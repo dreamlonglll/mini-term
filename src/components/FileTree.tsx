@@ -47,12 +47,10 @@ function TreeNode({ entry, projectRoot, depth }: TreeNodeProps) {
         }`}
         style={{ paddingLeft: `${depth * 16 + 8}px` }}
         onClick={handleToggle}
-        draggable={!entry.isDir}
+        draggable
         onDragStart={(e) => {
-          if (!entry.isDir) {
-            e.dataTransfer.setData('text/plain', entry.path);
-            e.dataTransfer.effectAllowed = 'copy';
-          }
+          e.dataTransfer.setData('text/plain', entry.path);
+          e.dataTransfer.effectAllowed = 'copy';
         }}
       >
         {entry.isDir && (

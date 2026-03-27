@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebglAddon } from '@xterm/addon-webgl';
@@ -16,8 +16,10 @@ interface Props {
 
 export function TerminalInstance({ ptyId, paneId, onSplit, onClose }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const wrapperRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
+  const [dragOver, setDragOver] = useState(false);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -116,16 +118,46 @@ export function TerminalInstance({ ptyId, paneId, onSplit, onClose }: Props) {
 
   return (
     <div
-      ref={containerRef}
-      className="w-full h-full"
-      onDrop={(e) => {
+      ref={wrapperRef}
+      className="w-full h-full relative"
+      onDragEnter={(e) => {
         e.preventDefault();
-        const filePath = e.dataTransfer.getData('text/plain');
-        if (filePath) {
-          invoke('write_pty', { ptyId, data: filePath });
-        }
+        setDragOver(true);
       }}
-      onDragOver={(e) => e.preventDefault()}
+    >
+      {/* xterm.js 渲染容器 */}
+      <div ref={containerRef} className="absolute inset-0" />
+
+      {/* 拖拽放置覆盖层 — 位于 xterm canvas 之上，仅在拖拽时激活 */}
+      {dragOver && (
+        <div
+          className="absolute inset-0 z-10 flex items-center justify-center"
+          style={{ background: 'rgba(200, 128, 90, 0.08)', border: '2px dashed var(--accent)', borderRadius: 'var(--radius-md)' }}
+          onDragOver={(e) => e.preventDefault()}
+          onDragLeave={(e) => {
+            // 仅当离开 wrapper 时才取消
+            if (wrapperRef.current && !wrapperRef.current.contains(e.relatedTarget as Node)) {
+              setDragOver(false);
+            }
+          }}
+          onDrop={(e) => {
+            e.preventDefault();
+            setDragOver(false);
+            const filePath = e.dataTransfer.getData('text/plain');
+            if (filePath) {
+              invoke('write_pty', { ptyId, data: filePath });
+            }
+          }}
+        >
+          <span className="text-[var(--accent)] text-xs px-3 py-1.5 rounded-[var(--radius-md)]"
+            style={{ background: 'var(--bg-overlay)' }}>
+            释放以插入路径
+          </span>
+        </div>
+      )}
+
+      {/* 右键菜单绑定在 wrapper 上 */}
+      <div className="absolute inset-0" style={{ pointerEvents: dragOver ? 'none' : 'auto', zIndex: dragOver ? -1 : 'auto' }}
       onContextMenu={(e) => {
         e.preventDefault();
         if (!paneId || !onSplit) return;
@@ -168,6 +200,7 @@ export function TerminalInstance({ ptyId, paneId, onSplit, onClose }: Props) {
         const dismiss = () => { menu.remove(); document.removeEventListener('click', dismiss); };
         setTimeout(() => document.addEventListener('click', dismiss), 0);
       }}
-    />
+      />
+    </div>
   );
 }
