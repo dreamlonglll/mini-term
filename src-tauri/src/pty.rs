@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
 #[derive(Clone, Serialize)]
@@ -33,6 +33,7 @@ struct PtyInstance {
 pub struct PtyManager {
     instances: Arc<Mutex<HashMap<u32, PtyInstance>>>,
     next_id: Arc<Mutex<u32>>,
+    last_output: Arc<Mutex<HashMap<u32, Instant>>>,
 }
 
 impl PtyManager {
@@ -40,12 +41,23 @@ impl PtyManager {
         Self {
             instances: Arc::new(Mutex::new(HashMap::new())),
             next_id: Arc::new(Mutex::new(1)),
+            last_output: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub fn get_pids(&self) -> HashMap<u32, Option<u32>> {
         let instances = self.instances.lock().unwrap();
         instances.iter().map(|(id, inst)| (*id, inst.child_pid)).collect()
+    }
+
+    pub fn mark_output(&self, pty_id: u32) {
+        let mut map = self.last_output.lock().unwrap();
+        map.insert(pty_id, Instant::now());
+    }
+
+    pub fn has_recent_output(&self, pty_id: u32, within: Duration) -> bool {
+        let map = self.last_output.lock().unwrap();
+        map.get(&pty_id).map_or(false, |t| t.elapsed() < within)
     }
 }
 
@@ -103,6 +115,7 @@ pub fn create_pty(
     });
 
     let app_flush = app.clone();
+    let last_output = state.last_output.clone();
     thread::spawn(move || {
         let mut pending = Vec::new();
 
@@ -150,6 +163,9 @@ pub fn create_pty(
                     pty_id: pty_id_for_reader, data,
                 });
                 pending.clear();
+                if let Ok(mut map) = last_output.lock() {
+                    map.insert(pty_id_for_reader, Instant::now());
+                }
             }
         }
     });
@@ -188,5 +204,7 @@ pub fn resize_pty(state: tauri::State<'_, PtyManager>, pty_id: u32, cols: u16, r
 pub fn kill_pty(state: tauri::State<'_, PtyManager>, pty_id: u32) -> Result<(), String> {
     let mut instances = state.instances.lock().unwrap();
     instances.remove(&pty_id);
+    let mut map = state.last_output.lock().unwrap();
+    map.remove(&pty_id);
     Ok(())
 }

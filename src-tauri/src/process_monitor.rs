@@ -55,32 +55,15 @@ fn snapshot_processes() -> Vec<(u32, u32, String)> {
     vec![]
 }
 
-/// 判断 shell 下的 AI 进程状态：
-///   - 无 AI 子进程 → "idle"
-///   - AI 子进程无后代 → "ai-idle"（等待用户输入）
-///   - AI 子进程有后代 → "ai-working"（正在执行工具）
-fn detect_status(shell_pid: u32, snapshot: &[(u32, u32, String)]) -> &'static str {
-    let mut ai_pids = vec![];
-
-    for (pid, ppid, name) in snapshot {
-        if *ppid == shell_pid && AI_PROCESS_NAMES.iter().any(|ai| name.contains(ai)) {
-            ai_pids.push(*pid);
-        }
-    }
-
-    if ai_pids.is_empty() {
-        return "idle";
-    }
-
-    // AI 进程是否有子进程 → 正在执行工具/命令
-    for ai_pid in &ai_pids {
-        if snapshot.iter().any(|(_, ppid, _)| ppid == ai_pid) {
-            return "ai-working";
-        }
-    }
-
-    "ai-idle"
+/// shell 的子进程中是否包含 AI 进程
+fn has_ai_child(shell_pid: u32, snapshot: &[(u32, u32, String)]) -> bool {
+    snapshot.iter().any(|(_, ppid, name)| {
+        *ppid == shell_pid && AI_PROCESS_NAMES.iter().any(|ai| name.contains(ai))
+    })
 }
+
+/// AI 输出活跃超时阈值
+const AI_ACTIVE_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub fn start_monitor(app: AppHandle, pty_manager: crate::pty::PtyManager) {
     thread::spawn(move || {
@@ -92,18 +75,27 @@ pub fn start_monitor(app: AppHandle, pty_manager: crate::pty::PtyManager) {
 
             for (pty_id, child_pid) in &pids {
                 let status = if let Some(pid) = child_pid {
-                    detect_status(*pid, &snapshot).to_string()
+                    if has_ai_child(*pid, &snapshot) {
+                        // AI 进程存在 → 看最近是否有输出
+                        if pty_manager.has_recent_output(*pty_id, AI_ACTIVE_TIMEOUT) {
+                            "ai-working"
+                        } else {
+                            "ai-idle"
+                        }
+                    } else {
+                        "idle"
+                    }
                 } else {
-                    "idle".to_string()
+                    "idle"
                 };
 
                 let prev = prev_statuses.get(pty_id);
-                if prev.map(|s| s.as_str()) != Some(&status) {
+                if prev.map(|s| s.as_str()) != Some(status) {
                     let _ = app.emit("pty-status-change", PtyStatusChangePayload {
                         pty_id: *pty_id,
-                        status: status.clone(),
+                        status: status.to_string(),
                     });
-                    prev_statuses.insert(*pty_id, status);
+                    prev_statuses.insert(*pty_id, status.to_string());
                 }
             }
 
@@ -120,28 +112,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn status_idle_no_children() {
-        assert_eq!(detect_status(1, &[]), "idle");
-    }
-
-    #[test]
-    fn status_idle_non_ai_children() {
+    fn no_ai_child() {
         let snap = vec![(2, 1, "node.exe".to_string())];
-        assert_eq!(detect_status(1, &snap), "idle");
+        assert!(!has_ai_child(1, &snap));
     }
 
     #[test]
-    fn status_ai_idle() {
+    fn has_claude_child() {
         let snap = vec![(2, 1, "claude.exe".to_string())];
-        assert_eq!(detect_status(1, &snap), "ai-idle");
+        assert!(has_ai_child(1, &snap));
     }
 
     #[test]
-    fn status_ai_working() {
-        let snap = vec![
-            (2, 1, "claude.exe".to_string()),
-            (3, 2, "bash.exe".to_string()),
-        ];
-        assert_eq!(detect_status(1, &snap), "ai-working");
+    fn has_codex_child() {
+        let snap = vec![(2, 1, "codex.exe".to_string())];
+        assert!(has_ai_child(1, &snap));
+    }
+
+    #[test]
+    fn no_children_at_all() {
+        assert!(!has_ai_child(1, &[]));
     }
 }
