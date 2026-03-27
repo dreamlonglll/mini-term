@@ -1,0 +1,12 @@
+@import "tailwindcss";
+@import "allotment/dist/style.css";
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  background: #0d0d1a;
+  color: #ccc;
+  font-family: 'Segoe UI', system-ui, sans-serif;
+}
