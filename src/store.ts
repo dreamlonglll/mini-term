@@ -17,7 +17,7 @@ export const genId = () => `id-${Date.now()}-${++idCounter}`;
 const STATUS_PRIORITY: Record<PaneStatus, number> = {
   error: 3,
   'ai-working': 2,
-  running: 1,
+  'ai-idle': 1,
   idle: 0,
 };
 

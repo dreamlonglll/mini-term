@@ -115,6 +115,24 @@ pub fn watch_directory(
 }
 
 #[tauri::command]
+pub fn create_file(path: String) -> Result<(), String> {
+    let p = Path::new(&path);
+    if p.exists() {
+        return Err(format!("已存在: {}", path));
+    }
+    fs::write(p, "").map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn create_directory(path: String) -> Result<(), String> {
+    let p = Path::new(&path);
+    if p.exists() {
+        return Err(format!("已存在: {}", path));
+    }
+    fs::create_dir(p).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub fn unwatch_directory(state: tauri::State<'_, FsWatcherManager>, path: String) -> Result<(), String> {
     let mut watchers = state.watchers.lock().unwrap();
     watchers.remove(&path);

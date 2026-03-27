@@ -24,7 +24,7 @@ export interface ShellConfig {
 
 // === 运行时状态 ===
 
-export type PaneStatus = 'idle' | 'running' | 'ai-working' | 'error';
+export type PaneStatus = 'idle' | 'ai-idle' | 'ai-working' | 'error';
 
 export interface ProjectState {
   id: string;

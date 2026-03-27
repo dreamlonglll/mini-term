@@ -11,6 +11,9 @@ interface MenuSeparator {
 type MenuEntry = MenuItem | MenuSeparator;
 
 export function showContextMenu(x: number, y: number, items: MenuEntry[]) {
+  // 关闭已有的右键菜单
+  document.querySelectorAll('.ctx-menu').forEach((el) => el.remove());
+
   const menu = document.createElement('div');
   menu.className = 'fixed ctx-menu text-xs';
   menu.style.left = `${x}px`;

@@ -29,6 +29,8 @@ pub fn run() {
             fs::list_directory,
             fs::watch_directory,
             fs::unwatch_directory,
+            fs::create_file,
+            fs::create_directory,
             ai_sessions::get_ai_sessions,
         ])
         .run(tauri::generate_context!())

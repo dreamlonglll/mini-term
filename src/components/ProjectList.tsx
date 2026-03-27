@@ -46,6 +46,7 @@ export function ProjectList() {
     if (!ps) return null;
     for (const tab of ps.tabs) {
       if (tab.status === 'ai-working') return 'ai-working';
+      if (tab.status === 'ai-idle') return 'ai-idle';
     }
     return null;
   };

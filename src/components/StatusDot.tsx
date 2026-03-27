@@ -1,13 +1,13 @@
 import type { PaneStatus } from '../types';
 
 const STATUS_STYLES: Record<PaneStatus, { bg: string; shadow: string }> = {
-  idle: { bg: '#6bb87a', shadow: 'none' },
-  running: { bg: '#d4a84a', shadow: '0 0 6px #d4a84a80' },
+  idle: { bg: '#5c5850', shadow: 'none' },
+  'ai-idle': { bg: '#6bb87a', shadow: 'none' },
   'ai-working': { bg: '#b08cd4', shadow: '0 0 6px #b08cd480' },
   error: { bg: '#d4605a', shadow: 'none' },
 };
 
-const GLOW_STATUSES: PaneStatus[] = ['running', 'ai-working'];
+const GLOW_STATUSES: PaneStatus[] = ['ai-working'];
 
 export function StatusDot({ status, size = 'sm' }: { status: PaneStatus; size?: 'sm' | 'md' }) {
   const style = STATUS_STYLES[status];

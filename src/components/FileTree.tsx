@@ -1,7 +1,10 @@
 import { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { revealItemInDir, openPath } from '@tauri-apps/plugin-opener';
 import { useAppStore } from '../store';
 import { useTauriEvent } from '../hooks/useTauriEvent';
+import { showContextMenu } from '../utils/contextMenu';
+import { showPrompt } from '../utils/prompt';
 import type { FileEntry, FsChangePayload } from '../types';
 
 interface TreeNodeProps {
@@ -47,6 +50,48 @@ function TreeNode({ entry, projectRoot, depth }: TreeNodeProps) {
         }`}
         style={{ paddingLeft: `${depth * 16 + 8}px` }}
         onClick={handleToggle}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const items: Parameters<typeof showContextMenu>[2] = [
+            {
+              label: '在文件夹中打开',
+              onClick: () => revealItemInDir(entry.path),
+            },
+          ];
+          if (!entry.isDir) {
+            items.unshift({
+              label: '使用默认工具打开',
+              onClick: () => openPath(entry.path),
+            });
+          }
+          if (entry.isDir) {
+            items.push({ separator: true });
+            items.push({
+              label: '新建文件',
+              onClick: async () => {
+                const name = await showPrompt('新建文件', '请输入文件名');
+                if (!name?.trim()) return;
+                const sep = entry.path.includes('/') ? '/' : '\\';
+                await invoke('create_file', { path: `${entry.path}${sep}${name.trim()}` });
+                if (!expanded) handleToggle();
+                else loadChildren();
+              },
+            });
+            items.push({
+              label: '新建文件夹',
+              onClick: async () => {
+                const name = await showPrompt('新建文件夹', '请输入文件夹名');
+                if (!name?.trim()) return;
+                const sep = entry.path.includes('/') ? '/' : '\\';
+                await invoke('create_directory', { path: `${entry.path}${sep}${name.trim()}` });
+                if (!expanded) handleToggle();
+                else loadChildren();
+              },
+            });
+          }
+          showContextMenu(e.clientX, e.clientY, items);
+        }}
         draggable
         onDragStart={(e) => {
           e.dataTransfer.setData('text/plain', entry.path);

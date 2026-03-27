@@ -164,6 +164,86 @@ html, body, #root {
   margin: 4px 0;
 }
 
+/* ===== Prompt dialog ===== */
+.prompt-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(4px);
+}
+
+.prompt-dialog {
+  width: 360px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-md);
+  box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+  padding: 20px;
+  animation: slideIn 0.12s ease-out;
+}
+
+.prompt-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 12px;
+}
+
+.prompt-input {
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  font-size: 14px;
+  outline: none;
+  font-family: 'JetBrains Mono', 'Cascadia Code', Consolas, monospace;
+}
+
+.prompt-input:focus {
+  border-color: var(--accent);
+}
+
+.prompt-buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+.prompt-btn {
+  padding: 6px 16px;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  cursor: pointer;
+  border: none;
+  transition: all 0.15s ease;
+}
+
+.prompt-btn-cancel {
+  background: transparent;
+  color: var(--text-muted);
+}
+
+.prompt-btn-cancel:hover {
+  color: var(--text-primary);
+}
+
+.prompt-btn-confirm {
+  background: var(--accent);
+  color: var(--bg-base);
+}
+
+.prompt-btn-confirm:hover {
+  opacity: 0.9;
+}
+
 /* ===== Selection ===== */
 ::selection {
   background: var(--accent-muted);
