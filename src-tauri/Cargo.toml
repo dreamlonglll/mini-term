@@ -26,7 +26,6 @@ serde_json = "1"
 portable-pty = "0.8"
 notify = "7"
 ignore = "0.4"
-dirs = "6"
 windows = { version = "0.58", features = [
   "Win32_System_Diagnostics_ToolHelp",
   "Win32_Foundation",

@@ -50,11 +50,6 @@ impl PtyManager {
         instances.iter().map(|(id, inst)| (*id, inst.child_pid)).collect()
     }
 
-    pub fn mark_output(&self, pty_id: u32) {
-        let mut map = self.last_output.lock().unwrap();
-        map.insert(pty_id, Instant::now());
-    }
-
     pub fn has_recent_output(&self, pty_id: u32, within: Duration) -> bool {
         let map = self.last_output.lock().unwrap();
         map.get(&pty_id).map_or(false, |t| t.elapsed() < within)
