@@ -46,13 +46,13 @@ function ShellRow({
       <div className="flex flex-col gap-2 p-3 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-default)]">
         <div className="flex gap-2">
           <input
-            className="flex-1 bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1 text-xs outline-none focus:border-[var(--accent)]"
+            className="flex-1 bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1 text-base outline-none focus:border-[var(--accent)]"
             placeholder="名称"
             value={name}
             onChange={(e) => setName(e.target.value)}
           />
           <input
-            className="flex-[2] bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1 text-xs outline-none focus:border-[var(--accent)] font-mono"
+            className="flex-[2] bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1 text-base outline-none focus:border-[var(--accent)] font-mono"
             placeholder="命令路径"
             value={command}
             onChange={(e) => setCommand(e.target.value)}
@@ -60,19 +60,19 @@ function ShellRow({
         </div>
         <div className="flex gap-2 items-center">
           <input
-            className="flex-1 bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1 text-xs outline-none focus:border-[var(--accent)] font-mono"
+            className="flex-1 bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1 text-base outline-none focus:border-[var(--accent)] font-mono"
             placeholder="启动参数（空格分隔，可选）"
             value={args}
             onChange={(e) => setArgs(e.target.value)}
           />
           <button
-            className="px-3 py-1 text-xs bg-[var(--accent)] text-[var(--bg-base)] rounded-[var(--radius-sm)] hover:opacity-90 transition-opacity"
+            className="px-3 py-1 text-base bg-[var(--accent)] text-[var(--bg-base)] rounded-[var(--radius-sm)] hover:opacity-90 transition-opacity"
             onClick={handleSave}
           >
             保存
           </button>
           <button
-            className="px-3 py-1 text-xs text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors"
+            className="px-3 py-1 text-base text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors"
             onClick={() => setEditing(false)}
           >
             取消
@@ -94,20 +94,20 @@ function ShellRow({
         title="设为默认"
       />
       <div className="flex-1 min-w-0">
-        <div className="text-xs font-medium text-[var(--text-primary)]">{shell.name}</div>
-        <div className="text-[10px] text-[var(--text-muted)] font-mono truncate">
+        <div className="text-base font-medium text-[var(--text-primary)]">{shell.name}</div>
+        <div className="text-sm text-[var(--text-muted)] font-mono truncate">
           {shell.command}{shell.args ? ` ${shell.args.join(' ')}` : ''}
         </div>
       </div>
       <div className="hidden group-hover:flex items-center gap-1">
         <button
-          className="px-2 py-0.5 text-[10px] text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors"
+          className="px-2 py-0.5 text-sm text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors"
           onClick={() => setEditing(true)}
         >
           编辑
         </button>
         <button
-          className="px-2 py-0.5 text-[10px] text-[var(--text-muted)] hover:text-[var(--color-error)] transition-colors"
+          className="px-2 py-0.5 text-sm text-[var(--text-muted)] hover:text-[var(--color-error)] transition-colors"
           onClick={onDelete}
         >
           删除
@@ -198,7 +198,7 @@ export function TerminalConfigModal({ open, onClose }: Props) {
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between px-5 py-4 border-b border-[var(--border-subtle)]">
-          <h2 className="text-sm font-semibold text-[var(--text-primary)]">终端配置</h2>
+          <h2 className="text-lg font-semibold text-[var(--text-primary)]">终端配置</h2>
           <button
             className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors text-lg leading-none"
             onClick={onClose}
@@ -208,7 +208,7 @@ export function TerminalConfigModal({ open, onClose }: Props) {
         </div>
 
         <div className="flex-1 overflow-y-auto px-5 py-4 space-y-2">
-          <div className="text-[10px] text-[var(--text-muted)] uppercase tracking-[0.1em] mb-2">
+          <div className="text-base text-[var(--text-muted)] uppercase tracking-[0.1em] mb-2">
             可用终端（●= 默认）
           </div>
           {shells.map((shell, idx) => (
@@ -226,14 +226,14 @@ export function TerminalConfigModal({ open, onClose }: Props) {
             <div className="flex flex-col gap-2 p-3 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--accent)] border-dashed">
               <div className="flex gap-2">
                 <input
-                  className="flex-1 bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1 text-xs outline-none focus:border-[var(--accent)]"
+                  className="flex-1 bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1 text-base outline-none focus:border-[var(--accent)]"
                   placeholder="名称（如 pwsh）"
                   value={newName}
                   onChange={(e) => setNewName(e.target.value)}
                   autoFocus
                 />
                 <input
-                  className="flex-[2] bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1 text-xs outline-none focus:border-[var(--accent)] font-mono"
+                  className="flex-[2] bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1 text-base outline-none focus:border-[var(--accent)] font-mono"
                   placeholder="命令路径（如 pwsh 或 C:\...\bash.exe）"
                   value={newCommand}
                   onChange={(e) => setNewCommand(e.target.value)}
@@ -241,20 +241,20 @@ export function TerminalConfigModal({ open, onClose }: Props) {
               </div>
               <div className="flex gap-2 items-center">
                 <input
-                  className="flex-1 bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1 text-xs outline-none focus:border-[var(--accent)] font-mono"
+                  className="flex-1 bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1 text-base outline-none focus:border-[var(--accent)] font-mono"
                   placeholder="启动参数（空格分隔，可选）"
                   value={newArgs}
                   onChange={(e) => setNewArgs(e.target.value)}
                   onKeyDown={(e) => e.key === 'Enter' && handleAdd()}
                 />
                 <button
-                  className="px-3 py-1 text-xs bg-[var(--accent)] text-[var(--bg-base)] rounded-[var(--radius-sm)] hover:opacity-90 transition-opacity"
+                  className="px-3 py-1 text-base bg-[var(--accent)] text-[var(--bg-base)] rounded-[var(--radius-sm)] hover:opacity-90 transition-opacity"
                   onClick={handleAdd}
                 >
                   添加
                 </button>
                 <button
-                  className="px-3 py-1 text-xs text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors"
+                  className="px-3 py-1 text-base text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors"
                   onClick={() => setAdding(false)}
                 >
                   取消
@@ -263,7 +263,7 @@ export function TerminalConfigModal({ open, onClose }: Props) {
             </div>
           ) : (
             <button
-              className="w-full py-2.5 border border-dashed border-[var(--border-default)] rounded-[var(--radius-md)] text-xs text-[var(--text-muted)] hover:border-[var(--accent)] hover:text-[var(--accent)] transition-all"
+              className="w-full py-2.5 border border-dashed border-[var(--border-default)] rounded-[var(--radius-md)] text-base text-[var(--text-muted)] hover:border-[var(--accent)] hover:text-[var(--accent)] transition-all"
               onClick={() => setAdding(true)}
             >
               + 添加终端
@@ -271,7 +271,7 @@ export function TerminalConfigModal({ open, onClose }: Props) {
           )}
         </div>
 
-        <div className="px-5 py-3 border-t border-[var(--border-subtle)] text-[10px] text-[var(--text-muted)]">
+        <div className="px-5 py-3 border-t border-[var(--border-subtle)] text-sm text-[var(--text-muted)]">
           点击圆点设为默认终端 · 新建终端标签页时可选择类型
         </div>
       </div>
