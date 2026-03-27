@@ -9,9 +9,11 @@ import '@xterm/xterm/css/xterm.css';
 
 interface Props {
   ptyId: number;
+  paneId?: string;
+  onSplit?: (paneId: string, direction: 'horizontal' | 'vertical') => void;
 }
 
-export function TerminalInstance({ ptyId }: Props) {
+export function TerminalInstance({ ptyId, paneId, onSplit }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
@@ -100,6 +102,35 @@ export function TerminalInstance({ ptyId }: Props) {
         }
       }}
       onDragOver={(e) => e.preventDefault()}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        if (!paneId || !onSplit) return;
+
+        const menu = document.createElement('div');
+        menu.className = 'fixed bg-[#1a1a2e] border border-[#333] rounded shadow-lg py-1 z-50 text-xs';
+        menu.style.left = `${e.clientX}px`;
+        menu.style.top = `${e.clientY}px`;
+
+        const items = [
+          { label: '↔ 向右分屏', dir: 'horizontal' as const },
+          { label: '↕ 向下分屏', dir: 'vertical' as const },
+        ];
+
+        items.forEach(({ label, dir }) => {
+          const item = document.createElement('div');
+          item.className = 'px-3 py-1.5 cursor-pointer hover:bg-[#7c83ff33] text-gray-300';
+          item.textContent = label;
+          item.onclick = () => {
+            onSplit(paneId, dir);
+            menu.remove();
+          };
+          menu.appendChild(item);
+        });
+
+        document.body.appendChild(menu);
+        const dismiss = () => { menu.remove(); document.removeEventListener('click', dismiss); };
+        setTimeout(() => document.addEventListener('click', dismiss), 0);
+      }}
     />
   );
 }
