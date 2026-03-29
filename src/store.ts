@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { invoke } from '@tauri-apps/api/core';
 import type {
   AppConfig,
   ProjectConfig,
@@ -71,6 +72,75 @@ export function serializeLayout(ps: ProjectState): SavedProjectLayout {
   }));
   const activeTabIndex = ps.tabs.findIndex((t) => t.id === ps.activeTabId);
   return { tabs, activeTabIndex: activeTabIndex >= 0 ? activeTabIndex : 0 };
+}
+
+// 反序列化：重建 SplitNode 树并创建 PTY
+async function restoreSplitNode(
+  saved: SavedSplitNode,
+  projectPath: string,
+  config: AppConfig,
+): Promise<SplitNode | null> {
+  if (saved.type === 'leaf') {
+    const shell =
+      config.availableShells.find((s) => s.name === saved.pane.shellName)
+      ?? config.availableShells.find((s) => s.name === config.defaultShell)
+      ?? config.availableShells[0];
+    if (!shell) return null;
+    try {
+      const ptyId = await invoke<number>('create_pty', {
+        shell: shell.command,
+        args: shell.args ?? [],
+        cwd: projectPath,
+      });
+      return {
+        type: 'leaf',
+        pane: { id: genId(), shellName: shell.name, status: 'idle' as PaneStatus, ptyId },
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  const children: SplitNode[] = [];
+  for (const child of saved.children) {
+    const restored = await restoreSplitNode(child, projectPath, config);
+    if (restored) children.push(restored);
+  }
+  if (children.length === 0) return null;
+  if (children.length === 1) return children[0];
+  return {
+    type: 'split',
+    direction: saved.direction,
+    children,
+    sizes: children.map(() => 100 / children.length),
+  };
+}
+
+export async function restoreLayout(
+  projectId: string,
+  savedLayout: SavedProjectLayout,
+  projectPath: string,
+  config: AppConfig,
+): Promise<void> {
+  const tabs: TerminalTab[] = [];
+  for (const savedTab of savedLayout.tabs) {
+    const layout = await restoreSplitNode(savedTab.splitLayout, projectPath, config);
+    if (layout) {
+      tabs.push({
+        id: genId(),
+        customTitle: savedTab.customTitle,
+        splitLayout: layout,
+        status: 'idle',
+      });
+    }
+  }
+  if (tabs.length === 0) return;
+  const activeTabId = tabs[savedLayout.activeTabIndex]?.id ?? tabs[0]?.id ?? '';
+  useAppStore.setState((state) => {
+    const newStates = new Map(state.projectStates);
+    newStates.set(projectId, { id: projectId, tabs, activeTabId });
+    return { projectStates: newStates };
+  });
 }
 
 interface AppStore {
