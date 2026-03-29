@@ -28,6 +28,8 @@ interface SavedProjectLayout {
 }
 ```
 
+Design decision: `SavedPane` only stores `shellName`, not `command`/`args`. On restore, the current `availableShells` config is used to resolve the full shell config. This means if a user renames or reconfigures a shell, restored panes will use the current config. This is intentional — the layout captures structure, not frozen shell configurations.
+
 ### ProjectConfig Extension
 
 `ProjectConfig` gains an optional `savedLayout` field:
@@ -41,7 +43,54 @@ interface ProjectConfig {
 }
 ```
 
-Rust side mirrors this with `Option<SavedProjectLayout>` on `ProjectConfig`, using `#[serde(rename_all = "camelCase")]`.
+### Rust Structs
+
+All new structs use `#[serde(rename_all = "camelCase")]`. The new field on `ProjectConfig` uses `#[serde(default)]` for backward compatibility with existing `config.json` files that lack this field.
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedPane {
+    pub shell_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "type")]
+pub enum SavedSplitNode {
+    Leaf { pane: SavedPane },
+    Split {
+        direction: String,
+        children: Vec<SavedSplitNode>,
+        sizes: Vec<f64>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedTab {
+    #[serde(default)]
+    pub custom_title: Option<String>,
+    pub split_layout: SavedSplitNode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedProjectLayout {
+    pub tabs: Vec<SavedTab>,
+    pub active_tab_index: usize,
+}
+
+// ProjectConfig updated:
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectConfig {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    #[serde(default)]
+    pub saved_layout: Option<SavedProjectLayout>,
+}
+```
 
 ## Serialization (Save)
 
@@ -54,23 +103,29 @@ A pure function `serializeLayout(ps: ProjectState): SavedProjectLayout` in `stor
 
 ## Deserialization (Restore)
 
-An async function `restoreLayout(projectId, savedLayout, projectPath, shells)` in `store.ts`:
+An async function `restoreLayout(projectId, savedLayout, projectPath, config)` in `store.ts`:
 
 1. Iterates `savedLayout.tabs`, for each `SavedTab` recursively walks `SavedSplitNode`
 2. At each leaf:
    - Finds shell config by matching `shellName` against `config.availableShells[].name`
    - Falls back to `config.defaultShell` if not found
+   - If no shell can be resolved at all (empty `availableShells` and no `defaultShell` match), skip this pane (return `null`)
    - Calls `invoke('create_pty', { shell, args, cwd: projectPath })` to get a `ptyId`
-   - Assembles `PaneState { id: genId(), shellName, status: 'idle', ptyId }`
+   - On PTY creation failure, return `null`
+   - On success, assembles `PaneState { id: genId(), shellName, status: 'idle', ptyId }`
 3. Assembles `TerminalTab { id: genId(), splitLayout, status: 'idle', customTitle }`
-4. Sets `activeTabId = tabs[savedLayout.activeTabIndex]?.id ?? tabs[0]?.id`
+4. Sets `activeTabId = tabs[savedLayout.activeTabIndex]?.id ?? tabs[0]?.id ?? ''`
 
-### Error Handling
+### Error Handling During Tree Construction
 
-- Single pane PTY creation failure: skip the pane, remove from tree (reuse `removePane`)
-- All panes in a tab fail: skip the tab
-- All tabs fail: degrade to empty tabs (as if no savedLayout)
-- Shell name not found in availableShells: fallback to defaultShell
+Errors are handled inline during the recursive tree build, not post-hoc:
+
+- Leaf node PTY creation fails → recursive function returns `null`
+- Parent split node filters out `null` children, recalculates `sizes` as equal proportions
+- If a split has only one child remaining → unwrap to that child
+- If a split has zero children → return `null` (propagates up)
+- Tab with `null` root layout → skip the tab
+- All tabs skipped → degrade to empty tabs (as if no savedLayout)
 - Silent degradation, no user-facing error
 
 ## Save Triggers
@@ -81,7 +136,7 @@ Reuse existing `save_config` + 500ms debounce. A new `saveLayoutToConfig()` meth
 2. Writes result into `ProjectConfig.savedLayout`
 3. Calls `invoke('save_config', { config })` (debounced)
 
-Trigger points (all in existing code paths):
+Trigger points:
 
 | Operation | Location | Hook |
 |-----------|----------|------|
@@ -90,30 +145,42 @@ Trigger points (all in existing code paths):
 | Close pane | `TerminalArea.tsx` `handleClosePane` | After removePane |
 | Close tab | `TerminalArea.tsx` `handleCloseTab` | After tab removal |
 | Drag tab to split | `TerminalArea.tsx` `handleTabDrop` | After layout update |
-| Resize splits | `SplitLayout.tsx` Allotment `onChange` | In callback |
+| Resize splits | `SplitLayout.tsx` Allotment `onChange` | See below |
+| Switch project | `App.tsx` / store `setActiveProject` | Before switching |
+| App closing | `window` `beforeunload` | Flush immediately (no debounce) |
+
+### Allotment Resize Sizes Propagation
+
+Current `SplitLayout.tsx` passes `node.sizes` as `defaultSizes` to Allotment but has no `onChange` handler. To capture resize changes:
+
+- Add `onChange` prop to `SplitLayout`'s recursive rendering
+- `SplitLayout` accepts a new callback prop: `onLayoutChange(updatedNode: SplitNode)`
+- When Allotment `onChange` fires, clone the current `SplitNode` with the new sizes array, call `onLayoutChange` with the updated tree
+- `TerminalArea` receives this callback, calls `updateTabLayout` to persist the new sizes into the store, then triggers `saveLayoutToConfig`
+
+This propagation works because each recursive `SplitLayout` instance knows its own node and can reconstruct the updated subtree.
 
 ## Restore Timing
 
 In `App.tsx` initialization `useEffect`, after `load_config`:
 
-```
-for each project in config.projects:
-  if project.savedLayout exists and has tabs:
-    await restoreLayout(project.id, project.savedLayout, project.path, config)
-  else:
-    initialize with empty tabs (current behavior)
-```
+1. First, synchronously initialize all project states with empty tabs (current behavior) — ensures UI renders immediately
+2. Then, for each project with a `savedLayout`, kick off `restoreLayout()` asynchronously
+3. Use `Promise.all` to restore all projects in parallel
+4. Each `restoreLayout` updates the store once complete, replacing the empty tabs
+
+This avoids blocking UI rendering. The user may see empty tabs briefly before restoration completes, which is acceptable given the PTY creation latency.
 
 ## Files Changed
 
 | File | Change |
 |------|--------|
 | `src/types.ts` | Add `SavedPane`, `SavedSplitNode`, `SavedTab`, `SavedProjectLayout`; extend `ProjectConfig` |
-| `src-tauri/src/config.rs` | Add corresponding Rust structs; extend `ProjectConfig` |
+| `src-tauri/src/config.rs` | Add Rust structs with serde annotations; extend `ProjectConfig` with `#[serde(default)]` |
 | `src/store.ts` | Add `serializeLayout()`, `restoreLayout()`, `saveLayoutToConfig()` |
-| `src/App.tsx` | Call `restoreLayout` during init |
+| `src/App.tsx` | Call `restoreLayout` during init; add `beforeunload` handler |
 | `src/components/TerminalArea.tsx` | Call `saveLayoutToConfig` after layout mutations |
-| `src/components/SplitLayout.tsx` | Call `saveLayoutToConfig` on Allotment resize |
+| `src/components/SplitLayout.tsx` | Add Allotment `onChange` + `onLayoutChange` callback prop |
 
 ## Not Changed
 
