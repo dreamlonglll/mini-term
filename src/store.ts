@@ -6,6 +6,9 @@ import type {
   TerminalTab,
   SplitNode,
   PaneStatus,
+  SavedSplitNode,
+  SavedTab,
+  SavedProjectLayout,
 } from './types';
 
 // 生成唯一 ID
@@ -46,6 +49,28 @@ function updatePaneStatus(node: SplitNode, ptyId: number, status: PaneStatus): S
 export function collectPtyIds(node: SplitNode): number[] {
   if (node.type === 'leaf') return [node.pane.ptyId];
   return node.children.flatMap(collectPtyIds);
+}
+
+// 序列化 SplitNode 树（剥离运行时数据）
+function serializeSplitNode(node: SplitNode): SavedSplitNode {
+  if (node.type === 'leaf') {
+    return { type: 'leaf', pane: { shellName: node.pane.shellName } };
+  }
+  return {
+    type: 'split',
+    direction: node.direction,
+    children: node.children.map(serializeSplitNode),
+    sizes: [...node.sizes],
+  };
+}
+
+export function serializeLayout(ps: ProjectState): SavedProjectLayout {
+  const tabs: SavedTab[] = ps.tabs.map((tab) => ({
+    customTitle: tab.customTitle,
+    splitLayout: serializeSplitNode(tab.splitLayout),
+  }));
+  const activeTabIndex = ps.tabs.findIndex((t) => t.id === ps.activeTabId);
+  return { tabs, activeTabIndex: activeTabIndex >= 0 ? activeTabIndex : 0 };
 }
 
 interface AppStore {
