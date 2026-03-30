@@ -180,7 +180,10 @@ export function TerminalArea({ projectId, projectPath }: Props) {
   );
 
   const handleClosePane = useCallback(async (paneId: string) => {
-    if (!ps || !activeTab) return;
+    // 从 store 读取最新状态，避免闭包过期
+    const currentPs = useAppStore.getState().projectStates.get(projectId);
+    const currentTab = currentPs?.tabs.find(t => t.id === currentPs.activeTabId);
+    if (!currentTab) return;
 
     const findPty = (node: SplitNode): number | null => {
       if (node.type === 'leaf') return node.pane.id === paneId ? node.pane.ptyId : null;
@@ -191,19 +194,24 @@ export function TerminalArea({ projectId, projectPath }: Props) {
       return null;
     };
 
-    const ptyId = findPty(activeTab.splitLayout);
+    const ptyId = findPty(currentTab.splitLayout);
     if (ptyId !== null) {
       await invoke('kill_pty', { ptyId });
     }
 
-    const newLayout = removePane(activeTab.splitLayout, paneId);
+    // await 之后重新读取最新状态，防止并发关闭时布局被覆盖
+    const latestPs = useAppStore.getState().projectStates.get(projectId);
+    const latestTab = latestPs?.tabs.find(t => t.id === latestPs.activeTabId);
+    if (!latestTab) return;
+
+    const newLayout = removePane(latestTab.splitLayout, paneId);
     if (newLayout) {
-      updateTabLayout(projectId, activeTab.id, newLayout);
+      updateTabLayout(projectId, latestTab.id, newLayout);
       saveLayoutToConfig(projectId);
     } else {
-      handleCloseTab(activeTab.id);
+      handleCloseTab(latestTab.id);
     }
-  }, [ps, activeTab, projectId, updateTabLayout, handleCloseTab]);
+  }, [projectId, updateTabLayout, handleCloseTab]);
 
   const handleLayoutChange = useCallback((updatedNode: SplitNode) => {
     const currentPs = useAppStore.getState().projectStates.get(projectId);
