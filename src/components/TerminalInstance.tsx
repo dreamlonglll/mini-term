@@ -95,7 +95,11 @@ export function TerminalInstance({ ptyId, paneId, shellName, status, onSplit, on
 
     try {
       const webgl = new WebglAddon();
-      webgl.onContextLoss(() => webgl.dispose());
+      webgl.onContextLoss(() => {
+        webgl.dispose();
+        // 强制用 Canvas 渲染器刷新，消除 WebGL→Canvas 降级时的白屏
+        term.refresh(0, term.rows - 1);
+      });
       term.loadAddon(webgl);
     } catch {
       // WebGL 不支持时回退到 Canvas

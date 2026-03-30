@@ -11,6 +11,12 @@ interface Props {
   projectPath: string;
 }
 
+// 收集 SplitNode 树中所有 pane ID
+function collectPaneIds(node: SplitNode): string[] {
+  if (node.type === 'leaf') return [node.pane.id];
+  return node.children.flatMap(collectPaneIds);
+}
+
 function removePane(node: SplitNode, targetPaneId: string): SplitNode | null {
   if (node.type === 'leaf') {
     return node.pane.id === targetPaneId ? null : node;
@@ -217,6 +223,12 @@ export function TerminalArea({ projectId, projectPath }: Props) {
     const currentPs = useAppStore.getState().projectStates.get(projectId);
     const currentActiveTab = currentPs?.tabs.find((t) => t.id === currentPs.activeTabId);
     if (!currentActiveTab) return;
+
+    // 校验布局结构一致：若 pane ID 集合不同，说明是过期的 RAF 回调，丢弃
+    const currentIds = collectPaneIds(currentActiveTab.splitLayout).sort().join(',');
+    const updatedIds = collectPaneIds(updatedNode).sort().join(',');
+    if (currentIds !== updatedIds) return;
+
     updateTabLayout(projectId, currentActiveTab.id, updatedNode);
     saveLayoutToConfig(projectId);
   }, [projectId, updateTabLayout]);

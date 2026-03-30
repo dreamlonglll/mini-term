@@ -18,6 +18,11 @@ function getNodeKey(node: SplitNode): string {
 }
 
 export function SplitLayout({ node, onSplit, onClose, onTabDrop, onLayoutChange }: Props) {
+  // hooks 必须在条件返回之前调用，保证调用顺序一致
+  const rafRef = useRef<number>(0);
+  const nodeRef = useRef(node);
+  nodeRef.current = node;
+
   if (node.type === 'leaf') {
     return (
       <TerminalInstance
@@ -33,22 +38,26 @@ export function SplitLayout({ node, onSplit, onClose, onTabDrop, onLayoutChange 
   }
 
   // Allotment onChange 返回像素值，防抖后转比例值更新 store
-  const rafRef = useRef<number>(0);
   const handleSizesChange = (sizes: number[]) => {
     if (!onLayoutChange) return;
     cancelAnimationFrame(rafRef.current);
     rafRef.current = requestAnimationFrame(() => {
+      const currentNode = nodeRef.current;
+      // 布局已变化（如关闭面板导致子节点数变化），丢弃过期尺寸
+      if (currentNode.type !== 'split' || sizes.length !== currentNode.children.length) return;
       const total = sizes.reduce((a, b) => a + b, 0);
       const proportional = total > 0 ? sizes.map((s) => (s / total) * 100) : sizes;
-      onLayoutChange({ ...node, sizes: proportional });
+      onLayoutChange({ ...currentNode, sizes: proportional });
     });
   };
 
   const handleChildLayoutChange = (index: number, updatedChild: SplitNode) => {
     if (!onLayoutChange) return;
-    const newChildren = [...node.children];
+    const currentNode = nodeRef.current;
+    if (currentNode.type !== 'split') return;
+    const newChildren = [...currentNode.children];
     newChildren[index] = updatedChild;
-    onLayoutChange({ ...node, children: newChildren });
+    onLayoutChange({ ...currentNode, children: newChildren });
   };
 
   return (
