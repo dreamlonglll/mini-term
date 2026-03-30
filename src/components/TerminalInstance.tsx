@@ -127,6 +127,7 @@ export function TerminalInstance({ ptyId, paneId, shellName, status, onSplit, on
     invoke('resize_pty', { ptyId, cols: term.cols, rows: term.rows });
 
     const onDataDisposable = term.onData((data) => {
+      term.scrollToBottom();
       invoke('write_pty', { ptyId, data });
     });
 
