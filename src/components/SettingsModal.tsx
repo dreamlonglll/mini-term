@@ -1,5 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { getVersion } from '@tauri-apps/api/app';
+import { openUrl } from '@tauri-apps/plugin-opener';
 import { useAppStore } from '../store';
 import type { ShellConfig } from '../types';
 
@@ -8,7 +10,7 @@ interface Props {
   onClose: () => void;
 }
 
-type SettingsPage = 'terminal' | 'system';
+type SettingsPage = 'terminal' | 'system' | 'about';
 
 // ─── ShellRow（终端设置子组件）───
 
@@ -349,11 +351,125 @@ function SystemSettings() {
   );
 }
 
+// ─── AboutSettings（关于页）───
+
+const GITHUB_REPO = 'dreamlonglll/mini-term';
+
+interface ReleaseInfo {
+  version: string;
+  url: string;
+  publishedAt: string;
+}
+
+function compareVersions(a: string, b: string): number {
+  const pa = a.replace(/^v/, '').split('.').map(Number);
+  const pb = b.replace(/^v/, '').split('.').map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const diff = (pa[i] ?? 0) - (pb[i] ?? 0);
+    if (diff !== 0) return diff;
+  }
+  return 0;
+}
+
+function AboutSettings() {
+  const [currentVersion, setCurrentVersion] = useState('');
+  const [latest, setLatest] = useState<ReleaseInfo | null>(null);
+  const [checking, setChecking] = useState(false);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    getVersion().then(setCurrentVersion);
+  }, []);
+
+  const checkUpdate = useCallback(async () => {
+    setChecking(true);
+    setError('');
+    setLatest(null);
+    try {
+      const resp = await fetch(`https://api.github.com/repos/${GITHUB_REPO}/releases/latest`);
+      if (!resp.ok) throw new Error(resp.status === 404 ? '暂无发布版本' : `请求失败 (${resp.status})`);
+      const data = await resp.json();
+      setLatest({
+        version: data.tag_name,
+        url: data.html_url,
+        publishedAt: data.published_at,
+      });
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : '检查失败，请稍后重试');
+    } finally {
+      setChecking(false);
+    }
+  }, []);
+
+  const hasUpdate = latest && compareVersions(latest.version, currentVersion) > 0;
+
+  return (
+    <div className="space-y-6">
+      <div className="text-base text-[var(--text-muted)] uppercase tracking-[0.1em] mb-2">
+        版本信息
+      </div>
+
+      {/* 当前版本 */}
+      <div className="flex items-center gap-3 px-4 py-3 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)]">
+        <span className="text-base text-[var(--text-secondary)]">当前版本</span>
+        <span className="font-mono text-base text-[var(--accent)]">v{currentVersion}</span>
+      </div>
+
+      {/* 检查更新按钮 */}
+      <button
+        className="w-full py-2.5 border border-[var(--border-default)] rounded-[var(--radius-md)] text-base text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--accent)] transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+        onClick={checkUpdate}
+        disabled={checking}
+      >
+        {checking ? '正在检查...' : '检查更新'}
+      </button>
+
+      {/* 检查结果 */}
+      {error && (
+        <div className="px-4 py-3 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--color-error)]/30 text-sm text-[var(--color-error)]">
+          {error}
+        </div>
+      )}
+
+      {latest && (
+        <div className={`px-4 py-3 rounded-[var(--radius-md)] bg-[var(--bg-base)] border ${hasUpdate ? 'border-[var(--accent)]/50' : 'border-[var(--border-subtle)]'}`}>
+          {hasUpdate ? (
+            <div className="space-y-3">
+              <div className="flex items-center gap-2">
+                <span className="text-base text-[var(--text-primary)]">发现新版本</span>
+                <span className="font-mono text-base text-[var(--accent)]">{latest.version}</span>
+              </div>
+              <div className="text-sm text-[var(--text-muted)]">
+                发布于 {new Date(latest.publishedAt).toLocaleDateString('zh-CN')}
+              </div>
+              <button
+                className="w-full py-2 bg-[var(--accent)] text-[var(--bg-base)] rounded-[var(--radius-sm)] text-base font-medium hover:opacity-90 transition-opacity"
+                onClick={() => openUrl(latest.url)}
+              >
+                前往 GitHub 下载
+              </button>
+            </div>
+          ) : (
+            <div className="text-base text-[var(--text-secondary)]">
+              已是最新版本
+            </div>
+          )}
+        </div>
+      )}
+
+      <div className="pt-3 text-sm text-[var(--text-muted)]">
+        点击检查更新从 GitHub 获取最新版本信息
+      </div>
+    </div>
+  );
+}
+
 // ─── SettingsModal（主弹窗）───
 
 const MENU_ITEMS: { key: SettingsPage; label: string }[] = [
   { key: 'terminal', label: '终端设置' },
   { key: 'system', label: '系统设置' },
+  { key: 'about', label: '关于' },
 ];
 
 export function SettingsModal({ open, onClose }: Props) {
@@ -409,6 +525,7 @@ export function SettingsModal({ open, onClose }: Props) {
           <div className="flex-1 overflow-y-auto px-5 py-4">
             {activePage === 'terminal' && <TerminalSettings />}
             {activePage === 'system' && <SystemSettings />}
+            {activePage === 'about' && <AboutSettings />}
           </div>
         </div>
       </div>
