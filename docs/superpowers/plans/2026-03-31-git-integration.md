@@ -25,7 +25,7 @@
 
 | 文件 | 改动 |
 |------|------|
-| `src-tauri/Cargo.toml` | 添加 `git2` 依赖 |
+| `src-tauri/Cargo.toml` | 添加 `git2`、`pathdiff` 依赖 |
 | `src-tauri/src/lib.rs` | 添加 `mod git;`，注册两个命令 |
 | `src/types.ts` | 新增 Git 相关类型 |
 | `src/components/FileTree.tsx` | 加载 git status、TreeNode 标记、右键菜单、DiffModal 集成 |
@@ -188,6 +188,15 @@ git commit -m "feat: add git2 dependency and scaffold git module"
 
 **Files:**
 - Modify: `src-tauri/src/git.rs`
+- Modify: `src-tauri/Cargo.toml`
+
+- [ ] **Step 0: 在 Cargo.toml 添加 pathdiff 依赖**
+
+在 `[dependencies]` 末尾添加：
+
+```toml
+pathdiff = "0.2"
+```
 
 - [ ] **Step 1: 实现仓库发现和状态映射辅助函数**
 
@@ -198,7 +207,8 @@ use git2::{Repository, StatusOptions, Status};
 use std::path::PathBuf;
 
 /// 将 git2 Status 位标志转换为 GitFileStatus
-fn map_status(status: Status) -> (GitStatus, &'static str) {
+/// is_empty_repo: 空仓库时 WT_NEW 映射为 Added 而非 Untracked
+fn map_status(status: Status, is_empty_repo: bool) -> (GitStatus, &'static str) {
     if status.intersects(Status::CONFLICTED) {
         (GitStatus::Conflicted, "C")
     } else if status.intersects(Status::INDEX_DELETED | Status::WT_DELETED) {
@@ -210,7 +220,11 @@ fn map_status(status: Status) -> (GitStatus, &'static str) {
     } else if status.intersects(Status::INDEX_MODIFIED | Status::WT_MODIFIED) {
         (GitStatus::Modified, "M")
     } else if status.intersects(Status::WT_NEW) {
-        (GitStatus::Untracked, "?")
+        if is_empty_repo {
+            (GitStatus::Added, "A")
+        } else {
+            (GitStatus::Untracked, "?")
+        }
     } else {
         (GitStatus::Modified, "M")
     }
@@ -226,12 +240,13 @@ fn collect_repo_status(
         .recurse_untracked_dirs(true)
         .include_ignored(false);
 
+    let is_empty_repo = repo.head().is_err();
     let statuses = repo.statuses(Some(&mut opts)).map_err(|e| e.to_string())?;
     let mut result = Vec::new();
 
     for entry in statuses.iter() {
         let raw_path = entry.path().unwrap_or_default().to_string();
-        let (git_status, label) = map_status(entry.status());
+        let (git_status, label) = map_status(entry.status(), is_empty_repo);
 
         let full_path = if path_prefix.is_empty() {
             raw_path.clone()
@@ -308,12 +323,6 @@ pub fn get_git_status(project_path: String) -> Result<Vec<GitFileStatus>, String
 
     Ok(all_statuses)
 }
-```
-
-注意：需要在 `Cargo.toml` 添加 `pathdiff` 依赖：
-
-```toml
-pathdiff = "0.2"
 ```
 
 - [ ] **Step 3: 验证编译通过**
@@ -431,24 +440,37 @@ fn compute_diff_hunks(old: &str, new: &str) -> Vec<DiffHunk> {
     let old_lines: Vec<&str> = old.lines().collect();
     let new_lines: Vec<&str> = new.lines().collect();
 
-    // 使用 git2 的 diff 或简单的逐行比较
-    // 这里用简单的方式：将整个内容作为一个 hunk
-    let mut lines = Vec::new();
-    let mut old_idx = 0;
-    let mut new_idx = 0;
+    // 行数过大时退化为全量替换，防止 O(n*m) LCS 的内存溢出
+    // 3000 * 3000 * 4 bytes ≈ 36MB，可接受上限
+    if (old_lines.len() as u64) * (new_lines.len() as u64) > 10_000_000 {
+        let mut lines = Vec::new();
+        for (i, line) in old_lines.iter().enumerate() {
+            lines.push(DiffLine {
+                kind: "delete".to_string(),
+                content: line.to_string(),
+                old_lineno: Some(i as u32 + 1),
+                new_lineno: None,
+            });
+        }
+        for (i, line) in new_lines.iter().enumerate() {
+            lines.push(DiffLine {
+                kind: "add".to_string(),
+                content: line.to_string(),
+                old_lineno: None,
+                new_lineno: Some(i as u32 + 1),
+            });
+        }
+        return vec![DiffHunk {
+            old_start: 1,
+            old_lines: old_lines.len() as u32,
+            new_start: 1,
+            new_lines: new_lines.len() as u32,
+            lines,
+        }];
+    }
 
-    // LCS-based diff using patience algorithm approximation
-    // For simplicity, use a basic line-by-line comparison with context
-    let max_len = old_lines.len().max(new_lines.len());
-
-    // Simple approach: generate unified diff lines
-    let old_set: std::collections::HashSet<(usize, &str)> =
-        old_lines.iter().enumerate().map(|(i, l)| (i, *l)).collect();
-    let new_set: std::collections::HashSet<(usize, &str)> =
-        new_lines.iter().enumerate().map(|(i, l)| (i, *l)).collect();
-
-    // Use similar crate-style approach with basic O(n*m) LCS
     let diff_results = simple_diff(&old_lines, &new_lines);
+    let mut lines = Vec::new();
 
     for item in &diff_results {
         match item {
