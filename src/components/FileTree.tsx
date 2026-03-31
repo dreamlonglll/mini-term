@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { revealItemInDir, openPath } from '@tauri-apps/plugin-opener';
 import { writeText } from '@tauri-apps/plugin-clipboard-manager';
@@ -6,12 +6,15 @@ import { useAppStore } from '../store';
 import { useTauriEvent } from '../hooks/useTauriEvent';
 import { showContextMenu } from '../utils/contextMenu';
 import { showPrompt } from '../utils/prompt';
-import type { FileEntry, FsChangePayload } from '../types';
+import { DiffModal } from './DiffModal';
+import type { FileEntry, FsChangePayload, GitFileStatus, PtyOutputPayload } from '../types';
 
 interface TreeNodeProps {
   entry: FileEntry;
   projectRoot: string;
   depth: number;
+  gitStatusMap: Map<string, GitFileStatus>;
+  onViewDiff: (status: GitFileStatus) => void;
 }
 
 function getRelativePath(targetPath: string, rootPath: string) {
@@ -26,7 +29,7 @@ function getRelativePath(targetPath: string, rootPath: string) {
   return normalizedTarget.slice(normalizedRoot.length + 1).replace(/\//g, sep);
 }
 
-function TreeNode({ entry, projectRoot, depth }: TreeNodeProps) {
+function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff }: TreeNodeProps) {
   const [expanded, setExpanded] = useState(false);
   const [children, setChildren] = useState<FileEntry[]>([]);
 
@@ -39,7 +42,14 @@ function TreeNode({ entry, projectRoot, depth }: TreeNodeProps) {
   }, [entry.path, projectRoot]);
 
   const handleToggle = useCallback(async () => {
-    if (!entry.isDir) return;
+    if (!entry.isDir) {
+      const rel = getRelativePath(entry.path, projectRoot).replace(/\\/g, '/');
+      const fileStatus = gitStatusMap.get(rel);
+      if (fileStatus) {
+        onViewDiff(fileStatus);
+      }
+      return;
+    }
     if (!expanded) {
       await loadChildren();
       invoke('watch_directory', { path: entry.path, projectPath: projectRoot });
@@ -47,7 +57,7 @@ function TreeNode({ entry, projectRoot, depth }: TreeNodeProps) {
       invoke('unwatch_directory', { path: entry.path });
     }
     setExpanded(!expanded);
-  }, [entry, expanded, loadChildren, projectRoot]);
+  }, [entry, expanded, loadChildren, projectRoot, gitStatusMap, onViewDiff]);
 
   useTauriEvent<FsChangePayload>('fs-change', useCallback((payload: FsChangePayload) => {
     if (expanded && payload.path.startsWith(entry.path)) {
@@ -113,6 +123,16 @@ function TreeNode({ entry, projectRoot, depth }: TreeNodeProps) {
               },
             });
           }
+          // 查看变更菜单项
+          const relForGit = getRelativePath(entry.path, projectRoot).replace(/\\/g, '/');
+          const entryGitStatus = gitStatusMap.get(relForGit);
+          if (entryGitStatus && !entry.isDir) {
+            items.push({ separator: true });
+            items.push({
+              label: '查看变更',
+              onClick: () => onViewDiff(entryGitStatus),
+            });
+          }
           showContextMenu(e.clientX, e.clientY, items);
         }}
         draggable
@@ -129,11 +149,52 @@ function TreeNode({ entry, projectRoot, depth }: TreeNodeProps) {
         )}
         {!entry.isDir && <span className="w-3 text-center text-[var(--text-muted)] text-xs">·</span>}
         <span className="truncate">{entry.name}</span>
+        {(() => {
+          const rel = getRelativePath(entry.path, projectRoot).replace(/\\/g, '/');
+          const fileStatus = gitStatusMap.get(rel);
+          if (fileStatus) {
+            return (
+              <span className="ml-1 text-xs text-[var(--text-muted)] opacity-60 flex-shrink-0">
+                {fileStatus.statusLabel}
+              </span>
+            );
+          }
+          if (entry.isDir) {
+            const prefix = rel.endsWith('/') ? rel : rel + '/';
+            const PRIORITY: Record<string, number> = { C: 6, D: 5, M: 4, A: 3, R: 2, '?': 1 };
+            let bestLabel = '';
+            let bestPriority = 0;
+            for (const [path, s] of gitStatusMap) {
+              if (path.startsWith(prefix)) {
+                const p = PRIORITY[s.statusLabel] ?? 0;
+                if (p > bestPriority) {
+                  bestPriority = p;
+                  bestLabel = s.statusLabel;
+                }
+              }
+            }
+            if (bestLabel) {
+              return (
+                <span className="ml-1 text-xs text-[var(--text-muted)] opacity-40 flex-shrink-0">
+                  {bestLabel}
+                </span>
+              );
+            }
+          }
+          return null;
+        })()}
       </div>
 
       {expanded &&
         children.map((child) => (
-          <TreeNode key={child.path} entry={child} projectRoot={projectRoot} depth={depth + 1} />
+          <TreeNode
+            key={child.path}
+            entry={child}
+            projectRoot={projectRoot}
+            depth={depth + 1}
+            gitStatusMap={gitStatusMap}
+            onViewDiff={onViewDiff}
+          />
         ))}
     </div>
   );
@@ -145,6 +206,29 @@ export function FileTree() {
   const project = config.projects.find((p) => p.id === activeProjectId);
 
   const [rootEntries, setRootEntries] = useState<FileEntry[]>([]);
+  const [gitStatusMap, setGitStatusMap] = useState<Map<string, GitFileStatus>>(new Map());
+  const [diffTarget, setDiffTarget] = useState<GitFileStatus | null>(null);
+  const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const loadGitStatus = useCallback(() => {
+    if (!project) return;
+    invoke<GitFileStatus[]>('get_git_status', { projectPath: project.path })
+      .then((statuses) => {
+        const map = new Map<string, GitFileStatus>();
+        for (const s of statuses) map.set(s.path, s);
+        setGitStatusMap(map);
+      })
+      .catch(() => setGitStatusMap(new Map()));
+  }, [project?.path]);
+
+  useEffect(() => {
+    loadGitStatus();
+  }, [loadGitStatus]);
+
+  const debouncedRefresh = useCallback(() => {
+    if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
+    refreshTimerRef.current = setTimeout(loadGitStatus, 500);
+  }, [loadGitStatus]);
 
   const loadRootEntries = useCallback(() => {
     if (!project) return;
@@ -169,6 +253,23 @@ export function FileTree() {
       loadRootEntries();
     }
   }, [project?.path, loadRootEntries]));
+
+  useTauriEvent<FsChangePayload>('fs-change', useCallback((payload: FsChangePayload) => {
+    if (project && payload.projectPath === project.path) {
+      debouncedRefresh();
+    }
+  }, [project?.path, debouncedRefresh]));
+
+  const GIT_PATTERNS = [/create mode/, /Switched to/, /Already up to date/, /insertions?\(\+\)/, /deletions?\(-\)/];
+  useTauriEvent<PtyOutputPayload>('pty-output', useCallback((payload: PtyOutputPayload) => {
+    if (GIT_PATTERNS.some((p) => p.test(payload.data))) {
+      debouncedRefresh();
+    }
+  }, [debouncedRefresh]));
+
+  const handleViewDiff = useCallback((status: GitFileStatus) => {
+    setDiffTarget(status);
+  }, []);
 
   const handleRootContextMenu = useCallback((e: React.MouseEvent) => {
     if (!project) return;
@@ -211,9 +312,24 @@ export function FileTree() {
       </div>
       <div className="flex-1 px-1" onContextMenu={handleRootContextMenu}>
         {rootEntries.map((entry) => (
-          <TreeNode key={entry.path} entry={entry} projectRoot={project.path} depth={0} />
+          <TreeNode
+            key={entry.path}
+            entry={entry}
+            projectRoot={project.path}
+            depth={0}
+            gitStatusMap={gitStatusMap}
+            onViewDiff={handleViewDiff}
+          />
         ))}
       </div>
+      {diffTarget && (
+        <DiffModal
+          open={!!diffTarget}
+          onClose={() => setDiffTarget(null)}
+          projectPath={project.path}
+          status={diffTarget}
+        />
+      )}
     </div>
   );
 }
