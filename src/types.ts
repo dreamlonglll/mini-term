@@ -1,7 +1,16 @@
 // === 配置持久化 ===
 
+export interface ProjectGroup {
+  id: string;
+  name: string;
+  collapsed: boolean;
+  projectIds: string[];
+}
+
 export interface AppConfig {
   projects: ProjectConfig[];
+  projectGroups?: ProjectGroup[];
+  projectOrdering?: string[];
   defaultShell: string;
   availableShells: ShellConfig[];
   uiFontSize: number;

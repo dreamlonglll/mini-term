@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import type {
   AppConfig,
   ProjectConfig,
+  ProjectGroup,
   ProjectState,
   TerminalTab,
   SplitNode,
@@ -180,6 +181,61 @@ export function flushLayoutToConfig(projectId: string) {
   doSaveLayout(projectId);
 }
 
+// 渲染列表项类型
+export type OrderedItem =
+  | { type: 'project'; project: ProjectConfig }
+  | { type: 'group'; group: ProjectGroup; projects: ProjectConfig[] };
+
+// 从 config 计算侧栏渲染列表
+export function getOrderedItems(config: AppConfig): OrderedItem[] {
+  const { projects, projectGroups, projectOrdering } = config;
+  if (!projectOrdering || projectOrdering.length === 0) {
+    return projects.map((p) => ({ type: 'project', project: p }));
+  }
+
+  const projectMap = new Map(projects.map((p) => [p.id, p]));
+  const groupMap = new Map((projectGroups ?? []).map((g) => [g.id, g]));
+  const seen = new Set<string>();
+  const result: OrderedItem[] = [];
+
+  for (const itemId of projectOrdering) {
+    const group = groupMap.get(itemId);
+    if (group) {
+      seen.add(itemId);
+      const groupProjects = group.projectIds
+        .map((pid) => projectMap.get(pid))
+        .filter((p): p is ProjectConfig => !!p);
+      groupProjects.forEach((p) => seen.add(p.id));
+      result.push({ type: 'group', group, projects: groupProjects });
+    } else {
+      const project = projectMap.get(itemId);
+      if (project) {
+        seen.add(itemId);
+        result.push({ type: 'project', project });
+      }
+    }
+  }
+
+  // 追加不在 ordering 中的项目（新添加的项目）
+  for (const p of projects) {
+    if (!seen.has(p.id)) {
+      result.push({ type: 'project', project: p });
+    }
+  }
+
+  return result;
+}
+
+// 确保 ordering 已初始化
+function ensureOrdering(config: AppConfig): AppConfig {
+  if (config.projectOrdering && config.projectOrdering.length > 0) return config;
+  return {
+    ...config,
+    projectOrdering: config.projects.map((p) => p.id),
+    projectGroups: config.projectGroups ?? [],
+  };
+}
+
 interface AppStore {
   // 配置
   config: AppConfig;
@@ -201,6 +257,14 @@ interface AppStore {
   // Pane 状态
   updatePaneStatusByPty: (ptyId: number, status: PaneStatus) => void;
 
+  // 分组
+  createGroup: (name: string) => void;
+  removeGroup: (groupId: string) => void;
+  renameGroup: (groupId: string, name: string) => void;
+  toggleGroupCollapse: (groupId: string) => void;
+  moveProjectToGroup: (projectId: string, groupId: string, index?: number) => void;
+  moveProjectOutOfGroup: (projectId: string, insertAfter?: string) => void;
+  reorderItems: (ordering: string[]) => void;
 }
 
 export const useAppStore = create<AppStore>((set) => ({
@@ -220,7 +284,14 @@ export const useAppStore = create<AppStore>((set) => ({
 
   addProject: (project) =>
     set((state) => {
-      const newConfig = { ...state.config, projects: [...state.config.projects, project] };
+      const newConfig = {
+        ...state.config,
+        projects: [...state.config.projects, project],
+        // 如果 ordering 已初始化，追加新项目
+        projectOrdering: state.config.projectOrdering
+          ? [...state.config.projectOrdering, project.id]
+          : undefined,
+      };
       const newStates = new Map(state.projectStates);
       newStates.set(project.id, { id: project.id, tabs: [], activeTabId: '' });
       return {
@@ -235,6 +306,11 @@ export const useAppStore = create<AppStore>((set) => ({
       const newConfig = {
         ...state.config,
         projects: state.config.projects.filter((p) => p.id !== id),
+        projectOrdering: state.config.projectOrdering?.filter((item) => item !== id),
+        projectGroups: state.config.projectGroups?.map((g) => ({
+          ...g,
+          projectIds: g.projectIds.filter((pid) => pid !== id),
+        })),
       };
       const newStates = new Map(state.projectStates);
       newStates.delete(id);
@@ -322,5 +398,101 @@ export const useAppStore = create<AppStore>((set) => ({
       }
       return changed ? { projectStates: newStates } : state;
     }),
+
+  createGroup: (name) =>
+    set((state) => {
+      const config = ensureOrdering(state.config);
+      const group: ProjectGroup = { id: genId(), name, collapsed: false, projectIds: [] };
+      return {
+        config: {
+          ...config,
+          projectGroups: [...(config.projectGroups ?? []), group],
+          projectOrdering: [...(config.projectOrdering ?? []), group.id],
+        },
+      };
+    }),
+
+  removeGroup: (groupId) =>
+    set((state) => {
+      const groups = state.config.projectGroups ?? [];
+      const group = groups.find((g) => g.id === groupId);
+      if (!group) return state;
+      const ordering = state.config.projectOrdering ?? [];
+      const idx = ordering.indexOf(groupId);
+      // 将分组内的项目释放到 ordering 中原分组位置
+      const newOrdering = [...ordering];
+      if (idx >= 0) {
+        newOrdering.splice(idx, 1, ...group.projectIds);
+      }
+      return {
+        config: {
+          ...state.config,
+          projectGroups: groups.filter((g) => g.id !== groupId),
+          projectOrdering: newOrdering,
+        },
+      };
+    }),
+
+  renameGroup: (groupId, name) =>
+    set((state) => ({
+      config: {
+        ...state.config,
+        projectGroups: (state.config.projectGroups ?? []).map((g) =>
+          g.id === groupId ? { ...g, name } : g
+        ),
+      },
+    })),
+
+  toggleGroupCollapse: (groupId) =>
+    set((state) => ({
+      config: {
+        ...state.config,
+        projectGroups: (state.config.projectGroups ?? []).map((g) =>
+          g.id === groupId ? { ...g, collapsed: !g.collapsed } : g
+        ),
+      },
+    })),
+
+  moveProjectToGroup: (projectId, groupId, index) =>
+    set((state) => {
+      const config = ensureOrdering(state.config);
+      // 从 ordering 顶层移除（如果在顶层）
+      const newOrdering = (config.projectOrdering ?? []).filter((id) => id !== projectId);
+      // 从所有分组中移除
+      const newGroups = (config.projectGroups ?? []).map((g) => {
+        if (g.id === groupId) {
+          const ids = g.projectIds.filter((pid) => pid !== projectId);
+          const insertIdx = index !== undefined ? Math.min(index, ids.length) : ids.length;
+          ids.splice(insertIdx, 0, projectId);
+          return { ...g, projectIds: ids };
+        }
+        return { ...g, projectIds: g.projectIds.filter((pid) => pid !== projectId) };
+      });
+      return { config: { ...config, projectOrdering: newOrdering, projectGroups: newGroups } };
+    }),
+
+  moveProjectOutOfGroup: (projectId, insertAfter) =>
+    set((state) => {
+      const config = ensureOrdering(state.config);
+      // 从所有分组中移除
+      const newGroups = (config.projectGroups ?? []).map((g) => ({
+        ...g,
+        projectIds: g.projectIds.filter((pid) => pid !== projectId),
+      }));
+      // 插入到 ordering 中
+      const newOrdering = (config.projectOrdering ?? []).filter((id) => id !== projectId);
+      if (insertAfter) {
+        const idx = newOrdering.indexOf(insertAfter);
+        newOrdering.splice(idx >= 0 ? idx + 1 : newOrdering.length, 0, projectId);
+      } else {
+        newOrdering.push(projectId);
+      }
+      return { config: { ...config, projectOrdering: newOrdering, projectGroups: newGroups } };
+    }),
+
+  reorderItems: (ordering) =>
+    set((state) => ({
+      config: { ...state.config, projectOrdering: ordering },
+    })),
 
 }));

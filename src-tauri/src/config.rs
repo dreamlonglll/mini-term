@@ -5,8 +5,21 @@ use tauri::{AppHandle, Manager};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ProjectGroup {
+    pub id: String,
+    pub name: String,
+    pub collapsed: bool,
+    pub project_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AppConfig {
     pub projects: Vec<ProjectConfig>,
+    #[serde(default)]
+    pub project_groups: Option<Vec<ProjectGroup>>,
+    #[serde(default)]
+    pub project_ordering: Option<Vec<String>>,
     pub default_shell: String,
     pub available_shells: Vec<ShellConfig>,
     #[serde(default = "default_ui_font_size")]
@@ -74,6 +87,8 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             projects: vec![],
+            project_groups: None,
+            project_ordering: None,
             default_shell: default_shell_name(),
             available_shells: default_shells(),
             ui_font_size: default_ui_font_size(),
@@ -180,6 +195,20 @@ mod tests {
         let config: AppConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.projects.len(), 1);
         assert!(config.projects[0].saved_layout.is_none());
+    }
+
+    #[test]
+    fn old_config_without_groups_deserializes() {
+        let json = r#"{
+            "projects": [{"id": "1", "name": "test", "path": "/tmp"}],
+            "defaultShell": "cmd",
+            "availableShells": [{"name": "cmd", "command": "cmd"}],
+            "uiFontSize": 13,
+            "terminalFontSize": 14
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert!(config.project_groups.is_none());
+        assert!(config.project_ordering.is_none());
     }
 
     #[test]

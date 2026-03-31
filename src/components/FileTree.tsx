@@ -146,16 +146,55 @@ export function FileTree() {
 
   const [rootEntries, setRootEntries] = useState<FileEntry[]>([]);
 
-  useEffect(() => {
-    if (!project) {
-      setRootEntries([]);
-      return;
-    }
+  const loadRootEntries = useCallback(() => {
+    if (!project) return;
     invoke<FileEntry[]>('list_directory', {
       projectRoot: project.path,
       path: project.path,
     }).then(setRootEntries);
   }, [project?.path]);
+
+  useEffect(() => {
+    if (!project) {
+      setRootEntries([]);
+      return;
+    }
+    loadRootEntries();
+    invoke('watch_directory', { path: project.path, projectPath: project.path });
+    return () => { invoke('unwatch_directory', { path: project.path }); };
+  }, [project?.path, loadRootEntries]);
+
+  useTauriEvent<FsChangePayload>('fs-change', useCallback((payload: FsChangePayload) => {
+    if (project && payload.path === project.path) {
+      loadRootEntries();
+    }
+  }, [project?.path, loadRootEntries]));
+
+  const handleRootContextMenu = useCallback((e: React.MouseEvent) => {
+    if (!project) return;
+    e.preventDefault();
+    const sep = project.path.includes('/') ? '/' : '\\';
+    showContextMenu(e.clientX, e.clientY, [
+      {
+        label: '新建文件',
+        onClick: async () => {
+          const name = await showPrompt('新建文件', '请输入文件名');
+          if (!name?.trim()) return;
+          await invoke('create_file', { path: `${project.path}${sep}${name.trim()}` });
+          loadRootEntries();
+        },
+      },
+      {
+        label: '新建文件夹',
+        onClick: async () => {
+          const name = await showPrompt('新建文件夹', '请输入文件夹名');
+          if (!name?.trim()) return;
+          await invoke('create_directory', { path: `${project.path}${sep}${name.trim()}` });
+          loadRootEntries();
+        },
+      },
+    ]);
+  }, [project, loadRootEntries]);
 
   if (!project) {
     return (
@@ -170,7 +209,7 @@ export function FileTree() {
       <div className="px-3 pt-3 pb-1.5 text-sm text-[var(--text-muted)] uppercase tracking-[0.12em] font-medium">
         Files — {project.name}
       </div>
-      <div className="flex-1 px-1">
+      <div className="flex-1 px-1" onContextMenu={handleRootContextMenu}>
         {rootEntries.map((entry) => (
           <TreeNode key={entry.path} entry={entry} projectRoot={project.path} depth={0} />
         ))}
