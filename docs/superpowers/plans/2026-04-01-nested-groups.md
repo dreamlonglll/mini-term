@@ -19,7 +19,6 @@
 | 修改 | `src/types.ts` | 新增 `ProjectTreeItem`，改造 `ProjectGroup`，`AppConfig` 新增 `projectTree` |
 | 新建 | `src/utils/projectTree.ts` | 树操作纯函数（getDepth, removeFromTree, insertIntoTree, getSubtreeMaxDepth, isDescendant, canDrop, canDropAt, getOrderedTree, migrateToTree, collectAllGroups, findGroupInTree, deepCloneTree） |
 | 修改 | `src/store.ts` | 移除旧分组 actions，新增树操作 actions，导入 projectTree 工具函数 |
-| 修改 | `src/utils/dragState.ts` | DragPayload 新增 `subtreeDepth` 缓存字段 |
 | 修改 | `src/components/ProjectList.tsx` | 嵌套渲染、深度缩进、拖拽校验、右键菜单增强 |
 | 修改 | `src-tauri/src/config.rs` | `ProjectTreeItem` enum、`ProjectGroup` 改 children、迁移逻辑 |
 
@@ -400,28 +399,29 @@ export function removeFromTree(tree: ProjectTreeItem[], id: string): ProjectTree
   return null;
 }
 
-/** 插入节点到指定组内（targetGroupId 为 null 表示根级别） */
+/** 插入节点到指定组内（targetGroupId 为 null 表示根级别），返回是否成功 */
 export function insertIntoTree(
   tree: ProjectTreeItem[],
   targetGroupId: string | null,
   item: ProjectTreeItem,
   index?: number,
-): void {
+): boolean {
   if (targetGroupId === null) {
     const idx = index !== undefined ? Math.min(index, tree.length) : tree.length;
     tree.splice(idx, 0, item);
-    return;
+    return true;
   }
   for (const node of tree) {
     if (isGroup(node) && node.id === targetGroupId) {
       const idx = index !== undefined ? Math.min(index, node.children.length) : node.children.length;
       node.children.splice(idx, 0, item);
-      return;
+      return true;
     }
     if (isGroup(node)) {
-      insertIntoTree(node.children, targetGroupId, item, index);
+      if (insertIntoTree(node.children, targetGroupId, item, index)) return true;
     }
   }
+  return false;
 }
 
 /** 在树中查找组并更新 */
@@ -830,32 +830,7 @@ git commit -m "refactor: store 从扁平分组迁移到树操作模型"
 
 ---
 
-### Task 5: DragState 更新
-
-**Files:**
-- Modify: `src/utils/dragState.ts:1-4`
-
-- [ ] **Step 1: 更新 DragPayload 类型**
-
-```typescript
-export type DragPayload =
-  | { type: 'tab'; tabId: string }
-  | { type: 'project'; projectId: string }
-  | { type: 'group'; groupId: string; subtreeDepth: number };
-```
-
-`subtreeDepth` 在拖拽开始时预计算并缓存，避免 dragOver 频繁重算。
-
-- [ ] **Step 2: 提交**
-
-```bash
-git add src/utils/dragState.ts
-git commit -m "feat: DragPayload 新增 subtreeDepth 缓存"
-```
-
----
-
-### Task 6: ProjectList 组件重写
+### Task 5: ProjectList 组件重写
 
 **Files:**
 - Modify: `src/components/ProjectList.tsx`
@@ -895,6 +870,19 @@ const moveItem = useAppStore((s) => s.moveItem);
 
 移除 `moveProjectToGroup`、`moveProjectOutOfGroup`、`reorderItems` 的引用。
 
+更新 `renderDropLine` 在 `forbidden` 时不显示：
+
+```typescript
+const renderDropLine = (id: string, position: 'before' | 'after') => {
+  if (dropIndicator?.id !== id || dropIndicator.position !== position) return null;
+  if (dropIndicator.forbidden) return null;
+  return (
+    <div className="absolute left-1 right-1 h-0.5 bg-[var(--accent)] rounded-full z-10"
+      style={position === 'before' ? { top: -1 } : { bottom: -1 }} />
+  );
+};
+```
+
 更新 `orderedItems`：
 ```typescript
 const orderedItems = getOrderedTree(config);
@@ -910,10 +898,10 @@ const allGroups = collectAllGroups(config.projectTree ?? []);
 **handleGroupDragStart** — 缓存子树深度：
 
 ```typescript
-const handleGroupDragStart = useCallback((e: React.DragEvent, groupId: string, group: ProjectGroup) => {
+const handleGroupDragStart = useCallback((e: React.DragEvent, groupId: string) => {
   e.dataTransfer.setData('application/group-id', groupId);
   e.dataTransfer.effectAllowed = 'move';
-  setDragPayload({ type: 'group', groupId, subtreeDepth: getSubtreeMaxDepth(group) });
+  setDragPayload({ type: 'group', groupId });
   requestAnimationFrame(() => {
     (e.target as HTMLElement).style.opacity = '0.4';
   });
@@ -1017,7 +1005,15 @@ const handleDrop = useCallback((e: React.DragEvent, targetId: string, targetCont
     const targetIdx = parent.findIndex((item) =>
       (typeof item === 'string' ? item : item.id) === targetId
     );
-    const insertIdx = indicator.position === 'after' ? targetIdx + 1 : targetIdx;
+    let insertIdx = indicator.position === 'after' ? targetIdx + 1 : targetIdx;
+    // 修正 off-by-one：如果被拖拽项在同一父级且在目标之前，
+    // moveItem 内部 removeFromTree 后索引会下移 1
+    const draggedIdx = parent.findIndex((item) =>
+      (typeof item === 'string' ? item : item.id) === itemId
+    );
+    if (draggedIdx >= 0 && draggedIdx < insertIdx) {
+      insertIdx--;
+    }
     moveItem(itemId, parentGroupId ?? null, insertIdx);
   }
   saveConfig();
@@ -1072,7 +1068,7 @@ const renderGroup = (group: ProjectGroup, depth: number) => {
 
   return (
     <div key={group.id} className="relative" style={{ paddingLeft: `${depth * 16}px` }}>
-      {/* ... 组头部 */}
+      {renderDropLine(group.id, 'before')}
       <div
         className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-[var(--radius-sm)] cursor-pointer text-sm transition-all duration-150 select-none ${
           isForbidden
@@ -1082,7 +1078,7 @@ const renderGroup = (group: ProjectGroup, depth: number) => {
               : 'text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--border-subtle)]'
         }`}
         draggable={!isEditing}
-        onDragStart={(e) => handleGroupDragStart(e, group.id, group)}
+        onDragStart={(e) => handleGroupDragStart(e, group.id)}
         onDragEnd={handleDragEnd}
         onDragOver={(e) => handleDragOver(e, group.id, true)}
         onDragLeave={handleDragLeave}
@@ -1115,7 +1111,7 @@ const renderGroup = (group: ProjectGroup, depth: number) => {
         {/* ... 折叠箭头、名称、计数 */}
         <span className="text-xs text-[var(--text-muted)]">({projectCount})</span>
       </div>
-      {/* children 不再由外部传入，组件从 orderedItems 的 depth 自然处理 */}
+      {renderDropLine(group.id, 'after')}
     </div>
   );
 };
@@ -1152,7 +1148,7 @@ git commit -m "feat: ProjectList 支持嵌套组渲染、深度校验和拖拽"
 
 ---
 
-### Task 7: 集成测试与验收
+### Task 6: 集成测试与验收
 
 **Files:**
 - 无新文件
