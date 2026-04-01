@@ -344,6 +344,12 @@ export function ProjectList() {
             const menuItems: Parameters<typeof showContextMenu>[2] = [
               { label: '重命名分组', onClick: () => startRenameGroup(group.id, group.name) },
             ];
+            if (depth > 0) {
+              menuItems.push({
+                label: '移出分组',
+                onClick: () => { moveItem(group.id, null); saveConfig(); },
+              });
+            }
             if (groupDepth < MAX_DEPTH - 1) {
               menuItems.push({
                 label: '新建子组',
