@@ -1,6 +1,8 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { Allotment } from 'allotment';
 import { invoke } from '@tauri-apps/api/core';
+import { getVersion } from '@tauri-apps/api/app';
+import { openUrl } from '@tauri-apps/plugin-opener';
 import { useAppStore, restoreLayout, flushLayoutToConfig, initExpandedDirs, flushExpandedDirsToConfig } from './store';
 import { TerminalArea } from './components/TerminalArea';
 import { ProjectList } from './components/ProjectList';
@@ -8,10 +10,14 @@ import { FileTree } from './components/FileTree';
 import { GitHistory } from './components/GitHistory';
 import { SettingsModal } from './components/SettingsModal';
 import { useTauriEvent } from './hooks/useTauriEvent';
+import { checkForUpdate, type ReleaseInfo } from './utils/updateChecker';
 import type { AppConfig, PtyStatusChangePayload, PtyExitPayload, PaneStatus } from './types';
 
 export function App() {
   const [configOpen, setConfigOpen] = useState(false);
+  const [currentVersion, setCurrentVersion] = useState('');
+  const [updateInfo, setUpdateInfo] = useState<ReleaseInfo | null>(null);
+  const [showUpdateDialog, setShowUpdateDialog] = useState(false);
   const activeProjectId = useAppStore((s) => s.activeProjectId);
   const config = useAppStore((s) => s.config);
   const setConfig = useAppStore((s) => s.setConfig);
@@ -47,6 +53,19 @@ export function App() {
           .filter((p) => p.savedLayout && p.savedLayout.tabs.length > 0)
           .map((p) => restoreLayout(p.id, p.savedLayout!, p.path, cfg))
       ).catch(console.error);
+    });
+  }, []);
+
+  // 启动时获取版本号并检查更新
+  useEffect(() => {
+    getVersion().then((ver) => {
+      setCurrentVersion(ver);
+      checkForUpdate(ver).then((release) => {
+        if (release) {
+          setUpdateInfo(release);
+          setShowUpdateDialog(true);
+        }
+      }).catch(() => {});
     });
   }, []);
 
@@ -113,6 +132,19 @@ export function App() {
         <span className="font-semibold tracking-wide text-[var(--accent)] text-sm" style={{ fontFamily: "'DM Sans', sans-serif", letterSpacing: '0.05em' }}>
           MINI-TERM
         </span>
+        {currentVersion && (
+          <span className="text-[10px] text-[var(--text-muted)] font-mono">v{currentVersion}</span>
+        )}
+        {updateInfo && (
+          <span
+            className="text-[10px] px-1.5 py-0.5 rounded-full bg-[var(--accent)]/15 text-[var(--accent)] cursor-pointer hover:bg-[var(--accent)]/25 transition-colors"
+            style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
+            onClick={() => setShowUpdateDialog(true)}
+            title={`新版本 ${updateInfo.version} 可用`}
+          >
+            新版本 {updateInfo.version}
+          </span>
+        )}
         <div className="w-px h-3.5 bg-[var(--border-default)]" />
         <div className="flex items-center gap-3 text-[var(--text-muted)]" style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}>
           <span className="cursor-pointer hover:text-[var(--text-primary)] transition-colors duration-150" onClick={() => setConfigOpen(true)}>设置</span>
@@ -165,6 +197,38 @@ export function App() {
         </Allotment>
       </div>
       <SettingsModal open={configOpen} onClose={() => setConfigOpen(false)} />
+
+      {/* 新版本提示弹框 */}
+      {showUpdateDialog && updateInfo && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={() => setShowUpdateDialog(false)}>
+          <div className="bg-[var(--bg-elevated)] border border-[var(--border-default)] rounded-[var(--radius-lg)] p-6 w-80 shadow-xl" onClick={(e) => e.stopPropagation()}>
+            <div className="text-sm font-medium text-[var(--text-primary)] mb-3">发现新版本</div>
+            <div className="flex items-center gap-2 mb-2">
+              <span className="text-xs text-[var(--text-muted)]">当前版本</span>
+              <span className="font-mono text-xs text-[var(--text-secondary)]">v{currentVersion}</span>
+              <span className="text-[var(--text-muted)]">→</span>
+              <span className="font-mono text-xs text-[var(--accent)]">{updateInfo.version}</span>
+            </div>
+            <div className="text-[11px] text-[var(--text-muted)] mb-4">
+              发布于 {new Date(updateInfo.publishedAt).toLocaleDateString('zh-CN')}
+            </div>
+            <div className="flex gap-2">
+              <button
+                className="flex-1 py-1.5 text-xs border border-[var(--border-default)] rounded-[var(--radius-sm)] text-[var(--text-secondary)] hover:border-[var(--text-muted)] transition-colors"
+                onClick={() => setShowUpdateDialog(false)}
+              >
+                稍后再说
+              </button>
+              <button
+                className="flex-1 py-1.5 text-xs bg-[var(--accent)] text-[var(--bg-base)] rounded-[var(--radius-sm)] font-medium hover:opacity-90 transition-opacity"
+                onClick={() => { openUrl(updateInfo.url); setShowUpdateDialog(false); }}
+              >
+                前往下载
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

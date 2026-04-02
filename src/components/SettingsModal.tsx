@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { getVersion } from '@tauri-apps/api/app';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { useAppStore } from '../store';
+import { checkForUpdate, compareVersions, type ReleaseInfo } from '../utils/updateChecker';
 import type { ShellConfig } from '../types';
 
 interface Props {
@@ -353,24 +354,6 @@ function SystemSettings() {
 
 // ─── AboutSettings（关于页）───
 
-const GITHUB_REPO = 'dreamlonglll/mini-term';
-
-interface ReleaseInfo {
-  version: string;
-  url: string;
-  publishedAt: string;
-}
-
-function compareVersions(a: string, b: string): number {
-  const pa = a.replace(/^v/, '').split('.').map(Number);
-  const pb = b.replace(/^v/, '').split('.').map(Number);
-  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-    const diff = (pa[i] ?? 0) - (pb[i] ?? 0);
-    if (diff !== 0) return diff;
-  }
-  return 0;
-}
-
 function AboutSettings() {
   const [currentVersion, setCurrentVersion] = useState('');
   const [latest, setLatest] = useState<ReleaseInfo | null>(null);
@@ -386,20 +369,19 @@ function AboutSettings() {
     setError('');
     setLatest(null);
     try {
-      const resp = await fetch(`https://api.github.com/repos/${GITHUB_REPO}/releases/latest`);
-      if (!resp.ok) throw new Error(resp.status === 404 ? '暂无发布版本' : `请求失败 (${resp.status})`);
-      const data = await resp.json();
-      setLatest({
-        version: data.tag_name,
-        url: data.html_url,
-        publishedAt: data.published_at,
-      });
+      const release = await checkForUpdate(currentVersion);
+      if (release) {
+        setLatest(release);
+      } else {
+        // 没有新版本，仍显示当前为最新
+        setLatest({ version: currentVersion, url: '', publishedAt: '' });
+      }
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : '检查失败，请稍后重试');
     } finally {
       setChecking(false);
     }
-  }, []);
+  }, [currentVersion]);
 
   const hasUpdate = latest && compareVersions(latest.version, currentVersion) > 0;
 
