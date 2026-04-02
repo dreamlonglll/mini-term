@@ -311,6 +311,8 @@ export const useAppStore = create<AppStore>((set) => ({
     availableShells: [],
     uiFontSize: 13,
     terminalFontSize: 14,
+    theme: 'auto',
+    terminalFollowTheme: true,
   },
   setConfig: (config) => set({ config }),
 

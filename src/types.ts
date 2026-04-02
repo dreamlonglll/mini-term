@@ -21,6 +21,8 @@ export interface AppConfig {
   terminalFontSize: number;
   layoutSizes?: number[];
   middleColumnSizes?: number[];
+  theme: 'auto' | 'light' | 'dark';
+  terminalFollowTheme: boolean;
 }
 
 export interface ProjectConfig {
