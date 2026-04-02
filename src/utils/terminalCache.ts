@@ -16,6 +16,7 @@ import { listen } from '@tauri-apps/api/event';
 import { readText, writeText } from '@tauri-apps/plugin-clipboard-manager';
 import { useAppStore } from '../store';
 import type { PtyOutputPayload } from '../types';
+import { getResolvedTheme } from './themeManager';
 
 export interface CachedTerminal {
   term: Terminal;
@@ -25,6 +26,63 @@ export interface CachedTerminal {
 
 interface CachedEntry extends CachedTerminal {
   cleanup: () => void;
+}
+
+export const DARK_TERMINAL_THEME = {
+  background: '#100f0d',
+  foreground: '#d8d4cc',
+  cursor: '#c8805a',
+  cursorAccent: '#100f0d',
+  selectionBackground: '#c8805a30',
+  selectionForeground: '#e5e0d8',
+  black: '#2a2824',
+  red: '#d4605a',
+  green: '#6bb87a',
+  yellow: '#d4a84a',
+  blue: '#6896c8',
+  magenta: '#b08cd4',
+  cyan: '#7dcfb8',
+  white: '#d8d4cc',
+  brightBlack: '#5c5850',
+  brightRed: '#e07060',
+  brightGreen: '#80d090',
+  brightYellow: '#e0b860',
+  brightBlue: '#80aad8',
+  brightMagenta: '#c0a0e0',
+  brightCyan: '#90e0c8',
+  brightWhite: '#e5e0d8',
+};
+
+export const LIGHT_TERMINAL_THEME = {
+  background: '#fafafa',
+  foreground: '#1a1a1a',
+  cursor: '#b06830',
+  cursorAccent: '#fafafa',
+  selectionBackground: '#b0683030',
+  selectionForeground: '#1a1a1a',
+  black: '#1a1a1a',
+  red: '#c0392b',
+  green: '#2d8a46',
+  yellow: '#b08620',
+  blue: '#2860a0',
+  magenta: '#8a5cb8',
+  cyan: '#1a8a6a',
+  white: '#f0f0f0',
+  brightBlack: '#666666',
+  brightRed: '#e04030',
+  brightGreen: '#38a058',
+  brightYellow: '#c89830',
+  brightBlue: '#3870b8',
+  brightMagenta: '#a070d0',
+  brightCyan: '#28a080',
+  brightWhite: '#ffffff',
+};
+
+export function getTerminalTheme(terminalFollowTheme: boolean): typeof DARK_TERMINAL_THEME {
+  if (terminalFollowTheme && getResolvedTheme() === 'light') {
+    return LIGHT_TERMINAL_THEME;
+  }
+  return DARK_TERMINAL_THEME;
 }
 
 const cache = new Map<number, CachedEntry>();
@@ -49,30 +107,7 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
     scrollback: 100000,
     letterSpacing: 0,
     lineHeight: 1.35,
-    theme: {
-      background: '#100f0d',
-      foreground: '#d8d4cc',
-      cursor: '#c8805a',
-      cursorAccent: '#100f0d',
-      selectionBackground: '#c8805a30',
-      selectionForeground: '#e5e0d8',
-      black: '#2a2824',
-      red: '#d4605a',
-      green: '#6bb87a',
-      yellow: '#d4a84a',
-      blue: '#6896c8',
-      magenta: '#b08cd4',
-      cyan: '#7dcfb8',
-      white: '#d8d4cc',
-      brightBlack: '#5c5850',
-      brightRed: '#e07060',
-      brightGreen: '#80d090',
-      brightYellow: '#e0b860',
-      brightBlue: '#80aad8',
-      brightMagenta: '#c0a0e0',
-      brightCyan: '#90e0c8',
-      brightWhite: '#e5e0d8',
-    },
+    theme: getTerminalTheme(useAppStore.getState().config.terminalFollowTheme ?? true),
   });
 
   const fitAddon = new FitAddon();
@@ -158,4 +193,11 @@ export function disposeTerminal(ptyId: number): void {
   entry.wrapper.remove();
   entry.cleanup();
   cache.delete(ptyId);
+}
+
+export function updateAllTerminalThemes(terminalFollowTheme: boolean): void {
+  const theme = getTerminalTheme(terminalFollowTheme);
+  for (const entry of cache.values()) {
+    entry.term.options.theme = theme;
+  }
 }

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '../store';
-import { getOrCreateTerminal, getCachedTerminal } from '../utils/terminalCache';
+import { getOrCreateTerminal, getCachedTerminal, getTerminalTheme } from '../utils/terminalCache';
 import '@xterm/xterm/css/xterm.css';
 
 interface Props {
@@ -63,6 +63,18 @@ export function TerminalInstance({ ptyId }: Props) {
     }
   }, [terminalFontSize, ptyId]);
 
+  useEffect(() => {
+    const handler = () => {
+      const cached = getCachedTerminal(ptyId);
+      if (cached) {
+        const { config } = useAppStore.getState();
+        cached.term.options.theme = getTerminalTheme(config.terminalFollowTheme ?? true);
+      }
+    };
+    window.addEventListener('theme-changed', handler);
+    return () => window.removeEventListener('theme-changed', handler);
+  }, [ptyId]);
+
   const handleDragOver = (e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
     e.dataTransfer.dropEffect = 'copy';
@@ -87,7 +99,7 @@ export function TerminalInstance({ ptyId }: Props) {
   return (
     <div className="w-full h-full flex flex-col">
       <div
-        className="flex-1 relative bg-[#100f0d]"
+        className="flex-1 relative bg-[var(--bg-terminal)]"
         onDragOverCapture={handleDragOver}
         onDragLeaveCapture={handleDragLeave}
         onDropCapture={handleDrop}
@@ -97,7 +109,7 @@ export function TerminalInstance({ ptyId }: Props) {
         {fileDrag && (
           <div
             className="absolute inset-1 z-10 flex items-center justify-center pointer-events-none rounded-[var(--radius-md)]"
-            style={{ background: 'rgba(200, 128, 90, 0.06)', border: '2px dashed var(--accent)' }}
+            style={{ background: 'var(--accent-subtle)', border: '2px dashed var(--accent)' }}
           >
             <span className="text-[var(--accent)] text-xs px-3 py-1.5 rounded-[var(--radius-md)]"
               style={{ background: 'var(--bg-overlay)' }}>
