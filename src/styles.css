@@ -33,10 +33,53 @@
   --color-warning: #d4a84a;
   --color-error: #d4605a;
   --color-ai: #b08cd4;
+  --color-info: #6896c8;
+  --diff-add-bg: rgba(60,180,60,0.12);
+  --diff-del-bg: rgba(220,60,60,0.12);
+  --diff-add-text: #6bb87a;
+  --diff-del-text: #d4605a;
+  --color-error-muted: rgba(212, 96, 90, 0.15);
+  --shadow-overlay: 0 8px 32px rgba(0,0,0,0.5), 0 0 1px rgba(255,255,255,0.05);
 
   /* Sizing */
   --radius-sm: 4px;
   --radius-md: 6px;
+}
+
+:root[data-theme="light"] {
+  --bg-base: #ffffff;
+  --bg-surface: #f5f5f5;
+  --bg-elevated: #ebebeb;
+  --bg-overlay: #e0e0e0;
+  --bg-terminal: #fafafa;
+
+  --accent: #b06830;
+  --accent-muted: #b0683033;
+  --accent-subtle: #b0683018;
+
+  --text-primary: #1a1a1a;
+  --text-secondary: #666666;
+  --text-muted: #999999;
+
+  --border-subtle: rgba(0,0,0,0.06);
+  --border-default: rgba(0,0,0,0.10);
+  --border-strong: rgba(0,0,0,0.15);
+
+  --color-file: #1a8a6a;
+  --color-folder: #8a7a40;
+  --color-success: #2d8a46;
+  --color-warning: #b08620;
+  --color-error: #c0392b;
+  --color-ai: #8a5cb8;
+  --color-info: #2860a0;
+
+  --diff-add-bg: rgba(40,140,40,0.10);
+  --diff-del-bg: rgba(200,50,40,0.10);
+  --diff-add-text: #2d8a46;
+  --diff-del-text: #c0392b;
+
+  --color-error-muted: rgba(192, 57, 43, 0.12);
+  --shadow-overlay: 0 8px 32px rgba(0,0,0,0.15), 0 0 1px rgba(0,0,0,0.08);
 }
 
 html, body, #root {
@@ -51,6 +94,8 @@ html, body, #root {
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  transition: background-color 0.25s ease, color 0.25s ease,
+              border-color 0.25s ease, box-shadow 0.25s ease;
 }
 
 /* ===== Subtle noise texture overlay ===== */
@@ -77,12 +122,12 @@ html, body, #root {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.08);
+  background: var(--border-default);
   border-radius: 3px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.15);
+  background: var(--border-strong);
 }
 
 ::-webkit-scrollbar-corner {
@@ -124,11 +169,13 @@ html, body, #root {
   background: var(--bg-overlay);
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-md);
-  box-shadow: 0 8px 32px rgba(0,0,0,0.5), 0 0 1px rgba(255,255,255,0.05);
+  box-shadow: var(--shadow-overlay);
   backdrop-filter: blur(12px);
   padding: 4px;
   z-index: 50;
   animation: slideIn 0.12s ease-out;
+  transition: background-color 0.25s ease, color 0.25s ease,
+              border-color 0.25s ease, box-shadow 0.25s ease;
 }
 
 .ctx-menu-item {
@@ -150,7 +197,7 @@ html, body, #root {
 }
 
 .ctx-menu-item.danger:hover {
-  background: rgba(212, 96, 90, 0.15);
+  background: var(--color-error-muted);
 }
 
 .ctx-menu-sep {
@@ -176,9 +223,11 @@ html, body, #root {
   background: var(--bg-surface);
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-md);
-  box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+  box-shadow: var(--shadow-overlay);
   padding: 20px;
   animation: slideIn 0.12s ease-out;
+  transition: background-color 0.25s ease, color 0.25s ease,
+              border-color 0.25s ease, box-shadow 0.25s ease;
 }
 
 .prompt-title {
@@ -243,4 +292,13 @@ html, body, #root {
 ::selection {
   background: var(--accent-muted);
   color: var(--text-primary);
+}
+
+/* ===== Light theme overrides ===== */
+:root[data-theme="light"] #root::before {
+  opacity: 0.015;
+}
+
+:root[data-theme="light"] .ctx-menu {
+  background: rgba(255, 255, 255, 0.85);
 }
