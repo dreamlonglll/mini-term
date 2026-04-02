@@ -86,7 +86,7 @@ export function ProjectList() {
     const ps = projectStates.get(projectId);
     if (!ps || ps.tabs.length === 0) return 'idle';
     const hasPaneWith = (node: SplitNode, target: PaneStatus): boolean => {
-      if (node.type === 'leaf') return node.pane.status === target;
+      if (node.type === 'leaf') return node.panes.some((p) => p.status === target);
       return node.children.some((c) => hasPaneWith(c, target));
     };
     let hasAiWorking = false;
@@ -150,7 +150,7 @@ export function ProjectList() {
 
   const handleDragOver = useCallback((e: React.DragEvent, targetId: string, allowInside: boolean) => {
     const payload = getDragPayload();
-    if (!payload || payload.type === 'tab') return;
+    if (!payload) return;
     if (
       (payload.type === 'project' && payload.projectId === targetId) ||
       (payload.type === 'group' && payload.groupId === targetId)
@@ -203,7 +203,7 @@ export function ProjectList() {
   const handleDrop = useCallback((e: React.DragEvent, targetId: string) => {
     e.preventDefault();
     const payload = getDragPayload();
-    if (!payload || payload.type === 'tab') return;
+    if (!payload) return;
     const indicator = dropIndicator;
     setDropIndicator(null);
     setDragPayload(null);

@@ -44,7 +44,7 @@ export interface SavedPane {
 }
 
 export type SavedSplitNode =
-  | { type: 'leaf'; pane: SavedPane }
+  | { type: 'leaf'; panes: SavedPane[] }
   | { type: 'split'; direction: 'horizontal' | 'vertical'; children: SavedSplitNode[]; sizes: number[] };
 
 export interface SavedTab {
@@ -75,7 +75,7 @@ export interface TerminalTab {
 }
 
 export type SplitNode =
-  | { type: 'leaf'; pane: PaneState }
+  | { type: 'leaf'; panes: PaneState[]; activePaneId: string }
   | { type: 'split'; direction: 'horizontal' | 'vertical'; children: SplitNode[]; sizes: number[] };
 
 export interface PaneState {

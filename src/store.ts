@@ -7,7 +7,9 @@ import type {
   ProjectState,
   TerminalTab,
   SplitNode,
+  PaneState,
   PaneStatus,
+  SavedPane,
   SavedSplitNode,
   SavedTab,
   SavedProjectLayout,
@@ -35,7 +37,11 @@ const STATUS_PRIORITY: Record<PaneStatus, number> = {
 };
 
 function getHighestStatus(node: SplitNode): PaneStatus {
-  if (node.type === 'leaf') return node.pane.status;
+  if (node.type === 'leaf') {
+    return node.panes.reduce<PaneStatus>((acc, p) => {
+      return STATUS_PRIORITY[p.status] > STATUS_PRIORITY[acc] ? p.status : acc;
+    }, 'idle');
+  }
   return node.children.reduce<PaneStatus>((acc, child) => {
     const s = getHighestStatus(child);
     return STATUS_PRIORITY[s] > STATUS_PRIORITY[acc] ? s : acc;
@@ -45,8 +51,11 @@ function getHighestStatus(node: SplitNode): PaneStatus {
 // 在 SplitNode 中更新指定 pane 的状态
 function updatePaneStatus(node: SplitNode, ptyId: number, status: PaneStatus): SplitNode {
   if (node.type === 'leaf') {
-    if (node.pane.ptyId === ptyId) {
-      return { ...node, pane: { ...node.pane, status } };
+    const idx = node.panes.findIndex((p) => p.ptyId === ptyId);
+    if (idx >= 0) {
+      const newPanes = [...node.panes];
+      newPanes[idx] = { ...newPanes[idx], status };
+      return { ...node, panes: newPanes };
     }
     return node;
   }
@@ -58,14 +67,14 @@ function updatePaneStatus(node: SplitNode, ptyId: number, status: PaneStatus): S
 
 // 收集所有 pane 的 ptyId
 export function collectPtyIds(node: SplitNode): number[] {
-  if (node.type === 'leaf') return [node.pane.ptyId];
+  if (node.type === 'leaf') return node.panes.map((p) => p.ptyId);
   return node.children.flatMap(collectPtyIds);
 }
 
 // 序列化 SplitNode 树（剥离运行时数据）
 function serializeSplitNode(node: SplitNode): SavedSplitNode {
   if (node.type === 'leaf') {
-    return { type: 'leaf', pane: { shellName: node.pane.shellName } };
+    return { type: 'leaf', panes: node.panes.map((p) => ({ shellName: p.shellName })) };
   }
   return {
     type: 'split',
@@ -91,24 +100,33 @@ async function restoreSplitNode(
   config: AppConfig,
 ): Promise<SplitNode | null> {
   if (saved.type === 'leaf') {
-    const shell =
-      config.availableShells.find((s) => s.name === saved.pane.shellName)
-      ?? config.availableShells.find((s) => s.name === config.defaultShell)
-      ?? config.availableShells[0];
-    if (!shell) return null;
-    try {
-      const ptyId = await invoke<number>('create_pty', {
-        shell: shell.command,
-        args: shell.args ?? [],
-        cwd: projectPath,
-      });
-      return {
-        type: 'leaf',
-        pane: { id: genId(), shellName: shell.name, status: 'idle' as PaneStatus, ptyId },
-      };
-    } catch {
-      return null;
+    // Backward compatibility: old format had `pane` (single), new has `panes` (array).
+    // TODO: remove this compat shim once all users have migrated (added in v0.2.0).
+    const savedPanes = saved.panes ?? [((saved as any).pane as SavedPane)].filter(Boolean);
+    const panes: PaneState[] = [];
+    for (const savedPane of savedPanes) {
+      const shell =
+        config.availableShells.find((s) => s.name === savedPane.shellName)
+        ?? config.availableShells.find((s) => s.name === config.defaultShell)
+        ?? config.availableShells[0];
+      if (!shell) continue;
+      try {
+        const ptyId = await invoke<number>('create_pty', {
+          shell: shell.command,
+          args: shell.args ?? [],
+          cwd: projectPath,
+        });
+        panes.push({ id: genId(), shellName: shell.name, status: 'idle' as PaneStatus, ptyId });
+      } catch {
+        // skip failed pane
+      }
     }
+    if (panes.length === 0) return null;
+    return {
+      type: 'leaf',
+      panes,
+      activePaneId: panes[0].id,
+    };
   }
 
   const children: SplitNode[] = [];

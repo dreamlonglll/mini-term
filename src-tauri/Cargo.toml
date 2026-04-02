@@ -26,13 +26,15 @@ serde_json = "1"
 portable-pty = "0.8"
 notify = "7"
 ignore = "0.4"
-windows = { version = "0.58", features = [
-  "Win32_System_Diagnostics_ToolHelp",
-  "Win32_Foundation",
-  "Win32_System_Threading",
-] }
 tauri-plugin-clipboard-manager = "2.3.2"
 tauri-plugin-window-state = "2"
 dirs = "6"
 git2 = "0.19"
 pathdiff = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_Foundation",
+  "Win32_System_Threading",
+] }

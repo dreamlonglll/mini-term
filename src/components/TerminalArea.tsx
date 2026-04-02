@@ -1,10 +1,8 @@
 import { useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { useAppStore, genId, collectPtyIds, saveLayoutToConfig } from '../store';
-import { TabBar } from './TabBar';
+import { useAppStore, genId, saveLayoutToConfig } from '../store';
 import { SplitLayout } from './SplitLayout';
 import { showContextMenu } from '../utils/contextMenu';
-import { disposeTerminal } from '../utils/terminalCache';
 import type { TerminalTab, PaneState, SplitNode, ShellConfig } from '../types';
 
 interface Props {
@@ -14,34 +12,22 @@ interface Props {
 
 // 收集 SplitNode 树中所有 pane ID
 function collectPaneIds(node: SplitNode): string[] {
-  if (node.type === 'leaf') return [node.pane.id];
+  if (node.type === 'leaf') return node.panes.map((p) => p.id);
   return node.children.flatMap(collectPaneIds);
-}
-
-function removePane(node: SplitNode, targetPaneId: string): SplitNode | null {
-  if (node.type === 'leaf') {
-    return node.pane.id === targetPaneId ? null : node;
-  }
-  const remaining = node.children
-    .map((c) => removePane(c, targetPaneId))
-    .filter((c): c is SplitNode => c !== null);
-  if (remaining.length === 0) return null;
-  if (remaining.length === 1) return remaining[0];
-  return { ...node, children: remaining, sizes: remaining.map(() => 100 / remaining.length) };
 }
 
 function insertSplit(
   node: SplitNode,
   targetPaneId: string,
   direction: 'horizontal' | 'vertical',
-  newPane: PaneState
+  newLeaf: SplitNode
 ): SplitNode {
   if (node.type === 'leaf') {
-    if (node.pane.id === targetPaneId) {
+    if (node.panes.some((p) => p.id === targetPaneId)) {
       return {
         type: 'split',
         direction,
-        children: [node, { type: 'leaf', pane: newPane }],
+        children: [node, newLeaf],
         sizes: [50, 50],
       };
     }
@@ -49,29 +35,10 @@ function insertSplit(
   }
   return {
     ...node,
-    children: node.children.map((c) => insertSplit(c, targetPaneId, direction, newPane)),
+    children: node.children.map((c) => insertSplit(c, targetPaneId, direction, newLeaf)),
   };
 }
 
-function insertSplitNode(
-  node: SplitNode,
-  targetPaneId: string,
-  direction: 'horizontal' | 'vertical',
-  newNode: SplitNode,
-  position: 'before' | 'after'
-): SplitNode {
-  if (node.type === 'leaf') {
-    if (node.pane.id === targetPaneId) {
-      const children = position === 'before' ? [newNode, node] : [node, newNode];
-      return { type: 'split', direction, children, sizes: [50, 50] };
-    }
-    return node;
-  }
-  return {
-    ...node,
-    children: node.children.map((c) => insertSplitNode(c, targetPaneId, direction, newNode, position)),
-  };
-}
 
 export function TerminalArea({ projectId, projectPath }: Props) {
   const config = useAppStore((s) => s.config);
@@ -81,19 +48,6 @@ export function TerminalArea({ projectId, projectPath }: Props) {
   const removeTab = useAppStore((s) => s.removeTab);
   const ps = projectStates.get(projectId);
   const activeTab = ps?.tabs.find((t) => t.id === ps.activeTabId);
-
-  const handleCloseTab = useCallback(async (tabId: string) => {
-    const tab = ps?.tabs.find(t => t.id === tabId);
-    if (tab) {
-      const ptyIds = collectPtyIds(tab.splitLayout);
-      for (const id of ptyIds) {
-        await invoke('kill_pty', { ptyId: id });
-        disposeTerminal(id);
-      }
-    }
-    removeTab(projectId, tabId);
-    saveLayoutToConfig(projectId);
-  }, [ps, projectId, removeTab]);
 
   const handleNewTab = useCallback(async (selectedShell?: ShellConfig) => {
     const shell = selectedShell
@@ -115,12 +69,13 @@ export function TerminalArea({ projectId, projectPath }: Props) {
       status: 'idle',
       splitLayout: {
         type: 'leaf',
-        pane: {
+        panes: [{
           id: paneId,
           shellName: shell.name,
           status: 'idle',
           ptyId,
-        },
+        }],
+        activePaneId: paneId,
       },
     };
 
@@ -159,75 +114,39 @@ export function TerminalArea({ projectId, projectPath }: Props) {
         ptyId,
       };
 
-      const newLayout = insertSplit(activeTab.splitLayout, paneId, direction, newPane);
+      const newLeaf: SplitNode = {
+        type: 'leaf',
+        panes: [newPane],
+        activePaneId: newPane.id,
+      };
+
+      const newLayout = insertSplit(activeTab.splitLayout, paneId, direction, newLeaf);
       updateTabLayout(projectId, activeTab.id, newLayout);
       saveLayoutToConfig(projectId);
     },
     [ps, activeTab, config, projectId, projectPath, updateTabLayout]
   );
 
-  const handleTabDrop = useCallback(
-    (sourceTabId: string, targetPaneId: string, direction: 'horizontal' | 'vertical', position: 'before' | 'after') => {
-      if (!ps || !activeTab) return;
-      if (sourceTabId === activeTab.id) return;
-      const sourceTab = ps.tabs.find((t) => t.id === sourceTabId);
-      if (!sourceTab) return;
-
-      const newLayout = insertSplitNode(
-        activeTab.splitLayout,
-        targetPaneId,
-        direction,
-        sourceTab.splitLayout,
-        position
-      );
-      updateTabLayout(projectId, activeTab.id, newLayout);
-      removeTab(projectId, sourceTabId);
-      saveLayoutToConfig(projectId);
-    },
-    [ps, activeTab, projectId, updateTabLayout, removeTab]
-  );
-
-  const handleClosePane = useCallback(async (paneId: string) => {
-    // 从 store 读取最新状态，避免闭包过期
+  // Called when an entire leaf (pane group) is closed.
+  // PTYs are already killed by PaneGroup before this is called.
+  // For the root leaf case, we close the whole tab.
+  const handleCloseLeaf = useCallback((_leafNode: SplitNode) => {
     const currentPs = useAppStore.getState().projectStates.get(projectId);
     const currentTab = currentPs?.tabs.find(t => t.id === currentPs.activeTabId);
     if (!currentTab) return;
 
-    const findPty = (node: SplitNode): number | null => {
-      if (node.type === 'leaf') return node.pane.id === paneId ? node.pane.ptyId : null;
-      for (const c of node.children) {
-        const found = findPty(c);
-        if (found !== null) return found;
-      }
-      return null;
-    };
-
-    const ptyId = findPty(currentTab.splitLayout);
-    if (ptyId !== null) {
-      await invoke('kill_pty', { ptyId });
-      disposeTerminal(ptyId);
-    }
-
-    // await 之后重新读取最新状态，防止并发关闭时布局被覆盖
-    const latestPs = useAppStore.getState().projectStates.get(projectId);
-    const latestTab = latestPs?.tabs.find(t => t.id === latestPs.activeTabId);
-    if (!latestTab) return;
-
-    const newLayout = removePane(latestTab.splitLayout, paneId);
-    if (newLayout) {
-      updateTabLayout(projectId, latestTab.id, newLayout);
-      saveLayoutToConfig(projectId);
-    } else {
-      handleCloseTab(latestTab.id);
-    }
-  }, [projectId, updateTabLayout, handleCloseTab]);
+    // PTYs are already killed by PaneGroup before this is called.
+    // Remove the entire layout tab.
+    removeTab(projectId, currentTab.id);
+    saveLayoutToConfig(projectId);
+  }, [projectId, removeTab]);
 
   const handleLayoutChange = useCallback((updatedNode: SplitNode) => {
     const currentPs = useAppStore.getState().projectStates.get(projectId);
     const currentActiveTab = currentPs?.tabs.find((t) => t.id === currentPs.activeTabId);
     if (!currentActiveTab) return;
 
-    // 校验布局结构一致：若 pane ID 集合不同，说明是过期的 RAF 回调，丢弃
+    // Validate layout structure: if pane ID sets differ, discard stale RAF callback
     const currentIds = collectPaneIds(currentActiveTab.splitLayout).sort().join(',');
     const updatedIds = collectPaneIds(updatedNode).sort().join(',');
     if (currentIds !== updatedIds) return;
@@ -236,10 +155,19 @@ export function TerminalArea({ projectId, projectPath }: Props) {
     saveLayoutToConfig(projectId);
   }, [projectId, updateTabLayout]);
 
+  // Handler for structural changes: tabs added/removed/switched within a leaf,
+  // or children removed from a split. Bypasses pane-ID validation since the
+  // set of pane IDs is expected to change.
+  const handleUpdateNode = useCallback((updatedNode: SplitNode) => {
+    const currentPs = useAppStore.getState().projectStates.get(projectId);
+    const currentActiveTab = currentPs?.tabs.find((t) => t.id === currentPs.activeTabId);
+    if (!currentActiveTab) return;
+    updateTabLayout(projectId, currentActiveTab.id, updatedNode);
+    saveLayoutToConfig(projectId);
+  }, [projectId, updateTabLayout]);
+
   return (
     <div className="flex flex-col h-full bg-[var(--bg-terminal)]">
-      <TabBar projectId={projectId} onNewTab={handleNewTabClick} onCloseTab={handleCloseTab} />
-
       <div className="flex-1 overflow-hidden relative">
         {ps?.tabs.map((tab) => (
           <div
@@ -247,7 +175,14 @@ export function TerminalArea({ projectId, projectPath }: Props) {
             className="absolute inset-0"
             style={{ display: tab.id === ps.activeTabId ? 'block' : 'none' }}
           >
-            <SplitLayout node={tab.splitLayout} onSplit={handleSplitPane} onClose={handleClosePane} onTabDrop={handleTabDrop} onLayoutChange={handleLayoutChange} />
+            <SplitLayout
+              node={tab.splitLayout}
+              projectPath={projectPath}
+              onSplit={handleSplitPane}
+              onCloseLeaf={handleCloseLeaf}
+              onUpdateNode={handleUpdateNode}
+              onLayoutChange={handleLayoutChange}
+            />
           </div>
         ))}
 
