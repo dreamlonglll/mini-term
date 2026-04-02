@@ -17,7 +17,6 @@ export function App() {
   const [configOpen, setConfigOpen] = useState(false);
   const [currentVersion, setCurrentVersion] = useState('');
   const [updateInfo, setUpdateInfo] = useState<ReleaseInfo | null>(null);
-  const [showUpdateDialog, setShowUpdateDialog] = useState(false);
   const activeProjectId = useAppStore((s) => s.activeProjectId);
   const config = useAppStore((s) => s.config);
   const setConfig = useAppStore((s) => s.setConfig);
@@ -61,10 +60,7 @@ export function App() {
     getVersion().then((ver) => {
       setCurrentVersion(ver);
       checkForUpdate(ver).then((release) => {
-        if (release) {
-          setUpdateInfo(release);
-          setShowUpdateDialog(true);
-        }
+        if (release) setUpdateInfo(release);
       }).catch(() => {});
     });
   }, []);
@@ -139,8 +135,8 @@ export function App() {
           <span
             className="text-[10px] px-1.5 py-0.5 rounded-full bg-[var(--accent)]/15 text-[var(--accent)] cursor-pointer hover:bg-[var(--accent)]/25 transition-colors"
             style={{ WebkitAppRegion: 'no-drag' } as React.CSSProperties}
-            onClick={() => setShowUpdateDialog(true)}
-            title={`新版本 ${updateInfo.version} 可用`}
+            onClick={() => openUrl(updateInfo.url)}
+            title={`新版本 ${updateInfo.version} 可用，点击前往下载`}
           >
             新版本 {updateInfo.version}
           </span>
@@ -197,38 +193,6 @@ export function App() {
         </Allotment>
       </div>
       <SettingsModal open={configOpen} onClose={() => setConfigOpen(false)} />
-
-      {/* 新版本提示弹框 */}
-      {showUpdateDialog && updateInfo && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={() => setShowUpdateDialog(false)}>
-          <div className="bg-[var(--bg-elevated)] border border-[var(--border-default)] rounded-[var(--radius-lg)] p-6 w-80 shadow-xl" onClick={(e) => e.stopPropagation()}>
-            <div className="text-sm font-medium text-[var(--text-primary)] mb-3">发现新版本</div>
-            <div className="flex items-center gap-2 mb-2">
-              <span className="text-xs text-[var(--text-muted)]">当前版本</span>
-              <span className="font-mono text-xs text-[var(--text-secondary)]">v{currentVersion}</span>
-              <span className="text-[var(--text-muted)]">→</span>
-              <span className="font-mono text-xs text-[var(--accent)]">{updateInfo.version}</span>
-            </div>
-            <div className="text-[11px] text-[var(--text-muted)] mb-4">
-              发布于 {new Date(updateInfo.publishedAt).toLocaleDateString('zh-CN')}
-            </div>
-            <div className="flex gap-2">
-              <button
-                className="flex-1 py-1.5 text-xs border border-[var(--border-default)] rounded-[var(--radius-sm)] text-[var(--text-secondary)] hover:border-[var(--text-muted)] transition-colors"
-                onClick={() => setShowUpdateDialog(false)}
-              >
-                稍后再说
-              </button>
-              <button
-                className="flex-1 py-1.5 text-xs bg-[var(--accent)] text-[var(--bg-base)] rounded-[var(--radius-sm)] font-medium hover:opacity-90 transition-opacity"
-                onClick={() => { openUrl(updateInfo.url); setShowUpdateDialog(false); }}
-              >
-                前往下载
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
