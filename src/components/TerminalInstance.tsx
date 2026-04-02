@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '../store';
-import { getOrCreateTerminal, getCachedTerminal, getTerminalTheme } from '../utils/terminalCache';
+import { getOrCreateTerminal, getCachedTerminal, getTerminalTheme, DARK_TERMINAL_THEME } from '../utils/terminalCache';
+import { getResolvedTheme } from '../utils/themeManager';
 import '@xterm/xterm/css/xterm.css';
 
 interface Props {
@@ -12,6 +13,11 @@ export function TerminalInstance({ ptyId }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [fileDrag, setFileDrag] = useState(false);
   const terminalFontSize = useAppStore((s) => s.config.terminalFontSize);
+  const terminalFollowTheme = useAppStore((s) => s.config.terminalFollowTheme);
+
+  // 终端不跟随主题且处于浅色模式时，面板背景强制深色
+  const forceDarkBg = !terminalFollowTheme && getResolvedTheme() === 'light';
+  const panelBg = forceDarkBg ? DARK_TERMINAL_THEME.background : undefined;
 
   useEffect(() => {
     const container = containerRef.current;
@@ -100,6 +106,7 @@ export function TerminalInstance({ ptyId }: Props) {
     <div className="w-full h-full flex flex-col">
       <div
         className="flex-1 relative bg-[var(--bg-terminal)]"
+        style={panelBg ? { backgroundColor: panelBg } : undefined}
         onDragOverCapture={handleDragOver}
         onDragLeaveCapture={handleDragLeave}
         onDropCapture={handleDrop}
