@@ -23,9 +23,9 @@ export function InlineView({ hunks }: { hunks: GitDiffResult['hunks'] }) {
               key={li}
               className={`flex ${
                 line.kind === 'add'
-                  ? 'bg-[rgba(60,180,60,0.12)]'
+                  ? 'bg-[var(--diff-add-bg)]'
                   : line.kind === 'delete'
-                  ? 'bg-[rgba(220,60,60,0.12)]'
+                  ? 'bg-[var(--diff-del-bg)]'
                   : ''
               }`}
             >
@@ -35,9 +35,9 @@ export function InlineView({ hunks }: { hunks: GitDiffResult['hunks'] }) {
               <span
                 className={`flex-1 whitespace-pre px-2 ${
                   line.kind === 'add'
-                    ? 'text-green-400'
+                    ? 'text-[var(--diff-add-text)]'
                     : line.kind === 'delete'
-                    ? 'text-red-400'
+                    ? 'text-[var(--diff-del-text)]'
                     : 'text-[var(--text-primary)]'
                 }`}
               >
@@ -104,7 +104,7 @@ export function SideBySideView({ hunks }: { hunks: GitDiffResult['hunks'] }) {
     return (
       <div
         className={`flex ${
-          isAdd ? 'bg-[rgba(60,180,60,0.12)]' : isDel ? 'bg-[rgba(220,60,60,0.12)]' : ''
+          isAdd ? 'bg-[var(--diff-add-bg)]' : isDel ? 'bg-[var(--diff-del-bg)]' : ''
         }`}
       >
         <span className="w-12 text-right pr-2 text-[var(--text-muted)] select-none flex-shrink-0 opacity-50">
@@ -112,7 +112,7 @@ export function SideBySideView({ hunks }: { hunks: GitDiffResult['hunks'] }) {
         </span>
         <span
           className={`flex-1 whitespace-pre px-2 ${
-            isAdd ? 'text-green-400' : isDel ? 'text-red-400' : 'text-[var(--text-primary)]'
+            isAdd ? 'text-[var(--diff-add-text)]' : isDel ? 'text-[var(--diff-del-text)]' : 'text-[var(--text-primary)]'
           }`}
         >
           {line.content}
@@ -177,7 +177,7 @@ export function DiffModal({ open, onClose, projectPath, status }: DiffModalProps
     <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={onClose}>
       <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
       <div
-        className="relative flex flex-col overflow-hidden bg-[var(--bg-surface)] border border-[var(--border-strong)] rounded-[var(--radius-md)] shadow-2xl animate-slide-in"
+        className="relative flex flex-col overflow-hidden bg-[var(--bg-surface)] border border-[var(--border-strong)] rounded-[var(--radius-md)] shadow-[var(--shadow-overlay)] animate-slide-in"
         style={{ width: '90vw', height: '80vh' }}
         onClick={(e) => e.stopPropagation()}
       >
