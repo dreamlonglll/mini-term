@@ -39,25 +39,6 @@ function insertSplit(
   };
 }
 
-function insertSplitNode(
-  node: SplitNode,
-  targetPaneId: string,
-  direction: 'horizontal' | 'vertical',
-  newNode: SplitNode,
-  position: 'before' | 'after'
-): SplitNode {
-  if (node.type === 'leaf') {
-    if (node.panes.some((p) => p.id === targetPaneId)) {
-      const children = position === 'before' ? [newNode, node] : [node, newNode];
-      return { type: 'split', direction, children, sizes: [50, 50] };
-    }
-    return node;
-  }
-  return {
-    ...node,
-    children: node.children.map((c) => insertSplitNode(c, targetPaneId, direction, newNode, position)),
-  };
-}
 
 export function TerminalArea({ projectId, projectPath }: Props) {
   const config = useAppStore((s) => s.config);
@@ -146,27 +127,6 @@ export function TerminalArea({ projectId, projectPath }: Props) {
     [ps, activeTab, config, projectId, projectPath, updateTabLayout]
   );
 
-  const handleTabDrop = useCallback(
-    (sourceTabId: string, targetPaneId: string, direction: 'horizontal' | 'vertical', position: 'before' | 'after') => {
-      if (!ps || !activeTab) return;
-      if (sourceTabId === activeTab.id) return;
-      const sourceTab = ps.tabs.find((t) => t.id === sourceTabId);
-      if (!sourceTab) return;
-
-      const newLayout = insertSplitNode(
-        activeTab.splitLayout,
-        targetPaneId,
-        direction,
-        sourceTab.splitLayout,
-        position
-      );
-      updateTabLayout(projectId, activeTab.id, newLayout);
-      removeTab(projectId, sourceTabId);
-      saveLayoutToConfig(projectId);
-    },
-    [ps, activeTab, projectId, updateTabLayout, removeTab]
-  );
-
   // Called when an entire leaf (pane group) is closed.
   // PTYs are already killed by PaneGroup before this is called.
   // For the root leaf case, we close the whole tab.
@@ -221,7 +181,6 @@ export function TerminalArea({ projectId, projectPath }: Props) {
               onSplit={handleSplitPane}
               onCloseLeaf={handleCloseLeaf}
               onUpdateNode={handleUpdateNode}
-              onTabDrop={handleTabDrop}
               onLayoutChange={handleLayoutChange}
             />
           </div>

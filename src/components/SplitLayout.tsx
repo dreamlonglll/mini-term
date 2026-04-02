@@ -9,7 +9,6 @@ interface Props {
   onSplit?: (paneId: string, direction: 'horizontal' | 'vertical') => void;
   onCloseLeaf?: (node: SplitNode) => void;
   onUpdateNode?: (updated: SplitNode) => void;
-  onTabDrop?: (sourceTabId: string, targetPaneId: string, direction: 'horizontal' | 'vertical', position: 'before' | 'after') => void;
   onLayoutChange?: (updatedNode: SplitNode) => void;
 }
 
@@ -20,7 +19,7 @@ function getNodeKey(node: SplitNode): string {
   return node.children.map(getNodeKey).join('-');
 }
 
-export function SplitLayout({ node, projectPath, onSplit, onCloseLeaf, onUpdateNode, onTabDrop, onLayoutChange }: Props) {
+export function SplitLayout({ node, projectPath, onSplit, onCloseLeaf, onUpdateNode, onLayoutChange }: Props) {
   const rafRef = useRef<number>(0);
   const nodeRef = useRef(node);
   nodeRef.current = node;
@@ -33,7 +32,6 @@ export function SplitLayout({ node, projectPath, onSplit, onCloseLeaf, onUpdateN
         onSplit={onSplit ?? (() => {})}
         onClosePane={() => onCloseLeaf?.(node)}
         onUpdateNode={(updated) => onUpdateNode?.(updated)}
-        onTabDrop={onTabDrop}
       />
     );
   }
@@ -66,7 +64,6 @@ export function SplitLayout({ node, projectPath, onSplit, onCloseLeaf, onUpdateN
     if (remaining.length === 0) {
       onCloseLeaf?.(currentNode);
     } else if (remaining.length === 1) {
-      // Collapse: promote the single remaining child
       onUpdateNode?.(remaining[0]);
     } else {
       onUpdateNode?.({
@@ -82,8 +79,6 @@ export function SplitLayout({ node, projectPath, onSplit, onCloseLeaf, onUpdateN
     if (currentNode.type !== 'split') return;
     const newChildren = [...currentNode.children];
     newChildren[index] = updated;
-    // Use onUpdateNode for structural changes (tab add/remove/switch in PaneGroup)
-    // to bypass the pane-ID validation in handleLayoutChange.
     onUpdateNode?.({ ...currentNode, children: newChildren });
   };
 
@@ -101,7 +96,6 @@ export function SplitLayout({ node, projectPath, onSplit, onCloseLeaf, onUpdateN
             onSplit={onSplit}
             onCloseLeaf={() => handleChildClose(index)}
             onUpdateNode={(updated) => handleChildUpdate(index, updated)}
-            onTabDrop={onTabDrop}
             onLayoutChange={(updated) => handleChildLayoutChange(index, updated)}
           />
         </Allotment.Pane>

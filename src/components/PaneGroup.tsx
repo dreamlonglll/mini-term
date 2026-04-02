@@ -13,10 +13,9 @@ interface Props {
   onSplit: (paneId: string, direction: 'horizontal' | 'vertical') => void;
   onClosePane: () => void;
   onUpdateNode: (updated: SplitNode) => void;
-  onTabDrop?: (sourceTabId: string, targetPaneId: string, direction: 'horizontal' | 'vertical', position: 'before' | 'after') => void;
 }
 
-export function PaneGroup({ node, projectPath, onSplit, onClosePane, onUpdateNode, onTabDrop }: Props) {
+export function PaneGroup({ node, projectPath, onSplit, onClosePane, onUpdateNode }: Props) {
   const config = useAppStore((s) => s.config);
   const [headerHover, setHeaderHover] = useState(false);
 
@@ -194,8 +193,6 @@ export function PaneGroup({ node, projectPath, onSplit, onClosePane, onUpdateNod
           >
             <TerminalInstance
               ptyId={pane.ptyId}
-              paneId={pane.id}
-              onTabDrop={onTabDrop}
             />
           </div>
         ))}

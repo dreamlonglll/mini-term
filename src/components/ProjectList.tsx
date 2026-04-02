@@ -150,7 +150,7 @@ export function ProjectList() {
 
   const handleDragOver = useCallback((e: React.DragEvent, targetId: string, allowInside: boolean) => {
     const payload = getDragPayload();
-    if (!payload || payload.type === 'tab') return;
+    if (!payload) return;
     if (
       (payload.type === 'project' && payload.projectId === targetId) ||
       (payload.type === 'group' && payload.groupId === targetId)
@@ -203,7 +203,7 @@ export function ProjectList() {
   const handleDrop = useCallback((e: React.DragEvent, targetId: string) => {
     e.preventDefault();
     const payload = getDragPayload();
-    if (!payload || payload.type === 'tab') return;
+    if (!payload) return;
     const indicator = dropIndicator;
     setDropIndicator(null);
     setDragPayload(null);
