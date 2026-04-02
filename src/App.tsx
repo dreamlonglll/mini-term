@@ -2,7 +2,9 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { Allotment } from 'allotment';
 import { invoke } from '@tauri-apps/api/core';
 import { getVersion } from '@tauri-apps/api/app';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import { openUrl } from '@tauri-apps/plugin-opener';
+import { ask } from '@tauri-apps/plugin-dialog';
 import { useAppStore, restoreLayout, flushLayoutToConfig, initExpandedDirs, flushExpandedDirsToConfig } from './store';
 import { TerminalArea } from './components/TerminalArea';
 import { ProjectList } from './components/ProjectList';
@@ -78,17 +80,21 @@ export function App() {
     }
   }, [updatePaneStatusByPty]));
 
-  // 关闭窗口时立即保存布局
+  // 关闭窗口时二次确认并保存布局
   useEffect(() => {
-    const handleBeforeUnload = () => {
+    const appWindow = getCurrentWindow();
+    const unlisten = appWindow.onCloseRequested(async (event) => {
+      event.preventDefault();
+      const confirmed = await ask('确定要关闭 Mini-Term 吗？', { title: '关闭确认', kind: 'warning' });
+      if (!confirmed) return;
       const { activeProjectId } = useAppStore.getState();
       if (activeProjectId) {
         flushLayoutToConfig(activeProjectId);
         flushExpandedDirsToConfig(activeProjectId);
       }
-    };
-    window.addEventListener('beforeunload', handleBeforeUnload);
-    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+      appWindow.destroy();
+    });
+    return () => { unlisten.then((fn) => fn()); };
   }, []);
 
   // 切换项目时保存前一个项目的布局
