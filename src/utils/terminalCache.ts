@@ -98,7 +98,7 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
 
   const term = new Terminal({
     fontSize: useAppStore.getState().config.terminalFontSize ?? 14,
-    fontFamily: "'JetBrains Mono', 'Cascadia Code', Consolas, monospace",
+    fontFamily: "'JetBrains Mono', 'Cascadia Code', Consolas, 'Sarasa Term SC', monospace",
     fontWeight: '400',
     fontWeightBold: '600',
     cursorBlink: true,
@@ -114,7 +114,7 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
   term.loadAddon(fitAddon);
   term.open(wrapper);
 
-  // WebGL 渲染，降级时回退到 Canvas
+  // WebGL 渲染，降级时回退到 DOM
   try {
     const webgl = new WebglAddon();
     webgl.onContextLoss(() => {
@@ -123,7 +123,7 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
     });
     term.loadAddon(webgl);
   } catch {
-    // WebGL 不支持
+    // WebGL 不支持，回退到 DOM
   }
 
   // 剪贴板快捷键
