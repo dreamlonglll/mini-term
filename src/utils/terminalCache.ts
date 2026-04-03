@@ -67,7 +67,7 @@ export const LIGHT_TERMINAL_THEME = {
   blue: '#2860a0',
   magenta: '#8a5cb8',
   cyan: '#1a8a6a',
-  white: '#f0f0f0',
+  white: '#808080',
   brightBlack: '#666666',
   brightRed: '#e04030',
   brightGreen: '#38a058',
@@ -75,7 +75,7 @@ export const LIGHT_TERMINAL_THEME = {
   brightBlue: '#3870b8',
   brightMagenta: '#a070d0',
   brightCyan: '#28a080',
-  brightWhite: '#ffffff',
+  brightWhite: '#a0a0a0',
 };
 
 export function getTerminalTheme(terminalFollowTheme: boolean): typeof DARK_TERMINAL_THEME {
