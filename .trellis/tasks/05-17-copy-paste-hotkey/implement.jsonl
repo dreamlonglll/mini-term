@@ -1,1 +1,6 @@
-{"_example": "Fill with {\"file\": \"<path>\", \"reason\": \"<why>\"}. Put spec/research files only — no code paths. Run `python3 .trellis/scripts/get_context.py --mode packages` to list available specs. Delete this line once real entries are added."}
+{"file": ".trellis/spec/frontend/index.md", "reason": "前端 spec 总索引，了解整体约定"}
+{"file": ".trellis/spec/frontend/type-safety.md", "reason": "AppConfig 新增 smartCopyPaste 字段需遵循类型定义规范"}
+{"file": ".trellis/spec/frontend/state-management.md", "reason": "store.ts config 初始值改动需遵循 zustand 状态管理约定"}
+{"file": ".trellis/spec/frontend/component-guidelines.md", "reason": "SettingsModal 新增 toggle 设置项需遵循组件规范"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "配置字段跨 Rust config / 前端 types / store / UI 多层同步"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "智能快捷键复用既有 copyTerminalSelection / pasteToTerminal"}
