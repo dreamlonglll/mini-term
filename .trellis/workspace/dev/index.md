@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 1
-- **Last Active**: 2026-05-08
+- **Total Sessions**: 2
+- **Last Active**: 2026-05-17
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~40 | Active |
+| `journal-1.md` | ~74 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 2 | 2026-05-17 | 实现智能终端复制粘贴快捷键（issue #31） | `2d192f5`, `a98255d` | `main` |
 | 1 | 2026-05-08 | 修复退出 AI agent 后状态卡在 ai-idle | `41f2f86` | `main` |
 <!-- @@@/auto:session-history -->
 
