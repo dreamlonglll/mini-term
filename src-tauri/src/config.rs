@@ -95,6 +95,8 @@ pub struct AppConfig {
     pub last_active_project_id: Option<String>,
     #[serde(default)]
     pub hook_enabled: bool,
+    #[serde(default)]
+    pub smart_copy_paste: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -230,6 +232,7 @@ impl Default for AppConfig {
             git_visible: true,
             last_active_project_id: None,
             hook_enabled: false,
+            smart_copy_paste: false,
         }
     }
 }

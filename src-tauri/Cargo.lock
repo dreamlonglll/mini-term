@@ -4415,7 +4415,7 @@ dependencies = [
 
 [[package]]
 name = "tauri-app"
-version = "0.4.5"
+version = "0.4.6"
 dependencies = [
  "dirs",
  "git2",

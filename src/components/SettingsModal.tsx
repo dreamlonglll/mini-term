@@ -250,6 +250,7 @@ function TerminalSettings() {
   const [newArgs, setNewArgs] = useState('');
 
   const longPasteEnabled = config.longPasteToFile ?? true;
+  const smartCopyPasteEnabled = config.smartCopyPaste ?? false;
   const savedLineThreshold = config.longPasteLineThreshold ?? 10;
   const savedCharThreshold = config.longPasteCharThreshold ?? 2000;
   const [lineThresholdInput, setLineThresholdInput] = useState(String(savedLineThreshold));
@@ -412,6 +413,31 @@ function TerminalSettings() {
 
       <div className="pt-3 text-sm text-[var(--text-muted)]">
         点击圆点设为默认终端 · 新建终端标签页时可选择类型
+      </div>
+
+      <div className="pt-6 text-base text-[var(--text-muted)] uppercase tracking-[0.1em] mb-2">
+        复制粘贴
+      </div>
+
+      <div className="flex items-center justify-between px-3 py-2.5 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)]">
+        <div className="pr-4">
+          <div className="text-base text-[var(--text-primary)]">智能 Ctrl+C / Ctrl+V</div>
+          <div className="text-sm text-[var(--text-muted)]">
+            开启后选中文本时 Ctrl+C 复制、无选区时中断程序，Ctrl+V 直接粘贴；Ctrl+Shift+C/V 始终可用
+          </div>
+        </div>
+        <button
+          className={`relative w-9 h-5 rounded-full transition-colors flex-shrink-0 ${
+            smartCopyPasteEnabled ? 'bg-[var(--accent)]' : 'bg-[var(--border-strong)]'
+          }`}
+          onClick={() => saveConfigPatch({ smartCopyPaste: !smartCopyPasteEnabled })}
+        >
+          <span
+            className={`absolute top-0.5 left-0 w-4 h-4 rounded-full bg-white transition-transform ${
+              smartCopyPasteEnabled ? 'translate-x-[18px]' : 'translate-x-0.5'
+            }`}
+          />
+        </button>
       </div>
 
       <div className="pt-6 text-base text-[var(--text-muted)] uppercase tracking-[0.1em] mb-2">
@@ -1257,33 +1283,45 @@ function AboutSettings() {
 
 // ─── ShortcutsSettings（快捷键页）───
 
-const SHORTCUT_GROUPS: { title: string; items: { keys: string; desc: string }[] }[] = [
-  {
-    title: '全局',
-    items: [
-      { keys: `${MOD_LABEL} + Shift + F`, desc: '打开/关闭全局搜索' },
-    ],
-  },
-  {
-    title: '终端操作',
-    items: [
-      { keys: `${MOD_LABEL} + Shift + C`, desc: '复制终端选中文本' },
-      { keys: `${MOD_LABEL} + Shift + V`, desc: '粘贴到终端' },
-    ],
-  },
-  {
-    title: 'AI 任务标记',
-    items: [
-      { keys: `${MOD_LABEL} + Shift + ↑`, desc: '跳转到上一个 AI 任务提交' },
-      { keys: `${MOD_LABEL} + Shift + ↓`, desc: '跳转到下一个 AI 任务提交' },
-    ],
-  },
-];
+function buildShortcutGroups(
+  smartCopyPaste: boolean,
+): { title: string; items: { keys: string; desc: string }[] }[] {
+  const terminalItems = smartCopyPaste
+    ? [
+        { keys: `${MOD_LABEL} + C`, desc: '复制选中文本（无选区时中断程序）' },
+        { keys: `${MOD_LABEL} + V`, desc: '粘贴到终端' },
+        { keys: `${MOD_LABEL} + Shift + C`, desc: '复制终端选中文本' },
+        { keys: `${MOD_LABEL} + Shift + V`, desc: '粘贴到终端' },
+      ]
+    : [
+        { keys: `${MOD_LABEL} + Shift + C`, desc: '复制终端选中文本' },
+        { keys: `${MOD_LABEL} + Shift + V`, desc: '粘贴到终端' },
+      ];
+  return [
+    {
+      title: '全局',
+      items: [{ keys: `${MOD_LABEL} + Shift + F`, desc: '打开/关闭全局搜索' }],
+    },
+    {
+      title: '终端操作',
+      items: terminalItems,
+    },
+    {
+      title: 'AI 任务标记',
+      items: [
+        { keys: `${MOD_LABEL} + Shift + ↑`, desc: '跳转到上一个 AI 任务提交' },
+        { keys: `${MOD_LABEL} + Shift + ↓`, desc: '跳转到下一个 AI 任务提交' },
+      ],
+    },
+  ];
+}
 
 function ShortcutsSettings() {
+  const smartCopyPaste = useAppStore((s) => s.config.smartCopyPaste ?? false);
+  const groups = buildShortcutGroups(smartCopyPaste);
   return (
     <div className="space-y-6">
-      {SHORTCUT_GROUPS.map((group) => (
+      {groups.map((group) => (
         <div key={group.title}>
           <div className="text-base text-[var(--text-muted)] uppercase tracking-[0.1em] mb-2">
             {group.title}

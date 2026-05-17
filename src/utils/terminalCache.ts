@@ -247,15 +247,35 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
   // 剪贴板快捷键
   term.attachCustomKeyEventHandler((e) => {
     if (e.type !== 'keydown') return true;
-    if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.code === 'KeyC') {
+    const mod = e.ctrlKey || e.metaKey;
+    // Ctrl+Shift+C / Ctrl+Shift+V：始终生效
+    if (mod && e.shiftKey && e.code === 'KeyC') {
       e.preventDefault();
       void copyTerminalSelection(ptyId);
       return false;
     }
-    if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.code === 'KeyV') {
+    if (mod && e.shiftKey && e.code === 'KeyV') {
       e.preventDefault();
       void pasteToTerminal(ptyId);
       return false;
+    }
+    // 智能 Ctrl+C/V（设置开启时）：Ctrl+C 有选区则复制并清除选区、
+    // 无选区则透传 SIGINT；Ctrl+V 直接粘贴
+    if (mod && !e.shiftKey && !e.altKey && useAppStore.getState().config.smartCopyPaste) {
+      if (e.code === 'KeyC') {
+        if (term.hasSelection()) {
+          e.preventDefault();
+          void copyTerminalSelection(ptyId);
+          term.clearSelection();
+          return false;
+        }
+        return true;
+      }
+      if (e.code === 'KeyV') {
+        e.preventDefault();
+        void pasteToTerminal(ptyId);
+        return false;
+      }
     }
     return true;
   });

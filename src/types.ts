@@ -40,6 +40,7 @@ export interface AppConfig {
   gitVisible: boolean;
   lastActiveProjectId?: string;
   hookEnabled: boolean;
+  smartCopyPaste: boolean;
 }
 
 export interface ProjectConfig {
