@@ -72,3 +72,36 @@ SessionEnd 事件清除 hook 状态回退 idle；process_monitor 增加 ai-idle 
 ### Next Steps
 
 - None - task complete
+
+
+## Session 3: SSH 管理器 v2：私钥权限自动处理
+
+**Date**: 2026-05-18
+**Task**: SSH 管理器 v2：私钥权限自动处理
+**Branch**: `main`
+
+### Summary
+
+完成 SSH 管理器 v2 阶段。新增后端 src-tauri/src/ssh.rs：prepare_ssh_key 命令连接前把私钥复制到权限收紧的临时副本（按源路径 DefaultHasher 稳定命名、重连复用），Windows 用 icacls /inheritance:r /grant:r 收紧 ACL、Unix 设 0600，绕过 Windows OpenSSH UNPROTECTED PRIVATE KEY FILE 拒绝；cleanup_ssh_temp_keys 启动时清理临时密钥目录。lib.rs 注册命令并接入启动清理。前端 TerminalInstance.tsx 的 connectSsh 连接前调用 prepare_ssh_key 取临时副本路径，失败 console.error 回退原始路径；buildSshCommand 签名改为 (conn, identityPath)。流程：trellis-implement 实现 → trellis-check 审查无问题 → cargo test 87 通过、npm run build 通过 → 提交 30b2182。3.3 判定无需更新 spec（复用 clipboard.rs 既有模式）。
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `30b2182` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
