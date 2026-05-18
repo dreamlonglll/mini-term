@@ -9,7 +9,7 @@ import { StatusDot } from './StatusDot';
 import { DoneTag } from './DoneTag';
 import { SessionList } from './SessionList';
 import { showContextMenu } from '../utils/contextMenu';
-import { showPrompt } from '../utils/prompt';
+import { showPrompt, showAlert } from '../utils/prompt';
 import { initProjectDrag, isProjectDragging, getProjectDragPayload, onProjectDragEnd } from '../utils/projectDragState';
 import {
   getOrderedTree,
@@ -213,6 +213,35 @@ export function ProjectList() {
     setEditingProjectId(null);
   }, [editingProjectId, editingName, renameProject]);
 
+  // 切换项目的 SSH MCP 启用状态
+  const toggleSshMcp = useCallback(async (project: ProjectConfig) => {
+    const enable = !project.sshMcpEnabled;
+    try {
+      const msg = await invoke<string>(enable ? 'enable_ssh_mcp' : 'disable_ssh_mcp', {
+        projectDir: project.path,
+      });
+      // 写入成功后才更新持久化状态
+      const cfg = useAppStore.getState().config;
+      const newConfig = {
+        ...cfg,
+        projects: cfg.projects.map((p) =>
+          p.id === project.id ? { ...p, sshMcpEnabled: enable } : p
+        ),
+      };
+      useAppStore.getState().setConfig(newConfig);
+      await invoke('save_config', { config: newConfig });
+      await showAlert(
+        enable ? '已启用 SSH MCP' : '已停用 SSH MCP',
+        `${msg}\n\n如该项目里有正在运行的 Claude / Codex 会话，需重启该会话后才会生效。`,
+      );
+    } catch (e: unknown) {
+      await showAlert(
+        enable ? '启用 SSH MCP 失败' : '停用 SSH MCP 失败',
+        e instanceof Error ? e.message : String(e),
+      );
+    }
+  }, []);
+
   // 开始重命名分组
   const startRenameGroup = useCallback((groupId: string, currentName: string) => {
     setEditingGroupId(groupId);
@@ -370,6 +399,11 @@ export function ProjectList() {
             { label: '重命名', onClick: () => startRenameProject(project.id, project.name) },
             { label: '在文件夹中打开', onClick: () => revealItemInDir(project.path) },
             { label: '复制绝对路径', onClick: () => navigator.clipboard.writeText(project.path) },
+            { separator: true },
+            {
+              label: project.sshMcpEnabled ? '停用 SSH MCP' : '启用 SSH MCP',
+              onClick: () => { void toggleSshMcp(project); },
+            },
           ];
           // 添加分组相关菜单
           if (allGroups.length > 0) {

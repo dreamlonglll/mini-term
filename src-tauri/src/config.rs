@@ -1,3 +1,4 @@
+use mt_core::SshConnection;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -150,6 +151,9 @@ pub struct ProjectConfig {
     pub saved_layout: Option<SavedProjectLayout>,
     #[serde(default)]
     pub expanded_dirs: Vec<String>,
+    /// 是否已为该项目启用 SSH MCP（向项目目录写入了 Claude / Codex 的 MCP 注册配置）。
+    #[serde(default)]
+    pub ssh_mcp_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,24 +169,6 @@ pub struct ShellConfig {
 pub struct EditorConfig {
     pub name: String,
     pub command: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SshConnection {
-    pub id: String,
-    pub name: String,
-    pub host: String,
-    pub port: u16,
-    pub user: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub password: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub identity_file: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub proxy_jump: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub group: Option<String>,
 }
 
 fn default_ui_font_size() -> f64 {

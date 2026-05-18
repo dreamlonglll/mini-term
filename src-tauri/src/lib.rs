@@ -10,6 +10,7 @@ mod process_monitor;
 mod pty;
 mod search;
 mod ssh;
+mod ssh_mcp_registry;
 
 use tauri::Manager;
 
@@ -122,6 +123,8 @@ pub fn run() {
             hook_registry::get_hook_config_snippet,
             hook_registry::get_hook_status,
             hook_server::toggle_hook_server,
+            ssh_mcp_registry::enable_ssh_mcp,
+            ssh_mcp_registry::disable_ssh_mcp,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

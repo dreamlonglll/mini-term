@@ -50,6 +50,8 @@ export interface ProjectConfig {
   path: string;
   savedLayout?: SavedProjectLayout;
   expandedDirs?: string[];
+  /** 是否已为该项目启用 SSH MCP（向项目目录写入了 Claude / Codex 的 MCP 注册配置） */
+  sshMcpEnabled?: boolean;
 }
 
 export interface ShellConfig {
@@ -73,6 +75,8 @@ export interface SshConnection {
   identityFile?: string;
   proxyJump?: string;
   group?: string;
+  /** 是否允许终端里的 AI agent 通过 SSH MCP 调用此连接（默认 false） */
+  agentAccessible?: boolean;
 }
 
 // === 布局持久化 ===

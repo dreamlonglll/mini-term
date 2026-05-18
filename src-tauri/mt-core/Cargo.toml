@@ -1,0 +1,13 @@
+[package]
+name = "mt-core"
+version = "0.4.8"
+description = "mini-term shared core: tauri-free logic reusable by the app and sidecar binaries"
+edition = "2021"
+
+[lib]
+name = "mt_core"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "6"

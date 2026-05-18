@@ -55,6 +55,58 @@ export function showConfirm(title: string, message: string): Promise<boolean> {
 }
 
 /**
+ * 自定义信息提示弹窗，替代 window.alert
+ * 只有一个「知道了」按钮，返回 Promise<void>
+ */
+export function showAlert(title: string, message: string): Promise<void> {
+  return new Promise((resolve) => {
+    const overlay = document.createElement('div');
+    overlay.className = 'prompt-overlay';
+
+    const dialog = document.createElement('div');
+    dialog.className = 'prompt-dialog';
+
+    const titleEl = document.createElement('div');
+    titleEl.className = 'prompt-title';
+    titleEl.textContent = title;
+    dialog.appendChild(titleEl);
+
+    const msgEl = document.createElement('div');
+    msgEl.className = 'prompt-message';
+    msgEl.textContent = message;
+    dialog.appendChild(msgEl);
+
+    const buttons = document.createElement('div');
+    buttons.className = 'prompt-buttons';
+
+    const okBtn = document.createElement('button');
+    okBtn.className = 'prompt-btn prompt-btn-confirm';
+    okBtn.textContent = '知道了';
+
+    buttons.appendChild(okBtn);
+    dialog.appendChild(buttons);
+    overlay.appendChild(dialog);
+    document.body.appendChild(overlay);
+
+    okBtn.focus();
+
+    const cleanup = () => {
+      overlay.remove();
+      resolve();
+    };
+
+    okBtn.onclick = cleanup;
+    overlay.onclick = (e) => { if (e.target === overlay) cleanup(); };
+    document.addEventListener('keydown', function handler(e) {
+      if (e.key === 'Enter' || e.key === 'Escape') {
+        cleanup();
+        document.removeEventListener('keydown', handler);
+      }
+    });
+  });
+}
+
+/**
  * 自定义 prompt 弹窗，替代 window.prompt
  * 返回 Promise<string | null>，取消返回 null
  */

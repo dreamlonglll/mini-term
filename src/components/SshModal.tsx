@@ -13,7 +13,7 @@ const INPUT_CLASS =
   'w-full bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1 text-base outline-none focus:border-[var(--accent)]';
 
 function emptyConnection(): SshConnection {
-  return { id: '', name: '', host: '', port: 22, user: '' };
+  return { id: '', name: '', host: '', port: 22, user: '', agentAccessible: false };
 }
 
 /** user@host:port 摘要（端口为 22 时省略） */
@@ -53,6 +53,7 @@ function SshConnectionForm({
   const [identityFile, setIdentityFile] = useState(initial.identityFile ?? '');
   const [proxyJump, setProxyJump] = useState(initial.proxyJump ?? '');
   const [group, setGroup] = useState(initial.group ?? '');
+  const [agentAccessible, setAgentAccessible] = useState(initial.agentAccessible ?? false);
 
   const handleBrowse = useCallback(async () => {
     const selected = await openDialog({ title: '选择私钥文件', multiple: false, directory: false });
@@ -74,6 +75,7 @@ function SshConnectionForm({
       identityFile: identityFile.trim() || undefined,
       proxyJump: proxyJump.trim() || undefined,
       group: group.trim() || undefined,
+      agentAccessible,
     });
   };
 
@@ -162,6 +164,20 @@ function SshConnectionForm({
           placeholder="如 内网 / 客户A"
         />
       </Field>
+      <div className="flex flex-col gap-1">
+        <label className="flex items-center gap-2 cursor-pointer select-none">
+          <input
+            type="checkbox"
+            className="accent-[var(--accent)]"
+            checked={agentAccessible}
+            onChange={(e) => setAgentAccessible(e.target.checked)}
+          />
+          <span className="text-base text-[var(--text-primary)]">允许 AI agent 访问</span>
+        </label>
+        <div className="text-xs text-[var(--text-muted)]">
+          勾选后此连接可被终端里的 AI 通过 SSH MCP 调用
+        </div>
+      </div>
       <div className="flex gap-2 justify-end pt-0.5">
         <button
           className="px-3 py-1 text-base text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors"
@@ -199,6 +215,7 @@ function SshRow({
         <div className="text-sm text-[var(--text-muted)] font-mono truncate">
           {connectionSummary(conn)}
           {conn.password ? ' · 已存密码' : ''}
+          {conn.agentAccessible ? ' · AI 可访问' : ''}
         </div>
       </div>
       <div className="hidden group-hover:flex items-center gap-1">

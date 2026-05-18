@@ -19,10 +19,15 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 name = "miniterm-hook"
 path = "src/bin/miniterm-hook.rs"
 
+[[bin]]
+name = "mt-ssh-mcp"
+path = "src/bin/mt-ssh-mcp.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+mt-core = { path = "mt-core" }
 tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
@@ -39,6 +44,10 @@ git2 = "0.19"
 pathdiff = "0.2"
 tiny_http = "0.12"
 toml_edit = "0.22"
+# SSH MCP sidecar (mt-ssh-mcp bin) 依赖:官方 rmcp stdio MCP server。
+# feature 仅 server + macros + transport-io(服务端 stdio),不开 HTTP/auth。
+rmcp = { version = "1", features = ["server", "macros", "transport-io"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
