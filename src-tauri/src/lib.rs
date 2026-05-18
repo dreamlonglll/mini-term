@@ -9,6 +9,7 @@ mod hook_server;
 mod process_monitor;
 mod pty;
 mod search;
+mod ssh;
 
 use tauri::Manager;
 
@@ -37,6 +38,7 @@ pub fn run() {
             // 必须发生在任何 read_config 之前。
             config::migrate_legacy_app_data(app.handle());
             clipboard::cleanup_old_clipboard_images();
+            ssh::cleanup_ssh_temp_keys();
 
             // 初始化 hook 状态并注册为 Tauri managed state
             let hook_state = hook_server::HookState::new();
@@ -81,6 +83,7 @@ pub fn run() {
             pty::resize_pty,
             pty::kill_pty,
             pty::arm_ssh_autofill,
+            ssh::prepare_ssh_key,
             fs::list_directory,
             fs::watch_directory,
             fs::unwatch_directory,

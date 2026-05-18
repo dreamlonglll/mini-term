@@ -12,11 +12,15 @@ interface Props {
   ptyId: number;
 }
 
-/** 把 SSH 连接拼成 ssh 命令行 */
-function buildSshCommand(conn: SshConnection): string {
+/**
+ * 把 SSH 连接拼成 ssh 命令行。
+ * identityPath 为解析后的私钥路径(可能是后端收紧权限的临时副本),
+ * 未配置私钥时传 undefined。
+ */
+function buildSshCommand(conn: SshConnection, identityPath: string | undefined): string {
   const parts = ['ssh'];
   if (conn.port && conn.port !== 22) parts.push('-p', String(conn.port));
-  const identity = conn.identityFile?.trim();
+  const identity = identityPath?.trim();
   // 反斜杠转正斜杠:Nushell/bash 等会把双引号内的 "\" 当转义符导致报错,
   // 而 Windows OpenSSH 接受正斜杠路径,正斜杠在所有 shell 中都安全
   if (identity) parts.push('-i', `"${identity.replace(/\\/g, '/')}"`);
@@ -35,7 +39,17 @@ async function connectSsh(ptyId: number, conn: SshConnection): Promise<void> {
       // 注册自动填充失败不阻断连接,用户可在终端手动输入密码
     }
   }
-  await writePtyInput(ptyId, `${buildSshCommand(conn)}\r`);
+  // 配了私钥时先复制到权限收紧的临时副本,绕过 OpenSSH 的
+  // "UNPROTECTED PRIVATE KEY FILE" 拒绝;准备失败回退原始路径让 ssh 自行报错
+  let identityPath = conn.identityFile?.trim() || undefined;
+  if (identityPath) {
+    try {
+      identityPath = await invoke<string>('prepare_ssh_key', { identityFile: identityPath });
+    } catch (e) {
+      console.error('准备 SSH 私钥临时副本失败,回退原始路径:', e);
+    }
+  }
+  await writePtyInput(ptyId, `${buildSshCommand(conn, identityPath)}\r`);
   getCachedTerminal(ptyId)?.term.focus();
 }
 
