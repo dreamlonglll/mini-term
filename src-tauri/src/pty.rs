@@ -251,6 +251,32 @@ fn strip_ansi_codes(s: &str) -> String {
     result
 }
 
+/// SSH 输出扫描结果
+enum SshPromptScan {
+    /// 尚未命中
+    None,
+    /// 命中密码提示,应回写密码
+    Password,
+    /// 命中 "Permission denied, please try again.",密码错误,应停止自动填充
+    AuthFailed,
+}
+
+/// 扫描(已 strip ANSI、仅保留尾部的)SSH 输出文本,判定是否到达密码提示。
+/// 先判 AuthFailed:错误密码重试场景下残留 buffer 可能同时含旧的失败提示与新的
+/// 密码提示,此时必须停止而非继续灌密码。
+fn scan_ssh_prompt(text: &str) -> SshPromptScan {
+    let lower = text.to_lowercase();
+    if lower.contains("permission denied, please try again") {
+        return SshPromptScan::AuthFailed;
+    }
+    // 命中 "<user>@<host>'s password:" 与键盘交互的 "Password:";
+    // host-key 确认提示以 "?" 结尾、passphrase 提示以 "':" 结尾,均不会误命中。
+    if lower.trim_end().ends_with("password:") {
+        return SshPromptScan::Password;
+    }
+    SshPromptScan::None
+}
+
 fn command_word_matches_ai(word: &str) -> bool {
     let word = word.trim_matches(|c| matches!(c, '"' | '\'' | '`'));
     let basename = word.rsplit(['/', '\\']).next().unwrap_or(word);
@@ -309,6 +335,14 @@ fn output_contains_ai_command(output: &str) -> bool {
         .any(line_contains_ai_command)
 }
 
+struct SshAutofillState {
+    password: String,
+    /// 累加的输出尾部,用于跨缓冲块匹配密码提示
+    residual: String,
+    /// 已填充或已禁用(命中错误密码)后置位,后续输出不再处理
+    done: bool,
+}
+
 #[derive(Clone)]
 pub struct PtyManager {
     instances: Arc<Mutex<HashMap<u32, PtyInstance>>>,
@@ -321,6 +355,8 @@ pub struct PtyManager {
     pending_submits: Arc<Mutex<HashMap<u32, Vec<UserSubmit>>>>,
     /// resize 冷却窗口结束时间:在此之前 PTY 输出不刷新 last_output
     tui_redraw_cooldown_until: Arc<Mutex<HashMap<u32, Instant>>>,
+    /// SSH 密码自动填充状态(arm_ssh_autofill 注册,命中密码提示后回写)
+    ssh_autofill: Arc<Mutex<HashMap<u32, SshAutofillState>>>,
 }
 
 impl PtyManager {
@@ -335,6 +371,7 @@ impl PtyManager {
             last_enter: Arc::new(Mutex::new(HashMap::new())),
             pending_submits: Arc::new(Mutex::new(HashMap::new())),
             tui_redraw_cooldown_until: Arc::new(Mutex::new(HashMap::new())),
+            ssh_autofill: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -385,6 +422,58 @@ impl PtyManager {
     pub fn note_focus_event(&self, pty_id: u32, data: &str) {
         if data == FOCUS_IN_SEQ || data == FOCUS_OUT_SEQ {
             self.bump_cooldown(pty_id, FOCUS_COOLDOWN);
+        }
+    }
+
+    /// 注册某个 pty 的 SSH 密码自动填充。再次调用会重置状态(覆盖密码、清除 done)。
+    pub fn arm_ssh_autofill(&self, pty_id: u32, password: String) {
+        self.ssh_autofill.lock().unwrap().insert(
+            pty_id,
+            SshAutofillState {
+                password,
+                residual: String::new(),
+                done: false,
+            },
+        );
+    }
+
+    /// 扫描 pty 输出:命中密码提示则把已保存的密码回写到 PTY(每个 pty 只填一次);
+    /// 命中 "Permission denied, please try again." 则永久禁用,避免连灌错误密码。
+    fn process_ssh_autofill(&self, pty_id: u32, data: &str) {
+        let to_fill: Option<String> = {
+            let mut map = self.ssh_autofill.lock().unwrap();
+            match map.get_mut(&pty_id) {
+                Some(st) if !st.done => {
+                    st.residual.push_str(&strip_ansi_codes(data));
+                    // 仅保留尾部,解决跨 16ms/4096B 分块的提示匹配;按 char 边界截断
+                    const KEEP: usize = 256;
+                    let count = st.residual.chars().count();
+                    if count > KEEP {
+                        st.residual = st.residual.chars().skip(count - KEEP).collect();
+                    }
+                    match scan_ssh_prompt(&st.residual) {
+                        SshPromptScan::AuthFailed => {
+                            st.done = true;
+                            None
+                        }
+                        SshPromptScan::Password => {
+                            st.done = true;
+                            Some(st.password.clone())
+                        }
+                        SshPromptScan::None => None,
+                    }
+                }
+                _ => None,
+            }
+        };
+        if let Some(password) = to_fill {
+            if let Ok(mut instances) = self.instances.lock() {
+                if let Some(inst) = instances.get_mut(&pty_id) {
+                    let _ = inst.writer.write_all(password.as_bytes());
+                    let _ = inst.writer.write_all(b"\r");
+                    let _ = inst.writer.flush();
+                }
+            }
         }
     }
 
@@ -688,6 +777,9 @@ pub fn create_pty(
                 if valid_len > 0 {
                     let data = String::from_utf8_lossy(&pending[..valid_len]).into_owned();
 
+                    // SSH 密码自动填充:扫描输出,命中密码提示则回写已保存的密码
+                    mgr_flush.process_ssh_autofill(pty_id_for_reader, &data);
+
                     // 基于输出扫描检测 AI 会话（补偿上箭头历史调用 / PSReadLine 补全）：
                     // 若在 Enter 后 2 秒内收到包含 AI 命令 echo 的输出，自动标记为 AI 会话
                     {
@@ -860,6 +952,7 @@ pub fn kill_pty(
     state.last_ctrlc.lock().unwrap().remove(&pty_id);
     state.last_enter.lock().unwrap().remove(&pty_id);
     state.pending_submits.lock().unwrap().remove(&pty_id);
+    state.ssh_autofill.lock().unwrap().remove(&pty_id);
     state
         .tui_redraw_cooldown_until
         .lock()
@@ -889,6 +982,17 @@ pub fn kill_pty(
         });
     }
 
+    Ok(())
+}
+
+/// 为某个 pty 注册 SSH 密码自动填充。前端在写入 `ssh` 命令前调用(连接配有密码时)。
+#[tauri::command]
+pub fn arm_ssh_autofill(
+    state: tauri::State<'_, PtyManager>,
+    pty_id: u32,
+    password: String,
+) -> Result<(), String> {
+    state.arm_ssh_autofill(pty_id, password);
     Ok(())
 }
 
@@ -1344,5 +1448,59 @@ mod tests {
         mgr.note_focus_event(1, "\x1b[I");
         assert!(mgr.is_in_cooldown(1));
         assert!(!mgr.is_in_cooldown(2));
+    }
+
+    #[test]
+    fn scan_ssh_prompt_detects_password() {
+        assert!(matches!(
+            scan_ssh_prompt("root@10.0.0.5's password: "),
+            SshPromptScan::Password
+        ));
+        assert!(matches!(
+            scan_ssh_prompt("Password:"),
+            SshPromptScan::Password
+        ));
+    }
+
+    #[test]
+    fn scan_ssh_prompt_detects_auth_failure() {
+        assert!(matches!(
+            scan_ssh_prompt("Permission denied, please try again."),
+            SshPromptScan::AuthFailed
+        ));
+    }
+
+    #[test]
+    fn scan_ssh_prompt_auth_failure_takes_priority() {
+        // 错误密码后:残留 buffer 同时含失败提示与新密码提示 → 必须停止
+        let buf = "Permission denied, please try again.\r\nroot@host's password: ";
+        assert!(matches!(scan_ssh_prompt(buf), SshPromptScan::AuthFailed));
+    }
+
+    #[test]
+    fn scan_ssh_prompt_ignores_hostkey_and_passphrase() {
+        assert!(matches!(
+            scan_ssh_prompt("Are you sure you want to continue connecting (yes/no/[fingerprint])? "),
+            SshPromptScan::None
+        ));
+        assert!(matches!(
+            scan_ssh_prompt("Enter passphrase for key '/home/u/.ssh/id_rsa': "),
+            SshPromptScan::None
+        ));
+    }
+
+    #[test]
+    fn scan_ssh_prompt_ignores_plain_output() {
+        assert!(matches!(
+            scan_ssh_prompt("Last login: Mon May 18\r\n$ "),
+            SshPromptScan::None
+        ));
+    }
+
+    #[test]
+    fn arm_ssh_autofill_registers_state() {
+        let mgr = PtyManager::new();
+        mgr.arm_ssh_autofill(7, "secret".into());
+        assert!(mgr.ssh_autofill.lock().unwrap().contains_key(&7));
     }
 }

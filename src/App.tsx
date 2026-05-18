@@ -12,6 +12,7 @@ import { FileTree } from './components/FileTree';
 import { GitHistory } from './components/GitHistory';
 import { ActivityBar } from './components/ActivityBar';
 import { SettingsModal } from './components/SettingsModal';
+import { SshModal } from './components/SshModal';
 import { SearchModal } from './components/SearchModal';
 import { ToastContainer } from './components/ToastContainer';
 import { useTauriEvent } from './hooks/useTauriEvent';
@@ -27,6 +28,7 @@ import type { AppConfig, PtyStatusChangePayload, PtyExitPayload, PaneStatus } fr
 export function App() {
   const [configLoaded, setConfigLoaded] = useState(false);
   const [configOpen, setConfigOpen] = useState(false);
+  const [sshOpen, setSshOpen] = useState(false);
   const [currentVersion, setCurrentVersion] = useState('');
   const [updateInfo, setUpdateInfo] = useState<ReleaseInfo | null>(null);
   const [mountedProjectIds, setMountedProjectIds] = useState<string[]>([]);
@@ -247,6 +249,7 @@ export function App() {
         <div className="w-px h-3.5 bg-[var(--border-default)]" />
         <div className="flex items-center gap-3 text-[var(--text-muted)]" data-no-drag>
           <span className="cursor-pointer hover:text-[var(--text-primary)] transition-colors duration-150" onClick={() => setConfigOpen(true)}>设置</span>
+          <span className="cursor-pointer hover:text-[var(--text-primary)] transition-colors duration-150" onClick={() => setSshOpen(true)}>SSH</span>
         </div>
         <div className="flex-1" />
       </div>
@@ -310,6 +313,7 @@ export function App() {
         </Allotment> : null}
       </div>
       <SettingsModal open={configOpen} onClose={() => setConfigOpen(false)} />
+      <SshModal open={sshOpen} onClose={() => setSshOpen(false)} />
       <SearchModal open={searchModalOpen} onClose={() => setSearchModalOpen(false)} />
       <ToastContainer />
     </div>

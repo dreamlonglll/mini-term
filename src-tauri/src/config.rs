@@ -97,6 +97,8 @@ pub struct AppConfig {
     pub hook_enabled: bool,
     #[serde(default)]
     pub smart_copy_paste: bool,
+    #[serde(default)]
+    pub ssh_connections: Vec<SshConnection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,6 +165,24 @@ pub struct ShellConfig {
 pub struct EditorConfig {
     pub name: String,
     pub command: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshConnection {
+    pub id: String,
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity_file: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_jump: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 fn default_ui_font_size() -> f64 {
@@ -233,6 +253,7 @@ impl Default for AppConfig {
             last_active_project_id: None,
             hook_enabled: false,
             smart_copy_paste: false,
+            ssh_connections: vec![],
         }
     }
 }

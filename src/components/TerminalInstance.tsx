@@ -3,12 +3,65 @@ import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '../store';
 import { getOrCreateTerminal, getCachedTerminal, activateWebgl, getTerminalTheme, DARK_TERMINAL_THEME, writePtyInput, copyTerminalSelection, pasteToTerminal } from '../utils/terminalCache';
 import { getResolvedTheme } from '../utils/themeManager';
-import { showContextMenu } from '../utils/contextMenu';
+import { showContextMenu, type MenuEntry } from '../utils/contextMenu';
 import { isFileDragging, getFileDragPath } from '../utils/fileDragState';
+import type { SshConnection } from '../types';
 import '@xterm/xterm/css/xterm.css';
 
 interface Props {
   ptyId: number;
+}
+
+/** 把 SSH 连接拼成 ssh 命令行 */
+function buildSshCommand(conn: SshConnection): string {
+  const parts = ['ssh'];
+  if (conn.port && conn.port !== 22) parts.push('-p', String(conn.port));
+  const identity = conn.identityFile?.trim();
+  // 反斜杠转正斜杠:Nushell/bash 等会把双引号内的 "\" 当转义符导致报错,
+  // 而 Windows OpenSSH 接受正斜杠路径,正斜杠在所有 shell 中都安全
+  if (identity) parts.push('-i', `"${identity.replace(/\\/g, '/')}"`);
+  const jump = conn.proxyJump?.trim();
+  if (jump) parts.push('-J', jump);
+  parts.push(`${conn.user}@${conn.host}`);
+  return parts.join(' ');
+}
+
+/** 在指定终端中连接 SSH:有密码先注册自动填充,再写入 ssh 命令并回车 */
+async function connectSsh(ptyId: number, conn: SshConnection): Promise<void> {
+  if (conn.password) {
+    try {
+      await invoke('arm_ssh_autofill', { ptyId, password: conn.password });
+    } catch {
+      // 注册自动填充失败不阻断连接,用户可在终端手动输入密码
+    }
+  }
+  await writePtyInput(ptyId, `${buildSshCommand(conn)}\r`);
+  getCachedTerminal(ptyId)?.term.focus();
+}
+
+/** 构建终端右键菜单的「SSH 连接」子菜单(按 group 分组) */
+function buildSshSubmenu(connections: SshConnection[], ptyId: number): MenuEntry[] {
+  const groups: { group?: string; items: SshConnection[] }[] = [];
+  for (const conn of connections) {
+    const g = conn.group?.trim() || undefined;
+    let bucket = groups.find((x) => x.group === g);
+    if (!bucket) {
+      bucket = { group: g, items: [] };
+      groups.push(bucket);
+    }
+    bucket.items.push(conn);
+  }
+  const hasNamedGroup = groups.some((g) => g.group);
+  const entries: MenuEntry[] = [];
+  for (const bucket of groups) {
+    if (bucket.group || hasNamedGroup) {
+      entries.push({ header: bucket.group ?? '未分组' });
+    }
+    for (const conn of bucket.items) {
+      entries.push({ label: conn.name, onClick: () => void connectSsh(ptyId, conn) });
+    }
+  }
+  return entries;
 }
 
 export function TerminalInstance({ ptyId }: Props) {
@@ -16,6 +69,7 @@ export function TerminalInstance({ ptyId }: Props) {
   const [fileDrag, setFileDrag] = useState(false);
   const terminalFontSize = useAppStore((s) => s.config.terminalFontSize);
   const terminalFollowTheme = useAppStore((s) => s.config.terminalFollowTheme);
+  const sshConnections = useAppStore((s) => s.config.sshConnections);
 
   // 终端不跟随主题且处于浅色模式时，覆写 CSS 变量让整个终端区域（含 .xterm）统一深色
   const forceDarkBg = !terminalFollowTheme && getResolvedTheme() === 'light';
@@ -149,7 +203,7 @@ export function TerminalInstance({ ptyId }: Props) {
   const handleContextMenu = (e: React.MouseEvent<HTMLDivElement>) => {
     e.preventDefault();
     const hasSelection = !!getCachedTerminal(ptyId)?.term.getSelection();
-    showContextMenu(e.clientX, e.clientY, [
+    const menu: MenuEntry[] = [
       {
         label: '复制',
         disabled: !hasSelection,
@@ -162,7 +216,12 @@ export function TerminalInstance({ ptyId }: Props) {
           getCachedTerminal(ptyId)?.term.focus();
         },
       },
-    ]);
+      { separator: true },
+      sshConnections.length > 0
+        ? { label: 'SSH 连接', submenu: buildSshSubmenu(sshConnections, ptyId) }
+        : { label: 'SSH 连接（暂无）', disabled: true },
+    ];
+    showContextMenu(e.clientX, e.clientY, menu);
   };
 
   return (

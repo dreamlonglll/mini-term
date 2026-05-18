@@ -80,6 +80,7 @@ pub fn run() {
             pty::write_pty,
             pty::resize_pty,
             pty::kill_pty,
+            pty::arm_ssh_autofill,
             fs::list_directory,
             fs::watch_directory,
             fs::unwatch_directory,

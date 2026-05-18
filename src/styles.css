@@ -349,6 +349,29 @@ body.project-dragging {
   margin: 4px 0;
 }
 
+.ctx-menu-header {
+  padding: 6px 12px 3px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  cursor: default;
+}
+
+.ctx-menu-item.has-submenu {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.ctx-menu-item.has-submenu::after {
+  content: '▸';
+  font-size: 10px;
+  opacity: 0.6;
+}
+
 /* ===== Prompt dialog ===== */
 .prompt-overlay {
   position: fixed;

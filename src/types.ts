@@ -41,6 +41,7 @@ export interface AppConfig {
   lastActiveProjectId?: string;
   hookEnabled: boolean;
   smartCopyPaste: boolean;
+  sshConnections: SshConnection[];
 }
 
 export interface ProjectConfig {
@@ -60,6 +61,18 @@ export interface ShellConfig {
 export interface EditorConfig {
   name: string;
   command: string;
+}
+
+export interface SshConnection {
+  id: string;
+  name: string;
+  host: string;
+  port: number;
+  user: string;
+  password?: string;
+  identityFile?: string;
+  proxyJump?: string;
+  group?: string;
 }
 
 // === 布局持久化 ===
