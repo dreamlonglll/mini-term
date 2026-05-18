@@ -140,14 +140,21 @@ export function ProjectList() {
     };
   }, []);
 
-  const handleAddProject = useCallback(async () => {
+  const handleAddProject = useCallback(async (targetGroupId?: string) => {
     const selected = await open({ directory: true, multiple: false });
     if (!selected) return;
     const path = selected as string;
     const name = path.split(/[/\\]/).pop() || path;
-    addProject({ id: genId(), name, path });
+    const id = genId();
+    addProject({ id, name, path });
+    if (targetGroupId) {
+      moveItem(id, targetGroupId);
+      // 目标分组若折叠则展开,确保新项目可见
+      const grp = findGroupInTree(useAppStore.getState().config.projectTree ?? [], targetGroupId);
+      if (grp?.collapsed) toggleGroupCollapse(targetGroupId);
+    }
     saveConfig();
-  }, [addProject]);
+  }, [addProject, moveItem, toggleGroupCollapse]);
 
   const handleRemoveProject = useCallback(
     (e: React.MouseEvent, id: string) => {
@@ -447,6 +454,7 @@ export function ProjectList() {
             e.stopPropagation();
             const menuItems: Parameters<typeof showContextMenu>[2] = [
               { label: '重命名分组', onClick: () => startRenameGroup(group.id, group.name) },
+              { label: '添加项目', onClick: () => handleAddProject(group.id) },
             ];
             if (depth > 0) {
               menuItems.push({
@@ -554,7 +562,7 @@ export function ProjectList() {
             <div className="p-2 flex gap-1.5">
               <div
                 className="flex-1 px-3 py-2 border border-dashed border-[var(--border-default)] rounded-[var(--radius-md)] text-center text-sm text-[var(--text-muted)] cursor-pointer hover:border-[var(--accent)] hover:text-[var(--accent)] transition-all duration-200"
-                onClick={handleAddProject}
+                onClick={() => handleAddProject()}
               >
                 + 添加项目
               </div>
