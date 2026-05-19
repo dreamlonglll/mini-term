@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.4.8-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.4.9-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -57,6 +57,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 - **密码自动填充** — 配了密码的连接，后端扫描 PTY 输出命中密码提示自动回写密码，每会话只填一次，密码错误时停止以防连灌错误密码
 - **私钥权限自动处理** — 使用私钥连接时自动把密钥复制到权限收紧的临时副本（Windows `icacls` / Unix `0600`），绕过 OpenSSH「UNPROTECTED PRIVATE KEY FILE」拒绝，不修改用户原始密钥文件
 - **进阶能力** — 密钥文件登录（`ssh -i`）、跳板机 / ProxyJump（`ssh -J`）、连接分组管理
+- **SSH MCP Server** — 把已保存的 SSH 连接作为 MCP 工具暴露给终端里运行的 AI agent（Claude Code / Codex）。项目右键菜单「关联 SSH」勾选连接即按项目启用，并把可见范围限定在所选连接；内置 `mt-ssh-mcp` sidecar（基于官方 rmcp 的 stdio MCP server）提供 `ssh_list_connections`、`ssh_exec` 两个工具，`ssh_exec` 复用密码自动填充 / 私钥 / 跳板机能力，带超时、输出封顶与审计日志；启用 / 停用时按命名 marker 幂等写入 Claude `.mcp.json` 与 Codex `.codex/config.toml`
 
 ### 文件搜索
 
@@ -221,7 +222,7 @@ mini-term/
 │       ├── projectDataCache.ts   # FileTree / GitHistory 项目级数据缓存
 │       ├── themeManager.ts       # 主题切换 + 系统配色监听
 │       └── updateChecker.ts      # GitHub Release 版本检查
-├── src-tauri/                    # Rust 后端
+├── src-tauri/                    # Rust 后端（Tauri 应用 + 共享 crate + sidecar）
 │   ├── src/
 │   │   ├── lib.rs                # Tauri 初始化与命令 / 插件注册
 │   │   ├── pty.rs                # PTY 生命周期 + AI 会话识别
@@ -232,9 +233,15 @@ mini-term/
 │   │   ├── search.rs             # 全局文件搜索（文件名 + 内容，流式推送）
 │   │   ├── ai_sessions.rs        # Claude / Codex 会话记录读取
 │   │   ├── hook_server.rs        # Hook HTTP 服务器（接收 AI 工具事件）
-│   │   └── hook_registry.rs      # Hook 注册 / 卸载（Claude Code + Codex）
-│   └── src/bin/
-│       └── miniterm-hook.rs      # Hook CLI 小工具（被 AI 工具 hook 调用）
+│   │   ├── hook_registry.rs      # Hook 注册 / 卸载（Claude Code + Codex）
+│   │   ├── ssh.rs                # SSH 连接管理 + 密码自动填充 / 私钥处理
+│   │   └── ssh_mcp_registry.rs   # 按项目启用 SSH MCP（写入 .mcp.json / Codex 配置）
+│   ├── mt-core/                  # 无 tauri 依赖的共享库 crate（SSH 类型 / 配置 / 私钥）
+│   └── mt-sidecars/src/bin/      # 独立 sidecar crate（不依赖 tauri-build）
+│       ├── miniterm-hook.rs      # Hook CLI 小工具（被 AI 工具 hook 调用）
+│       └── mt-ssh-mcp.rs         # SSH MCP server（rmcp stdio，供终端 AI agent 调用）
+├── scripts/
+│   └── stage-sidecars.mjs        # 构建 sidecar 并按 triple 就位为 Tauri externalBin
 └── package.json
 ```
 
