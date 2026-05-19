@@ -154,6 +154,10 @@ pub struct ProjectConfig {
     /// 是否已为该项目启用 SSH MCP（向项目目录写入了 Claude / Codex 的 MCP 注册配置）。
     #[serde(default)]
     pub ssh_mcp_enabled: bool,
+    /// 该项目的 agent 可访问的 SSH 连接 id 列表（「关联 SSH」设定的范围）。
+    /// `None` = 未设置 → 默认全部连接可见。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_connection_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

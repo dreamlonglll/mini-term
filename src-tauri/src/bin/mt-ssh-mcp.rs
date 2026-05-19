@@ -64,18 +64,16 @@ struct SshConnectionView {
     /// 连接所属分组(可选)。
     #[serde(skip_serializing_if = "Option::is_none")]
     group: Option<String>,
-    /// 是否对 agent 可见。能出现在本列表里的恒为 true。
-    agent_accessible: bool,
 }
 
-/// 把原始连接列表过滤 + 投影成对 agent 可见的视图。
+/// 把连接列表投影成对 agent 可见的视图。
 ///
-/// 安全核心:只保留 `agent_accessible == true` 的连接,并映射到不含
-/// `password` / `identityFile` 的 `SshConnectionView`。抽成纯函数便于单测。
-fn visible_connections(conns: Vec<mt_core::SshConnection>) -> Vec<SshConnectionView> {
+/// 安全核心:映射到不含 `password` / `identityFile` 的 `SshConnectionView`,
+/// 绝不把明文密码序列化给 agent。传入的连接列表已由
+/// `read_ssh_connections_for_project` 按项目关联范围过滤。抽成纯函数便于单测。
+fn connection_views(conns: Vec<mt_core::SshConnection>) -> Vec<SshConnectionView> {
     conns
         .into_iter()
-        .filter(|c| c.agent_accessible)
         .map(|c| SshConnectionView {
             id: c.id,
             name: c.name,
@@ -83,7 +81,6 @@ fn visible_connections(conns: Vec<mt_core::SshConnection>) -> Vec<SshConnectionV
             port: c.port,
             user: c.user,
             group: c.group,
-            agent_accessible: c.agent_accessible,
         })
         .collect()
 }
@@ -135,13 +132,15 @@ struct SshExecResult {
 // ssh_exec —— 纯逻辑(可单测)
 // ---------------------------------------------------------------------------
 
-/// 在连接列表里按 name 或 id 查找连接,并校验 `agent_accessible`。
+/// 在连接列表里按 name 或 id 查找连接。
 ///
 /// 匹配规则(先 name 后 id,均大小写敏感,与 SshModal 行为一致):
 /// - name 精确命中多条 → 歧义错误;
 /// - name 无命中再按 id 精确命中;
-/// - 命中的连接 `agent_accessible == false` → 未授权错误。
+/// - 均无命中 → 未找到错误。
 ///
+/// 传入列表已由 `read_ssh_connections_for_project` 按项目关联范围过滤,
+/// 因此本项目无权访问的连接天然「未找到」,无需再单独校验授权。
 /// 所有错误信息**不含密码**(只回显用户给的标识符)。
 fn find_connection(
     conns: &[mt_core::SshConnection],
@@ -149,35 +148,21 @@ fn find_connection(
 ) -> Result<mt_core::SshConnection, String> {
     let by_name: Vec<&mt_core::SshConnection> =
         conns.iter().filter(|c| c.name == selector).collect();
-    let matched = match by_name.len() {
-        1 => by_name[0],
-        n if n > 1 => {
-            return Err(format!(
-                "SSH connection name '{selector}' is ambiguous: {n} connections share this name. \
-                Use the connection id instead."
-            ));
-        }
-        _ => {
-            // name 无命中 → 退而按 id 精确匹配
-            match conns.iter().find(|c| c.id == selector) {
-                Some(c) => c,
-                None => {
-                    return Err(format!(
-                        "No SSH connection found matching '{selector}'. \
-                        Call ssh_list_connections to see available connections."
-                    ));
-                }
-            }
-        }
-    };
-
-    if !matched.agent_accessible {
-        return Err(format!(
-            "SSH connection '{selector}' is not marked accessible to agents. \
-            Enable it in mini-term's SSH manager first."
-        ));
+    match by_name.len() {
+        1 => Ok(by_name[0].clone()),
+        n if n > 1 => Err(format!(
+            "SSH connection name '{selector}' is ambiguous: {n} connections share this name. \
+            Use the connection id instead."
+        )),
+        // name 无命中 → 退而按 id 精确匹配
+        _ => match conns.iter().find(|c| c.id == selector) {
+            Some(c) => Ok(c.clone()),
+            None => Err(format!(
+                "No SSH connection found matching '{selector}'. \
+                Call ssh_list_connections to see available connections."
+            )),
+        },
     }
-    Ok(matched.clone())
 }
 
 /// 拼远程要执行的命令:`cwd` 非空时前缀 `cd <cwd> && `。
@@ -549,16 +534,40 @@ fn strip_recent_text(collected: &[u8]) -> String {
     mt_core::strip_ansi_codes(&String::from_utf8_lossy(tail))
 }
 
+/// 从进程参数里解析 `--project-id <id>`。
+///
+/// 支持 `--project-id <value>` 与 `--project-id=<value>` 两种写法。
+/// 未提供 / 值为空白 → `None`(不限定项目,暴露全部连接)。
+/// 抽成纯函数(入参为参数序列)便于单测;解析绝不 panic。
+fn parse_project_id<I: IntoIterator<Item = String>>(args: I) -> Option<String> {
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        if let Some(rest) = arg.strip_prefix("--project-id=") {
+            let v = rest.trim();
+            return (!v.is_empty()).then(|| v.to_string());
+        }
+        if arg == "--project-id" {
+            let v = iter.next()?.trim().to_string();
+            return (!v.is_empty()).then_some(v);
+        }
+    }
+    None
+}
+
 #[derive(Clone)]
-struct SshMcp;
+struct SshMcp {
+    /// 本 sidecar 所属项目的 id(来自启动参数 `--project-id`)。
+    /// `None` = 未指定项目 → 暴露全部已保存连接。
+    project_id: Option<String>,
+}
 
 #[tool_router]
 impl SshMcp {
-    /// 列出对 agent 可见的、已保存的 SSH 连接。
+    /// 列出本项目可访问的、已保存的 SSH 连接。
     ///
-    /// 只返回 `agentAccessible == true` 的连接,且**不含任何密码字段**。
+    /// 范围由 mini-term 里该项目的「关联 SSH」设定决定,且**不含任何密码字段**。
     #[tool(
-        description = "List the saved SSH connections that are marked accessible to AI agents. \
+        description = "List the saved SSH connections this project's agent may access. \
         Returns connection metadata (id, name, host, port, user, group) with NO passwords. \
         Use a connection's name (or id) with ssh_exec to run commands on that host."
     )]
@@ -566,8 +575,11 @@ impl SshMcp {
         &self,
         Parameters(ListConnectionsArgs {}): Parameters<ListConnectionsArgs>,
     ) -> Result<CallToolResult, McpError> {
-        // 读全局 config.json 的 sshConnections;文件缺失/解析失败时为空 Vec。
-        let views = visible_connections(mt_core::read_ssh_connections());
+        // 读全局 config.json 的 sshConnections,并按本项目的关联范围过滤;
+        // 文件缺失/解析失败时为空 Vec。
+        let views = connection_views(mt_core::read_ssh_connections_for_project(
+            self.project_id.as_deref(),
+        ));
 
         // 序列化失败属于不可恢复的内部错误,回结构化 MCP 错误而非 panic。
         let json = serde_json::to_string(&views).map_err(|e| {
@@ -583,7 +595,7 @@ impl SshMcp {
         Provide the connection's name (or id) and the command. \
         Optionally set timeout_secs (default 60) and cwd (remote working directory). \
         Returns stdout, stderr, exitCode and a truncated flag. \
-        Only connections marked accessible to agents can be used."
+        Only connections this project is associated with can be used."
     )]
     async fn ssh_exec(
         &self,
@@ -596,9 +608,12 @@ impl SshMcp {
             cwd,
         } = args;
 
-        // 1. 查连接 + 校验授权。错误不含密码。
-        let conn = find_connection(&mt_core::read_ssh_connections(), &connection)
-            .map_err(|e| McpError::invalid_params(e, None))?;
+        // 1. 查连接(列表已按本项目关联范围过滤,越权连接天然「未找到」)。错误不含密码。
+        let conn = find_connection(
+            &mt_core::read_ssh_connections_for_project(self.project_id.as_deref()),
+            &connection,
+        )
+        .map_err(|e| McpError::invalid_params(e, None))?;
 
         // 2. 拼远程命令(可选 cwd 前缀)。
         let remote_command = build_remote_command(&command, cwd.as_deref());
@@ -669,13 +684,22 @@ impl ServerHandler for SshMcp {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 启动参数 `--project-id <id>` 决定本 sidecar 所属项目;缺省则暴露全部连接。
+    let project_id = parse_project_id(std::env::args().skip(1));
+
     // 日志走 stderr —— stdout 留给 MCP 协议 JSON。失败也只往 stderr 写。
-    eprintln!("[mt-ssh-mcp] starting stdio MCP server");
+    eprintln!(
+        "[mt-ssh-mcp] starting stdio MCP server (project: {})",
+        project_id.as_deref().unwrap_or("<all>")
+    );
 
     // 握手并注册工具;.serve() 绑定进程的 stdin/stdout 作为 stdio 传输。
-    let service = SshMcp.serve(stdio()).await.inspect_err(|e| {
-        eprintln!("[mt-ssh-mcp] failed to start server: {e}");
-    })?;
+    let service = SshMcp { project_id }
+        .serve(stdio())
+        .await
+        .inspect_err(|e| {
+            eprintln!("[mt-ssh-mcp] failed to start server: {e}");
+        })?;
 
     // 阻塞直到 stdin 关闭 / 客户端断开 —— 这是 sidecar 正常退出的信号。
     service.waiting().await?;
@@ -688,7 +712,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
 
-    fn conn(id: &str, accessible: bool, password: Option<&str>) -> mt_core::SshConnection {
+    fn conn(id: &str, password: Option<&str>) -> mt_core::SshConnection {
         mt_core::SshConnection {
             id: id.into(),
             name: format!("conn-{id}"),
@@ -699,35 +723,64 @@ mod tests {
             identity_file: Some("/home/u/.ssh/id_rsa".into()),
             proxy_jump: None,
             group: Some("内网".into()),
-            agent_accessible: accessible,
         }
     }
 
+    // --- parse_project_id ---
+
     #[test]
-    fn visible_connections_keeps_only_agent_accessible() {
-        let conns = vec![
-            conn("1", true, Some("secret1")),
-            conn("2", false, Some("secret2")),
-            conn("3", true, None),
-        ];
-        let views = visible_connections(conns);
-        assert_eq!(views.len(), 2);
-        let ids: Vec<&str> = views.iter().map(|v| v.id.as_str()).collect();
-        assert_eq!(ids, ["1", "3"]);
-        assert!(views.iter().all(|v| v.agent_accessible));
+    fn parse_project_id_space_form() {
+        let args = vec!["--project-id".to_string(), "p1".to_string()];
+        assert_eq!(parse_project_id(args), Some("p1".to_string()));
     }
 
     #[test]
-    fn visible_connections_empty_when_none_accessible() {
-        let conns = vec![conn("1", false, None), conn("2", false, None)];
-        assert!(visible_connections(conns).is_empty());
+    fn parse_project_id_equals_form() {
+        let args = vec!["--project-id=p2".to_string()];
+        assert_eq!(parse_project_id(args), Some("p2".to_string()));
+    }
+
+    #[test]
+    fn parse_project_id_absent_yields_none() {
+        let args = vec!["--other".to_string(), "x".to_string()];
+        assert_eq!(parse_project_id(args), None);
+    }
+
+    #[test]
+    fn parse_project_id_blank_value_yields_none() {
+        assert_eq!(
+            parse_project_id(vec!["--project-id".to_string(), "  ".to_string()]),
+            None
+        );
+        assert_eq!(parse_project_id(vec!["--project-id=".to_string()]), None);
+    }
+
+    #[test]
+    fn parse_project_id_missing_value_yields_none() {
+        assert_eq!(parse_project_id(vec!["--project-id".to_string()]), None);
+    }
+
+    // --- connection_views ---
+
+    #[test]
+    fn connection_views_projects_all_connections() {
+        // connection_views 本身不再过滤,原样投影传入的连接列表
+        let conns = vec![conn("1", Some("secret1")), conn("2", None)];
+        let views = connection_views(conns);
+        let ids: Vec<&str> = views.iter().map(|v| v.id.as_str()).collect();
+        assert_eq!(ids, ["1", "2"]);
+    }
+
+    #[test]
+    fn connection_views_empty_input_yields_empty() {
+        assert!(connection_views(vec![]).is_empty());
     }
 
     #[test]
     fn serialized_view_never_leaks_password_or_identity_file() {
         // 安全验收:即便源连接有明文密码与私钥路径,序列化结果也绝不能含它们。
-        let conns = vec![conn("1", true, Some("super-secret-password"))];
-        let views = visible_connections(conns);
+        let conns = vec![conn("1", Some("super-secret-password"))];
+        let views = connection_views(conns);
         let json = serde_json::to_string(&views).unwrap();
         assert!(!json.contains("super-secret-password"));
         assert!(!json.to_lowercase().contains("password"));
@@ -735,43 +788,35 @@ mod tests {
         assert!(!json.contains("id_rsa"));
         // 但应保留展示字段
         assert!(json.contains("\"host\":\"10.0.0.5\""));
-        assert!(json.contains("\"agentAccessible\":true"));
     }
 
     // --- find_connection ---
 
     #[test]
     fn find_connection_matches_by_name() {
-        let conns = vec![conn("1", true, None)];
+        let conns = vec![conn("1", None)];
         let found = find_connection(&conns, "conn-1").unwrap();
         assert_eq!(found.id, "1");
     }
 
     #[test]
     fn find_connection_matches_by_id_when_name_misses() {
-        let conns = vec![conn("abc", true, None)];
+        let conns = vec![conn("abc", None)];
         let found = find_connection(&conns, "abc").unwrap();
         assert_eq!(found.id, "abc");
     }
 
     #[test]
     fn find_connection_errors_when_not_found() {
-        let conns = vec![conn("1", true, None)];
+        let conns = vec![conn("1", None)];
         let err = find_connection(&conns, "does-not-exist").unwrap_err();
         assert!(err.contains("No SSH connection found"));
     }
 
     #[test]
-    fn find_connection_errors_when_not_accessible() {
-        let conns = vec![conn("1", false, None)];
-        let err = find_connection(&conns, "conn-1").unwrap_err();
-        assert!(err.contains("not marked accessible"));
-    }
-
-    #[test]
     fn find_connection_errors_on_ambiguous_name() {
-        let mut a = conn("1", true, None);
-        let mut b = conn("2", true, None);
+        let mut a = conn("1", None);
+        let mut b = conn("2", None);
         a.name = "dup".into();
         b.name = "dup".into();
         let err = find_connection(&[a, b], "dup").unwrap_err();
@@ -779,10 +824,10 @@ mod tests {
     }
 
     #[test]
-    fn find_connection_error_never_contains_password() {
-        // 安全:连接未授权时,错误信息不能泄漏该连接的明文密码。
-        let conns = vec![conn("1", false, Some("topsecretpw"))];
-        let err = find_connection(&conns, "conn-1").unwrap_err();
+    fn find_connection_not_found_error_never_contains_password() {
+        // 安全:未找到时错误信息只回显 selector,绝不泄漏任何连接的明文密码。
+        let conns = vec![conn("1", Some("topsecretpw"))];
+        let err = find_connection(&conns, "does-not-exist").unwrap_err();
         assert!(!err.contains("topsecretpw"));
     }
 
@@ -811,7 +856,7 @@ mod tests {
 
     #[test]
     fn build_ssh_args_minimal() {
-        let c = conn("1", true, None);
+        let c = conn("1", None);
         let args = build_ssh_args(&c, None, "uptime", true);
         // 默认端口 22 不出现 -p;无私钥不出现 -i;无跳板不出现 -J
         assert!(!args.contains(&"-p".to_string()));
@@ -824,7 +869,7 @@ mod tests {
 
     #[test]
     fn build_ssh_args_includes_non_default_port() {
-        let mut c = conn("1", true, None);
+        let mut c = conn("1", None);
         c.port = 2222;
         let args = build_ssh_args(&c, None, "uptime", true);
         let pos = args.iter().position(|a| a == "-p").unwrap();
@@ -833,7 +878,7 @@ mod tests {
 
     #[test]
     fn build_ssh_args_includes_identity_file_with_forward_slashes() {
-        let c = conn("1", true, None);
+        let c = conn("1", None);
         let args = build_ssh_args(&c, Some(r"C:\tmp\keys\abc.key"), "uptime", true);
         let pos = args.iter().position(|a| a == "-i").unwrap();
         // Windows 路径反斜杠转正斜杠
@@ -842,7 +887,7 @@ mod tests {
 
     #[test]
     fn build_ssh_args_includes_proxy_jump() {
-        let mut c = conn("1", true, None);
+        let mut c = conn("1", None);
         c.proxy_jump = Some("user@bastion".into());
         let args = build_ssh_args(&c, None, "uptime", true);
         let pos = args.iter().position(|a| a == "-J").unwrap();
@@ -851,7 +896,7 @@ mod tests {
 
     #[test]
     fn build_ssh_args_target_precedes_remote_command() {
-        let c = conn("1", true, None);
+        let c = conn("1", None);
         let args = build_ssh_args(&c, None, "cd /tmp && ls", true);
         let target_pos = args.iter().position(|a| a == "root@10.0.0.5").unwrap();
         // user@host 必须是倒数第二个,remote command 是最后一个
@@ -861,7 +906,7 @@ mod tests {
 
     #[test]
     fn build_ssh_args_batch_mode_toggles_batchmode_option() {
-        let c = conn("1", true, None);
+        let c = conn("1", None);
         // batch_mode = true(密钥/agent 路径):带 BatchMode=yes
         let with_batch = build_ssh_args(&c, None, "uptime", true);
         assert!(with_batch.contains(&"BatchMode=yes".to_string()));

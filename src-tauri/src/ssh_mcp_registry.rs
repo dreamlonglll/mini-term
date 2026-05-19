@@ -80,11 +80,14 @@ fn validate_project_dir(project_dir: &str) -> Result<PathBuf, String> {
 /// 严格按 Claude Code `.mcp.json` schema:stdio server 用 `type` / `command` /
 /// `args` / `env` 字段。`command` 用 `mt-ssh-mcp` 二进制绝对路径(机器相关,
 /// 因此也才需要把 `.mcp.json` 加进 `.gitignore`)。
-fn build_mcp_server_entry(binary_path: &str) -> Value {
+///
+/// `args` 携带 `--project-id <id>`,让 sidecar 知道自己属于哪个项目,
+/// 从而按该项目的「关联 SSH」范围过滤可见连接。
+fn build_mcp_server_entry(binary_path: &str, project_id: &str) -> Value {
     serde_json::json!({
         "type": "stdio",
         "command": binary_path,
-        "args": [],
+        "args": ["--project-id", project_id],
         "env": {}
     })
 }
@@ -93,7 +96,11 @@ fn build_mcp_server_entry(binary_path: &str) -> Value {
 ///
 /// 读现有 `.mcp.json`(没有则新建),只在 `mcpServers` 对象里增/改本 server
 /// 这一个 key,其它 server 与字段原样保留。
-fn write_project_mcp_json(project_dir: &Path, binary_path: &str) -> Result<(), String> {
+fn write_project_mcp_json(
+    project_dir: &Path,
+    binary_path: &str,
+    project_id: &str,
+) -> Result<(), String> {
     let mcp_path = project_dir.join(".mcp.json");
 
     let mut root: Value = if mcp_path.exists() {
@@ -120,7 +127,10 @@ fn write_project_mcp_json(project_dir: &Path, binary_path: &str) -> Result<(), S
         .as_object_mut()
         .ok_or_else(|| ".mcp.json 的 mcpServers 字段不是对象".to_string())?;
 
-    servers.insert(MCP_SERVER_NAME.to_string(), build_mcp_server_entry(binary_path));
+    servers.insert(
+        MCP_SERVER_NAME.to_string(),
+        build_mcp_server_entry(binary_path, project_id),
+    );
 
     let json_str = serde_json::to_string_pretty(&root)
         .map_err(|e| format!("序列化 .mcp.json 失败: {}", e))?;
@@ -179,8 +189,12 @@ fn remove_project_mcp_json(project_dir: &Path) -> Result<(), String> {
 /// 把 `[mcp_servers.mini-term-ssh]` 幂等写入 `<project>/.codex/config.toml`。
 ///
 /// 用 `toml_edit` 解析+改写,只动本 server 子表,其它内容原样保留。
-/// stdio server 只需 `command`(`args` / `env` 留空即可,本 sidecar 无需参数)。
-fn write_project_codex_config(project_dir: &Path, binary_path: &str) -> Result<(), String> {
+/// 写 `command` 与 `args`(`args` 携带 `--project-id`,见 `apply_codex_mcp_server`)。
+fn write_project_codex_config(
+    project_dir: &Path,
+    binary_path: &str,
+    project_id: &str,
+) -> Result<(), String> {
     let codex_dir = project_dir.join(".codex");
     std::fs::create_dir_all(&codex_dir)
         .map_err(|e| format!("创建项目 .codex 目录失败: {}", e))?;
@@ -197,7 +211,7 @@ fn write_project_codex_config(project_dir: &Path, binary_path: &str) -> Result<(
         .parse::<toml_edit::DocumentMut>()
         .map_err(|e| format!("解析项目 config.toml 失败: {}", e))?;
 
-    apply_codex_mcp_server(&mut doc, binary_path);
+    apply_codex_mcp_server(&mut doc, binary_path, project_id);
 
     std::fs::write(&config_path, doc.to_string())
         .map_err(|e| format!("写入项目 config.toml 失败: {}", e))?;
@@ -212,7 +226,9 @@ fn write_project_codex_config(project_dir: &Path, binary_path: &str) -> Result<(
 /// 头),`mini-term-ssh` 作为**显式** `Table`(非 inline)写入,这样才会序列化成
 /// 研究文件指定的 `[mcp_servers.mini-term-ssh]` 点路径表头形式,而不是 inline
 /// table `mini-term-ssh = { command = "..." }`。
-fn apply_codex_mcp_server(doc: &mut toml_edit::DocumentMut, binary_path: &str) {
+///
+/// `args` 写成 `["--project-id", "<id>"]`,让 sidecar 知道自己属于哪个项目。
+fn apply_codex_mcp_server(doc: &mut toml_edit::DocumentMut, binary_path: &str, project_id: &str) {
     if doc.get("mcp_servers").is_none() {
         let mut parent = toml_edit::Table::new();
         parent.set_implicit(true);
@@ -229,6 +245,11 @@ fn apply_codex_mcp_server(doc: &mut toml_edit::DocumentMut, binary_path: &str) {
             toml_edit::Item::Table(toml_edit::Table::new());
     }
     doc["mcp_servers"][MCP_SERVER_NAME]["command"] = toml_edit::value(binary_path);
+
+    let mut args = toml_edit::Array::new();
+    args.push("--project-id");
+    args.push(project_id);
+    doc["mcp_servers"][MCP_SERVER_NAME]["args"] = toml_edit::value(args);
 }
 
 /// 从 `<project>/.codex/config.toml` 幂等移除 `[mcp_servers.mini-term-ssh]`。
@@ -440,16 +461,22 @@ fn compute_gitignore_append(existing: &str) -> Option<String> {
 
 /// 为指定项目启用 SSH MCP。
 ///
-/// `project_dir` 为项目目录绝对路径。成功后该项目的终端里新启动的
-/// Claude Code / Codex 会话即可调用 SSH 工具(已运行的会话需重启)。
+/// `project_dir` 为项目目录绝对路径;`project_id` 为该项目的稳定 id,会写进
+/// MCP 注册的 `args`,让 sidecar 按该项目的「关联 SSH」范围过滤可见连接。
+/// 成功后该项目的终端里新启动的 Claude Code / Codex 会话即可调用 SSH 工具
+/// (已运行的会话需重启)。
 #[tauri::command]
-pub fn enable_ssh_mcp(project_dir: String) -> Result<String, String> {
+pub fn enable_ssh_mcp(project_dir: String, project_id: String) -> Result<String, String> {
     let dir = validate_project_dir(&project_dir)?;
+    let pid = project_id.trim();
+    if pid.is_empty() {
+        return Err("项目 id 为空,无法启用 SSH MCP".to_string());
+    }
     let binary_path = get_ssh_mcp_binary_path()?;
 
     // 核心写入:任何一步失败都直接返回错误(可读中文)。
-    write_project_mcp_json(&dir, &binary_path)?;
-    write_project_codex_config(&dir, &binary_path)?;
+    write_project_mcp_json(&dir, &binary_path, pid)?;
+    write_project_codex_config(&dir, &binary_path, pid)?;
     trust_project_in_codex(&dir)?;
     set_claude_mcp_approval(true)?;
 
@@ -491,11 +518,15 @@ mod tests {
 
     #[test]
     fn build_mcp_server_entry_has_stdio_fields() {
-        let entry = build_mcp_server_entry(r"C:\apps\mt-ssh-mcp.exe");
+        let entry = build_mcp_server_entry(r"C:\apps\mt-ssh-mcp.exe", "proj-1");
         assert_eq!(entry["type"], "stdio");
         assert_eq!(entry["command"], r"C:\apps\mt-ssh-mcp.exe");
-        assert!(entry["args"].is_array());
         assert!(entry["env"].is_object());
+        // args 携带 --project-id <id>,让 sidecar 知道自己属于哪个项目
+        assert_eq!(
+            entry["args"],
+            serde_json::json!(["--project-id", "proj-1"])
+        );
     }
 
     // ─── .mcp.json 幂等合并 ───
@@ -509,10 +540,10 @@ mod tests {
         if root.get("mcpServers").is_none() {
             root["mcpServers"] = serde_json::json!({});
         }
-        root["mcpServers"]
-            .as_object_mut()
-            .unwrap()
-            .insert(MCP_SERVER_NAME.to_string(), build_mcp_server_entry(binary));
+        root["mcpServers"].as_object_mut().unwrap().insert(
+            MCP_SERVER_NAME.to_string(),
+            build_mcp_server_entry(binary, "test-pid"),
+        );
         root
     }
 
@@ -593,7 +624,7 @@ mod tests {
     #[test]
     fn codex_mcp_server_written_under_correct_table() {
         let mut doc: toml_edit::DocumentMut = "".parse().unwrap();
-        apply_codex_mcp_server(&mut doc, r"C:\apps\mt-ssh-mcp.exe");
+        apply_codex_mcp_server(&mut doc, r"C:\apps\mt-ssh-mcp.exe", "proj-1");
         let text = doc.to_string();
         // toml_edit 对带连字符的 key 会写成 [mcp_servers."mini-term-ssh"];
         // 引号与否都是合法 TOML、Codex 都能解析,这里只校验是 dotted-table 表头
@@ -601,19 +632,26 @@ mod tests {
         assert!(text.contains("[mcp_servers."), "got:\n{text}");
         assert!(text.contains("mini-term-ssh"), "got:\n{text}");
         assert!(text.contains("command ="), "got:\n{text}");
-        // 关键:reparse 后能读回 command,且反斜杠被正确转义、未被破坏。
+        // 关键:reparse 后能读回 command / args,且反斜杠被正确转义、未被破坏。
         let reparsed: toml_edit::DocumentMut = text.parse().unwrap();
         assert_eq!(
             reparsed["mcp_servers"]["mini-term-ssh"]["command"].as_str(),
             Some(r"C:\apps\mt-ssh-mcp.exe")
         );
+        let args: Vec<&str> = reparsed["mcp_servers"]["mini-term-ssh"]["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(args, ["--project-id", "proj-1"]);
     }
 
     #[test]
     fn codex_mcp_server_preserves_existing_content() {
         let initial = "[mcp_servers.context7]\ncommand = \"npx\"\nargs = [\"@upstash/context7-mcp\"]\n";
         let mut doc: toml_edit::DocumentMut = initial.parse().unwrap();
-        apply_codex_mcp_server(&mut doc, "/bin/mt-ssh-mcp");
+        apply_codex_mcp_server(&mut doc, "/bin/mt-ssh-mcp", "p1");
         let reparsed: toml_edit::DocumentMut = doc.to_string().parse().unwrap();
         // 既有 server 保留
         assert_eq!(
@@ -630,10 +668,10 @@ mod tests {
     #[test]
     fn codex_mcp_server_write_is_idempotent() {
         let mut doc: toml_edit::DocumentMut = "".parse().unwrap();
-        apply_codex_mcp_server(&mut doc, "/bin/mt-ssh-mcp");
+        apply_codex_mcp_server(&mut doc, "/bin/mt-ssh-mcp", "p1");
         let once = doc.to_string();
         let mut doc2: toml_edit::DocumentMut = once.parse().unwrap();
-        apply_codex_mcp_server(&mut doc2, "/bin/mt-ssh-mcp");
+        apply_codex_mcp_server(&mut doc2, "/bin/mt-ssh-mcp", "p1");
         assert_eq!(once, doc2.to_string());
     }
 
@@ -857,18 +895,22 @@ mod tests {
         let binary = "/bin/mt-ssh-mcp";
 
         // 启用:写 .mcp.json + .codex/config.toml
-        write_project_mcp_json(&dir, binary).unwrap();
-        write_project_codex_config(&dir, binary).unwrap();
+        write_project_mcp_json(&dir, binary, "p1").unwrap();
+        write_project_codex_config(&dir, binary, "p1").unwrap();
 
         let mcp_path = dir.join(".mcp.json");
         let codex_path = dir.join(".codex").join("config.toml");
         assert!(mcp_path.exists());
         assert!(codex_path.exists());
 
-        // .mcp.json 内容正确
+        // .mcp.json 内容正确,且 args 携带 --project-id
         let mcp: Value =
             serde_json::from_str(&std::fs::read_to_string(&mcp_path).unwrap()).unwrap();
         assert_eq!(mcp["mcpServers"][MCP_SERVER_NAME]["command"], binary);
+        assert_eq!(
+            mcp["mcpServers"][MCP_SERVER_NAME]["args"],
+            serde_json::json!(["--project-id", "p1"])
+        );
 
         // .codex/config.toml 内容正确
         let codex: toml_edit::DocumentMut = std::fs::read_to_string(&codex_path)
@@ -904,7 +946,7 @@ mod tests {
         .unwrap();
 
         // 启用再停用,团队 server 必须毫发无损
-        write_project_mcp_json(&dir, "/bin/mt-ssh-mcp").unwrap();
+        write_project_mcp_json(&dir, "/bin/mt-ssh-mcp", "p1").unwrap();
         remove_project_mcp_json(&dir).unwrap();
 
         let mcp_path = dir.join(".mcp.json");

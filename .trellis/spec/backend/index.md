@@ -20,7 +20,7 @@
 
 **Why**：sidecar bin（如 `mt-ssh-mcp`，及未来其它）若 `use tauri_app_lib` 会链接整个 Tauri（webview 等），体积与编译时间不可接受。`mt-core` 不依赖 tauri，sidecar 依赖它即可拿到共享逻辑而不背 Tauri。
 
-**已在 `mt-core` 的内容**：`SshConnection` 类型、`scan_ssh_prompt` / `strip_ansi_codes`、`prepare_ssh_key` 纯逻辑、`config.json` 读取（`read_ssh_connections` / `config_json_path`）。
+**已在 `mt-core` 的内容**：`SshConnection` 类型、`scan_ssh_prompt` / `strip_ansi_codes`、`prepare_ssh_key` 纯逻辑、`config.json` 读取（`read_ssh_connections_for_project` 按项目关联范围过滤连接 / `config_json_path`）。
 
 **注意**：`mt-core` 没有 `AppHandle`，定位 `config.json` 之类的路径要用 `dirs` crate 自行按平台拼（镜像 `src-tauri/src/bin/miniterm-hook.rs` 的平台分支），不能用 Tauri 的 `app.path()`。
 

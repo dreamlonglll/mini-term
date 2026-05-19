@@ -3,6 +3,10 @@ use serde::{Deserialize, Serialize};
 /// 一条已保存的 SSH 连接。持久化在 `config.json` 的 `sshConnections` 数组里。
 ///
 /// 该类型被 mini-term 主程序与 SSH MCP sidecar 共用,因此放在 `mt-core`。
+///
+/// 所有连接默认都能被 SSH MCP 工具访问;具体哪个项目的 agent 能看到哪些连接,
+/// 由 `config.json` 里项目的 `sshConnectionIds` 决定(见 `config_reader`),
+/// 连接本身不再带可见性开关。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SshConnection {
@@ -19,9 +23,6 @@ pub struct SshConnection {
     pub proxy_jump: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
-    /// 是否允许终端里的 AI agent 通过 SSH MCP 调用此连接。默认 false。
-    #[serde(default)]
-    pub agent_accessible: bool,
 }
 
 #[cfg(test)]
@@ -29,18 +30,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn minimal_connection_deserializes_without_agent_accessible() {
-        // 旧 config.json 没有 agentAccessible 字段,须能反序列化并默认为 false
+    fn minimal_connection_deserializes() {
         let json = r#"{"id":"1","name":"prod","host":"10.0.0.5","port":22,"user":"root"}"#;
         let conn: SshConnection = serde_json::from_str(json).unwrap();
         assert_eq!(conn.id, "1");
         assert_eq!(conn.port, 22);
-        assert!(!conn.agent_accessible);
         assert!(conn.password.is_none());
     }
 
     #[test]
-    fn agent_accessible_round_trips() {
+    fn connection_round_trips() {
         let conn = SshConnection {
             id: "abc".into(),
             name: "jump-host".into(),
@@ -51,17 +50,16 @@ mod tests {
             identity_file: None,
             proxy_jump: Some("user@bastion".into()),
             group: Some("内网".into()),
-            agent_accessible: true,
         };
         let json = serde_json::to_string(&conn).unwrap();
         let parsed: SshConnection = serde_json::from_str(&json).unwrap();
-        assert!(parsed.agent_accessible);
         assert_eq!(parsed.port, 2222);
         assert_eq!(parsed.proxy_jump.as_deref(), Some("user@bastion"));
+        assert_eq!(parsed.group.as_deref(), Some("内网"));
     }
 
     #[test]
-    fn agent_accessible_field_uses_camel_case() {
+    fn fields_use_camel_case() {
         let conn = SshConnection {
             id: "1".into(),
             name: "n".into(),
@@ -69,12 +67,11 @@ mod tests {
             port: 22,
             user: "u".into(),
             password: None,
-            identity_file: None,
+            identity_file: Some("/k".into()),
             proxy_jump: None,
             group: None,
-            agent_accessible: true,
         };
         let json = serde_json::to_string(&conn).unwrap();
-        assert!(json.contains("\"agentAccessible\":true"));
+        assert!(json.contains("\"identityFile\":\"/k\""));
     }
 }

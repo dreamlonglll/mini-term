@@ -10,7 +10,7 @@ mod ssh_connection;
 mod ssh_key;
 mod ssh_prompt;
 
-pub use config_reader::{config_json_path, read_ssh_connections};
+pub use config_reader::{config_json_path, read_ssh_connections_for_project};
 pub use ssh_connection::SshConnection;
 pub use ssh_key::{cleanup_ssh_temp_keys, prepare_ssh_key, restrict_permissions, temp_keys_dir};
 pub use ssh_prompt::{scan_ssh_prompt, strip_ansi_codes, SshPromptScan};
