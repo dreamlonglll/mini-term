@@ -8,8 +8,8 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "build-hook": "cargo build --manifest-path src-tauri/Cargo.toml --bin miniterm-hook",
-    "pretauri": "npm run build-hook"
+    "build-sidecars": "node scripts/stage-sidecars.mjs",
+    "pretauri": "npm run build-sidecars"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

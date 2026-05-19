@@ -1,0 +1,7 @@
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "本任务核心是复用：抽 mt-core crate、复用 prepare_ssh_key/scan_ssh_prompt、对标 hook_registry.rs 的配置注入模式，避免另起一套"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "agentAccessible 字段横跨 Rust SshConnection 与 TS 类型，需 serde camelCase 对齐；新增 Tauri 命令的前后端契约要一致"}
+{"file": ".trellis/spec/frontend/index.md", "reason": "前端改动（SshModal 勾选框、项目右键菜单、types.ts、store）须遵守前端规范索引"}
+{"file": ".trellis/spec/frontend/state-management.md", "reason": "SshConnection 加 agentAccessible、ProjectConfig 加 SSH MCP 启用状态，涉及 Zustand store 与 config.json 持久化"}
+{"file": ".trellis/tasks/05-18-ssh-mcp-server/research/rust-mcp-sdk.md", "reason": "PR2 实现 mt-ssh-mcp sidecar：rmcp 1.7 最小 server 骨架、Cargo 依赖、stdio 坑"}
+{"file": ".trellis/tasks/05-18-ssh-mcp-server/research/claude-mcp-json.md", "reason": "PR3 写项目 .mcp.json：schema、信任流程、幂等合并要求"}
+{"file": ".trellis/tasks/05-18-ssh-mcp-server/research/codex-mcp-config.md", "reason": "PR3 写 <project>/.codex/config.toml：[mcp_servers] 格式与 trust 提权写法"}

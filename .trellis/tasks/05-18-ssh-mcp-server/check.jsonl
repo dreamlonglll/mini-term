@@ -1,0 +1,5 @@
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "检查是否真复用了 prepare_ssh_key/scan_ssh_prompt/hook_registry 模式，无重复造轮子"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "检查 agentAccessible 等字段 Rust/TS 两端一致、Tauri 命令契约对齐、回退路径完整"}
+{"file": ".trellis/tasks/05-18-ssh-mcp-server/research/rust-mcp-sdk.md", "reason": "校验 sidecar 符合 rmcp 用法与 stdio 约束（stdout 仅协议、日志走 stderr）"}
+{"file": ".trellis/tasks/05-18-ssh-mcp-server/research/claude-mcp-json.md", "reason": "校验 .mcp.json 写入符合 schema 且幂等不覆盖既有内容"}
+{"file": ".trellis/tasks/05-18-ssh-mcp-server/research/codex-mcp-config.md", "reason": "校验 Codex config.toml 写入格式与 trust 处理正确"}
