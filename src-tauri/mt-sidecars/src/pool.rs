@@ -24,13 +24,14 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mt_core::SshConnection;
 use russh::client::{self, Handle, Handler};
 use russh::keys::{load_secret_key, PrivateKeyWithHashAlg};
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 
 /// 会话池可调参数。所有默认值都来自 research/session-pool-patterns.md TL;DR 表。
 #[derive(Debug, Clone)]
@@ -113,6 +114,17 @@ impl CachedSession {
     pub fn touch(&self) {
         self.last_used.store(now_millis(), Ordering::Relaxed);
     }
+
+    /// 取 last_used 的 UNIX 毫秒(reaper 用)。
+    pub fn last_used_millis(&self) -> u64 {
+        self.last_used.load(Ordering::Relaxed)
+    }
+
+    /// 取 opened_at 与某基准 Instant 的差值(reaper 用)。
+    /// 我们提供 `now: Instant` 入参便于测试与避免单次 tick 内多次取 `Instant::now()`。
+    pub fn age_from(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.opened_at)
+    }
 }
 
 /// 当前 UNIX 毫秒(`SystemTime::now()` 单调性不保证,但 last_used 容忍轻微回拨)。
@@ -129,6 +141,12 @@ pub struct SshPool {
     config: PoolConfig,
     /// known_hosts 文件路径。为了便于测试,允许在构造时显式覆盖默认 `~/.ssh/known_hosts`。
     known_hosts_path: PathBuf,
+    /// 后台 reaper task 句柄,持有以便在 Drop 时 abort。
+    ///
+    /// 用 `std::sync::Mutex` 而非 `tokio::sync::Mutex`:Drop 是同步上下文,不能
+    /// `.await` 拿锁;abort 本身又是同步 API。reaper task 内部不再用这个字段,
+    /// 它只会被 Drop / 显式访问读到。
+    reaper: std::sync::Mutex<Option<JoinHandle<()>>>,
 }
 
 impl SshPool {
@@ -147,14 +165,28 @@ impl SshPool {
         Self::with_paths(config, known_hosts_path)
     }
 
-    /// 全显式构造,主要给单测用。
+    /// 全显式构造,主要给单测用。会在 tokio runtime 中 spawn 后台 reaper task。
+    ///
+    /// **前置**:必须在 tokio runtime 内调用(直接或间接处于 `#[tokio::main]` /
+    /// `#[tokio::test]` 上下文),否则 `tokio::spawn` 会 panic。
     pub fn with_paths(config: PoolConfig, known_hosts_path: PathBuf) -> Self {
+        let inner = Arc::new(Mutex::new(PoolInner {
+            sessions: HashMap::new(),
+        }));
+        // reaper 拿 Weak,避免它持有 Arc 让 pool 永远不被 drop —— 这是关键。
+        let reaper_weak = Arc::downgrade(&inner);
+        let reaper_handle = spawn_reaper(
+            reaper_weak,
+            config.reaper_tick,
+            config.idle_timeout,
+            config.max_lifetime,
+            config.shutdown_per_session_timeout,
+        );
         Self {
-            inner: Arc::new(Mutex::new(PoolInner {
-                sessions: HashMap::new(),
-            })),
+            inner,
             config,
             known_hosts_path,
+            reaper: std::sync::Mutex::new(Some(reaper_handle)),
         }
     }
 
@@ -234,13 +266,23 @@ impl SshPool {
     }
 
     /// 关掉所有 session,清空池。sidecar shutdown 时调用。
+    ///
+    /// 同时 abort 后台 reaper task —— sidecar 主流程返回后 reaper 不再需要继续跑。
+    /// 单条 session disconnect 各自加超时,**不让单条挂死阻塞退出**。
     pub async fn shutdown(&self) {
+        // 1) abort reaper(Drop 也会兜底,但显式调用更清晰)
+        if let Ok(mut guard) = self.reaper.lock() {
+            if let Some(handle) = guard.take() {
+                handle.abort();
+            }
+        }
+
+        // 2) drain 并发 disconnect 所有 session
         let mut inner = self.inner.lock().await;
         let entries: Vec<_> = inner.sessions.drain().map(|(_, v)| v).collect();
         drop(inner);
 
         let timeout = self.config.shutdown_per_session_timeout;
-        // 并发 disconnect,各自加超时;不让单条挂死阻塞退出。
         let futures = entries.into_iter().map(|s| {
             let t = timeout;
             async move {
@@ -290,6 +332,97 @@ impl Default for SshPool {
     fn default() -> Self {
         Self::new()
     }
+}
+
+impl Drop for SshPool {
+    /// Drop 时兜底 abort reaper。`shutdown()` 显式调用过则这里是 no-op。
+    ///
+    /// Drop 不能 `.await`,所以这里**不能** disconnect 后端 session ——
+    /// 那部分必须靠 `shutdown()` 显式驱动。SIGKILL / 异常退出场景下,远端
+    /// 会通过 TCP RST 感知本地断开,与此前 spawn-ssh 路径行为一致。
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.reaper.lock() {
+            if let Some(handle) = guard.take() {
+                handle.abort();
+            }
+        }
+    }
+}
+
+/// 启动后台 reaper task,返回 JoinHandle 以便 Drop / shutdown 时 abort。
+///
+/// **生命周期关键**:reaper 持有 `Weak<Mutex<PoolInner>>`,每次 tick 内
+/// `Weak::upgrade()` 拿 Arc。pool 被 drop 后 strong count 归零,upgrade 返回
+/// None,reaper 退出循环、task 结束。**这一点保证 reaper 不会因为持有 Arc
+/// 让 pool 永远不被 drop**。
+fn spawn_reaper(
+    inner: Weak<Mutex<PoolInner>>,
+    tick: Duration,
+    idle_timeout: Duration,
+    max_lifetime: Duration,
+    per_session_shutdown_timeout: Duration,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(tick);
+        // 第一次 tick 立刻返回 —— 跳过,我们想等 `tick` 再开始扫,避免构造瞬间
+        // 就把刚 acquire 完的 session 误判为 idle(opened_at 与 last_used 距 now
+        // 都是 0ms,不会过 threshold,但 reaper 也无事可做)。
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let Some(arc) = inner.upgrade() else {
+                // pool 已被 drop,退出 reaper task。
+                return;
+            };
+            // 锁内只做"读快照 + 决定踢谁 + 从 map 移除",真正的 disconnect 异步外抛。
+            let to_evict: Vec<Arc<CachedSession>> = {
+                let mut guard = arc.lock().await;
+                let now_instant = Instant::now();
+                let now_ms = now_millis();
+                let triples: Vec<(String, u64, Duration)> = guard
+                    .sessions
+                    .iter()
+                    .map(|(id, s)| (id.clone(), s.last_used_millis(), s.age_from(now_instant)))
+                    .collect();
+                let victims = select_expired(&triples, now_ms, idle_timeout, max_lifetime);
+                let mut evicted = Vec::with_capacity(victims.len());
+                for id in victims {
+                    if let Some(v) = guard.sessions.remove(&id) {
+                        evicted.push(v);
+                    }
+                }
+                evicted
+            };
+            for v in to_evict {
+                spawn_disconnect(v, per_session_shutdown_timeout);
+            }
+        }
+    })
+}
+
+/// 从 (id, last_used_millis, opened_age) 三元组里挑出已过期(idle 或 lifetime)
+/// 的 id。**抽成纯函数便于单测**——绕开"造真 CachedSession"的不可能任务。
+///
+/// - `triples`:池子里每条 session 的 `(id, last_used UNIX 毫秒, opened_at 距 now 的 age)`。
+/// - `now_ms`:当前 UNIX 毫秒,用于判断 idle。
+/// - `idle_timeout`:`now_ms - last_used >= idle_timeout` 即过期。
+/// - `max_lifetime`:`age >= max_lifetime` 即过期(防 NAT 静默丢链)。
+fn select_expired(
+    triples: &[(String, u64, Duration)],
+    now_ms: u64,
+    idle_timeout: Duration,
+    max_lifetime: Duration,
+) -> Vec<String> {
+    let idle_ms = idle_timeout.as_millis() as u64;
+    triples
+        .iter()
+        .filter(|(_, last_used, age)| {
+            let idle_too_long = now_ms.saturating_sub(*last_used) >= idle_ms;
+            let lived_too_long = *age >= max_lifetime;
+            idle_too_long || lived_too_long
+        })
+        .map(|(id, _, _)| id.clone())
+        .collect()
 }
 
 /// 按 `last_used` 最小者挑一条 victim。
@@ -771,5 +904,166 @@ mod tests {
         );
         let err = err_of(pool.acquire(&conn).await);
         assert!(!err.contains("jump host"), "got: {err}");
+    }
+
+    // --- PR3: reaper / select_expired / Drop --------------------------------
+
+    /// `select_expired` 在空池上稳健返回空。
+    #[test]
+    fn select_expired_empty_input_returns_empty() {
+        let v = select_expired(&[], 1_000_000, Duration::from_secs(60), Duration::from_secs(3600));
+        assert!(v.is_empty());
+    }
+
+    /// 全部在 idle / lifetime 阈值内 → 没有 victim。
+    #[test]
+    fn select_expired_all_fresh_no_victims() {
+        // last_used 在 now 前 1s,age 5s 内 —— idle 阈值 60s、lifetime 3600s,均未过期。
+        let now_ms: u64 = 1_000_000_000;
+        let triples = vec![
+            ("a".to_string(), now_ms - 1_000, Duration::from_secs(5)),
+            ("b".to_string(), now_ms - 500, Duration::from_secs(1)),
+        ];
+        let v = select_expired(&triples, now_ms, Duration::from_secs(60), Duration::from_secs(3600));
+        assert!(v.is_empty(), "expected no victims, got {v:?}");
+    }
+
+    /// 仅 idle 过期:`now - last_used >= idle_timeout`,但 age 仍小于 max_lifetime。
+    #[test]
+    fn select_expired_picks_idle_expired() {
+        let now_ms: u64 = 1_000_000_000;
+        let triples = vec![
+            ("idle".to_string(), now_ms - 70_000, Duration::from_secs(120)), // 70s 没用 ≥ 60s
+            ("fresh".to_string(), now_ms - 1_000, Duration::from_secs(120)),
+        ];
+        let v = select_expired(&triples, now_ms, Duration::from_secs(60), Duration::from_secs(3600));
+        assert_eq!(v, vec!["idle".to_string()]);
+    }
+
+    /// 仅 lifetime 过期:age ≥ max_lifetime,即便 last_used 很近。
+    #[test]
+    fn select_expired_picks_lifetime_expired() {
+        let now_ms: u64 = 1_000_000_000;
+        let triples = vec![
+            ("old".to_string(), now_ms - 100, Duration::from_secs(7200)), // 已活够 2h
+            ("young".to_string(), now_ms - 100, Duration::from_secs(60)),
+        ];
+        let v = select_expired(
+            &triples,
+            now_ms,
+            Duration::from_secs(600),
+            Duration::from_secs(3600),
+        );
+        assert_eq!(v, vec!["old".to_string()]);
+    }
+
+    /// 同时 idle 与 lifetime 过期的多个条目都会被踢。
+    #[test]
+    fn select_expired_handles_mixed_idle_and_lifetime() {
+        let now_ms: u64 = 1_000_000_000;
+        let triples = vec![
+            ("idle".to_string(), now_ms - 700_000, Duration::from_secs(10)),
+            ("aged".to_string(), now_ms - 1, Duration::from_secs(7_201)),
+            ("ok".to_string(), now_ms - 1_000, Duration::from_secs(60)),
+        ];
+        let mut v = select_expired(
+            &triples,
+            now_ms,
+            Duration::from_secs(600),
+            Duration::from_secs(3600),
+        );
+        v.sort();
+        assert_eq!(v, vec!["aged".to_string(), "idle".to_string()]);
+    }
+
+    /// `now_ms < last_used`(系统时钟回拨)时 `saturating_sub` 不溢出,该条目按 idle=0 处理 → 不踢。
+    #[test]
+    fn select_expired_tolerates_clock_skew() {
+        let triples = vec![
+            ("future".to_string(), 1_000_000_000, Duration::from_secs(10)),
+        ];
+        // now < last_used —— saturating_sub 返 0,idle 判断不命中;lifetime 也未到。
+        let v = select_expired(
+            &triples,
+            999_999_000,
+            Duration::from_secs(60),
+            Duration::from_secs(3600),
+        );
+        assert!(v.is_empty(), "expected clock-skew tolerance, got {v:?}");
+    }
+
+    /// 边界:刚好 idle_timeout —— 用 `>=` 判定,等于阈值也算过期。
+    #[test]
+    fn select_expired_idle_exact_boundary_is_expired() {
+        let now_ms: u64 = 1_000_000_000;
+        let triples = vec![
+            ("on_edge".to_string(), now_ms - 60_000, Duration::from_secs(1)),
+        ];
+        let v = select_expired(&triples, now_ms, Duration::from_secs(60), Duration::from_secs(3600));
+        assert_eq!(v, vec!["on_edge".to_string()]);
+    }
+
+    /// Drop SshPool 时,reaper task 应该被 abort,且不再 hold inner 的强引用。
+    ///
+    /// 验证手段:**在 drop 后用 `Weak::strong_count` 探测 inner Arc 的余生**——
+    /// reaper 始终只持有 `Weak`,所以 pool 这一份 Arc 一旦 drop,strong_count 立即
+    /// 归零。短时可能因 reaper 正巧在 `upgrade()` 后临时持 Arc 而不为 0,
+    /// 但 Drop 会同步 abort 它,abort 后 tokio 调度器会在下一次轮转里清掉。
+    /// 用一个短自旋等待避免偶发抖动失败。
+    #[tokio::test]
+    async fn pool_drop_aborts_reaper() {
+        let pool = SshPool::with_paths(
+            PoolConfig {
+                reaper_tick: Duration::from_millis(20), // 让 reaper 频繁 tick,便于触发竞争
+                ..PoolConfig::default()
+            },
+            std::env::temp_dir().join("mt-ssh-mcp-test-known_hosts-drop"),
+        );
+        let weak_inner: Weak<Mutex<PoolInner>> = Arc::downgrade(&pool.inner);
+        assert_eq!(weak_inner.strong_count(), 1, "pool 持有 1 个 strong ref");
+
+        drop(pool);
+        // 自旋等待 reaper 释放(若它正巧 upgrade 中)。最长 500ms。
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while weak_inner.strong_count() > 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            weak_inner.strong_count(),
+            0,
+            "expected pool inner released, reaper should not hold strong ref"
+        );
+    }
+
+    /// reaper task 在 pool 被 drop 后,下一个 tick 必须能感知到并主动退出。
+    ///
+    /// 直接 spawn 一个 reaper 而不通过 SshPool —— 这样 reaper 没有"Drop abort"兜底,
+    /// 必须靠 Weak::upgrade 返 None 自行退出,**真正测出了 Weak 生命周期的正确性**。
+    #[tokio::test]
+    async fn reaper_exits_when_pool_dropped() {
+        let inner = Arc::new(Mutex::new(PoolInner {
+            sessions: HashMap::new(),
+        }));
+        let weak = Arc::downgrade(&inner);
+        let handle = spawn_reaper(
+            weak,
+            Duration::from_millis(20),
+            Duration::from_secs(600),
+            Duration::from_secs(7200),
+            Duration::from_secs(2),
+        );
+
+        // drop 掉唯一的 strong Arc;reaper 持的是 Weak,下一次 upgrade 会返 None。
+        drop(inner);
+
+        // 自旋等待 reaper task 退出(最长 500ms)。
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while !handle.is_finished() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            handle.is_finished(),
+            "reaper should have exited after the pool's inner Arc was dropped"
+        );
     }
 }

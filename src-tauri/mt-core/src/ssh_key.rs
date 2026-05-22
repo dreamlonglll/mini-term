@@ -5,7 +5,14 @@
 //! 仅当前用户可读写的临时副本,用 `ssh -i <临时副本>` 连接,绕过该检查,
 //! 不修改用户的原始密钥文件。
 //!
-//! 被 mini-term 主程序与 SSH MCP sidecar 共用,因此放在 `mt-core`。
+//! **仅供 mini-term 主程序内置终端的 SSH 启动路径使用**:主程序通过 PTY
+//! 拉起 `ssh` 客户端进程,需要这一层权限收紧的临时副本(详见
+//! `src-tauri/src/ssh.rs` 与 `TerminalInstance.tsx`)。
+//!
+//! `mt-ssh-mcp` sidecar 自 v0.5 起已迁移到 `russh` 进程内会话池
+//! (`src-tauri/mt-sidecars/src/pool.rs`),库直接读密钥 bytes 进内存,不再
+//! 经过 `ssh` 客户端的文件权限校验 —— sidecar 路径**不再调用本模块**,
+//! 但函数仍保留在 `mt-core`,因为主程序 PTY 路径仍依赖它们。
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};

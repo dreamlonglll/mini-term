@@ -30,7 +30,7 @@
 
 > **`BatchMode=yes` 会连带禁用 SSH 密码认证。**
 >
-> 给 `ssh` 拼参数时，`-o BatchMode=yes`（让密钥 / agent 认证失败时立即返回、不挂起）会**同时禁掉密码认证**。需要 PTY autofill 灌密码的连接绝不能带 `BatchMode=yes`。按认证类型区分：密码型传 `batch=false`，密钥 / agent 型传 `batch=true`。见 `src-tauri/src/bin/mt-ssh-mcp.rs` 的 `build_ssh_args`。
+> 给 `ssh` 拼参数时，`-o BatchMode=yes`（让密钥 / agent 认证失败时立即返回、不挂起）会**同时禁掉密码认证**。需要 PTY autofill 灌密码的连接绝不能带 `BatchMode=yes`。**当前仅 mini-term 主程序内置终端的 SSH 启动路径仍依赖 ssh CLI**（见 `src-tauri/src/ssh.rs` 与 `src-tauri/src/pty.rs` 的 `arm_ssh_autofill` / PTY 扫描逻辑）；`mt-ssh-mcp` sidecar 自 v0.5 起已切换到 russh 进程内会话池（`src-tauri/mt-sidecars/src/pool.rs`），不再走 ssh CLI 与 BatchMode，无此 gotcha。
 
 > **stdio MCP sidecar 的 stdout 只能输出协议消息。**
 >

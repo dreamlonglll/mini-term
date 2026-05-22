@@ -593,6 +593,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pool = Arc::new(SshPool::new());
 
     // 握手并注册工具;.serve() 绑定进程的 stdin/stdout 作为 stdio 传输。
+    // `SshMcp` 派生 Clone(rmcp 框架要求);Clone 内部走 `Arc::clone`,共享同一池。
     let service = SshMcp {
         project_id,
         pool: pool.clone(),
@@ -605,6 +606,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 阻塞直到 stdin 关闭 / 客户端断开 —— 这是 sidecar 正常退出的信号。
     service.waiting().await?;
+
+    // shutdown 钩子:对每条 session 跑 disconnect(ByApplication)+ 2s 单 session 超时,
+    // 并 abort 池内后台 reaper。**必须在 eprintln 退出语句前调用**——否则 sidecar 进程
+    // 退出后远端只能感知 TCP RST,留下 dangling channel/session 直到服务器自身回收。
+    eprintln!("[mt-ssh-mcp] draining session pool");
+    pool.shutdown().await;
 
     eprintln!("[mt-ssh-mcp] client disconnected, exiting");
     Ok(())
