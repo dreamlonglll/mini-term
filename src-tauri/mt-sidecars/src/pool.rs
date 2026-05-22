@@ -185,8 +185,15 @@ impl SshPool {
         {
             let inner = self.inner.lock().await;
             if let Some(s) = inner.sessions.get(&conn.id) {
-                // 复用前检查:underlying handle 还活着且不在 cooldown。
-                if !s.handle.lock().await.is_closed() && !s.is_unhealthy_now() {
+                // 复用前只检查 underlying handle 是否还活着。
+                //
+                // **不要在这里同时检查 is_unhealthy_now**:cooldown 的意图是「上一次失败
+                // 后 30s 内立即返错、不再去打远端」,需要把带 unhealthy 标记的 session
+                // 原样返给调用方,由 ssh_exec 那边的 is_unhealthy_now 分支返错。如果
+                // 在这里把 unhealthy session 当作 miss 跳过去走重建,acquire 会真的重连
+                // 远端、并返回一个 unhealthy_until=0 的新 session,调用方永远看不到
+                // cooldown,gatetime 语义彻底失效。
+                if !s.handle.lock().await.is_closed() {
                     s.touch();
                     return Ok(s.clone());
                 }
