@@ -9,6 +9,9 @@
 | 文档 | 说明 |
 |------|------|
 | [Agent 配置注入](./agent-config-injection.md) | 幂等读写 Claude Code / Codex 的外部配置文件（hooks、MCP server 注册） |
+| [Rust 加密 crate 在 Windows MSVC 上的 NASM 陷阱](./rust-crypto-on-windows-msvc.md) | 拉 russh / reqwest / rustls 一类加密 crate 时优先选 `ring` 后端，避开 aws-lc-sys 对 NASM 的工具链依赖 |
+| [`rand_core` 多版本对齐](./rand-core-version-alignment.md) | 给加密 crate 写测试 fixture 时避开 rng-based API，直接用底层类型构造，绕开 rand_core 多版本 `CryptoRng` trait 路径冲突 |
+| [Tokio 常驻资源池骨架](./tokio-session-pool-pattern.md) | 带后台 reaper + graceful shutdown 的常驻资源池可复用骨架（Weak reaper、std Mutex 持 JoinHandle、shutdown 三步、fast-path 不查 unhealthy、纯函数抽决策） |
 
 ---
 
