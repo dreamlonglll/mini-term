@@ -163,6 +163,11 @@ impl SshPool {
         self.inner.lock().await.sessions.len()
     }
 
+    /// 池里是否一条 session 都没有(配对 `len`,clippy 要求)。
+    pub async fn is_empty(&self) -> bool {
+        self.inner.lock().await.sessions.is_empty()
+    }
+
     /// 拿一条可用 session。lazy 建,池满时 LRU 淘汰。
     ///
     /// 返回 `Arc<CachedSession>`,调用方再 `session.lock().await` 开 channel。
@@ -209,6 +214,18 @@ impl SshPool {
         Ok(arc)
     }
 
+    /// 把指定连接对应的 session 从池里踢出去并后台 disconnect。
+    ///
+    /// 用途:`ssh_exec` 在拿到 session 后开 channel / exec 失败(transport-level
+    /// 死链 race),需要先把这条死 session 移出池再重新 acquire 触发重连。
+    /// 不阻塞 caller —— 后台 spawn disconnect 带超时兜底。
+    pub async fn evict(&self, id: &str) {
+        let mut inner = self.inner.lock().await;
+        if let Some(victim) = inner.sessions.remove(id) {
+            spawn_disconnect(victim, self.config.shutdown_per_session_timeout);
+        }
+    }
+
     /// 关掉所有 session,清空池。sidecar shutdown 时调用。
     pub async fn shutdown(&self) {
         let mut inner = self.inner.lock().await;
@@ -232,10 +249,12 @@ impl SshPool {
 
     /// 真正建一条 session。涵盖 connect + 主机密钥校验(在 Handler 内) + auth。
     async fn build_session(&self, conn: &SshConnection) -> Result<CachedSession, String> {
-        let mut cfg = client::Config::default();
-        cfg.keepalive_interval = Some(self.config.keepalive_interval);
-        cfg.keepalive_max = self.config.keepalive_max;
-        let cfg = Arc::new(cfg);
+        // 用 `..Default::default()` 一次性赋值,避开 clippy::field_reassign_with_default。
+        let cfg = Arc::new(client::Config {
+            keepalive_interval: Some(self.config.keepalive_interval),
+            keepalive_max: self.config.keepalive_max,
+            ..Default::default()
+        });
 
         let handler = MtClient {
             host: conn.host.clone(),
@@ -521,7 +540,7 @@ fn append_known_host(
         use base64_engine::Engine;
         let bytes = server_pubkey
             .to_bytes()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
         base64_engine::engine::general_purpose::STANDARD.encode(bytes)
     };
     let line = format!("{host_pattern} {algo} {b64}\n");

@@ -4,14 +4,16 @@
 //! 一个 stdio MCP server,把 mini-term 已保存的 SSH 连接暴露成 MCP 工具,
 //! 供运行在 mini-term 终端里的 AI agent(Claude Code / Codex)调用。
 //!
-//! 本文件覆盖 PR2:server 骨架 + `ssh_list_connections` + `ssh_exec`。
+//! 实现层:`ssh_exec` 通过 `mt_sidecars::pool::SshPool` 在 sidecar 进程内
+//! 维护一个 `connection_id → SSH session` 缓存池(russh 0.61 持久连接),
+//! 第一次调用建 session,后续复用,彻底绕开旧的「每次 spawn ssh 子进程 +
+//! PTY autofill 喂密码」路径。
 //!
 //! stdio 铁律:进程的 **stdout 只能输出 MCP 协议 JSON-RPC 消息**;任何日志 /
 //! 调试输出一律走 stderr,否则会破坏 JSON-RPC 帧、导致客户端判定 server 挂掉。
-//! `ssh_exec` 起的 ssh 子进程的输出是**工具结果数据**,必须收集进返回值,
+//! `ssh_exec` 收集到的远程输出是**工具结果数据**,必须放进返回值序列化,
 //! 绝不能透传到本进程 stdout。
 
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use rmcp::{
     handler::server::wrapper::Parameters,
     model::{CallToolResult, Content, Implementation, ServerCapabilities, ServerInfo},
@@ -19,9 +21,13 @@ use rmcp::{
     transport::stdio,
     ErrorData as McpError, ServerHandler, ServiceExt,
 };
+use russh::ChannelMsg;
 use serde::Serialize;
-use std::io::{Read, Write};
-use std::time::{Duration, Instant};
+use std::io::Write;
+use std::sync::Arc;
+use std::time::Duration;
+
+use mt_sidecars::pool::SshPool;
 
 /// 输出封顶:stdout / stderr 各自最多保留约 100 KB,超出截断并标记。
 const OUTPUT_CAP_BYTES: usize = 100 * 1024;
@@ -98,9 +104,9 @@ struct SshExecArgs {
     /// 在远程主机上执行的命令。
     #[schemars(description = "The command to run on the remote host.")]
     command: String,
-    /// 可选:超时秒数,超时强制 kill ssh 进程。缺省 60。
+    /// 可选:超时秒数,超时关闭 channel(不影响池里 session)。缺省 60。
     #[schemars(
-        description = "Optional timeout in seconds; the ssh process is killed if it exceeds this. Defaults to 60."
+        description = "Optional timeout in seconds; the exec channel is closed if it exceeds this. Defaults to 60."
     )]
     #[serde(default)]
     timeout_secs: Option<u64>,
@@ -118,9 +124,9 @@ struct SshExecArgs {
 struct SshExecResult {
     /// 远程命令的标准输出(可能被封顶截断)。
     stdout: String,
-    /// 远程命令的标准错误(可能被封顶截断;密码型 PTY 路径下恒为空)。
+    /// 远程命令的标准错误(可能被封顶截断)。
     stderr: String,
-    /// 退出码。超时被 kill 时为 None。
+    /// 退出码。超时被强制关闭 channel 时为 None。
     exit_code: Option<i32>,
     /// stdout 或 stderr 是否因超出封顶被截断。
     truncated: bool,
@@ -171,51 +177,6 @@ fn build_remote_command(command: &str, cwd: Option<&str>) -> String {
         Some(dir) => format!("cd {dir} && {command}"),
         None => command.to_string(),
     }
-}
-
-/// 拼 ssh 命令行参数(不含 "ssh" 本身,作为 program 单独传给 spawn)。
-///
-/// 形如:`[-p <port>] [-i <key>] [-J <jump>] -o StrictHostKeyChecking=accept-new
-/// [-o BatchMode=yes] <user>@<host> <remote_command>`。
-///
-/// `identity_path` 为已解析的私钥路径(可能是收紧权限的临时副本);路径里的
-/// 反斜杠转正斜杠 —— Windows OpenSSH 接受正斜杠,且作为独立 argv 元素传递
-/// 不经 shell,不会有转义问题(转正斜杠仅为与主程序 connectSsh 行为一致)。
-///
-/// `batch_mode`:`true` 时加 `-o BatchMode=yes` 禁掉一切交互提示(密钥 /
-/// agent 路径用,认证失败时不会挂起等 stdin);**密码型连接必须传 `false`**
-/// —— `BatchMode=yes` 会连带禁掉密码认证,PTY autofill 就再也喂不进密码。
-fn build_ssh_args(
-    conn: &mt_core::SshConnection,
-    identity_path: Option<&str>,
-    remote_command: &str,
-    batch_mode: bool,
-) -> Vec<String> {
-    let mut args: Vec<String> = Vec::new();
-    if conn.port != 0 && conn.port != 22 {
-        args.push("-p".into());
-        args.push(conn.port.to_string());
-    }
-    if let Some(key) = identity_path.map(str::trim).filter(|s| !s.is_empty()) {
-        args.push("-i".into());
-        args.push(key.replace('\\', "/"));
-    }
-    if let Some(jump) = conn.proxy_jump.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        args.push("-J".into());
-        args.push(jump.to_string());
-    }
-    // host key:首见自动接受并记入 known_hosts,已变更则仍拒绝。
-    // 非交互场景必需,否则 ssh 会卡在 host-key 确认提示。
-    args.push("-o".into());
-    args.push("StrictHostKeyChecking=accept-new".into());
-    if batch_mode {
-        // 密钥 / agent 路径:禁掉交互密码提示,认证失败立即返回而非挂起。
-        args.push("-o".into());
-        args.push("BatchMode=yes".into());
-    }
-    args.push(format!("{}@{}", conn.user, conn.host));
-    args.push(remote_command.to_string());
-    args
 }
 
 /// 把一段输出按字节封顶。返回 (截断后的文本, 是否发生截断)。
@@ -327,211 +288,81 @@ fn append_audit_log(conn_name: &str, command: &str, exit: Option<i32>) {
 }
 
 // ---------------------------------------------------------------------------
-// ssh_exec —— 执行(阻塞 I/O,在 spawn_blocking 里跑)
+// ssh_exec —— 远程执行(走 SshPool)
 // ---------------------------------------------------------------------------
 
-/// 非密码路径:用 `std::process::Command` 起 ssh,管道分离 stdout/stderr。
+/// 单次 channel exec 的累积输出。
+struct ChannelOutcome {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    exit_code: Option<i32>,
+}
+
+/// 在已 acquire 到的 session 上开 channel、跑 exec、收集流。
 ///
-/// 在独立线程里等待进程结束以实现超时:超时则 kill。返回 `SshExecResult`。
-fn run_ssh_piped(args: &[String], timeout: Duration) -> Result<SshExecResult, String> {
-    use std::process::{Command, Stdio};
+/// 不做超时——超时由外层 `tokio::time::timeout` 兜底。返回 `Result`:
+/// `Err(String)` 代表 transport-level 失败(channel 开不了 / exec 发不出去),
+/// caller 可用此信号触发"evict + 重连"。
+async fn run_exec_on_session(
+    session: &mt_sidecars::pool::CachedSession,
+    remote_command: &str,
+) -> Result<ChannelOutcome, String> {
+    let handle_guard = session.lock().await;
+    let mut channel = handle_guard
+        .channel_open_session()
+        .await
+        .map_err(|e| format!("channel_open_session failed: {e}"))?;
+    channel
+        .exec(true, remote_command)
+        .await
+        .map_err(|e| format!("channel exec failed: {e}"))?;
 
-    let mut child = Command::new("ssh")
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("failed to spawn ssh: {e}"))?;
+    let mut stdout: Vec<u8> = Vec::new();
+    let mut stderr: Vec<u8> = Vec::new();
+    let mut exit_code: Option<i32> = None;
 
-    // stdout/stderr 各开一个线程读到底,避免管道写满导致子进程阻塞。
-    let mut stdout_pipe = child.stdout.take();
-    let mut stderr_pipe = child.stderr.take();
-    let stdout_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(ref mut p) = stdout_pipe {
-            let _ = p.read_to_end(&mut buf);
-        }
-        buf
-    });
-    let stderr_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(ref mut p) = stderr_pipe {
-            let _ = p.read_to_end(&mut buf);
-        }
-        buf
-    });
+    // RFC 4254 §5.2: ExtendedData.ext == 1 表示 stderr。
+    const SSH_EXTENDED_DATA_STDERR: u32 = 1;
 
-    // 轮询 try_wait 实现超时。
-    let deadline = Instant::now() + timeout;
-    let mut timed_out = false;
-    let exit_code: Option<i32> = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status.code(),
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    timed_out = true;
-                    break None;
-                }
-                std::thread::sleep(Duration::from_millis(50));
+    while let Some(msg) = channel.wait().await {
+        match msg {
+            ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
+            ChannelMsg::ExtendedData { data, ext } if ext == SSH_EXTENDED_DATA_STDERR => {
+                stderr.extend_from_slice(&data);
             }
-            Err(e) => return Err(format!("error while waiting for ssh: {e}")),
+            ChannelMsg::ExitStatus { exit_status } => {
+                exit_code = Some(exit_status as i32);
+                // 不能立刻 break:服务器可能在 ExitStatus 之后还会发 Close/Eof,
+                // 也可能还有最后一批 Data 待收。让循环走到 wait() 返回 None。
+            }
+            // 收到 Eof / Close 后,wait() 很快会返回 None 退出循环;不需要 break。
+            _ => {}
         }
-    };
+    }
+    // 主动关闭 channel(server-side 可能已经关了,这里幂等 best-effort)。
+    let _ = channel.close().await;
+    drop(handle_guard);
 
-    // 进程已结束(或被 kill),管道走到 EOF,读线程随即返回。
-    let stdout_bytes = stdout_handle.join().unwrap_or_default();
-    let stderr_bytes = stderr_handle.join().unwrap_or_default();
-    let (stdout, out_trunc) =
-        cap_output(&String::from_utf8_lossy(&stdout_bytes), OUTPUT_CAP_BYTES);
-    let (stderr, err_trunc) =
-        cap_output(&String::from_utf8_lossy(&stderr_bytes), OUTPUT_CAP_BYTES);
-
-    Ok(SshExecResult {
+    Ok(ChannelOutcome {
         stdout,
         stderr,
         exit_code,
+    })
+}
+
+/// 把一次 channel 执行的累积结果做 cap_output + 包装成工具返回结构。
+fn finalize_outcome(outcome: ChannelOutcome, timed_out: bool) -> SshExecResult {
+    let (stdout, out_trunc) =
+        cap_output(&String::from_utf8_lossy(&outcome.stdout), OUTPUT_CAP_BYTES);
+    let (stderr, err_trunc) =
+        cap_output(&String::from_utf8_lossy(&outcome.stderr), OUTPUT_CAP_BYTES);
+    SshExecResult {
+        stdout,
+        stderr,
+        exit_code: if timed_out { None } else { outcome.exit_code },
         truncated: out_trunc || err_trunc,
         timed_out,
-    })
-}
-
-/// 密码路径:用 `portable-pty` 起 ssh,扫描 PTY 输出做密码 autofill。
-///
-/// PTY 下 stdout/stderr 合并为一路,全部计入 `stdout`,`stderr` 留空。
-/// 每会话只灌一次密码;命中 `AuthFailed`(密码错误)后停止灌密码,
-/// 避免连灌错误密码。
-///
-/// 实现要点:扫描 + 回写都在**读线程**里做 —— 读线程独占 `reader`,把
-/// `writer` 一并 move 进去就能在命中密码提示时立即回写,不需要跨线程共享
-/// PTY 句柄。主线程只负责轮询子进程与超时 kill。
-fn run_ssh_pty(args: &[String], password: &str, timeout: Duration) -> Result<SshExecResult, String> {
-    let pty_system = native_pty_system();
-    let pair = pty_system
-        .openpty(PtySize {
-            rows: 24,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .map_err(|e| format!("failed to open pty: {e}"))?;
-
-    let mut cmd = CommandBuilder::new("ssh");
-    for a in args {
-        cmd.arg(a);
     }
-    // UTF-8 环境,与主程序 create_pty 一致,避免远程输出乱码。
-    cmd.env("TERM", "xterm-256color");
-    cmd.env("LANG", "C.UTF-8");
-    cmd.env("LC_CTYPE", "C.UTF-8");
-
-    let mut child = pair
-        .slave
-        .spawn_command(cmd)
-        .map_err(|e| format!("failed to spawn ssh in pty: {e}"))?;
-    // slave 句柄留着会让 master 读不到 EOF,spawn 后立即丢弃。
-    drop(pair.slave);
-
-    let mut reader = pair
-        .master
-        .try_clone_reader()
-        .map_err(|e| format!("failed to clone pty reader: {e}"))?;
-    let mut writer = pair
-        .master
-        .take_writer()
-        .map_err(|e| format!("failed to take pty writer: {e}"))?;
-
-    // 读线程:收集 PTY 全部输出,并在命中密码提示时回写密码。
-    // 进程退出后 master 走到 EOF,read 返回 0,线程结束。
-    let password_owned = password.to_string();
-    let read_handle = std::thread::spawn(move || {
-        let mut collected: Vec<u8> = Vec::new();
-        let mut buf = [0u8; 4096];
-        // 每会话只灌一次密码:命中并写入后置 true,后续不再写。
-        let mut password_sent = false;
-        // 命中 AuthFailed 后彻底停止灌密码。
-        let mut auth_failed = false;
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    collected.extend_from_slice(&buf[..n]);
-                    if password_sent || auth_failed {
-                        continue;
-                    }
-                    // 扫描尾部输出判定密码提示。对累积 buffer 取尾段足够:
-                    // 提示串很短,strip ANSI 后判尾即可。
-                    let tail = strip_recent_text(&collected);
-                    match mt_core::scan_ssh_prompt(&tail) {
-                        mt_core::SshPromptScan::Password => {
-                            let mut line = password_owned.clone();
-                            line.push('\r');
-                            if writer.write_all(line.as_bytes()).is_ok() {
-                                let _ = writer.flush();
-                            }
-                            password_sent = true;
-                        }
-                        mt_core::SshPromptScan::AuthFailed => {
-                            auth_failed = true;
-                        }
-                        mt_core::SshPromptScan::None => {}
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-        collected
-    });
-
-    // 主线程:轮询子进程,超时强制 kill。
-    let deadline = Instant::now() + timeout;
-    let mut timed_out = false;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    timed_out = true;
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            Err(e) => {
-                let _ = child.kill();
-                return Err(format!("error while waiting for ssh in pty: {e}"));
-            }
-        }
-    }
-
-    let exit_code = child.wait().ok().map(|s| s.exit_code() as i32);
-    // 进程已结束,master 走到 EOF,读线程随即返回。
-    let collected = read_handle.join().unwrap_or_default();
-    let (stdout, truncated) =
-        cap_output(&String::from_utf8_lossy(&collected), OUTPUT_CAP_BYTES);
-
-    Ok(SshExecResult {
-        stdout,
-        stderr: String::new(),
-        exit_code,
-        truncated,
-        timed_out,
-    })
-}
-
-/// 从累积的 PTY 字节里取尾段并 strip ANSI,用于密码提示扫描。
-///
-/// 密码 / 认证失败提示串都很短,只需看输出末尾;取尾段也避免对越来越大的
-/// buffer 反复全量 strip。在 UTF-8 字符边界处切割以免产生非法 UTF-8。
-fn strip_recent_text(collected: &[u8]) -> String {
-    /// 尾段窗口大小:足以覆盖最长的提示行。
-    const TAIL_WINDOW: usize = 512;
-    let start = collected.len().saturating_sub(TAIL_WINDOW);
-    let tail = &collected[start..];
-    mt_core::strip_ansi_codes(&String::from_utf8_lossy(tail))
 }
 
 /// 从进程参数里解析 `--project-id <id>`。
@@ -559,6 +390,9 @@ struct SshMcp {
     /// 本 sidecar 所属项目的 id(来自启动参数 `--project-id`)。
     /// `None` = 未指定项目 → 暴露全部已保存连接。
     project_id: Option<String>,
+    /// 进程内 SSH 持久会话池。`Arc` 让 `SshMcp` 的 derive(Clone)
+    /// (rmcp 框架要求)保持廉价 —— Clone 只复制 Arc 指针。
+    pool: Arc<SshPool>,
 }
 
 #[tool_router]
@@ -609,6 +443,9 @@ impl SshMcp {
         } = args;
 
         // 1. 查连接(列表已按本项目关联范围过滤,越权连接天然「未找到」)。错误不含密码。
+        //    `read_ssh_connections_for_project` 仍在每次 ssh_exec 入口调用 ——
+        //    保证用户在主程序里新加的连接立即可见。一旦池里建好同 id 的 session,
+        //    后续连接信息「变更」不会动那条 session(见 PRD「配置一致性」)。
         let conn = find_connection(
             &mt_core::read_ssh_connections_for_project(self.project_id.as_deref()),
             &connection,
@@ -618,42 +455,101 @@ impl SshMcp {
         // 2. 拼远程命令(可选 cwd 前缀)。
         let remote_command = build_remote_command(&command, cwd.as_deref());
         let timeout = Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS).max(1));
-
-        // 3. 私钥:先准备权限收紧的临时副本。准备失败回退原始路径让 ssh 自报错。
-        let identity_path: Option<String> = conn
-            .identity_file
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|orig| match mt_core::prepare_ssh_key(orig) {
-                Ok(tmp) => tmp,
-                Err(e) => {
-                    eprintln!("[mt-ssh-mcp] prepare_ssh_key failed, using original path: {e}");
-                    orig.to_string()
-                }
-            });
-
-        // 密码型连接走 PTY autofill,**不能**加 BatchMode(否则禁掉密码认证);
-        // 密钥 / agent 路径加 BatchMode,认证失败立即返回不挂起。
-        let password = conn.password.clone();
-        let use_password = password.as_deref().map(|p| !p.is_empty()).unwrap_or(false);
-        let ssh_args = build_ssh_args(
-            &conn,
-            identity_path.as_deref(),
-            &remote_command,
-            /* batch_mode = */ !use_password,
-        );
         let conn_name_for_audit = conn.name.clone();
+        let conn_id = conn.id.clone();
 
-        // 4. portable-pty / std::process::Command 都是阻塞 API —— 丢进
-        //    spawn_blocking,不阻塞 tokio runtime。
-        let exec_result = tokio::task::spawn_blocking(move || match password {
-            Some(pw) if !pw.is_empty() => run_ssh_pty(&ssh_args, &pw, timeout),
-            _ => run_ssh_piped(&ssh_args, timeout),
-        })
-        .await
-        .map_err(|e| McpError::internal_error(format!("ssh exec task panicked: {e}"), None))?
-        .map_err(|e| McpError::internal_error(e, None))?;
+        // 3. 走池:lazy 建/复用 session。proxy_jump 的拒绝错误也由 pool.acquire 统一返。
+        //    pool.acquire 失败:transport / auth 层错;直接返给 agent(不进 retry,
+        //    auth 错重试只会徒增暴力)。
+        let session = self
+            .pool
+            .acquire(&conn)
+            .await
+            .map_err(|e| McpError::internal_error(e, None))?;
+        if session.is_unhealthy_now() {
+            return Err(McpError::internal_error(
+                "session is in cooldown after a previous auth failure; retry shortly",
+                None,
+            ));
+        }
+
+        // 4. 在 session 上跑 exec + 收集输出,整段套 tokio::time::timeout 超时。
+        //    第一次失败 → evict + 重新 acquire → 再试一次 → 仍失败 → 标 unhealthy + 返错。
+        let outcome_result =
+            tokio::time::timeout(timeout, run_exec_on_session(&session, &remote_command)).await;
+
+        let exec_result = match outcome_result {
+            Ok(Ok(outcome)) => {
+                session.touch();
+                finalize_outcome(outcome, false)
+            }
+            Ok(Err(first_err)) => {
+                // transport-level 错(channel 开不了 / exec 发不出),可能是死链 race。
+                // 移除并重建,再试一次。
+                eprintln!("[mt-ssh-mcp] exec on cached session failed, retrying: {first_err}");
+                self.pool.evict(&conn_id).await;
+                let session2 = self.pool.acquire(&conn).await.map_err(|e| {
+                    McpError::internal_error(format!("reconnect failed: {e}"), None)
+                })?;
+                if session2.is_unhealthy_now() {
+                    return Err(McpError::internal_error(
+                        "session is in cooldown after a previous auth failure; retry shortly",
+                        None,
+                    ));
+                }
+                match tokio::time::timeout(
+                    timeout,
+                    run_exec_on_session(&session2, &remote_command),
+                )
+                .await
+                {
+                    Ok(Ok(outcome)) => {
+                        session2.touch();
+                        finalize_outcome(outcome, false)
+                    }
+                    Ok(Err(second_err)) => {
+                        // 两次都失败 —— 进 30s gatetime cooldown,避免连发把服务器打死。
+                        session2.mark_unhealthy(Duration::from_secs(30));
+                        append_audit_log(&conn_name_for_audit, &command, None);
+                        return Err(McpError::internal_error(
+                            format!("ssh exec failed after retry: {second_err}"),
+                            None,
+                        ));
+                    }
+                    Err(_) => {
+                        // 第二次:超时。已有输出仍然丢失(channel 收集器没拿到),
+                        // 但与原行为一致 —— 强制中止 + timedOut=true。
+                        eprintln!(
+                            "[mt-ssh-mcp] exec timed out on retry after {}s",
+                            timeout.as_secs()
+                        );
+                        SshExecResult {
+                            stdout: String::new(),
+                            stderr: String::new(),
+                            exit_code: None,
+                            truncated: false,
+                            timed_out: true,
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                // 第一次超时:已无法拿到部分输出(future 被取消),只能上报 timeout。
+                // 不 evict、不 disconnect session —— 单 channel 超时不代表整个 session 死了。
+                eprintln!(
+                    "[mt-ssh-mcp] exec timed out after {}s on connection '{}'",
+                    timeout.as_secs(),
+                    conn_name_for_audit
+                );
+                SshExecResult {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    exit_code: None,
+                    truncated: false,
+                    timed_out: true,
+                }
+            }
+        };
 
         // 5. 审计日志:每次执行记一行(失败不影响结果)。
         append_audit_log(&conn_name_for_audit, &command, exec_result.exit_code);
@@ -693,13 +589,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         project_id.as_deref().unwrap_or("<all>")
     );
 
+    // 初始化进程内 SSH 会话池(默认 profile,无需 env 调参)。
+    let pool = Arc::new(SshPool::new());
+
     // 握手并注册工具;.serve() 绑定进程的 stdin/stdout 作为 stdio 传输。
-    let service = SshMcp { project_id }
-        .serve(stdio())
-        .await
-        .inspect_err(|e| {
-            eprintln!("[mt-ssh-mcp] failed to start server: {e}");
-        })?;
+    let service = SshMcp {
+        project_id,
+        pool: pool.clone(),
+    }
+    .serve(stdio())
+    .await
+    .inspect_err(|e| {
+        eprintln!("[mt-ssh-mcp] failed to start server: {e}");
+    })?;
 
     // 阻塞直到 stdin 关闭 / 客户端断开 —— 这是 sidecar 正常退出的信号。
     service.waiting().await?;
@@ -852,70 +754,6 @@ mod tests {
         assert_eq!(build_remote_command("pwd", Some("")), "pwd");
     }
 
-    // --- build_ssh_args ---
-
-    #[test]
-    fn build_ssh_args_minimal() {
-        let c = conn("1", None);
-        let args = build_ssh_args(&c, None, "uptime", true);
-        // 默认端口 22 不出现 -p;无私钥不出现 -i;无跳板不出现 -J
-        assert!(!args.contains(&"-p".to_string()));
-        assert!(!args.contains(&"-i".to_string()));
-        assert!(!args.contains(&"-J".to_string()));
-        assert!(args.contains(&"StrictHostKeyChecking=accept-new".to_string()));
-        assert!(args.contains(&"root@10.0.0.5".to_string()));
-        assert_eq!(args.last().unwrap(), "uptime");
-    }
-
-    #[test]
-    fn build_ssh_args_includes_non_default_port() {
-        let mut c = conn("1", None);
-        c.port = 2222;
-        let args = build_ssh_args(&c, None, "uptime", true);
-        let pos = args.iter().position(|a| a == "-p").unwrap();
-        assert_eq!(args[pos + 1], "2222");
-    }
-
-    #[test]
-    fn build_ssh_args_includes_identity_file_with_forward_slashes() {
-        let c = conn("1", None);
-        let args = build_ssh_args(&c, Some(r"C:\tmp\keys\abc.key"), "uptime", true);
-        let pos = args.iter().position(|a| a == "-i").unwrap();
-        // Windows 路径反斜杠转正斜杠
-        assert_eq!(args[pos + 1], "C:/tmp/keys/abc.key");
-    }
-
-    #[test]
-    fn build_ssh_args_includes_proxy_jump() {
-        let mut c = conn("1", None);
-        c.proxy_jump = Some("user@bastion".into());
-        let args = build_ssh_args(&c, None, "uptime", true);
-        let pos = args.iter().position(|a| a == "-J").unwrap();
-        assert_eq!(args[pos + 1], "user@bastion");
-    }
-
-    #[test]
-    fn build_ssh_args_target_precedes_remote_command() {
-        let c = conn("1", None);
-        let args = build_ssh_args(&c, None, "cd /tmp && ls", true);
-        let target_pos = args.iter().position(|a| a == "root@10.0.0.5").unwrap();
-        // user@host 必须是倒数第二个,remote command 是最后一个
-        assert_eq!(target_pos, args.len() - 2);
-        assert_eq!(args.last().unwrap(), "cd /tmp && ls");
-    }
-
-    #[test]
-    fn build_ssh_args_batch_mode_toggles_batchmode_option() {
-        let c = conn("1", None);
-        // batch_mode = true(密钥/agent 路径):带 BatchMode=yes
-        let with_batch = build_ssh_args(&c, None, "uptime", true);
-        assert!(with_batch.contains(&"BatchMode=yes".to_string()));
-        // batch_mode = false(密码型,PTY autofill):绝不能带 BatchMode,
-        // 否则 ssh 会禁掉密码认证,autofill 喂不进密码。
-        let without_batch = build_ssh_args(&c, None, "uptime", false);
-        assert!(!without_batch.contains(&"BatchMode=yes".to_string()));
-    }
-
     // --- cap_output ---
 
     #[test]
@@ -991,6 +829,49 @@ mod tests {
         assert_eq!(&ts[10..11], "T");
         // 年份在合理范围
         let year: i64 = ts[..4].parse().unwrap();
-        assert!(year >= 2025 && year < 2100);
+        assert!((2025..2100).contains(&year));
+    }
+
+    // --- finalize_outcome ---
+
+    #[test]
+    fn finalize_outcome_passes_through_normal_exec() {
+        let outcome = ChannelOutcome {
+            stdout: b"hi\n".to_vec(),
+            stderr: b"warn\n".to_vec(),
+            exit_code: Some(0),
+        };
+        let r = finalize_outcome(outcome, false);
+        assert_eq!(r.stdout, "hi\n");
+        assert_eq!(r.stderr, "warn\n");
+        assert_eq!(r.exit_code, Some(0));
+        assert!(!r.truncated);
+        assert!(!r.timed_out);
+    }
+
+    #[test]
+    fn finalize_outcome_marks_truncated_when_stdout_overflows() {
+        let outcome = ChannelOutcome {
+            stdout: vec![b'a'; OUTPUT_CAP_BYTES + 10],
+            stderr: Vec::new(),
+            exit_code: Some(0),
+        };
+        let r = finalize_outcome(outcome, false);
+        assert!(r.truncated);
+        // 截断后内容长度受 cap + truncation marker 约束
+        assert!(r.stdout.contains("output truncated"));
+    }
+
+    #[test]
+    fn finalize_outcome_timed_out_drops_exit_code() {
+        // 超时路径:即便 outcome 携带 exit_code,最终结果也必须 None。
+        let outcome = ChannelOutcome {
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            exit_code: Some(0),
+        };
+        let r = finalize_outcome(outcome, true);
+        assert!(r.timed_out);
+        assert_eq!(r.exit_code, None);
     }
 }
