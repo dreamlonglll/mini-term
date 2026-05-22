@@ -15,12 +15,6 @@
 //! - 认证顺序:identity_file 优先 → password 兜底,password 走 password 与
 //!   keyboard-interactive 两种 method(某些服务器仅接后者)。
 //!
-//! 本 PR(PR1)只交付池骨架与 `acquire`,**不接入 `ssh_exec`**——旧 `run_ssh_pty` /
-//! `run_ssh_piped` 路径继续工作,PR2 才切流量。所以池里许多公共 API 会暂时
-//! 没有调用方,允许 `dead_code` 警告。
-
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -85,9 +79,6 @@ pub struct CachedSession {
     opened_at: Instant,
     /// 最近一次使用(`ssh_exec` 触发)的 UNIX 毫秒。Atomic 是为了 reaper 不抢锁就能读。
     last_used: AtomicU64,
-    /// session 建立时所用的连接快照。**重连也用这一份**,不重读 config(故意行为,
-    /// 见 PRD"配置一致性"决策)。
-    conn_snapshot: SshConnection,
     /// auth 连失败后的冷却截止 UNIX 毫秒,0 表示无 cooldown。
     unhealthy_until: AtomicU64,
 }
@@ -322,7 +313,6 @@ impl SshPool {
             handle: Mutex::new(handle),
             opened_at: Instant::now(),
             last_used: AtomicU64::new(now_millis()),
-            conn_snapshot: conn.clone(),
             unhealthy_until: AtomicU64::new(0),
         })
     }
