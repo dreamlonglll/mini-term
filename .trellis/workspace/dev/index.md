@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 3
-- **Last Active**: 2026-05-18
+- **Total Sessions**: 4
+- **Last Active**: 2026-05-22
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~107 | Active |
+| `journal-1.md` | ~145 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 4 | 2026-05-22 | 重构 mt-ssh-mcp 为 russh 持久会话池 | `7c460b0`, `5db2dad`, `ea52f9f`, `c302b99`, `0875fa2`, `d641fd6` | `refactor/ssh-mcp-session-pool` |
 | 3 | 2026-05-18 | SSH 管理器 v2：私钥权限自动处理 | `30b2182` | `main` |
 | 2 | 2026-05-17 | 实现智能终端复制粘贴快捷键（issue #31） | `2d192f5`, `a98255d` | `main` |
 | 1 | 2026-05-08 | 修复退出 AI agent 后状态卡在 ai-idle | `41f2f86` | `main` |

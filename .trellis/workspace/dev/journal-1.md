@@ -105,3 +105,41 @@ SessionEnd 事件清除 hook 状态回退 idle；process_monitor 增加 ai-idle 
 ### Next Steps
 
 - None - task complete
+
+
+## Session 4: 重构 mt-ssh-mcp 为 russh 持久会话池
+
+**Date**: 2026-05-22
+**Task**: 重构 mt-ssh-mcp 为 russh 持久会话池
+**Branch**: `refactor/ssh-mcp-session-pool`
+
+### Summary
+
+把 mt-ssh-mcp sidecar 的 每次 spawn ssh 子进程 模型重构为基于 russh 0.61 的进程内 SSH 会话池：第一次调用建 session、后续 ssh_exec 复用同一 session 开 exec channel。三个 PR 切分：PR1 引入 russh + 池骨架(SshPool/MtClient Handler/known_hosts accept-new/LRU)、PR2 把 ssh_exec 切到走池并删除旧的 PTY autofill 路径、PR3 加后台 reaper(10min idle/2h lifetime)与 shutdown 钩子。中间一个 gatetime cooldown bug 修复 + 一个 dead_code 清理。沉淀 3 个 backend spec：Windows MSVC NASM 坑、rand_core 多版本坑、tokio 资源池骨架。50 sidecar 测试 + 29 mt-core 测试全过，dev/release/clippy 全 0 warning。
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `7c460b0` | (see git log) |
+| `5db2dad` | (see git log) |
+| `ea52f9f` | (see git log) |
+| `c302b99` | (see git log) |
+| `0875fa2` | (see git log) |
+| `d641fd6` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
