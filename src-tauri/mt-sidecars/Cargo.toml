@@ -20,7 +20,23 @@ mt-core = { path = "../mt-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "6"
+# portable-pty 仅 miniterm-hook 仍在使用；mt-ssh-mcp 重构到 russh 后不再依赖。
 portable-pty = "0.8"
 # mt-ssh-mcp 的 MCP server 实现：官方 rmcp stdio server。
 rmcp = { version = "1", features = ["server", "macros", "transport-io"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "time", "sync"] }
+# mt-ssh-mcp 的 SSH 客户端实现：纯 Rust + tokio 原生 async；
+# 持久会话池由它建/维持单条 SSH 连接，channel 用于 exec。
+#
+# 加密后端用 ring 而非默认 aws-lc-rs：后者在 Windows MSVC 上需要 NASM 汇编器
+# (aws-lc-sys 的 jitterentropy / chacha20 等用 NASM 写优化路径)，本仓库与 CI
+# 都没装 NASM；ring 是 pure Rust 不需要任何额外工具链。
+russh = { version = "0.61", default-features = false, features = ["ring"] }
+# 会话池 shutdown 时并发关闭多条 session 用 join_all。
+futures = "0.3"
+# known_hosts 文件读写时编解码 server pubkey 字节。
+base64 = "0.22"
+
+[dev-dependencies]
+# 单测里的 SSH 公钥用预计算 OpenSSH 字符串解析,无需 rand 依赖。
+
