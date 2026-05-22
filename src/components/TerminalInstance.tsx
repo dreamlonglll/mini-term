@@ -24,8 +24,6 @@ function buildSshCommand(conn: SshConnection, identityPath: string | undefined):
   // 反斜杠转正斜杠:Nushell/bash 等会把双引号内的 "\" 当转义符导致报错,
   // 而 Windows OpenSSH 接受正斜杠路径,正斜杠在所有 shell 中都安全
   if (identity) parts.push('-i', `"${identity.replace(/\\/g, '/')}"`);
-  const jump = conn.proxyJump?.trim();
-  if (jump) parts.push('-J', jump);
   parts.push(`${conn.user}@${conn.host}`);
   return parts.join(' ');
 }

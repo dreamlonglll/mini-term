@@ -75,7 +75,6 @@ export interface SshConnection {
   user: string;
   password?: string;
   identityFile?: string;
-  proxyJump?: string;
   group?: string;
 }
 

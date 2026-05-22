@@ -458,7 +458,7 @@ impl SshMcp {
         let conn_name_for_audit = conn.name.clone();
         let conn_id = conn.id.clone();
 
-        // 3. 走池:lazy 建/复用 session。proxy_jump 的拒绝错误也由 pool.acquire 统一返。
+        // 3. 走池:lazy 建/复用 session。
         //    pool.acquire 失败:transport / auth 层错;直接返给 agent(不进 retry,
         //    auth 错重试只会徒增暴力)。
         let session = self
@@ -630,7 +630,6 @@ mod tests {
             user: "root".into(),
             password: password.map(|s| s.into()),
             identity_file: Some("/home/u/.ssh/id_rsa".into()),
-            proxy_jump: None,
             group: Some("内网".into()),
         }
     }

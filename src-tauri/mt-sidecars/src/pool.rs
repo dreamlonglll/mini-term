@@ -197,14 +197,6 @@ impl SshPool {
     /// 若返回的 session `is_unhealthy_now() == true`,调用方应立即返错而不去开 channel,
     /// 实现 30s gatetime cooldown 的语义。
     pub async fn acquire(&self, conn: &SshConnection) -> Result<Arc<CachedSession>, String> {
-        // 拒绝跳板机连接 —— MVP 阶段不支持(见 PRD Out of Scope)。
-        if conn.proxy_jump.as_deref().map(str::trim).filter(|s| !s.is_empty()).is_some() {
-            return Err(format!(
-                "jump host is no longer supported by ssh_exec; remove proxy_jump on connection '{}'",
-                conn.name
-            ));
-        }
-
         {
             let inner = self.inner.lock().await;
             if let Some(s) = inner.sessions.get(&conn.id) {
@@ -840,60 +832,6 @@ mod tests {
         let content2 = std::fs::read_to_string(&path).expect("read 2");
         assert_eq!(content2.lines().count(), 2);
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// 用 `match` 取 Err,绕开 `unwrap_err` 对 Ok variant 的 Debug 约束
-    /// (Arc<CachedSession> 没有 Debug,也不值得只为测试加)。
-    fn err_of<T>(r: Result<T, String>) -> String {
-        match r {
-            Err(e) => e,
-            Ok(_) => panic!("expected Err, got Ok"),
-        }
-    }
-
-    #[tokio::test]
-    async fn acquire_rejects_proxy_jump_connections() {
-        let conn = SshConnection {
-            id: "1".into(),
-            name: "with-jump".into(),
-            host: "h.example.com".into(),
-            port: 22,
-            user: "u".into(),
-            password: None,
-            identity_file: None,
-            proxy_jump: Some("user@bastion".into()),
-            group: None,
-        };
-        let pool = SshPool::with_paths(
-            PoolConfig::default(),
-            std::env::temp_dir().join("mt-ssh-mcp-test-known_hosts"),
-        );
-        let err = err_of(pool.acquire(&conn).await);
-        assert!(err.contains("jump host"), "got: {err}");
-        assert!(err.contains("with-jump"), "got: {err}");
-    }
-
-    #[tokio::test]
-    async fn acquire_blank_proxy_jump_treated_as_none_and_proceeds_to_connect() {
-        // 空白 proxy_jump 应被视作 None,不被 jump 检查拒掉。这里没有真实 sshd,
-        // 走到 connect 必然失败 —— 我们只验证 **失败原因不是 "jump host"**。
-        let conn = SshConnection {
-            id: "2".into(),
-            name: "blank-jump".into(),
-            host: "127.0.0.1".into(),
-            port: 1, // 几乎肯定没人监听
-            user: "u".into(),
-            password: Some("x".into()),
-            identity_file: None,
-            proxy_jump: Some("   ".into()), // 全空白 → 视为没填
-            group: None,
-        };
-        let pool = SshPool::with_paths(
-            PoolConfig::default(),
-            std::env::temp_dir().join("mt-ssh-mcp-test-known_hosts-2"),
-        );
-        let err = err_of(pool.acquire(&conn).await);
-        assert!(!err.contains("jump host"), "got: {err}");
     }
 
     // --- PR3: reaper / select_expired / Drop --------------------------------

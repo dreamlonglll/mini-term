@@ -51,7 +51,6 @@ function SshConnectionForm({
   const [user, setUser] = useState(initial.user);
   const [password, setPassword] = useState(initial.password ?? '');
   const [identityFile, setIdentityFile] = useState(initial.identityFile ?? '');
-  const [proxyJump, setProxyJump] = useState(initial.proxyJump ?? '');
   const [group, setGroup] = useState(initial.group ?? '');
 
   const handleBrowse = useCallback(async () => {
@@ -72,7 +71,6 @@ function SshConnectionForm({
       user: user.trim(),
       password: password ? password : undefined,
       identityFile: identityFile.trim() || undefined,
-      proxyJump: proxyJump.trim() || undefined,
       group: group.trim() || undefined,
     });
   };
@@ -145,14 +143,6 @@ function SshConnectionForm({
             ...
           </button>
         </div>
-      </Field>
-      <Field label="跳板机" hint="可选，对应 ssh -J，格式 user@jumphost[:port]">
-        <input
-          className={INPUT_CLASS}
-          value={proxyJump}
-          onChange={(e) => setProxyJump(e.target.value)}
-          placeholder="user@jump.example.com"
-        />
       </Field>
       <Field label="分组" hint="可选，用于在列表与右键菜单中归类">
         <input

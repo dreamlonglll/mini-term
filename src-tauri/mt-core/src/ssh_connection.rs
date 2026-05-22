@@ -20,8 +20,6 @@ pub struct SshConnection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity_file: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub proxy_jump: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
 }
 
@@ -42,19 +40,17 @@ mod tests {
     fn connection_round_trips() {
         let conn = SshConnection {
             id: "abc".into(),
-            name: "jump-host".into(),
+            name: "prod".into(),
             host: "example.com".into(),
             port: 2222,
             user: "deploy".into(),
             password: Some("secret".into()),
             identity_file: None,
-            proxy_jump: Some("user@bastion".into()),
             group: Some("内网".into()),
         };
         let json = serde_json::to_string(&conn).unwrap();
         let parsed: SshConnection = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.port, 2222);
-        assert_eq!(parsed.proxy_jump.as_deref(), Some("user@bastion"));
         assert_eq!(parsed.group.as_deref(), Some("内网"));
     }
 
@@ -68,10 +64,18 @@ mod tests {
             user: "u".into(),
             password: None,
             identity_file: Some("/k".into()),
-            proxy_jump: None,
             group: None,
         };
         let json = serde_json::to_string(&conn).unwrap();
         assert!(json.contains("\"identityFile\":\"/k\""));
+    }
+
+    #[test]
+    fn legacy_proxy_jump_field_is_ignored() {
+        // 老配置文件里残留的 proxyJump 字段应被 serde 静默忽略,
+        // 不破坏整体反序列化。
+        let json = r#"{"id":"1","name":"n","host":"h","port":22,"user":"u","proxyJump":"user@bastion"}"#;
+        let conn: SshConnection = serde_json::from_str(json).unwrap();
+        assert_eq!(conn.id, "1");
     }
 }

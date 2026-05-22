@@ -157,7 +157,6 @@ mod tests {
             user: "root".into(),
             password: None,
             identity_file: None,
-            proxy_jump: None,
             group: None,
         }
     }
