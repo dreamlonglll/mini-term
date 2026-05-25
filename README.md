@@ -62,7 +62,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 ### WSL 支持（Windows）
 
 - **WSL 目录作为项目根** — 支持把 `\\wsl$\<distro>\<unix-path>` 与 `\\wsl.localhost\<distro>\<unix-path>` 两种形式的 WSL 路径添加为项目，前端展示路径自动剥掉 `\\?\UNC\` verbatim 前缀，文件树可正常展开与预览
-- **自动 wsl.exe 启动** — 检测到 cwd 是 WSL UNC 路径时，`create_pty` 忽略用户配置的 shell（cmd / pwsh 等），强制改用 `wsl.exe -d <distro> --cd <unix-path>` 启动，cwd 真正落在 WSL 里（`pwd` 显示 `/home/<user>/proj` 而不是 `C:\Windows`），与 Windows Terminal `MangleStartingDirectoryForWSL` 行为一致；distro 名从路径直接 parse，不调 `wsl -l -v` 探测；触发重写时右下角弹一次性 toast 提示
+- **自动 wsl.exe 启动** — 检测到 cwd 是 WSL UNC 路径时，`create_pty` 忽略用户配置的 shell（cmd / pwsh 等），强制改用 `wsl.exe -d <distro> --cd <unix-path>` 启动，cwd 真正落在 WSL 里（`pwd` 显示 `/home/<user>/proj` 而不是 `C:\Windows`），与 Windows Terminal `MangleStartingDirectoryForWSL` 行为一致；distro 名从路径直接 parse，不调 `wsl -l -v` 探测；触发重写时弹一次性 toast 提示
 - **已知限制** — AI 进程识别（ai-working / ai-idle 状态）依赖宿主机的 `process_monitor` 看子进程名，wsl.exe 启动后 WSL VM 内的 `claude` / `codex` 进程不在监控范围内，AI 状态会失效；`notify` 文件监听在 WSL 9P 文件系统上事件大概率丢失，文件树需要手动刷新。仅 WSL2 验证，WSL1 兼容性未保证
 
 ### 文件搜索

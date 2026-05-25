@@ -26,7 +26,9 @@ export function ToastContainer() {
               dismissNotification(n.id);
             }}
           >
-            <div className="toast-icon">{isWslInfo ? 'i' : '✓'}</div>
+            <div className={isWslInfo ? 'toast-icon toast-icon--info' : 'toast-icon'}>
+              {isWslInfo ? 'i' : '✓'}
+            </div>
             <div className="toast-body">
               <div className="toast-name">{n.projectName}</div>
               <div className="toast-desc">

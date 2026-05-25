@@ -267,6 +267,7 @@ body.project-dragging {
   font-size: 11px;
   flex-shrink: 0;
 }
+.toast-icon--info { background: var(--color-info); }
 
 .toast-body { flex: 1; min-width: 0; }
 .toast-name {

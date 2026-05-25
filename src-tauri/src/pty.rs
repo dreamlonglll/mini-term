@@ -600,6 +600,10 @@ pub fn create_pty(
     let wsl_override = decide_wsl_override(&cwd);
 
     let (effective_shell, effective_args, effective_cwd) = match &wsl_override {
+        // WSL 分支:启动的是宿主 wsl.exe,WSL VM 内的 claude/codex 子进程
+        // process_monitor 看不到,因此本路径下 AI 进程识别(ai-working/ai-idle 状态)
+        // 会失效 —— PRD Out of Scope 已列,见
+        // `.trellis/tasks/05-25-support-wsl-project-root/prd.md`。
         Some((distro, unix_path)) => (
             "wsl.exe".to_string(),
             vec![
