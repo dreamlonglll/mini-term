@@ -46,6 +46,10 @@
   /* Sizing */
   --radius-sm: 4px;
   --radius-md: 6px;
+
+  /* App font family (overridable via uiFontFamily config) */
+  --app-font-family: 'DM Sans', system-ui, -apple-system, sans-serif;
+  --app-font-mono: 'JetBrains Mono', 'Cascadia Code', Consolas, monospace;
 }
 
 :root[data-theme="light"] {
@@ -92,13 +96,18 @@ html, body, #root {
   overflow: hidden;
   background: var(--bg-base);
   color: var(--text-primary);
-  font-family: 'DM Sans', system-ui, -apple-system, sans-serif;
+  font-family: var(--app-font-family);
   font-size: 13px;
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   transition: background-color 0.25s ease, color 0.25s ease,
               border-color 0.25s ease, box-shadow 0.25s ease;
+}
+
+/* Tailwind v4 默认 font-mono 重定向到我们可配置的变量 */
+.font-mono {
+  font-family: var(--app-font-mono);
 }
 
 /* ===== 防止 xterm.js WebGL canvas 首帧渲染前白屏 ===== */
@@ -421,7 +430,7 @@ body.project-dragging {
   padding: 8px 10px;
   font-size: 14px;
   outline: none;
-  font-family: 'JetBrains Mono', 'Cascadia Code', Consolas, monospace;
+  font-family: var(--app-font-mono);
 }
 
 .prompt-input:focus {
@@ -510,7 +519,7 @@ body.project-dragging {
   color: var(--accent);
   padding: 0.15em 0.4em;
   border-radius: var(--radius-sm);
-  font-family: 'JetBrains Mono', 'Cascadia Code', Consolas, monospace;
+  font-family: var(--app-font-mono);
   font-size: 0.88em;
 }
 

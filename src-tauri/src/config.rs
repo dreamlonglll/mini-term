@@ -51,6 +51,10 @@ pub struct AppConfig {
     pub ui_font_size: f64,
     #[serde(default = "default_terminal_font_size")]
     pub terminal_font_size: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_font_family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_font_family: Option<String>,
     #[serde(default)]
     pub layout_sizes: Option<Vec<f64>>,
     #[serde(default)]
@@ -220,6 +224,8 @@ impl Default for AppConfig {
             available_shells: default_shells(),
             ui_font_size: default_ui_font_size(),
             terminal_font_size: default_terminal_font_size(),
+            ui_font_family: None,
+            terminal_font_family: None,
             layout_sizes: None,
             middle_column_sizes: None,
             theme: default_theme(),
@@ -504,6 +510,39 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let parsed: AppConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.available_shells.len(), config.available_shells.len());
+    }
+
+    #[test]
+    fn font_family_round_trip() {
+        let json = r#"{
+            "projects": [],
+            "defaultShell": "cmd",
+            "availableShells": [],
+            "uiFontSize": 13,
+            "terminalFontSize": 14,
+            "uiFontFamily": "Arial, sans-serif",
+            "terminalFontFamily": "'JetBrainsMono Nerd Font', monospace"
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.ui_font_family.as_deref(), Some("Arial, sans-serif"));
+        assert_eq!(
+            config.terminal_font_family.as_deref(),
+            Some("'JetBrainsMono Nerd Font', monospace")
+        );
+    }
+
+    #[test]
+    fn font_family_absent_is_none() {
+        let json = r#"{
+            "projects": [],
+            "defaultShell": "cmd",
+            "availableShells": [],
+            "uiFontSize": 13,
+            "terminalFontSize": 14
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert!(config.ui_font_family.is_none());
+        assert!(config.terminal_font_family.is_none());
     }
 
     #[test]

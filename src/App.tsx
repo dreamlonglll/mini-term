@@ -21,6 +21,7 @@ import { useMarkerHotkeys } from './hooks/useMarkerHotkeys';
 import { useExternalFileDrop } from './hooks/useExternalFileDrop';
 import { checkForUpdate, type ReleaseInfo } from './utils/updateChecker';
 import { applyTheme } from './utils/themeManager';
+import { applyUiFontFamily } from './utils/fontManager';
 import { markAiPty, updateAllTerminalThemes } from './utils/terminalCache';
 import { includeActiveProject } from './utils/projectKeepAlive';
 import type { AppConfig, PtyStatusChangePayload, PtyExitPayload, PaneStatus } from './types';
@@ -46,6 +47,7 @@ export function App() {
       if (cfg.uiFontSize) {
         document.documentElement.style.fontSize = `${cfg.uiFontSize}px`;
       }
+      applyUiFontFamily(cfg.uiFontFamily);
       const { projectStates } = useAppStore.getState();
       const newStates = new Map(projectStates);
       for (const p of cfg.projects) {

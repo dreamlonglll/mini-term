@@ -19,6 +19,8 @@ export interface AppConfig {
   availableShells: ShellConfig[];
   uiFontSize: number;
   terminalFontSize: number;
+  uiFontFamily?: string;
+  terminalFontFamily?: string;
   layoutSizes?: number[];
   middleColumnSizes?: number[];
   theme: 'auto' | 'light' | 'dark';

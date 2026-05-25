@@ -26,6 +26,14 @@ export interface CachedTerminal {
   wrapper: HTMLDivElement;
 }
 
+export const DEFAULT_TERMINAL_FONT_FAMILY =
+  "'JetBrainsMono Nerd Font', 'CaskaydiaCove Nerd Font', 'JetBrains Mono', 'Cascadia Code', Consolas, monospace";
+
+export function resolveTerminalFontFamily(value: string | undefined): string {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : DEFAULT_TERMINAL_FONT_FAMILY;
+}
+
 interface CachedEntry extends CachedTerminal {
   cleanup: () => void;
   webglLoaded: boolean;
@@ -208,7 +216,7 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
 
   const term = new Terminal({
     fontSize: useAppStore.getState().config.terminalFontSize ?? 14,
-    fontFamily: "'JetBrains Mono', 'Cascadia Code', Consolas, monospace",
+    fontFamily: resolveTerminalFontFamily(useAppStore.getState().config.terminalFontFamily),
     fontWeight: '400',
     fontWeightBold: '600',
     cursorBlink: true,

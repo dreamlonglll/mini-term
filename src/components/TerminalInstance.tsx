@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '../store';
-import { getOrCreateTerminal, getCachedTerminal, activateWebgl, getTerminalTheme, DARK_TERMINAL_THEME, writePtyInput, copyTerminalSelection, pasteToTerminal } from '../utils/terminalCache';
+import { getOrCreateTerminal, getCachedTerminal, activateWebgl, getTerminalTheme, DARK_TERMINAL_THEME, writePtyInput, copyTerminalSelection, pasteToTerminal, resolveTerminalFontFamily } from '../utils/terminalCache';
 import { getResolvedTheme } from '../utils/themeManager';
 import { showContextMenu, type MenuEntry } from '../utils/contextMenu';
 import { isFileDragging, getFileDragPath } from '../utils/fileDragState';
@@ -80,6 +80,7 @@ export function TerminalInstance({ ptyId }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [fileDrag, setFileDrag] = useState(false);
   const terminalFontSize = useAppStore((s) => s.config.terminalFontSize);
+  const terminalFontFamily = useAppStore((s) => s.config.terminalFontFamily);
   const terminalFollowTheme = useAppStore((s) => s.config.terminalFollowTheme);
   const sshConnections = useAppStore((s) => s.config.sshConnections);
 
@@ -170,6 +171,13 @@ export function TerminalInstance({ ptyId }: Props) {
       cached.fitAddon.fit();
     }
   }, [terminalFontSize, ptyId]);
+
+  useEffect(() => {
+    const cached = getCachedTerminal(ptyId);
+    if (!cached) return;
+    cached.term.options.fontFamily = resolveTerminalFontFamily(terminalFontFamily);
+    cached.fitAddon.fit();
+  }, [terminalFontFamily, ptyId]);
 
   useEffect(() => {
     const handler = () => {

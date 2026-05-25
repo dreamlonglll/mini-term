@@ -7,7 +7,8 @@ import { useAppStore } from '../store';
 import { playNotificationSound } from '../utils/notificationSound';
 import { checkForUpdate, compareVersions, type ReleaseInfo } from '../utils/updateChecker';
 import { applyTheme } from '../utils/themeManager';
-import { updateAllTerminalThemes } from '../utils/terminalCache';
+import { updateAllTerminalThemes, DEFAULT_TERMINAL_FONT_FAMILY } from '../utils/terminalCache';
+import { applyUiFontFamily } from '../utils/fontManager';
 import { MOD_LABEL } from '../utils/platform';
 import type { ShellConfig, EditorConfig } from '../types';
 
@@ -656,6 +657,27 @@ function SystemSettings() {
     invoke('save_config', { config: newConfig });
   }, [setConfig]);
 
+  const handleUiFontFamilyChange = useCallback((value: string) => {
+    const trimmed = value.trim();
+    const newConfig = {
+      ...useAppStore.getState().config,
+      uiFontFamily: trimmed || undefined,
+    };
+    setConfig(newConfig);
+    applyUiFontFamily(trimmed || undefined);
+    invoke('save_config', { config: newConfig });
+  }, [setConfig]);
+
+  const handleTerminalFontFamilyChange = useCallback((value: string) => {
+    const trimmed = value.trim();
+    const newConfig = {
+      ...useAppStore.getState().config,
+      terminalFontFamily: trimmed || undefined,
+    };
+    setConfig(newConfig);
+    invoke('save_config', { config: newConfig });
+  }, [setConfig]);
+
   const handleThemeChange = useCallback((theme: 'auto' | 'light' | 'dark') => {
     const newConfig = { ...useAppStore.getState().config, theme };
     setConfig(newConfig);
@@ -845,6 +867,69 @@ function SystemSettings() {
       <div className="pt-3 text-sm text-[var(--text-muted)]">
         界面字体影响侧栏、标签页等 UI 元素 · 终端字体影响终端内文字显示
       </div>
+
+      <div className="pt-4 text-base text-[var(--text-muted)] uppercase tracking-[0.1em] mb-2">
+        字体
+      </div>
+
+      <FontFamilyInput
+        label="界面字体"
+        value={config.uiFontFamily ?? ''}
+        placeholder="'DM Sans', system-ui, sans-serif"
+        onChange={handleUiFontFamilyChange}
+      />
+
+      <FontFamilyInput
+        label="终端字体"
+        value={config.terminalFontFamily ?? ''}
+        placeholder={DEFAULT_TERMINAL_FONT_FAMILY}
+        onChange={handleTerminalFontFamilyChange}
+      />
+
+      <div className="pt-3 text-sm text-[var(--text-muted)]">
+        留空使用默认 · 支持 CSS font-family 语法（如 <span className="font-mono">'JetBrainsMono Nerd Font', monospace</span>）
+      </div>
+    </div>
+  );
+}
+
+// ─── FontFamilyInput ───
+
+function FontFamilyInput({
+  label,
+  value,
+  placeholder,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  placeholder: string;
+  onChange: (v: string) => void;
+}) {
+  const [draft, setDraft] = useState(value);
+  useEffect(() => {
+    setDraft(value);
+  }, [value]);
+  const commit = () => {
+    if (draft !== value) onChange(draft);
+  };
+  return (
+    <div className="space-y-1.5">
+      <span className="text-base text-[var(--text-primary)]">{label}</span>
+      <input
+        type="text"
+        value={draft}
+        placeholder={placeholder}
+        spellCheck={false}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') {
+            (e.target as HTMLInputElement).blur();
+          }
+        }}
+        className="w-full bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1.5 text-base outline-none focus:border-[var(--accent)] font-mono"
+      />
     </div>
   );
 }
