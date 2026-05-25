@@ -628,4 +628,108 @@ mod tests {
         assert!(try_strip_windows_verbatim("/home/user").is_none());
         assert!(try_strip_windows_verbatim("").is_none());
     }
+
+    /// host 名大小写不该被 try_strip 改写(strip 是纯字符串提取,
+    /// 不归一化大小写;归一化由 wsl_path::parse_unc 负责)
+    #[test]
+    fn try_strip_preserves_host_case() {
+        assert_eq!(
+            try_strip_windows_verbatim(r"\\?\UNC\WSL$\Ubuntu\home"),
+            Some(r"\\WSL$\Ubuntu\home".to_string())
+        );
+        assert_eq!(
+            try_strip_windows_verbatim(r"\\?\UNC\Wsl.LocalHost\Ubuntu\home"),
+            Some(r"\\Wsl.LocalHost\Ubuntu\home".to_string())
+        );
+    }
+
+    /// `\\?\UNC\` 后只跟一个 host 而无 share/rest 也应剥成 `\\<host>`
+    #[test]
+    fn try_strip_unc_host_only() {
+        assert_eq!(
+            try_strip_windows_verbatim(r"\\?\UNC\wsl$"),
+            Some(r"\\wsl$".to_string())
+        );
+    }
+
+    // ─── PathBuf 包装版(cfg(windows))与 verify_under_project_root 集成 ───
+
+    #[cfg(windows)]
+    #[test]
+    fn strip_verbatim_prefix_pathbuf_strips_drive_form() {
+        let stripped = strip_verbatim_prefix(PathBuf::from(r"\\?\C:\Users\u\proj"));
+        assert_eq!(stripped, PathBuf::from(r"C:\Users\u\proj"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn strip_verbatim_prefix_pathbuf_strips_unc_form() {
+        let stripped =
+            strip_verbatim_prefix(PathBuf::from(r"\\?\UNC\wsl$\Ubuntu\home\user\proj"));
+        assert_eq!(stripped, PathBuf::from(r"\\wsl$\Ubuntu\home\user\proj"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn strip_verbatim_prefix_pathbuf_is_noop_on_volume_guid() {
+        // Volume GUID 形式保留原样(verbatim 但不在我们处理的两类前缀里)
+        let original = PathBuf::from(r"\\?\Volume{12345678-1234-1234-1234-123456789012}\foo");
+        let stripped = strip_verbatim_prefix(original.clone());
+        assert_eq!(stripped, original);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn strip_verbatim_prefix_pathbuf_is_noop_on_already_clean_path() {
+        let original = PathBuf::from(r"C:\Users\u\proj");
+        let stripped = strip_verbatim_prefix(original.clone());
+        assert_eq!(stripped, original);
+    }
+
+    /// 在 Windows 上 `canonicalize` 临时目录会得到 `\\?\C:\...` 形式;
+    /// 经过 verify_under_project_root 之后,返回值必须已剥掉 verbatim 前缀,
+    /// 否则前端拿到的路径拖进 shell 不友好。
+    #[cfg(windows)]
+    #[test]
+    fn verify_strips_verbatim_prefix_in_result() {
+        let (root, file) = make_test_project();
+        let canon = verify_under_project_root(
+            root.to_string_lossy().as_ref(),
+            file.to_string_lossy().as_ref(),
+            true,
+        )
+        .unwrap();
+        let s = canon.to_string_lossy();
+        assert!(
+            !s.starts_with(r"\\?\"),
+            "verify 返回的路径不应包含 \\?\\ verbatim 前缀: {s}"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// canonicalize 直接传 verbatim 路径仍能 work,verify 返回的剥前缀路径
+    /// 与原路径(剥前缀后)应等价 —— 验证 root 与 target 都剥前缀后
+    /// starts_with 比较的对称性。
+    #[cfg(windows)]
+    #[test]
+    fn verify_equivalence_between_verbatim_and_plain_input() {
+        let (root, file) = make_test_project();
+        let plain = verify_under_project_root(
+            root.to_string_lossy().as_ref(),
+            file.to_string_lossy().as_ref(),
+            true,
+        )
+        .unwrap();
+        // 用 canonicalize 拿到的 verbatim 形式作为输入,verify 后应该剥成同样结果
+        let verbatim_root = root.canonicalize().unwrap();
+        let verbatim_file = file.canonicalize().unwrap();
+        let from_verbatim = verify_under_project_root(
+            verbatim_root.to_string_lossy().as_ref(),
+            verbatim_file.to_string_lossy().as_ref(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(plain, from_verbatim);
+        fs::remove_dir_all(&root).ok();
+    }
 }
