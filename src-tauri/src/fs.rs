@@ -106,19 +106,37 @@ fn is_path_ignored(gitignores: &[Gitignore], full_path: &Path, is_dir: bool) -> 
 
 pub const ALWAYS_IGNORE: &[&str] = &[".git", "node_modules", "target", ".next", "dist", "__pycache__", ".superpowers"];
 
-/// Windows 上 `Path::canonicalize()` 会给普通盘符路径加上 `\\?\` verbatim 前缀
+/// 纯字符串版剥 Windows verbatim 前缀,跨平台可测:
+/// - `\\?\C:\foo` → `Some("C:\\foo")`
+/// - `\\?\UNC\wsl$\Ubuntu\home` → `Some("\\\\wsl$\\Ubuntu\\home")`
+/// - `\\?\UNC\wsl.localhost\Ubuntu\home` → `Some("\\\\wsl.localhost\\Ubuntu\\home")`
+/// - Volume GUID `\\?\Volume{...}` 等其他 verbatim 形式 → `None` (保留原样)
+/// - 非 verbatim 路径 → `None`
+fn try_strip_windows_verbatim(s: &str) -> Option<String> {
+    let rest = s.strip_prefix(r"\\?\")?;
+    // UNC verbatim: `\\?\UNC\<host>\<rest>` → `\\<host>\<rest>`
+    // canonicalize 在 WSL UNC 上会产出这种形式,前端不剥前缀的话路径无法直接粘进 shell。
+    if let Some(unc_rest) = rest.strip_prefix(r"UNC\") {
+        return Some(format!(r"\\{}", unc_rest));
+    }
+    // Drive verbatim: `\\?\<drive>:\...` → `<drive>:\...`
+    let bytes = rest.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' {
+        return Some(rest.to_string());
+    }
+    None
+}
+
+/// Windows 上 `Path::canonicalize()` 会给路径加上 `\\?\` verbatim 前缀
 /// (绕过 MAX_PATH 限制),这种形式回传前端后拖进 shell 不友好。
-/// 只剥掉 `\\?\C:\...` 形式,UNC/Volume GUID 等特殊前缀保留不动。
+/// 同时剥掉盘符 `\\?\C:\...` 与 UNC `\\?\UNC\<host>\...` 两种形式;
+/// Volume GUID 等其他特殊前缀保留不动。
 #[cfg(windows)]
 fn strip_verbatim_prefix(p: PathBuf) -> PathBuf {
-    let s = p.to_string_lossy();
-    if let Some(rest) = s.strip_prefix(r"\\?\") {
-        let bytes = rest.as_bytes();
-        if bytes.len() >= 2 && bytes[1] == b':' {
-            return PathBuf::from(rest);
-        }
+    match try_strip_windows_verbatim(&p.to_string_lossy()) {
+        Some(stripped) => PathBuf::from(stripped),
+        None => p,
     }
-    p
 }
 
 #[cfg(not(windows))]
@@ -555,5 +573,59 @@ mod tests {
         assert!(canon.starts_with(strip_verbatim_prefix(root.canonicalize().unwrap())));
         assert!(!canon.exists()); // 文件还没创建
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn try_strip_drive_verbatim() {
+        assert_eq!(
+            try_strip_windows_verbatim(r"\\?\C:\foo\bar"),
+            Some(r"C:\foo\bar".to_string())
+        );
+        assert_eq!(
+            try_strip_windows_verbatim(r"\\?\D:\"),
+            Some(r"D:\".to_string())
+        );
+    }
+
+    #[test]
+    fn try_strip_unc_verbatim_wsl_dollar() {
+        assert_eq!(
+            try_strip_windows_verbatim(r"\\?\UNC\wsl$\Ubuntu\home\user"),
+            Some(r"\\wsl$\Ubuntu\home\user".to_string())
+        );
+    }
+
+    #[test]
+    fn try_strip_unc_verbatim_wsl_localhost() {
+        assert_eq!(
+            try_strip_windows_verbatim(r"\\?\UNC\wsl.localhost\Ubuntu\home\user"),
+            Some(r"\\wsl.localhost\Ubuntu\home\user".to_string())
+        );
+    }
+
+    #[test]
+    fn try_strip_unc_verbatim_generic_server() {
+        // 非 WSL 的 UNC 也应剥前缀(canonicalize 对任何 UNC 都会加前缀)
+        assert_eq!(
+            try_strip_windows_verbatim(r"\\?\UNC\server\share\folder"),
+            Some(r"\\server\share\folder".to_string())
+        );
+    }
+
+    #[test]
+    fn try_strip_volume_guid_returns_none() {
+        // Volume GUID 形式不剥(保留原行为,这种路径通常用户也不会拿到)
+        assert!(
+            try_strip_windows_verbatim(r"\\?\Volume{12345678-1234-1234-1234-123456789012}\foo")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn try_strip_non_verbatim_returns_none() {
+        assert!(try_strip_windows_verbatim(r"C:\foo").is_none());
+        assert!(try_strip_windows_verbatim(r"\\wsl$\Ubuntu\home").is_none());
+        assert!(try_strip_windows_verbatim("/home/user").is_none());
+        assert!(try_strip_windows_verbatim("").is_none());
     }
 }
