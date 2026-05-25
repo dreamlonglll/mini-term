@@ -17,7 +17,7 @@ interface Props {
   onClose: () => void;
 }
 
-type SettingsPage = 'terminal' | 'system' | 'ai-notification' | 'shortcuts' | 'about';
+type SettingsPage = 'terminal' | 'system' | 'font' | 'ai-notification' | 'shortcuts' | 'about';
 
 // ─── ShellRow（终端设置子组件）───
 
@@ -644,40 +644,6 @@ function SystemSettings() {
     }
   }, []);
 
-  const handleUiFontSizeChange = useCallback((size: number) => {
-    const newConfig = { ...useAppStore.getState().config, uiFontSize: size };
-    setConfig(newConfig);
-    document.documentElement.style.fontSize = `${size}px`;
-    invoke('save_config', { config: newConfig });
-  }, [setConfig]);
-
-  const handleTerminalFontSizeChange = useCallback((size: number) => {
-    const newConfig = { ...useAppStore.getState().config, terminalFontSize: size };
-    setConfig(newConfig);
-    invoke('save_config', { config: newConfig });
-  }, [setConfig]);
-
-  const handleUiFontFamilyChange = useCallback((value: string) => {
-    const trimmed = value.trim();
-    const newConfig = {
-      ...useAppStore.getState().config,
-      uiFontFamily: trimmed || undefined,
-    };
-    setConfig(newConfig);
-    applyUiFontFamily(trimmed || undefined);
-    invoke('save_config', { config: newConfig });
-  }, [setConfig]);
-
-  const handleTerminalFontFamilyChange = useCallback((value: string) => {
-    const trimmed = value.trim();
-    const newConfig = {
-      ...useAppStore.getState().config,
-      terminalFontFamily: trimmed || undefined,
-    };
-    setConfig(newConfig);
-    invoke('save_config', { config: newConfig });
-  }, [setConfig]);
-
   const handleThemeChange = useCallback((theme: 'auto' | 'light' | 'dark') => {
     const newConfig = { ...useAppStore.getState().config, theme };
     setConfig(newConfig);
@@ -843,7 +809,52 @@ function SystemSettings() {
           点击圆点设为默认编辑器 · 文件树顶部按钮将使用默认编辑器打开
         </div>
       </div>
+    </div>
+  );
+}
 
+// ─── FontSettings（字体设置页）───
+
+function FontSettings() {
+  const config = useAppStore((s) => s.config);
+  const setConfig = useAppStore((s) => s.setConfig);
+
+  const handleUiFontSizeChange = useCallback((size: number) => {
+    const newConfig = { ...useAppStore.getState().config, uiFontSize: size };
+    setConfig(newConfig);
+    document.documentElement.style.fontSize = `${size}px`;
+    invoke('save_config', { config: newConfig });
+  }, [setConfig]);
+
+  const handleTerminalFontSizeChange = useCallback((size: number) => {
+    const newConfig = { ...useAppStore.getState().config, terminalFontSize: size };
+    setConfig(newConfig);
+    invoke('save_config', { config: newConfig });
+  }, [setConfig]);
+
+  const handleUiFontFamilyChange = useCallback((value: string) => {
+    const trimmed = value.trim();
+    const newConfig = {
+      ...useAppStore.getState().config,
+      uiFontFamily: trimmed || undefined,
+    };
+    setConfig(newConfig);
+    applyUiFontFamily(trimmed || undefined);
+    invoke('save_config', { config: newConfig });
+  }, [setConfig]);
+
+  const handleTerminalFontFamilyChange = useCallback((value: string) => {
+    const trimmed = value.trim();
+    const newConfig = {
+      ...useAppStore.getState().config,
+      terminalFontFamily: trimmed || undefined,
+    };
+    setConfig(newConfig);
+    invoke('save_config', { config: newConfig });
+  }, [setConfig]);
+
+  return (
+    <div className="space-y-6">
       <div className="text-base text-[var(--text-muted)] uppercase tracking-[0.1em] mb-2">
         字体大小
       </div>
@@ -1438,6 +1449,7 @@ function ShortcutsSettings() {
 const MENU_ITEMS: { key: SettingsPage; label: string }[] = [
   { key: 'terminal', label: '终端设置' },
   { key: 'system', label: '系统设置' },
+  { key: 'font', label: '字体' },
   { key: 'ai-notification', label: 'AI 完成通知' },
   { key: 'shortcuts', label: '快捷键' },
   { key: 'about', label: '关于' },
@@ -1496,6 +1508,7 @@ export function SettingsModal({ open, onClose }: Props) {
           <div className="flex-1 overflow-y-auto px-5 py-4">
             {activePage === 'terminal' && <TerminalSettings />}
             {activePage === 'system' && <SystemSettings />}
+            {activePage === 'font' && <FontSettings />}
             {activePage === 'ai-notification' && <AiNotificationSettings />}
             {activePage === 'shortcuts' && <ShortcutsSettings />}
             {activePage === 'about' && <AboutSettings />}
