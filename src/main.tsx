@@ -10,8 +10,8 @@ document.addEventListener('contextmenu', (e) => {
 
 // 禁用 WebView 默认快捷键（F5 刷新、F7、F12 开发者工具、Ctrl+R 等）
 document.addEventListener('keydown', (e) => {
-  // F1-F12
-  if (e.key.startsWith('F') && !isNaN(Number(e.key.slice(1)))) {
+  // F1-F12（注意：必须排除单独的 'F'，否则 Shift+F 输入大写 F 会被误拦截）
+  if (/^F([1-9]|1[0-2])$/.test(e.key)) {
     e.preventDefault();
     return;
   }
