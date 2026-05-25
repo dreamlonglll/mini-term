@@ -114,6 +114,11 @@ export interface AiCompletionNotification {
   projectId: string;
   projectName: string;
   timestamp: number;
+  /** 通知类型,默认 'ai-completion'(AI 任务完成,点击跳到对应项目);
+   *  'wsl-info' 用于 WSL 启动器重写提示,不携带 projectId 跳转语义。 */
+  kind?: 'ai-completion' | 'wsl-info';
+  /** kind='wsl-info' 时的自定义消息文本,渲染时直接展示。 */
+  message?: string;
 }
 
 export interface TerminalTab {

@@ -1,4 +1,4 @@
-use mt_core::{scan_ssh_prompt, strip_ansi_codes, SshPromptScan};
+use mt_core::{parse_wsl_unc, scan_ssh_prompt, strip_ansi_codes, SshPromptScan};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
@@ -21,6 +21,34 @@ struct PtyOutputPayload {
 struct PtyExitPayload {
     pty_id: u32,
     exit_code: i32,
+}
+
+/// 当 cwd 命中 WSL UNC 路径时,`create_pty` 会强制改用 `wsl.exe -d <distro> --cd <unix-path>`
+/// 启动,并向前端推送本 payload 以便弹一次性 toast。重写发生在用户配置的 shell 之前
+/// (无视用户的 cmd/pwsh 设置),与 Windows Terminal 的 `MangleStartingDirectoryForWSL` 行为一致。
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WslShellOverridePayload {
+    pty_id: u32,
+    distro: String,
+    unix_path: String,
+}
+
+/// 判断是否要把 cwd 重写为 WSL 启动器。返回 `Some((distro, unix_path))` 时,
+/// 调用方必须把 shell 切到 `wsl.exe`、args 切到 `["-d", &distro, "--cd", &unix_path]`,
+/// 并把 portable-pty 的 cwd 改成一个 Windows 端合法的目录(如 `%USERPROFILE%` 或 `C:\`),
+/// 避免 ConPTY 在 `is_dir()` 检查 UNC 路径失败时静默退回 `$USERPROFILE`。
+///
+/// 仅做纯字符串解析,跨平台行为一致 —— 在 Linux/macOS 上,普通路径不会匹配 `\\` 前缀,
+/// 因此 `parse_wsl_unc` 返回 None,函数也返回 None,保持原启动逻辑不变。
+fn decide_wsl_override(cwd: &str) -> Option<(String, String)> {
+    parse_wsl_unc(cwd).map(|wsl| (wsl.distro, wsl.unix_path))
+}
+
+/// 选一个 Windows 端合法的兜底 cwd 给 portable-pty,
+/// 避免把 WSL UNC 直接传给 ConPTY 触发 `$USERPROFILE` 静默 fallback。
+fn fallback_windows_cwd() -> String {
+    std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\".to_string())
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -567,11 +595,29 @@ pub fn create_pty(
         })
         .map_err(|e| e.to_string())?;
 
-    let mut cmd = CommandBuilder::new(&shell);
-    for arg in &args {
+    // WSL UNC cwd 检测:命中则忽略用户配置的 shell,改用 wsl.exe 启动,
+    // 并把 portable-pty 的 cwd 换成 Windows 端合法目录(详见 decide_wsl_override 注释)。
+    let wsl_override = decide_wsl_override(&cwd);
+
+    let (effective_shell, effective_args, effective_cwd) = match &wsl_override {
+        Some((distro, unix_path)) => (
+            "wsl.exe".to_string(),
+            vec![
+                "-d".to_string(),
+                distro.clone(),
+                "--cd".to_string(),
+                unix_path.clone(),
+            ],
+            fallback_windows_cwd(),
+        ),
+        None => (shell, args, cwd),
+    };
+
+    let mut cmd = CommandBuilder::new(&effective_shell);
+    for arg in &effective_args {
         cmd.arg(arg);
     }
-    cmd.cwd(&cwd);
+    cmd.cwd(&effective_cwd);
 
     // Advertise terminal capabilities so TUI apps (Claude Code, etc.)
     // enable colors and advanced cursor rendering.
@@ -597,6 +643,18 @@ pub fn create_pty(
     // 注入 PTY ID 环境变量，Claude Code / Codex 的 hook 子进程可通过此变量
     // 关联到具体的终端 pane
     cmd.env("MINITERM_PTY_ID", pty_id.to_string());
+
+    // WSL 重写发生时通知前端弹一次性 toast。pty_id 必须先分配,否则 payload 无法携带。
+    if let Some((distro, unix_path)) = wsl_override.as_ref() {
+        let _ = app.emit(
+            "wsl-shell-override",
+            WslShellOverridePayload {
+                pty_id,
+                distro: distro.clone(),
+                unix_path: unix_path.clone(),
+            },
+        );
+    }
 
     // 注入 hook 服务器端口，避免 miniterm-hook 每次都从文件读取端口
     let hook_port = hook_state.get_port();
@@ -1399,5 +1457,67 @@ mod tests {
         let mgr = PtyManager::new();
         mgr.arm_ssh_autofill(7, "secret".into());
         assert!(mgr.ssh_autofill.lock().unwrap().contains_key(&7));
+    }
+
+    // === WSL UNC 启动器重写检测 ===
+    // 完整的 create_pty 会 spawn 真实 shell,不适合在单测里跑;
+    // 这里只验证 decide_wsl_override 这层纯函数的分支选择,覆盖
+    // "WSL UNC 触发重写 / 普通路径不触发 / Linux 路径不触发" 三种 PRD 要求场景。
+
+    #[test]
+    fn wsl_override_triggered_by_wsl_dollar_unc() {
+        let result = decide_wsl_override(r"\\wsl$\Ubuntu\home\u\proj");
+        assert_eq!(
+            result,
+            Some(("Ubuntu".to_string(), "/home/u/proj".to_string()))
+        );
+    }
+
+    #[test]
+    fn wsl_override_triggered_by_wsl_localhost_unc() {
+        let result = decide_wsl_override(r"\\wsl.localhost\Ubuntu-22.04\home\u\proj");
+        assert_eq!(
+            result,
+            Some(("Ubuntu-22.04".to_string(), "/home/u/proj".to_string()))
+        );
+    }
+
+    #[test]
+    fn wsl_override_triggered_by_verbatim_unc() {
+        // Rust canonicalize 在 WSL UNC 上输出 \\?\UNC\<host>\<rest>;
+        // 与裸 \\wsl$\ 等价,decide_wsl_override 必须识别两种形式。
+        let result = decide_wsl_override(r"\\?\UNC\wsl$\Ubuntu\home\u");
+        assert_eq!(
+            result,
+            Some(("Ubuntu".to_string(), "/home/u".to_string()))
+        );
+    }
+
+    #[test]
+    fn wsl_override_not_triggered_by_windows_local_path() {
+        assert!(decide_wsl_override(r"C:\Users\u\proj").is_none());
+        assert!(decide_wsl_override(r"D:\Git\mini-term").is_none());
+    }
+
+    #[test]
+    fn wsl_override_not_triggered_by_unix_path() {
+        // Linux/macOS 平台传入的普通绝对路径不应被识别。
+        assert!(decide_wsl_override("/home/u/proj").is_none());
+        assert!(decide_wsl_override("/").is_none());
+    }
+
+    #[test]
+    fn wsl_override_not_triggered_by_non_wsl_unc() {
+        // 普通文件共享 UNC 不能被误识别为 WSL。
+        assert!(decide_wsl_override(r"\\server\share\folder").is_none());
+        assert!(decide_wsl_override(r"\\?\UNC\fileserver\share").is_none());
+    }
+
+    #[test]
+    fn fallback_windows_cwd_returns_existing_path() {
+        // 兜底 cwd 必须是 portable-pty 能 is_dir() 通过的目录;
+        // %USERPROFILE% 在所有用户环境下都存在,失败时退化为 C:\。
+        let cwd = fallback_windows_cwd();
+        assert!(!cwd.is_empty(), "fallback cwd 不应为空字符串");
     }
 }

@@ -12,29 +12,37 @@ export function ToastContainer() {
 
   return (
     <div className="toast-stack">
-      {visible.map((n) => (
-        <div
-          key={n.id}
-          className="toast-card"
-          onClick={() => {
-            setActiveProject(n.projectId);
-            dismissNotification(n.id);
-          }}
-        >
-          <div className="toast-icon">✓</div>
-          <div className="toast-body">
-            <div className="toast-name">{n.projectName}</div>
-            <div className="toast-desc">AI 已完成 · 点击查看</div>
-          </div>
+      {visible.map((n) => {
+        const isWslInfo = n.kind === 'wsl-info';
+        return (
           <div
-            className="toast-close"
-            onClick={(e) => {
-              e.stopPropagation();
+            key={n.id}
+            className="toast-card"
+            onClick={() => {
+              // WSL 信息提示不带项目跳转语义,点击仅 dismiss
+              if (!isWslInfo) {
+                setActiveProject(n.projectId);
+              }
               dismissNotification(n.id);
             }}
-          >×</div>
-        </div>
-      ))}
+          >
+            <div className="toast-icon">{isWslInfo ? 'i' : '✓'}</div>
+            <div className="toast-body">
+              <div className="toast-name">{n.projectName}</div>
+              <div className="toast-desc">
+                {isWslInfo ? (n.message ?? '') : 'AI 已完成 · 点击查看'}
+              </div>
+            </div>
+            <div
+              className="toast-close"
+              onClick={(e) => {
+                e.stopPropagation();
+                dismissNotification(n.id);
+              }}
+            >×</div>
+          </div>
+        );
+      })}
     </div>
   );
 }

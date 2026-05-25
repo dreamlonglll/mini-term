@@ -148,6 +148,20 @@ export function App() {
     }
   }, [updatePaneStatusByPty]));
 
+  // WSL 启动器重写提示:后端检测到 cwd 是 WSL UNC 路径并强制改用 wsl.exe 启动时,
+  // 弹一次性 toast(5s 自动消失)。projectId 仅作占位 (不参与跳转,kind='wsl-info' 已屏蔽点击跳转)。
+  useTauriEvent<{ ptyId: number; distro: string; unixPath: string }>(
+    'wsl-shell-override',
+    useCallback((payload) => {
+      useAppStore.getState().pushNotification({
+        projectId: '__wsl_info__',
+        projectName: `WSL: ${payload.distro}`,
+        kind: 'wsl-info',
+        message: `已检测到 WSL 项目,使用 wsl.exe 启动终端 (${payload.unixPath})`,
+      });
+    }, []),
+  );
+
   useAiSubmitMarker();
   useMarkerHotkeys();
   useExternalFileDrop();
