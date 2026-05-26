@@ -1,8 +1,14 @@
+import { invoke } from '@tauri-apps/api/core';
+
 type ThemeMode = 'auto' | 'light' | 'dark';
 type ResolvedTheme = 'light' | 'dark';
 
 let currentResolved: ResolvedTheme = 'dark';
 let cleanupFn: (() => void) | null = null;
+
+function syncNativeTitleBar(theme: ResolvedTheme) {
+  invoke('set_window_dark_mode', { dark: theme === 'dark' }).catch(() => {});
+}
 
 const STORAGE_KEY = 'mini-term-theme';
 const COLOR_SCHEME_QUERY = '(prefers-color-scheme: light)';
@@ -52,6 +58,7 @@ function applyToDOM(theme: ResolvedTheme) {
   currentResolved = theme;
   document.documentElement.dataset.theme = theme;
   localStorage.setItem(STORAGE_KEY, theme);
+  syncNativeTitleBar(theme);
 }
 
 export function getResolvedTheme(): ResolvedTheme {

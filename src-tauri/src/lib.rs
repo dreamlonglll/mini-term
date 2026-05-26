@@ -11,6 +11,7 @@ mod pty;
 mod search;
 mod ssh;
 mod ssh_mcp_registry;
+mod window_theme;
 
 use tauri::Manager;
 
@@ -127,6 +128,7 @@ pub fn run() {
             hook_server::toggle_hook_server,
             ssh_mcp_registry::enable_ssh_mcp,
             ssh_mcp_registry::disable_ssh_mcp,
+            window_theme::set_window_dark_mode,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
