@@ -96,3 +96,53 @@ smartCopyPaste: false,
 **Optional fields**: if the field is semantically nullable, use `Option<T>` +
 `#[serde(default, skip_serializing_if = "Option::is_none")]` on the Rust side and
 `field?: T` on the frontend.
+
+**Collection fields**: if the field is a list/map whose empty state should not
+pollute `config.json`, use `Vec<T>` (or `HashMap<K, V>`) +
+`#[serde(default, skip_serializing_if = "Vec::is_empty")]` on the Rust side and
+`field?: T[]` on the frontend. Old configs auto-default to empty; new empty
+configs do not write the field. Example: `ProjectConfig.env_vars`.
+
+### Convention: Optimistic update with rollback on save failure
+
+**What**: When a modal writes to `AppConfig` via `save_config`, do **optimistic
+update + rollback on failure**, never "await save then setConfig". The pattern:
+
+```ts
+const prevConfig = useAppStore.getState().config;
+const newConfig = { ...prevConfig, /* changes */ };
+useAppStore.getState().setConfig(newConfig);  // optimistic
+try {
+  await invoke('save_config', { config: newConfig });
+  onClose();
+} catch (e) {
+  useAppStore.getState().setConfig(prevConfig);  // rollback
+  setBusy(false);
+  await showAlert('保存失败', e instanceof Error ? e.message : String(e));
+}
+```
+
+**Why**:
+
+1. **Responsiveness**: UI reflects change immediately; the disk write happens in
+   background.
+2. **Consistency invariant**: store and `config.json` must agree at rest. If
+   `save_config` rejects after we set the store but before we rolled back, the
+   next startup loads the on-disk (old) value while the runtime store has the
+   new value — user sees their change "silently lost" on next launch.
+3. **User feedback**: `showAlert` makes the failure visible; silent
+   `console.error` leaves users thinking they saved when they didn't.
+
+**Existing followers**: `SshAssocModal.tsx`, `ProjectEnvVarsModal.tsx`.
+
+**Don't**:
+
+```ts
+// ❌ Wrong: store updated but disk not, and user gets no feedback.
+useAppStore.getState().setConfig(newConfig);
+try {
+  await invoke('save_config', { config: newConfig });
+} catch (e) {
+  console.error(e);  // user thinks save succeeded; store and disk diverge
+}
+```

@@ -15,6 +15,7 @@
 | [portable-pty ConPTY cwd 静默 fallback](./portable-pty-conpty-cwd-fallback.md) | Windows 上 `CommandBuilder::cwd()` 拿到非合法目录时静默退回 `$USERPROFILE`，调用方必须先校验或替换 cwd，避免诊断黑洞 |
 | [Windows `\\?\UNC\` verbatim 前缀剥离](./windows-unc-verbatim-prefix-strip.md) | `canonicalize` 返回的 UNC verbatim 前缀 `dunce::simplified` 不剥（只剥盘符），自己写一条 `\\?\UNC\<host>\<rest>` → `\\<host>\<rest>` 规则 |
 | [`wsl.exe --cd` 路径语义](./wsl-exe-cd-path-semantics.md) | `wsl.exe -d <distro> --cd <path>` 的 path 不接受 `\\wsl$\` UNC，必须先 parse 出 distro 与 Linux 路径再传；distro 名从路径取，不调 `wsl -l -v` |
+| [PTY 子进程环境变量注入契约](./pty-env-vars-injection.md) | `create_pty` 注入项目级 env 的完整契约：注入顺序（内部 env 先 / 用户 envs 后）、`MINITERM_*` 前后端双重保护、WSL 分支跳过注入、前后端 WSL 检测口径必须对齐 |
 
 ---
 
