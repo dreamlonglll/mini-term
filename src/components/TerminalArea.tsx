@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { useAppStore, genId, saveLayoutToConfig } from '../store';
 import { SplitLayout } from './SplitLayout';
 import { showContextMenu } from '../utils/contextMenu';
+import { getProjectEnvs } from '../utils/projectEnv';
 import type { TerminalTab, PaneState, SplitNode, ShellConfig } from '../types';
 
 interface Props {
@@ -59,6 +60,7 @@ export function TerminalArea({ projectId, projectPath }: Props) {
       shell: shell.command,
       args: shell.args ?? [],
       cwd: projectPath,
+      envs: getProjectEnvs(projectId),
     });
 
     const paneId = genId();
@@ -105,6 +107,7 @@ export function TerminalArea({ projectId, projectPath }: Props) {
         shell: shell.command,
         args: shell.args ?? [],
         cwd: projectPath,
+        envs: getProjectEnvs(projectId),
       });
 
       const newPane: PaneState = {

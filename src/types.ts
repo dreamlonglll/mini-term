@@ -56,6 +56,15 @@ export interface ProjectConfig {
   sshMcpEnabled?: boolean;
   /** 该项目的 agent 可访问的 SSH 连接 id 列表（「关联 SSH」设定的范围）；undefined = 全部 */
   sshConnectionIds?: string[];
+  /** 项目级环境变量,新建终端时注入到 PTY 子进程。已开终端不受影响。 */
+  envVars?: ProjectEnvVar[];
+}
+
+export interface ProjectEnvVar {
+  key: string;
+  value: string;
+  /** 取消勾选时 value 保留但不注入,允许临时禁用某变量而无需删行重输 */
+  enabled: boolean;
 }
 
 export interface ShellConfig {

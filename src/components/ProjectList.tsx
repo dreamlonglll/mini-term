@@ -9,6 +9,7 @@ import { StatusDot } from './StatusDot';
 import { DoneTag } from './DoneTag';
 import { SessionList } from './SessionList';
 import { SshAssocModal } from './SshAssocModal';
+import { ProjectEnvVarsModal } from './ProjectEnvVarsModal';
 import { showContextMenu } from '../utils/contextMenu';
 import { showPrompt } from '../utils/prompt';
 import { initProjectDrag, isProjectDragging, getProjectDragPayload, onProjectDragEnd } from '../utils/projectDragState';
@@ -53,6 +54,7 @@ export function ProjectList() {
 
   const [confirmTarget, setConfirmTarget] = useState<{ id: string; name: string } | null>(null);
   const [sshAssocTarget, setSshAssocTarget] = useState<ProjectConfig | null>(null);
+  const [envVarsTarget, setEnvVarsTarget] = useState<ProjectConfig | null>(null);
   const [dropIndicator, setDropIndicator] = useState<DropIndicator | null>(null);
   const [editingGroupId, setEditingGroupId] = useState<string | null>(null);
   const [editingProjectId, setEditingProjectId] = useState<string | null>(null);
@@ -377,6 +379,10 @@ export function ProjectList() {
               label: '关联 SSH…',
               onClick: () => setSshAssocTarget(project),
             },
+            {
+              label: '环境变量…',
+              onClick: () => setEnvVarsTarget(project),
+            },
           ];
           // 添加分组相关菜单
           if (allGroups.length > 0) {
@@ -592,6 +598,8 @@ export function ProjectList() {
 
       {/* 关联 SSH 弹窗 */}
       <SshAssocModal project={sshAssocTarget} onClose={() => setSshAssocTarget(null)} />
+      {/* 环境变量弹窗 */}
+      <ProjectEnvVarsModal project={envVarsTarget} onClose={() => setEnvVarsTarget(null)} />
 
       {/* 删除确认弹窗 */}
       {confirmTarget && (

@@ -584,6 +584,7 @@ pub fn create_pty(
     shell: String,
     args: Vec<String>,
     cwd: String,
+    envs: Option<Vec<(String, String)>>,
 ) -> Result<u32, String> {
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -664,6 +665,25 @@ pub fn create_pty(
     let hook_port = hook_state.get_port();
     if hook_port > 0 {
         cmd.env("MINITERM_HOOK_PORT", hook_port.to_string());
+    }
+
+    // 项目级用户环境变量注入。
+    // - 顺序在 mini-term 内部 env(TERM/LANG/MINITERM_*) 之后,允许用户覆盖 TERM/LANG 等
+    //   标准变量。
+    // - `MINITERM_` 前缀属于 mini-term 内部 hook 协议,这里再做一次防御性过滤:
+    //   即便用户绕过前端校验(手改 config.json)塞进来,也不会覆盖 MINITERM_PTY_ID /
+    //   MINITERM_HOOK_PORT 等保留变量。
+    // - WSL 启动器分支跳过:wsl.exe 的进程 env 不会自动透传给 Linux bash,
+    //   注入了也没用,反而误导用户。WSLENV 自动翻译留给 v2。
+    if wsl_override.is_none() {
+        if let Some(list) = envs {
+            for (k, v) in list {
+                if k.starts_with("MINITERM_") {
+                    continue;
+                }
+                cmd.env(k, v);
+            }
+        }
     }
 
     let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;

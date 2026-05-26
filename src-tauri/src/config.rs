@@ -145,6 +145,18 @@ pub struct SavedProjectLayout {
     pub active_tab_index: usize,
 }
 
+/// 项目级环境变量。注入到该项目新建终端 PTY 的子进程,与 portable-pty 默认继承的
+/// 父进程 env 合并(同名 key 覆盖)。已开终端不受影响。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectEnvVar {
+    pub key: String,
+    pub value: String,
+    /// 取消勾选时 value 保留但不注入;允许用户临时禁用某变量而无需删行重输。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectConfig {
@@ -162,6 +174,9 @@ pub struct ProjectConfig {
     /// `None` = 未设置 → 默认全部连接可见。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh_connection_ids: Option<Vec<String>>,
+    /// 项目级环境变量列表,新建终端时注入。空 Vec 时序列化跳过保持文件干净。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env_vars: Vec<ProjectEnvVar>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -689,6 +704,64 @@ mod tests {
         assert!(!new_dir.join("config.json").exists());
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn env_vars_round_trip() {
+        let json = r#"{
+            "projects": [{
+                "id": "p1",
+                "name": "proj1",
+                "path": "/tmp/1",
+                "envVars": [
+                    {"key": "FOO", "value": "bar", "enabled": true},
+                    {"key": "API_KEY", "value": "sk-xxx", "enabled": false},
+                    {"key": "EMPTY", "value": ""}
+                ]
+            }],
+            "defaultShell": "cmd",
+            "availableShells": [{"name": "cmd", "command": "cmd"}],
+            "uiFontSize": 13,
+            "terminalFontSize": 14
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        let env_vars = &config.projects[0].env_vars;
+        assert_eq!(env_vars.len(), 3);
+        assert_eq!(env_vars[0].key, "FOO");
+        assert_eq!(env_vars[0].value, "bar");
+        assert!(env_vars[0].enabled);
+        assert!(!env_vars[1].enabled);
+        // enabled 字段缺省时默认 true
+        assert_eq!(env_vars[2].key, "EMPTY");
+        assert_eq!(env_vars[2].value, "");
+        assert!(env_vars[2].enabled);
+
+        // round-trip:再序列化再反序列化,字段顺序与值保持
+        let serialized = serde_json::to_string(&config).unwrap();
+        let reparsed: AppConfig = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.projects[0].env_vars.len(), 3);
+        assert_eq!(reparsed.projects[0].env_vars[1].value, "sk-xxx");
+    }
+
+    #[test]
+    fn env_vars_absent_is_empty_and_not_serialized() {
+        // 旧 config.json 无 envVars 字段 → 默认空 Vec
+        let json = r#"{
+            "projects": [{"id": "p1", "name": "proj1", "path": "/tmp/1"}],
+            "defaultShell": "cmd",
+            "availableShells": [{"name": "cmd", "command": "cmd"}],
+            "uiFontSize": 13,
+            "terminalFontSize": 14
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert!(config.projects[0].env_vars.is_empty());
+
+        // 空 Vec 不写入 JSON,保持配置文件干净
+        let serialized = serde_json::to_string(&config).unwrap();
+        assert!(
+            !serialized.contains("envVars"),
+            "空 envVars 不应序列化进 JSON: {serialized}"
+        );
     }
 
     #[test]
