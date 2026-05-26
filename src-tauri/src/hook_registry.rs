@@ -92,21 +92,18 @@ fn build_claude_hook_entry(hook_path: &str, event: &str) -> Value {
 
 /// 注册 Claude Code hooks 到 ~/.claude/settings.json
 fn register_claude_hooks(hook_path: &str) -> Result<String, String> {
-    let settings_path = claude_settings_path()
-        .ok_or_else(|| "无法获取 home 目录".to_string())?;
+    let settings_path = claude_settings_path().ok_or_else(|| "无法获取 home 目录".to_string())?;
 
     // 确保 .claude 目录存在
     if let Some(parent) = settings_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("创建 .claude 目录失败: {}", e))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建 .claude 目录失败: {}", e))?;
     }
 
     // 读取现有配置
     let mut settings: Value = if settings_path.exists() {
         let content = std::fs::read_to_string(&settings_path)
             .map_err(|e| format!("读取 settings.json 失败: {}", e))?;
-        serde_json::from_str(&content)
-            .map_err(|e| format!("解析 settings.json 失败: {}", e))?
+        serde_json::from_str(&content).map_err(|e| format!("解析 settings.json 失败: {}", e))?
     } else {
         serde_json::json!({})
     };
@@ -116,7 +113,8 @@ fn register_claude_hooks(hook_path: &str) -> Result<String, String> {
         settings["hooks"] = serde_json::json!({});
     }
 
-    let hooks = settings["hooks"].as_object_mut()
+    let hooks = settings["hooks"]
+        .as_object_mut()
         .ok_or_else(|| "hooks 字段不是对象".to_string())?;
 
     let mut updated = 0;
@@ -181,8 +179,8 @@ fn unregister_claude_hooks() -> Result<String, String> {
 
     let content = std::fs::read_to_string(&settings_path)
         .map_err(|e| format!("读取 settings.json 失败: {}", e))?;
-    let mut settings: Value = serde_json::from_str(&content)
-        .map_err(|e| format!("解析 settings.json 失败: {}", e))?;
+    let mut settings: Value =
+        serde_json::from_str(&content).map_err(|e| format!("解析 settings.json 失败: {}", e))?;
 
     let mut removed = 0;
 
@@ -261,13 +259,11 @@ fn build_codex_hook_entry(hook_path: &str, event: &str) -> Value {
 
 /// 确保 Codex config.toml 中启用了 hooks feature flag
 fn ensure_codex_hooks_feature() -> Result<(), String> {
-    let config_path = codex_config_path()
-        .ok_or_else(|| "无法获取 home 目录".to_string())?;
+    let config_path = codex_config_path().ok_or_else(|| "无法获取 home 目录".to_string())?;
 
     // 确保 .codex 目录存在
     if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("创建 .codex 目录失败: {}", e))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建 .codex 目录失败: {}", e))?;
     }
 
     // 读取或创建 config.toml
@@ -278,7 +274,8 @@ fn ensure_codex_hooks_feature() -> Result<(), String> {
         String::new()
     };
 
-    let mut doc: toml_edit::DocumentMut = content.parse::<toml_edit::DocumentMut>()
+    let mut doc: toml_edit::DocumentMut = content
+        .parse::<toml_edit::DocumentMut>()
         .map_err(|e| format!("解析 config.toml 失败: {}", e))?;
 
     // 确保 [features] 段落存在并设置 codex_hooks = true
@@ -295,13 +292,11 @@ fn ensure_codex_hooks_feature() -> Result<(), String> {
 
 /// 注册 Codex hooks 到 ~/.codex/hooks.json
 fn register_codex_hooks(hook_path: &str) -> Result<String, String> {
-    let hooks_path = codex_hooks_path()
-        .ok_or_else(|| "无法获取 home 目录".to_string())?;
+    let hooks_path = codex_hooks_path().ok_or_else(|| "无法获取 home 目录".to_string())?;
 
     // 确保 .codex 目录存在
     if let Some(parent) = hooks_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("创建 .codex 目录失败: {}", e))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建 .codex 目录失败: {}", e))?;
     }
 
     // 启用 feature flag
@@ -311,8 +306,7 @@ fn register_codex_hooks(hook_path: &str) -> Result<String, String> {
     let mut config: Value = if hooks_path.exists() {
         let content = std::fs::read_to_string(&hooks_path)
             .map_err(|e| format!("读取 hooks.json 失败: {}", e))?;
-        serde_json::from_str(&content)
-            .map_err(|e| format!("解析 hooks.json 失败: {}", e))?
+        serde_json::from_str(&content).map_err(|e| format!("解析 hooks.json 失败: {}", e))?
     } else {
         serde_json::json!({})
     };
@@ -322,7 +316,8 @@ fn register_codex_hooks(hook_path: &str) -> Result<String, String> {
         config["hooks"] = serde_json::json!({});
     }
 
-    let hooks = config["hooks"].as_object_mut()
+    let hooks = config["hooks"]
+        .as_object_mut()
         .ok_or_else(|| "hooks 字段不是对象".to_string())?;
 
     let mut updated = 0;
@@ -376,8 +371,7 @@ fn register_codex_hooks(hook_path: &str) -> Result<String, String> {
     // 写回配置文件
     let json_str = serde_json::to_string_pretty(&config)
         .map_err(|e| format!("序列化 hooks.json 失败: {}", e))?;
-    std::fs::write(&hooks_path, json_str)
-        .map_err(|e| format!("写入 hooks.json 失败: {}", e))?;
+    std::fs::write(&hooks_path, json_str).map_err(|e| format!("写入 hooks.json 失败: {}", e))?;
 
     Ok(format!(
         "Codex: {} 个 hook 已添加, {} 个已更新 (共 {} 个事件)",
@@ -394,10 +388,10 @@ fn unregister_codex_hooks() -> Result<String, String> {
         _ => return Ok("Codex: hooks.json 不存在，无需卸载".to_string()),
     };
 
-    let content = std::fs::read_to_string(&hooks_path)
-        .map_err(|e| format!("读取 hooks.json 失败: {}", e))?;
-    let mut config: Value = serde_json::from_str(&content)
-        .map_err(|e| format!("解析 hooks.json 失败: {}", e))?;
+    let content =
+        std::fs::read_to_string(&hooks_path).map_err(|e| format!("读取 hooks.json 失败: {}", e))?;
+    let mut config: Value =
+        serde_json::from_str(&content).map_err(|e| format!("解析 hooks.json 失败: {}", e))?;
 
     let mut removed = 0;
 
@@ -438,8 +432,7 @@ fn unregister_codex_hooks() -> Result<String, String> {
 
     let json_str = serde_json::to_string_pretty(&config)
         .map_err(|e| format!("序列化 hooks.json 失败: {}", e))?;
-    std::fs::write(&hooks_path, json_str)
-        .map_err(|e| format!("写入 hooks.json 失败: {}", e))?;
+    std::fs::write(&hooks_path, json_str).map_err(|e| format!("写入 hooks.json 失败: {}", e))?;
 
     Ok(format!("Codex: 已移除 {} 个 hook 条目", removed))
 }
@@ -498,8 +491,7 @@ pub fn get_hook_config_snippet(_app: AppHandle) -> Result<Value, String> {
     let claude_snippet = serde_json::json!({
         "hooks": claude_hooks
     });
-    let claude_str = serde_json::to_string_pretty(&claude_snippet)
-        .map_err(|e| e.to_string())?;
+    let claude_str = serde_json::to_string_pretty(&claude_snippet).map_err(|e| e.to_string())?;
 
     // Codex 配置片段 — 镜像 register_codex_hooks 的写入逻辑
     let mut codex_config: Value = serde_json::json!({});
@@ -509,8 +501,7 @@ pub fn get_hook_config_snippet(_app: AppHandle) -> Result<Value, String> {
             hooks.insert(event.to_string(), build_codex_hook_entry(&hook_path, event));
         }
     }
-    let codex_str = serde_json::to_string_pretty(&codex_config)
-        .map_err(|e| e.to_string())?;
+    let codex_str = serde_json::to_string_pretty(&codex_config).map_err(|e| e.to_string())?;
 
     Ok(serde_json::json!({
         "claude": {

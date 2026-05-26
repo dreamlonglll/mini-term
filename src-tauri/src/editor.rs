@@ -25,9 +25,8 @@ pub fn open_in_editor(
             .or_else(|| cfg.editors.first())
     };
 
-    let editor = editor.ok_or(
-        "尚未配置外部编辑器,请在『设置 → 系统设置 → 外部编辑器』中添加。".to_string(),
-    )?;
+    let editor = editor
+        .ok_or("尚未配置外部编辑器,请在『设置 → 系统设置 → 外部编辑器』中添加。".to_string())?;
 
     let exe = editor.command.trim();
     if exe.is_empty() {
@@ -36,10 +35,7 @@ pub fn open_in_editor(
 
     let exe_path = Path::new(exe);
     if !exe_path.exists() {
-        return Err(format!(
-            "编辑器「{}」的路径不存在:{}",
-            editor.name, exe
-        ));
+        return Err(format!("编辑器「{}」的路径不存在:{}", editor.name, exe));
     }
 
     let mut cmd = Command::new(exe_path);

@@ -1,5 +1,5 @@
 use ignore::gitignore::Gitignore;
-use notify::{RecommendedWatcher, RecursiveMode, Watcher, Event as NotifyEvent};
+use notify::{Event as NotifyEvent, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Serialize;
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -23,13 +23,17 @@ fn natural_cmp(a: &str, b: &str) -> Ordering {
                 if ac.is_ascii_digit() && bc.is_ascii_digit() {
                     let mut an: u64 = 0;
                     while let Some(&&d) = ai.peek() {
-                        if !d.is_ascii_digit() { break; }
+                        if !d.is_ascii_digit() {
+                            break;
+                        }
                         an = an * 10 + (d - b'0') as u64;
                         ai.next();
                     }
                     let mut bn: u64 = 0;
                     while let Some(&&d) = bi.peek() {
-                        if !d.is_ascii_digit() { break; }
+                        if !d.is_ascii_digit() {
+                            break;
+                        }
                         bn = bn * 10 + (d - b'0') as u64;
                         bi.next();
                     }
@@ -39,7 +43,10 @@ fn natural_cmp(a: &str, b: &str) -> Ordering {
                     }
                 } else {
                     match ac.cmp(&bc) {
-                        Ordering::Equal => { ai.next(); bi.next(); }
+                        Ordering::Equal => {
+                            ai.next();
+                            bi.next();
+                        }
                         ord => return ord,
                     }
                 }
@@ -104,7 +111,15 @@ fn is_path_ignored(gitignores: &[Gitignore], full_path: &Path, is_dir: bool) -> 
     ignored
 }
 
-pub const ALWAYS_IGNORE: &[&str] = &[".git", "node_modules", "target", ".next", "dist", "__pycache__", ".superpowers"];
+pub const ALWAYS_IGNORE: &[&str] = &[
+    ".git",
+    "node_modules",
+    "target",
+    ".next",
+    "dist",
+    "__pycache__",
+    ".superpowers",
+];
 
 /// 纯字符串版剥 Windows verbatim 前缀,跨平台可测:
 /// - `\\?\C:\foo` → `Some("C:\\foo")`
@@ -231,7 +246,8 @@ pub fn list_directory(project_root: String, path: String) -> Result<Vec<FileEntr
         })
         .collect();
     entries.sort_by(|a, b| {
-        b.is_dir.cmp(&a.is_dir)
+        b.is_dir
+            .cmp(&a.is_dir)
             .then_with(|| a.ignored.cmp(&b.ignored))
             .then_with(|| natural_cmp(&a.name, &b.name))
     });
@@ -252,7 +268,9 @@ pub struct FsWatcherManager {
 
 impl FsWatcherManager {
     pub fn new() -> Self {
-        Self { watchers: Arc::new(Mutex::new(HashMap::new())) }
+        Self {
+            watchers: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 }
 
@@ -270,16 +288,22 @@ pub fn watch_directory(
     let mut watcher = notify::recommended_watcher(move |res: Result<NotifyEvent, _>| {
         if let Ok(event) = res {
             for p in &event.paths {
-                let _ = app_clone.emit("fs-change", FsChangePayload {
-                    project_path: project_path_clone.clone(),
-                    path: p.to_string_lossy().to_string(),
-                    kind: format!("{:?}", event.kind),
-                });
+                let _ = app_clone.emit(
+                    "fs-change",
+                    FsChangePayload {
+                        project_path: project_path_clone.clone(),
+                        path: p.to_string_lossy().to_string(),
+                        kind: format!("{:?}", event.kind),
+                    },
+                );
             }
         }
-    }).map_err(|e| e.to_string())?;
+    })
+    .map_err(|e| e.to_string())?;
 
-    watcher.watch(&watch_path, RecursiveMode::NonRecursive).map_err(|e| e.to_string())?;
+    watcher
+        .watch(&watch_path, RecursiveMode::NonRecursive)
+        .map_err(|e| e.to_string())?;
 
     let mut watchers = state.watchers.lock().unwrap();
     watchers.insert(path, watcher);
@@ -304,12 +328,24 @@ pub fn read_file_content(project_root: String, path: String) -> Result<FileConte
     }
     let metadata = fs::metadata(&p).map_err(|e| e.to_string())?;
     if metadata.len() > MAX_FILE_VIEW_SIZE {
-        return Ok(FileContentResult { content: String::new(), is_binary: false, too_large: true });
+        return Ok(FileContentResult {
+            content: String::new(),
+            is_binary: false,
+            too_large: true,
+        });
     }
     let bytes = fs::read(&p).map_err(|e| e.to_string())?;
     match String::from_utf8(bytes) {
-        Ok(s) => Ok(FileContentResult { content: s, is_binary: false, too_large: false }),
-        Err(_) => Ok(FileContentResult { content: String::new(), is_binary: true, too_large: false }),
+        Ok(s) => Ok(FileContentResult {
+            content: s,
+            is_binary: false,
+            too_large: false,
+        }),
+        Err(_) => Ok(FileContentResult {
+            content: String::new(),
+            is_binary: true,
+            too_large: false,
+        }),
     }
 }
 
@@ -332,7 +368,10 @@ pub fn create_directory(project_root: String, path: String) -> Result<(), String
 }
 
 #[tauri::command]
-pub fn unwatch_directory(state: tauri::State<'_, FsWatcherManager>, path: String) -> Result<(), String> {
+pub fn unwatch_directory(
+    state: tauri::State<'_, FsWatcherManager>,
+    path: String,
+) -> Result<(), String> {
     let mut watchers = state.watchers.lock().unwrap();
     watchers.remove(&path);
     Ok(())
@@ -350,11 +389,8 @@ pub fn rename_entry(
         .ok_or_else(|| "无法获取父目录".to_string())?;
     let new_path = parent.join(&new_name);
     // new_name 可能含 `../` 等,必须再校验一遍新路径仍在 project_root 内
-    let new_canon = verify_under_project_root(
-        &project_root,
-        new_path.to_string_lossy().as_ref(),
-        false,
-    )?;
+    let new_canon =
+        verify_under_project_root(&project_root, new_path.to_string_lossy().as_ref(), false)?;
     if new_canon.exists() {
         return Err(format!("目标已存在: {}", new_canon.display()));
     }
@@ -615,10 +651,10 @@ mod tests {
     #[test]
     fn try_strip_volume_guid_returns_none() {
         // Volume GUID 形式不剥(保留原行为,这种路径通常用户也不会拿到)
-        assert!(
-            try_strip_windows_verbatim(r"\\?\Volume{12345678-1234-1234-1234-123456789012}\foo")
-                .is_none()
-        );
+        assert!(try_strip_windows_verbatim(
+            r"\\?\Volume{12345678-1234-1234-1234-123456789012}\foo"
+        )
+        .is_none());
     }
 
     #[test]
@@ -664,8 +700,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn strip_verbatim_prefix_pathbuf_strips_unc_form() {
-        let stripped =
-            strip_verbatim_prefix(PathBuf::from(r"\\?\UNC\wsl$\Ubuntu\home\user\proj"));
+        let stripped = strip_verbatim_prefix(PathBuf::from(r"\\?\UNC\wsl$\Ubuntu\home\user\proj"));
         assert_eq!(stripped, PathBuf::from(r"\\wsl$\Ubuntu\home\user\proj"));
     }
 

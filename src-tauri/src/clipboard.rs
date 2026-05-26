@@ -7,8 +7,8 @@ mod win {
 
     use windows::Win32::Foundation::HGLOBAL;
     use windows::Win32::Graphics::Gdi::{
-        BITMAPINFOHEADER, BI_RGB, CreateCompatibleDC, DeleteDC,
-        GetDIBits, GetObjectW, SelectObject, BITMAP, DIB_RGB_COLORS, HBITMAP,
+        CreateCompatibleDC, DeleteDC, GetDIBits, GetObjectW, SelectObject, BITMAP,
+        BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP,
     };
     use windows::Win32::System::DataExchange::{
         CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
@@ -47,8 +47,8 @@ mod win {
     }
 
     unsafe fn read_dib() -> Result<RgbaImage, String> {
-        let handle = GetClipboardData(CF_DIB)
-            .map_err(|e| format!("GetClipboardData(CF_DIB): {e}"))?;
+        let handle =
+            GetClipboardData(CF_DIB).map_err(|e| format!("GetClipboardData(CF_DIB): {e}"))?;
         let hglobal = HGLOBAL(handle.0);
         let ptr = GlobalLock(hglobal) as *const u8;
         if ptr.is_null() {
@@ -105,7 +105,12 @@ mod win {
                 let (r, g, b, a) = match bit_count {
                     32 => {
                         let off = (x * 4) as usize;
-                        (*row.add(off + 2), *row.add(off + 1), *row.add(off), *row.add(off + 3))
+                        (
+                            *row.add(off + 2),
+                            *row.add(off + 1),
+                            *row.add(off),
+                            *row.add(off + 3),
+                        )
                     }
                     24 => {
                         let off = (x * 3) as usize;
@@ -121,8 +126,8 @@ mod win {
     }
 
     unsafe fn read_bitmap() -> Result<RgbaImage, String> {
-        let handle = GetClipboardData(CF_BITMAP)
-            .map_err(|e| format!("GetClipboardData(CF_BITMAP): {e}"))?;
+        let handle =
+            GetClipboardData(CF_BITMAP).map_err(|e| format!("GetClipboardData(CF_BITMAP): {e}"))?;
         let hbitmap = HBITMAP(handle.0);
 
         let mut bmp = BITMAP::default();
@@ -175,8 +180,7 @@ mod win {
             chunk.swap(0, 2);
         }
 
-        ImageBuffer::from_raw(width, height, buf)
-            .ok_or_else(|| "构建图像缓冲区失败".into())
+        ImageBuffer::from_raw(width, height, buf).ok_or_else(|| "构建图像缓冲区失败".into())
     }
 
     fn save_png(img: &RgbaImage) -> Result<PathBuf, String> {
@@ -199,11 +203,15 @@ mod win {
 /// 清理 temp 目录中超过 24 小时的剪贴板截图文件，启动时调用一次。
 pub fn cleanup_old_clipboard_images() {
     let dir = std::env::temp_dir().join("mini-term-clipboard");
-    let Ok(entries) = std::fs::read_dir(&dir) else { return };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
     let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(24 * 3600);
     for entry in entries.flatten() {
         let Ok(meta) = entry.metadata() else { continue };
-        let Ok(modified) = meta.modified() else { continue };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
         if modified < cutoff {
             let _ = std::fs::remove_file(entry.path());
         }

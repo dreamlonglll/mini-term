@@ -110,8 +110,7 @@ fn write_project_mcp_json(
         if content.trim().is_empty() {
             serde_json::json!({})
         } else {
-            serde_json::from_str(&content)
-                .map_err(|e| format!("解析 .mcp.json 失败: {}", e))?
+            serde_json::from_str(&content).map_err(|e| format!("解析 .mcp.json 失败: {}", e))?
         }
     } else {
         serde_json::json!({})
@@ -132,10 +131,9 @@ fn write_project_mcp_json(
         build_mcp_server_entry(binary_path, project_id),
     );
 
-    let json_str = serde_json::to_string_pretty(&root)
-        .map_err(|e| format!("序列化 .mcp.json 失败: {}", e))?;
-    std::fs::write(&mcp_path, json_str)
-        .map_err(|e| format!("写入 .mcp.json 失败: {}", e))?;
+    let json_str =
+        serde_json::to_string_pretty(&root).map_err(|e| format!("序列化 .mcp.json 失败: {}", e))?;
+    std::fs::write(&mcp_path, json_str).map_err(|e| format!("写入 .mcp.json 失败: {}", e))?;
     Ok(())
 }
 
@@ -148,15 +146,15 @@ fn remove_project_mcp_json(project_dir: &Path) -> Result<(), String> {
     if !mcp_path.exists() {
         return Ok(());
     }
-    let content = std::fs::read_to_string(&mcp_path)
-        .map_err(|e| format!("读取 .mcp.json 失败: {}", e))?;
+    let content =
+        std::fs::read_to_string(&mcp_path).map_err(|e| format!("读取 .mcp.json 失败: {}", e))?;
     if content.trim().is_empty() {
         // 空文件直接删
         let _ = std::fs::remove_file(&mcp_path);
         return Ok(());
     }
-    let mut root: Value = serde_json::from_str(&content)
-        .map_err(|e| format!("解析 .mcp.json 失败: {}", e))?;
+    let mut root: Value =
+        serde_json::from_str(&content).map_err(|e| format!("解析 .mcp.json 失败: {}", e))?;
 
     if let Some(servers) = root.get_mut("mcpServers").and_then(|s| s.as_object_mut()) {
         servers.remove(MCP_SERVER_NAME);
@@ -173,13 +171,11 @@ fn remove_project_mcp_json(project_dir: &Path) -> Result<(), String> {
         .unwrap_or(false);
 
     if is_now_empty {
-        std::fs::remove_file(&mcp_path)
-            .map_err(|e| format!("删除空的 .mcp.json 失败: {}", e))?;
+        std::fs::remove_file(&mcp_path).map_err(|e| format!("删除空的 .mcp.json 失败: {}", e))?;
     } else {
         let json_str = serde_json::to_string_pretty(&root)
             .map_err(|e| format!("序列化 .mcp.json 失败: {}", e))?;
-        std::fs::write(&mcp_path, json_str)
-            .map_err(|e| format!("写入 .mcp.json 失败: {}", e))?;
+        std::fs::write(&mcp_path, json_str).map_err(|e| format!("写入 .mcp.json 失败: {}", e))?;
     }
     Ok(())
 }
@@ -196,8 +192,7 @@ fn write_project_codex_config(
     project_id: &str,
 ) -> Result<(), String> {
     let codex_dir = project_dir.join(".codex");
-    std::fs::create_dir_all(&codex_dir)
-        .map_err(|e| format!("创建项目 .codex 目录失败: {}", e))?;
+    std::fs::create_dir_all(&codex_dir).map_err(|e| format!("创建项目 .codex 目录失败: {}", e))?;
     let config_path = codex_dir.join("config.toml");
 
     let content = if config_path.exists() {
@@ -241,8 +236,7 @@ fn apply_codex_mcp_server(doc: &mut toml_edit::DocumentMut, binary_path: &str, p
         .and_then(|i| i.as_table())
         .is_none();
     if needs_new_table {
-        doc["mcp_servers"][MCP_SERVER_NAME] =
-            toml_edit::Item::Table(toml_edit::Table::new());
+        doc["mcp_servers"][MCP_SERVER_NAME] = toml_edit::Item::Table(toml_edit::Table::new());
     }
     doc["mcp_servers"][MCP_SERVER_NAME]["command"] = toml_edit::value(binary_path);
 
@@ -296,11 +290,9 @@ fn strip_codex_mcp_server(doc: &mut toml_edit::DocumentMut) {
 /// `trust_level` 为 `"trusted"`。停用时**不**移除此信任(无法可靠判断是否
 /// 本功能所加,且信任本身无害)。
 fn trust_project_in_codex(project_dir: &Path) -> Result<(), String> {
-    let config_path = codex_global_config_path()
-        .ok_or_else(|| "无法获取 home 目录".to_string())?;
+    let config_path = codex_global_config_path().ok_or_else(|| "无法获取 home 目录".to_string())?;
     if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("创建 .codex 目录失败: {}", e))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建 .codex 目录失败: {}", e))?;
     }
 
     let content = if config_path.exists() {
@@ -344,11 +336,9 @@ fn apply_codex_project_trust(doc: &mut toml_edit::DocumentMut, project_key: &str
 /// 幂等:已在数组里则不重复添加。停用单个项目时也从数组移除本 server 名
 /// (`enabledMcpjsonServers` 是按 server 名而非按项目的白名单)。
 fn set_claude_mcp_approval(enable: bool) -> Result<(), String> {
-    let settings_path = claude_settings_path()
-        .ok_or_else(|| "无法获取 home 目录".to_string())?;
+    let settings_path = claude_settings_path().ok_or_else(|| "无法获取 home 目录".to_string())?;
     if let Some(parent) = settings_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("创建 .claude 目录失败: {}", e))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建 .claude 目录失败: {}", e))?;
     }
 
     // 停用且文件不存在 → 无需处理
@@ -388,9 +378,7 @@ fn apply_claude_mcp_approval(settings: &mut Value, enable: bool) {
             settings["enabledMcpjsonServers"] = serde_json::json!([]);
         }
         if let Some(arr) = settings["enabledMcpjsonServers"].as_array_mut() {
-            let already = arr
-                .iter()
-                .any(|v| v.as_str() == Some(MCP_SERVER_NAME));
+            let already = arr.iter().any(|v| v.as_str() == Some(MCP_SERVER_NAME));
             if !already {
                 arr.push(Value::String(MCP_SERVER_NAME.to_string()));
             }
@@ -433,8 +421,7 @@ fn append_gitignore_entries(project_dir: &Path) -> Result<(), String> {
 
 /// 计算追加条目后的 `.gitignore` 全文;若无需追加返回 `None`。抽出便于单测。
 fn compute_gitignore_append(existing: &str) -> Option<String> {
-    let present: std::collections::HashSet<&str> =
-        existing.lines().map(|l| l.trim()).collect();
+    let present: std::collections::HashSet<&str> = existing.lines().map(|l| l.trim()).collect();
     let missing: Vec<&str> = GITIGNORE_ENTRIES
         .iter()
         .copied()
@@ -523,10 +510,7 @@ mod tests {
         assert_eq!(entry["command"], r"C:\apps\mt-ssh-mcp.exe");
         assert!(entry["env"].is_object());
         // args 携带 --project-id <id>,让 sidecar 知道自己属于哪个项目
-        assert_eq!(
-            entry["args"],
-            serde_json::json!(["--project-id", "proj-1"])
-        );
+        assert_eq!(entry["args"], serde_json::json!(["--project-id", "proj-1"]));
     }
 
     // ─── .mcp.json 幂等合并 ───
@@ -649,7 +633,8 @@ mod tests {
 
     #[test]
     fn codex_mcp_server_preserves_existing_content() {
-        let initial = "[mcp_servers.context7]\ncommand = \"npx\"\nargs = [\"@upstash/context7-mcp\"]\n";
+        let initial =
+            "[mcp_servers.context7]\ncommand = \"npx\"\nargs = [\"@upstash/context7-mcp\"]\n";
         let mut doc: toml_edit::DocumentMut = initial.parse().unwrap();
         apply_codex_mcp_server(&mut doc, "/bin/mt-ssh-mcp", "p1");
         let reparsed: toml_edit::DocumentMut = doc.to_string().parse().unwrap();
@@ -775,7 +760,10 @@ mod tests {
         let mut settings = serde_json::json!({});
         apply_claude_mcp_approval(&mut settings, true);
         apply_claude_mcp_approval(&mut settings, true);
-        assert_eq!(settings["enabledMcpjsonServers"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            settings["enabledMcpjsonServers"].as_array().unwrap().len(),
+            1
+        );
     }
 
     #[test]
@@ -803,7 +791,10 @@ mod tests {
     fn claude_approval_disable_noop_when_absent() {
         let mut settings = serde_json::json!({ "enabledMcpjsonServers": ["memory"] });
         apply_claude_mcp_approval(&mut settings, false);
-        assert_eq!(settings["enabledMcpjsonServers"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            settings["enabledMcpjsonServers"].as_array().unwrap().len(),
+            1
+        );
     }
 
     #[test]

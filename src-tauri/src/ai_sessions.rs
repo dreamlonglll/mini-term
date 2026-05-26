@@ -637,10 +637,13 @@ pub fn get_ai_sessions(project_path: String) -> Result<Vec<AiSession>, String> {
         sessions.truncate(MAX_TOTAL_SESSIONS);
     }
 
-    cache.insert(cache_key, CachedSessions {
-        loaded_at: Instant::now(),
-        sessions: sessions.clone(),
-    });
+    cache.insert(
+        cache_key,
+        CachedSessions {
+            loaded_at: Instant::now(),
+            sessions: sessions.clone(),
+        },
+    );
 
     Ok(sessions)
 }
@@ -652,9 +655,15 @@ mod tests {
     #[test]
     fn sort_newest_session_paths_keeps_recent_files_first() {
         let mut paths = vec![
-            PathBuf::from(r"C:\Users\test\.codex\sessions\2025\10\28\rollout-2025-10-28T10-47-08-old.jsonl"),
-            PathBuf::from(r"C:\Users\test\.codex\sessions\2026\04\24\rollout-2026-04-24T19-00-00-newest.jsonl"),
-            PathBuf::from(r"C:\Users\test\.codex\sessions\2026\01\02\rollout-2026-01-02T09-00-00-middle.jsonl"),
+            PathBuf::from(
+                r"C:\Users\test\.codex\sessions\2025\10\28\rollout-2025-10-28T10-47-08-old.jsonl",
+            ),
+            PathBuf::from(
+                r"C:\Users\test\.codex\sessions\2026\04\24\rollout-2026-04-24T19-00-00-newest.jsonl",
+            ),
+            PathBuf::from(
+                r"C:\Users\test\.codex\sessions\2026\01\02\rollout-2026-01-02T09-00-00-middle.jsonl",
+            ),
         ];
 
         sort_newest_session_paths(&mut paths, 2);

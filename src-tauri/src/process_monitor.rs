@@ -15,11 +15,7 @@ pub struct PtyStatusChangePayload {
 /// AI 输出活跃超时阈值
 const AI_ACTIVE_TIMEOUT: Duration = Duration::from_secs(3);
 
-pub fn start_monitor(
-    app: AppHandle,
-    pty_manager: crate::pty::PtyManager,
-    hook_state: HookState,
-) {
+pub fn start_monitor(app: AppHandle, pty_manager: crate::pty::PtyManager, hook_state: HookState) {
     thread::spawn(move || {
         let mut prev_statuses: HashMap<u32, String> = HashMap::new();
 

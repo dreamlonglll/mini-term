@@ -286,12 +286,7 @@ fn discover_repo_limited(start: &Path) -> Option<Repository> {
             _ => break,
         }
     }
-    Repository::open_ext(
-        start,
-        RepositoryOpenFlags::empty(),
-        &[&ceiling],
-    )
-    .ok()
+    Repository::open_ext(start, RepositoryOpenFlags::empty(), &[&ceiling]).ok()
 }
 
 struct RepoPathEntry {
@@ -300,8 +295,9 @@ struct RepoPathEntry {
     is_worktree: bool,
 }
 
-static REPO_PATH_CACHE: std::sync::LazyLock<Mutex<HashMap<PathBuf, (Instant, Vec<RepoPathEntry>)>>> =
-    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+static REPO_PATH_CACHE: std::sync::LazyLock<
+    Mutex<HashMap<PathBuf, (Instant, Vec<RepoPathEntry>)>>,
+> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 const REPO_CACHE_TTL: Duration = Duration::from_secs(30);
 
@@ -311,22 +307,34 @@ fn find_repos_cached_paths(project_path: &Path) -> Vec<RepoPathEntry> {
         let cache = REPO_PATH_CACHE.lock().unwrap();
         if let Some((ts, entries)) = cache.get(&key) {
             if ts.elapsed() < REPO_CACHE_TTL {
-                return entries.iter().map(|e| RepoPathEntry {
-                    name: e.name.clone(),
-                    path: e.path.clone(),
-                    is_worktree: e.is_worktree,
-                }).collect();
+                return entries
+                    .iter()
+                    .map(|e| RepoPathEntry {
+                        name: e.name.clone(),
+                        path: e.path.clone(),
+                        is_worktree: e.is_worktree,
+                    })
+                    .collect();
             }
         }
     }
     let entries = discover_repo_paths(project_path);
     {
         let mut cache = REPO_PATH_CACHE.lock().unwrap();
-        cache.insert(key, (Instant::now(), entries.iter().map(|e| RepoPathEntry {
-            name: e.name.clone(),
-            path: e.path.clone(),
-            is_worktree: e.is_worktree,
-        }).collect()));
+        cache.insert(
+            key,
+            (
+                Instant::now(),
+                entries
+                    .iter()
+                    .map(|e| RepoPathEntry {
+                        name: e.name.clone(),
+                        path: e.path.clone(),
+                        is_worktree: e.is_worktree,
+                    })
+                    .collect(),
+            ),
+        );
     }
     entries
 }
@@ -342,15 +350,34 @@ fn discover_repo_paths(project_path: &Path) -> Vec<RepoPathEntry> {
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "root".to_string());
             for wt in collect_worktrees_of(&repo) {
-                entries.push(RepoPathEntry { name: wt.0, path: wt.1, is_worktree: true });
+                entries.push(RepoPathEntry {
+                    name: wt.0,
+                    path: wt.1,
+                    is_worktree: true,
+                });
             }
-            entries.insert(0, RepoPathEntry { name, path: repo_root, is_worktree: false });
+            entries.insert(
+                0,
+                RepoPathEntry {
+                    name,
+                    path: repo_root,
+                    is_worktree: false,
+                },
+            );
             return entries;
         }
     }
 
     const MAX_DEPTH: u32 = 5;
-    const SKIP_DIRS: &[&str] = &[".git", "node_modules", "target", ".next", "dist", "__pycache__", ".superpowers"];
+    const SKIP_DIRS: &[&str] = &[
+        ".git",
+        "node_modules",
+        "target",
+        ".next",
+        "dist",
+        "__pycache__",
+        ".superpowers",
+    ];
     fn scan(dir: &Path, depth: u32, entries: &mut Vec<RepoPathEntry>) {
         if depth > MAX_DEPTH {
             return;
@@ -376,9 +403,17 @@ fn discover_repo_paths(project_path: &Path) -> Vec<RepoPathEntry> {
                             .file_name()
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_default();
-                        entries.push(RepoPathEntry { name, path: sub, is_worktree: false });
+                        entries.push(RepoPathEntry {
+                            name,
+                            path: sub,
+                            is_worktree: false,
+                        });
                         for wt in collect_worktrees_of(&repo) {
-                            entries.push(RepoPathEntry { name: wt.0, path: wt.1, is_worktree: true });
+                            entries.push(RepoPathEntry {
+                                name: wt.0,
+                                path: wt.1,
+                                is_worktree: true,
+                            });
                         }
                         continue;
                     }
@@ -516,7 +551,9 @@ pub fn get_git_log(
     let limit = limit.unwrap_or(30);
 
     let mut revwalk = repo.revwalk().map_err(|e| e.to_string())?;
-    revwalk.set_sorting(git2::Sort::TIME).map_err(|e| e.to_string())?;
+    revwalk
+        .set_sorting(git2::Sort::TIME)
+        .map_err(|e| e.to_string())?;
 
     if let Some(ref hash) = before_commit {
         let oid = git2::Oid::from_str(hash).map_err(|e| e.to_string())?;
@@ -577,9 +614,16 @@ pub fn get_repo_branches(repo_path: String) -> Result<Vec<BranchInfo>, String> {
     let mut branches = Vec::new();
 
     // Local branches
-    for branch_result in repo.branches(Some(git2::BranchType::Local)).map_err(|e| e.to_string())? {
+    for branch_result in repo
+        .branches(Some(git2::BranchType::Local))
+        .map_err(|e| e.to_string())?
+    {
         let (branch, _) = branch_result.map_err(|e| e.to_string())?;
-        let name = branch.name().map_err(|e| e.to_string())?.unwrap_or("").to_string();
+        let name = branch
+            .name()
+            .map_err(|e| e.to_string())?
+            .unwrap_or("")
+            .to_string();
         if let Some(target) = branch.get().target() {
             branches.push(BranchInfo {
                 name,
@@ -591,9 +635,16 @@ pub fn get_repo_branches(repo_path: String) -> Result<Vec<BranchInfo>, String> {
     }
 
     // Remote branches
-    for branch_result in repo.branches(Some(git2::BranchType::Remote)).map_err(|e| e.to_string())? {
+    for branch_result in repo
+        .branches(Some(git2::BranchType::Remote))
+        .map_err(|e| e.to_string())?
+    {
         let (branch, _) = branch_result.map_err(|e| e.to_string())?;
-        let name = branch.name().map_err(|e| e.to_string())?.unwrap_or("").to_string();
+        let name = branch
+            .name()
+            .map_err(|e| e.to_string())?
+            .unwrap_or("")
+            .to_string();
         // Skip HEAD pointer like origin/HEAD
         if name.ends_with("/HEAD") {
             continue;
@@ -622,7 +673,13 @@ pub fn get_commit_files(
     let tree = commit.tree().map_err(|e| e.to_string())?;
 
     let parent_tree = if commit.parent_count() > 0 {
-        Some(commit.parent(0).map_err(|e| e.to_string())?.tree().map_err(|e| e.to_string())?)
+        Some(
+            commit
+                .parent(0)
+                .map_err(|e| e.to_string())?
+                .tree()
+                .map_err(|e| e.to_string())?,
+        )
     } else {
         None
     };
@@ -646,7 +703,10 @@ pub fn get_commit_files(
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
         let old_path = if delta.status() == git2::Delta::Renamed {
-            delta.old_file().path().map(|p| p.to_string_lossy().to_string())
+            delta
+                .old_file()
+                .path()
+                .map(|p| p.to_string_lossy().to_string())
         } else {
             None
         };
@@ -672,7 +732,13 @@ pub fn get_commit_file_diff(
     let tree = commit.tree().map_err(|e| e.to_string())?;
 
     let parent_tree = if commit.parent_count() > 0 {
-        Some(commit.parent(0).map_err(|e| e.to_string())?.tree().map_err(|e| e.to_string())?)
+        Some(
+            commit
+                .parent(0)
+                .map_err(|e| e.to_string())?
+                .tree()
+                .map_err(|e| e.to_string())?,
+        )
     } else {
         None
     };
@@ -761,9 +827,7 @@ fn get_head_content(repo: &Repository, rel_path: &str) -> Result<Option<String>,
         Ok(h) => h,
         Err(_) => return Ok(None), // empty repo
     };
-    let tree = head
-        .peel_to_tree()
-        .map_err(|e| e.to_string())?;
+    let tree = head.peel_to_tree().map_err(|e| e.to_string())?;
     let entry = match tree.get_path(Path::new(rel_path)) {
         Ok(e) => e,
         Err(_) => return Ok(Some(String::new())), // file not yet in HEAD
@@ -965,14 +1029,17 @@ pub fn get_git_diff(
     let project = Path::new(&project_path);
     let abs_file = project.join(&file_path);
 
-    let repo = discover_repo_limited(&abs_file)
-        .ok_or_else(|| format!("no git repository found within {} parents of {}", MAX_DISCOVER_PARENTS, abs_file.display()))?;
-    let workdir = repo
-        .workdir()
-        .ok_or("bare repository not supported")?;
+    let repo = discover_repo_limited(&abs_file).ok_or_else(|| {
+        format!(
+            "no git repository found within {} parents of {}",
+            MAX_DISCOVER_PARENTS,
+            abs_file.display()
+        )
+    })?;
+    let workdir = repo.workdir().ok_or("bare repository not supported")?;
 
-    let rel_path = diff_paths(&abs_file, workdir)
-        .ok_or("file is outside repository working directory")?;
+    let rel_path =
+        diff_paths(&abs_file, workdir).ok_or("file is outside repository working directory")?;
     let rel_str = rel_path.to_string_lossy().replace('\\', "/");
 
     let is_staged = staged.unwrap_or(false);
@@ -1165,7 +1232,9 @@ pub fn git_unstage(repo_path: String, files: Vec<String>) -> Result<(), String> 
         // empty repo: 批量从 index 移除，最后一次 write
         let mut index = repo.index().map_err(|e| e.to_string())?;
         for file in &files {
-            index.remove_path(Path::new(file)).map_err(|e| e.to_string())?;
+            index
+                .remove_path(Path::new(file))
+                .map_err(|e| e.to_string())?;
         }
         index.write().map_err(|e| e.to_string())?;
     }
@@ -1194,7 +1263,9 @@ pub fn git_stage_all(repo_path: String) -> Result<(), String> {
         })
         .collect();
     for path in entries {
-        index.remove_path(Path::new(&path)).map_err(|e| e.to_string())?;
+        index
+            .remove_path(Path::new(&path))
+            .map_err(|e| e.to_string())?;
     }
 
     index.write().map_err(|e| e.to_string())?;
@@ -1274,12 +1345,8 @@ pub fn git_discard_file(repo_path: String, files: Vec<String>) -> Result<(), Str
                 let _ = repo.reset_default(Some(commit.as_object()), [file.as_str()]);
             }
             // checkout from HEAD
-            repo.checkout_head(Some(
-                git2::build::CheckoutBuilder::new()
-                    .force()
-                    .path(file),
-            ))
-            .map_err(|e| e.to_string())?;
+            repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force().path(file)))
+                .map_err(|e| e.to_string())?;
         }
     }
     Ok(())

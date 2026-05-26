@@ -48,7 +48,9 @@ pub fn run() {
             // 读取配置，仅当 hookEnabled == true 时才启动 hook server
             let app_config = config::read_config(app.handle());
             if app_config.hook_enabled {
-                if let Err(e) = hook_server::start_hook_server(app.handle().clone(), hook_state.clone()) {
+                if let Err(e) =
+                    hook_server::start_hook_server(app.handle().clone(), hook_state.clone())
+                {
                     eprintln!("[setup] hook server 启动失败: {}", e);
                 }
             }

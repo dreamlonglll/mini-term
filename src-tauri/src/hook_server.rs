@@ -82,10 +82,7 @@ impl HookState {
             .lock()
             .unwrap()
             .insert(pty_id, Instant::now());
-        self.last_hook_status
-            .lock()
-            .unwrap()
-            .insert(pty_id, status);
+        self.last_hook_status.lock().unwrap().insert(pty_id, status);
     }
 
     /// 移除指定 PTY 的 hook 状态（PTY 关闭时调用）
@@ -183,20 +180,18 @@ pub fn start_hook_server(app: AppHandle, hook_state: HookState) -> Result<(), St
     write_port_file(&app, port);
 
     std::thread::spawn(move || {
-
         // 处理请求
         for mut request in server.incoming_requests() {
             if request.method() != &tiny_http::Method::Post {
-                let response = tiny_http::Response::from_string("Method Not Allowed")
-                    .with_status_code(405);
+                let response =
+                    tiny_http::Response::from_string("Method Not Allowed").with_status_code(405);
                 let _ = request.respond(response);
                 continue;
             }
 
             let url = request.url().to_string();
             if url != "/hook" {
-                let response =
-                    tiny_http::Response::from_string("Not Found").with_status_code(404);
+                let response = tiny_http::Response::from_string("Not Found").with_status_code(404);
                 let _ = request.respond(response);
                 continue;
             }
@@ -215,8 +210,8 @@ pub fn start_hook_server(app: AppHandle, hook_state: HookState) -> Result<(), St
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("[hook-server] JSON 解析失败: {}", e);
-                    let response = tiny_http::Response::from_string("Bad Request")
-                        .with_status_code(400);
+                    let response =
+                        tiny_http::Response::from_string("Bad Request").with_status_code(400);
                     let _ = request.respond(response);
                     continue;
                 }
@@ -305,11 +300,7 @@ fn write_port_file(app: &AppHandle, port: u16) {
         let path = dir.join("hook-server.json");
         let content = format!("{{\"port\":{}}}", port);
         if let Err(e) = std::fs::write(&path, &content) {
-            eprintln!(
-                "[hook-server] 写入端口文件失败 {}: {}",
-                path.display(),
-                e
-            );
+            eprintln!("[hook-server] 写入端口文件失败 {}: {}", path.display(), e);
         } else {
             eprintln!("[hook-server] 端口文件已写入 {}", path.display());
         }
@@ -322,11 +313,7 @@ fn delete_port_file(app: &AppHandle) {
         let path = dir.join("hook-server.json");
         if path.exists() {
             if let Err(e) = std::fs::remove_file(&path) {
-                eprintln!(
-                    "[hook-server] 删除端口文件失败 {}: {}",
-                    path.display(),
-                    e
-                );
+                eprintln!("[hook-server] 删除端口文件失败 {}: {}", path.display(), e);
             } else {
                 eprintln!("[hook-server] 端口文件已删除 {}", path.display());
             }
