@@ -51,6 +51,31 @@ fn fallback_windows_cwd() -> String {
     std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\".to_string())
 }
 
+/// 为 WSL 启动器分支拼装 `WSLENV` 环境变量的 value。
+///
+/// 输入 `user_envs` 已经被外层过滤过(剔除 `MINITERM_*` 前缀与用户输入的 `WSLENV` key);
+/// 本函数只负责把剩余的 key 加上 `/u` flag 并用 `:` 连接,再把宿主已有的 `WSLENV`
+/// (若存在且非空)追加在尾部合并 —— 不覆盖,与 JetBrains IDEA terminal / wslgit 对齐。
+///
+/// flag 选 `/u`(仅 Win→WSL 方向,不做路径翻译)的决策依据见 PRD 与
+/// `.trellis/tasks/05-26-wsl-env-vars-injection/research/wslenv-mechanism.md`。
+///
+/// 返回 `None` 当且仅当 `user_envs` 为空且宿主无 `WSLENV` —— 此时不应注入 WSLENV,
+/// 否则会用空字符串覆盖宿主既有值。
+fn build_wslenv_value(user_envs: &[(String, String)], host_wslenv: Option<&str>) -> Option<String> {
+    let mut parts: Vec<String> = user_envs.iter().map(|(k, _)| format!("{}/u", k)).collect();
+    if let Some(existing) = host_wslenv {
+        if !existing.is_empty() {
+            parts.push(existing.to_string());
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(":"))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct UserSubmit {
     pub line: String,
@@ -673,17 +698,28 @@ pub fn create_pty(
     // - `MINITERM_` 前缀属于 mini-term 内部 hook 协议,这里再做一次防御性过滤:
     //   即便用户绕过前端校验(手改 config.json)塞进来,也不会覆盖 MINITERM_PTY_ID /
     //   MINITERM_HOOK_PORT 等保留变量。
-    // - WSL 启动器分支跳过:wsl.exe 的进程 env 不会自动透传给 Linux bash,
-    //   注入了也没用,反而误导用户。WSLENV 自动翻译留给 v2。
-    if wsl_override.is_none() {
-        if let Some(list) = envs {
-            for (k, v) in list {
-                if k.starts_with("MINITERM_") {
-                    continue;
-                }
-                cmd.env(k, v);
-            }
+    // - 用户 envs 里的 `WSLENV` key 整条跳过:WSL 分支需要由 mini-term 拼装 WSLENV
+    //   的 value(K1/u:K2/u:... + 宿主既有 WSLENV),允许用户覆盖会破坏拼接结果。
+    // - WSL 启动器分支:wsl.exe 进程 env 不会自动透传给 Linux bash,必须配合 WSLENV
+    //   机制使用 —— 在 cmd.env(k, v) 之外额外拼一个 `WSLENV=K1/u:K2/u:...` 注入到
+    //   wsl.exe 进程 env,WSL init 才会在 distro 内为 bash 设置同名变量。flag 选 `/u`
+    //   (仅 Win→WSL,不做路径翻译),与 JetBrains IDEA terminal 对齐;宿主既有 WSLENV
+    //   追加在尾部合并(不覆盖)。决策详见 PRD 与 research/wslenv-mechanism.md。
+    let user_envs: Vec<(String, String)> = envs
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(k, _)| !k.starts_with("MINITERM_") && k != "WSLENV")
+        .collect();
+
+    if wsl_override.is_some() && !user_envs.is_empty() {
+        let host_wslenv = std::env::var("WSLENV").ok();
+        if let Some(value) = build_wslenv_value(&user_envs, host_wslenv.as_deref()) {
+            cmd.env("WSLENV", value);
         }
+    }
+
+    for (k, v) in &user_envs {
+        cmd.env(k, v);
     }
 
     let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
@@ -1511,10 +1547,7 @@ mod tests {
         // Rust canonicalize 在 WSL UNC 上输出 \\?\UNC\<host>\<rest>;
         // 与裸 \\wsl$\ 等价,decide_wsl_override 必须识别两种形式。
         let result = decide_wsl_override(r"\\?\UNC\wsl$\Ubuntu\home\u");
-        assert_eq!(
-            result,
-            Some(("Ubuntu".to_string(), "/home/u".to_string()))
-        );
+        assert_eq!(result, Some(("Ubuntu".to_string(), "/home/u".to_string())));
     }
 
     #[test]
@@ -1543,5 +1576,77 @@ mod tests {
         // %USERPROFILE% 在所有用户环境下都存在,失败时退化为 C:\。
         let cwd = fallback_windows_cwd();
         assert!(!cwd.is_empty(), "fallback cwd 不应为空字符串");
+    }
+
+    // === WSLENV 字符串拼接(WSL 分支项目级 env 注入) ===
+    // 这些单测覆盖 build_wslenv_value 纯函数的所有路径:
+    // - 空列表 → None(避免用空 WSLENV 覆盖宿主既有值)
+    // - 单条 / 多条变量 → "K1/u" / "K1/u:K2/u"(/u flag 与 JetBrains IDEA 对齐)
+    // - 宿主既有 WSLENV → 追加在尾部合并(不覆盖)
+    // - 宿主 WSLENV 为空 / Some("") → 视同 None,不追加
+    // 外层过滤(MINITERM_* / WSLENV key)由 create_pty 调用方负责,本函数不重复。
+
+    #[test]
+    fn build_wslenv_empty_no_host_returns_none() {
+        // 空 user_envs + 宿主无 WSLENV → None,调用方应跳过 cmd.env("WSLENV", ...)
+        let result = build_wslenv_value(&[], None);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn build_wslenv_single_var() {
+        let envs = vec![("FOO".to_string(), "bar".to_string())];
+        let result = build_wslenv_value(&envs, None);
+        assert_eq!(result, Some("FOO/u".to_string()));
+    }
+
+    #[test]
+    fn build_wslenv_multiple_vars_preserves_insertion_order() {
+        let envs = vec![
+            ("FOO".to_string(), "1".to_string()),
+            ("BAR".to_string(), "2".to_string()),
+            ("BAZ".to_string(), "3".to_string()),
+        ];
+        let result = build_wslenv_value(&envs, None);
+        assert_eq!(result, Some("FOO/u:BAR/u:BAZ/u".to_string()));
+    }
+
+    #[test]
+    fn build_wslenv_merges_existing_host_wslenv_at_tail() {
+        // 宿主已有 WSLENV=EXISTING_VAR/p → mini-term 拼出 K1/u:K2/u 后,
+        // 在尾部追加 EXISTING_VAR/p,不覆盖。与 JetBrains/wslgit 对齐。
+        let envs = vec![
+            ("FOO".to_string(), "1".to_string()),
+            ("BAR".to_string(), "2".to_string()),
+        ];
+        let result = build_wslenv_value(&envs, Some("EXISTING_VAR/p"));
+        assert_eq!(result, Some("FOO/u:BAR/u:EXISTING_VAR/p".to_string()));
+    }
+
+    #[test]
+    fn build_wslenv_empty_user_envs_but_host_has_wslenv() {
+        // user_envs 空但宿主有 WSLENV → 仍返回 Some(宿主值),
+        // 因为 create_pty 调用本函数前已经判定 wsl_override 命中,
+        // 即使没有项目 env 也应保留宿主既有 WSLENV(理论上无需 mini-term 干预,
+        // 但保持纯函数语义:输入有非空内容就有输出)。
+        // 实际 create_pty 入口处已有 !user_envs.is_empty() 兜底,本测试只验证函数语义。
+        let result = build_wslenv_value(&[], Some("HOST_VAR/u"));
+        assert_eq!(result, Some("HOST_VAR/u".to_string()));
+    }
+
+    #[test]
+    fn build_wslenv_empty_host_wslenv_string_treated_as_absent() {
+        // 宿主 WSLENV="" (空字符串) 不应追加 → 避免产生 "FOO/u:" 这种尾部 : 残留。
+        let envs = vec![("FOO".to_string(), "1".to_string())];
+        let result = build_wslenv_value(&envs, Some(""));
+        assert_eq!(result, Some("FOO/u".to_string()));
+    }
+
+    #[test]
+    fn build_wslenv_host_with_multiple_existing_entries() {
+        // 宿主 WSLENV 自身可含多个条目(冒号分隔),整段照搬在尾部。
+        let envs = vec![("FOO".to_string(), "1".to_string())];
+        let result = build_wslenv_value(&envs, Some("A/u:B/p:C"));
+        assert_eq!(result, Some("FOO/u:A/u:B/p:C".to_string()));
     }
 }

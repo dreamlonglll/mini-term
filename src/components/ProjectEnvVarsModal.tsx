@@ -18,6 +18,7 @@ const KEY_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 type RowErrorKind =
   | 'empty-key'
   | 'protected-prefix'
+  | 'reserved-wslenv'
   | 'invalid-key'
   | 'duplicate-key'
   | 'invalid-value';
@@ -25,12 +26,13 @@ type RowErrorKind =
 const ERROR_TEXT: Record<RowErrorKind, string> = {
   'empty-key': 'key 不能为空',
   'protected-prefix': 'MINITERM_ 前缀为内部保留,不可使用',
+  'reserved-wslenv': '`WSLENV` 由 mini-term 内部管理,不可用作变量名',
   'invalid-key': 'key 只能含 a-z A-Z 0-9 _,且首字符不能是数字',
   'duplicate-key': 'key 与其他行重复',
   'invalid-value': 'value 不能含换行或 NUL 字符',
 };
 
-/** 错误优先级:空 key > 受保护前缀 > 非法字符 > 重复 > value 非法 */
+/** 错误优先级:空 key > 受保护前缀 > 保留 WSLENV > 非法字符 > 重复 > value 非法 */
 function computeErrors(rows: EditableRow[]): Map<string, RowErrorKind> {
   const errors = new Map<string, RowErrorKind>();
   const keyCount = new Map<string, number>();
@@ -45,6 +47,12 @@ function computeErrors(rows: EditableRow[]): Map<string, RowErrorKind> {
     }
     if (r.key.startsWith('MINITERM_')) {
       errors.set(r.rid, 'protected-prefix');
+      continue;
+    }
+    // `WSLENV` 在 WSL 分支由 Rust 端拼装注入(K1/u:K2/u: + 宿主既有),
+    // 允许用户覆盖会破坏拼接结果。大小写敏感比较 —— 与 Microsoft 官方一致。
+    if (r.key === 'WSLENV') {
+      errors.set(r.rid, 'reserved-wslenv');
       continue;
     }
     if (!KEY_PATTERN.test(r.key)) {
@@ -198,8 +206,10 @@ export function ProjectEnvVarsModal({ project, onClose }: Props) {
         </div>
 
         {isWsl && (
-          <div className="mx-5 mt-3 px-3 py-2 rounded bg-yellow-500/10 border border-yellow-500/30 text-sm text-yellow-200">
-            ⚠ WSL 项目下环境变量暂不支持透传给 Linux bash,请在 WSL 内的 <code className="text-yellow-100">~/.bashrc</code> 配置。
+          <div className="mx-5 mt-3 px-3 py-2 rounded bg-green-500/10 border border-green-500/30 text-sm text-green-200">
+            ✓ WSL 项目环境变量通过 WSLENV 透传至 Linux bash(<code className="text-green-100">/u</code> 单向,不做路径翻译)。
+            值是路径时请填 Linux 风格如 <code className="text-green-100">/home/u/...</code>;
+            <code className="text-green-100">~/.bashrc</code> 中 <code className="text-green-100">export</code> 同名变量会覆盖此值。
           </div>
         )}
 
