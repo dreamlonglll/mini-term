@@ -143,3 +143,37 @@ SessionEnd 事件清除 hook 状态回退 idle；process_monitor 增加 ai-idle 
 ### Next Steps
 
 - None - task complete
+
+
+## Session 5: 项目级环境变量功能
+
+**Date**: 2026-05-26
+**Task**: 项目级环境变量功能
+**Branch**: `main`
+
+### Summary
+
+为每个项目支持自定义环境变量,新建终端 PTY 时按项目独立注入到子进程。完整 brainstorm→grill(9轮)→implement→trellis-check→update-spec→finish 流程。后端 ProjectConfig.envVars + create_pty envs 参数 + MINITERM_* 前后端双重保护 + WSL 分支跳过注入;前端独立 modal 仿 SshAssocModal、行级 enabled checkbox、inline POSIX 校验红框、保存按钮 disabled、WSL 警告条、Esc 关闭遮罩不响应、保存失败 setConfig 回滚。trellis-check 修复 3 个问题(2 阻塞:前端 isWslPath 漏 verbatim、Rust 缺 MINITERM_ 二次保护;1 建议:save_config 失败无回滚无 toast)。新增 spec backend/pty-env-vars-injection.md 完整 7 sections,frontend/state-management.md 补 Vec 持久化 + 乐观更新回滚两条 convention。
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `20c979c` | (see git log) |
+| `c52104b` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
