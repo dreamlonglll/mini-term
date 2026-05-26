@@ -1,0 +1,6 @@
+{"_example": "Fill with {\"file\": \"<path>\", \"reason\": \"<why>\"}. Put spec/research files only — no code paths. Run `python3 .trellis/scripts/get_context.py --mode packages` to list available specs. Delete this line once real entries are added."}
+{"file": ".trellis/spec/backend/pty-env-vars-injection.md", "reason": "envs 注入合约,check 阶段核对 WSL 分支契约是否兑现"}
+{"file": ".trellis/spec/backend/wsl-exe-cd-path-semantics.md", "reason": "WSL 检测口径必须与 parse_wsl_unc 对齐"}
+{"file": ".trellis/spec/frontend/quality-guidelines.md", "reason": "前端质量检查清单"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "跨层一致性检查 - 前后端 WSL 检测口径对齐"}
+{"file": ".trellis/tasks/05-26-wsl-env-vars-injection/research/wslenv-mechanism.md", "reason": "AC 边界场景验证清单来源"}

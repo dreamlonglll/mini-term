@@ -1,0 +1,8 @@
+{"_example": "Fill with {\"file\": \"<path>\", \"reason\": \"<why>\"}. Put spec/research files only — no code paths. Run `python3 .trellis/scripts/get_context.py --mode packages` to list available specs. Delete this line once real entries are added."}
+{"file": ".trellis/spec/backend/index.md", "reason": "backend 层 pre-development checklist 和 spec 索引"}
+{"file": ".trellis/spec/backend/pty-env-vars-injection.md", "reason": "现有 envs 注入契约,需扩展 WSL 章节"}
+{"file": ".trellis/spec/backend/wsl-exe-cd-path-semantics.md", "reason": "WSL 启动器路径语义,本任务相关 WSL 分支判断口径"}
+{"file": ".trellis/spec/frontend/index.md", "reason": "frontend 层 pre-development checklist"}
+{"file": ".trellis/spec/frontend/state-management.md", "reason": "modal 保存失败回滚 + Vec<T> skip_serializing_if 约定"}
+{"file": ".trellis/spec/frontend/component-guidelines.md", "reason": "modal 组件改动需对齐组件规范"}
+{"file": ".trellis/tasks/05-26-wsl-env-vars-injection/research/wslenv-mechanism.md", "reason": "WSLENV /u flag 决策依据 + 业界惯例 + 9 条 AC 来源"}
