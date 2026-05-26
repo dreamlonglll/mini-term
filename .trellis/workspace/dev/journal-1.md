@@ -210,3 +210,36 @@ SessionEnd 事件清除 hook 状态回退 idle；process_monitor 增加 ai-idle 
 ### Next Steps
 
 - None - task complete
+
+
+## Session 7: fix Windows 深色模式标题栏 (issue #33)
+
+**Date**: 2026-05-26
+**Task**: fix Windows 深色模式标题栏 (issue #33)
+**Branch**: `main`
+
+### Summary
+
+调 Win32 DwmSetWindowAttribute(DWMWA_USE_IMMERSIVE_DARK_MODE=20) 切原生标题栏配色，挂在 themeManager.applyToDOM 末尾，theme 切换 / 启动 / auto 系统色变化三处自动同步。Cargo windows crate 加 Win32_Graphics_Dwm feature；适配 Win10 20H2+ / Win11，非 Windows cfg 包裹 no-op，失败 eprintln 不阻塞。trellis-check 一次过，5fc8ccb 提交。
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `5fc8ccb` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
