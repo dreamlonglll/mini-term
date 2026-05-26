@@ -177,3 +177,36 @@ SessionEnd 事件清除 hook 状态回退 idle；process_monitor 增加 ai-idle 
 ### Next Steps
 
 - None - task complete
+
+
+## Session 6: WSL 项目 envVars 通过 WSLENV 透传 + 升级 v0.4.15
+
+**Date**: 2026-05-26
+**Task**: WSL 项目 envVars 通过 WSLENV 透传 + 升级 v0.4.15
+**Branch**: `main`
+
+### Summary
+
+后端 pty.rs 抽出 build_wslenv_value 纯函数，WSL 分支拼 WSLENV=K1/u:K2/u 并把宿主既有值追加在尾部合并，对齐 JetBrains IDEA terminal 惯例；MINITERM_ 前缀 + WSLENV 大小写敏感等值前后端双重防御过滤；前端 ProjectEnvVarsModal 拒绝 WSLENV 作为 key，WSL 顶部警告条由黄变绿；新增 7 个 build_wslenv_value 单测覆盖空 list / 单变量 / 多变量顺序 / 宿主合并 / 空字符串边界；spec pty-env-vars-injection.md WSL 章节从 v2 预留升级为已实现；版本号 0.4.14 → 0.4.15。
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `53f97fb` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
