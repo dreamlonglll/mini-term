@@ -4,6 +4,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeRaw from 'rehype-raw';
 import type { FileContentResult } from '../types';
+import { handleExternalLinkClick } from '../utils/externalLink';
 
 interface FileViewerModalProps {
   open: boolean;
@@ -184,6 +185,9 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
                 components={{
                   img: ({ src, alt, ...props }) => (
                     <img src={resolveImgSrc(src)} alt={alt ?? ''} {...props} />
+                  ),
+                  a: ({ href, children, ...props }) => (
+                    <a href={href} onClick={handleExternalLinkClick} {...props}>{children}</a>
                   ),
                 }}
               >

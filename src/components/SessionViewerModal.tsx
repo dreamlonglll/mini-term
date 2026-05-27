@@ -4,6 +4,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeRaw from 'rehype-raw';
 import { MOD_LABEL } from '../utils/platform';
+import { handleExternalLinkClick } from '../utils/externalLink';
 import type { AiSession, AiSessionMessage } from '../types';
 
 interface Props {
@@ -251,7 +252,15 @@ export function SessionViewerModal({ open, onClose, session, projectPath }: Prop
               >
                 {msg.role === 'assistant' ? (
                   <div className="md-preview">
-                    <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeRaw]}>{msg.content}</ReactMarkdown>
+                    <ReactMarkdown
+                      remarkPlugins={[remarkGfm]}
+                      rehypePlugins={[rehypeRaw]}
+                      components={{
+                        a: ({ href, children, ...props }) => (
+                          <a href={href} onClick={handleExternalLinkClick} {...props}>{children}</a>
+                        ),
+                      }}
+                    >{msg.content}</ReactMarkdown>
                   </div>
                 ) : (
                   <div style={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word' }}>
