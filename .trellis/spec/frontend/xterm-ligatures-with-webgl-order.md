@@ -52,7 +52,27 @@ export async function reloadLigaturesForPty(ptyId: number): Promise<void> {
 - `mount` 流程尚未完成（`webglLoaded === false`）时**必须早返回** —— 让首次 `activateWebgl` 自然按当前配置加载，避免 mount 中途双重 load。
 - 切换字体时也要触发此函数（不只是 toggle ligatures），因为上游 #5455：`font-feature-settings` 变化不会通知 WebGL atlas 重建。
 
-### 约束 3：禁止依赖 README 中的 `font-finder` / Node `fs` 描述
+### 约束 3：`new Terminal()` 必须开 `allowProposedApi: true`
+
+```typescript
+// ✅ 正确
+const term = new Terminal({
+  fontFamily: '...',
+  allowProposedApi: true,  // ← LigaturesAddon 需要
+});
+```
+
+```typescript
+// ❌ 错误：addon 加载时抛 "You must set the allowProposedApi option to true to use proposed API"
+const term = new Terminal({ fontFamily: '...' });
+term.loadAddon(new LigaturesAddon());  // 抛错,被 try/catch 吞掉,表现为开关无效果
+```
+
+`LigaturesAddon` 内部调用 `term.registerCharacterJoiner` 注入字符合并逻辑,而 `registerCharacterJoiner` 在 xterm.js v6 中仍标记为 **proposed API**(未来可能调整签名),默认禁用。必须在 `new Terminal()` 配置中显式 opt-in。
+
+注意:这个错误会被 `loadLigaturesIfEnabled` 内的 `try/catch` 静默吞掉(只 console.error),表现为开关切到 ON 但终端无任何视觉变化 —— 排查时必须看 devtools console 才能定位。
+
+### 约束 4：禁止依赖 README 中的 `font-finder` / Node `fs` 描述
 
 `@xterm/addon-ligatures@0.10.0` 的官方 README 仍声明依赖 Node `font-finder` 走 Node `fs`。**这个说明已过时**，published `lib/addon-ligatures.mjs` 实际使用浏览器原生 [`window.queryLocalFonts()`](https://developer.mozilla.org/en-US/docs/Web/API/Window/queryLocalFonts)，无 Node `fs`、无 WASM、无 `eval`。
 

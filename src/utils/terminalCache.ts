@@ -229,6 +229,9 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
     letterSpacing: 0,
     lineHeight: 1.35,
     theme,
+    // LigaturesAddon 内部用 registerCharacterJoiner（xterm.js proposed API），
+    // 不开启 allowProposedApi 加载 addon 会抛 "You must set the allowProposedApi option to true"。
+    allowProposedApi: true,
   });
 
   const fitAddon = new FitAddon();
