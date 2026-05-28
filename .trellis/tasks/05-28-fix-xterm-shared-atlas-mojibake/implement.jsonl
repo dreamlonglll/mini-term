@@ -1,0 +1,1 @@
+{"file": ".trellis/tasks/05-28-fix-xterm-shared-atlas-mojibake/research/atlas-sharing-root-cause.md", "reason": "完整根因证据链:xterm.js addon-webgl atlas 跨实例共享、page merge 原地改写 glyph 字段、dormant renderer vertex buffer 漏刷新。修复点定位 src/utils/terminalCache.ts 的 loadWebgl"}

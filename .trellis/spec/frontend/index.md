@@ -21,6 +21,7 @@ This directory contains guidelines for frontend development. Fill in each file w
 | [Quality Guidelines](./quality-guidelines.md) | Code standards, forbidden patterns | To fill |
 | [Type Safety](./type-safety.md) | Type patterns, validation | To fill |
 | [xterm Ligatures + WebGL Order](./xterm-ligatures-with-webgl-order.md) | LigaturesAddon 必须先于 WebglAddon、热切换同步无 await、平台差异 | Filled |
+| [xterm.js WebGL TextureAtlas 跨实例共享](./xterm-webgl-atlas-sharing.md) | atlas page merge 后必须广播 `term.refresh` 唤醒 dormant 终端;否则多 AI 并发出现同形乱码 | Active |
 
 ---
 
