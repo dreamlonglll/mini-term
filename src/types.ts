@@ -45,6 +45,21 @@ export interface AppConfig {
   hookEnabled: boolean;
   smartCopyPaste: boolean;
   sshConnections: SshConnection[];
+  /** cc-connect 集成配置(进程管理 + 项目导入 + dashboard 嵌入),未配置时缺省 */
+  ccConnect?: CcConnectConfig;
+}
+
+export interface CcConnectConfig {
+  /** cc-connect 可执行文件路径,空字符串 = 让前端 PATH 探测 */
+  exePath: string;
+  /** config.toml 路径,空字符串 = 默认 ~/.cc-connect/config.toml */
+  configPath: string;
+  /** mini-term 启动时自动 spawn cc-connect */
+  autoStart: boolean;
+  /** 额外启动参数 */
+  extraArgs: string[];
+  /** mini-term project id → cc-connect project name 映射 */
+  projectLinks: Record<string, string>;
 }
 
 export interface ProjectConfig {

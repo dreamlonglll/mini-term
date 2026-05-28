@@ -106,6 +106,31 @@ pub struct AppConfig {
     pub smart_copy_paste: bool,
     #[serde(default)]
     pub ssh_connections: Vec<SshConnection>,
+    /// cc-connect 集成配置(进程管理 + 项目导入关联 + dashboard 嵌入)。
+    /// 未配置时为 None;序列化时省略以保持老 config.json 干净。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cc_connect: Option<CcConnectConfig>,
+}
+
+/// cc-connect 集成的持久化配置。详见 .trellis/tasks/05-28-embed-cc-connect-panel/prd.md
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CcConnectConfig {
+    /// cc-connect 可执行文件路径(空字符串 = 让前端去 PATH 探测)
+    #[serde(default)]
+    pub exe_path: String,
+    /// config.toml 路径(空字符串 = 用默认 ~/.cc-connect/config.toml)
+    #[serde(default)]
+    pub config_path: String,
+    /// mini-term 启动时自动 spawn cc-connect
+    #[serde(default)]
+    pub auto_start: bool,
+    /// 额外启动参数
+    #[serde(default)]
+    pub extra_args: Vec<String>,
+    /// mini-term project id → cc-connect project name 映射
+    #[serde(default)]
+    pub project_links: std::collections::HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -268,6 +293,7 @@ impl Default for AppConfig {
             hook_enabled: false,
             smart_copy_paste: false,
             ssh_connections: vec![],
+            cc_connect: None,
         }
     }
 }

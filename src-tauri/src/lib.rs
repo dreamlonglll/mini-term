@@ -1,4 +1,5 @@
 mod ai_sessions;
+mod cc_connect;
 mod clipboard;
 mod config;
 mod editor;
@@ -34,6 +35,7 @@ pub fn run() {
         .manage(pty::PtyManager::new())
         .manage(fs::FsWatcherManager::new())
         .manage(search::SearchManager::new())
+        .manage(cc_connect::CcConnectManager::new())
         .setup(|app| {
             // identifier 从 com.tauri-app.tauri-app 切换为 com.mini-term.app 后,
             // 第一次启动时把旧 app_data_dir 下的 config.json 拷到新目录,
@@ -129,6 +131,14 @@ pub fn run() {
             ssh_mcp_registry::enable_ssh_mcp,
             ssh_mcp_registry::disable_ssh_mcp,
             window_theme::set_window_dark_mode,
+            cc_connect::cc_connect_probe,
+            cc_connect::cc_connect_read_token,
+            cc_connect::cc_connect_start,
+            cc_connect::cc_connect_stop,
+            cc_connect::cc_connect_restart,
+            cc_connect::cc_connect_list_projects,
+            cc_connect::cc_connect_import_project,
+            cc_connect::cc_connect_unlink_project,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

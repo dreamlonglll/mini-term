@@ -36,6 +36,7 @@ git2 = "0.19"
 pathdiff = "0.2"
 tiny_http = "0.12"
 toml_edit = "0.22"
+ureq = { version = "2", features = ["json"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
