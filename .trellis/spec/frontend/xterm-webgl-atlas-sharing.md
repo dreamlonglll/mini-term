@@ -94,6 +94,117 @@ function loadWebgl(entry: CachedEntry): void {
 
 ---
 
+## 未覆盖路径:`RenderService._isPaused` 拦截 + 可见性恢复时的 partial update 残留
+
+> v0.4.18(9bb05e4)的 `term.refresh` 广播修复仍漏了一种场景:`@xterm/xterm@6.0.0` 的 `RenderService` 自带 IntersectionObserver 监视 `screenElement`,不可见(`intersectionRatio === 0` / `isIntersecting === false`)时 `_isPaused = true`,**refreshRows 直接 return 只设 `_needsFullRefresh = true`**(`node_modules/@xterm/xterm/src/browser/services/RenderService.ts:148-152`)。mini-term 切 tab 时 `TerminalArea` 只渲染 active tab,非 active tab 的 `wrapper.remove()` 让所有终端的 screenElement 脱离 DOM,触发 `_isPaused = true`。此期间 atlas 事件路径的 `term.refresh` 全部被吞掉。
+>
+> 切回 tab 时 IntersectionObserver 自动 flush 一次 `refreshRows(0, rowCount - 1)`,但是 —— **此时 GlyphRenderer vertex buffer 中仍是 page merge 前的 glyph 旧坐标**。如果 RenderService 触发的是 partial 路径(`_updateModel(start, end)`,start≠0 或 end≠rows-1),漏改的行就持续乱码。具体表现:用户截图 `clip-1779957312528.png` 中部分行换字(中文/数字 → 拉丁字母)、相邻行正常,且**不会自行恢复,必须 resize / 切走再回来**才能修。
+
+### Convention:`TerminalInstance` 的 `visibilityObserver` + mount 后必须主动 `clearTextureAtlas`
+
+```ts
+// terminalCache.ts
+export function clearAtlasForPty(ptyId: number): void {
+  const entry = cache.get(ptyId);
+  if (!entry?.webglAddon) return;
+  entry.webglAddon.clearTextureAtlas();   // 清 atlas pages + _clearModel(true) + _requestRedrawViewport
+}
+
+// TerminalInstance.tsx:mount 路径
+requestAnimationFrame(() => {
+  // ... fit + refresh
+  requestAnimationFrame(() => {
+    activateWebgl(ptyId);
+    requestAnimationFrame(() => clearAtlasForPty(ptyId));   // ← 三层 rAF:webglAddon 就绪后第一帧
+  });
+});
+
+// TerminalInstance.tsx:可见性恢复路径
+const visibilityObserver = new IntersectionObserver((entries) => {
+  if (entries.some((e) => e.isIntersecting)) {
+    requestAnimationFrame(() => {
+      fitAddon.fit();
+      term.refresh(0, term.rows - 1);
+      clearAtlasForPty(ptyId);   // ← 切回 tab / 重新可见时强制清 atlas
+    });
+  }
+});
+visibilityObserver.observe(container);
+```
+
+`clearTextureAtlas` 内部:
+1. `atlas.clearTexture()` 清空所有 page canvas + cacheMap + `page.version++` → 下次 render 时 GlyphRenderer.render(line 359-364)检测 version mismatch 自动重传 GPU texture
+2. `_clearModel(true)` 清 `RenderModel.lineLengths` + GlyphRenderer vertex buffer 全 fill(0)
+3. `_requestRedrawViewport()` fire `_onRequestRedraw({start:0, end:rows-1})` → RenderService.refreshRows(0, rows-1, isRedrawOnly=true) → 下一帧 _updateModel(0, rows-1) 全 viewport 重写
+
+### Wrong vs Correct
+
+#### Wrong(v0.4.18:9bb05e4 only)
+
+```ts
+// 仅在 atlas 事件路径广播 term.refresh,没有可见性恢复路径的兜底
+function loadWebgl(entry: CachedEntry): void {
+  const webgl = new WebglAddon();
+  webgl.onAddTextureAtlasCanvas(refreshAllTerminalsForAtlasChange);
+  webgl.onRemoveTextureAtlasCanvas(refreshAllTerminalsForAtlasChange);
+  entry.term.loadAddon(webgl);
+}
+// TerminalInstance visibilityObserver 内只调 term.refresh
+```
+
+bug 表现:切走 tab → atlas 在另一个 tab 发生 merge → 切回原 tab → 部分行乱码且不会自愈,必须 resize 才恢复。
+
+#### Correct(v0.4.20+)
+
+```ts
+// 事件路径 + mount + 可见性恢复 三条路径都覆盖
+function loadWebgl(entry: CachedEntry): void {
+  const webgl = new WebglAddon();
+  webgl.onAddTextureAtlasCanvas(() => refreshAllTerminalsForAtlasChange('add'));
+  webgl.onRemoveTextureAtlasCanvas(() => refreshAllTerminalsForAtlasChange('remove'));
+  entry.term.loadAddon(webgl);
+}
+// + TerminalInstance.tsx mount/visibilityObserver 内调 clearAtlasForPty
+```
+
+### 为什么事件路径不用 `clearTextureAtlas`
+
+`clearTextureAtlas` 把 `vertex buffer + lineLengths` 全 fill(0),下一帧 `GlyphRenderer.render`(line 348-353):
+```ts
+for (let y = 0; y < renderModel.lineLengths.length; y++) {
+  const sub = this._vertices.attributes.subarray(si, si + renderModel.lineLengths[y] * INDICES_PER_CELL);
+  // lineLengths[y]=0 → sub 长度=0 → 这一行画 0 个 cell
+}
+gl.drawElementsInstanced(...bufferLength / INDICES_PER_CELL = 0);   // ← 整屏空白
+```
+
+可见终端会闪烁一帧。事件路径的可见终端用 `term.refresh` 同帧走 `_clearModel + _updateModel(0, rows-1)` 把 lineLengths 与 vertex buffer 同时写满,**无闪烁**。
+
+mount / 可见性恢复路径本来就要重绘整屏,< 1 帧空白被 mount/切换动画掩盖,可接受。
+
+---
+
+## 诊断开关:`localStorage.miniterm.atlasDebug`
+
+在浏览器 DevTools 控制台:
+```js
+localStorage.setItem('miniterm.atlasDebug', '1');   // 打开
+localStorage.removeItem('miniterm.atlasDebug');     // 关闭
+```
+
+打开后 `console.log` 输出:
+- `[atlasDebug] atlas-event` — atlas page add/remove 触发时,带 `reason / cacheSize / terminals[{ptyId, rows, isPaused}]`
+- `[atlasDebug] clear-atlas` — `clearAtlasForPty` 调用时,带 `ptyId / rows`
+
+用途:复现乱码场景时,观察:
+1. atlas 事件频次 / 是否真的有 add/remove 触发
+2. 触发时各终端的 `_isPaused` 状态(经反射读 `term._core._renderService._isPaused`,xterm.js 私有字段)
+3. cacheSize 与可见性的关系
+
+默认 OFF,不污染普通用户控制台。
+
+---
+
 ## 适用范围与升级注意
 
 - 锁定版本:`@xterm/xterm@6.0.0` + `@xterm/addon-webgl@0.19.0`(见 `package.json`)。

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '../store';
-import { getOrCreateTerminal, getCachedTerminal, activateWebgl, getTerminalTheme, DARK_TERMINAL_THEME, writePtyInput, copyTerminalSelection, pasteToTerminal, resolveTerminalFontFamily, reloadLigaturesForPty } from '../utils/terminalCache';
+import { getOrCreateTerminal, getCachedTerminal, activateWebgl, getTerminalTheme, DARK_TERMINAL_THEME, writePtyInput, copyTerminalSelection, pasteToTerminal, resolveTerminalFontFamily, reloadLigaturesForPty, clearAtlasForPty } from '../utils/terminalCache';
 import { getResolvedTheme } from '../utils/themeManager';
 import { showContextMenu, type MenuEntry } from '../utils/contextMenu';
 import { isFileDragging, getFileDragPath } from '../utils/fileDragState';
@@ -111,7 +111,11 @@ export function TerminalInstance({ ptyId }: Props) {
         // split/remount 后视口可能停留在 buffer 顶部，滚回光标位置
         if (mountWasAtBottom) term.scrollToBottom();
         // 等 canvas 渲染器首帧合成上屏后再加载 WebGL，避免替换 canvas 时闪白
-        requestAnimationFrame(() => activateWebgl(ptyId));
+        requestAnimationFrame(() => {
+          activateWebgl(ptyId);
+          // mount 后强制 clearTextureAtlas,见 spec/frontend/xterm-webgl-atlas-sharing.md
+          requestAnimationFrame(() => clearAtlasForPty(ptyId));
+        });
       }
     });
 
@@ -151,6 +155,9 @@ export function TerminalInstance({ ptyId }: Props) {
         requestAnimationFrame(() => {
           fitAddon.fit();
           term.refresh(0, term.rows - 1);
+          // 可见性恢复时强制清 atlas 兜底 RenderService._isPaused 拦截期间的残留,
+          // 见 .trellis/spec/frontend/xterm-webgl-atlas-sharing.md 「未覆盖路径」章节
+          clearAtlasForPty(ptyId);
         });
       }
     });

@@ -358,20 +358,78 @@ function disposeWebgl(entry: CachedEntry): void {
   entry.webglLoaded = false;
 }
 
+/** 诊断开关:localStorage.miniterm.atlasDebug === '1' 时打印 atlas 事件日志。 */
+function isAtlasDebugEnabled(): boolean {
+  try {
+    return typeof localStorage !== 'undefined' && localStorage.getItem('miniterm.atlasDebug') === '1';
+  } catch {
+    return false;
+  }
+}
+
+function atlasDebugLog(tag: string, payload: Record<string, unknown>): void {
+  if (!isAtlasDebugEnabled()) return;
+  // eslint-disable-next-line no-console
+  console.log(`[atlasDebug] ${tag}`, payload);
+}
+
+/** 读取 RenderService._isPaused(仅调试用,经 any 反射,xterm.js 私有字段)。 */
+function readIsPaused(term: Terminal): boolean | null {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const rs = (term as any)._core?._renderService;
+    return rs?._isPaused ?? null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * atlas page 变更后,把 cache 中所有终端的可视行打 dirty,
  * 唤醒 dormant render loop 让其消费 atlas 的 _requestClearModel 兜底。
  *
- * xterm.js WebGL atlas 跨实例共享(CharAtlasCache 按字体/字号/主题/DPR 命中);
- * page merge 时原地改写 glyph 的 texturePage 与 atlas 坐标,但各 Terminal 自己的
- * GlyphRenderer GPU vertex buffer 仍引用旧值。只有被 xterm.js core 重新 schedule
- * renderRows 的 renderer 才会经 beginFrame → _clearModel(true)+_updateModel(0,rows-1)
- * 重写 buffer。AI 终端在等待响应时 PTY 静默 → render loop dormant → 持续渲染
- * 错位字形,表现为多个 claude 终端同时出现相同乱码,resize 单个才能恢复。
+ * 不可见终端(RenderService._isPaused === true)的 refresh 会被 xterm.js core 吞掉,
+ * 仅设 _needsFullRefresh,需要靠 TerminalInstance 的 visibilityObserver 在可见性恢复时
+ * 调 clearAtlasForPty 兜底。完整背景见 .trellis/spec/frontend/xterm-webgl-atlas-sharing.md
  */
-function refreshAllTerminalsForAtlasChange(): void {
+function refreshAllTerminalsForAtlasChange(reason: 'add' | 'remove'): void {
+  if (isAtlasDebugEnabled()) {
+    atlasDebugLog('atlas-event', {
+      reason,
+      cacheSize: cache.size,
+      terminals: Array.from(cache.entries()).map(([ptyId, e]) => ({
+        ptyId,
+        rows: e.term.rows,
+        isPaused: readIsPaused(e.term),
+      })),
+    });
+  }
   for (const e of cache.values()) {
     if (e.term.rows > 0) e.term.refresh(0, e.term.rows - 1);
+  }
+}
+
+/**
+ * 可见性恢复时(mount / IntersectionObserver intersecting)强制清空 atlas + 重置 vertex buffer。
+ *
+ * 为什么不在 atlas 事件路径用这个:clearTextureAtlas 会把 vertex buffer 与 lineLengths 全 fill(0),
+ * 下一帧 GlyphRenderer.render 画 0 个 cell → 可见终端会闪烁一帧。事件路径用 term.refresh 走
+ * _clearModel + _updateModel(0, rows-1) 同帧重写 vertex buffer,无闪烁。
+ *
+ * 为什么在可见性恢复路径用:mount/切回 tab 本来就要重绘整屏,clearTextureAtlas 的 < 1 帧空白
+ * 不会比正常 mount 显得更突兀;同时绕开 RenderService._isPaused 残留(如果切走 tab 时被置 true,
+ * 切回时虽然 IntersectionObserver 会 flush 一次 refreshRows,但若 vertex buffer 已含旧坐标,
+ * partial _updateModel(start, end) 不会覆盖未更新行 → 仍残留乱码)。
+ */
+export function clearAtlasForPty(ptyId: number): void {
+  const entry = cache.get(ptyId);
+  if (!entry?.webglAddon) return;
+  try {
+    entry.webglAddon.clearTextureAtlas();
+    atlasDebugLog('clear-atlas', { ptyId, rows: entry.term.rows });
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.error('[atlasDebug] clearTextureAtlas failed', e);
   }
 }
 
@@ -385,8 +443,8 @@ function loadWebgl(entry: CachedEntry): void {
       entry.webglAddon = undefined;
       entry.term.refresh(0, entry.term.rows - 1);
     });
-    webgl.onAddTextureAtlasCanvas(refreshAllTerminalsForAtlasChange);
-    webgl.onRemoveTextureAtlasCanvas(refreshAllTerminalsForAtlasChange);
+    webgl.onAddTextureAtlasCanvas(() => refreshAllTerminalsForAtlasChange('add'));
+    webgl.onRemoveTextureAtlasCanvas(() => refreshAllTerminalsForAtlasChange('remove'));
     entry.term.loadAddon(webgl);
     entry.webglAddon = webgl;
   } catch {
