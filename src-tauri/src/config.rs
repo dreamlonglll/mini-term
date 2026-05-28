@@ -56,6 +56,8 @@ pub struct AppConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_font_family: Option<String>,
     #[serde(default)]
+    pub terminal_ligatures: bool,
+    #[serde(default)]
     pub layout_sizes: Option<Vec<f64>>,
     #[serde(default)]
     pub middle_column_sizes: Option<Vec<f64>>,
@@ -241,6 +243,7 @@ impl Default for AppConfig {
             terminal_font_size: default_terminal_font_size(),
             ui_font_family: None,
             terminal_font_family: None,
+            terminal_ligatures: false,
             layout_sizes: None,
             middle_column_sizes: None,
             theme: default_theme(),
@@ -558,6 +561,37 @@ mod tests {
         let config: AppConfig = serde_json::from_str(json).unwrap();
         assert!(config.ui_font_family.is_none());
         assert!(config.terminal_font_family.is_none());
+    }
+
+    #[test]
+    fn terminal_ligatures_round_trip() {
+        let json = r#"{
+            "projects": [],
+            "defaultShell": "cmd",
+            "availableShells": [],
+            "uiFontSize": 13,
+            "terminalFontSize": 14,
+            "terminalLigatures": true
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert!(config.terminal_ligatures);
+
+        let serialized = serde_json::to_string(&config).unwrap();
+        let reparsed: AppConfig = serde_json::from_str(&serialized).unwrap();
+        assert!(reparsed.terminal_ligatures);
+    }
+
+    #[test]
+    fn terminal_ligatures_absent_defaults_false() {
+        let json = r#"{
+            "projects": [],
+            "defaultShell": "cmd",
+            "availableShells": [],
+            "uiFontSize": 13,
+            "terminalFontSize": 14
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert!(!config.terminal_ligatures);
     }
 
     #[test]

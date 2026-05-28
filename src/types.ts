@@ -21,6 +21,7 @@ export interface AppConfig {
   terminalFontSize: number;
   uiFontFamily?: string;
   terminalFontFamily?: string;
+  terminalLigatures?: boolean;
   layoutSizes?: number[];
   middleColumnSizes?: number[];
   theme: 'auto' | 'light' | 'dark';

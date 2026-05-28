@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '../store';
-import { getOrCreateTerminal, getCachedTerminal, activateWebgl, getTerminalTheme, DARK_TERMINAL_THEME, writePtyInput, copyTerminalSelection, pasteToTerminal, resolveTerminalFontFamily } from '../utils/terminalCache';
+import { getOrCreateTerminal, getCachedTerminal, activateWebgl, getTerminalTheme, DARK_TERMINAL_THEME, writePtyInput, copyTerminalSelection, pasteToTerminal, resolveTerminalFontFamily, reloadLigaturesForPty } from '../utils/terminalCache';
 import { getResolvedTheme } from '../utils/themeManager';
 import { showContextMenu, type MenuEntry } from '../utils/contextMenu';
 import { isFileDragging, getFileDragPath } from '../utils/fileDragState';
@@ -81,6 +81,7 @@ export function TerminalInstance({ ptyId }: Props) {
   const [fileDrag, setFileDrag] = useState(false);
   const terminalFontSize = useAppStore((s) => s.config.terminalFontSize);
   const terminalFontFamily = useAppStore((s) => s.config.terminalFontFamily);
+  const terminalLigatures = useAppStore((s) => s.config.terminalLigatures);
   const terminalFollowTheme = useAppStore((s) => s.config.terminalFollowTheme);
   const sshConnections = useAppStore((s) => s.config.sshConnections);
 
@@ -178,6 +179,12 @@ export function TerminalInstance({ ptyId }: Props) {
     cached.term.options.fontFamily = resolveTerminalFontFamily(terminalFontFamily);
     cached.fitAddon.fit();
   }, [terminalFontFamily, ptyId]);
+
+  // ligatures 开关切换 / 字体切换 → 重做 ligatures + WebGL atlas
+  // (上游 #5455:font-feature-settings 变更不会自动进 WebGL 纹理 atlas,需 dispose+reload)
+  useEffect(() => {
+    reloadLigaturesForPty(ptyId);
+  }, [terminalLigatures, terminalFontFamily, ptyId]);
 
   useEffect(() => {
     const handler = () => {

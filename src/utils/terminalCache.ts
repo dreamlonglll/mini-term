@@ -11,6 +11,7 @@
 import { Terminal, type IMarker, type IDecoration } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebglAddon } from '@xterm/addon-webgl';
+import { LigaturesAddon } from '@xterm/addon-ligatures';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { readText, readImage, writeText } from '@tauri-apps/plugin-clipboard-manager';
@@ -37,6 +38,8 @@ export function resolveTerminalFontFamily(value: string | undefined): string {
 interface CachedEntry extends CachedTerminal {
   cleanup: () => void;
   webglLoaded: boolean;
+  webglAddon?: WebglAddon;
+  ligaturesAddon?: LigaturesAddon;
 }
 
 export const DARK_TERMINAL_THEME = {
@@ -321,21 +324,77 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
   return entry;
 }
 
-/** 在终端已挂载 DOM 并 fit 后激活 WebGL 渲染，降级时回退 Canvas */
-export function activateWebgl(ptyId: number): void {
-  const entry = cache.get(ptyId);
-  if (!entry || entry.webglLoaded) return;
+/** 按当前配置加载 LigaturesAddon。
+ * 必须在 WebglAddon 之前调用 —— 否则 font-feature-settings 不会进 WebGL 纹理 atlas(上游 #5455)。
+ * Windows/WebView2 用 queryLocalFonts 真实解析字体 calt 表;mac/Linux 无此 API 自动 fallback 到内置 Iosevka 60 条。
+ */
+function loadLigaturesIfEnabled(entry: CachedEntry): void {
+  if (entry.ligaturesAddon) return;
+  if (!useAppStore.getState().config.terminalLigatures) return;
+  try {
+    const lig = new LigaturesAddon();
+    entry.term.loadAddon(lig);
+    entry.ligaturesAddon = lig;
+  } catch (e) {
+    console.error('LigaturesAddon load failed', e);
+  }
+}
+
+function disposeLigatures(entry: CachedEntry): void {
+  if (entry.ligaturesAddon) {
+    try { entry.ligaturesAddon.dispose(); } catch { /* 已 dispose */ }
+    entry.ligaturesAddon = undefined;
+  }
+}
+
+function disposeWebgl(entry: CachedEntry): void {
+  if (entry.webglAddon) {
+    try { entry.webglAddon.dispose(); } catch { /* 已 dispose */ }
+    entry.webglAddon = undefined;
+  }
+  entry.webglLoaded = false;
+}
+
+function loadWebgl(entry: CachedEntry): void {
+  if (entry.webglLoaded) return;
   entry.webglLoaded = true;
   try {
     const webgl = new WebglAddon();
     webgl.onContextLoss(() => {
       webgl.dispose();
+      entry.webglAddon = undefined;
       entry.term.refresh(0, entry.term.rows - 1);
     });
     entry.term.loadAddon(webgl);
+    entry.webglAddon = webgl;
   } catch {
-    // WebGL 不支持
+    entry.webglLoaded = false;
   }
+}
+
+/** 在终端已挂载 DOM 并 fit 后激活 WebGL 渲染，降级时回退 Canvas。
+ * ligatures 配置开启时,先加载 LigaturesAddon 再加 WebGL,保证 atlas 包含 calt glyph。
+ */
+export function activateWebgl(ptyId: number): void {
+  const entry = cache.get(ptyId);
+  if (!entry || entry.webglLoaded) return;
+  loadLigaturesIfEnabled(entry);
+  loadWebgl(entry);
+}
+
+/** 切换「启用连体字」开关或字体后,对单个已开终端重做 ligatures + WebGL 顺序。
+ * 操作单帧内同步完成: dispose webgl → dispose ligatures → 按需 reload ligatures → reload webgl,
+ * 全程无 await,避开 pty-output 全局监听器在 term.dispose 后写入的 race。
+ * mount 流程尚未走完(webglLoaded=false)时跳过 —— activateWebgl 内会自然读到当前配置。
+ */
+export function reloadLigaturesForPty(ptyId: number): void {
+  const entry = cache.get(ptyId);
+  if (!entry || !entry.webglLoaded) return;
+  disposeWebgl(entry);
+  disposeLigatures(entry);
+  loadLigaturesIfEnabled(entry);
+  loadWebgl(entry);
+  entry.term.refresh(0, entry.term.rows - 1);
 }
 
 /** 获取已缓存的终端（不创建新的） */

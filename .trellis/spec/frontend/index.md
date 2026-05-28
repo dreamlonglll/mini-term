@@ -20,6 +20,7 @@ This directory contains guidelines for frontend development. Fill in each file w
 | [State Management](./state-management.md) | Local state, global state, server state | Partial |
 | [Quality Guidelines](./quality-guidelines.md) | Code standards, forbidden patterns | To fill |
 | [Type Safety](./type-safety.md) | Type patterns, validation | To fill |
+| [xterm Ligatures + WebGL Order](./xterm-ligatures-with-webgl-order.md) | LigaturesAddon 必须先于 WebglAddon、热切换同步无 await、平台差异 | Filled |
 
 ---
 

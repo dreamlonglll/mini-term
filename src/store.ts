@@ -350,6 +350,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
     availableShells: [],
     uiFontSize: 13,
     terminalFontSize: 14,
+    terminalLigatures: false,
     theme: 'auto',
     skin: 'none',
     terminalFollowTheme: true,

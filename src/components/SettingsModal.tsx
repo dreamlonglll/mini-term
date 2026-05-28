@@ -853,6 +853,13 @@ function FontSettings() {
     invoke('save_config', { config: newConfig });
   }, [setConfig]);
 
+  const terminalLigaturesEnabled = config.terminalLigatures ?? false;
+  const handleTerminalLigaturesChange = useCallback((enabled: boolean) => {
+    const newConfig = { ...useAppStore.getState().config, terminalLigatures: enabled };
+    setConfig(newConfig);
+    invoke('save_config', { config: newConfig });
+  }, [setConfig]);
+
   return (
     <div className="space-y-6">
       <div className="text-base text-[var(--text-muted)] uppercase tracking-[0.1em] mb-2">
@@ -899,6 +906,31 @@ function FontSettings() {
 
       <div className="pt-3 text-sm text-[var(--text-muted)]">
         留空使用默认 · 支持 CSS font-family 语法（如 <span className="font-mono">'JetBrainsMono Nerd Font', monospace</span>）
+      </div>
+
+      <div className="pt-6 text-base text-[var(--text-muted)] uppercase tracking-[0.1em] mb-2">
+        连体字
+      </div>
+
+      <div className="flex items-center justify-between px-3 py-2.5 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)]">
+        <div className="pr-4">
+          <div className="text-base text-[var(--text-primary)]">启用终端连体字 (ligatures)</div>
+          <div className="text-sm text-[var(--text-muted)]">
+            开启后 <span className="font-mono">==</span> <span className="font-mono">=&gt;</span> <span className="font-mono">!=</span> <span className="font-mono">-&gt;</span> 等会合成 ligature glyph，需字体本身含 calt 表（如 Fira Code、JetBrains Mono）· Windows 完整支持；macOS / Linux 受 webview API 限制，仅 ~60 条内置 Iosevka fallback
+          </div>
+        </div>
+        <button
+          className={`relative w-9 h-5 rounded-full transition-colors flex-shrink-0 ${
+            terminalLigaturesEnabled ? 'bg-[var(--accent)]' : 'bg-[var(--border-strong)]'
+          }`}
+          onClick={() => handleTerminalLigaturesChange(!terminalLigaturesEnabled)}
+        >
+          <span
+            className={`absolute top-0.5 left-0 w-4 h-4 rounded-full bg-white transition-transform ${
+              terminalLigaturesEnabled ? 'translate-x-[18px]' : 'translate-x-0.5'
+            }`}
+          />
+        </button>
       </div>
     </div>
   );
