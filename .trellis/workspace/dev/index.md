@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 8
+- **Total Sessions**: 9
 - **Last Active**: 2026-05-28
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~278 | Active |
+| `journal-1.md` | ~311 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 9 | 2026-05-28 | 修复 xterm.js WebGL 共享 atlas 致多 claude 终端同时乱码 | `9bb05e4` | `main` |
 | 8 | 2026-05-28 | xterm 终端连体字 (ligatures) 支持 | `0b31a35` | `main` |
 | 7 | 2026-05-26 | fix Windows 深色模式标题栏 (issue #33) | `5fc8ccb` | `main` |
 | 6 | 2026-05-26 | WSL 项目 envVars 通过 WSLENV 透传 + 升级 v0.4.15 | `53f97fb` | `main` |

@@ -276,3 +276,36 @@ SessionEnd 事件清除 hook 状态回退 idle；process_monitor 增加 ai-idle 
 ### Next Steps
 
 - None - task complete
+
+
+## Session 9: 修复 xterm.js WebGL 共享 atlas 致多 claude 终端同时乱码
+
+**Date**: 2026-05-28
+**Task**: 修复 xterm.js WebGL 共享 atlas 致多 claude 终端同时乱码
+**Branch**: `main`
+
+### Summary
+
+深入诊断 xterm.js addon-webgl CharAtlasCache 跨终端共享导致的 vertex buffer 失效 → 多 claude 并发出现同形乱码。修复在 loadWebgl 内挂 onAdd/onRemoveTextureAtlasCanvas 广播 term.refresh 唤醒 dormant render loop;归档 prd+完整证据链 research+spec(xterm-webgl-atlas-sharing.md) 供未来 upgrade addon-webgl 时回归。fix/xterm-shared-atlas-mojibake 分支 cherry-pick 到 main,与 ligatures 任务合并
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `9bb05e4` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
