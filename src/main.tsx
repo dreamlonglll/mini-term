@@ -2,6 +2,7 @@ import React from 'react';
 import ReactDOM from 'react-dom/client';
 import { App } from './App';
 import './styles.css';
+import './fluent2.css';
 
 // 禁用 WebView 默认右键菜单
 document.addEventListener('contextmenu', (e) => {

@@ -142,6 +142,56 @@ export const BLUEPRINT_LIGHT_TERMINAL_THEME = {
   brightWhite: '#64748b',
 };
 
+export const FLUENT2_TERMINAL_THEME = {
+  background: '#15181f',
+  foreground: '#e8e8e8',
+  cursor: '#4cc2ff',
+  cursorAccent: '#15181f',
+  selectionBackground: 'rgba(76,194,255,0.22)',
+  selectionForeground: '#ffffff',
+  black: '#1f1f1f',
+  red: '#f87171',
+  green: '#6ccb5f',
+  yellow: '#fce100',
+  blue: '#4cc2ff',
+  magenta: '#c8a2ff',
+  cyan: '#61d6d6',
+  white: '#e8e8e8',
+  brightBlack: '#767676',
+  brightRed: '#ff9594',
+  brightGreen: '#80e16e',
+  brightYellow: '#ffe555',
+  brightBlue: '#6fcdff',
+  brightMagenta: '#d3b4ff',
+  brightCyan: '#88e0e0',
+  brightWhite: '#ffffff',
+};
+
+export const FLUENT2_LIGHT_TERMINAL_THEME = {
+  background: '#fafbfd',
+  foreground: '#1a1a1a',
+  cursor: '#0067c0',
+  cursorAccent: '#fafbfd',
+  selectionBackground: 'rgba(0,103,192,0.18)',
+  selectionForeground: '#1a1a1a',
+  black: '#1a1a1a',
+  red: '#c42b1c',
+  green: '#107c10',
+  yellow: '#b89500',
+  blue: '#0067c0',
+  magenta: '#8764b8',
+  cyan: '#038387',
+  white: '#767676',
+  brightBlack: '#4a4a4a',
+  brightRed: '#d13438',
+  brightGreen: '#13a10e',
+  brightYellow: '#c19c00',
+  brightBlue: '#3b9eff',
+  brightMagenta: '#b146c2',
+  brightCyan: '#3a96dd',
+  brightWhite: '#ffffff',
+};
+
 export function getTerminalTheme(terminalFollowTheme: boolean): typeof DARK_TERMINAL_THEME {
   if (!terminalFollowTheme) return DARK_TERMINAL_THEME;
   const skin = useAppStore.getState().config.skin;
@@ -149,6 +199,11 @@ export function getTerminalTheme(terminalFollowTheme: boolean): typeof DARK_TERM
     return getResolvedTheme() === 'light'
       ? BLUEPRINT_LIGHT_TERMINAL_THEME
       : BLUEPRINT_TERMINAL_THEME;
+  }
+  if (skin === 'fluent2') {
+    return getResolvedTheme() === 'light'
+      ? FLUENT2_LIGHT_TERMINAL_THEME
+      : FLUENT2_TERMINAL_THEME;
   }
   if (getResolvedTheme() === 'light') return LIGHT_TERMINAL_THEME;
   return DARK_TERMINAL_THEME;

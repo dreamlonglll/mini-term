@@ -1,6 +1,7 @@
 @import "tailwindcss";
 @import "allotment/dist/style.css";
 @import "./blueprint.css";
+@import "./fluent2.css";
 
 /* ===== Mini-Term "Warm Carbon" Theme ===== */
 
@@ -707,3 +708,86 @@ body.project-dragging {
   --radius-sm: 2px;
   --radius-md: 3px;
 }
+
+/* ===== Fluent 2 Skin — CSS Variable Overrides ===== */
+
+:root[data-skin="fluent2"] {
+  --bg-base: #1a1d24;
+  --bg-surface: #20242c;
+  --bg-elevated: #2a2f38;
+  --bg-overlay: #323845;
+  --bg-terminal: #15181f;
+
+  --accent: #4cc2ff;
+  --accent-muted: rgba(76, 194, 255, 0.18);
+  --accent-subtle: rgba(76, 194, 255, 0.08);
+
+  --text-primary: rgba(255, 255, 255, 0.92);
+  --text-secondary: rgba(255, 255, 255, 0.64);
+  --text-muted: rgba(255, 255, 255, 0.42);
+
+  --border-subtle: rgba(255, 255, 255, 0.06);
+  --border-default: rgba(255, 255, 255, 0.1);
+  --border-strong: rgba(255, 255, 255, 0.16);
+
+  --color-file: #4cc2ff;
+  --color-folder: #b4d8ff;
+  --color-success: #6ccb5f;
+  --color-warning: #fce100;
+  --color-error: #ff7878;
+  --color-ai: #c8a2ff;
+  --color-ai-working: #ffb900;
+  --color-info: #4cc2ff;
+
+  --diff-add-bg: rgba(108, 203, 95, 0.16);
+  --diff-del-bg: rgba(255, 120, 120, 0.16);
+  --diff-add-text: #6ccb5f;
+  --diff-del-text: #ff7878;
+
+  --color-error-muted: rgba(255, 120, 120, 0.18);
+  --shadow-overlay: 0 8px 28px rgba(0, 0, 0, 0.55), 0 1px 0 rgba(255, 255, 255, 0.06);
+
+  --radius-sm: 4px;
+  --radius-md: 8px;
+}
+
+:root[data-skin="fluent2"][data-theme="light"] {
+  --bg-base: #f6f8fc;
+  --bg-surface: #eef2f8;
+  --bg-elevated: #e6ecf4;
+  --bg-overlay: #dde5ef;
+  --bg-terminal: #fafbfd;
+
+  --accent: #0067c0;
+  --accent-muted: rgba(0, 103, 192, 0.14);
+  --accent-subtle: rgba(0, 103, 192, 0.06);
+
+  --text-primary: #1a1a1a;
+  --text-secondary: #424242;
+  --text-muted: #707070;
+
+  --border-subtle: rgba(0, 0, 0, 0.06);
+  --border-default: rgba(0, 0, 0, 0.1);
+  --border-strong: rgba(0, 0, 0, 0.16);
+
+  --color-file: #0067c0;
+  --color-folder: #1f6feb;
+  --color-success: #107c10;
+  --color-warning: #b89500;
+  --color-error: #c42b1c;
+  --color-ai: #8764b8;
+  --color-ai-working: #ca5010;
+  --color-info: #0067c0;
+
+  --diff-add-bg: rgba(16, 124, 16, 0.1);
+  --diff-del-bg: rgba(196, 43, 28, 0.1);
+  --diff-add-text: #107c10;
+  --diff-del-text: #c42b1c;
+
+  --color-error-muted: rgba(196, 43, 28, 0.12);
+  --shadow-overlay: 0 8px 28px rgba(0, 0, 0, 0.12), 0 1px 0 rgba(255, 255, 255, 0.7);
+
+  --radius-sm: 4px;
+  --radius-md: 8px;
+}
+

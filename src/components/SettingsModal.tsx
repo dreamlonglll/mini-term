@@ -659,7 +659,7 @@ function SystemSettings() {
     invoke('save_config', { config: newConfig });
   }, [setConfig]);
 
-  const handleSkinChange = useCallback((skin: 'none' | 'blueprint') => {
+  const handleSkinChange = useCallback((skin: 'none' | 'blueprint' | 'fluent2') => {
     const currentConfig = useAppStore.getState().config;
     const newConfig = { ...currentConfig, skin };
     setConfig(newConfig);
@@ -703,6 +703,7 @@ function SystemSettings() {
         {([
           { value: 'none' as const, label: '无' },
           { value: 'blueprint' as const, label: '蓝图' },
+          { value: 'fluent2' as const, label: 'Fluent 2' },
         ]).map((opt) => (
           <button
             key={opt.value}
