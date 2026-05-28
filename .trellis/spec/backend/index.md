@@ -16,6 +16,9 @@
 | [Windows `\\?\UNC\` verbatim 前缀剥离](./windows-unc-verbatim-prefix-strip.md) | `canonicalize` 返回的 UNC verbatim 前缀 `dunce::simplified` 不剥（只剥盘符），自己写一条 `\\?\UNC\<host>\<rest>` → `\\<host>\<rest>` 规则 |
 | [`wsl.exe --cd` 路径语义](./wsl-exe-cd-path-semantics.md) | `wsl.exe -d <distro> --cd <path>` 的 path 不接受 `\\wsl$\` UNC，必须先 parse 出 distro 与 Linux 路径再传；distro 名从路径取，不调 `wsl -l -v` |
 | [PTY 子进程环境变量注入契约](./pty-env-vars-injection.md) | `create_pty` 注入项目级 env 的完整契约：注入顺序（内部 env 先 / 用户 envs 后）、`MINITERM_*` 前后端双重保护、WSL 分支跳过注入、前后端 WSL 检测口径必须对齐 |
+| [toml_edit 处理 array-of-tables](./toml-edit-array-of-tables.md) | 编辑 TOML `[[xxx]]` 数组表的标准模式，保留用户注释和顺序；包含类型推断歧义 / `ArrayOfTables` 无 `Index<usize>` 等坑的 Wrong vs Correct |
+| [mini-term × cc-connect 集成约定](./cc-connect-integration.md) | Management API :9820 接入面、token 从 `~/.cc-connect/config.toml` 读、创建新项目必经 toml_edit + `POST /api/v1/restart`（`/reload` 不生效）、dashboard iframe URL + race-safe broken 标记 |
+| [Tauri command nested struct 参数 invoke 约定](./tauri-command-nested-args.md) | 后端 command 含 struct 参数时前端 invoke 必须 wrap `{ req: {...} }` 而非散开；含 `#[serde(rename_all = "camelCase")]` 后跨边界字段名严格 1:1 对齐 |
 
 ---
 
