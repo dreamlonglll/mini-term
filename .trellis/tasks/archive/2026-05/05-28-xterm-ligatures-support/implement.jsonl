@@ -1,0 +1,7 @@
+{"file": ".trellis/spec/frontend/index.md", "reason": "前端整体规范索引"}
+{"file": ".trellis/spec/frontend/component-guidelines.md", "reason": "SettingsModal/TerminalInstance 组件规范"}
+{"file": ".trellis/spec/frontend/hook-guidelines.md", "reason": "useEffect 依赖/时序约束"}
+{"file": ".trellis/spec/frontend/state-management.md", "reason": "Zustand store 默认值与 setConfig"}
+{"file": ".trellis/spec/frontend/type-safety.md", "reason": "AppConfig camelCase 与 Rust 端对齐"}
+{"file": ".trellis/spec/backend/index.md", "reason": "config.rs serde 字段新增规范"}
+{"file": ".trellis/tasks/05-28-xterm-ligatures-support/research/xterm-ligatures.md", "reason": "WebGL+LigaturesAddon 共存顺序与平台差异决策依据"}

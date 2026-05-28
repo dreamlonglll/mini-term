@@ -1,0 +1,8 @@
+{"file": ".trellis/spec/frontend/index.md", "reason": "前端整体规范索引"}
+{"file": ".trellis/spec/frontend/component-guidelines.md", "reason": "SettingsModal/TerminalInstance 组件规范"}
+{"file": ".trellis/spec/frontend/hook-guidelines.md", "reason": "新增 useEffect 监听 terminalLigatures/terminalFontFamily 的依赖与时序约束"}
+{"file": ".trellis/spec/frontend/quality-guidelines.md", "reason": "前端质量基线"}
+{"file": ".trellis/spec/frontend/state-management.md", "reason": "Zustand store 默认值新增 + setConfig 流程"}
+{"file": ".trellis/spec/frontend/type-safety.md", "reason": "AppConfig 接口新增 terminalLigatures 字段需与 Rust 端 camelCase 对齐"}
+{"file": ".trellis/spec/backend/index.md", "reason": "后端 config.rs 新增 terminal_ligatures bool 字段 + serde 兼容旧 config 的规范"}
+{"file": ".trellis/tasks/05-28-xterm-ligatures-support/research/xterm-ligatures.md", "reason": "决策依据:WebGL+LigaturesAddon 共存顺序、平台差异、上游 #5455 工作绕过"}
