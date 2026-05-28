@@ -16,6 +16,7 @@ import { SshModal } from './components/SshModal';
 import { SearchModal } from './components/SearchModal';
 import { ToastContainer } from './components/ToastContainer';
 import { CcConnectStatusDot } from './components/CcConnectStatusDot';
+import { CcConnectDashboard } from './components/CcConnectDashboard';
 import { useTauriEvent } from './hooks/useTauriEvent';
 import { useAiSubmitMarker } from './hooks/useAiSubmitMarker';
 import { useMarkerHotkeys } from './hooks/useMarkerHotkeys';
@@ -33,6 +34,9 @@ export function App() {
   const [configOpen, setConfigOpen] = useState(false);
   const [configPage, setConfigPage] = useState<SettingsPage | undefined>(undefined);
   const [sshOpen, setSshOpen] = useState(false);
+  const [ccDashboardOpen, setCcDashboardOpen] = useState(false);
+  const ccConnectStatus = useAppStore((s) => s.ccConnectStatus);
+  const ccRunning = ccConnectStatus?.running ?? false;
   const [currentVersion, setCurrentVersion] = useState('');
   const [updateInfo, setUpdateInfo] = useState<ReleaseInfo | null>(null);
   const [mountedProjectIds, setMountedProjectIds] = useState<string[]>([]);
@@ -304,7 +308,24 @@ export function App() {
         <div className="w-px h-3.5 bg-[var(--border-default)]" />
         <CcConnectStatusDot
           onOpenSettings={() => { setConfigPage('cc-connect'); setConfigOpen(true); }}
+          onOpenDashboard={() => setCcDashboardOpen(true)}
         />
+        {config.ccConnect && (
+          <span
+            data-no-drag
+            className={`text-[10px] transition-colors duration-150 ${
+              ccRunning
+                ? 'text-[var(--text-muted)] hover:text-[var(--accent)] cursor-pointer'
+                : 'text-[var(--text-muted)]/50 cursor-not-allowed'
+            }`}
+            onClick={() => {
+              if (ccRunning) setCcDashboardOpen(true);
+            }}
+            title={ccRunning ? '打开 cc-connect Dashboard' : '需要先启动 cc-connect'}
+          >
+            Dashboard
+          </span>
+        )}
         <div className="flex-1" />
       </div>
 
@@ -369,6 +390,7 @@ export function App() {
       <SettingsModal open={configOpen} onClose={() => setConfigOpen(false)} initialPage={configPage} />
       <SshModal open={sshOpen} onClose={() => setSshOpen(false)} />
       <SearchModal open={searchModalOpen} onClose={() => setSearchModalOpen(false)} />
+      <CcConnectDashboard open={ccDashboardOpen} onClose={() => setCcDashboardOpen(false)} />
       <ToastContainer />
     </div>
   );
