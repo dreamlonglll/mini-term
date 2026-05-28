@@ -309,3 +309,39 @@ SessionEnd 事件清除 hook 状态回退 idle；process_monitor 增加 ai-idle 
 ### Next Steps
 
 - None - task complete
+
+
+## Session 10: mini-term × cc-connect 集成 (PR1+PR2+PR3+spec)
+
+**Date**: 2026-05-28
+**Task**: mini-term × cc-connect 集成 (PR1+PR2+PR3+spec)
+**Branch**: `feat/cc-connect-panel`
+
+### Summary
+
+完成 mini-term 与 cc-connect 端到端集成三件套:进程启停管理 + 项目导入与关联 + dashboard iframe 嵌入。PR1 基建层新增 src-tauri/src/cc_connect.rs 含 8 个 Tauri command (probe/read_token/start/stop/restart/list_projects/import_project/unlink_project),走 ureq 调本机 Management API :9820,import 用 toml_edit 写回 [[projects]] 保留注释 + POST /api/v1/restart (cc-connect 无 reload 路径让新项目生效),AppConfig 扩 ccConnect?: CcConnectConfig 字段,5 个单元测试 round-trip;PR2 UI 入口 SettingsModal 加 cc-connect 栏 (4 字段 + 5 按钮 + 状态指示器) + App.tsx 标题栏 CcConnectStatusDot 三态 + autoStart 钩 mount + useCcConnectProbe 5s 轮询失焦暂停;PR3 ProjectList 右键 4 项 (导入/解除/配置平台/清理失效关联) + 项目 icon 绿◆/红⚠ race-safe 关联状态 + CcConnectDashboard 全屏 iframe createPortal 到 document.body 绕 Fluent 2 backdrop-filter containing block + keep-alive display:none 避免重 login;沉淀 4 项 spec (toml-edit-array-of-tables / cc-connect-integration / tauri-command-nested-args / fluent2-portal-modal)。check sub-agent 抓出并修复 race 误报红 + URL 未编码 + probe useEffect 反复 fire 三个真 bug。
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `18e7e9d` | (see git log) |
+| `d10ce72` | (see git log) |
+| `0bc7be0` | (see git log) |
+| `4a308c6` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

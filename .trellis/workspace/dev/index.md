@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 9
+- **Total Sessions**: 10
 - **Last Active**: 2026-05-28
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~311 | Active |
+| `journal-1.md` | ~347 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 10 | 2026-05-28 | mini-term × cc-connect 集成 (PR1+PR2+PR3+spec) | `18e7e9d`, `d10ce72`, `0bc7be0`, `4a308c6` | `feat/cc-connect-panel` |
 | 9 | 2026-05-28 | 修复 xterm.js WebGL 共享 atlas 致多 claude 终端同时乱码 | `9bb05e4` | `main` |
 | 8 | 2026-05-28 | xterm 终端连体字 (ligatures) 支持 | `0b31a35` | `main` |
 | 7 | 2026-05-26 | fix Windows 深色模式标题栏 (issue #33) | `5fc8ccb` | `main` |
