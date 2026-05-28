@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
+import { createPortal } from 'react-dom';
 import { invoke, convertFileSrc } from '@tauri-apps/api/core';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -84,7 +85,7 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
 
   const fileName = filePath.replace(/\\/g, '/').split('/').pop() ?? filePath;
 
-  return (
+  return createPortal(
     <div className="fixed inset-0 z-50 flex items-center justify-center select-text" onClick={onClose}>
       <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
       <div
@@ -214,6 +215,7 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
           )}
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }

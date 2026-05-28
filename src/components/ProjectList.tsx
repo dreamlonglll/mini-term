@@ -1,4 +1,5 @@
 import { useCallback, useState, useRef, useEffect } from 'react';
+import { createPortal } from 'react-dom';
 import { Allotment } from 'allotment';
 import { open } from '@tauri-apps/plugin-dialog';
 import { invoke } from '@tauri-apps/api/core';
@@ -601,8 +602,8 @@ export function ProjectList() {
       {/* 环境变量弹窗 */}
       <ProjectEnvVarsModal project={envVarsTarget} onClose={() => setEnvVarsTarget(null)} />
 
-      {/* 删除确认弹窗 */}
-      {confirmTarget && (
+      {/* 删除确认弹窗 — portal 到 body,避免 fluent2 [data-panel] 的 backdrop-filter 形成 containing block 把 fixed 拽进面板 */}
+      {confirmTarget && createPortal(
         <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={() => setConfirmTarget(null)}>
           <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
           <div
@@ -628,7 +629,8 @@ export function ProjectList() {
               </button>
             </div>
           </div>
-        </div>
+        </div>,
+        document.body,
       )}
     </div>
   );

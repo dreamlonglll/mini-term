@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo, useCallback } from 'react';
+import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '../store';
 import { showAlert } from '../utils/prompt';
@@ -138,7 +139,7 @@ export function SshAssocModal({ project, onClose }: Props) {
   }
   const hasNamedGroup = groups.some((g) => g.group);
 
-  return (
+  return createPortal(
     <div className="fixed inset-0 z-50 flex items-start justify-center pt-[10vh]">
       <div
         className="absolute inset-0 bg-black/50 backdrop-blur-sm"
@@ -247,6 +248,7 @@ export function SshAssocModal({ project, onClose }: Props) {
           </button>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }

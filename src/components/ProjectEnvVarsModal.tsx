@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '../store';
 import { showAlert } from '../utils/prompt';
@@ -183,7 +184,7 @@ export function ProjectEnvVarsModal({ project, onClose }: Props) {
   if (!project) return null;
   const isWsl = isWslPath(project.path);
 
-  return (
+  return createPortal(
     <div className="fixed inset-0 z-50 flex items-start justify-center pt-[10vh]">
       {/* 遮罩:不响应点击,防误触关闭 */}
       <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
@@ -307,6 +308,7 @@ export function ProjectEnvVarsModal({ project, onClose }: Props) {
           </button>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }

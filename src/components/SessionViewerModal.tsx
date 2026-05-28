@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -149,7 +150,7 @@ export function SessionViewerModal({ open, onClose, session, projectPath }: Prop
   const isMatch = (i: number) => q && matchIndices.includes(i);
   const isCurrentMatch = (i: number) => q && matchIndices[matchIdx] === i;
 
-  return (
+  return createPortal(
     <div className="fixed inset-0 z-50 flex items-center justify-center select-text" onClick={onClose}>
       <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
       <div
@@ -272,6 +273,7 @@ export function SessionViewerModal({ open, onClose, session, projectPath }: Prop
           ))}
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }

@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
+import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { InlineView, SideBySideView } from './DiffModal';
 import { useAppStore } from '../store';
@@ -86,7 +87,7 @@ export function CommitDiffModal({
 
   const shortHash = commitHash.slice(0, 7);
 
-  return (
+  return createPortal(
     <div className="fixed inset-0 z-50 flex items-center justify-center select-text" onClick={onClose}>
       <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
       <div
@@ -205,6 +206,7 @@ export function CommitDiffModal({
           </div>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }

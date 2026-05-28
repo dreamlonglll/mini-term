@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { Allotment } from 'allotment';
 import { useAppStore } from '../store';
@@ -186,7 +187,7 @@ export function DiffModal({ open, onClose, projectPath, status, staged }: DiffMo
 
   const fileName = status.path.split('/').pop() ?? status.path;
 
-  return (
+  return createPortal(
     <div className="fixed inset-0 z-50 flex items-center justify-center select-text" onClick={onClose}>
       <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
       <div
@@ -266,6 +267,7 @@ export function DiffModal({ open, onClose, projectPath, status, staged }: DiffMo
           )}
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
