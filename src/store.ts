@@ -16,6 +16,7 @@ import type {
   AiCompletionNotification,
   AiMarker,
   AiUserSubmitPayload,
+  CcConnectStatus,
 } from './types';
 import { restoreSavedProjectLayout } from './utils/layoutRestore';
 import { playNotificationSound } from './utils/notificationSound';
@@ -341,6 +342,10 @@ interface AppStore {
   // 搜索弹窗
   searchModalOpen: boolean;
   setSearchModalOpen: (open: boolean) => void;
+
+  // cc-connect 状态(顶部状态点 + 设置页共享,由 App.tsx 拉起 5s 轮询)
+  ccConnectStatus: CcConnectStatus | null;
+  setCcConnectStatus: (status: CcConnectStatus | null) => void;
 }
 
 export const useAppStore = create<AppStore>((set, get) => ({
@@ -378,6 +383,9 @@ export const useAppStore = create<AppStore>((set, get) => ({
   markersByPty: new Map(),
   searchModalOpen: false,
   setSearchModalOpen: (open) => set({ searchModalOpen: open }),
+
+  ccConnectStatus: null,
+  setCcConnectStatus: (status) => set({ ccConnectStatus: status }),
 
   setActiveProject: (id) =>
     set((state) => {

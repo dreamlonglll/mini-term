@@ -62,6 +62,32 @@ export interface CcConnectConfig {
   projectLinks: Record<string, string>;
 }
 
+/** cc_connect_probe 返回值。字段命名对齐后端 #[serde(rename_all = "camelCase")]. */
+export interface CcConnectStatus {
+  running: boolean;
+  port: number;
+  version?: string;
+  /** mini-term 自己 spawn 的 cc-connect PID,用户手动启动时为 undefined */
+  ownPid?: number;
+  /** 探活失败时的友好诊断信息(token 缺失 / 端口不通 / 配置文件不存在等) */
+  diagnostic?: string;
+}
+
+/** cc_connect_list_projects 返回的单条项目记录。 */
+export interface CcProject {
+  name: string;
+  workDir?: string;
+  agentType?: string;
+  hasPlatform: boolean;
+}
+
+/** cc_connect_import_project 的请求载荷。 */
+export interface ImportProjectRequest {
+  name: string;
+  workDir: string;
+  agentType?: string;
+}
+
 export interface ProjectConfig {
   id: string;
   name: string;

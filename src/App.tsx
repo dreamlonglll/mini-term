@@ -11,24 +11,27 @@ import { ProjectList } from './components/ProjectList';
 import { FileTree } from './components/FileTree';
 import { GitHistory } from './components/GitHistory';
 import { ActivityBar } from './components/ActivityBar';
-import { SettingsModal } from './components/SettingsModal';
+import { SettingsModal, type SettingsPage } from './components/SettingsModal';
 import { SshModal } from './components/SshModal';
 import { SearchModal } from './components/SearchModal';
 import { ToastContainer } from './components/ToastContainer';
+import { CcConnectStatusDot } from './components/CcConnectStatusDot';
 import { useTauriEvent } from './hooks/useTauriEvent';
 import { useAiSubmitMarker } from './hooks/useAiSubmitMarker';
 import { useMarkerHotkeys } from './hooks/useMarkerHotkeys';
 import { useExternalFileDrop } from './hooks/useExternalFileDrop';
+import { useCcConnectProbe } from './hooks/useCcConnectProbe';
 import { checkForUpdate, type ReleaseInfo } from './utils/updateChecker';
 import { applyTheme } from './utils/themeManager';
 import { applyUiFontFamily } from './utils/fontManager';
 import { markAiPty, updateAllTerminalThemes } from './utils/terminalCache';
 import { includeActiveProject } from './utils/projectKeepAlive';
-import type { AppConfig, PtyStatusChangePayload, PtyExitPayload, PaneStatus } from './types';
+import type { AppConfig, PtyStatusChangePayload, PtyExitPayload, PaneStatus, CcConnectStatus } from './types';
 
 export function App() {
   const [configLoaded, setConfigLoaded] = useState(false);
   const [configOpen, setConfigOpen] = useState(false);
+  const [configPage, setConfigPage] = useState<SettingsPage | undefined>(undefined);
   const [sshOpen, setSshOpen] = useState(false);
   const [currentVersion, setCurrentVersion] = useState('');
   const [updateInfo, setUpdateInfo] = useState<ReleaseInfo | null>(null);
@@ -88,8 +91,39 @@ export function App() {
         }));
       };
       showWindow();
+
+      // cc-connect autoStart:首次 probe 发现未运行时尝试 spawn(配置过且勾选了 autoStart)
+      const ccCfg = cfg.ccConnect;
+      if (ccCfg?.autoStart && ccCfg.exePath?.trim()) {
+        invoke<CcConnectStatus>('cc_connect_probe', {
+          configPath: ccCfg.configPath || undefined,
+        }).then((status) => {
+          useAppStore.getState().setCcConnectStatus(status);
+          if (!status.running) {
+            return invoke<number>('cc_connect_start', {
+              exePath: ccCfg.exePath,
+              configPath: ccCfg.configPath || undefined,
+              extraArgs: ccCfg.extraArgs ?? [],
+            }).then(() => {
+              // spawn 后等 ~600ms 让 cc-connect 起监听端口再重新 probe
+              setTimeout(() => {
+                invoke<CcConnectStatus>('cc_connect_probe', {
+                  configPath: ccCfg.configPath || undefined,
+                })
+                  .then((s) => useAppStore.getState().setCcConnectStatus(s))
+                  .catch(() => {});
+              }, 600);
+            });
+          }
+        }).catch(() => {
+          // autoStart 失败静默(用户可在设置面板手动启动 + 看错误诊断)
+        });
+      }
     });
   }, []);
+
+  // cc-connect 状态 5s 轮询(失焦时暂停节省 CPU);仅在用户配置过时启动
+  useCcConnectProbe(configLoaded ? config.ccConnect : undefined);
 
   // 阻止浏览器默认的文件拖放行为（防止导航到拖入的文件）
   useEffect(() => {
@@ -264,9 +298,13 @@ export function App() {
         )}
         <div className="w-px h-3.5 bg-[var(--border-default)]" />
         <div className="flex items-center gap-3 text-[var(--text-muted)]" data-no-drag>
-          <span className="cursor-pointer hover:text-[var(--text-primary)] transition-colors duration-150" onClick={() => setConfigOpen(true)}>设置</span>
+          <span className="cursor-pointer hover:text-[var(--text-primary)] transition-colors duration-150" onClick={() => { setConfigPage(undefined); setConfigOpen(true); }}>设置</span>
           <span className="cursor-pointer hover:text-[var(--text-primary)] transition-colors duration-150" onClick={() => setSshOpen(true)}>SSH</span>
         </div>
+        <div className="w-px h-3.5 bg-[var(--border-default)]" />
+        <CcConnectStatusDot
+          onOpenSettings={() => { setConfigPage('cc-connect'); setConfigOpen(true); }}
+        />
         <div className="flex-1" />
       </div>
 
@@ -328,7 +366,7 @@ export function App() {
           </Allotment.Pane>
         </Allotment> : null}
       </div>
-      <SettingsModal open={configOpen} onClose={() => setConfigOpen(false)} />
+      <SettingsModal open={configOpen} onClose={() => setConfigOpen(false)} initialPage={configPage} />
       <SshModal open={sshOpen} onClose={() => setSshOpen(false)} />
       <SearchModal open={searchModalOpen} onClose={() => setSearchModalOpen(false)} />
       <ToastContainer />
