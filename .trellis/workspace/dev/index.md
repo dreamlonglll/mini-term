@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 7
-- **Last Active**: 2026-05-26
+- **Total Sessions**: 8
+- **Last Active**: 2026-05-28
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~245 | Active |
+| `journal-1.md` | ~278 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 8 | 2026-05-28 | xterm 终端连体字 (ligatures) 支持 | `0b31a35` | `main` |
 | 7 | 2026-05-26 | fix Windows 深色模式标题栏 (issue #33) | `5fc8ccb` | `main` |
 | 6 | 2026-05-26 | WSL 项目 envVars 通过 WSLENV 透传 + 升级 v0.4.15 | `53f97fb` | `main` |
 | 5 | 2026-05-26 | 项目级环境变量功能 | `20c979c`, `c52104b` | `main` |
