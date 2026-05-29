@@ -345,3 +345,36 @@ SessionEnd 事件清除 hook 状态回退 idle；process_monitor 增加 ai-idle 
 ### Next Steps
 
 - None - task complete
+
+
+## Session 11: cc-connect-panel review 3 Critical + Major #7 修复
+
+**Date**: 2026-05-29
+**Task**: cc-connect-panel review 3 Critical + Major #7 修复
+**Branch**: `feat/cc-connect-panel`
+
+### Summary
+
+code review feat/cc-connect-panel 分支后修复 4 个 ship 必须修的问题:Critical #1 CcConnectDashboard 双挂载 → store 加 dashboard slice + App.tsx 单例挂载 + ProjectList 删 local state;Critical #2 cc-connect restart 后 iframe 不刷新 → lastSeenRunning/lastSeenOwnPid ref 边缘检测,running false→true 或 ownPid 变化时强制 rebuild,true→false 保留 url 避免临时掉线白屏;Critical #3 restart fallback exe_path 缺失导致 child 已杀但未 spawn 的半同步态 → exe_path 校验前置到 take child 之前;Major #7 import_project/unlink_project 半同步态 → 返回值改 ImportProjectResult/UnlinkProjectResult struct,toml/DELETE 成功后 restart 失败编码到 result 不返 Err,前端仍写/清 projectLinks + 警告 toast 消除项目存在但未关联或项目已删 icon 仍红场景。spec cc-connect-integration.md Validation Matrix 同步契约。cargo test 154 / cargo check / tsc / vite build 全 clean。
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `6bacb19` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
