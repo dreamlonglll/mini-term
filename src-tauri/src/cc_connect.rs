@@ -256,6 +256,14 @@ pub fn cc_connect_read_token(config_path: Option<String>) -> Result<String, Stri
     Ok(token)
 }
 
+/// 解析 config.toml 的绝对路径(未传 config_path 时落到默认 ~/.cc-connect/config.toml)。
+/// 供前端"编辑配置文件"在用户未填写路径时打开默认配置。
+#[tauri::command]
+pub fn cc_connect_config_path(config_path: Option<String>) -> Result<String, String> {
+    let path = resolve_config_path(config_path.as_deref())?;
+    Ok(path.to_string_lossy().to_string())
+}
+
 #[tauri::command]
 pub fn cc_connect_start(
     state: tauri::State<'_, CcConnectManager>,

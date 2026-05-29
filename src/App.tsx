@@ -15,7 +15,7 @@ import { SettingsModal, type SettingsPage } from './components/SettingsModal';
 import { SshModal } from './components/SshModal';
 import { SearchModal } from './components/SearchModal';
 import { ToastContainer } from './components/ToastContainer';
-import { CcConnectStatusDot } from './components/CcConnectStatusDot';
+import { CcConnectModal } from './components/CcConnectModal';
 import { CcConnectDashboard } from './components/CcConnectDashboard';
 import { useTauriEvent } from './hooks/useTauriEvent';
 import { useAiSubmitMarker } from './hooks/useAiSubmitMarker';
@@ -27,18 +27,25 @@ import { applyTheme } from './utils/themeManager';
 import { applyUiFontFamily } from './utils/fontManager';
 import { markAiPty, updateAllTerminalThemes } from './utils/terminalCache';
 import { includeActiveProject } from './utils/projectKeepAlive';
-import type { AppConfig, PtyStatusChangePayload, PtyExitPayload, PaneStatus, CcConnectStatus } from './types';
+import type { AppConfig, PtyStatusChangePayload, PtyExitPayload, PaneStatus, CcConnectStatus, CcConnectConfig } from './types';
+
+/** cc-connect 未保存配置时,「连接」弹窗 / Dashboard 打开期间仍以默认路径探活的占位配置。 */
+const EMPTY_CC_CONFIG: CcConnectConfig = {
+  exePath: '',
+  configPath: '',
+  autoStart: false,
+  extraArgs: [],
+  projectLinks: {},
+};
 
 export function App() {
   const [configLoaded, setConfigLoaded] = useState(false);
   const [configOpen, setConfigOpen] = useState(false);
   const [configPage, setConfigPage] = useState<SettingsPage | undefined>(undefined);
   const [sshOpen, setSshOpen] = useState(false);
-  const ccConnectStatus = useAppStore((s) => s.ccConnectStatus);
-  const ccRunning = ccConnectStatus?.running ?? false;
+  const [ccConnectOpen, setCcConnectOpen] = useState(false);
   const ccDashboardOpen = useAppStore((s) => s.ccDashboardOpen);
   const ccDashboardDeepLink = useAppStore((s) => s.ccDashboardDeepLink);
-  const openCcDashboard = useAppStore((s) => s.openCcDashboard);
   const closeCcDashboard = useAppStore((s) => s.closeCcDashboard);
   const [currentVersion, setCurrentVersion] = useState('');
   const [updateInfo, setUpdateInfo] = useState<ReleaseInfo | null>(null);
@@ -99,16 +106,18 @@ export function App() {
       };
       showWindow();
 
-      // cc-connect autoStart:首次 probe 发现未运行时尝试 spawn(配置过且勾选了 autoStart)
+      // cc-connect autoStart:首次 probe 发现未运行时尝试 spawn(勾选了 autoStart 即可,
+      // 未填写可执行文件时回退 PATH 中的 cc-connect)
       const ccCfg = cfg.ccConnect;
-      if (ccCfg?.autoStart && ccCfg.exePath?.trim()) {
+      if (ccCfg?.autoStart) {
+        const autoExe = ccCfg.exePath?.trim() || 'cc-connect';
         invoke<CcConnectStatus>('cc_connect_probe', {
           configPath: ccCfg.configPath || undefined,
         }).then((status) => {
           useAppStore.getState().setCcConnectStatus(status);
           if (!status.running) {
             return invoke<number>('cc_connect_start', {
-              exePath: ccCfg.exePath,
+              exePath: autoExe,
               configPath: ccCfg.configPath || undefined,
               extraArgs: ccCfg.extraArgs ?? [],
             }).then(() => {
@@ -129,8 +138,10 @@ export function App() {
     });
   }, []);
 
-  // cc-connect 状态 5s 轮询(失焦时暂停节省 CPU);仅在用户配置过时启动
-  useCcConnectProbe(configLoaded ? config.ccConnect : undefined);
+  // cc-connect 状态 5s 轮询(失焦时暂停节省 CPU)。配置过时常驻;
+  // 未配置但「连接」弹窗或 Dashboard 打开时,以默认路径临时探活,支撑零配置使用。
+  const ccProbeConfig = config.ccConnect ?? ((ccConnectOpen || ccDashboardOpen) ? EMPTY_CC_CONFIG : undefined);
+  useCcConnectProbe(configLoaded ? ccProbeConfig : undefined);
 
   // 阻止浏览器默认的文件拖放行为（防止导航到拖入的文件）
   useEffect(() => {
@@ -307,28 +318,8 @@ export function App() {
         <div className="flex items-center gap-3 text-[var(--text-muted)]" data-no-drag>
           <span className="cursor-pointer hover:text-[var(--text-primary)] transition-colors duration-150" onClick={() => { setConfigPage(undefined); setConfigOpen(true); }}>设置</span>
           <span className="cursor-pointer hover:text-[var(--text-primary)] transition-colors duration-150" onClick={() => setSshOpen(true)}>SSH</span>
+          <span className="cursor-pointer hover:text-[var(--text-primary)] transition-colors duration-150" onClick={() => setCcConnectOpen(true)}>连接</span>
         </div>
-        <div className="w-px h-3.5 bg-[var(--border-default)]" />
-        <CcConnectStatusDot
-          onOpenSettings={() => { setConfigPage('cc-connect'); setConfigOpen(true); }}
-          onOpenDashboard={() => openCcDashboard()}
-        />
-        {config.ccConnect && (
-          <span
-            data-no-drag
-            className={`text-[10px] transition-colors duration-150 ${
-              ccRunning
-                ? 'text-[var(--text-muted)] hover:text-[var(--accent)] cursor-pointer'
-                : 'text-[var(--text-muted)]/50 cursor-not-allowed'
-            }`}
-            onClick={() => {
-              if (ccRunning) openCcDashboard();
-            }}
-            title={ccRunning ? '打开 cc-connect Dashboard' : '需要先启动 cc-connect'}
-          >
-            Dashboard
-          </span>
-        )}
         <div className="flex-1" />
       </div>
 
@@ -392,6 +383,7 @@ export function App() {
       </div>
       <SettingsModal open={configOpen} onClose={() => setConfigOpen(false)} initialPage={configPage} />
       <SshModal open={sshOpen} onClose={() => setSshOpen(false)} />
+      <CcConnectModal open={ccConnectOpen} onClose={() => setCcConnectOpen(false)} />
       <SearchModal open={searchModalOpen} onClose={() => setSearchModalOpen(false)} />
       <CcConnectDashboard
         open={ccDashboardOpen}

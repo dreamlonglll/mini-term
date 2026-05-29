@@ -133,6 +133,7 @@ pub fn run() {
             window_theme::set_window_dark_mode,
             cc_connect::cc_connect_probe,
             cc_connect::cc_connect_read_token,
+            cc_connect::cc_connect_config_path,
             cc_connect::cc_connect_start,
             cc_connect::cc_connect_stop,
             cc_connect::cc_connect_restart,
