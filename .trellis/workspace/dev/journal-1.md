@@ -378,3 +378,36 @@ code review feat/cc-connect-panel 分支后修复 4 个 ship 必须修的问题:
 ### Next Steps
 
 - None - task complete
+
+
+## Session 12: README + Cargo.toml 文档同步 cc-connect 集成
+
+**Date**: 2026-05-29
+**Task**: README + Cargo.toml 文档同步 cc-connect 集成
+**Branch**: `feat/cc-connect-panel`
+
+### Summary
+
+feat/cc-connect-panel 分支文档收尾:README 顶部 slogan 加 '· IM 平台远程驱动 (cc-connect)' 亮点,功能特性新增 '### cc-connect 集成' 分组放在 AI 进程感知后/项目管理前,涵盖进程管理(启停/测试连接/autoStart/状态点三态) / 项目导入与关联(toml_edit 写盘+restart+hash 冲突后缀+race-safe icon) / Dashboard 嵌入(iframe 自动登录+createPortal 绕 Fluent 2+keep-alive) / 半同步态处理(tomlWritten 与 deletedOk 分支) / 优雅降级 五大子项。src-tauri/Cargo.toml description 从占位符 'A Tauri App' 改成 mini-term 真实描述,对齐 mt-core/Cargo.toml 既有风格。本会话不归档新 task(本轮无 active task)。
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `16b2248` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

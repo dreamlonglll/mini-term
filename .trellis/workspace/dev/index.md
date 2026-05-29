@@ -8,7 +8,7 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 11
+- **Total Sessions**: 12
 - **Last Active**: 2026-05-29
 <!-- @@@/auto:current-status -->
 
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~380 | Active |
+| `journal-1.md` | ~413 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 12 | 2026-05-29 | README + Cargo.toml 文档同步 cc-connect 集成 | `16b2248` | `feat/cc-connect-panel` |
 | 11 | 2026-05-29 | cc-connect-panel review 3 Critical + Major #7 修复 | `6bacb19` | `feat/cc-connect-panel` |
 | 10 | 2026-05-28 | mini-term × cc-connect 集成 (PR1+PR2+PR3+spec) | `18e7e9d`, `d10ce72`, `0bc7be0`, `4a308c6` | `feat/cc-connect-panel` |
 | 9 | 2026-05-28 | 修复 xterm.js WebGL 共享 atlas 致多 claude 终端同时乱码 | `9bb05e4` | `main` |
