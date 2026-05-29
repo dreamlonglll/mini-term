@@ -78,8 +78,8 @@ cors_origins = ["*"]
 | [management] 段缺失 / token 为空 | 同上,diagnostic 提示跑 `cc-connect web` |
 | HTTP 端口不通 | `probe` 返 `{ running: false, port, diagnostic: "GET ... 失败" }`,前端状态点变灰 |
 | 项目名重复 | `cc_connect_import_project` 检 list + toml 双重防重;冲突加 8 字符 hash 后缀 |
-| restart 失败但 toml 已写 | 返"写入成功但 restart 失败",提示用户手动重启;**不回滚 toml**(用户可重试) |
-| DELETE 成功但 restart 失败 | 同上 |
+| restart 失败但 toml 已写 | **不返 Err**:返 `ImportProjectResult { tomlWritten: true, restartOk: false, restartError: Some(...) }`。前端按 `tomlWritten` 仍写 `projectLinks` + 警告 toast,**避免"项目存在但未关联"半同步态**;**不回滚 toml**(用户可重试或手动重启 cc-connect 生效) |
+| DELETE 成功但 restart 失败 | 同上语义:返 `UnlinkProjectResult { deletedOk: true, restartOk: false, restartError: Some(...) }`,前端按 `deletedOk` 仍清本地 `projectLinks` 摆脱 broken icon |
 | 用户在 cc-connect web 手动删项目 | `useCcConnectProjects` 检测 `missingLinks`,ProjectList icon 标红 ⚠;右键加"清理失效关联"清本地 `projectLinks` |
 | cc-connect 重启期间 list 暂时拉不到 | `useCcConnectProjects` **必须**仅在 `listLoaded` 后才比对,否则全员误报 broken |
 

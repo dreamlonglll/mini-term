@@ -7,7 +7,9 @@ import type {
   CcConnectStatus,
   CcProject,
   ImportProjectRequest,
+  ImportProjectResult,
   ProjectConfig,
+  UnlinkProjectResult,
 } from '../types';
 
 const DEFAULT_CC_CONNECT_CONFIG: CcConnectConfig = {
@@ -101,14 +103,27 @@ export async function importProjectToCcConnect(
       workDir: project.path,
       agentType: 'claudecode',
     };
-    await invoke('cc_connect_import_project', {
+    const result = await invoke<ImportProjectResult>('cc_connect_import_project', {
       req,
       configPath: cc.configPath || undefined,
     });
-    await writeProjectLinks((links) => ({ ...links, [project.id]: uniqueName }));
-    await refreshStatus(cc.configPath);
-    await refreshCcProjects();
-    return true;
+    // 后端契约:tomlWritten 为 true 时(目前只可能为 true,失败直接 Err 出),
+    // 不论 restartOk 都写本地 projectLinks,避免"toml 写了但 link 没写"半同步态。
+    if (result.tomlWritten) {
+      await writeProjectLinks((links) => ({ ...links, [project.id]: result.name }));
+      await refreshStatus(cc.configPath);
+      await refreshCcProjects();
+      if (!result.restartOk) {
+        await showAlert(
+          '导入成功但 cc-connect 重启失败',
+          `项目「${result.name}」已写入 cc-connect 配置;但重启 cc-connect 失败:\n${result.restartError ?? '未知错误'}\n\n下次启动 cc-connect 时新项目会生效。`,
+        );
+      }
+      return true;
+    }
+    // 理论不可达(toml 未写时后端会 Err 出),但保留分支防御
+    await showAlert('导入失败', 'cc-connect 未能写入项目配置');
+    return false;
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
     await showAlert('导入失败', msg);
@@ -146,11 +161,16 @@ export async function unlinkProjectFromCcConnect(
   );
   if (!ok) return false;
 
+  let restartWarning: string | null = null;
   try {
-    await invoke('cc_connect_unlink_project', {
+    const result = await invoke<UnlinkProjectResult>('cc_connect_unlink_project', {
       name: linkedName,
       configPath: cc.configPath || undefined,
     });
+    // 后端契约:deletedOk=true 即返 Ok,restartOk 失败时仅 toast 提示但仍清本地 link。
+    if (!result.restartOk) {
+      restartWarning = result.restartError ?? '未知错误';
+    }
   } catch (e: unknown) {
     // DELETE 失败不阻断本地 link 清理(例如 cc-connect 那边已被手动删了)
     const msg = e instanceof Error ? e.message : String(e);
@@ -168,5 +188,11 @@ export async function unlinkProjectFromCcConnect(
   });
   await refreshStatus(cc.configPath);
   await refreshCcProjects();
+  if (restartWarning) {
+    await showAlert(
+      '解除关联成功但 cc-connect 重启失败',
+      `项目「${linkedName}」已从 cc-connect 删除;但重启 cc-connect 失败:\n${restartWarning}\n\n下次启动 cc-connect 时会生效。`,
+    );
+  }
   return true;
 }

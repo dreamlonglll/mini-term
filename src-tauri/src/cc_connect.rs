@@ -70,6 +70,29 @@ pub struct ImportProjectRequest {
     pub agent_type: Option<String>,
 }
 
+/// 导入项目结果:toml_written 必为 true(否则直接返 Err);restart_ok 可为 false,
+/// 让前端按 tomlWritten / restartOk 分别决策写 projectLinks 与 toast 文案,
+/// 避免"toml 已写但 restart 失败 → 前端不写 projectLinks → 半同步态"。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportProjectResult {
+    pub name: String,
+    pub toml_written: bool,
+    pub restart_ok: bool,
+    pub restart_error: Option<String>,
+}
+
+/// 解除关联结果:类似 ImportProjectResult,deleted_ok 必为 true(否则返 Err);
+/// restart_ok 可为 false,前端仍删本地 projectLinks 摆脱 broken 状态。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnlinkProjectResult {
+    pub name: String,
+    pub deleted_ok: bool,
+    pub restart_ok: bool,
+    pub restart_error: Option<String>,
+}
+
 fn default_config_path() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".cc-connect").join("config.toml"))
 }
@@ -308,7 +331,13 @@ pub fn cc_connect_restart(
     if api_result.is_ok() {
         return Ok(());
     }
-    // 2. fallback: 仅对自己 spawn 的做 kill+respawn
+    let api_err = api_result.unwrap_err();
+    // 2. fallback: 必须先校验 exe_path 再杀 child,
+    //    否则 exe_path = None 时 child 已杀但没法 spawn,state 已清空 → 用户陷入"不是 mini-term 启动"半同步态。
+    let exe = exe_path.ok_or_else(|| format!(
+        "HTTP restart 失败 ({}),且未提供 exe_path 用于 fallback 重启;请在设置里填写 cc-connect 路径后手动重启",
+        api_err,
+    ))?;
     {
         let mut guard = state.child.lock().map_err(|e| e.to_string())?;
         if let Some(mut child) = guard.take() {
@@ -317,11 +346,10 @@ pub fn cc_connect_restart(
         } else {
             return Err(format!(
                 "HTTP restart 失败且 cc-connect 不是由 mini-term 启动 (原因: {})",
-                api_result.unwrap_err()
+                api_err,
             ));
         }
     }
-    let exe = exe_path.ok_or_else(|| "fallback restart 需要 exe_path".to_string())?;
     let _ = cc_connect_start(state, exe, config_path, extra_args)?;
     Ok(())
 }
@@ -373,7 +401,7 @@ pub fn cc_connect_list_projects(config_path: Option<String>) -> Result<Vec<CcPro
 pub fn cc_connect_import_project(
     req: ImportProjectRequest,
     config_path: Option<String>,
-) -> Result<(), String> {
+) -> Result<ImportProjectResult, String> {
     let path = resolve_config_path(config_path.as_deref())?;
     let (token, port) = read_token_port(&path)?;
     let mut doc = read_doc(&path)?;
@@ -413,25 +441,44 @@ pub fn cc_connect_import_project(
     std::fs::write(&path, doc.to_string())
         .map_err(|e| format!("写回 {} 失败: {}", path.display(), e))?;
 
+    // toml 已写盘 → 无论 restart 成败都返 Ok(ImportProjectResult { toml_written: true, ... }),
+    // 让前端按 restartOk 分支决策:成功 → 写 projectLinks + 成功 toast;
+    // 失败 → 仍写 projectLinks(避免半同步态)+ 警告 toast 提示用户重启 cc-connect 生效。
     let url = build_api_url(port, "/api/v1/restart");
-    http_post_json(&url, &token, &serde_json::json!({}))
-        .map_err(|e| format!("写入成功但 restart cc-connect 失败,请手动重启 ({})", e))?;
-    Ok(())
+    let (restart_ok, restart_error) = match http_post_json(&url, &token, &serde_json::json!({})) {
+        Ok(_) => (true, None),
+        Err(e) => (false, Some(e)),
+    };
+    Ok(ImportProjectResult {
+        name: req.name,
+        toml_written: true,
+        restart_ok,
+        restart_error,
+    })
 }
 
 #[tauri::command]
 pub fn cc_connect_unlink_project(
     name: String,
     config_path: Option<String>,
-) -> Result<(), String> {
+) -> Result<UnlinkProjectResult, String> {
     let path = resolve_config_path(config_path.as_deref())?;
     let (token, port) = read_token_port(&path)?;
     let del_url = build_api_url(port, &format!("/api/v1/projects/{}", urlencode(&name)));
     http_delete(&del_url, &token)?;
+    // DELETE 已成功 → 同 import 一样,restart 即使失败也返 Ok,
+    // 让前端仍删本地 projectLinks 摆脱 broken 红 icon,只 toast 提示重启 cc-connect。
     let restart_url = build_api_url(port, "/api/v1/restart");
-    http_post_json(&restart_url, &token, &serde_json::json!({}))
-        .map_err(|e| format!("DELETE 成功但 restart cc-connect 失败,请手动重启 ({})", e))?;
-    Ok(())
+    let (restart_ok, restart_error) = match http_post_json(&restart_url, &token, &serde_json::json!({})) {
+        Ok(_) => (true, None),
+        Err(e) => (false, Some(e)),
+    };
+    Ok(UnlinkProjectResult {
+        name,
+        deleted_ok: true,
+        restart_ok,
+        restart_error,
+    })
 }
 
 #[cfg(test)]

@@ -11,7 +11,6 @@ import { DoneTag } from './DoneTag';
 import { SessionList } from './SessionList';
 import { SshAssocModal } from './SshAssocModal';
 import { ProjectEnvVarsModal } from './ProjectEnvVarsModal';
-import { CcConnectDashboard } from './CcConnectDashboard';
 import { showContextMenu } from '../utils/contextMenu';
 import { showPrompt } from '../utils/prompt';
 import { initProjectDrag, isProjectDragging, getProjectDragPayload, onProjectDragEnd } from '../utils/projectDragState';
@@ -59,8 +58,6 @@ export function ProjectList() {
   const [confirmTarget, setConfirmTarget] = useState<{ id: string; name: string } | null>(null);
   const [sshAssocTarget, setSshAssocTarget] = useState<ProjectConfig | null>(null);
   const [envVarsTarget, setEnvVarsTarget] = useState<ProjectConfig | null>(null);
-  const [ccDashboardDeepLink, setCcDashboardDeepLink] = useState<string | undefined>(undefined);
-  const [ccDashboardOpen, setCcDashboardOpen] = useState(false);
   const [dropIndicator, setDropIndicator] = useState<DropIndicator | null>(null);
   const [editingGroupId, setEditingGroupId] = useState<string | null>(null);
   const [editingProjectId, setEditingProjectId] = useState<string | null>(null);
@@ -80,12 +77,12 @@ export function ProjectList() {
   const ccRunning = ccConnectStatus?.running ?? false;
   const { missingLinks, refresh: refreshCcProjects } = useCcConnectProjects();
   const projectLinks = ccConfig?.projectLinks;
+  const openCcDashboard = useAppStore((s) => s.openCcDashboard);
 
   const openCcDashboardForProject = useCallback((linkedName: string | undefined) => {
     // encode 项目名,避免名字含 '/' '?' '#' 等导致 deepLink 解析错位
-    setCcDashboardDeepLink(linkedName ? `/projects/${encodeURIComponent(linkedName)}` : undefined);
-    setCcDashboardOpen(true);
-  }, []);
+    openCcDashboard(linkedName ? `/projects/${encodeURIComponent(linkedName)}` : undefined);
+  }, [openCcDashboard]);
 
   // === 系统文件拖放（从资源管理器拖入文件夹添加项目） ===
   useEffect(() => {
@@ -665,12 +662,6 @@ export function ProjectList() {
       <SshAssocModal project={sshAssocTarget} onClose={() => setSshAssocTarget(null)} />
       {/* 环境变量弹窗 */}
       <ProjectEnvVarsModal project={envVarsTarget} onClose={() => setEnvVarsTarget(null)} />
-      {/* cc-connect Dashboard 弹窗 */}
-      <CcConnectDashboard
-        open={ccDashboardOpen}
-        onClose={() => setCcDashboardOpen(false)}
-        deepLink={ccDashboardDeepLink}
-      />
 
       {/* 删除确认弹窗 — portal 到 body,避免 fluent2 [data-panel] 的 backdrop-filter 形成 containing block 把 fixed 拽进面板 */}
       {confirmTarget && createPortal(

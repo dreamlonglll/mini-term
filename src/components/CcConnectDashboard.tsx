@@ -30,6 +30,10 @@ export function CcConnectDashboard({ open, onClose, deepLink }: Props) {
   const [iframeUrl, setIframeUrl] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const currentDeepLinkRef = useRef<string | undefined>(deepLink);
+  // 边缘检测:cc-connect running false→true 或 ownPid 变化时强制 rebuild iframe,
+  // 避免 cc-connect restart 后 token 仍有效但 session 已失效导致页面空白/登录页。
+  const lastSeenRunningRef = useRef<boolean>(status?.running ?? false);
+  const lastSeenOwnPidRef = useRef<number | undefined>(status?.ownPid);
 
   const buildUrl = useCallback(async (): Promise<string | null> => {
     if (!status?.running) {
@@ -52,7 +56,23 @@ export function CcConnectDashboard({ open, onClose, deepLink }: Props) {
     }
   }, [status?.running, status?.port, ccConfig?.configPath, deepLink]);
 
-  // 首次 open / deepLink 切换 / cc-connect 重启时重建 URL
+  // cc-connect 重启检测:running false→true 边缘 或 ownPid 变化 → 强制 rebuild
+  // (不在依赖里依赖 iframeUrl,避免循环;只看 status 切换)
+  useEffect(() => {
+    const curRunning = status?.running ?? false;
+    const curPid = status?.ownPid;
+    const runningEdgeUp = !lastSeenRunningRef.current && curRunning;
+    const pidChanged = lastSeenOwnPidRef.current !== curPid;
+    lastSeenRunningRef.current = curRunning;
+    lastSeenOwnPidRef.current = curPid;
+    // running false→true 或 ownPid 变化 → 清空 iframeUrl,让下面 effect 在 open 时重建
+    // (running true→false 时保留 iframeUrl,避免空白闪烁)
+    if (runningEdgeUp || pidChanged) {
+      setIframeUrl(null);
+    }
+  }, [status?.running, status?.ownPid]);
+
+  // 首次 open / deepLink 切换 / cc-connect 重启清空后重建 URL
   useEffect(() => {
     if (!open) return;
     // deepLink 切换时强制 reload(同 URL 多次设置 react 不会触发 iframe 重载,这里通过加时间戳确保 navigate)

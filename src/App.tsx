@@ -34,9 +34,12 @@ export function App() {
   const [configOpen, setConfigOpen] = useState(false);
   const [configPage, setConfigPage] = useState<SettingsPage | undefined>(undefined);
   const [sshOpen, setSshOpen] = useState(false);
-  const [ccDashboardOpen, setCcDashboardOpen] = useState(false);
   const ccConnectStatus = useAppStore((s) => s.ccConnectStatus);
   const ccRunning = ccConnectStatus?.running ?? false;
+  const ccDashboardOpen = useAppStore((s) => s.ccDashboardOpen);
+  const ccDashboardDeepLink = useAppStore((s) => s.ccDashboardDeepLink);
+  const openCcDashboard = useAppStore((s) => s.openCcDashboard);
+  const closeCcDashboard = useAppStore((s) => s.closeCcDashboard);
   const [currentVersion, setCurrentVersion] = useState('');
   const [updateInfo, setUpdateInfo] = useState<ReleaseInfo | null>(null);
   const [mountedProjectIds, setMountedProjectIds] = useState<string[]>([]);
@@ -308,7 +311,7 @@ export function App() {
         <div className="w-px h-3.5 bg-[var(--border-default)]" />
         <CcConnectStatusDot
           onOpenSettings={() => { setConfigPage('cc-connect'); setConfigOpen(true); }}
-          onOpenDashboard={() => setCcDashboardOpen(true)}
+          onOpenDashboard={() => openCcDashboard()}
         />
         {config.ccConnect && (
           <span
@@ -319,7 +322,7 @@ export function App() {
                 : 'text-[var(--text-muted)]/50 cursor-not-allowed'
             }`}
             onClick={() => {
-              if (ccRunning) setCcDashboardOpen(true);
+              if (ccRunning) openCcDashboard();
             }}
             title={ccRunning ? '打开 cc-connect Dashboard' : '需要先启动 cc-connect'}
           >
@@ -390,7 +393,11 @@ export function App() {
       <SettingsModal open={configOpen} onClose={() => setConfigOpen(false)} initialPage={configPage} />
       <SshModal open={sshOpen} onClose={() => setSshOpen(false)} />
       <SearchModal open={searchModalOpen} onClose={() => setSearchModalOpen(false)} />
-      <CcConnectDashboard open={ccDashboardOpen} onClose={() => setCcDashboardOpen(false)} />
+      <CcConnectDashboard
+        open={ccDashboardOpen}
+        onClose={closeCcDashboard}
+        deepLink={ccDashboardDeepLink || undefined}
+      />
       <ToastContainer />
     </div>
   );

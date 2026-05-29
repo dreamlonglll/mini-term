@@ -88,6 +88,30 @@ export interface ImportProjectRequest {
   agentType?: string;
 }
 
+/**
+ * cc_connect_import_project 返回值。
+ *
+ * 后端在 toml 已写盘但 cc-connect restart 失败时不再返 Err,而是把 restartOk=false 编码到 result 里,
+ * 让前端按 tomlWritten && !restartOk 仍然写入 projectLinks(避免"项目存在但未关联"半同步态)。
+ */
+export interface ImportProjectResult {
+  name: string;
+  tomlWritten: boolean;
+  restartOk: boolean;
+  restartError?: string;
+}
+
+/**
+ * cc_connect_unlink_project 返回值。语义与 ImportProjectResult 对称:
+ * deletedOk=true 但 restartOk=false 时,前端仍清理本地 projectLinks 摆脱 broken 红 icon。
+ */
+export interface UnlinkProjectResult {
+  name: string;
+  deletedOk: boolean;
+  restartOk: boolean;
+  restartError?: string;
+}
+
 export interface ProjectConfig {
   id: string;
   name: string;
