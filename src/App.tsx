@@ -138,9 +138,11 @@ export function App() {
     });
   }, []);
 
-  // cc-connect 状态 5s 轮询(失焦时暂停节省 CPU)。配置过时常驻;
-  // 未配置但「连接」弹窗或 Dashboard 打开时,以默认路径临时探活,支撑零配置使用。
-  const ccProbeConfig = config.ccConnect ?? ((ccConnectOpen || ccDashboardOpen) ? EMPTY_CC_CONFIG : undefined);
+  // cc-connect 状态 5s 轮询(失焦时暂停节省 CPU)、常驻探活:配置过用保存的 configPath,
+  // 未配置则以默认 ~/.cc-connect/config.toml 探活 —— 这样零配置下也能识别 cc-connect 运行态,
+  // 让项目列表的"导入到 cc-connect"右键菜单在 running 时直接可用。
+  // 无 cc-connect 的用户:探活只是一次快速失败的文件读(不产生 HTTP),UI 也不展示任何状态。
+  const ccProbeConfig = config.ccConnect ?? EMPTY_CC_CONFIG;
   useCcConnectProbe(configLoaded ? ccProbeConfig : undefined);
 
   // 阻止浏览器默认的文件拖放行为（防止导航到拖入的文件）

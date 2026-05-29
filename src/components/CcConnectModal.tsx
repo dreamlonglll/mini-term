@@ -2,6 +2,8 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { useAppStore } from '../store';
+import { useCcConnectProjects } from '../hooks/useCcConnectProjects';
+import { importProjectToCcConnect, importProjectsToCcConnect, unlinkProjectFromCcConnect } from '../utils/ccConnectActions';
 import type { CcConnectConfig, CcConnectStatus } from '../types';
 
 interface Props {
@@ -43,12 +45,18 @@ function CcConnectModalContent({ onClose }: { onClose: () => void }) {
   const setCcConnectStatus = useAppStore((s) => s.setCcConnectStatus);
   const openCcDashboard = useAppStore((s) => s.openCcDashboard);
 
+  // 项目导入:复用与右键菜单相同的 actions;弹窗内 probe 保证 running 实时,
+  // 故这里的导入/解除按钮在 cc-connect 运行时一定可用(不依赖全局轮询状态)。
+  const { missingLinks, refresh: refreshCcProjects } = useCcConnectProjects();
+
   const cc = config.ccConnect ?? DEFAULT_CC_CONNECT_CONFIG;
   const [exePath, setExePath] = useState(cc.exePath);
   const [configPath, setConfigPath] = useState(cc.configPath);
   const [extraArgsInput, setExtraArgsInput] = useState((cc.extraArgs ?? []).join(' '));
   const [resultMsg, setResultMsg] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
   const [busy, setBusy] = useState<null | 'start' | 'stop' | 'restart' | 'test'>(null);
+  // 勾选待批量导入的项目 id(仅未关联项目可勾选)
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     setExePath(cc.exePath);
@@ -214,7 +222,22 @@ function CcConnectModalContent({ onClose }: { onClose: () => void }) {
     }
   }, [configPath]);
 
+  const handleBatchImport = useCallback(async () => {
+    const targets = useAppStore.getState().config.projects.filter(
+      (p) => selectedIds.has(p.id) && useAppStore.getState().config.ccConnect?.projectLinks?.[p.id] === undefined,
+    );
+    if (targets.length === 0) return;
+    const ok = await importProjectsToCcConnect(targets, refreshCcProjects);
+    if (ok) setSelectedIds(new Set());
+  }, [selectedIds, refreshCcProjects]);
+
   const running = ccStatus?.running ?? false;
+
+  // 待导入(未关联)项目 + 勾选交集,select-all 与批量按钮据此计算(避免已关联的残留 id 干扰)
+  const unlinkedProjects = config.projects.filter((p) => config.ccConnect?.projectLinks?.[p.id] === undefined);
+  const selectedUnlinkedCount = unlinkedProjects.filter((p) => selectedIds.has(p.id)).length;
+  const allUnlinkedSelected = unlinkedProjects.length > 0 && selectedUnlinkedCount === unlinkedProjects.length;
+  const someUnlinkedSelected = selectedUnlinkedCount > 0 && !allUnlinkedSelected;
 
   // 状态点颜色
   const indicator = (() => {
@@ -267,6 +290,103 @@ function CcConnectModalContent({ onClose }: { onClose: () => void }) {
             >
               打开 Dashboard
             </button>
+          </div>
+
+          {/* 项目导入:勾选 + 一键导入(批量只重启一次 cc-connect);也可逐行单独导入 */}
+          <div className="space-y-1.5">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-base text-[var(--text-primary)]">导入项目到 cc-connect</span>
+              <div className="flex items-center gap-3">
+                {unlinkedProjects.length > 0 && (
+                  <label className="flex items-center gap-1.5 text-xs text-[var(--text-muted)] cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      className="accent-[var(--accent)]"
+                      checked={allUnlinkedSelected}
+                      ref={(el) => { if (el) el.indeterminate = someUnlinkedSelected; }}
+                      onChange={(e) => {
+                        setSelectedIds(e.target.checked ? new Set(unlinkedProjects.map((p) => p.id)) : new Set());
+                      }}
+                    />
+                    全选
+                  </label>
+                )}
+                <button
+                  className="px-2.5 py-1 text-sm rounded-[var(--radius-sm)] bg-[var(--accent)] text-[var(--bg-base)] hover:opacity-90 transition-opacity disabled:opacity-40 disabled:cursor-not-allowed"
+                  disabled={!running || selectedUnlinkedCount === 0}
+                  title={running ? '导入勾选的项目(只重启一次 cc-connect)' : '需要先启动 cc-connect'}
+                  onClick={() => { void handleBatchImport(); }}
+                >
+                  一键导入{selectedUnlinkedCount > 0 ? ` (${selectedUnlinkedCount})` : ''}
+                </button>
+              </div>
+            </div>
+            {config.projects.length === 0 ? (
+              <div className="text-sm text-[var(--text-muted)] px-3 py-2 rounded-[var(--radius-sm)] bg-[var(--bg-base)] border border-[var(--border-subtle)]">
+                还没有项目,先在左栏添加
+              </div>
+            ) : (
+              <div className="max-h-[180px] overflow-y-auto rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)] divide-y divide-[var(--border-subtle)]">
+                {config.projects.map((p) => {
+                  const linkedName = config.ccConnect?.projectLinks?.[p.id];
+                  const broken = linkedName !== undefined && missingLinks.has(p.id);
+                  return (
+                    <div key={p.id} className="flex items-center gap-2 px-3 py-2">
+                      {linkedName === undefined ? (
+                        <input
+                          type="checkbox"
+                          className="accent-[var(--accent)] flex-shrink-0"
+                          checked={selectedIds.has(p.id)}
+                          onChange={(e) => {
+                            setSelectedIds((prev) => {
+                              const next = new Set(prev);
+                              if (e.target.checked) next.add(p.id); else next.delete(p.id);
+                              return next;
+                            });
+                          }}
+                        />
+                      ) : (
+                        <span className="w-[13px] flex-shrink-0" aria-hidden />
+                      )}
+                      <div className="min-w-0 flex-1">
+                        <div className="text-sm text-[var(--text-primary)] truncate">{p.name}</div>
+                        <div className="text-xs text-[var(--text-muted)] font-mono truncate">{p.path}</div>
+                      </div>
+                      {linkedName === undefined ? (
+                        <button
+                          className="px-2.5 py-1 text-sm rounded-[var(--radius-sm)] bg-[var(--accent)] text-[var(--bg-base)] hover:opacity-90 transition-opacity disabled:opacity-40 disabled:cursor-not-allowed flex-shrink-0"
+                          disabled={!running}
+                          title={running ? '导入到 cc-connect' : '需要先启动 cc-connect'}
+                          onClick={() => { void importProjectToCcConnect(p, refreshCcProjects); }}
+                        >
+                          导入
+                        </button>
+                      ) : broken ? (
+                        <button
+                          className="px-2.5 py-1 text-sm rounded-[var(--radius-sm)] border border-[var(--color-error)]/40 text-[var(--color-error)] hover:bg-[var(--color-error)]/10 transition-colors flex-shrink-0"
+                          title={`关联「${linkedName}」已失效,点击清理`}
+                          onClick={() => { void unlinkProjectFromCcConnect(p, refreshCcProjects); }}
+                        >
+                          失效·清理
+                        </button>
+                      ) : (
+                        <div className="flex items-center gap-2 flex-shrink-0">
+                          <span className="text-xs text-[var(--color-success)]" title={`已关联「${linkedName}」`}>● 已关联</span>
+                          <button
+                            className="px-2 py-1 text-xs rounded-[var(--radius-sm)] border border-[var(--border-default)] text-[var(--text-secondary)] hover:border-[var(--color-error)] hover:text-[var(--color-error)] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                            disabled={!running}
+                            title={running ? '解除关联' : '需要先启动 cc-connect'}
+                            onClick={() => { void unlinkProjectFromCcConnect(p, refreshCcProjects); }}
+                          >
+                            解除
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </div>
 
           {/* 可执行文件路径 */}

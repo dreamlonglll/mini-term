@@ -139,6 +139,7 @@ pub fn run() {
             cc_connect::cc_connect_restart,
             cc_connect::cc_connect_list_projects,
             cc_connect::cc_connect_import_project,
+            cc_connect::cc_connect_import_projects,
             cc_connect::cc_connect_unlink_project,
         ])
         .run(tauri::generate_context!())

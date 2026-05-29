@@ -3,6 +3,7 @@ import { useAppStore } from '../store';
 import { showConfirm, showAlert } from './prompt';
 import type {
   AppConfig,
+  BatchImportResult,
   CcConnectConfig,
   CcConnectStatus,
   CcProject,
@@ -127,6 +128,89 @@ export async function importProjectToCcConnect(
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
     await showAlert('导入失败', msg);
+    return false;
+  }
+}
+
+/**
+ * 批量导入多个 mini-term 项目到 cc-connect（一次写盘 + 仅重启一次 cc-connect）。
+ *
+ * 相比逐个调 importProjectToCcConnect，避免 N 次 restart 多次断开 IM active sessions。
+ * 流程：
+ * 1. 一次 confirm 列出全部待导入项目
+ * 2. list_projects 拉现有项目名，在“现有 + 本批次内部”统一去重（冲突加 8 字符 hash 后缀）
+ * 3. cc_connect_import_projects 批量写 toml + 单次 restart
+ * 4. 一次性写入所有 projectLinks 并 save_config
+ * 5. 刷新 status + cc 项目列表
+ *
+ * 返回 boolean：用户取消或失败返回 false。
+ */
+export async function importProjectsToCcConnect(
+  projects: ProjectConfig[],
+  refreshCcProjects: () => Promise<void>,
+): Promise<boolean> {
+  if (projects.length === 0) return false;
+  const cfg = useAppStore.getState().config;
+  const cc = cfg.ccConnect ?? DEFAULT_CC_CONNECT_CONFIG;
+
+  const MAX_LIST = 15;
+  const names = projects.map((p) => `· ${p.name}`);
+  const listStr =
+    names.length > MAX_LIST
+      ? `${names.slice(0, MAX_LIST).join('\n')}\n…等共 ${projects.length} 个`
+      : names.join('\n');
+  const ok = await showConfirm(
+    '批量导入到 cc-connect',
+    `将向 cc-connect 添加以下 ${projects.length} 个项目并重启一次 cc-connect，可能短暂中断 IM 连接，继续吗？\n\n${listStr}`,
+  );
+  if (!ok) return false;
+
+  try {
+    // 拉现有列表，本批次内部 + 与现有项目统一去重
+    const list = await invoke<CcProject[]>('cc_connect_list_projects', {
+      configPath: cc.configPath || undefined,
+    });
+    const used = new Set(list.map((p) => p.name));
+    const reqs: ImportProjectRequest[] = [];
+    const idToName: Record<string, string> = {};
+    for (const p of projects) {
+      let name = p.name;
+      if (used.has(name)) name = `${p.name}_${shortHashSuffix(p.id)}`;
+      // 极端兜底：加 hash 后仍冲突（几乎不可能），继续追加直到唯一
+      while (used.has(name)) name = `${name}_x`;
+      used.add(name);
+      idToName[p.id] = name;
+      reqs.push({ name, workDir: p.path, agentType: 'claudecode' });
+    }
+
+    const result = await invoke<BatchImportResult>('cc_connect_import_projects', {
+      reqs,
+      configPath: cc.configPath || undefined,
+    });
+
+    if (result.tomlWritten) {
+      // 一次写入所有 projectLinks（避免多次 save_config）
+      await writeProjectLinks((links) => {
+        const next = { ...links };
+        for (const p of projects) next[p.id] = idToName[p.id];
+        return next;
+      });
+      await refreshStatus(cc.configPath);
+      await refreshCcProjects();
+      if (!result.restartOk) {
+        await showAlert(
+          '批量导入成功但 cc-connect 重启失败',
+          `${result.imported.length} 个项目已写入 cc-connect 配置；但重启 cc-connect 失败：\n${result.restartError ?? '未知错误'}\n\n下次启动 cc-connect 时新项目会生效。`,
+        );
+      }
+      return true;
+    }
+    // tomlWritten=false：选中项目在 cc-connect 中均已存在（前端去重后理论不可达）
+    await showAlert('无需导入', '选中的项目在 cc-connect 中均已存在');
+    return false;
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    await showAlert('批量导入失败', msg);
     return false;
   }
 }

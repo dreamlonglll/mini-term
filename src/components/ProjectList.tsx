@@ -407,8 +407,9 @@ export function ProjectList() {
               onClick: () => setEnvVarsTarget(project),
             },
           ];
-          // cc-connect 集成菜单(仅当用户配置过 ccConnect 时显示;未启动时灰显)
-          if (ccConfig) {
+          // cc-connect 集成菜单:配置过 或 探测到正在运行(零配置)时显示;import 项未运行时灰显。
+          // 首次导入会落盘 ccConnect.projectLinks → 之后 ccConfig 即为真,菜单常驻。
+          if (ccConfig || ccRunning) {
             menuItems.push({ separator: true });
             if (linkedName) {
               menuItems.push({

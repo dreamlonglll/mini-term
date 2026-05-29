@@ -419,6 +419,10 @@ body.project-dragging {
   color: var(--text-secondary);
   margin-bottom: 16px;
   line-height: 1.5;
+  /* 保留消息中的换行(确认框普遍用 \n 排版,如批量导入的项目清单);超长时滚动而非撑破视口 */
+  white-space: pre-wrap;
+  max-height: 50vh;
+  overflow-y: auto;
 }
 
 .prompt-input {

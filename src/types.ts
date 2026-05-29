@@ -112,6 +112,15 @@ export interface UnlinkProjectResult {
   restartError?: string;
 }
 
+/** cc_connect_import_projects(批量导入)返回值:一次写盘 + 仅重启一次。 */
+export interface BatchImportResult {
+  imported: string[];
+  skipped: string[];
+  tomlWritten: boolean;
+  restartOk: boolean;
+  restartError?: string;
+}
+
 export interface ProjectConfig {
   id: string;
   name: string;

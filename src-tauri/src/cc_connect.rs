@@ -12,6 +12,7 @@
 //! - mini-term 关闭不联动 kill cc-connect(IM 持续可用) → 不在 Drop 里 kill
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -89,6 +90,18 @@ pub struct ImportProjectResult {
 pub struct UnlinkProjectResult {
     pub name: String,
     pub deleted_ok: bool,
+    pub restart_ok: bool,
+    pub restart_error: Option<String>,
+}
+
+/// 批量导入结果:一次写盘 + 仅重启一次。imported/skipped 按 req 顺序分类,
+/// 前端用自己持有的 projectId→name 映射写 projectLinks(不依赖此返回顺序)。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchImportResult {
+    pub imported: Vec<String>,
+    pub skipped: Vec<String>,
+    pub toml_written: bool,
     pub restart_ok: bool,
     pub restart_error: Option<String>,
 }
@@ -194,6 +207,19 @@ fn urlencode(s: &str) -> String {
             }
         })
         .collect()
+}
+
+/// 构造一个 [[projects]] 表(name + agent.type + agent.options.work_dir),单/批量导入共用。
+fn make_project_table(name: &str, work_dir: &str, agent_type: &str) -> Table {
+    let mut new_proj = Table::new();
+    new_proj["name"] = value(name);
+    let mut agent = Table::new();
+    agent["type"] = value(agent_type);
+    let mut options = Table::new();
+    options["work_dir"] = value(work_dir);
+    agent["options"] = Item::Table(options);
+    new_proj["agent"] = Item::Table(agent);
+    new_proj
 }
 
 // ====================== Tauri Commands ======================
@@ -431,20 +457,7 @@ pub fn cc_connect_import_project(
     }
 
     let agent_type = req.agent_type.unwrap_or_else(|| DEFAULT_AGENT_TYPE.to_string());
-
-    let mut new_proj = Table::new();
-    new_proj["name"] = value(req.name.clone());
-
-    let mut agent = Table::new();
-    agent["type"] = value(agent_type);
-
-    let mut options = Table::new();
-    options["work_dir"] = value(req.work_dir.clone());
-    agent["options"] = Item::Table(options);
-
-    new_proj["agent"] = Item::Table(agent);
-
-    projects.push(new_proj);
+    projects.push(make_project_table(&req.name, &req.work_dir, &agent_type));
 
     std::fs::write(&path, doc.to_string())
         .map_err(|e| format!("写回 {} 失败: {}", path.display(), e))?;
@@ -459,6 +472,74 @@ pub fn cc_connect_import_project(
     };
     Ok(ImportProjectResult {
         name: req.name,
+        toml_written: true,
+        restart_ok,
+        restart_error,
+    })
+}
+
+/// 批量导入多个项目:一次性把所有新 [[projects]] 写入 config.toml,然后只 POST 一次 /restart。
+/// 相比逐个调 cc_connect_import_project,避免 N 次 restart 多次断开 IM active sessions。
+/// 名称唯一性由前端在调用前 resolve(与现有项目 + 批次内部去重);后端对已存在同名做防御性跳过。
+#[tauri::command]
+pub fn cc_connect_import_projects(
+    reqs: Vec<ImportProjectRequest>,
+    config_path: Option<String>,
+) -> Result<BatchImportResult, String> {
+    let path = resolve_config_path(config_path.as_deref())?;
+    let (token, port) = read_token_port(&path)?;
+    let mut doc = read_doc(&path)?;
+
+    let projects_item = doc
+        .entry("projects")
+        .or_insert(Item::ArrayOfTables(ArrayOfTables::new()));
+    let projects = projects_item
+        .as_array_of_tables_mut()
+        .ok_or_else(|| "config.toml 的 projects 不是 array of tables".to_string())?;
+
+    let mut existing: HashSet<String> = projects
+        .iter()
+        .filter_map(|t| t.get("name").and_then(|i| i.as_str()).map(String::from))
+        .collect();
+
+    let mut imported = Vec::new();
+    let mut skipped = Vec::new();
+    for req in reqs {
+        if existing.contains(&req.name) {
+            skipped.push(req.name);
+            continue;
+        }
+        let agent_type = req
+            .agent_type
+            .clone()
+            .unwrap_or_else(|| DEFAULT_AGENT_TYPE.to_string());
+        projects.push(make_project_table(&req.name, &req.work_dir, &agent_type));
+        existing.insert(req.name.clone());
+        imported.push(req.name);
+    }
+
+    // 没有任何新项目(全部已存在)→ 不写盘不重启,避免无谓断开 IM
+    if imported.is_empty() {
+        return Ok(BatchImportResult {
+            imported,
+            skipped,
+            toml_written: false,
+            restart_ok: true,
+            restart_error: None,
+        });
+    }
+
+    std::fs::write(&path, doc.to_string())
+        .map_err(|e| format!("写回 {} 失败: {}", path.display(), e))?;
+
+    let url = build_api_url(port, "/api/v1/restart");
+    let (restart_ok, restart_error) = match http_post_json(&url, &token, &serde_json::json!({})) {
+        Ok(_) => (true, None),
+        Err(e) => (false, Some(e)),
+    };
+    Ok(BatchImportResult {
+        imported,
+        skipped,
         toml_written: true,
         restart_ok,
         restart_error,
