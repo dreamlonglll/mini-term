@@ -2,7 +2,12 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { useAppStore } from '../store';
-import type { CcConnectConfig, CcConnectStatus } from '../types';
+import {
+  importProjectToCcConnect,
+  importProjectsToCcConnect,
+  unlinkProjectFromCcConnect,
+} from '../utils/ccConnectImport';
+import type { CcConnectConfig, CcConnectStatus, ProjectConfig } from '../types';
 
 interface Props {
   open: boolean;
@@ -49,6 +54,9 @@ function CcConnectModalContent({ onClose }: { onClose: () => void }) {
   const [extraArgsInput, setExtraArgsInput] = useState((cc.extraArgs ?? []).join(' '));
   const [resultMsg, setResultMsg] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
   const [busy, setBusy] = useState<null | 'start' | 'stop' | 'restart' | 'test'>(null);
+  // 勾选待批量导入的项目 id(仅未导入项目可勾选);importing 防止导入/移除期间重复点击
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [importing, setImporting] = useState(false);
 
   useEffect(() => {
     setExePath(cc.exePath);
@@ -214,7 +222,46 @@ function CcConnectModalContent({ onClose }: { onClose: () => void }) {
     }
   }, [configPath]);
 
+  const handleBatchImport = useCallback(async () => {
+    const cfg = useAppStore.getState().config;
+    const targets = cfg.projects.filter(
+      (p) => selectedIds.has(p.id) && cfg.ccConnect?.projectLinks?.[p.id] === undefined,
+    );
+    if (targets.length === 0) return;
+    setImporting(true);
+    try {
+      const ok = await importProjectsToCcConnect(targets);
+      if (ok) setSelectedIds(new Set());
+    } finally {
+      setImporting(false);
+    }
+  }, [selectedIds]);
+
+  const handleSingleImport = useCallback(async (project: ProjectConfig) => {
+    setImporting(true);
+    try {
+      await importProjectToCcConnect(project);
+    } finally {
+      setImporting(false);
+    }
+  }, []);
+
+  const handleRemove = useCallback(async (project: ProjectConfig) => {
+    setImporting(true);
+    try {
+      await unlinkProjectFromCcConnect(project);
+    } finally {
+      setImporting(false);
+    }
+  }, []);
+
   const running = ccStatus?.running ?? false;
+
+  // 未导入项目(projectLinks 无记录)+ 勾选交集,全选与批量按钮据此计算(避免已导入残留 id 干扰)
+  const unimportedProjects = config.projects.filter((p) => config.ccConnect?.projectLinks?.[p.id] === undefined);
+  const selectedCount = unimportedProjects.filter((p) => selectedIds.has(p.id)).length;
+  const allSelected = unimportedProjects.length > 0 && selectedCount === unimportedProjects.length;
+  const someSelected = selectedCount > 0 && !allSelected;
 
   // 状态点颜色
   const indicator = (() => {
@@ -267,6 +314,96 @@ function CcConnectModalContent({ onClose }: { onClose: () => void }) {
             >
               打开 Dashboard
             </button>
+          </div>
+
+          {/* 导入项目到 cc-connect:勾选 + 一键导入(批量只重启一次);也可逐行单独导入。
+              每个导入项目会附带占位 telegram 平台(后端注入),保证 cc-connect 冷启动,用户后续到 Dashboard 换真平台。 */}
+          <div className="space-y-1.5">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-base text-[var(--text-primary)]">导入项目到 cc-connect</span>
+              <div className="flex items-center gap-3">
+                {unimportedProjects.length > 0 && (
+                  <label className="flex items-center gap-1.5 text-xs text-[var(--text-muted)] cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      className="accent-[var(--accent)]"
+                      checked={allSelected}
+                      ref={(el) => { if (el) el.indeterminate = someSelected; }}
+                      onChange={(e) => {
+                        setSelectedIds(e.target.checked ? new Set(unimportedProjects.map((p) => p.id)) : new Set());
+                      }}
+                    />
+                    全选
+                  </label>
+                )}
+                <button
+                  className="px-2.5 py-1 text-sm rounded-[var(--radius-sm)] bg-[var(--accent)] text-[var(--bg-base)] hover:opacity-90 transition-opacity disabled:opacity-40 disabled:cursor-not-allowed"
+                  disabled={!running || importing || selectedCount === 0}
+                  title={running ? '导入勾选的项目(只重启一次 cc-connect)' : '需要先启动 cc-connect'}
+                  onClick={() => { void handleBatchImport(); }}
+                >
+                  一键导入{selectedCount > 0 ? ` (${selectedCount})` : ''}
+                </button>
+              </div>
+            </div>
+            {config.projects.length === 0 ? (
+              <div className="text-sm text-[var(--text-muted)] px-3 py-2 rounded-[var(--radius-sm)] bg-[var(--bg-base)] border border-[var(--border-subtle)]">
+                还没有项目,先在左栏添加
+              </div>
+            ) : (
+              <div className="max-h-[180px] overflow-y-auto rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)] divide-y divide-[var(--border-subtle)]">
+                {config.projects.map((p) => {
+                  const linkedName = config.ccConnect?.projectLinks?.[p.id];
+                  const imported = linkedName !== undefined;
+                  return (
+                    <div key={p.id} className="flex items-center gap-2 px-3 py-2">
+                      {imported ? (
+                        <span className="w-[13px] flex-shrink-0" aria-hidden />
+                      ) : (
+                        <input
+                          type="checkbox"
+                          className="accent-[var(--accent)] flex-shrink-0"
+                          checked={selectedIds.has(p.id)}
+                          onChange={(e) => {
+                            setSelectedIds((prev) => {
+                              const next = new Set(prev);
+                              if (e.target.checked) next.add(p.id); else next.delete(p.id);
+                              return next;
+                            });
+                          }}
+                        />
+                      )}
+                      <div className="min-w-0 flex-1">
+                        <div className="text-sm text-[var(--text-primary)] truncate">{p.name}</div>
+                        <div className="text-xs text-[var(--text-muted)] font-mono truncate">{p.path}</div>
+                      </div>
+                      {imported ? (
+                        <div className="flex items-center gap-2 flex-shrink-0">
+                          <span className="text-xs text-[var(--color-success)]" title={`已导入「${linkedName}」`}>● 已导入</span>
+                          <button
+                            className="px-2 py-1 text-xs rounded-[var(--radius-sm)] border border-[var(--border-default)] text-[var(--text-secondary)] hover:border-[var(--color-error)] hover:text-[var(--color-error)] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                            disabled={!running || importing}
+                            title={running ? '从 cc-connect 移除该项目' : '需要先启动 cc-connect'}
+                            onClick={() => { void handleRemove(p); }}
+                          >
+                            移除
+                          </button>
+                        </div>
+                      ) : (
+                        <button
+                          className="px-2.5 py-1 text-sm rounded-[var(--radius-sm)] bg-[var(--accent)] text-[var(--bg-base)] hover:opacity-90 transition-opacity disabled:opacity-40 disabled:cursor-not-allowed flex-shrink-0"
+                          disabled={!running || importing}
+                          title={running ? '导入到 cc-connect' : '需要先启动 cc-connect'}
+                          onClick={() => { void handleSingleImport(p); }}
+                        >
+                          导入
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </div>
 
           {/* 可执行文件路径 */}

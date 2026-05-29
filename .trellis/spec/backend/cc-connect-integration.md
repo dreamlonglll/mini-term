@@ -58,7 +58,16 @@ cors_origins = ["*"]
 
 **cc-connect 没有 `POST /api/v1/projects` 端点。** 新增项目必经:
 
-1. 用 `toml_edit` 往 `~/.cc-connect/config.toml` 追加 `[[projects]]`(详见 [toml-edit-array-of-tables.md](./toml-edit-array-of-tables.md))
+0. ⚠️ **每个 `[[projects]]` 必须带至少一个 `[[projects.platforms]]`**。cc-connect 的 `config.validate()`
+   (config.go L1097-1103)对 `platforms` 为空的项目直接 `return error` → `main.go` `os.Exit(1)`
+   (`config: projects[N] needs at least one [[projects.platforms]]`),**整进程冷启动失败**(经源码 + 隔离实测确认,
+   v1.3.2)。没有 `enabled=false`/`disabled` 开关可「登记但不连」。导入时拿不到真实 IM 凭据 →
+   **必须注入一个冷启动安全的占位平台**:`type="telegram"` + `options.token` 为**非空**假值
+   (`make_project_table` 已硬编码 `PLACEHOLDER_PLATFORM_*`)。telegram 工厂仅校验 token 非空、`Start()`
+   异步拨号失败只退避重连不崩;**绝不能用 discord**(其 `Start()` 同步 `session.Open()` 返回 error,单平台时拖垮 engine→os.Exit);
+   **token 不可为空**(空串触发工厂 os.Exit)。用户后续在 Dashboard 把占位平台**替换**(而非删除)为真实平台。
+   占位项目处于 pending 时 `/api/v1/status` 可能返 502 → 导入成功判定**以 `tomlWritten` 为准,不依赖 `status.running`**。
+1. 用 `toml_edit` 往 `~/.cc-connect/config.toml` 追加 `[[projects]]`(含上面的占位平台,详见 [toml-edit-array-of-tables.md](./toml-edit-array-of-tables.md))
 2. POST `/api/v1/restart`(**不能用 `/reload`**:Go 端 `handleReload` 当前 main 分支只遍历已注册的 engine,新项目永远不会被激活)
 3. ⚠ restart 期间所有 **active IM sessions 被断开**,turn 中断;UI **必须显式 confirm** 提示用户"会重启 cc-connect,可能短暂中断 IM 连接,继续?"
 
@@ -87,7 +96,7 @@ cors_origins = ["*"]
 
 - **Good**:探活成功 → 状态点绿 → 导入 confirm → toml_edit + restart → **立即手动 probe** 刷新 → icon 变绿 → 一键打开 dashboard 配 platform
 - **Base**:cc-connect 没启动 → 状态点灰 → 设置里点"启动" → spawn 成功 → 5s 内变绿(全局轮询)
-- **Bad**:用 `POST /api/v1/reload` 期望新项目生效 → 静默无效;用 BurntSushi/toml 序列化 config.toml → 用户注释全丢;`probe` 抛 Err → 前端轮询断了无法降级
+- **Bad**:导入 `[[projects]]` 不带任何 `[[projects.platforms]]` → cc-connect 下次冷启动 `validate()` 失败 `os.Exit(1)`(曾导致整个导入功能被删,见 commit 6cb688d);用 `POST /api/v1/reload` 期望新项目生效 → 静默无效;用 BurntSushi/toml 序列化 config.toml → 用户注释全丢;`probe` 抛 Err → 前端轮询断了无法降级
 
 ## Tests Required
 

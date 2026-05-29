@@ -73,6 +73,54 @@ export interface CcConnectStatus {
   diagnostic?: string;
 }
 
+/** cc_connect_list_projects 返回的单条项目记录。 */
+export interface CcProject {
+  name: string;
+  workDir?: string;
+  agentType?: string;
+  hasPlatform: boolean;
+}
+
+/** cc_connect_import_project 的请求载荷。 */
+export interface ImportProjectRequest {
+  name: string;
+  workDir: string;
+  agentType?: string;
+}
+
+/**
+ * cc_connect_import_project 返回值。
+ *
+ * 后端在 toml 已写盘但 cc-connect restart 失败时不再返 Err,而是把 restartOk=false 编码到 result 里,
+ * 让前端按 tomlWritten && !restartOk 仍然写入 projectLinks(避免"项目存在但未关联"半同步态)。
+ */
+export interface ImportProjectResult {
+  name: string;
+  tomlWritten: boolean;
+  restartOk: boolean;
+  restartError?: string;
+}
+
+/**
+ * cc_connect_unlink_project 返回值。语义与 ImportProjectResult 对称:
+ * deletedOk=true 但 restartOk=false 时,前端仍清理本地 projectLinks。
+ */
+export interface UnlinkProjectResult {
+  name: string;
+  deletedOk: boolean;
+  restartOk: boolean;
+  restartError?: string;
+}
+
+/** cc_connect_import_projects(批量导入)返回值:一次写盘 + 仅重启一次。 */
+export interface BatchImportResult {
+  imported: string[];
+  skipped: string[];
+  tomlWritten: boolean;
+  restartOk: boolean;
+  restartError?: string;
+}
+
 export interface ProjectConfig {
   id: string;
   name: string;

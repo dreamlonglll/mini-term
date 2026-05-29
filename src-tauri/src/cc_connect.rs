@@ -23,6 +23,18 @@ const DEFAULT_PORT: u16 = 9820;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_AGENT_TYPE: &str = "claudecode";
 
+/// 占位平台:cc-connect 的 config.validate() 强制每个 [[projects]] 至少有一个 [[projects.platforms]],
+/// 否则冷启动直接 os.Exit(1)("config: projects[N] needs at least one [[projects.platforms]]")。
+/// 导入时拿不到真实 IM 凭据 → 注入一个「冷启动安全」的占位平台,让写出的 config.toml 永远能冷启动,
+/// 用户后续在 cc-connect Dashboard 把它替换为真实平台。
+///
+/// 选 telegram 的依据(经源码 + 隔离实测确认,cc-connect v1.3.2):工厂 New() 仅校验 token 非空,
+/// Start() 把拨号丢进 goroutine 后 return nil,假 token 只会后台退避重连、绝不返回 error 让进程崩。
+/// ⚠ 绝不能用 discord 占位:其 Start() 同步 session.Open() 并返回 error,作为单平台时会拖垮 engine→os.Exit。
+/// ⚠ token 必须非空:空串会让 telegram 工厂报错 → main.go CreatePlatform 失败 → os.Exit(1)。
+const PLACEHOLDER_PLATFORM_TYPE: &str = "telegram";
+const PLACEHOLDER_PLATFORM_TOKEN: &str = "0:MINITERM_PLACEHOLDER_REPLACE_IN_DASHBOARD";
+
 /// Tauri managed state:仅追踪 mini-term 自己 spawn 的 cc-connect Child 句柄。
 /// 不缓存 probe 结果(每次走 HTTP 实时);不接管"用户手动启动"的进程。
 #[derive(Default, Clone)]
@@ -209,7 +221,10 @@ fn urlencode(s: &str) -> String {
         .collect()
 }
 
-/// 构造一个 [[projects]] 表(name + agent.type + agent.options.work_dir),单/批量导入共用。
+/// 构造一个 [[projects]] 表(name + agent.type + agent.options.work_dir + 占位 platform),单/批量导入共用。
+///
+/// 必带一个占位 [[projects.platforms]](见 PLACEHOLDER_PLATFORM_*):cc-connect 校验阶段强制每个项目
+/// 至少一个平台,否则冷启动 os.Exit(1)。不带占位平台的导入正是上一版被删的根因。
 fn make_project_table(name: &str, work_dir: &str, agent_type: &str) -> Table {
     let mut new_proj = Table::new();
     new_proj["name"] = value(name);
@@ -219,6 +234,17 @@ fn make_project_table(name: &str, work_dir: &str, agent_type: &str) -> Table {
     options["work_dir"] = value(work_dir);
     agent["options"] = Item::Table(options);
     new_proj["agent"] = Item::Table(agent);
+
+    // 占位平台:type = telegram,options.token 为非空假值。保证冷启动安全(详见常量注释)。
+    let mut platform = Table::new();
+    platform["type"] = value(PLACEHOLDER_PLATFORM_TYPE);
+    let mut platform_options = Table::new();
+    platform_options["token"] = value(PLACEHOLDER_PLATFORM_TOKEN);
+    platform["options"] = Item::Table(platform_options);
+    let mut platforms = ArrayOfTables::new();
+    platforms.push(platform);
+    new_proj["platforms"] = Item::ArrayOfTables(platforms);
+
     new_proj
 }
 
@@ -783,5 +809,33 @@ name = "dup"
                 .unwrap_or(false)
         });
         assert!(has);
+    }
+
+    #[test]
+    fn make_project_table_injects_placeholder_platform() {
+        // 守住冷启动回归线:make_project_table 产物必须带至少一个非空 token 的 [[projects.platforms]],
+        // 否则 cc-connect config.validate() 会让进程 os.Exit(1)(上一版被删的根因)。
+        let t = make_project_table("proj", "D:\\Git\\x", "claudecode");
+        let platforms = t["platforms"]
+            .as_array_of_tables()
+            .expect("应有 platforms array of tables");
+        assert_eq!(platforms.len(), 1);
+        let p0 = platforms.get(0).unwrap();
+        assert_eq!(p0["type"].as_str().unwrap(), "telegram");
+        let token = p0["options"]["token"].as_str().unwrap();
+        assert!(!token.is_empty(), "占位 token 必须非空(空串会让 telegram 工厂 os.Exit)");
+
+        // round-trip:序列化后重新解析仍能读到平台 type
+        let mut doc = DocumentMut::new();
+        let mut arr = ArrayOfTables::new();
+        arr.push(t);
+        doc["projects"] = Item::ArrayOfTables(arr);
+        let reparsed: DocumentMut = doc.to_string().parse().unwrap();
+        let ptype = reparsed["projects"].as_array_of_tables().unwrap()
+            .get(0).unwrap()["platforms"]
+            .as_array_of_tables().unwrap()
+            .get(0).unwrap()["type"]
+            .as_str().unwrap();
+        assert_eq!(ptype, "telegram");
     }
 }
