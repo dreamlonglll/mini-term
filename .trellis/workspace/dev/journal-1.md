@@ -411,3 +411,39 @@ feat/cc-connect-panel 分支文档收尾:README 顶部 slogan 加 '· IM 平台�
 ### Next Steps
 
 - None - task complete
+
+
+## Session 13: cc-connect 一键导入集成并入主线 + v0.4.21 发版
+
+**Date**: 2026-05-29
+**Task**: cc-connect 一键导入集成并入主线 + v0.4.21 发版
+**Branch**: `main`
+
+### Summary
+
+「连接」弹窗内置项目导入到 cc-connect：支持单个/勾选批量一键导入，已关联项可解除、失效项可清理。新增后端 cc_connect_import_projects 命令（批量一次写盘 + 仅重启一次 cc-connect），现有项目与批次内统一去重（冲突加 hash 后缀）。探活改为常驻、放宽右键导入门控支持零配置识别运行态。修复 Windows 启动失败/孤儿进程/卡顿，移除会产出无效配置的项目导入。确认框支持换行与超长滚动折叠。最终升级版本号至 v0.4.21，首次将 cc-connect 集成并入主线。
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `d06df9c` | (see git log) |
+| `6cb688d` | (see git log) |
+| `50b5cfc` | (see git log) |
+| `4a5c294` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
