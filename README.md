@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>为 AI 时代打造的桌面终端管理器</strong><br>
-  基于 Tauri v2 · 多项目 · 多标签 · 分屏布局 · AI 进程感知
+  基于 Tauri v2 · 多项目 · 多标签 · 分屏布局 · AI 进程感知 · IM 平台远程驱动 (cc-connect)
 </p>
 
 <p align="center">
@@ -87,6 +87,16 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 - **会话历史** — 读取本地 Claude / Codex 历史会话记录，右键复制恢复命令快速续接；首屏仅渲染 20 条，滚动到底部自动加载更多
 - **会话查看** — 右键「查看」展示完整对话内容，User 纯文本 / Assistant Markdown 渲染（外链点击二次确认后调系统默认浏览器打开），支持 `Ctrl+F` 搜索高亮和 User 消息快速导航
 - **AI 任务标记** — AI 会话内每次用户按 Enter 自动在 xterm 打点，标签右上角 ⚑ 按钮下拉展示历史提交列表，点击或 `Ctrl+Shift+↑/↓`（macOS `⌘+Shift+↑/↓`）在标记间跳转，目标行短暂高亮提示
+
+### cc-connect 集成
+
+把本机跑的 AI agent 通过 IM 平台（飞书 / Slack / Telegram / Discord / 钉钉 / 微信等）远程驱动，与上游 [chenhg5/cc-connect](https://github.com/chenhg5/cc-connect) 桥接。
+
+- **进程管理** — 设置面板填 cc-connect 可执行路径 / config.toml 路径 / 启动参数，一键启动 / 停止 / 重启 / 测试连接 / 打开 config，标题栏小圆点三态显示运行状态（运行中绿色含 pid + 端口 + 版本 / 已停止 / 错误含诊断），可选 mini-term 启动时自动 spawn；关闭 mini-term 不联动 kill，保证 IM 持续可用
+- **项目导入与关联** — 项目列表右键「导入到 cc-connect」一键写入 `~/.cc-connect/config.toml` 的 `[[projects]]` 并通过 `POST /api/v1/restart` 让新项目生效；用 `toml_edit` 保留用户既有注释和顺序；同名冲突自动加 8 字符 hash 后缀；项目右侧绿色 ◆ / 红色 ⚠ icon 实时显示关联状态，race-safe 仅在拉到 cc-connect 项目列表后才比对，cc-connect 重启期间不误标 broken
+- **Dashboard 嵌入** — 项目右键「在 cc-connect 配置平台」或顶部独立按钮一键打开 cc-connect 自家 Web 控制台 iframe（自动登录态），直接在 mini-term 内配置 IM 平台 / 切换 provider / 管理 cron，无需另开浏览器；createPortal 到 `document.body` 绕开 Fluent 2 [data-panel] 的 backdrop-filter，确保全屏铺满；keep-alive 关闭走 `display:none` 不卸载，避免重新登录
+- **半同步态处理** — 项目导入 / 解除关联即使 cc-connect 重启失败，前端按 `tomlWritten` / `deletedOk` 分支仍维持本地 `projectLinks`，warning toast 提示 restart 失败原因，避免「项目存在但未关联」「项目已删但 icon 仍红」体验缺陷
+- **优雅降级** — cc-connect 未运行时所有相关 UI 提示「先启动 cc-connect」而非崩溃；config.toml 未配置 `[management].token` 时给出友好诊断指引用户跑 `cc-connect web` 自动生成
 
 ### 项目管理
 
