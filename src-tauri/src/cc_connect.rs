@@ -222,39 +222,149 @@ fn make_project_table(name: &str, work_dir: &str, agent_type: &str) -> Table {
     new_proj
 }
 
+/// Windows: 像终端一样按 PATH × PATHEXT 解析可执行文件,弥补 `Command::new` 解析裸名
+/// 只补 `.exe`、不读 `PATHEXT` 的缺陷(cc-connect 常以 npm 脚本壳安装:cc-connect.cmd / .ps1,
+/// 无原生 .exe,会触发 program not found)。返回 (program, prefix_args):
+/// - .exe/.com/.cmd/.bat → (解析到的绝对路径, [])  (.cmd/.bat 由 std 自行经 cmd.exe 拉起)
+/// - .ps1 脚本壳         → ("powershell", ["-NoProfile","-ExecutionPolicy","Bypass","-File", 路径])
+///
+/// 找不到则返 Err,提示用户到「连接」弹窗填绝对路径。
+#[cfg(windows)]
+fn resolve_windows_program(exe: &str) -> Result<(String, Vec<String>), String> {
+    use std::path::Path;
+
+    // PATHEXT 兜底默认值;额外补 .PS1(PATHEXT 通常不含,但我们能经 powershell 跑)
+    let mut exts: Vec<String> = std::env::var("PATHEXT")
+        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
+        .split(';')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+    if !exts.iter().any(|e| e.eq_ignore_ascii_case(".PS1")) {
+        exts.push(".PS1".to_string());
+    }
+
+    // 把一个具体文件包装成 (program, prefix_args)
+    let wrap = |p: PathBuf| -> (String, Vec<String>) {
+        let is_ps1 = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.eq_ignore_ascii_case("ps1"))
+            .unwrap_or(false);
+        let s = p.to_string_lossy().to_string();
+        if is_ps1 {
+            (
+                "powershell".to_string(),
+                vec![
+                    "-NoProfile".to_string(),
+                    "-ExecutionPolicy".to_string(),
+                    "Bypass".to_string(),
+                    "-File".to_string(),
+                    s,
+                ],
+            )
+        } else {
+            (s, vec![])
+        }
+    };
+
+    // 1) 用户给了带路径分隔符的目标(绝对/相对路径):直接用,漏扩展名则补 PATHEXT
+    if exe.contains('\\') || exe.contains('/') {
+        let p = PathBuf::from(exe);
+        if p.is_file() {
+            return Ok(wrap(p));
+        }
+        if Path::new(exe).extension().is_none() {
+            for ext in &exts {
+                let cand = PathBuf::from(format!("{}{}", exe, ext));
+                if cand.is_file() {
+                    return Ok(wrap(cand));
+                }
+            }
+        }
+        // 仍找不到:原样交给 Command,保留其原生错误语义
+        return Ok((exe.to_string(), vec![]));
+    }
+
+    // 2) 裸名(可能自带扩展名)→ 扫 PATH 各目录
+    let has_ext = Path::new(exe).extension().is_some();
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            if has_ext {
+                let cand = dir.join(exe);
+                if cand.is_file() {
+                    return Ok(wrap(cand));
+                }
+            } else {
+                for ext in &exts {
+                    let cand = dir.join(format!("{}{}", exe, ext));
+                    if cand.is_file() {
+                        return Ok(wrap(cand));
+                    }
+                }
+            }
+        }
+    }
+
+    Err(format!(
+        "在 PATH 中找不到 \"{}\"(已按 PATHEXT 尝试 .exe/.cmd/.bat/.ps1 等);请在「连接」弹窗的「可执行文件」填写绝对路径",
+        exe
+    ))
+}
+
+/// 杀掉 mini-term 启动的 cc-connect。Windows 下 child 可能是脚本壳(cmd/powershell),
+/// 真正的 node/cc-connect 是其子孙进程,`child.kill()` 杀不到 → 用 `taskkill /T /F` 杀整棵树;
+/// 末尾 `child.kill()` + `wait()` 兜底确保壳进程结束并回收句柄。原生 .exe 时 taskkill 无子进程亦无害。
+fn kill_child_tree(child: &mut Child) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = Command::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .creation_flags(0x08000000) // CREATE_NO_WINDOW
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 // ====================== Tauri Commands ======================
 
+/// async:probe 每 5s 轮询且内部是阻塞式 ureq HTTP(最长 5s 超时)。Tauri 把同步 command 放
+/// 主线程执行,阻塞 HTTP 会冻结 UI;声明为 async 让其在异步运行时工作线程上跑,主线程不被阻塞。
 #[tauri::command]
-pub fn cc_connect_probe(
+pub async fn cc_connect_probe(
     state: tauri::State<'_, CcConnectManager>,
     config_path: Option<String>,
-) -> CcConnectStatus {
+) -> Result<CcConnectStatus, String> {
     let path = match resolve_config_path(config_path.as_deref()) {
         Ok(p) => p,
         Err(e) => {
-            return CcConnectStatus {
+            return Ok(CcConnectStatus {
                 running: false,
                 port: DEFAULT_PORT,
                 version: None,
                 own_pid: state.own_pid(),
                 diagnostic: Some(e),
-            };
+            });
         }
     };
     let (token, port) = match read_token_port(&path) {
         Ok(v) => v,
         Err(e) => {
-            return CcConnectStatus {
+            return Ok(CcConnectStatus {
                 running: false,
                 port: DEFAULT_PORT,
                 version: None,
                 own_pid: state.own_pid(),
                 diagnostic: Some(e),
-            };
+            });
         }
     };
     let url = build_api_url(port, "/api/v1/status");
-    match http_get_json(&url, &token) {
+    Ok(match http_get_json(&url, &token) {
         Ok(json) => CcConnectStatus {
             running: true,
             port,
@@ -272,7 +382,7 @@ pub fn cc_connect_probe(
             own_pid: state.own_pid(),
             diagnostic: Some(e),
         },
-    }
+    })
 }
 
 #[tauri::command]
@@ -307,7 +417,18 @@ pub fn cc_connect_start(
         }
         *guard = None;
     }
-    let mut cmd = Command::new(&exe_path);
+    // Windows 下 exe_path 可能是 npm 脚本壳(cc-connect.cmd / .ps1)或裸名,Command::new 解析裸名
+    // 只补 .exe 会 program not found;这里按 PATH × PATHEXT 像终端一样解析,.ps1 包一层 powershell。
+    #[cfg(windows)]
+    let (program, prefix_args) = resolve_windows_program(&exe_path)
+        .map_err(|e| format!("启动 cc-connect 失败 ({}): {}", exe_path, e))?;
+    #[cfg(not(windows))]
+    let (program, prefix_args): (String, Vec<String>) = (exe_path.clone(), Vec::new());
+
+    let mut cmd = Command::new(&program);
+    for a in &prefix_args {
+        cmd.arg(a);
+    }
     if let Some(cfg) = config_path.as_deref() {
         if !cfg.is_empty() {
             cmd.args(["--config", cfg]);
@@ -339,8 +460,7 @@ pub fn cc_connect_start(
 pub fn cc_connect_stop(state: tauri::State<'_, CcConnectManager>) -> Result<(), String> {
     let mut guard = state.child.lock().map_err(|e| e.to_string())?;
     if let Some(mut child) = guard.take() {
-        let _ = child.kill();
-        let _ = child.wait();
+        kill_child_tree(&mut child);
         Ok(())
     } else {
         Err("cc-connect 不是由 mini-term 启动的,无法停止 (请到对应进程处自行关闭)".to_string())
@@ -375,8 +495,7 @@ pub fn cc_connect_restart(
     {
         let mut guard = state.child.lock().map_err(|e| e.to_string())?;
         if let Some(mut child) = guard.take() {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_child_tree(&mut child);
         } else {
             return Err(format!(
                 "HTTP restart 失败且 cc-connect 不是由 mini-term 启动 (原因: {})",

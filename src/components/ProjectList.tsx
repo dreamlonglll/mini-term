@@ -14,8 +14,6 @@ import { ProjectEnvVarsModal } from './ProjectEnvVarsModal';
 import { showContextMenu } from '../utils/contextMenu';
 import { showPrompt } from '../utils/prompt';
 import { initProjectDrag, isProjectDragging, getProjectDragPayload, onProjectDragEnd } from '../utils/projectDragState';
-import { useCcConnectProjects } from '../hooks/useCcConnectProjects';
-import { importProjectToCcConnect, unlinkProjectFromCcConnect } from '../utils/ccConnectActions';
 import {
   getOrderedTree,
   collectAllGroups,
@@ -70,19 +68,6 @@ export function ProjectList() {
 
   const orderedItems = getOrderedTree(config);
   const allGroups = collectAllGroups(config.projectTree ?? []);
-
-  // === cc-connect 集成状态 ===
-  const ccConfig = config.ccConnect;
-  const ccConnectStatus = useAppStore((s) => s.ccConnectStatus);
-  const ccRunning = ccConnectStatus?.running ?? false;
-  const { missingLinks, refresh: refreshCcProjects } = useCcConnectProjects();
-  const projectLinks = ccConfig?.projectLinks;
-  const openCcDashboard = useAppStore((s) => s.openCcDashboard);
-
-  const openCcDashboardForProject = useCallback((linkedName: string | undefined) => {
-    // encode 项目名,避免名字含 '/' '?' '#' 等导致 deepLink 解析错位
-    openCcDashboard(linkedName ? `/projects/${encodeURIComponent(linkedName)}` : undefined);
-  }, [openCcDashboard]);
 
   // === 系统文件拖放（从资源管理器拖入文件夹添加项目） ===
   useEffect(() => {
@@ -369,13 +354,6 @@ export function ProjectList() {
     const projectPs = projectStates.get(project.id);
     const showDoneTag = !!projectPs?.needsAttention && !isActive;
 
-    // cc-connect 关联状态:已关联(绿) / 已关联但失效(红 ⚠) / 未关联(不渲染)
-    const linkedName = projectLinks?.[project.id];
-    const linkBroken = linkedName !== undefined && missingLinks.has(project.id);
-    const ccIconKind: 'linked' | 'broken' | null = linkedName
-      ? (linkBroken ? 'broken' : 'linked')
-      : null;
-
     return (
       <div
         key={project.id}
@@ -407,31 +385,6 @@ export function ProjectList() {
               onClick: () => setEnvVarsTarget(project),
             },
           ];
-          // cc-connect 集成菜单:配置过 或 探测到正在运行(零配置)时显示;import 项未运行时灰显。
-          // 首次导入会落盘 ccConnect.projectLinks → 之后 ccConfig 即为真,菜单常驻。
-          if (ccConfig || ccRunning) {
-            menuItems.push({ separator: true });
-            if (linkedName) {
-              menuItems.push({
-                label: '在 cc-connect 配置平台',
-                disabled: !ccRunning || linkBroken,
-                onClick: () => openCcDashboardForProject(linkedName),
-              });
-              // broken 关联即使 cc 未启动也允许清理本地 link;running 时走 DELETE+restart
-              menuItems.push({
-                label: linkBroken ? '清理失效的 cc-connect 关联' : '解除 cc-connect 关联',
-                disabled: !ccRunning && !linkBroken,
-                danger: true,
-                onClick: () => { void unlinkProjectFromCcConnect(project, refreshCcProjects); },
-              });
-            } else {
-              menuItems.push({
-                label: ccRunning ? '导入到 cc-connect' : '导入到 cc-connect(先启动 cc-connect)',
-                disabled: !ccRunning,
-                onClick: () => { void importProjectToCcConnect(project, refreshCcProjects); },
-              });
-            }
-          }
           // 添加分组相关菜单
           if (allGroups.length > 0) {
             menuItems.push({ separator: true });
@@ -474,21 +427,6 @@ export function ProjectList() {
           />
         ) : (
           <span className="truncate flex-1">{project.name}</span>
-        )}
-        {ccIconKind && (
-          <span
-            className="flex-shrink-0 leading-none text-[11px]"
-            style={{
-              color: ccIconKind === 'broken' ? 'var(--color-error)' : 'var(--color-success)',
-            }}
-            title={
-              ccIconKind === 'broken'
-                ? `cc-connect 关联失效:目标项目「${linkedName}」已不存在,可右键解除关联`
-                : `已关联 cc-connect 项目「${linkedName}」`
-            }
-          >
-            {ccIconKind === 'broken' ? '⚠' : '◆'}
-          </span>
         )}
         {showDoneTag ? <DoneTag /> : <StatusDot status={projectStatus} />}
         <span
