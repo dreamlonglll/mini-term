@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.4.20-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.4.21-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -90,13 +90,13 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 
 ### cc-connect 集成
 
-把本机跑的 AI agent 通过 IM 平台（飞书 / Slack / Telegram / Discord / 钉钉 / 微信等）远程驱动，与上游 [chenhg5/cc-connect](https://github.com/chenhg5/cc-connect) 桥接。
+把本机跑的 AI agent 通过 IM 平台（飞书 / Slack / Telegram / Discord / 钉钉 / 微信等）远程驱动，与上游 [chenhg5/cc-connect](https://github.com/chenhg5/cc-connect) 桥接。入口统一收在顶栏「连接」按钮弹窗内。
 
-- **进程管理** — 设置面板填 cc-connect 可执行路径 / config.toml 路径 / 启动参数，一键启动 / 停止 / 重启 / 测试连接 / 打开 config，标题栏小圆点三态显示运行状态（运行中绿色含 pid + 端口 + 版本 / 已停止 / 错误含诊断），可选 mini-term 启动时自动 spawn；关闭 mini-term 不联动 kill，保证 IM 持续可用
-- **项目导入与关联** — 项目列表右键「导入到 cc-connect」一键写入 `~/.cc-connect/config.toml` 的 `[[projects]]` 并通过 `POST /api/v1/restart` 让新项目生效；用 `toml_edit` 保留用户既有注释和顺序；同名冲突自动加 8 字符 hash 后缀；项目右侧绿色 ◆ / 红色 ⚠ icon 实时显示关联状态，race-safe 仅在拉到 cc-connect 项目列表后才比对，cc-connect 重启期间不误标 broken
-- **Dashboard 嵌入** — 项目右键「在 cc-connect 配置平台」或顶部独立按钮一键打开 cc-connect 自家 Web 控制台 iframe（自动登录态），直接在 mini-term 内配置 IM 平台 / 切换 provider / 管理 cron，无需另开浏览器；createPortal 到 `document.body` 绕开 Fluent 2 [data-panel] 的 backdrop-filter，确保全屏铺满；keep-alive 关闭走 `display:none` 不卸载，避免重新登录
-- **半同步态处理** — 项目导入 / 解除关联即使 cc-connect 重启失败，前端按 `tomlWritten` / `deletedOk` 分支仍维持本地 `projectLinks`，warning toast 提示 restart 失败原因，避免「项目存在但未关联」「项目已删但 icon 仍红」体验缺陷
-- **优雅降级** — cc-connect 未运行时所有相关 UI 提示「先启动 cc-connect」而非崩溃；config.toml 未配置 `[management].token` 时给出友好诊断指引用户跑 `cc-connect web` 自动生成
+- **进程管理（零配置）** — 「连接」弹窗内一键启动 / 停止 / 重启 / 测试连接 / 编辑 config.toml，可选 mini-term 启动时自动 spawn；可执行文件 / 配置路径留空时自动回退 PATH 中的 `cc-connect` 与 `~/.cc-connect/config.toml`，零配置即可使用；Windows 下按 PATH × PATHEXT 解析 npm 脚本壳（`.cmd` / `.ps1`），停止 / 重启用 `taskkill /T` 杀整棵进程树避免孤儿进程；关闭 mini-term 不联动 kill，保证 IM 持续可用
+- **一键导入项目** — 「连接」弹窗内列出全部 mini-term 项目，勾选 / 全选后一键批量导入（用 `toml_edit` 追加 `[[projects]]` 保留注释、单次写盘 + 仅重启一次 cc-connect、同名冲突自动加 8 字符 hash 后缀），也可逐项单独导入；已导入项显示「● 已导入」并可一键移除。每个导入项目会附带一个**占位 Telegram 平台**（cc-connect 强制每个项目至少一个平台，否则冷启动失败），导入后到 Dashboard 把占位替换为真实 IM 平台即可启用
+- **Dashboard 嵌入** — 「连接」弹窗内「打开 Dashboard」一键打开 cc-connect 自家 Web 控制台 iframe（自动登录态），直接在 mini-term 内配置 IM 平台 / 切换 provider / 管理 cron，无需另开浏览器；createPortal 到 `document.body` 绕开 Fluent 2 `[data-panel]` 的 backdrop-filter，确保全屏铺满；keep-alive 关闭走 `display:none` 不卸载，避免重新登录
+- **半同步态处理** — 项目导入 / 移除即使 cc-connect 重启失败，前端按 `tomlWritten` / `deletedOk` 分支仍维持本地 `projectLinks`，warning toast 提示 restart 失败原因，下次启动 cc-connect 自动生效
+- **优雅降级** — cc-connect 未运行时导入 / Dashboard 等按钮置灰提示「先启动 cc-connect」而非崩溃；config.toml 未配置 `[management].token` 时给出友好诊断指引用户跑 `cc-connect web` 自动生成
 
 ### 项目管理
 
@@ -146,7 +146,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 | Git | git2 0.19 |
 | 文件监听 | notify 7 + ignore 0.4（.gitignore 过滤） |
 | Tauri 插件 | `window-state` · `clipboard-manager` · `dialog` · `opener` |
-| 测试覆盖 | 87 个 Rust 单元测试（pty / fs / config / hook） |
+| 测试覆盖 | 155 个 Rust 单元测试（pty / fs / config / hook / cc-connect） |
 
 ## 快速开始
 
