@@ -5,6 +5,7 @@ import { getOrCreateTerminal, getCachedTerminal, activateWebgl, getTerminalTheme
 import { getResolvedTheme } from '../utils/themeManager';
 import { showContextMenu, type MenuEntry } from '../utils/contextMenu';
 import { isFileDragging, getFileDragPath } from '../utils/fileDragState';
+import { useT, t } from '../i18n';
 import type { SshConnection } from '../types';
 import '@xterm/xterm/css/xterm.css';
 
@@ -67,7 +68,7 @@ function buildSshSubmenu(connections: SshConnection[], ptyId: number): MenuEntry
   const entries: MenuEntry[] = [];
   for (const bucket of groups) {
     if (bucket.group || hasNamedGroup) {
-      entries.push({ header: bucket.group ?? '未分组' });
+      entries.push({ header: bucket.group ?? t('terminal.ungrouped') });
     }
     for (const conn of bucket.items) {
       entries.push({ label: conn.name, onClick: () => void connectSsh(ptyId, conn) });
@@ -77,6 +78,7 @@ function buildSshSubmenu(connections: SshConnection[], ptyId: number): MenuEntry
 }
 
 export function TerminalInstance({ ptyId }: Props) {
+  const t = useT();
   const containerRef = useRef<HTMLDivElement>(null);
   const [fileDrag, setFileDrag] = useState(false);
   const terminalFontSize = useAppStore((s) => s.config.terminalFontSize);
@@ -239,12 +241,12 @@ export function TerminalInstance({ ptyId }: Props) {
     const hasSelection = !!getCachedTerminal(ptyId)?.term.getSelection();
     const menu: MenuEntry[] = [
       {
-        label: '复制',
+        label: t('terminal.copy'),
         disabled: !hasSelection,
         onClick: () => { void copyTerminalSelection(ptyId); },
       },
       {
-        label: '粘贴',
+        label: t('terminal.paste'),
         onClick: () => {
           void pasteToTerminal(ptyId);
           getCachedTerminal(ptyId)?.term.focus();
@@ -252,8 +254,8 @@ export function TerminalInstance({ ptyId }: Props) {
       },
       { separator: true },
       sshConnections.length > 0
-        ? { label: 'SSH 连接', submenu: buildSshSubmenu(sshConnections, ptyId) }
-        : { label: 'SSH 连接（暂无）', disabled: true },
+        ? { label: t('terminal.sshConnect'), submenu: buildSshSubmenu(sshConnections, ptyId) }
+        : { label: t('terminal.sshConnectEmpty'), disabled: true },
     ];
     showContextMenu(e.clientX, e.clientY, menu);
   };
@@ -280,7 +282,7 @@ export function TerminalInstance({ ptyId }: Props) {
           >
             <span className="text-[var(--accent)] text-xs px-3 py-1.5 rounded-[var(--radius-md)]"
               style={{ background: 'var(--bg-overlay)' }}>
-              释放以插入路径
+              {t('terminal.dropToInsertPath')}
             </span>
           </div>
         )}

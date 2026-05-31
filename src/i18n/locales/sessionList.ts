@@ -1,0 +1,34 @@
+export const sessionList = {
+  zh: {
+    time: {
+      justNow: "刚刚",
+      minutesAgo: "{n}分钟前",
+      hoursAgo: "{n}小时前",
+      daysAgo: "{n}天前",
+      monthDay: "{m}月{d}日",
+    },
+    refresh: "刷新会话列表",
+    loading: "加载中…",
+    empty: "暂无会话记录",
+    selectProject: "请先选择项目",
+    view: "查看",
+    copyResumeCommand: "复制恢复命令",
+    more: "{n} 条更多…",
+  },
+  en: {
+    time: {
+      justNow: "just now",
+      minutesAgo: "{n} min ago",
+      hoursAgo: "{n} hr ago",
+      daysAgo: "{n} days ago",
+      monthDay: "{m}/{d}",
+    },
+    refresh: "Refresh session list",
+    loading: "Loading…",
+    empty: "No session history",
+    selectProject: "Select a project first",
+    view: "View",
+    copyResumeCommand: "Copy resume command",
+    more: "{n} more…",
+  },
+} as const;

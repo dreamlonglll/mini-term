@@ -4,6 +4,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '../store';
 import { showAlert } from '../utils/prompt';
 import { connectionSummary } from './SshModal';
+import { useT, t as tStatic } from '../i18n';
 import type { ProjectConfig, SshConnection } from '../types';
 
 interface Props {
@@ -39,6 +40,7 @@ function sameScope(a: string[] | undefined, b: string[] | undefined): boolean {
  * 全选时范围存为 undefined（含将来新增的连接），子集则存显式 id 列表。
  */
 export function SshAssocModal({ project, onClose }: Props) {
+  const t = useT();
   const connections = useAppStore((s) => s.config.sshConnections) ?? [];
   const allIds = useMemo(() => connections.map((c) => c.id), [connections]);
   const [checked, setChecked] = useState<Set<string>>(new Set());
@@ -98,29 +100,28 @@ export function SshAssocModal({ project, onClose }: Props) {
       onClose();
 
       const scopeDesc =
-        scope === undefined ? `全部 ${allIds.length} 个连接` : `${scope.length} 个连接`;
+        scope === undefined
+          ? tStatic('sshAssoc.scopeAll', { count: allIds.length })
+          : tStatic('sshAssoc.scopeSubset', { count: scope.length });
       if (nowEnabled && !wasEnabled) {
         await showAlert(
-          '已启用 SSH MCP',
-          `「${project.name}」的 AI agent 现在可访问 ${scopeDesc}。\n\n` +
-            '新会话即时可用；该项目里正在运行的 Claude / Codex 会话需重启后才生效。',
+          tStatic('sshAssoc.enabledTitle'),
+          tStatic('sshAssoc.enabledMessage', { name: project.name, scope: scopeDesc }),
         );
       } else if (nowEnabled && wasEnabled) {
         await showAlert(
-          '已更新关联范围',
-          `「${project.name}」的 AI agent 现在可访问 ${scopeDesc}。\n\n` +
-            '范围变更对该项目的 agent 即时生效，无需重启会话。',
+          tStatic('sshAssoc.updatedTitle'),
+          tStatic('sshAssoc.updatedMessage', { name: project.name, scope: scopeDesc }),
         );
       } else {
         await showAlert(
-          '已停用 SSH MCP',
-          `已为「${project.name}」停用 SSH MCP。\n\n` +
-            '该项目里正在运行的 Claude / Codex 会话需重启后才会移除 SSH 工具。',
+          tStatic('sshAssoc.disabledTitle'),
+          tStatic('sshAssoc.disabledMessage', { name: project.name, scope: scopeDesc }),
         );
       }
     } catch (e: unknown) {
       setBusy(false);
-      await showAlert('关联 SSH 失败', e instanceof Error ? e.message : String(e));
+      await showAlert(tStatic('sshAssoc.saveFailedTitle'), e instanceof Error ? e.message : String(e));
     }
   }, [project, checked, allIds, onClose]);
 
@@ -149,7 +150,7 @@ export function SshAssocModal({ project, onClose }: Props) {
         {/* 顶栏 */}
         <div className="px-5 py-4 border-b border-[var(--border-subtle)]">
           <div className="flex items-center justify-between">
-            <h2 className="text-lg font-semibold text-[var(--text-primary)]">关联 SSH</h2>
+            <h2 className="text-lg font-semibold text-[var(--text-primary)]">{t('sshAssoc.title')}</h2>
             <button
               className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors text-lg leading-none"
               onClick={onClose}
@@ -158,7 +159,7 @@ export function SshAssocModal({ project, onClose }: Props) {
             </button>
           </div>
           <div className="text-sm text-[var(--text-muted)] mt-1 truncate">
-            选择项目「{project.name}」的 AI agent 可访问的 SSH 连接
+            {t('sshAssoc.subtitle', { name: project.name })}
           </div>
         </div>
 
@@ -166,27 +167,27 @@ export function SshAssocModal({ project, onClose }: Props) {
         <div className="flex-1 overflow-y-auto px-5 py-4 space-y-3">
           {connections.length === 0 ? (
             <div className="text-center text-sm text-[var(--text-muted)] py-10">
-              还没有 SSH 连接，先在顶栏「SSH」里添加
+              {t('sshAssoc.empty')}
             </div>
           ) : (
             <>
               <div className="flex items-center justify-between text-sm text-[var(--text-muted)]">
                 <span>
-                  已选 {checked.size} / {connections.length}
+                  {t('sshAssoc.selectedCount', { checked: checked.size, total: connections.length })}
                 </span>
                 <div className="flex gap-2">
                   <button
                     className="hover:text-[var(--accent)] transition-colors"
                     onClick={() => setChecked(new Set(allIds))}
                   >
-                    全选
+                    {t('sshAssoc.selectAll')}
                   </button>
                   <span className="opacity-40">|</span>
                   <button
                     className="hover:text-[var(--accent)] transition-colors"
                     onClick={() => setChecked(new Set())}
                   >
-                    全不选
+                    {t('sshAssoc.selectNone')}
                   </button>
                 </div>
               </div>
@@ -195,7 +196,7 @@ export function SshAssocModal({ project, onClose }: Props) {
                 <div key={bucket.group ?? '__ungrouped__'} className="space-y-1">
                   {(bucket.group || hasNamedGroup) && (
                     <div className="text-sm text-[var(--text-muted)] uppercase tracking-[0.1em]">
-                      {bucket.group ?? '未分组'}
+                      {bucket.group ?? t('sshAssoc.ungrouped')}
                     </div>
                   )}
                   {bucket.items.map((conn) => (
@@ -229,22 +230,22 @@ export function SshAssocModal({ project, onClose }: Props) {
         <div className="px-5 py-3 border-t border-[var(--border-subtle)] flex items-center gap-3">
           <div className="text-xs text-[var(--text-muted)] flex-1">
             {checked.size === 0
-              ? '不勾选任何连接 = 停用该项目的 SSH MCP'
-              : '勾选的连接对该项目的 AI agent 可见'}
+              ? t('sshAssoc.footerHintEmpty')
+              : t('sshAssoc.footerHintSelected')}
           </div>
           <button
             className="px-3 py-1 text-base text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors disabled:opacity-40"
             onClick={onClose}
             disabled={busy}
           >
-            取消
+            {t('sshAssoc.cancel')}
           </button>
           <button
             className="px-3 py-1 text-base bg-[var(--accent)] text-[var(--bg-base)] rounded-[var(--radius-sm)] hover:opacity-90 transition-opacity disabled:opacity-40"
             onClick={handleSave}
             disabled={busy}
           >
-            {busy ? '处理中…' : '保存'}
+            {busy ? t('sshAssoc.saving') : t('sshAssoc.save')}
           </button>
         </div>
       </div>

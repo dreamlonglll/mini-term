@@ -1,3 +1,5 @@
+import { t } from "../i18n";
+
 const GITHUB_REPO = 'dreamlonglll/mini-term';
 
 export interface ReleaseInfo {
@@ -18,7 +20,7 @@ export function compareVersions(a: string, b: string): number {
 
 export async function checkForUpdate(currentVersion: string): Promise<ReleaseInfo | null> {
   const resp = await fetch(`https://api.github.com/repos/${GITHUB_REPO}/releases/latest`);
-  if (!resp.ok) throw new Error(resp.status === 404 ? '暂无发布版本' : `请求失败 (${resp.status})`);
+  if (!resp.ok) throw new Error(resp.status === 404 ? t("updateChecker.noRelease") : t("updateChecker.requestFailed", { status: resp.status }));
   const data = await resp.json();
   const release: ReleaseInfo = {
     version: data.tag_name,

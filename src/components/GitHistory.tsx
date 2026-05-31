@@ -4,11 +4,13 @@ import { useAppStore } from '../store';
 import { GitHistoryContent } from './GitHistoryContent';
 import { GitChanges } from './GitChanges';
 import { getGitHistoryCache, setGitHistoryCache } from '../utils/projectDataCache';
+import { useT } from '../i18n';
 import type { GitRepoInfo } from '../types';
 
 type GitTab = 'history' | 'changes';
 
 export function GitHistory() {
+  const t = useT();
   const activeProjectId = useAppStore((s) => s.activeProjectId);
   const config = useAppStore((s) => s.config);
   const project = config.projects.find((p) => p.id === activeProjectId);
@@ -81,7 +83,7 @@ export function GitHistory() {
   if (!project) {
     return (
       <div className="h-full bg-[var(--bg-surface)] flex items-center justify-center text-[var(--text-muted)] text-base">
-        选择一个项目
+        {t("gitHistory.selectProject")}
       </div>
     );
   }
@@ -122,7 +124,7 @@ export function GitHistory() {
               >
                 &#9662;
               </span>
-              <span className="truncate font-medium">{selectedRepoInfo?.name ?? '选择仓库'}</span>
+              <span className="truncate font-medium">{selectedRepoInfo?.name ?? t("gitHistory.selectRepo")}</span>
               {selectedRepoInfo?.currentBranch && (
                 <span className="shrink-0 text-[11px] leading-[18px] px-1.5 rounded font-mono text-[var(--text-muted)] bg-[var(--border-subtle)]">
                   {selectedRepoInfo.currentBranch}

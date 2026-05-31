@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, type ReactNode } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { useAppStore, genId } from '../store';
+import { useT } from '../i18n';
 import type { SshConnection } from '../types';
 
 interface Props {
@@ -45,6 +46,7 @@ function SshConnectionForm({
   onSave: (conn: SshConnection) => void;
   onCancel: () => void;
 }) {
+  const t = useT();
   const [name, setName] = useState(initial.name);
   const [host, setHost] = useState(initial.host);
   const [port, setPort] = useState(String(initial.port || 22));
@@ -54,9 +56,9 @@ function SshConnectionForm({
   const [group, setGroup] = useState(initial.group ?? '');
 
   const handleBrowse = useCallback(async () => {
-    const selected = await openDialog({ title: '选择私钥文件', multiple: false, directory: false });
+    const selected = await openDialog({ title: t('sshModal.selectKeyFile'), multiple: false, directory: false });
     if (typeof selected === 'string' && selected.trim()) setIdentityFile(selected);
-  }, []);
+  }, [t]);
 
   const canSave = !!(name.trim() && host.trim() && user.trim());
 
@@ -77,28 +79,28 @@ function SshConnectionForm({
 
   return (
     <div className="flex flex-col gap-2.5 p-3 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--accent)] border-dashed">
-      <Field label="名称 *">
+      <Field label={t('sshModal.nameLabel')}>
         <input
           className={INPUT_CLASS}
           value={name}
           onChange={(e) => setName(e.target.value)}
-          placeholder="如 生产服务器"
+          placeholder={t('sshModal.namePlaceholder')}
           autoFocus
         />
       </Field>
       <div className="flex gap-2">
         <div className="flex-[2]">
-          <Field label="主机 *">
+          <Field label={t('sshModal.hostLabel')}>
             <input
               className={INPUT_CLASS}
               value={host}
               onChange={(e) => setHost(e.target.value)}
-              placeholder="example.com 或 10.0.0.5"
+              placeholder={t('sshModal.hostPlaceholder')}
             />
           </Field>
         </div>
         <div className="flex-1">
-          <Field label="端口">
+          <Field label={t('sshModal.portLabel')}>
             <input
               className={INPUT_CLASS}
               type="number"
@@ -108,17 +110,17 @@ function SshConnectionForm({
           </Field>
         </div>
       </div>
-      <Field label="用户名 *">
+      <Field label={t('sshModal.userLabel')}>
         <input
           className={INPUT_CLASS}
           value={user}
           onChange={(e) => setUser(e.target.value)}
-          placeholder="root"
+          placeholder={t('sshModal.userPlaceholder')}
         />
       </Field>
       <Field
-        label="密码"
-        hint="留空则连接时在终端手动输入；填写则明文保存在 config.json，连接时自动填充"
+        label={t('sshModal.passwordLabel')}
+        hint={t('sshModal.passwordHint')}
       >
         <input
           className={INPUT_CLASS}
@@ -127,13 +129,13 @@ function SshConnectionForm({
           onChange={(e) => setPassword(e.target.value)}
         />
       </Field>
-      <Field label="私钥文件" hint="可选，对应 ssh -i">
+      <Field label={t('sshModal.identityLabel')} hint={t('sshModal.identityHint')}>
         <div className="flex gap-2">
           <input
             className={INPUT_CLASS}
             value={identityFile}
             onChange={(e) => setIdentityFile(e.target.value)}
-            placeholder="私钥文件路径"
+            placeholder={t('sshModal.identityPlaceholder')}
           />
           <button
             type="button"
@@ -144,12 +146,12 @@ function SshConnectionForm({
           </button>
         </div>
       </Field>
-      <Field label="分组" hint="可选，用于在列表与右键菜单中归类">
+      <Field label={t('sshModal.groupLabel')} hint={t('sshModal.groupHint')}>
         <input
           className={INPUT_CLASS}
           value={group}
           onChange={(e) => setGroup(e.target.value)}
-          placeholder="如 内网 / 客户A"
+          placeholder={t('sshModal.groupPlaceholder')}
         />
       </Field>
       <div className="flex gap-2 justify-end pt-0.5">
@@ -157,14 +159,14 @@ function SshConnectionForm({
           className="px-3 py-1 text-base text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors"
           onClick={onCancel}
         >
-          取消
+          {t('sshModal.cancel')}
         </button>
         <button
           className="px-3 py-1 text-base bg-[var(--accent)] text-[var(--bg-base)] rounded-[var(--radius-sm)] hover:opacity-90 transition-opacity disabled:opacity-40"
           onClick={handleSave}
           disabled={!canSave}
         >
-          保存
+          {t('sshModal.save')}
         </button>
       </div>
     </div>
@@ -182,13 +184,14 @@ function SshRow({
   onEdit: () => void;
   onDelete: () => void;
 }) {
+  const t = useT();
   return (
     <div className="flex items-center gap-3 px-3 py-2.5 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)] group hover:border-[var(--border-default)] transition-colors">
       <div className="flex-1 min-w-0">
         <div className="text-base font-medium text-[var(--text-primary)] truncate">{conn.name}</div>
         <div className="text-sm text-[var(--text-muted)] font-mono truncate">
           {connectionSummary(conn)}
-          {conn.password ? ' · 已存密码' : ''}
+          {conn.password ? t('sshModal.passwordSaved') : ''}
         </div>
       </div>
       <div className="hidden group-hover:flex items-center gap-1">
@@ -196,13 +199,13 @@ function SshRow({
           className="px-2 py-0.5 text-sm text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors"
           onClick={onEdit}
         >
-          编辑
+          {t('sshModal.edit')}
         </button>
         <button
           className="px-2 py-0.5 text-sm text-[var(--text-muted)] hover:text-[var(--color-error)] transition-colors"
           onClick={onDelete}
         >
-          删除
+          {t('sshModal.delete')}
         </button>
       </div>
     </div>
@@ -212,6 +215,7 @@ function SshRow({
 // ─── SshModal（主弹窗）───
 
 export function SshModal({ open, onClose }: Props) {
+  const t = useT();
   const setConfig = useAppStore((s) => s.setConfig);
   const connections = useAppStore((s) => s.config.sshConnections) ?? [];
   const [adding, setAdding] = useState(false);
@@ -267,7 +271,7 @@ export function SshModal({ open, onClose }: Props) {
       <div className="relative w-[560px] max-h-[80vh] bg-[var(--bg-surface)] border border-[var(--border-strong)] rounded-[var(--radius-md)] shadow-[var(--shadow-overlay)] flex flex-col overflow-hidden animate-slide-in">
         {/* 顶栏 */}
         <div className="flex items-center justify-between px-5 py-4 border-b border-[var(--border-subtle)]">
-          <h2 className="text-lg font-semibold text-[var(--text-primary)]">SSH 连接</h2>
+          <h2 className="text-lg font-semibold text-[var(--text-primary)]">{t('sshModal.title')}</h2>
           <button
             className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors text-lg leading-none"
             onClick={onClose}
@@ -280,7 +284,7 @@ export function SshModal({ open, onClose }: Props) {
         <div className="flex-1 overflow-y-auto px-5 py-4 space-y-3">
           {connections.length === 0 && !adding && (
             <div className="text-center text-sm text-[var(--text-muted)] py-10">
-              还没有 SSH 连接，点下方按钮添加
+              {t('sshModal.empty')}
             </div>
           )}
 
@@ -288,7 +292,7 @@ export function SshModal({ open, onClose }: Props) {
             <div key={bucket.group ?? '__ungrouped__'} className="space-y-1.5">
               {(bucket.group || hasNamedGroup) && (
                 <div className="text-sm text-[var(--text-muted)] uppercase tracking-[0.1em]">
-                  {bucket.group ?? '未分组'}
+                  {bucket.group ?? t('sshModal.ungrouped')}
                 </div>
               )}
               {bucket.items.map((conn) =>
@@ -330,12 +334,12 @@ export function SshModal({ open, onClose }: Props) {
                 setAdding(true);
               }}
             >
-              + 添加连接
+              {t('sshModal.addConnection')}
             </button>
           )}
 
           <div className="pt-1 text-sm text-[var(--text-muted)]">
-            在终端中右键「SSH 连接」即可快速选择并连接
+            {t('sshModal.footerHint')}
           </div>
         </div>
       </div>

@@ -1,5 +1,6 @@
 import type { AiMarker } from '../types';
 import { scrollToMarker } from '../utils/terminalCache';
+import { useT } from '../i18n';
 
 interface Props {
   ptyId: number;
@@ -17,10 +18,11 @@ function truncate(s: string, max = 40): string {
 }
 
 export function MarkerList({ ptyId, markers, onClose }: Props) {
+  const t = useT();
   if (markers.length === 0) {
     return (
       <div className="px-3 py-2 text-xs text-[var(--text-muted)]">
-        暂无标记
+        {t("markerList.empty")}
       </div>
     );
   }
@@ -43,7 +45,7 @@ export function MarkerList({ ptyId, markers, onClose }: Props) {
             <span
               className="w-1.5 h-1.5 rounded-full shrink-0"
               style={{ background: 'var(--color-ai-working)' }}
-              aria-label="正在进行"
+              aria-label={t("markerList.inProgress")}
             />
           )}
         </button>

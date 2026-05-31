@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { InlineView, SideBySideView } from './DiffModal';
 import { useAppStore } from '../store';
+import { useT } from '../i18n';
 import type { CommitFileInfo, GitDiffResult } from '../types';
 
 interface CommitDiffModalProps {
@@ -31,6 +32,7 @@ export function CommitDiffModal({
   commitMessage,
   files,
 }: CommitDiffModalProps) {
+  const t = useT();
   const [viewMode, setViewMode] = useState<ViewMode>('side-by-side');
   const [selectedFile, setSelectedFile] = useState<string>(files[0]?.path ?? '');
   const terminalFontSize = useAppStore((s) => s.config.terminalFontSize) || 14;
@@ -128,7 +130,7 @@ export function CommitDiffModal({
             })}
           </div>
           <div className="px-3 py-2 border-t border-[var(--border-subtle)] text-xs text-[var(--text-muted)]">
-            {files.length} 个文件变更
+            {t("commitDiff.fileCount", { count: files.length })}
           </div>
         </div>
 
@@ -150,7 +152,7 @@ export function CommitDiffModal({
                   }`}
                   onClick={() => setViewMode('side-by-side')}
                 >
-                  并排
+                  {t("commitDiff.sideBySide")}
                 </button>
                 <button
                   className={`px-3 py-1 text-sm transition-colors ${
@@ -160,7 +162,7 @@ export function CommitDiffModal({
                   }`}
                   onClick={() => setViewMode('inline')}
                 >
-                  内联
+                  {t("commitDiff.inline")}
                 </button>
               </div>
               <button
@@ -175,7 +177,7 @@ export function CommitDiffModal({
           <div className="flex-1 overflow-auto bg-[var(--bg-base)]">
             {loading && (
               <div className="flex items-center justify-center h-full text-[var(--text-muted)]">
-                加载中...
+                {t("commitDiff.loading")}
               </div>
             )}
             {error && (
@@ -185,12 +187,12 @@ export function CommitDiffModal({
             )}
             {diffResult && diffResult.isBinary && (
               <div className="flex items-center justify-center h-full text-[var(--text-muted)]">
-                二进制文件，不支持 diff 预览
+                {t("commitDiff.binaryFile")}
               </div>
             )}
             {diffResult && diffResult.tooLarge && (
               <div className="flex items-center justify-center h-full text-[var(--text-muted)]">
-                文件过大（&gt;1MB），不支持 diff 预览
+                {t("commitDiff.tooLarge")}
               </div>
             )}
             {diffResult && !diffResult.isBinary && !diffResult.tooLarge && (
@@ -200,7 +202,7 @@ export function CommitDiffModal({
             )}
             {!loading && !error && !diffResult && files.length === 0 && (
               <div className="flex items-center justify-center h-full text-[var(--text-muted)]">
-                该提交无文件变更
+                {t("commitDiff.noChanges")}
               </div>
             )}
           </div>

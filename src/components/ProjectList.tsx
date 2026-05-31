@@ -14,6 +14,7 @@ import { ProjectEnvVarsModal } from './ProjectEnvVarsModal';
 import { showContextMenu } from '../utils/contextMenu';
 import { showPrompt } from '../utils/prompt';
 import { initProjectDrag, isProjectDragging, getProjectDragPayload, onProjectDragEnd } from '../utils/projectDragState';
+import { useT } from '../i18n';
 import {
   getOrderedTree,
   collectAllGroups,
@@ -41,6 +42,7 @@ interface DropIndicator {
 }
 
 export function ProjectList() {
+  const t = useT();
   const config = useAppStore((s) => s.config);
   const activeProjectId = useAppStore((s) => s.activeProjectId);
   const projectStates = useAppStore((s) => s.projectStates);
@@ -194,11 +196,11 @@ export function ProjectList() {
 
   // 创建分组
   const handleCreateGroup = useCallback(async () => {
-    const name = await showPrompt('新建分组', '请输入分组名称');
+    const name = await showPrompt(t('projectList.newGroup'), t('projectList.newGroupPlaceholder'));
     if (!name?.trim()) return;
     createGroup(name.trim());
     saveConfig();
-  }, [createGroup]);
+  }, [createGroup, t]);
 
   const renameProject = useAppStore((s) => s.renameProject);
 
@@ -372,16 +374,16 @@ export function ProjectList() {
           e.preventDefault();
           e.stopPropagation();
           const menuItems: Parameters<typeof showContextMenu>[2] = [
-            { label: '重命名', onClick: () => startRenameProject(project.id, project.name) },
-            { label: '在文件夹中打开', onClick: () => revealItemInDir(project.path) },
-            { label: '复制绝对路径', onClick: () => navigator.clipboard.writeText(project.path) },
+            { label: t('projectList.menu.rename'), onClick: () => startRenameProject(project.id, project.name) },
+            { label: t('projectList.menu.openInFolder'), onClick: () => revealItemInDir(project.path) },
+            { label: t('projectList.menu.copyAbsolutePath'), onClick: () => navigator.clipboard.writeText(project.path) },
             { separator: true },
             {
-              label: '关联 SSH…',
+              label: t('projectList.menu.associateSsh'),
               onClick: () => setSshAssocTarget(project),
             },
             {
-              label: '环境变量…',
+              label: t('projectList.menu.envVars'),
               onClick: () => setEnvVarsTarget(project),
             },
           ];
@@ -390,7 +392,7 @@ export function ProjectList() {
             menuItems.push({ separator: true });
             if (parentGroupId) {
               menuItems.push({
-                label: '移出分组',
+                label: t('projectList.menu.moveOutOfGroup'),
                 onClick: () => { moveItem(project.id, null); saveConfig(); },
               });
             }
@@ -398,7 +400,7 @@ export function ProjectList() {
               if (g.id === parentGroupId) continue;
               if (gDepth + 1 > MAX_DEPTH) continue;
               menuItems.push({
-                label: `移动到「${g.name}」`,
+                label: t('projectList.menu.moveTo', { name: g.name }),
                 onClick: () => { moveItem(project.id, g.id); saveConfig(); },
               });
             }
@@ -467,20 +469,20 @@ export function ProjectList() {
             e.preventDefault();
             e.stopPropagation();
             const menuItems: Parameters<typeof showContextMenu>[2] = [
-              { label: '重命名分组', onClick: () => startRenameGroup(group.id, group.name) },
-              { label: '添加项目', onClick: () => handleAddProject(group.id) },
+              { label: t('projectList.menu.renameGroup'), onClick: () => startRenameGroup(group.id, group.name) },
+              { label: t('projectList.menu.addProject'), onClick: () => handleAddProject(group.id) },
             ];
             if (depth > 0) {
               menuItems.push({
-                label: '移出分组',
+                label: t('projectList.menu.moveOutOfGroup'),
                 onClick: () => { moveItem(group.id, null); saveConfig(); },
               });
             }
             if (groupDepth < MAX_DEPTH - 1) {
               menuItems.push({
-                label: '新建子组',
+                label: t('projectList.menu.newSubgroup'),
                 onClick: async () => {
-                  const name = await showPrompt('新建子组', '请输入子组名称');
+                  const name = await showPrompt(t('projectList.newSubgroup'), t('projectList.newSubgroupPlaceholder'));
                   if (!name?.trim()) return;
                   createGroup(name.trim(), group.id);
                   saveConfig();
@@ -488,7 +490,7 @@ export function ProjectList() {
               });
             }
             menuItems.push(
-              { label: '删除分组（保留项目）', danger: true, onClick: () => { removeGroup(group.id); saveConfig(); } },
+              { label: t('projectList.menu.deleteGroup'), danger: true, onClick: () => { removeGroup(group.id); saveConfig(); } },
             );
             showContextMenu(e.clientX, e.clientY, menuItems);
           }}
@@ -546,10 +548,10 @@ export function ProjectList() {
                       : 'text-[var(--accent)]'
                 }`}>
                   {fileDragKind === 'forbidden'
-                    ? '仅支持拖入文件夹'
+                    ? t('projectList.dragHint.forbidden')
                     : fileDragKind === 'duplicate'
-                      ? '项目已存在，松手切换'
-                      : '拖放文件夹以添加项目'}
+                      ? t('projectList.dragHint.duplicate')
+                      : t('projectList.dragHint.valid')}
                 </span>
               </div>
             )}
@@ -558,7 +560,7 @@ export function ProjectList() {
               onContextMenu={(e) => {
                 e.preventDefault();
                 showContextMenu(e.clientX, e.clientY, [
-                  { label: '新建分组', onClick: handleCreateGroup },
+                  { label: t('projectList.newGroup'), onClick: handleCreateGroup },
                 ]);
               }}
             >
@@ -578,12 +580,12 @@ export function ProjectList() {
                 className="flex-1 px-3 py-2 border border-dashed border-[var(--border-default)] rounded-[var(--radius-md)] text-center text-sm text-[var(--text-muted)] cursor-pointer hover:border-[var(--accent)] hover:text-[var(--accent)] transition-all duration-200"
                 onClick={() => handleAddProject()}
               >
-                + 添加项目
+                {t('projectList.addProject')}
               </div>
               <div
                 className="px-3 py-2 border border-dashed border-[var(--border-default)] rounded-[var(--radius-md)] text-center text-sm text-[var(--text-muted)] cursor-pointer hover:border-[var(--accent)] hover:text-[var(--accent)] transition-all duration-200"
                 onClick={handleCreateGroup}
-                title="新建分组"
+                title={t('projectList.newGroup')}
               >
                 +
               </div>
@@ -610,22 +612,22 @@ export function ProjectList() {
             className="relative w-[320px] bg-[var(--bg-surface)] border border-[var(--border-strong)] rounded-[var(--radius-md)] shadow-[var(--shadow-overlay)] p-5 animate-slide-in"
             onClick={(e) => e.stopPropagation()}
           >
-            <div className="text-sm font-medium text-[var(--text-primary)] mb-2">移除项目</div>
+            <div className="text-sm font-medium text-[var(--text-primary)] mb-2">{t('projectList.removeConfirm.title')}</div>
             <div className="text-xs text-[var(--text-secondary)] mb-5">
-              确定要移除项目「<span className="text-[var(--accent)]">{confirmTarget.name}</span>」吗？此操作仅从列表中移除，不会删除文件。
+              {t('projectList.removeConfirm.messagePrefix')}<span className="text-[var(--accent)]">{confirmTarget.name}</span>{t('projectList.removeConfirm.messageSuffix')}
             </div>
             <div className="flex justify-end gap-2">
               <button
                 className="px-3 py-1.5 text-xs rounded-[var(--radius-sm)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--border-subtle)] transition-colors"
                 onClick={() => setConfirmTarget(null)}
               >
-                取消
+                {t('projectList.removeConfirm.cancel')}
               </button>
               <button
                 className="px-3 py-1.5 text-xs rounded-[var(--radius-sm)] bg-[var(--color-error)] text-white hover:opacity-90 transition-opacity"
                 onClick={doRemove}
               >
-                移除
+                {t('projectList.removeConfirm.confirm')}
               </button>
             </div>
           </div>

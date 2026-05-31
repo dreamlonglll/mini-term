@@ -1,6 +1,7 @@
 import type { MouseEvent } from 'react';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { showConfirm } from './prompt';
+import { t } from '../i18n';
 
 export function isHttpUrl(href: string | null | undefined): href is string {
   return !!href && /^https?:\/\//i.test(href);
@@ -14,7 +15,7 @@ export async function handleExternalLinkClick(e: MouseEvent<HTMLAnchorElement>) 
   const href = e.currentTarget.getAttribute('href');
   if (!isHttpUrl(href)) return;
   e.preventDefault();
-  const ok = await showConfirm('在浏览器中打开链接?', href);
+  const ok = await showConfirm(t('externalLink.openConfirm'), href);
   if (!ok) return;
   openUrl(href).catch((err) => console.error('打开链接失败:', err));
 }

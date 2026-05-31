@@ -10,6 +10,7 @@ import { showConfirm, showPrompt } from '../utils/prompt';
 import { disposeTerminal } from '../utils/terminalCache';
 import { getProjectEnvs } from '../utils/projectEnv';
 import { MOD_LABEL } from '../utils/platform';
+import { useT } from '../i18n';
 import type { SplitNode, PaneState, ShellConfig, AiMarker } from '../types';
 
 const EMPTY_MARKERS: AiMarker[] = [];
@@ -36,6 +37,7 @@ interface Props {
 }
 
 export function PaneGroup({ projectId, node, projectPath, onSplit, onClosePane, onUpdateNode }: Props) {
+  const t = useT();
   const config = useAppStore((s) => s.config);
   const setPanePty = useAppStore((s) => s.setPanePty);
   const updatePaneStatusByPaneId = useAppStore((s) => s.updatePaneStatusByPaneId);
@@ -138,10 +140,10 @@ export function PaneGroup({ projectId, node, projectPath, onSplit, onClosePane, 
 
     const label = pane.customTitle || pane.shellName;
     const hasAi = pane.status === 'ai-working' || pane.status === 'ai-idle';
-    const title = hasAi ? '关闭 AI 对话' : '关闭终端';
+    const title = hasAi ? t('paneGroup.closeAiTitle') : t('paneGroup.closeTerminalTitle');
     const message = hasAi
-      ? `终端「${label}」正在运行 AI 对话，关闭后对话将被终止，确定继续吗？`
-      : `确定要关闭终端「${label}」吗？`;
+      ? t('paneGroup.closeTabAiMessage', { label })
+      : t('paneGroup.closeTabMessage', { label });
 
     const confirmed = await showConfirm(title, message);
     if (!confirmed) return;
@@ -172,7 +174,7 @@ export function PaneGroup({ projectId, node, projectPath, onSplit, onClosePane, 
   const handleRenameTab = useCallback(async (paneId: string) => {
     const pane = node.panes.find((p) => p.id === paneId);
     if (!pane) return;
-    const newTitle = await showPrompt('重命名终端', pane.customTitle || pane.shellName);
+    const newTitle = await showPrompt(t('paneGroup.renameTerminal'), pane.customTitle || pane.shellName);
     if (newTitle === null) return;
     onUpdateNode({
       ...node,
@@ -192,10 +194,10 @@ export function PaneGroup({ projectId, node, projectPath, onSplit, onClosePane, 
     const aiCount = node.panes.filter(
       (p) => p.status === 'ai-working' || p.status === 'ai-idle'
     ).length;
-    const title = aiCount > 0 ? '关闭 AI 对话' : '关闭终端';
+    const title = aiCount > 0 ? t('paneGroup.closeAiTitle') : t('paneGroup.closeTerminalTitle');
     const message = aiCount > 0
-      ? `该区域内有 ${aiCount} 个终端正在运行 AI 对话，关闭后对话将被终止，确定继续吗？`
-      : '确定要关闭该区域内所有终端吗？';
+      ? t('paneGroup.closeGroupAiMessage', { count: aiCount })
+      : t('paneGroup.closeGroupMessage');
 
     const confirmed = await showConfirm(title, message);
     if (!confirmed) return;
@@ -273,7 +275,7 @@ export function PaneGroup({ projectId, node, projectPath, onSplit, onClosePane, 
                 e.preventDefault();
                 e.stopPropagation();
                 showContextMenu(e.clientX, e.clientY, [
-                  { label: '重命名', onClick: () => handleRenameTab(pane.id) },
+                  { label: t('paneGroup.rename'), onClick: () => handleRenameTab(pane.id) },
                 ]);
               }}
             >
@@ -313,7 +315,7 @@ export function PaneGroup({ projectId, node, projectPath, onSplit, onClosePane, 
               type="button"
               className="mr-1 px-1.5 py-0.5 text-[11px] rounded text-[var(--text-muted)] hover:text-[var(--accent)] hover:bg-[var(--border-subtle)] flex items-center gap-1 transition-colors"
               onClick={() => (markerOpen ? setMarkerOpen(false) : openMarkerPopover())}
-              title={`AI 任务标记 (${MOD_LABEL}+Shift+↑/↓ 跳转)`}
+              title={t('paneGroup.markerTooltip', { mod: MOD_LABEL })}
             >
               <span>⚑</span>
               <span className="tabular-nums">{markers.length}</span>
@@ -357,18 +359,18 @@ export function PaneGroup({ projectId, node, projectPath, onSplit, onClosePane, 
             />
           ) : activePane.status === 'error' ? (
             <div className="h-full flex flex-col items-center justify-center gap-2 text-[var(--text-muted)] text-sm">
-              <div>终端启动失败</div>
+              <div>{t('paneGroup.startFailed')}</div>
               <button
                 type="button"
                 className="px-3 py-1.5 rounded-[var(--radius-sm)] border border-[var(--border-default)] hover:border-[var(--accent)] hover:text-[var(--accent)] transition-colors"
                 onClick={handleRetryCreatePty}
               >
-                重试
+                {t('paneGroup.retry')}
               </button>
             </div>
           ) : (
             <div className="h-full flex items-center justify-center text-[var(--text-muted)] text-sm">
-              正在启动终端...
+              {t('paneGroup.starting')}
             </div>
           )}
         </div>

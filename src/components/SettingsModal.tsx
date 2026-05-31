@@ -10,6 +10,8 @@ import { applyTheme } from '../utils/themeManager';
 import { updateAllTerminalThemes, DEFAULT_TERMINAL_FONT_FAMILY } from '../utils/terminalCache';
 import { applyUiFontFamily } from '../utils/fontManager';
 import { MOD_LABEL } from '../utils/platform';
+import { useT } from '../i18n';
+import { LanguageToggle } from './LanguageToggle';
 import type { ShellConfig, EditorConfig } from '../types';
 
 interface Props {
@@ -36,6 +38,7 @@ function ShellRow({
   onDelete: () => void;
   onUpdate: (s: ShellConfig) => void;
 }) {
+  const t = useT();
   const [editing, setEditing] = useState(false);
   const [name, setName] = useState(shell.name);
   const [command, setCommand] = useState(shell.command);
@@ -62,13 +65,13 @@ function ShellRow({
         <div className="flex gap-2">
           <input
             className="flex-1 bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1 text-base outline-none focus:border-[var(--accent)]"
-            placeholder="名称"
+            placeholder={t("settings.common.namePlaceholder")}
             value={name}
             onChange={(e) => setName(e.target.value)}
           />
           <input
             className="flex-[2] bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1 text-base outline-none focus:border-[var(--accent)] font-mono"
-            placeholder="命令路径"
+            placeholder={t("settings.shellRow.commandPlaceholder")}
             value={command}
             onChange={(e) => setCommand(e.target.value)}
           />
@@ -76,7 +79,7 @@ function ShellRow({
         <div className="flex gap-2 items-center">
           <input
             className="flex-1 bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1 text-base outline-none focus:border-[var(--accent)] font-mono"
-            placeholder="启动参数（空格分隔，可选）"
+            placeholder={t("settings.shellRow.argsPlaceholder")}
             value={args}
             onChange={(e) => setArgs(e.target.value)}
           />
@@ -84,13 +87,13 @@ function ShellRow({
             className="px-3 py-1 text-base bg-[var(--accent)] text-[var(--bg-base)] rounded-[var(--radius-sm)] hover:opacity-90 transition-opacity"
             onClick={handleSave}
           >
-            保存
+            {t("settings.common.save")}
           </button>
           <button
             className="px-3 py-1 text-base text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors"
             onClick={() => setEditing(false)}
           >
-            取消
+            {t("settings.common.cancel")}
           </button>
         </div>
       </div>
@@ -106,7 +109,7 @@ function ShellRow({
             : 'border-[var(--border-strong)] hover:border-[var(--accent)]'
         }`}
         onClick={onSetDefault}
-        title="设为默认"
+        title={t("settings.common.setDefault")}
       />
       <div className="flex-1 min-w-0">
         <div className="text-base font-medium text-[var(--text-primary)]">{shell.name}</div>
@@ -119,13 +122,13 @@ function ShellRow({
           className="px-2 py-0.5 text-sm text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors"
           onClick={() => setEditing(true)}
         >
-          编辑
+          {t("settings.common.edit")}
         </button>
         <button
           className="px-2 py-0.5 text-sm text-[var(--text-muted)] hover:text-[var(--color-error)] transition-colors"
           onClick={onDelete}
         >
-          删除
+          {t("settings.common.delete")}
         </button>
       </div>
     </div>
@@ -149,6 +152,7 @@ function EditorRow({
   onUpdate: (e: EditorConfig) => void;
   onBrowse: (onSelect: (path: string) => void) => void;
 }) {
+  const t = useT();
   const [editing, setEditing] = useState(false);
   const [name, setName] = useState(editor.name);
   const [command, setCommand] = useState(editor.command);
@@ -171,14 +175,14 @@ function EditorRow({
       <div className="flex flex-col gap-2 p-3 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-default)]">
         <input
           className="bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1 text-base outline-none focus:border-[var(--accent)]"
-          placeholder="名称"
+          placeholder={t("settings.common.namePlaceholder")}
           value={name}
           onChange={(e) => setName(e.target.value)}
         />
         <div className="flex gap-2 items-center">
           <input
             className="flex-1 bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1 text-base outline-none focus:border-[var(--accent)] font-mono"
-            placeholder="可执行文件路径"
+            placeholder={t("settings.editorRow.execPathPlaceholder")}
             value={command}
             onChange={(e) => setCommand(e.target.value)}
           />
@@ -193,13 +197,13 @@ function EditorRow({
             className="px-3 py-1 text-base bg-[var(--accent)] text-[var(--bg-base)] rounded-[var(--radius-sm)] hover:opacity-90 transition-opacity"
             onClick={handleSave}
           >
-            保存
+            {t("settings.common.save")}
           </button>
           <button
             className="px-3 py-1 text-base text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors"
             onClick={() => setEditing(false)}
           >
-            取消
+            {t("settings.common.cancel")}
           </button>
         </div>
       </div>
@@ -215,7 +219,7 @@ function EditorRow({
             : 'border-[var(--border-strong)] hover:border-[var(--accent)]'
         }`}
         onClick={onSetDefault}
-        title="设为默认"
+        title={t("settings.common.setDefault")}
       />
       <div className="flex-1 min-w-0">
         <div className="text-base font-medium text-[var(--text-primary)]">{editor.name}</div>
@@ -226,13 +230,13 @@ function EditorRow({
           className="px-2 py-0.5 text-sm text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors"
           onClick={() => setEditing(true)}
         >
-          编辑
+          {t("settings.common.edit")}
         </button>
         <button
           className="px-2 py-0.5 text-sm text-[var(--text-muted)] hover:text-[var(--color-error)] transition-colors"
           onClick={onDelete}
         >
-          删除
+          {t("settings.common.delete")}
         </button>
       </div>
     </div>
@@ -242,6 +246,7 @@ function EditorRow({
 // ─── TerminalSettings（终端设置页）───
 
 function TerminalSettings() {
+  const t = useT();
   const config = useAppStore((s) => s.config);
   const setConfig = useAppStore((s) => s.setConfig);
 
@@ -353,7 +358,7 @@ function TerminalSettings() {
   return (
     <div className="space-y-2">
       <div className="text-base text-[var(--text-muted)] uppercase tracking-[0.1em] mb-2">
-        可用终端（●= 默认）
+        {t("settings.terminal.availableTerminals")}
       </div>
       {shells.map((shell, idx) => (
         <ShellRow
@@ -371,14 +376,14 @@ function TerminalSettings() {
           <div className="flex gap-2">
             <input
               className="flex-1 bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1 text-base outline-none focus:border-[var(--accent)]"
-              placeholder="名称（如 pwsh）"
+              placeholder={t("settings.terminal.newNamePlaceholder")}
               value={newName}
               onChange={(e) => setNewName(e.target.value)}
               autoFocus
             />
             <input
               className="flex-[2] bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1 text-base outline-none focus:border-[var(--accent)] font-mono"
-              placeholder="命令路径（如 pwsh 或 C:\...\bash.exe）"
+              placeholder={t("settings.terminal.newCommandPlaceholder")}
               value={newCommand}
               onChange={(e) => setNewCommand(e.target.value)}
             />
@@ -386,7 +391,7 @@ function TerminalSettings() {
           <div className="flex gap-2 items-center">
             <input
               className="flex-1 bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1 text-base outline-none focus:border-[var(--accent)] font-mono"
-              placeholder="启动参数（空格分隔，可选）"
+              placeholder={t("settings.terminal.newArgsPlaceholder")}
               value={newArgs}
               onChange={(e) => setNewArgs(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && handleAdd()}
@@ -395,13 +400,13 @@ function TerminalSettings() {
               className="px-3 py-1 text-base bg-[var(--accent)] text-[var(--bg-base)] rounded-[var(--radius-sm)] hover:opacity-90 transition-opacity"
               onClick={handleAdd}
             >
-              添加
+              {t("settings.common.add")}
             </button>
             <button
               className="px-3 py-1 text-base text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors"
               onClick={() => setAdding(false)}
             >
-              取消
+              {t("settings.common.cancel")}
             </button>
           </div>
         </div>
@@ -410,23 +415,23 @@ function TerminalSettings() {
           className="w-full py-2.5 border border-dashed border-[var(--border-default)] rounded-[var(--radius-md)] text-base text-[var(--text-muted)] hover:border-[var(--accent)] hover:text-[var(--accent)] transition-all"
           onClick={() => setAdding(true)}
         >
-          + 添加终端
+          {t("settings.terminal.addTerminal")}
         </button>
       )}
 
       <div className="pt-3 text-sm text-[var(--text-muted)]">
-        点击圆点设为默认终端 · 新建终端标签页时可选择类型
+        {t("settings.terminal.defaultHint")}
       </div>
 
       <div className="pt-6 text-base text-[var(--text-muted)] uppercase tracking-[0.1em] mb-2">
-        复制粘贴
+        {t("settings.terminal.copyPaste")}
       </div>
 
       <div className="flex items-center justify-between px-3 py-2.5 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)]">
         <div className="pr-4">
-          <div className="text-base text-[var(--text-primary)]">智能 Ctrl+C / Ctrl+V</div>
+          <div className="text-base text-[var(--text-primary)]">{t("settings.terminal.smartCopyPasteTitle")}</div>
           <div className="text-sm text-[var(--text-muted)]">
-            开启后选中文本时 Ctrl+C 复制、无选区时中断程序，Ctrl+V 直接粘贴；Ctrl+Shift+C/V 始终可用
+            {t("settings.terminal.smartCopyPasteDesc")}
           </div>
         </div>
         <button
@@ -444,14 +449,14 @@ function TerminalSettings() {
       </div>
 
       <div className="pt-6 text-base text-[var(--text-muted)] uppercase tracking-[0.1em] mb-2">
-        长文本粘贴
+        {t("settings.terminal.longPaste")}
       </div>
 
       <div className="flex items-center justify-between px-3 py-2.5 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)]">
         <div className="pr-4">
-          <div className="text-base text-[var(--text-primary)]">粘贴时超长文本转临时文件</div>
+          <div className="text-base text-[var(--text-primary)]">{t("settings.terminal.longPasteTitle")}</div>
           <div className="text-sm text-[var(--text-muted)]">
-            超过下方阈值时，将剪贴板内容保存到临时 .txt 并粘贴带引号的文件路径，避免 AI 工具被超长粘贴卡住
+            {t("settings.terminal.longPasteDesc")}
           </div>
         </div>
         <button
@@ -474,8 +479,8 @@ function TerminalSettings() {
         }`}
       >
         <div className="flex-1 min-w-0">
-          <div className="text-base text-[var(--text-primary)]">行数阈值</div>
-          <div className="text-sm text-[var(--text-muted)]">粘贴内容行数 ≥ 此值即转存（0 表示不按行数判断）</div>
+          <div className="text-base text-[var(--text-primary)]">{t("settings.terminal.lineThreshold")}</div>
+          <div className="text-sm text-[var(--text-muted)]">{t("settings.terminal.lineThresholdDesc")}</div>
         </div>
         <input
           type="number"
@@ -494,8 +499,8 @@ function TerminalSettings() {
         }`}
       >
         <div className="flex-1 min-w-0">
-          <div className="text-base text-[var(--text-primary)]">字符数阈值</div>
-          <div className="text-sm text-[var(--text-muted)]">粘贴内容长度 ≥ 此值即转存（0 表示不按字符判断）</div>
+          <div className="text-base text-[var(--text-primary)]">{t("settings.terminal.charThreshold")}</div>
+          <div className="text-sm text-[var(--text-muted)]">{t("settings.terminal.charThresholdDesc")}</div>
         </div>
         <input
           type="number"
@@ -509,7 +514,7 @@ function TerminalSettings() {
       </div>
 
       <div className="pt-1 text-sm text-[var(--text-muted)]">
-        关闭后超长文本将直接粘贴 · 任一阈值命中即触发转存 · 临时文件保存在系统 temp 目录，24 小时后自动清理
+        {t("settings.terminal.longPasteFooter")}
       </div>
     </div>
   );
@@ -556,6 +561,7 @@ function FontSizeSlider({
 // ─── SystemSettings（系统设置页）───
 
 function SystemSettings() {
+  const t = useT();
   const config = useAppStore((s) => s.config);
   const setConfig = useAppStore((s) => s.setConfig);
 
@@ -585,7 +591,7 @@ function SystemSettings() {
     if (!newEditorName.trim() || !newEditorCommand.trim()) return;
     const trimmedName = newEditorName.trim();
     if (editors.some((e) => e.name === trimmedName)) {
-      alert(`已存在名为「${trimmedName}」的编辑器，请使用其他名称`);
+      alert(t("settings.system.editorExistsAlert", { name: trimmedName }));
       return;
     }
     const editor: EditorConfig = {
@@ -600,7 +606,7 @@ function SystemSettings() {
     const def = defaultEditorName || editor.name;
     setDefaultEditorName(def);
     saveEditors(updated, def);
-  }, [editors, defaultEditorName, newEditorName, newEditorCommand, saveEditors]);
+  }, [editors, defaultEditorName, newEditorName, newEditorCommand, saveEditors, t]);
 
   const handleDeleteEditor = useCallback((idx: number) => {
     const updated = editors.filter((_, i) => i !== idx);
@@ -615,7 +621,7 @@ function SystemSettings() {
   const handleUpdateEditor = useCallback((idx: number, editor: EditorConfig) => {
     const oldName = editors[idx].name;
     if (editor.name !== oldName && editors.some((e, i) => i !== idx && e.name === editor.name)) {
-      alert(`已存在名为「${editor.name}」的编辑器，请使用其他名称`);
+      alert(t("settings.system.editorExistsAlert", { name: editor.name }));
       return;
     }
     const wasDefault = oldName === defaultEditorName;
@@ -624,7 +630,7 @@ function SystemSettings() {
     const def = wasDefault ? editor.name : defaultEditorName;
     setDefaultEditorName(def);
     saveEditors(updated, def);
-  }, [editors, defaultEditorName, saveEditors]);
+  }, [editors, defaultEditorName, saveEditors, t]);
 
   const handleSetDefaultEditor = useCallback((name: string) => {
     setDefaultEditorName(name);
@@ -634,17 +640,17 @@ function SystemSettings() {
   const handleBrowseEditorPath = useCallback(async (onSelect: (path: string) => void) => {
     const isWindows = navigator.userAgent.includes('Windows');
     const selected = await openDialog({
-      title: '选择编辑器可执行文件',
+      title: t("settings.system.browseDialogTitle"),
       multiple: false,
       directory: false,
       filters: isWindows
-        ? [{ name: '可执行文件', extensions: ['exe'] }]
+        ? [{ name: t("settings.system.executableFilter"), extensions: ['exe'] }]
         : undefined,
     });
     if (typeof selected === 'string' && selected.trim()) {
       onSelect(selected);
     }
-  }, []);
+  }, [t]);
 
   const handleThemeChange = useCallback((theme: 'auto' | 'light' | 'dark') => {
     const newConfig = { ...useAppStore.getState().config, theme };
@@ -671,16 +677,22 @@ function SystemSettings() {
 
   return (
     <div className="space-y-6">
+      {/* 界面语言 */}
+      <div className="flex items-center justify-between px-3 py-2.5 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)]">
+        <span className="text-base text-[var(--text-primary)]">{t("settings.system.languageLabel")}</span>
+        <LanguageToggle />
+      </div>
+
       {/* 主题模式 */}
       <div className="text-base text-[var(--text-muted)] uppercase tracking-[0.1em] mb-2">
-        主题
+        {t("settings.system.theme")}
       </div>
 
       <div className="flex gap-2 mb-4">
         {([
-          { value: 'dark' as const, label: '深色' },
-          { value: 'light' as const, label: '浅色' },
-          { value: 'auto' as const, label: '跟随系统' },
+          { value: 'dark' as const, label: t("settings.system.themeDark") },
+          { value: 'light' as const, label: t("settings.system.themeLight") },
+          { value: 'auto' as const, label: t("settings.system.themeAuto") },
         ]).map((opt) => (
           <button
             key={opt.value}
@@ -698,13 +710,13 @@ function SystemSettings() {
 
       {/* 皮肤 */}
       <div className="text-base text-[var(--text-muted)] uppercase tracking-[0.1em] mb-2 mt-4">
-        皮肤
+        {t("settings.system.skin")}
       </div>
 
       <div className="flex gap-2 mb-4">
         {([
-          { value: 'none' as const, label: '无' },
-          { value: 'blueprint' as const, label: '蓝图' },
+          { value: 'none' as const, label: t("settings.system.skinNone") },
+          { value: 'blueprint' as const, label: t("settings.system.skinBlueprint") },
           { value: 'fluent2' as const, label: 'Fluent 2' },
         ]).map((opt) => (
           <button
@@ -724,8 +736,8 @@ function SystemSettings() {
       {/* 终端跟随主题 */}
       <div className="flex items-center justify-between px-3 py-2.5 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)] mb-6">
         <div>
-          <div className="text-base text-[var(--text-primary)]">终端跟随主题</div>
-          <div className="text-sm text-[var(--text-muted)]">关闭时终端始终使用深色方案</div>
+          <div className="text-base text-[var(--text-primary)]">{t("settings.system.terminalFollowTheme")}</div>
+          <div className="text-sm text-[var(--text-muted)]">{t("settings.system.terminalFollowThemeDesc")}</div>
         </div>
         <button
           className={`relative w-9 h-5 rounded-full transition-colors ${
@@ -743,7 +755,7 @@ function SystemSettings() {
 
       {/* 外部编辑器 */}
       <div className="text-base text-[var(--text-muted)] uppercase tracking-[0.1em] mb-2">
-        外部编辑器（● = 默认）
+        {t("settings.system.externalEditor")}
       </div>
 
       <div className="space-y-2 mb-6">
@@ -764,7 +776,7 @@ function SystemSettings() {
             <div className="flex gap-2">
               <input
                 className="flex-1 bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1 text-base outline-none focus:border-[var(--accent)]"
-                placeholder="名称（如 VS Code）"
+                placeholder={t("settings.system.newEditorNamePlaceholder")}
                 value={newEditorName}
                 onChange={(e) => setNewEditorName(e.target.value)}
                 autoFocus
@@ -773,7 +785,7 @@ function SystemSettings() {
             <div className="flex gap-2 items-center">
               <input
                 className="flex-[2] bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1 text-base outline-none focus:border-[var(--accent)] font-mono"
-                placeholder="可执行文件路径"
+                placeholder={t("settings.system.newEditorCommandPlaceholder")}
                 value={newEditorCommand}
                 onChange={(e) => setNewEditorCommand(e.target.value)}
                 onKeyDown={(e) => e.key === 'Enter' && handleAddEditor()}
@@ -789,13 +801,13 @@ function SystemSettings() {
                 className="px-3 py-1 text-base bg-[var(--accent)] text-[var(--bg-base)] rounded-[var(--radius-sm)] hover:opacity-90 transition-opacity"
                 onClick={handleAddEditor}
               >
-                添加
+                {t("settings.common.add")}
               </button>
               <button
                 className="px-3 py-1 text-base text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors"
                 onClick={() => setAddingEditor(false)}
               >
-                取消
+                {t("settings.common.cancel")}
               </button>
             </div>
           </div>
@@ -804,12 +816,12 @@ function SystemSettings() {
             className="w-full py-2.5 border border-dashed border-[var(--border-default)] rounded-[var(--radius-md)] text-base text-[var(--text-muted)] hover:border-[var(--accent)] hover:text-[var(--accent)] transition-all"
             onClick={() => setAddingEditor(true)}
           >
-            + 添加编辑器
+            {t("settings.system.addEditor")}
           </button>
         )}
 
         <div className="pt-1 text-sm text-[var(--text-muted)]">
-          点击圆点设为默认编辑器 · 文件树顶部按钮将使用默认编辑器打开
+          {t("settings.system.editorDefaultHint")}
         </div>
       </div>
     </div>
@@ -819,6 +831,7 @@ function SystemSettings() {
 // ─── FontSettings（字体设置页）───
 
 function FontSettings() {
+  const t = useT();
   const config = useAppStore((s) => s.config);
   const setConfig = useAppStore((s) => s.setConfig);
 
@@ -866,11 +879,11 @@ function FontSettings() {
   return (
     <div className="space-y-6">
       <div className="text-base text-[var(--text-muted)] uppercase tracking-[0.1em] mb-2">
-        字体大小
+        {t("settings.font.fontSize")}
       </div>
 
       <FontSizeSlider
-        label="界面字体大小"
+        label={t("settings.font.uiFontSize")}
         value={config.uiFontSize ?? 13}
         min={10}
         max={20}
@@ -878,7 +891,7 @@ function FontSettings() {
       />
 
       <FontSizeSlider
-        label="终端字体大小"
+        label={t("settings.font.terminalFontSize")}
         value={config.terminalFontSize ?? 14}
         min={10}
         max={24}
@@ -886,40 +899,40 @@ function FontSettings() {
       />
 
       <div className="pt-3 text-sm text-[var(--text-muted)]">
-        界面字体影响侧栏、标签页等 UI 元素 · 终端字体影响终端内文字显示
+        {t("settings.font.fontSizeFooter")}
       </div>
 
       <div className="pt-4 text-base text-[var(--text-muted)] uppercase tracking-[0.1em] mb-2">
-        字体
+        {t("settings.font.font")}
       </div>
 
       <FontFamilyInput
-        label="界面字体"
+        label={t("settings.font.uiFont")}
         value={config.uiFontFamily ?? ''}
         placeholder="'DM Sans', system-ui, sans-serif"
         onChange={handleUiFontFamilyChange}
       />
 
       <FontFamilyInput
-        label="终端字体"
+        label={t("settings.font.terminalFont")}
         value={config.terminalFontFamily ?? ''}
         placeholder={DEFAULT_TERMINAL_FONT_FAMILY}
         onChange={handleTerminalFontFamilyChange}
       />
 
       <div className="pt-3 text-sm text-[var(--text-muted)]">
-        留空使用默认 · 支持 CSS font-family 语法（如 <span className="font-mono">'JetBrainsMono Nerd Font', monospace</span>）
+        {t("settings.font.fontFamilyFooterPrefix")}<span className="font-mono">'JetBrainsMono Nerd Font', monospace</span>{t("settings.font.fontFamilyFooterSuffix")}
       </div>
 
       <div className="pt-6 text-base text-[var(--text-muted)] uppercase tracking-[0.1em] mb-2">
-        连体字
+        {t("settings.font.ligatures")}
       </div>
 
       <div className="flex items-center justify-between px-3 py-2.5 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)]">
         <div className="pr-4">
-          <div className="text-base text-[var(--text-primary)]">启用终端连体字 (ligatures)</div>
+          <div className="text-base text-[var(--text-primary)]">{t("settings.font.ligaturesTitle")}</div>
           <div className="text-sm text-[var(--text-muted)]">
-            开启后 <span className="font-mono">==</span> <span className="font-mono">=&gt;</span> <span className="font-mono">!=</span> <span className="font-mono">-&gt;</span> 等会合成 ligature glyph，需字体本身含 calt 表（如 Fira Code、JetBrains Mono）· Windows 完整支持；macOS / Linux 受 webview API 限制，仅 ~60 条内置 Iosevka fallback
+            {t("settings.font.ligaturesDescPrefix")}<span className="font-mono">==</span> <span className="font-mono">=&gt;</span> <span className="font-mono">!=</span> <span className="font-mono">-&gt;</span>{t("settings.font.ligaturesDescSuffix")}
           </div>
         </div>
         <button
@@ -983,6 +996,7 @@ function FontFamilyInput({
 // ─── AiNotificationSettings（AI 完成通知页）───
 
 function AiHookSettings() {
+  const t = useT();
   const config = useAppStore((s) => s.config);
   const setConfig = useAppStore((s) => s.setConfig);
   const hookEnabled = config.hookEnabled ?? false;
@@ -1066,15 +1080,15 @@ function AiHookSettings() {
   return (
     <div className="space-y-2">
       <div className="text-base text-[var(--text-muted)] uppercase tracking-[0.1em] mb-2">
-        AI Hook 事件
+        {t("settings.aiHook.title")}
       </div>
 
       {/* Hook 服务器开关 */}
       <div className="flex items-center justify-between px-3 py-2.5 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)]">
         <div className="pr-4">
-          <div className="text-base text-[var(--text-primary)]">启用 Hook 服务器</div>
+          <div className="text-base text-[var(--text-primary)]">{t("settings.aiHook.enableHook")}</div>
           <div className="text-sm text-[var(--text-muted)]">
-            开启后监听本地端口接收 AI 事件，Windows 上首次开启可能触发防火墙授权
+            {t("settings.aiHook.enableHookDesc")}
           </div>
         </div>
         <button
@@ -1105,11 +1119,11 @@ function AiHookSettings() {
           <div className="flex items-center gap-2 mb-1">
             <div className={`w-2 h-2 rounded-full ${hookStatus?.running ? 'bg-[var(--color-success)]' : 'bg-[var(--border-strong)]'}`} />
             <span className="text-base text-[var(--text-primary)]">
-              Hook 服务器 {hookStatus?.running ? `运行中 (端口 ${hookStatus.port})` : '未启动'}
+              {t("settings.aiHook.serverLabel")} {hookStatus?.running ? t("settings.aiHook.serverRunning", { port: hookStatus.port }) : t("settings.aiHook.serverStopped")}
             </span>
           </div>
           <div className="text-sm text-[var(--text-muted)]">
-            通过 Claude Code / Codex 的 hook 系统获取精确的 AI 状态，替代进程轮询
+            {t("settings.aiHook.serverDesc")}
           </div>
         </div>
 
@@ -1119,14 +1133,14 @@ function AiHookSettings() {
             onClick={handleRegister}
             disabled={registering}
           >
-            {registering ? '注册中...' : '一键注册 Hook'}
+            {registering ? t("settings.aiHook.registering") : t("settings.aiHook.register")}
           </button>
           <button
             className="flex-1 py-2 bg-[var(--bg-base)] text-[var(--text-secondary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] text-base hover:border-[var(--accent)] hover:text-[var(--accent)] transition-all disabled:opacity-50"
             onClick={handleUnregister}
             disabled={unregistering}
           >
-            {unregistering ? '卸载中...' : '卸载 Hook'}
+            {unregistering ? t("settings.aiHook.unregistering") : t("settings.aiHook.unregister")}
           </button>
         </div>
 
@@ -1134,7 +1148,7 @@ function AiHookSettings() {
           className="w-full py-2 text-base text-[var(--text-muted)] hover:text-[var(--accent)] transition-colors"
           onClick={handleShowSnippet}
         >
-          {showSnippet ? '收起配置片段' : '查看配置片段（手动粘贴）'}
+          {showSnippet ? t("settings.aiHook.collapseSnippet") : t("settings.aiHook.showSnippet")}
         </button>
 
         {showSnippet && snippetData && (
@@ -1175,7 +1189,7 @@ function AiHookSettings() {
         )}
 
         <div className="pt-1 text-sm text-[var(--text-muted)]">
-          注册后 Claude Code / Codex 会在事件发生时通知 Mini-Term · 未注册时自动使用进程轮询检测
+          {t("settings.aiHook.footer")}
         </div>
       </div>
     </div>
@@ -1185,6 +1199,7 @@ function AiHookSettings() {
 // ─── AiNotificationSettings（AI 完成通知页）───
 
 function AiNotificationSettings() {
+  const t = useT();
   const config = useAppStore((s) => s.config);
   const setConfig = useAppStore((s) => s.setConfig);
 
@@ -1196,26 +1211,26 @@ function AiNotificationSettings() {
 
   const handleSoundPathChange = useCallback(async () => {
     const selected = await openDialog({
-      title: '选择提示音文件',
+      title: t("settings.aiNotification.soundDialogTitle"),
       multiple: false,
       directory: false,
-      filters: [{ name: '音频文件', extensions: ['mp3', 'wav', 'ogg', 'flac', 'aac', 'm4a'] }],
+      filters: [{ name: t("settings.aiNotification.audioFilter"), extensions: ['mp3', 'wav', 'ogg', 'flac', 'aac', 'm4a'] }],
     });
     if (typeof selected === 'string' && selected.trim()) {
       void saveConfigPatch({ aiCompletionSoundPath: selected });
     }
-  }, [saveConfigPatch]);
+  }, [saveConfigPatch, t]);
 
   return (
     <div className="space-y-2">
       <div className="text-base text-[var(--text-muted)] uppercase tracking-[0.1em] mb-2">
-        通知方式
+        {t("settings.aiNotification.method")}
       </div>
 
       <div className="flex items-center justify-between px-3 py-2.5 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)]">
         <div>
-          <div className="text-base text-[var(--text-primary)]">弹框提醒</div>
-          <div className="text-sm text-[var(--text-muted)]">AI 任务结束时在右下角弹出提醒卡片</div>
+          <div className="text-base text-[var(--text-primary)]">{t("settings.aiNotification.popup")}</div>
+          <div className="text-sm text-[var(--text-muted)]">{t("settings.aiNotification.popupDesc")}</div>
         </div>
         <button
           className={`relative w-9 h-5 rounded-full transition-colors flex-shrink-0 ${
@@ -1233,8 +1248,8 @@ function AiNotificationSettings() {
 
       <div className="flex items-center justify-between px-3 py-2.5 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)]">
         <div>
-          <div className="text-base text-[var(--text-primary)]">任务栏闪烁</div>
-          <div className="text-sm text-[var(--text-muted)]">窗口失焦时请求用户注意（Windows 闪烁任务栏，macOS 跳动 Dock）</div>
+          <div className="text-base text-[var(--text-primary)]">{t("settings.aiNotification.taskbarFlash")}</div>
+          <div className="text-sm text-[var(--text-muted)]">{t("settings.aiNotification.taskbarFlashDesc")}</div>
         </div>
         <button
           className={`relative w-9 h-5 rounded-full transition-colors flex-shrink-0 ${
@@ -1252,8 +1267,8 @@ function AiNotificationSettings() {
 
       <div className="flex items-center justify-between px-3 py-2.5 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)]">
         <div>
-          <div className="text-base text-[var(--text-primary)]">提示音</div>
-          <div className="text-sm text-[var(--text-muted)]">AI 任务结束时播放提示音</div>
+          <div className="text-base text-[var(--text-primary)]">{t("settings.aiNotification.sound")}</div>
+          <div className="text-sm text-[var(--text-muted)]">{t("settings.aiNotification.soundDesc")}</div>
         </div>
         <button
           className={`relative w-9 h-5 rounded-full transition-colors flex-shrink-0 ${
@@ -1276,31 +1291,31 @@ function AiNotificationSettings() {
       >
         <div className="flex items-center gap-2 px-3 py-2.5 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)]">
           <div className="flex-1 min-w-0">
-            <div className="text-base text-[var(--text-primary)]">自定义提示音</div>
+            <div className="text-base text-[var(--text-primary)]">{t("settings.aiNotification.customSound")}</div>
             <div className="text-sm text-[var(--text-muted)] font-mono truncate">
-              {config.aiCompletionSoundPath || '默认提示音'}
+              {config.aiCompletionSoundPath || t("settings.aiNotification.defaultSound")}
             </div>
           </div>
           <div className="flex items-center gap-1 flex-shrink-0">
             <button
               className="px-2.5 py-1 text-sm bg-[var(--bg-elevated)] text-[var(--text-secondary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] hover:border-[var(--accent)] hover:text-[var(--accent)] transition-all"
               onClick={() => playNotificationSound(config.aiCompletionSoundPath)}
-              title="试听"
+              title={t("settings.aiNotification.preview")}
             >
-              试听
+              {t("settings.aiNotification.preview")}
             </button>
             <button
               className="px-2.5 py-1 text-sm bg-[var(--bg-elevated)] text-[var(--text-secondary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] hover:border-[var(--accent)] hover:text-[var(--accent)] transition-all"
               onClick={handleSoundPathChange}
             >
-              选择文件
+              {t("settings.aiNotification.chooseFile")}
             </button>
             {config.aiCompletionSoundPath && (
               <button
                 className="px-2.5 py-1 text-sm text-[var(--text-muted)] hover:text-[var(--color-error)] transition-colors"
                 onClick={() => saveConfigPatch({ aiCompletionSoundPath: undefined })}
               >
-                清除
+                {t("settings.aiNotification.clear")}
               </button>
             )}
           </div>
@@ -1308,7 +1323,7 @@ function AiNotificationSettings() {
       </div>
 
       <div className="pt-3 text-sm text-[var(--text-muted)]">
-        以上通知在 AI 任务（Claude / Codex）完成时触发
+        {t("settings.aiNotification.footer")}
       </div>
 
       <div className="pt-6">
@@ -1321,6 +1336,7 @@ function AiNotificationSettings() {
 // ─── AboutSettings（关于页）───
 
 function AboutSettings() {
+  const t = useT();
   const [currentVersion, setCurrentVersion] = useState('');
   const [latest, setLatest] = useState<ReleaseInfo | null>(null);
   const [checking, setChecking] = useState(false);
@@ -1343,23 +1359,23 @@ function AboutSettings() {
         setLatest({ version: currentVersion, url: '', publishedAt: '' });
       }
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : '检查失败，请稍后重试');
+      setError(e instanceof Error ? e.message : t("settings.about.checkFailed"));
     } finally {
       setChecking(false);
     }
-  }, [currentVersion]);
+  }, [currentVersion, t]);
 
   const hasUpdate = latest && compareVersions(latest.version, currentVersion) > 0;
 
   return (
     <div className="space-y-6">
       <div className="text-base text-[var(--text-muted)] uppercase tracking-[0.1em] mb-2">
-        版本信息
+        {t("settings.about.versionInfo")}
       </div>
 
       {/* 当前版本 */}
       <div className="flex items-center gap-3 px-4 py-3 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)]">
-        <span className="text-base text-[var(--text-secondary)]">当前版本</span>
+        <span className="text-base text-[var(--text-secondary)]">{t("settings.about.currentVersion")}</span>
         <span className="font-mono text-base text-[var(--accent)]">v{currentVersion}</span>
       </div>
 
@@ -1369,7 +1385,7 @@ function AboutSettings() {
         onClick={checkUpdate}
         disabled={checking}
       >
-        {checking ? '正在检查...' : '检查更新'}
+        {checking ? t("settings.about.checking") : t("settings.about.checkUpdate")}
       </button>
 
       {/* 检查结果 */}
@@ -1384,29 +1400,29 @@ function AboutSettings() {
           {hasUpdate ? (
             <div className="space-y-3">
               <div className="flex items-center gap-2">
-                <span className="text-base text-[var(--text-primary)]">发现新版本</span>
+                <span className="text-base text-[var(--text-primary)]">{t("settings.about.newVersionFound")}</span>
                 <span className="font-mono text-base text-[var(--accent)]">{latest.version}</span>
               </div>
               <div className="text-sm text-[var(--text-muted)]">
-                发布于 {new Date(latest.publishedAt).toLocaleDateString('zh-CN')}
+                {t("settings.about.publishedAt", { date: new Date(latest.publishedAt).toLocaleDateString('zh-CN') })}
               </div>
               <button
                 className="w-full py-2 bg-[var(--accent)] text-[var(--bg-base)] rounded-[var(--radius-sm)] text-base font-medium hover:opacity-90 transition-opacity"
                 onClick={() => openUrl(latest.url)}
               >
-                前往 GitHub 下载
+                {t("settings.about.downloadFromGitHub")}
               </button>
             </div>
           ) : (
             <div className="text-base text-[var(--text-secondary)]">
-              已是最新版本
+              {t("settings.about.upToDate")}
             </div>
           )}
         </div>
       )}
 
       <div className="pt-3 text-sm text-[var(--text-muted)]">
-        点击检查更新从 GitHub 获取最新版本信息
+        {t("settings.about.footer")}
       </div>
     </div>
   );
@@ -1416,40 +1432,42 @@ function AboutSettings() {
 
 function buildShortcutGroups(
   smartCopyPaste: boolean,
+  tr: (key: string) => string,
 ): { title: string; items: { keys: string; desc: string }[] }[] {
   const terminalItems = smartCopyPaste
     ? [
-        { keys: `${MOD_LABEL} + C`, desc: '复制选中文本（无选区时中断程序）' },
-        { keys: `${MOD_LABEL} + V`, desc: '粘贴到终端' },
-        { keys: `${MOD_LABEL} + Shift + C`, desc: '复制终端选中文本' },
-        { keys: `${MOD_LABEL} + Shift + V`, desc: '粘贴到终端' },
+        { keys: `${MOD_LABEL} + C`, desc: tr('settings.shortcuts.copyDesc') },
+        { keys: `${MOD_LABEL} + V`, desc: tr('settings.shortcuts.pasteToTerminal') },
+        { keys: `${MOD_LABEL} + Shift + C`, desc: tr('settings.shortcuts.copySelected') },
+        { keys: `${MOD_LABEL} + Shift + V`, desc: tr('settings.shortcuts.pasteToTerminal') },
       ]
     : [
-        { keys: `${MOD_LABEL} + Shift + C`, desc: '复制终端选中文本' },
-        { keys: `${MOD_LABEL} + Shift + V`, desc: '粘贴到终端' },
+        { keys: `${MOD_LABEL} + Shift + C`, desc: tr('settings.shortcuts.copySelected') },
+        { keys: `${MOD_LABEL} + Shift + V`, desc: tr('settings.shortcuts.pasteToTerminal') },
       ];
   return [
     {
-      title: '全局',
-      items: [{ keys: `${MOD_LABEL} + Shift + F`, desc: '打开/关闭全局搜索' }],
+      title: tr('settings.shortcuts.global'),
+      items: [{ keys: `${MOD_LABEL} + Shift + F`, desc: tr('settings.shortcuts.toggleGlobalSearch') }],
     },
     {
-      title: '终端操作',
+      title: tr('settings.shortcuts.terminalOps'),
       items: terminalItems,
     },
     {
-      title: 'AI 任务标记',
+      title: tr('settings.shortcuts.aiTaskMarks'),
       items: [
-        { keys: `${MOD_LABEL} + Shift + ↑`, desc: '跳转到上一个 AI 任务提交' },
-        { keys: `${MOD_LABEL} + Shift + ↓`, desc: '跳转到下一个 AI 任务提交' },
+        { keys: `${MOD_LABEL} + Shift + ↑`, desc: tr('settings.shortcuts.jumpPrevAi') },
+        { keys: `${MOD_LABEL} + Shift + ↓`, desc: tr('settings.shortcuts.jumpNextAi') },
       ],
     },
   ];
 }
 
 function ShortcutsSettings() {
+  const t = useT();
   const smartCopyPaste = useAppStore((s) => s.config.smartCopyPaste ?? false);
-  const groups = buildShortcutGroups(smartCopyPaste);
+  const groups = buildShortcutGroups(smartCopyPaste, t);
   return (
     <div className="space-y-6">
       {groups.map((group) => (
@@ -1473,7 +1491,7 @@ function ShortcutsSettings() {
         </div>
       ))}
       <div className="pt-3 text-sm text-[var(--text-muted)]">
-        终端内快捷键仅在终端获得焦点时生效
+        {t("settings.shortcuts.footer")}
       </div>
     </div>
   );
@@ -1481,16 +1499,17 @@ function ShortcutsSettings() {
 
 // ─── SettingsModal（主弹窗）───
 
-const MENU_ITEMS: { key: SettingsPage; label: string }[] = [
-  { key: 'terminal', label: '终端设置' },
-  { key: 'system', label: '系统设置' },
-  { key: 'font', label: '字体' },
-  { key: 'ai-notification', label: 'AI 完成通知' },
-  { key: 'shortcuts', label: '快捷键' },
-  { key: 'about', label: '关于' },
+const MENU_ITEMS: { key: SettingsPage; labelKey: string }[] = [
+  { key: 'terminal', labelKey: 'settings.menu.terminal' },
+  { key: 'system', labelKey: 'settings.menu.system' },
+  { key: 'font', labelKey: 'settings.menu.font' },
+  { key: 'ai-notification', labelKey: 'settings.menu.aiNotification' },
+  { key: 'shortcuts', labelKey: 'settings.menu.shortcuts' },
+  { key: 'about', labelKey: 'settings.menu.about' },
 ];
 
 export function SettingsModal({ open, onClose, initialPage }: Props) {
+  const t = useT();
   const [activePage, setActivePage] = useState<SettingsPage>(initialPage ?? 'terminal');
 
   useEffect(() => {
@@ -1508,7 +1527,7 @@ export function SettingsModal({ open, onClose, initialPage }: Props) {
       >
         {/* 顶栏 */}
         <div className="flex items-center justify-between px-5 py-4 border-b border-[var(--border-subtle)]">
-          <h2 className="text-lg font-semibold text-[var(--text-primary)]">设置</h2>
+          <h2 className="text-lg font-semibold text-[var(--text-primary)]">{t("settings.title")}</h2>
           <button
             className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors text-lg leading-none"
             onClick={onClose}
@@ -1534,7 +1553,7 @@ export function SettingsModal({ open, onClose, initialPage }: Props) {
                 {activePage === item.key && (
                   <span className="w-0.5 h-4 rounded-full bg-[var(--accent)] flex-shrink-0" />
                 )}
-                <span>{item.label}</span>
+                <span>{t(item.labelKey)}</span>
               </div>
             ))}
           </div>

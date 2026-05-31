@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { Allotment } from 'allotment';
 import { useAppStore } from '../store';
+import { useT } from '../i18n';
 import type { GitFileStatus, GitDiffResult, DiffLine } from '../types';
 
 interface DiffModalProps {
@@ -152,6 +153,7 @@ export function SideBySideView({ hunks, fontSize = 13 }: { hunks: GitDiffResult[
 // ─── DiffModal ───
 
 export function DiffModal({ open, onClose, projectPath, status, staged }: DiffModalProps) {
+  const t = useT();
   const [viewMode, setViewMode] = useState<ViewMode>('side-by-side');
   const [diffResult, setDiffResult] = useState<GitDiffResult | null>(null);
   const [loading, setLoading] = useState(false);
@@ -216,7 +218,7 @@ export function DiffModal({ open, onClose, projectPath, status, staged }: DiffMo
                 }`}
                 onClick={() => setViewMode('side-by-side')}
               >
-                并排
+                {t('diffModal.sideBySide')}
               </button>
               <button
                 className={`px-3 py-1 text-sm transition-colors ${
@@ -226,7 +228,7 @@ export function DiffModal({ open, onClose, projectPath, status, staged }: DiffMo
                 }`}
                 onClick={() => setViewMode('inline')}
               >
-                内联
+                {t('diffModal.inline')}
               </button>
             </div>
             <button
@@ -242,7 +244,7 @@ export function DiffModal({ open, onClose, projectPath, status, staged }: DiffMo
         <div className="flex-1 overflow-auto bg-[var(--bg-base)]">
           {loading && (
             <div className="flex items-center justify-center h-full text-[var(--text-muted)]">
-              加载中...
+              {t('diffModal.loading')}
             </div>
           )}
           {error && (
@@ -252,12 +254,12 @@ export function DiffModal({ open, onClose, projectPath, status, staged }: DiffMo
           )}
           {diffResult && diffResult.isBinary && (
             <div className="flex items-center justify-center h-full text-[var(--text-muted)]">
-              二进制文件，不支持 diff 预览
+              {t('diffModal.binaryNotSupported')}
             </div>
           )}
           {diffResult && diffResult.tooLarge && (
             <div className="flex items-center justify-center h-full text-[var(--text-muted)]">
-              文件过大（&gt;1MB），不支持 diff 预览
+              {t('diffModal.tooLarge')}
             </div>
           )}
           {diffResult && !diffResult.isBinary && !diffResult.tooLarge && (

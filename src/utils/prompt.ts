@@ -1,3 +1,5 @@
+import { t } from "../i18n";
+
 /**
  * 自定义 confirm 弹窗，替代 window.confirm
  * 返回 Promise<boolean>
@@ -25,11 +27,11 @@ export function showConfirm(title: string, message: string): Promise<boolean> {
 
     const cancelBtn = document.createElement('button');
     cancelBtn.className = 'prompt-btn prompt-btn-cancel';
-    cancelBtn.textContent = '取消';
+    cancelBtn.textContent = t("prompt.cancel");
 
     const confirmBtn = document.createElement('button');
     confirmBtn.className = 'prompt-btn prompt-btn-confirm';
-    confirmBtn.textContent = '确定';
+    confirmBtn.textContent = t("prompt.confirm");
 
     buttons.appendChild(cancelBtn);
     buttons.appendChild(confirmBtn);
@@ -81,7 +83,7 @@ export function showAlert(title: string, message: string): Promise<void> {
 
     const okBtn = document.createElement('button');
     okBtn.className = 'prompt-btn prompt-btn-confirm';
-    okBtn.textContent = '知道了';
+    okBtn.textContent = t("prompt.ok");
 
     buttons.appendChild(okBtn);
     dialog.appendChild(buttons);
@@ -142,11 +144,11 @@ export function showPrompt(title: string, placeholder?: string, defaultValue?: s
 
     const cancelBtn = document.createElement('button');
     cancelBtn.className = 'prompt-btn prompt-btn-cancel';
-    cancelBtn.textContent = '取消';
+    cancelBtn.textContent = t("prompt.cancel");
 
     const confirmBtn = document.createElement('button');
     confirmBtn.className = 'prompt-btn prompt-btn-confirm';
-    confirmBtn.textContent = '确定';
+    confirmBtn.textContent = t("prompt.confirm");
 
     buttons.appendChild(cancelBtn);
     buttons.appendChild(confirmBtn);

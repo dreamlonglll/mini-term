@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '../store';
 import { showContextMenu } from '../utils/contextMenu';
 import { SessionViewerModal } from './SessionViewerModal';
+import { useT, t } from '../i18n';
 import type { AiSession } from '../types';
 
 const PAGE_SIZE = 20;
@@ -17,21 +18,21 @@ function formatTime(iso: string): string {
   const diff = now - date.getTime();
   const minutes = Math.floor(diff / 60000);
 
-  if (minutes < 1) return '刚刚';
-  if (minutes < 60) return `${minutes}分钟前`;
+  if (minutes < 1) return t('sessionList.time.justNow');
+  if (minutes < 60) return t('sessionList.time.minutesAgo', { n: minutes });
 
   const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}小时前`;
+  if (hours < 24) return t('sessionList.time.hoursAgo', { n: hours });
 
   const days = Math.floor(hours / 24);
-  if (days < 7) return `${days}天前`;
+  if (days < 7) return t('sessionList.time.daysAgo', { n: days });
 
   // 超过一周显示日期
   const m = date.getMonth() + 1;
   const d = date.getDate();
   const y = date.getFullYear();
   const currentYear = new Date().getFullYear();
-  return y === currentYear ? `${m}月${d}日` : `${y}/${m}/${d}`;
+  return y === currentYear ? t('sessionList.time.monthDay', { m, d }) : `${y}/${m}/${d}`;
 }
 
 const TYPE_BADGE: Record<string, { label: string; color: string }> = {
@@ -40,6 +41,7 @@ const TYPE_BADGE: Record<string, { label: string; color: string }> = {
 };
 
 export function SessionList() {
+  const t = useT();
   const config = useAppStore((s) => s.config);
   const activeProjectId = useAppStore((s) => s.activeProjectId);
 
@@ -92,7 +94,7 @@ export function SessionList() {
           <span
             className="text-xs normal-case tracking-normal cursor-pointer hover:text-[var(--text-primary)] transition-colors"
             onClick={() => fetchSessions(activeProject.path)}
-            title="刷新会话列表"
+            title={t('sessionList.refresh')}
           >
             ↻
           </span>
@@ -101,12 +103,12 @@ export function SessionList() {
 
       <div ref={scrollRef} className="flex-1 overflow-y-auto px-1.5" onScroll={handleScroll}>
         {loading && allSessions.length === 0 && (
-          <div className="px-2.5 py-3 text-xs text-[var(--text-muted)] text-center">加载中…</div>
+          <div className="px-2.5 py-3 text-xs text-[var(--text-muted)] text-center">{t('sessionList.loading')}</div>
         )}
 
         {!loading && allSessions.length === 0 && (
           <div className="px-2.5 py-3 text-xs text-[var(--text-muted)] text-center">
-            {activeProject ? '暂无会话记录' : '请先选择项目'}
+            {activeProject ? t('sessionList.empty') : t('sessionList.selectProject')}
           </div>
         )}
 
@@ -133,12 +135,12 @@ export function SessionList() {
                   : `codex resume ${session.id}`;
                 showContextMenu(e.clientX, e.clientY, [
                   {
-                    label: '查看',
+                    label: t('sessionList.view'),
                     onClick: () => setViewingSession(session),
                   },
                   { separator: true },
                   {
-                    label: '复制恢复命令',
+                    label: t('sessionList.copyResumeCommand'),
                     onClick: () => navigator.clipboard.writeText(cmd),
                   },
                 ]);
@@ -167,7 +169,7 @@ export function SessionList() {
 
         {hasMore && (
           <div className="px-2.5 py-2 text-[10px] text-[var(--text-muted)] text-center">
-            {allSessions.length - displayCount} 条更多…
+            {t('sessionList.more', { n: allSessions.length - displayCount })}
           </div>
         )}
       </div>

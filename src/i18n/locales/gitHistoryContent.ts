@@ -1,0 +1,28 @@
+export const gitHistoryContent = {
+  zh: {
+    remoteBranch: "远程分支: {name}",
+    currentBranch: "当前分支: {name}",
+    localBranch: "本地分支: {name}",
+    copyCommitHash: "复制 Commit Hash",
+    viewChanges: "查看变更",
+    viewingBranchHistory: "正在查看分支 {branch} 的历史(当前 HEAD: {head}),点击切换",
+    switchBranchHint: "点击切换查看其他分支的 git log(不会 checkout)",
+    loading: "加载中...",
+    refresh: "刷新",
+    noCommits: "暂无提交",
+    noRepos: "未发现 Git 仓库",
+  },
+  en: {
+    remoteBranch: "Remote branch: {name}",
+    currentBranch: "Current branch: {name}",
+    localBranch: "Local branch: {name}",
+    copyCommitHash: "Copy Commit Hash",
+    viewChanges: "View Changes",
+    viewingBranchHistory: "Viewing history of branch {branch} (current HEAD: {head}), click to switch",
+    switchBranchHint: "Click to view git log of another branch (no checkout)",
+    loading: "Loading...",
+    refresh: "Refresh",
+    noCommits: "No commits",
+    noRepos: "No Git repositories found",
+  },
+} as const;

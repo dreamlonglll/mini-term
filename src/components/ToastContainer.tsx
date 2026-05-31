@@ -1,6 +1,8 @@
 import { useAppStore } from '../store';
+import { useT } from '../i18n';
 
 export function ToastContainer() {
+  const t = useT();
   const notifications = useAppStore((s) => s.notifications);
   const dismissNotification = useAppStore((s) => s.dismissNotification);
   const setActiveProject = useAppStore((s) => s.setActiveProject);
@@ -32,7 +34,7 @@ export function ToastContainer() {
             <div className="toast-body">
               <div className="toast-name">{n.projectName}</div>
               <div className="toast-desc">
-                {isWslInfo ? (n.message ?? '') : 'AI 已完成 · 点击查看'}
+                {isWslInfo ? (n.message ?? '') : t('toast.aiDone')}
               </div>
             </div>
             <div

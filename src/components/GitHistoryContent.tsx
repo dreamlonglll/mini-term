@@ -6,6 +6,7 @@ import { showContextMenu } from '../utils/contextMenu';
 import { isAiPty } from '../utils/terminalCache';
 import { formatRelativeTime } from '../utils/timeFormat';
 import { CommitDiffModal } from './CommitDiffModal';
+import { useT } from '../i18n';
 import type { GitRepoInfo, GitCommitInfo, CommitFileInfo, BranchInfo, PtyOutputPayload } from '../types';
 
 interface RepoState {
@@ -128,6 +129,7 @@ const CommitItem = memo(function CommitItem({
   onContextMenu: (e: React.MouseEvent, repoPath: string, commit: GitCommitInfo) => void;
   onDoubleClick: (repoPath: string, commit: GitCommitInfo) => void;
 }) {
+  const t = useT();
   const commitBranches = allBranches.filter((b) => b.commitHash === commit.hash);
   return (
     <div
@@ -154,7 +156,7 @@ const CommitItem = memo(function CommitItem({
                   ? 'var(--text-muted)'
                   : 'rgb(63, 185, 80)',
             }}
-            title={b.isRemote ? `远程分支: ${b.name}` : b.isHead ? `当前分支: ${b.name}` : `本地分支: ${b.name}`}
+            title={b.isRemote ? t('gitHistoryContent.remoteBranch', { name: b.name }) : b.isHead ? t('gitHistoryContent.currentBranch', { name: b.name }) : t('gitHistoryContent.localBranch', { name: b.name })}
           >
             {b.name}
           </span>
@@ -187,6 +189,7 @@ interface GitHistoryContentProps {
 }
 
 export function GitHistoryContent({ projectPath, repos, refreshRepos }: GitHistoryContentProps) {
+  const t = useT();
   const [expandedRepos, setExpandedRepos] = useState<Set<string>>(new Set());
   const [repoStates, setRepoStates] = useState<Map<string, RepoState>>(new Map());
   const [diffModal, setDiffModal] = useState<{
@@ -371,17 +374,17 @@ export function GitHistoryContent({ projectPath, repos, refreshRepos }: GitHisto
       e.preventDefault();
       showContextMenu(e.clientX, e.clientY, [
         {
-          label: '复制 Commit Hash',
+          label: t('gitHistoryContent.copyCommitHash'),
           onClick: () => writeText(commit.hash),
         },
         { separator: true },
         {
-          label: '查看变更',
+          label: t('gitHistoryContent.viewChanges'),
           onClick: () => handleViewDiff(repoPath, commit),
         },
       ]);
     },
-    [handleViewDiff],
+    [handleViewDiff, t],
   );
 
   const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -509,8 +512,8 @@ export function GitHistoryContent({ projectPath, repos, refreshRepos }: GitHisto
                         }`}
                         title={
                           isViewingOther
-                            ? `正在查看分支 ${displayBranch} 的历史(当前 HEAD: ${repo.currentBranch}),点击切换`
-                            : '点击切换查看其他分支的 git log(不会 checkout)'
+                            ? t('gitHistoryContent.viewingBranchHistory', { branch: displayBranch, head: repo.currentBranch })
+                            : t('gitHistoryContent.switchBranchHint')
                         }
                         onClick={(e) => {
                           e.stopPropagation();
@@ -532,7 +535,7 @@ export function GitHistoryContent({ projectPath, repos, refreshRepos }: GitHisto
                           onClick={(e) => e.stopPropagation()}
                         >
                           {allBranches.length === 0 ? (
-                            <div className="px-3 py-1.5 text-xs text-[var(--text-muted)]">加载中...</div>
+                            <div className="px-3 py-1.5 text-xs text-[var(--text-muted)]">{t('gitHistoryContent.loading')}</div>
                           ) : (
                             allBranches.map((b) => {
                               const active = displayBranch === b.name;
@@ -571,7 +574,7 @@ export function GitHistoryContent({ projectPath, repos, refreshRepos }: GitHisto
               <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity duration-150">
                 <button
                   className="w-5 h-5 flex items-center justify-center text-sm transition-colors rounded text-[var(--text-muted)] hover:text-[var(--text-primary)] cursor-pointer"
-                  title="刷新"
+                  title={t('gitHistoryContent.refresh')}
                   onClick={(e) => {
                     e.stopPropagation();
                     loadCommits(repo.path);
@@ -614,13 +617,13 @@ export function GitHistoryContent({ projectPath, repos, refreshRepos }: GitHisto
 
               {state?.loading && (
                 <div className="text-center text-[var(--text-muted)] text-xs py-2">
-                  加载中...
+                  {t('gitHistoryContent.loading')}
                 </div>
               )}
 
               {state && !state.loading && state.commits.length === 0 && (
                 <div className="text-center text-[var(--text-muted)] text-xs py-2">
-                  暂无提交
+                  {t('gitHistoryContent.noCommits')}
                 </div>
               )}
             </div>
@@ -668,7 +671,7 @@ export function GitHistoryContent({ projectPath, repos, refreshRepos }: GitHisto
       <div className="flex-1 overflow-y-auto px-1" ref={scrollRef} onScroll={handleScroll}>
         {repos.length === 0 && (
           <div className="text-center text-[var(--text-muted)] text-sm py-6">
-            未发现 Git 仓库
+            {t('gitHistoryContent.noRepos')}
           </div>
         )}
         {repoTree.map((node) => renderTreeNode(node, 0))}

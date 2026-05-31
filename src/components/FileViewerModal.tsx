@@ -6,6 +6,7 @@ import remarkGfm from 'remark-gfm';
 import rehypeRaw from 'rehype-raw';
 import type { FileContentResult } from '../types';
 import { handleExternalLinkClick } from '../utils/externalLink';
+import { useT } from '../i18n';
 
 interface FileViewerModalProps {
   open: boolean;
@@ -28,6 +29,7 @@ function isHtmlFile(path: string) {
 }
 
 export function FileViewerModal({ open, onClose, filePath, projectRoot, highlightLine }: FileViewerModalProps) {
+  const t = useT();
   const [result, setResult] = useState<FileContentResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -108,13 +110,13 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
                   className={`px-2.5 py-1 transition-colors ${preview ? 'bg-[var(--accent)] text-[var(--bg-base)]' : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]'}`}
                   onClick={() => setPreview(true)}
                 >
-                  预览
+                  {t("fileViewer.preview")}
                 </button>
                 <button
                   className={`px-2.5 py-1 transition-colors ${!preview ? 'bg-[var(--accent)] text-[var(--bg-base)]' : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]'}`}
                   onClick={() => setPreview(false)}
                 >
-                  源码
+                  {t("fileViewer.source")}
                 </button>
               </div>
             )}
@@ -131,7 +133,7 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
         <div className="flex-1 overflow-auto bg-[var(--bg-base)]">
           {loading && (
             <div className="flex items-center justify-center h-full text-[var(--text-muted)]">
-              加载中...
+              {t("fileViewer.loading")}
             </div>
           )}
           {error && (
@@ -151,23 +153,23 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
           )}
           {!isImg && result && result.isBinary && (
             <div className="flex flex-col items-center justify-center h-full gap-4 text-[var(--text-muted)]">
-              <span>二进制文件，不支持预览</span>
+              <span>{t("fileViewer.binaryNotSupported")}</span>
               <button
                 className="px-4 py-1.5 text-sm rounded-[var(--radius-sm)] bg-[var(--accent)] text-[var(--bg-base)] hover:opacity-90 transition-opacity"
                 onClick={() => invoke('open_path_with_default_app', { path: filePath })}
               >
-                使用默认工具打开
+                {t("fileViewer.openWithDefaultApp")}
               </button>
             </div>
           )}
           {!isImg && result && result.tooLarge && (
             <div className="flex flex-col items-center justify-center h-full gap-4 text-[var(--text-muted)]">
-              <span>文件过大（&gt;1MB），不支持预览</span>
+              <span>{t("fileViewer.tooLarge")}</span>
               <button
                 className="px-4 py-1.5 text-sm rounded-[var(--radius-sm)] bg-[var(--accent)] text-[var(--bg-base)] hover:opacity-90 transition-opacity"
                 onClick={() => invoke('open_path_with_default_app', { path: filePath })}
               >
-                使用默认工具打开
+                {t("fileViewer.openWithDefaultApp")}
               </button>
             </div>
           )}

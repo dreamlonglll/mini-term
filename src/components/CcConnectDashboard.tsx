@@ -2,6 +2,7 @@ import { useEffect, useState, useRef, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '../store';
+import { useT } from '../i18n';
 
 interface Props {
   /** modal 是否打开;false 时 iframe 仍保留(visibility:hidden) */
@@ -25,6 +26,7 @@ interface Props {
  * - cc-connect 未运行时不渲染 iframe,显示降级提示
  */
 export function CcConnectDashboard({ open, onClose, deepLink }: Props) {
+  const t = useT();
   const ccConfig = useAppStore((s) => s.config.ccConnect);
   const status = useAppStore((s) => s.ccConnectStatus);
   const [iframeUrl, setIframeUrl] = useState<string | null>(null);
@@ -37,7 +39,7 @@ export function CcConnectDashboard({ open, onClose, deepLink }: Props) {
 
   const buildUrl = useCallback(async (): Promise<string | null> => {
     if (!status?.running) {
-      setError('cc-connect 未运行,请先在设置中启动');
+      setError(t('ccDashboard.notRunning'));
       return null;
     }
     try {
@@ -51,10 +53,10 @@ export function CcConnectDashboard({ open, onClose, deepLink }: Props) {
       return `http://127.0.0.1:${port}/login?${params.toString()}`;
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
-      setError(`无法读取 cc-connect token: ${msg}`);
+      setError(t('ccDashboard.readTokenFailed', { msg }));
       return null;
     }
-  }, [status?.running, status?.port, ccConfig?.configPath, deepLink]);
+  }, [status?.running, status?.port, ccConfig?.configPath, deepLink, t]);
 
   // cc-connect 重启检测:running false→true 边缘 或 ownPid 变化 → 强制 rebuild
   // (不在依赖里依赖 iframeUrl,避免循环;只看 status 切换)
@@ -128,14 +130,14 @@ export function CcConnectDashboard({ open, onClose, deepLink }: Props) {
                 setIframeUrl(null);
                 void buildUrl().then((url) => { if (url) setIframeUrl(url); });
               }}
-              title="重新加载"
+              title={t('ccDashboard.reload')}
             >
-              刷新
+              {t('ccDashboard.refresh')}
             </button>
             <button
               className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors text-lg leading-none"
               onClick={onClose}
-              title="关闭 (Esc)"
+              title={t('ccDashboard.close')}
             >
               ✕
             </button>
@@ -147,7 +149,7 @@ export function CcConnectDashboard({ open, onClose, deepLink }: Props) {
           {error ? (
             <div className="absolute inset-0 flex items-center justify-center p-6">
               <div className="text-center max-w-md">
-                <div className="text-base text-[var(--color-error)] mb-2">无法加载 Dashboard</div>
+                <div className="text-base text-[var(--color-error)] mb-2">{t('ccDashboard.loadFailed')}</div>
                 <div className="text-sm text-[var(--text-muted)] whitespace-pre-wrap break-all">{error}</div>
               </div>
             </div>
@@ -160,7 +162,7 @@ export function CcConnectDashboard({ open, onClose, deepLink }: Props) {
             />
           ) : (
             <div className="absolute inset-0 flex items-center justify-center">
-              <div className="text-sm text-[var(--text-muted)]">正在加载...</div>
+              <div className="text-sm text-[var(--text-muted)]">{t('ccDashboard.loading')}</div>
             </div>
           )}
         </div>

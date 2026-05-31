@@ -8,6 +8,7 @@ import {
   unlinkProjectFromCcConnect,
 } from '../utils/ccConnectImport';
 import type { CcConnectConfig, CcConnectStatus, ProjectConfig } from '../types';
+import { useT } from '../i18n';
 
 interface Props {
   open: boolean;
@@ -42,6 +43,7 @@ export function CcConnectModal({ open, onClose }: Props) {
 }
 
 function CcConnectModalContent({ onClose }: { onClose: () => void }) {
+  const t = useT();
   const config = useAppStore((s) => s.config);
   const setConfig = useAppStore((s) => s.setConfig);
   const ccStatus = useAppStore((s) => s.ccConnectStatus);
@@ -97,10 +99,10 @@ function CcConnectModalContent({ onClose }: { onClose: () => void }) {
   const handleBrowseExe = useCallback(async () => {
     const isWindows = navigator.userAgent.includes('Windows');
     const selected = await openDialog({
-      title: '选择 cc-connect 可执行文件',
+      title: t('ccConnectModal.browseExeTitle'),
       multiple: false,
       directory: false,
-      filters: isWindows ? [{ name: '可执行文件', extensions: ['exe'] }] : undefined,
+      filters: isWindows ? [{ name: t('ccConnectModal.browseExeFilterName'), extensions: ['exe'] }] : undefined,
     });
     if (typeof selected === 'string' && selected.trim()) {
       setExePath(selected);
@@ -110,7 +112,7 @@ function CcConnectModalContent({ onClose }: { onClose: () => void }) {
 
   const handleBrowseConfig = useCallback(async () => {
     const selected = await openDialog({
-      title: '选择 cc-connect config.toml',
+      title: t('ccConnectModal.browseConfigTitle'),
       multiple: false,
       directory: false,
       filters: [{ name: 'TOML', extensions: ['toml'] }],
@@ -149,7 +151,7 @@ function CcConnectModalContent({ onClose }: { onClose: () => void }) {
         configPath: configPath || undefined,
         extraArgs: cc.extraArgs ?? [],
       });
-      setResultMsg({ kind: 'ok', text: `已启动 cc-connect (pid=${pid})` });
+      setResultMsg({ kind: 'ok', text: t('ccConnectModal.startedOk', { pid }) });
       // 给进程 ~600ms 起监听端口,再拉状态
       setTimeout(() => { void probe(); }, 600);
     } catch (e: unknown) {
@@ -164,7 +166,7 @@ function CcConnectModalContent({ onClose }: { onClose: () => void }) {
     setResultMsg(null);
     try {
       await invoke('cc_connect_stop');
-      setResultMsg({ kind: 'ok', text: 'cc-connect 已停止' });
+      setResultMsg({ kind: 'ok', text: t('ccConnectModal.stoppedOk') });
       setTimeout(() => { void probe(); }, 400);
     } catch (e: unknown) {
       setResultMsg({ kind: 'err', text: e instanceof Error ? e.message : String(e) });
@@ -183,7 +185,7 @@ function CcConnectModalContent({ onClose }: { onClose: () => void }) {
         configPath: configPath || undefined,
         extraArgs: cc.extraArgs ?? [],
       });
-      setResultMsg({ kind: 'ok', text: '已重启 cc-connect(active sessions 已重连)' });
+      setResultMsg({ kind: 'ok', text: t('ccConnectModal.restartedOk') });
       setTimeout(() => { void probe(); }, 800);
     } catch (e: unknown) {
       setResultMsg({ kind: 'err', text: e instanceof Error ? e.message : String(e) });
@@ -200,10 +202,12 @@ function CcConnectModalContent({ onClose }: { onClose: () => void }) {
       if (status?.running) {
         setResultMsg({
           kind: 'ok',
-          text: `连接成功:端口 ${status.port}${status.version ? ` · 版本 ${status.version}` : ''}`,
+          text: status.version
+            ? t('ccConnectModal.testOkWithVersion', { port: status.port, version: status.version })
+            : t('ccConnectModal.testOk', { port: status.port }),
         });
       } else {
-        setResultMsg({ kind: 'err', text: status?.diagnostic ?? '无法连接到 cc-connect' });
+        setResultMsg({ kind: 'err', text: status?.diagnostic ?? t('ccConnectModal.cannotConnect') });
       }
     } finally {
       setBusy(null);
@@ -265,15 +269,15 @@ function CcConnectModalContent({ onClose }: { onClose: () => void }) {
 
   // 状态点颜色
   const indicator = (() => {
-    if (!ccStatus) return { color: 'var(--text-muted)', label: '未知', glyph: '○' };
-    if (ccStatus.running) return { color: 'var(--color-success)', label: '运行中', glyph: '●' };
-    if (ccStatus.diagnostic) return { color: 'var(--color-error)', label: '错误', glyph: '⚠' };
-    return { color: 'var(--text-muted)', label: '未启动', glyph: '○' };
+    if (!ccStatus) return { color: 'var(--text-muted)', label: t('ccConnectModal.indicator.unknown'), glyph: '○' };
+    if (ccStatus.running) return { color: 'var(--color-success)', label: t('ccConnectModal.indicator.running'), glyph: '●' };
+    if (ccStatus.diagnostic) return { color: 'var(--color-error)', label: t('ccConnectModal.indicator.error'), glyph: '⚠' };
+    return { color: 'var(--text-muted)', label: t('ccConnectModal.indicator.stopped'), glyph: '○' };
   })();
 
   const statusDetail = ccStatus?.running
-    ? `端口 ${ccStatus.port}${ccStatus.ownPid ? ` · pid ${ccStatus.ownPid}` : ''}${ccStatus.version ? ` · 版本 ${ccStatus.version}` : ''}`
-    : ccStatus?.diagnostic ?? '点击下方"测试连接"探测 cc-connect 状态';
+    ? `${t('ccConnectModal.statusPort', { port: ccStatus.port })}${ccStatus.ownPid ? t('ccConnectModal.statusPid', { pid: ccStatus.ownPid }) : ''}${ccStatus.version ? t('ccConnectModal.statusVersion', { version: ccStatus.version }) : ''}`
+    : ccStatus?.diagnostic ?? t('ccConnectModal.statusDetailHint');
 
   return (
     <div className="fixed inset-0 z-50 flex items-start justify-center pt-[8vh]" onClick={onClose}>
@@ -284,7 +288,7 @@ function CcConnectModalContent({ onClose }: { onClose: () => void }) {
       >
         {/* 顶栏 */}
         <div className="flex items-center justify-between px-5 py-4 border-b border-[var(--border-subtle)] flex-shrink-0">
-          <h2 className="text-lg font-semibold text-[var(--text-primary)]">连接 · cc-connect</h2>
+          <h2 className="text-lg font-semibold text-[var(--text-primary)]">{t('ccConnectModal.title')}</h2>
           <button
             className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors text-lg leading-none"
             onClick={onClose}
@@ -302,7 +306,7 @@ function CcConnectModalContent({ onClose }: { onClose: () => void }) {
                 <span data-status-dot style={{ color: indicator.color }} className="text-base leading-none">
                   {indicator.glyph}
                 </span>
-                <span className="text-base text-[var(--text-primary)]">cc-connect {indicator.label}</span>
+                <span className="text-base text-[var(--text-primary)]">{t('ccConnectModal.statusRunning', { label: indicator.label })}</span>
               </div>
               <div className="text-sm text-[var(--text-muted)] font-mono break-all">{statusDetail}</div>
             </div>
@@ -310,9 +314,9 @@ function CcConnectModalContent({ onClose }: { onClose: () => void }) {
               className="w-full py-2 bg-[var(--accent)] text-[var(--bg-base)] rounded-[var(--radius-sm)] text-base font-medium hover:opacity-90 transition-opacity disabled:opacity-40 disabled:cursor-not-allowed"
               onClick={() => openCcDashboard()}
               disabled={!running}
-              title={running ? '打开 cc-connect Web Dashboard' : '需要先启动 cc-connect'}
+              title={running ? t('ccConnectModal.openDashboardTitle') : t('ccConnectModal.needStartFirst')}
             >
-              打开 Dashboard
+              {t('ccConnectModal.openDashboard')}
             </button>
           </div>
 
@@ -320,7 +324,7 @@ function CcConnectModalContent({ onClose }: { onClose: () => void }) {
               每个导入项目会附带占位 telegram 平台(后端注入),保证 cc-connect 冷启动,用户后续到 Dashboard 换真平台。 */}
           <div className="space-y-1.5">
             <div className="flex items-center justify-between gap-2">
-              <span className="text-base text-[var(--text-primary)]">导入项目到 cc-connect</span>
+              <span className="text-base text-[var(--text-primary)]">{t('ccConnectModal.importHeading')}</span>
               <div className="flex items-center gap-3">
                 {unimportedProjects.length > 0 && (
                   <label className="flex items-center gap-1.5 text-xs text-[var(--text-muted)] cursor-pointer select-none">
@@ -333,22 +337,22 @@ function CcConnectModalContent({ onClose }: { onClose: () => void }) {
                         setSelectedIds(e.target.checked ? new Set(unimportedProjects.map((p) => p.id)) : new Set());
                       }}
                     />
-                    全选
+                    {t('ccConnectModal.selectAll')}
                   </label>
                 )}
                 <button
                   className="px-2.5 py-1 text-sm rounded-[var(--radius-sm)] bg-[var(--accent)] text-[var(--bg-base)] hover:opacity-90 transition-opacity disabled:opacity-40 disabled:cursor-not-allowed"
                   disabled={!running || importing || selectedCount === 0}
-                  title={running ? '导入勾选的项目(只重启一次 cc-connect)' : '需要先启动 cc-connect'}
+                  title={running ? t('ccConnectModal.batchImportTitle') : t('ccConnectModal.needStartFirst')}
                   onClick={() => { void handleBatchImport(); }}
                 >
-                  一键导入{selectedCount > 0 ? ` (${selectedCount})` : ''}
+                  {selectedCount > 0 ? t('ccConnectModal.batchImportWithCount', { count: selectedCount }) : t('ccConnectModal.batchImport')}
                 </button>
               </div>
             </div>
             {config.projects.length === 0 ? (
               <div className="text-sm text-[var(--text-muted)] px-3 py-2 rounded-[var(--radius-sm)] bg-[var(--bg-base)] border border-[var(--border-subtle)]">
-                还没有项目,先在左栏添加
+                {t('ccConnectModal.noProjects')}
               </div>
             ) : (
               <div className="max-h-[180px] overflow-y-auto rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)] divide-y divide-[var(--border-subtle)]">
@@ -379,24 +383,24 @@ function CcConnectModalContent({ onClose }: { onClose: () => void }) {
                       </div>
                       {imported ? (
                         <div className="flex items-center gap-2 flex-shrink-0">
-                          <span className="text-xs text-[var(--color-success)]" title={`已导入「${linkedName}」`}>● 已导入</span>
+                          <span className="text-xs text-[var(--color-success)]" title={t('ccConnectModal.importedTitle', { name: linkedName })}>{t('ccConnectModal.importedTag')}</span>
                           <button
                             className="px-2 py-1 text-xs rounded-[var(--radius-sm)] border border-[var(--border-default)] text-[var(--text-secondary)] hover:border-[var(--color-error)] hover:text-[var(--color-error)] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                             disabled={!running || importing}
-                            title={running ? '从 cc-connect 移除该项目' : '需要先启动 cc-connect'}
+                            title={running ? t('ccConnectModal.removeTitle') : t('ccConnectModal.needStartFirst')}
                             onClick={() => { void handleRemove(p); }}
                           >
-                            移除
+                            {t('ccConnectModal.remove')}
                           </button>
                         </div>
                       ) : (
                         <button
                           className="px-2.5 py-1 text-sm rounded-[var(--radius-sm)] bg-[var(--accent)] text-[var(--bg-base)] hover:opacity-90 transition-opacity disabled:opacity-40 disabled:cursor-not-allowed flex-shrink-0"
                           disabled={!running || importing}
-                          title={running ? '导入到 cc-connect' : '需要先启动 cc-connect'}
+                          title={running ? t('ccConnectModal.importBtnTitle') : t('ccConnectModal.needStartFirst')}
                           onClick={() => { void handleSingleImport(p); }}
                         >
-                          导入
+                          {t('ccConnectModal.importBtn')}
                         </button>
                       )}
                     </div>
@@ -408,11 +412,11 @@ function CcConnectModalContent({ onClose }: { onClose: () => void }) {
 
           {/* 可执行文件路径 */}
           <div className="space-y-1.5">
-            <span className="text-base text-[var(--text-primary)]">可执行文件路径</span>
+            <span className="text-base text-[var(--text-primary)]">{t('ccConnectModal.exePathLabel')}</span>
             <div className="flex gap-2 items-center">
               <input
                 className="flex-1 bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1.5 text-base outline-none focus:border-[var(--accent)] font-mono"
-                placeholder="留空使用 PATH 中的 cc-connect"
+                placeholder={t('ccConnectModal.exePathPlaceholder')}
                 value={exePath}
                 spellCheck={false}
                 onChange={(e) => setExePath(e.target.value)}
@@ -424,18 +428,18 @@ function CcConnectModalContent({ onClose }: { onClose: () => void }) {
                 className="px-3 py-1.5 text-base bg-[var(--bg-elevated)] text-[var(--text-secondary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] hover:border-[var(--accent)] hover:text-[var(--accent)] transition-all flex-shrink-0"
                 onClick={handleBrowseExe}
               >
-                浏览
+                {t('ccConnectModal.browse')}
               </button>
             </div>
           </div>
 
           {/* config.toml 路径 */}
           <div className="space-y-1.5">
-            <span className="text-base text-[var(--text-primary)]">config.toml 路径</span>
+            <span className="text-base text-[var(--text-primary)]">{t('ccConnectModal.configPathLabel')}</span>
             <div className="flex gap-2 items-center">
               <input
                 className="flex-1 bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1.5 text-base outline-none focus:border-[var(--accent)] font-mono"
-                placeholder="留空使用 ~/.cc-connect/config.toml"
+                placeholder={t('ccConnectModal.configPathPlaceholder')}
                 value={configPath}
                 spellCheck={false}
                 onChange={(e) => setConfigPath(e.target.value)}
@@ -447,17 +451,17 @@ function CcConnectModalContent({ onClose }: { onClose: () => void }) {
                 className="px-3 py-1.5 text-base bg-[var(--bg-elevated)] text-[var(--text-secondary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] hover:border-[var(--accent)] hover:text-[var(--accent)] transition-all flex-shrink-0"
                 onClick={handleBrowseConfig}
               >
-                浏览
+                {t('ccConnectModal.browse')}
               </button>
             </div>
           </div>
 
           {/* 额外启动参数 */}
           <div className="space-y-1.5">
-            <span className="text-base text-[var(--text-primary)]">额外启动参数</span>
+            <span className="text-base text-[var(--text-primary)]">{t('ccConnectModal.extraArgsLabel')}</span>
             <input
               className="w-full bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1.5 text-base outline-none focus:border-[var(--accent)] font-mono"
-              placeholder="空格分隔,例如:--verbose"
+              placeholder={t('ccConnectModal.extraArgsPlaceholder')}
               value={extraArgsInput}
               spellCheck={false}
               onChange={(e) => setExtraArgsInput(e.target.value)}
@@ -469,8 +473,8 @@ function CcConnectModalContent({ onClose }: { onClose: () => void }) {
           {/* 自动启动 */}
           <div className="flex items-center justify-between px-3 py-2.5 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)]">
             <div className="pr-4">
-              <div className="text-base text-[var(--text-primary)]">mini-term 启动时自动启动</div>
-              <div className="text-sm text-[var(--text-muted)]">仅当探测到 cc-connect 未运行时才会 spawn,避免冲突</div>
+              <div className="text-base text-[var(--text-primary)]">{t('ccConnectModal.autoStartTitle')}</div>
+              <div className="text-sm text-[var(--text-muted)]">{t('ccConnectModal.autoStartDesc')}</div>
             </div>
             <button
               className={`relative w-9 h-5 rounded-full transition-colors flex-shrink-0 ${
@@ -493,21 +497,21 @@ function CcConnectModalContent({ onClose }: { onClose: () => void }) {
               onClick={handleStart}
               disabled={busy !== null}
             >
-              {busy === 'start' ? '启动中...' : '启动'}
+              {busy === 'start' ? t('ccConnectModal.starting') : t('ccConnectModal.start')}
             </button>
             <button
               className="py-2 bg-[var(--bg-base)] text-[var(--text-secondary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] text-base hover:border-[var(--accent)] hover:text-[var(--accent)] transition-all disabled:opacity-50"
               onClick={handleStop}
               disabled={busy !== null}
             >
-              {busy === 'stop' ? '停止中...' : '停止'}
+              {busy === 'stop' ? t('ccConnectModal.stopping') : t('ccConnectModal.stop')}
             </button>
             <button
               className="py-2 bg-[var(--bg-base)] text-[var(--text-secondary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] text-base hover:border-[var(--accent)] hover:text-[var(--accent)] transition-all disabled:opacity-50"
               onClick={handleRestart}
               disabled={busy !== null}
             >
-              {busy === 'restart' ? '重启中...' : '重启'}
+              {busy === 'restart' ? t('ccConnectModal.restarting') : t('ccConnectModal.restart')}
             </button>
           </div>
 
@@ -517,13 +521,13 @@ function CcConnectModalContent({ onClose }: { onClose: () => void }) {
               onClick={handleTest}
               disabled={busy !== null}
             >
-              {busy === 'test' ? '测试中...' : '测试连接'}
+              {busy === 'test' ? t('ccConnectModal.testing') : t('ccConnectModal.test')}
             </button>
             <button
               className="py-2 bg-[var(--bg-base)] text-[var(--text-secondary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] text-base hover:border-[var(--accent)] hover:text-[var(--accent)] transition-all"
               onClick={handleOpenConfigToml}
             >
-              编辑配置文件
+              {t('ccConnectModal.editConfig')}
             </button>
           </div>
 
@@ -541,7 +545,7 @@ function CcConnectModalContent({ onClose }: { onClose: () => void }) {
           )}
 
           <div className="pt-1 text-sm text-[var(--text-muted)]">
-            留空可执行文件 / 配置路径即用默认值(PATH 中的 cc-connect + ~/.cc-connect/config.toml)· 重启会断开所有 IM active sessions(chat 历史保留)· mini-term 关闭时不会联动停止 cc-connect
+            {t('ccConnectModal.footer')}
           </div>
         </div>
       </div>

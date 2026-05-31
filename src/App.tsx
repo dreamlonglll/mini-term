@@ -27,6 +27,7 @@ import { applyTheme } from './utils/themeManager';
 import { applyUiFontFamily } from './utils/fontManager';
 import { markAiPty, updateAllTerminalThemes } from './utils/terminalCache';
 import { includeActiveProject } from './utils/projectKeepAlive';
+import { useT } from './i18n';
 import type { AppConfig, PtyStatusChangePayload, PtyExitPayload, PaneStatus, CcConnectStatus, CcConnectConfig } from './types';
 
 /** cc-connect 未保存配置时,「连接」弹窗 / Dashboard 打开期间仍以默认路径探活的占位配置。 */
@@ -39,6 +40,7 @@ const EMPTY_CC_CONFIG: CcConnectConfig = {
 };
 
 export function App() {
+  const t = useT();
   const [configLoaded, setConfigLoaded] = useState(false);
   const [configOpen, setConfigOpen] = useState(false);
   const [configPage, setConfigPage] = useState<SettingsPage | undefined>(undefined);
@@ -213,7 +215,7 @@ export function App() {
         projectId: '__wsl_info__',
         projectName: `WSL: ${payload.distro}`,
         kind: 'wsl-info',
-        message: `已检测到 WSL 项目,使用 wsl.exe 启动终端 (${payload.unixPath})`,
+        message: t('app.wslOverride', { path: payload.unixPath }),
       });
     }, []),
   );
@@ -227,7 +229,7 @@ export function App() {
     const appWindow = getCurrentWindow();
     const unlisten = appWindow.onCloseRequested(async (event) => {
       event.preventDefault();
-      const confirmed = await ask('确定要关闭 Mini-Term 吗？', { title: '关闭确认', kind: 'warning' });
+      const confirmed = await ask(t('app.closeConfirm.message'), { title: t('app.closeConfirm.title'), kind: 'warning' });
       if (!confirmed) return;
       const { projectStates, activeProjectId: currentActive, config: currentConfig } = useAppStore.getState();
       for (const projectId of projectStates.keys()) {
@@ -311,16 +313,16 @@ export function App() {
             className="text-[10px] px-1.5 py-0.5 rounded-full bg-[var(--accent)]/15 text-[var(--accent)] cursor-pointer hover:bg-[var(--accent)]/25 transition-colors"
             data-no-drag
             onClick={() => openUrl(updateInfo.url)}
-            title={`新版本 ${updateInfo.version} 可用，点击前往下载`}
+            title={t('app.update.title', { version: updateInfo.version })}
           >
-            新版本 {updateInfo.version}
+            {t('app.update.badge', { version: updateInfo.version })}
           </span>
         )}
         <div className="w-px h-3.5 bg-[var(--border-default)]" />
         <div className="flex items-center gap-3 text-[var(--text-muted)]" data-no-drag>
-          <span className="cursor-pointer hover:text-[var(--text-primary)] transition-colors duration-150" onClick={() => { setConfigPage(undefined); setConfigOpen(true); }}>设置</span>
+          <span className="cursor-pointer hover:text-[var(--text-primary)] transition-colors duration-150" onClick={() => { setConfigPage(undefined); setConfigOpen(true); }}>{t('app.menu.settings')}</span>
           <span className="cursor-pointer hover:text-[var(--text-primary)] transition-colors duration-150" onClick={() => setSshOpen(true)}>SSH</span>
-          <span className="cursor-pointer hover:text-[var(--text-primary)] transition-colors duration-150" onClick={() => setCcConnectOpen(true)}>连接</span>
+          <span className="cursor-pointer hover:text-[var(--text-primary)] transition-colors duration-150" onClick={() => setCcConnectOpen(true)}>{t('app.menu.connect')}</span>
         </div>
         <div className="flex-1" />
       </div>
@@ -376,7 +378,7 @@ export function App() {
               })}
               {config.projects.length === 0 && (
                 <div className="h-full bg-[var(--bg-terminal)] flex items-center justify-center text-[var(--text-muted)] text-sm">
-                  请先在左栏添加项目
+                  {t('app.emptyState')}
                 </div>
               )}
             </div>

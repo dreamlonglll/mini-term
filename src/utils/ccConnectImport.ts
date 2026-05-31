@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '../store';
+import { t } from '../i18n';
 import { showConfirm, showAlert } from './prompt';
 import type {
   AppConfig,
@@ -26,9 +27,7 @@ const DEFAULT_CC_CONNECT_CONFIG: CcConnectConfig = {
  * cc-connect 强制每个项目至少一个 [[projects.platforms]],否则冷启动 os.Exit(1);导入时拿不到真实
  * IM 凭据,故注入占位平台保证可冷启动,用户后续在 Dashboard 替换为真实平台。confirm 文案据此告知。
  */
-const PLACEHOLDER_NOTE =
-  '导入的项目会附带一个占位 Telegram 平台(假凭据),稍后请到 Dashboard 替换为真实 IM 平台' +
-  '(请替换而非直接删除占位平台,否则该项目会缺平台导致 cc-connect 下次无法启动)。';
+const placeholderNote = () => t('ccConnectImport.placeholderNote');
 
 /** 基于 projectId 生成 8 字符 hash 后缀(同名冲突时避免与既存 cc-connect 项目撞名)。 */
 function shortHashSuffix(projectId: string): string {
@@ -92,11 +91,12 @@ export async function importProjectToCcConnect(project: ProjectConfig): Promise<
   const cc = cfg.ccConnect ?? DEFAULT_CC_CONNECT_CONFIG;
 
   const ok = await showConfirm(
-    '导入到 cc-connect',
-    `将向 cc-connect 添加项目「${project.name}」并重启 cc-connect,可能短暂中断现有 IM 会话,继续吗?\n\n` +
-      `${PLACEHOLDER_NOTE}\n\n` +
-      `工作目录: ${project.path}\n` +
-      `Agent 类型: claudecode (后续可在 Dashboard 中修改)`,
+    t('ccConnectImport.importTitle'),
+    t('ccConnectImport.importConfirm', {
+      name: project.name,
+      note: placeholderNote(),
+      path: project.path,
+    }),
   );
   if (!ok) return false;
 
@@ -116,17 +116,23 @@ export async function importProjectToCcConnect(project: ProjectConfig): Promise<
       await refreshStatus(cc.configPath);
       if (!result.restartOk) {
         await showAlert(
-          '导入成功但 cc-connect 重启失败',
-          `项目「${result.name}」已写入 cc-connect 配置;但重启 cc-connect 失败:\n${result.restartError ?? '未知错误'}\n\n下次启动 cc-connect 时新项目会生效。`,
+          t('ccConnectImport.importRestartFailedTitle'),
+          t('ccConnectImport.importRestartFailedMsg', {
+            name: result.name,
+            error: result.restartError ?? t('ccConnectImport.unknownError'),
+          }),
         );
       }
       return true;
     }
-    await showAlert('导入失败', 'cc-connect 未能写入项目配置');
+    await showAlert(
+      t('ccConnectImport.importFailedTitle'),
+      t('ccConnectImport.importFailedNoWrite'),
+    );
     return false;
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
-    await showAlert('导入失败', msg);
+    await showAlert(t('ccConnectImport.importFailedTitle'), msg);
     return false;
   }
 }
@@ -148,11 +154,15 @@ export async function importProjectsToCcConnect(projects: ProjectConfig[]): Prom
   const names = projects.map((p) => `· ${p.name}`);
   const listStr =
     names.length > MAX_LIST
-      ? `${names.slice(0, MAX_LIST).join('\n')}\n…等共 ${projects.length} 个`
+      ? `${names.slice(0, MAX_LIST).join('\n')}\n${t('ccConnectImport.batchListMore', { count: projects.length })}`
       : names.join('\n');
   const ok = await showConfirm(
-    '批量导入到 cc-connect',
-    `将向 cc-connect 添加以下 ${projects.length} 个项目并重启一次 cc-connect,可能短暂中断现有 IM 会话,继续吗?\n\n${listStr}\n\n${PLACEHOLDER_NOTE}`,
+    t('ccConnectImport.batchImportTitle'),
+    t('ccConnectImport.batchImportConfirm', {
+      count: projects.length,
+      list: listStr,
+      note: placeholderNote(),
+    }),
   );
   if (!ok) return false;
 
@@ -189,18 +199,24 @@ export async function importProjectsToCcConnect(projects: ProjectConfig[]): Prom
       await refreshStatus(cc.configPath);
       if (!result.restartOk) {
         await showAlert(
-          '批量导入成功但 cc-connect 重启失败',
-          `${result.imported.length} 个项目已写入 cc-connect 配置;但重启 cc-connect 失败:\n${result.restartError ?? '未知错误'}\n\n下次启动 cc-connect 时新项目会生效。`,
+          t('ccConnectImport.batchRestartFailedTitle'),
+          t('ccConnectImport.batchRestartFailedMsg', {
+            count: result.imported.length,
+            error: result.restartError ?? t('ccConnectImport.unknownError'),
+          }),
         );
       }
       return true;
     }
     // tomlWritten=false:选中项目在 cc-connect 中均已存在(前端去重后理论不可达)
-    await showAlert('无需导入', '选中的项目在 cc-connect 中均已存在');
+    await showAlert(
+      t('ccConnectImport.batchNoNeedTitle'),
+      t('ccConnectImport.batchNoNeedMsg'),
+    );
     return false;
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
-    await showAlert('批量导入失败', msg);
+    await showAlert(t('ccConnectImport.batchImportFailedTitle'), msg);
     return false;
   }
 }
@@ -217,13 +233,16 @@ export async function unlinkProjectFromCcConnect(project: ProjectConfig): Promis
   const cc = cfg.ccConnect ?? DEFAULT_CC_CONNECT_CONFIG;
   const linkedName = cc.projectLinks?.[project.id];
   if (!linkedName) {
-    await showAlert('未导入', `项目「${project.name}」尚未导入到 cc-connect`);
+    await showAlert(
+      t('ccConnectImport.notImportedTitle'),
+      t('ccConnectImport.notImportedMsg', { name: project.name }),
+    );
     return false;
   }
 
   const ok = await showConfirm(
-    '从 cc-connect 移除',
-    `将从 cc-connect 删除项目「${linkedName}」并重启 cc-connect,可能短暂中断现有 IM 会话,继续吗?`,
+    t('ccConnectImport.removeTitle'),
+    t('ccConnectImport.removeConfirm', { name: linkedName }),
   );
   if (!ok) return false;
 
@@ -235,14 +254,14 @@ export async function unlinkProjectFromCcConnect(project: ProjectConfig): Promis
     });
     // 后端契约:deletedOk=true 即返 Ok,restartOk 失败时仅 toast 提示但仍清本地 link。
     if (!result.restartOk) {
-      restartWarning = result.restartError ?? '未知错误';
+      restartWarning = result.restartError ?? t('ccConnectImport.unknownError');
     }
   } catch (e: unknown) {
     // DELETE 失败不阻断本地 link 清理(例如 cc-connect 那边已被手动删了)
     const msg = e instanceof Error ? e.message : String(e);
     const proceed = await showConfirm(
-      'cc-connect 删除失败',
-      `${msg}\n\n是否仍要从 mini-term 端清理「${project.name}」的导入记录?`,
+      t('ccConnectImport.deleteFailedTitle'),
+      t('ccConnectImport.deleteFailedConfirm', { error: msg, name: project.name }),
     );
     if (!proceed) return false;
   }
@@ -255,8 +274,11 @@ export async function unlinkProjectFromCcConnect(project: ProjectConfig): Promis
   await refreshStatus(cc.configPath);
   if (restartWarning) {
     await showAlert(
-      '移除成功但 cc-connect 重启失败',
-      `项目「${linkedName}」已从 cc-connect 删除;但重启 cc-connect 失败:\n${restartWarning}\n\n下次启动 cc-connect 时会生效。`,
+      t('ccConnectImport.removeRestartFailedTitle'),
+      t('ccConnectImport.removeRestartFailedMsg', {
+        name: linkedName,
+        error: restartWarning,
+      }),
     );
   }
   return true;

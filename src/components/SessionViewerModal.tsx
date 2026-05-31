@@ -6,6 +6,7 @@ import remarkGfm from 'remark-gfm';
 import rehypeRaw from 'rehype-raw';
 import { MOD_LABEL } from '../utils/platform';
 import { handleExternalLinkClick } from '../utils/externalLink';
+import { useT } from '../i18n';
 import type { AiSession, AiSessionMessage } from '../types';
 
 interface Props {
@@ -43,6 +44,7 @@ function HighlightText({ text, query }: { text: string; query: string }) {
 }
 
 export function SessionViewerModal({ open, onClose, session, projectPath }: Props) {
+  const t = useT();
   const [messages, setMessages] = useState<AiSessionMessage[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -169,7 +171,7 @@ export function SessionViewerModal({ open, onClose, session, projectPath }: Prop
             </span>
             <span className="text-base font-medium text-[var(--text-primary)] truncate">{session.title}</span>
             {messages.length > 0 && (
-              <span className="text-xs text-[var(--text-muted)] flex-shrink-0">{messages.length} 条消息</span>
+              <span className="text-xs text-[var(--text-muted)] flex-shrink-0">{t("sessionViewer.messageCount", { count: messages.length })}</span>
             )}
           </div>
 
@@ -177,13 +179,13 @@ export function SessionViewerModal({ open, onClose, session, projectPath }: Prop
             {/* User 消息快速导航 */}
             {userIndices.length > 0 && (
               <div className="flex items-center gap-1 text-xs text-[var(--text-muted)]">
-                <button className="hover:text-[var(--text-primary)] transition-colors px-0.5" onClick={() => goUser(-1)} title="上一个用户消息">
+                <button className="hover:text-[var(--text-primary)] transition-colors px-0.5" onClick={() => goUser(-1)} title={t("sessionViewer.prevUserMessage")}>
                   ▲
                 </button>
                 <span className="min-w-[4em] text-center">
                   User {userIdx >= 0 ? userIdx + 1 : '-'}/{userIndices.length}
                 </span>
-                <button className="hover:text-[var(--text-primary)] transition-colors px-0.5" onClick={() => goUser(1)} title="下一个用户消息">
+                <button className="hover:text-[var(--text-primary)] transition-colors px-0.5" onClick={() => goUser(1)} title={t("sessionViewer.nextUserMessage")}>
                   ▼
                 </button>
               </div>
@@ -202,7 +204,7 @@ export function SessionViewerModal({ open, onClose, session, projectPath }: Prop
               ref={searchRef}
               type="text"
               className="flex-1 bg-transparent text-sm text-[var(--text-primary)] outline-none placeholder:text-[var(--text-muted)]"
-              placeholder={`搜索消息内容… (${MOD_LABEL}+F)`}
+              placeholder={t("sessionViewer.searchPlaceholder", { mod: MOD_LABEL })}
               value={search}
               onChange={(e) => setSearch(e.target.value)}
             />
@@ -215,7 +217,7 @@ export function SessionViewerModal({ open, onClose, session, projectPath }: Prop
                     <button className="hover:text-[var(--text-primary)] px-0.5" onClick={() => goMatch(1)}>▶</button>
                   </>
                 ) : (
-                  <span>无匹配</span>
+                  <span>{t("sessionViewer.noMatch")}</span>
                 )}
                 <button className="hover:text-[var(--text-primary)] ml-1 px-0.5" onClick={() => setSearch('')}>✕</button>
               </div>
@@ -225,10 +227,10 @@ export function SessionViewerModal({ open, onClose, session, projectPath }: Prop
 
         {/* 消息列表 */}
         <div className="flex-1 overflow-auto bg-[var(--bg-base)] p-4 space-y-4">
-          {loading && <div className="flex items-center justify-center h-full text-[var(--text-muted)]">加载中...</div>}
+          {loading && <div className="flex items-center justify-center h-full text-[var(--text-muted)]">{t("sessionViewer.loading")}</div>}
           {error && <div className="flex items-center justify-center h-full text-[var(--color-error)]">{error}</div>}
           {!loading && !error && messages.length === 0 && (
-            <div className="flex items-center justify-center h-full text-[var(--text-muted)]">无消息内容</div>
+            <div className="flex items-center justify-center h-full text-[var(--text-muted)]">{t("sessionViewer.emptyContent")}</div>
           )}
 
           {messages.map((msg, i) => (

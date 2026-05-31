@@ -13,6 +13,7 @@ import { DiffModal } from './DiffModal';
 import { FileViewerModal } from './FileViewerModal';
 import { initFileDrag } from '../utils/fileDragState';
 import { getFileTreeCache, setFileTreeCache } from '../utils/projectDataCache';
+import { useT } from '../i18n';
 import type { FileEntry, FsChangePayload, GitFileStatus, PtyOutputPayload } from '../types';
 
 interface TreeNodeProps {
@@ -37,6 +38,7 @@ function getRelativePath(targetPath: string, rootPath: string) {
 }
 
 function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff, onViewFile }: TreeNodeProps) {
+  const t = useT();
   const activeProjectId = useAppStore((s) => s.activeProjectId);
   const [expanded, setExpanded] = useState(() =>
     activeProjectId ? isExpanded(activeProjectId, entry.path) : false
@@ -98,63 +100,69 @@ function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff, onViewF
           const relativePath = getRelativePath(entry.path, projectRoot);
           const items: Parameters<typeof showContextMenu>[2] = [
             {
-              label: '复制相对路径',
+              label: t('fileTree.menu.copyRelativePath'),
               onClick: () => writeText(relativePath),
             },
             {
-              label: '复制绝对路径',
+              label: t('fileTree.menu.copyAbsolutePath'),
               onClick: () => writeText(entry.path),
             },
             { separator: true },
             {
-              label: '在文件夹中打开',
+              label: t('fileTree.menu.revealInFolder'),
               onClick: () => revealItemInDir(entry.path),
             },
           ];
           if (!entry.isDir) {
             items.unshift({
-              label: '使用默认工具打开',
+              label: t('fileTree.menu.openWithDefault'),
               onClick: () => invoke('open_path_with_default_app', { path: entry.path }),
             });
           }
           items.push({ separator: true });
           items.push({
-            label: '重命名',
+            label: t('fileTree.menu.rename'),
             onClick: async () => {
-              const newName = await showPrompt('重命名', '请输入新名称', entry.name);
+              const newName = await showPrompt(t('fileTree.prompt.renameTitle'), t('fileTree.prompt.renameMessage'), entry.name);
               if (!newName?.trim() || newName.trim() === entry.name) return;
               try {
                 await invoke('rename_entry', { projectRoot, oldPath: entry.path, newName: newName.trim() });
                 loadChildren();
               } catch (err) {
                 console.error('重命名失败:', err);
-                await message(`重命名失败：${String(err)}`, { title: '重命名失败', kind: 'error' });
+                await message(t('fileTree.dialog.renameFailedMessage', { error: String(err) }), { title: t('fileTree.dialog.renameFailedTitle'), kind: 'error' });
               }
             },
           });
           items.push({
-            label: '删除',
+            label: t('fileTree.menu.delete'),
             onClick: async () => {
-              const kind = entry.isDir ? '文件夹' : '文件';
               const confirmed = await ask(
-                `确定要删除${kind} "${entry.name}" 吗？${entry.isDir ? '\n该操作会递归删除文件夹下的所有内容,无法撤销。' : '\n该操作无法撤销。'}`,
-                { title: `删除${kind}`, kind: 'warning', okLabel: '删除', cancelLabel: '取消' },
+                entry.isDir
+                  ? t('fileTree.dialog.deleteConfirmFolder', { name: entry.name })
+                  : t('fileTree.dialog.deleteConfirmFile', { name: entry.name }),
+                {
+                  title: entry.isDir ? t('fileTree.dialog.deleteFolderTitle') : t('fileTree.dialog.deleteFileTitle'),
+                  kind: 'warning',
+                  okLabel: t('fileTree.dialog.deleteOk'),
+                  cancelLabel: t('fileTree.dialog.deleteCancel'),
+                },
               );
               if (!confirmed) return;
               try {
                 await invoke('delete_entry', { projectRoot, path: entry.path });
               } catch (err) {
                 console.error('删除失败:', err);
-                await message(`删除失败：${String(err)}`, { title: '删除失败', kind: 'error' });
+                await message(t('fileTree.dialog.deleteFailedMessage', { error: String(err) }), { title: t('fileTree.dialog.deleteFailedTitle'), kind: 'error' });
               }
             },
           });
           if (entry.isDir) {
             items.push({ separator: true });
             items.push({
-              label: '新建文件',
+              label: t('fileTree.menu.newFile'),
               onClick: async () => {
-                const name = await showPrompt('新建文件', '请输入文件名');
+                const name = await showPrompt(t('fileTree.prompt.newFileTitle'), t('fileTree.prompt.newFileMessage'));
                 if (!name?.trim()) return;
                 const sep = entry.path.includes('/') ? '/' : '\\';
                 await invoke('create_file', { projectRoot, path: `${entry.path}${sep}${name.trim()}` });
@@ -163,9 +171,9 @@ function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff, onViewF
               },
             });
             items.push({
-              label: '新建文件夹',
+              label: t('fileTree.menu.newFolder'),
               onClick: async () => {
-                const name = await showPrompt('新建文件夹', '请输入文件夹名');
+                const name = await showPrompt(t('fileTree.prompt.newFolderTitle'), t('fileTree.prompt.newFolderMessage'));
                 if (!name?.trim()) return;
                 const sep = entry.path.includes('/') ? '/' : '\\';
                 await invoke('create_directory', { projectRoot, path: `${entry.path}${sep}${name.trim()}` });
@@ -180,7 +188,7 @@ function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff, onViewF
           if (entryGitStatus && !entry.isDir) {
             items.push({ separator: true });
             items.push({
-              label: '查看变更',
+              label: t('fileTree.menu.viewDiff'),
               onClick: () => onViewDiff(entryGitStatus),
             });
           }
@@ -259,6 +267,7 @@ function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff, onViewF
 }
 
 export function FileTree() {
+  const t = useT();
   const activeProjectId = useAppStore((s) => s.activeProjectId);
   const config = useAppStore((s) => s.config);
   const setSearchModalOpen = useAppStore((s) => s.setSearchModalOpen);
@@ -268,8 +277,8 @@ export function FileTree() {
     if (!project) return;
     if (!config.editors.length) {
       await message(
-        '请先在『设置 → 系统设置 → 外部编辑器』中添加编辑器。',
-        { title: '未配置外部编辑器', kind: 'warning' },
+        t('fileTree.dialog.noEditorMessage'),
+        { title: t('fileTree.dialog.noEditorTitle'), kind: 'warning' },
       );
       return;
     }
@@ -281,9 +290,9 @@ export function FileTree() {
     } catch (err) {
       const detail = typeof err === 'string' ? err : String(err);
       console.error('打开编辑器失败:', err);
-      await message(detail, { title: '打开编辑器失败', kind: 'error' });
+      await message(detail, { title: t('fileTree.dialog.openEditorFailedTitle'), kind: 'error' });
     }
-  }, [project, config.editors]);
+  }, [project, config.editors, t]);
 
   const handleSwitchAndOpen = useCallback((editorName: string) => {
     const newConfig = { ...config, defaultEditor: editorName };
@@ -444,30 +453,30 @@ export function FileTree() {
     const sep = project.path.includes('/') ? '/' : '\\';
     showContextMenu(e.clientX, e.clientY, [
       {
-        label: '新建文件',
+        label: t('fileTree.menu.newFile'),
         onClick: async () => {
-          const name = await showPrompt('新建文件', '请输入文件名');
+          const name = await showPrompt(t('fileTree.prompt.newFileTitle'), t('fileTree.prompt.newFileMessage'));
           if (!name?.trim()) return;
           await invoke('create_file', { projectRoot: project.path, path: `${project.path}${sep}${name.trim()}` });
           loadRootEntries();
         },
       },
       {
-        label: '新建文件夹',
+        label: t('fileTree.menu.newFolder'),
         onClick: async () => {
-          const name = await showPrompt('新建文件夹', '请输入文件夹名');
+          const name = await showPrompt(t('fileTree.prompt.newFolderTitle'), t('fileTree.prompt.newFolderMessage'));
           if (!name?.trim()) return;
           await invoke('create_directory', { projectRoot: project.path, path: `${project.path}${sep}${name.trim()}` });
           loadRootEntries();
         },
       },
     ]);
-  }, [project, loadRootEntries]);
+  }, [project, loadRootEntries, t]);
 
   if (!project) {
     return (
       <div className="h-full bg-[var(--bg-surface)] flex items-center justify-center text-[var(--text-muted)] text-base">
-        选择一个项目
+        {t('fileTree.empty.selectProject')}
       </div>
     );
   }
@@ -482,7 +491,7 @@ export function FileTree() {
           <button
             type="button"
             onClick={() => setSearchModalOpen(true)}
-            title={`搜索文件 (${MOD_LABEL}+Shift+F)`}
+            title={t('fileTree.header.searchTitle', { mod: MOD_LABEL })}
             className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors text-sm leading-none px-1.5 py-0.5 rounded-[var(--radius-sm)] hover:bg-[var(--border-subtle)]"
           >
             ⌕
@@ -493,7 +502,7 @@ export function FileTree() {
               loadRootEntries();
               loadGitStatus();
             }}
-            title="刷新"
+            title={t('fileTree.header.refresh')}
             className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors text-sm leading-none px-1.5 py-0.5 rounded-[var(--radius-sm)] hover:bg-[var(--border-subtle)]"
           >
             ↻
@@ -503,7 +512,7 @@ export function FileTree() {
               <button
                 type="button"
                 onClick={() => handleOpenInEditor()}
-                title={`使用${config.editors.find((e) => e.name === config.defaultEditor)?.name ?? config.editors[0]?.name ?? '编辑器'}打开`}
+                title={t('fileTree.header.openWithEditor', { editor: config.editors.find((e) => e.name === config.defaultEditor)?.name ?? config.editors[0]?.name ?? t('fileTree.header.editorFallback') })}
                 className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors text-xs leading-none px-1.5 py-0.5 rounded-l-[var(--radius-sm)] hover:bg-[var(--border-subtle)]"
               >
                 {config.editors.find((e) => e.name === config.defaultEditor)?.name ?? config.editors[0]?.name}
@@ -519,7 +528,7 @@ export function FileTree() {
                       onClick: () => handleSwitchAndOpen(editor.name),
                     })));
                   }}
-                  title="选择其他编辑器"
+                  title={t('fileTree.menu.chooseOtherEditor')}
                   className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors text-xs leading-none pl-0.5 pr-1 py-0.5 rounded-r-[var(--radius-sm)] hover:bg-[var(--border-subtle)] border-l border-[var(--border-subtle)]"
                 >
                   <svg width="8" height="8" viewBox="0 0 8 8" fill="currentColor" aria-hidden="true">
@@ -534,26 +543,26 @@ export function FileTree() {
       <div className="flex-1 min-h-0 overflow-y-auto px-1" onContextMenu={handleRootContextMenu}>
         {loading && rootEntries.length === 0 ? (
           <div className="flex items-center justify-center py-8 text-[var(--text-muted)] text-sm">
-            加载中...
+            {t('fileTree.empty.loading')}
           </div>
         ) : loadError && rootEntries.length === 0 ? (
           <div className="flex flex-col items-center justify-center gap-2 py-8 px-3 text-center text-sm">
             <div className="text-[var(--text-muted)] truncate max-w-full" title={loadError}>
-              文件列表加载失败
+              {t('fileTree.empty.loadFailed')}
             </div>
             <button
               type="button"
               onClick={loadRootEntries}
               className="px-2 py-1 rounded-[var(--radius-sm)] text-[var(--accent)] hover:bg-[var(--border-subtle)] transition-colors"
             >
-              重试
+              {t('fileTree.empty.retry')}
             </button>
           </div>
         ) : (
           <>
             {loadError && (
               <div className="px-2 py-1 text-xs text-[var(--text-muted)] truncate" title={loadError}>
-                文件列表刷新失败，已保留缓存
+                {t('fileTree.empty.refreshFailed')}
               </div>
             )}
             {rootEntries.map((entry) => (

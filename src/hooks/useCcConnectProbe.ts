@@ -1,6 +1,7 @@
 import { useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '../store';
+import { t } from '../i18n';
 import type { CcConnectConfig, CcConnectStatus } from '../types';
 
 const POLL_INTERVAL_MS = 5000;
@@ -41,7 +42,7 @@ export function useCcConnectProbe(ccConfig: CcConnectConfig | undefined): void {
             setCcConnectStatus({
               running: false,
               port: 9820,
-              diagnostic: 'probe invoke 失败,后端可能未响应',
+              diagnostic: t('ccProbe.invokeFailed'),
             });
           }
         });

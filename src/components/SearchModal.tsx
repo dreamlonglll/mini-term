@@ -6,6 +6,7 @@ import { useTauriEvent } from '../hooks/useTauriEvent';
 import { FileViewerModal } from './FileViewerModal';
 import { showContextMenu } from '../utils/contextMenu';
 import { MOD_LABEL } from '../utils/platform';
+import { useT } from '../i18n';
 import type { SearchResultItem, SearchResultsPayload, SearchCompletePayload } from '../types';
 
 // ── Keyword highlight helper ──
@@ -44,6 +45,7 @@ function ContentResults({
   onResultClick: (item: SearchResultItem) => void;
   onResultDoubleClick: (item: SearchResultItem) => void;
 }) {
+  const t = useT();
   const grouped = new Map<string, SearchResultItem[]>();
   for (const item of results) {
     const group = grouped.get(item.filePath) ?? [];
@@ -56,7 +58,7 @@ function ContentResults({
     e.preventDefault();
     e.stopPropagation();
     showContextMenu(e.clientX, e.clientY, [
-      { label: '复制文件地址', onClick: () => writeText(projectRoot + sep + item.filePath) },
+      { label: t('search.copyFilePath'), onClick: () => writeText(projectRoot + sep + item.filePath) },
     ]);
   };
 
@@ -102,6 +104,7 @@ interface SearchModalProps {
 }
 
 export function SearchModal({ open, onClose }: SearchModalProps) {
+  const t = useT();
   const [query, setQuery] = useState('');
   const [mode, setMode] = useState<'filename' | 'content'>('filename');
   const [useRegex, setUseRegex] = useState(false);
@@ -236,19 +239,19 @@ export function SearchModal({ open, onClose }: SearchModalProps) {
         {/* Header */}
         <div className="flex items-center justify-between px-4 py-3 border-b border-[var(--border-subtle)] flex-shrink-0">
           <div className="flex items-center gap-3">
-            <span className="text-base font-medium text-[var(--accent)]">搜索</span>
+            <span className="text-base font-medium text-[var(--accent)]">{t('search.title')}</span>
             <div className="flex rounded-[var(--radius-sm)] border border-[var(--border-default)] overflow-hidden text-xs">
               <button
                 className={`px-2.5 py-1 transition-colors ${mode === 'filename' ? 'bg-[var(--accent)] text-[var(--bg-base)]' : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]'}`}
                 onClick={() => setMode('filename')}
               >
-                文件名
+                {t('search.modeFilename')}
               </button>
               <button
                 className={`px-2.5 py-1 transition-colors ${mode === 'content' ? 'bg-[var(--accent)] text-[var(--bg-base)]' : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]'}`}
                 onClick={() => setMode('content')}
               >
-                内容
+                {t('search.modeContent')}
               </button>
             </div>
           </div>
@@ -270,7 +273,7 @@ export function SearchModal({ open, onClose }: SearchModalProps) {
             onKeyDown={(e) => {
               if (e.key === 'Enter') handleSearch();
             }}
-            placeholder={mode === 'filename' ? '搜索文件名...' : '搜索文件内容...'}
+            placeholder={mode === 'filename' ? t('search.placeholderFilename') : t('search.placeholderContent')}
             className="flex-1 bg-[var(--bg-base)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-3 py-1.5 text-sm text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:border-[var(--accent)]"
           />
           <button
@@ -280,7 +283,7 @@ export function SearchModal({ open, onClose }: SearchModalProps) {
                 : 'text-[var(--text-muted)] border-[var(--border-default)] hover:text-[var(--text-primary)]'
             }`}
             onClick={() => setUseRegex(!useRegex)}
-            title="正则表达式"
+            title={t('search.regexTitle')}
           >
             .*
           </button>
@@ -289,18 +292,18 @@ export function SearchModal({ open, onClose }: SearchModalProps) {
             disabled={!query.trim() || status === 'searching'}
             className="px-3 py-1.5 text-xs rounded-[var(--radius-sm)] bg-[var(--accent)] text-[var(--bg-base)] hover:opacity-90 disabled:opacity-50 transition-opacity"
           >
-            搜索
+            {t('search.searchButton')}
           </button>
         </div>
 
         {/* Results */}
         <div className="flex-1 overflow-auto bg-[var(--bg-base)]">
           {status === 'searching' && results.length === 0 && (
-            <div className="flex items-center justify-center h-full text-[var(--text-muted)]">搜索中...</div>
+            <div className="flex items-center justify-center h-full text-[var(--text-muted)]">{t('search.searching')}</div>
           )}
           {status === 'idle' && (
             <div className="flex items-center justify-center h-full text-[var(--text-muted)] text-sm">
-              输入关键词后按 Enter 开始搜索
+              {t('search.idleHint')}
             </div>
           )}
           {results.length > 0 && (
@@ -318,7 +321,7 @@ export function SearchModal({ open, onClose }: SearchModalProps) {
                           e.preventDefault();
                           e.stopPropagation();
                           showContextMenu(e.clientX, e.clientY, [
-                            { label: '复制文件地址', onClick: () => writeText(project!.path + sep + item.filePath) },
+                            { label: t('search.copyFilePath'), onClick: () => writeText(project!.path + sep + item.filePath) },
                           ]);
                         }}
                       >
@@ -336,17 +339,17 @@ export function SearchModal({ open, onClose }: SearchModalProps) {
           )}
           {results.length >= 1000 && (
             <div className="px-4 py-2 text-xs text-[var(--color-warning)] bg-[var(--bg-elevated)]">
-              已显示前 1000 条结果，更多结果未显示
+              {t('search.truncated')}
             </div>
           )}
         </div>
 
         {/* Status bar */}
         <div className="flex items-center px-4 py-1.5 border-t border-[var(--border-subtle)] text-xs text-[var(--text-muted)] flex-shrink-0">
-          {status === 'searching' && <span>搜索中... 已找到 {results.length} 条</span>}
-          {status === 'done' && mode === 'filename' && <span>找到 {totalCount} 个文件</span>}
-          {status === 'done' && mode === 'content' && <span>找到 {totalCount} 处匹配</span>}
-          {status === 'idle' && <span>{MOD_LABEL}+Shift+F 打开搜索</span>}
+          {status === 'searching' && <span>{t('search.searchingFound', { count: results.length })}</span>}
+          {status === 'done' && mode === 'filename' && <span>{t('search.foundFiles', { count: totalCount })}</span>}
+          {status === 'done' && mode === 'content' && <span>{t('search.foundMatches', { count: totalCount })}</span>}
+          {status === 'idle' && <span>{t('search.shortcutHint', { mod: MOD_LABEL })}</span>}
         </div>
       </div>
 

@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { ask } from '@tauri-apps/plugin-dialog';
+import { useT } from '../i18n';
 import { useAppStore } from '../store';
 import { useTauriEvent } from '../hooks/useTauriEvent';
 import { showContextMenu } from '../utils/contextMenu';
@@ -82,6 +83,7 @@ function statusColor(_file: ChangeFileStatus, area: string): string {
 // --- Main component ---
 
 export function GitChanges({ projectPath: _projectPath, repoPath, onCommitSuccess }: GitChangesProps) {
+  const t = useT();
   const config = useAppStore((s) => s.config);
   const setConfig = useAppStore((s) => s.setConfig);
 
@@ -195,8 +197,8 @@ export function GitChanges({ projectPath: _projectPath, repoPath, onCommitSucces
 
   const handleDiscard = useCallback(async (files: string[]) => {
     const confirmed = await ask(
-      `确定要丢弃 ${files.length} 个文件的修改吗？\n此操作不可撤销。`,
-      { title: '丢弃修改', kind: 'warning', okLabel: '丢弃', cancelLabel: '取消' },
+      t('gitChanges.discardConfirm', { count: files.length }),
+      { title: t('gitChanges.discardTitle'), kind: 'warning', okLabel: t('gitChanges.discardOk'), cancelLabel: t('gitChanges.discardCancel') },
     );
     if (!confirmed) return;
     try {
@@ -239,13 +241,13 @@ export function GitChanges({ projectPath: _projectPath, repoPath, onCommitSucces
           e.preventDefault();
           const sep = { separator: true as const };
           const items: Parameters<typeof showContextMenu>[2] = [
-            { label: '查看 Diff', onClick: () => handleViewDiff(file.path, isStaged, statusChar) },
+            { label: t('gitChanges.contextViewDiff'), onClick: () => handleViewDiff(file.path, isStaged, statusChar) },
             sep,
             ...(isStaged
               ? [{ label: 'Unstage', onClick: () => handleUnstage([file.path]) }]
               : [{ label: 'Stage', onClick: () => handleStage([file.path]) }]),
             ...(area !== 'staged'
-              ? [sep, { label: '丢弃修改', onClick: () => handleDiscard([file.path]) }]
+              ? [sep, { label: t('gitChanges.contextDiscard'), onClick: () => handleDiscard([file.path]) }]
               : []),
           ];
           showContextMenu(e.clientX, e.clientY, items);
@@ -357,14 +359,14 @@ export function GitChanges({ projectPath: _projectPath, repoPath, onCommitSucces
         <button
           className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors text-sm"
           onClick={loadChanges}
-          title="刷新"
+          title={t('gitChanges.refresh')}
         >
           ↻
         </button>
         <button
           className="text-xs text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors"
           onClick={toggleViewMode}
-          title={viewMode === 'list' ? '切换到树形视图' : '切换到列表视图'}
+          title={viewMode === 'list' ? t('gitChanges.switchToTree') : t('gitChanges.switchToList')}
         >
           {viewMode === 'list' ? '⊞' : '≡'}
         </button>
@@ -373,23 +375,23 @@ export function GitChanges({ projectPath: _projectPath, repoPath, onCommitSucces
       {/* File list */}
       <div className="flex-1 overflow-y-auto px-1">
         {loading && changes.length === 0 && (
-          <div className="text-center text-[var(--text-muted)] text-sm py-6">加载中...</div>
+          <div className="text-center text-[var(--text-muted)] text-sm py-6">{t('gitChanges.loading')}</div>
         )}
 
         {!loading && changes.length === 0 && (
-          <div className="text-center text-[var(--text-muted)] text-sm py-6">暂无变更</div>
+          <div className="text-center text-[var(--text-muted)] text-sm py-6">{t('gitChanges.empty')}</div>
         )}
 
         {renderGroup('Staged Changes', staged, 'staged', {
-          label: '↓ 全部取消',
+          label: t('gitChanges.unstageAll'),
           onClick: handleUnstageAll,
         })}
         {renderGroup('Changes', unstaged, 'unstaged', {
-          label: '↑ 全部暂存',
+          label: t('gitChanges.stageAll'),
           onClick: handleStageAll,
         })}
         {renderGroup('Untracked Files', untracked, 'untracked', {
-          label: '↑ 全部暂存',
+          label: t('gitChanges.stageAll'),
           onClick: handleStageAll,
         })}
       </div>
@@ -417,7 +419,7 @@ export function GitChanges({ projectPath: _projectPath, repoPath, onCommitSucces
           disabled={!commitMsg.trim() || staged.length === 0 || committing}
           onClick={handleCommit}
         >
-          {committing ? '提交中...' : `Commit (${staged.length})`}
+          {committing ? t('gitChanges.committing') : `Commit (${staged.length})`}
         </button>
       </div>
 

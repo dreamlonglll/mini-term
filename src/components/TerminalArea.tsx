@@ -4,6 +4,7 @@ import { useAppStore, genId, saveLayoutToConfig } from '../store';
 import { SplitLayout } from './SplitLayout';
 import { showContextMenu } from '../utils/contextMenu';
 import { getProjectEnvs } from '../utils/projectEnv';
+import { useT } from '../i18n';
 import type { TerminalTab, PaneState, SplitNode, ShellConfig } from '../types';
 
 interface Props {
@@ -42,6 +43,7 @@ function insertSplit(
 
 
 export function TerminalArea({ projectId, projectPath }: Props) {
+  const t = useT();
   const config = useAppStore((s) => s.config);
   const projectStates = useAppStore((s) => s.projectStates);
   const addTab = useAppStore((s) => s.addTab);
@@ -196,7 +198,7 @@ export function TerminalArea({ projectId, projectPath }: Props) {
               className="px-5 py-2.5 border border-dashed border-[var(--border-default)] rounded-[var(--radius-md)] text-sm hover:border-[var(--accent)] hover:text-[var(--accent)] transition-all duration-200"
               onClick={handleNewTabClick}
             >
-              + 新建终端
+              + {t("terminalArea.newTerminal")}
             </button>
           </div>
         )}

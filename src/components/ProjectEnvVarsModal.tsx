@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '../store';
 import { showAlert } from '../utils/prompt';
+import { useT, t as tStatic } from '../i18n';
 import type { ProjectConfig, ProjectEnvVar } from '../types';
 
 interface Props {
@@ -24,13 +25,13 @@ type RowErrorKind =
   | 'duplicate-key'
   | 'invalid-value';
 
-const ERROR_TEXT: Record<RowErrorKind, string> = {
-  'empty-key': 'key 不能为空',
-  'protected-prefix': 'MINITERM_ 前缀为内部保留,不可使用',
-  'reserved-wslenv': '`WSLENV` 由 mini-term 内部管理,不可用作变量名',
-  'invalid-key': 'key 只能含 a-z A-Z 0-9 _,且首字符不能是数字',
-  'duplicate-key': 'key 与其他行重复',
-  'invalid-value': 'value 不能含换行或 NUL 字符',
+const ERROR_TEXT_KEY: Record<RowErrorKind, string> = {
+  'empty-key': 'envVars.error.emptyKey',
+  'protected-prefix': 'envVars.error.protectedPrefix',
+  'reserved-wslenv': 'envVars.error.reservedWslenv',
+  'invalid-key': 'envVars.error.invalidKey',
+  'duplicate-key': 'envVars.error.duplicateKey',
+  'invalid-value': 'envVars.error.invalidValue',
 };
 
 /** 错误优先级:空 key > 受保护前缀 > 保留 WSLENV > 非法字符 > 重复 > value 非法 */
@@ -97,6 +98,7 @@ function isWslPath(path: string): boolean {
 }
 
 export function ProjectEnvVarsModal({ project, onClose }: Props) {
+  const t = useT();
   const [rows, setRows] = useState<EditableRow[]>([]);
   const [busy, setBusy] = useState(false);
   const ridCounter = useRef(0);
@@ -177,7 +179,7 @@ export function ProjectEnvVarsModal({ project, onClose }: Props) {
     } catch (e) {
       useAppStore.getState().setConfig(prevConfig);
       setBusy(false);
-      await showAlert('保存环境变量失败', e instanceof Error ? e.message : String(e));
+      await showAlert(tStatic('envVars.saveFailed'), e instanceof Error ? e.message : String(e));
     }
   }, [project, busy, hasErrors, rows, onClose]);
 
@@ -192,7 +194,7 @@ export function ProjectEnvVarsModal({ project, onClose }: Props) {
         {/* 顶栏 */}
         <div className="px-5 py-4 border-b border-[var(--border-subtle)]">
           <div className="flex items-center justify-between">
-            <h2 className="text-lg font-semibold text-[var(--text-primary)]">环境变量</h2>
+            <h2 className="text-lg font-semibold text-[var(--text-primary)]">{t('envVars.title')}</h2>
             <button
               className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors text-lg leading-none disabled:opacity-40"
               onClick={onClose}
@@ -202,15 +204,14 @@ export function ProjectEnvVarsModal({ project, onClose }: Props) {
             </button>
           </div>
           <div className="text-sm text-[var(--text-muted)] mt-1 truncate">
-            为项目「{project.name}」配置启动终端时注入的环境变量
+            {t('envVars.subtitle', { name: project.name })}
           </div>
         </div>
 
         {isWsl && (
           <div className="mx-5 mt-3 px-3 py-2 rounded bg-green-500/10 border border-green-500/30 text-sm text-green-200">
-            ✓ WSL 项目环境变量通过 WSLENV 透传至 Linux bash(<code className="text-green-100">/u</code> 单向,不做路径翻译)。
-            值是路径时请填 Linux 风格如 <code className="text-green-100">/home/u/...</code>;
-            <code className="text-green-100">~/.bashrc</code> 中 <code className="text-green-100">export</code> 同名变量会覆盖此值。
+            ✓ {t('envVars.wsl.part1')}<code className="text-green-100">/u</code>{t('envVars.wsl.part2')}<code className="text-green-100">/home/u/...</code>{t('envVars.wsl.part3')}
+            <code className="text-green-100">~/.bashrc</code>{t('envVars.wsl.part4')}<code className="text-green-100">export</code>{t('envVars.wsl.part5')}
           </div>
         )}
 
@@ -218,7 +219,7 @@ export function ProjectEnvVarsModal({ project, onClose }: Props) {
         <div className="flex-1 overflow-y-auto px-5 py-4">
           {/* 表头 */}
           <div className="flex items-center gap-2 mb-2 text-xs text-[var(--text-muted)] uppercase tracking-wide">
-            <span className="w-4 text-center">启</span>
+            <span className="w-4 text-center">{t('envVars.colEnabled')}</span>
             <span className="flex-[40] min-w-0">Key</span>
             <span className="flex-[55] min-w-0">Value</span>
             <span className="w-6"></span>
@@ -237,7 +238,7 @@ export function ProjectEnvVarsModal({ project, onClose }: Props) {
                       className="w-4 h-4 accent-[var(--accent)] flex-shrink-0"
                       checked={row.enabled}
                       onChange={(e) => updateRow(row.rid, { enabled: e.target.checked })}
-                      title={row.enabled ? '已启用' : '已禁用'}
+                      title={row.enabled ? t('envVars.rowEnabled') : t('envVars.rowDisabled')}
                     />
                     <input
                       ref={isPending ? newKeyInputRef : undefined}
@@ -263,14 +264,14 @@ export function ProjectEnvVarsModal({ project, onClose }: Props) {
                     <button
                       className="w-6 h-6 flex items-center justify-center text-[var(--text-muted)] hover:text-[var(--color-error)] transition-colors"
                       onClick={() => handleRemoveRow(row.rid)}
-                      title="删除该行"
+                      title={t('envVars.removeRow')}
                     >
                       ✕
                     </button>
                   </div>
                   {err && (
                     <div className="ml-6 mt-0.5 text-xs text-red-400">
-                      {ERROR_TEXT[err]}
+                      {t(ERROR_TEXT_KEY[err])}
                     </div>
                   )}
                 </div>
@@ -282,29 +283,29 @@ export function ProjectEnvVarsModal({ project, onClose }: Props) {
             className="mt-3 text-sm text-[var(--accent)] hover:underline"
             onClick={handleAddRow}
           >
-            + 新增一行
+            {t('envVars.addRow')}
           </button>
         </div>
 
         {/* 底栏 */}
         <div className="px-5 py-3 border-t border-[var(--border-subtle)] flex items-center gap-3">
           <div className="text-xs text-[var(--text-muted)] flex-1">
-            修改后仅新建终端生效,已有终端不受影响。
+            {t('envVars.footnote')}
           </div>
           <button
             className="px-3 py-1 text-base text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors disabled:opacity-40"
             onClick={onClose}
             disabled={busy}
           >
-            取消
+            {t('envVars.cancel')}
           </button>
           <button
             className="px-3 py-1 text-base bg-[var(--accent)] text-[var(--bg-base)] rounded-[var(--radius-sm)] hover:opacity-90 transition-opacity disabled:opacity-40 disabled:cursor-not-allowed"
             onClick={handleSave}
             disabled={busy || hasErrors}
-            title={hasErrors ? '存在校验错误,无法保存' : undefined}
+            title={hasErrors ? t('envVars.hasErrors') : undefined}
           >
-            {busy ? '处理中…' : '保存'}
+            {busy ? t('envVars.saving') : t('envVars.save')}
           </button>
         </div>
       </div>
