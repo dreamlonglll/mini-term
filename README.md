@@ -5,8 +5,12 @@
 <h1 align="center">Mini-Term</h1>
 
 <p align="center">
-  <strong>为 AI 时代打造的桌面终端管理器</strong><br>
-  基于 Tauri v2 · 多项目 · 多标签 · 分屏布局 · AI 进程感知 · IM 平台远程驱动 (cc-connect)
+  <strong>A desktop terminal manager built for the AI era</strong><br>
+  Powered by Tauri v2 · Multi-project · Multi-tab · Split-pane layout · AI process awareness · Remote driving over IM platforms (cc-connect)
+</p>
+
+<p align="center">
+  <strong>English</strong> · <a href="README.zh-CN.md">简体中文</a>
 </p>
 
 <p align="center">
@@ -20,310 +24,310 @@
 
 ---
 
-## 解决痛点
+## Why Mini-Term
 
-1. **重量级工具多余** — All In AI 的用户只需要终端跑 Agent，却不得不打开 VS Code / IDEA 等重型 IDE，大且占内存
-2. **多 Agent 并发无感知** — 同时开多个 Claude / Codex 会话，某个 Agent 跑完了无法直观看到
-3. **项目切换不便** — 系统终端缺少多项目组织、标签页和分屏管理能力
+1. **Heavyweight tools are overkill** — All-in-on-AI users only need a terminal to run their agents, yet are forced to fire up heavy IDEs like VS Code / IDEA that are large and memory-hungry.
+2. **No awareness of concurrent agents** — When several Claude / Codex sessions run at once, there's no clear way to see which agent has finished.
+3. **Project switching is clumsy** — The system terminal lacks multi-project organization, tabs, and split-pane management.
 
-Mini-Term 用一个轻量桌面应用解决以上所有问题。
+Mini-Term solves all of the above with one lightweight desktop app.
 
-## 预览
+## Preview
 
-![主界面](docs/screenshots/main.png)
-![设置界面](docs/screenshots/settings.png)
+![Main UI](docs/screenshots/main.png)
+![Settings UI](docs/screenshots/settings.png)
 
 
-## 功能特性
+## Features
 
-### 终端核心
+### Terminal Core
 
-- **多标签管理** — 每个项目独立标签页，拖拽排序，状态图标一目了然
-- **递归分屏** — 横向 / 纵向任意嵌套分屏，Allotment 拖拽调整比例
-- **高性能渲染** — xterm.js v6 + WebGL 加速，自动降级为 Canvas
-- **10 万行滚动缓冲** — 拦截 CSI 3J（ED3）指令，Claude / Codex / OpenCode 等 TUI 清屏时保留上滚历史；拦截 alternate screen 切换，TUI 程序输出留在主缓冲区，滚动条和 scrollback 始终可用
-- **终端缓存** — 切换项目 / 标签 / 分屏不重建 xterm 实例，已有内容不丢失；启动按需懒加载，仅当前可见 pane 创建 PTY，避免历史项目终端越多启动越卡
-- **项目切换缓存** — FileTree / GitHistory 数据按项目缓存，切回已访问项目零延迟渲染；目录加载与 Git 状态并行执行，Git 仓库扫描结果缓存 30 秒
-- **复制粘贴** — `Ctrl+Shift+C/V`（macOS `⌘+Shift+C/V`）快捷键 + 右键菜单，未选中时"复制"自动置灰；可在设置中开启「智能 `Ctrl+C/V`」（有选区时 `Ctrl+C` 复制、无选区时中断程序，`Ctrl+V` 直接粘贴）；Windows 大段多行粘贴自动分块写入，防止 ConPTY 丢行
-- **长文本粘贴** — 剪贴板文本 ≥10 行或 ≥2000 字符时自动转存为临时 `.txt` 并粘贴带引号的文件路径，避免 AI 工具直接处理超长内容引发性能与 paste bracket 问题
-- **图片粘贴** — 剪贴板含截图时自动检测，通过 Win32 API 保存为临时 PNG 并粘贴带引号的路径，兼容 PinPix 等非标准格式
-- **文件拖拽** — 文件树或系统资源管理器拖文件到终端自动插入带引号的绝对路径，精准定位目标分屏 pane，兼容含空格的路径
-- **多 Shell 配置** — Windows（cmd / powershell / pwsh）、macOS（zsh / bash）、Linux（bash / sh）等，可自由增删
+- **Multi-tab management** — A dedicated tab per project, drag to reorder, status icons at a glance.
+- **Recursive splitting** — Arbitrarily nested horizontal / vertical splits, drag to adjust ratios via Allotment.
+- **High-performance rendering** — xterm.js v6 + WebGL acceleration, automatic fallback to Canvas.
+- **100k-line scrollback buffer** — Intercepts the CSI 3J (ED3) sequence so scrollback survives when TUIs like Claude / Codex / OpenCode clear the screen; intercepts alternate-screen switching so TUI output stays in the main buffer, keeping the scrollbar and scrollback always available.
+- **Terminal caching** — Switching projects / tabs / panes never rebuilds the xterm instance, so existing content is preserved; lazy startup creates a PTY only for the currently visible pane, avoiding the slowdown of spawning more terminals the more history projects you have.
+- **Project-switch caching** — FileTree / GitHistory data is cached per project, so switching back to a visited project renders with zero latency; directory loading and Git status run in parallel, and Git repo scan results are cached for 30 seconds.
+- **Copy & paste** — `Ctrl+Shift+C/V` (macOS `⌘+Shift+C/V`) shortcuts + context menu, with "Copy" auto-greyed when nothing is selected; an optional "Smart `Ctrl+C/V`" mode (copy when there's a selection, interrupt the program when there isn't, and `Ctrl+V` pastes directly); on Windows, large multi-line pastes are chunked to prevent ConPTY from dropping lines.
+- **Long-text paste** — When clipboard text is ≥10 lines or ≥2000 chars, it is automatically saved to a temporary `.txt` and a quoted file path is pasted instead, avoiding the performance and paste-bracket issues of feeding huge content straight to AI tools.
+- **Image paste** — Detects screenshots in the clipboard, saves them to a temporary PNG via the Win32 API, and pastes a quoted path; compatible with non-standard formats such as PinPix.
+- **File drag & drop** — Dragging a file from the file tree or system file explorer onto the terminal inserts its quoted absolute path, targeting the exact split pane and handling paths with spaces.
+- **Multiple shell profiles** — Windows (cmd / powershell / pwsh), macOS (zsh / bash), Linux (bash / sh) and more, freely added or removed.
 
-### SSH 连接
+### SSH Connections
 
-- **连接管理** — 顶栏「SSH」按钮打开管理弹窗，对 SSH 连接增删改，支持主机 / 端口 / 用户名 / 密码 / 私钥 / 分组字段，持久化到配置文件
-- **快速连接** — 终端内右键「SSH 连接」子菜单按分组列出已保存连接，选中后在当前终端直接拼接 `ssh` 命令拉起会话
-- **密码自动填充** — 配了密码的连接，后端扫描 PTY 输出命中密码提示自动回写密码，每会话只填一次，密码错误时停止以防连灌错误密码
-- **私钥权限自动处理** — 使用私钥连接时自动把密钥复制到权限收紧的临时副本（Windows `icacls` / Unix `0600`），绕过 OpenSSH「UNPROTECTED PRIVATE KEY FILE」拒绝，不修改用户原始密钥文件
-- **进阶能力** — 密钥文件登录（`ssh -i`）、连接分组管理
-- **SSH MCP Server** — 把已保存的 SSH 连接作为 MCP 工具暴露给终端里运行的 AI agent（Claude Code / Codex）。项目右键菜单「关联 SSH」勾选连接即按项目启用，并把可见范围限定在所选连接；内置 `mt-ssh-mcp` sidecar（基于官方 rmcp 的 stdio MCP server）提供 `ssh_list_connections`、`ssh_exec` 两个工具，`ssh_exec` 复用密码 / 私钥认证，带超时、输出封顶与审计日志；启用 / 停用时按命名 marker 幂等写入 Claude `.mcp.json` 与 Codex `.codex/config.toml`。**自 v0.4.10 起 sidecar 维护进程内 SSH 会话池**（russh 0.61 + tokio），首次调用某连接做一次 TCP 握手 + 认证（~秒级），后续命令仅消耗 RTT；会话空闲 10 分钟或最长 2 小时自动回收，并在 sidecar 退出时优雅 `disconnect`
+- **Connection management** — The top-bar "SSH" button opens a management dialog to add / edit / delete SSH connections, with host / port / username / password / private key / group fields, persisted to the config file.
+- **Quick connect** — A right-click "SSH Connect" submenu inside the terminal lists saved connections by group; selecting one assembles the `ssh` command and launches the session right in the current terminal.
+- **Password auto-fill** — For connections with a saved password, the backend scans PTY output for the password prompt and writes the password back automatically, once per session, stopping on a wrong password to avoid hammering the server with bad credentials.
+- **Private-key permission handling** — When connecting with a private key, the key is copied to a permission-tightened temporary copy (Windows `icacls` / Unix `0600`) to bypass OpenSSH's "UNPROTECTED PRIVATE KEY FILE" rejection, without modifying your original key file.
+- **Advanced capabilities** — Key-file login (`ssh -i`) and connection grouping.
+- **SSH MCP Server** — Exposes saved SSH connections as MCP tools to AI agents running in the terminal (Claude Code / Codex). The project right-click "Link SSH" menu enables them per project and limits visibility to the selected connections; the built-in `mt-ssh-mcp` sidecar (a stdio MCP server based on the official rmcp) provides `ssh_list_connections` and `ssh_exec`, where `ssh_exec` reuses password / private-key auth with timeouts, output capping, and an audit log; enabling / disabling writes idempotently into Claude's `.mcp.json` and Codex's `.codex/config.toml` using named markers. **Since v0.4.10 the sidecar maintains an in-process SSH session pool** (russh 0.61 + tokio): the first call to a connection does one TCP handshake + auth (~seconds), and subsequent commands cost only an RTT; sessions are recycled after 10 minutes idle or 2 hours max, and gracefully `disconnect` when the sidecar exits.
 
-### WSL 支持（Windows）
+### WSL Support (Windows)
 
-- **WSL 目录作为项目根** — 支持把 `\\wsl$\<distro>\<unix-path>` 与 `\\wsl.localhost\<distro>\<unix-path>` 两种形式的 WSL 路径添加为项目，前端展示路径自动剥掉 `\\?\UNC\` verbatim 前缀，文件树可正常展开与预览
-- **自动 wsl.exe 启动** — 检测到 cwd 是 WSL UNC 路径时，`create_pty` 忽略用户配置的 shell（cmd / pwsh 等），强制改用 `wsl.exe -d <distro> --cd <unix-path>` 启动，cwd 真正落在 WSL 里（`pwd` 显示 `/home/<user>/proj` 而不是 `C:\Windows`），与 Windows Terminal `MangleStartingDirectoryForWSL` 行为一致；distro 名从路径直接 parse，不调 `wsl -l -v` 探测；触发重写时弹一次性 toast 提示
-- **已知限制** — AI 进程识别（ai-working / ai-idle 状态）依赖宿主机的 `process_monitor` 看子进程名，wsl.exe 启动后 WSL VM 内的 `claude` / `codex` 进程不在监控范围内，AI 状态会失效；`notify` 文件监听在 WSL 9P 文件系统上事件大概率丢失，文件树需要手动刷新。仅 WSL2 验证，WSL1 兼容性未保证
+- **WSL directories as project roots** — Supports adding WSL paths in both `\\wsl$\<distro>\<unix-path>` and `\\wsl.localhost\<distro>\<unix-path>` forms as projects; the displayed path automatically strips the `\\?\UNC\` verbatim prefix, and the file tree expands and previews normally.
+- **Automatic wsl.exe launch** — When the cwd is detected as a WSL UNC path, `create_pty` ignores the user-configured shell (cmd / pwsh, etc.) and forces `wsl.exe -d <distro> --cd <unix-path>`, so the cwd truly lands inside WSL (`pwd` shows `/home/<user>/proj` rather than `C:\Windows`), consistent with Windows Terminal's `MangleStartingDirectoryForWSL` behavior; the distro name is parsed directly from the path without invoking `wsl -l -v`, and a one-time toast appears when the rewrite triggers.
+- **Known limitations** — AI process detection (ai-working / ai-idle states) relies on the host's `process_monitor` reading child process names; after a wsl.exe launch, the `claude` / `codex` processes inside the WSL VM are out of the monitor's scope, so AI status stops working. `notify` file watching very likely loses events on the WSL 9P filesystem, so the file tree needs a manual refresh. Verified only on WSL2; WSL1 compatibility is not guaranteed.
 
-### 文件搜索
+### File Search
 
-- **全局搜索** — `Ctrl+Shift+F`（macOS `⌘+Shift+F`）快捷键或文件树工具栏按钮唤起，支持文件名搜索和文件内容搜索两种模式
-- **正则匹配** — 可切换子串 / 正则模式，结果关键词高亮显示
-- **流式推送** — 后端使用 ignore crate 遍历文件树，每 50 条或 100ms 批量推送结果，支持随时取消
-- **内容分组** — 内容搜索模式按文件分组展示匹配行号，点击结果直接预览并定位到匹配行
+- **Global search** — Triggered by `Ctrl+Shift+F` (macOS `⌘+Shift+F`) or the file-tree toolbar button, supporting both filename and file-content search modes.
+- **Regex matching** — Toggle between substring / regex modes, with matched keywords highlighted in the results.
+- **Streaming results** — The backend walks the file tree with the `ignore` crate and pushes results in batches every 50 entries or 100ms, cancellable at any time.
+- **Content grouping** — Content-search mode groups matched line numbers by file; clicking a result previews and jumps straight to the matched line.
 
-### AI 进程感知
+### AI Process Awareness
 
-- **Hook 事件系统** — 接入 Claude Code / Codex 官方 Hook API，接收 AI 工具事件（SessionStart / End、ToolUse 等），比进程轮询更精准及时；内置 `miniterm-hook` CLI 工具供 Hook 系统调用，自动 POST 事件到本地服务器；设置界面一键注册 / 卸载 Hook 配置，合并而非覆盖用户已有 hook
-- **实时状态检测** — Hook 优先 + 500ms 进程轮询降级，自动识别 Claude / Codex / OpenCode，显示 idle / working / error 状态
-- **状态聚合** — 面板 → 标签页 → 项目逐层聚合，优先级 `error > ai-working > ai-idle > idle`
-- **完成提醒三件套** — AI 任务从 working → idle 时立刻触发：
-  - 右下角 Toast 桌面通知（仅非活跃项目弹出，同项目去重）
-  - 项目列表 DONE 徽章，点击清除
-  - 任务栏闪烁（Windows）/ Dock 跳动（macOS），窗口失焦时才触发
-  - 提示音播放（Web Audio API 合成默认音，支持自定义音频文件）
-  - 所有通知开关独立可配，设置中心单独「AI 完成通知」页面管理
-- **会话进出检测** — 命令 echo 识别进入 AI；双击 `Ctrl+C` / `Ctrl+D` 或 `exit` / `quit` / `:quit` / `/logout` 识别退出
-- **会话历史** — 读取本地 Claude / Codex 历史会话记录，右键复制恢复命令快速续接；首屏仅渲染 20 条，滚动到底部自动加载更多
-- **会话查看** — 右键「查看」展示完整对话内容，User 纯文本 / Assistant Markdown 渲染（外链点击二次确认后调系统默认浏览器打开），支持 `Ctrl+F` 搜索高亮和 User 消息快速导航
-- **AI 任务标记** — AI 会话内每次用户按 Enter 自动在 xterm 打点，标签右上角 ⚑ 按钮下拉展示历史提交列表，点击或 `Ctrl+Shift+↑/↓`（macOS `⌘+Shift+↑/↓`）在标记间跳转，目标行短暂高亮提示
+- **Hook event system** — Integrates the official Claude Code / Codex Hook APIs to receive AI tool events (SessionStart / End, ToolUse, etc.), which is more precise and timely than process polling; the built-in `miniterm-hook` CLI is called by the hook system to POST events to a local server; the settings UI registers / unregisters the hook config with one click, merging rather than overwriting your existing hooks.
+- **Real-time status detection** — Hook-first with a 500ms process-polling fallback, auto-detecting Claude / Codex / OpenCode and showing idle / working / error states.
+- **Status aggregation** — Aggregated layer by layer from pane → tab → project, with priority `error > ai-working > ai-idle > idle`.
+- **Completion notification trio** — Fires the moment an AI task goes working → idle:
+  - A bottom-right toast desktop notification (only for inactive projects, deduplicated per project).
+  - A DONE badge in the project list, cleared on click.
+  - Taskbar flashing (Windows) / Dock bouncing (macOS), triggered only when the window is unfocused.
+  - A notification sound (a default tone synthesized via the Web Audio API, with support for a custom audio file).
+  - All notification toggles are independently configurable, managed on a dedicated "AI Completion Notifications" page in the settings center.
+- **Session enter/exit detection** — Recognizes entering AI via command echo; recognizes exit via a double `Ctrl+C` / `Ctrl+D` or `exit` / `quit` / `:quit` / `/logout`.
+- **Session history** — Reads local Claude / Codex history records, with a right-click to copy the resume command for quick continuation; the first screen renders only 20 entries, loading more automatically as you scroll to the bottom.
+- **Session viewer** — A right-click "View" shows the full conversation, with User as plain text and Assistant rendered as Markdown (external links open in the system default browser after a confirmation prompt), supporting `Ctrl+F` search highlighting and quick navigation between User messages.
+- **AI task markers** — Each time the user presses Enter inside an AI session, a marker is dropped in xterm; the ⚑ button at the tab's top-right drops down the list of past submissions, and clicking one or pressing `Ctrl+Shift+↑/↓` (macOS `⌘+Shift+↑/↓`) jumps between markers, briefly highlighting the target line.
 
-### cc-connect 集成
+### cc-connect Integration
 
-把本机跑的 AI agent 通过 IM 平台（飞书 / Slack / Telegram / Discord / 钉钉 / 微信等）远程驱动，与上游 [chenhg5/cc-connect](https://github.com/chenhg5/cc-connect) 桥接。入口统一收在顶栏「连接」按钮弹窗内。
+Remotely drive the AI agents running on your machine through IM platforms (Feishu / Slack / Telegram / Discord / DingTalk / WeChat, etc.), bridged with the upstream [chenhg5/cc-connect](https://github.com/chenhg5/cc-connect). All entry points are gathered in the top-bar "Connect" button dialog.
 
-- **进程管理（零配置）** — 「连接」弹窗内一键启动 / 停止 / 重启 / 测试连接 / 编辑 config.toml，可选 mini-term 启动时自动 spawn；可执行文件 / 配置路径留空时自动回退 PATH 中的 `cc-connect` 与 `~/.cc-connect/config.toml`，零配置即可使用；Windows 下按 PATH × PATHEXT 解析 npm 脚本壳（`.cmd` / `.ps1`），停止 / 重启用 `taskkill /T` 杀整棵进程树避免孤儿进程；关闭 mini-term 不联动 kill，保证 IM 持续可用
-- **一键导入项目** — 「连接」弹窗内列出全部 mini-term 项目，勾选 / 全选后一键批量导入（用 `toml_edit` 追加 `[[projects]]` 保留注释、单次写盘 + 仅重启一次 cc-connect、同名冲突自动加 8 字符 hash 后缀），也可逐项单独导入；已导入项显示「● 已导入」并可一键移除。每个导入项目会附带一个**占位 Telegram 平台**（cc-connect 强制每个项目至少一个平台，否则冷启动失败），导入后到 Dashboard 把占位替换为真实 IM 平台即可启用
-- **Dashboard 嵌入** — 「连接」弹窗内「打开 Dashboard」一键打开 cc-connect 自家 Web 控制台 iframe（自动登录态），直接在 mini-term 内配置 IM 平台 / 切换 provider / 管理 cron，无需另开浏览器；createPortal 到 `document.body` 绕开 Fluent 2 `[data-panel]` 的 backdrop-filter，确保全屏铺满；keep-alive 关闭走 `display:none` 不卸载，避免重新登录
-- **半同步态处理** — 项目导入 / 移除即使 cc-connect 重启失败，前端按 `tomlWritten` / `deletedOk` 分支仍维持本地 `projectLinks`，warning toast 提示 restart 失败原因，下次启动 cc-connect 自动生效
-- **优雅降级** — cc-connect 未运行时导入 / Dashboard 等按钮置灰提示「先启动 cc-connect」而非崩溃；config.toml 未配置 `[management].token` 时给出友好诊断指引用户跑 `cc-connect web` 自动生成
+- **Process management (zero-config)** — Start / stop / restart / test-connection / edit config.toml from within the "Connect" dialog, optionally auto-spawned on mini-term startup; when the executable / config paths are left blank, it falls back to `cc-connect` on PATH and `~/.cc-connect/config.toml`, working with zero configuration; on Windows it resolves the npm script shell (`.cmd` / `.ps1`) via PATH × PATHEXT, and stop / restart use `taskkill /T` to kill the whole process tree to avoid orphans; closing mini-term does not kill it, keeping IM available continuously.
+- **One-click project import** — The "Connect" dialog lists all mini-term projects; check / select-all to batch-import in one click (appending `[[projects]]` via `toml_edit` to preserve comments, a single disk write + a single cc-connect restart, with an 8-char hash suffix auto-added on name conflicts), or import individually; imported entries show "● Imported" and can be removed in one click. Each imported project comes with a **placeholder Telegram platform** (cc-connect requires at least one platform per project or cold start fails); after importing, replace the placeholder with a real IM platform in the Dashboard to enable it.
+- **Embedded Dashboard** — "Open Dashboard" in the "Connect" dialog opens cc-connect's own web console in an iframe (already authenticated), letting you configure IM platforms / switch providers / manage cron directly inside mini-term without opening a browser; it `createPortal`s to `document.body` to bypass the backdrop-filter of Fluent 2's `[data-panel]` and ensure full-screen coverage; keep-alive close uses `display:none` without unmounting, avoiding re-login.
+- **Half-synced state handling** — Even if cc-connect's restart fails on project import / removal, the frontend keeps the local `projectLinks` based on the `tomlWritten` / `deletedOk` branches and shows a warning toast explaining the restart failure; the change takes effect the next time cc-connect starts.
+- **Graceful degradation** — When cc-connect isn't running, buttons like Import / Dashboard are greyed out with a "start cc-connect first" hint rather than crashing; when config.toml has no `[management].token`, it gives a friendly diagnostic guiding the user to run `cc-connect web` to generate one automatically.
 
-### 项目管理
+### Project Management
 
-- **项目列表** — 左侧边栏管理多个项目目录，一键切换工作区，重启自动恢复上次激活项目
-- **拖拽添加项目** — 从资源管理器拖拽文件夹到项目列表即可快速添加，自动识别文件 / 文件夹 / 重复项目并给出视觉反馈
-- **嵌套分组** — 最多 3 级项目分组，拖拽排序，折叠 / 展开，分组右键菜单可直接添加项目并归入该组
-- **文件树** — 集成目录浏览器，自然排序（V1 → V2 → V10 而非字典序），嵌套 `.gitignore` 置灰（每层子目录的忽略规则与 `!pattern` 白名单都会生效，与 git 行为一致），`notify` 文件监听实时刷新
-- **文件操作** — 文件树内新建文件 / 文件夹、重命名、删除、查看内容（Markdown 渲染支持 HTML 标签和外部图片，外链点击二次确认后调系统默认浏览器打开，图片格式直接展示，HTML 文件 iframe 预览并自动解析相对路径资源，二进制与超大文件友好提示）
-- **外部编辑器打开** — 文件树右上角按钮一键用配置的编辑器（默认 VS Code）打开当前项目，路径可在「设置 → 系统设置 → 外部编辑器」自定义；文件可用系统默认应用打开
-- **项目级环境变量** — 项目右键菜单「环境变量…」打开管理弹窗，行级 `[启用 checkbox][key][value][✕]` 布局，启动该项目终端时按项目注入到 PTY 子进程；严格 POSIX 校验（key 匹配 `^[A-Za-z_][A-Za-z0-9_]*$`、非 `MINITERM_` 前缀、不可用 `WSLENV`、项目内不重复，value 禁 `\n/\r/\0`）；Rust 端再加 `MINITERM_` 前缀 + `WSLENV` 防御性过滤，即便手改 `config.json` 绕过前端校验也无法破坏 hook 协议或 WSLENV 拼接；WSL 项目下环境变量通过 WSLENV 机制透传至 Linux bash（`/u` 单向不做路径翻译；`~/.bashrc` 中 `export` 同名变量会覆盖）
+- **Project list** — Manage multiple project directories in the left sidebar, switch workspaces in one click, and restore the last active project on restart.
+- **Drag to add projects** — Drag a folder from the file explorer onto the project list to add it quickly, with automatic detection of files / folders / duplicate projects and visual feedback.
+- **Nested groups** — Up to 3 levels of project grouping, drag to reorder, collapse / expand, with a group context menu to add a project directly into that group.
+- **File tree** — An integrated directory browser with natural sorting (V1 → V2 → V10 rather than lexicographic), nested `.gitignore` greying (ignore rules and `!pattern` allowlists at every sub-directory level take effect, consistent with git behavior), and live refresh via `notify` file watching.
+- **File operations** — Create / rename / delete files and folders and view contents inside the file tree (Markdown rendering supports HTML tags and external images, external links open in the system default browser after a confirmation prompt, image formats are shown directly, HTML files preview in an iframe with relative-path resources auto-resolved, and binary / oversized files get a friendly notice).
+- **Open in external editor** — A button at the top-right of the file tree opens the current project in your configured editor (VS Code by default), with the path customizable under "Settings → System → External Editor"; files can be opened with the system default app.
+- **Project-level environment variables** — The project context menu "Environment Variables…" opens a management dialog with a row-level `[enable checkbox][key][value][✕]` layout, injecting per-project variables into the PTY child process when starting that project's terminal; strict POSIX validation (key matches `^[A-Za-z_][A-Za-z0-9_]*$`, no `MINITERM_` prefix, no `WSLENV`, no duplicates within a project, and value forbids `\n/\r/\0`); the Rust side adds a defensive `MINITERM_`-prefix + `WSLENV` filter, so even hand-editing `config.json` to bypass frontend validation cannot break the hook protocol or WSLENV concatenation; under WSL projects, variables pass through to Linux bash via the WSLENV mechanism (`/u` is one-way without path translation; an `export` of the same name in `~/.bashrc` will override).
 
-### Git 集成
+### Git Integration
 
-- **文件状态** — 文件树显示 Git 状态颜色（修改 / 新增 / 删除 / 冲突）
-- **变更 Diff** — 工作区文件变更的详细 Diff，Hunk 行级解析，并排 / 内联双视图，并排模式支持拖拽调节分隔比例，字号跟随终端字体设置
-- **提交历史** — 浏览仓库提交记录，游标分页加载（默认 30 条）
-- **提交 Diff** — 查看任意提交的文件变更，逐文件切换
-- **分支信息** — 本地 / 远程分支列表
-- **源码控制面板** — VS Code 风格 Changes 面板，Staged / Changes / Untracked 分组展示，支持单文件和全量 stage / unstage / discard，`Ctrl+Enter` 快速提交，列表与树形视图切换
-- **Pull / Push** — 仓库行内按钮一键同步远端，支持刷新按钮重新加载提交记录与分支信息
-- **多仓库发现** — 自动扫描项目目录下所有 Git 仓库（递归 5 层，跳过 `node_modules` 等）
+- **File status** — The file tree shows Git status colors (modified / added / deleted / conflict).
+- **Change diff** — A detailed diff of working-tree file changes, parsed at the hunk/line level, with side-by-side / inline dual views; side-by-side mode supports dragging to adjust the split ratio, and the font size follows the terminal font setting.
+- **Commit history** — Browse the repo's commit log with cursor-based pagination (30 entries by default).
+- **Commit diff** — View the file changes of any commit, switching file by file.
+- **Branch info** — Local / remote branch lists.
+- **Source control panel** — A VS Code-style Changes panel grouping Staged / Changes / Untracked, supporting per-file and bulk stage / unstage / discard, `Ctrl+Enter` to commit quickly, and toggling between list and tree views.
+- **Pull / Push** — In-row buttons sync with the remote in one click, with a refresh button to reload the commit log and branch info.
+- **Multi-repo discovery** — Automatically scans all Git repos under the project directory (recursing 5 levels, skipping `node_modules` etc.).
 
-![Git 集成](docs/screenshots/git.png)
+![Git integration](docs/screenshots/git.png)
 
-### 外观与配置
+### Appearance & Configuration
 
-- **Activity Bar 侧边栏** — 最左侧常驻 40px 图标栏，含 Projects / Sessions / Files / Git 四个面板开关，独立控制显隐，激活态蓝色竖条指示，状态持久化
-- **三种主题模式** — Auto（跟随系统）/ Light / Dark，深色基于 Warm Carbon 暖炭色调，自定义 CSS 变量体系；Windows 原生标题栏（DWM Immersive Dark Mode）自动跟随主题切换，启动深色用户无首帧浅色闪烁
-- **Blueprint 蓝图皮肤** — 可选科幻风蓝图皮肤，网格背景 + 角标记 + 光晕效果，支持深色 / 日间两种模式，终端配色同步切换
-- **字体独立调节** — UI 与终端的字号（10-20px）/ 字体 family 分别可调，终端可选是否跟随 UI 主题
-- **连体字 (ligatures)** — 终端连体字渲染开关，开启后 `==` `=>` `!=` `->` 等合成 ligature glyph，需字体含 calt 表（Fira Code / JetBrains Mono）；Windows 完整支持，macOS / Linux 受 webview API 限制使用 60 条 Iosevka fallback
-- **布局持久化** — 分屏比例、标签页、窗口大小 / 位置自动保存，重启恢复（`tauri-plugin-window-state`）
-- **关闭确认** — 关闭窗口前二次确认，并 flush 所有项目布局，避免误操作
-- **版本检查** — 启动时拉取 GitHub Release，标题栏显示新版本提示
-- **设置中心** — 统一的 SettingsModal 管理主题、字体、Shell、AI 通知等所有开关
+- **Activity Bar sidebar** — A persistent 40px icon bar on the far left with Projects / Sessions / Files / Git panel toggles, independently controlling visibility, a blue vertical bar indicating the active state, and persisted state.
+- **Three theme modes** — Auto (follows the system) / Light / Dark, with Dark based on a Warm Carbon palette and a custom CSS-variable system; the native Windows title bar (DWM Immersive Dark Mode) follows the theme automatically, with no first-frame light flash for dark-mode users on startup.
+- **Blueprint skin** — An optional sci-fi Blueprint skin with a grid background + corner markers + glow effects, supporting both dark and light modes, with the terminal palette switching in sync.
+- **Independent font tuning** — The UI and terminal font sizes (10-20px) / families are adjustable separately, and the terminal can optionally follow the UI theme.
+- **Ligatures** — A terminal ligature toggle that composes glyphs like `==` `=>` `!=` `->` when enabled, requiring a font with a calt table (Fira Code / JetBrains Mono); fully supported on Windows, while macOS / Linux use a 60-entry Iosevka fallback due to webview API limitations.
+- **Layout persistence** — Split ratios, tabs, and window size / position are saved automatically and restored on restart (`tauri-plugin-window-state`).
+- **Close confirmation** — A confirmation before closing the window, flushing all project layouts to prevent accidental loss.
+- **Update check** — Fetches the GitHub Release on startup and shows a new-version hint in the title bar.
+- **Settings center** — A unified SettingsModal managing all toggles: theme, fonts, shells, AI notifications, and more.
 
-## 技术栈
+## Tech Stack
 
-| 层 | 技术 |
+| Layer | Technology |
 |---|---|
-| 框架 | Tauri v2（Rust 后端 + WebView 前端） |
-| 前端 | React 19 + TypeScript 5.8 + Tailwind CSS v4 + Vite 7 |
-| 终端 | xterm.js v6（WebGL addon，Canvas 降级） |
-| 状态 | Zustand（全局单一 Store） |
-| 布局 | Allotment（三栏主布局 + 递归 SplitNode 分屏树） |
+| Framework | Tauri v2 (Rust backend + WebView frontend) |
+| Frontend | React 19 + TypeScript 5.8 + Tailwind CSS v4 + Vite 7 |
+| Terminal | xterm.js v6 (WebGL addon, Canvas fallback) |
+| State | Zustand (single global store) |
+| Layout | Allotment (three-column main layout + recursive SplitNode tree) |
 | PTY | portable-pty 0.8 |
 | Git | git2 0.19 |
-| 文件监听 | notify 7 + ignore 0.4（.gitignore 过滤） |
-| Tauri 插件 | `window-state` · `clipboard-manager` · `dialog` · `opener` |
-| 测试覆盖 | 155 个 Rust 单元测试（pty / fs / config / hook / cc-connect） |
+| File watching | notify 7 + ignore 0.4 (.gitignore filtering) |
+| Tauri plugins | `window-state` · `clipboard-manager` · `dialog` · `opener` |
+| Test coverage | 155 Rust unit tests (pty / fs / config / hook / cc-connect) |
 
-## 快速开始
+## Getting Started
 
-### 直接下载
+### Direct Download
 
-前往 [Releases](https://github.com/dreamlonglll/mini-term/releases) 页面下载最新安装包。
+Head to the [Releases](https://github.com/dreamlonglll/mini-term/releases) page to download the latest installer.
 
-> **平台支持说明**
-> - **Windows** — 主要支持平台，保证可用性，日常开发与测试均在 Windows 上进行
-> - **macOS / Linux** — 代码层面已支持（Tauri bundle targets = `all`），但**可用性欠佳**，未经充分打磨，欢迎提 Issue 反馈
+> **Platform support note**
+> - **Windows** — The primary supported platform with guaranteed usability; daily development and testing all happen on Windows.
+> - **macOS / Linux** — Supported at the code level (Tauri bundle targets = `all`), but **not well polished**, lacking thorough refinement; Issue reports are welcome.
 
-#### macOS 安装提示
+#### macOS Installation Note
 
-下载 `.dmg` 后双击打开,如果系统弹出 **"Mini-Term" is damaged and can't be opened. You should move it to the Bin**(已损坏,移到废纸篓),这并不是文件真的损坏 —— 而是 Release 产物没有 Apple Developer ID 签名,被 Gatekeeper 因 quarantine 标记拒绝。
+After downloading the `.dmg` and double-clicking to open it, if the system shows **"Mini-Term" is damaged and can't be opened. You should move it to the Bin**, the file is not actually corrupted — the Release artifact simply isn't signed with an Apple Developer ID and is rejected by Gatekeeper due to the quarantine flag.
 
-把 `.app` 拖入 `/Applications` 后,在终端执行一次即可解除限制:
+Drag the `.app` into `/Applications`, then run this once in a terminal to lift the restriction:
 
 ```bash
 xattr -cr /Applications/Mini-Term.app
 ```
 
-之后正常双击启动。每次升级新版本都需要再执行一次。
+After that it launches normally on double-click. You'll need to run it again after each version upgrade.
 
-### 从源码构建
+### Build from Source
 
-#### 前置条件
+#### Prerequisites
 
 - [Node.js](https://nodejs.org/) >= 18
 - [Rust](https://www.rust-lang.org/tools/install) >= 1.70
 - [Tauri v2 CLI](https://v2.tauri.app/start/prerequisites/)
 
-#### 安装与运行
+#### Install & Run
 
 ```bash
-# 克隆仓库
+# Clone the repo
 git clone https://github.com/dreamlonglll/mini-term.git
 cd mini-term
 
-# 安装依赖
+# Install dependencies
 npm install
 
-# 启动完整 Tauri 开发环境（前端 + 后端）
+# Start the full Tauri dev environment (frontend + backend)
 npm run tauri dev
 
-# 构建发布包
+# Build a release bundle
 npm run tauri build
 ```
 
-## 项目结构
+## Project Structure
 
 ```
 mini-term/
-├── src/                          # 前端源码
-│   ├── App.tsx                   # 三栏主布局入口 + 窗口事件
-│   ├── store.ts                  # Zustand 全局状态 + 持久化
-│   ├── types.ts                  # 类型定义（Pane / Tab / Project / SplitNode ...）
-│   ├── styles.css                # 全局样式 + CSS 变量（Warm Carbon）
+├── src/                          # Frontend source
+│   ├── App.tsx                   # Three-column main layout entry + window events
+│   ├── store.ts                  # Zustand global state + persistence
+│   ├── types.ts                  # Type definitions (Pane / Tab / Project / SplitNode ...)
+│   ├── styles.css                # Global styles + CSS variables (Warm Carbon)
 │   ├── components/
-│   │   ├── ProjectList.tsx       # 项目列表 + 嵌套分组 + DONE 徽章
-│   │   ├── SessionList.tsx       # AI 会话历史列表（Claude / Codex）
-│   │   ├── FileTree.tsx          # 文件目录树 + Git 状态 + 新建 / 重命名
-│   │   ├── TerminalArea.tsx      # 标签管理 + 分屏树操作
-│   │   ├── SplitLayout.tsx       # 递归渲染 SplitNode 分屏树
-│   │   ├── TerminalInstance.tsx  # xterm.js 实例 + 右键菜单 + 文件拖拽
-│   │   ├── PaneGroup.tsx         # 分屏分组容器
-│   │   ├── MarkerList.tsx        # AI 任务标记下拉列表
-│   │   ├── GitHistory.tsx        # Git 仓库树 + 提交历史 + Pull / Push
-│   │   ├── GitHistoryContent.tsx # Git 提交历史内容渲染
-│   │   ├── GitChanges.tsx        # 源码控制面板（stage / unstage / commit）
-│   │   ├── CommitDiffModal.tsx   # 提交 Diff 查看器
-│   │   ├── DiffModal.tsx         # 工作区文件 Diff 查看器
-│   │   ├── SearchModal.tsx       # 全局文件搜索弹窗
-│   │   ├── FileViewerModal.tsx   # 文件内容查看器
-│   │   ├── SessionViewerModal.tsx # AI 会话内容查看器（Markdown 渲染）
-│   │   ├── SettingsModal.tsx     # 设置弹窗（主题 / 字体 / Shell / AI 通知 / Hook）
-│   │   ├── ToastContainer.tsx    # AI 完成 Toast 通知
-│   │   ├── ActivityBar.tsx       # Activity Bar 侧边栏（面板显隐 + AI 状态角标）
-│   │   ├── DoneTag.tsx           # 项目列表 DONE 徽章
-│   │   └── StatusDot.tsx         # 状态指示点
+│   │   ├── ProjectList.tsx       # Project list + nested groups + DONE badge
+│   │   ├── SessionList.tsx       # AI session history list (Claude / Codex)
+│   │   ├── FileTree.tsx          # File directory tree + Git status + create / rename
+│   │   ├── TerminalArea.tsx      # Tab management + split-tree operations
+│   │   ├── SplitLayout.tsx       # Recursively renders the SplitNode tree
+│   │   ├── TerminalInstance.tsx  # xterm.js instance + context menu + file drop
+│   │   ├── PaneGroup.tsx         # Split group container
+│   │   ├── MarkerList.tsx        # AI task marker dropdown
+│   │   ├── GitHistory.tsx        # Git repo tree + commit history + Pull / Push
+│   │   ├── GitHistoryContent.tsx # Git commit history content rendering
+│   │   ├── GitChanges.tsx        # Source control panel (stage / unstage / commit)
+│   │   ├── CommitDiffModal.tsx   # Commit diff viewer
+│   │   ├── DiffModal.tsx         # Working-tree file diff viewer
+│   │   ├── SearchModal.tsx       # Global file search dialog
+│   │   ├── FileViewerModal.tsx   # File content viewer
+│   │   ├── SessionViewerModal.tsx # AI session content viewer (Markdown rendering)
+│   │   ├── SettingsModal.tsx     # Settings dialog (theme / font / shell / AI notify / hook)
+│   │   ├── ToastContainer.tsx    # AI completion toast notifications
+│   │   ├── ActivityBar.tsx       # Activity Bar sidebar (panel visibility + AI status badge)
+│   │   ├── DoneTag.tsx           # Project list DONE badge
+│   │   └── StatusDot.tsx         # Status indicator dot
 │   ├── hooks/
-│   │   ├── useTauriEvent.ts      # Tauri 事件订阅封装
-│   │   ├── useAiSubmitMarker.ts  # AI 会话 Enter 打点
-│   │   ├── useExternalFileDrop.ts # 系统资源管理器拖拽文件到终端
-│   │   └── useMarkerHotkeys.ts   # 标记间跳转快捷键
+│   │   ├── useTauriEvent.ts      # Tauri event subscription wrapper
+│   │   ├── useAiSubmitMarker.ts  # AI session Enter marker
+│   │   ├── useExternalFileDrop.ts # System explorer file drop onto terminal
+│   │   └── useMarkerHotkeys.ts   # Marker-jump shortcuts
 │   └── utils/
-│       ├── contextMenu.ts        # 右键菜单 DOM 实现
-│       ├── dragState.ts          # 项目树拖拽状态
-│       ├── fileDragState.ts      # 文件拖拽到终端状态管理
-│       ├── projectTree.ts        # 项目树递归操作
-│       ├── terminalCache.ts      # xterm 缓存 + 复制粘贴
-│       ├── projectDataCache.ts   # FileTree / GitHistory 项目级数据缓存
-│       ├── themeManager.ts       # 主题切换 + 系统配色监听
-│       └── updateChecker.ts      # GitHub Release 版本检查
-├── src-tauri/                    # Rust 后端（Tauri 应用 + 共享 crate + sidecar）
+│       ├── contextMenu.ts        # Context menu DOM implementation
+│       ├── dragState.ts          # Project tree drag state
+│       ├── fileDragState.ts      # File-drop-onto-terminal state management
+│       ├── projectTree.ts        # Recursive project tree operations
+│       ├── terminalCache.ts      # xterm cache + copy/paste
+│       ├── projectDataCache.ts   # FileTree / GitHistory per-project data cache
+│       ├── themeManager.ts       # Theme switching + system color watching
+│       └── updateChecker.ts      # GitHub Release version check
+├── src-tauri/                    # Rust backend (Tauri app + shared crate + sidecars)
 │   ├── src/
-│   │   ├── lib.rs                # Tauri 初始化与命令 / 插件注册
-│   │   ├── pty.rs                # PTY 生命周期 + AI 会话识别
-│   │   ├── process_monitor.rs    # 子进程状态轮询（500ms）+ Hook 优先
-│   │   ├── config.rs             # 配置持久化 + 版本迁移
-│   │   ├── fs.rs                 # 目录列表 / 监听 / 新建 / 重命名 / 删除
-│   │   ├── git.rs                # Git 操作（状态 / Diff / Log / Pull / Push）
-│   │   ├── search.rs             # 全局文件搜索（文件名 + 内容，流式推送）
-│   │   ├── ai_sessions.rs        # Claude / Codex 会话记录读取
-│   │   ├── hook_server.rs        # Hook HTTP 服务器（接收 AI 工具事件）
-│   │   ├── hook_registry.rs      # Hook 注册 / 卸载（Claude Code + Codex）
-│   │   ├── ssh.rs                # SSH 连接管理 + 密码自动填充 / 私钥处理
-│   │   └── ssh_mcp_registry.rs   # 按项目启用 SSH MCP（写入 .mcp.json / Codex 配置）
-│   ├── mt-core/                  # 无 tauri 依赖的共享库 crate（SSH 类型 / 配置 / 私钥）
-│   └── mt-sidecars/src/bin/      # 独立 sidecar crate（不依赖 tauri-build）
-│       ├── miniterm-hook.rs      # Hook CLI 小工具（被 AI 工具 hook 调用）
-│       └── mt-ssh-mcp.rs         # SSH MCP server（rmcp stdio，供终端 AI agent 调用）
+│   │   ├── lib.rs                # Tauri init + command / plugin registration
+│   │   ├── pty.rs                # PTY lifecycle + AI session detection
+│   │   ├── process_monitor.rs    # Child process status polling (500ms) + hook-first
+│   │   ├── config.rs             # Config persistence + version migration
+│   │   ├── fs.rs                 # Directory list / watch / create / rename / delete
+│   │   ├── git.rs                # Git operations (status / diff / log / pull / push)
+│   │   ├── search.rs             # Global file search (filename + content, streaming)
+│   │   ├── ai_sessions.rs        # Claude / Codex session record reading
+│   │   ├── hook_server.rs        # Hook HTTP server (receives AI tool events)
+│   │   ├── hook_registry.rs      # Hook register / unregister (Claude Code + Codex)
+│   │   ├── ssh.rs                # SSH connection management + password auto-fill / key handling
+│   │   └── ssh_mcp_registry.rs   # Per-project SSH MCP enablement (writes .mcp.json / Codex config)
+│   ├── mt-core/                  # Shared library crate without tauri deps (SSH types / config / keys)
+│   └── mt-sidecars/src/bin/      # Standalone sidecar crate (no tauri-build dependency)
+│       ├── miniterm-hook.rs      # Hook CLI tool (called by AI tool hooks)
+│       └── mt-ssh-mcp.rs         # SSH MCP server (rmcp stdio, for terminal AI agents)
 ├── scripts/
-│   └── stage-sidecars.mjs        # 构建 sidecar 并按 triple 就位为 Tauri externalBin
+│   └── stage-sidecars.mjs        # Builds sidecars and stages them per-triple as Tauri externalBin
 └── package.json
 ```
 
-## 架构概览
+## Architecture Overview
 
-### 数据流
+### Data Flow
 
 ```
-用户键入 → xterm.onData → invoke('write_pty') → Rust PTY writer
-Rust PTY reader → 16ms 批量缓冲 → emit('pty-output') → term.write()
-进程退出       → emit('pty-exit')          → store.updatePaneStatusByPty('error')
-进程监控 500ms → emit('pty-status-change') → StatusDot 更新
-文件变更 notify → emit('fs-change')         → FileTree 刷新
+User keystroke → xterm.onData → invoke('write_pty') → Rust PTY writer
+Rust PTY reader → 16ms batch buffer → emit('pty-output') → term.write()
+Process exit       → emit('pty-exit')          → store.updatePaneStatusByPty('error')
+Process monitor 500ms → emit('pty-status-change') → StatusDot update
+File change notify  → emit('fs-change')          → FileTree refresh
 ai-working → ai-idle → Toast + DONE Tag + requestUserAttention
 ```
 
-### Tauri 接口一览
+### Tauri Interface Overview
 
-- **Commands（46 个）** — PTY: `create_pty` · `write_pty` · `resize_pty` · `kill_pty`；FS: `list_directory` · `read_file_content` · `watch_directory` · `unwatch_directory` · `create_file` · `create_directory` · `rename_entry` · `delete_entry` · `filter_directories`；Search: `start_search` · `cancel_search`；Git: `get_git_status` · `get_git_diff` · `discover_git_repos` · `get_git_log` · `get_repo_branches` · `get_commit_files` · `get_commit_file_diff` · `git_pull` · `git_push` · `get_changes_status` · `git_stage` · `git_unstage` · `git_stage_all` · `git_unstage_all` · `git_commit` · `git_discard_file`；Config: `load_config` · `save_config`；Editor: `open_in_editor` · `open_path_with_default_app`；Clipboard: `read_clipboard_image` · `save_clipboard_text`；AI: `get_ai_sessions` · `get_ai_session_content`；Hook: `register_ai_hooks` · `unregister_ai_hooks` · `get_hook_config_snippet` · `get_hook_status` · `toggle_hook_server`；SSH: `arm_ssh_autofill` · `prepare_ssh_key`
-- **Events（后端 → 前端）** — `pty-output` · `pty-exit` · `pty-status-change` · `fs-change` · `search-results` · `search-complete`
+- **Commands (46)** — PTY: `create_pty` · `write_pty` · `resize_pty` · `kill_pty`; FS: `list_directory` · `read_file_content` · `watch_directory` · `unwatch_directory` · `create_file` · `create_directory` · `rename_entry` · `delete_entry` · `filter_directories`; Search: `start_search` · `cancel_search`; Git: `get_git_status` · `get_git_diff` · `discover_git_repos` · `get_git_log` · `get_repo_branches` · `get_commit_files` · `get_commit_file_diff` · `git_pull` · `git_push` · `get_changes_status` · `git_stage` · `git_unstage` · `git_stage_all` · `git_unstage_all` · `git_commit` · `git_discard_file`; Config: `load_config` · `save_config`; Editor: `open_in_editor` · `open_path_with_default_app`; Clipboard: `read_clipboard_image` · `save_clipboard_text`; AI: `get_ai_sessions` · `get_ai_session_content`; Hook: `register_ai_hooks` · `unregister_ai_hooks` · `get_hook_config_snippet` · `get_hook_status` · `toggle_hook_server`; SSH: `arm_ssh_autofill` · `prepare_ssh_key`
+- **Events (backend → frontend)** — `pty-output` · `pty-exit` · `pty-status-change` · `fs-change` · `search-results` · `search-complete`
 
-### 状态优先级
+### Status Priority
 
-终端面板状态从叶节点聚合到标签页和项目级别：
+Terminal pane status is aggregated from leaf nodes up to the tab and project levels:
 
 ```
 error > ai-working > ai-idle > idle
 ```
 
-### 布局模型
+### Layout Model
 
 ```
 App
-├── ActivityBar（常驻最左侧，面板显隐开关 + AI 状态角标）
-├── Allotment 三栏
-│   ├── 左栏：ProjectList（项目 + 分组 + 会话 + DONE 徽章）
-│   ├── 中栏：FileTree（目录浏览 + Git 状态 + 文件操作）
-│   └── 右栏
-    ├── TabBar（标签管理）
-    ├── SplitLayout（递归 SplitNode 分屏树）
-    │   └── TerminalInstance × N（xterm.js + 右键菜单）
-    └── GitHistory（仓库树 + 提交历史 + Pull/Push）
+├── ActivityBar (persistent far-left, panel visibility toggles + AI status badge)
+├── Allotment three columns
+│   ├── Left: ProjectList (projects + groups + sessions + DONE badge)
+│   ├── Middle: FileTree (directory browsing + Git status + file operations)
+│   └── Right
+    ├── TabBar (tab management)
+    ├── SplitLayout (recursive SplitNode tree)
+    │   └── TerminalInstance × N (xterm.js + context menu)
+    └── GitHistory (repo tree + commit history + Pull/Push)
 
-ToastContainer 悬浮于右下角，SettingsModal 覆盖全局。
+ToastContainer floats at the bottom-right; SettingsModal overlays globally.
 ```
 
-## 推荐开发环境
+## Recommended Dev Environment
 
 - [VS Code](https://code.visualstudio.com/) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
 
-## 贡献
+## Contributing
 
-欢迎提交 Issue 和 PR。外部贡献会经过功能验证和安全审查后合并。
+Issues and PRs are welcome. External contributions are merged after functional verification and a security review.
 
-提交代码前请运行：
+Before submitting, please run:
 
 ```bash
-# 前端类型检查
+# Frontend type check
 npm run build
 
-# Rust 测试与构建
+# Rust tests & build
 cd src-tauri && cargo test && cargo build
 ```
 
-## 社区
+## Community
 
-学 AI，上 L 站 — [LinuxDO](https://linux.do/)
+Learn AI, join the L site — [LinuxDO](https://linux.do/)
