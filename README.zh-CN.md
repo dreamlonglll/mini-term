@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.4.22-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.5.0-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -135,6 +135,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 - **布局持久化** — 分屏比例、标签页、窗口大小 / 位置自动保存，重启恢复（`tauri-plugin-window-state`）
 - **关闭确认** — 关闭窗口前二次确认，并 flush 所有项目布局，避免误操作
 - **版本检查** — 启动时拉取 GitHub Release，标题栏显示新版本提示
+- **中英双语界面** — 「设置 → 系统」一键切换中 / 英文，整个界面实时重渲染；首次启动按系统语言自动探测并记忆选择，重启保留。每个页面、每个功能的文案均已翻译，内置轻量 i18n 层（无额外运行时依赖）
 - **设置中心** — 统一的 SettingsModal 管理主题、字体、Shell、AI 通知等所有开关
 
 ## 技术栈

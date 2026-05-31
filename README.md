@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.4.22-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.5.0-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -135,6 +135,7 @@ Remotely drive the AI agents running on your machine through IM platforms (Feish
 - **Layout persistence** — Split ratios, tabs, and window size / position are saved automatically and restored on restart (`tauri-plugin-window-state`).
 - **Close confirmation** — A confirmation before closing the window, flushing all project layouts to prevent accidental loss.
 - **Update check** — Fetches the GitHub Release on startup and shows a new-version hint in the title bar.
+- **Bilingual UI (English / 中文)** — A one-click language toggle under "Settings → System" instantly re-renders the entire interface; the language is auto-detected from the system on first launch and remembered across restarts. Every page and feature is fully translated, with a lightweight built-in i18n layer (no extra runtime dependency).
 - **Settings center** — A unified SettingsModal managing all toggles: theme, fonts, shells, AI notifications, and more.
 
 ## Tech Stack
