@@ -481,3 +481,40 @@ feat/cc-connect-panel 分支文档收尾:README 顶部 slogan 加 '· IM 平台�
 ### Next Steps
 
 - None - task complete
+
+
+## Session 15: 全项目深度 review + 修复 search 崩溃/clipboard 越界/配置原子写/资源泄漏
+
+**Date**: 2026-06-01
+**Task**: 全项目深度 review + 修复 search 崩溃/clipboard 越界/配置原子写/资源泄漏
+**Branch**: `main`
+
+### Summary
+
+对 mini-term 全 17 模块做多 agent 对抗式深度 review(确认 22 问题、推翻含 rehype-raw XSS 在内的 4 误报);在 worktree 分支 fix/review-2026-06-01 修复并对抗复审通过:H1/H2 搜索遇 CJK/多字节字符崩溃且前端永久卡死(重写子串匹配为逐字符折叠+catch_unwind)、H3 剪贴板 DIB 越界读/整数溢出、配置文件原子写横切(16 处 fs::atomic_write,含 Unix 权限位保留)、删项目与 FileTree watcher 的 PTY/终端/句柄泄漏。164 Rust 测试+tsc 全绿;分支未合并,剩余 medium/low 入 backlog。
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `f1d187e` | (see git log) |
+| `1fcf1bc` | (see git log) |
+| `d210ce7` | (see git log) |
+| `b28c4dd` | (see git log) |
+| `571782d` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
