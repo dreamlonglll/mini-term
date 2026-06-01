@@ -447,3 +447,37 @@ feat/cc-connect-panel 分支文档收尾:README 顶部 slogan 加 '· IM 平台�
 ### Next Steps
 
 - None - task complete
+
+
+## Session 14: 归档全应用中英双语 (i18n) 任务
+
+**Date**: 2026-06-01
+**Task**: 归档全应用中英双语 (i18n) 任务
+**Branch**: `main`
+
+### Summary
+
+完成并归档 i18n 双语任务:自研 zustand i18n 基础设施(useT/t、点分 key、{param} 插值、localStorage 持久化+navigator 自动探测),28 个组件文案抽取为 src/i18n/locales 下 29 个 zh/en 命名空间字典,新增 LanguageToggle 接入设置→系统分页;随 v0.5.0 发布。
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `59926aa` | (see git log) |
+| `591c598` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
