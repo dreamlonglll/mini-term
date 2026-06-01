@@ -177,7 +177,7 @@ fn remove_project_mcp_json(project_dir: &Path) -> Result<(), String> {
         let json_str = serde_json::to_string_pretty(&root)
             .map_err(|e| format!("序列化 .mcp.json 失败: {}", e))?;
         crate::fs::atomic_write(&mcp_path, json_str.as_bytes())
-        .map_err(|e| format!("写入 .mcp.json 失败: {}", e))?;
+            .map_err(|e| format!("写入 .mcp.json 失败: {}", e))?;
     }
     Ok(())
 }

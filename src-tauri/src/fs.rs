@@ -40,6 +40,12 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         return Err(e);
     }
 
+    // 若目标已存在,把其权限位复制到临时文件,避免 rename 后权限退化为 umask 默认值
+    // (Unix 下保护用户 chmod 600 的含 token 配置不被降级为 0644;Windows 上对应只读位)。
+    if let Ok(meta) = fs::metadata(path) {
+        let _ = fs::set_permissions(&tmp, meta.permissions());
+    }
+
     match fs::rename(&tmp, path) {
         Ok(()) => Ok(()),
         Err(e) => {
