@@ -1184,14 +1184,16 @@ fn run_git_network_command(repo_path: &str, op: &'static str) -> Result<String, 
     }
 }
 
-// 两个 command 故意是 sync fn:内部 `recv_timeout(30s)` 是阻塞调用,
-// sync command 在 Tauri 的 blocking 池运行,不会占用 async runtime 的 worker。
-#[tauri::command]
+// 必须用 `(async)`:Tauri 的同步 `#[tauri::command]` 会在主线程(WebView 事件循环)上执行,
+// 而本函数内部 `recv_timeout(30s)` 是阻塞等待 —— 那会卡住整个 UI(间歇性卡顿的根因)。
+// 标记 (async) 后 Tauri 通过 async_runtime::spawn 在 worker 线程运行,主线程不再被阻塞;
+// 内部的「独立线程跑 git + mpsc + 30s 超时」逻辑保持不变,只是阻塞等待挪到了 worker 线程。
+#[tauri::command(async)]
 pub fn git_pull(repo_path: String) -> Result<String, String> {
     run_git_network_command(&repo_path, "pull")
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 pub fn git_push(repo_path: String) -> Result<String, String> {
     run_git_network_command(&repo_path, "push")
 }
