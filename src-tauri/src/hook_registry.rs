@@ -159,7 +159,7 @@ fn register_claude_hooks(hook_path: &str) -> Result<String, String> {
     // 写回配置文件
     let json_str = serde_json::to_string_pretty(&settings)
         .map_err(|e| format!("序列化 settings.json 失败: {}", e))?;
-    std::fs::write(&settings_path, json_str)
+    crate::fs::atomic_write(&settings_path, json_str.as_bytes())
         .map_err(|e| format!("写入 settings.json 失败: {}", e))?;
 
     Ok(format!(
@@ -221,7 +221,7 @@ fn unregister_claude_hooks() -> Result<String, String> {
 
     let json_str = serde_json::to_string_pretty(&settings)
         .map_err(|e| format!("序列化 settings.json 失败: {}", e))?;
-    std::fs::write(&settings_path, json_str)
+    crate::fs::atomic_write(&settings_path, json_str.as_bytes())
         .map_err(|e| format!("写入 settings.json 失败: {}", e))?;
 
     Ok(format!("Claude Code: 已移除 {} 个 hook 条目", removed))
@@ -284,7 +284,7 @@ fn ensure_codex_hooks_feature() -> Result<(), String> {
     }
     doc["features"]["codex_hooks"] = toml_edit::value(true);
 
-    std::fs::write(&config_path, doc.to_string())
+    crate::fs::atomic_write(&config_path, doc.to_string().as_bytes())
         .map_err(|e| format!("写入 config.toml 失败: {}", e))?;
 
     Ok(())
@@ -371,7 +371,8 @@ fn register_codex_hooks(hook_path: &str) -> Result<String, String> {
     // 写回配置文件
     let json_str = serde_json::to_string_pretty(&config)
         .map_err(|e| format!("序列化 hooks.json 失败: {}", e))?;
-    std::fs::write(&hooks_path, json_str).map_err(|e| format!("写入 hooks.json 失败: {}", e))?;
+    crate::fs::atomic_write(&hooks_path, json_str.as_bytes())
+        .map_err(|e| format!("写入 hooks.json 失败: {}", e))?;
 
     Ok(format!(
         "Codex: {} 个 hook 已添加, {} 个已更新 (共 {} 个事件)",
@@ -432,7 +433,8 @@ fn unregister_codex_hooks() -> Result<String, String> {
 
     let json_str = serde_json::to_string_pretty(&config)
         .map_err(|e| format!("序列化 hooks.json 失败: {}", e))?;
-    std::fs::write(&hooks_path, json_str).map_err(|e| format!("写入 hooks.json 失败: {}", e))?;
+    crate::fs::atomic_write(&hooks_path, json_str.as_bytes())
+        .map_err(|e| format!("写入 hooks.json 失败: {}", e))?;
 
     Ok(format!("Codex: 已移除 {} 个 hook 条目", removed))
 }

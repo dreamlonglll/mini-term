@@ -53,13 +53,23 @@ function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff, onViewF
     setChildren(entries);
   }, [entry.path, projectRoot]);
 
-  // 恢复时自动加载子节点并注册监听
+  // 恢复时(初始即展开)加载一次子节点
   useEffect(() => {
     if (expanded && entry.isDir) {
       loadChildren();
-      invoke('watch_directory', { path: entry.path, projectPath: projectRoot });
     }
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps -- 仅在 mount 时按持久化展开态恢复一次
+
+  // 目录监听生命周期:展开时注册 watcher,折叠 / 组件卸载 / 路径变化时自动注销。
+  // 旧实现只在手动折叠当前节点时 unwatch,父级折叠或切换项目导致后代节点直接 unmount
+  // 时其 watcher 永不释放,会持续累积 OS 文件监听句柄(inotify / ReadDirectoryChangesW)。
+  useEffect(() => {
+    if (!entry.isDir || !expanded) return;
+    invoke('watch_directory', { path: entry.path, projectPath: projectRoot }).catch(() => {});
+    return () => {
+      invoke('unwatch_directory', { path: entry.path }).catch(() => {});
+    };
+  }, [expanded, entry.isDir, entry.path, projectRoot]);
 
   const handleToggle = useCallback(async () => {
     if (!entry.isDir) {
@@ -67,17 +77,16 @@ function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff, onViewF
       return;
     }
     const next = !expanded;
+    // 展开前先加载子节点避免空帧;watcher 的注册/注销由上面的监听生命周期 effect
+    // 跟随 expanded 状态自动处理(含 unmount 时的释放),此处不再手动 watch/unwatch。
     if (next) {
       await loadChildren();
-      invoke('watch_directory', { path: entry.path, projectPath: projectRoot });
-    } else {
-      invoke('unwatch_directory', { path: entry.path });
     }
     setExpanded(next);
     if (activeProjectId) {
       toggleExpandedDir(activeProjectId, entry.path, next);
     }
-  }, [entry, expanded, loadChildren, projectRoot, gitStatusMap, onViewDiff, onViewFile, activeProjectId]);
+  }, [entry, expanded, loadChildren, onViewFile, activeProjectId]);
 
   useTauriEvent<FsChangePayload>('fs-change', useCallback((payload: FsChangePayload) => {
     if (expanded && payload.path.startsWith(entry.path)) {

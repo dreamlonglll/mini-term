@@ -75,24 +75,41 @@ mod win {
             return Err(format!("不支持的 DIB 压缩格式: {compression}"));
         }
 
-        let header_size = header.biSize as usize;
-        let pixel_offset = if bit_count <= 8 {
-            let palette_entries = if header.biClrUsed > 0 {
-                header.biClrUsed as usize
-            } else {
-                1usize << bit_count
-            };
-            header_size + palette_entries * 4
-        } else {
-            header_size
-        };
+        // 只支持 24/32 位真彩(调色板位深从未真正被下方循环支持),提前拒绝可避免
+        // palette 偏移歧义,也让后续偏移计算只有一种分支。
+        if bit_count != 24 && bit_count != 32 {
+            return Err(format!("不支持的位深: {bit_count}"));
+        }
 
+        // 尺寸来自剪贴板写入方完全可控的 BITMAPINFOHEADER。biWidth 负值经 `as u32` 会
+        // 回绕成巨值,必须用原始 i32 判;并对维度设上限防止 RgbaImage::new 巨额分配。
+        if header.biWidth <= 0 || header.biHeight == 0 {
+            return Err("DIB 尺寸非法".into());
+        }
+        const MAX_DIM: u32 = 1 << 16; // 65536,远超任何真实截图
+        if width > MAX_DIM || height > MAX_DIM {
+            return Err("DIB 尺寸超出上限".into());
+        }
+
+        let pixel_offset = header.biSize as usize; // 24/32 位无调色板,像素紧跟头部
         if pixel_offset >= size {
             return Err("像素数据偏移超出范围".into());
         }
 
+        // 关键加固:全程 usize + checked 运算,并校验整块像素数据落在缓冲区内,
+        // 杜绝声称维度远大于实际分配时的越界读 / 整数溢出。
+        let stride = (((width as usize) * (bit_count as usize) + 31) / 32) * 4;
+        let pixel_bytes = (height as usize)
+            .checked_mul(stride)
+            .ok_or("DIB 像素数据长度溢出")?;
+        let required = pixel_offset
+            .checked_add(pixel_bytes)
+            .ok_or("DIB 像素数据长度溢出")?;
+        if required > size {
+            return Err("DIB 像素数据超出缓冲区范围".into());
+        }
+
         let pixels = ptr.add(pixel_offset);
-        let stride = ((width * bit_count as u32 + 31) / 32 * 4) as usize;
         let bottom_up = header.biHeight > 0;
 
         let mut img = RgbaImage::new(width, height);
@@ -102,21 +119,18 @@ mod win {
             let row = pixels.add(src_y as usize * stride);
 
             for x in 0..width {
-                let (r, g, b, a) = match bit_count {
-                    32 => {
-                        let off = (x * 4) as usize;
-                        (
-                            *row.add(off + 2),
-                            *row.add(off + 1),
-                            *row.add(off),
-                            *row.add(off + 3),
-                        )
-                    }
-                    24 => {
-                        let off = (x * 3) as usize;
-                        (*row.add(off + 2), *row.add(off + 1), *row.add(off), 255)
-                    }
-                    _ => return Err(format!("不支持的位深: {bit_count}")),
+                let (r, g, b, a) = if bit_count == 32 {
+                    let off = (x as usize) * 4;
+                    (
+                        *row.add(off + 2),
+                        *row.add(off + 1),
+                        *row.add(off),
+                        *row.add(off + 3),
+                    )
+                } else {
+                    // 24 位
+                    let off = (x as usize) * 3;
+                    (*row.add(off + 2), *row.add(off + 1), *row.add(off), 255)
                 };
                 img.put_pixel(x, y, image::Rgba([r, g, b, a]));
             }
@@ -197,6 +211,72 @@ mod win {
 
         img.save(&path).map_err(|e| format!("保存 PNG 失败: {e}"))?;
         Ok(path)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        const HDR: usize = std::mem::size_of::<BITMAPINFOHEADER>();
+
+        fn make_header(width: i32, height: i32, bit_count: u16) -> BITMAPINFOHEADER {
+            let mut h: BITMAPINFOHEADER = unsafe { std::mem::zeroed() };
+            h.biSize = HDR as u32;
+            h.biWidth = width;
+            h.biHeight = height;
+            h.biPlanes = 1;
+            h.biBitCount = bit_count;
+            h.biCompression = BI_RGB.0;
+            h
+        }
+
+        fn buf_with_header(header: &BITMAPINFOHEADER, total: usize) -> Vec<u8> {
+            let mut buf = vec![0u8; total.max(HDR)];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    header as *const _ as *const u8,
+                    buf.as_mut_ptr(),
+                    HDR,
+                );
+            }
+            buf
+        }
+
+        // 声称 1000x1000 却只给极小缓冲:必须返回 Err 而不是越界读/panic。
+        #[test]
+        fn parse_dib_rejects_truncated_pixel_buffer() {
+            let header = make_header(1000, 1000, 32);
+            let buf = buf_with_header(&header, HDR + 64);
+            unsafe {
+                assert!(parse_dib(buf.as_ptr(), buf.len()).is_err());
+            }
+        }
+
+        // 负宽度(as u32 会回绕)与超大维度都必须被拒绝。
+        #[test]
+        fn parse_dib_rejects_negative_or_oversized_dims() {
+            let neg = make_header(-5, 10, 32);
+            let big = make_header(1 << 20, 10, 32);
+            let buf_neg = buf_with_header(&neg, HDR + 16);
+            let buf_big = buf_with_header(&big, HDR + 16);
+            unsafe {
+                assert!(parse_dib(buf_neg.as_ptr(), buf_neg.len()).is_err());
+                assert!(parse_dib(buf_big.as_ptr(), buf_big.len()).is_err());
+            }
+        }
+
+        // 回归:合法的小图仍能正常解析,确保加固没误伤正常路径。
+        #[test]
+        fn parse_dib_accepts_valid_small_bitmap() {
+            let (w, h) = (2i32, 2i32);
+            let header = make_header(w, h, 32);
+            let stride = (((w as usize) * 32 + 31) / 32) * 4;
+            let buf = buf_with_header(&header, HDR + stride * (h as usize));
+            unsafe {
+                let img = parse_dib(buf.as_ptr(), buf.len()).expect("合法小图应解析成功");
+                assert_eq!((img.width(), img.height()), (2, 2));
+            }
+        }
     }
 }
 

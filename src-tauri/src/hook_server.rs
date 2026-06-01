@@ -299,7 +299,7 @@ fn write_port_file(app: &AppHandle, port: u16) {
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("hook-server.json");
         let content = format!("{{\"port\":{}}}", port);
-        if let Err(e) = std::fs::write(&path, &content) {
+        if let Err(e) = crate::fs::atomic_write(&path, content.as_bytes()) {
             eprintln!("[hook-server] 写入端口文件失败 {}: {}", path.display(), e);
         } else {
             eprintln!("[hook-server] 端口文件已写入 {}", path.display());

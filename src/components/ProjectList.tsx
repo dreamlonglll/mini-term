@@ -5,7 +5,7 @@ import { open } from '@tauri-apps/plugin-dialog';
 import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { revealItemInDir } from '@tauri-apps/plugin-opener';
-import { useAppStore, genId } from '../store';
+import { useAppStore, genId, collectPtyIds } from '../store';
 import { StatusDot } from './StatusDot';
 import { DoneTag } from './DoneTag';
 import { SessionList } from './SessionList';
@@ -13,6 +13,7 @@ import { SshAssocModal } from './SshAssocModal';
 import { ProjectEnvVarsModal } from './ProjectEnvVarsModal';
 import { showContextMenu } from '../utils/contextMenu';
 import { showPrompt } from '../utils/prompt';
+import { disposeTerminal } from '../utils/terminalCache';
 import { initProjectDrag, isProjectDragging, getProjectDragPayload, onProjectDragEnd } from '../utils/projectDragState';
 import { useT } from '../i18n';
 import {
@@ -174,10 +175,26 @@ export function ProjectList() {
 
   const doRemove = useCallback(() => {
     if (!confirmTarget) return;
-    removeProject(confirmTarget.id);
+    const id = confirmTarget.id;
+    // 删项目走的是 removeProject 而非 PaneGroup 关闭路径,后者才负责销毁终端。
+    // 这里先回收该项目所有 tab/分屏下的终端:杀后端 PTY 子进程 + dispose 前端 xterm 实例,
+    // 否则会残留孤儿 shell/AI 进程(继续占用 CPU/内存、AI 可能还在烧 token)与泄漏的
+    // WebGL 上下文。markers 由 removeProject 内部清理。
+    const ps = useAppStore.getState().projectStates.get(id);
+    if (ps) {
+      const ptyIds = new Set<number>();
+      for (const tab of ps.tabs) {
+        for (const pid of collectPtyIds(tab.splitLayout)) ptyIds.add(pid);
+      }
+      for (const ptyId of ptyIds) {
+        invoke('kill_pty', { ptyId }).catch(() => {});
+        disposeTerminal(ptyId);
+      }
+    }
+    removeProject(id);
     saveConfig();
     setConfirmTarget(null);
-  }, [confirmTarget, removeProject]);
+  }, [confirmTarget, removeProject, saveConfig]);
 
   const getProjectStatus = (projectId: string): PaneStatus => {
     const ps = projectStates.get(projectId);
