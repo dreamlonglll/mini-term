@@ -108,19 +108,40 @@ fn build_walker(root: &str) -> ignore::Walk {
     builder.build()
 }
 
-fn find_substring_matches(text: &str, query_lower: &str) -> Vec<(usize, usize)> {
-    let text_lower = text.to_lowercase();
-    let mut result = Vec::new();
-    let mut start = 0;
-    while start < text_lower.len() {
-        match text_lower[start..].find(query_lower) {
-            Some(pos) => {
-                let abs_start = start + pos;
-                let abs_end = abs_start + query_lower.len();
-                result.push((abs_start, abs_end));
-                start = abs_start + 1;
+/// 大小写不敏感子串搜索，直接返回【原始 text】的 char 区间（前端按 char 高亮）。
+///
+/// 逐字符做小写折叠，同时记录每个小写字符来自哪个原始字符；匹配在小写字符序列
+/// 上按 char 进行，命中后回映射到原始 char 下标。这样即便 Unicode 大小写折叠改变
+/// 长度（İ→i̇、ǅ→ǆ 等），结果也始终落在原始字符边界上——从根本上避免了旧实现里
+/// 「按字节 +1 步进切多字节字符 panic」以及「在 to_lowercase() 串上算偏移却拿原串
+/// 做 byte→char 映射导致越界 / 错位」两个问题。query_lower 由调用方预先小写化。
+fn find_substring_char_ranges(text: &str, query_lower: &str) -> Vec<(usize, usize)> {
+    let query_chars: Vec<char> = query_lower.chars().collect();
+    if query_chars.is_empty() {
+        return Vec::new();
+    }
+    // 小写字符序列 + 每个小写字符对应的原始字符下标
+    let mut lower_chars: Vec<char> = Vec::new();
+    let mut origin: Vec<usize> = Vec::new();
+    for (orig_ci, ch) in text.chars().enumerate() {
+        for lc in ch.to_lowercase() {
+            lower_chars.push(lc);
+            origin.push(orig_ci);
+        }
+    }
+    let qn = query_chars.len();
+    let mut result: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i + qn <= lower_chars.len() {
+        if lower_chars[i..i + qn] == query_chars[..] {
+            let start_char = origin[i];
+            let end_char = origin[i + qn - 1] + 1; // 覆盖最后一个原始字符的完整宽度
+            if result.last() != Some(&(start_char, end_char)) {
+                result.push((start_char, end_char));
             }
-            None => break,
+            i += qn; // 非重叠匹配
+        } else {
+            i += 1;
         }
     }
     result
@@ -234,14 +255,13 @@ fn search_filenames(
         }
         let file_name = entry.file_name().to_string_lossy().to_string();
 
-        let matches = if let Some(ref re) = re {
-            find_regex_matches(&file_name, re)
+        let char_ranges = if let Some(ref re) = re {
+            byte_ranges_to_char_ranges(&file_name, find_regex_matches(&file_name, re))
         } else {
-            find_substring_matches(&file_name, &query_lower)
+            find_substring_char_ranges(&file_name, &query_lower)
         };
 
-        if !matches.is_empty() {
-            let char_ranges = byte_ranges_to_char_ranges(&file_name, matches);
+        if !char_ranges.is_empty() {
             let rel_path = entry
                 .path()
                 .strip_prefix(root)
@@ -310,13 +330,12 @@ fn search_contents(
             if cancel.load(Ordering::Relaxed) {
                 return Ok(());
             }
-            let matches = if let Some(ref re) = re {
-                find_regex_matches(line, re)
+            let char_ranges = if let Some(ref re) = re {
+                byte_ranges_to_char_ranges(line, find_regex_matches(line, re))
             } else {
-                find_substring_matches(line, &query_lower)
+                find_substring_char_ranges(line, &query_lower)
             };
-            if !matches.is_empty() {
-                let char_ranges = byte_ranges_to_char_ranges(line, matches);
+            if !char_ranges.is_empty() {
                 batcher.push(SearchResultItem {
                     file_path: rel_path.clone(),
                     file_name: file_name.clone(),
@@ -359,14 +378,22 @@ pub fn start_search(
     let sid = search_id.clone();
     std::thread::spawn(move || {
         let mut batcher = ResultBatcher::new(app, sid.clone());
-        let _ = match search_mode {
-            SearchMode::FileName => {
-                search_filenames(&project_root, &query, use_regex, &cancel, &mut batcher)
+        // 用 catch_unwind 兜底：即便搜索体内将来再出现 panic，也不会跳过下面的
+        // finish()/remove()，否则前端永远收不到 search-complete、搜索框卡死在 loading，
+        // 且 active_searches 残留。AssertUnwindSafe 是因为 batcher/AppHandle 跨越捕获边界。
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            match search_mode {
+                SearchMode::FileName => {
+                    search_filenames(&project_root, &query, use_regex, &cancel, &mut batcher)
+                }
+                SearchMode::FileContent => {
+                    search_contents(&project_root, &query, use_regex, &cancel, &mut batcher)
+                }
             }
-            SearchMode::FileContent => {
-                search_contents(&project_root, &query, use_regex, &cancel, &mut batcher)
-            }
-        };
+        }));
+        if outcome.is_err() {
+            eprintln!("[search] worker panicked during search {}", sid);
+        }
         let cancelled = cancel.load(Ordering::Relaxed);
         batcher.finish(cancelled);
         manager.remove(&sid);
@@ -418,14 +445,50 @@ mod tests {
 
     #[test]
     fn find_substring_case_insensitive() {
-        let matches = find_substring_matches("Hello World hello", "hello");
+        // ASCII：char 区间与 byte 区间相同
+        let matches = find_substring_char_ranges("Hello World hello", "hello");
         assert_eq!(matches, vec![(0, 5), (12, 17)]);
     }
 
     #[test]
     fn find_substring_no_match() {
-        let matches = find_substring_matches("foo bar", "baz");
+        let matches = find_substring_char_ranges("foo bar", "baz");
         assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn find_substring_empty_query() {
+        // 空 query 不应匹配（也防御性避免任何死循环）
+        assert!(find_substring_char_ranges("anything", "").is_empty());
+    }
+
+    #[test]
+    fn find_substring_cjk_no_panic() {
+        // 旧实现按 +1 字节步进，搜中文相邻字符必 panic（not a char boundary）。
+        // 现按字符返回原始 char 区间。
+        let matches = find_substring_char_ranges("你你你", "你");
+        assert_eq!(matches, vec![(0, 1), (1, 2), (2, 3)]);
+    }
+
+    #[test]
+    fn find_substring_cjk_substring() {
+        // “好” 在原始文本里是第 1 个字符（char 下标 1..2）
+        let matches = find_substring_char_ranges("你好world", "好");
+        assert_eq!(matches, vec![(1, 2)]);
+    }
+
+    #[test]
+    fn find_substring_turkish_dotted_i_no_panic() {
+        // İ (U+0130) 小写为 "i̇"（2 个 char），旧实现会让偏移越过原串长度而 panic。
+        // 搜 "i" 应高亮整个原始 İ 字符（char 区间 0..1）。
+        let matches = find_substring_char_ranges("İ", "i");
+        assert_eq!(matches, vec![(0, 1)]);
+    }
+
+    #[test]
+    fn find_substring_emoji_no_panic() {
+        let matches = find_substring_char_ranges("a😀b😀c", "😀");
+        assert_eq!(matches, vec![(1, 2), (3, 4)]);
     }
 
     #[test]
