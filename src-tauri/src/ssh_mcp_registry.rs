@@ -133,7 +133,8 @@ fn write_project_mcp_json(
 
     let json_str =
         serde_json::to_string_pretty(&root).map_err(|e| format!("序列化 .mcp.json 失败: {}", e))?;
-    std::fs::write(&mcp_path, json_str).map_err(|e| format!("写入 .mcp.json 失败: {}", e))?;
+    crate::fs::atomic_write(&mcp_path, json_str.as_bytes())
+        .map_err(|e| format!("写入 .mcp.json 失败: {}", e))?;
     Ok(())
 }
 
@@ -175,7 +176,8 @@ fn remove_project_mcp_json(project_dir: &Path) -> Result<(), String> {
     } else {
         let json_str = serde_json::to_string_pretty(&root)
             .map_err(|e| format!("序列化 .mcp.json 失败: {}", e))?;
-        std::fs::write(&mcp_path, json_str).map_err(|e| format!("写入 .mcp.json 失败: {}", e))?;
+        crate::fs::atomic_write(&mcp_path, json_str.as_bytes())
+        .map_err(|e| format!("写入 .mcp.json 失败: {}", e))?;
     }
     Ok(())
 }
@@ -208,7 +210,7 @@ fn write_project_codex_config(
 
     apply_codex_mcp_server(&mut doc, binary_path, project_id);
 
-    std::fs::write(&config_path, doc.to_string())
+    crate::fs::atomic_write(&config_path, doc.to_string().as_bytes())
         .map_err(|e| format!("写入项目 config.toml 失败: {}", e))?;
     Ok(())
 }
@@ -262,7 +264,7 @@ fn remove_project_codex_config(project_dir: &Path) -> Result<(), String> {
 
     strip_codex_mcp_server(&mut doc);
 
-    std::fs::write(&config_path, doc.to_string())
+    crate::fs::atomic_write(&config_path, doc.to_string().as_bytes())
         .map_err(|e| format!("写入项目 config.toml 失败: {}", e))?;
     Ok(())
 }
@@ -310,7 +312,7 @@ fn trust_project_in_codex(project_dir: &Path) -> Result<(), String> {
     let key = project_dir.to_string_lossy().to_string();
     apply_codex_project_trust(&mut doc, &key);
 
-    std::fs::write(&config_path, doc.to_string())
+    crate::fs::atomic_write(&config_path, doc.to_string().as_bytes())
         .map_err(|e| format!("写入 Codex config.toml 失败: {}", e))?;
     Ok(())
 }
@@ -366,7 +368,7 @@ fn set_claude_mcp_approval(enable: bool) -> Result<(), String> {
 
     let json_str = serde_json::to_string_pretty(&settings)
         .map_err(|e| format!("序列化 Claude settings.json 失败: {}", e))?;
-    std::fs::write(&settings_path, json_str)
+    crate::fs::atomic_write(&settings_path, json_str.as_bytes())
         .map_err(|e| format!("写入 Claude settings.json 失败: {}", e))?;
     Ok(())
 }
@@ -414,7 +416,7 @@ fn append_gitignore_entries(project_dir: &Path) -> Result<(), String> {
         return Ok(());
     };
 
-    std::fs::write(&gitignore_path, appended)
+    crate::fs::atomic_write(&gitignore_path, appended.as_bytes())
         .map_err(|e| format!("写入 .gitignore 失败: {}", e))?;
     Ok(())
 }

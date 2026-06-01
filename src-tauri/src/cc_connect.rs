@@ -604,7 +604,7 @@ pub fn cc_connect_import_project(
     let agent_type = req.agent_type.unwrap_or_else(|| DEFAULT_AGENT_TYPE.to_string());
     projects.push(make_project_table(&req.name, &req.work_dir, &agent_type));
 
-    std::fs::write(&path, doc.to_string())
+    crate::fs::atomic_write(&path, doc.to_string().as_bytes())
         .map_err(|e| format!("写回 {} 失败: {}", path.display(), e))?;
 
     // toml 已写盘 → 无论 restart 成败都返 Ok(ImportProjectResult { toml_written: true, ... }),
@@ -674,7 +674,7 @@ pub fn cc_connect_import_projects(
         });
     }
 
-    std::fs::write(&path, doc.to_string())
+    crate::fs::atomic_write(&path, doc.to_string().as_bytes())
         .map_err(|e| format!("写回 {} 失败: {}", path.display(), e))?;
 
     let url = build_api_url(port, "/api/v1/restart");

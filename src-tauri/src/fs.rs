@@ -8,6 +8,47 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter};
 
+/// 原子写文件:先写到同目录的临时文件,fsync 后再 rename 覆盖目标。
+///
+/// rename 在同一卷上是原子操作(Windows 下 Rust 的 std::fs::rename 走
+/// MOVEFILE_REPLACE_EXISTING,可原子替换已存在文件),因此即便写入过程中崩溃/断电/
+/// 磁盘满,目标文件要么是旧内容、要么是完整新内容,绝不会留下被截断的半截文件。
+/// 用于所有「覆盖用户/全局既有配置」的写入(config.json、config.toml、.mcp.json、
+/// settings.json、hooks.json 等),避免裸 fs::write 的 truncate-then-write 损坏用户配置。
+pub fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let dir = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "目标路径没有父目录")
+    })?;
+    // 临时文件必须与目标同目录,保证同卷,rename 才能原子
+    let seq = COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+    let stem = path.file_name().and_then(|s| s.to_str()).unwrap_or("tmp");
+    let tmp = dir.join(format!(".{}.{}.{}.tmp", stem, std::process::id(), seq));
+
+    let write_result = (|| -> std::io::Result<()> {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(contents)?;
+        f.flush()?;
+        let _ = f.sync_all(); // sync 失败不致命,尽力而为
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    match fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
 fn natural_cmp(a: &str, b: &str) -> Ordering {
     let a = a.to_lowercase();
     let b = b.to_lowercase();
@@ -431,6 +472,35 @@ mod tests {
     #[test]
     fn is_path_ignored_empty_returns_false() {
         assert!(!is_path_ignored(&[], Path::new("/any/path"), false));
+    }
+
+    #[test]
+    fn atomic_write_creates_and_overwrites() {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("mini-term-atomic-{ts}"));
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("conf.json");
+
+        // 目标不存在 → 创建
+        atomic_write(&target, b"first").unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "first");
+
+        // 目标已存在 → 原子覆盖(Windows 下也应成功,验证 rename 替换语义)
+        atomic_write(&target, b"second-longer-content").unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "second-longer-content");
+
+        // 不应残留任何 .tmp 临时文件
+        let leftover: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftover.is_empty(), "残留临时文件: {:?}", leftover);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     fn make_test_project() -> (PathBuf, PathBuf) {

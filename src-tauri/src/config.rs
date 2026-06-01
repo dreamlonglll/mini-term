@@ -534,7 +534,8 @@ pub fn load_config(app: AppHandle) -> AppConfig {
 pub fn save_config(app: AppHandle, config: AppConfig) -> Result<(), String> {
     let path = config_path(&app);
     let json = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
-    fs::write(&path, json).map_err(|e| e.to_string())
+    // 原子写,避免写入中途崩溃留下截断的 config.json 导致全部用户配置丢失
+    crate::fs::atomic_write(&path, json.as_bytes()).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
