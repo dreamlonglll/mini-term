@@ -38,13 +38,16 @@ fn home_dir() -> Option<PathBuf> {
     dirs::home_dir()
 }
 
-/// 将项目路径编码为 Claude 项目目录名（`:` `\` `/` → `-`）
+/// 将项目路径编码为 Claude 项目目录名。
+/// Claude Code 会把 cwd 中**所有非字母数字字符**（含 `:` `\` `/` `.` 空格及中文等）
+/// 统一替换为 `-`，而非仅替换路径分隔符。
+/// 例如 `D:\Git\bhyt-一体机` → `D--Git-bhyt----`。
 fn encode_project_path(project_path: &str) -> String {
     project_path
         .trim_end_matches(['/', '\\'])
-        .replace(':', "-")
-        .replace('\\', "-")
-        .replace('/', "-")
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
 }
 
 /// 查找项目路径对应的所有 Claude 项目目录（含尾部斜杠导致的变体）
@@ -59,6 +62,7 @@ fn find_claude_project_dirs(project_path: &str) -> Vec<PathBuf> {
     }
 
     let encoded = encode_project_path(project_path);
+    let normalized_project = normalize_path(project_path);
 
     let entries = match fs::read_dir(&projects_dir) {
         Ok(e) => e,
@@ -75,15 +79,54 @@ fn find_claude_project_dirs(project_path: &str) -> Vec<PathBuf> {
             Some(n) => n,
             None => continue,
         };
-        if dir_name == encoded
-            || (dir_name.starts_with(&encoded)
-                && dir_name[encoded.len()..].chars().all(|c| c == '-'))
-        {
+        if dir_name == encoded {
+            // 名称完全一致：直接采用
             dirs.push(path);
+        } else if dir_name.starts_with(&encoded)
+            && dir_name[encoded.len()..].chars().all(|c| c == '-')
+        {
+            // 仅多出尾部 `-`：可能是「带尾部斜杠的同一项目」，也可能是「前缀相同的不同项目」。
+            // 编码有损（如 `D:\Git\bhyt` 会前缀匹配到 `D:\Git\bhyt-一体机` 的目录 `D--Git-bhyt----`），
+            // 因此读取会话文件内的真实 cwd 做精确校验，避免把兄弟项目的会话也吃进来。
+            if dir_matches_project(&path, &normalized_project) {
+                dirs.push(path);
+            }
         }
     }
 
     dirs
+}
+
+/// 读取 Claude 项目目录下任一 jsonl 的 `cwd` 字段，确认其是否就是目标项目。
+/// 用于消除目录名编码有损导致的前缀误匹配。
+fn dir_matches_project(dir: &Path, normalized_project: &str) -> bool {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return false,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let file = match fs::File::open(&path) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let reader = BufReader::new(file);
+        for line in reader.lines().take(5) {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+            if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&line) {
+                if let Some(cwd) = obj.get("cwd").and_then(|v| v.as_str()) {
+                    return normalize_path(cwd) == normalized_project;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// 路径统一化（小写 + 反斜杠，去尾部斜杠），用于 Windows 路径比较
