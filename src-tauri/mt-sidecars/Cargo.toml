@@ -36,6 +36,20 @@ russh = { version = "0.61", default-features = false, features = ["ring"] }
 futures = "0.3"
 # known_hosts 文件读写时编解码 server pubkey 字节。
 base64 = "0.22"
+# --- 传统 PKCS#1 RSA 私钥支持 (task 06-06-ssh-mcp-pkcs1-rsa-key) ---
+# russh::keys 底层 ssh-key 默认只解析 OpenSSH / PKCS#8; 传统 `-----BEGIN RSA PRIVATE
+# KEY-----`(PKCS#1) 会报 "Unsupported key type RSA" 导致连接失败。启用 ssh-key 的
+# `rsa` feature, 在 pool.rs 做纯 Rust fallback: PKCS#1 PEM -> rsa::RsaPrivateKey ->
+# ssh_key::private::RsaKeypair -> ssh_key::PrivateKey, 再交给 russh 认证。
+# 版本精确锁 =0.7.0-rc.10 与 russh 0.61 内部锁定一致, 否则 PrivateKey 跨 crate 版本
+# 类型不可互换(同 rand_core 多版本陷阱)。
+ssh-key = { version = "=0.7.0-rc.10", default-features = false, features = ["rsa", "alloc"] }
+# 解析 PKCS#1 RSA。版本须与 ssh-key 0.7.0-rc.10 内部锁定的 rsa 一致(=0.10.0-rc.18),
+# 否则 RsaKeypair::try_from(&rsa::RsaPrivateKey) 因类型来自不同 crate 版本而编译失败。
+# 用默认 features(std + encoding, 后者含 pkcs1 DER 解码); rsa 没有 `pem` feature
+# (PEM 仅由 pkcs1/pem 提供且 rsa 未传递), 故走 from_pkcs1_der + 自剥 PEM(base64)路径。
+# 纯 Rust(num-bigint/crypto-bigint), 不触发 aws-lc 的 NASM 工具链依赖; rand_core 统一 0.10。
+rsa = "=0.10.0-rc.18"
 
 [dev-dependencies]
 # 单测里的 SSH 公钥用预计算 OpenSSH 字符串解析,无需 rand 依赖。

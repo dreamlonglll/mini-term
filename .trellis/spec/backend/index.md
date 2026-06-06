@@ -11,6 +11,7 @@
 | [Agent 配置注入](./agent-config-injection.md) | 幂等读写 Claude Code / Codex 的外部配置文件（hooks、MCP server 注册） |
 | [Rust 加密 crate 在 Windows MSVC 上的 NASM 陷阱](./rust-crypto-on-windows-msvc.md) | 拉 russh / reqwest / rustls 一类加密 crate 时优先选 `ring` 后端，避开 aws-lc-sys 对 NASM 的工具链依赖 |
 | [`rand_core` 多版本对齐](./rand-core-version-alignment.md) | 给加密 crate 写测试 fixture 时避开 rng-based API，直接用底层类型构造，绕开 rand_core 多版本 `CryptoRng` trait 路径冲突 |
+| [russh 加载 RSA 私钥的两个坑](./russh-rsa-key-loading.md) | ① ssh-key 不认传统 PKCS#1/SEC1 PEM，需 rsa crate 自剥 PEM→DER fallback；② `PrivateKeyWithHashAlg::new(rsa_key, None)` 落到 SHA-1 被现代 OpenSSH 拒，须用 `best_supported_rsa_hash` 选 rsa-sha2-512/256 |
 | [Tokio 常驻资源池骨架](./tokio-session-pool-pattern.md) | 带后台 reaper + graceful shutdown 的常驻资源池可复用骨架（Weak reaper、std Mutex 持 JoinHandle、shutdown 三步、fast-path 不查 unhealthy、纯函数抽决策） |
 | [portable-pty ConPTY cwd 静默 fallback](./portable-pty-conpty-cwd-fallback.md) | Windows 上 `CommandBuilder::cwd()` 拿到非合法目录时静默退回 `$USERPROFILE`，调用方必须先校验或替换 cwd，避免诊断黑洞 |
 | [Windows `\\?\UNC\` verbatim 前缀剥离](./windows-unc-verbatim-prefix-strip.md) | `canonicalize` 返回的 UNC verbatim 前缀 `dunce::simplified` 不剥（只剥盘符），自己写一条 `\\?\UNC\<host>\<rest>` → `\\<host>\<rest>` 规则 |

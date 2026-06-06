@@ -438,17 +438,23 @@ fn spawn_disconnect(s: Arc<CachedSession>, timeout: Duration) {
 async fn authenticate(handle: &mut Handle<MtClient>, conn: &SshConnection) -> Result<(), String> {
     // 1) publickey
     if let Some(path) = conn.identity_file.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        let key = load_secret_key(path, None)
-            .map_err(|e| {
-                // OpenSSH 加密密钥会在这里报 "encrypted" 或类似;给清晰错误指引。
-                format!(
-                    "failed to load private key '{path}': {e}. \
-                    If the key is encrypted with a passphrase, mt-ssh-mcp does not support \
-                    passphrase keys yet — use an unencrypted key or ssh-agent."
-                )
-            })?;
-        // PrivateKeyWithHashAlg::new(key, hash) —— None 让 russh 协商最合适的 hash 算法。
-        let with_hash = PrivateKeyWithHashAlg::new(Arc::new(key), None);
+        let key = load_private_key_compat(path)?;
+        // RSA 公钥签名的 hash 选择 —— 关键:`PrivateKeyWithHashAlg::new(key, None)` 对
+        // RSA key 会落到 **legacy ssh-rsa(SHA-1)**,而现代 OpenSSH(>=8.8,如 Ubuntu
+        // 22.04/24.04)默认禁用 SHA-1 公钥认证,导致 "server rejected all methods"。
+        // 按服务器通告的 server-sig-algs 选 rsa-sha2-512/256;服务器未发 EXT_INFO 时
+        // best_supported_rsa_hash 返回 Ok(None),回退 SHA-512(现代服务器普遍接受,远胜
+        // 默认 SHA-1)。仅 RSA key 需要查 —— `best_supported_rsa_hash` 会等最多 1s
+        // EXT_INFO,对 ed25519/ecdsa 该 hash 反正被 new() 忽略,无谓多查只会平添连接延迟。
+        let rsa_hash = if key.algorithm().is_rsa() {
+            match handle.best_supported_rsa_hash().await {
+                Ok(Some(alg)) => alg,
+                Ok(None) | Err(_) => Some(russh::keys::HashAlg::Sha512),
+            }
+        } else {
+            None
+        };
+        let with_hash = PrivateKeyWithHashAlg::new(Arc::new(key), rsa_hash);
         let auth = handle
             .authenticate_publickey(&conn.user, with_hash)
             .await
@@ -480,6 +486,96 @@ async fn authenticate(handle: &mut Handle<MtClient>, conn: &SshConnection) -> Re
     }
 
     Err("authentication failed: server rejected all configured methods (publickey/password)".into())
+}
+
+/// 加载私钥,在 russh 原生 `load_secret_key` 之上对传统 PEM 格式做 fallback。
+///
+/// russh 底层 `ssh-key` 只解析 OpenSSH(`-----BEGIN OPENSSH PRIVATE KEY-----`)与
+/// PKCS#8(`-----BEGIN PRIVATE KEY-----`)两种明文私钥;OpenSSH 早期版本及
+/// `ssh-keygen -m PEM` / 各类云控制台(如 Oracle Cloud)下发的传统 **PKCS#1 明文
+/// RSA**(`-----BEGIN RSA PRIVATE KEY-----`)会被它判为 `Unsupported key type RSA`,
+/// 导致用该密钥的连接永远建不起来(系统 `ssh` 客户端却能正常登录)。
+///
+/// 这里先走 russh 原生解析覆盖现代密钥;失败再读原文件按 PEM 标签判定:命中
+/// PKCS#1 标签就用纯 Rust 的 `rsa` crate 解析、转成 `ssh_key::PrivateKey`。其余
+/// 格式回退到 russh 原始错误文本,并附 passphrase 不支持的指引。
+///
+/// 加密私钥(passphrase —— 传统 PEM 的 `Proc-Type: 4,ENCRYPTED` 或 OpenSSH 加密块)
+/// 仍不支持,给出明确指引而非吐底层晦涩错误。
+fn load_private_key_compat(path: &str) -> Result<russh::keys::PrivateKey, String> {
+    // 1) russh 原生: OpenSSH / PKCS#8 明文,覆盖绝大多数现代密钥。
+    //    失败时保留错误,供步骤 3 回退诊断复用——避免重复读盘+重复解析。
+    let orig_err = match load_secret_key(path, None) {
+        Ok(key) => return Ok(key),
+        Err(e) => e,
+    };
+
+    // 2) fallback: 读原文件,按 PEM 标签判定传统格式。
+    //    注意先于"加密指引"读文件,文件不可读直接给 IO 错误。
+    let pem = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read private key '{path}': {e}"))?;
+
+    if let Some(key) = try_parse_pkcs1_rsa(&pem)
+        .map_err(|e| format!("failed to load private key '{path}': {e}"))?
+    {
+        return Ok(key);
+    }
+
+    // 3) 不是我们能补救的格式 —— 回退到 russh 原始错误 + passphrase 指引。
+    Err(format!(
+        "failed to load private key '{path}': {orig_err}. \
+        If the key is encrypted with a passphrase, mt-ssh-mcp does not support \
+        passphrase keys yet — use an unencrypted key (`ssh-keygen -p -N \"\" -f <key>`) or ssh-agent."
+    ))
+}
+
+/// 尝试把传统 **PKCS#1 明文 RSA** PEM(`-----BEGIN RSA PRIVATE KEY-----`)解析成
+/// `ssh_key::PrivateKey`。不是 PKCS#1 标签时返回 `Ok(None)`,让调用方回退到原始错误。
+///
+/// 抽成接受 `&str`、不碰文件系统的纯函数,便于单测直接喂 PEM 字符串。
+fn try_parse_pkcs1_rsa(pem: &str) -> Result<Option<russh::keys::PrivateKey>, String> {
+    use rsa::pkcs1::DecodeRsaPrivateKey;
+
+    const BEGIN: &str = "-----BEGIN RSA PRIVATE KEY-----";
+    const END: &str = "-----END RSA PRIVATE KEY-----";
+
+    // 不是 PKCS#1 标签 —— 交回上层(可能是 SEC1 EC / 加密 OpenSSH 等,本函数不处理)。
+    let Some(begin_at) = pem.find(BEGIN) else {
+        return Ok(None);
+    };
+    // 加密的传统 PEM(`Proc-Type: 4,ENCRYPTED`)明确不支持,给可操作指引。
+    if pem.contains("Proc-Type:") && pem.contains("ENCRYPTED") {
+        return Err(
+            "key is an encrypted PKCS#1 RSA private key (Proc-Type: 4,ENCRYPTED); \
+            passphrase keys are not supported — decrypt it first \
+            (`openssl rsa -in <key> -out <key.dec>` or re-export without a passphrase)"
+                .into(),
+        );
+    }
+
+    // 自剥 PEM -> DER:rsa 0.10 没有 `pem` feature(PEM 方法 gated 在 pkcs1/pem,
+    // rsa 未传递),故不能用 from_pkcs1_pem;改取 BEGIN/END 之间的 base64 主体、
+    // 去掉所有空白后解码成 DER,再走不依赖 pem feature 的 from_pkcs1_der。
+    let body_start = begin_at + BEGIN.len();
+    let body_end = pem
+        .find(END)
+        .filter(|&e| e >= body_start)
+        .ok_or_else(|| "PKCS#1 RSA PEM missing END marker".to_string())?;
+    let b64: String = pem[body_start..body_end]
+        .split_whitespace()
+        .collect();
+    let der = {
+        use base64_engine::Engine;
+        base64_engine::engine::general_purpose::STANDARD
+            .decode(b64.as_bytes())
+            .map_err(|e| format!("invalid base64 in PKCS#1 RSA PEM: {e}"))?
+    };
+
+    let rsa_key = rsa::RsaPrivateKey::from_pkcs1_der(&der)
+        .map_err(|e| format!("invalid PKCS#1 RSA private key: {e}"))?;
+    let keypair = russh::keys::ssh_key::private::RsaKeypair::try_from(&rsa_key)
+        .map_err(|e| format!("cannot convert RSA key into ssh-key form: {e}"))?;
+    Ok(Some(russh::keys::PrivateKey::from(keypair)))
 }
 
 /// 把 password 灌进 keyboard-interactive 响应。多 round prompt 都重复 echo 同一密码,
@@ -993,5 +1089,84 @@ mod tests {
             handle.is_finished(),
             "reaper should have exited after the pool's inner Arc was dropped"
         );
+    }
+
+    // --- PKCS#1 传统 RSA 私钥 fallback (task 06-06-ssh-mcp-pkcs1-rsa-key) -------
+    //
+    // 下面这把私钥是 `ssh-keygen -t rsa -b 2048 -m PEM` 一次性生成的**测试专用
+    // 废弃密钥**,只用于验证 PKCS#1 PEM 能被 try_parse_pkcs1_rsa 解析,不对应任何
+    // 真实主机/账号,无任何安全意义。
+
+    const PKCS1_RSA_FIXTURE: &str = r#"-----BEGIN RSA PRIVATE KEY-----
+MIIEowIBAAKCAQEAlsXj/txeglED7/6iFd1ic1U6NygRpptNLQ5AxqEBHFgRLOxa
+v5oTe1JQCIz4AcUiBM1d8DCRhFgdrUCz8O/gc7R3d0CjlWmcrw9VTe/OsndWeexz
+WQWduN7dqBR53jNmVw1+638mc6hXq2wNvDpohVJVK7WkpyGIfTJ6Pu/RE0JIpLjj
+5UoYHGOtGApME3/xmznA77BLjACCDvOzBtnRJWdvMruzzFgvfZEOJJIEqbgXSrCd
+XBxBFo+QEggaHtSzvCE2f5ADAnlZya6EZrxkMykxqWbHrRPrlISw7kOqgx4636QQ
+trdwNr6qpWFTon9wMPMC3soJg0wNs3gVxXVuaQIDAQABAoIBAA2/wAR8DguY3bYN
++gk/u1GZzQmTQtYhmrkSxVTCVo/szAF/uuAhaci41ImNvrP9SRaNBRWj0tvxuSBq
+d75EnFWQzcV3LzOvLNWd8qvSbtPsJAZRn0yClu5xNwoJIU/iT2EoNDxqHOnhHmrd
+xfw14KrVEOU/1uL9di03OYScaUF13xFsvrRgdpjIKyJF7G/Tg7iSn0CrQ14mGmqJ
+1y+xYHGEezZjNAQNqYVpcyGXgNqWyNjdg0VOyunnR77GuyGgLzZMTMJGPTm7psnz
+o2ieLJOyZWO9H9EnjhwLkC+SfG6f1h6l65ZB/kS9lTwyZehQJZsN0aHUQeEYK45D
+GalV1X0CgYEAzbGacQ2FR7Pc0RM52pvRRFc3pI1LAyAiJCnDI80DKUW0dlZurr2D
+/jG3WY3FMlPImM5juzwosxgOwBvA3x6Enwz2ZFt9IXDkcykzSXKITp3OdK8Xjy+L
+gn2wdvAWHhzp859wwoekXc0oRTAXWsiW9bhSysWoroaTy2HRgwwSf58CgYEAu6W5
+FGY7oIHwOXP0uSDBs3HMkuXoUMVcUnk397GGk2rNzH0LkFzYqmsB56IRNgZG2IbZ
+3SKPx+9qrm7/SOv7Hbr/HJ8rTfj6U9xGoIGX2ruX8lS2pRhlcgB38t2bvFsrb8RN
+xIueELXerOOMnq4oBXp+EGPtEMuK1vf3tQRQNPcCgYAL8TzTRYKweAvhA6m/PH64
+5gtv/VgWlV4GFXqj8Ho3gjmJCVmhwZURRBeuFmIVmvGxlYIK0+JVC5eHpdTb32y5
+w0nm57zrHR/WY9T7da/eSKE8+xF2Gb+S0vNU5HmUQ/99SouEb9WmMIwfADzK44yI
+Naxw42r4vw2DqGk+n4vPZwKBgBLEuaVTsGUWeguVEIYvw5AKMtcCjeD+TISnQTTS
+Gc7G4PyyCSUQVE9/UnpzmFsZ954Sptnaah0qUjZOPdRyXfSUTo3zUaaD363hm2LU
+c3baSpFfbcFHlmX3rAerqLcHO2n7bXfaKx4qwrHyNI9uhew+WzuScxS59xIXTTxa
+yRbzAoGBALUQGCvKpui8rdcPsRAIjqxQ1/EPB2smWtvLwv23d0D9xjotpWdW5Ujk
+vm3b+9rtE2PW5jCNTR/JgxaWkAqC6j+fCIAunMUxYFqHMC+Q2aExzL+dDSxBe1Jb
+ipMBLNlhlJHNKVmgnpLBSiUoO5fDWn1KcwvQouOC3U3hSMAPnT+7
+-----END RSA PRIVATE KEY-----
+"#;
+
+    #[test]
+    fn try_parse_pkcs1_rsa_parses_plaintext_pkcs1() {
+        let key = try_parse_pkcs1_rsa(PKCS1_RSA_FIXTURE)
+            .expect("PKCS#1 RSA 应解析成功")
+            .expect("PKCS#1 标签应命中 Some 分支");
+        // 解析出的私钥算法应为 RSA(ssh-rsa)。
+        assert!(
+            key.algorithm().as_str().contains("rsa"),
+            "expected an RSA key, got algorithm {}",
+            key.algorithm().as_str()
+        );
+    }
+
+    #[test]
+    fn try_parse_pkcs1_rsa_returns_none_for_non_pkcs1_tag() {
+        // OpenSSH 格式标签 —— 本函数不处理,返回 None 让上层回退到 russh 原生错误。
+        let openssh = "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----\n";
+        assert!(matches!(try_parse_pkcs1_rsa(openssh), Ok(None)));
+        // PKCS#8 标签同理。
+        let pkcs8 = "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n";
+        assert!(matches!(try_parse_pkcs1_rsa(pkcs8), Ok(None)));
+    }
+
+    #[test]
+    fn try_parse_pkcs1_rsa_rejects_encrypted_pkcs1_with_guidance() {
+        let encrypted = "-----BEGIN RSA PRIVATE KEY-----\n\
+            Proc-Type: 4,ENCRYPTED\n\
+            DEK-Info: AES-128-CBC,0123456789ABCDEF0123456789ABCDEF\n\n\
+            QUJDRA==\n\
+            -----END RSA PRIVATE KEY-----\n";
+        let err = try_parse_pkcs1_rsa(encrypted).expect_err("加密 PKCS#1 应被拒绝");
+        assert!(
+            err.contains("passphrase"),
+            "错误信息应给 passphrase 指引,实际: {err}"
+        );
+    }
+
+    #[test]
+    fn try_parse_pkcs1_rsa_errors_on_corrupt_base64() {
+        // 命中 PKCS#1 标签但主体不是合法 base64/DER —— 返回 Err,不会 panic。
+        let bad = "-----BEGIN RSA PRIVATE KEY-----\n@@@not-base64@@@\n-----END RSA PRIVATE KEY-----\n";
+        assert!(try_parse_pkcs1_rsa(bad).is_err());
     }
 }
