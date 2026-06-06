@@ -518,3 +518,37 @@ feat/cc-connect-panel 分支文档收尾:README 顶部 slogan 加 '· IM 平台�
 ### Next Steps
 
 - None - task complete
+
+
+## Session 16: 修复 mt-ssh-mcp 无法用传统 PKCS#1 RSA 私钥连接 SSH
+
+**Date**: 2026-06-06
+**Task**: 修复 mt-ssh-mcp 无法用传统 PKCS#1 RSA 私钥连接 SSH
+**Branch**: `main`
+
+### Summary
+
+诊断 Oracle Cloud SSH 连接失败(系统 ssh 同 key 可登, mt-ssh-mcp 报 Unsupported key type RSA)。定位两个串联的坑: ① russh 底层 ssh-key 0.7 不认传统 PKCS#1 明文 RSA PEM; ② PrivateKeyWithHashAlg::new(key,None) 对 RSA 落到 SHA-1, 被现代 OpenSSH(>=8.8)拒。修复: pool.rs 加纯 Rust PKCS#1 PEM->DER fallback(load_private_key_compat/try_parse_pkcs1_rsa) + authenticate 按 server-sig-algs 选 rsa-sha2-512(is_rsa 门控); Cargo.toml 增 ssh-key(rsa feature)/rsa 依赖, 版本锁定与 russh 一致、无 aws-lc、rand_core 统一。验证: 临时 example 端到端实连 oracle-4c-24g 成功 + 全量 cargo test/clippy + debug/release 构建 + 双 agent high-effort review 修 3 项 quality。固化 spec russh-rsa-key-loading.md(含可执行契约)。生效需重启 mini-term。
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `6cda88d` | (see git log) |
+| `318e4f6` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
