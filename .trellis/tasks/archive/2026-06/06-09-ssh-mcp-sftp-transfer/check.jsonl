@@ -1,0 +1,5 @@
+{"file": ".trellis/spec/backend/index.md", "reason": "检查项:mt-core tauri-free 约定是否被破坏;stdio MCP stdout 铁律(SFTP 传输数据/库日志绝不能写本进程 stdout)"}
+{"file": ".trellis/spec/backend/rust-crypto-on-windows-msvc.md", "reason": "验收核查:加 russh-sftp 后 Cargo.lock 无 aws-lc、russh 仍单一 0.61.x、ssh-key/ssh-encoding/rsa 精确锁行未变"}
+{"file": ".trellis/spec/backend/rand-core-version-alignment.md", "reason": "若新增加密相关测试 fixture,避开 rng-based API 直接用底层类型构造,绕开 rand_core 多版本 CryptoRng trait 冲突"}
+{"file": ".trellis/tasks/06-09-ssh-mcp-sftp-transfer/research/russh-sftp-options.md", "reason": "对照研究里列出的风险点核查:大文件是否用流式(非整文件进内存)、传输是否全程持 session.lock、超时是否放宽、错误归类是否正确"}
+{"file": ".trellis/tasks/06-09-ssh-mcp-sftp-transfer/prd.md", "reason": "验收标准与护栏:字节一致、大文件不爆内存、config.json 护栏拦截、错误不泄密、纯逻辑有单测"}

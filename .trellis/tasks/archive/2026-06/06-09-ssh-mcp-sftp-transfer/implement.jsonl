@@ -1,0 +1,5 @@
+{"file": ".trellis/spec/backend/index.md", "reason": "后端总约定:mt-core 必须 tauri-free(SFTP 逻辑若进 mt-core 不能依赖 tauri);stdio MCP sidecar stdout 只能输出协议 JSON,日志走 eprintln!,子进程/库输出不得透传 stdout"}
+{"file": ".trellis/spec/backend/rust-crypto-on-windows-msvc.md", "reason": "新增 russh-sftp 依赖的硬约束:必须用 ring 后端、绝不能间接拉入 aws-lc/aws-lc-sys(Windows MSVC 无 NASM 会编译失败);加依赖后须验证 Cargo.lock 无 aws-lc"}
+{"file": ".trellis/spec/backend/tokio-session-pool-pattern.md", "reason": "SFTP 复用现有 SshPool 常驻会话池:在 acquire 到的 CachedSession 上 lock()+开 channel,沿用池的串行化/超时/evict-retry 语义,理解骨架避免破坏 reaper/shutdown"}
+{"file": ".trellis/tasks/06-09-ssh-mcp-sftp-transfer/research/russh-sftp-options.md", "reason": "实现方案权威依据:russh-sftp 2.3.0 接入流程(request_subsystem+into_stream+SftpSession)、最小上传/下载示例、open_with_flags 大文件流式分块写法、超时/错误归类注意点、依赖写法"}
+{"file": ".trellis/tasks/06-09-ssh-mcp-sftp-transfer/prd.md", "reason": "需求与技术决策:两个工具签名、本地路径不限制但保留 config.json 硬护栏、下载落盘不回传、流式分块、超时300s、审计日志、验收标准"}
