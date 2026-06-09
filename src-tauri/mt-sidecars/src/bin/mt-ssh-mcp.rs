@@ -27,13 +27,19 @@ use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 
-use mt_sidecars::pool::SshPool;
+use mt_sidecars::pool::{
+    run_sftp_download_on_session, run_sftp_upload_on_session, SshPool, SftpTransferError,
+};
 
 /// 输出封顶:stdout / stderr 各自最多保留约 100 KB,超出截断并标记。
 const OUTPUT_CAP_BYTES: usize = 100 * 1024;
 
 /// `ssh_exec` 的默认超时秒数。
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
+
+/// `ssh_upload` / `ssh_download` 的默认超时秒数。比 exec 宽松——文件传输天然更慢,
+/// 大文件需要更长窗口(task 06-09)。
+const DEFAULT_TRANSFER_TIMEOUT_SECS: u64 = 300;
 
 /// 审计日志文件名(与 `config.json` 同目录)。
 const AUDIT_LOG_FILE: &str = "ssh-mcp-audit.log";
@@ -277,6 +283,224 @@ fn append_audit_log(conn_name: &str, command: &str, exit: Option<i32>) {
     };
     let log_path = dir.join(AUDIT_LOG_FILE);
     let line = format_audit_line(&utc_timestamp(), conn_name, command, exit);
+    let write_result = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .and_then(|mut f| f.write_all(line.as_bytes()));
+    if let Err(e) = write_result {
+        eprintln!("[mt-ssh-mcp] audit: failed to write {AUDIT_LOG_FILE}: {e}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ssh_upload / ssh_download —— 安全护栏 + 入参 / 出参 / 审计
+// ---------------------------------------------------------------------------
+
+/// 安全硬护栏:判断一个本地路径是否是 mini-term 自身的 `config.json`。
+///
+/// `config.json` 是本工具自己的凭据库(含全部 SSH 连接的明文密码),agent 一句
+/// `ssh_upload` 即可外泄,等于 SSH MCP 自我拆穿。其它普通本地文件按 PRD Decision
+/// **不做沙箱限制**(仅审计),这是唯一一条硬拒绝。见 task 06-09 prd.md 的 Decision。
+///
+/// 规范化策略(文件可能不存在 → canonicalize 会失败,需兜底):
+/// 1. 拿到 `config_json_path()`;定位失败则放行(无从比对,不误伤普通文件)。
+/// 2. 优先用 `canonicalize` 把两边都规范成绝对真实路径再比(消解 `..` / 符号链接 /
+///    大小写等差异)。`local_path` 通常存在(上传)或其父目录存在(下载)。
+/// 3. 任一侧 canonicalize 失败:回退到「按 components 规范化 + 末段文件名」的保守比对
+///    —— 只要规范化后的绝对路径相等即判命中,避免因文件尚不存在而绕过护栏。
+///
+/// 抽成接受 `&str` 的纯函数便于单测(对真实 `config_json_path()` 做相对独立的可测设计:
+/// 用 `is_blocked_local_path_against` 注入 target,单测不依赖运行环境的 config 路径)。
+fn is_blocked_local_path(local_path: &str) -> bool {
+    let Some(target) = mt_core::config_json_path() else {
+        // 定位不到 config.json —— 无从比对,放行(不误伤普通文件)。
+        return false;
+    };
+    is_blocked_local_path_against(local_path, &target)
+}
+
+/// `is_blocked_local_path` 的可测核心:把 `local_path` 与给定 `target`(config.json
+/// 的预期路径)规范化后比较。抽出 `target` 入参,单测无需依赖运行环境的真实 config 路径。
+fn is_blocked_local_path_against(local_path: &str, target: &std::path::Path) -> bool {
+    use std::path::{Component, Path, PathBuf};
+
+    // 纯路径规范化(不碰文件系统):折叠 `.` 与 `..`,统一为可比较的形态。
+    // 不解析符号链接 —— 那需要文件存在;这里作为 canonicalize 失败时的保守兜底。
+    fn lexical_normalize(p: &Path) -> PathBuf {
+        let mut out = PathBuf::new();
+        for comp in p.components() {
+            match comp {
+                Component::ParentDir => {
+                    // 仅当上一段是普通目录名时才弹出,避免越过根。
+                    if matches!(
+                        out.components().next_back(),
+                        Some(Component::Normal(_))
+                    ) {
+                        out.pop();
+                    } else {
+                        out.push(comp.as_os_str());
+                    }
+                }
+                Component::CurDir => {}
+                other => out.push(other.as_os_str()),
+            }
+        }
+        out
+    }
+
+    let local = Path::new(local_path);
+
+    // 优先 canonicalize 两边(消解符号链接/大小写/相对路径)。
+    let canon_local = std::fs::canonicalize(local).ok();
+    let canon_target = std::fs::canonicalize(target).ok();
+    if let (Some(a), Some(b)) = (&canon_local, &canon_target) {
+        return a == b;
+    }
+
+    // 任一侧 canonicalize 失败(文件不存在等)→ 退到 lexical 规范化比对。
+    // Windows 路径大小写不敏感,统一小写后比;其它平台大小写敏感,原样比。
+    let norm_local = lexical_normalize(local);
+    let norm_target = lexical_normalize(target);
+    #[cfg(target_os = "windows")]
+    {
+        let a = norm_local.to_string_lossy().to_lowercase().replace('/', "\\");
+        let b = norm_target.to_string_lossy().to_lowercase().replace('/', "\\");
+        a == b
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        norm_local == norm_target
+    }
+}
+
+/// 文件传输方向。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransferDirection {
+    Upload,
+    Download,
+}
+
+impl TransferDirection {
+    fn as_str(self) -> &'static str {
+        match self {
+            TransferDirection::Upload => "upload",
+            TransferDirection::Download => "download",
+        }
+    }
+}
+
+/// `ssh_upload` 工具的入参。
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SshUploadArgs {
+    /// 目标连接:已保存 SSH 连接的 name(也接受 id)。
+    #[schemars(description = "Name of a saved SSH connection (its id is also accepted).")]
+    connection: String,
+    /// 本地源文件路径(在运行 mini-term 的这台机器上)。
+    #[schemars(
+        description = "Path to the LOCAL source file (on the machine running mini-term) to upload."
+    )]
+    local_path: String,
+    /// 远程目标文件路径(在 SSH 服务器上)。
+    #[schemars(
+        description = "Destination file path on the REMOTE host where the file will be written."
+    )]
+    remote_path: String,
+    /// 可选:超时秒数。缺省 300。
+    #[schemars(description = "Optional timeout in seconds for the transfer. Defaults to 300.")]
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+}
+
+/// `ssh_download` 工具的入参。
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SshDownloadArgs {
+    /// 目标连接:已保存 SSH 连接的 name(也接受 id)。
+    #[schemars(description = "Name of a saved SSH connection (its id is also accepted).")]
+    connection: String,
+    /// 远程源文件路径(在 SSH 服务器上)。
+    #[schemars(description = "Path to the REMOTE source file (on the SSH host) to download.")]
+    remote_path: String,
+    /// 本地目标文件路径(在运行 mini-term 的这台机器上,文件落盘到此处)。
+    #[schemars(
+        description = "Destination file path on the LOCAL machine (running mini-term) where the file is saved to disk."
+    )]
+    local_path: String,
+    /// 可选:超时秒数。缺省 300。
+    #[schemars(description = "Optional timeout in seconds for the transfer. Defaults to 300.")]
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+}
+
+/// `ssh_upload` / `ssh_download` 的执行结果,序列化为工具返回的 JSON。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SshTransferResult {
+    /// 传输方向:`upload` 或 `download`。
+    direction: String,
+    /// 实际传输的字节数。
+    bytes: u64,
+    /// 远程文件路径。
+    remote_path: String,
+    /// 本地文件路径。
+    local_path: String,
+    /// 是否成功(始终 true —— 失败走 McpError 而非此结构)。
+    success: bool,
+}
+
+/// 格式化一行传输审计日志。抽出便于单测。
+///
+/// 形如:`2026-06-09T12:34:56Z\tdir=upload\tconn=prod\tlocal=/a/b\tremote=/c/d\tresult=1234`
+/// 路径里的换行/制表替换成空格,保证一次传输就是一行。`result` 成功时为字节数,失败为 `error`。
+fn format_transfer_audit_line(
+    timestamp: &str,
+    direction: TransferDirection,
+    conn_name: &str,
+    local_path: &str,
+    remote_path: &str,
+    result: Option<u64>,
+) -> String {
+    let sanitize = |s: &str| s.replace(['\n', '\r', '\t'], " ");
+    let result_str = match result {
+        Some(bytes) => bytes.to_string(),
+        None => "error".to_string(),
+    };
+    format!(
+        "{timestamp}\tdir={}\tconn={}\tlocal={}\tremote={}\tresult={result_str}\n",
+        direction.as_str(),
+        sanitize(conn_name),
+        sanitize(local_path),
+        sanitize(remote_path),
+    )
+}
+
+/// 把一行传输审计日志追加到 `{config.json 所在目录}/ssh-mcp-audit.log`。
+///
+/// 写日志失败绝不影响工具结果 —— 只往 stderr 记一笔。`result = Some(bytes)` 成功、`None` 失败。
+fn append_transfer_audit_log(
+    direction: TransferDirection,
+    conn_name: &str,
+    local_path: &str,
+    remote_path: &str,
+    result: Option<u64>,
+) {
+    let Some(cfg_path) = mt_core::config_json_path() else {
+        eprintln!("[mt-ssh-mcp] audit: cannot locate config.json dir, skipping audit log");
+        return;
+    };
+    let Some(dir) = cfg_path.parent() else {
+        eprintln!("[mt-ssh-mcp] audit: config.json has no parent dir, skipping audit log");
+        return;
+    };
+    let log_path = dir.join(AUDIT_LOG_FILE);
+    let line = format_transfer_audit_line(
+        &utc_timestamp(),
+        direction,
+        conn_name,
+        local_path,
+        remote_path,
+        result,
+    );
     let write_result = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -558,6 +782,260 @@ impl SshMcp {
             McpError::internal_error(format!("failed to serialize ssh_exec result: {e}"), None)
         })?;
         Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+
+    /// 通过已保存的 SSH 连接,把**本地**文件上传到**远程**主机(SFTP)。
+    #[tool(
+        description = "Upload a LOCAL file to a REMOTE host over SFTP, using a saved SSH connection. \
+        Provide the connection's name (or id), local_path (source file on the machine running mini-term) \
+        and remote_path (destination on the SSH host). Streams the file in chunks (constant memory, \
+        handles large files). Optionally set timeout_secs (default 300). Returns the byte count. \
+        Use this instead of base64-echoing files through ssh_exec. \
+        Only connections this project is associated with can be used."
+    )]
+    async fn ssh_upload(
+        &self,
+        Parameters(args): Parameters<SshUploadArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let SshUploadArgs {
+            connection,
+            local_path,
+            remote_path,
+            timeout_secs,
+        } = args;
+        self.run_transfer(
+            TransferDirection::Upload,
+            &connection,
+            &local_path,
+            &remote_path,
+            timeout_secs,
+        )
+        .await
+    }
+
+    /// 通过已保存的 SSH 连接,把**远程**文件下载并落盘到**本地**路径(SFTP)。
+    #[tool(
+        description = "Download a REMOTE file to the LOCAL machine over SFTP, using a saved SSH connection. \
+        Provide the connection's name (or id), remote_path (source file on the SSH host) and \
+        local_path (destination on the machine running mini-term; the file is written to disk there). \
+        The content is NOT returned in the response — read the saved local file afterwards if you need it. \
+        Streams the file in chunks (constant memory, handles large files). Optionally set timeout_secs \
+        (default 300). Returns the byte count. \
+        Only connections this project is associated with can be used."
+    )]
+    async fn ssh_download(
+        &self,
+        Parameters(args): Parameters<SshDownloadArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let SshDownloadArgs {
+            connection,
+            remote_path,
+            local_path,
+            timeout_secs,
+        } = args;
+        self.run_transfer(
+            TransferDirection::Download,
+            &connection,
+            &local_path,
+            &remote_path,
+            timeout_secs,
+        )
+        .await
+    }
+
+    /// `ssh_upload` / `ssh_download` 的共享编排:护栏 → 查连接 → acquire → 超时 +
+    /// transport 错的 evict+单次 retry → 审计 → 结构化返回。逻辑与 `ssh_exec` 同构。
+    async fn run_transfer(
+        &self,
+        direction: TransferDirection,
+        connection: &str,
+        local_path: &str,
+        remote_path: &str,
+        timeout_secs: Option<u64>,
+    ) -> Result<CallToolResult, McpError> {
+        // 0. 安全硬护栏:绝不传输 mini-term 自身的 config.json(含全部明文密码)。
+        //    upload 与 download 都拦 —— 上传外泄、下载覆盖凭据库均不可接受。
+        if is_blocked_local_path(local_path) {
+            return Err(McpError::invalid_params(
+                "refusing to transfer mini-term's own config.json: it contains all saved SSH \
+                credentials and must never be uploaded or overwritten via this tool."
+                    .to_string(),
+                None,
+            ));
+        }
+
+        // 1. 查连接(列表已按本项目关联范围过滤,越权连接天然「未找到」)。错误不含密码。
+        let conn = find_connection(
+            &mt_core::read_ssh_connections_for_project(self.project_id.as_deref()),
+            connection,
+        )
+        .map_err(|e| McpError::invalid_params(e, None))?;
+
+        let timeout = Duration::from_secs(
+            timeout_secs.unwrap_or(DEFAULT_TRANSFER_TIMEOUT_SECS).max(1),
+        );
+        let conn_name_for_audit = conn.name.clone();
+        let conn_id = conn.id.clone();
+
+        // 2. 走池:lazy 建/复用 session。auth/transport 错直接返(不进 retry)。
+        let session = self
+            .pool
+            .acquire(&conn)
+            .await
+            .map_err(|e| McpError::internal_error(e, None))?;
+        if session.is_unhealthy_now() {
+            return Err(McpError::internal_error(
+                "session is in cooldown after a previous auth failure; retry shortly",
+                None,
+            ));
+        }
+
+        // 3. 跑传输,整段套 tokio::time::timeout。第一次 transport 错 → evict + 重连 → 再试一次。
+        let first = tokio::time::timeout(
+            timeout,
+            run_one_transfer(direction, &session, local_path, remote_path, timeout),
+        )
+        .await;
+
+        let bytes = match first {
+            Ok(Ok(n)) => {
+                session.touch();
+                n
+            }
+            Ok(Err(e)) if e.is_transport() => {
+                // transport-level:可能死链 race,evict + 重建再试一次。
+                eprintln!(
+                    "[mt-ssh-mcp] sftp {} on cached session failed (transport), retrying: {e}",
+                    direction.as_str()
+                );
+                self.pool.evict(&conn_id).await;
+                let session2 = self.pool.acquire(&conn).await.map_err(|e| {
+                    McpError::internal_error(format!("reconnect failed: {e}"), None)
+                })?;
+                if session2.is_unhealthy_now() {
+                    return Err(McpError::internal_error(
+                        "session is in cooldown after a previous auth failure; retry shortly",
+                        None,
+                    ));
+                }
+                match tokio::time::timeout(
+                    timeout,
+                    run_one_transfer(direction, &session2, local_path, remote_path, timeout),
+                )
+                .await
+                {
+                    Ok(Ok(n)) => {
+                        session2.touch();
+                        n
+                    }
+                    Ok(Err(second_err)) => {
+                        if second_err.is_transport() {
+                            session2.mark_unhealthy(Duration::from_secs(30));
+                        }
+                        append_transfer_audit_log(
+                            direction,
+                            &conn_name_for_audit,
+                            local_path,
+                            remote_path,
+                            None,
+                        );
+                        return Err(McpError::internal_error(
+                            format!("ssh {} failed after retry: {second_err}", direction.as_str()),
+                            None,
+                        ));
+                    }
+                    Err(_) => {
+                        append_transfer_audit_log(
+                            direction,
+                            &conn_name_for_audit,
+                            local_path,
+                            remote_path,
+                            None,
+                        );
+                        return Err(McpError::internal_error(
+                            format!(
+                                "ssh {} timed out after {}s on retry",
+                                direction.as_str(),
+                                timeout.as_secs()
+                            ),
+                            None,
+                        ));
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                // SFTP 业务错(路径不存在/无权限/本地 IO):不 evict、不 retry,直接返 agent。
+                append_transfer_audit_log(
+                    direction,
+                    &conn_name_for_audit,
+                    local_path,
+                    remote_path,
+                    None,
+                );
+                return Err(McpError::invalid_params(
+                    format!("ssh {} failed: {e}", direction.as_str()),
+                    None,
+                ));
+            }
+            Err(_) => {
+                // 超时(第一次)。
+                append_transfer_audit_log(
+                    direction,
+                    &conn_name_for_audit,
+                    local_path,
+                    remote_path,
+                    None,
+                );
+                return Err(McpError::internal_error(
+                    format!(
+                        "ssh {} timed out after {}s",
+                        direction.as_str(),
+                        timeout.as_secs()
+                    ),
+                    None,
+                ));
+            }
+        };
+
+        // 4. 审计:成功记字节数。
+        append_transfer_audit_log(
+            direction,
+            &conn_name_for_audit,
+            local_path,
+            remote_path,
+            Some(bytes),
+        );
+
+        let result = SshTransferResult {
+            direction: direction.as_str().to_string(),
+            bytes,
+            remote_path: remote_path.to_string(),
+            local_path: local_path.to_string(),
+            success: true,
+        };
+        let json = serde_json::to_string(&result).map_err(|e| {
+            McpError::internal_error(format!("failed to serialize transfer result: {e}"), None)
+        })?;
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
+}
+
+/// 根据方向在一条 session 上跑一次 SFTP 传输。把 upload/download 两个 pool 函数
+/// 统一成同一签名,供 `run_transfer` 的重试编排复用。
+async fn run_one_transfer(
+    direction: TransferDirection,
+    session: &mt_sidecars::pool::CachedSession,
+    local_path: &str,
+    remote_path: &str,
+    timeout: Duration,
+) -> Result<u64, SftpTransferError> {
+    match direction {
+        TransferDirection::Upload => {
+            run_sftp_upload_on_session(session, local_path, remote_path, timeout).await
+        }
+        TransferDirection::Download => {
+            run_sftp_download_on_session(session, remote_path, local_path, timeout).await
+        }
     }
 }
 
@@ -879,5 +1357,205 @@ mod tests {
         let r = finalize_outcome(outcome, true);
         assert!(r.timed_out);
         assert_eq!(r.exit_code, None);
+    }
+
+    // --- ssh_upload / ssh_download: 安全护栏 is_blocked_local_path ---------
+
+    #[test]
+    fn is_blocked_local_path_blocks_exact_config_json() {
+        // 用一个真实存在的临时文件当 config.json target,canonicalize 两边都成功,
+        // 同一路径必须命中护栏。
+        let dir = std::env::temp_dir().join(format!(
+            "mt-ssh-mcp-guard-{}-{}",
+            std::process::id(),
+            "exact"
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("config.json");
+        std::fs::write(&target, b"{}").unwrap();
+
+        assert!(is_blocked_local_path_against(
+            target.to_str().unwrap(),
+            &target
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_blocked_local_path_allows_other_file_in_same_dir() {
+        let dir = std::env::temp_dir().join(format!(
+            "mt-ssh-mcp-guard-{}-{}",
+            std::process::id(),
+            "other"
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("config.json");
+        std::fs::write(&target, b"{}").unwrap();
+        let other = dir.join("notes.txt");
+        std::fs::write(&other, b"hi").unwrap();
+
+        assert!(!is_blocked_local_path_against(
+            other.to_str().unwrap(),
+            &target
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_blocked_local_path_blocks_via_dotdot_when_nonexistent() {
+        // local_path 含 `..` 且文件不存在 → canonicalize 失败,走 lexical 兜底,
+        // 规范化后等于 target 仍应命中(防止用 `..` 绕过护栏)。
+        let dir = std::env::temp_dir().join("mt-ssh-mcp-guard-dotdot");
+        let target = dir.join("config.json");
+        let sneaky = dir
+            .join("sub")
+            .join("..")
+            .join("config.json");
+        assert!(is_blocked_local_path_against(
+            sneaky.to_str().unwrap(),
+            &target
+        ));
+    }
+
+    #[test]
+    fn is_blocked_local_path_allows_unrelated_nonexistent_path() {
+        let dir = std::env::temp_dir().join("mt-ssh-mcp-guard-unrelated");
+        let target = dir.join("config.json");
+        let unrelated = dir.join("data").join("payload.bin");
+        assert!(!is_blocked_local_path_against(
+            unrelated.to_str().unwrap(),
+            &target
+        ));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn is_blocked_local_path_windows_case_insensitive_nonexistent() {
+        // Windows 路径大小写不敏感:CONFIG.JSON 仍应命中 config.json(走 lexical 兜底)。
+        let dir = std::path::PathBuf::from(r"C:\nonexistent-dir-mt-test");
+        let target = dir.join("config.json");
+        let upper = dir.join("CONFIG.JSON");
+        assert!(is_blocked_local_path_against(
+            upper.to_str().unwrap(),
+            &target
+        ));
+    }
+
+    // --- format_transfer_audit_line ---------------------------------------
+
+    #[test]
+    fn format_transfer_audit_line_upload_basic() {
+        let line = format_transfer_audit_line(
+            "2026-06-09T12:00:00Z",
+            TransferDirection::Upload,
+            "prod",
+            "/local/a.bin",
+            "/remote/b.bin",
+            Some(1234),
+        );
+        assert!(line.starts_with("2026-06-09T12:00:00Z\t"));
+        assert!(line.contains("dir=upload"));
+        assert!(line.contains("conn=prod"));
+        assert!(line.contains("local=/local/a.bin"));
+        assert!(line.contains("remote=/remote/b.bin"));
+        assert!(line.contains("result=1234"));
+        assert!(line.ends_with('\n'));
+    }
+
+    #[test]
+    fn format_transfer_audit_line_download_error_result() {
+        let line = format_transfer_audit_line(
+            "t",
+            TransferDirection::Download,
+            "c",
+            "/l",
+            "/r",
+            None,
+        );
+        assert!(line.contains("dir=download"));
+        assert!(line.contains("result=error"));
+    }
+
+    #[test]
+    fn format_transfer_audit_line_sanitizes_newlines_and_tabs_to_one_line() {
+        // 路径里的换行/制表被替成空格 —— 一次传输只占一行。
+        let line = format_transfer_audit_line(
+            "t",
+            TransferDirection::Upload,
+            "weird\nconn",
+            "/a\tb\nc",
+            "/r\rd",
+            Some(0),
+        );
+        assert_eq!(line.matches('\n').count(), 1);
+        assert!(line.ends_with('\n'));
+    }
+
+    // --- SftpTransferError: 分类 + 错误不含密码 ----------------------------
+
+    #[test]
+    fn sftp_transfer_error_classification() {
+        assert!(SftpTransferError::Transport("x".into()).is_transport());
+        assert!(!SftpTransferError::Sftp("x".into()).is_transport());
+    }
+
+    #[test]
+    fn sftp_transfer_error_message_never_contains_password() {
+        // 安全:错误文本只透传库错误(不携带凭据)。模拟一个含路径的业务错,
+        // 验证它绝不会回带连接密码(密码从不进入这些错误的构造)。
+        let err = SftpTransferError::Sftp("sftp open '/etc/shadow' failed: permission denied".into());
+        let msg = err.to_string();
+        assert!(!msg.to_lowercase().contains("password"));
+        assert!(msg.contains("permission denied"));
+    }
+
+    // --- SshTransferResult 序列化(camelCase) -----------------------------
+
+    #[test]
+    fn ssh_transfer_result_serializes_camel_case() {
+        let r = SshTransferResult {
+            direction: "upload".into(),
+            bytes: 42,
+            remote_path: "/r".into(),
+            local_path: "/l".into(),
+            success: true,
+        };
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("\"direction\":\"upload\""));
+        assert!(json.contains("\"bytes\":42"));
+        assert!(json.contains("\"remotePath\":\"/r\""));
+        assert!(json.contains("\"localPath\":\"/l\""));
+        assert!(json.contains("\"success\":true"));
+    }
+
+    // --- 入参解析(serde Deserialize + camelCase via #[serde] default) -----
+
+    #[test]
+    fn ssh_upload_args_parse_with_and_without_timeout() {
+        // rmcp 用 JsonSchema 的字段名(snake_case 字段),JSON 入参用同名键。
+        let with: SshUploadArgs = serde_json::from_str(
+            r#"{"connection":"prod","local_path":"/a","remote_path":"/b","timeout_secs":120}"#,
+        )
+        .unwrap();
+        assert_eq!(with.connection, "prod");
+        assert_eq!(with.local_path, "/a");
+        assert_eq!(with.remote_path, "/b");
+        assert_eq!(with.timeout_secs, Some(120));
+
+        let without: SshUploadArgs =
+            serde_json::from_str(r#"{"connection":"p","local_path":"/a","remote_path":"/b"}"#)
+                .unwrap();
+        assert_eq!(without.timeout_secs, None);
+    }
+
+    #[test]
+    fn ssh_download_args_parse() {
+        let a: SshDownloadArgs = serde_json::from_str(
+            r#"{"connection":"prod","remote_path":"/r","local_path":"/l"}"#,
+        )
+        .unwrap();
+        assert_eq!(a.remote_path, "/r");
+        assert_eq!(a.local_path, "/l");
+        assert_eq!(a.timeout_secs, None);
     }
 }
