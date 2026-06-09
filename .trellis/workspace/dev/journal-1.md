@@ -552,3 +552,37 @@ feat/cc-connect-panel 分支文档收尾:README 顶部 slogan 加 '· IM 平台�
 ### Next Steps
 
 - None - task complete
+
+
+## Session 17: mt-ssh-mcp SFTP 文件上传/下载
+
+**Date**: 2026-06-09
+**Task**: mt-ssh-mcp SFTP 文件上传/下载
+**Branch**: `feat/ssh-mcp-sftp-transfer`
+
+### Summary
+
+为 mt-ssh-mcp 接入 russh-sftp 2.3.0,新增 ssh_upload/ssh_download 两个 MCP 工具:大文件流式分块、config.json 明文密码外泄硬护栏、协议层 set_timeout 10s 逐请求超时修复;复核依赖零 aws-lc 不破坏精确锁。固化 russh-sftp-file-transfer.md 后端 spec(7 段契约),README 中英双版更新。全程走 trellis 流程:brainstorm→research(russh-sftp 兼容性)→implement→check(审出并修复协议层超时缺陷)→spec→commit。66 单测全绿,clippy 零警告。
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `43cf5e6` | (see git log) |
+| `05d182d` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 16
-- **Last Active**: 2026-06-06
+- **Total Sessions**: 17
+- **Last Active**: 2026-06-09
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~554 | Active |
+| `journal-1.md` | ~588 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 17 | 2026-06-09 | mt-ssh-mcp SFTP 文件上传/下载 | `43cf5e6`, `05d182d` | `feat/ssh-mcp-sftp-transfer` |
 | 16 | 2026-06-06 | 修复 mt-ssh-mcp 无法用传统 PKCS#1 RSA 私钥连接 SSH | `6cda88d`, `318e4f6` | `main` |
 | 15 | 2026-06-01 | 全项目深度 review + 修复 search 崩溃/clipboard 越界/配置原子写/资源泄漏 | `f1d187e`, `1fcf1bc`, `d210ce7`, `b28c4dd`, `571782d` | `main` |
 | 14 | 2026-06-01 | 归档全应用中英双语 (i18n) 任务 | `59926aa`, `591c598` | `main` |
