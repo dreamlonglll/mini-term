@@ -160,6 +160,21 @@ export function App() {
     };
   }, []);
 
+  // 防御输入法候选框把布局「顶开」(issue #34):WebView2 在 IME composition 时会把获得
+  // 焦点的 xterm helper-textarea 滚进可视区,给某个 overflow:hidden 的布局祖先(Allotment
+  // pane / 主内容区 / #root/body)设了非 0 的 scrollLeft,整页内容被横向推走、右侧露出桌面。
+  // 这类布局容器本就不该横向滚动,监听到偏移即复位;合法横向滚动容器是 overflow-x:auto/scroll
+  // (代码块、tab 栏、modal),scrollLeft 短路或 overflowX 非 hidden 而被放过,不受影响。
+  useEffect(() => {
+    const onScroll = (e: Event) => {
+      const node = e.target instanceof HTMLElement ? e.target : document.scrollingElement;
+      if (!(node instanceof HTMLElement) || node.scrollLeft === 0) return;
+      if (getComputedStyle(node).overflowX === 'hidden') node.scrollLeft = 0;
+    };
+    window.addEventListener('scroll', onScroll, true);
+    return () => window.removeEventListener('scroll', onScroll, true);
+  }, []);
+
   // Ctrl+Shift+F 打开/关闭搜索弹窗
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
