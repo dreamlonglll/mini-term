@@ -12,6 +12,7 @@ import { Terminal, type IMarker, type IDecoration } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebglAddon } from '@xterm/addon-webgl';
 import { LigaturesAddon } from '@xterm/addon-ligatures';
+import { activateUnicodeWidth } from './terminalUnicodeWidth';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { readText, readImage, writeText } from '@tauri-apps/plugin-clipboard-manager';
@@ -291,6 +292,11 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
 
   const fitAddon = new FitAddon();
   term.loadAddon(fitAddon);
+
+  // 切换到带 VS16 修正的 Unicode 11 宽度表:默认 v6 把 ✅❌⚠️ 等 emoji 判为窄字符(width 1),
+  // 与生成 box-drawing 表格的 CLI/AI 工具(按 emoji = 2 格对齐)口径不一致导致竖线列错位。
+  // 详见 terminalUnicodeWidth.ts。宽度表属 buffer 层,与 WebGL/Ligatures 渲染正交。
+  activateUnicodeWidth(term);
 
   // 拦截 CSI 3J (ED3 - Erase Saved Lines)：保留 scrollback 缓冲区。
   // codex/claude 等 TUI 应用在主缓冲区周期性发送此序列清空滚动历史，
