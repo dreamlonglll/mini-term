@@ -25,19 +25,19 @@ function initialChecked(project: ProjectConfig, allIds: string[]): Set<string> {
   return new Set(allIds);
 }
 
-/** 两个范围（undefined = 全部连接）是否等价。 */
-function sameScope(a: string[] | undefined, b: string[] | undefined): boolean {
-  if (a === undefined || b === undefined) return a === b;
-  if (a.length !== b.length) return false;
+/** 两个范围是否等价。`undefined` 视为 allIds（兼容旧配置）。 */
+function sameScope(a: string[] | undefined, b: string[], allIds: string[]): boolean {
+  const effectiveA = a ?? allIds;
+  if (effectiveA.length !== b.length) return false;
   const sb = new Set(b);
-  return a.every((id) => sb.has(id));
+  return effectiveA.every((id) => sb.has(id));
 }
 
 /**
  * 「关联 SSH」弹窗：按项目设定 agent 可访问的 SSH 连接范围。
  *
  * 勾选 ≥1 个连接 = 为该项目启用 SSH MCP 并限定范围；全部取消 = 停用。
- * 全选时范围存为 undefined（含将来新增的连接），子集则存显式 id 列表。
+ * 范围始终存为显式 id 列表，新增连接不会被自动纳入已有项目。
  */
 export function SshAssocModal({ project, onClose }: Props) {
   const t = useT();
@@ -66,12 +66,11 @@ export function SshAssocModal({ project, onClose }: Props) {
     if (!project) return;
     const wasEnabled = !!project.sshMcpEnabled;
     const nowEnabled = checked.size > 0;
-    // 全选 → 存 undefined（含将来新增连接）；子集 → 存显式 id 列表
-    const scope =
-      checked.size === allIds.length ? undefined : allIds.filter((id) => checked.has(id));
+    // 始终存显式 id 列表，不用 undefined 表示"全选"
+    const scope = allIds.filter((id) => checked.has(id));
 
     // 无任何变化 → 直接关闭，不写盘、不弹提示
-    if (wasEnabled === nowEnabled && (!nowEnabled || sameScope(project.sshConnectionIds, scope))) {
+    if (wasEnabled === nowEnabled && (!nowEnabled || sameScope(project.sshConnectionIds, scope, allIds))) {
       onClose();
       return;
     }
@@ -100,7 +99,7 @@ export function SshAssocModal({ project, onClose }: Props) {
       onClose();
 
       const scopeDesc =
-        scope === undefined
+        scope.length === allIds.length
           ? tStatic('sshAssoc.scopeAll', { count: allIds.length })
           : tStatic('sshAssoc.scopeSubset', { count: scope.length });
       if (nowEnabled && !wasEnabled) {

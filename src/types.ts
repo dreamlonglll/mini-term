@@ -129,7 +129,7 @@ export interface ProjectConfig {
   expandedDirs?: string[];
   /** 是否已为该项目启用 SSH MCP（向项目目录写入了 Claude / Codex 的 MCP 注册配置） */
   sshMcpEnabled?: boolean;
-  /** 该项目的 agent 可访问的 SSH 连接 id 列表（「关联 SSH」设定的范围）；undefined = 全部 */
+  /** 该项目的 agent 可访问的 SSH 连接 id 列表（「关联 SSH」设定的范围）；undefined = 旧配置兼容,视为全部 */
   sshConnectionIds?: string[];
   /** 项目级环境变量,新建终端时注入到 PTY 子进程。已开终端不受影响。 */
   envVars?: ProjectEnvVar[];
