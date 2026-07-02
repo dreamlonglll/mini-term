@@ -1,0 +1,10 @@
+{"file": ".trellis/spec/backend/index.md", "reason": "后端 spec 入口：Rust/Tauri 开发前检查清单与质量要求"}
+{"file": ".trellis/spec/backend/tauri-command-nested-args.md", "reason": "新增 Tauri command（list_wsl_distros / get_wsl_ai_sessions）的参数命名与嵌套约定"}
+{"file": ".trellis/spec/backend/windows-unc-verbatim-prefix-strip.md", "reason": "读 \\\\wsl$ UNC 路径时 verbatim 前缀（\\\\?\\UNC\\）处理的既有契约"}
+{"file": ".trellis/spec/backend/wsl-exe-cd-path-semantics.md", "reason": "WSL 路径语义与 parse_unc 的既有约定，路径映射实现必须一致"}
+{"file": ".trellis/spec/frontend/index.md", "reason": "前端 spec 入口：开发前检查清单"}
+{"file": ".trellis/spec/frontend/component-guidelines.md", "reason": "SessionList/ProjectList 改动需遵循组件规范"}
+{"file": ".trellis/spec/frontend/state-management.md", "reason": "zustand store 使用规范（wslSessionsDistro 配置写入与 save_config）"}
+{"file": ".trellis/spec/frontend/type-safety.md", "reason": "types.ts 与 Rust serde camelCase 对齐的类型规范"}
+{"file": "CONTEXT.md", "reason": "领域术语表：会话来源 / WSL 会话 / WSL 根项目 / WSL 关联项目，代码命名与注释须与术语一致"}
+{"file": ".trellis/tasks/07-02-wsl-ai-sessions/research/wsl-session-sources.md", "reason": "本任务研究：现有代码结构、WSL 注册表枚举、9P 性能、路径映射规则"}

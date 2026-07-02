@@ -1,0 +1,5 @@
+{"file": ".trellis/spec/backend/index.md", "reason": "后端质量检查清单"}
+{"file": ".trellis/spec/frontend/index.md", "reason": "前端质量检查清单"}
+{"file": ".trellis/spec/frontend/quality-guidelines.md", "reason": "前端质量规范（i18n 双语、错误处理、性能）"}
+{"file": ".trellis/spec/frontend/type-safety.md", "reason": "校验 TS 类型与 Rust serde 结构对齐"}
+{"file": ".trellis/tasks/07-02-wsl-ai-sessions/research/wsl-session-sources.md", "reason": "对照研究结论核查实现：扫描上限、缓存 key、静默降级、lowercase 匹配"}
