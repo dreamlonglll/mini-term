@@ -1,10 +1,11 @@
-import { useEffect, useState, useCallback, useRef } from 'react';
+import { useEffect, useState, useCallback, useRef, useMemo } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '../store';
 import { showContextMenu } from '../utils/contextMenu';
+import { isWslPath } from '../utils/wslPath';
 import { SessionViewerModal } from './SessionViewerModal';
 import { useT, t } from '../i18n';
-import type { AiSession } from '../types';
+import type { AiSession, ProjectConfig } from '../types';
 
 const PAGE_SIZE = 20;
 
@@ -40,40 +41,99 @@ const TYPE_BADGE: Record<string, { label: string; color: string }> = {
   codex: { label: 'X', color: 'var(--color-success)' },
 };
 
+/** 项目是否有 WSL 会话来源:WSL 根项目(UNC)自动启用,或显式配置了发行版 */
+function hasWslSource(project: ProjectConfig): boolean {
+  return isWslPath(project.path) || !!project.wslSessionsDistro;
+}
+
 export function SessionList() {
   const t = useT();
   const config = useAppStore((s) => s.config);
   const activeProjectId = useAppStore((s) => s.activeProjectId);
 
-  const [allSessions, setAllSessions] = useState<AiSession[]>([]);
+  // Windows 宿主与 WSL 两个来源各自持有 state,渲染时合并排序(分段加载:宿主先出)
+  const [hostSessions, setHostSessions] = useState<AiSession[]>([]);
+  const [wslSessions, setWslSessions] = useState<AiSession[]>([]);
   const [displayCount, setDisplayCount] = useState(PAGE_SIZE);
   const [loading, setLoading] = useState(false);
+  const [wslLoading, setWslLoading] = useState(false);
   const [viewingSession, setViewingSession] = useState<AiSession | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  // 请求序号:项目切换后旧请求(尤其是慢的 WSL 请求)返回时不得覆盖新项目的列表
+  const requestIdRef = useRef(0);
 
   const activeProject = config.projects.find((p) => p.id === activeProjectId);
 
-  const fetchSessions = useCallback(async (projectPath: string) => {
+  // 有意不用 async/await:两个 invoke 并行发出,各自 then 落各自 state(分段加载)
+  const fetchSessions = useCallback((project: ProjectConfig, force: boolean) => {
+    const reqId = ++requestIdRef.current;
+
+    // Windows 宿主来源:照旧秒出先显示
     setLoading(true);
-    try {
-      const result = await invoke<AiSession[]>('get_ai_sessions', { projectPath });
-      setAllSessions(result);
-      setDisplayCount(PAGE_SIZE);
-    } catch {
-      setAllSessions([]);
-    } finally {
-      setLoading(false);
+    invoke<AiSession[]>('get_ai_sessions', { projectPath: project.path })
+      .then((result) => {
+        if (requestIdRef.current !== reqId) return;
+        setHostSessions(result);
+        setDisplayCount(PAGE_SIZE);
+      })
+      .catch(() => {
+        if (requestIdRef.current !== reqId) return;
+        setHostSessions([]);
+      })
+      .finally(() => {
+        if (requestIdRef.current !== reqId) return;
+        setLoading(false);
+      });
+
+    // WSL 来源:并行请求,到达后合并(9P + 可能的 VM 冷启动,秒级,不阻塞宿主显示)
+    if (hasWslSource(project)) {
+      setWslLoading(true);
+      invoke<AiSession[]>('get_wsl_ai_sessions', {
+        projectPath: project.path,
+        distro: project.wslSessionsDistro,
+        force,
+      })
+        .then((result) => {
+          if (requestIdRef.current !== reqId) return;
+          setWslSessions(result);
+        })
+        .catch(() => {
+          if (requestIdRef.current !== reqId) return;
+          setWslSessions([]);
+        })
+        .finally(() => {
+          if (requestIdRef.current !== reqId) return;
+          setWslLoading(false);
+        });
+    } else {
+      setWslSessions([]);
+      setWslLoading(false);
     }
   }, []);
 
   useEffect(() => {
     if (activeProject?.path) {
-      fetchSessions(activeProject.path);
+      // 项目切换 / WSL 来源配置变化:先清掉上一来源的 WSL 条目,避免与新项目混排
+      setWslSessions([]);
+      fetchSessions(activeProject, false);
     } else {
-      setAllSessions([]);
+      requestIdRef.current++;
+      setHostSessions([]);
+      setWslSessions([]);
+      setLoading(false);
+      setWslLoading(false);
       setDisplayCount(PAGE_SIZE);
     }
-  }, [activeProject?.path, fetchSessions]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeProject?.path, activeProject?.wslSessionsDistro, fetchSessions]);
+
+  // 合并两个来源,按时间戳降序混排(与后端排序口径一致:ISO 8601 字符串比较)
+  const allSessions = useMemo(() => {
+    if (wslSessions.length === 0) return hostSessions;
+    const merged = [...hostSessions, ...wslSessions];
+    merged.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+    return merged;
+  }, [hostSessions, wslSessions]);
 
   const visibleSessions = allSessions.slice(0, displayCount);
   const hasMore = displayCount < allSessions.length;
@@ -89,11 +149,19 @@ export function SessionList() {
   return (
     <div className="h-full flex flex-col overflow-hidden bg-[var(--bg-surface)] select-none">
       <div className="px-3 pt-2.5 pb-1.5 text-sm text-[var(--text-muted)] uppercase tracking-[0.12em] font-medium flex items-center justify-between">
-        <span>Sessions</span>
+        <span className="flex items-center gap-1.5">
+          Sessions
+          {wslLoading && (
+            <span
+              className="inline-block w-3 h-3 border border-[var(--text-muted)] border-t-transparent rounded-full animate-spin"
+              title={t('sessionList.wslLoading')}
+            />
+          )}
+        </span>
         {activeProject && (
           <span
             className="text-xs normal-case tracking-normal cursor-pointer hover:text-[var(--text-primary)] transition-colors"
-            onClick={() => fetchSessions(activeProject.path)}
+            onClick={() => fetchSessions(activeProject, true)}
             title={t('sessionList.refresh')}
           >
             ↻
@@ -124,7 +192,7 @@ export function SessionList() {
 
           return (
             <div
-              key={`${session.sessionType}-${session.id}`}
+              key={`${session.sessionType}-${session.wslDistro ?? 'host'}-${session.id}`}
               className="flex items-start gap-2 px-2.5 py-1.5 rounded-[var(--radius-sm)] text-xs group hover:bg-[var(--border-subtle)] transition-colors cursor-default"
               title={session.title}
               onContextMenu={(e) => {
@@ -161,6 +229,11 @@ export function SessionList() {
                 </div>
                 <div className="text-[var(--text-muted)] text-[10px] mt-0.5 leading-none">
                   {formatTime(session.timestamp)}
+                  {session.wslDistro && (
+                    <span className="ml-1.5 opacity-70" title={session.wslDistro}>
+                      {t('sessionList.wslBadge')}
+                    </span>
+                  )}
                 </div>
               </div>
             </div>

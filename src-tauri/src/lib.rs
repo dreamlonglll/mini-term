@@ -13,6 +13,7 @@ mod search;
 mod ssh;
 mod ssh_mcp_registry;
 mod window_theme;
+mod wsl_distros;
 
 use tauri::Manager;
 
@@ -100,7 +101,9 @@ pub fn run() {
             fs::delete_entry,
             fs::filter_directories,
             ai_sessions::get_ai_sessions,
+            ai_sessions::get_wsl_ai_sessions,
             ai_sessions::get_ai_session_content,
+            wsl_distros::list_wsl_distros,
             git::get_git_status,
             git::get_git_diff,
             git::discover_git_repos,

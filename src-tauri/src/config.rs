@@ -204,6 +204,10 @@ pub struct ProjectConfig {
     /// 项目级环境变量列表,新建终端时注入。空 Vec 时序列化跳过保持文件干净。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env_vars: Vec<ProjectEnvVar>,
+    /// WSL 会话来源发行版名(「WSL 关联项目」的声明)。`None` = 未启用。
+    /// WSL 根项目(UNC 路径)不落此配置,distro 从路径自动推导。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wsl_sessions_distro: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
