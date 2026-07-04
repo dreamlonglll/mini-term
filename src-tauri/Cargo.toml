@@ -48,4 +48,7 @@ windows = { version = "0.58", features = [
   "Win32_Graphics_Gdi",
   "Win32_Graphics_Dwm",
 ] }
+# WSL 发行版枚举:读 HKCU\...\Lxss 注册表,不 spawn wsl.exe(避免 UTF-16 stdout 坑)。
+# 0.2 与 windows 0.58 共享 windows-result 0.2 / windows-targets 0.52 依赖树。
+windows-registry = "0.2"
 image = "0.25"

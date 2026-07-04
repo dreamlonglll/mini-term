@@ -133,6 +133,9 @@ export interface ProjectConfig {
   sshConnectionIds?: string[];
   /** 项目级环境变量,新建终端时注入到 PTY 子进程。已开终端不受影响。 */
   envVars?: ProjectEnvVar[];
+  /** WSL 会话来源发行版名（「WSL 关联项目」声明）；undefined = 未启用。
+   *  WSL 根项目（UNC 路径）不落此配置,distro 从路径自动推导。 */
+  wslSessionsDistro?: string;
 }
 
 export interface ProjectEnvVar {
@@ -233,6 +236,14 @@ export interface AiSession {
   sessionType: 'claude' | 'codex';
   title: string;
   timestamp: string; // ISO 8601
+  /** 会话来源:有值 = 该 WSL 发行版内的会话,undefined = Windows 宿主会话 */
+  wslDistro?: string;
+}
+
+/** list_wsl_distros 返回的单条发行版记录 */
+export interface WslDistro {
+  name: string;
+  isDefault: boolean;
 }
 
 export interface AiSessionMessage {

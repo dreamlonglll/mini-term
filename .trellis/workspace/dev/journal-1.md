@@ -586,3 +586,37 @@ feat/cc-connect-panel 分支文档收尾:README 顶部 slogan 加 '· IM 平台�
 ### Next Steps
 
 - None - task complete
+
+
+## Session 18: Session 块支持查看 WSL 内 claude/codex 历史会话
+
+**Date**: 2026-07-02
+**Task**: Session 块支持查看 WSL 内 claude/codex 历史会话
+**Branch**: `feature/wsl-ai-sessions`
+
+### Summary
+
+grilling 拷问收敛 7 项需求决议后走完 trellis 全程：WSL 根项目（\wsl$ UNC）自动加载发行版内会话零配置；Windows 路径项目右键「WSL 会话」子菜单选发行版（注册表 Lxss 枚举，不 spawn wsl.exe），按 /mnt 规则映射路径；Session 列表分段加载合并混排带 WSL 标识与竞态防护；会话正文查看回传 wslDistro；WSL 侧扫描限额/独立缓存/静默降级；沉淀 CONTEXT.md 术语表与 wsl-unc-session-scanning.md 后端规范；cargo test 176 通过、npm run build 通过
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `cea1250` | (see git log) |
+| `c35b331` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete

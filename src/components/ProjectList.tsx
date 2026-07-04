@@ -15,6 +15,7 @@ import { showContextMenu } from '../utils/contextMenu';
 import { showPrompt } from '../utils/prompt';
 import { disposeTerminal } from '../utils/terminalCache';
 import { initProjectDrag, isProjectDragging, getProjectDragPayload, onProjectDragEnd } from '../utils/projectDragState';
+import { isWslPath } from '../utils/wslPath';
 import { useT } from '../i18n';
 import {
   getOrderedTree,
@@ -27,12 +28,24 @@ import {
   findGroupInTree,
   MAX_DEPTH,
 } from '../utils/projectTree';
-import type { PaneStatus, SplitNode, ProjectConfig, ProjectGroup } from '../types';
+import type { PaneStatus, SplitNode, ProjectConfig, ProjectGroup, WslDistro } from '../types';
 
 // 保存配置的快捷方法
 function saveConfig() {
   const config = useAppStore.getState().config;
   invoke('save_config', { config });
+}
+
+// 模块级缓存:WSL 发行版列表只 invoke 一次。
+// 右键菜单是同步构建的,组件挂载时预取,打开菜单时直接读缓存。
+// 非 Windows / 未装 WSL 时列表为空,「WSL 会话」菜单项自然隐藏。
+let wslDistrosCache: WslDistro[] | null = null;
+let wslDistrosPromise: Promise<void> | null = null;
+function prefetchWslDistros() {
+  if (wslDistrosCache || wslDistrosPromise) return;
+  wslDistrosPromise = invoke<WslDistro[]>('list_wsl_distros')
+    .then((list) => { wslDistrosCache = list; })
+    .catch(() => { wslDistrosCache = []; });
 }
 
 // Drop 指示器位置
@@ -71,6 +84,24 @@ export function ProjectList() {
 
   const orderedItems = getOrderedTree(config);
   const allGroups = collectAllGroups(config.projectTree ?? []);
+
+  // 预取 WSL 发行版列表,保证右键菜单构建时缓存已就绪
+  useEffect(() => {
+    prefetchWslDistros();
+  }, []);
+
+  // 写入项目的 WSL 会话来源发行版(undefined = 不启用),并持久化
+  const setWslSessionsDistro = useCallback((projectId: string, distro: string | undefined) => {
+    const cfg = useAppStore.getState().config;
+    const newConfig = {
+      ...cfg,
+      projects: cfg.projects.map((p) =>
+        p.id === projectId ? { ...p, wslSessionsDistro: distro } : p,
+      ),
+    };
+    useAppStore.getState().setConfig(newConfig);
+    invoke('save_config', { config: newConfig });
+  }, []);
 
   // === 系统文件拖放（从资源管理器拖入文件夹添加项目） ===
   useEffect(() => {
@@ -404,6 +435,34 @@ export function ProjectList() {
               onClick: () => setEnvVarsTarget(project),
             },
           ];
+          // 「WSL 会话」子菜单:选择该项目的 WSL 会话来源发行版。
+          // WSL 根项目不显示(distro 从路径自动推导);
+          // 发行版枚举为空且未配置时也不显示(非 Windows / 未装 WSL 自然隐藏)。
+          if (!isWslPath(project.path)) {
+            const distros = wslDistrosCache ?? [];
+            const current = project.wslSessionsDistro;
+            if (distros.length > 0 || current) {
+              const submenu: Parameters<typeof showContextMenu>[2] = [
+                {
+                  label: `${current ? '　' : '✓ '}${t('projectList.menu.wslSessionsDisable')}`,
+                  onClick: () => setWslSessionsDistro(project.id, undefined),
+                },
+                { separator: true },
+                ...distros.map((d) => ({
+                  label: `${current === d.name ? '✓ ' : '　'}${d.name}`,
+                  onClick: () => setWslSessionsDistro(project.id, d.name),
+                })),
+              ];
+              // 已配置的发行版枚举不到(被卸载):显示「(未找到)」标记项
+              if (current && !distros.some((d) => d.name === current)) {
+                submenu.push({
+                  label: `✓ ${t('projectList.menu.wslSessionsNotFound', { name: current })}`,
+                  disabled: true,
+                });
+              }
+              menuItems.push({ label: t('projectList.menu.wslSessions'), submenu });
+            }
+          }
           // 添加分组相关菜单
           if (allGroups.length > 0) {
             menuItems.push({ separator: true });

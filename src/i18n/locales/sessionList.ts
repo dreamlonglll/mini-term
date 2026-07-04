@@ -14,6 +14,8 @@ export const sessionList = {
     view: "查看",
     copyResumeCommand: "复制恢复命令",
     more: "{n} 条更多…",
+    wslBadge: "WSL",
+    wslLoading: "正在加载 WSL 会话…",
   },
   en: {
     time: {
@@ -30,5 +32,7 @@ export const sessionList = {
     view: "View",
     copyResumeCommand: "Copy resume command",
     more: "{n} more…",
+    wslBadge: "WSL",
+    wslLoading: "Loading WSL sessions…",
   },
 } as const;

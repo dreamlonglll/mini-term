@@ -68,6 +68,8 @@ export function SessionViewerModal({ open, onClose, session, projectPath }: Prop
       sessionType: session.sessionType,
       sessionId: session.id,
       projectPath,
+      // WSL 会话:回传来源发行版,后端从对应 UNC 位置读正文
+      wslDistro: session.wslDistro,
     })
       .then((msgs) => {
         setMessages(msgs);
