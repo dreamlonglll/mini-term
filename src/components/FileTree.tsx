@@ -47,6 +47,9 @@ function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff, onViewF
     activeProjectId ? isExpanded(activeProjectId, entry.path) : false
   );
   const [children, setChildren] = useState<FileEntry[]>([]);
+  // 仅远程展开时置 true:SFTP 往返可达秒级,需要行内 spinner 反馈;
+  // 本地列目录近乎即时,置 loading 反而闪一帧
+  const [loadingChildren, setLoadingChildren] = useState(false);
 
   const loadChildren = useCallback(async () => {
     // 远程目录:SFTP readdir(每次展开重新拉取,不做 notify 监听);
@@ -74,7 +77,8 @@ function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff, onViewF
   // 恢复时(初始即展开)加载一次子节点
   useEffect(() => {
     if (expanded && entry.isDir) {
-      loadChildren();
+      if (remoteConnectionId) setLoadingChildren(true);
+      loadChildren().finally(() => setLoadingChildren(false));
     }
   }, []); // eslint-disable-line react-hooks/exhaustive-deps -- 仅在 mount 时按持久化展开态恢复一次
 
@@ -95,17 +99,23 @@ function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff, onViewF
       onViewFile(entry.path);
       return;
     }
+    if (loadingChildren) return; // 加载中忽略重复点击,避免叠发 SFTP 请求
     const next = !expanded;
     // 展开前先加载子节点避免空帧;watcher 的注册/注销由上面的监听生命周期 effect
     // 跟随 expanded 状态自动处理(含 unmount 时的释放),此处不再手动 watch/unwatch。
     if (next) {
-      await loadChildren();
+      if (remoteConnectionId) setLoadingChildren(true);
+      try {
+        await loadChildren();
+      } finally {
+        setLoadingChildren(false);
+      }
     }
     setExpanded(next);
     if (activeProjectId) {
       toggleExpandedDir(activeProjectId, entry.path, next);
     }
-  }, [entry, expanded, loadChildren, onViewFile, activeProjectId]);
+  }, [entry, expanded, loadingChildren, loadChildren, onViewFile, activeProjectId, remoteConnectionId]);
 
   useTauriEvent<FsChangePayload>('fs-change', useCallback((payload: FsChangePayload) => {
     if (remoteConnectionId) return; // 远程项目无 watcher,fs-change 与本树无关
@@ -244,10 +254,16 @@ function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff, onViewF
         }}
       >
         {entry.isDir && (
-          <span className="text-[13px] w-3 text-center text-[var(--text-muted)] transition-transform duration-150"
-            style={{ transform: expanded ? 'rotate(0deg)' : 'rotate(-90deg)', display: 'inline-block' }}>
-            ▾
-          </span>
+          loadingChildren ? (
+            <span className="w-3 flex items-center justify-center flex-shrink-0">
+              <span className="inline-block w-2.5 h-2.5 border border-[var(--text-muted)] border-t-transparent rounded-full animate-spin" />
+            </span>
+          ) : (
+            <span className="text-[13px] w-3 text-center text-[var(--text-muted)] transition-transform duration-150"
+              style={{ transform: expanded ? 'rotate(0deg)' : 'rotate(-90deg)', display: 'inline-block' }}>
+              ▾
+            </span>
+          )
         )}
         {!entry.isDir && <span className="w-3 text-center text-[var(--text-muted)] text-xs">·</span>}
         <span className="truncate" title={entry.name}>{entry.name}</span>
