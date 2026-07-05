@@ -1,0 +1,16 @@
+{"file": ".trellis/spec/backend/index.md", "reason": "后端 spec 入口：Rust/Tauri 开发前检查清单与质量要求"}
+{"file": ".trellis/spec/backend/tokio-session-pool-pattern.md", "reason": "russh 会话池的既有设计契约——抽 mt-ssh crate 时行为不得改变"}
+{"file": ".trellis/spec/backend/russh-rsa-key-loading.md", "reason": "PKCS#1 RSA 私钥加载的版本精确锁契约，抽包时依赖不能动"}
+{"file": ".trellis/spec/backend/russh-sftp-file-transfer.md", "reason": "russh-sftp 接入方式契约，远程 readdir/read 复用同一模式"}
+{"file": ".trellis/spec/backend/rust-crypto-on-windows-msvc.md", "reason": "ring 而非 aws-lc 的工具链约束，新 crate 依赖配置必读"}
+{"file": ".trellis/spec/backend/rand-core-version-alignment.md", "reason": "跨 crate 版本锁陷阱，mt-ssh 抽包 Cargo.toml 必读"}
+{"file": ".trellis/spec/backend/tauri-command-nested-args.md", "reason": "新增远程 fs/session Tauri command 的参数命名与嵌套约定"}
+{"file": ".trellis/spec/backend/wsl-unc-session-scanning.md", "reason": "慢 IO 契约（async command、缓存锁不跨慢 IO、静默降级），SFTP 场景同样适用"}
+{"file": ".trellis/spec/backend/portable-pty-conpty-cwd-fallback.md", "reason": "PTY spawn cwd 语义，直接 spawn ssh 启动器需遵循"}
+{"file": ".trellis/spec/frontend/index.md", "reason": "前端 spec 入口：开发前检查清单"}
+{"file": ".trellis/spec/frontend/component-guidelines.md", "reason": "FileTree/ProjectList/SessionList/新弹窗改动需遵循组件规范"}
+{"file": ".trellis/spec/frontend/fluent2-portal-modal.md", "reason": "「添加远程项目」新弹窗的 portal/样式规范"}
+{"file": ".trellis/spec/frontend/state-management.md", "reason": "zustand store 使用规范（sshConnectionId 配置写入与 save_config）"}
+{"file": ".trellis/spec/frontend/type-safety.md", "reason": "types.ts 与 Rust serde camelCase 对齐的类型规范"}
+{"file": "CONTEXT.md", "reason": "领域术语表，远程项目相关命名与注释须与既有术语一致"}
+{"file": ".trellis/tasks/07-05-ssh-remote-projects/research/codebase-recon.md", "reason": "本任务勘察：可复用资产、改造落点、gate 清单、分批顺序、autofill 竞态提醒"}

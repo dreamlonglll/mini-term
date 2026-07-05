@@ -1,0 +1,7 @@
+{"file": ".trellis/spec/backend/index.md", "reason": "后端质量检查清单"}
+{"file": ".trellis/spec/backend/wsl-unc-session-scanning.md", "reason": "核查慢 IO 契约：async command、缓存锁不跨 SFTP IO、静默降级"}
+{"file": ".trellis/spec/backend/rand-core-version-alignment.md", "reason": "核查 mt-ssh 抽包后依赖版本锁未被破坏"}
+{"file": ".trellis/spec/frontend/index.md", "reason": "前端质量检查清单"}
+{"file": ".trellis/spec/frontend/quality-guidelines.md", "reason": "前端质量规范（i18n 双语、错误处理、性能）"}
+{"file": ".trellis/spec/frontend/type-safety.md", "reason": "校验 TS 类型与 Rust serde 结构对齐"}
+{"file": ".trellis/tasks/07-05-ssh-remote-projects/research/codebase-recon.md", "reason": "对照 gate 清单逐项核查本地消费者遗漏；对照决策速查核查实现偏差"}
