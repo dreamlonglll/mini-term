@@ -55,7 +55,9 @@ pub fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     }
 }
 
-fn natural_cmp(a: &str, b: &str) -> Ordering {
+/// 自然排序比较(数字段按数值比)。pub(crate):远程文件树(remote_ssh.rs)
+/// 复用同一排序规则,保证本地/远程树观感一致。
+pub(crate) fn natural_cmp(a: &str, b: &str) -> Ordering {
     let a = a.to_lowercase();
     let b = b.to_lowercase();
     let mut ai = a.as_bytes().iter().peekable();

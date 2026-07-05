@@ -11,21 +11,23 @@ const MAX_CODEX_SESSION_FILES_TO_SCAN: usize = 500;
 // WSL 侧经 \\wsl$ 走 9P 协议,逐文件读慢(毫秒级往返),上限下调。
 const MAX_WSL_CLAUDE_SESSION_FILES_TO_SCAN: usize = 100;
 const MAX_WSL_CODEX_SESSION_FILES_TO_SCAN: usize = 200;
-const MAX_SESSIONS_PER_SOURCE: usize = 80;
-const MAX_TOTAL_SESSIONS: usize = 120;
+pub(crate) const MAX_SESSIONS_PER_SOURCE: usize = 80;
+pub(crate) const MAX_TOTAL_SESSIONS: usize = 120;
 const SESSION_CACHE_TTL: Duration = Duration::from_secs(2);
 // WSL 扫描代价高(9P + 可能触发 VM 冷启动),TTL 放宽;手动刷新走 force 绕过。
 const WSL_SESSION_CACHE_TTL: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
-struct CachedSessions {
-    loaded_at: Instant,
-    sessions: Vec<AiSession>,
+pub(crate) struct CachedSessions {
+    pub(crate) loaded_at: Instant,
+    pub(crate) sessions: Vec<AiSession>,
 }
 
 static SESSION_CACHE: OnceLock<Mutex<HashMap<String, CachedSessions>>> = OnceLock::new();
 
-fn session_cache() -> &'static Mutex<HashMap<String, CachedSessions>> {
+/// 会话列表缓存(Windows / WSL / SSH 远程三来源共用同一 map,key 前缀区分)。
+/// 锁契约:即取即放,**绝不跨慢 IO 持锁**(见 spec/backend/wsl-unc-session-scanning.md)。
+pub(crate) fn session_cache() -> &'static Mutex<HashMap<String, CachedSessions>> {
     SESSION_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -39,6 +41,10 @@ pub struct AiSession {
     /// 会话来源:Some = 该 WSL 发行版内的会话,None = Windows 宿主会话。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wsl_distro: Option<String>,
+    /// 会话来源:Some = 该 SSH 连接指向的远程机器上的会话(SSH 远程项目),
+    /// None = 本机来源。与 `wsl_distro` 同为 CONTEXT.md「会话来源」标识,互斥。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_connection_id: Option<String>,
 }
 
 /// 获取用户 home 目录
@@ -72,7 +78,8 @@ impl PathStyle {
 /// 统一替换为 `-`,而非仅替换路径分隔符。
 /// 例如 `D:\Git\bhyt-一体机` → `D--Git-bhyt----`;
 /// 对 unix cwd 同样成立:`/mnt/d/git/foo` → `-mnt-d-git-foo`。
-fn encode_project_path(project_path: &str) -> String {
+/// pub(crate):SSH 远程项目的会话扫描(remote_ssh.rs)复用同一编码。
+pub(crate) fn encode_project_path(project_path: &str) -> String {
     project_path
         .trim_end_matches(['/', '\\'])
         .chars()
@@ -83,7 +90,7 @@ fn encode_project_path(project_path: &str) -> String {
 /// 目录名是否为编码名的「变体」:大小写不同(drvfs 大小写不敏感,WSL 内
 /// `cd /mnt/d/GIT/foo` 也能进同一目录)或仅多出尾部 `-`(带尾部斜杠的同一项目)。
 /// 编码有损,变体命中后仍需读 jsonl 内真实 cwd 精确校验,防止吃进兄弟项目。
-fn is_encoded_variant(dir_name: &str, encoded: &str) -> bool {
+pub(crate) fn is_encoded_variant(dir_name: &str, encoded: &str) -> bool {
     // encoded 只含 ASCII 字母数字与 `-`,lowercase 后 byte 长度不变,切片安全
     let dn = dir_name.to_lowercase();
     let en = encoded.to_lowercase();
@@ -184,8 +191,8 @@ fn normalize_path(path: &str) -> String {
         .to_string()
 }
 
-/// Unix 语义路径统一化(小写 + 保留 `/`,去尾部 `/`),用于 WSL 内 cwd 比较
-fn normalize_unix_path(path: &str) -> String {
+/// Unix 语义路径统一化(小写 + 保留 `/`,去尾部 `/`),用于 WSL 内 / SSH 远程 cwd 比较
+pub(crate) fn normalize_unix_path(path: &str) -> String {
     path.to_lowercase().trim_end_matches('/').to_string()
 }
 
@@ -311,6 +318,7 @@ fn get_claude_sessions_in(
             title,
             timestamp,
             wsl_distro: wsl_distro.map(String::from),
+            ssh_connection_id: None,
         });
     }
 
@@ -340,14 +348,21 @@ fn read_claude_session_info(path: &Path) -> (String, String) {
     };
 
     let reader = BufReader::new(file);
+    let lines: Vec<String> = reader
+        .lines()
+        .take(50)
+        .filter_map(Result::ok)
+        .collect();
+    claude_session_info_from_lines(lines.iter().map(String::as_str))
+}
 
-    for line in reader.lines().take(50) {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-
-        let obj: serde_json::Value = match serde_json::from_str(&line) {
+/// 从会话文件的前若干行提取 (title, timestamp)。行级纯函数,本地(BufReader)
+/// 与远程(SFTP 读头部字节后按行切)两条路径共用。
+pub(crate) fn claude_session_info_from_lines<'a>(
+    lines: impl IntoIterator<Item = &'a str>,
+) -> (String, String) {
+    for line in lines {
+        let obj: serde_json::Value = match serde_json::from_str(line) {
             Ok(v) => v,
             Err(_) => continue,
         };
@@ -509,6 +524,67 @@ fn collect_codex_session_paths(dir: &Path, paths: &mut Vec<PathBuf>) {
     }
 }
 
+/// Codex 会话文件头部 session_meta 行的关键字段。
+pub(crate) struct CodexSessionMeta {
+    pub(crate) id: String,
+    pub(crate) timestamp: String,
+    pub(crate) cwd: String,
+}
+
+/// 解析一行,若是 session_meta 则取出 id/timestamp/cwd。行级纯函数,
+/// SSH 远程扫描(remote_ssh.rs)用它对远程 rollout 文件做 cwd 匹配。
+pub(crate) fn codex_meta_from_line(line: &str) -> Option<CodexSessionMeta> {
+    let obj: serde_json::Value = serde_json::from_str(line).ok()?;
+    if obj.get("type").and_then(|t| t.as_str()) != Some("session_meta") {
+        return None;
+    }
+    Some(CodexSessionMeta {
+        id: obj
+            .pointer("/payload/id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        timestamp: obj
+            .pointer("/payload/timestamp")
+            .or_else(|| obj.get("timestamp"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        cwd: obj
+            .pointer("/payload/cwd")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+    })
+}
+
+/// 从一行 response_item 里提取第一条真实用户输入作为标题候选
+/// (跳过 `<...>` 系统注入与 `# AGENTS.md` 前缀)。行级纯函数,本地与远程共用。
+pub(crate) fn codex_user_title_from_line(line: &str) -> Option<String> {
+    let obj: serde_json::Value = serde_json::from_str(line).ok()?;
+    if obj.get("type").and_then(|t| t.as_str()) != Some("response_item") {
+        return None;
+    }
+    if obj.pointer("/payload/role").and_then(|v| v.as_str()) != Some("user") {
+        return None;
+    }
+    let arr = obj.pointer("/payload/content").and_then(|v| v.as_array())?;
+    for item in arr {
+        if item.get("type").and_then(|t| t.as_str()) != Some("input_text") {
+            continue;
+        }
+        let text = item.get("text").and_then(|t| t.as_str()).unwrap_or("");
+        let trimmed = text.trim_start();
+        if !trimmed.is_empty()
+            && !trimmed.starts_with('<')
+            && !trimmed.starts_with("# AGENTS.md")
+        {
+            return Some(trimmed.chars().take(100).collect());
+        }
+    }
+    None
+}
+
 /// 读取 Codex session 文件,匹配 cwd 后返回 AiSession
 fn try_read_codex_session(
     path: &Path,
@@ -572,36 +648,8 @@ fn try_read_codex_session(
                 Ok(l) => l,
                 Err(_) => continue,
             };
-            let obj: serde_json::Value = match serde_json::from_str(&line) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-
-            if obj.get("type").and_then(|t| t.as_str()) != Some("response_item") {
-                continue;
-            }
-            if obj.pointer("/payload/role").and_then(|v| v.as_str()) != Some("user") {
-                continue;
-            }
-
-            // 遍历 content blocks,找第一个非系统注入的 text
-            if let Some(arr) = obj.pointer("/payload/content").and_then(|v| v.as_array()) {
-                for item in arr {
-                    if item.get("type").and_then(|t| t.as_str()) != Some("input_text") {
-                        continue;
-                    }
-                    let text = item.get("text").and_then(|t| t.as_str()).unwrap_or("");
-                    let trimmed = text.trim_start();
-                    if !trimmed.is_empty()
-                        && !trimmed.starts_with('<')
-                        && !trimmed.starts_with("# AGENTS.md")
-                    {
-                        title = trimmed.chars().take(100).collect();
-                        break;
-                    }
-                }
-            }
-            if !title.is_empty() {
+            if let Some(t) = codex_user_title_from_line(&line) {
+                title = t;
                 break;
             }
         }
@@ -619,6 +667,7 @@ fn try_read_codex_session(
         title,
         timestamp,
         wsl_distro: wsl_distro.map(String::from),
+        ssh_connection_id: None,
     })
 }
 
@@ -654,47 +703,48 @@ fn extract_text_content(content_val: Option<&serde_json::Value>) -> String {
     }
 }
 
+/// 解析 Claude JSONL 的一行为消息。非 user/assistant / 空内容 / 非 JSON → None。
+/// 行级纯函数,本地与远程(SFTP)两条正文读取路径共用。
+pub(crate) fn claude_message_from_line(line: &str) -> Option<AiSessionMessage> {
+    let obj: serde_json::Value = serde_json::from_str(line).ok()?;
+
+    let role = match obj.get("type").and_then(|t| t.as_str()) {
+        Some("user") => "user",
+        Some("assistant") => "assistant",
+        _ => return None,
+    };
+
+    let content = extract_text_content(obj.pointer("/message/content"));
+    if content.is_empty() {
+        return None;
+    }
+
+    let timestamp = obj
+        .get("timestamp")
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    Some(AiSessionMessage {
+        role: role.to_string(),
+        content,
+        timestamp,
+    })
+}
+
 /// 从单个 Claude JSONL 会话文件读取全部消息
 fn read_claude_messages_from_file(path: &Path) -> Result<Vec<AiSessionMessage>, String> {
     let file = fs::File::open(path).map_err(|e| format!("无法打开文件: {}", e))?;
     let reader = BufReader::new(file);
     let mut messages = Vec::new();
-
+    // 显式循环而非 map_while(Result::ok):坏行(如非 UTF-8)只跳过该行,
+    // 不中断迭代 —— map_while 会在首个 Err 处截断其后全部消息。
     for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-
-        let obj: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        let role = match obj.get("type").and_then(|t| t.as_str()) {
-            Some("user") => "user",
-            Some("assistant") => "assistant",
-            _ => continue,
-        };
-
-        let content = extract_text_content(obj.pointer("/message/content"));
-        if content.is_empty() {
-            continue;
+        let Ok(line) = line else { continue };
+        if let Some(m) = claude_message_from_line(&line) {
+            messages.push(m);
         }
-
-        let timestamp = obj
-            .get("timestamp")
-            .and_then(|t| t.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        messages.push(AiSessionMessage {
-            role: role.to_string(),
-            content,
-            timestamp,
-        });
     }
-
     Ok(messages)
 }
 
@@ -750,52 +800,52 @@ fn find_codex_session_file(sessions_dir: &Path, session_id: &str) -> Option<Path
         .find(|p| is_codex_session_match(p, session_id))
 }
 
+/// 解析 Codex JSONL 的一行为消息。非 response_item / 非 user/assistant / 空内容 → None。
+/// 行级纯函数,本地与远程(SFTP)两条正文读取路径共用。
+pub(crate) fn codex_message_from_line(line: &str) -> Option<AiSessionMessage> {
+    let obj: serde_json::Value = serde_json::from_str(line).ok()?;
+
+    if obj.get("type").and_then(|t| t.as_str()) != Some("response_item") {
+        return None;
+    }
+
+    let role = match obj.pointer("/payload/role").and_then(|v| v.as_str()) {
+        Some("user") => "user",
+        Some("assistant") => "assistant",
+        _ => return None,
+    };
+
+    let content = extract_text_content(obj.pointer("/payload/content"));
+    if content.is_empty() {
+        return None;
+    }
+
+    let timestamp = obj
+        .pointer("/payload/timestamp")
+        .or_else(|| obj.get("timestamp"))
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    Some(AiSessionMessage {
+        role: role.to_string(),
+        content,
+        timestamp,
+    })
+}
+
 /// 从单个 Codex JSONL 会话文件读取全部消息
 fn read_codex_messages_from_file(path: &Path) -> Result<Vec<AiSessionMessage>, String> {
     let file = fs::File::open(path).map_err(|e| format!("无法打开文件: {}", e))?;
     let reader = BufReader::new(file);
     let mut messages = Vec::new();
-
+    // 显式循环而非 map_while(Result::ok):坏行只跳过,不截断后续消息(同 claude 侧)。
     for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-
-        let obj: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        if obj.get("type").and_then(|t| t.as_str()) != Some("response_item") {
-            continue;
+        let Ok(line) = line else { continue };
+        if let Some(m) = codex_message_from_line(&line) {
+            messages.push(m);
         }
-
-        let role = match obj.pointer("/payload/role").and_then(|v| v.as_str()) {
-            Some("user") => "user",
-            Some("assistant") => "assistant",
-            _ => continue,
-        };
-
-        let content = extract_text_content(obj.pointer("/payload/content"));
-        if content.is_empty() {
-            continue;
-        }
-
-        let timestamp = obj
-            .pointer("/payload/timestamp")
-            .or_else(|| obj.get("timestamp"))
-            .and_then(|t| t.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        messages.push(AiSessionMessage {
-            role: role.to_string(),
-            content,
-            timestamp,
-        });
     }
-
     Ok(messages)
 }
 
@@ -1109,6 +1159,99 @@ mod tests {
         // 非变体:后缀含非 `-` 字符
         assert!(!is_encoded_variant("-home-u-proj2", "-home-u-proj"));
         assert!(!is_encoded_variant("-home-u-pro", "-home-u-proj"));
+    }
+
+    #[test]
+    fn ai_session_serializes_ssh_connection_id_only_when_present() {
+        let mut s = AiSession {
+            id: "s1".into(),
+            session_type: "claude".into(),
+            title: "t".into(),
+            timestamp: "2026-07-05T00:00:00Z".into(),
+            wsl_distro: None,
+            ssh_connection_id: None,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(!json.contains("sshConnectionId"), "None 不应序列化: {json}");
+        assert!(!json.contains("wslDistro"));
+
+        s.ssh_connection_id = Some("conn-1".into());
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"sshConnectionId\":\"conn-1\""), "camelCase 对齐: {json}");
+    }
+
+    #[test]
+    fn claude_session_info_from_lines_finds_first_user_message() {
+        let lines = [
+            r#"{"type":"summary","summary":"x"}"#,
+            r#"{"type":"user","message":{"content":"<local-command-caveat>skip me"},"timestamp":"2026-01-01T00:00:00Z"}"#,
+            r#"{"type":"user","message":{"content":"fix the bug"},"timestamp":"2026-01-02T00:00:00Z"}"#,
+        ];
+        let (title, ts) = claude_session_info_from_lines(lines);
+        assert_eq!(title, "fix the bug");
+        assert_eq!(ts, "2026-01-02T00:00:00Z");
+    }
+
+    #[test]
+    fn claude_session_info_from_lines_empty_returns_untitled() {
+        let (title, ts) = claude_session_info_from_lines([]);
+        assert_eq!(title, "Untitled");
+        assert!(ts.is_empty());
+    }
+
+    #[test]
+    fn claude_message_from_line_parses_roles_and_skips_noise() {
+        let user = r#"{"type":"user","message":{"content":"hello"},"timestamp":"t1"}"#;
+        let m = claude_message_from_line(user).unwrap();
+        assert_eq!(m.role, "user");
+        assert_eq!(m.content, "hello");
+        assert_eq!(m.timestamp, "t1");
+
+        let assistant =
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]},"timestamp":"t2"}"#;
+        let m = claude_message_from_line(assistant).unwrap();
+        assert_eq!(m.role, "assistant");
+        assert_eq!(m.content, "hi");
+
+        // 非消息行 / 空内容 / 非 JSON → None
+        assert!(claude_message_from_line(r#"{"type":"system"}"#).is_none());
+        assert!(claude_message_from_line(r#"{"type":"user","message":{"content":""}}"#).is_none());
+        assert!(claude_message_from_line("not json").is_none());
+    }
+
+    #[test]
+    fn codex_message_from_line_parses_response_items_only() {
+        let user = r#"{"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"do it"}],"timestamp":"t1"}}"#;
+        let m = codex_message_from_line(user).unwrap();
+        assert_eq!(m.role, "user");
+        assert_eq!(m.content, "do it");
+
+        assert!(codex_message_from_line(r#"{"type":"session_meta","payload":{}}"#).is_none());
+        assert!(codex_message_from_line("garbage").is_none());
+    }
+
+    #[test]
+    fn codex_meta_from_line_extracts_fields() {
+        let line = r#"{"type":"session_meta","payload":{"id":"abc","cwd":"/home/u/proj","timestamp":"2026-01-01T00:00:00Z"}}"#;
+        let meta = codex_meta_from_line(line).unwrap();
+        assert_eq!(meta.id, "abc");
+        assert_eq!(meta.cwd, "/home/u/proj");
+        assert_eq!(meta.timestamp, "2026-01-01T00:00:00Z");
+
+        assert!(codex_meta_from_line(r#"{"type":"response_item"}"#).is_none());
+        assert!(codex_meta_from_line("").is_none());
+    }
+
+    #[test]
+    fn codex_user_title_from_line_skips_injected_text() {
+        let injected = r#"{"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"<user_instructions>x</user_instructions>"}]}}"#;
+        assert!(codex_user_title_from_line(injected).is_none());
+
+        let agents = r##"{"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions"}]}}"##;
+        assert!(codex_user_title_from_line(agents).is_none());
+
+        let real = r#"{"type":"response_item","payload":{"role":"user","content":[{"type":"input_text","text":"refactor the pool"}]}}"#;
+        assert_eq!(codex_user_title_from_line(real).as_deref(), Some("refactor the pool"));
     }
 
     #[test]

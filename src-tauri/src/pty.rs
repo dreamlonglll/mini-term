@@ -1,6 +1,6 @@
 use mt_core::{parse_wsl_unc, scan_ssh_prompt, strip_ansi_codes, SshPromptScan};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::sync::mpsc;
@@ -49,6 +49,151 @@ fn decide_wsl_override(cwd: &str) -> Option<(String, String)> {
 /// 避免把 WSL UNC 直接传给 ConPTY 触发 `$USERPROFILE` 静默 fallback。
 fn fallback_windows_cwd() -> String {
     std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\".to_string())
+}
+
+/// 跨平台版兜底 cwd:SSH 远程启动器分支用。远程项目的 `path` 是远程 POSIX
+/// 绝对路径,不能传给 portable-pty(见 portable-pty-conpty-cwd-fallback spec);
+/// ssh 进程自己 `cd` 进远程目录,本地 cwd 只需是一个合法目录。
+fn fallback_local_cwd() -> String {
+    if cfg!(windows) {
+        fallback_windows_cwd()
+    } else {
+        std::env::var("HOME").unwrap_or_else(|_| "/".to_string())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SSH 远程项目启动器(task 07-05-ssh-remote-projects PR2)
+// ---------------------------------------------------------------------------
+
+/// `create_pty` 的可选远程启动参数。前端 invoke 时必须 wrap:
+/// `{ ..., sshRemote: { connectionId, remotePath } }`
+/// (struct 参数约定见 spec/backend/tauri-command-nested-args.md)。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SshRemoteSpec {
+    /// `config.json` `sshConnections` 里的连接 id。连接被删除时返回明确错误(断链态)。
+    pub connection_id: String,
+    /// 远程 POSIX 绝对路径,ssh 登录后 `cd` 进入。
+    pub remote_path: String,
+}
+
+/// 远程启动器的最终形态:spawn 的程序、参数与(可选)用于 autofill 预注册的密码。
+struct RemoteLaunch {
+    program: String,
+    args: Vec<String>,
+    password: Option<String>,
+}
+
+/// POSIX shell 单引号安全包裹:`'` → `'\''`。
+/// 远程路径来自用户输入,拼进 `cd <path>` 前必须做引号安全处理,
+/// 防止 `;`、`$()`、空格等在远程 shell 里被解释。
+fn shell_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// 拼 ssh 的远端命令:`cd '<path>' && exec $SHELL -l`。
+/// `$SHELL` 保持字面量 —— 本地不经过 shell(portable-pty 直接 spawn ssh,
+/// 参数按 argv 传递),它由远程 sshd 用登录 shell 执行时才展开,
+/// 从而落在用户自己的默认 shell 上。
+fn build_remote_login_command(remote_path: &str) -> String {
+    format!("cd {} && exec $SHELL -l", shell_single_quote(remote_path))
+}
+
+/// 拼直接 spawn `ssh` 作 PTY 子进程的参数列表(不经本地 shell,
+/// 对齐 WSL 根项目 spawn wsl.exe 的启动器重写模式)。
+///
+/// 形如:`-t [-p <port>] [-i <identity>] user@host "cd '<path>' && exec $SHELL -l"`。
+/// **绝不能加 `-o BatchMode=yes`**:它会连带禁用密码认证,
+/// 而密码连接依赖 PTY autofill 灌密码(见 spec/backend/index.md gotcha)。
+fn build_ssh_launcher_args(
+    host: &str,
+    port: u16,
+    user: &str,
+    identity: Option<&str>,
+    remote_path: &str,
+) -> Vec<String> {
+    let mut args: Vec<String> = vec!["-t".to_string()];
+    if port != 0 && port != 22 {
+        args.push("-p".to_string());
+        args.push(port.to_string());
+    }
+    if let Some(key) = identity {
+        args.push("-i".to_string());
+        args.push(key.to_string());
+    }
+    args.push(format!("{user}@{host}"));
+    args.push(build_remote_login_command(remote_path));
+    args
+}
+
+/// 在 PATH 里找可执行文件(本机 OpenSSH 客户端探测用)。
+fn find_in_path(program: &str) -> Option<std::path::PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    std::env::split_paths(&path_var)
+        .map(|dir| dir.join(program))
+        .find(|candidate| candidate.is_file())
+}
+
+/// 定位本机 ssh 客户端。Windows 10+ 自带 OpenSSH 客户端(System32\OpenSSH),
+/// 缺失时返回 None 由调用方给出明确安装提示。
+fn find_ssh_client() -> Option<std::path::PathBuf> {
+    if cfg!(windows) {
+        find_in_path("ssh.exe")
+    } else {
+        find_in_path("ssh")
+    }
+}
+
+/// 把 `SshRemoteSpec` 解析成可 spawn 的远程启动器:
+/// 查连接(断链给明确错误)→ 探测 ssh 客户端 → 私钥复制权限收紧临时副本 → 拼参数。
+fn prepare_ssh_remote_launch(
+    app: &AppHandle,
+    spec: &SshRemoteSpec,
+) -> Result<RemoteLaunch, String> {
+    let config = crate::config::read_config(app);
+    let conn = config
+        .ssh_connections
+        .iter()
+        .find(|c| c.id == spec.connection_id)
+        .ok_or_else(|| {
+            format!(
+                "SSH 连接不存在或已被删除 (id={}),请检查项目的远程连接设置",
+                spec.connection_id
+            )
+        })?;
+
+    let ssh_program = find_ssh_client().ok_or_else(|| {
+        "未找到 ssh 客户端(OpenSSH)。Windows 10+ 可在「设置 → 系统 → 可选功能」中安装 \
+        「OpenSSH 客户端」后重试"
+            .to_string()
+    })?;
+
+    // 私钥复制为权限收紧的临时副本(绕过 OpenSSH 的 UNPROTECTED PRIVATE KEY 拒绝),
+    // 复用既有 prepare_ssh_key;失败(源文件不存在等)直接报错。
+    let identity = match conn
+        .identity_file
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(path) => Some(mt_core::prepare_ssh_key(path)?),
+        None => None,
+    };
+
+    let args = build_ssh_launcher_args(
+        &conn.host,
+        conn.port,
+        &conn.user,
+        identity.as_deref(),
+        &spec.remote_path,
+    );
+
+    Ok(RemoteLaunch {
+        program: ssh_program.to_string_lossy().into_owned(),
+        args,
+        password: conn.password.clone().filter(|p| !p.is_empty()),
+    })
 }
 
 /// 为 WSL 启动器分支拼装 `WSLENV` 环境变量的 value。
@@ -602,6 +747,9 @@ impl PtyManager {
 }
 
 #[tauri::command]
+// Tauri command 的参数即前端 invoke 的 payload key,拆 struct 会破坏既有前端调用;
+// 新增的 ssh_remote 是第 8 个参数,allow 之。
+#[allow(clippy::too_many_arguments)]
 pub fn create_pty(
     app: AppHandle,
     state: tauri::State<'_, PtyManager>,
@@ -610,7 +758,15 @@ pub fn create_pty(
     args: Vec<String>,
     cwd: String,
     envs: Option<Vec<(String, String)>>,
+    ssh_remote: Option<SshRemoteSpec>,
 ) -> Result<u32, String> {
+    // SSH 远程项目分支:先于 openpty 解析,连接断链 / 缺 ssh 客户端时快速失败,
+    // 不留半开的 PTY。
+    let remote_launch = match &ssh_remote {
+        Some(spec) => Some(prepare_ssh_remote_launch(&app, spec)?),
+        None => None,
+    };
+
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -623,24 +779,42 @@ pub fn create_pty(
 
     // WSL UNC cwd 检测:命中则忽略用户配置的 shell,改用 wsl.exe 启动,
     // 并把 portable-pty 的 cwd 换成 Windows 端合法目录(详见 decide_wsl_override 注释)。
-    let wsl_override = decide_wsl_override(&cwd);
+    // 远程分支优先:远程项目的 cwd 是远程 POSIX 路径,不参与 WSL 判定。
+    let wsl_override = if remote_launch.is_some() {
+        None
+    } else {
+        decide_wsl_override(&cwd)
+    };
 
-    let (effective_shell, effective_args, effective_cwd) = match &wsl_override {
-        // WSL 分支:启动的是宿主 wsl.exe,WSL VM 内的 claude/codex 子进程
-        // process_monitor 看不到,因此本路径下 AI 进程识别(ai-working/ai-idle 状态)
-        // 会失效 —— PRD Out of Scope 已列,见
-        // `.trellis/tasks/05-25-support-wsl-project-root/prd.md`。
-        Some((distro, unix_path)) => (
-            "wsl.exe".to_string(),
-            vec![
-                "-d".to_string(),
-                distro.clone(),
-                "--cd".to_string(),
-                unix_path.clone(),
-            ],
-            fallback_windows_cwd(),
-        ),
-        None => (shell, args, cwd),
+    let (effective_shell, effective_args, effective_cwd) = if let Some(launch) = &remote_launch {
+        // SSH 远程分支:直接 spawn ssh 作 PTY 子进程(不经本地 shell,对齐 WSL
+        // 启动器重写模式)。本地 cwd 用兜底目录 —— 远程目录由 ssh 远端命令 cd 进入。
+        // AI 状态感知走 PTY 输入/输出扫描降级路径(track_input /
+        // output_contains_ai_command 作用于数据流,对远程天然可用);
+        // hook 精确状态不可用,PRD 已接受。
+        (
+            launch.program.clone(),
+            launch.args.clone(),
+            fallback_local_cwd(),
+        )
+    } else {
+        match &wsl_override {
+            // WSL 分支:启动的是宿主 wsl.exe,WSL VM 内的 claude/codex 子进程
+            // process_monitor 看不到,因此本路径下 AI 进程识别(ai-working/ai-idle 状态)
+            // 会失效 —— PRD Out of Scope 已列,见
+            // `.trellis/tasks/05-25-support-wsl-project-root/prd.md`。
+            Some((distro, unix_path)) => (
+                "wsl.exe".to_string(),
+                vec![
+                    "-d".to_string(),
+                    distro.clone(),
+                    "--cd".to_string(),
+                    unix_path.clone(),
+                ],
+                fallback_windows_cwd(),
+            ),
+            None => (shell, args, cwd),
+        }
     };
 
     let mut cmd = CommandBuilder::new(&effective_shell);
@@ -674,6 +848,15 @@ pub fn create_pty(
     // 关联到具体的终端 pane
     cmd.env("MINITERM_PTY_ID", pty_id.to_string());
 
+    // SSH 远程分支:密码自动填充在 **spawn 之前**注册(复用 arm_ssh_autofill 的
+    // 内部状态)。直接 spawn ssh 模式下,密码提示可能先于前端任何后续调用到达,
+    // 事后再 arm 存在竞态 —— 这里预注册彻底消除该窗口。
+    if let Some(launch) = &remote_launch {
+        if let Some(password) = &launch.password {
+            state.arm_ssh_autofill(pty_id, password.clone());
+        }
+    }
+
     // WSL 重写发生时通知前端弹一次性 toast。pty_id 必须先分配,否则 payload 无法携带。
     if let Some((distro, unix_path)) = wsl_override.as_ref() {
         let _ = app.emit(
@@ -705,11 +888,18 @@ pub fn create_pty(
     //   wsl.exe 进程 env,WSL init 才会在 distro 内为 bash 设置同名变量。flag 选 `/u`
     //   (仅 Win→WSL,不做路径翻译),与 JetBrains IDEA terminal 对齐;宿主既有 WSLENV
     //   追加在尾部合并(不覆盖)。决策详见 PRD 与 research/wslenv-mechanism.md。
-    let user_envs: Vec<(String, String)> = envs
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|(k, _)| !k.starts_with("MINITERM_") && k != "WSLENV")
-        .collect();
+    // SSH 远程分支跳过用户 env 注入:注给本地 ssh 进程的变量不会传到远程 shell,
+    // 注了也只是污染 ssh 进程环境(PRD R6:远程项目隐藏 envVars 入口,二期考虑
+    // 注入远程 shell)。与 WSL 分支「宿主 env 不自动透传」同理,但远程连 WSLENV
+    // 通道都没有,直接整组跳过。
+    let user_envs: Vec<(String, String)> = if remote_launch.is_some() {
+        Vec::new()
+    } else {
+        envs.unwrap_or_default()
+            .into_iter()
+            .filter(|(k, _)| !k.starts_with("MINITERM_") && k != "WSLENV")
+            .collect()
+    };
 
     if wsl_override.is_some() && !user_envs.is_empty() {
         let host_wslenv = std::env::var("WSLENV").ok();
@@ -1576,6 +1766,107 @@ mod tests {
         // %USERPROFILE% 在所有用户环境下都存在,失败时退化为 C:\。
         let cwd = fallback_windows_cwd();
         assert!(!cwd.is_empty(), "fallback cwd 不应为空字符串");
+    }
+
+    // === SSH 远程启动器(task 07-05 PR2) ===
+    // 与 decide_wsl_override 同理:完整 create_pty 会 spawn 真实进程,不适合单测;
+    // 这里覆盖「拼参数 / 引号安全」的纯函数层。
+
+    #[test]
+    fn shell_single_quote_wraps_plain_path() {
+        assert_eq!(shell_single_quote("/home/u/proj"), "'/home/u/proj'");
+    }
+
+    #[test]
+    fn shell_single_quote_escapes_embedded_single_quotes() {
+        // it's → 'it'\''s':单引号闭合 + 转义字面量 + 重新开引号
+        assert_eq!(shell_single_quote("/a/it's"), r"'/a/it'\''s'");
+    }
+
+    #[test]
+    fn shell_single_quote_neutralizes_shell_metacharacters() {
+        // `;`、`$()`、空格等在单引号内均为字面量,不会被远程 shell 解释
+        let quoted = shell_single_quote("/tmp/x; rm -rf $HOME `id`");
+        assert_eq!(quoted, "'/tmp/x; rm -rf $HOME `id`'");
+    }
+
+    #[test]
+    fn build_remote_login_command_quotes_path_and_keeps_shell_literal() {
+        let cmd = build_remote_login_command("/home/u/my proj");
+        assert_eq!(cmd, "cd '/home/u/my proj' && exec $SHELL -l");
+        // $SHELL 必须保持字面量,由远程登录 shell 展开
+        assert!(cmd.contains("$SHELL"));
+    }
+
+    #[test]
+    fn build_ssh_launcher_args_default_port_no_identity() {
+        let args = build_ssh_launcher_args("h.example.com", 22, "root", None, "/srv/app");
+        assert_eq!(
+            args,
+            vec![
+                "-t".to_string(),
+                "root@h.example.com".to_string(),
+                "cd '/srv/app' && exec $SHELL -l".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_ssh_launcher_args_port_zero_treated_as_default() {
+        let args = build_ssh_launcher_args("h", 0, "u", None, "/p");
+        assert!(!args.contains(&"-p".to_string()));
+    }
+
+    #[test]
+    fn build_ssh_launcher_args_custom_port_and_identity() {
+        let args = build_ssh_launcher_args(
+            "10.0.0.5",
+            2222,
+            "deploy",
+            Some(r"C:\Temp\mini-term-ssh-keys\abc.key"),
+            "/home/deploy",
+        );
+        assert_eq!(
+            args,
+            vec![
+                "-t".to_string(),
+                "-p".to_string(),
+                "2222".to_string(),
+                "-i".to_string(),
+                r"C:\Temp\mini-term-ssh-keys\abc.key".to_string(),
+                "deploy@10.0.0.5".to_string(),
+                "cd '/home/deploy' && exec $SHELL -l".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_ssh_launcher_args_never_uses_batchmode() {
+        // BatchMode=yes 会连带禁用密码认证,破坏 PTY autofill 灌密码链路
+        // (见 spec/backend/index.md gotcha)。任何组合下都不允许出现。
+        for (port, identity) in [(22u16, None), (2222, Some("/k")), (0, None)] {
+            let args = build_ssh_launcher_args("h", port, "u", identity, "/p");
+            assert!(
+                !args.iter().any(|a| a.contains("BatchMode")),
+                "args 不得包含 BatchMode: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_ssh_launcher_args_hostile_remote_path_is_contained() {
+        // 恶意路径整体落在单引号内,`;` 与 `$()` 不会成为独立命令
+        let args = build_ssh_launcher_args("h", 22, "u", None, "/tmp'; rm -rf /; echo '");
+        let remote_cmd = args.last().unwrap();
+        assert_eq!(
+            remote_cmd,
+            r"cd '/tmp'\''; rm -rf /; echo '\''' && exec $SHELL -l"
+        );
+    }
+
+    #[test]
+    fn fallback_local_cwd_returns_nonempty() {
+        assert!(!fallback_local_cwd().is_empty());
     }
 
     // === WSLENV 字符串拼接(WSL 分支项目级 env 注入) ===

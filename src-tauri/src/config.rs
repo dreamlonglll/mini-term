@@ -208,6 +208,11 @@ pub struct ProjectConfig {
     /// WSL 根项目(UNC 路径)不落此配置,distro 从路径自动推导。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wsl_sessions_distro: Option<String>,
+    /// SSH 远程项目(task 07-05):有值即远程项目,指向 `sshConnections` 里
+    /// 一条连接的 id;此时 `path` 存**远程 POSIX 绝对路径**(如 `/home/u/proj`)。
+    /// 引用为单一来源、不内嵌连接快照——连接被删除时项目进入「断链」错误态。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_connection_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -827,6 +832,37 @@ mod tests {
             !serialized.contains("envVars"),
             "空 envVars 不应序列化进 JSON: {serialized}"
         );
+    }
+
+    #[test]
+    fn ssh_connection_id_round_trip_and_absent_default() {
+        // 远程项目:sshConnectionId 有值,path 为远程 POSIX 绝对路径
+        let json = r#"{
+            "projects": [
+                {"id": "p1", "name": "remote", "path": "/home/u/proj", "sshConnectionId": "conn-1"},
+                {"id": "p2", "name": "local", "path": "D:\\Git\\x"}
+            ],
+            "defaultShell": "cmd",
+            "availableShells": [{"name": "cmd", "command": "cmd"}],
+            "uiFontSize": 13,
+            "terminalFontSize": 14
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.projects[0].ssh_connection_id.as_deref(), Some("conn-1"));
+        assert_eq!(config.projects[0].path, "/home/u/proj");
+        // 旧配置无该字段 → None(向后兼容)
+        assert!(config.projects[1].ssh_connection_id.is_none());
+
+        // round-trip:camelCase 字段名保留;None 不写入 JSON
+        let serialized = serde_json::to_string(&config).unwrap();
+        assert!(serialized.contains("\"sshConnectionId\":\"conn-1\""));
+        assert_eq!(
+            serialized.matches("sshConnectionId").count(),
+            1,
+            "本地项目不应序列化 sshConnectionId: {serialized}"
+        );
+        let reparsed: AppConfig = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.projects[0].ssh_connection_id.as_deref(), Some("conn-1"));
     }
 
     #[test]
