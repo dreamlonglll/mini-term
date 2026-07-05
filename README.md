@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>A desktop terminal manager built for the AI era</strong><br>
-  Powered by Tauri v2 · Multi-project · Multi-tab · Split-pane layout · AI process awareness · Remote driving over IM platforms (cc-connect)
+  Powered by Tauri v2 · Multi-project · Multi-tab · Split-pane layout · AI process awareness · SSH remote projects · Remote driving over IM platforms (cc-connect)
 </p>
 
 <p align="center">
@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.6.5-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.6.6-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -62,6 +62,7 @@ Mini-Term solves all of the above with one lightweight desktop app.
 - **Private-key permission handling** — When connecting with a private key, the key is copied to a permission-tightened temporary copy (Windows `icacls` / Unix `0600`) to bypass OpenSSH's "UNPROTECTED PRIVATE KEY FILE" rejection, without modifying your original key file.
 - **Advanced capabilities** — Key-file login (`ssh -i`) and connection grouping.
 - **SSH MCP Server** — Exposes saved SSH connections as MCP tools to AI agents running in the terminal (Claude Code / Codex). The project right-click "Link SSH" menu enables them per project and limits visibility to the selected connections; the built-in `mt-ssh-mcp` sidecar (a stdio MCP server based on the official rmcp) provides `ssh_list_connections`, `ssh_exec`, `ssh_upload` and `ssh_download`, where `ssh_exec` reuses password / private-key auth with timeouts, output capping, and an audit log; `ssh_upload` / `ssh_download` transfer single files over SFTP (streamed in chunks for constant memory, so large files work, unlike base64-echoing through `ssh_exec`), download writes straight to a local path on disk, and a hard guard refuses to ever transfer mini-term's own `config.json` (which holds all saved SSH credentials); enabling / disabling writes idempotently into Claude's `.mcp.json` and Codex's `.codex/config.toml` using named markers. **Since v0.4.10 the sidecar maintains an in-process SSH session pool** (russh 0.61 + tokio): the first call to a connection does one TCP handshake + auth (~seconds), and subsequent commands cost only an RTT; sessions are recycled after 10 minutes idle or 2 hours max, and gracefully `disconnect` when the sidecar exits.
+- **SSH remote projects** — Add a directory on a remote server directly as a mini-term project: the "Add Remote Project" dialog picks a saved SSH connection and takes a remote POSIX path, validating that the directory exists over SSH before saving; the file tree lazy-loads over SFTP (an inline loading spinner on expand, manual refresh, root `.gitignore` filtering); the terminal connects via `ssh -t` and lands straight in the project directory, with a one-click reconnect overlay after a disconnection; the Sessions panel merges the remote machine's Claude / Codex sessions chronologically, with content viewing supported; deleting the referenced connection shows the project in a "broken-link" state rather than failing silently; under the hood it shares the extracted `mt-ssh` crate (persistent russh session pool + SFTP primitives) with the SSH MCP sidecar, and remote cache keys mix in the connection id so identical paths on two servers never cross-contaminate.
 
 ### WSL Support (Windows)
 
@@ -152,7 +153,7 @@ Remotely drive the AI agents running on your machine through IM platforms (Feish
 | Git | git2 0.19 |
 | File watching | notify 7 + ignore 0.4 (.gitignore filtering) |
 | Tauri plugins | `window-state` · `clipboard-manager` · `dialog` · `opener` |
-| Test coverage | 155 Rust unit tests (pty / fs / config / hook / cc-connect) |
+| Test coverage | 313 Rust unit tests (pty / fs / config / hook / ssh / cc-connect) |
 
 ## Getting Started
 
@@ -212,6 +213,7 @@ mini-term/
 │   ├── styles.css                # Global styles + CSS variables (Warm Carbon)
 │   ├── components/
 │   │   ├── ProjectList.tsx       # Project list + nested groups + DONE badge
+│   │   ├── AddRemoteProjectModal.tsx # Add SSH remote project dialog (connection pick + remote path validation)
 │   │   ├── SessionList.tsx       # AI session history list (Claude / Codex)
 │   │   ├── FileTree.tsx          # File directory tree + Git status + create / rename
 │   │   ├── TerminalArea.tsx      # Tab management + split-tree operations
@@ -244,6 +246,7 @@ mini-term/
 │       ├── projectTree.ts        # Recursive project tree operations
 │       ├── terminalCache.ts      # xterm cache + copy/paste
 │       ├── projectDataCache.ts   # FileTree / GitHistory per-project data cache
+│       ├── remoteProject.ts      # SSH remote project helpers (detection / broken-link check / remote PTY creation)
 │       ├── themeManager.ts       # Theme switching + system color watching
 │       └── updateChecker.ts      # GitHub Release version check
 ├── src-tauri/                    # Rust backend (Tauri app + shared crate + sidecars)
@@ -260,8 +263,10 @@ mini-term/
 │   │   ├── hook_server.rs        # Hook HTTP server (receives AI tool events)
 │   │   ├── hook_registry.rs      # Hook register / unregister (Claude Code + Codex)
 │   │   ├── ssh.rs                # SSH connection management + password auto-fill / key handling
+│   │   ├── remote_ssh.rs         # SSH remote projects (SFTP dir listing / dir validation / remote session reading)
 │   │   └── ssh_mcp_registry.rs   # Per-project SSH MCP enablement (writes .mcp.json / Codex config)
 │   ├── mt-core/                  # Shared library crate without tauri deps (SSH types / config / keys)
+│   ├── mt-ssh/                   # Shared SSH crate (persistent russh session pool + SFTP primitives, used by both the app and sidecars)
 │   └── mt-sidecars/src/bin/      # Standalone sidecar crate (no tauri-build dependency)
 │       ├── miniterm-hook.rs      # Hook CLI tool (called by AI tool hooks)
 │       └── mt-ssh-mcp.rs         # SSH MCP server (rmcp stdio, for terminal AI agents)
@@ -285,7 +290,7 @@ ai-working → ai-idle → Toast + DONE Tag + requestUserAttention
 
 ### Tauri Interface Overview
 
-- **Commands (61)** — PTY: `create_pty` · `write_pty` · `resize_pty` · `kill_pty`; FS: `list_directory` · `read_file_content` · `watch_directory` · `unwatch_directory` · `create_file` · `create_directory` · `rename_entry` · `delete_entry` · `filter_directories`; Search: `start_search` · `cancel_search`; Git: `get_git_status` · `get_git_diff` · `discover_git_repos` · `get_git_log` · `get_repo_branches` · `get_commit_files` · `get_commit_file_diff` · `git_pull` · `git_push` · `get_changes_status` · `git_stage` · `git_unstage` · `git_stage_all` · `git_unstage_all` · `git_commit` · `git_discard_file`; Config: `load_config` · `save_config`; Editor: `open_in_editor` · `open_path_with_default_app`; Clipboard: `read_clipboard_image` · `save_clipboard_text`; AI: `get_ai_sessions` · `get_wsl_ai_sessions` · `get_ai_session_content`; WSL: `list_wsl_distros`; Hook: `register_ai_hooks` · `unregister_ai_hooks` · `get_hook_config_snippet` · `get_hook_status` · `toggle_hook_server`; SSH: `arm_ssh_autofill` · `prepare_ssh_key`; SSH MCP: `enable_ssh_mcp` · `disable_ssh_mcp`; Theme: `set_window_dark_mode`; cc-connect: `cc_connect_probe` · `cc_connect_read_token` · `cc_connect_config_path` · `cc_connect_start` · `cc_connect_stop` · `cc_connect_restart` · `cc_connect_list_projects` · `cc_connect_import_project` · `cc_connect_import_projects` · `cc_connect_unlink_project`
+- **Commands (65)** — PTY: `create_pty` · `write_pty` · `resize_pty` · `kill_pty`; FS: `list_directory` · `read_file_content` · `watch_directory` · `unwatch_directory` · `create_file` · `create_directory` · `rename_entry` · `delete_entry` · `filter_directories`; Search: `start_search` · `cancel_search`; Git: `get_git_status` · `get_git_diff` · `discover_git_repos` · `get_git_log` · `get_repo_branches` · `get_commit_files` · `get_commit_file_diff` · `git_pull` · `git_push` · `get_changes_status` · `git_stage` · `git_unstage` · `git_stage_all` · `git_unstage_all` · `git_commit` · `git_discard_file`; Config: `load_config` · `save_config`; Editor: `open_in_editor` · `open_path_with_default_app`; Clipboard: `read_clipboard_image` · `save_clipboard_text`; AI: `get_ai_sessions` · `get_wsl_ai_sessions` · `get_ai_session_content`; WSL: `list_wsl_distros`; Hook: `register_ai_hooks` · `unregister_ai_hooks` · `get_hook_config_snippet` · `get_hook_status` · `toggle_hook_server`; SSH: `arm_ssh_autofill` · `prepare_ssh_key`; SSH MCP: `enable_ssh_mcp` · `disable_ssh_mcp`; SSH remote: `ssh_remote_list_directory` · `ssh_remote_validate_dir` · `ssh_remote_ai_sessions` · `ssh_remote_ai_session_content`; Theme: `set_window_dark_mode`; cc-connect: `cc_connect_probe` · `cc_connect_read_token` · `cc_connect_config_path` · `cc_connect_start` · `cc_connect_stop` · `cc_connect_restart` · `cc_connect_list_projects` · `cc_connect_import_project` · `cc_connect_import_projects` · `cc_connect_unlink_project`
 - **Events (backend → frontend)** — `pty-output` · `pty-exit` · `pty-status-change` · `fs-change` · `search-results` · `search-complete`
 
 ### Status Priority
