@@ -8,8 +8,8 @@
 
 <!-- @@@auto:current-status -->
 - **Active File**: `journal-1.md`
-- **Total Sessions**: 18
-- **Last Active**: 2026-07-02
+- **Total Sessions**: 19
+- **Last Active**: 2026-07-05
 <!-- @@@/auto:current-status -->
 
 ---
@@ -19,7 +19,7 @@
 <!-- @@@auto:active-documents -->
 | File | Lines | Status |
 |------|-------|--------|
-| `journal-1.md` | ~622 | Active |
+| `journal-1.md` | ~658 | Active |
 <!-- @@@/auto:active-documents -->
 
 ---
@@ -29,6 +29,7 @@
 <!-- @@@auto:session-history -->
 | # | Date | Title | Commits | Branch |
 |---|------|-------|---------|--------|
+| 19 | 2026-07-05 | SSH 远程开发：远程项目全链路（grilling 设计 + 三批实现 + 双轮检查） | `413b8f1`, `b878b52`, `d8bb2d9`, `bdbfaa4` | `feature/ssh-remote-projects` |
 | 18 | 2026-07-02 | Session 块支持查看 WSL 内 claude/codex 历史会话 | `cea1250`, `c35b331` | `feature/wsl-ai-sessions` |
 | 17 | 2026-06-09 | mt-ssh-mcp SFTP 文件上传/下载 | `43cf5e6`, `05d182d` | `feat/ssh-mcp-sftp-transfer` |
 | 16 | 2026-06-06 | 修复 mt-ssh-mcp 无法用传统 PKCS#1 RSA 私钥连接 SSH | `6cda88d`, `318e4f6` | `main` |

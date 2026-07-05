@@ -620,3 +620,39 @@ grilling 拷问收敛 7 项需求决议后走完 trellis 全程：WSL 根项目�
 ### Next Steps
 
 - None - task complete
+
+
+## Session 19: SSH 远程开发：远程项目全链路（grilling 设计 + 三批实现 + 双轮检查）
+
+**Date**: 2026-07-05
+**Task**: SSH 远程开发：远程项目全链路（grilling 设计 + 三批实现 + 双轮检查）
+**Branch**: `feature/ssh-remote-projects`
+
+### Summary
+
+grilling 访谈逐分支收敛 SSH 远程项目设计（类 Remote-SSH：sshConnectionId 引用连接 + 远程 POSIX path），trellis 全流程落地：PR1 抽 mt-ssh 共享 crate（russh 池+SFTP 原语，sidecar 零行为变化）；PR2 后端四个 ssh_remote_* async command + create_pty sshRemote 直连启动器（引号安全、autofill spawn 前预注册）；PR3 前端添加入口/远程文件树/断线一键重连/远程 Session 混排，i18n 双语。两轮 trellis-check 修复 5 问题（map_while 截断回归、exitedPtyIds 无界增长、缓存串键等）。cargo test 209+26+40 全绿，tsc 通过。spec 新增 ssh-remote-project.md 契约，CONTEXT.md 补术语。README 留发版更新；真机端到端验收待做。
+
+### Main Changes
+
+(Add details)
+
+### Git Commits
+
+| Hash | Message |
+|------|---------|
+| `413b8f1` | (see git log) |
+| `b878b52` | (see git log) |
+| `d8bb2d9` | (see git log) |
+| `bdbfaa4` | (see git log) |
+
+### Testing
+
+- [OK] (Add test results)
+
+### Status
+
+[OK] **Completed**
+
+### Next Steps
+
+- None - task complete
