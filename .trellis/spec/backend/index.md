@@ -22,6 +22,7 @@
 | [mini-term × cc-connect 集成约定](./cc-connect-integration.md) | Management API :9820 接入面、token 从 `~/.cc-connect/config.toml` 读、创建新项目必经 toml_edit + `POST /api/v1/restart`（`/reload` 不生效）、dashboard iframe URL + race-safe broken 标记 |
 | [Tauri command nested struct 参数 invoke 约定](./tauri-command-nested-args.md) | 后端 command 含 struct 参数时前端 invoke 必须 wrap `{ req: {...} }` 而非散开；含 `#[serde(rename_all = "camelCase")]` 后跨边界字段名严格 1:1 对齐 |
 | [经 `\\wsl$` UNC 扫描 WSL 内 AI 会话](./wsl-unc-session-scanning.md) | 从 Windows 读 WSL 发行版内文件的完整契约：发行版枚举只读注册表 Lxss（禁 spawn wsl.exe）、秒级 9P IO 必须 `#[tauri::command(async)]`、缓存锁不得跨慢 IO、unix/windows 两套 normalize 不可混用、一切失败静默降级 |
+| [SSH 远程项目契约](./ssh-remote-project.md) | `sshConnectionId` 判别字段语义、4 个 `ssh_remote_*` command + `create_pty sshRemote` 签名、POSIX 路径纪律、密码 autofill 须 spawn 前预注册、本地消费者 gate 规则、`map_while(Result::ok)` 截断陷阱 |
 
 ---
 
@@ -35,6 +36,8 @@
 
 **已在 `mt-core` 的内容**：`SshConnection` 类型、`scan_ssh_prompt` / `strip_ansi_codes`、`prepare_ssh_key` 纯逻辑、`config.json` 读取（`read_ssh_connections_for_project` 按项目关联范围过滤连接 / `config_json_path`）。
 
+**重依赖共享逻辑放 `mt-ssh`**：需要 tokio/russh 的共享能力（SSH 会话池、SFTP 原语）放 `src-tauri/mt-ssh/`（同样 tauri-free），别塞进刻意轻量的 `mt-core`。主程序与 `mt-sidecars` 各自路径依赖 `mt-ssh`、各持一池实例（同一台机器可能同时存在两条连接，已接受）。russh 类型统一从 `mt_ssh::russh` 再导出取，杜绝双版本类型不可互换。
+
 **注意**：`mt-core` 没有 `AppHandle`，定位 `config.json` 之类的路径要用 `dirs` crate 自行按平台拼（镜像 `src-tauri/src/bin/miniterm-hook.rs` 的平台分支），不能用 Tauri 的 `app.path()`。
 
 ---
@@ -43,7 +46,7 @@
 
 > **`BatchMode=yes` 会连带禁用 SSH 密码认证。**
 >
-> 给 `ssh` 拼参数时，`-o BatchMode=yes`（让密钥 / agent 认证失败时立即返回、不挂起）会**同时禁掉密码认证**。需要 PTY autofill 灌密码的连接绝不能带 `BatchMode=yes`。**当前仅 mini-term 主程序内置终端的 SSH 启动路径仍依赖 ssh CLI**（见 `src-tauri/src/ssh.rs` 与 `src-tauri/src/pty.rs` 的 `arm_ssh_autofill` / PTY 扫描逻辑）；`mt-ssh-mcp` sidecar 自 v0.4.10 起已切换到 russh 进程内会话池（`src-tauri/mt-sidecars/src/pool.rs`），不再走 ssh CLI 与 BatchMode，无此 gotcha。
+> 给 `ssh` 拼参数时，`-o BatchMode=yes`（让密钥 / agent 认证失败时立即返回、不挂起）会**同时禁掉密码认证**。需要 PTY autofill 灌密码的连接绝不能带 `BatchMode=yes`。**当前仅 mini-term 主程序内置终端的 SSH 启动路径仍依赖 ssh CLI**（手动右键连接与远程项目 pane 的 `build_ssh_launcher_args` 均是，见 `src-tauri/src/ssh.rs` 与 `src-tauri/src/pty.rs` 的 `arm_ssh_autofill` / PTY 扫描逻辑，后者有「永不含 BatchMode」反例单测守护）；`mt-ssh-mcp` sidecar 自 v0.4.10 起已切换到 russh 进程内会话池（现位于 `src-tauri/mt-ssh/src/pool.rs`），不再走 ssh CLI 与 BatchMode，无此 gotcha。
 
 > **stdio MCP sidecar 的 stdout 只能输出协议消息。**
 >

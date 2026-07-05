@@ -155,5 +155,5 @@ let wh = PrivateKeyWithHashAlg::new(Arc::new(key), rsa_hash);
 task `06-06-ssh-mcp-pkcs1-rsa-key`:用 Oracle Cloud 下发的 2048-bit PKCS#1 RSA key 连
 `oracle-4c-24g`,先报 `Unsupported key type RSA`(坑1),加 fallback 后变
 `server rejected all configured methods`(坑2),改 `best_supported_rsa_hash` 后端到端连通。
-见 `src-tauri/mt-sidecars/src/pool.rs` 的 `authenticate` / `load_private_key_compat` /
+见 `src-tauri/mt-ssh/src/pool.rs`（07-05 自 mt-sidecars 抽包）的 `authenticate` / `load_private_key_compat` /
 `try_parse_pkcs1_rsa` 及其单测。
