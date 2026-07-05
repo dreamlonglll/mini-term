@@ -17,6 +17,11 @@ path = "src/bin/mt-ssh-mcp.rs"
 
 [dependencies]
 mt-core = { path = "../mt-core" }
+# SSH 持久会话池 + SFTP 传输原语(russh 0.61 + ring 后端、ssh-key/rsa 精确锁、
+# russh-sftp)。task 07-05-ssh-remote-projects PR1 抽到共享 crate mt-ssh,
+# 主程序与 sidecar 共用;russh 类型(如 ChannelMsg)经 `mt_ssh::russh` 再导出取用,
+# 保证与池同一 crate 版本。依赖版本锁的完整说明见 ../mt-ssh/Cargo.toml。
+mt-ssh = { path = "../mt-ssh" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "6"
@@ -24,42 +29,7 @@ dirs = "6"
 portable-pty = "0.8"
 # mt-ssh-mcp 的 MCP server 实现：官方 rmcp stdio server。
 rmcp = { version = "1", features = ["server", "macros", "transport-io"] }
-# `fs` feature 供 SFTP 传输用 tokio::fs 流式读写本地文件(task 06-09)。
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "time", "sync", "fs"] }
-# mt-ssh-mcp 的 SSH 客户端实现：纯 Rust + tokio 原生 async；
-# 持久会话池由它建/维持单条 SSH 连接，channel 用于 exec。
-#
-# 加密后端用 ring 而非默认 aws-lc-rs：后者在 Windows MSVC 上需要 NASM 汇编器
-# (aws-lc-sys 的 jitterentropy / chacha20 等用 NASM 写优化路径)，本仓库与 CI
-# 都没装 NASM；ring 是 pure Rust 不需要任何额外工具链。
-russh = { version = "0.61", default-features = false, features = ["ring"] }
-# 会话池 shutdown 时并发关闭多条 session 用 join_all。
-futures = "0.3"
-# known_hosts 文件读写时编解码 server pubkey 字节。
-base64 = "0.22"
-# --- 传统 PKCS#1 RSA 私钥支持 (task 06-06-ssh-mcp-pkcs1-rsa-key) ---
-# russh::keys 底层 ssh-key 默认只解析 OpenSSH / PKCS#8; 传统 `-----BEGIN RSA PRIVATE
-# KEY-----`(PKCS#1) 会报 "Unsupported key type RSA" 导致连接失败。启用 ssh-key 的
-# `rsa` feature, 在 pool.rs 做纯 Rust fallback: PKCS#1 PEM -> rsa::RsaPrivateKey ->
-# ssh_key::private::RsaKeypair -> ssh_key::PrivateKey, 再交给 russh 认证。
-# 版本精确锁 =0.7.0-rc.10 与 russh 0.61 内部锁定一致, 否则 PrivateKey 跨 crate 版本
-# 类型不可互换(同 rand_core 多版本陷阱)。
-ssh-key = { version = "=0.7.0-rc.10", default-features = false, features = ["rsa", "alloc"] }
-# 解析 PKCS#1 RSA。版本须与 ssh-key 0.7.0-rc.10 内部锁定的 rsa 一致(=0.10.0-rc.18),
-# 否则 RsaKeypair::try_from(&rsa::RsaPrivateKey) 因类型来自不同 crate 版本而编译失败。
-# 用默认 features(std + encoding, 后者含 pkcs1 DER 解码); rsa 没有 `pem` feature
-# (PEM 仅由 pkcs1/pem 提供且 rsa 未传递), 故走 from_pkcs1_der + 自剥 PEM(base64)路径。
-# 纯 Rust(num-bigint/crypto-bigint), 不触发 aws-lc 的 NASM 工具链依赖; rand_core 统一 0.10。
-rsa = "=0.10.0-rc.18"
-# --- SFTP 文件上传/下载 (task 06-09-ssh-mcp-sftp-transfer) ---
-# russh-sftp 通过 AsyncRead+AsyncWrite 接 russh 的 channel.into_stream(),本身**不依赖
-# russh**(russh 仅在它的 dev-dependencies 里),故不引入第二个 russh、不破坏 ssh-key /
-# ssh-encoding / rsa 的现有精确锁,也不触发 aws-lc 的 NASM 工具链(子代理本地实测依赖树零
-# aws-lc,russh 仍单一 0.61.x)。它是 russh 官方 examples/sftp_client.rs 钦定的配套库。
-# 无需开任何 feature:async-trait 仅 server 端用得到,client 不需要。
-# 详见 .trellis/tasks/06-09-ssh-mcp-sftp-transfer/research/russh-sftp-options.md。
-russh-sftp = "2.3.0"
-
-[dev-dependencies]
-# 单测里的 SSH 公钥用预计算 OpenSSH 字符串解析,无需 rand 依赖。
+# SFTP 传输的 tokio::fs 本地文件读写已随会话池迁入 mt-ssh(其 `fs`/`io-util`
+# features 经 feature unification 依旧生效);这里只保留 sidecar 自身需要的面。
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "time", "sync"] }
 
