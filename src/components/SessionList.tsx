@@ -68,6 +68,33 @@ export function SessionList() {
   const fetchSessions = useCallback((project: ProjectConfig, force: boolean) => {
     const reqId = ++requestIdRef.current;
 
+    // SSH 远程项目:仅远程来源(本地 get_ai_sessions 对远程 POSIX 路径无意义,
+    // WSL 来源与远程互斥)。失败(含断链)后端静默降级返回空列表。
+    if (project.sshConnectionId) {
+      setWslSessions([]);
+      setWslLoading(false);
+      setLoading(true);
+      invoke<AiSession[]>('ssh_remote_ai_sessions', {
+        connectionId: project.sshConnectionId,
+        projectPath: project.path,
+        force,
+      })
+        .then((result) => {
+          if (requestIdRef.current !== reqId) return;
+          setHostSessions(result);
+          setDisplayCount(PAGE_SIZE);
+        })
+        .catch(() => {
+          if (requestIdRef.current !== reqId) return;
+          setHostSessions([]);
+        })
+        .finally(() => {
+          if (requestIdRef.current !== reqId) return;
+          setLoading(false);
+        });
+      return;
+    }
+
     // Windows 宿主来源:照旧秒出先显示
     setLoading(true);
     invoke<AiSession[]>('get_ai_sessions', { projectPath: project.path })
@@ -113,8 +140,9 @@ export function SessionList() {
 
   useEffect(() => {
     if (activeProject?.path) {
-      // 项目切换 / WSL 来源配置变化:先清掉上一来源的 WSL 条目,避免与新项目混排
+      // 项目切换 / 来源配置变化:先清掉上一来源的条目,避免与新项目混排
       setWslSessions([]);
+      setHostSessions([]);
       fetchSessions(activeProject, false);
     } else {
       requestIdRef.current++;
@@ -125,7 +153,7 @@ export function SessionList() {
       setDisplayCount(PAGE_SIZE);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeProject?.path, activeProject?.wslSessionsDistro, fetchSessions]);
+  }, [activeProject?.path, activeProject?.wslSessionsDistro, activeProject?.sshConnectionId, fetchSessions]);
 
   // 合并两个来源,按时间戳降序混排(与后端排序口径一致:ISO 8601 字符串比较)
   const allSessions = useMemo(() => {
@@ -155,6 +183,12 @@ export function SessionList() {
             <span
               className="inline-block w-3 h-3 border border-[var(--text-muted)] border-t-transparent rounded-full animate-spin"
               title={t('sessionList.wslLoading')}
+            />
+          )}
+          {loading && !!activeProject?.sshConnectionId && (
+            <span
+              className="inline-block w-3 h-3 border border-[var(--text-muted)] border-t-transparent rounded-full animate-spin"
+              title={t('sessionList.remoteLoading')}
             />
           )}
         </span>
@@ -189,10 +223,14 @@ export function SessionList() {
 
         {visibleSessions.map((session) => {
           const badge = TYPE_BADGE[session.sessionType] ?? TYPE_BADGE.claude;
+          // 远程会话标识:显示来源连接名(连接被删时回退 'SSH')
+          const remoteConnName = session.sshConnectionId
+            ? (config.sshConnections.find((c) => c.id === session.sshConnectionId)?.name ?? 'SSH')
+            : undefined;
 
           return (
             <div
-              key={`${session.sessionType}-${session.wslDistro ?? 'host'}-${session.id}`}
+              key={`${session.sessionType}-${session.wslDistro ?? session.sshConnectionId ?? 'host'}-${session.id}`}
               className="flex items-start gap-2 px-2.5 py-1.5 rounded-[var(--radius-sm)] text-xs group hover:bg-[var(--border-subtle)] transition-colors cursor-default"
               title={session.title}
               onContextMenu={(e) => {
@@ -232,6 +270,14 @@ export function SessionList() {
                   {session.wslDistro && (
                     <span className="ml-1.5 opacity-70" title={session.wslDistro}>
                       {t('sessionList.wslBadge')}
+                    </span>
+                  )}
+                  {remoteConnName && (
+                    <span
+                      className="ml-1.5 opacity-70"
+                      title={t('sessionList.remoteBadgeTitle', { name: remoteConnName })}
+                    >
+                      {remoteConnName}
                     </span>
                   )}
                 </div>

@@ -14,6 +14,8 @@ export function GitHistory() {
   const activeProjectId = useAppStore((s) => s.activeProjectId);
   const config = useAppStore((s) => s.config);
   const project = config.projects.find((p) => p.id === activeProjectId);
+  // SSH 远程项目:git 命令跑在本地,对远程路径无意义 → 整个面板显示占位(远程 Git 二期)
+  const isRemote = !!project?.sshConnectionId;
 
   const [activeTab, setActiveTab] = useState<GitTab>('history');
 
@@ -28,7 +30,7 @@ export function GitHistory() {
   const dropdownRef = useRef<HTMLDivElement>(null);
 
   const loadRepos = useCallback(() => {
-    if (!project) return;
+    if (!project || isRemote) return;
     invoke<GitRepoInfo[]>('discover_git_repos', { projectPath: project.path })
       .then((r) => {
         setRepos(r);
@@ -40,7 +42,7 @@ export function GitHistory() {
         setGitHistoryCache(project.path, { repos: r, selectedRepo: nextRepo });
       })
       .catch(() => setRepos([]));
-  }, [project?.path]);
+  }, [project?.path, isRemote]);
 
   useEffect(() => {
     if (!project) {
@@ -84,6 +86,14 @@ export function GitHistory() {
     return (
       <div className="h-full bg-[var(--bg-surface)] flex items-center justify-center text-[var(--text-muted)] text-base">
         {t("gitHistory.selectProject")}
+      </div>
+    );
+  }
+
+  if (isRemote) {
+    return (
+      <div className="h-full bg-[var(--bg-surface)] flex items-center justify-center text-[var(--text-muted)] text-base border-t border-[var(--border-subtle)]">
+        {t("gitHistory.remoteNotSupported")}
       </div>
     );
   }

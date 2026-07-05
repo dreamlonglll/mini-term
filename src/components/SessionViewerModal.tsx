@@ -7,7 +7,7 @@ import rehypeRaw from 'rehype-raw';
 import { MOD_LABEL } from '../utils/platform';
 import { handleExternalLinkClick } from '../utils/externalLink';
 import { useT } from '../i18n';
-import type { AiSession, AiSessionMessage } from '../types';
+import type { AiSession, AiSessionMessage, RemoteSessionContent } from '../types';
 
 interface Props {
   open: boolean;
@@ -64,13 +64,26 @@ export function SessionViewerModal({ open, onClose, session, projectPath }: Prop
     setMatchIdx(0);
     setUserIdx(-1);
 
-    invoke<AiSessionMessage[]>('get_ai_session_content', {
-      sessionType: session.sessionType,
-      sessionId: session.id,
-      projectPath,
-      // WSL 会话:回传来源发行版,后端从对应 UNC 位置读正文
-      wslDistro: session.wslDistro,
-    })
+    // SSH 远程会话:走 SFTP 读取链路。后端支持增量 offset(返回 nextOffset 供下次续读),
+    // 与本地查看链路对齐:打开时一次性全量加载(offset=0),modal 内无刷新入口,
+    // nextOffset 留给后续需要增量刷新的调用方。
+    const contentPromise: Promise<AiSessionMessage[]> = session.sshConnectionId
+      ? invoke<RemoteSessionContent>('ssh_remote_ai_session_content', {
+          connectionId: session.sshConnectionId,
+          sessionType: session.sessionType,
+          sessionId: session.id,
+          projectPath,
+          offset: 0,
+        }).then((r) => r.messages)
+      : invoke<AiSessionMessage[]>('get_ai_session_content', {
+          sessionType: session.sessionType,
+          sessionId: session.id,
+          projectPath,
+          // WSL 会话:回传来源发行版,后端从对应 UNC 位置读正文
+          wslDistro: session.wslDistro,
+        });
+
+    contentPromise
       .then((msgs) => {
         setMessages(msgs);
         msgRefs.current = new Array(msgs.length).fill(null);

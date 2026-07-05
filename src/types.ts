@@ -136,6 +136,9 @@ export interface ProjectConfig {
   /** WSL 会话来源发行版名（「WSL 关联项目」声明）；undefined = 未启用。
    *  WSL 根项目（UNC 路径）不落此配置,distro 从路径自动推导。 */
   wslSessionsDistro?: string;
+  /** SSH 远程项目：有值 = 该项目指向远程机器上的目录（引用 sshConnections 里的连接 id）。
+   *  此时 `path` 存远程 POSIX 绝对路径。连接被删除 → 项目进入「断链」错误态。 */
+  sshConnectionId?: string;
 }
 
 export interface ProjectEnvVar {
@@ -238,6 +241,8 @@ export interface AiSession {
   timestamp: string; // ISO 8601
   /** 会话来源:有值 = 该 WSL 发行版内的会话,undefined = Windows 宿主会话 */
   wslDistro?: string;
+  /** 会话来源:有值 = 该 SSH 连接指向的远程机器上的会话（与 wslDistro 互斥） */
+  sshConnectionId?: string;
 }
 
 /** list_wsl_distros 返回的单条发行版记录 */
@@ -250,6 +255,20 @@ export interface AiSessionMessage {
   role: 'user' | 'assistant';
   content: string;
   timestamp: string;
+}
+
+/** ssh_remote_ai_session_content 返回值（对齐 Rust RemoteSessionContent camelCase 序列化） */
+export interface RemoteSessionContent {
+  /** 本次解析出的消息（与本地 get_ai_session_content 的元素同构） */
+  messages: AiSessionMessage[];
+  /** 下次增量读取应传入的字节偏移。首次调用传 offset=0（或省略）拿全量 */
+  nextOffset: number;
+}
+
+/** create_pty 的可选远程启动参数（对齐 Rust SshRemoteSpec camelCase 反序列化） */
+export interface SshRemoteSpec {
+  connectionId: string;
+  remotePath: string;
 }
 
 // === 文件树 ===

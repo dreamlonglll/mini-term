@@ -16,6 +16,8 @@ export const sessionList = {
     more: "{n} 条更多…",
     wslBadge: "WSL",
     wslLoading: "正在加载 WSL 会话…",
+    remoteLoading: "正在加载远程会话…",
+    remoteBadgeTitle: "远程会话 · {name}",
   },
   en: {
     time: {
@@ -34,5 +36,7 @@ export const sessionList = {
     more: "{n} more…",
     wslBadge: "WSL",
     wslLoading: "Loading WSL sessions…",
+    remoteLoading: "Loading remote sessions…",
+    remoteBadgeTitle: "Remote session · {name}",
   },
 } as const;

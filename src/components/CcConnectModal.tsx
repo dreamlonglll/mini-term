@@ -229,7 +229,7 @@ function CcConnectModalContent({ onClose }: { onClose: () => void }) {
   const handleBatchImport = useCallback(async () => {
     const cfg = useAppStore.getState().config;
     const targets = cfg.projects.filter(
-      (p) => selectedIds.has(p.id) && cfg.ccConnect?.projectLinks?.[p.id] === undefined,
+      (p) => !p.sshConnectionId && selectedIds.has(p.id) && cfg.ccConnect?.projectLinks?.[p.id] === undefined,
     );
     if (targets.length === 0) return;
     setImporting(true);
@@ -261,8 +261,10 @@ function CcConnectModalContent({ onClose }: { onClose: () => void }) {
 
   const running = ccStatus?.running ?? false;
 
+  // SSH 远程项目不可导入:cc-connect 跑在本机,workDir 是远程 POSIX 路径对它无意义
+  const importableProjects = config.projects.filter((p) => !p.sshConnectionId);
   // 未导入项目(projectLinks 无记录)+ 勾选交集,全选与批量按钮据此计算(避免已导入残留 id 干扰)
-  const unimportedProjects = config.projects.filter((p) => config.ccConnect?.projectLinks?.[p.id] === undefined);
+  const unimportedProjects = importableProjects.filter((p) => config.ccConnect?.projectLinks?.[p.id] === undefined);
   const selectedCount = unimportedProjects.filter((p) => selectedIds.has(p.id)).length;
   const allSelected = unimportedProjects.length > 0 && selectedCount === unimportedProjects.length;
   const someSelected = selectedCount > 0 && !allSelected;
@@ -350,13 +352,13 @@ function CcConnectModalContent({ onClose }: { onClose: () => void }) {
                 </button>
               </div>
             </div>
-            {config.projects.length === 0 ? (
+            {importableProjects.length === 0 ? (
               <div className="text-sm text-[var(--text-muted)] px-3 py-2 rounded-[var(--radius-sm)] bg-[var(--bg-base)] border border-[var(--border-subtle)]">
                 {t('ccConnectModal.noProjects')}
               </div>
             ) : (
               <div className="max-h-[180px] overflow-y-auto rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)] divide-y divide-[var(--border-subtle)]">
-                {config.projects.map((p) => {
+                {importableProjects.map((p) => {
                   const linkedName = config.ccConnect?.projectLinks?.[p.id];
                   const imported = linkedName !== undefined;
                   return (

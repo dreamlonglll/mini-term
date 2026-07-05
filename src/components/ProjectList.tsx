@@ -11,6 +11,8 @@ import { DoneTag } from './DoneTag';
 import { SessionList } from './SessionList';
 import { SshAssocModal } from './SshAssocModal';
 import { ProjectEnvVarsModal } from './ProjectEnvVarsModal';
+import { AddRemoteProjectModal } from './AddRemoteProjectModal';
+import { connectionSummary } from './SshModal';
 import { showContextMenu } from '../utils/contextMenu';
 import { showPrompt } from '../utils/prompt';
 import { disposeTerminal } from '../utils/terminalCache';
@@ -72,6 +74,7 @@ export function ProjectList() {
   const [confirmTarget, setConfirmTarget] = useState<{ id: string; name: string } | null>(null);
   const [sshAssocTarget, setSshAssocTarget] = useState<ProjectConfig | null>(null);
   const [envVarsTarget, setEnvVarsTarget] = useState<ProjectConfig | null>(null);
+  const [addRemoteOpen, setAddRemoteOpen] = useState(false);
   const [dropIndicator, setDropIndicator] = useState<DropIndicator | null>(null);
   const [editingGroupId, setEditingGroupId] = useState<string | null>(null);
   const [editingProjectId, setEditingProjectId] = useState<string | null>(null);
@@ -403,6 +406,12 @@ export function ProjectList() {
     const projectStatus = getProjectStatus(project.id);
     const projectPs = projectStates.get(project.id);
     const showDoneTag = !!projectPs?.needsAttention && !isActive;
+    // SSH 远程项目:显示连接名标识;连接被删除 = 断链态（可见、可删,标识转错误色）
+    const isRemote = !!project.sshConnectionId;
+    const remoteConn = isRemote
+      ? config.sshConnections.find((c) => c.id === project.sshConnectionId)
+      : undefined;
+    const remoteBroken = isRemote && !remoteConn;
 
     return (
       <div
@@ -421,24 +430,31 @@ export function ProjectList() {
         onContextMenu={(e) => {
           e.preventDefault();
           e.stopPropagation();
+          // 远程项目 gate:本地专属入口（资源管理器打开 / 关联 SSH MCP / 环境变量 /
+          // WSL 会话）一律隐藏 —— agent 已在远程机、envVars 不注入远程 shell（二期）,
+          // 路径也不是本机可打开的位置。保留:重命名 / 复制绝对路径（远程 POSIX）/ 分组操作。
           const menuItems: Parameters<typeof showContextMenu>[2] = [
             { label: t('projectList.menu.rename'), onClick: () => startRenameProject(project.id, project.name) },
-            { label: t('projectList.menu.openInFolder'), onClick: () => revealItemInDir(project.path) },
+            ...(isRemote ? [] : [
+              { label: t('projectList.menu.openInFolder'), onClick: () => revealItemInDir(project.path) },
+            ]),
             { label: t('projectList.menu.copyAbsolutePath'), onClick: () => navigator.clipboard.writeText(project.path) },
-            { separator: true },
-            {
-              label: t('projectList.menu.associateSsh'),
-              onClick: () => setSshAssocTarget(project),
-            },
-            {
-              label: t('projectList.menu.envVars'),
-              onClick: () => setEnvVarsTarget(project),
-            },
+            ...(isRemote ? [] : [
+              { separator: true as const },
+              {
+                label: t('projectList.menu.associateSsh'),
+                onClick: () => setSshAssocTarget(project),
+              },
+              {
+                label: t('projectList.menu.envVars'),
+                onClick: () => setEnvVarsTarget(project),
+              },
+            ]),
           ];
           // 「WSL 会话」子菜单:选择该项目的 WSL 会话来源发行版。
-          // WSL 根项目不显示(distro 从路径自动推导);
+          // WSL 根项目不显示(distro 从路径自动推导);远程项目不显示(来源互斥);
           // 发行版枚举为空且未配置时也不显示(非 Windows / 未装 WSL 自然隐藏)。
-          if (!isWslPath(project.path)) {
+          if (!isRemote && !isWslPath(project.path)) {
             const distros = wslDistrosCache ?? [];
             const current = project.wslSessionsDistro;
             if (distros.length > 0 || current) {
@@ -505,6 +521,20 @@ export function ProjectList() {
           />
         ) : (
           <span className="truncate flex-1">{project.name}</span>
+        )}
+        {isRemote && (
+          <span
+            className={`flex-shrink-0 max-w-[80px] truncate text-[10px] leading-[14px] px-1 rounded font-mono ${
+              remoteBroken
+                ? 'text-[var(--color-error)] bg-[var(--color-error)]/15'
+                : 'text-[var(--text-muted)] bg-[var(--border-subtle)]'
+            }`}
+            title={remoteBroken
+              ? t('projectList.remoteBrokenTitle')
+              : t('projectList.remoteBadgeTitle', { summary: remoteConn ? connectionSummary(remoteConn) : '' })}
+          >
+            {remoteBroken ? t('projectList.remoteBrokenBadge') : (remoteConn?.name ?? 'SSH')}
+          </span>
         )}
         {showDoneTag ? <DoneTag /> : projectStatus !== 'idle' ? <StatusDot status={projectStatus} /> : null}
         <span
@@ -659,6 +689,13 @@ export function ProjectList() {
                 {t('projectList.addProject')}
               </div>
               <div
+                className="px-2 py-2 border border-dashed border-[var(--border-default)] rounded-[var(--radius-md)] text-center text-sm text-[var(--text-muted)] cursor-pointer hover:border-[var(--accent)] hover:text-[var(--accent)] transition-all duration-200 font-mono"
+                onClick={() => setAddRemoteOpen(true)}
+                title={t('projectList.addRemoteProject')}
+              >
+                SSH
+              </div>
+              <div
                 className="px-3 py-2 border border-dashed border-[var(--border-default)] rounded-[var(--radius-md)] text-center text-sm text-[var(--text-muted)] cursor-pointer hover:border-[var(--accent)] hover:text-[var(--accent)] transition-all duration-200"
                 onClick={handleCreateGroup}
                 title={t('projectList.newGroup')}
@@ -679,6 +716,8 @@ export function ProjectList() {
       <SshAssocModal project={sshAssocTarget} onClose={() => setSshAssocTarget(null)} />
       {/* 环境变量弹窗 */}
       <ProjectEnvVarsModal project={envVarsTarget} onClose={() => setEnvVarsTarget(null)} />
+      {/* 添加远程项目弹窗 */}
+      <AddRemoteProjectModal open={addRemoteOpen} onClose={() => setAddRemoteOpen(false)} />
 
       {/* 删除确认弹窗 — portal 到 body,避免 fluent2 [data-panel] 的 backdrop-filter 形成 containing block 把 fixed 拽进面板 */}
       {confirmTarget && createPortal(

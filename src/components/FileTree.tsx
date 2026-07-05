@@ -12,7 +12,7 @@ import { MOD_LABEL } from '../utils/platform';
 import { DiffModal } from './DiffModal';
 import { FileViewerModal } from './FileViewerModal';
 import { initFileDrag } from '../utils/fileDragState';
-import { getFileTreeCache, setFileTreeCache } from '../utils/projectDataCache';
+import { getFileTreeCache, setFileTreeCache, projectCacheKey } from '../utils/projectDataCache';
 import { useT } from '../i18n';
 import type { FileEntry, FsChangePayload, GitFileStatus, PtyOutputPayload } from '../types';
 
@@ -23,6 +23,9 @@ interface TreeNodeProps {
   gitStatusMap: Map<string, GitFileStatus>;
   onViewDiff: (status: GitFileStatus) => void;
   onViewFile: (path: string) => void;
+  /** SSH 远程项目:有值 = 子目录懒加载走 ssh_remote_list_directory,
+   *  不注册 notify watcher,右键菜单仅保留复制相对/绝对路径(POSIX)。 */
+  remoteConnectionId?: string;
 }
 
 function getRelativePath(targetPath: string, rootPath: string) {
@@ -37,7 +40,7 @@ function getRelativePath(targetPath: string, rootPath: string) {
   return normalizedTarget.slice(normalizedRoot.length + 1).replace(/\//g, sep);
 }
 
-function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff, onViewFile }: TreeNodeProps) {
+function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff, onViewFile, remoteConnectionId }: TreeNodeProps) {
   const t = useT();
   const activeProjectId = useAppStore((s) => s.activeProjectId);
   const [expanded, setExpanded] = useState(() =>
@@ -46,12 +49,27 @@ function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff, onViewF
   const [children, setChildren] = useState<FileEntry[]>([]);
 
   const loadChildren = useCallback(async () => {
+    // 远程目录:SFTP readdir(每次展开重新拉取,不做 notify 监听);
+    // 失败(断线/超时)静默保持旧列表,不清空已展示内容
+    if (remoteConnectionId) {
+      try {
+        const entries = await invoke<FileEntry[]>('ssh_remote_list_directory', {
+          connectionId: remoteConnectionId,
+          path: entry.path,
+          projectRoot,
+        });
+        setChildren(entries);
+      } catch {
+        // 保持旧列表
+      }
+      return;
+    }
     const entries = await invoke<FileEntry[]>('list_directory', {
       projectRoot,
       path: entry.path,
     });
     setChildren(entries);
-  }, [entry.path, projectRoot]);
+  }, [entry.path, projectRoot, remoteConnectionId]);
 
   // 恢复时(初始即展开)加载一次子节点
   useEffect(() => {
@@ -64,12 +82,13 @@ function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff, onViewF
   // 旧实现只在手动折叠当前节点时 unwatch,父级折叠或切换项目导致后代节点直接 unmount
   // 时其 watcher 永不释放,会持续累积 OS 文件监听句柄(inotify / ReadDirectoryChangesW)。
   useEffect(() => {
-    if (!entry.isDir || !expanded) return;
+    // 远程项目不做 notify 监听(SFTP 无监听通道);展开重拉 + 树顶手动刷新代替
+    if (!entry.isDir || !expanded || remoteConnectionId) return;
     invoke('watch_directory', { path: entry.path, projectPath: projectRoot }).catch(() => {});
     return () => {
       invoke('unwatch_directory', { path: entry.path }).catch(() => {});
     };
-  }, [expanded, entry.isDir, entry.path, projectRoot]);
+  }, [expanded, entry.isDir, entry.path, projectRoot, remoteConnectionId]);
 
   const handleToggle = useCallback(async () => {
     if (!entry.isDir) {
@@ -89,10 +108,11 @@ function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff, onViewF
   }, [entry, expanded, loadChildren, onViewFile, activeProjectId]);
 
   useTauriEvent<FsChangePayload>('fs-change', useCallback((payload: FsChangePayload) => {
+    if (remoteConnectionId) return; // 远程项目无 watcher,fs-change 与本树无关
     if (expanded && payload.path.startsWith(entry.path)) {
       loadChildren();
     }
-  }, [expanded, entry.path, loadChildren]));
+  }, [expanded, entry.path, loadChildren, remoteConnectionId]));
 
   return (
     <div>
@@ -107,6 +127,22 @@ function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff, onViewF
           e.preventDefault();
           e.stopPropagation();
           const relativePath = getRelativePath(entry.path, projectRoot);
+          // 远程项目 MVP 只读:仅保留复制相对/绝对路径(路径为 POSIX 分隔符,
+          // getRelativePath 依据根路径无 `\` 自动选 `/`);「资源管理器显示 /
+          // 默认应用打开 / 重命名 / 删除 / 新建」等本地操作一律隐藏。
+          if (remoteConnectionId) {
+            showContextMenu(e.clientX, e.clientY, [
+              {
+                label: t('fileTree.menu.copyRelativePath'),
+                onClick: () => writeText(relativePath),
+              },
+              {
+                label: t('fileTree.menu.copyAbsolutePath'),
+                onClick: () => writeText(entry.path),
+              },
+            ]);
+            return;
+          }
           const items: Parameters<typeof showContextMenu>[2] = [
             {
               label: t('fileTree.menu.copyRelativePath'),
@@ -269,6 +305,7 @@ function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff, onViewF
             gitStatusMap={gitStatusMap}
             onViewDiff={onViewDiff}
             onViewFile={onViewFile}
+            remoteConnectionId={remoteConnectionId}
           />
         ))}
     </div>
@@ -281,6 +318,15 @@ export function FileTree() {
   const config = useAppStore((s) => s.config);
   const setSearchModalOpen = useAppStore((s) => s.setSearchModalOpen);
   const project = config.projects.find((p) => p.id === activeProjectId);
+
+  // SSH 远程项目:文件树走 ssh_remote_list_directory(SFTP readdir),
+  // 不 watch、不拉 git 状态;断链(连接被删除)给明确错误提示。
+  const remoteConnectionId = project?.sshConnectionId;
+  const isRemote = !!remoteConnectionId;
+  const remoteBroken =
+    isRemote && !config.sshConnections.some((c) => c.id === remoteConnectionId);
+  // 缓存 key:远程项目掺连接 id(不同服务器同 POSIX 路径不得互串);本地即 path
+  const cacheKey = project ? projectCacheKey(project) : undefined;
 
   const handleOpenInEditor = useCallback(async (editorName?: string) => {
     if (!project) return;
@@ -311,12 +357,12 @@ export function FileTree() {
   }, [config, handleOpenInEditor]);
 
   const [rootEntries, setRootEntries] = useState<FileEntry[]>(() => {
-    return (project ? getFileTreeCache(project.path) : undefined)?.rootEntries ?? [];
+    return (cacheKey ? getFileTreeCache(cacheKey) : undefined)?.rootEntries ?? [];
   });
   const [gitStatusMap, setGitStatusMap] = useState<Map<string, GitFileStatus>>(() => {
-    return (project ? getFileTreeCache(project.path) : undefined)?.gitStatusMap ?? new Map();
+    return (cacheKey ? getFileTreeCache(cacheKey) : undefined)?.gitStatusMap ?? new Map();
   });
-  const [loading, setLoading] = useState(() => !project || !getFileTreeCache(project.path));
+  const [loading, setLoading] = useState(() => !cacheKey || !getFileTreeCache(cacheKey));
   const [loadError, setLoadError] = useState<string | null>(null);
   const [diffTarget, setDiffTarget] = useState<GitFileStatus | null>(null);
   const [viewFilePath, setViewFilePath] = useState<string | null>(null);
@@ -327,40 +373,55 @@ export function FileTree() {
   gitStatusMapRef.current = gitStatusMap;
 
   const loadGitStatus = useCallback(() => {
-    if (!project) return;
+    if (!project || isRemote) return; // 远程项目跳过 git 状态(远程 Git 二期)
+    const key = projectCacheKey(project);
     invoke<GitFileStatus[]>('get_git_status', { projectPath: project.path })
       .then((statuses) => {
         const map = new Map<string, GitFileStatus>();
         for (const s of statuses) map.set(s.path, s);
         setGitStatusMap(map);
         gitStatusMapRef.current = map;
-        setFileTreeCache(project.path, {
+        setFileTreeCache(key, {
           rootEntries: rootEntriesRef.current,
           gitStatusMap: map,
         });
       })
       .catch(() => setGitStatusMap(new Map()));
-  }, [project?.path]);
+  }, [project?.path, isRemote]);
 
   const debouncedRefresh = useCallback(() => {
     if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
     refreshTimerRef.current = setTimeout(loadGitStatus, 500);
   }, [loadGitStatus]);
 
-  const loadRootEntries = useCallback(() => {
+  /** 加载根目录列表。`refreshIgnore=true` 仅远程有效:强制后端重读根 .gitignore(手动刷新)。 */
+  const loadRootEntries = useCallback((refreshIgnore = false) => {
     if (!project) return;
     const projectPath = project.path;
+    if (remoteBroken) {
+      setLoading(false);
+      setLoadError(t('fileTree.remote.broken'));
+      return;
+    }
     setLoadError(null);
     if (rootEntriesRef.current.length === 0) setLoading(true);
-    invoke<FileEntry[]>('list_directory', {
-      projectRoot: projectPath,
-      path: projectPath,
-    }).then((entries) => {
+    const listPromise = remoteConnectionId
+      ? invoke<FileEntry[]>('ssh_remote_list_directory', {
+          connectionId: remoteConnectionId,
+          path: projectPath,
+          projectRoot: projectPath,
+          refreshIgnore: refreshIgnore || undefined,
+        })
+      : invoke<FileEntry[]>('list_directory', {
+          projectRoot: projectPath,
+          path: projectPath,
+        });
+    listPromise.then((entries) => {
       setRootEntries(entries);
       rootEntriesRef.current = entries;
       setLoading(false);
       setLoadError(null);
-      setFileTreeCache(project.path, {
+      setFileTreeCache(projectCacheKey(project), {
         rootEntries: entries,
         gitStatusMap: gitStatusMapRef.current,
       });
@@ -368,7 +429,7 @@ export function FileTree() {
       setLoading(false);
       setLoadError(typeof err === 'string' ? err : String(err));
     });
-  }, [project?.path]);
+  }, [project?.path, remoteConnectionId, remoteBroken, t]);
 
   useEffect(() => {
     if (!project) {
@@ -380,7 +441,8 @@ export function FileTree() {
     }
     let cancelled = false;
     const projectPath = project.path;
-    const cached = getFileTreeCache(projectPath);
+    const key = projectCacheKey(project);
+    const cached = getFileTreeCache(key);
     if (cached) {
       setRootEntries(cached.rootEntries);
       rootEntriesRef.current = cached.rootEntries;
@@ -394,6 +456,33 @@ export function FileTree() {
     setLoadError(null);
     setDiffTarget(null);
     setViewFilePath(null);
+
+    // SSH 远程项目:SFTP readdir,不拉 git 状态、不注册 notify watcher;
+    // 断链直接给明确错误(项目仍可见、可删除)。
+    if (isRemote) {
+      if (remoteBroken) {
+        setLoading(false);
+        setLoadError(t('fileTree.remote.broken'));
+        return () => { cancelled = true; };
+      }
+      invoke<FileEntry[]>('ssh_remote_list_directory', {
+        connectionId: remoteConnectionId,
+        path: projectPath,
+        projectRoot: projectPath,
+      }).then((entries) => {
+        if (cancelled) return;
+        setRootEntries(entries);
+        rootEntriesRef.current = entries;
+        setLoading(false);
+        setFileTreeCache(key, { rootEntries: entries, gitStatusMap: new Map() });
+      }).catch((err) => {
+        if (cancelled) return;
+        setLoading(false);
+        setLoadError(typeof err === 'string' ? err : String(err));
+      });
+      return () => { cancelled = true; };
+    }
+
     const listPromise = invoke<FileEntry[]>('list_directory', { projectRoot: projectPath, path: projectPath });
     const statusPromise = invoke<GitFileStatus[]>('get_git_status', { projectPath }).catch(() => [] as GitFileStatus[]);
     Promise.all([listPromise, statusPromise]).then(([entries, statuses]) => {
@@ -405,7 +494,7 @@ export function FileTree() {
       setGitStatusMap(map);
       gitStatusMapRef.current = map;
       setLoading(false);
-      setFileTreeCache(projectPath, { rootEntries: entries, gitStatusMap: map });
+      setFileTreeCache(key, { rootEntries: entries, gitStatusMap: map });
     }).catch((err) => {
       if (cancelled) return;
       setLoading(false);
@@ -416,10 +505,12 @@ export function FileTree() {
       cancelled = true;
       invoke('unwatch_directory', { path: projectPath });
     };
-  }, [project?.path]);
+    // t 仅用于断链错误文案,语言切换不重拉列表
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [project?.path, remoteConnectionId, remoteBroken]);
 
   useTauriEvent<FsChangePayload>('fs-change', useCallback((payload: FsChangePayload) => {
-    if (!project) return;
+    if (!project || isRemote) return; // 远程项目无 watcher
     // notify 在 NonRecursive watcher 上 emit 的 payload.path 是发生变化的文件,
     // 而不是被 watch 的目录本身。原条件 `payload.path === project.path` 永远不匹配,
     // 导致根目录下重命名/新建/删除后文件列表不刷新。
@@ -432,33 +523,36 @@ export function FileTree() {
     if (!rest.includes('/')) {
       loadRootEntries();
     }
-  }, [project?.path, loadRootEntries]));
+  }, [project?.path, isRemote, loadRootEntries]));
 
   useTauriEvent<FsChangePayload>('fs-change', useCallback((payload: FsChangePayload) => {
-    if (project && payload.projectPath === project.path) {
+    if (project && !isRemote && payload.projectPath === project.path) {
       debouncedRefresh();
     }
-  }, [project?.path, debouncedRefresh]));
+  }, [project?.path, isRemote, debouncedRefresh]));
 
   const GIT_PATTERNS = [/create mode/, /Switched to/, /Already up to date/, /insertions?\(\+\)/, /deletions?\(-\)/];
   useTauriEvent<PtyOutputPayload>('pty-output', useCallback((payload: PtyOutputPayload) => {
+    if (isRemote) return; // 远程项目不做 git 状态刷新
     if (isAiPty(payload.ptyId)) return;
     if (GIT_PATTERNS.some((p) => p.test(payload.data))) {
       debouncedRefresh();
     }
-  }, [debouncedRefresh]));
+  }, [isRemote, debouncedRefresh]));
 
   const handleViewDiff = useCallback((status: GitFileStatus) => {
     setDiffTarget(status);
   }, []);
 
   const handleViewFile = useCallback((path: string) => {
+    if (isRemote) return; // 文件查看走本地读文件链路,远程 MVP 只读浏览不支持
     setViewFilePath(path);
-  }, []);
+  }, [isRemote]);
 
   const handleRootContextMenu = useCallback((e: React.MouseEvent) => {
     if (!project) return;
     e.preventDefault();
+    if (isRemote) return; // 远程 MVP 只读:根目录「新建文件/文件夹」隐藏
     const sep = project.path.includes('/') ? '/' : '\\';
     showContextMenu(e.clientX, e.clientY, [
       {
@@ -480,7 +574,7 @@ export function FileTree() {
         },
       },
     ]);
-  }, [project, loadRootEntries, t]);
+  }, [project, isRemote, loadRootEntries, t]);
 
   if (!project) {
     return (
@@ -497,26 +591,31 @@ export function FileTree() {
           Files — {project.name}
         </span>
         <div className="flex items-center flex-shrink-0 gap-1">
-          <button
-            type="button"
-            onClick={() => setSearchModalOpen(true)}
-            title={t('fileTree.header.searchTitle', { mod: MOD_LABEL })}
-            className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors text-sm leading-none px-1.5 py-0.5 rounded-[var(--radius-sm)] hover:bg-[var(--border-subtle)]"
-          >
-            ⌕
-          </button>
+          {/* 内容搜索是本地 ripgrep 链路,远程项目隐藏 */}
+          {!isRemote && (
+            <button
+              type="button"
+              onClick={() => setSearchModalOpen(true)}
+              title={t('fileTree.header.searchTitle', { mod: MOD_LABEL })}
+              className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors text-sm leading-none px-1.5 py-0.5 rounded-[var(--radius-sm)] hover:bg-[var(--border-subtle)]"
+            >
+              ⌕
+            </button>
+          )}
           <button
             type="button"
             onClick={() => {
-              loadRootEntries();
+              // 远程:refreshIgnore=true 强制重读根 .gitignore;本地:同旧行为
+              loadRootEntries(isRemote);
               loadGitStatus();
             }}
-            title={t('fileTree.header.refresh')}
+            title={isRemote ? t('fileTree.remote.refreshTitle') : t('fileTree.header.refresh')}
             className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors text-sm leading-none px-1.5 py-0.5 rounded-[var(--radius-sm)] hover:bg-[var(--border-subtle)]"
           >
             ↻
           </button>
-          {config.editors.length > 0 && (
+          {/* 外部编辑器打开的是本机路径,远程项目隐藏 */}
+          {!isRemote && config.editors.length > 0 && (
             <div className="flex items-center">
               <button
                 type="button"
@@ -561,7 +660,7 @@ export function FileTree() {
             </div>
             <button
               type="button"
-              onClick={loadRootEntries}
+              onClick={() => loadRootEntries()}
               className="px-2 py-1 rounded-[var(--radius-sm)] text-[var(--accent)] hover:bg-[var(--border-subtle)] transition-colors"
             >
               {t('fileTree.empty.retry')}
@@ -583,6 +682,7 @@ export function FileTree() {
                 gitStatusMap={gitStatusMap}
                 onViewDiff={handleViewDiff}
                 onViewFile={handleViewFile}
+                remoteConnectionId={remoteConnectionId}
               />
             ))}
           </>
