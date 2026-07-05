@@ -1,4 +1,9 @@
-//! `mt-ssh-mcp` 的 SSH 持久会话池。
+//! SSH 持久会话池(mini-term 共享,原 `mt-sidecars/src/pool.rs`)。
+//!
+//! task 07-05-ssh-remote-projects PR1 把本模块从 `mt-sidecars` 抽到共享 crate
+//! `mt-ssh`:mt-ssh-mcp sidecar 与主程序各持一个池实例,行为不变。
+//! (stderr 日志统一用 `[mt-ssh]` 前缀 —— PR2 起主程序与 sidecar 共用本 crate,
+//! 前缀跟 crate 而非跟调用方走,便于在两边日志里定位到同一层。)
 //!
 //! 设计来源:`.trellis/tasks/05-22-refactor-ssh-mcp-persistent-session-pool/research/`。
 //! 摘要:
@@ -426,7 +431,7 @@ fn spawn_disconnect(s: Arc<CachedSession>, timeout: Duration) {
         })
         .await;
         if res.is_err() {
-            eprintln!("[mt-ssh-mcp] session disconnect timed out, dropping");
+            eprintln!("[mt-ssh] session disconnect timed out, dropping");
         }
     });
 }
@@ -848,7 +853,7 @@ impl Handler for MtClient {
             HostKeyMatch::Match => Ok(true),
             HostKeyMatch::Mismatch => {
                 eprintln!(
-                    "[mt-ssh-mcp] host key MISMATCH for {host_pattern}; refusing to connect. \
+                    "[mt-ssh] host key MISMATCH for {host_pattern}; refusing to connect. \
                     Remove the offending line from {} if the change is expected.",
                     self.known_hosts_path.display()
                 );
@@ -857,7 +862,7 @@ impl Handler for MtClient {
             HostKeyMatch::Unknown => {
                 if let Err(e) = append_known_host(&self.known_hosts_path, &host_pattern, server_pubkey) {
                     eprintln!(
-                        "[mt-ssh-mcp] failed to append to {}: {e}",
+                        "[mt-ssh] failed to append to {}: {e}",
                         self.known_hosts_path.display()
                     );
                     return Ok(false);

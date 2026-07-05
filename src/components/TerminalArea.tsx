@@ -1,9 +1,9 @@
 import { useCallback } from 'react';
-import { invoke } from '@tauri-apps/api/core';
 import { useAppStore, genId, saveLayoutToConfig } from '../store';
 import { SplitLayout } from './SplitLayout';
 import { showContextMenu } from '../utils/contextMenu';
-import { getProjectEnvs } from '../utils/projectEnv';
+import { createProjectPty, isRemoteProject, remotePaneLabel } from '../utils/remoteProject';
+import { showAlert } from '../utils/prompt';
 import { useT } from '../i18n';
 import type { TerminalTab, PaneState, SplitNode, ShellConfig } from '../types';
 
@@ -51,19 +51,25 @@ export function TerminalArea({ projectId, projectPath }: Props) {
   const removeTab = useAppStore((s) => s.removeTab);
   const ps = projectStates.get(projectId);
   const activeTab = ps?.tabs.find((t) => t.id === ps.activeTabId);
+  // SSH 远程项目:新开 tab/分屏 pane 一律 spawn ssh 启动器(shell 选择无意义);
+  // 断链 / 缺 ssh 客户端时后端返回明确 Err,弹窗提示。
+  const project = config.projects.find((p) => p.id === projectId);
+  const remote = isRemoteProject(project);
 
   const handleNewTab = useCallback(async (selectedShell?: ShellConfig) => {
     const shell = selectedShell
       ?? config.availableShells.find((s) => s.name === config.defaultShell)
       ?? config.availableShells[0];
-    if (!shell) return;
+    if (!project) return;
+    if (!remote && !shell) return;
 
-    const ptyId = await invoke<number>('create_pty', {
-      shell: shell.command,
-      args: shell.args ?? [],
-      cwd: projectPath,
-      envs: getProjectEnvs(projectId),
-    });
+    let ptyId: number;
+    try {
+      ptyId = await createProjectPty(project, shell);
+    } catch (e) {
+      await showAlert(t('terminalArea.remoteConnectFailedTitle'), e instanceof Error ? e.message : String(e));
+      return;
+    }
 
     const paneId = genId();
     const tabId = genId();
@@ -75,7 +81,7 @@ export function TerminalArea({ projectId, projectPath }: Props) {
         type: 'leaf',
         panes: [{
           id: paneId,
-          shellName: shell.name,
+          shellName: remote ? remotePaneLabel(project) : shell!.name,
           status: 'idle',
           ptyId,
         }],
@@ -85,9 +91,14 @@ export function TerminalArea({ projectId, projectPath }: Props) {
 
     addTab(projectId, tab);
     saveLayoutToConfig(projectId);
-  }, [projectId, projectPath, config, addTab]);
+  }, [projectId, project, remote, config, addTab, t]);
 
   const handleNewTabClick = useCallback((e: React.MouseEvent) => {
+    // 远程项目不弹 shell 菜单:pane 固定为 ssh 启动器
+    if (remote) {
+      void handleNewTab();
+      return;
+    }
     showContextMenu(
       e.clientX,
       e.clientY,
@@ -96,25 +107,26 @@ export function TerminalArea({ projectId, projectPath }: Props) {
         onClick: () => handleNewTab(shell),
       })),
     );
-  }, [config.availableShells, handleNewTab]);
+  }, [remote, config.availableShells, handleNewTab]);
 
   const handleSplitPane = useCallback(
     async (paneId: string, direction: 'horizontal' | 'vertical') => {
-      if (!ps || !activeTab) return;
+      if (!ps || !activeTab || !project) return;
       const shell = config.availableShells.find((s) => s.name === config.defaultShell)
         ?? config.availableShells[0];
-      if (!shell) return;
+      if (!remote && !shell) return;
 
-      const ptyId = await invoke<number>('create_pty', {
-        shell: shell.command,
-        args: shell.args ?? [],
-        cwd: projectPath,
-        envs: getProjectEnvs(projectId),
-      });
+      let ptyId: number;
+      try {
+        ptyId = await createProjectPty(project, shell);
+      } catch (e) {
+        await showAlert(t('terminalArea.remoteConnectFailedTitle'), e instanceof Error ? e.message : String(e));
+        return;
+      }
 
       const newPane: PaneState = {
         id: genId(),
-        shellName: shell.name,
+        shellName: remote ? remotePaneLabel(project) : shell!.name,
         status: 'idle',
         ptyId,
       };
@@ -129,7 +141,7 @@ export function TerminalArea({ projectId, projectPath }: Props) {
       updateTabLayout(projectId, activeTab.id, newLayout);
       saveLayoutToConfig(projectId);
     },
-    [ps, activeTab, config, projectId, projectPath, updateTabLayout]
+    [ps, activeTab, config, project, remote, projectId, updateTabLayout, t]
   );
 
   // Called when an entire leaf (pane group) is closed.

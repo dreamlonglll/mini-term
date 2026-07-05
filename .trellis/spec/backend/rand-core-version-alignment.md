@@ -78,4 +78,4 @@ error[E0277]: the trait bound 'OsRng: <crate>::<...>::rand_core::CryptoRng' is n
 let key = ssh_key::PrivateKey::random(&mut rand::rngs::OsRng, Algorithm::Ed25519)?;
 ```
 
-`Cargo.toml` 加了 `rand = "0.8"` 作为 dev-dep，编译报上面那段错。改成用 `Ed25519PublicKey([0x11; 32])` 直接构造 `PublicKey`，dev-dep 整个 `rand` 删掉；测试反而更短、更确定。见当前 `src-tauri/mt-sidecars/src/pool.rs` 测试模块的 `test_pubkey_from_bytes` 与 `KEY_BYTES_A` / `KEY_BYTES_B`。
+`Cargo.toml` 加了 `rand = "0.8"` 作为 dev-dep，编译报上面那段错。改成用 `Ed25519PublicKey([0x11; 32])` 直接构造 `PublicKey`，dev-dep 整个 `rand` 删掉；测试反而更短、更确定。见当前 `src-tauri/mt-ssh/src/pool.rs`（07-05 抽包后位置）测试模块的 `test_pubkey_from_bytes` 与 `KEY_BYTES_A` / `KEY_BYTES_B`。

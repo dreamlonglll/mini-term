@@ -175,12 +175,14 @@ export function App() {
     return () => window.removeEventListener('scroll', onScroll, true);
   }, []);
 
-  // Ctrl+Shift+F 打开/关闭搜索弹窗
+  // Ctrl+Shift+F 打开/关闭搜索弹窗(内容搜索是本地 ripgrep 链路,SSH 远程项目不支持)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'F') {
         e.preventDefault();
-        const { searchModalOpen: isOpen, setSearchModalOpen: setOpen } = useAppStore.getState();
+        const { searchModalOpen: isOpen, setSearchModalOpen: setOpen, config: cfg, activeProjectId: pid } = useAppStore.getState();
+        const activeProject = cfg.projects.find((p) => p.id === pid);
+        if (!isOpen && activeProject?.sshConnectionId) return; // 远程项目:不打开
         setOpen(!isOpen);
       }
     };
@@ -216,6 +218,9 @@ export function App() {
   }, [updatePaneStatusByPty]));
 
   useTauriEvent<PtyExitPayload>('pty-exit', useCallback((payload) => {
+    // 登记已退出的 PTY:远程项目 pane 据此叠加「连接已断开,点击重连」覆盖层
+    // (不区分用户主动 exit 与异常断线);本地 pane 不消费该集合,登记无副作用。
+    useAppStore.getState().markPtyExited(payload.ptyId);
     if (payload.exitCode !== 0) {
       updatePaneStatusByPty(payload.ptyId, 'error');
     }

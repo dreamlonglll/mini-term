@@ -12,6 +12,8 @@ export const paneGroup = {
     startFailed: "终端启动失败",
     retry: "重试",
     starting: "正在启动终端...",
+    remoteDisconnected: "连接已断开",
+    reconnect: "点击重连",
   },
   en: {
     closeAiTitle: "Close AI Session",
@@ -26,5 +28,7 @@ export const paneGroup = {
     startFailed: "Failed to start terminal",
     retry: "Retry",
     starting: "Starting terminal...",
+    remoteDisconnected: "Connection lost",
+    reconnect: "Click to reconnect",
   },
 } as const;

@@ -251,7 +251,7 @@ tokio::spawn(async move {
 
 ## 真实落地点
 
-本仓 `src-tauri/mt-sidecars/src/pool.rs` 是本骨架的参考实现。文件内每个关键决策都有对应注释引回这里能用得上的判断点：
+本仓 `src-tauri/mt-ssh/src/pool.rs` 是本骨架的参考实现（07-05 起从 mt-sidecars 抽为共享 crate `mt-ssh`，主程序与 sidecar 各持一池实例）。文件内每个关键决策都有对应注释引回这里能用得上的判断点：
 
 - `spawn_reaper`：Weak upgrade 退出循环（决策 1）。
 - `Drop for SshPool` + `reaper: std::sync::Mutex<...>`（决策 2）。

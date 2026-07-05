@@ -145,7 +145,7 @@ loop { let n = local.read(&mut buf).await?; if n==0 {break;} f.write_all(&buf[..
 ## 真实出处
 
 task `06-09-ssh-mcp-sftp-transfer`:为 `mt-ssh-mcp` 加 SFTP 上传/下载。实现见
-`src-tauri/mt-sidecars/src/pool.rs`(`run_sftp_*_on_session` / `SftpTransferError` /
+`src-tauri/mt-ssh/src/pool.rs`(07-05 抽包后位置;`run_sftp_*_on_session` / `SftpTransferError` /
 `sftp_request_timeout_secs`)与 `src-tauri/mt-sidecars/src/bin/mt-ssh-mcp.rs`
 (`ssh_upload` / `ssh_download` / `is_blocked_local_path` / 传输审计)。坑 1(协议层 10s 逐请求超时)
 由 `trellis-check` 在实现后审出并修复——`trellis-implement` 初版漏了 prd 点名的这一项。

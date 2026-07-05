@@ -20,6 +20,14 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 mt-core = { path = "mt-core" }
+# 共享 SSH 通信层(russh 持久会话池 + SFTP 原语,task 07-05 PR1 抽出)。
+# 主程序用它实现「SSH 远程项目」的远程文件树 / 远程目录验证 / 远程 AI 会话扫描;
+# 与 mt-ssh-mcp sidecar 各持一个池实例。russh 用 ring 后端,不触发 aws-lc 的
+# NASM 工具链依赖(见 spec/backend/rust-crypto-on-windows-msvc.md)。
+mt-ssh = { path = "mt-ssh" }
+# 远程 SSH 能力需要的 tokio 面:time(外层超时)、io-util(SFTP 流读扩展 trait)。
+# 运行时本身由 Tauri v2 的 async runtime(tokio)提供,这里只声明直接用到的 feature。
+tokio = { version = "1", features = ["time", "io-util", "sync", "macros", "rt"] }
 tauri = { version = "2", features = ["protocol-asset", "devtools"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"

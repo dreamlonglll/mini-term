@@ -4,7 +4,8 @@
 //! 一个 stdio MCP server,把 mini-term 已保存的 SSH 连接暴露成 MCP 工具,
 //! 供运行在 mini-term 终端里的 AI agent(Claude Code / Codex)调用。
 //!
-//! 实现层:`ssh_exec` 通过 `mt_sidecars::pool::SshPool` 在 sidecar 进程内
+//! 实现层:`ssh_exec` 通过 `mt_ssh::pool::SshPool`(共享 crate mt-ssh,原
+//! `mt_sidecars::pool`,task 07-05 PR1 抽出)在 sidecar 进程内
 //! 维护一个 `connection_id → SSH session` 缓存池(russh 0.61 持久连接),
 //! 第一次调用建 session,后续复用,彻底绕开旧的「每次 spawn ssh 子进程 +
 //! PTY autofill 喂密码」路径。
@@ -21,13 +22,15 @@ use rmcp::{
     transport::stdio,
     ErrorData as McpError, ServerHandler, ServiceExt,
 };
-use russh::ChannelMsg;
+// russh 经 mt_ssh 再导出取用:保证与池同一 crate 版本(Handle/Channel 类型
+// 跨 crate 版本不可互换),sidecar 不再自行声明 russh 依赖。
+use mt_ssh::russh::ChannelMsg;
 use serde::Serialize;
 use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 
-use mt_sidecars::pool::{
+use mt_ssh::pool::{
     run_sftp_download_on_session, run_sftp_upload_on_session, SshPool, SftpTransferError,
 };
 
@@ -528,7 +531,7 @@ struct ChannelOutcome {
 /// `Err(String)` 代表 transport-level 失败(channel 开不了 / exec 发不出去),
 /// caller 可用此信号触发"evict + 重连"。
 async fn run_exec_on_session(
-    session: &mt_sidecars::pool::CachedSession,
+    session: &mt_ssh::pool::CachedSession,
     remote_command: &str,
 ) -> Result<ChannelOutcome, String> {
     let handle_guard = session.lock().await;
@@ -1024,7 +1027,7 @@ impl SshMcp {
 /// 统一成同一签名,供 `run_transfer` 的重试编排复用。
 async fn run_one_transfer(
     direction: TransferDirection,
-    session: &mt_sidecars::pool::CachedSession,
+    session: &mt_ssh::pool::CachedSession,
     local_path: &str,
     remote_path: &str,
     timeout: Duration,

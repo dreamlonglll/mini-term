@@ -1107,17 +1107,27 @@ dependencies = [
 name = "mt-sidecars"
 version = "0.4.8"
 dependencies = [
+ "dirs",
+ "mt-core",
+ "mt-ssh",
+ "portable-pty",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "mt-ssh"
+version = "0.6.5"
+dependencies = [
  "base64",
  "dirs",
  "futures",
  "mt-core",
- "portable-pty",
- "rmcp",
  "rsa",
  "russh",
  "russh-sftp",
- "serde",
- "serde_json",
  "ssh-key",
  "tokio",
 ]

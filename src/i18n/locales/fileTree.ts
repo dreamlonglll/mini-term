@@ -48,6 +48,10 @@ export const fileTree = {
       retry: "重试",
       refreshFailed: "文件列表刷新失败，已保留缓存",
     },
+    remote: {
+      broken: "SSH 连接已被删除，无法加载远程文件树",
+      refreshTitle: "刷新（重新读取远程根 .gitignore）",
+    },
   },
   en: {
     menu: {
@@ -97,6 +101,10 @@ export const fileTree = {
       loadFailed: "Failed to load file list",
       retry: "Retry",
       refreshFailed: "Failed to refresh file list, cached version kept",
+    },
+    remote: {
+      broken: "The SSH connection was deleted; cannot load the remote file tree",
+      refreshTitle: "Refresh (re-reads the remote root .gitignore)",
     },
   },
 } as const;

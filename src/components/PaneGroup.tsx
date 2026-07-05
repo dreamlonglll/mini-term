@@ -6,9 +6,9 @@ import { TerminalInstance } from './TerminalInstance';
 import { StatusDot } from './StatusDot';
 import { MarkerList } from './MarkerList';
 import { showContextMenu } from '../utils/contextMenu';
-import { showConfirm, showPrompt } from '../utils/prompt';
+import { showAlert, showConfirm, showPrompt } from '../utils/prompt';
 import { disposeTerminal } from '../utils/terminalCache';
-import { getProjectEnvs } from '../utils/projectEnv';
+import { createProjectPty, isRemoteProject, remotePaneLabel } from '../utils/remoteProject';
 import { MOD_LABEL } from '../utils/platform';
 import { useT } from '../i18n';
 import type { SplitNode, PaneState, ShellConfig, AiMarker } from '../types';
@@ -42,28 +42,38 @@ export function PaneGroup({ projectId, node, projectPath, onSplit, onClosePane, 
   const setPanePty = useAppStore((s) => s.setPanePty);
   const updatePaneStatusByPaneId = useAppStore((s) => s.updatePaneStatusByPaneId);
   const [headerHover, setHeaderHover] = useState(false);
+  // create_pty 失败时的错误详情(按 paneId 记录),远程断链 / 缺 ssh 客户端时展示明确原因
+  const [spawnErrors, setSpawnErrors] = useState<Record<string, string>>({});
 
   const activePane = node.panes.find((p) => p.id === node.activePaneId) ?? node.panes[0];
+
+  // SSH 远程项目:所有 pane 统一按远程方式启动(布局恢复亦然);
+  // pane 显示名用连接名(恢复布局时 shellName 会被映射为本地 shell 名,不可信)。
+  const project = config.projects.find((p) => p.id === projectId);
+  const remote = isRemoteProject(project);
+  const remoteLabel = project && remote ? remotePaneLabel(project) : undefined;
+  const paneLabel = (pane: PaneState) => pane.customTitle || (remote ? remoteLabel! : pane.shellName);
 
   useEffect(() => {
     if (!activePane || activePane.ptyId !== undefined || activePane.status === 'error') return;
     if (hydratingPaneIds.has(activePane.id)) return;
+    if (!project) return;
 
-    const shell = config.availableShells.find((s) => s.name === activePane.shellName)
-      ?? config.availableShells.find((s) => s.name === config.defaultShell)
-      ?? config.availableShells[0];
-    if (!shell) {
-      updatePaneStatusByPaneId(projectId, activePane.id, 'error');
-      return;
+    let shell: ShellConfig | undefined;
+    if (!remote) {
+      shell = config.availableShells.find((s) => s.name === activePane.shellName)
+        ?? config.availableShells.find((s) => s.name === config.defaultShell)
+        ?? config.availableShells[0];
+      if (!shell) {
+        updatePaneStatusByPaneId(projectId, activePane.id, 'error');
+        return;
+      }
     }
 
     hydratingPaneIds.add(activePane.id);
-    invoke<number>('create_pty', {
-      shell: shell.command,
-      args: shell.args ?? [],
-      cwd: projectPath,
-      envs: getProjectEnvs(projectId),
-    })
+    // 远程分支:create_pty 带 sshRemote,后端直接 spawn ssh 并预注册密码 autofill;
+    // 本地分支:行为与既有链路一致(shell + cwd + envVars)。
+    createProjectPty(project, shell)
       .then((ptyId) => {
         const ps = useAppStore.getState().projectStates.get(projectId);
         const pane = ps?.tabs
@@ -71,11 +81,23 @@ export function PaneGroup({ projectId, node, projectPath, onSplit, onClosePane, 
           .find(Boolean);
         if (pane && pane.ptyId === undefined) {
           setPanePty(projectId, activePane.id, ptyId);
+          setSpawnErrors((prev) => {
+            if (!(activePane.id in prev)) return prev;
+            const next = { ...prev };
+            delete next[activePane.id];
+            return next;
+          });
         } else {
           invoke('kill_pty', { ptyId }).catch(() => {});
         }
       })
-      .catch(() => updatePaneStatusByPaneId(projectId, activePane.id, 'error'))
+      .catch((e) => {
+        setSpawnErrors((prev) => ({
+          ...prev,
+          [activePane.id]: e instanceof Error ? e.message : String(e),
+        }));
+        updatePaneStatusByPaneId(projectId, activePane.id, 'error');
+      })
       .finally(() => {
         hydratingPaneIds.delete(activePane.id);
       });
@@ -86,6 +108,8 @@ export function PaneGroup({ projectId, node, projectPath, onSplit, onClosePane, 
     activePane?.status,
     config.availableShells,
     config.defaultShell,
+    project,
+    remote,
     projectId,
     projectPath,
     setPanePty,
@@ -96,18 +120,21 @@ export function PaneGroup({ projectId, node, projectPath, onSplit, onClosePane, 
     const shell = selectedShell
       ?? config.availableShells.find((s) => s.name === config.defaultShell)
       ?? config.availableShells[0];
-    if (!shell) return;
+    if (!project) return;
+    if (!remote && !shell) return;
 
-    const ptyId = await invoke<number>('create_pty', {
-      shell: shell.command,
-      args: shell.args ?? [],
-      cwd: projectPath,
-      envs: getProjectEnvs(projectId),
-    });
+    let ptyId: number;
+    try {
+      ptyId = await createProjectPty(project, shell);
+    } catch (e) {
+      // 断链 / 缺 ssh 客户端等 create_pty 明确错误:弹窗提示,pane 不创建,不留半开状态
+      await showAlert(t('terminalArea.remoteConnectFailedTitle'), e instanceof Error ? e.message : String(e));
+      return;
+    }
 
     const newPane: PaneState = {
       id: genId(),
-      shellName: shell.name,
+      shellName: remote ? remoteLabel! : shell!.name,
       status: 'idle',
       ptyId,
     };
@@ -117,10 +144,11 @@ export function PaneGroup({ projectId, node, projectPath, onSplit, onClosePane, 
       panes: [...node.panes, newPane],
       activePaneId: newPane.id,
     });
-  }, [config, projectPath, node, onUpdateNode]);
+  }, [config, project, remote, remoteLabel, node, onUpdateNode, t]);
 
   const handleNewTabClick = useCallback((e: React.MouseEvent) => {
-    if (config.availableShells.length <= 1) {
+    // 远程项目不弹 shell 菜单:pane 固定为 ssh 启动器
+    if (remote || config.availableShells.length <= 1) {
       handleNewTab();
       return;
     }
@@ -132,13 +160,13 @@ export function PaneGroup({ projectId, node, projectPath, onSplit, onClosePane, 
         onClick: () => handleNewTab(shell),
       })),
     );
-  }, [config.availableShells, handleNewTab]);
+  }, [remote, config.availableShells, handleNewTab]);
 
   const handleCloseTab = useCallback(async (paneId: string) => {
     const pane = node.panes.find((p) => p.id === paneId);
     if (!pane) return;
 
-    const label = pane.customTitle || pane.shellName;
+    const label = paneLabel(pane);
     const hasAi = pane.status === 'ai-working' || pane.status === 'ai-idle';
     const title = hasAi ? t('paneGroup.closeAiTitle') : t('paneGroup.closeTerminalTitle');
     const message = hasAi
@@ -174,7 +202,7 @@ export function PaneGroup({ projectId, node, projectPath, onSplit, onClosePane, 
   const handleRenameTab = useCallback(async (paneId: string) => {
     const pane = node.panes.find((p) => p.id === paneId);
     if (!pane) return;
-    const newTitle = await showPrompt(t('paneGroup.renameTerminal'), pane.customTitle || pane.shellName);
+    const newTitle = await showPrompt(t('paneGroup.renameTerminal'), paneLabel(pane));
     if (newTitle === null) return;
     onUpdateNode({
       ...node,
@@ -248,6 +276,27 @@ export function PaneGroup({ projectId, node, projectPath, onSplit, onClosePane, 
     updatePaneStatusByPaneId(projectId, activePane.id, 'idle');
   }, [activePane, projectId, updatePaneStatusByPaneId]);
 
+  // 远程 pane 断线检测:ssh 进程退出(pty-exit,不区分用户 exit 与异常断线)后
+  // pane 不自动关闭,叠加「连接已断开,点击重连」覆盖层。
+  const exitedPtyIds = useAppStore((s) => s.exitedPtyIds);
+  const showReconnect =
+    remote && activePane?.ptyId !== undefined && exitedPtyIds.has(activePane.ptyId);
+
+  // 重连:同一 pane 重新 create_pty(清屏方案 —— 销毁旧 xterm 实例,复用懒创建
+  // effect 重建全新终端)。选清屏而非保留历史:新 PTY 的输出从头开始,旧 buffer 的
+  // 光标/滚动状态与新会话无法衔接,保留反而会出现«半屏旧内容 + 新登录横幅»的错位;
+  // 且 dispose 一并回收 markers/WebGL 资源,链路与关 tab 完全一致,无新状态机。
+  const handleReconnect = useCallback(() => {
+    if (!activePane || activePane.ptyId === undefined) return;
+    const oldPtyId = activePane.ptyId;
+    invoke('kill_pty', { ptyId: oldPtyId }).catch(() => {});
+    disposeTerminal(oldPtyId);
+    useAppStore.getState().clearMarkersForPty(oldPtyId);
+    useAppStore.getState().clearPtyExited(oldPtyId);
+    // 置 ptyId=undefined + status=idle → 懒创建 effect 走远程分支重新 spawn ssh
+    useAppStore.getState().resetPaneForReconnect(projectId, activePane.id);
+  }, [activePane, projectId]);
+
   if (!activePane) return null;
 
   return (
@@ -283,7 +332,7 @@ export function PaneGroup({ projectId, node, projectPath, onSplit, onClosePane, 
                 <span className="absolute bottom-0 left-2 right-2 h-[2px] rounded-full bg-[var(--accent)]" />
               )}
               <StatusDot status={pane.status} />
-              <span className="font-medium">{pane.customTitle || pane.shellName}</span>
+              <span className="font-medium">{paneLabel(pane)}</span>
               <span
                 className="ml-0.5 text-[var(--text-muted)] hover:text-[var(--color-error)] text-[12px] transition-colors"
                 onClick={(e) => {
@@ -354,12 +403,34 @@ export function PaneGroup({ projectId, node, projectPath, onSplit, onClosePane, 
       <div className="flex-1 overflow-hidden relative">
         <div className="absolute inset-0">
           {activePane.ptyId !== undefined ? (
-            <TerminalInstance
-              ptyId={activePane.ptyId}
-            />
+            <>
+              <TerminalInstance
+                ptyId={activePane.ptyId}
+              />
+              {/* 远程断线覆盖层:保留 pane,点击在同一 pane 重连 */}
+              {showReconnect && (
+                <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-black/55 backdrop-blur-[1px]">
+                  <div className="text-sm text-[var(--text-secondary)]">
+                    {t('paneGroup.remoteDisconnected')}
+                  </div>
+                  <button
+                    type="button"
+                    className="px-3 py-1.5 text-sm rounded-[var(--radius-sm)] border border-[var(--border-default)] text-[var(--text-secondary)] hover:border-[var(--accent)] hover:text-[var(--accent)] transition-colors"
+                    onClick={handleReconnect}
+                  >
+                    {t('paneGroup.reconnect')}
+                  </button>
+                </div>
+              )}
+            </>
           ) : activePane.status === 'error' ? (
-            <div className="h-full flex flex-col items-center justify-center gap-2 text-[var(--text-muted)] text-sm">
+            <div className="h-full flex flex-col items-center justify-center gap-2 text-[var(--text-muted)] text-sm px-4">
               <div>{t('paneGroup.startFailed')}</div>
+              {spawnErrors[activePane.id] && (
+                <div className="text-xs text-[var(--color-error)] max-w-[80%] text-center break-all">
+                  {spawnErrors[activePane.id]}
+                </div>
+              )}
               <button
                 type="button"
                 className="px-3 py-1.5 rounded-[var(--radius-sm)] border border-[var(--border-default)] hover:border-[var(--accent)] hover:text-[var(--accent)] transition-colors"
