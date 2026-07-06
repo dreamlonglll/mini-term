@@ -483,6 +483,14 @@ struct SshAutofillState {
     residual: String,
     /// 已填充或已禁用(命中错误密码)后置位,后续输出不再处理
     done: bool,
+    /// 用户首次向 PTY 真实输入时是否解除本 autofill(见 disarm_ssh_autofill_on_user_input)。
+    /// - 远程项目 pane(create_pty 直接 spawn ssh,arm 后无命令写入,首个 write_pty 即用户
+    ///   输入)置 `true`:一旦用户打字即解除,避免 publickey 登录成功后 autofill 终身待命、
+    ///   把 SSH 密码灌进后续 su / mysql -p / passwd 提示。
+    /// - 右键「SSH 连接」路径(connectSsh:arm 后紧跟一条 `ssh ...\r` 命令写入)置 `false`:
+    ///   否则那条命令写入会在密码提示到达前就把 autofill 删掉,破坏该功能;它仍靠命中
+    ///   密码提示后置 `done` 自解除,保持既有行为。
+    disarm_on_input: bool,
 }
 
 #[derive(Clone)]
@@ -568,15 +576,41 @@ impl PtyManager {
     }
 
     /// 注册某个 pty 的 SSH 密码自动填充。再次调用会重置状态(覆盖密码、清除 done)。
-    pub fn arm_ssh_autofill(&self, pty_id: u32, password: String) {
+    ///
+    /// `disarm_on_input`:用户首次真实输入时是否解除本 autofill —— 远程项目 pane 传
+    /// `true`,右键「SSH 连接」路径传 `false`(见 SshAutofillState::disarm_on_input)。
+    pub fn arm_ssh_autofill(&self, pty_id: u32, password: String, disarm_on_input: bool) {
         self.ssh_autofill.lock().unwrap().insert(
             pty_id,
             SshAutofillState {
                 password,
                 residual: String::new(),
                 done: false,
+                disarm_on_input,
             },
         );
+    }
+
+    /// 无条件清除某个 pty 的 SSH 密码自动填充状态(含驻留的明文密码)。
+    /// 用于 pty 被 kill / 自然退出时的内存清理,不看 `disarm_on_input`。
+    pub fn clear_ssh_autofill(&self, pty_id: u32) {
+        self.ssh_autofill.lock().unwrap().remove(&pty_id);
+    }
+
+    /// 用户向 PTY 真实输入时调用:仅当该 autofill 标记了 `disarm_on_input` 才解除并清除
+    /// 明文密码。
+    ///
+    /// 语义:SSH 认证阶段用户不打字(ssh 自驱动 publickey,失败才由 autofill 灌密码);
+    /// 一旦用户按键即说明会话已进入交互 shell,此后 `su` / `mysql -p` / `passwd` 等以
+    /// "password:" 结尾的提示都不该再被灌入 SSH 登录密码 —— 尤其 publickey 登录成功时
+    /// 全程无密码提示、`done` 永不置位,不在此解除则 autofill 终身待命并泄露密码。
+    /// 要触发这些提示用户必先敲入对应命令,那次敲击会先经此路径解除 autofill。
+    /// 右键「SSH 连接」路径 arm 后紧跟一条 ssh 命令写入,故标 `false` 不在此解除。
+    pub fn disarm_ssh_autofill_on_user_input(&self, pty_id: u32) {
+        let mut map = self.ssh_autofill.lock().unwrap();
+        if map.get(&pty_id).is_some_and(|st| st.disarm_on_input) {
+            map.remove(&pty_id);
+        }
     }
 
     /// 扫描 pty 输出:命中密码提示则把已保存的密码回写到 PTY(每个 pty 只填一次);
@@ -853,7 +887,9 @@ pub fn create_pty(
     // 事后再 arm 存在竞态 —— 这里预注册彻底消除该窗口。
     if let Some(launch) = &remote_launch {
         if let Some(password) = &launch.password {
-            state.arm_ssh_autofill(pty_id, password.clone());
+            // 远程项目 pane:arm 后不再写入任何命令,首个 write_pty 即用户交互
+            // → disarm_on_input=true,用户一打字即解除,避免密码灌进后续 su/mysql 提示。
+            state.arm_ssh_autofill(pty_id, password.clone(), true);
         }
     }
 
@@ -980,6 +1016,10 @@ pub fn create_pty(
                             0
                         }
                     };
+
+                    // PTY 自然退出(前端未必调 kill_pty):无条件清除残留的 SSH 密码自动
+                    // 填充状态,避免明文密码在断连后仍驻留内存。
+                    mgr_flush.clear_ssh_autofill(pty_id_for_reader);
 
                     let _ = app_flush.emit(
                         "pty-exit",
@@ -1139,6 +1179,16 @@ pub fn write_pty(
     data: String,
     line_snapshot: Option<String>,
 ) -> Result<(), String> {
+    // 用户真实输入 → 会话已进入交互 shell,解除标了 disarm_on_input 的 SSH 密码自动
+    // 填充,避免后续 su / mysql -p / passwd 等 "password:" 提示被灌入 SSH 登录密码
+    // (见 disarm_ssh_autofill_on_user_input)。排除 xterm 焦点进/出 CSI 序列:TUI 开启
+    // DEC 1004 后 xterm 会把 focus/blur 也经 onData 发来,那不是用户按键,不能据此解除
+    // (否则认证期若碰上焦点事件会提前解除、密码提示灌不进)。autofill 自身回写密码走
+    // instance.writer 直写、不经本命令,故此处也不会误伤认证阶段的填充。
+    if data != FOCUS_IN_SEQ && data != FOCUS_OUT_SEQ {
+        state.disarm_ssh_autofill_on_user_input(pty_id);
+    }
+
     // 在写入前打开焦点冷却窗口:AI 对焦点事件的重绘响应几乎立即抵达 reader,
     // 必须早于那之前把冷却建立起来。
     state.note_focus_event(pty_id, &data);
@@ -1238,13 +1288,16 @@ pub fn kill_pty(
 }
 
 /// 为某个 pty 注册 SSH 密码自动填充。前端在写入 `ssh` 命令前调用(连接配有密码时)。
+///
+/// 该路径 arm 后紧跟一条 ssh 命令写入 PTY,故 `disarm_on_input=false` —— 不能因那条命令
+/// 写入就解除,否则密码提示到达前 autofill 已被删。它仍靠命中密码提示后置 `done` 自解除。
 #[tauri::command]
 pub fn arm_ssh_autofill(
     state: tauri::State<'_, PtyManager>,
     pty_id: u32,
     password: String,
 ) -> Result<(), String> {
-    state.arm_ssh_autofill(pty_id, password);
+    state.arm_ssh_autofill(pty_id, password, false);
     Ok(())
 }
 
@@ -1705,8 +1758,48 @@ mod tests {
     #[test]
     fn arm_ssh_autofill_registers_state() {
         let mgr = PtyManager::new();
-        mgr.arm_ssh_autofill(7, "secret".into());
+        mgr.arm_ssh_autofill(7, "secret".into(), true);
         assert!(mgr.ssh_autofill.lock().unwrap().contains_key(&7));
+    }
+
+    #[test]
+    fn disarm_on_user_input_clears_when_flagged() {
+        // 远程项目 pane(disarm_on_input=true):用户输入后解除,后续 su / mysql -p 等
+        // 密码提示不得再被灌入 SSH 登录密码。
+        let mgr = PtyManager::new();
+        mgr.arm_ssh_autofill(7, "secret".into(), true);
+        mgr.disarm_ssh_autofill_on_user_input(7);
+        assert!(!mgr.ssh_autofill.lock().unwrap().contains_key(&7));
+    }
+
+    #[test]
+    fn disarm_on_user_input_keeps_when_not_flagged() {
+        // 右键「SSH 连接」路径(disarm_on_input=false):arm 后紧跟的 ssh 命令写入
+        // 不得解除 autofill,否则密码提示到达前已被删。
+        let mgr = PtyManager::new();
+        mgr.arm_ssh_autofill(9, "secret".into(), false);
+        mgr.disarm_ssh_autofill_on_user_input(9);
+        assert!(
+            mgr.ssh_autofill.lock().unwrap().contains_key(&9),
+            "未标 disarm_on_input 的 autofill 不应被用户输入解除"
+        );
+    }
+
+    #[test]
+    fn disarm_on_user_input_absent_pty_is_noop() {
+        // 非远程 pty(从未 arm)上调用应安全无操作,不 panic
+        let mgr = PtyManager::new();
+        mgr.disarm_ssh_autofill_on_user_input(42);
+        assert!(mgr.ssh_autofill.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn clear_ssh_autofill_removes_regardless_of_flag() {
+        // 无条件清理(kill / 自然退出):不看 disarm_on_input 都要清掉明文密码。
+        let mgr = PtyManager::new();
+        mgr.arm_ssh_autofill(9, "secret".into(), false);
+        mgr.clear_ssh_autofill(9);
+        assert!(!mgr.ssh_autofill.lock().unwrap().contains_key(&9));
     }
 
     // === WSL UNC 启动器重写检测 ===

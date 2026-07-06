@@ -69,11 +69,23 @@ export function SshAssocModal({ project, onClose }: Props) {
     // 始终存显式 id 列表，不用 undefined 表示"全选"
     const scope = allIds.filter((id) => checked.has(id));
 
-    // 无任何变化 → 直接关闭，不写盘、不弹提示
-    if (wasEnabled === nowEnabled && (!nowEnabled || sameScope(project.sshConnectionIds, scope, allIds))) {
+    // 旧配置 sshConnectionIds === undefined 的语义是「含未来新增连接」，与显式 id
+    // 列表并不等价：即便当前全选，若不落盘迁移成显式列表，之后新增 SSH 连接会被静默
+    // 纳入该项目的可见范围（违背 v0.6.3「新增连接不自动纳入已有项目」的承诺）。
+    // 故启用状态下 undefined 必须迁移；仅当迁移前后「当前有效范围」不变时静默落盘、
+    // 不打扰用户（沿用 c25d99d 无改动不弹提示的意图）。
+    const needsScopeMigration = nowEnabled && project.sshConnectionIds === undefined;
+    const effectiveUnchanged =
+      wasEnabled === nowEnabled &&
+      (!nowEnabled || sameScope(project.sshConnectionIds, scope, allIds));
+
+    // 完全无变化且已是显式列表 → 直接关闭，不写盘、不弹提示
+    if (effectiveUnchanged && !needsScopeMigration) {
       onClose();
       return;
     }
+    // 有效范围不变、仅把旧 undefined 迁移成等价显式列表 → 静默落盘，不弹提示
+    const silentMigration = effectiveUnchanged && needsScopeMigration;
 
     setBusy(true);
     try {
@@ -97,6 +109,9 @@ export function SshAssocModal({ project, onClose }: Props) {
       useAppStore.getState().setConfig(newConfig);
       await invoke('save_config', { config: newConfig });
       onClose();
+
+      // 静默迁移(旧 undefined → 等价显式列表,有效范围未变)：落盘即可，不弹提示
+      if (silentMigration) return;
 
       const scopeDesc =
         scope.length === allIds.length
