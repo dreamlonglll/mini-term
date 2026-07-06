@@ -314,7 +314,8 @@ function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff, onViewF
       {expanded &&
         children.map((child) => (
           <TreeNode
-            key={child.path}
+            // 与根 map 一致:key 掺连接 id,保持「key = 服务器 + 路径」不变量自洽
+            key={`${remoteConnectionId ?? 'local'}:${child.path}`}
             entry={child}
             projectRoot={projectRoot}
             depth={depth + 1}
@@ -691,7 +692,13 @@ export function FileTree() {
             )}
             {rootEntries.map((entry) => (
               <TreeNode
-                key={entry.path}
+                // key 掺连接 id:两台服务器可有相同 POSIX 路径(如都是 /root/app)。
+                // FileTree 不随切项目 remount,若 key 只用 path,从缓存命中的同路径远程
+                // 项目切回时 React 会按 path 复用 TreeNode 实例,其 children/expanded
+                // state 仍来自另一台服务器 → 展开子树静默显示错误服务器的文件。掺入
+                // remoteConnectionId 后,不同服务器的根节点 key 不同强制整树重挂并按当前
+                // 连接重新拉取;切回同一远程项目 key 不变仍复用、保留展开态。
+                key={`${remoteConnectionId ?? 'local'}:${entry.path}`}
                 entry={entry}
                 projectRoot={project.path}
                 depth={0}
