@@ -41,6 +41,10 @@ export interface AppConfig {
   sessionsVisible: boolean;
   filesVisible: boolean;
   gitVisible: boolean;
+  /** 中间栏（Projects + Files）整体折叠开关 */
+  middleColumnVisible: boolean;
+  /** 右侧悬浮抽屉（Sessions / Git）宽度 */
+  rightDrawerWidth?: number;
   lastActiveProjectId?: string;
   hookEnabled: boolean;
   smartCopyPaste: boolean;

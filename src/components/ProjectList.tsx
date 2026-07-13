@@ -1,6 +1,5 @@
 import { useCallback, useState, useRef, useEffect } from 'react';
 import { createPortal } from 'react-dom';
-import { Allotment } from 'allotment';
 import { open } from '@tauri-apps/plugin-dialog';
 import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
@@ -8,7 +7,6 @@ import { revealItemInDir } from '@tauri-apps/plugin-opener';
 import { useAppStore, genId, collectPtyIds } from '../store';
 import { StatusDot } from './StatusDot';
 import { DoneTag } from './DoneTag';
-import { SessionList } from './SessionList';
 import { SshAssocModal } from './SshAssocModal';
 import { ProjectEnvVarsModal } from './ProjectEnvVarsModal';
 import { AddRemoteProjectModal } from './AddRemoteProjectModal';
@@ -629,15 +627,10 @@ export function ProjectList() {
     );
   };
 
-  const projectsVisible = config.projectsVisible;
-  const sessionsVisible = config.sessionsVisible;
-
   return (
     <div data-panel className="h-full bg-[var(--bg-surface)] flex flex-col select-none">
-      <Allotment vertical>
-        {/* 上半部分：项目列表 */}
-        <Allotment.Pane minSize={100} visible={projectsVisible}>
-          <div ref={projectListRef} className="relative h-full flex flex-col overflow-hidden">
+      {/* 项目列表（Sessions 已移至右侧悬浮抽屉） */}
+      <div ref={projectListRef} className="relative flex-1 min-h-0 flex flex-col overflow-hidden">
             {isFileDragOver && (
               <div className={`absolute inset-0 z-20 border-2 border-dashed rounded-[var(--radius-md)] flex items-center justify-center pointer-events-none ${
                 fileDragKind === 'forbidden'
@@ -703,14 +696,7 @@ export function ProjectList() {
                 +
               </div>
             </div>
-          </div>
-        </Allotment.Pane>
-
-        {/* 下半部分：会话列表 */}
-        <Allotment.Pane minSize={80} visible={sessionsVisible}>
-          <SessionList />
-        </Allotment.Pane>
-      </Allotment>
+      </div>
 
       {/* 关联 SSH 弹窗 */}
       <SshAssocModal project={sshAssocTarget} onClose={() => setSshAssocTarget(null)} />

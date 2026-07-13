@@ -98,6 +98,10 @@ pub struct AppConfig {
     pub files_visible: bool,
     #[serde(default = "default_true")]
     pub git_visible: bool,
+    #[serde(default = "default_true")]
+    pub middle_column_visible: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub right_drawer_width: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_active_project_id: Option<String>,
     #[serde(default)]
@@ -298,6 +302,8 @@ impl Default for AppConfig {
             sessions_visible: true,
             files_visible: true,
             git_visible: true,
+            middle_column_visible: true,
+            right_drawer_width: None,
             last_active_project_id: None,
             hook_enabled: false,
             smart_copy_paste: false,

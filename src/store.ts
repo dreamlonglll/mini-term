@@ -339,6 +339,13 @@ interface AppStore {
 
   // 面板显隐
   togglePanel: (panel: 'projects' | 'sessions' | 'files' | 'git') => void;
+  /** 折叠/展开中间栏（Projects + Files），持久化到 config */
+  toggleMiddleColumn: () => void;
+
+  // 右侧悬浮抽屉（Sessions / Git）——运行时态,互斥单抽屉,不持久化开合(每次启动收起)
+  rightDrawer: 'sessions' | 'git' | null;
+  toggleRightDrawer: (panel: 'sessions' | 'git') => void;
+  closeRightDrawer: () => void;
 
   // 分组
   createGroup: (name: string, parentGroupId?: string) => void;
@@ -385,6 +392,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
     sessionsVisible: true,
     filesVisible: true,
     gitVisible: true,
+    middleColumnVisible: true,
     hookEnabled: false,
     smartCopyPaste: false,
     sshConnections: [],
@@ -397,6 +405,8 @@ export const useAppStore = create<AppStore>((set, get) => ({
   markersByPty: new Map(),
   searchModalOpen: false,
   setSearchModalOpen: (open) => set({ searchModalOpen: open }),
+
+  rightDrawer: null,
 
   ccConnectStatus: null,
   setCcConnectStatus: (status) => set({ ccConnectStatus: status }),
@@ -820,6 +830,18 @@ export const useAppStore = create<AppStore>((set, get) => ({
       invoke('save_config', { config: newConfig }).catch(() => {});
       return { config: newConfig };
     }),
+
+  toggleMiddleColumn: () =>
+    set((state) => {
+      const newConfig = { ...state.config, middleColumnVisible: !state.config.middleColumnVisible };
+      invoke('save_config', { config: newConfig }).catch(() => {});
+      return { config: newConfig };
+    }),
+
+  toggleRightDrawer: (panel) =>
+    set((state) => ({ rightDrawer: state.rightDrawer === panel ? null : panel })),
+
+  closeRightDrawer: () => set({ rightDrawer: null }),
 
   createGroup: (name, parentGroupId) =>
     set((state) => {
