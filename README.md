@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.6.7-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.6.8-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -129,14 +129,14 @@ Remotely drive the AI agents running on your machine through IM platforms (Feish
 
 ### Appearance & Configuration
 
-- **Activity Bar sidebar** — A persistent 40px icon bar on the far left with Projects / Sessions / Files / Git panel toggles, independently controlling visibility, a blue vertical bar indicating the active state, and persisted state.
+- **Icon sidebar + three-column layout** — A persistent icon bar on the far left (collapse middle column / Sessions / Git / Settings / SSH / Connect); the middle column stacks Projects over Files and collapses as a whole; the terminal sits on the right. Sessions / Git are now floating drawers that slide out from the right edge over the terminal (mutually exclusive single panel, left-edge drag to resize with persisted width, ✕ to close), with a blue vertical bar indicating the active state.
 - **Three theme modes** — Auto (follows the system) / Light / Dark, with Dark based on a Warm Carbon palette and a custom CSS-variable system; the native Windows title bar (DWM Immersive Dark Mode) follows the theme automatically, with no first-frame light flash for dark-mode users on startup.
 - **Blueprint skin** — An optional sci-fi Blueprint skin with a grid background + corner markers + glow effects, supporting both dark and light modes, with the terminal palette switching in sync.
 - **Independent font tuning** — The UI and terminal font sizes (10-20px) / families are adjustable separately, and the terminal can optionally follow the UI theme.
 - **Ligatures** — A terminal ligature toggle that composes glyphs like `==` `=>` `!=` `->` when enabled, requiring a font with a calt table (Fira Code / JetBrains Mono); fully supported on Windows, while macOS / Linux use a 60-entry Iosevka fallback due to webview API limitations.
 - **Layout persistence** — Split ratios, tabs, and window size / position are saved automatically and restored on restart (`tauri-plugin-window-state`).
 - **Close confirmation** — A confirmation before closing the window, flushing all project layouts to prevent accidental loss.
-- **Update check** — Fetches the GitHub Release on startup and shows a new-version hint in the title bar.
+- **Update check** — Fetches the GitHub Release on startup; when a new version is available a highlighted hint appears on the icon sidebar (click to download), and the version number is written into the native window title.
 - **Bilingual UI (English / 中文)** — A one-click language toggle under "Settings → System" instantly re-renders the entire interface; the language is auto-detected from the system on first launch and remembered across restarts. Every page and feature is fully translated, with a lightweight built-in i18n layer (no extra runtime dependency).
 - **Settings center** — A unified SettingsModal managing all toggles: theme, fonts, shells, AI notifications, and more.
 

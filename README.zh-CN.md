@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.6.7-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.6.8-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -129,14 +129,14 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 
 ### 外观与配置
 
-- **Activity Bar 侧边栏** — 最左侧常驻 40px 图标栏，含 Projects / Sessions / Files / Git 四个面板开关，独立控制显隐，激活态蓝色竖条指示，状态持久化
+- **图标侧栏 + 三栏布局** — 最左侧常驻图标栏（折叠中间栏 / Sessions / Git / 设置 / SSH / 连接）；中间栏纵向叠放 Projects 与 Files、可整栏一键折叠；右侧为终端。Sessions / Git 改为从右边缘滑出、浮在终端之上的悬浮抽屉（互斥单开，左缘可拖拽调宽并持久化，✕ 关闭），激活态蓝色竖条指示
 - **三种主题模式** — Auto（跟随系统）/ Light / Dark，深色基于 Warm Carbon 暖炭色调，自定义 CSS 变量体系；Windows 原生标题栏（DWM Immersive Dark Mode）自动跟随主题切换，启动深色用户无首帧浅色闪烁
 - **Blueprint 蓝图皮肤** — 可选科幻风蓝图皮肤，网格背景 + 角标记 + 光晕效果，支持深色 / 日间两种模式，终端配色同步切换
 - **字体独立调节** — UI 与终端的字号（10-20px）/ 字体 family 分别可调，终端可选是否跟随 UI 主题
 - **连体字 (ligatures)** — 终端连体字渲染开关，开启后 `==` `=>` `!=` `->` 等合成 ligature glyph，需字体含 calt 表（Fira Code / JetBrains Mono）；Windows 完整支持，macOS / Linux 受 webview API 限制使用 60 条 Iosevka fallback
 - **布局持久化** — 分屏比例、标签页、窗口大小 / 位置自动保存，重启恢复（`tauri-plugin-window-state`）
 - **关闭确认** — 关闭窗口前二次确认，并 flush 所有项目布局，避免误操作
-- **版本检查** — 启动时拉取 GitHub Release，标题栏显示新版本提示
+- **版本检查** — 启动时拉取 GitHub Release，有新版本时侧栏图标高亮提示、点击前往下载；版本号写入原生窗口标题
 - **中英双语界面** — 「设置 → 系统」一键切换中 / 英文，整个界面实时重渲染；首次启动按系统语言自动探测并记忆选择，重启保留。每个页面、每个功能的文案均已翻译，内置轻量 i18n 层（无额外运行时依赖）
 - **设置中心** — 统一的 SettingsModal 管理主题、字体、Shell、AI 通知等所有开关
 
