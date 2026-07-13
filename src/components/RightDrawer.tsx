@@ -34,11 +34,15 @@ export function RightDrawer({ initialWidth, onResizeEnd }: RightDrawerProps) {
     e.preventDefault();
     const startX = e.clientX;
     const startWidth = width;
+    // 拖拽期间禁止页面选中文本(否则划过终端会误选)
+    const prevUserSelect = document.body.style.userSelect;
+    document.body.style.userSelect = 'none';
     // 抽屉贴右边缘:把左缘往左拖 => 变宽,故用 startX - 当前X
     const onMove = (ev: MouseEvent) => setWidth(clamp(startWidth + (startX - ev.clientX)));
     const onUp = (ev: MouseEvent) => {
       document.removeEventListener('mousemove', onMove);
       document.removeEventListener('mouseup', onUp);
+      document.body.style.userSelect = prevUserSelect;
       const final = clamp(startWidth + (startX - ev.clientX));
       setWidth(final);
       onResizeEnd(final);
