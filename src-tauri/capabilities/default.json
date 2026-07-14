@@ -12,6 +12,7 @@
     "clipboard-manager:allow-write-text",
     "core:window:allow-destroy",
     "core:window:allow-request-user-attention",
-    "core:window:allow-show"
+    "core:window:allow-show",
+    "core:window:allow-set-title"
   ]
 }
