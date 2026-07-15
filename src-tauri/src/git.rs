@@ -1329,8 +1329,13 @@ pub fn git_discard_file(repo_path: String, files: Vec<String>) -> Result<(), Str
         let abs_path = workdir.join(file);
 
         // 检查是否 untracked (WT_NEW)
+        // 注意:StatusOptions::new() 默认不含未跟踪文件,必须显式开 include_untracked,
+        // 否则新增文件永远查不到 WT_NEW,会被误当作已跟踪文件走 checkout_head(对其无效),
+        // 表现为「丢弃新增文件没有反应」。
         let mut opts = StatusOptions::new();
-        opts.pathspec(file);
+        opts.include_untracked(true)
+            .recurse_untracked_dirs(true)
+            .pathspec(file);
         let statuses = repo.statuses(Some(&mut opts)).map_err(|e| e.to_string())?;
         let is_untracked = statuses.iter().any(|e| e.status().contains(Status::WT_NEW));
 
