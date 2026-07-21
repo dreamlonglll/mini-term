@@ -23,7 +23,7 @@ This directory contains guidelines for frontend development. Fill in each file w
 | [xterm Ligatures + WebGL Order](./xterm-ligatures-with-webgl-order.md) | LigaturesAddon 必须先于 WebglAddon、热切换同步无 await、平台差异 | Filled |
 | [xterm.js WebGL TextureAtlas 跨实例共享](./xterm-webgl-atlas-sharing.md) | atlas page merge 后必须广播 `term.refresh` 唤醒 dormant 终端;否则多 AI 并发出现同形乱码 | Active |
 | [Fluent 2 + backdrop-filter Modal/iframe Portal Convention](./fluent2-portal-modal.md) | `[data-panel]` 的 `backdrop-filter` 形成 containing block,导致 `position: fixed` 全屏 modal/iframe 被拽进面板边界;统一走 `createPortal(node, document.body)` 规避(沿用 commit `e7316e5` 七 modal 修复范式) | Active |
-| [TUI 历史保留与 Windows PTY 分层契约](./tui-scrollback-policy.md) | 100k scrollback、ED3/alternate-screen 拦截是 xterm 历史保留策略；便携 ConPTY 是上游字节流一致性修复，两层不可混为同一根因 | Active |
+| [TUI scrollback 与 Windows PTY 分层契约](./tui-scrollback-policy.md) | 100k 容量、标准 ED3 与 alternate-screen 拦截是 xterm 语义；便携 ConPTY 是上游字节流一致性修复，两层不可混为同一根因 | Active |
 
 ---
 

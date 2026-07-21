@@ -1,0 +1,11 @@
+{"file":".trellis/spec/backend/index.md","reason":"核对 Rust/Tauri 后端规范"}
+{"file":".trellis/spec/backend/portable-pty-conpty-cwd-fallback.md","reason":"确认未破坏 portable-pty cwd 语义"}
+{"file":".trellis/spec/backend/pty-env-vars-injection.md","reason":"确认未破坏 PTY 环境变量注入契约"}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"检查 staging/config 多入口一致性"}
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"检查源码资源到安装包再到运行时的完整数据流"}
+{"file":".trellis/tasks/07-21-fix-codex-cli-scrollback/research/pty-code-path.md","reason":"以研究事实核对接入范围"}
+{"file":".trellis/tasks/07-21-fix-codex-cli-scrollback/research/portable-conpty.md","reason":"核对架构、文件布局、安全和回退边界"}
+{"file":".trellis/tasks/07-21-fix-codex-cli-scrollback/research/test-seam.md","reason":"核对回归测试是否覆盖资源、选择与回退"}
+{"file":".trellis/spec/frontend/index.md","reason":"核对前端终端策略规范"}
+{"file":".trellis/spec/frontend/tui-scrollback-policy.md","reason":"核对 ED3 放行没有误改 alternate-screen、scrollback 与 focus 契约"}
+{"file":".trellis/tasks/07-21-fix-codex-cli-scrollback/research/codex-folding.md","reason":"按 Codex 精确版本源码与 xterm 探针核对折叠行为"}

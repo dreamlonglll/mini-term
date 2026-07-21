@@ -1,7 +1,8 @@
-# TUI 历史保留与 Windows PTY 分层契约
+# TUI scrollback 与 Windows PTY 分层契约
 
-> mini-term 为 AI/TUI 会话选择“历史优先”体验，但该策略必须与 Windows ConPTY
-> 字节流兼容性分层维护，不能把下游 parser handler 当成上游 PTY 根因修复。
+> mini-term 使用 10 万行 normal-buffer 容量并遵循标准 ED3 清历史语义；
+> alternate-screen 47/1047/1049 仍是独立的全局兼容策略。两者必须与上游 Windows
+> ConPTY 字节流兼容性分层维护。
 
 ## 1. Scope / Trigger
 
@@ -16,7 +17,7 @@
 
 ```text
 Codex/TUI → ConPTY/OpenConsole → pty-output → term.write → xterm parser/buffer
-             上游兼容层                         下游历史保留策略
+             上游兼容层                         下游终端语义
 ```
 
 ## 2. Signatures
@@ -26,10 +27,7 @@ Codex/TUI → ConPTY/OpenConsole → pty-output → term.write → xterm parser/
 ```ts
 new Terminal({ scrollback: 100000 });
 
-term.parser.registerCsiHandler(
-  { final: 'J' },
-  params => params[0] === 3,
-);
+// 不注册 CSI J override：ED0/1/2/3 全部由 xterm 默认 handler 执行。
 
 term.parser.registerCsiHandler(
   { final: 'h', prefix: '?' },
@@ -41,87 +39,88 @@ term.parser.registerCsiHandler(
 );
 ```
 
-`registerCsiHandler` 返回 `true` 表示整条 CSI 已被处理，xterm 默认 handler 不再执行；
+`registerCsiHandler` 返回 `true` 表示整条 CSI 已处理，xterm 默认 handler 不再执行；
 公开 API 不支持“只消费一条 CSI 中的部分参数”。
 
 ## 3. Contracts
 
-- `scrollback: 100000` 只控制已经形成的 normal-buffer 历史容量，不负责让 `baseY` 增长。
-- ED3 handler 是有意覆盖标准 `Erase Saved Lines` 语义的“历史优先”产品策略；ED0/1/2
-  必须继续交给 xterm 默认实现。
-- 47/1047/1049 handler 是全局 TUI 兼容策略，不是 Codex 专用开关；它让输出留在 normal
-  buffer，但同时放弃标准 alternate-buffer 及 1049 保存/恢复光标语义。
+- `scrollback: 100000` 只控制已经形成的 normal-buffer 历史容量，不保证历史永不被应用清除。
+- 不得注册 CSI J override。ED0/1/2/3 全部进入 xterm 默认实现；其中 ED3 标准语义是
+  `Erase Saved Lines`，可永久清除 saved lines。
+- ED3 是全局终端语义：Codex、Claude、shell `clear` 与其他应用一视同仁。parser callback
+  没有可靠发送者身份，不得用 ANSI 指纹、AI 状态或进程启发式做“仅 Codex”放行。
+- Codex inline consolidation 会发送 `ED2 + ED3`，清除流式临时 scrollback 后从 canonical
+  transcript 重放；吞掉 ED3 会留下已经进入 saved lines 的旧临时内容。
+- 47/1047/1049 handler 仍是全局 TUI 兼容策略，与 ED3 独立；它让 overlay 输出留在
+  normal buffer，但放弃标准 alternate-buffer 及 1049 保存/恢复光标语义。
 - focus 产生的 `CSI I`/`CSI O` 仍写入 PTY，但不得触发 `scrollToBottom`。
-- resize/focus 冷却只抑制 TUI viewport/full-screen redraw 对 AI 活动时间戳的污染；不得称为
-  alternate-buffer 专属逻辑。
-- 便携 ConPTY 负责保证进入 xterm 前的 PTY 字节流行为跨 Windows build 一致，不替代上述
-  历史保留策略；上述策略也不能修复 `normal.baseY` 从未形成的上游问题。
+- resize/focus 冷却只抑制 TUI viewport/full-screen redraw 对 AI 活动时间戳的污染。
+- 便携 ConPTY 负责保证进入 xterm 前的 PTY 字节流跨 Windows build 一致，不替代上述
+  xterm 语义；放行 ED3 也不能修复 `normal.baseY` 从未形成的上游问题。
 
 ## 4. Validation & Error Matrix
 
 | 条件 | 必须行为 |
 |---|---|
-| CSI J 参数为 3 | 当前策略吞掉 ED3，保留 saved lines |
-| CSI J 参数为 0/1/2 | 返回 `false`，执行 xterm 默认擦除语义 |
+| CSI J 参数为 0/1/2/3 | 不由 mini-term 消费，执行 xterm 默认擦除语义 |
+| Codex `ED2 + ED3 + replay` | 删除旧 saved lines，只留下重放后的 canonical transcript |
+| shell/Codex `/clear` 发送 ED3 | 可真正清除旧 scrollback，这是有意的标准语义 |
 | DECSET/DECRST 仅含 47/1047/1049 | 当前兼容策略吞掉整条序列 |
 | DECSET/DECRST 不含 alt 参数 | 返回 `false`，不得影响其他 DEC 私有模式 |
-| 混合参数（如 `?1004;1049h`） | 当前实现会吞掉整条，属于已知风险；后续调整必须显式测试和记录取舍 |
+| 混合参数（如 `?1004;1049h`） | 当前实现吞掉整条，属于已知风险；后续调整必须显式测试 |
 | focus 输入 `CSI I/O` | 写入 PTY，但保持用户当前滚动位置 |
-| 便携 ConPTY 资源缺失/回退 | parser 策略保持不变，不能用 handler 开关掩盖 backend 诊断 |
+| 便携 ConPTY 资源缺失/回退 | xterm parser 策略不变，不能用 handler 开关掩盖 backend 诊断 |
 
 ## 5. Good / Base / Bad Cases
 
-- **Good**：便携 ConPTY 提供稳定字节流；ED3 handler 保留已形成的历史；用户输入回到底部，
-  focus 切换不改变手动上翻位置。
-- **Base**：标准 `clear` 明确发送 ED3，但 mini-term 仍保留历史。这是已公开的“历史优先”
-  取舍，不应描述成 xterm bug。
-- **Bad**：看到 Codex 可滚动就宣称 ConPTY 根因已修复，却没有记录 backend；或在同一改动中
-  同时更换 ConPTY 并删除 parser handler，导致结果无法归因。
+- **Good**：便携 ConPTY 提供稳定字节流；Codex hard-reset 的 ED3 删除 transient saved
+  lines，最终只看到 canonical transcript；普通历史仍可增长到 10 万行。
+- **Base**：应用明确发送 ED3 后，用户无法再上翻已 purge 的内容。这是恢复标准终端语义的
+  产品取舍，不是 xterm 数据丢失 bug。
+- **Bad**：保留 CSI J handler 并声称“只保护历史”；这会破坏 Codex consolidation、
+  `/clear`、resize/线程切换后的 canonical replay。
+- **Bad**：为“仅 Codex 放行”猜测发送者，或顺手删除 alternate-screen handler，导致两个
+  独立产品语义被绑定在一次改动中。
 - **Bad**：用 `params.some(...)` 吞掉含 1049 的混合序列，却忽略同一序列中的 1004 等模式。
 
 ## 6. Tests Required
 
 任何改动 ED3/alternate-screen 策略的任务至少覆盖：
 
-1. ED3 被处理，ED0/1/2 被放行；
-2. 单独 47/1047/1049 的 set/reset；
-3. 非 alternate DEC 私有模式被放行；
-4. 混合 DEC 参数的行为是明确断言，不得静默随实现漂移；
-5. focus `CSI I/O` 不调用 `scrollToBottom`，普通用户输入仍调用；
-6. 原故障机器执行 portable/system backend 与 handler 开/关 A/B，记录 active buffer、
-   `normal.baseY`、控制序列和实际 OpenConsole 路径。
-
-在 portable backend 基线通过、且故障机与正常机的 handler A/B 都有证据前，不得删除现有
-parser handler。
+1. 在真实 xterm 上写入 Codex 同形 `ED2 + ED3 + folded transcript`，断言旧 saved lines
+   消失、`baseY == 0` 且 canonical transcript 存在；
+2. `terminalCache.ts` 不再注册 CSI J handler，因而 ED0/1/2/3 均由 xterm 默认实现；
+3. `scrollback: 100000` 保持；
+4. 单独 47/1047/1049 的 set/reset handler 保持；
+5. 非 alternate DEC 私有模式被放行；混合 DEC 参数行为有明确断言；
+6. focus `CSI I/O` 不调用 `scrollToBottom`，普通用户输入仍调用；
+7. 原故障机器记录 portable/system backend、active buffer、`normal.baseY`、控制序列和
+   实际 OpenConsole 路径。
 
 ## 7. Wrong vs Correct
 
-### Wrong：把 ED3 拦截当成 Windows 根因修复
+### Wrong：吞掉 ED3 保护历史
 
 ```ts
-// 只能处理已经到达 xterm 的 ED3，不能修复 ConPTY 未形成历史行。
 term.parser.registerCsiHandler({ final: 'J' }, params => params[0] === 3);
 ```
 
-### Correct：分别诊断 backend 与历史策略
+ED2 只能清可见区，已经进入 saved lines 的 transient 内容仍残留，阻止 Codex
+hard-reset/replay 完成自动折叠。
 
-```text
-[conpty-bootstrap] backend=portable ...
-term.buffer.active.type = normal
-term.buffer.normal.baseY = <observed>
-ED3 handler = on/off
-alternate handler = on/off
-```
-
-先证明固定 ConPTY backend 解决跨机器差异，再独立决定是否保留历史优先策略。
-
-### Wrong：无意识吞掉混合 DEC 参数
+### Correct：恢复 xterm 标准 ED3，独立保留 alternate-screen 策略
 
 ```ts
-params.some(isAltScreenMode); // ?1004;1049h 会连 1004 一起吞掉
+const term = new Terminal({ scrollback: 100000 });
+// 无 CSI J override。
+
+term.parser.registerCsiHandler(
+  { final: 'h', prefix: '?' },
+  params => params.some(isAltScreenMode),
+);
 ```
 
-### Correct：把混合参数作为显式兼容决策
+### Wrong：通过 ANSI/进程启发式仅对 Codex 放行
 
-若公开 parser API 无法部分消费，必须通过测试明确选择“整条放行”或更深的状态适配；不可
-继续把无关模式丢失当成未定义行为。
+parser callback 只能看到通用 CSI 参数；同一 PTY 还会依次运行 shell、Codex 和其他程序。
+若未来需要“禁止应用清历史”，应提供显式终端语义设置，而不是猜发送者身份。

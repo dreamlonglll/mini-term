@@ -45,7 +45,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 - **多标签管理** — 每个项目独立标签页，拖拽排序，状态图标一目了然
 - **递归分屏** — 横向 / 纵向任意嵌套分屏，Allotment 拖拽调整比例
 - **高性能渲染** — xterm.js v6 + WebGL 加速，自动降级为 Canvas
-- **10 万行滚动缓冲** — 拦截 CSI 3J（ED3）指令，Claude / Codex / OpenCode 等 TUI 清屏时保留上滚历史；拦截 alternate screen 切换，TUI 程序输出留在主缓冲区，滚动条和 scrollback 始终可用
+- **10 万行滚动缓冲** — 主缓冲区最多保留 10 万行，同时全局遵循标准 CSI 3J（ED3）；Codex 等应用可删除流式临时内容并重放折叠后的最终 transcript，`/clear` 也能真正清除旧历史；alternate screen 切换仍被拦截，TUI overlay 留在主缓冲区并保持滚动条可用
 - **终端缓存** — 切换项目 / 标签 / 分屏不重建 xterm 实例，已有内容不丢失；启动按需懒加载，仅当前可见 pane 创建 PTY，避免历史项目终端越多启动越卡
 - **项目切换缓存** — FileTree / GitHistory 数据按项目缓存，切回已访问项目零延迟渲染；目录加载与 Git 状态并行执行，Git 仓库扫描结果缓存 30 秒
 - **复制粘贴** — `Ctrl+Shift+C/V`（macOS `⌘+Shift+C/V`）快捷键 + 右键菜单，未选中时"复制"自动置灰；可在设置中开启「智能 `Ctrl+C/V`」（有选区时 `Ctrl+C` 复制、无选区时中断程序，`Ctrl+V` 直接粘贴）；Windows 大段多行粘贴自动分块写入，防止 ConPTY 丢行
