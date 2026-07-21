@@ -14,6 +14,7 @@
 import { execFileSync } from 'node:child_process';
 import { copyFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { stagePortableConpty, WINDOWS_X64_TARGET } from './stage-conpty.mjs';
 
 const SIDECARS = ['miniterm-hook', 'mt-ssh-mcp'];
 const MANIFEST = join('src-tauri', 'mt-sidecars', 'Cargo.toml');
@@ -76,5 +77,16 @@ for (const name of SIDECARS) {
       console.warn(`[stage-sidecars] 跳过 ${devCopy}（可能正在运行）: ${e.code ?? e.message}`);
     }
   }
+}
+
+if (triple.includes('windows')) {
+  if (triple !== WINDOWS_X64_TARGET) {
+    throw new Error(
+      `[stage-sidecars] Windows 目标 ${triple} 尚无匹配的便携 ConPTY 资源`,
+    );
+  }
+  await stagePortableConpty({ target: triple });
+} else {
+  console.log(`[stage-sidecars] ${triple} 非 Windows，跳过便携 ConPTY staging`);
 }
 console.log('[stage-sidecars] done');

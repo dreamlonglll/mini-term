@@ -9,6 +9,8 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "build-sidecars": "node scripts/stage-sidecars.mjs",
+    "stage-conpty": "node scripts/stage-conpty.mjs",
+    "test:conpty": "node --test tests/conptyBundle.test.cjs && cargo test --manifest-path src-tauri/Cargo.toml --lib conpty_bootstrap",
     "pretauri": "npm run build-sidecars"
   },
   "dependencies": {

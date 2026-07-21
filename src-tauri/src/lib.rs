@@ -2,6 +2,7 @@ mod ai_sessions;
 mod cc_connect;
 mod clipboard;
 mod config;
+mod conpty_bootstrap;
 mod editor;
 mod fs;
 mod git;
@@ -40,6 +41,12 @@ pub fn run() {
         .manage(cc_connect::CcConnectManager::new())
         .manage(remote_ssh::RemoteSshState::new())
         .setup(|app| {
+            // portable-pty 0.8.1 会在第一次 openpty 时进程级缓存 ConPTY 函数表；
+            // 因此便携 DLL 的资源校验和绝对路径预载必须是 setup 的第一项，早于
+            // 任何可能创建 PTY 的初始化；预载引用保留到进程退出且不修改 PATH。
+            #[cfg(windows)]
+            conpty_bootstrap::initialize(app.handle());
+
             // identifier 从 com.tauri-app.tauri-app 切换为 com.mini-term.app 后,
             // 第一次启动时把旧 app_data_dir 下的 config.json 拷到新目录,
             // 必须发生在任何 read_config 之前。
