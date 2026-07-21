@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.6.8-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.6.9-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -45,7 +45,7 @@ Mini-Term solves all of the above with one lightweight desktop app.
 - **Multi-tab management** — A dedicated tab per project, drag to reorder, status icons at a glance.
 - **Recursive splitting** — Arbitrarily nested horizontal / vertical splits, drag to adjust ratios via Allotment.
 - **High-performance rendering** — xterm.js v6 + WebGL acceleration, automatic fallback to Canvas.
-- **100k-line scrollback buffer** — Keeps up to 100,000 normal-buffer lines while honoring standard CSI 3J (ED3) globally, so applications such as Codex can discard transient output and replay a folded transcript, while `/clear` can truly purge old history; alternate-screen switching remains intercepted so TUI overlays stay in the main buffer with a usable scrollbar.
+- **100k-line scrollback buffer** — Keeps up to 100,000 normal-buffer lines while honoring standard CSI 3J (ED3) globally, so applications such as Codex can discard transient output and replay a folded transcript, while `/clear` can truly purge old history; alternate-screen switching remains intercepted so TUI overlays stay in the main buffer with a usable scrollbar. On Windows, mini-term bundles and preloads a pinned official ConPTY compatibility runtime (with a system-ConPTY fallback if validation fails) to keep Codex scrolling and transcript folding consistent across Windows versions.
 - **Terminal caching** — Switching projects / tabs / panes never rebuilds the xterm instance, so existing content is preserved; lazy startup creates a PTY only for the currently visible pane, avoiding the slowdown of spawning more terminals the more history projects you have.
 - **Project-switch caching** — FileTree / GitHistory data is cached per project, so switching back to a visited project renders with zero latency; directory loading and Git status run in parallel, and Git repo scan results are cached for 30 seconds.
 - **Copy & paste** — `Ctrl+Shift+C/V` (macOS `⌘+Shift+C/V`) shortcuts + context menu, with "Copy" auto-greyed when nothing is selected; an optional "Smart `Ctrl+C/V`" mode (copy when there's a selection, interrupt the program when there isn't, and `Ctrl+V` pastes directly); on Windows, large multi-line pastes are chunked to prevent ConPTY from dropping lines.
@@ -79,7 +79,7 @@ Mini-Term solves all of the above with one lightweight desktop app.
 
 ### AI Process Awareness
 
-- **Hook event system** — Integrates the official Claude Code / Codex Hook APIs to receive AI tool events (SessionStart / End, ToolUse, etc.), which is more precise and timely than process polling; the built-in `miniterm-hook` CLI is called by the hook system to POST events to a local server; the settings UI registers / unregisters the hook config with one click, merging rather than overwriting your existing hooks.
+- **Hook event system** — Integrates the official Claude Code / Codex Hook APIs to receive AI tool events (SessionStart / End, ToolUse, etc.), which is more precise and timely than process polling; the built-in `miniterm-hook` CLI is called by the hook system to POST events to a local server; the settings UI registers / unregisters the hook config with one click, merging rather than overwriting your existing hooks. Codex permission requests stay in `ai-working` through approval and tool execution, avoiding premature completion notifications.
 - **Real-time status detection** — Hook-first with a 500ms process-polling fallback, auto-detecting Claude / Codex / OpenCode and showing idle / working / error states.
 - **Status aggregation** — Aggregated layer by layer from pane → tab → project, with priority `error > ai-working > ai-idle > idle`.
 - **Completion notification trio** — Fires the moment an AI task goes working → idle:
@@ -153,7 +153,7 @@ Remotely drive the AI agents running on your machine through IM platforms (Feish
 | Git | git2 0.19 |
 | File watching | notify 7 + ignore 0.4 (.gitignore filtering) |
 | Tauri plugins | `window-state` · `clipboard-manager` · `dialog` · `opener` |
-| Test coverage | 317 Rust unit tests (pty / fs / config / hook / ssh / cc-connect) |
+| Test coverage | 327 Rust unit tests (pty / fs / config / hook / ssh / cc-connect) |
 
 ## Getting Started
 

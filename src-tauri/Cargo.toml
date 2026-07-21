@@ -1,6 +1,6 @@
 [package]
 name = "tauri-app"
-version = "0.6.8"
+version = "0.6.9"
 description = "mini-term: AI-aware desktop terminal manager built on Tauri v2 — multi-project, multi-tab, split-pane, IM bridged via cc-connect"
 authors = ["you"]
 edition = "2021"

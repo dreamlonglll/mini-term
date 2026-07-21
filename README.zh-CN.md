@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.6.8-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.6.9-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -45,7 +45,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 - **多标签管理** — 每个项目独立标签页，拖拽排序，状态图标一目了然
 - **递归分屏** — 横向 / 纵向任意嵌套分屏，Allotment 拖拽调整比例
 - **高性能渲染** — xterm.js v6 + WebGL 加速，自动降级为 Canvas
-- **10 万行滚动缓冲** — 主缓冲区最多保留 10 万行，同时全局遵循标准 CSI 3J（ED3）；Codex 等应用可删除流式临时内容并重放折叠后的最终 transcript，`/clear` 也能真正清除旧历史；alternate screen 切换仍被拦截，TUI overlay 留在主缓冲区并保持滚动条可用
+- **10 万行滚动缓冲** — 主缓冲区最多保留 10 万行，同时全局遵循标准 CSI 3J（ED3）；Codex 等应用可删除流式临时内容并重放折叠后的最终 transcript，`/clear` 也能真正清除旧历史；alternate screen 切换仍被拦截，TUI overlay 留在主缓冲区并保持滚动条可用。Windows 版内置并预载固定版本的官方 ConPTY 兼容运行时（资源校验失败时自动回退系统 ConPTY），让不同 Windows 版本下的 Codex 滚动与 transcript 折叠行为保持一致
 - **终端缓存** — 切换项目 / 标签 / 分屏不重建 xterm 实例，已有内容不丢失；启动按需懒加载，仅当前可见 pane 创建 PTY，避免历史项目终端越多启动越卡
 - **项目切换缓存** — FileTree / GitHistory 数据按项目缓存，切回已访问项目零延迟渲染；目录加载与 Git 状态并行执行，Git 仓库扫描结果缓存 30 秒
 - **复制粘贴** — `Ctrl+Shift+C/V`（macOS `⌘+Shift+C/V`）快捷键 + 右键菜单，未选中时"复制"自动置灰；可在设置中开启「智能 `Ctrl+C/V`」（有选区时 `Ctrl+C` 复制、无选区时中断程序，`Ctrl+V` 直接粘贴）；Windows 大段多行粘贴自动分块写入，防止 ConPTY 丢行
@@ -79,7 +79,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 
 ### AI 进程感知
 
-- **Hook 事件系统** — 接入 Claude Code / Codex 官方 Hook API，接收 AI 工具事件（SessionStart / End、ToolUse 等），比进程轮询更精准及时；内置 `miniterm-hook` CLI 工具供 Hook 系统调用，自动 POST 事件到本地服务器；设置界面一键注册 / 卸载 Hook 配置，合并而非覆盖用户已有 hook
+- **Hook 事件系统** — 接入 Claude Code / Codex 官方 Hook API，接收 AI 工具事件（SessionStart / End、ToolUse 等），比进程轮询更精准及时；内置 `miniterm-hook` CLI 工具供 Hook 系统调用，自动 POST 事件到本地服务器；设置界面一键注册 / 卸载 Hook 配置，合并而非覆盖用户已有 hook。Codex 权限请求从审批到工具执行完成期间持续保持 `ai-working`，避免提前触发任务完成提醒
 - **实时状态检测** — Hook 优先 + 500ms 进程轮询降级，自动识别 Claude / Codex / OpenCode，显示 idle / working / error 状态
 - **状态聚合** — 面板 → 标签页 → 项目逐层聚合，优先级 `error > ai-working > ai-idle > idle`
 - **完成提醒三件套** — AI 任务从 working → idle 时立刻触发：
@@ -153,7 +153,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 | Git | git2 0.19 |
 | 文件监听 | notify 7 + ignore 0.4（.gitignore 过滤） |
 | Tauri 插件 | `window-state` · `clipboard-manager` · `dialog` · `opener` |
-| 测试覆盖 | 317 个 Rust 单元测试（pty / fs / config / hook / ssh / cc-connect） |
+| 测试覆盖 | 327 个 Rust 单元测试（pty / fs / config / hook / ssh / cc-connect） |
 
 ## 快速开始
 
