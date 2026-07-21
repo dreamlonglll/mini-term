@@ -5,7 +5,7 @@
 //! - start / stop / restart: 进程生命周期管理(mini-term 自己 spawn 时持有 Child)
 //! - list_projects / import_project / unlink_project: 项目同步与关联
 //!
-//! 关键决策(详见 .trellis/tasks/05-28-embed-cc-connect-panel/prd.md):
+//! 关键决策:
 //! - cc-connect 进程不需要 PTY,用 std::process::Command 即可(stdout/stderr null)
 //! - 写回 config.toml 用 toml_edit 保留注释和顺序(沿用 hook_registry / ssh_mcp_registry 既有模式)
 //! - 创建新 [[projects]] 后必须 POST /api/v1/restart 才生效(/reload 对全新项目无效)

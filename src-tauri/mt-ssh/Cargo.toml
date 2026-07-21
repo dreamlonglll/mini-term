@@ -46,7 +46,6 @@ rsa = "=0.10.0-rc.18"
 # ssh-encoding / rsa 的现有精确锁,也不触发 aws-lc 的 NASM 工具链(子代理本地实测依赖树零
 # aws-lc,russh 仍单一 0.61.x)。它是 russh 官方 examples/sftp_client.rs 钦定的配套库。
 # 无需开任何 feature:async-trait 仅 server 端用得到,client 不需要。
-# 详见 .trellis/tasks/06-09-ssh-mcp-sftp-transfer/research/russh-sftp-options.md。
 russh-sftp = "2.3.0"
 # 池与 SFTP 需要的 tokio 面:rt(spawn reaper/后台 disconnect)、sync(Mutex)、
 # time(interval/timeout)、fs + io-util(SFTP 传输用 tokio::fs 流式读写本地文件,task 06-09)。

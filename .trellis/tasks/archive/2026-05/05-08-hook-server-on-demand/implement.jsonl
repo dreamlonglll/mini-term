@@ -1,6 +1,0 @@
-{"file": ".trellis/spec/frontend/index.md", "reason": "前端整体规范索引"}
-{"file": ".trellis/spec/frontend/component-guidelines.md", "reason": "组件开发规范，SettingsModal 改动需遵循"}
-{"file": ".trellis/spec/frontend/state-management.md", "reason": "Zustand store 规范，config 相关状态管理"}
-{"file": ".trellis/spec/frontend/hook-guidelines.md", "reason": "Hook 开发规范"}
-{"file": ".trellis/spec/frontend/type-safety.md", "reason": "类型安全规范，新增 hookEnabled 字段"}
-{"file": ".trellis/tasks/05-08-hook-server-on-demand/prd.md", "reason": "需求文档"}

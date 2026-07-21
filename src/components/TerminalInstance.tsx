@@ -157,8 +157,7 @@ export function TerminalInstance({ ptyId }: Props) {
         requestAnimationFrame(() => {
           fitAddon.fit();
           term.refresh(0, term.rows - 1);
-          // 可见性恢复时强制清 atlas 兜底 RenderService._isPaused 拦截期间的残留,
-          // 见 .trellis/spec/frontend/xterm-webgl-atlas-sharing.md 「未覆盖路径」章节
+          // 可见性恢复时强制清 atlas，兜底 RenderService._isPaused 拦截期间的残留。
           clearAtlasForPty(ptyId);
         });
       }

@@ -116,7 +116,7 @@ pub struct AppConfig {
     pub cc_connect: Option<CcConnectConfig>,
 }
 
-/// cc-connect 集成的持久化配置。详见 .trellis/tasks/05-28-embed-cc-connect-panel/prd.md
+/// cc-connect 集成的持久化配置。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct CcConnectConfig {

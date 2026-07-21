@@ -445,7 +445,7 @@ function readIsPaused(term: Terminal): boolean | null {
  *
  * 不可见终端(RenderService._isPaused === true)的 refresh 会被 xterm.js core 吞掉,
  * 仅设 _needsFullRefresh,需要靠 TerminalInstance 的 visibilityObserver 在可见性恢复时
- * 调 clearAtlasForPty 兜底。完整背景见 .trellis/spec/frontend/xterm-webgl-atlas-sharing.md
+ * 调 clearAtlasForPty 兜底。
  */
 function refreshAllTerminalsForAtlasChange(reason: 'add' | 'remove'): void {
   if (isAtlasDebugEnabled()) {

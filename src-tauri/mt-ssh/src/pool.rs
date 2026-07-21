@@ -5,8 +5,7 @@
 //! (stderr 日志统一用 `[mt-ssh]` 前缀 —— PR2 起主程序与 sidecar 共用本 crate,
 //! 前缀跟 crate 而非跟调用方走,便于在两边日志里定位到同一层。)
 //!
-//! 设计来源:`.trellis/tasks/05-22-refactor-ssh-mcp-persistent-session-pool/research/`。
-//! 摘要:
+//! 设计摘要:
 //! - 库:`russh 0.61`(pure Rust + 原生 tokio async),加密后端 `ring`(避免 Windows
 //!   MSVC 上对 aws-lc-sys NASM 的依赖)。
 //! - 数据结构:`HashMap<ConnId, Arc<CachedSession>>` 包在 `tokio::sync::Mutex` 内;

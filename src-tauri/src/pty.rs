@@ -202,8 +202,7 @@ fn prepare_ssh_remote_launch(
 /// 本函数只负责把剩余的 key 加上 `/u` flag 并用 `:` 连接,再把宿主已有的 `WSLENV`
 /// (若存在且非空)追加在尾部合并 —— 不覆盖,与 JetBrains IDEA terminal / wslgit 对齐。
 ///
-/// flag 选 `/u`(仅 Win→WSL 方向,不做路径翻译)的决策依据见 PRD 与
-/// `.trellis/tasks/05-26-wsl-env-vars-injection/research/wslenv-mechanism.md`。
+/// flag 选 `/u`(仅 Win→WSL 方向,不做路径翻译),避免把普通环境变量值当作路径转换。
 ///
 /// 返回 `None` 当且仅当 `user_envs` 为空且宿主无 `WSLENV` —— 此时不应注入 WSLENV,
 /// 否则会用空字符串覆盖宿主既有值。
@@ -835,8 +834,7 @@ pub fn create_pty(
         match &wsl_override {
             // WSL 分支:启动的是宿主 wsl.exe,WSL VM 内的 claude/codex 子进程
             // process_monitor 看不到,因此本路径下 AI 进程识别(ai-working/ai-idle 状态)
-            // 会失效 —— PRD Out of Scope 已列,见
-            // `.trellis/tasks/05-25-support-wsl-project-root/prd.md`。
+            // 会失效,目前不在此路径内处理。
             Some((distro, unix_path)) => (
                 "wsl.exe".to_string(),
                 vec![
