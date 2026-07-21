@@ -60,8 +60,9 @@ fn main() {
 
     // 推断 agent 类型
     if body.get("agent").is_none() {
-        // 尝试从 stdin payload 的字段推断
-        let agent = if body.get("transcript_path").is_some() {
+        // Codex 的 hook payload 固定携带 turn_id，Claude Code 没有该字段；
+        // transcript_path 两者都有，不能用来区分。
+        let agent = if body.get("turn_id").is_some() {
             "codex"
         } else {
             "claude-code"

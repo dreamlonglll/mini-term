@@ -118,7 +118,14 @@ impl HookState {
 /// - ai-working: 表示 AI 正在处理（思考/工具调用/子代理/压缩）
 /// - ai-idle: 表示 AI 等待用户输入（停止/权限请求/通知等）
 /// - SessionEnd 单独处理（清除 hook 状态），不在此映射
-fn map_event_to_status(event: &str) -> Option<&'static str> {
+fn map_event_to_status(event: &str, agent: Option<&str>) -> Option<&'static str> {
+    // Codex 的 PermissionRequest 在审批 UI 弹出前触发，批准后直接执行工具，
+    // 直到 PostToolUse 之前不再有任何 hook 事件。若映射为 ai-idle，批准后
+    // 整个命令执行期间状态都会卡在 ai-idle，且审批弹出时误报"任务完成"，
+    // 因此对 Codex 保持 ai-working（仍处于任务中）。
+    if event == "PermissionRequest" && agent == Some("codex") {
+        return Some("ai-working");
+    }
     match event {
         // ai-working 状态：AI 正在积极工作
         "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "SubagentStart" | "SubagentStop"
@@ -237,7 +244,7 @@ pub fn start_hook_server(app: AppHandle, hook_state: HookState) -> Result<(), St
                         "[hook-server] pty_id={} event=SessionEnd -> hook 已清除，回退到 idle",
                         pty_id
                     );
-                } else if let Some(status) = map_event_to_status(event) {
+                } else if let Some(status) = map_event_to_status(event, payload.agent.as_deref()) {
                     hook_state.update(pty_id, status.to_string());
 
                     // 通过 Tauri event 通知前端（复用现有 pty-status-change 事件）
@@ -318,5 +325,44 @@ fn delete_port_file(app: &AppHandle) {
                 eprintln!("[hook-server] 端口文件已删除 {}", path.display());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_permission_request_maps_to_ai_working() {
+        assert_eq!(
+            map_event_to_status("PermissionRequest", Some("codex")),
+            Some("ai-working")
+        );
+    }
+
+    #[test]
+    fn claude_permission_request_keeps_ai_idle() {
+        assert_eq!(
+            map_event_to_status("PermissionRequest", Some("claude-code")),
+            Some("ai-idle")
+        );
+        // agent 字段缺失时保持原有行为
+        assert_eq!(
+            map_event_to_status("PermissionRequest", None),
+            Some("ai-idle")
+        );
+    }
+
+    #[test]
+    fn other_events_unaffected_by_agent() {
+        assert_eq!(
+            map_event_to_status("Stop", Some("codex")),
+            Some("ai-idle")
+        );
+        assert_eq!(
+            map_event_to_status("PreToolUse", Some("codex")),
+            Some("ai-working")
+        );
+        assert_eq!(map_event_to_status("Unknown", Some("codex")), None);
     }
 }
