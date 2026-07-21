@@ -15,6 +15,7 @@
 | [Tokio 常驻资源池骨架](./tokio-session-pool-pattern.md) | 带后台 reaper + graceful shutdown 的常驻资源池可复用骨架（Weak reaper、std Mutex 持 JoinHandle、shutdown 三步、fast-path 不查 unhealthy、纯函数抽决策） |
 | [russh-sftp 文件传输](./russh-sftp-file-transfer.md) | 在 russh 0.61 持久 session 上用 `russh-sftp 2.3.0` 做 SFTP 上传/下载：接入模式（request_subsystem+into_stream）、大文件流式分块（禁整文件进内存）、协议层 `set_timeout` 默认 10s/逐请求须放宽、`config.json` 明文密码外泄硬护栏 |
 | [portable-pty ConPTY cwd 静默 fallback](./portable-pty-conpty-cwd-fallback.md) | Windows 上 `CommandBuilder::cwd()` 拿到非合法目录时静默退回 `$USERPROFILE`，调用方必须先校验或替换 cwd，避免诊断黑洞 |
+| [Windows 便携 ConPTY 运行时](./portable-conpty-runtime.md) | x64 发布物固定官方 DLL + x64/ARM64 host，Tauri setup 首次 `openpty` 前预载、诊断与系统回退边界 |
 | [Windows `\\?\UNC\` verbatim 前缀剥离](./windows-unc-verbatim-prefix-strip.md) | `canonicalize` 返回的 UNC verbatim 前缀 `dunce::simplified` 不剥（只剥盘符），自己写一条 `\\?\UNC\<host>\<rest>` → `\\<host>\<rest>` 规则 |
 | [`wsl.exe --cd` 路径语义](./wsl-exe-cd-path-semantics.md) | `wsl.exe -d <distro> --cd <path>` 的 path 不接受 `\\wsl$\` UNC，必须先 parse 出 distro 与 Linux 路径再传；distro 名从路径取，不调 `wsl -l -v` |
 | [PTY 子进程环境变量注入契约](./pty-env-vars-injection.md) | `create_pty` 注入项目级 env 的完整契约：注入顺序（内部 env 先 / 用户 envs 后）、`MINITERM_*` 前后端双重保护、WSL 分支跳过注入、前后端 WSL 检测口径必须对齐 |
