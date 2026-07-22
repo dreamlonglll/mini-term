@@ -257,7 +257,7 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
               {currentPath}
             </span>
           </div>
-          <div className="flex items-center gap-2 flex-shrink-0">
+          <div className="flex items-center gap-4 flex-shrink-0">
             {editButton}
             {(isMd || isHtml) && result && !result.isBinary && !result.tooLarge && (
               <div className="flex rounded-[var(--radius-sm)] border border-[var(--border-default)] overflow-hidden text-xs">
