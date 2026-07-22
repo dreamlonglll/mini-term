@@ -1,5 +1,12 @@
 export const fileViewer = {
   zh: {
+    edit: '\u7f16\u8f91',
+    save: '\u4fdd\u5b58',
+    saving: '\u4fdd\u5b58\u4e2d...',
+    cancel: '\u53d6\u6d88',
+    saved: '\u5df2\u4fdd\u5b58',
+    saveFailed: '\u4fdd\u5b58\u5931\u8d25',
+    unsavedConfirm: '\u6709\u672a\u4fdd\u5b58\u7684\u4fee\u6539\uff0c\u786e\u5b9a\u8981\u653e\u5f03\u5417\uff1f',
     preview: "预览",
     source: "源码",
     loading: "加载中...",
@@ -9,6 +16,13 @@ export const fileViewer = {
     back: "返回",
   },
   en: {
+    edit: 'Edit',
+    save: 'Save',
+    saving: 'Saving...',
+    cancel: 'Cancel',
+    saved: 'Saved',
+    saveFailed: 'Save failed',
+    unsavedConfirm: 'Discard unsaved changes?',
     preview: "Preview",
     source: "Source",
     loading: "Loading...",

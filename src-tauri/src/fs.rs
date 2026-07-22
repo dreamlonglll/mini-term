@@ -399,6 +399,12 @@ pub fn read_file_content(project_root: String, path: String) -> Result<FileConte
 }
 
 #[tauri::command]
+pub fn write_file_content(project_root: String, path: String, content: String) -> Result<(), String> {
+    let p = verify_under_project_root(&project_root, &path, true)?;
+    atomic_write(&p, content.as_bytes()).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub fn create_file(project_root: String, path: String) -> Result<(), String> {
     let p = verify_under_project_root(&project_root, &path, false)?;
     if p.exists() {

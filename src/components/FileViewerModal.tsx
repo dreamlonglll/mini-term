@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import type { MouseEvent as ReactMouseEvent, ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke, convertFileSrc } from '@tauri-apps/api/core';
@@ -92,11 +92,15 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [preview, setPreview] = useState(true);
+  const [editing, setEditing] = useState(false);
+  const [editContent, setEditContent] = useState('');
+  const [saving, setSaving] = useState(false);
   // 当前正在查看的文件，可随 Markdown 内的本地链接跳转；初始为传入的 filePath
   const [currentPath, setCurrentPath] = useState(filePath);
   const [history, setHistory] = useState<string[]>([]);
   const highlightRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
+  const isDirty = editing && result !== null && editContent !== result.content;
 
   const isMd = useMemo(() => isMarkdownFile(currentPath), [currentPath]);
   const isImg = useMemo(() => isImageFile(currentPath), [currentPath]);
@@ -134,6 +138,24 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
     setHistory((h) => h.slice(0, -1));
   }, [history]);
 
+  const handleClose = useCallback(() => {
+    if (isDirty && !window.confirm(t('fileViewer.unsavedConfirm'))) return;
+    onClose();
+  }, [isDirty, onClose, t]);
+
+  const handleSave = useCallback(async () => {
+    if (!result || saving) return;
+    setSaving(true);
+    try {
+      await invoke('write_file_content', { projectRoot, path: currentPath, content: editContent });
+      setResult({ ...result, content: editContent });
+    } catch (e) {
+      setError(t('fileViewer.saveFailed') + ': ' + String(e));
+    } finally {
+      setSaving(false);
+    }
+  }, [currentPath, editContent, projectRoot, result, saving, t]);
+
   // 拦截 Markdown 内的 <a> 点击：先 preventDefault 避免整个程序重载
   const handleLinkClick = useCallback((e: ReactMouseEvent<HTMLAnchorElement>) => {
     e.preventDefault();
@@ -170,7 +192,7 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
     setResult(null);
 
     invoke<FileContentResult>('read_file_content', { projectRoot, path: currentPath })
-      .then(setResult)
+      .then((nextResult) => { setResult(nextResult); setEditContent(nextResult.content); })
       .catch((e) => setError(String(e)))
       .finally(() => setLoading(false));
   }, [open, currentPath, projectRoot, isImg]);
@@ -189,11 +211,12 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
   useEffect(() => {
     if (!open) return;
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's' && editing) { e.preventDefault(); void handleSave(); }
+      else if (e.key === 'Escape') handleClose();
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [open, onClose]);
+  }, [editing, handleClose, handleSave, open]);
 
   // 仅当查看的是原始 filePath 时才高亮跳转行
   useEffect(() => {
@@ -205,6 +228,9 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
   if (!open) return null;
 
   const fileName = currentPath.replace(/\\/g, '/').split('/').pop() ?? currentPath;
+  const editButton = !isImg && result && !result.isBinary && !result.tooLarge
+    ? React.createElement('button', { onClick: editing ? () => void handleSave() : () => { setEditContent(result.content); setEditing(true); setPreview(false); }, disabled: editing && (saving || !isDirty) }, editing ? (saving ? t('fileViewer.saving') : t('fileViewer.save')) : t('fileViewer.edit'))
+    : null;
 
   return createPortal(
     <div className="fixed inset-0 z-50 flex items-center justify-center select-text" onClick={onClose}>
@@ -232,6 +258,7 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
             </span>
           </div>
           <div className="flex items-center gap-2 flex-shrink-0">
+            {editButton}
             {(isMd || isHtml) && result && !result.isBinary && !result.tooLarge && (
               <div className="flex rounded-[var(--radius-sm)] border border-[var(--border-default)] overflow-hidden text-xs">
                 <button
@@ -250,7 +277,7 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
             )}
             <button
               className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors text-lg leading-none"
-              onClick={onClose}
+              onClick={handleClose}
             >
               ✕
             </button>
@@ -301,7 +328,9 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
               </button>
             </div>
           )}
-          {!isImg && result && !result.isBinary && !result.tooLarge && isHtml && preview ? (
+          {!isImg && result && !result.isBinary && !result.tooLarge && editing ? (
+            <textarea value={editContent} onChange={(event) => setEditContent(event.target.value)} autoFocus spellCheck={false} className={'w-full h-full resize-none outline-none bg-[var(--bg-base)] text-[var(--text-primary)] font-mono text-sm leading-6 p-4'} />
+          ) : !isImg && result && !result.isBinary && !result.tooLarge && isHtml && preview ? (
             <iframe
               srcDoc={htmlSrcDoc}
               title={fileName}
