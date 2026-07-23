@@ -1,6 +1,7 @@
 export const fileViewer = {
   zh: {
     edit: '\u7f16\u8f91',
+    view: '\u67e5\u770b',
     save: '\u4fdd\u5b58',
     saving: '\u4fdd\u5b58\u4e2d...',
     cancel: '\u53d6\u6d88',
@@ -17,6 +18,7 @@ export const fileViewer = {
   },
   en: {
     edit: 'Edit',
+    view: 'View',
     save: 'Save',
     saving: 'Saving...',
     cancel: 'Cancel',

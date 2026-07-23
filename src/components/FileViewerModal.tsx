@@ -229,9 +229,16 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
   if (!open) return null;
 
   const fileName = currentPath.replace(/\\/g, '/').split('/').pop() ?? currentPath;
-  const editButton = !isImg && result && !result.isBinary && !result.tooLarge
-    ? React.createElement('button', { onClick: editing ? () => void handleSave() : () => { setEditContent(result.content); setEditing(true); setPreview(false); }, disabled: editing && (saving || !isDirty) }, editing ? (saving ? t('fileViewer.saving') : t('fileViewer.save')) : t('fileViewer.edit'))
-    : null;
+  const canEdit = !isImg && result && !result.isBinary && !result.tooLarge;
+  const toggleEditMode = () => {
+    if (editing) {
+      setEditing(false);
+      return;
+    }
+    if (!editContent) setEditContent(result?.content ?? '');
+    setEditing(true);
+    setPreview(false);
+  };
 
   return createPortal(
     <div className="fixed inset-0 z-50 flex items-center justify-center select-text" onClick={onClose}>
@@ -259,7 +266,18 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
             </span>
           </div>
           <div className="flex items-center gap-4 flex-shrink-0">
-            {editButton}
+            {canEdit && (
+              <>
+                {editing && (
+                  <button onClick={() => void handleSave()} disabled={saving || !isDirty}>
+                    {saving ? t('fileViewer.saving') : t('fileViewer.save')}
+                  </button>
+                )}
+                <button onClick={toggleEditMode}>
+                  {editing ? t('fileViewer.view') : t('fileViewer.edit')}
+                </button>
+              </>
+            )}
             {(isMd || isHtml) && result && !result.isBinary && !result.tooLarge && (
               <div className="flex rounded-[var(--radius-sm)] border border-[var(--border-default)] overflow-hidden text-xs">
                 <button
