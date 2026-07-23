@@ -100,6 +100,7 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
   const [history, setHistory] = useState<string[]>([]);
   const highlightRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
+  const editLineNumbersRef = useRef<HTMLDivElement>(null);
   const isDirty = editing && result !== null && editContent !== result.content;
 
   const isMd = useMemo(() => isMarkdownFile(currentPath), [currentPath]);
@@ -329,7 +330,22 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
             </div>
           )}
           {!isImg && result && !result.isBinary && !result.tooLarge && editing ? (
-            <textarea value={editContent} onChange={(event) => setEditContent(event.target.value)} autoFocus spellCheck={false} className={'w-full h-full resize-none outline-none bg-[var(--bg-base)] text-[var(--text-primary)] font-mono text-sm leading-6 p-4'} />
+            <div className="flex w-full h-full overflow-hidden font-mono text-sm leading-6">
+              <div ref={editLineNumbersRef} className="w-12 h-full overflow-hidden py-4 text-right pr-3 text-[var(--text-muted)] select-none flex-shrink-0 opacity-40">
+                {editContent.split('\n').map((_line, index) => <div key={index}>{index + 1}</div>)}
+              </div>
+              <textarea
+                value={editContent}
+                onChange={(event) => setEditContent(event.target.value)}
+                onScroll={(event) => {
+                  if (editLineNumbersRef.current) editLineNumbersRef.current.scrollTop = event.currentTarget.scrollTop;
+                }}
+                autoFocus
+                spellCheck={false}
+                wrap="off"
+                className="flex-1 h-full resize-none outline-none bg-[var(--bg-base)] text-[var(--text-primary)] leading-6 py-4 px-2"
+              />
+            </div>
           ) : !isImg && result && !result.isBinary && !result.tooLarge && isHtml && preview ? (
             <iframe
               srcDoc={htmlSrcDoc}
