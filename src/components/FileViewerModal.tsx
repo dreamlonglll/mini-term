@@ -210,6 +210,11 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
   }, [currentPath]);
 
   useEffect(() => {
+    if (contentRef.current) contentRef.current.scrollTop = 0;
+    if (editLineNumbersRef.current) editLineNumbersRef.current.scrollTop = 0;
+  }, [editing]);
+
+  useEffect(() => {
     if (!open) return;
     const handleKeyDown = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's' && editing) { e.preventDefault(); void handleSave(); }
@@ -304,7 +309,10 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
         </div>
 
         {/* 内容区 */}
-        <div ref={contentRef} className="flex-1 overflow-auto bg-[var(--bg-base)]">
+        <div
+          ref={contentRef}
+          className={`flex-1 min-h-0 bg-[var(--bg-base)] ${editing ? 'overflow-hidden' : 'overflow-auto'}`}
+        >
           {loading && (
             <div className="flex items-center justify-center h-full text-[var(--text-muted)]">
               {t("fileViewer.loading")}
