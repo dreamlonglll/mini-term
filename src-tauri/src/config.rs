@@ -110,6 +110,10 @@ pub struct AppConfig {
     pub smart_copy_paste: bool,
     #[serde(default)]
     pub ssh_connections: Vec<SshConnection>,
+    /// 显式创建的 SSH 分组名（允许空分组存在）。连接上的 group 字段仍是归属的
+    /// 单一来源，此列表只补充「还没有连接的分组」；空 Vec 时序列化跳过。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ssh_groups: Vec<String>,
     /// cc-connect 集成配置(进程管理 + 项目导入关联 + dashboard 嵌入)。
     /// 未配置时为 None;序列化时省略以保持老 config.json 干净。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -308,6 +312,7 @@ impl Default for AppConfig {
             hook_enabled: false,
             smart_copy_paste: false,
             ssh_connections: vec![],
+            ssh_groups: vec![],
             cc_connect: None,
         }
     }
@@ -869,6 +874,36 @@ mod tests {
         );
         let reparsed: AppConfig = serde_json::from_str(&serialized).unwrap();
         assert_eq!(reparsed.projects[0].ssh_connection_id.as_deref(), Some("conn-1"));
+    }
+
+    #[test]
+    fn ssh_groups_round_trip_and_absent_default() {
+        // 显式分组列表:round-trip 保留顺序
+        let json = r#"{
+            "projects": [],
+            "defaultShell": "cmd",
+            "availableShells": [],
+            "uiFontSize": 13,
+            "terminalFontSize": 14,
+            "sshGroups": ["内网", "客户A"]
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.ssh_groups, vec!["内网", "客户A"]);
+        let serialized = serde_json::to_string(&config).unwrap();
+        let reparsed: AppConfig = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.ssh_groups, vec!["内网", "客户A"]);
+
+        // 旧配置无该字段 → 空 Vec,且空时不序列化
+        let old: AppConfig = serde_json::from_str(
+            r#"{"projects":[],"defaultShell":"cmd","availableShells":[],"uiFontSize":13,"terminalFontSize":14}"#,
+        )
+        .unwrap();
+        assert!(old.ssh_groups.is_empty());
+        let serialized_old = serde_json::to_string(&old).unwrap();
+        assert!(
+            !serialized_old.contains("sshGroups"),
+            "空 sshGroups 不应序列化进 JSON: {serialized_old}"
+        );
     }
 
     #[test]

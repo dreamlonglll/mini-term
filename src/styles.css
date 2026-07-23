@@ -123,7 +123,8 @@ body.file-dragging [data-terminal-drop] > * {
   pointer-events: none !important;
 }
 body.file-dragging,
-body.project-dragging {
+body.project-dragging,
+body.ssh-conn-dragging {
   cursor: grabbing !important;
   user-select: none !important;
 }
