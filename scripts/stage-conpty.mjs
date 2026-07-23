@@ -6,6 +6,7 @@
 
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import {
   copyFile,
   mkdir,
@@ -148,6 +149,16 @@ export async function stagePortableConptyFromDirectory({
   return validatePortableConptyLayout(outputDir, { verifyOfficialHashes });
 }
 
+// .nupkg 是 zip 容器；Git Bash 等环境 PATH 上的 GNU tar 不识别 zip，
+// Windows 下固定使用系统自带的 bsdtar（System32\tar.exe）
+function tarExecutable() {
+  if (process.platform === 'win32') {
+    const systemTar = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'tar.exe');
+    if (existsSync(systemTar)) return systemTar;
+  }
+  return 'tar';
+}
+
 async function downloadPackage(destination) {
   console.log(`[stage-conpty] 下载 ${CONPTY_PACKAGE.url}`);
   const response = await fetch(CONPTY_PACKAGE.url, { redirect: 'follow' });
@@ -184,7 +195,7 @@ export async function stagePortableConpty({
 
   const extractionRoot = await mkdtemp(join(tmpdir(), 'mini-term-conpty-'));
   try {
-    execFileSync('tar', ['-xf', packagePath, '-C', extractionRoot], {
+    execFileSync(tarExecutable(), ['-xf', packagePath, '-C', extractionRoot], {
       stdio: 'inherit',
     });
     await rm(outputDir, { recursive: true, force: true });

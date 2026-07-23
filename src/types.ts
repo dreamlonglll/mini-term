@@ -49,6 +49,8 @@ export interface AppConfig {
   hookEnabled: boolean;
   smartCopyPaste: boolean;
   sshConnections: SshConnection[];
+  /** 显式创建的 SSH 分组名（允许空分组）。连接的 group 字段仍是归属单一来源 */
+  sshGroups?: string[];
   /** cc-connect 集成配置(进程管理 + 项目导入 + dashboard 嵌入),未配置时缺省 */
   ccConnect?: CcConnectConfig;
 }
