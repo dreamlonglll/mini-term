@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.6.10-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.6.11-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -153,7 +153,7 @@ Remotely drive the AI agents running on your machine through IM platforms (Feish
 | Git | git2 0.19 |
 | File watching | notify 7 + ignore 0.4 (.gitignore filtering) |
 | Tauri plugins | `window-state` · `clipboard-manager` · `dialog` · `opener` |
-| Test coverage | 328 Rust unit tests (pty / fs / config / hook / ssh / cc-connect) |
+| Test coverage | 334 Rust unit tests (pty / fs / config / hook / ssh / cc-connect) |
 
 ## Getting Started
 

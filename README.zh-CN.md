@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.6.10-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.6.11-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -153,7 +153,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 | Git | git2 0.19 |
 | 文件监听 | notify 7 + ignore 0.4（.gitignore 过滤） |
 | Tauri 插件 | `window-state` · `clipboard-manager` · `dialog` · `opener` |
-| 测试覆盖 | 328 个 Rust 单元测试（pty / fs / config / hook / ssh / cc-connect） |
+| 测试覆盖 | 334 个 Rust 单元测试（pty / fs / config / hook / ssh / cc-connect） |
 
 ## 快速开始
 
