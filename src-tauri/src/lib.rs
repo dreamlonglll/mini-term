@@ -14,19 +14,11 @@ mod remote_ssh;
 mod search;
 mod ssh;
 mod ssh_mcp_registry;
+mod window_input_recovery;
 mod window_theme;
 mod wsl_distros;
 
 use tauri::Manager;
-
-#[cfg(windows)]
-extern "system" {
-    fn ReleaseCapture() -> i32;
-    fn GetAsyncKeyState(v_key: i32) -> i16;
-}
-
-#[cfg(windows)]
-const VK_LBUTTON: i32 = 0x01;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -74,21 +66,13 @@ pub fn run() {
             process_monitor::start_monitor(app.handle().clone(), pty_clone, hook_state);
             Ok(())
         })
-        .on_window_event(|_window, event| {
+        .on_window_event(|window, event| {
             // 窗口失焦时释放鼠标捕获，防止外部工具（截图等）与 WebView2
             // 事件处理冲突导致输入锁定。
-            // 但若用户正按住左键发起 modal move/size loop（拖拽标题栏 /
-            // 窗口边缘 resize），WebView2 子窗口会失焦触发该事件，此时
-            // ReleaseCapture 会取消系统的鼠标捕获并立即终止 modal loop，
-            // 表现为拖拽和 resize "光标变化但不生效"。
-            // 因此左键按下时跳过释放，留给系统自然处理；松开时再释放。
+            // 左键按下时不能立即取消正常的拖动/缩放；window_input_recovery
+            // 会等待松开后投递 WM_CANCELMODE，补上此前缺失的延迟清理。
             if let tauri::WindowEvent::Focused(false) = event {
-                #[cfg(windows)]
-                unsafe {
-                    if (GetAsyncKeyState(VK_LBUTTON) as u16 & 0x8000) == 0 {
-                        ReleaseCapture();
-                    }
-                }
+                window_input_recovery::recover_after_focus_loss(window);
             }
         })
         .invoke_handler(tauri::generate_handler![
