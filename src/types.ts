@@ -67,6 +67,8 @@ export interface MobileRelayStatusPayload {
   /** versionMismatch 时携带,用于给出明确升级提示 */
   expectedVersion?: number;
   actualVersion?: number;
+  /** 移动端配对状态(中转推送);undefined = 尚未知悉(未连上中转) */
+  paired?: boolean;
 }
 
 export interface ProjectConfig {

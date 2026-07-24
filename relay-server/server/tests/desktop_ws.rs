@@ -56,7 +56,7 @@ async fn recv_msg(ws: &mut WsClient) -> Option<RelayToDesktop> {
 }
 
 #[tokio::test]
-async fn handshake_success_returns_ack() {
+async fn handshake_success_returns_ack_then_pairing_state() {
     let addr = spawn_relay().await;
     let mut ws = connect_desktop(addr).await;
     send_hello(&mut ws, PROTOCOL_VERSION).await;
@@ -68,6 +68,9 @@ async fn handshake_success_returns_ack() {
             protocol_version: PROTOCOL_VERSION
         }
     );
+    // 握手成功后立即收到当前配对状态(未配对)
+    let update = recv_msg(&mut ws).await.expect("expected pairingUpdate");
+    assert_eq!(update, RelayToDesktop::PairingUpdate { paired: false });
 }
 
 #[tokio::test]
@@ -99,27 +102,32 @@ async fn first_message_not_hello_closes_without_ack() {
     assert!(recv_msg(&mut ws).await.is_none(), "non-hello first message must be dropped");
 }
 
+/// 完成握手并消费 ack + pairingUpdate 两帧。
+async fn handshake(ws: &mut WsClient) {
+    send_hello(ws, PROTOCOL_VERSION).await;
+    assert!(matches!(
+        recv_msg(ws).await,
+        Some(RelayToDesktop::HelloAck { .. })
+    ));
+    assert!(matches!(
+        recv_msg(ws).await,
+        Some(RelayToDesktop::PairingUpdate { .. })
+    ));
+}
+
 #[tokio::test]
 async fn desktop_can_reconnect_after_disconnect() {
     let addr = spawn_relay().await;
 
     // 第一次连接握手成功后主动断开
     let mut first = connect_desktop(addr).await;
-    send_hello(&mut first, PROTOCOL_VERSION).await;
-    assert!(matches!(
-        recv_msg(&mut first).await,
-        Some(RelayToDesktop::HelloAck { .. })
-    ));
+    handshake(&mut first).await;
     first.close(None).await.unwrap();
     drop(first);
 
     // 断线后重连,中转必须再次接受
     let mut second = connect_desktop(addr).await;
-    send_hello(&mut second, PROTOCOL_VERSION).await;
-    assert!(matches!(
-        recv_msg(&mut second).await,
-        Some(RelayToDesktop::HelloAck { .. })
-    ));
+    handshake(&mut second).await;
 }
 
 #[tokio::test]
@@ -127,18 +135,10 @@ async fn new_desktop_connection_replaces_old_one() {
     let addr = spawn_relay().await;
 
     let mut old = connect_desktop(addr).await;
-    send_hello(&mut old, PROTOCOL_VERSION).await;
-    assert!(matches!(
-        recv_msg(&mut old).await,
-        Some(RelayToDesktop::HelloAck { .. })
-    ));
+    handshake(&mut old).await;
 
     let mut new = connect_desktop(addr).await;
-    send_hello(&mut new, PROTOCOL_VERSION).await;
-    assert!(matches!(
-        recv_msg(&mut new).await,
-        Some(RelayToDesktop::HelloAck { .. })
-    ));
+    handshake(&mut new).await;
 
     // 旧连接被顶替:下一次读取应得到关闭
     assert!(

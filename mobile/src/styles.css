@@ -1,0 +1,114 @@
+/* mini-term 移动端基础样式:暗色、移动优先 */
+
+:root {
+  --bg-base: #1a1a1a;
+  --bg-surface: #232323;
+  --border-subtle: #333;
+  --text-primary: #e8e6e3;
+  --text-secondary: #b5b2ad;
+  --text-muted: #7a7772;
+  --accent: #4a9eff;
+  --color-success: #4caf78;
+  --color-error: #e05c5c;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  background: var(--bg-base);
+  color: var(--text-primary);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC",
+    "Microsoft YaHei", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+.app {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.app-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: calc(env(safe-area-inset-top, 0px) + 12px) 16px 12px;
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--bg-surface);
+}
+
+.app-name {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.lang-toggle {
+  display: flex;
+  gap: 4px;
+}
+
+.lang-toggle button {
+  background: transparent;
+  border: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+  font-size: 12px;
+  padding: 3px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.lang-toggle button.active {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.app-main {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.status-screen {
+  text-align: center;
+  max-width: 320px;
+}
+
+.status-icon {
+  font-size: 44px;
+  color: var(--text-secondary);
+  margin-bottom: 16px;
+  line-height: 1;
+}
+
+.status-icon.spinning {
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 1; }
+}
+
+.status-title {
+  font-size: 18px;
+  font-weight: 600;
+  margin-bottom: 10px;
+}
+
+.status-hint {
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--text-muted);
+}

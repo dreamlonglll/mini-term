@@ -10,6 +10,7 @@ export const app = {
       git: "Git 变更",
       settings: "设置",
       ssh: "SSH 连接",
+      mobile: "移动端",
       closeDrawer: "关闭",
     },
     update: {
@@ -34,6 +35,7 @@ export const app = {
       git: "Git changes",
       settings: "Settings",
       ssh: "SSH connections",
+      mobile: "Mobile",
       closeDrawer: "Close",
     },
     update: {

@@ -12,6 +12,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time",
 futures-util = "0.3"
 serde = { workspace = true }
 serde_json = { workspace = true }
+# 配对码 / 长期凭证的不可猜测随机 id
+uuid = { version = "1", features = ["v4"] }
+# 托管 PWA 静态资源(SPA fallback 到 index.html)
+tower-http = { version = "0.6", features = ["fs"] }
 
 [dev-dependencies]
 # Seam 1 测试的模拟桌面端 WS 客户端(本地明文 ws://,无需 TLS feature)

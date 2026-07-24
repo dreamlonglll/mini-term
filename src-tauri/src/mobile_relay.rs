@@ -11,7 +11,7 @@ use futures_util::{SinkExt, StreamExt};
 use mt_relay_protocol::{DesktopToRelay, RelayToDesktop, PROTOCOL_VERSION};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
 
 /// 握手 ack 等待超时。
@@ -28,6 +28,9 @@ pub struct MobileRelayStatusPayload {
     pub expected_version: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub actual_version: Option<u32>,
+    /// 移动端配对状态(中转 PairingUpdate 推送);None = 尚未知悉(未连上中转)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paired: Option<bool>,
 }
 
 impl MobileRelayStatusPayload {
@@ -36,6 +39,7 @@ impl MobileRelayStatusPayload {
             status: status.into(),
             expected_version: None,
             actual_version: None,
+            paired: None,
         }
     }
 }
@@ -44,6 +48,10 @@ impl MobileRelayStatusPayload {
 pub struct MobileRelayManager {
     cancel: StdMutex<Option<watch::Sender<bool>>>,
     status: StdMutex<MobileRelayStatusPayload>,
+    /// 已连接会话的出站消息通道(请求配对码/重置配对经此送往中转)
+    outbound: StdMutex<Option<mpsc::UnboundedSender<DesktopToRelay>>>,
+    /// 最近一次 PairingUpdate 的配对状态(断线清空)
+    paired: StdMutex<Option<bool>>,
 }
 
 impl MobileRelayManager {
@@ -51,16 +59,41 @@ impl MobileRelayManager {
         Self {
             cancel: StdMutex::new(None),
             status: StdMutex::new(MobileRelayStatusPayload::simple("disconnected")),
+            outbound: StdMutex::new(None),
+            paired: StdMutex::new(None),
         }
     }
 
-    fn set_status(&self, app: &AppHandle, payload: MobileRelayStatusPayload) {
+    fn set_status(&self, app: &AppHandle, mut payload: MobileRelayStatusPayload) {
+        // 断开/重连中时配对状态不可知,清空避免陈旧值误导 UI
+        if payload.status != "connected" {
+            *self.paired.lock().unwrap() = None;
+        }
+        payload.paired = *self.paired.lock().unwrap();
+        *self.status.lock().unwrap() = payload.clone();
+        let _ = app.emit("mobile-relay-status", payload);
+    }
+
+    /// 中转推送 PairingUpdate 时更新配对状态并重发 status 事件。
+    fn set_paired(&self, app: &AppHandle, paired: bool) {
+        *self.paired.lock().unwrap() = Some(paired);
+        let mut payload = self.status.lock().unwrap().clone();
+        payload.paired = Some(paired);
         *self.status.lock().unwrap() = payload.clone();
         let _ = app.emit("mobile-relay-status", payload);
     }
 
     pub fn current_status(&self) -> MobileRelayStatusPayload {
         self.status.lock().unwrap().clone()
+    }
+
+    /// 向中转发送消息(仅已连接时可用)。
+    fn send(&self, msg: DesktopToRelay) -> Result<(), String> {
+        let outbound = self.outbound.lock().unwrap();
+        match outbound.as_ref() {
+            Some(tx) => tx.send(msg).map_err(|_| "connection closing".into()),
+            None => Err("not connected to relay".into()),
+        }
     }
 
     /// 应用新的中转地址:先停旧连接;地址非空则启动新的重连循环。
@@ -122,6 +155,7 @@ async fn connection_loop(app: AppHandle, url: String, mut cancel_rx: watch::Rece
                         status: "versionMismatch".into(),
                         expected_version: Some(expected),
                         actual_version: Some(actual),
+                        paired: None,
                     },
                 );
                 return;
@@ -186,7 +220,8 @@ async fn connect_once(
                     actual: actual_version,
                 }
             }
-            Err(_) => return Attempt::Failed,
+            // 握手期不该出现其他消息;当协议错乱处理
+            Ok(_) | Err(_) => return Attempt::Failed,
         },
         _ => return Attempt::Failed,
     }
@@ -194,23 +229,59 @@ async fn connect_once(
     let manager = app.state::<MobileRelayManager>();
     manager.set_status(app, MobileRelayStatusPayload::simple("connected"));
 
-    // 已连接:挂住读循环直到断线/取消(业务消息由后续 ticket 在此路由)
-    loop {
+    // 注册出站通道(配对码请求/重置配对经此发送)
+    let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<DesktopToRelay>();
+    *manager.outbound.lock().unwrap() = Some(outbound_tx);
+
+    // 已连接:读循环 + 出站转发,直到断线/取消
+    let outcome = loop {
         tokio::select! {
             msg = ws.next() => match msg {
-                Some(Ok(Message::Close(_))) | None => return Attempt::ConnectedThenLost,
+                Some(Ok(Message::Text(text))) => handle_relay_message(app, &manager, &text),
+                Some(Ok(Message::Close(_))) | None => break Attempt::ConnectedThenLost,
                 Some(Ok(_)) => {}
                 Some(Err(e)) => {
                     eprintln!("[mobile-relay] connection lost: {e}");
-                    return Attempt::ConnectedThenLost;
+                    break Attempt::ConnectedThenLost;
+                }
+            },
+            out = outbound_rx.recv() => {
+                if let Some(msg) = out {
+                    let text = serde_json::to_string(&msg).unwrap();
+                    if ws.send(Message::Text(text.into())).await.is_err() {
+                        break Attempt::ConnectedThenLost;
+                    }
                 }
             },
             _ = cancel_rx.changed() => {
                 let _ = ws.close(None).await;
-                return Attempt::Cancelled;
+                break Attempt::Cancelled;
             }
         }
+    };
+    *manager.outbound.lock().unwrap() = None;
+    outcome
+}
+
+/// 处理中转推来的消息(已握手连接上)。
+fn handle_relay_message(app: &AppHandle, manager: &MobileRelayManager, text: &str) {
+    match serde_json::from_str::<RelayToDesktop>(text) {
+        Ok(RelayToDesktop::PairingCode { code }) => {
+            let _ = app.emit("mobile-relay-pairing-code", PairingCodePayload { code });
+        }
+        Ok(RelayToDesktop::PairingUpdate { paired }) => {
+            manager.set_paired(app, paired);
+        }
+        Ok(_) => {}
+        Err(_) => eprintln!("[mobile-relay] unparseable relay message (ignored)"),
     }
+}
+
+/// mobile-relay-pairing-code 事件载荷。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PairingCodePayload {
+    pub code: String,
 }
 
 /// 指数退避:1s → 2s → 4s → … 封顶 60s。attempt 从 1 计。
@@ -257,6 +328,22 @@ pub fn mobile_relay_status(
     manager: tauri::State<'_, MobileRelayManager>,
 ) -> MobileRelayStatusPayload {
     manager.current_status()
+}
+
+/// 请求中转签发一次性配对码;结果经 mobile-relay-pairing-code 事件推回。
+#[tauri::command]
+pub fn mobile_relay_request_pairing_code(
+    manager: tauri::State<'_, MobileRelayManager>,
+) -> Result<(), String> {
+    manager.send(DesktopToRelay::RequestPairingCode)
+}
+
+/// 重置配对:吊销移动端全部凭证;结果经 mobile-relay-status 的 paired 字段推回。
+#[tauri::command]
+pub fn mobile_relay_reset_pairing(
+    manager: tauri::State<'_, MobileRelayManager>,
+) -> Result<(), String> {
+    manager.send(DesktopToRelay::ResetPairing)
 }
 
 #[cfg(test)]
@@ -310,6 +397,7 @@ mod tests {
             status: "versionMismatch".into(),
             expected_version: Some(1),
             actual_version: Some(2),
+            paired: None,
         };
         let json = serde_json::to_string(&payload).unwrap();
         assert!(

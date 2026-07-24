@@ -13,6 +13,7 @@ import { ActivityBar } from './components/ActivityBar';
 import { RightDrawer } from './components/RightDrawer';
 import { SettingsModal, type SettingsPage } from './components/SettingsModal';
 import { SshModal } from './components/SshModal';
+import { MobileRelayModal } from './components/MobileRelayModal';
 import { SearchModal } from './components/SearchModal';
 import { ToastContainer } from './components/ToastContainer';
 import { useTauriEvent } from './hooks/useTauriEvent';
@@ -33,6 +34,7 @@ export function App() {
   const [configOpen, setConfigOpen] = useState(false);
   const [configPage, setConfigPage] = useState<SettingsPage | undefined>(undefined);
   const [sshOpen, setSshOpen] = useState(false);
+  const [mobileOpen, setMobileOpen] = useState(false);
   const [updateInfo, setUpdateInfo] = useState<ReleaseInfo | null>(null);
   const [mountedProjectIds, setMountedProjectIds] = useState<string[]>([]);
   const activeProjectId = useAppStore((s) => s.activeProjectId);
@@ -275,6 +277,7 @@ export function App() {
           <ActivityBar
             onOpenSettings={() => { setConfigPage(undefined); setConfigOpen(true); }}
             onOpenSsh={() => setSshOpen(true)}
+            onOpenMobile={() => setMobileOpen(true)}
             updateVersion={updateInfo?.version ?? null}
             onOpenUpdate={() => { if (updateInfo) openUrl(updateInfo.url); }}
           />
@@ -341,6 +344,11 @@ export function App() {
       </div>
       <SettingsModal open={configOpen} onClose={() => setConfigOpen(false)} initialPage={configPage} />
       <SshModal open={sshOpen} onClose={() => setSshOpen(false)} />
+      <MobileRelayModal
+        open={mobileOpen}
+        onClose={() => setMobileOpen(false)}
+        onOpenSettings={() => { setConfigPage('mobile'); setConfigOpen(true); }}
+      />
       <SearchModal open={searchModalOpen} onClose={() => setSearchModalOpen(false)} />
       <ToastContainer />
     </div>

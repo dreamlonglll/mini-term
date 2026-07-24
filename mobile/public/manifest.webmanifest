@@ -1,0 +1,10 @@
+{
+  "name": "mini-term 移动端",
+  "short_name": "mini-term",
+  "description": "mini-term mobile client — watch active AI sessions and send commands through your self-hosted relay",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#1a1a1a",
+  "theme_color": "#1a1a1a",
+  "icons": []
+}

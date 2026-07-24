@@ -141,6 +141,8 @@ pub fn run() {
             window_theme::set_window_dark_mode,
             mobile_relay::mobile_relay_apply,
             mobile_relay::mobile_relay_status,
+            mobile_relay::mobile_relay_request_pairing_code,
+            mobile_relay::mobile_relay_reset_pairing,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
