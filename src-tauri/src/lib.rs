@@ -143,6 +143,7 @@ pub fn run() {
             mobile_relay::mobile_relay_status,
             mobile_relay::mobile_relay_request_pairing_code,
             mobile_relay::mobile_relay_reset_pairing,
+            mobile_relay::mobile_relay_update_sessions,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

@@ -157,11 +157,20 @@ async fn handle_desktop(mut socket: WebSocket, state: RelayState) {
     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
     let paired = {
         let mut inner = state.inner.lock().unwrap();
-        if let Some(old) = inner.desktop.take() {
+        let replaced = inner.desktop.take();
+        if let Some(old) = replaced.as_ref() {
             eprintln!("[relay] desktop connection replaced (gen {})", old.generation);
             let _ = old.tx.send(Message::Close(None));
         }
         inner.desktop = Some(ConnSlot { generation, tx });
+        // presence:桌面端从离线转为在线时通知移动端(顶替不算状态变化)
+        if replaced.is_none() {
+            if let Some(mobile) = inner.mobile.as_ref() {
+                let _ = mobile.tx.send(to_text(&RelayToMobile::Presence {
+                    desktop_online: true,
+                }));
+            }
+        }
         inner.credential.is_some()
     };
     eprintln!("[relay] desktop connected (gen {generation})");
@@ -219,6 +228,27 @@ async fn handle_desktop(mut socket: WebSocket, state: RelayState) {
 fn handle_desktop_message(state: &RelayState, msg: DesktopToRelay) {
     match msg {
         DesktopToRelay::Hello { .. } => {} // 重复 hello 忽略
+        // 结构快照/增量:只转发给在线移动端,中转不缓存不解析内容
+        DesktopToRelay::SessionsSnapshot { projects } => {
+            let inner = state.inner.lock().unwrap();
+            if let Some(mobile) = inner.mobile.as_ref() {
+                let _ = mobile
+                    .tx
+                    .send(to_text(&RelayToMobile::SessionsSnapshot { projects }));
+            }
+        }
+        DesktopToRelay::SessionsDelta {
+            upserts,
+            removed_project_ids,
+        } => {
+            let inner = state.inner.lock().unwrap();
+            if let Some(mobile) = inner.mobile.as_ref() {
+                let _ = mobile.tx.send(to_text(&RelayToMobile::SessionsDelta {
+                    upserts,
+                    removed_project_ids,
+                }));
+            }
+        }
         DesktopToRelay::RequestPairingCode => {
             let code = random_id();
             let mut inner = state.inner.lock().unwrap();
@@ -257,6 +287,12 @@ fn deregister_desktop(state: &RelayState, generation: u64) {
         .is_some_and(|s| s.generation == generation)
     {
         inner.desktop = None;
+        // presence:桌面端离线,立即推给在线移动端(离线横幅)
+        if let Some(mobile) = inner.mobile.as_ref() {
+            let _ = mobile.tx.send(to_text(&RelayToMobile::Presence {
+                desktop_online: false,
+            }));
+        }
     }
 }
 
@@ -367,23 +403,38 @@ async fn handle_mobile(mut socket: WebSocket, state: RelayState) {
     // ── 注册:同凭证重连顶替旧连接 ──
     let generation = state.next_generation();
     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-    {
+    let desktop_online = {
         let mut inner = state.inner.lock().unwrap();
         if let Some(old) = inner.mobile.take() {
             eprintln!("[relay] mobile connection replaced (gen {})", old.generation);
             let _ = old.tx.send(Message::Close(None));
         }
         inner.mobile = Some(ConnSlot { generation, tx });
-    }
+        inner.desktop.is_some()
+    };
     eprintln!("[relay] mobile connected (gen {generation})");
 
+    // 握手成功:ack + 当前桌面端 presence;桌面端在线则请它回发最新结构快照
     let ack = RelayToMobile::HelloAck {
         protocol_version: PROTOCOL_VERSION,
         credential: issued_credential,
     };
-    if socket.send(to_text(&ack)).await.is_err() {
+    if socket.send(to_text(&ack)).await.is_err()
+        || socket
+            .send(to_text(&RelayToMobile::Presence { desktop_online }))
+            .await
+            .is_err()
+    {
         deregister_mobile(&state, generation);
         return;
+    }
+    if desktop_online {
+        let inner = state.inner.lock().unwrap();
+        if let Some(desktop) = inner.desktop.as_ref() {
+            let _ = desktop
+                .tx
+                .send(to_text(&RelayToDesktop::SessionsSnapshotRequest));
+        }
     }
 
     // ── 消息循环:移动端业务消息由后续 ticket 路由 ──

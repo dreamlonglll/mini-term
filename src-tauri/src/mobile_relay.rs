@@ -7,8 +7,10 @@
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
+use std::collections::{HashMap, HashSet};
+
 use futures_util::{SinkExt, StreamExt};
-use mt_relay_protocol::{DesktopToRelay, RelayToDesktop, PROTOCOL_VERSION};
+use mt_relay_protocol::{DesktopToRelay, MobileProject, RelayToDesktop, PROTOCOL_VERSION};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::{mpsc, watch};
@@ -52,6 +54,8 @@ pub struct MobileRelayManager {
     outbound: StdMutex<Option<mpsc::UnboundedSender<DesktopToRelay>>>,
     /// 最近一次 PairingUpdate 的配对状态(断线清空)
     paired: StdMutex<Option<bool>>,
+    /// 活跃 AI 会话结构的最新快照(前端 store 经 command 喂入,后端据此组装增量)
+    sessions: StdMutex<Vec<MobileProject>>,
 }
 
 impl MobileRelayManager {
@@ -61,6 +65,7 @@ impl MobileRelayManager {
             status: StdMutex::new(MobileRelayStatusPayload::simple("disconnected")),
             outbound: StdMutex::new(None),
             paired: StdMutex::new(None),
+            sessions: StdMutex::new(Vec::new()),
         }
     }
 
@@ -94,6 +99,29 @@ impl MobileRelayManager {
             Some(tx) => tx.send(msg).map_err(|_| "connection closing".into()),
             None => Err("not connected to relay".into()),
         }
+    }
+
+    /// 接收前端 store 喂入的活跃 AI 会话全量状态:组装增量推给中转,存下新状态。
+    pub fn update_sessions(&self, next: Vec<MobileProject>) {
+        let delta = {
+            let mut sessions = self.sessions.lock().unwrap();
+            let delta = diff_sessions(&sessions, &next);
+            *sessions = next;
+            delta
+        };
+        if let Some((upserts, removed_project_ids)) = delta {
+            // 未连接/无移动端时发送失败无妨:移动端上线会拿到全量快照
+            let _ = self.send(DesktopToRelay::SessionsDelta {
+                upserts,
+                removed_project_ids,
+            });
+        }
+    }
+
+    /// 发送当前全量快照(握手成功后 / 收到中转的快照请求时)。
+    fn send_snapshot(&self) {
+        let projects = self.sessions.lock().unwrap().clone();
+        let _ = self.send(DesktopToRelay::SessionsSnapshot { projects });
     }
 
     /// 应用新的中转地址:先停旧连接;地址非空则启动新的重连循环。
@@ -229,9 +257,12 @@ async fn connect_once(
     let manager = app.state::<MobileRelayManager>();
     manager.set_status(app, MobileRelayStatusPayload::simple("connected"));
 
-    // 注册出站通道(配对码请求/重置配对经此发送)
+    // 注册出站通道(配对码请求/重置配对/结构快照经此发送)
     let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<DesktopToRelay>();
     *manager.outbound.lock().unwrap() = Some(outbound_tx);
+
+    // 连上即推一份全量快照:覆盖"桌面端重连时移动端已在线"的场景
+    manager.send_snapshot();
 
     // 已连接:读循环 + 出站转发,直到断线/取消
     let outcome = loop {
@@ -272,8 +303,39 @@ fn handle_relay_message(app: &AppHandle, manager: &MobileRelayManager, text: &st
         Ok(RelayToDesktop::PairingUpdate { paired }) => {
             manager.set_paired(app, paired);
         }
+        // 移动端上线,回发最新结构快照(中转不缓存)
+        Ok(RelayToDesktop::SessionsSnapshotRequest) => manager.send_snapshot(),
         Ok(_) => {}
         Err(_) => eprintln!("[mobile-relay] unparseable relay message (ignored)"),
+    }
+}
+
+/// 组装结构增量:整项目 upsert(新增或内容变化)+ 项目移除。无变化返回 None。
+fn diff_sessions(
+    prev: &[MobileProject],
+    next: &[MobileProject],
+) -> Option<(Vec<MobileProject>, Vec<String>)> {
+    let prev_map: HashMap<&str, &MobileProject> =
+        prev.iter().map(|p| (p.project_id.as_str(), p)).collect();
+    let mut upserts: Vec<MobileProject> = Vec::new();
+    for p in next {
+        match prev_map.get(p.project_id.as_str()) {
+            Some(old) if **old == *p => {}
+            _ => upserts.push(p.clone()),
+        }
+    }
+
+    let next_ids: HashSet<&str> = next.iter().map(|p| p.project_id.as_str()).collect();
+    let removed: Vec<String> = prev
+        .iter()
+        .filter(|p| !next_ids.contains(p.project_id.as_str()))
+        .map(|p| p.project_id.clone())
+        .collect();
+
+    if upserts.is_empty() && removed.is_empty() {
+        None
+    } else {
+        Some((upserts, removed))
     }
 }
 
@@ -346,6 +408,15 @@ pub fn mobile_relay_reset_pairing(
     manager.send(DesktopToRelay::ResetPairing)
 }
 
+/// 前端 store 喂入活跃 AI 会话全量状态(可见性规则由前端裁剪:仅 AI 会话 pane)。
+#[tauri::command]
+pub fn mobile_relay_update_sessions(
+    manager: tauri::State<'_, MobileRelayManager>,
+    projects: Vec<MobileProject>,
+) {
+    manager.update_sessions(projects);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,6 +460,75 @@ mod tests {
         // 空白 = 未配置
         assert_eq!(normalize_relay_url("   "), None);
         assert_eq!(normalize_relay_url(""), None);
+    }
+
+    fn project(id: &str, name: &str, panes: &[(&str, &str)]) -> MobileProject {
+        MobileProject {
+            project_id: id.into(),
+            name: name.into(),
+            panes: panes
+                .iter()
+                .map(|(pane_id, status)| mt_relay_protocol::MobilePane {
+                    pane_id: (*pane_id).into(),
+                    title: "claude".into(),
+                    status: (*status).into(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn diff_detects_added_project() {
+        let prev = vec![];
+        let next = vec![project("p1", "demo", &[("a", "ai-working")])];
+        let (upserts, removed) = diff_sessions(&prev, &next).unwrap();
+        assert_eq!(upserts.len(), 1);
+        assert_eq!(upserts[0].project_id, "p1");
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn diff_detects_pane_status_change_as_project_upsert() {
+        let prev = vec![project("p1", "demo", &[("a", "ai-working")])];
+        let next = vec![project("p1", "demo", &[("a", "ai-idle")])];
+        let (upserts, removed) = diff_sessions(&prev, &next).unwrap();
+        assert_eq!(upserts.len(), 1);
+        assert_eq!(upserts[0].panes[0].status, "ai-idle");
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn diff_detects_removed_project() {
+        let prev = vec![
+            project("p1", "demo", &[("a", "ai-idle")]),
+            project("p2", "other", &[("b", "ai-working")]),
+        ];
+        let next = vec![project("p2", "other", &[("b", "ai-working")])];
+        let (upserts, removed) = diff_sessions(&prev, &next).unwrap();
+        assert!(upserts.is_empty());
+        assert_eq!(removed, vec!["p1".to_string()]);
+    }
+
+    #[test]
+    fn diff_no_change_returns_none() {
+        let state = vec![project("p1", "demo", &[("a", "ai-working")])];
+        assert!(diff_sessions(&state, &state.clone()).is_none());
+    }
+
+    #[test]
+    fn diff_mixed_upsert_and_removal() {
+        let prev = vec![
+            project("p1", "demo", &[("a", "ai-idle")]),
+            project("p2", "other", &[("b", "ai-working")]),
+        ];
+        let next = vec![
+            project("p2", "other", &[("b", "error")]),
+            project("p3", "new", &[("c", "ai-working")]),
+        ];
+        let (upserts, removed) = diff_sessions(&prev, &next).unwrap();
+        let upsert_ids: Vec<&str> = upserts.iter().map(|p| p.project_id.as_str()).collect();
+        assert_eq!(upsert_ids, vec!["p2", "p3"]);
+        assert_eq!(removed, vec!["p1".to_string()]);
     }
 
     #[test]

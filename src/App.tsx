@@ -25,6 +25,7 @@ import { applyTheme } from './utils/themeManager';
 import { applyUiFontFamily } from './utils/fontManager';
 import { markAiPty, updateAllTerminalThemes } from './utils/terminalCache';
 import { includeActiveProject } from './utils/projectKeepAlive';
+import { initMobileSessionSync } from './utils/mobileSessionSync';
 import { useT } from './i18n';
 import type { AppConfig, PtyStatusChangePayload, PtyExitPayload, PaneStatus, MobileRelayStatusPayload } from './types';
 
@@ -169,6 +170,11 @@ export function App() {
   useTauriEvent<MobileRelayStatusPayload>('mobile-relay-status', useCallback((payload) => {
     useAppStore.getState().setMobileRelayStatus(payload);
   }, []));
+
+  // 活跃 AI 会话结构同步:store 变化 → 后端 → 中转 → 移动端列表
+  useEffect(() => {
+    initMobileSessionSync();
+  }, []);
 
   useTauriEvent<PtyExitPayload>('pty-exit', useCallback((payload) => {
     // 登记已退出的 PTY:远程项目 pane 据此叠加「连接已断开,点击重连」覆盖层

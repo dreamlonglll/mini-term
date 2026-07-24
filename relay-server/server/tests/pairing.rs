@@ -79,10 +79,20 @@ async fn paired_desktop(addr: SocketAddr) -> WsClient {
     ws
 }
 
+/// 读取下一条配对相关的桌面端消息,跳过移动端上线附带的结构快照请求。
+async fn recv_desktop_pairing(ws: &mut WsClient) -> Option<RelayToDesktop> {
+    loop {
+        match recv_json::<RelayToDesktop>(ws).await {
+            Some(RelayToDesktop::SessionsSnapshotRequest) => continue,
+            other => return other,
+        }
+    }
+}
+
 /// 桌面端请求配对码并取回。
 async fn request_pairing_code(desktop: &mut WsClient) -> String {
     send_json(desktop, &DesktopToRelay::RequestPairingCode).await;
-    match recv_json::<RelayToDesktop>(desktop).await {
+    match recv_desktop_pairing(desktop).await {
         Some(RelayToDesktop::PairingCode { code }) => code,
         other => panic!("expected pairingCode, got {other:?}"),
     }
@@ -125,7 +135,7 @@ async fn pairing_code_exchanges_for_credential() {
 
     // 桌面端收到配对成功通知
     assert_eq!(
-        recv_json::<RelayToDesktop>(&mut desktop).await,
+        recv_desktop_pairing(&mut desktop).await,
         Some(RelayToDesktop::PairingUpdate { paired: true })
     );
 }
@@ -260,8 +270,13 @@ async fn new_pairing_revokes_old_device() {
         }) => c,
         other => panic!("expected credential, got {other:?}"),
     };
+    // 消费握手后紧随的 presence 帧
+    assert!(matches!(
+        recv_json::<RelayToMobile>(&mut mobile_a).await,
+        Some(RelayToMobile::Presence { .. })
+    ));
     assert_eq!(
-        recv_json::<RelayToDesktop>(&mut desktop).await,
+        recv_desktop_pairing(&mut desktop).await,
         Some(RelayToDesktop::PairingUpdate { paired: true })
     );
 
@@ -301,15 +316,20 @@ async fn reset_pairing_revokes_credential_and_kicks_mobile() {
         }) => c,
         other => panic!("expected credential, got {other:?}"),
     };
+    // 消费握手后紧随的 presence 帧
+    assert!(matches!(
+        recv_json::<RelayToMobile>(&mut mobile).await,
+        Some(RelayToMobile::Presence { .. })
+    ));
     assert_eq!(
-        recv_json::<RelayToDesktop>(&mut desktop).await,
+        recv_desktop_pairing(&mut desktop).await,
         Some(RelayToDesktop::PairingUpdate { paired: true })
     );
 
     // 桌面端一键重置配对
     send_json(&mut desktop, &DesktopToRelay::ResetPairing).await;
     assert_eq!(
-        recv_json::<RelayToDesktop>(&mut desktop).await,
+        recv_desktop_pairing(&mut desktop).await,
         Some(RelayToDesktop::PairingUpdate { paired: false })
     );
 

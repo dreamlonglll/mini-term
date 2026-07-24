@@ -9,6 +9,7 @@ import { create } from 'zustand';
 import {
   PROTOCOL_VERSION,
   type MobileHello,
+  type MobileProject,
   type MobileRejectReason,
   type RelayToMobile,
 } from './protocol';
@@ -27,14 +28,17 @@ export type Phase =
 interface RelayStore {
   phase: Phase;
   rejectReason: MobileRejectReason | null;
-  /** 本次会话中刚完成配对(用于展示"配对完成"提示) */
-  justPaired: boolean;
+  /** 桌面端在线状态;null = 尚未收到 presence */
+  desktopOnline: boolean | null;
+  /** 活跃 AI 会话列表(按项目分组,来自桌面端快照/增量) */
+  projects: MobileProject[];
 }
 
 export const useRelayStore = create<RelayStore>(() => ({
   phase: 'idle',
   rejectReason: null,
-  justPaired: false,
+  desktopOnline: null,
+  projects: [],
 }));
 
 function setPhase(phase: Phase, rejectReason: MobileRejectReason | null = null) {
@@ -127,10 +131,7 @@ function connect(auth: { pairingCode?: string; credential?: string }) {
       case 'helloAck':
         handshakeDone = true;
         reconnectAttempt = 0;
-        if (msg.credential) {
-          saveCredential(msg.credential);
-          useRelayStore.setState({ justPaired: true });
-        }
+        if (msg.credential) saveCredential(msg.credential);
         setPhase('connected');
         break;
       case 'helloReject':
@@ -143,6 +144,31 @@ function connect(auth: { pairingCode?: string; credential?: string }) {
         clearCredential();
         setPhase('revoked');
         break;
+      case 'presence':
+        useRelayStore.setState({ desktopOnline: msg.desktopOnline });
+        break;
+      case 'sessionsSnapshot':
+        useRelayStore.setState({ projects: msg.projects });
+        break;
+      case 'sessionsDelta': {
+        const { projects } = useRelayStore.getState();
+        const removed = new Set(msg.removedProjectIds);
+        const upsertMap = new Map(msg.upserts.map((p) => [p.projectId, p]));
+        const next: MobileProject[] = [];
+        for (const p of projects) {
+          if (removed.has(p.projectId)) continue;
+          const upserted = upsertMap.get(p.projectId);
+          if (upserted) {
+            next.push(upserted);
+            upsertMap.delete(p.projectId);
+          } else {
+            next.push(p);
+          }
+        }
+        next.push(...upsertMap.values()); // 新增项目追加在尾部
+        useRelayStore.setState({ projects: next });
+        break;
+      }
     }
   };
 

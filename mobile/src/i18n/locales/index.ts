@@ -3,14 +3,17 @@
  * 每个命名空间一个文件,`t('<ns>.<key>')` 访问。
  */
 import { pair } from './pair';
+import { sessions } from './sessions';
 
 type Dict = Record<string, unknown>;
 
 export const dicts: { zh: Dict; en: Dict } = {
   zh: {
     pair: pair.zh,
+    sessions: sessions.zh,
   },
   en: {
     pair: pair.en,
+    sessions: sessions.en,
   },
 };

@@ -1,5 +1,6 @@
 import { useRelayStore } from './relay';
 import { useI18nStore, useT } from './i18n';
+import { SessionList } from './SessionList';
 
 function LanguageToggle() {
   const lang = useI18nStore((s) => s.lang);
@@ -31,7 +32,6 @@ export function App() {
   const t = useT();
   const phase = useRelayStore((s) => s.phase);
   const rejectReason = useRelayStore((s) => s.rejectReason);
-  const justPaired = useRelayStore((s) => s.justPaired);
 
   let body;
   switch (phase) {
@@ -48,13 +48,7 @@ export function App() {
       body = <StatusScreen icon="◌" title={t('pair.reconnecting')} spinning />;
       break;
     case 'connected':
-      body = (
-        <StatusScreen
-          icon="✓"
-          title={t('pair.connected')}
-          hint={justPaired ? t('pair.pairedOk') : t('pair.connectedHint')}
-        />
-      );
+      body = <SessionList />;
       break;
     case 'revoked':
       body = <StatusScreen icon="⊘" title={t('pair.revoked')} hint={t('pair.revokedHint')} />;
@@ -75,7 +69,7 @@ export function App() {
         <span className="app-name">{t('pair.appName')}</span>
         <LanguageToggle />
       </header>
-      <main className="app-main">{body}</main>
+      <main className={`app-main ${phase === 'connected' ? 'list-mode' : ''}`}>{body}</main>
     </div>
   );
 }

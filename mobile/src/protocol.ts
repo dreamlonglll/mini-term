@@ -44,4 +44,42 @@ export interface MobileRevoked {
   type: 'revoked';
 }
 
-export type RelayToMobile = MobileHelloAck | MobileHelloReject | MobileRevoked;
+// ── 活跃 AI 会话结构 ──
+
+export interface MobilePane {
+  paneId: string;
+  title: string;
+  /** 与桌面端 PaneStatus 一致:"ai-working" | "ai-idle" | "error" */
+  status: string;
+}
+
+export interface MobileProject {
+  projectId: string;
+  name: string;
+  panes: MobilePane[];
+}
+
+/** 桌面端在线状态(握手成功后立即推一次,此后变化时推送) */
+export interface MobilePresence {
+  type: 'presence';
+  desktopOnline: boolean;
+}
+
+export interface MobileSessionsSnapshot {
+  type: 'sessionsSnapshot';
+  projects: MobileProject[];
+}
+
+export interface MobileSessionsDelta {
+  type: 'sessionsDelta';
+  upserts: MobileProject[];
+  removedProjectIds: string[];
+}
+
+export type RelayToMobile =
+  | MobileHelloAck
+  | MobileHelloReject
+  | MobileRevoked
+  | MobilePresence
+  | MobileSessionsSnapshot
+  | MobileSessionsDelta;
