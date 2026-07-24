@@ -8,9 +8,11 @@
 import { create } from 'zustand';
 import {
   PROTOCOL_VERSION,
+  type MirrorMessage,
   type MobileHello,
   type MobileProject,
   type MobileRejectReason,
+  type MobileToRelay,
   type RelayToMobile,
 } from './protocol';
 
@@ -25,6 +27,23 @@ export type Phase =
   | 'revoked' // 配对被顶替/重置
   | 'rejected'; // 握手被拒(带 reason)
 
+/** 对话镜像视图状态(一次只镜像一个 pane)。 */
+export interface MirrorState {
+  paneId: string;
+  /** 该 pane 的展示名(从列表带入) */
+  title: string;
+  /** 已加载的消息,按 seq 升序 */
+  messages: MirrorMessage[];
+  /** 是否还有更早历史可分页 */
+  hasMore: boolean;
+  /** 是否已收到首个快照(false = 加载中) */
+  loaded: boolean;
+  /** 加载更早历史的请求进行中 */
+  loadingOlder: boolean;
+  /** 目标 pane 已关闭/AI 会话已结束 */
+  closed: boolean;
+}
+
 interface RelayStore {
   phase: Phase;
   rejectReason: MobileRejectReason | null;
@@ -32,6 +51,8 @@ interface RelayStore {
   desktopOnline: boolean | null;
   /** 活跃 AI 会话列表(按项目分组,来自桌面端快照/增量) */
   projects: MobileProject[];
+  /** 当前打开的对话镜像;null = 在列表页 */
+  mirror: MirrorState | null;
 }
 
 export const useRelayStore = create<RelayStore>(() => ({
@@ -39,6 +60,7 @@ export const useRelayStore = create<RelayStore>(() => ({
   rejectReason: null,
   desktopOnline: null,
   projects: [],
+  mirror: null,
 }));
 
 function setPhase(phase: Phase, rejectReason: MobileRejectReason | null = null) {
@@ -128,12 +150,18 @@ function connect(auth: { pairingCode?: string; credential?: string }) {
       return;
     }
     switch (msg.type) {
-      case 'helloAck':
+      case 'helloAck': {
         handshakeDone = true;
         reconnectAttempt = 0;
         if (msg.credential) saveCredential(msg.credential);
         setPhase('connected');
+        // 断线前若在看某个镜像:重连后自动恢复订阅(桌面端会重发快照)
+        const { mirror } = useRelayStore.getState();
+        if (mirror && !mirror.closed) {
+          sendToRelay({ type: 'subscribePane', paneId: mirror.paneId });
+        }
         break;
+      }
       case 'helloReject':
         stopped = true;
         if (msg.reason === 'invalidCredential') clearCredential();
@@ -169,6 +197,47 @@ function connect(auth: { pairingCode?: string; credential?: string }) {
         useRelayStore.setState({ projects: next });
         break;
       }
+      case 'mirrorSnapshot': {
+        const { mirror } = useRelayStore.getState();
+        if (!mirror || mirror.paneId !== msg.paneId) break;
+        useRelayStore.setState({
+          mirror: {
+            ...mirror,
+            messages: msg.messages,
+            hasMore: msg.hasMore,
+            loaded: true,
+            loadingOlder: false,
+          },
+        });
+        break;
+      }
+      case 'mirrorAppend': {
+        const { mirror } = useRelayStore.getState();
+        if (!mirror || mirror.paneId !== msg.paneId) break;
+        useRelayStore.setState({
+          mirror: { ...mirror, messages: [...mirror.messages, ...msg.messages] },
+        });
+        break;
+      }
+      case 'mirrorHistory': {
+        const { mirror } = useRelayStore.getState();
+        if (!mirror || mirror.paneId !== msg.paneId) break;
+        useRelayStore.setState({
+          mirror: {
+            ...mirror,
+            messages: [...msg.messages, ...mirror.messages],
+            hasMore: msg.hasMore,
+            loadingOlder: false,
+          },
+        });
+        break;
+      }
+      case 'paneClosed': {
+        const { mirror } = useRelayStore.getState();
+        if (!mirror || mirror.paneId !== msg.paneId) break;
+        useRelayStore.setState({ mirror: { ...mirror, closed: true } });
+        break;
+      }
     }
   };
 
@@ -186,6 +255,48 @@ function connect(auth: { pairingCode?: string; credential?: string }) {
     setPhase('reconnecting');
     reconnectTimer = setTimeout(() => connect({ credential: cred }), backoffMs(reconnectAttempt));
   };
+}
+
+/** 向中转发送一条消息;未连接时静默丢弃(调用方 UI 已按连接态禁用入口)。 */
+export function sendToRelay(msg: MobileToRelay) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(msg));
+  }
+}
+
+/** 进入某 pane 的对话镜像:登记视图状态并向桌面端订阅。 */
+export function openMirror(paneId: string, title: string) {
+  useRelayStore.setState({
+    mirror: {
+      paneId,
+      title,
+      messages: [],
+      hasMore: false,
+      loaded: false,
+      loadingOlder: false,
+      closed: false,
+    },
+  });
+  sendToRelay({ type: 'subscribePane', paneId });
+}
+
+/** 退出镜像返回列表:退订并清空视图状态。 */
+export function closeMirror() {
+  const { mirror } = useRelayStore.getState();
+  if (mirror) sendToRelay({ type: 'unsubscribePane', paneId: mirror.paneId });
+  useRelayStore.setState({ mirror: null });
+}
+
+/** 上拉加载更早历史(以当前最早消息的 seq 为锚)。 */
+export function loadOlderMirror() {
+  const { mirror } = useRelayStore.getState();
+  if (!mirror || !mirror.hasMore || mirror.loadingOlder || mirror.messages.length === 0) return;
+  useRelayStore.setState({ mirror: { ...mirror, loadingOlder: true } });
+  sendToRelay({
+    type: 'requestMirrorHistory',
+    paneId: mirror.paneId,
+    beforeSeq: mirror.messages[0].seq,
+  });
 }
 
 /** 应用启动入口:优先兑换 URL 里的配对码,否则凭本地凭证重连。 */

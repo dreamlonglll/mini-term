@@ -7,6 +7,7 @@ mod fs;
 mod git;
 mod hook_registry;
 mod hook_server;
+mod mobile_mirror;
 mod mobile_relay;
 mod process_monitor;
 mod pty;

@@ -19,6 +19,8 @@ interface MobilePanePayload {
 interface MobileProjectPayload {
   projectId: string;
   name: string;
+  /** 项目根路径:后端镜像订阅据此定位会话记录文件,不会转发给移动端 */
+  path: string;
   panes: MobilePanePayload[];
 }
 
@@ -61,7 +63,7 @@ function computeSnapshot(): MobileProjectPayload[] {
       }
     }
     if (panes.length > 0) {
-      projects.push({ projectId: project.id, name: project.name, panes });
+      projects.push({ projectId: project.id, name: project.name, path: project.path, panes });
     }
   }
 

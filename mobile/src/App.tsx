@@ -1,6 +1,7 @@
 import { useRelayStore } from './relay';
 import { useI18nStore, useT } from './i18n';
 import { SessionList } from './SessionList';
+import { MirrorView } from './MirrorView';
 
 function LanguageToggle() {
   const lang = useI18nStore((s) => s.lang);
@@ -32,6 +33,7 @@ export function App() {
   const t = useT();
   const phase = useRelayStore((s) => s.phase);
   const rejectReason = useRelayStore((s) => s.rejectReason);
+  const mirrorOpen = useRelayStore((s) => s.mirror !== null);
 
   let body;
   switch (phase) {
@@ -48,7 +50,7 @@ export function App() {
       body = <StatusScreen icon="◌" title={t('pair.reconnecting')} spinning />;
       break;
     case 'connected':
-      body = <SessionList />;
+      body = mirrorOpen ? <MirrorView /> : <SessionList />;
       break;
     case 'revoked':
       body = <StatusScreen icon="⊘" title={t('pair.revoked')} hint={t('pair.revokedHint')} />;

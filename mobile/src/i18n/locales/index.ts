@@ -4,6 +4,7 @@
  */
 import { pair } from './pair';
 import { sessions } from './sessions';
+import { mirror } from './mirror';
 
 type Dict = Record<string, unknown>;
 
@@ -11,9 +12,11 @@ export const dicts: { zh: Dict; en: Dict } = {
   zh: {
     pair: pair.zh,
     sessions: sessions.zh,
+    mirror: mirror.zh,
   },
   en: {
     pair: pair.en,
     sessions: sessions.en,
+    mirror: mirror.en,
   },
 };

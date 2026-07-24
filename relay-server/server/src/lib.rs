@@ -49,6 +49,9 @@ struct Inner {
     pairing_code: Option<PairingCode>,
     /// 当前有效的移动端长期凭证(1×1:新配对生效即顶替)
     credential: Option<String>,
+    /// 移动端当前订阅的镜像 pane 集合;未订阅 pane 的镜像消息在路由层丢弃。
+    /// 只存 pane id(元数据),不缓存镜像内容。
+    subscriptions: std::collections::HashSet<String>,
 }
 
 #[derive(Clone)]
@@ -249,6 +252,60 @@ fn handle_desktop_message(state: &RelayState, msg: DesktopToRelay) {
                 }));
             }
         }
+        // 镜像消息:仅路由给已订阅该 pane 的移动端,未订阅一律丢弃
+        DesktopToRelay::MirrorSnapshot {
+            pane_id,
+            messages,
+            has_more,
+        } => {
+            let inner = state.inner.lock().unwrap();
+            if inner.subscriptions.contains(&pane_id) {
+                if let Some(mobile) = inner.mobile.as_ref() {
+                    let _ = mobile.tx.send(to_text(&RelayToMobile::MirrorSnapshot {
+                        pane_id,
+                        messages,
+                        has_more,
+                    }));
+                }
+            }
+        }
+        DesktopToRelay::MirrorAppend { pane_id, messages } => {
+            let inner = state.inner.lock().unwrap();
+            if inner.subscriptions.contains(&pane_id) {
+                if let Some(mobile) = inner.mobile.as_ref() {
+                    let _ = mobile
+                        .tx
+                        .send(to_text(&RelayToMobile::MirrorAppend { pane_id, messages }));
+                }
+            }
+        }
+        DesktopToRelay::MirrorHistory {
+            pane_id,
+            messages,
+            has_more,
+        } => {
+            let inner = state.inner.lock().unwrap();
+            if inner.subscriptions.contains(&pane_id) {
+                if let Some(mobile) = inner.mobile.as_ref() {
+                    let _ = mobile.tx.send(to_text(&RelayToMobile::MirrorHistory {
+                        pane_id,
+                        messages,
+                        has_more,
+                    }));
+                }
+            }
+        }
+        // pane 关闭:转发并清掉订阅(后续同 pane 消息不再路由)
+        DesktopToRelay::PaneClosed { pane_id } => {
+            let mut inner = state.inner.lock().unwrap();
+            if inner.subscriptions.remove(&pane_id) {
+                if let Some(mobile) = inner.mobile.as_ref() {
+                    let _ = mobile
+                        .tx
+                        .send(to_text(&RelayToMobile::PaneClosed { pane_id }));
+                }
+            }
+        }
         DesktopToRelay::RequestPairingCode => {
             let code = random_id();
             let mut inner = state.inner.lock().unwrap();
@@ -268,6 +325,7 @@ fn handle_desktop_message(state: &RelayState, msg: DesktopToRelay) {
             if let Some(mobile) = inner.mobile.take() {
                 let _ = mobile.tx.send(to_text(&RelayToMobile::Revoked));
                 let _ = mobile.tx.send(Message::Close(None));
+                drop_subscriptions(&mut inner);
             }
             eprintln!("[relay] pairing reset: credential revoked");
             if let Some(desktop) = inner.desktop.as_ref() {
@@ -335,6 +393,7 @@ fn authenticate_mobile(
         if let Some(old) = inner.mobile.take() {
             let _ = old.tx.send(to_text(&RelayToMobile::Revoked));
             let _ = old.tx.send(Message::Close(None));
+            drop_subscriptions(&mut inner);
         }
         if let Some(desktop) = inner.desktop.as_ref() {
             let _ = desktop
@@ -363,7 +422,7 @@ async fn handle_mobile(mut socket: WebSocket, state: RelayState) {
                 pairing_code,
                 credential,
             }) => (protocol_version, pairing_code, credential),
-            Err(_) => {
+            _ => {
                 eprintln!("[relay] mobile handshake failed: first message not hello");
                 let _ = socket.send(Message::Close(None)).await;
                 return;
@@ -408,6 +467,8 @@ async fn handle_mobile(mut socket: WebSocket, state: RelayState) {
         if let Some(old) = inner.mobile.take() {
             eprintln!("[relay] mobile connection replaced (gen {})", old.generation);
             let _ = old.tx.send(Message::Close(None));
+            // 旧连接的订阅对新连接无意义,清掉并通知桌面端停止镜像推送
+            drop_subscriptions(&mut inner);
         }
         inner.mobile = Some(ConnSlot { generation, tx });
         inner.desktop.is_some()
@@ -437,7 +498,7 @@ async fn handle_mobile(mut socket: WebSocket, state: RelayState) {
         }
     }
 
-    // ── 消息循环:移动端业务消息由后续 ticket 路由 ──
+    // ── 消息循环 ──
     loop {
         tokio::select! {
             out = rx.recv() => match out {
@@ -454,8 +515,14 @@ async fn handle_mobile(mut socket: WebSocket, state: RelayState) {
                 None => break,
             },
             msg = socket.recv() => match msg {
+                Some(Ok(Message::Text(text))) => {
+                    match serde_json::from_str::<MobileToRelay>(&text) {
+                        Ok(msg) => handle_mobile_message(&state, msg),
+                        Err(_) => eprintln!("[relay] mobile sent unparseable message (ignored)"),
+                    }
+                }
                 Some(Ok(Message::Close(_))) | None => break,
-                Some(Ok(_)) => { /* 后续 ticket 在此路由移动端业务消息 */ }
+                Some(Ok(_)) => {}
                 Some(Err(_)) => break,
             },
         }
@@ -463,6 +530,47 @@ async fn handle_mobile(mut socket: WebSocket, state: RelayState) {
 
     deregister_mobile(&state, generation);
     eprintln!("[relay] mobile disconnected (gen {generation})");
+}
+
+/// 处理握手后的移动端业务消息:订阅登记 + 转发给桌面端。
+fn handle_mobile_message(state: &RelayState, msg: MobileToRelay) {
+    let mut inner = state.inner.lock().unwrap();
+    let forward = match msg {
+        MobileToRelay::Hello { .. } => None, // 重复 hello 忽略
+        MobileToRelay::SubscribePane { pane_id } => {
+            inner.subscriptions.insert(pane_id.clone());
+            Some(RelayToDesktop::SubscribePane { pane_id })
+        }
+        MobileToRelay::UnsubscribePane { pane_id } => {
+            inner.subscriptions.remove(&pane_id);
+            Some(RelayToDesktop::UnsubscribePane { pane_id })
+        }
+        MobileToRelay::RequestMirrorHistory {
+            pane_id,
+            before_seq,
+        } => inner
+            .subscriptions
+            .contains(&pane_id)
+            .then_some(RelayToDesktop::RequestMirrorHistory {
+                pane_id,
+                before_seq,
+            }),
+    };
+    if let (Some(msg), Some(desktop)) = (forward, inner.desktop.as_ref()) {
+        let _ = desktop.tx.send(to_text(&msg));
+    }
+}
+
+/// 清空移动端订阅并逐一通知桌面端退订(移动端断线/被顶替/被吊销时调用)。
+fn drop_subscriptions(inner: &mut Inner) {
+    let panes: Vec<String> = inner.subscriptions.drain().collect();
+    if let Some(desktop) = inner.desktop.as_ref() {
+        for pane_id in panes {
+            let _ = desktop
+                .tx
+                .send(to_text(&RelayToDesktop::UnsubscribePane { pane_id }));
+        }
+    }
 }
 
 fn deregister_mobile(state: &RelayState, generation: u64) {
@@ -473,5 +581,6 @@ fn deregister_mobile(state: &RelayState, generation: u64) {
         .is_some_and(|s| s.generation == generation)
     {
         inner.mobile = None;
+        drop_subscriptions(&mut inner);
     }
 }

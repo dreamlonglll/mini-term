@@ -139,7 +139,7 @@ fn find_claude_project_dirs_in(
 }
 
 /// Windows 宿主视角:查找项目路径对应的所有 Claude 项目目录
-fn find_claude_project_dirs(project_path: &str) -> Vec<PathBuf> {
+pub(crate) fn find_claude_project_dirs(project_path: &str) -> Vec<PathBuf> {
     let home = match home_dir() {
         Some(h) => h,
         None => return vec![],
@@ -184,7 +184,7 @@ fn dir_matches_project(dir: &Path, normalized_project: &str, style: PathStyle) -
 }
 
 /// 路径统一化(小写 + 反斜杠,去尾部斜杠),用于 Windows 路径比较
-fn normalize_path(path: &str) -> String {
+pub(crate) fn normalize_path(path: &str) -> String {
     path.replace('/', "\\")
         .to_lowercase()
         .trim_end_matches('\\')
@@ -493,7 +493,7 @@ fn load_codex_thread_names(codex_dir: &Path) -> HashMap<String, String> {
     map
 }
 
-fn sort_newest_session_paths(paths: &mut Vec<PathBuf>, limit: usize) {
+pub(crate) fn sort_newest_session_paths(paths: &mut Vec<PathBuf>, limit: usize) {
     paths.sort_by(|a, b| {
         let mt = |p: &PathBuf| p.metadata().and_then(|m| m.modified()).ok();
         match (mt(a), mt(b)) {
@@ -508,7 +508,7 @@ fn sort_newest_session_paths(paths: &mut Vec<PathBuf>, limit: usize) {
 
 /// 递归遍历 sessions/<year>/<month>/<day>/ 目录,仅收集文件路径。
 /// 真正读取 JSONL 前先按路径日期排序和限量,避免历史记录增长后每次刷新都读全量内容。
-fn collect_codex_session_paths(dir: &Path, paths: &mut Vec<PathBuf>) {
+pub(crate) fn collect_codex_session_paths(dir: &Path, paths: &mut Vec<PathBuf>) {
     let entries = match fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,

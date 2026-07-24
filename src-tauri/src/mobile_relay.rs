@@ -8,16 +8,49 @@ use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
-use mt_relay_protocol::{DesktopToRelay, MobileProject, RelayToDesktop, PROTOCOL_VERSION};
-use serde::Serialize;
+use mt_relay_protocol::{
+    DesktopToRelay, MirrorMessage, MobilePane, MobileProject, RelayToDesktop, PROTOCOL_VERSION,
+};
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::mobile_mirror::{self, history_slice, MirrorParser, MIRROR_PAGE_SIZE};
+
 /// 握手 ack 等待超时。
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 镜像会话文件轮询间隔。
+const MIRROR_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// 前端 store 喂入的同步载荷:比 wire 类型多项目路径(镜像绑定用,不发给移动端)。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncProject {
+    pub project_id: String,
+    pub name: String,
+    pub path: String,
+    pub panes: Vec<SyncPane>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncPane {
+    pub pane_id: String,
+    pub title: String,
+    pub status: String,
+}
+
+/// 一个被订阅 pane 的镜像状态:取消句柄 + 已解析消息(分页取数用)。
+struct MirrorSub {
+    cancel_tx: watch::Sender<bool>,
+    messages: Arc<StdMutex<Vec<MirrorMessage>>>,
+}
 
 /// 连接状态(serde camelCase 与前端 MobileRelayStatusPayload 对齐)。
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -56,6 +89,10 @@ pub struct MobileRelayManager {
     paired: StdMutex<Option<bool>>,
     /// 活跃 AI 会话结构的最新快照(前端 store 经 command 喂入,后端据此组装增量)
     sessions: StdMutex<Vec<MobileProject>>,
+    /// pane → 项目路径(镜像订阅时解析会话文件用)
+    pane_paths: StdMutex<HashMap<String, String>>,
+    /// 已订阅镜像的 pane 集合
+    mirror_subs: StdMutex<HashMap<String, MirrorSub>>,
 }
 
 impl MobileRelayManager {
@@ -66,6 +103,8 @@ impl MobileRelayManager {
             outbound: StdMutex::new(None),
             paired: StdMutex::new(None),
             sessions: StdMutex::new(Vec::new()),
+            pane_paths: StdMutex::new(HashMap::new()),
+            mirror_subs: StdMutex::new(HashMap::new()),
         }
     }
 
@@ -101,8 +140,47 @@ impl MobileRelayManager {
         }
     }
 
-    /// 接收前端 store 喂入的活跃 AI 会话全量状态:组装增量推给中转,存下新状态。
-    pub fn update_sessions(&self, next: Vec<MobileProject>) {
+    /// 接收前端 store 喂入的活跃 AI 会话全量状态:组装增量推给中转,存下新状态,
+    /// 更新 pane→路径映射;被订阅镜像的 pane 消失时通知移动端并撤销订阅。
+    pub fn update_sessions(&self, projects: Vec<SyncProject>) {
+        let mut pane_paths: HashMap<String, String> = HashMap::new();
+        for p in &projects {
+            for pane in &p.panes {
+                pane_paths.insert(pane.pane_id.clone(), p.path.clone());
+            }
+        }
+
+        // 订阅中的 pane 已不在活跃集合(pane 关闭/AI 会话结束)→ PaneClosed
+        let gone: Vec<String> = {
+            let subs = self.mirror_subs.lock().unwrap();
+            subs.keys()
+                .filter(|id| !pane_paths.contains_key(*id))
+                .cloned()
+                .collect()
+        };
+        for pane_id in gone {
+            self.unsubscribe_pane(&pane_id);
+            let _ = self.send(DesktopToRelay::PaneClosed { pane_id });
+        }
+        *self.pane_paths.lock().unwrap() = pane_paths;
+
+        let next: Vec<MobileProject> = projects
+            .into_iter()
+            .map(|p| MobileProject {
+                project_id: p.project_id,
+                name: p.name,
+                panes: p
+                    .panes
+                    .into_iter()
+                    .map(|x| MobilePane {
+                        pane_id: x.pane_id,
+                        title: x.title,
+                        status: x.status,
+                    })
+                    .collect(),
+            })
+            .collect();
+
         let delta = {
             let mut sessions = self.sessions.lock().unwrap();
             let delta = diff_sessions(&sessions, &next);
@@ -116,6 +194,37 @@ impl MobileRelayManager {
                 removed_project_ids,
             });
         }
+    }
+
+    /// 撤销单个镜像订阅(幂等)。
+    fn unsubscribe_pane(&self, pane_id: &str) {
+        if let Some(sub) = self.mirror_subs.lock().unwrap().remove(pane_id) {
+            let _ = sub.cancel_tx.send(true);
+        }
+    }
+
+    /// 撤销全部镜像订阅(与中转断线时调用;移动端重连后会重新订阅)。
+    fn clear_mirror_subs(&self) {
+        let subs: Vec<MirrorSub> = self.mirror_subs.lock().unwrap().drain().map(|(_, s)| s).collect();
+        for sub in subs {
+            let _ = sub.cancel_tx.send(true);
+        }
+    }
+
+    /// 分页取数:从订阅的消息缓存里取 seq < before_seq 的最近一页并回发。
+    fn send_mirror_history(&self, pane_id: &str, before_seq: u64) {
+        let slice = {
+            let subs = self.mirror_subs.lock().unwrap();
+            let Some(sub) = subs.get(pane_id) else { return };
+            let messages = sub.messages.lock().unwrap();
+            history_slice(&messages, Some(before_seq), MIRROR_PAGE_SIZE)
+        };
+        let (messages, has_more) = slice;
+        let _ = self.send(DesktopToRelay::MirrorHistory {
+            pane_id: pane_id.into(),
+            messages,
+            has_more,
+        });
     }
 
     /// 发送当前全量快照(握手成功后 / 收到中转的快照请求时)。
@@ -291,6 +400,8 @@ async fn connect_once(
         }
     };
     *manager.outbound.lock().unwrap() = None;
+    // 断线后镜像推送无处可去,撤销全部订阅;移动端重连会重新订阅
+    manager.clear_mirror_subs();
     outcome
 }
 
@@ -305,8 +416,115 @@ fn handle_relay_message(app: &AppHandle, manager: &MobileRelayManager, text: &st
         }
         // 移动端上线,回发最新结构快照(中转不缓存)
         Ok(RelayToDesktop::SessionsSnapshotRequest) => manager.send_snapshot(),
+        // 对话镜像:订阅/退订/分页
+        Ok(RelayToDesktop::SubscribePane { pane_id }) => subscribe_pane(app, manager, pane_id),
+        Ok(RelayToDesktop::UnsubscribePane { pane_id }) => manager.unsubscribe_pane(&pane_id),
+        Ok(RelayToDesktop::RequestMirrorHistory {
+            pane_id,
+            before_seq,
+        }) => manager.send_mirror_history(&pane_id, before_seq),
         Ok(_) => {}
         Err(_) => eprintln!("[mobile-relay] unparseable relay message (ignored)"),
+    }
+}
+
+/// 建立镜像订阅:绑定 pane 所属项目的最新会话文件,启动轮询任务。
+/// 重复订阅先撤旧再建新(移动端重连后重订阅拿到新快照)。
+fn subscribe_pane(app: &AppHandle, manager: &MobileRelayManager, pane_id: String) {
+    manager.unsubscribe_pane(&pane_id);
+    let Some(project_path) = manager.pane_paths.lock().unwrap().get(&pane_id).cloned() else {
+        // pane 已不存在(或从未同步):直接告知已关闭
+        let _ = manager.send(DesktopToRelay::PaneClosed { pane_id });
+        return;
+    };
+
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+    let messages = Arc::new(StdMutex::new(Vec::new()));
+    manager.mirror_subs.lock().unwrap().insert(
+        pane_id.clone(),
+        MirrorSub {
+            cancel_tx,
+            messages: messages.clone(),
+        },
+    );
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        mirror_task(app, pane_id, project_path, messages, cancel_rx).await;
+    });
+}
+
+/// 镜像轮询任务:解析 pane 应镜像的最新会话文件,增量读取新行推送;
+/// 出现更新的会话文件时重新绑定并重发快照。
+async fn mirror_task(
+    app: AppHandle,
+    pane_id: String,
+    project_path: String,
+    messages: Arc<StdMutex<Vec<MirrorMessage>>>,
+    mut cancel_rx: watch::Receiver<bool>,
+) {
+    let manager = app.state::<MobileRelayManager>();
+    let mut bound: Option<(PathBuf, MirrorParser, u64)> = None;
+    let mut sent_initial = false;
+
+    loop {
+        match mobile_mirror::resolve_session_file(&project_path) {
+            None => {
+                // 会话文件尚未出现(AI 刚启动还没落盘):先给空快照,出现后再重发
+                if !sent_initial {
+                    sent_initial = true;
+                    let _ = manager.send(DesktopToRelay::MirrorSnapshot {
+                        pane_id: pane_id.clone(),
+                        messages: vec![],
+                        has_more: false,
+                    });
+                }
+            }
+            Some((path, agent)) => {
+                let rebind = bound.as_ref().is_none_or(|(p, _, _)| *p != path);
+                if rebind {
+                    // 首次绑定或换绑到更新的会话文件:全量解析 + 重发快照
+                    let mut parser = MirrorParser::new(agent);
+                    if let Some((bytes, offset)) = mobile_mirror::read_from_offset(&path, 0) {
+                        let msgs = parser.feed(&bytes);
+                        *messages.lock().unwrap() = msgs;
+                        bound = Some((path, parser, offset));
+                        sent_initial = true;
+                        let (page, has_more) = {
+                            let m = messages.lock().unwrap();
+                            history_slice(&m, None, MIRROR_PAGE_SIZE)
+                        };
+                        let _ = manager.send(DesktopToRelay::MirrorSnapshot {
+                            pane_id: pane_id.clone(),
+                            messages: page,
+                            has_more,
+                        });
+                    }
+                } else if let Some((bpath, parser, offset)) = bound.as_mut() {
+                    match mobile_mirror::read_from_offset(bpath, *offset) {
+                        Some((bytes, new_offset)) => {
+                            *offset = new_offset;
+                            if !bytes.is_empty() {
+                                let new_msgs = parser.feed(&bytes);
+                                if !new_msgs.is_empty() {
+                                    messages.lock().unwrap().extend(new_msgs.clone());
+                                    let _ = manager.send(DesktopToRelay::MirrorAppend {
+                                        pane_id: pane_id.clone(),
+                                        messages: new_msgs,
+                                    });
+                                }
+                            }
+                        }
+                        // 文件被截断/重写:下一轮重新绑定
+                        None => bound = None,
+                    }
+                }
+            }
+        }
+
+        tokio::select! {
+            _ = tokio::time::sleep(MIRROR_POLL_INTERVAL) => {}
+            _ = cancel_rx.changed() => return,
+        }
     }
 }
 
@@ -412,7 +630,7 @@ pub fn mobile_relay_reset_pairing(
 #[tauri::command]
 pub fn mobile_relay_update_sessions(
     manager: tauri::State<'_, MobileRelayManager>,
-    projects: Vec<MobileProject>,
+    projects: Vec<SyncProject>,
 ) {
     manager.update_sessions(projects);
 }

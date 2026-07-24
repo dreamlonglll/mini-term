@@ -29,6 +29,18 @@ pub struct MobileProject {
     pub panes: Vec<MobilePane>,
 }
 
+/// 对话镜像中的一条消息。seq 在一次镜像绑定内从 0 连续递增,分页取数以此为锚。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MirrorMessage {
+    pub seq: u64,
+    /// 来源:"desktop"(桌面输入)| "assistant"(AI 回复)| "mobile"(移动端指令)
+    pub source: String,
+    pub content: String,
+    /// 会话记录中的 ISO 8601 时间戳,缺失时为空串
+    pub timestamp: String,
+}
+
 /// 桌面端 → 中转
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
@@ -46,6 +58,26 @@ pub enum DesktopToRelay {
         upserts: Vec<MobileProject>,
         removed_project_ids: Vec<String>,
     },
+    /// 对话镜像初始快照(订阅成功/镜像绑定切换时发送,最近若干条)。
+    MirrorSnapshot {
+        pane_id: String,
+        messages: Vec<MirrorMessage>,
+        /// 是否还有更早的历史可分页加载
+        has_more: bool,
+    },
+    /// 对话镜像增量:新出现的消息(桌面输入/AI 回复实时回流)。
+    MirrorAppend {
+        pane_id: String,
+        messages: Vec<MirrorMessage>,
+    },
+    /// 分页历史响应:seq 早于请求锚点的一段消息。
+    MirrorHistory {
+        pane_id: String,
+        messages: Vec<MirrorMessage>,
+        has_more: bool,
+    },
+    /// 被订阅的 pane 已关闭/AI 会话已结束:移动端应提示并返回列表。
+    PaneClosed { pane_id: String },
 }
 
 /// 中转 → 桌面端
@@ -67,6 +99,12 @@ pub enum RelayToDesktop {
     PairingUpdate { paired: bool },
     /// 移动端上线,请桌面端回发一份最新的 SessionsSnapshot(中转不缓存结构数据)。
     SessionsSnapshotRequest,
+    /// 移动端订阅某 pane 的对话镜像(转发自移动端)。
+    SubscribePane { pane_id: String },
+    /// 移动端退订(显式退出镜像页/移动端断线时由中转代发)。
+    UnsubscribePane { pane_id: String },
+    /// 移动端请求更早的镜像历史(转发自移动端)。
+    RequestMirrorHistory { pane_id: String, before_seq: u64 },
 }
 
 /// 移动端 → 中转
@@ -81,6 +119,12 @@ pub enum MobileToRelay {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         credential: Option<String>,
     },
+    /// 订阅某 pane 的对话镜像(进入镜像页)。
+    SubscribePane { pane_id: String },
+    /// 退订(返回列表)。
+    UnsubscribePane { pane_id: String },
+    /// 上拉加载更早的镜像历史。
+    RequestMirrorHistory { pane_id: String, before_seq: u64 },
 }
 
 /// 中转 → 移动端
@@ -107,6 +151,25 @@ pub enum RelayToMobile {
         upserts: Vec<MobileProject>,
         removed_project_ids: Vec<String>,
     },
+    /// 对话镜像初始快照(转发自桌面端;仅已订阅 pane)。
+    MirrorSnapshot {
+        pane_id: String,
+        messages: Vec<MirrorMessage>,
+        has_more: bool,
+    },
+    /// 对话镜像增量(转发自桌面端;仅已订阅 pane)。
+    MirrorAppend {
+        pane_id: String,
+        messages: Vec<MirrorMessage>,
+    },
+    /// 分页历史响应(转发自桌面端)。
+    MirrorHistory {
+        pane_id: String,
+        messages: Vec<MirrorMessage>,
+        has_more: bool,
+    },
+    /// 被订阅的 pane 已关闭/AI 会话结束(转发自桌面端)。
+    PaneClosed { pane_id: String },
 }
 
 /// 移动端握手被拒绝的原因。
@@ -288,5 +351,50 @@ mod tests {
         let req = RelayToDesktop::SessionsSnapshotRequest;
         let json = serde_json::to_string(&req).unwrap();
         assert_eq!(json, r#"{"type":"sessionsSnapshotRequest"}"#);
+    }
+
+    #[test]
+    fn mirror_messages_camel_case_round_trip() {
+        let snapshot = DesktopToRelay::MirrorSnapshot {
+            pane_id: "pane-1".into(),
+            messages: vec![MirrorMessage {
+                seq: 42,
+                source: "desktop".into(),
+                content: "hello".into(),
+                timestamp: "2026-07-24T12:00:00Z".into(),
+            }],
+            has_more: true,
+        };
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(
+            json.contains(r#""paneId":"pane-1""#)
+                && json.contains(r#""hasMore":true"#)
+                && json.contains(r#""seq":42"#),
+            "serde camelCase 对齐被破坏: {json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<DesktopToRelay>(&json).unwrap(),
+            snapshot
+        );
+
+        let sub = MobileToRelay::SubscribePane {
+            pane_id: "pane-1".into(),
+        };
+        let json = serde_json::to_string(&sub).unwrap();
+        assert_eq!(json, r#"{"type":"subscribePane","paneId":"pane-1"}"#);
+
+        let req = MobileToRelay::RequestMirrorHistory {
+            pane_id: "pane-1".into(),
+            before_seq: 70,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains(r#""beforeSeq":70"#), "{json}");
+        assert_eq!(serde_json::from_str::<MobileToRelay>(&json).unwrap(), req);
+
+        let closed = RelayToMobile::PaneClosed {
+            pane_id: "pane-1".into(),
+        };
+        let json = serde_json::to_string(&closed).unwrap();
+        assert_eq!(serde_json::from_str::<RelayToMobile>(&json).unwrap(), closed);
     }
 }

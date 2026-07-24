@@ -17,7 +17,30 @@ export interface MobileHello {
   credential?: string;
 }
 
-export type MobileToRelay = MobileHello;
+/** 订阅某 pane 的对话镜像(进入镜像页) */
+export interface MobileSubscribePane {
+  type: 'subscribePane';
+  paneId: string;
+}
+
+/** 退订(返回列表) */
+export interface MobileUnsubscribePane {
+  type: 'unsubscribePane';
+  paneId: string;
+}
+
+/** 上拉加载更早的镜像历史 */
+export interface MobileRequestMirrorHistory {
+  type: 'requestMirrorHistory';
+  paneId: string;
+  beforeSeq: number;
+}
+
+export type MobileToRelay =
+  | MobileHello
+  | MobileSubscribePane
+  | MobileUnsubscribePane
+  | MobileRequestMirrorHistory;
 
 // ── 中转 → 移动端 ──
 
@@ -76,10 +99,51 @@ export interface MobileSessionsDelta {
   removedProjectIds: string[];
 }
 
+// ── 对话镜像 ──
+
+/** 镜像中的一条消息。seq 在一次绑定内从 0 连续递增,分页以此为锚 */
+export interface MirrorMessage {
+  seq: number;
+  /** "desktop"(桌面输入)| "assistant"(AI 回复)| "mobile"(移动端指令) */
+  source: string;
+  content: string;
+  timestamp: string;
+}
+
+export interface MobileMirrorSnapshot {
+  type: 'mirrorSnapshot';
+  paneId: string;
+  messages: MirrorMessage[];
+  hasMore: boolean;
+}
+
+export interface MobileMirrorAppend {
+  type: 'mirrorAppend';
+  paneId: string;
+  messages: MirrorMessage[];
+}
+
+export interface MobileMirrorHistory {
+  type: 'mirrorHistory';
+  paneId: string;
+  messages: MirrorMessage[];
+  hasMore: boolean;
+}
+
+/** 被订阅的 pane 已关闭/AI 会话结束 */
+export interface MobilePaneClosed {
+  type: 'paneClosed';
+  paneId: string;
+}
+
 export type RelayToMobile =
   | MobileHelloAck
   | MobileHelloReject
   | MobileRevoked
   | MobilePresence
   | MobileSessionsSnapshot
-  | MobileSessionsDelta;
+  | MobileSessionsDelta
+  | MobileMirrorSnapshot
+  | MobileMirrorAppend
+  | MobileMirrorHistory
+  | MobilePaneClosed;

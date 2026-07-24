@@ -1,4 +1,4 @@
-import { useRelayStore } from './relay';
+import { openMirror, useRelayStore } from './relay';
 import { useT } from './i18n';
 import type { MobilePane } from './protocol';
 
@@ -22,11 +22,12 @@ function statusKey(status: string): string {
 function PaneRow({ pane }: { pane: MobilePane }) {
   const t = useT();
   return (
-    <div className="pane-row">
+    <button className="pane-row" onClick={() => openMirror(pane.paneId, pane.title)}>
       <span className={`status-dot ${STATUS_CLASS[pane.status] ?? 'dot-error'}`} />
       <span className="pane-title">{pane.title}</span>
       <span className="pane-status">{t(statusKey(pane.status))}</span>
-    </div>
+      <span className="pane-chevron">›</span>
+    </button>
   );
 }
 
