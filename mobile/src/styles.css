@@ -453,3 +453,77 @@ body {
   padding-left: 10px;
   color: var(--text-secondary);
 }
+
+/* ── 指令输入区 ── */
+
+.composer {
+  border-top: 1px solid var(--border-subtle);
+  background: var(--bg-surface);
+  padding: 8px 12px calc(env(safe-area-inset-bottom, 0px) + 10px);
+  flex-shrink: 0;
+}
+
+.composer-receipt {
+  font-size: 12px;
+  padding: 4px 2px 6px;
+}
+
+.composer-receipt.ok {
+  color: var(--color-success);
+}
+
+.composer-receipt.fail {
+  color: var(--color-error);
+}
+
+.composer-hint {
+  font-size: 12px;
+  color: var(--text-muted);
+  padding: 4px 2px 6px;
+}
+
+.composer-row {
+  display: flex;
+  gap: 8px;
+  align-items: flex-end;
+}
+
+.composer-input {
+  flex: 1;
+  resize: none;
+  background: var(--bg-base);
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 15px;
+  line-height: 1.4;
+  padding: 9px 12px;
+  min-height: 40px;
+  max-height: 120px;
+}
+
+.composer-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.composer-input:disabled {
+  opacity: 0.45;
+}
+
+.composer-send {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 10px;
+  font-size: 14px;
+  padding: 10px 16px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.composer-send:disabled {
+  opacity: 0.4;
+  cursor: default;
+}

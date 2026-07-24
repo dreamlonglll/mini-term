@@ -9,11 +9,13 @@ import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '../store';
 import type { SplitNode, PaneState } from '../types';
 
-/** 与后端 mt-relay-protocol 的 MobilePane / MobileProject 对齐(camelCase)。 */
+/** 与后端 mobile_relay::SyncPane / SyncProject 对齐(camelCase)。 */
 interface MobilePanePayload {
   paneId: string;
   title: string;
   status: string;
+  /** 移动端指令写穿目标;终端尚未创建时缺省 */
+  ptyId?: number;
 }
 
 interface MobileProjectPayload {
@@ -59,6 +61,7 @@ function computeSnapshot(): MobileProjectPayload[] {
           paneId: pane.id,
           title: pane.customTitle ?? tab.customTitle ?? pane.shellName,
           status: pane.status,
+          ptyId: pane.ptyId,
         });
       }
     }

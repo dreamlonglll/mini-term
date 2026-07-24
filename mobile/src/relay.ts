@@ -8,6 +8,7 @@
 import { create } from 'zustand';
 import {
   PROTOCOL_VERSION,
+  type CommandFailReason,
   type MirrorMessage,
   type MobileHello,
   type MobileProject,
@@ -42,6 +43,10 @@ export interface MirrorState {
   loadingOlder: boolean;
   /** 目标 pane 已关闭/AI 会话已结束 */
   closed: boolean;
+  /** 等待回执中的指令 id;null = 没有在途指令 */
+  pendingCommandId: string | null;
+  /** 最近一次指令回执(短暂展示后由 UI 清除) */
+  receipt: { ok: boolean; reason?: CommandFailReason } | null;
 }
 
 interface RelayStore {
@@ -238,6 +243,19 @@ function connect(auth: { pairingCode?: string; credential?: string }) {
         useRelayStore.setState({ mirror: { ...mirror, closed: true } });
         break;
       }
+      case 'commandReceipt': {
+        const { mirror } = useRelayStore.getState();
+        if (!mirror || mirror.paneId !== msg.paneId) break;
+        if (mirror.pendingCommandId !== null && mirror.pendingCommandId !== msg.commandId) break;
+        useRelayStore.setState({
+          mirror: {
+            ...mirror,
+            pendingCommandId: null,
+            receipt: { ok: msg.ok, reason: msg.reason },
+          },
+        });
+        break;
+      }
     }
   };
 
@@ -275,9 +293,33 @@ export function openMirror(paneId: string, title: string) {
       loaded: false,
       loadingOlder: false,
       closed: false,
+      pendingCommandId: null,
+      receipt: null,
     },
   });
   sendToRelay({ type: 'subscribePane', paneId });
+}
+
+/** 发送移动端指令(写穿,不排队)。返回 false = 当前不可发送。 */
+export function sendMobileCommand(text: string): boolean {
+  const { mirror, desktopOnline, phase } = useRelayStore.getState();
+  const trimmed = text.trim();
+  if (!mirror || mirror.closed || !trimmed) return false;
+  if (phase !== 'connected' || desktopOnline === false) return false;
+  const commandId = crypto.randomUUID();
+  useRelayStore.setState({
+    mirror: { ...mirror, pendingCommandId: commandId, receipt: null },
+  });
+  sendToRelay({ type: 'mobileCommand', paneId: mirror.paneId, commandId, text: trimmed });
+  return true;
+}
+
+/** 清除回执提示(UI 展示几秒后调用)。 */
+export function clearCommandReceipt() {
+  const { mirror } = useRelayStore.getState();
+  if (mirror?.receipt) {
+    useRelayStore.setState({ mirror: { ...mirror, receipt: null } });
+  }
 }
 
 /** 退出镜像返回列表:退订并清空视图状态。 */

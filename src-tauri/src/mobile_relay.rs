@@ -44,6 +44,9 @@ pub struct SyncPane {
     pub pane_id: String,
     pub title: String,
     pub status: String,
+    /// 该 pane 当前的 PTY id(移动端指令写穿目标);终端未创建时缺省
+    #[serde(default)]
+    pub pty_id: Option<u32>,
 }
 
 /// 一个被订阅 pane 的镜像状态:取消句柄 + 已解析消息(分页取数用)。
@@ -91,8 +94,13 @@ pub struct MobileRelayManager {
     sessions: StdMutex<Vec<MobileProject>>,
     /// pane → 项目路径(镜像订阅时解析会话文件用)
     pane_paths: StdMutex<HashMap<String, String>>,
+    /// pane → PTY id(移动端指令写穿目标)
+    pane_ptys: StdMutex<HashMap<String, u32>>,
     /// 已订阅镜像的 pane 集合
     mirror_subs: StdMutex<HashMap<String, MirrorSub>>,
+    /// 每 pane 最近成功写入的移动端指令原文:会话记录回流时把匹配的
+    /// user 消息来源改标为 "mobile"(见 relabel_mobile_sources)
+    recent_mobile_cmds: StdMutex<HashMap<String, Vec<String>>>,
 }
 
 impl MobileRelayManager {
@@ -104,7 +112,9 @@ impl MobileRelayManager {
             paired: StdMutex::new(None),
             sessions: StdMutex::new(Vec::new()),
             pane_paths: StdMutex::new(HashMap::new()),
+            pane_ptys: StdMutex::new(HashMap::new()),
             mirror_subs: StdMutex::new(HashMap::new()),
+            recent_mobile_cmds: StdMutex::new(HashMap::new()),
         }
     }
 
@@ -144,11 +154,16 @@ impl MobileRelayManager {
     /// 更新 pane→路径映射;被订阅镜像的 pane 消失时通知移动端并撤销订阅。
     pub fn update_sessions(&self, projects: Vec<SyncProject>) {
         let mut pane_paths: HashMap<String, String> = HashMap::new();
+        let mut pane_ptys: HashMap<String, u32> = HashMap::new();
         for p in &projects {
             for pane in &p.panes {
                 pane_paths.insert(pane.pane_id.clone(), p.path.clone());
+                if let Some(pty_id) = pane.pty_id {
+                    pane_ptys.insert(pane.pane_id.clone(), pty_id);
+                }
             }
         }
+        *self.pane_ptys.lock().unwrap() = pane_ptys;
 
         // 订阅中的 pane 已不在活跃集合(pane 关闭/AI 会话结束)→ PaneClosed
         let gone: Vec<String> = {
@@ -208,6 +223,34 @@ impl MobileRelayManager {
         let subs: Vec<MirrorSub> = self.mirror_subs.lock().unwrap().drain().map(|(_, s)| s).collect();
         for sub in subs {
             let _ = sub.cancel_tx.send(true);
+        }
+    }
+
+    /// 登记一条已写入 PTY 的移动端指令原文(镜像回流改标来源用,每 pane 上限 20 条)。
+    fn record_mobile_cmd(&self, pane_id: &str, text: &str) {
+        let mut map = self.recent_mobile_cmds.lock().unwrap();
+        let list = map.entry(pane_id.to_string()).or_default();
+        list.push(text.trim().to_string());
+        if list.len() > 20 {
+            list.remove(0);
+        }
+    }
+
+    /// 镜像新消息回流时调用:与最近移动端指令逐字匹配的 user 消息改标 "mobile"。
+    /// 不匹配保持 "desktop"(误差方向安全:最多把移动端指令标成桌面输入)。
+    fn relabel_mobile_sources(&self, pane_id: &str, messages: &mut [MirrorMessage]) {
+        let mut map = self.recent_mobile_cmds.lock().unwrap();
+        let Some(list) = map.get_mut(pane_id) else {
+            return;
+        };
+        for msg in messages.iter_mut() {
+            if msg.source != "desktop" {
+                continue;
+            }
+            if let Some(pos) = list.iter().position(|cmd| cmd == msg.content.trim()) {
+                msg.source = "mobile".into();
+                list.remove(pos);
+            }
         }
     }
 
@@ -423,8 +466,58 @@ fn handle_relay_message(app: &AppHandle, manager: &MobileRelayManager, text: &st
             pane_id,
             before_seq,
         }) => manager.send_mirror_history(&pane_id, before_seq),
+        // 移动端指令:到达即写入目标 pane 的 PTY(写穿,不排队),随即回执
+        Ok(RelayToDesktop::MobileCommand {
+            pane_id,
+            command_id,
+            text,
+        }) => handle_mobile_command(app, manager, pane_id, command_id, text),
         Ok(_) => {}
         Err(_) => eprintln!("[mobile-relay] unparseable relay message (ignored)"),
+    }
+}
+
+/// 写穿移动端指令:等价本人在桌面对该终端敲入同样内容并回车。
+/// 回执仅表示"已写入 PTY",AI 真正接收以镜像回流为准。
+fn handle_mobile_command(
+    app: &AppHandle,
+    manager: &MobileRelayManager,
+    pane_id: String,
+    command_id: String,
+    text: String,
+) {
+    use mt_relay_protocol::CommandFailReason;
+
+    let pty_id = manager.pane_ptys.lock().unwrap().get(&pane_id).copied();
+    let result = match pty_id {
+        None => Err(CommandFailReason::PaneNotFound),
+        Some(pty_id) => {
+            // 复用 write_pty 全语义(输入跟踪/AI marker/SSH autofill 解除),
+            // 文本 + \r 一次写入 = 敲入内容并回车;AI 工作中依赖 CLI 自身输入缓冲
+            let data = format!("{text}\r");
+            crate::pty::write_pty(app.clone(), app.state(), pty_id, data, None)
+                .map_err(|_| CommandFailReason::WriteFailed)
+        }
+    };
+
+    match result {
+        Ok(()) => {
+            manager.record_mobile_cmd(&pane_id, &text);
+            let _ = manager.send(DesktopToRelay::CommandReceipt {
+                pane_id,
+                command_id,
+                ok: true,
+                reason: None,
+            });
+        }
+        Err(reason) => {
+            let _ = manager.send(DesktopToRelay::CommandReceipt {
+                pane_id,
+                command_id,
+                ok: false,
+                reason: Some(reason),
+            });
+        }
     }
 }
 
@@ -504,8 +597,10 @@ async fn mirror_task(
                         Some((bytes, new_offset)) => {
                             *offset = new_offset;
                             if !bytes.is_empty() {
-                                let new_msgs = parser.feed(&bytes);
+                                let mut new_msgs = parser.feed(&bytes);
                                 if !new_msgs.is_empty() {
+                                    // 移动端指令回流:匹配的 user 消息改标 "mobile"
+                                    manager.relabel_mobile_sources(&pane_id, &mut new_msgs);
                                     messages.lock().unwrap().extend(new_msgs.clone());
                                     let _ = manager.send(DesktopToRelay::MirrorAppend {
                                         pane_id: pane_id.clone(),
@@ -747,6 +842,59 @@ mod tests {
         let upsert_ids: Vec<&str> = upserts.iter().map(|p| p.project_id.as_str()).collect();
         assert_eq!(upsert_ids, vec!["p2", "p3"]);
         assert_eq!(removed, vec!["p1".to_string()]);
+    }
+
+    #[test]
+    fn relabel_marks_matching_user_message_as_mobile_once() {
+        let manager = MobileRelayManager::new();
+        manager.record_mobile_cmd("pane-1", "  npm test ");
+
+        let mut msgs = vec![
+            MirrorMessage {
+                seq: 0,
+                source: "desktop".into(),
+                content: "unrelated input".into(),
+                timestamp: String::new(),
+            },
+            MirrorMessage {
+                seq: 1,
+                source: "desktop".into(),
+                content: "npm test".into(),
+                timestamp: String::new(),
+            },
+            MirrorMessage {
+                seq: 2,
+                source: "assistant".into(),
+                content: "npm test".into(),
+                timestamp: String::new(),
+            },
+        ];
+        manager.relabel_mobile_sources("pane-1", &mut msgs);
+        assert_eq!(msgs[0].source, "desktop");
+        assert_eq!(msgs[1].source, "mobile");
+        // assistant 消息不受影响
+        assert_eq!(msgs[2].source, "assistant");
+
+        // 记录一次性消费:同文本再次回流按桌面输入处理
+        let mut again = vec![MirrorMessage {
+            seq: 3,
+            source: "desktop".into(),
+            content: "npm test".into(),
+            timestamp: String::new(),
+        }];
+        manager.relabel_mobile_sources("pane-1", &mut again);
+        assert_eq!(again[0].source, "desktop");
+
+        // 其他 pane 的记录互不影响
+        manager.record_mobile_cmd("pane-2", "ls");
+        let mut other = vec![MirrorMessage {
+            seq: 0,
+            source: "desktop".into(),
+            content: "ls".into(),
+            timestamp: String::new(),
+        }];
+        manager.relabel_mobile_sources("pane-1", &mut other);
+        assert_eq!(other[0].source, "desktop");
     }
 
     #[test]

@@ -1,6 +1,12 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
-import { closeMirror, loadOlderMirror, useRelayStore } from './relay';
+import {
+  clearCommandReceipt,
+  closeMirror,
+  loadOlderMirror,
+  sendMobileCommand,
+  useRelayStore,
+} from './relay';
 import { useT } from './i18n';
 import type { MirrorMessage } from './protocol';
 
@@ -29,6 +35,71 @@ function MessageRow({ msg }: { msg: MirrorMessage }) {
         ) : (
           <pre className="plain-input">{msg.content}</pre>
         )}
+      </div>
+    </div>
+  );
+}
+
+/** 镜像底部的指令输入区:桌面离线/会话结束置灰;发送后展示回执。 */
+function CommandComposer() {
+  const t = useT();
+  const mirror = useRelayStore((s) => s.mirror);
+  const desktopOnline = useRelayStore((s) => s.desktopOnline);
+  const [text, setText] = useState('');
+
+  const receipt = mirror?.receipt ?? null;
+  const sending = mirror?.pendingCommandId != null;
+  const disabled = !mirror || mirror.closed || desktopOnline === false;
+
+  // 回执短暂展示后自动清除
+  useEffect(() => {
+    if (!receipt) return;
+    const timer = setTimeout(clearCommandReceipt, receipt.ok ? 2500 : 5000);
+    return () => clearTimeout(timer);
+  }, [receipt]);
+
+  const submit = () => {
+    if (disabled || sending) return;
+    if (sendMobileCommand(text)) setText('');
+  };
+
+  let notice: { text: string; ok: boolean } | null = null;
+  if (receipt) {
+    notice = receipt.ok
+      ? { text: t('mirror.receiptOk'), ok: true }
+      : { text: t(`mirror.receiptFail.${receipt.reason ?? 'writeFailed'}`), ok: false };
+  }
+
+  return (
+    <div className="composer">
+      {notice && (
+        <div className={`composer-receipt ${notice.ok ? 'ok' : 'fail'}`}>{notice.text}</div>
+      )}
+      {disabled && desktopOnline === false && (
+        <div className="composer-hint">{t('mirror.offlineCannotSend')}</div>
+      )}
+      <div className="composer-row">
+        <textarea
+          className="composer-input"
+          value={text}
+          rows={1}
+          placeholder={t('mirror.inputPlaceholder')}
+          disabled={disabled}
+          onChange={(e) => setText(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+              e.preventDefault();
+              submit();
+            }
+          }}
+        />
+        <button
+          className="composer-send"
+          disabled={disabled || sending || !text.trim()}
+          onClick={submit}
+        >
+          {sending ? t('mirror.sending') : t('mirror.send')}
+        </button>
       </div>
     </div>
   );
@@ -107,6 +178,8 @@ export function MirrorView() {
           mirror.messages.map((m) => <MessageRow key={m.seq} msg={m} />)
         )}
       </div>
+
+      <CommandComposer />
     </div>
   );
 }

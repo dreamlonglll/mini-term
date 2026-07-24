@@ -36,11 +36,20 @@ export interface MobileRequestMirrorHistory {
   beforeSeq: number;
 }
 
+/** 移动端指令:写穿目标 pane 的 PTY(等价桌面敲入并回车),不排队 */
+export interface MobileCommandMsg {
+  type: 'mobileCommand';
+  paneId: string;
+  commandId: string;
+  text: string;
+}
+
 export type MobileToRelay =
   | MobileHello
   | MobileSubscribePane
   | MobileUnsubscribePane
-  | MobileRequestMirrorHistory;
+  | MobileRequestMirrorHistory
+  | MobileCommandMsg;
 
 // ── 中转 → 移动端 ──
 
@@ -136,6 +145,17 @@ export interface MobilePaneClosed {
   paneId: string;
 }
 
+export type CommandFailReason = 'desktopOffline' | 'paneNotFound' | 'writeFailed';
+
+/** 指令回执:ok = 已写入桌面终端(AI 真正接收以镜像回流为准) */
+export interface MobileCommandReceipt {
+  type: 'commandReceipt';
+  paneId: string;
+  commandId: string;
+  ok: boolean;
+  reason?: CommandFailReason;
+}
+
 export type RelayToMobile =
   | MobileHelloAck
   | MobileHelloReject
@@ -146,4 +166,5 @@ export type RelayToMobile =
   | MobileMirrorSnapshot
   | MobileMirrorAppend
   | MobileMirrorHistory
-  | MobilePaneClosed;
+  | MobilePaneClosed
+  | MobileCommandReceipt;

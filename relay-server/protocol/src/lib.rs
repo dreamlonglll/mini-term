@@ -29,6 +29,18 @@ pub struct MobileProject {
     pub panes: Vec<MobilePane>,
 }
 
+/// 移动端指令发送失败的原因。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CommandFailReason {
+    /// 桌面端离线:中转在路由层直接拒绝(不做存储转发)
+    DesktopOffline,
+    /// 目标 pane 已关闭/AI 会话已结束
+    PaneNotFound,
+    /// PTY 写入失败
+    WriteFailed,
+}
+
 /// 对话镜像中的一条消息。seq 在一次镜像绑定内从 0 连续递增,分页取数以此为锚。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -78,6 +90,14 @@ pub enum DesktopToRelay {
     },
     /// 被订阅的 pane 已关闭/AI 会话已结束:移动端应提示并返回列表。
     PaneClosed { pane_id: String },
+    /// 移动端指令回执:ok = 已写入 PTY(不承诺 AI 已接收,以镜像回流为准)。
+    CommandReceipt {
+        pane_id: String,
+        command_id: String,
+        ok: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<CommandFailReason>,
+    },
 }
 
 /// 中转 → 桌面端
@@ -105,6 +125,12 @@ pub enum RelayToDesktop {
     UnsubscribePane { pane_id: String },
     /// 移动端请求更早的镜像历史(转发自移动端)。
     RequestMirrorHistory { pane_id: String, before_seq: u64 },
+    /// 移动端指令(转发自移动端):到达即写入目标 pane 的 PTY,不排队。
+    MobileCommand {
+        pane_id: String,
+        command_id: String,
+        text: String,
+    },
 }
 
 /// 移动端 → 中转
@@ -125,6 +151,13 @@ pub enum MobileToRelay {
     UnsubscribePane { pane_id: String },
     /// 上拉加载更早的镜像历史。
     RequestMirrorHistory { pane_id: String, before_seq: u64 },
+    /// 移动端指令:写穿目标 pane 的 PTY(等价桌面敲入同样内容并回车)。
+    /// command_id 由移动端生成,用于回执关联。
+    MobileCommand {
+        pane_id: String,
+        command_id: String,
+        text: String,
+    },
 }
 
 /// 中转 → 移动端
@@ -170,6 +203,14 @@ pub enum RelayToMobile {
     },
     /// 被订阅的 pane 已关闭/AI 会话结束(转发自桌面端)。
     PaneClosed { pane_id: String },
+    /// 移动端指令回执:桌面端写入结果,或中转在桌面离线时的路由层拒绝。
+    CommandReceipt {
+        pane_id: String,
+        command_id: String,
+        ok: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<CommandFailReason>,
+    },
 }
 
 /// 移动端握手被拒绝的原因。
@@ -396,5 +437,40 @@ mod tests {
         };
         let json = serde_json::to_string(&closed).unwrap();
         assert_eq!(serde_json::from_str::<RelayToMobile>(&json).unwrap(), closed);
+    }
+
+    #[test]
+    fn mobile_command_and_receipt_round_trip() {
+        let cmd = MobileToRelay::MobileCommand {
+            pane_id: "pane-1".into(),
+            command_id: "cmd-1".into(),
+            text: "继续".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(
+            json.contains(r#""type":"mobileCommand""#) && json.contains(r#""commandId":"cmd-1""#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<MobileToRelay>(&json).unwrap(), cmd);
+
+        let ok = RelayToMobile::CommandReceipt {
+            pane_id: "pane-1".into(),
+            command_id: "cmd-1".into(),
+            ok: true,
+            reason: None,
+        };
+        let json = serde_json::to_string(&ok).unwrap();
+        assert!(!json.contains("reason"), "成功回执不应携带 reason: {json}");
+        assert_eq!(serde_json::from_str::<RelayToMobile>(&json).unwrap(), ok);
+
+        let fail = RelayToMobile::CommandReceipt {
+            pane_id: "pane-1".into(),
+            command_id: "cmd-2".into(),
+            ok: false,
+            reason: Some(CommandFailReason::DesktopOffline),
+        };
+        let json = serde_json::to_string(&fail).unwrap();
+        assert!(json.contains(r#""reason":"desktopOffline""#), "{json}");
+        assert_eq!(serde_json::from_str::<RelayToMobile>(&json).unwrap(), fail);
     }
 }

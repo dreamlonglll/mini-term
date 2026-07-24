@@ -16,8 +16,8 @@ use axum::response::IntoResponse;
 use axum::routing::{any, get};
 use axum::Router;
 use mt_relay_protocol::{
-    DesktopToRelay, MobileRejectReason, MobileToRelay, RelayToDesktop, RelayToMobile,
-    PROTOCOL_VERSION,
+    CommandFailReason, DesktopToRelay, MobileRejectReason, MobileToRelay, RelayToDesktop,
+    RelayToMobile, PROTOCOL_VERSION,
 };
 use tokio::sync::mpsc;
 
@@ -306,6 +306,23 @@ fn handle_desktop_message(state: &RelayState, msg: DesktopToRelay) {
                 }
             }
         }
+        // 指令回执:原样转发(以 command_id 关联,不依赖订阅状态)
+        DesktopToRelay::CommandReceipt {
+            pane_id,
+            command_id,
+            ok,
+            reason,
+        } => {
+            let inner = state.inner.lock().unwrap();
+            if let Some(mobile) = inner.mobile.as_ref() {
+                let _ = mobile.tx.send(to_text(&RelayToMobile::CommandReceipt {
+                    pane_id,
+                    command_id,
+                    ok,
+                    reason,
+                }));
+            }
+        }
         DesktopToRelay::RequestPairingCode => {
             let code = random_id();
             let mut inner = state.inner.lock().unwrap();
@@ -555,6 +572,31 @@ fn handle_mobile_message(state: &RelayState, msg: MobileToRelay) {
                 pane_id,
                 before_seq,
             }),
+        // 移动端指令:桌面端离线即拒(路由层生成失败回执,不做存储转发)
+        MobileToRelay::MobileCommand {
+            pane_id,
+            command_id,
+            text,
+        } => {
+            if inner.desktop.is_some() {
+                Some(RelayToDesktop::MobileCommand {
+                    pane_id,
+                    command_id,
+                    text,
+                })
+            } else {
+                eprintln!("[relay] mobile command rejected: desktop offline");
+                if let Some(mobile) = inner.mobile.as_ref() {
+                    let _ = mobile.tx.send(to_text(&RelayToMobile::CommandReceipt {
+                        pane_id,
+                        command_id,
+                        ok: false,
+                        reason: Some(CommandFailReason::DesktopOffline),
+                    }));
+                }
+                None
+            }
+        }
     };
     if let (Some(msg), Some(desktop)) = (forward, inner.desktop.as_ref()) {
         let _ = desktop.tx.send(to_text(&msg));

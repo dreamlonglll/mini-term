@@ -11,6 +11,16 @@ export const mirror = {
       assistant: "AI 回复",
       mobile: "移动端指令",
     },
+    inputPlaceholder: "输入指令，将写入桌面终端…",
+    send: "发送",
+    sending: "发送中…",
+    receiptOk: "已写入桌面终端",
+    receiptFail: {
+      desktopOffline: "发送失败：桌面端离线",
+      paneNotFound: "发送失败：目标 pane 已关闭或 AI 会话已结束",
+      writeFailed: "发送失败：终端写入失败",
+    },
+    offlineCannotSend: "桌面端离线，暂时无法发送指令",
   },
   en: {
     back: "Back",
@@ -24,5 +34,15 @@ export const mirror = {
       assistant: "AI reply",
       mobile: "Mobile command",
     },
+    inputPlaceholder: "Type a command to write into the desktop terminal…",
+    send: "Send",
+    sending: "Sending…",
+    receiptOk: "Written to desktop terminal",
+    receiptFail: {
+      desktopOffline: "Failed: desktop is offline",
+      paneNotFound: "Failed: target pane closed or AI session ended",
+      writeFailed: "Failed: terminal write error",
+    },
+    offlineCannotSend: "Desktop offline — commands cannot be sent right now",
   },
 } as const;
