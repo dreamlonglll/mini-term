@@ -51,6 +51,22 @@ export interface AppConfig {
   sshConnections: SshConnection[];
   /** 显式创建的 SSH 分组名（允许空分组）。连接的 group 字段仍是归属单一来源 */
   sshGroups?: string[];
+  /** 移动端中转配置(docs/adr/0001),未配置时缺省 */
+  mobileRelay?: MobileRelayConfig;
+}
+
+/** 移动端中转体系的持久化配置。字段对齐后端 #[serde(rename_all = "camelCase")]. */
+export interface MobileRelayConfig {
+  /** 中转服务器地址(如 wss://relay.example.com),空字符串 = 未配置、不建连 */
+  relayUrl: string;
+}
+
+/** mobile-relay-status 事件 / mobile_relay_status 命令的载荷。 */
+export interface MobileRelayStatusPayload {
+  status: 'disconnected' | 'connecting' | 'connected' | 'reconnecting' | 'versionMismatch';
+  /** versionMismatch 时携带,用于给出明确升级提示 */
+  expectedVersion?: number;
+  actualVersion?: number;
 }
 
 export interface ProjectConfig {

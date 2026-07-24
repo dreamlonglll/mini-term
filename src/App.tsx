@@ -25,7 +25,7 @@ import { applyUiFontFamily } from './utils/fontManager';
 import { markAiPty, updateAllTerminalThemes } from './utils/terminalCache';
 import { includeActiveProject } from './utils/projectKeepAlive';
 import { useT } from './i18n';
-import type { AppConfig, PtyStatusChangePayload, PtyExitPayload, PaneStatus } from './types';
+import type { AppConfig, PtyStatusChangePayload, PtyExitPayload, PaneStatus, MobileRelayStatusPayload } from './types';
 
 export function App() {
   const t = useT();
@@ -162,6 +162,11 @@ export function App() {
     markAiPty(payload.ptyId, payload.status === 'ai-working' || payload.status === 'ai-idle');
     updatePaneStatusByPty(payload.ptyId, payload.status as PaneStatus);
   }, [updatePaneStatusByPty]));
+
+  // 中转连接状态:后端长连状态机推送,写入 store 供设置页「移动端」区域实时展示
+  useTauriEvent<MobileRelayStatusPayload>('mobile-relay-status', useCallback((payload) => {
+    useAppStore.getState().setMobileRelayStatus(payload);
+  }, []));
 
   useTauriEvent<PtyExitPayload>('pty-exit', useCallback((payload) => {
     // 登记已退出的 PTY:远程项目 pane 据此叠加「连接已断开,点击重连」覆盖层

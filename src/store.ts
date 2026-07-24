@@ -16,6 +16,7 @@ import type {
   AiCompletionNotification,
   AiMarker,
   AiUserSubmitPayload,
+  MobileRelayStatusPayload,
 } from './types';
 import { restoreSavedProjectLayout } from './utils/layoutRestore';
 import { playNotificationSound } from './utils/notificationSound';
@@ -356,6 +357,10 @@ interface AppStore {
   // 搜索弹窗
   searchModalOpen: boolean;
   setSearchModalOpen: (open: boolean) => void;
+
+  // 移动端中转连接状态(后端 mobile-relay-status 事件驱动,设置页「移动端」区域展示)
+  mobileRelayStatus: MobileRelayStatusPayload | null;
+  setMobileRelayStatus: (status: MobileRelayStatusPayload | null) => void;
 }
 
 export const useAppStore = create<AppStore>((set, get) => ({
@@ -396,6 +401,9 @@ export const useAppStore = create<AppStore>((set, get) => ({
   setSearchModalOpen: (open) => set({ searchModalOpen: open }),
 
   rightDrawer: null,
+
+  mobileRelayStatus: null,
+  setMobileRelayStatus: (status) => set({ mobileRelayStatus: status }),
 
   setActiveProject: (id) =>
     set((state) => {

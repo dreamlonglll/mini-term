@@ -31,6 +31,7 @@ import { prompt } from './prompt';
 import { externalLink } from './externalLink';
 import { updateChecker } from './updateChecker';
 import { remoteProject } from './remoteProject';
+import { mobileRelay } from './mobileRelay';
 
 type Dict = Record<string, unknown>;
 
@@ -62,6 +63,7 @@ export const dicts: { zh: Dict; en: Dict } = {
     externalLink: externalLink.zh,
     updateChecker: updateChecker.zh,
     remoteProject: remoteProject.zh,
+    mobileRelay: mobileRelay.zh,
   },
   en: {
     app: app.en,
@@ -90,5 +92,6 @@ export const dicts: { zh: Dict; en: Dict } = {
     externalLink: externalLink.en,
     updateChecker: updateChecker.en,
     remoteProject: remoteProject.en,
+    mobileRelay: mobileRelay.en,
   },
 };

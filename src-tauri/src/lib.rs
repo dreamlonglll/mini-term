@@ -7,6 +7,7 @@ mod fs;
 mod git;
 mod hook_registry;
 mod hook_server;
+mod mobile_relay;
 mod process_monitor;
 mod pty;
 mod remote_ssh;
@@ -29,6 +30,7 @@ pub fn run() {
         .manage(pty::PtyManager::new())
         .manage(fs::FsWatcherManager::new())
         .manage(search::SearchManager::new())
+        .manage(mobile_relay::MobileRelayManager::new())
         .manage(remote_ssh::RemoteSshState::new())
         .setup(|app| {
             // portable-pty 0.8.1 会在第一次 openpty 时进程级缓存 ConPTY 函数表；
@@ -62,6 +64,14 @@ pub fn run() {
             let pty_manager = app.state::<crate::pty::PtyManager>();
             let pty_clone = pty_manager.inner().clone();
             process_monitor::start_monitor(app.handle().clone(), pty_clone, hook_state);
+
+            // 已配置中转地址时,启动对中转服务器的出站长连(断线自动指数退避重连)
+            if let Some(relay) = app_config.mobile_relay.as_ref() {
+                if !relay.relay_url.trim().is_empty() {
+                    app.state::<mobile_relay::MobileRelayManager>()
+                        .apply(app.handle(), &relay.relay_url);
+                }
+            }
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -129,6 +139,8 @@ pub fn run() {
             ssh_mcp_registry::enable_ssh_mcp,
             ssh_mcp_registry::disable_ssh_mcp,
             window_theme::set_window_dark_mode,
+            mobile_relay::mobile_relay_apply,
+            mobile_relay::mobile_relay_status,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
