@@ -1,7 +1,7 @@
 [package]
 name = "tauri-app"
 version = "0.6.11"
-description = "mini-term: AI-aware desktop terminal manager built on Tauri v2 — multi-project, multi-tab, split-pane, IM bridged via cc-connect"
+description = "mini-term: AI-aware desktop terminal manager built on Tauri v2 — multi-project, multi-tab, split-pane"
 authors = ["you"]
 edition = "2021"
 default-run = "tauri-app"
@@ -44,7 +44,6 @@ git2 = "0.19"
 pathdiff = "0.2"
 tiny_http = "0.12"
 toml_edit = "0.22"
-ureq = { version = "2", features = ["json"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

@@ -15,29 +15,17 @@ import { SettingsModal, type SettingsPage } from './components/SettingsModal';
 import { SshModal } from './components/SshModal';
 import { SearchModal } from './components/SearchModal';
 import { ToastContainer } from './components/ToastContainer';
-import { CcConnectModal } from './components/CcConnectModal';
-import { CcConnectDashboard } from './components/CcConnectDashboard';
 import { useTauriEvent } from './hooks/useTauriEvent';
 import { useAiSubmitMarker } from './hooks/useAiSubmitMarker';
 import { useMarkerHotkeys } from './hooks/useMarkerHotkeys';
 import { useExternalFileDrop } from './hooks/useExternalFileDrop';
-import { useCcConnectProbe } from './hooks/useCcConnectProbe';
 import { checkForUpdate, type ReleaseInfo } from './utils/updateChecker';
 import { applyTheme } from './utils/themeManager';
 import { applyUiFontFamily } from './utils/fontManager';
 import { markAiPty, updateAllTerminalThemes } from './utils/terminalCache';
 import { includeActiveProject } from './utils/projectKeepAlive';
 import { useT } from './i18n';
-import type { AppConfig, PtyStatusChangePayload, PtyExitPayload, PaneStatus, CcConnectStatus, CcConnectConfig } from './types';
-
-/** cc-connect 未保存配置时,「连接」弹窗 / Dashboard 打开期间仍以默认路径探活的占位配置。 */
-const EMPTY_CC_CONFIG: CcConnectConfig = {
-  exePath: '',
-  configPath: '',
-  autoStart: false,
-  extraArgs: [],
-  projectLinks: {},
-};
+import type { AppConfig, PtyStatusChangePayload, PtyExitPayload, PaneStatus } from './types';
 
 export function App() {
   const t = useT();
@@ -45,10 +33,6 @@ export function App() {
   const [configOpen, setConfigOpen] = useState(false);
   const [configPage, setConfigPage] = useState<SettingsPage | undefined>(undefined);
   const [sshOpen, setSshOpen] = useState(false);
-  const [ccConnectOpen, setCcConnectOpen] = useState(false);
-  const ccDashboardOpen = useAppStore((s) => s.ccDashboardOpen);
-  const ccDashboardDeepLink = useAppStore((s) => s.ccDashboardDeepLink);
-  const closeCcDashboard = useAppStore((s) => s.closeCcDashboard);
   const [updateInfo, setUpdateInfo] = useState<ReleaseInfo | null>(null);
   const [mountedProjectIds, setMountedProjectIds] = useState<string[]>([]);
   const activeProjectId = useAppStore((s) => s.activeProjectId);
@@ -106,45 +90,8 @@ export function App() {
         }));
       };
       showWindow();
-
-      // cc-connect autoStart:首次 probe 发现未运行时尝试 spawn(勾选了 autoStart 即可,
-      // 未填写可执行文件时回退 PATH 中的 cc-connect)
-      const ccCfg = cfg.ccConnect;
-      if (ccCfg?.autoStart) {
-        const autoExe = ccCfg.exePath?.trim() || 'cc-connect';
-        invoke<CcConnectStatus>('cc_connect_probe', {
-          configPath: ccCfg.configPath || undefined,
-        }).then((status) => {
-          useAppStore.getState().setCcConnectStatus(status);
-          if (!status.running) {
-            return invoke<number>('cc_connect_start', {
-              exePath: autoExe,
-              configPath: ccCfg.configPath || undefined,
-              extraArgs: ccCfg.extraArgs ?? [],
-            }).then(() => {
-              // spawn 后等 ~600ms 让 cc-connect 起监听端口再重新 probe
-              setTimeout(() => {
-                invoke<CcConnectStatus>('cc_connect_probe', {
-                  configPath: ccCfg.configPath || undefined,
-                })
-                  .then((s) => useAppStore.getState().setCcConnectStatus(s))
-                  .catch(() => {});
-              }, 600);
-            });
-          }
-        }).catch(() => {
-          // autoStart 失败静默(用户可在设置面板手动启动 + 看错误诊断)
-        });
-      }
     });
   }, []);
-
-  // cc-connect 状态 5s 轮询(失焦时暂停节省 CPU)、常驻探活:配置过用保存的 configPath,
-  // 未配置则以默认 ~/.cc-connect/config.toml 探活 —— 这样零配置下也能识别 cc-connect 运行态,
-  // 让项目列表的"导入到 cc-connect"右键菜单在 running 时直接可用。
-  // 无 cc-connect 的用户:探活只是一次快速失败的文件读(不产生 HTTP),UI 也不展示任何状态。
-  const ccProbeConfig = config.ccConnect ?? EMPTY_CC_CONFIG;
-  useCcConnectProbe(configLoaded ? ccProbeConfig : undefined);
 
   // 阻止浏览器默认的文件拖放行为（防止导航到拖入的文件）
   useEffect(() => {
@@ -323,7 +270,6 @@ export function App() {
           <ActivityBar
             onOpenSettings={() => { setConfigPage(undefined); setConfigOpen(true); }}
             onOpenSsh={() => setSshOpen(true)}
-            onOpenConnect={() => setCcConnectOpen(true)}
             updateVersion={updateInfo?.version ?? null}
             onOpenUpdate={() => { if (updateInfo) openUrl(updateInfo.url); }}
           />
@@ -390,13 +336,7 @@ export function App() {
       </div>
       <SettingsModal open={configOpen} onClose={() => setConfigOpen(false)} initialPage={configPage} />
       <SshModal open={sshOpen} onClose={() => setSshOpen(false)} />
-      <CcConnectModal open={ccConnectOpen} onClose={() => setCcConnectOpen(false)} />
       <SearchModal open={searchModalOpen} onClose={() => setSearchModalOpen(false)} />
-      <CcConnectDashboard
-        open={ccDashboardOpen}
-        onClose={closeCcDashboard}
-        deepLink={ccDashboardDeepLink || undefined}
-      />
       <ToastContainer />
     </div>
   );

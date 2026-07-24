@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>A desktop terminal manager built for the AI era</strong><br>
-  Powered by Tauri v2 · Multi-project · Multi-tab · Split-pane layout · AI process awareness · SSH remote projects · Remote driving over IM platforms (cc-connect)
+  Powered by Tauri v2 · Multi-project · Multi-tab · Split-pane layout · AI process awareness · SSH remote projects
 </p>
 
 <p align="center">
@@ -94,16 +94,6 @@ Mini-Term solves all of the above with one lightweight desktop app.
 - **WSL sessions** — Reads Claude / Codex session history inside WSL distros directly from Windows (no `wsl.exe` spawn — via `\\wsl$` UNC plus registry-based distro enumeration): WSL-rooted projects auto-derive the distro and path with zero configuration; Windows-path projects pick a distro via the right-click "WSL Sessions" submenu and are scanned through `/mnt` path mapping, with in-session cwd verification to prevent cross-project mixing; WSL sessions merge chronologically with local ones under a WSL badge, a header spinner shows while loading, and viewing session content is supported too.
 - **AI task markers** — Each time the user presses Enter inside an AI session, a marker is dropped in xterm; the ⚑ button at the tab's top-right drops down the list of past submissions, and clicking one or pressing `Ctrl+Shift+↑/↓` (macOS `⌘+Shift+↑/↓`) jumps between markers, briefly highlighting the target line.
 
-### cc-connect Integration
-
-Remotely drive the AI agents running on your machine through IM platforms (Feishu / Slack / Telegram / Discord / DingTalk / WeChat, etc.), bridged with the upstream [chenhg5/cc-connect](https://github.com/chenhg5/cc-connect). All entry points are gathered in the top-bar "Connect" button dialog.
-
-- **Process management (zero-config)** — Start / stop / restart / test-connection / edit config.toml from within the "Connect" dialog, optionally auto-spawned on mini-term startup; when the executable / config paths are left blank, it falls back to `cc-connect` on PATH and `~/.cc-connect/config.toml`, working with zero configuration; on Windows it resolves the npm script shell (`.cmd` / `.ps1`) via PATH × PATHEXT, and stop / restart use `taskkill /T` to kill the whole process tree to avoid orphans; closing mini-term does not kill it, keeping IM available continuously.
-- **One-click project import** — The "Connect" dialog lists all mini-term projects; check / select-all to batch-import in one click (appending `[[projects]]` via `toml_edit` to preserve comments, a single disk write + a single cc-connect restart, with an 8-char hash suffix auto-added on name conflicts), or import individually; imported entries show "● Imported" and can be removed in one click. Each imported project comes with a **placeholder Telegram platform** (cc-connect requires at least one platform per project or cold start fails); after importing, replace the placeholder with a real IM platform in the Dashboard to enable it.
-- **Embedded Dashboard** — "Open Dashboard" in the "Connect" dialog opens cc-connect's own web console in an iframe (already authenticated), letting you configure IM platforms / switch providers / manage cron directly inside mini-term without opening a browser; it `createPortal`s to `document.body` to bypass the backdrop-filter of Fluent 2's `[data-panel]` and ensure full-screen coverage; keep-alive close uses `display:none` without unmounting, avoiding re-login.
-- **Half-synced state handling** — Even if cc-connect's restart fails on project import / removal, the frontend keeps the local `projectLinks` based on the `tomlWritten` / `deletedOk` branches and shows a warning toast explaining the restart failure; the change takes effect the next time cc-connect starts.
-- **Graceful degradation** — When cc-connect isn't running, buttons like Import / Dashboard are greyed out with a "start cc-connect first" hint rather than crashing; when config.toml has no `[management].token`, it gives a friendly diagnostic guiding the user to run `cc-connect web` to generate one automatically.
-
 ### Project Management
 
 - **Project list** — Manage multiple project directories in the left sidebar, switch workspaces in one click, and restore the last active project on restart.
@@ -129,7 +119,7 @@ Remotely drive the AI agents running on your machine through IM platforms (Feish
 
 ### Appearance & Configuration
 
-- **Icon sidebar + three-column layout** — A persistent icon bar on the far left (collapse middle column / Sessions / Git / Settings / SSH / Connect); the middle column stacks Projects over Files and collapses as a whole; the terminal sits on the right. Sessions / Git are now floating drawers that slide out from the right edge over the terminal (mutually exclusive single panel, left-edge drag to resize with persisted width, ✕ to close), with a blue vertical bar indicating the active state.
+- **Icon sidebar + three-column layout** — A persistent icon bar on the far left (collapse middle column / Sessions / Git / Settings / SSH); the middle column stacks Projects over Files and collapses as a whole; the terminal sits on the right. Sessions / Git are now floating drawers that slide out from the right edge over the terminal (mutually exclusive single panel, left-edge drag to resize with persisted width, ✕ to close), with a blue vertical bar indicating the active state.
 - **Three theme modes** — Auto (follows the system) / Light / Dark, with Dark based on a Warm Carbon palette and a custom CSS-variable system; the native Windows title bar (DWM Immersive Dark Mode) follows the theme automatically, with no first-frame light flash for dark-mode users on startup.
 - **Blueprint skin** — An optional sci-fi Blueprint skin with a grid background + corner markers + glow effects, supporting both dark and light modes, with the terminal palette switching in sync.
 - **Independent font tuning** — The UI and terminal font sizes (10-20px) / families are adjustable separately, and the terminal can optionally follow the UI theme.
@@ -153,7 +143,7 @@ Remotely drive the AI agents running on your machine through IM platforms (Feish
 | Git | git2 0.19 |
 | File watching | notify 7 + ignore 0.4 (.gitignore filtering) |
 | Tauri plugins | `window-state` · `clipboard-manager` · `dialog` · `opener` |
-| Test coverage | 334 Rust unit tests (pty / fs / config / hook / ssh / cc-connect) |
+| Test coverage | 334 Rust unit tests (pty / fs / config / hook / ssh) |
 
 ## Getting Started
 
@@ -290,7 +280,7 @@ ai-working → ai-idle → Toast + DONE Tag + requestUserAttention
 
 ### Tauri Interface Overview
 
-- **Commands (65)** — PTY: `create_pty` · `write_pty` · `resize_pty` · `kill_pty`; FS: `list_directory` · `read_file_content` · `watch_directory` · `unwatch_directory` · `create_file` · `create_directory` · `rename_entry` · `delete_entry` · `filter_directories`; Search: `start_search` · `cancel_search`; Git: `get_git_status` · `get_git_diff` · `discover_git_repos` · `get_git_log` · `get_repo_branches` · `get_commit_files` · `get_commit_file_diff` · `git_pull` · `git_push` · `get_changes_status` · `git_stage` · `git_unstage` · `git_stage_all` · `git_unstage_all` · `git_commit` · `git_discard_file`; Config: `load_config` · `save_config`; Editor: `open_in_editor` · `open_path_with_default_app`; Clipboard: `read_clipboard_image` · `save_clipboard_text`; AI: `get_ai_sessions` · `get_wsl_ai_sessions` · `get_ai_session_content`; WSL: `list_wsl_distros`; Hook: `register_ai_hooks` · `unregister_ai_hooks` · `get_hook_config_snippet` · `get_hook_status` · `toggle_hook_server`; SSH: `arm_ssh_autofill` · `prepare_ssh_key`; SSH MCP: `enable_ssh_mcp` · `disable_ssh_mcp`; SSH remote: `ssh_remote_list_directory` · `ssh_remote_validate_dir` · `ssh_remote_ai_sessions` · `ssh_remote_ai_session_content`; Theme: `set_window_dark_mode`; cc-connect: `cc_connect_probe` · `cc_connect_read_token` · `cc_connect_config_path` · `cc_connect_start` · `cc_connect_stop` · `cc_connect_restart` · `cc_connect_list_projects` · `cc_connect_import_project` · `cc_connect_import_projects` · `cc_connect_unlink_project`
+- **Commands (55)** — PTY: `create_pty` · `write_pty` · `resize_pty` · `kill_pty`; FS: `list_directory` · `read_file_content` · `watch_directory` · `unwatch_directory` · `create_file` · `create_directory` · `rename_entry` · `delete_entry` · `filter_directories`; Search: `start_search` · `cancel_search`; Git: `get_git_status` · `get_git_diff` · `discover_git_repos` · `get_git_log` · `get_repo_branches` · `get_commit_files` · `get_commit_file_diff` · `git_pull` · `git_push` · `get_changes_status` · `git_stage` · `git_unstage` · `git_stage_all` · `git_unstage_all` · `git_commit` · `git_discard_file`; Config: `load_config` · `save_config`; Editor: `open_in_editor` · `open_path_with_default_app`; Clipboard: `read_clipboard_image` · `save_clipboard_text`; AI: `get_ai_sessions` · `get_wsl_ai_sessions` · `get_ai_session_content`; WSL: `list_wsl_distros`; Hook: `register_ai_hooks` · `unregister_ai_hooks` · `get_hook_config_snippet` · `get_hook_status` · `toggle_hook_server`; SSH: `arm_ssh_autofill` · `prepare_ssh_key`; SSH MCP: `enable_ssh_mcp` · `disable_ssh_mcp`; SSH remote: `ssh_remote_list_directory` · `ssh_remote_validate_dir` · `ssh_remote_ai_sessions` · `ssh_remote_ai_session_content`; Theme: `set_window_dark_mode`
 - **Events (backend → frontend)** — `pty-output` · `pty-exit` · `pty-status-change` · `fs-change` · `search-results` · `search-complete`
 
 ### Status Priority

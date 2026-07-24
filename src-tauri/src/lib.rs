@@ -1,5 +1,4 @@
 mod ai_sessions;
-mod cc_connect;
 mod clipboard;
 mod config;
 mod conpty_bootstrap;
@@ -30,7 +29,6 @@ pub fn run() {
         .manage(pty::PtyManager::new())
         .manage(fs::FsWatcherManager::new())
         .manage(search::SearchManager::new())
-        .manage(cc_connect::CcConnectManager::new())
         .manage(remote_ssh::RemoteSshState::new())
         .setup(|app| {
             // portable-pty 0.8.1 会在第一次 openpty 时进程级缓存 ConPTY 函数表；
@@ -131,16 +129,6 @@ pub fn run() {
             ssh_mcp_registry::enable_ssh_mcp,
             ssh_mcp_registry::disable_ssh_mcp,
             window_theme::set_window_dark_mode,
-            cc_connect::cc_connect_probe,
-            cc_connect::cc_connect_read_token,
-            cc_connect::cc_connect_config_path,
-            cc_connect::cc_connect_start,
-            cc_connect::cc_connect_stop,
-            cc_connect::cc_connect_restart,
-            cc_connect::cc_connect_list_projects,
-            cc_connect::cc_connect_import_project,
-            cc_connect::cc_connect_import_projects,
-            cc_connect::cc_connect_unlink_project,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

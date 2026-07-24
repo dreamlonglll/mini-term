@@ -2,7 +2,6 @@ export const app = {
   zh: {
     menu: {
       settings: "设置",
-      connect: "连接",
     },
     activityBar: {
       collapse: "折叠中间栏",
@@ -11,7 +10,6 @@ export const app = {
       git: "Git 变更",
       settings: "设置",
       ssh: "SSH 连接",
-      connect: "连接",
       closeDrawer: "关闭",
     },
     update: {
@@ -28,7 +26,6 @@ export const app = {
   en: {
     menu: {
       settings: "Settings",
-      connect: "Connect",
     },
     activityBar: {
       collapse: "Collapse panel",
@@ -37,7 +34,6 @@ export const app = {
       git: "Git changes",
       settings: "Settings",
       ssh: "SSH connections",
-      connect: "Connect",
       closeDrawer: "Close",
     },
     update: {
