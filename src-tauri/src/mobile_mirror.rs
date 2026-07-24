@@ -2,8 +2,12 @@
 //!
 //! 数据源是 Claude/Codex 会话记录文件,不是终端原始输出(docs/adr/0001)。
 //! 移动端按 pane 订阅;桌面端把 pane 绑定到其项目目录下**最新**的会话文件,
-//! 轮询增量解析新行并推送。v1 限制:仅本机(Windows 宿主)来源的会话记录;
-//! 同一项目多个 AI pane 时共同镜像最新会话(无法从 PTY 反查具体 session 文件)。
+//! 轮询增量解析新行并推送。用轮询而非复用 fs.rs 的 notify 监听是有意取舍:
+//! 镜像除了"文件长大"还要发现"更新的会话文件出现"(换绑),对单文件挂 notify
+//! 覆盖不了后者;1s 轮询两种情况一并处理,订阅通常只有一个,代价可忽略。
+//!
+//! v1 限制:仅本机(Windows 宿主)来源的会话记录;同一项目多个 AI pane 时
+//! 共同镜像最新会话(无法从 PTY 反查具体 session 文件)。
 
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
@@ -64,8 +68,8 @@ impl MirrorParser {
             MirrorAgent::Claude => ai_sessions::claude_message_from_line(line)?,
             MirrorAgent::Codex => ai_sessions::codex_message_from_line(line)?,
         };
-        // 来源标注:user = 桌面输入(移动端指令的来源改标在 ticket 06 落地),
-        // assistant = AI 回复
+        // 来源标注:user = 桌面输入,assistant = AI 回复;与最近移动端指令匹配的
+        // user 消息由 mobile_relay::relabel_mobile_sources 改标为 "mobile"
         let source = if raw.role == "user" {
             "desktop"
         } else {

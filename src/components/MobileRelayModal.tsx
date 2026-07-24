@@ -5,6 +5,7 @@ import QRCode from 'qrcode';
 import { useAppStore } from '../store';
 import { useTauriEvent } from '../hooks/useTauriEvent';
 import { useT } from '../i18n';
+import { RelayStatusBadge } from './RelayStatusBadge';
 import type { MobileRelayStatusPayload } from '../types';
 
 interface Props {
@@ -13,14 +14,6 @@ interface Props {
   /** 未配置中转地址时跳转设置中心「移动端」页 */
   onOpenSettings: () => void;
 }
-
-const STATUS_COLORS: Record<string, string> = {
-  connected: 'var(--color-success)',
-  connecting: 'var(--color-ai-working)',
-  reconnecting: 'var(--color-ai-working)',
-  disconnected: 'var(--text-muted)',
-  versionMismatch: 'var(--color-error)',
-};
 
 /** 中转地址(ws/wss)→ 移动端网页地址(http/https)。 */
 function relayHttpBase(relayUrl: string): string {
@@ -84,13 +77,6 @@ export function MobileRelayModal({ open, onClose, onOpenSettings }: Props) {
 
   if (!open) return null;
 
-  const statusText = status === 'versionMismatch'
-    ? t('mobileRelay.status.versionMismatch', {
-        expected: relayStatus?.expectedVersion ?? '?',
-        actual: relayStatus?.actualVersion ?? '?',
-      })
-    : t(`mobileRelay.status.${status}`);
-
   const paired = relayStatus?.paired;
 
   return (
@@ -129,15 +115,7 @@ export function MobileRelayModal({ open, onClose, onOpenSettings }: Props) {
               {/* 中转连接状态 */}
               <div className="flex items-center justify-between px-3 py-2.5 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)]">
                 <span className="text-base text-[var(--text-primary)]">{t('mobileRelay.statusLabel')}</span>
-                <span className="flex items-center gap-2 text-base text-[var(--text-secondary)] max-w-[70%] text-right">
-                  <span
-                    className={`w-2 h-2 rounded-full flex-shrink-0 ${
-                      status === 'connecting' || status === 'reconnecting' ? 'animate-blink' : ''
-                    }`}
-                    style={{ backgroundColor: STATUS_COLORS[status] ?? 'var(--text-muted)' }}
-                  />
-                  {statusText}
-                </span>
+                <RelayStatusBadge relayStatus={relayStatus} />
               </div>
 
               {/* 配对状态 */}

@@ -12,6 +12,7 @@ import { applyUiFontFamily } from '../utils/fontManager';
 import { MOD_LABEL } from '../utils/platform';
 import { useT } from '../i18n';
 import { LanguageToggle } from './LanguageToggle';
+import { RelayStatusBadge } from './RelayStatusBadge';
 import type { ShellConfig, EditorConfig, MobileRelayStatusPayload } from '../types';
 
 interface Props {
@@ -1499,14 +1500,6 @@ function ShortcutsSettings() {
 
 // ─── MobileRelaySettings（移动端中转设置）───
 
-const RELAY_STATUS_COLORS: Record<string, string> = {
-  connected: 'var(--color-success)',
-  connecting: 'var(--color-ai-working)',
-  reconnecting: 'var(--color-ai-working)',
-  disconnected: 'var(--text-muted)',
-  versionMismatch: 'var(--color-error)',
-};
-
 function MobileRelaySettings() {
   const t = useT();
   const config = useAppStore((s) => s.config);
@@ -1538,14 +1531,6 @@ function MobileRelaySettings() {
     await invoke('save_config', { config: newConfig });
     await invoke('mobile_relay_apply', { relayUrl: trimmed });
   }, [setConfig]);
-
-  const status = relayStatus?.status ?? 'disconnected';
-  const statusText = status === 'versionMismatch'
-    ? t('mobileRelay.status.versionMismatch', {
-        expected: relayStatus?.expectedVersion ?? '?',
-        actual: relayStatus?.actualVersion ?? '?',
-      })
-    : t(`mobileRelay.status.${status}`);
 
   return (
     <div className="space-y-5">
@@ -1586,15 +1571,7 @@ function MobileRelaySettings() {
       {/* 连接状态 */}
       <div className="flex items-center justify-between px-3 py-2.5 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)]">
         <span className="text-base text-[var(--text-primary)]">{t('mobileRelay.statusLabel')}</span>
-        <span className="flex items-center gap-2 text-base text-[var(--text-secondary)] max-w-[70%] text-right">
-          <span
-            className={`w-2 h-2 rounded-full flex-shrink-0 ${
-              status === 'connecting' || status === 'reconnecting' ? 'animate-blink' : ''
-            }`}
-            style={{ backgroundColor: RELAY_STATUS_COLORS[status] ?? 'var(--text-muted)' }}
-          />
-          {statusText}
-        </span>
+        <RelayStatusBadge relayStatus={relayStatus} />
       </div>
     </div>
   );

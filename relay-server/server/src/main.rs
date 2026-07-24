@@ -16,8 +16,10 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind((bind.as_str(), port))
         .await
         .unwrap_or_else(|e| panic!("failed to bind {bind}:{port}: {e}"));
+    // 打实际绑定端口(RELAY_PORT=0 时为系统分配的临时端口,测试据此定位)
+    let actual_port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
     eprintln!(
-        "[relay] listening on {bind}:{port} (protocol v{}, pwa dir: {pwa_dir})",
+        "[relay] listening on {bind}:{actual_port} (protocol v{}, pwa dir: {pwa_dir})",
         mt_relay_protocol::PROTOCOL_VERSION
     );
 
