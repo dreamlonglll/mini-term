@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>为 AI 时代打造的桌面终端管理器</strong><br>
-  基于 Tauri v2 · 多项目 · 多标签 · 分屏布局 · AI 进程感知 · SSH 远程项目
+  基于 Tauri v2 · 多项目 · 多标签 · 分屏布局 · AI 进程感知 · SSH 远程项目 · 手机远程看 AI
 </p>
 
 <p align="center">
@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.6.11-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.7.0-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -94,6 +94,17 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 - **WSL 会话** — Windows 下直接读取 WSL 发行版内的 Claude / Codex 历史会话（不 spawn `wsl.exe`，走 `\\wsl$` UNC + 注册表枚举发行版）：WSL 根项目自动推导发行版与路径零配置加载；Windows 路径项目右键「WSL 会话」子菜单选择发行版后按 `/mnt` 规则映射扫描，靠会话内 cwd 精确校验防串项目；WSL 会话与本机会话按时间混排并带 WSL 标识，加载中头部显示 spinner，查看正文同样支持
 - **AI 任务标记** — AI 会话内每次用户按 Enter 自动在 xterm 打点，标签右上角 ⚑ 按钮下拉展示历史提交列表，点击或 `Ctrl+Shift+↑/↓`（macOS `⌘+Shift+↑/↓`）在标记间跳转，目标行短暂高亮提示
 
+### 移动端 + 自托管中转
+
+出门在外用手机看桌面上跑着的 AI，并直接给它发指令。桌面端只出不进（出站长连），不需要公网 IP、不需要内网穿透、不需要在路由器上开任何端口。
+
+- **一站式连接与配对** — 顶栏「移动端」面板里填中转地址 → 保存并连接 → 生成配对二维码，全流程一个面板走完；手机相机扫码即打开 PWA 自动配对，配对码一次性有效（10 分钟），新设备配对自动顶替旧设备，「重置配对」立即吊销全部凭证
+- **活跃 AI 会话列表** — 手机端按项目分组展示正在跑的 Claude / Codex 会话，状态灯与桌面端实时同步增删变色；桌面端离线时顶部横幅提示并置灰，恢复后自动消除
+- **对话镜像（只读）** — 点进任一会话实时查看对话内容，AI 回复 Markdown 渲染、桌面输入原文展示，滚动到顶自动分页加载更早消息；镜像绑定经 Hook 会话身份精确到 pane，同项目并行开多个 AI 也不会互相串台
+- **移动端指令** — 镜像页底部输入框把文本写穿到桌面对应终端（等价于本人在键盘上敲下并回车），带即时回执与明确失败原因；桌面端离线时中转直接拒绝，不做存储转发
+- **中转只转发不落盘** — 中转服务器不存储任何消息体，日志仅记录元数据（有子进程级自动化测试断言全流程零文件残留）；自带三阶段 Dockerfile 与 compose 示例，一条命令从源码构建启动，反代 + TLS 配置见 [部署文档](docs/deploy-relay.md)
+- **PWA 体验** — 手机浏览器「添加到主屏幕」后以独立窗口运行，断线指数退避重连并自动恢复订阅，内置与桌面端同模式的中英双语
+
 ### 项目管理
 
 - **项目列表** — 左侧边栏管理多个项目目录，一键切换工作区，重启自动恢复上次激活项目
@@ -143,7 +154,8 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 | Git | git2 0.19 |
 | 文件监听 | notify 7 + ignore 0.4（.gitignore 过滤） |
 | Tauri 插件 | `window-state` · `clipboard-manager` · `dialog` · `opener` |
-| 测试覆盖 | 334 个 Rust 单元测试（pty / fs / config / hook / ssh） |
+| 移动端中转 | axum + tokio WebSocket 中转服务（`relay-server/`）· React + TS + Vite PWA（`mobile/`） |
+| 测试覆盖 | 390 个 Rust 单元测试（352 桌面端 pty / fs / config / hook / ssh / 中转客户端 + 38 中转服务端协议边界） |
 
 ## 快速开始
 
@@ -254,12 +266,19 @@ mini-term/
 │   │   ├── hook_registry.rs      # Hook 注册 / 卸载（Claude Code + Codex）
 │   │   ├── ssh.rs                # SSH 连接管理 + 密码自动填充 / 私钥处理
 │   │   ├── remote_ssh.rs         # SSH 远程项目（SFTP 列目录 / 目录验证 / 远程会话读取）
-│   │   └── ssh_mcp_registry.rs   # 按项目启用 SSH MCP（写入 .mcp.json / Codex 配置）
+│   │   ├── ssh_mcp_registry.rs   # 按项目启用 SSH MCP（写入 .mcp.json / Codex 配置）
+│   │   ├── mobile_relay.rs       # 移动端中转（出站 WSS 长连 / 配对 / 会话快照 / 指令写穿）
+│   │   └── mobile_mirror.rs      # 对话镜像（会话 JSONL 增量解析 + 分页取数）
 │   ├── mt-core/                  # 无 tauri 依赖的共享库 crate（SSH 类型 / 配置 / 私钥）
 │   ├── mt-ssh/                   # SSH 共享 crate（russh 持久会话池 + SFTP 原语，主程序与 sidecar 共用）
 │   └── mt-sidecars/src/bin/      # 独立 sidecar crate（不依赖 tauri-build）
 │       ├── miniterm-hook.rs      # Hook CLI 小工具（被 AI 工具 hook 调用）
 │       └── mt-ssh-mcp.rs         # SSH MCP server（rmcp stdio，供终端 AI agent 调用）
+├── relay-server/                 # 自托管中转服务（独立 Rust workspace）
+│   ├── protocol/                 # 桌面端与中转共享的协议消息 crate（JSON over WebSocket）
+│   ├── server/                   # axum 中转服务（只转发不落盘 + PWA 静态托管）
+│   └── docker-compose.yml        # 一条命令从源码构建启动
+├── mobile/                       # 移动端 PWA（React + TS + Vite，扫码配对 / 列表 / 镜像 / 指令）
 ├── scripts/
 │   └── stage-sidecars.mjs        # 构建 sidecar 并按 triple 就位为 Tauri externalBin
 └── package.json
@@ -280,8 +299,8 @@ ai-working → ai-idle → Toast + DONE Tag + requestUserAttention
 
 ### Tauri 接口一览
 
-- **Commands（55 个）** — PTY: `create_pty` · `write_pty` · `resize_pty` · `kill_pty`；FS: `list_directory` · `read_file_content` · `watch_directory` · `unwatch_directory` · `create_file` · `create_directory` · `rename_entry` · `delete_entry` · `filter_directories`；Search: `start_search` · `cancel_search`；Git: `get_git_status` · `get_git_diff` · `discover_git_repos` · `get_git_log` · `get_repo_branches` · `get_commit_files` · `get_commit_file_diff` · `git_pull` · `git_push` · `get_changes_status` · `git_stage` · `git_unstage` · `git_stage_all` · `git_unstage_all` · `git_commit` · `git_discard_file`；Config: `load_config` · `save_config`；Editor: `open_in_editor` · `open_path_with_default_app`；Clipboard: `read_clipboard_image` · `save_clipboard_text`；AI: `get_ai_sessions` · `get_wsl_ai_sessions` · `get_ai_session_content`；WSL: `list_wsl_distros`；Hook: `register_ai_hooks` · `unregister_ai_hooks` · `get_hook_config_snippet` · `get_hook_status` · `toggle_hook_server`；SSH: `arm_ssh_autofill` · `prepare_ssh_key`；SSH MCP: `enable_ssh_mcp` · `disable_ssh_mcp`；SSH 远程: `ssh_remote_list_directory` · `ssh_remote_validate_dir` · `ssh_remote_ai_sessions` · `ssh_remote_ai_session_content`；主题: `set_window_dark_mode`
-- **Events（后端 → 前端）** — `pty-output` · `pty-exit` · `pty-status-change` · `fs-change` · `search-results` · `search-complete`
+- **Commands（60 个）** — PTY: `create_pty` · `write_pty` · `resize_pty` · `kill_pty`；FS: `list_directory` · `read_file_content` · `watch_directory` · `unwatch_directory` · `create_file` · `create_directory` · `rename_entry` · `delete_entry` · `filter_directories`；Search: `start_search` · `cancel_search`；Git: `get_git_status` · `get_git_diff` · `discover_git_repos` · `get_git_log` · `get_repo_branches` · `get_commit_files` · `get_commit_file_diff` · `git_pull` · `git_push` · `get_changes_status` · `git_stage` · `git_unstage` · `git_stage_all` · `git_unstage_all` · `git_commit` · `git_discard_file`；Config: `load_config` · `save_config`；Editor: `open_in_editor` · `open_path_with_default_app`；Clipboard: `read_clipboard_image` · `save_clipboard_text`；AI: `get_ai_sessions` · `get_wsl_ai_sessions` · `get_ai_session_content`；WSL: `list_wsl_distros`；Hook: `register_ai_hooks` · `unregister_ai_hooks` · `get_hook_config_snippet` · `get_hook_status` · `toggle_hook_server`；SSH: `arm_ssh_autofill` · `prepare_ssh_key`；SSH MCP: `enable_ssh_mcp` · `disable_ssh_mcp`；SSH 远程: `ssh_remote_list_directory` · `ssh_remote_validate_dir` · `ssh_remote_ai_sessions` · `ssh_remote_ai_session_content`；主题: `set_window_dark_mode`；移动端中转: `mobile_relay_apply` · `mobile_relay_status` · `mobile_relay_request_pairing_code` · `mobile_relay_reset_pairing` · `mobile_relay_update_sessions`
+- **Events（后端 → 前端）** — `pty-output` · `pty-exit` · `pty-status-change` · `fs-change` · `search-results` · `search-complete` · `mobile-relay-status` · `mobile-relay-pairing-code`
 
 ### 状态优先级
 

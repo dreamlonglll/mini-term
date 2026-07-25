@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>A desktop terminal manager built for the AI era</strong><br>
-  Powered by Tauri v2 · Multi-project · Multi-tab · Split-pane layout · AI process awareness · SSH remote projects
+  Powered by Tauri v2 · Multi-project · Multi-tab · Split-pane layout · AI process awareness · SSH remote projects · Watch your AI from your phone
 </p>
 
 <p align="center">
@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.6.11-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.7.0-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -94,6 +94,17 @@ Mini-Term solves all of the above with one lightweight desktop app.
 - **WSL sessions** — Reads Claude / Codex session history inside WSL distros directly from Windows (no `wsl.exe` spawn — via `\\wsl$` UNC plus registry-based distro enumeration): WSL-rooted projects auto-derive the distro and path with zero configuration; Windows-path projects pick a distro via the right-click "WSL Sessions" submenu and are scanned through `/mnt` path mapping, with in-session cwd verification to prevent cross-project mixing; WSL sessions merge chronologically with local ones under a WSL badge, a header spinner shows while loading, and viewing session content is supported too.
 - **AI task markers** — Each time the user presses Enter inside an AI session, a marker is dropped in xterm; the ⚑ button at the tab's top-right drops down the list of past submissions, and clicking one or pressing `Ctrl+Shift+↑/↓` (macOS `⌘+Shift+↑/↓`) jumps between markers, briefly highlighting the target line.
 
+### Mobile Client + Self-Hosted Relay
+
+Watch the AI running on your desktop from your phone while you're out, and send it commands directly. The desktop only dials out (an outbound long-lived connection), so no public IP, no NAT traversal, and no ports opened on your router.
+
+- **Connect and pair in one place** — Fill in the relay address in the top-bar "Mobile" panel → save & connect → generate a pairing QR code, all in a single panel. Scanning with your phone camera opens the PWA and pairs automatically; the code is single-use (valid for 10 minutes), pairing a new device replaces the old one, and "Reset pairing" revokes every credential instantly.
+- **Active AI session list** — The phone shows running Claude / Codex sessions grouped by project, with status lights that add, remove, and change color in real time alongside the desktop; when the desktop goes offline a top banner appears and the list greys out, clearing automatically on reconnect.
+- **Conversation mirror (read-only)** — Tap into any session to follow the conversation live, with AI replies rendered as Markdown and desktop input shown verbatim; scrolling to the top pages in older messages. Mirror binding resolves the session identity through hooks down to the exact pane, so multiple AI sessions running in the same project never cross-contaminate.
+- **Mobile commands** — The input box at the bottom of the mirror page writes text straight through to the corresponding desktop terminal (equivalent to typing it yourself and pressing Enter), with an immediate receipt and an explicit failure reason; when the desktop is offline the relay rejects the command outright rather than storing and forwarding it.
+- **The relay forwards, never persists** — The relay server stores no message bodies and logs metadata only (a subprocess-level automated test asserts zero file residue across the full flow); it ships with a three-stage Dockerfile and a compose example to build and run from source in one command — reverse proxy + TLS setup in the [deployment guide](docs/deploy-relay.md).
+- **PWA experience** — "Add to Home Screen" runs it as a standalone window, with exponential-backoff reconnection that automatically restores subscriptions, and the same bilingual (English / 中文) layer as the desktop app.
+
 ### Project Management
 
 - **Project list** — Manage multiple project directories in the left sidebar, switch workspaces in one click, and restore the last active project on restart.
@@ -143,7 +154,8 @@ Mini-Term solves all of the above with one lightweight desktop app.
 | Git | git2 0.19 |
 | File watching | notify 7 + ignore 0.4 (.gitignore filtering) |
 | Tauri plugins | `window-state` · `clipboard-manager` · `dialog` · `opener` |
-| Test coverage | 334 Rust unit tests (pty / fs / config / hook / ssh) |
+| Mobile relay | axum + tokio WebSocket relay service (`relay-server/`) · React + TS + Vite PWA (`mobile/`) |
+| Test coverage | 390 Rust unit tests (352 desktop — pty / fs / config / hook / ssh / relay client — plus 38 relay-server protocol boundary tests) |
 
 ## Getting Started
 
@@ -254,12 +266,19 @@ mini-term/
 │   │   ├── hook_registry.rs      # Hook register / unregister (Claude Code + Codex)
 │   │   ├── ssh.rs                # SSH connection management + password auto-fill / key handling
 │   │   ├── remote_ssh.rs         # SSH remote projects (SFTP dir listing / dir validation / remote session reading)
-│   │   └── ssh_mcp_registry.rs   # Per-project SSH MCP enablement (writes .mcp.json / Codex config)
+│   │   ├── ssh_mcp_registry.rs   # Per-project SSH MCP enablement (writes .mcp.json / Codex config)
+│   │   ├── mobile_relay.rs       # Mobile relay (outbound WSS link / pairing / session snapshots / command write-through)
+│   │   └── mobile_mirror.rs      # Conversation mirror (incremental session JSONL parsing + pagination)
 │   ├── mt-core/                  # Shared library crate without tauri deps (SSH types / config / keys)
 │   ├── mt-ssh/                   # Shared SSH crate (persistent russh session pool + SFTP primitives, used by both the app and sidecars)
 │   └── mt-sidecars/src/bin/      # Standalone sidecar crate (no tauri-build dependency)
 │       ├── miniterm-hook.rs      # Hook CLI tool (called by AI tool hooks)
 │       └── mt-ssh-mcp.rs         # SSH MCP server (rmcp stdio, for terminal AI agents)
+├── relay-server/                 # Self-hosted relay service (standalone Rust workspace)
+│   ├── protocol/                 # Protocol message crate shared by desktop and relay (JSON over WebSocket)
+│   ├── server/                   # axum relay service (forward-only, no persistence + PWA static hosting)
+│   └── docker-compose.yml        # Build and run from source in one command
+├── mobile/                       # Mobile PWA (React + TS + Vite — pairing / list / mirror / commands)
 ├── scripts/
 │   └── stage-sidecars.mjs        # Builds sidecars and stages them per-triple as Tauri externalBin
 └── package.json
@@ -280,8 +299,8 @@ ai-working → ai-idle → Toast + DONE Tag + requestUserAttention
 
 ### Tauri Interface Overview
 
-- **Commands (55)** — PTY: `create_pty` · `write_pty` · `resize_pty` · `kill_pty`; FS: `list_directory` · `read_file_content` · `watch_directory` · `unwatch_directory` · `create_file` · `create_directory` · `rename_entry` · `delete_entry` · `filter_directories`; Search: `start_search` · `cancel_search`; Git: `get_git_status` · `get_git_diff` · `discover_git_repos` · `get_git_log` · `get_repo_branches` · `get_commit_files` · `get_commit_file_diff` · `git_pull` · `git_push` · `get_changes_status` · `git_stage` · `git_unstage` · `git_stage_all` · `git_unstage_all` · `git_commit` · `git_discard_file`; Config: `load_config` · `save_config`; Editor: `open_in_editor` · `open_path_with_default_app`; Clipboard: `read_clipboard_image` · `save_clipboard_text`; AI: `get_ai_sessions` · `get_wsl_ai_sessions` · `get_ai_session_content`; WSL: `list_wsl_distros`; Hook: `register_ai_hooks` · `unregister_ai_hooks` · `get_hook_config_snippet` · `get_hook_status` · `toggle_hook_server`; SSH: `arm_ssh_autofill` · `prepare_ssh_key`; SSH MCP: `enable_ssh_mcp` · `disable_ssh_mcp`; SSH remote: `ssh_remote_list_directory` · `ssh_remote_validate_dir` · `ssh_remote_ai_sessions` · `ssh_remote_ai_session_content`; Theme: `set_window_dark_mode`
-- **Events (backend → frontend)** — `pty-output` · `pty-exit` · `pty-status-change` · `fs-change` · `search-results` · `search-complete`
+- **Commands (60)** — PTY: `create_pty` · `write_pty` · `resize_pty` · `kill_pty`; FS: `list_directory` · `read_file_content` · `watch_directory` · `unwatch_directory` · `create_file` · `create_directory` · `rename_entry` · `delete_entry` · `filter_directories`; Search: `start_search` · `cancel_search`; Git: `get_git_status` · `get_git_diff` · `discover_git_repos` · `get_git_log` · `get_repo_branches` · `get_commit_files` · `get_commit_file_diff` · `git_pull` · `git_push` · `get_changes_status` · `git_stage` · `git_unstage` · `git_stage_all` · `git_unstage_all` · `git_commit` · `git_discard_file`; Config: `load_config` · `save_config`; Editor: `open_in_editor` · `open_path_with_default_app`; Clipboard: `read_clipboard_image` · `save_clipboard_text`; AI: `get_ai_sessions` · `get_wsl_ai_sessions` · `get_ai_session_content`; WSL: `list_wsl_distros`; Hook: `register_ai_hooks` · `unregister_ai_hooks` · `get_hook_config_snippet` · `get_hook_status` · `toggle_hook_server`; SSH: `arm_ssh_autofill` · `prepare_ssh_key`; SSH MCP: `enable_ssh_mcp` · `disable_ssh_mcp`; SSH remote: `ssh_remote_list_directory` · `ssh_remote_validate_dir` · `ssh_remote_ai_sessions` · `ssh_remote_ai_session_content`; Theme: `set_window_dark_mode`; Mobile relay: `mobile_relay_apply` · `mobile_relay_status` · `mobile_relay_request_pairing_code` · `mobile_relay_reset_pairing` · `mobile_relay_update_sessions`
+- **Events (backend → frontend)** — `pty-output` · `pty-exit` · `pty-status-change` · `fs-change` · `search-results` · `search-complete` · `mobile-relay-status` · `mobile-relay-pairing-code`
 
 ### Status Priority
 
