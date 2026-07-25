@@ -556,13 +556,23 @@ async fn mirror_task(
     mut cancel_rx: watch::Receiver<bool>,
 ) {
     let manager = app.state::<MobileRelayManager>();
+    let pty_manager = app.state::<crate::pty::PtyManager>();
     let mut bound: Option<(PathBuf, MirrorParser, u64)> = None;
     let mut sent_initial = false;
 
     loop {
-        match mobile_mirror::resolve_session_file(&project_path) {
+        // 以 pane 里 AI 会话的启动时刻为下限过滤旧记录文件:新会话首条消息落盘前
+        // 项目内最新的文件属于上一次会话,不能绑。每轮重取,pane 的 PTY 可能后到。
+        let ai_started = manager
+            .pane_ptys
+            .lock()
+            .unwrap()
+            .get(&pane_id)
+            .copied()
+            .and_then(|pty_id| pty_manager.ai_session_started_at(pty_id));
+        match mobile_mirror::resolve_session_file(&project_path, ai_started) {
             None => {
-                // 会话文件尚未出现(AI 刚启动还没落盘):先给空快照,出现后再重发
+                // 属于本轮会话的文件尚未出现(AI 刚启动还没落盘):先给空快照,出现后再重发
                 if !sent_initial {
                     sent_initial = true;
                     let _ = manager.send(DesktopToRelay::MirrorSnapshot {

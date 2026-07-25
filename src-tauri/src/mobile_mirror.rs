@@ -7,7 +7,9 @@
 //! 覆盖不了后者;1s 轮询两种情况一并处理,订阅通常只有一个,代价可忽略。
 //!
 //! v1 限制:仅本机(Windows 宿主)来源的会话记录;同一项目多个 AI pane 时
-//! 共同镜像最新会话(无法从 PTY 反查具体 session 文件)。
+//! 共同镜像最新会话(无法从 PTY 反查具体 session 文件)。绑定以 pane 里
+//! AI 启动时刻为下限过滤旧文件——新会话未落盘时(首条消息前)给空镜像,
+//! 而不是错绑上一次会话的记录。
 
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
@@ -162,10 +164,27 @@ fn newest_codex_file(project_path: &str) -> Option<(PathBuf, SystemTime)> {
     None
 }
 
+/// 丢弃早于 `min_mtime` 的候选:候选取的是项目内 mtime 最大者,它若早于锚点,
+/// 项目里就不存在属于本轮会话的文件。锚点为 None(无法确定启动时刻)时不过滤。
+fn fresh_since(
+    candidate: Option<(PathBuf, SystemTime)>,
+    min_mtime: Option<SystemTime>,
+) -> Option<(PathBuf, SystemTime)> {
+    match (candidate, min_mtime) {
+        (Some((_, t)), Some(min)) if t < min => None,
+        (candidate, _) => candidate,
+    }
+}
+
 /// 解析 pane 所属项目当前应镜像的会话文件:Claude 与 Codex 里最新修改的那个。
-pub fn resolve_session_file(project_path: &str) -> Option<(PathBuf, MirrorAgent)> {
-    let claude = newest_claude_file(project_path);
-    let codex = newest_codex_file(project_path);
+/// `min_mtime` 是本轮 AI 会话的启动时刻:更早的文件属于以前的会话,一律不绑,
+/// 宁可先给空镜像等新会话落盘(代价:`--resume` 恢复的旧记录在下一条消息前不显示)。
+pub fn resolve_session_file(
+    project_path: &str,
+    min_mtime: Option<SystemTime>,
+) -> Option<(PathBuf, MirrorAgent)> {
+    let claude = fresh_since(newest_claude_file(project_path), min_mtime);
+    let codex = fresh_since(newest_codex_file(project_path), min_mtime);
     match (claude, codex) {
         (Some((cp, ct)), Some((xp, xt))) => {
             if ct >= xt {
@@ -313,6 +332,24 @@ mod tests {
         let (empty, has_more) = history_slice(&msgs, Some(0), MIRROR_PAGE_SIZE);
         assert!(empty.is_empty());
         assert!(!has_more);
+    }
+
+    #[test]
+    fn fresh_since_filters_files_older_than_session_start() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let old = UNIX_EPOCH + Duration::from_secs(1_000);
+        let start = UNIX_EPOCH + Duration::from_secs(2_000);
+        let new = UNIX_EPOCH + Duration::from_secs(3_000);
+        let file = || PathBuf::from("s.jsonl");
+
+        // 早于会话启动的旧文件不绑定(新会话首条消息前应显示空镜像)
+        assert!(fresh_since(Some((file(), old)), Some(start)).is_none());
+        // 会话启动后落盘的文件正常绑定;恰好等于锚点时刻也算本轮
+        assert!(fresh_since(Some((file(), new)), Some(start)).is_some());
+        assert!(fresh_since(Some((file(), start)), Some(start)).is_some());
+        // 无锚点(无法确定启动时刻)不过滤,退回原行为
+        assert!(fresh_since(Some((file(), old)), None).is_some());
+        assert!(fresh_since(None, Some(start)).is_none());
     }
 
     #[test]
