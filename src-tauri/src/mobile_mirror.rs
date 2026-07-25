@@ -6,10 +6,11 @@
 //! 镜像除了"文件长大"还要发现"更新的会话文件出现"(换绑),对单文件挂 notify
 //! 覆盖不了后者;1s 轮询两种情况一并处理,订阅通常只有一个,代价可忽略。
 //!
-//! v1 限制:仅本机(Windows 宿主)来源的会话记录;同一项目多个 AI pane 时
-//! 共同镜像最新会话(无法从 PTY 反查具体 session 文件)。绑定以 pane 里
-//! AI 启动时刻为下限过滤旧文件——新会话未落盘时(首条消息前)给空镜像,
-//! 而不是错绑上一次会话的记录。
+//! 绑定策略分两层:hook 上报过会话身份(pty→session_id)时精确绑定该会话的
+//! 文件,同项目多个 AI pane 各绑各的会话;未启用 hook 时退回"项目最新文件 +
+//! AI 启动时刻下限"启发式(此路径保留 v1 限制:多 pane 共同镜像最新会话)。
+//! 两层都保证:本轮会话未落盘时(首条消息前)给空镜像,不错绑别的会话。
+//! v1 限制:仅本机(Windows 宿主)来源的会话记录。
 
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
@@ -199,6 +200,68 @@ pub fn resolve_session_file(
     }
 }
 
+/// session_id 应为 UUID 形态;拒绝任何可构成路径穿越的字符——hook 端口对
+/// 本机所有进程开放,上报的 session_id 不可未经校验直接拼文件路径。
+fn valid_session_id(id: &str) -> bool {
+    !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// 在给定目录列表中定位 `<session_id>.jsonl`(Claude 会话文件名即 session id)。
+fn claude_session_file_in(dirs: &[PathBuf], session_id: &str) -> Option<PathBuf> {
+    dirs.iter()
+        .map(|dir| dir.join(format!("{session_id}.jsonl")))
+        .find(|p| p.is_file())
+}
+
+/// 在 Codex sessions 目录中按头部 session_meta 的 id 定位会话文件
+/// (文件名不含 session id,须读 meta;限扫描量同 newest_codex_file)。
+fn codex_session_file_in(sessions_dir: &Path, session_id: &str) -> Option<PathBuf> {
+    const MAX_SCAN: usize = 30;
+    if !sessions_dir.exists() {
+        return None;
+    }
+    let mut paths = Vec::new();
+    ai_sessions::collect_codex_session_paths(sessions_dir, &mut paths);
+    ai_sessions::sort_newest_session_paths(&mut paths, MAX_SCAN);
+    for path in paths {
+        let Ok(file) = fs::File::open(&path) else {
+            continue;
+        };
+        use std::io::BufRead;
+        let reader = std::io::BufReader::new(file);
+        for line in reader.lines().take(5) {
+            let Ok(line) = line else { continue };
+            if let Some(meta) = ai_sessions::codex_meta_from_line(&line) {
+                if meta.id == session_id {
+                    return Some(path);
+                }
+                break;
+            }
+        }
+    }
+    None
+}
+
+/// 按 hook 上报的会话身份精确定位记录文件——同项目多个 AI pane 各绑各的
+/// 会话,不再共同镜像"项目最新"。文件尚未落盘(首条消息前)返回 None。
+pub fn resolve_session_file_by_id(
+    project_path: &str,
+    agent: Option<&str>,
+    session_id: &str,
+) -> Option<(PathBuf, MirrorAgent)> {
+    if !valid_session_id(session_id) {
+        return None;
+    }
+    let is_codex = agent.is_some_and(|a| a.to_ascii_lowercase().contains("codex"));
+    if is_codex {
+        let sessions_dir = dirs::home_dir()?.join(".codex").join("sessions");
+        codex_session_file_in(&sessions_dir, session_id).map(|p| (p, MirrorAgent::Codex))
+    } else {
+        let dirs = ai_sessions::find_claude_project_dirs(project_path);
+        claude_session_file_in(&dirs, session_id).map(|p| (p, MirrorAgent::Claude))
+    }
+}
+
 /// 从 `offset` 读到文件尾。返回 (新字节, 新 offset);文件比 offset 短(被截断/重写)
 /// 返回 None,调用方应重新绑定。
 pub fn read_from_offset(path: &Path, offset: u64) -> Option<(Vec<u8>, u64)> {
@@ -332,6 +395,67 @@ mod tests {
         let (empty, has_more) = history_slice(&msgs, Some(0), MIRROR_PAGE_SIZE);
         assert!(empty.is_empty());
         assert!(!has_more);
+    }
+
+    #[test]
+    fn valid_session_id_rejects_path_traversal() {
+        assert!(valid_session_id("0198c2f4-7e4a-7b3c-9d2e-1f0a2b3c4d5e"));
+        assert!(valid_session_id("abc123"));
+        assert!(!valid_session_id(""));
+        assert!(!valid_session_id("../../etc/passwd"));
+        assert!(!valid_session_id("a/b"));
+        assert!(!valid_session_id("a\\b"));
+        assert!(!valid_session_id("a.b"));
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "mt-mirror-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn claude_session_file_found_by_exact_name() {
+        let d1 = temp_dir("claude-a");
+        let d2 = temp_dir("claude-b");
+        fs::write(d2.join("sid-42.jsonl"), b"{}\n").unwrap();
+
+        let dirs = vec![d1.clone(), d2.clone()];
+        // 命中:文件在第二个候选目录里
+        assert_eq!(
+            claude_session_file_in(&dirs, "sid-42"),
+            Some(d2.join("sid-42.jsonl"))
+        );
+        // 未落盘:返回 None(镜像给空快照,不退回项目最新文件)
+        assert!(claude_session_file_in(&dirs, "sid-other").is_none());
+
+        fs::remove_dir_all(&d1).ok();
+        fs::remove_dir_all(&d2).ok();
+    }
+
+    #[test]
+    fn codex_session_file_found_by_meta_id() {
+        let root = temp_dir("codex");
+        let day = root.join("2026").join("07").join("25");
+        fs::create_dir_all(&day).unwrap();
+        let meta =
+            |id: &str| format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":\"D:\\\\proj\"}}}}\n");
+        fs::write(day.join("rollout-1.jsonl"), meta("sid-first")).unwrap();
+        fs::write(day.join("rollout-2.jsonl"), meta("sid-second")).unwrap();
+
+        assert_eq!(
+            codex_session_file_in(&root, "sid-first"),
+            Some(day.join("rollout-1.jsonl"))
+        );
+        assert!(codex_session_file_in(&root, "sid-missing").is_none());
+
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]

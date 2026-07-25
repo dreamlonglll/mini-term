@@ -557,20 +557,28 @@ async fn mirror_task(
 ) {
     let manager = app.state::<MobileRelayManager>();
     let pty_manager = app.state::<crate::pty::PtyManager>();
+    let hook_state = app.state::<crate::hook_server::HookState>();
     let mut bound: Option<(PathBuf, MirrorParser, u64)> = None;
     let mut sent_initial = false;
 
     loop {
-        // 以 pane 里 AI 会话的启动时刻为下限过滤旧记录文件:新会话首条消息落盘前
-        // 项目内最新的文件属于上一次会话,不能绑。每轮重取,pane 的 PTY 可能后到。
-        let ai_started = manager
-            .pane_ptys
-            .lock()
-            .unwrap()
-            .get(&pane_id)
-            .copied()
-            .and_then(|pty_id| pty_manager.ai_session_started_at(pty_id));
-        match mobile_mirror::resolve_session_file(&project_path, ai_started) {
+        // 绑定分两层,每轮重取(PTY 映射、hook 上报都可能后到):
+        // 1. hook 上报过会话身份 → 只认该会话的文件,未落盘就等(空镜像),
+        //    不退启发式——退了就会串到同项目其他 pane 的会话;
+        // 2. 无会话身份(未启用 hook)→ 退回"项目最新文件 + AI 启动时刻下限"启发式。
+        let pty_id = manager.pane_ptys.lock().unwrap().get(&pane_id).copied();
+        let resolved = match pty_id.and_then(|id| hook_state.session_of(id)) {
+            Some(s) => mobile_mirror::resolve_session_file_by_id(
+                &project_path,
+                s.agent.as_deref(),
+                &s.session_id,
+            ),
+            None => {
+                let ai_started = pty_id.and_then(|id| pty_manager.ai_session_started_at(id));
+                mobile_mirror::resolve_session_file(&project_path, ai_started)
+            }
+        };
+        match resolved {
             None => {
                 // 属于本轮会话的文件尚未出现(AI 刚启动还没落盘):先给空快照,出现后再重发
                 if !sent_initial {

@@ -40,11 +40,22 @@ pub struct HookStatusInfo {
     pub running: bool,
 }
 
+/// pane 内 AI 会话的精确身份（hook 上报）。对话镜像用它把 pane 绑到
+/// 确切的会话记录文件，避免同项目多 pane 串台。
+#[derive(Debug, Clone)]
+pub struct HookSessionId {
+    /// 来源 agent（claude-code / codex），缺省按 Claude 处理
+    pub agent: Option<String>,
+    pub session_id: String,
+}
+
 /// Hook 状态管理器，记录每个 PTY 的最后 hook 事件时间和状态
 #[derive(Clone)]
 pub struct HookState {
     last_hook_time: Arc<Mutex<HashMap<u32, Instant>>>,
     last_hook_status: Arc<Mutex<HashMap<u32, String>>>,
+    /// pty → 当前会话身份；/clear 等换会话时随下一个 hook 事件自动刷新
+    last_session: Arc<Mutex<HashMap<u32, HookSessionId>>>,
     /// 记录哪些 PTY 曾经收到过 hook 事件（一旦标记，永不降级回轮询）
     hook_enabled: Arc<Mutex<std::collections::HashSet<u32>>>,
     port: Arc<Mutex<u16>>,
@@ -57,6 +68,7 @@ impl HookState {
         Self {
             last_hook_time: Arc::new(Mutex::new(HashMap::new())),
             last_hook_status: Arc::new(Mutex::new(HashMap::new())),
+            last_session: Arc::new(Mutex::new(HashMap::new())),
             hook_enabled: Arc::new(Mutex::new(std::collections::HashSet::new())),
             port: Arc::new(Mutex::new(0)),
             server: Arc::new(Mutex::new(None)),
@@ -75,6 +87,19 @@ impl HookState {
         self.last_hook_status.lock().unwrap().get(&pty_id).cloned()
     }
 
+    /// 当前会话身份;从未收到带 session_id 的事件时返回 None
+    pub fn session_of(&self, pty_id: u32) -> Option<HookSessionId> {
+        self.last_session.lock().unwrap().get(&pty_id).cloned()
+    }
+
+    /// 记录 hook 上报的会话身份(每个事件都带,直接覆盖即可)
+    fn record_session(&self, pty_id: u32, agent: Option<String>, session_id: String) {
+        self.last_session
+            .lock()
+            .unwrap()
+            .insert(pty_id, HookSessionId { agent, session_id });
+    }
+
     /// 更新指定 PTY 的 hook 状态
     fn update(&self, pty_id: u32, status: String) {
         self.hook_enabled.lock().unwrap().insert(pty_id);
@@ -90,6 +115,7 @@ impl HookState {
         self.hook_enabled.lock().unwrap().remove(&pty_id);
         self.last_hook_time.lock().unwrap().remove(&pty_id);
         self.last_hook_status.lock().unwrap().remove(&pty_id);
+        self.last_session.lock().unwrap().remove(&pty_id);
     }
 
     /// 获取当前服务器端口
@@ -244,22 +270,29 @@ pub fn start_hook_server(app: AppHandle, hook_state: HookState) -> Result<(), St
                         "[hook-server] pty_id={} event=SessionEnd -> hook 已清除，回退到 idle",
                         pty_id
                     );
-                } else if let Some(status) = map_event_to_status(event, payload.agent.as_deref()) {
-                    hook_state.update(pty_id, status.to_string());
+                } else {
+                    // 会话身份先于状态映射记录:即使事件不映射状态(如未知事件),
+                    // session_id 也是有效信息;/clear 换会话时靠这里自动刷新
+                    if let Some(sid) = payload.session_id.clone() {
+                        hook_state.record_session(pty_id, payload.agent.clone(), sid);
+                    }
+                    if let Some(status) = map_event_to_status(event, payload.agent.as_deref()) {
+                        hook_state.update(pty_id, status.to_string());
 
-                    // 通过 Tauri event 通知前端（复用现有 pty-status-change 事件）
-                    let _ = app.emit(
-                        "pty-status-change",
-                        PtyStatusChangePayload {
-                            pty_id,
-                            status: status.to_string(),
-                        },
-                    );
+                        // 通过 Tauri event 通知前端（复用现有 pty-status-change 事件）
+                        let _ = app.emit(
+                            "pty-status-change",
+                            PtyStatusChangePayload {
+                                pty_id,
+                                status: status.to_string(),
+                            },
+                        );
 
-                    eprintln!(
-                        "[hook-server] pty_id={} event={} -> status={}",
-                        pty_id, event, status
-                    );
+                        eprintln!(
+                            "[hook-server] pty_id={} event={} -> status={}",
+                            pty_id, event, status
+                        );
+                    }
                 }
             }
         }
@@ -331,6 +364,25 @@ fn delete_port_file(app: &AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hook_state_records_and_clears_session_identity() {
+        let state = HookState::new();
+        assert!(state.session_of(1).is_none());
+
+        state.record_session(1, Some("claude-code".into()), "sid-a".into());
+        let s = state.session_of(1).unwrap();
+        assert_eq!(s.session_id, "sid-a");
+        assert_eq!(s.agent.as_deref(), Some("claude-code"));
+
+        // /clear 换会话:同 pty 覆盖为新 id
+        state.record_session(1, Some("claude-code".into()), "sid-b".into());
+        assert_eq!(state.session_of(1).unwrap().session_id, "sid-b");
+
+        // SessionEnd / PTY 关闭走 remove:会话身份一并清除
+        state.remove(1);
+        assert!(state.session_of(1).is_none());
+    }
 
     #[test]
     fn codex_permission_request_maps_to_ai_working() {
