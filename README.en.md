@@ -96,7 +96,7 @@ Mini-Term solves all of the above with one lightweight desktop app.
 
 Watch the AI running on your desktop from your phone while you're out, and send it commands directly.
 
-**Prerequisite**: you need your own publicly reachable server to run the relay (1 vCPU / 1 GB is plenty, one Docker command to start, plus a domain pointed at it for TLS — see the [deployment guide](docs/deploy-relay.md)). What you get in return is that **your own machine only ever dials out** (an outbound long-lived connection) — no public IP, no NAT traversal, and no ports opened on your router.
+**Prerequisite**: you need your own publicly reachable server to run the relay (1 vCPU / 1 GB is plenty, one Docker command to start, plus a domain pointed at it for TLS — see the [deployment guide](docs/deploy-relay.md)).
 
 - **Connect and pair in one place** — Fill in the relay address in the top-bar "Mobile" panel → save & connect → generate a pairing QR code, all in a single panel. Scanning with your phone camera opens the PWA and pairs automatically; the code is single-use (valid for 10 minutes), pairing a new device replaces the old one, and "Reset pairing" revokes every credential instantly.
 - **Active AI session list** — The phone shows running Claude / Codex sessions grouped by project, with status lights that add, remove, and change color in real time alongside the desktop; when the desktop goes offline a top banner appears and the list greys out, clearing automatically on reconnect.
