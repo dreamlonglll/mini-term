@@ -35,8 +35,6 @@ Mini-Term solves all of the above with one lightweight desktop app.
 ## Preview
 
 ![Main UI](docs/screenshots/main.png)
-![Settings UI](docs/screenshots/settings.png)
-
 
 ## Features
 
@@ -155,7 +153,7 @@ Watch the AI running on your desktop from your phone while you're out, and send 
 | File watching | notify 7 + ignore 0.4 (.gitignore filtering) |
 | Tauri plugins | `window-state` · `clipboard-manager` · `dialog` · `opener` |
 | Mobile relay | axum + tokio WebSocket relay service (`relay-server/`) · React + TS + Vite PWA (`mobile/`) |
-| Test coverage | 390 Rust unit tests (352 desktop — pty / fs / config / hook / ssh / relay client — plus 38 relay-server protocol boundary tests) |
+| Test coverage | 390 Rust tests = 352 desktop (tauri-app 248 + mt-core 38 + mt-ssh 26 + mt-sidecars 40) + 38 relay-server (protocol & routing); plus 11 Node tests |
 
 ## Getting Started
 
@@ -183,8 +181,8 @@ After that it launches normally on double-click. You'll need to run it again aft
 
 #### Prerequisites
 
-- [Node.js](https://nodejs.org/) >= 18
-- [Rust](https://www.rust-lang.org/tools/install) >= 1.70
+- [Node.js](https://nodejs.org/) >= 20.19 (or >= 22.12) — required by Vite 7's `engines`; CI runs Node 22
+- [Rust](https://www.rust-lang.org/tools/install) >= 1.85 — set by russh 0.61 (Tauri v2 itself only needs 1.77.2)
 - [Tauri v2 CLI](https://v2.tauri.app/start/prerequisites/)
 
 #### Install & Run
@@ -209,13 +207,16 @@ npm run tauri build
 ```
 mini-term/
 ├── src/                          # Frontend source
-│   ├── App.tsx                   # Three-column main layout entry + window events
+│   ├── App.tsx                   # Main layout entry (ActivityBar + 2-column Allotment + drawer) + window events
 │   ├── store.ts                  # Zustand global state + persistence
 │   ├── types.ts                  # Type definitions (Pane / Tab / Project / SplitNode ...)
 │   ├── styles.css                # Global styles + CSS variables (Warm Carbon)
 │   ├── components/
+│   │   ├── ActivityBar.tsx       # Far-left persistent icon rail (panel toggles + AI status badge)
+│   │   ├── RightDrawer.tsx       # Floating drawer sliding in from the right (Sessions / Git)
 │   │   ├── ProjectList.tsx       # Project list + nested groups + DONE badge
 │   │   ├── AddRemoteProjectModal.tsx # Add SSH remote project dialog (connection pick + remote path validation)
+│   │   ├── ProjectEnvVarsModal.tsx   # Per-project environment variables dialog (POSIX validation)
 │   │   ├── SessionList.tsx       # AI session history list (Claude / Codex)
 │   │   ├── FileTree.tsx          # File directory tree + Git status + create / rename
 │   │   ├── TerminalArea.tsx      # Tab management + split-tree operations
@@ -231,9 +232,13 @@ mini-term/
 │   │   ├── SearchModal.tsx       # Global file search dialog
 │   │   ├── FileViewerModal.tsx   # File content viewer
 │   │   ├── SessionViewerModal.tsx # AI session content viewer (Markdown rendering)
+│   │   ├── SshModal.tsx          # SSH connection manager (groups + connection CRUD)
+│   │   ├── SshAssocModal.tsx     # Per-project SSH association (enables MCP, scopes visibility)
+│   │   ├── MobileRelayModal.tsx  # "Mobile" panel (relay address / connection status / pairing QR)
+│   │   ├── RelayStatusBadge.tsx  # Relay connection status badge
 │   │   ├── SettingsModal.tsx     # Settings dialog (theme / font / shell / AI notify / hook)
+│   │   ├── LanguageToggle.tsx    # Chinese / English switcher
 │   │   ├── ToastContainer.tsx    # AI completion toast notifications
-│   │   ├── ActivityBar.tsx       # Activity Bar sidebar (panel visibility + AI status badge)
 │   │   ├── DoneTag.tsx           # Project list DONE badge
 │   │   └── StatusDot.tsx         # Status indicator dot
 │   ├── hooks/
@@ -241,25 +246,32 @@ mini-term/
 │   │   ├── useAiSubmitMarker.ts  # AI session Enter marker
 │   │   ├── useExternalFileDrop.ts # System explorer file drop onto terminal
 │   │   └── useMarkerHotkeys.ts   # Marker-jump shortcuts
-│   └── utils/
+│   ├── i18n/                     # In-house lightweight i18n (locales/<ns>.ts dictionaries + useT())
+│   └── utils/                    # Excerpt below; 24 files in total
 │       ├── contextMenu.ts        # Context menu DOM implementation
-│       ├── dragState.ts          # Project tree drag state
-│       ├── fileDragState.ts      # File-drop-onto-terminal state management
+│       ├── terminalCache.ts      # xterm cache + copy/paste + long-text / image paste
+│       ├── terminalSnapshot.ts   # Terminal content snapshots (for layout restore)
 │       ├── projectTree.ts        # Recursive project tree operations
-│       ├── terminalCache.ts      # xterm cache + copy/paste
 │       ├── projectDataCache.ts   # FileTree / GitHistory per-project data cache
+│       ├── projectEnv.ts         # Per-project environment variable validation
 │       ├── remoteProject.ts      # SSH remote project helpers (detection / broken-link check / remote PTY creation)
+│       ├── wslPath.ts            # WSL UNC path parsing and display
+│       ├── mobileSessionSync.ts  # Pushes active AI session snapshots to the relay
+│       ├── ptyWriteQueue.ts      # PTY write queue (chunked large pastes)
 │       ├── themeManager.ts       # Theme switching + system color watching
 │       └── updateChecker.ts      # GitHub Release version check
 ├── src-tauri/                    # Rust backend (Tauri app + shared crate + sidecars)
 │   ├── src/
 │   │   ├── lib.rs                # Tauri init + command / plugin registration
 │   │   ├── pty.rs                # PTY lifecycle + AI session detection
+│   │   ├── conpty_bootstrap.rs   # Preloads the bundled Windows ConPTY runtime (falls back to system ConPTY)
 │   │   ├── process_monitor.rs    # Child process status polling (500ms) + hook-first
 │   │   ├── config.rs             # Config persistence + version migration
 │   │   ├── fs.rs                 # Directory list / watch / create / rename / delete
 │   │   ├── git.rs                # Git operations (status / diff / log / pull / push)
 │   │   ├── search.rs             # Global file search (filename + content, streaming)
+│   │   ├── clipboard.rs          # Clipboard image reading + long-text spill to temp file
+│   │   ├── editor.rs             # Open in external editor / system default app
 │   │   ├── ai_sessions.rs        # Claude / Codex session record reading (local + WSL UNC)
 │   │   ├── wsl_distros.rs        # WSL distro enumeration (registry Lxss, no wsl.exe spawn)
 │   │   ├── hook_server.rs        # Hook HTTP server (receives AI tool events)
@@ -268,7 +280,9 @@ mini-term/
 │   │   ├── remote_ssh.rs         # SSH remote projects (SFTP dir listing / dir validation / remote session reading)
 │   │   ├── ssh_mcp_registry.rs   # Per-project SSH MCP enablement (writes .mcp.json / Codex config)
 │   │   ├── mobile_relay.rs       # Mobile relay (outbound WSS link / pairing / session snapshots / command write-through)
-│   │   └── mobile_mirror.rs      # Conversation mirror (incremental session JSONL parsing + pagination)
+│   │   ├── mobile_mirror.rs      # Conversation mirror (incremental session JSONL parsing + pagination)
+│   │   ├── window_theme.rs       # Native Windows title bar dark mode (DWM Immersive Dark Mode)
+│   │   └── window_input_recovery.rs # Recovery from stuck window input focus
 │   ├── mt-core/                  # Shared library crate without tauri deps (SSH types / config / keys)
 │   ├── mt-ssh/                   # Shared SSH crate (persistent russh session pool + SFTP primitives, used by both the app and sidecars)
 │   └── mt-sidecars/src/bin/      # Standalone sidecar crate (no tauri-build dependency)
@@ -280,7 +294,9 @@ mini-term/
 │   └── docker-compose.yml        # Build and run from source in one command
 ├── mobile/                       # Mobile PWA (React + TS + Vite — pairing / list / mirror / commands)
 ├── scripts/
-│   └── stage-sidecars.mjs        # Builds sidecars and stages them per-triple as Tauri externalBin
+│   ├── stage-sidecars.mjs        # Builds sidecars and stages them per-triple as Tauri externalBin
+│   └── stage-conpty.mjs          # Downloads, verifies and stages the pinned ConPTY runtime (Windows)
+├── tests/                        # Node-side tests (11: ConPTY bundling / TUI scrollback / layout restore / theme compat ...)
 └── package.json
 ```
 
@@ -300,7 +316,7 @@ ai-working → ai-idle → Toast + DONE Tag + requestUserAttention
 ### Tauri Interface Overview
 
 - **Commands (60)** — PTY: `create_pty` · `write_pty` · `resize_pty` · `kill_pty`; FS: `list_directory` · `read_file_content` · `watch_directory` · `unwatch_directory` · `create_file` · `create_directory` · `rename_entry` · `delete_entry` · `filter_directories`; Search: `start_search` · `cancel_search`; Git: `get_git_status` · `get_git_diff` · `discover_git_repos` · `get_git_log` · `get_repo_branches` · `get_commit_files` · `get_commit_file_diff` · `git_pull` · `git_push` · `get_changes_status` · `git_stage` · `git_unstage` · `git_stage_all` · `git_unstage_all` · `git_commit` · `git_discard_file`; Config: `load_config` · `save_config`; Editor: `open_in_editor` · `open_path_with_default_app`; Clipboard: `read_clipboard_image` · `save_clipboard_text`; AI: `get_ai_sessions` · `get_wsl_ai_sessions` · `get_ai_session_content`; WSL: `list_wsl_distros`; Hook: `register_ai_hooks` · `unregister_ai_hooks` · `get_hook_config_snippet` · `get_hook_status` · `toggle_hook_server`; SSH: `arm_ssh_autofill` · `prepare_ssh_key`; SSH MCP: `enable_ssh_mcp` · `disable_ssh_mcp`; SSH remote: `ssh_remote_list_directory` · `ssh_remote_validate_dir` · `ssh_remote_ai_sessions` · `ssh_remote_ai_session_content`; Theme: `set_window_dark_mode`; Mobile relay: `mobile_relay_apply` · `mobile_relay_status` · `mobile_relay_request_pairing_code` · `mobile_relay_reset_pairing` · `mobile_relay_update_sessions`
-- **Events (backend → frontend)** — `pty-output` · `pty-exit` · `pty-status-change` · `fs-change` · `search-results` · `search-complete` · `mobile-relay-status` · `mobile-relay-pairing-code`
+- **Events (9, backend → frontend)** — `pty-output` · `pty-exit` · `pty-status-change` · `ai-user-submit` (user pressed Enter inside an AI session; drives marker placement) · `fs-change` · `search-results` · `search-complete` · `mobile-relay-status` · `mobile-relay-pairing-code`
 
 ### Status Priority
 
@@ -314,17 +330,20 @@ error > ai-working > ai-idle > idle
 
 ```
 App
-├── ActivityBar (persistent far-left, panel visibility toggles + AI status badge)
-├── Allotment three columns
-│   ├── Left: ProjectList (projects + groups + sessions + DONE badge)
-│   ├── Middle: FileTree (directory browsing + Git status + file operations)
-│   └── Right
-    ├── TabBar (tab management)
-    ├── SplitLayout (recursive SplitNode tree)
-    │   └── TerminalInstance × N (xterm.js + context menu)
-    └── GitHistory (repo tree + commit history + Pull/Push)
+├── ActivityBar (persistent far-left icon rail: collapse middle column / Sessions / Git /
+│               Settings / SSH / Mobile + AI status badge)
+└── Allotment, two columns (draggable, ratios persisted)
+    ├── Middle column (collapsible as a whole · split vertically)
+    │   ├── Top:    ProjectList (projects + nested groups + DONE badge)
+    │   └── Bottom: FileTree (directory browsing + Git status + file operations)
+    └── Right column: TerminalArea × N (one per project, only the active one display:block)
+        ├── TabBar (tab management + ⚑ marker dropdown)
+        └── SplitLayout (recursive SplitNode tree)
+            └── TerminalInstance × N (xterm.js + context menu)
 
-ToastContainer floats at the bottom-right; SettingsModal overlays globally.
+RightDrawer slides in from the right edge and floats above the terminal (Sessions / Git,
+mutually exclusive, left edge draggable to resize, width persisted).
+ToastContainer floats at the bottom-right; SettingsModal / SshModal / MobileRelayModal overlay globally.
 ```
 
 ## Recommended Dev Environment
@@ -338,11 +357,25 @@ Issues and PRs are welcome. External contributions are merged after functional v
 Before submitting, please run:
 
 ```bash
-# Frontend type check
+# Frontend type check (tsc + vite build)
 npm run build
 
-# Rust tests & build
-cd src-tauri && cargo test && cargo build
+# Node-side tests (11)
+node --test "tests/*.test.cjs"
+
+# Desktop Rust tests (352)
+# Note: mt-core / mt-ssh / mt-sidecars are standalone crates, not workspace members.
+# Running `cd src-tauri && cargo test` alone only covers tauri-app's 248 — the other
+# three need their manifests specified explicitly.
+cd src-tauri
+cargo test                                        # tauri-app     248
+cargo test --manifest-path mt-core/Cargo.toml     # mt-core        38
+cargo test --manifest-path mt-ssh/Cargo.toml      # mt-ssh         26
+cargo test --manifest-path mt-sidecars/Cargo.toml # mt-sidecars    40
+cargo build
+
+# Relay server tests (38, standalone workspace)
+cd ../relay-server && cargo test
 ```
 
 ## Community

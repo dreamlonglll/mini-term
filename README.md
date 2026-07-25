@@ -35,8 +35,6 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 ## 预览
 
 ![主界面](docs/screenshots/main.png)
-![设置界面](docs/screenshots/settings.png)
-
 
 ## 功能特性
 
@@ -155,7 +153,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 | 文件监听 | notify 7 + ignore 0.4（.gitignore 过滤） |
 | Tauri 插件 | `window-state` · `clipboard-manager` · `dialog` · `opener` |
 | 移动端中转 | axum + tokio WebSocket 中转服务（`relay-server/`）· React + TS + Vite PWA（`mobile/`） |
-| 测试覆盖 | 390 个 Rust 单元测试（352 桌面端 pty / fs / config / hook / ssh / 中转客户端 + 38 中转服务端协议边界） |
+| 测试覆盖 | 390 个 Rust 测试 = 桌面端 352（tauri-app 248 + mt-core 38 + mt-ssh 26 + mt-sidecars 40）+ 中转服务端 38（协议与路由）；另有 11 个 Node 测试 |
 
 ## 快速开始
 
@@ -183,8 +181,8 @@ xattr -cr /Applications/Mini-Term.app
 
 #### 前置条件
 
-- [Node.js](https://nodejs.org/) >= 18
-- [Rust](https://www.rust-lang.org/tools/install) >= 1.70
+- [Node.js](https://nodejs.org/) >= 20.19（或 >= 22.12）—— Vite 7 的 engines 要求，CI 使用 Node 22
+- [Rust](https://www.rust-lang.org/tools/install) >= 1.85 —— 由 russh 0.61 决定（Tauri v2 自身只要求 1.77.2）
 - [Tauri v2 CLI](https://v2.tauri.app/start/prerequisites/)
 
 #### 安装与运行
@@ -209,13 +207,16 @@ npm run tauri build
 ```
 mini-term/
 ├── src/                          # 前端源码
-│   ├── App.tsx                   # 三栏主布局入口 + 窗口事件
+│   ├── App.tsx                   # 主布局入口（ActivityBar + 两栏 Allotment + 悬浮抽屉）+ 窗口事件
 │   ├── store.ts                  # Zustand 全局状态 + 持久化
 │   ├── types.ts                  # 类型定义（Pane / Tab / Project / SplitNode ...）
 │   ├── styles.css                # 全局样式 + CSS 变量（Warm Carbon）
 │   ├── components/
+│   │   ├── ActivityBar.tsx       # 最左侧常驻图标栏（面板开关 + AI 状态角标）
+│   │   ├── RightDrawer.tsx       # 右边缘滑出的悬浮抽屉（Sessions / Git 互斥单开）
 │   │   ├── ProjectList.tsx       # 项目列表 + 嵌套分组 + DONE 徽章
 │   │   ├── AddRemoteProjectModal.tsx # 添加 SSH 远程项目弹窗（选连接 + 远程路径验证）
+│   │   ├── ProjectEnvVarsModal.tsx   # 项目级环境变量管理弹窗（POSIX 校验）
 │   │   ├── SessionList.tsx       # AI 会话历史列表（Claude / Codex）
 │   │   ├── FileTree.tsx          # 文件目录树 + Git 状态 + 新建 / 重命名
 │   │   ├── TerminalArea.tsx      # 标签管理 + 分屏树操作
@@ -231,9 +232,13 @@ mini-term/
 │   │   ├── SearchModal.tsx       # 全局文件搜索弹窗
 │   │   ├── FileViewerModal.tsx   # 文件内容查看器
 │   │   ├── SessionViewerModal.tsx # AI 会话内容查看器（Markdown 渲染）
+│   │   ├── SshModal.tsx          # SSH 连接管理弹窗（分组 + 连接增删改）
+│   │   ├── SshAssocModal.tsx     # 项目关联 SSH（按项目启用 MCP + 限定可见范围）
+│   │   ├── MobileRelayModal.tsx  # 「移动端」面板（中转地址 / 连接状态 / 配对二维码）
+│   │   ├── RelayStatusBadge.tsx  # 中转连接状态角标
 │   │   ├── SettingsModal.tsx     # 设置弹窗（主题 / 字体 / Shell / AI 通知 / Hook）
+│   │   ├── LanguageToggle.tsx    # 中英语言切换
 │   │   ├── ToastContainer.tsx    # AI 完成 Toast 通知
-│   │   ├── ActivityBar.tsx       # Activity Bar 侧边栏（面板显隐 + AI 状态角标）
 │   │   ├── DoneTag.tsx           # 项目列表 DONE 徽章
 │   │   └── StatusDot.tsx         # 状态指示点
 │   ├── hooks/
@@ -241,25 +246,32 @@ mini-term/
 │   │   ├── useAiSubmitMarker.ts  # AI 会话 Enter 打点
 │   │   ├── useExternalFileDrop.ts # 系统资源管理器拖拽文件到终端
 │   │   └── useMarkerHotkeys.ts   # 标记间跳转快捷键
-│   └── utils/
+│   ├── i18n/                     # 自研轻量 i18n（locales/<ns>.ts 字典 + useT()）
+│   └── utils/                    # 以下为节选，完整 24 个见目录
 │       ├── contextMenu.ts        # 右键菜单 DOM 实现
-│       ├── dragState.ts          # 项目树拖拽状态
-│       ├── fileDragState.ts      # 文件拖拽到终端状态管理
+│       ├── terminalCache.ts      # xterm 缓存 + 复制粘贴 + 长文本 / 图片粘贴
+│       ├── terminalSnapshot.ts   # 终端内容快照（布局恢复用）
 │       ├── projectTree.ts        # 项目树递归操作
-│       ├── terminalCache.ts      # xterm 缓存 + 复制粘贴
 │       ├── projectDataCache.ts   # FileTree / GitHistory 项目级数据缓存
+│       ├── projectEnv.ts         # 项目级环境变量校验
 │       ├── remoteProject.ts      # SSH 远程项目辅助（判别 / 断链检测 / 远程 PTY 创建）
+│       ├── wslPath.ts            # WSL UNC 路径解析与展示
+│       ├── mobileSessionSync.ts  # 活跃 AI 会话快照同步给中转
+│       ├── ptyWriteQueue.ts      # PTY 写入队列（大段粘贴分块）
 │       ├── themeManager.ts       # 主题切换 + 系统配色监听
 │       └── updateChecker.ts      # GitHub Release 版本检查
 ├── src-tauri/                    # Rust 后端（Tauri 应用 + 共享 crate + sidecar）
 │   ├── src/
 │   │   ├── lib.rs                # Tauri 初始化与命令 / 插件注册
 │   │   ├── pty.rs                # PTY 生命周期 + AI 会话识别
+│   │   ├── conpty_bootstrap.rs   # Windows 内置 ConPTY 运行时预载（校验失败回退系统 ConPTY）
 │   │   ├── process_monitor.rs    # 子进程状态轮询（500ms）+ Hook 优先
 │   │   ├── config.rs             # 配置持久化 + 版本迁移
 │   │   ├── fs.rs                 # 目录列表 / 监听 / 新建 / 重命名 / 删除
 │   │   ├── git.rs                # Git 操作（状态 / Diff / Log / Pull / Push）
 │   │   ├── search.rs             # 全局文件搜索（文件名 + 内容，流式推送）
+│   │   ├── clipboard.rs          # 剪贴板图片读取 + 长文本转存临时文件
+│   │   ├── editor.rs             # 外部编辑器 / 系统默认应用打开
 │   │   ├── ai_sessions.rs        # Claude / Codex 会话记录读取（本机 + WSL UNC）
 │   │   ├── wsl_distros.rs        # WSL 发行版枚举（读注册表 Lxss，不 spawn wsl.exe）
 │   │   ├── hook_server.rs        # Hook HTTP 服务器（接收 AI 工具事件）
@@ -268,7 +280,9 @@ mini-term/
 │   │   ├── remote_ssh.rs         # SSH 远程项目（SFTP 列目录 / 目录验证 / 远程会话读取）
 │   │   ├── ssh_mcp_registry.rs   # 按项目启用 SSH MCP（写入 .mcp.json / Codex 配置）
 │   │   ├── mobile_relay.rs       # 移动端中转（出站 WSS 长连 / 配对 / 会话快照 / 指令写穿）
-│   │   └── mobile_mirror.rs      # 对话镜像（会话 JSONL 增量解析 + 分页取数）
+│   │   ├── mobile_mirror.rs      # 对话镜像（会话 JSONL 增量解析 + 分页取数）
+│   │   ├── window_theme.rs       # Windows 原生标题栏深色模式（DWM Immersive Dark Mode）
+│   │   └── window_input_recovery.rs # 窗口输入焦点异常恢复
 │   ├── mt-core/                  # 无 tauri 依赖的共享库 crate（SSH 类型 / 配置 / 私钥）
 │   ├── mt-ssh/                   # SSH 共享 crate（russh 持久会话池 + SFTP 原语，主程序与 sidecar 共用）
 │   └── mt-sidecars/src/bin/      # 独立 sidecar crate（不依赖 tauri-build）
@@ -280,7 +294,9 @@ mini-term/
 │   └── docker-compose.yml        # 一条命令从源码构建启动
 ├── mobile/                       # 移动端 PWA（React + TS + Vite，扫码配对 / 列表 / 镜像 / 指令）
 ├── scripts/
-│   └── stage-sidecars.mjs        # 构建 sidecar 并按 triple 就位为 Tauri externalBin
+│   ├── stage-sidecars.mjs        # 构建 sidecar 并按 triple 就位为 Tauri externalBin
+│   └── stage-conpty.mjs          # 下载校验并就位固定版本 ConPTY 运行时（Windows）
+├── tests/                        # Node 侧测试（ConPTY 打包 / TUI 滚动 / 布局恢复 / 主题兼容等 11 个）
 └── package.json
 ```
 
@@ -300,7 +316,7 @@ ai-working → ai-idle → Toast + DONE Tag + requestUserAttention
 ### Tauri 接口一览
 
 - **Commands（60 个）** — PTY: `create_pty` · `write_pty` · `resize_pty` · `kill_pty`；FS: `list_directory` · `read_file_content` · `watch_directory` · `unwatch_directory` · `create_file` · `create_directory` · `rename_entry` · `delete_entry` · `filter_directories`；Search: `start_search` · `cancel_search`；Git: `get_git_status` · `get_git_diff` · `discover_git_repos` · `get_git_log` · `get_repo_branches` · `get_commit_files` · `get_commit_file_diff` · `git_pull` · `git_push` · `get_changes_status` · `git_stage` · `git_unstage` · `git_stage_all` · `git_unstage_all` · `git_commit` · `git_discard_file`；Config: `load_config` · `save_config`；Editor: `open_in_editor` · `open_path_with_default_app`；Clipboard: `read_clipboard_image` · `save_clipboard_text`；AI: `get_ai_sessions` · `get_wsl_ai_sessions` · `get_ai_session_content`；WSL: `list_wsl_distros`；Hook: `register_ai_hooks` · `unregister_ai_hooks` · `get_hook_config_snippet` · `get_hook_status` · `toggle_hook_server`；SSH: `arm_ssh_autofill` · `prepare_ssh_key`；SSH MCP: `enable_ssh_mcp` · `disable_ssh_mcp`；SSH 远程: `ssh_remote_list_directory` · `ssh_remote_validate_dir` · `ssh_remote_ai_sessions` · `ssh_remote_ai_session_content`；主题: `set_window_dark_mode`；移动端中转: `mobile_relay_apply` · `mobile_relay_status` · `mobile_relay_request_pairing_code` · `mobile_relay_reset_pairing` · `mobile_relay_update_sessions`
-- **Events（后端 → 前端）** — `pty-output` · `pty-exit` · `pty-status-change` · `fs-change` · `search-results` · `search-complete` · `mobile-relay-status` · `mobile-relay-pairing-code`
+- **Events（9 个，后端 → 前端）** — `pty-output` · `pty-exit` · `pty-status-change` · `ai-user-submit`（AI 会话内用户按 Enter，用于打标记）· `fs-change` · `search-results` · `search-complete` · `mobile-relay-status` · `mobile-relay-pairing-code`
 
 ### 状态优先级
 
@@ -314,17 +330,18 @@ error > ai-working > ai-idle > idle
 
 ```
 App
-├── ActivityBar（常驻最左侧，面板显隐开关 + AI 状态角标）
-├── Allotment 三栏
-│   ├── 左栏：ProjectList（项目 + 分组 + 会话 + DONE 徽章）
-│   ├── 中栏：FileTree（目录浏览 + Git 状态 + 文件操作）
-│   └── 右栏
-    ├── TabBar（标签管理）
-    ├── SplitLayout（递归 SplitNode 分屏树）
-    │   └── TerminalInstance × N（xterm.js + 右键菜单）
-    └── GitHistory（仓库树 + 提交历史 + Pull/Push）
+├── ActivityBar（常驻最左侧图标栏：折叠中间栏 / Sessions / Git / 设置 / SSH / 移动端 + AI 状态角标）
+└── Allotment 两栏（可拖拽，比例持久化）
+    ├── 中间栏（可整栏折叠 · 纵向再分两块）
+    │   ├── 上：ProjectList（项目 + 嵌套分组 + DONE 徽章）
+    │   └── 下：FileTree（目录浏览 + Git 状态 + 文件操作）
+    └── 右栏：TerminalArea × N（按项目常驻，仅活跃项目 display:block）
+        ├── TabBar（标签管理 + ⚑ 标记下拉）
+        └── SplitLayout（递归 SplitNode 分屏树）
+            └── TerminalInstance × N（xterm.js + 右键菜单）
 
-ToastContainer 悬浮于右下角，SettingsModal 覆盖全局。
+RightDrawer 从右边缘滑出、浮在终端之上（Sessions / Git 互斥单开，左缘可拖拽调宽并持久化）。
+ToastContainer 悬浮于右下角，SettingsModal / SshModal / MobileRelayModal 覆盖全局。
 ```
 
 ## 推荐开发环境
@@ -338,11 +355,24 @@ ToastContainer 悬浮于右下角，SettingsModal 覆盖全局。
 提交代码前请运行：
 
 ```bash
-# 前端类型检查
+# 前端类型检查（tsc + vite build）
 npm run build
 
-# Rust 测试与构建
-cd src-tauri && cargo test && cargo build
+# Node 侧测试（11 个）
+node --test "tests/*.test.cjs"
+
+# 桌面端 Rust 测试（352 个）
+# 注意：mt-core / mt-ssh / mt-sidecars 是独立 crate 而非 workspace member，
+# 单跑 `cd src-tauri && cargo test` 只覆盖 tauri-app 的 248 个，其余三个要分别指定 manifest。
+cd src-tauri
+cargo test                                        # tauri-app     248
+cargo test --manifest-path mt-core/Cargo.toml     # mt-core        38
+cargo test --manifest-path mt-ssh/Cargo.toml      # mt-ssh         26
+cargo test --manifest-path mt-sidecars/Cargo.toml # mt-sidecars    40
+cargo build
+
+# 中转服务测试（38 个，独立 workspace）
+cd ../relay-server && cargo test
 ```
 
 ## 社区
