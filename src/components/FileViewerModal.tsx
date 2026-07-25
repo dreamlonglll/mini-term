@@ -278,9 +278,14 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
                     {saving ? t('fileViewer.saving') : t('fileViewer.save')}
                   </button>
                 )}
-                <button onClick={toggleEditMode}>
-                  {editing ? t('fileViewer.view') : t('fileViewer.edit')}
-                </button>
+                <div className="flex rounded-[var(--radius-sm)] border border-[var(--border-default)] overflow-hidden text-xs">
+                  <button
+                    className={`px-2.5 py-1 transition-colors ${editing ? 'bg-[var(--accent)] text-[var(--bg-base)]' : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]'}`}
+                    onClick={toggleEditMode}
+                  >
+                    {editing ? t('fileViewer.view') : t('fileViewer.edit')}
+                  </button>
+                </div>
               </>
             )}
             {(isMd || isHtml) && result && !result.isBinary && !result.tooLarge && (
