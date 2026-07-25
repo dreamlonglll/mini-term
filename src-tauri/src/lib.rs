@@ -69,8 +69,11 @@ pub fn run() {
             // 已配置中转地址时,启动对中转服务器的出站长连(断线自动指数退避重连)
             if let Some(relay) = app_config.mobile_relay.as_ref() {
                 if !relay.relay_url.trim().is_empty() {
-                    app.state::<mobile_relay::MobileRelayManager>()
-                        .apply(app.handle(), &relay.relay_url);
+                    app.state::<mobile_relay::MobileRelayManager>().apply(
+                        app.handle(),
+                        &relay.relay_url,
+                        &relay.desktop_key,
+                    );
                 }
             }
             Ok(())
@@ -145,6 +148,9 @@ pub fn run() {
             mobile_relay::mobile_relay_request_pairing_code,
             mobile_relay::mobile_relay_reset_pairing,
             mobile_relay::mobile_relay_update_sessions,
+            mobile_relay::mobile_relay_launchers_changed,
+            mobile_relay::mobile_relay_start_session_result,
+            mobile_relay::mobile_relay_check_launcher_command,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

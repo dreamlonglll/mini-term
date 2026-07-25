@@ -429,7 +429,9 @@ fn command_word_matches_ai(word: &str) -> bool {
     AI_COMMANDS.iter().any(|&ai| basename == ai)
 }
 
-fn is_interactive_ai_command(command: &str) -> bool {
+/// 该命令行是否会被识别为"进入交互式 AI 会话"。
+/// AI 启动器配置校验(mobile_relay)复用同一判定,避免两处口径漂移。
+pub fn is_interactive_ai_command(command: &str) -> bool {
     let mut words = command.split_whitespace();
     let mut first_word = words.next().unwrap_or("");
     if first_word == "&" {

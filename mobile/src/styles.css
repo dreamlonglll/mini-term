@@ -527,3 +527,166 @@ body {
   opacity: 0.4;
   cursor: default;
 }
+
+/* ── 发起新 AI 会话:悬浮按钮 + 弹层 ── */
+
+/* 悬浮按钮压在列表上方,给内容留出能滚过它的空间(56px 按钮 + 间距) */
+.session-body {
+  padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 94px);
+}
+
+.start-banner {
+  background: rgba(74, 158, 255, 0.12);
+  border-bottom: 1px solid rgba(74, 158, 255, 0.4);
+  color: var(--accent);
+  font-size: 13px;
+  padding: 10px 16px;
+}
+
+.start-banner--error {
+  background: rgba(224, 92, 92, 0.12);
+  border-bottom-color: rgba(224, 92, 92, 0.4);
+  color: var(--color-error);
+}
+
+.fab {
+  position: fixed;
+  right: 18px;
+  bottom: calc(env(safe-area-inset-bottom, 0px) + 22px);
+  width: 56px;
+  height: 56px;
+  border-radius: 50%;
+  border: none;
+  background: var(--accent);
+  color: #fff;
+  font-size: 30px;
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
+  z-index: 20;
+}
+
+.fab:disabled {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+  box-shadow: none;
+  cursor: not-allowed;
+}
+
+/* 置灰原因:触屏没有 hover,title 看不到,所以直接写在按钮旁边 */
+.fab-hint {
+  position: fixed;
+  right: 84px;
+  bottom: calc(env(safe-area-inset-bottom, 0px) + 38px);
+  max-width: 55vw;
+  font-size: 12px;
+  color: var(--text-muted);
+  text-align: right;
+  z-index: 20;
+}
+
+.sheet-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: flex-end;
+  z-index: 30;
+}
+
+.sheet {
+  width: 100%;
+  max-height: 78vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-surface);
+  border-top-left-radius: 14px;
+  border-top-right-radius: 14px;
+  border-top: 1px solid var(--border-subtle);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+.sheet-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.sheet-title {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.sheet-back,
+.sheet-close {
+  background: transparent;
+  border: none;
+  color: var(--accent);
+  font: inherit;
+  font-size: 14px;
+  cursor: pointer;
+  padding: 0;
+}
+
+.sheet-close {
+  color: var(--text-muted);
+}
+
+.sheet-body {
+  overflow-y: auto;
+  padding-bottom: 8px;
+}
+
+.sheet-subtitle {
+  font-size: 12px;
+  color: var(--text-muted);
+  padding: 10px 16px 4px;
+}
+
+.sheet-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 14px 16px;
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid var(--border-subtle);
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.sheet-row:active:not(:disabled) {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.sheet-row:disabled {
+  cursor: not-allowed;
+  color: var(--text-muted);
+}
+
+.sheet-row-name {
+  flex: 1;
+  font-size: 15px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sheet-row-note {
+  font-size: 12px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.sheet-empty {
+  padding: 32px 24px;
+  text-align: center;
+  font-size: 13px;
+  color: var(--text-muted);
+}

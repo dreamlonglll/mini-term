@@ -6,6 +6,8 @@ import { useAppStore } from '../store';
 import { useTauriEvent } from '../hooks/useTauriEvent';
 import { useT } from '../i18n';
 import { RelayStatusBadge } from './RelayStatusBadge';
+import { AiLauncherSection } from './AiLauncherSection';
+import { withMobileRelayDefaults } from '../utils/mobileRelayConfig';
 import type { MobileRelayStatusPayload } from '../types';
 
 interface Props {
@@ -34,15 +36,20 @@ export function MobileRelayModal({ open, onClose }: Props) {
   const [qrRequested, setQrRequested] = useState(false);
 
   const relayUrl = config.mobileRelay?.relayUrl ?? '';
+  const desktopKey = config.mobileRelay?.desktopKey ?? '';
   const status = relayStatus?.status ?? 'disconnected';
   const connected = status === 'connected';
 
   const [url, setUrl] = useState(relayUrl);
+  const [key, setKey] = useState(desktopKey);
 
   // 配置变化(含本面板保存后回写)同步到输入框
   useEffect(() => {
     setUrl(relayUrl);
   }, [relayUrl]);
+  useEffect(() => {
+    setKey(desktopKey);
+  }, [desktopKey]);
 
   // 打开面板时取一次当前状态兜底;关闭时丢弃已展示的二维码(旧码可能已被后续操作作废)
   useEffect(() => {
@@ -56,19 +63,24 @@ export function MobileRelayModal({ open, onClose }: Props) {
       .catch(() => {});
   }, [open, setMobileRelayStatus]);
 
-  // 保存中转地址并让后端重建连接;地址变了旧配对二维码即作废,一并清掉
-  const applyUrl = useCallback(async (nextUrl: string) => {
+  // 保存中转地址 + 桌面端密钥并让后端重建连接;地址变了旧配对二维码即作废,一并清掉。
+  // 清空地址时保留密钥与启动器(它们与"这次是否建连"无关,别让用户重填)。
+  const applyRelaySettings = useCallback(async (nextUrl: string, nextKey: string) => {
     const trimmed = nextUrl.trim();
+    const trimmedKey = nextKey.trim();
     setQrDataUrl(null);
     setQrRequested(false);
     const cfg = useAppStore.getState().config;
     const newConfig = {
       ...cfg,
-      mobileRelay: trimmed ? { ...cfg.mobileRelay, relayUrl: trimmed } : undefined,
+      mobileRelay: withMobileRelayDefaults(cfg.mobileRelay, {
+        relayUrl: trimmed,
+        desktopKey: trimmedKey,
+      }),
     };
     setConfig(newConfig);
     await invoke('save_config', { config: newConfig });
-    await invoke('mobile_relay_apply', { relayUrl: trimmed });
+    await invoke('mobile_relay_apply', { relayUrl: trimmed, desktopKey: trimmedKey });
   }, [setConfig]);
 
   // 中转签发配对码 → 组配对链接 → 渲染二维码
@@ -128,28 +140,50 @@ export function MobileRelayModal({ open, onClose }: Props) {
               type="text"
               value={url}
               onChange={(e) => setUrl(e.target.value)}
-              onKeyDown={(e) => { if (e.key === 'Enter') applyUrl(url); }}
+              onKeyDown={(e) => { if (e.key === 'Enter') applyRelaySettings(url, key); }}
               placeholder={t('mobileRelay.urlPlaceholder')}
               spellCheck={false}
               className="w-full px-3 py-2 rounded-[var(--radius-sm)] bg-[var(--bg-base)] border border-[var(--border-default)] text-base text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:border-[var(--accent)] focus:outline-none"
             />
+
+            {/* 桌面端接入密钥:与中转的 MT_RELAY_DESKTOP_KEY 必须一致 */}
+            <div className="text-base text-[var(--text-muted)] uppercase tracking-[0.1em] mt-3 mb-2">
+              {t('mobileRelay.keyLabel')}
+            </div>
+            <input
+              type="password"
+              value={key}
+              onChange={(e) => setKey(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') applyRelaySettings(url, key); }}
+              placeholder={t('mobileRelay.keyPlaceholder')}
+              spellCheck={false}
+              autoComplete="off"
+              className="w-full px-3 py-2 rounded-[var(--radius-sm)] bg-[var(--bg-base)] border border-[var(--border-default)] text-base text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:border-[var(--accent)] focus:outline-none"
+            />
+            <p className="text-sm text-[var(--text-muted)] leading-relaxed mt-1">
+              {t('mobileRelay.keyHint')}
+            </p>
+
             <div className="flex gap-2 mt-2">
               <button
                 className="px-4 py-1.5 rounded-[var(--radius-sm)] text-base bg-[var(--accent-muted)] text-[var(--accent)] border border-[var(--accent)] hover:opacity-90 transition-opacity disabled:opacity-40"
                 disabled={!url.trim()}
-                onClick={() => applyUrl(url)}
+                onClick={() => applyRelaySettings(url, key)}
               >
                 {t('mobileRelay.apply')}
               </button>
               <button
                 className="px-4 py-1.5 rounded-[var(--radius-sm)] text-base bg-[var(--bg-base)] text-[var(--text-secondary)] border border-[var(--border-default)] hover:border-[var(--accent)] transition-colors disabled:opacity-40"
-                disabled={!url.trim() && !config.mobileRelay}
-                onClick={() => { setUrl(''); applyUrl(''); }}
+                disabled={!url.trim() && !relayUrl}
+                onClick={() => { setUrl(''); applyRelaySettings('', key); }}
               >
                 {t('mobileRelay.clear')}
               </button>
             </div>
           </div>
+
+          {/* AI 启动器:决定手机能起哪些 agent(与是否已连上中转无关,始终可编辑) */}
+          <AiLauncherSection />
 
           {/* 中转连接状态 */}
           <div className="flex items-center justify-between px-3 py-2.5 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)]">

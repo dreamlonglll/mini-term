@@ -1,9 +1,13 @@
 /**
- * 活跃 AI 会话结构同步:前端 store → Rust 后端(mobile_relay_update_sessions)。
+ * 项目与活跃 AI 会话结构同步:前端 store → Rust 后端(mobile_relay_update_sessions)。
  *
- * 可见性规则(docs/specs/mobile-relay-v1.md):仅处于 AI 会话中的 pane 进入快照——
- * ai-working / ai-idle,以及"曾是 AI 会话且现处 error 态"的 pane;裸 shell 一律不出现。
- * 无可见 pane 的项目不出现。后端拿全量状态自行组装增量推给中转。
+ * 可见性规则(docs/specs/mobile-start-session-v1.md):
+ * - **项目**:上报 `config.projects` 全集——手机的发起弹层要能选到没有活跃会话的项目。
+ * - **pane**:只有处于 AI 会话中的 pane 进快照(ai-working / ai-idle,以及"曾是 AI
+ *   会话且现处 error 态"的 pane),裸 shell 一律不出现。这条规则**只作用于 pane 列表**,
+ *   不再决定项目是否进快照;手机首页仍只渲染有 pane 的项目,用户看不出差别。
+ *
+ * 后端拿全量状态自行组装增量推给中转,并据 path / sshConnectionId 判定能否远程发起。
  */
 import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '../store';
@@ -23,6 +27,8 @@ interface MobileProjectPayload {
   name: string;
   /** 项目根路径:后端镜像订阅据此定位会话记录文件,不会转发给移动端 */
   path: string;
+  /** SSH 远程项目的连接 id;后端据此判定 canStartSession */
+  sshConnectionId?: string;
   panes: MobilePanePayload[];
 }
 
@@ -46,10 +52,9 @@ function computeSnapshot(): MobileProjectPayload[] {
   const projects: MobileProjectPayload[] = [];
 
   for (const project of config.projects) {
-    const ps = projectStates.get(project.id);
-    if (!ps) continue;
     const panes: MobilePanePayload[] = [];
-    for (const tab of ps.tabs) {
+    const ps = projectStates.get(project.id);
+    for (const tab of ps?.tabs ?? []) {
       const flat: PaneState[] = [];
       collectPanes(tab.splitLayout, flat);
       for (const pane of flat) {
@@ -65,9 +70,13 @@ function computeSnapshot(): MobileProjectPayload[] {
         });
       }
     }
-    if (panes.length > 0) {
-      projects.push({ projectId: project.id, name: project.name, path: project.path, panes });
-    }
+    projects.push({
+      projectId: project.id,
+      name: project.name,
+      path: project.path,
+      sshConnectionId: project.sshConnectionId,
+      panes,
+    });
   }
 
   aiPaneIds = nextAiPaneIds;

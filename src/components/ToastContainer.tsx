@@ -16,6 +16,9 @@ export function ToastContainer() {
     <div className="toast-stack">
       {visible.map((n) => {
         const isWslInfo = n.kind === 'wsl-info';
+        // 移动端发起的新会话:带项目跳转(点一下就能接管),图标用信息态区分
+        const isMobileSession = n.kind === 'mobile-session';
+        const isInfo = isWslInfo || isMobileSession;
         return (
           <div
             key={n.id}
@@ -28,13 +31,13 @@ export function ToastContainer() {
               dismissNotification(n.id);
             }}
           >
-            <div className={isWslInfo ? 'toast-icon toast-icon--info' : 'toast-icon'}>
-              {isWslInfo ? 'i' : '✓'}
+            <div className={isInfo ? 'toast-icon toast-icon--info' : 'toast-icon'}>
+              {isInfo ? 'i' : '✓'}
             </div>
             <div className="toast-body">
               <div className="toast-name">{n.projectName}</div>
               <div className="toast-desc">
-                {isWslInfo ? (n.message ?? '') : t('toast.aiDone')}
+                {isInfo ? (n.message ?? '') : t('toast.aiDone')}
               </div>
             </div>
             <div

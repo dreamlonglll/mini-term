@@ -307,7 +307,8 @@ interface AppStore {
   renameProject: (id: string, name: string) => void;
 
   // Tab
-  addTab: (projectId: string, tab: TerminalTab) => void;
+  /** 新增 tab。`activate=false`(移动端远程发起)时不抢当前 tab 焦点 */
+  addTab: (projectId: string, tab: TerminalTab, activate?: boolean) => void;
   removeTab: (projectId: string, tabId: string) => void;
   setActiveTab: (projectId: string, tabId: string) => void;
   updateTabLayout: (projectId: string, tabId: string, layout: SplitNode) => void;
@@ -495,15 +496,18 @@ export const useAppStore = create<AppStore>((set, get) => ({
       },
     })),
 
-  addTab: (projectId, tab) =>
+  addTab: (projectId, tab, activate = true) =>
     set((state) => {
       const newStates = new Map(state.projectStates);
       const ps = newStates.get(projectId);
       if (!ps) return state;
+      // 不抢焦点时仍要保证有个活动 tab：项目此前一个 tab 都没有(或 activeTabId
+      // 已指向不存在的 tab)的话不激活就是一片空白,那不是"保住现场"而是弄坏现场。
+      const hasLiveActive = ps.tabs.some((t) => t.id === ps.activeTabId);
       newStates.set(projectId, {
         ...ps,
         tabs: [...ps.tabs, tab],
-        activeTabId: tab.id,
+        activeTabId: activate || !hasLiveActive ? tab.id : ps.activeTabId,
       });
       return { projectStates: newStates };
     }),

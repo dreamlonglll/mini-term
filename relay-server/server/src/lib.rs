@@ -16,8 +16,8 @@ use axum::response::IntoResponse;
 use axum::routing::{any, get};
 use axum::Router;
 use mt_relay_protocol::{
-    CommandFailReason, DesktopToRelay, MobileRejectReason, MobileToRelay, RelayToDesktop,
-    RelayToMobile, PROTOCOL_VERSION,
+    CommandFailReason, DesktopRejectReason, DesktopToRelay, MobileRejectReason, MobileToRelay,
+    RelayToDesktop, RelayToMobile, StartSessionFailReason, PROTOCOL_VERSION,
 };
 use tokio::sync::mpsc;
 
@@ -59,9 +59,14 @@ pub struct RelayState {
     inner: Arc<Mutex<Inner>>,
     generation_counter: Arc<AtomicU64>,
     code_ttl: Duration,
+    /// 桌面端共享密钥(部署方经 `MT_RELAY_DESKTOP_KEY` 配置)。
+    /// `None` = 未配置 → fail-closed,拒绝一切桌面连接。
+    desktop_key: Option<Arc<String>>,
 }
 
 impl RelayState {
+    /// 未配置桌面端密钥的实例:任何桌面连接都会被拒。
+    /// 生产入口必须用 [`RelayState::with_desktop_key`] 传入实际密钥。
     pub fn new() -> Self {
         Self::with_code_ttl(PAIRING_CODE_TTL)
     }
@@ -72,6 +77,31 @@ impl RelayState {
             inner: Arc::new(Mutex::new(Inner::default())),
             generation_counter: Arc::new(AtomicU64::new(0)),
             code_ttl,
+            desktop_key: None,
+        }
+    }
+
+    /// 配置桌面端共享密钥。空白字符串按"未配置"处理(避免 `MT_RELAY_DESKTOP_KEY=`
+    /// 这种写法被当成"密钥就是空串"而放行任意空密钥的桌面端)。
+    pub fn with_desktop_key(mut self, key: Option<String>) -> Self {
+        self.desktop_key = key
+            .map(|k| k.trim().to_string())
+            .filter(|k| !k.is_empty())
+            .map(Arc::new);
+        self
+    }
+
+    /// 是否已配置桌面端密钥(入口据此打印启动日志)。
+    pub fn desktop_key_configured(&self) -> bool {
+        self.desktop_key.is_some()
+    }
+
+    /// 桌面端握手鉴权:先看中转有没有配密钥(未配 = 拒绝一切),再比对。
+    fn authenticate_desktop(&self, presented: &str) -> Result<(), DesktopRejectReason> {
+        match self.desktop_key.as_deref() {
+            None => Err(DesktopRejectReason::KeyNotConfigured),
+            Some(expected) if secret_eq(expected, presented) => Ok(()),
+            Some(_) => Err(DesktopRejectReason::InvalidKey),
         }
     }
 
@@ -84,6 +114,15 @@ impl Default for RelayState {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// 密钥比对:等长时不因首个差异字节提前返回。长度本身仍会泄漏(不敏感)。
+fn secret_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// WebSocket 端点路由(不含 PWA 静态资源,测试直接用这个)。
@@ -122,13 +161,16 @@ async fn desktop_ws_handler(
     ws.on_upgrade(move |socket| handle_desktop(socket, state))
 }
 
-/// 桌面端连接生命周期:握手(版本校验)→ 注册(顶替旧连接)→ 消息循环 → 注销。
+/// 桌面端连接生命周期:握手(版本 → 密钥)→ 注册(顶替旧连接)→ 消息循环 → 注销。
 async fn handle_desktop(mut socket: WebSocket, state: RelayState) {
-    // ── 握手:第一条消息必须是 hello,且版本匹配 ──
+    // ── 握手:第一条消息必须是 hello,且版本匹配、密钥正确 ──
     let first = tokio::time::timeout(HANDSHAKE_TIMEOUT, socket.recv()).await;
-    let actual_version = match first {
+    let (actual_version, desktop_key) = match first {
         Ok(Some(Ok(Message::Text(text)))) => match serde_json::from_str::<DesktopToRelay>(&text) {
-            Ok(DesktopToRelay::Hello { protocol_version }) => protocol_version,
+            Ok(DesktopToRelay::Hello {
+                protocol_version,
+                desktop_key,
+            }) => (protocol_version, desktop_key),
             _ => {
                 eprintln!("[relay] desktop handshake failed: first message not hello");
                 let _ = socket.send(Message::Close(None)).await;
@@ -142,13 +184,28 @@ async fn handle_desktop(mut socket: WebSocket, state: RelayState) {
         }
     };
 
+    // 校验顺序:版本 → 密钥。版本对不上时密钥字段的语义本就不可信。
     if actual_version != PROTOCOL_VERSION {
         eprintln!(
             "[relay] desktop rejected: protocol version {actual_version} != {PROTOCOL_VERSION}"
         );
         let reject = RelayToDesktop::HelloReject {
-            expected_version: PROTOCOL_VERSION,
-            actual_version,
+            reason: DesktopRejectReason::VersionMismatch,
+            expected_version: Some(PROTOCOL_VERSION),
+            actual_version: Some(actual_version),
+        };
+        let _ = socket.send(to_text(&reject)).await;
+        let _ = socket.send(Message::Close(None)).await;
+        return;
+    }
+
+    // 鉴权失败只记原因,绝不记密钥本身(中转日志纪律)
+    if let Err(reason) = state.authenticate_desktop(&desktop_key) {
+        eprintln!("[relay] desktop rejected: {reason:?}");
+        let reject = RelayToDesktop::HelloReject {
+            reason,
+            expected_version: None,
+            actual_version: None,
         };
         let _ = socket.send(to_text(&reject)).await;
         let _ = socket.send(Message::Close(None)).await;
@@ -232,12 +289,16 @@ fn handle_desktop_message(state: &RelayState, msg: DesktopToRelay) {
     match msg {
         DesktopToRelay::Hello { .. } => {} // 重复 hello 忽略
         // 结构快照/增量:只转发给在线移动端,中转不缓存不解析内容
-        DesktopToRelay::SessionsSnapshot { projects } => {
+        DesktopToRelay::SessionsSnapshot {
+            projects,
+            launchers,
+        } => {
             let inner = state.inner.lock().unwrap();
             if let Some(mobile) = inner.mobile.as_ref() {
-                let _ = mobile
-                    .tx
-                    .send(to_text(&RelayToMobile::SessionsSnapshot { projects }));
+                let _ = mobile.tx.send(to_text(&RelayToMobile::SessionsSnapshot {
+                    projects,
+                    launchers,
+                }));
             }
         }
         DesktopToRelay::SessionsDelta {
@@ -319,6 +380,23 @@ fn handle_desktop_message(state: &RelayState, msg: DesktopToRelay) {
                     pane_id,
                     command_id,
                     ok,
+                    reason,
+                }));
+            }
+        }
+        // 发起会话回执:原样转发(以 request_id 关联)
+        DesktopToRelay::StartSessionReceipt {
+            request_id,
+            ok,
+            pane_id,
+            reason,
+        } => {
+            let inner = state.inner.lock().unwrap();
+            if let Some(mobile) = inner.mobile.as_ref() {
+                let _ = mobile.tx.send(to_text(&RelayToMobile::StartSessionReceipt {
+                    request_id,
+                    ok,
+                    pane_id,
                     reason,
                 }));
             }
@@ -592,6 +670,31 @@ fn handle_mobile_message(state: &RelayState, msg: MobileToRelay) {
                         command_id,
                         ok: false,
                         reason: Some(CommandFailReason::DesktopOffline),
+                    }));
+                }
+                None
+            }
+        }
+        // 发起新 AI 会话:同样离线即拒(桌面离线意味着起不来,补送没有意义)
+        MobileToRelay::StartAiSession {
+            request_id,
+            project_id,
+            launcher_id,
+        } => {
+            if inner.desktop.is_some() {
+                Some(RelayToDesktop::StartAiSession {
+                    request_id,
+                    project_id,
+                    launcher_id,
+                })
+            } else {
+                eprintln!("[relay] start ai session rejected: desktop offline");
+                if let Some(mobile) = inner.mobile.as_ref() {
+                    let _ = mobile.tx.send(to_text(&RelayToMobile::StartSessionReceipt {
+                        request_id,
+                        ok: false,
+                        pane_id: None,
+                        reason: Some(StartSessionFailReason::DesktopOffline),
                     }));
                 }
                 None

@@ -26,8 +26,9 @@ import { applyUiFontFamily } from './utils/fontManager';
 import { markAiPty, updateAllTerminalThemes } from './utils/terminalCache';
 import { includeActiveProject } from './utils/projectKeepAlive';
 import { initMobileSessionSync } from './utils/mobileSessionSync';
+import { handleMobileStartSession } from './utils/mobileStartSession';
 import { useT } from './i18n';
-import type { AppConfig, PtyStatusChangePayload, PtyExitPayload, PaneStatus, MobileRelayStatusPayload } from './types';
+import type { AppConfig, PtyStatusChangePayload, PtyExitPayload, PaneStatus, MobileRelayStatusPayload, MobileStartSessionPayload } from './types';
 
 export function App() {
   const t = useT();
@@ -175,6 +176,12 @@ export function App() {
   useEffect(() => {
     initMobileSessionSync();
   }, []);
+
+  // 移动端远程发起新 AI 会话:在目标项目后台新开一个 tab 并拉起 AI CLI,
+  // 不切当前项目/tab(远程操作不改动桌面上正在看的现场)
+  useTauriEvent<MobileStartSessionPayload>('mobile-start-session', useCallback((payload) => {
+    void handleMobileStartSession(payload);
+  }, []));
 
   useTauriEvent<PtyExitPayload>('pty-exit', useCallback((payload) => {
     // 登记已退出的 PTY:远程项目 pane 据此叠加「连接已断开,点击重连」覆盖层

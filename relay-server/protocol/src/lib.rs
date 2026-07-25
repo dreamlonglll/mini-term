@@ -1,13 +1,14 @@
-//! 中转协议 v1:JSON over WebSocket 的消息类型定义。
+//! 中转协议 v2:JSON over WebSocket 的消息类型定义。
 //!
-//! 命名纪律(见 CONTEXT.md):移动端 / 中转服务器 / 配对 / 对话镜像 / 移动端指令。
-//! 所有消息经 `#[serde(tag = "type", rename_all_fields = "camelCase")]` 序列化,
-//! 与前端 TypeScript 手写镜像类型对齐;字段增删必须保持向后兼容或提升版本号。
+//! 命名纪律(见 CONTEXT.md):移动端 / 中转服务器 / 配对 / 对话镜像 / 移动端指令 /
+//! AI 启动器。所有消息经 `#[serde(tag = "type", rename_all_fields = "camelCase")]`
+//! 序列化,与前端 TypeScript 手写镜像类型对齐;字段增删必须保持向后兼容或提升版本号。
 
 use serde::{Deserialize, Serialize};
 
-/// 协议版本。两端握手时校验,不匹配即拒绝(不静默错乱)。
-pub const PROTOCOL_VERSION: u32 = 1;
+/// 协议版本。两端握手时严格相等校验,不匹配即拒绝(不静默错乱)。
+/// v2:桌面端握手携带共享密钥 + 移动端可发起 AI 会话(docs/adr/0002)。
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// 移动端可见的单个 pane(仅处于 AI 会话中的 pane 才会出现,裸 shell 不进快照)。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -20,13 +21,29 @@ pub struct MobilePane {
     pub status: String,
 }
 
-/// 移动端可见的项目条目(仅含存在活跃 AI 会话的项目)。
+/// 移动端可见的项目条目。
+///
+/// v2 起**全部**项目进快照(没有活跃 AI 会话的项目 `panes` 为空数组),
+/// 供发起会话弹层选目标;"仅 AI 会话 pane 可见"的规则只作用于 `panes`。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MobileProject {
     pub project_id: String,
     pub name: String,
     pub panes: Vec<MobilePane>,
+    /// 能否在该项目发起新 AI 会话(桌面端判定:SSH 远程项目与 WSL 根项目为 false,
+    /// 因为它们的对话镜像目前一定是空的)。移动端据此置灰,不自行推断。
+    #[serde(default)]
+    pub can_start_session: bool,
+}
+
+/// 移动端可见的 AI 启动器条目:**只有** id 与展示名。
+/// 命令与 shell 归桌面端配置所有,绝不下发(见 ADR 0002 的边界)。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MobileLauncher {
+    pub id: String,
+    pub name: String,
 }
 
 /// 移动端指令发送失败的原因。
@@ -39,6 +56,34 @@ pub enum CommandFailReason {
     PaneNotFound,
     /// PTY 写入失败
     WriteFailed,
+}
+
+/// 移动端发起新 AI 会话失败的原因。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum StartSessionFailReason {
+    /// 桌面端离线:中转在路由层直接拒绝(与移动端指令的离线即拒一致)
+    DesktopOffline,
+    /// 目标项目已不存在
+    ProjectNotFound,
+    /// 启动器已被删除
+    LauncherNotFound,
+    /// 目标项目不支持远程发起(SSH 远程项目 / WSL 根项目:对话镜像不可用)
+    NotSupported,
+    /// 终端创建失败
+    SpawnFailed,
+}
+
+/// 桌面端握手被拒绝的原因(中转 → 桌面端)。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DesktopRejectReason {
+    /// 协议版本不匹配:两端必须同版本升级
+    VersionMismatch,
+    /// 桌面端密钥缺失或与中转配置的不一致
+    InvalidKey,
+    /// 中转未配置 `MT_RELAY_DESKTOP_KEY`:fail-closed,拒绝一切桌面连接
+    KeyNotConfigured,
 }
 
 /// 对话镜像中的一条消息。seq 在一次镜像绑定内从 0 连续递增,分页取数以此为锚。
@@ -58,13 +103,22 @@ pub struct MirrorMessage {
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum DesktopToRelay {
     /// 握手:桌面端连上 WebSocket 后必须发送的第一条消息。
-    Hello { protocol_version: u32 },
+    /// `desktop_key` 是部署方配置在中转上的共享密钥(v2 起必填,不匹配即拒)。
+    Hello {
+        protocol_version: u32,
+        desktop_key: String,
+    },
     /// 请求签发一次性配对码(用于桌面端展示二维码)。旧配对码立即作废。
     RequestPairingCode,
     /// 重置配对:吊销移动端长期凭证与未用配对码,踢掉在线移动端。
     ResetPairing,
-    /// 活跃 AI 会话结构全量快照(连上中转后/收到快照请求时发送)。
-    SessionsSnapshot { projects: Vec<MobileProject> },
+    /// 结构全量快照(连上中转后/收到快照请求时/启动器配置变化时发送)。
+    /// 含全部项目(无活跃 pane 的 `panes` 为空)与可用 AI 启动器名单。
+    SessionsSnapshot {
+        projects: Vec<MobileProject>,
+        #[serde(default)]
+        launchers: Vec<MobileLauncher>,
+    },
     /// 活跃 AI 会话结构增量:整项目 upsert + 项目移除。
     SessionsDelta {
         upserts: Vec<MobileProject>,
@@ -98,6 +152,16 @@ pub enum DesktopToRelay {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<CommandFailReason>,
     },
+    /// 发起会话回执:ok = pane 已创建且启动命令已写入 PTY,**不**承诺 AI 已起来。
+    /// 真正的成功信号是该 pane 出现在活跃会话快照里。
+    StartSessionReceipt {
+        request_id: String,
+        ok: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<StartSessionFailReason>,
+    },
 }
 
 /// 中转 → 桌面端
@@ -106,11 +170,15 @@ pub enum DesktopToRelay {
 pub enum RelayToDesktop {
     /// 握手成功。
     HelloAck { protocol_version: u32 },
-    /// 版本不匹配等握手拒绝;发送后中转立即关闭连接。
-    /// 桌面端据 expected/actual 给出明确升级提示,不再自动重连。
+    /// 握手拒绝(版本不匹配 / 密钥不对 / 中转未配置密钥);发送后中转立即关闭连接。
+    /// 桌面端据 reason 分别给出"升级"与"配置密钥"的提示,两种都不再自动重连。
+    /// 版本字段仅 `VersionMismatch` 时携带。
     HelloReject {
-        expected_version: u32,
-        actual_version: u32,
+        reason: DesktopRejectReason,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected_version: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actual_version: Option<u32>,
     },
     /// 响应 RequestPairingCode:新签发的一次性配对码。
     PairingCode { code: String },
@@ -130,6 +198,13 @@ pub enum RelayToDesktop {
         pane_id: String,
         command_id: String,
         text: String,
+    },
+    /// 移动端发起新 AI 会话(原样转发自移动端):按 `launcher_id` 引用桌面端配置的
+    /// 具名启动器,命令文本从不经过移动端或中转。
+    StartAiSession {
+        request_id: String,
+        project_id: String,
+        launcher_id: String,
     },
 }
 
@@ -158,6 +233,13 @@ pub enum MobileToRelay {
         command_id: String,
         text: String,
     },
+    /// 发起新 AI 会话:在 `project_id` 项目里按 `launcher_id` 启动器新开一个 tab。
+    /// request_id 由移动端生成,用于回执关联。
+    StartAiSession {
+        request_id: String,
+        project_id: String,
+        launcher_id: String,
+    },
 }
 
 /// 中转 → 移动端
@@ -177,8 +259,12 @@ pub enum RelayToMobile {
     Revoked,
     /// 桌面端在线状态(握手成功后立即推一次,此后变化时推送)。
     Presence { desktop_online: bool },
-    /// 活跃 AI 会话结构全量快照(转发自桌面端)。
-    SessionsSnapshot { projects: Vec<MobileProject> },
+    /// 结构全量快照(转发自桌面端):全部项目 + 可用 AI 启动器名单。
+    SessionsSnapshot {
+        projects: Vec<MobileProject>,
+        #[serde(default)]
+        launchers: Vec<MobileLauncher>,
+    },
     /// 活跃 AI 会话结构增量(转发自桌面端)。
     SessionsDelta {
         upserts: Vec<MobileProject>,
@@ -211,6 +297,15 @@ pub enum RelayToMobile {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<CommandFailReason>,
     },
+    /// 发起会话回执:桌面端的创建结果,或中转在桌面离线时的路由层拒绝。
+    StartSessionReceipt {
+        request_id: String,
+        ok: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<StartSessionFailReason>,
+    },
 }
 
 /// 移动端握手被拒绝的原因。
@@ -232,13 +327,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn protocol_version_is_v2() {
+        // 两端严格相等校验:版本号是唯一的兼容性闸门,改动必须是有意的
+        assert_eq!(PROTOCOL_VERSION, 2);
+    }
+
+    #[test]
     fn desktop_hello_camel_case_round_trip() {
         let msg = DesktopToRelay::Hello {
             protocol_version: PROTOCOL_VERSION,
+            desktop_key: "s3cret".into(),
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(
-            json.contains(r#""type":"hello""#) && json.contains(r#""protocolVersion":1"#),
+            json.contains(r#""type":"hello""#)
+                && json.contains(r#""protocolVersion":2"#)
+                && json.contains(r#""desktopKey":"s3cret""#),
             "serde camelCase 对齐被破坏: {json}"
         );
         let parsed: DesktopToRelay = serde_json::from_str(&json).unwrap();
@@ -259,16 +363,42 @@ mod tests {
     #[test]
     fn hello_reject_round_trip() {
         let msg = RelayToDesktop::HelloReject {
-            expected_version: 1,
-            actual_version: 99,
+            reason: DesktopRejectReason::VersionMismatch,
+            expected_version: Some(2),
+            actual_version: Some(99),
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(
-            json.contains(r#""expectedVersion":1"#) && json.contains(r#""actualVersion":99"#),
+            json.contains(r#""reason":"versionMismatch""#)
+                && json.contains(r#""expectedVersion":2"#)
+                && json.contains(r#""actualVersion":99"#),
             "{json}"
         );
         let parsed: RelayToDesktop = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn hello_reject_key_reasons_omit_versions() {
+        for reason in [
+            DesktopRejectReason::InvalidKey,
+            DesktopRejectReason::KeyNotConfigured,
+        ] {
+            let msg = RelayToDesktop::HelloReject {
+                reason,
+                expected_version: None,
+                actual_version: None,
+            };
+            let json = serde_json::to_string(&msg).unwrap();
+            assert!(
+                !json.contains("Version"),
+                "密钥类拒绝不应携带版本字段: {json}"
+            );
+            assert_eq!(serde_json::from_str::<RelayToDesktop>(&json).unwrap(), msg);
+        }
+        // camelCase 枚举值口径(前端手写镜像按此匹配)
+        let json = serde_json::to_string(&DesktopRejectReason::KeyNotConfigured).unwrap();
+        assert_eq!(json, r#""keyNotConfigured""#);
     }
 
     #[test]
@@ -351,6 +481,7 @@ mod tests {
                 title: "claude".into(),
                 status: "ai-working".into(),
             }],
+            can_start_session: true,
         }
     }
 
@@ -358,19 +489,110 @@ mod tests {
     fn sessions_snapshot_camel_case_round_trip() {
         let msg = DesktopToRelay::SessionsSnapshot {
             projects: vec![sample_project()],
+            launchers: vec![MobileLauncher {
+                id: "l1".into(),
+                name: "Claude".into(),
+            }],
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(
             json.contains(r#""projectId":"p1""#)
                 && json.contains(r#""paneId":"pane-1""#)
-                && json.contains(r#""status":"ai-working""#),
+                && json.contains(r#""status":"ai-working""#)
+                && json.contains(r#""canStartSession":true"#)
+                && json.contains(r#""launchers":[{"id":"l1","name":"Claude"}]"#),
             "serde camelCase 对齐被破坏: {json}"
         );
+        // 启动器只下发 id 与展示名:命令/shell 绝不出现在 wire 上
+        assert!(!json.contains("command") && !json.contains("shell"), "{json}");
         assert_eq!(serde_json::from_str::<DesktopToRelay>(&json).unwrap(), msg);
     }
 
     #[test]
+    fn snapshot_carries_project_without_panes() {
+        // v2:没有活跃 AI 会话的项目也进快照(panes 空数组),供发起弹层选目标
+        let empty = MobileProject {
+            project_id: "p2".into(),
+            name: "idle-proj".into(),
+            panes: vec![],
+            can_start_session: false,
+        };
+        let msg = RelayToMobile::SessionsSnapshot {
+            projects: vec![empty.clone()],
+            launchers: vec![],
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""panes":[]"#) && json.contains(r#""canStartSession":false"#), "{json}");
+        assert_eq!(serde_json::from_str::<RelayToMobile>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn start_ai_session_and_receipt_round_trip() {
+        let req = MobileToRelay::StartAiSession {
+            request_id: "req-1".into(),
+            project_id: "p1".into(),
+            launcher_id: "l1".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains(r#""type":"startAiSession""#)
+                && json.contains(r#""requestId":"req-1""#)
+                && json.contains(r#""launcherId":"l1""#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<MobileToRelay>(&json).unwrap(), req);
+
+        let fwd = RelayToDesktop::StartAiSession {
+            request_id: "req-1".into(),
+            project_id: "p1".into(),
+            launcher_id: "l1".into(),
+        };
+        let json = serde_json::to_string(&fwd).unwrap();
+        assert_eq!(serde_json::from_str::<RelayToDesktop>(&json).unwrap(), fwd);
+
+        // 成功回执携带 paneId、不携带 reason
+        let ok = DesktopToRelay::StartSessionReceipt {
+            request_id: "req-1".into(),
+            ok: true,
+            pane_id: Some("pane-9".into()),
+            reason: None,
+        };
+        let json = serde_json::to_string(&ok).unwrap();
+        assert!(json.contains(r#""paneId":"pane-9""#) && !json.contains("reason"), "{json}");
+        assert_eq!(serde_json::from_str::<DesktopToRelay>(&json).unwrap(), ok);
+
+        // 失败回执携带 reason、不携带 paneId
+        let fail = RelayToMobile::StartSessionReceipt {
+            request_id: "req-2".into(),
+            ok: false,
+            pane_id: None,
+            reason: Some(StartSessionFailReason::LauncherNotFound),
+        };
+        let json = serde_json::to_string(&fail).unwrap();
+        assert!(
+            json.contains(r#""reason":"launcherNotFound""#) && !json.contains("paneId"),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<RelayToMobile>(&json).unwrap(), fail);
+    }
+
+    #[test]
+    fn start_session_fail_reasons_serialize_camel_case() {
+        let cases = [
+            (StartSessionFailReason::DesktopOffline, r#""desktopOffline""#),
+            (StartSessionFailReason::ProjectNotFound, r#""projectNotFound""#),
+            (StartSessionFailReason::LauncherNotFound, r#""launcherNotFound""#),
+            (StartSessionFailReason::NotSupported, r#""notSupported""#),
+            (StartSessionFailReason::SpawnFailed, r#""spawnFailed""#),
+        ];
+        for (reason, expected) in cases {
+            assert_eq!(serde_json::to_string(&reason).unwrap(), expected);
+        }
+    }
+
+    #[test]
     fn sessions_delta_and_presence_round_trip() {
+        // 增量不带 launchers:启动器变化走重发全量快照(不为它单开增量消息)
         let delta = RelayToMobile::SessionsDelta {
             upserts: vec![sample_project()],
             removed_project_ids: vec!["p9".into()],

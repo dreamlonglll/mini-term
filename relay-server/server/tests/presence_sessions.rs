@@ -5,8 +5,8 @@
 
 use futures_util::{SinkExt, StreamExt};
 use mt_relay_protocol::{
-    DesktopToRelay, MobilePane, MobileProject, MobileToRelay, RelayToDesktop, RelayToMobile,
-    PROTOCOL_VERSION,
+    DesktopToRelay, MobileLauncher, MobilePane, MobileProject, MobileToRelay, RelayToDesktop,
+    RelayToMobile, PROTOCOL_VERSION,
 };
 use mt_relay_server::{app, RelayState};
 use std::future::IntoFuture;
@@ -18,10 +18,19 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 type WsClient = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+/// 中转与桌面端约定的共享密钥(v2 起桌面端握手必须携带)。
+const DESKTOP_KEY: &str = "test-desktop-key";
+
 async fn spawn_relay() -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(axum::serve(listener, app(RelayState::new())).into_future());
+    tokio::spawn(
+        axum::serve(
+            listener,
+            app(RelayState::new().with_desktop_key(Some(DESKTOP_KEY.into()))),
+        )
+        .into_future(),
+    );
     addr
 }
 
@@ -60,6 +69,7 @@ async fn desktop_handshake(addr: SocketAddr) -> WsClient {
         &mut ws,
         &DesktopToRelay::Hello {
             protocol_version: PROTOCOL_VERSION,
+            desktop_key: DESKTOP_KEY.into(),
         },
     )
     .await;
@@ -126,15 +136,32 @@ async fn mobile_connect(addr: SocketAddr, credential: &str) -> WsClient {
     ws
 }
 
+/// 一个有活跃 pane 的项目 + 一个没有活跃 pane 的项目(v2 起后者也进快照)。
 fn sample_projects() -> Vec<MobileProject> {
-    vec![MobileProject {
-        project_id: "p1".into(),
-        name: "demo".into(),
-        panes: vec![MobilePane {
-            pane_id: "pane-1".into(),
-            title: "claude".into(),
-            status: "ai-working".into(),
-        }],
+    vec![
+        MobileProject {
+            project_id: "p1".into(),
+            name: "demo".into(),
+            panes: vec![MobilePane {
+                pane_id: "pane-1".into(),
+                title: "claude".into(),
+                status: "ai-working".into(),
+            }],
+            can_start_session: true,
+        },
+        MobileProject {
+            project_id: "p2".into(),
+            name: "remote".into(),
+            panes: vec![],
+            can_start_session: false,
+        },
+    ]
+}
+
+fn sample_launchers() -> Vec<MobileLauncher> {
+    vec![MobileLauncher {
+        id: "l1".into(),
+        name: "Claude".into(),
     }]
 }
 
@@ -227,18 +254,20 @@ async fn snapshot_and_delta_are_routed_to_mobile() {
         Some(RelayToDesktop::SessionsSnapshotRequest)
     );
 
-    // 桌面端响应快照 → 路由到移动端
+    // 桌面端响应快照 → 路由到移动端(含空 pane 项目与启动器名单)
     send_json(
         &mut desktop,
         &DesktopToRelay::SessionsSnapshot {
             projects: sample_projects(),
+            launchers: sample_launchers(),
         },
     )
     .await;
     assert_eq!(
         recv_json::<RelayToMobile>(&mut mobile).await,
         Some(RelayToMobile::SessionsSnapshot {
-            projects: sample_projects()
+            projects: sample_projects(),
+            launchers: sample_launchers(),
         })
     );
 
@@ -270,6 +299,7 @@ async fn sessions_messages_without_mobile_are_dropped() {
         &mut desktop,
         &DesktopToRelay::SessionsSnapshot {
             projects: sample_projects(),
+            launchers: sample_launchers(),
         },
     )
     .await;
