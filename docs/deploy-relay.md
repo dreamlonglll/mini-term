@@ -1,26 +1,28 @@
-# 中转服务器部署指南（自托管）
+# Relay Server Deployment Guide (Self-Hosted)
 
-mini-term 移动端体系需要一台你自己的中转服务器（Relay Server）：桌面端主动出站连接它（穿 NAT），手机上的 PWA 也连接它，中转只做消息转发。本文面向「有一台 VPS 的独立开发者」，覆盖 Docker 一键部署与反代 + TLS 的典型配置。
+<strong>English</strong> · <a href="deploy-relay.zh-CN.md">简体中文</a>
 
-## 架构一览
+The mini-term mobile stack requires a relay server of your own: the desktop app dials out to it (punching through NAT), and the PWA on your phone connects to it too — the relay only forwards messages. This guide targets the "solo developer with one VPS" case, covering one-command Docker deployment plus a typical reverse proxy + TLS setup.
+
+## Architecture at a Glance
 
 ```
-mini-term 桌面端 ──(wss 出站长连)──▶ ┌──────────────┐ ◀──(wss/https)── 手机 PWA
-                                     │  中转服务器   │
-                                     │  (Docker)    │  同时托管 PWA 静态资源
-                                     └──────────────┘
+mini-term desktop ──(outbound wss)──▶ ┌──────────────┐ ◀──(wss/https)── phone PWA
+                                      │ relay server │
+                                      │   (Docker)   │  also serves the PWA assets
+                                      └──────────────┘
 ```
 
-- 全链路 TLS（wss/https），由前置反代终结证书。
-- 中转纪律：消息体仅内存转发、**不落盘**；日志只记连接与鉴权元数据、不含对话内容；容器不挂任何数据卷。
-- 配对状态（一次性配对码、移动端长期凭证）也仅存内存——**中转重启后需要在桌面端重新生成二维码扫码配对**。
+- TLS end to end (wss/https), with certificates terminated by the front reverse proxy.
+- Relay discipline: message bodies are forwarded in memory only and **never written to disk**; logs record connection and auth metadata only, never conversation content; the container mounts no volumes.
+- Pairing state (the one-time pairing code and the mobile long-lived credential) is also in memory only — **after a relay restart you must generate a fresh QR code on the desktop and pair again**.
 
-## 一、前置要求
+## 1. Prerequisites
 
-- 一台可公网访问的服务器（1C1G 足够），已装 Docker 与 Docker Compose 插件。
-- 一个解析到该服务器的域名（例如 `relay.example.com`）。TLS 证书由 Caddy 自动签或 Nginx + certbot。
+- A publicly reachable server (1 vCPU / 1 GB RAM is plenty) with Docker and the Docker Compose plugin installed.
+- A domain name resolving to that server (e.g. `relay.example.com`). Certificates come from Caddy's automatic issuance or Nginx + certbot.
 
-## 二、一键启动
+## 2. One-Command Start
 
 ```bash
 git clone https://github.com/dreamlonglll/mini-term.git
@@ -28,31 +30,31 @@ cd mini-term/relay-server
 docker compose up -d --build
 ```
 
-构建分三阶段：Node 构建 PWA → Rust 构建中转 → 拷入最小运行时镜像（非 root 运行）。完成后中转监听在 `127.0.0.1:8080`（compose 默认只绑回环，由反代对外服务）。
+The build runs in three stages: Node builds the PWA → Rust builds the relay → both are copied into a minimal runtime image (running as non-root). Once up, the relay listens on `127.0.0.1:8080` (the compose file binds loopback only by default, leaving the reverse proxy to serve the public).
 
-验证：
+Verify:
 
 ```bash
-curl http://127.0.0.1:8080/healthz   # 应返回 ok
+curl http://127.0.0.1:8080/healthz   # should return ok
 ```
 
-### 环境变量
+### Environment Variables
 
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `RELAY_PORT` | `8080` | 容器内监听端口 |
-| `RELAY_BIND` | `0.0.0.0` | 容器内监听地址 |
-| `RELAY_PWA_DIR` | `/srv/pwa` | PWA 静态资源目录（镜像已内置，无需修改） |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `RELAY_PORT` | `8080` | Listen port inside the container |
+| `RELAY_BIND` | `0.0.0.0` | Listen address inside the container |
+| `RELAY_PWA_DIR` | `/srv/pwa` | PWA asset directory (baked into the image; no need to change) |
 
-对外地址（域名/端口）不需要配置进中转——桌面端与手机连接哪个地址由你在桌面端设置里填写的中转地址决定。
+The public address (domain/port) is not configured on the relay — which address the desktop and phone connect to is determined by the relay URL you enter in the desktop settings.
 
-## 三、反代 + TLS
+## 3. Reverse Proxy + TLS
 
-中转的三类流量都走同一端口：`/ws/desktop`、`/ws/mobile`（WebSocket）与 PWA 静态资源（HTTP）。反代需开启 WebSocket 升级。
+All three kinds of relay traffic share one port: `/ws/desktop` and `/ws/mobile` (WebSocket) plus the PWA static assets (HTTP). The reverse proxy must allow WebSocket upgrades.
 
-### Caddy（推荐，自动 HTTPS）
+### Caddy (recommended — automatic HTTPS)
 
-`/etc/caddy/Caddyfile`：
+`/etc/caddy/Caddyfile`:
 
 ```caddy
 relay.example.com {
@@ -60,7 +62,7 @@ relay.example.com {
 }
 ```
 
-Caddy 默认透传 WebSocket 升级，无需额外配置，证书自动签发续期。
+Caddy passes WebSocket upgrades through by default with no extra configuration, and issues and renews certificates automatically.
 
 ### Nginx
 
@@ -78,32 +80,32 @@ server {
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
         proxy_set_header Host $host;
-        # 长连不掐断(默认 60s 会断开空闲 WebSocket)
+        # Keep long-lived connections alive (the 60s default drops idle WebSockets)
         proxy_read_timeout 7d;
         proxy_send_timeout 7d;
     }
 }
 ```
 
-## 四、走通全流程
+## 4. Walking Through the Full Flow
 
-1. 桌面端 mini-term → 顶栏「移动端」：中转服务器地址填 `wss://relay.example.com`，保存并连接，状态变为「已连接」。
-2. 同一面板内 → 生成配对二维码。
-3. 手机相机扫码 → 浏览器打开 PWA 自动完成配对，显示活跃 AI 会话列表。
-4. 手机浏览器菜单「添加到主屏幕」，此后以独立窗口打开（iOS 必须添加到主屏幕才有独立窗口体验）。
-5. 桌面端任一终端里启动 Claude / Codex → 手机列表实时出现 → 点进查看对话镜像 → 底部输入框发送指令，桌面终端原样写入。
+1. Desktop mini-term → "Mobile" in the title bar: set the relay server address to `wss://relay.example.com`, save and connect, and wait for the status to turn "Connected".
+2. In the same panel → generate the pairing QR code.
+3. Scan it with your phone camera → the PWA opens in the browser, pairs automatically, and shows the list of active AI sessions.
+4. Use the browser menu's "Add to Home Screen" so it opens as a standalone window from then on (on iOS, adding to the home screen is required for the standalone window experience).
+5. Start Claude / Codex in any desktop terminal → it appears in the phone's list in real time → tap in to watch the conversation mirror → send a command from the input box at the bottom, and it is written verbatim into the desktop terminal.
 
-## 五、升级与运维
+## 5. Upgrades and Operations
 
 ```bash
 cd mini-term && git pull
 cd relay-server && docker compose up -d --build
 ```
 
-注意事项：
+Things to keep in mind:
 
-- 中转重启（含升级重建容器）会丢失配对状态，手机需重新扫码。
-- 协议带版本号：桌面端与中转版本不匹配时握手明确拒绝并提示升级，不会静默错乱。
-- 1×1 拓扑：同一时刻只有一台桌面端、一部手机有效；新设备扫码配对会顶替旧设备。
-- 手机丢失：桌面端「移动端」面板 → 重置配对，所有移动端凭证立即失效。
-- 日志抽查：`docker logs mini-term-relay` 只应出现连接/鉴权/配对元数据，不含任何对话内容。
+- Restarting the relay (including recreating the container on upgrade) loses pairing state, so the phone must scan again.
+- The protocol is versioned: if the desktop and relay versions do not match, the handshake is rejected explicitly with an upgrade prompt rather than failing silently.
+- 1×1 topology: only one desktop and one phone are active at a time; pairing a new device supersedes the old one.
+- Lost phone: desktop "Mobile" panel → reset pairing, and every mobile credential is invalidated immediately.
+- Log spot-check: `docker logs mini-term-relay` should show only connection / auth / pairing metadata, never any conversation content.

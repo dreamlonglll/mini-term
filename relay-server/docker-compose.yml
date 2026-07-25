@@ -1,6 +1,6 @@
 # mini-term 中转服务器:一条命令启动(在 relay-server/ 目录下执行)
 #   docker compose up -d --build
-# TLS 由前置反代(Caddy/Nginx)终结,见 docs/deploy-relay.md。
+# TLS 由前置反代(Caddy/Nginx)终结,见 docs/deploy-relay.zh-CN.md。
 # 中转纪律:消息体不落盘——本服务不挂任何数据卷。
 services:
   relay:

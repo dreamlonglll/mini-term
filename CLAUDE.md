@@ -54,7 +54,7 @@ cd src-tauri && cargo test
 
 - `relay-server/protocol`：桌面端与中转共享的协议消息 crate（JSON over WebSocket，serde camelCase，带版本号握手校验）；PWA 侧 TypeScript 类型在 `mobile/src/protocol.ts` 手写镜像，两侧字段必须同步维护
 - `relay-server/server`：axum 中转服务，只做转发不落盘；`cd relay-server && cargo test` 跑 Seam 1 协议边界测试
-- `mobile/`：React + TS + Vite PWA（扫码配对、会话列表、对话镜像、移动端指令）；`cd mobile && npm run build` 构建，产物由中转托管；部署见 `docs/deploy-relay.md`
+- `mobile/`：React + TS + Vite PWA（扫码配对、会话列表、对话镜像、移动端指令）；`cd mobile && npm run build` 构建，产物由中转托管；部署见 `docs/deploy-relay.zh-CN.md`（英文版 `docs/deploy-relay.md`）
 
 ### 前端 (`src/`)
 
