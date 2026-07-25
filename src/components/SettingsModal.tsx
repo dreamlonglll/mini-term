@@ -12,8 +12,7 @@ import { applyUiFontFamily } from '../utils/fontManager';
 import { MOD_LABEL } from '../utils/platform';
 import { useT } from '../i18n';
 import { LanguageToggle } from './LanguageToggle';
-import { RelayStatusBadge } from './RelayStatusBadge';
-import type { ShellConfig, EditorConfig, MobileRelayStatusPayload } from '../types';
+import type { ShellConfig, EditorConfig } from '../types';
 
 interface Props {
   open: boolean;
@@ -22,7 +21,7 @@ interface Props {
   initialPage?: SettingsPage;
 }
 
-export type SettingsPage = 'terminal' | 'system' | 'font' | 'ai-notification' | 'mobile' | 'shortcuts' | 'about';
+export type SettingsPage = 'terminal' | 'system' | 'font' | 'ai-notification' | 'shortcuts' | 'about';
 
 // ─── ShellRow（终端设置子组件）───
 
@@ -1498,85 +1497,6 @@ function ShortcutsSettings() {
   );
 }
 
-// ─── MobileRelaySettings（移动端中转设置）───
-
-function MobileRelaySettings() {
-  const t = useT();
-  const config = useAppStore((s) => s.config);
-  const setConfig = useAppStore((s) => s.setConfig);
-  const relayStatus = useAppStore((s) => s.mobileRelayStatus);
-  const setMobileRelayStatus = useAppStore((s) => s.setMobileRelayStatus);
-
-  const [url, setUrl] = useState(config.mobileRelay?.relayUrl ?? '');
-
-  useEffect(() => {
-    setUrl(config.mobileRelay?.relayUrl ?? '');
-  }, [config]);
-
-  // 打开页面时取一次当前状态兜底(事件只在变化时推送,晚订阅者需要初始值)
-  useEffect(() => {
-    invoke<MobileRelayStatusPayload>('mobile_relay_status')
-      .then(setMobileRelayStatus)
-      .catch(() => {});
-  }, [setMobileRelayStatus]);
-
-  const applyUrl = useCallback(async (nextUrl: string) => {
-    const trimmed = nextUrl.trim();
-    const cfg = useAppStore.getState().config;
-    const newConfig = {
-      ...cfg,
-      mobileRelay: trimmed ? { ...cfg.mobileRelay, relayUrl: trimmed } : undefined,
-    };
-    setConfig(newConfig);
-    await invoke('save_config', { config: newConfig });
-    await invoke('mobile_relay_apply', { relayUrl: trimmed });
-  }, [setConfig]);
-
-  return (
-    <div className="space-y-5">
-      <p className="text-sm text-[var(--text-muted)] leading-relaxed">{t('mobileRelay.intro')}</p>
-
-      {/* 中转地址 */}
-      <div>
-        <div className="text-base text-[var(--text-muted)] uppercase tracking-[0.1em] mb-2">
-          {t('mobileRelay.urlLabel')}
-        </div>
-        <input
-          type="text"
-          value={url}
-          onChange={(e) => setUrl(e.target.value)}
-          onKeyDown={(e) => { if (e.key === 'Enter') applyUrl(url); }}
-          placeholder={t('mobileRelay.urlPlaceholder')}
-          spellCheck={false}
-          className="w-full px-3 py-2 rounded-[var(--radius-sm)] bg-[var(--bg-base)] border border-[var(--border-default)] text-base text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:border-[var(--accent)] focus:outline-none"
-        />
-        <div className="flex gap-2 mt-2">
-          <button
-            className="px-4 py-1.5 rounded-[var(--radius-sm)] text-base bg-[var(--accent-muted)] text-[var(--accent)] border border-[var(--accent)] hover:opacity-90 transition-opacity disabled:opacity-40"
-            disabled={!url.trim()}
-            onClick={() => applyUrl(url)}
-          >
-            {t('mobileRelay.apply')}
-          </button>
-          <button
-            className="px-4 py-1.5 rounded-[var(--radius-sm)] text-base bg-[var(--bg-base)] text-[var(--text-secondary)] border border-[var(--border-default)] hover:border-[var(--accent)] transition-colors disabled:opacity-40"
-            disabled={!url.trim() && !config.mobileRelay}
-            onClick={() => { setUrl(''); applyUrl(''); }}
-          >
-            {t('mobileRelay.clear')}
-          </button>
-        </div>
-      </div>
-
-      {/* 连接状态 */}
-      <div className="flex items-center justify-between px-3 py-2.5 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)]">
-        <span className="text-base text-[var(--text-primary)]">{t('mobileRelay.statusLabel')}</span>
-        <RelayStatusBadge relayStatus={relayStatus} />
-      </div>
-    </div>
-  );
-}
-
 // ─── SettingsModal（主弹窗）───
 
 const MENU_ITEMS: { key: SettingsPage; labelKey: string }[] = [
@@ -1584,7 +1504,6 @@ const MENU_ITEMS: { key: SettingsPage; labelKey: string }[] = [
   { key: 'system', labelKey: 'settings.menu.system' },
   { key: 'font', labelKey: 'settings.menu.font' },
   { key: 'ai-notification', labelKey: 'settings.menu.aiNotification' },
-  { key: 'mobile', labelKey: 'settings.menu.mobile' },
   { key: 'shortcuts', labelKey: 'settings.menu.shortcuts' },
   { key: 'about', labelKey: 'settings.menu.about' },
 ];
@@ -1645,7 +1564,6 @@ export function SettingsModal({ open, onClose, initialPage }: Props) {
             {activePage === 'system' && <SystemSettings />}
             {activePage === 'font' && <FontSettings />}
             {activePage === 'ai-notification' && <AiNotificationSettings />}
-            {activePage === 'mobile' && <MobileRelaySettings />}
             {activePage === 'shortcuts' && <ShortcutsSettings />}
             {activePage === 'about' && <AboutSettings />}
           </div>

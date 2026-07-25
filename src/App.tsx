@@ -350,11 +350,7 @@ export function App() {
       </div>
       <SettingsModal open={configOpen} onClose={() => setConfigOpen(false)} initialPage={configPage} />
       <SshModal open={sshOpen} onClose={() => setSshOpen(false)} />
-      <MobileRelayModal
-        open={mobileOpen}
-        onClose={() => setMobileOpen(false)}
-        onOpenSettings={() => { setConfigPage('mobile'); setConfigOpen(true); }}
-      />
+      <MobileRelayModal open={mobileOpen} onClose={() => setMobileOpen(false)} />
       <SearchModal open={searchModalOpen} onClose={() => setSearchModalOpen(false)} />
       <ToastContainer />
     </div>

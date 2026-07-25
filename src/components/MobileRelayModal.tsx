@@ -11,8 +11,6 @@ import type { MobileRelayStatusPayload } from '../types';
 interface Props {
   open: boolean;
   onClose: () => void;
-  /** 未配置中转地址时跳转设置中心「移动端」页 */
-  onOpenSettings: () => void;
 }
 
 /** 中转地址(ws/wss)→ 移动端网页地址(http/https)。 */
@@ -24,10 +22,11 @@ function relayHttpBase(relayUrl: string): string {
   return `https://${trimmed}`;
 }
 
-/** 顶栏「移动端」面板:配对二维码、中转连接状态、重置配对。 */
-export function MobileRelayModal({ open, onClose, onOpenSettings }: Props) {
+/** 顶栏「移动端」面板:中转地址配置、连接状态、配对二维码、重置配对(一站式)。 */
+export function MobileRelayModal({ open, onClose }: Props) {
   const t = useT();
   const config = useAppStore((s) => s.config);
+  const setConfig = useAppStore((s) => s.setConfig);
   const relayStatus = useAppStore((s) => s.mobileRelayStatus);
   const setMobileRelayStatus = useAppStore((s) => s.setMobileRelayStatus);
 
@@ -37,6 +36,13 @@ export function MobileRelayModal({ open, onClose, onOpenSettings }: Props) {
   const relayUrl = config.mobileRelay?.relayUrl ?? '';
   const status = relayStatus?.status ?? 'disconnected';
   const connected = status === 'connected';
+
+  const [url, setUrl] = useState(relayUrl);
+
+  // 配置变化(含本面板保存后回写)同步到输入框
+  useEffect(() => {
+    setUrl(relayUrl);
+  }, [relayUrl]);
 
   // 打开面板时取一次当前状态兜底;关闭时丢弃已展示的二维码(旧码可能已被后续操作作废)
   useEffect(() => {
@@ -49,6 +55,21 @@ export function MobileRelayModal({ open, onClose, onOpenSettings }: Props) {
       .then(setMobileRelayStatus)
       .catch(() => {});
   }, [open, setMobileRelayStatus]);
+
+  // 保存中转地址并让后端重建连接;地址变了旧配对二维码即作废,一并清掉
+  const applyUrl = useCallback(async (nextUrl: string) => {
+    const trimmed = nextUrl.trim();
+    setQrDataUrl(null);
+    setQrRequested(false);
+    const cfg = useAppStore.getState().config;
+    const newConfig = {
+      ...cfg,
+      mobileRelay: trimmed ? { ...cfg.mobileRelay, relayUrl: trimmed } : undefined,
+    };
+    setConfig(newConfig);
+    await invoke('save_config', { config: newConfig });
+    await invoke('mobile_relay_apply', { relayUrl: trimmed });
+  }, [setConfig]);
 
   // 中转签发配对码 → 组配对链接 → 渲染二维码
   useTauriEvent<{ code: string }>('mobile-relay-pairing-code', useCallback((payload) => {
@@ -98,26 +119,52 @@ export function MobileRelayModal({ open, onClose, onOpenSettings }: Props) {
         </div>
 
         <div className="flex-1 overflow-y-auto px-5 py-4 space-y-4">
-          {!relayUrl ? (
-            <>
-              <p className="text-sm text-[var(--text-muted)] leading-relaxed">
-                {t('mobileRelay.modal.notConfigured')}
-              </p>
+          <p className="text-sm text-[var(--text-muted)] leading-relaxed">{t('mobileRelay.intro')}</p>
+
+          {/* 中转服务器地址 */}
+          <div>
+            <div className="text-base text-[var(--text-muted)] uppercase tracking-[0.1em] mb-2">
+              {t('mobileRelay.urlLabel')}
+            </div>
+            <input
+              type="text"
+              value={url}
+              onChange={(e) => setUrl(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Enter') applyUrl(url); }}
+              placeholder={t('mobileRelay.urlPlaceholder')}
+              spellCheck={false}
+              className="w-full px-3 py-2 rounded-[var(--radius-sm)] bg-[var(--bg-base)] border border-[var(--border-default)] text-base text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:border-[var(--accent)] focus:outline-none"
+            />
+            <div className="flex gap-2 mt-2">
               <button
-                className="px-4 py-1.5 rounded-[var(--radius-sm)] text-base bg-[var(--accent-muted)] text-[var(--accent)] border border-[var(--accent)] hover:opacity-90 transition-opacity"
-                onClick={() => { onClose(); onOpenSettings(); }}
+                className="px-4 py-1.5 rounded-[var(--radius-sm)] text-base bg-[var(--accent-muted)] text-[var(--accent)] border border-[var(--accent)] hover:opacity-90 transition-opacity disabled:opacity-40"
+                disabled={!url.trim()}
+                onClick={() => applyUrl(url)}
               >
-                {t('mobileRelay.modal.openSettings')}
+                {t('mobileRelay.apply')}
               </button>
-            </>
+              <button
+                className="px-4 py-1.5 rounded-[var(--radius-sm)] text-base bg-[var(--bg-base)] text-[var(--text-secondary)] border border-[var(--border-default)] hover:border-[var(--accent)] transition-colors disabled:opacity-40"
+                disabled={!url.trim() && !config.mobileRelay}
+                onClick={() => { setUrl(''); applyUrl(''); }}
+              >
+                {t('mobileRelay.clear')}
+              </button>
+            </div>
+          </div>
+
+          {/* 中转连接状态 */}
+          <div className="flex items-center justify-between px-3 py-2.5 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)]">
+            <span className="text-base text-[var(--text-primary)]">{t('mobileRelay.statusLabel')}</span>
+            <RelayStatusBadge relayStatus={relayStatus} />
+          </div>
+
+          {!relayUrl ? (
+            <p className="text-sm text-[var(--text-muted)] leading-relaxed">
+              {t('mobileRelay.modal.notConfigured')}
+            </p>
           ) : (
             <>
-              {/* 中转连接状态 */}
-              <div className="flex items-center justify-between px-3 py-2.5 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)]">
-                <span className="text-base text-[var(--text-primary)]">{t('mobileRelay.statusLabel')}</span>
-                <RelayStatusBadge relayStatus={relayStatus} />
-              </div>
-
               {/* 配对状态 */}
               <div className="flex items-center justify-between px-3 py-2.5 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)]">
                 <span className="text-base text-[var(--text-primary)]">{t('mobileRelay.modal.pairedLabel')}</span>

@@ -16,8 +16,7 @@ export const mobileRelay = {
     },
     modal: {
       title: "移动端",
-      notConfigured: "尚未配置中转服务器地址。移动端体系需要一台自托管中转服务器：手机经中转查看活跃 AI 会话并发送指令。",
-      openSettings: "前往设置",
+      notConfigured: "填写并保存中转服务器地址后，即可在此生成配对二维码。",
       pairedLabel: "配对状态",
       paired: "已配对",
       notPaired: "未配对",
@@ -48,8 +47,7 @@ export const mobileRelay = {
     },
     modal: {
       title: "Mobile",
-      notConfigured: "No relay server configured yet. The mobile system needs a self-hosted relay server: your phone connects through it to watch active AI sessions and send commands.",
-      openSettings: "Open settings",
+      notConfigured: "Save a relay server address above to generate a pairing QR code here.",
       pairedLabel: "Pairing status",
       paired: "Paired",
       notPaired: "Not paired",
