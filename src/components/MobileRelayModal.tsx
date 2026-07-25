@@ -101,12 +101,10 @@ export function MobileRelayModal({ open, onClose }: Props) {
   const paired = relayStatus?.paired;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-start justify-center pt-[12vh]" onClick={onClose}>
+    // 遮罩不响应点击:面板内有地址输入与配对操作,误点外侧关闭会丢掉未保存的内容
+    <div className="fixed inset-0 z-50 flex items-start justify-center pt-[12vh]">
       <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
-      <div
-        className="relative w-[440px] max-h-[76vh] bg-[var(--bg-surface)] border border-[var(--border-strong)] rounded-[var(--radius-md)] shadow-[var(--shadow-overlay)] flex flex-col overflow-hidden animate-slide-in"
-        onClick={(e) => e.stopPropagation()}
-      >
+      <div className="relative w-[440px] max-h-[76vh] bg-[var(--bg-surface)] border border-[var(--border-strong)] rounded-[var(--radius-md)] shadow-[var(--shadow-overlay)] flex flex-col overflow-hidden animate-slide-in">
         {/* 顶栏 */}
         <div className="flex items-center justify-between px-5 py-4 border-b border-[var(--border-subtle)]">
           <h2 className="text-lg font-semibold text-[var(--text-primary)]">{t('mobileRelay.modal.title')}</h2>
