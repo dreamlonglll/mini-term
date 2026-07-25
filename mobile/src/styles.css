@@ -1,0 +1,529 @@
+/* mini-term 移动端基础样式:暗色、移动优先 */
+
+:root {
+  --bg-base: #1a1a1a;
+  --bg-surface: #232323;
+  --border-subtle: #333;
+  --text-primary: #e8e6e3;
+  --text-secondary: #b5b2ad;
+  --text-muted: #7a7772;
+  --accent: #4a9eff;
+  --color-success: #4caf78;
+  --color-error: #e05c5c;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  background: var(--bg-base);
+  color: var(--text-primary);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC",
+    "Microsoft YaHei", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+.app {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.app-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: calc(env(safe-area-inset-top, 0px) + 12px) 16px 12px;
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--bg-surface);
+}
+
+.app-name {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.lang-toggle {
+  display: flex;
+  gap: 4px;
+}
+
+.lang-toggle button {
+  background: transparent;
+  border: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+  font-size: 12px;
+  padding: 3px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.lang-toggle button.active {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.app-main {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.status-screen {
+  text-align: center;
+  max-width: 320px;
+}
+
+.status-icon {
+  font-size: 44px;
+  color: var(--text-secondary);
+  margin-bottom: 16px;
+  line-height: 1;
+}
+
+.status-icon.spinning {
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 1; }
+}
+
+.status-title {
+  font-size: 18px;
+  font-weight: 600;
+  margin-bottom: 10px;
+}
+
+.status-hint {
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+
+/* ── 活跃 AI 会话列表 ── */
+
+.app-main.list-mode {
+  align-items: stretch;
+  justify-content: flex-start;
+  padding: 0;
+  overflow-y: auto;
+}
+
+.session-list {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.offline-banner {
+  background: rgba(224, 92, 92, 0.12);
+  border-bottom: 1px solid rgba(224, 92, 92, 0.4);
+  padding: 10px 16px;
+}
+
+.offline-title {
+  color: var(--color-error);
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.offline-hint {
+  color: var(--text-muted);
+  font-size: 12px;
+  margin-top: 2px;
+}
+
+.session-body {
+  padding: 12px 16px calc(env(safe-area-inset-bottom, 0px) + 16px);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.session-body.inert {
+  opacity: 0.45;
+  pointer-events: none;
+}
+
+.sessions-empty {
+  text-align: center;
+  padding: 48px 24px;
+}
+
+.sessions-empty-title {
+  font-size: 16px;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+.sessions-empty-hint {
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text-muted);
+}
+
+.project-card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.project-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  padding: 10px 14px 6px;
+}
+
+.pane-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  border-top: 1px solid var(--border-subtle);
+  width: 100%;
+  background: transparent;
+  border-left: none;
+  border-right: none;
+  border-bottom: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.pane-row:active {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.pane-chevron {
+  color: var(--text-muted);
+  font-size: 18px;
+  line-height: 1;
+}
+
+.pane-title {
+  flex: 1;
+  font-size: 15px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pane-status {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.status-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.dot-working {
+  background: var(--accent);
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+.dot-idle {
+  background: var(--color-success);
+}
+
+.dot-error {
+  background: var(--color-error);
+}
+
+/* ── 对话镜像 ── */
+
+.mirror-view {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.mirror-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--bg-surface);
+  flex-shrink: 0;
+}
+
+.mirror-back {
+  background: transparent;
+  border: none;
+  color: var(--accent);
+  font-size: 15px;
+  cursor: pointer;
+  padding: 4px 6px;
+  flex-shrink: 0;
+}
+
+.mirror-title {
+  font-size: 15px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mirror-closed {
+  padding: 12px 16px;
+  background: rgba(224, 92, 92, 0.12);
+  border-bottom: 1px solid rgba(224, 92, 92, 0.4);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-shrink: 0;
+}
+
+.mirror-closed-text {
+  color: var(--color-error);
+  font-size: 13px;
+}
+
+.mirror-closed-btn {
+  background: transparent;
+  border: 1px solid var(--color-error);
+  color: var(--color-error);
+  border-radius: 6px;
+  font-size: 13px;
+  padding: 4px 12px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.mirror-scroll {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px 14px calc(env(safe-area-inset-bottom, 0px) + 16px);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+}
+
+.mirror-load-older {
+  align-self: center;
+  background: transparent;
+  border: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+  border-radius: 14px;
+  font-size: 12px;
+  padding: 5px 14px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.mirror-loading,
+.mirror-empty {
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 13px;
+  padding: 40px 0;
+}
+
+.mirror-msg {
+  max-width: 92%;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.mirror-msg.from-input {
+  align-self: flex-end;
+  align-items: flex-end;
+}
+
+.mirror-msg.from-assistant {
+  align-self: flex-start;
+  align-items: flex-start;
+}
+
+.mirror-msg-source {
+  font-size: 11px;
+  color: var(--text-muted);
+  padding: 0 4px;
+}
+
+.mirror-msg-body {
+  border-radius: 12px;
+  padding: 9px 12px;
+  font-size: 14px;
+  line-height: 1.55;
+  overflow-wrap: break-word;
+  min-width: 0;
+}
+
+.from-input .mirror-msg-body {
+  background: rgba(74, 158, 255, 0.16);
+  border: 1px solid rgba(74, 158, 255, 0.3);
+}
+
+.from-assistant .mirror-msg-body {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+}
+
+.plain-input {
+  margin: 0;
+  font: inherit;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* Markdown 基础排版(AI 回复) */
+.markdown > *:first-child {
+  margin-top: 0;
+}
+
+.markdown > *:last-child {
+  margin-bottom: 0;
+}
+
+.markdown p,
+.markdown ul,
+.markdown ol,
+.markdown pre,
+.markdown blockquote {
+  margin: 8px 0;
+}
+
+.markdown ul,
+.markdown ol {
+  padding-left: 20px;
+}
+
+.markdown h1,
+.markdown h2,
+.markdown h3,
+.markdown h4 {
+  margin: 12px 0 6px;
+  font-size: 15px;
+}
+
+.markdown code {
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-family: Consolas, Menlo, monospace;
+  font-size: 12.5px;
+}
+
+.markdown pre {
+  background: #141414;
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  padding: 10px 12px;
+  overflow-x: auto;
+}
+
+.markdown pre code {
+  background: transparent;
+  padding: 0;
+}
+
+.markdown a {
+  color: var(--accent);
+}
+
+.markdown blockquote {
+  border-left: 3px solid var(--border-subtle);
+  padding-left: 10px;
+  color: var(--text-secondary);
+}
+
+/* ── 指令输入区 ── */
+
+.composer {
+  border-top: 1px solid var(--border-subtle);
+  background: var(--bg-surface);
+  padding: 8px 12px calc(env(safe-area-inset-bottom, 0px) + 10px);
+  flex-shrink: 0;
+}
+
+.composer-receipt {
+  font-size: 12px;
+  padding: 4px 2px 6px;
+}
+
+.composer-receipt.ok {
+  color: var(--color-success);
+}
+
+.composer-receipt.fail {
+  color: var(--color-error);
+}
+
+.composer-hint {
+  font-size: 12px;
+  color: var(--text-muted);
+  padding: 4px 2px 6px;
+}
+
+.composer-row {
+  display: flex;
+  gap: 8px;
+  align-items: flex-end;
+}
+
+.composer-input {
+  flex: 1;
+  resize: none;
+  background: var(--bg-base);
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 15px;
+  line-height: 1.4;
+  padding: 9px 12px;
+  min-height: 40px;
+  max-height: 120px;
+}
+
+.composer-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.composer-input:disabled {
+  opacity: 0.45;
+}
+
+.composer-send {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 10px;
+  font-size: 14px;
+  padding: 10px 16px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.composer-send:disabled {
+  opacity: 0.4;
+  cursor: default;
+}

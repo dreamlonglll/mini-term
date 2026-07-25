@@ -1,0 +1,48 @@
+export const mirror = {
+  zh: {
+    back: "返回",
+    backToList: "返回列表",
+    loading: "加载中…",
+    loadOlder: "加载更早的消息",
+    empty: "该会话暂无消息记录",
+    paneClosed: "该 AI 会话已结束或 pane 已关闭",
+    source: {
+      desktop: "桌面输入",
+      assistant: "AI 回复",
+      mobile: "移动端指令",
+    },
+    inputPlaceholder: "输入指令，将写入桌面终端…",
+    send: "发送",
+    sending: "发送中…",
+    receiptOk: "已写入桌面终端",
+    receiptFail: {
+      desktopOffline: "发送失败：桌面端离线",
+      paneNotFound: "发送失败：目标 pane 已关闭或 AI 会话已结束",
+      writeFailed: "发送失败：终端写入失败",
+    },
+    offlineCannotSend: "桌面端离线，暂时无法发送指令",
+  },
+  en: {
+    back: "Back",
+    backToList: "Back to list",
+    loading: "Loading…",
+    loadOlder: "Load earlier messages",
+    empty: "No messages recorded for this session yet",
+    paneClosed: "This AI session has ended or the pane was closed",
+    source: {
+      desktop: "Desktop input",
+      assistant: "AI reply",
+      mobile: "Mobile command",
+    },
+    inputPlaceholder: "Type a command to write into the desktop terminal…",
+    send: "Send",
+    sending: "Sending…",
+    receiptOk: "Written to desktop terminal",
+    receiptFail: {
+      desktopOffline: "Failed: desktop is offline",
+      paneNotFound: "Failed: target pane closed or AI session ended",
+      writeFailed: "Failed: terminal write error",
+    },
+    offlineCannotSend: "Desktop offline — commands cannot be sent right now",
+  },
+} as const;

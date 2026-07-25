@@ -1,0 +1,10 @@
+# 中转协议消息定义:桌面端(src-tauri)与中转服务(relay-server/server)共享。
+# PWA 侧 TypeScript 类型按仓库 serde camelCase 对齐约定手写镜像,不由此 crate 生成。
+[package]
+name = "mt-relay-protocol"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }

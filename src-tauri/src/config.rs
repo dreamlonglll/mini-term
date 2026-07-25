@@ -114,31 +114,18 @@ pub struct AppConfig {
     /// 单一来源，此列表只补充「还没有连接的分组」；空 Vec 时序列化跳过。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ssh_groups: Vec<String>,
-    /// cc-connect 集成配置(进程管理 + 项目导入关联 + dashboard 嵌入)。
-    /// 未配置时为 None;序列化时省略以保持老 config.json 干净。
+    /// 移动端中转配置(docs/adr/0001)。None = 未启用;序列化时省略保持文件干净。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cc_connect: Option<CcConnectConfig>,
+    pub mobile_relay: Option<MobileRelayConfig>,
 }
 
-/// cc-connect 集成的持久化配置。
+/// 移动端中转体系的持久化配置。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
-pub struct CcConnectConfig {
-    /// cc-connect 可执行文件路径(空字符串 = 让前端去 PATH 探测)
+pub struct MobileRelayConfig {
+    /// 中转服务器地址(如 wss://relay.example.com);空字符串 = 未配置、不建连。
     #[serde(default)]
-    pub exe_path: String,
-    /// config.toml 路径(空字符串 = 用默认 ~/.cc-connect/config.toml)
-    #[serde(default)]
-    pub config_path: String,
-    /// mini-term 启动时自动 spawn cc-connect
-    #[serde(default)]
-    pub auto_start: bool,
-    /// 额外启动参数
-    #[serde(default)]
-    pub extra_args: Vec<String>,
-    /// mini-term project id → cc-connect project name 映射
-    #[serde(default)]
-    pub project_links: std::collections::HashMap<String, String>,
+    pub relay_url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -313,7 +300,7 @@ impl Default for AppConfig {
             smart_copy_paste: false,
             ssh_connections: vec![],
             ssh_groups: vec![],
-            cc_connect: None,
+            mobile_relay: None,
         }
     }
 }
@@ -903,6 +890,71 @@ mod tests {
         assert!(
             !serialized_old.contains("sshGroups"),
             "空 sshGroups 不应序列化进 JSON: {serialized_old}"
+        );
+    }
+
+    #[test]
+    fn mobile_relay_round_trip_and_absent_default() {
+        // 有值:camelCase 字段名往返保留
+        let json = r#"{
+            "projects": [],
+            "defaultShell": "cmd",
+            "availableShells": [],
+            "uiFontSize": 13,
+            "terminalFontSize": 14,
+            "mobileRelay": {"relayUrl": "wss://relay.example.com"}
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            config.mobile_relay.as_ref().map(|m| m.relay_url.as_str()),
+            Some("wss://relay.example.com")
+        );
+        let serialized = serde_json::to_string(&config).unwrap();
+        assert!(serialized.contains(r#""mobileRelay":{"relayUrl":"wss://relay.example.com"}"#));
+        let reparsed: AppConfig = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(
+            reparsed.mobile_relay.map(|m| m.relay_url),
+            Some("wss://relay.example.com".into())
+        );
+
+        // 旧配置无该字段 → None,且 None 不序列化(保持老 config.json 干净)
+        let old: AppConfig = serde_json::from_str(
+            r#"{"projects":[],"defaultShell":"cmd","availableShells":[],"uiFontSize":13,"terminalFontSize":14}"#,
+        )
+        .unwrap();
+        assert!(old.mobile_relay.is_none());
+        let serialized_old = serde_json::to_string(&old).unwrap();
+        assert!(
+            !serialized_old.contains("mobileRelay"),
+            "未配置时不应序列化 mobileRelay: {serialized_old}"
+        );
+    }
+
+    #[test]
+    fn legacy_cc_connect_field_is_ignored_and_dropped_on_save() {
+        // cc-connect 集成已移除:带 ccConnect 字段的旧 config.json 必须静默加载
+        // (serde 默认忽略未知字段),且重新序列化后该字段消失(升级无感自动清除)。
+        let json = r#"{
+            "projects": [],
+            "defaultShell": "cmd",
+            "availableShells": [],
+            "uiFontSize": 13,
+            "terminalFontSize": 14,
+            "ccConnect": {
+                "exePath": "C:\\tools\\cc-connect.exe",
+                "configPath": "",
+                "autoStart": true,
+                "extraArgs": ["--verbose"],
+                "projectLinks": {"p1": "proj-one"}
+            }
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.default_shell, "cmd");
+
+        let serialized = serde_json::to_string(&config).unwrap();
+        assert!(
+            !serialized.contains("ccConnect"),
+            "保存后不应残留 ccConnect 字段: {serialized}"
         );
     }
 

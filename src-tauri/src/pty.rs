@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tauri::{AppHandle, Emitter};
 
 #[derive(Clone, Serialize)]
@@ -498,6 +498,9 @@ pub struct PtyManager {
     next_id: Arc<Mutex<u32>>,
     last_output: Arc<Mutex<HashMap<u32, Instant>>>,
     ai_sessions: Arc<Mutex<HashSet<u32>>>,
+    /// pty → 本轮 AI 会话的启动时刻(enter_ai 时记录)。对话镜像用它过滤
+    /// 早于本轮会话的旧记录文件,避免新会话未落盘时错绑上一次会话。
+    ai_started: Arc<Mutex<HashMap<u32, SystemTime>>>,
     input_states: Arc<Mutex<HashMap<u32, InputState>>>,
     last_ctrlc: Arc<Mutex<HashMap<u32, Instant>>>,
     last_enter: Arc<Mutex<HashMap<u32, Instant>>>,
@@ -515,6 +518,7 @@ impl PtyManager {
             next_id: Arc::new(Mutex::new(1)),
             last_output: Arc::new(Mutex::new(HashMap::new())),
             ai_sessions: Arc::new(Mutex::new(HashSet::new())),
+            ai_started: Arc::new(Mutex::new(HashMap::new())),
             input_states: Arc::new(Mutex::new(HashMap::new())),
             last_ctrlc: Arc::new(Mutex::new(HashMap::new())),
             last_enter: Arc::new(Mutex::new(HashMap::new())),
@@ -535,6 +539,11 @@ impl PtyManager {
 
     pub fn is_ai_session(&self, pty_id: u32) -> bool {
         self.ai_sessions.lock().unwrap().contains(&pty_id)
+    }
+
+    /// 本轮 AI 会话的启动时刻;不在 AI 会话中返回 None。
+    pub fn ai_session_started_at(&self, pty_id: u32) -> Option<SystemTime> {
+        self.ai_started.lock().unwrap().get(&pty_id).copied()
     }
 
     pub fn drain_submits(&self, pty_id: u32) -> Vec<UserSubmit> {
@@ -770,10 +779,13 @@ impl PtyManager {
         }
         if enter_ai || exit_ai {
             let mut sessions = self.ai_sessions.lock().unwrap();
+            let mut started = self.ai_started.lock().unwrap();
             if enter_ai {
                 sessions.insert(pty_id);
+                started.insert(pty_id, SystemTime::now());
             } else {
                 sessions.remove(&pty_id);
+                started.remove(&pty_id);
             }
         }
     }
@@ -1248,6 +1260,7 @@ pub fn kill_pty(
     let instance = state.instances.lock().unwrap().remove(&pty_id);
     state.last_output.lock().unwrap().remove(&pty_id);
     state.ai_sessions.lock().unwrap().remove(&pty_id);
+    state.ai_started.lock().unwrap().remove(&pty_id);
     state.input_states.lock().unwrap().remove(&pty_id);
     state.last_ctrlc.lock().unwrap().remove(&pty_id);
     state.last_enter.lock().unwrap().remove(&pty_id);
@@ -1559,6 +1572,28 @@ mod tests {
         mgr.track_input(1, "claude\r");
         assert!(mgr.drain_submits(1).is_empty());
         assert!(mgr.is_ai_session(1)); // 但会话状态已建立
+    }
+
+    #[test]
+    fn ai_session_started_at_follows_session_lifecycle() {
+        let mgr = PtyManager::new();
+        // 未进入 AI 会话:无启动时刻
+        assert!(mgr.ai_session_started_at(1).is_none());
+
+        let before = SystemTime::now();
+        mgr.track_input(1, "claude\r");
+        let started = mgr.ai_session_started_at(1).expect("进入会话应记录启动时刻");
+        assert!(started >= before && started <= SystemTime::now());
+
+        // Ctrl+D 退出:清除启动时刻(镜像不应再拿旧锚点)
+        mgr.track_input(1, "\x04");
+        assert!(!mgr.is_ai_session(1));
+        assert!(mgr.ai_session_started_at(1).is_none());
+
+        // 同 pane 再次进入:锚点刷新为新一轮的启动时刻
+        mgr.track_input(1, "claude\r");
+        let restarted = mgr.ai_session_started_at(1).expect("重启会话应重新记录");
+        assert!(restarted >= started);
     }
 
     #[test]

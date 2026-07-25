@@ -7,8 +7,6 @@
  */
 import { app } from './app';
 import { settings } from './settings';
-import { ccConnectModal } from './ccConnectModal';
-import { ccDashboard } from './ccDashboard';
 import { projectList } from './projectList';
 import { fileTree } from './fileTree';
 import { sshModal } from './sshModal';
@@ -32,9 +30,8 @@ import { time } from './time';
 import { prompt } from './prompt';
 import { externalLink } from './externalLink';
 import { updateChecker } from './updateChecker';
-import { ccConnectImport } from './ccConnectImport';
-import { ccProbe } from './ccProbe';
 import { remoteProject } from './remoteProject';
+import { mobileRelay } from './mobileRelay';
 
 type Dict = Record<string, unknown>;
 
@@ -42,8 +39,6 @@ export const dicts: { zh: Dict; en: Dict } = {
   zh: {
     app: app.zh,
     settings: settings.zh,
-    ccConnectModal: ccConnectModal.zh,
-    ccDashboard: ccDashboard.zh,
     projectList: projectList.zh,
     fileTree: fileTree.zh,
     sshModal: sshModal.zh,
@@ -67,15 +62,12 @@ export const dicts: { zh: Dict; en: Dict } = {
     prompt: prompt.zh,
     externalLink: externalLink.zh,
     updateChecker: updateChecker.zh,
-    ccConnectImport: ccConnectImport.zh,
-    ccProbe: ccProbe.zh,
     remoteProject: remoteProject.zh,
+    mobileRelay: mobileRelay.zh,
   },
   en: {
     app: app.en,
     settings: settings.en,
-    ccConnectModal: ccConnectModal.en,
-    ccDashboard: ccDashboard.en,
     projectList: projectList.en,
     fileTree: fileTree.en,
     sshModal: sshModal.en,
@@ -99,8 +91,7 @@ export const dicts: { zh: Dict; en: Dict } = {
     prompt: prompt.en,
     externalLink: externalLink.en,
     updateChecker: updateChecker.en,
-    ccConnectImport: ccConnectImport.en,
-    ccProbe: ccProbe.en,
     remoteProject: remoteProject.en,
+    mobileRelay: mobileRelay.en,
   },
 };

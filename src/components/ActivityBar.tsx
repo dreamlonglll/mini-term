@@ -41,10 +41,10 @@ const ICON_SSH = (
     <path d="M4.8 6.5 6.6 8l-1.8 1.5M8.4 10h2.8" />
   </svg>
 );
-const ICON_CONNECT = (
+const ICON_MOBILE = (
   <svg width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round">
-    <path d="M7 9a3 3 0 004.24 0l1.5-1.5a3 3 0 00-4.24-4.24L8 4" />
-    <path d="M9 7a3 3 0 00-4.24 0l-1.5 1.5a3 3 0 004.24 4.24L8 12" />
+    <rect x="4.5" y="1.5" width="7" height="13" rx="1.5" />
+    <path d="M7 12.5h2" />
   </svg>
 );
 const ICON_UPDATE = (
@@ -61,13 +61,13 @@ const ACCENT_BAR = (
 interface ActivityBarProps {
   onOpenSettings: () => void;
   onOpenSsh: () => void;
-  onOpenConnect: () => void;
+  onOpenMobile: () => void;
   /** 有新版本时的版本号（null = 无更新,不显示更新按钮） */
   updateVersion?: string | null;
   onOpenUpdate: () => void;
 }
 
-export function ActivityBar({ onOpenSettings, onOpenSsh, onOpenConnect, updateVersion, onOpenUpdate }: ActivityBarProps) {
+export function ActivityBar({ onOpenSettings, onOpenSsh, onOpenMobile, updateVersion, onOpenUpdate }: ActivityBarProps) {
   const t = useT();
   const config = useAppStore((s) => s.config);
   const projectStates = useAppStore((s) => s.projectStates);
@@ -149,9 +149,9 @@ export function ActivityBar({ onOpenSettings, onOpenSsh, onOpenConnect, updateVe
       <button className={btnClass(false)} onClick={onOpenSsh} title={t('app.activityBar.ssh')}>
         {ICON_SSH}
       </button>
-      {/* 连接 */}
-      <button className={btnClass(false)} onClick={onOpenConnect} title={t('app.activityBar.connect')}>
-        {ICON_CONNECT}
+      {/* 移动端(原 Connect 入口位置) */}
+      <button className={btnClass(false)} onClick={onOpenMobile} title={t('app.activityBar.mobile')}>
+        {ICON_MOBILE}
       </button>
 
       {/* 有新版本时才出现：点击前往下载 */}

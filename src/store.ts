@@ -16,7 +16,7 @@ import type {
   AiCompletionNotification,
   AiMarker,
   AiUserSubmitPayload,
-  CcConnectStatus,
+  MobileRelayStatusPayload,
 } from './types';
 import { restoreSavedProjectLayout } from './utils/layoutRestore';
 import { playNotificationSound } from './utils/notificationSound';
@@ -358,15 +358,9 @@ interface AppStore {
   searchModalOpen: boolean;
   setSearchModalOpen: (open: boolean) => void;
 
-  // cc-connect 状态(顶部状态点 + 设置页共享,由 App.tsx 拉起 5s 轮询)
-  ccConnectStatus: CcConnectStatus | null;
-  setCcConnectStatus: (status: CcConnectStatus | null) => void;
-
-  // cc-connect Dashboard modal(单例:App.tsx 唯一挂载,ProjectList 等通过 action 打开)
-  ccDashboardOpen: boolean;
-  ccDashboardDeepLink: string;
-  openCcDashboard: (deepLink?: string) => void;
-  closeCcDashboard: () => void;
+  // 移动端中转连接状态(后端 mobile-relay-status 事件驱动,设置页「移动端」区域展示)
+  mobileRelayStatus: MobileRelayStatusPayload | null;
+  setMobileRelayStatus: (status: MobileRelayStatusPayload | null) => void;
 }
 
 export const useAppStore = create<AppStore>((set, get) => ({
@@ -408,13 +402,8 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
   rightDrawer: null,
 
-  ccConnectStatus: null,
-  setCcConnectStatus: (status) => set({ ccConnectStatus: status }),
-
-  ccDashboardOpen: false,
-  ccDashboardDeepLink: '',
-  openCcDashboard: (deepLink) => set({ ccDashboardOpen: true, ccDashboardDeepLink: deepLink ?? '' }),
-  closeCcDashboard: () => set({ ccDashboardOpen: false }),
+  mobileRelayStatus: null,
+  setMobileRelayStatus: (status) => set({ mobileRelayStatus: status }),
 
   setActiveProject: (id) =>
     set((state) => {

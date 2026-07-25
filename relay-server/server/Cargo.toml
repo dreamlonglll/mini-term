@@ -1,0 +1,22 @@
+# 中转服务器:桌面端与移动端之间的消息转发。只做转发,不接触 AI/PTY/项目数据。
+# 中转纪律:消息体仅内存转发不落盘,日志只记元数据(连接、鉴权结果),不记消息内容。
+[package]
+name = "mt-relay-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mt-relay-protocol = { path = "../protocol" }
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "signal"] }
+futures-util = "0.3"
+serde = { workspace = true }
+serde_json = { workspace = true }
+# 配对码 / 长期凭证的不可猜测随机 id
+uuid = { version = "1", features = ["v4"] }
+# 托管 PWA 静态资源(SPA fallback 到 index.html)
+tower-http = { version = "0.6", features = ["fs"] }
+
+[dev-dependencies]
+# Seam 1 测试的模拟桌面端 WS 客户端(本地明文 ws://,无需 TLS feature)
+tokio-tungstenite = "0.27"

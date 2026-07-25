@@ -1,0 +1,16 @@
+# 中转镜像构建上下文瘦身:只需要 relay-server/ 与 mobile/ 的源码
+.git
+.scratch
+.worktrees
+docs
+node_modules
+dist
+mobile/node_modules
+mobile/dist
+src
+src-tauri
+relay-server/target
+public
+package.json
+package-lock.json
+*.md
