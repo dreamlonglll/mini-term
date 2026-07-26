@@ -31,11 +31,13 @@ function StatusGlyph({ status }: { status: PaneStatus }) {
         </>
       );
     case 'ai-working':
-      // 半填充：外圈 + 一段粗弧，形状上一眼区别于「完成」的实心对勾
+      // 底圈 + 一段亮弧 = spinner。这个形状本身就在说「正在转」，
+      // 所以它必须真的转（见下面的 animate-status-spin）—— 画着一段弧却纹丝不动，
+      // 看上去就是个卡死的加载指示器。
       return (
         <>
-          <circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" strokeWidth="1.6" opacity="0.35" />
-          <path d="M8 2a6 6 0 0 1 6 6" fill="none" stroke="currentColor" strokeWidth="2.6" strokeLinecap="round" />
+          <circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" strokeWidth="1.6" opacity="0.3" />
+          <path d="M8 2a6 6 0 0 1 6 6" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" />
         </>
       );
     case 'error':
@@ -61,7 +63,7 @@ export function StatusDot({ status, size = 'sm' }: { status: PaneStatus; size?: 
       width={px}
       height={px}
       viewBox="0 0 16 16"
-      className={`flex-shrink-0 ${status === 'ai-working' ? 'animate-glow' : ''}`}
+      className={`flex-shrink-0 ${status === 'ai-working' ? 'animate-status-spin' : ''}`}
       style={{ color: STATUS_COLORS[status] }}
       role="img"
       aria-label={label}

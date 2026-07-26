@@ -900,8 +900,16 @@ body {
 }
 
 @media (prefers-reduced-motion: reduce) {
+  /* 装饰性/循环性动效一律停掉 */
   .skeleton-line,
-  .pull-indicator .spinner {
+  .status-icon.spinning,
+  .dot-working {
     animation: none;
+  }
+
+  /* 例外：下拉刷新的 spinner 是「正在刷新」的唯一反馈，停住就等于假装卡死。
+     放慢而不是取消 —— 小幅匀速旋转不属于 reduced-motion 要消除的那类动效。 */
+  .pull-indicator .spinner {
+    animation-duration: 2.4s;
   }
 }

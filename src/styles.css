@@ -204,6 +204,18 @@ body.ssh-conn-dragging {
   animation: slideIn 0.12s ease-out;
 }
 
+/* AI 运行中的状态点。形状是 spinner（底圈 + 一段亮弧），就得真的转起来；
+   匀速旋转也比呼吸/闪烁更贴「正在进行」的语义，且不抢注意力。
+   transform-origin 显式写成 50%：SVG 元素的默认原点是 (0,0)，不设会绕左上角甩出去。 */
+@keyframes statusSpin {
+  to { transform: rotate(360deg); }
+}
+
+.animate-status-spin {
+  transform-origin: 50% 50%;
+  animation: statusSpin 1.1s linear infinite;
+}
+
 /* ===== 减弱动效 =====
    状态点、更新徽标等是无限循环动画，对前庭敏感 / 注意力障碍用户是持续干扰。
    系统开了「减弱动态效果」就一律静止 —— 状态本身已由形状+颜色编码，不靠动画传达。 */
@@ -218,6 +230,17 @@ body.ssh-conn-dragging {
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
     scroll-behavior: auto !important;
+  }
+
+  /* 例外：**进行中**指示器必须继续动。
+     它传达的不是装饰而是状态本身（「这件事还在跑」）——一个停住的 spinner
+     不是"安静"，是在说谎，看上去就是卡死。prefers-reduced-motion 要消除的是
+     闪烁、位移、视差这类会引发不适的效果；小幅匀速旋转不在其列，放慢即可。
+     真正该停的闪烁（.animate-blink）仍由上面的通配规则停掉。 */
+  .animate-status-spin,
+  .animate-spin {
+    animation-duration: 2.4s !important;
+    animation-iteration-count: infinite !important;
   }
 }
 

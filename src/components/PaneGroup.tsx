@@ -245,7 +245,10 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
               role="tab"
               tabIndex={isActive ? 0 : -1}
               aria-selected={isActive}
-              className={`flex items-center gap-1.5 pl-3 pr-2 py-[3px] cursor-pointer whitespace-nowrap transition-all duration-100 relative ${
+              // 状态点 + 标题 + 关闭按钮作为一组在 tab 内居中：左右 padding 对称，
+              // 再给一个最小宽度 —— 否则 tab 宽度完全由内容撑开，居中无从谈起，
+              // 短标题（nushell）和长标题的 tab 也会宽窄不一显得毛糙。
+              className={`flex items-center justify-center gap-1.5 px-3 py-[3px] min-w-[7.5rem] cursor-pointer whitespace-nowrap transition-all duration-100 relative ${
                 isActive
                   ? 'bg-[var(--bg-terminal)] text-[var(--text-primary)]'
                   : 'text-[var(--text-muted)] hover:text-[var(--text-secondary)] hover:bg-[var(--border-subtle)]'
