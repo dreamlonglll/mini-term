@@ -1,9 +1,9 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '../store';
 import { showAlert } from '../utils/prompt';
 import { isWslPath } from '../utils/wslPath';
+import { Modal, ModalCloseButton } from './Modal';
 import { useT, t as tStatic } from '../i18n';
 import type { ProjectConfig, ProjectEnvVar } from '../types';
 
@@ -103,16 +103,6 @@ export function ProjectEnvVarsModal({ project, onClose }: Props) {
     }
   });
 
-  // Esc 关闭
-  useEffect(() => {
-    if (!project) return;
-    const handler = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && !busy) onClose();
-    };
-    window.addEventListener('keydown', handler);
-    return () => window.removeEventListener('keydown', handler);
-  }, [project, busy, onClose]);
-
   const errors = useMemo(() => computeErrors(rows), [rows]);
   const hasErrors = errors.size > 0;
 
@@ -163,22 +153,21 @@ export function ProjectEnvVarsModal({ project, onClose }: Props) {
   if (!project) return null;
   const isWsl = isWslPath(project.path);
 
-  return createPortal(
-    <div className="fixed inset-0 z-50 flex items-start justify-center pt-[10vh]">
-      {/* 遮罩:不响应点击,防误触关闭 */}
-      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
-      <div className="relative w-[640px] max-h-[80vh] bg-[var(--bg-surface)] border border-[var(--border-strong)] rounded-[var(--radius-md)] shadow-[var(--shadow-overlay)] flex flex-col overflow-hidden animate-slide-in">
-        {/* 顶栏 */}
-        <div className="px-5 py-4 border-b border-[var(--border-subtle)]">
-          <div className="flex items-center justify-between">
+  return (
+    <Modal
+      open
+      onClose={onClose}
+      ariaLabel={t('envVars.title')}
+      panelClassName="w-[640px] max-h-[80vh]"
+      // 一整屏手填的键值对，点遮罩关掉代价太大；Esc 仍是逃生口（保存中除外）
+      closeOnOverlay={false}
+      closeOnEscape={!busy}
+    >
+      {/* 顶栏（带副标题，故不用 Modal 自带的 title） */}
+      <div className="px-5 py-4 border-b border-[var(--border-subtle)] flex-shrink-0">
+          <div className="flex items-center justify-between gap-3">
             <h2 className="text-lg font-semibold text-[var(--text-primary)]">{t('envVars.title')}</h2>
-            <button
-              className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors text-lg leading-none disabled:opacity-40"
-              onClick={onClose}
-              disabled={busy}
-            >
-              ✕
-            </button>
+            <ModalCloseButton onClose={onClose} label={t('envVars.cancel')} />
           </div>
           <div className="text-sm text-[var(--text-muted)] mt-1 truncate">
             {t('envVars.subtitle', { name: project.name })}
@@ -197,8 +186,8 @@ export function ProjectEnvVarsModal({ project, onClose }: Props) {
           {/* 表头 */}
           <div className="flex items-center gap-2 mb-2 text-xs text-[var(--text-muted)] uppercase tracking-wide">
             <span className="w-4 text-center">{t('envVars.colEnabled')}</span>
-            <span className="flex-[40] min-w-0">Key</span>
-            <span className="flex-[55] min-w-0">Value</span>
+            <span className="flex-[40] min-w-0">{t('envVars.keyHeader')}</span>
+            <span className="flex-[55] min-w-0">{t('envVars.valueHeader')}</span>
             <span className="w-6"></span>
           </div>
 
@@ -220,7 +209,7 @@ export function ProjectEnvVarsModal({ project, onClose }: Props) {
                     <input
                       ref={isPending ? newKeyInputRef : undefined}
                       type="text"
-                      placeholder="KEY"
+                      placeholder={t('envVars.keyPlaceholder')}
                       className={`flex-[40] min-w-0 px-2 py-1 text-sm bg-[var(--bg-base)] border ${errorBorder} rounded font-mono outline-none focus:border-[var(--accent)]`}
                       value={row.key}
                       onChange={(e) => updateRow(row.rid, { key: e.target.value })}
@@ -230,7 +219,7 @@ export function ProjectEnvVarsModal({ project, onClose }: Props) {
                     />
                     <input
                       type="text"
-                      placeholder="value"
+                      placeholder={t('envVars.valuePlaceholder')}
                       className={`flex-[55] min-w-0 px-2 py-1 text-sm bg-[var(--bg-base)] border ${errorBorder} rounded font-mono outline-none focus:border-[var(--accent)]`}
                       value={row.value}
                       onChange={(e) => updateRow(row.rid, { value: e.target.value })}
@@ -285,8 +274,6 @@ export function ProjectEnvVarsModal({ project, onClose }: Props) {
             {busy ? t('envVars.saving') : t('envVars.save')}
           </button>
         </div>
-      </div>
-    </div>,
-    document.body,
+    </Modal>
   );
 }

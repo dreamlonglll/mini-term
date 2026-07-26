@@ -272,7 +272,9 @@ export function TerminalInstance({ ptyId }: Props) {
         onMouseUp={handleMouseUp}
         onContextMenu={handleContextMenu}
       >
-        <div ref={containerRef} className="absolute top-1.5 bottom-0 left-2.5 right-0 cursor-none" />
+        {/* cursor-none 曾挂在这里,但 xterm.css 的 `.xterm { cursor: text }` 把它整个盖掉了,
+            只在 padding 缝隙生效 —— 留着纯属误导,已移除 */}
+        <div ref={containerRef} className="absolute top-1.5 bottom-0 left-2.5 right-0" />
 
         {fileDrag && (
           <div

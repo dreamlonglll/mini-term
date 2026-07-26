@@ -3,7 +3,7 @@
  *
  * 后端 `mobile-start-session` 事件到达后:
  *   建 pane(按启动器绑定的 shell,未绑定则用默认 shell)
- *   → 挂进当前 tab 布局树的 tab 栏,**不**切当前项目、**不**切当前 pane
+ *   → 挂进项目布局树最左侧 leaf 的 tab 栏,**不**切当前项目、**不**切当前 pane
  *   → 把启动命令连同回车写入 PTY
  *
  * 最后一步是关键:AI 会话身份靠输入检测建立,只有"往 shell 里敲进启动命令并回车"
@@ -23,14 +23,11 @@ import type {
   PaneState,
   SplitNode,
   StartSessionFailReason,
-  TerminalTab,
 } from '../types';
 
 /**
- * 把新 pane 追加到布局树最左侧 leaf 的 tab 栏末尾,不动 activePaneId。
- *
- * 桌面端只渲染当前 tab 的这棵树,leaf 的 tab 栏(PaneGroup)是「终端标签」的唯一出口——
- * 单开一个 ProjectState.tab 在界面上是看不见的,那一层没有切换 UI。
+ * 把新 pane 追加到布局树最左侧 leaf 的 tab 栏末尾,不动 activePaneId
+ * （leaf 的 tab 栏是「终端标签」的唯一出口）。
  */
 function appendPaneToFirstLeaf(node: SplitNode, pane: PaneState): SplitNode {
   if (node.type === 'leaf') {
@@ -101,25 +98,15 @@ export async function handleMobileStartSession(
   getOrCreateTerminal(ptyId);
 
   const store = useAppStore.getState();
-  const ps = store.projectStates.get(projectId);
-  const activeTab = ps?.tabs.find((tab) => tab.id === ps.activeTabId);
-  if (activeTab) {
-    // 挂进用户当前看得到的那棵布局树;activePaneId 不动 —— 远程操作不抢桌面现场
-    store.updateTabLayout(
-      projectId,
-      activeTab.id,
-      appendPaneToFirstLeaf(activeTab.splitLayout, pane),
-    );
-  } else {
-    // 项目一个 tab 都没有:只能新开。addTab 的空态兜底会激活它,否则终端区还是空白
-    const tab: TerminalTab = {
-      id: genId(),
-      customTitle: launcherName,
-      status: 'idle',
-      splitLayout: { type: 'leaf', panes: [pane], activePaneId: paneId },
-    };
-    store.addTab(projectId, tab, false);
-  }
+  const layout = store.projectStates.get(projectId)?.layout;
+  // 有布局就挂进去（activePaneId 不动 —— 远程操作不抢桌面现场）；
+  // 项目还一个终端都没有时新建根 leaf，否则终端区仍是空白。
+  store.setProjectLayout(
+    projectId,
+    layout
+      ? appendPaneToFirstLeaf(layout, pane)
+      : { type: 'leaf', panes: [pane], activePaneId: paneId },
+  );
   saveLayoutToConfig(projectId);
 
   try {

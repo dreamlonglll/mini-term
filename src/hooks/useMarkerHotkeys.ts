@@ -1,77 +1,38 @@
 import { useEffect, useRef } from 'react';
 import { useAppStore } from '../store';
 import { scrollToMarker } from '../utils/terminalCache';
-import type { SplitNode } from '../types';
+import { HOTKEYS, matchHotkey } from '../utils/hotkeys';
+import { focusedPtyIdFromDom, findPaneByPtyId, resolveActivePane } from '../utils/layoutOps';
 
-/// 多分屏下,DOM focus 是判断"用户当前操作哪个 pane"最准确的信号:
-/// 用户输入时 xterm textarea 是 document.activeElement,它的最近祖先
-/// `[data-pty-id]` 就是当前 PaneGroup 的 active pane ptyId。
-///
-/// 失败时(如焦点在弹窗、菜单、body)回退到 findActivePaneIdInTree,
-/// 行为与之前一致(命中树里第一个 leaf 的 activePaneId)。
-function findFocusedPtyIdFromDom(): number | null {
-  const active = document.activeElement;
-  if (!active) return null;
-  const el = (active as Element).closest('[data-pty-id]') as HTMLElement | null;
-  if (!el?.dataset.ptyId) return null;
-  const id = Number(el.dataset.ptyId);
-  return Number.isFinite(id) ? id : null;
-}
+const PREV = HOTKEYS.find((h) => h.id === 'markerPrev')!;
+const NEXT = HOTKEYS.find((h) => h.id === 'markerNext')!;
 
-function findActivePaneIdInTree(node: SplitNode): string | null {
-  if (node.type === 'leaf') return node.activePaneId || null;
-  for (const child of node.children) {
-    const id = findActivePaneIdInTree(child);
-    if (id) return id;
-  }
-  return null;
-}
-
-function findPtyIdByPaneId(node: SplitNode, paneId: string): number | null {
-  if (node.type === 'leaf') {
-    const pane = node.panes.find((p) => p.id === paneId);
-    return pane?.ptyId ?? null;
-  }
-  for (const child of node.children) {
-    const id = findPtyIdByPaneId(child, paneId);
-    if (id != null) return id;
-  }
-  return null;
-}
-
-/// 校验给定 ptyId 是否属于当前 tab,防止焦点落在已切走 tab 的残留 DOM 上时误跳转
-function ptyBelongsToTree(node: SplitNode, ptyId: number): boolean {
-  if (node.type === 'leaf') {
-    return node.panes.some((p) => p.ptyId === ptyId);
-  }
-  return node.children.some((c) => ptyBelongsToTree(c, ptyId));
-}
-
+/**
+ * AI 任务标记跳转（Ctrl+Shift+↑/↓）。
+ *
+ * 单独于 useGlobalHotkeys 之外，因为它要维护「这个 pane 上次跳到哪条 marker」
+ * 的游标——连按方向键要沿列表连续走，而不是每次都从头/尾重来。
+ */
 export function useMarkerHotkeys() {
   const lastJumpRef = useRef<Map<number, string>>(new Map());
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if (!(e.ctrlKey || e.metaKey) || !e.shiftKey || e.altKey) return;
-      if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
+      const dir = matchHotkey(e, PREV) ? -1 : matchHotkey(e, NEXT) ? +1 : 0;
+      if (dir === 0) return;
 
       const state = useAppStore.getState();
       const activeProjectId = state.activeProjectId;
       if (!activeProjectId) return;
-      const ps = state.projectStates.get(activeProjectId);
-      if (!ps) return;
-      const tab = ps.tabs.find((t) => t.id === ps.activeTabId);
-      if (!tab) return;
+      const layout = state.projectStates.get(activeProjectId)?.layout;
+      if (!layout) return;
 
-      // 优先用 DOM focus 定位真正聚焦的 pane(多分屏关键修复);
-      // 焦点不在任何 pane 内时回退到树里第一个 leaf 的 activePaneId
-      const domPtyId = findFocusedPtyIdFromDom();
-      const ptyId = domPtyId != null && ptyBelongsToTree(tab.splitLayout, domPtyId)
+      // 优先用 DOM focus 定位真正聚焦的 pane（多分屏关键）；
+      // 焦点不在任何 pane 内时回退到布局里第一个 leaf 的 activePaneId
+      const domPtyId = focusedPtyIdFromDom();
+      const ptyId = domPtyId != null && findPaneByPtyId(layout, domPtyId)
         ? domPtyId
-        : (() => {
-            const paneId = findActivePaneIdInTree(tab.splitLayout);
-            return paneId ? findPtyIdByPaneId(tab.splitLayout, paneId) : null;
-          })();
+        : resolveActivePane(layout)?.ptyId ?? null;
       if (ptyId == null) return;
 
       const markers = state.getMarkersForPty(ptyId);
@@ -79,7 +40,6 @@ export function useMarkerHotkeys() {
 
       const lastId = lastJumpRef.current.get(ptyId);
       const lastIdx = lastId ? markers.findIndex((m) => m.id === lastId) : markers.length;
-      const dir = e.key === 'ArrowUp' ? -1 : +1;
 
       let nextIdx: number;
       if (lastId && lastIdx >= 0) {

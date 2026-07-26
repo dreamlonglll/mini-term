@@ -112,7 +112,7 @@ export function GitHistory() {
             }`}
             onClick={() => setActiveTab(tab)}
           >
-            {tab === 'history' ? 'History' : 'Changes'}
+            {tab === 'history' ? t('panels.history') : t('panels.changes')}
           </button>
         ))}
       </div>
@@ -126,7 +126,7 @@ export function GitHistory() {
           >
             <div className="flex items-center gap-1.5 min-w-0">
               <span
-                className="text-[13px] w-3 text-center text-[var(--text-muted)] transition-transform duration-150"
+                className="text-base w-3 text-center text-[var(--text-muted)] transition-transform duration-150"
                 style={{
                   transform: repoDropdownOpen ? 'rotate(0deg)' : 'rotate(-90deg)',
                   display: 'inline-block',
@@ -136,7 +136,7 @@ export function GitHistory() {
               </span>
               <span className="truncate font-medium">{selectedRepoInfo?.name ?? t("gitHistory.selectRepo")}</span>
               {selectedRepoInfo?.currentBranch && (
-                <span className="shrink-0 text-[11px] leading-[18px] px-1.5 rounded font-mono text-[var(--text-muted)] bg-[var(--border-subtle)]">
+                <span className="shrink-0 text-sm leading-[18px] px-1.5 rounded font-mono text-[var(--text-muted)] bg-[var(--border-subtle)]">
                   {selectedRepoInfo.currentBranch}
                 </span>
               )}
@@ -159,7 +159,7 @@ export function GitHistory() {
                 >
                   <span className="truncate">{r.name}</span>
                   {r.currentBranch && (
-                    <span className="shrink-0 text-[11px] leading-[18px] px-1.5 rounded font-mono text-[var(--text-muted)] bg-[var(--border-subtle)]">
+                    <span className="shrink-0 text-sm leading-[18px] px-1.5 rounded font-mono text-[var(--text-muted)] bg-[var(--border-subtle)]">
                       {r.currentBranch}
                     </span>
                   )}

@@ -16,6 +16,7 @@ export const projectList = {
     newSubgroupPlaceholder: "请输入子组名称",
     menu: {
       rename: "重命名",
+      remove: "移除项目",
       openInFolder: "在文件夹中打开",
       copyAbsolutePath: "复制绝对路径",
       associateSsh: "关联 SSH…",
@@ -55,6 +56,7 @@ export const projectList = {
     newSubgroupPlaceholder: "Enter subgroup name",
     menu: {
       rename: "Rename",
+      remove: "Remove project",
       openInFolder: "Reveal in Folder",
       copyAbsolutePath: "Copy Absolute Path",
       associateSsh: "Associate SSH…",

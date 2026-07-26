@@ -1,6 +1,5 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import type { MouseEvent as ReactMouseEvent, ReactNode } from 'react';
-import { createPortal } from 'react-dom';
 import { invoke, convertFileSrc } from '@tauri-apps/api/core';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import ReactMarkdown from 'react-markdown';
@@ -8,6 +7,7 @@ import remarkGfm from 'remark-gfm';
 import rehypeRaw from 'rehype-raw';
 import type { FileContentResult } from '../types';
 import { openExternalUrl } from '../utils/externalLink';
+import { Modal } from './Modal';
 import { useT } from '../i18n';
 
 interface FileViewerModalProps {
@@ -186,15 +186,6 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
     if (contentRef.current) contentRef.current.scrollTop = 0;
   }, [currentPath]);
 
-  useEffect(() => {
-    if (!open) return;
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [open, onClose]);
-
   // 仅当查看的是原始 filePath 时才高亮跳转行
   useEffect(() => {
     if (currentPath === filePath && result && highlightLine && highlightRef.current) {
@@ -206,14 +197,9 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
 
   const fileName = currentPath.replace(/\\/g, '/').split('/').pop() ?? currentPath;
 
-  return createPortal(
-    <div className="fixed inset-0 z-50 flex items-center justify-center select-text" onClick={onClose}>
-      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
-      <div
-        className="relative flex flex-col overflow-hidden bg-[var(--bg-surface)] border border-[var(--border-strong)] rounded-[var(--radius-md)] shadow-[var(--shadow-overlay)] animate-slide-in"
-        style={{ width: '90vw', height: '80vh' }}
-        onClick={(e) => e.stopPropagation()}
-      >
+  return (
+    <Modal open={open} onClose={onClose} align="center" ariaLabel={fileName}
+      panelClassName="w-[90vw] h-[80vh] select-text">
         {/* 工具栏 */}
         <div className="flex items-center justify-between px-4 py-3 border-b border-[var(--border-subtle)] flex-shrink-0">
           <div className="flex items-center gap-2 min-w-0">
@@ -345,8 +331,6 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
             </div>
           )}
         </div>
-      </div>
-    </div>,
-    document.body,
+    </Modal>
   );
 }

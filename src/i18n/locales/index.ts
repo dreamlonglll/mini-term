@@ -32,6 +32,9 @@ import { externalLink } from './externalLink';
 import { updateChecker } from './updateChecker';
 import { remoteProject } from './remoteProject';
 import { mobileRelay } from './mobileRelay';
+import { panels } from './panels';
+import { terminalSearch } from './terminalSearch';
+import { projectSwitcher } from './projectSwitcher';
 
 type Dict = Record<string, unknown>;
 
@@ -64,6 +67,9 @@ export const dicts: { zh: Dict; en: Dict } = {
     updateChecker: updateChecker.zh,
     remoteProject: remoteProject.zh,
     mobileRelay: mobileRelay.zh,
+    panels: panels.zh,
+    terminalSearch: terminalSearch.zh,
+    projectSwitcher: projectSwitcher.zh,
   },
   en: {
     app: app.en,
@@ -93,5 +99,8 @@ export const dicts: { zh: Dict; en: Dict } = {
     updateChecker: updateChecker.en,
     remoteProject: remoteProject.en,
     mobileRelay: mobileRelay.en,
+    panels: panels.en,
+    terminalSearch: terminalSearch.en,
+    projectSwitcher: projectSwitcher.en,
   },
 };

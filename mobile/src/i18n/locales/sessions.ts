@@ -4,6 +4,9 @@ export const sessions = {
     empty: "当前没有活跃的 AI 会话",
     emptyHint: "在桌面端 mini-term 的终端里启动 Claude / Codex 后，对应 pane 会实时出现在这里。",
     offlineBanner: "桌面端离线",
+    pullToRefresh: "下拉刷新",
+    releaseToRefresh: "松开即可刷新",
+    refreshing: "正在刷新…",
     offlineHint: "mini-term 未连接中转服务器，列表暂不可用；桌面端恢复后自动更新。",
     status: {
       aiWorking: "工作中",
@@ -24,6 +27,9 @@ export const sessions = {
     empty: "No active AI sessions",
     emptyHint: "Start Claude / Codex in a desktop mini-term terminal and the pane will appear here in real time.",
     offlineBanner: "Desktop offline",
+    pullToRefresh: "Pull to refresh",
+    releaseToRefresh: "Release to refresh",
+    refreshing: "Refreshing…",
     offlineHint: "mini-term is not connected to the relay; the list is unavailable until the desktop comes back.",
     status: {
       aiWorking: "Working",

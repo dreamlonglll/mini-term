@@ -12,6 +12,7 @@ import { Terminal, type IMarker, type IDecoration } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebglAddon } from '@xterm/addon-webgl';
 import { LigaturesAddon } from '@xterm/addon-ligatures';
+import type { SearchAddon } from '@xterm/addon-search';
 import { activateUnicodeWidth } from './terminalUnicodeWidth';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
@@ -41,6 +42,9 @@ interface CachedEntry extends CachedTerminal {
   webglLoaded: boolean;
   webglAddon?: WebglAddon;
   ligaturesAddon?: LigaturesAddon;
+  /** 终端内查找的 addon，首次 Ctrl+F 时由 terminalSearch.ts 懒加载。
+   *  不需要单独回收：term.dispose() 会连带 dispose 所有已加载 addon。 */
+  searchAddon?: SearchAddon;
 }
 
 export const DARK_TERMINAL_THEME = {
@@ -538,6 +542,16 @@ export function reloadLigaturesForPty(ptyId: number): void {
 /** 获取已缓存的终端（不创建新的） */
 export function getCachedTerminal(ptyId: number): CachedTerminal | undefined {
   return cache.get(ptyId);
+}
+
+/** 终端内查找 addon 的存取（由 terminalSearch.ts 懒加载后寄存在此）。 */
+export function getSearchAddon(ptyId: number): SearchAddon | undefined {
+  return cache.get(ptyId)?.searchAddon;
+}
+
+export function setSearchAddon(ptyId: number, addon: SearchAddon): void {
+  const entry = cache.get(ptyId);
+  if (entry) entry.searchAddon = addon;
 }
 
 /** 彻底销毁终端（面板关闭 / kill_pty 后调用） */

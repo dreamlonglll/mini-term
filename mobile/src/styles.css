@@ -584,7 +584,9 @@ body {
   line-height: 1.4;
   padding: 9px 12px;
   min-height: 40px;
-  max-height: 120px;
+  /* 自增高上限：JS 按行高算到 6 行，这里兜底防极端字体下失控 */
+  max-height: 160px;
+  overflow-y: auto;
 }
 
 .composer-input:focus {
@@ -822,4 +824,92 @@ body {
   flex-shrink: 0;
   font-size: 12px;
   opacity: 0.75;
+}
+
+
+/* ===== 镜像首屏骨架 =====
+   拉整段会话记录要一会儿，一行「加载中…」看起来像卡死；给出气泡形状的占位，
+   让等待有个「内容正在来」的形，而不是「什么都没有」。 */
+.mirror-skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 12px 0;
+}
+
+.skeleton-msg {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  max-width: 86%;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: var(--bg-elevated);
+}
+
+.skeleton-msg.from-input {
+  align-self: flex-end;
+  align-items: flex-end;
+}
+
+.skeleton-line {
+  height: 10px;
+  border-radius: 5px;
+  background: linear-gradient(
+    90deg,
+    var(--border-subtle) 25%,
+    var(--border-strong) 37%,
+    var(--border-subtle) 63%
+  );
+  background-size: 400% 100%;
+  animation: skeletonShimmer 1.4s ease-in-out infinite;
+}
+
+.skeleton-line.w-40 { width: 40%; }
+.skeleton-line.w-full { width: 100%; }
+.skeleton-line.w-75 { width: 75%; }
+
+@keyframes skeletonShimmer {
+  0% { background-position: 100% 50%; }
+  100% { background-position: 0 50%; }
+}
+
+/* ===== 下拉刷新 ===== */
+.pull-indicator {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-size: 13px;
+  transition: height 0.18s ease;
+}
+
+.pull-indicator .spinner {
+  width: 14px;
+  height: 14px;
+  margin-right: 6px;
+  border: 2px solid var(--text-muted);
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: pullSpin 0.8s linear infinite;
+}
+
+@keyframes pullSpin {
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* 装饰性/循环性动效一律停掉 */
+  .skeleton-line,
+  .status-icon.spinning,
+  .dot-working {
+    animation: none;
+  }
+
+  /* 例外：下拉刷新的 spinner 是「正在刷新」的唯一反馈，停住就等于假装卡死。
+     放慢而不是取消 —— 小幅匀速旋转不属于 reduced-motion 要消除的那类动效。 */
+  .pull-indicator .spinner {
+    animation-duration: 2.4s;
+  }
 }

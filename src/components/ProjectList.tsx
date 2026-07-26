@@ -1,5 +1,4 @@
 import { useCallback, useState, useRef, useEffect } from 'react';
-import { createPortal } from 'react-dom';
 import { open } from '@tauri-apps/plugin-dialog';
 import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
@@ -10,6 +9,7 @@ import { DoneTag } from './DoneTag';
 import { SshAssocModal } from './SshAssocModal';
 import { ProjectEnvVarsModal } from './ProjectEnvVarsModal';
 import { AddRemoteProjectModal } from './AddRemoteProjectModal';
+import { Modal } from './Modal';
 import { connectionSummary } from './SshModal';
 import { showContextMenu } from '../utils/contextMenu';
 import { showPrompt } from '../utils/prompt';
@@ -213,11 +213,8 @@ export function ProjectList() {
     // 否则会残留孤儿 shell/AI 进程(继续占用 CPU/内存、AI 可能还在烧 token)与泄漏的
     // WebGL 上下文。markers 由 removeProject 内部清理。
     const ps = useAppStore.getState().projectStates.get(id);
-    if (ps) {
-      const ptyIds = new Set<number>();
-      for (const tab of ps.tabs) {
-        for (const pid of collectPtyIds(tab.splitLayout)) ptyIds.add(pid);
-      }
+    if (ps?.layout) {
+      const ptyIds = new Set(collectPtyIds(ps.layout));
       for (const ptyId of ptyIds) {
         invoke('kill_pty', { ptyId }).catch(() => {});
         disposeTerminal(ptyId);
@@ -228,19 +225,17 @@ export function ProjectList() {
     setConfirmTarget(null);
   }, [confirmTarget, removeProject, saveConfig]);
 
+  // 项目列表只关心 AI 相关状态:error 由 pane 自己在终端里显示,列在侧栏里
+  // 会把「某个 shell 退出了」渲染成整个项目出事,反而盖住真正在跑的 AI。
   const getProjectStatus = (projectId: string): PaneStatus => {
-    const ps = projectStates.get(projectId);
-    if (!ps || ps.tabs.length === 0) return 'idle';
+    const layout = projectStates.get(projectId)?.layout;
+    if (!layout) return 'idle';
     const hasPaneWith = (node: SplitNode, target: PaneStatus): boolean => {
       if (node.type === 'leaf') return node.panes.some((p) => p.status === target);
       return node.children.some((c) => hasPaneWith(c, target));
     };
-    let hasAiIdle = false;
-    for (const tab of ps.tabs) {
-      if (hasPaneWith(tab.splitLayout, 'ai-working')) return 'ai-working';
-      if (hasPaneWith(tab.splitLayout, 'ai-idle')) hasAiIdle = true;
-    }
-    return hasAiIdle ? 'ai-idle' : 'idle';
+    if (hasPaneWith(layout, 'ai-working')) return 'ai-working';
+    return hasPaneWith(layout, 'ai-idle') ? 'ai-idle' : 'idle';
   };
 
   // 创建分组
@@ -420,11 +415,27 @@ export function ProjectList() {
             : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--border-subtle)]'
         }`}
         style={{ paddingLeft: `${depth * 16 + 10}px`, paddingRight: '10px' }}
+        role="option"
+        aria-selected={isActive}
+        tabIndex={0}
         onMouseDown={(e) => handleProjectMouseDown(e, project.id)}
         onMouseMove={(e) => handleMouseMoveOver(e, project.id, false)}
         onMouseLeave={handleMouseLeaveTarget}
         onMouseUp={(e) => handleMouseUpDrop(e, project.id)}
         onClick={() => setActiveProject(project.id)}
+        onKeyDown={(e) => {
+          if (editingProjectId === project.id) return; // 重命名输入框自己处理按键
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            setActiveProject(project.id);
+          } else if (e.key === 'F2') {
+            e.preventDefault();
+            startRenameProject(project.id, project.name);
+          } else if (e.key === 'Delete') {
+            e.preventDefault();
+            setConfirmTarget({ id: project.id, name: project.name });
+          }
+        }}
         onContextMenu={(e) => {
           e.preventDefault();
           e.stopPropagation();
@@ -522,7 +533,7 @@ export function ProjectList() {
         )}
         {isRemote && (
           <span
-            className={`flex-shrink-0 max-w-[80px] truncate text-[10px] leading-[14px] px-1 rounded font-mono ${
+            className={`flex-shrink-0 max-w-[80px] truncate text-xs leading-[14px] px-1 rounded font-mono ${
               remoteBroken
                 ? 'text-[var(--color-error)] bg-[var(--color-error)]/15'
                 : 'text-[var(--text-muted)] bg-[var(--border-subtle)]'
@@ -535,12 +546,16 @@ export function ProjectList() {
           </span>
         )}
         {showDoneTag ? <DoneTag /> : projectStatus !== 'idle' ? <StatusDot status={projectStatus} /> : null}
-        <span
+        <button
+          type="button"
+          tabIndex={-1}
           className="text-[var(--text-muted)] hover:text-[var(--color-error)] hidden group-hover:inline transition-colors text-sm"
+          title={t('projectList.menu.remove')}
+          aria-label={t('projectList.menu.remove')}
           onClick={(e) => handleRemoveProject(e, project.id)}
         >
           ✕
-        </span>
+        </button>
         {renderDropLine(project.id, 'after')}
       </div>
     );
@@ -564,11 +579,25 @@ export function ProjectList() {
                 : 'text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--border-subtle)]'
           }`}
           style={{ paddingLeft: `${depth * 16}px`, paddingRight: '10px' }}
+          role="treeitem"
+          aria-expanded={!group.collapsed}
+          tabIndex={0}
           onMouseDown={(e) => handleGroupMouseDown(e, group.id)}
           onMouseMove={(e) => handleMouseMoveOver(e, group.id, true)}
           onMouseLeave={handleMouseLeaveTarget}
           onMouseUp={(e) => handleMouseUpDrop(e, group.id)}
           onClick={() => { if (!isEditing) toggleGroupCollapse(group.id); saveConfig(); }}
+          onKeyDown={(e) => {
+            if (isEditing) return;
+            if (e.key === 'Enter' || e.key === ' ') {
+              e.preventDefault();
+              toggleGroupCollapse(group.id);
+              saveConfig();
+            } else if (e.key === 'F2') {
+              e.preventDefault();
+              startRenameGroup(group.id, group.name);
+            }
+          }}
           onContextMenu={(e) => {
             e.preventDefault();
             e.stopPropagation();
@@ -663,10 +692,10 @@ export function ProjectList() {
                 ]);
               }}
             >
-              Projects
+              {t('panels.projects')}
             </div>
 
-            <div className="flex-1 overflow-y-auto px-1.5 space-y-0.5">
+            <div className="flex-1 overflow-y-auto px-1.5 space-y-0.5" role="listbox" aria-label={t('panels.projects')}>
               {orderedItems.map((item) =>
                 item.type === 'project'
                   ? renderProjectItem(item.project, item.depth, item.parentGroupId ?? undefined)
@@ -675,26 +704,31 @@ export function ProjectList() {
             </div>
 
             <div className="p-2 flex gap-1.5">
-              <div
+              <button
+                type="button"
                 className="flex-1 px-3 py-2 border border-dashed border-[var(--border-default)] rounded-[var(--radius-md)] text-center text-sm text-[var(--text-muted)] cursor-pointer hover:border-[var(--accent)] hover:text-[var(--accent)] transition-all duration-200"
                 onClick={() => handleAddProject()}
               >
                 {t('projectList.addProject')}
-              </div>
-              <div
+              </button>
+              <button
+                type="button"
                 className="px-2 py-2 border border-dashed border-[var(--border-default)] rounded-[var(--radius-md)] text-center text-sm text-[var(--text-muted)] cursor-pointer hover:border-[var(--accent)] hover:text-[var(--accent)] transition-all duration-200 font-mono"
                 onClick={() => setAddRemoteOpen(true)}
                 title={t('projectList.addRemoteProject')}
+                aria-label={t('projectList.addRemoteProject')}
               >
                 SSH
-              </div>
-              <div
+              </button>
+              <button
+                type="button"
                 className="px-3 py-2 border border-dashed border-[var(--border-default)] rounded-[var(--radius-md)] text-center text-sm text-[var(--text-muted)] cursor-pointer hover:border-[var(--accent)] hover:text-[var(--accent)] transition-all duration-200"
                 onClick={handleCreateGroup}
                 title={t('projectList.newGroup')}
+                aria-label={t('projectList.newGroup')}
               >
                 +
-              </div>
+              </button>
             </div>
       </div>
 
@@ -705,36 +739,37 @@ export function ProjectList() {
       {/* 添加远程项目弹窗 */}
       <AddRemoteProjectModal open={addRemoteOpen} onClose={() => setAddRemoteOpen(false)} />
 
-      {/* 删除确认弹窗 — portal 到 body,避免 fluent2 [data-panel] 的 backdrop-filter 形成 containing block 把 fixed 拽进面板 */}
-      {confirmTarget && createPortal(
-        <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={() => setConfirmTarget(null)}>
-          <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
-          <div
-            className="relative w-[320px] bg-[var(--bg-surface)] border border-[var(--border-strong)] rounded-[var(--radius-md)] shadow-[var(--shadow-overlay)] p-5 animate-slide-in"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="text-sm font-medium text-[var(--text-primary)] mb-2">{t('projectList.removeConfirm.title')}</div>
-            <div className="text-xs text-[var(--text-secondary)] mb-5">
-              {t('projectList.removeConfirm.messagePrefix')}<span className="text-[var(--accent)]">{confirmTarget.name}</span>{t('projectList.removeConfirm.messageSuffix')}
-            </div>
-            <div className="flex justify-end gap-2">
-              <button
-                className="px-3 py-1.5 text-xs rounded-[var(--radius-sm)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--border-subtle)] transition-colors"
-                onClick={() => setConfirmTarget(null)}
-              >
-                {t('projectList.removeConfirm.cancel')}
-              </button>
-              <button
-                className="px-3 py-1.5 text-xs rounded-[var(--radius-sm)] bg-[var(--color-error)] text-white hover:opacity-90 transition-opacity"
-                onClick={doRemove}
-              >
-                {t('projectList.removeConfirm.confirm')}
-              </button>
-            </div>
+      {/* 删除确认 —— Modal 内部 portal 到 body,避免 fluent2 [data-panel] 的
+          backdrop-filter 形成 containing block 把 fixed 拽进面板 */}
+      <Modal
+        open={!!confirmTarget}
+        onClose={() => setConfirmTarget(null)}
+        align="center"
+        ariaLabel={t('projectList.removeConfirm.title')}
+        panelClassName="w-[320px]"
+      >
+        <div className="p-5">
+          <div className="text-sm font-medium text-[var(--text-primary)] mb-2">{t('projectList.removeConfirm.title')}</div>
+          <div className="text-xs text-[var(--text-secondary)] mb-5">
+            {t('projectList.removeConfirm.messagePrefix')}<span className="text-[var(--accent)]">{confirmTarget?.name}</span>{t('projectList.removeConfirm.messageSuffix')}
           </div>
-        </div>,
-        document.body,
-      )}
+          <div className="flex justify-end gap-2">
+            <button
+              className="px-3 py-1.5 text-xs rounded-[var(--radius-sm)] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--border-subtle)] transition-colors"
+              onClick={() => setConfirmTarget(null)}
+            >
+              {t('projectList.removeConfirm.cancel')}
+            </button>
+            <button
+              className="px-3 py-1.5 text-xs rounded-[var(--radius-sm)] bg-[var(--color-error)] text-white hover:opacity-90 transition-opacity"
+              onClick={doRemove}
+              autoFocus
+            >
+              {t('projectList.removeConfirm.confirm')}
+            </button>
+          </div>
+        </div>
+      </Modal>
     </div>
   );
 }
