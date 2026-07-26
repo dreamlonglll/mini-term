@@ -4,6 +4,7 @@ import { ask } from '@tauri-apps/plugin-dialog';
 import QRCode from 'qrcode';
 import { useAppStore } from '../store';
 import { useTauriEvent } from '../hooks/useTauriEvent';
+import { Modal } from './Modal';
 import { useT } from '../i18n';
 import { RelayStatusBadge } from './RelayStatusBadge';
 import { AiLauncherSection } from './AiLauncherSection';
@@ -108,25 +109,17 @@ export function MobileRelayModal({ open, onClose }: Props) {
     invoke('mobile_relay_reset_pairing').catch(() => {});
   }, [t]);
 
-  if (!open) return null;
-
   const paired = relayStatus?.paired;
 
   return (
-    // 遮罩不响应点击:面板内有地址输入与配对操作,误点外侧关闭会丢掉未保存的内容
-    <div className="fixed inset-0 z-50 flex items-start justify-center pt-[12vh]">
-      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
-      <div className="relative w-[440px] max-h-[76vh] bg-[var(--bg-surface)] border border-[var(--border-strong)] rounded-[var(--radius-md)] shadow-[var(--shadow-overlay)] flex flex-col overflow-hidden animate-slide-in">
-        {/* 顶栏 */}
-        <div className="flex items-center justify-between px-5 py-4 border-b border-[var(--border-subtle)]">
-          <h2 className="text-lg font-semibold text-[var(--text-primary)]">{t('mobileRelay.modal.title')}</h2>
-          <button
-            className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors text-lg leading-none"
-            onClick={onClose}
-          >
-            ✕
-          </button>
-        </div>
+    <Modal
+      open={open}
+      onClose={onClose}
+      title={t('mobileRelay.modal.title')}
+      panelClassName="w-[440px] max-h-[76vh]"
+      // 面板内有地址/密钥输入与配对操作，误点外侧关闭会丢掉未保存内容；Esc 仍可退
+      closeOnOverlay={false}
+    >
 
         <div className="flex-1 overflow-y-auto px-5 py-4 space-y-4">
           <p className="text-sm text-[var(--text-muted)] leading-relaxed">{t('mobileRelay.intro')}</p>
@@ -251,7 +244,6 @@ export function MobileRelayModal({ open, onClose }: Props) {
             </>
           )}
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }

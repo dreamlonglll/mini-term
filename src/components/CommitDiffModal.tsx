@@ -1,8 +1,8 @@
 import { useState, useEffect, useCallback } from 'react';
-import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { InlineView, SideBySideView } from './DiffModal';
 import { useAppStore } from '../store';
+import { Modal } from './Modal';
 import { useT } from '../i18n';
 import type { CommitFileInfo, GitDiffResult } from '../types';
 
@@ -76,27 +76,13 @@ export function CommitDiffModal({
     }
   }, [open, files, selectedFile]);
 
-  useEffect(() => {
-    if (!open) return;
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [open, onClose]);
-
   if (!open) return null;
 
   const shortHash = commitHash.slice(0, 7);
 
-  return createPortal(
-    <div className="fixed inset-0 z-50 flex items-center justify-center select-text" onClick={onClose}>
-      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
-      <div
-        className="relative flex overflow-hidden bg-[var(--bg-surface)] border border-[var(--border-strong)] rounded-[var(--radius-md)] shadow-[var(--shadow-overlay)] animate-slide-in"
-        style={{ width: '92vw', height: '85vh' }}
-        onClick={(e) => e.stopPropagation()}
-      >
+  return (
+    <Modal open={open} onClose={onClose} align="center" ariaLabel={commitMessage}
+      panelClassName="w-[92vw] h-[85vh] select-text flex-row">
         {/* 左侧文件列表 */}
         <div className="w-56 flex-shrink-0 border-r border-[var(--border-subtle)] flex flex-col bg-[var(--bg-elevated)]">
           <div className="px-3 py-3 border-b border-[var(--border-subtle)]">
@@ -207,8 +193,6 @@ export function CommitDiffModal({
             )}
           </div>
         </div>
-      </div>
-    </div>,
-    document.body,
+    </Modal>
   );
 }

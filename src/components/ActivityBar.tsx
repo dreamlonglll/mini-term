@@ -1,4 +1,4 @@
-import { useAppStore, STATUS_PRIORITY, getHighestStatus } from '../store';
+import { useAppStore, STATUS_PRIORITY } from '../store';
 import { useT } from '../i18n';
 import type { PaneStatus } from '../types';
 
@@ -77,14 +77,14 @@ export function ActivityBar({ onOpenSettings, onOpenSsh, onOpenMobile, updateVer
 
   const middleVisible = config.middleColumnVisible;
 
-  // 聚合所有项目的最高 AI 状态（徽标挂在「中间栏」按钮上,中间栏承载 Projects）
+  // 聚合所有项目的最高 AI 状态（徽标挂在「中间栏」按钮上,中间栏承载 Projects）。
+  // 与项目列表的状态点口径保持一致:只反映 AI 状态,不把 error 往上冒 ——
+  // 某个 shell `exit 1` 不该让整个活动栏亮起红点,那会盖住真正在跑的 AI。
   let globalStatus: PaneStatus = 'idle';
   for (const ps of projectStates.values()) {
-    for (const tab of ps.tabs) {
-      const s = getHighestStatus(tab.splitLayout);
-      if (STATUS_PRIORITY[s] > STATUS_PRIORITY[globalStatus]) {
-        globalStatus = s;
-      }
+    const s = ps.status === 'error' ? 'idle' : ps.status;
+    if (STATUS_PRIORITY[s] > STATUS_PRIORITY[globalStatus]) {
+      globalStatus = s;
     }
   }
 

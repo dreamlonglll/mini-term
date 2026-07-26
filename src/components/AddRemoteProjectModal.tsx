@@ -1,8 +1,8 @@
 import { useState, useEffect, useCallback } from 'react';
-import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { useAppStore, genId, persistConfig } from '../store';
 import { connectionSummary } from './SshModal';
+import { Modal, ModalCloseButton } from './Modal';
 import { useT } from '../i18n';
 import type { ProjectConfig, SshConnection } from '../types';
 
@@ -86,28 +86,26 @@ export function AddRemoteProjectModal({ open, onClose }: Props) {
   }
   const hasNamedGroup = groups.some((g) => g.group);
 
-  return createPortal(
-    <div className="fixed inset-0 z-50 flex items-start justify-center pt-[10vh]">
-      <div
-        className="absolute inset-0 bg-black/50 backdrop-blur-sm"
-        onClick={() => { if (!busy) onClose(); }}
-      />
-      <div className="relative w-[480px] max-h-[80vh] bg-[var(--bg-surface)] border border-[var(--border-strong)] rounded-[var(--radius-md)] shadow-[var(--shadow-overlay)] flex flex-col overflow-hidden animate-slide-in">
-        {/* 顶栏 */}
-        <div className="px-5 py-4 border-b border-[var(--border-subtle)]">
-          <div className="flex items-center justify-between">
-            <h2 className="text-lg font-semibold text-[var(--text-primary)]">{t('remoteProject.title')}</h2>
-            <button
-              className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors text-lg leading-none"
-              onClick={onClose}
-            >
-              ✕
-            </button>
-          </div>
-          <div className="text-sm text-[var(--text-muted)] mt-1">
-            {t('remoteProject.subtitle')}
-          </div>
+  return (
+    <Modal
+      open
+      onClose={onClose}
+      ariaLabel={t('remoteProject.title')}
+      panelClassName="w-[480px] max-h-[80vh]"
+      // 保存中不给关：正在做远程校验，中途退出会留下半截状态
+      closeOnOverlay={!busy}
+      closeOnEscape={!busy}
+    >
+      {/* 顶栏（带副标题，故不用 Modal 自带的 title） */}
+      <div className="px-5 py-4 border-b border-[var(--border-subtle)] flex-shrink-0">
+        <div className="flex items-center justify-between gap-3">
+          <h2 className="text-lg font-semibold text-[var(--text-primary)]">{t('remoteProject.title')}</h2>
+          <ModalCloseButton onClose={onClose} label={t('remoteProject.cancel')} />
         </div>
+        <div className="text-sm text-[var(--text-muted)] mt-1">
+          {t('remoteProject.subtitle')}
+        </div>
+      </div>
 
         {/* 内容 */}
         <div className="flex-1 overflow-y-auto px-5 py-4 space-y-4">
@@ -210,8 +208,6 @@ export function AddRemoteProjectModal({ open, onClose }: Props) {
             {busy ? t('remoteProject.validating') : t('remoteProject.save')}
           </button>
         </div>
-      </div>
-    </div>,
-    document.body,
+    </Modal>
   );
 }

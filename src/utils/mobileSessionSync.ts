@@ -14,7 +14,8 @@
 import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '../store';
 import { getProjectsWithGroupPath } from './projectTree';
-import type { SplitNode, PaneState } from '../types';
+import { collectPanes } from './layoutOps';
+import type { PaneState } from '../types';
 
 /** 与后端 mobile_relay::SyncPane / SyncProject 对齐(camelCase)。 */
 interface MobilePanePayload {
@@ -43,14 +44,6 @@ let lastSentJson = '';
 let debounceTimer: ReturnType<typeof setTimeout> | undefined;
 let started = false;
 
-function collectPanes(node: SplitNode, out: PaneState[]): void {
-  if (node.type === 'leaf') {
-    out.push(...node.panes);
-  } else {
-    for (const child of node.children) collectPanes(child, out);
-  }
-}
-
 function computeSnapshot(): MobileProjectPayload[] {
   const { config, projectStates } = useAppStore.getState();
   const nextAiPaneIds = new Set<string>();
@@ -60,22 +53,19 @@ function computeSnapshot(): MobileProjectPayload[] {
   // 就能还原桌面端侧栏的排列,分组层级靠每项自带的 groupPath 还原
   for (const { project, groupPath } of getProjectsWithGroupPath(config)) {
     const panes: MobilePanePayload[] = [];
-    const ps = projectStates.get(project.id);
-    for (const tab of ps?.tabs ?? []) {
-      const flat: PaneState[] = [];
-      collectPanes(tab.splitLayout, flat);
-      for (const pane of flat) {
-        const isAi = pane.status === 'ai-working' || pane.status === 'ai-idle';
-        const isAiError = pane.status === 'error' && aiPaneIds.has(pane.id);
-        if (!isAi && !isAiError) continue;
-        nextAiPaneIds.add(pane.id);
-        panes.push({
-          paneId: pane.id,
-          title: pane.customTitle ?? tab.customTitle ?? pane.shellName,
-          status: pane.status,
-          ptyId: pane.ptyId,
-        });
-      }
+    const layout = projectStates.get(project.id)?.layout;
+    const flat: PaneState[] = layout ? collectPanes(layout) : [];
+    for (const pane of flat) {
+      const isAi = pane.status === 'ai-working' || pane.status === 'ai-idle';
+      const isAiError = pane.status === 'error' && aiPaneIds.has(pane.id);
+      if (!isAi && !isAiError) continue;
+      nextAiPaneIds.add(pane.id);
+      panes.push({
+        paneId: pane.id,
+        title: pane.customTitle ?? pane.shellName,
+        status: pane.status,
+        ptyId: pane.ptyId,
+      });
     }
     projects.push({
       projectId: project.id,

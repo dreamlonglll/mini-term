@@ -90,14 +90,9 @@ pub struct AppConfig {
     pub long_paste_line_threshold: u32,
     #[serde(default = "default_long_paste_char_threshold")]
     pub long_paste_char_threshold: u32,
-    #[serde(default = "default_true")]
-    pub projects_visible: bool,
-    #[serde(default = "default_true")]
-    pub sessions_visible: bool,
-    #[serde(default = "default_true")]
-    pub files_visible: bool,
-    #[serde(default = "default_true")]
-    pub git_visible: bool,
+    // NOTE: 曾有 projects_visible / sessions_visible / files_visible / git_visible
+    // 四个面板显隐开关，界面上没有任何入口消费（已被 middle_column_visible 与右侧
+    // 抽屉取代），随 UI 改版一并删除。旧 config.json 里残留的这些键会被 serde 忽略。
     #[serde(default = "default_true")]
     pub middle_column_visible: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -342,10 +337,6 @@ impl Default for AppConfig {
             long_paste_to_file: true,
             long_paste_line_threshold: default_long_paste_line_threshold(),
             long_paste_char_threshold: default_long_paste_char_threshold(),
-            projects_visible: true,
-            sessions_visible: true,
-            files_visible: true,
-            git_visible: true,
             middle_column_visible: true,
             right_drawer_width: None,
             last_active_project_id: None,

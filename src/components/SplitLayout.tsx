@@ -7,13 +7,11 @@ interface Props {
   projectId: string;
   node: SplitNode;
   projectPath: string;
-  onSplit?: (paneId: string, direction: 'horizontal' | 'vertical') => void;
-  onCloseLeaf?: (node: SplitNode) => void;
-  onUpdateNode?: (updated: SplitNode) => void;
+  /** 分隔条拖动导致的 sizes 变化回写；pane 的增删由 paneActions 直接改全局布局 */
   onLayoutChange?: (updatedNode: SplitNode) => void;
 }
 
-// Stable key: 递归取第一个叶节点的 pane ID。
+// 稳定 key：递归取第一个叶节点的 pane ID。
 // 当 leaf 被 insertSplit 变为 split 时，原 leaf 始终是 children[0]，
 // key 不变 → 父级 Allotment 不会重新分配尺寸。
 function getNodeKey(node: SplitNode): string {
@@ -21,22 +19,13 @@ function getNodeKey(node: SplitNode): string {
   return getNodeKey(node.children[0]);
 }
 
-export function SplitLayout({ projectId, node, projectPath, onSplit, onCloseLeaf, onUpdateNode, onLayoutChange }: Props) {
+export function SplitLayout({ projectId, node, projectPath, onLayoutChange }: Props) {
   const rafRef = useRef<number>(0);
   const nodeRef = useRef(node);
   nodeRef.current = node;
 
   if (node.type === 'leaf') {
-    return (
-      <PaneGroup
-        projectId={projectId}
-        node={node}
-        projectPath={projectPath}
-        onSplit={onSplit ?? (() => {})}
-        onClosePane={() => onCloseLeaf?.(node)}
-        onUpdateNode={(updated) => onUpdateNode?.(updated)}
-      />
-    );
+    return <PaneGroup projectId={projectId} node={node} projectPath={projectPath} />;
   }
 
   const handleSizesChange = (sizes: number[]) => {
@@ -60,31 +49,6 @@ export function SplitLayout({ projectId, node, projectPath, onSplit, onCloseLeaf
     onLayoutChange({ ...currentNode, children: newChildren });
   };
 
-  const handleChildClose = (index: number) => {
-    const currentNode = nodeRef.current;
-    if (currentNode.type !== 'split') return;
-    const remaining = currentNode.children.filter((_, i) => i !== index);
-    if (remaining.length === 0) {
-      onCloseLeaf?.(currentNode);
-    } else if (remaining.length === 1) {
-      onUpdateNode?.(remaining[0]);
-    } else {
-      onUpdateNode?.({
-        ...currentNode,
-        children: remaining,
-        sizes: remaining.map(() => 100 / remaining.length),
-      });
-    }
-  };
-
-  const handleChildUpdate = (index: number, updated: SplitNode) => {
-    const currentNode = nodeRef.current;
-    if (currentNode.type !== 'split') return;
-    const newChildren = [...currentNode.children];
-    newChildren[index] = updated;
-    onUpdateNode?.({ ...currentNode, children: newChildren });
-  };
-
   return (
     <Allotment
       vertical={node.direction === 'vertical'}
@@ -97,9 +61,6 @@ export function SplitLayout({ projectId, node, projectPath, onSplit, onCloseLeaf
             projectId={projectId}
             node={child}
             projectPath={projectPath}
-            onSplit={onSplit}
-            onCloseLeaf={() => handleChildClose(index)}
-            onUpdateNode={(updated) => handleChildUpdate(index, updated)}
             onLayoutChange={(updated) => handleChildLayoutChange(index, updated)}
           />
         </Allotment.Pane>

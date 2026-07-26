@@ -204,6 +204,51 @@ body.ssh-conn-dragging {
   animation: slideIn 0.12s ease-out;
 }
 
+/* ===== 减弱动效 =====
+   状态点、更新徽标等是无限循环动画，对前庭敏感 / 注意力障碍用户是持续干扰。
+   系统开了「减弱动态效果」就一律静止 —— 状态本身已由形状+颜色编码，不靠动画传达。 */
+@media (prefers-reduced-motion: reduce) {
+  /* 通配兜底，而不是逐个类名点名 —— 逐个点名总会漏（Tailwind 的 animate-pulse/
+     animate-spin、.done-tag 的 tagFadeIn、toast 与菜单的入场动画都曾漏在外面）。
+     一次性动画保留但压到瞬时；无限循环的直接停在第一帧。 */
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ===== 键盘焦点 =====
+   全库有十几处 outline-none 却没有任何替代样式，键盘用户在控件间跳转时看不到
+   焦点落在哪。:focus-visible 只在键盘导航时出现，鼠标点击不会画框。 */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+  border-radius: var(--radius-sm);
+}
+/* xterm 的 helper textarea 是隐藏在屏幕外的输入代理，给它画框会闪一条游离的线 */
+.xterm-helper-textarea:focus-visible {
+  outline: none;
+}
+
+/* ===== 键位提示 ===== */
+.kbd {
+  display: inline-block;
+  padding: 1px 5px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-default);
+  border-bottom-width: 2px;
+  font-family: var(--app-font-mono);
+  font-size: 0.85em;
+  line-height: 1.5;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
 /* ===== AI 完成 Tag ===== */
 .done-tag {
   display: inline-flex;
@@ -211,7 +256,7 @@ body.ssh-conn-dragging {
   padding: 2px 8px;
   background: var(--color-success);
   color: var(--bg-base);
-  font-size: 10px;
+  font-size: 0.77rem;
   font-weight: 700;
   letter-spacing: 0.06em;
   border-radius: 10px;
@@ -275,7 +320,7 @@ body.ssh-conn-dragging {
   align-items: center;
   justify-content: center;
   font-weight: 700;
-  font-size: 11px;
+  font-size: 0.85rem;
   flex-shrink: 0;
 }
 .toast-icon--info { background: var(--color-info); }
@@ -283,7 +328,7 @@ body.ssh-conn-dragging {
 .toast-body { flex: 1; min-width: 0; }
 .toast-name {
   color: var(--text-primary);
-  font-size: 12px;
+  font-size: 0.92rem;
   font-weight: 600;
   white-space: nowrap;
   overflow: hidden;
@@ -291,12 +336,12 @@ body.ssh-conn-dragging {
 }
 .toast-desc {
   color: var(--text-secondary);
-  font-size: 10px;
+  font-size: 0.77rem;
   margin-top: 1px;
 }
 .toast-close {
   color: var(--text-muted);
-  font-size: 14px;
+  font-size: 1.08rem;
   padding: 0 4px;
   cursor: pointer;
 }
@@ -324,17 +369,32 @@ body.ssh-conn-dragging {
 }
 
 .ctx-menu-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
   padding: 6px 12px;
   border-radius: var(--radius-sm);
   cursor: pointer;
   color: var(--text-secondary);
-  font-size: 12px;
+  font-size: 0.92rem;
   transition: all 0.1s ease;
+  outline: none;
 }
 
-.ctx-menu-item:hover {
+.ctx-menu-item:hover,
+.ctx-menu-item:focus-visible {
   background: var(--accent-muted);
   color: var(--text-primary);
+}
+
+/* 菜单项右侧的快捷键提示：弱化、等宽，不与标签抢视线 */
+.ctx-menu-shortcut {
+  flex-shrink: 0;
+  font-family: var(--app-font-mono);
+  font-size: 0.9em;
+  color: var(--text-muted);
+  opacity: 0.8;
 }
 
 .ctx-menu-item.danger {
@@ -363,7 +423,7 @@ body.ssh-conn-dragging {
 
 .ctx-menu-header {
   padding: 6px 12px 3px;
-  font-size: 10px;
+  font-size: 0.77rem;
   font-weight: 600;
   letter-spacing: 0.06em;
   text-transform: uppercase;
@@ -371,16 +431,9 @@ body.ssh-conn-dragging {
   cursor: default;
 }
 
-.ctx-menu-item.has-submenu {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-
 .ctx-menu-item.has-submenu::after {
   content: '▸';
-  font-size: 10px;
+  font-size: 0.77rem;
   opacity: 0.6;
 }
 
@@ -409,14 +462,14 @@ body.ssh-conn-dragging {
 }
 
 .prompt-title {
-  font-size: 14px;
+  font-size: 1.08rem;
   font-weight: 600;
   color: var(--text-primary);
   margin-bottom: 12px;
 }
 
 .prompt-message {
-  font-size: 13px;
+  font-size: 1rem;
   color: var(--text-secondary);
   margin-bottom: 16px;
   line-height: 1.5;
@@ -434,7 +487,7 @@ body.ssh-conn-dragging {
   border: 1px solid var(--border-default);
   border-radius: var(--radius-sm);
   padding: 8px 10px;
-  font-size: 14px;
+  font-size: 1.08rem;
   outline: none;
   font-family: var(--app-font-mono);
 }
@@ -453,7 +506,7 @@ body.ssh-conn-dragging {
 .prompt-btn {
   padding: 6px 16px;
   border-radius: var(--radius-sm);
-  font-size: 13px;
+  font-size: 1rem;
   cursor: pointer;
   border: none;
   transition: all 0.15s ease;
@@ -480,7 +533,7 @@ body.ssh-conn-dragging {
 /* ===== Markdown preview ===== */
 .md-preview {
   color: var(--text-primary);
-  font-size: 14px;
+  font-size: 1.08rem;
   line-height: 1.7;
 }
 

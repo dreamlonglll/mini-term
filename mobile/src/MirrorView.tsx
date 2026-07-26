@@ -47,6 +47,7 @@ function CommandComposer() {
   const mirror = useRelayStore((s) => s.mirror);
   const desktopOnline = useRelayStore((s) => s.desktopOnline);
   const [text, setText] = useState('');
+  const inputRef = useRef<HTMLTextAreaElement>(null);
 
   const receipt = mirror?.receipt ?? null;
   const sending = mirror?.pendingCommandId != null;
@@ -58,6 +59,16 @@ function CommandComposer() {
     const timer = setTimeout(clearCommandReceipt, receipt.ok ? 2500 : 5000);
     return () => clearTimeout(timer);
   }, [receipt]);
+
+  // 输入框随内容自增高（最多 6 行）。rows=1 固定高度时，稍长一点的指令就只能
+  // 从一条缝里往外看，改完更是无从复核。
+  useEffect(() => {
+    const el = inputRef.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    const line = parseFloat(getComputedStyle(el).lineHeight) || 20;
+    el.style.height = `${Math.min(el.scrollHeight, line * 6 + 16)}px`;
+  }, [text]);
 
   const submit = () => {
     if (disabled || sending) return;
@@ -81,6 +92,7 @@ function CommandComposer() {
       )}
       <div className="composer-row">
         <textarea
+          ref={inputRef}
           className="composer-input"
           value={text}
           rows={1}
@@ -189,7 +201,16 @@ export function MirrorView() {
           </button>
         )}
         {!mirror.loaded ? (
-          <div className="mirror-loading">{t('mirror.loading')}</div>
+          // 骨架屏而不是一行「加载中…」：首屏要拉整段会话记录，纯文字会让人以为卡住了
+          <div className="mirror-skeleton" aria-label={t('mirror.loading')} aria-busy="true">
+            {[0, 1, 2].map((i) => (
+              <div key={i} className={`skeleton-msg ${i % 2 ? 'from-input' : 'from-assistant'}`}>
+                <div className="skeleton-line w-40" />
+                <div className="skeleton-line w-full" />
+                <div className="skeleton-line w-75" />
+              </div>
+            ))}
+          </div>
         ) : mirror.messages.length === 0 ? (
           <div className="mirror-empty">{t('mirror.empty')}</div>
         ) : (
