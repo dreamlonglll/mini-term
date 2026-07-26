@@ -3,7 +3,7 @@
  *
  * 后端 `mobile-start-session` 事件到达后:
  *   建 pane(按启动器绑定的 shell,未绑定则用默认 shell)
- *   → 新开一个 tab,**不**切当前项目、**不**切当前 tab
+ *   → 挂进当前 tab 布局树的 tab 栏,**不**切当前项目、**不**切当前 pane
  *   → 把启动命令连同回车写入 PTY
  *
  * 最后一步是关键:AI 会话身份靠输入检测建立,只有"往 shell 里敲进启动命令并回车"
@@ -16,12 +16,31 @@
 import { invoke } from '@tauri-apps/api/core';
 import { useAppStore, genId, saveLayoutToConfig } from '../store';
 import { createProjectPty } from './remoteProject';
+import { getOrCreateTerminal } from './terminalCache';
 import { t } from '../i18n';
 import type {
   MobileStartSessionPayload,
+  PaneState,
+  SplitNode,
   StartSessionFailReason,
   TerminalTab,
 } from '../types';
+
+/**
+ * 把新 pane 追加到布局树最左侧 leaf 的 tab 栏末尾,不动 activePaneId。
+ *
+ * 桌面端只渲染当前 tab 的这棵树,leaf 的 tab 栏(PaneGroup)是「终端标签」的唯一出口——
+ * 单开一个 ProjectState.tab 在界面上是看不见的,那一层没有切换 UI。
+ */
+function appendPaneToFirstLeaf(node: SplitNode, pane: PaneState): SplitNode {
+  if (node.type === 'leaf') {
+    return { ...node, panes: [...node.panes, pane] };
+  }
+  return {
+    ...node,
+    children: [appendPaneToFirstLeaf(node.children[0], pane), ...node.children.slice(1)],
+  };
+}
 
 function reportResult(
   requestId: string,
@@ -66,21 +85,41 @@ export async function handleMobileStartSession(
   }
 
   const paneId = genId();
-  const tab: TerminalTab = {
-    id: genId(),
-    // 用启动器名当 tab 标题:回到电脑前一眼看出这个 tab 是什么,手机列表里也不再
+  const pane: PaneState = {
+    id: paneId,
+    // 用启动器名当 pane 标题:回到电脑前一眼看出这个标签是什么,手机列表里也不再
     // 显示成裸 shell 名。shellName 仍存实际 shell —— 布局恢复靠它查 availableShells。
     customTitle: launcherName,
     status: 'idle',
-    splitLayout: {
-      type: 'leaf',
-      panes: [{ id: paneId, shellName: shell.name, status: 'idle', ptyId }],
-      activePaneId: paneId,
-    },
+    shellName: shell.name,
+    ptyId,
   };
 
-  // activate=false:远程操作不改动用户桌面上正在看的现场
-  useAppStore.getState().addTab(projectId, tab, false);
+  // 先建 xterm 实例,再写启动命令:pty-output 的全局分发只写进已缓存的实例,cache miss
+  // 直接丢弃。这个 pane 在用户点开前不会 mount,不提前建实例的话 AI 起来那一整段输出
+  // 全部丢在地上,用户回到桌面切过去只剩一片空白。
+  getOrCreateTerminal(ptyId);
+
+  const store = useAppStore.getState();
+  const ps = store.projectStates.get(projectId);
+  const activeTab = ps?.tabs.find((tab) => tab.id === ps.activeTabId);
+  if (activeTab) {
+    // 挂进用户当前看得到的那棵布局树;activePaneId 不动 —— 远程操作不抢桌面现场
+    store.updateTabLayout(
+      projectId,
+      activeTab.id,
+      appendPaneToFirstLeaf(activeTab.splitLayout, pane),
+    );
+  } else {
+    // 项目一个 tab 都没有:只能新开。addTab 的空态兜底会激活它,否则终端区还是空白
+    const tab: TerminalTab = {
+      id: genId(),
+      customTitle: launcherName,
+      status: 'idle',
+      splitLayout: { type: 'leaf', panes: [pane], activePaneId: paneId },
+    };
+    store.addTab(projectId, tab, false);
+  }
   saveLayoutToConfig(projectId);
 
   try {
