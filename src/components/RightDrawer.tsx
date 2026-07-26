@@ -23,6 +23,7 @@ export function RightDrawer({ initialWidth, onResizeEnd }: RightDrawerProps) {
   const t = useT();
   const rightDrawer = useAppStore((s) => s.rightDrawer);
   const closeRightDrawer = useAppStore((s) => s.closeRightDrawer);
+  const openRightDrawer = useAppStore((s) => s.openRightDrawer);
   const [width, setWidth] = useState(clamp(initialWidth));
 
   // config 侧宽度变化（或初次持久值到达）时同步,拖拽自身不受影响
@@ -63,14 +64,41 @@ export function RightDrawer({ initialWidth, onResizeEnd }: RightDrawerProps) {
         className="absolute left-0 top-0 h-full w-1.5 -translate-x-1/2 cursor-col-resize hover:bg-[var(--accent)]/40 transition-colors z-10"
         onMouseDown={startResize}
       />
-      {/* 抽屉标题条:仅一个关闭按钮,面板自身标题在下方内容里 */}
-      <div className="flex items-center justify-end h-8 px-1.5 border-b border-[var(--border-subtle)] flex-shrink-0">
+      {/* 标题条：两个面板互斥，之前只有一个 ✕，切换必须回 ActivityBar 点两下。
+          这里直接给一组 segmented 切换，抽屉内一次点击就能换面板。 */}
+      <div className="flex items-center gap-1 h-9 px-1.5 border-b border-[var(--border-subtle)] flex-shrink-0">
+        <div
+          role="tablist"
+          aria-label={t('app.activityBar.sessions')}
+          className="flex flex-1 rounded-[var(--radius-sm)] border border-[var(--border-default)] overflow-hidden"
+        >
+          {(['sessions', 'git'] as const).map((panel) => (
+            <button
+              key={panel}
+              type="button"
+              role="tab"
+              aria-selected={rightDrawer === panel}
+              className={`flex-1 px-2 py-1 text-xs transition-colors ${
+                rightDrawer === panel
+                  ? 'bg-[var(--accent-subtle)] text-[var(--accent)] font-medium'
+                  : 'text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--border-subtle)]'
+              }`}
+              onClick={() => openRightDrawer(panel)}
+            >
+              {panel === 'sessions' ? t('panels.sessions') : t('panels.git')}
+            </button>
+          ))}
+        </div>
         <button
-          className="w-6 h-6 flex items-center justify-center rounded text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--border-subtle)] transition-colors text-sm"
+          type="button"
+          className="w-6 h-6 flex items-center justify-center rounded-[var(--radius-sm)] text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--border-subtle)] transition-colors flex-shrink-0"
           onClick={closeRightDrawer}
           title={t('app.activityBar.closeDrawer')}
+          aria-label={t('app.activityBar.closeDrawer')}
         >
-          ✕
+          <svg width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
+            <path d="M4.5 4.5l7 7M11.5 4.5l-7 7" />
+          </svg>
         </button>
       </div>
       <div className="flex-1 min-h-0 overflow-hidden">

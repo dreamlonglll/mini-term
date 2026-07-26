@@ -37,10 +37,6 @@ export interface AppConfig {
   longPasteToFile: boolean;
   longPasteLineThreshold: number;
   longPasteCharThreshold: number;
-  projectsVisible: boolean;
-  sessionsVisible: boolean;
-  filesVisible: boolean;
-  gitVisible: boolean;
   /** 中间栏（Projects + Files）整体折叠开关 */
   middleColumnVisible: boolean;
   /** 右侧悬浮抽屉（Sessions / Git）宽度 */
@@ -185,6 +181,15 @@ export interface SavedTab {
   splitLayout: SavedSplitNode;
 }
 
+/**
+ * 磁盘上的项目布局。
+ *
+ * `tabs` 是历史包袱:曾经有一层「项目级 tab」，但界面上从来没有切换入口，
+ * 那层运行时状态已删除（终端标签的唯一出口是 PaneGroup 的 tab 栏）。
+ * 磁盘格式保留原样是为了向后兼容 Rust 端 `SavedProjectLayout` 与旧 config.json —
+ * **写出时恒为单元素**；读取旧配置遇到多元素时，后续 tab 的 pane 会被合并进
+ * 第一棵布局树（见 layoutRestore.ts），不丢用户的终端。
+ */
 export interface SavedProjectLayout {
   tabs: SavedTab[];
   activeTabIndex: number;
@@ -196,8 +201,10 @@ export type PaneStatus = 'idle' | 'ai-idle' | 'ai-working' | 'error';
 
 export interface ProjectState {
   id: string;
-  tabs: TerminalTab[];
-  activeTabId: string;
+  /** 该项目的终端布局树；null = 还没有终端（渲染空态） */
+  layout: SplitNode | null;
+  /** 由 layout 聚合出的项目级状态（error > ai-working > ai-idle > idle） */
+  status: PaneStatus;
   needsAttention?: boolean;
 }
 
@@ -212,13 +219,6 @@ export interface AiCompletionNotification {
   kind?: 'ai-completion' | 'wsl-info' | 'mobile-session';
   /** kind='wsl-info' / 'mobile-session' 时的自定义消息文本,渲染时直接展示。 */
   message?: string;
-}
-
-export interface TerminalTab {
-  id: string;
-  customTitle?: string;
-  splitLayout: SplitNode;
-  status: PaneStatus;
 }
 
 export type SplitNode =

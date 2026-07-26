@@ -1,5 +1,9 @@
 export const envVars = {
   zh: {
+    keyHeader: "变量名",
+    valueHeader: "变量值",
+    keyPlaceholder: "变量名",
+    valuePlaceholder: "变量值",
     error: {
       emptyKey: 'key 不能为空',
       protectedPrefix: 'MINITERM_ 前缀为内部保留,不可使用',
@@ -30,6 +34,10 @@ export const envVars = {
     saveFailed: '保存环境变量失败',
   },
   en: {
+    keyHeader: "Key",
+    valueHeader: "Value",
+    keyPlaceholder: "KEY",
+    valuePlaceholder: "value",
     error: {
       emptyKey: 'Key cannot be empty',
       protectedPrefix: 'The MINITERM_ prefix is reserved for internal use',

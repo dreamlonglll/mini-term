@@ -143,7 +143,7 @@ const CommitItem = memo(function CommitItem({
         {commitBranches.map((b) => (
           <span
             key={b.name}
-            className="inline-flex items-center shrink-0 text-[11px] leading-[18px] px-1.5 rounded font-medium"
+            className="inline-flex items-center shrink-0 text-sm leading-[18px] px-1.5 rounded font-medium"
             style={{
               backgroundColor: b.isHead
                 ? 'var(--color-accent, #58a6ff)'
@@ -485,7 +485,7 @@ export function GitHistoryContent({ projectPath, repos, refreshRepos }: GitHisto
             >
               <div className="flex items-center gap-1 min-w-0">
                 <span
-                  className="text-[13px] w-3 text-center text-[var(--text-muted)] transition-transform duration-150"
+                  className="text-base w-3 text-center text-[var(--text-muted)] transition-transform duration-150"
                   style={{
                     transform: isExpanded ? 'rotate(0deg)' : 'rotate(-90deg)',
                     display: 'inline-block',
@@ -505,7 +505,7 @@ export function GitHistoryContent({ projectPath, repos, refreshRepos }: GitHisto
                       ref={dropdownOpen ? branchDropdownRef : null}
                     >
                       <span
-                        className={`inline-flex items-center gap-0.5 text-[11px] leading-[18px] px-1.5 rounded font-mono cursor-pointer transition-colors ${
+                        className={`inline-flex items-center gap-0.5 text-sm leading-[18px] px-1.5 rounded font-mono cursor-pointer transition-colors ${
                           isViewingOther
                             ? 'text-[var(--color-accent,#58a6ff)] bg-[rgba(88,166,255,0.15)] hover:bg-[rgba(88,166,255,0.25)]'
                             : 'text-[var(--text-muted)] bg-[var(--border-subtle)] hover:bg-[var(--color-accent,#58a6ff)] hover:text-white'
@@ -526,7 +526,7 @@ export function GitHistoryContent({ projectPath, repos, refreshRepos }: GitHisto
                         }}
                       >
                         <span className="truncate max-w-[200px]">{displayBranch}</span>
-                        <span className="text-[9px] opacity-70">▾</span>
+                        <span className="text-[0.7rem] opacity-70">▾</span>
                       </span>
                       {dropdownOpen && (
                         <div
@@ -559,7 +559,7 @@ export function GitHistoryContent({ projectPath, repos, refreshRepos }: GitHisto
                                   />
                                   <span className="truncate font-mono flex-1">{b.name}</span>
                                   {b.name === repo.currentBranch && (
-                                    <span className="shrink-0 text-[9px] px-1 rounded bg-[var(--color-accent,#58a6ff)] text-white font-medium">HEAD</span>
+                                    <span className="shrink-0 text-[0.7rem] px-1 rounded bg-[var(--color-accent,#58a6ff)] text-white font-medium">HEAD</span>
                                   )}
                                 </div>
                               );
@@ -653,7 +653,7 @@ export function GitHistoryContent({ projectPath, repos, refreshRepos }: GitHisto
             }}
           >
             <span
-              className="text-[13px] w-3 text-center transition-transform duration-150"
+              className="text-base w-3 text-center transition-transform duration-150"
               style={{ transform: isDirExpanded ? 'rotate(0deg)' : 'rotate(-90deg)', display: 'inline-block' }}
             >
               ▾

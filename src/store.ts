@@ -6,12 +6,10 @@ import type {
   ProjectConfig,
   ProjectGroup,
   ProjectState,
-  TerminalTab,
   SplitNode,
   PaneState,
   PaneStatus,
   SavedSplitNode,
-  SavedTab,
   SavedProjectLayout,
   AiCompletionNotification,
   AiMarker,
@@ -114,6 +112,25 @@ function updatePaneById(
   return changed ? { ...node, children } : node;
 }
 
+/**
+ * 对某个项目布局里的单个 pane 做原地更新，并同步项目级聚合状态。
+ * updater 返回同一引用即视为无变化，整个 set 短路（不触发订阅）。
+ */
+function updateProjectPane(
+  state: { projectStates: Map<string, ProjectState> },
+  projectId: string,
+  paneId: string,
+  updater: (pane: PaneState) => PaneState,
+): Partial<{ projectStates: Map<string, ProjectState> }> {
+  const ps = state.projectStates.get(projectId);
+  if (!ps?.layout) return state;
+  const layout = updatePaneById(ps.layout, paneId, updater);
+  if (layout === ps.layout) return state;
+  const newStates = new Map(state.projectStates);
+  newStates.set(projectId, { ...ps, layout, status: getHighestStatus(layout) });
+  return { projectStates: newStates };
+}
+
 // 序列化 SplitNode 树（剥离运行时数据）
 function serializeSplitNode(node: SplitNode): SavedSplitNode {
   if (node.type === 'leaf') {
@@ -127,13 +144,16 @@ function serializeSplitNode(node: SplitNode): SavedSplitNode {
   };
 }
 
+/**
+ * 运行时布局 → 磁盘格式。`tabs` 恒为 0 或 1 个元素:项目级 tab 层已删除,
+ * 数组只是为了兼容 Rust 端 SavedProjectLayout 与旧 config.json（见 types.ts）。
+ */
 export function serializeLayout(ps: ProjectState): SavedProjectLayout {
-  const tabs: SavedTab[] = ps.tabs.map((tab) => ({
-    customTitle: tab.customTitle,
-    splitLayout: serializeSplitNode(tab.splitLayout),
-  }));
-  const activeTabIndex = ps.tabs.findIndex((t) => t.id === ps.activeTabId);
-  return { tabs, activeTabIndex: activeTabIndex >= 0 ? activeTabIndex : 0 };
+  if (!ps.layout) return { tabs: [], activeTabIndex: 0 };
+  return {
+    tabs: [{ splitLayout: serializeSplitNode(ps.layout) }],
+    activeTabIndex: 0,
+  };
 }
 
 export function restoreLayout(
@@ -285,6 +305,26 @@ export function persistConfig() {
   return invoke('save_config', { config: useAppStore.getState().config });
 }
 
+// Toast 自动消失定时器（按 id）。悬停暂停 = 清掉定时器，移开 = 重新计时满 5s。
+const NOTIFICATION_TTL_MS = 5000;
+const notificationTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function clearNotificationTimer(id: string) {
+  const timer = notificationTimers.get(id);
+  if (timer) {
+    clearTimeout(timer);
+    notificationTimers.delete(id);
+  }
+}
+
+function armNotificationTimer(id: string) {
+  clearNotificationTimer(id);
+  notificationTimers.set(id, setTimeout(() => {
+    notificationTimers.delete(id);
+    useAppStore.getState().dismissNotification(id);
+  }, NOTIFICATION_TTL_MS));
+}
+
 function ensureTree(config: AppConfig): AppConfig {
   if (config.projectTree && config.projectTree.length > 0) return config;
   if (config.projectOrdering || config.projectGroups) {
@@ -306,12 +346,10 @@ interface AppStore {
   removeProject: (id: string) => void;
   renameProject: (id: string, name: string) => void;
 
-  // Tab
-  /** 新增 tab。`activate=false`(移动端远程发起)时不抢当前 tab 焦点 */
-  addTab: (projectId: string, tab: TerminalTab, activate?: boolean) => void;
-  removeTab: (projectId: string, tabId: string) => void;
-  setActiveTab: (projectId: string, tabId: string) => void;
-  updateTabLayout: (projectId: string, tabId: string, layout: SplitNode) => void;
+  // 终端布局
+  /** 写入项目的终端布局树；`null` = 清空（最后一个 pane 被关掉）。
+   *  布局里消失的 pane，其 AI markers 一并回收。 */
+  setProjectLayout: (projectId: string, layout: SplitNode | null) => void;
 
   // Pane 状态
   updatePaneStatusByPty: (ptyId: number, status: PaneStatus) => void;
@@ -339,15 +377,18 @@ interface AppStore {
   notifications: AiCompletionNotification[];
   pushNotification: (n: Omit<AiCompletionNotification, 'id' | 'timestamp'>) => void;
   dismissNotification: (id: string) => void;
+  /** 鼠标悬停在 toast 上时暂停自动消失，移开后重新计时 */
+  pauseNotification: (id: string, paused: boolean) => void;
 
   // 面板显隐
-  togglePanel: (panel: 'projects' | 'sessions' | 'files' | 'git') => void;
   /** 折叠/展开中间栏（Projects + Files），持久化到 config */
   toggleMiddleColumn: () => void;
 
   // 右侧悬浮抽屉（Sessions / Git）——运行时态,互斥单抽屉,不持久化开合(每次启动收起)
   rightDrawer: 'sessions' | 'git' | null;
   toggleRightDrawer: (panel: 'sessions' | 'git') => void;
+  /** 直接切到某个面板（抽屉内的 segmented 切换用，不做「再点一次关闭」） */
+  openRightDrawer: (panel: 'sessions' | 'git') => void;
   closeRightDrawer: () => void;
 
   // 分组
@@ -385,10 +426,6 @@ export const useAppStore = create<AppStore>((set, get) => ({
     longPasteToFile: true,
     longPasteLineThreshold: 10,
     longPasteCharThreshold: 2000,
-    projectsVisible: true,
-    sessionsVisible: true,
-    filesVisible: true,
-    gitVisible: true,
     middleColumnVisible: true,
     hookEnabled: false,
     smartCopyPaste: false,
@@ -428,7 +465,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
         projectTree: newTree,
       };
       const newStates = new Map(state.projectStates);
-      newStates.set(project.id, { id: project.id, tabs: [], activeTabId: '' });
+      newStates.set(project.id, { id: project.id, layout: null, status: 'idle' });
       return {
         config: newConfig,
         projectStates: newStates,
@@ -451,11 +488,8 @@ export const useAppStore = create<AppStore>((set, get) => ({
       // 合并清理该项目下所有 pane 的 AI markers,防止内存泄漏
       const removingPs = state.projectStates.get(id);
       let newMarkers = state.markersByPty;
-      if (removingPs) {
-        const ptyIds: number[] = [];
-        for (const tab of removingPs.tabs) {
-          ptyIds.push(...collectPtyIds(tab.splitLayout));
-        }
+      if (removingPs?.layout) {
+        const ptyIds = collectPtyIds(removingPs.layout);
         if (ptyIds.some((pid) => newMarkers.has(pid))) {
           newMarkers = new Map(newMarkers);
           for (const pid of ptyIds) newMarkers.delete(pid);
@@ -498,66 +532,32 @@ export const useAppStore = create<AppStore>((set, get) => ({
       },
     })),
 
-  addTab: (projectId, tab, activate = true) =>
-    set((state) => {
-      const newStates = new Map(state.projectStates);
-      const ps = newStates.get(projectId);
-      if (!ps) return state;
-      // 不抢焦点时仍要保证有个活动 tab：项目此前一个 tab 都没有(或 activeTabId
-      // 已指向不存在的 tab)的话不激活就是一片空白,那不是"保住现场"而是弄坏现场。
-      const hasLiveActive = ps.tabs.some((t) => t.id === ps.activeTabId);
-      newStates.set(projectId, {
-        ...ps,
-        tabs: [...ps.tabs, tab],
-        activeTabId: activate || !hasLiveActive ? tab.id : ps.activeTabId,
-      });
-      return { projectStates: newStates };
-    }),
-
-  removeTab: (projectId, tabId) =>
+  setProjectLayout: (projectId, layout) =>
     set((state) => {
       const ps = state.projectStates.get(projectId);
       if (!ps) return state;
-      const closingTab = ps.tabs.find((t) => t.id === tabId);
-      if (!closingTab) return state;
+      if (ps.layout === layout) return state;
 
-      // 合并清理该 tab 下所有 pane 的 AI markers,避免多次 set 触发的中间态
-      const ptyIds = collectPtyIds(closingTab.splitLayout);
+      // 从布局里消失的 pane 一并回收其 AI markers。这条路径同时覆盖「关一个 pane」
+      // 与「关掉整个项目的终端」,不必再让各调用方自己记得清。
       let newMarkers = state.markersByPty;
-      if (ptyIds.some((id) => newMarkers.has(id))) {
-        newMarkers = new Map(newMarkers);
-        for (const id of ptyIds) newMarkers.delete(id);
+      const before = ps.layout ? collectPtyIds(ps.layout) : [];
+      if (before.length > 0) {
+        const after = new Set(layout ? collectPtyIds(layout) : []);
+        const gone = before.filter((id) => !after.has(id) && newMarkers.has(id));
+        if (gone.length > 0) {
+          newMarkers = new Map(newMarkers);
+          for (const id of gone) newMarkers.delete(id);
+        }
       }
 
       const newStates = new Map(state.projectStates);
-      const newTabs = ps.tabs.filter((t) => t.id !== tabId);
-      const newActive =
-        ps.activeTabId === tabId ? (newTabs[newTabs.length - 1]?.id ?? '') : ps.activeTabId;
-      newStates.set(projectId, { ...ps, tabs: newTabs, activeTabId: newActive });
-      return { projectStates: newStates, markersByPty: newMarkers };
-    }),
-
-  setActiveTab: (projectId, tabId) =>
-    set((state) => {
-      const newStates = new Map(state.projectStates);
-      const ps = newStates.get(projectId);
-      if (!ps) return state;
-      newStates.set(projectId, { ...ps, activeTabId: tabId });
-      return { projectStates: newStates };
-    }),
-
-  updateTabLayout: (projectId, tabId, layout) =>
-    set((state) => {
-      const newStates = new Map(state.projectStates);
-      const ps = newStates.get(projectId);
-      if (!ps) return state;
       newStates.set(projectId, {
         ...ps,
-        tabs: ps.tabs.map((t) =>
-          t.id === tabId ? { ...t, splitLayout: layout, status: getHighestStatus(layout) } : t
-        ),
+        layout,
+        status: layout ? getHighestStatus(layout) : 'idle',
       });
-      return { projectStates: newStates };
+      return { projectStates: newStates, markersByPty: newMarkers };
     }),
 
   updatePaneStatusByPty: (ptyId, status) =>
@@ -566,33 +566,25 @@ export const useAppStore = create<AppStore>((set, get) => ({
       let oldStatus: PaneStatus | null = null;
       let owningProjectId: string | null = null;
       for (const [pid, ps] of state.projectStates) {
-        for (const tab of ps.tabs) {
-          const found = findPaneByPty(tab.splitLayout, ptyId);
-          if (found) {
-            oldStatus = found.status;
-            owningProjectId = pid;
-            break;
-          }
+        if (!ps.layout) continue;
+        const found = findPaneByPty(ps.layout, ptyId);
+        if (found) {
+          oldStatus = found.status;
+          owningProjectId = pid;
+          break;
         }
-        if (owningProjectId) break;
       }
       if (!owningProjectId || oldStatus === null) return state;
 
-      // 2. 更新各项目 tabs 中匹配 ptyId 的 pane status
+      // 2. 更新各项目布局中匹配 ptyId 的 pane status
       const newStates = new Map(state.projectStates);
       let changed = false;
       for (const [pid, ps] of newStates) {
-        let tabsChanged = false;
-        const updatedTabs = ps.tabs.map((tab) => {
-          const newLayout = updatePaneStatus(tab.splitLayout, ptyId, status);
-          if (newLayout === tab.splitLayout) return tab;
-          tabsChanged = true;
-          return { ...tab, splitLayout: newLayout, status: getHighestStatus(newLayout) };
-        });
-        if (tabsChanged) {
-          newStates.set(pid, { ...ps, tabs: updatedTabs });
-          changed = true;
-        }
+        if (!ps.layout) continue;
+        const newLayout = updatePaneStatus(ps.layout, ptyId, status);
+        if (newLayout === ps.layout) continue;
+        newStates.set(pid, { ...ps, layout: newLayout, status: getHighestStatus(newLayout) });
+        changed = true;
       }
       if (!changed) return state;
 
@@ -647,26 +639,9 @@ export const useAppStore = create<AppStore>((set, get) => ({
     }),
 
   setPanePty: (projectId, paneId, ptyId) =>
-    set((state) => {
-      const ps = state.projectStates.get(projectId);
-      if (!ps) return state;
-
-      let changed = false;
-      const tabs = ps.tabs.map((tab) => {
-        const splitLayout = updatePaneById(tab.splitLayout, paneId, (pane) => {
-          if (pane.ptyId !== undefined) return pane;
-          return { ...pane, ptyId, status: 'idle' };
-        });
-        if (splitLayout === tab.splitLayout) return tab;
-        changed = true;
-        return { ...tab, splitLayout, status: getHighestStatus(splitLayout) };
-      });
-      if (!changed) return state;
-
-      const newStates = new Map(state.projectStates);
-      newStates.set(projectId, { ...ps, tabs });
-      return { projectStates: newStates };
-    }),
+    set((state) => updateProjectPane(state, projectId, paneId, (pane) => (
+      pane.ptyId !== undefined ? pane : { ...pane, ptyId, status: 'idle' }
+    ))),
 
   exitedPtyIds: new Set<number>(),
 
@@ -677,9 +652,8 @@ export const useAppStore = create<AppStore>((set, get) => ({
       // - 重连后旧 pty 的迟到 pty-exit 也因 pane 已换新 ptyId 而被拒,消除竞态残留。
       const live = new Set<number>();
       state.projectStates.forEach((ps) => {
-        for (const tab of ps.tabs) {
-          for (const id of collectPtyIds(tab.splitLayout)) live.add(id);
-        }
+        if (!ps.layout) return;
+        for (const id of collectPtyIds(ps.layout)) live.add(id);
       });
       const next = new Set<number>();
       state.exitedPtyIds.forEach((id) => {
@@ -706,47 +680,16 @@ export const useAppStore = create<AppStore>((set, get) => ({
     }),
 
   resetPaneForReconnect: (projectId, paneId) =>
-    set((state) => {
-      const ps = state.projectStates.get(projectId);
-      if (!ps) return state;
-
-      let changed = false;
-      const tabs = ps.tabs.map((tab) => {
-        const splitLayout = updatePaneById(tab.splitLayout, paneId, (pane) => {
-          if (pane.ptyId === undefined && pane.status === 'idle') return pane;
-          return { ...pane, ptyId: undefined, status: 'idle' };
-        });
-        if (splitLayout === tab.splitLayout) return tab;
-        changed = true;
-        return { ...tab, splitLayout, status: getHighestStatus(splitLayout) };
-      });
-      if (!changed) return state;
-
-      const newStates = new Map(state.projectStates);
-      newStates.set(projectId, { ...ps, tabs });
-      return { projectStates: newStates };
-    }),
+    set((state) => updateProjectPane(state, projectId, paneId, (pane) => (
+      pane.ptyId === undefined && pane.status === 'idle'
+        ? pane
+        : { ...pane, ptyId: undefined, status: 'idle' }
+    ))),
 
   updatePaneStatusByPaneId: (projectId, paneId, status) =>
-    set((state) => {
-      const ps = state.projectStates.get(projectId);
-      if (!ps) return state;
-
-      let changed = false;
-      const tabs = ps.tabs.map((tab) => {
-        const splitLayout = updatePaneById(tab.splitLayout, paneId, (pane) => (
-          pane.status === status ? pane : { ...pane, status }
-        ));
-        if (splitLayout === tab.splitLayout) return tab;
-        changed = true;
-        return { ...tab, splitLayout, status: getHighestStatus(splitLayout) };
-      });
-      if (!changed) return state;
-
-      const newStates = new Map(state.projectStates);
-      newStates.set(projectId, { ...ps, tabs });
-      return { projectStates: newStates };
-    }),
+    set((state) => updateProjectPane(state, projectId, paneId, (pane) => (
+      pane.status === status ? pane : { ...pane, status }
+    ))),
 
   // 移动端改会话名:按 paneId 全局找（移动端只认得 pane，不知道它挂在哪个项目下）。
   // pane 级 customTitle 不进 savedLayout，所以不落配置——AI 会话本来就活不过重启。
@@ -755,17 +698,12 @@ export const useAppStore = create<AppStore>((set, get) => ({
       const nextTitle = title || undefined; // 空串 = 清掉自定义名，回落 shell 名
       const newStates = new Map(state.projectStates);
       for (const [pid, ps] of newStates) {
-        let changed = false;
-        const tabs = ps.tabs.map((tab) => {
-          const splitLayout = updatePaneById(tab.splitLayout, paneId, (pane) =>
-            pane.customTitle === nextTitle ? pane : { ...pane, customTitle: nextTitle }
-          );
-          if (splitLayout === tab.splitLayout) return tab;
-          changed = true;
-          return { ...tab, splitLayout };
-        });
-        if (!changed) continue;
-        newStates.set(pid, { ...ps, tabs });
+        if (!ps.layout) continue;
+        const layout = updatePaneById(ps.layout, paneId, (pane) =>
+          pane.customTitle === nextTitle ? pane : { ...pane, customTitle: nextTitle }
+        );
+        if (layout === ps.layout) continue;
+        newStates.set(pid, { ...ps, layout });
         return { projectStates: newStates }; // paneId 全局唯一，命中即收工
       }
       return state;
@@ -825,29 +763,21 @@ export const useAppStore = create<AppStore>((set, get) => ({
       ],
     }));
     // 5s 自动消失：在 store 内部管理定时器，避免组件 useEffect 重置问题
-    setTimeout(() => {
-      useAppStore.getState().dismissNotification(id);
-    }, 5000);
+    armNotificationTimer(id);
   },
 
-  dismissNotification: (id) =>
+  dismissNotification: (id) => {
+    clearNotificationTimer(id);
     set((state) => ({
       notifications: state.notifications.filter((x) => x.id !== id),
-    })),
+    }));
+  },
 
-  togglePanel: (panel) =>
-    set((state) => {
-      const visibleKeys = {
-        projects: 'projectsVisible',
-        sessions: 'sessionsVisible',
-        files: 'filesVisible',
-        git: 'gitVisible',
-      } as const;
-      const key = visibleKeys[panel];
-      const newConfig = { ...state.config, [key]: !state.config[key] };
-      invoke('save_config', { config: newConfig }).catch(() => {});
-      return { config: newConfig };
-    }),
+  // 悬停暂停：鼠标压在 toast 上时它不该在指针底下消失（点「跳转到项目」经常来不及）
+  pauseNotification: (id, paused) => {
+    if (paused) clearNotificationTimer(id);
+    else if (get().notifications.some((n) => n.id === id)) armNotificationTimer(id);
+  },
 
   toggleMiddleColumn: () =>
     set((state) => {
@@ -858,6 +788,8 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
   toggleRightDrawer: (panel) =>
     set((state) => ({ rightDrawer: state.rightDrawer === panel ? null : panel })),
+
+  openRightDrawer: (panel) => set({ rightDrawer: panel }),
 
   closeRightDrawer: () => set({ rightDrawer: null }),
 

@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, type ReactNode, type MouseEvent } fro
 import { invoke } from '@tauri-apps/api/core';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { useAppStore, genId } from '../store';
+import { Modal } from './Modal';
 import { useT } from '../i18n';
 import { showContextMenu } from '../utils/contextMenu';
 import type { SshConnection } from '../types';
@@ -608,21 +609,15 @@ export function SshModal({ open, onClose }: Props) {
     );
 
   return (
-    <div className="fixed inset-0 z-50 flex items-start justify-center pt-[10vh]">
-      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
-      <div className="relative w-[720px] h-[70vh] max-h-[680px] bg-[var(--bg-surface)] border border-[var(--border-strong)] rounded-[var(--radius-md)] shadow-[var(--shadow-overlay)] flex flex-col overflow-hidden animate-slide-in">
-        {/* 顶栏 */}
-        <div className="flex items-center justify-between px-5 py-4 border-b border-[var(--border-subtle)]">
-          <h2 className="text-lg font-semibold text-[var(--text-primary)]">{t('sshModal.title')}</h2>
-          <button
-            className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors text-lg leading-none"
-            onClick={onClose}
-          >
-            ✕
-          </button>
-        </div>
-
-        {/* 内容：左侧分组列表 + 右侧连接列表 */}
+    <Modal
+      open={open}
+      onClose={onClose}
+      title={t('sshModal.title')}
+      panelClassName="w-[720px] h-[70vh] max-h-[680px]"
+      // 面板里有连接表单（含密码/私钥路径），误点遮罩关掉会丢未保存内容；Esc 仍可退
+      closeOnOverlay={false}
+    >
+      {/* 内容：左侧分组列表 + 右侧连接列表 */}
         <div className="flex-1 flex min-h-0">
           {/* 左栏 */}
           <div
@@ -710,7 +705,7 @@ export function SshModal({ open, onClose }: Props) {
                       className="w-full flex items-center gap-1.5 text-sm text-[var(--text-muted)] uppercase tracking-[0.1em] hover:text-[var(--text-primary)] transition-colors"
                       onClick={() => toggleCollapsed(key)}
                     >
-                      <span className="text-[10px] w-3 flex-shrink-0">{isCollapsed ? '▸' : '▾'}</span>
+                      <span className="text-xs w-3 flex-shrink-0">{isCollapsed ? '▸' : '▾'}</span>
                       <span className="truncate">{bucket.group ?? t('sshModal.ungrouped')}</span>
                       <span className="normal-case tracking-normal flex-shrink-0">({bucket.items.length})</span>
                     </button>
@@ -748,7 +743,6 @@ export function SshModal({ open, onClose }: Props) {
             </div>
           </div>
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }

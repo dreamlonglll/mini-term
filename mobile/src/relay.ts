@@ -498,6 +498,33 @@ export function loadOlderMirror() {
   });
 }
 
+/**
+ * 下拉刷新：主动断开重连。
+ *
+ * 协议里没有「请求全量快照」这条消息（加一条要同时动 relay-server 的 protocol
+ * crate 与桌面端），而握手成功后桌面端本来就会推一份完整 sessionsSnapshot ——
+ * 重连即是最直接的「重新对齐」，且复用了已经跑熟的那条路径。
+ *
+ * 返回 false = 当前没有凭证，刷新无从谈起（未配对）。
+ */
+export function refreshSessions(): boolean {
+  const cred = getCredential();
+  if (!cred) return false;
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+  reconnectAttempt = 0;
+  // 先摘掉 onclose 再关，免得旧连接的关闭回调把我们刚发起的重连排到退避队列里
+  if (ws) {
+    ws.onclose = null;
+    ws.close();
+    ws = null;
+  }
+  connect({ credential: cred });
+  return true;
+}
+
 /** 应用启动入口:优先兑换 URL 里的配对码,否则凭本地凭证重连。 */
 export function startRelay() {
   const code = consumePairingCode();
