@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { clearStartError, openMirror, useRelayStore } from './relay';
 import { useT } from './i18n';
 import { StartSessionSheet } from './StartSessionSheet';
+import { RenameSheet } from './RenameSheet';
 import type { MobilePane } from './protocol';
 
 const STATUS_CLASS: Record<string, string> = {
@@ -23,13 +24,34 @@ function statusKey(status: string): string {
 
 function PaneRow({ pane }: { pane: MobilePane }) {
   const t = useT();
+  const [renaming, setRenaming] = useState(false);
   return (
-    <button className="pane-row" onClick={() => openMirror(pane.paneId, pane.title)}>
-      <span className={`status-dot ${STATUS_CLASS[pane.status] ?? 'dot-error'}`} />
-      <span className="pane-title">{pane.title}</span>
-      <span className="pane-status">{t(statusKey(pane.status))}</span>
-      <span className="pane-chevron">›</span>
-    </button>
+    <>
+      {/* 行是容器不是按钮:进镜像与改名是两个热区,按钮不能相互嵌套 */}
+      <div className="pane-row">
+        <button className="pane-open" onClick={() => openMirror(pane.paneId, pane.title)}>
+          <span className={`status-dot ${STATUS_CLASS[pane.status] ?? 'dot-error'}`} />
+          <span className="pane-title">{pane.title}</span>
+          <span className="pane-status">{t(statusKey(pane.status))}</span>
+          <span className="pane-chevron">›</span>
+        </button>
+        <button
+          className="pane-rename"
+          aria-label={t('sessions.rename.action')}
+          title={t('sessions.rename.action')}
+          onClick={() => setRenaming(true)}
+        >
+          ✎
+        </button>
+      </div>
+      {renaming && (
+        <RenameSheet
+          paneId={pane.paneId}
+          current={pane.title}
+          onClose={() => setRenaming(false)}
+        />
+      )}
+    </>
   );
 }
 

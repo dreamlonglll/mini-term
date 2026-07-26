@@ -10,6 +10,14 @@ export const sessions = {
       aiIdle: "空闲",
       error: "错误",
     },
+    rename: {
+      action: "重命名会话",
+      title: "重命名会话",
+      placeholder: "会话名称",
+      hint: "留空恢复默认名称。改动会同步到桌面端的终端标签。",
+      confirm: "确定",
+      cancel: "取消",
+    },
   },
   en: {
     title: "Active AI Sessions",
@@ -21,6 +29,14 @@ export const sessions = {
       aiWorking: "Working",
       aiIdle: "Idle",
       error: "Error",
+    },
+    rename: {
+      action: "Rename session",
+      title: "Rename session",
+      placeholder: "Session name",
+      hint: "Leave empty to restore the default name. The change also applies to the desktop terminal tab.",
+      confirm: "Save",
+      cancel: "Cancel",
     },
   },
 } as const;

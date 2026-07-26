@@ -93,6 +93,13 @@ export interface MobileRelayStatusPayload {
   paired?: boolean;
 }
 
+/** mobile-rename-pane 事件载荷:移动端改会话名(标题已由后端收敛:去空白/控制字符/限长)。 */
+export interface MobileRenamePanePayload {
+  paneId: string;
+  /** 空串 = 清除自定义名,回落 shell 名 */
+  title: string;
+}
+
 /** mobile-start-session 事件载荷:移动端发起的一次会话创建请求。 */
 export interface MobileStartSessionPayload {
   requestId: string;

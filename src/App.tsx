@@ -28,7 +28,7 @@ import { includeActiveProject } from './utils/projectKeepAlive';
 import { initMobileSessionSync } from './utils/mobileSessionSync';
 import { handleMobileStartSession } from './utils/mobileStartSession';
 import { useT } from './i18n';
-import type { AppConfig, PtyStatusChangePayload, PtyExitPayload, PaneStatus, MobileRelayStatusPayload, MobileStartSessionPayload } from './types';
+import type { AppConfig, PtyStatusChangePayload, PtyExitPayload, PaneStatus, MobileRelayStatusPayload, MobileStartSessionPayload, MobileRenamePanePayload } from './types';
 
 export function App() {
   const t = useT();
@@ -181,6 +181,12 @@ export function App() {
   // 不切当前项目/tab(远程操作不改动桌面上正在看的现场)
   useTauriEvent<MobileStartSessionPayload>('mobile-start-session', useCallback((payload) => {
     void handleMobileStartSession(payload);
+  }, []));
+
+  // 移动端改会话名:直接改布局里那个 pane 的 customTitle,桌面端 tab 栏同步显示。
+  // 不回执——改完的新名字会随结构增量推回手机,那既是反馈也是真相。
+  useTauriEvent<MobileRenamePanePayload>('mobile-rename-pane', useCallback((payload) => {
+    useAppStore.getState().renamePaneById(payload.paneId, payload.title);
   }, []));
 
   useTauriEvent<PtyExitPayload>('pty-exit', useCallback((payload) => {

@@ -356,6 +356,21 @@ export function openMirror(paneId: string, title: string) {
   sendToRelay({ type: 'subscribePane', paneId });
 }
 
+/**
+ * 重命名会话。返回 false = 当前不可改(未连接 / 桌面端离线)。
+ *
+ * 不做乐观更新:改完的名字由桌面端随结构增量推回来,列表和镜像页标题跟着变。
+ * 本地先改会在失败时留下一个假名字——桌面端没改成的话它什么也不会推,
+ * 那个假名字要等下次全量快照才被纠正回去。
+ * 传空串 = 清除自定义名(回落 shell 名),与桌面端右键重命名留空同义。
+ */
+export function renamePane(paneId: string, title: string): boolean {
+  const { phase, desktopOnline } = useRelayStore.getState();
+  if (phase !== 'connected' || desktopOnline === false) return false;
+  sendToRelay({ type: 'renamePane', paneId, title: title.trim() });
+  return true;
+}
+
 /** 发送移动端指令(写穿,不排队)。返回 false = 当前不可发送。 */
 export function sendMobileCommand(text: string): boolean {
   const { mirror, desktopOnline, phase } = useRelayStore.getState();
@@ -422,7 +437,17 @@ function findPane(projects: MobileProject[], paneId: string) {
  * 出现即视为"AI 真起来了",自动进入它的对话镜像。
  */
 function onProjectsChanged() {
-  const { starting, projects } = useRelayStore.getState();
+  const { starting, projects, mirror } = useRelayStore.getState();
+
+  // 镜像页的标题是打开时从列表带入的副本:列表里的名字变了(手机改名、桌面端改名)
+  // 得跟着走,否则正在看的这个会话还挂着旧名字
+  if (mirror) {
+    const current = findPane(projects, mirror.paneId);
+    if (current && current.title !== mirror.title) {
+      useRelayStore.setState({ mirror: { ...mirror, title: current.title } });
+    }
+  }
+
   if (!starting?.paneId) return;
   const pane = findPane(projects, starting.paneId);
   if (!pane) return;

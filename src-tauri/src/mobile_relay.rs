@@ -563,6 +563,16 @@ fn handle_relay_message(app: &AppHandle, manager: &MobileRelayManager, text: &st
             command_id,
             text,
         }) => handle_mobile_command(app, manager, pane_id, command_id, text),
+        // 移动端重命名会话:pane 标题归前端布局状态所有,后端只做长度收敛后转交
+        Ok(RelayToDesktop::RenamePane { pane_id, title }) => {
+            let _ = app.emit(
+                "mobile-rename-pane",
+                RenamePanePayload {
+                    pane_id,
+                    title: sanitize_pane_title(&title),
+                },
+            );
+        }
         // 移动端发起新 AI 会话:后端校验后交给前端建 tab(PTY 与布局都归前端管)
         Ok(RelayToDesktop::StartAiSession {
             request_id,
@@ -572,6 +582,30 @@ fn handle_relay_message(app: &AppHandle, manager: &MobileRelayManager, text: &st
         Ok(_) => {}
         Err(_) => eprintln!("[mobile-relay] unparseable relay message (ignored)"),
     }
+}
+
+/// pane 自定义标题的字符数上限。桌面端 tab 栏是一行横排,超长标题会把同组其它
+/// tab 挤出可视区;截断而不是拒绝——用户改的名字过长是手滑,不该整条改名失败。
+const MAX_PANE_TITLE_CHARS: usize = 64;
+
+/// 收敛移动端传来的标题:去首尾空白、砍掉控制字符、限长。
+/// 空串是合法输入(= 清除自定义名),原样返回给前端处理。
+fn sanitize_pane_title(title: &str) -> String {
+    title
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_PANE_TITLE_CHARS)
+        .collect()
+}
+
+/// `mobile-rename-pane` 事件载荷:交给前端改布局里那个 pane 的 customTitle。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenamePanePayload {
+    pub pane_id: String,
+    /// 已收敛过的标题;空串 = 清除自定义名,回落 shell 名
+    pub title: String,
 }
 
 /// `mobile-start-session` 事件载荷:后端校验通过后交给前端执行的启动指令。
@@ -1016,6 +1050,18 @@ mod tests {
             can_start_session: true,
             group_path: vec![],
         }
+    }
+
+    #[test]
+    fn sanitize_pane_title_trims_strips_controls_and_limits_length() {
+        assert_eq!(sanitize_pane_title("  重构登录  "), "重构登录");
+        // 换行/ESC 之类的控制字符会破坏 tab 栏的单行排版
+        assert_eq!(sanitize_pane_title("a\nb\x1b[31mc"), "ab[31mc");
+        // 全空白 = 清除自定义名
+        assert_eq!(sanitize_pane_title("   "), "");
+        // 按字符数限长,不是字节数——中文不该被砍成半个字
+        let long = "长".repeat(100);
+        assert_eq!(sanitize_pane_title(&long).chars().count(), MAX_PANE_TITLE_CHARS);
     }
 
     #[test]

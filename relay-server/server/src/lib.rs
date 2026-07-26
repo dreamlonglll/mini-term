@@ -675,6 +675,12 @@ fn handle_mobile_message(state: &RelayState, msg: MobileToRelay) {
                 None
             }
         }
+        // 重命名会话:桌面端离线就丢弃。无回执通道——改没改成看结构增量回不回新
+        // title,离线时手机侧本来就看得到「桌面端离线」横幅
+        MobileToRelay::RenamePane { pane_id, title } => inner
+            .desktop
+            .is_some()
+            .then_some(RelayToDesktop::RenamePane { pane_id, title }),
         // 发起新 AI 会话:同样离线即拒(桌面离线意味着起不来,补送没有意义)
         MobileToRelay::StartAiSession {
             request_id,

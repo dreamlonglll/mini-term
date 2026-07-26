@@ -317,6 +317,8 @@ interface AppStore {
   updatePaneStatusByPty: (ptyId: number, status: PaneStatus) => void;
   setPanePty: (projectId: string, paneId: string, ptyId: number) => void;
   updatePaneStatusByPaneId: (projectId: string, paneId: string, status: PaneStatus) => void;
+  /** 移动端改会话名:按 paneId 全局定位;空串 = 清除自定义名,回落 shell 名 */
+  renamePaneById: (paneId: string, title: string) => void;
 
   // 已退出的 PTY 集合（pty-exit 事件登记）。远程 pane 据此显示「连接已断开,点击重连」
   // 覆盖层（远程 ssh 进程退出后 pane 不自动关闭,用户主动 exit 与异常断线不做区分）。
@@ -744,6 +746,29 @@ export const useAppStore = create<AppStore>((set, get) => ({
       const newStates = new Map(state.projectStates);
       newStates.set(projectId, { ...ps, tabs });
       return { projectStates: newStates };
+    }),
+
+  // 移动端改会话名:按 paneId 全局找（移动端只认得 pane，不知道它挂在哪个项目下）。
+  // pane 级 customTitle 不进 savedLayout，所以不落配置——AI 会话本来就活不过重启。
+  renamePaneById: (paneId, title) =>
+    set((state) => {
+      const nextTitle = title || undefined; // 空串 = 清掉自定义名，回落 shell 名
+      const newStates = new Map(state.projectStates);
+      for (const [pid, ps] of newStates) {
+        let changed = false;
+        const tabs = ps.tabs.map((tab) => {
+          const splitLayout = updatePaneById(tab.splitLayout, paneId, (pane) =>
+            pane.customTitle === nextTitle ? pane : { ...pane, customTitle: nextTitle }
+          );
+          if (splitLayout === tab.splitLayout) return tab;
+          changed = true;
+          return { ...tab, splitLayout };
+        });
+        if (!changed) continue;
+        newStates.set(pid, { ...ps, tabs });
+        return { projectStates: newStates }; // paneId 全局唯一，命中即收工
+      }
+      return state;
     }),
 
   addMarker: (payload, xtermMarkerId) => {

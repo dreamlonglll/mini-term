@@ -206,6 +206,8 @@ pub enum RelayToDesktop {
         command_id: String,
         text: String,
     },
+    /// 移动端重命名会话(转发自移动端):改的是目标 pane 的自定义标题。
+    RenamePane { pane_id: String, title: String },
     /// 移动端发起新 AI 会话(原样转发自移动端):按 `launcher_id` 引用桌面端配置的
     /// 具名启动器,命令文本从不经过移动端或中转。
     StartAiSession {
@@ -240,6 +242,12 @@ pub enum MobileToRelay {
         command_id: String,
         text: String,
     },
+    /// 重命名会话:改目标 pane 的自定义标题(桌面端 tab 栏同步显示)。
+    ///
+    /// 无回执:改名成功与否由结构增量把新 title 推回来体现——那既是反馈也是真相,
+    /// 再加一条回执只是把同一件事说两遍。空 title = 清除自定义名(回落 shell 名),
+    /// 与桌面端右键重命名留空同义。
+    RenamePane { pane_id: String, title: String },
     /// 发起新 AI 会话:在 `project_id` 项目里按 `launcher_id` 启动器新开一个 tab。
     /// request_id 由移动端生成,用于回执关联。
     StartAiSession {
@@ -679,6 +687,29 @@ mod tests {
         };
         let json = serde_json::to_string(&closed).unwrap();
         assert_eq!(serde_json::from_str::<RelayToMobile>(&json).unwrap(), closed);
+    }
+
+    #[test]
+    fn rename_pane_round_trip() {
+        let req = MobileToRelay::RenamePane {
+            pane_id: "pane-1".into(),
+            title: "重构登录".into(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains(r#""type":"renamePane""#) && json.contains(r#""paneId":"pane-1""#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<MobileToRelay>(&json).unwrap(), req);
+
+        // 转发到桌面端的那一跳字段同名;空 title 合法(= 清除自定义名)
+        let fwd = RelayToDesktop::RenamePane {
+            pane_id: "pane-1".into(),
+            title: String::new(),
+        };
+        let json = serde_json::to_string(&fwd).unwrap();
+        assert!(json.contains(r#""type":"renamePane""#), "{json}");
+        assert_eq!(serde_json::from_str::<RelayToDesktop>(&json).unwrap(), fwd);
     }
 
     #[test]

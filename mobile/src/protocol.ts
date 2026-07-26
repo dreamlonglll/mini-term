@@ -44,6 +44,16 @@ export interface MobileCommandMsg {
   text: string;
 }
 
+/**
+ * 重命名会话:改桌面端那个 pane 的自定义标题。
+ * 无回执——改没改成看结构增量把新 title 推没推回来。空 title = 清除自定义名。
+ */
+export interface MobileRenamePane {
+  type: 'renamePane';
+  paneId: string;
+  title: string;
+}
+
 /** 发起新 AI 会话:按桌面端配置的具名启动器,在某项目新开一个 tab */
 export interface MobileStartAiSession {
   type: 'startAiSession';
@@ -58,6 +68,7 @@ export type MobileToRelay =
   | MobileUnsubscribePane
   | MobileRequestMirrorHistory
   | MobileCommandMsg
+  | MobileRenamePane
   | MobileStartAiSession;
 
 // ── 中转 → 移动端 ──

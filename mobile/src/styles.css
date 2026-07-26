@@ -189,25 +189,46 @@ body {
   padding: 10px 14px 6px;
 }
 
+/* 会话行 = 「进镜像」按钮 + 「改名」按钮两个热区(按钮不能套按钮,行本身是容器) */
 .pane-row {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 12px 14px;
   border-top: 1px solid var(--border-subtle);
   width: 100%;
+}
+
+.pane-open {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex: 1;
+  min-width: 0; /* 不设的话 flex 子项撑开，.pane-title 的省略号失效 */
+  padding: 12px 4px 12px 14px;
   background: transparent;
-  border-left: none;
-  border-right: none;
-  border-bottom: none;
+  border: none;
   color: inherit;
   font: inherit;
   text-align: left;
   cursor: pointer;
 }
 
-.pane-row:active {
+.pane-open:active {
   background: rgba(255, 255, 255, 0.04);
+}
+
+.pane-rename {
+  flex-shrink: 0;
+  padding: 12px 14px;
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.pane-rename:active {
+  color: var(--accent);
 }
 
 .pane-chevron {
@@ -279,12 +300,75 @@ body {
   flex-shrink: 0;
 }
 
+/* 标题即改名入口:点它弹重命名(会话结束/桌面端离线时由 disabled 收掉) */
 .mirror-title {
+  flex: 1;
+  min-width: 0;
+  padding: 4px 0;
+  background: transparent;
+  border: none;
+  color: inherit;
+  font-family: inherit;
   font-size: 15px;
   font-weight: 600;
+  text-align: left;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  cursor: pointer;
+}
+
+.mirror-title:disabled {
+  cursor: default;
+}
+
+.mirror-title:not(:disabled):active {
+  color: var(--accent);
+}
+
+/* 重命名弹层 */
+.rename-field {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+}
+
+.rename-input {
+  width: 100%;
+  padding: 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-elevated, rgba(255, 255, 255, 0.04));
+  color: inherit;
+  font: inherit;
+  font-size: 16px; /* iOS Safari 对 <16px 的输入框会自动放大页面 */
+}
+
+.rename-input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.rename-hint {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.rename-confirm {
+  padding: 12px;
+  border-radius: 10px;
+  border: none;
+  background: var(--accent);
+  color: #fff;
+  font: inherit;
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.rename-confirm:active {
+  opacity: 0.85;
 }
 
 .mirror-closed {
