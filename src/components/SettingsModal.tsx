@@ -11,6 +11,7 @@ import { updateAllTerminalThemes, DEFAULT_TERMINAL_FONT_FAMILY } from '../utils/
 import { applyUiFontFamily } from '../utils/fontManager';
 import { MOD_LABEL } from '../utils/platform';
 import { comboLabel, hotkeyGroups } from '../utils/hotkeys';
+import { DEFAULT_REMOTE_PASTE_DIR } from '../utils/pastePath';
 import { useT } from '../i18n';
 import { LanguageToggle } from './LanguageToggle';
 import { Modal } from './Modal';
@@ -265,6 +266,8 @@ function TerminalSettings() {
   const savedCharThreshold = config.longPasteCharThreshold ?? 2000;
   const [lineThresholdInput, setLineThresholdInput] = useState(String(savedLineThreshold));
   const [charThresholdInput, setCharThresholdInput] = useState(String(savedCharThreshold));
+  const savedRemotePasteDir = config.remotePasteDir ?? DEFAULT_REMOTE_PASTE_DIR;
+  const [remotePasteDirInput, setRemotePasteDirInput] = useState(savedRemotePasteDir);
 
   useEffect(() => {
     setShells([...config.availableShells]);
@@ -275,7 +278,8 @@ function TerminalSettings() {
   useEffect(() => {
     setLineThresholdInput(String(savedLineThreshold));
     setCharThresholdInput(String(savedCharThreshold));
-  }, [savedLineThreshold, savedCharThreshold]);
+    setRemotePasteDirInput(savedRemotePasteDir);
+  }, [savedLineThreshold, savedCharThreshold, savedRemotePasteDir]);
 
   const save = useCallback(async (updatedShells: ShellConfig[], updatedDefault: string) => {
     const newConfig = {
@@ -354,6 +358,16 @@ function TerminalSettings() {
     setCharThresholdInput(String(clamped));
     if (clamped !== savedCharThreshold) {
       void saveConfigPatch({ longPasteCharThreshold: clamped });
+    }
+  };
+
+  const commitRemotePasteDir = () => {
+    // 清空 = 回默认值（而不是落一个空串让后端每次去兜底）。
+    // `..` 的拒绝在后端 resolve_paste_dir，这里只做归一，避免两处判定漂移。
+    const next = remotePasteDirInput.trim() || DEFAULT_REMOTE_PASTE_DIR;
+    setRemotePasteDirInput(next);
+    if (next !== savedRemotePasteDir) {
+      void saveConfigPatch({ remotePasteDir: next });
     }
   };
 
@@ -517,6 +531,33 @@ function TerminalSettings() {
 
       <div className="pt-1 text-sm text-[var(--text-muted)]">
         {t("settings.terminal.longPasteFooter")}
+      </div>
+
+      <div className="pt-6 text-base text-[var(--text-muted)] uppercase tracking-[0.1em] mb-2">
+        {t("settings.terminal.remotePaste")}
+      </div>
+
+      <div className="px-3 py-2.5 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)]">
+        <div className="text-base text-[var(--text-primary)]">
+          {t("settings.terminal.remotePasteDir")}
+        </div>
+        <div className="text-sm text-[var(--text-muted)] mb-2">
+          {t("settings.terminal.remotePasteDirDesc")}
+        </div>
+        <input
+          type="text"
+          spellCheck={false}
+          placeholder={DEFAULT_REMOTE_PASTE_DIR}
+          className="w-full bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1 text-base outline-none focus:border-[var(--accent)] font-mono"
+          value={remotePasteDirInput}
+          onChange={(e) => setRemotePasteDirInput(e.target.value)}
+          onBlur={commitRemotePasteDir}
+          onKeyDown={(e) => e.key === 'Enter' && (e.target as HTMLInputElement).blur()}
+        />
+      </div>
+
+      <div className="pt-1 text-sm text-[var(--text-muted)]">
+        {t("settings.terminal.remotePasteFooter")}
       </div>
     </div>
   );

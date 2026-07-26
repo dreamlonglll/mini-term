@@ -112,6 +112,7 @@ pub fn run() {
             remote_ssh::ssh_remote_validate_dir,
             remote_ssh::ssh_remote_ai_sessions,
             remote_ssh::ssh_remote_ai_session_content,
+            remote_ssh::ssh_remote_upload_paste,
             wsl_distros::list_wsl_distros,
             git::get_git_status,
             git::get_git_diff,

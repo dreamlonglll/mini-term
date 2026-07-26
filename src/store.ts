@@ -88,6 +88,23 @@ function findPaneByPty(node: SplitNode, ptyId: number): PaneState | null {
   return null;
 }
 
+/**
+ * 查 ptyId 归属的项目 id 与 pane（跨全部项目布局深搜）；找不到返回 null。
+ *
+ * 粘贴链路要按「pane 属于本地 / WSL / SSH 远程项目」分流，而 xterm 的 key
+ * handler 手上只有 ptyId —— 这里补上那一跳。
+ */
+export function findPaneContextByPty(
+  ptyId: number,
+): { projectId: string; pane: PaneState } | null {
+  for (const [projectId, ps] of useAppStore.getState().projectStates) {
+    if (!ps.layout) continue;
+    const pane = findPaneByPty(ps.layout, ptyId);
+    if (pane) return { projectId, pane };
+  }
+  return null;
+}
+
 function updatePaneById(
   node: SplitNode,
   paneId: string,
@@ -426,6 +443,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
     longPasteToFile: true,
     longPasteLineThreshold: 10,
     longPasteCharThreshold: 2000,
+    remotePasteDir: '.mini-term/pasted',
     middleColumnVisible: true,
     hookEnabled: false,
     smartCopyPaste: false,

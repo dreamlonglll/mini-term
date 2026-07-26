@@ -34,6 +34,10 @@ export const settings = {
       charThreshold: "字符数阈值",
       charThresholdDesc: "粘贴内容长度 ≥ 此值即转存（0 表示不按字符判断）",
       longPasteFooter: "关闭后超长文本将直接粘贴 · 任一阈值命中即触发转存 · 临时文件保存在系统 temp 目录，24 小时后自动清理",
+      remotePaste: "远程粘贴",
+      remotePasteDir: "远程项目上传目录",
+      remotePasteDirDesc: "在 SSH 远程项目的终端里粘贴图片 / 超长文本时，文件会先传到远端这个目录，再粘贴远端路径",
+      remotePasteFooter: "相对路径按远程项目根解析（默认 .mini-term/pasted，落在项目内 agent 可直接读取）· 也可填远端绝对路径如 /tmp/mini-term 或 ~/uploads · 不允许包含 .. · WSL 项目无需上传，自动改用 /mnt 路径",
     },
     system: {
       languageLabel: "界面语言",
@@ -192,6 +196,10 @@ export const settings = {
       charThreshold: "Character threshold",
       charThresholdDesc: "Save when paste length ≥ this value (0 means ignore character count)",
       longPasteFooter: "When off, long pastes go through directly · Hitting either threshold triggers saving · Temp files live in the system temp dir and are cleaned up after 24 hours",
+      remotePaste: "Remote paste",
+      remotePasteDir: "Upload directory for remote projects",
+      remotePasteDirDesc: "When pasting images / long text into an SSH remote project's terminal, the file is uploaded to this directory first and the remote path is pasted instead",
+      remotePasteFooter: "Relative paths resolve against the remote project root (default .mini-term/pasted, inside the project so agents can read it without extra permission) · Absolute remote paths like /tmp/mini-term or ~/uploads also work · `..` is rejected · WSL projects need no upload and use /mnt paths automatically",
     },
     system: {
       languageLabel: "Language",

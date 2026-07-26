@@ -19,6 +19,8 @@ export function ToastContainer() {
         const isWslInfo = n.kind === 'wsl-info';
         // 移动端发起的新会话:带项目跳转(点一下就能接管),图标用信息态区分
         const isMobileSession = n.kind === 'mobile-session';
+        // 远程粘贴上传失败:错误态图标,点击仅关闭(项目就在眼前,不需要跳转)
+        const isPasteError = n.kind === 'paste-error';
         const isInfo = isWslInfo || isMobileSession;
         return (
           <div
@@ -28,20 +30,28 @@ export function ToastContainer() {
             onMouseEnter={() => pauseNotification(n.id, true)}
             onMouseLeave={() => pauseNotification(n.id, false)}
             onClick={() => {
-              // WSL 信息提示不带项目跳转语义,点击仅 dismiss
-              if (!isWslInfo) {
+              // WSL 信息提示 / 粘贴失败不带项目跳转语义,点击仅 dismiss
+              if (!isWslInfo && !isPasteError) {
                 setActiveProject(n.projectId);
               }
               dismissNotification(n.id);
             }}
           >
-            <div className={isInfo ? 'toast-icon toast-icon--info' : 'toast-icon'}>
-              {isInfo ? 'i' : '✓'}
+            <div
+              className={
+                isPasteError
+                  ? 'toast-icon toast-icon--error'
+                  : isInfo
+                    ? 'toast-icon toast-icon--info'
+                    : 'toast-icon'
+              }
+            >
+              {isPasteError ? '!' : isInfo ? 'i' : '✓'}
             </div>
             <div className="toast-body">
               <div className="toast-name">{n.projectName}</div>
               <div className="toast-desc">
-                {isInfo ? (n.message ?? '') : t('toast.aiDone')}
+                {isInfo || isPasteError ? (n.message ?? '') : t('toast.aiDone')}
               </div>
             </div>
             <button

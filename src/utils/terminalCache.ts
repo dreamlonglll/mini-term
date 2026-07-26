@@ -22,6 +22,8 @@ import type { PtyOutputPayload } from '../types';
 import { getResolvedTheme } from './themeManager';
 import { createPtyWriteQueue } from './ptyWriteQueue';
 import { getCurrentLineSnapshotFromBuffer } from './terminalSnapshot';
+import { resolvePasteTarget, mapPastedFilePath, type PasteTarget } from './pastePath';
+import { t } from '../i18n';
 
 export interface CachedTerminal {
   term: Terminal;
@@ -664,20 +666,66 @@ function isLongText(text: string, lineThreshold: number, charThreshold: number):
   return false;
 }
 
+/** 正在处理粘贴的 pty。远程上传要几百毫秒到几秒，这期间用户连按 Ctrl+V 会让
+ *  多条路径以完成顺序乱序插入命令行；直接丢弃重入的那次，语义上等同「还没粘完」。*/
+const pasteInFlight = new Set<number>();
+
+/** 上传/转换失败时弹一条提示（远程 pane 静默失败最难排查：粘进去的路径看着
+ *  没毛病，只有远端 agent 报「文件不存在」）。仅在有项目归属时能弹。 */
+function notifyPasteFailure(target: PasteTarget, err: unknown): void {
+  console.error('粘贴内容转存到远端失败:', err);
+  if (target.kind !== 'ssh') return;
+  const detail = err instanceof Error ? err.message : String(err);
+  useAppStore.getState().pushNotification({
+    projectId: target.projectId,
+    projectName: target.projectName,
+    kind: 'paste-error',
+    message: t('terminal.pasteUploadFailed', { detail }),
+  });
+}
+
 /** 读取系统剪贴板并写入终端 PTY。
  * - 剪贴板含图片 → 保存为 temp PNG，粘贴带引号的路径（兼容含空格路径）
  * - 文本超过配置阈值且开关开启 → 保存为 temp .txt，粘贴带引号的路径
  * - 否则直接粘贴文本
+ *
+ * 落盘路径都要先过 {@link mapPastedFilePath}：WSL pane 转 `/mnt/...`，
+ * SSH 远程 pane 走 SFTP 上传后粘远端路径（issue #36）。
  */
 export async function pasteToTerminal(ptyId: number): Promise<void> {
+  if (pasteInFlight.has(ptyId)) return;
+  pasteInFlight.add(ptyId);
+  try {
+    await pasteToTerminalInner(ptyId);
+  } finally {
+    pasteInFlight.delete(ptyId);
+  }
+}
+
+async function pasteToTerminalInner(ptyId: number): Promise<void> {
+  const target = resolvePasteTarget(ptyId);
+
   if (await clipboardHasImage()) {
     // 优先：Win32 API 读取图片保存为 temp PNG，粘贴文件路径
     // 兼容 PinPix 等 arboard 无法读取的非标准剪贴板格式
+    let localPath: string | null = null;
     try {
-      const path: string = await invoke('read_clipboard_image');
-      await enqueuePtyWrite(ptyId, `"${path}"`);
-      return;
+      localPath = await invoke<string>('read_clipboard_image');
     } catch { /* Win32 也读不到，回退 Alt+V */ }
+
+    if (localPath !== null) {
+      try {
+        const path = await mapPastedFilePath(localPath, target);
+        await enqueuePtyWrite(ptyId, `"${path}"`);
+        return;
+      } catch (e) {
+        // 上传失败：明确告知。此时回退 Alt+V 也没用（远端 agent 读的是远端
+        // 剪贴板），所以只提示、不往终端写任何东西。
+        notifyPasteFailure(target, e);
+        return;
+      }
+    }
+
     // 回退：发送 Alt+V 转义序列让 AI 工具自行处理
     await enqueuePtyWrite(ptyId, '\x1bv');
     return;
@@ -693,10 +741,16 @@ export async function pasteToTerminal(ptyId: number): Promise<void> {
   // 长文本：转存临时文件，粘贴路径；失败则回退到直接粘贴
   if (enabled && isLongText(text, lineThreshold, charThreshold)) {
     try {
-      const path: string = await invoke('save_clipboard_text', { text });
+      const localPath = await invoke<string>('save_clipboard_text', { text });
+      const path = await mapPastedFilePath(localPath, target);
       await enqueuePtyWrite(ptyId, `"${path}"`);
       return;
-    } catch { /* 写文件失败，回退到直接粘贴 */ }
+    } catch (e) {
+      // 本地写文件失败 → 直接粘原文（老行为）。
+      // 远端上传失败 → 直接粘原文同样可用（就是长了点），比报错更有用；
+      // 但仍要提示，否则用户不知道自己粘的是全文而非路径。
+      notifyPasteFailure(target, e);
+    }
   }
 
   const cached = getCachedTerminal(ptyId);

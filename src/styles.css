@@ -347,6 +347,7 @@ body.ssh-conn-dragging {
   flex-shrink: 0;
 }
 .toast-icon--info { background: var(--color-info); }
+.toast-icon--error { background: var(--color-error); }
 
 .toast-body { flex: 1; min-width: 0; }
 .toast-name {

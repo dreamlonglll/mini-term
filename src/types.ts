@@ -37,6 +37,9 @@ export interface AppConfig {
   longPasteToFile: boolean;
   longPasteLineThreshold: number;
   longPasteCharThreshold: number;
+  /** 远程项目粘贴落盘目录（剪贴板图片 / 长文本经 SFTP 上传的目标）。
+   *  相对路径 = 相对项目根（默认 `.mini-term/pasted`）；也可填远端绝对路径或 `~/xxx` */
+  remotePasteDir: string;
   /** 中间栏（Projects + Files）整体折叠开关 */
   middleColumnVisible: boolean;
   /** 右侧悬浮抽屉（Sessions / Git）宽度 */
@@ -215,8 +218,9 @@ export interface AiCompletionNotification {
   timestamp: number;
   /** 通知类型,默认 'ai-completion'(AI 任务完成,点击跳到对应项目);
    *  'wsl-info' 用于 WSL 启动器重写提示,不携带 projectId 跳转语义;
-   *  'mobile-session' 用于移动端远程发起的新会话(点击跳到对应项目)。 */
-  kind?: 'ai-completion' | 'wsl-info' | 'mobile-session';
+   *  'mobile-session' 用于移动端远程发起的新会话(点击跳到对应项目);
+   *  'paste-error' 用于远程粘贴上传失败(错误态图标,点击仅关闭)。 */
+  kind?: 'ai-completion' | 'wsl-info' | 'mobile-session' | 'paste-error';
   /** kind='wsl-info' / 'mobile-session' 时的自定义消息文本,渲染时直接展示。 */
   message?: string;
 }

@@ -90,6 +90,12 @@ pub struct AppConfig {
     pub long_paste_line_threshold: u32,
     #[serde(default = "default_long_paste_char_threshold")]
     pub long_paste_char_threshold: u32,
+    /// 远程项目粘贴落盘目录:剪贴板图片 / 长文本转存的临时文件经 SFTP 上传到这里，
+    /// 粘进终端的是远端路径（本地路径远端 agent 读不到）。
+    /// 相对路径 = 相对项目根（默认落项目内，agent 无需额外授权即可读）；
+    /// 也可填远端绝对路径（`/tmp/mini-term`）或 `~/xxx`。含 `..` 的写法会被拒绝。
+    #[serde(default = "default_remote_paste_dir")]
+    pub remote_paste_dir: String,
     // NOTE: 曾有 projects_visible / sessions_visible / files_visible / git_visible
     // 四个面板显隐开关，界面上没有任何入口消费（已被 middle_column_visible 与右侧
     // 抽屉取代），随 UI 改版一并删除。旧 config.json 里残留的这些键会被 serde 忽略。
@@ -303,6 +309,11 @@ fn default_long_paste_line_threshold() -> u32 {
 fn default_long_paste_char_threshold() -> u32 {
     2000
 }
+/// 默认落项目内的隐藏目录:agent 对项目目录天然有读权限，不像 `/tmp` 那样
+/// 会触发 Claude Code 的项目外路径确认。
+pub fn default_remote_paste_dir() -> String {
+    ".mini-term/pasted".into()
+}
 fn default_true() -> bool {
     true
 }
@@ -337,6 +348,7 @@ impl Default for AppConfig {
             long_paste_to_file: true,
             long_paste_line_threshold: default_long_paste_line_threshold(),
             long_paste_char_threshold: default_long_paste_char_threshold(),
+            remote_paste_dir: default_remote_paste_dir(),
             middle_column_visible: true,
             right_drawer_width: None,
             last_active_project_id: None,
