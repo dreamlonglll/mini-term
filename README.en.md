@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.8.0-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.8.1-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -158,7 +158,7 @@ Watch the AI running on your desktop from your phone while you're out, and send 
 | File watching | notify 7 + ignore 0.4 (.gitignore filtering) |
 | Tauri plugins | `window-state` · `clipboard-manager` · `dialog` · `opener` |
 | Mobile relay | axum + tokio WebSocket relay service (`relay-server/`) · React + TS + Vite PWA (`mobile/`) |
-| Test coverage | 413 Rust tests = 375 desktop (tauri-app 271 + mt-core 38 + mt-ssh 26 + mt-sidecars 40) + 38 relay-server (protocol & routing); plus 19 Node tests |
+| Test coverage | 419 Rust tests = 381 desktop (tauri-app 277 + mt-core 38 + mt-ssh 26 + mt-sidecars 40) + 38 relay-server (protocol & routing); plus 19 Node tests |
 
 ## Getting Started
 
@@ -372,12 +372,12 @@ npm run build
 # Node-side tests (19)
 node --test "tests/*.test.cjs"
 
-# Desktop Rust tests (352)
+# Desktop Rust tests (381)
 # Note: mt-core / mt-ssh / mt-sidecars are standalone crates, not workspace members.
-# Running `cd src-tauri && cargo test` alone only covers tauri-app's 248 — the other
+# Running `cd src-tauri && cargo test` alone only covers tauri-app's 277 — the other
 # three need their manifests specified explicitly.
 cd src-tauri
-cargo test                                        # tauri-app     248
+cargo test                                        # tauri-app     277
 cargo test --manifest-path mt-core/Cargo.toml     # mt-core        38
 cargo test --manifest-path mt-ssh/Cargo.toml      # mt-ssh         26
 cargo test --manifest-path mt-sidecars/Cargo.toml # mt-sidecars    40

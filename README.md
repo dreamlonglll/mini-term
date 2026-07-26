@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.8.0-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.8.1-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -158,7 +158,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 | 文件监听 | notify 7 + ignore 0.4（.gitignore 过滤） |
 | Tauri 插件 | `window-state` · `clipboard-manager` · `dialog` · `opener` |
 | 移动端中转 | axum + tokio WebSocket 中转服务（`relay-server/`）· React + TS + Vite PWA（`mobile/`） |
-| 测试覆盖 | 413 个 Rust 测试 = 桌面端 375（tauri-app 271 + mt-core 38 + mt-ssh 26 + mt-sidecars 40）+ 中转服务端 38（协议与路由）；另有 19 个 Node 测试 |
+| 测试覆盖 | 419 个 Rust 测试 = 桌面端 381（tauri-app 277 + mt-core 38 + mt-ssh 26 + mt-sidecars 40）+ 中转服务端 38（协议与路由）；另有 19 个 Node 测试 |
 
 ## 快速开始
 
@@ -370,11 +370,11 @@ npm run build
 # Node 侧测试（19 个）
 node --test "tests/*.test.cjs"
 
-# 桌面端 Rust 测试（375 个）
+# 桌面端 Rust 测试（381 个）
 # 注意：mt-core / mt-ssh / mt-sidecars 是独立 crate 而非 workspace member，
-# 单跑 `cd src-tauri && cargo test` 只覆盖 tauri-app 的 271 个，其余三个要分别指定 manifest。
+# 单跑 `cd src-tauri && cargo test` 只覆盖 tauri-app 的 277 个，其余三个要分别指定 manifest。
 cd src-tauri
-cargo test                                        # tauri-app     271
+cargo test                                        # tauri-app     277
 cargo test --manifest-path mt-core/Cargo.toml     # mt-core        38
 cargo test --manifest-path mt-ssh/Cargo.toml      # mt-ssh         26
 cargo test --manifest-path mt-sidecars/Cargo.toml # mt-sidecars    40
