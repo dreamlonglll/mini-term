@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.7.0-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.7.1-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -100,6 +100,8 @@ Watch the AI running on your desktop from your phone while you're out, and send 
 
 - **Connect and pair in one place** — Fill in the relay address in the top-bar "Mobile" panel → save & connect → generate a pairing QR code, all in a single panel. Scanning with your phone camera opens the PWA and pairs automatically; the code is single-use (valid for 10 minutes), pairing a new device replaces the old one, and "Reset pairing" revokes every credential instantly.
 - **Active AI session list** — The phone shows running Claude / Codex sessions grouped by project, with status lights that add, remove, and change color in real time alongside the desktop; when the desktop goes offline a top banner appears and the list greys out, clearing automatically on reconnect.
+- **Start a new session from your phone** — Tap **+** → pick a project → pick an AI launcher, and the desktop opens a terminal tab in that project in the background and brings the agent up; once the session is really running the phone enters its mirror automatically, without disturbing whatever you are looking at on the desktop. Projects are listed with the desktop's group hierarchy and can be collapsed. Launchers are named entries configured on the desktop — the phone references them by id and only ever sees the name, so **the command text never passes through the phone or the relay**.
+- **Rename sessions** — Give a session a name you will recognise, from the ✎ on a list row or the title on the mirror page; it shows up on the desktop terminal tab as well. Leave it empty to restore the default name.
 - **Conversation mirror (read-only)** — Tap into any session to follow the conversation live, with AI replies rendered as Markdown and desktop input shown verbatim; scrolling to the top pages in older messages. Mirror binding resolves the session identity through hooks down to the exact pane, so multiple AI sessions running in the same project never cross-contaminate.
 - **Mobile commands** — The input box at the bottom of the mirror page writes text straight through to the corresponding desktop terminal (equivalent to typing it yourself and pressing Enter), with an immediate receipt and an explicit failure reason; when the desktop is offline the relay rejects the command outright rather than storing and forwarding it.
 - **The relay forwards, never persists** — The relay server stores no message bodies and logs metadata only (a subprocess-level automated test asserts zero file residue across the full flow); it ships with a three-stage Dockerfile and a compose example to build and run from source in one command — reverse proxy + TLS setup in the [deployment guide](docs/deploy-relay.md).
@@ -236,7 +238,8 @@ mini-term/
 │   │   ├── SessionViewerModal.tsx # AI session content viewer (Markdown rendering)
 │   │   ├── SshModal.tsx          # SSH connection manager (groups + connection CRUD)
 │   │   ├── SshAssocModal.tsx     # Per-project SSH association (enables MCP, scopes visibility)
-│   │   ├── MobileRelayModal.tsx  # "Mobile" panel (relay address / connection status / pairing QR)
+│   │   ├── MobileRelayModal.tsx  # "Mobile" panel (relay address / status / pairing QR / AI launchers)
+│   │   ├── AiLauncherSection.tsx # AI launcher CRUD (name / shell / command + command-detection warning)
 │   │   ├── RelayStatusBadge.tsx  # Relay connection status badge
 │   │   ├── SettingsModal.tsx     # Settings dialog (theme / font / shell / AI notify / hook)
 │   │   ├── LanguageToggle.tsx    # Chinese / English switcher
@@ -258,7 +261,8 @@ mini-term/
 │       ├── projectEnv.ts         # Per-project environment variable validation
 │       ├── remoteProject.ts      # SSH remote project helpers (detection / broken-link check / remote PTY creation)
 │       ├── wslPath.ts            # WSL UNC path parsing and display
-│       ├── mobileSessionSync.ts  # Pushes active AI session snapshots to the relay
+│       ├── mobileSessionSync.ts  # Pushes project + active AI session snapshots (with group hierarchy)
+│       ├── mobileStartSession.ts # Desktop landing for phone-started sessions (pane + launch command)
 │       ├── ptyWriteQueue.ts      # PTY write queue (chunked large pastes)
 │       ├── themeManager.ts       # Theme switching + system color watching
 │       └── updateChecker.ts      # GitHub Release version check
@@ -281,7 +285,7 @@ mini-term/
 │   │   ├── ssh.rs                # SSH connection management + password auto-fill / key handling
 │   │   ├── remote_ssh.rs         # SSH remote projects (SFTP dir listing / dir validation / remote session reading)
 │   │   ├── ssh_mcp_registry.rs   # Per-project SSH MCP enablement (writes .mcp.json / Codex config)
-│   │   ├── mobile_relay.rs       # Mobile relay (outbound WSS link / pairing / session snapshots / command write-through)
+│   │   ├── mobile_relay.rs       # Mobile relay (outbound WSS link / pairing / snapshots / commands / start session / rename)
 │   │   ├── mobile_mirror.rs      # Conversation mirror (incremental session JSONL parsing + pagination)
 │   │   ├── window_theme.rs       # Native Windows title bar dark mode (DWM Immersive Dark Mode)
 │   │   └── window_input_recovery.rs # Recovery from stuck window input focus
@@ -294,7 +298,7 @@ mini-term/
 │   ├── protocol/                 # Protocol message crate shared by desktop and relay (JSON over WebSocket)
 │   ├── server/                   # axum relay service (forward-only, no persistence + PWA static hosting)
 │   └── docker-compose.yml        # Build and run from source in one command
-├── mobile/                       # Mobile PWA (React + TS + Vite — pairing / list / mirror / commands)
+├── mobile/                       # Mobile PWA (React + TS + Vite — pairing / list / mirror / commands / start / rename)
 ├── scripts/
 │   ├── stage-sidecars.mjs        # Builds sidecars and stages them per-triple as Tauri externalBin
 │   └── stage-conpty.mjs          # Downloads, verifies and stages the pinned ConPTY runtime (Windows)
@@ -317,8 +321,8 @@ ai-working → ai-idle → Toast + DONE Tag + requestUserAttention
 
 ### Tauri Interface Overview
 
-- **Commands (60)** — PTY: `create_pty` · `write_pty` · `resize_pty` · `kill_pty`; FS: `list_directory` · `read_file_content` · `watch_directory` · `unwatch_directory` · `create_file` · `create_directory` · `rename_entry` · `delete_entry` · `filter_directories`; Search: `start_search` · `cancel_search`; Git: `get_git_status` · `get_git_diff` · `discover_git_repos` · `get_git_log` · `get_repo_branches` · `get_commit_files` · `get_commit_file_diff` · `git_pull` · `git_push` · `get_changes_status` · `git_stage` · `git_unstage` · `git_stage_all` · `git_unstage_all` · `git_commit` · `git_discard_file`; Config: `load_config` · `save_config`; Editor: `open_in_editor` · `open_path_with_default_app`; Clipboard: `read_clipboard_image` · `save_clipboard_text`; AI: `get_ai_sessions` · `get_wsl_ai_sessions` · `get_ai_session_content`; WSL: `list_wsl_distros`; Hook: `register_ai_hooks` · `unregister_ai_hooks` · `get_hook_config_snippet` · `get_hook_status` · `toggle_hook_server`; SSH: `arm_ssh_autofill` · `prepare_ssh_key`; SSH MCP: `enable_ssh_mcp` · `disable_ssh_mcp`; SSH remote: `ssh_remote_list_directory` · `ssh_remote_validate_dir` · `ssh_remote_ai_sessions` · `ssh_remote_ai_session_content`; Theme: `set_window_dark_mode`; Mobile relay: `mobile_relay_apply` · `mobile_relay_status` · `mobile_relay_request_pairing_code` · `mobile_relay_reset_pairing` · `mobile_relay_update_sessions`
-- **Events (9, backend → frontend)** — `pty-output` · `pty-exit` · `pty-status-change` · `ai-user-submit` (user pressed Enter inside an AI session; drives marker placement) · `fs-change` · `search-results` · `search-complete` · `mobile-relay-status` · `mobile-relay-pairing-code`
+- **Commands (63)** — PTY: `create_pty` · `write_pty` · `resize_pty` · `kill_pty`; FS: `list_directory` · `read_file_content` · `watch_directory` · `unwatch_directory` · `create_file` · `create_directory` · `rename_entry` · `delete_entry` · `filter_directories`; Search: `start_search` · `cancel_search`; Git: `get_git_status` · `get_git_diff` · `discover_git_repos` · `get_git_log` · `get_repo_branches` · `get_commit_files` · `get_commit_file_diff` · `git_pull` · `git_push` · `get_changes_status` · `git_stage` · `git_unstage` · `git_stage_all` · `git_unstage_all` · `git_commit` · `git_discard_file`; Config: `load_config` · `save_config`; Editor: `open_in_editor` · `open_path_with_default_app`; Clipboard: `read_clipboard_image` · `save_clipboard_text`; AI: `get_ai_sessions` · `get_wsl_ai_sessions` · `get_ai_session_content`; WSL: `list_wsl_distros`; Hook: `register_ai_hooks` · `unregister_ai_hooks` · `get_hook_config_snippet` · `get_hook_status` · `toggle_hook_server`; SSH: `arm_ssh_autofill` · `prepare_ssh_key`; SSH MCP: `enable_ssh_mcp` · `disable_ssh_mcp`; SSH remote: `ssh_remote_list_directory` · `ssh_remote_validate_dir` · `ssh_remote_ai_sessions` · `ssh_remote_ai_session_content`; Theme: `set_window_dark_mode`; Mobile relay: `mobile_relay_apply` · `mobile_relay_status` · `mobile_relay_request_pairing_code` · `mobile_relay_reset_pairing` · `mobile_relay_update_sessions` · `mobile_relay_launchers_changed` · `mobile_relay_start_session_result` · `mobile_relay_check_launcher_command`
+- **Events (12, backend → frontend)** — `pty-output` · `pty-exit` · `pty-status-change` · `ai-user-submit` (user pressed Enter inside an AI session; drives marker placement) · `fs-change` · `search-results` · `search-complete` · `wsl-shell-override` · `mobile-relay-status` · `mobile-relay-pairing-code` · `mobile-start-session` · `mobile-rename-pane`
 
 ### Status Priority
 
