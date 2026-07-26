@@ -109,7 +109,8 @@ server {
 3. Scan it with your phone camera → the PWA opens in the browser, pairs automatically, and shows the list of active AI sessions.
 4. Use the browser menu's "Add to Home Screen" so it opens as a standalone window from then on (on iOS, adding to the home screen is required for the standalone window experience).
 5. Start Claude / Codex in any desktop terminal → it appears in the phone's list in real time → tap in to watch the conversation mirror → send a command from the input box at the bottom, and it is written verbatim into the desktop terminal.
-6. Tap **+** at the bottom right of the phone's home screen → pick a project → pick an AI launcher → the desktop opens a new tab in that project and brings the agent up; once the session is live the phone enters its conversation mirror automatically. Launchers are managed in the desktop "Mobile" panel (Claude / Codex are preset); commands and shells never leave the desktop.
+6. Tap **+** at the bottom right of the phone's home screen → pick a project → pick an AI launcher → the desktop opens a new tab in that project and brings the agent up; once the session is live the phone enters its conversation mirror automatically. Projects are listed with the desktop's group hierarchy and can be collapsed; launchers are managed in the desktop "Mobile" panel (Claude / Codex are preset), and commands and shells never leave the desktop.
+7. Tap the ✎ on a session row, or the title at the top of the mirror page, to give the session a name you will recognise — the desktop terminal tab shows it too (leave it empty to restore the default).
 
 ## 5. Upgrades and Operations
 
@@ -118,15 +119,15 @@ cd mini-term && git pull
 cd relay-server && docker compose up -d --build
 ```
 
-### Upgrading from v0.7.0 (protocol v1) to protocol v2
+### Upgrading from v0.7.0 to v0.7.1 (protocol v1 → v2)
 
 Protocol v2 adds desktop authentication. **All three steps must be completed**, or the desktop simply cannot connect — that is the deliberate price of fail-closed:
 
 1. Rebuild and redeploy the relay (`docker compose up -d --build`).
 2. Configure `MT_RELAY_DESKTOP_KEY` on the relay (`relay-server/.env`, see above).
-3. Upgrade the desktop app and enter the same key value in the "Mobile" panel, then save and connect.
+3. Upgrade the desktop app to v0.7.1 or later and enter the same key value in the "Mobile" panel, then save and connect.
 
-The order does not matter (an old desktop against a new relay gets a version-mismatch prompt, and vice versa); being disconnected mid-upgrade is expected and resolves once all three steps are done. The phone needs no action: the PWA is served by the relay and follows along automatically.
+The order does not matter (an old desktop against a new relay gets a version-mismatch prompt, and vice versa); being disconnected mid-upgrade is expected and resolves once all three steps are done. The PWA is served by the relay and picks up the new version on its own, so it never needs a manual update; recreating the container does clear the pairing state, though, so the phone has to scan once more (see the notes below).
 
 Things to keep in mind:
 
