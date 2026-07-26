@@ -8,6 +8,7 @@ import {
   useRelayStore,
 } from './relay';
 import { useT } from './i18n';
+import { RenameSheet } from './RenameSheet';
 import type { MirrorMessage } from './protocol';
 
 function sourceKey(source: string): string {
@@ -112,6 +113,7 @@ export function MirrorView() {
   const desktopOnline = useRelayStore((s) => s.desktopOnline);
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
+  const [renaming, setRenaming] = useState(false);
 
   const messageCount = mirror?.messages.length ?? 0;
   const lastSeq = messageCount > 0 ? mirror!.messages[messageCount - 1].seq : -1;
@@ -142,8 +144,24 @@ export function MirrorView() {
         <button className="mirror-back" onClick={closeMirror}>
           ‹ {t('mirror.back')}
         </button>
-        <span className="mirror-title">{mirror.title}</span>
+        {/* 标题即改名入口。会话已结束/桌面端离线时改不动:pane 没了或消息送不到 */}
+        <button
+          className="mirror-title"
+          disabled={mirror.closed || desktopOnline === false}
+          title={t('sessions.rename.action')}
+          onClick={() => setRenaming(true)}
+        >
+          {mirror.title}
+        </button>
       </div>
+
+      {renaming && (
+        <RenameSheet
+          paneId={mirror.paneId}
+          current={mirror.title}
+          onClose={() => setRenaming(false)}
+        />
+      )}
 
       {desktopOnline === false && (
         <div className="offline-banner">

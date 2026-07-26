@@ -307,7 +307,8 @@ interface AppStore {
   renameProject: (id: string, name: string) => void;
 
   // Tab
-  addTab: (projectId: string, tab: TerminalTab) => void;
+  /** 新增 tab。`activate=false`(移动端远程发起)时不抢当前 tab 焦点 */
+  addTab: (projectId: string, tab: TerminalTab, activate?: boolean) => void;
   removeTab: (projectId: string, tabId: string) => void;
   setActiveTab: (projectId: string, tabId: string) => void;
   updateTabLayout: (projectId: string, tabId: string, layout: SplitNode) => void;
@@ -316,6 +317,8 @@ interface AppStore {
   updatePaneStatusByPty: (ptyId: number, status: PaneStatus) => void;
   setPanePty: (projectId: string, paneId: string, ptyId: number) => void;
   updatePaneStatusByPaneId: (projectId: string, paneId: string, status: PaneStatus) => void;
+  /** 移动端改会话名:按 paneId 全局定位;空串 = 清除自定义名,回落 shell 名 */
+  renamePaneById: (paneId: string, title: string) => void;
 
   // 已退出的 PTY 集合（pty-exit 事件登记）。远程 pane 据此显示「连接已断开,点击重连」
   // 覆盖层（远程 ssh 进程退出后 pane 不自动关闭,用户主动 exit 与异常断线不做区分）。
@@ -495,15 +498,18 @@ export const useAppStore = create<AppStore>((set, get) => ({
       },
     })),
 
-  addTab: (projectId, tab) =>
+  addTab: (projectId, tab, activate = true) =>
     set((state) => {
       const newStates = new Map(state.projectStates);
       const ps = newStates.get(projectId);
       if (!ps) return state;
+      // 不抢焦点时仍要保证有个活动 tab：项目此前一个 tab 都没有(或 activeTabId
+      // 已指向不存在的 tab)的话不激活就是一片空白,那不是"保住现场"而是弄坏现场。
+      const hasLiveActive = ps.tabs.some((t) => t.id === ps.activeTabId);
       newStates.set(projectId, {
         ...ps,
         tabs: [...ps.tabs, tab],
-        activeTabId: tab.id,
+        activeTabId: activate || !hasLiveActive ? tab.id : ps.activeTabId,
       });
       return { projectStates: newStates };
     }),
@@ -740,6 +746,29 @@ export const useAppStore = create<AppStore>((set, get) => ({
       const newStates = new Map(state.projectStates);
       newStates.set(projectId, { ...ps, tabs });
       return { projectStates: newStates };
+    }),
+
+  // 移动端改会话名:按 paneId 全局找（移动端只认得 pane，不知道它挂在哪个项目下）。
+  // pane 级 customTitle 不进 savedLayout，所以不落配置——AI 会话本来就活不过重启。
+  renamePaneById: (paneId, title) =>
+    set((state) => {
+      const nextTitle = title || undefined; // 空串 = 清掉自定义名，回落 shell 名
+      const newStates = new Map(state.projectStates);
+      for (const [pid, ps] of newStates) {
+        let changed = false;
+        const tabs = ps.tabs.map((tab) => {
+          const splitLayout = updatePaneById(tab.splitLayout, paneId, (pane) =>
+            pane.customTitle === nextTitle ? pane : { ...pane, customTitle: nextTitle }
+          );
+          if (splitLayout === tab.splitLayout) return tab;
+          changed = true;
+          return { ...tab, splitLayout };
+        });
+        if (!changed) continue;
+        newStates.set(pid, { ...ps, tabs });
+        return { projectStates: newStates }; // paneId 全局唯一，命中即收工
+      }
+      return state;
     }),
 
   addMarker: (payload, xtermMarkerId) => {

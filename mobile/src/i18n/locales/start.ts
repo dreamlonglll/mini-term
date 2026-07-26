@@ -1,0 +1,48 @@
+export const start = {
+  zh: {
+    fab: "新建会话",
+    pickProject: "选择项目",
+    pickLauncher: "选择 AI 启动器",
+    back: "返回",
+    cancel: "取消",
+    notSupported: "对话镜像不可用",
+    noProjects: "桌面端还没有任何项目",
+    starting: "正在「{project}」启动会话…",
+    disabled: {
+      offline: "桌面端离线，无法新建会话",
+      noLaunchers: "请先在桌面端配置启动器",
+      starting: "正在启动会话…",
+    },
+    error: {
+      timeout: "未能进入 AI 会话，请到桌面查看",
+      desktopOffline: "桌面端离线，会话没有被创建",
+      projectNotFound: "该项目已不存在",
+      launcherNotFound: "该启动器已被删除",
+      notSupported: "该项目不支持远程新建会话",
+      spawnFailed: "桌面端创建终端失败",
+    },
+  },
+  en: {
+    fab: "New session",
+    pickProject: "Pick a project",
+    pickLauncher: "Pick an AI launcher",
+    back: "Back",
+    cancel: "Cancel",
+    notSupported: "Conversation mirror unavailable",
+    noProjects: "No projects on the desktop yet",
+    starting: "Starting a session in “{project}”…",
+    disabled: {
+      offline: "Desktop offline — can't start a session",
+      noLaunchers: "Configure a launcher on the desktop first",
+      starting: "Starting a session…",
+    },
+    error: {
+      timeout: "The AI session never came up — check your desktop",
+      desktopOffline: "Desktop went offline; no session was created",
+      projectNotFound: "That project no longer exists",
+      launcherNotFound: "That launcher has been deleted",
+      notSupported: "This project can't start sessions remotely",
+      spawnFailed: "The desktop failed to create a terminal",
+    },
+  },
+} as const;

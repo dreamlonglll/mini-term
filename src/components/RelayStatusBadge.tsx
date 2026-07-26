@@ -6,7 +6,10 @@ const RELAY_STATUS_COLORS: Record<string, string> = {
   connecting: 'var(--color-ai-working)',
   reconnecting: 'var(--color-ai-working)',
   disconnected: 'var(--text-muted)',
+  // 三种"配置问题"终态:已停止重连,红点提示要人动手改配置
   versionMismatch: 'var(--color-error)',
+  authFailed: 'var(--color-error)',
+  keyNotConfigured: 'var(--color-error)',
 };
 
 /** 中转连接状态徽章:彩色圆点 + 状态文案(设置页与「移动端」面板共用)。 */

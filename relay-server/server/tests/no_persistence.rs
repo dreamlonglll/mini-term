@@ -71,6 +71,7 @@ async fn relay_process_leaves_no_files_behind() {
         .current_dir(&root)
         .env("RELAY_BIND", "127.0.0.1")
         .env("RELAY_PORT", "0") // 临时端口,从 stderr 日志解析实际值
+        .env("MT_RELAY_DESKTOP_KEY", "no-persist-key")
         .env("HOME", &home)
         .env("USERPROFILE", &home)
         .env("TMP", &tmp)
@@ -120,6 +121,7 @@ async fn relay_process_leaves_no_files_behind() {
         &mut desktop,
         &DesktopToRelay::Hello {
             protocol_version: PROTOCOL_VERSION,
+            desktop_key: "no-persist-key".into(),
         },
     )
     .await;

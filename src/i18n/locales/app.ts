@@ -23,6 +23,7 @@ export const app = {
     },
     emptyState: "请先在中间栏添加项目",
     wslOverride: "已检测到 WSL 项目,使用 wsl.exe 启动终端 ({path})",
+    mobileStartSession: "移动端新建了会话（{launcher}）",
   },
   en: {
     menu: {
@@ -48,5 +49,6 @@ export const app = {
     },
     emptyState: "Add a project in the middle panel first",
     wslOverride: "WSL project detected, launching terminal with wsl.exe ({path})",
+    mobileStartSession: "Mobile started a session ({launcher})",
   },
 } as const;

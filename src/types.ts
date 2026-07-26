@@ -59,17 +59,67 @@ export interface AppConfig {
 export interface MobileRelayConfig {
   /** 中转服务器地址(如 wss://relay.example.com),空字符串 = 未配置、不建连 */
   relayUrl: string;
+  /** 桌面端接入密钥,须与中转的 MT_RELAY_DESKTOP_KEY 一致;空 = 未填,连不上 */
+  desktopKey?: string;
+  /** AI 启动器列表:决定手机能起哪些 agent;命令与 shell 只存在于这里 */
+  launchers?: AiLauncher[];
+}
+
+/** 一条具名的「怎么起一个 AI 会话」。 */
+export interface AiLauncher {
+  id: string;
+  name: string;
+  /** 引用 availableShells 里的条目名;缺省 = 用 defaultShell */
+  shell?: string;
+  command: string;
 }
 
 /** mobile-relay-status 事件 / mobile_relay_status 命令的载荷。 */
 export interface MobileRelayStatusPayload {
-  status: 'disconnected' | 'connecting' | 'connected' | 'reconnecting' | 'versionMismatch';
+  status:
+    | 'disconnected'
+    | 'connecting'
+    | 'connected'
+    | 'reconnecting'
+    | 'versionMismatch'
+    /** 密钥不匹配 */
+    | 'authFailed'
+    /** 中转未配置 MT_RELAY_DESKTOP_KEY(fail-closed) */
+    | 'keyNotConfigured';
   /** versionMismatch 时携带,用于给出明确升级提示 */
   expectedVersion?: number;
   actualVersion?: number;
   /** 移动端配对状态(中转推送);undefined = 尚未知悉(未连上中转) */
   paired?: boolean;
 }
+
+/** mobile-rename-pane 事件载荷:移动端改会话名(标题已由后端收敛:去空白/控制字符/限长)。 */
+export interface MobileRenamePanePayload {
+  paneId: string;
+  /** 空串 = 清除自定义名,回落 shell 名 */
+  title: string;
+}
+
+/** mobile-start-session 事件载荷:移动端发起的一次会话创建请求。 */
+export interface MobileStartSessionPayload {
+  requestId: string;
+  projectId: string;
+  launcherId: string;
+  /** 启动器展示名(通知文案用) */
+  launcherName: string;
+  /** 绑定的 shell 名;缺省 = 用默认 shell */
+  shellName?: string;
+  /** 要写入 PTY 的启动命令 */
+  command: string;
+}
+
+/** 发起会话失败原因,对齐后端 StartSessionFailReason 的 camelCase 串。 */
+export type StartSessionFailReason =
+  | 'desktopOffline'
+  | 'projectNotFound'
+  | 'launcherNotFound'
+  | 'notSupported'
+  | 'spawnFailed';
 
 export interface ProjectConfig {
   id: string;
@@ -157,9 +207,10 @@ export interface AiCompletionNotification {
   projectName: string;
   timestamp: number;
   /** 通知类型,默认 'ai-completion'(AI 任务完成,点击跳到对应项目);
-   *  'wsl-info' 用于 WSL 启动器重写提示,不携带 projectId 跳转语义。 */
-  kind?: 'ai-completion' | 'wsl-info';
-  /** kind='wsl-info' 时的自定义消息文本,渲染时直接展示。 */
+   *  'wsl-info' 用于 WSL 启动器重写提示,不携带 projectId 跳转语义;
+   *  'mobile-session' 用于移动端远程发起的新会话(点击跳到对应项目)。 */
+  kind?: 'ai-completion' | 'wsl-info' | 'mobile-session';
+  /** kind='wsl-info' / 'mobile-session' 时的自定义消息文本,渲染时直接展示。 */
   message?: string;
 }
 
