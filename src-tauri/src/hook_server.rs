@@ -3,17 +3,19 @@
 //! 在后台线程监听 `127.0.0.1` 的 HTTP 请求，接收 Claude Code / Codex 的
 //! hook 事件上报，并通过 Tauri event 通知前端。
 
-use crate::process_monitor::PtyStatusChangePayload;
+use crate::process_monitor::StatusEmitter;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
 
 /// 默认监听端口
 const DEFAULT_PORT: u16 = 23456;
 /// 端口冲突时最多尝试的端口数
 const MAX_PORT_ATTEMPTS: u16 = 5;
+/// 每个 PTY 保留的已结束会话墓碑数量上限
+const ENDED_SESSIONS_CAP: usize = 8;
 /// Hook 事件的 JSON payload
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)] // 保留完整字段供未来 UI 细化使用
@@ -30,6 +32,9 @@ pub struct HookPayload {
     pub cwd: Option<String>,
     /// 工具名称（PreToolUse/PostToolUse 时有值）
     pub tool_name: Option<String>,
+    /// SessionEnd 的结束原因（clear / logout / prompt_input_exit / other），
+    /// Claude Code 写在 stdin payload 里，sidecar 原样转发
+    pub reason: Option<String>,
 }
 
 /// Hook 状态信息，供前端查询
@@ -58,6 +63,11 @@ pub struct HookState {
     last_session: Arc<Mutex<HashMap<u32, HookSessionId>>>,
     /// 记录哪些 PTY 曾经收到过 hook 事件（一旦标记，永不降级回轮询）
     hook_enabled: Arc<Mutex<std::collections::HashSet<u32>>>,
+    /// pty → 已结束会话 id 的环形墓碑。hook 脚本是独立进程，POST 到达
+    /// 顺序无保证：SessionEnd 之后仍可能收到旧会话迟到的 Stop/Notification，
+    /// 若放行会把已退出的 pane 重新推回 ai-idle。`remove()` 不清墓碑
+    /// （SessionEnd 自身要先打墓碑再 remove），PTY 关闭时由 `purge()` 清理。
+    ended_sessions: Arc<Mutex<HashMap<u32, VecDeque<String>>>>,
     port: Arc<Mutex<u16>>,
     /// 保存 server 实例，供运行时停止（Arc 共享给监听线程）
     server: Arc<Mutex<Option<Arc<tiny_http::Server>>>>,
@@ -70,6 +80,7 @@ impl HookState {
             last_hook_status: Arc::new(Mutex::new(HashMap::new())),
             last_session: Arc::new(Mutex::new(HashMap::new())),
             hook_enabled: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            ended_sessions: Arc::new(Mutex::new(HashMap::new())),
             port: Arc::new(Mutex::new(0)),
             server: Arc::new(Mutex::new(None)),
         }
@@ -110,12 +121,41 @@ impl HookState {
         self.last_hook_status.lock().unwrap().insert(pty_id, status);
     }
 
-    /// 移除指定 PTY 的 hook 状态（PTY 关闭时调用）
+    /// 移除指定 PTY 的 hook 状态。不清墓碑：SessionEnd 打完墓碑后调用
+    /// 本方法，墓碑要继续挡住旧会话的迟到事件。
     pub fn remove(&self, pty_id: u32) {
         self.hook_enabled.lock().unwrap().remove(&pty_id);
         self.last_hook_time.lock().unwrap().remove(&pty_id);
         self.last_hook_status.lock().unwrap().remove(&pty_id);
         self.last_session.lock().unwrap().remove(&pty_id);
+    }
+
+    /// PTY 关闭时的彻底清理：hook 状态 + 墓碑
+    pub fn purge(&self, pty_id: u32) {
+        self.remove(pty_id);
+        self.ended_sessions.lock().unwrap().remove(&pty_id);
+    }
+
+    /// 给已结束的会话 id 打墓碑
+    pub fn mark_session_ended(&self, pty_id: u32, session_id: String) {
+        let mut map = self.ended_sessions.lock().unwrap();
+        let queue = map.entry(pty_id).or_default();
+        if queue.iter().any(|s| s == &session_id) {
+            return;
+        }
+        if queue.len() >= ENDED_SESSIONS_CAP {
+            queue.pop_front();
+        }
+        queue.push_back(session_id);
+    }
+
+    /// 该会话是否已被打墓碑（已结束）
+    pub fn is_session_ended(&self, pty_id: u32, session_id: &str) -> bool {
+        self.ended_sessions
+            .lock()
+            .unwrap()
+            .get(&pty_id)
+            .map_or(false, |q| q.iter().any(|s| s == session_id))
     }
 
     /// 获取当前服务器端口
@@ -164,12 +204,27 @@ fn map_event_to_status(event: &str, agent: Option<&str>) -> Option<&'static str>
     }
 }
 
+/// SessionEnd 是否已过时:payload 与当前记录的会话 id 都已知且不相等,
+/// 说明这个 pty 上已经跑起了新会话(hook 进程独立 POST,新 SessionStart
+/// 可能先到),销毁动作(清 hook 状态 / 清 AI 会话标记 / 发 idle)必须跳过。
+/// 任一方未知时按未过时处理,保持与旧行为一致。
+fn session_end_is_stale(ended_sid: Option<&str>, current_sid: Option<&str>) -> bool {
+    match (ended_sid, current_sid) {
+        (Some(ended), Some(current)) => ended != current,
+        _ => false,
+    }
+}
+
 /// 启动 hook HTTP 服务器
 ///
 /// 在后台线程监听，接收 hook 事件后通过 Tauri event 通知前端。
 /// 端口从 DEFAULT_PORT 开始尝试，冲突时自动递增。
 /// 返回 `Err` 表示无法绑定端口，调用方应将错误提示给用户。
-pub fn start_hook_server(app: AppHandle, hook_state: HookState) -> Result<(), String> {
+pub fn start_hook_server(
+    app: AppHandle,
+    hook_state: HookState,
+    emitter: StatusEmitter,
+) -> Result<(), String> {
     // 如果已经在运行，不重复启动
     if hook_state.is_server_running() {
         eprintln!("[hook-server] 服务器已在运行，跳过启动");
@@ -257,20 +312,54 @@ pub fn start_hook_server(app: AppHandle, hook_state: HookState) -> Result<(), St
             // 处理事件
             if let (Some(pty_id), Some(ref event)) = (payload.pty_id, &payload.event) {
                 if event == "SessionEnd" {
-                    // 会话结束：清除 hook 状态，让 process_monitor 回退到轮询
-                    hook_state.remove(pty_id);
-                    let _ = app.emit(
-                        "pty-status-change",
-                        PtyStatusChangePayload {
-                            pty_id,
-                            status: "idle".to_string(),
-                        },
-                    );
-                    eprintln!(
-                        "[hook-server] pty_id={} event=SessionEnd -> hook 已清除，回退到 idle",
-                        pty_id
-                    );
+                    // 只用 payload 自带的 session_id 打墓碑。不要退回 session_of:
+                    // 新会话的 SessionStart 若先到,session_of 已是新会话,兜底会
+                    // 把新会话误打进墓碑,冻结其全部后续事件。
+                    if let Some(sid) = payload.session_id.clone() {
+                        hook_state.mark_session_ended(pty_id, sid);
+                    }
+                    let current_sid = hook_state.session_of(pty_id).map(|s| s.session_id);
+                    if payload.reason.as_deref() == Some("clear") {
+                        // /clear 换会话不是退出：紧随其后的 SessionStart 会带新
+                        // session id 刷新状态，这里只靠墓碑挡住旧会话的迟到事件
+                        eprintln!(
+                            "[hook-server] pty_id={} event=SessionEnd(clear) -> 仅记录墓碑",
+                            pty_id
+                        );
+                    } else if session_end_is_stale(
+                        payload.session_id.as_deref(),
+                        current_sid.as_deref(),
+                    ) {
+                        // 迟到的 SessionEnd:pty 上已经记录了更新的会话
+                        // (退出后立刻重开 claude,新 SessionStart 先到)。
+                        // 此时清 hook 状态 / AI 会话标记会误杀新会话,只留墓碑。
+                        eprintln!(
+                            "[hook-server] pty_id={} event=SessionEnd 迟到(已有新会话),仅记录墓碑",
+                            pty_id
+                        );
+                    } else {
+                        // 权威退出信号：清 hook 状态回退到轮询，同时清输入检测的
+                        // AI 会话标记——双击 Ctrl+C 间隔超窗漏检时靠这里自愈
+                        hook_state.remove(pty_id);
+                        app.state::<crate::pty::PtyManager>().clear_ai_session(pty_id);
+                        emitter.emit_if_changed(&app, pty_id, "idle");
+                        eprintln!(
+                            "[hook-server] pty_id={} event=SessionEnd(reason={:?}) -> hook 已清除，回退到 idle",
+                            pty_id, payload.reason
+                        );
+                    }
                 } else {
+                    // 已结束会话的迟到事件直接丢弃：hook 脚本是独立进程，
+                    // POST 到达顺序无保证，放行会把退出后的 pane 推回 ai-idle
+                    if let Some(sid) = payload.session_id.as_deref() {
+                        if hook_state.is_session_ended(pty_id, sid) {
+                            eprintln!(
+                                "[hook-server] pty_id={} event={} 来自已结束会话 {}，忽略",
+                                pty_id, event, sid
+                            );
+                            continue;
+                        }
+                    }
                     // 会话身份先于状态映射记录:即使事件不映射状态(如未知事件),
                     // session_id 也是有效信息;/clear 换会话时靠这里自动刷新
                     if let Some(sid) = payload.session_id.clone() {
@@ -279,14 +368,8 @@ pub fn start_hook_server(app: AppHandle, hook_state: HookState) -> Result<(), St
                     if let Some(status) = map_event_to_status(event, payload.agent.as_deref()) {
                         hook_state.update(pty_id, status.to_string());
 
-                        // 通过 Tauri event 通知前端（复用现有 pty-status-change 事件）
-                        let _ = app.emit(
-                            "pty-status-change",
-                            PtyStatusChangePayload {
-                                pty_id,
-                                status: status.to_string(),
-                            },
-                        );
+                        // 通知前端（与 process_monitor 共享同一份去重表）
+                        emitter.emit_if_changed(&app, pty_id, status);
 
                         eprintln!(
                             "[hook-server] pty_id={} event={} -> status={}",
@@ -321,11 +404,12 @@ pub fn stop_hook_server(hook_state: &HookState, app: &AppHandle) {
 pub fn toggle_hook_server(
     app: AppHandle,
     hook_state: tauri::State<'_, HookState>,
+    emitter: tauri::State<'_, StatusEmitter>,
     enabled: bool,
 ) -> Result<(), String> {
     if enabled {
         if !hook_state.is_server_running() {
-            start_hook_server(app, hook_state.inner().clone())?;
+            start_hook_server(app, hook_state.inner().clone(), emitter.inner().clone())?;
         }
     } else if hook_state.is_server_running() {
         stop_hook_server(hook_state.inner(), &app);
@@ -382,6 +466,59 @@ mod tests {
         // SessionEnd / PTY 关闭走 remove:会话身份一并清除
         state.remove(1);
         assert!(state.session_of(1).is_none());
+    }
+
+    #[test]
+    fn session_end_staleness() {
+        // 正常退出:payload 与当前记录一致 -> 不过时,执行销毁动作
+        assert!(!session_end_is_stale(Some("sid-a"), Some("sid-a")));
+        // 退出后立刻重开,新 SessionStart 先到 -> 过时,只留墓碑
+        assert!(session_end_is_stale(Some("sid-a"), Some("sid-b")));
+        // 任一方未知时保守按未过时处理(旧行为)
+        assert!(!session_end_is_stale(None, Some("sid-b")));
+        assert!(!session_end_is_stale(Some("sid-a"), None));
+        assert!(!session_end_is_stale(None, None));
+    }
+
+    #[test]
+    fn tombstone_blocks_ended_session() {
+        let state = HookState::new();
+        assert!(!state.is_session_ended(1, "sid-a"));
+        state.mark_session_ended(1, "sid-a".into());
+        assert!(state.is_session_ended(1, "sid-a"));
+        // 其他会话 / 其他 pty 不受影响
+        assert!(!state.is_session_ended(1, "sid-b"));
+        assert!(!state.is_session_ended(2, "sid-a"));
+    }
+
+    #[test]
+    fn tombstone_survives_remove_cleared_by_purge() {
+        let state = HookState::new();
+        state.update(1, "ai-idle".into());
+        state.mark_session_ended(1, "sid-a".into());
+
+        // SessionEnd 路径:先打墓碑再 remove,墓碑必须存活
+        state.remove(1);
+        assert!(!state.is_hook_enabled(1));
+        assert!(state.is_session_ended(1, "sid-a"));
+
+        // PTY 关闭走 purge:墓碑一并清理
+        state.purge(1);
+        assert!(!state.is_session_ended(1, "sid-a"));
+    }
+
+    #[test]
+    fn tombstone_capped_and_deduped() {
+        let state = HookState::new();
+        // 重复打墓碑不占额外容量
+        state.mark_session_ended(1, "sid-0".into());
+        state.mark_session_ended(1, "sid-0".into());
+        for i in 1..ENDED_SESSIONS_CAP + 2 {
+            state.mark_session_ended(1, format!("sid-{}", i));
+        }
+        // 超容量后最老的被挤出,最新的保留
+        assert!(!state.is_session_ended(1, "sid-0"));
+        assert!(state.is_session_ended(1, &format!("sid-{}", ENDED_SESSIONS_CAP + 1)));
     }
 
     #[test]
