@@ -148,12 +148,15 @@ fn sample_projects() -> Vec<MobileProject> {
                 status: "ai-working".into(),
             }],
             can_start_session: true,
+            // 带分组的项目:中转是「反序列化→再序列化」转发的,这里同时守着 groupPath 不被吃掉
+            group_path: vec!["工作".into(), "后端".into()],
         },
         MobileProject {
             project_id: "p2".into(),
             name: "remote".into(),
             panes: vec![],
             can_start_session: false,
+            group_path: vec![],
         },
     ]
 }

@@ -690,3 +690,52 @@ body {
   font-size: 13px;
   color: var(--text-muted);
 }
+
+/* 项目分组行(对齐桌面端侧栏的分组样式:折叠箭头 + 组名 + 项目计数)。
+   左内边距由 JSX 按层级 inline 覆盖,这里只定基准。 */
+.sheet-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 11px 16px;
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+}
+
+.sheet-group:active {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.sheet-group-arrow {
+  flex-shrink: 0;
+  width: 12px;
+  font-size: 11px;
+  line-height: 1;
+  text-align: center;
+  transition: transform 0.15s ease;
+}
+
+.sheet-group-arrow.is-collapsed {
+  transform: rotate(-90deg);
+}
+
+.sheet-group-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sheet-group-count {
+  flex-shrink: 0;
+  font-size: 12px;
+  opacity: 0.75;
+}

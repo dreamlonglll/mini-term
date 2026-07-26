@@ -35,6 +35,13 @@ pub struct MobileProject {
     /// 因为它们的对话镜像目前一定是空的)。移动端据此置灰,不自行推断。
     #[serde(default)]
     pub can_start_session: bool,
+    /// 该项目在桌面端项目树里的祖先分组名链(根→父),顶层项目为空。
+    ///
+    /// 只下发组**名**:移动端据此还原桌面端的分组层级,分组 id 与桌面端折叠态都不下发
+    /// (手机屏小,跟着桌面折叠反而找不到项目,折叠状态由手机侧自己管)。
+    /// 加字段是向后兼容的:旧桌面端不发 → 移动端平铺;旧中转会把它丢掉,同样退化为平铺。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub group_path: Vec<String>,
 }
 
 /// 移动端可见的 AI 启动器条目:**只有** id 与展示名。
@@ -482,6 +489,7 @@ mod tests {
                 status: "ai-working".into(),
             }],
             can_start_session: true,
+            group_path: vec!["工作".into(), "后端".into()],
         }
     }
 
@@ -500,6 +508,7 @@ mod tests {
                 && json.contains(r#""paneId":"pane-1""#)
                 && json.contains(r#""status":"ai-working""#)
                 && json.contains(r#""canStartSession":true"#)
+                && json.contains(r#""groupPath":["工作","后端"]"#)
                 && json.contains(r#""launchers":[{"id":"l1","name":"Claude"}]"#),
             "serde camelCase 对齐被破坏: {json}"
         );
@@ -516,6 +525,7 @@ mod tests {
             name: "idle-proj".into(),
             panes: vec![],
             can_start_session: false,
+            group_path: vec![],
         };
         let msg = RelayToMobile::SessionsSnapshot {
             projects: vec![empty.clone()],
@@ -523,7 +533,17 @@ mod tests {
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains(r#""panes":[]"#) && json.contains(r#""canStartSession":false"#), "{json}");
+        // 顶层项目不占 wire:空 groupPath 整个字段省略
+        assert!(!json.contains("groupPath"), "{json}");
         assert_eq!(serde_json::from_str::<RelayToMobile>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn project_without_group_path_field_parses_as_flat() {
+        // 旧桌面端 / 旧中转发来的载荷不含 groupPath:必须解析成空链(平铺),不是报错
+        let json = r#"{"projectId":"p3","name":"legacy","panes":[],"canStartSession":true}"#;
+        let parsed: MobileProject = serde_json::from_str(json).unwrap();
+        assert!(parsed.group_path.is_empty());
     }
 
     #[test]

@@ -101,6 +101,12 @@ export interface MobileProject {
   panes: MobilePane[];
   /** 能否在此项目发起新会话(桌面端判定:SSH 远程 / WSL 根项目为 false) */
   canStartSession: boolean;
+  /**
+   * 该项目在桌面端项目树里的祖先分组名链(根→父),顶层项目为空/缺省。
+   * 快照里的项目已按桌面端树序排列,顺序渲染 + 这条链即可还原分组层级。
+   * 旧桌面端不发、旧中转会把它吃掉 —— 两种情况都缺省,列表退化为平铺。
+   */
+  groupPath?: string[];
 }
 
 /** 可用的 AI 启动器:只有 id 与展示名,命令与 shell 永远留在桌面端 */

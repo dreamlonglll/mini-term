@@ -241,6 +241,45 @@ export function getOrderedTree(config: AppConfig): OrderedItem[] {
   return result;
 }
 
+/** 项目 + 它在树中的祖先分组名链（根→父）；顶层项目为空数组 */
+export interface ProjectWithGroupPath {
+  project: ProjectConfig;
+  groupPath: string[];
+}
+
+/**
+ * 按树序（深度优先）列出全部项目，每个带上祖先分组名链。
+ *
+ * 与 `getOrderedTree` 的区别：**不**跳过折叠组的子项——折叠是桌面侧栏的视图状态，
+ * 而这里的消费者（移动端快照）要的是完整清单，折叠与否由移动端自己决定。
+ */
+export function getProjectsWithGroupPath(config: AppConfig): ProjectWithGroupPath[] {
+  const projectMap = new Map(config.projects.map((p) => [p.id, p]));
+  const result: ProjectWithGroupPath[] = [];
+  const seen = new Set<string>();
+
+  function walk(items: ProjectTreeItem[], groupPath: string[]) {
+    for (const item of items) {
+      if (isGroup(item)) {
+        walk(item.children, [...groupPath, item.name]);
+        continue;
+      }
+      const project = projectMap.get(item);
+      if (project && !seen.has(project.id)) {
+        seen.add(project.id);
+        result.push({ project, groupPath });
+      }
+    }
+  }
+  walk(config.projectTree ?? [], []);
+
+  // 不在树中的项目（异常配置兜底）追加到顶层，与 getOrderedTree 口径一致
+  for (const p of config.projects) {
+    if (!seen.has(p.id)) result.push({ project: p, groupPath: [] });
+  }
+  return result;
+}
+
 /** 收集树中所有组（递归），返回 [group, depth] 对 */
 export function collectAllGroups(tree: ProjectTreeItem[], depth = 0): Array<[ProjectGroup, number]> {
   const result: Array<[ProjectGroup, number]> = [];

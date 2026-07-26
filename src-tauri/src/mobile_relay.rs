@@ -44,6 +44,9 @@ pub struct SyncProject {
     #[serde(default)]
     pub ssh_connection_id: Option<String>,
     pub panes: Vec<SyncPane>,
+    /// 桌面端项目树里的祖先分组名链(根→父),顶层项目为空。原样透传给移动端。
+    #[serde(default)]
+    pub group_path: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -195,6 +198,7 @@ impl MobileRelayManager {
                 can_start_session: can_start_session(&p.path, p.ssh_connection_id.as_deref()),
                 project_id: p.project_id,
                 name: p.name,
+                group_path: p.group_path,
                 panes: p
                     .panes
                     .into_iter()
@@ -1010,6 +1014,7 @@ mod tests {
                 })
                 .collect(),
             can_start_session: true,
+            group_path: vec![],
         }
     }
 
