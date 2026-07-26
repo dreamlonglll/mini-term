@@ -25,7 +25,8 @@ export function useAiSubmitMarker() {
         if (retry) {
           requestAnimationFrame(() => tryRegister(false));
         } else {
-          console.warn('[ai-submit-marker] term not ready for pty', payload.ptyId);
+          // 终端未就绪,或 TUI 已进备用缓冲区(alt buffer 打点无意义,见 registerAiMarker)
+          console.debug('[ai-submit-marker] 跳过打点 pty', payload.ptyId);
         }
       };
 

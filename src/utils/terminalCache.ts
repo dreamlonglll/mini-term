@@ -300,18 +300,21 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
 
   term.open(wrapper);
 
-  // 拦截 alternate screen 切换（DECSET/DECRST 47, 1047, 1049）：
-  // 阻止 TUI 程序进入备用缓冲区，让所有输出留在主缓冲区，
-  // 保持 scrollback 和滚动条可用。codex 等 TUI 的清屏/重绘
-  // 仅影响可视区域，scrollback 历史不受影响。
-  const isAltScreenMode = (p: number | number[]) => {
-    const v = typeof p === 'number' ? p : p[0];
-    return v === 47 || v === 1047 || v === 1049;
-  };
-  term.parser.registerCsiHandler({ final: 'h', prefix: '?' }, (params) =>
-    params.some(isAltScreenMode));
-  term.parser.registerCsiHandler({ final: 'l', prefix: '?' }, (params) =>
-    params.some(isAltScreenMode));
+  // 这里曾拦截 alternate screen 切换(DECSET/DECRST 47/1047/1049),把 TUI 输出摁在
+  // 主缓冲区以保住 scrollback。前提"TUI 的清屏/重绘仅影响可视区域"只在一帧不高于
+  // 窗口时成立,而 AI TUI 的界面经常比窗口高:
+  //   Ink(Claude Code)每帧靠相对光标上移回到帧首再擦除(ESC[nA + ESC[J);
+  //   帧高 > rows 时上移被 clamp 在 viewport 顶部,够不到已滚进 scrollback 的那几行
+  //   → 擦不干净 → 重画 → 每帧都往 scrollback 落一段残留,越滚越多。
+  // tests/tuiScrollback.test.cjs 有 rows=4/帧高=6 的复现:4 帧画完留下 4 份帧头。
+  //
+  // 用户滚动时尤其明显:AI TUI 都开鼠标追踪,xterm 把 wheel 上报给 TUI 而不滚视口
+  // (Terminal._bindMouse 的 bit 16,同时 Viewport 置 handleMouseWheel:false),
+  // 于是每滚一次就触发一次额外整屏重绘,当场再灌一份残留。
+  //
+  // 现已放行:TUI 回到备用缓冲区原地重绘,重复消失,也是 Windows Terminal / iTerm
+  // 的标准行为。代价是 AI 运行期间没有 xterm scrollback,滚动由 TUI 自己承担
+  // (它本来就收得到滚轮);打点跳转的连带影响见 registerAiMarker。
 
   // 剪贴板快捷键
   term.attachCustomKeyEventHandler((e) => {
@@ -551,6 +554,10 @@ export function disposeTerminal(ptyId: number): void {
 export function registerAiMarker(ptyId: number): IMarker | null {
   const cached = getCachedTerminal(ptyId);
   if (!cached) return null;
+  // 备用缓冲区里打点没有意义,直接跳过:alt buffer 没有 scrollback 可滚,
+  // 且 BufferSet.activateNormalBuffer() 退出时会 clearAllMarkers() 全部清掉。
+  // 放行 alt screen(见 getOrCreateTerminal)后,走 TUI 的 AI 基本都落在这个分支。
+  if (cached.term.buffer.active.type === 'alternate') return null;
   // -1:Enter 回显后光标已换行到下一行,取上一行即用户输入行本身
   const marker = cached.term.registerMarker(-1);
   if (!marker) return null;
