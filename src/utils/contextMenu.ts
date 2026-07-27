@@ -33,13 +33,19 @@ export function showContextMenu(x: number, y: number, items: MenuEntry[]) {
     currentCleanup();
   }
 
-  // 已打开的子菜单元素(独立挂在 body 上,便于溢出处理与统一清理)
+  // 已打开的子菜单元素(独立挂在 body 上,便于溢出处理与统一清理)。
+  // 数组下标 = 层级 - 1:submenus[0] 是根菜单展开的子菜单,submenus[1] 是它再展开的孙菜单……
   const submenus: HTMLElement[] = [];
-  const closeSubmenus = () => {
-    while (submenus.length) {
+  // 与 submenus 同步入栈:记录每层子菜单是从哪一项展开的(ArrowLeft 收起时把焦点还给它)
+  const submenuOwners: HTMLElement[] = [];
+  /** 关掉层级深于 level 的子菜单(level 0 = 根菜单,即全部关掉) */
+  const closeSubmenusFrom = (level: number) => {
+    while (submenus.length > level) {
       submenus.pop()!.remove();
+      submenuOwners.pop();
     }
   };
+  const closeSubmenus = () => closeSubmenusFrom(0);
 
   // rootMenu 在 buildMenu 之后才赋值;cleanup 仅在之后被调用,闭包引用安全
   let rootMenu: HTMLElement;
@@ -66,22 +72,21 @@ export function showContextMenu(x: number, y: number, items: MenuEntry[]) {
   const docClick = () => cleanup();
 
   /**
-   * 当前键盘作用域里可聚焦的项。
+   * 当前键盘作用域里可聚焦的项 —— 取**焦点所在的最深一层菜单**。
    *
    * 子菜单是悬停展开的,鼠标移开并不会收起它。若无条件以「最后展开的子菜单」
    * 为作用域,用户鼠标划过子菜单父项后再按 ↓,焦点会直接跳进子菜单 ——
-   * 而他看着的还是根菜单。所以只有焦点确实落在子菜单里时才用它当作用域。
+   * 而他看着的还是根菜单。所以只有焦点确实落在某层里时才用它当作用域。
    */
   const focusableItems = (): HTMLElement[] => {
-    const sub = submenus[submenus.length - 1];
-    const scope = sub && sub.contains(document.activeElement) ? sub : rootMenu;
+    let scope: HTMLElement = rootMenu;
+    for (const sub of submenus) {
+      if (sub.contains(document.activeElement)) scope = sub;
+    }
     return Array.from(
       scope.querySelectorAll<HTMLElement>('.ctx-menu-item:not(.disabled)'),
     );
   };
-
-  /** 记住是从哪一项展开的子菜单,ArrowLeft 收起时把焦点还给它 */
-  let submenuOwner: HTMLElement | null = null;
 
   const moveFocus = (delta: 1 | -1) => {
     const list = focusableItems();
@@ -120,7 +125,13 @@ export function showContextMenu(x: number, y: number, items: MenuEntry[]) {
           e.preventDefault();
           e.stopPropagation();
           active.dispatchEvent(new MouseEvent('mouseenter'));
-          requestAnimationFrame(() => focusableItems()[0]?.focus());
+          // 直接进刚展开的那一层:此刻焦点还在父项上,走 focusableItems() 只会
+          // 算出父项所在的菜单,焦点会跳回本层第一项而不是进子菜单
+          requestAnimationFrame(() => {
+            submenus[submenus.length - 1]
+              ?.querySelector<HTMLElement>('.ctx-menu-item:not(.disabled)')
+              ?.focus();
+          });
         }
         break;
       }
@@ -128,10 +139,10 @@ export function showContextMenu(x: number, y: number, items: MenuEntry[]) {
         if (submenus.length > 0) {
           e.preventDefault();
           e.stopPropagation();
-          const owner = submenuOwner;
-          closeSubmenus();
-          // 还给**展开它的那一项**,而不是第一个 has-submenu
-          // （一个菜单里可能有好几个子菜单入口）
+          // 只收起最深的一层,还给**展开它的那一项**（而不是第一个 has-submenu:
+          // 一个菜单里可能有好几个子菜单入口）
+          const owner = submenuOwners[submenus.length - 1];
+          closeSubmenusFrom(submenus.length - 1);
           owner?.focus();
         }
         break;
@@ -161,8 +172,9 @@ export function showContextMenu(x: number, y: number, items: MenuEntry[]) {
     menu.style.visibility = '';
   };
 
-  // 递归构建菜单 DOM。isRoot 决定是否在悬停时管理子菜单(子菜单内的项不再嵌套)
-  const buildMenu = (entries: MenuEntry[], isRoot: boolean): HTMLElement => {
+  // 递归构建菜单 DOM。level 0 = 根菜单,每深一层 +1 —— 悬停某层的项只收起**比它更深**
+  // 的子菜单,自身所在的那层保持展开,子菜单因此可以无限层嵌套(分组树选择要用)
+  const buildMenu = (entries: MenuEntry[], level: number): HTMLElement => {
     const menu = document.createElement('div');
     menu.className = 'fixed ctx-menu text-xs';
     menu.setAttribute('role', 'menu');
@@ -208,22 +220,21 @@ export function showContextMenu(x: number, y: number, items: MenuEntry[]) {
         const sub = entry.submenu;
         item.setAttribute('aria-haspopup', 'menu');
         item.onmouseenter = () => {
-          closeSubmenus();
-          submenuOwner = item;
-          const child = buildMenu(sub, false);
+          // 先收掉比本层更深的子菜单(含自己上次展开的那个),本层及祖先原样保留
+          closeSubmenusFrom(level);
+          const child = buildMenu(sub, level + 1);
           document.body.appendChild(child);
           const rect = item.getBoundingClientRect();
           // 紧贴父项右缘展开,避免与父项之间出现鼠标可穿过的间隙
           placeInViewport(child, rect.right - 2, rect.top - 4);
           submenus.push(child);
+          submenuOwners.push(item);
         };
         // 点击子菜单父项本身不触发动作、也不关闭菜单
         item.onclick = (e) => e.stopPropagation();
       } else {
-        // 悬停根菜单的普通项时收起已展开的子菜单
-        if (isRoot) {
-          item.onmouseenter = () => { closeSubmenus(); submenuOwner = null; };
-        }
+        // 悬停普通项时收起本层展开的子菜单(祖先层不动)
+        item.onmouseenter = () => closeSubmenusFrom(level);
         item.onclick = () => {
           if (entry.disabled) return;
           // 先收菜单再执行动作:动作可能同步打开一个输入弹窗并聚焦输入框,
@@ -237,7 +248,7 @@ export function showContextMenu(x: number, y: number, items: MenuEntry[]) {
     return menu;
   };
 
-  rootMenu = buildMenu(items, true);
+  rootMenu = buildMenu(items, 0);
   document.body.appendChild(rootMenu);
   placeInViewport(rootMenu, x, y);
 

@@ -14,22 +14,23 @@ import { GitWorktreeModal } from './GitWorktreeModal';
 import { Modal } from './Modal';
 import { connectionSummary } from './SshModal';
 import { showContextMenu } from '../utils/contextMenu';
-import { showPrompt } from '../utils/prompt';
+import type { MenuEntry } from '../utils/contextMenu';
+import { showConfirm, showPrompt } from '../utils/prompt';
 import { initProjectDrag, isProjectDragging, getProjectDragPayload, onProjectDragEnd } from '../utils/projectDragState';
 import { isWslPath } from '../utils/wslPath';
 import { useT } from '../i18n';
 import {
   getOrderedTree,
-  collectAllGroups,
   countProjectsInGroup,
   canDrop,
   canDropAt,
   getDepth,
+  isGroup,
   findParentGroupId,
   findGroupInTree,
   MAX_DEPTH,
 } from '../utils/projectTree';
-import type { PaneStatus, SplitNode, ProjectConfig, ProjectGroup, WslDistro } from '../types';
+import type { PaneStatus, SplitNode, ProjectConfig, ProjectGroup, ProjectTreeItem, WslDistro } from '../types';
 
 // 保存配置的快捷方法
 function saveConfig() {
@@ -47,6 +48,52 @@ function prefetchWslDistros() {
   wslDistrosPromise = invoke<WslDistro[]>('list_wsl_distros')
     .then((list) => { wslDistrosCache = list; })
     .catch(() => { wslDistrosCache = []; });
+}
+
+type TFunc = (key: string, params?: Record<string, string | number>) => string;
+
+/**
+ * 「移动到分组」的树形子菜单:按 projectTree 的层级逐级展开,而不是把所有分组拍平成
+ * 一长串「移动到「X」」。
+ *
+ * 含子组的组既是落点又是入口 —— 子菜单父项本身不可点(contextMenu 的约定),
+ * 所以把「移动到此处」放在它子菜单的第一项,后面才是子组。
+ * 项目当前所在的组标 ✓ 并置灰(移到原地是空操作)。
+ */
+function buildMoveToGroupMenu(
+  items: ProjectTreeItem[],
+  depth: number,
+  currentParentId: string | undefined,
+  onPick: (groupId: string) => void,
+  t: TFunc,
+): MenuEntry[] {
+  const entries: MenuEntry[] = [];
+  for (const item of items) {
+    if (!isGroup(item)) continue;
+    const isCurrent = item.id === currentParentId;
+    // 项目落进该组后就到了 depth+1 层,超限则该组不可选(其子组更深,同样不可选)
+    const selectable = !isCurrent && depth + 1 <= MAX_DEPTH;
+    // 前缀留一个全角空格,让有无 ✓ 的行文字左对齐(与「WSL 会话」子菜单同一写法)
+    const label = `${isCurrent ? '✓ ' : '　'}${item.name}`;
+    const children = buildMoveToGroupMenu(item.children, depth + 1, currentParentId, onPick, t);
+    if (children.length > 0) {
+      entries.push({
+        label,
+        submenu: [
+          {
+            label: t('projectList.menu.moveToThisGroup'),
+            disabled: !selectable,
+            onClick: () => onPick(item.id),
+          },
+          { separator: true },
+          ...children,
+        ],
+      });
+    } else {
+      entries.push({ label, disabled: !selectable, onClick: () => onPick(item.id) });
+    }
+  }
+  return entries;
 }
 
 // Drop 指示器位置
@@ -87,7 +134,6 @@ export function ProjectList() {
   const projectListRef = useRef<HTMLDivElement>(null);
 
   const orderedItems = getOrderedTree(config);
-  const allGroups = collectAllGroups(config.projectTree ?? []);
 
   // 预取 WSL 发行版列表,保证右键菜单构建时缓存已就绪
   useEffect(() => {
@@ -519,7 +565,16 @@ export function ProjectList() {
             }
           }
           // 添加分组相关菜单
-          if (allGroups.length > 0 || isChild) {
+          // 子项目不在树里(位置由父项目派生),没有「当前所在组」可言 ——
+          // 选任意组都是有效动作(顺带脱离父项目),所以不传 currentParentId
+          const moveToEntries = buildMoveToGroupMenu(
+            config.projectTree ?? [],
+            0,
+            isChild ? undefined : parentGroupId,
+            (groupId) => { moveItem(project.id, groupId); saveConfig(); },
+            t,
+          );
+          if (moveToEntries.length > 0 || isChild || parentGroupId) {
             menuItems.push({ separator: true });
             if (isChild) {
               // 脱离父项目 = 清 parentProjectId 并转为顶层树节点(moveItem 内处理)
@@ -533,15 +588,19 @@ export function ProjectList() {
                 onClick: () => { moveItem(project.id, null); saveConfig(); },
               });
             }
-            for (const [g, gDepth] of allGroups) {
-              if (g.id === parentGroupId) continue;
-              if (gDepth + 1 > MAX_DEPTH) continue;
-              menuItems.push({
-                label: t('projectList.menu.moveTo', { name: g.name }),
-                onClick: () => { moveItem(project.id, g.id); saveConfig(); },
-              });
+            if (moveToEntries.length > 0) {
+              menuItems.push({ label: t('projectList.menu.moveToGroup'), submenu: moveToEntries });
             }
           }
+          // 移除项目:与 ✕ 按钮 / Delete 键同一条确认路径
+          menuItems.push(
+            { separator: true },
+            {
+              label: t('projectList.menu.remove'),
+              danger: true,
+              onClick: () => setConfirmTarget({ id: project.id, name: project.name }),
+            },
+          );
           showContextMenu(e.clientX, e.clientY, menuItems);
         }}
         title={project.path}
@@ -667,9 +726,23 @@ export function ProjectList() {
                 },
               });
             }
-            menuItems.push(
-              { label: t('projectList.menu.deleteGroup'), danger: true, onClick: () => { removeGroup(group.id); saveConfig(); } },
-            );
+            menuItems.push({
+              label: t('projectList.menu.deleteGroup'),
+              danger: true,
+              onClick: async () => {
+                // 删组不删项目,但组内项目会散回上一级 —— 组织结构没得撤销,先确认
+                const ok = await showConfirm(
+                  t('projectList.deleteGroupConfirm.title'),
+                  t('projectList.deleteGroupConfirm.message', {
+                    name: group.name,
+                    count: countProjectsInGroup(group),
+                  }),
+                );
+                if (!ok) return;
+                removeGroup(group.id);
+                saveConfig();
+              },
+            });
             showContextMenu(e.clientX, e.clientY, menuItems);
           }}
         >
