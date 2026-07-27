@@ -423,6 +423,9 @@ export function ProjectList() {
       ? config.sshConnections.find((c) => c.id === project.sshConnectionId)
       : undefined;
     const remoteBroken = isRemote && !remoteConn;
+    // 子项目(worktree「设为项目」):渲染由 getOrderedTree 注入到父项目下,
+    // 位置是派生的 → 不能作为拖放目标;自身可拖走(= 脱离父项目转普通节点)
+    const isChild = !!project.parentProjectId;
     // 项目路径是某仓库的 linked worktree → 显示 ⎇ 分支徽章
     const wtBranch = isRemote ? undefined : worktreeBranches.get(project.path);
 
@@ -439,9 +442,9 @@ export function ProjectList() {
         aria-selected={isActive}
         tabIndex={0}
         onMouseDown={(e) => handleProjectMouseDown(e, project.id)}
-        onMouseMove={(e) => handleMouseMoveOver(e, project.id, false)}
-        onMouseLeave={handleMouseLeaveTarget}
-        onMouseUp={(e) => handleMouseUpDrop(e, project.id)}
+        onMouseMove={isChild ? undefined : (e) => handleMouseMoveOver(e, project.id, false)}
+        onMouseLeave={isChild ? undefined : handleMouseLeaveTarget}
+        onMouseUp={isChild ? undefined : (e) => handleMouseUpDrop(e, project.id)}
         onClick={() => setActiveProject(project.id)}
         onKeyDown={(e) => {
           if (editingProjectId === project.id) return; // 重命名输入框自己处理按键
@@ -509,9 +512,15 @@ export function ProjectList() {
             }
           }
           // 添加分组相关菜单
-          if (allGroups.length > 0) {
+          if (allGroups.length > 0 || isChild) {
             menuItems.push({ separator: true });
-            if (parentGroupId) {
+            if (isChild) {
+              // 脱离父项目 = 清 parentProjectId 并转为顶层树节点(moveItem 内处理)
+              menuItems.push({
+                label: t('projectList.menu.detachFromParent'),
+                onClick: () => { moveItem(project.id, null); saveConfig(); },
+              });
+            } else if (parentGroupId) {
               menuItems.push({
                 label: t('projectList.menu.moveOutOfGroup'),
                 onClick: () => { moveItem(project.id, null); saveConfig(); },

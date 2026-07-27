@@ -25,6 +25,7 @@ import {
   updateGroupInTree,
   removeGroupAndPromoteChildren,
   removeProjectFromTree,
+  replaceProjectInTree,
   migrateToTree,
 } from './utils/projectTree';
 import { clearProjectCache, projectCacheKey } from './utils/projectDataCache';
@@ -359,7 +360,8 @@ interface AppStore {
   activeProjectId: string | null;
   projectStates: Map<string, ProjectState>;
   setActiveProject: (id: string) => void;
-  addProject: (project: ProjectConfig) => void;
+  /** 传 parentProjectId = 作为其子项目挂载(worktree「设为项目」),不进 projectTree */
+  addProject: (project: ProjectConfig, parentProjectId?: string) => void;
   removeProject: (id: string) => void;
   renameProject: (id: string, name: string) => void;
 
@@ -473,13 +475,19 @@ export const useAppStore = create<AppStore>((set, get) => ({
       return { activeProjectId: id, projectStates: newStates };
     }),
 
-  addProject: (project) =>
+  addProject: (project, parentProjectId) =>
     set((state) => {
       const config = ensureTree(state.config);
-      const newTree = [...(config.projectTree ?? []), project.id];
+      // 父项目必须真实存在,否则回落为普通顶层项目(防止产生渲染不出来的孤儿)
+      const parentOk = !!parentProjectId
+        && config.projects.some((p) => p.id === parentProjectId);
+      const newProject = parentOk ? { ...project, parentProjectId } : project;
+      const newTree = parentOk
+        ? (config.projectTree ?? [])
+        : [...(config.projectTree ?? []), project.id];
       const newConfig = {
         ...config,
-        projects: [...config.projects, project],
+        projects: [...config.projects, newProject],
         projectTree: newTree,
       };
       const newStates = new Map(state.projectStates);
@@ -514,11 +522,26 @@ export const useAppStore = create<AppStore>((set, get) => ({
         }
       }
 
+      // 子项目晋升:被删项目若有 worktree 子项目,子项顶替它的树位置成为顶层节点;
+      // 被删项目自己也是子项目时,子项改挂到它的父项目上(不进树)。
+      const childIds = state.config.projects
+        .filter((p) => p.parentProjectId === id)
+        .map((p) => p.id);
+      const inheritedParent = removingProject?.parentProjectId;
+
       const newTree = deepCloneTree(state.config.projectTree ?? []);
-      removeProjectFromTree(newTree, id);
+      if (inheritedParent) {
+        removeProjectFromTree(newTree, id); // 子项目本不在树里,通常为 no-op
+      } else if (!replaceProjectInTree(newTree, id, childIds)) {
+        newTree.push(...childIds); // 被删项目不在树中(异常配置),子项兜底进根层
+      }
       const newConfig = {
         ...state.config,
-        projects: state.config.projects.filter((p) => p.id !== id),
+        projects: state.config.projects
+          .filter((p) => p.id !== id)
+          .map((p) =>
+            p.parentProjectId === id ? { ...p, parentProjectId: inheritedParent } : p,
+          ),
         projectTree: newTree,
       };
       const newStates = new Map(state.projectStates);
@@ -845,10 +868,19 @@ export const useAppStore = create<AppStore>((set, get) => ({
     set((state) => {
       const config = ensureTree(state.config);
       const newTree = deepCloneTree(config.projectTree ?? []);
-      const removed = removeFromTree(newTree, itemId);
-      if (!removed) return state;
+      let removed = removeFromTree(newTree, itemId);
+      let newProjects = config.projects;
+      if (!removed) {
+        // 子项目(worktree)不在树里:移动即脱离父项目,清掉 parentProjectId 转普通树节点
+        const child = config.projects.find((p) => p.id === itemId && p.parentProjectId);
+        if (!child) return state;
+        removed = itemId;
+        newProjects = config.projects.map((p) =>
+          p.id === itemId ? { ...p, parentProjectId: undefined } : p,
+        );
+      }
       insertIntoTree(newTree, targetGroupId, removed, index);
-      return { config: { ...config, projectTree: newTree } };
+      return { config: { ...config, projects: newProjects, projectTree: newTree } };
     }),
 
 }));

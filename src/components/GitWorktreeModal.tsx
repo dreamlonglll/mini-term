@@ -137,18 +137,23 @@ export function GitWorktreeModal({ repoPath, onClose, onChanged }: Props) {
   }, [sep, repoName, effectiveBranch]);
 
   const switchToProjectAt = useCallback((path: string, fallbackName: string) => {
-    const { addProject, setActiveProject } = useAppStore.getState();
+    const { addProject, setActiveProject, activeProjectId, config } = useAppStore.getState();
     const existing = findProjectByPath(path);
     if (existing) {
       setActiveProject(existing.id);
       return;
     }
+    // 挂为子项目:主仓库对应的项目优先;主仓库不是项目时回落到当前激活项目
+    // (Worktree 面板就是从它打开的)。都没有则成为普通顶层项目。
+    const parent =
+      (mainRepoPath ? findProjectByPath(mainRepoPath) : undefined)
+      ?? config.projects.find((p) => p.id === activeProjectId);
     const id = genId();
     const name = path.split(/[\\/]/).filter(Boolean).pop() || fallbackName;
-    addProject({ id, name, path });
+    addProject({ id, name, path }, parent?.id);
     invoke('save_config', { config: useAppStore.getState().config });
     setActiveProject(id);
-  }, []);
+  }, [mainRepoPath]);
 
   const handleCreate = useCallback(async () => {
     const branch = (mode === 'existing' ? selBranch : newBranch).trim();

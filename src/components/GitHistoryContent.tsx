@@ -258,6 +258,7 @@ const CommitItem = memo(function CommitItem({
 const RepoCommitList = memo(function RepoCommitList({
   commits,
   allBranches,
+  viewBranch,
   depth,
   repoPath,
   onContextMenu,
@@ -265,19 +266,28 @@ const RepoCommitList = memo(function RepoCommitList({
 }: {
   commits: GitCommitInfo[];
   allBranches: BranchInfo[];
+  /** 正在查看(未 checkout)的分支名;undefined = 跟随 HEAD */
+  viewBranch?: string;
   depth: number;
   repoPath: string;
   onContextMenu: (e: React.MouseEvent, repoPath: string, commit: GitCommitInfo) => void;
   onDoubleClick: (repoPath: string, commit: GitCommitInfo) => void;
 }) {
   const graph = useMemo(() => computeGitGraph(commits), [commits]);
+  // 只标注本仓库/worktree 自己检出的分支(以及正在查看的分支)。
+  // worktree 与主仓库共享 refs,标出全部分支会把其他工作区的分支、
+  // 远程分支全挂到 commit 上,看起来像本工作区持有它们。
+  const shownBranches = useMemo(
+    () => allBranches.filter((b) => b.isHead || b.name === viewBranch),
+    [allBranches, viewBranch],
+  );
   return (
     <>
       {commits.map((commit, i) => (
         <CommitItem
           key={commit.hash}
           commit={commit}
-          allBranches={allBranches}
+          allBranches={shownBranches}
           depth={depth}
           repoPath={repoPath}
           row={graph.rows[i]}
@@ -772,6 +782,7 @@ export function GitHistoryContent({ projectPath, repos, refreshRepos, onOpenWork
                 <RepoCommitList
                   commits={state.commits}
                   allBranches={repoBranches.get(repo.path) ?? EMPTY_BRANCHES}
+                  viewBranch={viewBranches.get(repo.path)}
                   depth={depth}
                   repoPath={repo.path}
                   onContextMenu={handleCommitContextMenu}

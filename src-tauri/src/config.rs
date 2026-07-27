@@ -265,6 +265,9 @@ pub struct ProjectConfig {
     /// 引用为单一来源、不内嵌连接快照——连接被删除时项目进入「断链」错误态。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh_connection_id: Option<String>,
+    /// 子项目(worktree「设为项目」):有值 = 挂在该项目 id 下渲染,不在 projectTree 里
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_project_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

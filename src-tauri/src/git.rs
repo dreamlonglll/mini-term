@@ -250,36 +250,6 @@ pub struct BranchInfo {
     pub commit_hash: String,
 }
 
-/// 给定一个主仓库,收集它的所有 git worktree 作为独立仓库条目。
-/// 失效(路径不存在 / 无法 open)的 worktree 会被静默跳过。
-fn collect_worktrees_of(repo: &Repository) -> Vec<(String, PathBuf, Repository)> {
-    let mut out = Vec::new();
-    let names = match repo.worktrees() {
-        Ok(n) => n,
-        Err(_) => return out,
-    };
-    for wt_name in names.iter().flatten() {
-        let wt = match repo.find_worktree(wt_name) {
-            Ok(w) => w,
-            Err(_) => continue,
-        };
-        let wt_path = wt.path().to_path_buf();
-        if !wt_path.exists() {
-            continue; // prune 后的 worktree 路径已失效
-        }
-        let wt_repo = match Repository::open_from_worktree(&wt) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        let display_name = wt_path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| wt_name.to_string());
-        out.push((display_name, wt_path, wt_repo));
-    }
-    out
-}
-
 const MAX_DISCOVER_PARENTS: usize = 5;
 
 fn discover_repo_limited(start: &Path) -> Option<Repository> {
@@ -359,21 +329,13 @@ fn discover_repo_paths(project_path: &Path) -> Vec<RepoPathEntry> {
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "root".to_string());
-            for wt in collect_worktrees_of(&repo) {
-                entries.push(RepoPathEntry {
-                    name: wt.0,
-                    path: wt.1,
-                    is_worktree: true,
-                });
-            }
-            entries.insert(
-                0,
-                RepoPathEntry {
-                    name,
-                    path: repo_root,
-                    is_worktree: false,
-                },
-            );
+            // 每个项目只展示自己工作区的仓库,不再把关联 worktree 注入为独立条目——
+            // worktree 通过「设为项目」拥有自己的 Git 面板,这里再列一遍就是重复。
+            entries.push(RepoPathEntry {
+                name,
+                path: repo_root,
+                is_worktree: repo.is_worktree(),
+            });
             return entries;
         }
     }
@@ -413,18 +375,13 @@ fn discover_repo_paths(project_path: &Path) -> Vec<RepoPathEntry> {
                             .file_name()
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_default();
+                        // 物理上在项目目录内的 worktree 才会走到这里(作为子目录仓库),
+                        // 项目目录外的关联 worktree 不再注入
                         entries.push(RepoPathEntry {
                             name,
                             path: sub,
-                            is_worktree: false,
+                            is_worktree: repo.is_worktree(),
                         });
-                        for wt in collect_worktrees_of(&repo) {
-                            entries.push(RepoPathEntry {
-                                name: wt.0,
-                                path: wt.1,
-                                is_worktree: true,
-                            });
-                        }
                         continue;
                     }
                 }
@@ -437,8 +394,8 @@ fn discover_repo_paths(project_path: &Path) -> Vec<RepoPathEntry> {
 }
 
 /// Scan project_path for git repositories.
-/// 除了项目自身 / 子目录下直接可见的仓库,还会把每个主仓库关联的 git worktree
-/// 作为独立条目加入,这样 History / Changes 面板就能看到并切换 worktree。
+/// 只收集项目自身 / 子目录下物理可见的仓库;项目目录外的关联 worktree 不注入——
+/// 它们经「设为项目」成为独立项目后,有自己的 History / Changes 面板。
 fn find_repos(project_path: &Path) -> Vec<(String, PathBuf, Repository, bool)> {
     let cached_paths = find_repos_cached_paths(project_path);
     let mut repos = Vec::new();

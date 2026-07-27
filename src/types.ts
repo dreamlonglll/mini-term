@@ -138,6 +138,9 @@ export interface ProjectConfig {
   /** SSH 远程项目：有值 = 该项目指向远程机器上的目录（引用 sshConnections 里的连接 id）。
    *  此时 `path` 存远程 POSIX 绝对路径。连接被删除 → 项目进入「断链」错误态。 */
   sshConnectionId?: string;
+  /** 子项目(worktree「设为项目」)：有值 = 渲染在该父项目下方缩进一级,
+   *  且**不进 projectTree**(树里只有顶层项目与分组)。拖出/「脱离父项目」时清除并入树。 */
+  parentProjectId?: string;
 }
 
 export interface ProjectEnvVar {
