@@ -860,10 +860,12 @@ export function ProjectList() {
         targetGroupId={addRemoteTarget?.groupId}
         onClose={() => setAddRemoteTarget(null)}
       />
-      {/* Worktree 管理弹窗(项目右键菜单进入)。onChanged 留空:
-          后端已在增删后失效仓库发现缓存,Git 抽屉下次加载即为新数据 */}
+      {/* Worktree 管理弹窗(项目右键菜单进入)。项目根目录未必是仓库,
+          交给弹窗按 Git 面板同一套逻辑向下发现仓库(多个时可勾选批量新建)。
+          onChanged 留空:后端已在增删后失效仓库发现缓存,Git 抽屉下次加载即为新数据 */}
       <GitWorktreeModal
         repoPath={worktreeTarget?.path ?? null}
+        discoverRepos
         projectId={worktreeTarget?.projectId}
         onClose={() => setWorktreeTarget(null)}
         onChanged={() => {}}
