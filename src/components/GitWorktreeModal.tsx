@@ -19,6 +19,8 @@ interface Props {
   onClose: () => void;
   /** worktree 集合变化(新建/删除/清理)后通知外层刷新仓库列表 */
   onChanged: () => void;
+  /** 「开终端」的目标项目;缺省用当前激活项目(从项目右键菜单打开时应传右键的那个项目) */
+  projectId?: string;
 }
 
 /** 分支名 → 可用作目录名的片段(worktree 默认路径建议用) */
@@ -33,7 +35,7 @@ const badgeCls =
  * Worktree 管理弹窗:列出主工作区 + 全部 linked worktree,支持新建(现有分支 /
  * 新建分支)、删除(可强制)、清理失效条目、在终端打开、一键添加为项目。
  */
-export function GitWorktreeModal({ repoPath, onClose, onChanged }: Props) {
+export function GitWorktreeModal({ repoPath, onClose, onChanged, projectId }: Props) {
   const t = useT();
   // 订阅 projects:worktree 行的「已是项目」标识要跟着增删项目即时变化
   const projects = useAppStore((s) => s.config.projects);
@@ -187,14 +189,14 @@ export function GitWorktreeModal({ repoPath, onClose, onChanged }: Props) {
   }, [mainRepoPath, mode, selBranch, newBranch, baseBranch, wtPath, creating, addAsProject, onChanged, onClose, switchToProjectAt, load]);
 
   const handleOpenTerminal = useCallback((wt: WorktreeInfo) => {
-    const projectId = useAppStore.getState().activeProjectId;
-    if (!projectId) return;
-    void newTerminal(projectId, undefined, {
+    const targetProjectId = projectId ?? useAppStore.getState().activeProjectId;
+    if (!targetProjectId) return;
+    void newTerminal(targetProjectId, undefined, {
       cwd: wt.path,
       title: `⎇ ${wt.branch ?? wt.name}`,
     });
     onClose();
-  }, [onClose]);
+  }, [projectId, onClose]);
 
   const handleRemove = useCallback(async () => {
     if (!mainRepoPath || !removeTarget || removing) return;

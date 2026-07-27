@@ -10,6 +10,7 @@ import { DoneTag } from './DoneTag';
 import { SshAssocModal } from './SshAssocModal';
 import { ProjectEnvVarsModal } from './ProjectEnvVarsModal';
 import { AddRemoteProjectModal } from './AddRemoteProjectModal';
+import { GitWorktreeModal } from './GitWorktreeModal';
 import { Modal } from './Modal';
 import { connectionSummary } from './SshModal';
 import { showContextMenu } from '../utils/contextMenu';
@@ -73,6 +74,8 @@ export function ProjectList() {
   const [envVarsTarget, setEnvVarsTarget] = useState<ProjectConfig | null>(null);
   // null = 关闭；{ groupId } = 打开（groupId 为空表示加到根层）
   const [addRemoteTarget, setAddRemoteTarget] = useState<{ groupId?: string } | null>(null);
+  // Worktree 管理弹窗:记录右键项目的路径与 id(「开终端」要落在该项目里)
+  const [worktreeTarget, setWorktreeTarget] = useState<{ path: string; projectId: string } | null>(null);
   const [dropIndicator, setDropIndicator] = useState<DropIndicator | null>(null);
   const [editingGroupId, setEditingGroupId] = useState<string | null>(null);
   const [editingProjectId, setEditingProjectId] = useState<string | null>(null);
@@ -481,6 +484,10 @@ export function ProjectList() {
                 label: t('projectList.menu.envVars'),
                 onClick: () => setEnvVarsTarget(project),
               },
+              {
+                label: t('projectList.menu.worktrees'),
+                onClick: () => setWorktreeTarget({ path: project.path, projectId: project.id }),
+              },
             ]),
           ];
           // 「WSL 会话」子菜单:选择该项目的 WSL 会话来源发行版。
@@ -779,6 +786,14 @@ export function ProjectList() {
         open={!!addRemoteTarget}
         targetGroupId={addRemoteTarget?.groupId}
         onClose={() => setAddRemoteTarget(null)}
+      />
+      {/* Worktree 管理弹窗(项目右键菜单进入)。onChanged 留空:
+          后端已在增删后失效仓库发现缓存,Git 抽屉下次加载即为新数据 */}
+      <GitWorktreeModal
+        repoPath={worktreeTarget?.path ?? null}
+        projectId={worktreeTarget?.projectId}
+        onClose={() => setWorktreeTarget(null)}
+        onChanged={() => {}}
       />
 
       {/* 删除确认 —— Modal 内部 portal 到 body,避免 fluent2 [data-panel] 的

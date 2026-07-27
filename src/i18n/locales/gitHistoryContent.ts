@@ -12,7 +12,7 @@ export const gitHistoryContent = {
     noCommits: "暂无提交",
     noRepos: "未发现 Git 仓库",
     openInTerminal: "在终端打开",
-    manageWorktrees: "Worktree 管理…",
+    manageWorktrees: "Worktree 管理",
     worktreeBadgeTitle: "此仓库是一个 git worktree",
   },
   en: {
@@ -28,7 +28,7 @@ export const gitHistoryContent = {
     noCommits: "No commits",
     noRepos: "No Git repositories found",
     openInTerminal: "Open in Terminal",
-    manageWorktrees: "Manage Worktrees…",
+    manageWorktrees: "Manage Worktrees",
     worktreeBadgeTitle: "This repository is a git worktree",
   },
 } as const;
