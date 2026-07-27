@@ -17,6 +17,7 @@ import { terminalArea } from './terminalArea';
 import { gitHistory } from './gitHistory';
 import { gitHistoryContent } from './gitHistoryContent';
 import { gitChanges } from './gitChanges';
+import { worktree } from './worktree';
 import { search } from './search';
 import { sessionList } from './sessionList';
 import { sessionViewer } from './sessionViewer';
@@ -52,6 +53,7 @@ export const dicts: { zh: Dict; en: Dict } = {
     gitHistory: gitHistory.zh,
     gitHistoryContent: gitHistoryContent.zh,
     gitChanges: gitChanges.zh,
+    worktree: worktree.zh,
     search: search.zh,
     sessionList: sessionList.zh,
     sessionViewer: sessionViewer.zh,
@@ -84,6 +86,7 @@ export const dicts: { zh: Dict; en: Dict } = {
     gitHistory: gitHistory.en,
     gitHistoryContent: gitHistoryContent.en,
     gitChanges: gitChanges.en,
+    worktree: worktree.en,
     search: search.en,
     sessionList: sessionList.en,
     sessionViewer: sessionViewer.en,

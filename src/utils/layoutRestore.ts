@@ -33,6 +33,7 @@ export function restoreSavedSplitNode(
         id: createId(),
         shellName,
         status: 'idle',
+        cwd: savedPane.cwd,
       });
     }
 

@@ -93,8 +93,8 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
 
     hydratingPaneIds.add(activePane.id);
     // 远程分支:create_pty 带 sshRemote,后端直接 spawn ssh 并预注册密码 autofill;
-    // 本地分支:行为与既有链路一致(shell + cwd + envVars)。
-    createProjectPty(project, shell)
+    // 本地分支:行为与既有链路一致(shell + cwd + envVars),pane 的 cwd 覆盖优先(worktree 终端)。
+    createProjectPty(project, shell, activePane.cwd)
       .then((ptyId) => {
         const layout = useAppStore.getState().projectStates.get(projectId)?.layout;
         const pane = layout ? findPaneById(layout, activePane.id) : null;
@@ -125,6 +125,7 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
     activePane?.ptyId,
     activePane?.shellName,
     activePane?.status,
+    activePane?.cwd,
     config.availableShells,
     config.defaultShell,
     project,

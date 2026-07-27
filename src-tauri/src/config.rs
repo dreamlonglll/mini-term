@@ -186,6 +186,9 @@ fn default_launchers() -> Vec<AiLauncher> {
 #[serde(rename_all = "camelCase")]
 pub struct SavedPane {
     pub shell_name: String,
+    /// 工作目录覆盖(worktree 终端):有值则替代项目根作为 PTY cwd
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -732,12 +735,14 @@ mod tests {
                             pane: None,
                             panes: vec![SavedPane {
                                 shell_name: "cmd".into(),
+                                cwd: None,
                             }],
                         },
                         SavedSplitNode::Leaf {
                             pane: None,
                             panes: vec![SavedPane {
                                 shell_name: "powershell".into(),
+                                cwd: None,
                             }],
                         },
                     ],

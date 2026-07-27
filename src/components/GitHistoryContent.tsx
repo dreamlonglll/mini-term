@@ -4,6 +4,8 @@ import { writeText } from '@tauri-apps/plugin-clipboard-manager';
 import { useTauriEvent } from '../hooks/useTauriEvent';
 import { showContextMenu } from '../utils/contextMenu';
 import { isAiPty } from '../utils/terminalCache';
+import { useAppStore } from '../store';
+import { newTerminal } from '../utils/paneActions';
 import { formatRelativeTime } from '../utils/timeFormat';
 import { CommitDiffModal } from './CommitDiffModal';
 import {
@@ -300,9 +302,11 @@ interface GitHistoryContentProps {
   projectPath: string;
   repos: GitRepoInfo[];
   refreshRepos: () => void;
+  /** 打开某仓库的 Worktree 管理弹窗(仓库行右键菜单进入) */
+  onOpenWorktrees: (repoPath: string) => void;
 }
 
-export function GitHistoryContent({ projectPath, repos, refreshRepos }: GitHistoryContentProps) {
+export function GitHistoryContent({ projectPath, repos, refreshRepos, onOpenWorktrees }: GitHistoryContentProps) {
   const t = useT();
   const [expandedRepos, setExpandedRepos] = useState<Set<string>>(new Set());
   const [repoStates, setRepoStates] = useState<Map<string, RepoState>>(new Map());
@@ -492,6 +496,35 @@ export function GitHistoryContent({ projectPath, repos, refreshRepos }: GitHisto
     return () => document.removeEventListener('mousedown', handleClick);
   }, [branchDropdownOpen]);
 
+  // 仓库行右键菜单:在终端打开 / Worktree 管理
+  const handleRepoContextMenu = useCallback(
+    (e: React.MouseEvent, repo: GitRepoInfo) => {
+      e.preventDefault();
+      e.stopPropagation();
+      showContextMenu(e.clientX, e.clientY, [
+        {
+          label: t('gitHistoryContent.openInTerminal'),
+          onClick: () => {
+            const projectId = useAppStore.getState().activeProjectId;
+            if (!projectId) return;
+            // 项目根仓库不必带 cwd 覆盖(默认就是项目根);子仓库/worktree 才需要
+            const isProjectRoot = repo.path.replace(/[\\/]+$/, '') === projectPath.replace(/[\\/]+$/, '');
+            void newTerminal(projectId, undefined, isProjectRoot ? undefined : {
+              cwd: repo.path,
+              title: repo.isWorktree ? `⎇ ${repo.currentBranch ?? repo.name}` : repo.name,
+            });
+          },
+        },
+        { separator: true },
+        {
+          label: t('gitHistoryContent.manageWorktrees'),
+          onClick: () => onOpenWorktrees(repo.path),
+        },
+      ]);
+    },
+    [projectPath, onOpenWorktrees, t],
+  );
+
   const handleCommitContextMenu = useCallback(
     (e: React.MouseEvent, repoPath: string, commit: GitCommitInfo) => {
       e.preventDefault();
@@ -605,6 +638,7 @@ export function GitHistoryContent({ projectPath, repos, refreshRepos }: GitHisto
               className="group flex items-center justify-between w-full py-[5px] cursor-pointer hover:bg-[var(--border-subtle)] rounded-[var(--radius-sm)] text-base transition-colors duration-100 text-[var(--color-folder)]"
               style={{ paddingLeft: `${depth * 16 + 8}px`, paddingRight: '8px' }}
               onClick={() => toggleRepo(repo.path)}
+              onContextMenu={(e) => handleRepoContextMenu(e, repo)}
             >
               <div className="flex items-center gap-1 min-w-0">
                 <span
@@ -617,6 +651,14 @@ export function GitHistoryContent({ projectPath, repos, refreshRepos }: GitHisto
                   &#9662;
                 </span>
                 <span className="truncate font-medium">{node.name}</span>
+                {repo.isWorktree && (
+                  <span
+                    className="shrink-0 text-sm text-[var(--text-muted)]"
+                    title={t('gitHistoryContent.worktreeBadgeTitle')}
+                  >
+                    ⎇
+                  </span>
+                )}
                 {repo.currentBranch && (() => {
                   const viewing = viewBranches.get(repo.path);
                   const displayBranch = viewing ?? repo.currentBranch;

@@ -3,7 +3,8 @@ import { open } from '@tauri-apps/plugin-dialog';
 import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { revealItemInDir } from '@tauri-apps/plugin-opener';
-import { useAppStore, genId, collectPtyIds } from '../store';
+import { useAppStore, genId } from '../store';
+import { removeProjectWithCleanup } from '../utils/projectActions';
 import { StatusDot } from './StatusDot';
 import { DoneTag } from './DoneTag';
 import { SshAssocModal } from './SshAssocModal';
@@ -13,7 +14,6 @@ import { Modal } from './Modal';
 import { connectionSummary } from './SshModal';
 import { showContextMenu } from '../utils/contextMenu';
 import { showPrompt } from '../utils/prompt';
-import { disposeTerminal } from '../utils/terminalCache';
 import { initProjectDrag, isProjectDragging, getProjectDragPayload, onProjectDragEnd } from '../utils/projectDragState';
 import { isWslPath } from '../utils/wslPath';
 import { useT } from '../i18n';
@@ -62,7 +62,6 @@ export function ProjectList() {
   const projectStates = useAppStore((s) => s.projectStates);
   const setActiveProject = useAppStore((s) => s.setActiveProject);
   const addProject = useAppStore((s) => s.addProject);
-  const removeProject = useAppStore((s) => s.removeProject);
   const createGroup = useAppStore((s) => s.createGroup);
   const removeGroup = useAppStore((s) => s.removeGroup);
   const renameGroup = useAppStore((s) => s.renameGroup);
@@ -91,6 +90,36 @@ export function ProjectList() {
   useEffect(() => {
     prefetchWslDistros();
   }, []);
+
+  // worktree 徽章:批量探测哪些项目路径是 linked worktree,是则记下分支名。
+  // 远程项目路径在远端、无从探测;UNC(WSL)路径由后端直接跳过。
+  const [worktreeBranches, setWorktreeBranches] = useState<Map<string, string>>(new Map());
+  const projectPathsKey = config.projects
+    .filter((p) => !p.sshConnectionId)
+    .map((p) => p.path)
+    .join('\n');
+  useEffect(() => {
+    const paths = projectPathsKey ? projectPathsKey.split('\n') : [];
+    if (paths.length === 0) {
+      setWorktreeBranches(new Map());
+      return;
+    }
+    let cancelled = false;
+    invoke<(string | null)[]>('get_worktree_branches', { paths })
+      .then((res) => {
+        if (cancelled) return;
+        const next = new Map<string, string>();
+        paths.forEach((p, i) => {
+          const branch = res[i];
+          if (branch) next.set(p, branch);
+        });
+        setWorktreeBranches(next);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [projectPathsKey]);
 
   // 写入项目的 WSL 会话来源发行版(undefined = 不启用),并持久化
   const setWslSessionsDistro = useCallback((projectId: string, distro: string | undefined) => {
@@ -208,23 +237,11 @@ export function ProjectList() {
 
   const doRemove = useCallback(() => {
     if (!confirmTarget) return;
-    const id = confirmTarget.id;
-    // 删项目走的是 removeProject 而非 PaneGroup 关闭路径,后者才负责销毁终端。
-    // 这里先回收该项目所有 tab/分屏下的终端:杀后端 PTY 子进程 + dispose 前端 xterm 实例,
-    // 否则会残留孤儿 shell/AI 进程(继续占用 CPU/内存、AI 可能还在烧 token)与泄漏的
-    // WebGL 上下文。markers 由 removeProject 内部清理。
-    const ps = useAppStore.getState().projectStates.get(id);
-    if (ps?.layout) {
-      const ptyIds = new Set(collectPtyIds(ps.layout));
-      for (const ptyId of ptyIds) {
-        invoke('kill_pty', { ptyId }).catch(() => {});
-        disposeTerminal(ptyId);
-      }
-    }
-    removeProject(id);
-    saveConfig();
+    // 删项目走的是 removeProject 而非 PaneGroup 关闭路径,后者才负责销毁终端;
+    // removeProjectWithCleanup 会先回收该项目全部终端资源再删项目并落盘。
+    removeProjectWithCleanup(confirmTarget.id);
     setConfirmTarget(null);
-  }, [confirmTarget, removeProject, saveConfig]);
+  }, [confirmTarget]);
 
   // 项目列表只关心 AI 相关状态:error 由 pane 自己在终端里显示,列在侧栏里
   // 会把「某个 shell 退出了」渲染成整个项目出事,反而盖住真正在跑的 AI。
@@ -406,6 +423,8 @@ export function ProjectList() {
       ? config.sshConnections.find((c) => c.id === project.sshConnectionId)
       : undefined;
     const remoteBroken = isRemote && !remoteConn;
+    // 项目路径是某仓库的 linked worktree → 显示 ⎇ 分支徽章
+    const wtBranch = isRemote ? undefined : worktreeBranches.get(project.path);
 
     return (
       <div
@@ -531,6 +550,14 @@ export function ProjectList() {
           />
         ) : (
           <span className="truncate flex-1">{project.name}</span>
+        )}
+        {wtBranch && (
+          <span
+            className="flex-shrink-0 max-w-[100px] truncate text-xs leading-[14px] px-1 rounded font-mono text-[var(--text-muted)] bg-[var(--border-subtle)]"
+            title={t('projectList.worktreeBadgeTitle', { branch: wtBranch })}
+          >
+            ⎇ {wtBranch}
+          </span>
         )}
         {isRemote && (
           <span

@@ -151,7 +151,7 @@ function updateProjectPane(
 // 序列化 SplitNode 树（剥离运行时数据）
 function serializeSplitNode(node: SplitNode): SavedSplitNode {
   if (node.type === 'leaf') {
-    return { type: 'leaf', panes: node.panes.map((p) => ({ shellName: p.shellName })) };
+    return { type: 'leaf', panes: node.panes.map((p) => ({ shellName: p.shellName, cwd: p.cwd })) };
   }
   return {
     type: 'split',

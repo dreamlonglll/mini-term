@@ -55,12 +55,13 @@ async function spawnPane(
   project: ProjectConfig,
   shell: ShellConfig | undefined,
   customTitle?: string,
+  cwd?: string,
 ): Promise<PaneState | null> {
   const remote = isRemoteProject(project);
   if (!remote && !shell) return null;
   let ptyId: number;
   try {
-    ptyId = await createProjectPty(project, shell);
+    ptyId = await createProjectPty(project, shell, cwd);
   } catch (e) {
     await showAlert(
       t('terminalArea.remoteConnectFailedTitle'),
@@ -74,6 +75,7 @@ async function spawnPane(
     customTitle,
     status: 'idle',
     ptyId,
+    cwd,
   };
 }
 
@@ -87,14 +89,19 @@ function commit(projectId: string, layout: SplitNode | null) {
  * 新建一个终端标签。
  * - 项目还没有布局：建根 leaf
  * - 已有布局：加进当前活动 pane 所在 leaf 的 tab 栏并激活
+ * - `opts.cwd` / `opts.title`:worktree「在终端打开」用,在指定目录起 shell 并命名 tab
  */
-export async function newTerminal(projectId: string, shell?: ShellConfig): Promise<PaneState | null> {
+export async function newTerminal(
+  projectId: string,
+  shell?: ShellConfig,
+  opts?: { cwd?: string; title?: string },
+): Promise<PaneState | null> {
   const { state, project } = snapshot(projectId);
   if (!project) return null;
   const resolved = isRemoteProject(project) ? undefined : resolveShell(state.config, shell);
   if (!isRemoteProject(project) && !resolved) return null;
 
-  const pane = await spawnPane(project, resolved);
+  const pane = await spawnPane(project, resolved, opts?.title, opts?.cwd);
   if (!pane) return null;
 
   // await 期间布局可能已变。注意这里**不能**回落到 await 之前的快照：
@@ -135,7 +142,9 @@ export async function splitPane(
   const resolved = isRemoteProject(project) ? undefined : resolveShell(state.config);
   if (!isRemoteProject(project) && !resolved) return;
 
-  const pane = await spawnPane(project, resolved);
+  // 分屏继承源 pane 的 cwd 覆盖:worktree 终端分出来的屏理应还在 worktree 里
+  const sourceCwd = findPaneById(layout, target)?.cwd;
+  const pane = await spawnPane(project, resolved, undefined, sourceCwd);
   if (!pane) return;
 
   // spawn 期间布局可能已变：目标 pane 被关掉、或整个项目的终端都关光了。

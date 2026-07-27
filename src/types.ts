@@ -173,6 +173,8 @@ export interface SshConnection {
 
 export interface SavedPane {
   shellName: string;
+  /** 工作目录覆盖(worktree 终端):有值则替代项目根作为 PTY cwd */
+  cwd?: string;
 }
 
 export type SavedSplitNode =
@@ -235,6 +237,8 @@ export interface PaneState {
   customTitle?: string;
   status: PaneStatus;
   ptyId?: number;
+  /** 工作目录覆盖(worktree 终端):有值则替代项目根作为 PTY cwd,随布局持久化 */
+  cwd?: string;
 }
 
 // === AI 会话 ===
@@ -386,6 +390,20 @@ export interface GitRepoInfo {
   name: string;
   path: string;
   currentBranch?: string;
+  /** 该条目是不是某个主仓库的 linked worktree */
+  isWorktree?: boolean;
+}
+
+/** list_worktrees 返回的单条工作区记录(主工作区 + linked worktree) */
+export interface WorktreeInfo {
+  name: string;
+  path: string;
+  /** HEAD 所在分支;detached / 失效条目为 undefined */
+  branch?: string;
+  isMain: boolean;
+  /** false = 目录已丢失/元数据损坏,可 prune 的失效条目 */
+  isValid: boolean;
+  isLocked: boolean;
 }
 
 export interface GitCommitInfo {
