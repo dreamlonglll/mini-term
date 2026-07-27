@@ -35,6 +35,11 @@ export interface GraphSegment {
   /** 线段在本行底边所处的 lane；-1 表示它终止于本行节点（只画上半程） */
   to: number;
   color: string;
+  /**
+   * 线段末端要融入的颜色。分支线并入主线（或汇进异色节点）时，
+   * 两种颜色硬碰会很突兀，设了这个就沿路径渐变过去。与 color 相同时不渐变。
+   */
+  endColor?: string;
 }
 
 export interface GraphRow {
@@ -100,7 +105,7 @@ export function computeGitGraph(commits: GitCommitInfo[]): GraphLayout {
 
     // 4. 上半程：incoming 的每条线汇入节点；除节点所在 lane 外全部释放
     for (const i of incoming) {
-      segments.push({ from: i, to: -1, color: lanes[i]!.color });
+      segments.push({ from: i, to: -1, color: lanes[i]!.color, endColor: color });
       if (i !== lane) lanes[i] = null;
     }
 
@@ -112,7 +117,9 @@ export function computeGitGraph(commits: GitCommitInfo[]): GraphLayout {
       // 该父提交已经有线在等它 → 本行直接汇过去，不另开 lane
       const existing = lanes.findIndex((l) => l?.hash === parent);
       if (existing >= 0) {
-        segments.push({ from: -1, to: existing, color: lanes[existing]!.color });
+        // 用本节点的颜色而非目标 lane 的颜色——线的颜色跟着分支走，
+        // 一条分支线从诞生到汇入主线全程保持自己的颜色，只在根部渐变融入主线。
+        segments.push({ from: -1, to: existing, color, endColor: lanes[existing]!.color });
         continue;
       }
       const target = pi === 0 ? lane : allocLane();
@@ -139,8 +146,13 @@ export function laneX(lane: number): number {
   return clamped * GRAPH_LANE_WIDTH + GRAPH_LANE_WIDTH / 2;
 }
 
-/** 拐角圆角半径 */
-const R = 5;
+/**
+ * 贝塞尔控制点到端点的垂直距离。
+ * 控制点摆在端点正上/正下方，两端切线就都是垂直的：
+ * 线从节点垂直出发、垂直并入相邻行的 lane，行与行之间接得上，
+ * 中段自然地斜向目标 lane（弧朝上凹）。
+ */
+const CURVE = GRAPH_ROW_HEIGHT / 4;
 
 /** 把一条线段编译成 SVG path */
 export function segmentPath(seg: GraphSegment, nodeLane: number): string {
@@ -161,17 +173,40 @@ export function segmentPath(seg: GraphSegment, nodeLane: number): string {
   if (seg.from >= 0) {
     const xf = laneX(seg.from);
     if (xf === xn) return `M ${xf} 0 V ${mid}`;
-    const s = xn > xf ? 1 : -1;
-    return `M ${xf} 0 V ${mid - R} Q ${xf} ${mid} ${xf + s * R} ${mid} H ${xn}`;
+    return `M ${xf} 0 C ${xf} ${CURVE} ${xn} ${CURVE} ${xn} ${mid}`;
   }
 
   // 下半程：从节点分出到底边的某条 lane
   if (seg.to >= 0) {
     const xt = laneX(seg.to);
     if (xt === xn) return `M ${xn} ${mid} V ${h}`;
-    const s = xt > xn ? 1 : -1;
-    return `M ${xn} ${mid} H ${xt - s * R} Q ${xt} ${mid} ${xt} ${mid + R} V ${h}`;
+    return `M ${xn} ${mid} C ${xn} ${mid + CURVE} ${xt} ${mid + CURVE} ${xt} ${h}`;
   }
 
   return '';
+}
+
+/** 线段是否需要渐变（两端异色才需要） */
+export function needsGradient(seg: GraphSegment): boolean {
+  return !!seg.endColor && seg.endColor !== seg.color;
+}
+
+/** 渐变的起止坐标，与 segmentPath 的两个端点对齐 */
+export function segmentGradient(
+  seg: GraphSegment,
+  nodeLane: number,
+): { x1: number; y1: number; x2: number; y2: number } {
+  const h = GRAPH_ROW_HEIGHT;
+  const mid = h / 2;
+  const xn = laneX(nodeLane);
+
+  // 上半程：顶边 → 节点
+  if (seg.from >= 0 && seg.to < 0) {
+    return { x1: laneX(seg.from), y1: 0, x2: xn, y2: mid };
+  }
+  // 下半程：节点 → 底边
+  if (seg.from < 0 && seg.to >= 0) {
+    return { x1: xn, y1: mid, x2: laneX(seg.to), y2: h };
+  }
+  return { x1: laneX(seg.from), y1: 0, x2: laneX(seg.to), y2: h };
 }

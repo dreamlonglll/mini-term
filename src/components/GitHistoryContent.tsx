@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef, memo, useMemo } from 'react';
+import { useState, useEffect, useCallback, useRef, memo, useMemo, useId } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { writeText } from '@tauri-apps/plugin-clipboard-manager';
 import { useTauriEvent } from '../hooks/useTauriEvent';
@@ -9,6 +9,8 @@ import { CommitDiffModal } from './CommitDiffModal';
 import {
   computeGitGraph,
   segmentPath,
+  segmentGradient,
+  needsGradient,
   laneX,
   GRAPH_ROW_HEIGHT,
   type GraphRow,
@@ -131,6 +133,8 @@ const CommitGraphCell = memo(function CommitGraphCell({
 }) {
   const mid = GRAPH_ROW_HEIGHT / 2;
   const x = laneX(row.lane);
+  // useId 带冒号，SVG 的 url(#…) 引用里去掉更稳妥
+  const uid = useId().replace(/:/g, '');
   return (
     <svg
       width={width}
@@ -138,11 +142,29 @@ const CommitGraphCell = memo(function CommitGraphCell({
       className="shrink-0 pointer-events-none"
       aria-hidden="true"
     >
+      <defs>
+        {row.segments.map((seg, i) => {
+          if (!needsGradient(seg)) return null;
+          return (
+            <linearGradient
+              key={i}
+              id={`${uid}-${i}`}
+              gradientUnits="userSpaceOnUse"
+              {...segmentGradient(seg, row.lane)}
+            >
+              {/* 前半段保持分支自己的颜色，只在根部融入目标线 */}
+              <stop offset="0%" stopColor={seg.color} />
+              <stop offset="70%" stopColor={seg.color} />
+              <stop offset="100%" stopColor={seg.endColor} />
+            </linearGradient>
+          );
+        })}
+      </defs>
       {row.segments.map((seg, i) => (
         <path
           key={i}
           d={segmentPath(seg, row.lane)}
-          stroke={seg.color}
+          stroke={needsGradient(seg) ? `url(#${uid}-${i})` : seg.color}
           strokeWidth={1.5}
           fill="none"
         />
