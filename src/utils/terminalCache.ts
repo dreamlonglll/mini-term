@@ -291,6 +291,9 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
     letterSpacing: 0,
     lineHeight: 1.35,
     theme,
+    // 前景/背景对比度不足时自动提亮前景（WCAG AA）。Claude Code 的 AskUserQuestion
+    // 提问行用近黑前景，在暗色主题下与背景几乎同色，不选中看不见；VS Code 同为 4.5。
+    minimumContrastRatio: 4.5,
     // LigaturesAddon 内部用 registerCharacterJoiner（xterm.js proposed API），
     // 不开启 allowProposedApi 加载 addon 会抛 "You must set the allowProposedApi option to true"。
     allowProposedApi: true,
