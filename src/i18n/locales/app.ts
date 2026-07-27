@@ -18,10 +18,8 @@ export const app = {
       title: "新版本 {version} 可用，点击前往下载",
     },
     closeConfirm: {
-      title: "关闭确认",
       titleAi: "有 AI 会话正在运行",
-      message: "还有 {count} 个终端在运行，关闭后它们会被终止。确定退出吗？",
-      messageWithSessions: "还有 {count} 个终端在运行，其中这些 AI 会话会被终止：\n\n{names}\n\n确定退出吗？",
+      messageWithSessions: "还有 {count} 个 AI 会话，关闭后它们会被终止：\n\n{names}\n\n确定退出吗？",
     },
     emptyState: "请先在中间栏添加项目",
     firstRun: {
@@ -53,10 +51,8 @@ export const app = {
       title: "New version {version} available, click to download",
     },
     closeConfirm: {
-      title: "Confirm Close",
       titleAi: "AI sessions still running",
-      message: "{count} terminal(s) are still running and will be terminated. Quit anyway?",
-      messageWithSessions: "{count} terminal(s) are still running. These AI sessions will be terminated:\n\n{names}\n\nQuit anyway?",
+      messageWithSessions: "{count} AI session(s) are still running and will be terminated:\n\n{names}\n\nQuit anyway?",
     },
     emptyState: "Add a project in the middle panel first",
     firstRun: {

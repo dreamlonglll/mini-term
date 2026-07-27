@@ -36,28 +36,23 @@ import { useT } from './i18n';
 import type { AppConfig, PtyStatusChangePayload, PtyExitPayload, PaneStatus, MobileRelayStatusPayload, MobileStartSessionPayload, MobileRenamePanePayload } from './types';
 
 /**
- * 关窗前盘点还活着的终端：总数、其中的 AI 会话数、以及给用户看的名字清单。
- * 名字只列 AI 会话——裸 shell 列出来是噪音，AI 会话被 kill 才是真损失。
+ * 关窗前盘点还活着的 AI 会话（ai-working / ai-idle）：数量 + 给用户看的名字清单。
+ * 只数 AI 会话——裸 shell 关掉不心疼，AI 会话被 kill 才是真损失。
  */
-function collectLivePanes(): { total: number; aiCount: number; names: string[] } {
+function collectLiveAiPanes(): { count: number; names: string[] } {
   const { projectStates, config } = useAppStore.getState();
-  let total = 0;
-  let aiCount = 0;
   const names: string[] = [];
   for (const [projectId, ps] of projectStates) {
     if (!ps.layout) continue;
     const projectName = config.projects.find((p) => p.id === projectId)?.name ?? '';
     for (const pane of collectPanes(ps.layout)) {
       if (pane.ptyId === undefined) continue;
-      total++;
-      if (pane.status === 'ai-working' || pane.status === 'ai-idle') {
-        aiCount++;
-        const label = pane.customTitle || pane.shellName;
-        names.push(projectName ? `· ${projectName} / ${label}` : `· ${label}`);
-      }
+      if (pane.status !== 'ai-working' && pane.status !== 'ai-idle') continue;
+      const label = pane.customTitle || pane.shellName;
+      names.push(projectName ? `· ${projectName} / ${label}` : `· ${label}`);
     }
   }
-  return { total, aiCount, names };
+  return { count: names.length, names };
 }
 
 export function App() {
@@ -244,19 +239,14 @@ export function App() {
     const unlisten = appWindow.onCloseRequested(async (event) => {
       event.preventDefault();
 
-      const live = collectLivePanes();
-      if (live.total > 0) {
+      const live = collectLiveAiPanes();
+      if (live.count > 0) {
         const confirmed = await ask(
-          live.names.length > 0
-            ? t('app.closeConfirm.messageWithSessions', {
-                count: live.total,
-                names: live.names.join('\n'),
-              })
-            : t('app.closeConfirm.message', { count: live.total }),
-          {
-            title: live.aiCount > 0 ? t('app.closeConfirm.titleAi') : t('app.closeConfirm.title'),
-            kind: 'warning',
-          },
+          t('app.closeConfirm.messageWithSessions', {
+            count: live.count,
+            names: live.names.join('\n'),
+          }),
+          { title: t('app.closeConfirm.titleAi'), kind: 'warning' },
         );
         if (!confirmed) return;
       }
