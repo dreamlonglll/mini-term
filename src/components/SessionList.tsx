@@ -97,7 +97,6 @@ export function SessionList() {
   const [loading, setLoading] = useState(false);
   const [wslLoading, setWslLoading] = useState(false);
   const [viewingSession, setViewingSession] = useState<AiSession | null>(null);
-  const scrollRef = useRef<HTMLDivElement>(null);
   // 请求序号:项目切换后旧请求(尤其是慢的 WSL 请求)返回时不得覆盖新项目的列表
   const requestIdRef = useRef(0);
 
@@ -205,13 +204,9 @@ export function SessionList() {
   const visibleSessions = allSessions.slice(0, displayCount);
   const hasMore = displayCount < allSessions.length;
 
-  const handleScroll = useCallback(() => {
-    const el = scrollRef.current;
-    if (!el || !hasMore || loading) return;
-    if (el.scrollTop + el.clientHeight >= el.scrollHeight - 40) {
-      setDisplayCount((c) => Math.min(c + PAGE_SIZE, allSessions.length));
-    }
-  }, [hasMore, loading, allSessions.length]);
+  const loadMore = useCallback(() => {
+    setDisplayCount((c) => Math.min(c + PAGE_SIZE, allSessions.length));
+  }, [allSessions.length]);
 
   return (
     <div className="h-full flex flex-col overflow-hidden bg-[var(--bg-surface)] select-none">
@@ -242,7 +237,7 @@ export function SessionList() {
         )}
       </div>
 
-      <div ref={scrollRef} className="flex-1 overflow-y-auto px-1.5" onScroll={handleScroll}>
+      <div className="flex-1 overflow-y-auto px-1.5">
         {loading && allSessions.length === 0 && (
           <div className="px-2.5 py-3 text-xs text-[var(--text-muted)] text-center">{t('sessionList.loading')}</div>
         )}
@@ -338,9 +333,12 @@ export function SessionList() {
         })}
 
         {hasMore && (
-          <div className="px-2.5 py-2 text-xs text-[var(--text-muted)] text-center">
-            {t('sessionList.more', { n: allSessions.length - displayCount })}
-          </div>
+          <button
+            className="w-full px-2.5 py-2 my-0.5 text-xs text-[var(--text-muted)] text-center rounded-[var(--radius-sm)] cursor-pointer transition-colors hover:bg-[var(--border-subtle)] hover:text-[var(--text-primary)]"
+            onClick={loadMore}
+          >
+            {t('sessionList.loadMore', { n: allSessions.length - displayCount })}
+          </button>
         )}
       </div>
     </div>
