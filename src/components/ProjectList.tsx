@@ -72,7 +72,8 @@ export function ProjectList() {
   const [confirmTarget, setConfirmTarget] = useState<{ id: string; name: string } | null>(null);
   const [sshAssocTarget, setSshAssocTarget] = useState<ProjectConfig | null>(null);
   const [envVarsTarget, setEnvVarsTarget] = useState<ProjectConfig | null>(null);
-  const [addRemoteOpen, setAddRemoteOpen] = useState(false);
+  // null = 关闭；{ groupId } = 打开（groupId 为空表示加到根层）
+  const [addRemoteTarget, setAddRemoteTarget] = useState<{ groupId?: string } | null>(null);
   const [dropIndicator, setDropIndicator] = useState<DropIndicator | null>(null);
   const [editingGroupId, setEditingGroupId] = useState<string | null>(null);
   const [editingProjectId, setEditingProjectId] = useState<string | null>(null);
@@ -604,6 +605,7 @@ export function ProjectList() {
             const menuItems: Parameters<typeof showContextMenu>[2] = [
               { label: t('projectList.menu.renameGroup'), onClick: () => startRenameGroup(group.id, group.name) },
               { label: t('projectList.menu.addProject'), onClick: () => handleAddProject(group.id) },
+              { label: t('projectList.menu.addRemoteProject'), onClick: () => setAddRemoteTarget({ groupId: group.id }) },
             ];
             if (depth > 0) {
               menuItems.push({
@@ -714,7 +716,7 @@ export function ProjectList() {
               <button
                 type="button"
                 className="px-2 py-2 border border-dashed border-[var(--border-default)] rounded-[var(--radius-md)] text-center text-sm text-[var(--text-muted)] cursor-pointer hover:border-[var(--accent)] hover:text-[var(--accent)] transition-all duration-200 font-mono"
-                onClick={() => setAddRemoteOpen(true)}
+                onClick={() => setAddRemoteTarget({})}
                 title={t('projectList.addRemoteProject')}
                 aria-label={t('projectList.addRemoteProject')}
               >
@@ -737,7 +739,11 @@ export function ProjectList() {
       {/* 环境变量弹窗 */}
       <ProjectEnvVarsModal project={envVarsTarget} onClose={() => setEnvVarsTarget(null)} />
       {/* 添加远程项目弹窗 */}
-      <AddRemoteProjectModal open={addRemoteOpen} onClose={() => setAddRemoteOpen(false)} />
+      <AddRemoteProjectModal
+        open={!!addRemoteTarget}
+        targetGroupId={addRemoteTarget?.groupId}
+        onClose={() => setAddRemoteTarget(null)}
+      />
 
       {/* 删除确认 —— Modal 内部 portal 到 body,避免 fluent2 [data-panel] 的
           backdrop-filter 形成 containing block 把 fixed 拽进面板 */}
