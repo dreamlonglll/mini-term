@@ -395,6 +395,8 @@ export interface GitCommitInfo {
   body?: string;
   author: string;
   timestamp: number;
+  /** 全部父提交 hash（第 0 个是主线父），用于绘制分支拓扑图 */
+  parentHashes: string[];
 }
 
 export interface CommitFileInfo {

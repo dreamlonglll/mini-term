@@ -227,6 +227,8 @@ pub struct GitCommitInfo {
     pub body: Option<String>,
     pub author: String,
     pub timestamp: i64,
+    /// 全部父提交 hash（按 git 顺序：第 0 个是主线父）。前端据此绘制分支拓扑图。
+    pub parent_hashes: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -551,8 +553,10 @@ pub fn get_git_log(
     let limit = limit.unwrap_or(30);
 
     let mut revwalk = repo.revwalk().map_err(|e| e.to_string())?;
+    // 加 TOPOLOGICAL：保证父提交永远排在子提交之后，否则时钟偏移/rebase 后的仓库
+    // 会出现父在子之前，前端拓扑图的连线就会断。
     revwalk
-        .set_sorting(git2::Sort::TIME)
+        .set_sorting(git2::Sort::TIME | git2::Sort::TOPOLOGICAL)
         .map_err(|e| e.to_string())?;
 
     if let Some(ref hash) = before_commit {
@@ -591,6 +595,7 @@ pub fn get_git_log(
         let body = commit.body().map(|s| s.to_string());
         let author = commit.author().name().unwrap_or("unknown").to_string();
         let timestamp = commit.time().seconds();
+        let parent_hashes = commit.parent_ids().map(|id| id.to_string()).collect();
         result.push(GitCommitInfo {
             hash,
             short_hash,
@@ -598,6 +603,7 @@ pub fn get_git_log(
             body,
             author,
             timestamp,
+            parent_hashes,
         });
     }
 

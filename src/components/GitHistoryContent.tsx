@@ -6,6 +6,13 @@ import { showContextMenu } from '../utils/contextMenu';
 import { isAiPty } from '../utils/terminalCache';
 import { formatRelativeTime } from '../utils/timeFormat';
 import { CommitDiffModal } from './CommitDiffModal';
+import {
+  computeGitGraph,
+  segmentPath,
+  laneX,
+  GRAPH_ROW_HEIGHT,
+  type GraphRow,
+} from '../utils/gitGraph';
 import { useT } from '../i18n';
 import type { GitRepoInfo, GitCommitInfo, CommitFileInfo, BranchInfo, PtyOutputPayload } from '../types';
 
@@ -114,11 +121,51 @@ const GitActionButton = memo(function GitActionButton({
   );
 });
 
+/** 单行的拓扑图：先画连线，再把节点圆盖在上面 */
+const CommitGraphCell = memo(function CommitGraphCell({
+  row,
+  width,
+}: {
+  row: GraphRow;
+  width: number;
+}) {
+  const mid = GRAPH_ROW_HEIGHT / 2;
+  const x = laneX(row.lane);
+  return (
+    <svg
+      width={width}
+      height={GRAPH_ROW_HEIGHT}
+      className="shrink-0 pointer-events-none"
+      aria-hidden="true"
+    >
+      {row.segments.map((seg, i) => (
+        <path
+          key={i}
+          d={segmentPath(seg, row.lane)}
+          stroke={seg.color}
+          strokeWidth={1.5}
+          fill="none"
+        />
+      ))}
+      {row.isMerge ? (
+        <>
+          <circle cx={x} cy={mid} r={5.5} fill="none" stroke={row.color} strokeWidth={1.5} opacity={0.55} />
+          <circle cx={x} cy={mid} r={3} fill={row.color} />
+        </>
+      ) : (
+        <circle cx={x} cy={mid} r={4} fill={row.color} />
+      )}
+    </svg>
+  );
+});
+
 const CommitItem = memo(function CommitItem({
   commit,
   allBranches,
   depth,
   repoPath,
+  row,
+  graphWidth,
   onContextMenu,
   onDoubleClick,
 }: {
@@ -126,6 +173,8 @@ const CommitItem = memo(function CommitItem({
   allBranches: BranchInfo[];
   depth: number;
   repoPath: string;
+  row: GraphRow;
+  graphWidth: number;
   onContextMenu: (e: React.MouseEvent, repoPath: string, commit: GitCommitInfo) => void;
   onDoubleClick: (repoPath: string, commit: GitCommitInfo) => void;
 }) {
@@ -133,44 +182,87 @@ const CommitItem = memo(function CommitItem({
   const commitBranches = allBranches.filter((b) => b.commitHash === commit.hash);
   return (
     <div
-      className="py-1.5 cursor-pointer hover:bg-[var(--border-subtle)] rounded-[var(--radius-sm)] transition-colors duration-100"
-      style={{ paddingLeft: `${(depth + 1) * 16 + 8}px`, paddingRight: '8px' }}
+      className="flex items-stretch cursor-pointer hover:bg-[var(--border-subtle)] rounded-[var(--radius-sm)] transition-colors duration-100"
+      style={{
+        height: `${GRAPH_ROW_HEIGHT}px`,
+        paddingLeft: `${depth * 16 + 8}px`,
+        paddingRight: '8px',
+      }}
       title={commit.body ? `${commit.message}\n\n${commit.body}` : commit.message}
       onContextMenu={(e) => onContextMenu(e, repoPath, commit)}
       onDoubleClick={() => onDoubleClick(repoPath, commit)}
     >
-      <div className="text-sm text-[var(--text-primary)] flex items-center gap-1 min-w-0">
-        {commitBranches.map((b) => (
-          <span
-            key={b.name}
-            className="inline-flex items-center shrink-0 text-sm leading-[18px] px-1.5 rounded font-medium"
-            style={{
-              backgroundColor: b.isHead
-                ? 'var(--color-accent, #58a6ff)'
-                : b.isRemote
-                  ? 'var(--border-subtle, #3d3d3d)'
-                  : 'rgba(63, 185, 80, 0.2)',
-              color: b.isHead
-                ? '#fff'
-                : b.isRemote
-                  ? 'var(--text-muted)'
-                  : 'rgb(63, 185, 80)',
-            }}
-            title={b.isRemote ? t('gitHistoryContent.remoteBranch', { name: b.name }) : b.isHead ? t('gitHistoryContent.currentBranch', { name: b.name }) : t('gitHistoryContent.localBranch', { name: b.name })}
-          >
-            {b.name}
-          </span>
-        ))}
-        <span className="truncate">{commit.message}</span>
-      </div>
-      <div className="text-xs text-[var(--text-muted)] flex items-center gap-1.5 mt-0.5">
-        <span>{commit.author}</span>
-        <span>&middot;</span>
-        <span>{formatRelativeTime(commit.timestamp)}</span>
-        <span>&middot;</span>
-        <span className="font-mono">{commit.shortHash}</span>
+      <CommitGraphCell row={row} width={graphWidth} />
+      <div className="flex-1 min-w-0 flex flex-col justify-center pl-1">
+        <div className="text-sm text-[var(--text-primary)] flex items-center gap-1 min-w-0">
+          {commitBranches.map((b) => (
+            <span
+              key={b.name}
+              className="inline-flex items-center shrink-0 text-sm leading-[18px] px-1.5 rounded font-medium"
+              style={{
+                backgroundColor: b.isHead
+                  ? 'var(--color-accent, #58a6ff)'
+                  : b.isRemote
+                    ? 'var(--border-subtle, #3d3d3d)'
+                    : 'rgba(63, 185, 80, 0.2)',
+                color: b.isHead
+                  ? '#fff'
+                  : b.isRemote
+                    ? 'var(--text-muted)'
+                    : 'rgb(63, 185, 80)',
+              }}
+              title={b.isRemote ? t('gitHistoryContent.remoteBranch', { name: b.name }) : b.isHead ? t('gitHistoryContent.currentBranch', { name: b.name }) : t('gitHistoryContent.localBranch', { name: b.name })}
+            >
+              {b.name}
+            </span>
+          ))}
+          <span className="truncate">{commit.message}</span>
+        </div>
+        <div className="text-xs text-[var(--text-muted)] flex items-center gap-1.5 mt-0.5">
+          <span className="truncate max-w-[140px]">{commit.author}</span>
+          <span>&middot;</span>
+          <span className="shrink-0">{formatRelativeTime(commit.timestamp)}</span>
+          <span>&middot;</span>
+          <span className="font-mono shrink-0">{commit.shortHash}</span>
+        </div>
       </div>
     </div>
+  );
+});
+
+/** 一个仓库的 commit 列表——拓扑图布局在这里按整份列表统一计算 */
+const RepoCommitList = memo(function RepoCommitList({
+  commits,
+  allBranches,
+  depth,
+  repoPath,
+  onContextMenu,
+  onDoubleClick,
+}: {
+  commits: GitCommitInfo[];
+  allBranches: BranchInfo[];
+  depth: number;
+  repoPath: string;
+  onContextMenu: (e: React.MouseEvent, repoPath: string, commit: GitCommitInfo) => void;
+  onDoubleClick: (repoPath: string, commit: GitCommitInfo) => void;
+}) {
+  const graph = useMemo(() => computeGitGraph(commits), [commits]);
+  return (
+    <>
+      {commits.map((commit, i) => (
+        <CommitItem
+          key={commit.hash}
+          commit={commit}
+          allBranches={allBranches}
+          depth={depth}
+          repoPath={repoPath}
+          row={graph.rows[i]}
+          graphWidth={graph.width}
+          onContextMenu={onContextMenu}
+          onDoubleClick={onDoubleClick}
+        />
+      ))}
+    </>
   );
 });
 
@@ -263,10 +355,19 @@ export function GitHistoryContent({ projectPath, repos, refreshRepos }: GitHisto
         setRepoStates((prev) => {
           const next = new Map(prev);
           const cur = next.get(repoPath) ?? { commits: [], loading: false, hasMore: true };
+          // 分页是从上一页末尾 commit 的 parent 重新 revwalk 的，有分支时会带回
+          // 已经加载过的 commit。重复 hash 会让拓扑图的连线算错，按 hash 去重；
+          // 若整页都是重复的则停止分页，避免用同一个游标反复请求。
+          let merged = commits;
+          if (beforeCommit) {
+            const seen = new Set(cur.commits.map((c) => c.hash));
+            merged = [...cur.commits, ...commits.filter((c) => !seen.has(c.hash))];
+          }
           next.set(repoPath, {
-            commits: beforeCommit ? [...cur.commits, ...commits] : commits,
+            commits: merged,
             loading: false,
-            hasMore: commits.length >= 30,
+            hasMore:
+              commits.length >= 30 && (!beforeCommit || merged.length > cur.commits.length),
           });
           return next;
         });
@@ -603,17 +704,16 @@ export function GitHistoryContent({ projectPath, repos, refreshRepos }: GitHisto
 
           {isExpanded && (
             <div className="relative" style={{ zIndex: 0 }}>
-              {state?.commits.map((commit) => (
-                <CommitItem
-                  key={commit.hash}
-                  commit={commit}
+              {state && state.commits.length > 0 && (
+                <RepoCommitList
+                  commits={state.commits}
                   allBranches={repoBranches.get(repo.path) ?? EMPTY_BRANCHES}
                   depth={depth}
                   repoPath={repo.path}
                   onContextMenu={handleCommitContextMenu}
                   onDoubleClick={handleViewDiff}
                 />
-              ))}
+              )}
 
               {state?.loading && (
                 <div className="text-center text-[var(--text-muted)] text-xs py-2">
