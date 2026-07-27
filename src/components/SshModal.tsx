@@ -5,6 +5,7 @@ import { useAppStore, genId } from '../store';
 import { Modal } from './Modal';
 import { useT } from '../i18n';
 import { showContextMenu } from '../utils/contextMenu';
+import { showConfirm } from '../utils/prompt';
 import type { SshConnection } from '../types';
 
 interface Props {
@@ -29,6 +30,42 @@ export function connectionSummary(conn: SshConnection): string {
 function normalizeGroup(group?: string): string | undefined {
   const g = group?.trim();
   return g || undefined;
+}
+
+export interface SshGroupBucket {
+  /** undefined = 未分组桶 */
+  group?: string;
+  items: SshConnection[];
+}
+
+/**
+ * 按分组归类连接。具名分组 = 连接中出现的组（按首次出现顺序）∪ 显式创建的
+ * `sshGroups`（允许空组）；未分组连接单独成桶。
+ *
+ * 「SSH 连接」与「关联 SSH」两个弹窗共用，避免两边分组顺序/空组处理走样。
+ */
+export function buildGroupBuckets(
+  connections: SshConnection[],
+  sshGroups: string[],
+): { namedGroups: { group: string; items: SshConnection[] }[]; ungroupedItems: SshConnection[] } {
+  const namedGroups: { group: string; items: SshConnection[] }[] = [];
+  const ensureGroup = (name: string) => {
+    let bucket = namedGroups.find((x) => x.group === name);
+    if (!bucket) {
+      bucket = { group: name, items: [] };
+      namedGroups.push(bucket);
+    }
+    return bucket;
+  };
+  for (const conn of connections) {
+    const g = normalizeGroup(conn.group);
+    if (g) ensureGroup(g).items.push(conn);
+  }
+  for (const raw of sshGroups) {
+    const g = raw.trim();
+    if (g) ensureGroup(g);
+  }
+  return { namedGroups, ungroupedItems: connections.filter((c) => !normalizeGroup(c.group)) };
 }
 
 // ─── Field（带标签的表单行）───
@@ -281,11 +318,11 @@ function SshRow({
 
 // ─── GroupSidebarRow（左侧分组列表项，兼作拖拽落点）───
 
-function GroupSidebarRow({
+export function GroupSidebarRow({
   label,
   count,
   active,
-  dropActive,
+  dropActive = false,
   onClick,
   onContextMenu,
   onMouseEnter,
@@ -295,7 +332,8 @@ function GroupSidebarRow({
   label: string;
   count: number;
   active: boolean;
-  dropActive: boolean;
+  /** 拖拽落点高亮；无拖拽场景（如「关联 SSH」）不传 */
+  dropActive?: boolean;
   onClick: () => void;
   onContextMenu?: (e: MouseEvent) => void;
   onMouseEnter?: () => void;
@@ -376,9 +414,16 @@ export function SshModal({ open, onClose }: Props) {
     setEditingId(null);
   };
 
-  const handleDelete = (id: string) => {
+  // 删除不可撤销（密码/私钥路径一并丢失），且会静默收窄已关联项目的 agent 可见范围，
+  // 故走二次确认；确认框在 overlayStack 里叠在本弹窗之上，Esc 只关它
+  const handleDelete = async (conn: SshConnection) => {
+    const ok = await showConfirm(
+      t('sshModal.deleteConfirmTitle'),
+      t('sshModal.deleteConfirmMessage', { name: conn.name, summary: connectionSummary(conn) }),
+    );
+    if (!ok) return;
     const current = useAppStore.getState().config.sshConnections ?? [];
-    void persist({ sshConnections: current.filter((c) => c.id !== id) });
+    void persist({ sshConnections: current.filter((c) => c.id !== conn.id) });
   };
 
   // ─── 分组操作 ───
@@ -533,28 +578,10 @@ export function SshModal({ open, onClose }: Props) {
 
   if (!open) return null;
 
-  // 具名分组 = 连接中出现的组（按首次出现顺序）∪ 显式创建的 sshGroups（允许空组）
-  const namedGroups: { group: string; items: SshConnection[] }[] = [];
-  const ensureGroup = (name: string) => {
-    let bucket = namedGroups.find((x) => x.group === name);
-    if (!bucket) {
-      bucket = { group: name, items: [] };
-      namedGroups.push(bucket);
-    }
-    return bucket;
-  };
-  for (const conn of connections) {
-    const g = normalizeGroup(conn.group);
-    if (g) ensureGroup(g).items.push(conn);
-  }
-  for (const raw of sshGroups) {
-    const g = raw.trim();
-    if (g) ensureGroup(g);
-  }
+  const { namedGroups, ungroupedItems } = buildGroupBuckets(connections, sshGroups);
   const groupOptions = namedGroups.map((g) => g.group);
-  const ungroupedItems = connections.filter((c) => !normalizeGroup(c.group));
   const hasNamedGroup = namedGroups.length > 0;
-  const groups: { group?: string; items: SshConnection[] }[] = [
+  const groups: SshGroupBucket[] = [
     ...namedGroups,
     ...(ungroupedItems.length > 0 ? [{ group: undefined, items: ungroupedItems }] : []),
   ];
@@ -603,7 +630,7 @@ export function SshModal({ open, onClose }: Props) {
           setAdding(false);
           setEditingId(conn.id);
         }}
-        onDelete={() => handleDelete(conn.id)}
+        onDelete={() => void handleDelete(conn)}
         onMouseDown={(e) => handleConnMouseDown(e, conn.id)}
       />
     );

@@ -2,10 +2,11 @@ import { useState, useEffect, useMemo, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '../store';
 import { showAlert } from '../utils/prompt';
-import { connectionSummary } from './SshModal';
+import { buildGroupBuckets, connectionSummary, GroupSidebarRow } from './SshModal';
+import type { SshGroupBucket } from './SshModal';
 import { Modal, ModalCloseButton } from './Modal';
 import { useT, t as tStatic } from '../i18n';
-import type { ProjectConfig, SshConnection } from '../types';
+import type { ProjectConfig } from '../types';
 
 interface Props {
   /** 目标项目；null 表示弹窗关闭 */
@@ -42,14 +43,20 @@ function sameScope(a: string[] | undefined, b: string[], allIds: string[]): bool
 export function SshAssocModal({ project, onClose }: Props) {
   const t = useT();
   const connections = useAppStore((s) => s.config.sshConnections) ?? [];
+  const sshGroups = useAppStore((s) => s.config.sshGroups) ?? [];
   const allIds = useMemo(() => connections.map((c) => c.id), [connections]);
   const [checked, setChecked] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
+  /** 左栏选中态：null = 全部；'' = 未分组；其他 = 具名分组名（与 SshModal 一致） */
+  const [selectedGroup, setSelectedGroup] = useState<string | null>(null);
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     if (project) {
       setChecked(initialChecked(project, allIds));
       setBusy(false);
+      setSelectedGroup(null);
+      setCollapsed(new Set());
     }
   }, [project, allIds]);
 
@@ -141,25 +148,59 @@ export function SshAssocModal({ project, onClose }: Props) {
 
   if (!project) return null;
 
-  // 按 group 归类，保持首次出现顺序（与 SshModal 一致）
-  const groups: { group?: string; items: SshConnection[] }[] = [];
-  for (const conn of connections) {
-    const g = conn.group?.trim() || undefined;
-    let bucket = groups.find((x) => x.group === g);
-    if (!bucket) {
-      bucket = { group: g, items: [] };
-      groups.push(bucket);
-    }
-    bucket.items.push(conn);
-  }
-  const hasNamedGroup = groups.some((g) => g.group);
+  // 分组归类与 SshModal 共用同一份逻辑（含显式创建的空分组）
+  const { namedGroups, ungroupedItems } = buildGroupBuckets(connections, sshGroups);
+  const hasNamedGroup = namedGroups.length > 0;
+  const groups: SshGroupBucket[] = [
+    ...namedGroups,
+    ...(ungroupedItems.length > 0 ? [{ group: undefined, items: ungroupedItems }] : []),
+  ];
+  const groupNames = namedGroups.map((g) => g.group);
+
+  // 选中的分组可能因（在另一个弹窗里）删除/重命名而消失，回落到「全部」
+  const activeGroup: string | null =
+    selectedGroup === null
+      ? null
+      : selectedGroup === ''
+        ? ungroupedItems.length > 0
+          ? ''
+          : null
+        : groupNames.includes(selectedGroup)
+          ? selectedGroup
+          : null;
+
+  // 右栏要展示的桶：全部视图展示所有桶（带可折叠标题），选中某组只展示该桶
+  const visibleBuckets =
+    activeGroup === null ? groups : groups.filter((g) => (g.group ?? '') === activeGroup);
+  // 全选 / 全不选作用于「当前看得见的连接」：在某个分组里点全选，不该顺手把别的组也勾上
+  const visibleIds = visibleBuckets.flatMap((b) => b.items.map((c) => c.id));
+
+  const setCheckedFor = (ids: string[], on: boolean) => {
+    setChecked((prev) => {
+      const next = new Set(prev);
+      for (const id of ids) {
+        if (on) next.add(id);
+        else next.delete(id);
+      }
+      return next;
+    });
+  };
+
+  const toggleCollapsed = (key: string) => {
+    setCollapsed((prev) => {
+      const s = new Set(prev);
+      if (s.has(key)) s.delete(key);
+      else s.add(key);
+      return s;
+    });
+  };
 
   return (
     <Modal
       open
       onClose={onClose}
       ariaLabel={t('sshAssoc.title')}
-      panelClassName="w-[480px] max-h-[80vh]"
+      panelClassName="w-[720px] h-[70vh] max-h-[680px]"
       // 保存中不给关：正在写配置，半途退出会让 store 与磁盘不一致
       closeOnOverlay={!busy}
       closeOnEscape={!busy}
@@ -175,71 +216,113 @@ export function SshAssocModal({ project, onClose }: Props) {
         </div>
       </div>
 
-        {/* 内容 */}
-        <div className="flex-1 overflow-y-auto px-5 py-4 space-y-3">
-          {connections.length === 0 ? (
-            <div className="text-center text-sm text-[var(--text-muted)] py-10">
-              {t('sshAssoc.empty')}
-            </div>
-          ) : (
-            <>
-              <div className="flex items-center justify-between text-sm text-[var(--text-muted)]">
-                <span>
-                  {t('sshAssoc.selectedCount', { checked: checked.size, total: connections.length })}
-                </span>
-                <div className="flex gap-2">
-                  <button
-                    className="hover:text-[var(--accent)] transition-colors"
-                    onClick={() => setChecked(new Set(allIds))}
-                  >
-                    {t('sshAssoc.selectAll')}
-                  </button>
-                  <span className="opacity-40">|</span>
-                  <button
-                    className="hover:text-[var(--accent)] transition-colors"
-                    onClick={() => setChecked(new Set())}
-                  >
-                    {t('sshAssoc.selectNone')}
-                  </button>
-                </div>
-              </div>
+        {/* 内容：左侧分组列表 + 右侧连接列表（与「SSH 连接」弹窗同构） */}
+        <div className="flex-1 flex min-h-0">
+          {/* 左栏 */}
+          <div className="w-44 flex-shrink-0 border-r border-[var(--border-subtle)] overflow-y-auto py-2 space-y-0.5">
+            <GroupSidebarRow
+              label={t('sshAssoc.allConnections')}
+              count={connections.length}
+              active={activeGroup === null}
+              onClick={() => setSelectedGroup(null)}
+            />
+            {namedGroups.map((g) => (
+              <GroupSidebarRow
+                key={g.group}
+                label={g.group}
+                count={g.items.length}
+                active={activeGroup === g.group}
+                onClick={() => setSelectedGroup(g.group)}
+              />
+            ))}
+            {ungroupedItems.length > 0 && (
+              <GroupSidebarRow
+                label={t('sshAssoc.ungrouped')}
+                count={ungroupedItems.length}
+                active={activeGroup === ''}
+                onClick={() => setSelectedGroup('')}
+              />
+            )}
+          </div>
 
-              {groups.map((bucket) => (
-                <div key={bucket.group ?? '__ungrouped__'} className="space-y-1">
-                  {(bucket.group || hasNamedGroup) && (
-                    <div className="text-sm text-[var(--text-muted)] uppercase tracking-[0.1em]">
-                      {bucket.group ?? t('sshAssoc.ungrouped')}
-                    </div>
-                  )}
-                  {bucket.items.map((conn) => (
-                    <label
-                      key={conn.id}
-                      className="flex items-center gap-3 px-3 py-2 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)] cursor-pointer hover:border-[var(--border-default)] transition-colors"
+          {/* 右栏 */}
+          <div className="flex-1 min-w-0 overflow-y-auto px-5 py-4 space-y-3">
+            {connections.length === 0 ? (
+              <div className="text-center text-sm text-[var(--text-muted)] py-10">
+                {t('sshAssoc.empty')}
+              </div>
+            ) : (
+              <>
+                <div className="flex items-center justify-between text-sm text-[var(--text-muted)]">
+                  <span>
+                    {t('sshAssoc.selectedCount', { checked: checked.size, total: connections.length })}
+                  </span>
+                  <div className="flex gap-2">
+                    <button
+                      className="hover:text-[var(--accent)] transition-colors"
+                      onClick={() => setCheckedFor(visibleIds, true)}
                     >
-                      <input
-                        type="checkbox"
-                        className="accent-[var(--accent)] flex-shrink-0"
-                        checked={checked.has(conn.id)}
-                        onChange={() => toggle(conn.id)}
-                      />
-                      <div className="flex-1 min-w-0">
-                        <div className="text-base text-[var(--text-primary)] truncate">
-                          {conn.name}
-                        </div>
-                        <div className="text-sm text-[var(--text-muted)] font-mono truncate">
-                          {connectionSummary(conn)}
-                        </div>
-                      </div>
-                    </label>
-                  ))}
+                      {t('sshAssoc.selectAll')}
+                    </button>
+                    <span className="opacity-40">|</span>
+                    <button
+                      className="hover:text-[var(--accent)] transition-colors"
+                      onClick={() => setCheckedFor(visibleIds, false)}
+                    >
+                      {t('sshAssoc.selectNone')}
+                    </button>
+                  </div>
                 </div>
-              ))}
-            </>
-          )}
+
+                {visibleBuckets.map((bucket) => {
+                  const key = bucket.group ?? '';
+                  const isCollapsed = activeGroup === null && collapsed.has(key);
+                  return (
+                    <div key={key || '__ungrouped__'} className="space-y-1.5">
+                      {activeGroup === null && (bucket.group || hasNamedGroup) && (
+                        <button
+                          className="w-full flex items-center gap-1.5 text-sm text-[var(--text-muted)] uppercase tracking-[0.1em] hover:text-[var(--text-primary)] transition-colors"
+                          onClick={() => toggleCollapsed(key)}
+                        >
+                          <span className="text-xs w-3 flex-shrink-0">{isCollapsed ? '▸' : '▾'}</span>
+                          <span className="truncate">{bucket.group ?? t('sshAssoc.ungrouped')}</span>
+                          <span className="normal-case tracking-normal flex-shrink-0">
+                            ({bucket.items.length})
+                          </span>
+                        </button>
+                      )}
+                      {!isCollapsed &&
+                        bucket.items.map((conn) => (
+                          <label
+                            key={conn.id}
+                            className="flex items-center gap-3 px-3 py-2.5 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)] cursor-pointer hover:border-[var(--border-default)] transition-colors"
+                          >
+                            <input
+                              type="checkbox"
+                              className="accent-[var(--accent)] flex-shrink-0"
+                              checked={checked.has(conn.id)}
+                              onChange={() => toggle(conn.id)}
+                            />
+                            <div className="flex-1 min-w-0">
+                              <div className="text-base font-medium text-[var(--text-primary)] truncate">
+                                {conn.name}
+                              </div>
+                              <div className="text-sm text-[var(--text-muted)] font-mono truncate">
+                                {connectionSummary(conn)}
+                              </div>
+                            </div>
+                          </label>
+                        ))}
+                    </div>
+                  );
+                })}
+              </>
+            )}
+          </div>
         </div>
 
         {/* 底栏 */}
-        <div className="px-5 py-3 border-t border-[var(--border-subtle)] flex items-center gap-3">
+        <div className="px-5 py-3 border-t border-[var(--border-subtle)] flex items-center gap-3 flex-shrink-0">
           <div className="text-xs text-[var(--text-muted)] flex-1">
             {checked.size === 0
               ? t('sshAssoc.footerHintEmpty')
