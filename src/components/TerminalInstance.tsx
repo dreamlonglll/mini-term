@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '../store';
-import { getOrCreateTerminal, getCachedTerminal, activateWebgl, getTerminalTheme, DARK_TERMINAL_THEME, writePtyInput, copyTerminalSelection, pasteToTerminal, resolveTerminalFontFamily, reloadLigaturesForPty, clearAtlasForPty } from '../utils/terminalCache';
+import { getOrCreateTerminal, getCachedTerminal, activateWebgl, getTerminalTheme, DARK_TERMINAL_THEME, writePtyInput, copyTerminalSelection, pasteToTerminal, resolveTerminalFontFamily, reloadLigaturesForPty, resetRenderStateForPty } from '../utils/terminalCache';
 import { getResolvedTheme } from '../utils/themeManager';
 import { showContextMenu, type MenuEntry } from '../utils/contextMenu';
 import { isFileDragging, getFileDragPath } from '../utils/fileDragState';
@@ -115,8 +115,9 @@ export function TerminalInstance({ ptyId }: Props) {
         // 等 canvas 渲染器首帧合成上屏后再加载 WebGL，避免替换 canvas 时闪白
         requestAnimationFrame(() => {
           activateWebgl(ptyId);
-          // mount 后强制 clearTextureAtlas,见 spec/frontend/xterm-webgl-atlas-sharing.md
-          requestAnimationFrame(() => clearAtlasForPty(ptyId));
+          // mount 后重建本终端 model/顶点缓冲，对齐共享 atlas 当前布局
+          // (只清自己，不动共享 atlas —— 见 resetRenderStateForPty 注释)
+          requestAnimationFrame(() => resetRenderStateForPty(ptyId));
         });
       }
     });
@@ -157,8 +158,8 @@ export function TerminalInstance({ ptyId }: Props) {
         requestAnimationFrame(() => {
           fitAddon.fit();
           term.refresh(0, term.rows - 1);
-          // 可见性恢复时强制清 atlas，兜底 RenderService._isPaused 拦截期间的残留。
-          clearAtlasForPty(ptyId);
+          // 可见性恢复时重建 model/顶点缓冲，兜底 _isPaused 拦截期间共享 atlas 变更的残留
+          resetRenderStateForPty(ptyId);
         });
       }
     });
