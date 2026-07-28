@@ -6,6 +6,7 @@ import { useTauriEvent } from '../hooks/useTauriEvent';
 import { FileViewerModal } from './FileViewerModal';
 import { showContextMenu } from '../utils/contextMenu';
 import { MOD_LABEL } from '../utils/platform';
+import { Modal } from './Modal';
 import { useT } from '../i18n';
 import type { SearchResultItem, SearchResultsPayload, SearchCompletePayload } from '../types';
 
@@ -151,18 +152,6 @@ export function SearchModal({ open, onClose }: SearchModalProps) {
     setSearchId(null);
   }, [mode]);
 
-  // Escape to close (only when FileViewerModal is not open)
-  useEffect(() => {
-    if (!open) return;
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && !viewFilePath) {
-        onClose();
-      }
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [open, onClose, viewFilePath]);
-
   // Listen for search results
   useTauriEvent<SearchResultsPayload>(
     'search-results',
@@ -230,12 +219,15 @@ export function SearchModal({ open, onClose }: SearchModalProps) {
   if (!open) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center select-text">
-      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
-      <div
-        className="relative flex flex-col overflow-hidden bg-[var(--bg-surface)] border border-[var(--border-strong)] rounded-[var(--radius-md)] shadow-[var(--shadow-overlay)] animate-slide-in"
-        style={{ width: '80vw', height: '70vh', maxWidth: '900px' }}
-      >
+    <Modal
+      open={open}
+      onClose={onClose}
+      align="center"
+      ariaLabel={t('search.title')}
+      panelClassName="w-[80vw] h-[70vh] max-w-[900px] select-text"
+      // 输了半天的查询词，误点遮罩就没了；Esc 仍可退（嵌套的文件预览会先吃掉 Esc）
+      closeOnOverlay={false}
+    >
         {/* Header */}
         <div className="flex items-center justify-between px-4 py-3 border-b border-[var(--border-subtle)] flex-shrink-0">
           <div className="flex items-center gap-3">
@@ -351,19 +343,16 @@ export function SearchModal({ open, onClose }: SearchModalProps) {
           {status === 'done' && mode === 'content' && <span>{t('search.foundMatches', { count: totalCount })}</span>}
           {status === 'idle' && <span>{t('search.shortcutHint', { mod: MOD_LABEL })}</span>}
         </div>
-      </div>
 
       {viewFilePath && project && (
-        <div onClick={(e) => e.stopPropagation()}>
-          <FileViewerModal
-            open={!!viewFilePath}
-            onClose={() => setViewFilePath(null)}
-            filePath={viewFilePath}
-            projectRoot={project.path}
-            highlightLine={viewHighlightLine}
-          />
-        </div>
+        <FileViewerModal
+          open={!!viewFilePath}
+          onClose={() => setViewFilePath(null)}
+          filePath={viewFilePath}
+          projectRoot={project.path}
+          highlightLine={viewHighlightLine}
+        />
       )}
-    </div>
+    </Modal>
   );
 }

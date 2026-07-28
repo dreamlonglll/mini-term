@@ -1,11 +1,22 @@
-import { useState, useEffect, useCallback, useRef, memo, useMemo } from 'react';
+import { useState, useEffect, useCallback, useRef, memo, useMemo, useId } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { writeText } from '@tauri-apps/plugin-clipboard-manager';
 import { useTauriEvent } from '../hooks/useTauriEvent';
 import { showContextMenu } from '../utils/contextMenu';
 import { isAiPty } from '../utils/terminalCache';
+import { useAppStore } from '../store';
+import { newTerminal } from '../utils/paneActions';
 import { formatRelativeTime } from '../utils/timeFormat';
 import { CommitDiffModal } from './CommitDiffModal';
+import {
+  computeGitGraph,
+  segmentPath,
+  segmentGradient,
+  needsGradient,
+  laneX,
+  GRAPH_ROW_HEIGHT,
+  type GraphRow,
+} from '../utils/gitGraph';
 import { useT } from '../i18n';
 import type { GitRepoInfo, GitCommitInfo, CommitFileInfo, BranchInfo, PtyOutputPayload } from '../types';
 
@@ -114,11 +125,71 @@ const GitActionButton = memo(function GitActionButton({
   );
 });
 
+/** 单行的拓扑图：先画连线，再把节点圆盖在上面 */
+const CommitGraphCell = memo(function CommitGraphCell({
+  row,
+  width,
+}: {
+  row: GraphRow;
+  width: number;
+}) {
+  const mid = GRAPH_ROW_HEIGHT / 2;
+  const x = laneX(row.lane);
+  // useId 带冒号，SVG 的 url(#…) 引用里去掉更稳妥
+  const uid = useId().replace(/:/g, '');
+  return (
+    <svg
+      width={width}
+      height={GRAPH_ROW_HEIGHT}
+      className="shrink-0 pointer-events-none"
+      aria-hidden="true"
+    >
+      <defs>
+        {row.segments.map((seg, i) => {
+          if (!needsGradient(seg)) return null;
+          return (
+            <linearGradient
+              key={i}
+              id={`${uid}-${i}`}
+              gradientUnits="userSpaceOnUse"
+              {...segmentGradient(seg, row.lane)}
+            >
+              {/* 前半段保持分支自己的颜色，只在根部融入目标线 */}
+              <stop offset="0%" stopColor={seg.color} />
+              <stop offset="70%" stopColor={seg.color} />
+              <stop offset="100%" stopColor={seg.endColor} />
+            </linearGradient>
+          );
+        })}
+      </defs>
+      {row.segments.map((seg, i) => (
+        <path
+          key={i}
+          d={segmentPath(seg, row.lane)}
+          stroke={needsGradient(seg) ? `url(#${uid}-${i})` : seg.color}
+          strokeWidth={1.5}
+          fill="none"
+        />
+      ))}
+      {row.isMerge ? (
+        <>
+          <circle cx={x} cy={mid} r={5.5} fill="none" stroke={row.color} strokeWidth={1.5} opacity={0.55} />
+          <circle cx={x} cy={mid} r={3} fill={row.color} />
+        </>
+      ) : (
+        <circle cx={x} cy={mid} r={4} fill={row.color} />
+      )}
+    </svg>
+  );
+});
+
 const CommitItem = memo(function CommitItem({
   commit,
   allBranches,
   depth,
   repoPath,
+  row,
+  graphWidth,
   onContextMenu,
   onDoubleClick,
 }: {
@@ -126,6 +197,8 @@ const CommitItem = memo(function CommitItem({
   allBranches: BranchInfo[];
   depth: number;
   repoPath: string;
+  row: GraphRow;
+  graphWidth: number;
   onContextMenu: (e: React.MouseEvent, repoPath: string, commit: GitCommitInfo) => void;
   onDoubleClick: (repoPath: string, commit: GitCommitInfo) => void;
 }) {
@@ -133,44 +206,97 @@ const CommitItem = memo(function CommitItem({
   const commitBranches = allBranches.filter((b) => b.commitHash === commit.hash);
   return (
     <div
-      className="py-1.5 cursor-pointer hover:bg-[var(--border-subtle)] rounded-[var(--radius-sm)] transition-colors duration-100"
-      style={{ paddingLeft: `${(depth + 1) * 16 + 8}px`, paddingRight: '8px' }}
+      className="flex items-stretch cursor-pointer hover:bg-[var(--border-subtle)] rounded-[var(--radius-sm)] transition-colors duration-100"
+      style={{
+        height: `${GRAPH_ROW_HEIGHT}px`,
+        paddingLeft: `${depth * 16 + 8}px`,
+        paddingRight: '8px',
+      }}
       title={commit.body ? `${commit.message}\n\n${commit.body}` : commit.message}
       onContextMenu={(e) => onContextMenu(e, repoPath, commit)}
       onDoubleClick={() => onDoubleClick(repoPath, commit)}
     >
-      <div className="text-sm text-[var(--text-primary)] flex items-center gap-1 min-w-0">
-        {commitBranches.map((b) => (
-          <span
-            key={b.name}
-            className="inline-flex items-center shrink-0 text-[11px] leading-[18px] px-1.5 rounded font-medium"
-            style={{
-              backgroundColor: b.isHead
-                ? 'var(--color-accent, #58a6ff)'
-                : b.isRemote
-                  ? 'var(--border-subtle, #3d3d3d)'
-                  : 'rgba(63, 185, 80, 0.2)',
-              color: b.isHead
-                ? '#fff'
-                : b.isRemote
-                  ? 'var(--text-muted)'
-                  : 'rgb(63, 185, 80)',
-            }}
-            title={b.isRemote ? t('gitHistoryContent.remoteBranch', { name: b.name }) : b.isHead ? t('gitHistoryContent.currentBranch', { name: b.name }) : t('gitHistoryContent.localBranch', { name: b.name })}
-          >
-            {b.name}
-          </span>
-        ))}
-        <span className="truncate">{commit.message}</span>
-      </div>
-      <div className="text-xs text-[var(--text-muted)] flex items-center gap-1.5 mt-0.5">
-        <span>{commit.author}</span>
-        <span>&middot;</span>
-        <span>{formatRelativeTime(commit.timestamp)}</span>
-        <span>&middot;</span>
-        <span className="font-mono">{commit.shortHash}</span>
+      <CommitGraphCell row={row} width={graphWidth} />
+      <div className="flex-1 min-w-0 flex flex-col justify-center pl-1">
+        <div className="text-sm text-[var(--text-primary)] flex items-center gap-1 min-w-0">
+          {commitBranches.map((b) => (
+            <span
+              key={b.name}
+              className="inline-flex items-center shrink-0 text-sm leading-[18px] px-1.5 rounded font-medium"
+              style={{
+                backgroundColor: b.isHead
+                  ? 'var(--color-accent, #58a6ff)'
+                  : b.isRemote
+                    ? 'var(--border-subtle, #3d3d3d)'
+                    : 'rgba(63, 185, 80, 0.2)',
+                color: b.isHead
+                  ? '#fff'
+                  : b.isRemote
+                    ? 'var(--text-muted)'
+                    : 'rgb(63, 185, 80)',
+              }}
+              title={b.isRemote ? t('gitHistoryContent.remoteBranch', { name: b.name }) : b.isHead ? t('gitHistoryContent.currentBranch', { name: b.name }) : t('gitHistoryContent.localBranch', { name: b.name })}
+            >
+              {b.name}
+            </span>
+          ))}
+          <span className="truncate">{commit.message}</span>
+        </div>
+        <div className="text-xs text-[var(--text-muted)] flex items-center gap-1.5 mt-0.5">
+          <span className="truncate max-w-[140px]">{commit.author}</span>
+          <span>&middot;</span>
+          <span className="shrink-0">{formatRelativeTime(commit.timestamp)}</span>
+          <span>&middot;</span>
+          <span className="font-mono shrink-0">{commit.shortHash}</span>
+        </div>
       </div>
     </div>
+  );
+});
+
+/** 一个仓库的 commit 列表——拓扑图布局在这里按整份列表统一计算 */
+const RepoCommitList = memo(function RepoCommitList({
+  commits,
+  allBranches,
+  viewBranch,
+  depth,
+  repoPath,
+  onContextMenu,
+  onDoubleClick,
+}: {
+  commits: GitCommitInfo[];
+  allBranches: BranchInfo[];
+  /** 正在查看(未 checkout)的分支名;undefined = 跟随 HEAD */
+  viewBranch?: string;
+  depth: number;
+  repoPath: string;
+  onContextMenu: (e: React.MouseEvent, repoPath: string, commit: GitCommitInfo) => void;
+  onDoubleClick: (repoPath: string, commit: GitCommitInfo) => void;
+}) {
+  const graph = useMemo(() => computeGitGraph(commits), [commits]);
+  // 只标注本仓库/worktree 自己检出的分支(以及正在查看的分支)。
+  // worktree 与主仓库共享 refs,标出全部分支会把其他工作区的分支、
+  // 远程分支全挂到 commit 上,看起来像本工作区持有它们。
+  const shownBranches = useMemo(
+    () => allBranches.filter((b) => b.isHead || b.name === viewBranch),
+    [allBranches, viewBranch],
+  );
+  return (
+    <>
+      {commits.map((commit, i) => (
+        <CommitItem
+          key={commit.hash}
+          commit={commit}
+          allBranches={shownBranches}
+          depth={depth}
+          repoPath={repoPath}
+          row={graph.rows[i]}
+          graphWidth={graph.width}
+          onContextMenu={onContextMenu}
+          onDoubleClick={onDoubleClick}
+        />
+      ))}
+    </>
   );
 });
 
@@ -186,9 +312,11 @@ interface GitHistoryContentProps {
   projectPath: string;
   repos: GitRepoInfo[];
   refreshRepos: () => void;
+  /** 打开某仓库的 Worktree 管理弹窗(仓库行右键菜单进入) */
+  onOpenWorktrees: (repoPath: string) => void;
 }
 
-export function GitHistoryContent({ projectPath, repos, refreshRepos }: GitHistoryContentProps) {
+export function GitHistoryContent({ projectPath, repos, refreshRepos, onOpenWorktrees }: GitHistoryContentProps) {
   const t = useT();
   const [expandedRepos, setExpandedRepos] = useState<Set<string>>(new Set());
   const [repoStates, setRepoStates] = useState<Map<string, RepoState>>(new Map());
@@ -263,10 +391,19 @@ export function GitHistoryContent({ projectPath, repos, refreshRepos }: GitHisto
         setRepoStates((prev) => {
           const next = new Map(prev);
           const cur = next.get(repoPath) ?? { commits: [], loading: false, hasMore: true };
+          // 分页是从上一页末尾 commit 的 parent 重新 revwalk 的，有分支时会带回
+          // 已经加载过的 commit。重复 hash 会让拓扑图的连线算错，按 hash 去重；
+          // 若整页都是重复的则停止分页，避免用同一个游标反复请求。
+          let merged = commits;
+          if (beforeCommit) {
+            const seen = new Set(cur.commits.map((c) => c.hash));
+            merged = [...cur.commits, ...commits.filter((c) => !seen.has(c.hash))];
+          }
           next.set(repoPath, {
-            commits: beforeCommit ? [...cur.commits, ...commits] : commits,
+            commits: merged,
             loading: false,
-            hasMore: commits.length >= 30,
+            hasMore:
+              commits.length >= 30 && (!beforeCommit || merged.length > cur.commits.length),
           });
           return next;
         });
@@ -368,6 +505,35 @@ export function GitHistoryContent({ projectPath, repos, refreshRepos }: GitHisto
     document.addEventListener('mousedown', handleClick);
     return () => document.removeEventListener('mousedown', handleClick);
   }, [branchDropdownOpen]);
+
+  // 仓库行右键菜单:在终端打开 / Worktree 管理
+  const handleRepoContextMenu = useCallback(
+    (e: React.MouseEvent, repo: GitRepoInfo) => {
+      e.preventDefault();
+      e.stopPropagation();
+      showContextMenu(e.clientX, e.clientY, [
+        {
+          label: t('gitHistoryContent.openInTerminal'),
+          onClick: () => {
+            const projectId = useAppStore.getState().activeProjectId;
+            if (!projectId) return;
+            // 项目根仓库不必带 cwd 覆盖(默认就是项目根);子仓库/worktree 才需要
+            const isProjectRoot = repo.path.replace(/[\\/]+$/, '') === projectPath.replace(/[\\/]+$/, '');
+            void newTerminal(projectId, undefined, isProjectRoot ? undefined : {
+              cwd: repo.path,
+              title: repo.isWorktree ? `⎇ ${repo.currentBranch ?? repo.name}` : repo.name,
+            });
+          },
+        },
+        { separator: true },
+        {
+          label: t('gitHistoryContent.manageWorktrees'),
+          onClick: () => onOpenWorktrees(repo.path),
+        },
+      ]);
+    },
+    [projectPath, onOpenWorktrees, t],
+  );
 
   const handleCommitContextMenu = useCallback(
     (e: React.MouseEvent, repoPath: string, commit: GitCommitInfo) => {
@@ -482,10 +648,11 @@ export function GitHistoryContent({ projectPath, repos, refreshRepos }: GitHisto
               className="group flex items-center justify-between w-full py-[5px] cursor-pointer hover:bg-[var(--border-subtle)] rounded-[var(--radius-sm)] text-base transition-colors duration-100 text-[var(--color-folder)]"
               style={{ paddingLeft: `${depth * 16 + 8}px`, paddingRight: '8px' }}
               onClick={() => toggleRepo(repo.path)}
+              onContextMenu={(e) => handleRepoContextMenu(e, repo)}
             >
               <div className="flex items-center gap-1 min-w-0">
                 <span
-                  className="text-[13px] w-3 text-center text-[var(--text-muted)] transition-transform duration-150"
+                  className="text-base w-3 text-center text-[var(--text-muted)] transition-transform duration-150"
                   style={{
                     transform: isExpanded ? 'rotate(0deg)' : 'rotate(-90deg)',
                     display: 'inline-block',
@@ -494,6 +661,14 @@ export function GitHistoryContent({ projectPath, repos, refreshRepos }: GitHisto
                   &#9662;
                 </span>
                 <span className="truncate font-medium">{node.name}</span>
+                {repo.isWorktree && (
+                  <span
+                    className="shrink-0 text-sm text-[var(--text-muted)]"
+                    title={t('gitHistoryContent.worktreeBadgeTitle')}
+                  >
+                    ⎇
+                  </span>
+                )}
                 {repo.currentBranch && (() => {
                   const viewing = viewBranches.get(repo.path);
                   const displayBranch = viewing ?? repo.currentBranch;
@@ -505,7 +680,7 @@ export function GitHistoryContent({ projectPath, repos, refreshRepos }: GitHisto
                       ref={dropdownOpen ? branchDropdownRef : null}
                     >
                       <span
-                        className={`inline-flex items-center gap-0.5 text-[11px] leading-[18px] px-1.5 rounded font-mono cursor-pointer transition-colors ${
+                        className={`inline-flex items-center gap-0.5 text-sm leading-[18px] px-1.5 rounded font-mono cursor-pointer transition-colors ${
                           isViewingOther
                             ? 'text-[var(--color-accent,#58a6ff)] bg-[rgba(88,166,255,0.15)] hover:bg-[rgba(88,166,255,0.25)]'
                             : 'text-[var(--text-muted)] bg-[var(--border-subtle)] hover:bg-[var(--color-accent,#58a6ff)] hover:text-white'
@@ -526,7 +701,7 @@ export function GitHistoryContent({ projectPath, repos, refreshRepos }: GitHisto
                         }}
                       >
                         <span className="truncate max-w-[200px]">{displayBranch}</span>
-                        <span className="text-[9px] opacity-70">▾</span>
+                        <span className="text-[0.7rem] opacity-70">▾</span>
                       </span>
                       {dropdownOpen && (
                         <div
@@ -559,7 +734,7 @@ export function GitHistoryContent({ projectPath, repos, refreshRepos }: GitHisto
                                   />
                                   <span className="truncate font-mono flex-1">{b.name}</span>
                                   {b.name === repo.currentBranch && (
-                                    <span className="shrink-0 text-[9px] px-1 rounded bg-[var(--color-accent,#58a6ff)] text-white font-medium">HEAD</span>
+                                    <span className="shrink-0 text-[0.7rem] px-1 rounded bg-[var(--color-accent,#58a6ff)] text-white font-medium">HEAD</span>
                                   )}
                                 </div>
                               );
@@ -603,17 +778,17 @@ export function GitHistoryContent({ projectPath, repos, refreshRepos }: GitHisto
 
           {isExpanded && (
             <div className="relative" style={{ zIndex: 0 }}>
-              {state?.commits.map((commit) => (
-                <CommitItem
-                  key={commit.hash}
-                  commit={commit}
+              {state && state.commits.length > 0 && (
+                <RepoCommitList
+                  commits={state.commits}
                   allBranches={repoBranches.get(repo.path) ?? EMPTY_BRANCHES}
+                  viewBranch={viewBranches.get(repo.path)}
                   depth={depth}
                   repoPath={repo.path}
                   onContextMenu={handleCommitContextMenu}
                   onDoubleClick={handleViewDiff}
                 />
-              ))}
+              )}
 
               {state?.loading && (
                 <div className="text-center text-[var(--text-muted)] text-xs py-2">
@@ -653,7 +828,7 @@ export function GitHistoryContent({ projectPath, repos, refreshRepos }: GitHisto
             }}
           >
             <span
-              className="text-[13px] w-3 text-center transition-transform duration-150"
+              className="text-base w-3 text-center transition-transform duration-150"
               style={{ transform: isDirExpanded ? 'rotate(0deg)' : 'rotate(-90deg)', display: 'inline-block' }}
             >
               ▾

@@ -1,6 +1,5 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import type { MouseEvent as ReactMouseEvent, ReactNode } from 'react';
-import { createPortal } from 'react-dom';
 import { invoke, convertFileSrc } from '@tauri-apps/api/core';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import ReactMarkdown from 'react-markdown';
@@ -8,6 +7,7 @@ import remarkGfm from 'remark-gfm';
 import rehypeRaw from 'rehype-raw';
 import type { FileContentResult } from '../types';
 import { openExternalUrl } from '../utils/externalLink';
+import { Modal } from './Modal';
 import { useT } from '../i18n';
 
 interface FileViewerModalProps {
@@ -209,21 +209,30 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
     if (contentRef.current) contentRef.current.scrollTop = 0;
   }, [currentPath]);
 
-  useEffect(() => {
+useEffect(() => {
+    // 1. 处理滚动重置 (只要 editing 变化就执行)
     if (contentRef.current) contentRef.current.scrollTop = 0;
     if (editLineNumbersRef.current) editLineNumbersRef.current.scrollTop = 0;
-  }, [editing]);
 
-  useEffect(() => {
+    // 2. 处理键盘事件监听 (只有 open 为 true 时才添加)
     if (!open) return;
+
     const handleKeyDown = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's' && editing) { e.preventDefault(); void handleSave(); }
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's' && editing) { 
+          e.preventDefault(); 
+          void handleSave(); 
+      }
       else if (e.key === 'Escape') handleClose();
     };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [editing, handleClose, handleSave, open]);
 
+    window.addEventListener('keydown', handleKeyDown);
+
+    // 清理函数：移除事件监听器
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+
+}, [editing, open, handleClose, handleSave]);
   // 仅当查看的是原始 filePath 时才高亮跳转行
   useEffect(() => {
     if (currentPath === filePath && result && highlightLine && highlightRef.current) {
@@ -245,14 +254,9 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
     setPreview(false);
   };
 
-  return createPortal(
-    <div className="fixed inset-0 z-50 flex items-center justify-center select-text" onClick={onClose}>
-      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
-      <div
-        className="relative flex flex-col overflow-hidden bg-[var(--bg-surface)] border border-[var(--border-strong)] rounded-[var(--radius-md)] shadow-[var(--shadow-overlay)] animate-slide-in"
-        style={{ width: '90vw', height: '80vh' }}
-        onClick={(e) => e.stopPropagation()}
-      >
+  return (
+    <Modal open={open} onClose={onClose} align="center" ariaLabel={fileName}
+      panelClassName="w-[90vw] h-[80vh] select-text">
         {/* 工具栏 */}
         <div className="flex items-center justify-between px-4 py-3 border-b border-[var(--border-subtle)] flex-shrink-0">
           <div className="flex items-center gap-2 min-w-0">
@@ -421,8 +425,6 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
             </div>
           )}
         </div>
-      </div>
-    </div>,
-    document.body,
+    </Modal>
   );
 }

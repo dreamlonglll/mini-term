@@ -216,6 +216,8 @@ pub struct GitRepoInfo {
     pub name: String,
     pub path: String,
     pub current_branch: Option<String>,
+    /// 该条目是不是某个主仓库的 linked worktree(前端据此显示 ⎇ 标识)
+    pub is_worktree: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -227,6 +229,8 @@ pub struct GitCommitInfo {
     pub body: Option<String>,
     pub author: String,
     pub timestamp: i64,
+    /// 全部父提交 hash（按 git 顺序：第 0 个是主线父）。前端据此绘制分支拓扑图。
+    pub parent_hashes: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -244,36 +248,6 @@ pub struct BranchInfo {
     pub is_head: bool,
     pub is_remote: bool,
     pub commit_hash: String,
-}
-
-/// 给定一个主仓库,收集它的所有 git worktree 作为独立仓库条目。
-/// 失效(路径不存在 / 无法 open)的 worktree 会被静默跳过。
-fn collect_worktrees_of(repo: &Repository) -> Vec<(String, PathBuf, Repository)> {
-    let mut out = Vec::new();
-    let names = match repo.worktrees() {
-        Ok(n) => n,
-        Err(_) => return out,
-    };
-    for wt_name in names.iter().flatten() {
-        let wt = match repo.find_worktree(wt_name) {
-            Ok(w) => w,
-            Err(_) => continue,
-        };
-        let wt_path = wt.path().to_path_buf();
-        if !wt_path.exists() {
-            continue; // prune 后的 worktree 路径已失效
-        }
-        let wt_repo = match Repository::open_from_worktree(&wt) {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        let display_name = wt_path
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| wt_name.to_string());
-        out.push((display_name, wt_path, wt_repo));
-    }
-    out
 }
 
 const MAX_DISCOVER_PARENTS: usize = 5;
@@ -300,6 +274,12 @@ static REPO_PATH_CACHE: std::sync::LazyLock<
 > = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 const REPO_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// worktree 增删/清理之后调用:仓库集合已变,让所有项目的发现缓存立即失效,
+/// 否则 History/Changes 面板要等 TTL 过期才能看到新条目。
+fn invalidate_repo_cache() {
+    REPO_PATH_CACHE.lock().unwrap().clear();
+}
 
 fn find_repos_cached_paths(project_path: &Path) -> Vec<RepoPathEntry> {
     let key = project_path.to_path_buf();
@@ -349,21 +329,13 @@ fn discover_repo_paths(project_path: &Path) -> Vec<RepoPathEntry> {
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| "root".to_string());
-            for wt in collect_worktrees_of(&repo) {
-                entries.push(RepoPathEntry {
-                    name: wt.0,
-                    path: wt.1,
-                    is_worktree: true,
-                });
-            }
-            entries.insert(
-                0,
-                RepoPathEntry {
-                    name,
-                    path: repo_root,
-                    is_worktree: false,
-                },
-            );
+            // 每个项目只展示自己工作区的仓库,不再把关联 worktree 注入为独立条目——
+            // worktree 通过「设为项目」拥有自己的 Git 面板,这里再列一遍就是重复。
+            entries.push(RepoPathEntry {
+                name,
+                path: repo_root,
+                is_worktree: repo.is_worktree(),
+            });
             return entries;
         }
     }
@@ -403,18 +375,13 @@ fn discover_repo_paths(project_path: &Path) -> Vec<RepoPathEntry> {
                             .file_name()
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_default();
+                        // 物理上在项目目录内的 worktree 才会走到这里(作为子目录仓库),
+                        // 项目目录外的关联 worktree 不再注入
                         entries.push(RepoPathEntry {
                             name,
                             path: sub,
-                            is_worktree: false,
+                            is_worktree: repo.is_worktree(),
                         });
-                        for wt in collect_worktrees_of(&repo) {
-                            entries.push(RepoPathEntry {
-                                name: wt.0,
-                                path: wt.1,
-                                is_worktree: true,
-                            });
-                        }
                         continue;
                     }
                 }
@@ -427,14 +394,14 @@ fn discover_repo_paths(project_path: &Path) -> Vec<RepoPathEntry> {
 }
 
 /// Scan project_path for git repositories.
-/// 除了项目自身 / 子目录下直接可见的仓库,还会把每个主仓库关联的 git worktree
-/// 作为独立条目加入,这样 History / Changes 面板就能看到并切换 worktree。
-fn find_repos(project_path: &Path) -> Vec<(String, PathBuf, Repository)> {
+/// 只收集项目自身 / 子目录下物理可见的仓库;项目目录外的关联 worktree 不注入——
+/// 它们经「设为项目」成为独立项目后,有自己的 History / Changes 面板。
+fn find_repos(project_path: &Path) -> Vec<(String, PathBuf, Repository, bool)> {
     let cached_paths = find_repos_cached_paths(project_path);
     let mut repos = Vec::new();
     for entry in cached_paths {
         if let Ok(repo) = Repository::open(&entry.path) {
-            repos.push((entry.name, entry.path, repo));
+            repos.push((entry.name, entry.path, repo, entry.is_worktree));
         }
     }
     repos
@@ -450,7 +417,7 @@ pub fn get_git_status(project_path: String) -> Result<Vec<GitFileStatus>, String
     }
 
     let mut all = Vec::new();
-    for (_, _, repo) in &repos {
+    for (_, _, repo, _) in &repos {
         if let Ok(mut files) = collect_repo_status(repo, Some(path)) {
             all.append(&mut files);
         }
@@ -518,7 +485,7 @@ pub fn discover_git_repos(project_path: String) -> Result<Vec<GitRepoInfo>, Stri
     let repos = find_repos(path);
     Ok(repos
         .into_iter()
-        .map(|(name, abs_path, repo)| {
+        .map(|(name, abs_path, repo, is_worktree)| {
             let current_branch = repo.head().ok().and_then(|h| {
                 if h.is_branch() {
                     h.shorthand().map(|s| s.to_string())
@@ -534,6 +501,7 @@ pub fn discover_git_repos(project_path: String) -> Result<Vec<GitRepoInfo>, Stri
                 name,
                 path: abs_path.to_string_lossy().to_string(),
                 current_branch,
+                is_worktree,
             }
         })
         .collect())
@@ -551,8 +519,10 @@ pub fn get_git_log(
     let limit = limit.unwrap_or(30);
 
     let mut revwalk = repo.revwalk().map_err(|e| e.to_string())?;
+    // 加 TOPOLOGICAL：保证父提交永远排在子提交之后，否则时钟偏移/rebase 后的仓库
+    // 会出现父在子之前，前端拓扑图的连线就会断。
     revwalk
-        .set_sorting(git2::Sort::TIME)
+        .set_sorting(git2::Sort::TIME | git2::Sort::TOPOLOGICAL)
         .map_err(|e| e.to_string())?;
 
     if let Some(ref hash) = before_commit {
@@ -591,6 +561,7 @@ pub fn get_git_log(
         let body = commit.body().map(|s| s.to_string());
         let author = commit.author().name().unwrap_or("unknown").to_string();
         let timestamp = commit.time().seconds();
+        let parent_hashes = commit.parent_ids().map(|id| id.to_string()).collect();
         result.push(GitCommitInfo {
             hash,
             short_hash,
@@ -598,6 +569,7 @@ pub fn get_git_log(
             body,
             author,
             timestamp,
+            parent_hashes,
         });
     }
 
@@ -1137,27 +1109,33 @@ fn hide_console_window(_cmd: &mut std::process::Command) {
     }
 }
 
-/// git pull / git push 的共享执行器:
+/// 通用 git CLI 执行器(pull/push/worktree 系列共用):
 /// - 校验 `repo_path` 是目录并且包含 `.git`(避免在任意目录上跑 git)
 /// - 在独立线程里 spawn git 进程,通过 mpsc 回传 output
 /// - `recv_timeout` 到达上限后立即返回超时错误(子进程会被 drop,
 ///   虽然不保证立刻 kill,但主线程不再被阻塞)
-fn run_git_network_command(repo_path: &str, op: &'static str) -> Result<String, String> {
-    const GIT_NET_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
+fn run_git_command(
+    repo_path: &str,
+    args: &[&str],
+    timeout: Duration,
+    timeout_hint: &str,
+) -> Result<String, String> {
     let repo = Path::new(repo_path);
     if !repo.is_dir() {
         return Err(format!("不是有效目录:{}", repo_path));
     }
+    // worktree 目录下 `.git` 是文件而非目录,exists() 两者皆真
     if !repo.join(".git").exists() {
         return Err(format!("不是 git 仓库(缺少 .git):{}", repo_path));
     }
 
+    let op = args.join(" ");
     let (tx, rx) = std::sync::mpsc::channel();
     let repo_path_owned = repo_path.to_string();
+    let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
     std::thread::spawn(move || {
         let mut cmd = std::process::Command::new("git");
-        cmd.arg(op)
+        cmd.args(&args_owned)
             .current_dir(&repo_path_owned)
             .stdin(std::process::Stdio::null());
         hide_console_window(&mut cmd);
@@ -1166,7 +1144,7 @@ fn run_git_network_command(repo_path: &str, op: &'static str) -> Result<String, 
         let _ = tx.send(result);
     });
 
-    match rx.recv_timeout(GIT_NET_TIMEOUT) {
+    match rx.recv_timeout(timeout) {
         Ok(Ok(output)) => {
             if output.status.success() {
                 Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -1176,12 +1154,22 @@ fn run_git_network_command(repo_path: &str, op: &'static str) -> Result<String, 
         }
         Ok(Err(e)) => Err(format!("启动 git {} 失败:{}", op, e)),
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(format!(
-            "git {} 超时({}s),可能在等待凭证或网络故障。请确认已配置凭证管理器或 SSH key",
+            "git {} 超时({}s){}",
             op,
-            GIT_NET_TIMEOUT.as_secs()
+            timeout.as_secs(),
+            timeout_hint
         )),
         Err(e) => Err(format!("git {} 通信错误:{}", op, e)),
     }
+}
+
+fn run_git_network_command(repo_path: &str, op: &'static str) -> Result<String, String> {
+    run_git_command(
+        repo_path,
+        &[op],
+        Duration::from_secs(30),
+        ",可能在等待凭证或网络故障。请确认已配置凭证管理器或 SSH key",
+    )
 }
 
 // 必须用 `(async)`:Tauri 的同步 `#[tauri::command]` 会在主线程(WebView 事件循环)上执行,
@@ -1357,4 +1345,196 @@ pub fn git_discard_file(repo_path: String, files: Vec<String>) -> Result<(), Str
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Worktree 管理
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeInfo {
+    pub name: String,
+    pub path: String,
+    /// HEAD 所在分支;detached / 失效条目为 None
+    pub branch: Option<String>,
+    pub is_main: bool,
+    /// 目录还在且元数据能通过校验;false = 可被 prune 的失效条目
+    pub is_valid: bool,
+    pub is_locked: bool,
+}
+
+/// 去掉路径尾部分隔符:git2 的 workdir() 带尾杠,而项目配置里的路径不带,
+/// 统一后前端才能做「该 worktree 是否已是项目」的对比。
+fn display_path(p: &Path) -> String {
+    let s = p.to_string_lossy();
+    s.trim_end_matches(['/', '\\']).to_string()
+}
+
+fn head_branch(repo: &Repository) -> Option<String> {
+    repo.head().ok().and_then(|h| {
+        if h.is_branch() {
+            h.shorthand().map(|s| s.to_string())
+        } else {
+            None
+        }
+    })
+}
+
+/// 列出某仓库的主工作区 + 全部 linked worktree(含失效条目,供管理面板展示与清理)。
+/// 从 worktree 路径调用同样可行:元数据都在主仓库 .git/worktrees 下。
+#[tauri::command]
+pub fn list_worktrees(repo_path: String) -> Result<Vec<WorktreeInfo>, String> {
+    let repo = Repository::open(Path::new(&repo_path)).map_err(|e| e.to_string())?;
+    // 从 linked worktree 打开时回到主仓库:linked worktree 的 gitdir 形如
+    // `<main>/.git/worktrees/<name>`,上溯两级即主仓库 .git(git2 0.19 未暴露 commondir)
+    let main_repo = if repo.is_worktree() {
+        let git_dir = repo.path().to_path_buf();
+        let main_git = git_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .ok_or_else(|| "无法定位主仓库".to_string())?;
+        Repository::open(main_git).map_err(|e| e.to_string())?
+    } else {
+        repo
+    };
+
+    let mut out = Vec::new();
+    if let Some(workdir) = main_repo.workdir() {
+        let name = workdir
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "main".to_string());
+        out.push(WorktreeInfo {
+            name,
+            path: display_path(workdir),
+            branch: head_branch(&main_repo),
+            is_main: true,
+            is_valid: true,
+            is_locked: false,
+        });
+    }
+
+    if let Ok(names) = main_repo.worktrees() {
+        for wt_name in names.iter().flatten() {
+            let wt = match main_repo.find_worktree(wt_name) {
+                Ok(w) => w,
+                Err(_) => continue,
+            };
+            let wt_path = wt.path().to_path_buf();
+            let is_valid = wt_path.exists() && wt.validate().is_ok();
+            let is_locked = matches!(
+                wt.is_locked(),
+                Ok(git2::WorktreeLockStatus::Locked(_))
+            );
+            let branch = if is_valid {
+                Repository::open_from_worktree(&wt)
+                    .ok()
+                    .and_then(|r| head_branch(&r))
+            } else {
+                None
+            };
+            out.push(WorktreeInfo {
+                name: wt_name.to_string(),
+                path: display_path(&wt_path),
+                branch,
+                is_main: false,
+                is_valid,
+                is_locked,
+            });
+        }
+    }
+
+    Ok(out)
+}
+
+/// 新建 worktree。`create_branch=true` 时以 `base`(缺省 HEAD)为起点建新分支,
+/// 否则检出已有分支(该分支不能已被其他工作区持有,git 会给出明确报错)。
+/// 大仓库的首次 checkout 可能较慢,超时给到 120s。
+#[tauri::command(async)]
+pub fn add_worktree(
+    repo_path: String,
+    worktree_path: String,
+    branch: String,
+    create_branch: bool,
+    base: Option<String>,
+) -> Result<String, String> {
+    let mut args: Vec<&str> = vec!["worktree", "add"];
+    if create_branch {
+        args.push("-b");
+        args.push(&branch);
+        args.push(&worktree_path);
+        if let Some(ref b) = base {
+            if !b.is_empty() {
+                args.push(b);
+            }
+        }
+    } else {
+        args.push(&worktree_path);
+        args.push(&branch);
+    }
+    let result = run_git_command(
+        &repo_path,
+        &args,
+        Duration::from_secs(120),
+        ",大仓库 checkout 可能较慢,请稍后刷新查看",
+    );
+    if result.is_ok() {
+        invalidate_repo_cache();
+    }
+    result
+}
+
+/// 删除 worktree(工作目录 + 主仓库里的元数据)。
+/// 有未提交改动 / 已锁定时 git 会拒绝,`force=true` 对应 `--force` 强制删除。
+#[tauri::command(async)]
+pub fn remove_worktree(
+    repo_path: String,
+    worktree_path: String,
+    force: bool,
+) -> Result<String, String> {
+    let mut args: Vec<&str> = vec!["worktree", "remove"];
+    if force {
+        args.push("--force");
+    }
+    args.push(&worktree_path);
+    let result = run_git_command(&repo_path, &args, Duration::from_secs(60), "");
+    if result.is_ok() {
+        invalidate_repo_cache();
+    }
+    result
+}
+
+/// 清理失效的 worktree 元数据(目录已被手动删除的条目)。
+#[tauri::command(async)]
+pub fn prune_worktrees(repo_path: String) -> Result<String, String> {
+    let result = run_git_command(
+        &repo_path,
+        &["worktree", "prune"],
+        Duration::from_secs(30),
+        "",
+    );
+    if result.is_ok() {
+        invalidate_repo_cache();
+    }
+    result
+}
+
+/// 批量判断路径是否 linked worktree,是则返回其分支名(项目列表 ⎇ 徽章用)。
+/// UNC 路径(WSL 项目)直接跳过:git2 对网络路径的探测慢且徽章意义不大。
+#[tauri::command]
+pub fn get_worktree_branches(paths: Vec<String>) -> Vec<Option<String>> {
+    paths
+        .into_iter()
+        .map(|p| {
+            if p.starts_with(r"\\") {
+                return None;
+            }
+            let repo = Repository::open(Path::new(&p)).ok()?;
+            if !repo.is_worktree() {
+                return None;
+            }
+            head_branch(&repo)
+        })
+        .collect()
 }

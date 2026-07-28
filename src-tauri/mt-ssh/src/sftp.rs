@@ -165,6 +165,85 @@ impl SftpHandle {
         Ok(out)
     }
 
+    /// 逐级创建远程目录(`mkdir -p` 语义)。`path` 必须是 POSIX 绝对路径。
+    ///
+    /// SFTP 协议没有递归 mkdir,只能自顶向下逐级 `create_dir`。中间层已存在时
+    /// server 回 FAILURE —— 这里一律忽略逐级错误,**成功与否只由最后的 stat 判定**
+    /// (存在且是目录 = 成功),否则「目录已存在」会被误报成失败。
+    ///
+    /// 快路径:先 stat 整条路径,已是目录直接返回(重复粘贴只花 1 次往返)。
+    pub async fn create_dir_all(&self, path: &str) -> Result<(), SftpTransferError> {
+        let trimmed = path.trim_end_matches('/');
+        if trimmed.is_empty() {
+            return Ok(()); // 根目录必然存在
+        }
+        if !trimmed.starts_with('/') {
+            return Err(SftpTransferError::Sftp(format!(
+                "create_dir_all 需要绝对路径,收到 '{path}'"
+            )));
+        }
+        // 快路径:已存在且是目录就不用逐级建。
+        if let Ok(meta) = self.sftp.metadata(trimmed).await {
+            return if meta.file_type().is_dir() {
+                Ok(())
+            } else {
+                Err(SftpTransferError::Sftp(format!(
+                    "远程路径 '{trimmed}' 已存在且不是目录"
+                )))
+            };
+        }
+        let mut prefix = String::new();
+        for seg in trimmed.split('/').filter(|s| !s.is_empty()) {
+            prefix.push('/');
+            prefix.push_str(seg);
+            // 已存在 / 无权限的层级都在这里失败,交给下方 stat 定论。
+            let _ = self.sftp.create_dir(prefix.clone()).await;
+        }
+        match self.sftp.metadata(trimmed).await {
+            Ok(meta) if meta.file_type().is_dir() => Ok(()),
+            Ok(_) => Err(SftpTransferError::Sftp(format!(
+                "远程路径 '{trimmed}' 已存在且不是目录"
+            ))),
+            Err(e) => Err(SftpTransferError::Sftp(format!(
+                "创建远程目录 '{trimmed}' 失败: {e}"
+            ))),
+        }
+    }
+
+    /// 写一个**仅当不存在时才创建**的小文件(CREATE|EXCLUDE 语义)。
+    ///
+    /// 已存在时 server 回 FAILURE,调用方按「无需重写」处理即可 —— 这正是
+    /// 幂等写标记文件(如自忽略的 `.gitignore`)想要的语义:一次往返,不用先 stat。
+    ///
+    /// 只用于小内容:全量 `write_all`,不分块。
+    pub async fn write_new_file(
+        &self,
+        path: &str,
+        contents: &[u8],
+    ) -> Result<(), SftpTransferError> {
+        use russh_sftp::protocol::OpenFlags;
+        use tokio::io::AsyncWriteExt;
+
+        let mut file = self
+            .sftp
+            .open_with_flags(
+                path,
+                OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::EXCLUDE,
+            )
+            .await
+            .map_err(|e| SftpTransferError::Sftp(format!("sftp create '{path}' failed: {e}")))?;
+        file.write_all(contents)
+            .await
+            .map_err(|e| SftpTransferError::Sftp(format!("sftp write '{path}' failed: {e}")))?;
+        file.flush()
+            .await
+            .map_err(|e| SftpTransferError::Sftp(format!("sftp flush '{path}' failed: {e}")))?;
+        file.shutdown()
+            .await
+            .map_err(|e| SftpTransferError::Sftp(format!("sftp close '{path}' failed: {e}")))?;
+        Ok(())
+    }
+
     /// 显式关闭 SFTP 会话(best-effort;drop 也会关底层 channel)。
     pub async fn close(self) {
         let _ = self.sftp.close().await;

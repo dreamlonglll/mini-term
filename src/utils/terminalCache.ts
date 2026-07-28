@@ -12,6 +12,7 @@ import { Terminal, type IMarker, type IDecoration } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebglAddon } from '@xterm/addon-webgl';
 import { LigaturesAddon } from '@xterm/addon-ligatures';
+import type { SearchAddon } from '@xterm/addon-search';
 import { activateUnicodeWidth } from './terminalUnicodeWidth';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
@@ -21,6 +22,8 @@ import type { PtyOutputPayload } from '../types';
 import { getResolvedTheme } from './themeManager';
 import { createPtyWriteQueue } from './ptyWriteQueue';
 import { getCurrentLineSnapshotFromBuffer } from './terminalSnapshot';
+import { resolvePasteTarget, mapPastedFilePath, type PasteTarget } from './pastePath';
+import { t } from '../i18n';
 
 export interface CachedTerminal {
   term: Terminal;
@@ -41,6 +44,9 @@ interface CachedEntry extends CachedTerminal {
   webglLoaded: boolean;
   webglAddon?: WebglAddon;
   ligaturesAddon?: LigaturesAddon;
+  /** 终端内查找的 addon，首次 Ctrl+F 时由 terminalSearch.ts 懒加载。
+   *  不需要单独回收：term.dispose() 会连带 dispose 所有已加载 addon。 */
+  searchAddon?: SearchAddon;
 }
 
 export const DARK_TERMINAL_THEME = {
@@ -285,6 +291,9 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
     letterSpacing: 0,
     lineHeight: 1.35,
     theme,
+    // 前景/背景对比度不足时自动提亮前景（WCAG AA）。Claude Code 的 AskUserQuestion
+    // 提问行用近黑前景，在暗色主题下与背景几乎同色，不选中看不见；VS Code 同为 4.5。
+    minimumContrastRatio: 4.5,
     // LigaturesAddon 内部用 registerCharacterJoiner（xterm.js proposed API），
     // 不开启 allowProposedApi 加载 addon 会抛 "You must set the allowProposedApi option to true"。
     allowProposedApi: true,
@@ -300,18 +309,21 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
 
   term.open(wrapper);
 
-  // 拦截 alternate screen 切换（DECSET/DECRST 47, 1047, 1049）：
-  // 阻止 TUI 程序进入备用缓冲区，让所有输出留在主缓冲区，
-  // 保持 scrollback 和滚动条可用。codex 等 TUI 的清屏/重绘
-  // 仅影响可视区域，scrollback 历史不受影响。
-  const isAltScreenMode = (p: number | number[]) => {
-    const v = typeof p === 'number' ? p : p[0];
-    return v === 47 || v === 1047 || v === 1049;
-  };
-  term.parser.registerCsiHandler({ final: 'h', prefix: '?' }, (params) =>
-    params.some(isAltScreenMode));
-  term.parser.registerCsiHandler({ final: 'l', prefix: '?' }, (params) =>
-    params.some(isAltScreenMode));
+  // 这里曾拦截 alternate screen 切换(DECSET/DECRST 47/1047/1049),把 TUI 输出摁在
+  // 主缓冲区以保住 scrollback。前提"TUI 的清屏/重绘仅影响可视区域"只在一帧不高于
+  // 窗口时成立,而 AI TUI 的界面经常比窗口高:
+  //   Ink(Claude Code)每帧靠相对光标上移回到帧首再擦除(ESC[nA + ESC[J);
+  //   帧高 > rows 时上移被 clamp 在 viewport 顶部,够不到已滚进 scrollback 的那几行
+  //   → 擦不干净 → 重画 → 每帧都往 scrollback 落一段残留,越滚越多。
+  // tests/tuiScrollback.test.cjs 有 rows=4/帧高=6 的复现:4 帧画完留下 4 份帧头。
+  //
+  // 用户滚动时尤其明显:AI TUI 都开鼠标追踪,xterm 把 wheel 上报给 TUI 而不滚视口
+  // (Terminal._bindMouse 的 bit 16,同时 Viewport 置 handleMouseWheel:false),
+  // 于是每滚一次就触发一次额外整屏重绘,当场再灌一份残留。
+  //
+  // 现已放行:TUI 回到备用缓冲区原地重绘,重复消失,也是 Windows Terminal / iTerm
+  // 的标准行为。代价是 AI 运行期间没有 xterm scrollback,滚动由 TUI 自己承担
+  // (它本来就收得到滚轮);打点跳转的连带影响见 registerAiMarker。
 
   // 剪贴板快捷键
   term.attachCustomKeyEventHandler((e) => {
@@ -537,6 +549,16 @@ export function getCachedTerminal(ptyId: number): CachedTerminal | undefined {
   return cache.get(ptyId);
 }
 
+/** 终端内查找 addon 的存取（由 terminalSearch.ts 懒加载后寄存在此）。 */
+export function getSearchAddon(ptyId: number): SearchAddon | undefined {
+  return cache.get(ptyId)?.searchAddon;
+}
+
+export function setSearchAddon(ptyId: number, addon: SearchAddon): void {
+  const entry = cache.get(ptyId);
+  if (entry) entry.searchAddon = addon;
+}
+
 /** 彻底销毁终端（面板关闭 / kill_pty 后调用） */
 export function disposeTerminal(ptyId: number): void {
   const entry = cache.get(ptyId);
@@ -551,6 +573,10 @@ export function disposeTerminal(ptyId: number): void {
 export function registerAiMarker(ptyId: number): IMarker | null {
   const cached = getCachedTerminal(ptyId);
   if (!cached) return null;
+  // 备用缓冲区里打点没有意义,直接跳过:alt buffer 没有 scrollback 可滚,
+  // 且 BufferSet.activateNormalBuffer() 退出时会 clearAllMarkers() 全部清掉。
+  // 放行 alt screen(见 getOrCreateTerminal)后,走 TUI 的 AI 基本都落在这个分支。
+  if (cached.term.buffer.active.type === 'alternate') return null;
   // -1:Enter 回显后光标已换行到下一行,取上一行即用户输入行本身
   const marker = cached.term.registerMarker(-1);
   if (!marker) return null;
@@ -643,20 +669,66 @@ function isLongText(text: string, lineThreshold: number, charThreshold: number):
   return false;
 }
 
+/** 正在处理粘贴的 pty。远程上传要几百毫秒到几秒，这期间用户连按 Ctrl+V 会让
+ *  多条路径以完成顺序乱序插入命令行；直接丢弃重入的那次，语义上等同「还没粘完」。*/
+const pasteInFlight = new Set<number>();
+
+/** 上传/转换失败时弹一条提示（远程 pane 静默失败最难排查：粘进去的路径看着
+ *  没毛病，只有远端 agent 报「文件不存在」）。仅在有项目归属时能弹。 */
+function notifyPasteFailure(target: PasteTarget, err: unknown): void {
+  console.error('粘贴内容转存到远端失败:', err);
+  if (target.kind !== 'ssh') return;
+  const detail = err instanceof Error ? err.message : String(err);
+  useAppStore.getState().pushNotification({
+    projectId: target.projectId,
+    projectName: target.projectName,
+    kind: 'paste-error',
+    message: t('terminal.pasteUploadFailed', { detail }),
+  });
+}
+
 /** 读取系统剪贴板并写入终端 PTY。
  * - 剪贴板含图片 → 保存为 temp PNG，粘贴带引号的路径（兼容含空格路径）
  * - 文本超过配置阈值且开关开启 → 保存为 temp .txt，粘贴带引号的路径
  * - 否则直接粘贴文本
+ *
+ * 落盘路径都要先过 {@link mapPastedFilePath}：WSL pane 转 `/mnt/...`，
+ * SSH 远程 pane 走 SFTP 上传后粘远端路径（issue #36）。
  */
 export async function pasteToTerminal(ptyId: number): Promise<void> {
+  if (pasteInFlight.has(ptyId)) return;
+  pasteInFlight.add(ptyId);
+  try {
+    await pasteToTerminalInner(ptyId);
+  } finally {
+    pasteInFlight.delete(ptyId);
+  }
+}
+
+async function pasteToTerminalInner(ptyId: number): Promise<void> {
+  const target = resolvePasteTarget(ptyId);
+
   if (await clipboardHasImage()) {
     // 优先：Win32 API 读取图片保存为 temp PNG，粘贴文件路径
     // 兼容 PinPix 等 arboard 无法读取的非标准剪贴板格式
+    let localPath: string | null = null;
     try {
-      const path: string = await invoke('read_clipboard_image');
-      await enqueuePtyWrite(ptyId, `"${path}"`);
-      return;
+      localPath = await invoke<string>('read_clipboard_image');
     } catch { /* Win32 也读不到，回退 Alt+V */ }
+
+    if (localPath !== null) {
+      try {
+        const path = await mapPastedFilePath(localPath, target);
+        await enqueuePtyWrite(ptyId, `"${path}"`);
+        return;
+      } catch (e) {
+        // 上传失败：明确告知。此时回退 Alt+V 也没用（远端 agent 读的是远端
+        // 剪贴板），所以只提示、不往终端写任何东西。
+        notifyPasteFailure(target, e);
+        return;
+      }
+    }
+
     // 回退：发送 Alt+V 转义序列让 AI 工具自行处理
     await enqueuePtyWrite(ptyId, '\x1bv');
     return;
@@ -672,10 +744,16 @@ export async function pasteToTerminal(ptyId: number): Promise<void> {
   // 长文本：转存临时文件，粘贴路径；失败则回退到直接粘贴
   if (enabled && isLongText(text, lineThreshold, charThreshold)) {
     try {
-      const path: string = await invoke('save_clipboard_text', { text });
+      const localPath = await invoke<string>('save_clipboard_text', { text });
+      const path = await mapPastedFilePath(localPath, target);
       await enqueuePtyWrite(ptyId, `"${path}"`);
       return;
-    } catch { /* 写文件失败，回退到直接粘贴 */ }
+    } catch (e) {
+      // 本地写文件失败 → 直接粘原文（老行为）。
+      // 远端上传失败 → 直接粘原文同样可用（就是长了点），比报错更有用；
+      // 但仍要提示，否则用户不知道自己粘的是全文而非路径。
+      notifyPasteFailure(target, e);
+    }
   }
 
   const cached = getCachedTerminal(ptyId);

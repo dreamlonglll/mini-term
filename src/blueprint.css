@@ -71,7 +71,7 @@
 [data-skin="blueprint"] [data-panel-header] {
   text-transform: uppercase;
   letter-spacing: 1.5px;
-  font-size: 9px;
+  font-size: 0.7rem;
   color: rgba(96, 165, 250, 0.7);
   border-bottom: 1px solid rgba(96, 165, 250, 0.2);
 }
@@ -80,7 +80,7 @@
 [data-skin="blueprint"] [data-pane-tab] {
   text-transform: uppercase;
   letter-spacing: 1px;
-  font-size: 10px;
+  font-size: 0.77rem;
 }
 
 /* --- Interactive Hover Effects (buttons with borders) --- */

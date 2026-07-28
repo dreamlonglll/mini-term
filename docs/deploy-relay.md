@@ -27,6 +27,10 @@ mini-term desktop ──(outbound wss)──▶ ┌─────────�
 ```bash
 git clone https://github.com/dreamlonglll/mini-term.git
 cd mini-term/relay-server
+
+# Generate the desktop access key and write it to .env (required, see below)
+echo "MT_RELAY_DESKTOP_KEY=$(openssl rand -hex 32)" > .env
+
 docker compose up -d --build
 ```
 
@@ -36,17 +40,28 @@ Verify:
 
 ```bash
 curl http://127.0.0.1:8080/healthz   # should return ok
+docker logs mini-term-relay | grep 'desktop key'   # expect "desktop key configured"
 ```
 
 ### Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `MT_RELAY_DESKTOP_KEY` | **none (required)** | Shared desktop access key; without it the relay rejects every desktop connection |
 | `RELAY_PORT` | `8080` | Listen port inside the container |
 | `RELAY_BIND` | `0.0.0.0` | Listen address inside the container |
 | `RELAY_PWA_DIR` | `/srv/pwa` | PWA asset directory (baked into the image; no need to change) |
 
 The public address (domain/port) is not configured on the relay — which address the desktop and phone connect to is determined by the relay URL you enter in the desktop settings.
+
+### Desktop access key (`MT_RELAY_DESKTOP_KEY`)
+
+The relay address is not a secret: the PWA is hosted on it, so the URL already sits in your phone's browser history. The `/ws/desktop` endpoint therefore authenticates with a shared key, and **a relay without a configured key rejects every desktop connection** (fail-closed) — "it starts up" must not be mistaken for "it's configured".
+
+- Generate: `openssl rand -hex 32`, then set `MT_RELAY_DESKTOP_KEY=` in `relay-server/.env`.
+- Desktop: mini-term title bar → **Mobile** → "Desktop access key" → enter **the same value** → Save & connect.
+- On a wrong key the desktop shows "Access key rejected" and **stops reconnecting** (a configuration problem is not a network problem, so retrying is pointless); when the relay has no key configured it shows "The relay has no MT_RELAY_DESKTOP_KEY set". The two messages are distinct so you can tell at a glance which end to fix.
+- Relay logs record the fact of an auth failure only — **never the key itself**.
 
 ## 3. Reverse Proxy + TLS
 
@@ -89,11 +104,13 @@ server {
 
 ## 4. Walking Through the Full Flow
 
-1. Desktop mini-term → "Mobile" in the title bar: set the relay server address to `wss://relay.example.com`, save and connect, and wait for the status to turn "Connected".
+1. Desktop mini-term → "Mobile" in the title bar: set the relay server address to `wss://relay.example.com`, enter the same access key as the relay's `MT_RELAY_DESKTOP_KEY`, save and connect, and wait for the status to turn "Connected".
 2. In the same panel → generate the pairing QR code.
 3. Scan it with your phone camera → the PWA opens in the browser, pairs automatically, and shows the list of active AI sessions.
 4. Use the browser menu's "Add to Home Screen" so it opens as a standalone window from then on (on iOS, adding to the home screen is required for the standalone window experience).
 5. Start Claude / Codex in any desktop terminal → it appears in the phone's list in real time → tap in to watch the conversation mirror → send a command from the input box at the bottom, and it is written verbatim into the desktop terminal.
+6. Tap **+** at the bottom right of the phone's home screen → pick a project → pick an AI launcher → the desktop opens a new tab in that project and brings the agent up; once the session is live the phone enters its conversation mirror automatically. Projects are listed with the desktop's group hierarchy and can be collapsed; launchers are managed in the desktop "Mobile" panel (Claude / Codex are preset), and commands and shells never leave the desktop.
+7. Tap the ✎ on a session row, or the title at the top of the mirror page, to give the session a name you will recognise — the desktop terminal tab shows it too (leave it empty to restore the default).
 
 ## 5. Upgrades and Operations
 
@@ -101,6 +118,16 @@ server {
 cd mini-term && git pull
 cd relay-server && docker compose up -d --build
 ```
+
+### Upgrading from v0.7.0 to v0.7.1 (protocol v1 → v2)
+
+Protocol v2 adds desktop authentication. **All three steps must be completed**, or the desktop simply cannot connect — that is the deliberate price of fail-closed:
+
+1. Rebuild and redeploy the relay (`docker compose up -d --build`).
+2. Configure `MT_RELAY_DESKTOP_KEY` on the relay (`relay-server/.env`, see above).
+3. Upgrade the desktop app to v0.7.1 or later and enter the same key value in the "Mobile" panel, then save and connect.
+
+The order does not matter (an old desktop against a new relay gets a version-mismatch prompt, and vice versa); being disconnected mid-upgrade is expected and resolves once all three steps are done. The PWA is served by the relay and picks up the new version on its own, so it never needs a manual update; recreating the container does clear the pairing state, though, so the phone has to scan once more (see the notes below).
 
 Things to keep in mind:
 

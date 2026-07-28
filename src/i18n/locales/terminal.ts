@@ -6,6 +6,7 @@ export const terminal = {
     sshConnect: "SSH 连接",
     sshConnectEmpty: "SSH 连接（暂无）",
     dropToInsertPath: "释放以插入路径",
+    pasteUploadFailed: "粘贴内容上传到远程失败：{detail}",
   },
   en: {
     ungrouped: "Ungrouped",
@@ -14,5 +15,6 @@ export const terminal = {
     sshConnect: "SSH Connection",
     sshConnectEmpty: "SSH Connection (none)",
     dropToInsertPath: "Drop to insert path",
+    pasteUploadFailed: "Failed to upload pasted content to the remote host: {detail}",
   },
 } as const;

@@ -16,18 +16,44 @@ import { SshModal } from './components/SshModal';
 import { MobileRelayModal } from './components/MobileRelayModal';
 import { SearchModal } from './components/SearchModal';
 import { ToastContainer } from './components/ToastContainer';
+import { FirstRunGuide } from './components/FirstRunGuide';
+import { ProjectSwitcher } from './components/ProjectSwitcher';
+import { TerminalSearchBar } from './components/TerminalSearchBar';
 import { useTauriEvent } from './hooks/useTauriEvent';
 import { useAiSubmitMarker } from './hooks/useAiSubmitMarker';
 import { useMarkerHotkeys } from './hooks/useMarkerHotkeys';
+import { useGlobalHotkeys } from './hooks/useGlobalHotkeys';
 import { useExternalFileDrop } from './hooks/useExternalFileDrop';
+import { collectPanes } from './utils/layoutOps';
 import { checkForUpdate, type ReleaseInfo } from './utils/updateChecker';
 import { applyTheme } from './utils/themeManager';
 import { applyUiFontFamily } from './utils/fontManager';
 import { markAiPty, updateAllTerminalThemes } from './utils/terminalCache';
 import { includeActiveProject } from './utils/projectKeepAlive';
 import { initMobileSessionSync } from './utils/mobileSessionSync';
+import { handleMobileStartSession } from './utils/mobileStartSession';
 import { useT } from './i18n';
-import type { AppConfig, PtyStatusChangePayload, PtyExitPayload, PaneStatus, MobileRelayStatusPayload } from './types';
+import type { AppConfig, PtyStatusChangePayload, PtyExitPayload, PaneStatus, MobileRelayStatusPayload, MobileStartSessionPayload, MobileRenamePanePayload } from './types';
+
+/**
+ * 关窗前盘点还活着的 AI 会话（ai-working / ai-idle）：数量 + 给用户看的名字清单。
+ * 只数 AI 会话——裸 shell 关掉不心疼，AI 会话被 kill 才是真损失。
+ */
+function collectLiveAiPanes(): { count: number; names: string[] } {
+  const { projectStates, config } = useAppStore.getState();
+  const names: string[] = [];
+  for (const [projectId, ps] of projectStates) {
+    if (!ps.layout) continue;
+    const projectName = config.projects.find((p) => p.id === projectId)?.name ?? '';
+    for (const pane of collectPanes(ps.layout)) {
+      if (pane.ptyId === undefined) continue;
+      if (pane.status !== 'ai-working' && pane.status !== 'ai-idle') continue;
+      const label = pane.customTitle || pane.shellName;
+      names.push(projectName ? `· ${projectName} / ${label}` : `· ${label}`);
+    }
+  }
+  return { count: names.length, names };
+}
 
 export function App() {
   const t = useT();
@@ -36,6 +62,7 @@ export function App() {
   const [configPage, setConfigPage] = useState<SettingsPage | undefined>(undefined);
   const [sshOpen, setSshOpen] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
+  const [switcherOpen, setSwitcherOpen] = useState(false);
   const [updateInfo, setUpdateInfo] = useState<ReleaseInfo | null>(null);
   const [mountedProjectIds, setMountedProjectIds] = useState<string[]>([]);
   const activeProjectId = useAppStore((s) => s.activeProjectId);
@@ -57,7 +84,7 @@ export function App() {
       const newStates = new Map(projectStates);
       for (const p of cfg.projects) {
         if (!newStates.has(p.id)) {
-          newStates.set(p.id, { id: p.id, tabs: [], activeTabId: '' });
+          newStates.set(p.id, { id: p.id, layout: null, status: 'idle' });
         }
       }
       const lastActive = cfg.lastActiveProjectId;
@@ -124,21 +151,6 @@ export function App() {
     return () => window.removeEventListener('scroll', onScroll, true);
   }, []);
 
-  // Ctrl+Shift+F 打开/关闭搜索弹窗(内容搜索是本地 ripgrep 链路,SSH 远程项目不支持)
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'F') {
-        e.preventDefault();
-        const { searchModalOpen: isOpen, setSearchModalOpen: setOpen, config: cfg, activeProjectId: pid } = useAppStore.getState();
-        const activeProject = cfg.projects.find((p) => p.id === pid);
-        if (!isOpen && activeProject?.sshConnectionId) return; // 远程项目:不打开
-        setOpen(!isOpen);
-      }
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, []);
-
   // 主题变化时应用新主题
   useEffect(() => {
     applyTheme(config.theme ?? 'auto');
@@ -176,6 +188,18 @@ export function App() {
     initMobileSessionSync();
   }, []);
 
+  // 移动端远程发起新 AI 会话:在目标项目后台新开一个 tab 并拉起 AI CLI,
+  // 不切当前项目/tab(远程操作不改动桌面上正在看的现场)
+  useTauriEvent<MobileStartSessionPayload>('mobile-start-session', useCallback((payload) => {
+    void handleMobileStartSession(payload);
+  }, []));
+
+  // 移动端改会话名:直接改布局里那个 pane 的 customTitle,桌面端 tab 栏同步显示。
+  // 不回执——改完的新名字会随结构增量推回手机,那既是反馈也是真相。
+  useTauriEvent<MobileRenamePanePayload>('mobile-rename-pane', useCallback((payload) => {
+    useAppStore.getState().renamePaneById(payload.paneId, payload.title);
+  }, []));
+
   useTauriEvent<PtyExitPayload>('pty-exit', useCallback((payload) => {
     // 登记已退出的 PTY:远程项目 pane 据此叠加「连接已断开,点击重连」覆盖层
     // (不区分用户主动 exit 与异常断线);本地 pane 不消费该集合,登记无副作用。
@@ -202,14 +226,31 @@ export function App() {
   useAiSubmitMarker();
   useMarkerHotkeys();
   useExternalFileDrop();
+  useGlobalHotkeys({
+    onOpenSettings: useCallback(() => { setConfigPage(undefined); setConfigOpen(true); }, []),
+    onSwitchProject: useCallback(() => setSwitcherOpen(true), []),
+  });
 
-  // 关闭窗口时二次确认并保存布局
+  // 关闭窗口：只在真的会毁掉什么时才拦一下。
+  // 之前无条件弹确认，日常开关十几次全是噪音，用户学会的是「闭眼点确定」——
+  // 那正好让确认框在唯一该起作用的时候（AI 正在跑）也失效。
   useEffect(() => {
     const appWindow = getCurrentWindow();
     const unlisten = appWindow.onCloseRequested(async (event) => {
       event.preventDefault();
-      const confirmed = await ask(t('app.closeConfirm.message'), { title: t('app.closeConfirm.title'), kind: 'warning' });
-      if (!confirmed) return;
+
+      const live = collectLiveAiPanes();
+      if (live.count > 0) {
+        const confirmed = await ask(
+          t('app.closeConfirm.messageWithSessions', {
+            count: live.count,
+            names: live.names.join('\n'),
+          }),
+          { title: t('app.closeConfirm.titleAi'), kind: 'warning' },
+        );
+        if (!confirmed) return;
+      }
+
       const { projectStates, activeProjectId: currentActive, config: currentConfig } = useAppStore.getState();
       for (const projectId of projectStates.keys()) {
         flushLayoutToConfig(projectId);
@@ -331,11 +372,7 @@ export function App() {
                       </div>
                     );
                   })}
-                  {config.projects.length === 0 && (
-                    <div className="h-full bg-[var(--bg-terminal)] flex items-center justify-center text-[var(--text-muted)] text-sm">
-                      {t('app.emptyState')}
-                    </div>
-                  )}
+                  {config.projects.length === 0 && <FirstRunGuide />}
                 </div>
               </Allotment.Pane>
             </Allotment>
@@ -352,6 +389,8 @@ export function App() {
       <SshModal open={sshOpen} onClose={() => setSshOpen(false)} />
       <MobileRelayModal open={mobileOpen} onClose={() => setMobileOpen(false)} />
       <SearchModal open={searchModalOpen} onClose={() => setSearchModalOpen(false)} />
+      <ProjectSwitcher open={switcherOpen} onClose={() => setSwitcherOpen(false)} />
+      <TerminalSearchBar />
       <ToastContainer />
     </div>
   );

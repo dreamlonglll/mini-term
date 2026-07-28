@@ -3,6 +3,9 @@ import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '../store';
 import { showContextMenu } from '../utils/contextMenu';
 import { isWslPath } from '../utils/wslPath';
+import { writePtyInput } from '../utils/terminalCache';
+import { resolveActivePane } from '../utils/layoutOps';
+import { focusPane, newTerminal } from '../utils/paneActions';
 import { SessionViewerModal } from './SessionViewerModal';
 import { useT, t } from '../i18n';
 import type { AiSession, ProjectConfig } from '../types';
@@ -46,6 +49,42 @@ function hasWslSource(project: ProjectConfig): boolean {
   return isWslPath(project.path) || !!project.wslSessionsDistro;
 }
 
+/** 该会话对应的 resume 命令。 */
+function resumeCommand(session: AiSession): string {
+  return session.sessionType === 'claude'
+    ? `claude --resume ${session.id}`
+    : `codex resume ${session.id}`;
+}
+
+/**
+ * 在当前活动终端里恢复会话：直接把命令敲进去并回车。
+ *
+ * 走 `writePtyInput` 而不是裸 write_pty，是为了保住输入跟踪 / AI marker 语义 ——
+ * 与用户自己打这条命令完全同一条链路，pane 因此能正常进入 AI 会话状态。
+ */
+async function resumeInCurrentPane(projectId: string, command: string): Promise<void> {
+  const layout = useAppStore.getState().projectStates.get(projectId)?.layout ?? null;
+  const pane = resolveActivePane(layout);
+  if (!pane || pane.ptyId === undefined) {
+    // 一个终端都没有 → 退化成「开一个新的再恢复」，而不是默默什么都不做
+    await resumeInNewTerminal(projectId, command);
+    return;
+  }
+  await writePtyInput(pane.ptyId, `${command}\r`);
+  focusPane(pane.ptyId);
+}
+
+/** 新开一个终端标签再恢复。 */
+async function resumeInNewTerminal(projectId: string, command: string): Promise<void> {
+  // 直接用 newTerminal 返回的那个 pane。不能再走 resolveActivePane：
+  // 它以 DOM 焦点为准，而新终端的 focus 排在 rAF 里、此刻还没执行，
+  // 拿到的会是用户原本待着的那个终端 —— resume 命令就敲进别人的会话了。
+  const pane = await newTerminal(projectId);
+  if (!pane || pane.ptyId === undefined) return;
+  await writePtyInput(pane.ptyId, `${command}\r`);
+  focusPane(pane.ptyId);
+}
+
 export function SessionList() {
   const t = useT();
   const config = useAppStore((s) => s.config);
@@ -58,7 +97,6 @@ export function SessionList() {
   const [loading, setLoading] = useState(false);
   const [wslLoading, setWslLoading] = useState(false);
   const [viewingSession, setViewingSession] = useState<AiSession | null>(null);
-  const scrollRef = useRef<HTMLDivElement>(null);
   // 请求序号:项目切换后旧请求(尤其是慢的 WSL 请求)返回时不得覆盖新项目的列表
   const requestIdRef = useRef(0);
 
@@ -166,19 +204,15 @@ export function SessionList() {
   const visibleSessions = allSessions.slice(0, displayCount);
   const hasMore = displayCount < allSessions.length;
 
-  const handleScroll = useCallback(() => {
-    const el = scrollRef.current;
-    if (!el || !hasMore || loading) return;
-    if (el.scrollTop + el.clientHeight >= el.scrollHeight - 40) {
-      setDisplayCount((c) => Math.min(c + PAGE_SIZE, allSessions.length));
-    }
-  }, [hasMore, loading, allSessions.length]);
+  const loadMore = useCallback(() => {
+    setDisplayCount((c) => Math.min(c + PAGE_SIZE, allSessions.length));
+  }, [allSessions.length]);
 
   return (
     <div className="h-full flex flex-col overflow-hidden bg-[var(--bg-surface)] select-none">
       <div className="px-3 pt-2.5 pb-1.5 text-sm text-[var(--text-muted)] uppercase tracking-[0.12em] font-medium flex items-center justify-between">
         <span className="flex items-center gap-1.5">
-          Sessions
+          {t('panels.sessions')}
           {wslLoading && (
             <span
               className="inline-block w-3 h-3 border border-[var(--text-muted)] border-t-transparent rounded-full animate-spin"
@@ -203,7 +237,7 @@ export function SessionList() {
         )}
       </div>
 
-      <div ref={scrollRef} className="flex-1 overflow-y-auto px-1.5" onScroll={handleScroll}>
+      <div className="flex-1 overflow-y-auto px-1.5">
         {loading && allSessions.length === 0 && (
           <div className="px-2.5 py-3 text-xs text-[var(--text-muted)] text-center">{t('sessionList.loading')}</div>
         )}
@@ -236,14 +270,26 @@ export function SessionList() {
               onContextMenu={(e) => {
                 e.preventDefault();
                 e.stopPropagation();
-                const cmd = session.sessionType === 'claude'
-                  ? `claude --resume ${session.id}`
-                  : `codex resume ${session.id}`;
+                const cmd = resumeCommand(session);
+                // 会话来自别处（WSL / 远程）时，把命令敲进本机终端是跑不通的，
+                // 只保留「查看 / 复制命令」——用户自己知道该在哪个终端里粘。
+                const canResumeHere = !session.wslDistro && !session.sshConnectionId;
                 showContextMenu(e.clientX, e.clientY, [
                   {
                     label: t('sessionList.view'),
                     onClick: () => setViewingSession(session),
                   },
+                  ...(canResumeHere && activeProjectId ? [
+                    { separator: true as const },
+                    {
+                      label: t('sessionList.resumeHere'),
+                      onClick: () => void resumeInCurrentPane(activeProjectId, cmd),
+                    },
+                    {
+                      label: t('sessionList.resumeInNewTab'),
+                      onClick: () => void resumeInNewTerminal(activeProjectId, cmd),
+                    },
+                  ] : []),
                   { separator: true },
                   {
                     label: t('sessionList.copyResumeCommand'),
@@ -254,7 +300,7 @@ export function SessionList() {
             >
               {/* 类型徽标 */}
               <span
-                className="flex-shrink-0 w-4 h-4 rounded flex items-center justify-center text-[10px] font-bold mt-0.5"
+                className="flex-shrink-0 w-4 h-4 rounded flex items-center justify-center text-xs font-bold mt-0.5"
                 style={{ backgroundColor: badge.color + '22', color: badge.color }}
               >
                 {badge.label}
@@ -265,7 +311,7 @@ export function SessionList() {
                 <div className="truncate text-[var(--text-secondary)] group-hover:text-[var(--text-primary)] transition-colors leading-snug">
                   {session.title}
                 </div>
-                <div className="text-[var(--text-muted)] text-[10px] mt-0.5 leading-none">
+                <div className="text-[var(--text-muted)] text-xs mt-0.5 leading-none">
                   {formatTime(session.timestamp)}
                   {session.wslDistro && (
                     <span className="ml-1.5 opacity-70" title={session.wslDistro}>
@@ -287,9 +333,12 @@ export function SessionList() {
         })}
 
         {hasMore && (
-          <div className="px-2.5 py-2 text-[10px] text-[var(--text-muted)] text-center">
-            {t('sessionList.more', { n: allSessions.length - displayCount })}
-          </div>
+          <button
+            className="w-full px-2.5 py-2 my-0.5 text-xs text-[var(--text-muted)] text-center rounded-[var(--radius-sm)] cursor-pointer transition-colors hover:bg-[var(--border-subtle)] hover:text-[var(--text-primary)]"
+            onClick={loadMore}
+          >
+            {t('sessionList.loadMore', { n: allSessions.length - displayCount })}
+          </button>
         )}
       </div>
     </div>

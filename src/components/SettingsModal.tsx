@@ -10,8 +10,11 @@ import { applyTheme } from '../utils/themeManager';
 import { updateAllTerminalThemes, DEFAULT_TERMINAL_FONT_FAMILY } from '../utils/terminalCache';
 import { applyUiFontFamily } from '../utils/fontManager';
 import { MOD_LABEL } from '../utils/platform';
+import { comboLabel, hotkeyGroups } from '../utils/hotkeys';
+import { DEFAULT_REMOTE_PASTE_DIR } from '../utils/pastePath';
 import { useT } from '../i18n';
 import { LanguageToggle } from './LanguageToggle';
+import { Modal } from './Modal';
 import type { ShellConfig, EditorConfig } from '../types';
 
 interface Props {
@@ -263,6 +266,8 @@ function TerminalSettings() {
   const savedCharThreshold = config.longPasteCharThreshold ?? 2000;
   const [lineThresholdInput, setLineThresholdInput] = useState(String(savedLineThreshold));
   const [charThresholdInput, setCharThresholdInput] = useState(String(savedCharThreshold));
+  const savedRemotePasteDir = config.remotePasteDir ?? DEFAULT_REMOTE_PASTE_DIR;
+  const [remotePasteDirInput, setRemotePasteDirInput] = useState(savedRemotePasteDir);
 
   useEffect(() => {
     setShells([...config.availableShells]);
@@ -273,7 +278,8 @@ function TerminalSettings() {
   useEffect(() => {
     setLineThresholdInput(String(savedLineThreshold));
     setCharThresholdInput(String(savedCharThreshold));
-  }, [savedLineThreshold, savedCharThreshold]);
+    setRemotePasteDirInput(savedRemotePasteDir);
+  }, [savedLineThreshold, savedCharThreshold, savedRemotePasteDir]);
 
   const save = useCallback(async (updatedShells: ShellConfig[], updatedDefault: string) => {
     const newConfig = {
@@ -352,6 +358,16 @@ function TerminalSettings() {
     setCharThresholdInput(String(clamped));
     if (clamped !== savedCharThreshold) {
       void saveConfigPatch({ longPasteCharThreshold: clamped });
+    }
+  };
+
+  const commitRemotePasteDir = () => {
+    // 清空 = 回默认值（而不是落一个空串让后端每次去兜底）。
+    // `..` 的拒绝在后端 resolve_paste_dir，这里只做归一，避免两处判定漂移。
+    const next = remotePasteDirInput.trim() || DEFAULT_REMOTE_PASTE_DIR;
+    setRemotePasteDirInput(next);
+    if (next !== savedRemotePasteDir) {
+      void saveConfigPatch({ remotePasteDir: next });
     }
   };
 
@@ -515,6 +531,33 @@ function TerminalSettings() {
 
       <div className="pt-1 text-sm text-[var(--text-muted)]">
         {t("settings.terminal.longPasteFooter")}
+      </div>
+
+      <div className="pt-6 text-base text-[var(--text-muted)] uppercase tracking-[0.1em] mb-2">
+        {t("settings.terminal.remotePaste")}
+      </div>
+
+      <div className="px-3 py-2.5 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)]">
+        <div className="text-base text-[var(--text-primary)]">
+          {t("settings.terminal.remotePasteDir")}
+        </div>
+        <div className="text-sm text-[var(--text-muted)] mb-2">
+          {t("settings.terminal.remotePasteDirDesc")}
+        </div>
+        <input
+          type="text"
+          spellCheck={false}
+          placeholder={DEFAULT_REMOTE_PASTE_DIR}
+          className="w-full bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1 text-base outline-none focus:border-[var(--accent)] font-mono"
+          value={remotePasteDirInput}
+          onChange={(e) => setRemotePasteDirInput(e.target.value)}
+          onBlur={commitRemotePasteDir}
+          onKeyDown={(e) => e.key === 'Enter' && (e.target as HTMLInputElement).blur()}
+        />
+      </div>
+
+      <div className="pt-1 text-sm text-[var(--text-muted)]">
+        {t("settings.terminal.remotePasteFooter")}
       </div>
     </div>
   );
@@ -1430,63 +1473,43 @@ function AboutSettings() {
 
 // ─── ShortcutsSettings（快捷键页）───
 
-function buildShortcutGroups(
-  smartCopyPaste: boolean,
-  tr: (key: string) => string,
-): { title: string; items: { keys: string; desc: string }[] }[] {
-  const terminalItems = smartCopyPaste
-    ? [
-        { keys: `${MOD_LABEL} + C`, desc: tr('settings.shortcuts.copyDesc') },
-        { keys: `${MOD_LABEL} + V`, desc: tr('settings.shortcuts.pasteToTerminal') },
-        { keys: `${MOD_LABEL} + Shift + C`, desc: tr('settings.shortcuts.copySelected') },
-        { keys: `${MOD_LABEL} + Shift + V`, desc: tr('settings.shortcuts.pasteToTerminal') },
-      ]
-    : [
-        { keys: `${MOD_LABEL} + Shift + C`, desc: tr('settings.shortcuts.copySelected') },
-        { keys: `${MOD_LABEL} + Shift + V`, desc: tr('settings.shortcuts.pasteToTerminal') },
-      ];
-  return [
-    {
-      title: tr('settings.shortcuts.global'),
-      items: [{ keys: `${MOD_LABEL} + Shift + F`, desc: tr('settings.shortcuts.toggleGlobalSearch') }],
-    },
-    {
-      title: tr('settings.shortcuts.terminalOps'),
-      items: terminalItems,
-    },
-    {
-      title: tr('settings.shortcuts.aiTaskMarks'),
-      items: [
-        { keys: `${MOD_LABEL} + Shift + ↑`, desc: tr('settings.shortcuts.jumpPrevAi') },
-        { keys: `${MOD_LABEL} + Shift + ↓`, desc: tr('settings.shortcuts.jumpNextAi') },
-      ],
-    },
-  ];
-}
-
+/**
+ * 快捷键页整个从 `utils/hotkeys.ts` 的表生成 —— 之前这里是一份手写的静态说明，
+ * 与实际监听逻辑各写各的，改了键位忘了改说明就直接漂移。
+ *
+ * 唯一的动态项是「智能 Ctrl+C/V」：它由设置开关决定是否生效，不在静态表里。
+ */
 function ShortcutsSettings() {
   const t = useT();
   const smartCopyPaste = useAppStore((s) => s.config.smartCopyPaste ?? false);
-  const groups = buildShortcutGroups(smartCopyPaste, t);
+  const groups = hotkeyGroups();
+
+  const row = (key: string, desc: string, keys: string) => (
+    <div
+      key={key}
+      className="flex items-center justify-between gap-4 px-3 py-2.5 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)]"
+    >
+      <span className="text-base text-[var(--text-primary)]">{desc}</span>
+      <kbd className="kbd flex-shrink-0">{keys}</kbd>
+    </div>
+  );
+
   return (
     <div className="space-y-6">
       {groups.map((group) => (
-        <div key={group.title}>
+        <div key={group.groupKey}>
           <div className="text-base text-[var(--text-muted)] uppercase tracking-[0.1em] mb-2">
-            {group.title}
+            {t(group.groupKey)}
           </div>
           <div className="space-y-1">
-            {group.items.map((item) => (
-              <div
-                key={item.keys}
-                className="flex items-center justify-between px-3 py-2.5 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)]"
-              >
-                <span className="text-base text-[var(--text-primary)]">{item.desc}</span>
-                <kbd className="px-2 py-0.5 rounded-[var(--radius-sm)] bg-[var(--bg-elevated)] border border-[var(--border-default)] text-sm font-mono text-[var(--text-secondary)]">
-                  {item.keys}
-                </kbd>
-              </div>
-            ))}
+            {group.items.map((def) => row(def.id, t(def.descKey), comboLabel(def.combo)))}
+            {/* 智能 Ctrl+C/V 开启时才存在，附在「复制粘贴」组末尾 */}
+            {group.groupKey === 'settings.shortcuts.clipboard' && smartCopyPaste && (
+              <>
+                {row('smartCopy', t('settings.shortcuts.copyDesc'), `${MOD_LABEL}+C`)}
+                {row('smartPaste', t('settings.shortcuts.pasteToTerminal'), `${MOD_LABEL}+V`)}
+              </>
+            )}
           </div>
         </div>
       ))}
@@ -1516,59 +1539,68 @@ export function SettingsModal({ open, onClose, initialPage }: Props) {
     if (open) setActivePage(initialPage ?? 'terminal');
   }, [open, initialPage]);
 
-  if (!open) return null;
-
   return (
-    <div className="fixed inset-0 z-50 flex items-start justify-center pt-[10vh]" onClick={onClose}>
-      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
-      <div
-        className="relative w-[640px] max-h-[80vh] bg-[var(--bg-surface)] border border-[var(--border-strong)] rounded-[var(--radius-md)] shadow-[var(--shadow-overlay)] flex flex-col overflow-hidden animate-slide-in"
-        onClick={(e) => e.stopPropagation()}
-      >
-        {/* 顶栏 */}
-        <div className="flex items-center justify-between px-5 py-4 border-b border-[var(--border-subtle)]">
-          <h2 className="text-lg font-semibold text-[var(--text-primary)]">{t("settings.title")}</h2>
-          <button
-            className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors text-lg leading-none"
-            onClick={onClose}
-          >
-            ✕
-          </button>
+    <Modal
+      open={open}
+      onClose={onClose}
+      title={t("settings.title")}
+      panelClassName="w-[640px] max-h-[80vh]"
+    >
+      {/* 左右布局 */}
+      <div className="flex flex-1 overflow-hidden">
+        {/* 左侧菜单 —— tab 语义，可用方向键在分页间移动 */}
+        <div
+          role="tablist"
+          aria-orientation="vertical"
+          aria-label={t("settings.title")}
+          className="w-[160px] flex-shrink-0 border-r border-[var(--border-subtle)] py-3 px-2 space-y-0.5"
+          onKeyDown={(e) => {
+            if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+            e.preventDefault();
+            const idx = MENU_ITEMS.findIndex((m) => m.key === activePage);
+            const delta = e.key === 'ArrowDown' ? 1 : -1;
+            const next = MENU_ITEMS[(idx + delta + MENU_ITEMS.length) % MENU_ITEMS.length];
+            setActivePage(next.key);
+            requestAnimationFrame(() => {
+              (e.currentTarget as HTMLElement)
+                ?.querySelector<HTMLElement>(`[data-page="${next.key}"]`)
+                ?.focus();
+            });
+          }}
+        >
+          {MENU_ITEMS.map((item) => (
+            <button
+              key={item.key}
+              type="button"
+              role="tab"
+              data-page={item.key}
+              aria-selected={activePage === item.key}
+              tabIndex={activePage === item.key ? 0 : -1}
+              className={`w-full flex items-center gap-2 px-3 py-2 rounded-[var(--radius-sm)] cursor-pointer text-base text-left transition-all duration-150 ${
+                activePage === item.key
+                  ? 'bg-[var(--accent-subtle)] text-[var(--accent)]'
+                  : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--border-subtle)]'
+              }`}
+              onClick={() => setActivePage(item.key)}
+            >
+              {activePage === item.key && (
+                <span className="w-0.5 h-4 rounded-full bg-[var(--accent)] flex-shrink-0" />
+              )}
+              <span>{t(item.labelKey)}</span>
+            </button>
+          ))}
         </div>
 
-        {/* 左右布局 */}
-        <div className="flex flex-1 overflow-hidden">
-          {/* 左侧菜单 */}
-          <div className="w-[160px] flex-shrink-0 border-r border-[var(--border-subtle)] py-3 px-2 space-y-0.5">
-            {MENU_ITEMS.map((item) => (
-              <div
-                key={item.key}
-                className={`flex items-center gap-2 px-3 py-2 rounded-[var(--radius-sm)] cursor-pointer text-base transition-all duration-150 ${
-                  activePage === item.key
-                    ? 'bg-[var(--accent-subtle)] text-[var(--accent)]'
-                    : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--border-subtle)]'
-                }`}
-                onClick={() => setActivePage(item.key)}
-              >
-                {activePage === item.key && (
-                  <span className="w-0.5 h-4 rounded-full bg-[var(--accent)] flex-shrink-0" />
-                )}
-                <span>{t(item.labelKey)}</span>
-              </div>
-            ))}
-          </div>
-
-          {/* 右侧内容 */}
-          <div className="flex-1 overflow-y-auto px-5 py-4">
-            {activePage === 'terminal' && <TerminalSettings />}
-            {activePage === 'system' && <SystemSettings />}
-            {activePage === 'font' && <FontSettings />}
-            {activePage === 'ai-notification' && <AiNotificationSettings />}
-            {activePage === 'shortcuts' && <ShortcutsSettings />}
-            {activePage === 'about' && <AboutSettings />}
-          </div>
+        {/* 右侧内容 */}
+        <div className="flex-1 overflow-y-auto px-5 py-4" role="tabpanel">
+          {activePage === 'terminal' && <TerminalSettings />}
+          {activePage === 'system' && <SystemSettings />}
+          {activePage === 'font' && <FontSettings />}
+          {activePage === 'ai-notification' && <AiNotificationSettings />}
+          {activePage === 'shortcuts' && <ShortcutsSettings />}
+          {activePage === 'about' && <AboutSettings />}
         </div>
       </div>
-    </div>
+    </Modal>
   );
 }

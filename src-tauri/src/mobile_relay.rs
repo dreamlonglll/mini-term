@@ -13,13 +13,15 @@ use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
 use mt_relay_protocol::{
-    DesktopToRelay, MirrorMessage, MobilePane, MobileProject, RelayToDesktop, PROTOCOL_VERSION,
+    DesktopRejectReason, DesktopToRelay, MirrorMessage, MobileLauncher, MobilePane, MobileProject,
+    RelayToDesktop, StartSessionFailReason, PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::config::AiLauncher;
 use crate::mobile_mirror::{self, history_slice, MirrorParser, MIRROR_PAGE_SIZE};
 
 /// 握手 ack 等待超时。
@@ -29,13 +31,22 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const MIRROR_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// 前端 store 喂入的同步载荷:比 wire 类型多项目路径(镜像绑定用,不发给移动端)。
+///
+/// v2 起前端上报 `config.projects` **全集**(不再只报有活跃 AI 会话的项目),
+/// "仅 AI 会话 pane 可见"的裁剪只作用于 `panes`。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncProject {
     pub project_id: String,
     pub name: String,
     pub path: String,
+    /// SSH 远程项目引用的连接 id;本地项目为 None(判定能否远程发起会话用)
+    #[serde(default)]
+    pub ssh_connection_id: Option<String>,
     pub panes: Vec<SyncPane>,
+    /// 桌面端项目树里的祖先分组名链(根→父),顶层项目为空。原样透传给移动端。
+    #[serde(default)]
+    pub group_path: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -60,6 +71,8 @@ struct MirrorSub {
 #[serde(rename_all = "camelCase")]
 pub struct MobileRelayStatusPayload {
     /// "disconnected" | "connecting" | "connected" | "reconnecting" | "versionMismatch"
+    /// | "authFailed"(密钥不匹配)| "keyNotConfigured"(中转未配置密钥)。
+    /// 后三者都是配置问题:停止重连,等用户改配置。
     pub status: String,
     /// versionMismatch 时携带,供前端给出明确升级提示
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -90,7 +103,7 @@ pub struct MobileRelayManager {
     outbound: StdMutex<Option<mpsc::UnboundedSender<DesktopToRelay>>>,
     /// 最近一次 PairingUpdate 的配对状态(断线清空)
     paired: StdMutex<Option<bool>>,
-    /// 活跃 AI 会话结构的最新快照(前端 store 经 command 喂入,后端据此组装增量)
+    /// 项目结构的最新快照(前端 store 经 command 喂入,后端据此组装增量)
     sessions: StdMutex<Vec<MobileProject>>,
     /// pane → 项目路径(镜像订阅时解析会话文件用)
     pane_paths: StdMutex<HashMap<String, String>>,
@@ -150,7 +163,7 @@ impl MobileRelayManager {
         }
     }
 
-    /// 接收前端 store 喂入的活跃 AI 会话全量状态:组装增量推给中转,存下新状态,
+    /// 接收前端 store 喂入的项目全量状态:组装增量推给中转,存下新状态,
     /// 更新 pane→路径映射;被订阅镜像的 pane 消失时通知移动端并撤销订阅。
     pub fn update_sessions(&self, projects: Vec<SyncProject>) {
         let mut pane_paths: HashMap<String, String> = HashMap::new();
@@ -182,8 +195,10 @@ impl MobileRelayManager {
         let next: Vec<MobileProject> = projects
             .into_iter()
             .map(|p| MobileProject {
+                can_start_session: can_start_session(&p.path, p.ssh_connection_id.as_deref()),
                 project_id: p.project_id,
                 name: p.name,
+                group_path: p.group_path,
                 panes: p
                     .panes
                     .into_iter()
@@ -209,6 +224,21 @@ impl MobileRelayManager {
                 removed_project_ids,
             });
         }
+    }
+
+    /// 回发一条发起会话回执(成功带 pane_id,失败带 reason)。
+    fn send_start_receipt(
+        &self,
+        request_id: String,
+        pane_id: Option<String>,
+        reason: Option<StartSessionFailReason>,
+    ) {
+        let _ = self.send(DesktopToRelay::StartSessionReceipt {
+            request_id,
+            ok: reason.is_none(),
+            pane_id,
+            reason,
+        });
     }
 
     /// 撤销单个镜像订阅(幂等)。
@@ -270,14 +300,25 @@ impl MobileRelayManager {
         });
     }
 
-    /// 发送当前全量快照(握手成功后 / 收到中转的快照请求时)。
-    fn send_snapshot(&self) {
+    /// 发送当前全量快照(握手成功后 / 收到中转的快照请求时 / 启动器配置变化时)。
+    /// 启动器名单从磁盘配置现取:它是低频数据,没必要在内存里再维护一份副本。
+    fn send_snapshot(&self, app: &AppHandle) {
         let projects = self.sessions.lock().unwrap().clone();
-        let _ = self.send(DesktopToRelay::SessionsSnapshot { projects });
+        let launchers = launchers_of(app)
+            .into_iter()
+            .map(|l| MobileLauncher {
+                id: l.id,
+                name: l.name,
+            })
+            .collect();
+        let _ = self.send(DesktopToRelay::SessionsSnapshot {
+            projects,
+            launchers,
+        });
     }
 
-    /// 应用新的中转地址:先停旧连接;地址非空则启动新的重连循环。
-    pub fn apply(&self, app: &AppHandle, relay_url: &str) {
+    /// 应用新的中转地址与桌面端密钥:先停旧连接;地址非空则启动新的重连循环。
+    pub fn apply(&self, app: &AppHandle, relay_url: &str, desktop_key: &str) {
         if let Some(tx) = self.cancel.lock().unwrap().take() {
             let _ = tx.send(true);
         }
@@ -295,10 +336,29 @@ impl MobileRelayManager {
         let (cancel_tx, cancel_rx) = watch::channel(false);
         *self.cancel.lock().unwrap() = Some(cancel_tx);
         let app = app.clone();
+        let desktop_key = desktop_key.to_string();
         tauri::async_runtime::spawn(async move {
-            connection_loop(app, url, cancel_rx).await;
+            connection_loop(app, url, desktop_key, cancel_rx).await;
         });
     }
+}
+
+/// 能否在该项目远程发起 AI 会话。
+///
+/// SSH 远程项目与 WSL 根项目一律为否:它们的对话镜像目前一定是空的
+/// (`mobile_mirror` 只认本机 Windows 宿主来源),在那儿开会话等于盲发指令。
+/// WSL **关联**项目(根路径是普通 Windows 路径)不在此列——它的镜像可用与否取决于
+/// 启动器把 AI 起在哪一侧,那是既有的 v1 镜像限制,不由本判定兜底。
+pub fn can_start_session(path: &str, ssh_connection_id: Option<&str>) -> bool {
+    ssh_connection_id.is_none() && mt_core::parse_wsl_unc(path).is_none()
+}
+
+/// 读取当前配置里的 AI 启动器名单(配置整块缺失时退回预置两条)。
+fn launchers_of(app: &AppHandle) -> Vec<AiLauncher> {
+    crate::config::read_config(app)
+        .mobile_relay
+        .unwrap_or_default()
+        .launchers
 }
 
 impl Default for MobileRelayManager {
@@ -315,18 +375,25 @@ enum Attempt {
     Failed,
     /// 版本不匹配 → 停止循环
     VersionMismatch { expected: u32, actual: u32 },
+    /// 密钥被拒(填错 / 中转未配置) → 停止循环,重试无意义
+    Rejected(DesktopRejectReason),
     /// 用户取消(改地址/清空地址) → 停止循环,状态由调用方设置
     Cancelled,
 }
 
-async fn connection_loop(app: AppHandle, url: String, mut cancel_rx: watch::Receiver<bool>) {
+async fn connection_loop(
+    app: AppHandle,
+    url: String,
+    desktop_key: String,
+    mut cancel_rx: watch::Receiver<bool>,
+) {
     let manager = app.state::<MobileRelayManager>();
     let mut attempt: u32 = 0;
     loop {
         let status = if attempt == 0 { "connecting" } else { "reconnecting" };
         manager.set_status(&app, MobileRelayStatusPayload::simple(status));
 
-        match connect_once(&app, &url, &mut cancel_rx).await {
+        match connect_once(&app, &url, &desktop_key, &mut cancel_rx).await {
             Attempt::Cancelled => return,
             Attempt::VersionMismatch { expected, actual } => {
                 manager.set_status(
@@ -337,6 +404,14 @@ async fn connection_loop(app: AppHandle, url: String, mut cancel_rx: watch::Rece
                         actual_version: Some(actual),
                         paired: None,
                     },
+                );
+                return;
+            }
+            // 配置问题不是网络问题:停在明确状态上,等用户改配置后重新「保存并连接」
+            Attempt::Rejected(reason) => {
+                manager.set_status(
+                    &app,
+                    MobileRelayStatusPayload::simple(reject_status(reason)),
                 );
                 return;
             }
@@ -352,10 +427,21 @@ async fn connection_loop(app: AppHandle, url: String, mut cancel_rx: watch::Rece
     }
 }
 
-/// 单次连接:建连 → hello → 等 ack → 已连接后挂住直到断线/取消。
+/// 握手拒绝原因 → 前端状态串(两种密钥问题的修法不同,文案也不同)。
+fn reject_status(reason: DesktopRejectReason) -> &'static str {
+    match reason {
+        DesktopRejectReason::InvalidKey => "authFailed",
+        DesktopRejectReason::KeyNotConfigured => "keyNotConfigured",
+        // 版本不匹配走 Attempt::VersionMismatch 分支,不会到这里
+        DesktopRejectReason::VersionMismatch => "versionMismatch",
+    }
+}
+
+/// 单次连接:建连 → hello(带密钥)→ 等 ack → 已连接后挂住直到断线/取消。
 async fn connect_once(
     app: &AppHandle,
     url: &str,
+    desktop_key: &str,
     cancel_rx: &mut watch::Receiver<bool>,
 ) -> Attempt {
     let connect = tokio_tungstenite::connect_async(url);
@@ -372,6 +458,7 @@ async fn connect_once(
 
     let hello = DesktopToRelay::Hello {
         protocol_version: PROTOCOL_VERSION,
+        desktop_key: desktop_key.to_string(),
     };
     if ws
         .send(Message::Text(
@@ -392,12 +479,16 @@ async fn connect_once(
         Ok(Some(Ok(Message::Text(text)))) => match serde_json::from_str::<RelayToDesktop>(&text) {
             Ok(RelayToDesktop::HelloAck { .. }) => {}
             Ok(RelayToDesktop::HelloReject {
+                reason,
                 expected_version,
                 actual_version,
             }) => {
-                return Attempt::VersionMismatch {
-                    expected: expected_version,
-                    actual: actual_version,
+                return match reason {
+                    DesktopRejectReason::VersionMismatch => Attempt::VersionMismatch {
+                        expected: expected_version.unwrap_or(PROTOCOL_VERSION),
+                        actual: actual_version.unwrap_or(PROTOCOL_VERSION),
+                    },
+                    other => Attempt::Rejected(other),
                 }
             }
             // 握手期不该出现其他消息;当协议错乱处理
@@ -414,7 +505,7 @@ async fn connect_once(
     *manager.outbound.lock().unwrap() = Some(outbound_tx);
 
     // 连上即推一份全量快照:覆盖"桌面端重连时移动端已在线"的场景
-    manager.send_snapshot();
+    manager.send_snapshot(app);
 
     // 已连接:读循环 + 出站转发,直到断线/取消
     let outcome = loop {
@@ -458,7 +549,7 @@ fn handle_relay_message(app: &AppHandle, manager: &MobileRelayManager, text: &st
             manager.set_paired(app, paired);
         }
         // 移动端上线,回发最新结构快照(中转不缓存)
-        Ok(RelayToDesktop::SessionsSnapshotRequest) => manager.send_snapshot(),
+        Ok(RelayToDesktop::SessionsSnapshotRequest) => manager.send_snapshot(app),
         // 对话镜像:订阅/退订/分页
         Ok(RelayToDesktop::SubscribePane { pane_id }) => subscribe_pane(app, manager, pane_id),
         Ok(RelayToDesktop::UnsubscribePane { pane_id }) => manager.unsubscribe_pane(&pane_id),
@@ -472,9 +563,123 @@ fn handle_relay_message(app: &AppHandle, manager: &MobileRelayManager, text: &st
             command_id,
             text,
         }) => handle_mobile_command(app, manager, pane_id, command_id, text),
+        // 移动端重命名会话:pane 标题归前端布局状态所有,后端只做长度收敛后转交
+        Ok(RelayToDesktop::RenamePane { pane_id, title }) => {
+            let _ = app.emit(
+                "mobile-rename-pane",
+                RenamePanePayload {
+                    pane_id,
+                    title: sanitize_pane_title(&title),
+                },
+            );
+        }
+        // 移动端发起新 AI 会话:后端校验后交给前端建 tab(PTY 与布局都归前端管)
+        Ok(RelayToDesktop::StartAiSession {
+            request_id,
+            project_id,
+            launcher_id,
+        }) => handle_start_ai_session(app, manager, request_id, project_id, launcher_id),
         Ok(_) => {}
         Err(_) => eprintln!("[mobile-relay] unparseable relay message (ignored)"),
     }
+}
+
+/// pane 自定义标题的字符数上限。桌面端 tab 栏是一行横排,超长标题会把同组其它
+/// tab 挤出可视区;截断而不是拒绝——用户改的名字过长是手滑,不该整条改名失败。
+const MAX_PANE_TITLE_CHARS: usize = 64;
+
+/// 收敛移动端传来的标题:去首尾空白、砍掉控制字符、限长。
+/// 空串是合法输入(= 清除自定义名),原样返回给前端处理。
+fn sanitize_pane_title(title: &str) -> String {
+    title
+        .trim()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_PANE_TITLE_CHARS)
+        .collect()
+}
+
+/// `mobile-rename-pane` 事件载荷:交给前端改布局里那个 pane 的 customTitle。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RenamePanePayload {
+    pub pane_id: String,
+    /// 已收敛过的标题;空串 = 清除自定义名,回落 shell 名
+    pub title: String,
+}
+
+/// `mobile-start-session` 事件载荷:后端校验通过后交给前端执行的启动指令。
+/// 命令与 shell 只在桌面端进程内流转,不回传中转。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StartSessionPayload {
+    pub request_id: String,
+    pub project_id: String,
+    pub launcher_id: String,
+    /// 启动器展示名(桌面端通知文案用)
+    pub launcher_name: String,
+    /// 绑定的 shell 名;None = 用默认 shell
+    pub shell_name: Option<String>,
+    /// 要写入 PTY 的启动命令
+    pub command: String,
+}
+
+/// 校验移动端的发起请求,通过则 emit 给前端执行,不通过直接回失败回执。
+///
+/// 校验的是"目标存在且支持",**不**校验命令内容——命令来自桌面端配置,
+/// 这是 ADR 0002 的防线本身,再做内容白名单也挡不住拼接。
+fn handle_start_ai_session(
+    app: &AppHandle,
+    manager: &MobileRelayManager,
+    request_id: String,
+    project_id: String,
+    launcher_id: String,
+) {
+    let config = crate::config::read_config(app);
+    let Some(project) = config.projects.iter().find(|p| p.id == project_id) else {
+        manager.send_start_receipt(request_id, None, Some(StartSessionFailReason::ProjectNotFound));
+        return;
+    };
+    if !can_start_session(&project.path, project.ssh_connection_id.as_deref()) {
+        manager.send_start_receipt(request_id, None, Some(StartSessionFailReason::NotSupported));
+        return;
+    }
+    let launchers = config.mobile_relay.unwrap_or_default().launchers;
+    let launcher = match resolve_launcher(&launchers, &launcher_id) {
+        Ok(l) => l,
+        Err(reason) => {
+            manager.send_start_receipt(request_id, None, Some(reason));
+            return;
+        }
+    };
+
+    let _ = app.emit(
+        "mobile-start-session",
+        StartSessionPayload {
+            request_id,
+            project_id,
+            launcher_id,
+            launcher_name: launcher.name,
+            shell_name: launcher.shell,
+            command: launcher.command,
+        },
+    );
+}
+
+/// launcher id → 启动这次会话需要的东西。空白 shell 名等同未绑定(不能拿去
+/// `available_shells` 里找一个空名条目)。
+fn resolve_launcher(
+    launchers: &[AiLauncher],
+    launcher_id: &str,
+) -> Result<AiLauncher, StartSessionFailReason> {
+    launchers
+        .iter()
+        .find(|l| l.id == launcher_id)
+        .map(|l| AiLauncher {
+            shell: l.shell.clone().filter(|s| !s.trim().is_empty()),
+            ..l.clone()
+        })
+        .ok_or(StartSessionFailReason::LauncherNotFound)
 }
 
 /// 写穿移动端指令:等价本人在桌面对该终端敲入同样内容并回车。
@@ -704,14 +909,16 @@ fn normalize_relay_url(input: &str) -> Option<String> {
     Some(format!("{}/ws/desktop", with_scheme.trim_end_matches('/')))
 }
 
-/// 应用(或清除)中转地址。前端在保存设置时调用;空字符串 = 断开并停用。
+/// 应用(或清除)中转地址与桌面端密钥。前端在保存设置时调用;
+/// 地址为空字符串 = 断开并停用。
 #[tauri::command]
 pub fn mobile_relay_apply(
     app: AppHandle,
     manager: tauri::State<'_, MobileRelayManager>,
     relay_url: String,
+    desktop_key: String,
 ) -> Result<(), String> {
-    manager.apply(&app, &relay_url);
+    manager.apply(&app, &relay_url, &desktop_key);
     Ok(())
 }
 
@@ -739,13 +946,48 @@ pub fn mobile_relay_reset_pairing(
     manager.send(DesktopToRelay::ResetPairing)
 }
 
-/// 前端 store 喂入活跃 AI 会话全量状态(可见性规则由前端裁剪:仅 AI 会话 pane)。
+/// 前端 store 喂入项目全量状态(项目全集;pane 侧仍按"仅 AI 会话 pane"裁剪)。
 #[tauri::command]
 pub fn mobile_relay_update_sessions(
     manager: tauri::State<'_, MobileRelayManager>,
     projects: Vec<SyncProject>,
 ) {
     manager.update_sessions(projects);
+}
+
+/// 启动器配置变化后重发一次全量快照(不为启动器单开增量消息)。
+#[tauri::command]
+pub fn mobile_relay_launchers_changed(
+    app: AppHandle,
+    manager: tauri::State<'_, MobileRelayManager>,
+) {
+    manager.send_snapshot(&app);
+}
+
+/// 前端执行完发起流程后回执:ok = pane 已建且启动命令已写入 PTY。
+/// `reason` 仅失败时携带,取值对齐 `StartSessionFailReason` 的 camelCase 串。
+#[tauri::command]
+pub fn mobile_relay_start_session_result(
+    manager: tauri::State<'_, MobileRelayManager>,
+    request_id: String,
+    ok: bool,
+    pane_id: Option<String>,
+    reason: Option<StartSessionFailReason>,
+) {
+    manager.send_start_receipt(
+        request_id,
+        if ok { pane_id } else { None },
+        if ok { None } else { reason.or(Some(StartSessionFailReason::SpawnFailed)) },
+    );
+}
+
+/// 校验一条启动命令能否被识别为 AI 会话(「移动端」面板保存启动器时的非阻塞提示)。
+///
+/// 这只是把失败从"手机上等 15 秒超时"前移到配置时,**不是安全防线**:
+/// 防线是"命令只能来自桌面端配置"(见 ADR 0002)。
+#[tauri::command]
+pub fn mobile_relay_check_launcher_command(command: String) -> bool {
+    crate::pty::is_interactive_ai_command(command.trim())
 }
 
 #[cfg(test)]
@@ -805,7 +1047,148 @@ mod tests {
                     status: (*status).into(),
                 })
                 .collect(),
+            can_start_session: true,
+            group_path: vec![],
         }
+    }
+
+    #[test]
+    fn sanitize_pane_title_trims_strips_controls_and_limits_length() {
+        assert_eq!(sanitize_pane_title("  重构登录  "), "重构登录");
+        // 换行/ESC 之类的控制字符会破坏 tab 栏的单行排版
+        assert_eq!(sanitize_pane_title("a\nb\x1b[31mc"), "ab[31mc");
+        // 全空白 = 清除自定义名
+        assert_eq!(sanitize_pane_title("   "), "");
+        // 按字符数限长,不是字节数——中文不该被砍成半个字
+        let long = "长".repeat(100);
+        assert_eq!(sanitize_pane_title(&long).chars().count(), MAX_PANE_TITLE_CHARS);
+    }
+
+    #[test]
+    fn can_start_session_rejects_remote_and_wsl_root_projects() {
+        // 普通 Windows 本地项目:可发起
+        assert!(can_start_session(r"D:\Git\mini-term", None));
+        assert!(can_start_session("/home/u/proj", None));
+
+        // SSH 远程项目:镜像一定是空的,置灰
+        assert!(!can_start_session("/home/u/proj", Some("conn-1")));
+
+        // WSL 根项目(UNC 路径,含 verbatim 与大小写变体):同样置灰
+        assert!(!can_start_session(r"\\wsl$\Ubuntu\home\u\proj", None));
+        assert!(!can_start_session(r"\\wsl.localhost\Debian\srv", None));
+        assert!(!can_start_session(r"\\?\UNC\wsl$\Ubuntu\home\u", None));
+        assert!(!can_start_session(r"\\WSL.LocalHost\Ubuntu\home\u", None));
+    }
+
+    #[test]
+    fn can_start_session_allows_wsl_associated_project() {
+        // WSL「关联」项目的根路径是普通 Windows 路径 —— 它不置灰:
+        // 镜像可用与否取决于启动器把 AI 起在哪一侧,不由本判定兜底
+        assert!(can_start_session(r"D:\Git\some-wsl-linked-project", None));
+    }
+
+    #[test]
+    fn diff_detects_can_start_session_change_as_upsert() {
+        // 项目从本地改成 SSH 远程(或反之)必须推到移动端,否则弹层置灰状态会陈旧
+        let prev = vec![project("p1", "demo", &[])];
+        let mut next = prev.clone();
+        next[0].can_start_session = false;
+        let (upserts, removed) = diff_sessions(&prev, &next).unwrap();
+        assert_eq!(upserts.len(), 1);
+        assert!(!upserts[0].can_start_session);
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn reject_status_maps_each_reason_to_its_own_state() {
+        // 三种拒绝的修法不同(升级 / 改密钥 / 去中转配密钥),状态串不能合并
+        assert_eq!(reject_status(DesktopRejectReason::InvalidKey), "authFailed");
+        assert_eq!(
+            reject_status(DesktopRejectReason::KeyNotConfigured),
+            "keyNotConfigured"
+        );
+        assert_eq!(
+            reject_status(DesktopRejectReason::VersionMismatch),
+            "versionMismatch"
+        );
+    }
+
+    #[test]
+    fn start_session_payload_serializes_camel_case() {
+        // 前端按 camelCase 读该事件载荷
+        let json = serde_json::to_string(&StartSessionPayload {
+            request_id: "req-1".into(),
+            project_id: "p1".into(),
+            launcher_id: "l1".into(),
+            launcher_name: "Claude".into(),
+            shell_name: Some("wsl-bash".into()),
+            command: "claude".into(),
+        })
+        .unwrap();
+        assert!(
+            json.contains(r#""requestId":"req-1""#)
+                && json.contains(r#""launcherName":"Claude""#)
+                && json.contains(r#""shellName":"wsl-bash""#),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn launcher_id_resolves_to_command_and_shell() {
+        let launchers = vec![
+            AiLauncher {
+                id: "l1".into(),
+                name: "Claude (WSL)".into(),
+                shell: Some("wsl-bash".into()),
+                command: "claude".into(),
+            },
+            AiLauncher {
+                id: "l2".into(),
+                name: "Codex".into(),
+                shell: None,
+                command: "codex".into(),
+            },
+            AiLauncher {
+                id: "l3".into(),
+                name: "Blank shell".into(),
+                shell: Some("  ".into()),
+                command: "claude".into(),
+            },
+        ];
+
+        let l1 = resolve_launcher(&launchers, "l1").unwrap();
+        assert_eq!(l1.command, "claude");
+        assert_eq!(l1.shell.as_deref(), Some("wsl-bash"));
+
+        // 未绑定 shell → None(前端据此用默认 shell)
+        let l2 = resolve_launcher(&launchers, "l2").unwrap();
+        assert_eq!(l2.command, "codex");
+        assert!(l2.shell.is_none());
+
+        // 空白 shell 名等同未绑定,不能拿去 availableShells 里找一个空名条目
+        assert!(resolve_launcher(&launchers, "l3").unwrap().shell.is_none());
+
+        // 已被删除的启动器 → launcherNotFound
+        assert_eq!(
+            resolve_launcher(&launchers, "gone").unwrap_err(),
+            StartSessionFailReason::LauncherNotFound
+        );
+    }
+
+    #[test]
+    fn launcher_command_check_matches_pty_ai_detection() {
+        // 面板保存时的提示口径 = PTY 输入检测口径(两处漂移就会出现
+        // "面板说没问题、手机上却永远等不到 AI 会话")
+        assert!(mobile_relay_check_launcher_command("claude".into()));
+        assert!(mobile_relay_check_launcher_command("  codex  ".into()));
+        assert!(mobile_relay_check_launcher_command(
+            "claude --dangerously-skip-permissions".into()
+        ));
+        // 非 AI CLI / 非交互标志:提示会被识别不了
+        assert!(!mobile_relay_check_launcher_command("npm test".into()));
+        assert!(!mobile_relay_check_launcher_command("claude -p 'hi'".into()));
+        assert!(!mobile_relay_check_launcher_command("codex --version".into()));
+        assert!(!mobile_relay_check_launcher_command(String::new()));
     }
 
     #[test]

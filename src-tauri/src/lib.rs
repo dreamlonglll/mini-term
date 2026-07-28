@@ -51,12 +51,19 @@ pub fn run() {
             let hook_state = hook_server::HookState::new();
             app.manage(hook_state.clone());
 
+            // 状态发射器:monitor 轮询与 hook server 直推共用同一份去重表,
+            // 避免迟到 hook 事件推错状态后 monitor 的纠正被去重吞掉
+            let status_emitter = process_monitor::StatusEmitter::new();
+            app.manage(status_emitter.clone());
+
             // 读取配置，仅当 hookEnabled == true 时才启动 hook server
             let app_config = config::read_config(app.handle());
             if app_config.hook_enabled {
-                if let Err(e) =
-                    hook_server::start_hook_server(app.handle().clone(), hook_state.clone())
-                {
+                if let Err(e) = hook_server::start_hook_server(
+                    app.handle().clone(),
+                    hook_state.clone(),
+                    status_emitter.clone(),
+                ) {
                     eprintln!("[setup] hook server 启动失败: {}", e);
                 }
             }
@@ -64,13 +71,21 @@ pub fn run() {
             // 启动进程监控（传入 hook_state 实现 hook 优先 + 轮询降级）
             let pty_manager = app.state::<crate::pty::PtyManager>();
             let pty_clone = pty_manager.inner().clone();
-            process_monitor::start_monitor(app.handle().clone(), pty_clone, hook_state);
+            process_monitor::start_monitor(
+                app.handle().clone(),
+                pty_clone,
+                hook_state,
+                status_emitter,
+            );
 
             // 已配置中转地址时,启动对中转服务器的出站长连(断线自动指数退避重连)
             if let Some(relay) = app_config.mobile_relay.as_ref() {
                 if !relay.relay_url.trim().is_empty() {
-                    app.state::<mobile_relay::MobileRelayManager>()
-                        .apply(app.handle(), &relay.relay_url);
+                    app.state::<mobile_relay::MobileRelayManager>().apply(
+                        app.handle(),
+                        &relay.relay_url,
+                        &relay.desktop_key,
+                    );
                 }
             }
             Ok(())
@@ -110,6 +125,7 @@ pub fn run() {
             remote_ssh::ssh_remote_validate_dir,
             remote_ssh::ssh_remote_ai_sessions,
             remote_ssh::ssh_remote_ai_session_content,
+            remote_ssh::ssh_remote_upload_paste,
             wsl_distros::list_wsl_distros,
             git::get_git_status,
             git::get_git_diff,
@@ -127,6 +143,11 @@ pub fn run() {
             git::git_unstage_all,
             git::git_commit,
             git::git_discard_file,
+            git::list_worktrees,
+            git::add_worktree,
+            git::remove_worktree,
+            git::prune_worktrees,
+            git::get_worktree_branches,
             editor::open_in_editor,
             editor::open_path_with_default_app,
             clipboard::read_clipboard_image,
@@ -146,6 +167,9 @@ pub fn run() {
             mobile_relay::mobile_relay_request_pairing_code,
             mobile_relay::mobile_relay_reset_pairing,
             mobile_relay::mobile_relay_update_sessions,
+            mobile_relay::mobile_relay_launchers_changed,
+            mobile_relay::mobile_relay_start_session_result,
+            mobile_relay::mobile_relay_check_launcher_command,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

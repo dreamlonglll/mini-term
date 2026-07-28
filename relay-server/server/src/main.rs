@@ -1,6 +1,8 @@
 //! 中转服务器入口:环境变量配置后启动。
 //! - `RELAY_BIND`(默认 0.0.0.0)/ `RELAY_PORT`(默认 8080)
 //! - `RELAY_PWA_DIR`(默认 ./pwa):移动端 PWA 静态资源目录
+//! - `MT_RELAY_DESKTOP_KEY`(**必配**):桌面端接入共享密钥。未配置时 fail-closed,
+//!   拒绝一切桌面端连接——"能跑起来"不等于"配好了"(见 ADR 0002)。
 
 use mt_relay_server::{app_with_pwa, RelayState};
 
@@ -12,6 +14,7 @@ async fn main() {
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(8080);
     let pwa_dir = std::env::var("RELAY_PWA_DIR").unwrap_or_else(|_| "./pwa".into());
+    let state = RelayState::new().with_desktop_key(std::env::var("MT_RELAY_DESKTOP_KEY").ok());
 
     let listener = tokio::net::TcpListener::bind((bind.as_str(), port))
         .await
@@ -22,8 +25,16 @@ async fn main() {
         "[relay] listening on {bind}:{actual_port} (protocol v{}, pwa dir: {pwa_dir})",
         mt_relay_protocol::PROTOCOL_VERSION
     );
+    if state.desktop_key_configured() {
+        eprintln!("[relay] desktop key configured: desktop connections require MT_RELAY_DESKTOP_KEY");
+    } else {
+        eprintln!(
+            "[relay] MT_RELAY_DESKTOP_KEY is NOT set — ALL desktop connections will be rejected. \
+             Set it on the relay and enter the same value in mini-term's Mobile panel."
+        );
+    }
 
-    axum::serve(listener, app_with_pwa(RelayState::new(), &pwa_dir))
+    axum::serve(listener, app_with_pwa(state, &pwa_dir))
         .await
         .expect("relay server crashed");
 }
