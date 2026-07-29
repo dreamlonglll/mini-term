@@ -7,6 +7,7 @@ import remarkGfm from 'remark-gfm';
 import rehypeRaw from 'rehype-raw';
 import type { FileContentResult } from '../types';
 import { openExternalUrl } from '../utils/externalLink';
+import { useOverlayPresence } from '../hooks/useOverlayMotion';
 import { Modal } from './Modal';
 import { useT } from '../i18n';
 
@@ -97,6 +98,7 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
   const [history, setHistory] = useState<string[]>([]);
   const highlightRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
+  const present = useOverlayPresence(open);
 
   const isMd = useMemo(() => isMarkdownFile(currentPath), [currentPath]);
   const isImg = useMemo(() => isImageFile(currentPath), [currentPath]);
@@ -193,7 +195,8 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
     }
   }, [result, highlightLine, currentPath, filePath]);
 
-  if (!open) return null;
+  // 关闭后不立刻塌掉子树，留给 Modal 播退场动画
+  if (!present) return null;
 
   const fileName = currentPath.replace(/\\/g, '/').split('/').pop() ?? currentPath;
 

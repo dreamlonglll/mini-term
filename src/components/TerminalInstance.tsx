@@ -275,7 +275,10 @@ export function TerminalInstance({ ptyId }: Props) {
       >
         {/* cursor-none 曾挂在这里,但 xterm.css 的 `.xterm { cursor: text }` 把它整个盖掉了,
             只在 padding 缝隙生效 —— 留着纯属误导,已移除 */}
-        <div ref={containerRef} className="absolute top-1.5 bottom-0 left-2.5 right-0" />
+        {/* key={ptyId}：切 pane 时让这层重建，淡入动画才会重播。
+            外层带 data-pty-id 的盒子不参与动画 —— 查找条与拖拽命中都按它的
+            矩形定位，跟着一起位移会让它们在这 0.2s 里飘一下 */}
+        <div key={ptyId} ref={containerRef} className="absolute top-1.5 bottom-0 left-2.5 right-0 terminal-swap-in" />
 
         {fileDrag && (
           <div

@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef, memo, useMemo, useId } from '
 import { invoke } from '@tauri-apps/api/core';
 import { writeText } from '@tauri-apps/plugin-clipboard-manager';
 import { useTauriEvent } from '../hooks/useTauriEvent';
+import { useOverlayValue } from '../hooks/useOverlayMotion';
 import { showContextMenu } from '../utils/contextMenu';
 import { isAiPty } from '../utils/terminalCache';
 import { useAppStore } from '../store';
@@ -327,6 +328,7 @@ export function GitHistoryContent({ projectPath, repos, refreshRepos, onOpenWork
     commitMessage: string;
     files: CommitFileInfo[];
   } | null>(null);
+  const [heldDiff, diffOpen] = useOverlayValue(diffModal);
 
   // branch name → commit hash 映射（每个 repo 独立）
   const [repoBranches, setRepoBranches] = useState<Map<string, BranchInfo[]>>(new Map());
@@ -852,14 +854,15 @@ export function GitHistoryContent({ projectPath, repos, refreshRepos, onOpenWork
         {repoTree.map((node) => renderTreeNode(node, 0))}
       </div>
 
-      {diffModal && (
+      {/* 置空后再多留一会儿（useOverlayValue），退场动画才播得完 */}
+      {heldDiff && (
         <CommitDiffModal
-          open={diffModal.open}
+          open={diffOpen && heldDiff.open}
           onClose={() => setDiffModal(null)}
-          repoPath={diffModal.repoPath}
-          commitHash={diffModal.commitHash}
-          commitMessage={diffModal.commitMessage}
-          files={diffModal.files}
+          repoPath={heldDiff.repoPath}
+          commitHash={heldDiff.commitHash}
+          commitMessage={heldDiff.commitMessage}
+          files={heldDiff.files}
         />
       )}
     </div>

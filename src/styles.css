@@ -48,6 +48,18 @@
   --radius-sm: 4px;
   --radius-md: 6px;
 
+  /* 浮层进出场动效。进场比出场慢一档：出现要看得见「从哪来」，
+     消失只需干脆让路，拖长了会显得应用反应迟钝。 */
+  --motion-overlay-in: 0.24s;
+  --motion-overlay-out: 0.14s;
+  --motion-menu-in: 0.16s;
+  /* 切终端要比开弹窗更快：这是高频操作，慢一点就变成「卡了一下」 */
+  --motion-terminal-swap: 0.2s;
+  --motion-tab-indicator: 0.22s;
+  /* easeOutExpo：起步快、尾段缓，收尾有「停稳」的手感（不是弹跳） */
+  --ease-overlay-in: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-overlay-out: cubic-bezier(0.4, 0, 0.9, 0.6);
+
   /* App font family (overridable via uiFontFamily config) */
   --app-font-family: 'DM Sans', system-ui, -apple-system, sans-serif;
   --app-font-mono: 'JetBrains Mono', 'Cascadia Code', Consolas, monospace;
@@ -187,11 +199,6 @@ body.ssh-conn-dragging {
   50% { opacity: 0.2; transform: scale(0.75); }
 }
 
-@keyframes slideIn {
-  from { opacity: 0; transform: scale(0.96); }
-  to { opacity: 1; transform: scale(1); }
-}
-
 .animate-glow {
   animation: subtleGlow 2s ease-in-out infinite;
 }
@@ -200,8 +207,78 @@ body.ssh-conn-dragging {
   animation: alertBlink 0.8s ease-in-out infinite;
 }
 
-.animate-slide-in {
-  animation: slideIn 0.12s ease-out;
+/* ===== 浮层进出场 =====
+   所有弹窗/菜单/抽屉共用同一组关键帧，手感在应用里保持一致：
+   遮罩淡入淡出，面板在淡入的同时从上方一点点落下并放大到位。
+
+   只有**出场**用 `forwards`：它需要停在末帧，等 JS 把 DOM 摘掉，
+   否则动画一跑完就闪回原样。进场绝不能加 —— 残留的 `transform: scale(1)`
+   会让面板一直是 containing block，把子树里的 `position: fixed` 拽进面板。 */
+@keyframes overlayFadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes overlayFadeOut {
+  from { opacity: 1; }
+  to { opacity: 0; }
+}
+
+@keyframes modalPopIn {
+  from { opacity: 0; transform: translateY(-18px) scale(0.94); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@keyframes modalPopOut {
+  from { opacity: 1; transform: translateY(0) scale(1); }
+  to { opacity: 0; transform: translateY(-10px) scale(0.97); }
+}
+
+/* 菜单/浮条：位移更小、更快 —— 它们贴着触发点出现，大幅位移会「飞」 */
+@keyframes menuPopIn {
+  from { opacity: 0; transform: translateY(-6px) scale(0.96); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@keyframes drawerSlideIn {
+  from { transform: translateX(100%); }
+  to { transform: translateX(0); }
+}
+
+/* 切换 pane（同一分屏格子里换终端）时，新终端淡入并轻抬一点。
+   位移只有 6px 且不加 forwards —— 动画一结束 transform 就撤掉，
+   xterm 的 canvas 不会长期停在合成层上，鼠标选区的坐标换算也不受影响。 */
+@keyframes terminalSwapIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.overlay-backdrop {
+  animation: overlayFadeIn var(--motion-overlay-in) var(--ease-overlay-in);
+}
+
+.overlay-panel {
+  animation: modalPopIn var(--motion-overlay-in) var(--ease-overlay-in);
+}
+
+.overlay-backdrop.is-closing {
+  animation: overlayFadeOut var(--motion-overlay-out) var(--ease-overlay-out) forwards;
+}
+
+.overlay-panel.is-closing {
+  animation: modalPopOut var(--motion-overlay-out) var(--ease-overlay-out) forwards;
+}
+
+.overlay-menu {
+  animation: menuPopIn var(--motion-menu-in) var(--ease-overlay-in);
+}
+
+.overlay-drawer {
+  animation: drawerSlideIn var(--motion-overlay-in) var(--ease-overlay-in);
+}
+
+.terminal-swap-in {
+  animation: terminalSwapIn var(--motion-terminal-swap) var(--ease-overlay-in);
 }
 
 /* AI 运行中的状态点。形状是 spinner（底圈 + 一段亮弧），就得真的转起来；
@@ -241,6 +318,42 @@ body.ssh-conn-dragging {
   .animate-spin {
     animation-duration: 2.4s !important;
     animation-iteration-count: infinite !important;
+  }
+
+  /* 例外：浮层的**进出场**照常播完整动画，不受本段影响。
+     Windows 上「关闭窗口动画」（SPI_GETCLIENTAREAANIMATION=FALSE）就会让
+     WebView2 落进 reduce 分支 —— 走到这里的多半不是前庭敏感用户，而是把系统
+     视觉效果调成「最佳性能」的人，他们并不想让应用里的转场也一起消失。
+     弹窗凭空出现/消失反而让人分不清界面刚发生了什么。
+     只覆盖 duration：通配规则动的就是它（name/fill-mode 原样保留，
+     所以退场的 forwards 仍在，动画结束前不会闪回）。 */
+  .overlay-backdrop,
+  .overlay-panel,
+  .overlay-drawer,
+  .prompt-overlay,
+  .prompt-dialog {
+    animation-duration: var(--motion-overlay-in) !important;
+  }
+
+  .overlay-menu,
+  .ctx-menu {
+    animation-duration: var(--motion-menu-in) !important;
+  }
+
+  /* 同理：切终端的淡入与 tab 指示条的滑动也照常播 */
+  .terminal-swap-in {
+    animation-duration: var(--motion-terminal-swap) !important;
+  }
+
+  .pane-tab-indicator {
+    transition-duration: var(--motion-tab-indicator) !important;
+  }
+
+  .overlay-backdrop.is-closing,
+  .overlay-panel.is-closing,
+  .prompt-overlay.is-closing,
+  .prompt-overlay.is-closing .prompt-dialog {
+    animation-duration: var(--motion-overlay-out) !important;
   }
 }
 
@@ -387,10 +500,18 @@ body.ssh-conn-dragging {
   backdrop-filter: blur(12px);
   padding: 4px;
   z-index: 50;
-  animation: slideIn 0.12s ease-out;
+  /* 菜单出现在鼠标位置：以左上角为原点展开，看上去是「从光标里长出来」，
+     而不是整块凭空缩放。菜单被视口边缘翻转时原点随之改（见 .ctx-menu-flip-*） */
+  transform-origin: top left;
+  animation: menuPopIn var(--motion-menu-in) var(--ease-overlay-in);
   transition: background-color 0.25s ease, color 0.25s ease,
               border-color 0.25s ease, box-shadow 0.25s ease;
 }
+
+/* 贴边翻转后菜单在光标的左侧/上方，展开原点要跟着换到那一角 */
+.ctx-menu.flip-x { transform-origin: top right; }
+.ctx-menu.flip-y { transform-origin: bottom left; }
+.ctx-menu.flip-x.flip-y { transform-origin: bottom right; }
 
 .ctx-menu-item {
   display: flex;
@@ -471,6 +592,7 @@ body.ssh-conn-dragging {
   justify-content: center;
   background: rgba(0, 0, 0, 0.5);
   backdrop-filter: blur(4px);
+  animation: overlayFadeIn var(--motion-overlay-in) var(--ease-overlay-in);
 }
 
 .prompt-dialog {
@@ -480,9 +602,20 @@ body.ssh-conn-dragging {
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-overlay);
   padding: 20px;
-  animation: slideIn 0.12s ease-out;
+  animation: modalPopIn var(--motion-overlay-in) var(--ease-overlay-in);
   transition: background-color 0.25s ease, color 0.25s ease,
               border-color 0.25s ease, box-shadow 0.25s ease;
+}
+
+/* 关闭：整块（遮罩 + 对话框）一起退场，DOM 由 prompt.ts 在动画结束后移除。
+   期间禁掉命中，免得动画那 0.14s 里还能点到已经"关掉"的按钮 */
+.prompt-overlay.is-closing {
+  animation: overlayFadeOut var(--motion-overlay-out) var(--ease-overlay-out) forwards;
+  pointer-events: none;
+}
+
+.prompt-overlay.is-closing .prompt-dialog {
+  animation: modalPopOut var(--motion-overlay-out) var(--ease-overlay-out) forwards;
 }
 
 .prompt-title {

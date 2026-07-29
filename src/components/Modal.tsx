@@ -1,6 +1,7 @@
-import { useEffect, useRef, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { isTopOverlay, popOverlay, pushOverlay } from '../utils/overlayStack';
+import { OVERLAY_EXIT_MS } from '../hooks/useOverlayMotion';
 import { useT } from '../i18n';
 
 /**
@@ -14,6 +15,10 @@ import { useT } from '../i18n';
  *  - 补齐 `role="dialog"` / `aria-modal`、打开即聚焦、焦点不外泄、关闭还原焦点
  *
  * 嵌套弹窗（如搜索里再开文件预览）靠模块级栈处理：Esc 只关最上面那个。
+ *
+ * 进出场动画：`open` 转 false 时不立刻卸载，先播退场动画（见 `.overlay-panel`），
+ * 动画结束才移除 DOM。这期间面板停止响应交互、也已从覆盖物栈里出栈 ——
+ * 「关掉了但还看得见」的那 0.14s 不该再吃 Esc、也不该还能点。
  */
 
 const FOCUSABLE = [
@@ -57,6 +62,32 @@ export function Modal({
   const panelRef = useRef<HTMLDivElement>(null);
   const idRef = useRef<number>(0);
   const restoreFocusRef = useRef<HTMLElement | null>(null);
+
+  // 渲染与 open 解耦：关闭后多留一会儿把退场动画播完。
+  // `open` 一为真立刻渲染（不等 effect），开弹窗不会慢一帧
+  const [lingering, setLingering] = useState(false);
+  const rendered = open || lingering;
+  const closing = !open && lingering;
+
+  // 退场期间冻结内容：调用方多半在 onClose 里顺手清空了数据源
+  // （`setTarget(null)` / `open={!!repoPath}`），照常渲染会让面板在淡出的同时
+  // 变空、标题消失甚至抛错。这里存住关闭前那一帧的 element 引用继续渲染 ——
+  // 引用没变，React 直接跳过这棵子树，连滚动位置都原样留着。
+  const frozenRef = useRef({ children, title, headerExtra });
+  if (open) frozenRef.current = { children, title, headerExtra };
+  const view = open ? { children, title, headerExtra } : frozenRef.current;
+
+  // 动画结束才卸载。animationend 是主路径，定时器只是兜底 ——
+  // 用户自带的 CSS、或动画被 `animation: none` 覆盖时事件不会来，
+  // 没有兜底面板就永远留在 DOM 上了
+  useEffect(() => {
+    if (open) {
+      setLingering(true);
+      return;
+    }
+    const timer = window.setTimeout(() => setLingering(false), OVERLAY_EXIT_MS);
+    return () => window.clearTimeout(timer);
+  }, [open]);
 
   // 入栈 / 出栈 + 焦点保存还原
   useEffect(() => {
@@ -123,38 +154,44 @@ export function Modal({
     return () => window.removeEventListener('keydown', handler, true);
   }, [open, onClose, closeOnEscape]);
 
-  if (!open) return null;
+  if (!rendered) return null;
 
   return createPortal(
     <div
       className={`fixed inset-0 z-50 flex justify-center ${
         align === 'top' ? 'items-start pt-[10vh]' : 'items-center'
-      }`}
-      onMouseDown={closeOnOverlay ? (e) => {
+      } ${closing ? 'pointer-events-none' : ''}`}
+      // 退场中已经不算「当前弹窗」：藏掉无障碍树，别再报一个 dialog 给读屏
+      aria-hidden={closing || undefined}
+      onMouseDown={closeOnOverlay && !closing ? (e) => {
         // mousedown 而非 click：在面板里按下、拖到遮罩上松手（选文本）不该关窗
         if (e.target === e.currentTarget) onClose();
       } : undefined}
     >
-      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm pointer-events-none" />
+      <div className={`absolute inset-0 bg-black/50 backdrop-blur-sm pointer-events-none overlay-backdrop ${closing ? 'is-closing' : ''}`} />
       <div
         ref={panelRef}
         role="dialog"
         aria-modal="true"
-        aria-label={typeof title === 'string' ? title : ariaLabel}
+        aria-label={typeof view.title === 'string' ? view.title : ariaLabel}
         tabIndex={-1}
-        className={`relative flex flex-col overflow-hidden bg-[var(--bg-surface)] border border-[var(--border-strong)] rounded-[var(--radius-md)] shadow-[var(--shadow-overlay)] animate-slide-in outline-none ${panelClassName}`}
+        className={`relative flex flex-col overflow-hidden bg-[var(--bg-surface)] border border-[var(--border-strong)] rounded-[var(--radius-md)] shadow-[var(--shadow-overlay)] overlay-panel outline-none ${closing ? 'is-closing' : ''} ${panelClassName}`}
         onMouseDown={(e) => e.stopPropagation()}
+        // 只认面板自己的动画：子树里的 spinner、进度条动画也会冒泡到这里
+        onAnimationEnd={(e) => {
+          if (closing && e.target === e.currentTarget) setLingering(false);
+        }}
       >
-        {title !== undefined && (
+        {view.title !== undefined && (
           <div className="flex items-center justify-between gap-3 px-5 py-4 border-b border-[var(--border-subtle)] flex-shrink-0">
-            <h2 className="text-lg font-semibold text-[var(--text-primary)] truncate">{title}</h2>
+            <h2 className="text-lg font-semibold text-[var(--text-primary)] truncate">{view.title}</h2>
             <div className="flex items-center gap-2 flex-shrink-0">
-              {headerExtra}
+              {view.headerExtra}
               <ModalCloseButton onClose={onClose} />
             </div>
           </div>
         )}
-        {children}
+        {view.children}
       </div>
     </div>,
     document.body,

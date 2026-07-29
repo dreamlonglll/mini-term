@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { writeText } from '@tauri-apps/plugin-clipboard-manager';
 import { useAppStore } from '../store';
 import { useTauriEvent } from '../hooks/useTauriEvent';
+import { useOverlayPresence, useOverlayValue } from '../hooks/useOverlayMotion';
 import { FileViewerModal } from './FileViewerModal';
 import { showContextMenu } from '../utils/contextMenu';
 import { MOD_LABEL } from '../utils/platform';
@@ -117,6 +118,8 @@ export function SearchModal({ open, onClose }: SearchModalProps) {
   const [viewHighlightLine, setViewHighlightLine] = useState<number | undefined>();
   const inputRef = useRef<HTMLInputElement>(null);
   const searchIdRef = useRef<string | null>(null);
+  const present = useOverlayPresence(open);
+  const [viewFile, viewFileOpen] = useOverlayValue(viewFilePath);
 
   const activeProjectId = useAppStore((s) => s.activeProjectId);
   const config = useAppStore((s) => s.config);
@@ -216,7 +219,8 @@ export function SearchModal({ open, onClose }: SearchModalProps) {
     [project],
   );
 
-  if (!open) return null;
+  // 关闭后不立刻塌掉子树，留给 Modal 播退场动画
+  if (!present) return null;
 
   return (
     <Modal
@@ -344,11 +348,12 @@ export function SearchModal({ open, onClose }: SearchModalProps) {
           {status === 'idle' && <span>{t('search.shortcutHint', { mod: MOD_LABEL })}</span>}
         </div>
 
-      {viewFilePath && project && (
+      {/* 预览路径置空后再多留一会儿（useOverlayValue），预览窗才有时间淡出 */}
+      {viewFile && project && (
         <FileViewerModal
-          open={!!viewFilePath}
+          open={viewFileOpen}
           onClose={() => setViewFilePath(null)}
-          filePath={viewFilePath}
+          filePath={viewFile}
           projectRoot={project.path}
           highlightLine={viewHighlightLine}
         />

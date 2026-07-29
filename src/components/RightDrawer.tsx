@@ -56,7 +56,7 @@ export function RightDrawer({ initialWidth, onResizeEnd }: RightDrawerProps) {
 
   return (
     <div
-      className="absolute top-0 right-0 h-full z-30 flex flex-col bg-[var(--bg-surface)] border-l border-[var(--border-default)] shadow-[var(--shadow-overlay)]"
+      className="absolute top-0 right-0 h-full z-30 flex flex-col bg-[var(--bg-surface)] border-l border-[var(--border-default)] shadow-[var(--shadow-overlay)] overlay-drawer"
       style={{ width }}
     >
       {/* 左缘拖拽手柄 */}

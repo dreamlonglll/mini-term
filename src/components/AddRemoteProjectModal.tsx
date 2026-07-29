@@ -4,6 +4,7 @@ import { useAppStore, genId, persistConfig } from '../store';
 import { buildGroupBuckets, connectionSummary, GroupSidebarRow } from './SshModal';
 import type { SshGroupBucket } from './SshModal';
 import { Modal, ModalCloseButton } from './Modal';
+import { useOverlayPresence } from '../hooks/useOverlayMotion';
 import { findGroupInTree } from '../utils/projectTree';
 import { useT } from '../i18n';
 import type { ProjectConfig } from '../types';
@@ -35,6 +36,7 @@ export function AddRemoteProjectModal({ open, onClose, targetGroupId }: Props) {
   /** 左栏选中态：null = 全部；'' = 未分组；其他 = 具名分组名（与 SshModal 一致） */
   const [selectedGroup, setSelectedGroup] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  const present = useOverlayPresence(open);
 
   useEffect(() => {
     if (open) {
@@ -88,7 +90,8 @@ export function AddRemoteProjectModal({ open, onClose, targetGroupId }: Props) {
     }
   }, [busy, connectionId, path, name, onClose, targetGroupId, t]);
 
-  if (!open) return null;
+  // 关闭后不立刻塌掉子树，留给 Modal 播退场动画
+  if (!present) return null;
 
   // 分组归类与 SshModal / SshAssocModal 共用同一份逻辑（含显式创建的空分组）
   const { namedGroups, ungroupedItems } = buildGroupBuckets(connections, sshGroups);
@@ -126,7 +129,7 @@ export function AddRemoteProjectModal({ open, onClose, targetGroupId }: Props) {
 
   return (
     <Modal
-      open
+      open={open}
       onClose={onClose}
       ariaLabel={t('remoteProject.title')}
       panelClassName="w-[720px] h-[70vh] max-h-[680px]"

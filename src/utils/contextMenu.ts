@@ -165,8 +165,16 @@ export function showContextMenu(x: number, y: number, items: MenuEntry[]) {
     const { offsetWidth: w, offsetHeight: h } = menu;
     let fx = px;
     let fy = py;
-    if (px + w + margin > window.innerWidth) fx = Math.max(margin, px - w);
-    if (py + h + margin > window.innerHeight) fy = Math.max(margin, py - h);
+    // 翻转后菜单落在光标的左侧/上方,展开动画的原点要跟着挪到那一角,
+    // 否则菜单看上去是从"光标对面"长出来的
+    if (px + w + margin > window.innerWidth) {
+      fx = Math.max(margin, px - w);
+      menu.classList.add('flip-x');
+    }
+    if (py + h + margin > window.innerHeight) {
+      fy = Math.max(margin, py - h);
+      menu.classList.add('flip-y');
+    }
     menu.style.left = `${fx}px`;
     menu.style.top = `${fy}px`;
     menu.style.visibility = '';
