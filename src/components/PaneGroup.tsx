@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useLayoutEffect, useCallback } from 'react';
+import { useState, useRef, useEffect, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '../store';
@@ -209,37 +209,6 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
     useAppStore.getState().resetPaneForReconnect(projectId, activePane.id);
   }, [activePane, projectId]);
 
-  // ── 活动 tab 的下划线：一条公用的指示条滑过去，而不是每个 tab 各画各的 ──
-  const tabBarRef = useRef<HTMLDivElement>(null);
-  const tabRefs = useRef(new Map<string, HTMLDivElement>());
-  const [indicator, setIndicator] = useState({ left: 0, width: 0 });
-
-  const activePaneId = activePane?.id;
-  const paneCount = node.panes.length;
-  // 依赖里带上 tab 数量与标题：新建/关闭/重命名都会改变其余 tab 的位置与宽度
-  const tabSignature = node.panes.map((p) => p.customTitle ?? p.shellName).join(' ');
-
-  useLayoutEffect(() => {
-    const measure = () => {
-      const el = activePaneId ? tabRefs.current.get(activePaneId) : undefined;
-      // 宽度为 0 = 项目被切到后台（App 用 display:none 留着不卸载），
-      // 此刻量出来的全是 0，先把指示条藏掉，等 ResizeObserver 在切回来时重量
-      if (!el || el.offsetWidth === 0) {
-        setIndicator((prev) => (prev.width === 0 ? prev : { ...prev, width: 0 }));
-        return;
-      }
-      // 左右各缩 8px，与原先 `left-2 right-2` 的下划线宽度一致
-      setIndicator({ left: el.offsetLeft + 8, width: Math.max(0, el.offsetWidth - 16) });
-    };
-    measure();
-
-    const bar = tabBarRef.current;
-    if (!bar) return;
-    const ro = new ResizeObserver(measure);
-    ro.observe(bar);
-    return () => ro.disconnect();
-  }, [activePaneId, paneCount, tabSignature]);
-
   const paneContextMenu = useCallback((e: React.MouseEvent, paneId: string) => {
     e.preventDefault();
     e.stopPropagation();
@@ -260,36 +229,21 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
     'w-6 h-6 flex items-center justify-center rounded-[var(--radius-sm)] text-[var(--text-muted)] opacity-60 hover:opacity-100 hover:text-[var(--accent)] hover:bg-[var(--border-subtle)] transition-all';
 
   return (
-    <div className="w-full h-full flex flex-col" data-pty-id={activePane.ptyId}>
+    // pane-enter：新分出来的格子淡入并放大到位。项目切到后台是 display:none
+    // 留着不卸载，不会重播；只有真正新建/重排分屏时这层才重挂载
+    <div className="w-full h-full flex flex-col pane-enter" data-pty-id={activePane.ptyId}>
       {/* Tab bar */}
       <div
-        ref={tabBarRef}
         data-panel-header
-        className="relative flex items-stretch bg-[var(--bg-elevated)] border-b border-[var(--border-subtle)] text-xs overflow-x-auto select-none shrink-0"
+        className="flex items-stretch bg-[var(--bg-elevated)] border-b border-[var(--border-subtle)] text-xs overflow-x-auto select-none shrink-0"
         role="tablist"
         aria-label={t('paneGroup.tablistLabel')}
       >
-        {/* 活动 tab 的下划线。放在 tab 之外、滚动内容层里：切 tab 时滑过去，
-            宽度也一起补间，比每个 tab 各自瞬现更能看出「切到哪儿了」 */}
-        <span
-          aria-hidden
-          className="pane-tab-indicator pointer-events-none absolute bottom-0 left-0 h-[2px] rounded-full bg-[var(--accent)] transition-[transform,width,opacity] ease-out"
-          style={{
-            transform: `translateX(${indicator.left}px)`,
-            width: indicator.width,
-            opacity: indicator.width > 0 ? 1 : 0,
-            transitionDuration: 'var(--motion-tab-indicator)',
-          }}
-        />
         {node.panes.map((pane) => {
           const isActive = pane.id === activePane.id;
           return (
             <div
               key={pane.id}
-              ref={(el) => {
-                if (el) tabRefs.current.set(pane.id, el);
-                else tabRefs.current.delete(pane.id);
-              }}
               data-pane-tab
               role="tab"
               tabIndex={isActive ? 0 : -1}

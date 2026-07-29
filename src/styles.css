@@ -56,6 +56,7 @@
   /* 切终端要比开弹窗更快：这是高频操作，慢一点就变成「卡了一下」 */
   --motion-terminal-swap: 0.2s;
   --motion-tab-indicator: 0.22s;
+  --motion-pane-enter: 0.26s;
   /* easeOutExpo：起步快、尾段缓，收尾有「停稳」的手感（不是弹跳） */
   --ease-overlay-in: cubic-bezier(0.16, 1, 0.3, 1);
   --ease-overlay-out: cubic-bezier(0.4, 0, 0.9, 0.6);
@@ -253,6 +254,24 @@ body.ssh-conn-dragging {
   to { opacity: 1; transform: translateY(0); }
 }
 
+@keyframes drawerSlideOut {
+  from { transform: translateX(0); }
+  to { transform: translateX(100%); }
+}
+
+/* 新分出来的 pane：淡入 + 轻微放大到位，让「这里多了一块」看得出来。
+   缩放幅度压到 0.97 —— 再大就会让 xterm 的 canvas 在这几帧里明显发虚。 */
+@keyframes paneEnter {
+  from { opacity: 0; transform: scale(0.97); }
+  to { opacity: 1; transform: scale(1); }
+}
+
+/* 抽屉里 Sessions ↔ Git 换面板：横向带一点位移，方向感比纯淡入强 */
+@keyframes panelSwapIn {
+  from { opacity: 0; transform: translateX(10px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
 .overlay-backdrop {
   animation: overlayFadeIn var(--motion-overlay-in) var(--ease-overlay-in);
 }
@@ -277,9 +296,23 @@ body.ssh-conn-dragging {
   animation: drawerSlideIn var(--motion-overlay-in) var(--ease-overlay-in);
 }
 
+.overlay-drawer.is-closing {
+  animation: drawerSlideOut var(--motion-overlay-out) var(--ease-overlay-out) forwards;
+  pointer-events: none;
+}
+
 .terminal-swap-in {
   animation: terminalSwapIn var(--motion-terminal-swap) var(--ease-overlay-in);
 }
+
+.pane-enter {
+  animation: paneEnter var(--motion-pane-enter) var(--ease-overlay-in);
+}
+
+.panel-swap-in {
+  animation: panelSwapIn var(--motion-terminal-swap) var(--ease-overlay-in);
+}
+
 
 /* AI 运行中的状态点。形状是 spinner（底圈 + 一段亮弧），就得真的转起来；
    匀速旋转也比呼吸/闪烁更贴「正在进行」的语义，且不抢注意力。
@@ -340,12 +373,21 @@ body.ssh-conn-dragging {
     animation-duration: var(--motion-menu-in) !important;
   }
 
-  /* 同理：切终端的淡入与 tab 指示条的滑动也照常播 */
-  .terminal-swap-in {
+  /* 同理：切终端 / 分屏 / 换面板的动画与 tab 指示条的滑动也照常播 */
+  .terminal-swap-in,
+  .panel-swap-in {
     animation-duration: var(--motion-terminal-swap) !important;
   }
 
-  .pane-tab-indicator {
+  .pane-enter {
+    animation-duration: var(--motion-pane-enter) !important;
+  }
+
+  .overlay-drawer.is-closing {
+    animation-duration: var(--motion-overlay-out) !important;
+  }
+
+  .drawer-tab-indicator {
     transition-duration: var(--motion-tab-indicator) !important;
   }
 
