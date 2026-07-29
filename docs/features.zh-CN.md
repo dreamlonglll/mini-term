@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.8.3-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.8.4-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -147,6 +147,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 - **版本检查** — 启动时拉取 GitHub Release，有新版本时侧栏图标高亮提示、点击前往下载；版本号写入原生窗口标题
 - **中英双语界面** — 「设置 → 系统」一键切换中 / 英文，整个界面实时重渲染；首次启动按系统语言自动探测并记忆选择，重启保留。每个页面、每个功能的文案均已翻译，内置轻量 i18n 层（无额外运行时依赖）
 - **设置中心** — 统一的 SettingsModal 管理主题、字体、Shell、AI 通知等所有开关
+- **界面动效** — 弹窗 / 右键菜单 / 侧拉抽屉共用一套进出场动画：遮罩淡入、面板落下并放大到位，关闭时反向播完再卸载（期间冻结内容、退出覆盖物栈，不会在淡出中变空或仍吃 Esc）；右键菜单从光标位置展开，切换终端与新建分屏各有过渡。系统关掉窗口动画（`prefers-reduced-motion: reduce`）时这套转场照常保留，只停掉状态点闪烁一类的循环动画
 
 ## 技术栈
 
