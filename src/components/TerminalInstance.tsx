@@ -108,6 +108,7 @@ export function TerminalInstance({ ptyId }: Props) {
     requestAnimationFrame(() => {
       if (container.clientWidth > 0 && container.clientHeight > 0) {
         fitAddon.fit();
+        // 尺寸真变时 onResize 已上报过;这里兜底同步,后端对同尺寸去重,重复上报无害
         invoke('resize_pty', { ptyId, cols: term.cols, rows: term.rows });
         term.refresh(0, term.rows - 1);
         // split/remount 后视口可能停留在 buffer 顶部，滚回光标位置

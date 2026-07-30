@@ -238,6 +238,8 @@ struct PtyInstance {
     writer: Box<dyn Write + Send>,
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
+    /// 上次已应用的 PTY 尺寸 (cols, rows),resize_pty 用它做同尺寸去重
+    last_size: (u16, u16),
 }
 
 #[derive(Clone)]
@@ -393,6 +395,12 @@ const DOUBLE_CTRLC_WINDOW: Duration = Duration::from_millis(1000);
 
 /// 按下 Enter 后扫描输出以检测 AI 命令 echo 的时间窗口
 const AI_ENTER_SCAN_WINDOW: Duration = Duration::from_millis(2000);
+
+/// PTY 创建时的初始尺寸。前端挂载后首次 fit 会立即上报真实尺寸;
+/// openpty 与 last_size(resize_pty 同尺寸去重的首个基准)必须取自这两个常量,
+/// 否则初始值失同步会让第一次 resize 被误去重吞掉。
+const INITIAL_PTY_COLS: u16 = 80;
+const INITIAL_PTY_ROWS: u16 = 24;
 
 /// PTY resize 后的 TUI 重绘冷却窗口
 ///
@@ -828,8 +836,8 @@ pub fn create_pty(
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
-            rows: 24,
-            cols: 80,
+            rows: INITIAL_PTY_ROWS,
+            cols: INITIAL_PTY_COLS,
             pixel_width: 0,
             pixel_height: 0,
         })
@@ -1153,6 +1161,7 @@ pub fn create_pty(
                 writer,
                 master,
                 child,
+                last_size: (INITIAL_PTY_COLS, INITIAL_PTY_ROWS),
             },
         );
     }
@@ -1243,8 +1252,15 @@ pub fn resize_pty(
     rows: u16,
 ) -> Result<(), String> {
     {
-        let instances = state.instances.lock().unwrap();
-        let instance = instances.get(&pty_id).ok_or("PTY not found")?;
+        let mut instances = state.instances.lock().unwrap();
+        let instance = instances.get_mut(&pty_id).ok_or("PTY not found")?;
+        // 同尺寸去重:前端挂载/切 tab 路径会重复上报未变的尺寸,而 ConPTY 收到
+        // resize(即使同尺寸)会让 TUI 应用整屏重绘 —— Ink(Claude Code)的帧高于
+        // 视口时,每次重绘都往 scrollback 漏一份残留(见 terminalCache.ts 的
+        // alt-screen 注释)。尺寸没变就不透传,也不开冷却窗口。
+        if instance.last_size == (cols, rows) {
+            return Ok(());
+        }
         instance
             .master
             .resize(PtySize {
@@ -1254,6 +1270,7 @@ pub fn resize_pty(
                 pixel_height: 0,
             })
             .map_err(|e| e.to_string())?;
+        instance.last_size = (cols, rows);
     }
 
     // 开启冷却窗口:之后 RESIZE_COOLDOWN 内的 PTY 输出(主要是 TUI 重绘)
