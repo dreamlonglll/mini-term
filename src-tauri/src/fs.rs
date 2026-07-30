@@ -404,6 +404,11 @@ pub fn write_file_content(
     path: String,
     content: String,
 ) -> Result<(), String> {
+    // 与读侧同一上限:编辑器根本打不开 >1MB 的文件,超限内容只可能来自
+    // 绕过前端直接调 command 的路径,后端不依赖前端约束
+    if content.len() as u64 > MAX_FILE_VIEW_SIZE {
+        return Err("内容过大(>1MB),拒绝写入".to_string());
+    }
     let p = verify_under_project_root(&project_root, &path, true)?;
     if !p.is_file() {
         return Err(format!("不是文件: {}", path));
@@ -590,6 +595,64 @@ mod tests {
 
         fs::remove_dir_all(&root).ok();
         fs::remove_dir_all(&other).ok();
+    }
+
+    #[test]
+    fn write_file_content_writes_inside_project() {
+        let (root, file) = make_test_project();
+        write_file_content(
+            root.to_string_lossy().to_string(),
+            file.to_string_lossy().to_string(),
+            "新内容\r\n第二行".to_string(),
+        )
+        .unwrap();
+        // CRLF 原样落盘:行尾保真由前端编辑器负责,后端不做任何归一
+        assert_eq!(fs::read_to_string(&file).unwrap(), "新内容\r\n第二行");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn write_file_content_rejects_escape() {
+        let (root, _) = make_test_project();
+        let escape = root.join("..").join("evil-write.txt");
+        let err = write_file_content(
+            root.to_string_lossy().to_string(),
+            escape.to_string_lossy().to_string(),
+            "x".to_string(),
+        )
+        .unwrap_err();
+        assert!(err.contains("不在项目根目录内") || err.contains("不可访问"));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn write_file_content_rejects_directory() {
+        let (root, _) = make_test_project();
+        // 目标是目录时应报语义明确的错误,而不是走到 rename 覆盖目录
+        let err = write_file_content(
+            root.to_string_lossy().to_string(),
+            root.to_string_lossy().to_string(),
+            "x".to_string(),
+        )
+        .unwrap_err();
+        assert!(err.contains("不是文件"));
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn write_file_content_rejects_oversize() {
+        let (root, file) = make_test_project();
+        let before = fs::read(&file).unwrap();
+        let err = write_file_content(
+            root.to_string_lossy().to_string(),
+            file.to_string_lossy().to_string(),
+            "a".repeat((MAX_FILE_VIEW_SIZE + 1) as usize),
+        )
+        .unwrap_err();
+        assert!(err.contains("过大"));
+        // 拒绝发生在写入之前,原文件必须一字未动
+        assert_eq!(fs::read(&file).unwrap(), before);
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
