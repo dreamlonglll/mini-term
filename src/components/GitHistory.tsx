@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useLayoutEffect, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '../store';
 import { GitHistoryContent } from './GitHistoryContent';
@@ -19,6 +19,16 @@ export function GitHistory() {
   const isRemote = !!project?.sshConnectionId;
 
   const [activeTab, setActiveTab] = useState<GitTab>('history');
+
+  // Tab 指示条:与 RightDrawer 的选中底块同理,滑过去而不是两边各自亮灭。
+  // 这里两个 tab 宽度随文案长短不等,没法用 0/100% 平移,按选中按钮实测位置;
+  // t 进依赖是因为切语言会改文案宽度,需要重测。
+  const tabBarRef = useRef<HTMLDivElement>(null);
+  const [tabIndicator, setTabIndicator] = useState<{ left: number; width: number } | null>(null);
+  useLayoutEffect(() => {
+    const btn = tabBarRef.current?.querySelector<HTMLButtonElement>(`[data-tab="${activeTab}"]`);
+    if (btn) setTabIndicator({ left: btn.offsetLeft, width: btn.offsetWidth });
+  }, [activeTab, t]);
 
   // 仓库选择器状态 — 提升到容器层，两个 tab 共享
   const [repos, setRepos] = useState<GitRepoInfo[]>(() => {
@@ -105,92 +115,108 @@ export function GitHistory() {
   return (
     <div data-panel className="h-full bg-[var(--bg-surface)] flex flex-col border-t border-[var(--border-subtle)] select-none">
       {/* Tab 栏 */}
-      <div className="flex items-center gap-0 px-3 pt-2 pb-0 flex-shrink-0">
+      <div ref={tabBarRef} className="relative flex items-center gap-0 px-3 pt-2 pb-0 flex-shrink-0">
         {(['history', 'changes'] as const).map((tab) => (
           <button
             key={tab}
-            className={`px-3 py-1.5 text-sm font-medium transition-colors border-b-2 ${
+            data-tab={tab}
+            className={`px-3 py-1.5 text-sm font-medium transition-colors border-b-2 border-transparent ${
               activeTab === tab
-                ? 'text-[var(--accent)] border-[var(--accent)]'
-                : 'text-[var(--text-muted)] border-transparent hover:text-[var(--text-primary)]'
+                ? 'text-[var(--accent)]'
+                : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]'
             }`}
             onClick={() => setActiveTab(tab)}
           >
             {tab === 'history' ? t('panels.history') : t('panels.changes')}
           </button>
         ))}
-      </div>
-
-      {/* 仓库选择器（仅 Changes tab + 多仓库时显示） */}
-      {activeTab === 'changes' && repos.length > 1 && (
-        <div className="px-2 pt-2 pb-0 flex-shrink-0 relative" ref={dropdownRef}>
-          <div
-            className="flex items-center justify-between w-full py-[5px] px-2 cursor-pointer hover:bg-[var(--border-subtle)] rounded-[var(--radius-sm)] text-sm transition-colors duration-100 text-[var(--color-folder)]"
-            onClick={() => setRepoDropdownOpen((v) => !v)}
-          >
-            <div className="flex items-center gap-1.5 min-w-0">
-              <span
-                className="text-base w-3 text-center text-[var(--text-muted)] transition-transform duration-150"
-                style={{
-                  transform: repoDropdownOpen ? 'rotate(0deg)' : 'rotate(-90deg)',
-                  display: 'inline-block',
-                }}
-              >
-                &#9662;
-              </span>
-              <span className="truncate font-medium">{selectedRepoInfo?.name ?? t("gitHistory.selectRepo")}</span>
-              {selectedRepoInfo?.currentBranch && (
-                <span className="shrink-0 text-sm leading-[18px] px-1.5 rounded font-mono text-[var(--text-muted)] bg-[var(--border-subtle)]">
-                  {selectedRepoInfo.isWorktree ? '⎇ ' : ''}{selectedRepoInfo.currentBranch}
-                </span>
-              )}
-            </div>
-          </div>
-          {repoDropdownOpen && (
-            <div className="absolute left-2 right-2 z-20 mt-0.5 bg-[var(--bg-elevated)] border border-[var(--border-default)] rounded-[var(--radius-sm)] shadow-[var(--shadow-overlay)] overflow-hidden">
-              {repos.map((r) => (
-                <div
-                  key={r.path}
-                  className={`flex items-center gap-1.5 px-3 py-1.5 text-sm cursor-pointer transition-colors duration-100 ${
-                    r.path === selectedRepo
-                      ? 'bg-[var(--accent-subtle)] text-[var(--accent)]'
-                      : 'text-[var(--text-primary)] hover:bg-[var(--border-subtle)]'
-                  }`}
-                  onClick={() => {
-                    setSelectedRepo(r.path);
-                    setRepoDropdownOpen(false);
-                  }}
-                >
-                  <span className="truncate">{r.name}</span>
-                  {r.currentBranch && (
-                    <span className="shrink-0 text-sm leading-[18px] px-1.5 rounded font-mono text-[var(--text-muted)] bg-[var(--border-subtle)]">
-                      {r.isWorktree ? '⎇ ' : ''}{r.currentBranch}
-                    </span>
-                  )}
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* Tab 内容 */}
-      <div className="flex-1 overflow-hidden">
-        {activeTab === 'history' ? (
-          <GitHistoryContent
-            key={historyRefreshKey}
-            projectPath={project.path}
-            repos={repos}
-            refreshRepos={loadRepos}
-            onOpenWorktrees={setWorktreeRepo}
-          />
-        ) : (
-          <GitChanges
-            projectPath={project.path}
-            repoPath={selectedRepo}
-            onCommitSuccess={onCommitSuccess}
+        {tabIndicator && (
+          <span
+            aria-hidden
+            className="drawer-tab-indicator pointer-events-none absolute bottom-0 h-0.5 bg-[var(--accent)] transition-[left,width] ease-out"
+            style={{
+              left: tabIndicator.left,
+              width: tabIndicator.width,
+              transitionDuration: 'var(--motion-tab-indicator)',
+            }}
           />
         )}
+      </div>
+
+      {/* key={activeTab}:换 tab 时这层重建,横向淡入动画才会重播(同 RightDrawer 换面板)。
+          仓库选择器包在里面,跟内容一起进场而不是各动各的 */}
+      <div key={activeTab} className="flex-1 min-h-0 flex flex-col overflow-hidden panel-swap-in">
+        {/* 仓库选择器（仅 Changes tab + 多仓库时显示） */}
+        {activeTab === 'changes' && repos.length > 1 && (
+          <div className="px-2 pt-2 pb-0 flex-shrink-0 relative" ref={dropdownRef}>
+            <div
+              className="flex items-center justify-between w-full py-[5px] px-2 cursor-pointer hover:bg-[var(--border-subtle)] rounded-[var(--radius-sm)] text-sm transition-colors duration-100 text-[var(--color-folder)]"
+              onClick={() => setRepoDropdownOpen((v) => !v)}
+            >
+              <div className="flex items-center gap-1.5 min-w-0">
+                <span
+                  className="text-base w-3 text-center text-[var(--text-muted)] transition-transform duration-150"
+                  style={{
+                    transform: repoDropdownOpen ? 'rotate(0deg)' : 'rotate(-90deg)',
+                    display: 'inline-block',
+                  }}
+                >
+                  &#9662;
+                </span>
+                <span className="truncate font-medium">{selectedRepoInfo?.name ?? t("gitHistory.selectRepo")}</span>
+                {selectedRepoInfo?.currentBranch && (
+                  <span className="shrink-0 text-sm leading-[18px] px-1.5 rounded font-mono text-[var(--text-muted)] bg-[var(--border-subtle)]">
+                    {selectedRepoInfo.isWorktree ? '⎇ ' : ''}{selectedRepoInfo.currentBranch}
+                  </span>
+                )}
+              </div>
+            </div>
+            {repoDropdownOpen && (
+              <div className="absolute left-2 right-2 z-20 mt-0.5 bg-[var(--bg-elevated)] border border-[var(--border-default)] rounded-[var(--radius-sm)] shadow-[var(--shadow-overlay)] overflow-hidden">
+                {repos.map((r) => (
+                  <div
+                    key={r.path}
+                    className={`flex items-center gap-1.5 px-3 py-1.5 text-sm cursor-pointer transition-colors duration-100 ${
+                      r.path === selectedRepo
+                        ? 'bg-[var(--accent-subtle)] text-[var(--accent)]'
+                        : 'text-[var(--text-primary)] hover:bg-[var(--border-subtle)]'
+                    }`}
+                    onClick={() => {
+                      setSelectedRepo(r.path);
+                      setRepoDropdownOpen(false);
+                    }}
+                  >
+                    <span className="truncate">{r.name}</span>
+                    {r.currentBranch && (
+                      <span className="shrink-0 text-sm leading-[18px] px-1.5 rounded font-mono text-[var(--text-muted)] bg-[var(--border-subtle)]">
+                        {r.isWorktree ? '⎇ ' : ''}{r.currentBranch}
+                      </span>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Tab 内容 */}
+        <div className="flex-1 overflow-hidden">
+          {activeTab === 'history' ? (
+            <GitHistoryContent
+              key={historyRefreshKey}
+              projectPath={project.path}
+              repos={repos}
+              refreshRepos={loadRepos}
+              onOpenWorktrees={setWorktreeRepo}
+            />
+          ) : (
+            <GitChanges
+              projectPath={project.path}
+              repoPath={selectedRepo}
+              onCommitSuccess={onCommitSuccess}
+            />
+          )}
+        </div>
       </div>
 
       <GitWorktreeModal
