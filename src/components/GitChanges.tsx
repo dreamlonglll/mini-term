@@ -6,6 +6,7 @@ import { useAppStore } from '../store';
 import { useTauriEvent } from '../hooks/useTauriEvent';
 import { showContextMenu } from '../utils/contextMenu';
 import { isAiPty } from '../utils/terminalCache';
+import { useOverlayValue } from '../hooks/useOverlayMotion';
 import { DiffModal } from './DiffModal';
 import type { ChangeFileStatus, PtyOutputPayload } from '../types';
 
@@ -100,6 +101,7 @@ export function GitChanges({ projectPath: _projectPath, repoPath, onCommitSucces
     staged: boolean;
     statusLabel: string;
   } | null>(null);
+  const [heldDiff, diffOpen] = useOverlayValue(diffModal);
 
   const [collapsedDirs, setCollapsedDirs] = useState<Set<string>>(new Set());
 
@@ -343,11 +345,12 @@ export function GitChanges({ projectPath: _projectPath, repoPath, onCommitSucces
   };
 
   // Build a GitFileStatus-compatible object for DiffModal
-  const diffModalStatus = diffModal
+  // （用 heldDiff 而非 diffModal：关闭动画期间 diffModal 已被置空）
+  const diffModalStatus = heldDiff
     ? {
-        path: diffModal.filePath,
+        path: heldDiff.filePath,
         status: 'modified' as const,
-        statusLabel: diffModal.statusLabel,
+        statusLabel: heldDiff.statusLabel,
       }
     : null;
 
@@ -424,14 +427,14 @@ export function GitChanges({ projectPath: _projectPath, repoPath, onCommitSucces
         </button>
       </div>
 
-      {/* Diff Modal */}
-      {diffModal && diffModalStatus && repoPath && (
+      {/* Diff Modal —— 置空后再多留一会儿（useOverlayValue），退场动画才播得完 */}
+      {heldDiff && diffModalStatus && repoPath && (
         <DiffModal
-          open={diffModal.open}
+          open={diffOpen && heldDiff.open}
           onClose={() => setDiffModal(null)}
           projectPath={repoPath}
           status={diffModalStatus}
-          staged={diffModal.staged}
+          staged={heldDiff.staged}
         />
       )}
     </div>

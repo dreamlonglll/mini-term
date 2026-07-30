@@ -7,6 +7,7 @@ import remarkGfm from 'remark-gfm';
 import rehypeRaw from 'rehype-raw';
 import type { FileContentResult } from '../types';
 import { openExternalUrl } from '../utils/externalLink';
+import { useOverlayPresence } from '../hooks/useOverlayMotion';
 import { Modal } from './Modal';
 import { useT } from '../i18n';
 
@@ -104,9 +105,9 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
   const contentRef = useRef<HTMLDivElement>(null);
   const editLineNumbersRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const handleCloseRef = useRef<() => void>(() => {});
   const handleSaveRef = useRef<() => Promise<void>>(async () => {});
   const isDirty = result !== null && editContent !== result.content;
+  const present = useOverlayPresence(open);
 
   const isMd = useMemo(() => isMarkdownFile(currentPath), [currentPath]);
   const isImg = useMemo(() => isImageFile(currentPath), [currentPath]);
@@ -175,7 +176,6 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
     }
   }, [currentPath, editContent, onSaved, projectRoot, result, saving, t]);
 
-  handleCloseRef.current = handleClose;
   handleSaveRef.current = handleSave;
 
   // 拦截 Markdown 内的 <a> 点击：先 preventDefault 避免整个程序重载
@@ -242,8 +242,6 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's' && editing) {
         event.preventDefault();
         void handleSaveRef.current();
-      } else if (event.key === 'Escape') {
-        handleCloseRef.current();
       }
     };
     window.addEventListener('keydown', handleKeyDown);
@@ -256,7 +254,8 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
     }
   }, [result, highlightLine, currentPath, filePath]);
 
-  if (!open) return null;
+  // 关闭后不立刻塌掉子树，留给 Modal 播退场动画
+  if (!present) return null;
 
   const fileName = currentPath.replace(/\\/g, '/').split('/').pop() ?? currentPath;
   const canEdit = !isImg && result && !result.isBinary && !result.tooLarge;

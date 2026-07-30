@@ -74,7 +74,17 @@ function createDialog(
     popOverlay(overlayId);
     // 无论走按钮、遮罩还是按键，清理都收敛到这一处
     window.removeEventListener('keydown', keyHandler, true);
-    overlay.remove();
+    // 退场动画期间元素还在（CSS 里已 pointer-events: none，点不到也吃不到按键），
+    // 播完再摘。焦点不等动画，立刻还给调用前那个元素 —— 键盘用户按下确认后
+    // 手已经在下一个操作上了，让他对着一个正在淡出的框空等是没道理的
+    overlay.classList.add('is-closing');
+    const remove = () => overlay.remove();
+    overlay.addEventListener('animationend', (e) => {
+      // 只认遮罩自己的动画：对话框的退场动画也会冒泡上来
+      if (e.target === overlay) remove();
+    });
+    // 兜底：动画被禁用（用户样式 / animation: none）时 animationend 不会来
+    window.setTimeout(remove, 400);
     prevFocus?.focus?.();
   };
 

@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Allotment } from 'allotment';
 import { useAppStore } from '../store';
+import { useOverlayPresence } from '../hooks/useOverlayMotion';
 import { Modal } from './Modal';
 import { useT } from '../i18n';
 import type { GitFileStatus, GitDiffResult, DiffLine } from '../types';
@@ -159,6 +160,7 @@ export function DiffModal({ open, onClose, projectPath, status, staged }: DiffMo
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const terminalFontSize = useAppStore((s) => s.config.terminalFontSize) || 14;
+  const present = useOverlayPresence(open);
 
   useEffect(() => {
     if (!open) return;
@@ -176,7 +178,8 @@ export function DiffModal({ open, onClose, projectPath, status, staged }: DiffMo
       .finally(() => setLoading(false));
   }, [open, projectPath, status.path]);
 
-  if (!open) return null;
+  // 关闭后不立刻塌掉子树，留给 Modal 播退场动画
+  if (!present) return null;
 
   const fileName = status.path.split('/').pop() ?? status.path;
 

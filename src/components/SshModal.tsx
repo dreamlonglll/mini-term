@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, type ReactNode, type MouseEvent } fro
 import { invoke } from '@tauri-apps/api/core';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { useAppStore, genId } from '../store';
+import { useOverlayPresence } from '../hooks/useOverlayMotion';
 import { Modal } from './Modal';
 import { useT } from '../i18n';
 import { showContextMenu } from '../utils/contextMenu';
@@ -381,6 +382,7 @@ export function SshModal({ open, onClose }: Props) {
   const [newGroupName, setNewGroupName] = useState('');
   const [dragConnId, setDragConnId] = useState<string | null>(null);
   const [dragOverGroup, setDragOverGroup] = useState<GroupKey>(null);
+  const present = useOverlayPresence(open);
 
   useEffect(() => {
     if (open) {
@@ -576,7 +578,8 @@ export function SshModal({ open, onClose }: Props) {
     },
   });
 
-  if (!open) return null;
+  // 关闭后不立刻塌掉子树，留给 Modal 播退场动画
+  if (!present) return null;
 
   const { namedGroups, ungroupedItems } = buildGroupBuckets(connections, sshGroups);
   const groupOptions = namedGroups.map((g) => g.group);

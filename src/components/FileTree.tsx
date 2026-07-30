@@ -5,6 +5,7 @@ import { revealItemInDir } from '@tauri-apps/plugin-opener';
 import { writeText } from '@tauri-apps/plugin-clipboard-manager';
 import { useAppStore, isExpanded, toggleExpandedDir } from '../store';
 import { useTauriEvent } from '../hooks/useTauriEvent';
+import { useOverlayValue } from '../hooks/useOverlayMotion';
 import { showContextMenu } from '../utils/contextMenu';
 import { showPrompt } from '../utils/prompt';
 import { isAiPty } from '../utils/terminalCache';
@@ -400,6 +401,8 @@ export function FileTree() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [diffTarget, setDiffTarget] = useState<GitFileStatus | null>(null);
   const [viewFilePath, setViewFilePath] = useState<string | null>(null);
+  const [viewFile, viewFileOpen] = useOverlayValue(viewFilePath);
+  const [diffFile, diffOpen] = useOverlayValue(diffTarget);
   const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const rootEntriesRef = useRef(rootEntries);
   rootEntriesRef.current = rootEntries;
@@ -741,21 +744,22 @@ export function FileTree() {
           </>
         )}
       </div>
-      {viewFilePath && project && (
+      {/* 两个弹窗的数据源置空后都再多留一会儿（useOverlayValue），退场动画才播得完 */}
+      {viewFile && project && (
         <FileViewerModal
-          open={!!viewFilePath}
+          open={viewFileOpen}
           onClose={() => setViewFilePath(null)}
-          filePath={viewFilePath}
+          filePath={viewFile}
           projectRoot={project.path}
           onSaved={handleFileSaved}
         />
       )}
-      {diffTarget && (
+      {diffFile && (
         <DiffModal
-          open={!!diffTarget}
+          open={diffOpen}
           onClose={() => setDiffTarget(null)}
           projectPath={project.path}
-          status={diffTarget}
+          status={diffFile}
         />
       )}
     </div>

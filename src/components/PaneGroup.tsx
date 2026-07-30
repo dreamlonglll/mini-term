@@ -229,7 +229,9 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
     'w-6 h-6 flex items-center justify-center rounded-[var(--radius-sm)] text-[var(--text-muted)] opacity-60 hover:opacity-100 hover:text-[var(--accent)] hover:bg-[var(--border-subtle)] transition-all';
 
   return (
-    <div className="w-full h-full flex flex-col" data-pty-id={activePane.ptyId}>
+    // pane-enter：新分出来的格子淡入并放大到位。项目切到后台是 display:none
+    // 留着不卸载，不会重播；只有真正新建/重排分屏时这层才重挂载
+    <div className="w-full h-full flex flex-col pane-enter" data-pty-id={activePane.ptyId}>
       {/* Tab bar */}
       <div
         data-panel-header
@@ -264,9 +266,6 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
               }}
               onContextMenu={(e) => paneContextMenu(e, pane.id)}
             >
-              {isActive && (
-                <span className="absolute bottom-0 left-2 right-2 h-[2px] rounded-full bg-[var(--accent)]" />
-              )}
               <StatusDot status={pane.status} />
               <span className="font-medium">{paneLabel(pane)}</span>
               <button

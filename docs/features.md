@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.8.2-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.8.4-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -147,6 +147,7 @@ Watch the AI running on your desktop from your phone while you're out, and send 
 - **Update check** — Fetches the GitHub Release on startup; when a new version is available a highlighted hint appears on the icon sidebar (click to download), and the version number is written into the native window title.
 - **Bilingual UI (English / 中文)** — A one-click language toggle under "Settings → System" instantly re-renders the entire interface; the language is auto-detected from the system on first launch and remembered across restarts. Every page and feature is fully translated, with a lightweight built-in i18n layer (no extra runtime dependency).
 - **Settings center** — A unified SettingsModal managing all toggles: theme, fonts, shells, AI notifications, and more.
+- **Interface motion** — Dialogs, context menus, and the side drawer share one enter/exit animation: the backdrop fades in while the panel drops and scales into place; on close it plays the reverse before unmounting (content is frozen and the overlay leaves the stack meanwhile, so it never goes blank mid-fade or keeps swallowing Esc). Context menus expand from the cursor, and switching terminals or creating a split each get their own transition. When the system disables window animations (`prefers-reduced-motion: reduce`) these transitions still play — only looping animations such as the blinking status dot are stopped.
 
 ## Tech Stack
 

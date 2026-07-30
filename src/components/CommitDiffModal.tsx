@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { InlineView, SideBySideView } from './DiffModal';
 import { useAppStore } from '../store';
+import { useOverlayPresence } from '../hooks/useOverlayMotion';
 import { Modal } from './Modal';
 import { useT } from '../i18n';
 import type { CommitFileInfo, GitDiffResult } from '../types';
@@ -39,6 +40,7 @@ export function CommitDiffModal({
   const [diffResult, setDiffResult] = useState<GitDiffResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const present = useOverlayPresence(open);
 
   const loadDiff = useCallback(
     async (filePath: string) => {
@@ -76,7 +78,8 @@ export function CommitDiffModal({
     }
   }, [open, files, selectedFile]);
 
-  if (!open) return null;
+  // 关闭后不立刻塌掉子树，留给 Modal 播退场动画
+  if (!present) return null;
 
   const shortHash = commitHash.slice(0, 7);
 

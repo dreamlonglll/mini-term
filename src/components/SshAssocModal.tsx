@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useCallback } from 'react';
+import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '../store';
 import { showAlert } from '../utils/prompt';
@@ -50,6 +50,8 @@ export function SshAssocModal({ project, onClose }: Props) {
   /** 左栏选中态：null = 全部；'' = 未分组；其他 = 具名分组名（与 SshModal 一致） */
   const [selectedGroup, setSelectedGroup] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  /** 最后一次非空的目标项目，供关闭动画期间继续渲染 */
+  const lastProjectRef = useRef<ProjectConfig | null>(project);
 
   useEffect(() => {
     if (project) {
@@ -146,7 +148,12 @@ export function SshAssocModal({ project, onClose }: Props) {
     }
   }, [project, checked, allIds, onClose]);
 
-  if (!project) return null;
+  // 关闭时父组件把 project 置了 null，但 Modal 还要播 ~0.14s 退场动画：
+  // 这段时间照旧用最后一次的 project 渲染（Modal 内部也冻结了内容快照，
+  // 这里只是保证 render 不去碰 null）
+  if (project) lastProjectRef.current = project;
+  const shown = project ?? lastProjectRef.current;
+  if (!shown) return null;
 
   // 分组归类与 SshModal 共用同一份逻辑（含显式创建的空分组）
   const { namedGroups, ungroupedItems } = buildGroupBuckets(connections, sshGroups);
@@ -197,7 +204,7 @@ export function SshAssocModal({ project, onClose }: Props) {
 
   return (
     <Modal
-      open
+      open={!!project}
       onClose={onClose}
       ariaLabel={t('sshAssoc.title')}
       panelClassName="w-[720px] h-[70vh] max-h-[680px]"
@@ -212,7 +219,7 @@ export function SshAssocModal({ project, onClose }: Props) {
           <ModalCloseButton onClose={onClose} label={t('sshAssoc.cancel')} />
         </div>
         <div className="text-sm text-[var(--text-muted)] mt-1 truncate">
-          {t('sshAssoc.subtitle', { name: project.name })}
+          {t('sshAssoc.subtitle', { name: shown.name })}
         </div>
       </div>
 

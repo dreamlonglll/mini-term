@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useAppStore } from '../store';
+import { useOverlayPresence, useOverlayValue } from '../hooks/useOverlayMotion';
 import { SessionList } from './SessionList';
 import { GitHistory } from './GitHistory';
 import { useT } from '../i18n';
@@ -25,6 +26,11 @@ export function RightDrawer({ initialWidth, onResizeEnd }: RightDrawerProps) {
   const closeRightDrawer = useAppStore((s) => s.closeRightDrawer);
   const openRightDrawer = useAppStore((s) => s.openRightDrawer);
   const [width, setWidth] = useState(clamp(initialWidth));
+  // 关闭后留住 DOM 把滑出动画播完；panel 也一并留住，
+  // 否则抽屉在滑出的同时内容先空掉
+  const present = useOverlayPresence(rightDrawer !== null);
+  const [panel] = useOverlayValue(rightDrawer);
+  const closing = present && rightDrawer === null;
 
   // config 侧宽度变化（或初次持久值到达）时同步,拖拽自身不受影响
   useEffect(() => {
@@ -52,11 +58,16 @@ export function RightDrawer({ initialWidth, onResizeEnd }: RightDrawerProps) {
     document.addEventListener('mouseup', onUp);
   }, [width, onResizeEnd]);
 
-  if (!rightDrawer) return null;
+  if (!present || !panel) return null;
 
   return (
     <div
-      className="absolute top-0 right-0 h-full z-30 flex flex-col bg-[var(--bg-surface)] border-l border-[var(--border-default)] shadow-[var(--shadow-overlay)]"
+      // z-[45]：要压过 allotment 分隔条的 z-index:35，否则那根线会画在抽屉上面；
+      // 同时低于弹窗(50)，抽屉开着时弹窗仍在最前
+      className={`absolute top-0 right-0 h-full z-[45] flex flex-col bg-[var(--bg-surface)] border-l border-[var(--border-default)] shadow-[var(--shadow-overlay)] overlay-drawer ${
+        closing ? 'is-closing' : ''
+      }`}
+      aria-hidden={closing || undefined}
       style={{ width }}
     >
       {/* 左缘拖拽手柄 */}
@@ -70,22 +81,32 @@ export function RightDrawer({ initialWidth, onResizeEnd }: RightDrawerProps) {
         <div
           role="tablist"
           aria-label={t('app.activityBar.sessions')}
-          className="flex flex-1 rounded-[var(--radius-sm)] border border-[var(--border-default)] overflow-hidden"
+          className="relative flex flex-1 rounded-[var(--radius-sm)] border border-[var(--border-default)] overflow-hidden"
         >
-          {(['sessions', 'git'] as const).map((panel) => (
+          {/* 选中态底块滑过去，而不是两边各自亮灭 —— 两个 tab 等宽(flex-1)，
+              位置只有 0 / 100% 两种，直接按当前面板平移即可 */}
+          <span
+            aria-hidden
+            className="drawer-tab-indicator pointer-events-none absolute inset-y-0 left-0 w-1/2 bg-[var(--accent-subtle)] transition-transform ease-out"
+            style={{
+              transform: `translateX(${panel === 'git' ? '100%' : '0%'})`,
+              transitionDuration: 'var(--motion-tab-indicator)',
+            }}
+          />
+          {(['sessions', 'git'] as const).map((key) => (
             <button
-              key={panel}
+              key={key}
               type="button"
               role="tab"
-              aria-selected={rightDrawer === panel}
-              className={`flex-1 px-2 py-1 text-xs transition-colors ${
-                rightDrawer === panel
-                  ? 'bg-[var(--accent-subtle)] text-[var(--accent)] font-medium'
-                  : 'text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--border-subtle)]'
+              aria-selected={panel === key}
+              className={`relative flex-1 px-2 py-1 text-xs transition-colors ${
+                panel === key
+                  ? 'text-[var(--accent)] font-medium'
+                  : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]'
               }`}
-              onClick={() => openRightDrawer(panel)}
+              onClick={() => openRightDrawer(key)}
             >
-              {panel === 'sessions' ? t('panels.sessions') : t('panels.git')}
+              {key === 'sessions' ? t('panels.sessions') : t('panels.git')}
             </button>
           ))}
         </div>
@@ -101,8 +122,9 @@ export function RightDrawer({ initialWidth, onResizeEnd }: RightDrawerProps) {
           </svg>
         </button>
       </div>
-      <div className="flex-1 min-h-0 overflow-hidden">
-        {rightDrawer === 'sessions' ? <SessionList /> : <GitHistory />}
+      {/* key={panel}：换面板时这层重建，横向淡入动画才会重播 */}
+      <div key={panel} className="flex-1 min-h-0 overflow-hidden panel-swap-in">
+        {panel === 'sessions' ? <SessionList /> : <GitHistory />}
       </div>
     </div>
   );

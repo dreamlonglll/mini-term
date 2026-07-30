@@ -261,10 +261,19 @@ export function getOrderedTree(config: AppConfig): OrderedItem[] {
   walk(tree, 0, null);
 
   // 追加既不在 tree 中、也没有(存活的)父项目的项目到顶层。
-  // 父项目仍在但自己还没被推入的情况不会出现——pushProject 已随父注入;
+  // 判断必须基于完整树而非 pushed——折叠组的子项没被 walk 渲染,但它们不是孤儿;
   // 父项目丢失的孤儿子项目在这里兜底回到顶层,保证不凭空消失。
+  const inTree = new Set<string>();
+  (function collectIds(items: ProjectTreeItem[]) {
+    for (const item of items) {
+      if (isGroup(item)) collectIds(item.children);
+      else inTree.add(item);
+    }
+  })(tree);
+
   for (const p of config.projects) {
     if (pushed.has(p.id)) continue;
+    if (inTree.has(p.id)) continue; // 折叠组内的项目:在树中,只是视图上隐藏
     if (p.parentProjectId && projectMap.has(p.parentProjectId)) continue;
     pushProject(p, 0, null);
   }

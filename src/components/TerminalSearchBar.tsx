@@ -108,7 +108,7 @@ export function TerminalSearchBar() {
       ref={boxRef}
       role="search"
       aria-label={t('terminalSearch.title')}
-      className="fixed z-40 flex items-center gap-1 px-2 py-1.5 rounded-[var(--radius-md)] bg-[var(--bg-elevated)] border border-[var(--border-strong)] shadow-[var(--shadow-overlay)]"
+      className="fixed z-40 flex items-center gap-1 px-2 py-1.5 rounded-[var(--radius-md)] bg-[var(--bg-elevated)] border border-[var(--border-strong)] shadow-[var(--shadow-overlay)] overlay-menu"
       style={{ visibility: 'hidden' }}
       onKeyDown={onKeyDown}
     >

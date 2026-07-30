@@ -81,6 +81,8 @@ export function ProjectEnvVarsModal({ project, onClose }: Props) {
   const ridCounter = useRef(0);
   const newKeyInputRef = useRef<HTMLInputElement | null>(null);
   const pendingFocusRid = useRef<string | null>(null);
+  /** 最后一次非空的目标项目，供关闭动画期间继续渲染 */
+  const lastProjectRef = useRef<ProjectConfig | null>(project);
 
   const newRid = useCallback(() => `r${++ridCounter.current}`, []);
 
@@ -150,12 +152,16 @@ export function ProjectEnvVarsModal({ project, onClose }: Props) {
     }
   }, [project, busy, hasErrors, rows, onClose]);
 
-  if (!project) return null;
-  const isWsl = isWslPath(project.path);
+  // 关闭时父组件已把 project 置空，但 Modal 还要播完退场动画：
+  // 这期间沿用最后一次的项目渲染（Modal 内部也冻结了内容快照）
+  if (project) lastProjectRef.current = project;
+  const shown = project ?? lastProjectRef.current;
+  if (!shown) return null;
+  const isWsl = isWslPath(shown.path);
 
   return (
     <Modal
-      open
+      open={!!project}
       onClose={onClose}
       ariaLabel={t('envVars.title')}
       panelClassName="w-[640px] max-h-[80vh]"
@@ -170,7 +176,7 @@ export function ProjectEnvVarsModal({ project, onClose }: Props) {
             <ModalCloseButton onClose={onClose} label={t('envVars.cancel')} />
           </div>
           <div className="text-sm text-[var(--text-muted)] mt-1 truncate">
-            {t('envVars.subtitle', { name: project.name })}
+            {t('envVars.subtitle', { name: shown.name })}
           </div>
         </div>
 
