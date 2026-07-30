@@ -236,7 +236,9 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
 
   useEffect(() => {
     if (editLineNumbersRef.current) editLineNumbersRef.current.scrollTop = 0;
+  }, [editing]);
 
+  useEffect(() => {
     if (!open) return;
     const handleKeyDown = (event: KeyboardEvent) => {
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's' && editing) {
@@ -283,8 +285,14 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
   };
 
   return (
-    <Modal open={open} onClose={handleClose} align="center" ariaLabel={fileName}
-      panelClassName="w-[90vw] h-[80vh] select-text">
+    <Modal
+      open={open}
+      onClose={handleClose}
+      closeOnOverlay={!editing}
+      align="center"
+      ariaLabel={fileName}
+      panelClassName="w-[90vw] h-[80vh] select-text"
+    >
         {/* 工具栏 */}
         <div className="flex items-center justify-between px-4 py-3 border-b border-[var(--border-subtle)] flex-shrink-0">
           <div className="flex items-center gap-2 min-w-0">
