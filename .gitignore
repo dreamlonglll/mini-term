@@ -33,6 +33,8 @@ dist-ssr
 
 # Claude local settings
 .claude/settings.local.json
+# Claude 隔离 worktree（嵌套 git 仓库，git add -A 会当 gitlink 收进来）
+.claude/worktrees/
 # mini-term SSH MCP（本机相关配置，勿提交）
 .mcp.json
 .codex/
