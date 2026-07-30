@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useRef, useCallback } from 'react';
-import type { MouseEvent as ReactMouseEvent, ReactNode } from 'react';
+import type { KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent, ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke, convertFileSrc } from '@tauri-apps/api/core';
 import { openUrl } from '@tauri-apps/plugin-opener';
@@ -16,6 +16,7 @@ interface FileViewerModalProps {
   filePath: string;
   projectRoot: string;
   highlightLine?: number;
+  onSaved?: () => void;
 }
 
 function isMarkdownFile(path: string) {
@@ -86,7 +87,7 @@ const headingComponents = {
   h6: makeHeading('h6'),
 };
 
-export function FileViewerModal({ open, onClose, filePath, projectRoot, highlightLine }: FileViewerModalProps) {
+export function FileViewerModal({ open, onClose, filePath, projectRoot, highlightLine, onSaved }: FileViewerModalProps) {
   const t = useT();
   const [result, setResult] = useState<FileContentResult | null>(null);
   const [loading, setLoading] = useState(false);
@@ -95,13 +96,17 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
   const [editing, setEditing] = useState(false);
   const [editContent, setEditContent] = useState('');
   const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
   // 当前正在查看的文件，可随 Markdown 内的本地链接跳转；初始为传入的 filePath
   const [currentPath, setCurrentPath] = useState(filePath);
   const [history, setHistory] = useState<string[]>([]);
   const highlightRef = useRef<HTMLDivElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
   const editLineNumbersRef = useRef<HTMLDivElement>(null);
-  const isDirty = editing && result !== null && editContent !== result.content;
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const handleCloseRef = useRef<() => void>(() => {});
+  const handleSaveRef = useRef<() => Promise<void>>(async () => {});
+  const isDirty = result !== null && editContent !== result.content;
 
   const isMd = useMemo(() => isMarkdownFile(currentPath), [currentPath]);
   const isImg = useMemo(() => isImageFile(currentPath), [currentPath]);
@@ -124,38 +129,54 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
     return convertFileSrc(fileDir + '/' + src);
   }, [currentPath]);
 
+  const canDiscardChanges = useCallback(() => {
+    return !isDirty || window.confirm(t('fileViewer.unsavedConfirm'));
+  }, [isDirty, t]);
+
   // 跳转到链接目标文件，记录历史以支持返回
   // 用两次独立 setState（而非在 updater 里嵌套 setState），避免 StrictMode 下
   // updater 被二次调用导致 history 重复入栈。
   const navigateTo = useCallback((absPath: string) => {
-    if (absPath === currentPath) return;
+    if (absPath === currentPath || !canDiscardChanges()) return;
     setHistory((h) => [...h, currentPath]);
     setCurrentPath(absPath);
-  }, [currentPath]);
+  }, [canDiscardChanges, currentPath]);
 
   const goBack = useCallback(() => {
-    if (!history.length) return;
+    if (!history.length || !canDiscardChanges()) return;
     setCurrentPath(history[history.length - 1]);
     setHistory((h) => h.slice(0, -1));
-  }, [history]);
+  }, [canDiscardChanges, history]);
 
   const handleClose = useCallback(() => {
-    if (isDirty && !window.confirm(t('fileViewer.unsavedConfirm'))) return;
+    if (!canDiscardChanges()) return;
     onClose();
-  }, [isDirty, onClose, t]);
+  }, [canDiscardChanges, onClose]);
 
   const handleSave = useCallback(async () => {
     if (!result || saving) return;
     setSaving(true);
+    setSaved(false);
+    setError('');
     try {
-      await invoke('write_file_content', { projectRoot, path: currentPath, content: editContent });
-      setResult({ ...result, content: editContent });
+      const modifiedAt = await invoke<string>('write_file_content', {
+        projectRoot,
+        path: currentPath,
+        content: editContent,
+        expectedModifiedAt: result.modifiedAt,
+      });
+      setResult({ ...result, content: editContent, modifiedAt });
+      setSaved(true);
+      onSaved?.();
     } catch (e) {
       setError(t('fileViewer.saveFailed') + ': ' + String(e));
     } finally {
       setSaving(false);
     }
-  }, [currentPath, editContent, projectRoot, result, saving, t]);
+  }, [currentPath, editContent, onSaved, projectRoot, result, saving, t]);
+
+  handleCloseRef.current = handleClose;
+  handleSaveRef.current = handleSave;
 
   // 拦截 Markdown 内的 <a> 点击：先 preventDefault 避免整个程序重载
   const handleLinkClick = useCallback((e: ReactMouseEvent<HTMLAnchorElement>) => {
@@ -193,7 +214,11 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
     setResult(null);
 
     invoke<FileContentResult>('read_file_content', { projectRoot, path: currentPath })
-      .then((nextResult) => { setResult(nextResult); setEditContent(nextResult.content); })
+      .then((nextResult) => {
+        setResult(nextResult);
+        setEditContent(nextResult.content);
+        setSaved(false);
+      })
       .catch((e) => setError(String(e)))
       .finally(() => setLoading(false));
   }, [open, currentPath, projectRoot, isImg]);
@@ -210,19 +235,22 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
   }, [currentPath]);
 
   useEffect(() => {
-    if (contentRef.current) contentRef.current.scrollTop = 0;
     if (editLineNumbersRef.current) editLineNumbersRef.current.scrollTop = 0;
   }, [editing]);
 
   useEffect(() => {
     if (!open) return;
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's' && editing) { e.preventDefault(); void handleSave(); }
-      else if (e.key === 'Escape') handleClose();
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's' && editing) {
+        event.preventDefault();
+        void handleSaveRef.current();
+      } else if (event.key === 'Escape') {
+        handleCloseRef.current();
+      }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [editing, handleClose, handleSave, open]);
+  }, [editing, open]);
 
   // 仅当查看的是原始 filePath 时才高亮跳转行
   useEffect(() => {
@@ -240,13 +268,29 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
       setEditing(false);
       return;
     }
-    if (!editContent) setEditContent(result?.content ?? '');
     setEditing(true);
     setPreview(false);
   };
 
+  const handleEditorKeyDown = (event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.key !== 'Tab') return;
+    event.preventDefault();
+    const textarea = event.currentTarget;
+    const selectionStart = textarea.selectionStart;
+    const selectionEnd = textarea.selectionEnd;
+    const nextContent = editContent.slice(0, selectionStart) + '\t' + editContent.slice(selectionEnd);
+    setEditContent(nextContent);
+    setSaved(false);
+    requestAnimationFrame(() => {
+      textareaRef.current?.setSelectionRange(selectionStart + 1, selectionStart + 1);
+    });
+  };
+
   return createPortal(
-    <div className="fixed inset-0 z-50 flex items-center justify-center select-text" onClick={onClose}>
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center select-text"
+      onClick={editing ? undefined : handleClose}
+    >
       <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
       <div
         className="relative flex flex-col overflow-hidden bg-[var(--bg-surface)] border border-[var(--border-strong)] rounded-[var(--radius-md)] shadow-[var(--shadow-overlay)] animate-slide-in"
@@ -274,9 +318,12 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
             {canEdit && (
               <>
                 {editing && (
-                  <button onClick={() => void handleSave()} disabled={saving || !isDirty}>
-                    {saving ? t('fileViewer.saving') : t('fileViewer.save')}
-                  </button>
+                  <>
+                    {saved && <span className="text-xs text-[var(--color-success)]">{t('fileViewer.saved')}</span>}
+                    <button onClick={() => void handleSave()} disabled={saving || !isDirty}>
+                      {saving ? t('fileViewer.saving') : t('fileViewer.save')}
+                    </button>
+                  </>
                 )}
                 <div className="flex rounded-[var(--radius-sm)] border border-[var(--border-default)] overflow-hidden text-xs">
                   <button
@@ -366,8 +413,13 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
                 {editContent.split('\n').map((_line, index) => <div key={index}>{index + 1}</div>)}
               </div>
               <textarea
+                ref={textareaRef}
                 value={editContent}
-                onChange={(event) => setEditContent(event.target.value)}
+                onChange={(event) => {
+                  setEditContent(event.target.value);
+                  setSaved(false);
+                }}
+                onKeyDown={handleEditorKeyDown}
                 onScroll={(event) => {
                   if (editLineNumbersRef.current) editLineNumbersRef.current.scrollTop = event.currentTarget.scrollTop;
                 }}

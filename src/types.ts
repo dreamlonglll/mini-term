@@ -323,6 +323,7 @@ export interface FileContentResult {
   content: string;
   isBinary: boolean;
   tooLarge: boolean;
+  modifiedAt: string;
 }
 
 // === Git 历史 ===

@@ -566,6 +566,11 @@ export function FileTree() {
     setViewFilePath(path);
   }, [isRemote]);
 
+  const handleFileSaved = useCallback(() => {
+    loadRootEntries();
+    loadGitStatus();
+  }, [loadGitStatus, loadRootEntries]);
+
   const handleRootContextMenu = useCallback((e: React.MouseEvent) => {
     if (!project) return;
     e.preventDefault();
@@ -717,6 +722,7 @@ export function FileTree() {
           onClose={() => setViewFilePath(null)}
           filePath={viewFilePath}
           projectRoot={project.path}
+          onSaved={handleFileSaved}
         />
       )}
       {diffTarget && (

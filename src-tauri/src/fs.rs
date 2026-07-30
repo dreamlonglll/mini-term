@@ -365,9 +365,18 @@ pub struct FileContentResult {
     pub content: String,
     pub is_binary: bool,
     pub too_large: bool,
+    pub modified_at: String,
 }
 
 const MAX_FILE_VIEW_SIZE: u64 = 1_048_576; // 1MB
+
+fn file_modified_at(metadata: &fs::Metadata) -> Result<String, String> {
+    let modified = metadata.modified().map_err(|e| e.to_string())?;
+    let duration = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?;
+    Ok(format!("{}:{}", duration.as_secs(), duration.subsec_nanos()))
+}
 
 #[tauri::command]
 pub fn read_file_content(project_root: String, path: String) -> Result<FileContentResult, String> {
@@ -376,11 +385,13 @@ pub fn read_file_content(project_root: String, path: String) -> Result<FileConte
         return Err(format!("不是文件: {}", path));
     }
     let metadata = fs::metadata(&p).map_err(|e| e.to_string())?;
+    let modified_at = file_modified_at(&metadata)?;
     if metadata.len() > MAX_FILE_VIEW_SIZE {
         return Ok(FileContentResult {
             content: String::new(),
             is_binary: false,
             too_large: true,
+            modified_at,
         });
     }
     let bytes = fs::read(&p).map_err(|e| e.to_string())?;
@@ -389,19 +400,41 @@ pub fn read_file_content(project_root: String, path: String) -> Result<FileConte
             content: s,
             is_binary: false,
             too_large: false,
+            modified_at,
         }),
         Err(_) => Ok(FileContentResult {
             content: String::new(),
             is_binary: true,
             too_large: false,
+            modified_at,
         }),
     }
 }
 
 #[tauri::command]
-pub fn write_file_content(project_root: String, path: String, content: String) -> Result<(), String> {
+pub fn write_file_content(
+    project_root: String,
+    path: String,
+    content: String,
+    expected_modified_at: String,
+) -> Result<String, String> {
     let p = verify_under_project_root(&project_root, &path, true)?;
-    atomic_write(&p, content.as_bytes()).map_err(|e| e.to_string())
+    if !p.is_file() {
+        return Err(format!("不是文件: {}", path));
+    }
+    if content.len() as u64 > MAX_FILE_VIEW_SIZE {
+        return Err(format!("文件内容超过 {} 字节限制", MAX_FILE_VIEW_SIZE));
+    }
+
+    let metadata = fs::metadata(&p).map_err(|e| e.to_string())?;
+    let current_modified_at = file_modified_at(&metadata)?;
+    if current_modified_at != expected_modified_at {
+        return Err("文件已被其他程序修改，请重新打开后再保存".to_string());
+    }
+
+    atomic_write(&p, content.as_bytes()).map_err(|e| e.to_string())?;
+    let metadata = fs::metadata(&p).map_err(|e| e.to_string())?;
+    file_modified_at(&metadata)
 }
 
 #[tauri::command]
@@ -528,6 +561,105 @@ mod tests {
         let inner_file = root.join("inside.txt");
         fs::write(&inner_file, "hi").unwrap();
         (root, inner_file)
+    }
+
+    #[test]
+    fn write_file_content_inside_project_succeeds() {
+        let (root, file) = make_test_project();
+        let before = read_file_content(
+            root.to_string_lossy().to_string(),
+            file.to_string_lossy().to_string(),
+        )
+        .unwrap();
+
+        let modified_at = write_file_content(
+            root.to_string_lossy().to_string(),
+            file.to_string_lossy().to_string(),
+            "updated".to_string(),
+            before.modified_at,
+        )
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(&file).unwrap(), "updated");
+        assert!(!modified_at.is_empty());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn write_file_content_rejects_path_outside_project() {
+        let (root, _) = make_test_project();
+        let other = std::env::temp_dir().join(format!(
+            "mini-term-fs-write-other-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&other).unwrap();
+        let other_file = other.join("outside.txt");
+        fs::write(&other_file, "outside").unwrap();
+
+        let result = write_file_content(
+            root.to_string_lossy().to_string(),
+            other_file.to_string_lossy().to_string(),
+            "changed".to_string(),
+            String::new(),
+        );
+
+        assert!(result.is_err(), "应拒绝写入项目外文件");
+        assert_eq!(fs::read_to_string(&other_file).unwrap(), "outside");
+        fs::remove_dir_all(&root).ok();
+        fs::remove_dir_all(&other).ok();
+    }
+
+    #[test]
+    fn write_file_content_rejects_directory_and_oversized_content() {
+        let (root, file) = make_test_project();
+        let directory_result = write_file_content(
+            root.to_string_lossy().to_string(),
+            root.to_string_lossy().to_string(),
+            "content".to_string(),
+            String::new(),
+        );
+        assert!(directory_result.unwrap_err().contains("不是文件"));
+
+        let before = read_file_content(
+            root.to_string_lossy().to_string(),
+            file.to_string_lossy().to_string(),
+        )
+        .unwrap();
+        let oversized = "x".repeat(MAX_FILE_VIEW_SIZE as usize + 1);
+        let oversized_result = write_file_content(
+            root.to_string_lossy().to_string(),
+            file.to_string_lossy().to_string(),
+            oversized,
+            before.modified_at,
+        );
+        assert!(oversized_result.unwrap_err().contains("超过"));
+        assert_eq!(fs::read_to_string(&file).unwrap(), "hi");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn write_file_content_rejects_stale_modified_time() {
+        let (root, file) = make_test_project();
+        let before = read_file_content(
+            root.to_string_lossy().to_string(),
+            file.to_string_lossy().to_string(),
+        )
+        .unwrap();
+        fs::write(&file, "external change").unwrap();
+
+        let result = write_file_content(
+            root.to_string_lossy().to_string(),
+            file.to_string_lossy().to_string(),
+            "editor change".to_string(),
+            before.modified_at,
+        );
+
+        assert!(result.unwrap_err().contains("其他程序修改"));
+        assert_eq!(fs::read_to_string(&file).unwrap(), "external change");
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
