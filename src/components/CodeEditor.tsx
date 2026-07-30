@@ -239,10 +239,17 @@ export function CodeEditor({
     let disposed = false;
     const langCompartment = new Compartment();
 
+    // CRLF 文件按 CRLF 往返:不设 lineSeparator 时 CM 输入接受任意行尾、
+    // toString() 一律用 \n 拼接 —— Windows 上打开 CRLF 文件改一个字保存,
+    // git diff 就是整文件行尾变更。设了 facet 后 doc.toString() 原样还原 \r\n
+    // (文件内偶发的孤立 \n 会以控制字符可见,恰好暴露混合行尾)
+    const crlf = value.includes('\r\n');
+
     const view = new EditorView({
       state: EditorState.create({
         doc: value,
         extensions: [
+          ...(crlf ? [EditorState.lineSeparator.of('\r\n')] : []),
           lineNumbers(),
           highlightActiveLineGutter(),
           highlightSpecialChars(),
