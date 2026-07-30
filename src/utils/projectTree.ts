@@ -175,6 +175,26 @@ export function removeGroupAndPromoteChildren(tree: ProjectTreeItem[], groupId: 
   return false;
 }
 
+/** 从树中移除项目 id,并在原位置插入替补 id 列表(父项目删除时子项目晋升原位)。
+ *  未找到目标时返回 false,替补的去处由调用方兜底。 */
+export function replaceProjectInTree(
+  tree: ProjectTreeItem[],
+  projectId: string,
+  replacementIds: string[],
+): boolean {
+  for (let i = 0; i < tree.length; i++) {
+    if (tree[i] === projectId) {
+      tree.splice(i, 1, ...replacementIds);
+      return true;
+    }
+    const item = tree[i];
+    if (isGroup(item) && replaceProjectInTree(item.children, projectId, replacementIds)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /** 从树中递归移除指定项目 ID */
 export function removeProjectFromTree(tree: ProjectTreeItem[], projectId: string): boolean {
   for (let i = 0; i < tree.length; i++) {
@@ -196,10 +216,30 @@ export type OrderedItem =
   | { type: 'project'; project: ProjectConfig; depth: number; parentGroupId: string | null }
   | { type: 'group'; group: ProjectGroup; depth: number; parentGroupId: string | null };
 
-/** 递归展平树为带 depth 和 parentGroupId 的有序列表 */
+/** 递归展平树为带 depth 和 parentGroupId 的有序列表。
+ *  子项目(parentProjectId 有值,不在树中)紧随其父项目之后、深度 +1 注入。 */
 export function getOrderedTree(config: AppConfig): OrderedItem[] {
   const projectMap = new Map(config.projects.map((p) => [p.id, p]));
   const result: OrderedItem[] = [];
+
+  const childrenByParent = new Map<string, ProjectConfig[]>();
+  for (const p of config.projects) {
+    if (!p.parentProjectId) continue;
+    const list = childrenByParent.get(p.parentProjectId) ?? [];
+    list.push(p);
+    childrenByParent.set(p.parentProjectId, list);
+  }
+
+  // pushed 兼做环路保护:异常配置里 parentProjectId 互指时不至于无限递归
+  const pushed = new Set<string>();
+  function pushProject(project: ProjectConfig, depth: number, parentGroupId: string | null) {
+    if (pushed.has(project.id)) return;
+    pushed.add(project.id);
+    result.push({ type: 'project', project, depth, parentGroupId });
+    for (const child of childrenByParent.get(project.id) ?? []) {
+      pushProject(child, depth + 1, parentGroupId);
+    }
+  }
 
   function walk(items: ProjectTreeItem[], depth: number, parentGroupId: string | null) {
     for (const item of items) {
@@ -211,7 +251,7 @@ export function getOrderedTree(config: AppConfig): OrderedItem[] {
       } else {
         const project = projectMap.get(item);
         if (project) {
-          result.push({ type: 'project', project, depth, parentGroupId });
+          pushProject(project, depth, parentGroupId);
         }
       }
     }
@@ -220,24 +260,54 @@ export function getOrderedTree(config: AppConfig): OrderedItem[] {
   const tree = config.projectTree ?? [];
   walk(tree, 0, null);
 
-  // 追加不在 tree 中的项目到顶层
-  const inTree = new Set<string>();
-  function collectIds(items: ProjectTreeItem[]) {
+  // 追加既不在 tree 中、也没有(存活的)父项目的项目到顶层。
+  // 父项目仍在但自己还没被推入的情况不会出现——pushProject 已随父注入;
+  // 父项目丢失的孤儿子项目在这里兜底回到顶层,保证不凭空消失。
+  for (const p of config.projects) {
+    if (pushed.has(p.id)) continue;
+    if (p.parentProjectId && projectMap.has(p.parentProjectId)) continue;
+    pushProject(p, 0, null);
+  }
+
+  return result;
+}
+
+/** 项目 + 它在树中的祖先分组名链（根→父）；顶层项目为空数组 */
+export interface ProjectWithGroupPath {
+  project: ProjectConfig;
+  groupPath: string[];
+}
+
+/**
+ * 按树序（深度优先）列出全部项目，每个带上祖先分组名链。
+ *
+ * 与 `getOrderedTree` 的区别：**不**跳过折叠组的子项——折叠是桌面侧栏的视图状态，
+ * 而这里的消费者（移动端快照）要的是完整清单，折叠与否由移动端自己决定。
+ */
+export function getProjectsWithGroupPath(config: AppConfig): ProjectWithGroupPath[] {
+  const projectMap = new Map(config.projects.map((p) => [p.id, p]));
+  const result: ProjectWithGroupPath[] = [];
+  const seen = new Set<string>();
+
+  function walk(items: ProjectTreeItem[], groupPath: string[]) {
     for (const item of items) {
       if (isGroup(item)) {
-        collectIds(item.children);
-      } else {
-        inTree.add(item);
+        walk(item.children, [...groupPath, item.name]);
+        continue;
+      }
+      const project = projectMap.get(item);
+      if (project && !seen.has(project.id)) {
+        seen.add(project.id);
+        result.push({ project, groupPath });
       }
     }
   }
-  collectIds(tree);
-  for (const p of config.projects) {
-    if (!inTree.has(p.id)) {
-      result.push({ type: 'project', project: p, depth: 0, parentGroupId: null });
-    }
-  }
+  walk(config.projectTree ?? [], []);
 
+  // 不在树中的项目（异常配置兜底）追加到顶层，与 getOrderedTree 口径一致
+  for (const p of config.projects) {
+    if (!seen.has(p.id)) result.push({ project: p, groupPath: [] });
+  }
   return result;
 }
 

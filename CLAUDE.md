@@ -43,18 +43,19 @@ cd src-tauri && cargo test
 | `config.rs` | `AppConfig` 持久化到 `{app_data_dir}/config.json`；提供跨平台预置 shell 列表 |
 | `fs.rs` | 目录列表（过滤 `.gitignore`）+ `notify` 文件监听，通过 `fs-change` 事件通知前端 |
 | `ai_sessions.rs` | 读取 Claude/Codex 历史会话记录 |
-| `mobile_relay.rs` | 移动端中转体系：对中转服务器的出站 WSS 长连（指数退避重连）、配对码/重置配对、活跃 AI 会话快照与项目级增量、镜像订阅管理、移动端指令写穿 PTY |
+| `mobile_relay.rs` | 移动端中转体系：对中转服务器的出站 WSS 长连（带桌面端密钥握手、指数退避重连）、配对码/重置配对、项目快照与项目级增量、镜像订阅管理、移动端指令写穿 PTY、移动端发起会话的校验与派发、移动端改会话名的标题收敛 |
 | `mobile_mirror.rs` | 对话镜像：pane → 项目最新会话 JSONL 的增量解析（半行拼接）、分页取数 |
 
-**Tauri Commands**: `load_config`, `save_config`, `create_pty`, `write_pty`, `resize_pty`, `kill_pty`, `list_directory`, `watch_directory`, `unwatch_directory`, `get_ai_sessions`, `mobile_relay_apply`, `mobile_relay_status`, `mobile_relay_request_pairing_code`, `mobile_relay_reset_pairing`, `mobile_relay_update_sessions`
+**Tauri Commands**: `load_config`, `save_config`, `create_pty`, `write_pty`, `resize_pty`, `kill_pty`, `list_directory`, `watch_directory`, `unwatch_directory`, `get_ai_sessions`, `mobile_relay_apply`, `mobile_relay_status`, `mobile_relay_request_pairing_code`, `mobile_relay_reset_pairing`, `mobile_relay_update_sessions`, `mobile_relay_launchers_changed`, `mobile_relay_start_session_result`, `mobile_relay_check_launcher_command`
 
-**Tauri Events（后端→前端）**: `pty-output`, `pty-exit`, `pty-status-change`, `fs-change`, `mobile-relay-status`, `mobile-relay-pairing-code`
+**Tauri Events（后端→前端）**: `pty-output`, `pty-exit`, `pty-status-change`, `fs-change`, `mobile-relay-status`, `mobile-relay-pairing-code`, `mobile-start-session`, `mobile-rename-pane`
 
 ### 移动端中转体系（`relay-server/` + `mobile/`）
 
-- `relay-server/protocol`：桌面端与中转共享的协议消息 crate（JSON over WebSocket，serde camelCase，带版本号握手校验）；PWA 侧 TypeScript 类型在 `mobile/src/protocol.ts` 手写镜像，两侧字段必须同步维护
-- `relay-server/server`：axum 中转服务，只做转发不落盘；`cd relay-server && cargo test` 跑 Seam 1 协议边界测试
-- `mobile/`：React + TS + Vite PWA（扫码配对、会话列表、对话镜像、移动端指令）；`cd mobile && npm run build` 构建，产物由中转托管；部署见 `docs/deploy-relay.zh-CN.md`（英文版 `docs/deploy-relay.md`）
+- `relay-server/protocol`：桌面端与中转共享的协议消息 crate（JSON over WebSocket，serde camelCase，带版本号握手校验，当前 v2）；PWA 侧 TypeScript 类型在 `mobile/src/protocol.ts` 手写镜像，两侧字段必须同步维护
+- `relay-server/server`：axum 中转服务，只做转发不落盘；桌面端接入需携带 `MT_RELAY_DESKTOP_KEY`（未配置即拒绝一切桌面连接，fail-closed）；`cd relay-server && cargo test` 跑 Seam 1 协议边界测试
+- `mobile/`：React + TS + Vite PWA（扫码配对、会话列表、对话镜像、移动端指令、发起新 AI 会话、会话重命名）；`cd mobile && npm run build` 构建，产物由中转托管；部署见 `docs/deploy-relay.zh-CN.md`（英文版 `docs/deploy-relay.md`）
+- **AI 启动器**：桌面端配置的具名 `{名称, shell?, 命令}`，移动端只按 id 引用、看得到名字，命令文本从不经过移动端或中转（ADR 0002 的边界）
 
 ### 前端 (`src/`)
 
@@ -72,6 +73,8 @@ cd src-tauri && cargo test
 | `SplitLayout.tsx` | 递归渲染 SplitNode 树，使用 Allotment 实现可拖拽分屏 |
 | `TerminalInstance.tsx` | xterm.js 终端实例，WebGL 渲染，ResizeObserver 自适应，文件拖拽插入路径 |
 | `TerminalConfigModal.tsx` | 终端配置 modal（shell 列表管理） |
+| `MobileRelayModal.tsx` | 「移动端」面板：中转地址 + 桌面端密钥、连接状态、配对二维码、AI 启动器 |
+| `AiLauncherSection.tsx` | AI 启动器增删改（名称 / shell / 命令 + 命令识别警告），嵌在「移动端」面板 |
 
 **类型系统** (`src/types.ts`): 前端所有类型定义，与后端 Rust 结构通过 `serde(rename_all = "camelCase")` 对齐。
 

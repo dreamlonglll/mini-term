@@ -1,11 +1,11 @@
 import { useState, useEffect, useMemo, useRef } from 'react';
-import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeRaw from 'rehype-raw';
 import { MOD_LABEL } from '../utils/platform';
 import { handleExternalLinkClick } from '../utils/externalLink';
+import { Modal } from './Modal';
 import { useT } from '../i18n';
 import type { AiSession, AiSessionMessage, RemoteSessionContent } from '../types';
 
@@ -121,11 +121,8 @@ export function SessionViewerModal({ open, onClose, session, projectPath }: Prop
         e.preventDefault();
         searchRef.current?.focus();
       } else if (e.key === 'Escape') {
-        if (search) {
-          setSearch('');
-        } else {
-          onClose();
-        }
+        // 关窗交给 Modal（closeOnEscape={!search}）；这里只管「先清搜索」这一层
+        if (search) setSearch('');
       } else if (e.key === 'Enter' && document.activeElement === searchRef.current) {
         e.preventDefault();
         if (matchIndices.length === 0) return;
@@ -167,14 +164,16 @@ export function SessionViewerModal({ open, onClose, session, projectPath }: Prop
   const isMatch = (i: number) => q && matchIndices.includes(i);
   const isCurrentMatch = (i: number) => q && matchIndices[matchIdx] === i;
 
-  return createPortal(
-    <div className="fixed inset-0 z-50 flex items-center justify-center select-text" onClick={onClose}>
-      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
-      <div
-        className="relative flex flex-col overflow-hidden bg-[var(--bg-surface)] border border-[var(--border-strong)] rounded-[var(--radius-md)] shadow-[var(--shadow-overlay)] animate-slide-in"
-        style={{ width: '90vw', height: '80vh' }}
-        onClick={(e) => e.stopPropagation()}
-      >
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      align="center"
+      ariaLabel={session?.title}
+      panelClassName="w-[90vw] h-[80vh] select-text"
+      // 有搜索词时 Esc 先清搜索（上面的 handler 负责），清空后再按才关窗
+      closeOnEscape={!search}
+    >
         {/* 标题栏 */}
         <div className="flex items-center justify-between px-4 py-2.5 border-b border-[var(--border-subtle)] flex-shrink-0">
           <div className="flex items-center gap-2 min-w-0">
@@ -259,7 +258,7 @@ export function SessionViewerModal({ open, onClose, session, projectPath }: Prop
                 <span className="text-xs font-semibold" style={{ color: msg.role === 'user' ? 'var(--text-secondary)' : typeColor }}>
                   {msg.role === 'user' ? 'User' : 'Assistant'}
                 </span>
-                {msg.timestamp && <span className="text-[10px] text-[var(--text-muted)]">{formatTime(msg.timestamp)}</span>}
+                {msg.timestamp && <span className="text-xs text-[var(--text-muted)]">{formatTime(msg.timestamp)}</span>}
               </div>
               <div
                 className={`rounded-[var(--radius-sm)] px-3 py-2 text-sm ${
@@ -289,8 +288,6 @@ export function SessionViewerModal({ open, onClose, session, projectPath }: Prop
             </div>
           ))}
         </div>
-      </div>
-    </div>,
-    document.body,
+    </Modal>
   );
 }

@@ -1,8 +1,8 @@
 import { useState, useEffect } from 'react';
-import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { Allotment } from 'allotment';
 import { useAppStore } from '../store';
+import { Modal } from './Modal';
 import { useT } from '../i18n';
 import type { GitFileStatus, GitDiffResult, DiffLine } from '../types';
 
@@ -176,27 +176,13 @@ export function DiffModal({ open, onClose, projectPath, status, staged }: DiffMo
       .finally(() => setLoading(false));
   }, [open, projectPath, status.path]);
 
-  useEffect(() => {
-    if (!open) return;
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [open, onClose]);
-
   if (!open) return null;
 
   const fileName = status.path.split('/').pop() ?? status.path;
 
-  return createPortal(
-    <div className="fixed inset-0 z-50 flex items-center justify-center select-text" onClick={onClose}>
-      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" />
-      <div
-        className="relative flex flex-col overflow-hidden bg-[var(--bg-surface)] border border-[var(--border-strong)] rounded-[var(--radius-md)] shadow-[var(--shadow-overlay)] animate-slide-in"
-        style={{ width: '90vw', height: '80vh' }}
-        onClick={(e) => e.stopPropagation()}
-      >
+  return (
+    <Modal open={open} onClose={onClose} align="center" ariaLabel={fileName}
+      panelClassName="w-[90vw] h-[80vh] select-text">
         {/* 工具栏 */}
         <div className="flex items-center justify-between px-4 py-3 border-b border-[var(--border-subtle)] flex-shrink-0">
           <div className="flex items-center gap-2">
@@ -268,8 +254,6 @@ export function DiffModal({ open, onClose, projectPath, status, staged }: DiffMo
               : <InlineView hunks={diffResult.hunks} fontSize={terminalFontSize} />
           )}
         </div>
-      </div>
-    </div>,
-    document.body,
+    </Modal>
   );
 }

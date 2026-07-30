@@ -15,6 +15,7 @@
     "src/utils/layoutRestore.ts",
     "src/utils/themeManager.ts",
     "src/utils/terminalSnapshot.ts",
-    "src/utils/ptyWriteQueue.ts"
+    "src/utils/ptyWriteQueue.ts",
+    "src/utils/wslPath.ts"
   ]
 }

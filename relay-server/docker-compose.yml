@@ -15,5 +15,11 @@ services:
       - "127.0.0.1:8080:8080"
     environment:
       RELAY_PORT: "8080"
+      # 桌面端接入密钥:**必配**。写进 relay-server/.env,生成:openssl rand -hex 32。
+      # 桌面端「移动端」面板里要填同一个值。
+      # 这里用 :- 而不是 :? —— 没配也要让容器起来:中转会正常服务 PWA 与移动端,
+      # 只拒绝桌面端连接并在启动日志里说清原因(fail-closed 的表达方式是"拒绝连接",
+      # 不是"拒绝启动";容器起不来的话那行日志就没人看得见了)。
+      MT_RELAY_DESKTOP_KEY: "${MT_RELAY_DESKTOP_KEY:-}"
       # RELAY_BIND: 0.0.0.0        # 容器内监听地址,默认即可
       # RELAY_PWA_DIR: /srv/pwa    # PWA 静态资源目录,镜像内已内置

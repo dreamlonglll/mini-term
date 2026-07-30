@@ -244,8 +244,8 @@ export function GitChanges({ projectPath: _projectPath, repoPath, onCommitSucces
             { label: t('gitChanges.contextViewDiff'), onClick: () => handleViewDiff(file.path, isStaged, statusChar) },
             sep,
             ...(isStaged
-              ? [{ label: 'Unstage', onClick: () => handleUnstage([file.path]) }]
-              : [{ label: 'Stage', onClick: () => handleStage([file.path]) }]),
+              ? [{ label: t('panels.unstage'), onClick: () => handleUnstage([file.path]) }]
+              : [{ label: t('panels.stage'), onClick: () => handleStage([file.path]) }]),
             ...(area !== 'staged'
               ? [sep, { label: t('gitChanges.contextDiscard'), onClick: () => handleDiscard([file.path]) }]
               : []),
@@ -263,7 +263,8 @@ export function GitChanges({ projectPath: _projectPath, repoPath, onCommitSucces
         </div>
         <button
           className="shrink-0 w-5 h-5 flex items-center justify-center text-sm opacity-0 group-hover:opacity-100 text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-opacity"
-          title={isStaged ? 'Unstage' : 'Stage'}
+          title={isStaged ? t('panels.unstage') : t('panels.stage')}
+          aria-label={isStaged ? t('panels.unstage') : t('panels.stage')}
           onClick={(e) => {
             e.stopPropagation();
             isStaged ? handleUnstage([file.path]) : handleStage([file.path]);
@@ -294,7 +295,7 @@ export function GitChanges({ projectPath: _projectPath, repoPath, onCommitSucces
             });
           }}
         >
-          <span className="text-[11px] w-3 text-center" style={{
+          <span className="text-sm w-3 text-center" style={{
             transform: isCollapsed ? 'rotate(-90deg)' : 'rotate(0deg)',
             display: 'inline-block',
             transition: 'transform 150ms',
@@ -382,15 +383,15 @@ export function GitChanges({ projectPath: _projectPath, repoPath, onCommitSucces
           <div className="text-center text-[var(--text-muted)] text-sm py-6">{t('gitChanges.empty')}</div>
         )}
 
-        {renderGroup('Staged Changes', staged, 'staged', {
+        {renderGroup(t('panels.stagedChanges'), staged, 'staged', {
           label: t('gitChanges.unstageAll'),
           onClick: handleUnstageAll,
         })}
-        {renderGroup('Changes', unstaged, 'unstaged', {
+        {renderGroup(t('panels.unstagedChanges'), unstaged, 'unstaged', {
           label: t('gitChanges.stageAll'),
           onClick: handleStageAll,
         })}
-        {renderGroup('Untracked Files', untracked, 'untracked', {
+        {renderGroup(t('panels.untrackedFiles'), untracked, 'untracked', {
           label: t('gitChanges.stageAll'),
           onClick: handleStageAll,
         })}
@@ -401,7 +402,7 @@ export function GitChanges({ projectPath: _projectPath, repoPath, onCommitSucces
         <textarea
           className="w-full text-sm bg-[var(--bg-base)] text-[var(--text-primary)] border border-[var(--border-default)] rounded px-2 py-1.5 resize-none placeholder:text-[var(--text-muted)] select-text"
           rows={3}
-          placeholder="Commit message..."
+          placeholder={t('panels.commitPlaceholder')}
           value={commitMsg}
           onChange={(e) => setCommitMsg(e.target.value)}
           onKeyDown={(e) => {
@@ -419,7 +420,7 @@ export function GitChanges({ projectPath: _projectPath, repoPath, onCommitSucces
           disabled={!commitMsg.trim() || staged.length === 0 || committing}
           onClick={handleCommit}
         >
-          {committing ? t('gitChanges.committing') : `Commit (${staged.length})`}
+          {committing ? t('gitChanges.committing') : t('panels.commit', { count: staged.length })}
         </button>
       </div>
 

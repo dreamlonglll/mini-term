@@ -11,6 +11,9 @@ export const gitHistoryContent = {
     refresh: "刷新",
     noCommits: "暂无提交",
     noRepos: "未发现 Git 仓库",
+    openInTerminal: "在终端打开",
+    manageWorktrees: "Worktree 管理",
+    worktreeBadgeTitle: "此仓库是一个 git worktree",
   },
   en: {
     remoteBranch: "Remote branch: {name}",
@@ -24,5 +27,8 @@ export const gitHistoryContent = {
     refresh: "Refresh",
     noCommits: "No commits",
     noRepos: "No Git repositories found",
+    openInTerminal: "Open in Terminal",
+    manageWorktrees: "Manage Worktrees",
+    worktreeBadgeTitle: "This repository is a git worktree",
   },
 } as const;

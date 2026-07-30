@@ -42,6 +42,14 @@ use crate::fs::{natural_cmp, FileEntry, ALWAYS_IGNORE};
 const SFTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 /// 建立(或复用)SSH session 的外层超时:TCP 连接 + 握手 + 认证。
 const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
+/// 粘贴上传的**单请求**超时(`run_sftp_upload_on_session` 把它转成
+/// `SftpSession::set_timeout`,不是整段传输的上限)。慢链路下单个 chunk 包
+/// 不该把整段打断,故比只读的 20s 宽。
+const PASTE_UPLOAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// 粘贴上传的**整体**墙钟上限。必须显式加 —— 前端在上传期间用 in-flight 去重
+/// 挡住重复 Ctrl+V,如果这里没有硬上限,一次卡死的传输会让该 pane 的粘贴
+/// 静默失效且永不恢复。用户此刻正盯着「按了 Ctrl+V 还没出路径」,宁可早报错。
+const PASTE_UPLOAD_TOTAL_TIMEOUT: Duration = Duration::from_secs(90);
 /// 根 `.gitignore` 读取上限。超大 .gitignore 截断(极端场景,规则少截无妨)。
 const GITIGNORE_MAX_BYTES: usize = 256 * 1024;
 /// 远程会话列表缓存 TTL(对齐 WSL 会话的 10s;`force=true` 绕过)。
@@ -156,15 +164,22 @@ async fn acquire_session(
     Ok(session)
 }
 
-/// 开一个 SFTP 会话句柄。transport 级失败(死链 race)evict + 重连再试一次,
-/// 与 mt-ssh-mcp 的 exec/transfer 编排同构。
-async fn open_sftp(state: &RemoteSshState, conn: &SshConnection) -> Result<SftpHandle, String> {
+/// 开一个 SFTP 会话句柄,**并把承载它的 session 一并返回**。
+/// transport 级失败(死链 race)evict + 重连再试一次,与 mt-ssh-mcp 的
+/// exec/transfer 编排同构。
+///
+/// 需要 session 的场景只有上传(`run_sftp_upload_on_session` 自己另开 channel,
+/// 但要拿同一条已认证 session);只读场景用下面的 [`open_sftp`] 丢掉它即可。
+async fn open_sftp_with_session(
+    state: &RemoteSshState,
+    conn: &SshConnection,
+) -> Result<(Arc<CachedSession>, SftpHandle), String> {
     let pool = state.pool();
     let session = acquire_session(&pool, conn).await?;
     match SftpHandle::open_on_session(&session, SFTP_REQUEST_TIMEOUT).await {
         Ok(h) => {
             session.touch();
-            Ok(h)
+            Ok((session, h))
         }
         Err(e) if e.is_transport() => {
             eprintln!("[remote-ssh] sftp open failed (transport), retrying once: {e}");
@@ -174,10 +189,15 @@ async fn open_sftp(state: &RemoteSshState, conn: &SshConnection) -> Result<SftpH
                 .await
                 .map_err(|e| e.message().to_string())?;
             session2.touch();
-            Ok(h)
+            Ok((session2, h))
         }
         Err(e) => Err(e.message().to_string()),
     }
+}
+
+/// 开一个 SFTP 会话句柄(只读路径用,不需要 session 本身)。
+async fn open_sftp(state: &RemoteSshState, conn: &SshConnection) -> Result<SftpHandle, String> {
+    Ok(open_sftp_with_session(state, conn).await?.1)
 }
 
 /// 远程 `$HOME`(SFTP canonicalize(".")),按连接缓存。锁即取即放。
@@ -247,6 +267,66 @@ fn expand_tilde(path: &str, home: &str) -> String {
         return join_posix(home_norm, rest);
     }
     p.to_string()
+}
+
+/// 把配置里的「远程粘贴落盘目录」解析成远端绝对路径。
+///
+/// 三种写法(对齐 `AppConfig::remote_paste_dir` 的文档):
+/// - 相对路径 `.mini-term/pasted` → 相对**项目根**展开(默认形态,图片落项目内)
+/// - `~` / `~/xxx` → 远程 home 展开
+/// - 绝对路径 `/tmp/mini-term` → 原样
+///
+/// **保证返回的路径不含 `..` 段**。这条路径最终会拼进 SFTP **写**操作 ——
+/// 逃出项目根 / home 的写入不是这个功能该有的能力,宁可报错。
+/// 判定放在归一之后,`project_path`(前端传入)带 `..` 的情形一并挡掉,
+/// 而不只是校验用户填的 `dest_dir`。
+fn resolve_paste_dir(project_path: &str, home: &str, dest_dir: &str) -> Result<String, String> {
+    // 用户可能顺手填了反斜杠,统一成 POSIX 分隔符再判定。
+    let raw = dest_dir.trim().replace('\\', "/");
+    let raw = if raw.trim().is_empty() {
+        crate::config::default_remote_paste_dir()
+    } else {
+        raw
+    };
+
+    let abs = if raw.starts_with('/') {
+        raw.clone()
+    } else if raw == "~" || raw.starts_with("~/") {
+        expand_tilde(&raw, home)
+    } else {
+        // 相对项目根。项目根必须是绝对路径(添加远程项目时已 canonicalize)。
+        if !project_path.starts_with('/') {
+            return Err(format!("远程项目路径不是绝对路径: {project_path}"));
+        }
+        join_posix(project_path, raw.trim_start_matches('/'))
+    };
+
+    // 归一:丢掉空段与 `.` 段。`./x` 和 `x` 必须解析成同一条路径,否则
+    // `/proj/.` 这种写法会绕过下游「目录是否严格位于项目内」的判定。
+    // 注意 `.` / `..` 都是**整段**比较,`.mini-term` 这类点开头的目录名不受影响。
+    let normalized: Vec<&str> = abs
+        .split('/')
+        .filter(|seg| !seg.is_empty() && *seg != ".")
+        .collect();
+    if normalized.is_empty() {
+        return Err("远程粘贴目录解析为空".into());
+    }
+    // 归一后再查 `..`:此时 dest_dir 与 project_path 两部分都已合入 abs,
+    // 一处判定覆盖两个来源。
+    if normalized.contains(&"..") {
+        return Err("远程粘贴目录不能包含 `..`".into());
+    }
+    Ok(format!("/{}", normalized.join("/")))
+}
+
+/// 从本地临时文件路径提取文件名。两种分隔符都切 —— 传进来的是 Windows 路径,
+/// 不能让 `\` 残留在远端路径里。
+fn paste_file_name(local_path: &str) -> Result<String, String> {
+    let name = local_path.rsplit(['/', '\\']).next().unwrap_or("").trim();
+    if name.is_empty() || name == "." || name == ".." {
+        return Err(format!("无法从本地路径提取文件名: {local_path}"));
+    }
+    Ok(name.to_string())
 }
 
 /// 用根 `.gitignore` 的文本内容构建匹配器。逐行喂 `add_line`(SFTP 读来的内容
@@ -470,6 +550,77 @@ pub async fn ssh_remote_validate_dir(
         Ok(canonical)
     }
     .await;
+    sftp.close().await;
+    result
+}
+
+// ---------------------------------------------------------------------------
+// command: 粘贴内容上传(issue #36)
+// ---------------------------------------------------------------------------
+
+/// 把本地临时文件(剪贴板图片 / 长文本转存)上传到远程项目,返回**远端绝对路径**。
+///
+/// 背景:远程项目的 pane 跑的是本地 `ssh` 客户端,粘贴走本地链路只会得到一个
+/// Windows 路径 —— 远端 agent 读不到。这里另开一条 SFTP(池里同一条 session)
+/// 把文件送过去,前端再把返回的远端路径粘进终端。
+///
+/// 目标目录由 `dest_dir` 决定(见 [`resolve_paste_dir`]),不存在则逐级创建。
+/// 同名覆盖:文件名由调用方生成(`clip-<ms>.png` / `paste-<ms>.txt`),带毫秒
+/// 时间戳,实际不会撞。
+#[tauri::command]
+pub async fn ssh_remote_upload_paste(
+    app: AppHandle,
+    state: tauri::State<'_, RemoteSshState>,
+    connection_id: String,
+    project_path: String,
+    local_path: String,
+    dest_dir: String,
+) -> Result<String, String> {
+    let conn = find_connection(&app, &connection_id)?;
+    let file_name = paste_file_name(&local_path)?;
+    let (session, sftp) = open_sftp_with_session(&state, &conn).await?;
+
+    // 整段(建目录 + 上传)套一层墙钟上限:见 PASTE_UPLOAD_TOTAL_TIMEOUT。
+    let result = tokio::time::timeout(PASTE_UPLOAD_TOTAL_TIMEOUT, async {
+        let home = remote_home(&state, &sftp, &connection_id).await?;
+        let dir = resolve_paste_dir(&project_path, &home, &dest_dir)?;
+        sftp.create_dir_all(&dir)
+            .await
+            .map_err(|e| format!("创建远程粘贴目录失败: {}", e.message()))?;
+
+        // 目录**严格位于**项目内(默认形态)时放一个自忽略的 .gitignore ——
+        // 否则每次粘图都会把用户仓库的 `git status` 弄脏。
+        // CREATE|EXCLUDE 语义天然幂等,已存在就失败,失败也无所谓:这只是体面,
+        // 绝不能拖累粘贴本身。
+        //
+        // 空相对路径(dir 就是项目根)必须排除 —— 那会在仓库根写下一个内容为
+        // `*` 的 .gitignore,把用户整个仓库忽略掉。
+        if posix_relative(&project_path, &dir).is_some_and(|rel| !rel.is_empty()) {
+            let _ = sftp
+                .write_new_file(&join_posix(&dir, ".gitignore"), b"*\n")
+                .await;
+        }
+
+        let remote_path = join_posix(&dir, &file_name);
+        mt_ssh::run_sftp_upload_on_session(
+            &session,
+            &local_path,
+            &remote_path,
+            PASTE_UPLOAD_REQUEST_TIMEOUT,
+        )
+        .await
+        .map_err(|e| format!("上传到远程失败: {}", e.message()))?;
+        session.touch();
+        Ok(remote_path)
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(format!(
+            "上传到远程超时({}s)",
+            PASTE_UPLOAD_TOTAL_TIMEOUT.as_secs()
+        ))
+    });
+
     sftp.close().await;
     result
 }
@@ -975,6 +1126,149 @@ mod tests {
         // `~user` 形式不支持展开,原样交给 canonicalize 报错
         assert_eq!(expand_tilde("~other/x", "/home/u"), "~other/x");
         assert_eq!(expand_tilde("relative/dir", "/home/u"), "relative/dir");
+    }
+
+    // --- 粘贴落盘目录解析(issue #36) ---
+
+    #[test]
+    fn resolve_paste_dir_defaults_to_project_relative() {
+        // 默认形态:相对项目根,图片落在项目内
+        assert_eq!(
+            resolve_paste_dir("/home/u/proj", "/home/u", ".mini-term/pasted").unwrap(),
+            "/home/u/proj/.mini-term/pasted"
+        );
+        // 空配置回落到默认值,而不是把文件丢到项目根
+        assert_eq!(
+            resolve_paste_dir("/home/u/proj", "/home/u", "   ").unwrap(),
+            "/home/u/proj/.mini-term/pasted"
+        );
+        // 项目根带尾斜杠不产生双斜杠
+        assert_eq!(
+            resolve_paste_dir("/home/u/proj/", "/home/u", "assets").unwrap(),
+            "/home/u/proj/assets"
+        );
+    }
+
+    #[test]
+    fn resolve_paste_dir_supports_absolute_and_tilde() {
+        assert_eq!(
+            resolve_paste_dir("/home/u/proj", "/home/u", "/tmp/mini-term").unwrap(),
+            "/tmp/mini-term"
+        );
+        assert_eq!(
+            resolve_paste_dir("/home/u/proj", "/home/u", "~/uploads").unwrap(),
+            "/home/u/uploads"
+        );
+        assert_eq!(
+            resolve_paste_dir("/home/u/proj", "/home/u", "~").unwrap(),
+            "/home/u"
+        );
+        // 尾斜杠被归一,避免拼出 `//file`
+        assert_eq!(
+            resolve_paste_dir("/home/u/proj", "/home/u", "/tmp/x/").unwrap(),
+            "/tmp/x"
+        );
+    }
+
+    #[test]
+    fn resolve_paste_dir_rejects_parent_traversal() {
+        // 这条路径会拼进 SFTP 写操作,`..` 逃逸必须挡在解析层
+        assert!(resolve_paste_dir("/home/u/proj", "/home/u", "../outside").is_err());
+        assert!(resolve_paste_dir("/home/u/proj", "/home/u", "a/../../b").is_err());
+        assert!(resolve_paste_dir("/home/u/proj", "/home/u", "/tmp/../etc").is_err());
+        assert!(resolve_paste_dir("/home/u/proj", "/home/u", "~/../root").is_err());
+        // 反斜杠写法先归一再判,不能绕过
+        assert!(resolve_paste_dir("/home/u/proj", "/home/u", r"..\outside").is_err());
+    }
+
+    #[test]
+    fn resolve_paste_dir_rejects_traversal_from_project_path_too() {
+        // `..` 也可能来自 project_path(前端传入,非用户在设置页填的那半)。
+        // 判定放在归一之后就是为了一处覆盖两个来源 —— 返回值恒不含 `..`。
+        assert!(resolve_paste_dir("/home/u/../etc", "/home/u", "assets").is_err());
+        assert!(resolve_paste_dir("/home/u/proj/..", "/home/u", ".mini-term").is_err());
+        // home 带 `..` 的 `~` 展开同样挡住
+        assert!(resolve_paste_dir("/home/u/proj", "/home/../root", "~/x").is_err());
+    }
+
+    #[test]
+    fn resolve_paste_dir_normalizes_dot_segments_and_double_slash() {
+        // `.` 段必须被吃掉:否则 `/proj/.` 会被下游当成「严格位于项目内」，
+        // 而它其实就是项目根 —— 自忽略 .gitignore 会写到仓库根，忽略整个仓库。
+        assert_eq!(
+            resolve_paste_dir("/home/u/proj", "/home/u", ".").unwrap(),
+            "/home/u/proj"
+        );
+        assert_eq!(
+            resolve_paste_dir("/home/u/proj", "/home/u", "./assets").unwrap(),
+            "/home/u/proj/assets"
+        );
+        assert_eq!(
+            resolve_paste_dir("/home/u/proj", "/home/u", "a//b").unwrap(),
+            "/home/u/proj/a/b"
+        );
+        // 点开头的目录名不是 `.` 段，不能被误删
+        assert_eq!(
+            resolve_paste_dir("/home/u/proj", "/home/u", ".mini-term").unwrap(),
+            "/home/u/proj/.mini-term"
+        );
+    }
+
+    #[test]
+    fn paste_dir_at_project_root_is_not_strictly_inside() {
+        // 自忽略 .gitignore 的守卫条件：rel 非空才写。
+        // 解析成项目根本身时 rel 为空 —— 绝不能在仓库根写下内容为 `*` 的 .gitignore。
+        let dir = resolve_paste_dir("/home/u/proj", "/home/u", ".").unwrap();
+        assert_eq!(posix_relative("/home/u/proj", &dir).as_deref(), Some(""));
+
+        // 默认形态才是「严格位于项目内」，应当写
+        let nested = resolve_paste_dir("/home/u/proj", "/home/u", ".mini-term/pasted").unwrap();
+        assert_eq!(
+            posix_relative("/home/u/proj", &nested).as_deref(),
+            Some(".mini-term/pasted")
+        );
+
+        // 项目外的绝对路径不参与 .gitignore 逻辑
+        let outside = resolve_paste_dir("/home/u/proj", "/home/u", "/tmp/mini-term").unwrap();
+        assert!(posix_relative("/home/u/proj", &outside).is_none());
+    }
+
+    #[test]
+    fn resolve_paste_dir_normalizes_backslash_input() {
+        // 用户顺手填了 Windows 风格分隔符,不该原样拼进远端路径
+        assert_eq!(
+            resolve_paste_dir("/home/u/proj", "/home/u", r".mini-term\pasted").unwrap(),
+            "/home/u/proj/.mini-term/pasted"
+        );
+    }
+
+    #[test]
+    fn resolve_paste_dir_rejects_relative_project_root() {
+        // 相对目录 + 非绝对项目根 = 拼不出合法远端路径,明确报错而不是拼个怪路径
+        assert!(resolve_paste_dir("proj", "/home/u", "assets").is_err());
+        // 但绝对 dest_dir 不依赖项目根,仍应通过
+        assert!(resolve_paste_dir("proj", "/home/u", "/tmp/x").is_ok());
+    }
+
+    // --- 粘贴文件名提取 ---
+
+    #[test]
+    fn paste_file_name_strips_both_separators() {
+        assert_eq!(
+            paste_file_name(r"C:\Users\u\AppData\Local\Temp\clip-123.png").unwrap(),
+            "clip-123.png"
+        );
+        assert_eq!(paste_file_name("/tmp/paste-9.txt").unwrap(), "paste-9.txt");
+        // 混合分隔符:不能让 `\` 残留进远端路径
+        assert_eq!(paste_file_name(r"C:/Temp\clip-1.png").unwrap(), "clip-1.png");
+    }
+
+    #[test]
+    fn paste_file_name_rejects_degenerate_input() {
+        assert!(paste_file_name("").is_err());
+        assert!(paste_file_name(r"C:\Temp\").is_err());
+        assert!(paste_file_name("/tmp/.").is_err());
+        assert!(paste_file_name("..").is_err());
     }
 
     // --- 根 .gitignore 相对路径匹配 ---

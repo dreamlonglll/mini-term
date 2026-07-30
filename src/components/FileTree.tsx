@@ -132,7 +132,24 @@ function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff, onViewF
           entry.ignored ? 'text-[var(--text-muted)] opacity-50' : entry.isDir ? 'text-[var(--color-folder)]' : 'text-[var(--color-file)]'
         }`}
         style={{ paddingLeft: `${depth * 16 + 8}px` }}
+        role="treeitem"
+        aria-expanded={entry.isDir ? expanded : undefined}
+        aria-label={entry.name}
+        tabIndex={0}
         onClick={handleToggle}
+        onKeyDown={(e) => {
+          // 目录：Enter/Space/→ 展开，← 折叠；文件：Enter/Space 打开预览
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            void handleToggle();
+          } else if (entry.isDir && e.key === 'ArrowRight' && !expanded) {
+            e.preventDefault();
+            void handleToggle();
+          } else if (entry.isDir && e.key === 'ArrowLeft' && expanded) {
+            e.preventDefault();
+            void handleToggle();
+          }
+        }}
         onContextMenu={(e) => {
           e.preventDefault();
           e.stopPropagation();
@@ -259,7 +276,7 @@ function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff, onViewF
               <span className="inline-block w-2.5 h-2.5 border border-[var(--text-muted)] border-t-transparent rounded-full animate-spin" />
             </span>
           ) : (
-            <span className="text-[13px] w-3 text-center text-[var(--text-muted)] transition-transform duration-150"
+            <span className="text-base w-3 text-center text-[var(--text-muted)] transition-transform duration-150"
               style={{ transform: expanded ? 'rotate(0deg)' : 'rotate(-90deg)', display: 'inline-block' }}>
               ▾
             </span>
@@ -610,7 +627,7 @@ export function FileTree() {
     <div data-panel className="h-full bg-[var(--bg-surface)] flex flex-col border-l border-[var(--border-subtle)] select-none">
       <div data-panel-header className="px-3 pt-3 pb-1.5 flex items-center justify-between gap-2 flex-shrink-0">
         <span className="text-sm text-[var(--text-muted)] uppercase tracking-[0.12em] font-medium truncate">
-          Files — {project.name}
+          {t('panels.filesOf', { project: project.name })}
         </span>
         <div className="flex items-center flex-shrink-0 gap-1">
           {/* 内容搜索是本地 ripgrep 链路,远程项目隐藏 */}
@@ -619,9 +636,13 @@ export function FileTree() {
               type="button"
               onClick={() => setSearchModalOpen(true)}
               title={t('fileTree.header.searchTitle', { mod: MOD_LABEL })}
-              className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors text-sm leading-none px-1.5 py-0.5 rounded-[var(--radius-sm)] hover:bg-[var(--border-subtle)]"
+              aria-label={t('fileTree.header.searchTitle', { mod: MOD_LABEL })}
+              className="w-[26px] h-[26px] flex items-center justify-center text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors rounded-[var(--radius-sm)] hover:bg-[var(--border-subtle)]"
             >
-              ⌕
+              <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round">
+                <circle cx="7" cy="7" r="4.2" />
+                <path d="M10.2 10.2L14 14" />
+              </svg>
             </button>
           )}
           <button
@@ -632,18 +653,22 @@ export function FileTree() {
               loadGitStatus();
             }}
             title={isRemote ? t('fileTree.remote.refreshTitle') : t('fileTree.header.refresh')}
-            className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors text-sm leading-none px-1.5 py-0.5 rounded-[var(--radius-sm)] hover:bg-[var(--border-subtle)]"
+            aria-label={isRemote ? t('fileTree.remote.refreshTitle') : t('fileTree.header.refresh')}
+            className="w-[26px] h-[26px] flex items-center justify-center text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors rounded-[var(--radius-sm)] hover:bg-[var(--border-subtle)]"
           >
-            ↻
+            <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M13.5 8a5.5 5.5 0 1 1-1.7-3.97" />
+              <path d="M13.6 2.6v3.2h-3.2" />
+            </svg>
           </button>
           {/* 外部编辑器打开的是本机路径,远程项目隐藏 */}
           {!isRemote && config.editors.length > 0 && (
-            <div className="flex items-center">
+            <div className="flex items-center ml-0.5 pl-1 border-l border-[var(--border-subtle)]">
               <button
                 type="button"
                 onClick={() => handleOpenInEditor()}
                 title={t('fileTree.header.openWithEditor', { editor: config.editors.find((e) => e.name === config.defaultEditor)?.name ?? config.editors[0]?.name ?? t('fileTree.header.editorFallback') })}
-                className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors text-xs leading-none px-1.5 py-0.5 rounded-l-[var(--radius-sm)] hover:bg-[var(--border-subtle)]"
+                className="h-[26px] flex items-center text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors text-xs px-1.5 rounded-l-[var(--radius-sm)] hover:bg-[var(--border-subtle)]"
               >
                 {config.editors.find((e) => e.name === config.defaultEditor)?.name ?? config.editors[0]?.name}
               </button>
@@ -659,7 +684,7 @@ export function FileTree() {
                     })));
                   }}
                   title={t('fileTree.menu.chooseOtherEditor')}
-                  className="text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors text-xs leading-none pl-0.5 pr-1 py-0.5 rounded-r-[var(--radius-sm)] hover:bg-[var(--border-subtle)] border-l border-[var(--border-subtle)]"
+                  className="h-[26px] flex items-center text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors text-xs pl-1 pr-1.5 rounded-r-[var(--radius-sm)] hover:bg-[var(--border-subtle)] border-l border-[var(--border-subtle)]"
                 >
                   <svg width="8" height="8" viewBox="0 0 8 8" fill="currentColor" aria-hidden="true">
                     <path d="M1.5 3L4 5.5L6.5 3" stroke="currentColor" strokeWidth="1.2" fill="none" strokeLinecap="round" strokeLinejoin="round" />
@@ -670,7 +695,7 @@ export function FileTree() {
           )}
         </div>
       </div>
-      <div className="flex-1 min-h-0 overflow-y-auto px-1" onContextMenu={handleRootContextMenu}>
+      <div className="flex-1 min-h-0 overflow-y-auto px-1" role="tree" aria-label={t('panels.files')} onContextMenu={handleRootContextMenu}>
         {loading && rootEntries.length === 0 ? (
           <div className="flex items-center justify-center py-8 text-[var(--text-muted)] text-sm">
             {t('fileTree.empty.loading')}

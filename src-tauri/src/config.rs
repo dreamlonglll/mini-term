@@ -90,14 +90,15 @@ pub struct AppConfig {
     pub long_paste_line_threshold: u32,
     #[serde(default = "default_long_paste_char_threshold")]
     pub long_paste_char_threshold: u32,
-    #[serde(default = "default_true")]
-    pub projects_visible: bool,
-    #[serde(default = "default_true")]
-    pub sessions_visible: bool,
-    #[serde(default = "default_true")]
-    pub files_visible: bool,
-    #[serde(default = "default_true")]
-    pub git_visible: bool,
+    /// 远程项目粘贴落盘目录:剪贴板图片 / 长文本转存的临时文件经 SFTP 上传到这里，
+    /// 粘进终端的是远端路径（本地路径远端 agent 读不到）。
+    /// 相对路径 = 相对项目根（默认落项目内，agent 无需额外授权即可读）；
+    /// 也可填远端绝对路径（`/tmp/mini-term`）或 `~/xxx`。含 `..` 的写法会被拒绝。
+    #[serde(default = "default_remote_paste_dir")]
+    pub remote_paste_dir: String,
+    // NOTE: 曾有 projects_visible / sessions_visible / files_visible / git_visible
+    // 四个面板显隐开关，界面上没有任何入口消费（已被 middle_column_visible 与右侧
+    // 抽屉取代），随 UI 改版一并删除。旧 config.json 里残留的这些键会被 serde 忽略。
     #[serde(default = "default_true")]
     pub middle_column_visible: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -120,18 +121,74 @@ pub struct AppConfig {
 }
 
 /// 移动端中转体系的持久化配置。
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MobileRelayConfig {
     /// 中转服务器地址(如 wss://relay.example.com);空字符串 = 未配置、不建连。
     #[serde(default)]
     pub relay_url: String,
+    /// 桌面端接入密钥:必须与中转的 `MT_RELAY_DESKTOP_KEY` 一致,握手时携带。
+    /// 空字符串 = 未填,中转一律拒绝(fail-closed,见 ADR 0002)。
+    #[serde(default)]
+    pub desktop_key: String,
+    /// AI 启动器列表:移动端能发起哪些 agent 由此决定。
+    /// 命令与 shell 只存在于桌面端配置里,移动端只见 id 与展示名。
+    /// 旧配置缺该字段时填充预置两条(Claude / Codex),开箱即用。
+    #[serde(default = "default_launchers")]
+    pub launchers: Vec<AiLauncher>,
+}
+
+impl Default for MobileRelayConfig {
+    fn default() -> Self {
+        Self {
+            relay_url: String::new(),
+            desktop_key: String::new(),
+            launchers: default_launchers(),
+        }
+    }
+}
+
+/// 一条具名的"怎么起一个 AI 会话"。
+///
+/// 启动流程是:按 `shell` 建 pane(缺省用 `default_shell`)→ 把 `command` 连同回车
+/// 写入 PTY。AI 会话身份靠输入检测建立,所以命令必须走"敲进 shell"这条路。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AiLauncher {
+    pub id: String,
+    /// 展示名(移动端弹层里看到的就是它)
+    pub name: String,
+    /// 引用 `available_shells` 里的条目名;None / 空 = 用 `default_shell`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell: Option<String>,
+    pub command: String,
+}
+
+/// 预置启动器:零配置直接可用。
+fn default_launchers() -> Vec<AiLauncher> {
+    vec![
+        AiLauncher {
+            id: "claude".into(),
+            name: "Claude".into(),
+            shell: None,
+            command: "claude".into(),
+        },
+        AiLauncher {
+            id: "codex".into(),
+            name: "Codex".into(),
+            shell: None,
+            command: "codex".into(),
+        },
+    ]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SavedPane {
     pub shell_name: String,
+    /// 工作目录覆盖(worktree 终端):有值则替代项目根作为 PTY cwd
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -208,6 +265,9 @@ pub struct ProjectConfig {
     /// 引用为单一来源、不内嵌连接快照——连接被删除时项目进入「断链」错误态。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh_connection_id: Option<String>,
+    /// 子项目(worktree「设为项目」):有值 = 挂在该项目 id 下渲染,不在 projectTree 里
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_project_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -255,6 +315,11 @@ fn default_long_paste_line_threshold() -> u32 {
 fn default_long_paste_char_threshold() -> u32 {
     2000
 }
+/// 默认落项目内的隐藏目录:agent 对项目目录天然有读权限，不像 `/tmp` 那样
+/// 会触发 Claude Code 的项目外路径确认。
+pub fn default_remote_paste_dir() -> String {
+    ".mini-term/pasted".into()
+}
 fn default_true() -> bool {
     true
 }
@@ -289,10 +354,7 @@ impl Default for AppConfig {
             long_paste_to_file: true,
             long_paste_line_threshold: default_long_paste_line_threshold(),
             long_paste_char_threshold: default_long_paste_char_threshold(),
-            projects_visible: true,
-            sessions_visible: true,
-            files_visible: true,
-            git_visible: true,
+            remote_paste_dir: default_remote_paste_dir(),
             middle_column_visible: true,
             right_drawer_width: None,
             last_active_project_id: None,
@@ -479,6 +541,13 @@ fn migrate_config(mut config: AppConfig) -> AppConfig {
         }
     }
     config.vscode_path = None;
+
+    // 移动端配置整块缺失(从未用过移动端)→ 补一份缺省,让「移动端」面板一打开
+    // 就有预置启动器可用。只补整块缺失的情况:`launchers: []` 是用户删光的有意
+    // 结果,不能被"好心"重新填上。
+    if config.mobile_relay.is_none() {
+        config.mobile_relay = Some(MobileRelayConfig::default());
+    }
 
     // 迁移 SavedSplitNode: pane → panes
     for project in config.projects.iter_mut() {
@@ -669,12 +738,14 @@ mod tests {
                             pane: None,
                             panes: vec![SavedPane {
                                 shell_name: "cmd".into(),
+                                cwd: None,
                             }],
                         },
                         SavedSplitNode::Leaf {
                             pane: None,
                             panes: vec![SavedPane {
                                 shell_name: "powershell".into(),
+                                cwd: None,
                             }],
                         },
                     ],
@@ -902,22 +973,24 @@ mod tests {
             "availableShells": [],
             "uiFontSize": 13,
             "terminalFontSize": 14,
-            "mobileRelay": {"relayUrl": "wss://relay.example.com"}
+            "mobileRelay": {"relayUrl": "wss://relay.example.com", "desktopKey": "s3cret"}
         }"#;
         let config: AppConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(
-            config.mobile_relay.as_ref().map(|m| m.relay_url.as_str()),
-            Some("wss://relay.example.com")
-        );
+        let relay = config.mobile_relay.as_ref().unwrap();
+        assert_eq!(relay.relay_url, "wss://relay.example.com");
+        assert_eq!(relay.desktop_key, "s3cret");
         let serialized = serde_json::to_string(&config).unwrap();
-        assert!(serialized.contains(r#""mobileRelay":{"relayUrl":"wss://relay.example.com"}"#));
-        let reparsed: AppConfig = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(
-            reparsed.mobile_relay.map(|m| m.relay_url),
-            Some("wss://relay.example.com".into())
+        assert!(
+            serialized.contains(r#""relayUrl":"wss://relay.example.com""#)
+                && serialized.contains(r#""desktopKey":"s3cret""#),
+            "{serialized}"
         );
+        let reparsed: AppConfig = serde_json::from_str(&serialized).unwrap();
+        let relay = reparsed.mobile_relay.unwrap();
+        assert_eq!(relay.relay_url, "wss://relay.example.com");
+        assert_eq!(relay.desktop_key, "s3cret");
 
-        // 旧配置无该字段 → None,且 None 不序列化(保持老 config.json 干净)
+        // 旧配置无该字段 → serde 层为 None,且 None 不序列化
         let old: AppConfig = serde_json::from_str(
             r#"{"projects":[],"defaultShell":"cmd","availableShells":[],"uiFontSize":13,"terminalFontSize":14}"#,
         )
@@ -926,8 +999,99 @@ mod tests {
         let serialized_old = serde_json::to_string(&old).unwrap();
         assert!(
             !serialized_old.contains("mobileRelay"),
-            "未配置时不应序列化 mobileRelay: {serialized_old}"
+            "serde 层未配置时不应序列化 mobileRelay: {serialized_old}"
         );
+    }
+
+    #[test]
+    fn desktop_key_absent_defaults_to_empty_string() {
+        // v1 时代的 mobileRelay 块没有 desktopKey → 空串(= 未填,中转会拒),
+        // 不能因缺字段导致整个 config 解析失败
+        let json = r#"{
+            "projects": [],
+            "defaultShell": "cmd",
+            "availableShells": [],
+            "uiFontSize": 13,
+            "terminalFontSize": 14,
+            "mobileRelay": {"relayUrl": "wss://relay.example.com"}
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.mobile_relay.unwrap().desktop_key, "");
+    }
+
+    #[test]
+    fn launchers_absent_gets_claude_and_codex_presets() {
+        // 旧 mobileRelay 块无 launchers 字段 → 预置两条
+        let json = r#"{
+            "projects": [],
+            "defaultShell": "cmd",
+            "availableShells": [],
+            "uiFontSize": 13,
+            "terminalFontSize": 14,
+            "mobileRelay": {"relayUrl": "wss://relay.example.com"}
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        let launchers = config.mobile_relay.unwrap().launchers;
+        assert_eq!(launchers.len(), 2);
+        assert_eq!(launchers[0].name, "Claude");
+        assert_eq!(launchers[0].command, "claude");
+        assert!(launchers[0].shell.is_none());
+        assert_eq!(launchers[1].name, "Codex");
+        assert_eq!(launchers[1].command, "codex");
+    }
+
+    #[test]
+    fn migration_fills_missing_mobile_relay_block_with_presets() {
+        // 整块 mobileRelay 缺失(从未用过移动端)→ 迁移补一份缺省,面板一打开就有启动器
+        let config: AppConfig = serde_json::from_str(
+            r#"{"projects":[],"defaultShell":"cmd","availableShells":[],"uiFontSize":13,"terminalFontSize":14}"#,
+        )
+        .unwrap();
+        let migrated = migrate_config(config);
+        let relay = migrated.mobile_relay.expect("迁移后应补上 mobileRelay");
+        assert_eq!(relay.launchers.len(), 2);
+        assert_eq!(relay.relay_url, "");
+        assert_eq!(relay.desktop_key, "");
+    }
+
+    #[test]
+    fn migration_keeps_deliberately_emptied_launcher_list() {
+        // 用户把启动器删光是有意结果,迁移不能"好心"把预置塞回去
+        let config: AppConfig = serde_json::from_str(
+            r#"{"projects":[],"defaultShell":"cmd","availableShells":[],"uiFontSize":13,
+                "terminalFontSize":14,"mobileRelay":{"relayUrl":"","desktopKey":"","launchers":[]}}"#,
+        )
+        .unwrap();
+        let migrated = migrate_config(config);
+        assert!(migrated.mobile_relay.unwrap().launchers.is_empty());
+    }
+
+    #[test]
+    fn launcher_round_trip_keeps_optional_shell() {
+        // shell 绑定("在 WSL bash 里跑 claude")与留空两种形态都要往返保真
+        let launchers = vec![
+            AiLauncher {
+                id: "l1".into(),
+                name: "Claude (WSL)".into(),
+                shell: Some("wsl-bash".into()),
+                command: "claude".into(),
+            },
+            AiLauncher {
+                id: "l2".into(),
+                name: "Codex".into(),
+                shell: None,
+                command: "codex --model gpt-5".into(),
+            },
+        ];
+        let json = serde_json::to_string(&launchers).unwrap();
+        assert!(json.contains(r#""shell":"wsl-bash""#), "{json}");
+        assert_eq!(
+            json.matches("shell").count(),
+            1,
+            "未绑定 shell 的启动器不应序列化该字段: {json}"
+        );
+        let parsed: Vec<AiLauncher> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, launchers);
     }
 
     #[test]

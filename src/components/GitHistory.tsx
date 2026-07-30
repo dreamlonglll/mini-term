@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '../store';
 import { GitHistoryContent } from './GitHistoryContent';
 import { GitChanges } from './GitChanges';
+import { GitWorktreeModal } from './GitWorktreeModal';
 import { getGitHistoryCache, setGitHistoryCache } from '../utils/projectDataCache';
 import { useT } from '../i18n';
 import type { GitRepoInfo } from '../types';
@@ -80,6 +81,9 @@ export function GitHistory() {
     setHistoryRefreshKey((k) => k + 1);
   }, []);
 
+  // Worktree 管理弹窗(仓库行右键菜单进入);增删后刷新仓库列表
+  const [worktreeRepo, setWorktreeRepo] = useState<string | null>(null);
+
   const selectedRepoInfo = repos.find((r) => r.path === selectedRepo);
 
   if (!project) {
@@ -112,7 +116,7 @@ export function GitHistory() {
             }`}
             onClick={() => setActiveTab(tab)}
           >
-            {tab === 'history' ? 'History' : 'Changes'}
+            {tab === 'history' ? t('panels.history') : t('panels.changes')}
           </button>
         ))}
       </div>
@@ -126,7 +130,7 @@ export function GitHistory() {
           >
             <div className="flex items-center gap-1.5 min-w-0">
               <span
-                className="text-[13px] w-3 text-center text-[var(--text-muted)] transition-transform duration-150"
+                className="text-base w-3 text-center text-[var(--text-muted)] transition-transform duration-150"
                 style={{
                   transform: repoDropdownOpen ? 'rotate(0deg)' : 'rotate(-90deg)',
                   display: 'inline-block',
@@ -136,8 +140,8 @@ export function GitHistory() {
               </span>
               <span className="truncate font-medium">{selectedRepoInfo?.name ?? t("gitHistory.selectRepo")}</span>
               {selectedRepoInfo?.currentBranch && (
-                <span className="shrink-0 text-[11px] leading-[18px] px-1.5 rounded font-mono text-[var(--text-muted)] bg-[var(--border-subtle)]">
-                  {selectedRepoInfo.currentBranch}
+                <span className="shrink-0 text-sm leading-[18px] px-1.5 rounded font-mono text-[var(--text-muted)] bg-[var(--border-subtle)]">
+                  {selectedRepoInfo.isWorktree ? '⎇ ' : ''}{selectedRepoInfo.currentBranch}
                 </span>
               )}
             </div>
@@ -159,8 +163,8 @@ export function GitHistory() {
                 >
                   <span className="truncate">{r.name}</span>
                   {r.currentBranch && (
-                    <span className="shrink-0 text-[11px] leading-[18px] px-1.5 rounded font-mono text-[var(--text-muted)] bg-[var(--border-subtle)]">
-                      {r.currentBranch}
+                    <span className="shrink-0 text-sm leading-[18px] px-1.5 rounded font-mono text-[var(--text-muted)] bg-[var(--border-subtle)]">
+                      {r.isWorktree ? '⎇ ' : ''}{r.currentBranch}
                     </span>
                   )}
                 </div>
@@ -178,6 +182,7 @@ export function GitHistory() {
             projectPath={project.path}
             repos={repos}
             refreshRepos={loadRepos}
+            onOpenWorktrees={setWorktreeRepo}
           />
         ) : (
           <GitChanges
@@ -187,6 +192,12 @@ export function GitHistory() {
           />
         )}
       </div>
+
+      <GitWorktreeModal
+        repoPath={worktreeRepo}
+        onClose={() => setWorktreeRepo(null)}
+        onChanged={loadRepos}
+      />
     </div>
   );
 }

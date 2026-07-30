@@ -17,6 +17,7 @@ import { terminalArea } from './terminalArea';
 import { gitHistory } from './gitHistory';
 import { gitHistoryContent } from './gitHistoryContent';
 import { gitChanges } from './gitChanges';
+import { worktree } from './worktree';
 import { search } from './search';
 import { sessionList } from './sessionList';
 import { sessionViewer } from './sessionViewer';
@@ -32,6 +33,9 @@ import { externalLink } from './externalLink';
 import { updateChecker } from './updateChecker';
 import { remoteProject } from './remoteProject';
 import { mobileRelay } from './mobileRelay';
+import { panels } from './panels';
+import { terminalSearch } from './terminalSearch';
+import { projectSwitcher } from './projectSwitcher';
 
 type Dict = Record<string, unknown>;
 
@@ -49,6 +53,7 @@ export const dicts: { zh: Dict; en: Dict } = {
     gitHistory: gitHistory.zh,
     gitHistoryContent: gitHistoryContent.zh,
     gitChanges: gitChanges.zh,
+    worktree: worktree.zh,
     search: search.zh,
     sessionList: sessionList.zh,
     sessionViewer: sessionViewer.zh,
@@ -64,6 +69,9 @@ export const dicts: { zh: Dict; en: Dict } = {
     updateChecker: updateChecker.zh,
     remoteProject: remoteProject.zh,
     mobileRelay: mobileRelay.zh,
+    panels: panels.zh,
+    terminalSearch: terminalSearch.zh,
+    projectSwitcher: projectSwitcher.zh,
   },
   en: {
     app: app.en,
@@ -78,6 +86,7 @@ export const dicts: { zh: Dict; en: Dict } = {
     gitHistory: gitHistory.en,
     gitHistoryContent: gitHistoryContent.en,
     gitChanges: gitChanges.en,
+    worktree: worktree.en,
     search: search.en,
     sessionList: sessionList.en,
     sessionViewer: sessionViewer.en,
@@ -93,5 +102,8 @@ export const dicts: { zh: Dict; en: Dict } = {
     updateChecker: updateChecker.en,
     remoteProject: remoteProject.en,
     mobileRelay: mobileRelay.en,
+    panels: panels.en,
+    terminalSearch: terminalSearch.en,
+    projectSwitcher: projectSwitcher.en,
   },
 };

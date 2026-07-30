@@ -18,6 +18,9 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 type WsClient = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+/// 中转与桌面端约定的共享密钥(v2 起桌面端握手必须携带)。
+const DESKTOP_KEY: &str = "test-desktop-key";
+
 async fn spawn_relay() -> SocketAddr {
     spawn_relay_with_state(RelayState::new()).await
 }
@@ -25,6 +28,7 @@ async fn spawn_relay() -> SocketAddr {
 async fn spawn_relay_with_state(state: RelayState) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let state = state.with_desktop_key(Some(DESKTOP_KEY.into()));
     tokio::spawn(axum::serve(listener, app(state)).into_future());
     addr
 }
@@ -65,6 +69,7 @@ async fn paired_desktop(addr: SocketAddr) -> WsClient {
         &mut ws,
         &DesktopToRelay::Hello {
             protocol_version: PROTOCOL_VERSION,
+            desktop_key: DESKTOP_KEY.into(),
         },
     )
     .await;

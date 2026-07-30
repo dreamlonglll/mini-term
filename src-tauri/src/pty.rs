@@ -429,7 +429,9 @@ fn command_word_matches_ai(word: &str) -> bool {
     AI_COMMANDS.iter().any(|&ai| basename == ai)
 }
 
-fn is_interactive_ai_command(command: &str) -> bool {
+/// 该命令行是否会被识别为"进入交互式 AI 会话"。
+/// AI 启动器配置校验(mobile_relay)复用同一判定,避免两处口径漂移。
+pub fn is_interactive_ai_command(command: &str) -> bool {
     let mut words = command.split_whitespace();
     let mut first_word = words.next().unwrap_or("");
     if first_word == "&" {
@@ -544,6 +546,19 @@ impl PtyManager {
     /// 本轮 AI 会话的启动时刻;不在 AI 会话中返回 None。
     pub fn ai_session_started_at(&self, pty_id: u32) -> Option<SystemTime> {
         self.ai_started.lock().unwrap().get(&pty_id).copied()
+    }
+
+    /// 清除 pane 的 AI 会话标记及相关输入痕迹。
+    ///
+    /// 输入检测到退出(双击 Ctrl+C / Ctrl+D / 显式退出命令)与 SessionEnd hook
+    /// 的权威退出信号都走这里。顺带清 last_enter 关掉 Enter 后的输出扫描窗口:
+    /// 否则退出瞬间 ConPTY 重绘把 scrollback 里的 "PS ..> claude" 再吐出来,
+    /// 会被扫描误判成命令 echo 又把会话标回去。
+    pub fn clear_ai_session(&self, pty_id: u32) {
+        self.ai_sessions.lock().unwrap().remove(&pty_id);
+        self.ai_started.lock().unwrap().remove(&pty_id);
+        self.last_ctrlc.lock().unwrap().remove(&pty_id);
+        self.last_enter.lock().unwrap().remove(&pty_id);
     }
 
     pub fn drain_submits(&self, pty_id: u32) -> Vec<UserSubmit> {
@@ -777,16 +792,14 @@ impl PtyManager {
                 }
             }
         }
-        if enter_ai || exit_ai {
-            let mut sessions = self.ai_sessions.lock().unwrap();
-            let mut started = self.ai_started.lock().unwrap();
-            if enter_ai {
-                sessions.insert(pty_id);
-                started.insert(pty_id, SystemTime::now());
-            } else {
-                sessions.remove(&pty_id);
-                started.remove(&pty_id);
-            }
+        if enter_ai {
+            self.ai_sessions.lock().unwrap().insert(pty_id);
+            self.ai_started
+                .lock()
+                .unwrap()
+                .insert(pty_id, SystemTime::now());
+        } else if exit_ai {
+            self.clear_ai_session(pty_id);
         }
     }
 }
@@ -1271,8 +1284,8 @@ pub fn kill_pty(
         .lock()
         .unwrap()
         .remove(&pty_id);
-    // 清理 hook 状态
-    hook_state.remove(pty_id);
+    // 清理 hook 状态(含已结束会话墓碑)
+    hook_state.purge(pty_id);
 
     // Drop the PTY instance on a background thread.
     //
@@ -1376,6 +1389,32 @@ mod tests {
         assert!(mgr.is_ai_session(1));
         mgr.track_input(1, "\x04");
         assert!(!mgr.is_ai_session(1));
+    }
+
+    #[test]
+    fn clear_ai_session_resets_state() {
+        let mgr = PtyManager::new();
+        mgr.track_input(1, "claude\r");
+        assert!(mgr.is_ai_session(1));
+        assert!(mgr.ai_session_started_at(1).is_some());
+        // SessionEnd 权威退出信号走这里:双击 Ctrl+C 漏检时自愈
+        mgr.clear_ai_session(1);
+        assert!(!mgr.is_ai_session(1));
+        assert!(mgr.ai_session_started_at(1).is_none());
+    }
+
+    #[test]
+    fn exit_clears_enter_scan_window() {
+        let mgr = PtyManager::new();
+        mgr.track_input(1, "claude\r");
+        // 会话内提交 prompt 会记录 last_enter(打开输出扫描窗口)
+        mgr.track_input(1, "fix the bug\r");
+        assert!(mgr.last_enter.lock().unwrap().contains_key(&1));
+        // 双击 Ctrl+C 退出后窗口必须关闭,防止退出重绘把会话标回去
+        mgr.track_input(1, "\x03");
+        mgr.track_input(1, "\x03");
+        assert!(!mgr.is_ai_session(1));
+        assert!(!mgr.last_enter.lock().unwrap().contains_key(&1));
     }
 
     #[test]
