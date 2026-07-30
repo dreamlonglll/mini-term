@@ -44,6 +44,20 @@
   --color-error-muted: rgba(212, 96, 90, 0.15);
   --shadow-overlay: 0 8px 32px rgba(0,0,0,0.5), 0 0 1px rgba(255,255,255,0.05);
 
+  /* 代码编辑器语法色板（CodeEditor.tsx 的 HighlightStyle 引用）。
+     全部转引应用现有色板：换皮肤（light/blueprint/fluent2）时这些引用
+     自动跟着目标皮肤的取值走，无需每套皮肤重定义；需要单独调某套皮肤的
+     语法色时,在对应皮肤选择器里覆盖 --syn-* 即可 */
+  --syn-keyword: var(--color-ai);
+  --syn-string: var(--color-success);
+  --syn-number: var(--color-warning);
+  --syn-function: var(--color-file);
+  --syn-type: var(--color-folder);
+  --syn-property: var(--color-info);
+  --syn-tag: var(--color-error);
+  --syn-comment: var(--text-muted);
+  --syn-operator: var(--text-secondary);
+
   /* Sizing */
   --radius-sm: 4px;
   --radius-md: 6px;
