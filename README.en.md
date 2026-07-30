@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.8.4-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.8.5-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -114,6 +114,7 @@ A VS Code-style **Changes panel** (Staged / Changes / Untracked groups, per-file
 | **Image paste** | Screenshots in the clipboard are detected, saved as a temp PNG, and pasted as a path; handles non-standard formats like PinPix |
 | **Remote-aware landing** | Both of the above remap in remote terminals: SSH projects upload over SFTP and paste the **remote** path; WSL projects rewrite `C:\...` into `/mnt/c/...` |
 | **File drag & drop** | Drag from the file tree or Explorer onto the terminal to insert a quoted absolute path, landing in the exact split pane |
+| **Built-in file editor** | Click any file in the tree to edit in place: CodeMirror 6 core with lazy-loaded syntax highlighting for 140+ languages, find & replace, code folding, multi-cursor, atomic `Ctrl+S` saves, external-change detection, and live Markdown preview of unsaved drafts |
 | **Global search** | `Ctrl+Shift+F` for filename or content search, substring or regex, streamed from the backend and cancellable anytime |
 | **Per-project env vars** | Injected into the PTY child process per project, with strict POSIX validation and a second defensive filter on the Rust side; passes through to WSL via WSLENV |
 | **Smart Ctrl+C/V** | Optional: copy when there's a selection, interrupt the program when there isn't; large Windows pastes are chunked so ConPTY doesn't drop lines |
