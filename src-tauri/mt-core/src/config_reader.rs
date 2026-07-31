@@ -75,6 +75,12 @@ struct ConfigSshView {
 struct ProjectScopeView {
     #[serde(default)]
     id: String,
+    /// 只有项目启用 SSH MCP/CLI 能力时，其能力令牌才有效。
+    #[serde(default)]
+    ssh_mcp_enabled: bool,
+    /// CLI/daemon 用的项目能力令牌。令牌命中后才能解析该项目的连接范围。
+    #[serde(default)]
+    ssh_cli_token: Option<String>,
     /// 该项目关联的 SSH 连接 id 列表。
     /// `None`(字段缺失)= 未设置关联 → 默认全部连接可见。
     #[serde(default)]
@@ -93,6 +99,15 @@ struct ProjectScopeView {
 pub fn read_ssh_connections_for_project(project_id: Option<&str>) -> Vec<SshConnection> {
     let view = parse_config_from(config_json_path());
     scope_connections(view.ssh_connections, &view.projects, project_id)
+}
+
+/// 读取能力令牌所属项目可见的 SSH 连接。
+///
+/// CLI/daemon 只能走此入口。令牌为空、未知或配置不可读时返回错误，绝不回退到
+/// 全部连接；命中后沿用项目 `sshConnectionIds` 的现有范围语义。
+pub fn read_ssh_connections_for_token(project_token: &str) -> Result<Vec<SshConnection>, String> {
+    let view = parse_config_from(config_json_path());
+    scope_connections_for_token(view.ssh_connections, &view.projects, project_token)
 }
 
 /// 从给定路径读取并解析 `config.json` 的最小投影。抽出便于单元测试注入临时文件。
@@ -132,6 +147,34 @@ fn scope_connections(
             .filter(|c| ids.iter().any(|id| id == &c.id))
             .collect(),
     }
+}
+
+/// 按项目能力令牌过滤连接。未知令牌必须 fail closed，绝不回退到全部连接。
+fn scope_connections_for_token(
+    connections: Vec<SshConnection>,
+    projects: &[ProjectScopeView],
+    project_token: &str,
+) -> Result<Vec<SshConnection>, String> {
+    if project_token.trim().is_empty() {
+        return Err("invalid project token".to_string());
+    }
+    let mut matches = projects
+        .iter()
+        .filter(|project| project.ssh_cli_token.as_deref() == Some(project_token));
+    let project = matches
+        .next()
+        .ok_or_else(|| "invalid project token".to_string())?;
+    if matches.next().is_some() || !project.ssh_mcp_enabled {
+        return Err("invalid project token".to_string());
+    }
+
+    Ok(match project.ssh_connection_ids.as_ref() {
+        None => connections,
+        Some(ids) => connections
+            .into_iter()
+            .filter(|connection| ids.iter().any(|id| id == &connection.id))
+            .collect(),
+    })
 }
 
 #[cfg(test)]
@@ -227,7 +270,10 @@ mod tests {
         let view = parse_config_from(Some(path.clone()));
         assert_eq!(view.projects.len(), 2);
         assert_eq!(view.projects[0].id, "p1");
-        assert_eq!(view.projects[0].ssh_connection_ids.as_deref(), Some(&["1".to_string()][..]));
+        assert_eq!(
+            view.projects[0].ssh_connection_ids.as_deref(),
+            Some(&["1".to_string()][..])
+        );
         // 未设置 sshConnectionIds 的项目为 None
         assert!(view.projects[1].ssh_connection_ids.is_none());
         let _ = std::fs::remove_file(&path);
@@ -248,6 +294,8 @@ mod tests {
         let conns = vec![conn("1"), conn("2")];
         let projects = vec![ProjectScopeView {
             id: "other".into(),
+            ssh_mcp_enabled: false,
+            ssh_cli_token: None,
             ssh_connection_ids: Some(vec!["1".into()]),
         }];
         // 给定的 project_id 在 projects 里找不到 → 默认全部可见
@@ -260,6 +308,8 @@ mod tests {
         let conns = vec![conn("1"), conn("2")];
         let projects = vec![ProjectScopeView {
             id: "p1".into(),
+            ssh_mcp_enabled: false,
+            ssh_cli_token: None,
             ssh_connection_ids: None,
         }];
         // 项目存在但未设置 sshConnectionIds → 默认全部可见
@@ -272,6 +322,8 @@ mod tests {
         let conns = vec![conn("1"), conn("2"), conn("3")];
         let projects = vec![ProjectScopeView {
             id: "p1".into(),
+            ssh_mcp_enabled: false,
+            ssh_cli_token: None,
             ssh_connection_ids: Some(vec!["1".into(), "3".into()]),
         }];
         let scoped = scope_connections(conns, &projects, Some("p1"));
@@ -285,6 +337,8 @@ mod tests {
         let conns = vec![conn("1"), conn("2")];
         let projects = vec![ProjectScopeView {
             id: "p1".into(),
+            ssh_mcp_enabled: false,
+            ssh_cli_token: None,
             ssh_connection_ids: Some(vec![]),
         }];
         let scoped = scope_connections(conns, &projects, Some("p1"));
@@ -297,10 +351,145 @@ mod tests {
         let conns = vec![conn("1")];
         let projects = vec![ProjectScopeView {
             id: "p1".into(),
+            ssh_mcp_enabled: false,
+            ssh_cli_token: None,
             ssh_connection_ids: Some(vec!["1".into(), "stale".into()]),
         }];
         let scoped = scope_connections(conns, &projects, Some("p1"));
         assert_eq!(scoped.len(), 1);
         assert_eq!(scoped[0].id, "1");
+    }
+
+    #[test]
+    fn capability_scope_rejects_unknown_token() {
+        let json = r#"{
+            "sshConnections": [
+                {"id":"1","name":"prod","host":"h","port":22,"user":"u"}
+            ],
+            "projects": [
+                {"id":"p1","sshMcpEnabled":true,"sshCliToken":"known-token","sshConnectionIds":["1"]}
+            ]
+        }"#;
+        let path = temp_file("unknown-token", json);
+        let view = parse_config_from(Some(path.clone()));
+
+        let scoped =
+            scope_connections_for_token(view.ssh_connections, &view.projects, "unknown-token");
+
+        assert!(scoped.is_err(), "未知能力令牌必须 fail closed");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn capability_scope_rejects_blank_token() {
+        let json = r#"{
+            "sshConnections": [
+                {"id":"1","name":"prod","host":"h","port":22,"user":"u"}
+            ],
+            "projects": [
+                {"id":"p1","sshMcpEnabled":true,"sshCliToken":"   ","sshConnectionIds":["1"]}
+            ]
+        }"#;
+        let path = temp_file("blank-token", json);
+        let view = parse_config_from(Some(path.clone()));
+
+        let scoped = scope_connections_for_token(view.ssh_connections, &view.projects, "   ");
+
+        assert!(scoped.is_err(), "空白能力令牌必须 fail closed");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn capability_scope_maps_token_to_exact_project_scope() {
+        let json = r#"{
+            "sshConnections": [
+                {"id":"1","name":"prod","host":"prod","port":22,"user":"u"},
+                {"id":"2","name":"dev","host":"dev","port":22,"user":"u"},
+                {"id":"3","name":"ops","host":"ops","port":22,"user":"u"}
+            ],
+            "projects": [
+                {"id":"p1","sshMcpEnabled":true,"sshCliToken":"token-a","sshConnectionIds":["1","3"]},
+                {"id":"p2","sshMcpEnabled":true,"sshCliToken":"token-b","sshConnectionIds":["2"]}
+            ]
+        }"#;
+        let path = temp_file("valid-token", json);
+        let view = parse_config_from(Some(path.clone()));
+
+        let scoped =
+            scope_connections_for_token(view.ssh_connections, &view.projects, "token-a").unwrap();
+        let ids: Vec<&str> = scoped.iter().map(|c| c.id.as_str()).collect();
+
+        assert_eq!(ids, ["1", "3"]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn capability_scope_rejects_duplicate_token_mapping() {
+        let json = r#"{
+            "sshConnections": [
+                {"id":"1","name":"prod","host":"prod","port":22,"user":"u"},
+                {"id":"2","name":"dev","host":"dev","port":22,"user":"u"}
+            ],
+            "projects": [
+                {"id":"p1","sshMcpEnabled":true,"sshCliToken":"duplicate","sshConnectionIds":["1"]},
+                {"id":"p2","sshMcpEnabled":true,"sshCliToken":"duplicate","sshConnectionIds":["2"]}
+            ]
+        }"#;
+        let path = temp_file("duplicate-token", json);
+        let view = parse_config_from(Some(path.clone()));
+
+        let scoped = scope_connections_for_token(view.ssh_connections, &view.projects, "duplicate");
+
+        assert!(scoped.is_err(), "重复能力令牌映射必须 fail closed");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn capability_scope_rejects_token_for_disabled_project() {
+        let json = r#"{
+            "sshConnections": [
+                {"id":"1","name":"prod","host":"prod","port":22,"user":"u"}
+            ],
+            "projects": [
+                {
+                    "id":"p1",
+                    "sshMcpEnabled":false,
+                    "sshCliToken":"disabled-token",
+                    "sshConnectionIds":["1"]
+                }
+            ]
+        }"#;
+        let path = temp_file("disabled-token", json);
+        let view = parse_config_from(Some(path.clone()));
+
+        let scoped =
+            scope_connections_for_token(view.ssh_connections, &view.projects, "disabled-token");
+
+        assert!(scoped.is_err(), "已停用项目的残留令牌必须失效");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn capability_scope_rejects_duplicate_token_when_one_project_is_disabled() {
+        let json = r#"{
+            "sshConnections": [
+                {"id":"1","name":"prod","host":"prod","port":22,"user":"u"},
+                {"id":"2","name":"dev","host":"dev","port":22,"user":"u"}
+            ],
+            "projects": [
+                {"id":"p1","sshMcpEnabled":true,"sshCliToken":"duplicate","sshConnectionIds":["1"]},
+                {"id":"p2","sshMcpEnabled":false,"sshCliToken":"duplicate","sshConnectionIds":["2"]}
+            ]
+        }"#;
+        let path = temp_file("duplicate-disabled-token", json);
+        let view = parse_config_from(Some(path.clone()));
+
+        let scoped = scope_connections_for_token(view.ssh_connections, &view.projects, "duplicate");
+
+        assert!(
+            scoped.is_err(),
+            "禁用项目里的残留映射也必须让重复令牌 fail closed"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

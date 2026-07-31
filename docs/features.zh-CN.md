@@ -61,7 +61,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 - **密码自动填充** — 配了密码的连接，后端扫描 PTY 输出命中密码提示自动回写密码，每会话只填一次，密码错误时停止以防连灌错误密码
 - **私钥权限自动处理** — 使用私钥连接时自动把密钥复制到权限收紧的临时副本（Windows `icacls` / Unix `0600`），绕过 OpenSSH「UNPROTECTED PRIVATE KEY FILE」拒绝，不修改用户原始密钥文件
 - **进阶能力** — 密钥文件登录（`ssh -i`）、连接分组管理：右键新增 / 重命名 / 解散分组（空分组可持久保存），拖拽连接到分组调整归属，编辑表单分组字段可下拉选择已有分组
-- **SSH 工具（CLI + Skill，供 AI agent）** — 让终端里运行的 AI agent（Claude Code / Codex）能操作已保存的 SSH 连接。项目右键菜单「关联 SSH」勾选连接即按项目启用，并把可见范围限定在所选连接；启用时生成 Claude / Codex 两份 SKILL.md（内嵌 CLI 绝对路径与 project-id，`.gitignore` 自动追加，存量项目的旧 MCP 注册自动摘除迁移），agent 经 Bash 直接调用内置 `mt-ssh-cli` sidecar：`list` / `exec` / `upload` / `download` 四个子命令，远程 stdout/stderr 原样流式透传、退出码透传（124 = 超时、2 = CLI 错误），SFTP 分块流式传输，密码 / 私钥认证全程在本机完成，每次调用落一行审计日志，并有一条硬护栏拒绝传输 mini-term 自身的 `config.json`（内含全部 SSH 明文凭据）。CLI 背后是全机单例 daemon 持久连接池（首调自动拉起、空闲 10 分钟 drain 自退、版本升级自动换代），同一连接的后续命令仅消耗一个 RTT；daemon 不可用时自动降级为进程内直连，WSL 里经 Windows interop 调用同样可用。过渡期 `mt-ssh-mcp` MCP sidecar 继续随包发布，服务尚未迁移的存量项目
+- **SSH 工具（CLI + Skill，供 AI agent）** — 让终端里运行的 AI agent（Claude Code / Codex）能操作已保存的 SSH 连接。项目右键菜单「关联 SSH」按项目启用并限定所选连接；启用时生成 Claude / Codex 两份 SKILL.md，内嵌 CLI 绝对路径与随机项目能力令牌，自动追加 `.gitignore` 并迁移清理存量 MCP。`list` / `exec` / `upload` / `download` 每次都必须携带令牌，缺失、纯空白、未知、重复或属于已停用项目的映射一律 fail closed，绝不回退到全部连接；生成示例分别覆盖 Bash、正确转义的 WSL interop 与必须使用 `&` 调用运算符的 PowerShell。远程 stdout/stderr 与退出码原样流式透传（124 = 超时、2 = CLI 错误），SFTP 分块传输，认证凭据始终留在本机，每次调用写审计日志，并硬拒绝传输内含全部 SSH 明文凭据的 mini-term `config.json`。CLI 背后是全机单例 daemon 持久连接池（首调自动拉起、空闲 10 分钟 drain 自退、版本升级自动换代）；Ctrl+C / 客户端断开或请求超时时显式关闭对应 SSH channel，健康 session 继续留池。IPC 仅当前用户可连，安全端点无法建立时 fail closed；daemon 不可用则自动降级为进程内直连。过渡期 `mt-ssh-mcp` MCP sidecar 继续随包发布
 - **SSH 远程项目** — 把远程服务器上的目录直接添加为项目管理：「添加远程项目」弹窗选择已保存的 SSH 连接并填写远程 POSIX 路径，保存前先远程验证目录存在；文件树经 SFTP 懒加载展开（展开行内 loading 反馈，支持手动刷新，根 `.gitignore` 过滤），终端 `ssh -t` 直连并自动落到项目目录，断线后覆盖层一键重连；Session 块按时间混排远程机器上的 Claude / Codex 会话并支持正文查看；引用的连接被删除时项目显示「断链」态而非静默失效；底层与 SSH 工具 sidecar 共用抽出的 `mt-ssh` crate（russh 持久会话池 + SFTP 原语），远程缓存键掺入连接 id，防止两台服务器的同名路径互相串数据
 
 ### WSL 支持（Windows）
@@ -164,7 +164,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 | 文件监听 | notify 7 + ignore 0.4（.gitignore 过滤） |
 | Tauri 插件 | `window-state` · `clipboard-manager` · `dialog` · `opener` |
 | 移动端中转 | axum + tokio WebSocket 中转服务（`relay-server/`）· React + TS + Vite PWA（`mobile/`） |
-| 测试覆盖 | 468 个 Rust 测试 = 桌面端 430（tauri-app 281 + mt-core 38 + mt-ssh 26 + mt-sidecars 85）+ 中转服务端 38（协议与路由）；另有 19 个 Node 测试 |
+| 测试覆盖 | 491 个 Rust 测试 = 桌面端 438（tauri-app 284 + mt-core 44 + mt-ssh 26 + mt-sidecars 84）+ 中转服务端 53（协议与路由）；另有 19 个 Node 测试 |
 
 ## 快速开始
 
@@ -378,17 +378,17 @@ npm run build
 # Node 侧测试（19 个）
 node --test "tests/*.test.cjs"
 
-# 桌面端 Rust 测试（381 个）
+# 桌面端 Rust 测试（438 个）
 # 注意：mt-core / mt-ssh / mt-sidecars 是独立 crate 而非 workspace member，
-# 单跑 `cd src-tauri && cargo test` 只覆盖 tauri-app 的 277 个，其余三个要分别指定 manifest。
+# 单跑 `cd src-tauri && cargo test` 只覆盖 tauri-app 的 284 个，其余三个要分别指定 manifest。
 cd src-tauri
-cargo test                                        # tauri-app     277
-cargo test --manifest-path mt-core/Cargo.toml     # mt-core        38
+cargo test                                        # tauri-app     284
+cargo test --manifest-path mt-core/Cargo.toml     # mt-core        44
 cargo test --manifest-path mt-ssh/Cargo.toml      # mt-ssh         26
-cargo test --manifest-path mt-sidecars/Cargo.toml # mt-sidecars    40
+cargo test --manifest-path mt-sidecars/Cargo.toml # mt-sidecars    84
 cargo build
 
-# 中转服务测试（38 个，独立 workspace）
+# 中转服务测试（53 个，独立 workspace）
 cd ../relay-server && cargo test
 ```
 

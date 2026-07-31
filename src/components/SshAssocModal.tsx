@@ -6,7 +6,7 @@ import { buildGroupBuckets, connectionSummary, GroupSidebarRow } from './SshModa
 import type { SshGroupBucket } from './SshModal';
 import { Modal, ModalCloseButton } from './Modal';
 import { useT, t as tStatic } from '../i18n';
-import type { ProjectConfig } from '../types';
+import type { EnableSshToolsResult, ProjectConfig } from '../types';
 
 interface Props {
   /** 目标项目；null 表示弹窗关闭 */
@@ -83,25 +83,28 @@ export function SshAssocModal({ project, onClose }: Props) {
     // 纳入该项目的可见范围（违背 v0.6.3「新增连接不自动纳入已有项目」的承诺）。
     // 故启用状态下 undefined 必须迁移；仅当迁移前后「当前有效范围」不变时静默落盘、
     // 不打扰用户（沿用 c25d99d 无改动不弹提示的意图）。
-    const needsScopeMigration = nowEnabled && project.sshConnectionIds === undefined;
     const effectiveUnchanged =
       wasEnabled === nowEnabled &&
       (!nowEnabled || sameScope(project.sshConnectionIds, scope, allIds));
 
-    // 完全无变化且已是显式列表 → 直接关闭，不写盘、不弹提示
-    if (effectiveUnchanged && !needsScopeMigration) {
+    // 未启用且仍未启用 → 没有生成物需要 reconcile，直接关闭。
+    if (effectiveUnchanged && !nowEnabled) {
       onClose();
       return;
     }
-    // 有效范围不变、仅把旧 undefined 迁移成等价显式列表 → 静默落盘，不弹提示
-    const silentMigration = effectiveUnchanged && needsScopeMigration;
+    // 已启用项目每次保存都幂等 reconcile SKILL.md / 旧 MCP；有效配置没变时静默。
+    // 这同时覆盖旧项目的 scope/token 迁移。
+    const silentReconcile = effectiveUnchanged;
 
     setBusy(true);
     try {
-      // 仅启用/停用的切换需要改写 SKILL.md 注册；纯范围变更靠持久化 config 即可，
-      // CLI/daemon 每次调用都重新读 config.json，范围变更即时生效。
-      if (nowEnabled && !wasEnabled) {
-        await invoke('enable_ssh_tools', { projectDir: project.path, projectId: project.id });
+      let projectToken = project.sshCliToken;
+      if (nowEnabled) {
+        const result = await invoke<EnableSshToolsResult>('enable_ssh_tools', {
+          projectDir: project.path,
+          projectToken,
+        });
+        projectToken = result.projectToken;
       } else if (!nowEnabled && wasEnabled) {
         await invoke('disable_ssh_tools', { projectDir: project.path });
       }
@@ -111,7 +114,12 @@ export function SshAssocModal({ project, onClose }: Props) {
         ...cfg,
         projects: cfg.projects.map((p) =>
           p.id === project.id
-            ? { ...p, sshMcpEnabled: nowEnabled, sshConnectionIds: nowEnabled ? scope : undefined }
+            ? {
+                ...p,
+                sshMcpEnabled: nowEnabled,
+                sshCliToken: nowEnabled ? projectToken : undefined,
+                sshConnectionIds: nowEnabled ? scope : undefined,
+              }
             : p,
         ),
       };
@@ -119,8 +127,8 @@ export function SshAssocModal({ project, onClose }: Props) {
       await invoke('save_config', { config: newConfig });
       onClose();
 
-      // 静默迁移(旧 undefined → 等价显式列表,有效范围未变)：落盘即可，不弹提示
-      if (silentMigration) return;
+      // 幂等 reconcile / 存量迁移：落盘即可，不弹提示。
+      if (silentReconcile) return;
 
       const scopeDesc =
         scope.length === allIds.length

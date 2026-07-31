@@ -83,18 +83,43 @@ pub fn connection_views(conns: Vec<mt_core::SshConnection>) -> Vec<SshConnection
         .collect()
 }
 
-/// 列出对指定项目可见的 SSH 连接(不含敏感字段)。
+/// 调用方的连接范围来源。MCP 保留存量 project-id 语义；CLI/daemon 必须使用
+/// 随机能力令牌，未知令牌 fail closed。
+#[derive(Debug, Clone, Copy)]
+pub enum ConnectionScope<'a> {
+    LegacyProject(Option<&'a str>),
+    Capability(&'a str),
+}
+
+/// 按调用来源读取连接，并把能力令牌错误归一为可读的参数错误。
+fn read_scoped_connections(
+    scope: ConnectionScope<'_>,
+) -> Result<Vec<mt_core::SshConnection>, ServiceError> {
+    match scope {
+        ConnectionScope::LegacyProject(project_id) => {
+            Ok(mt_core::read_ssh_connections_for_project(project_id))
+        }
+        ConnectionScope::Capability(project_token) => {
+            mt_core::read_ssh_connections_for_token(project_token)
+                .map_err(ServiceError::InvalidParams)
+        }
+    }
+}
+
+/// 列出对指定调用范围可见的 SSH 连接(不含敏感字段)。
 ///
 /// 每次调用重读 config.json —— 保证主程序里改「关联 SSH」范围即时生效。
-pub fn list_connections(project_id: Option<&str>) -> Vec<SshConnectionView> {
-    connection_views(mt_core::read_ssh_connections_for_project(project_id))
+pub fn list_connections(
+    scope: ConnectionScope<'_>,
+) -> Result<Vec<SshConnectionView>, ServiceError> {
+    read_scoped_connections(scope).map(connection_views)
 }
 
 // ---------------------------------------------------------------------------
 // 错误分类
 // ---------------------------------------------------------------------------
 
-/// service 层错误,按 MCP 时代的两类映射保留语义:
+/// service 层错误。MCP 时代的两类映射保留语义，另有 daemon 断连专用取消态:
 ///
 /// - `InvalidParams`:参数/业务错(连接未找到、护栏拒绝、SFTP 业务错)——
 ///   MCP 侧映射 `invalid_params`,CLI 侧一样是 exit 2;
@@ -106,6 +131,7 @@ pub fn list_connections(project_id: Option<&str>) -> Vec<SshConnectionView> {
 pub enum ServiceError {
     InvalidParams(String),
     Internal(String),
+    Cancelled,
 }
 
 impl ServiceError {
@@ -113,6 +139,7 @@ impl ServiceError {
     pub fn message(&self) -> &str {
         match self {
             ServiceError::InvalidParams(m) | ServiceError::Internal(m) => m,
+            ServiceError::Cancelled => "ssh exec cancelled",
         }
     }
 }
@@ -282,7 +309,12 @@ fn append_audit_line(line: &str) {
 
 /// exec 审计:格式化一行并落盘。
 fn append_audit_log(conn_name: &str, command: &str, exit: Option<i32>) {
-    append_audit_line(&format_audit_line(&utc_timestamp(), conn_name, command, exit));
+    append_audit_line(&format_audit_line(
+        &utc_timestamp(),
+        conn_name,
+        command,
+        exit,
+    ));
 }
 
 /// 格式化一行传输审计日志。抽出便于单测。
@@ -397,8 +429,14 @@ fn is_blocked_local_path_against(local_path: &str, target: &std::path::Path) -> 
     let norm_target = lexical_normalize(target);
     #[cfg(target_os = "windows")]
     {
-        let a = norm_local.to_string_lossy().to_lowercase().replace('/', "\\");
-        let b = norm_target.to_string_lossy().to_lowercase().replace('/', "\\");
+        let a = norm_local
+            .to_string_lossy()
+            .to_lowercase()
+            .replace('/', "\\");
+        let b = norm_target
+            .to_string_lossy()
+            .to_lowercase()
+            .replace('/', "\\");
         a == b
     }
     #[cfg(not(target_os = "windows"))]
@@ -427,6 +465,68 @@ impl TransferDirection {
 // exec —— 流式回调 + 完整编排
 // ---------------------------------------------------------------------------
 
+/// 状态型 exec 取消令牌。`cancel()` 后状态永久保持，既唤醒当前 waiter，也保证
+/// 尚未进入 SSH channel 阶段的 future 稍后观察到取消。
+#[derive(Debug, Clone)]
+pub struct ExecCancellation {
+    state: tokio::sync::watch::Sender<bool>,
+}
+
+impl ExecCancellation {
+    pub fn new() -> Self {
+        let (state, _) = tokio::sync::watch::channel(false);
+        Self { state }
+    }
+
+    pub fn cancel(&self) {
+        self.state.send_replace(true);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        *self.state.borrow()
+    }
+
+    pub async fn cancelled(&self) {
+        let mut receiver = self.state.subscribe();
+        if *receiver.borrow_and_update() {
+            return;
+        }
+        while receiver.changed().await.is_ok() {
+            if *receiver.borrow_and_update() {
+                return;
+            }
+        }
+    }
+}
+
+impl Default for ExecCancellation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+enum ControlledStep<T> {
+    Ready(T),
+    TimedOut,
+    Cancelled,
+}
+
+async fn await_exec_step<F>(
+    future: F,
+    deadline: tokio::time::Instant,
+    cancellation: &ExecCancellation,
+) -> ControlledStep<F::Output>
+where
+    F: std::future::Future,
+{
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => ControlledStep::Cancelled,
+        _ = tokio::time::sleep_until(deadline) => ControlledStep::TimedOut,
+        output = future => ControlledStep::Ready(output),
+    }
+}
+
 /// exec 输出流的类别,对应远程命令的 stdout / stderr。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamKind {
@@ -447,81 +547,133 @@ pub struct ExecOutcome {
     pub timed_out: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionExecOutcome {
+    Completed(Option<i32>),
+    TimedOut,
+    Cancelled,
+}
+
 /// 在已 acquire 到的 session 上开 channel、跑 exec,输出经回调流出。
 ///
-/// 不做超时——超时由外层 `tokio::time::timeout` 兜底。返回 `Result`:
+/// 超时与取消在 channel 所在状态机内处理：一旦 channel 已建立，任何提前结束
+/// 分支都先显式发送 SSH close，不能依赖 `Channel` 的 Drop。返回 `Result`:
 /// `Err(String)` 代表 transport-level 失败(channel 开不了 / exec 发不出去),
 /// caller 可用此信号触发"evict + 重连"。**transport 错只会发生在任何输出流出之前**
 /// (进入收流循环后错误只表现为流自然结束),因此 caller 重试不会造成输出重复。
 pub async fn run_exec_on_session(
     session: &mt_ssh::pool::CachedSession,
     remote_command: &str,
+    timeout: Duration,
+    cancellation: &ExecCancellation,
     on_output: &mut (impl FnMut(StreamKind, &[u8]) + Send),
-) -> Result<Option<i32>, String> {
-    let handle_guard = session.lock().await;
-    let mut channel = handle_guard
-        .channel_open_session()
-        .await
-        .map_err(|e| format!("channel_open_session failed: {e}"))?;
-    channel
-        .exec(true, remote_command)
-        .await
-        .map_err(|e| format!("channel exec failed: {e}"))?;
+) -> Result<SessionExecOutcome, String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let handle_guard = match await_exec_step(session.lock(), deadline, cancellation).await {
+        ControlledStep::Ready(guard) => guard,
+        ControlledStep::TimedOut => return Ok(SessionExecOutcome::TimedOut),
+        ControlledStep::Cancelled => return Ok(SessionExecOutcome::Cancelled),
+    };
+    let mut channel =
+        match await_exec_step(handle_guard.channel_open_session(), deadline, cancellation).await {
+            ControlledStep::Ready(Ok(channel)) => channel,
+            ControlledStep::Ready(Err(e)) => {
+                return Err(format!("channel_open_session failed: {e}"));
+            }
+            ControlledStep::TimedOut => return Ok(SessionExecOutcome::TimedOut),
+            ControlledStep::Cancelled => return Ok(SessionExecOutcome::Cancelled),
+        };
+
+    match await_exec_step(channel.exec(true, remote_command), deadline, cancellation).await {
+        ControlledStep::Ready(Ok(())) => {}
+        ControlledStep::Ready(Err(e)) => {
+            let _ = channel.close().await;
+            return Err(format!("channel exec failed: {e}"));
+        }
+        ControlledStep::TimedOut => {
+            let _ = channel.close().await;
+            return Ok(SessionExecOutcome::TimedOut);
+        }
+        ControlledStep::Cancelled => {
+            let _ = channel.close().await;
+            return Ok(SessionExecOutcome::Cancelled);
+        }
+    }
 
     let mut exit_code: Option<i32> = None;
 
     // RFC 4254 §5.2: ExtendedData.ext == 1 表示 stderr。
     const SSH_EXTENDED_DATA_STDERR: u32 = 1;
 
-    while let Some(msg) = channel.wait().await {
-        match msg {
-            ChannelMsg::Data { data } => on_output(StreamKind::Stdout, &data),
-            ChannelMsg::ExtendedData { data, ext } if ext == SSH_EXTENDED_DATA_STDERR => {
-                on_output(StreamKind::Stderr, &data);
+    loop {
+        match await_exec_step(channel.wait(), deadline, cancellation).await {
+            ControlledStep::Ready(Some(msg)) => match msg {
+                ChannelMsg::Data { data } => on_output(StreamKind::Stdout, &data),
+                ChannelMsg::ExtendedData { data, ext } if ext == SSH_EXTENDED_DATA_STDERR => {
+                    on_output(StreamKind::Stderr, &data);
+                }
+                ChannelMsg::ExitStatus { exit_status } => {
+                    exit_code = Some(exit_status as i32);
+                    // 不能立刻 break:服务器可能在 ExitStatus 之后还会发 Close/Eof,
+                    // 也可能还有最后一批 Data 待收。让循环走到 wait() 返回 None。
+                }
+                // 收到 Eof / Close 后,wait() 很快会返回 None 退出循环;不需要 break。
+                _ => {}
+            },
+            ControlledStep::Ready(None) => break,
+            ControlledStep::TimedOut => {
+                let _ = channel.close().await;
+                return Ok(SessionExecOutcome::TimedOut);
             }
-            ChannelMsg::ExitStatus { exit_status } => {
-                exit_code = Some(exit_status as i32);
-                // 不能立刻 break:服务器可能在 ExitStatus 之后还会发 Close/Eof,
-                // 也可能还有最后一批 Data 待收。让循环走到 wait() 返回 None。
+            ControlledStep::Cancelled => {
+                let _ = channel.close().await;
+                return Ok(SessionExecOutcome::Cancelled);
             }
-            // 收到 Eof / Close 后,wait() 很快会返回 None 退出循环;不需要 break。
-            _ => {}
         }
     }
     // 主动关闭 channel(server-side 可能已经关了,这里幂等 best-effort)。
     let _ = channel.close().await;
     drop(handle_guard);
 
-    Ok(exit_code)
+    Ok(SessionExecOutcome::Completed(exit_code))
 }
 
 /// 通过已保存的 SSH 连接在远程主机上执行一条命令 —— 完整编排。
 ///
 /// 编排步骤(与 MCP 时代逐项一致):
-/// 1. 每次重读 config.json 按 `project_id` 过滤后查连接(越权连接天然「未找到」);
+/// 1. 每次重读 config.json，按 MCP project-id 或 CLI capability token 解析范围；
 /// 2. 拼远程命令(可选 cwd 前缀);
 /// 3. 池 acquire(lazy 建/复用 session);cooldown 中直接返错;
-/// 4. 整段套 `tokio::time::timeout`;transport 错 → evict + 重 acquire + 单次 retry;
+/// 4. channel 内状态机强制超时/取消并显式 close；transport 错 → evict + 单次 retry;
 ///    retry 仍失败 → mark_unhealthy 30s;
 /// 5. 审计:除 acquire/cooldown 错之外,每次执行(含超时与 retry 失败)记一行。
 ///
 /// 输出经 `on_output` 实时流出;超时路径不撤回已流出的部分输出(见 [`ExecOutcome`])。
+#[derive(Debug, Clone, Copy)]
+pub struct ExecRequest<'a> {
+    pub scope: ConnectionScope<'a>,
+    pub connection: &'a str,
+    pub command: &'a str,
+    pub cwd: Option<&'a str>,
+    pub timeout_secs: Option<u64>,
+}
+
 pub async fn exec(
     pool: &SshPool,
-    project_id: Option<&str>,
-    connection: &str,
-    command: &str,
-    cwd: Option<&str>,
-    timeout_secs: Option<u64>,
+    request: ExecRequest<'_>,
+    cancellation: &ExecCancellation,
     mut on_output: impl FnMut(StreamKind, &[u8]) + Send,
 ) -> Result<ExecOutcome, ServiceError> {
-    // 1. 查连接。`read_ssh_connections_for_project` 在每次入口调用 ——
-    //    保证用户在主程序里新加的连接立即可见。
-    let conn = find_connection(
-        &mt_core::read_ssh_connections_for_project(project_id),
+    let ExecRequest {
+        scope,
         connection,
-    )
-    .map_err(ServiceError::InvalidParams)?;
+        command,
+        cwd,
+        timeout_secs,
+    } = request;
+    // 1. 每次入口都重读配置，保证范围或连接变更立即生效。
+    let conn = find_connection(&read_scoped_connections(scope)?, connection)
+        .map_err(ServiceError::InvalidParams)?;
 
     // 2. 拼远程命令(可选 cwd 前缀)。
     let remote_command = build_remote_command(command, cwd);
@@ -531,33 +683,33 @@ pub async fn exec(
 
     // 3. 走池:lazy 建/复用 session。acquire 失败(transport / auth 层错)直接返
     //    (不进 retry,auth 错重试只会徒增暴力)。
-    let session = pool
-        .acquire(&conn)
-        .await
-        .map_err(ServiceError::Internal)?;
+    let session = pool.acquire(&conn).await.map_err(ServiceError::Internal)?;
     if session.is_unhealthy_now() {
         return Err(ServiceError::Internal(
             "session is in cooldown after a previous auth failure; retry shortly".into(),
         ));
     }
 
-    // 4. 在 session 上跑 exec,整段套 tokio::time::timeout 超时。
+    // 4. 在 session 上跑 exec。超时/取消由 channel 内状态机处理，保证显式 close。
     //    第一次失败 → evict + 重新 acquire → 再试一次 → 仍失败 → 标 unhealthy + 返错。
-    let first = tokio::time::timeout(
+    let first = run_exec_on_session(
+        &session,
+        &remote_command,
         timeout,
-        run_exec_on_session(&session, &remote_command, &mut on_output),
+        cancellation,
+        &mut on_output,
     )
     .await;
 
     let outcome = match first {
-        Ok(Ok(exit_code)) => {
+        Ok(SessionExecOutcome::Completed(exit_code)) => {
             session.touch();
             ExecOutcome {
                 exit_code,
                 timed_out: false,
             }
         }
-        Ok(Err(first_err)) => {
+        Err(first_err) => {
             // transport-level 错(channel 开不了 / exec 发不出),可能是死链 race。
             // 移除并重建,再试一次。
             eprintln!("[mt-ssh-svc] exec on cached session failed, retrying: {first_err}");
@@ -571,20 +723,23 @@ pub async fn exec(
                     "session is in cooldown after a previous auth failure; retry shortly".into(),
                 ));
             }
-            match tokio::time::timeout(
+            match run_exec_on_session(
+                &session2,
+                &remote_command,
                 timeout,
-                run_exec_on_session(&session2, &remote_command, &mut on_output),
+                cancellation,
+                &mut on_output,
             )
             .await
             {
-                Ok(Ok(exit_code)) => {
+                Ok(SessionExecOutcome::Completed(exit_code)) => {
                     session2.touch();
                     ExecOutcome {
                         exit_code,
                         timed_out: false,
                     }
                 }
-                Ok(Err(second_err)) => {
+                Err(second_err) => {
                     // 两次都失败 —— 进 30s gatetime cooldown,避免连发把服务器打死。
                     session2.mark_unhealthy(UNHEALTHY_COOLDOWN);
                     append_audit_log(&conn_name_for_audit, command, None);
@@ -592,7 +747,7 @@ pub async fn exec(
                         "ssh exec failed after retry: {second_err}"
                     )));
                 }
-                Err(_) => {
+                Ok(SessionExecOutcome::TimedOut) => {
                     // 第二次:超时。强制中止 + timedOut=true。
                     eprintln!(
                         "[mt-ssh-svc] exec timed out on retry after {}s",
@@ -603,9 +758,10 @@ pub async fn exec(
                         timed_out: true,
                     }
                 }
+                Ok(SessionExecOutcome::Cancelled) => return Err(ServiceError::Cancelled),
             }
         }
-        Err(_) => {
+        Ok(SessionExecOutcome::TimedOut) => {
             // 第一次超时。不 evict、不 disconnect session —— 单 channel 超时
             // 不代表整个 session 死了。
             eprintln!(
@@ -618,6 +774,7 @@ pub async fn exec(
                 timed_out: true,
             }
         }
+        Ok(SessionExecOutcome::Cancelled) => return Err(ServiceError::Cancelled),
     };
 
     // 5. 审计日志:每次执行记一行(失败不影响结果)。超时记 exit=timeout。
@@ -657,7 +814,7 @@ async fn run_one_transfer(
 pub async fn transfer(
     pool: &SshPool,
     direction: TransferDirection,
-    project_id: Option<&str>,
+    scope: ConnectionScope<'_>,
     connection: &str,
     local_path: &str,
     remote_path: &str,
@@ -674,22 +831,15 @@ pub async fn transfer(
     }
 
     // 1. 查连接(列表已按本项目关联范围过滤,越权连接天然「未找到」)。错误不含密码。
-    let conn = find_connection(
-        &mt_core::read_ssh_connections_for_project(project_id),
-        connection,
-    )
-    .map_err(ServiceError::InvalidParams)?;
+    let conn = find_connection(&read_scoped_connections(scope)?, connection)
+        .map_err(ServiceError::InvalidParams)?;
 
-    let timeout =
-        Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_TRANSFER_TIMEOUT_SECS).max(1));
+    let timeout = Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_TRANSFER_TIMEOUT_SECS).max(1));
     let conn_name_for_audit = conn.name.clone();
     let conn_id = conn.id.clone();
 
     // 2. 走池:lazy 建/复用 session。auth/transport 错直接返(不进 retry)。
-    let session = pool
-        .acquire(&conn)
-        .await
-        .map_err(ServiceError::Internal)?;
+    let session = pool.acquire(&conn).await.map_err(ServiceError::Internal)?;
     if session.is_unhealthy_now() {
         return Err(ServiceError::Internal(
             "session is in cooldown after a previous auth failure; retry shortly".into(),
@@ -1154,6 +1304,23 @@ mod tests {
             ServiceError::Internal("reconnect failed: x".into()).to_string(),
             "reconnect failed: x"
         );
+    }
+
+    #[tokio::test]
+    async fn exec_cancellation_wakes_current_and_future_waiters() {
+        let cancellation = ExecCancellation::new();
+        let waiting = cancellation.clone();
+        let waiter = tokio::spawn(async move { waiting.cancelled().await });
+
+        cancellation.cancel();
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("当前 waiter 应被唤醒")
+            .expect("waiter task");
+
+        tokio::time::timeout(Duration::from_millis(50), cancellation.cancelled())
+            .await
+            .expect("取消状态必须对未来 waiter 保持可见");
     }
 
     // --- 回调收集器:MCP 侧收集行为等价于旧 run_exec_on_session 返回值 -----

@@ -61,7 +61,7 @@ Mini-Term solves all of the above with one lightweight desktop app.
 - **Password auto-fill** — For connections with a saved password, the backend scans PTY output for the password prompt and writes the password back automatically, once per session, stopping on a wrong password to avoid hammering the server with bad credentials.
 - **Private-key permission handling** — When connecting with a private key, the key is copied to a permission-tightened temporary copy (Windows `icacls` / Unix `0600`) to bypass OpenSSH's "UNPROTECTED PRIVATE KEY FILE" rejection, without modifying your original key file.
 - **Advanced capabilities** — Key-file login (`ssh -i`) and connection grouping: right-click to create / rename / dissolve groups (empty groups persist), drag a connection onto a group to move it, and pick existing groups from a dropdown in the edit form.
-- **SSH tools for AI agents (CLI + Skill)** — Lets AI agents running in the terminal (Claude Code / Codex) operate on saved SSH connections. The project right-click "Link SSH" menu enables them per project and limits visibility to the selected connections; enabling generates two SKILL.md files (Claude / Codex variants, with the CLI's absolute path and the project id baked in, `.gitignore` entries appended, and any legacy MCP registration of this project migrated away automatically), so agents call the built-in `mt-ssh-cli` sidecar over plain Bash: `list` / `exec` / `upload` / `download`, with remote stdout/stderr streamed through verbatim and the remote exit code passed through (124 = timeout, 2 = CLI error), SFTP transfers streamed in chunks, password / private-key auth handled entirely on the local machine, an audit log per call, and a hard guard that refuses to ever transfer mini-term's own `config.json` (which holds all saved SSH credentials). Behind the CLI sits a machine-wide singleton daemon holding a persistent session pool (auto-spawned on first call, drains and exits after 10 minutes idle, swaps itself out on version upgrades), so repeat commands on a connection cost only an RTT; if the daemon is unreachable the CLI transparently falls back to an in-process connection, and inside WSL the same Windows exe works via interop. During the transition the `mt-ssh-mcp` MCP sidecar still ships to serve projects that haven't been migrated yet.
+- **SSH tools for AI agents (CLI + Skill)** — Lets AI agents running in the terminal (Claude Code / Codex) operate on saved SSH connections. The project right-click "Link SSH" menu enables them per project and limits visibility to the selected connections; enabling generates two SKILL.md files (Claude / Codex variants, with the CLI's absolute path and a random per-project capability token baked in, `.gitignore` entries appended, and any legacy MCP registration migrated away automatically). The token is required on every `list` / `exec` / `upload` / `download` call; missing, blank, unknown, duplicate, or disabled-project mappings fail closed instead of exposing all connections. Generated examples cover Bash, correctly quoted WSL interop, and PowerShell's required `&` call operator. Remote stdout/stderr stream through verbatim and the remote exit code is passed through (124 = timeout, 2 = CLI error); SFTP transfers stream in chunks, credentials stay local, each call is audited, and a hard guard refuses to transfer mini-term's own credential-bearing `config.json`. A machine-wide singleton daemon holds the persistent session pool (auto-spawned on first call, drains after 10 minutes idle, swaps itself out on upgrades); Ctrl+C/client disconnect and request timeout explicitly close the SSH channel while retaining the healthy session. IPC is current-user-only and fails closed if its secure endpoint cannot be created. If the daemon is unreachable the CLI transparently falls back to an in-process connection. During the transition the `mt-ssh-mcp` MCP sidecar still ships for projects not yet migrated.
 - **SSH remote projects** — Add a directory on a remote server directly as a mini-term project: the "Add Remote Project" dialog picks a saved SSH connection and takes a remote POSIX path, validating that the directory exists over SSH before saving; the file tree lazy-loads over SFTP (an inline loading spinner on expand, manual refresh, root `.gitignore` filtering); the terminal connects via `ssh -t` and lands straight in the project directory, with a one-click reconnect overlay after a disconnection; the Sessions panel merges the remote machine's Claude / Codex sessions chronologically, with content viewing supported; deleting the referenced connection shows the project in a "broken-link" state rather than failing silently; under the hood it shares the extracted `mt-ssh` crate (persistent russh session pool + SFTP primitives) with the SSH tool sidecars, and remote cache keys mix in the connection id so identical paths on two servers never cross-contaminate.
 
 ### WSL Support (Windows)
@@ -164,7 +164,7 @@ Watch the AI running on your desktop from your phone while you're out, and send 
 | File watching | notify 7 + ignore 0.4 (.gitignore filtering) |
 | Tauri plugins | `window-state` · `clipboard-manager` · `dialog` · `opener` |
 | Mobile relay | axum + tokio WebSocket relay service (`relay-server/`) · React + TS + Vite PWA (`mobile/`) |
-| Test coverage | 468 Rust tests = 430 desktop (tauri-app 281 + mt-core 38 + mt-ssh 26 + mt-sidecars 85) + 38 relay-server (protocol & routing); plus 19 Node tests |
+| Test coverage | 491 Rust tests = 438 desktop (tauri-app 284 + mt-core 44 + mt-ssh 26 + mt-sidecars 84) + 53 relay-server (protocol & routing); plus 19 Node tests |
 
 ## Getting Started
 
@@ -380,18 +380,18 @@ npm run build
 # Node-side tests (19)
 node --test "tests/*.test.cjs"
 
-# Desktop Rust tests (381)
+# Desktop Rust tests (438)
 # Note: mt-core / mt-ssh / mt-sidecars are standalone crates, not workspace members.
-# Running `cd src-tauri && cargo test` alone only covers tauri-app's 277 — the other
+# Running `cd src-tauri && cargo test` alone only covers tauri-app's 284 — the other
 # three need their manifests specified explicitly.
 cd src-tauri
-cargo test                                        # tauri-app     277
-cargo test --manifest-path mt-core/Cargo.toml     # mt-core        38
+cargo test                                        # tauri-app     284
+cargo test --manifest-path mt-core/Cargo.toml     # mt-core        44
 cargo test --manifest-path mt-ssh/Cargo.toml      # mt-ssh         26
-cargo test --manifest-path mt-sidecars/Cargo.toml # mt-sidecars    40
+cargo test --manifest-path mt-sidecars/Cargo.toml # mt-sidecars    84
 cargo build
 
-# Relay server tests (38, standalone workspace)
+# Relay server tests (53, standalone workspace)
 cd ../relay-server && cargo test
 ```
 

@@ -7,8 +7,8 @@
 //!   同目录),权限 0600。
 //!
 //! 协议:newline-delimited JSON 帧(serde camelCase,`v` 字段版本号)。
-//! - 连接建立后 daemon 先发 `{type:"hello", version, pid}`;
-//! - 请求(CLI→daemon,单行):`{v:1, op, projectId?, connection?, ...}`;
+//! - 连接建立后 daemon 先发 `{type:"hello", version, protocolVersion, pid}`;
+//! - 请求(CLI→daemon,单行):`{v:2, op, projectToken?, connection?, ...}`;
 //! - 响应流(daemon→CLI,多行直至终帧):stdout/stderr 分片帧(base64 保
 //!   二进制安全)→ 终帧 result / error(message 绝不含密码)。
 
@@ -18,7 +18,9 @@ use crate::ssh_service::SshConnectionView;
 
 /// 请求帧协议版本。与二进制版本(hello 帧的 `version`)独立:协议版本管字段
 /// 兼容性,二进制版本管「app 升级后旧 daemon 换代」的握手。
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
+/// rev4 前 daemon 的协议版本；旧 hello 没有 `protocolVersion`，兼容时按 v1 处理。
+pub const LEGACY_PROTOCOL_VERSION: u32 = 1;
 
 /// 请求的操作类别。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,7 +47,7 @@ impl Op {
 
 /// CLI → daemon 的请求帧(单行 JSON)。
 ///
-/// 字段按 op 选用:list 只用 `project_id`;exec 用 `connection`/`command`/
+/// 字段按 op 选用:list 只用 `project_token`;exec 用 `connection`/`command`/
 /// `cwd`/`timeout_secs`;upload/download 用 `connection`/`local_path`/
 /// `remote_path`/`timeout_secs`(`local_path` 已由 CLI 端绝对化);
 /// status/shutdown 无业务字段。
@@ -55,7 +57,7 @@ pub struct Request {
     pub v: u32,
     pub op: Option<Op>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<String>,
+    pub project_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connection: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -72,10 +74,22 @@ pub struct Request {
 
 /// daemon → CLI 的响应帧(每帧单行 JSON,`type` 字段区分)。
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+#[serde(
+    tag = "type",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum ServerFrame {
-    /// 连接建立后 daemon 主动发出:二进制版本 + pid,供 CLI 做版本握手与排障。
-    Hello { version: String, pid: u32 },
+    /// 连接建立后 daemon 主动发出：二进制版本 + 协议版本 + pid。
+    ///
+    /// `protocol_version` 对反序列化保留可选：v1 hello 没有此字段，新 CLI
+    /// 读到 `None` 时按 [`LEGACY_PROTOCOL_VERSION`] 收尸并换代。
+    Hello {
+        version: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        protocol_version: Option<u32>,
+        pid: u32,
+    },
     /// exec 的远程 stdout 分片(base64 保二进制安全)。
     Stdout { data_b64: String },
     /// exec 的远程 stderr 分片。
@@ -210,7 +224,13 @@ pub fn default_endpoint() -> String {
 fn sanitize_tag(raw: &str) -> String {
     let cleaned: String = raw
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     if cleaned.is_empty() {
         "default".to_string()
@@ -392,13 +412,15 @@ pub mod windows_security {
             let ok = unsafe {
                 ConvertStringSecurityDescriptorToSecurityDescriptorW(
                     wide.as_ptr(),
-                    SDDL_REVISION_1 as u32,
+                    SDDL_REVISION_1,
                     &mut psd as *mut *mut c_void as *mut _,
                     std::ptr::null_mut(),
                 )
             };
             if ok == 0 || psd.is_null() {
-                return Err(format!("cannot build security descriptor from SDDL '{sddl}'"));
+                return Err(format!(
+                    "cannot build security descriptor from SDDL '{sddl}'"
+                ));
             }
             let attrs = Box::new(SecurityAttributes {
                 n_length: std::mem::size_of::<SecurityAttributes>() as u32,
@@ -443,7 +465,7 @@ mod tests {
         let req = Request {
             v: PROTOCOL_VERSION,
             op: Some(Op::Exec),
-            project_id: Some("p1".into()),
+            project_token: Some("token-1".into()),
             connection: Some("prod".into()),
             command: Some("ls -la".into()),
             cwd: Some("/var/log".into()),
@@ -455,13 +477,13 @@ mod tests {
         assert!(line.ends_with('\n'));
         assert_eq!(line.matches('\n').count(), 1, "必须恰好一行");
         // camelCase 键名(与 spec §2 协议示例一致)
-        assert!(line.contains("\"projectId\""), "got: {line}");
+        assert!(line.contains("\"projectToken\""), "got: {line}");
         assert!(line.contains("\"timeoutSecs\""), "got: {line}");
         assert!(line.contains("\"op\":\"exec\""), "got: {line}");
         let back: Request = decode_frame(&line).unwrap();
         assert_eq!(back.v, PROTOCOL_VERSION);
         assert_eq!(back.op, Some(Op::Exec));
-        assert_eq!(back.project_id.as_deref(), Some("p1"));
+        assert_eq!(back.project_token.as_deref(), Some("token-1"));
         assert_eq!(back.command.as_deref(), Some("ls -la"));
     }
 
@@ -473,7 +495,7 @@ mod tests {
             ..Default::default()
         };
         let line = encode_frame(&req).unwrap();
-        assert!(!line.contains("projectId"));
+        assert!(!line.contains("projectToken"));
         assert!(!line.contains("localPath"));
     }
 
@@ -506,20 +528,38 @@ mod tests {
     fn hello_frame_shape() {
         let f = ServerFrame::Hello {
             version: "0.8.5".into(),
+            protocol_version: Some(PROTOCOL_VERSION),
             pid: 4242,
         };
         let line = encode_frame(&f).unwrap();
         assert!(line.contains("\"type\":\"hello\""), "got: {line}");
         assert!(line.contains("\"version\":\"0.8.5\""));
+        assert!(line.contains("\"protocolVersion\":2"));
         assert!(line.contains("\"pid\":4242"));
         let back: ServerFrame = decode_frame(&line).unwrap();
         match back {
-            ServerFrame::Hello { version, pid } => {
+            ServerFrame::Hello {
+                version,
+                protocol_version,
+                pid,
+            } => {
                 assert_eq!(version, "0.8.5");
+                assert_eq!(protocol_version, Some(PROTOCOL_VERSION));
                 assert_eq!(pid, 4242);
             }
             other => panic!("expected hello, got {other:?}"),
         }
+
+        // v1 hello 没有 protocolVersion，新 CLI 必须仍能解码并识别为 legacy。
+        let legacy: ServerFrame =
+            decode_frame(r#"{"type":"hello","version":"0.4.8","pid":7}"#).unwrap();
+        assert!(matches!(
+            legacy,
+            ServerFrame::Hello {
+                protocol_version: None,
+                ..
+            }
+        ));
     }
 
     #[test]

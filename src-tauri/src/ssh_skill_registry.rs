@@ -6,7 +6,7 @@
 //!
 //! 与 `.mcp.json` 的合并式写入不同：SKILL.md 是 mini-term **独占生成物**，
 //! 直接整文件覆盖写入，文件头带 generated 注释标记。内容含 CLI 绝对路径与
-//! project-id（机器相关 → 进 `.gitignore`）。
+//! project-token（机器相关 → 进 `.gitignore`）。
 //!
 //! 启用时（全部幂等）：
 //! - 写 `<project>/.claude/skills/mini-term-ssh/SKILL.md`（含 `allowed-tools`）
@@ -22,6 +22,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::ssh_mcp_registry;
+use serde::Serialize;
 
 /// skill 目录名 —— 同时充当幂等 marker（与旧 MCP server 名一致，便于对应）。
 const SKILL_DIR_NAME: &str = "mini-term-ssh";
@@ -64,20 +65,31 @@ fn validate_project_dir(project_dir: &str) -> Result<PathBuf, String> {
 ///
 /// 正文英文（与 MCP tool descriptions 一致，对两端 agent 触发与遵循最稳）；
 /// description 明确列出「远程执行 / 查日志 / 部署 / 传文件」等触发场景。
-fn render_skill_md(binary_path: &str, project_id: &str, with_allowed_tools: bool) -> String {
+fn quote_posix_single(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn quote_powershell_single(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn render_skill_md(binary_path: &str, project_token: &str, with_allowed_tools: bool) -> String {
     // Windows 版 Claude Code 的 shell 工具可能是 Bash 或 PowerShell,两个都列
-    // (实测两条并列不影响 skill 加载;带 `&` 的 PowerShell 调用符写法会导致
-    // skill 加载失败,不要加)。未命中白名单时交互式会话一次手动批准兜底。
+    // (实测两条并列不影响 skill 加载)。allowed-tools 只描述可执行文件匹配；
+    // 正文里的 PowerShell 命令仍必须带调用运算符 `&`。
     // 整行是 YAML 单引号标量:路径若含撇号(如 C:\Users\O'Brien\...)需按 YAML
     // 规则双写转义,否则 frontmatter 断裂、skill 静默加载失败。
     let allowed_tools_line = if with_allowed_tools {
         let yaml_safe = binary_path.replace('\'', "''");
-        format!(
-            "allowed-tools: 'Bash(\"{yaml_safe}\" *), PowerShell(\"{yaml_safe}\" *)'\n"
-        )
+        format!("allowed-tools: 'Bash(\"{yaml_safe}\" *), PowerShell(\"{yaml_safe}\" *)'\n")
     } else {
         String::new()
     };
+    let bash_binary = quote_posix_single(binary_path);
+    let bash_token = quote_posix_single(project_token);
+    let wsl_binary = format!("\"$(wslpath {bash_binary})\"");
+    let powershell_binary = quote_powershell_single(binary_path);
+    let powershell_token = quote_powershell_single(project_token);
     format!(
         r#"---
 name: mini-term-ssh
@@ -96,28 +108,43 @@ CLI binary (quote the path, it may contain spaces):
 
     "{binary_path}"
 
-Inside WSL, call it via Windows interop:
+All examples below already carry this project's capability token. Never replace
+or omit it: the daemon rejects unknown tokens instead of exposing other projects.
 
-    "$(wslpath '{binary_path}')"
+## Bash / Git Bash
 
-All examples below already carry this project's id.
+List available connections:
 
-## List available connections
+    {bash_binary} list --project-token {bash_token} --json
 
-    "{binary_path}" list --project-id {project_id} --json
+Run a remote command:
 
-## Run a remote command
+    {bash_binary} exec --project-token {bash_token} [--cwd DIR] [--timeout SECS] <connection> -- <command...>
 
-    "{binary_path}" exec --project-id {project_id} [--cwd DIR] [--timeout SECS] <connection> -- <command...>
+Upload / download files:
+
+    {bash_binary} upload   --project-token {bash_token} <connection> <local_path> <remote_path>
+    {bash_binary} download --project-token {bash_token} <connection> <remote_path> <local_path>
+
+## WSL (Windows interop)
+
+    {wsl_binary} list --project-token {bash_token} --json
+    {wsl_binary} exec --project-token {bash_token} [--cwd DIR] [--timeout SECS] <connection> -- <command...>
+    {wsl_binary} upload   --project-token {bash_token} <connection> <local_path> <remote_path>
+    {wsl_binary} download --project-token {bash_token} <connection> <remote_path> <local_path>
+
+## PowerShell
+
+PowerShell requires the call operator `&` before a quoted executable path:
+
+    & {powershell_binary} list --project-token {powershell_token} --json
+    & {powershell_binary} exec --project-token {powershell_token} [--cwd DIR] [--timeout SECS] <connection> -- <command...>
+    & {powershell_binary} upload   --project-token {powershell_token} <connection> <local_path> <remote_path>
+    & {powershell_binary} download --project-token {powershell_token} <connection> <remote_path> <local_path>
 
 - Remote stdout/stderr stream through; exit code = remote exit code.
 - Exit 124 = timeout (default 60s), exit 2 + `mt-ssh-cli: error:` on stderr = CLI/connection error.
 - Large output: append `> file.log` and read the file afterwards.
-
-## Upload / download files (SFTP)
-
-    "{binary_path}" upload   --project-id {project_id} <connection> <local_path> <remote_path>
-    "{binary_path}" download --project-id {project_id} <connection> <remote_path> <local_path>
 
 Do NOT base64-echo file contents through exec — use upload/download.
 "#
@@ -147,13 +174,17 @@ fn skill_paths(project_dir: &Path) -> [(PathBuf, bool); 2] {
 }
 
 /// 整文件覆盖写入两份 SKILL.md（mini-term 独占生成物，无需合并语义）。
-fn write_skill_files(project_dir: &Path, binary_path: &str, project_id: &str) -> Result<(), String> {
+fn write_skill_files(
+    project_dir: &Path,
+    binary_path: &str,
+    project_token: &str,
+) -> Result<(), String> {
     for (path, with_allowed_tools) in skill_paths(project_dir) {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("创建 skill 目录失败 {}: {}", parent.display(), e))?;
         }
-        let content = render_skill_md(binary_path, project_id, with_allowed_tools);
+        let content = render_skill_md(binary_path, project_token, with_allowed_tools);
         crate::fs::atomic_write(&path, content.as_bytes())
             .map_err(|e| format!("写入 {} 失败: {}", path.display(), e))?;
     }
@@ -250,22 +281,39 @@ fn cleanup_legacy_mcp(project_dir: &Path) -> Result<(), String> {
 
 // ─── Tauri Commands ───
 
+/// `enable_ssh_tools` 返回值。前端必须把 `project_token` 持久化进对应项目配置，
+/// daemon 才能在后续请求中把令牌解析回项目范围。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnableSshToolsResult {
+    pub message: String,
+    pub project_token: String,
+}
+
+/// 复用已有非空令牌；存量项目没有令牌时生成新的 UUID v4 能力令牌。
+fn resolve_project_token(existing: Option<String>) -> String {
+    existing
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+}
+
 /// 为指定项目启用 SSH 工具（CLI + Skill）。
 ///
-/// `project_dir` 为项目目录绝对路径；`project_id` 写死进 SKILL.md 的命令示例，
-/// 让 agent 的每次调用都带上项目范围过滤。成功后该项目里新启动的
+/// `project_dir` 为项目目录绝对路径；已有 `project_token` 会稳定复用，存量项目
+/// 缺失时生成新的能力令牌并写死进 SKILL.md。成功后该项目里新启动的
 /// Claude Code / Codex 会话即可通过 skill 调用 SSH CLI（已运行的会话需重启）。
 #[tauri::command]
-pub fn enable_ssh_tools(project_dir: String, project_id: String) -> Result<String, String> {
+pub fn enable_ssh_tools(
+    project_dir: String,
+    project_token: Option<String>,
+) -> Result<EnableSshToolsResult, String> {
     let dir = validate_project_dir(&project_dir)?;
-    let pid = project_id.trim();
-    if pid.is_empty() {
-        return Err("项目 id 为空,无法启用 SSH 工具".to_string());
-    }
+    let project_token = resolve_project_token(project_token);
     let binary_path = get_ssh_cli_binary_path()?;
 
     // 核心写入：任何一步失败都直接返回错误（可读中文）。
-    write_skill_files(&dir, &binary_path, pid)?;
+    write_skill_files(&dir, &binary_path, &project_token)?;
     ssh_mcp_registry::trust_project_in_codex(&dir)?;
     // 存量项目自动摘除旧 MCP 注册（新项目本就没有,天然幂等）。
     cleanup_legacy_mcp(&dir)?;
@@ -279,10 +327,13 @@ pub fn enable_ssh_tools(project_dir: String, project_id: String) -> Result<Strin
         }
     };
 
-    Ok(format!(
-        "已为该项目启用 SSH 工具：已生成 Claude / Codex 两份 SKILL.md。{}",
-        gitignore_note
-    ))
+    Ok(EnableSshToolsResult {
+        message: format!(
+            "已为该项目启用 SSH 工具：已生成 Claude / Codex 两份 SKILL.md。{}",
+            gitignore_note
+        ),
+        project_token,
+    })
 }
 
 /// 为指定项目停用 SSH 工具。
@@ -319,11 +370,12 @@ mod tests {
     // ─── SKILL.md 渲染 ───
 
     #[test]
-    fn skill_md_embeds_binary_path_and_project_id() {
-        let md = render_skill_md(WIN_BIN, "proj-1", true);
+    fn skill_md_embeds_binary_path_and_project_token() {
+        let md = render_skill_md(WIN_BIN, "token-1", true);
         // Windows 路径原样嵌入（含空格与反斜杠,使用处都带引号）
         assert!(md.contains(&format!("\"{WIN_BIN}\"")), "got:\n{md}");
-        assert!(md.contains("--project-id proj-1"));
+        assert!(md.contains("--project-token 'token-1'"));
+        assert!(!md.contains("--project-id"));
         // 四个子命令的示例都在
         assert!(md.contains(" list "));
         assert!(md.contains(" exec "));
@@ -356,19 +408,50 @@ mod tests {
         // 撇号路径(如 O'Brien 用户名)在 YAML 单引号标量里必须双写,
         // 否则 frontmatter 断裂导致 skill 加载失败。
         let md = render_skill_md(r"C:\Users\O'Brien\mt-ssh-cli.exe", "p", true);
-        assert!(md.contains(r#"Bash("C:\Users\O''Brien\mt-ssh-cli.exe" *)"#), "got:\n{md}");
+        assert!(
+            md.contains(r#"Bash("C:\Users\O''Brien\mt-ssh-cli.exe" *)"#),
+            "got:\n{md}"
+        );
         // 正文(单引号标量之外)保留原始撇号
         assert!(md.contains(r#"    "C:\Users\O'Brien\mt-ssh-cli.exe""#));
     }
 
     #[test]
+    fn skill_md_powershell_examples_use_call_operator() {
+        let md = render_skill_md(WIN_BIN, "token-1", true);
+        assert!(
+            md.contains(
+                r#"& 'C:\Program Files\mini term\mt-ssh-cli.exe' list --project-token 'token-1'"#
+            ),
+            "got:\n{md}"
+        );
+    }
+
+    #[test]
+    fn skill_md_shell_quotes_apostrophe_paths() {
+        let path = r"C:\Users\O'Brien\mt-ssh-cli.exe";
+        let md = render_skill_md(path, "token-1", true);
+        assert!(
+            md.contains(r#"wslpath 'C:\Users\O'"'"'Brien\mt-ssh-cli.exe'"#),
+            "got:\n{md}"
+        );
+        assert!(
+            md.contains(r#"& 'C:\Users\O''Brien\mt-ssh-cli.exe' list --project-token 'token-1'"#),
+            "got:\n{md}"
+        );
+    }
+
+    #[test]
     fn skill_md_contains_no_sensitive_fields() {
-        // 模板只接收二进制路径与 project id 两个注入值,不可能携带凭据;
+        // 模板只接收二进制路径与 project token 两个注入值,不可能携带 SSH 凭据;
         // 正文提到 "passwords" 仅出现在「绝不向用户要密码」的指引行里。
         let md = render_skill_md(WIN_BIN, "p", true);
         assert!(!md.contains("identityFile"));
         for line in md.lines().filter(|l| l.to_lowercase().contains("password")) {
-            assert!(line.contains("NEVER ask the user for passwords"), "unexpected: {line}");
+            assert!(
+                line.contains("NEVER ask the user for passwords"),
+                "unexpected: {line}"
+            );
         }
     }
 
@@ -395,23 +478,26 @@ mod tests {
         let codex_md = std::fs::read_to_string(&codex).unwrap();
         assert!(claude_md.contains("allowed-tools"));
         assert!(!codex_md.contains("allowed-tools"));
-        assert!(claude_md.contains("--project-id p1"));
+        assert!(claude_md.contains("--project-token 'p1'"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn write_skill_files_overwrite_is_idempotent() {
-        // 整文件覆盖：改 project id 后重写,旧内容不残留。
+        // 整文件覆盖：改 project token 后重写,旧内容不残留。
         let dir = unique_test_dir("overwrite");
         write_skill_files(&dir, "/bin/mt-ssh-cli", "old-pid").unwrap();
         write_skill_files(&dir, "/bin/mt-ssh-cli", "new-pid").unwrap();
 
         let md = std::fs::read_to_string(
-            dir.join(".claude").join("skills").join(SKILL_DIR_NAME).join("SKILL.md"),
+            dir.join(".claude")
+                .join("skills")
+                .join(SKILL_DIR_NAME)
+                .join("SKILL.md"),
         )
         .unwrap();
-        assert!(md.contains("--project-id new-pid"));
+        assert!(md.contains("--project-token 'new-pid'"));
         assert!(!md.contains("old-pid"));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -475,7 +561,8 @@ mod tests {
 
     #[test]
     fn gitignore_append_skips_existing_entries() {
-        let existing = "node_modules\n.claude/skills/mini-term-ssh/\n.codex/skills/mini-term-ssh/\n";
+        let existing =
+            "node_modules\n.claude/skills/mini-term-ssh/\n.codex/skills/mini-term-ssh/\n";
         assert!(compute_gitignore_append(existing).is_none());
     }
 
@@ -520,6 +607,19 @@ mod tests {
         assert!(validate_project_dir(&tmp.to_string_lossy()).is_ok());
     }
 
+    #[test]
+    fn project_token_reuses_existing_or_generates_uuid() {
+        assert_eq!(
+            resolve_project_token(Some("  existing-token  ".into())),
+            "existing-token"
+        );
+        let generated = resolve_project_token(None);
+        assert!(
+            uuid::Uuid::parse_str(&generated).is_ok(),
+            "got: {generated}"
+        );
+    }
+
     // ─── 存量 MCP 项目迁移 round-trip ───
 
     #[test]
@@ -553,8 +653,7 @@ mod tests {
             .exists());
         // .mcp.json:本 server 条目消失,团队 server 毫发无损
         let mcp: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(dir.join(".mcp.json")).unwrap())
-                .unwrap();
+            serde_json::from_str(&std::fs::read_to_string(dir.join(".mcp.json")).unwrap()).unwrap();
         assert!(mcp["mcpServers"].get("mini-term-ssh").is_none());
         assert_eq!(mcp["mcpServers"]["team-server"]["command"], "team");
         // Codex 项目配置:本 server 子表消失,其它保留
@@ -574,8 +673,7 @@ mod tests {
         ssh_mcp_registry::remove_project_mcp_json(&dir).unwrap();
         assert!(!dir.join(".claude").exists());
         let mcp2: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(dir.join(".mcp.json")).unwrap())
-                .unwrap();
+            serde_json::from_str(&std::fs::read_to_string(dir.join(".mcp.json")).unwrap()).unwrap();
         assert_eq!(mcp2["mcpServers"]["team-server"]["command"], "team");
 
         let _ = std::fs::remove_dir_all(&dir);

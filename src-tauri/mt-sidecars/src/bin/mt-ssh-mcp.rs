@@ -27,11 +27,13 @@ use std::sync::Arc;
 use mt_sidecars::ssh_service::{self, ServiceError, StreamKind, TransferDirection};
 use mt_ssh::pool::SshPool;
 
-/// 把 service 层错误映射为 MCP 错误,保持迁移前的两类语义。
+/// 把 service 层错误映射为 MCP 错误；取消态只供 daemon 使用，MCP 若意外
+/// 收到则按内部错误处理。
 fn to_mcp_error(e: ServiceError) -> McpError {
     match e {
         ServiceError::InvalidParams(m) => McpError::invalid_params(m, None),
         ServiceError::Internal(m) => McpError::internal_error(m, None),
+        ServiceError::Cancelled => McpError::internal_error("ssh exec cancelled", None),
     }
 }
 
@@ -234,7 +236,10 @@ impl SshMcp {
     ) -> Result<CallToolResult, McpError> {
         // 读全局 config.json 的 sshConnections,并按本项目的关联范围过滤;
         // 文件缺失/解析失败时为空 Vec。投影不含敏感字段。
-        let views = ssh_service::list_connections(self.project_id.as_deref());
+        let views = ssh_service::list_connections(ssh_service::ConnectionScope::LegacyProject(
+            self.project_id.as_deref(),
+        ))
+        .map_err(to_mcp_error)?;
 
         // 序列化失败属于不可恢复的内部错误,回结构化 MCP 错误而非 panic。
         let json = serde_json::to_string(&views).map_err(|e| {
@@ -267,13 +272,17 @@ impl SshMcp {
         // MCP 侧用回调把流式输出收集进缓冲,最后 cap_output 打包 JSON。
         let mut stdout_buf: Vec<u8> = Vec::new();
         let mut stderr_buf: Vec<u8> = Vec::new();
+        let cancellation = ssh_service::ExecCancellation::new();
         let outcome = ssh_service::exec(
             &self.pool,
-            self.project_id.as_deref(),
-            &connection,
-            &command,
-            cwd.as_deref(),
-            timeout_secs,
+            ssh_service::ExecRequest {
+                scope: ssh_service::ConnectionScope::LegacyProject(self.project_id.as_deref()),
+                connection: &connection,
+                command: &command,
+                cwd: cwd.as_deref(),
+                timeout_secs,
+            },
+            &cancellation,
             |kind, data| match kind {
                 StreamKind::Stdout => stdout_buf.extend_from_slice(data),
                 StreamKind::Stderr => stderr_buf.extend_from_slice(data),
@@ -363,7 +372,7 @@ impl SshMcp {
         let bytes = ssh_service::transfer(
             &self.pool,
             direction,
-            self.project_id.as_deref(),
+            ssh_service::ConnectionScope::LegacyProject(self.project_id.as_deref()),
             connection,
             local_path,
             remote_path,
