@@ -5,7 +5,13 @@ description = "mini-term sidecar binaries: miniterm-hook (AI hook) and mt-ssh-mc
 edition = "2021"
 
 # 独立 crate：不依赖 tauri / tauri-build，单独 cargo build 不会触发主程序的
-# externalBin 校验。两个 sidecar 由 scripts/stage-sidecars.mjs 构建并就位。
+# externalBin 校验。sidecar 由 scripts/stage-sidecars.mjs 构建并就位。
+
+# lib target：ssh_service 业务编排共享层，mt-ssh-mcp 与 mt-ssh-cli 两个 bin
+# 都只做传输层、业务转调 lib（ssh-cli-skill spec §3）。
+[lib]
+name = "mt_sidecars"
+path = "src/lib.rs"
 
 [[bin]]
 name = "miniterm-hook"
