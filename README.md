@@ -134,7 +134,7 @@ VS Code 风格的 **Changes 面板**（Staged / Changes / Untracked 分组，单
 | 状态 / 布局 | Zustand 单一 Store · Allotment + 递归 SplitNode 分屏树 |
 | PTY / Git | portable-pty · git2 · notify + ignore |
 | 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`） |
-| 测试 | **419 个 Rust 测试**（桌面端 381 + 中转 38）+ 19 个 Node 测试 |
+| 测试 | **466 个 Rust 测试**（桌面端 428 + 中转 38）+ 19 个 Node 测试 |
 
 ---
 

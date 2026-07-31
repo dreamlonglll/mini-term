@@ -126,7 +126,8 @@ export interface ProjectConfig {
   path: string;
   savedLayout?: SavedProjectLayout;
   expandedDirs?: string[];
-  /** 是否已为该项目启用 SSH MCP（向项目目录写入了 Claude / Codex 的 MCP 注册配置） */
+  /** 是否已为该项目启用 SSH 工具（向项目目录生成了 Claude / Codex 的 SKILL.md；
+   *  字段名保留 Mcp 是为兼容存量配置，语义已是「SSH 工具（CLI + Skill）」） */
   sshMcpEnabled?: boolean;
   /** 该项目的 agent 可访问的 SSH 连接 id 列表（「关联 SSH」设定的范围）；undefined = 旧配置兼容,视为全部 */
   sshConnectionIds?: string[];

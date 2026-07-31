@@ -61,8 +61,8 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 - **密码自动填充** — 配了密码的连接，后端扫描 PTY 输出命中密码提示自动回写密码，每会话只填一次，密码错误时停止以防连灌错误密码
 - **私钥权限自动处理** — 使用私钥连接时自动把密钥复制到权限收紧的临时副本（Windows `icacls` / Unix `0600`），绕过 OpenSSH「UNPROTECTED PRIVATE KEY FILE」拒绝，不修改用户原始密钥文件
 - **进阶能力** — 密钥文件登录（`ssh -i`）、连接分组管理：右键新增 / 重命名 / 解散分组（空分组可持久保存），拖拽连接到分组调整归属，编辑表单分组字段可下拉选择已有分组
-- **SSH MCP Server** — 把已保存的 SSH 连接作为 MCP 工具暴露给终端里运行的 AI agent（Claude Code / Codex）。项目右键菜单「关联 SSH」勾选连接即按项目启用，并把可见范围限定在所选连接；内置 `mt-ssh-mcp` sidecar（基于官方 rmcp 的 stdio MCP server）提供 `ssh_list_connections`、`ssh_exec`、`ssh_upload`、`ssh_download` 四个工具，`ssh_exec` 复用密码 / 私钥认证，带超时、输出封顶与审计日志；`ssh_upload` / `ssh_download` 走 SFTP 单文件传输（分块流式、内存恒定，可传大文件，摆脱 `ssh_exec` + base64 echo 受输出封顶限制的 workaround），下载直接落盘到本地路径，并有一条硬护栏拒绝传输 mini-term 自身的 `config.json`（内含全部 SSH 明文凭据）；启用 / 停用时按命名 marker 幂等写入 Claude `.mcp.json` 与 Codex `.codex/config.toml`。**自 v0.4.10 起 sidecar 维护进程内 SSH 会话池**（russh 0.61 + tokio），首次调用某连接做一次 TCP 握手 + 认证（~秒级），后续命令仅消耗 RTT；会话空闲 10 分钟或最长 2 小时自动回收，并在 sidecar 退出时优雅 `disconnect`
-- **SSH 远程项目** — 把远程服务器上的目录直接添加为项目管理：「添加远程项目」弹窗选择已保存的 SSH 连接并填写远程 POSIX 路径，保存前先远程验证目录存在；文件树经 SFTP 懒加载展开（展开行内 loading 反馈，支持手动刷新，根 `.gitignore` 过滤），终端 `ssh -t` 直连并自动落到项目目录，断线后覆盖层一键重连；Session 块按时间混排远程机器上的 Claude / Codex 会话并支持正文查看；引用的连接被删除时项目显示「断链」态而非静默失效；底层与 SSH MCP sidecar 共用抽出的 `mt-ssh` crate（russh 持久会话池 + SFTP 原语），远程缓存键掺入连接 id，防止两台服务器的同名路径互相串数据
+- **SSH 工具（CLI + Skill，供 AI agent）** — 让终端里运行的 AI agent（Claude Code / Codex）能操作已保存的 SSH 连接。项目右键菜单「关联 SSH」勾选连接即按项目启用，并把可见范围限定在所选连接；启用时生成 Claude / Codex 两份 SKILL.md（内嵌 CLI 绝对路径与 project-id，`.gitignore` 自动追加，存量项目的旧 MCP 注册自动摘除迁移），agent 经 Bash 直接调用内置 `mt-ssh-cli` sidecar：`list` / `exec` / `upload` / `download` 四个子命令，远程 stdout/stderr 原样流式透传、退出码透传（124 = 超时、2 = CLI 错误），SFTP 分块流式传输，密码 / 私钥认证全程在本机完成，每次调用落一行审计日志，并有一条硬护栏拒绝传输 mini-term 自身的 `config.json`（内含全部 SSH 明文凭据）。CLI 背后是全机单例 daemon 持久连接池（首调自动拉起、空闲 10 分钟 drain 自退、版本升级自动换代），同一连接的后续命令仅消耗一个 RTT；daemon 不可用时自动降级为进程内直连，WSL 里经 Windows interop 调用同样可用。过渡期 `mt-ssh-mcp` MCP sidecar 继续随包发布，服务尚未迁移的存量项目
+- **SSH 远程项目** — 把远程服务器上的目录直接添加为项目管理：「添加远程项目」弹窗选择已保存的 SSH 连接并填写远程 POSIX 路径，保存前先远程验证目录存在；文件树经 SFTP 懒加载展开（展开行内 loading 反馈，支持手动刷新，根 `.gitignore` 过滤），终端 `ssh -t` 直连并自动落到项目目录，断线后覆盖层一键重连；Session 块按时间混排远程机器上的 Claude / Codex 会话并支持正文查看；引用的连接被删除时项目显示「断链」态而非静默失效；底层与 SSH 工具 sidecar 共用抽出的 `mt-ssh` crate（russh 持久会话池 + SFTP 原语），远程缓存键掺入连接 id，防止两台服务器的同名路径互相串数据
 
 ### WSL 支持（Windows）
 
@@ -164,7 +164,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 | 文件监听 | notify 7 + ignore 0.4（.gitignore 过滤） |
 | Tauri 插件 | `window-state` · `clipboard-manager` · `dialog` · `opener` |
 | 移动端中转 | axum + tokio WebSocket 中转服务（`relay-server/`）· React + TS + Vite PWA（`mobile/`） |
-| 测试覆盖 | 419 个 Rust 测试 = 桌面端 381（tauri-app 277 + mt-core 38 + mt-ssh 26 + mt-sidecars 40）+ 中转服务端 38（协议与路由）；另有 19 个 Node 测试 |
+| 测试覆盖 | 466 个 Rust 测试 = 桌面端 428（tauri-app 280 + mt-core 38 + mt-ssh 26 + mt-sidecars 84）+ 中转服务端 38（协议与路由）；另有 19 个 Node 测试 |
 
 ## 快速开始
 
@@ -293,7 +293,8 @@ mini-term/
 │   │   ├── hook_registry.rs      # Hook 注册 / 卸载（Claude Code + Codex）
 │   │   ├── ssh.rs                # SSH 连接管理 + 密码自动填充 / 私钥处理
 │   │   ├── remote_ssh.rs         # SSH 远程项目（SFTP 列目录 / 目录验证 / 远程会话读取）
-│   │   ├── ssh_mcp_registry.rs   # 按项目启用 SSH MCP（写入 .mcp.json / Codex 配置）
+│   │   ├── ssh_skill_registry.rs # 按项目启用 SSH 工具（生成 Claude / Codex 两份 SKILL.md）
+│   │   ├── ssh_mcp_registry.rs   # 历史 MCP 注册的读侧清理（存量项目迁移兜底）
 │   │   ├── mobile_relay.rs       # 移动端中转（出站 WSS 长连 / 配对 / 会话快照 / 指令写穿 / 发起会话 / 改名）
 │   │   ├── mobile_mirror.rs      # 对话镜像（会话 JSONL 增量解析 + 分页取数）
 │   │   ├── window_theme.rs       # Windows 原生标题栏深色模式（DWM Immersive Dark Mode）
@@ -302,7 +303,8 @@ mini-term/
 │   ├── mt-ssh/                   # SSH 共享 crate（russh 持久会话池 + SFTP 原语，主程序与 sidecar 共用）
 │   └── mt-sidecars/src/bin/      # 独立 sidecar crate（不依赖 tauri-build）
 │       ├── miniterm-hook.rs      # Hook CLI 小工具（被 AI 工具 hook 调用）
-│       └── mt-ssh-mcp.rs         # SSH MCP server（rmcp stdio，供终端 AI agent 调用）
+│       ├── mt-ssh-cli.rs         # SSH CLI（终端 AI agent 经 Bash 调用；daemon 持久连接池）
+│       └── mt-ssh-mcp.rs         # SSH MCP server（rmcp stdio；过渡期遗留通道）
 ├── relay-server/                 # 自托管中转服务（独立 Rust workspace）
 │   ├── protocol/                 # 桌面端与中转共享的协议消息 crate（JSON over WebSocket）
 │   ├── server/                   # axum 中转服务（只转发不落盘 + PWA 静态托管）
@@ -330,7 +332,7 @@ ai-working → ai-idle → Toast + DONE Tag + requestUserAttention
 
 ### Tauri 接口一览
 
-- **Commands（69 个）** — PTY: `create_pty` · `write_pty` · `resize_pty` · `kill_pty`；FS: `list_directory` · `read_file_content` · `watch_directory` · `unwatch_directory` · `create_file` · `create_directory` · `rename_entry` · `delete_entry` · `filter_directories`；Search: `start_search` · `cancel_search`；Git: `get_git_status` · `get_git_diff` · `discover_git_repos` · `get_git_log` · `get_repo_branches` · `get_commit_files` · `get_commit_file_diff` · `git_pull` · `git_push` · `get_changes_status` · `git_stage` · `git_unstage` · `git_stage_all` · `git_unstage_all` · `git_commit` · `git_discard_file` · `list_worktrees` · `add_worktree` · `remove_worktree` · `prune_worktrees` · `get_worktree_branches`；Config: `load_config` · `save_config`；Editor: `open_in_editor` · `open_path_with_default_app`；Clipboard: `read_clipboard_image` · `save_clipboard_text`；AI: `get_ai_sessions` · `get_wsl_ai_sessions` · `get_ai_session_content`；WSL: `list_wsl_distros`；Hook: `register_ai_hooks` · `unregister_ai_hooks` · `get_hook_config_snippet` · `get_hook_status` · `toggle_hook_server`；SSH: `arm_ssh_autofill` · `prepare_ssh_key`；SSH MCP: `enable_ssh_mcp` · `disable_ssh_mcp`；SSH 远程: `ssh_remote_list_directory` · `ssh_remote_validate_dir` · `ssh_remote_ai_sessions` · `ssh_remote_ai_session_content` · `ssh_remote_upload_paste`；主题: `set_window_dark_mode`；移动端中转: `mobile_relay_apply` · `mobile_relay_status` · `mobile_relay_request_pairing_code` · `mobile_relay_reset_pairing` · `mobile_relay_update_sessions` · `mobile_relay_launchers_changed` · `mobile_relay_start_session_result` · `mobile_relay_check_launcher_command`
+- **Commands（69 个）** — PTY: `create_pty` · `write_pty` · `resize_pty` · `kill_pty`；FS: `list_directory` · `read_file_content` · `watch_directory` · `unwatch_directory` · `create_file` · `create_directory` · `rename_entry` · `delete_entry` · `filter_directories`；Search: `start_search` · `cancel_search`；Git: `get_git_status` · `get_git_diff` · `discover_git_repos` · `get_git_log` · `get_repo_branches` · `get_commit_files` · `get_commit_file_diff` · `git_pull` · `git_push` · `get_changes_status` · `git_stage` · `git_unstage` · `git_stage_all` · `git_unstage_all` · `git_commit` · `git_discard_file` · `list_worktrees` · `add_worktree` · `remove_worktree` · `prune_worktrees` · `get_worktree_branches`；Config: `load_config` · `save_config`；Editor: `open_in_editor` · `open_path_with_default_app`；Clipboard: `read_clipboard_image` · `save_clipboard_text`；AI: `get_ai_sessions` · `get_wsl_ai_sessions` · `get_ai_session_content`；WSL: `list_wsl_distros`；Hook: `register_ai_hooks` · `unregister_ai_hooks` · `get_hook_config_snippet` · `get_hook_status` · `toggle_hook_server`；SSH: `arm_ssh_autofill` · `prepare_ssh_key`；SSH 工具: `enable_ssh_tools` · `disable_ssh_tools`；SSH 远程: `ssh_remote_list_directory` · `ssh_remote_validate_dir` · `ssh_remote_ai_sessions` · `ssh_remote_ai_session_content` · `ssh_remote_upload_paste`；主题: `set_window_dark_mode`；移动端中转: `mobile_relay_apply` · `mobile_relay_status` · `mobile_relay_request_pairing_code` · `mobile_relay_reset_pairing` · `mobile_relay_update_sessions` · `mobile_relay_launchers_changed` · `mobile_relay_start_session_result` · `mobile_relay_check_launcher_command`
 - **Events（12 个，后端 → 前端）** — `pty-output` · `pty-exit` · `pty-status-change` · `ai-user-submit`（AI 会话内用户按 Enter，用于打标记）· `fs-change` · `search-results` · `search-complete` · `wsl-shell-override` · `mobile-relay-status` · `mobile-relay-pairing-code` · `mobile-start-session` · `mobile-rename-pane`
 
 ### 状态优先级

@@ -16,7 +16,7 @@ interface Props {
 
 /** 计算弹窗打开时的初始勾选集合。 */
 function initialChecked(project: ProjectConfig, allIds: string[]): Set<string> {
-  // 未启用 SSH MCP → 默认全选（保存即以全部范围启用）
+  // 未启用 SSH 工具 → 默认全选（保存即以全部范围启用）
   if (!project.sshMcpEnabled) return new Set(allIds);
   // 已启用且设过范围 → 取已存范围（过滤掉已删除连接的陈旧 id）
   if (project.sshConnectionIds) {
@@ -37,7 +37,7 @@ function sameScope(a: string[] | undefined, b: string[], allIds: string[]): bool
 /**
  * 「关联 SSH」弹窗：按项目设定 agent 可访问的 SSH 连接范围。
  *
- * 勾选 ≥1 个连接 = 为该项目启用 SSH MCP 并限定范围；全部取消 = 停用。
+ * 勾选 ≥1 个连接 = 为该项目启用 SSH 工具（CLI + Skill）并限定范围；全部取消 = 停用。
  * 范围始终存为显式 id 列表，新增连接不会被自动纳入已有项目。
  */
 export function SshAssocModal({ project, onClose }: Props) {
@@ -98,12 +98,12 @@ export function SshAssocModal({ project, onClose }: Props) {
 
     setBusy(true);
     try {
-      // 仅启用/停用的切换需要改写 .mcp.json 注册；纯范围变更靠持久化 config 即可，
-      // sidecar 每次工具调用都重新读 config.json。
+      // 仅启用/停用的切换需要改写 SKILL.md 注册；纯范围变更靠持久化 config 即可，
+      // CLI/daemon 每次调用都重新读 config.json，范围变更即时生效。
       if (nowEnabled && !wasEnabled) {
-        await invoke('enable_ssh_mcp', { projectDir: project.path, projectId: project.id });
+        await invoke('enable_ssh_tools', { projectDir: project.path, projectId: project.id });
       } else if (!nowEnabled && wasEnabled) {
-        await invoke('disable_ssh_mcp', { projectDir: project.path });
+        await invoke('disable_ssh_tools', { projectDir: project.path });
       }
 
       const cfg = useAppStore.getState().config;
