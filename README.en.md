@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.8.5-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.9.0-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -73,13 +73,15 @@ The security boundaries were designed on purpose: pairing codes are single-use a
 
 ### 🧰 Turn your SSH connections into tools your AI can call
 
-Saved SSH connections can be exposed as **MCP tools** to the Claude Code / Codex agents running in your terminal. Right-click a project → "Link SSH", tick the connections, and it's enabled for that project — with **visibility scoped to exactly the ones you ticked**.
+Saved SSH connections can be handed to the Claude Code / Codex agents running in your terminal. Right-click a project → "Link SSH", tick the connections, and it's enabled for that project — with **visibility scoped to exactly the ones you ticked**.
 
-The built-in `mt-ssh-mcp` sidecar (a stdio MCP server based on the official rmcp) provides four tools: `ssh_list_connections`, `ssh_exec`, `ssh_upload`, `ssh_download`. `ssh_exec` reuses your saved password / private-key auth, with timeouts, output capping, and an audit log. Uploads and downloads go over **SFTP in streamed chunks** — constant memory, large files work, no more base64-echoing through `ssh_exec` against an output cap.
+**As of v0.9.0 these tools moved from MCP to a CLI + Skill**: enabling generates a `SKILL.md` for Claude and one for Codex (each embedding the CLI's absolute path and a random per-project capability token, appending to `.gitignore` idempotently, and stripping the old MCP registration from existing projects). The payoff: the agent loads the skill only when it needs it, so no tool schema sits in the context window permanently — and since it's a plain command line, it composes with `grep`, pipes, and redirection.
 
-The sidecar keeps an **in-process SSH session pool** (russh + tokio): the first call to a connection does one handshake + auth (seconds), and every command after that costs just one RTT. There's also a hard guard that refuses to ever transfer mini-term's own `config.json` (which holds every SSH credential in plaintext).
+The built-in `mt-ssh-cli` sidecar provides four subcommands — `list`, `exec`, `upload`, `download`. Remote stdout / stderr and exit codes are **streamed through verbatim** (`124` for timeout, `2` for a CLI error), transfers go over **SFTP in streamed chunks** (constant memory, large files work), credentials never leave your machine, and every call is written to an audit log. **Every command must carry the project token** — missing, unknown, duplicated, or belonging to a disabled project all fail closed, never falling back to "sees every connection".
 
-Enabling / disabling writes **idempotently** into Claude's `.mcp.json` and Codex's `.codex/config.toml` using named markers, so your hand-written config stays intact.
+Behind the CLI is a **machine-wide singleton daemon** holding the persistent connection pool: the first call spawns it and does one handshake + auth (seconds), and every command after that costs just one RTT; it drains and exits after 10 idle minutes, and a version bump hands over to a new generation automatically. `Ctrl+C`, a client disconnect, or a timeout explicitly closes that SSH channel while healthy sessions stay pooled. The IPC endpoint is reachable only by the current user and fails closed if it can't be secured; if the daemon is unavailable the CLI falls back to an in-process direct connection with an identical output and exit-code contract. There's also a hard guard that refuses to ever transfer mini-term's own `config.json` (which holds every SSH credential in plaintext).
+
+> The `mt-ssh-mcp` MCP sidecar still ships during the transition and is scheduled for removal next cycle.
 
 ### 🌐 Remote directories as local projects — and WSL too
 
@@ -134,7 +136,7 @@ A VS Code-style **Changes panel** (Staged / Changes / Untracked groups, per-file
 | State / layout | Zustand single store · Allotment + recursive SplitNode tree |
 | PTY / Git | portable-pty · git2 · notify + ignore |
 | Mobile relay | axum + tokio WebSocket (`relay-server/`) · React + Vite PWA (`mobile/`) |
-| Tests | **491 Rust tests** (438 desktop + 53 relay) plus 19 Node tests |
+| Tests | **503 Rust tests** (450 desktop + 53 relay) plus 19 Node tests |
 
 ---
 
