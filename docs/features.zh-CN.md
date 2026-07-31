@@ -164,7 +164,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 | 文件监听 | notify 7 + ignore 0.4（.gitignore 过滤） |
 | Tauri 插件 | `window-state` · `clipboard-manager` · `dialog` · `opener` |
 | 移动端中转 | axum + tokio WebSocket 中转服务（`relay-server/`）· React + TS + Vite PWA（`mobile/`） |
-| 测试覆盖 | 466 个 Rust 测试 = 桌面端 428（tauri-app 280 + mt-core 38 + mt-ssh 26 + mt-sidecars 84）+ 中转服务端 38（协议与路由）；另有 19 个 Node 测试 |
+| 测试覆盖 | 468 个 Rust 测试 = 桌面端 430（tauri-app 281 + mt-core 38 + mt-ssh 26 + mt-sidecars 85）+ 中转服务端 38（协议与路由）；另有 19 个 Node 测试 |
 
 ## 快速开始
 

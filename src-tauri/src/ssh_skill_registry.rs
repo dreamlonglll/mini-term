@@ -68,9 +68,12 @@ fn render_skill_md(binary_path: &str, project_id: &str, with_allowed_tools: bool
     // Windows 版 Claude Code 的 shell 工具可能是 Bash 或 PowerShell,两个都列
     // (实测两条并列不影响 skill 加载;带 `&` 的 PowerShell 调用符写法会导致
     // skill 加载失败,不要加)。未命中白名单时交互式会话一次手动批准兜底。
+    // 整行是 YAML 单引号标量:路径若含撇号(如 C:\Users\O'Brien\...)需按 YAML
+    // 规则双写转义,否则 frontmatter 断裂、skill 静默加载失败。
     let allowed_tools_line = if with_allowed_tools {
+        let yaml_safe = binary_path.replace('\'', "''");
         format!(
-            "allowed-tools: 'Bash(\"{binary_path}\" *), PowerShell(\"{binary_path}\" *)'\n"
+            "allowed-tools: 'Bash(\"{yaml_safe}\" *), PowerShell(\"{yaml_safe}\" *)'\n"
         )
     } else {
         String::new()
@@ -346,6 +349,16 @@ mod tests {
             assert!(md.starts_with("---\nname: mini-term-ssh\n"));
             assert!(md.contains("description: Run commands or transfer files"));
         }
+    }
+
+    #[test]
+    fn skill_md_escapes_apostrophe_in_path_for_yaml() {
+        // 撇号路径(如 O'Brien 用户名)在 YAML 单引号标量里必须双写,
+        // 否则 frontmatter 断裂导致 skill 加载失败。
+        let md = render_skill_md(r"C:\Users\O'Brien\mt-ssh-cli.exe", "p", true);
+        assert!(md.contains(r#"Bash("C:\Users\O''Brien\mt-ssh-cli.exe" *)"#), "got:\n{md}");
+        // 正文(单引号标量之外)保留原始撇号
+        assert!(md.contains(r#"    "C:\Users\O'Brien\mt-ssh-cli.exe""#));
     }
 
     #[test]

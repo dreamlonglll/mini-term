@@ -394,6 +394,12 @@ fn spawn_daemon_detached() -> Result<(), String> {
         .map_err(|e| format!("failed to spawn daemon: {e}"))
 }
 
+/// 版本握手判定:hello 报告的 daemon 版本与自身不一致即需要换代。
+/// 精确相等比较 —— 同一发布内两个二进制必然同版本,任何差异都视为「旧 daemon 残留」。
+fn daemon_version_mismatch(hello_version: &str, own_version: &str) -> bool {
+    hello_version != own_version
+}
+
 /// 建立一条通过版本握手的 daemon 会话(hello 已消费)。
 ///
 /// 版本不符(app 升级后旧 daemon 残留)→ 发 shutdown 踢掉旧 daemon → 等端点
@@ -414,7 +420,7 @@ async fn open_daemon_session(ep: &str) -> Result<(DaemonReader, DaemonWriter), S
             ServerFrame::Hello { version, .. } => version,
             other => return Err(format!("unexpected first frame from daemon: {other:?}")),
         };
-        if version == own_version {
+        if !daemon_version_mismatch(&version, own_version) {
             return Ok((reader, writer));
         }
 
@@ -503,12 +509,8 @@ async fn run_via_daemon(plan: &Plan) -> Result<i32, String> {
                         };
                         finish_exec(&outcome, plan.req.timeout_secs)
                     }
-                    Some(Op::Upload) | Some(Op::Download) => {
-                        let direction = if plan.req.op == Some(Op::Upload) {
-                            TransferDirection::Upload
-                        } else {
-                            TransferDirection::Download
-                        };
+                    Some(op @ (Op::Upload | Op::Download)) => {
+                        let direction = op.transfer_direction().expect("transfer op");
                         match bytes {
                             Some(n) => {
                                 print_transfer_summary(
@@ -581,12 +583,8 @@ async fn run_one_shot(plan: &Plan) -> i32 {
             })
             .await
         }
-        Some(Op::Upload) | Some(Op::Download) => {
-            let direction = if plan.req.op == Some(Op::Upload) {
-                TransferDirection::Upload
-            } else {
-                TransferDirection::Download
-            };
+        Some(op @ (Op::Upload | Op::Download)) => {
+            let direction = op.transfer_direction().expect("transfer op");
             let (Some(connection), Some(local), Some(remote)) = (
                 plan.req.connection.clone(),
                 plan.req.local_path.clone(),
@@ -662,15 +660,20 @@ async fn run_daemon_foreground(idle_secs: Option<u64>) -> i32 {
             eprintln!("[mt-ssh-cli daemon] shutdown requested, exiting");
             0
         }
-        Err(e) => {
+        Err(daemon::ServeError::AlreadyRunning(e)) => {
             // 端点被占 = 另一个 daemon 赢了 —— 静默让位(并发竞态收敛)。
             eprintln!("[mt-ssh-cli daemon] not starting: {e}");
             0
         }
+        // 绑定成功后的运行期故障:必须按错误暴露,不能伪装成「让位」。
+        Err(daemon::ServeError::Runtime(e)) => fail(&format!("daemon failed: {e}")),
     }
 }
 
 /// `daemon-status`:打印版本 / pid / 池内 session 数;daemon 不在时友好提示。
+///
+/// 退出码语义对齐 `systemctl is-active` 一类状态探测命令:0 = 在跑、1 = 不在跑,
+/// 便于脚本判断;「exit 2 = CLI 错误」的契约只约束业务子命令(本命令不进 SKILL.md)。
 async fn run_daemon_status() -> i32 {
     let ep = endpoint();
     let Ok(stream) = ipc::connect(&ep).await else {
@@ -913,6 +916,16 @@ mod tests {
             Cli::try_parse_from(["mt-ssh-cli", "daemon-stop"]).unwrap().command,
             Command::DaemonStop
         ));
+    }
+
+    // --- 版本握手比对 ---
+
+    #[test]
+    fn daemon_version_mismatch_is_exact_equality() {
+        assert!(!daemon_version_mismatch("0.4.8", "0.4.8"));
+        assert!(daemon_version_mismatch("0.4.8", "0.4.9"));
+        // 任何差异都算旧 daemon(不做语义化版本比较)
+        assert!(daemon_version_mismatch("0.4.8-rc1", "0.4.8"));
     }
 
     // --- exec_exit_code: 退出码矩阵 ---

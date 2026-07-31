@@ -256,10 +256,11 @@ fn utc_timestamp() -> String {
     )
 }
 
-/// 把一行审计日志追加到 `{config.json 所在目录}/ssh-mcp-audit.log`。
+/// 把一行(已格式化的)审计日志追加到 `{config.json 所在目录}/ssh-mcp-audit.log`。
 ///
-/// 写日志失败绝不影响工具结果 —— 只往 stderr 记一笔。
-fn append_audit_log(conn_name: &str, command: &str, exit: Option<i32>) {
+/// exec 与 transfer 两类审计共用的落盘尾段;写日志失败绝不影响工具结果 ——
+/// 只往 stderr 记一笔。
+fn append_audit_line(line: &str) {
     let Some(cfg_path) = mt_core::config_json_path() else {
         eprintln!("[mt-ssh-svc] audit: cannot locate config.json dir, skipping audit log");
         return;
@@ -269,7 +270,6 @@ fn append_audit_log(conn_name: &str, command: &str, exit: Option<i32>) {
         return;
     };
     let log_path = dir.join(AUDIT_LOG_FILE);
-    let line = format_audit_line(&utc_timestamp(), conn_name, command, exit);
     let write_result = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -278,6 +278,11 @@ fn append_audit_log(conn_name: &str, command: &str, exit: Option<i32>) {
     if let Err(e) = write_result {
         eprintln!("[mt-ssh-svc] audit: failed to write {AUDIT_LOG_FILE}: {e}");
     }
+}
+
+/// exec 审计:格式化一行并落盘。
+fn append_audit_log(conn_name: &str, command: &str, exit: Option<i32>) {
+    append_audit_line(&format_audit_line(&utc_timestamp(), conn_name, command, exit));
 }
 
 /// 格式化一行传输审计日志。抽出便于单测。
@@ -306,9 +311,7 @@ fn format_transfer_audit_line(
     )
 }
 
-/// 把一行传输审计日志追加到 `{config.json 所在目录}/ssh-mcp-audit.log`。
-///
-/// 写日志失败绝不影响工具结果 —— 只往 stderr 记一笔。`result = Some(bytes)` 成功、`None` 失败。
+/// 传输审计:格式化一行并落盘。`result = Some(bytes)` 成功、`None` 失败。
 fn append_transfer_audit_log(
     direction: TransferDirection,
     conn_name: &str,
@@ -316,31 +319,14 @@ fn append_transfer_audit_log(
     remote_path: &str,
     result: Option<u64>,
 ) {
-    let Some(cfg_path) = mt_core::config_json_path() else {
-        eprintln!("[mt-ssh-svc] audit: cannot locate config.json dir, skipping audit log");
-        return;
-    };
-    let Some(dir) = cfg_path.parent() else {
-        eprintln!("[mt-ssh-svc] audit: config.json has no parent dir, skipping audit log");
-        return;
-    };
-    let log_path = dir.join(AUDIT_LOG_FILE);
-    let line = format_transfer_audit_line(
+    append_audit_line(&format_transfer_audit_line(
         &utc_timestamp(),
         direction,
         conn_name,
         local_path,
         remote_path,
         result,
-    );
-    let write_result = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .and_then(|mut f| f.write_all(line.as_bytes()));
-    if let Err(e) = write_result {
-        eprintln!("[mt-ssh-svc] audit: failed to write {AUDIT_LOG_FILE}: {e}");
-    }
+    ));
 }
 
 // ---------------------------------------------------------------------------

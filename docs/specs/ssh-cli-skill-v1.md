@@ -81,7 +81,7 @@ mt-ssh-cli daemon-stop      # 请求 daemon 优雅退出（drain 池后退出）
 
 #### IPC 传输与协议
 
-- Windows：named pipe `\\.\pipe\mini-term.ssh-cli.<用户 SID 哈希>`，pipe security descriptor 限**仅当前用户**可连；
+- Windows：named pipe `\\.\pipe\mini-term.ssh-cli.<用户 SID（清洗后原文，非哈希——哈希在 Rust 版本间不保证稳定，会让升级前后的 CLI/daemon 算出不同 pipe 名、版本握手失效）>`，pipe security descriptor 限**仅当前用户**可连；
 - macOS/Linux：Unix domain socket（`$XDG_RUNTIME_DIR` 优先，回退 config.json 同目录），权限 0600；
 - WSL 关键路径：CLI 在 WSL 里经 interop 执行时**仍是 Windows 进程**，连的是 Windows 侧 named pipe——daemon、池、config.json 全在 Windows 侧，天然一致；
 - 协议：newline-delimited JSON 帧（serde camelCase，`v` 字段版本号）。
@@ -94,7 +94,7 @@ mt-ssh-cli daemon-stop      # 请求 daemon 优雅退出（drain 池后退出）
 
 #### 生命周期
 
-- **自拉起**：CLI 连 pipe 失败 → spawn 自身 `--daemon`（detached：Windows `DETACHED_PROCESS`+`CREATE_NO_WINDOW`，Unix 双 fork/setsid）→ 带退避重试连接（总窗口 ~3s）；
+- **自拉起**：CLI 连 pipe 失败 → spawn 自身 `daemon` 子命令（detached：Windows `DETACHED_PROCESS`+`CREATE_NEW_PROCESS_GROUP`，Unix `process_group(0)` + stdio 全空——与双 fork/setsid 等效且免 unsafe）→ 带退避重试连接（总窗口 ~3s）；
 - **并发竞态**：多个 CLI 同时拉 daemon → pipe/socket 绑定天然互斥，抢输的 daemon 实例静默退出，CLI 重试连接即收敛；
 - **空闲自退**：无活跃请求且 10 分钟无新连接 → drain 池（逐 session disconnect ByApplication，复用 `pool.shutdown()`）→ 退出。孤儿 daemon 最多存活一个空闲周期；
 - **版本握手**：CLI 比对 hello 帧 version 与自身不符（app 升级后旧 daemon 还在跑）→ 发 `shutdown` op → 等旧 daemon 退出 → 拉起新版。dev 迭代同理受益：`daemon-stop` 可手动踢掉占着二进制文件锁的旧 daemon（Windows 下运行中的 exe 无法被 stage-sidecars 覆盖，现有「跳过被占用文件」的容忍逻辑继续兜底）；
@@ -260,4 +260,5 @@ Do NOT base64-echo file contents through exec — use upload/download.
 1. Windows + Claude Code 交互式：UI「关联 SSH」启用 → skill 自动触发 → `allowed-tools` 是否免审批（开放问题 #3 交互式部分）；
 2. Windows + Codex：沙箱是否拦网络/拦 pipe（开放问题 #2）；
 3. WSL + Claude Code：interop 路径执行、连 Windows 侧 daemon、退出码透传；
-4. 存量 MCP 项目在 UI 里重新保存关联 → 迁移清理生效（单测已覆盖文件级行为，差 UI 全流程一遍）。
+4. 存量 MCP 项目在 UI 里重新保存关联 → 迁移清理生效（单测已覆盖文件级行为，差 UI 全流程一遍）；
+5. IPC 端点跨用户连接被拒（Windows ACL / Unix 0600 —— 代码已实现，需第二个系统用户实测）。

@@ -42,6 +42,24 @@ pub enum ServeOutcome {
     Shutdown,
 }
 
+/// serve 的失败分类:并发竞态的「让位」与运行期故障必须区分 ——
+/// 前者是正常收敛(静默退出 0),后者是要暴露的错误。
+#[derive(Debug)]
+pub enum ServeError {
+    /// 端点已被别的 daemon 持有(绑定失败),本实例应静默让位。
+    AlreadyRunning(String),
+    /// 绑定成功后的运行期故障(accept / 实例补建失败等)。
+    Runtime(String),
+}
+
+impl ServeError {
+    pub fn message(&self) -> &str {
+        match self {
+            ServeError::AlreadyRunning(m) | ServeError::Runtime(m) => m,
+        }
+    }
+}
+
 /// daemon 运行期共享状态。
 struct DaemonState {
     pool: Arc<SshPool>,
@@ -92,9 +110,9 @@ impl Drop for ActiveGuard {
 
 /// 绑定端点并服务直至空闲/收到 shutdown。返回前已 drain 池。
 ///
-/// 绑定失败(端点已被别的 daemon 持有)→ `Err`,caller 应静默退出 ——
-/// 并发自拉起的竞态由端点绑定互斥收敛。
-pub async fn serve(endpoint: &str, idle_exit: Duration) -> Result<ServeOutcome, String> {
+/// `Err(AlreadyRunning)` = 端点已被别的 daemon 持有,caller 应静默退出 ——
+/// 并发自拉起的竞态由端点绑定互斥收敛;`Err(Runtime)` = 绑定后的运行期故障。
+pub async fn serve(endpoint: &str, idle_exit: Duration) -> Result<ServeOutcome, ServeError> {
     let state = Arc::new(DaemonState {
         pool: Arc::new(SshPool::new()),
         active: AtomicUsize::new(0),
@@ -122,10 +140,11 @@ async fn serve_until_exit(
     endpoint: &str,
     idle_exit: Duration,
     state: &Arc<DaemonState>,
-) -> Result<ServeOutcome, String> {
+) -> Result<ServeOutcome, ServeError> {
     use tokio::net::windows::named_pipe::ServerOptions;
 
-    let security = ipc::windows_security::PipeSecurity::current_user_only()?;
+    let security = ipc::windows_security::PipeSecurity::current_user_only()
+        .map_err(ServeError::Runtime)?;
 
     // 首实例带 first_pipe_instance:同名 pipe 已被持有(另一个 daemon 赢了)
     // 会直接失败 —— 这是并发自拉起竞态的收敛点。
@@ -135,7 +154,7 @@ async fn serve_until_exit(
             .first_pipe_instance(true)
             .create_with_security_attributes_raw(endpoint, security.attributes_ptr())
     }
-    .map_err(|e| format!("endpoint already held or unavailable: {e}"))?;
+    .map_err(|e| ServeError::AlreadyRunning(format!("endpoint already held or unavailable: {e}")))?;
 
     let mut idle_tick = tokio::time::interval(idle_check_tick(idle_exit));
     idle_tick.tick().await; // 首个 tick 立即返回,跳过
@@ -143,14 +162,14 @@ async fn serve_until_exit(
     loop {
         tokio::select! {
             connected = server.connect() => {
-                connected.map_err(|e| format!("pipe accept failed: {e}"))?;
+                connected.map_err(|e| ServeError::Runtime(format!("pipe accept failed: {e}")))?;
                 // 先补一个新实例再处理当前连接,保证任何时刻都有实例在监听。
                 // SAFETY: 同上。
                 let next = unsafe {
                     ServerOptions::new()
                         .create_with_security_attributes_raw(endpoint, security.attributes_ptr())
                 }
-                .map_err(|e| format!("pipe re-create failed: {e}"))?;
+                .map_err(|e| ServeError::Runtime(format!("pipe re-create failed: {e}")))?;
                 let client = std::mem::replace(&mut server, next);
                 let st = state.clone();
                 tokio::spawn(async move { handle_connection(client, st).await });
@@ -172,19 +191,21 @@ async fn serve_until_exit(
     endpoint: &str,
     idle_exit: Duration,
     state: &Arc<DaemonState>,
-) -> Result<ServeOutcome, String> {
+) -> Result<ServeOutcome, ServeError> {
     use tokio::net::{UnixListener, UnixStream};
 
     let path = std::path::Path::new(endpoint);
     // 端点文件已存在:能连上 → 另一个 daemon 在跑,让位;连不上 → 陈旧残留,清掉。
     if path.exists() {
         if UnixStream::connect(path).await.is_ok() {
-            return Err("endpoint already held by a live daemon".into());
+            return Err(ServeError::AlreadyRunning(
+                "endpoint already held by a live daemon".into(),
+            ));
         }
         let _ = std::fs::remove_file(path);
     }
-    let listener =
-        UnixListener::bind(path).map_err(|e| format!("endpoint bind failed: {e}"))?;
+    let listener = UnixListener::bind(path)
+        .map_err(|e| ServeError::AlreadyRunning(format!("endpoint bind failed: {e}")))?;
     // 权限 0600:仅当前用户可连。
     {
         use std::os::unix::fs::PermissionsExt;
@@ -197,7 +218,8 @@ async fn serve_until_exit(
     let outcome = loop {
         tokio::select! {
             accepted = listener.accept() => {
-                let (stream, _) = accepted.map_err(|e| format!("socket accept failed: {e}"))?;
+                let (stream, _) = accepted
+                    .map_err(|e| ServeError::Runtime(format!("socket accept failed: {e}")))?;
                 let st = state.clone();
                 tokio::spawn(async move { handle_connection(stream, st).await });
             }
@@ -277,56 +299,23 @@ where
     match op {
         Op::List => {
             let views = ssh_service::list_connections(req.project_id.as_deref());
-            let _ = write_frame(
-                &mut writer,
-                &ServerFrame::Result {
-                    exit_code: None,
-                    timed_out: None,
-                    bytes: None,
-                    connections: Some(views),
-                    sessions: None,
-                },
-            )
-            .await;
+            let _ = write_frame(&mut writer, &ServerFrame::result_connections(views)).await;
         }
         Op::Status => {
             let sessions = state.pool.len().await;
-            let _ = write_frame(
-                &mut writer,
-                &ServerFrame::Result {
-                    exit_code: None,
-                    timed_out: None,
-                    bytes: None,
-                    connections: None,
-                    sessions: Some(sessions),
-                },
-            )
-            .await;
+            let _ = write_frame(&mut writer, &ServerFrame::result_sessions(sessions)).await;
         }
         Op::Shutdown => {
             // 先 ack 再触发退出:CLI 拿得到确认,drain 由 serve 统一做。
-            let _ = write_frame(
-                &mut writer,
-                &ServerFrame::Result {
-                    exit_code: None,
-                    timed_out: None,
-                    bytes: None,
-                    connections: None,
-                    sessions: None,
-                },
-            )
-            .await;
+            let _ = write_frame(&mut writer, &ServerFrame::result_empty()).await;
             state.shutdown.notify_one();
         }
         Op::Exec => {
-            handle_exec(&mut writer, req, &state).await;
+            handle_exec(&mut reader, &mut writer, req, &state).await;
         }
         Op::Upload | Op::Download => {
-            let direction = if op == Op::Upload {
-                TransferDirection::Upload
-            } else {
-                TransferDirection::Download
-            };
+            // transfer_direction 对这两个 op 必有值
+            let direction = op.transfer_direction().expect("transfer op");
             handle_transfer(&mut writer, req, direction, &state).await;
         }
     }
@@ -334,10 +323,13 @@ where
 
 /// exec:service 编排的输出经 mpsc 转成 stdout/stderr 帧实时写回。
 ///
-/// 写帧失败(CLI 断开)→ 丢弃 exec future:russh channel 随 drop 关闭,
-/// session 留池;请求级超时在 service 层强制,不依赖 CLI 存活。
-async fn handle_exec<W>(writer: &mut W, req: Request, state: &Arc<DaemonState>)
+/// CLI 断开的两路感知(spec §2「daemon 检测到连接断开即关闭对应 exec channel」):
+/// 写帧失败(有输出时),或读端到 EOF(无输出的长命令也能立即感知)——
+/// 任一触发即丢弃 exec future:russh channel 随 drop 关闭,session 留池;
+/// 请求级超时在 service 层强制,不依赖 CLI 存活。
+async fn handle_exec<R, W>(reader: &mut R, writer: &mut W, req: Request, state: &Arc<DaemonState>)
 where
+    R: tokio::io::AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let (connection, command) = match (req.connection.as_deref(), req.command.as_deref()) {
@@ -377,6 +369,9 @@ where
     );
     tokio::pin!(exec_fut);
 
+    // 断连探测缓冲:协议里 CLI 发完请求行就不再说话,这里读到 EOF/错误即断连;
+    // 读到额外行属协议外噪声,忽略续读。
+    let mut probe = String::new();
     let result = loop {
         tokio::select! {
             res = &mut exec_fut => break res,
@@ -386,6 +381,15 @@ where
                     // CLI 断开:丢弃 exec future(russh channel 关闭),session 留池。
                     eprintln!("[mt-ssh-cli daemon] client disconnected mid-exec, closing channel");
                     return;
+                }
+            }
+            read = reader.read_line(&mut probe) => {
+                match read {
+                    Ok(0) | Err(_) => {
+                        eprintln!("[mt-ssh-cli daemon] client disconnected mid-exec, closing channel");
+                        return;
+                    }
+                    Ok(_) => probe.clear(),
                 }
             }
         }
@@ -398,13 +402,7 @@ where
         }
     }
     let terminal = match result {
-        Ok(outcome) => ServerFrame::Result {
-            exit_code: outcome.exit_code,
-            timed_out: Some(outcome.timed_out),
-            bytes: None,
-            connections: None,
-            sessions: None,
-        },
+        Ok(outcome) => ServerFrame::result_exec(outcome.exit_code, outcome.timed_out),
         Err(e) => ServerFrame::Error {
             message: e.message().to_string(),
         },
@@ -450,13 +448,7 @@ async fn handle_transfer<W>(
     )
     .await
     {
-        Ok(bytes) => ServerFrame::Result {
-            exit_code: None,
-            timed_out: None,
-            bytes: Some(bytes),
-            connections: None,
-            sessions: None,
-        },
+        Ok(bytes) => ServerFrame::result_bytes(bytes),
         Err(e) => ServerFrame::Error {
             message: e.message().to_string(),
         },
@@ -540,7 +532,7 @@ mod tests {
     async fn spawn_daemon(
         endpoint: String,
         idle_exit: Duration,
-    ) -> tokio::task::JoinHandle<Result<ServeOutcome, String>> {
+    ) -> tokio::task::JoinHandle<Result<ServeOutcome, ServeError>> {
         let handle = tokio::spawn(async move { serve(&endpoint, idle_exit).await });
         tokio::time::sleep(Duration::from_millis(100)).await;
         handle

@@ -32,6 +32,17 @@ pub enum Op {
     Shutdown,
 }
 
+impl Op {
+    /// 传输类 op 对应的方向;非传输 op 返回 None。收敛散落的 if 级联。
+    pub fn transfer_direction(self) -> Option<crate::ssh_service::TransferDirection> {
+        match self {
+            Op::Upload => Some(crate::ssh_service::TransferDirection::Upload),
+            Op::Download => Some(crate::ssh_service::TransferDirection::Download),
+            _ => None,
+        }
+    }
+}
+
 /// CLI → daemon 的请求帧(单行 JSON)。
 ///
 /// 字段按 op 选用:list 只用 `project_id`;exec 用 `connection`/`command`/
@@ -89,6 +100,63 @@ pub enum ServerFrame {
     },
     /// 失败终帧。message 绝不含密码(service 层同一纪律)。
     Error { message: String },
+}
+
+impl ServerFrame {
+    /// 全空的 result 终帧(shutdown ack 等无业务字段场景)。
+    pub fn result_empty() -> Self {
+        ServerFrame::Result {
+            exit_code: None,
+            timed_out: None,
+            bytes: None,
+            connections: None,
+            sessions: None,
+        }
+    }
+
+    /// exec 的 result 终帧。
+    pub fn result_exec(exit_code: Option<i32>, timed_out: bool) -> Self {
+        ServerFrame::Result {
+            exit_code,
+            timed_out: Some(timed_out),
+            bytes: None,
+            connections: None,
+            sessions: None,
+        }
+    }
+
+    /// upload/download 的 result 终帧。
+    pub fn result_bytes(bytes: u64) -> Self {
+        ServerFrame::Result {
+            exit_code: None,
+            timed_out: None,
+            bytes: Some(bytes),
+            connections: None,
+            sessions: None,
+        }
+    }
+
+    /// list 的 result 终帧。
+    pub fn result_connections(connections: Vec<SshConnectionView>) -> Self {
+        ServerFrame::Result {
+            exit_code: None,
+            timed_out: None,
+            bytes: None,
+            connections: Some(connections),
+            sessions: None,
+        }
+    }
+
+    /// status 的 result 终帧。
+    pub fn result_sessions(sessions: usize) -> Self {
+        ServerFrame::Result {
+            exit_code: None,
+            timed_out: None,
+            bytes: None,
+            connections: None,
+            sessions: Some(sessions),
+        }
+    }
 }
 
 /// 把一帧编码成单行 JSON(含结尾换行)。

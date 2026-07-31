@@ -164,7 +164,7 @@ Watch the AI running on your desktop from your phone while you're out, and send 
 | File watching | notify 7 + ignore 0.4 (.gitignore filtering) |
 | Tauri plugins | `window-state` · `clipboard-manager` · `dialog` · `opener` |
 | Mobile relay | axum + tokio WebSocket relay service (`relay-server/`) · React + TS + Vite PWA (`mobile/`) |
-| Test coverage | 466 Rust tests = 428 desktop (tauri-app 280 + mt-core 38 + mt-ssh 26 + mt-sidecars 84) + 38 relay-server (protocol & routing); plus 19 Node tests |
+| Test coverage | 468 Rust tests = 430 desktop (tauri-app 281 + mt-core 38 + mt-ssh 26 + mt-sidecars 85) + 38 relay-server (protocol & routing); plus 19 Node tests |
 
 ## Getting Started
 
