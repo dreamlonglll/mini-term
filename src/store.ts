@@ -9,6 +9,7 @@ import type {
   SplitNode,
   PaneState,
   PaneStatus,
+  AiSessionRef,
   SavedSplitNode,
   SavedProjectLayout,
   AiCompletionNotification,
@@ -54,13 +55,19 @@ export function getHighestStatus(node: SplitNode): PaneStatus {
   }, 'idle');
 }
 
-// 在 SplitNode 中更新指定 pane 的状态
+// 在 SplitNode 中更新指定 pane 的状态。
+// 回到 idle/error = AI 会话不复存在,连带清掉待续接的会话身份,
+// 避免用户主动退出 claude 后下次启动又被 resume 回来。
 function updatePaneStatus(node: SplitNode, ptyId: number, status: PaneStatus): SplitNode {
   if (node.type === 'leaf') {
     const idx = node.panes.findIndex((p) => p.ptyId === ptyId);
     if (idx >= 0) {
       const newPanes = [...node.panes];
-      newPanes[idx] = { ...newPanes[idx], status };
+      newPanes[idx] = {
+        ...newPanes[idx],
+        status,
+        ...(status === 'idle' || status === 'error' ? { aiSession: undefined } : {}),
+      };
       return { ...node, panes: newPanes };
     }
     return node;
@@ -68,6 +75,23 @@ function updatePaneStatus(node: SplitNode, ptyId: number, status: PaneStatus): S
   return {
     ...node,
     children: node.children.map((c) => updatePaneStatus(c, ptyId, status)),
+  };
+}
+
+// 在 SplitNode 中按 ptyId 打补丁更新 pane 字段
+function patchPaneByPty(node: SplitNode, ptyId: number, patch: Partial<PaneState>): SplitNode {
+  if (node.type === 'leaf') {
+    const idx = node.panes.findIndex((p) => p.ptyId === ptyId);
+    if (idx >= 0) {
+      const newPanes = [...node.panes];
+      newPanes[idx] = { ...newPanes[idx], ...patch };
+      return { ...node, panes: newPanes };
+    }
+    return node;
+  }
+  return {
+    ...node,
+    children: node.children.map((c) => patchPaneByPty(c, ptyId, patch)),
   };
 }
 
@@ -104,6 +128,23 @@ export function findPaneContextByPty(
     if (pane) return { projectId, pane };
   }
   return null;
+}
+
+/** 写入/清除 pane 的 AI 会话身份(hook 上报 / resume 后清除);返回归属项目 id。 */
+export function setPaneAiSessionByPty(
+  ptyId: number,
+  aiSession: AiSessionRef | undefined,
+): string | null {
+  const ctx = findPaneContextByPty(ptyId);
+  if (!ctx) return null;
+  useAppStore.setState((state) => {
+    const ps = state.projectStates.get(ctx.projectId);
+    if (!ps?.layout) return state;
+    const newStates = new Map(state.projectStates);
+    newStates.set(ctx.projectId, { ...ps, layout: patchPaneByPty(ps.layout, ptyId, { aiSession }) });
+    return { projectStates: newStates };
+  });
+  return ctx.projectId;
 }
 
 function updatePaneById(
@@ -152,7 +193,7 @@ function updateProjectPane(
 // 序列化 SplitNode 树（剥离运行时数据）
 function serializeSplitNode(node: SplitNode): SavedSplitNode {
   if (node.type === 'leaf') {
-    return { type: 'leaf', panes: node.panes.map((p) => ({ shellName: p.shellName, cwd: p.cwd })) };
+    return { type: 'leaf', panes: node.panes.map((p) => ({ shellName: p.shellName, cwd: p.cwd, aiSession: p.aiSession })) };
   }
   return {
     type: 'split',

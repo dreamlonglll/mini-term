@@ -192,6 +192,20 @@ pub struct SavedPane {
     /// 工作目录覆盖(worktree 终端):有值则替代项目根作为 PTY cwd
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// 退出时该 pane 正在跑的 AI 会话(hook 上报的精确身份)。
+    /// 重启恢复布局后据此写入 `claude --resume` / `codex resume` 续接会话。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_session: Option<SavedAiSession>,
+}
+
+/// SavedPane 里持久化的 AI 会话身份。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedAiSession {
+    /// 来源 agent(claude-code / codex),缺省按 Claude 处理
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    pub session_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -750,6 +764,7 @@ mod tests {
                             panes: vec![SavedPane {
                                 shell_name: "cmd".into(),
                                 cwd: None,
+                                ai_session: None,
                             }],
                         },
                         SavedSplitNode::Leaf {
@@ -757,6 +772,7 @@ mod tests {
                             panes: vec![SavedPane {
                                 shell_name: "powershell".into(),
                                 cwd: None,
+                                ai_session: None,
                             }],
                         },
                     ],

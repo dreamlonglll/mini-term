@@ -5,7 +5,7 @@ import { getVersion } from '@tauri-apps/api/app';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { ask } from '@tauri-apps/plugin-dialog';
-import { useAppStore, restoreLayout, flushLayoutToConfig, initExpandedDirs, flushExpandedDirsToConfig, flushProjectToConfig, persistConfig } from './store';
+import { useAppStore, restoreLayout, flushLayoutToConfig, initExpandedDirs, flushExpandedDirsToConfig, flushProjectToConfig, persistConfig, setPaneAiSessionByPty, saveLayoutToConfig } from './store';
 import { TerminalArea } from './components/TerminalArea';
 import { ProjectList } from './components/ProjectList';
 import { FileTree } from './components/FileTree';
@@ -177,6 +177,15 @@ export function App() {
     markAiPty(payload.ptyId, payload.status === 'ai-working' || payload.status === 'ai-idle');
     updatePaneStatusByPty(payload.ptyId, payload.status as PaneStatus);
   }, [updatePaneStatusByPty]));
+
+  // hook 上报的 AI 会话身份 → 写进 pane 并防抖持久化,供重启后 resume 续接
+  useTauriEvent<{ ptyId: number; agent?: string; sessionId: string }>('pty-ai-session', useCallback((payload) => {
+    const projectId = setPaneAiSessionByPty(payload.ptyId, {
+      agent: payload.agent,
+      sessionId: payload.sessionId,
+    });
+    if (projectId) saveLayoutToConfig(projectId);
+  }, []));
 
   // 中转连接状态:后端长连状态机推送,写入 store 供设置页「移动端」区域实时展示
   useTauriEvent<MobileRelayStatusPayload>('mobile-relay-status', useCallback((payload) => {

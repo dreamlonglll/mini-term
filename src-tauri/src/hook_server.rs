@@ -112,12 +112,15 @@ impl HookState {
         self.last_session.lock().unwrap().get(&pty_id).cloned()
     }
 
-    /// 记录 hook 上报的会话身份(每个事件都带,直接覆盖即可)
-    fn record_session(&self, pty_id: u32, agent: Option<String>, session_id: String) {
-        self.last_session
-            .lock()
-            .unwrap()
-            .insert(pty_id, HookSessionId { agent, session_id });
+    /// 记录 hook 上报的会话身份(每个事件都带,直接覆盖即可)。
+    /// 返回身份是否发生变化(新 pane 或换会话),变化时调用方通知前端。
+    fn record_session(&self, pty_id: u32, agent: Option<String>, session_id: String) -> bool {
+        let mut map = self.last_session.lock().unwrap();
+        let changed = map
+            .get(&pty_id)
+            .map_or(true, |prev| prev.session_id != session_id);
+        map.insert(pty_id, HookSessionId { agent, session_id });
+        changed
     }
 
     /// 更新指定 PTY 的 hook 状态
@@ -397,7 +400,19 @@ pub fn start_hook_server(
                     // session_id 也是有效信息;/clear 换会话时靠这里自动刷新
                     if let Some(sid) = payload.session_id.clone() {
                         hook_state.note_session_active(pty_id, &sid);
-                        hook_state.record_session(pty_id, payload.agent.clone(), sid);
+                        if hook_state.record_session(pty_id, payload.agent.clone(), sid.clone()) {
+                            // 会话身份变化(新会话/换会话)时通知前端,供布局持久化
+                            // 记录「退出时该 pane 正跑着哪个 AI 会话」以便重启续接
+                            let _ = tauri::Emitter::emit(
+                                &app,
+                                "pty-ai-session",
+                                serde_json::json!({
+                                    "ptyId": pty_id,
+                                    "agent": payload.agent.clone(),
+                                    "sessionId": sid,
+                                }),
+                            );
+                        }
                     }
                     if let Some(status) = map_event_to_status(event, payload.agent.as_deref()) {
                         // hook 事件是 AI 进程存活的直接证据:输入检测漏判启动

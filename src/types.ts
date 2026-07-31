@@ -191,6 +191,14 @@ export interface SavedPane {
   shellName: string;
   /** 工作目录覆盖(worktree 终端):有值则替代项目根作为 PTY cwd */
   cwd?: string;
+  /** 退出时该 pane 正在跑的 AI 会话;重启后据此自动 resume 续接 */
+  aiSession?: AiSessionRef;
+}
+
+/** hook 上报的 AI 会话身份(agent 缺省按 Claude 处理)。 */
+export interface AiSessionRef {
+  agent?: string;
+  sessionId: string;
 }
 
 export type SavedSplitNode =
@@ -255,6 +263,9 @@ export interface PaneState {
   ptyId?: number;
   /** 工作目录覆盖(worktree 终端):有值则替代项目根作为 PTY cwd,随布局持久化 */
   cwd?: string;
+  /** 当前/上次 AI 会话身份(hook 上报),随布局持久化;会话正常退出时清除。
+   *  恢复布局时有值 = 待续接,PaneGroup 起 PTY 后写 resume 命令并清除。 */
+  aiSession?: AiSessionRef;
 }
 
 // === AI 会话 ===
