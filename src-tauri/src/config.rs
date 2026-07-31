@@ -109,6 +109,9 @@ pub struct AppConfig {
     pub hook_enabled: bool,
     #[serde(default)]
     pub smart_copy_paste: bool,
+    /// 拖选按住不动自动复制的静止时长(秒)。`None` = 前端默认 1s。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_auto_copy_secs: Option<f64>,
     #[serde(default)]
     pub ssh_connections: Vec<SshConnection>,
     /// 显式创建的 SSH 分组名（允许空分组存在）。连接上的 group 字段仍是归属的
@@ -242,6 +245,9 @@ pub struct ProjectConfig {
     pub id: String,
     pub name: String,
     pub path: String,
+    /// 需求描述,显示在项目名后的灰色小字。`None` = 不显示。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     #[serde(default)]
     pub saved_layout: Option<SavedProjectLayout>,
     #[serde(default)]
@@ -360,6 +366,7 @@ impl Default for AppConfig {
             last_active_project_id: None,
             hook_enabled: false,
             smart_copy_paste: false,
+            selection_auto_copy_secs: None,
             ssh_connections: vec![],
             ssh_groups: vec![],
             mobile_relay: None,

@@ -47,6 +47,8 @@ export interface AppConfig {
   lastActiveProjectId?: string;
   hookEnabled: boolean;
   smartCopyPaste: boolean;
+  /** 拖选按住不动自动复制的静止时长(秒);undefined = 1 */
+  selectionAutoCopySecs?: number;
   sshConnections: SshConnection[];
   /** 显式创建的 SSH 分组名（允许空分组）。连接的 group 字段仍是归属单一来源 */
   sshGroups?: string[];
@@ -124,6 +126,8 @@ export interface ProjectConfig {
   id: string;
   name: string;
   path: string;
+  /** 需求描述,显示在项目名后的灰色小字;undefined/空 = 不显示 */
+  description?: string;
   savedLayout?: SavedProjectLayout;
   expandedDirs?: string[];
   /** 是否已为该项目启用 SSH MCP（向项目目录写入了 Claude / Codex 的 MCP 注册配置） */

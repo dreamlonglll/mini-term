@@ -516,6 +516,19 @@ export function ProjectList() {
           // 路径也不是本机可打开的位置。保留:重命名 / 复制绝对路径（远程 POSIX）/ 分组操作。
           const menuItems: Parameters<typeof showContextMenu>[2] = [
             { label: t('projectList.menu.rename'), onClick: () => startRenameProject(project.id, project.name) },
+            {
+              label: t('projectList.menu.editDescription'),
+              onClick: async () => {
+                const next = await showPrompt(
+                  t('projectList.menu.editDescription'),
+                  t('projectList.descriptionPlaceholder'),
+                  project.description ?? '',
+                );
+                if (next === null) return;
+                useAppStore.getState().setProjectDescription(project.id, next.trim());
+                saveConfig();
+              },
+            },
             ...(isRemote ? [] : [
               { label: t('projectList.menu.openInFolder'), onClick: () => revealItemInDir(project.path) },
             ]),
@@ -624,7 +637,14 @@ export function ProjectList() {
             autoFocus
           />
         ) : (
-          <span className="truncate flex-1">{project.name}</span>
+          <span className="truncate flex-1">
+            {project.name}
+            {project.description && (
+              <span className="ml-1.5 text-xs text-[var(--text-muted)]" title={project.description}>
+                {project.description}
+              </span>
+            )}
+          </span>
         )}
         {wtBranch && (
           <span

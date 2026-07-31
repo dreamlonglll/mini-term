@@ -265,6 +265,8 @@ function TerminalSettings() {
   const savedLineThreshold = config.longPasteLineThreshold ?? 10;
   const savedCharThreshold = config.longPasteCharThreshold ?? 2000;
   const [lineThresholdInput, setLineThresholdInput] = useState(String(savedLineThreshold));
+  const savedAutoCopySecs = config.selectionAutoCopySecs ?? 1;
+  const [autoCopySecsInput, setAutoCopySecsInput] = useState(String(savedAutoCopySecs));
   const [charThresholdInput, setCharThresholdInput] = useState(String(savedCharThreshold));
   const savedRemotePasteDir = config.remotePasteDir ?? DEFAULT_REMOTE_PASTE_DIR;
   const [remotePasteDirInput, setRemotePasteDirInput] = useState(savedRemotePasteDir);
@@ -341,6 +343,15 @@ function TerminalSettings() {
 
   const handleLongPasteEnabledChange = (enabled: boolean) => {
     void saveConfigPatch({ longPasteToFile: enabled });
+  };
+
+  const commitAutoCopySecs = () => {
+    const n = parseFloat(autoCopySecsInput);
+    const clamped = Number.isFinite(n) && n >= 0.2 ? Math.min(n, 60) : savedAutoCopySecs;
+    setAutoCopySecsInput(String(clamped));
+    if (clamped !== savedAutoCopySecs) {
+      void saveConfigPatch({ selectionAutoCopySecs: clamped });
+    }
   };
 
   const commitLineThreshold = () => {
@@ -462,6 +473,23 @@ function TerminalSettings() {
             }`}
           />
         </button>
+      </div>
+
+      <div className="flex items-center justify-between gap-3 px-3 py-2.5 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)]">
+        <div className="flex-1 min-w-0">
+          <div className="text-base text-[var(--text-primary)]">{t("settings.terminal.autoCopyDwellTitle")}</div>
+          <div className="text-sm text-[var(--text-muted)]">{t("settings.terminal.autoCopyDwellDesc")}</div>
+        </div>
+        <input
+          type="number"
+          min={0.2}
+          step={0.5}
+          className="w-24 bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1 text-base outline-none focus:border-[var(--accent)] font-mono text-right"
+          value={autoCopySecsInput}
+          onChange={(e) => setAutoCopySecsInput(e.target.value)}
+          onBlur={commitAutoCopySecs}
+          onKeyDown={(e) => e.key === 'Enter' && (e.target as HTMLInputElement).blur()}
+        />
       </div>
 
       <div className="pt-6 text-base text-[var(--text-muted)] uppercase tracking-[0.1em] mb-2">

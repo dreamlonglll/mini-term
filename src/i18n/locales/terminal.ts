@@ -2,6 +2,7 @@ export const terminal = {
   zh: {
     ungrouped: "未分组",
     copy: "复制",
+    copied: "已复制",
     paste: "粘贴",
     sshConnect: "SSH 连接",
     sshConnectEmpty: "SSH 连接（暂无）",
@@ -11,6 +12,7 @@ export const terminal = {
   en: {
     ungrouped: "Ungrouped",
     copy: "Copy",
+    copied: "Copied",
     paste: "Paste",
     sshConnect: "SSH Connection",
     sshConnectEmpty: "SSH Connection (none)",

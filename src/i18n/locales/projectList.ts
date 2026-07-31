@@ -15,8 +15,10 @@ export const projectList = {
     newGroupPlaceholder: "请输入分组名称",
     newSubgroup: "新建子组",
     newSubgroupPlaceholder: "请输入子组名称",
+    descriptionPlaceholder: "请输入需求描述,留空清除",
     menu: {
       rename: "重命名",
+      editDescription: "编辑描述",
       remove: "移除项目",
       openInFolder: "在文件夹中打开",
       copyAbsolutePath: "复制绝对路径",
@@ -64,8 +66,10 @@ export const projectList = {
     newGroupPlaceholder: "Enter group name",
     newSubgroup: "New Subgroup",
     newSubgroupPlaceholder: "Enter subgroup name",
+    descriptionPlaceholder: "Enter description, leave empty to clear",
     menu: {
       rename: "Rename",
+      editDescription: "Edit Description",
       remove: "Remove project",
       openInFolder: "Reveal in Folder",
       copyAbsolutePath: "Copy Absolute Path",

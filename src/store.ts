@@ -364,6 +364,8 @@ interface AppStore {
   addProject: (project: ProjectConfig, parentProjectId?: string) => void;
   removeProject: (id: string) => void;
   renameProject: (id: string, name: string) => void;
+  /** 设置项目需求描述;空串 = 清除 */
+  setProjectDescription: (id: string, description: string) => void;
 
   // 终端布局
   /** 写入项目的终端布局树；`null` = 清空（最后一个 pane 被关掉）。
@@ -569,6 +571,16 @@ export const useAppStore = create<AppStore>((set, get) => ({
         ...state.config,
         projects: state.config.projects.map((p) =>
           p.id === id ? { ...p, name } : p
+        ),
+      },
+    })),
+
+  setProjectDescription: (id, description) =>
+    set((state) => ({
+      config: {
+        ...state.config,
+        projects: state.config.projects.map((p) =>
+          p.id === id ? { ...p, description: description || undefined } : p
         ),
       },
     })),
