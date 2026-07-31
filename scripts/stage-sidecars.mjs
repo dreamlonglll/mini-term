@@ -16,7 +16,7 @@ import { copyFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { stagePortableConpty, WINDOWS_X64_TARGET } from './stage-conpty.mjs';
 
-const SIDECARS = ['miniterm-hook', 'mt-ssh-mcp'];
+const SIDECARS = ['miniterm-hook', 'mt-ssh-mcp', 'mt-ssh-cli'];
 const MANIFEST = join('src-tauri', 'mt-sidecars', 'Cargo.toml');
 // externalBin 校验 + 发布打包都从这里取（文件名带 triple 后缀）。
 const EXTERNAL_BIN_DIR = join('src-tauri', 'binaries');

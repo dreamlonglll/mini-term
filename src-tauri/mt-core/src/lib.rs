@@ -11,7 +11,9 @@ mod ssh_key;
 mod ssh_prompt;
 mod wsl_path;
 
-pub use config_reader::{config_json_path, read_ssh_connections_for_project};
+pub use config_reader::{
+    config_json_path, read_ssh_connections_for_project, read_ssh_connections_for_token,
+};
 pub use ssh_connection::SshConnection;
 pub use ssh_key::{cleanup_ssh_temp_keys, prepare_ssh_key, restrict_permissions, temp_keys_dir};
 pub use ssh_prompt::{scan_ssh_prompt, strip_ansi_codes, SshPromptScan};

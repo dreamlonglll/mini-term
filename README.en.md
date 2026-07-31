@@ -134,7 +134,7 @@ A VS Code-style **Changes panel** (Staged / Changes / Untracked groups, per-file
 | State / layout | Zustand single store · Allotment + recursive SplitNode tree |
 | PTY / Git | portable-pty · git2 · notify + ignore |
 | Mobile relay | axum + tokio WebSocket (`relay-server/`) · React + Vite PWA (`mobile/`) |
-| Tests | **419 Rust tests** (381 desktop + 38 relay) plus 19 Node tests |
+| Tests | **491 Rust tests** (438 desktop + 53 relay) plus 19 Node tests |
 
 ---
 

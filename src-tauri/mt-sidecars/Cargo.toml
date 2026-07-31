@@ -1,11 +1,17 @@
 [package]
 name = "mt-sidecars"
 version = "0.4.8"
-description = "mini-term sidecar binaries: miniterm-hook (AI hook) and mt-ssh-mcp (SSH MCP server)"
+description = "mini-term sidecar binaries: miniterm-hook (AI hook), mt-ssh-mcp (SSH MCP server) and mt-ssh-cli (SSH CLI + daemon)"
 edition = "2021"
 
 # 独立 crate：不依赖 tauri / tauri-build，单独 cargo build 不会触发主程序的
-# externalBin 校验。两个 sidecar 由 scripts/stage-sidecars.mjs 构建并就位。
+# externalBin 校验。sidecar 由 scripts/stage-sidecars.mjs 构建并就位。
+
+# lib target：ssh_service 业务编排共享层，mt-ssh-mcp 与 mt-ssh-cli 两个 bin
+# 都只做传输层、业务转调 lib（ssh-cli-skill spec §3）。
+[lib]
+name = "mt_sidecars"
+path = "src/lib.rs"
 
 [[bin]]
 name = "miniterm-hook"
@@ -14,6 +20,10 @@ path = "src/bin/miniterm-hook.rs"
 [[bin]]
 name = "mt-ssh-mcp"
 path = "src/bin/mt-ssh-mcp.rs"
+
+[[bin]]
+name = "mt-ssh-cli"
+path = "src/bin/mt-ssh-cli.rs"
 
 [dependencies]
 mt-core = { path = "../mt-core" }
@@ -29,7 +39,21 @@ dirs = "6"
 portable-pty = "0.8"
 # mt-ssh-mcp 的 MCP server 实现：官方 rmcp stdio server。
 rmcp = { version = "1", features = ["server", "macros", "transport-io"] }
+# mt-ssh-cli 的参数解析：clap derive（用法错误信息对 agent 可读性好，--help 即文档）。
+clap = { version = "4", features = ["derive"] }
+# CLI ↔ daemon IPC 帧的 stdout/stderr 分片编码（保二进制安全）。
+base64 = "0.22"
 # SFTP 传输的 tokio::fs 本地文件读写已随会话池迁入 mt-ssh(其 `fs`/`io-util`
 # features 经 feature unification 依旧生效);这里只保留 sidecar 自身需要的面。
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "time", "sync"] }
+# `net` 供 mt-ssh-cli 的本机 IPC（Windows named pipe / Unix socket）。
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "time", "sync", "net"] }
+
+# named pipe 安全描述符（仅当前用户可连）：SID 查询 + SDDL 转换。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+] }
 

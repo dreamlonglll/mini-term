@@ -15,6 +15,7 @@ mod remote_ssh;
 mod search;
 mod ssh;
 mod ssh_mcp_registry;
+mod ssh_skill_registry;
 mod window_input_recovery;
 mod window_theme;
 mod wsl_distros;
@@ -159,8 +160,8 @@ pub fn run() {
             hook_registry::get_hook_config_snippet,
             hook_registry::get_hook_status,
             hook_server::toggle_hook_server,
-            ssh_mcp_registry::enable_ssh_mcp,
-            ssh_mcp_registry::disable_ssh_mcp,
+            ssh_skill_registry::enable_ssh_tools,
+            ssh_skill_registry::disable_ssh_tools,
             window_theme::set_window_dark_mode,
             mobile_relay::mobile_relay_apply,
             mobile_relay::mobile_relay_status,
