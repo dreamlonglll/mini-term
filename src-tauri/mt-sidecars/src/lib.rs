@@ -7,4 +7,6 @@
 //! 与 `mt-core` 的分工：mt-core 放跨主程序/sidecar 的纯逻辑（config 读取、
 //! SshConnection 类型），这里放仅 sidecar 需要的业务编排（依赖 mt-ssh 会话池）。
 
+pub mod daemon;
+pub mod ipc;
 pub mod ssh_service;
