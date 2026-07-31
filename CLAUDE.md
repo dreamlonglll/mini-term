@@ -39,7 +39,7 @@ cd src-tauri && cargo test
 |------|------|
 | `lib.rs` | Tauri app 初始化，注册所有 command 和 plugin |
 | `pty.rs` | PTY 生命周期管理（create/write/resize/kill）；16ms 批量缓冲后通过 `pty-output` 事件推送数据 |
-| `process_monitor.rs` | 后台线程每 500ms 轮询子进程名，识别 idle/running/ai-working 状态，通过 `pty-status-change` 事件通知前端 |
+| `process_monitor.rs` | 后台线程每 500ms 判定各 pane 状态（idle/ai-idle/ai-working）：hook 上报（`hook_server.rs`）一旦启用即为权威，退出以 SessionEnd 为准；无 hook 时降级为输入检测（`pty.rs` 的 AI 命令识别）+ 输出活跃度轮询，通过 `pty-status-change` 事件通知前端 |
 | `config.rs` | `AppConfig` 持久化到 `{app_data_dir}/config.json`；提供跨平台预置 shell 列表 |
 | `fs.rs` | 目录列表（过滤 `.gitignore`）+ `notify` 文件监听，通过 `fs-change` 事件通知前端 |
 | `ai_sessions.rs` | 读取 Claude/Codex 历史会话记录 |
@@ -62,7 +62,7 @@ cd src-tauri && cargo test
 **数据流**：
 - `store.ts` 是唯一全局状态，用 `Map<projectId, ProjectState>` 存储每个项目的 tabs
 - 每个 Tab 的终端区域是一棵 `SplitNode` 树（leaf = 单个 pane，split = 横/纵分屏）
-- `PaneStatus` 优先级：`error > ai-working > running > idle`，从叶节点聚合到 Tab 级别
+- `PaneStatus` 优先级：`error > ai-working > ai-idle > idle`，从叶节点聚合到 Tab 级别
 
 **关键组件**：
 
@@ -92,4 +92,4 @@ Rust reader → 16ms 批量缓冲 → emit('pty-output') → term.write()
 - 文件拖拽到终端会将文件路径作为文本写入 PTY（不是上传文件）
 - `WebkitAppRegion: 'drag'` 用于自定义标题栏拖拽，菜单项需设置 `no-drag` 区域
 - 分屏关闭最后一个 pane 时会关闭整个 tab（`removePane` 返回 `null` 时触发）
-- AI 进程识别通过检测子进程名包含 `claude` 或 `codex` 实现（`process_monitor.rs`）
+- AI 会话识别有两层：Claude/Codex hook 上报（`hook_server.rs`，权威）+ 输入检测（`pty.rs` 识别键入的 `claude`/`codex`/`opencode` 命令，含 ↑ 历史/Tab 补全的行快照兜底与输出回扫）；不做子进程名轮询

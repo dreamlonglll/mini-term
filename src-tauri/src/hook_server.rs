@@ -16,6 +16,9 @@ const DEFAULT_PORT: u16 = 23456;
 const MAX_PORT_ATTEMPTS: u16 = 5;
 /// 每个 PTY 保留的已结束会话墓碑数量上限
 const ENDED_SESSIONS_CAP: usize = 8;
+/// 每个 PTY 跟踪的活跃会话数量上限（正常只有 1 个；嵌套非交互实例/事件乱序
+/// 时短暂多个，上限只是防御事件丢失导致的累积）
+const ACTIVE_SESSIONS_CAP: usize = 8;
 /// Hook 事件的 JSON payload
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)] // 保留完整字段供未来 UI 细化使用
@@ -68,6 +71,11 @@ pub struct HookState {
     /// 若放行会把已退出的 pane 重新推回 ai-idle。`remove()` 不清墓碑
     /// （SessionEnd 自身要先打墓碑再 remove），PTY 关闭时由 `purge()` 清理。
     ended_sessions: Arc<Mutex<HashMap<u32, VecDeque<String>>>>,
+    /// pty → 当前活跃会话 id 集合（有序去重）。SessionEnd 只有在移除该会话后
+    /// 集合为空时才执行销毁动作：嵌套非交互实例（Bash 工具里跑 `claude -p` /
+    /// `codex exec`，继承 MINITERM_PTY_ID）与"退出后立刻重开"的乱序场景下，
+    /// pane 上还有别的活跃会话，误销毁会把正在工作的外层会话打回 idle。
+    active_sessions: Arc<Mutex<HashMap<u32, VecDeque<String>>>>,
     port: Arc<Mutex<u16>>,
     /// 保存 server 实例，供运行时停止（Arc 共享给监听线程）
     server: Arc<Mutex<Option<Arc<tiny_http::Server>>>>,
@@ -81,6 +89,7 @@ impl HookState {
             last_session: Arc::new(Mutex::new(HashMap::new())),
             hook_enabled: Arc::new(Mutex::new(std::collections::HashSet::new())),
             ended_sessions: Arc::new(Mutex::new(HashMap::new())),
+            active_sessions: Arc::new(Mutex::new(HashMap::new())),
             port: Arc::new(Mutex::new(0)),
             server: Arc::new(Mutex::new(None)),
         }
@@ -112,7 +121,7 @@ impl HookState {
     }
 
     /// 更新指定 PTY 的 hook 状态
-    fn update(&self, pty_id: u32, status: String) {
+    pub(crate) fn update(&self, pty_id: u32, status: String) {
         self.hook_enabled.lock().unwrap().insert(pty_id);
         self.last_hook_time
             .lock()
@@ -130,10 +139,45 @@ impl HookState {
         self.last_session.lock().unwrap().remove(&pty_id);
     }
 
-    /// PTY 关闭时的彻底清理：hook 状态 + 墓碑
+    /// PTY 关闭时的彻底清理：hook 状态 + 墓碑 + 活跃会话集
     pub fn purge(&self, pty_id: u32) {
         self.remove(pty_id);
         self.ended_sessions.lock().unwrap().remove(&pty_id);
+        self.active_sessions.lock().unwrap().remove(&pty_id);
+    }
+
+    /// 记录会话为活跃。任意非 SessionEnd 事件都调（不只 SessionStart：
+    /// hook server 中途启用时首个事件可能是 Stop/PreToolUse）。
+    /// 有序去重；超容量挤掉最老的——正常情况集合里只有 1 个。
+    fn note_session_active(&self, pty_id: u32, session_id: &str) {
+        let mut map = self.active_sessions.lock().unwrap();
+        let queue = map.entry(pty_id).or_default();
+        if queue.iter().any(|s| s == session_id) {
+            return;
+        }
+        if queue.len() >= ACTIVE_SESSIONS_CAP {
+            queue.pop_front();
+        }
+        queue.push_back(session_id.to_string());
+    }
+
+    /// SessionEnd：把该会话移出活跃集，返回移除后活跃集是否已空。
+    /// 为空 → 这是 pane 上最后一个会话，调用方执行销毁动作；
+    /// 非空 → pane 上还有别的活跃会话（嵌套 `claude -p` / 退出后立刻重开的
+    /// 乱序），只打墓碑不销毁。payload 无 session_id 时不移除，仅报告空否。
+    fn end_session(&self, pty_id: u32, session_id: Option<&str>) -> bool {
+        let mut map = self.active_sessions.lock().unwrap();
+        let Some(queue) = map.get_mut(&pty_id) else {
+            return true;
+        };
+        if let Some(sid) = session_id {
+            queue.retain(|s| s != sid);
+        }
+        let empty = queue.is_empty();
+        if empty {
+            map.remove(&pty_id);
+        }
+        empty
     }
 
     /// 给已结束的会话 id 打墓碑
@@ -201,17 +245,6 @@ fn map_event_to_status(event: &str, agent: Option<&str>) -> Option<&'static str>
             Some("ai-idle")
         }
         _ => None,
-    }
-}
-
-/// SessionEnd 是否已过时:payload 与当前记录的会话 id 都已知且不相等,
-/// 说明这个 pty 上已经跑起了新会话(hook 进程独立 POST,新 SessionStart
-/// 可能先到),销毁动作(清 hook 状态 / 清 AI 会话标记 / 发 idle)必须跳过。
-/// 任一方未知时按未过时处理,保持与旧行为一致。
-fn session_end_is_stale(ended_sid: Option<&str>, current_sid: Option<&str>) -> bool {
-    match (ended_sid, current_sid) {
-        (Some(ended), Some(current)) => ended != current,
-        _ => false,
     }
 }
 
@@ -318,7 +351,8 @@ pub fn start_hook_server(
                     if let Some(sid) = payload.session_id.clone() {
                         hook_state.mark_session_ended(pty_id, sid);
                     }
-                    let current_sid = hook_state.session_of(pty_id).map(|s| s.session_id);
+                    let was_last =
+                        hook_state.end_session(pty_id, payload.session_id.as_deref());
                     if payload.reason.as_deref() == Some("clear") {
                         // /clear 换会话不是退出：紧随其后的 SessionStart 会带新
                         // session id 刷新状态，这里只靠墓碑挡住旧会话的迟到事件
@@ -326,20 +360,19 @@ pub fn start_hook_server(
                             "[hook-server] pty_id={} event=SessionEnd(clear) -> 仅记录墓碑",
                             pty_id
                         );
-                    } else if session_end_is_stale(
-                        payload.session_id.as_deref(),
-                        current_sid.as_deref(),
-                    ) {
-                        // 迟到的 SessionEnd:pty 上已经记录了更新的会话
-                        // (退出后立刻重开 claude,新 SessionStart 先到)。
-                        // 此时清 hook 状态 / AI 会话标记会误杀新会话,只留墓碑。
+                    } else if !was_last {
+                        // pane 上还有别的活跃会话:嵌套非交互实例(Bash 工具里跑
+                        // `claude -p` / `codex exec`,继承 MINITERM_PTY_ID)结束,
+                        // 或退出后立刻重开、新 SessionStart 先到的乱序。此时清
+                        // hook 状态 / AI 会话标记会误杀仍在跑的会话,只留墓碑。
                         eprintln!(
-                            "[hook-server] pty_id={} event=SessionEnd 迟到(已有新会话),仅记录墓碑",
+                            "[hook-server] pty_id={} event=SessionEnd 非最后活跃会话,仅记录墓碑",
                             pty_id
                         );
                     } else {
-                        // 权威退出信号：清 hook 状态回退到轮询，同时清输入检测的
-                        // AI 会话标记——双击 Ctrl+C 间隔超窗漏检时靠这里自愈
+                        // 最后一个活跃会话结束 → 权威退出信号：清 hook 状态回退
+                        // 到轮询，同时清输入检测的 AI 会话标记——双击 Ctrl+C
+                        // 间隔超窗漏检时靠这里自愈
                         hook_state.remove(pty_id);
                         app.state::<crate::pty::PtyManager>().clear_ai_session(pty_id);
                         emitter.emit_if_changed(&app, pty_id, "idle");
@@ -363,9 +396,14 @@ pub fn start_hook_server(
                     // 会话身份先于状态映射记录:即使事件不映射状态(如未知事件),
                     // session_id 也是有效信息;/clear 换会话时靠这里自动刷新
                     if let Some(sid) = payload.session_id.clone() {
+                        hook_state.note_session_active(pty_id, &sid);
                         hook_state.record_session(pty_id, payload.agent.clone(), sid);
                     }
                     if let Some(status) = map_event_to_status(event, payload.agent.as_deref()) {
+                        // hook 事件是 AI 进程存活的直接证据:输入检测漏判启动
+                        // (别名/包装脚本)或误判退出(任务中双击 Ctrl+C)时,
+                        // 靠这里把 AI 会话标记扶正,保住后续 marker/移动端语义
+                        app.state::<crate::pty::PtyManager>().mark_ai_session(pty_id);
                         hook_state.update(pty_id, status.to_string());
 
                         // 通知前端（与 process_monitor 共享同一份去重表）
@@ -469,15 +507,71 @@ mod tests {
     }
 
     #[test]
-    fn session_end_staleness() {
-        // 正常退出:payload 与当前记录一致 -> 不过时,执行销毁动作
-        assert!(!session_end_is_stale(Some("sid-a"), Some("sid-a")));
-        // 退出后立刻重开,新 SessionStart 先到 -> 过时,只留墓碑
-        assert!(session_end_is_stale(Some("sid-a"), Some("sid-b")));
-        // 任一方未知时保守按未过时处理(旧行为)
-        assert!(!session_end_is_stale(None, Some("sid-b")));
-        assert!(!session_end_is_stale(Some("sid-a"), None));
-        assert!(!session_end_is_stale(None, None));
+    fn end_session_last_active_triggers_teardown() {
+        let state = HookState::new();
+        // 从未见过任何会话:保守按"最后一个"处理(执行销毁,对齐旧行为)
+        assert!(state.end_session(1, Some("sid-a")));
+
+        // 正常生命周期:唯一活跃会话结束 -> 销毁
+        state.note_session_active(1, "sid-a");
+        assert!(state.end_session(1, Some("sid-a")));
+    }
+
+    #[test]
+    fn nested_session_end_keeps_outer_alive() {
+        let state = HookState::new();
+        // 外层交互会话 A 活跃中,嵌套非交互实例 B(claude -p)启动又结束
+        state.note_session_active(1, "sid-outer");
+        state.note_session_active(1, "sid-nested");
+        assert!(!state.end_session(1, Some("sid-nested"))); // 不销毁:A 还在
+        assert!(state.end_session(1, Some("sid-outer"))); // A 退出才销毁
+    }
+
+    #[test]
+    fn exit_restart_race_skips_teardown() {
+        let state = HookState::new();
+        // 退出后立刻重开:新会话 B 的 SessionStart 先到,旧会话 A 的 SessionEnd 迟到
+        state.note_session_active(1, "sid-a");
+        state.note_session_active(1, "sid-b");
+        assert!(!state.end_session(1, Some("sid-a"))); // B 活跃,不销毁
+    }
+
+    #[test]
+    fn end_session_unknown_sid_respects_remaining_active() {
+        let state = HookState::new();
+        state.note_session_active(1, "sid-a");
+        // 未知会话结束(其 Start 早于 hook server 启用):A 仍活跃,不销毁
+        assert!(!state.end_session(1, Some("sid-x")));
+        // payload 无 session_id:按剩余活跃集判断
+        assert!(!state.end_session(1, None));
+        assert!(state.end_session(1, Some("sid-a")));
+    }
+
+    #[test]
+    fn note_session_active_dedup_and_cap() {
+        let state = HookState::new();
+        // 重复 note 去重,不占额外容量
+        state.note_session_active(1, "sid-0");
+        state.note_session_active(1, "sid-0");
+        // 再 note sid-1..sid-CAP,溢出一格 → 最老的 sid-0 被挤出
+        for i in 1..ACTIVE_SESSIONS_CAP + 1 {
+            state.note_session_active(1, &format!("sid-{}", i));
+        }
+        // 结束 sid-1..sid-(CAP-1):每次集合都还非空
+        for i in 1..ACTIVE_SESSIONS_CAP {
+            assert!(!state.end_session(1, Some(&format!("sid-{}", i))));
+        }
+        // 结束最后一个成员即空——证明 sid-0 确实已被挤出(否则此处非空)
+        assert!(state.end_session(1, Some(&format!("sid-{}", ACTIVE_SESSIONS_CAP))));
+    }
+
+    #[test]
+    fn purge_clears_active_sessions() {
+        let state = HookState::new();
+        state.note_session_active(1, "sid-a");
+        state.purge(1);
+        // purge 后无残留:未知 sid 结束按空集处理
+        assert!(state.end_session(1, Some("sid-b")));
     }
 
     #[test]
