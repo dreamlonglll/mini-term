@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.8.5-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.9.0-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -73,13 +73,15 @@ Mini-Term 就是为这件事做的：项目列表上的状态灯实时跳动，A
 
 ### 🧰 把你的 SSH 连接，变成 AI 能调用的工具
 
-保存好的 SSH 连接可以作为 **MCP 工具**暴露给终端里跑着的 Claude Code / Codex。项目右键「关联 SSH」勾选连接即按项目启用，**可见范围就限定在你勾的那几个**。
+保存好的 SSH 连接可以交给终端里跑着的 Claude Code / Codex 直接操作。项目右键「关联 SSH」勾选连接即按项目启用，**可见范围就限定在你勾的那几个**。
 
-内置 `mt-ssh-mcp` sidecar（基于官方 rmcp 的 stdio MCP server）提供四个工具：`ssh_list_connections`、`ssh_exec`、`ssh_upload`、`ssh_download`。`ssh_exec` 复用你存好的密码 / 私钥认证，带超时、输出封顶与审计日志；上传下载走 **SFTP 分块流式传输**，内存恒定、能传大文件，不必再用 `ssh_exec` + base64 echo 那套受输出封顶限制的土办法。
+**v0.9.0 起这套工具从 MCP 换成了 CLI + Skill**：启用时生成 Claude / Codex 两份 `SKILL.md`（内嵌 CLI 绝对路径与该项目的随机能力令牌，幂等追加 `.gitignore`，并自动摘除存量项目里的旧 MCP 注册）。好处是 agent 按需加载 skill，不再有一份工具 schema 常驻上下文；调用的是普通命令行，可以和 `grep`、管道、重定向自由组合。
 
-sidecar 内部维护**进程内 SSH 会话池**（russh + tokio）：首次调用某连接做一次握手 + 认证（秒级），之后每条命令只花一个 RTT。还有一条硬护栏——拒绝传输 mini-term 自己的 `config.json`（里面是全部 SSH 明文凭据）。
+内置 `mt-ssh-cli` sidecar 提供 `list` / `exec` / `upload` / `download` 四个子命令：远程 stdout / stderr 与退出码**原样流式透传**（`124` 超时、`2` CLI 错误），上传下载走 **SFTP 分块流式传输**（内存恒定、能传大文件），认证凭据始终留在本机，每次调用写审计日志。**每条命令都必须带项目令牌**——缺失、未知、重复或属于已停用项目的一律拒绝执行，绝不回退成「能看见全部连接」。
 
-启用 / 停用会按命名 marker **幂等写入** Claude 的 `.mcp.json` 与 Codex 的 `.codex/config.toml`，不会弄乱你手写的配置。
+CLI 背后是**全机单例 daemon** 持有的持久连接池：首次调用自动把它拉起来并完成握手 + 认证（秒级），之后每条命令只花一个 RTT；空闲 10 分钟 drain 自退，版本升级自动换代；`Ctrl+C`、客户端断开或超时会显式关掉对应 SSH channel，健康 session 继续留在池里。IPC 端点只有当前用户能连，建不起来就 fail closed；daemon 不可用时自动降级为进程内直连，输出与退出码契约完全一致。还有一条硬护栏——拒绝传输 mini-term 自己的 `config.json`（里面是全部 SSH 明文凭据）。
+
+> 过渡期 `mt-ssh-mcp` MCP sidecar 仍随安装包发布，计划下个周期下线。
 
 ### 🌐 远程目录当本地项目用，WSL 也一样
 
@@ -134,7 +136,7 @@ VS Code 风格的 **Changes 面板**（Staged / Changes / Untracked 分组，单
 | 状态 / 布局 | Zustand 单一 Store · Allotment + 递归 SplitNode 分屏树 |
 | PTY / Git | portable-pty · git2 · notify + ignore |
 | 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`） |
-| 测试 | **419 个 Rust 测试**（桌面端 381 + 中转 38）+ 19 个 Node 测试 |
+| 测试 | **503 个 Rust 测试**（桌面端 450 + 中转 53）+ 19 个 Node 测试 |
 
 ---
 

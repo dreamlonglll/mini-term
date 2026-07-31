@@ -1,6 +1,6 @@
 [package]
 name = "tauri-app"
-version = "0.8.5"
+version = "0.9.0"
 description = "mini-term: AI-aware desktop terminal manager built on Tauri v2 — multi-project, multi-tab, split-pane"
 authors = ["you"]
 edition = "2021"
@@ -52,6 +52,7 @@ mt-relay-protocol = { path = "../relay-server/protocol" }
 tokio-tungstenite = { version = "0.27", features = ["rustls-tls-native-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 futures-util = "0.3"
+uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

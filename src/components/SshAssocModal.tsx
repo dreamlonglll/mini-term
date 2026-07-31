@@ -6,7 +6,7 @@ import { buildGroupBuckets, connectionSummary, GroupSidebarRow } from './SshModa
 import type { SshGroupBucket } from './SshModal';
 import { Modal, ModalCloseButton } from './Modal';
 import { useT, t as tStatic } from '../i18n';
-import type { ProjectConfig } from '../types';
+import type { EnableSshToolsResult, ProjectConfig } from '../types';
 
 interface Props {
   /** 目标项目；null 表示弹窗关闭 */
@@ -16,7 +16,7 @@ interface Props {
 
 /** 计算弹窗打开时的初始勾选集合。 */
 function initialChecked(project: ProjectConfig, allIds: string[]): Set<string> {
-  // 未启用 SSH MCP → 默认全选（保存即以全部范围启用）
+  // 未启用 SSH 工具 → 默认全选（保存即以全部范围启用）
   if (!project.sshMcpEnabled) return new Set(allIds);
   // 已启用且设过范围 → 取已存范围（过滤掉已删除连接的陈旧 id）
   if (project.sshConnectionIds) {
@@ -37,7 +37,7 @@ function sameScope(a: string[] | undefined, b: string[], allIds: string[]): bool
 /**
  * 「关联 SSH」弹窗：按项目设定 agent 可访问的 SSH 连接范围。
  *
- * 勾选 ≥1 个连接 = 为该项目启用 SSH MCP 并限定范围；全部取消 = 停用。
+ * 勾选 ≥1 个连接 = 为该项目启用 SSH 工具（CLI + Skill）并限定范围；全部取消 = 停用。
  * 范围始终存为显式 id 列表，新增连接不会被自动纳入已有项目。
  */
 export function SshAssocModal({ project, onClose }: Props) {
@@ -83,27 +83,30 @@ export function SshAssocModal({ project, onClose }: Props) {
     // 纳入该项目的可见范围（违背 v0.6.3「新增连接不自动纳入已有项目」的承诺）。
     // 故启用状态下 undefined 必须迁移；仅当迁移前后「当前有效范围」不变时静默落盘、
     // 不打扰用户（沿用 c25d99d 无改动不弹提示的意图）。
-    const needsScopeMigration = nowEnabled && project.sshConnectionIds === undefined;
     const effectiveUnchanged =
       wasEnabled === nowEnabled &&
       (!nowEnabled || sameScope(project.sshConnectionIds, scope, allIds));
 
-    // 完全无变化且已是显式列表 → 直接关闭，不写盘、不弹提示
-    if (effectiveUnchanged && !needsScopeMigration) {
+    // 未启用且仍未启用 → 没有生成物需要 reconcile，直接关闭。
+    if (effectiveUnchanged && !nowEnabled) {
       onClose();
       return;
     }
-    // 有效范围不变、仅把旧 undefined 迁移成等价显式列表 → 静默落盘，不弹提示
-    const silentMigration = effectiveUnchanged && needsScopeMigration;
+    // 已启用项目每次保存都幂等 reconcile SKILL.md / 旧 MCP；有效配置没变时静默。
+    // 这同时覆盖旧项目的 scope/token 迁移。
+    const silentReconcile = effectiveUnchanged;
 
     setBusy(true);
     try {
-      // 仅启用/停用的切换需要改写 .mcp.json 注册；纯范围变更靠持久化 config 即可，
-      // sidecar 每次工具调用都重新读 config.json。
-      if (nowEnabled && !wasEnabled) {
-        await invoke('enable_ssh_mcp', { projectDir: project.path, projectId: project.id });
+      let projectToken = project.sshCliToken;
+      if (nowEnabled) {
+        const result = await invoke<EnableSshToolsResult>('enable_ssh_tools', {
+          projectDir: project.path,
+          projectToken,
+        });
+        projectToken = result.projectToken;
       } else if (!nowEnabled && wasEnabled) {
-        await invoke('disable_ssh_mcp', { projectDir: project.path });
+        await invoke('disable_ssh_tools', { projectDir: project.path });
       }
 
       const cfg = useAppStore.getState().config;
@@ -111,7 +114,12 @@ export function SshAssocModal({ project, onClose }: Props) {
         ...cfg,
         projects: cfg.projects.map((p) =>
           p.id === project.id
-            ? { ...p, sshMcpEnabled: nowEnabled, sshConnectionIds: nowEnabled ? scope : undefined }
+            ? {
+                ...p,
+                sshMcpEnabled: nowEnabled,
+                sshCliToken: nowEnabled ? projectToken : undefined,
+                sshConnectionIds: nowEnabled ? scope : undefined,
+              }
             : p,
         ),
       };
@@ -119,8 +127,8 @@ export function SshAssocModal({ project, onClose }: Props) {
       await invoke('save_config', { config: newConfig });
       onClose();
 
-      // 静默迁移(旧 undefined → 等价显式列表,有效范围未变)：落盘即可，不弹提示
-      if (silentMigration) return;
+      // 幂等 reconcile / 存量迁移：落盘即可，不弹提示。
+      if (silentReconcile) return;
 
       const scopeDesc =
         scope.length === allIds.length

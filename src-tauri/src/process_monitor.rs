@@ -57,6 +57,47 @@ impl StatusEmitter {
     }
 }
 
+/// 单个 pty 的状态判定（monitor 每轮对每个 pty 调一次）。
+///
+/// Hook 一旦启用即为权威，唯一兜底：hook 停在 ai-working 但 AI 已连续
+/// AI_ACTIVE_TIMEOUT 无输出，视为空闲——hook 的完成事件（Stop/Notification）
+/// 可能丢失或延迟。
+///
+/// 退出的唯一权威信号是 SessionEnd hook（hook_server 处理：清状态 + 直推 idle）。
+/// 这里**不能**根据输入检测（is_ai_session）把 hook 状态拆掉降级 idle：
+/// 输入检测会漏判启动（别名/包装脚本）、误判退出（任务运行中双击 Ctrl+C 只是
+/// 打断并不退出），曾经的 "ai-idle && !is_ai_session → idle" 兜底会把这类
+/// 误差放大成 pane 整个会话期永久显示 idle。SessionEnd 丢失（claude 被外部
+/// kill 等）时状态残留在 ai-idle 徽章，是有意接受的失败模式——罕见、纯视觉、
+/// 该 pane 下次启动 AI 会话即自愈。
+pub(crate) fn resolve_status(
+    hook_state: &HookState,
+    pty_manager: &crate::pty::PtyManager,
+    pty_id: u32,
+) -> String {
+    if hook_state.is_hook_enabled(pty_id) {
+        let hook_status = hook_state
+            .get_status(pty_id)
+            .unwrap_or_else(|| "idle".to_string());
+        if hook_status == "ai-working"
+            && !pty_manager.has_recent_output(pty_id, AI_ACTIVE_TIMEOUT)
+        {
+            "ai-idle".to_string()
+        } else {
+            hook_status
+        }
+    } else if pty_manager.is_ai_session(pty_id) {
+        // 未启用 hook 时降级到进程轮询逻辑
+        if pty_manager.has_recent_output(pty_id, AI_ACTIVE_TIMEOUT) {
+            "ai-working".to_string()
+        } else {
+            "ai-idle".to_string()
+        }
+    } else {
+        "idle".to_string()
+    }
+}
+
 pub fn start_monitor(
     app: AppHandle,
     pty_manager: crate::pty::PtyManager,
@@ -68,39 +109,7 @@ pub fn start_monitor(
             let pty_ids = pty_manager.get_pty_ids();
 
             for pty_id in &pty_ids {
-                // Hook 优先。两种兜底：
-                // 1. hook 停在 ai-working 但 AI 已连续 AI_ACTIVE_TIMEOUT 无输出，
-                //    视为空闲——hook 的完成事件（Stop/Notification）可能丢失或延迟。
-                // 2. 状态为 ai-idle 且 AI 会话已退出（/exit、Ctrl+D 等），清除 hook 状态。
-                let status = if hook_state.is_hook_enabled(*pty_id) {
-                    let hook_status = hook_state
-                        .get_status(*pty_id)
-                        .unwrap_or_else(|| "idle".to_string());
-                    let effective = if hook_status == "ai-working"
-                        && !pty_manager.has_recent_output(*pty_id, AI_ACTIVE_TIMEOUT)
-                    {
-                        "ai-idle".to_string()
-                    } else {
-                        hook_status
-                    };
-                    if effective == "ai-idle" && !pty_manager.is_ai_session(*pty_id) {
-                        // AI 已通过输入检测退出，清除 hook 状态后回退到 idle
-                        hook_state.remove(*pty_id);
-                        "idle".to_string()
-                    } else {
-                        effective
-                    }
-                } else if pty_manager.is_ai_session(*pty_id) {
-                    // 未启用 hook 时降级到进程轮询逻辑
-                    if pty_manager.has_recent_output(*pty_id, AI_ACTIVE_TIMEOUT) {
-                        "ai-working".to_string()
-                    } else {
-                        "ai-idle".to_string()
-                    }
-                } else {
-                    "idle".to_string()
-                };
-
+                let status = resolve_status(&hook_state, &pty_manager, *pty_id);
                 emitter.emit_if_changed(&app, *pty_id, &status);
             }
 
@@ -110,4 +119,81 @@ pub fn start_monitor(
             thread::sleep(Duration::from_millis(sleep_ms));
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pty::PtyManager;
+
+    /// 回归测试（2026-07-31 tab 显示 idle 而非 ai-* 的 bug）：claude 任务
+    /// 运行中快速连按两次 Ctrl+C 打断（claude 只是中断当前任务回到提示符，
+    /// 并未退出），输入检测按"双击 Ctrl+C 退出"误清 AI 会话标记；随后 hook
+    /// 上报 ai-idle。修复前 monitor 因 !is_ai_session 把 hook 状态整体拆除
+    /// 并降级为 idle——hook 状态必须保持权威。
+    #[test]
+    fn double_ctrlc_interrupt_keeps_hook_ai_idle() {
+        let hooks = HookState::new();
+        let mgr = PtyManager::new();
+
+        mgr.track_input(1, "claude\r"); // 用户启动 claude
+        hooks.update(1, "ai-working".to_string()); // UserPromptSubmit：任务运行中
+        mgr.track_input(1, "\x03"); // 双击 Ctrl+C 打断任务
+        mgr.track_input(1, "\x03"); // （claude 未退出，仅回到提示符）
+        hooks.update(1, "ai-idle".to_string()); // 打断后 claude 上报 ai-idle
+
+        assert_eq!(resolve_status(&hooks, &mgr, 1), "ai-idle");
+    }
+
+    /// 同上但打断后没有任何 hook 事件（Stop 在用户主动打断时不触发）：
+    /// hook 停在 ai-working、无输出 → 按超时兜底降到 ai-idle，而不是 idle。
+    #[test]
+    fn double_ctrlc_interrupt_with_stuck_ai_working_degrades_to_ai_idle() {
+        let hooks = HookState::new();
+        let mgr = PtyManager::new();
+
+        mgr.track_input(1, "claude\r");
+        hooks.update(1, "ai-working".to_string());
+        mgr.track_input(1, "\x03");
+        mgr.track_input(1, "\x03");
+        // 无后续 hook 事件、无 PTY 输出（has_recent_output 为 false）
+
+        assert_eq!(resolve_status(&hooks, &mgr, 1), "ai-idle");
+    }
+
+    /// 启动方式漏检（别名/包装脚本，输入检测从未标记 is_ai_session）时，
+    /// hook 状态照常生效，不因 !is_ai_session 被降级。
+    #[test]
+    fn alias_start_without_input_detection_keeps_hook_status() {
+        let hooks = HookState::new();
+        let mgr = PtyManager::new();
+
+        hooks.update(1, "ai-idle".to_string()); // hook 正常上报，但输入检测漏了启动
+
+        assert_eq!(resolve_status(&hooks, &mgr, 1), "ai-idle");
+    }
+
+    /// 对照组：输入检测与 hook 一致（未误判退出）时，ai-idle 正常保持。
+    #[test]
+    fn hook_ai_idle_stays_when_input_detection_agrees() {
+        let hooks = HookState::new();
+        let mgr = PtyManager::new();
+
+        mgr.track_input(1, "claude\r");
+        hooks.update(1, "ai-idle".to_string());
+
+        assert_eq!(resolve_status(&hooks, &mgr, 1), "ai-idle");
+    }
+
+    /// 无 hook 的 pane（WSL/SSH/hook 关闭）维持轮询逻辑：
+    /// 输入检测在会话中 + 无近期输出 → ai-idle；不在会话中 → idle。
+    #[test]
+    fn fallback_path_without_hook_unchanged() {
+        let hooks = HookState::new();
+        let mgr = PtyManager::new();
+
+        assert_eq!(resolve_status(&hooks, &mgr, 1), "idle");
+        mgr.track_input(1, "claude\r");
+        assert_eq!(resolve_status(&hooks, &mgr, 1), "ai-idle");
+    }
 }

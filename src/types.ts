@@ -122,6 +122,12 @@ export type StartSessionFailReason =
   | 'notSupported'
   | 'spawnFailed';
 
+/** `enable_ssh_tools` 返回值；projectToken 必须随项目配置持久化。 */
+export interface EnableSshToolsResult {
+  message: string;
+  projectToken: string;
+}
+
 export interface ProjectConfig {
   id: string;
   name: string;
@@ -130,8 +136,11 @@ export interface ProjectConfig {
   description?: string;
   savedLayout?: SavedProjectLayout;
   expandedDirs?: string[];
-  /** 是否已为该项目启用 SSH MCP（向项目目录写入了 Claude / Codex 的 MCP 注册配置） */
+  /** 是否已为该项目启用 SSH 工具（向项目目录生成了 Claude / Codex 的 SKILL.md；
+   *  字段名保留 Mcp 是为兼容存量配置，语义已是「SSH 工具（CLI + Skill）」） */
   sshMcpEnabled?: boolean;
+  /** CLI/daemon 项目能力令牌；旧项目缺失时在下次保存「关联 SSH」时自动迁移。 */
+  sshCliToken?: string;
   /** 该项目的 agent 可访问的 SSH 连接 id 列表（「关联 SSH」设定的范围）；undefined = 旧配置兼容,视为全部 */
   sshConnectionIds?: string[];
   /** 项目级环境变量,新建终端时注入到 PTY 子进程。已开终端不受影响。 */

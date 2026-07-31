@@ -5692,7 +5692,7 @@ dependencies = [
 
 [[package]]
 name = "tauri-app"
-version = "0.8.5"
+version = "0.9.0"
 dependencies = [
  "dirs",
  "futures-util",
@@ -5719,6 +5719,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "toml_edit 0.22.27",
+ "uuid",
  "windows 0.58.0",
  "windows-registry",
 ]

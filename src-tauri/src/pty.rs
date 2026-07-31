@@ -556,6 +556,20 @@ impl PtyManager {
         self.ai_started.lock().unwrap().get(&pty_id).copied()
     }
 
+    /// hook 事件证明 AI 进程存活时把会话标记扶正：输入检测漏判启动
+    /// （别名/包装脚本，命令行里没有 "claude" 字样）或误判退出（任务运行中
+    /// 双击 Ctrl+C 只是打断并不退出）的自愈路径。已标记时幂等 no-op，
+    /// 不重置 ai_started（对话镜像按它过滤旧记录，中途重置会错绑）。
+    pub fn mark_ai_session(&self, pty_id: u32) {
+        let mut sessions = self.ai_sessions.lock().unwrap();
+        if sessions.insert(pty_id) {
+            self.ai_started
+                .lock()
+                .unwrap()
+                .insert(pty_id, SystemTime::now());
+        }
+    }
+
     /// 清除 pane 的 AI 会话标记及相关输入痕迹。
     ///
     /// 输入检测到退出(双击 Ctrl+C / Ctrl+D / 显式退出命令)与 SessionEnd hook
@@ -1418,6 +1432,30 @@ mod tests {
         mgr.clear_ai_session(1);
         assert!(!mgr.is_ai_session(1));
         assert!(mgr.ai_session_started_at(1).is_none());
+    }
+
+    #[test]
+    fn mark_ai_session_rearms_after_false_exit() {
+        let mgr = PtyManager::new();
+        mgr.track_input(1, "claude\r");
+        // 任务运行中双击 Ctrl+C 打断:输入检测误判为退出
+        mgr.track_input(1, "\x03");
+        mgr.track_input(1, "\x03");
+        assert!(!mgr.is_ai_session(1));
+        // 后续 hook 事件证明 AI 还活着 → 扶正
+        mgr.mark_ai_session(1);
+        assert!(mgr.is_ai_session(1));
+        assert!(mgr.ai_session_started_at(1).is_some());
+    }
+
+    #[test]
+    fn mark_ai_session_idempotent_keeps_started_at() {
+        let mgr = PtyManager::new();
+        mgr.track_input(1, "claude\r");
+        let started = mgr.ai_session_started_at(1).expect("进入会话应记录启动时刻");
+        // 会话已标记时 mark 为 no-op,不得重置 ai_started(镜像按它过滤旧记录)
+        mgr.mark_ai_session(1);
+        assert_eq!(mgr.ai_session_started_at(1), Some(started));
     }
 
     #[test]

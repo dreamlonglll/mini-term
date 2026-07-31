@@ -252,9 +252,13 @@ pub struct ProjectConfig {
     pub saved_layout: Option<SavedProjectLayout>,
     #[serde(default)]
     pub expanded_dirs: Vec<String>,
-    /// 是否已为该项目启用 SSH MCP（向项目目录写入了 Claude / Codex 的 MCP 注册配置）。
+    /// 是否已为该项目启用 SSH 工具（字段名保留 MCP 以兼容存量配置）。
     #[serde(default)]
     pub ssh_mcp_enabled: bool,
+    /// CLI/daemon 项目能力令牌。随机生成并写入项目 SKILL.md，用于不可伪造地
+    /// 解析该项目的 SSH 连接范围；旧配置缺失时在下次保存「关联 SSH」时迁移。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ssh_cli_token: Option<String>,
     /// 该项目的 agent 可访问的 SSH 连接 id 列表（「关联 SSH」设定的范围）。
     /// `None` = 未设置 → 默认全部连接可见。
     #[serde(default, skip_serializing_if = "Option::is_none")]
