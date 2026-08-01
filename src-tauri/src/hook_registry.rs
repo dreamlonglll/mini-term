@@ -31,6 +31,8 @@ const CLAUDE_HOOK_EVENTS: &[&str] = &[
 /// Codex 需要注册的 hook 事件列表
 const CODEX_HOOK_EVENTS: &[&str] = &[
     "SessionStart",
+    // process_monitor 的 hook 权威模式只接受 SessionEnd 作为会话退出信号。
+    "SessionEnd",
     "UserPromptSubmit",
     "PreToolUse",
     "PostToolUse",
@@ -536,4 +538,28 @@ pub fn get_hook_status(
         port: hook_state.get_port(),
         running: hook_state.is_server_running(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_registration_includes_authoritative_session_end() {
+        assert_eq!(
+            CODEX_HOOK_EVENTS
+                .iter()
+                .filter(|event| **event == "SessionEnd")
+                .count(),
+            1,
+            "Codex 必须且只能注册一次 SessionEnd"
+        );
+
+        let entry = build_codex_hook_entry("miniterm-hook", "SessionEnd");
+        let command = entry[0]["hooks"][0]["command"]
+            .as_str()
+            .expect("SessionEnd hook 应包含命令");
+        assert!(command.contains("miniterm-hook"));
+        assert!(command.ends_with(" SessionEnd"));
+    }
 }
