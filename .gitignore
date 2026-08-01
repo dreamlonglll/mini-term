@@ -42,3 +42,6 @@ dist-ssr
 # 构建时下载并校验的官方 ConPTY 包与 staging 产物
 src-tauri/.conpty-cache/
 src-tauri/resources/portable-conpty/
+# mini-term SSH skill（本机相关生成物，勿提交）
+.claude/skills/mini-term-ssh/
+.codex/skills/mini-term-ssh/
