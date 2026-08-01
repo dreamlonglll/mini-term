@@ -28,7 +28,7 @@ mt-ssh = { path = "mt-ssh" }
 # 远程 SSH 能力需要的 tokio 面:time(外层超时)、io-util(SFTP 流读扩展 trait)。
 # 运行时本身由 Tauri v2 的 async runtime(tokio)提供,这里只声明直接用到的 feature。
 tokio = { version = "1", features = ["time", "io-util", "sync", "macros", "rt"] }
-tauri = { version = "2", features = ["protocol-asset", "devtools"] }
+tauri = { version = "2", features = ["protocol-asset", "devtools", "tray-icon"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }

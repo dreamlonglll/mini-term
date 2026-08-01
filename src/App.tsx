@@ -5,7 +5,7 @@ import { getVersion } from '@tauri-apps/api/app';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { ask } from '@tauri-apps/plugin-dialog';
-import { useAppStore, restoreLayout, flushLayoutToConfig, initExpandedDirs, flushExpandedDirsToConfig, flushProjectToConfig, persistConfig, setPaneAiSessionByPty, saveLayoutToConfig } from './store';
+import { useAppStore, restoreLayout, flushLayoutToConfig, initExpandedDirs, flushExpandedDirsToConfig, flushProjectToConfig, persistConfig, setPaneAiSessionByPty, saveLayoutToConfig, syncTrayStatus, setWindowFocused, saveConfigToDisk, setConfigToken } from './store';
 import { TerminalArea } from './components/TerminalArea';
 import { ProjectList } from './components/ProjectList';
 import { FileTree } from './components/FileTree';
@@ -14,6 +14,7 @@ import { RightDrawer } from './components/RightDrawer';
 import { SettingsModal, type SettingsPage } from './components/SettingsModal';
 import { SshModal } from './components/SshModal';
 import { MobileRelayModal } from './components/MobileRelayModal';
+import { UsageStatsModal } from './components/usage/UsageStatsModal';
 import { SearchModal } from './components/SearchModal';
 import { ToastContainer } from './components/ToastContainer';
 import { FirstRunGuide } from './components/FirstRunGuide';
@@ -62,6 +63,7 @@ export function App() {
   const [configPage, setConfigPage] = useState<SettingsPage | undefined>(undefined);
   const [sshOpen, setSshOpen] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
+  const [statsOpen, setStatsOpen] = useState(false);
   const [switcherOpen, setSwitcherOpen] = useState(false);
   const [updateInfo, setUpdateInfo] = useState<ReleaseInfo | null>(null);
   const [mountedProjectIds, setMountedProjectIds] = useState<string[]>([]);
@@ -73,7 +75,24 @@ export function App() {
   const setSearchModalOpen = useAppStore((s) => s.setSearchModalOpen);
 
   useEffect(() => {
-    invoke<AppConfig>('load_config').then((cfg) => {
+    // 加载失败重试 3 次;仍失败则显示窗口并明确报错,绝不带着空白配置
+    // 静默运行。写盘由令牌把关:load_config 成功才发放令牌,save_config
+    // 必须携带当前令牌——空白页面/加载失败的页面天然没有写盘资格,
+    // 防止空状态覆盖磁盘上的完整配置
+    const loadWithRetry = async (): Promise<{ config: AppConfig; token: number }> => {
+      let lastErr: unknown;
+      for (let i = 0; i < 3; i++) {
+        try {
+          return await invoke<{ config: AppConfig; token: number }>('load_config');
+        } catch (e) {
+          lastErr = e;
+          await new Promise((r) => setTimeout(r, 500 * (i + 1)));
+        }
+      }
+      throw lastErr;
+    };
+    loadWithRetry().then(({ config: cfg, token }) => {
+      setConfigToken(token);
       setConfig(cfg);
       // 应用 UI 字体大小
       if (cfg.uiFontSize) {
@@ -120,6 +139,11 @@ export function App() {
         }));
       };
       showWindow();
+    }).catch((e) => {
+      // 配置加载彻底失败:显示窗口让用户看到明确报错,而不是一个"全新"的空应用
+      getCurrentWindow().show();
+      console.error('load_config 失败:', e);
+      alert(t('app.configLoadFailed', { detail: String(e) }));
     });
   }, []);
 
@@ -175,8 +199,62 @@ export function App() {
 
   useTauriEvent<PtyStatusChangePayload>('pty-status-change', useCallback((payload) => {
     markAiPty(payload.ptyId, payload.status === 'ai-working' || payload.status === 'ai-idle');
-    updatePaneStatusByPty(payload.ptyId, payload.status as PaneStatus);
+    updatePaneStatusByPty(payload.ptyId, payload.status as PaneStatus, payload.cause);
   }, [updatePaneStatusByPty]));
+
+  // 菜单栏状态灯:焦点变化经 Tauri 原生事件上报(DOM focus 在点原生标题栏等
+  // 场景不可靠,曾导致绿灯不灭)。聚焦 = 完成已读,绿灯熄灭;失焦状态供闪烁策略用
+  useEffect(() => {
+    const unlisten = getCurrentWindow().onFocusChanged(({ payload: focused }) => {
+      setWindowFocused(focused);
+      if (focused) {
+        useAppStore.getState().clearUnreadDone();
+      }
+      syncTrayStatus();
+    });
+    return () => { unlisten.then((fn) => fn()); };
+  }, []);
+
+  // 点击托盘 → 跳到最需要注意的项目(黄 > 蓝 > 绿 同托盘优先级)
+  useTauriEvent<null>('tray-clicked', useCallback(() => {
+    const { projectStates, unreadDonePaneIds, setActiveProject } = useAppStore.getState();
+    let workingPid: string | null = null;
+    let donePid: string | null = null;
+    for (const [pid, ps] of projectStates) {
+      if (!ps.layout) continue;
+      const stack = [ps.layout];
+      while (stack.length) {
+        const node = stack.pop()!;
+        if (node.type === 'leaf') {
+          for (const pane of node.panes) {
+            if (pane.status === 'error' || pane.attention) {
+              setActiveProject(pid);
+              return;
+            }
+            if (pane.status === 'ai-working') workingPid ??= pid;
+            if (unreadDonePaneIds.has(pane.id)) donePid ??= pid;
+          }
+        } else {
+          stack.push(...node.children);
+        }
+      }
+    }
+    const target = workingPid ?? donePid;
+    if (target) setActiveProject(target);
+  }, []));
+
+  // 托盘右键菜单点击项目 → 直接跳到该项目
+  useTauriEvent<string>('tray-project-clicked', useCallback((projectId) => {
+    const { config, setActiveProject } = useAppStore.getState();
+    if (config.projects.some((p) => p.id === projectId)) setActiveProject(projectId);
+  }, []));
+
+  // 托盘开关/上限配置变化时立即生效(签名含 enabled,重复调用被去重)
+  const trayStatusEnabled = useAppStore((s) => s.config.trayStatusEnabled ?? true);
+  const trayMaxProjects = useAppStore((s) => s.config.trayMaxProjects ?? 5);
+  useEffect(() => {
+    syncTrayStatus();
+  }, [trayStatusEnabled, trayMaxProjects]);
 
   // hook 上报的 AI 会话身份 → 写进 pane 并防抖持久化,供重启后 resume 续接
   useTauriEvent<{ ptyId: number; agent?: string; sessionId: string }>('pty-ai-session', useCallback((payload) => {
@@ -302,7 +380,7 @@ export function App() {
       const cfg = useAppStore.getState().config;
       const newConfig = { ...cfg, layoutSizes: sizes };
       setConfig(newConfig);
-      invoke('save_config', { config: newConfig });
+      saveConfigToDisk(newConfig);
     }, 500);
   }, [setConfig]);
 
@@ -313,7 +391,7 @@ export function App() {
       const cfg = useAppStore.getState().config;
       const newConfig = { ...cfg, middleColumnSizes: sizes };
       setConfig(newConfig);
-      invoke('save_config', { config: newConfig });
+      saveConfigToDisk(newConfig);
     }, 500);
   }, [setConfig]);
 
@@ -322,7 +400,7 @@ export function App() {
     const cfg = useAppStore.getState().config;
     const newConfig = { ...cfg, rightDrawerWidth: width };
     setConfig(newConfig);
-    invoke('save_config', { config: newConfig });
+    saveConfigToDisk(newConfig);
   }, [setConfig]);
 
   return (
@@ -334,6 +412,7 @@ export function App() {
             onOpenSettings={() => { setConfigPage(undefined); setConfigOpen(true); }}
             onOpenSsh={() => setSshOpen(true)}
             onOpenMobile={() => setMobileOpen(true)}
+            onOpenStats={() => setStatsOpen(true)}
             updateVersion={updateInfo?.version ?? null}
             onOpenUpdate={() => { if (updateInfo) openUrl(updateInfo.url); }}
           />
@@ -397,6 +476,7 @@ export function App() {
       <SettingsModal open={configOpen} onClose={() => setConfigOpen(false)} initialPage={configPage} />
       <SshModal open={sshOpen} onClose={() => setSshOpen(false)} />
       <MobileRelayModal open={mobileOpen} onClose={() => setMobileOpen(false)} />
+      <UsageStatsModal open={statsOpen} onClose={() => setStatsOpen(false)} />
       <SearchModal open={searchModalOpen} onClose={() => setSearchModalOpen(false)} />
       <ProjectSwitcher open={switcherOpen} onClose={() => setSwitcherOpen(false)} />
       <TerminalSearchBar />

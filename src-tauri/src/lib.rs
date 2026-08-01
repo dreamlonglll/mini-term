@@ -16,6 +16,8 @@ mod search;
 mod ssh;
 mod ssh_mcp_registry;
 mod ssh_skill_registry;
+mod tray;
+mod usage_stats;
 mod window_input_recovery;
 mod window_theme;
 mod wsl_distros;
@@ -30,6 +32,7 @@ pub fn run() {
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_window_state::Builder::new().build())
         .manage(pty::PtyManager::new())
+        .manage(config::ConfigToken(std::sync::atomic::AtomicU64::new(0)))
         .manage(fs::FsWatcherManager::new())
         .manage(search::SearchManager::new())
         .manage(mobile_relay::MobileRelayManager::new())
@@ -47,6 +50,14 @@ pub fn run() {
             config::migrate_legacy_app_data(app.handle());
             clipboard::cleanup_old_clipboard_images();
             ssh::cleanup_ssh_temp_keys();
+
+            // 菜单栏状态灯(黄=待确认 蓝=处理中 绿=完成未读 灰=安静)
+            match tray::init_tray(app.handle()) {
+                Ok(tray_state) => {
+                    app.manage(tray_state);
+                }
+                Err(e) => eprintln!("[setup] 托盘状态灯初始化失败: {}", e),
+            }
 
             // 初始化 hook 状态并注册为 Tauri managed state
             let hook_state = hook_server::HookState::new();
@@ -103,6 +114,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             config::load_config,
             config::save_config,
+            tray::set_tray_status,
             pty::create_pty,
             pty::write_pty,
             pty::resize_pty,
@@ -171,6 +183,8 @@ pub fn run() {
             mobile_relay::mobile_relay_launchers_changed,
             mobile_relay::mobile_relay_start_session_result,
             mobile_relay::mobile_relay_check_launcher_command,
+            usage_stats::start_usage_stats,
+            usage_stats::cancel_usage_stats,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

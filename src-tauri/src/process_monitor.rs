@@ -11,6 +11,10 @@ use tauri::{AppHandle, Emitter};
 pub struct PtyStatusChangePayload {
     pub pty_id: u32,
     pub status: String,
+    /// 状态成因(hook 事件语义):"attention" = 需要用户确认(授权/输入请求),
+    /// "stop" = 一轮回答正常结束;None = 无成因信息(monitor 降级路径)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cause: Option<String>,
 }
 
 /// AI 输出活跃超时阈值
@@ -25,7 +29,8 @@ const AI_ACTIVE_TIMEOUT: Duration = Duration::from_secs(3);
 /// 比较、记录、emit 收在同一把锁内，保证两个发射源的事件顺序一致。
 #[derive(Clone)]
 pub struct StatusEmitter {
-    prev: Arc<Mutex<HashMap<u32, String>>>,
+    /// pty → 上次发出的 (status, cause)
+    prev: Arc<Mutex<HashMap<u32, (String, Option<String>)>>>,
 }
 
 impl StatusEmitter {
@@ -35,18 +40,36 @@ impl StatusEmitter {
         }
     }
 
-    /// 与上次发出的状态不同才 emit
-    pub fn emit_if_changed(&self, app: &AppHandle, pty_id: u32, status: &str) {
+    /// 与上次发出的状态不同才 emit。
+    /// cause 规则:
+    /// - 状态变化 → 总是 emit(cause 取本次值,None 会清掉前端 attention 标注,
+    ///   这正是「用户批准后下一个事件自然熄灭黄灯」的路径);
+    /// - 状态相同 + cause=None → **跳过**:monitor 每 500ms 以无成因方式重发
+    ///   hook 状态,若放行会在黄灯点亮后 500ms 内把 attention 抹掉
+    ///   (黄灯闪一下就被蓝色顶掉的根因);
+    /// - 状态相同 + cause=attention → **总是 emit**:黄灯的清除发生在前端
+    ///   (用户键入即批准),后端去重表感知不到;若按相同 cause 去重,
+    ///   同一轮内第二次授权请求会被吞掉,黄灯不再点亮;
+    /// - 状态相同 + 其他 cause 变化 → emit(如 attention → stop)。
+    pub fn emit_if_changed(&self, app: &AppHandle, pty_id: u32, status: &str, cause: Option<&str>) {
         let mut prev = self.prev.lock().unwrap();
-        if prev.get(&pty_id).map(|s| s.as_str()) == Some(status) {
-            return;
+        if let Some((prev_status, prev_cause)) = prev.get(&pty_id) {
+            if prev_status == status {
+                match cause {
+                    None => return,
+                    Some("attention") => {}
+                    Some(c) if prev_cause.as_deref() == Some(c) => return,
+                    _ => {}
+                }
+            }
         }
-        prev.insert(pty_id, status.to_string());
+        prev.insert(pty_id, (status.to_string(), cause.map(|s| s.to_string())));
         let _ = app.emit(
             "pty-status-change",
             PtyStatusChangePayload {
                 pty_id,
                 status: status.to_string(),
+                cause: cause.map(|s| s.to_string()),
             },
         );
     }
@@ -110,7 +133,7 @@ pub fn start_monitor(
 
             for pty_id in &pty_ids {
                 let status = resolve_status(&hook_state, &pty_manager, *pty_id);
-                emitter.emit_if_changed(&app, *pty_id, &status);
+                emitter.emit_if_changed(&app, *pty_id, &status, None);
             }
 
             emitter.retain(&pty_ids);

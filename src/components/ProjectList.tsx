@@ -3,7 +3,7 @@ import { open } from '@tauri-apps/plugin-dialog';
 import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { revealItemInDir } from '@tauri-apps/plugin-opener';
-import { useAppStore, genId } from '../store';
+import { useAppStore, genId, saveConfigToDisk } from '../store';
 import { removeProjectWithCleanup } from '../utils/projectActions';
 import { StatusDot } from './StatusDot';
 import { DoneTag } from './DoneTag';
@@ -35,7 +35,7 @@ import type { PaneStatus, SplitNode, ProjectConfig, ProjectGroup, ProjectTreeIte
 // 保存配置的快捷方法
 function saveConfig() {
   const config = useAppStore.getState().config;
-  invoke('save_config', { config });
+  saveConfigToDisk(config);
 }
 
 // 模块级缓存:WSL 发行版列表只 invoke 一次。
@@ -180,7 +180,7 @@ export function ProjectList() {
       ),
     };
     useAppStore.getState().setConfig(newConfig);
-    invoke('save_config', { config: newConfig });
+    saveConfigToDisk(newConfig);
   }, []);
 
   // === 系统文件拖放（从资源管理器拖入文件夹添加项目） ===

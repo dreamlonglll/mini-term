@@ -2,7 +2,7 @@
  * 项目级操作的共享实现(不依赖 React,组件与弹窗都能调)。
  */
 import { invoke } from '@tauri-apps/api/core';
-import { useAppStore, collectPtyIds } from '../store';
+import { useAppStore, collectPtyIds, saveConfigToDisk } from '../store';
 import { disposeTerminal } from './terminalCache';
 
 /** 路径归一化:worktree 路径与项目路径可能一个用 / 一个用 \,比对前统一。 */
@@ -38,5 +38,5 @@ export function disposeProjectTerminals(id: string): void {
 export function removeProjectWithCleanup(id: string): void {
   disposeProjectTerminals(id);
   useAppStore.getState().removeProject(id);
-  invoke('save_config', { config: useAppStore.getState().config });
+  saveConfigToDisk();
 }

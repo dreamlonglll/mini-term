@@ -3,7 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { ask, message } from '@tauri-apps/plugin-dialog';
 import { revealItemInDir } from '@tauri-apps/plugin-opener';
 import { writeText } from '@tauri-apps/plugin-clipboard-manager';
-import { useAppStore, isExpanded, toggleExpandedDir } from '../store';
+import { useAppStore, isExpanded, toggleExpandedDir, saveConfigToDisk } from '../store';
 import { useTauriEvent } from '../hooks/useTauriEvent';
 import { useOverlayValue } from '../hooks/useOverlayMotion';
 import { showContextMenu } from '../utils/contextMenu';
@@ -387,7 +387,7 @@ export function FileTree() {
   const handleSwitchAndOpen = useCallback((editorName: string) => {
     const newConfig = { ...config, defaultEditor: editorName };
     useAppStore.getState().setConfig(newConfig);
-    invoke('save_config', { config: newConfig });
+    saveConfigToDisk(newConfig);
     handleOpenInEditor(editorName);
   }, [config, handleOpenInEditor]);
 

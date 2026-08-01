@@ -469,7 +469,8 @@ fn get_codex_sessions(project_path: &str) -> Vec<AiSession> {
 }
 
 /// 加载 Codex session_index.jsonl → { id: thread_name }
-fn load_codex_thread_names(codex_dir: &Path) -> HashMap<String, String> {
+/// pub(crate)：使用统计(usage_stats)全局扫描时复用同一标题映射。
+pub(crate) fn load_codex_thread_names(codex_dir: &Path) -> HashMap<String, String> {
     let index_path = codex_dir.join("session_index.jsonl");
     let mut map = HashMap::new();
 

@@ -47,6 +47,10 @@ export interface AppConfig {
   lastActiveProjectId?: string;
   hookEnabled: boolean;
   smartCopyPaste: boolean;
+  /** 菜单栏项目状态灯总开关;undefined = 开启 */
+  trayStatusEnabled?: boolean;
+  /** 托盘右键菜单最多显示的活跃项目数;undefined = 5 */
+  trayMaxProjects?: number;
   /** 拖选按住不动自动复制的静止时长(秒);undefined = 1 */
   selectionAutoCopySecs?: number;
   sshConnections: SshConnection[];
@@ -266,6 +270,8 @@ export interface PaneState {
   /** 当前/上次 AI 会话身份(hook 上报),随布局持久化;会话正常退出时清除。
    *  恢复布局时有值 = 待续接,PaneGroup 起 PTY 后写 resume 命令并清除。 */
   aiSession?: AiSessionRef;
+  /** ai-idle 的成因是「需要用户确认」(授权/输入请求);运行时状态不持久化 */
+  attention?: boolean;
 }
 
 // === AI 会话 ===
@@ -332,6 +338,9 @@ export interface PtyExitPayload {
 export interface PtyStatusChangePayload {
   ptyId: number;
   status: PaneStatus;
+  /** 状态成因(hook 事件语义):'attention' = 需要用户确认,'stop' = 一轮回答
+   *  正常结束;缺省 = 无成因信息(monitor 降级路径)。托盘黄/绿灯靠它区分。 */
+  cause?: 'attention' | 'stop';
 }
 
 export interface FsChangePayload {
@@ -473,4 +482,98 @@ export interface AiMarker {
   ts: number;            // epoch ms
   xtermMarkerId: number; // xterm IMarker.id,用于查找 module-local 缓存
   inProgress: boolean;   // 最后一个 marker 为 true,新 marker 到来时前一个翻 false
+}
+
+// === 使用统计（对齐 Rust usage_stats camelCase 序列化） ===
+
+export type UsageAgentFilter = 'all' | 'claude' | 'codex';
+export type UsageRange = 'today' | 'days7' | 'days30' | 'all';
+
+/** 单模型价格（$/token，前端拉 models.dev 后 ÷1e6 归一） */
+export interface ModelPriceEntry {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+}
+
+export interface UsageDailyStat {
+  /** 日粒度 "YYYY-MM-DD"；「今天」视图为小时粒度 "HH:00"（均本地时区） */
+  date: string;
+  cost: number;
+  calls: number;
+  /** hover 详情用的 token 明细 */
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+}
+
+export interface UsageProjectStat {
+  path: string;
+  name: string;
+  cost: number;
+  sessions: number;
+  calls: number;
+  tokens: number;
+}
+
+export interface UsageTopSessionStat {
+  sessionId: string;
+  agent: string;
+  projectPath: string;
+  projectName: string;
+  title: string;
+  timestamp: string; // "YYYY-MM-DD"（本地日历日）
+  cost: number;
+  calls: number;
+  tokens: number;
+}
+
+export interface UsageModelStat {
+  /** 归一后的模型名（剥日期/provider 前缀）；空串 = 未知模型 */
+  model: string;
+  cost: number;
+  calls: number;
+  tokens: number;
+}
+
+export interface UsageProviderStat {
+  /** 供应商展示名（baseurl 的 host） */
+  provider: string;
+  cost: number;
+  calls: number;
+  tokens: number;
+  sessions: number;
+}
+
+export interface UsageStatsPayload {
+  totalCost: number;
+  totalCalls: number;
+  sessionCount: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  daily: UsageDailyStat[];
+  byProject: UsageProjectStat[];
+  byModel: UsageModelStat[];
+  byProvider: UsageProviderStat[];
+  topSessions: UsageTopSessionStat[];
+}
+
+export interface UsageStatsProgressPayload {
+  requestId: string;
+  processed: number;
+  total: number;
+  partial: UsageStatsPayload;
+}
+
+export interface UsageStatsDonePayload {
+  requestId: string;
+  stats: UsageStatsPayload;
+}
+
+export interface UsageStatsErrorPayload {
+  requestId: string;
+  error: string;
 }
