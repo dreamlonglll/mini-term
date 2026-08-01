@@ -113,12 +113,14 @@ impl HookState {
     }
 
     /// 记录 hook 上报的会话身份(每个事件都带,直接覆盖即可)。
-    /// 返回身份是否发生变化(新 pane 或换会话),变化时调用方通知前端。
+    /// 返回身份是否发生变化(新 pane/换会话/agent 修正),变化时调用方通知前端。
+    /// agent 也参与比较:codex 的 SessionStart 不带 turn_id 会被 hook 二进制
+    /// 误推断为 claude-code,靠后续带 turn_id 的事件在这里纠正并重新通知。
     fn record_session(&self, pty_id: u32, agent: Option<String>, session_id: String) -> bool {
         let mut map = self.last_session.lock().unwrap();
         let changed = map
             .get(&pty_id)
-            .map_or(true, |prev| prev.session_id != session_id);
+            .map_or(true, |prev| prev.session_id != session_id || prev.agent != agent);
         map.insert(pty_id, HookSessionId { agent, session_id });
         changed
     }
@@ -203,6 +205,14 @@ impl HookState {
             .unwrap()
             .get(&pty_id)
             .map_or(false, |q| q.iter().any(|s| s == session_id))
+    }
+
+    /// 摘除墓碑:SessionStart 表明同 id 会话再次存活(退出后 claude -c / --resume
+    /// 重开),不摘的话该会话的后续事件被永久忽略,身份也无法重新记录
+    pub fn revive_session(&self, pty_id: u32, session_id: &str) {
+        if let Some(queue) = self.ended_sessions.lock().unwrap().get_mut(&pty_id) {
+            queue.retain(|s| s != session_id);
+        }
     }
 
     /// 获取当前服务器端口
@@ -386,9 +396,13 @@ pub fn start_hook_server(
                     }
                 } else {
                     // 已结束会话的迟到事件直接丢弃：hook 脚本是独立进程，
-                    // POST 到达顺序无保证，放行会把退出后的 pane 推回 ai-idle
+                    // POST 到达顺序无保证，放行会把退出后的 pane 推回 ai-idle。
+                    // 例外:SessionStart 是会话再次存活的肯定证据(退出后 claude -c /
+                    // --resume 同 id 重开),复活墓碑走正常记录,否则该会话被永久忽略
                     if let Some(sid) = payload.session_id.as_deref() {
-                        if hook_state.is_session_ended(pty_id, sid) {
+                        if event == "SessionStart" {
+                            hook_state.revive_session(pty_id, sid);
+                        } else if hook_state.is_session_ended(pty_id, sid) {
                             eprintln!(
                                 "[hook-server] pty_id={} event={} 来自已结束会话 {}，忽略",
                                 pty_id, event, sid
