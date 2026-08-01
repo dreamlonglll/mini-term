@@ -19,6 +19,7 @@ import type {
 } from './types';
 import { restoreSavedProjectLayout } from './utils/layoutRestore';
 import { playNotificationSound } from './utils/notificationSound';
+import { t } from './i18n';
 import {
   deepCloneTree,
   removeFromTree,
@@ -58,7 +59,8 @@ export function getHighestStatus(node: SplitNode): PaneStatus {
 // 在 SplitNode 中更新指定 pane 的状态。
 // 回到 idle/error = AI 会话不复存在,连带清掉待续接的会话身份,
 // 避免用户主动退出 claude 后下次启动又被 resume 回来。
-function updatePaneStatus(node: SplitNode, ptyId: number, status: PaneStatus): SplitNode {
+// attention = 本次 ai-idle 的成因是「需要用户确认」(托盘黄灯依据)。
+function updatePaneStatus(node: SplitNode, ptyId: number, status: PaneStatus, attention: boolean): SplitNode {
   if (node.type === 'leaf') {
     const idx = node.panes.findIndex((p) => p.ptyId === ptyId);
     if (idx >= 0) {
@@ -66,6 +68,7 @@ function updatePaneStatus(node: SplitNode, ptyId: number, status: PaneStatus): S
       newPanes[idx] = {
         ...newPanes[idx],
         status,
+        attention: attention || undefined,
         ...(status === 'idle' || status === 'error' ? { aiSession: undefined } : {}),
       };
       return { ...node, panes: newPanes };
@@ -74,7 +77,7 @@ function updatePaneStatus(node: SplitNode, ptyId: number, status: PaneStatus): S
   }
   return {
     ...node,
-    children: node.children.map((c) => updatePaneStatus(c, ptyId, status)),
+    children: node.children.map((c) => updatePaneStatus(c, ptyId, status, attention)),
   };
 }
 
@@ -145,6 +148,110 @@ export function setPaneAiSessionByPty(
     return { projectStates: newStates };
   });
   return ctx.projectId;
+}
+
+// 主窗口聚焦状态(App.tsx 经 tauri onFocusChanged 维护)。
+// 聚焦时完成的任务用户正看着,不计入「未读完成」;托盘闪烁也依赖此值。
+let windowFocusedFlag = true;
+export function setWindowFocused(focused: boolean): void {
+  windowFocusedFlag = focused;
+}
+
+/** 用户对 pane 键入 = 已在处理待确认事项,清掉 attention 黄灯。
+ *  codex 批准后直到 PostToolUse 无任何 hook 事件,不清会误挂整个执行期。 */
+export function clearPaneAttentionByPty(ptyId: number): void {
+  const ctx = findPaneContextByPty(ptyId);
+  if (!ctx?.pane.attention) return;
+  useAppStore.setState((state) => {
+    const ps = state.projectStates.get(ctx.projectId);
+    if (!ps?.layout) return state;
+    const newStates = new Map(state.projectStates);
+    newStates.set(ctx.projectId, { ...ps, layout: patchPaneByPty(ps.layout, ptyId, { attention: undefined }) });
+    return { projectStates: newStates };
+  });
+  queueMicrotask(syncTrayStatus);
+}
+
+// === 菜单栏状态灯 ===
+// 聚合全部 pane 状态推送 Rust 托盘(黄=待确认/异常 蓝=处理中 绿=完成未读)。
+// 同时按项目生成右键菜单明细(只列活跃项目,按 黄>蓝>绿 排序,上限可配)。
+// 签名去重:聚合结果没变不打 IPC。
+// seq:单调递增序号随每次推送带给后端——command 在 Rust 线程池上可能乱序
+// 执行,后端按序号丢弃过期推送,防止旧状态覆盖新状态。
+let lastTraySig = '';
+let traySeq = 0;
+export function syncTrayStatus(): void {
+  const { projectStates, unreadDonePaneIds, config } = useAppStore.getState();
+  const enabled = config.trayStatusEnabled ?? true;
+  const maxProjects = config.trayMaxProjects ?? 5;
+
+  let attention = 0;
+  let working = 0;
+  let done = 0;
+  // 每个活跃项目的状态聚合:优先级 attention > working > done
+  const perProject: { id: string; name: string; kind: 'attention' | 'working' | 'done' }[] = [];
+  for (const [pid, ps] of projectStates) {
+    if (!ps.layout) continue;
+    let pAttention = false;
+    let pWorking = false;
+    let pDone = false;
+    const stack: SplitNode[] = [ps.layout];
+    while (stack.length) {
+      const node = stack.pop()!;
+      if (node.type === 'leaf') {
+        for (const pane of node.panes) {
+          if (pane.status === 'error' || pane.attention) {
+            attention++;
+            pAttention = true;
+          } else if (pane.status === 'ai-working') {
+            working++;
+            pWorking = true;
+          }
+          // 只数仍存在的 pane(关掉即失效);又开始工作的不再算「未读完成」
+          if (unreadDonePaneIds.has(pane.id) && pane.status !== 'ai-working') {
+            done++;
+            pDone = true;
+          }
+        }
+      } else {
+        stack.push(...node.children);
+      }
+    }
+    if (pAttention || pWorking || pDone) {
+      const name = config.projects.find((p) => p.id === pid)?.name ?? pid;
+      perProject.push({
+        id: pid,
+        name,
+        kind: pAttention ? 'attention' : pWorking ? 'working' : 'done',
+      });
+    }
+  }
+
+  const KIND_ORDER = { attention: 0, working: 1, done: 2 } as const;
+  const KIND_EMOJI = { attention: '🟡', working: '🔵', done: '🟢' } as const;
+  perProject.sort((a, b) => KIND_ORDER[a.kind] - KIND_ORDER[b.kind]);
+  const projects = perProject.slice(0, maxProjects).map((p) => ({
+    id: p.id,
+    label: `${KIND_EMOJI[p.kind]} ${p.name} · ${t(`app.trayStatus.${p.kind}`)}`,
+  }));
+
+  const sig = `${enabled}|${windowFocusedFlag}|${attention}|${working}|${done}|${projects.map((p) => p.label).join(',')}`;
+  if (sig === lastTraySig) return;
+  lastTraySig = sig;
+  const parts: string[] = [];
+  if (attention) parts.push(t('app.trayAttention', { count: attention }));
+  if (working) parts.push(t('app.trayWorking', { count: working }));
+  if (done) parts.push(t('app.trayDone', { count: done }));
+  invoke('set_tray_status', {
+    seq: ++traySeq,
+    attention: attention > 0,
+    working: working > 0,
+    done: done > 0,
+    tooltip: parts.join(' · '),
+    projects,
+    enabled,
+    focused: windowFocusedFlag,
+  }).catch(() => {});
 }
 
 function updatePaneById(
@@ -271,7 +378,7 @@ function applyExpandedDirsToStore(projectId: string) {
 
 function doSaveExpandedDirs(projectId: string) {
   applyExpandedDirsToStore(projectId);
-  invoke('save_config', { config: useAppStore.getState().config });
+  saveConfigToDisk();
 }
 
 function saveExpandedDirsToConfig(projectId: string) {
@@ -311,7 +418,7 @@ function applyLayoutToStore(projectId: string) {
 
 function doSaveLayout(projectId: string) {
   applyLayoutToStore(projectId);
-  invoke('save_config', { config: useAppStore.getState().config });
+  saveConfigToDisk();
 }
 
 export function saveLayoutToConfig(projectId: string) {
@@ -359,9 +466,28 @@ export function flushProjectToConfig(projectId: string) {
   useAppStore.getState().setConfig(newConfig);
 }
 
+// 配置写盘令牌:App.tsx 在 load_config 成功后写入;save_config 必须携带,
+// 后端校验与当前一代一致才允许写盘。空白页面(未加载完/HMR 重载)与加载
+// 失败的页面拿不到有效令牌,其保存天然被拒——防止空配置覆盖磁盘。
+let configToken = 0;
+export function setConfigToken(token: number): void {
+  // 只接受更新的令牌:StrictMode 双挂载/重试会并发两次 load_config,
+  // 后端令牌单调递增,若旧的一次后完成回写,会把过期令牌留在这里,
+  // 之后所有保存都被后端拒绝
+  if (token > configToken) configToken = token;
+}
+
+/** 配置写盘唯一入口:统一携带令牌。config 缺省 = store 当前值 */
+export function saveConfigToDisk(config?: AppConfig): Promise<void> {
+  return invoke('save_config', {
+    token: configToken,
+    config: config ?? useAppStore.getState().config,
+  });
+}
+
 /** 将当前 store 中的 config 写入磁盘（返回 Promise） */
 export function persistConfig() {
-  return invoke('save_config', { config: useAppStore.getState().config });
+  return saveConfigToDisk();
 }
 
 // Toast 自动消失定时器（按 id）。悬停暂停 = 清掉定时器，移开 = 重新计时满 5s。
@@ -414,7 +540,10 @@ interface AppStore {
   setProjectLayout: (projectId: string, layout: SplitNode | null) => void;
 
   // Pane 状态
-  updatePaneStatusByPty: (ptyId: number, status: PaneStatus) => void;
+  updatePaneStatusByPty: (ptyId: number, status: PaneStatus, cause?: 'attention' | 'stop') => void;
+  /** 托盘绿灯的「已完成未读」pane 集合;激活主窗口时清空 */
+  unreadDonePaneIds: Set<string>;
+  clearUnreadDone: () => void;
   setPanePty: (projectId: string, paneId: string, ptyId: number) => void;
   updatePaneStatusByPaneId: (projectId: string, paneId: string, status: PaneStatus) => void;
   /** 移动端改会话名:按 paneId 全局定位;空串 = 清除自定义名,回落 shell 名 */
@@ -604,6 +733,8 @@ export const useAppStore = create<AppStore>((set, get) => ({
         markersByPty: newMarkers,
       };
     });
+    // 关掉整个项目 = 它的 pane 状态全部消失,托盘同步刷新(蓝/黄灯不残留)
+    queueMicrotask(syncTrayStatus);
   },
 
   renameProject: (id, name) =>
@@ -626,7 +757,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
       },
     })),
 
-  setProjectLayout: (projectId, layout) =>
+  setProjectLayout: (projectId, layout) => {
     set((state) => {
       const ps = state.projectStates.get(projectId);
       if (!ps) return state;
@@ -652,38 +783,62 @@ export const useAppStore = create<AppStore>((set, get) => ({
         status: layout ? getHighestStatus(layout) : 'idle',
       });
       return { projectStates: newStates, markersByPty: newMarkers };
-    }),
+    });
+    // pane 被关掉时托盘也要跟着变(蓝/黄灯不残留)
+    queueMicrotask(syncTrayStatus);
+  },
 
-  updatePaneStatusByPty: (ptyId, status) =>
+  updatePaneStatusByPty: (ptyId, status, cause) => {
     set((state) => {
       // 1. 找到 pane 所属项目并捕获 oldStatus
       let oldStatus: PaneStatus | null = null;
       let owningProjectId: string | null = null;
+      let foundPaneId: string | null = null;
       for (const [pid, ps] of state.projectStates) {
         if (!ps.layout) continue;
         const found = findPaneByPty(ps.layout, ptyId);
         if (found) {
           oldStatus = found.status;
           owningProjectId = pid;
+          foundPaneId = found.id;
           break;
         }
       }
       if (!owningProjectId || oldStatus === null) return state;
 
       // 2. 更新各项目布局中匹配 ptyId 的 pane status
+      // attention 与状态解耦:codex 的 PermissionRequest 状态是 ai-working
+      // 但同样需要黄灯;用户对该 pane 键入时清除(clearPaneAttentionByPty)
+      const attention = cause === 'attention';
       const newStates = new Map(state.projectStates);
       let changed = false;
       for (const [pid, ps] of newStates) {
         if (!ps.layout) continue;
-        const newLayout = updatePaneStatus(ps.layout, ptyId, status);
+        const newLayout = updatePaneStatus(ps.layout, ptyId, status, attention);
         if (newLayout === ps.layout) continue;
         newStates.set(pid, { ...ps, layout: newLayout, status: getHighestStatus(newLayout) });
         changed = true;
       }
       if (!changed) return state;
 
-      // 3. 检测 transition：ai-working → ai-idle
+      // 3. 完成判定:hook 的 Stop 成因是权威信号(ai-idle(待确认)→批准→Stop
+      // 这类不经过 ai-working 的路径靠它补上);无成因降级路径仍用状态迁移判定
       const isCompletion = oldStatus === 'ai-working' && status === 'ai-idle';
+      const isDone = cause === 'stop' || isCompletion;
+      // 托盘灯互斥:一个 pane 任一时刻只贡献一种灯。进入待确认/异常时,
+      // 旧的「完成未读」记录作废(否则同一 pane 黄绿双计,托盘黄绿交替误导)
+      let unreadDonePaneIds = state.unreadDonePaneIds;
+      if (foundPaneId && (attention || status === 'error') && unreadDonePaneIds.has(foundPaneId)) {
+        unreadDonePaneIds = new Set(unreadDonePaneIds);
+        unreadDonePaneIds.delete(foundPaneId);
+      }
+      // 托盘绿灯:真正的完成(非待确认)才计入未读;窗口聚焦时用户正看着,不算未读
+      if (isDone && !attention && foundPaneId && !windowFocusedFlag) {
+        if (unreadDonePaneIds === state.unreadDonePaneIds) {
+          unreadDonePaneIds = new Set(unreadDonePaneIds);
+        }
+        unreadDonePaneIds.add(foundPaneId);
+      }
       if (isCompletion) {
         // 3a. 提示音 — 不区分激活项目
         if (state.config.aiCompletionSound) {
@@ -729,8 +884,17 @@ export const useAppStore = create<AppStore>((set, get) => ({
         }
       }
 
-      return { projectStates: newStates };
-    }),
+      return { projectStates: newStates, unreadDonePaneIds };
+    });
+    queueMicrotask(syncTrayStatus);
+  },
+
+  unreadDonePaneIds: new Set<string>(),
+
+  clearUnreadDone: () => {
+    set((state) => (state.unreadDonePaneIds.size === 0 ? state : { unreadDonePaneIds: new Set<string>() }));
+    queueMicrotask(syncTrayStatus);
+  },
 
   setPanePty: (projectId, paneId, ptyId) =>
     set((state) => updateProjectPane(state, projectId, paneId, (pane) => (
@@ -876,7 +1040,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
   toggleMiddleColumn: () =>
     set((state) => {
       const newConfig = { ...state.config, middleColumnVisible: !state.config.middleColumnVisible };
-      invoke('save_config', { config: newConfig }).catch(() => {});
+      saveConfigToDisk(newConfig).catch(() => {});
       return { config: newConfig };
     }),
 

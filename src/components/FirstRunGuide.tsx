@@ -1,7 +1,6 @@
 import { useCallback, useState } from 'react';
 import { open } from '@tauri-apps/plugin-dialog';
-import { invoke } from '@tauri-apps/api/core';
-import { useAppStore, genId } from '../store';
+import { useAppStore, genId, saveConfigToDisk } from '../store';
 import { AddRemoteProjectModal } from './AddRemoteProjectModal';
 import { hotkeyLabel } from '../utils/hotkeys';
 import { useT } from '../i18n';
@@ -24,7 +23,7 @@ export function FirstRunGuide() {
     const path = selected as string;
     const name = path.split(/[/\\]/).pop() || path;
     addProject({ id: genId(), name, path });
-    invoke('save_config', { config: useAppStore.getState().config });
+    saveConfigToDisk();
   }, [addProject]);
 
   const primary =

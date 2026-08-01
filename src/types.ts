@@ -47,6 +47,10 @@ export interface AppConfig {
   lastActiveProjectId?: string;
   hookEnabled: boolean;
   smartCopyPaste: boolean;
+  /** 菜单栏项目状态灯总开关;undefined = 开启 */
+  trayStatusEnabled?: boolean;
+  /** 托盘右键菜单最多显示的活跃项目数;undefined = 5 */
+  trayMaxProjects?: number;
   /** 拖选按住不动自动复制的静止时长(秒);undefined = 1 */
   selectionAutoCopySecs?: number;
   sshConnections: SshConnection[];
@@ -266,6 +270,8 @@ export interface PaneState {
   /** 当前/上次 AI 会话身份(hook 上报),随布局持久化;会话正常退出时清除。
    *  恢复布局时有值 = 待续接,PaneGroup 起 PTY 后写 resume 命令并清除。 */
   aiSession?: AiSessionRef;
+  /** ai-idle 的成因是「需要用户确认」(授权/输入请求);运行时状态不持久化 */
+  attention?: boolean;
 }
 
 // === AI 会话 ===
@@ -332,6 +338,9 @@ export interface PtyExitPayload {
 export interface PtyStatusChangePayload {
   ptyId: number;
   status: PaneStatus;
+  /** 状态成因(hook 事件语义):'attention' = 需要用户确认,'stop' = 一轮回答
+   *  正常结束;缺省 = 无成因信息(monitor 降级路径)。托盘黄/绿灯靠它区分。 */
+  cause?: 'attention' | 'stop';
 }
 
 export interface FsChangePayload {

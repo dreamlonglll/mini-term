@@ -43,6 +43,10 @@ export const settings = {
     },
     system: {
       languageLabel: "界面语言",
+      trayStatusTitle: "菜单栏项目状态",
+      trayStatusDesc: "在 macOS 菜单栏显示 AI 状态灯（黄=待确认 蓝=处理中 绿=完成未读），右键可查看各项目状态",
+      trayMaxTitle: "状态菜单最多显示项目数",
+      trayMaxDesc: "托盘右键菜单只列出活跃项目，超出数量的不显示",
       theme: "主题",
       themeDark: "深色",
       themeLight: "浅色",
@@ -207,6 +211,10 @@ export const settings = {
     },
     system: {
       languageLabel: "Language",
+      trayStatusTitle: "Menu bar project status",
+      trayStatusDesc: "Show an AI status light in the macOS menu bar (yellow=awaiting confirmation, blue=working, green=unread completion); right-click for per-project status",
+      trayMaxTitle: "Max projects in status menu",
+      trayMaxDesc: "The tray menu only lists active projects, up to this count",
       theme: "Theme",
       themeDark: "Dark",
       themeLight: "Light",

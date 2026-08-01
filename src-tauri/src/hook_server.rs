@@ -253,6 +253,22 @@ fn is_retry_notification(message: &str) -> bool {
         || m.contains("rate limit")
 }
 
+/// 事件 → 状态成因标注。
+/// "attention" = 需要用户确认/输入(授权、通知、询问);"stop" = 一轮回答正常结束。
+/// PermissionRequest/Elicitation 不论状态一律标 attention:codex 的
+/// PermissionRequest 特判映射为 ai-working(批准后无事件,映射 idle 会卡死),
+/// 但「等你确认」的信号必须发出去,否则托盘黄灯在 codex 场景永远不亮;
+/// 用户对该 pane 键入任何内容(确认动作本身)时由前端清除 attention。
+/// 重试类 Notification 已在 map_event_to_status 映射为 ai-working,不会走到 attention。
+fn event_cause(event: &str, status: &str) -> Option<&'static str> {
+    match event {
+        "PermissionRequest" | "Elicitation" => Some("attention"),
+        "Stop" if status == "ai-idle" => Some("stop"),
+        "Notification" if status == "ai-idle" => Some("attention"),
+        _ => None,
+    }
+}
+
 /// 将 hook 事件名映射为 PTY 状态
 ///
 /// - ai-working: 表示 AI 正在处理（思考/工具调用/子代理/压缩/API 重试）
@@ -409,7 +425,7 @@ pub fn start_hook_server(
                         // 间隔超窗漏检时靠这里自愈
                         hook_state.remove(pty_id);
                         app.state::<crate::pty::PtyManager>().clear_ai_session(pty_id);
-                        emitter.emit_if_changed(&app, pty_id, "idle");
+                        emitter.emit_if_changed(&app, pty_id, "idle", None);
                         eprintln!(
                             "[hook-server] pty_id={} event=SessionEnd(reason={:?}) -> hook 已清除，回退到 idle",
                             pty_id, payload.reason
@@ -456,12 +472,13 @@ pub fn start_hook_server(
                         app.state::<crate::pty::PtyManager>().mark_ai_session(pty_id);
                         hook_state.update(pty_id, status.to_string());
 
-                        // 通知前端（与 process_monitor 共享同一份去重表）
-                        emitter.emit_if_changed(&app, pty_id, status);
+                        // 通知前端（与 process_monitor 共享同一份去重表）；
+                        // cause 标注 ai-idle 的成因,托盘据此区分黄灯(待确认)与绿灯(完成)
+                        emitter.emit_if_changed(&app, pty_id, status, event_cause(event, status));
 
                         eprintln!(
-                            "[hook-server] pty_id={} event={} -> status={}",
-                            pty_id, event, status
+                            "[hook-server] pty_id={} event={} agent={:?} -> status={} cause={:?}",
+                            pty_id, event, payload.agent, status, event_cause(event, status)
                         );
                     }
                 }

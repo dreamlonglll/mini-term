@@ -17,7 +17,7 @@ import { activateUnicodeWidth } from './terminalUnicodeWidth';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { readText, readImage, writeText } from '@tauri-apps/plugin-clipboard-manager';
-import { useAppStore } from '../store';
+import { useAppStore, clearPaneAttentionByPty } from '../store';
 import type { PtyOutputPayload } from '../types';
 import { getResolvedTheme } from './themeManager';
 import { createPtyWriteQueue } from './ptyWriteQueue';
@@ -375,6 +375,13 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
     void enqueuePtyWrite(ptyId, data, lineSnapshot);
   });
 
+  // 用户真实按键 = 正在处理待确认事项,熄灭托盘黄灯。
+  // 挂 onKey 而非 onData:onData 还承载 TUI 查询的自动应答(光标位置/颜色
+  // 能力等)与鼠标序列,授权框弹出瞬间就会被这类"伪输入"误清(黄灯闪一下就没)
+  const onKeyDisp = term.onKey(() => {
+    clearPaneAttentionByPty(ptyId);
+  });
+
   // 终端 resize → 同步到 PTY
   const onResizeDisp = term.onResize(({ cols, rows }) => {
     invoke('resize_pty', { ptyId, cols, rows });
@@ -385,6 +392,7 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
 
   const cleanup = () => {
     onDataDisp.dispose();
+    onKeyDisp.dispose();
     onResizeDisp.dispose();
     term.dispose();
   };

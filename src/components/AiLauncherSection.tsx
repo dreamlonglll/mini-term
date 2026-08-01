@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { useAppStore, genId } from '../store';
+import { useAppStore, genId, saveConfigToDisk } from '../store';
 import { useT } from '../i18n';
 import { withMobileRelayDefaults } from '../utils/mobileRelayConfig';
 import type { AiLauncher } from '../types';
@@ -66,7 +66,7 @@ export function AiLauncherSection() {
       mobileRelay: withMobileRelayDefaults(cfg.mobileRelay, { launchers: next }),
     };
     setConfig(newConfig);
-    await invoke('save_config', { config: newConfig }).catch(() => {});
+    await saveConfigToDisk(newConfig).catch(() => {});
     await invoke('mobile_relay_launchers_changed').catch(() => {});
   }, [setConfig]);
 

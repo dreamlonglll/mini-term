@@ -21,6 +21,15 @@ export const app = {
       titleAi: "有 AI 会话正在运行",
       messageWithSessions: "还有 {count} 个 AI 会话，关闭后它们会被终止：\n\n{names}\n\n确定退出吗？",
     },
+    configLoadFailed: "配置加载失败，为防止覆盖已有配置，本次运行禁止保存。请重启应用重试。\n\n错误：{detail}",
+    trayAttention: "{count} 个待确认",
+    trayStatus: {
+      attention: "待确认",
+      working: "处理中",
+      done: "已完成",
+    },
+    trayWorking: "{count} 个处理中",
+    trayDone: "{count} 个已完成",
     emptyState: "请先在中间栏添加项目",
     firstRun: {
       title: "还没有项目",
@@ -54,6 +63,15 @@ export const app = {
       titleAi: "AI sessions still running",
       messageWithSessions: "{count} AI session(s) are still running and will be terminated:\n\n{names}\n\nQuit anyway?",
     },
+    configLoadFailed: "Failed to load config. Saving is disabled for this run to protect your existing config. Please restart the app.\n\nError: {detail}",
+    trayAttention: "{count} awaiting confirmation",
+    trayStatus: {
+      attention: "Awaiting confirmation",
+      working: "Working",
+      done: "Completed",
+    },
+    trayWorking: "{count} working",
+    trayDone: "{count} completed",
     emptyState: "Add a project in the middle panel first",
     firstRun: {
       title: "No projects yet",
