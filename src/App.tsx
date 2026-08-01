@@ -14,6 +14,7 @@ import { RightDrawer } from './components/RightDrawer';
 import { SettingsModal, type SettingsPage } from './components/SettingsModal';
 import { SshModal } from './components/SshModal';
 import { MobileRelayModal } from './components/MobileRelayModal';
+import { UsageStatsModal } from './components/usage/UsageStatsModal';
 import { SearchModal } from './components/SearchModal';
 import { ToastContainer } from './components/ToastContainer';
 import { FirstRunGuide } from './components/FirstRunGuide';
@@ -62,6 +63,7 @@ export function App() {
   const [configPage, setConfigPage] = useState<SettingsPage | undefined>(undefined);
   const [sshOpen, setSshOpen] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
+  const [statsOpen, setStatsOpen] = useState(false);
   const [switcherOpen, setSwitcherOpen] = useState(false);
   const [updateInfo, setUpdateInfo] = useState<ReleaseInfo | null>(null);
   const [mountedProjectIds, setMountedProjectIds] = useState<string[]>([]);
@@ -410,6 +412,7 @@ export function App() {
             onOpenSettings={() => { setConfigPage(undefined); setConfigOpen(true); }}
             onOpenSsh={() => setSshOpen(true)}
             onOpenMobile={() => setMobileOpen(true)}
+            onOpenStats={() => setStatsOpen(true)}
             updateVersion={updateInfo?.version ?? null}
             onOpenUpdate={() => { if (updateInfo) openUrl(updateInfo.url); }}
           />
@@ -473,6 +476,7 @@ export function App() {
       <SettingsModal open={configOpen} onClose={() => setConfigOpen(false)} initialPage={configPage} />
       <SshModal open={sshOpen} onClose={() => setSshOpen(false)} />
       <MobileRelayModal open={mobileOpen} onClose={() => setMobileOpen(false)} />
+      <UsageStatsModal open={statsOpen} onClose={() => setStatsOpen(false)} />
       <SearchModal open={searchModalOpen} onClose={() => setSearchModalOpen(false)} />
       <ProjectSwitcher open={switcherOpen} onClose={() => setSwitcherOpen(false)} />
       <TerminalSearchBar />

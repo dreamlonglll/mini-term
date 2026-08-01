@@ -17,6 +17,7 @@ mod ssh;
 mod ssh_mcp_registry;
 mod ssh_skill_registry;
 mod tray;
+mod usage_stats;
 mod window_input_recovery;
 mod window_theme;
 mod wsl_distros;
@@ -182,6 +183,8 @@ pub fn run() {
             mobile_relay::mobile_relay_launchers_changed,
             mobile_relay::mobile_relay_start_session_result,
             mobile_relay::mobile_relay_check_launcher_command,
+            usage_stats::start_usage_stats,
+            usage_stats::cancel_usage_stats,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

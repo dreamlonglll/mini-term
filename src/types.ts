@@ -483,3 +483,97 @@ export interface AiMarker {
   xtermMarkerId: number; // xterm IMarker.id,用于查找 module-local 缓存
   inProgress: boolean;   // 最后一个 marker 为 true,新 marker 到来时前一个翻 false
 }
+
+// === 使用统计（对齐 Rust usage_stats camelCase 序列化） ===
+
+export type UsageAgentFilter = 'all' | 'claude' | 'codex';
+export type UsageRange = 'today' | 'days7' | 'days30' | 'all';
+
+/** 单模型价格（$/token，前端拉 models.dev 后 ÷1e6 归一） */
+export interface ModelPriceEntry {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+}
+
+export interface UsageDailyStat {
+  /** 日粒度 "YYYY-MM-DD"；「今天」视图为小时粒度 "HH:00"（均本地时区） */
+  date: string;
+  cost: number;
+  calls: number;
+  /** hover 详情用的 token 明细 */
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+}
+
+export interface UsageProjectStat {
+  path: string;
+  name: string;
+  cost: number;
+  sessions: number;
+  calls: number;
+  tokens: number;
+}
+
+export interface UsageTopSessionStat {
+  sessionId: string;
+  agent: string;
+  projectPath: string;
+  projectName: string;
+  title: string;
+  timestamp: string; // "YYYY-MM-DD"（本地日历日）
+  cost: number;
+  calls: number;
+  tokens: number;
+}
+
+export interface UsageModelStat {
+  /** 归一后的模型名（剥日期/provider 前缀）；空串 = 未知模型 */
+  model: string;
+  cost: number;
+  calls: number;
+  tokens: number;
+}
+
+export interface UsageProviderStat {
+  /** 供应商展示名（baseurl 的 host） */
+  provider: string;
+  cost: number;
+  calls: number;
+  tokens: number;
+  sessions: number;
+}
+
+export interface UsageStatsPayload {
+  totalCost: number;
+  totalCalls: number;
+  sessionCount: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  daily: UsageDailyStat[];
+  byProject: UsageProjectStat[];
+  byModel: UsageModelStat[];
+  byProvider: UsageProviderStat[];
+  topSessions: UsageTopSessionStat[];
+}
+
+export interface UsageStatsProgressPayload {
+  requestId: string;
+  processed: number;
+  total: number;
+  partial: UsageStatsPayload;
+}
+
+export interface UsageStatsDonePayload {
+  requestId: string;
+  stats: UsageStatsPayload;
+}
+
+export interface UsageStatsErrorPayload {
+  requestId: string;
+  error: string;
+}

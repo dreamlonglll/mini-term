@@ -51,6 +51,12 @@ const ICON_MOBILE = (
     <path d="M7 12.5h2" />
   </svg>
 );
+const ICON_STATS = (
+  <svg width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M2.5 13.5h11" />
+    <path d="M4 13.5V9M8 13.5V4.5M12 13.5V7" />
+  </svg>
+);
 const ICON_UPDATE = (
   <svg width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round">
     <path d="M8 10.5V3M5 6l3-3 3 3" />
@@ -66,12 +72,13 @@ interface ActivityBarProps {
   onOpenSettings: () => void;
   onOpenSsh: () => void;
   onOpenMobile: () => void;
+  onOpenStats: () => void;
   /** 有新版本时的版本号（null = 无更新,不显示更新按钮） */
   updateVersion?: string | null;
   onOpenUpdate: () => void;
 }
 
-export function ActivityBar({ onOpenSettings, onOpenSsh, onOpenMobile, updateVersion, onOpenUpdate }: ActivityBarProps) {
+export function ActivityBar({ onOpenSettings, onOpenSsh, onOpenMobile, onOpenStats, updateVersion, onOpenUpdate }: ActivityBarProps) {
   const t = useT();
   const config = useAppStore((s) => s.config);
   const projectStates = useAppStore((s) => s.projectStates);
@@ -145,6 +152,10 @@ export function ActivityBar({ onOpenSettings, onOpenSsh, onOpenMobile, updateVer
       {/* 分隔符 */}
       <div className="w-6 h-px bg-[var(--border-default)] my-1" />
 
+      {/* 使用统计 */}
+      <button className={btnClass(false)} onClick={onOpenStats} title={t('app.activityBar.stats')}>
+        {ICON_STATS}
+      </button>
       {/* 设置 */}
       <button className={btnClass(false)} onClick={onOpenSettings} title={t('app.activityBar.settings')}>
         {ICON_SETTINGS}
