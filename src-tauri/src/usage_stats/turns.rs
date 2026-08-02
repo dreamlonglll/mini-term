@@ -440,7 +440,17 @@ pub(crate) fn parse_codex_session(
                     continue;
                 }
                 turns.push(Turn {
-                    message_id: None,
+                    // Codex rollout 无消息 id,合成稳定指纹供聚合层跨 rollout 去重
+                    // (fork 复制父会话历史、重复 token_count 行都会原样带着时间戳
+                    // 与用量)。不含 session_id:fork 出的新 rollout 换了 id,含了
+                    // 反而挡不住复制行。时间戳缺失时不合成(mtime 兜底跨文件不稳),
+                    // 宁可不去重也不误伤。
+                    message_id: line_ts.map(|ts| {
+                        format!(
+                            "codex:{}:{}:{}:{}:{}",
+                            ts, usage.input, usage.output, usage.reasoning, usage.cache_read
+                        )
+                    }),
                     model: model.clone(),
                     timestamp_ms: line_ts,
                     usage,
@@ -567,5 +577,37 @@ mod tests {
         assert_eq!(u.cache_read, 800);
         assert_eq!(u.output, 100);
         assert_eq!(u.reasoning, 20);
+    }
+
+    #[test]
+    fn codex_turns_get_synthetic_fingerprint_stable_across_rollouts() {
+        let root = std::env::temp_dir().join(format!(
+            "mini-term-turns-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let l1 = r#"{"type":"event_msg","timestamp":"2026-08-01T10:00:00.000Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"output_tokens":50,"total_tokens":150}}}}"#;
+        let l2 = r#"{"type":"event_msg","timestamp":"2026-08-01T10:00:05.000Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}}}}"#;
+
+        let a = root.join("rollout-a.jsonl");
+        std::fs::write(&a, format!("{l1}\n{l2}\n")).unwrap();
+        // fork:新 rollout 原样复制父会话历史行,session id(此处回退文件名)不同
+        let b = root.join("rollout-b.jsonl");
+        std::fs::write(&b, format!("{l1}\n")).unwrap();
+
+        let names = HashMap::new();
+        let pa = parse_codex_session(&a, &names).unwrap();
+        let pb = parse_codex_session(&b, &names).unwrap();
+
+        assert_eq!(pa.turns.len(), 2);
+        let id0 = pa.turns[0].message_id.as_ref().unwrap();
+        let id1 = pa.turns[1].message_id.as_ref().unwrap();
+        // 不同调用 → 指纹不同,不会误去重
+        assert_ne!(id0, id1);
+        // fork 复制的同一历史行 → 指纹一致,聚合层 seen_ids 跨 rollout 去重生效
+        assert_eq!(pb.turns[0].message_id.as_ref().unwrap(), id0);
     }
 }
