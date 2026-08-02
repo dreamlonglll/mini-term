@@ -252,9 +252,9 @@ function resolveVariant(def: ThemePackJson, mode: 'dark' | 'light'): ThemeVarian
     // 压不住图的亮度/纹理（浅色 UI 对底噪尤其敏感），图退为边缘氛围
     effects: {
       ...def.effects,
-      surfaceOpacity: def.effects?.surfaceOpacity ?? 0.88,
-      backgroundDim: def.effects?.backgroundDim ?? 0.5,
-      terminalOpacity: def.effects?.terminalOpacity ?? 0.82,
+      surfaceOpacity: def.effects?.surfaceOpacity ?? 0.78,
+      backgroundDim: def.effects?.backgroundDim ?? 0.42,
+      terminalOpacity: def.effects?.terminalOpacity ?? 0.72,
     },
   };
 }
@@ -284,8 +284,10 @@ function buildTokenMap(variant: ThemeVariantDef, withBackground: boolean): Recor
     '--border-strong': scaleAlpha(c.line, 1.4),
     // theme.css 旋钮变量（Phase 3，与 ds 的 --ds-theme-* 同构）
     '--mt-theme-color-background': c.background,
-    '--mt-theme-color-panel': c.panel,
-    '--mt-theme-color-panel-alt': c.panelAlt,
+    // 背景图模式下旋钮面板色同样带 surfaceOpacity:theme.css 用它直接刷
+    // 容器背景(如 sidebar),给不透明原色会与 --bg-surface 半透明面板割裂
+    '--mt-theme-color-panel': withBackground ? withAlpha(c.panel, so) ?? c.panel : c.panel,
+    '--mt-theme-color-panel-alt': withBackground ? withAlpha(c.panelAlt, so) ?? c.panelAlt : c.panelAlt,
     '--mt-theme-color-accent': c.accent,
     '--mt-theme-color-text': c.text,
     '--mt-theme-color-muted': c.muted,
