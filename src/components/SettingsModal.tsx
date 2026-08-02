@@ -829,7 +829,7 @@ function SystemSettings() {
           <button
             key={opt.value}
             className={`flex-1 py-2 rounded-[var(--radius-sm)] text-base transition-all ${
-              config.theme === opt.value
+              !config.customThemeId && config.theme === opt.value
                 ? 'bg-[var(--accent-muted)] text-[var(--accent)] border border-[var(--accent)]'
                 : 'bg-[var(--bg-base)] text-[var(--text-secondary)] border border-[var(--border-default)] hover:border-[var(--accent)]'
             }`}
@@ -854,7 +854,7 @@ function SystemSettings() {
           <button
             key={opt.value}
             className={`flex-1 py-2 rounded-[var(--radius-sm)] text-base transition-all ${
-              config.skin === opt.value
+              !config.customThemeId && config.skin === opt.value
                 ? 'bg-[var(--accent-muted)] text-[var(--accent)] border border-[var(--accent)]'
                 : 'bg-[var(--bg-base)] text-[var(--text-secondary)] border border-[var(--border-default)] hover:border-[var(--accent)]'
             }`}
