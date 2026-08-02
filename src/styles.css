@@ -76,7 +76,8 @@
   --ease-overlay-out: cubic-bezier(0.4, 0, 0.9, 0.6);
 
   /* App font family (overridable via uiFontFamily config) */
-  --app-font-family: 'DM Sans', system-ui, -apple-system, sans-serif;
+  /* 'DM Sans Variable' 是 @fontsource-variable 打包字体的 family 名；保留 'DM Sans' 兼容用户本机安装的同名字体 */
+  --app-font-family: 'DM Sans Variable', 'DM Sans', system-ui, -apple-system, sans-serif;
   --app-font-mono: 'JetBrains Mono', 'Cascadia Code', Consolas, monospace;
 }
 

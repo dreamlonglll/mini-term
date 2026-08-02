@@ -1,6 +1,11 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import { App } from './App';
+// 本地字体（woff2 随安装包分发）：启动路径零网络请求，离线可用（含 xterm 等宽字体）
+import '@fontsource-variable/dm-sans';
+import '@fontsource/jetbrains-mono/400.css';
+import '@fontsource/jetbrains-mono/500.css';
+import '@fontsource/jetbrains-mono/600.css';
 import './styles.css';
 import './fluent2.css';
 

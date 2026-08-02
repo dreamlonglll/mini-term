@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, lazy, Suspense } from 'react';
 import { Allotment } from 'allotment';
 import { invoke } from '@tauri-apps/api/core';
 import { getVersion } from '@tauri-apps/api/app';
@@ -11,16 +11,15 @@ import { ProjectList } from './components/ProjectList';
 import { FileTree } from './components/FileTree';
 import { ActivityBar } from './components/ActivityBar';
 import { RightDrawer } from './components/RightDrawer';
-import { SettingsModal, type SettingsPage } from './components/SettingsModal';
+import type { SettingsPage } from './components/SettingsModal';
 import { SshModal } from './components/SshModal';
-import { MobileRelayModal } from './components/MobileRelayModal';
-import { UsageStatsModal } from './components/usage/UsageStatsModal';
 import { SearchModal } from './components/SearchModal';
 import { ToastContainer } from './components/ToastContainer';
 import { FirstRunGuide } from './components/FirstRunGuide';
 import { ProjectSwitcher } from './components/ProjectSwitcher';
 import { TerminalSearchBar } from './components/TerminalSearchBar';
 import { useTauriEvent } from './hooks/useTauriEvent';
+import { useEverOpened } from './hooks/useOverlayMotion';
 import { useAiSubmitMarker } from './hooks/useAiSubmitMarker';
 import { useMarkerHotkeys } from './hooks/useMarkerHotkeys';
 import { useGlobalHotkeys } from './hooks/useGlobalHotkeys';
@@ -35,6 +34,12 @@ import { initMobileSessionSync } from './utils/mobileSessionSync';
 import { handleMobileStartSession } from './utils/mobileStartSession';
 import { useT } from './i18n';
 import type { AppConfig, PtyStatusChangePayload, PtyExitPayload, PaneStatus, MobileRelayStatusPayload, MobileStartSessionPayload, MobileRenamePanePayload } from './types';
+
+// 懒加载三个重弹窗（SettingsModal 自身体量 / MobileRelayModal 连带 qrcode / UsageStatsModal
+// 连带 usage/ 成套组件与 react-markdown），首次打开才拉 chunk，不占启动关键路径
+const SettingsModal = lazy(() => import('./components/SettingsModal').then((m) => ({ default: m.SettingsModal })));
+const MobileRelayModal = lazy(() => import('./components/MobileRelayModal').then((m) => ({ default: m.MobileRelayModal })));
+const UsageStatsModal = lazy(() => import('./components/usage/UsageStatsModal').then((m) => ({ default: m.UsageStatsModal })));
 
 /**
  * 关窗前盘点还活着的 AI 会话（ai-working / ai-idle）：数量 + 给用户看的名字清单。
@@ -64,6 +69,10 @@ export function App() {
   const [sshOpen, setSshOpen] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
   const [statsOpen, setStatsOpen] = useState(false);
+  // 懒挂载门控：三个懒弹窗首次打开前不挂载（chunk 不拉）；之后常驻，退场动画照播
+  const settingsEverOpened = useEverOpened(configOpen);
+  const mobileEverOpened = useEverOpened(mobileOpen);
+  const statsEverOpened = useEverOpened(statsOpen);
   const [switcherOpen, setSwitcherOpen] = useState(false);
   const [updateInfo, setUpdateInfo] = useState<ReleaseInfo | null>(null);
   const [mountedProjectIds, setMountedProjectIds] = useState<string[]>([]);
@@ -473,10 +482,23 @@ export function App() {
           </div>
         ) : null}
       </div>
-      <SettingsModal open={configOpen} onClose={() => setConfigOpen(false)} initialPage={configPage} />
+      {/* 三个懒弹窗各自独立 Suspense：共享边界会让一个弹窗首次加载时把另一个已打开的闪没 */}
+      {settingsEverOpened && (
+        <Suspense fallback={null}>
+          <SettingsModal open={configOpen} onClose={() => setConfigOpen(false)} initialPage={configPage} />
+        </Suspense>
+      )}
       <SshModal open={sshOpen} onClose={() => setSshOpen(false)} />
-      <MobileRelayModal open={mobileOpen} onClose={() => setMobileOpen(false)} />
-      <UsageStatsModal open={statsOpen} onClose={() => setStatsOpen(false)} />
+      {mobileEverOpened && (
+        <Suspense fallback={null}>
+          <MobileRelayModal open={mobileOpen} onClose={() => setMobileOpen(false)} />
+        </Suspense>
+      )}
+      {statsEverOpened && (
+        <Suspense fallback={null}>
+          <UsageStatsModal open={statsOpen} onClose={() => setStatsOpen(false)} />
+        </Suspense>
+      )}
       <SearchModal open={searchModalOpen} onClose={() => setSearchModalOpen(false)} />
       <ProjectSwitcher open={switcherOpen} onClose={() => setSwitcherOpen(false)} />
       <TerminalSearchBar />
