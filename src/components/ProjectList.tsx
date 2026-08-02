@@ -123,8 +123,7 @@ function collectAiPanes(node: SplitNode | null | undefined): PaneState[] {
   return node.children.flatMap((c) => collectAiPanes(c));
 }
 
-/** AI 品牌图标堆叠区的固定宽度(px):图标多时在此宽度内部分重叠。 */
-const AI_STACK_WIDTH = 26;
+/** AI 品牌图标尺寸(px);图标间与领位图标后均留 2px 小间距,并排不重叠。 */
 const AI_ICON_SIZE = 14;
 
 export function ProjectList() {
@@ -550,9 +549,9 @@ export function ProjectList() {
             : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--border-subtle)]'
         }`}
         style={{
-          // 组内项目对齐父级分组的倒三角(父组 paddingLeft = (depth-1)*16,+2 对准字形),
+          // 组内项目对齐父级分组的倒三角区域((depth-1)*16 起,+16 不贴左缘),
           // 顶层项目维持原有 10px
-          paddingLeft: `${depth === 0 ? 10 : (depth - 1) * 16 + 2}px`,
+          paddingLeft: `${depth === 0 ? 10 : (depth - 1) * 16 + 16}px`,
           paddingRight: '10px',
         }}
         role="option"
@@ -732,30 +731,14 @@ export function ProjectList() {
         )}
         {aiVendors.length > 0 && (
           // 固定 text-secondary 颜色上下文:单色品牌图标(OpenAI/Grok…)与 pane
-          // 标签观感一致,不随选中行的 accent 变色
+          // 标签观感一致,不随选中行的 accent 变色。
+          // 负边距抵掉行内 gap-2,与领位图标只留 2px 小间隙;图标间同样 2px 并排不重叠
           <span
-            className="relative flex-shrink-0 text-[var(--text-secondary)]"
-            style={{
-              // 单枚不留空档;多枚固定宽度内部分重叠
-              width: aiVendors.length === 1 ? AI_ICON_SIZE : AI_STACK_WIDTH,
-              height: AI_ICON_SIZE,
-            }}
+            className="flex items-center flex-shrink-0 text-[var(--text-secondary)]"
+            style={{ marginLeft: -6, gap: 2 }}
           >
-            {aiVendors.map((v, i) => (
-              <span
-                key={v ?? 'unknown'}
-                className="absolute top-0"
-                style={{
-                  left:
-                    aiVendors.length === 1
-                      ? 0
-                      : i *
-                        Math.min(12, (AI_STACK_WIDTH - AI_ICON_SIZE) / (aiVendors.length - 1)),
-                  zIndex: i,
-                }}
-              >
-                <BrandIcon vendor={v} size={AI_ICON_SIZE} />
-              </span>
+            {aiVendors.map((v) => (
+              <BrandIcon key={v ?? 'unknown'} vendor={v} size={AI_ICON_SIZE} />
             ))}
           </span>
         )}

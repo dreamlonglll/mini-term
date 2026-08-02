@@ -35,6 +35,13 @@ const BRAND_ICONS: Record<AiVendor, ComponentType<{ size?: number | string }>> =
   ollama: OllamaMono,
 };
 
+/** 只有 Mono 变体的品牌指定代表色(官方 logo 本为黑白,借品牌主色提辨识度);
+ *  未列出的 Mono 品牌(Grok/OpenCode/Ollama 官方即黑色)维持 currentColor 跟随主题。 */
+const MONO_BRAND_COLORS: Partial<Record<AiVendor, string>> = {
+  openai: '#10a37f',
+  copilot: '#8957e5',
+};
+
 interface Props {
   vendor: AiVendor | null | undefined;
   size?: number;
@@ -44,9 +51,11 @@ interface Props {
 
 export function BrandIcon({ vendor, size = 13, title, className }: Props) {
   const Icon = vendor ? BRAND_ICONS[vendor] : undefined;
+  const monoColor = vendor ? MONO_BRAND_COLORS[vendor] : undefined;
   return (
     <span
       className={`mt-icon mt-icon-brand inline-flex items-center flex-shrink-0 ${className ?? ''}`}
+      style={monoColor ? { color: monoColor } : undefined}
       title={title}
       aria-hidden
     >
