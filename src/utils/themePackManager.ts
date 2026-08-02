@@ -281,25 +281,59 @@ function removeThemeCss(): void {
 
 // ─── 背景图氛围层（Phase 2）───
 
-function applyBackgroundLayer(def: ThemePackJson, dir: string): void {
-  const rootEl = document.getElementById('root');
-  if (!rootEl) return;
-  const url = convertFileSrc(`${dir}/${def.image}`);
+/** 探活令牌：主题切换后作废在途的 base64 兜底回填 */
+let bgProbeToken = 0;
+
+function setRootBackground(rootEl: HTMLElement, def: ThemePackJson, imageUrl: string): void {
   const dim = withAlpha(def.colors.background, def.effects?.backgroundDim ?? DEFAULT_BACKGROUND_DIM)
     ?? `rgba(0, 0, 0, ${DEFAULT_BACKGROUND_DIM})`;
   const focusX = def.art?.focusX ?? 0.5;
   const focusY = def.art?.focusY ?? 0.5;
   // 压暗层与图片合成在同一 background 上；background-color 仍由 styles.css 的
   // var(--bg-base) 兜底（图片加载完成前 / 加载失败时可见）
-  rootEl.style.backgroundImage = `linear-gradient(${dim}, ${dim}), url("${url}")`;
+  rootEl.style.backgroundImage = `linear-gradient(${dim}, ${dim}), url("${imageUrl}")`;
   rootEl.style.backgroundSize = 'cover';
   rootEl.style.backgroundPosition = `${+(focusX * 100).toFixed(2)}% ${+(focusY * 100).toFixed(2)}%`;
   rootEl.style.backgroundRepeat = 'no-repeat';
+}
+
+function mimeOf(file: string): string {
+  const f = file.toLowerCase();
+  if (f.endsWith('.png')) return 'image/png';
+  if (f.endsWith('.webp')) return 'image/webp';
+  if (f.endsWith('.gif')) return 'image/gif';
+  return 'image/jpeg';
+}
+
+function applyBackgroundLayer(def: ThemePackJson, dir: string): void {
+  const rootEl = document.getElementById('root');
+  if (!rootEl) return;
+  const image = def.image!;
+  const url = convertFileSrc(`${dir}/${image}`);
+  setRootBackground(rootEl, def, url);
   // 噪点层随背景主题归零（styles.css 的 :root[data-custom-theme-bg] 规则）
   document.documentElement.dataset.customThemeBg = '1';
+
+  // 探活：CSS 背景图加载失败是静默的，用 Image 预载检测 asset URL；
+  // 失败则走 Rust 读文件转 base64 数据 URL 兜底，并把根因留在控制台
+  const token = ++bgProbeToken;
+  const themeId = dir.split(/[/\\]/).filter(Boolean).pop() ?? def.id;
+  const probe = new Image();
+  probe.onerror = () => {
+    if (token !== bgProbeToken) return;
+    console.warn(`背景图 asset URL 加载失败，回退 base64 通道: ${url}`);
+    invoke<string>('read_theme_asset', { themeId, file: image })
+      .then((b64) => {
+        if (token !== bgProbeToken) return;
+        setRootBackground(rootEl, def, `data:${mimeOf(image)};base64,${b64}`);
+      })
+      .catch((e) => console.error('背景图兜底读取也失败:', e));
+  };
+  probe.src = url;
 }
 
 function clearBackgroundLayer(): void {
+  bgProbeToken++;
   const rootEl = document.getElementById('root');
   if (rootEl) {
     rootEl.style.removeProperty('background-image');

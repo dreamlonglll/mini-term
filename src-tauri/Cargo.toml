@@ -55,6 +55,7 @@ futures-util = "0.3"
 uuid = { version = "1", features = ["v4"] }
 sha2 = "0.11.0"
 zip = "8.6.0"
+base64 = "0.23.0"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

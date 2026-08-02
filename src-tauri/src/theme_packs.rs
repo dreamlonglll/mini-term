@@ -177,6 +177,21 @@ pub fn import_theme_pack_zip(app: AppHandle, zip_path: String) -> Result<String,
     Ok(theme_id)
 }
 
+/// 读取包内二进制资源（背景图）转 base64。
+/// asset 协议加载失败时的前端兜底通道（CSS 背景图加载失败是静默的）。
+#[tauri::command]
+pub fn read_theme_asset(app: AppHandle, theme_id: String, file: String) -> Result<String, String> {
+    for part in [&theme_id, &file] {
+        if part.is_empty() || part.contains(['/', '\\']) || part.contains("..") {
+            return Err(format!("非法路径分量: {part}"));
+        }
+    }
+    let path = themes_dir(&app)?.join(&theme_id).join(&file);
+    let data = fs::read(&path).map_err(|e| format!("读取 {theme_id}/{file} 失败: {e}"))?;
+    use base64::Engine;
+    Ok(base64::engine::general_purpose::STANDARD.encode(data))
+}
+
 /// 删除主题包目录。
 #[tauri::command]
 pub fn delete_theme_pack(app: AppHandle, theme_id: String) -> Result<(), String> {
