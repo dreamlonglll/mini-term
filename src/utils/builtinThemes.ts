@@ -1,8 +1,7 @@
 /**
  * 内置外观的「主题描述」层（custom-theme-plan 决策 1）：
  * 内置外观仍由 styles.css 静态规则实现（early-theme.js 防闪依赖），
- * 这里只提供与外置主题包同构的描述数据，供设置页统一渲染主题卡片，
- * 以及 6 套终端配色常量的统一出口（原散落在 terminalCache.ts，纯数据搬家）。
+ * 这里是 6 套终端配色常量的统一出口（原散落在 terminalCache.ts，纯数据搬家）。
  */
 
 export const DARK_TERMINAL_THEME = {
@@ -166,39 +165,3 @@ export const BUILTIN_TERMINAL_THEMES = {
   fluent2: FLUENT2_TERMINAL_THEME,
   'fluent2-light': FLUENT2_LIGHT_TERMINAL_THEME,
 } as const satisfies Record<string, TerminalTheme>;
-
-export interface BuiltinThemeDescriptor {
-  id: 'dark' | 'light' | 'blueprint' | 'fluent2';
-  nameKey: string;
-  /** 选中后写入 config 的补丁：dark/light 卡固定 theme，皮肤卡保留用户的 theme 模式 */
-  patch: { theme?: 'dark' | 'light'; skin: 'none' | 'blueprint' | 'fluent2' };
-  /** 设置页色卡预览（背景 / 面板 / 强调 / 文本） */
-  preview: { background: string; surface: string; accent: string; text: string };
-}
-
-export const BUILTIN_THEMES: BuiltinThemeDescriptor[] = [
-  {
-    id: 'dark',
-    nameKey: 'settings.themes.builtinDark',
-    patch: { theme: 'dark', skin: 'none' },
-    preview: { background: '#0a0908', surface: '#171512', accent: '#c8805a', text: '#d8d4cc' },
-  },
-  {
-    id: 'light',
-    nameKey: 'settings.themes.builtinLight',
-    patch: { theme: 'light', skin: 'none' },
-    preview: { background: '#fafafa', surface: '#ffffff', accent: '#b06830', text: '#1a1a1a' },
-  },
-  {
-    id: 'blueprint',
-    nameKey: 'settings.themes.builtinBlueprint',
-    patch: { skin: 'blueprint' },
-    preview: { background: '#060e1c', surface: '#0a1628', accent: '#22d3ee', text: '#d9e2ec' },
-  },
-  {
-    id: 'fluent2',
-    nameKey: 'settings.themes.builtinFluent2',
-    patch: { skin: 'fluent2' },
-    preview: { background: '#15181f', surface: '#1f232c', accent: '#4cc2ff', text: '#e8e8e8' },
-  },
-];

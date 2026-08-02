@@ -83,3 +83,29 @@ pub fn read_theme_pack(app: AppHandle, theme_id: String) -> Result<ThemePackData
 pub fn get_themes_dir(app: AppHandle) -> Result<String, String> {
     Ok(themes_dir(&app)?.to_string_lossy().into_owned())
 }
+
+/// 把用户选择的主题文件夹拷入 themes/（四件套平铺，只拷顶层文件）。
+/// 返回落库后的主题 id（目录名）。
+#[tauri::command]
+pub fn import_theme_pack(app: AppHandle, src_dir: String) -> Result<String, String> {
+    let src = PathBuf::from(&src_dir);
+    if !src.join("theme.json").is_file() {
+        return Err("所选文件夹缺少 theme.json，不是主题包".into());
+    }
+    let theme_id = src
+        .file_name()
+        .ok_or("非法路径")?
+        .to_string_lossy()
+        .into_owned();
+    let dest = themes_dir(&app)?.join(&theme_id);
+    fs::create_dir_all(&dest).map_err(|e| format!("创建 {theme_id} 目录失败: {e}"))?;
+    for entry in fs::read_dir(&src).map_err(|e| e.to_string())?.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        fs::copy(&path, dest.join(entry.file_name()))
+            .map_err(|e| format!("拷贝 {} 失败: {e}", entry.file_name().to_string_lossy()))?;
+    }
+    Ok(theme_id)
+}

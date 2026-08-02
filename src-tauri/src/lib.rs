@@ -126,6 +126,7 @@ pub fn run() {
             theme_packs::list_theme_packs,
             theme_packs::read_theme_pack,
             theme_packs::get_themes_dir,
+            theme_packs::import_theme_pack,
             tray::set_tray_status,
             pty::create_pty,
             pty::write_pty,
