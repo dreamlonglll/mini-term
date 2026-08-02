@@ -520,7 +520,8 @@ export function ProjectList() {
         ? null
         : (project.kindOverride as ProjectKind | undefined) ?? projectKinds.get(project.id) ?? null;
     // 打开 pane 里的 AI 会话:有则领位图标换成品牌图标堆叠(哪家 AI 在跑一眼可见)。
-    // 按厂商去重 —— 同款 AI 开多个 pane 只显示一枚,重叠一摞并不好看
+    // 按厂商去重 —— 同款 AI 开多个 pane 只显示一枚,重叠一摞并不好看;
+    // 再按厂商名字母序排列,不随开 pane 顺序漂移(未知厂商固定排最后)
     const aiVendors: (AiVendor | null)[] = [];
     {
       const seen = new Set<string>();
@@ -532,6 +533,9 @@ export function ProjectList() {
           aiVendors.push(v);
         }
       }
+      aiVendors.sort((a, b) =>
+        a === null ? 1 : b === null ? -1 : a.localeCompare(b),
+      );
     }
 
     return (
