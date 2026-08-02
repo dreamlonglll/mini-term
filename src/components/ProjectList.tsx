@@ -24,6 +24,7 @@ import type { ProjectKind } from '../utils/projectKind';
 import { TechIcon } from './TechIcon';
 import { BrandIcon } from './BrandIcon';
 import { inferVendor } from '../utils/inferVendor';
+import type { AiVendor } from '../utils/inferVendor';
 import { Boxes, Package, Server } from './icons';
 import { useT } from '../i18n';
 import {
@@ -518,8 +519,20 @@ export function ProjectList() {
       project.kindOverride === 'none'
         ? null
         : (project.kindOverride as ProjectKind | undefined) ?? projectKinds.get(project.id) ?? null;
-    // 打开 pane 里的 AI 会话:有则领位图标换成品牌图标堆叠(哪家 AI 在跑一眼可见)
-    const aiPanes = collectAiPanes(projectPs?.layout);
+    // 打开 pane 里的 AI 会话:有则领位图标换成品牌图标堆叠(哪家 AI 在跑一眼可见)。
+    // 按厂商去重 —— 同款 AI 开多个 pane 只显示一枚,重叠一摞并不好看
+    const aiVendors: (AiVendor | null)[] = [];
+    {
+      const seen = new Set<string>();
+      for (const p of collectAiPanes(projectPs?.layout)) {
+        const v = inferVendor({ agent: p.aiSession?.agent ?? p.detectedAgent });
+        const key = v ?? 'unknown';
+        if (!seen.has(key)) {
+          seen.add(key);
+          aiVendors.push(v);
+        }
+      }
+    }
 
     return (
       <div
@@ -692,28 +705,27 @@ export function ProjectList() {
           <span className="w-0.5 h-4 rounded-full bg-[var(--accent)] flex-shrink-0" />
         )}
         {/* 领位图标:AI 会话堆叠 > SSH 连接 > 技术栈徽标 > 通用项目图标 */}
-        {aiPanes.length > 0 ? (
+        {aiVendors.length > 0 ? (
+          // 固定 text-secondary 颜色上下文:单色品牌图标(OpenAI/Grok…)与 pane
+          // 标签观感一致,不随选中行的 accent 变色
           <span
-            className="relative flex-shrink-0"
+            className="relative flex-shrink-0 text-[var(--text-secondary)]"
             style={{ width: AI_STACK_WIDTH, height: AI_ICON_SIZE }}
           >
-            {aiPanes.map((p, i) => (
+            {aiVendors.map((v, i) => (
               <span
-                key={p.id}
+                key={v ?? 'unknown'}
                 className="absolute top-0"
                 style={{
                   left:
-                    aiPanes.length === 1
+                    aiVendors.length === 1
                       ? 0
                       : i *
-                        Math.min(12, (AI_STACK_WIDTH - AI_ICON_SIZE) / (aiPanes.length - 1)),
+                        Math.min(12, (AI_STACK_WIDTH - AI_ICON_SIZE) / (aiVendors.length - 1)),
                   zIndex: i,
                 }}
               >
-                <BrandIcon
-                  vendor={inferVendor({ agent: p.aiSession?.agent ?? p.detectedAgent })}
-                  size={AI_ICON_SIZE}
-                />
+                <BrandIcon vendor={v} size={AI_ICON_SIZE} />
               </span>
             ))}
           </span>
