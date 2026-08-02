@@ -631,11 +631,49 @@ fn migrate_config(mut config: AppConfig) -> AppConfig {
 /// 从磁盘加载并迁移配置。供后端内部调用(例如 editor.rs 读取 vscode_path)。
 /// 容错版:任何读取/解析失败都回退默认——内部调用方只是取个别字段,
 /// 不会写盘,吞错无害。面向前端的 load_config 走下面的严格版。
+/// 读取并解析配置文件；主文件损坏时尝试上一代备份 .bak 自愈。
+/// `Ok(Some)` = 成功（可能来自备份）；`Ok(None)` = 主文件不存在（首次启动）；
+/// `Err` = 主文件损坏且备份不可用。load_config 与 read_config 共用，
+/// 保证「备份自愈」对前端与后台启动路径(hook/relay)同时生效。
+fn read_config_from(path: &Path) -> Result<Option<AppConfig>, String> {
+    match fs::read_to_string(path) {
+        Ok(content) => match serde_json::from_str(&content) {
+            Ok(parsed) => Ok(Some(migrate_config(parsed))),
+            Err(parse_err) => {
+                let bak = path.with_extension("json.bak");
+                match fs::read_to_string(&bak).ok().and_then(|c| serde_json::from_str(&c).ok()) {
+                    Some(parsed) => {
+                        eprintln!(
+                            "[config] config.json 解析失败({}), 已用备份 {} 恢复",
+                            parse_err,
+                            bak.display()
+                        );
+                        Ok(Some(migrate_config(parsed)))
+                    }
+                    None => Err(format!(
+                        "配置文件损坏且备份不可用: {} ({})",
+                        path.display(),
+                        parse_err
+                    )),
+                }
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("配置文件读取失败: {} ({})", path.display(), e)),
+    }
+}
+
 pub fn read_config(app: &AppHandle) -> AppConfig {
     let path = config_path(app);
-    match fs::read_to_string(&path) {
-        Ok(content) => migrate_config(serde_json::from_str(&content).unwrap_or_default()),
-        Err(_) => migrate_config(AppConfig::default()),
+    match read_config_from(&path) {
+        Ok(Some(config)) => config,
+        Ok(None) => migrate_config(AppConfig::default()),
+        Err(e) => {
+            // 后台(hook/relay)必须能启动,只在主+备均不可用时才按默认运行;
+            // 写盘由令牌把关,默认配置不会反向污染磁盘
+            eprintln!("[config] {e}; 后台本次按默认配置启动");
+            migrate_config(AppConfig::default())
+        }
     }
 }
 
@@ -664,32 +702,9 @@ pub struct LoadedConfig {
 pub fn load_config(app: AppHandle) -> Result<LoadedConfig, String> {
     crate::startup_trace::mark("load_config enter");
     let path = config_path(&app);
-    let config = match fs::read_to_string(&path) {
-        Ok(content) => match serde_json::from_str(&content) {
-            Ok(parsed) => migrate_config(parsed),
-            Err(parse_err) => {
-                let bak = path.with_extension("json.bak");
-                match fs::read_to_string(&bak).ok().and_then(|c| serde_json::from_str(&c).ok()) {
-                    Some(parsed) => {
-                        eprintln!(
-                            "[config] config.json 解析失败({}), 已用备份 {} 恢复",
-                            parse_err,
-                            bak.display()
-                        );
-                        migrate_config(parsed)
-                    }
-                    None => {
-                        return Err(format!(
-                            "配置文件损坏且备份不可用: {} ({})",
-                            path.display(),
-                            parse_err
-                        ))
-                    }
-                }
-            }
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => migrate_config(AppConfig::default()),
-        Err(e) => return Err(format!("配置文件读取失败: {} ({})", path.display(), e)),
+    let config = match read_config_from(&path)? {
+        Some(config) => config,
+        None => migrate_config(AppConfig::default()),
     };
 
     // 加载成功才轮换发放令牌;旧页面(HMR 重载前)的令牌随之作废
@@ -702,6 +717,12 @@ pub fn load_config(app: AppHandle) -> Result<LoadedConfig, String> {
     };
     eprintln!("[config] load_config ok, token={}", token);
     Ok(LoadedConfig { config, token })
+}
+
+/// save 前是否把现有主文件留作 .bak:仅内容仍可解析时才值得备份,
+/// 损坏的主文件绝不覆盖仍有抢救价值的上一代备份。
+fn should_backup(existing: Option<&str>) -> bool {
+    existing.is_some_and(|c| serde_json::from_str::<AppConfig>(c).is_ok())
 }
 
 #[tauri::command]
@@ -726,8 +747,9 @@ pub fn save_config(app: AppHandle, token: u64, config: AppConfig) -> Result<(), 
     if existing.as_deref() == Some(json.as_str()) {
         return Ok(());
     }
-    // 覆写前留一代备份,任何原因导致配置被写坏都可救回
-    if existing.is_some() {
+    // 覆写前留一代备份,任何原因导致配置被写坏都可救回。
+    // 仅当现有主文件仍可解析时才备份——损坏的主文件绝不覆盖仍有抢救价值的 .bak
+    if should_backup(existing.as_deref()) {
         let _ = fs::copy(&path, path.with_extension("json.bak"));
     }
     // 原子写,避免写入中途崩溃留下截断的 config.json 导致全部用户配置丢失
@@ -914,6 +936,44 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    #[test]
+    fn read_config_from_recovers_from_backup_when_main_corrupted() {
+        let root = unique_test_root("read-bak-recover");
+        let path = root.join("config.json");
+        fs::write(&path, "{ corrupted").unwrap();
+        let valid = serde_json::to_string(&AppConfig {
+            default_shell: "bak-shell".into(),
+            ..AppConfig::default()
+        })
+        .unwrap();
+        fs::write(root.join("config.json.bak"), &valid).unwrap();
+
+        let got = read_config_from(&path).unwrap().unwrap();
+        assert_eq!(got.default_shell, "bak-shell");
+    }
+
+    #[test]
+    fn read_config_from_errors_when_main_and_backup_both_unusable() {
+        let root = unique_test_root("read-bak-none");
+        let path = root.join("config.json");
+        fs::write(&path, "{ corrupted").unwrap();
+        assert!(read_config_from(&path).is_err());
+    }
+
+    #[test]
+    fn read_config_from_none_when_missing() {
+        let root = unique_test_root("read-missing");
+        assert!(read_config_from(&root.join("config.json")).unwrap().is_none());
+    }
+
+    #[test]
+    fn corrupted_main_never_backed_up() {
+        assert!(!should_backup(Some("{ corrupted")));
+        assert!(!should_backup(None));
+        let valid = serde_json::to_string(&AppConfig::default()).unwrap();
+        assert!(should_backup(Some(&valid)));
     }
 
     #[test]
