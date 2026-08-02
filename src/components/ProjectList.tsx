@@ -721,13 +721,13 @@ export function ProjectList() {
             size={14}
             strokeWidth={1.5}
             aria-hidden
-            className={`flex-shrink-0 ${remoteBroken ? 'text-[var(--color-error)]' : 'text-[var(--text-muted)]'}`}
+            className={`flex-shrink-0 ${remoteBroken ? 'text-[var(--color-error)]' : 'text-[var(--color-info)]'}`}
           />
         ) : projectKind ? (
           <TechIcon kind={projectKind} size={14} className="flex-shrink-0" />
         ) : (
-          // 识别不出 / 用户选「不显示」:回退通用项目图标,保证每行都有图标、缩进对齐
-          <Package size={14} strokeWidth={1.5} aria-hidden className="flex-shrink-0 text-[var(--text-muted)]" />
+          // 识别不出 / 用户选「不显示」:回退通用项目图标(主题文件色),每行都有图标、缩进对齐
+          <Package size={14} strokeWidth={1.5} aria-hidden className="flex-shrink-0 text-[var(--color-file)]" />
         )}
         {aiVendors.length > 0 && (
           // 固定 text-secondary 颜色上下文:单色品牌图标(OpenAI/Grok…)与 pane
@@ -890,8 +890,8 @@ export function ProjectList() {
             style={{ transform: group.collapsed ? 'rotate(-90deg)' : undefined }}>
             ▾
           </span>
-          {/* 分组 = 空间:用 Boxes 图标(currentColor 跟随主题),开合由左侧 chevron 表达 */}
-          <Boxes size={13} strokeWidth={1.5} aria-hidden className="flex-shrink-0" />
+          {/* 分组 = 空间:用 Boxes 图标,着主题文件夹色(容器语义,四套主题自适配) */}
+          <Boxes size={13} strokeWidth={1.5} aria-hidden className="flex-shrink-0 text-[var(--color-folder)]" />
           {isEditing ? (
             <input
               ref={editInputRef}
