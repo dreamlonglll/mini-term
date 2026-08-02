@@ -77,7 +77,7 @@ function updatePaneStatus(
         status,
         attention: attention || undefined,
         ...(status === 'idle' || status === 'error'
-          ? { aiSession: undefined, detectedAgent: undefined }
+          ? { aiSession: undefined, detectedAgent: undefined, resumePending: undefined }
           : agent
             ? { detectedAgent: agent }
             : {}),
@@ -159,6 +159,22 @@ export function setPaneAiSessionByPty(
     return { projectStates: newStates };
   });
   return ctx.projectId;
+}
+
+/** 清除 pane 的待续接标记(resume 命令已写入;身份 aiSession 保留)。 */
+export function clearPaneResumePendingByPty(ptyId: number): void {
+  const ctx = findPaneContextByPty(ptyId);
+  if (!ctx?.pane.resumePending) return;
+  useAppStore.setState((state) => {
+    const ps = state.projectStates.get(ctx.projectId);
+    if (!ps?.layout) return state;
+    const newStates = new Map(state.projectStates);
+    newStates.set(ctx.projectId, {
+      ...ps,
+      layout: patchPaneByPty(ps.layout, ptyId, { resumePending: undefined }),
+    });
+    return { projectStates: newStates };
+  });
 }
 
 // 主窗口聚焦状态(App.tsx 经 tauri onFocusChanged 维护)。

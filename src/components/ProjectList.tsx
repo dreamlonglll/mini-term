@@ -111,11 +111,14 @@ interface DropIndicator {
   forbidden?: boolean;
 }
 
-/** 收集布局树里处于 AI 会话状态的 pane(项目行的品牌图标堆叠数据源)。 */
+/** 收集布局树里与 AI 会话相关的 pane:正在跑(ai-*)或持有会话身份
+ *  (aiSession,含重启后待续接的 pane —— 重启不该丢图标)。 */
 function collectAiPanes(node: SplitNode | null | undefined): PaneState[] {
   if (!node) return [];
   if (node.type === 'leaf') {
-    return node.panes.filter((p) => p.status === 'ai-working' || p.status === 'ai-idle');
+    return node.panes.filter(
+      (p) => p.status === 'ai-working' || p.status === 'ai-idle' || p.aiSession,
+    );
   }
   return node.children.flatMap((c) => collectAiPanes(c));
 }
@@ -708,13 +711,30 @@ export function ProjectList() {
         {isActive && (
           <span className="w-0.5 h-4 rounded-full bg-[var(--accent)] flex-shrink-0" />
         )}
-        {/* 领位图标:AI 会话堆叠 > SSH 连接 > 技术栈徽标 > 通用项目图标 */}
-        {aiVendors.length > 0 ? (
+        {/* 领位:项目身份图标恒显(SSH > 技术栈 > 通用),AI 品牌堆叠只追加不覆盖 */}
+        {isRemote ? (
+          <Server
+            size={14}
+            strokeWidth={1.5}
+            aria-hidden
+            className={`flex-shrink-0 ${remoteBroken ? 'text-[var(--color-error)]' : 'text-[var(--text-muted)]'}`}
+          />
+        ) : projectKind ? (
+          <TechIcon kind={projectKind} size={14} className="flex-shrink-0" />
+        ) : (
+          // 识别不出 / 用户选「不显示」:回退通用项目图标,保证每行都有图标、缩进对齐
+          <Package size={14} strokeWidth={1.5} aria-hidden className="flex-shrink-0 text-[var(--text-muted)]" />
+        )}
+        {aiVendors.length > 0 && (
           // 固定 text-secondary 颜色上下文:单色品牌图标(OpenAI/Grok…)与 pane
           // 标签观感一致,不随选中行的 accent 变色
           <span
             className="relative flex-shrink-0 text-[var(--text-secondary)]"
-            style={{ width: AI_STACK_WIDTH, height: AI_ICON_SIZE }}
+            style={{
+              // 单枚不留空档;多枚固定宽度内部分重叠
+              width: aiVendors.length === 1 ? AI_ICON_SIZE : AI_STACK_WIDTH,
+              height: AI_ICON_SIZE,
+            }}
           >
             {aiVendors.map((v, i) => (
               <span
@@ -733,18 +753,6 @@ export function ProjectList() {
               </span>
             ))}
           </span>
-        ) : isRemote ? (
-          <Server
-            size={14}
-            strokeWidth={1.5}
-            aria-hidden
-            className={`flex-shrink-0 ${remoteBroken ? 'text-[var(--color-error)]' : 'text-[var(--text-muted)]'}`}
-          />
-        ) : projectKind ? (
-          <TechIcon kind={projectKind} size={14} className="flex-shrink-0" />
-        ) : (
-          // 识别不出 / 用户选「不显示」:回退通用项目图标,保证每行都有图标、缩进对齐
-          <Package size={14} strokeWidth={1.5} aria-hidden className="flex-shrink-0 text-[var(--text-muted)]" />
         )}
         {editingProjectId === project.id ? (
           <input

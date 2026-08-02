@@ -16,6 +16,8 @@ import { initFileDrag } from '../utils/fileDragState';
 import { getFileTreeCache, setFileTreeCache, projectCacheKey } from '../utils/projectDataCache';
 import { resolveFileIcon } from '../utils/fileIcon';
 import { useFileIcons } from '../hooks/useFileIcons';
+import { ensureDirKinds, getDirKind, useDirKindsVersion } from '../hooks/useProjectKinds';
+import { TechIcon } from './TechIcon';
 import { useT } from '../i18n';
 import type { FileEntry, FsChangePayload, GitFileStatus, PtyOutputPayload } from '../types';
 
@@ -119,6 +121,14 @@ function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff, onViewF
       toggleExpandedDir(activeProjectId, entry.path, next);
     }
   }, [entry, expanded, loadingChildren, loadChildren, onViewFile, activeProjectId, remoteConnectionId]);
+
+  // 子工程识别:子列表加载后对其中的非 ignored 目录探测工程类型,
+  // 命中的目录用技术栈图标替代普通文件夹图标(多工程聚合仓一眼可辨)。
+  // 远程项目跳过(探测走本地 list_directory);缓存命中零开销
+  useEffect(() => {
+    if (remoteConnectionId) return;
+    ensureDirKinds(children.filter((c) => c.isDir && !c.ignored).map((c) => c.path));
+  }, [children, remoteConnectionId]);
 
   useTauriEvent<FsChangePayload>('fs-change', useCallback((payload: FsChangePayload) => {
     if (remoteConnectionId) return; // 远程项目无 watcher,fs-change 与本树无关
@@ -288,6 +298,13 @@ function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff, onViewF
         {(() => {
           // 类型图标(baybreezy 懒加载):就绪前回退原有符号 —— 目录无图标、文件用 ·。
           // gitignore 的置灰走父级 opacity,对 <img> 同样生效。
+          // 目录若被识别为子工程(pom.xml/Cargo.toml/…),优先显示技术栈图标
+          if (entry.isDir && !remoteConnectionId && !entry.ignored) {
+            const dirKind = getDirKind(entry.path);
+            if (dirKind) {
+              return <TechIcon kind={dirKind} size={14} className="flex-shrink-0" />;
+            }
+          }
           const iconSrc = resolveFileIcon(entry.name, entry.isDir, entry.isDir && expanded);
           if (iconSrc) {
             return <img src={iconSrc} className="mt-icon mt-icon-file w-3.5 h-3.5 flex-shrink-0" alt="" aria-hidden draggable={false} />;
@@ -361,6 +378,8 @@ export function FileTree() {
   const t = useT();
   // 触发文件类型图标懒加载,就绪时重渲染整树(TreeNode 未 memo,根重渲染即级联)
   useFileIcons();
+  // 目录工程类型探测完成后重渲染,子工程文件夹换上技术栈图标
+  useDirKindsVersion();
   const activeProjectId = useAppStore((s) => s.activeProjectId);
   const config = useAppStore((s) => s.config);
   const setSearchModalOpen = useAppStore((s) => s.setSearchModalOpen);
@@ -420,6 +439,12 @@ export function FileTree() {
   rootEntriesRef.current = rootEntries;
   const gitStatusMapRef = useRef(gitStatusMap);
   gitStatusMapRef.current = gitStatusMap;
+
+  // 根目录一级子目录的子工程探测:不必展开就能在树里看到技术栈图标
+  useEffect(() => {
+    if (isRemote) return;
+    ensureDirKinds(rootEntries.filter((e) => e.isDir && !e.ignored).map((e) => e.path));
+  }, [rootEntries, isRemote]);
 
   const loadGitStatus = useCallback(() => {
     if (!project || isRemote) return; // 远程项目跳过 git 状态(远程 Git 二期)

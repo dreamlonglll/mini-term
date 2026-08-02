@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
-import { useAppStore, setPaneAiSessionByPty } from '../store';
+import { useAppStore, clearPaneResumePendingByPty } from '../store';
 import { TerminalInstance } from './TerminalInstance';
 import { StatusDot } from './StatusDot';
 import { BrandIcon } from './BrandIcon';
@@ -102,14 +102,22 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
         const pane = layout ? findPaneById(layout, activePane.id) : null;
         if (pane && pane.ptyId === undefined) {
           setPanePty(projectId, activePane.id, ptyId);
-          // 恢复的布局带 AI 会话身份 → 写 resume 命令续接上次会话。
+          // 恢复的布局带待续接标记 → 写 resume 命令续接上次会话。
           // PTY 内核缓冲 stdin,shell 就绪前写入不丢(与移动端发起会话同一时序)。
-          // 写完即清,避免重连/二次水合重复 resume;新会话身份由 hook 重新上报。
-          if (pane.aiSession && /^[A-Za-z0-9_-]+$/.test(pane.aiSession.sessionId)) {
-            const cmd = pane.aiSession.agent === 'codex'
-              ? `codex resume ${pane.aiSession.sessionId}`
-              : `claude --resume ${pane.aiSession.sessionId}`;
-            setPaneAiSessionByPty(ptyId, undefined);
+          // 只清 resumePending 标记、**保留 aiSession 身份**:codex resume 不会
+          // 重新上报 SessionStart,若写完把身份也清掉,第二次重启就断代恢复不了;
+          // claude 会上报新身份自然覆盖旧值。会话身份取 effect 闭包快照,
+          // 规避 monitor 在 create 与 write 之间发 idle 把身份抹掉的竞态。
+          const session = activePane.aiSession;
+          if (
+            pane.resumePending &&
+            session &&
+            /^[A-Za-z0-9_-]+$/.test(session.sessionId)
+          ) {
+            const cmd = session.agent === 'codex'
+              ? `codex resume ${session.sessionId}`
+              : `claude --resume ${session.sessionId}`;
+            clearPaneResumePendingByPty(ptyId);
             void writePtyInput(ptyId, `${cmd}\r`);
           }
           setSpawnErrors((prev) => {

@@ -270,8 +270,12 @@ export interface PaneState {
   /** 工作目录覆盖(worktree 终端):有值则替代项目根作为 PTY cwd,随布局持久化 */
   cwd?: string;
   /** 当前/上次 AI 会话身份(hook 上报),随布局持久化;会话正常退出时清除。
-   *  恢复布局时有值 = 待续接,PaneGroup 起 PTY 后写 resume 命令并清除。 */
+   *  身份在 resume 后**保留**(codex resume 不会重新上报 SessionStart,
+   *  写完即清会让身份在第二次重启时断代),hook 上报新身份时自然覆盖。 */
   aiSession?: AiSessionRef;
+  /** 待续接标记:恢复布局时随 aiSession 置位,PaneGroup 起 PTY 写完 resume
+   *  命令后清除(只清标记不清身份);运行时状态不持久化。 */
+  resumePending?: boolean;
   /** 后端识别的会话内 AI 命令名(输入检测/hook 兜底);运行时状态不持久化。
    *  品牌图标优先用 aiSession.agent,无 hook 时靠它。 */
   detectedAgent?: string;

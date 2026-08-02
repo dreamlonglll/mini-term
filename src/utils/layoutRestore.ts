@@ -34,8 +34,10 @@ export function restoreSavedSplitNode(
         shellName,
         status: 'idle',
         cwd: savedPane.cwd,
-        // 上次退出时的 AI 会话身份;PaneGroup 起 PTY 后据此写 resume 命令续接
+        // 上次退出时的 AI 会话身份;PaneGroup 起 PTY 后据此写 resume 命令续接。
+        // resumePending 单独置位:写完 resume 只清标记,身份保留供下次重启续传
         aiSession: savedPane.aiSession,
+        resumePending: savedPane.aiSession ? true : undefined,
       });
     }
 

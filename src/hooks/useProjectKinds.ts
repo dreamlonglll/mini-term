@@ -49,6 +49,44 @@ async function detectLocal(projectPath: string): Promise<ProjectKind | null> {
   return classifyProject(files, deps);
 }
 
+/** 读取缓存的目录类型;undefined = 尚未探测,null = 已探测但识别不出。 */
+export function getDirKind(path: string): ProjectKind | null | undefined {
+  return kindCache.get(path);
+}
+
+/** 批量探测目录类型(去重、带缓存;仅限本地路径,远程由调用方跳过)。
+ *  项目根与文件树里的子工程目录共用同一份缓存。 */
+export function ensureDirKinds(paths: string[]): void {
+  for (const path of paths) {
+    if (kindCache.has(path) || pending.has(path)) continue;
+    pending.add(path);
+    detectLocal(path)
+      .then((kind) => {
+        kindCache.set(path, kind);
+        notify();
+      })
+      .catch(() => {
+        kindCache.set(path, null);
+      })
+      .finally(() => {
+        pending.delete(path);
+      });
+  }
+}
+
+/** 订阅目录类型缓存变化(文件树用:探测完成后重渲染出技术栈图标)。 */
+export function useDirKindsVersion(): number {
+  const [v, setV] = useState(0);
+  useEffect(() => {
+    const fn = () => setV((x) => x + 1);
+    listeners.add(fn);
+    return () => {
+      listeners.delete(fn);
+    };
+  }, []);
+  return v;
+}
+
 /** 返回 projectId → ProjectKind 的映射(识别不出/未就绪的项目不在表里)。 */
 export function useProjectKinds(projects: ProjectConfig[]): Map<string, ProjectKind> {
   const [version, setVersion] = useState(0);
@@ -62,22 +100,8 @@ export function useProjectKinds(projects: ProjectConfig[]): Map<string, ProjectK
   }, []);
 
   useEffect(() => {
-    for (const p of projects) {
-      if (p.sshConnectionId) continue; // 远程项目等 FileTree seed
-      if (kindCache.has(p.path) || pending.has(p.path)) continue;
-      pending.add(p.path);
-      detectLocal(p.path)
-        .then((kind) => {
-          kindCache.set(p.path, kind);
-          notify();
-        })
-        .catch(() => {
-          kindCache.set(p.path, null);
-        })
-        .finally(() => {
-          pending.delete(p.path);
-        });
-    }
+    // 远程项目不探测(项目行领位固定显示 SSH 图标)
+    ensureDirKinds(projects.filter((p) => !p.sshConnectionId).map((p) => p.path));
   }, [projects, version]);
 
   useTauriEvent<FsChangePayload>(
