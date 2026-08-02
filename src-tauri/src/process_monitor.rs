@@ -115,7 +115,10 @@ pub(crate) fn resolve_status(
         let hook_status = hook_state
             .get_status(pty_id)
             .unwrap_or_else(|| "idle".to_string());
+        // 无输出超时降级是防 hook 漏发 Stop 的兜底;重试保持态(API 退避等待,
+        // TUI 静止属正常)期间豁免,否则重试中被降为 ai-idle 会被前端当作完成
         if hook_status == "ai-working"
+            && !hook_state.is_retry_hold(pty_id)
             && !pty_manager.has_recent_output(pty_id, AI_ACTIVE_TIMEOUT)
         {
             "ai-idle".to_string()

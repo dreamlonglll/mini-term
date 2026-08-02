@@ -79,6 +79,10 @@ pub struct HookState {
     /// `codex exec`，继承 MINITERM_PTY_ID）与"退出后立刻重开"的乱序场景下，
     /// pane 上还有别的活跃会话，误销毁会把正在工作的外层会话打回 idle。
     active_sessions: Arc<Mutex<HashMap<u32, VecDeque<String>>>>,
+    /// pty → 重试保持态:最近一个 hook 事件是 API 重试类 Notification。
+    /// 重试等待期(退避可达数十秒)TUI 可能完全静止,monitor 的「无输出降 ai-idle」
+    /// 兜底会把它误判为完成;置位期间豁免降级,下一个任何 hook 事件清除。
+    retry_hold: Arc<Mutex<std::collections::HashSet<u32>>>,
     port: Arc<Mutex<u16>>,
     /// 保存 server 实例，供运行时停止（Arc 共享给监听线程）
     server: Arc<Mutex<Option<Arc<tiny_http::Server>>>>,
@@ -93,6 +97,7 @@ impl HookState {
             hook_enabled: Arc::new(Mutex::new(std::collections::HashSet::new())),
             ended_sessions: Arc::new(Mutex::new(HashMap::new())),
             active_sessions: Arc::new(Mutex::new(HashMap::new())),
+            retry_hold: Arc::new(Mutex::new(std::collections::HashSet::new())),
             port: Arc::new(Mutex::new(0)),
             server: Arc::new(Mutex::new(None)),
         }
@@ -138,6 +143,20 @@ impl HookState {
         self.last_hook_status.lock().unwrap().insert(pty_id, status);
     }
 
+    /// 重试保持态读写:置位期间 monitor 不得凭「无输出超时」把 ai-working 降为 ai-idle。
+    pub(crate) fn set_retry_hold(&self, pty_id: u32, hold: bool) {
+        let mut set = self.retry_hold.lock().unwrap();
+        if hold {
+            set.insert(pty_id);
+        } else {
+            set.remove(&pty_id);
+        }
+    }
+
+    pub fn is_retry_hold(&self, pty_id: u32) -> bool {
+        self.retry_hold.lock().unwrap().contains(&pty_id)
+    }
+
     /// 移除指定 PTY 的 hook 状态。不清墓碑：SessionEnd 打完墓碑后调用
     /// 本方法，墓碑要继续挡住旧会话的迟到事件。
     pub fn remove(&self, pty_id: u32) {
@@ -145,6 +164,7 @@ impl HookState {
         self.last_hook_time.lock().unwrap().remove(&pty_id);
         self.last_hook_status.lock().unwrap().remove(&pty_id);
         self.last_session.lock().unwrap().remove(&pty_id);
+        self.retry_hold.lock().unwrap().remove(&pty_id);
     }
 
     /// PTY 关闭时的彻底清理：hook 状态 + 墓碑 + 活跃会话集
@@ -496,6 +516,13 @@ pub fn start_hook_server(
                         // 靠这里把 AI 会话标记扶正,保住后续 marker/移动端语义
                         app.state::<crate::pty::PtyManager>()
                             .mark_ai_session(pty_id, payload.agent.as_deref().unwrap_or("claude"));
+                        // 重试类 Notification 置保持态(等待期无输出不得降级),
+                        // 其余任何事件到达即清除
+                        hook_state.set_retry_hold(
+                            pty_id,
+                            event == "Notification"
+                                && payload.message.as_deref().map_or(false, is_retry_notification),
+                        );
                         hook_state.update(pty_id, status.to_string());
 
                         // 通知前端（与 process_monitor 共享同一份去重表）；
@@ -580,6 +607,21 @@ fn delete_port_file(app: &AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_hold_set_clear_and_removed_with_state() {
+        let state = HookState::new();
+        assert!(!state.is_retry_hold(7));
+        state.set_retry_hold(7, true);
+        assert!(state.is_retry_hold(7));
+        // 非重试事件到达 → 清除
+        state.set_retry_hold(7, false);
+        assert!(!state.is_retry_hold(7));
+        // remove(SessionEnd)/purge(PTY 关闭) 连带清理
+        state.set_retry_hold(7, true);
+        state.remove(7);
+        assert!(!state.is_retry_hold(7));
+    }
 
     #[test]
     fn hook_state_records_and_clears_session_identity() {
