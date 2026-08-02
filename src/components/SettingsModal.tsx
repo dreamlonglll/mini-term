@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { invoke } from '@tauri-apps/api/core';
+import { invoke, convertFileSrc } from '@tauri-apps/api/core';
 import { getVersion } from '@tauri-apps/api/app';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { revealItemInDir } from '@tauri-apps/plugin-opener';
@@ -1617,14 +1617,20 @@ function ShortcutsSettings() {
 
 function ThemeCard({
   name,
-  preview,
+  colors,
+  imageUrl,
+  focusX,
+  focusY,
   active,
   subtitle,
   onSelect,
   onDelete,
 }: {
   name: string;
-  preview: { background: string; surface: string; accent: string; text: string };
+  colors: { background: string; panel: string; accent: string; text: string; muted?: string };
+  imageUrl?: string;
+  focusX?: number;
+  focusY?: number;
   active: boolean;
   subtitle?: string;
   onSelect: () => void;
@@ -1640,14 +1646,45 @@ function ThemeCard({
       }`}
       onClick={onSelect}
     >
-      {/* 色卡预览 */}
+      {/* 缩小版实际效果:背景图 + 压暗层 + 迷你侧栏/终端界面 */}
       <div
-        className="h-12 rounded-[var(--radius-sm)] border border-[var(--border-subtle)] flex items-center gap-1.5 px-2"
-        style={{ backgroundColor: preview.background }}
+        className="relative h-24 rounded-[var(--radius-sm)] border border-[var(--border-subtle)] overflow-hidden"
+        style={{ backgroundColor: colors.background }}
       >
-        <span className="w-5 h-5 rounded-sm" style={{ backgroundColor: preview.surface }} />
-        <span className="w-5 h-5 rounded-full" style={{ backgroundColor: preview.accent }} />
-        <span className="text-sm font-mono" style={{ color: preview.text }}>Aa</span>
+        {imageUrl && (
+          <div
+            className="absolute inset-0"
+            style={{
+              backgroundImage: `url("${imageUrl}")`,
+              backgroundSize: 'cover',
+              backgroundPosition: `${(focusX ?? 0.5) * 100}% ${(focusY ?? 0.5) * 100}%`,
+            }}
+          />
+        )}
+        {/* 压暗层,与真实氛围层同款(35%) */}
+        <div
+          className="absolute inset-0"
+          style={{ backgroundColor: `color-mix(in srgb, ${colors.background} 35%, transparent)` }}
+        />
+        {/* 迷你侧栏(72% 半透明面板) */}
+        <div
+          className="absolute left-1.5 top-1.5 bottom-1.5 w-12 rounded-sm px-1.5 py-1 space-y-1"
+          style={{ backgroundColor: `color-mix(in srgb, ${colors.panel} 72%, transparent)` }}
+        >
+          <div className="h-1 w-8 rounded-full" style={{ backgroundColor: colors.accent }} />
+          <div className="h-1 w-6 rounded-full opacity-60" style={{ backgroundColor: colors.text }} />
+          <div className="h-1 w-7 rounded-full opacity-40" style={{ backgroundColor: colors.text }} />
+        </div>
+        {/* 迷你终端区(60% 着色 + 提示符) */}
+        <div
+          className="absolute left-[3.9rem] right-1.5 top-1.5 bottom-1.5 rounded-sm px-1.5 py-1"
+          style={{ backgroundColor: `color-mix(in srgb, ${colors.background} 60%, transparent)` }}
+        >
+          <div className="text-[10px] leading-tight font-mono" style={{ color: colors.accent }}>
+            ❯ <span style={{ color: colors.text }}>Aa 字</span>
+          </div>
+          <div className="mt-0.5 h-1 w-10 rounded-full opacity-50" style={{ backgroundColor: colors.text }} />
+        </div>
       </div>
       <div className="flex items-start justify-between gap-2 min-w-0">
         <div className="min-w-0">
@@ -1807,12 +1844,15 @@ function CustomThemePacksSection() {
               key={pack.themeId}
               name={pack.def.name}
               subtitle={pack.themeId}
-              preview={{
+              colors={{
                 background: pack.def.colors.background,
-                surface: pack.def.colors.panel,
+                panel: pack.def.colors.panel,
                 accent: pack.def.colors.accent,
                 text: pack.def.colors.text,
               }}
+              imageUrl={pack.def.image ? convertFileSrc(`${pack.dir}/${pack.def.image}`) : undefined}
+              focusX={pack.def.art?.focusX}
+              focusY={pack.def.art?.focusY}
               active={config.customThemeId === pack.themeId}
               onSelect={() => void selectCustom(pack)}
               onDelete={() => void deletePack(pack)}

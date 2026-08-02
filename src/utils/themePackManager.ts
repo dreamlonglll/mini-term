@@ -83,6 +83,8 @@ export interface ThemePackMeta {
   /** themes/ 下目录名（read_theme_pack 用它定位） */
   themeId: string;
   def: ThemePackJson;
+  /** 包目录绝对路径，卡片背景缩略图用 convertFileSrc 组 URL */
+  dir: string;
 }
 
 // ─── 校验 ───
@@ -246,7 +248,14 @@ function resolveVariant(def: ThemePackJson, mode: 'dark' | 'light'): ThemeVarian
       highlight: c.highlight,
       line: withAlpha(c.accent, 0.35) ?? 'rgba(128, 128, 128, 0.4)',
     },
-    effects: def.effects,
+    // 派生态用更高的不透明度：背景图按原生态设计，反相态下纱罩太透会
+    // 压不住图的亮度/纹理（浅色 UI 对底噪尤其敏感），图退为边缘氛围
+    effects: {
+      ...def.effects,
+      surfaceOpacity: def.effects?.surfaceOpacity ?? 0.88,
+      backgroundDim: def.effects?.backgroundDim ?? 0.5,
+      terminalOpacity: def.effects?.terminalOpacity ?? 0.82,
+    },
   };
 }
 
@@ -504,7 +513,7 @@ export function isTransparentThemeActive(): boolean {
 
 // ─── 与后端的读取链路 ───
 
-interface ThemePackEntry { themeId: string; themeJson: string }
+interface ThemePackEntry { themeId: string; themeJson: string; dir: string }
 interface ThemePackData { themeJson: string; themeCss: string | null; dir: string }
 
 /** 扫描 themes/ 目录，解析失败的包跳过并 console.warn（不阻塞列表） */
@@ -513,7 +522,7 @@ export async function listThemePacks(): Promise<ThemePackMeta[]> {
   const out: ThemePackMeta[] = [];
   for (const entry of entries) {
     try {
-      out.push({ themeId: entry.themeId, def: parseThemePack(entry.themeId, entry.themeJson) });
+      out.push({ themeId: entry.themeId, def: parseThemePack(entry.themeId, entry.themeJson), dir: entry.dir });
     } catch (e) {
       console.warn(`主题包 ${entry.themeId} 无效，已跳过:`, e);
     }

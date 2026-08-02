@@ -30,6 +30,8 @@ pub struct ThemePackEntry {
     pub theme_id: String,
     /// theme.json 原文，由前端解析校验
     pub theme_json: String,
+    /// 包目录绝对路径（设置页卡片缩略图组背景 URL 用）
+    pub dir: String,
 }
 
 #[tauri::command]
@@ -48,6 +50,7 @@ pub fn list_theme_packs(app: AppHandle) -> Result<Vec<ThemePackEntry>, String> {
         out.push(ThemePackEntry {
             theme_id: entry.file_name().to_string_lossy().into_owned(),
             theme_json,
+            dir: path.to_string_lossy().into_owned(),
         });
     }
     out.sort_by(|a, b| a.theme_id.cmp(&b.theme_id));
