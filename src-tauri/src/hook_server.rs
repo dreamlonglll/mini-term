@@ -253,18 +253,43 @@ fn is_retry_notification(message: &str) -> bool {
         || m.contains("rate limit")
 }
 
+/// Notification 文案是否为「需要用户确认/授权」类。
+///
+/// Claude Code 的 Notification 事件承载两类语义:权限请求("Claude needs your
+/// permission to use …")与闲置提醒("Claude is waiting for your input",空闲
+/// 60 秒触发)。后者不是待办事项 —— 若也标 attention,pane 只要闲置就点亮
+/// 托盘黄灯,黄灯从「有事要确认」退化成「AI 没在跑」,失去信号价值。
+/// 按权限类关键词白名单判定,未匹配(含无文案)一律不标 attention:
+/// 真正的授权请求另有 PermissionRequest/Elicitation 事件兜底,漏匹配不丢黄灯。
+fn is_confirmation_notification(message: &str) -> bool {
+    let m = message.to_lowercase();
+    m.contains("permission")
+        || m.contains("approv")
+        || m.contains("authoriz")
+        || m.contains("confirm")
+        || m.contains("授权")
+        || m.contains("确认")
+        || m.contains("允许")
+}
+
 /// 事件 → 状态成因标注。
-/// "attention" = 需要用户确认/输入(授权、通知、询问);"stop" = 一轮回答正常结束。
+/// "attention" = 需要用户确认/输入(授权、询问);"stop" = 一轮回答正常结束。
 /// PermissionRequest/Elicitation 不论状态一律标 attention:codex 的
 /// PermissionRequest 特判映射为 ai-working(批准后无事件,映射 idle 会卡死),
 /// 但「等你确认」的信号必须发出去,否则托盘黄灯在 codex 场景永远不亮;
 /// 用户对该 pane 键入任何内容(确认动作本身)时由前端清除 attention。
+/// Notification 只有权限/确认类文案才标 attention(闲置提醒不是待办);
 /// 重试类 Notification 已在 map_event_to_status 映射为 ai-working,不会走到 attention。
-fn event_cause(event: &str, status: &str) -> Option<&'static str> {
+fn event_cause(event: &str, status: &str, message: Option<&str>) -> Option<&'static str> {
     match event {
         "PermissionRequest" | "Elicitation" => Some("attention"),
         "Stop" if status == "ai-idle" => Some("stop"),
-        "Notification" if status == "ai-idle" => Some("attention"),
+        "Notification"
+            if status == "ai-idle"
+                && message.map_or(false, is_confirmation_notification) =>
+        {
+            Some("attention")
+        }
         _ => None,
     }
 }
@@ -475,17 +500,12 @@ pub fn start_hook_server(
 
                         // 通知前端（与 process_monitor 共享同一份去重表）；
                         // cause 标注 ai-idle 的成因,托盘据此区分黄灯(待确认)与绿灯(完成)
-                        emitter.emit_if_changed(
-                            &app,
-                            pty_id,
-                            status,
-                            event_cause(event, status),
-                            payload.agent.clone(),
-                        );
+                        let cause = event_cause(event, status, payload.message.as_deref());
+                        emitter.emit_if_changed(&app, pty_id, status, cause, payload.agent.clone());
 
                         eprintln!(
                             "[hook-server] pty_id={} event={} agent={:?} -> status={} cause={:?}",
-                            pty_id, event, payload.agent, status, event_cause(event, status)
+                            pty_id, event, payload.agent, status, cause
                         );
                     }
                 }
@@ -758,5 +778,47 @@ mod tests {
             map_event_to_status("Notification", Some("claude-code"), None),
             Some("ai-idle")
         );
+    }
+
+    #[test]
+    fn permission_notification_causes_attention() {
+        // 权限/确认类文案:真正待用户确认,点黄灯
+        for msg in [
+            "Claude needs your permission to use Bash",
+            "Waiting for your approval to run the command",
+        ] {
+            assert_eq!(
+                event_cause("Notification", "ai-idle", Some(msg)),
+                Some("attention"),
+                "该亮黄灯没亮: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn idle_reminder_notification_not_attention() {
+        // 闲置提醒不是待办:不点黄灯(状态仍是 ai-idle 绿色)
+        assert_eq!(
+            event_cause("Notification", "ai-idle", Some("Claude is waiting for your input")),
+            None
+        );
+        // 无文案无从判定,保守不点黄灯(真授权另有 PermissionRequest/Elicitation 兜底)
+        assert_eq!(event_cause("Notification", "ai-idle", None), None);
+        // 重试类在 map_event_to_status 已映射 ai-working,event_cause 不标 attention
+        assert_eq!(
+            event_cause("Notification", "ai-working", Some("Connection error, retrying...")),
+            None
+        );
+    }
+
+    #[test]
+    fn permission_request_and_elicitation_always_attention() {
+        // codex 的 PermissionRequest 映射为 ai-working,attention 信号仍须发出
+        assert_eq!(
+            event_cause("PermissionRequest", "ai-working", None),
+            Some("attention")
+        );
+        assert_eq!(event_cause("Elicitation", "ai-idle", None), Some("attention"));
+        assert_eq!(event_cause("Stop", "ai-idle", None), Some("stop"));
     }
 }
