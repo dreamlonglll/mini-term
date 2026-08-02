@@ -3,7 +3,11 @@
  *
  * 应用机制照抄 fontManager 先例：documentElement.style.setProperty 批量覆盖
  * CSS 变量，清除时全量 removeProperty 回落 styles.css 静态基线，零残留。
- * `appearance` 决定 data-theme 取 dark/light（未覆盖的 token 回落到正确明暗基线），
+ *
+ * 明暗双态：主题包是「外置皮肤」，与内置皮肤一样跟随用户的 theme 轴。
+ * 顶层 colors 是 appearance 声明的那一态；另一态优先取 variants.dark/light
+ * 精调定义，缺失时自动派生（中性明暗基线 + 保留 accent 色相身份）。
+ * data-theme 完全由既有 theme 链路管理，明暗切换后由 App 调 reapplyCustomTheme。
  * data-skin 置空（由 App.tsx 的 skin effect 按 customThemeId 收敛）。
  *
  * Phase 2 背景图氛围层：背景图挂在 #root 的 inline background（html/body 的
@@ -15,7 +19,7 @@
 
 import { convertFileSrc, invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { applyTheme } from './themeManager';
+import { getResolvedTheme } from './themeManager';
 import { BUILTIN_TERMINAL_THEMES, type TerminalTheme } from './builtinThemes';
 import type { FsChangePayload } from '../types';
 
@@ -59,6 +63,20 @@ export interface ThemePackJson {
   terminal?: Partial<TerminalTheme>;
   /** mini-term 扩展：直接覆盖任意 `--` 变量的逃生舱，优先级最高 */
   tokens?: Record<string, string>;
+  /** mini-term 扩展：另一明暗态的精调变体。顶层 colors 即 appearance 声明
+   *  那一态；缺失的另一态自动派生（中性明暗基线 + 保留 accent 色相身份） */
+  variants?: {
+    dark?: ThemeVariantDef;
+    light?: ThemeVariantDef;
+  };
+}
+
+/** 一个明暗态变体的完整定义 */
+export interface ThemeVariantDef {
+  colors: ThemePackColors;
+  effects?: ThemePackJson['effects'];
+  terminal?: Partial<TerminalTheme>;
+  tokens?: Record<string, string>;
 }
 
 export interface ThemePackMeta {
@@ -76,6 +94,21 @@ function isValidColor(value: unknown): value is string {
   return typeof value === 'string' && CSS.supports('color', value);
 }
 
+function validateColors(colors: unknown, label: string): asserts colors is ThemePackColors {
+  if (typeof colors !== 'object' || colors === null) throw new Error(`缺少 ${label} 字段`);
+  const c = colors as Record<string, unknown>;
+  for (const key of REQUIRED_COLOR_KEYS) {
+    if (!isValidColor(c[key])) {
+      throw new Error(`${label}.${key} 缺失或不是合法色值: ${String(c[key])}`);
+    }
+  }
+  for (const key of OPTIONAL_COLOR_KEYS) {
+    if (c[key] !== undefined && !isValidColor(c[key])) {
+      throw new Error(`${label}.${key} 不是合法色值: ${String(c[key])}`);
+    }
+  }
+}
+
 /** 解析并校验 theme.json 文本，不合法直接 throw（错误信息面向设置页展示） */
 export function parseThemePack(themeId: string, jsonText: string): ThemePackJson {
   let raw: unknown;
@@ -91,16 +124,10 @@ export function parseThemePack(themeId: string, jsonText: string): ThemePackJson
   if (def.appearance !== 'dark' && def.appearance !== 'light') {
     throw new Error(`appearance 必须为 dark 或 light，实际: ${String(def.appearance)}`);
   }
-  if (typeof def.colors !== 'object' || def.colors === null) throw new Error('缺少 colors 字段');
-  for (const key of REQUIRED_COLOR_KEYS) {
-    if (!isValidColor(def.colors[key])) {
-      throw new Error(`colors.${key} 缺失或不是合法色值: ${String(def.colors[key])}`);
-    }
-  }
-  for (const key of OPTIONAL_COLOR_KEYS) {
-    if (def.colors[key] !== undefined && !isValidColor(def.colors[key])) {
-      throw new Error(`colors.${key} 不是合法色值: ${String(def.colors[key])}`);
-    }
+  validateColors(def.colors, 'colors');
+  for (const mode of ['dark', 'light'] as const) {
+    const variant = def.variants?.[mode];
+    if (variant !== undefined) validateColors(variant.colors, `variants.${mode}.colors`);
   }
   if (def.tokens !== undefined && (typeof def.tokens !== 'object' || def.tokens === null)) {
     throw new Error('tokens 必须是对象');
@@ -166,25 +193,72 @@ function hasBackgroundImage(def: ThemePackJson, dir: string | null): dir is stri
   return !!def.image && !!dir;
 }
 
-function surfaceOpacityOf(def: ThemePackJson): number {
-  const v = def.effects?.surfaceOpacity;
+type ThemeEffects = ThemePackJson['effects'];
+
+function surfaceOpacityOf(effects: ThemeEffects): number {
+  const v = effects?.surfaceOpacity;
   return typeof v === 'number' && v >= 0 && v <= 1 ? v : DEFAULT_SURFACE_OPACITY;
 }
 
-function terminalOpacityOf(def: ThemePackJson): number {
-  const v = def.effects?.terminalOpacity;
+function terminalOpacityOf(effects: ThemeEffects): number {
+  const v = effects?.terminalOpacity;
   return typeof v === 'number' && v >= 0 && v <= 1 ? v : DEFAULT_TERMINAL_OPACITY;
+}
+
+// ─── 明暗变体解析 ───
+
+/** 自动派生另一态时的中性表面基线：保证可读性，皮肤个性由 accent 系承载 */
+const DERIVED_SURFACES: Record<'dark' | 'light', Pick<ThemePackColors, 'background' | 'panel' | 'panelAlt' | 'text' | 'muted'>> = {
+  dark: {
+    background: '#101216',
+    panel: '#181b21',
+    panelAlt: '#22262e',
+    text: '#e2e2e2',
+    muted: 'rgba(226, 226, 226, 0.6)',
+  },
+  light: {
+    background: '#fafafa',
+    panel: '#ffffff',
+    panelAlt: '#f1f2f4',
+    text: '#1a1a1a',
+    muted: 'rgba(26, 26, 26, 0.55)',
+  },
+};
+
+/** 取 mode 对应的变体：native 态 → 顶层字段；作者精调 → variants[mode]；
+ *  否则自动派生。terminal/tokens 只在明确声明的变体上生效（它们按态设计）。 */
+function resolveVariant(def: ThemePackJson, mode: 'dark' | 'light'): ThemeVariantDef {
+  if (mode === def.appearance) {
+    return { colors: def.colors, effects: def.effects, terminal: def.terminal, tokens: def.tokens };
+  }
+  const declared = def.variants?.[mode];
+  if (declared) {
+    return { ...declared, effects: declared.effects ?? def.effects };
+  }
+  const c = def.colors;
+  const base = DERIVED_SURFACES[mode];
+  return {
+    colors: {
+      ...base,
+      accent: c.accent,
+      accentAlt: c.accentAlt,
+      secondary: c.secondary,
+      highlight: c.highlight,
+      line: withAlpha(c.accent, 0.35) ?? 'rgba(128, 128, 128, 0.4)',
+    },
+    effects: def.effects,
+  };
 }
 
 // ─── theme.json → mini-term token 映射（计划 3.2 映射表） ───
 
-function buildTokenMap(def: ThemePackJson, withBackground: boolean): Record<string, string> {
-  const c = def.colors;
-  const so = surfaceOpacityOf(def);
+function buildTokenMap(variant: ThemeVariantDef, withBackground: boolean): Record<string, string> {
+  const c = variant.colors;
+  const so = surfaceOpacityOf(variant.effects);
   const map: Record<string, string> = {
     '--bg-base': c.background,
     '--bg-terminal': withBackground
-      ? withAlpha(c.background, terminalOpacityOf(def)) ?? c.background
+      ? withAlpha(c.background, terminalOpacityOf(variant.effects)) ?? c.background
       : c.background,
     '--bg-surface': withBackground ? withAlpha(c.panel, so) ?? c.panel : c.panel,
     '--bg-elevated': withBackground ? withAlpha(c.panelAlt, so) ?? c.panelAlt : c.panelAlt,
@@ -207,8 +281,8 @@ function buildTokenMap(def: ThemePackJson, withBackground: boolean): Record<stri
     '--mt-theme-color-text': c.text,
     '--mt-theme-color-muted': c.muted,
     '--mt-theme-color-line': c.line,
-    '--mt-theme-surface-radius': def.effects?.surfaceRadius ?? '10px',
-    '--mt-theme-surface-blur': def.effects?.surfaceBlur ?? '12px',
+    '--mt-theme-surface-radius': variant.effects?.surfaceRadius ?? '10px',
+    '--mt-theme-surface-blur': variant.effects?.surfaceBlur ?? '12px',
   };
   // 近似归宿：mt 暂无 accent-alt / secondary / highlight 独立 token（计划 3.2）
   if (c.accentAlt) {
@@ -224,14 +298,14 @@ function buildTokenMap(def: ThemePackJson, withBackground: boolean): Record<stri
     map['--mt-theme-color-highlight'] = c.highlight;
   }
   // 逃生舱：tokens 直覆任意变量，优先级最高
-  if (def.tokens) Object.assign(map, def.tokens);
+  if (variant.tokens) Object.assign(map, variant.tokens);
   return map;
 }
 
-/** 缺省推导终端配色；ANSI 16 色取 appearance 对应内置基线（乱推会毁掉 TUI 可读性） */
-function deriveTerminalTheme(def: ThemePackJson, withBackground: boolean): TerminalTheme {
-  const base = BUILTIN_TERMINAL_THEMES[def.appearance];
-  const c = def.colors;
+/** 缺省推导终端配色；ANSI 16 色取当前明暗态的内置基线（乱推会毁掉 TUI 可读性） */
+function deriveTerminalTheme(variant: ThemeVariantDef, mode: 'dark' | 'light', withBackground: boolean): TerminalTheme {
+  const base = BUILTIN_TERMINAL_THEMES[mode];
+  const c = variant.colors;
   return {
     ...base,
     // 背景图模式下 xterm 自身背景全透明（保留 RGB 供对比度计算），
@@ -242,7 +316,7 @@ function deriveTerminalTheme(def: ThemePackJson, withBackground: boolean): Termi
     cursorAccent: c.background,
     selectionBackground: withAlpha(c.accent, 0.22) ?? base.selectionBackground,
     selectionForeground: c.text,
-    ...def.terminal,
+    ...variant.terminal,
   };
 }
 
@@ -284,8 +358,9 @@ function removeThemeCss(): void {
 /** 探活令牌：主题切换后作废在途的 base64 兜底回填 */
 let bgProbeToken = 0;
 
-function setRootBackground(rootEl: HTMLElement, def: ThemePackJson, imageUrl: string): void {
-  const dim = withAlpha(def.colors.background, def.effects?.backgroundDim ?? DEFAULT_BACKGROUND_DIM)
+function setRootBackground(rootEl: HTMLElement, def: ThemePackJson, variant: ThemeVariantDef, imageUrl: string): void {
+  // 压暗层用当前变体底色：浅色态自动变成浅纱罩
+  const dim = withAlpha(variant.colors.background, variant.effects?.backgroundDim ?? DEFAULT_BACKGROUND_DIM)
     ?? `rgba(0, 0, 0, ${DEFAULT_BACKGROUND_DIM})`;
   const focusX = def.art?.focusX ?? 0.5;
   const focusY = def.art?.focusY ?? 0.5;
@@ -305,12 +380,12 @@ function mimeOf(file: string): string {
   return 'image/jpeg';
 }
 
-function applyBackgroundLayer(def: ThemePackJson, dir: string): void {
+function applyBackgroundLayer(def: ThemePackJson, variant: ThemeVariantDef, dir: string): void {
   const rootEl = document.getElementById('root');
   if (!rootEl) return;
   const image = def.image!;
   const url = convertFileSrc(`${dir}/${image}`);
-  setRootBackground(rootEl, def, url);
+  setRootBackground(rootEl, def, variant, url);
   // 噪点层随背景主题归零（styles.css 的 :root[data-custom-theme-bg] 规则）
   document.documentElement.dataset.customThemeBg = '1';
 
@@ -325,7 +400,7 @@ function applyBackgroundLayer(def: ThemePackJson, dir: string): void {
     invoke<string>('read_theme_asset', { themeId, file: image })
       .then((b64) => {
         if (token !== bgProbeToken) return;
-        setRootBackground(rootEl, def, `data:${mimeOf(image)};base64,${b64}`);
+        setRootBackground(rootEl, def, variant, `data:${mimeOf(image)};base64,${b64}`);
       })
       .catch((e) => console.error('背景图兜底读取也失败:', e));
   };
@@ -351,21 +426,24 @@ const PROPS_ATTR = 'data-custom-theme-props';
 
 let activeTheme: ThemePackJson | null = null;
 let activeThemeDir: string | null = null;
+let activeThemeCss: string | null = null;
 let customTerminalTheme: TerminalTheme | null = null;
 
 export function applyCustomTheme(def: ThemePackJson, dir: string | null = null, themeCss: string | null = null): void {
-  clearCustomTheme();
-  // 先落明暗基线：未覆盖的 token（diff/语法高亮等）回落到正确的 dark/light 静态规则
-  applyTheme(def.appearance);
+  clearAppliedDom();
+  // 明暗态跟随用户 theme 轴（data-theme 由既有链路维护），按当前态解析变体；
+  // 未覆盖的 token（diff/语法高亮等）自然回落对应的 dark/light 静态规则
+  const mode = getResolvedTheme();
+  const variant = resolveVariant(def, mode);
   const root = document.documentElement;
   root.dataset.customTheme = def.id;
   const withBg = hasBackgroundImage(def, dir);
-  const map = buildTokenMap(def, withBg);
+  const map = buildTokenMap(variant, withBg);
   for (const [prop, value] of Object.entries(map)) {
     root.style.setProperty(prop, value);
   }
   root.setAttribute(PROPS_ATTR, Object.keys(map).join(' '));
-  if (withBg) applyBackgroundLayer(def, dir);
+  if (withBg) applyBackgroundLayer(def, variant, dir);
   // theme.css 不合法只警告不整包失败（token 主题仍可用）
   try {
     injectThemeCss(themeCss);
@@ -374,11 +452,19 @@ export function applyCustomTheme(def: ThemePackJson, dir: string | null = null, 
   }
   activeTheme = def;
   activeThemeDir = dir;
-  customTerminalTheme = deriveTerminalTheme(def, withBg);
+  activeThemeCss = themeCss;
+  customTerminalTheme = deriveTerminalTheme(variant, mode, withBg);
 }
 
-/** 全量移除覆盖与标记。data-theme/data-skin 的回落由调用方走既有 theme/skin 链路。 */
-export function clearCustomTheme(): void {
+/** 明暗切换后按新 resolved 态重算当前主题包（未激活时 no-op）。 */
+export function reapplyCustomTheme(): void {
+  if (!activeTheme) return;
+  applyCustomTheme(activeTheme, activeThemeDir, activeThemeCss);
+}
+
+/** 只清 DOM 覆盖（变量/背景层/注入 CSS/标记），保留监听与激活态。
+ *  供 applyCustomTheme 重算变体时复用——热重载监听跨明暗切换存活。 */
+function clearAppliedDom(): void {
   const root = document.documentElement;
   const props = root.getAttribute(PROPS_ATTR)?.split(' ').filter(Boolean) ?? [];
   for (const prop of props) {
@@ -387,10 +473,17 @@ export function clearCustomTheme(): void {
   root.removeAttribute(PROPS_ATTR);
   clearBackgroundLayer();
   removeThemeCss();
+  delete root.dataset.customTheme;
+}
+
+/** 完全停用：DOM 覆盖 + 激活态 + 目录监听全清。
+ *  data-theme/data-skin 的回落由调用方走既有 theme/skin 链路。 */
+export function clearCustomTheme(): void {
+  clearAppliedDom();
   activeTheme = null;
   activeThemeDir = null;
+  activeThemeCss = null;
   customTerminalTheme = null;
-  delete root.dataset.customTheme;
   activeThemeId = null;
   void unwatchThemeDir();
 }
