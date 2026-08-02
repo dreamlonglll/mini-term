@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { getVersion } from '@tauri-apps/api/app';
 import { openUrl } from '@tauri-apps/plugin-opener';
+import { revealItemInDir } from '@tauri-apps/plugin-opener';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { useAppStore, saveConfigToDisk } from '../store';
 import { playNotificationSound } from '../utils/notificationSound';
@@ -9,6 +10,8 @@ import { checkForUpdate, compareVersions, type ReleaseInfo } from '../utils/upda
 import { applyTheme } from '../utils/themeManager';
 import { updateAllTerminalThemes, DEFAULT_TERMINAL_FONT_FAMILY } from '../utils/terminalCache';
 import { applyUiFontFamily } from '../utils/fontManager';
+import { BUILTIN_THEMES, type BuiltinThemeDescriptor } from '../utils/builtinThemes';
+import { clearCustomTheme, listThemePacks, loadAndApplyCustomTheme, type ThemePackMeta } from '../utils/themePackManager';
 import { MOD_LABEL } from '../utils/platform';
 import { comboLabel, hotkeyGroups } from '../utils/hotkeys';
 import { DEFAULT_REMOTE_PASTE_DIR } from '../utils/pastePath';
@@ -24,7 +27,7 @@ interface Props {
   initialPage?: SettingsPage;
 }
 
-export type SettingsPage = 'terminal' | 'system' | 'font' | 'ai-notification' | 'shortcuts' | 'about';
+export type SettingsPage = 'terminal' | 'system' | 'themes' | 'font' | 'ai-notification' | 'shortcuts' | 'about';
 
 // ─── ShellRow（终端设置子组件）───
 
@@ -1604,11 +1607,189 @@ function ShortcutsSettings() {
   );
 }
 
+// ─── ThemesSettings（主题分页：内置外观 + 外置主题包统一卡片列表）───
+
+function ThemeCard({
+  name,
+  preview,
+  active,
+  subtitle,
+  onSelect,
+}: {
+  name: string;
+  preview: { background: string; surface: string; accent: string; text: string };
+  active: boolean;
+  subtitle?: string;
+  onSelect: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      className={`flex flex-col gap-2 p-3 rounded-[var(--radius-md)] text-left transition-all border ${
+        active
+          ? 'border-[var(--accent)] bg-[var(--accent-subtle)]'
+          : 'border-[var(--border-default)] bg-[var(--bg-base)] hover:border-[var(--accent)]'
+      }`}
+      onClick={onSelect}
+    >
+      {/* 色卡预览 */}
+      <div
+        className="h-12 rounded-[var(--radius-sm)] border border-[var(--border-subtle)] flex items-center gap-1.5 px-2"
+        style={{ backgroundColor: preview.background }}
+      >
+        <span className="w-5 h-5 rounded-sm" style={{ backgroundColor: preview.surface }} />
+        <span className="w-5 h-5 rounded-full" style={{ backgroundColor: preview.accent }} />
+        <span className="text-sm font-mono" style={{ color: preview.text }}>Aa</span>
+      </div>
+      <div className="min-w-0">
+        <div className={`text-base truncate ${active ? 'text-[var(--accent)]' : 'text-[var(--text-primary)]'}`}>
+          {name}
+        </div>
+        {subtitle && <div className="text-sm text-[var(--text-muted)] truncate">{subtitle}</div>}
+      </div>
+    </button>
+  );
+}
+
+function ThemesSettings() {
+  const t = useT();
+  const config = useAppStore((s) => s.config);
+  const setConfig = useAppStore((s) => s.setConfig);
+  const [packs, setPacks] = useState<ThemePackMeta[]>([]);
+  const [error, setError] = useState<string | null>(null);
+
+  const refresh = useCallback(() => {
+    setError(null);
+    listThemePacks().then(setPacks).catch((e) => setError(String(e)));
+  }, []);
+
+  useEffect(() => { refresh(); }, [refresh]);
+
+  const selectBuiltin = useCallback((b: BuiltinThemeDescriptor) => {
+    clearCustomTheme();
+    const cur = useAppStore.getState().config;
+    const newConfig = {
+      ...cur,
+      theme: b.patch.theme ?? cur.theme,
+      skin: b.patch.skin,
+      customThemeId: undefined,
+    };
+    setConfig(newConfig);
+    // data-theme / data-skin 的回落由 App.tsx 的 theme/skin effect 按新 config 收敛
+    applyTheme(newConfig.theme ?? 'auto');
+    updateAllTerminalThemes(newConfig.terminalFollowTheme ?? true);
+    saveConfigToDisk(newConfig);
+  }, [setConfig]);
+
+  const selectCustom = useCallback(async (pack: ThemePackMeta) => {
+    setError(null);
+    try {
+      await loadAndApplyCustomTheme(pack.themeId);
+    } catch (e) {
+      setError(t('settings.themes.applyFailed', { detail: String(e) }));
+      return;
+    }
+    const cur = useAppStore.getState().config;
+    const newConfig = { ...cur, customThemeId: pack.themeId };
+    setConfig(newConfig);
+    updateAllTerminalThemes(newConfig.terminalFollowTheme ?? true);
+    saveConfigToDisk(newConfig);
+  }, [setConfig, t]);
+
+  const openThemesDir = useCallback(async () => {
+    try {
+      const dir = await invoke<string>('get_themes_dir');
+      await revealItemInDir(dir);
+    } catch (e) {
+      setError(String(e));
+    }
+  }, []);
+
+  const builtinActive = (b: BuiltinThemeDescriptor) =>
+    !config.customThemeId &&
+    (config.skin ?? 'none') === b.patch.skin &&
+    (b.patch.theme === undefined || config.theme === b.patch.theme);
+
+  return (
+    <div className="space-y-6">
+      {/* 内置外观 */}
+      <div>
+        <div className="text-base text-[var(--text-muted)] uppercase tracking-[0.1em] mb-2">
+          {t('settings.themes.builtinSection')}
+        </div>
+        <div className="grid grid-cols-2 gap-2">
+          {BUILTIN_THEMES.map((b) => (
+            <ThemeCard
+              key={b.id}
+              name={t(b.nameKey)}
+              preview={b.preview}
+              active={builtinActive(b)}
+              onSelect={() => selectBuiltin(b)}
+            />
+          ))}
+        </div>
+      </div>
+
+      {/* 外置主题包 */}
+      <div>
+        <div className="flex items-center justify-between mb-2">
+          <div className="text-base text-[var(--text-muted)] uppercase tracking-[0.1em]">
+            {t('settings.themes.customSection')}
+          </div>
+          <div className="flex gap-2">
+            <button
+              className="px-2 py-1 text-sm rounded-[var(--radius-sm)] text-[var(--text-secondary)] border border-[var(--border-default)] hover:border-[var(--accent)] hover:text-[var(--text-primary)] transition-all"
+              onClick={openThemesDir}
+            >
+              {t('settings.themes.openDir')}
+            </button>
+            <button
+              className="px-2 py-1 text-sm rounded-[var(--radius-sm)] text-[var(--text-secondary)] border border-[var(--border-default)] hover:border-[var(--accent)] hover:text-[var(--text-primary)] transition-all"
+              onClick={refresh}
+            >
+              {t('settings.themes.refresh')}
+            </button>
+          </div>
+        </div>
+        {packs.length === 0 ? (
+          <div className="px-3 py-4 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)] text-sm text-[var(--text-muted)]">
+            {t('settings.themes.empty')}
+          </div>
+        ) : (
+          <div className="grid grid-cols-2 gap-2">
+            {packs.map((pack) => (
+              <ThemeCard
+                key={pack.themeId}
+                name={pack.def.name}
+                subtitle={pack.themeId}
+                preview={{
+                  background: pack.def.colors.background,
+                  surface: pack.def.colors.panel,
+                  accent: pack.def.colors.accent,
+                  text: pack.def.colors.text,
+                }}
+                active={config.customThemeId === pack.themeId}
+                onSelect={() => void selectCustom(pack)}
+              />
+            ))}
+          </div>
+        )}
+        {error && (
+          <div className="mt-2 px-3 py-2 rounded-[var(--radius-sm)] border border-[var(--color-error)] text-sm text-[var(--color-error)]">
+            {error}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ─── SettingsModal（主弹窗）───
 
 const MENU_ITEMS: { key: SettingsPage; labelKey: string }[] = [
   { key: 'terminal', labelKey: 'settings.menu.terminal' },
   { key: 'system', labelKey: 'settings.menu.system' },
+  { key: 'themes', labelKey: 'settings.menu.themes' },
   { key: 'font', labelKey: 'settings.menu.font' },
   { key: 'ai-notification', labelKey: 'settings.menu.aiNotification' },
   { key: 'shortcuts', labelKey: 'settings.menu.shortcuts' },
@@ -1679,6 +1860,7 @@ export function SettingsModal({ open, onClose, initialPage }: Props) {
         <div className="flex-1 overflow-y-auto px-5 py-4" role="tabpanel">
           {activePage === 'terminal' && <TerminalSettings />}
           {activePage === 'system' && <SystemSettings />}
+          {activePage === 'themes' && <ThemesSettings />}
           {activePage === 'font' && <FontSettings />}
           {activePage === 'ai-notification' && <AiNotificationSettings />}
           {activePage === 'shortcuts' && <ShortcutsSettings />}

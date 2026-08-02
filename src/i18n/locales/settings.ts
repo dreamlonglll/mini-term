@@ -65,6 +65,18 @@ export const settings = {
       browseDialogTitle: "选择编辑器可执行文件",
       executableFilter: "可执行文件",
     },
+    themes: {
+      builtinSection: "内置外观",
+      customSection: "外置主题包",
+      builtinDark: "深色",
+      builtinLight: "浅色",
+      builtinBlueprint: "蓝图",
+      builtinFluent2: "Fluent 2",
+      openDir: "打开主题目录",
+      refresh: "刷新",
+      empty: "还没有外置主题包。点「打开主题目录」，把 Dream Skin 格式的主题文件夹（含 theme.json）拷入后刷新",
+      applyFailed: "主题应用失败：{detail}",
+    },
     font: {
       fontSize: "字体大小",
       uiFontSize: "界面字体大小",
@@ -160,6 +172,7 @@ export const settings = {
     menu: {
       terminal: "终端设置",
       system: "系统设置",
+      themes: "主题",
       font: "字体",
       aiNotification: "AI 完成通知",
       shortcuts: "快捷键",
@@ -232,6 +245,18 @@ export const settings = {
       editorExistsAlert: "An editor named \"{name}\" already exists, please use a different name",
       browseDialogTitle: "Select editor executable",
       executableFilter: "Executable",
+    },
+    themes: {
+      builtinSection: "Built-in appearances",
+      customSection: "Custom theme packs",
+      builtinDark: "Dark",
+      builtinLight: "Light",
+      builtinBlueprint: "Blueprint",
+      builtinFluent2: "Fluent 2",
+      openDir: "Open themes folder",
+      refresh: "Refresh",
+      empty: "No custom theme packs yet. Click \"Open themes folder\", copy a Dream Skin format theme folder (with theme.json) into it, then refresh",
+      applyFailed: "Failed to apply theme: {detail}",
     },
     font: {
       fontSize: "Font size",
@@ -328,6 +353,7 @@ export const settings = {
     menu: {
       terminal: "Terminal",
       system: "System",
+      themes: "Themes",
       font: "Font",
       aiNotification: "AI notifications",
       shortcuts: "Shortcuts",

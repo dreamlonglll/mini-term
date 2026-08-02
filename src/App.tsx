@@ -29,6 +29,7 @@ import { collectPanes } from './utils/layoutOps';
 import { checkForUpdate, type ReleaseInfo } from './utils/updateChecker';
 import { applyTheme } from './utils/themeManager';
 import { applyUiFontFamily } from './utils/fontManager';
+import { loadAndApplyCustomTheme } from './utils/themePackManager';
 import { markAiPty, updateAllTerminalThemes } from './utils/terminalCache';
 import { includeActiveProject } from './utils/projectKeepAlive';
 import { initMobileSessionSync } from './utils/mobileSessionSync';
@@ -142,6 +143,15 @@ export function App() {
 
       applyTheme(cfg.theme ?? 'auto');
 
+      // 外置主题异步加载：不进 show() 前关键路径；失败回落内置（上面已应用）
+      if (cfg.customThemeId) {
+        loadAndApplyCustomTheme(cfg.customThemeId)
+          .then(() => updateAllTerminalThemes(cfg.terminalFollowTheme ?? true))
+          .catch((e) => {
+            console.error(`自定义主题 ${cfg.customThemeId} 加载失败，回落内置外观:`, e);
+          });
+      }
+
       for (const p of cfg.projects) {
         if (p.savedLayout && p.savedLayout.tabs.length > 0) {
           restoreLayout(p.id, p.savedLayout, cfg);
@@ -198,17 +208,19 @@ export function App() {
     return () => window.removeEventListener('scroll', onScroll, true);
   }, []);
 
-  // 主题变化时应用新主题
+  // 主题变化时应用新主题；自定义主题激活时 data-theme 由主题包 appearance 决定
   useEffect(() => {
+    if (config.customThemeId) return;
     applyTheme(config.theme ?? 'auto');
-  }, [config.theme]);
+  }, [config.theme, config.customThemeId]);
 
-  // 皮肤变化时应用
+  // 皮肤变化时应用；自定义主题激活时 data-skin 置空
   useEffect(() => {
     const skin = config.skin ?? 'none';
-    document.documentElement.dataset.skin = skin === 'none' ? '' : skin;
+    document.documentElement.dataset.skin =
+      config.customThemeId || skin === 'none' ? '' : skin;
     updateAllTerminalThemes(config.terminalFollowTheme);
-  }, [config.skin]);
+  }, [config.skin, config.customThemeId]);
 
   // 启动时获取版本号：写进原生窗口标题（原自定义标题栏已移除），并检查更新
   useEffect(() => {

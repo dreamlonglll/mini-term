@@ -17,6 +17,7 @@ mod ssh;
 mod ssh_mcp_registry;
 mod ssh_skill_registry;
 mod startup_trace;
+mod theme_packs;
 mod tray;
 mod usage_stats;
 mod window_input_recovery;
@@ -122,6 +123,9 @@ pub fn run() {
             startup_trace::startup_report,
             config::load_config,
             config::save_config,
+            theme_packs::list_theme_packs,
+            theme_packs::read_theme_pack,
+            theme_packs::get_themes_dir,
             tray::set_tray_status,
             pty::create_pty,
             pty::write_pty,
