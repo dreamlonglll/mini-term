@@ -413,6 +413,9 @@ export function activateWebgl(ptyId: number): void {
   const entry = cache.get(ptyId);
   if (!entry || entry.webglLoaded) return;
   loadLigaturesIfEnabled(entry);
+  // WebGL 渲染器不支持透明背景(xterm 上游限制,canvas 会画满不透明底色):
+  // 背景图主题激活时留在 DOM 渲染,切回不透明主题由 updateAllTerminalThemes 恢复
+  if (isTransparentThemeActive()) return;
   loadWebgl(entry);
 }
 
@@ -509,19 +512,22 @@ export function updateAllTerminalThemes(terminalFollowTheme: boolean): void {
   const theme = getTerminalTheme(terminalFollowTheme);
   const transparent = isTransparentThemeActive();
   for (const entry of cache.values()) {
-    // allowTransparency 是渲染层选项，运行时切换后重载 WebGL addon 让其按
-    // 新 alpha 模式重建；个别 xterm 版本不允许运行时改，失败则只影响透明度
+    // 个别 xterm 版本不允许运行时改 allowTransparency，失败只影响背景透出
     // （新建终端仍会按正确值构造），不阻塞换主题
     if (entry.term.options.allowTransparency !== transparent) {
       try {
         entry.term.options.allowTransparency = transparent;
-        if (entry.webglLoaded) {
-          disposeWebgl(entry);
-          loadWebgl(entry);
-        }
       } catch (e) {
         console.warn('切换终端透明模式失败（仅影响背景透出）:', e);
       }
+    }
+    // WebGL 渲染器不支持透明背景(canvas 画满不透明底色,直接盖住背景图):
+    // 透明主题下卸掉 WebGL 退回 DOM 渲染,切回不透明主题时对已挂载终端恢复
+    if (transparent && entry.webglLoaded) {
+      disposeWebgl(entry);
+    } else if (!transparent && !entry.webglLoaded && entry.wrapper.isConnected) {
+      loadLigaturesIfEnabled(entry);
+      loadWebgl(entry);
     }
     entry.wrapper.style.backgroundColor = transparent ? 'transparent' : 'var(--bg-terminal)';
     entry.term.options.theme = theme;
