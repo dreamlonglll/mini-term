@@ -1,7 +1,7 @@
 use mt_core::{parse_wsl_unc, scan_ssh_prompt, strip_ansi_codes, SshPromptScan};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -426,7 +426,8 @@ const FOCUS_COOLDOWN: Duration = Duration::from_millis(800);
 const FOCUS_IN_SEQ: &str = "\x1b[I";
 const FOCUS_OUT_SEQ: &str = "\x1b[O";
 
-fn command_word_matches_ai(word: &str) -> bool {
+/// 命令词对应的 AI 命令名(basename 归一后精确匹配);非 AI 命令返回 None。
+fn ai_command_name(word: &str) -> Option<&'static str> {
     let word = word.trim_matches(|c| matches!(c, '"' | '\'' | '`'));
     let basename = word.rsplit(['/', '\\']).next().unwrap_or(word);
     let basename = [".exe", ".cmd", ".bat", ".ps1"]
@@ -434,56 +435,64 @@ fn command_word_matches_ai(word: &str) -> bool {
         .find_map(|suffix| basename.strip_suffix(suffix))
         .unwrap_or(basename);
     let basename = basename.to_lowercase();
-    AI_COMMANDS.iter().any(|&ai| basename == ai)
+    AI_COMMANDS.iter().find(|&&ai| basename == ai).copied()
 }
 
-/// 该命令行是否会被识别为"进入交互式 AI 会话"。
-/// AI 启动器配置校验(mobile_relay)复用同一判定,避免两处口径漂移。
-pub fn is_interactive_ai_command(command: &str) -> bool {
+/// 该命令行会进入哪个交互式 AI 会话;不会进入返回 None。
+pub fn interactive_ai_command_name(command: &str) -> Option<&'static str> {
     let mut words = command.split_whitespace();
     let mut first_word = words.next().unwrap_or("");
     if first_word == "&" {
         first_word = words.next().unwrap_or("");
     }
-    if !command_word_matches_ai(first_word) {
-        return false;
-    }
+    let agent = ai_command_name(first_word)?;
 
-    !words.any(|w| {
+    if words.any(|w| {
         let flag = w.to_lowercase();
         NON_INTERACTIVE_FLAGS.iter().any(|&f| flag == f)
-    })
+    }) {
+        None
+    } else {
+        Some(agent)
+    }
 }
 
-fn line_contains_ai_command(line: &str) -> bool {
+/// 该命令行是否会被识别为"进入交互式 AI 会话"。
+/// AI 启动器配置校验(mobile_relay)复用同一判定,避免两处口径漂移。
+pub fn is_interactive_ai_command(command: &str) -> bool {
+    interactive_ai_command_name(command).is_some()
+}
+
+fn line_ai_command_name(line: &str) -> Option<&'static str> {
     let line = strip_ansi_codes(line);
     let line = line.trim();
     if line.is_empty() {
-        return false;
+        return None;
     }
 
-    if is_interactive_ai_command(line) {
-        return true;
+    if let Some(agent) = interactive_ai_command_name(line) {
+        return Some(agent);
     }
 
     // xterm 行快照通常包含 shell prompt，例如 "PS D:\repo> claude"。
     // 对常见 prompt 分隔符取最后一段，避免把 prompt 内容当作命令解析。
     for marker in [">", "$ ", "# ", "% "] {
         if let Some(idx) = line.rfind(marker) {
-            if is_interactive_ai_command(&line[idx + marker.len()..]) {
-                return true;
+            if let Some(agent) = interactive_ai_command_name(&line[idx + marker.len()..]) {
+                return Some(agent);
             }
         }
     }
 
-    false
+    None
 }
 
-/// 检查 PTY 输出中是否包含 AI 命令被 echo（例如 "PS C:\> claude" 或单独的 "claude"）
-fn output_contains_ai_command(output: &str) -> bool {
+/// 检查 PTY 输出中是否包含 AI 命令被 echo（例如 "PS C:\> claude" 或单独的 "claude"），
+/// 命中返回对应的 AI 命令名
+fn output_ai_command_name(output: &str) -> Option<&'static str> {
     strip_ansi_codes(output)
         .lines()
-        .any(line_contains_ai_command)
+        .find_map(line_ai_command_name)
 }
 
 struct SshAutofillState {
@@ -507,7 +516,9 @@ pub struct PtyManager {
     instances: Arc<Mutex<HashMap<u32, PtyInstance>>>,
     next_id: Arc<Mutex<u32>>,
     last_output: Arc<Mutex<HashMap<u32, Instant>>>,
-    ai_sessions: Arc<Mutex<HashSet<u32>>>,
+    /// pty → 会话内 AI 命令名("claude"/"codex"/"opencode";hook 扶正时取 hook 的 agent)。
+    /// 有键即视为处于 AI 会话,值供前端品牌图标兜底(无 hook 时的唯一 agent 来源)。
+    ai_sessions: Arc<Mutex<HashMap<u32, String>>>,
     /// pty → 本轮 AI 会话的启动时刻(enter_ai 时记录)。对话镜像用它过滤
     /// 早于本轮会话的旧记录文件,避免新会话未落盘时错绑上一次会话。
     ai_started: Arc<Mutex<HashMap<u32, SystemTime>>>,
@@ -527,7 +538,7 @@ impl PtyManager {
             instances: Arc::new(Mutex::new(HashMap::new())),
             next_id: Arc::new(Mutex::new(1)),
             last_output: Arc::new(Mutex::new(HashMap::new())),
-            ai_sessions: Arc::new(Mutex::new(HashSet::new())),
+            ai_sessions: Arc::new(Mutex::new(HashMap::new())),
             ai_started: Arc::new(Mutex::new(HashMap::new())),
             input_states: Arc::new(Mutex::new(HashMap::new())),
             last_ctrlc: Arc::new(Mutex::new(HashMap::new())),
@@ -548,7 +559,12 @@ impl PtyManager {
     }
 
     pub fn is_ai_session(&self, pty_id: u32) -> bool {
-        self.ai_sessions.lock().unwrap().contains(&pty_id)
+        self.ai_sessions.lock().unwrap().contains_key(&pty_id)
+    }
+
+    /// 会话内 AI 命令名("claude"/"codex"/…);不在 AI 会话中返回 None。
+    pub fn ai_session_agent(&self, pty_id: u32) -> Option<String> {
+        self.ai_sessions.lock().unwrap().get(&pty_id).cloned()
     }
 
     /// 本轮 AI 会话的启动时刻;不在 AI 会话中返回 None。
@@ -560,9 +576,10 @@ impl PtyManager {
     /// （别名/包装脚本，命令行里没有 "claude" 字样）或误判退出（任务运行中
     /// 双击 Ctrl+C 只是打断并不退出）的自愈路径。已标记时幂等 no-op，
     /// 不重置 ai_started（对话镜像按它过滤旧记录，中途重置会错绑）。
-    pub fn mark_ai_session(&self, pty_id: u32) {
+    pub fn mark_ai_session(&self, pty_id: u32, agent: &str) {
         let mut sessions = self.ai_sessions.lock().unwrap();
-        if sessions.insert(pty_id) {
+        if !sessions.contains_key(&pty_id) {
+            sessions.insert(pty_id, agent.to_string());
             self.ai_started
                 .lock()
                 .unwrap()
@@ -710,7 +727,7 @@ impl PtyManager {
         line_snapshot: Option<&str>,
     ) {
         let in_ai = self.is_ai_session(pty_id);
-        let mut enter_ai = false;
+        let mut enter_ai: Option<&'static str> = None;
         let mut exit_ai = false;
         {
             let mut states = self.input_states.lock().unwrap();
@@ -761,11 +778,14 @@ impl PtyManager {
                         let allow_line_snapshot = state.allow_line_snapshot;
                         let raw = state.take_line();
                         let trimmed = raw.trim();
-                        let snapshot_is_ai = allow_line_snapshot
-                            && line_snapshot.map(line_contains_ai_command).unwrap_or(false);
+                        let snapshot_agent = if allow_line_snapshot {
+                            line_snapshot.and_then(line_ai_command_name)
+                        } else {
+                            None
+                        };
                         // 记录 Enter 时间，供输出扫描用。空回车不打开扫描窗口，
                         // 避免 shell autosuggestion 出现在重绘输出中时被当成命令 echo。
-                        if !trimmed.is_empty() || snapshot_is_ai {
+                        if !trimmed.is_empty() || snapshot_agent.is_some() {
                             self.last_enter
                                 .lock()
                                 .unwrap()
@@ -796,8 +816,10 @@ impl PtyManager {
                             // 非 AI 会话：检测 AI 命令启动。优先使用本地输入状态；
                             // 对上方向键历史、Tab 补全等 shell 改写行的场景，使用
                             // 前端在 Enter 前捕获的可见行快照补判。
-                            if is_interactive_ai_command(trimmed) || snapshot_is_ai {
-                                enter_ai = true;
+                            if let Some(agent) =
+                                interactive_ai_command_name(trimmed).or(snapshot_agent)
+                            {
+                                enter_ai = Some(agent);
                             }
                         }
                     }
@@ -814,8 +836,11 @@ impl PtyManager {
                 }
             }
         }
-        if enter_ai {
-            self.ai_sessions.lock().unwrap().insert(pty_id);
+        if let Some(agent) = enter_ai {
+            self.ai_sessions
+                .lock()
+                .unwrap()
+                .insert(pty_id, agent.to_string());
             self.ai_started
                 .lock()
                 .unwrap()
@@ -1128,10 +1153,10 @@ pub fn create_pty(
                             .unwrap_or(false);
                         if recently_entered {
                             let mut sessions = ai_sessions_flush.lock().unwrap();
-                            if !sessions.contains(&pty_id_for_reader)
-                                && output_contains_ai_command(&data)
-                            {
-                                sessions.insert(pty_id_for_reader);
+                            if !sessions.contains_key(&pty_id_for_reader) {
+                                if let Some(agent) = output_ai_command_name(&data) {
+                                    sessions.insert(pty_id_for_reader, agent.to_string());
+                                }
                             }
                         }
                     }
@@ -1443,7 +1468,7 @@ mod tests {
         mgr.track_input(1, "\x03");
         assert!(!mgr.is_ai_session(1));
         // 后续 hook 事件证明 AI 还活着 → 扶正
-        mgr.mark_ai_session(1);
+        mgr.mark_ai_session(1, "claude");
         assert!(mgr.is_ai_session(1));
         assert!(mgr.ai_session_started_at(1).is_some());
     }
@@ -1454,7 +1479,7 @@ mod tests {
         mgr.track_input(1, "claude\r");
         let started = mgr.ai_session_started_at(1).expect("进入会话应记录启动时刻");
         // 会话已标记时 mark 为 no-op,不得重置 ai_started(镜像按它过滤旧记录)
-        mgr.mark_ai_session(1);
+        mgr.mark_ai_session(1, "claude");
         assert_eq!(mgr.ai_session_started_at(1), Some(started));
     }
 

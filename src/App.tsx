@@ -199,7 +199,7 @@ export function App() {
 
   useTauriEvent<PtyStatusChangePayload>('pty-status-change', useCallback((payload) => {
     markAiPty(payload.ptyId, payload.status === 'ai-working' || payload.status === 'ai-idle');
-    updatePaneStatusByPty(payload.ptyId, payload.status as PaneStatus, payload.cause);
+    updatePaneStatusByPty(payload.ptyId, payload.status as PaneStatus, payload.cause, payload.agent);
   }, [updatePaneStatusByPty]));
 
   // 菜单栏状态灯:焦点变化经 Tauri 原生事件上报(DOM focus 在点原生标题栏等

@@ -158,6 +158,8 @@ export interface ProjectConfig {
   /** 子项目(worktree「设为项目」)：有值 = 渲染在该父项目下方缩进一级,
    *  且**不进 projectTree**(树里只有顶层项目与分组)。拖出/「脱离父项目」时清除并入树。 */
   parentProjectId?: string;
+  /** 项目类型徽标覆盖:undefined = 自动探测,'none' = 不显示,其余为技术栈 key(ProjectKind)。 */
+  kindOverride?: string;
 }
 
 export interface ProjectEnvVar {
@@ -270,6 +272,9 @@ export interface PaneState {
   /** 当前/上次 AI 会话身份(hook 上报),随布局持久化;会话正常退出时清除。
    *  恢复布局时有值 = 待续接,PaneGroup 起 PTY 后写 resume 命令并清除。 */
   aiSession?: AiSessionRef;
+  /** 后端识别的会话内 AI 命令名(输入检测/hook 兜底);运行时状态不持久化。
+   *  品牌图标优先用 aiSession.agent,无 hook 时靠它。 */
+  detectedAgent?: string;
   /** ai-idle 的成因是「需要用户确认」(授权/输入请求);运行时状态不持久化 */
   attention?: boolean;
 }
@@ -341,6 +346,8 @@ export interface PtyStatusChangePayload {
   /** 状态成因(hook 事件语义):'attention' = 需要用户确认,'stop' = 一轮回答
    *  正常结束;缺省 = 无成因信息(monitor 降级路径)。托盘黄/绿灯靠它区分。 */
   cause?: 'attention' | 'stop';
+  /** 会话内 AI 命令名(claude/codex/opencode…),品牌图标兜底用;缺省 = 未知 */
+  agent?: string;
 }
 
 export interface FsChangePayload {

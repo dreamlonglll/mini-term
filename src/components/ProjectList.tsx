@@ -18,6 +18,13 @@ import type { MenuEntry } from '../utils/contextMenu';
 import { showConfirm, showPrompt } from '../utils/prompt';
 import { initProjectDrag, isProjectDragging, getProjectDragPayload, onProjectDragEnd } from '../utils/projectDragState';
 import { isWslPath } from '../utils/wslPath';
+import { useProjectKinds } from '../hooks/useProjectKinds';
+import { PROJECT_KINDS, PROJECT_KIND_LABELS } from '../utils/projectKind';
+import type { ProjectKind } from '../utils/projectKind';
+import { TechIcon } from './TechIcon';
+import { BrandIcon } from './BrandIcon';
+import { inferVendor } from '../utils/inferVendor';
+import { Boxes, Package, Server } from './icons';
 import { useT } from '../i18n';
 import {
   getOrderedTree,
@@ -30,7 +37,7 @@ import {
   findGroupInTree,
   MAX_DEPTH,
 } from '../utils/projectTree';
-import type { PaneStatus, SplitNode, ProjectConfig, ProjectGroup, ProjectTreeItem, WslDistro } from '../types';
+import type { PaneStatus, PaneState, SplitNode, ProjectConfig, ProjectGroup, ProjectTreeItem, WslDistro } from '../types';
 
 // 保存配置的快捷方法
 function saveConfig() {
@@ -103,6 +110,19 @@ interface DropIndicator {
   forbidden?: boolean;
 }
 
+/** 收集布局树里处于 AI 会话状态的 pane(项目行的品牌图标堆叠数据源)。 */
+function collectAiPanes(node: SplitNode | null | undefined): PaneState[] {
+  if (!node) return [];
+  if (node.type === 'leaf') {
+    return node.panes.filter((p) => p.status === 'ai-working' || p.status === 'ai-idle');
+  }
+  return node.children.flatMap((c) => collectAiPanes(c));
+}
+
+/** AI 品牌图标堆叠区的固定宽度(px):图标多时在此宽度内部分重叠。 */
+const AI_STACK_WIDTH = 26;
+const AI_ICON_SIZE = 14;
+
 export function ProjectList() {
   const t = useT();
   const config = useAppStore((s) => s.config);
@@ -134,6 +154,9 @@ export function ProjectList() {
   const projectListRef = useRef<HTMLDivElement>(null);
 
   const orderedItems = getOrderedTree(config);
+
+  // 项目类型徽标:本地项目自动探测,远程项目由 FileTree 首次展开时喂入
+  const projectKinds = useProjectKinds(config.projects);
 
   // 预取 WSL 发行版列表,保证右键菜单构建时缓存已就绪
   useEffect(() => {
@@ -169,6 +192,19 @@ export function ProjectList() {
       cancelled = true;
     };
   }, [projectPathsKey]);
+
+  // 写入项目类型徽标覆盖(undefined = 自动探测,'none' = 不显示),并持久化
+  const setProjectKindOverride = useCallback((projectId: string, kind: string | undefined) => {
+    const cfg = useAppStore.getState().config;
+    const newConfig = {
+      ...cfg,
+      projects: cfg.projects.map((p) =>
+        p.id === projectId ? { ...p, kindOverride: kind } : p,
+      ),
+    };
+    useAppStore.getState().setConfig(newConfig);
+    saveConfigToDisk(newConfig);
+  }, []);
 
   // 写入项目的 WSL 会话来源发行版(undefined = 不启用),并持久化
   const setWslSessionsDistro = useCallback((projectId: string, distro: string | undefined) => {
@@ -477,6 +513,13 @@ export function ProjectList() {
     const isChild = !!project.parentProjectId;
     // 项目路径是某仓库的 linked worktree → 显示 ⎇ 分支徽章
     const wtBranch = isRemote ? undefined : worktreeBranches.get(project.path);
+    // 技术栈徽标:手动覆盖 > 自动探测;'none' = 用户关闭
+    const projectKind: ProjectKind | null =
+      project.kindOverride === 'none'
+        ? null
+        : (project.kindOverride as ProjectKind | undefined) ?? projectKinds.get(project.id) ?? null;
+    // 打开 pane 里的 AI 会话:有则领位图标换成品牌图标堆叠(哪家 AI 在跑一眼可见)
+    const aiPanes = collectAiPanes(projectPs?.layout);
 
     return (
       <div
@@ -577,6 +620,32 @@ export function ProjectList() {
               menuItems.push({ label: t('projectList.menu.wslSessions'), submenu });
             }
           }
+          // 「项目类型」子菜单:探测只提供默认值,允许手动指定或关闭徽标;
+          // 远程项目领位固定 SSH 图标,不显示该菜单
+          if (!isRemote) {
+            const currentKind = project.kindOverride;
+            const detected = projectKinds.get(project.id);
+            menuItems.push({
+              label: t('projectList.menu.projectKind'),
+              submenu: [
+                {
+                  label: `${currentKind === undefined ? '✓ ' : '　'}${t('projectList.menu.projectKindAuto')}${
+                    detected ? `（${PROJECT_KIND_LABELS[detected]}）` : ''
+                  }`,
+                  onClick: () => setProjectKindOverride(project.id, undefined),
+                },
+                {
+                  label: `${currentKind === 'none' ? '✓ ' : '　'}${t('projectList.menu.projectKindHidden')}`,
+                  onClick: () => setProjectKindOverride(project.id, 'none'),
+                },
+                { separator: true },
+                ...PROJECT_KINDS.map((k) => ({
+                  label: `${currentKind === k ? '✓ ' : '　'}${PROJECT_KIND_LABELS[k]}`,
+                  onClick: () => setProjectKindOverride(project.id, k),
+                })),
+              ],
+            });
+          }
           // 添加分组相关菜单
           // 子项目不在树里(位置由父项目派生),没有「当前所在组」可言 ——
           // 选任意组都是有效动作(顺带脱离父项目),所以不传 currentParentId
@@ -621,6 +690,45 @@ export function ProjectList() {
         {renderDropLine(project.id, 'before')}
         {isActive && (
           <span className="w-0.5 h-4 rounded-full bg-[var(--accent)] flex-shrink-0" />
+        )}
+        {/* 领位图标:AI 会话堆叠 > SSH 连接 > 技术栈徽标 > 通用项目图标 */}
+        {aiPanes.length > 0 ? (
+          <span
+            className="relative flex-shrink-0"
+            style={{ width: AI_STACK_WIDTH, height: AI_ICON_SIZE }}
+          >
+            {aiPanes.map((p, i) => (
+              <span
+                key={p.id}
+                className="absolute top-0"
+                style={{
+                  left:
+                    aiPanes.length === 1
+                      ? 0
+                      : i *
+                        Math.min(12, (AI_STACK_WIDTH - AI_ICON_SIZE) / (aiPanes.length - 1)),
+                  zIndex: i,
+                }}
+              >
+                <BrandIcon
+                  vendor={inferVendor({ agent: p.aiSession?.agent ?? p.detectedAgent })}
+                  size={AI_ICON_SIZE}
+                />
+              </span>
+            ))}
+          </span>
+        ) : isRemote ? (
+          <Server
+            size={14}
+            strokeWidth={1.5}
+            aria-hidden
+            className={`flex-shrink-0 ${remoteBroken ? 'text-[var(--color-error)]' : 'text-[var(--text-muted)]'}`}
+          />
+        ) : projectKind ? (
+          <TechIcon kind={projectKind} size={14} className="flex-shrink-0" />
+        ) : (
+          // 识别不出 / 用户选「不显示」:回退通用项目图标,保证每行都有图标、缩进对齐
+          <Package size={14} strokeWidth={1.5} aria-hidden className="flex-shrink-0 text-[var(--text-muted)]" />
         )}
         {editingProjectId === project.id ? (
           <input
@@ -770,6 +878,8 @@ export function ProjectList() {
             style={{ transform: group.collapsed ? 'rotate(-90deg)' : undefined }}>
             ▾
           </span>
+          {/* 分组 = 空间:用 Boxes 图标(currentColor 跟随主题),开合由左侧 chevron 表达 */}
+          <Boxes size={13} strokeWidth={1.5} aria-hidden className="flex-shrink-0" />
           {isEditing ? (
             <input
               ref={editInputRef}

@@ -14,6 +14,8 @@ import { DiffModal } from './DiffModal';
 import { FileViewerModal } from './FileViewerModal';
 import { initFileDrag } from '../utils/fileDragState';
 import { getFileTreeCache, setFileTreeCache, projectCacheKey } from '../utils/projectDataCache';
+import { resolveFileIcon } from '../utils/fileIcon';
+import { useFileIcons } from '../hooks/useFileIcons';
 import { useT } from '../i18n';
 import type { FileEntry, FsChangePayload, GitFileStatus, PtyOutputPayload } from '../types';
 
@@ -283,7 +285,15 @@ function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff, onViewF
             </span>
           )
         )}
-        {!entry.isDir && <span className="w-3 text-center text-[var(--text-muted)] text-xs">·</span>}
+        {(() => {
+          // 类型图标(baybreezy 懒加载):就绪前回退原有符号 —— 目录无图标、文件用 ·。
+          // gitignore 的置灰走父级 opacity,对 <img> 同样生效。
+          const iconSrc = resolveFileIcon(entry.name, entry.isDir, entry.isDir && expanded);
+          if (iconSrc) {
+            return <img src={iconSrc} className="mt-icon mt-icon-file w-3.5 h-3.5 flex-shrink-0" alt="" aria-hidden draggable={false} />;
+          }
+          return entry.isDir ? null : <span className="w-3 text-center text-[var(--text-muted)] text-xs">·</span>;
+        })()}
         <span className="truncate" title={entry.name}>{entry.name}</span>
         {(() => {
           const rel = getRelativePath(entry.path, projectRoot).replace(/\\/g, '/');
@@ -349,6 +359,8 @@ function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff, onViewF
 
 export function FileTree() {
   const t = useT();
+  // 触发文件类型图标懒加载,就绪时重渲染整树(TreeNode 未 memo,根重渲染即级联)
+  useFileIcons();
   const activeProjectId = useAppStore((s) => s.activeProjectId);
   const config = useAppStore((s) => s.config);
   const setSearchModalOpen = useAppStore((s) => s.setSearchModalOpen);

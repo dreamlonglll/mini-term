@@ -425,7 +425,7 @@ pub fn start_hook_server(
                         // 间隔超窗漏检时靠这里自愈
                         hook_state.remove(pty_id);
                         app.state::<crate::pty::PtyManager>().clear_ai_session(pty_id);
-                        emitter.emit_if_changed(&app, pty_id, "idle", None);
+                        emitter.emit_if_changed(&app, pty_id, "idle", None, None);
                         eprintln!(
                             "[hook-server] pty_id={} event=SessionEnd(reason={:?}) -> hook 已清除，回退到 idle",
                             pty_id, payload.reason
@@ -469,12 +469,19 @@ pub fn start_hook_server(
                         // hook 事件是 AI 进程存活的直接证据:输入检测漏判启动
                         // (别名/包装脚本)或误判退出(任务中双击 Ctrl+C)时,
                         // 靠这里把 AI 会话标记扶正,保住后续 marker/移动端语义
-                        app.state::<crate::pty::PtyManager>().mark_ai_session(pty_id);
+                        app.state::<crate::pty::PtyManager>()
+                            .mark_ai_session(pty_id, payload.agent.as_deref().unwrap_or("claude"));
                         hook_state.update(pty_id, status.to_string());
 
                         // 通知前端（与 process_monitor 共享同一份去重表）；
                         // cause 标注 ai-idle 的成因,托盘据此区分黄灯(待确认)与绿灯(完成)
-                        emitter.emit_if_changed(&app, pty_id, status, event_cause(event, status));
+                        emitter.emit_if_changed(
+                            &app,
+                            pty_id,
+                            status,
+                            event_cause(event, status),
+                            payload.agent.clone(),
+                        );
 
                         eprintln!(
                             "[hook-server] pty_id={} event={} agent={:?} -> status={} cause={:?}",

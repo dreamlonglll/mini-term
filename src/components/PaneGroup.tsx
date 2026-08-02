@@ -4,8 +4,10 @@ import { invoke } from '@tauri-apps/api/core';
 import { useAppStore, setPaneAiSessionByPty } from '../store';
 import { TerminalInstance } from './TerminalInstance';
 import { StatusDot } from './StatusDot';
+import { BrandIcon } from './BrandIcon';
 import { MarkerList } from './MarkerList';
 import { showContextMenu } from '../utils/contextMenu';
+import { inferVendor } from '../utils/inferVendor';
 import { disposeTerminal, writePtyInput } from '../utils/terminalCache';
 import { createProjectPty, isRemoteProject, remotePaneLabel } from '../utils/remoteProject';
 import { findPaneById } from '../utils/layoutOps';
@@ -251,6 +253,9 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
       >
         {node.panes.map((pane) => {
           const isActive = pane.id === activePane.id;
+          // 会话跑的是哪家 AI 就亮哪家品牌图标:hook 上报的 agent 权威,
+          // 无 hook(仅输入检测)时 aiSession 为空 → 回退通用 Bot
+          const aiActive = pane.status === 'ai-working' || pane.status === 'ai-idle';
           return (
             <div
               key={pane.id}
@@ -277,6 +282,12 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
               onContextMenu={(e) => paneContextMenu(e, pane.id)}
             >
               <StatusDot status={pane.status} />
+              {aiActive && (
+                <BrandIcon
+                  vendor={inferVendor({ agent: pane.aiSession?.agent ?? pane.detectedAgent })}
+                  size={12}
+                />
+              )}
               <span className="font-medium">{paneLabel(pane)}</span>
               <button
                 type="button"
