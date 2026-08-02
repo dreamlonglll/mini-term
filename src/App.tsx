@@ -20,6 +20,7 @@ import { ProjectSwitcher } from './components/ProjectSwitcher';
 import { TerminalSearchBar } from './components/TerminalSearchBar';
 import { useTauriEvent } from './hooks/useTauriEvent';
 import { useEverOpened } from './hooks/useOverlayMotion';
+import { markStartup, flushStartupTrace } from './utils/startupTrace';
 import { useAiSubmitMarker } from './hooks/useAiSubmitMarker';
 import { useMarkerHotkeys } from './hooks/useMarkerHotkeys';
 import { useGlobalHotkeys } from './hooks/useGlobalHotkeys';
@@ -61,7 +62,14 @@ function collectLiveAiPanes(): { count: number; names: string[] } {
   return { count: names.length, names };
 }
 
+// 启动埋点:App 首次进入 render 的时刻(StrictMode 双 render 只记第一次)
+let firstRenderMarked = false;
+
 export function App() {
+  if (!firstRenderMarked) {
+    firstRenderMarked = true;
+    markStartup('App() first render');
+  }
   const t = useT();
   const [configLoaded, setConfigLoaded] = useState(false);
   const [configOpen, setConfigOpen] = useState(false);
@@ -89,6 +97,7 @@ export function App() {
     // 必须携带当前令牌——空白页面/加载失败的页面天然没有写盘资格,
     // 防止空状态覆盖磁盘上的完整配置
     const loadWithRetry = async (): Promise<{ config: AppConfig; token: number }> => {
+      markStartup('load_config invoke');
       let lastErr: unknown;
       for (let i = 0; i < 3; i++) {
         try {
@@ -101,6 +110,7 @@ export function App() {
       throw lastErr;
     };
     loadWithRetry().then(({ config: cfg, token }) => {
+      markStartup('load_config resolved');
       setConfigToken(token);
       setConfig(cfg);
       // 应用 UI 字体大小
@@ -138,13 +148,17 @@ export function App() {
         }
       }
 
+      markStartup('config applied (layout restored)');
       setConfigLoaded(true);
 
       // 布局元数据恢复完成后显示窗口；终端进程由可见 pane 按需创建。
       const showWindow = () => {
         // 双 rAF 确保 React 首帧布局完成后再显示。
         requestAnimationFrame(() => requestAnimationFrame(() => {
-          getCurrentWindow().show();
+          // 到这里 configLoaded 后的主界面首帧已渲染完成:
+          // 本节点与上一节点的间隔 ≈ React 主界面首帧(含 xterm 首挂)耗时
+          markStartup('show() call (main UI first frame done)');
+          getCurrentWindow().show().then(() => flushStartupTrace());
         }));
       };
       showWindow();
