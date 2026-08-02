@@ -14,14 +14,47 @@ import type {
 /** 渲染状态优先级（互斥）：pricingError ＞ pricing ＞ error ＞ scanning ＞ done */
 export type UsageStatsPhase = 'idle' | 'pricing' | 'pricingError' | 'scanning' | 'error' | 'done';
 
+/** date input 的 "YYYY-MM-DD" 按本地时区解析(new Date(str) 会当 UTC 午夜,东侧时区错一天)。 */
+function parseLocalDate(s: string): Date | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+  if (!m) return null;
+  return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+}
+
 /** range → 窗口起点 epoch ms。本地日历日口径：today = 本地 00:00 起（绝不用
- * 滚动 24h）；days7/30 = 含今天的完整日历日；all = 0。Date 构造器做日历
- * 减法天然处理 DST/月末越界。 */
-function rangeSinceMs(range: UsageRange): number {
-  if (range === 'all') return 0;
+ * 滚动 24h）；days7/30 = 含今天的完整日历日；month/months3/months6 = 对应
+ * 月份的月初；custom = 起始日本地 00:00。Date 构造器做日历减法天然处理
+ * DST/月末越界。 */
+function rangeSinceMs(range: UsageRange, customFrom: string): number {
   const now = new Date();
-  const daysBack = range === 'today' ? 0 : range === 'days7' ? 6 : 29;
-  return new Date(now.getFullYear(), now.getMonth(), now.getDate() - daysBack).getTime();
+  switch (range) {
+    case 'today':
+      return new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+    case 'days7':
+      return new Date(now.getFullYear(), now.getMonth(), now.getDate() - 6).getTime();
+    case 'days30':
+      return new Date(now.getFullYear(), now.getMonth(), now.getDate() - 29).getTime();
+    case 'month':
+      return new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+    case 'months3':
+      return new Date(now.getFullYear(), now.getMonth() - 2, 1).getTime();
+    case 'months6':
+      return new Date(now.getFullYear(), now.getMonth() - 5, 1).getTime();
+    case 'custom': {
+      const from = parseLocalDate(customFrom);
+      // 起始缺失/非法回落近 30 天,不让面板空转
+      if (!from) return new Date(now.getFullYear(), now.getMonth(), now.getDate() - 29).getTime();
+      return from.getTime();
+    }
+  }
+}
+
+/** custom range 的窗口上界(含截止日全天);其余 range 开区间到现在。 */
+function rangeUntilMs(range: UsageRange, customTo: string): number | null {
+  if (range !== 'custom') return null;
+  const to = parseLocalDate(customTo);
+  if (!to) return null;
+  return new Date(to.getFullYear(), to.getMonth(), to.getDate() + 1).getTime() - 1;
 }
 
 interface UseUsageStatsResult {
@@ -42,6 +75,11 @@ export function useUsageStats(
   open: boolean,
   agents: UsageAgentFilter,
   range: UsageRange,
+  /** 单项目 scope:登记项目绝对路径;null = 整机全部 */
+  projectPath: string | null,
+  /** custom range 起止("YYYY-MM-DD");其余 range 忽略 */
+  customFrom: string,
+  customTo: string,
 ): UseUsageStatsResult {
   const [phase, setPhase] = useState<UsageStatsPhase>('idle');
   const [stats, setStats] = useState<UsageStatsPayload | null>(null);
@@ -70,7 +108,8 @@ export function useUsageStats(
     let cancelled = false;
     // 静默刷新：同参数重扫（自动/手动刷新）保留旧数据继续展示，新快照到达后
     // 整包替换；切 scope/range 时旧数据已是错的，必须清空回骨架
-    const params = `${agents}|${range}`;
+    const customKey = range === 'custom' ? `${customFrom}:${customTo}` : '';
+    const params = `${agents}|${range}|${projectPath ?? ''}|${customKey}`;
     const paramsChanged = lastParamsRef.current !== params;
     lastParamsRef.current = params;
     silentRef.current = !paramsChanged && statsRef.current !== null;
@@ -102,8 +141,13 @@ export function useUsageStats(
         await invoke('start_usage_stats', {
           requestId,
           agents,
-          sinceMs: rangeSinceMs(range),
+          sinceMs: rangeSinceMs(range, customFrom),
+          untilMs: rangeUntilMs(range, customTo),
+          projectPath,
           tzOffsetMinutes: new Date().getTimezoneOffset(),
+          // IANA 时区名:后端按每条记录自身时刻求偏移,DST 地区历史不错日;
+          // 解析失败时后端回落上面的固定偏移
+          tzName: Intl.DateTimeFormat().resolvedOptions().timeZone,
           hourly: range === 'today',
           pricing,
         });
@@ -120,7 +164,7 @@ export function useUsageStats(
       requestIdRef.current = '';
       invoke('cancel_usage_stats').catch(() => {});
     };
-  }, [open, agents, range, refreshTick]);
+  }, [open, agents, range, projectPath, customFrom, customTo, refreshTick]);
 
   useTauriEvent<UsageStatsProgressPayload>(
     'usage-stats-progress',

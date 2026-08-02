@@ -3,12 +3,16 @@ export const usageStats = {
     title: "使用统计",
     scope: {
       all: "全部",
+      allProjects: "全部项目",
     },
     range: {
       today: "今天",
       days7: "近 7 天",
       days30: "近 30 天",
-      all: "全部时间",
+      month: "本月",
+      months3: "近 3 个月",
+      months6: "近 6 个月",
+      custom: "自定义",
     },
     kpi: {
       cost: "总成本",
@@ -53,12 +57,16 @@ export const usageStats = {
     title: "Statistics",
     scope: {
       all: "All agents",
+      allProjects: "All projects",
     },
     range: {
       today: "Today",
       days7: "Last 7 days",
       days30: "Last 30 days",
-      all: "All time",
+      month: "This month",
+      months3: "Last 3 months",
+      months6: "Last 6 months",
+      custom: "Custom",
     },
     kpi: {
       cost: "Cost",

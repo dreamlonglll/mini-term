@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWindow, UserAttentionType } from '@tauri-apps/api/window';
+import { collectPanes } from './utils/layoutOps';
 import type {
   AppConfig,
   ProjectConfig,
@@ -222,26 +223,18 @@ export function syncTrayStatus(): void {
     let pAttention = false;
     let pWorking = false;
     let pDone = false;
-    const stack: SplitNode[] = [ps.layout];
-    while (stack.length) {
-      const node = stack.pop()!;
-      if (node.type === 'leaf') {
-        for (const pane of node.panes) {
-          if (pane.status === 'error' || pane.attention) {
-            attention++;
-            pAttention = true;
-          } else if (pane.status === 'ai-working') {
-            working++;
-            pWorking = true;
-          }
-          // 只数仍存在的 pane(关掉即失效);又开始工作的不再算「未读完成」
-          if (unreadDonePaneIds.has(pane.id) && pane.status !== 'ai-working') {
-            done++;
-            pDone = true;
-          }
-        }
-      } else {
-        stack.push(...node.children);
+    for (const pane of collectPanes(ps.layout)) {
+      if (pane.status === 'error' || pane.attention) {
+        attention++;
+        pAttention = true;
+      } else if (pane.status === 'ai-working') {
+        working++;
+        pWorking = true;
+      }
+      // 只数仍存在的 pane(关掉即失效);又开始工作的不再算「未读完成」
+      if (unreadDonePaneIds.has(pane.id) && pane.status !== 'ai-working') {
+        done++;
+        pDone = true;
       }
     }
     if (pAttention || pWorking || pDone) {

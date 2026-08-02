@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { Modal, ModalCloseButton } from '../Modal';
 import { SessionViewerModal } from '../SessionViewerModal';
 import { useUsageStats } from '../../hooks/useUsageStats';
+import { useAppStore } from '../../store';
 import { useT } from '../../i18n';
 import type { AiSession, UsageAgentFilter, UsageModelStat, UsageRange, UsageTopSessionStat } from '../../types';
 import { KpiCards } from './KpiCards';
@@ -12,6 +13,7 @@ import { formatCost, formatTokens, modelShortName } from './format';
 
 const SCOPE_KEY = 'mini-term-usage-scope';
 const RANGE_KEY = 'mini-term-usage-range';
+const PROJECT_KEY = 'mini-term-usage-project';
 const AUTO_REFRESH_KEY = 'mini-term-usage-autorefresh';
 
 /** 自动刷新档位（秒）；0 = 关闭 */
@@ -37,7 +39,16 @@ function savePref(key: string, v: string) {
 }
 
 const SCOPES: readonly UsageAgentFilter[] = ['all', 'claude', 'codex'];
-const RANGES: readonly UsageRange[] = ['today', 'days7', 'days30', 'all'];
+// 设计合同(docs/plans/2026-08-01-usage-stats-design.md §2):不提供 all(全盘扫描太重);
+// 存量 localStorage 里的 'all' 不在白名单,loadPref 自动回落 days30
+const RANGES: readonly UsageRange[] = ['today', 'days7', 'days30', 'month', 'months3', 'months6', 'custom'];
+
+/** date input 值("YYYY-MM-DD",本地日历日),n 天前 */
+function localDateStr(daysBack: number): string {
+  const d = new Date();
+  d.setDate(d.getDate() - daysBack);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
 
 function Segmented<T extends string>({
   options,
@@ -93,13 +104,34 @@ export function UsageStatsModal({ open, onClose }: { open: boolean; onClose: () 
   const t = useT();
   const [scope, setScope] = useState<UsageAgentFilter>(() => loadPref(SCOPE_KEY, SCOPES, 'all'));
   const [range, setRange] = useState<UsageRange>(() => loadPref(RANGE_KEY, RANGES, 'days30'));
+  // 单项目 scope(与 agent 过滤独立叠加);持久化 raw 路径,项目已被移除时回落整机
+  const projects = useAppStore((s) => s.config.projects);
+  const [projectPath, setProjectPath] = useState<string | null>(() => {
+    try {
+      return localStorage.getItem(PROJECT_KEY);
+    } catch {
+      return null;
+    }
+  });
+  const effectiveProject =
+    projectPath && projects.some((p) => p.path === projectPath) ? projectPath : null;
+  // custom range 起止(本地日历日),默认近 30 天;input 的 min/max 约束上限 1 年
+  const [customFrom, setCustomFrom] = useState(() => localDateStr(29));
+  const [customTo, setCustomTo] = useState(() => localDateStr(0));
   const [autoRefresh, setAutoRefresh] = useState<number>(() => {
     const v = Number(loadPref(AUTO_REFRESH_KEY, AUTO_REFRESH_OPTIONS.map(String), '0'));
     return Number.isFinite(v) ? v : 0;
   });
   const [viewer, setViewer] = useState<UsageTopSessionStat | null>(null);
 
-  const { phase, stats, processed, total, error, refresh } = useUsageStats(open, scope, range);
+  const { phase, stats, processed, total, error, refresh } = useUsageStats(
+    open,
+    scope,
+    range,
+    effectiveProject,
+    customFrom,
+    customTo,
+  );
 
   // 自动刷新：仅在上一轮扫描完成后触发（静默重扫），间隔内还在扫则跳过本拍，
   // 避免扫描时长 > 间隔时永远扫不完
@@ -120,6 +152,15 @@ export function UsageStatsModal({ open, onClose }: { open: boolean; onClose: () 
   const changeRange = useCallback((v: UsageRange) => {
     setRange(v);
     savePref(RANGE_KEY, v);
+  }, []);
+  const changeProject = useCallback((path: string | null) => {
+    setProjectPath(path);
+    try {
+      if (path) localStorage.setItem(PROJECT_KEY, path);
+      else localStorage.removeItem(PROJECT_KEY);
+    } catch {
+      /* 持久化失败不影响本次使用 */
+    }
   }, []);
   const changeAutoRefresh = useCallback((v: number) => {
     setAutoRefresh(v);
@@ -294,9 +335,42 @@ export function UsageStatsModal({ open, onClose }: { open: boolean; onClose: () 
           <h2 className="text-base font-semibold text-[var(--text-primary)] flex-shrink-0">
             {t('usageStats.title')}
           </h2>
-          <div className="flex-1 flex items-center justify-center gap-3 min-w-0">
+          <div className="flex-1 flex items-center justify-center gap-3 min-w-0 flex-wrap">
             <Segmented options={SCOPES} value={scope} onChange={changeScope} labelOf={scopeLabel} />
+            {/* 单项目 scope:与 agent 过滤独立叠加(设计合同 §2) */}
+            <select
+              className="bg-[var(--bg-base)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-1.5 py-1 text-xs text-[var(--text-secondary)] focus:outline-none focus:border-[var(--accent)] flex-shrink-0 max-w-[160px]"
+              value={effectiveProject ?? ''}
+              onChange={(e) => changeProject(e.target.value || null)}
+            >
+              <option value="">{t('usageStats.scope.allProjects')}</option>
+              {projects.map((p) => (
+                <option key={p.id} value={p.path}>
+                  {p.name}
+                </option>
+              ))}
+            </select>
             <Segmented options={RANGES} value={range} onChange={changeRange} labelOf={rangeLabel} />
+            {range === 'custom' && (
+              <span className="flex items-center gap-1 flex-shrink-0">
+                <input
+                  type="date"
+                  className="bg-[var(--bg-base)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-1.5 py-0.5 text-xs text-[var(--text-secondary)] focus:outline-none focus:border-[var(--accent)]"
+                  value={customFrom}
+                  max={customTo}
+                  onChange={(e) => setCustomFrom(e.target.value)}
+                />
+                <span className="text-xs text-[var(--text-muted)]">–</span>
+                <input
+                  type="date"
+                  className="bg-[var(--bg-base)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-1.5 py-0.5 text-xs text-[var(--text-secondary)] focus:outline-none focus:border-[var(--accent)]"
+                  value={customTo}
+                  min={customFrom}
+                  max={localDateStr(0)}
+                  onChange={(e) => setCustomTo(e.target.value)}
+                />
+              </span>
+            )}
           </div>
           {/* 自动刷新间隔（紧挨手动刷新按钮，语义自明） */}
           <select

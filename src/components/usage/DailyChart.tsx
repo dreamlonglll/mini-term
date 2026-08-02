@@ -43,14 +43,22 @@ function fillBuckets(daily: UsageDailyStat[], range: UsageRange): UsageDailyStat
   }
   if (daily.length === 0) return out;
   let start: Date;
-  if (range === 'all') {
-    const [y, m, d] = daily[0].date.split('-').map(Number);
-    start = new Date(y, m - 1, d);
-  } else {
+  if (range === 'days7' || range === 'days30') {
     const daysBack = range === 'days7' ? 6 : 29;
     start = new Date(now.getFullYear(), now.getMonth(), now.getDate() - daysBack);
+  } else {
+    // month/months3/months6/custom:窗口起点不在本组件已知,从数据首日起补零
+    const [y, m, d] = daily[0].date.split('-').map(Number);
+    start = new Date(y, m - 1, d);
   }
-  const end = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  // custom 的截止日可能远在过去,补零到今天只会画一条零尾巴 → 止于数据末日
+  const end = (() => {
+    if (range === 'custom') {
+      const [y, m, d] = daily[daily.length - 1].date.split('-').map(Number);
+      return new Date(y, m - 1, d);
+    }
+    return new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  })();
   for (
     let cur = start;
     cur <= end;

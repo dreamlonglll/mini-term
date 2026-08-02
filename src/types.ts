@@ -354,6 +354,19 @@ export interface PtyStatusChangePayload {
   agent?: string;
 }
 
+/** load_config 命令返回:配置 + 本次写盘令牌(config.rs LoadedConfig 镜像)。 */
+export interface LoadedConfig {
+  config: AppConfig;
+  token: number;
+}
+
+/** pty-ai-session 事件载荷:hook 上报的 AI 会话身份,供重启后 resume 续接。 */
+export interface PtyAiSessionPayload {
+  ptyId: number;
+  agent?: string;
+  sessionId: string;
+}
+
 export interface FsChangePayload {
   projectPath: string;
   path: string;
@@ -498,7 +511,7 @@ export interface AiMarker {
 // === 使用统计（对齐 Rust usage_stats camelCase 序列化） ===
 
 export type UsageAgentFilter = 'all' | 'claude' | 'codex';
-export type UsageRange = 'today' | 'days7' | 'days30' | 'all';
+export type UsageRange = 'today' | 'days7' | 'days30' | 'month' | 'months3' | 'months6' | 'custom';
 
 /** 单模型价格（$/token，前端拉 models.dev 后 ÷1e6 归一） */
 export interface ModelPriceEntry {

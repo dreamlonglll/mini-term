@@ -66,38 +66,49 @@ impl SessionJob {
 
 /// 枚举 ~/.claude/projects/ 下**全部**项目的会话（统计需要全局枚举，
 /// 与 ai_sessions.rs 的按项目 cwd 过滤是两条入口）。
-fn collect_claude_jobs(home: &Path, jobs: &mut Vec<SessionJob>) {
+fn collect_claude_jobs(home: &Path, project: Option<&str>, jobs: &mut Vec<SessionJob>) {
+    // 单项目 scope:目录名即 cwd 编码,复用 ai_sessions 的匹配原语直达,不全盘枚举
+    if let Some(project) = project {
+        for dir in crate::ai_sessions::find_claude_project_dirs(project) {
+            collect_claude_jobs_in_dir(&dir, jobs);
+        }
+        return;
+    }
     let projects_dir = home.join(".claude").join("projects");
     let Ok(project_entries) = fs::read_dir(&projects_dir) else {
         return;
     };
     for project in project_entries.flatten() {
         let project_path = project.path();
-        if !project_path.is_dir() {
+        if project_path.is_dir() {
+            collect_claude_jobs_in_dir(&project_path, jobs);
+        }
+    }
+}
+
+/// 收集单个 Claude 项目目录下的全部会话(主转录 + subagents 子转录)。
+fn collect_claude_jobs_in_dir(project_path: &Path, jobs: &mut Vec<SessionJob>) {
+    let Ok(entries) = fs::read_dir(project_path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
         }
-        let Ok(entries) = fs::read_dir(&project_path) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
-            let mut subagents = Vec::new();
-            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                let sub_dir = project_path.join(stem).join("subagents");
-                if let Ok(subs) = fs::read_dir(&sub_dir) {
-                    for sub in subs.flatten() {
-                        let sp = sub.path();
-                        if sp.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-                            subagents.push(sp);
-                        }
+        let mut subagents = Vec::new();
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            let sub_dir = project_path.join(stem).join("subagents");
+            if let Ok(subs) = fs::read_dir(&sub_dir) {
+                for sub in subs.flatten() {
+                    let sp = sub.path();
+                    if sp.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                        subagents.push(sp);
                     }
                 }
             }
-            jobs.push(SessionJob::Claude { main: path, subagents });
         }
+        jobs.push(SessionJob::Claude { main: path, subagents });
     }
 }
 
@@ -176,18 +187,32 @@ impl ProviderResolver {
     }
 }
 
+/// agent 过滤：serde 层拒收未知值(原为 String,未知值会静默退化为全扫)。
+#[derive(Clone, Copy, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentFilter {
+    All,
+    Claude,
+    Codex,
+}
+
 /// 一次扫描的请求参数（打包随 worker 线程移动）。
 struct ScanParams {
     request_id: String,
-    agents: String,
+    agents: AgentFilter,
     since_ms: i64,
+    /// 窗口上界(custom range 的「止」,含当日);None = 开区间到现在
+    until_ms: Option<i64>,
+    /// 单项目 scope:登记项目的绝对路径;None = 整机全部
+    project_path: Option<String>,
     tz_offset_minutes: i32,
+    tz_name: Option<String>,
     hourly: bool,
 }
 
 fn run_scan(app: &AppHandle, my_gen: u64, params: &ScanParams, pricing: PricingTable) {
     let request_id = params.request_id.as_str();
-    let agents = params.agents.as_str();
+    let agents = params.agents;
     let since_ms = params.since_ms;
     let Some(home) = dirs::home_dir() else {
         let _ = app.emit(
@@ -198,10 +223,10 @@ fn run_scan(app: &AppHandle, my_gen: u64, params: &ScanParams, pricing: PricingT
     };
 
     let mut jobs: Vec<SessionJob> = Vec::new();
-    if agents != "codex" {
-        collect_claude_jobs(&home, &mut jobs);
+    if agents != AgentFilter::Codex {
+        collect_claude_jobs(&home, params.project_path.as_deref(), &mut jobs);
     }
-    if agents != "claude" {
+    if agents != AgentFilter::Claude {
         collect_codex_jobs(&home, &mut jobs);
     }
     // mtime 粗筛：最后写入早于窗口起点的文件不可能有窗内 turn（仅省解析，
@@ -209,13 +234,19 @@ fn run_scan(app: &AppHandle, my_gen: u64, params: &ScanParams, pricing: PricingT
     jobs.retain(|j| j.mtime_ms() >= since_ms);
     let total = jobs.len();
 
-    let thread_names = if agents != "claude" {
+    let thread_names = if agents != AgentFilter::Claude {
         crate::ai_sessions::load_codex_thread_names(&home.join(".codex"))
     } else {
         HashMap::new()
     };
 
-    let mut agg = Aggregator::new(since_ms, params.tz_offset_minutes, params.hourly);
+    let mut agg = Aggregator::new(
+        since_ms,
+        params.until_ms,
+        params.tz_offset_minutes,
+        params.tz_name.as_deref(),
+        params.hourly,
+    );
     let resolver = ProviderResolver::new(&home);
     let mut last_flush = Instant::now();
     let mut since_flush = 0usize;
@@ -229,8 +260,19 @@ fn run_scan(app: &AppHandle, my_gen: u64, params: &ScanParams, pricing: PricingT
             SessionJob::Codex { path } => turns::parse_codex_session(path, &thread_names),
         };
         if let Some(mut s) = parsed {
-            s.provider = Some(resolver.resolve(&s));
-            agg.add_session(&s, &pricing);
+            // 单项目 scope 的 cwd 终判:Claude 已按目录直达(此处双保险),
+            // Codex rollout 无目录索引,只能解析后按 cwd 过滤(mtime 粗筛仍生效)
+            let in_scope = match params.project_path.as_deref() {
+                Some(proj) => s
+                    .cwd
+                    .as_deref()
+                    .is_some_and(|c| c.trim_end_matches(['/', '\\']) == proj.trim_end_matches(['/', '\\'])),
+                None => true,
+            };
+            if in_scope {
+                s.provider = Some(resolver.resolve(&s));
+                agg.add_session(&s, &pricing);
+            }
         }
 
         since_flush += 1;
@@ -263,15 +305,27 @@ fn run_scan(app: &AppHandle, my_gen: u64, params: &ScanParams, pricing: PricingT
 pub fn start_usage_stats(
     app: AppHandle,
     request_id: String,
-    agents: String,
+    agents: AgentFilter,
     since_ms: i64,
+    until_ms: Option<i64>,
+    project_path: Option<String>,
     tz_offset_minutes: i32,
+    tz_name: Option<String>,
     hourly: bool,
     pricing: HashMap<String, ModelPrice>,
 ) -> Result<(), String> {
     let my_gen = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     let table = PricingTable::new(pricing);
-    let params = ScanParams { request_id, agents, since_ms, tz_offset_minutes, hourly };
+    let params = ScanParams {
+        request_id,
+        agents,
+        since_ms,
+        until_ms,
+        project_path,
+        tz_offset_minutes,
+        tz_name,
+        hourly,
+    };
 
     std::thread::spawn(move || {
         // catch_unwind 兜底：panic 也要给前端一个 error 事件，否则骨架屏永远转圈
@@ -295,6 +349,3 @@ pub fn start_usage_stats(
 pub fn cancel_usage_stats() {
     GENERATION.fetch_add(1, Ordering::SeqCst);
 }
-
-
-

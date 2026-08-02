@@ -118,7 +118,12 @@ struct SessionAcc {
 /// 本地日历日/小时分桶 → 全部被去重/窗外的会话不计 session_count。
 pub struct Aggregator {
     since_ms: i64,
+    /// 窗口上界(custom range 的「止」,含端点);None = 开区间到现在
+    until_ms: Option<i64>,
     tz_offset_minutes: i32,
+    /// IANA 时区(前端 Intl 提供):分桶按每条记录自身时刻求当地偏移,
+    /// DST 地区历史记录不错日;None(名字缺失/解析失败)回落固定偏移
+    tz: Option<chrono_tz::Tz>,
     /// true = 按本地小时分桶（「今天」视图），false = 按本地日历日
     hourly: bool,
     seen_ids: HashSet<String>,
@@ -142,11 +147,29 @@ fn project_name(cwd: &str) -> String {
         .to_string()
 }
 
+/// 该 UTC 毫秒时刻在 tz 的偏移，返回 JS getTimezoneOffset 语义(UTC−local 分钟)。
+fn tz_offset_minutes_at(tz: &chrono_tz::Tz, ts_ms: i64) -> i32 {
+    use chrono::{Offset, TimeZone};
+    match tz.timestamp_millis_opt(ts_ms) {
+        chrono::LocalResult::Single(dt) => -(dt.offset().fix().local_minus_utc() / 60),
+        // UTC instant → 当地时间无歧义,此分支理论不可达;兜底 0(UTC)
+        _ => 0,
+    }
+}
+
 impl Aggregator {
-    pub fn new(since_ms: i64, tz_offset_minutes: i32, hourly: bool) -> Self {
+    pub fn new(
+        since_ms: i64,
+        until_ms: Option<i64>,
+        tz_offset_minutes: i32,
+        tz_name: Option<&str>,
+        hourly: bool,
+    ) -> Self {
         Self {
             since_ms,
+            until_ms,
             tz_offset_minutes,
+            tz: tz_name.and_then(|n| n.parse().ok()),
             hourly,
             seen_ids: HashSet::new(),
             totals: UsageTotals::default(),
@@ -196,6 +219,9 @@ impl Aggregator {
             if ts < self.since_ms {
                 continue;
             }
+            if self.until_ms.is_some_and(|u| ts > u) {
+                continue;
+            }
 
             let cost = turn
                 .model
@@ -209,9 +235,14 @@ impl Aggregator {
             self.total_cost += cost;
             self.total_calls += 1;
 
-            // 时段分桶：本地时区(getTimezoneOffset 语义为 UTC−local，故 local = ts − offset)，
+            // 时段分桶：本地时区(getTimezoneOffset 语义为 UTC−local，故 local = ts − offset)。
+            // 有 IANA 时区时按该记录自身时刻求偏移(DST 边界两侧各用各的)，
             // 「今天」视图按小时，其余按日历日
-            let local_ms = ts - self.tz_offset_minutes as i64 * 60_000;
+            let offset_minutes = match &self.tz {
+                Some(tz) => tz_offset_minutes_at(tz, ts),
+                None => self.tz_offset_minutes,
+            };
+            let local_ms = ts - offset_minutes as i64 * 60_000;
             let bucket = local_ms.div_euclid(if self.hourly { 3_600_000 } else { 86_400_000 });
             let d = self.daily.entry(bucket).or_default();
             d.cost += cost;
@@ -440,8 +471,23 @@ mod tests {
     const DAY: i64 = 86_400_000;
 
     #[test]
+    fn tz_offset_follows_dst_at_record_time() {
+        let tz: chrono_tz::Tz = "America/New_York".parse().unwrap();
+        let winter = chrono::DateTime::parse_from_rfc3339("2026-01-15T12:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let summer = chrono::DateTime::parse_from_rfc3339("2026-07-15T12:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        // getTimezoneOffset 语义(UTC−local 分钟):冬令 EST=+300,夏令 EDT=+240。
+        // 修复前用「当前时刻」固定偏移套全量历史,跨 DST 边界的记录会错日
+        assert_eq!(tz_offset_minutes_at(&tz, winter), 300);
+        assert_eq!(tz_offset_minutes_at(&tz, summer), 240);
+    }
+
+    #[test]
     fn cross_file_dedup_does_not_double_count() {
-        let mut agg = Aggregator::new(0, 0, false);
+        let mut agg = Aggregator::new(0, None, 0, None, false);
         let p = pricing();
         agg.add_session(&session("s1", "/a", vec![turn(Some("m1"), DAY, 100)]), &p);
         // fork 会话复制了同一条消息
@@ -456,7 +502,7 @@ mod tests {
     #[test]
     fn per_turn_window_filter_and_daily_sum_matches_kpi() {
         // 窗口从第 2 天本地午夜起：第 1 天的 turn 全维度不算
-        let mut agg = Aggregator::new(DAY, 0, false);
+        let mut agg = Aggregator::new(DAY, None, 0, None, false);
         let p = pricing();
         agg.add_session(
             &session(
@@ -484,7 +530,7 @@ mod tests {
 
     #[test]
     fn all_turns_out_of_window_drops_session() {
-        let mut agg = Aggregator::new(DAY * 10, 0, false);
+        let mut agg = Aggregator::new(DAY * 10, None, 0, None, false);
         let p = pricing();
         agg.add_session(&session("s1", "/a", vec![turn(Some("m1"), DAY, 100)]), &p);
         let snap = agg.snapshot();
@@ -495,7 +541,7 @@ mod tests {
 
     #[test]
     fn missing_turn_timestamp_falls_back_to_file_mtime() {
-        let mut agg = Aggregator::new(2_000_000, 0, false);
+        let mut agg = Aggregator::new(2_000_000, None, 0, None, false);
         let p = pricing();
         let mut s = session("s1", "/a", vec![]);
         s.mtime_ms = 3_000_000; // 窗内
@@ -512,7 +558,7 @@ mod tests {
     #[test]
     fn daily_bucket_uses_local_timezone() {
         // 东八区(offset = -480)：UTC 23:00 属于本地次日
-        let mut agg = Aggregator::new(0, -480, false);
+        let mut agg = Aggregator::new(0, None, -480, None, false);
         let p = pricing();
         agg.add_session(&session("s1", "/a", vec![turn(Some("m1"), 23 * 3_600_000, 10)]), &p);
         let snap = agg.snapshot();
@@ -522,7 +568,7 @@ mod tests {
     #[test]
     fn rankings_sort_by_cost_then_fall_back_to_tokens_when_unpriced() {
         let p = pricing();
-        let mut agg = Aggregator::new(0, 0, false);
+        let mut agg = Aggregator::new(0, None, 0, None, false);
         agg.add_session(&session("s1", "/big", vec![turn(Some("m1"), DAY, 1000)]), &p);
         agg.add_session(&session("s2", "/small", vec![turn(Some("m2"), DAY, 10)]), &p);
         let snap = agg.snapshot();
@@ -531,7 +577,7 @@ mod tests {
 
         // 空价格表 → 成本全 0 → 按 tokens 降序仍有排行
         let empty = PricingTable::new(StdHashMap::new());
-        let mut agg = Aggregator::new(0, 0, false);
+        let mut agg = Aggregator::new(0, None, 0, None, false);
         agg.add_session(&session("s1", "/big", vec![turn(Some("m1"), DAY, 1000)]), &empty);
         agg.add_session(&session("s2", "/small", vec![turn(Some("m2"), DAY, 10)]), &empty);
         let snap = agg.snapshot();
@@ -541,7 +587,7 @@ mod tests {
 
     #[test]
     fn codex_turns_without_id_skip_global_dedup() {
-        let mut agg = Aggregator::new(0, 0, false);
+        let mut agg = Aggregator::new(0, None, 0, None, false);
         let p = pricing();
         agg.add_session(&session("s1", "/a", vec![turn(None, DAY, 10), turn(None, DAY, 10)]), &p);
         assert_eq!(agg.snapshot().total_calls, 2);
@@ -550,7 +596,7 @@ mod tests {
     #[test]
     fn hourly_buckets_use_local_hour_labels() {
         // 东八区：UTC 01:30 → 本地 09:30，落 "09:00" 桶
-        let mut agg = Aggregator::new(0, -480, true);
+        let mut agg = Aggregator::new(0, None, -480, None, true);
         let p = pricing();
         agg.add_session(
             &session(
@@ -573,7 +619,7 @@ mod tests {
 
     #[test]
     fn by_provider_groups_sessions_by_source() {
-        let mut agg = Aggregator::new(0, 0, false);
+        let mut agg = Aggregator::new(0, None, 0, None, false);
         let p = pricing();
         agg.add_session(&session("s1", "/a", vec![turn(Some("m1"), DAY, 100)]), &p);
         let mut s2 = session("s2", "/b", vec![turn(Some("m2"), DAY, 10)]);
@@ -590,7 +636,7 @@ mod tests {
 
     #[test]
     fn by_model_groups_date_variants_and_sorts_by_cost() {
-        let mut agg = Aggregator::new(0, 0, false);
+        let mut agg = Aggregator::new(0, None, 0, None, false);
         let p = pricing();
         let mut s = session("s1", "/a", vec![turn(Some("m1"), DAY, 1000)]);
         // 同模型的带日期版本归入同一桶

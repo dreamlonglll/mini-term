@@ -41,4 +41,3 @@
 **Step 2:** Run `npm run build`.
 
 **Step 3:** Run `npm run tauri dev`, verify the application reaches its running state without the OpenSSL linker error, then stop the development process cleanly.
-
