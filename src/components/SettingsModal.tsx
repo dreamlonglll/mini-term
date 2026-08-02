@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { invoke, convertFileSrc } from '@tauri-apps/api/core';
+import { invoke } from '@tauri-apps/api/core';
 import { getVersion } from '@tauri-apps/api/app';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { revealItemInDir } from '@tauri-apps/plugin-opener';
@@ -10,7 +10,7 @@ import { checkForUpdate, compareVersions, type ReleaseInfo } from '../utils/upda
 import { applyTheme } from '../utils/themeManager';
 import { updateAllTerminalThemes, DEFAULT_TERMINAL_FONT_FAMILY } from '../utils/terminalCache';
 import { applyUiFontFamily } from '../utils/fontManager';
-import { clearCustomTheme, listThemePacks, loadAndApplyCustomTheme, reapplyCustomTheme, type ThemePackMeta } from '../utils/themePackManager';
+import { clearCustomTheme, listThemePacks, loadAndApplyCustomTheme, reapplyCustomTheme, resolveThemeAssetUrl, type ThemePackMeta } from '../utils/themePackManager';
 import { MOD_LABEL } from '../utils/platform';
 import { comboLabel, hotkeyGroups } from '../utils/hotkeys';
 import { DEFAULT_REMOTE_PASTE_DIR } from '../utils/pastePath';
@@ -1712,7 +1712,23 @@ function CustomThemePacksSection() {
   const config = useAppStore((s) => s.config);
   const setConfig = useAppStore((s) => s.setConfig);
   const [packs, setPacks] = useState<ThemePackMeta[]>([]);
+  const [thumbUrls, setThumbUrls] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
+
+  // 缩略图走 asset 探活/base64 兜底通道(asset 协议在部分 WebView 环境不可用,
+  // CSS 背景加载失败是静默的),逐个就绪逐个上屏
+  useEffect(() => {
+    let cancelled = false;
+    for (const pack of packs) {
+      if (!pack.def.image) continue;
+      resolveThemeAssetUrl(pack.dir, pack.themeId, pack.def.image)
+        .then((url) => {
+          if (!cancelled) setThumbUrls((prev) => ({ ...prev, [pack.themeId]: url }));
+        })
+        .catch((e) => console.warn(`皮肤 ${pack.themeId} 缩略图加载失败:`, e));
+    }
+    return () => { cancelled = true; };
+  }, [packs]);
 
   const refresh = useCallback(() => {
     setError(null);
@@ -1850,7 +1866,7 @@ function CustomThemePacksSection() {
                 accent: pack.def.colors.accent,
                 text: pack.def.colors.text,
               }}
-              imageUrl={pack.def.image ? convertFileSrc(`${pack.dir}/${pack.def.image}`) : undefined}
+              imageUrl={thumbUrls[pack.themeId]}
               focusX={pack.def.art?.focusX}
               focusY={pack.def.art?.focusY}
               active={config.customThemeId === pack.themeId}

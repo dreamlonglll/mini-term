@@ -366,6 +366,29 @@ function removeThemeCss(): void {
 
 // ─── 背景图氛围层（Phase 2）───
 
+/** 包内资源的可用 URL 缓存（asset 探活或 base64 兜底的结果，按 themeId/file 记） */
+const assetUrlCache = new Map<string, string>();
+
+/** 解析包内资源的可显示 URL：优先 asset 协议，加载失败回退 base64 数据 URL。
+ *  设置页皮肤卡片缩略图使用；结果缓存避免重复 IPC 大文件。 */
+export async function resolveThemeAssetUrl(dir: string, themeId: string, file: string): Promise<string> {
+  const key = `${themeId}/${file}`;
+  const cached = assetUrlCache.get(key);
+  if (cached) return cached;
+  const assetUrl = convertFileSrc(`${dir}/${file}`);
+  const ok = await new Promise<boolean>((resolve) => {
+    const probe = new Image();
+    probe.onload = () => resolve(true);
+    probe.onerror = () => resolve(false);
+    probe.src = assetUrl;
+  });
+  const url = ok
+    ? assetUrl
+    : `data:${mimeOf(file)};base64,${await invoke<string>('read_theme_asset', { themeId, file })}`;
+  assetUrlCache.set(key, url);
+  return url;
+}
+
 /** 探活令牌：主题切换后作废在途的 base64 兜底回填 */
 let bgProbeToken = 0;
 
