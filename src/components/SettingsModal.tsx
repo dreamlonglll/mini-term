@@ -10,7 +10,7 @@ import { checkForUpdate, compareVersions, type ReleaseInfo } from '../utils/upda
 import { applyTheme } from '../utils/themeManager';
 import { updateAllTerminalThemes, DEFAULT_TERMINAL_FONT_FAMILY } from '../utils/terminalCache';
 import { applyUiFontFamily } from '../utils/fontManager';
-import { clearCustomTheme, listThemePacks, loadAndApplyCustomTheme, reapplyCustomTheme, resolveThemeAssetUrl, type ThemePackMeta } from '../utils/themePackManager';
+import { clearCustomTheme, listThemePacks, loadAndApplyCustomTheme, resolveThemeAssetUrl, type ThemePackMeta } from '../utils/themePackManager';
 import { MOD_LABEL } from '../utils/platform';
 import { comboLabel, hotkeyGroups } from '../utils/hotkeys';
 import { DEFAULT_REMOTE_PASTE_DIR } from '../utils/pastePath';
@@ -726,11 +726,11 @@ function SystemSettings() {
   }, [t]);
 
   const handleThemeChange = useCallback((theme: 'auto' | 'light' | 'dark') => {
-    const newConfig = { ...useAppStore.getState().config, theme };
+    // 外置皮肤的明暗由 appearance 定死:切主题 = 退出皮肤回内置
+    clearCustomTheme();
+    const newConfig = { ...useAppStore.getState().config, theme, customThemeId: undefined };
     setConfig(newConfig);
     applyTheme(theme);
-    // 主题包是外置皮肤,跟随明暗轴:按新 resolved 态重算变体而非退出
-    reapplyCustomTheme();
     updateAllTerminalThemes(newConfig.terminalFollowTheme ?? true);
     saveConfigToDisk(newConfig);
   }, [setConfig]);
@@ -830,7 +830,7 @@ function SystemSettings() {
           <button
             key={opt.value}
             className={`flex-1 py-2 rounded-[var(--radius-sm)] text-base transition-all ${
-              config.theme === opt.value
+              !config.customThemeId && config.theme === opt.value
                 ? 'bg-[var(--accent-muted)] text-[var(--accent)] border border-[var(--accent)]'
                 : 'bg-[var(--bg-base)] text-[var(--text-secondary)] border border-[var(--border-default)] hover:border-[var(--accent)]'
             }`}

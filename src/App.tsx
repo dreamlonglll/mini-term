@@ -29,7 +29,7 @@ import { collectPanes } from './utils/layoutOps';
 import { checkForUpdate, type ReleaseInfo } from './utils/updateChecker';
 import { applyTheme } from './utils/themeManager';
 import { applyUiFontFamily } from './utils/fontManager';
-import { loadAndApplyCustomTheme, reapplyCustomTheme } from './utils/themePackManager';
+import { loadAndApplyCustomTheme } from './utils/themePackManager';
 import { markAiPty, updateAllTerminalThemes } from './utils/terminalCache';
 import { includeActiveProject } from './utils/projectKeepAlive';
 import { initMobileSessionSync } from './utils/mobileSessionSync';
@@ -208,27 +208,11 @@ export function App() {
     return () => window.removeEventListener('scroll', onScroll, true);
   }, []);
 
-  // 主题变化时应用新主题；主题包（外置皮肤）跟随明暗轴，按新态重算变体
+  // 主题变化时应用新主题；外置皮肤激活时 data-theme 由皮肤 appearance 定死
   useEffect(() => {
+    if (config.customThemeId) return;
     applyTheme(config.theme ?? 'auto');
-    if (config.customThemeId) {
-      reapplyCustomTheme();
-      updateAllTerminalThemes(config.terminalFollowTheme ?? true);
-    }
   }, [config.theme, config.customThemeId]);
-
-  // auto 模式下系统日夜切换（theme-changed 由 themeManager 派发）同样重算变体。
-  // 本监听在 App 首挂时注册，先于各终端的 theme-changed 处理器执行，
-  // 保证它们读到的是重算后的终端配色
-  useEffect(() => {
-    const onSystemThemeFlip = () => {
-      if (!useAppStore.getState().config.customThemeId) return;
-      reapplyCustomTheme();
-      updateAllTerminalThemes(useAppStore.getState().config.terminalFollowTheme ?? true);
-    };
-    window.addEventListener('theme-changed', onSystemThemeFlip);
-    return () => window.removeEventListener('theme-changed', onSystemThemeFlip);
-  }, []);
 
   // 皮肤变化时应用；自定义主题激活时 data-skin 置空
   useEffect(() => {
