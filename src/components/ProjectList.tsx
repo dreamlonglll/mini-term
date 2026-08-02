@@ -917,7 +917,7 @@ export function ProjectList() {
   };
 
   return (
-    <div data-panel className="h-full bg-[var(--bg-surface)] flex flex-col select-none">
+    <div data-panel data-mt-part="sidebar" className="h-full bg-[var(--bg-surface)] flex flex-col select-none">
       {/* 项目列表（Sessions 已移至右侧悬浮抽屉） */}
       <div ref={projectListRef} className="relative flex-1 min-h-0 flex flex-col overflow-hidden">
             {isFileDragOver && (

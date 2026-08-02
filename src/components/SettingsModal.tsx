@@ -1620,17 +1620,19 @@ function ThemeCard({
   active,
   subtitle,
   onSelect,
+  onDelete,
 }: {
   name: string;
   preview: { background: string; surface: string; accent: string; text: string };
   active: boolean;
   subtitle?: string;
   onSelect: () => void;
+  onDelete?: () => void;
 }) {
   return (
     <button
       type="button"
-      className={`flex flex-col gap-2 p-3 rounded-[var(--radius-md)] text-left transition-all border ${
+      className={`group/card flex flex-col gap-2 p-3 rounded-[var(--radius-md)] text-left transition-all border ${
         active
           ? 'border-[var(--accent)] bg-[var(--accent-subtle)]'
           : 'border-[var(--border-default)] bg-[var(--bg-base)] hover:border-[var(--accent)]'
@@ -1646,11 +1648,22 @@ function ThemeCard({
         <span className="w-5 h-5 rounded-full" style={{ backgroundColor: preview.accent }} />
         <span className="text-sm font-mono" style={{ color: preview.text }}>Aa</span>
       </div>
-      <div className="min-w-0">
-        <div className={`text-base truncate ${active ? 'text-[var(--accent)]' : 'text-[var(--text-primary)]'}`}>
-          {name}
+      <div className="flex items-start justify-between gap-2 min-w-0">
+        <div className="min-w-0">
+          <div className={`text-base truncate ${active ? 'text-[var(--accent)]' : 'text-[var(--text-primary)]'}`}>
+            {name}
+          </div>
+          {subtitle && <div className="text-sm text-[var(--text-muted)] truncate">{subtitle}</div>}
         </div>
-        {subtitle && <div className="text-sm text-[var(--text-muted)] truncate">{subtitle}</div>}
+        {onDelete && (
+          <span
+            role="button"
+            className="hidden group-hover/card:block px-1 text-sm text-[var(--text-muted)] hover:text-[var(--color-error)] transition-colors flex-shrink-0"
+            onClick={(e) => { e.stopPropagation(); onDelete(); }}
+          >
+            ✕
+          </span>
+        )}
       </div>
     </button>
   );
@@ -1701,6 +1714,45 @@ function CustomThemePacksSection() {
     }
   }, [refresh, t]);
 
+  const importZip = useCallback(async () => {
+    setError(null);
+    const selected = await openDialog({
+      title: t('settings.themes.importZipDialogTitle'),
+      directory: false,
+      multiple: false,
+      filters: [{ name: 'Zip', extensions: ['zip'] }],
+    });
+    if (typeof selected !== 'string' || !selected.trim()) return;
+    try {
+      await invoke<string>('import_theme_pack_zip', { zipPath: selected });
+      refresh();
+    } catch (e) {
+      setError(String(e));
+    }
+  }, [refresh, t]);
+
+  const deletePack = useCallback(async (pack: ThemePackMeta) => {
+    if (!window.confirm(t('settings.themes.deleteConfirm', { name: pack.def.name }))) return;
+    setError(null);
+    try {
+      await invoke('delete_theme_pack', { themeId: pack.themeId });
+    } catch (e) {
+      setError(String(e));
+      return;
+    }
+    const cur = useAppStore.getState().config;
+    if (cur.customThemeId === pack.themeId) {
+      // 删的是当前激活主题：清除并回落内置外观
+      clearCustomTheme();
+      const newConfig = { ...cur, customThemeId: undefined };
+      setConfig(newConfig);
+      applyTheme(newConfig.theme ?? 'auto');
+      updateAllTerminalThemes(newConfig.terminalFollowTheme ?? true);
+      saveConfigToDisk(newConfig);
+    }
+    refresh();
+  }, [refresh, setConfig, t]);
+
   const openThemesDir = useCallback(async () => {
     try {
       const dir = await invoke<string>('get_themes_dir');
@@ -1722,6 +1774,12 @@ function CustomThemePacksSection() {
             onClick={importPack}
           >
             {t('settings.themes.addPack')}
+          </button>
+          <button
+            className="px-2 py-1 text-sm rounded-[var(--radius-sm)] text-[var(--text-secondary)] border border-[var(--border-default)] hover:border-[var(--accent)] hover:text-[var(--text-primary)] transition-all"
+            onClick={importZip}
+          >
+            {t('settings.themes.importZip')}
           </button>
           <button
             className="px-2 py-1 text-sm rounded-[var(--radius-sm)] text-[var(--text-secondary)] border border-[var(--border-default)] hover:border-[var(--accent)] hover:text-[var(--text-primary)] transition-all"
@@ -1756,6 +1814,7 @@ function CustomThemePacksSection() {
               }}
               active={config.customThemeId === pack.themeId}
               onSelect={() => void selectCustom(pack)}
+              onDelete={() => void deletePack(pack)}
             />
           ))}
         </div>

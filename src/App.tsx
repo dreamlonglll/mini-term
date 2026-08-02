@@ -222,6 +222,15 @@ export function App() {
     updateAllTerminalThemes(config.terminalFollowTheme);
   }, [config.skin, config.customThemeId]);
 
+  // 主题包热重载（改主题文件即重应用）后联动刷新终端配色
+  useEffect(() => {
+    const onReload = () => {
+      updateAllTerminalThemes(useAppStore.getState().config.terminalFollowTheme ?? true);
+    };
+    window.addEventListener('custom-theme-reloaded', onReload);
+    return () => window.removeEventListener('custom-theme-reloaded', onReload);
+  }, []);
+
   // 启动时获取版本号：写进原生窗口标题（原自定义标题栏已移除），并检查更新
   useEffect(() => {
     getVersion().then((ver) => {

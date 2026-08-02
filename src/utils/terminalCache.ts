@@ -21,7 +21,7 @@ import { useAppStore, clearPaneAttentionByPty } from '../store';
 import type { PtyOutputPayload } from '../types';
 import { getResolvedTheme } from './themeManager';
 import { BUILTIN_TERMINAL_THEMES, DARK_TERMINAL_THEME } from './builtinThemes';
-import { getCustomTerminalTheme } from './themePackManager';
+import { getCustomTerminalTheme, isTransparentThemeActive } from './themePackManager';
 import { createPtyWriteQueue } from './ptyWriteQueue';
 import { getCurrentLineSnapshotFromBuffer } from './terminalSnapshot';
 import { resolvePasteTarget, mapPastedFilePath, type PasteTarget } from './pastePath';
@@ -155,6 +155,8 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
     // LigaturesAddon 内部用 registerCharacterJoiner（xterm.js proposed API），
     // 不开启 allowProposedApi 加载 addon 会抛 "You must set the allowProposedApi option to true"。
     allowProposedApi: true,
+    // 背景图主题激活时终端背景半透明，透出 #root 的氛围背景图（Phase 2）
+    allowTransparency: isTransparentThemeActive(),
   });
 
   const fitAddon = new FitAddon();
@@ -503,8 +505,24 @@ export function clearMarkerInstances(ptyId: number): void {
 
 export function updateAllTerminalThemes(terminalFollowTheme: boolean): void {
   const theme = getTerminalTheme(terminalFollowTheme);
+  const transparent = isTransparentThemeActive();
   for (const entry of cache.values()) {
+    // allowTransparency 是渲染层选项，运行时切换后重载 WebGL addon 让其按
+    // 新 alpha 模式重建；个别 xterm 版本不允许运行时改，失败则只影响透明度
+    // （新建终端仍会按正确值构造），不阻塞换主题
+    if (entry.term.options.allowTransparency !== transparent) {
+      try {
+        entry.term.options.allowTransparency = transparent;
+        if (entry.webglLoaded) {
+          disposeWebgl(entry);
+          loadWebgl(entry);
+        }
+      } catch (e) {
+        console.warn('切换终端透明模式失败（仅影响背景透出）:', e);
+      }
+    }
     entry.term.options.theme = theme;
+    if (entry.term.rows > 0) entry.term.refresh(0, entry.term.rows - 1);
   }
 }
 

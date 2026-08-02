@@ -941,6 +941,11 @@ body.ssh-conn-dragging {
   opacity: 0;
 }
 
+/* 背景图主题激活时噪点层归零，避免在图片上蒙沙（参照 blueprint 先例） */
+:root[data-custom-theme-bg] #root::before {
+  opacity: 0;
+}
+
 :root[data-skin="blueprint"][data-theme="light"] {
   --bg-base: #f0f4f8;
   --bg-surface: #e8eef4;
