@@ -662,6 +662,7 @@ pub struct LoadedConfig {
 /// (那会让前端拿着空配置开始运行,下一次保存就把磁盘覆盖了)。
 #[tauri::command]
 pub fn load_config(app: AppHandle) -> Result<LoadedConfig, String> {
+    crate::startup_trace::mark("load_config enter");
     let path = config_path(&app);
     let config = match fs::read_to_string(&path) {
         Ok(content) => match serde_json::from_str(&content) {

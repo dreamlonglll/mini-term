@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, lazy, Suspense } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { ask, message } from '@tauri-apps/plugin-dialog';
 import { revealItemInDir } from '@tauri-apps/plugin-opener';
@@ -11,7 +11,6 @@ import { showPrompt } from '../utils/prompt';
 import { isAiPty } from '../utils/terminalCache';
 import { MOD_LABEL } from '../utils/platform';
 import { DiffModal } from './DiffModal';
-import { FileViewerModal } from './FileViewerModal';
 import { initFileDrag } from '../utils/fileDragState';
 import { getFileTreeCache, setFileTreeCache, projectCacheKey } from '../utils/projectDataCache';
 import { resolveFileIcon } from '../utils/fileIcon';
@@ -20,6 +19,9 @@ import { ensureDirKinds, getDirKind, useDirKindsVersion } from '../hooks/useProj
 import { TechIcon } from './TechIcon';
 import { useT } from '../i18n';
 import type { FileEntry, FsChangePayload, GitFileStatus, PtyOutputPayload } from '../types';
+
+// 懒加载：FileViewerModal 连带 CodeMirror + react-markdown（数百 KB），首次预览文件才拉 chunk
+const FileViewerModal = lazy(() => import('./FileViewerModal').then((m) => ({ default: m.FileViewerModal })));
 
 interface TreeNodeProps {
   entry: FileEntry;
@@ -809,12 +811,14 @@ export function FileTree() {
       </div>
       {/* 两个弹窗的数据源置空后都再多留一会儿（useOverlayValue），退场动画才播得完 */}
       {viewFile && project && (
-        <FileViewerModal
-          open={viewFileOpen}
-          onClose={() => setViewFilePath(null)}
-          filePath={viewFile}
-          projectRoot={project.path}
-        />
+        <Suspense fallback={null}>
+          <FileViewerModal
+            open={viewFileOpen}
+            onClose={() => setViewFilePath(null)}
+            filePath={viewFile}
+            projectRoot={project.path}
+          />
+        </Suspense>
       )}
       {diffFile && (
         <DiffModal

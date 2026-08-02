@@ -54,3 +54,15 @@ export function useOverlayValue<T>(value: T | null | undefined): [T | null, bool
 
   return [value ?? held, value != null];
 }
+
+/**
+ * 懒加载（React.lazy）弹窗的挂载门控：首次 open 前不挂载，对应 chunk 也就不会拉；
+ * 首次打开后**永久**保持挂载 —— 关闭时组件仍在树上，弹窗内部的 `useOverlayPresence`
+ * 才有机会播完退场动画（写成 `{open && <Lazy/>}` 会在关闭瞬间连组件带动画一起摘掉）。
+ */
+export function useEverOpened(open: boolean): boolean {
+  const [ever, setEver] = useState(open);
+  // render 期间同步置位（React 的 adjust-state-during-render 模式），开弹窗不慢一帧
+  if (open && !ever) setEver(true);
+  return ever;
+}

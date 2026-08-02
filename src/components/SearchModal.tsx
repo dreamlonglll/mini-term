@@ -1,15 +1,17 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, lazy, Suspense } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { writeText } from '@tauri-apps/plugin-clipboard-manager';
 import { useAppStore } from '../store';
 import { useTauriEvent } from '../hooks/useTauriEvent';
 import { useOverlayPresence, useOverlayValue } from '../hooks/useOverlayMotion';
-import { FileViewerModal } from './FileViewerModal';
 import { showContextMenu } from '../utils/contextMenu';
 import { MOD_LABEL } from '../utils/platform';
 import { Modal } from './Modal';
 import { useT } from '../i18n';
 import type { SearchResultItem, SearchResultsPayload, SearchCompletePayload } from '../types';
+
+// 懒加载：FileViewerModal 连带 CodeMirror + react-markdown（数百 KB），首次预览文件才拉 chunk
+const FileViewerModal = lazy(() => import('./FileViewerModal').then((m) => ({ default: m.FileViewerModal })));
 
 // ── Keyword highlight helper ──
 
@@ -350,13 +352,15 @@ export function SearchModal({ open, onClose }: SearchModalProps) {
 
       {/* 预览路径置空后再多留一会儿（useOverlayValue），预览窗才有时间淡出 */}
       {viewFile && project && (
-        <FileViewerModal
-          open={viewFileOpen}
-          onClose={() => setViewFilePath(null)}
-          filePath={viewFile}
-          projectRoot={project.path}
-          highlightLine={viewHighlightLine}
-        />
+        <Suspense fallback={null}>
+          <FileViewerModal
+            open={viewFileOpen}
+            onClose={() => setViewFilePath(null)}
+            filePath={viewFile}
+            projectRoot={project.path}
+            highlightLine={viewHighlightLine}
+          />
+        </Suspense>
       )}
     </Modal>
   );

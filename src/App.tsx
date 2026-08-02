@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback, useRef, lazy, Suspense } from 'react';
 import { Allotment } from 'allotment';
 import { invoke } from '@tauri-apps/api/core';
 import { getVersion } from '@tauri-apps/api/app';
@@ -11,16 +11,16 @@ import { ProjectList } from './components/ProjectList';
 import { FileTree } from './components/FileTree';
 import { ActivityBar } from './components/ActivityBar';
 import { RightDrawer } from './components/RightDrawer';
-import { SettingsModal, type SettingsPage } from './components/SettingsModal';
+import type { SettingsPage } from './components/SettingsModal';
 import { SshModal } from './components/SshModal';
-import { MobileRelayModal } from './components/MobileRelayModal';
-import { UsageStatsModal } from './components/usage/UsageStatsModal';
 import { SearchModal } from './components/SearchModal';
 import { ToastContainer } from './components/ToastContainer';
 import { FirstRunGuide } from './components/FirstRunGuide';
 import { ProjectSwitcher } from './components/ProjectSwitcher';
 import { TerminalSearchBar } from './components/TerminalSearchBar';
 import { useTauriEvent } from './hooks/useTauriEvent';
+import { useEverOpened } from './hooks/useOverlayMotion';
+import { markStartup, flushStartupTrace } from './utils/startupTrace';
 import { useAiSubmitMarker } from './hooks/useAiSubmitMarker';
 import { useMarkerHotkeys } from './hooks/useMarkerHotkeys';
 import { useGlobalHotkeys } from './hooks/useGlobalHotkeys';
@@ -35,6 +35,12 @@ import { initMobileSessionSync } from './utils/mobileSessionSync';
 import { handleMobileStartSession } from './utils/mobileStartSession';
 import { useT } from './i18n';
 import type { AppConfig, PtyStatusChangePayload, PtyExitPayload, PaneStatus, MobileRelayStatusPayload, MobileStartSessionPayload, MobileRenamePanePayload } from './types';
+
+// 懒加载三个重弹窗（SettingsModal 自身体量 / MobileRelayModal 连带 qrcode / UsageStatsModal
+// 连带 usage/ 成套组件与 react-markdown），首次打开才拉 chunk，不占启动关键路径
+const SettingsModal = lazy(() => import('./components/SettingsModal').then((m) => ({ default: m.SettingsModal })));
+const MobileRelayModal = lazy(() => import('./components/MobileRelayModal').then((m) => ({ default: m.MobileRelayModal })));
+const UsageStatsModal = lazy(() => import('./components/usage/UsageStatsModal').then((m) => ({ default: m.UsageStatsModal })));
 
 /**
  * 关窗前盘点还活着的 AI 会话（ai-working / ai-idle）：数量 + 给用户看的名字清单。
@@ -56,7 +62,14 @@ function collectLiveAiPanes(): { count: number; names: string[] } {
   return { count: names.length, names };
 }
 
+// 启动埋点:App 首次进入 render 的时刻(StrictMode 双 render 只记第一次)
+let firstRenderMarked = false;
+
 export function App() {
+  if (!firstRenderMarked) {
+    firstRenderMarked = true;
+    markStartup('App() first render');
+  }
   const t = useT();
   const [configLoaded, setConfigLoaded] = useState(false);
   const [configOpen, setConfigOpen] = useState(false);
@@ -64,6 +77,10 @@ export function App() {
   const [sshOpen, setSshOpen] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
   const [statsOpen, setStatsOpen] = useState(false);
+  // 懒挂载门控：三个懒弹窗首次打开前不挂载（chunk 不拉）；之后常驻，退场动画照播
+  const settingsEverOpened = useEverOpened(configOpen);
+  const mobileEverOpened = useEverOpened(mobileOpen);
+  const statsEverOpened = useEverOpened(statsOpen);
   const [switcherOpen, setSwitcherOpen] = useState(false);
   const [updateInfo, setUpdateInfo] = useState<ReleaseInfo | null>(null);
   const [mountedProjectIds, setMountedProjectIds] = useState<string[]>([]);
@@ -80,6 +97,7 @@ export function App() {
     // 必须携带当前令牌——空白页面/加载失败的页面天然没有写盘资格,
     // 防止空状态覆盖磁盘上的完整配置
     const loadWithRetry = async (): Promise<{ config: AppConfig; token: number }> => {
+      markStartup('load_config invoke');
       let lastErr: unknown;
       for (let i = 0; i < 3; i++) {
         try {
@@ -92,6 +110,7 @@ export function App() {
       throw lastErr;
     };
     loadWithRetry().then(({ config: cfg, token }) => {
+      markStartup('load_config resolved');
       setConfigToken(token);
       setConfig(cfg);
       // 应用 UI 字体大小
@@ -129,13 +148,17 @@ export function App() {
         }
       }
 
+      markStartup('config applied (layout restored)');
       setConfigLoaded(true);
 
       // 布局元数据恢复完成后显示窗口；终端进程由可见 pane 按需创建。
       const showWindow = () => {
         // 双 rAF 确保 React 首帧布局完成后再显示。
         requestAnimationFrame(() => requestAnimationFrame(() => {
-          getCurrentWindow().show();
+          // 到这里 configLoaded 后的主界面首帧已渲染完成:
+          // 本节点与上一节点的间隔 ≈ React 主界面首帧(含 xterm 首挂)耗时
+          markStartup('show() call (main UI first frame done)');
+          getCurrentWindow().show().then(() => flushStartupTrace());
         }));
       };
       showWindow();
@@ -473,10 +496,23 @@ export function App() {
           </div>
         ) : null}
       </div>
-      <SettingsModal open={configOpen} onClose={() => setConfigOpen(false)} initialPage={configPage} />
+      {/* 三个懒弹窗各自独立 Suspense：共享边界会让一个弹窗首次加载时把另一个已打开的闪没 */}
+      {settingsEverOpened && (
+        <Suspense fallback={null}>
+          <SettingsModal open={configOpen} onClose={() => setConfigOpen(false)} initialPage={configPage} />
+        </Suspense>
+      )}
       <SshModal open={sshOpen} onClose={() => setSshOpen(false)} />
-      <MobileRelayModal open={mobileOpen} onClose={() => setMobileOpen(false)} />
-      <UsageStatsModal open={statsOpen} onClose={() => setStatsOpen(false)} />
+      {mobileEverOpened && (
+        <Suspense fallback={null}>
+          <MobileRelayModal open={mobileOpen} onClose={() => setMobileOpen(false)} />
+        </Suspense>
+      )}
+      {statsEverOpened && (
+        <Suspense fallback={null}>
+          <UsageStatsModal open={statsOpen} onClose={() => setStatsOpen(false)} />
+        </Suspense>
+      )}
       <SearchModal open={searchModalOpen} onClose={() => setSearchModalOpen(false)} />
       <ProjectSwitcher open={switcherOpen} onClose={() => setSwitcherOpen(false)} />
       <TerminalSearchBar />

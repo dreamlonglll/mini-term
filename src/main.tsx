@@ -1,8 +1,17 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import { App } from './App';
+import { markStartup } from './utils/startupTrace';
+// 本地字体（woff2 随安装包分发）：启动路径零网络请求，离线可用（含 xterm 等宽字体）
+import '@fontsource-variable/dm-sans';
+import '@fontsource/jetbrains-mono/400.css';
+import '@fontsource/jetbrains-mono/500.css';
+import '@fontsource/jetbrains-mono/600.css';
 import './styles.css';
 import './fluent2.css';
+
+// 主 chunk（含全部静态依赖模块）加载 + 解析 + 执行完毕的时刻
+markStartup('main chunk exec done');
 
 // 禁用 WebView 默认右键菜单
 document.addEventListener('contextmenu', (e) => {
