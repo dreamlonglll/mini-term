@@ -262,8 +262,10 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
         {node.panes.map((pane) => {
           const isActive = pane.id === activePane.id;
           // 会话跑的是哪家 AI 就亮哪家品牌图标:hook 上报的 agent 权威,
-          // 无 hook(仅输入检测)时 aiSession 为空 → 回退通用 Bot
-          const aiActive = pane.status === 'ai-working' || pane.status === 'ai-idle';
+          // 输入检测的 detectedAgent 兜底;持有 aiSession(含重启后待续接、
+          // 尚未激活恢复的 pane)也显示 —— 图标不该等切过去恢复后才出现
+          const aiActive =
+            pane.status === 'ai-working' || pane.status === 'ai-idle' || !!pane.aiSession;
           return (
             <div
               key={pane.id}

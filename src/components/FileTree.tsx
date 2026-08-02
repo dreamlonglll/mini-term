@@ -45,6 +45,38 @@ function getRelativePath(targetPath: string, rootPath: string) {
   return normalizedTarget.slice(normalizedRoot.length + 1).replace(/\//g, sep);
 }
 
+/**
+ * 单链目录汇总(IDE 的 compact middle packages):目录一路只有唯一子目录、
+ * 没有文件时,折叠成一行 `main/java/com/…`,path 指向链尾真实目录 ——
+ * 右键/展开/watch 都落在链尾,语义自洽。仅本地(远程 SFTP 逐级往返太贵,
+ * 调用方跳过);链中途遇到 ignored 目录即停。
+ * 边界:链中段目录不被 watch,外部直接往中段塞文件不会自动刷新(手动刷新可见)。
+ */
+async function compactDirChains(entries: FileEntry[], projectRoot: string): Promise<FileEntry[]> {
+  return Promise.all(
+    entries.map(async (e) => {
+      if (!e.isDir || e.ignored) return e;
+      let name = e.name;
+      let path = e.path;
+      for (;;) {
+        let kids: FileEntry[];
+        try {
+          kids = await invoke<FileEntry[]>('list_directory', { projectRoot, path });
+        } catch {
+          break;
+        }
+        if (kids.length === 1 && kids[0].isDir && !kids[0].ignored) {
+          name = `${name}/${kids[0].name}`;
+          path = kids[0].path;
+        } else {
+          break;
+        }
+      }
+      return name === e.name ? e : { ...e, name, path };
+    }),
+  );
+}
+
 function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff, onViewFile, remoteConnectionId }: TreeNodeProps) {
   const t = useT();
   const activeProjectId = useAppStore((s) => s.activeProjectId);
@@ -76,7 +108,7 @@ function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff, onViewF
       projectRoot,
       path: entry.path,
     });
-    setChildren(entries);
+    setChildren(await compactDirChains(entries, projectRoot));
   }, [entry.path, projectRoot, remoteConnectionId]);
 
   // 恢复时(初始即展开)加载一次子节点
@@ -122,13 +154,8 @@ function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff, onViewF
     }
   }, [entry, expanded, loadingChildren, loadChildren, onViewFile, activeProjectId, remoteConnectionId]);
 
-  // 子工程识别:子列表加载后对其中的非 ignored 目录探测工程类型,
-  // 命中的目录用技术栈图标替代普通文件夹图标(多工程聚合仓一眼可辨)。
-  // 远程项目跳过(探测走本地 list_directory);缓存命中零开销
-  useEffect(() => {
-    if (remoteConnectionId) return;
-    ensureDirKinds(children.filter((c) => c.isDir && !c.ignored).map((c) => c.path));
-  }, [children, remoteConnectionId]);
+  // 子工程识别只做第一级(根目录直接子目录):更深层的目录不再按工程显示,
+  // 树里层层技术栈图标反而喧宾夺主。探测由 FileTree 根组件统一触发。
 
   useTauriEvent<FsChangePayload>('fs-change', useCallback((payload: FsChangePayload) => {
     if (remoteConnectionId) return; // 远程项目无 watcher,fs-change 与本树无关
@@ -298,8 +325,8 @@ function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff, onViewF
         {(() => {
           // 类型图标(baybreezy 懒加载):就绪前回退原有符号 —— 目录无图标、文件用 ·。
           // gitignore 的置灰走父级 opacity,对 <img> 同样生效。
-          // 目录若被识别为子工程(pom.xml/Cargo.toml/…),优先显示技术栈图标
-          if (entry.isDir && !remoteConnectionId && !entry.ignored) {
+          // 第一级目录若被识别为子工程(pom.xml/Cargo.toml/…),优先显示技术栈图标
+          if (entry.isDir && depth === 0 && !remoteConnectionId && !entry.ignored) {
             const dirKind = getDirKind(entry.path);
             if (dirKind) {
               return <TechIcon kind={dirKind} size={14} className="flex-shrink-0" />;
@@ -490,13 +517,15 @@ export function FileTree() {
           projectRoot: projectPath,
           path: projectPath,
         });
-    listPromise.then((entries) => {
-      setRootEntries(entries);
-      rootEntriesRef.current = entries;
+    listPromise.then(async (entries) => {
+      // 本地做单链目录汇总;远程逐级 SFTP 往返太贵,保持原样
+      const finalEntries = remoteConnectionId ? entries : await compactDirChains(entries, projectPath);
+      setRootEntries(finalEntries);
+      rootEntriesRef.current = finalEntries;
       setLoading(false);
       setLoadError(null);
       setFileTreeCache(projectCacheKey(project), {
-        rootEntries: entries,
+        rootEntries: finalEntries,
         gitStatusMap: gitStatusMapRef.current,
       });
     }).catch((err) => {
@@ -559,7 +588,9 @@ export function FileTree() {
 
     const listPromise = invoke<FileEntry[]>('list_directory', { projectRoot: projectPath, path: projectPath });
     const statusPromise = invoke<GitFileStatus[]>('get_git_status', { projectPath }).catch(() => [] as GitFileStatus[]);
-    Promise.all([listPromise, statusPromise]).then(([entries, statuses]) => {
+    Promise.all([listPromise, statusPromise]).then(async ([rawEntries, statuses]) => {
+      if (cancelled) return;
+      const entries = await compactDirChains(rawEntries, projectPath);
       if (cancelled) return;
       const map = new Map<string, GitFileStatus>();
       for (const s of statuses) map.set(s.path, s);
