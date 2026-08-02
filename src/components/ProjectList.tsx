@@ -549,7 +549,12 @@ export function ProjectList() {
             ? 'bg-[var(--accent-subtle)] text-[var(--accent)]'
             : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--border-subtle)]'
         }`}
-        style={{ paddingLeft: `${depth * 16 + 10}px`, paddingRight: '10px' }}
+        style={{
+          // 组内项目对齐父级分组的倒三角(父组 paddingLeft = (depth-1)*16,+2 对准字形),
+          // 顶层项目维持原有 10px
+          paddingLeft: `${depth === 0 ? 10 : (depth - 1) * 16 + 2}px`,
+          paddingRight: '10px',
+        }}
         role="option"
         aria-selected={isActive}
         tabIndex={0}
