@@ -298,6 +298,9 @@ pub struct ProjectConfig {
     /// 子项目(worktree「设为项目」):有值 = 挂在该项目 id 下渲染,不在 projectTree 里
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_project_id: Option<String>,
+    /// 项目类型徽标覆盖:`None` = 前端自动探测,"none" = 不显示,其余为技术栈 key。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind_override: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

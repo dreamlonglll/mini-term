@@ -15,6 +15,11 @@ pub struct PtyStatusChangePayload {
     /// "stop" = 一轮回答正常结束;None = 无成因信息(monitor 降级路径)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cause: Option<String>,
+    /// 会话内 AI 命令名("claude"/"codex"/…),前端品牌图标兜底用
+    /// (hook 未启用时 aiSession 不会上报,这是 agent 的唯一来源);
+    /// None = 非 AI 状态或来源未知。不参与去重(同一会话内恒定)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 }
 
 /// AI 输出活跃超时阈值
@@ -51,7 +56,14 @@ impl StatusEmitter {
     ///   (用户键入即批准),后端去重表感知不到;若按相同 cause 去重,
     ///   同一轮内第二次授权请求会被吞掉,黄灯不再点亮;
     /// - 状态相同 + 其他 cause 变化 → emit(如 attention → stop)。
-    pub fn emit_if_changed(&self, app: &AppHandle, pty_id: u32, status: &str, cause: Option<&str>) {
+    pub fn emit_if_changed(
+        &self,
+        app: &AppHandle,
+        pty_id: u32,
+        status: &str,
+        cause: Option<&str>,
+        agent: Option<String>,
+    ) {
         let mut prev = self.prev.lock().unwrap();
         if let Some((prev_status, prev_cause)) = prev.get(&pty_id) {
             if prev_status == status {
@@ -70,6 +82,7 @@ impl StatusEmitter {
                 pty_id,
                 status: status.to_string(),
                 cause: cause.map(|s| s.to_string()),
+                agent,
             },
         );
     }
@@ -133,7 +146,12 @@ pub fn start_monitor(
 
             for pty_id in &pty_ids {
                 let status = resolve_status(&hook_state, &pty_manager, *pty_id);
-                emitter.emit_if_changed(&app, *pty_id, &status, None);
+                let agent = if status.starts_with("ai-") {
+                    pty_manager.ai_session_agent(*pty_id)
+                } else {
+                    None
+                };
+                emitter.emit_if_changed(&app, *pty_id, &status, None, agent);
             }
 
             emitter.retain(&pty_ids);

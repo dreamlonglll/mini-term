@@ -57,10 +57,17 @@ export function getHighestStatus(node: SplitNode): PaneStatus {
 }
 
 // 在 SplitNode 中更新指定 pane 的状态。
-// 回到 idle/error = AI 会话不复存在,连带清掉待续接的会话身份,
+// 回到 idle/error = AI 会话不复存在,连带清掉待续接的会话身份与检测到的 agent,
 // 避免用户主动退出 claude 后下次启动又被 resume 回来。
 // attention = 本次 ai-idle 的成因是「需要用户确认」(托盘黄灯依据)。
-function updatePaneStatus(node: SplitNode, ptyId: number, status: PaneStatus, attention: boolean): SplitNode {
+// agent = 后端识别的会话内 AI 命令名(输入检测/hook),品牌图标兜底用。
+function updatePaneStatus(
+  node: SplitNode,
+  ptyId: number,
+  status: PaneStatus,
+  attention: boolean,
+  agent?: string,
+): SplitNode {
   if (node.type === 'leaf') {
     const idx = node.panes.findIndex((p) => p.ptyId === ptyId);
     if (idx >= 0) {
@@ -69,7 +76,11 @@ function updatePaneStatus(node: SplitNode, ptyId: number, status: PaneStatus, at
         ...newPanes[idx],
         status,
         attention: attention || undefined,
-        ...(status === 'idle' || status === 'error' ? { aiSession: undefined } : {}),
+        ...(status === 'idle' || status === 'error'
+          ? { aiSession: undefined, detectedAgent: undefined, resumePending: undefined }
+          : agent
+            ? { detectedAgent: agent }
+            : {}),
       };
       return { ...node, panes: newPanes };
     }
@@ -77,7 +88,7 @@ function updatePaneStatus(node: SplitNode, ptyId: number, status: PaneStatus, at
   }
   return {
     ...node,
-    children: node.children.map((c) => updatePaneStatus(c, ptyId, status, attention)),
+    children: node.children.map((c) => updatePaneStatus(c, ptyId, status, attention, agent)),
   };
 }
 
@@ -148,6 +159,22 @@ export function setPaneAiSessionByPty(
     return { projectStates: newStates };
   });
   return ctx.projectId;
+}
+
+/** 清除 pane 的待续接标记(resume 命令已写入;身份 aiSession 保留)。 */
+export function clearPaneResumePendingByPty(ptyId: number): void {
+  const ctx = findPaneContextByPty(ptyId);
+  if (!ctx?.pane.resumePending) return;
+  useAppStore.setState((state) => {
+    const ps = state.projectStates.get(ctx.projectId);
+    if (!ps?.layout) return state;
+    const newStates = new Map(state.projectStates);
+    newStates.set(ctx.projectId, {
+      ...ps,
+      layout: patchPaneByPty(ps.layout, ptyId, { resumePending: undefined }),
+    });
+    return { projectStates: newStates };
+  });
 }
 
 // 主窗口聚焦状态(App.tsx 经 tauri onFocusChanged 维护)。
@@ -540,7 +567,7 @@ interface AppStore {
   setProjectLayout: (projectId: string, layout: SplitNode | null) => void;
 
   // Pane 状态
-  updatePaneStatusByPty: (ptyId: number, status: PaneStatus, cause?: 'attention' | 'stop') => void;
+  updatePaneStatusByPty: (ptyId: number, status: PaneStatus, cause?: 'attention' | 'stop', agent?: string) => void;
   /** 托盘绿灯的「已完成未读」pane 集合;激活主窗口时清空 */
   unreadDonePaneIds: Set<string>;
   clearUnreadDone: () => void;
@@ -788,7 +815,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
     queueMicrotask(syncTrayStatus);
   },
 
-  updatePaneStatusByPty: (ptyId, status, cause) => {
+  updatePaneStatusByPty: (ptyId, status, cause, agent) => {
     set((state) => {
       // 1. 找到 pane 所属项目并捕获 oldStatus
       let oldStatus: PaneStatus | null = null;
@@ -814,7 +841,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
       let changed = false;
       for (const [pid, ps] of newStates) {
         if (!ps.layout) continue;
-        const newLayout = updatePaneStatus(ps.layout, ptyId, status, attention);
+        const newLayout = updatePaneStatus(ps.layout, ptyId, status, attention, agent);
         if (newLayout === ps.layout) continue;
         newStates.set(pid, { ...ps, layout: newLayout, status: getHighestStatus(newLayout) });
         changed = true;
