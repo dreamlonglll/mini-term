@@ -134,8 +134,10 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
   wrapper.style.height = '100%';
 
   const theme = getTerminalTheme(useAppStore.getState().config.terminalFollowTheme ?? true);
-  // 预设背景色，防止首帧渲染前闪屏；始终跟随系统主题 CSS 变量
-  wrapper.style.backgroundColor = 'var(--bg-terminal)';
+  // 预设背景色，防止首帧渲染前闪屏；始终跟随系统主题 CSS 变量。
+  // 背景图主题下 wrapper 透明——着色已由 TerminalArea 容器的 --bg-terminal 承担，
+  // 再画一层会叠乘不透明度把背景图盖没
+  wrapper.style.backgroundColor = isTransparentThemeActive() ? 'transparent' : 'var(--bg-terminal)';
 
   const term = new Terminal({
     fontSize: useAppStore.getState().config.terminalFontSize ?? 14,
@@ -521,6 +523,7 @@ export function updateAllTerminalThemes(terminalFollowTheme: boolean): void {
         console.warn('切换终端透明模式失败（仅影响背景透出）:', e);
       }
     }
+    entry.wrapper.style.backgroundColor = transparent ? 'transparent' : 'var(--bg-terminal)';
     entry.term.options.theme = theme;
     if (entry.term.rows > 0) entry.term.refresh(0, entry.term.rows - 1);
   }

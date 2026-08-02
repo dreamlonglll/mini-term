@@ -49,7 +49,7 @@ export interface ThemePackJson {
     surfaceOpacity?: number;
     /** 背景图上的底色压暗层不透明度，默认 0.45 */
     backgroundDim?: number;
-    /** 终端背景不透明度，默认取 surfaceOpacity */
+    /** 终端区着色层不透明度，默认 0.6（着色只画一层在 --bg-terminal） */
     terminalOpacity?: number;
     /** theme.css 旋钮 --mt-theme-surface-radius / -blur 的取值 */
     surfaceRadius?: string;
@@ -157,8 +157,10 @@ function withAlpha(color: string, alpha: number): string | null {
 
 // ─── 氛围层参数 ───
 
-const DEFAULT_SURFACE_OPACITY = 0.85;
-const DEFAULT_BACKGROUND_DIM = 0.45;
+// 氛围可见度：压暗层与表面 alpha 是乘性叠加，默认值取「图可见 + 文字可读」平衡点
+const DEFAULT_SURFACE_OPACITY = 0.72;
+const DEFAULT_BACKGROUND_DIM = 0.35;
+const DEFAULT_TERMINAL_OPACITY = 0.6;
 
 function hasBackgroundImage(def: ThemePackJson, dir: string | null): dir is string {
   return !!def.image && !!dir;
@@ -171,7 +173,7 @@ function surfaceOpacityOf(def: ThemePackJson): number {
 
 function terminalOpacityOf(def: ThemePackJson): number {
   const v = def.effects?.terminalOpacity;
-  return typeof v === 'number' && v >= 0 && v <= 1 ? v : surfaceOpacityOf(def);
+  return typeof v === 'number' && v >= 0 && v <= 1 ? v : DEFAULT_TERMINAL_OPACITY;
 }
 
 // ─── theme.json → mini-term token 映射（计划 3.2 映射表） ───
@@ -232,9 +234,9 @@ function deriveTerminalTheme(def: ThemePackJson, withBackground: boolean): Termi
   const c = def.colors;
   return {
     ...base,
-    background: withBackground
-      ? withAlpha(c.background, terminalOpacityOf(def)) ?? c.background
-      : c.background,
+    // 背景图模式下 xterm 自身背景全透明（保留 RGB 供对比度计算），
+    // 着色统一由 --bg-terminal 容器层承担，避免容器/wrapper/xterm 三层叠加
+    background: withBackground ? withAlpha(c.background, 0) ?? c.background : c.background,
     foreground: c.text,
     cursor: c.accent,
     cursorAccent: c.background,
