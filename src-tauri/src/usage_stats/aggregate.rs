@@ -86,8 +86,8 @@ pub struct UsageStatsPayload {
     pub top_sessions: Vec<TopSessionStat>,
 }
 
-/// 项目排行上限：前端固定高度内滚动展示，给足条目（仅防极端项目数爆炸）
-const TOP_PROJECTS: usize = 50;
+/// 项目排行上限：设计合同(2026-08-01 §2.2)定为前 8
+const TOP_PROJECTS: usize = 8;
 const TOP_SESSIONS: usize = 10;
 
 #[derive(Default)]
@@ -385,7 +385,13 @@ impl Aggregator {
             .take(TOP_SESSIONS)
             .map(|s| {
                 let ts = if s.first_ts_ms == i64::MAX { 0 } else { s.first_ts_ms };
-                let day = (ts - self.tz_offset_minutes as i64 * 60_000).div_euclid(86_400_000);
+                // 与每日分桶同口径:按该会话自身时刻求当地偏移(DST 地区
+                // 午夜附近的历史会话不错日,与图表一致)
+                let offset_minutes = match &self.tz {
+                    Some(tz) => tz_offset_minutes_at(tz, ts),
+                    None => self.tz_offset_minutes,
+                };
+                let day = (ts - offset_minutes as i64 * 60_000).div_euclid(86_400_000);
                 let (y, m, d) = civil_from_days(day);
                 TopSessionStat {
                     session_id: s.session_id.clone(),
@@ -483,6 +489,21 @@ mod tests {
         // 修复前用「当前时刻」固定偏移套全量历史,跨 DST 边界的记录会错日
         assert_eq!(tz_offset_minutes_at(&tz, winter), 300);
         assert_eq!(tz_offset_minutes_at(&tz, summer), 240);
+    }
+
+    #[test]
+    fn top_session_date_uses_offset_at_record_time() {
+        // 纽约夏令(EDT=UTC-4):UTC 04:30 → 本地 00:30 属当日;
+        // 修复前用固定冬令偏移(+300)会算成前一日 23:30,与每日图错位
+        let summer = chrono::DateTime::parse_from_rfc3339("2026-07-15T04:30:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let mut agg = Aggregator::new(0, None, 300, Some("America/New_York"), false);
+        let p = pricing();
+        agg.add_session(&session("s1", "/a", vec![turn(Some("m1"), summer, 10)]), &p);
+        let snap = agg.snapshot();
+        assert_eq!(snap.top_sessions[0].timestamp, "2026-07-15");
+        assert_eq!(snap.daily[0].date, "2026-07-15", "会话日期必须与每日桶一致");
     }
 
     #[test]

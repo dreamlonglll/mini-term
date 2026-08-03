@@ -1,6 +1,7 @@
 import { useT } from '../../i18n';
 import type { UsageStatsPayload } from '../../types';
 import { cacheHitRate, formatCost, formatCount } from './format';
+import { useTweenedNumber } from './useTween';
 
 // === 图标（统一 16 viewBox / stroke currentColor，对齐 ActivityBar 画风）===
 const ICON_WALLET = (
@@ -45,7 +46,7 @@ function KpiCard({ icon, iconColor, label, value, valueColor }: KpiCardProps) {
       <div className="min-w-0">
         <div className="text-[10px] font-semibold tracking-wider uppercase text-[var(--text-muted)]">{label}</div>
         <div
-          className="text-xl font-bold leading-tight truncate"
+          className="text-xl font-bold leading-tight truncate tabular-nums"
           style={{ color: valueColor ?? 'var(--text-primary)' }}
         >
           {value}
@@ -58,32 +59,37 @@ function KpiCard({ icon, iconColor, label, value, valueColor }: KpiCardProps) {
 export function KpiCards({ stats }: { stats: UsageStatsPayload }) {
   const t = useT();
   const hit = cacheHitRate(stats.inputTokens, stats.cacheReadTokens, stats.cacheWriteTokens);
+  // 数字滚动:数据更新时从旧值补间到新值(等宽字体下无位移)
+  const cost = useTweenedNumber(stats.totalCost);
+  const callsN = useTweenedNumber(stats.totalCalls);
+  const sessionsN = useTweenedNumber(stats.sessionCount);
+  const hitN = useTweenedNumber(hit ?? 0);
   return (
     <div className="grid grid-cols-4 gap-3">
       <KpiCard
         icon={ICON_WALLET}
         iconColor="var(--color-info)"
         label={t('usageStats.kpi.cost')}
-        value={formatCost(stats.totalCost)}
+        value={formatCost(cost)}
         valueColor="var(--accent)"
       />
       <KpiCard
         icon={ICON_PULSE}
         iconColor="var(--color-info)"
         label={t('usageStats.kpi.calls')}
-        value={formatCount(stats.totalCalls)}
+        value={formatCount(Math.round(callsN))}
       />
       <KpiCard
         icon={ICON_CHAT}
         iconColor="var(--color-info)"
         label={t('usageStats.kpi.sessions')}
-        value={formatCount(stats.sessionCount)}
+        value={formatCount(Math.round(sessionsN))}
       />
       <KpiCard
         icon={ICON_BOLT}
         iconColor="var(--color-info)"
         label={t('usageStats.kpi.cacheHit')}
-        value={hit === null ? '—' : `${hit.toFixed(1)}%`}
+        value={hit === null ? '—' : `${hitN.toFixed(1)}%`}
       />
     </div>
   );

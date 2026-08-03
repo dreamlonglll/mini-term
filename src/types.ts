@@ -585,19 +585,13 @@ export interface UsageStatsPayload {
   topSessions: UsageTopSessionStat[];
 }
 
-export interface UsageStatsProgressPayload {
-  requestId: string;
+export interface UsageLedgerProgressPayload {
+  /** backfill（账本首建全量同步）进度：已处理/总文件数 */
   processed: number;
   total: number;
-  partial: UsageStatsPayload;
 }
 
-export interface UsageStatsDonePayload {
-  requestId: string;
-  stats: UsageStatsPayload;
-}
-
-export interface UsageStatsErrorPayload {
-  requestId: string;
-  error: string;
+export interface UsageLedgerSyncedPayload {
+  /** 本轮增量同步重解析的文件数；0 = 账本无变化 */
+  added: number;
 }

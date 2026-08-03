@@ -191,8 +191,8 @@ pub fn run() {
             mobile_relay::mobile_relay_launchers_changed,
             mobile_relay::mobile_relay_start_session_result,
             mobile_relay::mobile_relay_check_launcher_command,
-            usage_stats::start_usage_stats,
-            usage_stats::cancel_usage_stats,
+            usage_stats::ledger::usage_ledger_query,
+            usage_stats::ledger::usage_ledger_sync,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

@@ -279,6 +279,9 @@ fn claude_turns_from_lines<'a>(
             _ => {}
         }
     }
+    // 计费门槛：任一计费维度 > 0 才计入。全 0 行（流式中间快照未被同 id 覆盖、
+    // 本地占位等）不是一次计费调用，计入会虚增 calls（Codex 侧解析时已同门槛）
+    turns.retain(|t| t.usage.total() > 0);
     (turns, cwd, title)
 }
 
@@ -339,11 +342,18 @@ fn usage_from_codex(u: &serde_json::Value) -> UsageTotals {
     }
 }
 
+/// 0.146+ 的 subagent/fork rollout 会把复制的父历史逐行改写时间戳为复制时刻
+/// （实测比 child session_meta 晚 ~1ms），`ts < meta_ts` 挡不住；而真实 turn
+/// 至少要一次模型往返（秒级）才会出现。含复制历史的文件（≥2 个 session_meta）
+/// 按「最后一个 meta 时刻 + 本容差」截断复制块。
+const LINEAGE_EPSILON_MS: i64 = 2_000;
+
 /// 解析一个 Codex rollout 文件（一文件一会话）。
 /// usage 优先取每条 token_count 的 `last_token_usage`（自带该轮 timestamp）；
 /// 缺失时对 `total_token_usage` 做相邻差分兜底。Codex 无 message id，不参与
 /// 聚合层去重；fork/resume 复制进来的父会话历史在本函数内按「早于本文件
-/// session_meta 时刻」前缀跳过，防止跨 rollout 重复计费。
+/// session_meta 时刻」前缀跳过（时间戳被改写的复制块另按 LINEAGE_EPSILON_MS
+/// 截断），防止跨 rollout 重复计费。
 pub(crate) fn parse_codex_session(
     path: &Path,
     thread_names: &HashMap<String, String>,
@@ -358,6 +368,8 @@ pub(crate) fn parse_codex_session(
     let mut turns: Vec<Turn> = Vec::new();
     let mut prev_total = UsageTotals::default();
     let mut meta_ts: Option<i64> = None;
+    let mut last_meta_ts: Option<i64> = None;
+    let mut meta_count = 0usize;
 
     for line in &lines {
         let obj: serde_json::Value = match serde_json::from_str(line) {
@@ -370,22 +382,28 @@ pub(crate) fn parse_codex_session(
             .and_then(parse_rfc3339_ms);
         match obj.get("type").and_then(|t| t.as_str()) {
             Some("session_meta") => {
-                // 本文件的创建时刻:早于它的 token_count 只能是 fork/resume
-                // 复制进来的父会话历史(复制行原样保留原时间戳)
-                if meta_ts.is_none() {
+                meta_count += 1;
+                if let Some(ts) = line_ts {
+                    last_meta_ts = Some(last_meta_ts.map_or(ts, |m| m.max(ts)));
+                }
+                // 身份字段只认首个 meta：后续 meta 是 subagent/fork 复制进来的
+                // 父会话头，覆盖会把本会话记成父 ID（Top Session 点开错会话）
+                if meta_count == 1 {
+                    // 本文件的创建时刻:早于它的 token_count 只能是 fork/resume
+                    // 复制进来的父会话历史(复制行原样保留原时间戳)
                     meta_ts = line_ts;
-                }
-                if let Some(meta) = crate::ai_sessions::codex_meta_from_line(line) {
-                    session_id = meta.id;
-                    if !meta.cwd.is_empty() {
-                        cwd = Some(meta.cwd);
+                    if let Some(meta) = crate::ai_sessions::codex_meta_from_line(line) {
+                        session_id = meta.id;
+                        if !meta.cwd.is_empty() {
+                            cwd = Some(meta.cwd);
+                        }
                     }
+                    provider = obj
+                        .pointer("/payload/model_provider")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(String::from);
                 }
-                provider = obj
-                    .pointer("/payload/model_provider")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .map(String::from);
             }
             Some("turn_context") => {
                 // model 每回合记录且一个会话可跨多模型：随行更新，后续 token_count 用当前值
@@ -453,6 +471,16 @@ pub(crate) fn parse_codex_session(
                 if let (Some(ts), Some(meta)) = (line_ts, meta_ts) {
                     if ts < meta {
                         continue;
+                    }
+                }
+                // 0.146+ 复制块截断:文件含 ≥2 个 session_meta 即带复制历史,
+                // 复制行时间戳被改写为复制时刻(聚在 meta 附近、晚于 meta),
+                // 真实 turn 在秒级模型往返之后——按 last_meta + 容差挡住
+                if meta_count >= 2 {
+                    if let (Some(ts), Some(last)) = (line_ts, last_meta_ts) {
+                        if ts <= last + LINEAGE_EPSILON_MS {
+                            continue;
+                        }
                     }
                 }
                 // 同一事件被重复写入(相邻行同时间戳同用量)只算一次;
@@ -529,6 +557,19 @@ mod tests {
     }
 
     #[test]
+    fn claude_zero_usage_turns_are_dropped() {
+        // m1 全程 usage 全 0(无后续覆盖)→ 不是计费调用,不得虚增 calls;
+        // m2 有计费维度 → 保留
+        let lines = [
+            r#"{"type":"assistant","timestamp":"2026-08-01T10:00:00Z","message":{"id":"m1","model":"claude-opus-4-8","usage":{"input_tokens":0,"output_tokens":0}}}"#,
+            r#"{"type":"assistant","timestamp":"2026-08-01T10:01:00Z","message":{"id":"m2","model":"claude-opus-4-8","usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":9}}}"#,
+        ];
+        let (turns, _, _) = claude_turns_from_lines(lines.iter().copied());
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].message_id.as_deref(), Some("m2"));
+    }
+
+    #[test]
     fn claude_usage_merges_same_message_id_keeping_larger_total() {
         let lines = [
             r#"{"type":"assistant","timestamp":"2026-08-01T10:00:00Z","message":{"id":"m1","model":"claude-opus-4-8","usage":{"input_tokens":0,"output_tokens":0}}}"#,
@@ -594,6 +635,34 @@ mod tests {
         assert_eq!(u.cache_read, 800);
         assert_eq!(u.output, 100);
         assert_eq!(u.reasoning, 20);
+    }
+
+    #[test]
+    fn codex_subagent_rewritten_copy_block_not_double_counted_and_keeps_child_id() {
+        // Codex 0.146+ subagent rollout 实测形状:child meta 与复制进来的
+        // parent meta 同毫秒,复制的父历史 token_count 时间戳被改写为复制
+        // 时刻(+1ms,晚于 meta)→ 仅靠 ts < meta_ts 挡不住;
+        // 第二个 meta 也不得把会话身份覆盖成父 ID
+        let root = std::env::temp_dir().join(format!(
+            "mini-term-turns-subagent-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let child_meta = r#"{"type":"session_meta","timestamp":"2026-08-03T08:21:47.505Z","payload":{"id":"sess-child","cwd":"/p"}}"#;
+        let parent_meta = r#"{"type":"session_meta","timestamp":"2026-08-03T08:21:47.505Z","payload":{"id":"sess-parent","cwd":"/p"}}"#;
+        let copied = r#"{"type":"event_msg","timestamp":"2026-08-03T08:21:47.506Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"output_tokens":50,"total_tokens":150}}}}"#;
+        let real = r#"{"type":"event_msg","timestamp":"2026-08-03T08:22:31.000Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":20,"output_tokens":9,"total_tokens":29}}}}"#;
+        let f = root.join("rollout-child.jsonl");
+        std::fs::write(&f, format!("{child_meta}\n{parent_meta}\n{copied}\n{real}\n")).unwrap();
+
+        let p = parse_codex_session(&f, &HashMap::new()).unwrap();
+        assert_eq!(p.session_id, "sess-child", "身份只认首个 meta,不得被父 meta 覆盖");
+        assert_eq!(p.turns.len(), 1, "改写时间戳的复制历史不得重复计费");
+        assert_eq!(p.turns[0].usage.input, 20);
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
