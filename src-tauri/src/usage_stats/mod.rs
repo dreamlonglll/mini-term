@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -17,6 +18,12 @@ use pricing::{ModelPrice, PricingTable};
 /// 代际取消：新请求 / cancel 都令计数 +1，worker 每处理一个文件比对代际，
 /// 不等即静默退出（对齐 search.rs 的 start/cancel 模式，前端同样按 requestId 双保险）。
 static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// 解析缓存：文件解析与扫描参数无关，按「主文件路径 → (粗筛 mtime, 解析结果)」
+/// 跨扫描复用——重扫/切参数只重新解析有变化的文件（增量追加），不再全量重解析。
+/// 条目数以磁盘会话文件数为上限，不做淘汰（被删文件的残留条目只占少量内存）。
+static PARSE_CACHE: OnceLock<Mutex<HashMap<PathBuf, (i64, turns::ParsedSession)>>> =
+    OnceLock::new();
 
 const FLUSH_EVERY_FILES: usize = 16;
 const FLUSH_EVERY: Duration = Duration::from_millis(250);
@@ -255,9 +262,38 @@ fn run_scan(app: &AppHandle, my_gen: u64, params: &ScanParams, pricing: PricingT
         if GENERATION.load(Ordering::SeqCst) != my_gen {
             return; // 已被新请求/取消淘汰，静默退出
         }
-        let parsed = match job {
-            SessionJob::Claude { main, subagents } => turns::parse_claude_session(main, subagents),
-            SessionJob::Codex { path } => turns::parse_codex_session(path, &thread_names),
+        let cache_key = match job {
+            SessionJob::Claude { main, .. } => main,
+            SessionJob::Codex { path } => path,
+        };
+        let job_mtime = job.mtime_ms();
+        let cache = PARSE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        // 命中(路径 + mtime 一致)直接复用解析结果;未命中才解析并回填
+        let parsed = {
+            let hit = cache
+                .lock()
+                .unwrap()
+                .get(cache_key)
+                .filter(|(m, _)| *m == job_mtime)
+                .map(|(_, s)| s.clone());
+            match hit {
+                Some(s) => Some(s),
+                None => {
+                    let p = match job {
+                        SessionJob::Claude { main, subagents } => {
+                            turns::parse_claude_session(main, subagents)
+                        }
+                        SessionJob::Codex { path } => turns::parse_codex_session(path, &thread_names),
+                    };
+                    if let Some(ref s) = p {
+                        cache
+                            .lock()
+                            .unwrap()
+                            .insert(cache_key.clone(), (job_mtime, s.clone()));
+                    }
+                    p
+                }
+            }
         };
         if let Some(mut s) = parsed {
             // 单项目 scope 的 cwd 终判:Claude 已按目录直达(此处双保险),

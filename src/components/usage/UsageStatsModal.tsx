@@ -84,12 +84,40 @@ function Segmented<T extends string>({
 /** 区块卡片：左侧竖条标题 + 内容 */
 function Section({ title, children }: { title: string; children: ReactNode }) {
   return (
-    <div className="border border-[var(--border-subtle)] rounded-[var(--radius-md)] bg-[var(--bg-elevated)]/40 px-4 py-3.5">
+    <div className="border border-[var(--border-subtle)] rounded-[var(--radius-md)] bg-[var(--bg-elevated)]/40 px-4 py-3.5 shadow-sm">
       <div className="flex items-center gap-2 mb-3">
         <span className="w-0.5 h-3.5 rounded-full bg-[var(--color-info)]" />
         <span className="text-sm font-semibold text-[var(--text-primary)]">{title}</span>
       </div>
       {children}
+    </div>
+  );
+}
+
+function SkeletonBlock({ className }: { className: string }) {
+  return (
+    <div
+      className={`animate-pulse rounded-[var(--radius-md)] bg-[var(--border-subtle)] ${className}`}
+    />
+  );
+}
+
+/** 与真实布局同形的骨架占位(仅首次无任何快照时出现)，避免「转圈 → 完整布局」跳变 */
+function BodySkeleton() {
+  return (
+    <div className="space-y-4" aria-hidden>
+      <div className="grid grid-cols-4 gap-3">
+        {[0, 1, 2, 3].map((i) => (
+          <SkeletonBlock key={i} className="h-[66px]" />
+        ))}
+      </div>
+      <SkeletonBlock className="h-4 w-80" />
+      <SkeletonBlock className="h-[280px]" />
+      <div className="flex gap-4">
+        {[0, 1, 2].map((i) => (
+          <SkeletonBlock key={i} className="flex-1 h-[200px]" />
+        ))}
+      </div>
     </div>
   );
 }
@@ -225,7 +253,7 @@ export function UsageStatsModal({ open, onClose }: { open: boolean; onClose: () 
       />
     );
   } else if (!stats) {
-    body = <StateHint text={t('usageStats.scanning')} spinning />;
+    body = <BodySkeleton />;
   } else if (phase === 'done' && stats.sessionCount === 0) {
     body = <StateHint text={t('usageStats.empty')} />;
   } else {
@@ -235,7 +263,7 @@ export function UsageStatsModal({ open, onClose }: { open: boolean; onClose: () 
       first && metric(first) > 0 ? metric(x) / metric(first) : 0;
 
     body = (
-      <div className="space-y-4">
+      <div className="space-y-4 usage-fade-in">
         <KpiCards stats={stats} />
 
         {/* Token 副行：in / out / cached / written */}

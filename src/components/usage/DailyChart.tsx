@@ -2,6 +2,7 @@ import { useLayoutEffect, useRef, useState } from 'react';
 import { useT } from '../../i18n';
 import type { UsageDailyStat, UsageRange } from '../../types';
 import { formatCost, formatCount, formatTokens } from './format';
+import { useTweenedNumbers } from './useTween';
 
 /** 轴上限取 1/2/2.5/5×10ⁿ 阶梯，让刻度值可读 */
 function niceMax(v: number): number {
@@ -145,15 +146,18 @@ function ChartSvg({ daily, width }: { daily: UsageDailyStat[]; width: number }) 
   const plotH = H - PAD_T - PAD_B;
   const slot = plotW / n;
 
-  const costMax = niceMax(Math.max(...daily.map((d) => d.cost)));
-  const callsMax = niceMax(Math.max(...daily.map((d) => d.calls)));
+  // 几何走补间值(数据更新时折线/柱平滑过渡),hover 文案仍用真实值
+  const costs = useTweenedNumbers(daily.map((d) => d.cost));
+  const calls = useTweenedNumbers(daily.map((d) => d.calls));
+  const costMax = niceMax(Math.max(...costs));
+  const callsMax = niceMax(Math.max(...calls));
 
   const yCost = (v: number) => PAD_T + plotH * (1 - v / costMax);
   const yCalls = (v: number) => PAD_T + plotH * (1 - v / callsMax);
   const xMid = (i: number) => PAD_L + slot * (i + 0.5);
 
-  const linePath = daily
-    .map((d, i) => `${i === 0 ? 'M' : 'L'}${xMid(i).toFixed(1)},${yCost(d.cost).toFixed(1)}`)
+  const linePath = costs
+    .map((c, i) => `${i === 0 ? 'M' : 'L'}${xMid(i).toFixed(1)},${yCost(c).toFixed(1)}`)
     .join('');
   const baseline = PAD_T + plotH;
   const areaPath = `${linePath}L${xMid(n - 1).toFixed(1)},${baseline}L${xMid(0).toFixed(1)},${baseline}Z`;
@@ -199,13 +203,13 @@ function ChartSvg({ daily, width }: { daily: UsageDailyStat[]; width: number }) 
         })}
 
         {/* calls 柱（右轴） */}
-        {daily.map((d, i) => (
+        {daily.map((_, i) => (
           <rect
             key={`b${i}`}
             x={xMid(i) - barW / 2}
-            y={yCalls(d.calls)}
+            y={yCalls(calls[i])}
             width={barW}
-            height={Math.max(baseline - yCalls(d.calls), 0)}
+            height={Math.max(baseline - yCalls(calls[i]), 0)}
             rx={Math.min(2, barW / 2)}
             fill="var(--text-muted)"
             opacity={hover === i ? 0.5 : 0.28}
@@ -216,8 +220,8 @@ function ChartSvg({ daily, width }: { daily: UsageDailyStat[]; width: number }) 
         <path d={areaPath} fill="url(#usage-daily-area)" />
         <path d={linePath} fill="none" stroke="var(--accent)" strokeWidth="1.8" strokeLinejoin="round" />
         {dotR > 0 &&
-          daily.map((d, i) => (
-            <circle key={`p${i}`} cx={xMid(i)} cy={yCost(d.cost)} r={dotR} fill="var(--accent)" />
+          daily.map((_, i) => (
+            <circle key={`p${i}`} cx={xMid(i)} cy={yCost(costs[i])} r={dotR} fill="var(--accent)" />
           ))}
 
         {/* hover 参考线 + 高亮点 */}
@@ -233,7 +237,7 @@ function ChartSvg({ daily, width }: { daily: UsageDailyStat[]; width: number }) 
             />
             <circle
               cx={xMid(hover)}
-              cy={yCost(daily[hover].cost)}
+              cy={yCost(costs[hover])}
               r={4}
               fill="var(--accent)"
               stroke="var(--bg-surface)"

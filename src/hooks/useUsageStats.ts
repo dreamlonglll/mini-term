@@ -74,6 +74,10 @@ interface UseUsageStatsResult {
   refresh: () => void;
 }
 
+/** 参数键 → 最近一次 done 整包快照（模块级，跨开关 Modal / 切参数保留）。
+ * 只作秒出的旧快照，每次仍会静默重扫校正——不是数据源，无需失效策略 */
+const statsCache = new Map<string, UsageStatsPayload>();
+
 /**
  * 统计数据流 hook：拉价 → start_usage_stats → 订阅三事件流式充实。
  * requestId 与后端代际取消双保险；关 Modal（open=false）即 cancel 停扫描。
@@ -113,19 +117,19 @@ export function useUsageStats(
       return;
     }
     let cancelled = false;
-    // 静默刷新：同参数重扫（自动/手动刷新）保留旧数据继续展示，新快照到达后
-    // 整包替换；切 scope/range 时旧数据已是错的，必须清空回骨架
+    // 静默刷新：只要手上有数据（同参数重扫保留旧数据；切参数命中快照缓存）就
+    // 保持展示，partial 不覆盖，新整包到达后替换；无缓存的新参数才清空回骨架
     const customKey = range === 'custom' ? `${customFrom}:${customTo}` : '';
     const params = `${agents}|${range}|${projectPath ?? ''}|${customKey}`;
     const paramsChanged = lastParamsRef.current !== params;
     lastParamsRef.current = params;
-    silentRef.current = !paramsChanged && statsRef.current !== null;
-    setPhase('pricing');
     if (paramsChanged) {
-      applyStats(null);
+      applyStats(statsCache.get(params) ?? null);
       setProcessed(0);
       setTotal(0);
     }
+    silentRef.current = statsRef.current !== null;
+    setPhase('pricing');
     setError('');
 
     (async () => {
@@ -187,6 +191,7 @@ export function useUsageStats(
     'usage-stats-done',
     useCallback((p) => {
       if (p.requestId !== requestIdRef.current) return;
+      statsCache.set(lastParamsRef.current, p.stats);
       applyStats(p.stats);
       setPhase('done');
     }, [applyStats]),
