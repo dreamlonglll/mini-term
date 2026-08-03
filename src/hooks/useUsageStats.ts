@@ -3,16 +3,16 @@ import { invoke } from '@tauri-apps/api/core';
 import { useTauriEvent } from './useTauriEvent';
 import { loadModelPricing } from '../utils/modelPricing';
 import type {
+  ModelPriceEntry,
   UsageAgentFilter,
+  UsageLedgerProgressPayload,
+  UsageLedgerSyncedPayload,
   UsageRange,
-  UsageStatsDonePayload,
-  UsageStatsErrorPayload,
   UsageStatsPayload,
-  UsageStatsProgressPayload,
 } from '../types';
 
-/** 渲染状态优先级（互斥）：pricingError ＞ pricing ＞ error ＞ scanning ＞ done */
-export type UsageStatsPhase = 'idle' | 'pricing' | 'pricingError' | 'scanning' | 'error' | 'done';
+/** 渲染状态优先级（互斥）：pricingError ＞ pricing ＞ error ＞ ready */
+export type UsageStatsPhase = 'pricing' | 'pricingError' | 'ready' | 'error';
 
 /** date input 的 "YYYY-MM-DD" 按本地时区解析(new Date(str) 会当 UTC 午夜,东侧时区错一天)。 */
 function parseLocalDate(s: string): Date | null {
@@ -44,8 +44,7 @@ function rangeSinceMs(range: UsageRange, customFrom: string): number {
       const from = parseLocalDate(customFrom);
       // 起始缺失/非法回落近 30 天,不让面板空转
       if (!from) return new Date(now.getFullYear(), now.getMonth(), now.getDate() - 29).getTime();
-      // date input 的 min 只标 :invalid 不拦截键入,这里兜底 clamp 到 1 年内,
-      // 防止久远起始日触发全历史扫描(设计上已移除 'all' 范围)
+      // date input 的 min 只标 :invalid 不拦截键入,这里兜底 clamp 到 1 年内
       const floor = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 364).getTime();
       return Math.max(from.getTime(), floor);
     }
@@ -60,27 +59,32 @@ function rangeUntilMs(range: UsageRange, customFrom: string, customTo: string): 
   // date input 的 min 只标 :invalid 不拦截键入,键盘可造出 from>to 的倒置区间;
   // 倒置时把上界抬到起始日(等效单日查询),避免静默全零
   const from = parseLocalDate(customFrom);
-  const day = from && from.getTime() > to.getTime() ? from : to;
+  let day = from && from.getTime() > to.getTime() ? from : to;
+  // 与 rangeSinceMs 的一年下限同步 clamp:两端都早于一年时退成下限当日的
+  // 单日窗口,而不是 since 被抬、until 不动产生的 since>until 倒置空窗
+  const now = new Date();
+  const floor = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 364);
+  if (day.getTime() < floor.getTime()) day = floor;
   return new Date(day.getFullYear(), day.getMonth(), day.getDate() + 1).getTime() - 1;
 }
 
 interface UseUsageStatsResult {
   phase: UsageStatsPhase;
-  /** 扫描中为 partial 快照，done 后为最终结果 */
   stats: UsageStatsPayload | null;
-  processed: number;
-  total: number;
+  /** backfill（账本首建全量同步）进度；非 backfill 期间恒 0/0 */
+  backfillProcessed: number;
+  backfillTotal: number;
   error: string;
+  /** 手动刷新：重拉价（若失败过）→ 重查 → 触发增量同步 */
   refresh: () => void;
+  /** 仅触发一次增量同步（自动刷新定时器用；数据有变由 synced 事件驱动重查） */
+  sync: () => void;
 }
 
-/** 参数键 → 最近一次 done 整包快照（模块级，跨开关 Modal / 切参数保留）。
- * 只作秒出的旧快照，每次仍会静默重扫校正——不是数据源，无需失效策略 */
-const statsCache = new Map<string, UsageStatsPayload>();
-
 /**
- * 统计数据流 hook：拉价 → start_usage_stats → 订阅三事件流式充实。
- * requestId 与后端代际取消双保险；关 Modal（open=false）即 cancel 停扫描。
+ * 统计数据流 hook（账本化）：展示只查账本（usage_ledger_query 毫秒级秒出），
+ * 增量同步在后台跑（usage_ledger_sync），synced 事件驱动重查。
+ * 切参数就是重新查询——无扫描态、无快照缓存、无静默机制。
  */
 export function useUsageStats(
   open: boolean,
@@ -92,121 +96,121 @@ export function useUsageStats(
   customFrom: string,
   customTo: string,
 ): UseUsageStatsResult {
-  const [phase, setPhase] = useState<UsageStatsPhase>('idle');
+  const [phase, setPhase] = useState<UsageStatsPhase>('pricing');
   const [stats, setStats] = useState<UsageStatsPayload | null>(null);
-  const [processed, setProcessed] = useState(0);
-  const [total, setTotal] = useState(0);
+  const [backfill, setBackfill] = useState({ processed: 0, total: 0 });
   const [error, setError] = useState('');
   const [refreshTick, setRefreshTick] = useState(0);
-  const requestIdRef = useRef('');
-  const lastParamsRef = useRef('');
+  /** 价格表跨开关 Modal 保留（loadModelPricing 另有 24h localStorage 缓存） */
+  const pricingRef = useRef<Record<string, ModelPriceEntry> | null>(null);
+  /** 查询竞态防护：只采纳最新一次查询的结果 */
+  const seqRef = useRef(0);
+  const openRef = useRef(open);
+  openRef.current = open;
+  /** stats/phase 的权威镜像：refresh effect 里判断状态用（不进依赖数组） */
   const statsRef = useRef<UsageStatsPayload | null>(null);
-  /** 静默刷新轮次：partial 不覆盖已展示的完整数据，只收 done 的整包替换 */
-  const silentRef = useRef(false);
+  const phaseRef = useRef<UsageStatsPhase>('pricing');
+  phaseRef.current = phase;
 
-  const applyStats = useCallback((s: UsageStatsPayload | null) => {
-    statsRef.current = s;
-    setStats(s);
-  }, []);
+  const query = useCallback(async () => {
+    if (!pricingRef.current || !openRef.current) return;
+    const seq = ++seqRef.current;
+    try {
+      const s = await invoke<UsageStatsPayload>('usage_ledger_query', {
+        agents,
+        sinceMs: rangeSinceMs(range, customFrom),
+        untilMs: rangeUntilMs(range, customFrom, customTo),
+        projectPath,
+        tzOffsetMinutes: new Date().getTimezoneOffset(),
+        // IANA 时区名:后端按每条记录自身时刻求偏移,DST 地区历史不错日;
+        // 解析失败时后端回落上面的固定偏移
+        tzName: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        hourly: range === 'today',
+        pricing: pricingRef.current,
+      });
+      if (seq === seqRef.current) {
+        // 内容未变就保留旧引用：整包替换会让整棵子树重渲染,recharts 会把
+        // 新引用当「数据变了」重启动画(连击下图形卡在起始帧,表现为消失)
+        const prev = statsRef.current;
+        const next = prev && JSON.stringify(prev) === JSON.stringify(s) ? prev : s;
+        statsRef.current = next;
+        setStats(next);
+        setPhase('ready');
+      }
+    } catch (e) {
+      if (seq === seqRef.current) {
+        setError(String(e));
+        setPhase('error');
+      }
+    }
+  }, [agents, range, projectPath, customFrom, customTo]);
+  const queryRef = useRef(query);
+  queryRef.current = query;
 
+  // 打开面板 / 手动刷新：拉价（缓存命中即瞬时）→ 后台增量同步。
+  // 已就绪(ready 且有数据)时刷新**只发 sync**——synced(added>0) 驱动重查,
+  // 与自动刷新完全同路径,账本没变时零请求零渲染;
+  // 仅拉价补查与错误恢复需要主动 query(sync added=0 时不会驱动查询)
   useEffect(() => {
-    if (!open) {
-      requestIdRef.current = '';
-      lastParamsRef.current = '';
-      setPhase('idle');
-      return;
-    }
+    if (!open) return;
     let cancelled = false;
-    // 静默刷新：只要手上有数据（同参数重扫保留旧数据；切参数命中快照缓存）就
-    // 保持展示，partial 不覆盖，新整包到达后替换；无缓存的新参数才清空回骨架
-    const customKey = range === 'custom' ? `${customFrom}:${customTo}` : '';
-    const params = `${agents}|${range}|${projectPath ?? ''}|${customKey}`;
-    const paramsChanged = lastParamsRef.current !== params;
-    lastParamsRef.current = params;
-    if (paramsChanged) {
-      applyStats(statsCache.get(params) ?? null);
-      setProcessed(0);
-      setTotal(0);
-    }
-    silentRef.current = statsRef.current !== null;
-    setPhase('pricing');
-    setError('');
-
     (async () => {
-      let pricing;
-      try {
-        pricing = await loadModelPricing();
-      } catch (e) {
-        if (!cancelled) {
-          setPhase('pricingError');
-          setError(String(e));
+      if (!pricingRef.current) {
+        setPhase('pricing');
+        setError('');
+        try {
+          pricingRef.current = await loadModelPricing();
+        } catch (e) {
+          if (!cancelled) {
+            setError(String(e));
+            setPhase('pricingError');
+          }
+          return;
         }
-        return;
+        if (cancelled) return;
+        queryRef.current();
+      } else if (statsRef.current === null || phaseRef.current === 'error') {
+        queryRef.current();
       }
-      if (cancelled) return;
-
-      const requestId = crypto.randomUUID();
-      requestIdRef.current = requestId;
-      setPhase('scanning');
-      try {
-        await invoke('start_usage_stats', {
-          requestId,
-          agents,
-          sinceMs: rangeSinceMs(range, customFrom),
-          untilMs: rangeUntilMs(range, customFrom, customTo),
-          projectPath,
-          tzOffsetMinutes: new Date().getTimezoneOffset(),
-          // IANA 时区名:后端按每条记录自身时刻求偏移,DST 地区历史不错日;
-          // 解析失败时后端回落上面的固定偏移
-          tzName: Intl.DateTimeFormat().resolvedOptions().timeZone,
-          hourly: range === 'today',
-          pricing,
-        });
-      } catch (e) {
-        if (!cancelled) {
-          setPhase('error');
-          setError(String(e));
-        }
-      }
+      invoke('usage_ledger_sync').catch(() => {});
     })();
-
     return () => {
       cancelled = true;
-      requestIdRef.current = '';
-      invoke('cancel_usage_stats').catch(() => {});
     };
-  }, [open, agents, range, projectPath, customFrom, customTo, refreshTick]);
+  }, [open, refreshTick]);
 
-  useTauriEvent<UsageStatsProgressPayload>(
-    'usage-stats-progress',
-    useCallback((p) => {
-      if (p.requestId !== requestIdRef.current) return;
-      if (!silentRef.current) applyStats(p.partial);
-      setProcessed(p.processed);
-      setTotal(p.total);
-    }, [applyStats]),
-  );
+  // 切参数 → 直接重新查询（毫秒级；价格未就绪时由上面的 effect 拉完价补查）
+  useEffect(() => {
+    if (!open) return;
+    query();
+  }, [open, query]);
 
-  useTauriEvent<UsageStatsDonePayload>(
-    'usage-stats-done',
-    useCallback((p) => {
-      if (p.requestId !== requestIdRef.current) return;
-      statsCache.set(lastParamsRef.current, p.stats);
-      applyStats(p.stats);
-      setPhase('done');
-    }, [applyStats]),
-  );
+  useTauriEvent<UsageLedgerProgressPayload>('usage-ledger-progress', (p) => {
+    if (openRef.current) setBackfill({ processed: p.processed, total: p.total });
+  });
 
-  useTauriEvent<UsageStatsErrorPayload>(
-    'usage-stats-error',
-    useCallback((p) => {
-      if (p.requestId !== requestIdRef.current) return;
-      setError(p.error);
-      setPhase('error');
-    }, []),
-  );
+  useTauriEvent<UsageLedgerSyncedPayload>('usage-ledger-synced', (p) => {
+    // 值未变时保留旧引用:每 5s 的空转 sync(added=0)不得触发重渲染
+    // (Modal 重渲染本身就会被 recharts 感知,见 DailyChart 的 buckets memo)
+    setBackfill((prev) =>
+      prev.processed === 0 && prev.total === 0 ? prev : { processed: 0, total: 0 },
+    );
+    // added = 0 表示账本无变化,跳过重查避免无谓重渲染
+    if (openRef.current && p.added > 0) queryRef.current();
+  });
 
   const refresh = useCallback(() => setRefreshTick((t) => t + 1), []);
+  const sync = useCallback(() => {
+    invoke('usage_ledger_sync').catch(() => {});
+  }, []);
 
-  return { phase, stats, processed, total, error, refresh };
+  return {
+    phase,
+    stats,
+    backfillProcessed: backfill.processed,
+    backfillTotal: backfill.total,
+    error,
+    refresh,
+    sync,
+  };
 }

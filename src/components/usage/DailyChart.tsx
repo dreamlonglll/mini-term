@@ -1,17 +1,16 @@
-import { useLayoutEffect, useRef, useState } from 'react';
+import { useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { useT } from '../../i18n';
+import {
+  Area,
+  Bar,
+  CartesianGrid,
+  ComposedChart,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from 'recharts';
 import type { UsageDailyStat, UsageRange } from '../../types';
 import { formatCost, formatCount, formatTokens } from './format';
-import { useTweenedNumbers } from './useTween';
-
-/** 轴上限取 1/2/2.5/5×10ⁿ 阶梯，让刻度值可读 */
-function niceMax(v: number): number {
-  if (v <= 0) return 1;
-  const base = Math.pow(10, Math.floor(Math.log10(v)));
-  const f = v / base;
-  const nf = f <= 1 ? 1 : f <= 2 ? 2 : f <= 2.5 ? 2.5 : f <= 5 ? 5 : 10;
-  return nf * base;
-}
 
 function axisCost(v: number): string {
   return v >= 1000 ? `$${(v / 1000).toFixed(1)}K` : `$${v.toFixed(2)}`;
@@ -22,7 +21,7 @@ function dayKey(d: Date): string {
 }
 
 /** 补齐空桶：今天视图从 00:00 到当前小时；日粒度补窗口（all 用数据首日）到今天。
- * 后端快照是稀疏的（只有有数据的桶），无活动时段补 0 才能画出图 5 那样的完整时间轴 */
+ * 后端快照是稀疏的（只有有数据的桶），无活动时段补 0 才能画出完整时间轴 */
 function fillBuckets(daily: UsageDailyStat[], range: UsageRange): UsageDailyStat[] {
   const map = new Map(daily.map((d) => [d.date, d]));
   const out: UsageDailyStat[] = [];
@@ -75,17 +74,62 @@ function fillBuckets(daily: UsageDailyStat[], range: UsageRange): UsageDailyStat
   return out;
 }
 
-const H = 232;
-const PAD_L = 52;
-const PAD_R = 44;
-const PAD_T = 10;
-const PAD_B = 20;
-const GRID_ROWS = 4;
+/** 悬浮详情：复用旧手绘版的行样式（色点 + 标签 + 右对齐数值）。
+ * 签名只取用到的字段（TooltipContentProps 的父类型,参数逆变兼容 v3 泛型）。 */
+function UsageTooltip({
+  active,
+  payload,
+}: {
+  active?: boolean;
+  payload?: ReadonlyArray<{ payload?: unknown }>;
+}) {
+  const t = useT();
+  if (!active || !payload || payload.length === 0) return null;
+  const d = payload[0].payload as UsageDailyStat;
+  return (
+    <div className="pointer-events-none min-w-[168px] px-3 py-2.5 rounded-[var(--radius-md)] border border-[var(--border-strong)] bg-[var(--bg-overlay)] shadow-[var(--shadow-overlay)]">
+      <div className="text-xs font-semibold text-[var(--text-primary)] mb-1.5">{d.date}</div>
+      {(
+        [
+          ['var(--color-info)', t('usageStats.tip.totalTokens'), formatTokens(d.inputTokens + d.outputTokens + d.cacheReadTokens)],
+          ['var(--color-success)', t('usageStats.tokens.in'), formatTokens(d.inputTokens)],
+          ['var(--color-error)', t('usageStats.tokens.out'), formatTokens(d.outputTokens)],
+          ['var(--color-warning)', t('usageStats.tokens.cached'), formatTokens(d.cacheReadTokens)],
+          ['var(--accent)', t('usageStats.tip.cost'), formatCost(d.cost)],
+          ['var(--text-muted)', t('usageStats.kpi.calls'), formatCount(d.calls)],
+        ] as const
+      ).map(([color, label, value]) => (
+        <div key={label} className="flex items-center gap-2 py-px text-xs">
+          <span className="w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ backgroundColor: color }} />
+          <span className="text-[var(--text-secondary)]">{label}</span>
+          <span className="flex-1 text-right font-medium text-[var(--text-primary)] tabular-nums">
+            {value}
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+const AXIS_TICK = { fontSize: 9, fill: 'var(--text-muted)' } as const;
+// 全部图表配置提成常量:recharts 的 points 由 data+布局计算,margin 等每次
+// render 新对象可能让 points 重算出新引用 → 动画被无谓重启(见 buckets memo 注释)
+const CHART_MARGIN = { top: 10, right: 4, bottom: 0, left: 4 } as const;
+const BAR_RADIUS: [number, number, number, number] = [2, 2, 0, 0];
+const DOT_BIG = { r: 2.5, fill: 'var(--accent)', strokeWidth: 0 } as const;
+const DOT_SMALL = { r: 1.8, fill: 'var(--accent)', strokeWidth: 0 } as const;
+const ACTIVE_DOT = { r: 4, fill: 'var(--accent)', stroke: 'var(--bg-surface)', strokeWidth: 1.5 } as const;
+const CURSOR = { stroke: 'var(--text-muted)', strokeDasharray: '3 3' } as const;
+const tickDate = (v: string) => (v.includes(':') ? v : v.slice(5));
+const tickCount = (v: number) => formatCount(Math.round(v));
 
 /**
- * 时段活动图：cost 折线（左轴）+ calls 柱（右轴），纯 SVG 不引图表库。
- * 「今天」按小时分桶，其余按日历日。hover 用原生 <title> 提示；
+ * 时段活动图（recharts v3）：cost 面积（左轴）+ calls 柱（右轴），
+ * 数据更新自带进入/补间动效。「今天」按小时分桶，其余按日历日；
  * 补齐后仍只有 1 个桶时退化为摘要卡（孤点图没有信息量）。
+ * 宽度自测而不用 ResponsiveContainer：数据整包替换引发回流时 WKWebView 的
+ * ResizeObserver 可能读到一拍 0 宽——RC 会就地渲染空图且不再自愈（表现为
+ * 图表消失,再刷新才回来）；这里沿用旧手绘版的「忽略瞬时 0 宽」守卫。
  */
 export function DailyChart({ daily, range }: { daily: UsageDailyStat[]; range: UsageRange }) {
   const t = useT();
@@ -95,8 +139,6 @@ export function DailyChart({ daily, range }: { daily: UsageDailyStat[]; range: U
   useLayoutEffect(() => {
     const el = containerRef.current;
     if (!el) return;
-    // 忽略瞬时 0 宽(数据整包替换引发回流时 RO 可能读到一拍 0):
-    // width 归 0 会卸载整个 ChartSvg,下一拍恢复重挂,表现为图表闪烁
     const measure = () => {
       const w = el.clientWidth;
       if (w > 0) setWidth(w);
@@ -107,20 +149,25 @@ export function DailyChart({ daily, range }: { daily: UsageDailyStat[]; range: U
     return () => ro.disconnect();
   }, []);
 
+  let content: ReactNode;
+  // recharts v3 按引用判定「数据变了→重启动画」(useAnimationId);buckets 必须
+  // memo——每次 render 新建数组会让任何一次父组件重渲染都重启动画,连击下
+  // 动画长期停在起始帧(clip 宽 0),表现为折线/柱整体消失
+  const buckets = useMemo(
+    () => (daily.length > 0 ? fillBuckets(daily, range) : []),
+    [daily, range],
+  );
+
   if (daily.length === 0) {
-    return (
+    content = (
       <div className="h-[232px] flex items-center justify-center text-sm text-[var(--text-muted)]">
         {t('usageStats.noDailyData')}
       </div>
     );
-  }
-
-  const buckets = fillBuckets(daily, range);
-
-  // 补齐后仍单桶（如 0 点刚过打开「今天」）：摘要卡
-  if (buckets.length === 1) {
+  } else if (buckets.length === 1) {
+    // 补齐后仍单桶（如 0 点刚过打开「今天」）：摘要卡
     const d = buckets[0];
-    return (
+    content = (
       <div className="h-[232px] flex flex-col items-center justify-center gap-1.5">
         <div className="text-xs text-[var(--text-muted)]">{d.date}</div>
         <div className="text-3xl font-bold text-[var(--accent)]">{formatCost(d.cost)}</div>
@@ -129,184 +176,78 @@ export function DailyChart({ daily, range }: { daily: UsageDailyStat[]; range: U
         </div>
       </div>
     );
-  }
-
-  return (
-    <div ref={containerRef} className="w-full">
-      {width > 0 && <ChartSvg daily={buckets} width={width} />}
-    </div>
-  );
-}
-
-function ChartSvg({ daily, width }: { daily: UsageDailyStat[]; width: number }) {
-  const t = useT();
-  const [hover, setHover] = useState<number | null>(null);
-  const n = daily.length;
-  const plotW = Math.max(width - PAD_L - PAD_R, 10);
-  const plotH = H - PAD_T - PAD_B;
-  const slot = plotW / n;
-
-  // 几何走补间值(数据更新时折线/柱平滑过渡),hover 文案仍用真实值
-  const costs = useTweenedNumbers(daily.map((d) => d.cost));
-  const calls = useTweenedNumbers(daily.map((d) => d.calls));
-  const costMax = niceMax(Math.max(...costs));
-  const callsMax = niceMax(Math.max(...calls));
-
-  const yCost = (v: number) => PAD_T + plotH * (1 - v / costMax);
-  const yCalls = (v: number) => PAD_T + plotH * (1 - v / callsMax);
-  const xMid = (i: number) => PAD_L + slot * (i + 0.5);
-
-  const linePath = costs
-    .map((c, i) => `${i === 0 ? 'M' : 'L'}${xMid(i).toFixed(1)},${yCost(c).toFixed(1)}`)
-    .join('');
-  const baseline = PAD_T + plotH;
-  const areaPath = `${linePath}L${xMid(n - 1).toFixed(1)},${baseline}L${xMid(0).toFixed(1)},${baseline}Z`;
-
-  const dotR = n <= 40 ? 2.5 : n <= 90 ? 1.8 : 0;
-  const barW = Math.min(Math.max(slot * 0.55, 1), 14);
-  const labelStep = Math.ceil(n / 6);
-  const hovered = hover !== null ? daily[hover] : null;
-
-  return (
-    <div className="relative" onMouseLeave={() => setHover(null)}>
-      <svg width={width} height={H} className="block select-none">
+  } else if (width > 0) {
+    const dot = buckets.length <= 40 ? DOT_BIG : buckets.length <= 90 ? DOT_SMALL : false;
+    content = (
+      <ComposedChart width={width} height={232} data={buckets} margin={CHART_MARGIN}>
         <defs>
           <linearGradient id="usage-daily-area" x1="0" y1="0" x2="0" y2="1">
             <stop offset="0%" stopColor="var(--accent)" stopOpacity="0.3" />
             <stop offset="100%" stopColor="var(--accent)" stopOpacity="0.02" />
           </linearGradient>
         </defs>
+        {/* v3:多 YAxis 下 grid 必须显式指定 yAxisId,否则不渲染 */}
+        <CartesianGrid
+          yAxisId="cost"
+          vertical={false}
+          strokeDasharray="3 4"
+          stroke="var(--border-default)"
+        />
+        <XAxis
+          dataKey="date"
+          tickFormatter={tickDate}
+          tick={AXIS_TICK}
+          axisLine={false}
+          tickLine={false}
+          minTickGap={24}
+        />
+        <YAxis
+          yAxisId="cost"
+          orientation="left"
+          width={52}
+          tickFormatter={axisCost}
+          tick={AXIS_TICK}
+          axisLine={false}
+          tickLine={false}
+        />
+        <YAxis
+          yAxisId="calls"
+          orientation="right"
+          width={44}
+          tickFormatter={tickCount}
+          tick={AXIS_TICK}
+          axisLine={false}
+          tickLine={false}
+        />
+        <Bar
+          yAxisId="calls"
+          dataKey="calls"
+          fill="var(--text-muted)"
+          opacity={0.28}
+          radius={BAR_RADIUS}
+          maxBarSize={14}
+          animationDuration={400}
+        />
+        <Area
+          yAxisId="cost"
+          type="monotone"
+          dataKey="cost"
+          stroke="var(--accent)"
+          strokeWidth={1.8}
+          fill="url(#usage-daily-area)"
+          dot={dot}
+          activeDot={ACTIVE_DOT}
+          animationDuration={400}
+        />
+        {/* SVG 无 z-index,层叠按 JSX 顺序,Tooltip 保持最后 */}
+        <Tooltip content={UsageTooltip} cursor={CURSOR} />
+      </ComposedChart>
+    );
+  }
 
-        {/* 网格 + 双轴刻度 */}
-        {Array.from({ length: GRID_ROWS + 1 }, (_, r) => {
-          const y = PAD_T + (plotH * r) / GRID_ROWS;
-          const costV = costMax * (1 - r / GRID_ROWS);
-          const callsV = callsMax * (1 - r / GRID_ROWS);
-          return (
-            <g key={r}>
-              <line
-                x1={PAD_L}
-                y1={y}
-                x2={width - PAD_R}
-                y2={y}
-                stroke="var(--border-default)"
-                strokeDasharray={r === GRID_ROWS ? undefined : '3 4'}
-              />
-              <text x={PAD_L - 6} y={y + 3} textAnchor="end" fontSize="9" fill="var(--text-muted)">
-                {axisCost(costV)}
-              </text>
-              <text x={width - PAD_R + 6} y={y + 3} textAnchor="start" fontSize="9" fill="var(--text-muted)">
-                {formatCount(Math.round(callsV))}
-              </text>
-            </g>
-          );
-        })}
-
-        {/* calls 柱（右轴） */}
-        {daily.map((_, i) => (
-          <rect
-            key={`b${i}`}
-            x={xMid(i) - barW / 2}
-            y={yCalls(calls[i])}
-            width={barW}
-            height={Math.max(baseline - yCalls(calls[i]), 0)}
-            rx={Math.min(2, barW / 2)}
-            fill="var(--text-muted)"
-            opacity={hover === i ? 0.5 : 0.28}
-          />
-        ))}
-
-        {/* cost 面积 + 折线 + 数据点（左轴） */}
-        <path d={areaPath} fill="url(#usage-daily-area)" />
-        <path d={linePath} fill="none" stroke="var(--accent)" strokeWidth="1.8" strokeLinejoin="round" />
-        {dotR > 0 &&
-          daily.map((_, i) => (
-            <circle key={`p${i}`} cx={xMid(i)} cy={yCost(costs[i])} r={dotR} fill="var(--accent)" />
-          ))}
-
-        {/* hover 参考线 + 高亮点 */}
-        {hover !== null && (
-          <g pointerEvents="none">
-            <line
-              x1={xMid(hover)}
-              y1={PAD_T}
-              x2={xMid(hover)}
-              y2={baseline}
-              stroke="var(--text-muted)"
-              strokeDasharray="3 3"
-            />
-            <circle
-              cx={xMid(hover)}
-              cy={yCost(costs[hover])}
-              r={4}
-              fill="var(--accent)"
-              stroke="var(--bg-surface)"
-              strokeWidth="1.5"
-            />
-          </g>
-        )}
-
-        {/* X 轴稀疏标签（小时桶 "HH:00" 原样，日桶截成 MM-DD） */}
-        {daily.map((d, i) =>
-          i % labelStep === 0 || i === n - 1 ? (
-            <text
-              key={`x${i}`}
-              x={xMid(i)}
-              y={H - 6}
-              textAnchor="middle"
-              fontSize="9"
-              fill="var(--text-muted)"
-            >
-              {d.date.includes(':') ? d.date : d.date.slice(5)}
-            </text>
-          ) : null,
-        )}
-
-        {/* hover 命中区 */}
-        {daily.map((_, i) => (
-          <rect
-            key={`h${i}`}
-            x={PAD_L + slot * i}
-            y={PAD_T}
-            width={slot}
-            height={plotH}
-            fill="transparent"
-            onMouseEnter={() => setHover(i)}
-          />
-        ))}
-      </svg>
-
-      {/* 悬浮详情（跟随命中列，过半宽自动翻到左侧） */}
-      {hovered && hover !== null && (
-        <div
-          className="absolute top-2 z-10 pointer-events-none min-w-[168px] px-3 py-2.5 rounded-[var(--radius-md)] border border-[var(--border-strong)] bg-[var(--bg-overlay)] shadow-[var(--shadow-overlay)]"
-          style={
-            xMid(hover) <= width / 2
-              ? { left: Math.round(xMid(hover)) + 10 }
-              : { right: Math.round(width - xMid(hover)) + 10 }
-          }
-        >
-          <div className="text-xs font-semibold text-[var(--text-primary)] mb-1.5">{hovered.date}</div>
-          {(
-            [
-              ['var(--color-info)', t('usageStats.tip.totalTokens'), formatTokens(hovered.inputTokens + hovered.outputTokens + hovered.cacheReadTokens)],
-              ['var(--color-success)', t('usageStats.tokens.in'), formatTokens(hovered.inputTokens)],
-              ['var(--color-error)', t('usageStats.tokens.out'), formatTokens(hovered.outputTokens)],
-              ['var(--color-warning)', t('usageStats.tokens.cached'), formatTokens(hovered.cacheReadTokens)],
-              ['var(--accent)', t('usageStats.tip.cost'), formatCost(hovered.cost)],
-              ['var(--text-muted)', t('usageStats.kpi.calls'), formatCount(hovered.calls)],
-            ] as const
-          ).map(([color, label, value]) => (
-            <div key={label} className="flex items-center gap-2 py-px text-xs">
-              <span className="w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ backgroundColor: color }} />
-              <span className="text-[var(--text-secondary)]">{label}</span>
-              <span className="flex-1 text-right font-medium text-[var(--text-primary)] tabular-nums">
-                {value}
-              </span>
-            </div>
-          ))}
-        </div>
-      )}
+  return (
+    <div ref={containerRef} className="w-full">
+      {content}
     </div>
   );
 }

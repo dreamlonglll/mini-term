@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useState, type ReactNode } from 'react';
 import { Modal, ModalCloseButton } from '../Modal';
 import { SessionViewerModal } from '../SessionViewerModal';
 import { useUsageStats } from '../../hooks/useUsageStats';
@@ -15,6 +15,8 @@ const SCOPE_KEY = 'mini-term-usage-scope';
 const RANGE_KEY = 'mini-term-usage-range';
 const PROJECT_KEY = 'mini-term-usage-project';
 const AUTO_REFRESH_KEY = 'mini-term-usage-autorefresh';
+const CUSTOM_FROM_KEY = 'mini-term-usage-custom-from';
+const CUSTOM_TO_KEY = 'mini-term-usage-custom-to';
 
 /** 自动刷新档位（秒）；0 = 关闭 */
 const AUTO_REFRESH_OPTIONS = [0, 5, 10, 30, 60] as const;
@@ -48,6 +50,17 @@ function localDateStr(daysBack: number): string {
   const d = new Date();
   d.setDate(d.getDate() - daysBack);
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+/** custom 起止日期的持久化读取：非法/缺失回落默认（重启后 custom 视图不漂移） */
+function loadDatePref(key: string, fallback: string): string {
+  try {
+    const v = localStorage.getItem(key);
+    if (v && /^\d{4}-\d{2}-\d{2}$/.test(v)) return v;
+  } catch {
+    /* localStorage 不可用则用默认值 */
+  }
+  return fallback;
 }
 
 function Segmented<T extends string>({
@@ -143,16 +156,16 @@ export function UsageStatsModal({ open, onClose }: { open: boolean; onClose: () 
   });
   const effectiveProject =
     projectPath && projects.some((p) => p.path === projectPath) ? projectPath : null;
-  // custom range 起止(本地日历日),默认近 30 天;input 的 min/max 约束上限 1 年
-  const [customFrom, setCustomFrom] = useState(() => localDateStr(29));
-  const [customTo, setCustomTo] = useState(() => localDateStr(0));
+  // custom range 起止(本地日历日),持久化,默认近 30 天;input 的 min/max 约束上限 1 年
+  const [customFrom, setCustomFrom] = useState(() => loadDatePref(CUSTOM_FROM_KEY, localDateStr(29)));
+  const [customTo, setCustomTo] = useState(() => loadDatePref(CUSTOM_TO_KEY, localDateStr(0)));
   const [autoRefresh, setAutoRefresh] = useState<number>(() => {
     const v = Number(loadPref(AUTO_REFRESH_KEY, AUTO_REFRESH_OPTIONS.map(String), '0'));
     return Number.isFinite(v) ? v : 0;
   });
   const [viewer, setViewer] = useState<UsageTopSessionStat | null>(null);
 
-  const { phase, stats, processed, total, error, refresh } = useUsageStats(
+  const { phase, stats, backfillProcessed, backfillTotal, error, refresh, sync } = useUsageStats(
     open,
     scope,
     range,
@@ -161,17 +174,12 @@ export function UsageStatsModal({ open, onClose }: { open: boolean; onClose: () 
     customTo,
   );
 
-  // 自动刷新：仅在上一轮扫描完成后触发（静默重扫），间隔内还在扫则跳过本拍，
-  // 避免扫描时长 > 间隔时永远扫不完
-  const phaseRef = useRef(phase);
-  phaseRef.current = phase;
+  // 自动刷新：定时触发增量同步（后端并发去重；数据有变由 synced 事件驱动重查）
   useEffect(() => {
     if (!open || autoRefresh <= 0) return;
-    const id = window.setInterval(() => {
-      if (phaseRef.current === 'done') refresh();
-    }, autoRefresh * 1000);
+    const id = window.setInterval(sync, autoRefresh * 1000);
     return () => window.clearInterval(id);
-  }, [open, autoRefresh, refresh]);
+  }, [open, autoRefresh, sync]);
 
   const changeScope = useCallback((v: UsageAgentFilter) => {
     setScope(v);
@@ -193,6 +201,14 @@ export function UsageStatsModal({ open, onClose }: { open: boolean; onClose: () 
   const changeAutoRefresh = useCallback((v: number) => {
     setAutoRefresh(v);
     savePref(AUTO_REFRESH_KEY, String(v));
+  }, []);
+  const changeCustomFrom = useCallback((v: string) => {
+    setCustomFrom(v);
+    savePref(CUSTOM_FROM_KEY, v);
+  }, []);
+  const changeCustomTo = useCallback((v: string) => {
+    setCustomTo(v);
+    savePref(CUSTOM_TO_KEY, v);
   }, []);
 
   const scopeLabel = (v: UsageAgentFilter) =>
@@ -230,8 +246,8 @@ export function UsageStatsModal({ open, onClose }: { open: boolean; onClose: () 
     return rows.map((r, i) => ({ ...r, ratio: metric(top[i]) / max }));
   };
 
-  // 状态优先级（互斥渲染）：价格失败(Retry) ＞ 价格加载中(仅无旧数据,静默
-  // 刷新期间保留主体防闪烁) ＞ 扫描错误 ＞ 骨架(无 partial) ＞ 空态 ＞ 主体。
+  // 状态优先级（互斥渲染）：价格失败(Retry) ＞ 价格加载中(仅无旧数据) ＞
+  // 查询错误 ＞ 骨架(查询未回 / backfill 进行中账本还空) ＞ 空态 ＞ 主体。
   // 价格未就绪且无旧数据时绝不渲染 KPI(全 0 会误导)
   let body: ReactNode;
   if (phase === 'pricingError') {
@@ -252,15 +268,19 @@ export function UsageStatsModal({ open, onClose }: { open: boolean; onClose: () 
         action={{ label: t('usageStats.retry'), onClick: refresh }}
       />
     );
-  } else if (!stats) {
+  } else if (!stats || (stats.sessionCount === 0 && backfillTotal > 0)) {
     body = <BodySkeleton />;
-  } else if (phase === 'done' && stats.sessionCount === 0) {
+  } else if (phase === 'ready' && stats.sessionCount === 0) {
     body = <StateHint text={t('usageStats.empty')} />;
   } else {
     /** 排行横条比例：相对榜首；成本全 $0（价格缺失）时按 tokens */
     const metric = (x: { cost: number; tokens: number }) => (stats.totalCost > 0 ? x.cost : x.tokens);
     const ratioOf = (x: { cost: number; tokens: number }, first?: { cost: number; tokens: number }) =>
       first && metric(first) > 0 ? metric(x) / metric(first) : 0;
+    /** cwd ↔ 登记项目路径匹配（大小写/分隔符/尾斜杠容错，对齐后端 normalize） */
+    const normPath = (p: string) => p.replace(/\//g, '\\').toLowerCase().replace(/\\+$/, '');
+    const registeredOf = (cwd: string) =>
+      cwd ? projects.find((rp) => normPath(rp.path) === normPath(cwd)) : undefined;
 
     body = (
       <div className="space-y-4 usage-fade-in">
@@ -298,14 +318,19 @@ export function UsageStatsModal({ open, onClose }: { open: boolean; onClose: () 
               <div className="max-h-[216px] overflow-y-auto">
                 <RankBarList
                   emptyText={t('usageStats.noSessions')}
-                  rows={stats.byProject.map((p) => ({
-                    key: p.path || p.name,
-                    label: p.name,
-                    ratio: ratioOf(p, stats.byProject[0]),
-                    primary: formatCost(p.cost),
-                    secondary: String(p.sessions),
-                    title: p.path,
-                  }))}
+                  rows={stats.byProject.map((p) => {
+                    // 设计 §2.2:点击已登记项目切入单项目 scope(未登记项目仅展示)
+                    const registered = registeredOf(p.path);
+                    return {
+                      key: p.path || p.name,
+                      label: p.name,
+                      ratio: ratioOf(p, stats.byProject[0]),
+                      primary: formatCost(p.cost),
+                      secondary: String(p.sessions),
+                      title: p.path,
+                      onClick: registered ? () => changeProject(registered.path) : undefined,
+                    };
+                  })}
                 />
               </div>
             </Section>
@@ -388,7 +413,7 @@ export function UsageStatsModal({ open, onClose }: { open: boolean; onClose: () 
                   value={customFrom}
                   min={localDateStr(364)}
                   max={customTo}
-                  onChange={(e) => setCustomFrom(e.target.value)}
+                  onChange={(e) => changeCustomFrom(e.target.value)}
                 />
                 <span className="text-xs text-[var(--text-muted)]">–</span>
                 <input
@@ -397,7 +422,7 @@ export function UsageStatsModal({ open, onClose }: { open: boolean; onClose: () 
                   value={customTo}
                   min={customFrom}
                   max={localDateStr(0)}
-                  onChange={(e) => setCustomTo(e.target.value)}
+                  onChange={(e) => changeCustomTo(e.target.value)}
                 />
               </span>
             )}
@@ -427,16 +452,17 @@ export function UsageStatsModal({ open, onClose }: { open: boolean; onClose: () 
         </div>
 
         <div className="flex-1 overflow-y-auto px-5 py-4">
-          {/* 副标题 + 扫描进度 */}
+          {/* 副标题 + backfill（账本首建）进度 */}
           <div className="flex items-center justify-between mb-3">
             <div className="text-sm text-[var(--text-secondary)]">
               <span className="font-semibold text-[var(--text-primary)]">{scopeLabel(scope)}</span>
               <span className="mx-1.5 text-[var(--text-muted)]">·</span>
               {rangeLabel(range)}
             </div>
-            {phase === 'scanning' && total > 0 && (
+            {backfillTotal > 0 && (
               <div className="text-xs text-[var(--text-muted)] tabular-nums">
-                {t('usageStats.progress', { processed, total })}
+                {t('usageStats.backfilling')}{' '}
+                {t('usageStats.progress', { processed: backfillProcessed, total: backfillTotal })}
               </div>
             )}
           </div>

@@ -56,6 +56,7 @@ uuid = { version = "1", features = ["v4"] }
 # 用量统计分桶按记录自身时刻求当地偏移(DST 地区历史记录不错日),chrono-tz 带 IANA 数据
 chrono = "0.4"
 chrono-tz = "0.10"
+rusqlite = { version = "0.40.1", features = ["bundled"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
