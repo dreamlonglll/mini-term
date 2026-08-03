@@ -19,6 +19,9 @@ const ENDED_SESSIONS_CAP: usize = 8;
 /// 每个 PTY 跟踪的活跃会话数量上限（正常只有 1 个；嵌套非交互实例/事件乱序
 /// 时短暂多个，上限只是防御事件丢失导致的累积）
 const ACTIVE_SESSIONS_CAP: usize = 8;
+/// 重试保持态的最长豁免时长:覆盖 API 指数退避的合理上限。超过后即使没有
+/// 后续 hook 事件(hook 丢失/进程被杀),也恢复「无输出降 ai-idle」兜底
+const RETRY_HOLD_MAX: std::time::Duration = std::time::Duration::from_secs(180);
 /// Hook 事件的 JSON payload
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)] // 保留完整字段供未来 UI 细化使用
@@ -79,10 +82,12 @@ pub struct HookState {
     /// `codex exec`，继承 MINITERM_PTY_ID）与"退出后立刻重开"的乱序场景下，
     /// pane 上还有别的活跃会话，误销毁会把正在工作的外层会话打回 idle。
     active_sessions: Arc<Mutex<HashMap<u32, VecDeque<String>>>>,
-    /// pty → 重试保持态:最近一个 hook 事件是 API 重试类 Notification。
+    /// pty → 重试保持态置位时刻:最近一个 hook 事件是 API 重试类 Notification。
     /// 重试等待期(退避可达数十秒)TUI 可能完全静止,monitor 的「无输出降 ai-idle」
     /// 兜底会把它误判为完成;置位期间豁免降级,下一个任何 hook 事件清除。
-    retry_hold: Arc<Mutex<std::collections::HashSet<u32>>>,
+    /// 带 RETRY_HOLD_MAX 时限:后续 hook 本身也可能丢失(网络断/进程被杀),
+    /// 超时后恢复兜底降级,避免 pane 永久卡在 ai-working。
+    retry_hold: Arc<Mutex<HashMap<u32, Instant>>>,
     port: Arc<Mutex<u16>>,
     /// 保存 server 实例，供运行时停止（Arc 共享给监听线程）
     server: Arc<Mutex<Option<Arc<tiny_http::Server>>>>,
@@ -97,7 +102,7 @@ impl HookState {
             hook_enabled: Arc::new(Mutex::new(std::collections::HashSet::new())),
             ended_sessions: Arc::new(Mutex::new(HashMap::new())),
             active_sessions: Arc::new(Mutex::new(HashMap::new())),
-            retry_hold: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            retry_hold: Arc::new(Mutex::new(HashMap::new())),
             port: Arc::new(Mutex::new(0)),
             server: Arc::new(Mutex::new(None)),
         }
@@ -145,16 +150,20 @@ impl HookState {
 
     /// 重试保持态读写:置位期间 monitor 不得凭「无输出超时」把 ai-working 降为 ai-idle。
     pub(crate) fn set_retry_hold(&self, pty_id: u32, hold: bool) {
-        let mut set = self.retry_hold.lock().unwrap();
+        let mut map = self.retry_hold.lock().unwrap();
         if hold {
-            set.insert(pty_id);
+            map.insert(pty_id, Instant::now());
         } else {
-            set.remove(&pty_id);
+            map.remove(&pty_id);
         }
     }
 
     pub fn is_retry_hold(&self, pty_id: u32) -> bool {
-        self.retry_hold.lock().unwrap().contains(&pty_id)
+        self.retry_hold
+            .lock()
+            .unwrap()
+            .get(&pty_id)
+            .is_some_and(|t| t.elapsed() < RETRY_HOLD_MAX)
     }
 
     /// 移除指定 PTY 的 hook 状态。不清墓碑：SessionEnd 打完墓碑后调用

@@ -46,8 +46,12 @@ function fillBuckets(daily: UsageDailyStat[], range: UsageRange): UsageDailyStat
   if (range === 'days7' || range === 'days30') {
     const daysBack = range === 'days7' ? 6 : 29;
     start = new Date(now.getFullYear(), now.getMonth(), now.getDate() - daysBack);
+  } else if (range === 'month' || range === 'months3' || range === 'months6') {
+    // 与 rangeSinceMs 同口径:对应月份的月初,x 轴跨度与所选范围一致
+    const monthsBack = range === 'month' ? 0 : range === 'months3' ? 2 : 5;
+    start = new Date(now.getFullYear(), now.getMonth() - monthsBack, 1);
   } else {
-    // month/months3/months6/custom:窗口起点不在本组件已知,从数据首日起补零
+    // custom:窗口起点不在本组件已知,从数据首日起补零
     const [y, m, d] = daily[0].date.split('-').map(Number);
     start = new Date(y, m - 1, d);
   }
@@ -90,9 +94,15 @@ export function DailyChart({ daily, range }: { daily: UsageDailyStat[]; range: U
   useLayoutEffect(() => {
     const el = containerRef.current;
     if (!el) return;
-    const ro = new ResizeObserver(() => setWidth(el.clientWidth));
+    // 忽略瞬时 0 宽(数据整包替换引发回流时 RO 可能读到一拍 0):
+    // width 归 0 会卸载整个 ChartSvg,下一拍恢复重挂,表现为图表闪烁
+    const measure = () => {
+      const w = el.clientWidth;
+      if (w > 0) setWidth(w);
+    };
+    const ro = new ResizeObserver(measure);
     ro.observe(el);
-    setWidth(el.clientWidth);
+    measure();
     return () => ro.disconnect();
   }, []);
 

@@ -261,12 +261,17 @@ fn run_scan(app: &AppHandle, my_gen: u64, params: &ScanParams, pricing: PricingT
         };
         if let Some(mut s) = parsed {
             // 单项目 scope 的 cwd 终判:Claude 已按目录直达(此处双保险),
-            // Codex rollout 无目录索引,只能解析后按 cwd 过滤(mtime 粗筛仍生效)
+            // Codex rollout 无目录索引,只能解析后按 cwd 过滤(mtime 粗筛仍生效)。
+            // 用与选目录一致的 normalize(大小写/分隔符容错)比较,并放行
+            // 子目录启动的会话(cwd 为项目路径的子路径)
             let in_scope = match params.project_path.as_deref() {
-                Some(proj) => s
-                    .cwd
-                    .as_deref()
-                    .is_some_and(|c| c.trim_end_matches(['/', '\\']) == proj.trim_end_matches(['/', '\\'])),
+                Some(proj) => {
+                    let proj = crate::ai_sessions::normalize_path(proj);
+                    s.cwd.as_deref().is_some_and(|c| {
+                        let c = crate::ai_sessions::normalize_path(c);
+                        c == proj || c.starts_with(&format!("{proj}\\"))
+                    })
+                }
                 None => true,
             };
             if in_scope {

@@ -44,17 +44,24 @@ function rangeSinceMs(range: UsageRange, customFrom: string): number {
       const from = parseLocalDate(customFrom);
       // 起始缺失/非法回落近 30 天,不让面板空转
       if (!from) return new Date(now.getFullYear(), now.getMonth(), now.getDate() - 29).getTime();
-      return from.getTime();
+      // date input 的 min 只标 :invalid 不拦截键入,这里兜底 clamp 到 1 年内,
+      // 防止久远起始日触发全历史扫描(设计上已移除 'all' 范围)
+      const floor = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 364).getTime();
+      return Math.max(from.getTime(), floor);
     }
   }
 }
 
 /** custom range 的窗口上界(含截止日全天);其余 range 开区间到现在。 */
-function rangeUntilMs(range: UsageRange, customTo: string): number | null {
+function rangeUntilMs(range: UsageRange, customFrom: string, customTo: string): number | null {
   if (range !== 'custom') return null;
   const to = parseLocalDate(customTo);
   if (!to) return null;
-  return new Date(to.getFullYear(), to.getMonth(), to.getDate() + 1).getTime() - 1;
+  // date input 的 min 只标 :invalid 不拦截键入,键盘可造出 from>to 的倒置区间;
+  // 倒置时把上界抬到起始日(等效单日查询),避免静默全零
+  const from = parseLocalDate(customFrom);
+  const day = from && from.getTime() > to.getTime() ? from : to;
+  return new Date(day.getFullYear(), day.getMonth(), day.getDate() + 1).getTime() - 1;
 }
 
 interface UseUsageStatsResult {
@@ -142,7 +149,7 @@ export function useUsageStats(
           requestId,
           agents,
           sinceMs: rangeSinceMs(range, customFrom),
-          untilMs: rangeUntilMs(range, customTo),
+          untilMs: rangeUntilMs(range, customFrom, customTo),
           projectPath,
           tzOffsetMinutes: new Date().getTimezoneOffset(),
           // IANA 时区名:后端按每条记录自身时刻求偏移,DST 地区历史不错日;

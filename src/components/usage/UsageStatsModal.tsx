@@ -202,8 +202,9 @@ export function UsageStatsModal({ open, onClose }: { open: boolean; onClose: () 
     return rows.map((r, i) => ({ ...r, ratio: metric(top[i]) / max }));
   };
 
-  // 状态优先级（互斥渲染）：价格失败(Retry) ＞ 价格加载中 ＞ 扫描错误 ＞
-  // 骨架(无 partial) ＞ 空态 ＞ 主体。价格未就绪时绝不渲染 KPI(全 0 会误导)
+  // 状态优先级（互斥渲染）：价格失败(Retry) ＞ 价格加载中(仅无旧数据,静默
+  // 刷新期间保留主体防闪烁) ＞ 扫描错误 ＞ 骨架(无 partial) ＞ 空态 ＞ 主体。
+  // 价格未就绪且无旧数据时绝不渲染 KPI(全 0 会误导)
   let body: ReactNode;
   if (phase === 'pricingError') {
     body = (
@@ -213,7 +214,7 @@ export function UsageStatsModal({ open, onClose }: { open: boolean; onClose: () 
         action={{ label: t('usageStats.retry'), onClick: refresh }}
       />
     );
-  } else if (phase === 'pricing') {
+  } else if (phase === 'pricing' && !stats) {
     body = <StateHint text={t('usageStats.pricingLoading')} spinning />;
   } else if (phase === 'error') {
     body = (
@@ -357,6 +358,7 @@ export function UsageStatsModal({ open, onClose }: { open: boolean; onClose: () 
                   type="date"
                   className="bg-[var(--bg-base)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-1.5 py-0.5 text-xs text-[var(--text-secondary)] focus:outline-none focus:border-[var(--accent)]"
                   value={customFrom}
+                  min={localDateStr(364)}
                   max={customTo}
                   onChange={(e) => setCustomFrom(e.target.value)}
                 />

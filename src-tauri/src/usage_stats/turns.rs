@@ -341,7 +341,9 @@ fn usage_from_codex(u: &serde_json::Value) -> UsageTotals {
 
 /// 解析一个 Codex rollout 文件（一文件一会话）。
 /// usage 优先取每条 token_count 的 `last_token_usage`（自带该轮 timestamp）；
-/// 缺失时对 `total_token_usage` 做相邻差分兜底。Codex 无 message id，不参与全局去重。
+/// 缺失时对 `total_token_usage` 做相邻差分兜底。Codex 无 message id，不参与
+/// 聚合层去重；fork/resume 复制进来的父会话历史在本函数内按「早于本文件
+/// session_meta 时刻」前缀跳过，防止跨 rollout 重复计费。
 pub(crate) fn parse_codex_session(
     path: &Path,
     thread_names: &HashMap<String, String>,
@@ -355,6 +357,7 @@ pub(crate) fn parse_codex_session(
     let mut model: Option<String> = None;
     let mut turns: Vec<Turn> = Vec::new();
     let mut prev_total = UsageTotals::default();
+    let mut meta_ts: Option<i64> = None;
 
     for line in &lines {
         let obj: serde_json::Value = match serde_json::from_str(line) {
@@ -367,6 +370,11 @@ pub(crate) fn parse_codex_session(
             .and_then(parse_rfc3339_ms);
         match obj.get("type").and_then(|t| t.as_str()) {
             Some("session_meta") => {
+                // 本文件的创建时刻:早于它的 token_count 只能是 fork/resume
+                // 复制进来的父会话历史(复制行原样保留原时间戳)
+                if meta_ts.is_none() {
+                    meta_ts = line_ts;
+                }
                 if let Some(meta) = crate::ai_sessions::codex_meta_from_line(line) {
                     session_id = meta.id;
                     if !meta.cwd.is_empty() {
@@ -439,18 +447,27 @@ pub(crate) fn parse_codex_session(
                 if usage.total() == 0 {
                     continue;
                 }
+                // 血缘前缀跳过:早于本文件 session_meta 时刻的事件是 fork/resume
+                // 复制来的父历史,已在父 rollout 计过账。差分基线 prev_total 已在
+                // 上方随行推进,跳过不影响 fork 后增量的正确性
+                if let (Some(ts), Some(meta)) = (line_ts, meta_ts) {
+                    if ts < meta {
+                        continue;
+                    }
+                }
+                // 同一事件被重复写入(相邻行同时间戳同用量)只算一次;
+                // 非相邻/跨文件的巧合碰撞不再误伤
+                if turns
+                    .last()
+                    .is_some_and(|t| t.timestamp_ms == line_ts && t.usage == usage)
+                {
+                    continue;
+                }
                 turns.push(Turn {
-                    // Codex rollout 无消息 id,合成稳定指纹供聚合层跨 rollout 去重
-                    // (fork 复制父会话历史、重复 token_count 行都会原样带着时间戳
-                    // 与用量)。不含 session_id:fork 出的新 rollout 换了 id,含了
-                    // 反而挡不住复制行。时间戳缺失时不合成(mtime 兜底跨文件不稳),
-                    // 宁可不去重也不误伤。
-                    message_id: line_ts.map(|ts| {
-                        format!(
-                            "codex:{}:{}:{}:{}:{}",
-                            ts, usage.input, usage.output, usage.reasoning, usage.cache_read
-                        )
-                    }),
+                    // Codex rollout 无消息 id:重复计费已在上方按血缘前缀与相邻
+                    // 重复处理,不再合成内容指纹参与聚合层去重(内容指纹会把
+                    // 同毫秒同用量的两个真实 turn 误判为重复)
+                    message_id: None,
                     model: model.clone(),
                     timestamp_ms: line_ts,
                     usage,
@@ -580,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_turns_get_synthetic_fingerprint_stable_across_rollouts() {
+    fn codex_fork_replay_prefix_skipped_and_duplicates_absorbed() {
         let root = std::env::temp_dir().join(format!(
             "mini-term-turns-test-{}",
             std::time::SystemTime::now()
@@ -589,25 +606,32 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&root).unwrap();
+        let meta_a = r#"{"type":"session_meta","timestamp":"2026-08-01T09:00:00.000Z","payload":{"id":"sess-a","cwd":"/p"}}"#;
         let l1 = r#"{"type":"event_msg","timestamp":"2026-08-01T10:00:00.000Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"output_tokens":50,"total_tokens":150}}}}"#;
         let l2 = r#"{"type":"event_msg","timestamp":"2026-08-01T10:00:05.000Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}}}}"#;
+        // 同毫秒同用量的两个真实 turn:内容一致但都是新增计费,不得互相吞掉
+        let l3 = r#"{"type":"event_msg","timestamp":"2026-08-01T11:00:00.000Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}}}}"#;
 
         let a = root.join("rollout-a.jsonl");
-        std::fs::write(&a, format!("{l1}\n{l2}\n")).unwrap();
-        // fork:新 rollout 原样复制父会话历史行,session id(此处回退文件名)不同
+        std::fs::write(&a, format!("{meta_a}\n{l1}\n{l2}\n{l2}\n{l3}\n")).unwrap();
+        // fork:新 rollout 原样复制父会话历史行(保留原时间戳),session_meta
+        // 是 fork 创建时刻,晚于复制行
+        let meta_b = r#"{"type":"session_meta","timestamp":"2026-08-01T12:00:00.000Z","payload":{"id":"sess-b","cwd":"/p"}}"#;
+        let l4 = r#"{"type":"event_msg","timestamp":"2026-08-01T12:30:00.000Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":20,"output_tokens":9,"total_tokens":29}}}}"#;
         let b = root.join("rollout-b.jsonl");
-        std::fs::write(&b, format!("{l1}\n")).unwrap();
+        std::fs::write(&b, format!("{meta_b}\n{l1}\n{l2}\n{l4}\n")).unwrap();
 
         let names = HashMap::new();
         let pa = parse_codex_session(&a, &names).unwrap();
         let pb = parse_codex_session(&b, &names).unwrap();
 
-        assert_eq!(pa.turns.len(), 2);
-        let id0 = pa.turns[0].message_id.as_ref().unwrap();
-        let id1 = pa.turns[1].message_id.as_ref().unwrap();
-        // 不同调用 → 指纹不同,不会误去重
-        assert_ne!(id0, id1);
-        // fork 复制的同一历史行 → 指纹一致,聚合层 seen_ids 跨 rollout 去重生效
-        assert_eq!(pb.turns[0].message_id.as_ref().unwrap(), id0);
+        // 父会话:l1 + l2 + l3 计入;相邻重复写入的 l2 只算一次;
+        // l3 与 l2 内容相同但非相邻,是真实 turn,不误伤
+        assert_eq!(pa.turns.len(), 3);
+        // fork 会话:复制的 l1/l2(早于 meta_b)被前缀跳过,只计 fork 后的 l4
+        assert_eq!(pb.turns.len(), 1);
+        assert_eq!(pb.turns[0].usage.input, 20);
+        // 不再合成内容指纹,不参与聚合层去重
+        assert!(pa.turns.iter().all(|t| t.message_id.is_none()));
     }
 }
