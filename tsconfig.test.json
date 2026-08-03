@@ -16,6 +16,7 @@
     "src/utils/themeManager.ts",
     "src/utils/terminalSnapshot.ts",
     "src/utils/ptyWriteQueue.ts",
-    "src/utils/wslPath.ts"
+    "src/utils/wslPath.ts",
+    "src/utils/worktreeReconcile.ts"
   ]
 }

@@ -3,8 +3,10 @@ import { open } from '@tauri-apps/plugin-dialog';
 import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { revealItemInDir } from '@tauri-apps/plugin-opener';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import { useAppStore, genId } from '../store';
 import { removeProjectWithCleanup } from '../utils/projectActions';
+import { collectWorktreeProbePaths, findStaleWorktreeProjects } from '../utils/worktreeReconcile';
 import { StatusDot } from './StatusDot';
 import { DoneTag } from './DoneTag';
 import { SshAssocModal } from './SshAssocModal';
@@ -142,7 +144,9 @@ export function ProjectList() {
 
   // worktree 徽章:批量探测哪些项目路径是 linked worktree,是则记下分支名。
   // 远程项目路径在远端、无从探测;UNC(WSL)路径由后端直接跳过。
+  // probeTick:窗口重获焦点时 +1 强制重探测——分支切换/worktree 增删都发生在窗外。
   const [worktreeBranches, setWorktreeBranches] = useState<Map<string, string>>(new Map());
+  const [probeTick, setProbeTick] = useState(0);
   const projectPathsKey = config.projects
     .filter((p) => !p.sshConnectionId)
     .map((p) => p.path)
@@ -168,7 +172,45 @@ export function ProjectList() {
     return () => {
       cancelled = true;
     };
-  }, [projectPathsKey]);
+  }, [projectPathsKey, probeTick]);
+
+  // 失效 worktree 子项目自动清理:AI agent/外部在终端里 `git worktree remove` 后
+  // 不会有任何事件通知,挂载与窗口重获焦点时探测一次目录存在性;目录已消失
+  // (且父项目目录仍在,排除盘符级整树消失的误判)的子项目连终端资源一起移除。
+  useEffect(() => {
+    let disposed = false;
+    const reconcile = async () => {
+      const projects = useAppStore.getState().config.projects;
+      const probe = collectWorktreeProbePaths(projects);
+      if (probe.length === 0) return;
+      try {
+        const existing = await invoke<string[]>('filter_directories', { paths: probe });
+        if (disposed) return;
+        for (const p of findStaleWorktreeProjects(projects, existing)) {
+          removeProjectWithCleanup(p.id);
+        }
+      } catch {
+        // 探测失败不做清理,下次获得焦点再试
+      }
+    };
+    reconcile();
+    let unlisten: (() => void) | undefined;
+    getCurrentWindow()
+      .onFocusChanged(({ payload: focused }) => {
+        if (!focused) return;
+        reconcile();
+        setProbeTick((t) => t + 1);
+      })
+      .then((fn) => {
+        if (disposed) fn();
+        else unlisten = fn;
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
 
   // 写入项目的 WSL 会话来源发行版(undefined = 不启用),并持久化
   const setWslSessionsDistro = useCallback((projectId: string, distro: string | undefined) => {
