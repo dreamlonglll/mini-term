@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.9.2-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.9.3-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -54,6 +54,8 @@ Status aggregates layer by layer from pane → tab → project (`error > ai-work
 - A **DONE** badge in the project list
 - Taskbar flashing (Windows) / Dock bouncing (macOS), only when the window is unfocused
 - A notification sound (a built-in synthesized tone, or your own audio file)
+
+Once hooks are reporting, they are the **only** status source for that pane — output activity no longer participates. (A TUI's idle redraws used to read as "back to work," replaying one finished task as a completion over and over.) Completion is keyed to the `Stop` event alone, so a permission prompt — also a "waiting for you" state — is no longer announced as a finished task.
 
 ### 📱 Watch your desktop AI from your phone, anywhere
 
@@ -136,7 +138,7 @@ A VS Code-style **Changes panel** (Staged / Changes / Untracked groups, per-file
 | State / layout | Zustand single store · Allotment + recursive SplitNode tree |
 | PTY / Git | portable-pty · git2 · notify + ignore |
 | Mobile relay | axum + tokio WebSocket (`relay-server/`) · React + Vite PWA (`mobile/`) |
-| Tests | **504 Rust tests** (451 desktop + 53 relay) plus 20 Node tests |
+| Tests | **505 Rust tests** (452 desktop + 53 relay) plus 21 Node tests |
 
 ---
 

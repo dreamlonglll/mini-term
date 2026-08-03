@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.9.2-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.9.3-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -80,9 +80,9 @@ Mini-Term solves all of the above with one lightweight desktop app.
 ### AI Process Awareness
 
 - **Hook event system** — Integrates the official Claude Code / Codex Hook APIs to receive AI tool events (SessionStart / End, ToolUse, etc.), which is more precise and timely than process polling; the built-in `miniterm-hook` CLI is called by the hook system to POST events to a local server; the settings UI registers / unregisters the hook config with one click, merging rather than overwriting your existing hooks. Codex permission requests stay in `ai-working` through approval and tool execution, avoiding premature completion notifications.
-- **Real-time status detection** — Hook-first with a 500ms process-polling fallback, auto-detecting Claude / Codex / OpenCode and showing idle / working / error states.
+- **Real-time status detection** — Once hooks are reporting they are the only status source for that pane; output activity no longer participates (a TUI's idle redraws used to read as "working again," firing the completion notification over and over). Panes without hooks fall back to 500ms process polling, auto-detecting Claude / Codex / OpenCode and showing idle / working / error states.
 - **Status aggregation** — Aggregated layer by layer from pane → tab → project, with priority `error > ai-working > ai-idle > idle`.
-- **Completion notification trio** — Fires the moment an AI task goes working → idle:
+- **Completion notification trio** — Fires the moment an AI task goes working → idle *and* the cause is a `Stop` event (permission requests, notifications, and elicitations also land on `ai-idle` and are no longer misreported as completion; the hookless fallback path still keys off the falling edge alone):
   - A bottom-right toast desktop notification (only for inactive projects, deduplicated per project).
   - A DONE badge in the project list, cleared on click.
   - Taskbar flashing (Windows) / Dock bouncing (macOS), triggered only when the window is unfocused.
@@ -164,7 +164,7 @@ Watch the AI running on your desktop from your phone while you're out, and send 
 | File watching | notify 7 + ignore 0.4 (.gitignore filtering) |
 | Tauri plugins | `window-state` · `clipboard-manager` · `dialog` · `opener` |
 | Mobile relay | axum + tokio WebSocket relay service (`relay-server/`) · React + TS + Vite PWA (`mobile/`) |
-| Test coverage | 504 Rust tests = 451 desktop (tauri-app 297 + mt-core 44 + mt-ssh 26 + mt-sidecars 84) + 53 relay-server (protocol & routing); plus 20 Node tests |
+| Test coverage | 505 Rust tests = 452 desktop (tauri-app 298 + mt-core 44 + mt-ssh 26 + mt-sidecars 84) + 53 relay-server (protocol & routing); plus 21 Node tests |
 
 ## Getting Started
 
@@ -380,7 +380,7 @@ npm run build
 # Node-side tests (20)
 node --test "tests/*.test.cjs"
 
-# Desktop Rust tests (451)
+# Desktop Rust tests (452)
 # Note: mt-core / mt-ssh / mt-sidecars are standalone crates, not workspace members.
 # Running `cd src-tauri && cargo test` alone only covers tauri-app's 297 — the other
 # three need their manifests specified explicitly.

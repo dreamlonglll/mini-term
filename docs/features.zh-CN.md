@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.9.2-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.9.3-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -80,9 +80,9 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 ### AI 进程感知
 
 - **Hook 事件系统** — 接入 Claude Code / Codex 官方 Hook API，接收 AI 工具事件（SessionStart / End、ToolUse 等），比进程轮询更精准及时；内置 `miniterm-hook` CLI 工具供 Hook 系统调用，自动 POST 事件到本地服务器；设置界面一键注册 / 卸载 Hook 配置，合并而非覆盖用户已有 hook。Codex 权限请求从审批到工具执行完成期间持续保持 `ai-working`，避免提前触发任务完成提醒
-- **实时状态检测** — Hook 优先 + 500ms 进程轮询降级，自动识别 Claude / Codex / OpenCode，显示 idle / working / error 状态
+- **实时状态检测** — Hook 一旦接入即为该面板唯一的状态来源，输出活跃度不再参与判定（AI 空闲期 TUI 的定时重绘曾被误判为「又在工作」，导致完成通知反复触发）；无 hook 的面板降级为 500ms 进程轮询，自动识别 Claude / Codex / OpenCode，显示 idle / working / error 状态
 - **状态聚合** — 面板 → 标签页 → 项目逐层聚合，优先级 `error > ai-working > ai-idle > idle`
-- **完成提醒三件套** — AI 任务从 working → idle 时立刻触发：
+- **完成提醒三件套** — AI 任务从 working → idle、且成因确为 `Stop` 事件时立刻触发（权限请求、通知、澄清同样落到 `ai-idle`，不再被误报为任务完成；无 hook 的降级路径仍以下降沿为准）：
   - 右下角 Toast 桌面通知（仅非活跃项目弹出，同项目去重）
   - 项目列表 DONE 徽章，点击清除
   - 任务栏闪烁（Windows）/ Dock 跳动（macOS），窗口失焦时才触发
@@ -164,7 +164,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 | 文件监听 | notify 7 + ignore 0.4（.gitignore 过滤） |
 | Tauri 插件 | `window-state` · `clipboard-manager` · `dialog` · `opener` |
 | 移动端中转 | axum + tokio WebSocket 中转服务（`relay-server/`）· React + TS + Vite PWA（`mobile/`） |
-| 测试覆盖 | 504 个 Rust 测试 = 桌面端 451（tauri-app 297 + mt-core 44 + mt-ssh 26 + mt-sidecars 84）+ 中转服务端 53（协议与路由）；另有 20 个 Node 测试 |
+| 测试覆盖 | 505 个 Rust 测试 = 桌面端 452（tauri-app 298 + mt-core 44 + mt-ssh 26 + mt-sidecars 84）+ 中转服务端 53（协议与路由）；另有 21 个 Node 测试 |
 
 ## 快速开始
 
@@ -378,7 +378,7 @@ npm run build
 # Node 侧测试（20 个）
 node --test "tests/*.test.cjs"
 
-# 桌面端 Rust 测试（451 个）
+# 桌面端 Rust 测试（452 个）
 # 注意：mt-core / mt-ssh / mt-sidecars 是独立 crate 而非 workspace member，
 # 单跑 `cd src-tauri && cargo test` 只覆盖 tauri-app 的 297 个，其余三个要分别指定 manifest。
 cd src-tauri
