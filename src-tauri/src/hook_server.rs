@@ -375,7 +375,7 @@ pub fn start_hook_server(
                         // 间隔超窗漏检时靠这里自愈
                         hook_state.remove(pty_id);
                         app.state::<crate::pty::PtyManager>().clear_ai_session(pty_id);
-                        emitter.emit_if_changed(&app, pty_id, "idle");
+                        emitter.emit_if_changed(&app, pty_id, "idle", Some("SessionEnd"));
                         eprintln!(
                             "[hook-server] pty_id={} event=SessionEnd(reason={:?}) -> hook 已清除，回退到 idle",
                             pty_id, payload.reason
@@ -406,8 +406,10 @@ pub fn start_hook_server(
                         app.state::<crate::pty::PtyManager>().mark_ai_session(pty_id);
                         hook_state.update(pty_id, status.to_string());
 
-                        // 通知前端（与 process_monitor 共享同一份去重表）
-                        emitter.emit_if_changed(&app, pty_id, status);
+                        // 通知前端（与 process_monitor 共享同一份去重表）。带上事件名：
+                        // Stop / PermissionRequest / Notification 都落到 ai-idle，
+                        // 但只有 Stop 是"任务做完了"，前端据此决定要不要播报完成。
+                        emitter.emit_if_changed(&app, pty_id, status, Some(event.as_str()));
 
                         eprintln!(
                             "[hook-server] pty_id={} event={} -> status={}",

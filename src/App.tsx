@@ -175,7 +175,7 @@ export function App() {
 
   useTauriEvent<PtyStatusChangePayload>('pty-status-change', useCallback((payload) => {
     markAiPty(payload.ptyId, payload.status === 'ai-working' || payload.status === 'ai-idle');
-    updatePaneStatusByPty(payload.ptyId, payload.status as PaneStatus);
+    updatePaneStatusByPty(payload.ptyId, payload.status as PaneStatus, payload.cause);
   }, [updatePaneStatusByPty]));
 
   // 中转连接状态:后端长连状态机推送,写入 store 供设置页「移动端」区域实时展示

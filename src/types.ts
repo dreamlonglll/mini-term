@@ -317,6 +317,14 @@ export interface PtyExitPayload {
 export interface PtyStatusChangePayload {
   ptyId: number;
   status: PaneStatus;
+  /**
+   * 状态变化的成因：hook 直推时是 hook 事件名（`Stop` / `PermissionRequest` /
+   * `SessionEnd` …），后端 monitor 轮询算出的变化没有该字段。
+   *
+   * 多个 hook 事件都落到 `ai-idle`，但只有 `Stop` 表示"任务做完了"——权限请求、
+   * 通知、澄清同样是 ai-idle，播报成完成就是误报。见 `isAiCompletion`。
+   */
+  cause?: string;
 }
 
 export interface FsChangePayload {

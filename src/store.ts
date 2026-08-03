@@ -16,6 +16,7 @@ import type {
   AiUserSubmitPayload,
   MobileRelayStatusPayload,
 } from './types';
+import { isAiCompletion } from './utils/aiCompletion';
 import { restoreSavedProjectLayout } from './utils/layoutRestore';
 import { playNotificationSound } from './utils/notificationSound';
 import {
@@ -371,7 +372,8 @@ interface AppStore {
   setProjectLayout: (projectId: string, layout: SplitNode | null) => void;
 
   // Pane 状态
-  updatePaneStatusByPty: (ptyId: number, status: PaneStatus) => void;
+  /** @param cause `pty-status-change` 带的 hook 事件名，决定这次变化算不算「任务完成」 */
+  updatePaneStatusByPty: (ptyId: number, status: PaneStatus, cause?: string) => void;
   setPanePty: (projectId: string, paneId: string, ptyId: number) => void;
   updatePaneStatusByPaneId: (projectId: string, paneId: string, status: PaneStatus) => void;
   /** 移动端改会话名:按 paneId 全局定位;空串 = 清除自定义名,回落 shell 名 */
@@ -601,7 +603,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
       return { projectStates: newStates, markersByPty: newMarkers };
     }),
 
-  updatePaneStatusByPty: (ptyId, status) =>
+  updatePaneStatusByPty: (ptyId, status, cause) =>
     set((state) => {
       // 1. 找到 pane 所属项目并捕获 oldStatus
       let oldStatus: PaneStatus | null = null;
@@ -629,9 +631,9 @@ export const useAppStore = create<AppStore>((set, get) => ({
       }
       if (!changed) return state;
 
-      // 3. 检测 transition：ai-working → ai-idle
-      const isCompletion = oldStatus === 'ai-working' && status === 'ai-idle';
-      if (isCompletion) {
+      // 3. 检测「任务完成」：ai-working → ai-idle 的下降沿，且成因确实是完成
+      //    （权限请求 / 通知同样落到 ai-idle，不该播报）——判据见 isAiCompletion
+      if (isAiCompletion(oldStatus, status, cause)) {
         // 3a. 提示音 — 不区分激活项目
         if (state.config.aiCompletionSound) {
           queueMicrotask(() => {
