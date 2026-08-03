@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.9.1-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.9.2-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -114,7 +114,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 - **项目列表** — 左侧边栏管理多个项目目录，一键切换工作区，重启自动恢复上次激活项目
 - **拖拽添加项目** — 从资源管理器拖拽文件夹到项目列表即可快速添加，自动识别文件 / 文件夹 / 重复项目并给出视觉反馈
 - **嵌套分组** — 最多 3 级项目分组，拖拽排序，折叠 / 展开，分组右键菜单可直接添加本地项目或远程 SSH 项目并归入该组（折叠的分组自动展开）；「删除分组」先弹确认并说明组内项目会移到上一级而非被删除；「移动到分组」按分组树逐级展开子菜单，当前所在组标 ✓ 并置灰，超深度的组不可选
-- **Worktree 子项目** — worktree「设为项目」后挂在主项目下方作子项目（缩进跟随分组），拖出或右键「脱离父项目」可转回顶层，删除父项目时子项目原位晋升不丢失；项目列表为 worktree 项目显示 ⎇ 分支徽章，仓库列表与 Changes 下拉同样标注 worktree 条目
+- **Worktree 子项目** — worktree「设为项目」后挂在主项目下方作子项目（缩进跟随分组），拖出或右键「脱离父项目」可转回顶层，删除父项目时子项目原位晋升不丢失；项目列表为 worktree 项目显示 ⎇ 分支徽章，仓库列表与 Changes 下拉同样标注 worktree 条目；**外部删除的 worktree 自动收敛** —— 窗口重获焦点时探测子项目目录是否还在，AI agent 在终端里跑完 `git worktree remove` 后，目录已消失的子项目连同终端资源一并移除，⎇ 徽章同步重探（仅在父项目目录仍存在时清理，盘符掉线不会误删；SSH 远程与 UNC/WSL 路径不参与），worktree 弹窗「清理失效条目」也会一并移除指向它的项目
 - **文件树** — 集成目录浏览器，自然排序（V1 → V2 → V10 而非字典序），嵌套 `.gitignore` 置灰（每层子目录的忽略规则与 `!pattern` 白名单都会生效，与 git 行为一致），`notify` 文件监听实时刷新
 - **文件操作** — 文件树内新建文件 / 文件夹、重命名、删除、查看内容（Markdown 渲染支持 HTML 标签和外部图片，外链点击二次确认后调系统默认浏览器打开，图片格式直接展示，HTML 文件 iframe 预览并自动解析相对路径资源，二进制与超大文件友好提示）
 - **内置文件编辑器** — 文件树点开文件即可就地编辑（CodeMirror 6 内核）：140+ 语言语法高亮按文件类型自动匹配、按需懒加载，查找替换（`Ctrl+F`，面板中文化）、代码折叠、括号匹配、多光标；`Ctrl+S` 原子落盘（临时文件 + rename，不怕写坏），CRLF 文件按原行尾往返不产生全文件 diff；有未保存修改时关闭 / 跳转先确认，文件被外部改动时干净则静默重载、脏则出提示条；Markdown / HTML 预览实时渲染未保存草稿；语法配色经 `--syn-*` 变量转引应用色板，自动跟随四套主题皮肤
@@ -164,7 +164,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 | 文件监听 | notify 7 + ignore 0.4（.gitignore 过滤） |
 | Tauri 插件 | `window-state` · `clipboard-manager` · `dialog` · `opener` |
 | 移动端中转 | axum + tokio WebSocket 中转服务（`relay-server/`）· React + TS + Vite PWA（`mobile/`） |
-| 测试覆盖 | 504 个 Rust 测试 = 桌面端 451（tauri-app 297 + mt-core 44 + mt-ssh 26 + mt-sidecars 84）+ 中转服务端 53（协议与路由）；另有 19 个 Node 测试 |
+| 测试覆盖 | 504 个 Rust 测试 = 桌面端 451（tauri-app 297 + mt-core 44 + mt-ssh 26 + mt-sidecars 84）+ 中转服务端 53（协议与路由）；另有 20 个 Node 测试 |
 
 ## 快速开始
 
@@ -313,7 +313,7 @@ mini-term/
 ├── scripts/
 │   ├── stage-sidecars.mjs        # 构建 sidecar 并按 triple 就位为 Tauri externalBin
 │   └── stage-conpty.mjs          # 下载校验并就位固定版本 ConPTY 运行时（Windows）
-├── tests/                        # Node 侧测试（ConPTY 打包 / TUI 滚动 / 布局恢复 / 主题兼容 / WSL 路径等 19 个）
+├── tests/                        # Node 侧测试（ConPTY 打包 / TUI 滚动 / 布局恢复 / 主题兼容 / WSL 路径 / worktree 收敛等 20 个）
 └── package.json
 ```
 
@@ -375,7 +375,7 @@ ToastContainer 悬浮于右下角，SettingsModal / SshModal / MobileRelayModal 
 # 前端类型检查（tsc + vite build）
 npm run build
 
-# Node 侧测试（19 个）
+# Node 侧测试（20 个）
 node --test "tests/*.test.cjs"
 
 # 桌面端 Rust 测试（451 个）
