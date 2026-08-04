@@ -127,11 +127,13 @@ function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff, onViewF
   // 目录监听生命周期:展开时注册 watcher,折叠 / 组件卸载 / 路径变化时自动注销。
   // 旧实现只在手动折叠当前节点时 unwatch,父级折叠或切换项目导致后代节点直接 unmount
   // 时其 watcher 永不释放,会持续累积 OS 文件监听句柄(inotify / ReadDirectoryChangesW)。
-  // 压缩链 entry 对链上每段都注册(watchKey 序列化链路径,链未变不重注册):
-  // 中段目录外部新增文件也能收到 fs-change,由上级重列并重新压缩
+  // 压缩链 entry 对链上每段都注册(watchKey 序列化链路径,链未变不重注册),
+  // 且折叠时也保持注册:后端 watcher 是 NonRecursive,折叠链的中段(a/b/c 的 b)
+  // 新增文件否则无人上报;fs-change 由展开的上级 startsWith 匹配重列并重新压缩
   const watchKey = (entry.chainPaths ?? [entry.path]).join('\n');
+  const watchActive = expanded || entry.chainPaths !== undefined;
   useEffect(() => {
-    if (!entry.isDir || !expanded || remoteConnectionId) return;
+    if (!entry.isDir || !watchActive || remoteConnectionId) return;
     const paths = watchKey.split('\n');
     for (const p of paths) {
       invoke('watch_directory', { path: p, projectPath: projectRoot }).catch(() => {});
@@ -141,7 +143,7 @@ function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff, onViewF
         invoke('unwatch_directory', { path: p }).catch(() => {});
       }
     };
-  }, [expanded, entry.isDir, watchKey, projectRoot, remoteConnectionId]);
+  }, [watchActive, entry.isDir, watchKey, projectRoot, remoteConnectionId]);
 
   const handleToggle = useCallback(async () => {
     if (!entry.isDir) {

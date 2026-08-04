@@ -19,7 +19,7 @@ const AUTO_REFRESH_KEY = 'mini-term-usage-autorefresh';
 const CUSTOM_FROM_KEY = 'mini-term-usage-custom-from';
 const CUSTOM_TO_KEY = 'mini-term-usage-custom-to';
 
-/** 自动刷新档位（秒）；0 = 关闭 */
+/** 自动刷新档位（秒）；0 = 关闭。默认 5s：设计要求面板开着时至少 5s 定时同步 */
 const AUTO_REFRESH_OPTIONS = [0, 5, 10, 30, 60] as const;
 const TOP_MODELS = 6;
 
@@ -161,7 +161,7 @@ export function UsageStatsModal({ open, onClose }: { open: boolean; onClose: () 
   const [customFrom, setCustomFrom] = useState(() => loadDatePref(CUSTOM_FROM_KEY, localDateStr(29)));
   const [customTo, setCustomTo] = useState(() => loadDatePref(CUSTOM_TO_KEY, localDateStr(0)));
   const [autoRefresh, setAutoRefresh] = useState<number>(() => {
-    const v = Number(loadPref(AUTO_REFRESH_KEY, AUTO_REFRESH_OPTIONS.map(String), '0'));
+    const v = Number(loadPref(AUTO_REFRESH_KEY, AUTO_REFRESH_OPTIONS.map(String), '5'));
     return Number.isFinite(v) ? v : 0;
   });
   const [viewer, setViewer] = useState<UsageTopSessionStat | null>(null);
@@ -317,7 +317,7 @@ export function UsageStatsModal({ open, onClose }: { open: boolean; onClose: () 
 
         {/* 使用趋势：全宽（hover 显示时段详情） */}
         <Section title={t('usageStats.dailyActivity')}>
-          <DailyChart daily={stats.daily} range={range} />
+          <DailyChart daily={stats.daily} range={range} customFrom={customFrom} customTo={customTo} />
         </Section>
 
         {/* 项目 | 模型 | 供应商 三卡同行；项目数可能多，固定高度内滚动 */}

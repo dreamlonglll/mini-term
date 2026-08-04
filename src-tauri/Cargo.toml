@@ -4,6 +4,8 @@ version = "0.9.3"
 description = "mini-term: AI-aware desktop terminal manager built on Tauri v2 — multi-project, multi-tab, split-pane"
 authors = ["you"]
 edition = "2021"
+# libsqlite3-sys 0.38 的 build.rs 用 cfg_select!(1.95 起稳定),旧工具链在此得到清晰报错
+rust-version = "1.95"
 default-run = "tauri-app"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

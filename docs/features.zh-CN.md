@@ -193,7 +193,7 @@ xattr -cr /Applications/Mini-Term.app
 #### 前置条件
 
 - [Node.js](https://nodejs.org/) >= 20.19（或 >= 22.12）—— Vite 7 的 engines 要求，CI 使用 Node 22
-- [Rust](https://www.rust-lang.org/tools/install) >= 1.85 —— 由 russh 0.61 决定（Tauri v2 自身只要求 1.77.2）
+- [Rust](https://www.rust-lang.org/tools/install) >= 1.95 —— 由 libsqlite3-sys 0.38 使用的 `cfg_select!` 决定（1.95 起稳定；Tauri v2 自身只要求 1.77.2）
 - [Tauri v2 CLI](https://v2.tauri.app/start/prerequisites/)
 
 #### 安装与运行

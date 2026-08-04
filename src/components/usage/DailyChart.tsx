@@ -10,7 +10,7 @@ import {
   YAxis,
 } from 'recharts';
 import type { UsageDailyStat, UsageRange } from '../../types';
-import { rangeStartDate } from '../../utils/usageDates';
+import { customChartWindow, rangeStartDate } from '../../utils/usageDates';
 import { formatCost, formatCount, formatTokens } from './format';
 
 function axisCost(v: number): string {
@@ -21,9 +21,14 @@ function dayKey(d: Date): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
-/** 补齐空桶：今天视图从 00:00 到当前小时；日粒度补窗口（all 用数据首日）到今天。
+/** 补齐空桶：今天视图从 00:00 到当前小时；日粒度补窗口到今天，custom 补用户所选起止。
  * 后端快照是稀疏的（只有有数据的桶），无活动时段补 0 才能画出完整时间轴 */
-function fillBuckets(daily: UsageDailyStat[], range: UsageRange): UsageDailyStat[] {
+function fillBuckets(
+  daily: UsageDailyStat[],
+  range: UsageRange,
+  customFrom: string,
+  customTo: string,
+): UsageDailyStat[] {
   const map = new Map(daily.map((d) => [d.date, d]));
   const out: UsageDailyStat[] = [];
   const empty = (date: string): UsageDailyStat => ({
@@ -44,23 +49,16 @@ function fillBuckets(daily: UsageDailyStat[], range: UsageRange): UsageDailyStat
   }
   if (daily.length === 0) return out;
   let start: Date;
-  // 非 custom 的窗口起点与查询 since 同源(utils/usageDates 的范围规格)
+  let end: Date;
+  // 窗口起止与查询 since/until 同源(utils/usageDates 的范围规格);
+  // custom 按用户所选起止补桶,轴反映所选窗口而非数据跨度
   const rangeStart = rangeStartDate(range, now);
   if (rangeStart) {
     start = rangeStart;
+    end = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   } else {
-    // custom:窗口起点不在本组件已知,从数据首日起补零
-    const [y, m, d] = daily[0].date.split('-').map(Number);
-    start = new Date(y, m - 1, d);
+    ({ start, end } = customChartWindow(customFrom, customTo, now));
   }
-  // custom 的截止日可能远在过去,补零到今天只会画一条零尾巴 → 止于数据末日
-  const end = (() => {
-    if (range === 'custom') {
-      const [y, m, d] = daily[daily.length - 1].date.split('-').map(Number);
-      return new Date(y, m - 1, d);
-    }
-    return new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  })();
   for (
     let cur = start;
     cur <= end;
@@ -129,7 +127,18 @@ const tickCount = (v: number) => formatCount(Math.round(v));
  * ResizeObserver 可能读到一拍 0 宽——RC 会就地渲染空图且不再自愈（表现为
  * 图表消失,再刷新才回来）；这里沿用旧手绘版的「忽略瞬时 0 宽」守卫。
  */
-export function DailyChart({ daily, range }: { daily: UsageDailyStat[]; range: UsageRange }) {
+export function DailyChart({
+  daily,
+  range,
+  customFrom,
+  customTo,
+}: {
+  daily: UsageDailyStat[];
+  range: UsageRange;
+  /** custom range 起止("YYYY-MM-DD");其余 range 忽略 */
+  customFrom: string;
+  customTo: string;
+}) {
   const t = useT();
   const containerRef = useRef<HTMLDivElement>(null);
   const [width, setWidth] = useState(0);
@@ -152,8 +161,8 @@ export function DailyChart({ daily, range }: { daily: UsageDailyStat[]; range: U
   // memo——每次 render 新建数组会让任何一次父组件重渲染都重启动画,连击下
   // 动画长期停在起始帧(clip 宽 0),表现为折线/柱整体消失
   const buckets = useMemo(
-    () => (daily.length > 0 ? fillBuckets(daily, range) : []),
-    [daily, range],
+    () => (daily.length > 0 ? fillBuckets(daily, range, customFrom, customTo) : []),
+    [daily, range, customFrom, customTo],
   );
 
   if (daily.length === 0) {

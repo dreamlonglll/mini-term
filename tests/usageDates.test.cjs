@@ -3,6 +3,7 @@ const test = require('node:test');
 
 const {
   acceptDateInput,
+  customChartWindow,
   rangeStartDate,
   rangeSinceMs,
   rangeUntilMs,
@@ -63,5 +64,32 @@ test('rangeUntilMs custom:倒置抬到起始日,两端过旧退成一年下限�
   assert.equal(rangeUntilMs('custom', '2020-01-01', '2020-02-01', NOW), floorEnd);
   const since = rangeSinceMs('custom', '2020-01-01', NOW);
   assert.ok(since <= floorEnd, 'since 不得大于 until');
+});
+
+// custom 趋势图补桶窗口:与查询窗口同源。仅从数据首日补到末日会把
+// 用户选的 1月1日–31日(仅 15 日有量)退化成单日摘要,无法反映完整时间轴。
+
+test('customChartWindow:正常区间取所选起止', () => {
+  const w = customChartWindow('2026-01-01', '2026-01-31', NOW);
+  assert.equal(w.start.getTime(), new Date(2026, 0, 1).getTime());
+  assert.equal(w.end.getTime(), new Date(2026, 0, 31).getTime());
+});
+
+test('customChartWindow:to 缺失补到今天(对应查询无上界)', () => {
+  const w = customChartWindow('2026-07-01', '', NOW);
+  assert.equal(w.start.getTime(), new Date(2026, 6, 1).getTime());
+  assert.equal(w.end.getTime(), new Date(2026, 7, 3).getTime());
+});
+
+test('customChartWindow:倒置区间抬到起始日(等效单日)', () => {
+  const w = customChartWindow('2026-07-20', '2026-07-10', NOW);
+  assert.equal(w.start.getTime(), new Date(2026, 6, 20).getTime());
+  assert.equal(w.end.getTime(), new Date(2026, 6, 20).getTime());
+});
+
+test('customChartWindow:起点过旧随查询钳到一年内', () => {
+  const w = customChartWindow('2020-01-01', '2026-01-31', NOW);
+  assert.equal(w.start.getTime(), new Date(2026, 7, 3 - 364).getTime());
+  assert.equal(w.end.getTime(), new Date(2026, 0, 31).getTime());
 });
 
