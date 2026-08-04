@@ -119,11 +119,20 @@ impl StatusEmitter {
 /// 输入检测会漏判启动（别名/包装脚本）、误判退出（任务运行中双击 Ctrl+C 只是
 /// 打断并不退出），曾经的 "ai-idle && !is_ai_session → idle" 兜底会把这类
 /// 误差放大成 pane 整个会话期永久显示 idle。
+///
+/// `hook_server_running` 是 AI 感知总开关（设置「AI HOOK 事件」）：server 未
+/// 运行时降级轮询分不清「完成」与「待确认」——绿灯会把等待授权谎报成任务
+/// 完成、黄灯又永远亮不起来，因此一律返回 idle（残留 hook 状态同样不显示），
+/// pane 回归普通终端；开关重开后 hook 状态仍在，下一个事件即恢复权威判定。
 pub(crate) fn resolve_status(
     hook_state: &HookState,
     pty_manager: &crate::pty::PtyManager,
     pty_id: u32,
+    hook_server_running: bool,
 ) -> String {
+    if !hook_server_running {
+        return "idle".to_string();
+    }
     if hook_state.is_hook_enabled(pty_id) {
         hook_state
             .get_status(pty_id)
@@ -149,9 +158,11 @@ pub fn start_monitor(
     thread::spawn(move || {
         loop {
             let pty_ids = pty_manager.get_pty_ids();
+            // 每轮取一次总开关状态:server 未运行时 AI 感知整体停用
+            let server_running = hook_state.is_server_running();
 
             for pty_id in &pty_ids {
-                let status = resolve_status(&hook_state, &pty_manager, *pty_id);
+                let status = resolve_status(&hook_state, &pty_manager, *pty_id, server_running);
                 let agent = if status.starts_with("ai-") {
                     pty_manager.ai_session_agent(*pty_id)
                 } else {
@@ -189,7 +200,7 @@ mod tests {
         mgr.track_input(1, "\x03"); // （claude 未退出，仅回到提示符）
         hooks.update(1, "ai-idle".to_string()); // 打断后 claude 上报 ai-idle
 
-        assert_eq!(resolve_status(&hooks, &mgr, 1), "ai-idle");
+        assert_eq!(resolve_status(&hooks, &mgr, 1, true), "ai-idle");
     }
 
     /// 回归测试（AI 完成通知每 20~50s 重复播报的 bug）：hook 卡在 ai-working
@@ -210,7 +221,7 @@ mod tests {
         mgr.track_input(1, "\x03");
         // 无后续 hook 事件、无 PTY 输出（has_recent_output 为 false）
 
-        assert_eq!(resolve_status(&hooks, &mgr, 1), "ai-working");
+        assert_eq!(resolve_status(&hooks, &mgr, 1, true), "ai-working");
     }
 
     /// 启动方式漏检（别名/包装脚本，输入检测从未标记 is_ai_session）时，
@@ -222,7 +233,7 @@ mod tests {
 
         hooks.update(1, "ai-idle".to_string()); // hook 正常上报，但输入检测漏了启动
 
-        assert_eq!(resolve_status(&hooks, &mgr, 1), "ai-idle");
+        assert_eq!(resolve_status(&hooks, &mgr, 1, true), "ai-idle");
     }
 
     /// 对照组：输入检测与 hook 一致（未误判退出）时，ai-idle 正常保持。
@@ -234,7 +245,7 @@ mod tests {
         mgr.track_input(1, "claude\r");
         hooks.update(1, "ai-idle".to_string());
 
-        assert_eq!(resolve_status(&hooks, &mgr, 1), "ai-idle");
+        assert_eq!(resolve_status(&hooks, &mgr, 1, true), "ai-idle");
     }
 
     /// 无 hook 的 pane（WSL/SSH/hook 关闭）维持轮询逻辑：
@@ -244,8 +255,23 @@ mod tests {
         let hooks = HookState::new();
         let mgr = PtyManager::new();
 
-        assert_eq!(resolve_status(&hooks, &mgr, 1), "idle");
+        assert_eq!(resolve_status(&hooks, &mgr, 1, true), "idle");
         mgr.track_input(1, "claude\r");
-        assert_eq!(resolve_status(&hooks, &mgr, 1), "ai-idle");
+        assert_eq!(resolve_status(&hooks, &mgr, 1, true), "ai-idle");
+    }
+
+    /// hook 总开关关闭(server 未运行)时 AI 感知整体停用:降级轮询分不清
+    /// 「完成」与「待确认」(绿灯会谎报完成、黄灯永远缺席),残留的 hook
+    /// 状态同样不显示;pane 一律回归普通 idle,无蓝/绿灯、无完成通知。
+    #[test]
+    fn server_off_disables_all_ai_status() {
+        let hooks = HookState::new();
+        let mgr = PtyManager::new();
+
+        mgr.track_input(1, "claude
+"); // 输入检测已标记 AI 会话
+        hooks.update(1, "ai-working".to_string()); // 关闭开关前残留的 hook 状态
+
+        assert_eq!(resolve_status(&hooks, &mgr, 1, false), "idle");
     }
 }

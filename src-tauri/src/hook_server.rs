@@ -477,6 +477,9 @@ pub fn start_hook_server(
                                     "ptyId": pty_id,
                                     "agent": payload.agent.clone(),
                                     "sessionId": sid,
+                                    // 会话启动目录:claude --resume 只认该目录的会话桶,
+                                    // 前端随身份持久化,重启续接时 PTY 直接以它为 cwd
+                                    "cwd": payload.cwd.clone(),
                                 }),
                             );
                         }

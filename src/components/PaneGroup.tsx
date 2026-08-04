@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
-import { useAppStore, clearPaneResumePendingByPty } from '../store';
+import { useAppStore, clearPaneResumePendingByPty, setPaneAiSessionByPty, saveLayoutToConfig } from '../store';
 import { TerminalInstance } from './TerminalInstance';
 import { StatusDot } from './StatusDot';
 import { BrandIcon } from './BrandIcon';
@@ -94,9 +94,29 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
     }
 
     hydratingPaneIds.add(activePane.id);
+    // 续接会话时 PTY 直接以会话记录的 cwd 启动:claude --resume 只认「启动目录」
+    // 对应的会话桶,起于子目录的会话在项目根恢复会报 No conversation found。
+    // 存量记录无 cwd 时向后端反查 jsonl(lookup_ai_session_cwd),查到随身份写回
+    // 持久化,下次重启免查;codex 会话不按目录分桶,无需反查。
+    const sessionRef = activePane.resumePending ? activePane.aiSession : undefined;
+    const resolveResumeCwd = async (): Promise<string | undefined> => {
+      if (remote || !sessionRef) return undefined;
+      if (sessionRef.cwd) return sessionRef.cwd;
+      if (sessionRef.agent === 'codex') return undefined;
+      if (!/^[A-Za-z0-9_-]+$/.test(sessionRef.sessionId)) return undefined;
+      const found = await invoke<string | null>('lookup_ai_session_cwd', {
+        sessionId: sessionRef.sessionId,
+      }).catch(() => null);
+      return found ?? undefined;
+    };
+    let resumeCwd: string | undefined;
     // 远程分支:create_pty 带 sshRemote,后端直接 spawn ssh 并预注册密码 autofill;
     // 本地分支:行为与既有链路一致(shell + cwd + envVars),pane 的 cwd 覆盖优先(worktree 终端)。
-    createProjectPty(project, shell, activePane.cwd)
+    resolveResumeCwd()
+      .then((cwd) => {
+        resumeCwd = cwd;
+        return createProjectPty(project, shell, cwd ?? activePane.cwd);
+      })
       .then((ptyId) => {
         const layout = useAppStore.getState().projectStates.get(projectId)?.layout;
         const pane = layout ? findPaneById(layout, activePane.id) : null;
@@ -119,6 +139,11 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
               : `claude --resume ${session.sessionId}`;
             clearPaneResumePendingByPty(ptyId);
             void writePtyInput(ptyId, `${cmd}\r`);
+            // 反查所得的启动目录随身份写回并持久化,下次重启直达不再查
+            if (resumeCwd && session.cwd !== resumeCwd) {
+              setPaneAiSessionByPty(ptyId, { ...session, cwd: resumeCwd });
+              saveLayoutToConfig(projectId);
+            }
           }
           setSpawnErrors((prev) => {
             if (!(activePane.id in prev)) return prev;
@@ -146,6 +171,8 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
     activePane?.shellName,
     activePane?.status,
     activePane?.cwd,
+    activePane?.aiSession,
+    activePane?.resumePending,
     config.availableShells,
     config.defaultShell,
     project,
@@ -159,7 +186,7 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
   const handleNewTabClick = useCallback((e: React.MouseEvent) => {
     // 远程项目不弹 shell 菜单:pane 固定为 ssh 启动器
     if (remote || config.availableShells.length <= 1) {
-      void newTerminal(projectId);
+      void newTerminal(projectId, undefined, { targetPaneId: activePane?.id });
       return;
     }
     showContextMenu(
@@ -167,10 +194,10 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
       e.clientY,
       config.availableShells.map((shell) => ({
         label: shell.name,
-        onClick: () => void newTerminal(projectId, shell),
+        onClick: () => void newTerminal(projectId, shell, { targetPaneId: activePane?.id }),
       })),
     );
-  }, [remote, config.availableShells, projectId]);
+  }, [remote, config.availableShells, projectId, activePane?.id]);
 
   const [markerOpen, setMarkerOpen] = useState(false);
   const [markerAnchor, setMarkerAnchor] = useState<{ top: number; right: number } | null>(null);

@@ -88,13 +88,14 @@ function commit(projectId: string, layout: SplitNode | null) {
 /**
  * 新建一个终端标签。
  * - 项目还没有布局：建根 leaf
- * - 已有布局：加进当前活动 pane 所在 leaf 的 tab 栏并激活
+ * - 已有布局：加进目标 leaf 的 tab 栏并激活——`opts.targetPaneId` 显式指定
+ *   锚点 pane（分屏下点某组的 + 号），缺省回落当前活动 pane 所在 leaf
  * - `opts.cwd` / `opts.title`:worktree「在终端打开」用,在指定目录起 shell 并命名 tab
  */
 export async function newTerminal(
   projectId: string,
   shell?: ShellConfig,
-  opts?: { cwd?: string; title?: string },
+  opts?: { cwd?: string; title?: string; targetPaneId?: string },
 ): Promise<PaneState | null> {
   const { state, project } = snapshot(projectId);
   if (!project) return null;
@@ -113,7 +114,10 @@ export async function newTerminal(
     focusPane(pane.ptyId);
     return pane;
   }
-  const active = resolveActivePane(current);
+  // 显式锚点优先:resolveActivePane 靠 DOM 焦点猜「用户在哪」,焦点不在任何
+  // xterm 上时会回退到第一个 leaf——分屏下点下方组的 + 号会把新 tab 加到上方组
+  const anchor = opts?.targetPaneId ? findPaneById(current, opts.targetPaneId) : null;
+  const active = anchor ?? resolveActivePane(current);
   const targetLeaf = active ? findLeafContainingPane(current, active.id) : collectLeaves(current)[0];
   if (!targetLeaf) {
     commit(projectId, { type: 'leaf', panes: [pane], activePaneId: pane.id });
