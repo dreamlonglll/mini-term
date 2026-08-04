@@ -89,6 +89,22 @@ export function rangeUntilMs(
   return new Date(day.getFullYear(), day.getMonth(), day.getDate() + 1).getTime() - 1;
 }
 
+/** custom 趋势图的补桶窗口（本地日历日）：与查询窗口同源——起点走 rangeSinceMs
+ *  （非法回落近 30 天、过旧钳一年），终点走 rangeUntilMs 的截止日（缺失/非法 =
+ *  无上界 → 补到今天；倒置抬到起始日）。图表轴反映所选窗口而非数据跨度。 */
+export function customChartWindow(
+  customFrom: string,
+  customTo: string,
+  now = new Date(),
+): { start: Date; end: Date } {
+  const start = new Date(rangeSinceMs('custom', customFrom, now));
+  const until = rangeUntilMs('custom', customFrom, customTo, now);
+  const endDay = until === null ? now : new Date(until);
+  let end = new Date(endDay.getFullYear(), endDay.getMonth(), endDay.getDate());
+  if (end.getTime() < start.getTime()) end = start;
+  return { start, end };
+}
+
 /** custom 起止日期输入的提交闸门。
  *
  * 原生 `<input type="date">` 的 change 只会给出完整 `YYYY-MM-DD` 或清空的 `''`；

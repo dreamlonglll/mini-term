@@ -160,7 +160,7 @@ xattr -cr /Applications/Mini-Term.app
 
 ### 从源码构建
 
-需要 Node.js >= 20.19（或 >= 22.12）、Rust >= 1.85、[Tauri v2 CLI](https://v2.tauri.app/start/prerequisites/)。
+需要 Node.js >= 20.19（或 >= 22.12）、Rust >= 1.95、[Tauri v2 CLI](https://v2.tauri.app/start/prerequisites/)。
 
 ```bash
 git clone https://github.com/dreamlonglll/mini-term.git

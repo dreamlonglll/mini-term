@@ -22,7 +22,7 @@ interface UseUsageStatsResult {
   backfillProcessed: number;
   backfillTotal: number;
   error: string;
-  /** 手动刷新：重拉价（若失败过）→ 重查 → 触发增量同步 */
+  /** 手动刷新：重拉价（24h TTL 缓存命中即瞬时）→ 重查 → 触发增量同步 */
   refresh: () => void;
   /** 仅触发一次增量同步（自动刷新定时器用；数据有变由 synced 事件驱动重查） */
   sync: () => void;
@@ -48,7 +48,7 @@ export function useUsageStats(
   const [backfill, setBackfill] = useState({ processed: 0, total: 0 });
   const [error, setError] = useState('');
   const [refreshTick, setRefreshTick] = useState(0);
-  /** 价格表跨开关 Modal 保留（loadModelPricing 另有 24h localStorage 缓存） */
+  /** 价格表跨开关 Modal 保留；每次打开/刷新都重走 loadModelPricing，24h TTL 由其缓存判定 */
   const pricingRef = useRef<Record<string, ModelPriceEntry> | null>(null);
   /** 查询竞态防护：只采纳最新一次查询的结果 */
   const seqRef = useRef(0);
@@ -56,10 +56,8 @@ export function useUsageStats(
   const lastProgressQueryRef = useRef(0);
   const openRef = useRef(open);
   openRef.current = open;
-  /** stats/phase 的权威镜像：refresh effect 里判断状态用（不进依赖数组） */
+  /** stats 的权威镜像：query 里做内容比对用（不进依赖数组） */
   const statsRef = useRef<UsageStatsPayload | null>(null);
-  const phaseRef = useRef<UsageStatsPhase>('pricing');
-  phaseRef.current = phase;
 
   const query = useCallback(async () => {
     if (!pricingRef.current || !openRef.current) return;
@@ -96,10 +94,11 @@ export function useUsageStats(
   const queryRef = useRef(query);
   queryRef.current = query;
 
-  // 打开面板 / 手动刷新：拉价（缓存命中即瞬时）→ 后台增量同步。
-  // 已就绪(ready 且有数据)时刷新**只发 sync**——synced(added>0) 驱动重查,
-  // 与自动刷新完全同路径,账本没变时零请求零渲染;
-  // 仅拉价补查与错误恢复需要主动 query(sync added=0 时不会驱动查询)
+  // 打开面板 / 手动刷新：拉价 → 重查 → 后台增量同步。
+  // loadModelPricing 每次都走：24h TTL 由其 localStorage 缓存判定（命中即瞬时），
+  // 内存引用不再永久绕过 TTL——应用常驻多日后过期价格照常重拉；
+  // 已有旧价格表时拉新失败静默沿用（不把可用面板打成错误态）。
+  // 重查毫秒级，内容未变时保留旧引用不触发重渲染（见 query）
   useEffect(() => {
     if (!open) return;
     let cancelled = false;
@@ -107,20 +106,20 @@ export function useUsageStats(
       if (!pricingRef.current) {
         setPhase('pricing');
         setError('');
-        try {
-          pricingRef.current = await loadModelPricing();
-        } catch (e) {
+      }
+      try {
+        pricingRef.current = await loadModelPricing();
+      } catch (e) {
+        if (!pricingRef.current) {
           if (!cancelled) {
             setError(String(e));
             setPhase('pricingError');
           }
           return;
         }
-        if (cancelled) return;
-        queryRef.current();
-      } else if (statsRef.current === null || phaseRef.current === 'error') {
-        queryRef.current();
       }
+      if (cancelled) return;
+      queryRef.current();
       invoke('usage_ledger_sync').catch(() => {});
     })();
     return () => {
