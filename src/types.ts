@@ -377,9 +377,16 @@ export interface PtyExitPayload {
 export interface PtyStatusChangePayload {
   ptyId: number;
   status: PaneStatus;
-  /** 状态成因(hook 事件语义):'attention' = 需要用户确认,'stop' = 一轮回答
-   *  正常结束;缺省 = 无成因信息(monitor 降级路径)。托盘黄/绿灯靠它区分。 */
-  cause?: 'attention' | 'stop';
+  /**
+   * 状态变化的成因：hook 直推时是（归一化后的）hook 事件名（`Stop` /
+   * `PermissionRequest` / `SessionEnd` …），后端 monitor 轮询算出的变化没有该字段。
+   *
+   * 多个 hook 事件都落到 `ai-idle`，但只有 `Stop` 表示"任务做完了"——权限请求、
+   * 通知、澄清同样是 ai-idle，播报成完成就是误报（见 `isAiCompletion`）。
+   * 托盘黄灯认 `PermissionRequest`/`Elicitation`（权限/确认类 Notification
+   * 已在后端按文案归一化为 `PermissionRequest`）。
+   */
+  cause?: string;
   /** 会话内 AI 命令名(claude/codex/opencode…),品牌图标兜底用;缺省 = 未知 */
   agent?: string;
 }

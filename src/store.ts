@@ -19,6 +19,7 @@ import type {
   MobileRelayStatusPayload,
   ProjectKind,
 } from './types';
+import { isAiCompletion } from './utils/aiCompletion';
 import { restoreSavedProjectLayout } from './utils/layoutRestore';
 import { playNotificationSound } from './utils/notificationSound';
 import { t } from './i18n';
@@ -561,7 +562,9 @@ interface AppStore {
   setProjectLayout: (projectId: string, layout: SplitNode | null) => void;
 
   // Pane 状态
-  updatePaneStatusByPty: (ptyId: number, status: PaneStatus, cause?: 'attention' | 'stop', agent?: string) => void;
+  /** @param cause `pty-status-change` 带的(归一化)hook 事件名:决定这次变化
+   *  算不算「任务完成」(只有 Stop)与该不该点托盘黄灯(PermissionRequest/Elicitation) */
+  updatePaneStatusByPty: (ptyId: number, status: PaneStatus, cause?: string, agent?: string) => void;
   /** 托盘绿灯的「已完成未读」pane 集合;激活主窗口时清空 */
   unreadDonePaneIds: Set<string>;
   clearUnreadDone: () => void;
@@ -849,8 +852,9 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
       // 2. 更新各项目布局中匹配 ptyId 的 pane status
       // attention 与状态解耦:codex 的 PermissionRequest 状态是 ai-working
-      // 但同样需要黄灯;用户对该 pane 键入时清除(clearPaneAttentionByPty)
-      const attention = cause === 'attention';
+      // 但同样需要黄灯;用户对该 pane 键入时清除(clearPaneAttentionByPty)。
+      // 判定按事件名:权限/确认类 Notification 已在后端归一化为 PermissionRequest
+      const attention = cause === 'PermissionRequest' || cause === 'Elicitation';
       const newStates = new Map(state.projectStates);
       let changed = false;
       for (const [pid, ps] of newStates) {
@@ -862,10 +866,13 @@ export const useAppStore = create<AppStore>((set, get) => ({
       }
       if (!changed) return state;
 
-      // 3. 完成判定:hook 的 Stop 成因是权威信号(ai-idle(待确认)→批准→Stop
-      // 这类不经过 ai-working 的路径靠它补上);无成因降级路径仍用状态迁移判定
-      const isCompletion = oldStatus === 'ai-working' && status === 'ai-idle';
-      const isDone = cause === 'stop' || isCompletion;
+      // 3. 完成判定:isAiCompletion —— ai-working → ai-idle 下降沿,且成因确实是
+      // 完成(权限请求/通知/澄清同样落 ai-idle,播报即误报;无成因 = 无 hook 的
+      // 降级路径,下降沿是唯一完成信号,放行)
+      const isCompletion = isAiCompletion(oldStatus, status, cause);
+      // hook 的 Stop 成因是权威信号:ai-idle(待确认)→批准→Stop 这类不经过
+      // ai-working 的路径靠它补上托盘绿灯(无下降沿,不播报)
+      const isDone = cause === 'Stop' || isCompletion;
       // 托盘灯互斥:一个 pane 任一时刻只贡献一种灯。进入待确认/异常时,
       // 旧的「完成未读」记录作废(否则同一 pane 黄绿双计,托盘黄绿交替误导)
       let unreadDonePaneIds = state.unreadDonePaneIds;

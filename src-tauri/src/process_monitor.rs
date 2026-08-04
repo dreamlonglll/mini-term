@@ -11,8 +11,11 @@ use tauri::{AppHandle, Emitter};
 pub struct PtyStatusChangePayload {
     pub pty_id: u32,
     pub status: String,
-    /// 状态成因(hook 事件语义):"attention" = 需要用户确认(授权/输入请求),
-    /// "stop" = 一轮回答正常结束;None = 无成因信息(monitor 降级路径)
+    /// 状态成因：hook 直推时是（归一化后的）hook 事件名（`Stop` /
+    /// `PermissionRequest` / `SessionEnd` …，见 hook_server::event_cause），
+    /// monitor 轮询算出的变化为 None。多个事件都落到 ai-idle，但只有 `Stop`
+    /// 是「任务做完了」，前端据此决定播报完成与托盘绿灯；黄灯认
+    /// `PermissionRequest`/`Elicitation`。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cause: Option<String>,
     /// 会话内 AI 命令名("claude"/"codex"/…),前端品牌图标兜底用
@@ -22,7 +25,8 @@ pub struct PtyStatusChangePayload {
     pub agent: Option<String>,
 }
 
-/// AI 输出活跃超时阈值
+/// AI 输出活跃超时阈值。**仅**用于无 hook 的降级路径（`resolve_status` 的
+/// `else if` 分支）；hook 已启用的 pane 不看输出活跃度。
 const AI_ACTIVE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// `pty-status-change` 的统一发射器：monitor 轮询与 hook server 直推
@@ -47,15 +51,16 @@ impl StatusEmitter {
 
     /// 与上次发出的状态不同才 emit。
     /// cause 规则:
-    /// - 状态变化 → 总是 emit(cause 取本次值,None 会清掉前端 attention 标注,
-    ///   这正是「用户批准后下一个事件自然熄灭黄灯」的路径);
+    /// - 状态变化 → 总是 emit(cause 取本次值,None/非 attention 类事件会清掉
+    ///   前端 attention 标注,这正是「用户批准后下一个事件自然熄灭黄灯」的路径);
     /// - 状态相同 + cause=None → **跳过**:monitor 每 500ms 以无成因方式重发
     ///   hook 状态,若放行会在黄灯点亮后 500ms 内把 attention 抹掉
     ///   (黄灯闪一下就被蓝色顶掉的根因);
-    /// - 状态相同 + cause=attention → **总是 emit**:黄灯的清除发生在前端
-    ///   (用户键入即批准),后端去重表感知不到;若按相同 cause 去重,
-    ///   同一轮内第二次授权请求会被吞掉,黄灯不再点亮;
-    /// - 状态相同 + 其他 cause 变化 → emit(如 attention → stop)。
+    /// - 状态相同 + cause 为 attention 类事件(PermissionRequest/Elicitation)
+    ///   → **总是 emit**:黄灯的清除发生在前端(用户键入即批准),后端去重表
+    ///   感知不到;若按相同 cause 去重,同一轮内第二次授权请求会被吞掉;
+    /// - 状态相同 + 其他 cause 与上次相同 → 跳过;变化 → emit(如
+    ///   PermissionRequest → Stop)。
     pub fn emit_if_changed(
         &self,
         app: &AppHandle,
@@ -69,7 +74,7 @@ impl StatusEmitter {
             if prev_status == status {
                 match cause {
                     None => return,
-                    Some("attention") => {}
+                    Some("PermissionRequest") | Some("Elicitation") => {}
                     Some(c) if prev_cause.as_deref() == Some(c) => return,
                     _ => {}
                 }
@@ -95,36 +100,34 @@ impl StatusEmitter {
 
 /// 单个 pty 的状态判定（monitor 每轮对每个 pty 调一次）。
 ///
-/// Hook 一旦启用即为权威，唯一兜底：hook 停在 ai-working 但 AI 已连续
-/// AI_ACTIVE_TIMEOUT 无输出，视为空闲——hook 的完成事件（Stop/Notification）
-/// 可能丢失或延迟。
+/// Hook 一旦启用即为**绝对**权威：状态完全由 hook 事件决定，PTY 输出活跃度
+/// 不参与判定。
+///
+/// 这里曾有一条兜底——"hook 停在 ai-working 但连续 AI_ACTIVE_TIMEOUT 无输出即
+/// 视为 ai-idle"（后又给 API 重试加了 retry_hold 豁免）。它是**无记忆**的：每轮
+/// 500ms 重算，降级结果不落盘，hook_status 本身仍是 ai-working。于是只要
+/// hook_status 卡住（Stop 丢失，或 Stop 之后又收到同会话迟到的 PostToolUse），
+/// AI 空闲期每一次零星伪输出（TUI 定时重绘等）都会把状态抬回 ai-working、
+/// 3 秒后再落回 ai-idle，形成以伪输出间隔为周期的脉冲（实测 20~50s 一轮），
+/// 每个下降沿被前端当成一次"任务完成"反复播报。v0.9.3 起整条兜底删除
+/// （retry_hold 机制随之失去消费者一并移除）：宁可徽章残留也不制造假完成——
+/// Stop 丢失时 pane 停在 ai-working，直到下一个 hook 事件或 SessionEnd 才恢复，
+/// 罕见、纯视觉、下一轮对话即自愈，与 SessionEnd 丢失残留 ai-idle 同一口径。
 ///
 /// 退出的唯一权威信号是 SessionEnd hook（hook_server 处理：清状态 + 直推 idle）。
 /// 这里**不能**根据输入检测（is_ai_session）把 hook 状态拆掉降级 idle：
 /// 输入检测会漏判启动（别名/包装脚本）、误判退出（任务运行中双击 Ctrl+C 只是
 /// 打断并不退出），曾经的 "ai-idle && !is_ai_session → idle" 兜底会把这类
-/// 误差放大成 pane 整个会话期永久显示 idle。SessionEnd 丢失（claude 被外部
-/// kill 等）时状态残留在 ai-idle 徽章，是有意接受的失败模式——罕见、纯视觉、
-/// 该 pane 下次启动 AI 会话即自愈。
+/// 误差放大成 pane 整个会话期永久显示 idle。
 pub(crate) fn resolve_status(
     hook_state: &HookState,
     pty_manager: &crate::pty::PtyManager,
     pty_id: u32,
 ) -> String {
     if hook_state.is_hook_enabled(pty_id) {
-        let hook_status = hook_state
+        hook_state
             .get_status(pty_id)
-            .unwrap_or_else(|| "idle".to_string());
-        // 无输出超时降级是防 hook 漏发 Stop 的兜底;重试保持态(API 退避等待,
-        // TUI 静止属正常)期间豁免,否则重试中被降为 ai-idle 会被前端当作完成
-        if hook_status == "ai-working"
-            && !hook_state.is_retry_hold(pty_id)
-            && !pty_manager.has_recent_output(pty_id, AI_ACTIVE_TIMEOUT)
-        {
-            "ai-idle".to_string()
-        } else {
-            hook_status
-        }
+            .unwrap_or_else(|| "idle".to_string())
     } else if pty_manager.is_ai_session(pty_id) {
         // 未启用 hook 时降级到进程轮询逻辑
         if pty_manager.has_recent_output(pty_id, AI_ACTIVE_TIMEOUT) {
@@ -189,10 +192,15 @@ mod tests {
         assert_eq!(resolve_status(&hooks, &mgr, 1), "ai-idle");
     }
 
-    /// 同上但打断后没有任何 hook 事件（Stop 在用户主动打断时不触发）：
-    /// hook 停在 ai-working、无输出 → 按超时兜底降到 ai-idle，而不是 idle。
+    /// 回归测试（AI 完成通知每 20~50s 重复播报的 bug）：hook 卡在 ai-working
+    /// 且无 PTY 输出时，**不再**按输出超时降级为 ai-idle。
+    ///
+    /// 旧行为在这里返回 ai-idle，而 hook_status 仍是 ai-working、降级结果不落盘；
+    /// 于是 AI 空闲期的零星伪输出会把状态抬回 ai-working，3 秒后再落回 ai-idle，
+    /// 每个下降沿被前端当成一次"任务完成"。现在 hook 是绝对权威，代价是 Stop
+    /// 丢失时徽章残留 ai-working（详见 `resolve_status` 文档）。
     #[test]
-    fn double_ctrlc_interrupt_with_stuck_ai_working_degrades_to_ai_idle() {
+    fn stuck_ai_working_is_not_degraded_by_output_timeout() {
         let hooks = HookState::new();
         let mgr = PtyManager::new();
 
@@ -202,7 +210,7 @@ mod tests {
         mgr.track_input(1, "\x03");
         // 无后续 hook 事件、无 PTY 输出（has_recent_output 为 false）
 
-        assert_eq!(resolve_status(&hooks, &mgr, 1), "ai-idle");
+        assert_eq!(resolve_status(&hooks, &mgr, 1), "ai-working");
     }
 
     /// 启动方式漏检（别名/包装脚本，输入检测从未标记 is_ai_session）时，
