@@ -232,6 +232,8 @@ export interface SavedPane {
 export interface AiSessionRef {
   agent?: string;
   sessionId: string;
+  /** 会话启动目录:claude --resume 只认该目录对应的会话桶,续接时 PTY 以它为 cwd */
+  cwd?: string;
 }
 
 export type SavedSplitNode =
@@ -402,6 +404,7 @@ export interface PtyAiSessionPayload {
   ptyId: number;
   agent?: string;
   sessionId: string;
+  cwd?: string;
 }
 
 export interface FsChangePayload {

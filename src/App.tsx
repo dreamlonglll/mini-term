@@ -276,6 +276,7 @@ export function App() {
     const projectId = setPaneAiSessionByPty(payload.ptyId, {
       agent: payload.agent,
       sessionId: payload.sessionId,
+      cwd: payload.cwd,
     });
     if (projectId) saveLayoutToConfig(projectId);
   }, []));

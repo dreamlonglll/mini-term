@@ -140,6 +140,7 @@ pub fn run() {
             fs::delete_entry,
             fs::filter_directories,
             ai_sessions::get_ai_sessions,
+            ai_sessions::lookup_ai_session_cwd,
             ai_sessions::get_wsl_ai_sessions,
             ai_sessions::get_ai_session_content,
             remote_ssh::ssh_remote_list_directory,
