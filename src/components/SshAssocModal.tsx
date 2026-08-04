@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { useAppStore } from '../store';
+import { useAppStore, saveConfigToDisk } from '../store';
 import { showAlert } from '../utils/prompt';
 import { buildGroupBuckets, connectionSummary, GroupSidebarRow } from './SshModal';
 import type { SshGroupBucket } from './SshModal';
@@ -124,7 +124,7 @@ export function SshAssocModal({ project, onClose }: Props) {
         ),
       };
       useAppStore.getState().setConfig(newConfig);
-      await invoke('save_config', { config: newConfig });
+      await saveConfigToDisk(newConfig);
       onClose();
 
       // 幂等 reconcile / 存量迁移：落盘即可，不弹提示。

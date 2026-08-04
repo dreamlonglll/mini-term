@@ -10,6 +10,8 @@ import { openExternalUrl } from '../utils/externalLink';
 import { showConfirm } from '../utils/prompt';
 import { useOverlayPresence } from '../hooks/useOverlayMotion';
 import { useTauriEvent } from '../hooks/useTauriEvent';
+import { useFileIcons } from '../hooks/useFileIcons';
+import { resolveFileIcon } from '../utils/fileIcon';
 import { Modal } from './Modal';
 import { CodeEditor, type CodeEditorApi } from './CodeEditor';
 import { useT } from '../i18n';
@@ -92,6 +94,8 @@ const headingComponents = {
 
 export function FileViewerModal({ open, onClose, filePath, projectRoot, highlightLine }: FileViewerModalProps) {
   const t = useT();
+  // 文件类型图标懒加载(通常已由 FileTree 触发,这里兜底并在就绪时重渲染标题)
+  useFileIcons();
   const [result, setResult] = useState<FileContentResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -302,6 +306,7 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
   if (!present) return null;
 
   const fileName = currentPath.replace(/\\/g, '/').split('/').pop() ?? currentPath;
+  const fileIconSrc = resolveFileIcon(fileName, false);
 
   return (
     <Modal open={open} onClose={requestClose} align="center" ariaLabel={fileName}
@@ -317,6 +322,9 @@ export function FileViewerModal({ open, onClose, filePath, projectRoot, highligh
               >
                 ←
               </button>
+            )}
+            {fileIconSrc && (
+              <img src={fileIconSrc} className="mt-icon mt-icon-file w-4 h-4 flex-shrink-0" alt="" aria-hidden draggable={false} />
             )}
             <span className="text-base font-medium text-[var(--accent)] flex-shrink-0">{fileName}</span>
             {dirty && (

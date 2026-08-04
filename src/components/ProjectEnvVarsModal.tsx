@@ -1,6 +1,5 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { invoke } from '@tauri-apps/api/core';
-import { useAppStore } from '../store';
+import { useAppStore, saveConfigToDisk } from '../store';
 import { showAlert } from '../utils/prompt';
 import { isWslPath } from '../utils/wslPath';
 import { Modal, ModalCloseButton } from './Modal';
@@ -143,7 +142,7 @@ export function ProjectEnvVarsModal({ project, onClose }: Props) {
     // store 与 config.json 不一致导致下次启动丢用户改动。
     useAppStore.getState().setConfig(newConfig);
     try {
-      await invoke('save_config', { config: newConfig });
+      await saveConfigToDisk(newConfig);
       onClose();
     } catch (e) {
       useAppStore.getState().setConfig(prevConfig);

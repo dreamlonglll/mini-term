@@ -4,7 +4,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
 import { revealItemInDir } from '@tauri-apps/plugin-opener';
 import { getCurrentWindow } from '@tauri-apps/api/window';
-import { useAppStore, genId } from '../store';
+import { useAppStore, genId, saveConfigToDisk } from '../store';
 import { removeProjectWithCleanup } from '../utils/projectActions';
 import { collectWorktreeProbePaths, findStaleWorktreeProjects } from '../utils/worktreeReconcile';
 import { StatusDot } from './StatusDot';
@@ -20,6 +20,14 @@ import type { MenuEntry } from '../utils/contextMenu';
 import { showConfirm, showPrompt } from '../utils/prompt';
 import { initProjectDrag, isProjectDragging, getProjectDragPayload, onProjectDragEnd } from '../utils/projectDragState';
 import { isWslPath } from '../utils/wslPath';
+import { useProjectKinds } from '../hooks/useProjectKinds';
+import { PROJECT_KINDS, PROJECT_KIND_LABELS } from '../utils/projectKind';
+import type { ProjectKind } from '../utils/projectKind';
+import { TechIcon } from './TechIcon';
+import { BrandIcon } from './BrandIcon';
+import { inferVendor } from '../utils/inferVendor';
+import type { AiVendor } from '../utils/inferVendor';
+import { Boxes, Package, Server } from './icons';
 import { useT } from '../i18n';
 import {
   getOrderedTree,
@@ -32,12 +40,12 @@ import {
   findGroupInTree,
   MAX_DEPTH,
 } from '../utils/projectTree';
-import type { PaneStatus, SplitNode, ProjectConfig, ProjectGroup, ProjectTreeItem, WslDistro } from '../types';
+import type { PaneStatus, PaneState, SplitNode, ProjectConfig, ProjectGroup, ProjectTreeItem, WslDistro } from '../types';
 
 // 保存配置的快捷方法
 function saveConfig() {
   const config = useAppStore.getState().config;
-  invoke('save_config', { config });
+  saveConfigToDisk(config);
 }
 
 // 模块级缓存:WSL 发行版列表只 invoke 一次。
@@ -105,6 +113,21 @@ interface DropIndicator {
   forbidden?: boolean;
 }
 
+/** 收集布局树里与 AI 会话相关的 pane:正在跑(ai-*)或持有会话身份
+ *  (aiSession,含重启后待续接的 pane —— 重启不该丢图标)。 */
+function collectAiPanes(node: SplitNode | null | undefined): PaneState[] {
+  if (!node) return [];
+  if (node.type === 'leaf') {
+    return node.panes.filter(
+      (p) => p.status === 'ai-working' || p.status === 'ai-idle' || p.aiSession,
+    );
+  }
+  return node.children.flatMap((c) => collectAiPanes(c));
+}
+
+/** AI 品牌图标尺寸(px);图标间与领位图标后均留 2px 小间距,并排不重叠。 */
+const AI_ICON_SIZE = 14;
+
 export function ProjectList() {
   const t = useT();
   const config = useAppStore((s) => s.config);
@@ -136,6 +159,9 @@ export function ProjectList() {
   const projectListRef = useRef<HTMLDivElement>(null);
 
   const orderedItems = getOrderedTree(config);
+
+  // 项目类型徽标:本地项目自动探测,远程项目由 FileTree 首次展开时喂入
+  const projectKinds = useProjectKinds(config.projects);
 
   // 预取 WSL 发行版列表,保证右键菜单构建时缓存已就绪
   useEffect(() => {
@@ -212,6 +238,19 @@ export function ProjectList() {
     };
   }, []);
 
+  // 写入项目类型徽标覆盖(undefined = 自动探测,'none' = 不显示),并持久化
+  const setProjectKindOverride = useCallback((projectId: string, kind: ProjectKind | 'none' | undefined) => {
+    const cfg = useAppStore.getState().config;
+    const newConfig = {
+      ...cfg,
+      projects: cfg.projects.map((p) =>
+        p.id === projectId ? { ...p, kindOverride: kind } : p,
+      ),
+    };
+    useAppStore.getState().setConfig(newConfig);
+    saveConfigToDisk(newConfig);
+  }, []);
+
   // 写入项目的 WSL 会话来源发行版(undefined = 不启用),并持久化
   const setWslSessionsDistro = useCallback((projectId: string, distro: string | undefined) => {
     const cfg = useAppStore.getState().config;
@@ -222,7 +261,7 @@ export function ProjectList() {
       ),
     };
     useAppStore.getState().setConfig(newConfig);
-    invoke('save_config', { config: newConfig });
+    saveConfigToDisk(newConfig);
   }, []);
 
   // === 系统文件拖放（从资源管理器拖入文件夹添加项目） ===
@@ -519,6 +558,29 @@ export function ProjectList() {
     const isChild = !!project.parentProjectId;
     // 项目路径是某仓库的 linked worktree → 显示 ⎇ 分支徽章
     const wtBranch = isRemote ? undefined : worktreeBranches.get(project.path);
+    // 技术栈徽标:手动覆盖 > 自动探测;'none' = 用户关闭
+    const projectKind: ProjectKind | null =
+      project.kindOverride === 'none'
+        ? null
+        : project.kindOverride ?? projectKinds.get(project.id) ?? null;
+    // 打开 pane 里的 AI 会话:有则领位图标换成品牌图标堆叠(哪家 AI 在跑一眼可见)。
+    // 按厂商去重 —— 同款 AI 开多个 pane 只显示一枚,重叠一摞并不好看;
+    // 再按厂商名字母序排列,不随开 pane 顺序漂移(未知厂商固定排最后)
+    const aiVendors: (AiVendor | null)[] = [];
+    {
+      const seen = new Set<string>();
+      for (const p of collectAiPanes(projectPs?.layout)) {
+        const v = inferVendor({ agent: p.aiSession?.agent ?? p.detectedAgent });
+        const key = v ?? 'unknown';
+        if (!seen.has(key)) {
+          seen.add(key);
+          aiVendors.push(v);
+        }
+      }
+      aiVendors.sort((a, b) =>
+        a === null ? 1 : b === null ? -1 : a.localeCompare(b),
+      );
+    }
 
     return (
       <div
@@ -528,7 +590,12 @@ export function ProjectList() {
             ? 'bg-[var(--accent-subtle)] text-[var(--accent)]'
             : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--border-subtle)]'
         }`}
-        style={{ paddingLeft: `${depth * 16 + 10}px`, paddingRight: '10px' }}
+        style={{
+          // 组内项目对齐父级分组的倒三角区域((depth-1)*16 起,+16 不贴左缘),
+          // 顶层项目维持原有 10px
+          paddingLeft: `${depth === 0 ? 10 : (depth - 1) * 16 + 16}px`,
+          paddingRight: '10px',
+        }}
         role="option"
         aria-selected={isActive}
         tabIndex={0}
@@ -558,6 +625,19 @@ export function ProjectList() {
           // 路径也不是本机可打开的位置。保留:重命名 / 复制绝对路径（远程 POSIX）/ 分组操作。
           const menuItems: Parameters<typeof showContextMenu>[2] = [
             { label: t('projectList.menu.rename'), onClick: () => startRenameProject(project.id, project.name) },
+            {
+              label: t('projectList.menu.editDescription'),
+              onClick: async () => {
+                const next = await showPrompt(
+                  t('projectList.menu.editDescription'),
+                  t('projectList.descriptionPlaceholder'),
+                  project.description ?? '',
+                );
+                if (next === null) return;
+                useAppStore.getState().setProjectDescription(project.id, next.trim());
+                saveConfig();
+              },
+            },
             ...(isRemote ? [] : [
               { label: t('projectList.menu.openInFolder'), onClick: () => revealItemInDir(project.path) },
             ]),
@@ -606,6 +686,32 @@ export function ProjectList() {
               menuItems.push({ label: t('projectList.menu.wslSessions'), submenu });
             }
           }
+          // 「项目类型」子菜单:探测只提供默认值,允许手动指定或关闭徽标;
+          // 远程项目领位固定 SSH 图标,不显示该菜单
+          if (!isRemote) {
+            const currentKind = project.kindOverride;
+            const detected = projectKinds.get(project.id);
+            menuItems.push({
+              label: t('projectList.menu.projectKind'),
+              submenu: [
+                {
+                  label: `${currentKind === undefined ? '✓ ' : '　'}${t('projectList.menu.projectKindAuto')}${
+                    detected ? `（${PROJECT_KIND_LABELS[detected]}）` : ''
+                  }`,
+                  onClick: () => setProjectKindOverride(project.id, undefined),
+                },
+                {
+                  label: `${currentKind === 'none' ? '✓ ' : '　'}${t('projectList.menu.projectKindHidden')}`,
+                  onClick: () => setProjectKindOverride(project.id, 'none'),
+                },
+                { separator: true },
+                ...PROJECT_KINDS.map((k) => ({
+                  label: `${currentKind === k ? '✓ ' : '　'}${PROJECT_KIND_LABELS[k]}`,
+                  onClick: () => setProjectKindOverride(project.id, k),
+                })),
+              ],
+            });
+          }
           // 添加分组相关菜单
           // 子项目不在树里(位置由父项目派生),没有「当前所在组」可言 ——
           // 选任意组都是有效动作(顺带脱离父项目),所以不传 currentParentId
@@ -651,6 +757,33 @@ export function ProjectList() {
         {isActive && (
           <span className="w-0.5 h-4 rounded-full bg-[var(--accent)] flex-shrink-0" />
         )}
+        {/* 领位:项目身份图标恒显(SSH > 技术栈 > 通用),AI 品牌堆叠只追加不覆盖 */}
+        {isRemote ? (
+          <Server
+            size={14}
+            strokeWidth={1.5}
+            aria-hidden
+            className={`flex-shrink-0 ${remoteBroken ? 'text-[var(--color-error)]' : 'text-[var(--color-info)]'}`}
+          />
+        ) : projectKind ? (
+          <TechIcon kind={projectKind} size={14} className="flex-shrink-0" />
+        ) : (
+          // 识别不出 / 用户选「不显示」:回退通用项目图标(主题文件色),每行都有图标、缩进对齐
+          <Package size={14} strokeWidth={1.5} aria-hidden className="flex-shrink-0 text-[var(--color-file)]" />
+        )}
+        {aiVendors.length > 0 && (
+          // 固定 text-secondary 颜色上下文:单色品牌图标(OpenAI/Grok…)与 pane
+          // 标签观感一致,不随选中行的 accent 变色。
+          // 负边距抵掉行内 gap-2,与领位图标只留 2px 小间隙;图标间同样 2px 并排不重叠
+          <span
+            className="flex items-center flex-shrink-0 text-[var(--text-secondary)]"
+            style={{ marginLeft: -6, gap: 2 }}
+          >
+            {aiVendors.map((v) => (
+              <BrandIcon key={v ?? 'unknown'} vendor={v} size={AI_ICON_SIZE} />
+            ))}
+          </span>
+        )}
         {editingProjectId === project.id ? (
           <input
             ref={editProjectInputRef}
@@ -666,7 +799,14 @@ export function ProjectList() {
             autoFocus
           />
         ) : (
-          <span className="truncate flex-1">{project.name}</span>
+          <span className="truncate flex-1">
+            {project.name}
+            {project.description && (
+              <span className="ml-1.5 text-xs text-[var(--text-muted)]" title={project.description}>
+                {project.description}
+              </span>
+            )}
+          </span>
         )}
         {wtBranch && (
           <span
@@ -792,6 +932,8 @@ export function ProjectList() {
             style={{ transform: group.collapsed ? 'rotate(-90deg)' : undefined }}>
             ▾
           </span>
+          {/* 分组 = 空间:用 Boxes 图标,着主题文件夹色(容器语义,四套主题自适配) */}
+          <Boxes size={13} strokeWidth={1.5} aria-hidden className="flex-shrink-0 text-[var(--color-folder)]" />
           {isEditing ? (
             <input
               ref={editInputRef}

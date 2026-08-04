@@ -81,11 +81,14 @@ export function TerminalInstance({ ptyId }: Props) {
   const t = useT();
   const containerRef = useRef<HTMLDivElement>(null);
   const [fileDrag, setFileDrag] = useState(false);
+  // 拖选停留 2s 自动复制:气泡位置(相对终端容器),null = 不显示
+  const [copiedTip, setCopiedTip] = useState<{ x: number; y: number } | null>(null);
   const terminalFontSize = useAppStore((s) => s.config.terminalFontSize);
   const terminalFontFamily = useAppStore((s) => s.config.terminalFontFamily);
   const terminalLigatures = useAppStore((s) => s.config.terminalLigatures);
   const terminalFollowTheme = useAppStore((s) => s.config.terminalFollowTheme);
   const sshConnections = useAppStore((s) => s.config.sshConnections);
+  const selectionAutoCopySecs = useAppStore((s) => s.config.selectionAutoCopySecs ?? 1);
 
   // 终端不跟随主题且处于浅色模式时，覆写 CSS 变量让整个终端区域（含 .xterm）统一深色
   const forceDarkBg = !terminalFollowTheme && getResolvedTheme() === 'light';
@@ -220,6 +223,75 @@ export function TerminalInstance({ ptyId }: Props) {
   // 内部拖拽（FileTree → 终端）：自定义鼠标事件，规避 WebView2 dragDropEnabled 拦截
   const dropZoneRef = useRef<HTMLDivElement>(null);
 
+  // 拖选停留 2s 自动复制:按住左键且鼠标静止 2s 后,若有选区则复制并显示「已复制」气泡。
+  // 状态存 ref 不进 React state —— mousemove 高频,进 state 会拖垮渲染。
+  useEffect(() => {
+    const zone = dropZoneRef.current;
+    if (!zone) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let tipTimer: ReturnType<typeof setTimeout> | undefined;
+    let tracking = false;
+    let copiedThisPress = false;
+    let lastX = 0;
+    let lastY = 0;
+
+    const clearDwell = () => { if (timer) { clearTimeout(timer); timer = undefined; } };
+
+    const armDwell = () => {
+      clearDwell();
+      timer = setTimeout(() => {
+        if (!tracking || copiedThisPress) return;
+        if (!getCachedTerminal(ptyId)?.term.hasSelection()) return;
+        void copyTerminalSelection(ptyId).then((ok) => {
+          if (!ok) return;
+          copiedThisPress = true;
+          const rect = zone.getBoundingClientRect();
+          // 贴边时往容器内收,避免气泡被裁掉
+          setCopiedTip({
+            x: Math.min(lastX - rect.left + 12, rect.width - 70),
+            y: Math.max(lastY - rect.top - 30, 4),
+          });
+          if (tipTimer) clearTimeout(tipTimer);
+          tipTimer = setTimeout(() => setCopiedTip(null), 1000);
+        });
+      }, selectionAutoCopySecs * 1000);
+    };
+
+    const onMouseDown = (e: MouseEvent) => {
+      if (e.button !== 0) return;
+      tracking = true;
+      copiedThisPress = false;
+      lastX = e.clientX;
+      lastY = e.clientY;
+      armDwell();
+    };
+    const onMouseMove = (e: MouseEvent) => {
+      if (!tracking) return;
+      // 4px 阈值过滤手抖,否则定时器永远在被重置
+      if (Math.abs(e.clientX - lastX) < 4 && Math.abs(e.clientY - lastY) < 4) return;
+      lastX = e.clientX;
+      lastY = e.clientY;
+      armDwell();
+    };
+    // mouseup 挂 document:拖选常在终端区域外松手,挂容器会漏掉导致状态卡死
+    const onMouseUp = () => {
+      tracking = false;
+      clearDwell();
+    };
+
+    zone.addEventListener('mousedown', onMouseDown);
+    document.addEventListener('mousemove', onMouseMove);
+    document.addEventListener('mouseup', onMouseUp);
+    return () => {
+      zone.removeEventListener('mousedown', onMouseDown);
+      document.removeEventListener('mousemove', onMouseMove);
+      document.removeEventListener('mouseup', onMouseUp);
+      clearDwell();
+      if (tipTimer) clearTimeout(tipTimer);
+      setCopiedTip(null);
+    };
+  }, [ptyId, selectionAutoCopySecs]);
+
   const handleMouseMove = useCallback(() => {
     if (isFileDragging() && !fileDrag) setFileDrag(true);
   }, [fileDrag]);
@@ -280,6 +352,15 @@ export function TerminalInstance({ ptyId }: Props) {
             外层带 data-pty-id 的盒子不参与动画 —— 查找条与拖拽命中都按它的
             矩形定位，跟着一起位移会让它们在这 0.2s 里飘一下 */}
         <div key={ptyId} ref={containerRef} className="absolute top-1.5 bottom-0 left-2.5 right-0 terminal-swap-in" />
+
+        {copiedTip && (
+          <span
+            className="absolute z-10 pointer-events-none text-xs px-2 py-0.5 rounded-[var(--radius-md)] text-[var(--accent)]"
+            style={{ left: copiedTip.x, top: copiedTip.y, background: 'var(--bg-overlay)', border: '1px solid var(--border-subtle)', animation: 'overlayFadeIn 0.15s ease-out' }}
+          >
+            {t('terminal.copied')}
+          </span>
+        )}
 
         {fileDrag && (
           <div

@@ -47,6 +47,12 @@ export interface AppConfig {
   lastActiveProjectId?: string;
   hookEnabled: boolean;
   smartCopyPaste: boolean;
+  /** 菜单栏项目状态灯总开关;undefined = 开启 */
+  trayStatusEnabled?: boolean;
+  /** 托盘右键菜单最多显示的活跃项目数;undefined = 5 */
+  trayMaxProjects?: number;
+  /** 拖选按住不动自动复制的静止时长(秒);undefined = 1 */
+  selectionAutoCopySecs?: number;
   sshConnections: SshConnection[];
   /** 显式创建的 SSH 分组名（允许空分组）。连接的 group 字段仍是归属单一来源 */
   sshGroups?: string[];
@@ -130,6 +136,8 @@ export interface ProjectConfig {
   id: string;
   name: string;
   path: string;
+  /** 需求描述,显示在项目名后的灰色小字;undefined/空 = 不显示 */
+  description?: string;
   savedLayout?: SavedProjectLayout;
   expandedDirs?: string[];
   /** 是否已为该项目启用 SSH 工具（向项目目录生成了 Claude / Codex 的 SKILL.md；
@@ -150,7 +158,36 @@ export interface ProjectConfig {
   /** 子项目(worktree「设为项目」)：有值 = 渲染在该父项目下方缩进一级,
    *  且**不进 projectTree**(树里只有顶层项目与分组)。拖出/「脱离父项目」时清除并入树。 */
   parentProjectId?: string;
+  /** 项目类型徽标覆盖:undefined = 自动探测,'none' = 不显示,其余为技术栈 key。 */
+  kindOverride?: ProjectKind | 'none';
 }
+
+/** 技术栈类型 key（项目类型徽标/探测结果）。展示名与探测规则在 utils/projectKind.ts。 */
+export type ProjectKind =
+  | 'java'
+  | 'rust'
+  | 'go'
+  | 'python'
+  | 'flutter'
+  | 'php'
+  | 'vuejs'
+  | 'nextjs'
+  | 'react'
+  | 'svelte'
+  | 'vite'
+  | 'nodejs';
+
+/** AI 厂商 key（pane 徽标/品牌图标）。推断规则在 utils/inferVendor.ts。 */
+export type AiVendor =
+  | 'claude'
+  | 'openai'
+  | 'gemini'
+  | 'opencode'
+  | 'grok'
+  | 'qwen'
+  | 'deepseek'
+  | 'copilot'
+  | 'ollama';
 
 export interface ProjectEnvVar {
   key: string;
@@ -187,6 +224,14 @@ export interface SavedPane {
   shellName: string;
   /** 工作目录覆盖(worktree 终端):有值则替代项目根作为 PTY cwd */
   cwd?: string;
+  /** 退出时该 pane 正在跑的 AI 会话;重启后据此自动 resume 续接 */
+  aiSession?: AiSessionRef;
+}
+
+/** hook 上报的 AI 会话身份(agent 缺省按 Claude 处理)。 */
+export interface AiSessionRef {
+  agent?: string;
+  sessionId: string;
 }
 
 export type SavedSplitNode =
@@ -251,6 +296,18 @@ export interface PaneState {
   ptyId?: number;
   /** 工作目录覆盖(worktree 终端):有值则替代项目根作为 PTY cwd,随布局持久化 */
   cwd?: string;
+  /** 当前/上次 AI 会话身份(hook 上报),随布局持久化;会话正常退出时清除。
+   *  身份在 resume 后**保留**(codex resume 不会重新上报 SessionStart,
+   *  写完即清会让身份在第二次重启时断代),hook 上报新身份时自然覆盖。 */
+  aiSession?: AiSessionRef;
+  /** 待续接标记:恢复布局时随 aiSession 置位,PaneGroup 起 PTY 写完 resume
+   *  命令后清除(只清标记不清身份);运行时状态不持久化。 */
+  resumePending?: boolean;
+  /** 后端识别的会话内 AI 命令名(输入检测/hook 兜底);运行时状态不持久化。
+   *  品牌图标优先用 aiSession.agent,无 hook 时靠它。 */
+  detectedAgent?: string;
+  /** ai-idle 的成因是「需要用户确认」(授权/输入请求);运行时状态不持久化 */
+  attention?: boolean;
 }
 
 // === AI 会话 ===
@@ -300,6 +357,9 @@ export interface FileEntry {
   isDir: boolean;
   ignored?: boolean;
   children?: FileEntry[];
+  /** 单链目录汇总(compact)后链上各段的真实路径(含链首与链尾)。前端
+   *  compactDirChains 附加,非后端字段;watch 注册与中段变化判定用。 */
+  chainPaths?: string[];
 }
 
 // === Tauri 事件 payload ===
@@ -318,13 +378,30 @@ export interface PtyStatusChangePayload {
   ptyId: number;
   status: PaneStatus;
   /**
-   * 状态变化的成因：hook 直推时是 hook 事件名（`Stop` / `PermissionRequest` /
-   * `SessionEnd` …），后端 monitor 轮询算出的变化没有该字段。
+   * 状态变化的成因：hook 直推时是（归一化后的）hook 事件名（`Stop` /
+   * `PermissionRequest` / `SessionEnd` …），后端 monitor 轮询算出的变化没有该字段。
    *
    * 多个 hook 事件都落到 `ai-idle`，但只有 `Stop` 表示"任务做完了"——权限请求、
-   * 通知、澄清同样是 ai-idle，播报成完成就是误报。见 `isAiCompletion`。
+   * 通知、澄清同样是 ai-idle，播报成完成就是误报（见 `isAiCompletion`）。
+   * 托盘黄灯认 `PermissionRequest`/`Elicitation`（权限/确认类 Notification
+   * 已在后端按文案归一化为 `PermissionRequest`）。
    */
   cause?: string;
+  /** 会话内 AI 命令名(claude/codex/opencode…),品牌图标兜底用;缺省 = 未知 */
+  agent?: string;
+}
+
+/** load_config 命令返回:配置 + 本次写盘令牌(config.rs LoadedConfig 镜像)。 */
+export interface LoadedConfig {
+  config: AppConfig;
+  token: number;
+}
+
+/** pty-ai-session 事件载荷:hook 上报的 AI 会话身份,供重启后 resume 续接。 */
+export interface PtyAiSessionPayload {
+  ptyId: number;
+  agent?: string;
+  sessionId: string;
 }
 
 export interface FsChangePayload {
@@ -466,4 +543,101 @@ export interface AiMarker {
   ts: number;            // epoch ms
   xtermMarkerId: number; // xterm IMarker.id,用于查找 module-local 缓存
   inProgress: boolean;   // 最后一个 marker 为 true,新 marker 到来时前一个翻 false
+}
+
+// === 使用统计（对齐 Rust usage_stats camelCase 序列化） ===
+
+export type UsageAgentFilter = 'all' | 'claude' | 'codex';
+export type UsageRange = 'today' | 'days7' | 'days30' | 'month' | 'months3' | 'months6' | 'custom';
+
+/** 单模型价格（$/token，前端拉 models.dev 后 ÷1e6 归一） */
+export interface ModelPriceEntry {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+}
+
+export interface UsageDailyStat {
+  /** 日粒度 "YYYY-MM-DD"；「今天」视图为小时粒度 "HH:00"（均本地时区） */
+  date: string;
+  cost: number;
+  calls: number;
+  /** hover 详情用的 token 明细 */
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+}
+
+export interface UsageProjectStat {
+  path: string;
+  name: string;
+  cost: number;
+  sessions: number;
+  calls: number;
+  tokens: number;
+}
+
+export interface UsageTopSessionStat {
+  sessionId: string;
+  agent: string;
+  projectPath: string;
+  projectName: string;
+  title: string;
+  timestamp: string; // "YYYY-MM-DD"（本地日历日）
+  cost: number;
+  calls: number;
+  tokens: number;
+}
+
+export interface UsageModelStat {
+  /** 归一后的模型名（剥日期/provider 前缀）；空串 = 未知模型 */
+  model: string;
+  cost: number;
+  calls: number;
+  tokens: number;
+}
+
+export interface UsageProviderStat {
+  /** 供应商展示名（baseurl 的 host） */
+  provider: string;
+  cost: number;
+  calls: number;
+  tokens: number;
+  sessions: number;
+}
+
+/** 计数排行条目（工具/Shell/MCP，设计 §2.2 各前 10） */
+export interface UsageCountStat {
+  name: string;
+  count: number;
+}
+
+export interface UsageStatsPayload {
+  totalCost: number;
+  totalCalls: number;
+  sessionCount: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  daily: UsageDailyStat[];
+  byProject: UsageProjectStat[];
+  byModel: UsageModelStat[];
+  byProvider: UsageProviderStat[];
+  topSessions: UsageTopSessionStat[];
+  byTool: UsageCountStat[];
+  byShell: UsageCountStat[];
+  byMcp: UsageCountStat[];
+}
+
+export interface UsageLedgerProgressPayload {
+  /** backfill（账本首建全量同步）进度：已处理/总文件数 */
+  processed: number;
+  total: number;
+}
+
+export interface UsageLedgerSyncedPayload {
+  /** 本轮增量同步重解析的文件数；0 = 账本无变化 */
+  added: number;
 }

@@ -4,6 +4,8 @@ version = "0.9.3"
 description = "mini-term: AI-aware desktop terminal manager built on Tauri v2 — multi-project, multi-tab, split-pane"
 authors = ["you"]
 edition = "2021"
+# libsqlite3-sys 0.38 的 build.rs 用 cfg_select!(1.95 起稳定),旧工具链在此得到清晰报错
+rust-version = "1.95"
 default-run = "tauri-app"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -28,7 +30,7 @@ mt-ssh = { path = "mt-ssh" }
 # 远程 SSH 能力需要的 tokio 面:time(外层超时)、io-util(SFTP 流读扩展 trait)。
 # 运行时本身由 Tauri v2 的 async runtime(tokio)提供,这里只声明直接用到的 feature。
 tokio = { version = "1", features = ["time", "io-util", "sync", "macros", "rt"] }
-tauri = { version = "2", features = ["protocol-asset", "devtools"] }
+tauri = { version = "2", features = ["protocol-asset", "devtools", "tray-icon"] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
@@ -40,7 +42,7 @@ regex = "1"
 tauri-plugin-clipboard-manager = "2.3.2"
 tauri-plugin-window-state = "2"
 dirs = "6"
-git2 = "0.19"
+git2 = { version = "0.19", features = ["vendored-openssl"] }
 pathdiff = "0.2"
 tiny_http = "0.12"
 toml_edit = "0.22"
@@ -53,6 +55,10 @@ tokio-tungstenite = { version = "0.27", features = ["rustls-tls-native-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 futures-util = "0.3"
 uuid = { version = "1", features = ["v4"] }
+# 用量统计分桶按记录自身时刻求当地偏移(DST 地区历史记录不错日),chrono-tz 带 IANA 数据
+chrono = "0.4"
+chrono-tz = "0.10"
+rusqlite = { version = "0.40.1", features = ["bundled"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

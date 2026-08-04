@@ -193,7 +193,7 @@ After that it launches normally on double-click. You'll need to run it again aft
 #### Prerequisites
 
 - [Node.js](https://nodejs.org/) >= 20.19 (or >= 22.12) — required by Vite 7's `engines`; CI runs Node 22
-- [Rust](https://www.rust-lang.org/tools/install) >= 1.85 — set by russh 0.61 (Tauri v2 itself only needs 1.77.2)
+- [Rust](https://www.rust-lang.org/tools/install) >= 1.95 — set by libsqlite3-sys 0.38's use of `cfg_select!`, stable since 1.95 (Tauri v2 itself only needs 1.77.2)
 - [Tauri v2 CLI](https://v2.tauri.app/start/prerequisites/)
 
 #### Install & Run

@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useRef, useMemo } from 'react';
+import { useEffect, useState, useCallback, useRef, useMemo, lazy, Suspense } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '../store';
 import { showContextMenu } from '../utils/contextMenu';
@@ -6,9 +6,14 @@ import { isWslPath } from '../utils/wslPath';
 import { writePtyInput } from '../utils/terminalCache';
 import { resolveActivePane } from '../utils/layoutOps';
 import { focusPane, newTerminal } from '../utils/paneActions';
-import { SessionViewerModal } from './SessionViewerModal';
+import { useEverOpened } from '../hooks/useOverlayMotion';
+import { BrandIcon } from './BrandIcon';
 import { useT, t } from '../i18n';
+import type { AiVendor } from '../utils/inferVendor';
 import type { AiSession, ProjectConfig } from '../types';
+
+// 懒加载：SessionViewerModal 连带 react-markdown（数百 KB），首次查看会话正文才拉 chunk
+const SessionViewerModal = lazy(() => import('./SessionViewerModal').then((m) => ({ default: m.SessionViewerModal })));
 
 const PAGE_SIZE = 20;
 
@@ -39,9 +44,10 @@ function formatTime(iso: string): string {
   return y === currentYear ? t('sessionList.time.monthDay', { m, d }) : `${y}/${m}/${d}`;
 }
 
-const TYPE_BADGE: Record<string, { label: string; color: string }> = {
-  claude: { label: 'C', color: 'var(--color-ai)' },
-  codex: { label: 'X', color: 'var(--color-success)' },
+/** 会话来源 → 品牌图标厂商 key(codex 是 OpenAI 家的 CLI)。 */
+const TYPE_VENDOR: Record<string, AiVendor> = {
+  claude: 'claude',
+  codex: 'openai',
 };
 
 /** 项目是否有 WSL 会话来源:WSL 根项目(UNC)自动启用,或显式配置了发行版 */
@@ -97,6 +103,8 @@ export function SessionList() {
   const [loading, setLoading] = useState(false);
   const [wslLoading, setWslLoading] = useState(false);
   const [viewingSession, setViewingSession] = useState<AiSession | null>(null);
+  // 懒挂载门控：首次查看会话前不挂 SessionViewerModal（chunk 不拉）；之后常驻，退场动画照播
+  const viewerEverOpened = useEverOpened(!!viewingSession);
   // 请求序号:项目切换后旧请求(尤其是慢的 WSL 请求)返回时不得覆盖新项目的列表
   const requestIdRef = useRef(0);
 
@@ -248,15 +256,19 @@ export function SessionList() {
           </div>
         )}
 
-        <SessionViewerModal
-          open={!!viewingSession}
-          onClose={() => setViewingSession(null)}
-          session={viewingSession}
-          projectPath={activeProject?.path ?? ''}
-        />
+        {viewerEverOpened && (
+          <Suspense fallback={null}>
+            <SessionViewerModal
+              open={!!viewingSession}
+              onClose={() => setViewingSession(null)}
+              session={viewingSession}
+              projectPath={activeProject?.path ?? ''}
+            />
+          </Suspense>
+        )}
 
         {visibleSessions.map((session) => {
-          const badge = TYPE_BADGE[session.sessionType] ?? TYPE_BADGE.claude;
+          const vendor = TYPE_VENDOR[session.sessionType] ?? 'claude';
           // 远程会话标识:显示来源连接名(连接被删时回退 'SSH')
           const remoteConnName = session.sshConnectionId
             ? (config.sshConnections.find((c) => c.id === session.sshConnectionId)?.name ?? 'SSH')
@@ -298,12 +310,9 @@ export function SessionList() {
                 ]);
               }}
             >
-              {/* 类型徽标 */}
-              <span
-                className="flex-shrink-0 w-4 h-4 rounded flex items-center justify-center text-xs font-bold mt-0.5"
-                style={{ backgroundColor: badge.color + '22', color: badge.color }}
-              >
-                {badge.label}
+              {/* 来源品牌图标(Mono 变体走 currentColor 跟随主题) */}
+              <span className="flex-shrink-0 w-4 h-4 flex items-center justify-center mt-0.5 text-[var(--text-secondary)]">
+                <BrandIcon vendor={vendor} size={14} title={session.sessionType} />
               </span>
 
               {/* 标题 + 时间 */}

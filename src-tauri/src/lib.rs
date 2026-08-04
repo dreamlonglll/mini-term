@@ -16,6 +16,9 @@ mod search;
 mod ssh;
 mod ssh_mcp_registry;
 mod ssh_skill_registry;
+mod startup_trace;
+mod tray;
+mod usage_stats;
 mod window_input_recovery;
 mod window_theme;
 mod wsl_distros;
@@ -24,17 +27,20 @@ use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    startup_trace::init();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_window_state::Builder::new().build())
         .manage(pty::PtyManager::new())
+        .manage(config::ConfigToken(std::sync::atomic::AtomicU64::new(0)))
         .manage(fs::FsWatcherManager::new())
         .manage(search::SearchManager::new())
         .manage(mobile_relay::MobileRelayManager::new())
         .manage(remote_ssh::RemoteSshState::new())
         .setup(|app| {
+            startup_trace::mark("setup enter");
             // portable-pty 0.8.1 会在第一次 openpty 时进程级缓存 ConPTY 函数表；
             // 因此便携 DLL 的资源校验和绝对路径预载必须是 setup 的第一项，早于
             // 任何可能创建 PTY 的初始化；预载引用保留到进程退出且不修改 PATH。
@@ -47,6 +53,16 @@ pub fn run() {
             config::migrate_legacy_app_data(app.handle());
             clipboard::cleanup_old_clipboard_images();
             ssh::cleanup_ssh_temp_keys();
+            startup_trace::mark("setup: migrate + cleanups done");
+
+            // 菜单栏状态灯(黄=待确认 蓝=处理中 绿=完成未读 灰=安静)
+            match tray::init_tray(app.handle()) {
+                Ok(tray_state) => {
+                    app.manage(tray_state);
+                }
+                Err(e) => eprintln!("[setup] 托盘状态灯初始化失败: {}", e),
+            }
+            startup_trace::mark("setup: tray done");
 
             // 初始化 hook 状态并注册为 Tauri managed state
             let hook_state = hook_server::HookState::new();
@@ -59,6 +75,7 @@ pub fn run() {
 
             // 读取配置，仅当 hookEnabled == true 时才启动 hook server
             let app_config = config::read_config(app.handle());
+            startup_trace::mark("setup: read_config done");
             if app_config.hook_enabled {
                 if let Err(e) = hook_server::start_hook_server(
                     app.handle().clone(),
@@ -89,6 +106,7 @@ pub fn run() {
                     );
                 }
             }
+            startup_trace::mark("setup exit");
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -101,8 +119,10 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            startup_trace::startup_report,
             config::load_config,
             config::save_config,
+            tray::set_tray_status,
             pty::create_pty,
             pty::write_pty,
             pty::resize_pty,
@@ -171,6 +191,8 @@ pub fn run() {
             mobile_relay::mobile_relay_launchers_changed,
             mobile_relay::mobile_relay_start_session_result,
             mobile_relay::mobile_relay_check_launcher_command,
+            usage_stats::ledger::usage_ledger_query,
+            usage_stats::ledger::usage_ledger_sync,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

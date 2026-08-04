@@ -1,7 +1,6 @@
 import { useState, useEffect, useCallback, type ReactNode, type MouseEvent } from 'react';
-import { invoke } from '@tauri-apps/api/core';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
-import { useAppStore, genId } from '../store';
+import { useAppStore, genId, saveConfigToDisk } from '../store';
 import { useOverlayPresence } from '../hooks/useOverlayMotion';
 import { Modal } from './Modal';
 import { useT } from '../i18n';
@@ -401,7 +400,7 @@ export function SshModal({ open, onClose }: Props) {
     async (patch: { sshConnections?: SshConnection[]; sshGroups?: string[] }) => {
       const newConfig = { ...useAppStore.getState().config, ...patch };
       setConfig(newConfig);
-      await invoke('save_config', { config: newConfig });
+      await saveConfigToDisk(newConfig);
     },
     [setConfig],
   );

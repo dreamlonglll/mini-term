@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { ask } from '@tauri-apps/plugin-dialog';
 import QRCode from 'qrcode';
-import { useAppStore } from '../store';
+import { useAppStore, saveConfigToDisk } from '../store';
 import { useTauriEvent } from '../hooks/useTauriEvent';
 import { Modal } from './Modal';
 import { useT } from '../i18n';
@@ -80,7 +80,7 @@ export function MobileRelayModal({ open, onClose }: Props) {
       }),
     };
     setConfig(newConfig);
-    await invoke('save_config', { config: newConfig });
+    await saveConfigToDisk(newConfig);
     await invoke('mobile_relay_apply', { relayUrl: trimmed, desktopKey: trimmedKey });
   }, [setConfig]);
 

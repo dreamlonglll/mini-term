@@ -76,7 +76,8 @@
   --ease-overlay-out: cubic-bezier(0.4, 0, 0.9, 0.6);
 
   /* App font family (overridable via uiFontFamily config) */
-  --app-font-family: 'DM Sans', system-ui, -apple-system, sans-serif;
+  /* 'DM Sans Variable' 是 @fontsource-variable 打包字体的 family 名；保留 'DM Sans' 兼容用户本机安装的同名字体 */
+  --app-font-family: 'DM Sans Variable', 'DM Sans', system-ui, -apple-system, sans-serif;
   --app-font-mono: 'JetBrains Mono', 'Cascadia Code', Consolas, monospace;
 }
 
@@ -220,6 +221,17 @@ body.ssh-conn-dragging {
 
 .animate-blink {
   animation: alertBlink 0.8s ease-in-out infinite;
+}
+
+/* 使用统计主体入场：首次数据就绪时轻微上浮淡入（不加 forwards，
+   动画结束即回落到无 transform，避免制造 containing block） */
+@keyframes usageFadeIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+
+.usage-fade-in {
+  animation: usageFadeIn 0.35s ease-out;
 }
 
 /* ===== 浮层进出场 =====
@@ -1062,3 +1074,12 @@ body.ssh-conn-dragging {
   --radius-md: 8px;
 }
 
+
+/* === 图标体系主题钩子 ===
+   单色图标(lucide / lobehub Mono)一律 currentColor,天然跟随主题 CSS 变量;
+   彩色图标(文件类型 .mt-icon-file / 品牌 .mt-icon-brand / 技术栈 .mt-icon-tech)
+   统一挂 .mt-icon,主题/皮肤在此整体调滤镜统一气质。
+   将来的主题包在这里按 [data-theme-pack="…"] 追加覆盖即可。 */
+[data-skin="blueprint"] .mt-icon {
+  filter: saturate(0.75);
+}

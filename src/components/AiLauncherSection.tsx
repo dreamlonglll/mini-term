@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { useAppStore, genId } from '../store';
+import { useAppStore, genId, saveConfigToDisk } from '../store';
 import { useT } from '../i18n';
 import { withMobileRelayDefaults } from '../utils/mobileRelayConfig';
+import { inferVendor } from '../utils/inferVendor';
+import { BrandIcon } from './BrandIcon';
 import type { AiLauncher } from '../types';
 
 /**
@@ -66,7 +68,7 @@ export function AiLauncherSection() {
       mobileRelay: withMobileRelayDefaults(cfg.mobileRelay, { launchers: next }),
     };
     setConfig(newConfig);
-    await invoke('save_config', { config: newConfig }).catch(() => {});
+    await saveConfigToDisk(newConfig).catch(() => {});
     await invoke('mobile_relay_launchers_changed').catch(() => {});
   }, [setConfig]);
 
@@ -114,6 +116,10 @@ export function AiLauncherSection() {
             key={launcher.id}
             className="flex items-center gap-2 px-3 py-2 rounded-[var(--radius-sm)] bg-[var(--bg-base)] border border-[var(--border-subtle)]"
           >
+            {/* 从命令文本推断品牌(识别不出回退 Bot) */}
+            <span className="flex-shrink-0 text-[var(--text-secondary)]">
+              <BrandIcon vendor={inferVendor({ command: launcher.command })} size={16} />
+            </span>
             <div className="flex-1 min-w-0">
               <div className="text-base text-[var(--text-primary)] truncate">{launcher.name}</div>
               <div className="text-sm text-[var(--text-muted)] truncate font-mono">

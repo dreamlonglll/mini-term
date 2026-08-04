@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import { Modal } from './Modal';
-import { useAppStore, genId } from '../store';
+import { useAppStore, genId, saveConfigToDisk } from '../store';
 import { newTerminal } from '../utils/paneActions';
 import {
   disposeProjectTerminals,
@@ -352,7 +352,7 @@ export function GitWorktreeModal({ repoPath, discoverRepos, onClose, onChanged, 
 
   const switchToProjectAt = useCallback((path: string, fallbackName: string, mainPath: string) => {
     const id = addProjectAt(path, fallbackName, mainPath);
-    invoke('save_config', { config: useAppStore.getState().config });
+    saveConfigToDisk();
     useAppStore.getState().setActiveProject(id);
   }, [addProjectAt]);
 
@@ -391,7 +391,7 @@ export function GitWorktreeModal({ repoPath, discoverRepos, onClose, onChanged, 
           const id = addProjectAt(r.target.path, branch, r.target.group.mainPath);
           if (!firstNewProject) firstNewProject = id;
         }
-        invoke('save_config', { config: useAppStore.getState().config });
+        saveConfigToDisk();
       }
 
       if (failed.length > 0) {

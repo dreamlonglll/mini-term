@@ -3,7 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { getVersion } from '@tauri-apps/api/app';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
-import { useAppStore } from '../store';
+import { useAppStore, saveConfigToDisk } from '../store';
 import { playNotificationSound } from '../utils/notificationSound';
 import { checkForUpdate, compareVersions, type ReleaseInfo } from '../utils/updateChecker';
 import { applyTheme } from '../utils/themeManager';
@@ -265,6 +265,8 @@ function TerminalSettings() {
   const savedLineThreshold = config.longPasteLineThreshold ?? 10;
   const savedCharThreshold = config.longPasteCharThreshold ?? 2000;
   const [lineThresholdInput, setLineThresholdInput] = useState(String(savedLineThreshold));
+  const savedAutoCopySecs = config.selectionAutoCopySecs ?? 1;
+  const [autoCopySecsInput, setAutoCopySecsInput] = useState(String(savedAutoCopySecs));
   const [charThresholdInput, setCharThresholdInput] = useState(String(savedCharThreshold));
   const savedRemotePasteDir = config.remotePasteDir ?? DEFAULT_REMOTE_PASTE_DIR;
   const [remotePasteDirInput, setRemotePasteDirInput] = useState(savedRemotePasteDir);
@@ -288,7 +290,7 @@ function TerminalSettings() {
       defaultShell: updatedDefault,
     };
     setConfig(newConfig);
-    await invoke('save_config', { config: newConfig });
+    await saveConfigToDisk(newConfig);
   }, [setConfig]);
 
   const handleAdd = () => {
@@ -336,11 +338,20 @@ function TerminalSettings() {
   const saveConfigPatch = useCallback(async (patch: Partial<typeof config>) => {
     const newConfig = { ...useAppStore.getState().config, ...patch };
     setConfig(newConfig);
-    await invoke('save_config', { config: newConfig });
+    await saveConfigToDisk(newConfig);
   }, [setConfig]);
 
   const handleLongPasteEnabledChange = (enabled: boolean) => {
     void saveConfigPatch({ longPasteToFile: enabled });
+  };
+
+  const commitAutoCopySecs = () => {
+    const n = parseFloat(autoCopySecsInput);
+    const clamped = Number.isFinite(n) && n >= 0.2 ? Math.min(n, 60) : savedAutoCopySecs;
+    setAutoCopySecsInput(String(clamped));
+    if (clamped !== savedAutoCopySecs) {
+      void saveConfigPatch({ selectionAutoCopySecs: clamped });
+    }
   };
 
   const commitLineThreshold = () => {
@@ -462,6 +473,23 @@ function TerminalSettings() {
             }`}
           />
         </button>
+      </div>
+
+      <div className="flex items-center justify-between gap-3 px-3 py-2.5 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)]">
+        <div className="flex-1 min-w-0">
+          <div className="text-base text-[var(--text-primary)]">{t("settings.terminal.autoCopyDwellTitle")}</div>
+          <div className="text-sm text-[var(--text-muted)]">{t("settings.terminal.autoCopyDwellDesc")}</div>
+        </div>
+        <input
+          type="number"
+          min={0.2}
+          step={0.5}
+          className="w-24 bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1 text-base outline-none focus:border-[var(--accent)] font-mono text-right"
+          value={autoCopySecsInput}
+          onChange={(e) => setAutoCopySecsInput(e.target.value)}
+          onBlur={commitAutoCopySecs}
+          onKeyDown={(e) => e.key === 'Enter' && (e.target as HTMLInputElement).blur()}
+        />
       </div>
 
       <div className="pt-6 text-base text-[var(--text-muted)] uppercase tracking-[0.1em] mb-2">
@@ -627,7 +655,7 @@ function SystemSettings() {
       defaultEditor: updatedDefault || undefined,
     };
     setConfig(newConfig);
-    await invoke('save_config', { config: newConfig });
+    await saveConfigToDisk(newConfig);
   }, [setConfig]);
 
   const handleAddEditor = useCallback(() => {
@@ -700,14 +728,14 @@ function SystemSettings() {
     setConfig(newConfig);
     applyTheme(theme);
     updateAllTerminalThemes(newConfig.terminalFollowTheme ?? true);
-    invoke('save_config', { config: newConfig });
+    saveConfigToDisk(newConfig);
   }, [setConfig]);
 
   const handleTerminalFollowThemeChange = useCallback((follow: boolean) => {
     const newConfig = { ...useAppStore.getState().config, terminalFollowTheme: follow };
     setConfig(newConfig);
     updateAllTerminalThemes(follow);
-    invoke('save_config', { config: newConfig });
+    saveConfigToDisk(newConfig);
   }, [setConfig]);
 
   const handleSkinChange = useCallback((skin: 'none' | 'blueprint' | 'fluent2') => {
@@ -715,8 +743,25 @@ function SystemSettings() {
     const newConfig = { ...currentConfig, skin };
     setConfig(newConfig);
     updateAllTerminalThemes(newConfig.terminalFollowTheme);
-    invoke('save_config', { config: newConfig });
+    saveConfigToDisk(newConfig);
   }, [setConfig]);
+
+  const trayEnabled = config.trayStatusEnabled ?? true;
+  const savedTrayMax = config.trayMaxProjects ?? 5;
+  const [trayMaxInput, setTrayMaxInput] = useState(String(savedTrayMax));
+
+  const patchTray = useCallback((patch: Partial<typeof config>) => {
+    const newConfig = { ...useAppStore.getState().config, ...patch };
+    setConfig(newConfig);
+    saveConfigToDisk(newConfig);
+  }, [setConfig]);
+
+  const commitTrayMax = () => {
+    const n = parseInt(trayMaxInput, 10);
+    const clamped = Number.isFinite(n) && n >= 1 ? Math.min(n, 20) : savedTrayMax;
+    setTrayMaxInput(String(clamped));
+    if (clamped !== savedTrayMax) patchTray({ trayMaxProjects: clamped });
+  };
 
   return (
     <div className="space-y-6">
@@ -725,6 +770,45 @@ function SystemSettings() {
         <span className="text-base text-[var(--text-primary)]">{t("settings.system.languageLabel")}</span>
         <LanguageToggle />
       </div>
+
+      {/* 菜单栏项目状态灯 */}
+      <div className="flex items-center justify-between px-3 py-2.5 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)]">
+        <div className="pr-4">
+          <div className="text-base text-[var(--text-primary)]">{t("settings.system.trayStatusTitle")}</div>
+          <div className="text-sm text-[var(--text-muted)]">{t("settings.system.trayStatusDesc")}</div>
+        </div>
+        <button
+          className={`relative w-9 h-5 rounded-full transition-colors flex-shrink-0 ${
+            trayEnabled ? 'bg-[var(--accent)]' : 'bg-[var(--border-strong)]'
+          }`}
+          onClick={() => patchTray({ trayStatusEnabled: !trayEnabled })}
+        >
+          <span
+            className={`absolute top-0.5 left-0 w-4 h-4 rounded-full bg-white transition-transform ${
+              trayEnabled ? 'translate-x-[18px]' : 'translate-x-0.5'
+            }`}
+          />
+        </button>
+      </div>
+
+      {trayEnabled && (
+        <div className="flex items-center justify-between gap-3 px-3 py-2.5 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)]">
+          <div className="flex-1 min-w-0">
+            <div className="text-base text-[var(--text-primary)]">{t("settings.system.trayMaxTitle")}</div>
+            <div className="text-sm text-[var(--text-muted)]">{t("settings.system.trayMaxDesc")}</div>
+          </div>
+          <input
+            type="number"
+            min={1}
+            max={20}
+            className="w-24 bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1 text-base outline-none focus:border-[var(--accent)] font-mono text-right"
+            value={trayMaxInput}
+            onChange={(e) => setTrayMaxInput(e.target.value)}
+            onBlur={commitTrayMax}
+            onKeyDown={(e) => e.key === 'Enter' && (e.target as HTMLInputElement).blur()}
+          />
+        </div>
+      )}
 
       {/* 主题模式 */}
       <div className="text-base text-[var(--text-muted)] uppercase tracking-[0.1em] mb-2">
@@ -882,13 +966,13 @@ function FontSettings() {
     const newConfig = { ...useAppStore.getState().config, uiFontSize: size };
     setConfig(newConfig);
     document.documentElement.style.fontSize = `${size}px`;
-    invoke('save_config', { config: newConfig });
+    saveConfigToDisk(newConfig);
   }, [setConfig]);
 
   const handleTerminalFontSizeChange = useCallback((size: number) => {
     const newConfig = { ...useAppStore.getState().config, terminalFontSize: size };
     setConfig(newConfig);
-    invoke('save_config', { config: newConfig });
+    saveConfigToDisk(newConfig);
   }, [setConfig]);
 
   const handleUiFontFamilyChange = useCallback((value: string) => {
@@ -899,7 +983,7 @@ function FontSettings() {
     };
     setConfig(newConfig);
     applyUiFontFamily(trimmed || undefined);
-    invoke('save_config', { config: newConfig });
+    saveConfigToDisk(newConfig);
   }, [setConfig]);
 
   const handleTerminalFontFamilyChange = useCallback((value: string) => {
@@ -909,14 +993,14 @@ function FontSettings() {
       terminalFontFamily: trimmed || undefined,
     };
     setConfig(newConfig);
-    invoke('save_config', { config: newConfig });
+    saveConfigToDisk(newConfig);
   }, [setConfig]);
 
   const terminalLigaturesEnabled = config.terminalLigatures ?? false;
   const handleTerminalLigaturesChange = useCallback((enabled: boolean) => {
     const newConfig = { ...useAppStore.getState().config, terminalLigatures: enabled };
     setConfig(newConfig);
-    invoke('save_config', { config: newConfig });
+    saveConfigToDisk(newConfig);
   }, [setConfig]);
 
   return (
@@ -1070,7 +1154,7 @@ function AiHookSettings() {
       await invoke('toggle_hook_server', { enabled });
       const newConfig = { ...useAppStore.getState().config, hookEnabled: enabled };
       setConfig(newConfig);
-      await invoke('save_config', { config: newConfig });
+      await saveConfigToDisk(newConfig);
       refreshHookStatus();
     } catch (e: unknown) {
       setResultMsg(e instanceof Error ? e.message : String(e));
@@ -1249,7 +1333,7 @@ function AiNotificationSettings() {
   const saveConfigPatch = useCallback(async (patch: Partial<typeof config>) => {
     const newConfig = { ...useAppStore.getState().config, ...patch };
     setConfig(newConfig);
-    await invoke('save_config', { config: newConfig });
+    await saveConfigToDisk(newConfig);
   }, [setConfig]);
 
   const handleSoundPathChange = useCallback(async () => {
