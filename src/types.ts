@@ -158,9 +158,36 @@ export interface ProjectConfig {
   /** 子项目(worktree「设为项目」)：有值 = 渲染在该父项目下方缩进一级,
    *  且**不进 projectTree**(树里只有顶层项目与分组)。拖出/「脱离父项目」时清除并入树。 */
   parentProjectId?: string;
-  /** 项目类型徽标覆盖:undefined = 自动探测,'none' = 不显示,其余为技术栈 key(ProjectKind)。 */
-  kindOverride?: string;
+  /** 项目类型徽标覆盖:undefined = 自动探测,'none' = 不显示,其余为技术栈 key。 */
+  kindOverride?: ProjectKind | 'none';
 }
+
+/** 技术栈类型 key（项目类型徽标/探测结果）。展示名与探测规则在 utils/projectKind.ts。 */
+export type ProjectKind =
+  | 'java'
+  | 'rust'
+  | 'go'
+  | 'python'
+  | 'flutter'
+  | 'php'
+  | 'vuejs'
+  | 'nextjs'
+  | 'react'
+  | 'svelte'
+  | 'vite'
+  | 'nodejs';
+
+/** AI 厂商 key（pane 徽标/品牌图标）。推断规则在 utils/inferVendor.ts。 */
+export type AiVendor =
+  | 'claude'
+  | 'openai'
+  | 'gemini'
+  | 'opencode'
+  | 'grok'
+  | 'qwen'
+  | 'deepseek'
+  | 'copilot'
+  | 'ollama';
 
 export interface ProjectEnvVar {
   key: string;
@@ -330,6 +357,9 @@ export interface FileEntry {
   isDir: boolean;
   ignored?: boolean;
   children?: FileEntry[];
+  /** 单链目录汇总(compact)后链上各段的真实路径(含链首与链尾)。前端
+   *  compactDirChains 附加,非后端字段;watch 注册与中段变化判定用。 */
+  chainPaths?: string[];
 }
 
 // === Tauri 事件 payload ===
@@ -570,6 +600,12 @@ export interface UsageProviderStat {
   sessions: number;
 }
 
+/** 计数排行条目（工具/Shell/MCP，设计 §2.2 各前 10） */
+export interface UsageCountStat {
+  name: string;
+  count: number;
+}
+
 export interface UsageStatsPayload {
   totalCost: number;
   totalCalls: number;
@@ -583,6 +619,9 @@ export interface UsageStatsPayload {
   byModel: UsageModelStat[];
   byProvider: UsageProviderStat[];
   topSessions: UsageTopSessionStat[];
+  byTool: UsageCountStat[];
+  byShell: UsageCountStat[];
+  byMcp: UsageCountStat[];
 }
 
 export interface UsageLedgerProgressPayload {

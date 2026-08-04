@@ -239,7 +239,7 @@ export function ProjectList() {
   }, []);
 
   // 写入项目类型徽标覆盖(undefined = 自动探测,'none' = 不显示),并持久化
-  const setProjectKindOverride = useCallback((projectId: string, kind: string | undefined) => {
+  const setProjectKindOverride = useCallback((projectId: string, kind: ProjectKind | 'none' | undefined) => {
     const cfg = useAppStore.getState().config;
     const newConfig = {
       ...cfg,
@@ -562,7 +562,7 @@ export function ProjectList() {
     const projectKind: ProjectKind | null =
       project.kindOverride === 'none'
         ? null
-        : (project.kindOverride as ProjectKind | undefined) ?? projectKinds.get(project.id) ?? null;
+        : project.kindOverride ?? projectKinds.get(project.id) ?? null;
     // 打开 pane 里的 AI 会话:有则领位图标换成品牌图标堆叠(哪家 AI 在跑一眼可见)。
     // 按厂商去重 —— 同款 AI 开多个 pane 只显示一枚,重叠一摞并不好看;
     // 再按厂商名字母序排列,不随开 pane 顺序漂移(未知厂商固定排最后)

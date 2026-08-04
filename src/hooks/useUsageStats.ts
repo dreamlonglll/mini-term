@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useTauriEvent } from './useTauriEvent';
 import { loadModelPricing } from '../utils/modelPricing';
+import { rangeSinceMs, rangeUntilMs } from '../utils/usageDates';
 import type {
   ModelPriceEntry,
   UsageAgentFilter,
@@ -13,60 +14,6 @@ import type {
 
 /** 渲染状态优先级（互斥）：pricingError ＞ pricing ＞ error ＞ ready */
 export type UsageStatsPhase = 'pricing' | 'pricingError' | 'ready' | 'error';
-
-/** date input 的 "YYYY-MM-DD" 按本地时区解析(new Date(str) 会当 UTC 午夜,东侧时区错一天)。 */
-function parseLocalDate(s: string): Date | null {
-  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
-  if (!m) return null;
-  return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
-}
-
-/** range → 窗口起点 epoch ms。本地日历日口径：today = 本地 00:00 起（绝不用
- * 滚动 24h）；days7/30 = 含今天的完整日历日；month/months3/months6 = 对应
- * 月份的月初；custom = 起始日本地 00:00。Date 构造器做日历减法天然处理
- * DST/月末越界。 */
-function rangeSinceMs(range: UsageRange, customFrom: string): number {
-  const now = new Date();
-  switch (range) {
-    case 'today':
-      return new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
-    case 'days7':
-      return new Date(now.getFullYear(), now.getMonth(), now.getDate() - 6).getTime();
-    case 'days30':
-      return new Date(now.getFullYear(), now.getMonth(), now.getDate() - 29).getTime();
-    case 'month':
-      return new Date(now.getFullYear(), now.getMonth(), 1).getTime();
-    case 'months3':
-      return new Date(now.getFullYear(), now.getMonth() - 2, 1).getTime();
-    case 'months6':
-      return new Date(now.getFullYear(), now.getMonth() - 5, 1).getTime();
-    case 'custom': {
-      const from = parseLocalDate(customFrom);
-      // 起始缺失/非法回落近 30 天,不让面板空转
-      if (!from) return new Date(now.getFullYear(), now.getMonth(), now.getDate() - 29).getTime();
-      // date input 的 min 只标 :invalid 不拦截键入,这里兜底 clamp 到 1 年内
-      const floor = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 364).getTime();
-      return Math.max(from.getTime(), floor);
-    }
-  }
-}
-
-/** custom range 的窗口上界(含截止日全天);其余 range 开区间到现在。 */
-function rangeUntilMs(range: UsageRange, customFrom: string, customTo: string): number | null {
-  if (range !== 'custom') return null;
-  const to = parseLocalDate(customTo);
-  if (!to) return null;
-  // date input 的 min 只标 :invalid 不拦截键入,键盘可造出 from>to 的倒置区间;
-  // 倒置时把上界抬到起始日(等效单日查询),避免静默全零
-  const from = parseLocalDate(customFrom);
-  let day = from && from.getTime() > to.getTime() ? from : to;
-  // 与 rangeSinceMs 的一年下限同步 clamp:两端都早于一年时退成下限当日的
-  // 单日窗口,而不是 since 被抬、until 不动产生的 since>until 倒置空窗
-  const now = new Date();
-  const floor = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 364);
-  if (day.getTime() < floor.getTime()) day = floor;
-  return new Date(day.getFullYear(), day.getMonth(), day.getDate() + 1).getTime() - 1;
-}
 
 interface UseUsageStatsResult {
   phase: UsageStatsPhase;
@@ -105,6 +52,8 @@ export function useUsageStats(
   const pricingRef = useRef<Record<string, ModelPriceEntry> | null>(null);
   /** 查询竞态防护：只采纳最新一次查询的结果 */
   const seqRef = useRef(0);
+  /** backfill 进度驱动重查的节流时钟 */
+  const lastProgressQueryRef = useRef(0);
   const openRef = useRef(open);
   openRef.current = open;
   /** stats/phase 的权威镜像：refresh effect 里判断状态用（不进依赖数组） */
@@ -186,7 +135,16 @@ export function useUsageStats(
   }, [open, query]);
 
   useTauriEvent<UsageLedgerProgressPayload>('usage-ledger-progress', (p) => {
-    if (openRef.current) setBackfill({ processed: p.processed, total: p.total });
+    if (!openRef.current) return;
+    setBackfill({ processed: p.processed, total: p.total });
+    // backfill 增量填充:进度事件(后端已 250ms 节流)按 ~1s 再节流触发重查,
+    // 图表/KPI 随回填逐步长出,不再干等终局 synced 一次性全出
+    // (查询毫秒级且跑在 runtime 线程,代价可忽略)
+    const now = Date.now();
+    if (now - lastProgressQueryRef.current >= 1000) {
+      lastProgressQueryRef.current = now;
+      queryRef.current();
+    }
   });
 
   useTauriEvent<UsageLedgerSyncedPayload>('usage-ledger-synced', (p) => {

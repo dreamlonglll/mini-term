@@ -40,6 +40,100 @@ pub struct Turn {
     pub usage: UsageTotals,
 }
 
+/// 单次工具调用记录（统计粒度，设计 §2.2 工具/Shell/MCP 排行）。
+/// kind："tool"（非 MCP 工具名）| "shell"（Bash 主命令首词）| "mcp"（server 名）。
+/// 一次 Bash tool_use 产生 tool=Bash 与 shell=首词 两条；mcp__s__t 只产生 mcp=s。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolUse {
+    pub kind: &'static str,
+    pub name: String,
+    /// 窗口判定时刻（缺失回退 session mtime，与 turn 同口径）。
+    pub timestamp_ms: Option<i64>,
+    /// 跨文件去重键（Claude 按 message_id 派生；Codex 无 → None，
+    /// fork 复制的血缘过滤在解析层完成，与 token_count 同规则）。
+    pub dedup_key: Option<String>,
+}
+
+/// §6.9 Shell 主命令首词提取（按实测形状加固）：连接符（&&、||、;、|）切段，
+/// `cd` 段跳过（Claude Bash 普遍 `cd X && 真命令`）；段内去 `KEY=VAL` 前缀、跳
+/// sudo/time/env/command/exec/nohup wrapper；带引号的可执行路径取引号内整体的
+/// basename。复杂引号/管道不做精确解析（统计用，噪声可接受）。
+fn shell_main_command(cmd: &str) -> Option<String> {
+    for seg in cmd.split([';', '|']).flat_map(|s| s.split("&&")) {
+        match segment_main_word(seg) {
+            Some(w) if w == "cd" => continue,
+            Some(w) => return Some(w),
+            None => continue,
+        }
+    }
+    None
+}
+
+fn segment_main_word(seg: &str) -> Option<String> {
+    const WRAPPERS: [&str; 6] = ["sudo", "time", "env", "command", "exec", "nohup"];
+    fn is_env_assign(tok: &str) -> bool {
+        match tok.split_once('=') {
+            Some((key, _)) => {
+                !key.is_empty()
+                    && key
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            }
+            None => false,
+        }
+    }
+    let s = seg.trim_start();
+    // 引号包裹的可执行路径("/Applications/…/Google Chrome"):引号内整体取 basename
+    for q in ['"', '\''] {
+        if let Some(rest) = s.strip_prefix(q) {
+            let inner = &rest[..rest.find(q)?];
+            let base = inner.rsplit('/').next().unwrap_or(inner).trim();
+            return (!base.is_empty()).then(|| base.to_string());
+        }
+    }
+    let tok = s
+        .split_whitespace()
+        .find(|t| !is_env_assign(t) && !WRAPPERS.contains(t))?;
+    let base = tok.rsplit('/').next().unwrap_or(tok);
+    (!base.is_empty()).then(|| base.to_string())
+}
+
+/// 由一次工具调用派生排行事件（设计 §2.2）：`mcp__server__tool` → mcp(server)，
+/// 不进 tool 排行；其余 → tool(name)，shell 命令文本存在时再追加 shell 首词
+/// （去重键在基础键上加 `#s` 后缀，与 tool 事件互不冲突）。
+fn push_tool_events(
+    out: &mut Vec<ToolUse>,
+    name: &str,
+    shell_cmd: Option<&str>,
+    timestamp_ms: Option<i64>,
+    dedup_base: Option<String>,
+) {
+    if let Some(rest) = name.strip_prefix("mcp__") {
+        let server = rest.split("__").next().unwrap_or(rest);
+        out.push(ToolUse {
+            kind: "mcp",
+            name: server.to_string(),
+            timestamp_ms,
+            dedup_key: dedup_base,
+        });
+        return;
+    }
+    out.push(ToolUse {
+        kind: "tool",
+        name: name.to_string(),
+        timestamp_ms,
+        dedup_key: dedup_base.clone(),
+    });
+    if let Some(word) = shell_cmd.and_then(shell_main_command) {
+        out.push(ToolUse {
+            kind: "shell",
+            name: word,
+            timestamp_ms,
+            dedup_key: dedup_base.map(|k| format!("{k}#s")),
+        });
+    }
+}
+
 /// 单个会话解析结果（Claude 主转录 + 子代理转录已合并；Codex 一文件一会话）。
 #[derive(Debug, Clone)]
 pub struct ParsedSession {
@@ -53,6 +147,8 @@ pub struct ParsedSession {
     /// 文件 mtime（turn 缺时间戳时的回退终判依据）。
     pub mtime_ms: i64,
     pub turns: Vec<Turn>,
+    /// 工具/Shell/MCP 调用记录（设计 §2.2 排行；与 turns 独立收集）。
+    pub tool_uses: Vec<ToolUse>,
 }
 
 // ─── 时间工具（无 chrono 依赖，手写 RFC3339 + civil date） ──────
@@ -204,12 +300,15 @@ fn claude_title_from_user_line(obj: &serde_json::Value) -> Option<String> {
 }
 
 /// 逐行解析 Claude JSONL 的 turns（文件内同 message.id 合并：usage 取
-/// total 大的一侧，model/timestamp 取该侧非空值——流式写入的中间行 usage 为 0）。
-/// 返回 (turns, cwd, title)。
+/// total 大的一侧，model/timestamp 取该侧非空值——实测每行恰一个 content 块，
+/// 同一逻辑消息跨多行共享 message.id）。工具事件按块自身 toolu id 作去重键
+/// 独立收集（fork 复制原样保留 toolu id，跨文件去重交聚合层）。
+/// 返回 (turns, tool_uses, cwd, title)。
 fn claude_turns_from_lines<'a>(
     lines: impl Iterator<Item = &'a str>,
-) -> (Vec<Turn>, Option<String>, Option<String>) {
+) -> (Vec<Turn>, Vec<ToolUse>, Option<String>, Option<String>) {
     let mut turns: Vec<Turn> = Vec::new();
+    let mut tool_uses: Vec<ToolUse> = Vec::new();
     let mut by_id: HashMap<String, usize> = HashMap::new();
     let mut cwd: Option<String> = None;
     let mut title: Option<String> = None;
@@ -233,6 +332,28 @@ fn claude_turns_from_lines<'a>(
                 if obj.pointer("/message/model").and_then(|v| v.as_str()) == Some("<synthetic>") {
                     continue;
                 }
+                let timestamp_ms = obj
+                    .get("timestamp")
+                    .and_then(|t| t.as_str())
+                    .and_then(parse_rfc3339_ms);
+
+                // 工具/Shell/MCP 事件:content[] 的 tool_use 块(实测每行一块)
+                if let Some(blocks) = obj.pointer("/message/content").and_then(|v| v.as_array()) {
+                    for b in blocks {
+                        if b.get("type").and_then(|t| t.as_str()) != Some("tool_use") {
+                            continue;
+                        }
+                        let Some(name) = b.get("name").and_then(|v| v.as_str()) else {
+                            continue;
+                        };
+                        let shell_cmd = (name == "Bash")
+                            .then(|| b.pointer("/input/command").and_then(|v| v.as_str()))
+                            .flatten();
+                        let block_id = b.get("id").and_then(|v| v.as_str()).map(String::from);
+                        push_tool_events(&mut tool_uses, name, shell_cmd, timestamp_ms, block_id);
+                    }
+                }
+
                 let Some(usage_val) = obj.pointer("/message/usage") else {
                     continue;
                 };
@@ -242,10 +363,6 @@ fn claude_turns_from_lines<'a>(
                     .and_then(|v| v.as_str())
                     .filter(|m| !m.is_empty())
                     .map(String::from);
-                let timestamp_ms = obj
-                    .get("timestamp")
-                    .and_then(|t| t.as_str())
-                    .and_then(parse_rfc3339_ms);
                 let id = obj
                     .pointer("/message/id")
                     .and_then(|v| v.as_str())
@@ -282,7 +399,7 @@ fn claude_turns_from_lines<'a>(
     // 计费门槛：任一计费维度 > 0 才计入。全 0 行（流式中间快照未被同 id 覆盖、
     // 本地占位等）不是一次计费调用，计入会虚增 calls（Codex 侧解析时已同门槛）
     turns.retain(|t| t.usage.total() > 0);
-    (turns, cwd, title)
+    (turns, tool_uses, cwd, title)
 }
 
 fn read_lines(path: &Path) -> Option<Vec<String>> {
@@ -301,12 +418,15 @@ pub(crate) fn parse_claude_session(
 ) -> Option<ParsedSession> {
     let session_id = main_path.file_stem()?.to_str()?.to_string();
     let lines = read_lines(main_path)?;
-    let (mut turns, cwd, title) = claude_turns_from_lines(lines.iter().map(String::as_str));
+    let (mut turns, mut tool_uses, cwd, title) =
+        claude_turns_from_lines(lines.iter().map(String::as_str));
 
     for sub in subagent_paths {
         if let Some(sub_lines) = read_lines(sub) {
-            let (sub_turns, _, _) = claude_turns_from_lines(sub_lines.iter().map(String::as_str));
+            let (sub_turns, sub_tools, _, _) =
+                claude_turns_from_lines(sub_lines.iter().map(String::as_str));
             turns.extend(sub_turns);
+            tool_uses.extend(sub_tools);
         }
     }
 
@@ -318,6 +438,7 @@ pub(crate) fn parse_claude_session(
         provider: None,
         mtime_ms: mtime_ms(main_path),
         turns,
+        tool_uses,
     })
 }
 
@@ -343,10 +464,38 @@ fn usage_from_codex(u: &serde_json::Value) -> UsageTotals {
 }
 
 /// 0.146+ 的 subagent/fork rollout 会把复制的父历史逐行改写时间戳为复制时刻
-/// （实测比 child session_meta 晚 ~1ms），`ts < meta_ts` 挡不住；而真实 turn
-/// 至少要一次模型往返（秒级）才会出现。含复制历史的文件（≥2 个 session_meta）
-/// 按「最后一个 meta 时刻 + 本容差」截断复制块。
-const LINEAGE_EPSILON_MS: i64 = 2_000;
+/// （实测比 child session_meta 晚 ~1ms），`ts < meta_ts` 挡不住。复制块是一次性
+/// 突发写入（行间距毫秒级），而真实 turn 与它之间必有一次模型往返的间隙——
+/// 含复制历史的文件（≥2 个 session_meta）从最后一个 meta 起按**连续簇**截断：
+/// 与簇尾间距 ≤ 本容差的行并入簇丢弃，出现更大间隙即停（快速真实 turn 幸存，
+/// 超长复制块也能整块吃掉，不受固定窗口长度限制）。
+const LINEAGE_GAP_MS: i64 = 500;
+
+/// Codex 工具调用的 shell 命令文本（实测三种形状）：`exec_command` 的
+/// `arguments.cmd`、旧版 `shell_command` 的 `arguments.command`（arguments 均为
+/// 二次编码的 JSON 串）、`custom_tool_call name=exec` 埋在 payload.input JS 串
+/// 里的 `exec_command({…})` 参数对象（流式反序列化取首个完整 JSON 值，忽略
+/// 其后的 JS 代码）。
+fn codex_shell_cmd(name: &str, obj: &serde_json::Value) -> Option<String> {
+    match name {
+        "exec_command" | "shell_command" => {
+            let args = obj.pointer("/payload/arguments")?.as_str()?;
+            let v: serde_json::Value = serde_json::from_str(args).ok()?;
+            let key = if name == "exec_command" { "cmd" } else { "command" };
+            v.get(key)?.as_str().map(String::from)
+        }
+        "exec" => {
+            let input = obj.pointer("/payload/input")?.as_str()?;
+            let pos = input.find("exec_command(")? + "exec_command(".len();
+            let v = serde_json::Deserializer::from_str(&input[pos..])
+                .into_iter::<serde_json::Value>()
+                .next()?
+                .ok()?;
+            v.get("cmd")?.as_str().map(String::from)
+        }
+        _ => None,
+    }
+}
 
 /// 解析一个 Codex rollout 文件（一文件一会话）。
 /// usage 优先取每条 token_count 的 `last_token_usage`（自带该轮 timestamp）；
@@ -366,9 +515,11 @@ pub(crate) fn parse_codex_session(
     let mut provider: Option<String> = None;
     let mut model: Option<String> = None;
     let mut turns: Vec<Turn> = Vec::new();
+    let mut tool_uses: Vec<ToolUse> = Vec::new();
     let mut prev_total = UsageTotals::default();
     let mut meta_ts: Option<i64> = None;
-    let mut last_meta_ts: Option<i64> = None;
+    // 血缘复制簇的滚动簇尾：起于最后一个 session_meta 时刻，随被丢弃的复制行推进
+    let mut lineage_cluster_end: Option<i64> = None;
     let mut meta_count = 0usize;
 
     for line in &lines {
@@ -384,7 +535,7 @@ pub(crate) fn parse_codex_session(
             Some("session_meta") => {
                 meta_count += 1;
                 if let Some(ts) = line_ts {
-                    last_meta_ts = Some(last_meta_ts.map_or(ts, |m| m.max(ts)));
+                    lineage_cluster_end = Some(lineage_cluster_end.map_or(ts, |m| m.max(ts)));
                 }
                 // 身份字段只认首个 meta：后续 meta 是 subagent/fork 复制进来的
                 // 父会话头，覆盖会把本会话记成父 ID（Top Session 点开错会话）
@@ -422,6 +573,26 @@ pub(crate) fn parse_codex_session(
                 // codex_user_title_from_line 的 `<`/`# AGENTS.md` 过滤挡住
                 if title.is_none() {
                     title = crate::ai_sessions::codex_user_title_from_line(line);
+                }
+                // 工具调用事件(实测形状:function_call / custom_tool_call)。
+                // fork 复制的行原样保留 call_id → 聚合层按 call_id 去重,
+                // 无需血缘时间窗截断
+                let payload_type = obj.pointer("/payload/type").and_then(|t| t.as_str());
+                if matches!(payload_type, Some("function_call") | Some("custom_tool_call")) {
+                    if let Some(name) = obj.pointer("/payload/name").and_then(|v| v.as_str()) {
+                        let call_id = obj
+                            .pointer("/payload/call_id")
+                            .and_then(|v| v.as_str())
+                            .map(String::from);
+                        let shell_cmd = codex_shell_cmd(name, &obj);
+                        push_tool_events(
+                            &mut tool_uses,
+                            name,
+                            shell_cmd.as_deref(),
+                            line_ts,
+                            call_id,
+                        );
+                    }
                 }
             }
             Some("event_msg") => {
@@ -474,11 +645,13 @@ pub(crate) fn parse_codex_session(
                     }
                 }
                 // 0.146+ 复制块截断:文件含 ≥2 个 session_meta 即带复制历史,
-                // 复制行时间戳被改写为复制时刻(聚在 meta 附近、晚于 meta),
-                // 真实 turn 在秒级模型往返之后——按 last_meta + 容差挡住
+                // 复制行时间戳被改写为复制时刻(毫秒级突发簇,起于 meta 附近)。
+                // 与簇尾间距 ≤ LINEAGE_GAP_MS 的行并入簇丢弃并推进簇尾;
+                // 真实 turn 隔着一次模型往返的间隙,不会被并入
                 if meta_count >= 2 {
-                    if let (Some(ts), Some(last)) = (line_ts, last_meta_ts) {
-                        if ts <= last + LINEAGE_EPSILON_MS {
+                    if let (Some(ts), Some(end)) = (line_ts, lineage_cluster_end) {
+                        if ts <= end + LINEAGE_GAP_MS {
+                            lineage_cluster_end = Some(end.max(ts));
                             continue;
                         }
                     }
@@ -518,6 +691,7 @@ pub(crate) fn parse_codex_session(
         provider,
         mtime_ms: mtime_ms(path),
         turns,
+        tool_uses,
     })
 }
 
@@ -564,7 +738,7 @@ mod tests {
             r#"{"type":"assistant","timestamp":"2026-08-01T10:00:00Z","message":{"id":"m1","model":"claude-opus-4-8","usage":{"input_tokens":0,"output_tokens":0}}}"#,
             r#"{"type":"assistant","timestamp":"2026-08-01T10:01:00Z","message":{"id":"m2","model":"claude-opus-4-8","usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":9}}}"#,
         ];
-        let (turns, _, _) = claude_turns_from_lines(lines.iter().copied());
+        let (turns, _, _, _) = claude_turns_from_lines(lines.iter().copied());
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].message_id.as_deref(), Some("m2"));
     }
@@ -576,7 +750,7 @@ mod tests {
             r#"{"type":"assistant","timestamp":"2026-08-01T10:00:05Z","message":{"id":"m1","model":"claude-opus-4-8","usage":{"input_tokens":10,"output_tokens":50,"cache_read_input_tokens":100}}}"#,
             r#"{"type":"assistant","timestamp":"2026-08-01T10:01:00Z","message":{"id":"m2","model":"claude-opus-4-8","usage":{"input_tokens":5,"output_tokens":7}}}"#,
         ];
-        let (turns, _, _) = claude_turns_from_lines(lines.iter().copied());
+        let (turns, _, _, _) = claude_turns_from_lines(lines.iter().copied());
         assert_eq!(turns.len(), 2, "同 id 多行必须合并，不得翻倍");
         assert_eq!(turns[0].usage.output, 50);
         assert_eq!(turns[0].usage.cache_read, 100);
@@ -617,7 +791,7 @@ mod tests {
             r#"{"type":"user","cwd":"/Users/u/proj","message":{"content":"<system-hint>skip"},"timestamp":"2026-01-01T00:00:00Z"}"#,
             r#"{"type":"user","cwd":"/Users/u/proj","message":{"content":"fix the bug"},"timestamp":"2026-01-01T00:00:01Z"}"#,
         ];
-        let (_, cwd, title) = claude_turns_from_lines(lines.iter().copied());
+        let (_, _, cwd, title) = claude_turns_from_lines(lines.iter().copied());
         assert_eq!(cwd.as_deref(), Some("/Users/u/proj"));
         assert_eq!(title.as_deref(), Some("fix the bug"));
     }
@@ -661,6 +835,127 @@ mod tests {
         let p = parse_codex_session(&f, &HashMap::new()).unwrap();
         assert_eq!(p.session_id, "sess-child", "身份只认首个 meta,不得被父 meta 覆盖");
         assert_eq!(p.turns.len(), 1, "改写时间戳的复制历史不得重复计费");
+        assert_eq!(p.turns[0].usage.input, 20);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn shell_main_command_extraction() {
+        // §6.9:去 KEY=VAL 前缀 → 跳 wrapper → 首 token 截 basename
+        assert_eq!(shell_main_command("git status"), Some("git".into()));
+        assert_eq!(shell_main_command("FOO=1 BAR=2 npm run build"), Some("npm".into()));
+        assert_eq!(shell_main_command("sudo env RUST_LOG=debug /usr/bin/cargo test"), Some("cargo".into()));
+        assert_eq!(shell_main_command("nohup ./scripts/dev.sh &"), Some("dev.sh".into()));
+        assert_eq!(shell_main_command("   "), None);
+        assert_eq!(shell_main_command("sudo"), None);
+        // 实测形状:Claude Bash 普遍 `cd X && 真命令`,cd 段跳过取下一段
+        assert_eq!(shell_main_command("cd \"/Users/u/my proj\" && node validate.js"), Some("node".into()));
+        assert_eq!(shell_main_command("cd /tmp && FOO=1 python3 run.py; echo done"), Some("python3".into()));
+        // 带引号的可执行路径 → 引号内整体取 basename
+        assert_eq!(
+            shell_main_command(r#"cd /a && "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --headless"#),
+            Some("Google Chrome".into())
+        );
+        // 管道/分号切段取首段
+        assert_eq!(shell_main_command("rg -n foo | head -5"), Some("rg".into()));
+        assert_eq!(shell_main_command("test -d .git && echo yes || echo no"), Some("test".into()));
+    }
+
+    #[test]
+    fn claude_tool_uses_extracted_per_block_with_toolu_dedup_keys() {
+        // 实测形状:每行恰一个 content 块,同 message.id 跨多行;工具事件按块自身
+        // toolu id 去重(fork 复制原样保留 toolu id);Bash 追加 shell 首词;
+        // mcp__server__tool 计 mcp(server),不进 tool 排行
+        let lines = [
+            r#"{"type":"assistant","timestamp":"2026-08-01T10:00:00Z","message":{"id":"m1","model":"claude-opus-4-8","usage":{"input_tokens":10,"output_tokens":5},"content":[{"type":"text","text":"hi"}]}}"#,
+            r#"{"type":"assistant","timestamp":"2026-08-01T10:00:01Z","message":{"id":"m1","model":"claude-opus-4-8","usage":{"input_tokens":10,"output_tokens":5},"content":[{"type":"tool_use","id":"toolu_A","name":"Read","input":{"file_path":"/a"}}]}}"#,
+            r#"{"type":"assistant","timestamp":"2026-08-01T10:00:02Z","message":{"id":"m1","model":"claude-opus-4-8","usage":{"input_tokens":10,"output_tokens":5},"content":[{"type":"tool_use","id":"toolu_B","name":"Bash","input":{"command":"cd /p && git log"}}]}}"#,
+            r#"{"type":"assistant","timestamp":"2026-08-01T10:01:00Z","message":{"id":"m2","model":"claude-opus-4-8","usage":{"input_tokens":1,"output_tokens":2},"content":[{"type":"tool_use","id":"toolu_C","name":"mcp__context7__query-docs","input":{}}]}}"#,
+        ];
+        let (turns, tool_uses, _, _) = claude_turns_from_lines(lines.iter().copied());
+        assert_eq!(turns.len(), 2, "同 id 多行合并为一次计费调用");
+        let got: Vec<(&str, &str, Option<&str>)> = tool_uses
+            .iter()
+            .map(|u| (u.kind, u.name.as_str(), u.dedup_key.as_deref()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("tool", "Read", Some("toolu_A")),
+                ("tool", "Bash", Some("toolu_B")),
+                ("shell", "git", Some("toolu_B#s")),
+                ("mcp", "context7", Some("toolu_C")),
+            ]
+        );
+        assert_eq!(tool_uses[0].timestamp_ms, parse_rfc3339_ms("2026-08-01T10:00:01Z"));
+    }
+
+    #[test]
+    fn codex_tool_calls_extracted_with_call_id_dedup_keys() {
+        // 实测形状:response_item 的 function_call(arguments 为二次编码 JSON 串)
+        // 与 custom_tool_call(name=exec,命令埋在 payload.input 的 JS 串里);
+        // call_id 稳定,作跨文件去重键;mcp__ 前缀抽 server,其余计 tool
+        let root = std::env::temp_dir().join(format!(
+            "mini-term-turns-codextool-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let meta = r#"{"type":"session_meta","timestamp":"2026-08-01T09:00:00.000Z","payload":{"id":"sess-t","cwd":"/p","model_provider":"openai"}}"#;
+        let exec = r#"{"type":"response_item","timestamp":"2026-08-01T09:01:00.000Z","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"sed -n '1,10p' a.md\",\"workdir\":\"/p\"}","call_id":"call_1"}}"#;
+        let shell_legacy = r#"{"type":"response_item","timestamp":"2026-08-01T09:02:00.000Z","payload":{"type":"function_call","name":"shell_command","arguments":"{\"command\":\"ls -la\",\"workdir\":\"/p\"}","call_id":"call_2"}}"#;
+        let custom = r#"{"type":"response_item","timestamp":"2026-08-01T09:03:00.000Z","payload":{"type":"custom_tool_call","name":"exec","call_id":"call_3","input":"const r = await tools.exec_command({\"cmd\":\"rg -n foo src\",\"workdir\":\"/p\"}); text(r.output)\n"}}"#;
+        let mcp = r#"{"type":"response_item","timestamp":"2026-08-01T09:04:00.000Z","payload":{"type":"function_call","name":"mcp__context7__query-docs","arguments":"{}","call_id":"call_4"}}"#;
+        let plain = r#"{"type":"response_item","timestamp":"2026-08-01T09:05:00.000Z","payload":{"type":"function_call","name":"update_plan","arguments":"{}","call_id":"call_5"}}"#;
+        let f = root.join("rollout-t.jsonl");
+        std::fs::write(&f, format!("{meta}\n{exec}\n{shell_legacy}\n{custom}\n{mcp}\n{plain}\n")).unwrap();
+
+        let p = parse_codex_session(&f, &HashMap::new()).unwrap();
+        let got: Vec<(&str, &str, Option<&str>)> = p
+            .tool_uses
+            .iter()
+            .map(|u| (u.kind, u.name.as_str(), u.dedup_key.as_deref()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("tool", "exec_command", Some("call_1")),
+                ("shell", "sed", Some("call_1#s")),
+                ("tool", "shell_command", Some("call_2")),
+                ("shell", "ls", Some("call_2#s")),
+                ("tool", "exec", Some("call_3")),
+                ("shell", "rg", Some("call_3#s")),
+                ("mcp", "context7", Some("call_4")),
+                ("tool", "update_plan", Some("call_5")),
+            ]
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn codex_fast_real_turn_after_fork_is_kept() {
+        // 复制块是毫秒级的突发写入（行间距 ~1ms）；真实 turn 与复制块之间必有
+        // 一次模型往返的间隙。meta 后 1.5s 完成的快速真实 turn 不得被血缘截断误吞
+        let root = std::env::temp_dir().join(format!(
+            "mini-term-turns-fastreal-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let child_meta = r#"{"type":"session_meta","timestamp":"2026-08-03T08:21:47.505Z","payload":{"id":"sess-child","cwd":"/p"}}"#;
+        let parent_meta = r#"{"type":"session_meta","timestamp":"2026-08-03T08:21:47.505Z","payload":{"id":"sess-parent","cwd":"/p"}}"#;
+        let copied1 = r#"{"type":"event_msg","timestamp":"2026-08-03T08:21:47.506Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"output_tokens":50,"total_tokens":150}}}}"#;
+        let copied2 = r#"{"type":"event_msg","timestamp":"2026-08-03T08:21:47.507Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}}}}"#;
+        let fast_real = r#"{"type":"event_msg","timestamp":"2026-08-03T08:21:49.005Z","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":20,"output_tokens":9,"total_tokens":29}}}}"#;
+        let f = root.join("rollout-child.jsonl");
+        std::fs::write(&f, format!("{child_meta}\n{parent_meta}\n{copied1}\n{copied2}\n{fast_real}\n")).unwrap();
+
+        let p = parse_codex_session(&f, &HashMap::new()).unwrap();
+        assert_eq!(p.turns.len(), 1, "毫秒级复制簇必须整块丢弃，1.5s 后的真实 turn 必须保留");
         assert_eq!(p.turns[0].usage.input, 20);
         std::fs::remove_dir_all(&root).ok();
     }

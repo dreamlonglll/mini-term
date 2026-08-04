@@ -19,6 +19,7 @@
     "src/utils/wslPath.ts",
     "src/utils/inferVendor.ts",
     "src/utils/projectKind.ts",
-    "src/utils/worktreeReconcile.ts"
+    "src/utils/worktreeReconcile.ts",
+    "src/utils/usageDates.ts"
   ]
 }

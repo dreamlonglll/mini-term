@@ -201,3 +201,18 @@ useTween.ts 的 useTweenedNumbers（数组版）。
 - 账本损坏：打开失败即删除重建 + 触发 backfill（数据源头是 JSONL，账本可再生，
   无需备份机制）。
 - 数据口径变化风险：§6.2 的新旧路径一致性测试兜底。
+
+---
+
+## 附注（2026-08-04 实施更新）
+
+- 账本 schema 已升 **v3**：turns 主键改为 `(session_id, request_id)` 并增 `message_id`
+  列（fork 归属确定化、Claude 收缩收敛，跨文件去重回聚合层首见规则）；新增
+  `tool_events` 表承载工具/Shell/MCP 排行（原设计 §2.2 遗留项落地）。
+- 上文「UsageStatsPayload 序列化形状不变」自 v3 起不再成立：payload 追加
+  `byTool` / `byShell` / `byMcp`（各前 10 计数，`UsageCountStat {name, count}`），
+  前端 types.ts 同步扩展。版本不匹配即删表重建，由空 sync_state 触发 backfill。
+- **展示层不渲染这三个排行**（2026-08-04 手长决定：仅采集不展示；token 消耗本就
+  完整——Claude 工具块的 token 计入所在 assistant 消息 usage，Codex 由 token_count
+  事件覆盖）。命令改 async（同步命令跑主线程,busy_timeout 等锁会冻住整窗）；版本
+  重建放 IMMEDIATE 事务内原子化；backfill 期间前端按进度事件节流(1s)重查实现增量填充。

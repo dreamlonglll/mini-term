@@ -5,19 +5,9 @@
  * 探测输入是项目根目录一层的文件名集合 + package.json 的 deps 合并表。
  */
 
-export type ProjectKind =
-  | 'java'
-  | 'rust'
-  | 'go'
-  | 'python'
-  | 'flutter'
-  | 'php'
-  | 'vuejs'
-  | 'nextjs'
-  | 'react'
-  | 'svelte'
-  | 'vite'
-  | 'nodejs';
+import type { ProjectKind } from '../types';
+
+export type { ProjectKind };
 
 /** 手动指定菜单的可选项顺序(常用在前)。 */
 export const PROJECT_KINDS: ProjectKind[] = [

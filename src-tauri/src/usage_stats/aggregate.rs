@@ -65,6 +65,14 @@ pub struct ProviderStat {
     pub sessions: u64,
 }
 
+/// 计数排行条目（工具/Shell/MCP，设计 §2.2）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CountStat {
+    pub name: String,
+    pub count: u64,
+}
+
 /// 聚合快照（serde camelCase，`src/types.ts` 手写镜像）。
 #[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -84,11 +92,17 @@ pub struct UsageStatsPayload {
     /// 全量输出（供应商数天然有限）
     pub by_provider: Vec<ProviderStat>,
     pub top_sessions: Vec<TopSessionStat>,
+    /// 工具/Shell 首词/MCP server 计数排行，各前 10（设计 §2.2）
+    pub by_tool: Vec<CountStat>,
+    pub by_shell: Vec<CountStat>,
+    pub by_mcp: Vec<CountStat>,
 }
 
 /// 项目排行上限：设计合同(2026-08-01 §2.2)定为前 8
 const TOP_PROJECTS: usize = 8;
 const TOP_SESSIONS: usize = 10;
+/// 工具/Shell/MCP 排行上限：设计合同 §2.2「各前 10」
+const TOP_TOOLS: usize = 10;
 
 #[derive(Default)]
 struct BucketAcc {
@@ -127,6 +141,8 @@ pub struct Aggregator {
     /// true = 按本地小时分桶（「今天」视图），false = 按本地日历日
     hourly: bool,
     seen_ids: HashSet<String>,
+    /// 工具事件的跨文件去重集（Claude 按 message_id 派生键；Codex 无键不参与）
+    seen_tool_keys: HashSet<String>,
     totals: UsageTotals,
     total_cost: f64,
     total_calls: u64,
@@ -136,6 +152,9 @@ pub struct Aggregator {
     models: HashMap<String, BucketAcc>,
     providers: HashMap<String, BucketAcc>,
     sessions: Vec<SessionAcc>,
+    tools: HashMap<String, u64>,
+    shells: HashMap<String, u64>,
+    mcps: HashMap<String, u64>,
 }
 
 fn project_name(cwd: &str) -> String {
@@ -172,6 +191,7 @@ impl Aggregator {
             tz: tz_name.and_then(|n| n.parse().ok()),
             hourly,
             seen_ids: HashSet::new(),
+            seen_tool_keys: HashSet::new(),
             totals: UsageTotals::default(),
             total_cost: 0.0,
             total_calls: 0,
@@ -181,6 +201,9 @@ impl Aggregator {
             models: HashMap::new(),
             providers: HashMap::new(),
             sessions: Vec::new(),
+            tools: HashMap::new(),
+            shells: HashMap::new(),
+            mcps: HashMap::new(),
         }
     }
 
@@ -260,6 +283,26 @@ impl Aggregator {
             acc.calls += 1;
             acc.tokens += tokens;
             acc.first_ts_ms = acc.first_ts_ms.min(ts);
+        }
+
+        // 工具/Shell/MCP 计数：与 turn 同口径的去重(有键先去重)与窗口终判;
+        // 不影响 session_count(纯工具活动不算计费会话)
+        for u in &s.tool_uses {
+            if let Some(key) = &u.dedup_key {
+                if !self.seen_tool_keys.insert(key.clone()) {
+                    continue;
+                }
+            }
+            let ts = u.timestamp_ms.unwrap_or(s.mtime_ms);
+            if ts < self.since_ms || self.until_ms.is_some_and(|until| ts > until) {
+                continue;
+            }
+            let bucket = match u.kind {
+                "shell" => &mut self.shells,
+                "mcp" => &mut self.mcps,
+                _ => &mut self.tools,
+            };
+            *bucket.entry(u.name.clone()).or_default() += 1;
         }
 
         // 全部被去重/窗外的会话不计入
@@ -411,6 +454,17 @@ impl Aggregator {
             })
             .collect();
 
+        // 工具/Shell/MCP:次数降序,同次数按名字典序确定化;各截前 10
+        let count_rank = |map: &HashMap<String, u64>| -> Vec<CountStat> {
+            let mut v: Vec<CountStat> = map
+                .iter()
+                .map(|(name, &count)| CountStat { name: name.clone(), count })
+                .collect();
+            v.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
+            v.truncate(TOP_TOOLS);
+            v
+        };
+
         UsageStatsPayload {
             total_cost: self.total_cost,
             total_calls: self.total_calls,
@@ -424,6 +478,9 @@ impl Aggregator {
             by_model,
             by_provider,
             top_sessions,
+            by_tool: count_rank(&self.tools),
+            by_shell: count_rank(&self.shells),
+            by_mcp: count_rank(&self.mcps),
         }
     }
 }
@@ -471,10 +528,67 @@ mod tests {
             provider: Some("api.anthropic.com".into()),
             mtime_ms: 1_000_000,
             turns,
+            tool_uses: Vec::new(),
         }
     }
 
     const DAY: i64 = 86_400_000;
+
+    fn tool_use(kind: &'static str, name: &str, ts_ms: i64, key: Option<&str>) -> super::super::turns::ToolUse {
+        super::super::turns::ToolUse {
+            kind,
+            name: name.into(),
+            timestamp_ms: Some(ts_ms),
+            dedup_key: key.map(String::from),
+        }
+    }
+
+    #[test]
+    fn tool_counts_deduped_and_window_filtered() {
+        let table = pricing();
+        let mut agg = Aggregator::new(DAY, None, 0, None, false);
+        let mut s1 = session("s1", "/p", vec![]);
+        s1.tool_uses.push(tool_use("tool", "Read", DAY + 1, Some("m1:0")));
+        s1.tool_uses.push(tool_use("tool", "Bash", DAY + 2, Some("m2:0")));
+        s1.tool_uses.push(tool_use("shell", "git", DAY + 2, Some("m2:0#s")));
+        s1.tool_uses.push(tool_use("mcp", "context7", DAY + 3, Some("m3:0")));
+        s1.tool_uses.push(tool_use("tool", "Out", DAY - 1, Some("m0:0"))); // 窗外
+        agg.add_session(&s1, &table);
+        // fork 复制:同 dedup_key 不得翻倍
+        let mut s2 = session("s2", "/p", vec![]);
+        s2.tool_uses.push(tool_use("tool", "Read", DAY + 1, Some("m1:0")));
+        // Codex 无 key:逐条计数
+        s2.tool_uses.push(tool_use("shell", "git", DAY + 5, None));
+        agg.add_session(&s2, &table);
+
+        let snap = agg.snapshot();
+        assert_eq!(
+            snap.by_tool.iter().map(|c| (c.name.as_str(), c.count)).collect::<Vec<_>>(),
+            vec![("Bash", 1), ("Read", 1)],
+            "同 key 去重、窗外不计、无 Out"
+        );
+        assert_eq!(snap.by_shell[0].name, "git");
+        assert_eq!(snap.by_shell[0].count, 2, "无 key 的 Codex 事件逐条计数");
+        assert_eq!(snap.by_mcp[0].name, "context7");
+    }
+
+    #[test]
+    fn tool_counts_ranked_desc_and_capped_at_ten() {
+        let table = pricing();
+        let mut agg = Aggregator::new(0, None, 0, None, false);
+        let mut s = session("s1", "/p", vec![]);
+        for i in 0..12u64 {
+            for _ in 0..=i {
+                s.tool_uses.push(tool_use("tool", &format!("T{i:02}"), DAY, None));
+            }
+        }
+        agg.add_session(&s, &table);
+        let snap = agg.snapshot();
+        assert_eq!(snap.by_tool.len(), 10, "各前 10");
+        assert_eq!(snap.by_tool[0].name, "T11");
+        assert_eq!(snap.by_tool[0].count, 12);
+        assert_eq!(snap.by_tool[9].name, "T02");
+    }
 
     #[test]
     fn tz_offset_follows_dst_at_record_time() {

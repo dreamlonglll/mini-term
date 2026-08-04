@@ -10,6 +10,7 @@ import { DailyChart } from './DailyChart';
 import { RankBarList, type RankRow } from './RankBarList';
 import { TopSessions } from './TopSessions';
 import { formatCost, formatTokens, modelShortName } from './format';
+import { acceptDateInput, USAGE_RANGES } from '../../utils/usageDates';
 
 const SCOPE_KEY = 'mini-term-usage-scope';
 const RANGE_KEY = 'mini-term-usage-range';
@@ -41,9 +42,9 @@ function savePref(key: string, v: string) {
 }
 
 const SCOPES: readonly UsageAgentFilter[] = ['all', 'claude', 'codex'];
-// 设计合同(docs/plans/2026-08-01-usage-stats-design.md §2):不提供 all(全盘扫描太重);
+// 范围清单同源于 utils/usageDates(设计合同:不提供 all,全盘扫描太重);
 // 存量 localStorage 里的 'all' 不在白名单,loadPref 自动回落 days30
-const RANGES: readonly UsageRange[] = ['today', 'days7', 'days30', 'month', 'months3', 'months6', 'custom'];
+const RANGES = USAGE_RANGES;
 
 /** date input 值("YYYY-MM-DD",本地日历日),n 天前 */
 function localDateStr(daysBack: number): string {
@@ -202,13 +203,21 @@ export function UsageStatsModal({ open, onClose }: { open: boolean; onClose: () 
     setAutoRefresh(v);
     savePref(AUTO_REFRESH_KEY, String(v));
   }, []);
+  // 提交闸门：只有完整日期才进查询状态/localStorage，清空或非法输入回弹上一个有效值
+  // （空值一旦进入查询,custom 窗口会静默退化为无上界/近30天）
   const changeCustomFrom = useCallback((v: string) => {
-    setCustomFrom(v);
-    savePref(CUSTOM_FROM_KEY, v);
+    setCustomFrom((prev) => {
+      const next = acceptDateInput(v, prev);
+      savePref(CUSTOM_FROM_KEY, next);
+      return next;
+    });
   }, []);
   const changeCustomTo = useCallback((v: string) => {
-    setCustomTo(v);
-    savePref(CUSTOM_TO_KEY, v);
+    setCustomTo((prev) => {
+      const next = acceptDateInput(v, prev);
+      savePref(CUSTOM_TO_KEY, next);
+      return next;
+    });
   }, []);
 
   const scopeLabel = (v: UsageAgentFilter) =>

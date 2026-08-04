@@ -17,6 +17,7 @@ import type {
   AiMarker,
   AiUserSubmitPayload,
   MobileRelayStatusPayload,
+  ProjectKind,
 } from './types';
 import { restoreSavedProjectLayout } from './utils/layoutRestore';
 import { playNotificationSound } from './utils/notificationSound';
@@ -616,6 +617,14 @@ interface AppStore {
   // 移动端中转连接状态(后端 mobile-relay-status 事件驱动,设置页「移动端」区域展示)
   mobileRelayStatus: MobileRelayStatusPayload | null;
   setMobileRelayStatus: (status: MobileRelayStatusPayload | null) => void;
+
+  // 目录技术栈探测缓存(key = 目录路径原样;value null = 已探测但识别不出,不再重探)。
+  // Map 原地更新、版本号驱动订阅方重渲染(探测完成高频发生,整表复制不划算)
+  dirKinds: Map<string, ProjectKind | null>;
+  dirKindsVersion: number;
+  setDirKind: (path: string, kind: ProjectKind | null) => void;
+  /** 根目录标记文件变化时失效缓存(版本号 +1 触发重探) */
+  removeDirKind: (path: string) => void;
 }
 
 export const useAppStore = create<AppStore>((set, get) => ({
@@ -656,6 +665,18 @@ export const useAppStore = create<AppStore>((set, get) => ({
 
   mobileRelayStatus: null,
   setMobileRelayStatus: (status) => set({ mobileRelayStatus: status }),
+
+  dirKinds: new Map(),
+  dirKindsVersion: 0,
+  setDirKind: (path, kind) =>
+    set((state) => {
+      state.dirKinds.set(path, kind);
+      return { dirKindsVersion: state.dirKindsVersion + 1 };
+    }),
+  removeDirKind: (path) =>
+    set((state) =>
+      state.dirKinds.delete(path) ? { dirKindsVersion: state.dirKindsVersion + 1 } : {},
+    ),
 
   setActiveProject: (id) =>
     set((state) => {

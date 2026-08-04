@@ -10,6 +10,7 @@ import {
   YAxis,
 } from 'recharts';
 import type { UsageDailyStat, UsageRange } from '../../types';
+import { rangeStartDate } from '../../utils/usageDates';
 import { formatCost, formatCount, formatTokens } from './format';
 
 function axisCost(v: number): string {
@@ -43,13 +44,10 @@ function fillBuckets(daily: UsageDailyStat[], range: UsageRange): UsageDailyStat
   }
   if (daily.length === 0) return out;
   let start: Date;
-  if (range === 'days7' || range === 'days30') {
-    const daysBack = range === 'days7' ? 6 : 29;
-    start = new Date(now.getFullYear(), now.getMonth(), now.getDate() - daysBack);
-  } else if (range === 'month' || range === 'months3' || range === 'months6') {
-    // 与 rangeSinceMs 同口径:对应月份的月初,x 轴跨度与所选范围一致
-    const monthsBack = range === 'month' ? 0 : range === 'months3' ? 2 : 5;
-    start = new Date(now.getFullYear(), now.getMonth() - monthsBack, 1);
+  // 非 custom 的窗口起点与查询 since 同源(utils/usageDates 的范围规格)
+  const rangeStart = rangeStartDate(range, now);
+  if (rangeStart) {
+    start = rangeStart;
   } else {
     // custom:窗口起点不在本组件已知,从数据首日起补零
     const [y, m, d] = daily[0].date.split('-').map(Number);
