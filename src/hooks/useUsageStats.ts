@@ -21,17 +21,25 @@ interface UseUsageStatsResult {
   /** backfill（账本首建全量同步）进度；非 backfill 期间恒 0/0 */
   backfillProcessed: number;
   backfillTotal: number;
+  /** 手动刷新正在等后端同步跑完（刷新按钮据此显示忙态、避免重复点击） */
+  syncing: boolean;
   error: string;
-  /** 手动刷新：重拉价（24h TTL 缓存命中即瞬时）→ 重查 → 触发增量同步 */
+  /** 手动刷新：重拉价（24h TTL 缓存命中即瞬时）→ 等增量同步跑完 → 再查 */
   refresh: () => void;
   /** 仅触发一次增量同步（自动刷新定时器用；数据有变由 synced 事件驱动重查） */
   sync: () => void;
 }
 
 /**
- * 统计数据流 hook（账本化）：展示只查账本（usage_ledger_query 毫秒级秒出），
- * 增量同步在后台跑（usage_ledger_sync），synced 事件驱动重查。
+ * 统计数据流 hook（账本化）：展示只查账本（usage_ledger_query 毫秒级秒出）。
  * 切参数就是重新查询——无扫描态、无快照缓存、无静默机制。
+ *
+ * 同步有两条路径，差别在「查询与同步的先后」：
+ * - 打开面板 / 定时自动刷新：先出账本现值，同步在后台跑，有变化再由
+ *   `usage-ledger-synced` 事件驱动补查（面板不空屏、定时器不阻塞）。
+ * - 手动刷新：先等同步跑完（`wait: true`）再查，数字一步到位。否则点一次
+ *   会先看到同步前的旧值、真值随后才补上，活跃使用或首次全量回填时表现为
+ *   金额大幅跳动。
  */
 export function useUsageStats(
   open: boolean,
@@ -46,8 +54,12 @@ export function useUsageStats(
   const [phase, setPhase] = useState<UsageStatsPhase>('pricing');
   const [stats, setStats] = useState<UsageStatsPayload | null>(null);
   const [backfill, setBackfill] = useState({ processed: 0, total: 0 });
+  const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState('');
   const [refreshTick, setRefreshTick] = useState(0);
+  /** 已消费的刷新序号：用来把「打开面板」与「点刷新」两条路径分开
+   *  （关闭再打开时 tick 不变，不该退化成一次阻塞刷新） */
+  const handledTickRef = useRef(0);
   /** 价格表跨开关 Modal 保留；每次打开/刷新都重走 loadModelPricing，24h TTL 由其缓存判定 */
   const pricingRef = useRef<Record<string, ModelPriceEntry> | null>(null);
   /** 查询竞态防护：只采纳最新一次查询的结果 */
@@ -94,38 +106,67 @@ export function useUsageStats(
   const queryRef = useRef(query);
   queryRef.current = query;
 
-  // 打开面板 / 手动刷新：拉价 → 重查 → 后台增量同步。
-  // loadModelPricing 每次都走：24h TTL 由其 localStorage 缓存判定（命中即瞬时），
+  // 拉价：24h TTL 由 loadModelPricing 的 localStorage 缓存判定（命中即瞬时），
   // 内存引用不再永久绕过 TTL——应用常驻多日后过期价格照常重拉；
   // 已有旧价格表时拉新失败静默沿用（不把可用面板打成错误态）。
-  // 重查毫秒级，内容未变时保留旧引用不触发重渲染（见 query）
+  // 返回是否可以继续查询。
+  const ensurePricing = useCallback(async (): Promise<boolean> => {
+    if (!pricingRef.current) {
+      setPhase('pricing');
+      setError('');
+    }
+    try {
+      pricingRef.current = await loadModelPricing();
+      return true;
+    } catch (e) {
+      if (pricingRef.current) return true;
+      setError(String(e));
+      setPhase('pricingError');
+      return false;
+    }
+  }, []);
+
+  // 打开面板：先出账本现值（查询毫秒级，不让面板空屏干等），再后台增量同步；
+  // 同步有变由 synced 事件驱动补查
   useEffect(() => {
     if (!open) return;
     let cancelled = false;
     (async () => {
-      if (!pricingRef.current) {
-        setPhase('pricing');
-        setError('');
-      }
-      try {
-        pricingRef.current = await loadModelPricing();
-      } catch (e) {
-        if (!pricingRef.current) {
-          if (!cancelled) {
-            setError(String(e));
-            setPhase('pricingError');
-          }
-          return;
-        }
-      }
-      if (cancelled) return;
+      const ok = await ensurePricing();
+      if (cancelled || !ok) return;
       queryRef.current();
-      invoke('usage_ledger_sync').catch(() => {});
+      invoke('usage_ledger_sync', { wait: false }).catch(() => {});
     })();
     return () => {
       cancelled = true;
     };
-  }, [open, refreshTick]);
+  }, [open, ensurePricing]);
+
+  // 手动刷新：等增量同步真正跑完再查 —— 数字一步到位。
+  // 旧实现是「先查、再触发同步」，每点一次必然先闪一次同步前的旧值，真值要等
+  // synced 事件才补上；在活跃使用或首次全量回填时表现为金额大幅跳动。
+  useEffect(() => {
+    if (!open || refreshTick === handledTickRef.current) return;
+    handledTickRef.current = refreshTick;
+    let cancelled = false;
+    (async () => {
+      const ok = await ensurePricing();
+      if (cancelled || !ok) return;
+      setSyncing(true);
+      try {
+        await invoke('usage_ledger_sync', { wait: true });
+      } catch {
+        // 同步失败仍查一次账本现值，不把可用面板打成错误态
+      }
+      if (cancelled) return;
+      setSyncing(false);
+      queryRef.current();
+    })();
+    return () => {
+      cancelled = true;
+      setSyncing(false);
+    };
+  }, [open, refreshTick, ensurePricing]);
 
   // 切参数 → 直接重新查询（毫秒级；价格未就绪时由上面的 effect 拉完价补查）
   useEffect(() => {
@@ -157,8 +198,9 @@ export function useUsageStats(
   });
 
   const refresh = useCallback(() => setRefreshTick((t) => t + 1), []);
+  // 定时自动刷新：非阻塞触发，不占用调用方；数据有变由 synced 事件驱动重查
   const sync = useCallback(() => {
-    invoke('usage_ledger_sync').catch(() => {});
+    invoke('usage_ledger_sync', { wait: false }).catch(() => {});
   }, []);
 
   return {
@@ -166,6 +208,7 @@ export function useUsageStats(
     stats,
     backfillProcessed: backfill.processed,
     backfillTotal: backfill.total,
+    syncing,
     error,
     refresh,
     sync,

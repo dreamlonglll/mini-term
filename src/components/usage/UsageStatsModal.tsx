@@ -166,7 +166,7 @@ export function UsageStatsModal({ open, onClose }: { open: boolean; onClose: () 
   });
   const [viewer, setViewer] = useState<UsageTopSessionStat | null>(null);
 
-  const { phase, stats, backfillProcessed, backfillTotal, error, refresh, sync } = useUsageStats(
+  const { phase, stats, backfillProcessed, backfillTotal, syncing, error, refresh, sync } = useUsageStats(
     open,
     scope,
     range,
@@ -449,10 +449,13 @@ export function UsageStatsModal({ open, onClose }: { open: boolean; onClose: () 
               </option>
             ))}
           </select>
+          {/* 刷新走「先同步再查」，跑完才出数：期间置忙态并挡住重复点击
+              （连点会各自等一轮同步，白白拉长等待） */}
           <button
             type="button"
-            className="w-7 h-7 flex items-center justify-center rounded-[var(--radius-sm)] text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--border-subtle)] transition-colors flex-shrink-0"
+            className="w-7 h-7 flex items-center justify-center rounded-[var(--radius-sm)] text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--border-subtle)] transition-colors flex-shrink-0 disabled:opacity-40 disabled:pointer-events-none"
             onClick={refresh}
+            disabled={syncing}
             title={t('usageStats.refresh')}
           >
             {ICON_REFRESH}
