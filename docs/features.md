@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.9.1-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.9.3-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -80,9 +80,9 @@ Mini-Term solves all of the above with one lightweight desktop app.
 ### AI Process Awareness
 
 - **Hook event system** — Integrates the official Claude Code / Codex Hook APIs to receive AI tool events (SessionStart / End, ToolUse, etc.), which is more precise and timely than process polling; the built-in `miniterm-hook` CLI is called by the hook system to POST events to a local server; the settings UI registers / unregisters the hook config with one click, merging rather than overwriting your existing hooks. Codex permission requests stay in `ai-working` through approval and tool execution, avoiding premature completion notifications.
-- **Real-time status detection** — Hook-first with a 500ms process-polling fallback, auto-detecting Claude / Codex / OpenCode and showing idle / working / error states.
+- **Real-time status detection** — Once hooks are reporting they are the only status source for that pane; output activity no longer participates (a TUI's idle redraws used to read as "working again," firing the completion notification over and over). Panes without hooks fall back to 500ms process polling, auto-detecting Claude / Codex / OpenCode and showing idle / working / error states.
 - **Status aggregation** — Aggregated layer by layer from pane → tab → project, with priority `error > ai-working > ai-idle > idle`.
-- **Completion notification trio** — Fires the moment an AI task goes working → idle:
+- **Completion notification trio** — Fires the moment an AI task goes working → idle *and* the cause is a `Stop` event (permission requests, notifications, and elicitations also land on `ai-idle` and are no longer misreported as completion; the hookless fallback path still keys off the falling edge alone):
   - A bottom-right toast desktop notification (only for inactive projects, deduplicated per project).
   - A DONE badge in the project list, cleared on click.
   - Taskbar flashing (Windows) / Dock bouncing (macOS), triggered only when the window is unfocused.
@@ -114,7 +114,7 @@ Watch the AI running on your desktop from your phone while you're out, and send 
 - **Project list** — Manage multiple project directories in the left sidebar, switch workspaces in one click, and restore the last active project on restart.
 - **Drag to add projects** — Drag a folder from the file explorer onto the project list to add it quickly, with automatic detection of files / folders / duplicate projects and visual feedback.
 - **Nested groups** — Up to 3 levels of project grouping, drag to reorder, collapse / expand, with a group context menu to add either a local project or a remote SSH project directly into that group (a collapsed group expands automatically). "Delete group" now asks for confirmation first, explaining that the projects inside move up one level rather than being deleted; "Move to group" expands the group tree level by level as submenus, marking the current group with a ✓ and greying it out, with over-depth groups unselectable.
-- **Worktree sub-projects** — A worktree turned into a project is mounted beneath its main project as a sub-project (indented, following the group), and can be dragged out or detached via "Detach from parent" to return to the top level; deleting a parent project promotes its sub-projects in place instead of losing them. The project list shows a ⎇ branch badge for worktree projects, and the repo list and Changes dropdown label worktree entries as well.
+- **Worktree sub-projects** — A worktree turned into a project is mounted beneath its main project as a sub-project (indented, following the group), and can be dragged out or detached via "Detach from parent" to return to the top level; deleting a parent project promotes its sub-projects in place instead of losing them. The project list shows a ⎇ branch badge for worktree projects, and the repo list and Changes dropdown label worktree entries as well. **Externally removed worktrees are reconciled automatically** — whenever the window regains focus, sub-project directories are probed for existence, so after an AI agent runs `git worktree remove` in a terminal the vanished sub-project is dropped along with its terminal resources and the ⎇ badges are re-probed (cleanup only happens while the parent project directory still exists, so a disconnected drive can't wipe entries; SSH remote and UNC/WSL paths are excluded). "Clean up stale entries" in the worktree modal removes the projects pointing at those worktrees too.
 - **File tree** — An integrated directory browser with natural sorting (V1 → V2 → V10 rather than lexicographic), nested `.gitignore` greying (ignore rules and `!pattern` allowlists at every sub-directory level take effect, consistent with git behavior), and live refresh via `notify` file watching.
 - **File operations** — Create / rename / delete files and folders and view contents inside the file tree (Markdown rendering supports HTML tags and external images, external links open in the system default browser after a confirmation prompt, image formats are shown directly, HTML files preview in an iframe with relative-path resources auto-resolved, and binary / oversized files get a friendly notice).
 - **Built-in file editor** — Click any file in the tree to edit it in place (CodeMirror 6 core): syntax highlighting for 140+ languages matched by file type and lazy-loaded on demand, find & replace (`Ctrl+F`), code folding, bracket matching, and multi-cursor editing; `Ctrl+S` saves atomically (temp file + rename), CRLF files round-trip with their original line endings so you never get a whole-file diff; closing or navigating away with unsaved changes asks first, and external modifications reload silently when clean or show a notice bar when dirty; Markdown / HTML previews render the unsaved draft live; syntax colors reference the app palette via `--syn-*` variables and follow all four theme skins.
@@ -164,7 +164,7 @@ Watch the AI running on your desktop from your phone while you're out, and send 
 | File watching | notify 7 + ignore 0.4 (.gitignore filtering) |
 | Tauri plugins | `window-state` · `clipboard-manager` · `dialog` · `opener` |
 | Mobile relay | axum + tokio WebSocket relay service (`relay-server/`) · React + TS + Vite PWA (`mobile/`) |
-| Test coverage | 504 Rust tests = 451 desktop (tauri-app 297 + mt-core 44 + mt-ssh 26 + mt-sidecars 84) + 53 relay-server (protocol & routing); plus 19 Node tests |
+| Test coverage | 505 Rust tests = 452 desktop (tauri-app 298 + mt-core 44 + mt-ssh 26 + mt-sidecars 84) + 53 relay-server (protocol & routing); plus 21 Node tests |
 
 ## Getting Started
 
@@ -313,7 +313,7 @@ mini-term/
 ├── scripts/
 │   ├── stage-sidecars.mjs        # Builds sidecars and stages them per-triple as Tauri externalBin
 │   └── stage-conpty.mjs          # Downloads, verifies and stages the pinned ConPTY runtime (Windows)
-├── tests/                        # Node-side tests (19: ConPTY bundling / TUI scrollback / layout restore / theme compat / WSL path ...)
+├── tests/                        # Node-side tests (20: ConPTY bundling / TUI scrollback / layout restore / theme compat / WSL path / worktree reconcile ...)
 └── package.json
 ```
 
@@ -377,10 +377,10 @@ Before submitting, please run:
 # Frontend type check (tsc + vite build)
 npm run build
 
-# Node-side tests (19)
+# Node-side tests (20)
 node --test "tests/*.test.cjs"
 
-# Desktop Rust tests (451)
+# Desktop Rust tests (452)
 # Note: mt-core / mt-ssh / mt-sidecars are standalone crates, not workspace members.
 # Running `cd src-tauri && cargo test` alone only covers tauri-app's 297 — the other
 # three need their manifests specified explicitly.

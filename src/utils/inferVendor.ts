@@ -5,16 +5,9 @@
  * 返回 null = 识别不出,调用方回退通用 Bot 图标。
  */
 
-export type AiVendor =
-  | 'claude'
-  | 'openai'
-  | 'gemini'
-  | 'opencode'
-  | 'grok'
-  | 'qwen'
-  | 'deepseek'
-  | 'copilot'
-  | 'ollama';
+import type { AiVendor } from '../types';
+
+export type { AiVendor };
 
 // 顺序即优先级:openai 的关键词面最宽(gpt/o1–o4),放最后避免误伤;
 // o1–o4 系列用前后非字母数字的 \b 边界防止匹配到普通单词(如 "foo3")。

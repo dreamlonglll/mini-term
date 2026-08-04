@@ -35,7 +35,7 @@ import { includeActiveProject } from './utils/projectKeepAlive';
 import { initMobileSessionSync } from './utils/mobileSessionSync';
 import { handleMobileStartSession } from './utils/mobileStartSession';
 import { useT } from './i18n';
-import type { AppConfig, PtyStatusChangePayload, PtyExitPayload, PaneStatus, MobileRelayStatusPayload, MobileStartSessionPayload, MobileRenamePanePayload } from './types';
+import type { LoadedConfig, PtyAiSessionPayload, PtyStatusChangePayload, PtyExitPayload, PaneStatus, MobileRelayStatusPayload, MobileStartSessionPayload, MobileRenamePanePayload } from './types';
 
 // 懒加载三个重弹窗（SettingsModal 自身体量 / MobileRelayModal 连带 qrcode / UsageStatsModal
 // 连带 usage/ 成套组件与 react-markdown），首次打开才拉 chunk，不占启动关键路径
@@ -97,12 +97,12 @@ export function App() {
     // 静默运行。写盘由令牌把关:load_config 成功才发放令牌,save_config
     // 必须携带当前令牌——空白页面/加载失败的页面天然没有写盘资格,
     // 防止空状态覆盖磁盘上的完整配置
-    const loadWithRetry = async (): Promise<{ config: AppConfig; token: number }> => {
+    const loadWithRetry = async (): Promise<LoadedConfig> => {
       markStartup('load_config invoke');
       let lastErr: unknown;
       for (let i = 0; i < 3; i++) {
         try {
-          return await invoke<{ config: AppConfig; token: number }>('load_config');
+          return await invoke<LoadedConfig>('load_config');
         } catch (e) {
           lastErr = e;
           await new Promise((r) => setTimeout(r, 500 * (i + 1)));
@@ -266,21 +266,13 @@ export function App() {
     let donePid: string | null = null;
     for (const [pid, ps] of projectStates) {
       if (!ps.layout) continue;
-      const stack = [ps.layout];
-      while (stack.length) {
-        const node = stack.pop()!;
-        if (node.type === 'leaf') {
-          for (const pane of node.panes) {
-            if (pane.status === 'error' || pane.attention) {
-              setActiveProject(pid);
-              return;
-            }
-            if (pane.status === 'ai-working') workingPid ??= pid;
-            if (unreadDonePaneIds.has(pane.id)) donePid ??= pid;
-          }
-        } else {
-          stack.push(...node.children);
+      for (const pane of collectPanes(ps.layout)) {
+        if (pane.status === 'error' || pane.attention) {
+          setActiveProject(pid);
+          return;
         }
+        if (pane.status === 'ai-working') workingPid ??= pid;
+        if (unreadDonePaneIds.has(pane.id)) donePid ??= pid;
       }
     }
     const target = workingPid ?? donePid;
@@ -301,7 +293,7 @@ export function App() {
   }, [trayStatusEnabled, trayMaxProjects]);
 
   // hook 上报的 AI 会话身份 → 写进 pane 并防抖持久化,供重启后 resume 续接
-  useTauriEvent<{ ptyId: number; agent?: string; sessionId: string }>('pty-ai-session', useCallback((payload) => {
+  useTauriEvent<PtyAiSessionPayload>('pty-ai-session', useCallback((payload) => {
     const projectId = setPaneAiSessionByPty(payload.ptyId, {
       agent: payload.agent,
       sessionId: payload.sessionId,

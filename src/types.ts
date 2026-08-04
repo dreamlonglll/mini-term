@@ -160,9 +160,36 @@ export interface ProjectConfig {
   /** 子项目(worktree「设为项目」)：有值 = 渲染在该父项目下方缩进一级,
    *  且**不进 projectTree**(树里只有顶层项目与分组)。拖出/「脱离父项目」时清除并入树。 */
   parentProjectId?: string;
-  /** 项目类型徽标覆盖:undefined = 自动探测,'none' = 不显示,其余为技术栈 key(ProjectKind)。 */
-  kindOverride?: string;
+  /** 项目类型徽标覆盖:undefined = 自动探测,'none' = 不显示,其余为技术栈 key。 */
+  kindOverride?: ProjectKind | 'none';
 }
+
+/** 技术栈类型 key（项目类型徽标/探测结果）。展示名与探测规则在 utils/projectKind.ts。 */
+export type ProjectKind =
+  | 'java'
+  | 'rust'
+  | 'go'
+  | 'python'
+  | 'flutter'
+  | 'php'
+  | 'vuejs'
+  | 'nextjs'
+  | 'react'
+  | 'svelte'
+  | 'vite'
+  | 'nodejs';
+
+/** AI 厂商 key（pane 徽标/品牌图标）。推断规则在 utils/inferVendor.ts。 */
+export type AiVendor =
+  | 'claude'
+  | 'openai'
+  | 'gemini'
+  | 'opencode'
+  | 'grok'
+  | 'qwen'
+  | 'deepseek'
+  | 'copilot'
+  | 'ollama';
 
 export interface ProjectEnvVar {
   key: string;
@@ -332,6 +359,9 @@ export interface FileEntry {
   isDir: boolean;
   ignored?: boolean;
   children?: FileEntry[];
+  /** 单链目录汇总(compact)后链上各段的真实路径(含链首与链尾)。前端
+   *  compactDirChains 附加,非后端字段;watch 注册与中段变化判定用。 */
+  chainPaths?: string[];
 }
 
 // === Tauri 事件 payload ===
@@ -349,11 +379,31 @@ export interface PtyExitPayload {
 export interface PtyStatusChangePayload {
   ptyId: number;
   status: PaneStatus;
-  /** 状态成因(hook 事件语义):'attention' = 需要用户确认,'stop' = 一轮回答
-   *  正常结束;缺省 = 无成因信息(monitor 降级路径)。托盘黄/绿灯靠它区分。 */
-  cause?: 'attention' | 'stop';
+  /**
+   * 状态变化的成因：hook 直推时是（归一化后的）hook 事件名（`Stop` /
+   * `PermissionRequest` / `SessionEnd` …），后端 monitor 轮询算出的变化没有该字段。
+   *
+   * 多个 hook 事件都落到 `ai-idle`，但只有 `Stop` 表示"任务做完了"——权限请求、
+   * 通知、澄清同样是 ai-idle，播报成完成就是误报（见 `isAiCompletion`）。
+   * 托盘黄灯认 `PermissionRequest`/`Elicitation`（权限/确认类 Notification
+   * 已在后端按文案归一化为 `PermissionRequest`）。
+   */
+  cause?: string;
   /** 会话内 AI 命令名(claude/codex/opencode…),品牌图标兜底用;缺省 = 未知 */
   agent?: string;
+}
+
+/** load_config 命令返回:配置 + 本次写盘令牌(config.rs LoadedConfig 镜像)。 */
+export interface LoadedConfig {
+  config: AppConfig;
+  token: number;
+}
+
+/** pty-ai-session 事件载荷:hook 上报的 AI 会话身份,供重启后 resume 续接。 */
+export interface PtyAiSessionPayload {
+  ptyId: number;
+  agent?: string;
+  sessionId: string;
 }
 
 export interface FsChangePayload {
@@ -500,7 +550,7 @@ export interface AiMarker {
 // === 使用统计（对齐 Rust usage_stats camelCase 序列化） ===
 
 export type UsageAgentFilter = 'all' | 'claude' | 'codex';
-export type UsageRange = 'today' | 'days7' | 'days30' | 'all';
+export type UsageRange = 'today' | 'days7' | 'days30' | 'month' | 'months3' | 'months6' | 'custom';
 
 /** 单模型价格（$/token，前端拉 models.dev 后 ÷1e6 归一） */
 export interface ModelPriceEntry {
@@ -559,6 +609,12 @@ export interface UsageProviderStat {
   sessions: number;
 }
 
+/** 计数排行条目（工具/Shell/MCP，设计 §2.2 各前 10） */
+export interface UsageCountStat {
+  name: string;
+  count: number;
+}
+
 export interface UsageStatsPayload {
   totalCost: number;
   totalCalls: number;
@@ -572,21 +628,18 @@ export interface UsageStatsPayload {
   byModel: UsageModelStat[];
   byProvider: UsageProviderStat[];
   topSessions: UsageTopSessionStat[];
+  byTool: UsageCountStat[];
+  byShell: UsageCountStat[];
+  byMcp: UsageCountStat[];
 }
 
-export interface UsageStatsProgressPayload {
-  requestId: string;
+export interface UsageLedgerProgressPayload {
+  /** backfill（账本首建全量同步）进度：已处理/总文件数 */
   processed: number;
   total: number;
-  partial: UsageStatsPayload;
 }
 
-export interface UsageStatsDonePayload {
-  requestId: string;
-  stats: UsageStatsPayload;
-}
-
-export interface UsageStatsErrorPayload {
-  requestId: string;
-  error: string;
+export interface UsageLedgerSyncedPayload {
+  /** 本轮增量同步重解析的文件数；0 = 账本无变化 */
+  added: number;
 }

@@ -1,15 +1,19 @@
-/** 金额：KPI/排行通用紧凑格式。>=1000 缩写 K；>=100 取整；常规两位小数；
+/** 金额：设计合同统一两位小数（千分位分组）；
  * 微额单独显示 <$0.01（不四舍五入成 $0.00 假象）。 */
 export function formatCost(v: number): string {
-  if (v >= 1000) return `$${(v / 1000).toFixed(1)}K`;
-  if (v >= 100) return `$${Math.round(v)}`;
-  if (v >= 0.01) return `$${v.toFixed(2)}`;
+  if (v >= 0.01) {
+    return `$${v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  }
   if (v > 0) return '<$0.01';
   return '$0';
 }
 
-/** token 数：M 封顶缩写（3168M 不进位 B，方便与 in/out 同尺度对比） */
+/** token 数：K/M/B 三档缩写（设计合同） */
 export function formatTokens(v: number): string {
+  if (v >= 1e9) {
+    const b = v / 1e9;
+    return b >= 10 ? `${Math.round(b)}B` : `${b.toFixed(1)}B`;
+  }
   if (v >= 1e6) {
     const m = v / 1e6;
     return m >= 10 ? `${Math.round(m)}M` : `${m.toFixed(1)}M`;

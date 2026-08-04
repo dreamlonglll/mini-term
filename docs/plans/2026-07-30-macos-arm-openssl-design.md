@@ -13,4 +13,3 @@ This preserves the existing Git HTTPS and SSH features. It increases the first R
 ## Verification
 
 Add a regression test that asks Cargo for the resolved `aarch64-apple-darwin` feature graph and requires `openssl-sys feature "vendored"`. Then run the Node tests, Rust tests, frontend build, and `npm run tauri dev` through successful application launch.
-

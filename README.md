@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.9.1-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.9.3-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -54,6 +54,8 @@ Mini-Term 就是为这件事做的：项目列表上的状态灯实时跳动，A
 - 项目列表 **DONE** 徽章
 - 任务栏闪烁（Windows）/ Dock 跳动（macOS），仅窗口失焦时触发
 - 提示音（内置合成音，也可以换成你自己的音频文件）
+
+Hook 一旦接入，就是该面板**唯一**的状态来源，输出活跃度不再参与判定——AI 空闲时 TUI 的定时重绘曾被误读成「又开始干活了」，把一次任务反复播报成完成。完成信号也只认 `Stop` 事件：权限审批框弹出同样是「在等你」，不会再被当作任务完成。
 
 ### 📱 出门在外，用手机看桌面上跑着的 AI
 
@@ -102,7 +104,7 @@ CLI 背后是**全机单例 daemon** 持有的持久连接池：首次调用自�
 
 VS Code 风格的 **Changes 面板**（Staged / Changes / Untracked 分组，单文件或全量 stage / discard，`Ctrl+Enter` 提交），并排 / 内联双视图 Diff，游标分页的提交历史，以及**手绘 SVG 分支拓扑图**（按 lane 布局与上色，合并提交实心点套外环，后端 revwalk 加 TOPOLOGICAL 排序避免 rebase 后连线断裂）。
 
-**Worktree 管理**对多 Agent 并行开发特别有用：项目根目录本身不是仓库时会**向下扫描子仓库**并按主工作区归并，组头可勾选多选 / 全选，**一次为每个勾选的仓库各建一个 worktree**（分支下拉取各仓库分支的交集）。建好的 worktree 可以一键「设为项目」挂到主项目下面成为子项目，或者直接开个终端进去。
+**Worktree 管理**对多 Agent 并行开发特别有用：项目根目录本身不是仓库时会**向下扫描子仓库**并按主工作区归并，组头可勾选多选 / 全选，**一次为每个勾选的仓库各建一个 worktree**（分支下拉取各仓库分支的交集）。建好的 worktree 可以一键「设为项目」挂到主项目下面成为子项目，或者直接开个终端进去。**AI agent 在终端里把 worktree 删掉之后**，回到窗口时列表会自动把目录已消失的子项目连同终端资源一起收掉，不留失效条目（只在父项目还在时清理，盘符掉线不会误删）。
 
 ![Git 集成](docs/screenshots/git.png)
 
@@ -136,7 +138,7 @@ VS Code 风格的 **Changes 面板**（Staged / Changes / Untracked 分组，单
 | 状态 / 布局 | Zustand 单一 Store · Allotment + 递归 SplitNode 分屏树 |
 | PTY / Git | portable-pty · git2 · notify + ignore |
 | 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`） |
-| 测试 | **503 个 Rust 测试**（桌面端 450 + 中转 53）+ 19 个 Node 测试 |
+| 测试 | **505 个 Rust 测试**（桌面端 452 + 中转 53）+ 21 个 Node 测试 |
 
 ---
 

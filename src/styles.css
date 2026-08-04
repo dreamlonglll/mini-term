@@ -235,6 +235,17 @@ body.ssh-conn-dragging {
   animation: alertBlink 0.8s ease-in-out infinite;
 }
 
+/* 使用统计主体入场：首次数据就绪时轻微上浮淡入（不加 forwards，
+   动画结束即回落到无 transform，避免制造 containing block） */
+@keyframes usageFadeIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+
+.usage-fade-in {
+  animation: usageFadeIn 0.35s ease-out;
+}
+
 /* ===== 浮层进出场 =====
    所有弹窗/菜单/抽屉共用同一组关键帧，手感在应用里保持一致：
    遮罩淡入淡出，面板在淡入的同时从上方一点点落下并放大到位。

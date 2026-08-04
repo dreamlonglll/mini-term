@@ -1,6 +1,6 @@
 [package]
 name = "tauri-app"
-version = "0.9.1"
+version = "0.9.3"
 description = "mini-term: AI-aware desktop terminal manager built on Tauri v2 — multi-project, multi-tab, split-pane"
 authors = ["you"]
 edition = "2021"
@@ -56,6 +56,10 @@ uuid = { version = "1", features = ["v4"] }
 sha2 = "0.11.0"
 zip = "8.6.0"
 base64 = "0.23.0"
+# 用量统计分桶按记录自身时刻求当地偏移(DST 地区历史记录不错日),chrono-tz 带 IANA 数据
+chrono = "0.4"
+chrono-tz = "0.10"
+rusqlite = { version = "0.40.1", features = ["bundled"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

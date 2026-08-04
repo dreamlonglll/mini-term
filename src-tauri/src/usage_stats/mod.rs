@@ -1,52 +1,15 @@
 mod aggregate;
+pub mod ledger;
 mod pricing;
 mod turns;
 
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
-
-use serde::Serialize;
-use tauri::{AppHandle, Emitter};
-
-use aggregate::{Aggregator, UsageStatsPayload};
-use pricing::{ModelPrice, PricingTable};
-
-/// 代际取消：新请求 / cancel 都令计数 +1，worker 每处理一个文件比对代际，
-/// 不等即静默退出（对齐 search.rs 的 start/cancel 模式，前端同样按 requestId 双保险）。
-static GENERATION: AtomicU64 = AtomicU64::new(0);
-
-const FLUSH_EVERY_FILES: usize = 16;
-const FLUSH_EVERY: Duration = Duration::from_millis(250);
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ProgressPayload<'a> {
-    request_id: &'a str,
-    processed: usize,
-    total: usize,
-    partial: &'a UsageStatsPayload,
-}
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct DonePayload<'a> {
-    request_id: &'a str,
-    stats: UsageStatsPayload,
-}
-
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ErrorPayload<'a> {
-    request_id: &'a str,
-    error: String,
-}
 
 /// 一个待解析的会话任务。
 enum SessionJob {
-    /// Claude 主转录 + 其子代理转录（subagents/*.jsonl，独立计费必须纳入）
+    /// Claude 主转录 + 其子代理转录（subagents/ 下全部 .jsonl，独立计费必须纳入）
     Claude { main: PathBuf, subagents: Vec<PathBuf> },
     Codex { path: PathBuf },
 }
@@ -64,8 +27,8 @@ impl SessionJob {
     }
 }
 
-/// 枚举 ~/.claude/projects/ 下**全部**项目的会话（统计需要全局枚举，
-/// 与 ai_sessions.rs 的按项目 cwd 过滤是两条入口）。
+/// 枚举 ~/.claude/projects/ 下**全部**项目的会话（账本要全量历史；
+/// 项目 scope 过滤移到查询层按 cwd 终判，与 ai_sessions.rs 的目录直达是两条入口）。
 fn collect_claude_jobs(home: &Path, jobs: &mut Vec<SessionJob>) {
     let projects_dir = home.join(".claude").join("projects");
     let Ok(project_entries) = fs::read_dir(&projects_dir) else {
@@ -73,31 +36,45 @@ fn collect_claude_jobs(home: &Path, jobs: &mut Vec<SessionJob>) {
     };
     for project in project_entries.flatten() {
         let project_path = project.path();
-        if !project_path.is_dir() {
+        if project_path.is_dir() {
+            collect_claude_jobs_in_dir(&project_path, jobs);
+        }
+    }
+}
+
+/// 递归收集目录下全部 .jsonl（子代理转录可嵌套：subagents/workflows/wf_*/*.jsonl，
+/// 只扫一层会系统性漏算 Workflow 子代理的用量）。
+fn collect_jsonl_recursive(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_jsonl_recursive(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+            out.push(path);
+        }
+    }
+}
+
+/// 收集单个 Claude 项目目录下的全部会话(主转录 + subagents 子转录)。
+fn collect_claude_jobs_in_dir(project_path: &Path, jobs: &mut Vec<SessionJob>) {
+    let Ok(entries) = fs::read_dir(project_path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
         }
-        let Ok(entries) = fs::read_dir(&project_path) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
-            }
-            let mut subagents = Vec::new();
-            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                let sub_dir = project_path.join(stem).join("subagents");
-                if let Ok(subs) = fs::read_dir(&sub_dir) {
-                    for sub in subs.flatten() {
-                        let sp = sub.path();
-                        if sp.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-                            subagents.push(sp);
-                        }
-                    }
-                }
-            }
-            jobs.push(SessionJob::Claude { main: path, subagents });
+        let mut subagents = Vec::new();
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            collect_jsonl_recursive(&project_path.join(stem).join("subagents"), &mut subagents);
         }
+        // read_dir 顺序平台相关：排序让 noid 顺序号与 parity 结果可复现
+        subagents.sort();
+        jobs.push(SessionJob::Claude { main: path, subagents });
     }
 }
 
@@ -176,125 +153,71 @@ impl ProviderResolver {
     }
 }
 
-/// 一次扫描的请求参数（打包随 worker 线程移动）。
-struct ScanParams {
-    request_id: String,
-    agents: String,
-    since_ms: i64,
-    tz_offset_minutes: i32,
-    hourly: bool,
+/// 单项目 scope 的 cwd 终判：用与选目录一致的 normalize(大小写/分隔符容错)
+/// 比较，并放行子目录启动的会话(cwd 为项目路径的子路径)。
+/// 会话枚举永远全量入账本、scope 只在查询层按本函数过滤——从项目子目录
+/// 启动(目录名编码与项目根不同)的 Claude 会话也能被计入。
+pub(super) fn session_in_scope(cwd: Option<&str>, project: &str) -> bool {
+    let proj = crate::ai_sessions::normalize_path(project);
+    cwd.is_some_and(|c| {
+        let c = crate::ai_sessions::normalize_path(c);
+        c == proj || c.starts_with(&format!("{proj}\\"))
+    })
 }
 
-fn run_scan(app: &AppHandle, my_gen: u64, params: &ScanParams, pricing: PricingTable) {
-    let request_id = params.request_id.as_str();
-    let agents = params.agents.as_str();
-    let since_ms = params.since_ms;
-    let Some(home) = dirs::home_dir() else {
-        let _ = app.emit(
-            "usage-stats-error",
-            ErrorPayload { request_id, error: "无法获取 home 目录".into() },
-        );
-        return;
-    };
-
-    let mut jobs: Vec<SessionJob> = Vec::new();
-    if agents != "codex" {
-        collect_claude_jobs(&home, &mut jobs);
-    }
-    if agents != "claude" {
-        collect_codex_jobs(&home, &mut jobs);
-    }
-    // mtime 粗筛：最后写入早于窗口起点的文件不可能有窗内 turn（仅省解析，
-    // 窗口判定仍由聚合层逐 turn 终判）
-    jobs.retain(|j| j.mtime_ms() >= since_ms);
-    let total = jobs.len();
-
-    let thread_names = if agents != "claude" {
-        crate::ai_sessions::load_codex_thread_names(&home.join(".codex"))
-    } else {
-        HashMap::new()
-    };
-
-    let mut agg = Aggregator::new(since_ms, params.tz_offset_minutes, params.hourly);
-    let resolver = ProviderResolver::new(&home);
-    let mut last_flush = Instant::now();
-    let mut since_flush = 0usize;
-
-    for (processed, job) in jobs.iter().enumerate() {
-        if GENERATION.load(Ordering::SeqCst) != my_gen {
-            return; // 已被新请求/取消淘汰，静默退出
-        }
-        let parsed = match job {
-            SessionJob::Claude { main, subagents } => turns::parse_claude_session(main, subagents),
-            SessionJob::Codex { path } => turns::parse_codex_session(path, &thread_names),
-        };
-        if let Some(mut s) = parsed {
-            s.provider = Some(resolver.resolve(&s));
-            agg.add_session(&s, &pricing);
-        }
-
-        since_flush += 1;
-        if since_flush >= FLUSH_EVERY_FILES || last_flush.elapsed() >= FLUSH_EVERY {
-            let partial = agg.snapshot();
-            let _ = app.emit(
-                "usage-stats-progress",
-                ProgressPayload { request_id, processed: processed + 1, total, partial: &partial },
-            );
-            since_flush = 0;
-            last_flush = Instant::now();
-        }
-    }
-
-    if GENERATION.load(Ordering::SeqCst) != my_gen {
-        return;
-    }
-    let _ = app.emit(
-        "usage-stats-done",
-        DonePayload { request_id, stats: agg.snapshot() },
-    );
+/// agent 过滤：serde 层拒收未知值(原为 String,未知值会静默退化为全扫)。
+#[derive(Clone, Copy, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentFilter {
+    All,
+    Claude,
+    Codex,
 }
 
-/// 启动一次统计扫描：立即返回，工作进后台线程，结果经
-/// usage-stats-progress / usage-stats-done / usage-stats-error 事件流回。
-/// `pricing` 由前端拉 models.dev 后传入（$/token）；`agents` 为 all|claude|codex；
-/// `since_ms` 为窗口起点（前端按本地日历日算好）；`tz_offset_minutes` 为
-/// JS getTimezoneOffset() 原值，供分桶按本地时区；`hourly` = 「今天」视图按小时分桶。
-#[tauri::command]
-pub fn start_usage_stats(
-    app: AppHandle,
-    request_id: String,
-    agents: String,
-    since_ms: i64,
-    tz_offset_minutes: i32,
-    hourly: bool,
-    pricing: HashMap<String, ModelPrice>,
-) -> Result<(), String> {
-    let my_gen = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
-    let table = PricingTable::new(pricing);
-    let params = ScanParams { request_id, agents, since_ms, tz_offset_minutes, hourly };
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    std::thread::spawn(move || {
-        // catch_unwind 兜底：panic 也要给前端一个 error 事件，否则骨架屏永远转圈
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_scan(&app, my_gen, &params, table);
-        }));
-        if outcome.is_err() {
-            eprintln!("[usage_stats] worker panicked during scan {}", params.request_id);
-            let _ = app.emit(
-                "usage-stats-error",
-                ErrorPayload { request_id: &params.request_id, error: "统计扫描异常终止".into() },
-            );
+    #[test]
+    fn scope_matches_root_and_subdirectory_sessions() {
+        // 项目根精确命中 + 子目录启动的会话放行(分隔符/大小写容错);
+        // 同名前缀的兄弟目录不得误入
+        assert!(session_in_scope(Some("/Users/u/proj"), "/Users/u/proj"));
+        assert!(session_in_scope(Some("/Users/u/proj/packages/web"), "/Users/u/proj"));
+        assert!(session_in_scope(Some("/Users/U/Proj"), "/users/u/proj"));
+        assert!(!session_in_scope(Some("/Users/u/proj-other"), "/Users/u/proj"));
+        assert!(!session_in_scope(None, "/Users/u/proj"));
+    }
+
+    #[test]
+    fn claude_subagents_collected_recursively() {
+        let root = std::env::temp_dir().join(format!(
+            "mini-term-usage-mod-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let project = root.join("proj");
+        // 主转录 sess-1.jsonl + 一层 subagents + workflows/wf_x 深层
+        let deep = project.join("sess-1").join("subagents").join("workflows").join("wf_x");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(project.join("sess-1.jsonl"), "{}\n").unwrap();
+        let flat = project.join("sess-1").join("subagents").join("agent-a.jsonl");
+        std::fs::write(&flat, "{}\n").unwrap();
+        std::fs::write(deep.join("agent-b.jsonl"), "{}\n").unwrap();
+        // 非 .jsonl 忽略
+        std::fs::write(deep.join("note.txt"), "x").unwrap();
+
+        let mut jobs = Vec::new();
+        collect_claude_jobs_in_dir(&project, &mut jobs);
+        assert_eq!(jobs.len(), 1);
+        match &jobs[0] {
+            SessionJob::Claude { subagents, .. } => {
+                assert_eq!(subagents.len(), 2, "深层 workflows/wf_*/ 子代理必须纳入");
+            }
+            _ => panic!("expected claude job"),
         }
-    });
-
-    Ok(())
+        std::fs::remove_dir_all(&root).ok();
+    }
 }
-
-/// 取消当前扫描（关 Modal 即停）：代际 +1，现役 worker 在下一个文件边界退出。
-#[tauri::command]
-pub fn cancel_usage_stats() {
-    GENERATION.fetch_add(1, Ordering::SeqCst);
-}
-
-
-

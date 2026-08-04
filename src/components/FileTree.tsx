@@ -50,9 +50,10 @@ function getRelativePath(targetPath: string, rootPath: string) {
 /**
  * 单链目录汇总(IDE 的 compact middle packages):目录一路只有唯一子目录、
  * 没有文件时,折叠成一行 `main/java/com/…`,path 指向链尾真实目录 ——
- * 右键/展开/watch 都落在链尾,语义自洽。仅本地(远程 SFTP 逐级往返太贵,
+ * 右键/展开都落在链尾,语义自洽。链上各段路径记入 chainPaths:展开时每段
+ * 都注册 watch(后端 NonRecursive),外部往中段塞文件也能收到 fs-change,
+ * 由持有该 entry 的上级重列并重新压缩。仅本地(远程 SFTP 逐级往返太贵,
  * 调用方跳过);链中途遇到 ignored 目录即停。
- * 边界:链中段目录不被 watch,外部直接往中段塞文件不会自动刷新(手动刷新可见)。
  */
 async function compactDirChains(entries: FileEntry[], projectRoot: string): Promise<FileEntry[]> {
   return Promise.all(
@@ -60,6 +61,7 @@ async function compactDirChains(entries: FileEntry[], projectRoot: string): Prom
       if (!e.isDir || e.ignored) return e;
       let name = e.name;
       let path = e.path;
+      const chain = [e.path];
       for (;;) {
         let kids: FileEntry[];
         try {
@@ -70,11 +72,12 @@ async function compactDirChains(entries: FileEntry[], projectRoot: string): Prom
         if (kids.length === 1 && kids[0].isDir && !kids[0].ignored) {
           name = `${name}/${kids[0].name}`;
           path = kids[0].path;
+          chain.push(path);
         } else {
           break;
         }
       }
-      return name === e.name ? e : { ...e, name, path };
+      return name === e.name ? e : { ...e, name, path, chainPaths: chain };
     }),
   );
 }
@@ -124,14 +127,21 @@ function TreeNode({ entry, projectRoot, depth, gitStatusMap, onViewDiff, onViewF
   // 目录监听生命周期:展开时注册 watcher,折叠 / 组件卸载 / 路径变化时自动注销。
   // 旧实现只在手动折叠当前节点时 unwatch,父级折叠或切换项目导致后代节点直接 unmount
   // 时其 watcher 永不释放,会持续累积 OS 文件监听句柄(inotify / ReadDirectoryChangesW)。
+  // 压缩链 entry 对链上每段都注册(watchKey 序列化链路径,链未变不重注册):
+  // 中段目录外部新增文件也能收到 fs-change,由上级重列并重新压缩
+  const watchKey = (entry.chainPaths ?? [entry.path]).join('\n');
   useEffect(() => {
-    // 远程项目不做 notify 监听(SFTP 无监听通道);展开重拉 + 树顶手动刷新代替
     if (!entry.isDir || !expanded || remoteConnectionId) return;
-    invoke('watch_directory', { path: entry.path, projectPath: projectRoot }).catch(() => {});
+    const paths = watchKey.split('\n');
+    for (const p of paths) {
+      invoke('watch_directory', { path: p, projectPath: projectRoot }).catch(() => {});
+    }
     return () => {
-      invoke('unwatch_directory', { path: entry.path }).catch(() => {});
+      for (const p of paths) {
+        invoke('unwatch_directory', { path: p }).catch(() => {});
+      }
     };
-  }, [expanded, entry.isDir, entry.path, projectRoot, remoteConnectionId]);
+  }, [expanded, entry.isDir, watchKey, projectRoot, remoteConnectionId]);
 
   const handleToggle = useCallback(async () => {
     if (!entry.isDir) {
@@ -629,7 +639,18 @@ export function FileTree() {
     const rest = changed.slice(root.length + 1);
     if (!rest.includes('/')) {
       loadRootEntries();
+      return;
     }
+    // 根级压缩链的非链尾段出现直接子项 → 压缩前提破坏(单链多出兄弟),
+    // 重列根目录以重新压缩;链尾子树的变化由链节点自身的 fs-change 处理
+    const midChainHit = rootEntriesRef.current.some((e) =>
+      e.chainPaths?.some((p, i, arr) => {
+        if (i === arr.length - 1) return false;
+        const np = normalize(p);
+        return changed.startsWith(np + '/') && !changed.slice(np.length + 1).includes('/');
+      }),
+    );
+    if (midChainHit) loadRootEntries();
   }, [project?.path, isRemote, loadRootEntries]));
 
   useTauriEvent<FsChangePayload>('fs-change', useCallback((payload: FsChangePayload) => {

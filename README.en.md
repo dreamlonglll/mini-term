@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.9.1-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.9.3-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -54,6 +54,8 @@ Status aggregates layer by layer from pane → tab → project (`error > ai-work
 - A **DONE** badge in the project list
 - Taskbar flashing (Windows) / Dock bouncing (macOS), only when the window is unfocused
 - A notification sound (a built-in synthesized tone, or your own audio file)
+
+Once hooks are reporting, they are the **only** status source for that pane — output activity no longer participates. (A TUI's idle redraws used to read as "back to work," replaying one finished task as a completion over and over.) Completion is keyed to the `Stop` event alone, so a permission prompt — also a "waiting for you" state — is no longer announced as a finished task.
 
 ### 📱 Watch your desktop AI from your phone, anywhere
 
@@ -102,7 +104,7 @@ Behind the CLI is a **machine-wide singleton daemon** holding the persistent con
 
 A VS Code-style **Changes panel** (Staged / Changes / Untracked groups, per-file or bulk stage / discard, `Ctrl+Enter` to commit), side-by-side and inline diff views, cursor-paginated commit history, and a **hand-drawn SVG branch topology graph** (lane-based layout and coloring, merge commits as a filled dot inside a ring, with TOPOLOGICAL sorting in the backend revwalk so a rebase can't break the lines).
 
-**Worktree management** is especially handy for running several agents in parallel: when the project root isn't a repo itself, it **scans downward for sub-repos** and groups them by main worktree, with checkable group headers (multi-select / select-all) so you can **create one worktree per checked repo in a single action** (the branch dropdown offers the intersection of all repos' branches). Any worktree can be turned into a project in one click — mounted under its parent as a sub-project — or just opened in a terminal.
+**Worktree management** is especially handy for running several agents in parallel: when the project root isn't a repo itself, it **scans downward for sub-repos** and groups them by main worktree, with checkable group headers (multi-select / select-all) so you can **create one worktree per checked repo in a single action** (the branch dropdown offers the intersection of all repos' branches). Any worktree can be turned into a project in one click — mounted under its parent as a sub-project — or just opened in a terminal. **When an AI agent deletes a worktree from the terminal**, the list reconciles itself the moment the window regains focus: sub-projects whose directory is gone are removed along with their terminal resources, leaving no stale entries (cleanup only runs while the parent project still exists, so a disconnected drive can't wipe entries).
 
 ![Git integration](docs/screenshots/git.png)
 
@@ -136,7 +138,7 @@ A VS Code-style **Changes panel** (Staged / Changes / Untracked groups, per-file
 | State / layout | Zustand single store · Allotment + recursive SplitNode tree |
 | PTY / Git | portable-pty · git2 · notify + ignore |
 | Mobile relay | axum + tokio WebSocket (`relay-server/`) · React + Vite PWA (`mobile/`) |
-| Tests | **503 Rust tests** (450 desktop + 53 relay) plus 19 Node tests |
+| Tests | **505 Rust tests** (452 desktop + 53 relay) plus 21 Node tests |
 
 ---
 
