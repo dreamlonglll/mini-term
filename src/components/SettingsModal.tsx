@@ -347,7 +347,10 @@ function TerminalSettings() {
 
   const commitAutoCopySecs = () => {
     const n = parseFloat(autoCopySecsInput);
-    const clamped = Number.isFinite(n) && n >= 0.2 ? Math.min(n, 60) : savedAutoCopySecs;
+    // 0 = 关闭该功能(静默覆盖剪贴板的行为必须可退出);非零值钳在 0.2~60s
+    const clamped = !Number.isFinite(n) || n < 0
+      ? savedAutoCopySecs
+      : n === 0 ? 0 : Math.min(Math.max(n, 0.2), 60);
     setAutoCopySecsInput(String(clamped));
     if (clamped !== savedAutoCopySecs) {
       void saveConfigPatch({ selectionAutoCopySecs: clamped });

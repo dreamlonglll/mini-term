@@ -27,8 +27,21 @@ export function fileIconsReady(): boolean {
   return mod !== null;
 }
 
+// 库的 getMaterial*Icon 每次调用都对 SVG 源码现做 btoa,无内部缓存;
+// TreeNode 未 memo、每次树刷新都会对全部可见行重查,必须在这层缓存住。
+// key 数量与项目内出现过的文件名种类同阶,设上限防止极端仓库无界增长。
+const iconCache = new Map<string, string>();
+const ICON_CACHE_MAX = 10000;
+
 /** 返回 base64 SVG data URI;未就绪返回 null(回退通用符号)。 */
 export function resolveFileIcon(name: string, isDir: boolean, isOpen = false): string | null {
   if (!mod) return null;
-  return isDir ? mod.getMaterialFolderIcon(name, isOpen) : mod.getMaterialFileIcon(name);
+  const key = `${isDir ? (isOpen ? 'D' : 'd') : 'f'}|${name}`;
+  let uri = iconCache.get(key);
+  if (uri === undefined) {
+    if (iconCache.size >= ICON_CACHE_MAX) iconCache.clear();
+    uri = isDir ? mod.getMaterialFolderIcon(name, isOpen) : mod.getMaterialFileIcon(name);
+    iconCache.set(key, uri);
+  }
+  return uri;
 }

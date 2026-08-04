@@ -223,15 +223,17 @@ export function TerminalInstance({ ptyId }: Props) {
   // 内部拖拽（FileTree → 终端）：自定义鼠标事件，规避 WebView2 dragDropEnabled 拦截
   const dropZoneRef = useRef<HTMLDivElement>(null);
 
-  // 拖选停留 2s 自动复制:按住左键且鼠标静止 2s 后,若有选区则复制并显示「已复制」气泡。
+  // 拖选停留自动复制(时长可配,默认 1s,0 = 关闭):按住左键且鼠标静止超过
+  // 该时长后,若有选区则复制并显示「已复制」气泡。
   // 状态存 ref 不进 React state —— mousemove 高频,进 state 会拖垮渲染。
   useEffect(() => {
     const zone = dropZoneRef.current;
-    if (!zone) return;
+    if (!zone || selectionAutoCopySecs <= 0) return;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let tipTimer: ReturnType<typeof setTimeout> | undefined;
     let tracking = false;
     let copiedThisPress = false;
+    let copiedText: string | null = null;
     let lastX = 0;
     let lastY = 0;
 
@@ -245,6 +247,7 @@ export function TerminalInstance({ ptyId }: Props) {
         void copyTerminalSelection(ptyId).then((ok) => {
           if (!ok) return;
           copiedThisPress = true;
+          copiedText = getCachedTerminal(ptyId)?.term.getSelection() ?? null;
           const rect = zone.getBoundingClientRect();
           // 贴边时往容器内收,避免气泡被裁掉
           setCopiedTip({
@@ -275,6 +278,15 @@ export function TerminalInstance({ ptyId }: Props) {
     };
     // mouseup 挂 document:拖选常在终端区域外松手,挂容器会漏掉导致状态卡死
     const onMouseUp = () => {
+      // 拖到边缘触发 xterm 自动滚屏时鼠标可保持静止,dwell 会在选区仍在
+      // 增长时提前复制半截;松手时选区已变则补复制一次,让剪贴板与用户
+      // 最终看到的选区一致(气泡不重弹,「已复制」对最终内容依然成立)
+      if (tracking && copiedThisPress) {
+        const sel = getCachedTerminal(ptyId)?.term.getSelection();
+        if (sel && copiedText !== null && sel !== copiedText) {
+          void copyTerminalSelection(ptyId);
+        }
+      }
       tracking = false;
       clearDwell();
     };

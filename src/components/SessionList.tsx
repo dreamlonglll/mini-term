@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '../store';
 import { showContextMenu } from '../utils/contextMenu';
 import { isWslPath } from '../utils/wslPath';
+import { buildResumeCommand } from '../utils/aiResume';
 import { writePtyInput } from '../utils/terminalCache';
 import { resolveActivePane } from '../utils/layoutOps';
 import { focusPane, newTerminal } from '../utils/paneActions';
@@ -55,11 +56,10 @@ function hasWslSource(project: ProjectConfig): boolean {
   return isWslPath(project.path) || !!project.wslSessionsDistro;
 }
 
-/** 该会话对应的 resume 命令。 */
-function resumeCommand(session: AiSession): string {
-  return session.sessionType === 'claude'
-    ? `claude --resume ${session.id}`
-    : `codex resume ${session.id}`;
+/** 该会话对应的 resume 命令;id 形态异常(会话文件被篡改/损坏)返回 null,
+ *  不提供任何会把它写进终端或剪贴板的入口。 */
+function resumeCommand(session: AiSession): string | null {
+  return buildResumeCommand(session.sessionType, session.id);
 }
 
 /**
@@ -285,7 +285,7 @@ export function SessionList() {
                 const cmd = resumeCommand(session);
                 // 会话来自别处（WSL / 远程）时，把命令敲进本机终端是跑不通的，
                 // 只保留「查看 / 复制命令」——用户自己知道该在哪个终端里粘。
-                const canResumeHere = !session.wslDistro && !session.sshConnectionId;
+                const canResumeHere = cmd !== null && !session.wslDistro && !session.sshConnectionId;
                 showContextMenu(e.clientX, e.clientY, [
                   {
                     label: t('sessionList.view'),
@@ -302,11 +302,13 @@ export function SessionList() {
                       onClick: () => void resumeInNewTerminal(activeProjectId, cmd),
                     },
                   ] : []),
-                  { separator: true },
-                  {
-                    label: t('sessionList.copyResumeCommand'),
-                    onClick: () => navigator.clipboard.writeText(cmd),
-                  },
+                  ...(cmd !== null ? [
+                    { separator: true as const },
+                    {
+                      label: t('sessionList.copyResumeCommand'),
+                      onClick: () => void navigator.clipboard.writeText(cmd),
+                    },
+                  ] : []),
                 ]);
               }}
             >

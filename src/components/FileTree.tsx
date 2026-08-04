@@ -63,6 +63,9 @@ async function compactDirChains(entries: FileEntry[], projectRoot: string): Prom
       let path = e.path;
       const chain = [e.path];
       for (;;) {
+        // 链深上限:每深一层多一次串行 list_directory IPC(后端还要跑 gitignore
+        // 匹配),8 层已覆盖 Java 式深包名;更深的异常结构按普通目录展示
+        if (chain.length >= 8) break;
         let kids: FileEntry[];
         try {
           kids = await invoke<FileEntry[]>('list_directory', { projectRoot, path });

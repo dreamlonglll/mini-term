@@ -86,8 +86,13 @@ static SYNC_PENDING: AtomicBool = AtomicBool::new(false);
 /// 外部触发；窗口极窄，且文件指纹保证届时必然补齐，不丢数据只延时。）
 fn run_coalesced(lock: &Mutex<()>, pending: &AtomicBool, mut round: impl FnMut()) -> bool {
     pending.store(true, Ordering::SeqCst);
-    let Ok(_guard) = lock.try_lock() else {
-        return false;
+    // 锁内数据是 ()，中毒不代表任何状态损坏（每轮从 db + 文件指纹重建），
+    // 恢复 guard 继续；否则一次 sync panic 会让后续所有同步在应用整个
+    // 生命周期内静默 no-op，账本从此停更。
+    let _guard = match lock.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return false,
     };
     while pending.swap(false, Ordering::SeqCst) {
         round();
@@ -933,6 +938,23 @@ mod tests {
         });
         assert!(ran);
         assert_eq!(rounds.load(Ordering::SeqCst), 2, "运行期间的触发必须补跑一轮，不得丢弃");
+    }
+
+    /// 回归测试：round panic 会让 guard 在展开中 drop、std Mutex 中毒。
+    /// 中毒锁必须被恢复继续用——否则一次 panic 后所有同步触发都走
+    /// try_lock Err 分支静默返回，账本在应用整个生命周期内停更。
+    #[test]
+    fn coalesced_sync_recovers_after_round_panic() {
+        use std::sync::atomic::AtomicBool;
+        let lock = Mutex::new(());
+        let pending = AtomicBool::new(false);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_coalesced(&lock, &pending, || panic!("模拟 sync panic"));
+        }));
+        let mut ran_round = false;
+        let ran = run_coalesced(&lock, &pending, || ran_round = true);
+        assert!(ran, "panic 中毒后的锁必须可恢复，触发不得静默失效");
+        assert!(ran_round, "恢复后本轮 round 必须实际执行");
     }
 
     #[test]
