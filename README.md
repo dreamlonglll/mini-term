@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.9.3-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.10.0-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -42,7 +42,7 @@ Mini-Term 就是为这件事做的：项目列表上的状态灯实时跳动，A
 
 ---
 
-## 六个最值得一试的地方
+## 八个最值得一试的地方
 
 ### 🔔 AI 跑完了，你第一时间知道
 
@@ -54,6 +54,8 @@ Mini-Term 就是为这件事做的：项目列表上的状态灯实时跳动，A
 - 项目列表 **DONE** 徽章
 - 任务栏闪烁（Windows）/ Dock 跳动（macOS），仅窗口失焦时触发
 - 提示音（内置合成音，也可以换成你自己的音频文件）
+
+窗口切走之后还有**系统托盘状态灯**接力：黄=待确认、蓝=处理中、绿=完成未读、灰=安静，右键托盘图标能看到每个项目各自的状态——不用切回窗口就知道该不该回来。
 
 Hook 一旦接入，就是该面板**唯一**的状态来源，输出活跃度不再参与判定——AI 空闲时 TUI 的定时重绘曾被误读成「又开始干活了」，把一次任务反复播报成完成。完成信号也只认 `Stop` 事件：权限审批框弹出同样是「在等你」，不会再被当作任务完成。
 
@@ -72,6 +74,16 @@ Hook 一旦接入，就是该面板**唯一**的状态来源，输出活跃度�
 安全边界是认真设计过的：配对码一次性有效（10 分钟），新设备配对自动顶替旧设备，「重置配对」立即吊销全部凭证；**中转服务器只转发不落盘**，日志仅留元数据（有子进程级自动化测试断言全流程零文件残留）；AI 启动器的**命令文本从不经过手机或中转**，手机只按 id 引用、只看得到名字。
 
 > **前提**：中转要跑在**你自己的**服务器上（1C1G 足够，Docker 一条命令起，另需一个解析到它的域名做 TLS）。这是刻意的设计——没有任何第三方服务掺在中间。见[部署文档](docs/deploy-relay.zh-CN.md)。
+
+### 📊 这个月 AI 花了多少钱，一眼看到
+
+顶栏「统计」打开使用统计面板：Claude Code / Codex 的**成本、调用、会话数**多维聚合，按日 / 按小时趋势图，模型、项目排行与 Top 会话，范围和口径随手切。
+
+数据从本地会话记录解析进 **rusqlite 账本**——面板毫秒级出数，后台增量同步补新账；fork 复制出来的历史**不会重复计费**，缓存读写按官方价差精确计价。价格表每天从 models.dev 拉一次（只读公开价目，**不上传任何用量数据**），拉不到就用缓存，绝不拿假数据糊你。
+
+### 🔁 重启不断线：AI 会话自动续接
+
+关掉 Mini-Term 再打开，上次每个分屏里跑着的 Claude / Codex 会**自动 `--resume` 续回原会话**——会话身份来自 hook 上报、随布局一起持久化，跨一次重启还在。写回终端前有白名单校验兜底：识别不了的一律不写，远程 pane 不参与，宁可不续也不敲错命令。
 
 ### 🧰 把你的 SSH 连接，变成 AI 能调用的工具
 
@@ -122,6 +134,10 @@ VS Code 风格的 **Changes 面板**（Staged / Changes / Untracked 分组，单
 | **全局搜索** | `Ctrl+Shift+F` 唤起，文件名 / 内容双模式，子串或正则，后端流式推送随时可取消 |
 | **项目级环境变量** | 按项目注入 PTY 子进程，严格 POSIX 校验，Rust 端二次防御，WSL 下经 WSLENV 透传 |
 | **智能 Ctrl+C/V** | 可选开启：有选区时复制、无选区时中断程序；Windows 大段粘贴自动分块防 ConPTY 丢行 |
+| **满屏图标** | 文件树 Material 主题文件图标、项目行 AI 品牌图标与技术栈图标——全量图标数据独立 chunk 按需懒加载，主包零增量 |
+| **拖选停留自动复制** | 拖选后按住鼠标静止超过设定时长自动复制选区并弹「已复制」气泡，时长可调（0 = 关闭） |
+| **项目描述** | 右键给项目补一行灰色小字备注，一排 worktree 子项目各自在干什么一眼分清 |
+| **启动零网络请求** | 字体本地打包（移除 Google Fonts 外链），重型弹窗全部懒加载，主包 gzip 从 631KB 降到 378KB |
 | **三种主题 + 蓝图皮肤** | Auto / Light / Dark（暖炭色调），另有科幻风蓝图皮肤；Windows 原生标题栏跟随，启动无浅色闪烁 |
 | **中英双语** | 一键切换全界面实时重渲染，首次启动按系统语言探测，自研轻量 i18n 无额外运行时依赖 |
 | **连体字** | `==` `=>` `!=` `->` 合成 ligature glyph（需 Fira Code / JetBrains Mono 等含 calt 表的字体） |
@@ -137,8 +153,9 @@ VS Code 风格的 **Changes 面板**（Staged / Changes / Untracked 分组，单
 | 终端 | xterm.js v6（WebGL 加速，自动降级 Canvas） |
 | 状态 / 布局 | Zustand 单一 Store · Allotment + 递归 SplitNode 分屏树 |
 | PTY / Git | portable-pty · git2 · notify + ignore |
+| 用量统计 | rusqlite 本地账本 · recharts 趋势图 |
 | 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`） |
-| 测试 | **505 个 Rust 测试**（桌面端 452 + 中转 53）+ 21 个 Node 测试 |
+| 测试 | **566 个 Rust 测试**（桌面端 513 + 中转 53）+ 51 个 Node 测试 |
 
 ---
 
