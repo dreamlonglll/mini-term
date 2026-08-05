@@ -7,7 +7,7 @@ use crate::process_monitor::StatusEmitter;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
 
 /// 默认监听端口
@@ -119,6 +119,17 @@ impl HookState {
     /// 获取指定 PTY 的 hook 状态
     pub fn get_status(&self, pty_id: u32) -> Option<String> {
         self.last_hook_status.lock().unwrap().get(&pty_id).cloned()
+    }
+
+    /// 距上一次 hook 事件（或上一次状态落盘）的时长；从未收到过事件返回 None。
+    /// 停摆兜底（`process_monitor::stall_settle_target`）用它确认「状态本身也
+    /// 已经静置足够久」，而不只是 PTY 没输出。
+    pub(crate) fn status_age(&self, pty_id: u32) -> Option<Duration> {
+        self.last_hook_time
+            .lock()
+            .unwrap()
+            .get(&pty_id)
+            .map(|t| t.elapsed())
     }
 
     /// 当前会话身份;从未收到带 session_id 的事件时返回 None

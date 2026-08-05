@@ -46,6 +46,16 @@ const { isAiCompletion, isAttentionCause } = require('../.tmp-tests/utils/aiComp
   assert.equal(isAiCompletion('ai-working', 'ai-idle', 'Interrupt'), false);
 }
 
+// 停摆兜底(后端 process_monitor.rs):ai-working 静默 10s 后把徽章摘下来。
+// Stall 收到 ai-idle、StallExit 直落 idle,两者都不是"任务做完了",
+// 播报即误报 —— 这正是 v0.9.3 删掉旧兜底的原因,新兜底靠成因把它挡在这里
+{
+  assert.equal(isAiCompletion('ai-working', 'ai-idle', 'Stall'), false);
+  assert.equal(isAiCompletion('ai-working', 'idle', 'StallExit'), false);
+  assert.equal(isAttentionCause('Stall'), false);
+  assert.equal(isAttentionCause('StallExit'), false);
+}
+
 // 新补的工作中事件即便碰巧构成下降沿也不是完成
 {
   for (const cause of ['PostToolUseFailure', 'PostToolBatch', 'PermissionDenied', 'ElicitationResult']) {

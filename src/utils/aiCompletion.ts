@@ -4,11 +4,11 @@ import type { PaneStatus } from '../types';
  * hook 事件里唯一表示"这一轮任务真的做完了"的事件名。
  *
  * `Stop`、`StopFailure`、`PermissionRequest`、`Notification`、`Elicitation`、
- * `SessionStart`、`Interrupt` 在后端 (`hook_server.rs` 的 `map_event_to_status`)
- * 全部映射为 `ai-idle` —— 因为它们确实都是"AI 不在干活、在等用户"。但只有
- * `Stop` 是完成；其余是"又要你来处理一下"（批权限 / 看通知 / 补澄清）、"这轮
- * 因 API 错误没跑完"（`StopFailure`）、"你自己把它打断了"（`Interrupt`），
- * 把它们播报成完成就是误报。
+ * `SessionStart`、`Interrupt`、`Stall` 全部落到 `ai-idle` —— 因为它们确实都是
+ * "AI 不在干活、在等用户"。但只有 `Stop` 是完成；其余是"又要你来处理一下"
+ * （批权限 / 看通知 / 补澄清）、"这轮因 API 错误没跑完"（`StopFailure`）、
+ * "你自己把它打断了"（`Interrupt`）、"它十秒没动静了"（`Stall`，后端
+ * `process_monitor.rs` 的停摆兜底），把它们播报成完成就是误报。
  */
 const COMPLETION_CAUSE = 'Stop';
 
@@ -37,7 +37,8 @@ export function isAttentionCause(cause?: string): boolean {
  * 1. **假完成（重复播报）**：hook 卡在 ai-working 时，旧的 `resolve_status`
  *    会按"3 秒无输出"把状态降级成 ai-idle，而降级不落盘，于是 AI 空闲期的
  *    零星伪输出把状态反复抬回 ai-working，每落一次就播报一次。这一条已在后端
- *    根治（hook 启用后输出活跃度不再参与判定），此处不再依赖。
+ *    根治：输出静默的兜底改为一次性把结论写进 hook 状态（`Stall` / `StallExit`
+ *    成因），触发一次即收敛，不再摆动；且成因不是 `Stop`，本函数直接排除。
  * 2. **假完成（权限请求）**：`PermissionRequest` 同样落到 ai-idle，弹审批框的
  *    瞬间就会被当成"任务完成"。后端对 Codex 已特判为 ai-working
  *    （`hook_server.rs`），Claude 侧保留 ai-idle 是对的——徽章该显示"在等你"

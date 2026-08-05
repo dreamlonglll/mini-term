@@ -631,6 +631,16 @@ impl PtyManager {
         map.get(&pty_id).map_or(false, |t| t.elapsed() < within)
     }
 
+    /// 测试用:伪造一次 PTY 输出时间戳。生产路径只由 reader 线程在
+    /// flush 时写入(且受 TUI 重绘冷却窗口约束),单测里没法真起 PTY。
+    #[cfg(test)]
+    pub fn note_output_for_test(&self, pty_id: u32) {
+        self.last_output
+            .lock()
+            .unwrap()
+            .insert(pty_id, Instant::now());
+    }
+
     pub fn is_ai_session(&self, pty_id: u32) -> bool {
         self.ai_sessions.lock().unwrap().contains_key(&pty_id)
     }
