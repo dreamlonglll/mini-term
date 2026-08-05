@@ -172,6 +172,7 @@ export function Modal({
       <div
         ref={panelRef}
         role="dialog"
+        data-mt-part="modal"
         aria-modal="true"
         aria-label={typeof view.title === 'string' ? view.title : ariaLabel}
         tabIndex={-1}

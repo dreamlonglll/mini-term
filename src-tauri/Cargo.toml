@@ -55,6 +55,9 @@ tokio-tungstenite = { version = "0.27", features = ["rustls-tls-native-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 futures-util = "0.3"
 uuid = { version = "1", features = ["v4"] }
+sha2 = "0.11.0"
+zip = "8.6.0"
+base64 = "0.23.0"
 # 用量统计分桶按记录自身时刻求当地偏移(DST 地区历史记录不错日),chrono-tz 带 IANA 数据
 chrono = "0.4"
 chrono-tz = "0.10"

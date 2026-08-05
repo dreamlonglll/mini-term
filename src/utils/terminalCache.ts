@@ -20,6 +20,8 @@ import { readText, readImage, writeText } from '@tauri-apps/plugin-clipboard-man
 import { useAppStore, clearPaneAttentionByPty } from '../store';
 import type { PtyOutputPayload } from '../types';
 import { getResolvedTheme } from './themeManager';
+import { BUILTIN_TERMINAL_THEMES, DARK_TERMINAL_THEME } from './builtinThemes';
+import { getCustomTerminalTheme, isTransparentThemeActive } from './themePackManager';
 import { createPtyWriteQueue } from './ptyWriteQueue';
 import { getCurrentLineSnapshotFromBuffer } from './terminalSnapshot';
 import { resolvePasteTarget, mapPastedFilePath, type PasteTarget } from './pastePath';
@@ -49,170 +51,26 @@ interface CachedEntry extends CachedTerminal {
   searchAddon?: SearchAddon;
 }
 
-export const DARK_TERMINAL_THEME = {
-  background: '#0a0908',
-  foreground: '#d8d4cc',
-  cursor: '#c8805a',
-  cursorAccent: '#0a0908',
-  selectionBackground: '#c8805a30',
-  selectionForeground: '#e5e0d8',
-  black: '#2a2824',
-  red: '#d4605a',
-  green: '#6bb87a',
-  yellow: '#d4a84a',
-  blue: '#6896c8',
-  magenta: '#b08cd4',
-  cyan: '#7dcfb8',
-  white: '#d8d4cc',
-  brightBlack: '#5c5850',
-  brightRed: '#e07060',
-  brightGreen: '#80d090',
-  brightYellow: '#e0b860',
-  brightBlue: '#80aad8',
-  brightMagenta: '#c0a0e0',
-  brightCyan: '#90e0c8',
-  brightWhite: '#e5e0d8',
-};
-
-export const LIGHT_TERMINAL_THEME = {
-  background: '#fafafa',
-  foreground: '#1a1a1a',
-  cursor: '#b06830',
-  cursorAccent: '#fafafa',
-  selectionBackground: '#b0683030',
-  selectionForeground: '#1a1a1a',
-  black: '#1a1a1a',
-  red: '#c0392b',
-  green: '#2d8a46',
-  yellow: '#b08620',
-  blue: '#2860a0',
-  magenta: '#8a5cb8',
-  cyan: '#1a8a6a',
-  white: '#808080',
-  brightBlack: '#666666',
-  brightRed: '#e04030',
-  brightGreen: '#38a058',
-  brightYellow: '#c89830',
-  brightBlue: '#3870b8',
-  brightMagenta: '#a070d0',
-  brightCyan: '#28a080',
-  brightWhite: '#a0a0a0',
-};
-
-export const BLUEPRINT_TERMINAL_THEME = {
-  background: '#060e1c',
-  foreground: '#d9e2ec',
-  cursor: '#22d3ee',
-  cursorAccent: '#060e1c',
-  selectionBackground: 'rgba(34,211,238,0.2)',
-  selectionForeground: '#f8fafc',
-  black: '#0a1628',
-  red: '#ef4444',
-  green: '#22c55e',
-  yellow: '#f97316',
-  blue: '#60a5fa',
-  magenta: '#a78bfa',
-  cyan: '#22d3ee',
-  white: '#e2e8f0',
-  brightBlack: '#1a365d',
-  brightRed: '#f87171',
-  brightGreen: '#4ade80',
-  brightYellow: '#fb923c',
-  brightBlue: '#93c5fd',
-  brightMagenta: '#c4b5fd',
-  brightCyan: '#67e8f9',
-  brightWhite: '#f8fafc',
-};
-
-export const BLUEPRINT_LIGHT_TERMINAL_THEME = {
-  background: '#f5f8fb',
-  foreground: '#0f172a',
-  cursor: '#0e7490',
-  cursorAccent: '#f5f8fb',
-  selectionBackground: 'rgba(14,116,144,0.15)',
-  selectionForeground: '#0f172a',
-  black: '#1e293b',
-  red: '#dc2626',
-  green: '#15803d',
-  yellow: '#c2410c',
-  blue: '#1d4ed8',
-  magenta: '#7c3aed',
-  cyan: '#0e7490',
-  white: '#94a3b8',
-  brightBlack: '#475569',
-  brightRed: '#ef4444',
-  brightGreen: '#22c55e',
-  brightYellow: '#f97316',
-  brightBlue: '#3b82f6',
-  brightMagenta: '#8b5cf6',
-  brightCyan: '#14b8a6',
-  brightWhite: '#64748b',
-};
-
-export const FLUENT2_TERMINAL_THEME = {
-  background: '#15181f',
-  foreground: '#e8e8e8',
-  cursor: '#4cc2ff',
-  cursorAccent: '#15181f',
-  selectionBackground: 'rgba(76,194,255,0.22)',
-  selectionForeground: '#ffffff',
-  black: '#1f1f1f',
-  red: '#f87171',
-  green: '#6ccb5f',
-  yellow: '#fce100',
-  blue: '#4cc2ff',
-  magenta: '#c8a2ff',
-  cyan: '#61d6d6',
-  white: '#e8e8e8',
-  brightBlack: '#767676',
-  brightRed: '#ff9594',
-  brightGreen: '#80e16e',
-  brightYellow: '#ffe555',
-  brightBlue: '#6fcdff',
-  brightMagenta: '#d3b4ff',
-  brightCyan: '#88e0e0',
-  brightWhite: '#ffffff',
-};
-
-export const FLUENT2_LIGHT_TERMINAL_THEME = {
-  background: '#fafbfd',
-  foreground: '#1a1a1a',
-  cursor: '#0067c0',
-  cursorAccent: '#fafbfd',
-  selectionBackground: 'rgba(0,103,192,0.18)',
-  selectionForeground: '#1a1a1a',
-  black: '#1a1a1a',
-  red: '#c42b1c',
-  green: '#107c10',
-  yellow: '#b89500',
-  blue: '#0067c0',
-  magenta: '#8764b8',
-  cyan: '#038387',
-  white: '#767676',
-  brightBlack: '#4a4a4a',
-  brightRed: '#d13438',
-  brightGreen: '#13a10e',
-  brightYellow: '#c19c00',
-  brightBlue: '#3b9eff',
-  brightMagenta: '#b146c2',
-  brightCyan: '#3a96dd',
-  brightWhite: '#ffffff',
-};
+// 6 套内置终端配色已收敛到 builtinThemes.ts（主题描述层），这里保留出口兼容既有导入
+export { DARK_TERMINAL_THEME, LIGHT_TERMINAL_THEME, BLUEPRINT_TERMINAL_THEME, BLUEPRINT_LIGHT_TERMINAL_THEME, FLUENT2_TERMINAL_THEME, FLUENT2_LIGHT_TERMINAL_THEME } from './builtinThemes';
 
 export function getTerminalTheme(terminalFollowTheme: boolean): typeof DARK_TERMINAL_THEME {
   if (!terminalFollowTheme) return DARK_TERMINAL_THEME;
+  // 自定义主题激活时优先返回其推导/声明的终端配色
+  const custom = getCustomTerminalTheme();
+  if (custom) return custom;
   const skin = useAppStore.getState().config.skin;
   if (skin === 'blueprint') {
     return getResolvedTheme() === 'light'
-      ? BLUEPRINT_LIGHT_TERMINAL_THEME
-      : BLUEPRINT_TERMINAL_THEME;
+      ? BUILTIN_TERMINAL_THEMES['blueprint-light']
+      : BUILTIN_TERMINAL_THEMES.blueprint;
   }
   if (skin === 'fluent2') {
     return getResolvedTheme() === 'light'
-      ? FLUENT2_LIGHT_TERMINAL_THEME
-      : FLUENT2_TERMINAL_THEME;
+      ? BUILTIN_TERMINAL_THEMES['fluent2-light']
+      : BUILTIN_TERMINAL_THEMES.fluent2;
   }
-  if (getResolvedTheme() === 'light') return LIGHT_TERMINAL_THEME;
+  if (getResolvedTheme() === 'light') return BUILTIN_TERMINAL_THEMES.light;
   return DARK_TERMINAL_THEME;
 }
 
@@ -276,8 +134,10 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
   wrapper.style.height = '100%';
 
   const theme = getTerminalTheme(useAppStore.getState().config.terminalFollowTheme ?? true);
-  // 预设背景色，防止首帧渲染前闪屏；始终跟随系统主题 CSS 变量
-  wrapper.style.backgroundColor = 'var(--bg-terminal)';
+  // 预设背景色，防止首帧渲染前闪屏；始终跟随系统主题 CSS 变量。
+  // 背景图主题下 wrapper 透明——着色已由 TerminalArea 容器的 --bg-terminal 承担，
+  // 再画一层会叠乘不透明度把背景图盖没
+  wrapper.style.backgroundColor = isTransparentThemeActive() ? 'transparent' : 'var(--bg-terminal)';
 
   const term = new Terminal({
     fontSize: useAppStore.getState().config.terminalFontSize ?? 14,
@@ -297,6 +157,8 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
     // LigaturesAddon 内部用 registerCharacterJoiner（xterm.js proposed API），
     // 不开启 allowProposedApi 加载 addon 会抛 "You must set the allowProposedApi option to true"。
     allowProposedApi: true,
+    // 背景图主题激活时终端背景半透明，透出 #root 的氛围背景图（Phase 2）
+    allowTransparency: isTransparentThemeActive(),
   });
 
   const fitAddon = new FitAddon();
@@ -551,6 +413,9 @@ export function activateWebgl(ptyId: number): void {
   const entry = cache.get(ptyId);
   if (!entry || entry.webglLoaded) return;
   loadLigaturesIfEnabled(entry);
+  // WebGL 渲染器不支持透明背景(xterm 上游限制,canvas 会画满不透明底色):
+  // 背景图主题激活时留在 DOM 渲染,切回不透明主题由 updateAllTerminalThemes 恢复
+  if (isTransparentThemeActive()) return;
   loadWebgl(entry);
 }
 
@@ -645,8 +510,28 @@ export function clearMarkerInstances(ptyId: number): void {
 
 export function updateAllTerminalThemes(terminalFollowTheme: boolean): void {
   const theme = getTerminalTheme(terminalFollowTheme);
+  const transparent = isTransparentThemeActive();
   for (const entry of cache.values()) {
+    // 个别 xterm 版本不允许运行时改 allowTransparency，失败只影响背景透出
+    // （新建终端仍会按正确值构造），不阻塞换主题
+    if (entry.term.options.allowTransparency !== transparent) {
+      try {
+        entry.term.options.allowTransparency = transparent;
+      } catch (e) {
+        console.warn('切换终端透明模式失败（仅影响背景透出）:', e);
+      }
+    }
+    // WebGL 渲染器不支持透明背景(canvas 画满不透明底色,直接盖住背景图):
+    // 透明主题下卸掉 WebGL 退回 DOM 渲染,切回不透明主题时对已挂载终端恢复
+    if (transparent && entry.webglLoaded) {
+      disposeWebgl(entry);
+    } else if (!transparent && !entry.webglLoaded && entry.wrapper.isConnected) {
+      loadLigaturesIfEnabled(entry);
+      loadWebgl(entry);
+    }
+    entry.wrapper.style.backgroundColor = transparent ? 'transparent' : 'var(--bg-terminal)';
     entry.term.options.theme = theme;
+    if (entry.term.rows > 0) entry.term.refresh(0, entry.term.rows - 1);
   }
 }
 

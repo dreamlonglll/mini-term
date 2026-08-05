@@ -58,6 +58,8 @@ export interface AppConfig {
   sshGroups?: string[];
   /** 移动端中转配置(docs/adr/0001),未配置时缺省 */
   mobileRelay?: MobileRelayConfig;
+  /** 激活的外置主题包 id（themes/ 下目录名）。undefined = 内置外观模式 */
+  customThemeId?: string;
 }
 
 /** 移动端中转体系的持久化配置。字段对齐后端 #[serde(rename_all = "camelCase")]. */

@@ -127,6 +127,10 @@ pub struct AppConfig {
     /// 移动端中转配置(docs/adr/0001)。None = 未启用;序列化时省略保持文件干净。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mobile_relay: Option<MobileRelayConfig>,
+    /// 激活的外置主题包 id（themes/ 下目录名）。None = 内置外观模式;
+    /// 激活时 theme/skin 保持不动，退出自定义主题可无损回落。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_theme_id: Option<String>,
 }
 
 /// 移动端中转体系的持久化配置。
@@ -399,6 +403,7 @@ impl Default for AppConfig {
             ssh_connections: vec![],
             ssh_groups: vec![],
             mobile_relay: None,
+            custom_theme_id: None,
         }
     }
 }

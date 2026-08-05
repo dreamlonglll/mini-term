@@ -59,7 +59,7 @@ export function TerminalArea({ projectId, projectPath }: Props) {
   }, [projectId, setProjectLayout]);
 
   return (
-    <div data-panel className="flex flex-col h-full bg-[var(--bg-terminal)]">
+    <div data-panel data-mt-part="terminal-area" className="flex flex-col h-full bg-[var(--bg-terminal)]">
       <div className="flex-1 overflow-hidden relative">
         {layout ? (
           <div className="absolute inset-0">
