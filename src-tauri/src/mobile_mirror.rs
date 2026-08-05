@@ -177,6 +177,19 @@ fn fresh_since(
     }
 }
 
+/// 该 agent 是否有本模块能解析的会话记录文件(只有 Claude 与 Codex 两家)。
+///
+/// 输入检测能认出的 agent 比这宽(pi / opencode 也在 `AI_COMMANDS` 里),它们**没有**
+/// 可解析的记录文件。调用方必须据此跳过启发式绑定:`resolve_session_file` 只按项目
+/// 找"最新的 claude/codex 文件",对一个 pi pane 调它,会把同项目里 Claude 的对话
+/// 贴到这个 pane 上(串台)。宁可空镜像。
+///
+/// 用 `contains` 而非全等:hook 上报的 agent 是 `claude-code`,输入检测是 `claude`。
+pub fn agent_has_session_log(agent: &str) -> bool {
+    let agent = agent.to_ascii_lowercase();
+    agent.contains("claude") || agent.contains("codex")
+}
+
 /// 解析 pane 所属项目当前应镜像的会话文件:Claude 与 Codex 里最新修改的那个。
 /// `min_mtime` 是本轮 AI 会话的启动时刻:更早的文件属于以前的会话,一律不绑,
 /// 宁可先给空镜像等新会话落盘(代价:`--resume` 恢复的旧记录在下一条消息前不显示)。
@@ -288,6 +301,18 @@ mod tests {
         format!(
             r#"{{"type":"{role}","message":{{"role":"{role}","content":[{{"type":"text","text":"{text}"}}]}},"timestamp":"{ts}"}}"#
         )
+    }
+
+    /// 只有 Claude/Codex 有可解析的记录;pi/opencode 必须落在白名单外,
+    /// 否则镜像会退启发式绑到同项目 Claude/Codex 的会话文件(串台)。
+    #[test]
+    fn only_claude_and_codex_have_session_logs() {
+        for agent in ["claude", "claude-code", "codex", "Codex"] {
+            assert!(agent_has_session_log(agent), "{agent} 应有会话记录");
+        }
+        for agent in ["pi", "opencode", "", "gemini"] {
+            assert!(!agent_has_session_log(agent), "{agent} 不应被认为有会话记录");
+        }
     }
 
     #[test]

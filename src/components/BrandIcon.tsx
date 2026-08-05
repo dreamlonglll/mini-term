@@ -23,9 +23,35 @@ import { Bot } from './icons';
 import type { AiVendor } from '../utils/inferVendor';
 import type { ComponentType } from 'react';
 
+/**
+ * pi(pi.dev,earendil-works/pi)官方标记,取自其 Press Kit 的 currentColor 版本。
+ *
+ * 不能用 `@lobehub/icons/es/Pi`:那是 Inflection AI 的 pi.ai,与本 agent 无从属关系,
+ * 挂上去等于标错厂商。viewBox 收到图形自身的包围盒(官网 hero 版同此裁剪),
+ * 否则原始 800×800 画布留白 20%,并排时比其他品牌图标明显小一圈。
+ */
+function PiMark({ size = 13 }: { size?: number | string }) {
+  return (
+    <svg
+      viewBox="165.29 165.29 469.43 469.43"
+      width={size}
+      height={size}
+      fill="currentColor"
+      aria-hidden
+    >
+      <path
+        fillRule="evenodd"
+        d="M165.29 165.29H517.36V400H400V517.36H282.65V634.72H165.29ZM282.65 282.65V400H400V282.65Z"
+      />
+      <path d="M517.36 400H634.72V634.72H517.36Z" />
+    </svg>
+  );
+}
+
 const BRAND_ICONS: Record<AiVendor, ComponentType<{ size?: number | string }>> = {
   claude: ClaudeColor,
   openai: OpenAIMono,
+  pi: PiMark,
   gemini: GeminiColor,
   opencode: OpenCodeMono,
   grok: GrokMono,

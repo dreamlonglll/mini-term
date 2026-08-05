@@ -187,6 +187,7 @@ export type ProjectKind =
 export type AiVendor =
   | 'claude'
   | 'openai'
+  | 'pi'
   | 'gemini'
   | 'opencode'
   | 'grok'

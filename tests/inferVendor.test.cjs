@@ -29,6 +29,27 @@ test('命令文本关键词映射', () => {
   assert.equal(inferVendor({ command: 'ollama run llama3' }), 'ollama');
 });
 
+// --- pi(多模型 harness,规则排在最前) ---
+
+test('pi 命令与 agent 都识别为 pi', () => {
+  assert.equal(inferVendor({ command: 'pi' }), 'pi');
+  assert.equal(inferVendor({ agent: 'pi' }), 'pi');
+  assert.equal(inferVendor({ command: 'pi -c' }), 'pi');
+});
+
+test('pi 承载别家模型时仍显示 harness 自己', () => {
+  assert.equal(inferVendor({ command: 'pi --model claude-sonnet-5' }), 'pi');
+  assert.equal(inferVendor({ command: 'pi --model gpt-5' }), 'pi');
+});
+
+test('pi 规则不误伤含 pi 字母的命令/厂商', () => {
+  assert.equal(inferVendor({ command: 'pip install requests' }), null);
+  assert.equal(inferVendor({ command: 'pixi run build' }), null);
+  assert.equal(inferVendor({ command: 'ping example.com' }), null);
+  assert.equal(inferVendor({ command: 'copilot suggest' }), 'copilot');
+  assert.equal(inferVendor({ command: 'opencode' }), 'opencode');
+});
+
 test('大小写不敏感', () => {
   assert.equal(inferVendor({ command: 'Claude' }), 'claude');
   assert.equal(inferVendor({ command: 'CODEX' }), 'openai');
