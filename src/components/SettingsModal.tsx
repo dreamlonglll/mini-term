@@ -7,7 +7,13 @@ import { useAppStore, saveConfigToDisk } from '../store';
 import { playNotificationSound } from '../utils/notificationSound';
 import { checkForUpdate, compareVersions, type ReleaseInfo } from '../utils/updateChecker';
 import { applyTheme } from '../utils/themeManager';
-import { updateAllTerminalThemes, DEFAULT_TERMINAL_FONT_FAMILY } from '../utils/terminalCache';
+import {
+  updateAllTerminalThemes,
+  updateAllTerminalScrollback,
+  resolveScrollback,
+  MAX_SCROLLBACK,
+  DEFAULT_TERMINAL_FONT_FAMILY,
+} from '../utils/terminalCache';
 import { applyUiFontFamily } from '../utils/fontManager';
 import { MOD_LABEL } from '../utils/platform';
 import { comboLabel, hotkeyGroups } from '../utils/hotkeys';
@@ -270,6 +276,8 @@ function TerminalSettings() {
   const [charThresholdInput, setCharThresholdInput] = useState(String(savedCharThreshold));
   const savedRemotePasteDir = config.remotePasteDir ?? DEFAULT_REMOTE_PASTE_DIR;
   const [remotePasteDirInput, setRemotePasteDirInput] = useState(savedRemotePasteDir);
+  const savedScrollback = resolveScrollback(config.terminalScrollback);
+  const [scrollbackInput, setScrollbackInput] = useState(String(savedScrollback));
 
   useEffect(() => {
     setShells([...config.availableShells]);
@@ -281,7 +289,8 @@ function TerminalSettings() {
     setLineThresholdInput(String(savedLineThreshold));
     setCharThresholdInput(String(savedCharThreshold));
     setRemotePasteDirInput(savedRemotePasteDir);
-  }, [savedLineThreshold, savedCharThreshold, savedRemotePasteDir]);
+    setScrollbackInput(String(savedScrollback));
+  }, [savedLineThreshold, savedCharThreshold, savedRemotePasteDir, savedScrollback]);
 
   const save = useCallback(async (updatedShells: ShellConfig[], updatedDefault: string) => {
     const newConfig = {
@@ -355,6 +364,19 @@ function TerminalSettings() {
     if (clamped !== savedAutoCopySecs) {
       void saveConfigPatch({ selectionAutoCopySecs: clamped });
     }
+  };
+
+  const commitScrollback = () => {
+    const n = parseInt(scrollbackInput, 10);
+    const clamped = Number.isFinite(n) && n >= 0
+      ? Math.min(n, MAX_SCROLLBACK)
+      : savedScrollback;
+    setScrollbackInput(String(clamped));
+    if (clamped === savedScrollback) return;
+    // 立即对已开终端生效:调小时 xterm 当场裁掉多余历史并释放内存,
+    // 内存吃紧的用户不用重启就能看到效果
+    updateAllTerminalScrollback(clamped);
+    void saveConfigPatch({ terminalScrollback: clamped });
   };
 
   const commitLineThreshold = () => {
@@ -491,6 +513,24 @@ function TerminalSettings() {
           value={autoCopySecsInput}
           onChange={(e) => setAutoCopySecsInput(e.target.value)}
           onBlur={commitAutoCopySecs}
+          onKeyDown={(e) => e.key === 'Enter' && (e.target as HTMLInputElement).blur()}
+        />
+      </div>
+
+      <div className="flex items-center justify-between gap-3 px-3 py-2.5 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)]">
+        <div className="flex-1 min-w-0">
+          <div className="text-base text-[var(--text-primary)]">{t("settings.terminal.scrollback")}</div>
+          <div className="text-sm text-[var(--text-muted)]">{t("settings.terminal.scrollbackDesc")}</div>
+        </div>
+        <input
+          type="number"
+          min={0}
+          max={MAX_SCROLLBACK}
+          step={1000}
+          className="w-24 bg-[var(--bg-elevated)] text-[var(--text-primary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] px-2 py-1 text-base outline-none focus:border-[var(--accent)] font-mono text-right"
+          value={scrollbackInput}
+          onChange={(e) => setScrollbackInput(e.target.value)}
+          onBlur={commitScrollback}
           onKeyDown={(e) => e.key === 'Enter' && (e.target as HTMLInputElement).blur()}
         />
       </div>

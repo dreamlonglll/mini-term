@@ -22,6 +22,7 @@ import type { PtyOutputPayload } from '../types';
 import { getResolvedTheme } from './themeManager';
 import { createPtyWriteQueue } from './ptyWriteQueue';
 import { getCurrentLineSnapshotFromBuffer } from './terminalSnapshot';
+import { DEFAULT_SCROLLBACK, MAX_SCROLLBACK, resolveScrollback } from './terminalScrollback';
 import { resolvePasteTarget, mapPastedFilePath, type PasteTarget } from './pastePath';
 import { t } from '../i18n';
 
@@ -38,6 +39,8 @@ export function resolveTerminalFontFamily(value: string | undefined): string {
   const trimmed = value?.trim();
   return trimmed ? trimmed : DEFAULT_TERMINAL_FONT_FAMILY;
 }
+
+export { DEFAULT_SCROLLBACK, MAX_SCROLLBACK, resolveScrollback };
 
 interface CachedEntry extends CachedTerminal {
   cleanup: () => void;
@@ -229,14 +232,70 @@ export function isAiPty(ptyId: number): boolean {
   return aiPtyIds.has(ptyId);
 }
 
+/**
+ * 输出流控。
+ *
+ * xterm 的 `write()` 是异步解析的:数据先进它内部的 WriteBuffer,再按每帧 12ms
+ * 的预算慢慢消化。后端此前以 16ms 为节拍无条件推送,谁也不管前端消化得完消化
+ * 不完 —— 一次 `cat 大文件` / 构建刷屏就能让 WriteBuffer 一路涨到 xterm 自己的
+ * 50MB 上限并**直接抛异常**(`write data discarded, use flow control...`),而在
+ * 抛之前,renderer 已经背着几十 MB 未解析的字符串了。
+ *
+ * 这里按 xterm 官方推荐的方式做闭环:用 write 的完成回调统计「已收到但还没解析
+ * 完」的字节数,越过高水位就让后端暂停投递,回落到低水位再恢复。后端暂停时
+ * 有界 channel 会迅速填满,reader 随之停止从 ConPTY 读,背压一路传导到刷屏的
+ * 进程本身 —— 和真实终端一样,慢终端会拖慢 `cat`,而不是把数据全缓存下来。
+ */
+const FLOW_HIGH_WATER = 4 * 1024 * 1024;
+const FLOW_LOW_WATER = 1 * 1024 * 1024;
+
+/** ptyId → 已 write 但回调尚未触发的字符数 */
+const pendingWriteBytes = new Map<number, number>();
+/** 当前已请求后端暂停的 pty(去重,避免每条输出都发一次 IPC) */
+const flowPausedPtys = new Set<number>();
+
+function setFlowPaused(ptyId: number, paused: boolean): void {
+  if (paused === flowPausedPtys.has(ptyId)) return;
+  if (paused) flowPausedPtys.add(ptyId);
+  else flowPausedPtys.delete(ptyId);
+  // 失败不回滚状态:后端有 MAX_FLOW_PAUSE 超时兜底,不会把 shell 永久卡住
+  void invoke('set_pty_flow_paused', { ptyId, paused }).catch(() => {});
+}
+
+function releasePending(ptyId: number, len: number): void {
+  const left = (pendingWriteBytes.get(ptyId) ?? 0) - len;
+  if (left > 0) pendingWriteBytes.set(ptyId, left);
+  else pendingWriteBytes.delete(ptyId);
+  if (left <= FLOW_LOW_WATER) setFlowPaused(ptyId, false);
+}
+
+/** 关 pane 时清掉流控簿记,并确保后端不会留着一个永远等不到 resume 的暂停标记 */
+function clearFlowState(ptyId: number): void {
+  pendingWriteBytes.delete(ptyId);
+  if (flowPausedPtys.has(ptyId)) setFlowPaused(ptyId, false);
+}
+
 let globalPtyListenerInit = false;
 function ensureGlobalPtyOutputListener() {
   if (globalPtyListenerInit) return;
   globalPtyListenerInit = true;
   listen<PtyOutputPayload>('pty-output', (event) => {
-    const entry = cache.get(event.payload.ptyId);
-    if (entry) {
-      entry.term.write(event.payload.data);
+    const { ptyId, data } = event.payload;
+    const entry = cache.get(ptyId);
+    if (!entry) return;
+
+    const pending = (pendingWriteBytes.get(ptyId) ?? 0) + data.length;
+    pendingWriteBytes.set(ptyId, pending);
+    if (pending >= FLOW_HIGH_WATER) setFlowPaused(ptyId, true);
+
+    try {
+      entry.term.write(data, () => releasePending(ptyId, data.length));
+    } catch (e) {
+      // xterm 的 WriteBuffer 越过 50MB 会 throw。此处不接住的话异常会逃进
+      // Tauri 的事件回调里(既救不回这段数据,又污染后续分发);而且回调永远
+      // 不会触发,计数器会卡在高位让该 pane 永久暂停。手动扣回并记一笔。
+      releasePending(ptyId, data.length);
+      console.error(`[pty ${ptyId}] 终端写入被丢弃(前端积压过多)`, e);
     }
   });
 }
@@ -287,7 +346,7 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
     cursorBlink: true,
     cursorStyle: 'bar',
     cursorWidth: 2,
-    scrollback: 100000,
+    scrollback: resolveScrollback(useAppStore.getState().config.terminalScrollback),
     letterSpacing: 0,
     lineHeight: 1.35,
     theme,
@@ -592,6 +651,7 @@ export function disposeTerminal(ptyId: number): void {
   entry.cleanup();
   cache.delete(ptyId);
   aiPtyIds.delete(ptyId);
+  clearFlowState(ptyId);
   clearMarkerInstances(ptyId);
 }
 
@@ -647,6 +707,15 @@ export function updateAllTerminalThemes(terminalFollowTheme: boolean): void {
   const theme = getTerminalTheme(terminalFollowTheme);
   for (const entry of cache.values()) {
     entry.term.options.theme = theme;
+  }
+}
+
+/** 改设置后对已开的终端生效。调小时 xterm 会当场裁掉超出的历史并释放内存,
+ *  不必等重启 —— 这正是内存吃紧时用户最需要的那个即时效果。 */
+export function updateAllTerminalScrollback(value: number | undefined): void {
+  const scrollback = resolveScrollback(value);
+  for (const entry of cache.values()) {
+    entry.term.options.scrollback = scrollback;
   }
 }
 

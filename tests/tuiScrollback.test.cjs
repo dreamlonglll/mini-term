@@ -123,13 +123,25 @@ test('放行 alternate-screen 后,TUI 重绘不再往 scrollback 落任何内容
   term.dispose();
 });
 
-test('CSI 策略与 100000 行容量:alt screen 必须放行,ED 全交给 xterm', () => {
+test('CSI 策略与回滚容量:alt screen 必须放行,ED 全交给 xterm', () => {
   assert.doesNotMatch(
     terminalCacheSource,
     /registerCsiHandler\(\s*\{\s*final:\s*['"]J['"]\s*\}/,
     'ED0/1/2/3 必须全部交给 xterm 默认 CSI J handler',
   );
-  assert.match(terminalCacheSource, /scrollback:\s*100000/);
+  // 容量改为读配置(默认 10000):硬编码 10 万行是 renderer OOM 的主因,
+  // 单终端最高吃掉 150-250MB 且切项目不销毁。这里只钉「必须走配置解析」,
+  // 具体数值由 resolveScrollback 的单测覆盖。
+  assert.match(
+    terminalCacheSource,
+    /scrollback:\s*resolveScrollback\(/,
+    'scrollback 必须来自 resolveScrollback(config),不得再硬编码',
+  );
+  assert.doesNotMatch(
+    terminalCacheSource,
+    /scrollback:\s*\d+/,
+    '不得残留硬编码的 scrollback 字面量',
+  );
   // 不要再把 alt screen 拦回主缓冲区 —— 会重新引入上面复现的 scrollback 残留。
   // 若将来为了保住 AI 的 scrollback 想再拦,先让上面那条复现测试过得去。
   assert.doesNotMatch(

@@ -22,6 +22,8 @@ export interface AppConfig {
   uiFontFamily?: string;
   terminalFontFamily?: string;
   terminalLigatures?: boolean;
+  /** 每个终端保留的回滚行数。renderer 内存的大头,见 terminalCache 的 resolveScrollback */
+  terminalScrollback?: number;
   layoutSizes?: number[];
   middleColumnSizes?: number[];
   theme: 'auto' | 'light' | 'dark';

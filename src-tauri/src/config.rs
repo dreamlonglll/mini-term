@@ -57,6 +57,15 @@ pub struct AppConfig {
     pub terminal_font_family: Option<String>,
     #[serde(default)]
     pub terminal_ligatures: bool,
+    /// 每个终端保留的回滚行数(scrollback)。
+    ///
+    /// 这是 WebView renderer 内存的大头:xterm 每行按 `Uint32Array(cols * 3)`
+    /// 分配,即 cols × 12 字节,120 列约 1.5KB/行。原先硬编码 10 万行意味着
+    /// 单个终端最高吃掉 150-250MB,而终端只在关 pane 时才销毁(切项目不销毁),
+    /// 多项目多分屏叠加足以把 renderer 撑到 OOM。默认降到 1 万行(≈15MB/终端),
+    /// 需要更长历史的用户可自行调高。
+    #[serde(default = "default_terminal_scrollback")]
+    pub terminal_scrollback: u32,
     #[serde(default)]
     pub layout_sizes: Option<Vec<f64>>,
     #[serde(default)]
@@ -329,6 +338,9 @@ fn default_ui_font_size() -> f64 {
 fn default_terminal_font_size() -> f64 {
     14.0
 }
+fn default_terminal_scrollback() -> u32 {
+    10000
+}
 fn default_theme() -> String {
     "auto".into()
 }
@@ -376,6 +388,7 @@ impl Default for AppConfig {
             ui_font_family: None,
             terminal_font_family: None,
             terminal_ligatures: false,
+            terminal_scrollback: default_terminal_scrollback(),
             layout_sizes: None,
             middle_column_sizes: None,
             theme: default_theme(),
