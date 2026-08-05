@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.10.2-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.10.3-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -44,7 +44,7 @@ Mini-Term solves all of the above with one lightweight desktop app.
 - **Multi-tab management** — A dedicated tab per project, drag to reorder, status icons at a glance.
 - **Recursive splitting** — Arbitrarily nested horizontal / vertical splits, drag to adjust ratios via Allotment.
 - **High-performance rendering** — xterm.js v6 + WebGL acceleration, automatic fallback to Canvas; minimum contrast is enforced, fixing Claude's prompt text being nearly invisible against a dark background.
-- **100k-line scrollback buffer** — Keeps up to 100,000 normal-buffer lines while honoring standard CSI 3J (ED3) globally, so applications such as Codex can discard transient output and replay a folded transcript, while `/clear` can truly purge old history; alternate-screen switching remains intercepted so TUI overlays stay in the main buffer with a usable scrollbar. On Windows, mini-term bundles and preloads a pinned official ConPTY compatibility runtime (with a system-ConPTY fallback if validation fails) to keep Codex scrolling and transcript folding consistent across Windows versions.
+- **Configurable scrollback buffer** — The number of retained normal-buffer lines is adjustable in Settings (10,000 by default; lowering it takes effect immediately and frees the memory). xterm allocates per line by column count, so the old hard-coded 100,000 meant a single terminal could hold 200+ MB — and terminals are only disposed when their pane closes, so enough projects and splits would push the renderer to OOM. Standard CSI 3J (ED3) is still honored globally, so applications such as Codex can discard transient output and replay a folded transcript, while `/clear` can truly purge old history; alternate-screen switching remains intercepted so TUI overlays stay in the main buffer with a usable scrollbar. On Windows, mini-term bundles and preloads a pinned official ConPTY compatibility runtime (with a system-ConPTY fallback if validation fails) to keep Codex scrolling and transcript folding consistent across Windows versions.
 - **Terminal caching** — Switching projects / tabs / panes never rebuilds the xterm instance, so existing content is preserved; lazy startup creates a PTY only for the currently visible pane, avoiding the slowdown of spawning more terminals the more history projects you have.
 - **Project-switch caching** — FileTree / GitHistory data is cached per project, so switching back to a visited project renders with zero latency; directory loading and Git status run in parallel, and Git repo scan results are cached for 30 seconds.
 - **Copy & paste** — `Ctrl+Shift+C/V` (macOS `⌘+Shift+C/V`) shortcuts + context menu, with "Copy" auto-greyed when nothing is selected; an optional "Smart `Ctrl+C/V`" mode (copy when there's a selection, interrupt the program when there isn't, and `Ctrl+V` pastes directly); on Windows, large multi-line pastes are chunked to prevent ConPTY from dropping lines.
@@ -81,7 +81,8 @@ Mini-Term solves all of the above with one lightweight desktop app.
 ### AI Process Awareness
 
 - **Hook event system** — Integrates the official Claude Code / Codex Hook APIs to receive AI tool events (SessionStart / End, ToolUse, etc.), which is more precise and timely than process polling; the built-in `miniterm-hook` CLI is called by the hook system to POST events to a local server; the settings UI registers / unregisters the hook config with one click, merging rather than overwriting your existing hooks. Codex permission requests stay in `ai-working` through approval and tool execution, avoiding premature completion notifications.
-- **Real-time status detection** — Once hooks are reporting they are the only status source for that pane; output activity no longer participates (a TUI's idle redraws used to read as "working again," firing the completion notification over and over). Panes without hooks fall back to 500ms process polling, auto-detecting Claude / Codex / OpenCode and showing idle / working / error states.
+- **Real-time status detection** — Once hooks are reporting they are the status source for that pane; each polling round reads the hook state directly and never consults output activity (a TUI's idle redraws used to read as "working again," firing the completion notification over and over). Panes without hooks fall back to 500ms process polling, auto-detecting Claude / Codex / OpenCode and showing idle / working / error states.
+- **Three fallbacks for a stuck badge** — `Stop` simply doesn't fire in several cases: a turn ending on an API error emits `StopFailure` instead (mapped to ai-idle, lighting the tray yellow so you know to resend), and a user interrupt via Esc / Ctrl+C emits nothing at all (settled from input detection, cause=`Interrupt`). Whatever those two miss is caught by a **stall check**: if the hook state sits at ai-working while both the state and the PTY output stay silent for 10 seconds, it converges — to `idle` when an exit was already triggered (Ctrl+D / double Ctrl+C / `/exit`, with no hook event since to prove otherwise), and to `ai-idle` otherwise. All three write their verdict into the hook state **once**, so they converge instead of oscillating, and none of them uses a `Stop` cause, so none is ever announced as a finished task (precisely why the memoryless version of this fallback was removed in v0.9.3). Panes awaiting user approval (Codex's `PermissionRequest`, for one) are exempt from the stall check, which would otherwise wipe out the tray's yellow light along with the badge.
 - **Status aggregation** — Aggregated layer by layer from pane → tab → project, with priority `error > ai-working > ai-idle > idle`.
 - **Completion notification trio** — Fires the moment an AI task goes working → idle *and* the cause is a `Stop` event (permission requests, notifications, and elicitations also land on `ai-idle` and are no longer misreported as completion; the hookless fallback path still keys off the falling edge alone):
   - A bottom-right toast desktop notification (only for inactive projects, deduplicated per project).
@@ -184,7 +185,7 @@ Watch the AI running on your desktop from your phone while you're out, and send 
 | Usage stats | rusqlite 0.40 local ledger · recharts 3 trend charts · chrono-tz timezone bucketing |
 | Tauri plugins | `window-state` · `clipboard-manager` · `dialog` · `opener` |
 | Mobile relay | axum + tokio WebSocket relay service (`relay-server/`) · React + TS + Vite PWA (`mobile/`) |
-| Test coverage | 566 Rust tests = 513 desktop (tauri-app 359 + mt-core 44 + mt-ssh 26 + mt-sidecars 84) + 53 relay-server (protocol & routing); plus 51 Node tests |
+| Test coverage | 601 Rust tests = 548 desktop (tauri-app 394 + mt-core 44 + mt-ssh 26 + mt-sidecars 84) + 53 relay-server (protocol & routing); plus 74 Node tests |
 
 ## Getting Started
 
@@ -334,7 +335,7 @@ mini-term/
 ├── scripts/
 │   ├── stage-sidecars.mjs        # Builds sidecars and stages them per-triple as Tauri externalBin
 │   └── stage-conpty.mjs          # Downloads, verifies and stages the pinned ConPTY runtime (Windows)
-├── tests/                        # Node-side tests (20: ConPTY bundling / TUI scrollback / layout restore / theme compat / WSL path / worktree reconcile ...)
+├── tests/                        # Node-side tests (18 files, 74 cases: ConPTY bundling / TUI scrollback / layout restore / theme compat / WSL path / worktree reconcile ...)
 └── package.json
 ```
 
@@ -398,15 +399,15 @@ Before submitting, please run:
 # Frontend type check (tsc + vite build)
 npm run build
 
-# Node-side tests (20)
+# Node-side tests (18 files, 74 cases)
 node --test "tests/*.test.cjs"
 
-# Desktop Rust tests (513)
+# Desktop Rust tests (548)
 # Note: mt-core / mt-ssh / mt-sidecars are standalone crates, not workspace members.
-# Running `cd src-tauri && cargo test` alone only covers tauri-app's 297 — the other
+# Running `cd src-tauri && cargo test` alone only covers tauri-app's 394 — the other
 # three need their manifests specified explicitly.
 cd src-tauri
-cargo test                                        # tauri-app     297
+cargo test                                        # tauri-app     394
 cargo test --manifest-path mt-core/Cargo.toml     # mt-core        44
 cargo test --manifest-path mt-ssh/Cargo.toml      # mt-ssh         26
 cargo test --manifest-path mt-sidecars/Cargo.toml # mt-sidecars    84
