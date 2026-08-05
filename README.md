@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.10.1-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.10.2-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -138,7 +138,8 @@ VS Code 风格的 **Changes 面板**（Staged / Changes / Untracked 分组，单
 | **拖选停留自动复制** | 拖选后按住鼠标静止超过设定时长自动复制选区并弹「已复制」气泡，时长可调（0 = 关闭） |
 | **项目描述** | 右键给项目补一行灰色小字备注，一排 worktree 子项目各自在干什么一眼分清 |
 | **启动零网络请求** | 字体本地打包（移除 Google Fonts 外链），重型弹窗全部懒加载，主包 gzip 从 631KB 降到 378KB |
-| **三种主题 + 蓝图皮肤** | Auto / Light / Dark（暖炭色调），另有科幻风蓝图皮肤；Windows 原生标题栏跟随，启动无浅色闪烁 |
+| **三种主题 + 蓝图皮肤** | Auto / Light / Dark（暖炭色调），另有科幻风蓝图皮肤；标题栏与主题同色，启动无浅色闪烁 |
+| **自定义标题栏** | 无边框窗口 + 自绘标题栏，配色跟着主题走不再是系统那条灰白；按平台适配习惯——Windows / Linux 右侧三键并保留 Win11 贴靠布局（悬停最大化按钮弹分屏菜单），macOS 保留原生交通灯。右侧状态灯汇总所有项目的 AI 状态，点一下直接跳到下一个该处理的会话（最先完成的排最前） |
 | **中英双语** | 一键切换全界面实时重渲染，首次启动按系统语言探测，自研轻量 i18n 无额外运行时依赖 |
 | **连体字** | `==` `=>` `!=` `->` 合成 ligature glyph（需 Fira Code / JetBrains Mono 等含 calt 表的字体） |
 

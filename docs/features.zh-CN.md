@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.10.1-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.10.2-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -151,7 +151,12 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 ### 外观与配置
 
 - **图标侧栏 + 三栏布局** — 最左侧常驻图标栏（折叠中间栏 / Sessions / Git / 设置 / SSH）；中间栏纵向叠放 Projects 与 Files、可整栏一键折叠；右侧为终端。Sessions / Git 改为从右边缘滑出、浮在终端之上的悬浮抽屉（互斥单开，左缘可拖拽调宽并持久化，✕ 关闭），激活态蓝色竖条指示
-- **三种主题模式** — Auto（跟随系统）/ Light / Dark，深色基于 Warm Carbon 暖炭色调，自定义 CSS 变量体系；Windows 原生标题栏（DWM Immersive Dark Mode）自动跟随主题切换，启动深色用户无首帧浅色闪烁
+- **三种主题模式** — Auto（跟随系统）/ Light / Dark，深色基于 Warm Carbon 暖炭色调，自定义 CSS 变量体系；标题栏由应用自绘、配色直接吃主题变量，启动深色用户无首帧浅色闪烁（Windows 窗口边框仍走 DWM Immersive Dark Mode 同步）
+- **自定义标题栏** — 窗口去掉系统装饰（`decorations: false`）改由应用自绘 32px 顶栏，左侧应用名与版本号、右侧全局状态灯与窗口控制，配色跟随主题而不再是系统那条灰白。按平台适配窗口习惯：
+  - **Windows / Linux** — 最小化 / 最大化 / 关闭三键靠右，关闭键悬停变红。Win11 的**贴靠布局**照常可用：`window_snap.rs` 子类化窗口过程，在 `WM_NCHITTEST` 中对最大化按钮矩形返回 `HTMAXBUTTON`，悬停即弹分屏菜单；该矩形随之成为非客户区、收不到 WebView 事件，悬停高亮改由后端 `titlebar-max-hover` 事件回传前端，点击直接投 `WM_SYSCOMMAND`
+  - **macOS** — 保留系统原生交通灯（`titleBarStyle: Overlay` + `hiddenTitle`），左上角留出让位，不自绘三色圆点，全屏 / 手势 / 系统集成一并保住
+  - **全局状态灯** — 汇总所有项目所有 pane 的最紧急一档（异常 > 待确认 > 处理中 > 已完成），点击跳到「下一个该我处理」的会话：待确认 / 异常优先，其次是**最先完成**的那个，最后才是还在跑的。与托盘右键菜单的排序有意不同——托盘回答「哪些项目还活着」，状态灯回答「下一件该做什么」
+  - 拖拽走 Tauri `startDragging` 而非 `-webkit-app-region`，避开 WebView2 模态循环导致的输入锁定（v0.2.16 修过的老问题）；双击顶栏最大化 / 还原
 - **Blueprint 蓝图皮肤** — 可选科幻风蓝图皮肤，网格背景 + 角标记 + 光晕效果，支持深色 / 日间两种模式，终端配色同步切换
 - **字体独立调节** — UI 与终端的字号（10-20px）/ 字体 family 分别可调，终端可选是否跟随 UI 主题
 - **连体字 (ligatures)** — 终端连体字渲染开关，开启后 `==` `=>` `!=` `->` 等合成 ligature glyph，需字体含 calt 表（Fira Code / JetBrains Mono）；Windows 完整支持，macOS / Linux 受 webview API 限制使用 60 条 Iosevka fallback
@@ -312,7 +317,8 @@ mini-term/
 │   │   ├── ssh_mcp_registry.rs   # 历史 MCP 注册的读侧清理（存量项目迁移兜底）
 │   │   ├── mobile_relay.rs       # 移动端中转（出站 WSS 长连 / 配对 / 会话快照 / 指令写穿 / 发起会话 / 改名）
 │   │   ├── mobile_mirror.rs      # 对话镜像（会话 JSONL 增量解析 + 分页取数）
-│   │   ├── window_theme.rs       # Windows 原生标题栏深色模式（DWM Immersive Dark Mode）
+│   │   ├── window_theme.rs       # Windows 窗口边框深色模式（DWM Immersive Dark Mode）
+│   │   ├── window_snap.rs        # Win11 贴靠布局（无边框窗口下的 HTMAXBUTTON 命中测试）
 │   │   └── window_input_recovery.rs # 窗口输入焦点异常恢复
 │   ├── mt-core/                  # 无 tauri 依赖的共享库 crate（SSH 类型 / 配置 / 私钥）
 │   ├── mt-ssh/                   # SSH 共享 crate（russh 持久会话池 + SFTP 原语，主程序与 sidecar 共用）
