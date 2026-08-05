@@ -112,12 +112,16 @@ pub struct AppConfig {
     /// 拖选按住不动自动复制的静止时长(秒)。`None` = 前端默认 1s。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection_auto_copy_secs: Option<f64>,
-    /// 菜单栏项目状态灯总开关。`None` = 前端默认开启。
+    /// 状态栏(系统托盘 / 菜单栏)项目状态灯总开关。`None` = 前端默认开启。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tray_status_enabled: Option<bool>,
     /// 托盘右键菜单最多显示的活跃项目数。`None` = 前端默认 5。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tray_max_projects: Option<u32>,
+    /// 左键点状态栏图标时是否顺带定位到「下一个该处理」的会话。
+    /// `None` = 前端默认开启;关掉则只唤起窗口，不改变当前视图。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tray_click_focus: Option<bool>,
     /// 启动恢复布局后是否自动续接上次的 AI 会话（往 pane 写 resume 命令）。
     /// `None` = 前端默认开启（保持旧行为）。关掉只是不写命令，会话身份仍随布局
     /// 持久化，重新打开开关后下次启动照样能续上。
@@ -401,6 +405,7 @@ impl Default for AppConfig {
             selection_auto_copy_secs: None,
             tray_status_enabled: None,
             tray_max_projects: None,
+            tray_click_focus: None,
             ai_auto_resume: None,
             ssh_connections: vec![],
             ssh_groups: vec![],

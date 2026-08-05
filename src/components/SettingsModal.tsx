@@ -750,6 +750,7 @@ function SystemSettings() {
   }, [setConfig]);
 
   const trayEnabled = config.trayStatusEnabled ?? true;
+  const trayClickFocus = config.trayClickFocus ?? true;
   const savedTrayMax = config.trayMaxProjects ?? 5;
   const [trayMaxInput, setTrayMaxInput] = useState(String(savedTrayMax));
   // 缺省开启:保持旧行为,老配置升级上来不改变启动表现
@@ -795,6 +796,28 @@ function SystemSettings() {
           />
         </button>
       </div>
+
+      {/* 点状态栏图标时是否顺带定位到会话 */}
+      {trayEnabled && (
+        <div className="flex items-center justify-between px-3 py-2.5 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)]">
+          <div className="pr-4">
+            <div className="text-base text-[var(--text-primary)]">{t("settings.system.trayClickFocusTitle")}</div>
+            <div className="text-sm text-[var(--text-muted)]">{t("settings.system.trayClickFocusDesc")}</div>
+          </div>
+          <button
+            className={`relative w-9 h-5 rounded-full transition-colors flex-shrink-0 ${
+              trayClickFocus ? 'bg-[var(--accent)]' : 'bg-[var(--border-strong)]'
+            }`}
+            onClick={() => patchConfig({ trayClickFocus: !trayClickFocus })}
+          >
+            <span
+              className={`absolute top-0.5 left-0 w-4 h-4 rounded-full bg-white transition-transform ${
+                trayClickFocus ? 'translate-x-[18px]' : 'translate-x-0.5'
+              }`}
+            />
+          </button>
+        </div>
+      )}
 
       {trayEnabled && (
         <div className="flex items-center justify-between gap-3 px-3 py-2.5 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)]">

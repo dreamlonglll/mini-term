@@ -23,6 +23,7 @@
     "src/utils/usageDates.ts",
     "src/utils/modelPricing.ts",
     "src/utils/aiCompletion.ts",
-    "src/utils/aiResume.ts"
+    "src/utils/aiResume.ts",
+    "src/utils/attentionTarget.ts"
   ]
 }

@@ -27,6 +27,7 @@ import { useMarkerHotkeys } from './hooks/useMarkerHotkeys';
 import { useGlobalHotkeys } from './hooks/useGlobalHotkeys';
 import { useExternalFileDrop } from './hooks/useExternalFileDrop';
 import { collectPanes } from './utils/layoutOps';
+import { focusAttentionTarget } from './utils/attentionJump';
 import { checkForUpdate, type ReleaseInfo } from './utils/updateChecker';
 import { applyTheme } from './utils/themeManager';
 import { applyUiFontFamily } from './utils/fontManager';
@@ -242,30 +243,20 @@ export function App() {
     return () => { unlisten.then((fn) => fn()); };
   }, []);
 
-  // 点击托盘 → 跳到最需要注意的项目(黄 > 蓝 > 绿 同托盘优先级)
+  // 点状态栏图标 → 和标题栏状态灯同一套落点:切到项目并激活那个 pane。
+  // 关掉「点击定位」时后端已经把窗口唤起了,这里就什么都不动,留在原地
   useTauriEvent<null>('tray-clicked', useCallback(() => {
-    const { projectStates, unreadDonePaneIds, setActiveProject } = useAppStore.getState();
-    let workingPid: string | null = null;
-    let donePid: string | null = null;
-    for (const [pid, ps] of projectStates) {
-      if (!ps.layout) continue;
-      for (const pane of collectPanes(ps.layout)) {
-        if (pane.status === 'error' || pane.attention) {
-          setActiveProject(pid);
-          return;
-        }
-        if (pane.status === 'ai-working') workingPid ??= pid;
-        if (unreadDonePaneIds.has(pane.id)) donePid ??= pid;
-      }
-    }
-    const target = workingPid ?? donePid;
-    if (target) setActiveProject(target);
+    if (!(useAppStore.getState().config.trayClickFocus ?? true)) return;
+    focusAttentionTarget();
   }, []));
 
-  // 托盘右键菜单点击项目 → 直接跳到该项目
+  // 状态栏右键菜单点项目 → 切到该项目,并定位到它内部最该处理的那个 pane
   useTauriEvent<string>('tray-project-clicked', useCallback((projectId) => {
     const { config, setActiveProject } = useAppStore.getState();
-    if (config.projects.some((p) => p.id === projectId)) setActiveProject(projectId);
+    if (!config.projects.some((p) => p.id === projectId)) return;
+    // 菜单是上一次推送的快照,点下去时那些 pane 可能已经安静了 —— 定位不到目标
+    // 也要把项目切过去,不能让这一下没反应
+    if (!focusAttentionTarget(projectId)) setActiveProject(projectId);
   }, []));
 
   // 托盘开关/上限配置变化时立即生效(签名含 enabled,重复调用被去重)
