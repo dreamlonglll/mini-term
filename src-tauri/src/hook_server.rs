@@ -41,6 +41,17 @@ pub struct HookPayload {
     /// Notification 事件的通知文案(Claude Code 自带,sidecar 原样转发),
     /// 用于区分「API 错误/重试中」与「需要授权/等待输入」
     pub message: Option<String>,
+    /// Notification 事件的结构化类型(permission_prompt / idle_prompt /
+    /// elicitation_dialog / …,与官方 hooks 文档的 Notification matcher 同集)。
+    /// 比 `message` 文案匹配可靠得多,优先采信;缺失时(旧版 Claude Code)才回落文案。
+    pub notification_type: Option<String>,
+    /// StopFailure 的错误类别(rate_limit / overloaded / authentication_failed /
+    /// max_output_tokens / …)。目前只入日志,不参与状态判定 —— 无论哪种错误,
+    /// 回合都已经结束,状态一律回落 ai-idle。
+    pub error_type: Option<String>,
+    /// hook payload 自带的事件名(Claude Code 公共字段)。sidecar 从 argv 取事件名
+    /// 注入 `event`;用户手改配置漏写参数时靠这个兜底,否则整条事件被丢弃。
+    pub hook_event_name: Option<String>,
 }
 
 /// Hook 状态信息，供前端查询
@@ -239,10 +250,40 @@ impl HookState {
     }
 }
 
+/// Notification 的结构化分类。
+///
+/// Claude Code 的 Notification 事件承载多种语义,payload 里的 `notification_type`
+/// 直接给出类别(取值与官方 hooks 文档的 Notification matcher 同集)。此前只能靠
+/// `message` 文案关键词猜,既怕本地化文案变动,也分不清「权限请求」与「闲置提醒」。
+/// 现在以类型为准,类型缺失(旧版 Claude Code / Codex)时才回落文案匹配。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotificationKind {
+    /// 需要用户确认/授权 —— 点托盘黄灯
+    Confirmation,
+    /// 纯知会,不需要用户做什么(闲置提醒、认证成功、表单已提交…)
+    Passive,
+    /// 无类型字段,交给文案匹配
+    Unknown,
+}
+
+fn classify_notification(notification_type: Option<&str>) -> NotificationKind {
+    match notification_type {
+        Some("permission_prompt") | Some("elicitation_dialog") | Some("agent_needs_input") => {
+            NotificationKind::Confirmation
+        }
+        Some("idle_prompt") | Some("auth_success") | Some("elicitation_complete")
+        | Some("elicitation_response") | Some("agent_completed") => NotificationKind::Passive,
+        _ => NotificationKind::Unknown,
+    }
+}
+
 /// Notification 文案是否为「API 错误/自动重试中」类:此时 AI 仍在自己重试,
 /// 属于工作中而非等待用户;若映射 ai-idle 会制造假的 working→idle 完成沿,
 /// 连接异常期间提示音/闪烁反复误报「完成」。按已知文案特征识别,
 /// 未匹配的一律按「需要用户注意」处理(ai-idle),漏匹配只是多响一声,不丢提醒。
+///
+/// 仅在 `notification_type` 缺失时才走这里:官方类型集里没有「错误重试」一类,
+/// 类型已知就说明该通知属于权限/闲置/认证等已分类语义,不该再按文案当成重试。
 fn is_retry_notification(message: &str) -> bool {
     let m = message.to_lowercase();
     m.contains("retrying")
@@ -253,7 +294,7 @@ fn is_retry_notification(message: &str) -> bool {
         || m.contains("rate limit")
 }
 
-/// Notification 文案是否为「需要用户确认/授权」类。
+/// Notification 文案是否为「需要用户确认/授权」类(`notification_type` 缺失时的兜底)。
 ///
 /// Claude Code 的 Notification 事件承载两类语义:权限请求("Claude needs your
 /// permission to use …")与闲置提醒("Claude is waiting for your input",空闲
@@ -272,25 +313,53 @@ fn is_confirmation_notification(message: &str) -> bool {
         || m.contains("允许")
 }
 
+/// Notification 是否「需要用户确认」:类型优先,类型缺失才看文案。
+fn notification_needs_confirmation(
+    notification_type: Option<&str>,
+    message: Option<&str>,
+) -> bool {
+    match classify_notification(notification_type) {
+        NotificationKind::Confirmation => true,
+        NotificationKind::Passive => false,
+        NotificationKind::Unknown => message.is_some_and(is_confirmation_notification),
+    }
+}
+
 /// 事件 → 前端 cause（hook 事件名，v0.9.3 起透传；前端 isAiCompletion 只认
-/// `Stop`，attention 黄灯认 `PermissionRequest`/`Elicitation`）。
-/// Notification 需按文案细分后归一化：权限/确认类文案与真正的权限请求同义，
-/// 归一化为 "PermissionRequest"（否则前端拿不到 message，无法区分闲置提醒
-/// ——闲置提醒不是待办，不该点黄灯）；重试类已映射 ai-working，原样透传。
-fn event_cause<'a>(event: &'a str, message: Option<&str>) -> &'a str {
-    if event == "Notification" && message.map_or(false, is_confirmation_notification) {
+/// `Stop`，attention 黄灯认 `PermissionRequest`/`Elicitation`/`StopFailure`）。
+/// Notification 需细分后归一化：权限/确认类与真正的权限请求同义，归一化为
+/// "PermissionRequest"（否则前端拿不到 notification_type/message，无法区分闲置
+/// 提醒——闲置提醒不是待办，不该点黄灯）；重试类已映射 ai-working，原样透传。
+fn event_cause<'a>(event: &'a str, notification_type: Option<&str>, message: Option<&str>) -> &'a str {
+    if event == "Notification" && notification_needs_confirmation(notification_type, message) {
         "PermissionRequest"
     } else {
         event
     }
 }
 
+/// 该 cause 是否表示「有事等你处理」——托盘黄灯的依据，同时也是
+/// `StatusEmitter::emit_if_changed` 的去重豁免名单：黄灯的清除发生在前端
+/// （用户对该 pane 键入即视为已在处理），后端去重表感知不到，若按「状态与 cause
+/// 都没变」去重，同一轮内第二次授权请求 / 第二次 API 失败就会被吞掉。
+pub(crate) fn is_attention_cause(cause: &str) -> bool {
+    matches!(
+        cause,
+        "PermissionRequest" | "Elicitation" | "StopFailure"
+    )
+}
+
 /// 将 hook 事件名映射为 PTY 状态
 ///
-/// - ai-working: 表示 AI 正在处理（思考/工具调用/子代理/压缩/API 重试）
-/// - ai-idle: 表示 AI 等待用户输入（停止/权限请求/通知等）
+/// - ai-working: 表示 AI 正在处理（思考/工具调用/工具失败后的续处理/子代理/压缩/API 重试）
+/// - ai-idle: 表示 AI 等待用户输入（停止/回合因 API 错误结束/权限请求/通知等）
 /// - SessionEnd 单独处理（清除 hook 状态），不在此映射
-fn map_event_to_status(event: &str, agent: Option<&str>, message: Option<&str>) -> Option<&'static str> {
+fn map_event_to_status(
+    event: &str,
+    agent: Option<&str>,
+    notification_type: Option<&str>,
+    message: Option<&str>,
+) -> Option<&'static str> {
     // Codex 的 PermissionRequest 在审批 UI 弹出前触发，批准后直接执行工具，
     // 直到 PostToolUse 之前不再有任何 hook 事件。若映射为 ai-idle，批准后
     // 整个命令执行期间状态都会卡在 ai-idle，且审批弹出时误报"任务完成"，
@@ -298,20 +367,77 @@ fn map_event_to_status(event: &str, agent: Option<&str>, message: Option<&str>) 
     if event == "PermissionRequest" && agent == Some("codex") {
         return Some("ai-working");
     }
-    // API 错误/重试类 Notification:AI 还在自动重试,保持工作中
-    if event == "Notification" && message.map_or(false, is_retry_notification) {
+    // API 错误/重试类 Notification:AI 还在自动重试,保持工作中。
+    // 有结构化类型时不走文案匹配(官方类型集里没有「错误重试」一类)。
+    if event == "Notification"
+        && classify_notification(notification_type) == NotificationKind::Unknown
+        && message.is_some_and(is_retry_notification)
+    {
         return Some("ai-working");
     }
     match event {
         // ai-working 状态：AI 正在积极工作
-        "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "SubagentStart" | "SubagentStop"
-        | "PreCompact" | "PostCompact" => Some("ai-working"),
+        //
+        // PostToolUseFailure / PostToolBatch / PermissionDenied / ElicitationResult
+        // 是 v0.10.3 补上的事件空洞：工具失败、并行工具批收尾、auto 模式拒绝、
+        // MCP 表单回填之后 AI 都还在跑，此前没有任何事件覆盖这些时刻，
+        // 状态只能靠下一个 PreToolUse 才恢复。后两者还兼任黄灯的熄灭路径
+        // （attention 随状态转 ai-working 一并清除）。
+        "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "PostToolUseFailure"
+        | "PostToolBatch" | "PermissionDenied" | "ElicitationResult" | "SubagentStart"
+        | "SubagentStop" | "PreCompact" | "PostCompact" => Some("ai-working"),
         // ai-idle 状态：AI 等待用户输入
-        "SessionStart" | "Stop" | "PermissionRequest" | "Notification" | "Elicitation" => {
-            Some("ai-idle")
-        }
+        //
+        // StopFailure = 回合因 API 错误结束。官方文档明确：`Stop` 不会在这种情况下
+        // 触发（"API errors fire StopFailure instead"），此前不注册该事件，pane 会
+        // 确定性地卡在 ai-working 直到下一轮对话——这是「Stop 丢失」最主要的来源，
+        // 不是丢包。cause 保持 StopFailure：不是完成，不播报，但点黄灯提示要回来看。
+        "SessionStart" | "Stop" | "StopFailure" | "PermissionRequest" | "Notification"
+        | "Elicitation" => Some("ai-idle"),
         _ => None,
     }
+}
+
+/// 打断是否应当改写状态（`note_user_interrupt` 的纯判定部分，抽出来是为了可测：
+/// 发射一侧需要 `AppHandle`，单测里构造不出来）。
+///
+/// 两道闸：hook 未启用的 pane 走的是轮询降级路径，那条路径本就按输出活跃度给出
+/// ai-idle，插手只会互相打架；当前状态不是 ai-working 说明没什么可打断的
+/// （已经在等用户，或压根不在 AI 会话里，Esc 只是 shell/TUI 的普通按键）。
+fn interrupt_should_settle(hook_state: &HookState, pty_id: u32) -> bool {
+    hook_state.is_hook_enabled(pty_id)
+        && hook_state.get_status(pty_id).as_deref() == Some("ai-working")
+}
+
+/// 用户按 Esc / 单次 Ctrl+C 打断 AI 时的状态收敛。
+///
+/// 官方文档：`Stop` hooks "don't fire on user interrupts" —— 打断不产生任何 hook
+/// 事件，pane 会一直停在 ai-working，直到下一轮任务跑完才恢复。hook 侧无解，
+/// 只能由输入检测补这一刀（`pty::write_pty` 识别裸 Esc / Ctrl+C 后调用）。
+///
+/// 与 v0.9.3 删掉的「输出活跃度兜底」的本质区别：那条是**无记忆**的，每 500ms
+/// 用 hook_status 重算一次，降级结果不落盘，于是空闲期的零星伪输出把状态反复
+/// 抬起再落下，每个下降沿都被前端当成一次完成播报。这里是一次性事件驱动，
+/// 结果**写进 last_hook_status**，monitor 后续每轮重算得到同一个 ai-idle，
+/// 不存在摆动，也就没有可供误判的下降沿。
+///
+/// 其余三重保险：只作用于 hook 已启用且当前正是 ai-working 的 pane（无 hook 的
+/// pane 走轮询降级路径，不干预）；cause 用 `Interrupt` 而非 `Stop`，前端
+/// `isAiCompletion` 认不出它，不会播报完成；误判（AI 其实还在跑，比如 Esc 只是
+/// 关了个补全弹层）由下一个 hook 事件立刻纠正回 ai-working。
+pub fn note_user_interrupt(
+    app: &AppHandle,
+    hook_state: &HookState,
+    emitter: &StatusEmitter,
+    pty_id: u32,
+    agent: Option<String>,
+) {
+    if !interrupt_should_settle(hook_state, pty_id) {
+        return;
+    }
+    hook_state.update(pty_id, "ai-idle".to_string());
+    emitter.emit_if_changed(app, pty_id, "ai-idle", Some("Interrupt"), agent);
+    eprintln!("[hook-server] pty_id={} 用户打断 -> ai-idle", pty_id);
 }
 
 /// 启动 hook HTTP 服务器
@@ -408,8 +534,14 @@ pub fn start_hook_server(
             let response = tiny_http::Response::from_string("OK").with_status_code(200);
             let _ = request.respond(response);
 
-            // 处理事件
-            if let (Some(pty_id), Some(ref event)) = (payload.pty_id, &payload.event) {
+            // 处理事件。事件名优先取 sidecar 从 argv 注入的 `event`；缺失时回落
+            // payload 自带的 `hook_event_name`（用户手改配置漏写命令行参数的兜底，
+            // 否则整条事件会因无事件名被静默丢弃）。
+            let resolved_event = payload
+                .event
+                .clone()
+                .or_else(|| payload.hook_event_name.clone());
+            if let (Some(pty_id), Some(event)) = (payload.pty_id, resolved_event.as_deref()) {
                 if event == "SessionEnd" {
                     // 只用 payload 自带的 session_id 打墓碑。不要退回 session_of:
                     // 新会话的 SessionStart 若先到,session_of 已是新会话,兜底会
@@ -481,7 +613,13 @@ pub fn start_hook_server(
                             );
                         }
                     }
-                    if let Some(status) = map_event_to_status(event, payload.agent.as_deref(), payload.message.as_deref()) {
+                    let mapped = map_event_to_status(
+                        event,
+                        payload.agent.as_deref(),
+                        payload.notification_type.as_deref(),
+                        payload.message.as_deref(),
+                    );
+                    if let Some(status) = mapped {
                         // hook 事件是 AI 进程存活的直接证据:输入检测漏判启动
                         // (别名/包装脚本)或误判退出(任务中双击 Ctrl+C)时,
                         // 靠这里把 AI 会话标记扶正,保住后续 marker/移动端语义
@@ -493,12 +631,32 @@ pub fn start_hook_server(
                         // 归一化后的事件名:Stop/PermissionRequest/Notification 都落
                         // ai-idle,但只有 Stop 是「任务做完了」,前端据此决定播报与
                         // 托盘黄绿灯（见 utils/aiCompletion.ts 与 store 的 attention 判定）
-                        let cause = event_cause(event, payload.message.as_deref());
+                        let cause = event_cause(
+                            event,
+                            payload.notification_type.as_deref(),
+                            payload.message.as_deref(),
+                        );
                         emitter.emit_if_changed(&app, pty_id, status, Some(cause), payload.agent.clone());
 
                         eprintln!(
-                            "[hook-server] pty_id={} event={} agent={:?} -> status={} cause={}",
-                            pty_id, event, payload.agent, status, cause
+                            "[hook-server] pty_id={} event={} agent={:?} -> status={} cause={}{}",
+                            pty_id,
+                            event,
+                            payload.agent,
+                            status,
+                            cause,
+                            payload
+                                .error_type
+                                .as_deref()
+                                .map(|e| format!(" error_type={}", e))
+                                .unwrap_or_default()
+                        );
+                    } else {
+                        // 未映射事件：新版 Claude Code / Codex 加了事件而这里还没跟上时
+                        // 的可见信号（注册列表是白名单，正常不会有陌生事件抵达）
+                        eprintln!(
+                            "[hook-server] pty_id={} event={} 无状态映射，已忽略",
+                            pty_id, event
                         );
                     }
                 }
@@ -702,10 +860,15 @@ mod tests {
         assert!(state.is_session_ended(1, &format!("sid-{}", ENDED_SESSIONS_CAP + 1)));
     }
 
+    /// 测试便捷包装:多数用例不关心 notification_type
+    fn map_event(event: &str, agent: Option<&str>, message: Option<&str>) -> Option<&'static str> {
+        map_event_to_status(event, agent, None, message)
+    }
+
     #[test]
     fn codex_permission_request_maps_to_ai_working() {
         assert_eq!(
-            map_event_to_status("PermissionRequest", Some("codex"), None),
+            map_event("PermissionRequest", Some("codex"), None),
             Some("ai-working")
         );
     }
@@ -713,27 +876,151 @@ mod tests {
     #[test]
     fn claude_permission_request_keeps_ai_idle() {
         assert_eq!(
-            map_event_to_status("PermissionRequest", Some("claude-code"), None),
+            map_event("PermissionRequest", Some("claude-code"), None),
             Some("ai-idle")
         );
         // agent 字段缺失时保持原有行为
-        assert_eq!(
-            map_event_to_status("PermissionRequest", None, None),
-            Some("ai-idle")
-        );
+        assert_eq!(map_event("PermissionRequest", None, None), Some("ai-idle"));
     }
 
     #[test]
     fn other_events_unaffected_by_agent() {
+        assert_eq!(map_event("Stop", Some("codex"), None), Some("ai-idle"));
         assert_eq!(
-            map_event_to_status("Stop", Some("codex"), None),
-            Some("ai-idle")
-        );
-        assert_eq!(
-            map_event_to_status("PreToolUse", Some("codex"), None),
+            map_event("PreToolUse", Some("codex"), None),
             Some("ai-working")
         );
-        assert_eq!(map_event_to_status("Unknown", Some("codex"), None), None);
+        assert_eq!(map_event("Unknown", Some("codex"), None), None);
+    }
+
+    /// 回合因 API 错误结束:官方文档明确此时 `Stop` 不触发,只有 StopFailure。
+    /// 不映射它,pane 会确定性地卡在 ai-working 直到下一轮对话。
+    #[test]
+    fn stop_failure_falls_back_to_ai_idle() {
+        assert_eq!(map_event("StopFailure", Some("claude-code"), None), Some("ai-idle"));
+        // 但它不是「完成」:cause 必须原样透传,前端 isAiCompletion 只认 Stop
+        assert_eq!(event_cause("StopFailure", None, None), "StopFailure");
+        // 需要用户回来重发 → 走 attention 黄灯
+        assert!(is_attention_cause("StopFailure"));
+    }
+
+    /// 补上的事件空洞:工具失败 / 并行工具批收尾 / auto 模式拒绝 / MCP 表单回填
+    /// 之后 AI 都还在跑,此前没有任何事件覆盖这些时刻。
+    #[test]
+    fn newly_covered_events_map_to_ai_working() {
+        for event in [
+            "PostToolUseFailure",
+            "PostToolBatch",
+            "PermissionDenied",
+            "ElicitationResult",
+        ] {
+            assert_eq!(
+                map_event(event, Some("claude-code"), None),
+                Some("ai-working"),
+                "{event} 应视为 AI 仍在工作"
+            );
+        }
+    }
+
+    /// PermissionDenied / ElicitationResult 是黄灯的熄灭路径:状态转 ai-working
+    /// 时前端把 attention 清掉,它们自身不得再被算作 attention。
+    #[test]
+    fn permission_resolution_events_are_not_attention() {
+        assert!(!is_attention_cause("PermissionDenied"));
+        assert!(!is_attention_cause("ElicitationResult"));
+        assert!(!is_attention_cause("Stop"));
+        assert!(!is_attention_cause("Interrupt"));
+        assert!(is_attention_cause("PermissionRequest"));
+        assert!(is_attention_cause("Elicitation"));
+    }
+
+    /// notification_type 优先于文案:结构化类型在,就不再猜关键词
+    #[test]
+    fn notification_type_overrides_message_heuristics() {
+        // 闲置提醒即便文案里带「确认」字样也不点黄灯
+        assert_eq!(
+            event_cause("Notification", Some("idle_prompt"), Some("请确认下一步")),
+            "Notification"
+        );
+        // 权限请求即便文案是本地化的、关键词全不匹配,也照样归一化点黄灯
+        assert_eq!(
+            event_cause("Notification", Some("permission_prompt"), Some("Bash ツールの実行")),
+            "PermissionRequest"
+        );
+        // MCP 表单打开 → 黄灯;表单已提交 → 不再是待办
+        assert_eq!(
+            event_cause("Notification", Some("elicitation_dialog"), None),
+            "PermissionRequest"
+        );
+        assert_eq!(
+            event_cause("Notification", Some("elicitation_complete"), None),
+            "Notification"
+        );
+    }
+
+    /// 用户打断:AI 正在跑时按 Esc/Ctrl+C,状态收敛到 ai-idle。
+    #[test]
+    fn interrupt_settles_running_ai() {
+        let state = HookState::new();
+        state.update(1, "ai-working".to_string());
+        assert!(interrupt_should_settle(&state, 1));
+    }
+
+    /// 打断的结果必须**落盘**到 hook 状态——这正是它与 v0.9.3 删掉的
+    /// 「输出活跃度兜底」的分水岭:那条不落盘,每 500ms 重算一次,于是状态在
+    /// working/idle 之间反复摆动,每个下降沿都被前端当成一次完成播报。
+    /// 这里改完 last_hook_status 后第二次打断不再满足条件,不会重复 emit。
+    #[test]
+    fn interrupt_result_is_persisted_and_not_repeated() {
+        let state = HookState::new();
+        state.update(1, "ai-working".to_string());
+        assert!(interrupt_should_settle(&state, 1));
+
+        state.update(1, "ai-idle".to_string()); // note_user_interrupt 的落盘动作
+        assert_eq!(state.get_status(1).as_deref(), Some("ai-idle"));
+        assert!(
+            !interrupt_should_settle(&state, 1),
+            "已收敛的 pane 再次打断不应重复改写状态"
+        );
+    }
+
+    /// 不越界的三种情形:hook 未启用(走轮询降级路径)、已在等用户、陌生 pty。
+    #[test]
+    fn interrupt_leaves_non_working_panes_alone() {
+        let state = HookState::new();
+        assert!(!interrupt_should_settle(&state, 1), "陌生 pty 不该被改写");
+
+        state.update(2, "ai-idle".to_string());
+        assert!(!interrupt_should_settle(&state, 2), "已在等用户,无事可打断");
+
+        // hook 从未启用的 pane(WSL/SSH/hook 关闭):即便 Esc 也不插手
+        let bare = HookState::new();
+        assert!(!interrupt_should_settle(&bare, 3));
+    }
+
+    /// 类型已知时不再按文案判重试:官方类型集里没有「错误重试」一类,
+    /// 权限文案里恰好出现 "rate limit" 之类的字样不该把状态推成 ai-working。
+    #[test]
+    fn known_notification_type_skips_retry_heuristics() {
+        assert_eq!(
+            map_event_to_status(
+                "Notification",
+                Some("claude-code"),
+                Some("permission_prompt"),
+                Some("Allow Bash to run `gh api --rate-limit`?"),
+            ),
+            Some("ai-idle")
+        );
+        // 类型缺失(旧版 Claude Code)时文案兜底照旧生效
+        assert_eq!(
+            map_event_to_status(
+                "Notification",
+                Some("claude-code"),
+                None,
+                Some("API Error: 529 Overloaded · Retrying…"),
+            ),
+            Some("ai-working")
+        );
     }
 
     #[test]
@@ -746,7 +1033,7 @@ mod tests {
             "Rate limit reached",
         ] {
             assert_eq!(
-                map_event_to_status("Notification", Some("claude-code"), Some(msg)),
+                map_event("Notification", Some("claude-code"), Some(msg)),
                 Some("ai-working"),
                 "误判为 idle: {msg}"
             );
@@ -761,14 +1048,14 @@ mod tests {
             "Claude is waiting for your input",
         ] {
             assert_eq!(
-                map_event_to_status("Notification", Some("claude-code"), Some(msg)),
+                map_event("Notification", Some("claude-code"), Some(msg)),
                 Some("ai-idle"),
                 "误判为 working: {msg}"
             );
         }
         // 无 message 时保持原有行为
         assert_eq!(
-            map_event_to_status("Notification", Some("claude-code"), None),
+            map_event("Notification", Some("claude-code"), None),
             Some("ai-idle")
         );
     }
@@ -781,7 +1068,7 @@ mod tests {
             "Waiting for your approval to run the command",
         ] {
             assert_eq!(
-                event_cause("Notification", Some(msg)),
+                event_cause("Notification", None, Some(msg)),
                 "PermissionRequest",
                 "该亮黄灯没亮: {msg}"
             );
@@ -792,19 +1079,19 @@ mod tests {
     fn idle_reminder_notification_keeps_event_name() {
         // 闲置提醒不是待办:保持 Notification 原名,前端不点黄灯也不算完成
         assert_eq!(
-            event_cause("Notification", Some("Claude is waiting for your input")),
+            event_cause("Notification", None, Some("Claude is waiting for your input")),
             "Notification"
         );
         // 无文案无从判定,保守不归一化(真授权另有 PermissionRequest/Elicitation 兜底)
-        assert_eq!(event_cause("Notification", None), "Notification");
+        assert_eq!(event_cause("Notification", None, None), "Notification");
     }
 
     #[test]
     fn non_notification_events_pass_through() {
         // 事件名原样透传:前端 isAiCompletion 只认 Stop,黄灯认 PermissionRequest/Elicitation
-        assert_eq!(event_cause("PermissionRequest", None), "PermissionRequest");
-        assert_eq!(event_cause("Elicitation", None), "Elicitation");
-        assert_eq!(event_cause("Stop", None), "Stop");
-        assert_eq!(event_cause("UserPromptSubmit", None), "UserPromptSubmit");
+        assert_eq!(event_cause("PermissionRequest", None, None), "PermissionRequest");
+        assert_eq!(event_cause("Elicitation", None, None), "Elicitation");
+        assert_eq!(event_cause("Stop", None, None), "Stop");
+        assert_eq!(event_cause("UserPromptSubmit", None, None), "UserPromptSubmit");
     }
 }

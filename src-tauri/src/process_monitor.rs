@@ -56,7 +56,7 @@ impl StatusEmitter {
     /// - 状态相同 + cause=None → **跳过**:monitor 每 500ms 以无成因方式重发
     ///   hook 状态,若放行会在黄灯点亮后 500ms 内把 attention 抹掉
     ///   (黄灯闪一下就被蓝色顶掉的根因);
-    /// - 状态相同 + cause 为 attention 类事件(PermissionRequest/Elicitation)
+    /// - 状态相同 + cause 为 attention 类事件(见 `hook_server::is_attention_cause`)
     ///   → **总是 emit**:黄灯的清除发生在前端(用户键入即批准),后端去重表
     ///   感知不到;若按相同 cause 去重,同一轮内第二次授权请求会被吞掉;
     /// - 状态相同 + 其他 cause 与上次相同 → 跳过;变化 → emit(如
@@ -74,7 +74,7 @@ impl StatusEmitter {
             if prev_status == status {
                 match cause {
                     None => return,
-                    Some("PermissionRequest") | Some("Elicitation") => {}
+                    Some(c) if crate::hook_server::is_attention_cause(c) => {}
                     Some(c) if prev_cause.as_deref() == Some(c) => return,
                     _ => {}
                 }

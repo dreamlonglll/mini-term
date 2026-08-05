@@ -3,12 +3,30 @@ import type { PaneStatus } from '../types';
 /**
  * hook 事件里唯一表示"这一轮任务真的做完了"的事件名。
  *
- * `Stop`、`PermissionRequest`、`Notification`、`Elicitation`、`SessionStart`
- * 在后端 (`hook_server.rs` 的 `map_event_to_status`) 全部映射为 `ai-idle` —— 因为
- * 它们确实都是"AI 不在干活、在等用户"。但只有 `Stop` 是完成；其余是"又要你来
- * 处理一下"（批权限 / 看通知 / 补澄清），把它们播报成完成就是误报。
+ * `Stop`、`StopFailure`、`PermissionRequest`、`Notification`、`Elicitation`、
+ * `SessionStart`、`Interrupt` 在后端 (`hook_server.rs` 的 `map_event_to_status`)
+ * 全部映射为 `ai-idle` —— 因为它们确实都是"AI 不在干活、在等用户"。但只有
+ * `Stop` 是完成；其余是"又要你来处理一下"（批权限 / 看通知 / 补澄清）、"这轮
+ * 因 API 错误没跑完"（`StopFailure`）、"你自己把它打断了"（`Interrupt`），
+ * 把它们播报成完成就是误报。
  */
 const COMPLETION_CAUSE = 'Stop';
+
+/**
+ * 该成因是否表示"有事等你处理"——托盘黄灯的依据，与后端
+ * `hook_server.rs` 的 `is_attention_cause` 必须保持同集。
+ *
+ * - `PermissionRequest`：权限审批（权限类 Notification 已在后端归一化成它）
+ * - `Elicitation`：MCP 表单待填
+ * - `StopFailure`：回合因 API 错误结束（限流 / 超载 / 鉴权失败…）。它不是完成，
+ *   不该播报，但用户得知道要回来重发，否则只会看到一个安静躺着的 ai-idle。
+ *
+ * 黄灯的熄灭不在这里：用户对该 pane 键入即视为已在处理
+ * (`clearPaneAttentionByPty`)，或状态转回 ai-working 时随 attention=false 清掉。
+ */
+export function isAttentionCause(cause?: string): boolean {
+  return cause === 'PermissionRequest' || cause === 'Elicitation' || cause === 'StopFailure';
+}
 
 /**
  * 判断一次 pane 状态变化是否构成"AI 任务完成"，即该不该播提示音 / 闪任务栏 /

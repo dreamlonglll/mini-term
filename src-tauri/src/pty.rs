@@ -1242,10 +1242,24 @@ fn write_pty_chunked(writer: &mut dyn Write, data: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 这一次写入是否为「打断当前 AI 任务」的按键。
+///
+/// 只认单独一个字节的裸 Esc / Ctrl+C：xterm.js 把方向键、功能键等 CSI 序列
+/// （`\x1b[A` …）一次性交给 onData，粘贴同理，长度一律大于 1，因此等值比较
+/// 足以把它们排除掉，不需要解析转义状态机。
+///
+/// 单次 Ctrl+C 在 AI 里是「取消当前任务」（连按两次才退出，见
+/// `track_input_with_line_snapshot`），Esc 同理，两者都不产生 hook 事件。
+fn is_interrupt_key(data: &str) -> bool {
+    data == "\x1b" || data == "\x03"
+}
+
 #[tauri::command]
 pub fn write_pty(
     app: tauri::AppHandle,
     state: tauri::State<'_, PtyManager>,
+    hook_state: tauri::State<'_, crate::hook_server::HookState>,
+    emitter: tauri::State<'_, crate::process_monitor::StatusEmitter>,
     pty_id: u32,
     data: String,
     line_snapshot: Option<String>,
@@ -1269,6 +1283,22 @@ pub fn write_pty(
         write_pty_chunked(&mut *instance.writer, &data)?;
     }
     state.track_input_with_line_snapshot(pty_id, &data, line_snapshot.as_deref());
+
+    // 用户打断 AI：Claude 在中断时不发任何 hook 事件（官方文档：`Stop` hooks
+    // "don't fire on user interrupts"），状态会一直停在 ai-working。这里补一刀
+    // 让它收敛到 ai-idle —— 判定与副作用都在 note_user_interrupt 里，含「只动
+    // hook 已启用且正在 ai-working 的 pane」与「cause=Interrupt 不算完成」两道闸。
+    // 放在 track_input 之后：双击 Ctrl+C 真退出的场景，紧随其后的 SessionEnd
+    // 会把状态进一步落到 idle，这一刀只是让中间那段不至于显示成「工作中」。
+    if is_interrupt_key(&data) {
+        crate::hook_server::note_user_interrupt(
+            &app,
+            &hook_state,
+            &emitter,
+            pty_id,
+            state.ai_session_agent(pty_id),
+        );
+    }
 
     for submit in state.drain_submits(pty_id) {
         let _ = app.emit(
@@ -1384,6 +1414,29 @@ pub fn arm_ssh_autofill(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 打断键识别:只认单独一个字节的裸 Esc / Ctrl+C。方向键等 CSI 序列由
+    /// xterm.js 一次性发来(`\x1b[A`),不能因为首字节是 Esc 就当成打断——否则
+    /// 用户翻个历史记录就把「工作中」徽章打灭了。
+    #[test]
+    fn interrupt_key_only_matches_bare_esc_and_ctrl_c() {
+        assert!(is_interrupt_key("\x1b"));
+        assert!(is_interrupt_key("\x03"));
+
+        for data in [
+            "\x1b[A",    // ↑
+            "\x1b[B",    // ↓
+            "\x1b[1;5C", // Ctrl+→
+            "\x1bOP",    // F1
+            "\x1b[I",    // 焦点进入
+            "\x03\x03",  // 一次写入里的两个 Ctrl+C
+            "\x1b\x1b",
+            "",
+            "esc",
+        ] {
+            assert!(!is_interrupt_key(data), "误判为打断键: {:?}", data);
+        }
+    }
 
     #[test]
     fn detect_claude_command() {

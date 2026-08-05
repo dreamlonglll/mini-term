@@ -19,7 +19,7 @@ import type {
   MobileRelayStatusPayload,
   ProjectKind,
 } from './types';
-import { isAiCompletion } from './utils/aiCompletion';
+import { isAiCompletion, isAttentionCause } from './utils/aiCompletion';
 import { restoreSavedProjectLayout } from './utils/layoutRestore';
 import { playNotificationSound } from './utils/notificationSound';
 import { t } from './i18n';
@@ -567,7 +567,9 @@ interface AppStore {
 
   // Pane 状态
   /** @param cause `pty-status-change` 带的(归一化)hook 事件名:决定这次变化
-   *  算不算「任务完成」(只有 Stop)与该不该点托盘黄灯(PermissionRequest/Elicitation) */
+   *  算不算「任务完成」(只有 Stop)与该不该点托盘黄灯(见 isAttentionCause)。
+   *  `Interrupt` 是唯一非 hook 来源的成因——用户按 Esc/Ctrl+C 打断,Claude 不发
+   *  任何事件,由后端输入检测补发,既不算完成也不点黄灯,只把徽章收回 ai-idle */
   updatePaneStatusByPty: (ptyId: number, status: PaneStatus, cause?: string, agent?: string) => void;
   /** 托盘绿灯的「已完成未读」pane 集合;激活主窗口时清空 */
   unreadDonePaneIds: Set<string>;
@@ -874,8 +876,9 @@ export const useAppStore = create<AppStore>((set, get) => ({
       // 2. 更新各项目布局中匹配 ptyId 的 pane status
       // attention 与状态解耦:codex 的 PermissionRequest 状态是 ai-working
       // 但同样需要黄灯;用户对该 pane 键入时清除(clearPaneAttentionByPty)。
-      // 判定按事件名:权限/确认类 Notification 已在后端归一化为 PermissionRequest
-      const attention = cause === 'PermissionRequest' || cause === 'Elicitation';
+      // 判定按事件名(isAttentionCause):权限/确认类 Notification 已在后端归一化为
+      // PermissionRequest,StopFailure(回合因 API 错误结束)同样要黄灯提醒回来重发
+      const attention = isAttentionCause(cause);
       const newStates = new Map(state.projectStates);
       let changed = false;
       for (const [pid, ps] of newStates) {

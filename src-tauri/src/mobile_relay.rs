@@ -700,8 +700,16 @@ fn handle_mobile_command(
             // 复用 write_pty 全语义(输入跟踪/AI marker/SSH autofill 解除),
             // 文本 + \r 一次写入 = 敲入内容并回车;AI 工作中依赖 CLI 自身输入缓冲
             let data = format!("{text}\r");
-            crate::pty::write_pty(app.clone(), app.state(), pty_id, data, None)
-                .map_err(|_| CommandFailReason::WriteFailed)
+            crate::pty::write_pty(
+                app.clone(),
+                app.state(),
+                app.state(),
+                app.state(),
+                pty_id,
+                data,
+                None,
+            )
+            .map_err(|_| CommandFailReason::WriteFailed)
         }
     };
 
