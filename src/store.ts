@@ -187,6 +187,10 @@ export function setWindowFocused(focused: boolean): void {
   windowFocusedFlag = focused;
 }
 
+// 完成序号发号器(aiDoneOrder 用)。取单调序号而不是时间戳:同一批完成事件
+// 常落在同一毫秒里,时间戳排不出先后,序号可以。
+let doneSeqCounter = 0;
+
 /** 用户对 pane 键入 = 已在处理待确认事项,清掉 attention 黄灯。
  *  codex 批准后直到 PostToolUse 无任何 hook 事件,不清会误挂整个执行期。 */
 export function clearPaneAttentionByPty(ptyId: number): void {
@@ -568,6 +572,10 @@ interface AppStore {
   /** 托盘绿灯的「已完成未读」pane 集合;激活主窗口时清空 */
   unreadDonePaneIds: Set<string>;
   clearUnreadDone: () => void;
+  /** paneId → 完成序号(单调递增)。标题栏状态灯据此「先完成的先跳」。
+   *  与 unreadDonePaneIds 分开是因为口径不同:那个是给托盘的「未读」,
+   *  窗口聚焦即清空;这个记的是完成先后,跳转时窗口必然聚焦,共用会永远是空的。 */
+  aiDoneOrder: Map<string, number>;
   setPanePty: (projectId: string, paneId: string, ptyId: number) => void;
   updatePaneStatusByPaneId: (projectId: string, paneId: string, status: PaneStatus) => void;
   /** 移动端改会话名:按 paneId 全局定位;空串 = 清除自定义名,回落 shell 名 */
@@ -820,13 +828,26 @@ export const useAppStore = create<AppStore>((set, get) => ({
         }
       }
 
+      // 关掉的 pane 一并撤出完成队列,否则标题栏状态灯会往一个已经不存在的
+      // pane 上跳(Map 也会随开关终端无界增长)
+      let newDoneOrder = state.aiDoneOrder;
+      if (newDoneOrder.size > 0) {
+        const beforeIds = ps.layout ? collectPanes(ps.layout).map((p) => p.id) : [];
+        const afterIds = new Set(layout ? collectPanes(layout).map((p) => p.id) : []);
+        const gone = beforeIds.filter((id) => !afterIds.has(id) && newDoneOrder.has(id));
+        if (gone.length > 0) {
+          newDoneOrder = new Map(newDoneOrder);
+          for (const id of gone) newDoneOrder.delete(id);
+        }
+      }
+
       const newStates = new Map(state.projectStates);
       newStates.set(projectId, {
         ...ps,
         layout,
         status: layout ? getHighestStatus(layout) : 'idle',
       });
-      return { projectStates: newStates, markersByPty: newMarkers };
+      return { projectStates: newStates, markersByPty: newMarkers, aiDoneOrder: newDoneOrder };
     });
     // pane 被关掉时托盘也要跟着变(蓝/黄灯不残留)
     queueMicrotask(syncTrayStatus);
@@ -887,6 +908,20 @@ export const useAppStore = create<AppStore>((set, get) => ({
         }
         unreadDonePaneIds.add(foundPaneId);
       }
+
+      // 标题栏状态灯的「先完成的先跳」队列。与托盘绿灯的区别:不看窗口焦点
+      // (点状态灯时窗口必然是聚焦的),且重新开工/转入待确认即撤出排队。
+      let aiDoneOrder = state.aiDoneOrder;
+      if (foundPaneId) {
+        const shouldQueue = isDone && !attention && status !== 'ai-working';
+        if (shouldQueue && !aiDoneOrder.has(foundPaneId)) {
+          // 已在队列里的不重新发号:同一次任务的多个 Stop 事件不该把它挤到队尾
+          aiDoneOrder = new Map(aiDoneOrder).set(foundPaneId, ++doneSeqCounter);
+        } else if (!shouldQueue && aiDoneOrder.has(foundPaneId)) {
+          aiDoneOrder = new Map(aiDoneOrder);
+          aiDoneOrder.delete(foundPaneId);
+        }
+      }
       if (isCompletion) {
         // 3a. 提示音 — 不区分激活项目
         if (state.config.aiCompletionSound) {
@@ -932,12 +967,14 @@ export const useAppStore = create<AppStore>((set, get) => ({
         }
       }
 
-      return { projectStates: newStates, unreadDonePaneIds };
+      return { projectStates: newStates, unreadDonePaneIds, aiDoneOrder };
     });
     queueMicrotask(syncTrayStatus);
   },
 
   unreadDonePaneIds: new Set<string>(),
+
+  aiDoneOrder: new Map<string, number>(),
 
   clearUnreadDone: () => {
     set((state) => (state.unreadDonePaneIds.size === 0 ? state : { unreadDonePaneIds: new Set<string>() }));

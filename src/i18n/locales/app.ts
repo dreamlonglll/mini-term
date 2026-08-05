@@ -14,6 +14,19 @@ export const app = {
       mobile: "移动端",
       closeDrawer: "关闭",
     },
+    titleBar: {
+      minimize: "最小化",
+      maximize: "最大化",
+      restore: "向下还原",
+      close: "关闭",
+      status: {
+        error: "有会话异常，点击前往",
+        attention: "有会话在等待确认，点击前往",
+        working: "AI 正在处理，点击前往",
+        done: "有会话已完成，点击前往最先完成的",
+        idle: "没有正在运行的 AI 会话",
+      },
+    },
     update: {
       badge: "新版本 {version}",
       title: "新版本 {version} 可用，点击前往下载",
@@ -56,6 +69,19 @@ export const app = {
       ssh: "SSH connections",
       mobile: "Mobile",
       closeDrawer: "Close",
+    },
+    titleBar: {
+      minimize: "Minimize",
+      maximize: "Maximize",
+      restore: "Restore down",
+      close: "Close",
+      status: {
+        error: "A session errored — click to jump there",
+        attention: "A session is awaiting confirmation — click to jump there",
+        working: "AI is working — click to jump there",
+        done: "A session finished — click to jump to the earliest one",
+        idle: "No AI sessions running",
+      },
     },
     update: {
       badge: "New version {version}",
