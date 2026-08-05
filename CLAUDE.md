@@ -38,7 +38,7 @@ cd src-tauri && cargo test
 | 文件 | 职责 |
 |------|------|
 | `lib.rs` | Tauri app 初始化，注册所有 command 和 plugin |
-| `pty.rs` | PTY 生命周期管理（create/write/resize/kill）；16ms 批量缓冲后通过 `pty-output` 事件推送数据 |
+| `pty.rs` | PTY 生命周期管理（create/write/resize/kill）；16ms 批量缓冲后通过 `pty-output` 事件推送数据；reader→flush 走**有界** channel，配合前端水位实现全链路背压（见「PTY 数据流」） |
 | `process_monitor.rs` | 后台线程每 500ms 判定各 pane 状态（idle/ai-idle/ai-working）：hook 上报（`hook_server.rs`）一旦启用即为权威，退出以 SessionEnd 为准；无 hook 时降级为输入检测（`pty.rs` 的 AI 命令识别）+ 输出活跃度轮询，通过 `pty-status-change` 事件通知前端。唯一的非 hook 例外是**用户打断**：Claude 在 Esc/Ctrl+C 中断时不发任何事件（官方文档明示 `Stop` 不触发），由 `write_pty` 识别裸 Esc/Ctrl+C 后调 `hook_server::note_user_interrupt` 把 hook 状态收敛为 ai-idle，cause=`Interrupt` 不算完成 |
 | `config.rs` | `AppConfig` 持久化到 `{app_data_dir}/config.json`；提供跨平台预置 shell 列表 |
 | `fs.rs` | 目录列表（过滤 `.gitignore`）+ `notify` 文件监听，通过 `fs-change` 事件通知前端 |
@@ -46,7 +46,7 @@ cd src-tauri && cargo test
 | `mobile_relay.rs` | 移动端中转体系：对中转服务器的出站 WSS 长连（带桌面端密钥握手、指数退避重连）、配对码/重置配对、项目快照与项目级增量、镜像订阅管理、移动端指令写穿 PTY、移动端发起会话的校验与派发、移动端改会话名的标题收敛 |
 | `mobile_mirror.rs` | 对话镜像：pane → 项目最新会话 JSONL 的增量解析（半行拼接）、分页取数 |
 
-**Tauri Commands**: `load_config`, `save_config`, `create_pty`, `write_pty`, `resize_pty`, `kill_pty`, `list_directory`, `watch_directory`, `unwatch_directory`, `get_ai_sessions`, `mobile_relay_apply`, `mobile_relay_status`, `mobile_relay_request_pairing_code`, `mobile_relay_reset_pairing`, `mobile_relay_update_sessions`, `mobile_relay_launchers_changed`, `mobile_relay_start_session_result`, `mobile_relay_check_launcher_command`
+**Tauri Commands**: `load_config`, `save_config`, `create_pty`, `write_pty`, `resize_pty`, `kill_pty`, `kill_all_ptys`, `set_pty_flow_paused`, `list_directory`, `watch_directory`, `unwatch_directory`, `get_ai_sessions`, `mobile_relay_apply`, `mobile_relay_status`, `mobile_relay_request_pairing_code`, `mobile_relay_reset_pairing`, `mobile_relay_update_sessions`, `mobile_relay_launchers_changed`, `mobile_relay_start_session_result`, `mobile_relay_check_launcher_command`
 
 **Tauri Events（后端→前端）**: `pty-output`, `pty-exit`, `pty-status-change`, `fs-change`, `mobile-relay-status`, `mobile-relay-pairing-code`, `mobile-start-session`, `mobile-rename-pane`
 
@@ -82,10 +82,23 @@ cd src-tauri && cargo test
 
 ```
 用户键入 → xterm.onData → invoke('write_pty') → Rust writer
-Rust reader → 16ms 批量缓冲 → emit('pty-output') → term.write()
+Rust reader → 有界 channel → 16ms 批量缓冲 → emit('pty-output') → term.write()
+                  ↑                                                    │
+                  └── 背压：flush 暂停 → channel 满 → reader 停读 ←────┘
+                      invoke('set_pty_flow_paused')  ← 前端积压过高水位
 进程退出 → emit('pty-exit') → store.updatePaneStatusByPty('error')
 进程监控 → emit('pty-status-change') → store.updatePaneStatusByPty(status)
+页面加载 → invoke('kill_all_ptys') → 回收上一轮遗留的 PTY（早于任何 create_pty）
 ```
+
+**背压**：`term.write()` 的完成回调统计「已收到未解析」的字节数，越过 4MB 让后端暂停投递、
+回落到 1MB 恢复。后端暂停时 flush 不取数据，有界 channel 迅速填满，reader 随之停止从 ConPTY 读，
+背压直达刷屏进程本身——和真实终端一样，慢终端拖慢 `cat`，而不是把数据全缓存到内存里。
+后端有 30s 超时兜底，前端崩了也不会把 shell 永久卡在写阻塞上。
+
+**孤儿 PTY**：`PtyManager` 活在主进程里，WebView2 renderer 被 OOM 杀掉后页面重载，
+恢复出的 pane 是全新 id 并各自新建 PTY，旧 PTY 就此无人引用却继续运行（崩一次漏一整套，
+内存压力递增形成正反馈）。前端在 `load_config` 之前先 `kill_all_ptys` 掐断这条链路。
 
 ## 注意事项
 

@@ -148,6 +148,8 @@ pub fn run() {
             pty::write_pty,
             pty::resize_pty,
             pty::kill_pty,
+            pty::kill_all_ptys,
+            pty::set_pty_flow_paused,
             pty::arm_ssh_autofill,
             ssh::prepare_ssh_key,
             fs::list_directory,

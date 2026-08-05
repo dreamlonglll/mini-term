@@ -99,6 +99,25 @@ export function App() {
     // 静默运行。写盘由令牌把关:load_config 成功才发放令牌,save_config
     // 必须携带当前令牌——空白页面/加载失败的页面天然没有写盘资格,
     // 防止空状态覆盖磁盘上的完整配置
+    // 回收上一轮页面遗留的 PTY,必须早于任何 create_pty。
+    //
+    // WebView2 的 renderer 被 OOM 杀掉后会重载页面,而 PtyManager 活在主进程里
+    // 毫发无损:重载后的前端按 savedLayout 恢复出的是**全新** pane(新 id、无
+    // ptyId),再各自新建 PTY,旧的 shell/AI 进程与它们的线程就此再无人引用却
+    // 继续运行 —— 崩一次就漏一整套,内存压力更大、下次崩得更快。
+    // 首次启动时后端存量为空,这里是个 no-op。
+    const reapOrphanPtys = async () => {
+      try {
+        const killed = await invoke<number[]>('kill_all_ptys');
+        if (killed.length > 0) {
+          console.warn(`[startup] 回收了 ${killed.length} 个上一轮页面遗留的 PTY:`, killed);
+        }
+      } catch (e) {
+        // 回收失败不该挡住启动:代价只是这一轮继续带着孤儿跑
+        console.error('[startup] 孤儿 PTY 回收失败:', e);
+      }
+    };
+
     const loadWithRetry = async (): Promise<LoadedConfig> => {
       markStartup('load_config invoke');
       let lastErr: unknown;
@@ -112,7 +131,7 @@ export function App() {
       }
       throw lastErr;
     };
-    loadWithRetry().then(({ config: cfg, token }) => {
+    reapOrphanPtys().then(loadWithRetry).then(({ config: cfg, token }) => {
       markStartup('load_config resolved');
       setConfigToken(token);
       setConfig(cfg);
