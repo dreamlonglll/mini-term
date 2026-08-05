@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.9.3-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.10.0-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -42,7 +42,7 @@ That is what Mini-Term is for. Status lights in the project list update live; th
 
 ---
 
-## Six things worth trying
+## Eight things worth trying
 
 ### 🔔 Know the moment your AI is done
 
@@ -54,6 +54,8 @@ Status aggregates layer by layer from pane → tab → project (`error > ai-work
 - A **DONE** badge in the project list
 - Taskbar flashing (Windows) / Dock bouncing (macOS), only when the window is unfocused
 - A notification sound (a built-in synthesized tone, or your own audio file)
+
+And once the window is out of sight, the **system tray status light** takes over: yellow = awaiting confirmation, blue = working, green = unread completion, gray = quiet. Right-click the tray icon for per-project status — you know whether to come back without switching back.
 
 Once hooks are reporting, they are the **only** status source for that pane — output activity no longer participates. (A TUI's idle redraws used to read as "back to work," replaying one finished task as a completion over and over.) Completion is keyed to the `Stop` event alone, so a permission prompt — also a "waiting for you" state — is no longer announced as a finished task.
 
@@ -72,6 +74,16 @@ Fill in your relay address in the top-bar "Mobile" panel → save & connect → 
 The security boundaries were designed on purpose: pairing codes are single-use and valid for 10 minutes, pairing a new device replaces the old one, and "Reset pairing" revokes every credential instantly. **The relay forwards and never persists** — no message bodies stored, metadata-only logs (a subprocess-level automated test asserts zero file residue across the full flow). And an AI launcher's **command text never passes through the phone or the relay** — the phone references launchers by id and only ever sees the name.
 
 > **Prerequisite**: the relay runs on **your own** server (1 vCPU / 1 GB is plenty, one Docker command to start, plus a domain pointed at it for TLS). That's deliberate — there is no third-party service in the middle. See the [deployment guide](docs/deploy-relay.md).
+
+### 📊 See what your AI spent this month, at a glance
+
+The "Stats" panel in the top bar aggregates Claude Code / Codex **cost, calls, and sessions** across every dimension: daily / hourly trend charts, model and project rankings, top sessions, with ranges and scopes one click away.
+
+Data is parsed from your local session records into a **rusqlite ledger** — the panel answers in milliseconds while incremental sync catches up in the background. Forked-session history is **never double-billed**, and cache reads/writes are priced precisely at the official rate differentials. The price table refreshes daily from models.dev (a read-only public price list — **no usage data is ever uploaded**); if it can't be fetched, the cache is used — you're never shown made-up numbers.
+
+### 🔁 Restart without losing your AI sessions
+
+Close Mini-Term and open it again: the Claude / Codex session that was running in each split pane **resumes automatically via `--resume`** — session identity comes from hook reports, persists with the layout, and survives the restart. An allowlist guards everything written back into the terminal: unrecognizable ids are never written, remote panes are excluded — better to not resume than to type the wrong command.
 
 ### 🧰 Turn your SSH connections into tools your AI can call
 
@@ -122,6 +134,10 @@ A VS Code-style **Changes panel** (Staged / Changes / Untracked groups, per-file
 | **Global search** | `Ctrl+Shift+F` for filename or content search, substring or regex, streamed from the backend and cancellable anytime |
 | **Per-project env vars** | Injected into the PTY child process per project, with strict POSIX validation and a second defensive filter on the Rust side; passes through to WSL via WSLENV |
 | **Smart Ctrl+C/V** | Optional: copy when there's a selection, interrupt the program when there isn't; large Windows pastes are chunked so ConPTY doesn't drop lines |
+| **Icons everywhere** | Material file icons in the tree, AI brand icons and tech-stack icons on project rows — the full icon dataset is a separate lazily-loaded chunk, zero main-bundle growth |
+| **Dwell-to-copy selection** | Hold the mouse still after drag-selecting and the selection is copied with a "Copied" tip; dwell time configurable (0 = off) |
+| **Project descriptions** | Right-click to add a gray one-liner next to the project name — tell a row of worktree sub-projects apart at a glance |
+| **Zero network requests at startup** | Fonts bundled locally (Google Fonts link removed), heavy modals all lazy-loaded; main bundle gzip down from 631KB to 378KB |
 | **Three themes + Blueprint skin** | Auto / Light / Dark (Warm Carbon), plus an optional sci-fi Blueprint skin; the native Windows title bar follows, with no light flash on startup |
 | **Bilingual UI** | One click re-renders the whole interface in English / 中文, auto-detected from the system on first launch; in-house lightweight i18n, no extra runtime dependency |
 | **Ligatures** | Composes `==` `=>` `!=` `->` glyphs (needs a calt-table font such as Fira Code / JetBrains Mono) |
@@ -137,8 +153,9 @@ A VS Code-style **Changes panel** (Staged / Changes / Untracked groups, per-file
 | Terminal | xterm.js v6 (WebGL, automatic Canvas fallback) |
 | State / layout | Zustand single store · Allotment + recursive SplitNode tree |
 | PTY / Git | portable-pty · git2 · notify + ignore |
+| Usage stats | rusqlite local ledger · recharts trend charts |
 | Mobile relay | axum + tokio WebSocket (`relay-server/`) · React + Vite PWA (`mobile/`) |
-| Tests | **505 Rust tests** (452 desktop + 53 relay) plus 21 Node tests |
+| Tests | **566 Rust tests** (513 desktop + 53 relay) plus 51 Node tests |
 
 ---
 

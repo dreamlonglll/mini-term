@@ -21,6 +21,7 @@
     "src/utils/projectKind.ts",
     "src/utils/worktreeReconcile.ts",
     "src/utils/usageDates.ts",
-    "src/utils/aiCompletion.ts"
+    "src/utils/aiCompletion.ts",
+    "src/utils/aiResume.ts"
   ]
 }

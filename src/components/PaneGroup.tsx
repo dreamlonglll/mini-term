@@ -8,6 +8,7 @@ import { BrandIcon } from './BrandIcon';
 import { MarkerList } from './MarkerList';
 import { showContextMenu } from '../utils/contextMenu';
 import { inferVendor } from '../utils/inferVendor';
+import { buildResumeCommand } from '../utils/aiResume';
 import { disposeTerminal, writePtyInput } from '../utils/terminalCache';
 import { createProjectPty, isRemoteProject, remotePaneLabel } from '../utils/remoteProject';
 import { findPaneById } from '../utils/layoutOps';
@@ -128,19 +129,18 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
           // 重新上报 SessionStart,若写完把身份也清掉,第二次重启就断代恢复不了;
           // claude 会上报新身份自然覆盖旧值。会话身份取 effect 闭包快照,
           // 规避 monitor 在 create 与 write 之间发 idle 把身份抹掉的竞态。
+          // 远程 pane 不自动续接:PTY 是 ssh 启动器,启动初期可能停在口令
+          // 交互上,预写的命令会被当作口令消费;远端会话身份也不来自本机 hook
           const session = activePane.aiSession;
-          if (
-            pane.resumePending &&
-            session &&
-            /^[A-Za-z0-9_-]+$/.test(session.sessionId)
-          ) {
-            const cmd = session.agent === 'codex'
-              ? `codex resume ${session.sessionId}`
-              : `claude --resume ${session.sessionId}`;
+          const resumeCmd =
+            pane.resumePending && session && !remote
+              ? buildResumeCommand(session.agent, session.sessionId)
+              : null;
+          if (resumeCmd) {
             clearPaneResumePendingByPty(ptyId);
-            void writePtyInput(ptyId, `${cmd}\r`);
+            void writePtyInput(ptyId, `${resumeCmd}\r`);
             // 反查所得的启动目录随身份写回并持久化,下次重启直达不再查
-            if (resumeCwd && session.cwd !== resumeCwd) {
+            if (resumeCwd && session && session.cwd !== resumeCwd) {
               setPaneAiSessionByPty(ptyId, { ...session, cwd: resumeCwd });
               saveLayoutToConfig(projectId);
             }

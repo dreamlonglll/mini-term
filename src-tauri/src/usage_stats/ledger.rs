@@ -79,16 +79,45 @@ CREATE TABLE IF NOT EXISTS sync_state (
 static SYNC_LOCK: Mutex<()> = Mutex::new(());
 static SYNC_PENDING: AtomicBool = AtomicBool::new(false);
 
-/// 同步触发的合并语义：任何触发先置 pending 再抢锁；抢不到锁立即返回 false，
-/// 由现役持锁者收尾时消费 pending 补跑一轮——运行中途落盘的新增量最多滞后
-/// 一轮，而不是等下一次外部触发。返回是否由本次调用实际执行。
-/// （残余竞窗：持锁者最后一次消费 pending 之后、放锁之前的触发会推迟到下一次
-/// 外部触发；窗口极窄，且文件指纹保证届时必然补齐，不丢数据只延时。）
-fn run_coalesced(lock: &Mutex<()>, pending: &AtomicBool, mut round: impl FnMut()) -> bool {
+/// 同步触发的合并语义：任何触发先置 pending 再取锁。
+/// - `blocking = false`（定时 / 打开面板的后台触发）：抢不到锁立即返回 false，
+///   由现役持锁者收尾时消费 pending 补跑一轮——运行中途落盘的新增量最多滞后
+///   一轮，而不是等下一次外部触发。
+/// - `blocking = true`（刷新按钮）：排队等现役轮次收尾。返回时必然已有一轮
+///   「起始晚于本次置位 pending」的同步跑完，故账本已含本次触发的增量——
+///   前端据此做「先同步再查」，不会先闪一次同步前的旧值。
+///
+/// 返回是否由本次调用取得锁并执行（blocking 下现役者已代跑完 pending 时，
+/// 本次可能一轮都不用跑，仍返回 true——语义是「同步已完成」而非「我跑了」）。
+///
+/// 注意：`blocking = true` 不可在 round 内重入调用（std Mutex 非重入，会死锁），
+/// round 内的触发一律走 `blocking = false`。
+///
+/// （blocking=false 的残余竞窗：持锁者最后一次消费 pending 之后、放锁之前的触发
+/// 会推迟到下一次外部触发；窗口极窄，且文件指纹保证届时必然补齐，不丢数据只延时。）
+fn run_coalesced(
+    lock: &Mutex<()>,
+    pending: &AtomicBool,
+    blocking: bool,
+    mut round: impl FnMut(),
+) -> bool {
     pending.store(true, Ordering::SeqCst);
-    let Ok(_guard) = lock.try_lock() else {
-        return false;
+    // 锁内数据是 ()，中毒不代表任何状态损坏（每轮从 db + 文件指纹重建），
+    // 恢复 guard 继续；否则一次 sync panic 会让后续所有同步在应用整个
+    // 生命周期内静默 no-op，账本从此停更。
+    let guard = if blocking {
+        match lock.lock() {
+            Ok(g) => Some(g),
+            Err(p) => Some(p.into_inner()),
+        }
+    } else {
+        match lock.try_lock() {
+            Ok(g) => Some(g),
+            Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
     };
+    let Some(_guard) = guard else { return false };
     while pending.swap(false, Ordering::SeqCst) {
         round();
     }
@@ -464,27 +493,41 @@ pub async fn usage_ledger_query(
     Ok(agg.snapshot())
 }
 
-/// 触发一次增量同步：立即返回，工作进后台线程（现役同步在跑则直接放弃，
-/// 由其收尾）。完成后 emit `usage-ledger-synced {added}`（added = 重解析的
-/// 文件数，0 表示无变化前端可跳过重查）；backfill（sync_state 为空）期间
-/// 另按节流 emit `usage-ledger-progress {processed, total}`。
+/// 触发一次增量同步。
+/// - `wait` 缺省 / false（定时刷新、打开面板）：立即返回，工作进后台线程
+///   （现役同步在跑则直接放弃，由其收尾），前端不被阻塞。
+/// - `wait = true`（刷新按钮）：等同步真正跑完再返回，前端据此做「先同步再查」。
+///   旧实现一律 fire-and-forget，前端点刷新时先查到的必然是同步前的旧账本，
+///   真值要等 synced 事件才补上——表现为每点一次刷新金额跳一次。
+///
+/// 完成后 emit `usage-ledger-synced {added}`（added = 重解析的文件数，0 表示
+/// 无变化前端可跳过重查）；backfill（sync_state 为空）期间另按节流 emit
+/// `usage-ledger-progress {processed, total}`。
 #[tauri::command]
-pub async fn usage_ledger_sync(app: AppHandle) -> Result<(), String> {
+pub async fn usage_ledger_sync(app: AppHandle, wait: Option<bool>) -> Result<(), String> {
     let db_path = ledger_db_path(&app)?;
-    std::thread::spawn(move || {
+    let blocking = wait.unwrap_or(false);
+    let run = move || {
         // catch_unwind 兜底：sync panic 只损失本轮增量，账本与查询不受影响
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            run_sync(&app, &db_path);
+            run_sync(&app, &db_path, blocking);
         }));
         if outcome.is_err() {
             eprintln!("[usage_stats] ledger sync panicked");
         }
-    });
+    };
+    if blocking {
+        // 同步是重文件 I/O + sqlite 写：交给 blocking 线程池，不占 tokio worker
+        return tauri::async_runtime::spawn_blocking(run)
+            .await
+            .map_err(|e| format!("同步任务失败: {e}"));
+    }
+    std::thread::spawn(run);
     Ok(())
 }
 
-fn run_sync(app: &AppHandle, db_path: &Path) {
-    run_coalesced(&SYNC_LOCK, &SYNC_PENDING, || sync_round(app, db_path));
+fn run_sync(app: &AppHandle, db_path: &Path, blocking: bool) {
+    run_coalesced(&SYNC_LOCK, &SYNC_PENDING, blocking, || sync_round(app, db_path));
 }
 
 fn sync_round(app: &AppHandle, db_path: &Path) {
@@ -923,16 +966,72 @@ mod tests {
         let lock = Mutex::new(());
         let pending = AtomicBool::new(false);
         let rounds = AtomicUsize::new(0);
-        let ran = run_coalesced(&lock, &pending, || {
+        let ran = run_coalesced(&lock, &pending, false, || {
             if rounds.fetch_add(1, Ordering::SeqCst) == 0 {
                 // 首轮进行中又来一次触发：拿不到锁不得直接执行，
                 // 应置 pending 交由现役持锁者补跑
-                let reentrant = run_coalesced(&lock, &pending, || panic!("并发触发不得直接执行"));
+                let reentrant =
+                    run_coalesced(&lock, &pending, false, || panic!("并发触发不得直接执行"));
                 assert!(!reentrant, "锁被占用时触发方必须立即返回");
             }
         });
         assert!(ran);
         assert_eq!(rounds.load(Ordering::SeqCst), 2, "运行期间的触发必须补跑一轮，不得丢弃");
+    }
+
+    /// 刷新按钮的 blocking 语义：现役同步在跑时不得像后台触发那样直接放弃，
+    /// 必须排队等它收尾——否则前端「先同步再查」在并发下会退化回查到同步前的
+    /// 旧账本，金额照旧跳动。
+    #[test]
+    fn blocking_trigger_waits_for_inflight_round() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+
+        let lock = Arc::new(Mutex::new(()));
+        let pending = Arc::new(AtomicBool::new(false));
+        let rounds = Arc::new(AtomicUsize::new(0));
+        let holder_started = Arc::new(AtomicBool::new(false));
+
+        // 现役后台同步：持锁跑一轮 300ms
+        let (l, p, r, s) = (lock.clone(), pending.clone(), rounds.clone(), holder_started.clone());
+        let holder = std::thread::spawn(move || {
+            run_coalesced(&l, &p, false, || {
+                s.store(true, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(300));
+                r.fetch_add(1, Ordering::SeqCst);
+            });
+        });
+        while !holder_started.load(Ordering::SeqCst) {
+            std::thread::yield_now();
+        }
+
+        // 阻塞触发：必须等现役轮收尾才返回
+        let ran = run_coalesced(&lock, &pending, true, || {
+            rounds.fetch_add(1, Ordering::SeqCst);
+        });
+        assert!(ran, "blocking 触发必须取得锁");
+        assert!(
+            rounds.load(Ordering::SeqCst) >= 2,
+            "返回时必须已有一轮起始晚于本次触发的同步跑完（现役轮 + 消费 pending 的补跑）"
+        );
+        holder.join().unwrap();
+    }
+
+    /// 回归测试：round panic 会让 guard 在展开中 drop、std Mutex 中毒。
+    /// 中毒锁必须被恢复继续用——否则一次 panic 后所有同步触发都走
+    /// try_lock Err 分支静默返回，账本在应用整个生命周期内停更。
+    #[test]
+    fn coalesced_sync_recovers_after_round_panic() {
+        use std::sync::atomic::AtomicBool;
+        let lock = Mutex::new(());
+        let pending = AtomicBool::new(false);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_coalesced(&lock, &pending, false, || panic!("模拟 sync panic"));
+        }));
+        let mut ran_round = false;
+        let ran = run_coalesced(&lock, &pending, false, || ran_round = true);
+        assert!(ran, "panic 中毒后的锁必须可恢复，触发不得静默失效");
+        assert!(ran_round, "恢复后本轮 round 必须实际执行");
     }
 
     #[test]

@@ -435,6 +435,18 @@ body.ssh-conn-dragging {
   .prompt-overlay.is-closing .prompt-dialog {
     animation-duration: var(--motion-overlay-out) !important;
   }
+
+  /* 例外：用量统计面板的数据动效照常播。KPI 数字滚动与图表生长是 JS 驱动
+     （rAF / recharts），通配规则本就拦不住；把同面板的 CSS 侧（入场渐显、
+     排行条宽度补间）一并豁免，避免同一面板半动半静的割裂。理由同浮层：
+     落进 reduce 分支的多半是关掉系统视觉效果的人，不是前庭敏感用户。 */
+  .usage-fade-in {
+    animation-duration: 0.35s !important;
+  }
+
+  .usage-rank-bar {
+    transition-duration: 0.5s !important;
+  }
 }
 
 /* ===== 键盘焦点 =====

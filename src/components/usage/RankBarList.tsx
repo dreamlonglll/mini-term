@@ -36,7 +36,7 @@ export function RankBarList({ rows, emptyText }: { rows: RankRow[]; emptyText: s
           </span>
           <span className="w-14 h-1.5 rounded-full bg-[var(--border-subtle)] overflow-hidden flex-shrink-0">
             <span
-              className="block h-full rounded-full transition-[width] duration-500 ease-out"
+              className="usage-rank-bar block h-full rounded-full transition-[width] duration-500 ease-out"
               style={{
                 width: `${Math.max(Math.min(r.ratio, 1) * 100, 2)}%`,
                 background: 'linear-gradient(90deg, var(--color-info), var(--color-ai))',

@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.9.3-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.10.0-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -48,6 +48,7 @@ Mini-Term solves all of the above with one lightweight desktop app.
 - **Terminal caching** — Switching projects / tabs / panes never rebuilds the xterm instance, so existing content is preserved; lazy startup creates a PTY only for the currently visible pane, avoiding the slowdown of spawning more terminals the more history projects you have.
 - **Project-switch caching** — FileTree / GitHistory data is cached per project, so switching back to a visited project renders with zero latency; directory loading and Git status run in parallel, and Git repo scan results are cached for 30 seconds.
 - **Copy & paste** — `Ctrl+Shift+C/V` (macOS `⌘+Shift+C/V`) shortcuts + context menu, with "Copy" auto-greyed when nothing is selected; an optional "Smart `Ctrl+C/V`" mode (copy when there's a selection, interrupt the program when there isn't, and `Ctrl+V` pastes directly); on Windows, large multi-line pastes are chunked to prevent ConPTY from dropping lines.
+- **Dwell-to-copy selection** — After drag-selecting, holding the mouse still past a configurable dwell (default 1s, 0.2–60s, 0 = off) copies the selection and shows a "Copied" tip at the cursor; if the selection kept growing before mouse-up, it copies once more so the clipboard always matches the final selection.
 - **Long-text paste** — When clipboard text is ≥10 lines or ≥2000 chars, it is automatically saved to a temporary `.txt` and a quoted file path is pasted instead, avoiding the performance and paste-bracket issues of feeding huge content straight to AI tools.
 - **Image paste** — Detects screenshots in the clipboard, saves them to a temporary PNG via the Win32 API, and pastes a quoted path; compatible with non-standard formats such as PinPix.
 - **Remote / WSL paste lands where the agent can read it** — Both "save to a file, paste the path" features above automatically remap their destination in remote terminals: SSH remote projects upload the file over SFTP and paste the **remote** path (default `<project root>/.mini-term/pasted`, inside the project so agents need no extra permission; configurable to `/tmp/mini-term`, `~/uploads`, etc., and a self-ignoring `.gitignore` is written so your `git status` stays clean), while WSL projects rewrite `C:\...` into `/mnt/c/...` (no upload needed). Upload failures raise an explicit toast instead of pasting a local path the remote host cannot read.
@@ -88,11 +89,20 @@ Mini-Term solves all of the above with one lightweight desktop app.
   - Taskbar flashing (Windows) / Dock bouncing (macOS), triggered only when the window is unfocused.
   - A notification sound (a default tone synthesized via the Web Audio API, with support for a custom audio file).
   - All notification toggles are independently configurable, managed on a dedicated "AI Completion Notifications" page in the settings center.
+- **Tray status light** — A persistent system-tray light for global AI status: yellow = awaiting confirmation, blue = working, green = unread completion, gray = quiet, rotating through coexisting states while the window is unfocused; the right-click tray menu lists per-project status and a left click summons the main window (Linux offers the right-click menu only). Notification classification only treats permission / confirmation wording as "awaiting" — API errors and retry waits never light yellow. Can be disabled in Settings.
+- **Automatic session resume** — After a restart, each split pane automatically writes `claude --resume` / `codex resume` to reconnect its previous session: session identity comes from hook reports and persists with the layout across one restart; everything written back is allowlist-checked (alphanumerics plus `-_` only, max length 128), remote panes are excluded, and anything unrecognizable is never written.
 - **Session enter/exit detection** — Recognizes entering AI via command echo; recognizes exit via a double `Ctrl+C` / `Ctrl+D` or `exit` / `quit` / `:quit` / `/logout`.
 - **Session history** — Reads local Claude / Codex history records, with a right-click to copy the resume command for quick continuation; the first screen renders only 20 entries, with a "Load more" button at the bottom to expand on demand (no longer triggered by scrolling).
 - **Session viewer** — A right-click "View" shows the full conversation, with User as plain text and Assistant rendered as Markdown (external links open in the system default browser after a confirmation prompt), supporting `Ctrl+F` search highlighting and quick navigation between User messages.
 - **WSL sessions** — Reads Claude / Codex session history inside WSL distros directly from Windows (no `wsl.exe` spawn — via `\\wsl$` UNC plus registry-based distro enumeration): WSL-rooted projects auto-derive the distro and path with zero configuration; Windows-path projects pick a distro via the right-click "WSL Sessions" submenu and are scanned through `/mnt` path mapping, with in-session cwd verification to prevent cross-project mixing; WSL sessions merge chronologically with local ones under a WSL badge, a header spinner shows while loading, and viewing session content is supported too.
 - **AI task markers** — Each time the user presses Enter inside an AI session, a marker is dropped in xterm; the ⚑ button at the tab's top-right drops down the list of past submissions, and clicking one or pressing `Ctrl+Shift+↑/↓` (macOS `⌘+Shift+↑/↓`) jumps between markers, briefly highlighting the target line.
+
+### Usage Statistics
+
+- **Multi-dimensional panel** — The "Stats" button in the top bar opens a panel aggregating Claude Code / Codex cost, call count, and session count as KPI groups, with daily / hourly trend charts (recharts), model rankings, project rankings, and top sessions; agent / time-range / project filters are one click away.
+- **rusqlite local ledger** — Local session JSONL files are parsed into a SQLite ledger; panel queries return in milliseconds while incremental sync catches up in the background (files are re-parsed only when their fingerprint changes). The ledger is positioned as "a cache regenerable from the raw records": corruption triggers an automatic rebuild, and there is no migration burden.
+- **Billing accuracy** — History duplicated by session forks is deduplicated by lineage and never double-billed; cache writes / reads are priced precisely at the official rate differentials (1h cache writes at 2× input price, 1h subsets pay only the difference); unknown models are estimated at the average of Claude's mainline tiers.
+- **Price table** — Fetched once a day from models.dev (a read-only GET of a public price list — **no usage data is ever uploaded**); on failure the local cache is used, and the panel never shows made-up numbers.
 
 ### Mobile Client + Self-Hosted Relay
 
@@ -112,6 +122,8 @@ Watch the AI running on your desktop from your phone while you're out, and send 
 ### Project Management
 
 - **Project list** — Manage multiple project directories in the left sidebar, switch workspaces in one click, and restore the last active project on restart.
+- **Project descriptions** — Right-click "Edit description" to add a one-line note, shown in gray after the project name; tell a row of worktree sub-projects apart at a glance.
+- **Project row icons** — Project rows show tech-stack icons and the brand icons of the AIs currently running there (deduplicated by vendor, alphabetical, monochrome brand icons tinted in brand colors); pane tabs and the session list show the same brand icons.
 - **Drag to add projects** — Drag a folder from the file explorer onto the project list to add it quickly, with automatic detection of files / folders / duplicate projects and visual feedback.
 - **Nested groups** — Up to 3 levels of project grouping, drag to reorder, collapse / expand, with a group context menu to add either a local project or a remote SSH project directly into that group (a collapsed group expands automatically). "Delete group" now asks for confirmation first, explaining that the projects inside move up one level rather than being deleted; "Move to group" expands the group tree level by level as submenus, marking the current group with a ✓ and greying it out, with over-depth groups unselectable.
 - **Worktree sub-projects** — A worktree turned into a project is mounted beneath its main project as a sub-project (indented, following the group), and can be dragged out or detached via "Detach from parent" to return to the top level; deleting a parent project promotes its sub-projects in place instead of losing them. The project list shows a ⎇ branch badge for worktree projects, and the repo list and Changes dropdown label worktree entries as well. **Externally removed worktrees are reconciled automatically** — whenever the window regains focus, sub-project directories are probed for existence, so after an AI agent runs `git worktree remove` in a terminal the vanished sub-project is dropped along with its terminal resources and the ⎇ badges are re-probed (cleanup only happens while the parent project directory still exists, so a disconnected drive can't wipe entries; SSH remote and UNC/WSL paths are excluded). "Clean up stale entries" in the worktree modal removes the projects pointing at those worktrees too.
@@ -148,7 +160,9 @@ Watch the AI running on your desktop from your phone while you're out, and send 
 - **Update check** — Fetches the GitHub Release on startup; when a new version is available a highlighted hint appears on the icon sidebar (click to download), and the version number is written into the native window title.
 - **Bilingual UI (English / 中文)** — A one-click language toggle under "Settings → System" instantly re-renders the entire interface; the language is auto-detected from the system on first launch and remembered across restarts. Every page and feature is fully translated, with a lightweight built-in i18n layer (no extra runtime dependency).
 - **Settings center** — A unified SettingsModal managing all toggles: theme, fonts, shells, AI notifications, and more.
-- **Interface motion** — Dialogs, context menus, and the side drawer share one enter/exit animation: the backdrop fades in while the panel drops and scales into place; on close it plays the reverse before unmounting (content is frozen and the overlay leaves the stack meanwhile, so it never goes blank mid-fade or keeps swallowing Esc). Context menus expand from the cursor, and switching terminals or creating a split each get their own transition. When the system disables window animations (`prefers-reduced-motion: reduce`) these transitions still play — only looping animations such as the blinking status dot are stopped.
+- **Icons everywhere** — Material-theme file / folder icons in the file tree (including open-folder states); the full icon dataset (gzip ≈1.2MB) is a separate dynamically-imported chunk with zero main-bundle growth, falling back to the original hand-drawn symbols until loaded; AI brand icons are imported as pure SVG components via deep paths.
+- **Startup performance** — Fonts are bundled locally (@fontsource woff2 shipped with the installer, removing the render-blocking Google Fonts link), so the startup path makes zero network requests and the offline first frame no longer waits on fonts; five heavy modals (Settings / File viewer / Session viewer / Mobile / Stats) are React.lazy-loaded on demand, bringing the main bundle from 631KB to 378KB gzipped; a unified Rust / WebView startup-timeline trace is written to stderr for regression hunting.
+- **Interface motion** — Dialogs, context menus, and the side drawer share one enter/exit animation: the backdrop fades in while the panel drops and scales into place; on close it plays the reverse before unmounting (content is frozen and the overlay leaves the stack meanwhile, so it never goes blank mid-fade or keeps swallowing Esc). Context menus expand from the cursor, and switching terminals or creating a split each get their own transition. When the system disables window animations (`prefers-reduced-motion: reduce`) these transitions still play — the usage panel's number tweens and chart animations are exempted likewise — only looping animations such as the blinking status dot are stopped.
 
 ## Tech Stack
 
@@ -162,9 +176,10 @@ Watch the AI running on your desktop from your phone while you're out, and send 
 | PTY | portable-pty 0.8 |
 | Git | git2 0.19 |
 | File watching | notify 7 + ignore 0.4 (.gitignore filtering) |
+| Usage stats | rusqlite 0.40 local ledger · recharts 3 trend charts · chrono-tz timezone bucketing |
 | Tauri plugins | `window-state` · `clipboard-manager` · `dialog` · `opener` |
 | Mobile relay | axum + tokio WebSocket relay service (`relay-server/`) · React + TS + Vite PWA (`mobile/`) |
-| Test coverage | 505 Rust tests = 452 desktop (tauri-app 298 + mt-core 44 + mt-ssh 26 + mt-sidecars 84) + 53 relay-server (protocol & routing); plus 21 Node tests |
+| Test coverage | 566 Rust tests = 513 desktop (tauri-app 359 + mt-core 44 + mt-ssh 26 + mt-sidecars 84) + 53 relay-server (protocol & routing); plus 51 Node tests |
 
 ## Getting Started
 
@@ -380,7 +395,7 @@ npm run build
 # Node-side tests (20)
 node --test "tests/*.test.cjs"
 
-# Desktop Rust tests (452)
+# Desktop Rust tests (513)
 # Note: mt-core / mt-ssh / mt-sidecars are standalone crates, not workspace members.
 # Running `cd src-tauri && cargo test` alone only covers tauri-app's 297 — the other
 # three need their manifests specified explicitly.

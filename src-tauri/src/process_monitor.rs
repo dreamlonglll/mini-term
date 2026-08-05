@@ -224,6 +224,25 @@ mod tests {
         assert_eq!(resolve_status(&hooks, &mgr, 1, true), "ai-working");
     }
 
+    /// 同一 bug 的另一面：monitor 每 500ms 重算一次，只要没有新 hook 事件，
+    /// 连续多轮必须给出同一个值——状态不再随输出活跃度上下摆动，也就没有
+    /// 供前端误判为"完成"的下降沿。
+    #[test]
+    fn hook_status_is_stable_across_polls() {
+        let hooks = HookState::new();
+        let mgr = PtyManager::new();
+
+        mgr.track_input(1, "claude\r");
+        hooks.update(1, "ai-working".to_string());
+
+        let polls: Vec<String> = (0..5).map(|_| resolve_status(&hooks, &mgr, 1, true)).collect();
+        assert!(
+            polls.iter().all(|s| s == "ai-working"),
+            "hook 未更新时状态应恒定，实测 {:?}",
+            polls
+        );
+    }
+
     /// 启动方式漏检（别名/包装脚本，输入检测从未标记 is_ai_session）时，
     /// hook 状态照常生效，不因 !is_ai_session 被降级。
     #[test]

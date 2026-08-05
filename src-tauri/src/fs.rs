@@ -312,7 +312,10 @@ struct FsChangePayload {
 }
 
 pub struct FsWatcherManager {
-    watchers: Arc<Mutex<HashMap<String, RecommendedWatcher>>>,
+    // 值为 (watcher, 引用计数)：压缩链让多个前端节点可能 watch 同一路径
+    // （链中段与其真实 TreeNode），无计数时后注册者会顶掉前者的 watcher、
+    // 先注销者会把仍在用的 watcher 一并摘除
+    watchers: Arc<Mutex<HashMap<String, (RecommendedWatcher, usize)>>>,
 }
 
 impl FsWatcherManager {
@@ -330,6 +333,15 @@ pub fn watch_directory(
     path: String,
     project_path: String,
 ) -> Result<(), String> {
+    // 已有同路径 watcher：仅计数 +1，不重建（notify 后端重复注册同一路径浪费句柄）
+    {
+        let mut watchers = state.watchers.lock().unwrap();
+        if let Some(entry) = watchers.get_mut(&path) {
+            entry.1 += 1;
+            return Ok(());
+        }
+    }
+
     let watch_path = PathBuf::from(&path);
     let project_path_clone = project_path.clone();
     let app_clone = app.clone();
@@ -355,7 +367,13 @@ pub fn watch_directory(
         .map_err(|e| e.to_string())?;
 
     let mut watchers = state.watchers.lock().unwrap();
-    watchers.insert(path, watcher);
+    // 竞态兜底：抢先检查后、insert 前若有并发注册者已写入，则沿用其 watcher 只递增计数
+    match watchers.get_mut(&path) {
+        Some(entry) => entry.1 += 1,
+        None => {
+            watchers.insert(path, (watcher, 1));
+        }
+    }
     Ok(())
 }
 
@@ -440,7 +458,12 @@ pub fn unwatch_directory(
     path: String,
 ) -> Result<(), String> {
     let mut watchers = state.watchers.lock().unwrap();
-    watchers.remove(&path);
+    if let Some(entry) = watchers.get_mut(&path) {
+        entry.1 -= 1;
+        if entry.1 == 0 {
+            watchers.remove(&path);
+        }
+    }
     Ok(())
 }
 

@@ -591,9 +591,10 @@ export function ProjectList() {
             : 'text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:bg-[var(--border-subtle)]'
         }`}
         style={{
-          // 组内项目对齐父级分组的倒三角区域((depth-1)*16 起,+16 不贴左缘),
-          // 顶层项目维持原有 10px
-          paddingLeft: `${depth === 0 ? 10 : (depth - 1) * 16 + 16}px`,
+          // 组内项目对齐父级分组的倒三角区域((depth-1)*16 起,+16 不贴左缘);
+          // 无分组链时(顶层项目及其 worktree 子项目)以 10px 为基准每层 +16,
+          // 不能共用组内公式——那会把顶层 worktree 子项目的相对缩进压到 6px
+          paddingLeft: `${parentGroupId ? (depth - 1) * 16 + 16 : 10 + depth * 16}px`,
           paddingRight: '10px',
         }}
         role="option"
