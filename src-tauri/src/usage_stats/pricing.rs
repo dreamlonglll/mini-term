@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::cmp::Reverse;
 use std::collections::HashMap;
 
 use super::turns::UsageTotals;
@@ -50,11 +51,66 @@ pub(super) fn strip_date_suffix(name: &str) -> Option<&str> {
     }
 }
 
+/// 同一 canonical 键下的择优序（元组字典序，越大越优先）。
+///
+/// 只看「来源形态」与「价格是否完整」，不比价格高低——挑贵的或挑便宜的都是在
+/// 替用户做经济判断，而挑「官方裸模型名 + 缓存单价齐全」的那条是可辩护的。
+fn candidate_rank(raw_key: &str, p: &ModelPrice) -> (bool, bool, bool, bool, bool, Reverse<usize>) {
+    (
+        // 全 0 占位价排最后：收下会把该模型整段成本抹成 0，比查不到价更糟
+        p.input > 0.0 || p.output > 0.0,
+        // 显式给出缓存单价者优先（缺失会退化成 0，Claude 侧缓存占大头，误差极大）
+        p.cache_read > 0.0,
+        p.cache_write > 0.0,
+        // 裸模型名优于 provider 前缀形式（`anthropic/claude-opus-5`）
+        !raw_key.contains('/'),
+        // 裸模型名优于地区/日期后缀（`claude-opus-5@eu`、`claude-opus-5@20251101`）
+        !raw_key.contains('@'),
+        Reverse(raw_key.len()),
+    )
+}
+
+/// 把原始价格表按 canonical 键压平，碰撞时按 `candidate_rank` 全序择优。
+///
+/// 不能直接 `for (k, v) in raw { exact.insert(canonical(&k), v) }`：models.dev
+/// 同一模型会被几十家 provider 以不同 id、不同价登记（`claude-opus-5` /
+/// `anthropic/claude-opus-5` / `claude-opus-5@eu` 全部塌成同一个键），而 std
+/// HashMap 的迭代顺序**逐实例**随机（RandomState 每 new 一个 map 就换种子），
+/// 于是「最后写入者胜出」每次查询都换人——表现为面板每点一次刷新，总额就在
+/// 几个值之间来回跳（实测 `claude-opus-5` 的官方价与 requesty 欧区价正好差
+/// 1.10 倍，同一天用量因此在 $10.02 / $11.02 之间反复横跳）。
+///
+/// 排序键完全不依赖迭代顺序，且末位用原始键字典序兜底，构成全序：同样的输入
+/// 永远得到同样的表。前端 `modelPricing.ts` 已按一方 provider 择优过一轮，这里
+/// 是第二道闸——价格表跨 IPC 传入是任意内容，且旧版 localStorage 缓存仍是按
+/// 原始 modelId 建的键，不能假设无碰撞。
+fn dedupe_by_canonical(raw: HashMap<String, ModelPrice>) -> Vec<(String, ModelPrice)> {
+    let mut entries: Vec<(String, String, ModelPrice)> = raw
+        .into_iter()
+        .map(|(key, price)| (canonical(&key), key, price))
+        .collect();
+    entries.sort_by(|(a_key, a_raw, a_price), (b_key, b_raw, b_price)| {
+        a_key
+            .cmp(b_key)
+            .then_with(|| candidate_rank(b_raw, b_price).cmp(&candidate_rank(a_raw, a_price)))
+            .then_with(|| a_raw.cmp(b_raw))
+    });
+    let mut out: Vec<(String, ModelPrice)> = Vec::with_capacity(entries.len());
+    for (key, _, price) in entries {
+        // 同 canonical 键已排在一起，组内第一个即最优，其余丢弃
+        if out.last().is_some_and(|(prev, _)| *prev == key) {
+            continue;
+        }
+        out.push((key, price));
+    }
+    out
+}
+
 impl PricingTable {
     pub fn new(raw: HashMap<String, ModelPrice>) -> Self {
         let mut exact = HashMap::with_capacity(raw.len());
-        for (k, v) in raw {
-            exact.insert(canonical(&k), v);
+        for (key, price) in dedupe_by_canonical(raw) {
+            exact.insert(key, price);
         }
         let anchors: Vec<ModelPrice> = ANCHOR_MODELS
             .iter()
@@ -94,7 +150,13 @@ impl PricingTable {
         for (k, v) in &self.exact {
             let boundary_ok = c.starts_with(k.as_str())
                 && (c.len() == k.len() || c.as_bytes()[k.len()] == b'-');
-            if boundary_ok && best.is_none_or(|(bk, _)| k.len() > bk.len()) {
+            // 最长前缀优先，等长按字典序最小兜底。等长前缀理论上唯一（两个不同
+            // 的等长字符串不可能同为一个串的前缀），兜底是为了让「与 HashMap
+            // 迭代顺序无关」成为显式不变量，而不是依赖这条推理成立
+            let better = |(bk, _): (&String, &ModelPrice)| {
+                k.len() > bk.len() || (k.len() == bk.len() && k < bk)
+            };
+            if boundary_ok && best.is_none_or(better) {
                 best = Some((k, v));
             }
         }
@@ -175,6 +237,86 @@ mod tests {
     fn resolve_empty_table_returns_none() {
         let t = PricingTable::new(HashMap::new());
         assert!(t.resolve("claude-opus-4-8").is_none());
+    }
+
+    fn price(input: f64, output: f64, cache_read: f64, cache_write: f64) -> ModelPrice {
+        ModelPrice { input, output, cache_read, cache_write }
+    }
+
+    /// models.dev 现网数据的真实碰撞组：四个原始键全部塌成 `claude-opus-5`，
+    /// requesty 欧区价恰是官方价的 1.10 倍。
+    fn colliding_opus5_table() -> HashMap<String, ModelPrice> {
+        let mut m = HashMap::new();
+        m.insert("claude-opus-5".to_string(), price(5e-6, 25e-6, 0.5e-6, 6.25e-6));
+        m.insert("anthropic/claude-opus-5".to_string(), price(5e-6, 25e-6, 0.5e-6, 6.25e-6));
+        m.insert("claude-opus-5@default".to_string(), price(5e-6, 25e-6, 0.5e-6, 6.25e-6));
+        m.insert("claude-opus-5@eu".to_string(), price(5.5e-6, 27.5e-6, 0.55e-6, 6.88e-6));
+        m
+    }
+
+    /// 回归：同一份价格表构造多次，查价结果必须逐次相同。
+    ///
+    /// 修复前 `PricingTable::new` 直接 `insert(canonical(k), v)`，胜出者由 std
+    /// HashMap 的迭代顺序决定；RandomState 每 new 一个 map 就换种子，于是每次
+    /// 查询都重新掷骰子——面板每点一次刷新总额就在 $10.02 / $11.02 间跳。
+    /// 单轮断言必然通过，唯有多轮才能抓到，故这里跑 64 轮。
+    #[test]
+    fn canonical_collisions_resolve_deterministically() {
+        let expected = PricingTable::new(colliding_opus5_table())
+            .resolve("claude-opus-5")
+            .expect("碰撞组必须解析出价格");
+        for round in 0..64 {
+            let got = PricingTable::new(colliding_opus5_table())
+                .resolve("claude-opus-5")
+                .expect("碰撞组必须解析出价格");
+            assert_eq!(got, expected, "第 {round} 轮查价与首轮不一致：择优仍依赖迭代顺序");
+        }
+    }
+
+    #[test]
+    fn bare_official_model_name_wins_collision() {
+        let t = PricingTable::new(colliding_opus5_table());
+        let p = t.resolve("claude-opus-5").unwrap();
+        // 官方裸键（无 provider 前缀、无 @ 后缀）胜出，而不是 requesty 的欧区价
+        assert_eq!(p, price(5e-6, 25e-6, 0.5e-6, 6.25e-6));
+    }
+
+    /// 全 0 占位价绝不能胜出：收下会把该模型整段成本抹成 0，
+    /// 而查不到价至少还有三锚点均价兜底。
+    #[test]
+    fn placeholder_zero_price_never_wins_collision() {
+        let mut m = HashMap::new();
+        // 裸键形态最“干净”，但价格是占位 0；带前缀的才是真价
+        m.insert("gpt-5-6-sol".to_string(), price(0.0, 0.0, 0.0, 0.0));
+        m.insert("openai/gpt-5.6-sol".to_string(), price(5e-6, 30e-6, 0.5e-6, 6.25e-6));
+        let t = PricingTable::new(m);
+        assert_eq!(t.resolve("gpt-5.6-sol").unwrap(), price(5e-6, 30e-6, 0.5e-6, 6.25e-6));
+    }
+
+    /// 缓存单价缺失（退化成 0）的条目让位给齐全的条目：Claude 侧 cache_read
+    /// 常占成本七成以上，取到缺缓存价的那条会把总额砍掉大半。
+    #[test]
+    fn entry_with_explicit_cache_prices_wins_collision() {
+        let mut m = HashMap::new();
+        m.insert("claude-opus-5".to_string(), price(5e-6, 25e-6, 0.0, 0.0));
+        m.insert("vendor/claude-opus-5".to_string(), price(5e-6, 25e-6, 0.5e-6, 6.25e-6));
+        let t = PricingTable::new(m);
+        assert_eq!(t.resolve("claude-opus-5").unwrap().cache_read, 0.5e-6);
+    }
+
+    /// 锚点均价兜底同样不得抖：锚点自身也来自碰撞组。
+    #[test]
+    fn anchor_fallback_is_stable_across_rebuilds() {
+        let build = || {
+            let mut m = colliding_opus5_table();
+            m.insert("claude-opus-4-8".to_string(), price(5e-6, 25e-6, 0.5e-6, 6.25e-6));
+            m.insert("claude-opus-4-8@eu".to_string(), price(5.5e-6, 27.5e-6, 0.55e-6, 6.88e-6));
+            PricingTable::new(m).resolve("codex-auto-review")
+        };
+        let expected = build().expect("锚点存在时必须有兜底均价");
+        for round in 0..64 {
+            assert_eq!(build().unwrap(), expected, "第 {round} 轮兜底均价漂移");
+        }
     }
 
     #[test]
