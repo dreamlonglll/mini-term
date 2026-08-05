@@ -144,6 +144,7 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
             clearPaneResumePendingByPty(ptyId);
             void writePtyInput(ptyId, `${resumeCmd}\r`);
             // 反查所得的启动目录随身份写回并持久化,下次重启直达不再查
+            const session = activePane.aiSession;
             if (resumeCwd && session && session.cwd !== resumeCwd) {
               setPaneAiSessionByPty(ptyId, { ...session, cwd: resumeCwd });
               saveLayoutToConfig(projectId);
