@@ -752,8 +752,10 @@ function SystemSettings() {
   const trayEnabled = config.trayStatusEnabled ?? true;
   const savedTrayMax = config.trayMaxProjects ?? 5;
   const [trayMaxInput, setTrayMaxInput] = useState(String(savedTrayMax));
+  // 缺省开启:保持旧行为,老配置升级上来不改变启动表现
+  const aiAutoResume = config.aiAutoResume ?? true;
 
-  const patchTray = useCallback((patch: Partial<typeof config>) => {
+  const patchConfig = useCallback((patch: Partial<typeof config>) => {
     const newConfig = { ...useAppStore.getState().config, ...patch };
     setConfig(newConfig);
     saveConfigToDisk(newConfig);
@@ -763,7 +765,7 @@ function SystemSettings() {
     const n = parseInt(trayMaxInput, 10);
     const clamped = Number.isFinite(n) && n >= 1 ? Math.min(n, 20) : savedTrayMax;
     setTrayMaxInput(String(clamped));
-    if (clamped !== savedTrayMax) patchTray({ trayMaxProjects: clamped });
+    if (clamped !== savedTrayMax) patchConfig({ trayMaxProjects: clamped });
   };
 
   return (
@@ -784,7 +786,7 @@ function SystemSettings() {
           className={`relative w-9 h-5 rounded-full transition-colors flex-shrink-0 ${
             trayEnabled ? 'bg-[var(--accent)]' : 'bg-[var(--border-strong)]'
           }`}
-          onClick={() => patchTray({ trayStatusEnabled: !trayEnabled })}
+          onClick={() => patchConfig({ trayStatusEnabled: !trayEnabled })}
         >
           <span
             className={`absolute top-0.5 left-0 w-4 h-4 rounded-full bg-white transition-transform ${
@@ -812,6 +814,26 @@ function SystemSettings() {
           />
         </div>
       )}
+
+      {/* 启动时自动续接 AI 会话 */}
+      <div className="flex items-center justify-between px-3 py-2.5 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)]">
+        <div className="pr-4">
+          <div className="text-base text-[var(--text-primary)]">{t("settings.system.aiAutoResumeTitle")}</div>
+          <div className="text-sm text-[var(--text-muted)]">{t("settings.system.aiAutoResumeDesc")}</div>
+        </div>
+        <button
+          className={`relative w-9 h-5 rounded-full transition-colors flex-shrink-0 ${
+            aiAutoResume ? 'bg-[var(--accent)]' : 'bg-[var(--border-strong)]'
+          }`}
+          onClick={() => patchConfig({ aiAutoResume: !aiAutoResume })}
+        >
+          <span
+            className={`absolute top-0.5 left-0 w-4 h-4 rounded-full bg-white transition-transform ${
+              aiAutoResume ? 'translate-x-[18px]' : 'translate-x-0.5'
+            }`}
+          />
+        </button>
+      </div>
 
       {/* 主题模式 */}
       <div className="text-base text-[var(--text-muted)] uppercase tracking-[0.1em] mb-2">

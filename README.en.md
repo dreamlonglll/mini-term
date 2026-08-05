@@ -83,7 +83,7 @@ Data is parsed from your local session records into a **rusqlite ledger** — th
 
 ### 🔁 Restart without losing your AI sessions
 
-Close Mini-Term and open it again: the Claude / Codex session that was running in each split pane **resumes automatically via `--resume`** — session identity comes from hook reports, persists with the layout, and survives the restart. An allowlist guards everything written back into the terminal: unrecognizable ids are never written, remote panes are excluded — better to not resume than to type the wrong command.
+Close Mini-Term and open it again: the Claude / Codex session that was running in each split pane **resumes automatically via `--resume`** — session identity comes from hook reports, persists with the layout, and survives the restart. An allowlist guards everything written back into the terminal: unrecognizable ids are never written, remote panes are excluded — better to not resume than to type the wrong command. Don't want it typing commands for you? One switch under Settings → System turns it off — terminals still come back, they just don't run the resume.
 
 ### 🧰 Turn your SSH connections into tools your AI can call
 

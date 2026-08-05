@@ -118,6 +118,11 @@ pub struct AppConfig {
     /// 托盘右键菜单最多显示的活跃项目数。`None` = 前端默认 5。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tray_max_projects: Option<u32>,
+    /// 启动恢复布局后是否自动续接上次的 AI 会话（往 pane 写 resume 命令）。
+    /// `None` = 前端默认开启（保持旧行为）。关掉只是不写命令，会话身份仍随布局
+    /// 持久化，重新打开开关后下次启动照样能续上。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ai_auto_resume: Option<bool>,
     #[serde(default)]
     pub ssh_connections: Vec<SshConnection>,
     /// 显式创建的 SSH 分组名（允许空分组存在）。连接上的 group 字段仍是归属的
@@ -396,6 +401,7 @@ impl Default for AppConfig {
             selection_auto_copy_secs: None,
             tray_status_enabled: None,
             tray_max_projects: None,
+            ai_auto_resume: None,
             ssh_connections: vec![],
             ssh_groups: vec![],
             mobile_relay: None,
