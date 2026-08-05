@@ -10,6 +10,7 @@ import { TerminalArea } from './components/TerminalArea';
 import { ProjectList } from './components/ProjectList';
 import { FileTree } from './components/FileTree';
 import { ActivityBar } from './components/ActivityBar';
+import { TitleBar } from './components/TitleBar';
 import { RightDrawer } from './components/RightDrawer';
 import type { SettingsPage } from './components/SettingsModal';
 import { SshModal } from './components/SshModal';
@@ -83,6 +84,7 @@ export function App() {
   const mobileEverOpened = useEverOpened(mobileOpen);
   const statsEverOpened = useEverOpened(statsOpen);
   const [switcherOpen, setSwitcherOpen] = useState(false);
+  const [currentVersion, setCurrentVersion] = useState('');
   const [updateInfo, setUpdateInfo] = useState<ReleaseInfo | null>(null);
   const [mountedProjectIds, setMountedProjectIds] = useState<string[]>([]);
   const activeProjectId = useAppStore((s) => s.activeProjectId);
@@ -231,9 +233,11 @@ export function App() {
     return () => window.removeEventListener('custom-theme-reloaded', onReload);
   }, []);
 
-  // 启动时获取版本号：写进原生窗口标题（原自定义标题栏已移除），并检查更新
+  // 启动时获取版本号：喂给自定义标题栏显示，同时写进原生窗口标题 ——
+  // 窗口虽已无边框，任务栏悬停预览与 Alt+Tab 仍读这个标题
   useEffect(() => {
     getVersion().then((ver) => {
+      setCurrentVersion(ver);
       getCurrentWindow().setTitle(`Mini-Term v${ver}`).catch(() => {});
       checkForUpdate(ver).then((release) => {
         if (release) setUpdateInfo(release);
@@ -442,6 +446,9 @@ export function App() {
 
   return (
     <div className="flex flex-col h-full">
+      {/* 无边框窗口的自定义标题栏。不受 configLoaded 门控：配置加载失败时
+          用户也得有地方能把窗口关掉 */}
+      <TitleBar version={currentVersion} />
       <div className="flex-1 overflow-hidden flex">
         {/* Icon 栏 — 常驻最左侧 */}
         {configLoaded && (

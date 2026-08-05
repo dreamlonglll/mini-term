@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.10.0-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.10.2-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -90,7 +90,7 @@ Mini-Term solves all of the above with one lightweight desktop app.
   - A notification sound (a default tone synthesized via the Web Audio API, with support for a custom audio file).
   - All notification toggles are independently configurable, managed on a dedicated "AI Completion Notifications" page in the settings center.
 - **Tray status light** — A persistent system-tray light for global AI status: yellow = awaiting confirmation, blue = working, green = unread completion, gray = quiet, rotating through coexisting states while the window is unfocused; the right-click tray menu lists per-project status and a left click summons the main window (Linux offers the right-click menu only). Notification classification only treats permission / confirmation wording as "awaiting" — API errors and retry waits never light yellow. Can be disabled in Settings.
-- **Automatic session resume** — After a restart, each split pane automatically writes `claude --resume` / `codex resume` to reconnect its previous session: session identity comes from hook reports and persists with the layout across one restart; everything written back is allowlist-checked (alphanumerics plus `-_` only, max length 128), remote panes are excluded, and anything unrecognizable is never written.
+- **Automatic session resume** — After a restart, each split pane automatically writes `claude --resume` / `codex resume` to reconnect its previous session: session identity comes from hook reports and persists with the layout across one restart; everything written back is allowlist-checked (alphanumerics plus `-_` only, max length 128), remote panes are excluded, and anything unrecognizable is never written. Can be turned off under Settings → System (terminals still come back, they just don't run the resume command).
 - **Session enter/exit detection** — Recognizes entering AI via command echo; recognizes exit via a double `Ctrl+C` / `Ctrl+D` or `exit` / `quit` / `:quit` / `/logout`.
 - **Session history** — Reads local Claude / Codex history records, with a right-click to copy the resume command for quick continuation; the first screen renders only 20 entries, with a "Load more" button at the bottom to expand on demand (no longer triggered by scrolling).
 - **Session viewer** — A right-click "View" shows the full conversation, with User as plain text and Assistant rendered as Markdown (external links open in the system default browser after a confirmation prompt), supporting `Ctrl+F` search highlighting and quick navigation between User messages.
@@ -151,7 +151,12 @@ Watch the AI running on your desktop from your phone while you're out, and send 
 ### Appearance & Configuration
 
 - **Icon sidebar + three-column layout** — A persistent icon bar on the far left (collapse middle column / Sessions / Git / Settings / SSH); the middle column stacks Projects over Files and collapses as a whole; the terminal sits on the right. Sessions / Git are now floating drawers that slide out from the right edge over the terminal (mutually exclusive single panel, left-edge drag to resize with persisted width, ✕ to close), with a blue vertical bar indicating the active state.
-- **Three theme modes** — Auto (follows the system) / Light / Dark, with Dark based on a Warm Carbon palette and a custom CSS-variable system; the native Windows title bar (DWM Immersive Dark Mode) follows the theme automatically, with no first-frame light flash for dark-mode users on startup.
+- **Three theme modes** — Auto (follows the system) / Light / Dark, with Dark based on a Warm Carbon palette and a custom CSS-variable system; the title bar is drawn by the app and reads the theme variables directly, with no first-frame light flash for dark-mode users on startup (the Windows window border still syncs via DWM Immersive Dark Mode).
+- **Custom title bar** — System decorations are dropped (`decorations: false`) in favour of a self-drawn 32px bar: app name and version on the left, global status light and window controls on the right, coloured from the theme instead of the system's grey strip. Adapted to each platform's conventions:
+  - **Windows / Linux** — Minimize / maximize / close on the right, with the close button turning red on hover. Win11 **Snap Layouts** still work: `window_snap.rs` subclasses the window procedure and returns `HTMAXBUTTON` for the maximize button's rectangle in `WM_NCHITTEST`, so hovering pops the snap menu. That rectangle thereby becomes non-client area and stops receiving WebView events, so hover highlighting is relayed back to the frontend via a `titlebar-max-hover` event and clicks post `WM_SYSCOMMAND` directly.
+  - **macOS** — The native traffic lights are kept (`titleBarStyle: Overlay` + `hiddenTitle`) with space reserved in the top-left corner; no hand-drawn dots, so full-screen, gestures, and system integration all survive.
+  - **Global status light** — Aggregates the most urgent state across every pane of every project (error > awaiting confirmation > working > done). Clicking jumps to the session that needs you next: awaiting-confirmation / errored first, then the **earliest finished** one, and only then anything still running. This deliberately differs from the tray context menu's ordering — the tray answers "which projects are still alive", the status light answers "what should I do next".
+  - Dragging goes through Tauri's `startDragging` rather than `-webkit-app-region`, avoiding the WebView2 modal-loop input lockup fixed back in v0.2.16; double-clicking the bar toggles maximize.
 - **Blueprint skin** — An optional sci-fi Blueprint skin with a grid background + corner markers + glow effects, supporting both dark and light modes, with the terminal palette switching in sync.
 - **Independent font tuning** — The UI and terminal font sizes (10-20px) / families are adjustable separately, and the terminal can optionally follow the UI theme.
 - **Ligatures** — A terminal ligature toggle that composes glyphs like `==` `=>` `!=` `->` when enabled, requiring a font with a calt table (Fira Code / JetBrains Mono); fully supported on Windows, while macOS / Linux use a 60-entry Iosevka fallback due to webview API limitations.
@@ -312,7 +317,8 @@ mini-term/
 │   │   ├── ssh_mcp_registry.rs   # Legacy MCP registration cleanup (migration fallback for old projects)
 │   │   ├── mobile_relay.rs       # Mobile relay (outbound WSS link / pairing / snapshots / commands / start session / rename)
 │   │   ├── mobile_mirror.rs      # Conversation mirror (incremental session JSONL parsing + pagination)
-│   │   ├── window_theme.rs       # Native Windows title bar dark mode (DWM Immersive Dark Mode)
+│   │   ├── window_theme.rs       # Windows window-border dark mode (DWM Immersive Dark Mode)
+│   │   ├── window_snap.rs        # Win11 Snap Layouts (HTMAXBUTTON hit-testing for the frameless window)
 │   │   └── window_input_recovery.rs # Recovery from stuck window input focus
 │   ├── mt-core/                  # Shared library crate without tauri deps (SSH types / config / keys)
 │   ├── mt-ssh/                   # Shared SSH crate (persistent russh session pool + SFTP primitives, used by both the app and sidecars)

@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.10.0-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.10.2-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -83,7 +83,7 @@ Data is parsed from your local session records into a **rusqlite ledger** — th
 
 ### 🔁 Restart without losing your AI sessions
 
-Close Mini-Term and open it again: the Claude / Codex session that was running in each split pane **resumes automatically via `--resume`** — session identity comes from hook reports, persists with the layout, and survives the restart. An allowlist guards everything written back into the terminal: unrecognizable ids are never written, remote panes are excluded — better to not resume than to type the wrong command.
+Close Mini-Term and open it again: the Claude / Codex session that was running in each split pane **resumes automatically via `--resume`** — session identity comes from hook reports, persists with the layout, and survives the restart. An allowlist guards everything written back into the terminal: unrecognizable ids are never written, remote panes are excluded — better to not resume than to type the wrong command. Don't want it typing commands for you? One switch under Settings → System turns it off — terminals still come back, they just don't run the resume.
 
 ### 🧰 Turn your SSH connections into tools your AI can call
 
@@ -138,7 +138,8 @@ A VS Code-style **Changes panel** (Staged / Changes / Untracked groups, per-file
 | **Dwell-to-copy selection** | Hold the mouse still after drag-selecting and the selection is copied with a "Copied" tip; dwell time configurable (0 = off) |
 | **Project descriptions** | Right-click to add a gray one-liner next to the project name — tell a row of worktree sub-projects apart at a glance |
 | **Zero network requests at startup** | Fonts bundled locally (Google Fonts link removed), heavy modals all lazy-loaded; main bundle gzip down from 631KB to 378KB |
-| **Three themes + Blueprint skin** | Auto / Light / Dark (Warm Carbon), plus an optional sci-fi Blueprint skin; the native Windows title bar follows, with no light flash on startup |
+| **Three themes + Blueprint skin** | Auto / Light / Dark (Warm Carbon), plus an optional sci-fi Blueprint skin; the title bar matches the theme, with no light flash on startup |
+| **Custom title bar** | Frameless window with a self-drawn title bar that follows your theme instead of the system's grey strip, adapted per platform — window controls on the right for Windows / Linux (Win11 Snap Layouts still pop up when you hover the maximize button), native traffic lights kept on macOS. The status light on the right aggregates AI state across every project; click it to jump to the next session needing you (earliest finished first) |
 | **Bilingual UI** | One click re-renders the whole interface in English / 中文, auto-detected from the system on first launch; in-house lightweight i18n, no extra runtime dependency |
 | **Ligatures** | Composes `==` `=>` `!=` `->` glyphs (needs a calt-table font such as Fira Code / JetBrains Mono) |
 

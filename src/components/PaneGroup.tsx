@@ -8,7 +8,7 @@ import { BrandIcon } from './BrandIcon';
 import { MarkerList } from './MarkerList';
 import { showContextMenu } from '../utils/contextMenu';
 import { inferVendor } from '../utils/inferVendor';
-import { buildResumeCommand } from '../utils/aiResume';
+import { paneShowsAiSession, resolveAutoResumeCommand } from '../utils/aiResume';
 import { disposeTerminal, writePtyInput } from '../utils/terminalCache';
 import { createProjectPty, isRemoteProject, remotePaneLabel } from '../utils/remoteProject';
 import { findPaneById } from '../utils/layoutOps';
@@ -77,6 +77,8 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
   const remote = isRemoteProject(project);
   const remoteLabel = project && remote ? remotePaneLabel(project) : undefined;
   const paneLabel = (pane: PaneState) => pane.customTitle || (remote ? remoteLabel! : pane.shellName);
+  // 缺省开启;既决定起 PTY 时写不写 resume,也决定待续接的 pane 亮不亮 AI 图标
+  const autoResumeEnabled = config.aiAutoResume ?? true;
 
   useEffect(() => {
     if (!activePane || activePane.ptyId !== undefined || activePane.status === 'error') return;
@@ -123,19 +125,21 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
         const pane = layout ? findPaneById(layout, activePane.id) : null;
         if (pane && pane.ptyId === undefined) {
           setPanePty(projectId, activePane.id, ptyId);
-          // 恢复的布局带待续接标记 → 写 resume 命令续接上次会话。
+          // 恢复的布局带待续接标记 → 写 resume 命令续接上次会话(否决条件见
+          // resolveAutoResumeCommand:系统设置开关 / 待续接标记 / 远程 pane / id 白名单)。
           // PTY 内核缓冲 stdin,shell 就绪前写入不丢(与移动端发起会话同一时序)。
           // 只清 resumePending 标记、**保留 aiSession 身份**:codex resume 不会
           // 重新上报 SessionStart,若写完把身份也清掉,第二次重启就断代恢复不了;
           // claude 会上报新身份自然覆盖旧值。会话身份取 effect 闭包快照,
           // 规避 monitor 在 create 与 write 之间发 idle 把身份抹掉的竞态。
-          // 远程 pane 不自动续接:PTY 是 ssh 启动器,启动初期可能停在口令
-          // 交互上,预写的命令会被当作口令消费;远端会话身份也不来自本机 hook
-          const session = activePane.aiSession;
-          const resumeCmd =
-            pane.resumePending && session && !remote
-              ? buildResumeCommand(session.agent, session.sessionId)
-              : null;
+          const resumeCmd = resolveAutoResumeCommand({
+            // 开关取现值而非 autoResumeEnabled:config 不在 effect deps 里,
+            // 闭包快照可能已过期(用户在起 PTY 期间刚改了设置)
+            enabled: useAppStore.getState().config.aiAutoResume ?? true,
+            resumePending: pane.resumePending,
+            session: activePane.aiSession,
+            remote,
+          });
           if (resumeCmd) {
             clearPaneResumePendingByPty(ptyId);
             void writePtyInput(ptyId, `${resumeCmd}\r`);
@@ -289,10 +293,9 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
         {node.panes.map((pane) => {
           const isActive = pane.id === activePane.id;
           // 会话跑的是哪家 AI 就亮哪家品牌图标:hook 上报的 agent 权威,
-          // 输入检测的 detectedAgent 兜底;持有 aiSession(含重启后待续接、
-          // 尚未激活恢复的 pane)也显示 —— 图标不该等切过去恢复后才出现
-          const aiActive =
-            pane.status === 'ai-working' || pane.status === 'ai-idle' || !!pane.aiSession;
+          // 输入检测的 detectedAgent 兜底;亮不亮的判定见 paneShowsAiSession
+          // (含重启后待续接、尚未激活恢复的 pane —— 图标不该等切过去才出现)
+          const aiActive = paneShowsAiSession(pane, autoResumeEnabled);
           return (
             <div
               key={pane.id}

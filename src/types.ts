@@ -51,6 +51,8 @@ export interface AppConfig {
   trayStatusEnabled?: boolean;
   /** 托盘右键菜单最多显示的活跃项目数;undefined = 5 */
   trayMaxProjects?: number;
+  /** 启动恢复布局后自动续接上次的 AI 会话(写 resume 命令);undefined = 开启 */
+  aiAutoResume?: boolean;
   /** 拖选按住不动自动复制的静止时长(秒);undefined = 1 */
   selectionAutoCopySecs?: number;
   sshConnections: SshConnection[];

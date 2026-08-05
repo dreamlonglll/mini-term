@@ -21,6 +21,7 @@ mod theme_packs;
 mod tray;
 mod usage_stats;
 mod window_input_recovery;
+mod window_snap;
 mod window_theme;
 mod wsl_distros;
 
@@ -33,7 +34,17 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
-        .plugin(tauri_plugin_window_state::Builder::new().build())
+        // 窗口状态恢复要排除 DECORATIONS：窗口本身是无边框的（自定义标题栏），
+        // 而插件默认会把上次运行存下的 decorated 原样 set_decorations 回来 ——
+        // 老状态文件里那个 true 会让原生标题栏在自定义标题栏之上再冒出来一条。
+        .plugin(
+            tauri_plugin_window_state::Builder::new()
+                .with_state_flags(
+                    tauri_plugin_window_state::StateFlags::all()
+                        .difference(tauri_plugin_window_state::StateFlags::DECORATIONS),
+                )
+                .build(),
+        )
         .manage(pty::PtyManager::new())
         .manage(config::ConfigToken(std::sync::atomic::AtomicU64::new(0)))
         .manage(fs::FsWatcherManager::new())
@@ -107,6 +118,12 @@ pub fn run() {
                     );
                 }
             }
+            // 无边框窗口下把 Win11「贴靠布局」装回去(悬停最大化按钮弹出的分屏菜单)。
+            // 非 Windows 为空实现——那里最大化按钮是普通 DOM 元素，走前端 onClick。
+            if let Some(window) = app.get_webview_window("main") {
+                window_snap::install(&window);
+            }
+
             startup_trace::mark("setup exit");
             Ok(())
         })
@@ -192,6 +209,7 @@ pub fn run() {
             ssh_skill_registry::enable_ssh_tools,
             ssh_skill_registry::disable_ssh_tools,
             window_theme::set_window_dark_mode,
+            window_snap::set_max_button_rect,
             mobile_relay::mobile_relay_apply,
             mobile_relay::mobile_relay_status,
             mobile_relay::mobile_relay_request_pairing_code,

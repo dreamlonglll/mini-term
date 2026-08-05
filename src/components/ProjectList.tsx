@@ -27,6 +27,7 @@ import { TechIcon } from './TechIcon';
 import { BrandIcon } from './BrandIcon';
 import { inferVendor } from '../utils/inferVendor';
 import type { AiVendor } from '../utils/inferVendor';
+import { paneShowsAiSession } from '../utils/aiResume';
 import { Boxes, Package, Server } from './icons';
 import { useT } from '../i18n';
 import {
@@ -113,16 +114,17 @@ interface DropIndicator {
   forbidden?: boolean;
 }
 
-/** 收集布局树里与 AI 会话相关的 pane:正在跑(ai-*)或持有会话身份
- *  (aiSession,含重启后待续接的 pane —— 重启不该丢图标)。 */
-function collectAiPanes(node: SplitNode | null | undefined): PaneState[] {
+/** 收集布局树里与 AI 会话相关的 pane;判定与 pane 标签页的品牌图标共用
+ *  paneShowsAiSession(含重启后待续接的 pane —— 重启不该丢图标)。 */
+function collectAiPanes(
+  node: SplitNode | null | undefined,
+  autoResumeEnabled: boolean,
+): PaneState[] {
   if (!node) return [];
   if (node.type === 'leaf') {
-    return node.panes.filter(
-      (p) => p.status === 'ai-working' || p.status === 'ai-idle' || p.aiSession,
-    );
+    return node.panes.filter((p) => paneShowsAiSession(p, autoResumeEnabled));
   }
-  return node.children.flatMap((c) => collectAiPanes(c));
+  return node.children.flatMap((c) => collectAiPanes(c, autoResumeEnabled));
 }
 
 /** AI 品牌图标尺寸(px);图标间与领位图标后均留 2px 小间距,并排不重叠。 */
@@ -569,7 +571,7 @@ export function ProjectList() {
     const aiVendors: (AiVendor | null)[] = [];
     {
       const seen = new Set<string>();
-      for (const p of collectAiPanes(projectPs?.layout)) {
+      for (const p of collectAiPanes(projectPs?.layout, config.aiAutoResume ?? true)) {
         const v = inferVendor({ agent: p.aiSession?.agent ?? p.detectedAgent });
         const key = v ?? 'unknown';
         if (!seen.has(key)) {
