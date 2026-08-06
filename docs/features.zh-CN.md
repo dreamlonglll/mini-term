@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.10.5-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.10.6-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -138,15 +138,16 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 ### Git 集成
 
 - **文件状态** — 文件树显示 Git 状态颜色（修改 / 新增 / 删除 / 冲突）
+- **变更 / 历史同屏** — Git 面板为上下两个可折叠区块：更改在上、提交历史在下，中缝可拖拽调节比例（钳 15%~85%），折叠 / 展开带动画且会话内记住折叠态与比例；面板顶部仓库栏下拉切换仓库（worktree 条目标 ⎇），分支徽章点击只切历史查看分支（不 checkout，查看非 HEAD 分支时高亮提示），刷新 / Pull / Push 集中在栏上，右键仓库名可在终端打开或进入 Worktree 管理
 - **变更 Diff** — 工作区文件变更的详细 Diff，Hunk 行级解析，并排 / 内联双视图，并排模式支持拖拽调节分隔比例，字号跟随终端字体设置
-- **提交历史** — 浏览仓库提交记录，游标分页加载（默认 30 条）
+- **提交历史** — 平铺展示顶部仓库栏选中仓库的提交记录，游标分页加载（默认 30 条）
 - **分支拓扑图** — 提交历史每行左侧绘制 SVG 拓扑图，按 lane 布局画出分支、合并与直穿连线，节点按 lane 上色、合并提交实心点套外环，汇入线用分支自身颜色的贝塞尔曲线并在根部渐变融入主线；后端 revwalk 追加 TOPOLOGICAL 排序，避免时钟偏移或 rebase 后父提交排在子提交之前导致连线断裂；commit 行只标注本仓库自己检出的分支，不再把其他工作区 / 远程分支全挂上来
 - **提交 Diff** — 查看任意提交的文件变更，逐文件切换
 - **分支信息** — 本地 / 远程分支列表
 - **源码控制面板** — VS Code 风格 Changes 面板，Staged / Changes / Untracked 分组展示，支持单文件和全量 stage / unstage / discard，`Ctrl+Enter` 快速提交，列表与树形视图切换
-- **Pull / Push** — 仓库行内按钮一键同步远端，支持刷新按钮重新加载提交记录与分支信息
+- **Pull / Push** — 顶部仓库栏按钮一键同步远端，刷新按钮重新加载提交记录与分支信息
 - **多仓库发现** — 自动扫描项目目录下所有 Git 仓库（递归 5 层，跳过 `node_modules` 等）
-- **Worktree 管理** — 项目右键菜单或 Git 面板仓库行右键打开「Worktree 管理」弹窗：列出全部 worktree、基于现有分支或新建分支创建、删除（可强制）、清理失效条目，增删后即时刷新仓库列表；worktree 可一键「设为项目」或直接在终端打开，pane 支持工作目录覆盖并随布局持久化、分屏继承目录。项目根目录本身不是仓库时会向下扫描子仓库，按主工作区归并为分组列表，组头可勾选多选 / 全选，一次为每个勾选的仓库各建一个 worktree（分支下拉取各仓库分支交集，路径框语义变为父目录并预览 `<仓库名>-<分支>` 落点，失败的逐仓库列出错误）
+- **Worktree 管理** — 项目右键菜单或 Git 面板顶部仓库栏右键打开「Worktree 管理」弹窗：列出全部 worktree、基于现有分支或新建分支创建、删除（可强制）、清理失效条目，增删后即时刷新仓库列表；worktree 可一键「设为项目」或直接在终端打开，pane 支持工作目录覆盖并随布局持久化、分屏继承目录。项目根目录本身不是仓库时会向下扫描子仓库，按主工作区归并为分组列表，组头可勾选多选 / 全选，一次为每个勾选的仓库各建一个 worktree（分支下拉取各仓库分支交集，路径框语义变为父目录并预览 `<仓库名>-<分支>` 落点，失败的逐仓库列出错误）
 
 ![Git 集成](screenshots/git.png)
 
@@ -257,8 +258,8 @@ mini-term/
 │   │   ├── TerminalInstance.tsx  # xterm.js 实例 + 右键菜单 + 文件拖拽
 │   │   ├── PaneGroup.tsx         # 分屏分组容器
 │   │   ├── MarkerList.tsx        # AI 任务标记下拉列表
-│   │   ├── GitHistory.tsx        # Git 仓库树 + 提交历史 + Pull / Push
-│   │   ├── GitHistoryContent.tsx # Git 提交历史内容渲染
+│   │   ├── GitHistory.tsx        # Git 面板容器：仓库栏 + 更改/历史折叠区块 + Pull / Push
+│   │   ├── GitHistoryContent.tsx # 选中仓库的提交历史列表渲染
 │   │   ├── GitChanges.tsx        # 源码控制面板（stage / unstage / commit）
 │   │   ├── CommitDiffModal.tsx   # 提交 Diff 查看器
 │   │   ├── DiffModal.tsx         # 工作区文件 Diff 查看器

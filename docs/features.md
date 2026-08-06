@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.10.5-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.10.6-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -138,15 +138,16 @@ Watch the AI running on your desktop from your phone while you're out, and send 
 ### Git Integration
 
 - **File status** — The file tree shows Git status colors (modified / added / deleted / conflict).
+- **Changes / history in one view** — The Git panel stacks two collapsible sections: Changes on top and commit history below, with a draggable divider (clamped 15%–85%) and animated collapse / expand, remembering fold state and ratio for the session; a repo bar at the top of the panel switches repos via a dropdown (worktree entries marked ⎇), clicking the branch badge only switches which branch's history is shown (no checkout, highlighted when viewing a non-HEAD branch), refresh / Pull / Push sit on the same bar, and right-clicking the repo name opens it in a terminal or enters worktree management.
 - **Change diff** — A detailed diff of working-tree file changes, parsed at the hunk/line level, with side-by-side / inline dual views; side-by-side mode supports dragging to adjust the split ratio, and the font size follows the terminal font setting.
-- **Commit history** — Browse the repo's commit log with cursor-based pagination (30 entries by default).
+- **Commit history** — A flat list of the commit log for the repo selected in the top repo bar, with cursor-based pagination (30 entries by default).
 - **Branch topology graph** — Each history row draws an SVG topology graph on the left, laying out branch, merge, and pass-through lines by lane, coloring nodes per lane and marking merge commits with a filled dot inside an outer ring; merge-in lines use the branch's own color as a Bézier curve that gradient-blends into the mainline at its root. The backend revwalk appends TOPOLOGICAL sorting so clock skew or a rebase can't place a parent after its child and break the lines, and a commit row is only labeled with the branches this repo itself has checked out, rather than hanging every other worktree / remote branch on it.
 - **Commit diff** — View the file changes of any commit, switching file by file.
 - **Branch info** — Local / remote branch lists.
 - **Source control panel** — A VS Code-style Changes panel grouping Staged / Changes / Untracked, supporting per-file and bulk stage / unstage / discard, `Ctrl+Enter` to commit quickly, and toggling between list and tree views.
-- **Pull / Push** — In-row buttons sync with the remote in one click, with a refresh button to reload the commit log and branch info.
+- **Pull / Push** — Buttons on the top repo bar sync with the remote in one click, with a refresh button to reload the commit log and branch info.
 - **Multi-repo discovery** — Automatically scans all Git repos under the project directory (recursing 5 levels, skipping `node_modules` etc.).
-- **Worktree management** — Right-click a project or a repo row in the Git panel to open the "Worktree management" dialog: list every worktree, create one from an existing branch or a new branch, remove it (force optional), and prune stale entries, with the repo list refreshing immediately after any change; a worktree can be turned into a project in one click or opened directly in a terminal, and panes support a working-directory override that persists with the layout and is inherited by splits. When the project root itself isn't a repo, it scans downward for sub-repos and groups them by main worktree into a list whose group headers are checkable (multi-select / select-all), creating one worktree per checked repo in a single action — the branch dropdown then offers the intersection of all repos' branches, the path field becomes a parent directory previewing the `<repo>-<branch>` landing spot, and failures are listed per repo.
+- **Worktree management** — Right-click a project or the repo bar at the top of the Git panel to open the "Worktree management" dialog: list every worktree, create one from an existing branch or a new branch, remove it (force optional), and prune stale entries, with the repo list refreshing immediately after any change; a worktree can be turned into a project in one click or opened directly in a terminal, and panes support a working-directory override that persists with the layout and is inherited by splits. When the project root itself isn't a repo, it scans downward for sub-repos and groups them by main worktree into a list whose group headers are checkable (multi-select / select-all), creating one worktree per checked repo in a single action — the branch dropdown then offers the intersection of all repos' branches, the path field becomes a parent directory previewing the `<repo>-<branch>` landing spot, and failures are listed per repo.
 
 ![Git integration](screenshots/git.png)
 
@@ -257,8 +258,8 @@ mini-term/
 │   │   ├── TerminalInstance.tsx  # xterm.js instance + context menu + file drop
 │   │   ├── PaneGroup.tsx         # Split group container
 │   │   ├── MarkerList.tsx        # AI task marker dropdown
-│   │   ├── GitHistory.tsx        # Git repo tree + commit history + Pull / Push
-│   │   ├── GitHistoryContent.tsx # Git commit history content rendering
+│   │   ├── GitHistory.tsx        # Git panel container: repo bar + collapsible Changes/History sections + Pull / Push
+│   │   ├── GitHistoryContent.tsx # Selected repo's commit history list rendering
 │   │   ├── GitChanges.tsx        # Source control panel (stage / unstage / commit)
 │   │   ├── CommitDiffModal.tsx   # Commit diff viewer
 │   │   ├── DiffModal.tsx         # Working-tree file diff viewer
