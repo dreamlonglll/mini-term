@@ -71,6 +71,8 @@
   --motion-terminal-swap: 0.2s;
   --motion-tab-indicator: 0.22s;
   --motion-pane-enter: 0.26s;
+  /* Git 面板区块折叠/展开(flex-grow 补间) */
+  --motion-section-toggle: 0.22s;
   /* easeOutExpo：起步快、尾段缓，收尾有「停稳」的手感（不是弹跳） */
   --ease-overlay-in: cubic-bezier(0.16, 1, 0.3, 1);
   --ease-overlay-out: cubic-bezier(0.4, 0, 0.9, 0.6);
@@ -339,6 +341,21 @@ body.ssh-conn-dragging {
   animation: panelSwapIn var(--motion-terminal-swap) var(--ease-overlay-in);
 }
 
+/* Git 面板的折叠区块：补间 flex-grow，高度随之收放（区块 flex-basis 恒为 0，
+   高度全由 grow 决定，两块同时补间时总和不变、不会跳）。
+   拖拽调比例期间由 .is-resizing 关掉补间，否则跟不上鼠标。 */
+.git-section-body {
+  transition: flex-grow var(--motion-section-toggle) var(--ease-overlay-in);
+}
+
+.git-section-body.is-resizing {
+  transition: none;
+}
+
+.git-section-chevron {
+  transition: transform var(--motion-section-toggle) var(--ease-overlay-in);
+}
+
 
 /* AI 运行中的状态点。形状是 spinner（底圈 + 一段亮弧），就得真的转起来；
    匀速旋转也比呼吸/闪烁更贴「正在进行」的语义，且不抢注意力。
@@ -415,6 +432,13 @@ body.ssh-conn-dragging {
 
   .drawer-tab-indicator {
     transition-duration: var(--motion-tab-indicator) !important;
+  }
+
+  /* 同理：Git 面板区块的折叠/展开照常播（.is-resizing 的 transition:none
+     把 property 清空了，这条 duration 覆盖对拖拽期间不起作用，仍旧跟手） */
+  .git-section-body,
+  .git-section-chevron {
+    transition-duration: var(--motion-section-toggle) !important;
   }
 
   .overlay-backdrop.is-closing,
