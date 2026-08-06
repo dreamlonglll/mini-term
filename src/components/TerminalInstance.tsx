@@ -4,7 +4,7 @@ import { useAppStore } from '../store';
 import { getOrCreateTerminal, getCachedTerminal, activateWebgl, getTerminalTheme, DARK_TERMINAL_THEME, writePtyInput, copyTerminalSelection, pasteToTerminal, resolveTerminalFontFamily, reloadLigaturesForPty, resetRenderStateForPty } from '../utils/terminalCache';
 import { getResolvedTheme } from '../utils/themeManager';
 import { showContextMenu, type MenuEntry } from '../utils/contextMenu';
-import { isFileDragging, getFileDragPath } from '../utils/fileDragState';
+import { isFileDragging, getFileDragPath, FILE_DRAG_CANCEL_EVENT } from '../utils/fileDragState';
 import { useT, t } from '../i18n';
 import type { SshConnection } from '../types';
 import '@xterm/xterm/css/xterm.css';
@@ -222,6 +222,14 @@ export function TerminalInstance({ ptyId }: Props) {
 
   // 内部拖拽（FileTree → 终端）：自定义鼠标事件，规避 WebView2 dragDropEnabled 拦截
   const dropZoneRef = useRef<HTMLDivElement>(null);
+
+  // 内部拖拽被 Esc 取消：高亮平时靠 mousemove/mouseleave 维护，而按 Esc 时鼠标
+  // 通常停在终端上一动不动，等不到鼠标事件——只能由取消事件把它撤下来
+  useEffect(() => {
+    const handler = () => setFileDrag(false);
+    window.addEventListener(FILE_DRAG_CANCEL_EVENT, handler);
+    return () => window.removeEventListener(FILE_DRAG_CANCEL_EVENT, handler);
+  }, []);
 
   // 拖选停留自动复制(时长可配,默认 1s,0 = 关闭):按住左键且鼠标静止超过
   // 该时长后,若有选区则复制并显示「已复制」气泡。
