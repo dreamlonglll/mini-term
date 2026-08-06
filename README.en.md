@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.10.2-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.10.3-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -55,9 +55,9 @@ Status aggregates layer by layer from pane → tab → project (`error > ai-work
 - Taskbar flashing (Windows) / Dock bouncing (macOS), only when the window is unfocused
 - A notification sound (a built-in synthesized tone, or your own audio file)
 
-And once the window is out of sight, the **system tray status light** takes over: yellow = awaiting confirmation, blue = working, green = unread completion, gray = quiet. Right-click the tray icon for per-project status — you know whether to come back without switching back.
+And once the window is out of sight, the **status bar icon** takes over (Windows tray / macOS menu bar): yellow = awaiting confirmation, blue = working, green = unread completion, gray = quiet. Left-click and you land **on the session that needs you** — it switches projects, activates the specific pane and focuses the terminal, prioritized as "awaiting confirmation / error > finished first > working", the same ordering the title bar status light uses. Picking a project from the right-click menu jumps to the pane in that project most in need of attention. If you'd rather it not change your current view, turn that off in Settings.
 
-Once hooks are reporting, they are the **only** status source for that pane — output activity no longer participates. (A TUI's idle redraws used to read as "back to work," replaying one finished task as a completion over and over.) Completion is keyed to the `Stop` event alone, so a permission prompt — also a "waiting for you" state — is no longer announced as a finished task.
+Once hooks are reporting, they are the status source for that pane: completion is keyed to the `Stop` event alone, so a permission prompt — also a "waiting for you" state — is not announced as a finished task. The remaining trouble is a **stuck badge**: `Stop` simply doesn't fire in several cases (a turn ending on an API error, you hitting Esc to interrupt), each of which is now covered by its own official event. On top of that sits a stall check: when both the status and the terminal output have been silent for 10 seconds the badge comes down, and if an exit was already triggered (Ctrl+D, double Ctrl+C, `/exit`) the pane is treated as exited. The fallback's verdict is written once and never oscillates, so there is no repeat of the early-version behavior where one task announced itself complete every twenty-odd seconds.
 
 ### 📱 Watch your desktop AI from your phone, anywhere
 
@@ -108,7 +108,7 @@ Behind the CLI is a **machine-wide singleton daemon** holding the persistent con
 - A **project sidebar** for multiple workspaces, with **up to 3 levels of nested groups**, drag-to-reorder, and drag-a-folder-from-Explorer to add
 - **Arbitrarily nested horizontal / vertical splits**, drag to adjust ratios; tabs, splits, and window geometry all persist and restore on restart
 - **Terminal caching** — switching projects, tabs, or panes never rebuilds the xterm instance, so nothing is lost; lazy startup creates a PTY only for the visible pane, so more history projects never means a slower launch
-- **100k-line scrollback** with correct CSI 3J handling, so Codex transcript folding and `/clear` behave faithfully; the Windows build bundles a pinned official ConPTY runtime for consistent behavior across Windows versions
+- **Configurable scrollback** (10,000 lines by default; lowering it in Settings takes effect immediately and frees the memory) with correct CSI 3J handling, so Codex transcript folding and `/clear` behave faithfully; the Windows build bundles a pinned official ConPTY runtime for consistent behavior across Windows versions
 - **AI session history** — read local Claude / Codex records, right-click to copy the resume command, or read the full conversation right there (Markdown rendering + `Ctrl+F` search)
 - **AI task markers** — every Enter inside a session drops a marker; `Ctrl+Shift+↑/↓` jumps between past submissions
 
@@ -138,6 +138,7 @@ A VS Code-style **Changes panel** (Staged / Changes / Untracked groups, per-file
 | **Dwell-to-copy selection** | Hold the mouse still after drag-selecting and the selection is copied with a "Copied" tip; dwell time configurable (0 = off) |
 | **Project descriptions** | Right-click to add a gray one-liner next to the project name — tell a row of worktree sub-projects apart at a glance |
 | **Zero network requests at startup** | Fonts bundled locally (Google Fonts link removed), heavy modals all lazy-loaded; main bundle gzip down from 631KB to 378KB |
+| **End-to-end backpressure** | When you `cat` a huge file or an AI floods the pane, a growing frontend backlog pushes back all the way to the flooding process — a slow terminal slows the process down instead of piling everything into memory. And if the renderer ever gets killed and reloads, PTYs left over from the previous round are reclaimed first, so one crash doesn't leak a whole set |
 | **Three themes + Blueprint skin** | Auto / Light / Dark (Warm Carbon), plus an optional sci-fi Blueprint skin; the title bar matches the theme, with no light flash on startup |
 | **Custom title bar** | Frameless window with a self-drawn title bar that follows your theme instead of the system's grey strip, adapted per platform — window controls on the right for Windows / Linux (Win11 Snap Layouts still pop up when you hover the maximize button), native traffic lights kept on macOS. The status light on the right aggregates AI state across every project; click it to jump to the next session needing you (earliest finished first) |
 | **Bilingual UI** | One click re-renders the whole interface in English / 中文, auto-detected from the system on first launch; in-house lightweight i18n, no extra runtime dependency |
@@ -156,7 +157,7 @@ A VS Code-style **Changes panel** (Staged / Changes / Untracked groups, per-file
 | PTY / Git | portable-pty · git2 · notify + ignore |
 | Usage stats | rusqlite local ledger · recharts trend charts |
 | Mobile relay | axum + tokio WebSocket (`relay-server/`) · React + Vite PWA (`mobile/`) |
-| Tests | **566 Rust tests** (513 desktop + 53 relay) plus 51 Node tests |
+| Tests | **601 Rust tests** (548 desktop + 53 relay) plus 74 Node tests |
 
 ---
 

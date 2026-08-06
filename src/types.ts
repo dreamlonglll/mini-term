@@ -22,6 +22,8 @@ export interface AppConfig {
   uiFontFamily?: string;
   terminalFontFamily?: string;
   terminalLigatures?: boolean;
+  /** 每个终端保留的回滚行数。renderer 内存的大头,见 terminalCache 的 resolveScrollback */
+  terminalScrollback?: number;
   layoutSizes?: number[];
   middleColumnSizes?: number[];
   theme: 'auto' | 'light' | 'dark';
@@ -47,10 +49,12 @@ export interface AppConfig {
   lastActiveProjectId?: string;
   hookEnabled: boolean;
   smartCopyPaste: boolean;
-  /** 菜单栏项目状态灯总开关;undefined = 开启 */
+  /** 状态栏(托盘/菜单栏)项目状态灯总开关;undefined = 开启 */
   trayStatusEnabled?: boolean;
   /** 托盘右键菜单最多显示的活跃项目数;undefined = 5 */
   trayMaxProjects?: number;
+  /** 左键点状态栏图标时除唤起窗口外还定位到「下一个该处理」的会话;undefined = 开启 */
+  trayClickFocus?: boolean;
   /** 启动恢复布局后自动续接上次的 AI 会话(写 resume 命令);undefined = 开启 */
   aiAutoResume?: boolean;
   /** 拖选按住不动自动复制的静止时长(秒);undefined = 1 */

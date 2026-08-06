@@ -27,6 +27,7 @@ import { useMarkerHotkeys } from './hooks/useMarkerHotkeys';
 import { useGlobalHotkeys } from './hooks/useGlobalHotkeys';
 import { useExternalFileDrop } from './hooks/useExternalFileDrop';
 import { collectPanes } from './utils/layoutOps';
+import { focusAttentionTarget } from './utils/attentionJump';
 import { checkForUpdate, type ReleaseInfo } from './utils/updateChecker';
 import { applyTheme } from './utils/themeManager';
 import { applyUiFontFamily } from './utils/fontManager';
@@ -99,6 +100,25 @@ export function App() {
     // 静默运行。写盘由令牌把关:load_config 成功才发放令牌,save_config
     // 必须携带当前令牌——空白页面/加载失败的页面天然没有写盘资格,
     // 防止空状态覆盖磁盘上的完整配置
+    // 回收上一轮页面遗留的 PTY,必须早于任何 create_pty。
+    //
+    // WebView2 的 renderer 被 OOM 杀掉后会重载页面,而 PtyManager 活在主进程里
+    // 毫发无损:重载后的前端按 savedLayout 恢复出的是**全新** pane(新 id、无
+    // ptyId),再各自新建 PTY,旧的 shell/AI 进程与它们的线程就此再无人引用却
+    // 继续运行 —— 崩一次就漏一整套,内存压力更大、下次崩得更快。
+    // 首次启动时后端存量为空,这里是个 no-op。
+    const reapOrphanPtys = async () => {
+      try {
+        const killed = await invoke<number[]>('kill_all_ptys');
+        if (killed.length > 0) {
+          console.warn(`[startup] 回收了 ${killed.length} 个上一轮页面遗留的 PTY:`, killed);
+        }
+      } catch (e) {
+        // 回收失败不该挡住启动:代价只是这一轮继续带着孤儿跑
+        console.error('[startup] 孤儿 PTY 回收失败:', e);
+      }
+    };
+
     const loadWithRetry = async (): Promise<LoadedConfig> => {
       markStartup('load_config invoke');
       let lastErr: unknown;
@@ -112,7 +132,7 @@ export function App() {
       }
       throw lastErr;
     };
-    loadWithRetry().then(({ config: cfg, token }) => {
+    reapOrphanPtys().then(loadWithRetry).then(({ config: cfg, token }) => {
       markStartup('load_config resolved');
       setConfigToken(token);
       setConfig(cfg);
@@ -263,30 +283,20 @@ export function App() {
     return () => { unlisten.then((fn) => fn()); };
   }, []);
 
-  // 点击托盘 → 跳到最需要注意的项目(黄 > 蓝 > 绿 同托盘优先级)
+  // 点状态栏图标 → 和标题栏状态灯同一套落点:切到项目并激活那个 pane。
+  // 关掉「点击定位」时后端已经把窗口唤起了,这里就什么都不动,留在原地
   useTauriEvent<null>('tray-clicked', useCallback(() => {
-    const { projectStates, unreadDonePaneIds, setActiveProject } = useAppStore.getState();
-    let workingPid: string | null = null;
-    let donePid: string | null = null;
-    for (const [pid, ps] of projectStates) {
-      if (!ps.layout) continue;
-      for (const pane of collectPanes(ps.layout)) {
-        if (pane.status === 'error' || pane.attention) {
-          setActiveProject(pid);
-          return;
-        }
-        if (pane.status === 'ai-working') workingPid ??= pid;
-        if (unreadDonePaneIds.has(pane.id)) donePid ??= pid;
-      }
-    }
-    const target = workingPid ?? donePid;
-    if (target) setActiveProject(target);
+    if (!(useAppStore.getState().config.trayClickFocus ?? true)) return;
+    focusAttentionTarget();
   }, []));
 
-  // 托盘右键菜单点击项目 → 直接跳到该项目
+  // 状态栏右键菜单点项目 → 切到该项目,并定位到它内部最该处理的那个 pane
   useTauriEvent<string>('tray-project-clicked', useCallback((projectId) => {
     const { config, setActiveProject } = useAppStore.getState();
-    if (config.projects.some((p) => p.id === projectId)) setActiveProject(projectId);
+    if (!config.projects.some((p) => p.id === projectId)) return;
+    // 菜单是上一次推送的快照,点下去时那些 pane 可能已经安静了 —— 定位不到目标
+    // 也要把项目切过去,不能让这一下没反应
+    if (!focusAttentionTarget(projectId)) setActiveProject(projectId);
   }, []));
 
   // 托盘开关/上限配置变化时立即生效(签名含 enabled,重复调用被去重)

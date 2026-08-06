@@ -15,6 +15,7 @@
     "src/utils/layoutRestore.ts",
     "src/utils/themeManager.ts",
     "src/utils/terminalSnapshot.ts",
+    "src/utils/terminalScrollback.ts",
     "src/utils/ptyWriteQueue.ts",
     "src/utils/wslPath.ts",
     "src/utils/inferVendor.ts",
@@ -23,6 +24,7 @@
     "src/utils/usageDates.ts",
     "src/utils/modelPricing.ts",
     "src/utils/aiCompletion.ts",
-    "src/utils/aiResume.ts"
+    "src/utils/aiResume.ts",
+    "src/utils/attentionTarget.ts"
   ]
 }

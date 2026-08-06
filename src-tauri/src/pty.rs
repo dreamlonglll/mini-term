@@ -426,6 +426,28 @@ const FOCUS_COOLDOWN: Duration = Duration::from_millis(800);
 const FOCUS_IN_SEQ: &str = "\x1b[I";
 const FOCUS_OUT_SEQ: &str = "\x1b[O";
 
+/// reader → flush 之间的有界通道容量(条,每条 ≤ READ_CHUNK 字节)。
+///
+/// 此前用的是无界 `mpsc::channel`:reader 以 ConPTY 的最快速度读,前端只要跟不上,
+/// 这个队列就一路涨到内存耗尽。换成有界后队列满时 reader 阻塞在 `send`,不再从
+/// ConPTY 读,背压传导到刷屏进程本身——这正是真实终端的行为(慢终端会拖慢
+/// `cat` 大文件,而不是把数据全缓存下来)。
+/// 512 × 4KB = 2MB 在途上限,足够吸收正常的突发,又不至于攒出可观的常驻内存。
+const OUTPUT_CHANNEL_CAPACITY: usize = 512;
+
+/// reader 单次读取的缓冲区大小
+const READ_CHUNK: usize = 4096;
+
+/// flush 缓冲区空闲时保留的容量上限(超出部分归还分配器)
+const PENDING_KEEP_CAPACITY: usize = 64 * 1024;
+
+/// 流控暂停期间 flush 线程的轮询间隔
+const FLOW_PAUSE_POLL: Duration = Duration::from_millis(8);
+
+/// 流控暂停的最长时限。前端崩溃/卡死后不会再发 resume,超时即强制恢复投递,
+/// 否则用户的 shell 会永久卡在一次写上(表现为终端完全没反应)。
+const MAX_FLOW_PAUSE: Duration = Duration::from_secs(30);
+
 /// 命令词对应的 AI 命令名(basename 归一后精确匹配);非 AI 命令返回 None。
 fn ai_command_name(word: &str) -> Option<&'static str> {
     let word = word.trim_matches(|c| matches!(c, '"' | '\'' | '`'));
@@ -530,6 +552,10 @@ pub struct PtyManager {
     tui_redraw_cooldown_until: Arc<Mutex<HashMap<u32, Instant>>>,
     /// SSH 密码自动填充状态(arm_ssh_autofill 注册,命中密码提示后回写)
     ssh_autofill: Arc<Mutex<HashMap<u32, SshAutofillState>>>,
+    /// 前端流控:被前端要求暂停投递的 pty 集合(见 `set_pty_flow_paused`)。
+    /// 值是暂停开始时刻,超过 `MAX_FLOW_PAUSE` 强制恢复——前端崩溃/卡死时
+    /// 不能让 shell 永久卡在写阻塞上。
+    flow_paused: Arc<Mutex<HashMap<u32, Instant>>>,
 }
 
 impl PtyManager {
@@ -546,6 +572,53 @@ impl PtyManager {
             pending_submits: Arc::new(Mutex::new(HashMap::new())),
             tui_redraw_cooldown_until: Arc::new(Mutex::new(HashMap::new())),
             ssh_autofill: Arc::new(Mutex::new(HashMap::new())),
+            flow_paused: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// 清除某个 pty 的全部旁路状态(不含 `instances` 本身,也不碰 hook)。
+    ///
+    /// kill_pty 与「PTY 自然退出」两条路径必须清同一批表:此前自然退出分支只
+    /// 清了 instances + ssh_autofill,余下 8 张表的条目会一直留到用户手动关
+    /// pane 才被 kill_pty 收走——用户敲 `exit` 后把 pane 开着不动,这些残留就
+    /// 永远不回收。抽成一处后新增字段不会再漏掉其中一条路径。
+    pub fn purge_pty_state(&self, pty_id: u32) {
+        self.last_output.lock().unwrap().remove(&pty_id);
+        self.ai_sessions.lock().unwrap().remove(&pty_id);
+        self.ai_started.lock().unwrap().remove(&pty_id);
+        self.input_states.lock().unwrap().remove(&pty_id);
+        self.last_ctrlc.lock().unwrap().remove(&pty_id);
+        self.last_enter.lock().unwrap().remove(&pty_id);
+        self.pending_submits.lock().unwrap().remove(&pty_id);
+        self.ssh_autofill.lock().unwrap().remove(&pty_id);
+        self.tui_redraw_cooldown_until.lock().unwrap().remove(&pty_id);
+        self.flow_paused.lock().unwrap().remove(&pty_id);
+    }
+
+    /// 前端流控开关。暂停期间 flush 线程不再从 channel 取数据,channel 塞满后
+    /// reader 线程阻塞在 send 上,背压一路传导回 ConPTY —— 刷屏的进程自己会被
+    /// 写阻塞而减速,这正是真实终端的行为。
+    pub fn set_flow_paused(&self, pty_id: u32, paused: bool) {
+        let mut map = self.flow_paused.lock().unwrap();
+        if paused {
+            map.entry(pty_id).or_insert_with(Instant::now);
+        } else {
+            map.remove(&pty_id);
+        }
+    }
+
+    /// 是否处于暂停投递状态。超过 `MAX_FLOW_PAUSE` 视为前端失联,强制恢复:
+    /// 宁可前端被数据淹没,也不能让用户的 shell 永久卡死在一次写上。
+    fn is_flow_paused(&self, pty_id: u32) -> bool {
+        let mut map = self.flow_paused.lock().unwrap();
+        match map.get(&pty_id) {
+            Some(since) if since.elapsed() < MAX_FLOW_PAUSE => true,
+            Some(_) => {
+                map.remove(&pty_id);
+                eprintln!("[pty] pty {} 流控暂停超时,强制恢复投递", pty_id);
+                false
+            }
+            None => false,
         }
     }
 
@@ -556,6 +629,16 @@ impl PtyManager {
     pub fn has_recent_output(&self, pty_id: u32, within: Duration) -> bool {
         let map = self.last_output.lock().unwrap();
         map.get(&pty_id).map_or(false, |t| t.elapsed() < within)
+    }
+
+    /// 测试用:伪造一次 PTY 输出时间戳。生产路径只由 reader 线程在
+    /// flush 时写入(且受 TUI 重绘冷却窗口约束),单测里没法真起 PTY。
+    #[cfg(test)]
+    pub fn note_output_for_test(&self, pty_id: u32) {
+        self.last_output
+            .lock()
+            .unwrap()
+            .insert(pty_id, Instant::now());
     }
 
     pub fn is_ai_session(&self, pty_id: u32) -> bool {
@@ -651,12 +734,6 @@ impl PtyManager {
                 disarm_on_input,
             },
         );
-    }
-
-    /// 无条件清除某个 pty 的 SSH 密码自动填充状态(含驻留的明文密码)。
-    /// 用于 pty 被 kill / 自然退出时的内存清理,不看 `disarm_on_input`。
-    pub fn clear_ssh_autofill(&self, pty_id: u32) {
-        self.ssh_autofill.lock().unwrap().remove(&pty_id);
     }
 
     /// 用户向 PTY 真实输入时调用:仅当该 autofill 标记了 `disarm_on_input` 才解除并清除
@@ -1024,13 +1101,15 @@ pub fn create_pty(
     let mut reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
     let master = pair.master;
 
-    // Channel + flush 定时器实现 16ms 批量缓冲
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    // 有界 channel + flush 定时器实现 16ms 批量缓冲。
+    // 有界是关键:队列满时下面的 `send` 阻塞,reader 停止从 ConPTY 读,
+    // 背压直达刷屏进程(见 OUTPUT_CHANNEL_CAPACITY)。
+    let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(OUTPUT_CHANNEL_CAPACITY);
     let instances_clone = state.instances.clone();
     let pty_id_for_reader = pty_id;
 
     thread::spawn(move || {
-        let mut buf = [0u8; 4096];
+        let mut buf = [0u8; READ_CHUNK];
         loop {
             match reader.read(&mut buf) {
                 Ok(0) => break,
@@ -1053,6 +1132,12 @@ pub fn create_pty(
         let mut pending = Vec::new();
 
         loop {
+            // 前端缓冲高于水位时不取新数据也不 emit:channel 随即塞满,
+            // reader 阻塞,ConPTY 背压生效。`pending` 原样留到恢复后再发。
+            while mgr_flush.is_flow_paused(pty_id_for_reader) {
+                thread::sleep(FLOW_PAUSE_POLL);
+            }
+
             match rx.recv_timeout(Duration::from_millis(16)) {
                 Ok(data) => {
                     pending.extend(data);
@@ -1087,9 +1172,10 @@ pub fn create_pty(
                         }
                     };
 
-                    // PTY 自然退出(前端未必调 kill_pty):无条件清除残留的 SSH 密码自动
-                    // 填充状态,避免明文密码在断连后仍驻留内存。
-                    mgr_flush.clear_ssh_autofill(pty_id_for_reader);
+                    // PTY 自然退出(前端未必调 kill_pty):走与 kill_pty 相同的全量
+                    // 清理,不再只清 ssh_autofill —— 用户敲 exit 后把 pane 开着不动
+                    // 时,余下 8 张表的条目此前会一直留到手动关 pane 才被回收。
+                    mgr_flush.purge_pty_state(pty_id_for_reader);
 
                     let _ = app_flush.emit(
                         "pty-exit",
@@ -1188,6 +1274,12 @@ pub fn create_pty(
                 } else {
                     pending.clear();
                 }
+
+                // clear() 不还容量:一次刷屏撑出来的缓冲区会按峰值大小常驻到
+                // PTY 结束。空闲后收回,只留一次批量的余量。
+                if pending.capacity() > PENDING_KEEP_CAPACITY {
+                    pending.shrink_to(PENDING_KEEP_CAPACITY);
+                }
             }
         }
     });
@@ -1242,10 +1334,24 @@ fn write_pty_chunked(writer: &mut dyn Write, data: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 这一次写入是否为「打断当前 AI 任务」的按键。
+///
+/// 只认单独一个字节的裸 Esc / Ctrl+C：xterm.js 把方向键、功能键等 CSI 序列
+/// （`\x1b[A` …）一次性交给 onData，粘贴同理，长度一律大于 1，因此等值比较
+/// 足以把它们排除掉，不需要解析转义状态机。
+///
+/// 单次 Ctrl+C 在 AI 里是「取消当前任务」（连按两次才退出，见
+/// `track_input_with_line_snapshot`），Esc 同理，两者都不产生 hook 事件。
+fn is_interrupt_key(data: &str) -> bool {
+    data == "\x1b" || data == "\x03"
+}
+
 #[tauri::command]
 pub fn write_pty(
     app: tauri::AppHandle,
     state: tauri::State<'_, PtyManager>,
+    hook_state: tauri::State<'_, crate::hook_server::HookState>,
+    emitter: tauri::State<'_, crate::process_monitor::StatusEmitter>,
     pty_id: u32,
     data: String,
     line_snapshot: Option<String>,
@@ -1269,6 +1375,22 @@ pub fn write_pty(
         write_pty_chunked(&mut *instance.writer, &data)?;
     }
     state.track_input_with_line_snapshot(pty_id, &data, line_snapshot.as_deref());
+
+    // 用户打断 AI：Claude 在中断时不发任何 hook 事件（官方文档：`Stop` hooks
+    // "don't fire on user interrupts"），状态会一直停在 ai-working。这里补一刀
+    // 让它收敛到 ai-idle —— 判定与副作用都在 note_user_interrupt 里，含「只动
+    // hook 已启用且正在 ai-working 的 pane」与「cause=Interrupt 不算完成」两道闸。
+    // 放在 track_input 之后：双击 Ctrl+C 真退出的场景，紧随其后的 SessionEnd
+    // 会把状态进一步落到 idle，这一刀只是让中间那段不至于显示成「工作中」。
+    if is_interrupt_key(&data) {
+        crate::hook_server::note_user_interrupt(
+            &app,
+            &hook_state,
+            &emitter,
+            pty_id,
+            state.ai_session_agent(pty_id),
+        );
+    }
 
     for submit in state.drain_submits(pty_id) {
         let _ = app.emit(
@@ -1325,21 +1447,55 @@ pub fn kill_pty(
     hook_state: tauri::State<'_, crate::hook_server::HookState>,
     pty_id: u32,
 ) -> Result<(), String> {
+    kill_pty_inner(&state, &hook_state, pty_id);
+    Ok(())
+}
+
+/// 杀掉全部存量 PTY,返回被回收的 id 列表。
+///
+/// 前端在页面加载时(load_config 之前)调用。WebView2 的 renderer 进程被 OOM
+/// 杀掉后会重载页面,而 `PtyManager` 活在主进程里毫发无损:重载后的前端按
+/// `savedLayout` 恢复布局时给每个 pane 发的是**新** pane id、并新建 PTY,
+/// 旧 PTY(shell 进程 + AI 进程 + 每个 PTY 两条线程)就此再无人引用却继续运行,
+/// 输出打到前端因 cache miss 被丢弃,process_monitor 还在轮询这些幽灵。
+/// 于是崩一次内存压力更大、下次崩得更快,形成正反馈。这里在恢复布局前先把
+/// 存量清空,把那条正反馈掐断。
+///
+/// 正常首次启动时存量为空,是个 no-op。
+#[tauri::command]
+pub fn kill_all_ptys(
+    state: tauri::State<'_, PtyManager>,
+    hook_state: tauri::State<'_, crate::hook_server::HookState>,
+) -> Result<Vec<u32>, String> {
+    let ids = state.get_pty_ids();
+    for id in &ids {
+        kill_pty_inner(&state, &hook_state, *id);
+    }
+    if !ids.is_empty() {
+        eprintln!("[pty] 页面加载:回收 {} 个孤儿 PTY {:?}", ids.len(), ids);
+    }
+    Ok(ids)
+}
+
+/// 前端流控开关。前端积压的待解析数据超过高水位时暂停,回落到低水位时恢复。
+#[tauri::command]
+pub fn set_pty_flow_paused(
+    state: tauri::State<'_, PtyManager>,
+    pty_id: u32,
+    paused: bool,
+) -> Result<(), String> {
+    state.set_flow_paused(pty_id, paused);
+    Ok(())
+}
+
+fn kill_pty_inner(
+    state: &PtyManager,
+    hook_state: &crate::hook_server::HookState,
+    pty_id: u32,
+) {
     // Remove metadata maps immediately so subsequent lookups return nothing.
     let instance = state.instances.lock().unwrap().remove(&pty_id);
-    state.last_output.lock().unwrap().remove(&pty_id);
-    state.ai_sessions.lock().unwrap().remove(&pty_id);
-    state.ai_started.lock().unwrap().remove(&pty_id);
-    state.input_states.lock().unwrap().remove(&pty_id);
-    state.last_ctrlc.lock().unwrap().remove(&pty_id);
-    state.last_enter.lock().unwrap().remove(&pty_id);
-    state.pending_submits.lock().unwrap().remove(&pty_id);
-    state.ssh_autofill.lock().unwrap().remove(&pty_id);
-    state
-        .tui_redraw_cooldown_until
-        .lock()
-        .unwrap()
-        .remove(&pty_id);
+    state.purge_pty_state(pty_id);
     // 清理 hook 状态(含已结束会话墓碑)
     hook_state.purge(pty_id);
 
@@ -1363,8 +1519,6 @@ pub fn kill_pty(
             drop(inst);
         });
     }
-
-    Ok(())
 }
 
 /// 为某个 pty 注册 SSH 密码自动填充。前端在写入 `ssh` 命令前调用(连接配有密码时)。
@@ -1384,6 +1538,29 @@ pub fn arm_ssh_autofill(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 打断键识别:只认单独一个字节的裸 Esc / Ctrl+C。方向键等 CSI 序列由
+    /// xterm.js 一次性发来(`\x1b[A`),不能因为首字节是 Esc 就当成打断——否则
+    /// 用户翻个历史记录就把「工作中」徽章打灭了。
+    #[test]
+    fn interrupt_key_only_matches_bare_esc_and_ctrl_c() {
+        assert!(is_interrupt_key("\x1b"));
+        assert!(is_interrupt_key("\x03"));
+
+        for data in [
+            "\x1b[A",    // ↑
+            "\x1b[B",    // ↓
+            "\x1b[1;5C", // Ctrl+→
+            "\x1bOP",    // F1
+            "\x1b[I",    // 焦点进入
+            "\x03\x03",  // 一次写入里的两个 Ctrl+C
+            "\x1b\x1b",
+            "",
+            "esc",
+        ] {
+            assert!(!is_interrupt_key(data), "误判为打断键: {:?}", data);
+        }
+    }
 
     #[test]
     fn detect_claude_command() {
@@ -1946,12 +2123,88 @@ mod tests {
     }
 
     #[test]
-    fn clear_ssh_autofill_removes_regardless_of_flag() {
+    fn purge_removes_ssh_autofill_regardless_of_flag() {
         // 无条件清理(kill / 自然退出):不看 disarm_on_input 都要清掉明文密码。
         let mgr = PtyManager::new();
         mgr.arm_ssh_autofill(9, "secret".into(), false);
-        mgr.clear_ssh_autofill(9);
+        mgr.purge_pty_state(9);
         assert!(!mgr.ssh_autofill.lock().unwrap().contains_key(&9));
+    }
+
+    /// 回归测试(PTY 自然退出漏清旁路状态):此前自然退出分支只清 ssh_autofill,
+    /// 用户敲 `exit` 后把 pane 开着不动,余下 8 张表的条目会一直残留到手动关
+    /// pane。purge_pty_state 必须把每一张都清空——漏掉任何一张,这条断言就红。
+    #[test]
+    fn purge_clears_every_side_table() {
+        let mgr = PtyManager::new();
+        let id = 3;
+
+        mgr.track_input(id, "claude\r"); // ai_sessions / ai_started / last_enter / input_states
+        mgr.track_input(id, "abc"); // input_states 里留下半行
+        mgr.track_input(id, "\x03"); // last_ctrlc
+        mgr.last_output.lock().unwrap().insert(id, Instant::now());
+        mgr.bump_cooldown(id, RESIZE_COOLDOWN);
+        mgr.arm_ssh_autofill(id, "secret".into(), false);
+        mgr.set_flow_paused(id, true);
+        mgr.pending_submits
+            .lock()
+            .unwrap()
+            .entry(id)
+            .or_default()
+            .push(UserSubmit {
+                line: "hi".into(),
+                ts: 0,
+            });
+
+        mgr.purge_pty_state(id);
+
+        assert!(mgr.last_output.lock().unwrap().is_empty(), "last_output 未清");
+        assert!(mgr.ai_sessions.lock().unwrap().is_empty(), "ai_sessions 未清");
+        assert!(mgr.ai_started.lock().unwrap().is_empty(), "ai_started 未清");
+        assert!(mgr.input_states.lock().unwrap().is_empty(), "input_states 未清");
+        assert!(mgr.last_ctrlc.lock().unwrap().is_empty(), "last_ctrlc 未清");
+        assert!(mgr.last_enter.lock().unwrap().is_empty(), "last_enter 未清");
+        assert!(
+            mgr.pending_submits.lock().unwrap().is_empty(),
+            "pending_submits 未清"
+        );
+        assert!(mgr.ssh_autofill.lock().unwrap().is_empty(), "ssh_autofill 未清");
+        assert!(
+            mgr.tui_redraw_cooldown_until.lock().unwrap().is_empty(),
+            "tui_redraw_cooldown_until 未清"
+        );
+        assert!(mgr.flow_paused.lock().unwrap().is_empty(), "flow_paused 未清");
+    }
+
+    /// 流控暂停超时后强制恢复:前端崩溃/卡死不再发 resume 时,shell 不能被
+    /// 永久卡在写阻塞上(表现为终端完全没反应)。
+    #[test]
+    fn flow_pause_expires_after_max_duration() {
+        let mgr = PtyManager::new();
+        mgr.set_flow_paused(1, true);
+        assert!(mgr.is_flow_paused(1), "刚暂停应处于暂停态");
+
+        // 把暂停起点回拨到超时之外,模拟前端失联
+        mgr.flow_paused
+            .lock()
+            .unwrap()
+            .insert(1, Instant::now() - MAX_FLOW_PAUSE - Duration::from_secs(1));
+
+        assert!(!mgr.is_flow_paused(1), "超时后应强制恢复投递");
+        assert!(
+            mgr.flow_paused.lock().unwrap().is_empty(),
+            "强制恢复时应顺手清掉记录,不留下每次都要重判的死条目"
+        );
+    }
+
+    #[test]
+    fn flow_pause_is_per_pty() {
+        let mgr = PtyManager::new();
+        mgr.set_flow_paused(1, true);
+        assert!(mgr.is_flow_paused(1));
+        assert!(!mgr.is_flow_paused(2), "流控不得波及其他 pane");
+        mgr.set_flow_paused(1, false);
+        assert!(!mgr.is_flow_paused(1));
     }
 
     // === WSL UNC 启动器重写检测 ===

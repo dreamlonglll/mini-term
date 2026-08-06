@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.10.2-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.10.3-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -44,7 +44,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 - **多标签管理** — 每个项目独立标签页，拖拽排序，状态图标一目了然
 - **递归分屏** — 横向 / 纵向任意嵌套分屏，Allotment 拖拽调整比例
 - **高性能渲染** — xterm.js v6 + WebGL 加速，自动降级为 Canvas；启用最小对比度，修复 Claude 提问文字在暗色下与背景近乎同色不可见的问题
-- **10 万行滚动缓冲** — 主缓冲区最多保留 10 万行，同时全局遵循标准 CSI 3J（ED3）；Codex 等应用可删除流式临时内容并重放折叠后的最终 transcript，`/clear` 也能真正清除旧历史；alternate screen 切换仍被拦截，TUI overlay 留在主缓冲区并保持滚动条可用。Windows 版内置并预载固定版本的官方 ConPTY 兼容运行时（资源校验失败时自动回退系统 ConPTY），让不同 Windows 版本下的 Codex 滚动与 transcript 折叠行为保持一致
+- **滚动缓冲行数可调** — 主缓冲区保留行数可在设置里调整（默认 1 万行，改小当场生效并释放内存；xterm 每行按列数分配内存，早期硬编码的 10 万行意味着单个终端最高吃掉两百多 MB，而终端只在关闭分屏时才销毁，多项目多分屏叠加足以把渲染进程推到 OOM），同时全局遵循标准 CSI 3J（ED3）；Codex 等应用可删除流式临时内容并重放折叠后的最终 transcript，`/clear` 也能真正清除旧历史；alternate screen 切换仍被拦截，TUI overlay 留在主缓冲区并保持滚动条可用。Windows 版内置并预载固定版本的官方 ConPTY 兼容运行时（资源校验失败时自动回退系统 ConPTY），让不同 Windows 版本下的 Codex 滚动与 transcript 折叠行为保持一致
 - **终端缓存** — 切换项目 / 标签 / 分屏不重建 xterm 实例，已有内容不丢失；启动按需懒加载，仅当前可见 pane 创建 PTY，避免历史项目终端越多启动越卡
 - **项目切换缓存** — FileTree / GitHistory 数据按项目缓存，切回已访问项目零延迟渲染；目录加载与 Git 状态并行执行，Git 仓库扫描结果缓存 30 秒
 - **复制粘贴** — `Ctrl+Shift+C/V`（macOS `⌘+Shift+C/V`）快捷键 + 右键菜单，未选中时"复制"自动置灰；可在设置中开启「智能 `Ctrl+C/V`」（有选区时 `Ctrl+C` 复制、无选区时中断程序，`Ctrl+V` 直接粘贴）；Windows 大段多行粘贴自动分块写入，防止 ConPTY 丢行
@@ -81,7 +81,8 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 ### AI 进程感知
 
 - **Hook 事件系统** — 接入 Claude Code / Codex 官方 Hook API，接收 AI 工具事件（SessionStart / End、ToolUse 等），比进程轮询更精准及时；内置 `miniterm-hook` CLI 工具供 Hook 系统调用，自动 POST 事件到本地服务器；设置界面一键注册 / 卸载 Hook 配置，合并而非覆盖用户已有 hook。Codex 权限请求从审批到工具执行完成期间持续保持 `ai-working`，避免提前触发任务完成提醒
-- **实时状态检测** — Hook 一旦接入即为该面板唯一的状态来源，输出活跃度不再参与判定（AI 空闲期 TUI 的定时重绘曾被误判为「又在工作」，导致完成通知反复触发）；无 hook 的面板降级为 500ms 进程轮询，自动识别 Claude / Codex / OpenCode，显示 idle / working / error 状态
+- **实时状态检测** — Hook 一旦接入即为该面板的状态来源，逐轮状态直接由 hook 事件决定，不看输出活跃度（AI 空闲期 TUI 的定时重绘曾被误判为「又在工作」，导致完成通知反复触发）；无 hook 的面板降级为 500ms 进程轮询，自动识别 Claude / Codex / OpenCode，显示 idle / working / error 状态
+- **徽章卡死的三重兜底** — `Stop` 事件在若干情形下根本不触发：回合因 API 错误结束走 `StopFailure`（映射 ai-idle 并点黄灯提示回来重发）、用户按 Esc / Ctrl+C 打断则不发任何事件（由输入检测收敛，cause=`Interrupt`）；两者都覆盖不到的残余情况再由**停摆判定**兜底——hook 状态停在 ai-working 且状态与 PTY 输出双双静默 10 秒即收敛，此前已触发过退出（Ctrl+D / 双击 Ctrl+C / `/exit`，且之后无 hook 事件扶正）则判为已退出回落 idle，否则降为 ai-idle。三条兜底的结论都**一次性落盘**进 hook 状态，触发一次即收敛不再摆动，且 cause 一律不是 `Stop`，因此不会被当成「任务完成」播报（这正是 v0.9.3 删掉无记忆版兜底的原因）；正等用户批准的面板（如 Codex 的 `PermissionRequest`）豁免停摆判定，否则会连托盘黄灯一并抹掉
 - **状态聚合** — 面板 → 标签页 → 项目逐层聚合，优先级 `error > ai-working > ai-idle > idle`
 - **完成提醒三件套** — AI 任务从 working → idle、且成因确为 `Stop` 事件时立刻触发（权限请求、通知、澄清同样落到 `ai-idle`，不再被误报为任务完成；无 hook 的降级路径仍以下降沿为准）：
   - 右下角 Toast 桌面通知（仅非活跃项目弹出，同项目去重）
@@ -89,7 +90,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
   - 任务栏闪烁（Windows）/ Dock 跳动（macOS），窗口失焦时才触发
   - 提示音播放（Web Audio API 合成默认音，支持自定义音频文件）
   - 所有通知开关独立可配，设置中心单独「AI 完成通知」页面管理
-- **托盘状态灯** — 系统托盘常驻全局 AI 状态灯：黄=待确认、蓝=处理中、绿=完成未读、灰=安静，多状态并存且窗口失焦时轮播展示；右键托盘菜单按项目列出各自状态，左键唤起主窗口（Linux 下仅右键菜单可用）；Notification 判定只认权限 / 确认类文案，API 错误与重试等待不点黄灯；可在设置中关闭
+- **托盘状态灯** — 系统托盘常驻全局 AI 状态灯：黄=待确认、蓝=处理中、绿=完成未读、灰=安静，多状态并存且窗口失焦时轮播展示；右键托盘菜单按项目列出各自状态、点某项即定位到该项目内最该处理的那个 pane，左键唤起主窗口并跳到「下一个该我处理」的会话（与标题栏状态灯同一套落点，可在设置里关掉只唤起窗口；Linux 下仅右键菜单可用）；Notification 判定只认权限 / 确认类文案，API 错误与重试等待不点黄灯；可在设置中关闭
 - **会话自动续接** — 重启后每个分屏 pane 自动写入 `claude --resume` / `codex resume` 续回上次会话：会话身份由 hook 上报、随布局持久化，跨一次重启保留；写入终端前经白名单校验（仅字母数字与 `-_`、长度上限 128），远程 pane 不参与，识别不了的一律不写；可在「设置 → 系统」关闭（关掉后终端照常恢复，只是不自动跑续接命令）
 - **会话进出检测** — 命令 echo 识别进入 AI；双击 `Ctrl+C` / `Ctrl+D` 或 `exit` / `quit` / `:quit` / `/logout` 识别退出
 - **会话历史** — 读取本地 Claude / Codex 历史会话记录，右键复制恢复命令快速续接；首屏仅渲染 20 条，底部「加载更多」按钮按需展开（不再滚动即触发）
@@ -184,7 +185,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 | 用量统计 | rusqlite 0.40 本地账本 · recharts 3 趋势图 · chrono-tz 时区分桶 |
 | Tauri 插件 | `window-state` · `clipboard-manager` · `dialog` · `opener` |
 | 移动端中转 | axum + tokio WebSocket 中转服务（`relay-server/`）· React + TS + Vite PWA（`mobile/`） |
-| 测试覆盖 | 566 个 Rust 测试 = 桌面端 513（tauri-app 359 + mt-core 44 + mt-ssh 26 + mt-sidecars 84）+ 中转服务端 53（协议与路由）；另有 51 个 Node 测试 |
+| 测试覆盖 | 601 个 Rust 测试 = 桌面端 548（tauri-app 394 + mt-core 44 + mt-ssh 26 + mt-sidecars 84）+ 中转服务端 53（协议与路由）；另有 74 个 Node 测试 |
 
 ## 快速开始
 
@@ -334,7 +335,7 @@ mini-term/
 ├── scripts/
 │   ├── stage-sidecars.mjs        # 构建 sidecar 并按 triple 就位为 Tauri externalBin
 │   └── stage-conpty.mjs          # 下载校验并就位固定版本 ConPTY 运行时（Windows）
-├── tests/                        # Node 侧测试（ConPTY 打包 / TUI 滚动 / 布局恢复 / 主题兼容 / WSL 路径 / worktree 收敛等 20 个）
+├── tests/                        # Node 侧测试（ConPTY 打包 / TUI 滚动 / 布局恢复 / 主题兼容 / WSL 路径 / worktree 收敛等 18 个文件、74 条用例）
 └── package.json
 ```
 
@@ -396,14 +397,14 @@ ToastContainer 悬浮于右下角，SettingsModal / SshModal / MobileRelayModal 
 # 前端类型检查（tsc + vite build）
 npm run build
 
-# Node 侧测试（20 个）
+# Node 侧测试（18 个文件、74 条用例）
 node --test "tests/*.test.cjs"
 
-# 桌面端 Rust 测试（513 个）
+# 桌面端 Rust 测试（548 个）
 # 注意：mt-core / mt-ssh / mt-sidecars 是独立 crate 而非 workspace member，
-# 单跑 `cd src-tauri && cargo test` 只覆盖 tauri-app 的 297 个，其余三个要分别指定 manifest。
+# 单跑 `cd src-tauri && cargo test` 只覆盖 tauri-app 的 394 个，其余三个要分别指定 manifest。
 cd src-tauri
-cargo test                                        # tauri-app     297
+cargo test                                        # tauri-app     394
 cargo test --manifest-path mt-core/Cargo.toml     # mt-core        44
 cargo test --manifest-path mt-ssh/Cargo.toml      # mt-ssh         26
 cargo test --manifest-path mt-sidecars/Cargo.toml # mt-sidecars    84

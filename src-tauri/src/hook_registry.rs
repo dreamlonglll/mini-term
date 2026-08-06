@@ -12,20 +12,39 @@ use tauri::AppHandle;
 const HOOK_MARKER: &str = "miniterm-hook";
 
 /// Claude Code 需要注册的 hook 事件列表
+///
+/// 事件名是白名单：Claude Code 只对认识的事件派发，settings.json 里多出的
+/// 事件名被忽略，所以列表可以领先于用户的 Claude Code 版本，不会让旧版报错。
 const CLAUDE_HOOK_EVENTS: &[&str] = &[
     "SessionStart",
     "SessionEnd",
     "UserPromptSubmit",
     "PreToolUse",
     "PostToolUse",
+    // 工具失败后 AI 仍在处理错误。只注册 PostToolUse 会漏掉整个失败分支，
+    // 状态要等到下一个 PreToolUse 才恢复。
+    "PostToolUseFailure",
+    // 一批并行工具全部结束、下次模型调用之前。并行工具批场景下它是唯一
+    // 覆盖「批已收尾但模型还没被调用」这段的事件。
+    "PostToolBatch",
     "Stop",
+    // 回合因 API 错误结束。官方文档：`Stop` 在这种情况下不触发
+    // （"API errors fire StopFailure instead"）——不注册它，限流/超载/鉴权失败
+    // 之后 pane 会确定性地卡在 ai-working 直到下一轮对话。
+    "StopFailure",
     "SubagentStart",
     "SubagentStop",
     "PreCompact",
     "PostCompact",
     "PermissionRequest",
+    // auto 模式分类器拒绝了工具调用。拒绝后 AI 继续处理，同时它是权限黄灯的
+    // 熄灭路径之一（状态转回 ai-working 会清掉 attention）。
+    "PermissionDenied",
     "Notification",
     "Elicitation",
+    // 用户回应了 MCP 表单 → AI 继续。与 Elicitation 成对，缺了它黄灯要等到
+    // 下一个工具事件才熄。
+    "ElicitationResult",
 ];
 
 /// Codex 需要注册的 hook 事件列表
@@ -39,6 +58,23 @@ const CODEX_HOOK_EVENTS: &[&str] = &[
     "Stop",
     "PermissionRequest",
 ];
+
+/// 该 hook 条目是否由 mini-term 写入。
+///
+/// Claude 与 Codex 的条目在这一层结构一致：`{ "hooks": [{ "command": "…" }] }`，
+/// 按命令文本里的 `miniterm-hook` 标识判定，不碰用户自己的 hook。
+fn entry_is_miniterm(entry: &Value) -> bool {
+    entry
+        .get("hooks")
+        .and_then(|h| h.as_array())
+        .is_some_and(|hooks_arr| {
+            hooks_arr.iter().any(|h| {
+                h.get("command")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|c| c.contains(HOOK_MARKER))
+            })
+        })
+}
 
 /// 获取 miniterm-hook 二进制的绝对路径
 fn get_hook_binary_path() -> Result<String, String> {
@@ -129,20 +165,7 @@ fn register_claude_hooks(hook_path: &str) -> Result<String, String> {
             if let Some(arr) = event_hooks.as_array_mut() {
                 // 查找已有的 miniterm-hook 条目
                 // Claude Code 格式: [{ "matcher": "", "hooks": [{ "command": "..." }] }]
-                let existing_idx = arr.iter().position(|entry| {
-                    entry
-                        .get("hooks")
-                        .and_then(|h| h.as_array())
-                        .map(|hooks_arr| {
-                            hooks_arr.iter().any(|h| {
-                                h.get("command")
-                                    .and_then(|c| c.as_str())
-                                    .map(|c| c.contains(HOOK_MARKER))
-                                    .unwrap_or(false)
-                            })
-                        })
-                        .unwrap_or(false)
-                });
+                let existing_idx = arr.iter().position(entry_is_miniterm);
 
                 if let Some(idx) = existing_idx {
                     arr[idx] = new_entry;
@@ -191,20 +214,7 @@ fn unregister_claude_hooks() -> Result<String, String> {
             if let Some(event_hooks) = hooks.get_mut(*event) {
                 if let Some(arr) = event_hooks.as_array_mut() {
                     let before = arr.len();
-                    arr.retain(|entry| {
-                        !entry
-                            .get("hooks")
-                            .and_then(|h| h.as_array())
-                            .map(|hooks_arr| {
-                                hooks_arr.iter().any(|h| {
-                                    h.get("command")
-                                        .and_then(|c| c.as_str())
-                                        .map(|c| c.contains(HOOK_MARKER))
-                                        .unwrap_or(false)
-                                })
-                            })
-                            .unwrap_or(false)
-                    });
+                    arr.retain(|entry| !entry_is_miniterm(entry));
                     removed += before - arr.len();
                 }
             }
@@ -227,6 +237,75 @@ fn unregister_claude_hooks() -> Result<String, String> {
         .map_err(|e| format!("写入 settings.json 失败: {}", e))?;
 
     Ok(format!("Claude Code: 已移除 {} 个 hook 条目", removed))
+}
+
+/// settings.json 里已写入 miniterm-hook 条目的事件名集合。
+/// 读不到 / 解析失败一律返回空集 —— 空集的语义是「没注册过」，调用方据此不动手，
+/// 比冒险改写一个读不懂的配置文件安全。
+fn registered_claude_events() -> std::collections::HashSet<String> {
+    let mut set = std::collections::HashSet::new();
+    let Some(path) = claude_settings_path() else {
+        return set;
+    };
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return set;
+    };
+    let Ok(settings) = serde_json::from_str::<Value>(&content) else {
+        return set;
+    };
+    let Some(hooks) = settings.get("hooks").and_then(|h| h.as_object()) else {
+        return set;
+    };
+    for (event, entries) in hooks {
+        let ours = entries
+            .as_array()
+            .is_some_and(|arr| arr.iter().any(entry_is_miniterm));
+        if ours {
+            set.insert(event.clone());
+        }
+    }
+    set
+}
+
+/// 需要补注册的事件（`sync_claude_hooks_if_registered` 的纯判定部分，抽出来是
+/// 为了可测：另一半要读用户 home 目录下的真实配置）。
+///
+/// `registered` 为空 = 从未注册过，返回空 —— 不给没开过这功能的用户写配置。
+fn missing_claude_events(registered: &std::collections::HashSet<String>) -> Vec<&'static str> {
+    if registered.is_empty() {
+        return Vec::new();
+    }
+    CLAUDE_HOOK_EVENTS
+        .iter()
+        .copied()
+        .filter(|e| !registered.contains(*e))
+        .collect()
+}
+
+/// 给已注册的用户补上新版本新增的 hook 事件。
+///
+/// `CLAUDE_HOOK_EVENTS` 会随版本增长（v0.10.3 补了 StopFailure 等 5 个），而注册
+/// 是设置面板里的一次性手动动作。不补的话，老用户升级后配置里永远是旧事件集，
+/// 新增的状态判定对他们完全不生效——而他们没有任何理由知道要再点一次「注册」。
+///
+/// 只在**已经注册过**（配置里存在 miniterm-hook 条目）时补：从未注册的用户不碰，
+/// 那是他们的选择。补齐直接复用幂等的 `register_claude_hooks`。
+pub fn sync_claude_hooks_if_registered() {
+    let missing = missing_claude_events(&registered_claude_events());
+    if missing.is_empty() {
+        return;
+    }
+    let hook_path = match get_hook_binary_path() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[hook-registry] 补注册跳过（拿不到 hook 二进制路径）: {}", e);
+            return;
+        }
+    };
+    match register_claude_hooks(&hook_path) {
+        Ok(msg) => eprintln!("[hook-registry] 补注册新增事件 {:?} -> {}", missing, msg),
+        Err(e) => eprintln!("[hook-registry] 补注册失败: {}", e),
+    }
 }
 
 // ─── Codex hook 注册/卸载 ───
@@ -332,20 +411,7 @@ fn register_codex_hooks(hook_path: &str) -> Result<String, String> {
             if let Some(arr) = event_hooks.as_array_mut() {
                 // 查找已有的 miniterm-hook 条目
                 // Codex 格式: [ { "hooks": [{ "type": "command", "command": "..." }] } ]
-                let existing_idx = arr.iter().position(|entry| {
-                    entry
-                        .get("hooks")
-                        .and_then(|h| h.as_array())
-                        .map(|hooks_arr| {
-                            hooks_arr.iter().any(|h| {
-                                h.get("command")
-                                    .and_then(|c| c.as_str())
-                                    .map(|c| c.contains(HOOK_MARKER))
-                                    .unwrap_or(false)
-                            })
-                        })
-                        .unwrap_or(false)
-                });
+                let existing_idx = arr.iter().position(entry_is_miniterm);
 
                 if let Some(idx) = existing_idx {
                     // 更新：替换整个条目
@@ -403,20 +469,7 @@ fn unregister_codex_hooks() -> Result<String, String> {
             if let Some(event_hooks) = hooks.get_mut(*event) {
                 if let Some(arr) = event_hooks.as_array_mut() {
                     let before = arr.len();
-                    arr.retain(|entry| {
-                        !entry
-                            .get("hooks")
-                            .and_then(|h| h.as_array())
-                            .map(|hooks_arr| {
-                                hooks_arr.iter().any(|h| {
-                                    h.get("command")
-                                        .and_then(|c| c.as_str())
-                                        .map(|c| c.contains(HOOK_MARKER))
-                                        .unwrap_or(false)
-                                })
-                            })
-                            .unwrap_or(false)
-                    });
+                    arr.retain(|entry| !entry_is_miniterm(entry));
                     removed += before - arr.len();
                 }
             }
@@ -543,6 +596,78 @@ pub fn get_hook_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 状态判定依赖的 Claude 事件必须都在注册列表里：注册列表是白名单，
+    /// 漏一个就等于该时刻没有任何事件覆盖，状态只能卡到下一个事件。
+    /// StopFailure 尤其关键——官方文档明确 API 错误结束回合时 `Stop` 不触发。
+    #[test]
+    fn claude_registration_covers_status_critical_events() {
+        for event in [
+            "SessionStart",
+            "SessionEnd",
+            "Stop",
+            "StopFailure",
+            "PostToolUse",
+            "PostToolUseFailure",
+            "PostToolBatch",
+            "PermissionRequest",
+            "PermissionDenied",
+            "Elicitation",
+            "ElicitationResult",
+        ] {
+            assert!(
+                CLAUDE_HOOK_EVENTS.contains(&event),
+                "{event} 未注册，该时刻的状态无事件覆盖"
+            );
+        }
+    }
+
+    /// 老用户（注册于事件列表增长之前）启动时应被补齐，且只补缺的那几个
+    #[test]
+    fn stale_registration_is_detected_as_missing() {
+        // v0.10.2 及更早的事件集
+        let old: std::collections::HashSet<String> = [
+            "SessionStart",
+            "SessionEnd",
+            "UserPromptSubmit",
+            "PreToolUse",
+            "PostToolUse",
+            "Stop",
+            "SubagentStart",
+            "SubagentStop",
+            "PreCompact",
+            "PostCompact",
+            "PermissionRequest",
+            "Notification",
+            "Elicitation",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        let missing = missing_claude_events(&old);
+        assert!(missing.contains(&"StopFailure"), "StopFailure 未被识别为缺失");
+        assert_eq!(missing.len(), CLAUDE_HOOK_EVENTS.len() - old.len());
+    }
+
+    /// 从未注册过的用户不该被静默写配置；已是最新的不该反复重写
+    #[test]
+    fn sync_is_noop_when_never_registered_or_already_current() {
+        assert!(missing_claude_events(&std::collections::HashSet::new()).is_empty());
+
+        let current: std::collections::HashSet<String> =
+            CLAUDE_HOOK_EVENTS.iter().map(|s| s.to_string()).collect();
+        assert!(missing_claude_events(&current).is_empty());
+    }
+
+    /// 事件名重复会在 settings.json 里写出两条相同 hook，AI 每次事件多跑一个进程
+    #[test]
+    fn claude_registration_has_no_duplicates() {
+        let mut seen = std::collections::HashSet::new();
+        for event in CLAUDE_HOOK_EVENTS {
+            assert!(seen.insert(*event), "重复注册事件: {event}");
+        }
+    }
 
     #[test]
     fn codex_registration_includes_authoritative_session_end() {

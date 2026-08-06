@@ -96,6 +96,10 @@ pub fn run() {
                 ) {
                     eprintln!("[setup] hook server 启动失败: {}", e);
                 }
+                // 注册过的用户补上新版本新增的 hook 事件（详见
+                // hook_registry::sync_claude_hooks_if_registered）。读写用户配置
+                // 文件，扔后台线程做，不挡启动。
+                std::thread::spawn(hook_registry::sync_claude_hooks_if_registered);
             }
 
             // 启动进程监控（传入 hook_state 实现 hook 优先 + 轮询降级）
@@ -152,6 +156,8 @@ pub fn run() {
             pty::write_pty,
             pty::resize_pty,
             pty::kill_pty,
+            pty::kill_all_ptys,
+            pty::set_pty_flow_paused,
             pty::arm_ssh_autofill,
             ssh::prepare_ssh_key,
             fs::list_directory,

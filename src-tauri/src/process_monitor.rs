@@ -26,8 +26,21 @@ pub struct PtyStatusChangePayload {
 }
 
 /// AI 输出活跃超时阈值。**仅**用于无 hook 的降级路径（`resolve_status` 的
-/// `else if` 分支）；hook 已启用的 pane 不看输出活跃度。
+/// `else if` 分支）；hook 已启用的 pane 不在 `resolve_status` 里看输出活跃度
+/// （hook 启用后的输出静默走另一套「一次性落盘」的停摆兜底，见
+/// `stall_settle_target`）。
 const AI_ACTIVE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// hook 已启用的 pane 上「AI 停摆」的判定窗口：hook 状态停在 ai-working、
+/// 且状态与 PTY 输出双双静默这么久，就认为这一轮实际已经结束。
+const AI_STALL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 停摆兜底改写状态时带的成因。两者都**不是** `Stop`，前端 `isAiCompletion`
+/// 认不出，不会播报完成；也都不在 `hook_server::is_attention_cause` 里，
+/// 不点托盘黄灯。纯粹用来把徽章从卡死的 ai-working 上摘下来。
+const STALL_CAUSE: &str = "Stall";
+/// 停摆 + 此前已触发过退出 → 判定 AI 已经退出，回落 idle（见 `stall_settle_target`）
+const STALL_EXIT_CAUSE: &str = "StallExit";
 
 /// `pty-status-change` 的统一发射器：monitor 轮询与 hook server 直推
 /// 共用同一份"上次发给前端的状态"去重表。
@@ -56,7 +69,7 @@ impl StatusEmitter {
     /// - 状态相同 + cause=None → **跳过**:monitor 每 500ms 以无成因方式重发
     ///   hook 状态,若放行会在黄灯点亮后 500ms 内把 attention 抹掉
     ///   (黄灯闪一下就被蓝色顶掉的根因);
-    /// - 状态相同 + cause 为 attention 类事件(PermissionRequest/Elicitation)
+    /// - 状态相同 + cause 为 attention 类事件(见 `hook_server::is_attention_cause`)
     ///   → **总是 emit**:黄灯的清除发生在前端(用户键入即批准),后端去重表
     ///   感知不到;若按相同 cause 去重,同一轮内第二次授权请求会被吞掉;
     /// - 状态相同 + 其他 cause 与上次相同 → 跳过;变化 → emit(如
@@ -74,7 +87,7 @@ impl StatusEmitter {
             if prev_status == status {
                 match cause {
                     None => return,
-                    Some("PermissionRequest") | Some("Elicitation") => {}
+                    Some(c) if crate::hook_server::is_attention_cause(c) => {}
                     Some(c) if prev_cause.as_deref() == Some(c) => return,
                     _ => {}
                 }
@@ -92,6 +105,16 @@ impl StatusEmitter {
         );
     }
 
+    /// 上次发给前端的成因。停摆兜底用它避让「正等用户批准」的 pane：
+    /// 那类 pane 的黄灯要一直亮到用户处理，兜底若插一脚会把 attention 抹掉。
+    pub(crate) fn last_cause(&self, pty_id: u32) -> Option<String> {
+        self.prev
+            .lock()
+            .unwrap()
+            .get(&pty_id)
+            .and_then(|(_, cause)| cause.clone())
+    }
+
     /// 清掉已不存在的 pty 的去重记录
     pub fn retain(&self, alive: &[u32]) {
         self.prev.lock().unwrap().retain(|id, _| alive.contains(id));
@@ -100,8 +123,8 @@ impl StatusEmitter {
 
 /// 单个 pty 的状态判定（monitor 每轮对每个 pty 调一次）。
 ///
-/// Hook 一旦启用即为**绝对**权威：状态完全由 hook 事件决定，PTY 输出活跃度
-/// 不参与判定。
+/// **本函数**里 hook 一旦启用即为绝对权威：状态完全由 `last_hook_status` 决定，
+/// PTY 输出活跃度不参与判定，因此同一份 hook 状态连续多轮必然算出同一个值。
 ///
 /// 这里曾有一条兜底——"hook 停在 ai-working 但连续 AI_ACTIVE_TIMEOUT 无输出即
 /// 视为 ai-idle"（后又给 API 重试加了 retry_hold 豁免）。它是**无记忆**的：每轮
@@ -109,10 +132,14 @@ impl StatusEmitter {
 /// hook_status 卡住（Stop 丢失，或 Stop 之后又收到同会话迟到的 PostToolUse），
 /// AI 空闲期每一次零星伪输出（TUI 定时重绘等）都会把状态抬回 ai-working、
 /// 3 秒后再落回 ai-idle，形成以伪输出间隔为周期的脉冲（实测 20~50s 一轮），
-/// 每个下降沿被前端当成一次"任务完成"反复播报。v0.9.3 起整条兜底删除
-/// （retry_hold 机制随之失去消费者一并移除）：宁可徽章残留也不制造假完成——
-/// Stop 丢失时 pane 停在 ai-working，直到下一个 hook 事件或 SessionEnd 才恢复，
-/// 罕见、纯视觉、下一轮对话即自愈，与 SessionEnd 丢失残留 ai-idle 同一口径。
+/// 每个下降沿被前端当成一次"任务完成"反复播报。v0.9.3 起整条兜底从本函数删除
+/// （retry_hold 机制随之失去消费者一并移除）。
+///
+/// 输出静默的兜底在 v0.10.3 以另一种形态回来了，但**不在这里**：见
+/// `stall_settle_target` / `settle_stalled_ai`——它一次性地把结论**写进**
+/// `last_hook_status`，于是本函数后续每轮读到的都是同一个收敛值，不存在摆动，
+/// 也就没有可供误判成"完成"的下降沿。判据（hook 状态是否停在 ai-working）
+/// 本身也随之改变，触发一次就不再满足，这正是与旧兜底的分水岭。
 ///
 /// 退出的唯一权威信号是 SessionEnd hook（hook_server 处理：清状态 + 直推 idle）。
 /// 这里**不能**根据输入检测（is_ai_session）把 hook 状态拆掉降级 idle：
@@ -149,6 +176,108 @@ pub(crate) fn resolve_status(
     }
 }
 
+/// 「AI 停摆」兜底的纯判定部分（发射一侧需要 `AppHandle`，单测里构造不出来，
+/// 因此把判据抽出来；`timeout` 也做成参数，测试可用 `Duration::ZERO` 表示
+/// "窗口已经走完"、用一个极大值表示"还没走完"）。
+///
+/// 背景：hook 状态卡在 ai-working 有确定性的来源——`Stop` 在若干情形下压根不
+/// 触发（用户打断已由 `note_user_interrupt` 覆盖；API 错误已由 `StopFailure`
+/// 覆盖），但仍有覆盖不到的：AI 进程被 kill / PTY 里的 shell 被换掉 / sidecar
+/// 上报失败 / 新版本又加了没注册的事件。这类 pane 会一直顶着 ai-working 徽章。
+///
+/// 五道闸，缺一不可：
+/// 1. hook 已启用——没启用的 pane 走 `resolve_status` 的轮询降级路径，那条路本就
+///    按输出活跃度给 ai-idle，插手只会互相打架；
+/// 2. 当前 hook 状态正是 ai-working——其余状态没什么可收敛的；
+/// 3. 上次发给前端的成因不是 attention 类——Codex 的 `PermissionRequest` 映射为
+///    ai-working 并点着黄灯，它是**明知故犯**地在等用户，且审批框弹出后本就没有
+///    输出。此时插手会连黄灯一起抹掉（前端按 cause 重算 attention），
+///    把"等你批准"变成"没在跑"；
+/// 4. 状态本身静置满 `timeout`——刚进 ai-working 就判停摆是误伤；
+/// 5. PTY 输出也静默满 `timeout`——真在干活的 Claude/Codex TUI 一直在重绘
+///    计时器与 spinner，10 秒完全无输出基本只有"已经不在跑了"一种解释。
+///
+/// 目标状态区分两种情形：
+/// - `ai-idle`：AI 进程还在（输入检测的会话标记仍在，且 hook 事件也一直在把它
+///   扶正），只是这一轮结束了/卡住了——降徽章即可；
+/// - `idle`：此前已经**触发过退出**（双击 Ctrl+C / Ctrl+D / `/exit` 等，
+///   `track_input` 据此清掉会话标记），且此后没有任何 hook 事件把标记扶回来。
+///   单看输入检测不可信（双击 Ctrl+C 常常只是打断），但"触发过退出"叠加
+///   "10 秒完全无输出"就足以确认它真的退出了：还活着的 AI 不会这么安静。
+pub(crate) fn stall_settle_target(
+    hook_state: &HookState,
+    pty_manager: &crate::pty::PtyManager,
+    last_cause: Option<&str>,
+    pty_id: u32,
+    timeout: Duration,
+) -> Option<&'static str> {
+    if !hook_state.is_hook_enabled(pty_id) {
+        return None;
+    }
+    if hook_state.get_status(pty_id).as_deref() != Some("ai-working") {
+        return None;
+    }
+    if last_cause.is_some_and(crate::hook_server::is_attention_cause) {
+        return None;
+    }
+    if !hook_state
+        .status_age(pty_id)
+        .is_some_and(|age| age >= timeout)
+    {
+        return None;
+    }
+    if pty_manager.has_recent_output(pty_id, timeout) {
+        return None;
+    }
+    Some(if pty_manager.is_ai_session(pty_id) {
+        "ai-idle"
+    } else {
+        "idle"
+    })
+}
+
+/// 停摆兜底的发射侧：判定命中就把结论**落盘**到 hook 状态并通知前端。
+///
+/// 落盘是关键（与 `note_user_interrupt` 同一手法）：`last_hook_status` 被改写后，
+/// 判据 2 不再成立，本轮之后不会重复触发；`resolve_status` 每轮读到的也都是这个
+/// 收敛值，不会随空闲期的零星伪输出摆回 ai-working。没有摆动 → 没有下降沿 →
+/// 不会重演 v0.9.3 修掉的"每 20~50s 播报一次假完成"。
+///
+/// 误判（AI 其实还在跑，只是安静）由下一个 hook 事件立刻纠正回 ai-working，
+/// 那条路径还会顺带 `mark_ai_session` 把会话标记扶正。
+fn settle_stalled_ai(
+    app: &AppHandle,
+    hook_state: &HookState,
+    pty_manager: &crate::pty::PtyManager,
+    emitter: &StatusEmitter,
+    pty_id: u32,
+) {
+    let last_cause = emitter.last_cause(pty_id);
+    let Some(target) = stall_settle_target(
+        hook_state,
+        pty_manager,
+        last_cause.as_deref(),
+        pty_id,
+        AI_STALL_TIMEOUT,
+    ) else {
+        return;
+    };
+    hook_state.update(pty_id, target.to_string());
+    let (cause, agent) = if target == "idle" {
+        (STALL_EXIT_CAUSE, None)
+    } else {
+        (STALL_CAUSE, pty_manager.ai_session_agent(pty_id))
+    };
+    emitter.emit_if_changed(app, pty_id, target, Some(cause), agent);
+    eprintln!(
+        "[monitor] pty_id={} ai-working 静默 {}s -> {} (cause={})",
+        pty_id,
+        AI_STALL_TIMEOUT.as_secs(),
+        target,
+        cause
+    );
+}
+
 pub fn start_monitor(
     app: AppHandle,
     pty_manager: crate::pty::PtyManager,
@@ -158,17 +287,25 @@ pub fn start_monitor(
     thread::spawn(move || {
         loop {
             let pty_ids = pty_manager.get_pty_ids();
-            // 每轮取一次总开关状态:server 未运行时 AI 感知整体停用
-            let server_running = hook_state.is_server_running();
 
             for pty_id in &pty_ids {
-                let status = resolve_status(&hook_state, &pty_manager, *pty_id, server_running);
-                let agent = if status.starts_with("ai-") {
-                    pty_manager.ai_session_agent(*pty_id)
-                } else {
-                    None
-                };
-                emitter.emit_if_changed(&app, *pty_id, &status, None, agent);
+                let handled = hook_state.with_running_server(|| {
+                    // 先做停摆收敛（会改写 hook 状态），再按收敛后的状态算本轮值：
+                    // 命中时下面这次 emit 会被去重吞掉，前端只收到带成因的那一条。
+                    settle_stalled_ai(&app, &hook_state, &pty_manager, &emitter, *pty_id);
+                    let status = resolve_status(&hook_state, &pty_manager, *pty_id, true);
+                    let agent = if status.starts_with("ai-") {
+                        pty_manager.ai_session_agent(*pty_id)
+                    } else {
+                        None
+                    };
+                    emitter.emit_if_changed(&app, *pty_id, &status, None, agent);
+                });
+
+                if handled.is_none() {
+                    let status = resolve_status(&hook_state, &pty_manager, *pty_id, false);
+                    emitter.emit_if_changed(&app, *pty_id, &status, None, None);
+                }
             }
 
             emitter.retain(&pty_ids);
@@ -235,7 +372,9 @@ mod tests {
         mgr.track_input(1, "claude\r");
         hooks.update(1, "ai-working".to_string());
 
-        let polls: Vec<String> = (0..5).map(|_| resolve_status(&hooks, &mgr, 1, true)).collect();
+        let polls: Vec<String> = (0..5)
+            .map(|_| resolve_status(&hooks, &mgr, 1, true))
+            .collect();
         assert!(
             polls.iter().all(|s| s == "ai-working"),
             "hook 未更新时状态应恒定，实测 {:?}",
@@ -287,10 +426,231 @@ mod tests {
         let hooks = HookState::new();
         let mgr = PtyManager::new();
 
-        mgr.track_input(1, "claude
-"); // 输入检测已标记 AI 会话
+        mgr.track_input(
+            1, "claude
+",
+        ); // 输入检测已标记 AI 会话
         hooks.update(1, "ai-working".to_string()); // 关闭开关前残留的 hook 状态
 
         assert_eq!(resolve_status(&hooks, &mgr, 1, false), "idle");
+    }
+
+    // ---- 停摆兜底（stall_settle_target）----
+    //
+    // 窗口用参数模拟：ZERO = 窗口已走完（`status_age >= 0` 恒真，
+    // `has_recent_output(_, 0)` 恒假），大值 = 窗口远未走完。
+
+    const ELAPSED: Duration = Duration::ZERO;
+    const NOT_ELAPSED: Duration = Duration::from_secs(3600);
+
+    /// 主场景：hook 卡在 ai-working、AI 进程还在（会话标记未被清），
+    /// 输出静默满窗口 → 收敛到 ai-idle（只降徽章，不当作退出）。
+    #[test]
+    fn stalled_ai_working_settles_to_ai_idle() {
+        let hooks = HookState::new();
+        let mgr = PtyManager::new();
+
+        mgr.track_input(1, "claude\r");
+        hooks.update(1, "ai-working".to_string());
+
+        assert_eq!(
+            stall_settle_target(&hooks, &mgr, None, 1, ELAPSED),
+            Some("ai-idle")
+        );
+    }
+
+    /// 另一半：此前已触发过退出（双击 Ctrl+C，输入检测清掉会话标记），
+    /// 此后再无 hook 事件把标记扶正 + 静默满窗口 → 确认已退出，回落 idle。
+    #[test]
+    fn stalled_after_exit_trigger_settles_to_idle() {
+        let hooks = HookState::new();
+        let mgr = PtyManager::new();
+
+        mgr.track_input(1, "claude\r");
+        hooks.update(1, "ai-working".to_string()); // 任务运行中
+        mgr.track_input(1, "\x03"); // 双击 Ctrl+C
+        mgr.track_input(1, "\x03"); // → clear_ai_session
+        assert!(!mgr.is_ai_session(1));
+
+        assert_eq!(
+            stall_settle_target(&hooks, &mgr, None, 1, ELAPSED),
+            Some("idle")
+        );
+    }
+
+    /// Ctrl+D 与显式退出命令同样构成「触发过退出」。
+    #[test]
+    fn explicit_exit_paths_settle_to_idle() {
+        for input in ["\x04", "/exit\r"] {
+            let hooks = HookState::new();
+            let mgr = PtyManager::new();
+
+            mgr.track_input(1, "claude\r");
+            hooks.update(1, "ai-working".to_string());
+            mgr.track_input(1, input);
+
+            assert_eq!(
+                stall_settle_target(&hooks, &mgr, None, 1, ELAPSED),
+                Some("idle"),
+                "退出方式 {:?} 未被确认",
+                input
+            );
+        }
+    }
+
+    /// hook 事件会把误清的会话标记扶正（`mark_ai_session`）：
+    /// 打断后 AI 其实没退，标记回来了 → 只降 ai-idle，不再判定为退出。
+    #[test]
+    fn hook_event_after_exit_trigger_downgrades_target_to_ai_idle() {
+        let hooks = HookState::new();
+        let mgr = PtyManager::new();
+
+        mgr.track_input(1, "claude\r");
+        hooks.update(1, "ai-working".to_string());
+        mgr.track_input(1, "\x03");
+        mgr.track_input(1, "\x03"); // 误判退出
+        mgr.mark_ai_session(1, "claude"); // 后续 hook 事件证明它还活着
+        hooks.update(1, "ai-working".to_string());
+
+        assert_eq!(
+            stall_settle_target(&hooks, &mgr, None, 1, ELAPSED),
+            Some("ai-idle")
+        );
+    }
+
+    /// 窗口未走完不动手：刚进 ai-working 的 pane 不算停摆。
+    #[test]
+    fn fresh_ai_working_is_not_settled() {
+        let hooks = HookState::new();
+        let mgr = PtyManager::new();
+
+        mgr.track_input(1, "claude\r");
+        hooks.update(1, "ai-working".to_string());
+
+        assert_eq!(
+            stall_settle_target(&hooks, &mgr, None, 1, NOT_ELAPSED),
+            None
+        );
+    }
+
+    /// 有近期输出不动手：真在干活的 TUI 一直在重绘，这是最主要的活体证据。
+    #[test]
+    fn recent_output_keeps_ai_working() {
+        let hooks = HookState::new();
+        let mgr = PtyManager::new();
+
+        mgr.track_input(1, "claude\r");
+        hooks.update(1, "ai-working".to_string());
+        mgr.note_output_for_test(1);
+
+        // 状态静置窗口已过，但输出窗口没过 → 不收敛
+        assert_eq!(
+            stall_settle_target(&hooks, &mgr, None, 1, NOT_ELAPSED),
+            None
+        );
+    }
+
+    /// Codex 的 PermissionRequest 映射为 ai-working 且点着黄灯：审批框弹出后
+    /// 本就没有输出，兜底若插手会把 attention 一并抹掉（前端按 cause 重算），
+    /// 把"等你批准"变成"没在跑"。attention 类成因一律避让。
+    #[test]
+    fn attention_pane_is_exempt_from_stall() {
+        let hooks = HookState::new();
+        let mgr = PtyManager::new();
+
+        mgr.track_input(1, "codex\r");
+        hooks.update(1, "ai-working".to_string());
+
+        for cause in ["PermissionRequest", "Elicitation", "StopFailure"] {
+            assert_eq!(
+                stall_settle_target(&hooks, &mgr, Some(cause), 1, ELAPSED),
+                None,
+                "cause={} 的 pane 不该被兜底改写",
+                cause
+            );
+        }
+        // 非 attention 成因（如工作中事件）不豁免
+        assert_eq!(
+            stall_settle_target(&hooks, &mgr, Some("PreToolUse"), 1, ELAPSED),
+            Some("ai-idle")
+        );
+    }
+
+    /// 只作用于 hook 已启用且正处于 ai-working 的 pane。
+    #[test]
+    fn stall_leaves_other_panes_alone() {
+        let mgr = PtyManager::new();
+        mgr.track_input(1, "claude\r");
+
+        // hook 从未启用（WSL/SSH/hook 关闭）：走轮询降级路径，不插手
+        let bare = HookState::new();
+        assert_eq!(stall_settle_target(&bare, &mgr, None, 1, ELAPSED), None);
+
+        // 已在等用户 / 已退出：没什么可收敛的
+        for status in ["ai-idle", "idle"] {
+            let hooks = HookState::new();
+            hooks.update(1, status.to_string());
+            assert_eq!(stall_settle_target(&hooks, &mgr, None, 1, ELAPSED), None);
+        }
+    }
+
+    /// 与 v0.9.3 删掉的旧兜底的分水岭：结论必须**落盘**。
+    /// 落盘后判据不再成立，不会每轮重复触发；`resolve_status` 每轮读到同一个
+    /// 收敛值，不随零星伪输出摆回 ai-working —— 没有摆动就没有假完成沿。
+    #[test]
+    fn stall_settle_is_latched_and_not_repeated() {
+        let hooks = HookState::new();
+        let mgr = PtyManager::new();
+
+        mgr.track_input(1, "claude\r");
+        hooks.update(1, "ai-working".to_string());
+        let target = stall_settle_target(&hooks, &mgr, None, 1, ELAPSED).unwrap();
+
+        hooks.update(1, target.to_string()); // settle_stalled_ai 的落盘动作
+        assert_eq!(
+            stall_settle_target(&hooks, &mgr, None, 1, ELAPSED),
+            None,
+            "已收敛的 pane 不该被反复改写"
+        );
+
+        // 落盘后即便伪输出继续零星抵达，多轮 resolve_status 也恒定
+        mgr.note_output_for_test(1);
+        let polls: Vec<String> = (0..5)
+            .map(|_| resolve_status(&hooks, &mgr, 1, true))
+            .collect();
+        assert!(
+            polls.iter().all(|s| s == "ai-idle"),
+            "收敛后状态应恒定，实测 {:?}",
+            polls
+        );
+    }
+
+    /// 收敛结果经 `resolve_status` 原样透出（hook 状态仍是唯一读取源）。
+    #[test]
+    fn settled_status_flows_through_resolve_status() {
+        let hooks = HookState::new();
+        let mgr = PtyManager::new();
+
+        mgr.track_input(1, "claude\r");
+        hooks.update(1, "ai-working".to_string());
+        mgr.track_input(1, "\x04"); // Ctrl+D 触发退出
+        let target = stall_settle_target(&hooks, &mgr, None, 1, ELAPSED).unwrap();
+        hooks.update(1, target.to_string());
+
+        assert_eq!(resolve_status(&hooks, &mgr, 1, true), "idle");
+    }
+
+    /// 兜底成因不得被前端当成「完成」或「待办」——与
+    /// `utils/aiCompletion.ts` 的同名断言互为镜像。
+    #[test]
+    fn stall_causes_are_neither_completion_nor_attention() {
+        for cause in [STALL_CAUSE, STALL_EXIT_CAUSE] {
+            assert_ne!(cause, "Stop", "兜底不得伪装成完成事件");
+            assert!(
+                !crate::hook_server::is_attention_cause(cause),
+                "{} 不该点黄灯",
+                cause
+            );
+        }
     }
 }
