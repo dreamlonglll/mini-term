@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.10.3-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.10.4-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -52,7 +52,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 - **长文本粘贴** — 剪贴板文本 ≥10 行或 ≥2000 字符时自动转存为临时 `.txt` 并粘贴带引号的文件路径，避免 AI 工具直接处理超长内容引发性能与 paste bracket 问题
 - **图片粘贴** — 剪贴板含截图时自动检测，通过 Win32 API 保存为临时 PNG 并粘贴带引号的路径，兼容 PinPix 等非标准格式
 - **远程 / WSL 粘贴自动落地** — 上面两种「转存成文件再粘路径」的能力在远程终端里会自动换算落点：SSH 远程项目经 SFTP 把文件上传到远端目录后粘贴**远端**路径（默认 `<项目根>/.mini-term/pasted`，落在项目内 agent 无需额外授权即可读，目录可在设置中改成 `/tmp/mini-term`、`~/uploads` 等，并自动写入自忽略的 `.gitignore` 以免弄脏 `git status`）；WSL 项目则把 `C:\...` 换算为 `/mnt/c/...`（无需上传）。上传失败会明确弹提示，而不是粘一个远端读不到的本机路径
-- **文件拖拽** — 文件树或系统资源管理器拖文件到终端自动插入带引号的绝对路径，精准定位目标分屏 pane，兼容含空格的路径
+- **文件拖拽** — 文件树或系统资源管理器拖文件到终端自动插入带引号的绝对路径，精准定位目标分屏 pane，兼容含空格的路径；拖拽途中按 `Esc` 就地取消，路径不写入 PTY（这次 Esc 由 window capture 阶段吞掉，不会当成 `\x1b` 送进终端），松手也不会退化成一次普通点击把文件打开，悬停虚线框同步撤掉。只有越过 5px 阈值真正进入拖拽后才吞 Esc，别处的 Esc 照常生效
 - **多 Shell 配置** — Windows（cmd / powershell / pwsh）、macOS（zsh / bash）、Linux（bash / sh）等，可自由增删
 
 ### SSH 连接
@@ -81,7 +81,8 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 ### AI 进程感知
 
 - **Hook 事件系统** — 接入 Claude Code / Codex 官方 Hook API，接收 AI 工具事件（SessionStart / End、ToolUse 等），比进程轮询更精准及时；内置 `miniterm-hook` CLI 工具供 Hook 系统调用，自动 POST 事件到本地服务器；设置界面一键注册 / 卸载 Hook 配置，合并而非覆盖用户已有 hook。Codex 权限请求从审批到工具执行完成期间持续保持 `ai-working`，避免提前触发任务完成提醒
-- **实时状态检测** — Hook 一旦接入即为该面板的状态来源，逐轮状态直接由 hook 事件决定，不看输出活跃度（AI 空闲期 TUI 的定时重绘曾被误判为「又在工作」，导致完成通知反复触发）；无 hook 的面板降级为 500ms 进程轮询，自动识别 Claude / Codex / OpenCode，显示 idle / working / error 状态
+- **实时状态检测** — Hook 一旦接入即为该面板的状态来源，逐轮状态直接由 hook 事件决定，不看输出活跃度（AI 空闲期 TUI 的定时重绘曾被误判为「又在工作」，导致完成通知反复触发）；无 hook 的面板降级为输入检测（识别键入的 `claude` / `codex` / `opencode` / `pi` 命令，含 ↑ 历史与 Tab 补全的行快照兜底）加 500ms 输出活跃度轮询，显示 idle / working / error 状态
+- **只靠输入检测识别的 agent** — `opencode` / `pi` 没有接 hook，也没有可解析的本地会话记录：状态徽章、完成播报、AI 启动器与移动端发起会话四条链路照常可用，但对话镜像、AI 历史面板与用量统计对它们为空。镜像的启发式绑定据此设了白名单（`mobile_mirror::agent_has_session_log`），不在名单内直接返回空镜像，不会退而绑到同项目里最新的 Claude / Codex 会话文件、把别人的对话贴到这个 pane 上。命令匹配走 basename 全等，`pip` / `ping` / `pixi` / `pi.py` 不会被误判成 `pi`
 - **徽章卡死的三重兜底** — `Stop` 事件在若干情形下根本不触发：回合因 API 错误结束走 `StopFailure`（映射 ai-idle 并点黄灯提示回来重发）、用户按 Esc / Ctrl+C 打断则不发任何事件（由输入检测收敛，cause=`Interrupt`）；两者都覆盖不到的残余情况再由**停摆判定**兜底——hook 状态停在 ai-working 且状态与 PTY 输出双双静默 10 秒即收敛，此前已触发过退出（Ctrl+D / 双击 Ctrl+C / `/exit`，且之后无 hook 事件扶正）则判为已退出回落 idle，否则降为 ai-idle。三条兜底的结论都**一次性落盘**进 hook 状态，触发一次即收敛不再摆动，且 cause 一律不是 `Stop`，因此不会被当成「任务完成」播报（这正是 v0.9.3 删掉无记忆版兜底的原因）；正等用户批准的面板（如 Codex 的 `PermissionRequest`）豁免停摆判定，否则会连托盘黄灯一并抹掉
 - **状态聚合** — 面板 → 标签页 → 项目逐层聚合，优先级 `error > ai-working > ai-idle > idle`
 - **完成提醒三件套** — AI 任务从 working → idle、且成因确为 `Stop` 事件时立刻触发（权限请求、通知、澄清同样落到 `ai-idle`，不再被误报为任务完成；无 hook 的降级路径仍以下降沿为准）：
@@ -185,7 +186,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 | 用量统计 | rusqlite 0.40 本地账本 · recharts 3 趋势图 · chrono-tz 时区分桶 |
 | Tauri 插件 | `window-state` · `clipboard-manager` · `dialog` · `opener` |
 | 移动端中转 | axum + tokio WebSocket 中转服务（`relay-server/`）· React + TS + Vite PWA（`mobile/`） |
-| 测试覆盖 | 601 个 Rust 测试 = 桌面端 548（tauri-app 394 + mt-core 44 + mt-ssh 26 + mt-sidecars 84）+ 中转服务端 53（协议与路由）；另有 74 个 Node 测试 |
+| 测试覆盖 | 609 个 Rust 测试 = 桌面端 556（tauri-app 402 + mt-core 44 + mt-ssh 26 + mt-sidecars 84）+ 中转服务端 53（协议与路由）；另有 77 个 Node 测试 |
 
 ## 快速开始
 
@@ -335,7 +336,7 @@ mini-term/
 ├── scripts/
 │   ├── stage-sidecars.mjs        # 构建 sidecar 并按 triple 就位为 Tauri externalBin
 │   └── stage-conpty.mjs          # 下载校验并就位固定版本 ConPTY 运行时（Windows）
-├── tests/                        # Node 侧测试（ConPTY 打包 / TUI 滚动 / 布局恢复 / 主题兼容 / WSL 路径 / worktree 收敛等 18 个文件、74 条用例）
+├── tests/                        # Node 侧测试（ConPTY 打包 / TUI 滚动 / 布局恢复 / 主题兼容 / WSL 路径 / worktree 收敛等 18 个文件、77 条用例）
 └── package.json
 ```
 
@@ -397,14 +398,14 @@ ToastContainer 悬浮于右下角，SettingsModal / SshModal / MobileRelayModal 
 # 前端类型检查（tsc + vite build）
 npm run build
 
-# Node 侧测试（18 个文件、74 条用例）
+# Node 侧测试（18 个文件、77 条用例）
 node --test "tests/*.test.cjs"
 
-# 桌面端 Rust 测试（548 个）
+# 桌面端 Rust 测试（556 个）
 # 注意：mt-core / mt-ssh / mt-sidecars 是独立 crate 而非 workspace member，
-# 单跑 `cd src-tauri && cargo test` 只覆盖 tauri-app 的 394 个，其余三个要分别指定 manifest。
+# 单跑 `cd src-tauri && cargo test` 只覆盖 tauri-app 的 402 个，其余三个要分别指定 manifest。
 cd src-tauri
-cargo test                                        # tauri-app     394
+cargo test                                        # tauri-app     402
 cargo test --manifest-path mt-core/Cargo.toml     # mt-core        44
 cargo test --manifest-path mt-ssh/Cargo.toml      # mt-ssh         26
 cargo test --manifest-path mt-sidecars/Cargo.toml # mt-sidecars    84

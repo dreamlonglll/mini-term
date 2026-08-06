@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.10.3-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.10.4-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -52,7 +52,7 @@ Mini-Term solves all of the above with one lightweight desktop app.
 - **Long-text paste** — When clipboard text is ≥10 lines or ≥2000 chars, it is automatically saved to a temporary `.txt` and a quoted file path is pasted instead, avoiding the performance and paste-bracket issues of feeding huge content straight to AI tools.
 - **Image paste** — Detects screenshots in the clipboard, saves them to a temporary PNG via the Win32 API, and pastes a quoted path; compatible with non-standard formats such as PinPix.
 - **Remote / WSL paste lands where the agent can read it** — Both "save to a file, paste the path" features above automatically remap their destination in remote terminals: SSH remote projects upload the file over SFTP and paste the **remote** path (default `<project root>/.mini-term/pasted`, inside the project so agents need no extra permission; configurable to `/tmp/mini-term`, `~/uploads`, etc., and a self-ignoring `.gitignore` is written so your `git status` stays clean), while WSL projects rewrite `C:\...` into `/mnt/c/...` (no upload needed). Upload failures raise an explicit toast instead of pasting a local path the remote host cannot read.
-- **File drag & drop** — Dragging a file from the file tree or system file explorer onto the terminal inserts its quoted absolute path, targeting the exact split pane and handling paths with spaces.
+- **File drag & drop** — Dragging a file from the file tree or system file explorer onto the terminal inserts its quoted absolute path, targeting the exact split pane and handling paths with spaces. Press `Esc` mid-drag to cancel on the spot: no path is written to the PTY (that Esc is swallowed in the window capture phase, so it never reaches the terminal as `\x1b`), releasing the mouse doesn't degrade into a plain click that opens the file, and the hover outline is cleared along with it. Esc is only swallowed once the drag is actually active (past the 5px threshold), so Esc elsewhere still behaves normally.
 - **Multiple shell profiles** — Windows (cmd / powershell / pwsh), macOS (zsh / bash), Linux (bash / sh) and more, freely added or removed.
 
 ### SSH Connections
@@ -81,7 +81,8 @@ Mini-Term solves all of the above with one lightweight desktop app.
 ### AI Process Awareness
 
 - **Hook event system** — Integrates the official Claude Code / Codex Hook APIs to receive AI tool events (SessionStart / End, ToolUse, etc.), which is more precise and timely than process polling; the built-in `miniterm-hook` CLI is called by the hook system to POST events to a local server; the settings UI registers / unregisters the hook config with one click, merging rather than overwriting your existing hooks. Codex permission requests stay in `ai-working` through approval and tool execution, avoiding premature completion notifications.
-- **Real-time status detection** — Once hooks are reporting they are the status source for that pane; each polling round reads the hook state directly and never consults output activity (a TUI's idle redraws used to read as "working again," firing the completion notification over and over). Panes without hooks fall back to 500ms process polling, auto-detecting Claude / Codex / OpenCode and showing idle / working / error states.
+- **Real-time status detection** — Once hooks are reporting they are the status source for that pane; each polling round reads the hook state directly and never consults output activity (a TUI's idle redraws used to read as "working again," firing the completion notification over and over). Panes without hooks fall back to input detection (recognizing typed `claude` / `codex` / `opencode` / `pi` commands, with a line-snapshot fallback for ↑ history and Tab completion) plus 500ms output-activity polling, showing idle / working / error states.
+- **Agents identified by input detection alone** — `opencode` / `pi` have no hook integration and no parseable local session log: status badges, completion announcements, AI launchers, and mobile-initiated sessions all work, but the conversation mirror, the AI history panel, and usage stats stay empty for them. The mirror's heuristic binding is gated behind a whitelist (`mobile_mirror::agent_has_session_log`) — anything outside it returns an empty mirror rather than falling back to the newest Claude / Codex session file in the same project and pasting someone else's conversation into that pane. Command matching is an exact basename match, so `pip` / `ping` / `pixi` / `pi.py` are never mistaken for `pi`.
 - **Three fallbacks for a stuck badge** — `Stop` simply doesn't fire in several cases: a turn ending on an API error emits `StopFailure` instead (mapped to ai-idle, lighting the tray yellow so you know to resend), and a user interrupt via Esc / Ctrl+C emits nothing at all (settled from input detection, cause=`Interrupt`). Whatever those two miss is caught by a **stall check**: if the hook state sits at ai-working while both the state and the PTY output stay silent for 10 seconds, it converges — to `idle` when an exit was already triggered (Ctrl+D / double Ctrl+C / `/exit`, with no hook event since to prove otherwise), and to `ai-idle` otherwise. All three write their verdict into the hook state **once**, so they converge instead of oscillating, and none of them uses a `Stop` cause, so none is ever announced as a finished task (precisely why the memoryless version of this fallback was removed in v0.9.3). Panes awaiting user approval (Codex's `PermissionRequest`, for one) are exempt from the stall check, which would otherwise wipe out the tray's yellow light along with the badge.
 - **Status aggregation** — Aggregated layer by layer from pane → tab → project, with priority `error > ai-working > ai-idle > idle`.
 - **Completion notification trio** — Fires the moment an AI task goes working → idle *and* the cause is a `Stop` event (permission requests, notifications, and elicitations also land on `ai-idle` and are no longer misreported as completion; the hookless fallback path still keys off the falling edge alone):
@@ -185,7 +186,7 @@ Watch the AI running on your desktop from your phone while you're out, and send 
 | Usage stats | rusqlite 0.40 local ledger · recharts 3 trend charts · chrono-tz timezone bucketing |
 | Tauri plugins | `window-state` · `clipboard-manager` · `dialog` · `opener` |
 | Mobile relay | axum + tokio WebSocket relay service (`relay-server/`) · React + TS + Vite PWA (`mobile/`) |
-| Test coverage | 601 Rust tests = 548 desktop (tauri-app 394 + mt-core 44 + mt-ssh 26 + mt-sidecars 84) + 53 relay-server (protocol & routing); plus 74 Node tests |
+| Test coverage | 609 Rust tests = 556 desktop (tauri-app 402 + mt-core 44 + mt-ssh 26 + mt-sidecars 84) + 53 relay-server (protocol & routing); plus 77 Node tests |
 
 ## Getting Started
 
@@ -335,7 +336,7 @@ mini-term/
 ├── scripts/
 │   ├── stage-sidecars.mjs        # Builds sidecars and stages them per-triple as Tauri externalBin
 │   └── stage-conpty.mjs          # Downloads, verifies and stages the pinned ConPTY runtime (Windows)
-├── tests/                        # Node-side tests (18 files, 74 cases: ConPTY bundling / TUI scrollback / layout restore / theme compat / WSL path / worktree reconcile ...)
+├── tests/                        # Node-side tests (18 files, 77 cases: ConPTY bundling / TUI scrollback / layout restore / theme compat / WSL path / worktree reconcile ...)
 └── package.json
 ```
 
@@ -399,15 +400,15 @@ Before submitting, please run:
 # Frontend type check (tsc + vite build)
 npm run build
 
-# Node-side tests (18 files, 74 cases)
+# Node-side tests (18 files, 77 cases)
 node --test "tests/*.test.cjs"
 
-# Desktop Rust tests (548)
+# Desktop Rust tests (556)
 # Note: mt-core / mt-ssh / mt-sidecars are standalone crates, not workspace members.
-# Running `cd src-tauri && cargo test` alone only covers tauri-app's 394 — the other
+# Running `cd src-tauri && cargo test` alone only covers tauri-app's 402 — the other
 # three need their manifests specified explicitly.
 cd src-tauri
-cargo test                                        # tauri-app     394
+cargo test                                        # tauri-app     402
 cargo test --manifest-path mt-core/Cargo.toml     # mt-core        44
 cargo test --manifest-path mt-ssh/Cargo.toml      # mt-ssh         26
 cargo test --manifest-path mt-sidecars/Cargo.toml # mt-sidecars    84
