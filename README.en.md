@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.10.3-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.10.6-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -57,6 +57,8 @@ Status aggregates layer by layer from pane → tab → project (`error > ai-work
 
 And once the window is out of sight, the **status bar icon** takes over (Windows tray / macOS menu bar): yellow = awaiting confirmation, blue = working, green = unread completion, gray = quiet. Left-click and you land **on the session that needs you** — it switches projects, activates the specific pane and focuses the terminal, prioritized as "awaiting confirmation / error > finished first > working", the same ordering the title bar status light uses. Picking a project from the right-click menu jumps to the pane in that project most in need of attention. If you'd rather it not change your current view, turn that off in Settings.
 
+Beyond Claude / Codex, **opencode and pi** are recognized too — not through hooks, but by detecting the command you type. Status lights, completion announcements, and phone-side commands all work the same. What they don't have is a parseable local session log, so the conversation mirror, the AI history panel, and usage stats stay empty for them — and they never latch onto a Claude / Codex session from the same project instead.
+
 Once hooks are reporting, they are the status source for that pane: completion is keyed to the `Stop` event alone, so a permission prompt — also a "waiting for you" state — is not announced as a finished task. The remaining trouble is a **stuck badge**: `Stop` simply doesn't fire in several cases (a turn ending on an API error, you hitting Esc to interrupt), each of which is now covered by its own official event. On top of that sits a stall check: when both the status and the terminal output have been silent for 10 seconds the badge comes down, and if an exit was already triggered (Ctrl+D, double Ctrl+C, `/exit`) the pane is treated as exited. The fallback's verdict is written once and never oscillates, so there is no repeat of the early-version behavior where one task announced itself complete every twenty-odd seconds.
 
 ### 📱 Watch your desktop AI from your phone, anywhere
@@ -83,7 +85,7 @@ Data is parsed from your local session records into a **rusqlite ledger** — th
 
 ### 🔁 Restart without losing your AI sessions
 
-Close Mini-Term and open it again: the Claude / Codex session that was running in each split pane **resumes automatically via `--resume`** — session identity comes from hook reports, persists with the layout, and survives the restart. An allowlist guards everything written back into the terminal: unrecognizable ids are never written, remote panes are excluded — better to not resume than to type the wrong command. Don't want it typing commands for you? One switch under Settings → System turns it off — terminals still come back, they just don't run the resume.
+Close Mini-Term and open it again: the Claude / Codex session that was running in each split pane **resumes automatically via `--resume`** — session identity comes from hook reports, persists with the layout, and survives the restart. An allowlist guards everything written back into the terminal: unrecognizable ids are never written, remote panes are excluded — better to not resume than to type the wrong command. Don't want it typing commands for you? One switch under Settings → System → General turns it off — terminals still come back, they just don't run the resume.
 
 ### 🧰 Turn your SSH connections into tools your AI can call
 
@@ -114,7 +116,7 @@ Behind the CLI is a **machine-wide singleton daemon** holding the persistent con
 
 ### 🌿 Git integration + batch worktree management
 
-A VS Code-style **Changes panel** (Staged / Changes / Untracked groups, per-file or bulk stage / discard, `Ctrl+Enter` to commit), side-by-side and inline diff views, cursor-paginated commit history, and a **hand-drawn SVG branch topology graph** (lane-based layout and coloring, merge commits as a filled dot inside a ring, with TOPOLOGICAL sorting in the backend revwalk so a rebase can't break the lines).
+A VS Code-style **Changes panel** (Staged / Changes / Untracked groups, per-file or bulk stage / discard, `Ctrl+Enter` to commit), side-by-side and inline diff views, cursor-paginated commit history, and a **hand-drawn SVG branch topology graph** (lane-based layout and coloring, merge commits as a filled dot inside a ring, with TOPOLOGICAL sorting in the backend revwalk so a rebase can't break the lines). The Git panel stacks **two collapsible sections** — Changes on top, commit history below — visible at the same time, with a draggable divider and animated collapse / expand; a repo bar at the top switches repos via a dropdown, the branch badge switches which branch's history is shown (no checkout), and refresh / Pull / Push live on the same bar.
 
 **Worktree management** is especially handy for running several agents in parallel: when the project root isn't a repo itself, it **scans downward for sub-repos** and groups them by main worktree, with checkable group headers (multi-select / select-all) so you can **create one worktree per checked repo in a single action** (the branch dropdown offers the intersection of all repos' branches). Any worktree can be turned into a project in one click — mounted under its parent as a sub-project — or just opened in a terminal. **When an AI agent deletes a worktree from the terminal**, the list reconciles itself the moment the window regains focus: sub-projects whose directory is gone are removed along with their terminal resources, leaving no stale entries (cleanup only runs while the parent project still exists, so a disconnected drive can't wipe entries).
 
@@ -129,7 +131,7 @@ A VS Code-style **Changes panel** (Staged / Changes / Untracked groups, per-file
 | **Long-text paste** | Clipboard text ≥10 lines or ≥2000 chars is spilled to a temp `.txt` and pasted as a quoted path — your AI tool never has to swallow a wall of text |
 | **Image paste** | Screenshots in the clipboard are detected, saved as a temp PNG, and pasted as a path; handles non-standard formats like PinPix |
 | **Remote-aware landing** | Both of the above remap in remote terminals: SSH projects upload over SFTP and paste the **remote** path; WSL projects rewrite `C:\...` into `/mnt/c/...` |
-| **File drag & drop** | Drag from the file tree or Explorer onto the terminal to insert a quoted absolute path, landing in the exact split pane |
+| **File drag & drop** | Drag from the file tree or Explorer onto the terminal to insert a quoted absolute path, landing in the exact split pane; change your mind mid-drag and Esc cancels it on the spot — no path written, and no degrading into a plain click that opens the file |
 | **Built-in file editor** | Click any file in the tree to edit in place: CodeMirror 6 core with lazy-loaded syntax highlighting for 140+ languages, find & replace, code folding, multi-cursor, atomic `Ctrl+S` saves, external-change detection, and live Markdown preview of unsaved drafts |
 | **Global search** | `Ctrl+Shift+F` for filename or content search, substring or regex, streamed from the backend and cancellable anytime |
 | **Per-project env vars** | Injected into the PTY child process per project, with strict POSIX validation and a second defensive filter on the Rust side; passes through to WSL via WSLENV |
@@ -143,6 +145,7 @@ A VS Code-style **Changes panel** (Staged / Changes / Untracked groups, per-file
 | **Custom title bar** | Frameless window with a self-drawn title bar that follows your theme instead of the system's grey strip, adapted per platform — window controls on the right for Windows / Linux (Win11 Snap Layouts still pop up when you hover the maximize button), native traffic lights kept on macOS. The status light on the right aggregates AI state across every project; click it to jump to the next session needing you (earliest finished first) |
 | **Bilingual UI** | One click re-renders the whole interface in English / 中文, auto-detected from the system on first launch; in-house lightweight i18n, no extra runtime dependency |
 | **Ligatures** | Composes `==` `=>` `!=` `->` glyphs (needs a calt-table font such as Fira Code / JetBrains Mono) |
+| **Grouped settings panel** | A two-level sidebar: Terminal (Shell / Copy & paste), Appearance (Theme & language / Font), AI (Notifications / Hook events), System (General / Editors) — every page fits on one screen instead of scrolling half a page to find a toggle |
 
 ---
 
@@ -157,7 +160,7 @@ A VS Code-style **Changes panel** (Staged / Changes / Untracked groups, per-file
 | PTY / Git | portable-pty · git2 · notify + ignore |
 | Usage stats | rusqlite local ledger · recharts trend charts |
 | Mobile relay | axum + tokio WebSocket (`relay-server/`) · React + Vite PWA (`mobile/`) |
-| Tests | **601 Rust tests** (548 desktop + 53 relay) plus 74 Node tests |
+| Tests | **609 Rust tests** (556 desktop + 53 relay) plus 77 Node tests |
 
 ---
 

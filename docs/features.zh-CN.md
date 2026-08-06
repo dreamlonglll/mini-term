@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.10.3-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.10.6-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -52,7 +52,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 - **长文本粘贴** — 剪贴板文本 ≥10 行或 ≥2000 字符时自动转存为临时 `.txt` 并粘贴带引号的文件路径，避免 AI 工具直接处理超长内容引发性能与 paste bracket 问题
 - **图片粘贴** — 剪贴板含截图时自动检测，通过 Win32 API 保存为临时 PNG 并粘贴带引号的路径，兼容 PinPix 等非标准格式
 - **远程 / WSL 粘贴自动落地** — 上面两种「转存成文件再粘路径」的能力在远程终端里会自动换算落点：SSH 远程项目经 SFTP 把文件上传到远端目录后粘贴**远端**路径（默认 `<项目根>/.mini-term/pasted`，落在项目内 agent 无需额外授权即可读，目录可在设置中改成 `/tmp/mini-term`、`~/uploads` 等，并自动写入自忽略的 `.gitignore` 以免弄脏 `git status`）；WSL 项目则把 `C:\...` 换算为 `/mnt/c/...`（无需上传）。上传失败会明确弹提示，而不是粘一个远端读不到的本机路径
-- **文件拖拽** — 文件树或系统资源管理器拖文件到终端自动插入带引号的绝对路径，精准定位目标分屏 pane，兼容含空格的路径
+- **文件拖拽** — 文件树或系统资源管理器拖文件到终端自动插入带引号的绝对路径，精准定位目标分屏 pane，兼容含空格的路径；拖拽途中按 `Esc` 就地取消，路径不写入 PTY（这次 Esc 由 window capture 阶段吞掉，不会当成 `\x1b` 送进终端），松手也不会退化成一次普通点击把文件打开，悬停虚线框同步撤掉。只有越过 5px 阈值真正进入拖拽后才吞 Esc，别处的 Esc 照常生效
 - **多 Shell 配置** — Windows（cmd / powershell / pwsh）、macOS（zsh / bash）、Linux（bash / sh）等，可自由增删
 
 ### SSH 连接
@@ -81,7 +81,8 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 ### AI 进程感知
 
 - **Hook 事件系统** — 接入 Claude Code / Codex 官方 Hook API，接收 AI 工具事件（SessionStart / End、ToolUse 等），比进程轮询更精准及时；内置 `miniterm-hook` CLI 工具供 Hook 系统调用，自动 POST 事件到本地服务器；设置界面一键注册 / 卸载 Hook 配置，合并而非覆盖用户已有 hook。Codex 权限请求从审批到工具执行完成期间持续保持 `ai-working`，避免提前触发任务完成提醒
-- **实时状态检测** — Hook 一旦接入即为该面板的状态来源，逐轮状态直接由 hook 事件决定，不看输出活跃度（AI 空闲期 TUI 的定时重绘曾被误判为「又在工作」，导致完成通知反复触发）；无 hook 的面板降级为 500ms 进程轮询，自动识别 Claude / Codex / OpenCode，显示 idle / working / error 状态
+- **实时状态检测** — Hook 一旦接入即为该面板的状态来源，逐轮状态直接由 hook 事件决定，不看输出活跃度（AI 空闲期 TUI 的定时重绘曾被误判为「又在工作」，导致完成通知反复触发）；无 hook 的面板降级为输入检测（识别键入的 `claude` / `codex` / `opencode` / `pi` 命令，含 ↑ 历史与 Tab 补全的行快照兜底）加 500ms 输出活跃度轮询，显示 idle / working / error 状态
+- **只靠输入检测识别的 agent** — `opencode` / `pi` 没有接 hook，也没有可解析的本地会话记录：状态徽章、完成播报、AI 启动器与移动端发起会话四条链路照常可用，但对话镜像、AI 历史面板与用量统计对它们为空。镜像的启发式绑定据此设了白名单（`mobile_mirror::agent_has_session_log`），不在名单内直接返回空镜像，不会退而绑到同项目里最新的 Claude / Codex 会话文件、把别人的对话贴到这个 pane 上。命令匹配走 basename 全等，`pip` / `ping` / `pixi` / `pi.py` 不会被误判成 `pi`
 - **徽章卡死的三重兜底** — `Stop` 事件在若干情形下根本不触发：回合因 API 错误结束走 `StopFailure`（映射 ai-idle 并点黄灯提示回来重发）、用户按 Esc / Ctrl+C 打断则不发任何事件（由输入检测收敛，cause=`Interrupt`）；两者都覆盖不到的残余情况再由**停摆判定**兜底——hook 状态停在 ai-working 且状态与 PTY 输出双双静默 10 秒即收敛，此前已触发过退出（Ctrl+D / 双击 Ctrl+C / `/exit`，且之后无 hook 事件扶正）则判为已退出回落 idle，否则降为 ai-idle。三条兜底的结论都**一次性落盘**进 hook 状态，触发一次即收敛不再摆动，且 cause 一律不是 `Stop`，因此不会被当成「任务完成」播报（这正是 v0.9.3 删掉无记忆版兜底的原因）；正等用户批准的面板（如 Codex 的 `PermissionRequest`）豁免停摆判定，否则会连托盘黄灯一并抹掉
 - **状态聚合** — 面板 → 标签页 → 项目逐层聚合，优先级 `error > ai-working > ai-idle > idle`
 - **完成提醒三件套** — AI 任务从 working → idle、且成因确为 `Stop` 事件时立刻触发（权限请求、通知、澄清同样落到 `ai-idle`，不再被误报为任务完成；无 hook 的降级路径仍以下降沿为准）：
@@ -89,9 +90,9 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
   - 项目列表 DONE 徽章，点击清除
   - 任务栏闪烁（Windows）/ Dock 跳动（macOS），窗口失焦时才触发
   - 提示音播放（Web Audio API 合成默认音，支持自定义音频文件）
-  - 所有通知开关独立可配，设置中心单独「AI 完成通知」页面管理
+  - 所有通知开关独立可配，在「设置 → AI → 完成通知」页统一管理（Hook 注册另在同组的「Hook 事件」页）
 - **托盘状态灯** — 系统托盘常驻全局 AI 状态灯：黄=待确认、蓝=处理中、绿=完成未读、灰=安静，多状态并存且窗口失焦时轮播展示；右键托盘菜单按项目列出各自状态、点某项即定位到该项目内最该处理的那个 pane，左键唤起主窗口并跳到「下一个该我处理」的会话（与标题栏状态灯同一套落点，可在设置里关掉只唤起窗口；Linux 下仅右键菜单可用）；Notification 判定只认权限 / 确认类文案，API 错误与重试等待不点黄灯；可在设置中关闭
-- **会话自动续接** — 重启后每个分屏 pane 自动写入 `claude --resume` / `codex resume` 续回上次会话：会话身份由 hook 上报、随布局持久化，跨一次重启保留；写入终端前经白名单校验（仅字母数字与 `-_`、长度上限 128），远程 pane 不参与，识别不了的一律不写；可在「设置 → 系统」关闭（关掉后终端照常恢复，只是不自动跑续接命令）
+- **会话自动续接** — 重启后每个分屏 pane 自动写入 `claude --resume` / `codex resume` 续回上次会话：会话身份由 hook 上报、随布局持久化，跨一次重启保留；写入终端前经白名单校验（仅字母数字与 `-_`、长度上限 128），远程 pane 不参与，识别不了的一律不写；可在「设置 → 系统 → 常规」关闭（关掉后终端照常恢复，只是不自动跑续接命令）
 - **会话进出检测** — 命令 echo 识别进入 AI；双击 `Ctrl+C` / `Ctrl+D` 或 `exit` / `quit` / `:quit` / `/logout` 识别退出
 - **会话历史** — 读取本地 Claude / Codex 历史会话记录，右键复制恢复命令快速续接；首屏仅渲染 20 条，底部「加载更多」按钮按需展开（不再滚动即触发）
 - **会话查看** — 右键「查看」展示完整对话内容，User 纯文本 / Assistant Markdown 渲染（外链点击二次确认后调系统默认浏览器打开），支持 `Ctrl+F` 搜索高亮和 User 消息快速导航
@@ -131,21 +132,22 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 - **文件树** — 集成目录浏览器，自然排序（V1 → V2 → V10 而非字典序），嵌套 `.gitignore` 置灰（每层子目录的忽略规则与 `!pattern` 白名单都会生效，与 git 行为一致），`notify` 文件监听实时刷新
 - **文件操作** — 文件树内新建文件 / 文件夹、重命名、删除、查看内容（Markdown 渲染支持 HTML 标签和外部图片，外链点击二次确认后调系统默认浏览器打开，图片格式直接展示，HTML 文件 iframe 预览并自动解析相对路径资源，二进制与超大文件友好提示）
 - **内置文件编辑器** — 文件树点开文件即可就地编辑（CodeMirror 6 内核）：140+ 语言语法高亮按文件类型自动匹配、按需懒加载，查找替换（`Ctrl+F`，面板中文化）、代码折叠、括号匹配、多光标；`Ctrl+S` 原子落盘（临时文件 + rename，不怕写坏），CRLF 文件按原行尾往返不产生全文件 diff；有未保存修改时关闭 / 跳转先确认，文件被外部改动时干净则静默重载、脏则出提示条；Markdown / HTML 预览实时渲染未保存草稿；语法配色经 `--syn-*` 变量转引应用色板，自动跟随四套主题皮肤
-- **外部编辑器打开** — 文件树右上角按钮一键用配置的编辑器（默认 VS Code）打开当前项目，路径可在「设置 → 系统设置 → 外部编辑器」自定义；文件可用系统默认应用打开
+- **外部编辑器打开** — 文件树右上角按钮一键用配置的编辑器（默认 VS Code）打开当前项目，路径可在「设置 → 系统 → 外部编辑器」自定义；文件可用系统默认应用打开
 - **项目级环境变量** — 项目右键菜单「环境变量…」打开管理弹窗，行级 `[启用 checkbox][key][value][✕]` 布局，启动该项目终端时按项目注入到 PTY 子进程；严格 POSIX 校验（key 匹配 `^[A-Za-z_][A-Za-z0-9_]*$`、非 `MINITERM_` 前缀、不可用 `WSLENV`、项目内不重复，value 禁 `\n/\r/\0`）；Rust 端再加 `MINITERM_` 前缀 + `WSLENV` 防御性过滤，即便手改 `config.json` 绕过前端校验也无法破坏 hook 协议或 WSLENV 拼接；WSL 项目下环境变量通过 WSLENV 机制透传至 Linux bash（`/u` 单向不做路径翻译；`~/.bashrc` 中 `export` 同名变量会覆盖）
 
 ### Git 集成
 
 - **文件状态** — 文件树显示 Git 状态颜色（修改 / 新增 / 删除 / 冲突）
+- **变更 / 历史同屏** — Git 面板为上下两个可折叠区块：更改在上、提交历史在下，中缝可拖拽调节比例（钳 15%~85%），折叠 / 展开带动画且会话内记住折叠态与比例；面板顶部仓库栏下拉切换仓库（worktree 条目标 ⎇），分支徽章点击只切历史查看分支（不 checkout，查看非 HEAD 分支时高亮提示），刷新 / Pull / Push 集中在栏上，右键仓库名可在终端打开或进入 Worktree 管理
 - **变更 Diff** — 工作区文件变更的详细 Diff，Hunk 行级解析，并排 / 内联双视图，并排模式支持拖拽调节分隔比例，字号跟随终端字体设置
-- **提交历史** — 浏览仓库提交记录，游标分页加载（默认 30 条）
+- **提交历史** — 平铺展示顶部仓库栏选中仓库的提交记录，游标分页加载（默认 30 条）
 - **分支拓扑图** — 提交历史每行左侧绘制 SVG 拓扑图，按 lane 布局画出分支、合并与直穿连线，节点按 lane 上色、合并提交实心点套外环，汇入线用分支自身颜色的贝塞尔曲线并在根部渐变融入主线；后端 revwalk 追加 TOPOLOGICAL 排序，避免时钟偏移或 rebase 后父提交排在子提交之前导致连线断裂；commit 行只标注本仓库自己检出的分支，不再把其他工作区 / 远程分支全挂上来
 - **提交 Diff** — 查看任意提交的文件变更，逐文件切换
 - **分支信息** — 本地 / 远程分支列表
 - **源码控制面板** — VS Code 风格 Changes 面板，Staged / Changes / Untracked 分组展示，支持单文件和全量 stage / unstage / discard，`Ctrl+Enter` 快速提交，列表与树形视图切换
-- **Pull / Push** — 仓库行内按钮一键同步远端，支持刷新按钮重新加载提交记录与分支信息
+- **Pull / Push** — 顶部仓库栏按钮一键同步远端，刷新按钮重新加载提交记录与分支信息
 - **多仓库发现** — 自动扫描项目目录下所有 Git 仓库（递归 5 层，跳过 `node_modules` 等）
-- **Worktree 管理** — 项目右键菜单或 Git 面板仓库行右键打开「Worktree 管理」弹窗：列出全部 worktree、基于现有分支或新建分支创建、删除（可强制）、清理失效条目，增删后即时刷新仓库列表；worktree 可一键「设为项目」或直接在终端打开，pane 支持工作目录覆盖并随布局持久化、分屏继承目录。项目根目录本身不是仓库时会向下扫描子仓库，按主工作区归并为分组列表，组头可勾选多选 / 全选，一次为每个勾选的仓库各建一个 worktree（分支下拉取各仓库分支交集，路径框语义变为父目录并预览 `<仓库名>-<分支>` 落点，失败的逐仓库列出错误）
+- **Worktree 管理** — 项目右键菜单或 Git 面板顶部仓库栏右键打开「Worktree 管理」弹窗：列出全部 worktree、基于现有分支或新建分支创建、删除（可强制）、清理失效条目，增删后即时刷新仓库列表；worktree 可一键「设为项目」或直接在终端打开，pane 支持工作目录覆盖并随布局持久化、分屏继承目录。项目根目录本身不是仓库时会向下扫描子仓库，按主工作区归并为分组列表，组头可勾选多选 / 全选，一次为每个勾选的仓库各建一个 worktree（分支下拉取各仓库分支交集，路径框语义变为父目录并预览 `<仓库名>-<分支>` 落点，失败的逐仓库列出错误）
 
 ![Git 集成](screenshots/git.png)
 
@@ -164,8 +166,8 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 - **布局持久化** — 分屏比例、标签页、窗口大小 / 位置自动保存，重启恢复（`tauri-plugin-window-state`）
 - **关闭确认** — 关闭窗口时只按 AI 会话数量盘点（ai-working / ai-idle 的 pane），裸 shell 终端不计入，仅当存在 AI 会话时才弹确认并列出会话名清单；无论是否弹窗都会 flush 所有项目布局
 - **版本检查** — 启动时拉取 GitHub Release，有新版本时侧栏图标高亮提示、点击前往下载；版本号写入原生窗口标题
-- **中英双语界面** — 「设置 → 系统」一键切换中 / 英文，整个界面实时重渲染；首次启动按系统语言自动探测并记忆选择，重启保留。每个页面、每个功能的文案均已翻译，内置轻量 i18n 层（无额外运行时依赖）
-- **设置中心** — 统一的 SettingsModal 管理主题、字体、Shell、AI 通知等所有开关
+- **中英双语界面** — 「设置 → 外观 → 主题与语言」一键切换中 / 英文，整个界面实时重渲染；首次启动按系统语言自动探测并记忆选择，重启保留。每个页面、每个功能的文案均已翻译，内置轻量 i18n 层（无额外运行时依赖）
+- **设置中心** — 统一的 SettingsModal，侧栏为「分组 + 分页」两级菜单：终端（Shell / 复制粘贴）、外观（主题与语言 / 字体）、AI（完成通知 / Hook 事件）、系统（常规 / 外部编辑器），快捷键与关于留在顶级。按主题归组后每页只剩一屏左右，不再出现「一页塞九组控件、找个开关要滚半页」的老问题；分页 id 保留旧值，外部深链（`initialPage`）不因重排失效
 - **满屏图标体系** — 文件树 Material 主题文件 / 文件夹图标（含目录展开态），全量图标数据（gzip ≈1.2MB）独立 chunk 动态 import 按需加载，主包零增量，未就绪时回退原手绘符号；AI 品牌图标按需深路径引入纯 SVG 组件
 - **启动性能** — 字体本地打包（@fontsource woff2 随安装包分发，移除 Google Fonts 渲染阻塞外链），启动路径零网络请求、离线首帧不再挂等字体；五个重型弹窗（设置 / 文件查看 / 会话查看 / 移动端 / 统计）React.lazy 按需加载，主包 gzip 631KB → 378KB；Rust / WebView 统一时间轴启动埋点写 stderr，便于回归定位
 - **界面动效** — 弹窗 / 右键菜单 / 侧拉抽屉共用一套进出场动画：遮罩淡入、面板落下并放大到位，关闭时反向播完再卸载（期间冻结内容、退出覆盖物栈，不会在淡出中变空或仍吃 Esc）；右键菜单从光标位置展开，切换终端与新建分屏各有过渡。系统关掉窗口动画（`prefers-reduced-motion: reduce`）时这套转场照常保留，用量统计面板的数字滚动与图表补间同样豁免，只停掉状态点闪烁一类的循环动画
@@ -185,7 +187,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 | 用量统计 | rusqlite 0.40 本地账本 · recharts 3 趋势图 · chrono-tz 时区分桶 |
 | Tauri 插件 | `window-state` · `clipboard-manager` · `dialog` · `opener` |
 | 移动端中转 | axum + tokio WebSocket 中转服务（`relay-server/`）· React + TS + Vite PWA（`mobile/`） |
-| 测试覆盖 | 601 个 Rust 测试 = 桌面端 548（tauri-app 394 + mt-core 44 + mt-ssh 26 + mt-sidecars 84）+ 中转服务端 53（协议与路由）；另有 74 个 Node 测试 |
+| 测试覆盖 | 609 个 Rust 测试 = 桌面端 556（tauri-app 402 + mt-core 44 + mt-ssh 26 + mt-sidecars 84）+ 中转服务端 53（协议与路由）；另有 77 个 Node 测试 |
 
 ## 快速开始
 
@@ -256,8 +258,8 @@ mini-term/
 │   │   ├── TerminalInstance.tsx  # xterm.js 实例 + 右键菜单 + 文件拖拽
 │   │   ├── PaneGroup.tsx         # 分屏分组容器
 │   │   ├── MarkerList.tsx        # AI 任务标记下拉列表
-│   │   ├── GitHistory.tsx        # Git 仓库树 + 提交历史 + Pull / Push
-│   │   ├── GitHistoryContent.tsx # Git 提交历史内容渲染
+│   │   ├── GitHistory.tsx        # Git 面板容器：仓库栏 + 更改/历史折叠区块 + Pull / Push
+│   │   ├── GitHistoryContent.tsx # 选中仓库的提交历史列表渲染
 │   │   ├── GitChanges.tsx        # 源码控制面板（stage / unstage / commit）
 │   │   ├── CommitDiffModal.tsx   # 提交 Diff 查看器
 │   │   ├── DiffModal.tsx         # 工作区文件 Diff 查看器
@@ -269,7 +271,7 @@ mini-term/
 │   │   ├── MobileRelayModal.tsx  # 「移动端」面板（中转地址 / 连接状态 / 配对二维码 / AI 启动器）
 │   │   ├── AiLauncherSection.tsx # AI 启动器增删改（名称 / shell / 命令 + 命令识别警告）
 │   │   ├── RelayStatusBadge.tsx  # 中转连接状态角标
-│   │   ├── SettingsModal.tsx     # 设置弹窗（主题 / 字体 / Shell / AI 通知 / Hook）
+│   │   ├── SettingsModal.tsx     # 设置弹窗（两级菜单：终端 / 外观 / AI / 系统 + 快捷键 / 关于）
 │   │   ├── LanguageToggle.tsx    # 中英语言切换
 │   │   ├── ToastContainer.tsx    # AI 完成 Toast 通知
 │   │   ├── DoneTag.tsx           # 项目列表 DONE 徽章
@@ -335,7 +337,7 @@ mini-term/
 ├── scripts/
 │   ├── stage-sidecars.mjs        # 构建 sidecar 并按 triple 就位为 Tauri externalBin
 │   └── stage-conpty.mjs          # 下载校验并就位固定版本 ConPTY 运行时（Windows）
-├── tests/                        # Node 侧测试（ConPTY 打包 / TUI 滚动 / 布局恢复 / 主题兼容 / WSL 路径 / worktree 收敛等 18 个文件、74 条用例）
+├── tests/                        # Node 侧测试（ConPTY 打包 / TUI 滚动 / 布局恢复 / 主题兼容 / WSL 路径 / worktree 收敛等 18 个文件、77 条用例）
 └── package.json
 ```
 
@@ -397,14 +399,14 @@ ToastContainer 悬浮于右下角，SettingsModal / SshModal / MobileRelayModal 
 # 前端类型检查（tsc + vite build）
 npm run build
 
-# Node 侧测试（18 个文件、74 条用例）
+# Node 侧测试（18 个文件、77 条用例）
 node --test "tests/*.test.cjs"
 
-# 桌面端 Rust 测试（548 个）
+# 桌面端 Rust 测试（556 个）
 # 注意：mt-core / mt-ssh / mt-sidecars 是独立 crate 而非 workspace member，
-# 单跑 `cd src-tauri && cargo test` 只覆盖 tauri-app 的 394 个，其余三个要分别指定 manifest。
+# 单跑 `cd src-tauri && cargo test` 只覆盖 tauri-app 的 402 个，其余三个要分别指定 manifest。
 cd src-tauri
-cargo test                                        # tauri-app     394
+cargo test                                        # tauri-app     402
 cargo test --manifest-path mt-core/Cargo.toml     # mt-core        44
 cargo test --manifest-path mt-ssh/Cargo.toml      # mt-ssh         26
 cargo test --manifest-path mt-sidecars/Cargo.toml # mt-sidecars    84

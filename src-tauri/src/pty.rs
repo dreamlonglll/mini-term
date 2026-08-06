@@ -377,7 +377,13 @@ impl InputState {
     }
 }
 
-const AI_COMMANDS: &[&str] = &["claude", "codex", "opencode"];
+/// 交互式 AI CLI 的命令名。
+///
+/// `pi`（pi.dev，earendil-works/pi）只有两个字母，但匹配走 `ai_command_name` 的
+/// basename **全等**，`pip install` / `ping` / `pi.py` 都不会命中；它的
+/// `-p/--print`、`-h/--help`、`-v/--version` 与下面的非交互标志逐一对齐，
+/// 退出用的 `/quit` 也已在 `AI_EXIT_COMMANDS` 里，无需为它开特例。
+const AI_COMMANDS: &[&str] = &["claude", "codex", "opencode", "pi"];
 
 /// 这些标志表示非交互命令（仅输出信息后退出），不应触发 AI 会话状态
 const NON_INTERACTIVE_FLAGS: &[&str] = &["-v", "--version", "-h", "--help", "-p", "--print"];
@@ -1774,6 +1780,72 @@ mod tests {
     fn codex_help_not_ai_session() {
         let mgr = PtyManager::new();
         mgr.track_input(1, "codex --help\r");
+        assert!(!mgr.is_ai_session(1));
+    }
+
+    #[test]
+    fn detect_pi_command() {
+        let mgr = PtyManager::new();
+        mgr.track_input(1, "pi\r");
+        assert!(mgr.is_ai_session(1));
+    }
+
+    #[test]
+    fn pi_with_interactive_args() {
+        let mgr = PtyManager::new();
+        mgr.track_input(1, "pi --model claude-sonnet-5\r");
+        assert!(mgr.is_ai_session(1));
+    }
+
+    #[test]
+    fn pi_non_interactive_flags_not_ai_session() {
+        for cmd in ["pi -p \"hello\"\r", "pi --print x\r", "pi -v\r", "pi --help\r"] {
+            let mgr = PtyManager::new();
+            mgr.track_input(1, cmd);
+            assert!(!mgr.is_ai_session(1), "{cmd} 不应进入 AI 会话");
+        }
+    }
+
+    /// `pi` 只有两个字母,匹配必须是 basename 全等:任何以 pi 开头的常见命令
+    /// (pip / ping / pixi)或同名脚本(pi.py)都不能把 pane 标成 AI 会话。
+    #[test]
+    fn pi_prefixed_commands_not_ai_session() {
+        for cmd in [
+            "pip install requests\r",
+            "ping example.com\r",
+            "pixi run build\r",
+            "pi.py\r",
+            "python pi.py\r",
+        ] {
+            let mgr = PtyManager::new();
+            mgr.track_input(1, cmd);
+            assert!(!mgr.is_ai_session(1), "{cmd} 不应被认成 pi");
+        }
+    }
+
+    /// ↑ 召回历史里的 `pi`:输入缓冲是空的,只能靠行快照判定。
+    #[test]
+    fn pi_from_line_snapshot() {
+        let mgr = PtyManager::new();
+        mgr.track_input(1, "\x1b[A");
+        mgr.track_input_with_line_snapshot(1, "\r", Some("PS D:\\Git\\mini-term> pi"));
+        assert!(mgr.is_ai_session(1));
+    }
+
+    #[test]
+    fn pip_from_line_snapshot_not_ai_session() {
+        let mgr = PtyManager::new();
+        mgr.track_input(1, "\x1b[A");
+        mgr.track_input_with_line_snapshot(1, "\r", Some("PS D:\\Git\\mini-term> pip install x"));
+        assert!(!mgr.is_ai_session(1));
+    }
+
+    #[test]
+    fn slash_quit_exits_pi_session() {
+        let mgr = PtyManager::new();
+        mgr.track_input(1, "pi\r");
+        assert!(mgr.is_ai_session(1));
+        mgr.track_input(1, "/quit\r");
         assert!(!mgr.is_ai_session(1));
     }
 

@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.10.3-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.10.6-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -57,6 +57,8 @@ Mini-Term 就是为这件事做的：项目列表上的状态灯实时跳动，A
 
 窗口切走之后还有**状态栏图标**接力（Windows 托盘 / macOS 菜单栏）：黄=待确认、蓝=处理中、绿=完成未读、灰=安静。左键点一下**直接落到该处理的那个会话**——切项目 + 激活到具体分屏并聚焦终端，优先级是「待确认/异常 > 最先完成 > 处理中」，与标题栏状态灯同一套口径；右键菜单里点某个项目则定位到该项目内最该处理的分屏。不想让它改变当前视图的话，设置里可以关掉。
 
+Claude / Codex 之外，终端里跑 **opencode / pi** 也会被认出来——不靠 hook，而是识别你敲下的命令，状态灯、完成播报与手机端发指令照常可用；只是这两家没有可解析的本地会话记录，所以对话镜像、AI 历史面板和用量统计对它们是空的，也不会去蹭同项目里 Claude / Codex 的会话。
+
 Hook 一旦接入，就是该面板的状态来源：完成信号只认 `Stop` 事件，权限审批框弹出同样是「在等你」，不会被当作任务完成。剩下的麻烦是**徽章卡住**——`Stop` 在若干情形下根本不触发（回合因 API 错误结束、你自己按 Esc 打断），这些已按官方事件逐个补齐；再兜一层「停摆判定」：状态与终端输出双双静默 10 秒就把徽章摘下来，此前若已触发过退出（Ctrl+D、连按两次 Ctrl+C、`/exit`）则直接判为已退出。兜底结论一次写定、不会来回摆动，所以不会重演早期版本那种「同一个任务每隔二三十秒播报一次完成」。
 
 ### 📱 出门在外，用手机看桌面上跑着的 AI
@@ -83,7 +85,7 @@ Hook 一旦接入，就是该面板的状态来源：完成信号只认 `Stop` �
 
 ### 🔁 重启不断线：AI 会话自动续接
 
-关掉 Mini-Term 再打开，上次每个分屏里跑着的 Claude / Codex 会**自动 `--resume` 续回原会话**——会话身份来自 hook 上报、随布局一起持久化，跨一次重启还在。写回终端前有白名单校验兜底：识别不了的一律不写，远程 pane 不参与，宁可不续也不敲错命令。不想让它自己敲命令的，「设置 → 系统」一个开关关掉——终端照常恢复，只是不自动跑续接。
+关掉 Mini-Term 再打开，上次每个分屏里跑着的 Claude / Codex 会**自动 `--resume` 续回原会话**——会话身份来自 hook 上报、随布局一起持久化，跨一次重启还在。写回终端前有白名单校验兜底：识别不了的一律不写，远程 pane 不参与，宁可不续也不敲错命令。不想让它自己敲命令的，「设置 → 系统 → 常规」一个开关关掉——终端照常恢复，只是不自动跑续接。
 
 ### 🧰 把你的 SSH 连接，变成 AI 能调用的工具
 
@@ -114,7 +116,7 @@ CLI 背后是**全机单例 daemon** 持有的持久连接池：首次调用自�
 
 ### 🌿 Git 集成 + Worktree 批量管理
 
-VS Code 风格的 **Changes 面板**（Staged / Changes / Untracked 分组，单文件或全量 stage / discard，`Ctrl+Enter` 提交），并排 / 内联双视图 Diff，游标分页的提交历史，以及**手绘 SVG 分支拓扑图**（按 lane 布局与上色，合并提交实心点套外环，后端 revwalk 加 TOPOLOGICAL 排序避免 rebase 后连线断裂）。
+VS Code 风格的 **Changes 面板**（Staged / Changes / Untracked 分组，单文件或全量 stage / discard，`Ctrl+Enter` 提交），并排 / 内联双视图 Diff，游标分页的提交历史，以及**手绘 SVG 分支拓扑图**（按 lane 布局与上色，合并提交实心点套外环，后端 revwalk 加 TOPOLOGICAL 排序避免 rebase 后连线断裂）。Git 面板为**上下两个可折叠区块**——更改在上、提交历史在下，同屏可见、中缝拖拽调比例、折叠展开带动画；顶部仓库栏下拉切换仓库，分支徽章一键切换历史查看分支（不 checkout），刷新 / Pull / Push 也收在栏上。
 
 **Worktree 管理**对多 Agent 并行开发特别有用：项目根目录本身不是仓库时会**向下扫描子仓库**并按主工作区归并，组头可勾选多选 / 全选，**一次为每个勾选的仓库各建一个 worktree**（分支下拉取各仓库分支的交集）。建好的 worktree 可以一键「设为项目」挂到主项目下面成为子项目，或者直接开个终端进去。**AI agent 在终端里把 worktree 删掉之后**，回到窗口时列表会自动把目录已消失的子项目连同终端资源一起收掉，不留失效条目（只在父项目还在时清理，盘符掉线不会误删）。
 
@@ -129,7 +131,7 @@ VS Code 风格的 **Changes 面板**（Staged / Changes / Untracked 分组，单
 | **长文本粘贴** | 剪贴板 ≥10 行或 ≥2000 字符时自动转存临时 `.txt`，粘贴带引号的路径——AI 工具不必硬吞超长内容 |
 | **图片粘贴** | 剪贴板里有截图自动检测，存成临时 PNG 并粘路径，兼容 PinPix 等非标准格式 |
 | **远程自动落地** | 上面两种粘贴在 SSH 远程项目里会经 SFTP 传到远端再粘**远端**路径；WSL 项目自动把 `C:\...` 换算成 `/mnt/c/...` |
-| **文件拖拽** | 从文件树或资源管理器拖文件到终端，插入带引号的绝对路径，精准落到目标分屏 |
+| **文件拖拽** | 从文件树或资源管理器拖文件到终端，插入带引号的绝对路径，精准落到目标分屏；拖到一半改主意按 Esc 就地取消，路径不写入、也不会退化成一次点击打开文件 |
 | **内置文件编辑器** | 文件树点开即改：CodeMirror 6 内核，140+ 语言语法高亮按需加载，查找替换、代码折叠、多光标，`Ctrl+S` 原子落盘，外部改动自动感知，Markdown 实时预览未保存草稿 |
 | **全局搜索** | `Ctrl+Shift+F` 唤起，文件名 / 内容双模式，子串或正则，后端流式推送随时可取消 |
 | **项目级环境变量** | 按项目注入 PTY 子进程，严格 POSIX 校验，Rust 端二次防御，WSL 下经 WSLENV 透传 |
@@ -143,6 +145,7 @@ VS Code 风格的 **Changes 面板**（Staged / Changes / Untracked 分组，单
 | **自定义标题栏** | 无边框窗口 + 自绘标题栏，配色跟着主题走不再是系统那条灰白；按平台适配习惯——Windows / Linux 右侧三键并保留 Win11 贴靠布局（悬停最大化按钮弹分屏菜单），macOS 保留原生交通灯。右侧状态灯汇总所有项目的 AI 状态，点一下直接跳到下一个该处理的会话（最先完成的排最前） |
 | **中英双语** | 一键切换全界面实时重渲染，首次启动按系统语言探测，自研轻量 i18n 无额外运行时依赖 |
 | **连体字** | `==` `=>` `!=` `->` 合成 ligature glyph（需 Fira Code / JetBrains Mono 等含 calt 表的字体） |
+| **设置面板分组** | 侧栏两级菜单：终端（Shell / 复制粘贴）、外观（主题与语言 / 字体）、AI（完成通知 / Hook 事件）、系统（常规 / 外部编辑器），每页只剩一屏，不用滚半页找开关 |
 
 ---
 
@@ -157,7 +160,7 @@ VS Code 风格的 **Changes 面板**（Staged / Changes / Untracked 分组，单
 | PTY / Git | portable-pty · git2 · notify + ignore |
 | 用量统计 | rusqlite 本地账本 · recharts 趋势图 |
 | 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`） |
-| 测试 | **601 个 Rust 测试**（桌面端 548 + 中转 53）+ 74 个 Node 测试 |
+| 测试 | **609 个 Rust 测试**（桌面端 556 + 中转 53）+ 77 个 Node 测试 |
 
 ---
 

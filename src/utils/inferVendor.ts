@@ -12,6 +12,10 @@ export type { AiVendor };
 // 顺序即优先级:openai 的关键词面最宽(gpt/o1–o4),放最后避免误伤;
 // o1–o4 系列用前后非字母数字的 \b 边界防止匹配到普通单词(如 "foo3")。
 const RULES: [AiVendor, RegExp][] = [
+  // pi 放最前:它是多模型 harness,`pi --model claude-sonnet-5` 这种命令下
+  // harness 才是该显示的厂商。反向不会误伤——claude / copilot / opencode
+  // 里的 "pi" 都不在词边界上(\bpi\b 不匹配 "copilot"),pip/ping 同理。
+  ['pi', /\bpi\b/i],
   ['claude', /\b(claude|anthropic)\b/i],
   ['gemini', /\bgemini\b/i],
   ['opencode', /\bopencode\b/i],
