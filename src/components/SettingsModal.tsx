@@ -1673,7 +1673,7 @@ function ThemeCard({
     >
       {/* 缩小版实际效果:背景图 + 压暗层 + 迷你侧栏/终端界面 */}
       <div
-        className="relative h-24 rounded-[var(--radius-sm)] border border-[var(--border-subtle)] overflow-hidden"
+        className="relative w-full h-24 rounded-[var(--radius-sm)] border border-[var(--border-subtle)] overflow-hidden"
         style={{ backgroundColor: colors.background }}
       >
         {imageUrl && (

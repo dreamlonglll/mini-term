@@ -314,9 +314,19 @@ export async function resolveThemeAssetUrl(dir: string, themeId: string, file: s
   if (cached) return cached;
   const assetUrl = convertFileSrc(`${dir}/${file}`);
   const ok = await new Promise<boolean>((resolve) => {
+    // 部分 WebView 环境对 asset 协议既不 onload 也不 onerror(静默挂起),
+    // 无超时会卡住整个解析、base64 兜底永远走不到,卡片静默无图;
+    // 超时一律视为「asset 不可用」落兜底(本地文件正常加载仅数十 ms)
     const probe = new Image();
-    probe.onload = () => resolve(true);
-    probe.onerror = () => resolve(false);
+    const timer = window.setTimeout(() => resolve(false), 1500);
+    probe.onload = () => {
+      window.clearTimeout(timer);
+      resolve(true);
+    };
+    probe.onerror = () => {
+      window.clearTimeout(timer);
+      resolve(false);
+    };
     probe.src = assetUrl;
   });
   const url = ok
