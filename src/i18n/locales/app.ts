@@ -26,6 +26,8 @@ export const app = {
         done: "有会话已完成，点击前往最先完成的",
         idle: "没有正在运行的 AI 会话",
       },
+      projectSwitcher: "当前项目，点击切换",
+      noAiProjects: "暂无进入 AI 会话的项目",
     },
     update: {
       badge: "新版本 {version}",
@@ -41,6 +43,7 @@ export const app = {
       attention: "待确认",
       working: "处理中",
       done: "已完成",
+      idle: "AI 空闲",
     },
     trayWorking: "{count} 个处理中",
     trayDone: "{count} 个已完成",
@@ -82,6 +85,8 @@ export const app = {
         done: "A session finished — click to jump to the earliest one",
         idle: "No AI sessions running",
       },
+      projectSwitcher: "Current project — click to switch",
+      noAiProjects: "No projects with AI sessions",
     },
     update: {
       badge: "New version {version}",
@@ -97,6 +102,7 @@ export const app = {
       attention: "Awaiting confirmation",
       working: "Working",
       done: "Completed",
+      idle: "AI idle",
     },
     trayWorking: "{count} working",
     trayDone: "{count} completed",

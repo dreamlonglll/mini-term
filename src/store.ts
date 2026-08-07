@@ -208,27 +208,42 @@ export function clearPaneAttentionByPty(ptyId: number): void {
 
 // === 菜单栏状态灯 ===
 // 聚合全部 pane 状态推送 Rust 托盘(黄=待确认/异常 蓝=处理中 绿=完成未读)。
-// 同时按项目生成右键菜单明细(只列活跃项目,按 黄>蓝>绿 排序,上限可配)。
+// 同时按项目生成右键菜单明细(列出所有进入 AI agent 的项目,含 ai-idle 空闲
+// 待命的,按 黄>蓝>绿>灰 排序,上限可配)。
 // 签名去重:聚合结果没变不打 IPC。
 // seq:单调递增序号随每次推送带给后端——command 在 Rust 线程池上可能乱序
 // 执行,后端按序号丢弃过期推送,防止旧状态覆盖新状态。
-let lastTraySig = '';
-let traySeq = 0;
-export function syncTrayStatus(): void {
-  const { projectStates, unreadDonePaneIds, config } = useAppStore.getState();
-  const enabled = config.trayStatusEnabled ?? true;
-  const maxProjects = config.trayMaxProjects ?? 5;
 
+/** 进入 AI agent 的项目在托盘菜单/标题栏项目切换器里的一条明细。 */
+export interface AiProjectEntry {
+  id: string;
+  name: string;
+  kind: 'attention' | 'working' | 'done' | 'idle';
+}
+
+const AI_PROJECT_KIND_ORDER = { attention: 0, working: 1, done: 2, idle: 3 } as const;
+
+/** 聚合出所有进入 AI agent 的项目(任一 pane 有 AI 会话,含 ai-idle 空闲待命),
+ *  每项目取最高优先级档位,按 attention > working > done > idle 排序。
+ *  done 的判据集合由调用方给:托盘用 unreadDonePaneIds(看窗口焦点),
+ *  标题栏用 aiDoneOrder(与全局状态灯同一套语义)。
+ *  同时返回按 pane 计数的 attention/working/done(托盘灯与 tooltip 用,
+ *  ai-idle 不点灯——它只是「agent 在场」,不需要吸引注意)。 */
+export function collectAiProjects(
+  projectStates: Map<string, ProjectState>,
+  projects: ProjectConfig[],
+  donePaneIds: { has(id: string): boolean },
+): { attention: number; working: number; done: number; entries: AiProjectEntry[] } {
   let attention = 0;
   let working = 0;
   let done = 0;
-  // 每个活跃项目的状态聚合:优先级 attention > working > done
-  const perProject: { id: string; name: string; kind: 'attention' | 'working' | 'done' }[] = [];
+  const entries: AiProjectEntry[] = [];
   for (const [pid, ps] of projectStates) {
     if (!ps.layout) continue;
     let pAttention = false;
     let pWorking = false;
     let pDone = false;
+    let pIdle = false;
     for (const pane of collectPanes(ps.layout)) {
       if (pane.status === 'error' || pane.attention) {
         attention++;
@@ -236,27 +251,43 @@ export function syncTrayStatus(): void {
       } else if (pane.status === 'ai-working') {
         working++;
         pWorking = true;
+      } else if (pane.status === 'ai-idle') {
+        pIdle = true;
       }
       // 只数仍存在的 pane(关掉即失效);又开始工作的不再算「未读完成」
-      if (unreadDonePaneIds.has(pane.id) && pane.status !== 'ai-working') {
+      if (donePaneIds.has(pane.id) && pane.status !== 'ai-working') {
         done++;
         pDone = true;
       }
     }
-    if (pAttention || pWorking || pDone) {
-      const name = config.projects.find((p) => p.id === pid)?.name ?? pid;
-      perProject.push({
+    if (pAttention || pWorking || pDone || pIdle) {
+      const name = projects.find((p) => p.id === pid)?.name ?? pid;
+      entries.push({
         id: pid,
         name,
-        kind: pAttention ? 'attention' : pWorking ? 'working' : 'done',
+        kind: pAttention ? 'attention' : pWorking ? 'working' : pDone ? 'done' : 'idle',
       });
     }
   }
+  entries.sort((a, b) => AI_PROJECT_KIND_ORDER[a.kind] - AI_PROJECT_KIND_ORDER[b.kind]);
+  return { attention, working, done, entries };
+}
 
-  const KIND_ORDER = { attention: 0, working: 1, done: 2 } as const;
-  const KIND_EMOJI = { attention: '🟡', working: '🔵', done: '🟢' } as const;
-  perProject.sort((a, b) => KIND_ORDER[a.kind] - KIND_ORDER[b.kind]);
-  const projects = perProject.slice(0, maxProjects).map((p) => ({
+let lastTraySig = '';
+let traySeq = 0;
+export function syncTrayStatus(): void {
+  const { projectStates, unreadDonePaneIds, config } = useAppStore.getState();
+  const enabled = config.trayStatusEnabled ?? true;
+  const maxProjects = config.trayMaxProjects ?? 5;
+
+  const { attention, working, done, entries } = collectAiProjects(
+    projectStates,
+    config.projects,
+    unreadDonePaneIds,
+  );
+
+  const KIND_EMOJI = { attention: '🟡', working: '🔵', done: '🟢', idle: '⚪' } as const;
+  const projects = entries.slice(0, maxProjects).map((p) => ({
     id: p.id,
     label: `${KIND_EMOJI[p.kind]} ${p.name} · ${t(`app.trayStatus.${p.kind}`)}`,
   }));
