@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.10.6-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.10.7-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -55,7 +55,7 @@ Status aggregates layer by layer from pane → tab → project (`error > ai-work
 - Taskbar flashing (Windows) / Dock bouncing (macOS), only when the window is unfocused
 - A notification sound (a built-in synthesized tone, or your own audio file)
 
-And once the window is out of sight, the **status bar icon** takes over (Windows tray / macOS menu bar): yellow = awaiting confirmation, blue = working, green = unread completion, gray = quiet. Left-click and you land **on the session that needs you** — it switches projects, activates the specific pane and focuses the terminal, prioritized as "awaiting confirmation / error > finished first > working", the same ordering the title bar status light uses. Picking a project from the right-click menu jumps to the pane in that project most in need of attention. If you'd rather it not change your current view, turn that off in Settings.
+And once the window is out of sight, the **status bar icon** takes over (Windows tray / macOS menu bar): yellow = awaiting confirmation, blue = working, green = unread completion, gray = quiet. Left-click and you land **on the session that needs you** — it switches projects, activates the specific pane and focuses the terminal, prioritized as "awaiting confirmation / error > finished first > working", the same ordering the title bar status light uses. The right-click menu lists **every project with an AI session** and its status (including ⚪ idle ones — not just the busy ones); picking a project jumps to the pane in it most in need of attention. If you'd rather it not change your current view, turn that off in Settings.
 
 Beyond Claude / Codex, **opencode and pi** are recognized too — not through hooks, but by detecting the command you type. Status lights, completion announcements, and phone-side commands all work the same. What they don't have is a parseable local session log, so the conversation mirror, the AI history panel, and usage stats stay empty for them — and they never latch onto a Claude / Codex session from the same project instead.
 
@@ -142,7 +142,7 @@ A VS Code-style **Changes panel** (Staged / Changes / Untracked groups, per-file
 | **Zero network requests at startup** | Fonts bundled locally (Google Fonts link removed), heavy modals all lazy-loaded; main bundle gzip down from 631KB to 378KB |
 | **End-to-end backpressure** | When you `cat` a huge file or an AI floods the pane, a growing frontend backlog pushes back all the way to the flooding process — a slow terminal slows the process down instead of piling everything into memory. And if the renderer ever gets killed and reloads, PTYs left over from the previous round are reclaimed first, so one crash doesn't leak a whole set |
 | **Three themes + Blueprint skin** | Auto / Light / Dark (Warm Carbon), plus an optional sci-fi Blueprint skin; the title bar matches the theme, with no light flash on startup |
-| **Custom title bar** | Frameless window with a self-drawn title bar that follows your theme instead of the system's grey strip, adapted per platform — window controls on the right for Windows / Linux (Win11 Snap Layouts still pop up when you hover the maximize button), native traffic lights kept on macOS. The status light on the right aggregates AI state across every project; click it to jump to the next session needing you (earliest finished first) |
+| **Custom title bar** | Frameless window with a self-drawn title bar that follows your theme instead of the system's grey strip, adapted per platform — window controls on the right for Windows / Linux (Win11 Snap Layouts still pop up when you hover the maximize button), native traffic lights kept on macOS. Next to the version number sits a **project switcher**: a pill button always showing the current project with its AI status dot, whose dropdown lists every project with an AI session and its status — click to switch; the global status light sits right beside it — click to jump to the next session needing you (earliest finished first) |
 | **Bilingual UI** | One click re-renders the whole interface in English / 中文, auto-detected from the system on first launch; in-house lightweight i18n, no extra runtime dependency |
 | **Ligatures** | Composes `==` `=>` `!=` `->` glyphs (needs a calt-table font such as Fira Code / JetBrains Mono) |
 | **Grouped settings panel** | A two-level sidebar: Terminal (Shell / Copy & paste), Appearance (Theme & language / Font), AI (Notifications / Hook events), System (General / Editors) — every page fits on one screen instead of scrolling half a page to find a toggle |
