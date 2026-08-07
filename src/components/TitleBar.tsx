@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWindow } from '@tauri-apps/api/window';
-import { useAppStore } from '../store';
+import { useAppStore, collectAiProjects } from '../store';
 import { useTauriEvent } from '../hooks/useTauriEvent';
 import { collectPanes } from '../utils/layoutOps';
 import { focusAttentionTarget } from '../utils/attentionJump';
@@ -43,6 +43,13 @@ const ICON_LOGO = (
   <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round">
     <rect x="1.5" y="2.5" width="13" height="11" rx="1.5" />
     <path d="M4.5 6.5L6.5 8l-2 1.5M8.5 10h3" />
+  </svg>
+);
+
+// 项目切换器的下拉箭头:比窗口控制图标小一号,同样的细线风格
+const ICON_CHEVRON_DOWN = (
+  <svg width="9" height="9" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M1.5 3.25L5 6.75l3.5-3.5" />
   </svg>
 );
 
@@ -95,13 +102,35 @@ export function TitleBar({ version }: Props) {
   const t = useT();
   const projectStates = useAppStore((s) => s.projectStates);
   const aiDoneOrder = useAppStore((s) => s.aiDoneOrder);
+  const activeProjectId = useAppStore((s) => s.activeProjectId);
+  const projects = useAppStore((s) => s.config.projects);
   const [maximized, setMaximized] = useState(false);
+  // 项目切换器:始终显示当前项目,下拉列出进入 AI agent 的项目及状态
+  const [switcherOpen, setSwitcherOpen] = useState(false);
+  const switcherRef = useRef<HTMLDivElement>(null);
   // Windows 上最大化按钮那块是「非客户区」，鼠标消息不进 WebView，
   // CSS :hover 失效，悬停态只能由后端命中测试回传（见 window_snap.rs）
   const [ncMaxHover, setNcMaxHover] = useState(false);
   const maxButtonRef = useRef<HTMLButtonElement>(null);
 
   const light = computeLight(projectStates, aiDoneOrder);
+  const activeProject = projects.find((p) => p.id === activeProjectId);
+  // done 判据用 aiDoneOrder,与旁边的全局状态灯同一套语义(不看窗口焦点)
+  const aiProjects = collectAiProjects(projectStates, projects, aiDoneOrder).entries;
+  // 当前项目的 AI 状态档位;undefined = 当前项目没有 AI 会话
+  const activeKind = aiProjects.find((p) => p.id === activeProjectId)?.kind;
+
+  // 点击切换器外部关闭下拉
+  useEffect(() => {
+    if (!switcherOpen) return;
+    const handleClick = (e: MouseEvent) => {
+      if (switcherRef.current && !switcherRef.current.contains(e.target as Node)) {
+        setSwitcherOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClick);
+    return () => document.removeEventListener('mousedown', handleClick);
+  }, [switcherOpen]);
 
   useEffect(() => {
     const appWindow = getCurrentWindow();
@@ -183,30 +212,103 @@ export function TitleBar({ version }: Props) {
           Mini-Term
         </span>
         {version && <span className="text-[11px] text-[var(--text-muted)]">v{version}</span>}
+
+        {/* 项目切换器:始终显示当前项目;下拉列出进入 AI agent 的项目及状态,
+            点击项目 = 切过去并定位到它内部最该处理的 pane(与托盘菜单同一套落点)。
+            画成带边框的胶囊按钮并用竖线与品牌区隔开——纯文字紧挨版本号
+            会被误读成标题的一部分 */}
+        {activeProject && (
+          <>
+            <div className="mx-1 w-px h-3.5 bg-[var(--border-default)]" />
+            <div ref={switcherRef} data-no-drag className="relative">
+              <button
+                type="button"
+                className="flex items-center gap-1.5 max-w-[220px] h-[22px] pl-2 pr-1.5 rounded-full border border-[var(--border-default)] bg-[var(--bg-elevated)] text-xs text-[var(--text-primary)] hover:border-[var(--accent)] hover:bg-[var(--border-subtle)] transition-colors"
+                title={t('app.titleBar.projectSwitcher')}
+                onClick={() => setSwitcherOpen((v) => !v)}
+              >
+                {/* 当前项目自己的 AI 状态色点;没有 AI 会话时压暗,和全局灯一个口径 */}
+                <span
+                  className="w-1.5 h-1.5 rounded-full shrink-0"
+                  style={{
+                    backgroundColor: LIGHT_COLORS[activeKind ?? 'idle'],
+                    opacity: activeKind ? 1 : 0.45,
+                  }}
+                />
+                <span className="truncate">{activeProject.name}</span>
+                <span
+                  className="shrink-0 text-[var(--text-muted)] transition-transform duration-150"
+                  style={{
+                    transform: switcherOpen ? 'rotate(180deg)' : undefined,
+                    display: 'inline-block',
+                  }}
+                >
+                  {ICON_CHEVRON_DOWN}
+                </span>
+              </button>
+              {switcherOpen && (
+                <div className="absolute left-0 top-full z-50 mt-1.5 min-w-[220px] max-w-[320px] bg-[var(--bg-elevated)] border border-[var(--border-default)] rounded-[var(--radius-sm)] shadow-[var(--shadow-overlay)] overflow-hidden">
+                  {aiProjects.length === 0 && (
+                    <div className="px-3 py-2 text-xs text-[var(--text-muted)]">
+                      {t('app.titleBar.noAiProjects')}
+                    </div>
+                  )}
+                  {aiProjects.map((p) => (
+                    <div
+                      key={p.id}
+                      className={`flex items-center gap-2 px-3 py-1.5 text-xs cursor-pointer transition-colors duration-100 ${
+                        p.id === activeProjectId
+                          ? 'bg-[var(--accent-subtle)] text-[var(--accent)]'
+                          : 'text-[var(--text-primary)] hover:bg-[var(--border-subtle)]'
+                      }`}
+                      onClick={() => {
+                        setSwitcherOpen(false);
+                        // 定位不到目标(pane 已安静)也要把项目切过去,不能没反应
+                        if (!focusAttentionTarget(p.id)) {
+                          useAppStore.getState().setActiveProject(p.id);
+                        }
+                      }}
+                    >
+                      <span
+                        className="w-1.5 h-1.5 rounded-full shrink-0"
+                        style={{ backgroundColor: LIGHT_COLORS[p.kind] }}
+                      />
+                      <span className="truncate flex-1">{p.name}</span>
+                      <span className="shrink-0 text-[var(--text-muted)]">
+                        {t(`app.trayStatus.${p.kind}`)}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </>
+        )}
+
+        {/* 全局状态灯:点一下跳到下一个该处理的会话。原在窗口控制键旁,
+            随项目切换器挪到它右边——全局态和当前项目态在同一处看齐 */}
+        <button
+          data-no-drag
+          type="button"
+          className="self-stretch px-1.5 flex items-center justify-center group"
+          title={t(`app.titleBar.status.${light}`)}
+          aria-label={t(`app.titleBar.status.${light}`)}
+          onClick={() => focusAttentionTarget()}
+        >
+          <span
+            className={`w-2 h-2 rounded-full transition-transform group-hover:scale-125 ${
+              light === 'working' ? 'animate-blink' : ''
+            }`}
+            style={{
+              backgroundColor: LIGHT_COLORS[light],
+              opacity: light === 'idle' ? 0.45 : 1,
+            }}
+          />
+        </button>
       </div>
 
       {/* 中段留白 —— 这里是主要的拖拽区 */}
       <div className="flex-1" />
-
-      {/* 全局状态灯：点一下跳到下一个该处理的会话 */}
-      <button
-        data-no-drag
-        type="button"
-        className="px-2.5 flex items-center justify-center group"
-        title={t(`app.titleBar.status.${light}`)}
-        aria-label={t(`app.titleBar.status.${light}`)}
-        onClick={() => focusAttentionTarget()}
-      >
-        <span
-          className={`w-2 h-2 rounded-full transition-transform group-hover:scale-125 ${
-            light === 'working' ? 'animate-blink' : ''
-          }`}
-          style={{
-            backgroundColor: LIGHT_COLORS[light],
-            opacity: light === 'idle' ? 0.45 : 1,
-          }}
-        />
-      </button>
 
       {/* 窗口控制 —— macOS 用系统交通灯，这里不画 */}
       {!isMac && (

@@ -13,8 +13,9 @@
 //! (NSStatusItem 只能在主线程操作)。策略:聚焦不闪;失焦多状态 =
 //! 同一灯位颜色轮转;失焦单状态 = 状态变化后短促亮暗呼吸几轮再定格全亮。
 //!
-//! 交互:左键唤起主窗口并跳最高优先级项目;右键菜单列出活跃项目
-//! (前端聚合时生成,与灯的数据源一致),点击项目跳转。
+//! 交互:左键唤起主窗口并跳最高优先级项目;右键菜单列出所有进入
+//! AI agent 的项目及状态(含 ai-idle 空闲待命的,前端聚合时生成,
+//! 与灯的数据源一致),点击项目跳转。
 
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -170,7 +171,7 @@ fn apply_full(app: &AppHandle, state: &SharedTrayState) {
         Some(tooltip.as_str())
     });
 
-    // 重建右键菜单:活跃项目列表(数量小,整个重建成本可忽略)
+    // 重建右键菜单:进入 AI agent 的项目列表(数量小,整个重建成本可忽略)
     let mut builder = MenuBuilder::new(app);
     for (id, label) in &projects {
         if let Ok(item) = MenuItemBuilder::with_id(format!("proj:{}", id), label).build(app) {
@@ -251,7 +252,7 @@ fn focus_main_window(app: &AppHandle) {
     }
 }
 
-/// 托盘菜单里的一个活跃项目(label 由前端拼好,含 emoji 灯色与 i18n 状态文案)
+/// 托盘菜单里的一个进入 AI agent 的项目(label 由前端拼好,含 emoji 灯色与 i18n 状态文案)
 #[derive(Deserialize)]
 pub struct TrayProjectEntry {
     pub id: String,
