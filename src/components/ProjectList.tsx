@@ -800,7 +800,6 @@ export function ProjectList() {
           );
           showContextMenu(e.clientX, e.clientY, menuItems);
         }}
-        title={project.path}
       >
         {renderDropLine(project.id, 'before')}
         {isActive && (

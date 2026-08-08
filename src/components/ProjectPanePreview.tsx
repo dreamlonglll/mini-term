@@ -25,8 +25,8 @@ import type { PaneState, ProjectConfig } from '../types';
  * 布局元数据,显示「未启动」占位。浮层打开期间 500ms 重画,预览是活的。
  */
 
-const CARD_WIDTH = 264;
-const MAX_PANES = 6;
+const CARD_WIDTH = 520;
+const MAX_PANES = 4;
 /** 与 ITheme 的 16 色字段一一对应,顺序即 ANSI 索引 */
 const THEME_PALETTE_KEYS = [
   'black', 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white',
@@ -79,7 +79,8 @@ function PaneThumb({ pane, label, tick, exited }: {
       </div>
       {cached ? (
         <div className="relative rounded-[var(--radius-sm)] overflow-hidden border border-[var(--border-subtle)]">
-          <canvas ref={canvasRef} className="block w-full h-auto" />
+          {/* 高终端裁顶留底:底部是最新输出/TUI 输入区,正是缩略图要看的 */}
+          <canvas ref={canvasRef} className="block w-full h-auto max-h-[240px] object-cover object-bottom" />
           {exited && (
             <div className="absolute inset-0 flex items-center justify-center bg-black/45 text-xs text-[var(--text-secondary)]">
               {t('projectList.preview.disconnected')}
@@ -136,16 +137,24 @@ export function ProjectPanePreview({ project, anchorRect }: Props) {
   return (
     <div
       ref={ref}
-      className="fixed z-50 pointer-events-none rounded-md border shadow-lg"
+      className="fixed z-50 pointer-events-none rounded-md border"
       style={{
-        left: anchorRect.right + 8,
+        left: Math.min(anchorRect.right + 8, window.innerWidth - CARD_WIDTH - 8),
         top,
         width: CARD_WIDTH,
-        background: 'var(--bg-elevated)',
-        borderColor: 'var(--border-subtle)',
+        // 与 .ctx-menu 同配方:半透明皮肤(背景图主题)下毛玻璃托底,内容不透底
+        background: 'var(--bg-overlay)',
+        borderColor: 'var(--border-strong)',
+        boxShadow: 'var(--shadow-overlay)',
+        backdropFilter: 'blur(12px)',
         animation: 'overlayFadeIn 0.15s ease-out',
       }}
     >
+      {/* 卡头:项目名 + 绝对路径。路径原先挂在行 title 上,原生 tooltip 会盖住浮层,挪到这里 */}
+      <div className="flex items-baseline gap-2 px-2 pt-2 min-w-0">
+        <span className="text-xs font-medium text-[var(--text-primary)] flex-shrink-0">{project.name}</span>
+        <span className="text-[11px] text-[var(--text-muted)] truncate">{project.path}</span>
+      </div>
       {shown.map(({ pane, leafIndex }, i) => (
         <div key={pane.id}>
           {/* 分屏叶子之间加分隔线,同叶子内的 tab 连排 */}
