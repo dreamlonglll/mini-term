@@ -10,6 +10,11 @@ export const projectList = {
     remoteBadgeTitle: "远程项目 · {summary}",
     worktreeBadgeTitle: "Git worktree · 分支 {branch}",
     remoteBrokenBadge: "断链",
+    preview: {
+      notStarted: "未启动",
+      disconnected: "已断开",
+      morePanes: "还有 {count} 个终端",
+    },
     remoteBrokenTitle: "SSH 连接已被删除，该远程项目暂不可用（可删除项目，或重新创建同名连接后重试）",
     newGroup: "新建分组",
     newGroupPlaceholder: "请输入分组名称",
@@ -64,6 +69,11 @@ export const projectList = {
     remoteBadgeTitle: "Remote project · {summary}",
     worktreeBadgeTitle: "Git worktree · branch {branch}",
     remoteBrokenBadge: "broken",
+    preview: {
+      notStarted: "Not started",
+      disconnected: "Disconnected",
+      morePanes: "{count} more terminals",
+    },
     remoteBrokenTitle: "The SSH connection was deleted; this remote project is unavailable (delete the project, or recreate the connection and retry)",
     newGroup: "New Group",
     newGroupPlaceholder: "Enter group name",
