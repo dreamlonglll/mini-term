@@ -27,6 +27,8 @@ dist-ssr
 .superpowers
 .tmp-tests/
 .scratch/
+.tmp/
+tmp/
 
 # Git worktrees
 .worktrees
