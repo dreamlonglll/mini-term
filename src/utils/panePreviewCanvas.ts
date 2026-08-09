@@ -1,4 +1,4 @@
-import type { PreviewGrid } from './panePreview';
+import type { PreviewGrid } from '../types';
 
 /**
  * 预览网格 → canvas 位图。

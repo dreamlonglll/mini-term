@@ -13,6 +13,8 @@
  * 定位靠等宽字体自身 advance，CJK 字形不保证精确 2 倍半角宽，混排会漂移。
  */
 
+import type { PreviewGrid, PreviewPaletteOptions, PreviewRun } from '../types';
+
 export interface PreviewCellLike {
   getChars(): string;
   getWidth(): number;
@@ -36,27 +38,6 @@ export interface PreviewTerminalLike {
   cols: number;
   rows: number;
   buffer: { active: PreviewBufferLike };
-}
-
-/** 同色连续字符段；col 为起始列，绘制定位 x = col × cellW */
-export interface PreviewRun {
-  col: number;
-  text: string;
-  color: string;
-}
-
-export interface PreviewGrid {
-  cols: number;
-  rows: number;
-  /** 每视口行的 runs；空白不产生 run */
-  lines: PreviewRun[][];
-}
-
-export interface PreviewPaletteOptions {
-  /** ANSI 16 色（black..white, brightBlack..brightWhite），来自终端主题 */
-  palette16: string[];
-  /** 默认前景色（theme.foreground） */
-  foreground: string;
 }
 
 /** xterm 默认 16 色，主题缺项时的回落 */

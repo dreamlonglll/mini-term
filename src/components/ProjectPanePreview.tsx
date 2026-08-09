@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { useAppStore } from '../store';
+import { useAppStore, STATUS_PRIORITY } from '../store';
 import { getCachedTerminal, resolveTerminalFontFamily } from '../utils/terminalCache';
 import {
   extractPreviewGrid,
@@ -11,9 +11,9 @@ import { StatusDot } from './StatusDot';
 import { BrandIcon } from './BrandIcon';
 import { inferVendor } from '../utils/inferVendor';
 import { paneShowsAiSession } from '../utils/aiResume';
-import { isRemoteProject, remotePaneLabel } from '../utils/remoteProject';
+import { paneDisplayLabel } from '../utils/remoteProject';
 import { useT } from '../i18n';
-import type { PaneState, PaneStatus, ProjectConfig, SplitNode } from '../types';
+import type { PaneState, ProjectConfig, SplitNode } from '../types';
 
 /**
  * 项目行悬停的 pane 预览浮层(设计: docs/plans/2026-08-08-project-pane-preview-design.md)。
@@ -47,14 +47,6 @@ function themeColors(theme: Record<string, string | undefined> | undefined) {
     background: t.background ?? '#0a0908',
   };
 }
-
-/** pane 状态聚合优先级,与 store 的项目级聚合同口径(error > ai-working > ai-idle > idle) */
-const STATUS_RANK: Record<PaneStatus, number> = {
-  error: 3,
-  'ai-working': 2,
-  'ai-idle': 1,
-  idle: 0,
-};
 
 interface MiniCtx {
   tick: number;
@@ -90,7 +82,7 @@ function MiniPane({ pane, siblings, ctx }: {
 
   // 隐藏 tab 中最要紧的状态:黄灯(等确认)/绿灯藏在非激活 tab 里时,徽章旁补一个状态点
   const hiddenTop = siblings.length > 0
-    ? siblings.reduce((best, p) => (STATUS_RANK[p.status] > STATUS_RANK[best.status] ? p : best))
+    ? siblings.reduce((best, p) => (STATUS_PRIORITY[p.status] > STATUS_PRIORITY[best.status] ? p : best))
     : null;
 
   return (
@@ -187,12 +179,10 @@ export function ProjectPanePreview({ project, anchorRect }: Props) {
 
   if (!layout) return null;
 
-  const remote = isRemoteProject(project);
-  const remoteLabel = remote ? remotePaneLabel(project) : undefined;
   const ctx: MiniCtx = {
     tick,
     exitedPtyIds,
-    labelOf: (pane) => pane.customTitle || (remote ? remoteLabel! : pane.shellName),
+    labelOf: (pane) => paneDisplayLabel(pane, project),
   };
 
   return (

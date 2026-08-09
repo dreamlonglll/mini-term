@@ -9,7 +9,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '../store';
 import { getProjectEnvs } from './projectEnv';
-import type { ProjectConfig, ShellConfig, SshConnection, SshRemoteSpec } from '../types';
+import type { PaneState, ProjectConfig, ShellConfig, SshConnection, SshRemoteSpec } from '../types';
 
 /** 是否为 SSH 远程项目 */
 export function isRemoteProject(project: ProjectConfig | undefined | null): boolean {
@@ -28,6 +28,17 @@ export function getRemoteConnection(
 /** 远程 pane 的显示名:连接名（断链时回退 'ssh'） */
 export function remotePaneLabel(project: ProjectConfig): string {
   return getRemoteConnection(project)?.name ?? 'ssh';
+}
+
+/** pane 显示名的统一口径:自定义名 > 远程连接名 > shell 名。
+ *  PaneGroup 的 tab 栏与项目预览浮层共用,防两处口径漂移。 */
+export function paneDisplayLabel(
+  pane: Pick<PaneState, 'customTitle' | 'shellName'>,
+  project: ProjectConfig | undefined,
+): string {
+  if (pane.customTitle) return pane.customTitle;
+  if (project && isRemoteProject(project)) return remotePaneLabel(project);
+  return pane.shellName;
 }
 
 /**

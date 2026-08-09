@@ -10,7 +10,7 @@ import { showContextMenu } from '../utils/contextMenu';
 import { inferVendor } from '../utils/inferVendor';
 import { paneShowsAiSession, resolveAutoResumeCommand } from '../utils/aiResume';
 import { disposeTerminal, writePtyInput } from '../utils/terminalCache';
-import { createProjectPty, isRemoteProject, remotePaneLabel } from '../utils/remoteProject';
+import { createProjectPty, isRemoteProject, paneDisplayLabel } from '../utils/remoteProject';
 import { findPaneById } from '../utils/layoutOps';
 import {
   activatePane,
@@ -72,11 +72,10 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
   const activePane = node.panes.find((p) => p.id === node.activePaneId) ?? node.panes[0];
 
   // SSH 远程项目:所有 pane 统一按远程方式启动(布局恢复亦然);
-  // pane 显示名用连接名(恢复布局时 shellName 会被映射为本地 shell 名,不可信)。
+  // pane 显示名走 paneDisplayLabel 统一口径(恢复布局时 shellName 会被映射为本地 shell 名,不可信)。
   const project = config.projects.find((p) => p.id === projectId);
   const remote = isRemoteProject(project);
-  const remoteLabel = project && remote ? remotePaneLabel(project) : undefined;
-  const paneLabel = (pane: PaneState) => pane.customTitle || (remote ? remoteLabel! : pane.shellName);
+  const paneLabel = (pane: PaneState) => paneDisplayLabel(pane, project);
   // 缺省开启;既决定起 PTY 时写不写 resume,也决定待续接的 pane 亮不亮 AI 图标
   const autoResumeEnabled = config.aiAutoResume ?? true;
 
