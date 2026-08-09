@@ -322,6 +322,13 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
               }}
               onContextMenu={(e) => paneContextMenu(e, pane.id)}
             >
+              {/* 激活指示条:始终占位、未激活透明(同 SettingsModal tab 惯例)。
+                  背景图皮肤下 --bg-terminal 与 --bg-elevated 几乎同色,
+                  仅靠底色分不出激活 tab,accent 条不吃主题 */}
+              <span
+                aria-hidden
+                className={`absolute top-0 left-0 right-0 h-[2px] ${isActive ? 'bg-[var(--accent)]' : 'bg-transparent'}`}
+              />
               <StatusDot status={pane.status} />
               {aiActive && (
                 <BrandIcon
