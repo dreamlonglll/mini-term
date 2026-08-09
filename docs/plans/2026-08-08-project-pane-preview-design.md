@@ -44,6 +44,14 @@ hover 项目行 (250ms) → projectStates.get(id).layout → collectLeaves()
 - 从未打开的项目整卡占位（元数据仍有信息量）；远程断线 pane 显示断线前画面。
 - 性能：不 hover 零开销；单项目数个 pane、每 pane 数千 cell 提取为毫秒级。
 
+## 变更记录
+
+- **2026-08-09 排版改版（方案 2）**：单列平铺在多 pane 时总高超屏（4 张 ≈ 1100px）。改为
+  「微缩布局拼图」：浮层固定 520×(卡头+340)，按 SplitNode 树用 flex-grow 复现 sizes 比例
+  嵌套排布，leaf 显示 active tab 画面（cover + 左下锚定裁右裁顶），隐藏 tab 以「+N」徽章
+  示数并附其中最高优先级状态点。永不超屏，与切过去看到的终端区所见即所得；
+  「所有 pane 均出画」退让为「active pane 出画 + 隐藏 tab 状态不漏报」。
+
 ## 验证
 
 - `tests/panePreview.test.cjs`：真 xterm Terminal（node 下可跑，`tuiScrollback.test.cjs` 先例）写入

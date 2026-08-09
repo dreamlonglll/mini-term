@@ -1,6 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { useAppStore } from '../store';
-import { collectLeaves } from '../utils/layoutOps';
 import { getCachedTerminal, resolveTerminalFontFamily } from '../utils/terminalCache';
 import {
   extractPreviewGrid,
@@ -14,10 +13,14 @@ import { inferVendor } from '../utils/inferVendor';
 import { paneShowsAiSession } from '../utils/aiResume';
 import { isRemoteProject, remotePaneLabel } from '../utils/remoteProject';
 import { useT } from '../i18n';
-import type { PaneState, ProjectConfig } from '../types';
+import type { PaneState, PaneStatus, ProjectConfig, SplitNode } from '../types';
 
 /**
  * 项目行悬停的 pane 预览浮层(设计: docs/plans/2026-08-08-project-pane-preview-design.md)。
+ *
+ * 排版为「微缩布局拼图」:按项目 SplitNode 树等比嵌套排布,整体固定尺寸永不超屏,
+ * 与切过去看到的终端区所见即所得。每个分屏叶子显示 active tab 的画面,隐藏 tab
+ * 以「+N」徽章示数并附其中最高优先级的状态点(隐藏 tab 挂着的 AI 黄绿灯不漏报)。
  *
  * 纯展示、pointer-events-none:不参与命中,移出项目行即由 ProjectList 关闭。
  * 有缓存终端的 pane 读 buffer 画迷你 canvas(隐藏 tab/后台项目的 buffer 也一直
@@ -26,7 +29,9 @@ import type { PaneState, ProjectConfig } from '../types';
  */
 
 const CARD_WIDTH = 520;
-const MAX_PANES = 4;
+/** 拼图区固定高:约合终端区 3:2 观感,配 top 钳制任何布局都不超屏 */
+const BOARD_HEIGHT = 340;
+
 /** 与 ITheme 的 16 色字段一一对应,顺序即 ANSI 索引 */
 const THEME_PALETTE_KEYS = [
   'black', 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white',
@@ -43,16 +48,31 @@ function themeColors(theme: Record<string, string | undefined> | undefined) {
   };
 }
 
-function PaneThumb({ pane, label, tick, exited }: {
-  pane: PaneState;
-  label: string;
+/** pane 状态聚合优先级,与 store 的项目级聚合同口径(error > ai-working > ai-idle > idle) */
+const STATUS_RANK: Record<PaneStatus, number> = {
+  error: 3,
+  'ai-working': 2,
+  'ai-idle': 1,
+  idle: 0,
+};
+
+interface MiniCtx {
   tick: number;
-  exited: boolean;
+  exitedPtyIds: Set<number>;
+  labelOf: (pane: PaneState) => string;
+}
+
+function MiniPane({ pane, siblings, ctx }: {
+  pane: PaneState;
+  /** 同叶子的其余 tab(隐藏 tab) */
+  siblings: PaneState[];
+  ctx: MiniCtx;
 }) {
   const t = useT();
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const autoResume = useAppStore((s) => s.config.aiAutoResume ?? true);
   const cached = pane.ptyId !== undefined ? getCachedTerminal(pane.ptyId) : undefined;
+  const exited = pane.ptyId !== undefined && ctx.exitedPtyIds.has(pane.ptyId);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -66,33 +86,76 @@ function PaneThumb({ pane, label, tick, exited }: {
       background,
       fontFamily: resolveTerminalFontFamily(useAppStore.getState().config.terminalFontFamily),
     });
-  }, [cached, tick]);
+  }, [cached, ctx.tick]);
+
+  // 隐藏 tab 中最要紧的状态:黄灯(等确认)/绿灯藏在非激活 tab 里时,徽章旁补一个状态点
+  const hiddenTop = siblings.length > 0
+    ? siblings.reduce((best, p) => (STATUS_RANK[p.status] > STATUS_RANK[best.status] ? p : best))
+    : null;
 
   return (
-    <div className="px-2 pt-2 last:pb-2">
-      <div className="flex items-center gap-1.5 pb-1 text-xs text-[var(--text-secondary)]">
-        <StatusDot status={pane.status} />
-        {paneShowsAiSession(pane, autoResume) && (
-          <BrandIcon vendor={inferVendor({ agent: pane.aiSession?.agent ?? pane.detectedAgent })} size={12} />
-        )}
-        <span className="truncate">{label}</span>
-      </div>
+    <div
+      className="relative w-full h-full overflow-hidden rounded-[3px] border border-[var(--border-subtle)]"
+      style={{ background: 'var(--bg-terminal)' }}
+    >
       {cached ? (
-        <div className="relative rounded-[var(--radius-sm)] overflow-hidden border border-[var(--border-subtle)]">
-          {/* 高终端裁顶留底:底部是最新输出/TUI 输入区,正是缩略图要看的 */}
-          <canvas ref={canvasRef} className="block w-full h-auto max-h-[240px] object-cover object-bottom" />
-          {exited && (
-            <div className="absolute inset-0 flex items-center justify-center bg-black/45 text-xs text-[var(--text-secondary)]">
-              {t('projectList.preview.disconnected')}
-            </div>
-          )}
-        </div>
+        // cover + 左下锚定:格子与终端宽高比不合时裁右裁顶,保住左下角的最新输出/TUI 输入区
+        <canvas ref={canvasRef} className="absolute inset-0 w-full h-full object-cover object-left-bottom" />
       ) : (
-        <div className="h-10 flex items-center justify-center rounded-[var(--radius-sm)] border border-dashed border-[var(--border-subtle)] text-xs text-[var(--text-muted)]">
+        <div className="absolute inset-0 flex items-center justify-center text-xs text-[var(--text-muted)]">
           {t('projectList.preview.notStarted')}
         </div>
       )}
+      {/* 标签条压在格子顶部 */}
+      <div
+        className="absolute top-0 inset-x-0 flex items-center gap-1 px-1.5 py-0.5 text-[10px] text-[var(--text-secondary)]"
+        style={{
+          background: 'color-mix(in srgb, var(--bg-overlay) 80%, transparent)',
+          backdropFilter: 'blur(6px)',
+        }}
+      >
+        <StatusDot status={pane.status} />
+        {paneShowsAiSession(pane, autoResume) && (
+          <BrandIcon vendor={inferVendor({ agent: pane.aiSession?.agent ?? pane.detectedAgent })} size={11} />
+        )}
+        <span className="truncate">{ctx.labelOf(pane)}</span>
+        {siblings.length > 0 && (
+          <span className="ml-auto flex items-center gap-1 flex-shrink-0">
+            {hiddenTop && hiddenTop.status !== 'idle' && <StatusDot status={hiddenTop.status} />}
+            <span className="text-[var(--text-muted)]">+{siblings.length}</span>
+          </span>
+        )}
+      </div>
+      {exited && (
+        <div className="absolute inset-0 flex items-center justify-center bg-black/45 text-xs text-[var(--text-secondary)]">
+          {t('projectList.preview.disconnected')}
+        </div>
+      )}
     </div>
+  );
+}
+
+/** 按 SplitNode 树递归拼微缩布局:split 用 flex-grow 复现 sizes 比例,leaf 出一格 */
+function MiniNode({ node, ctx }: { node: SplitNode; ctx: MiniCtx }) {
+  if (node.type === 'split') {
+    return (
+      <div className={`flex w-full h-full gap-[2px] ${node.direction === 'vertical' ? 'flex-col' : ''}`}>
+        {node.children.map((child, i) => (
+          <div key={i} className="min-w-0 min-h-0" style={{ flexGrow: node.sizes?.[i] ?? 1, flexBasis: 0 }}>
+            <MiniNode node={child} ctx={ctx} />
+          </div>
+        ))}
+      </div>
+    );
+  }
+  const active = node.panes.find((p) => p.id === node.activePaneId) ?? node.panes[0];
+  if (!active) return null;
+  return (
+    <MiniPane
+      pane={active}
+      siblings={node.panes.filter((p) => p.id !== active.id)}
+      ctx={ctx}
+    />
   );
 }
 
@@ -103,7 +166,6 @@ interface Props {
 }
 
 export function ProjectPanePreview({ project, anchorRect }: Props) {
-  const t = useT();
   const layout = useAppStore((s) => s.projectStates.get(project.id)?.layout ?? null);
   const exitedPtyIds = useAppStore((s) => s.exitedPtyIds);
   const [tick, setTick] = useState(0);
@@ -115,7 +177,7 @@ export function ProjectPanePreview({ project, anchorRect }: Props) {
     return () => clearInterval(id);
   }, []);
 
-  // 底部溢出时上移;高度随 pane 数变化,layout 变了重新钳
+  // 底部溢出时上移
   useLayoutEffect(() => {
     const el = ref.current;
     if (!el) return;
@@ -127,12 +189,11 @@ export function ProjectPanePreview({ project, anchorRect }: Props) {
 
   const remote = isRemoteProject(project);
   const remoteLabel = remote ? remotePaneLabel(project) : undefined;
-  const entries: { pane: PaneState; leafIndex: number }[] = [];
-  collectLeaves(layout).forEach((leaf, leafIndex) => {
-    for (const pane of leaf.panes) entries.push({ pane, leafIndex });
-  });
-  const shown = entries.slice(0, MAX_PANES);
-  const hiddenCount = entries.length - shown.length;
+  const ctx: MiniCtx = {
+    tick,
+    exitedPtyIds,
+    labelOf: (pane) => pane.customTitle || (remote ? remoteLabel! : pane.shellName),
+  };
 
   return (
     <div
@@ -155,25 +216,9 @@ export function ProjectPanePreview({ project, anchorRect }: Props) {
         <span className="text-xs font-medium text-[var(--text-primary)] flex-shrink-0">{project.name}</span>
         <span className="text-[11px] text-[var(--text-muted)] truncate">{project.path}</span>
       </div>
-      {shown.map(({ pane, leafIndex }, i) => (
-        <div key={pane.id}>
-          {/* 分屏叶子之间加分隔线,同叶子内的 tab 连排 */}
-          {i > 0 && leafIndex !== shown[i - 1].leafIndex && (
-            <div className="mx-2 mt-2 border-t border-[var(--border-subtle)]" />
-          )}
-          <PaneThumb
-            pane={pane}
-            label={pane.customTitle || (remote ? remoteLabel! : pane.shellName)}
-            tick={tick}
-            exited={pane.ptyId !== undefined && exitedPtyIds.has(pane.ptyId)}
-          />
-        </div>
-      ))}
-      {hiddenCount > 0 && (
-        <div className="px-2 py-1.5 text-xs text-[var(--text-muted)]">
-          {t('projectList.preview.morePanes', { count: hiddenCount })}
-        </div>
-      )}
+      <div className="p-2" style={{ height: BOARD_HEIGHT }}>
+        <MiniNode node={layout} ctx={ctx} />
+      </div>
     </div>
   );
 }
