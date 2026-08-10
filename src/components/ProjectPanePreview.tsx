@@ -22,6 +22,9 @@ import type { PaneState, ProjectConfig, SplitNode } from '../types';
  * 与切过去看到的终端区所见即所得。每个分屏叶子显示 active tab 的画面,隐藏 tab
  * 以「+N」徽章示数并附其中最高优先级的状态点(隐藏 tab 挂着的 AI 黄绿灯不漏报)。
  *
+ * 开闸权在 ProjectList(hasAiPane):只有跑着 AI 会话的项目才弹这张卡 —— 预览要
+ * 回答的是「AI 在别的项目里跑到哪一步了」,普通 shell 项目不该被它打断。
+ *
  * 纯展示、pointer-events-none:不参与命中,移出项目行即由 ProjectList 关闭。
  * 有缓存终端的 pane 读 buffer 画迷你 canvas(隐藏 tab/后台项目的 buffer 也一直
  * 在被全局 pty-output 监听更新,见 terminalCache.ts);没起过 PTY 的 pane 只有
@@ -180,9 +183,10 @@ export function ProjectPanePreview({ project, anchorRect }: Props) {
     setTop(Math.max(8, Math.min(anchorRect.top, window.innerHeight - h - 8)));
   }, [anchorRect.top, layout]);
 
-  // layout 为 null（项目从没打开过终端）时**不能** return null:项目行的
-  // title={project.path} 已经挪进本卡的卡头，直接不渲染会让这类项目既无浮层
-  // 也无 tooltip，绝对路径彻底不可见；设计文档写的也是「整卡占位」。
+  // layout 为 null（项目从没打开过终端）在开闸后已不可达（没 layout 就没 AI
+  // pane），下面的整卡占位是防御性分支：真走到这里也得有卡头把绝对路径显出来，
+  // 直接 return null 会让该项目既无浮层、也无行 title（那份 title 由 ProjectList
+  // 按「没有 AI 会话」挂，与本卡互斥）。
   const ctx: MiniCtx = {
     tick,
     exitedPtyIds,

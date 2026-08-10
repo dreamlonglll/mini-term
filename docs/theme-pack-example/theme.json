@@ -1,0 +1,50 @@
+{
+  "schemaVersion": 1,
+  "id": "example",
+  "name": "Example Skin 示例皮肤",
+  "appearance": "dark",
+  "colors": {
+    "background": "#0f1115",
+    "panel": "#161a21",
+    "panelAlt": "#1d222b",
+    "accent": "#6aa9ff",
+    "accentAlt": "#f0b429",
+    "secondary": "#7dd3c0",
+    "highlight": "#7bd88f",
+    "text": "#e6e9ef",
+    "muted": "#8b93a4",
+    "line": "#2a3140"
+  },
+  "art": {
+    "focusX": 0.5,
+    "focusY": 0.42
+  },
+  "effects": {
+    "surfaceOpacity": 0.72,
+    "backgroundDim": 0.35,
+    "terminalOpacity": 0.6,
+    "surfaceRadius": "10px",
+    "surfaceBlur": "12px"
+  },
+  "terminal": {
+    "black": "#2a3140",
+    "red": "#e06c75",
+    "green": "#7bd88f",
+    "yellow": "#f0b429",
+    "blue": "#6aa9ff",
+    "magenta": "#c792ea",
+    "cyan": "#7dd3c0",
+    "white": "#e6e9ef",
+    "brightBlack": "#4b5468",
+    "brightRed": "#f08a92",
+    "brightGreen": "#95e5a6",
+    "brightYellow": "#ffc857",
+    "brightBlue": "#8cc0ff",
+    "brightMagenta": "#d9a8f5",
+    "brightCyan": "#96e5d3",
+    "brightWhite": "#f5f7fa"
+  },
+  "tokens": {
+    "--accent-subtle": "rgba(106, 169, 255, 0.16)"
+  }
+}

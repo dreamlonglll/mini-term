@@ -1706,6 +1706,8 @@ function CustomThemePacksSection() {
   const [packs, setPacks] = useState<ThemePackMeta[]>([]);
   const [thumbUrls, setThumbUrls] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
+  /** 成功提示（生成示例皮肤）；与 error 互斥展示 */
+  const [notice, setNotice] = useState<string | null>(null);
 
   // 缩略图走 asset 探活/base64 兜底通道(asset 协议在部分 WebView 环境不可用,
   // CSS 背景加载失败是静默的),逐个就绪逐个上屏
@@ -1724,6 +1726,7 @@ function CustomThemePacksSection() {
 
   const refresh = useCallback(() => {
     setError(null);
+    setNotice(null);
     listThemePacks().then(setPacks).catch((e) => setError(String(e)));
   }, []);
 
@@ -1817,13 +1820,28 @@ function CustomThemePacksSection() {
     }
   }, []);
 
+  // 生成示例皮肤:内容与仓库 docs/theme-pack-example/ 同一份(编译期嵌入),
+  // 包内 README.md 就是字段说明。落盘后照常热重载,用户改完保存即见效
+  const createExample = useCallback(async () => {
+    setError(null);
+    setNotice(null);
+    try {
+      const themeId = await invoke<string>('create_example_theme_pack');
+      refresh();
+      setNotice(t('settings.themes.exampleCreated', { id: themeId }));
+    } catch (e) {
+      setError(String(e));
+    }
+  }, [refresh, t]);
+
   return (
     <div className="mb-4">
-      <div className="flex items-center justify-between mb-2 mt-4">
+      {/* 五个按钮 + 标题在 680px 弹窗里已经贴边(英文文案更长),允许换行不挤压 */}
+      <div className="flex flex-wrap items-center justify-between gap-y-2 mb-2 mt-4">
         <div className="text-base text-[var(--text-muted)] uppercase tracking-[0.1em]">
           {t('settings.themes.customSection')}
         </div>
-        <div className="flex gap-2">
+        <div className="flex flex-wrap gap-2">
           <button
             className="px-2 py-1 text-sm rounded-[var(--radius-sm)] text-[var(--text-secondary)] border border-[var(--border-default)] hover:border-[var(--accent)] hover:text-[var(--text-primary)] transition-all"
             onClick={importPack}
@@ -1835,6 +1853,13 @@ function CustomThemePacksSection() {
             onClick={importZip}
           >
             {t('settings.themes.importZip')}
+          </button>
+          <button
+            className="px-2 py-1 text-sm rounded-[var(--radius-sm)] text-[var(--text-secondary)] border border-[var(--border-default)] hover:border-[var(--accent)] hover:text-[var(--text-primary)] transition-all"
+            onClick={createExample}
+            title={t('settings.themes.createExampleHint')}
+          >
+            {t('settings.themes.createExample')}
           </button>
           <button
             className="px-2 py-1 text-sm rounded-[var(--radius-sm)] text-[var(--text-secondary)] border border-[var(--border-default)] hover:border-[var(--accent)] hover:text-[var(--text-primary)] transition-all"
@@ -1880,6 +1905,11 @@ function CustomThemePacksSection() {
       {error && (
         <div className="mt-2 px-3 py-2 rounded-[var(--radius-sm)] border border-[var(--color-error)] text-sm text-[var(--color-error)]">
           {error}
+        </div>
+      )}
+      {notice && !error && (
+        <div className="mt-2 px-3 py-2 rounded-[var(--radius-sm)] border border-[var(--color-success)] text-sm text-[var(--color-success)]">
+          {notice}
         </div>
       )}
     </div>

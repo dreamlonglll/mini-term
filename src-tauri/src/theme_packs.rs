@@ -105,6 +105,46 @@ pub fn get_themes_dir(app: AppHandle) -> Result<String, String> {
     Ok(themes_dir(&app)?.to_string_lossy().into_owned())
 }
 
+/// 示例主题包：与仓库 `docs/theme-pack-example/` **同一份文件**，编译期嵌入。
+/// 文档里的模板和用户点「生成示例」拿到的包因此永远不会漂开。
+const EXAMPLE_THEME_ID: &str = "example";
+const EXAMPLE_THEME_JSON: &str = include_str!("../../docs/theme-pack-example/theme.json");
+const EXAMPLE_THEME_CSS: &str = include_str!("../../docs/theme-pack-example/theme.css");
+const EXAMPLE_THEME_README: &str = include_str!("../../docs/theme-pack-example/README.md");
+
+/// 在 themes/ 下生成一份示例主题包，供用户照着改（字段说明在包内 README.md）。
+///
+/// 目录已存在时**报错而非覆盖**：用户多半已经在那份上改过东西，静默覆盖等于
+/// 删掉他的皮肤；要重来就先删掉或改名，语义清楚。
+#[tauri::command]
+pub fn create_example_theme_pack(app: AppHandle) -> Result<String, String> {
+    let dir = themes_dir(&app)?.join(EXAMPLE_THEME_ID);
+    if dir.exists() {
+        return Err(format!(
+            "示例主题已存在（themes/{EXAMPLE_THEME_ID}）：先删除或改名，再重新生成"
+        ));
+    }
+    fs::create_dir_all(&dir).map_err(|e| format!("创建示例主题目录失败: {e}"))?;
+    let written = (|| -> Result<(), String> {
+        for (name, body) in [
+            ("theme.json", EXAMPLE_THEME_JSON),
+            ("theme.css", EXAMPLE_THEME_CSS),
+            ("README.md", EXAMPLE_THEME_README),
+        ] {
+            fs::write(dir.join(name), body).map_err(|e| format!("写入 {name} 失败: {e}"))?;
+        }
+        Ok(())
+    })();
+    // 写到一半失败（盘满/权限/杀软锁文件）必须把目录收走：留下只有 theme.json 的
+    // 残包，list_theme_packs 照样把它列成可选皮肤，而下一次「生成示例」又会撞
+    // 上面那句「已存在」——用户从此自愈不了，只能手工去删目录
+    if let Err(e) = written {
+        let _ = fs::remove_dir_all(&dir);
+        return Err(e);
+    }
+    Ok(EXAMPLE_THEME_ID.to_string())
+}
+
 /// 把 `pack_root` 下的顶层文件安装为 `themes/<theme_id>`。
 ///
 /// 先拷进同目录下的暂存目录并在那里校验 manifest，通过后才用 rename 换掉既有
@@ -358,6 +398,48 @@ mod tests {
         assert!(!themes.join(".tmp-install-dracula").exists(), "暂存目录未清理");
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 示例包是「文档模板」与「一键生成」共用的同一份文件，跑偏了两边一起坏。
+    /// Rust 侧不做 theme.json 校验（在前端 parseThemePack），这里按它的必需
+    /// 字段给嵌入的示例体检一遍，编译期就把坏模板挡住。
+    #[test]
+    fn embedded_example_pack_matches_frontend_contract() {
+        assert!(validate_theme_id(EXAMPLE_THEME_ID).is_ok());
+        let v: serde_json::Value = serde_json::from_str(EXAMPLE_THEME_JSON).unwrap();
+        assert_eq!(v["id"].as_str(), Some(EXAMPLE_THEME_ID));
+        assert!(v["name"].as_str().is_some_and(|s| !s.is_empty()));
+        assert!(matches!(v["appearance"].as_str(), Some("dark") | Some("light")));
+        for key in ["background", "panel", "panelAlt", "accent", "text", "muted", "line"] {
+            assert!(v["colors"][key].as_str().is_some(), "colors.{key} 缺失");
+        }
+        // tokens 逃生舱的键名必须是 -- 开头的 CSS 变量、值必须是字符串
+        for (key, value) in v["tokens"].as_object().unwrap() {
+            assert!(key.starts_with("--"), "tokens 键名非法: {key}");
+            assert!(value.is_string(), "tokens.{key} 必须是字符串");
+        }
+        // 示例包不带背景图：写了 image 却没有图，终端会被透明化而氛围层挂不上
+        assert!(v.get("image").is_none(), "示例包不应声明 image");
+        // 与前端 sanitizeThemeCss 同序：先剥注释再查 —— 注释里那句「禁 @import」
+        // 是说明不是规则，直接在原文上查会把自己的文档误判成违规
+        let probe = strip_block_comments(EXAMPLE_THEME_CSS);
+        assert!(!probe.contains("@import"), "theme.css 不允许 @import");
+        assert!(!probe.contains("://"), "theme.css 不允许指向包外的引用");
+    }
+
+    /// 剥掉 `/* */` 块注释（对应前端 stripCssComments，取样用）
+    fn strip_block_comments(css: &str) -> String {
+        let mut out = String::new();
+        let mut rest = css;
+        while let Some(start) = rest.find("/*") {
+            out.push_str(&rest[..start]);
+            match rest[start + 2..].find("*/") {
+                Some(end) => rest = &rest[start + 2 + end + 2..],
+                None => return out,
+            }
+        }
+        out.push_str(rest);
+        out
     }
 
     /// 成功路径：同名覆盖后是新包内容，且不留暂存/备份目录

@@ -129,6 +129,17 @@ function collectAiPanes(
   return node.children.flatMap((c) => collectAiPanes(c, autoResumeEnabled));
 }
 
+/** 项目里有没有 AI 会话 pane —— pane 预览浮层的开闸条件。
+ *
+ *  与 collectAiPanes 同一把尺子(短路版,不构造数组):判定口径与项目行的 AI
+ *  品牌图标一致,于是「行上亮着图标 → 悬停才有预览」,一眼可预期。没跑 AI 的
+ *  项目悬停只出原生 title(绝对路径),不弹整张大卡打断视线。 */
+function hasAiPane(node: SplitNode | null | undefined, autoResumeEnabled: boolean): boolean {
+  if (!node) return false;
+  if (node.type === 'leaf') return node.panes.some((p) => paneShowsAiSession(p, autoResumeEnabled));
+  return node.children.some((c) => hasAiPane(c, autoResumeEnabled));
+}
+
 /** AI 品牌图标尺寸(px);图标间与领位图标后均留 2px 小间距,并排不重叠。 */
 const AI_ICON_SIZE = 14;
 
@@ -433,6 +444,8 @@ export function ProjectList() {
   }, [editingGroupId, editingName, renameGroup]);
 
   // === pane 预览浮层：悬停项目行 250ms 后弹出，移出/按下/滚动/拖拽即关 ===
+  // 仅限有 AI 会话的项目（hasAiPane）：预览的价值是「AI 在别的项目里跑到哪了」，
+  // 普通 shell 项目弹一张 520px 的卡只是打断视线。
 
   const [preview, setPreview] = useState<{ projectId: string; rect: { top: number; right: number } } | null>(null);
   const previewTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
@@ -450,12 +463,26 @@ export function ProjectList() {
     const el = e.currentTarget as HTMLElement;
     previewTimer.current = setTimeout(() => {
       if (isProjectDragging() || !el.isConnected) return;
+      // AI 判定放在到点时而非进入时:这 250ms 里 AI 完全可能刚起来(hook 一上报
+      // 状态就变),读 getState 拿最新一份,不吃闭包里进入那一刻的旧值
+      const s = useAppStore.getState();
+      if (!hasAiPane(s.projectStates.get(projectId)?.layout, s.config.aiAutoResume ?? true)) return;
       const r = el.getBoundingClientRect();
       setPreview({ projectId, rect: { top: r.top, right: r.right } });
     }, 250);
   }, []);
 
   useEffect(() => () => clearTimeout(previewTimer.current), []);
+
+  // AI 退出后把 preview 状态本身也收掉,而不只是渲染时 return null:留着的话
+  // 同一次悬停里 AI 再起来(比如用户在别处让它接着跑),浮层会拿**旧 rect** 复活,
+  // 而列表这期间完全可能已经增删过项目,卡就贴到别的行上了
+  useEffect(() => {
+    if (!preview) return;
+    if (!hasAiPane(projectStates.get(preview.projectId)?.layout, config.aiAutoResume ?? true)) {
+      closePreview();
+    }
+  }, [preview, projectStates, config.aiAutoResume, closePreview]);
 
   // 列表滚动/滚轮时浮层锚点失效,直接关闭(capture 才收得到内部容器的 scroll)
   useEffect(() => {
@@ -640,6 +667,10 @@ export function ProjectList() {
         role="option"
         aria-selected={isActive}
         tabIndex={0}
+        // 绝对路径的去处按有无预览分流:有 AI 会话时浮层的卡头显示路径(原生
+        // tooltip 会盖住浮层,不能同时挂);没有则退回行 title —— 否则不弹浮层
+        // 的项目路径就彻底不可见了
+        title={aiVendors.length > 0 ? undefined : project.path}
         onMouseDown={(e) => {
           closePreview();
           handleProjectMouseDown(e, project.id);
@@ -1139,12 +1170,15 @@ export function ProjectList() {
           项目已被删除时 find 落空,静默不渲染 */}
       {preview && (() => {
         const p = config.projects.find((x) => x.id === preview.projectId);
-        return p
-          ? createPortal(
-              <ProjectPanePreview project={p} anchorRect={preview.rect} />,
-              document.body,
-            )
-          : null;
+        // 开闸条件每次渲染重判:AI 跑完退出的那一帧就不画了。state 的收尾交给
+        // 上面那个 effect(它在 paint 之后才跑,只靠它会先闪一帧过期的卡)
+        if (!p || !hasAiPane(projectStates.get(preview.projectId)?.layout, config.aiAutoResume ?? true)) {
+          return null;
+        }
+        return createPortal(
+          <ProjectPanePreview project={p} anchorRect={preview.rect} />,
+          document.body,
+        );
       })()}
     </div>
   );

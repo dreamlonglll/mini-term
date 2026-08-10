@@ -151,6 +151,7 @@ pub fn run() {
             theme_packs::import_theme_pack_zip,
             theme_packs::delete_theme_pack,
             theme_packs::read_theme_asset,
+            theme_packs::create_example_theme_pack,
             tray::set_tray_status,
             pty::create_pty,
             pty::write_pty,

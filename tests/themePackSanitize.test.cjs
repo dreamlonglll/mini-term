@@ -1,5 +1,7 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
+const fs = require('node:fs');
+const path = require('node:path');
 
 // themePackManager 顶层 import 了 tauri api（ESM，Node 下 require 不了）。
 // 被测的是两个纯函数，桩掉即可。
@@ -161,6 +163,23 @@ test('effects 的 surfaceRadius / surfaceBlur 与 tokens 同一把尺子', () =>
 });
 
 // ─── terminal 色值（坏值会让 xterm 在 updateAllTerminalThemes 半途抛）───
+
+// ─── 仓库示例包（docs/theme-pack-example/）───
+
+test('示例主题包过应用自己的校验器', () => {
+  // 这份文件同时是设置页「生成示例」的产物（Rust 侧 include_str! 嵌的就是它），
+  // 过不了校验 = 用户点一下拿到个装不上的包，而错误只在控制台 warn 里
+  const dir = path.join(__dirname, '..', 'docs', 'theme-pack-example');
+  const def = parseThemePack('example', fs.readFileSync(path.join(dir, 'theme.json'), 'utf8'));
+  assert.equal(def.id, 'example');
+  assert.equal(def.appearance, 'dark');
+  // 不声明 image：写了却没有图，终端会被透明化（丢 WebGL）而氛围层挂不上
+  assert.equal(def.image, undefined);
+
+  const css = sanitizeThemeCss(fs.readFileSync(path.join(dir, 'theme.css'), 'utf8'));
+  // 示例里用的锚点得是 DOM 上真有的那批（ProjectList / FileTree / TerminalArea / Modal）
+  assert.match(css, /data-mt-part="sidebar"/);
+});
 
 test('terminal 的每个字段都过色值校验', () => {
   assert.throws(

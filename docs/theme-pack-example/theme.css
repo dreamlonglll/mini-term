@@ -1,0 +1,34 @@
+/*
+ * 示例 theme.css —— 可选文件，只在本皮肤激活期间注入，改完保存即热重载。
+ *
+ * 可用锚点（mini-term 在这些容器上挂了 data-mt-part；Dream Skin 的
+ * data-ds-part 写法会在注入时自动转译成 data-mt-part）：
+ *   sidebar / filetree / terminal-area / modal
+ *
+ * 可用旋钮变量（值来自 theme.json 的 colors 与 effects）：
+ *   --mt-theme-color-background / -panel / -panel-alt / -accent
+ *   --mt-theme-color-text / -muted / -line
+ *   --mt-theme-color-accent-alt / -secondary / -highlight（写了对应可选色才有）
+ *   --mt-theme-surface-radius / --mt-theme-surface-blur
+ *
+ * 限制：单文件 256KB 上限、禁 @import、任何指向包外的引用一律拒
+ * （url() 与裸字符串都查，转义写法如 url(\68 ttps://…) 同样挡得住）。
+ * 包内相对路径与 data: 可用。
+ */
+
+[data-mt-part="sidebar"] {
+  border-right: 1px solid var(--mt-theme-color-line);
+}
+
+[data-mt-part="filetree"] {
+  border-left-color: var(--mt-theme-color-line);
+}
+
+[data-mt-part="terminal-area"] {
+  border-radius: var(--mt-theme-surface-radius);
+}
+
+[data-mt-part="modal"] {
+  border-radius: var(--mt-theme-surface-radius);
+  backdrop-filter: blur(var(--mt-theme-surface-blur));
+}
