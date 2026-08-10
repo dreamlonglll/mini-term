@@ -80,7 +80,9 @@ function MiniPane({ pane, siblings, ctx }: {
     });
   }, [cached, ctx.tick]);
 
-  // 隐藏 tab 中最要紧的状态:黄灯(等确认)/绿灯藏在非激活 tab 里时,徽章旁补一个状态点
+  // 隐藏 tab 中最要紧的状态:AI 在跑/刚完成藏在非激活 tab 里时,徽章旁补一个状态点。
+  // 口径限于 PaneStatus —— 真正的「等确认」是 pane.attention,不在 PaneStatus 编码
+  // 内,这里同样看不到(与 pane tab 栏现有行为一致)。
   const hiddenTop = siblings.length > 0
     ? siblings.reduce((best, p) => (STATUS_PRIORITY[p.status] > STATUS_PRIORITY[best.status] ? p : best))
     : null;
@@ -158,6 +160,7 @@ interface Props {
 }
 
 export function ProjectPanePreview({ project, anchorRect }: Props) {
+  const t = useT();
   const layout = useAppStore((s) => s.projectStates.get(project.id)?.layout ?? null);
   const exitedPtyIds = useAppStore((s) => s.exitedPtyIds);
   const [tick, setTick] = useState(0);
@@ -177,8 +180,9 @@ export function ProjectPanePreview({ project, anchorRect }: Props) {
     setTop(Math.max(8, Math.min(anchorRect.top, window.innerHeight - h - 8)));
   }, [anchorRect.top, layout]);
 
-  if (!layout) return null;
-
+  // layout 为 null（项目从没打开过终端）时**不能** return null:项目行的
+  // title={project.path} 已经挪进本卡的卡头，直接不渲染会让这类项目既无浮层
+  // 也无 tooltip，绝对路径彻底不可见；设计文档写的也是「整卡占位」。
   const ctx: MiniCtx = {
     tick,
     exitedPtyIds,
@@ -188,7 +192,11 @@ export function ProjectPanePreview({ project, anchorRect }: Props) {
   return (
     <div
       ref={ref}
-      className="fixed z-50 pointer-events-none rounded-md border"
+      // overlay-menu 带 menuPopIn 入场（语义也更贴「贴着触发点出现」），且它在
+      // styles.css 的 prefers-reduced-motion 豁免名单里。内联 animation 挡不住
+      // 那段的 `animation-duration: 0.01ms !important` 通配规则 —— 系统开了
+      // 「减少动态效果」的机器上这个淡入原本是看不到的。
+      className="overlay-menu fixed z-50 pointer-events-none rounded-md border"
       style={{
         left: Math.min(anchorRect.right + 8, window.innerWidth - CARD_WIDTH - 8),
         top,
@@ -198,7 +206,6 @@ export function ProjectPanePreview({ project, anchorRect }: Props) {
         borderColor: 'var(--border-strong)',
         boxShadow: 'var(--shadow-overlay)',
         backdropFilter: 'blur(12px)',
-        animation: 'overlayFadeIn 0.15s ease-out',
       }}
     >
       {/* 卡头:项目名 + 绝对路径。路径原先挂在行 title 上,原生 tooltip 会盖住浮层,挪到这里 */}
@@ -207,7 +214,16 @@ export function ProjectPanePreview({ project, anchorRect }: Props) {
         <span className="text-[11px] text-[var(--text-muted)] truncate">{project.path}</span>
       </div>
       <div className="p-2" style={{ height: BOARD_HEIGHT }}>
-        <MiniNode node={layout} ctx={ctx} />
+        {layout ? (
+          <MiniNode node={layout} ctx={ctx} />
+        ) : (
+          <div
+            className="w-full h-full flex items-center justify-center rounded-[3px] border border-dashed border-[var(--border-subtle)] text-xs text-[var(--text-muted)]"
+            style={{ background: 'var(--bg-terminal)' }}
+          >
+            {t('projectList.preview.neverOpened')}
+          </div>
+        )}
       </div>
     </div>
   );

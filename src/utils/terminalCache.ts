@@ -77,6 +77,15 @@ export function getTerminalTheme(terminalFollowTheme: boolean): typeof DARK_TERM
   return DARK_TERMINAL_THEME;
 }
 
+/** 终端要不要按背景图皮肤透明化。
+ *
+ *  比 `isTransparentThemeActive()` 多一个「终端跟随主题」的闸：关掉它时终端用的
+ *  是固定的内置 DARK 配色，背景本来就不透明，wrapper 再透明也透不出氛围层 ——
+ *  只剩下白丢 WebGL（透明背景走 DOM 渲染）这一个后果。 */
+function terminalTransparencyActive(): boolean {
+  return (useAppStore.getState().config.terminalFollowTheme ?? true) && isTransparentThemeActive();
+}
+
 const cache = new Map<number, CachedEntry>();
 
 const aiPtyIds = new Set<number>();
@@ -196,7 +205,7 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
   // 预设背景色，防止首帧渲染前闪屏；始终跟随系统主题 CSS 变量。
   // 背景图主题下 wrapper 透明——着色已由 TerminalArea 容器的 --bg-terminal 承担，
   // 再画一层会叠乘不透明度把背景图盖没
-  wrapper.style.backgroundColor = isTransparentThemeActive() ? 'transparent' : 'var(--bg-terminal)';
+  wrapper.style.backgroundColor = terminalTransparencyActive() ? 'transparent' : 'var(--bg-terminal)';
 
   const term = new Terminal({
     fontSize: useAppStore.getState().config.terminalFontSize ?? 14,
@@ -217,7 +226,7 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
     // 不开启 allowProposedApi 加载 addon 会抛 "You must set the allowProposedApi option to true"。
     allowProposedApi: true,
     // 背景图主题激活时终端背景半透明，透出 #root 的氛围背景图（Phase 2）
-    allowTransparency: isTransparentThemeActive(),
+    allowTransparency: terminalTransparencyActive(),
   });
 
   const fitAddon = new FitAddon();
@@ -474,7 +483,7 @@ export function activateWebgl(ptyId: number): void {
   loadLigaturesIfEnabled(entry);
   // WebGL 渲染器不支持透明背景(xterm 上游限制,canvas 会画满不透明底色):
   // 背景图主题激活时留在 DOM 渲染,切回不透明主题由 updateAllTerminalThemes 恢复
-  if (isTransparentThemeActive()) return;
+  if (terminalTransparencyActive()) return;
   loadWebgl(entry);
 }
 
@@ -570,7 +579,8 @@ export function clearMarkerInstances(ptyId: number): void {
 
 export function updateAllTerminalThemes(terminalFollowTheme: boolean): void {
   const theme = getTerminalTheme(terminalFollowTheme);
-  const transparent = isTransparentThemeActive();
+  // 用传入的开关而不是 store 现值：调用方可能正拿着一个刚改还没落进 store 的值
+  const transparent = terminalFollowTheme && isTransparentThemeActive();
   for (const entry of cache.values()) {
     // 个别 xterm 版本不允许运行时改 allowTransparency，失败只影响背景透出
     // （新建终端仍会按正确值构造），不阻塞换主题

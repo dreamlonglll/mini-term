@@ -43,6 +43,12 @@ pub fn list_theme_packs(app: AppHandle) -> Result<Vec<ThemePackEntry>, String> {
         if !path.is_dir() {
             continue;
         }
+        // 跳过导入过程的暂存目录（.tmp-extract / .tmp-install-* / .tmp-old-*）：
+        // zip 根平铺时 .tmp-extract 里就有 theme.json，中途崩溃残留下来会被
+        // 当成一个主题包列出来。真实主题 id 走 validate_theme_id，不会以 . 开头。
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
         // 无 theme.json 的目录直接跳过，不视为主题包
         let Ok(theme_json) = fs::read_to_string(path.join("theme.json")) else {
             continue;
@@ -66,11 +72,22 @@ pub struct ThemePackData {
     pub dir: String,
 }
 
+/// 主题 id 的路径分量校验：id 只能是 themes/ 下的**一层目录名**。
+///
+/// 少了它，`themes.join(id)` 会逃出主题目录，而导入路径紧接着就是
+/// `remove_dir_all(&dest)`——`Path::new("...zip").file_stem()` 返回 `".."`
+/// （`"..zip"` 返回 `"."`），于是删掉的是整个 app_data_dir（config.json 一并
+/// 消失）或整个 themes/。Windows 上还要挡 `:`，`join("C:")` 会产生盘符相对路径。
+fn validate_theme_id(id: &str) -> Result<(), String> {
+    if id.is_empty() || id.contains(['/', '\\', ':']) || id.contains("..") || id == "." {
+        return Err(format!("非法主题 id: {id}"));
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn read_theme_pack(app: AppHandle, theme_id: String) -> Result<ThemePackData, String> {
-    if theme_id.is_empty() || theme_id.contains(['/', '\\']) || theme_id.contains("..") {
-        return Err(format!("非法主题 id: {theme_id}"));
-    }
+    validate_theme_id(&theme_id)?;
     let dir = themes_dir(&app)?.join(&theme_id);
     let theme_json = fs::read_to_string(dir.join("theme.json"))
         .map_err(|e| format!("读取 {theme_id}/theme.json 失败: {e}"))?;
@@ -88,6 +105,54 @@ pub fn get_themes_dir(app: AppHandle) -> Result<String, String> {
     Ok(themes_dir(&app)?.to_string_lossy().into_owned())
 }
 
+/// 把 `pack_root` 下的顶层文件安装为 `themes/<theme_id>`。
+///
+/// 先拷进同目录下的暂存目录并在那里校验 manifest，通过后才用 rename 换掉既有
+/// 目录。此前是 `create_dir_all(dest)` → 拷贝 → 校验失败再 `remove_dir_all(dest)`
+/// （zip 路径更是先删后拷），导入一个同名的坏包会连带删掉用户手工调过的既有皮肤。
+fn install_pack(themes: &Path, theme_id: &str, pack_root: &Path) -> Result<(), String> {
+    let staging = themes.join(format!(".tmp-install-{theme_id}"));
+    let _ = fs::remove_dir_all(&staging);
+    fs::create_dir_all(&staging).map_err(|e| format!("创建暂存目录失败: {e}"))?;
+
+    let staged = (|| -> Result<(), String> {
+        for entry in fs::read_dir(pack_root).map_err(|e| e.to_string())?.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            fs::copy(&path, staging.join(entry.file_name()))
+                .map_err(|e| format!("拷贝 {} 失败: {e}", entry.file_name().to_string_lossy()))?;
+        }
+        verify_manifest(&staging)
+    })();
+    if let Err(e) = staged {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(e);
+    }
+
+    // 换入：旧目录先挪到备份名，新目录就位后再删；rename 失败可原样回滚
+    let dest = themes.join(theme_id);
+    let backup = themes.join(format!(".tmp-old-{theme_id}"));
+    let _ = fs::remove_dir_all(&backup);
+    let had_old = dest.exists();
+    if had_old {
+        fs::rename(&dest, &backup).map_err(|e| {
+            let _ = fs::remove_dir_all(&staging);
+            format!("替换既有主题失败: {e}")
+        })?;
+    }
+    if let Err(e) = fs::rename(&staging, &dest) {
+        if had_old {
+            let _ = fs::rename(&backup, &dest);
+        }
+        let _ = fs::remove_dir_all(&staging);
+        return Err(format!("安装主题失败: {e}"));
+    }
+    let _ = fs::remove_dir_all(&backup);
+    Ok(())
+}
+
 /// 把用户选择的主题文件夹拷入 themes/（四件套平铺，只拷顶层文件）。
 /// 返回落库后的主题 id（目录名）。
 #[tauri::command]
@@ -101,20 +166,8 @@ pub fn import_theme_pack(app: AppHandle, src_dir: String) -> Result<String, Stri
         .ok_or("非法路径")?
         .to_string_lossy()
         .into_owned();
-    let dest = themes_dir(&app)?.join(&theme_id);
-    fs::create_dir_all(&dest).map_err(|e| format!("创建 {theme_id} 目录失败: {e}"))?;
-    for entry in fs::read_dir(&src).map_err(|e| e.to_string())?.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        fs::copy(&path, dest.join(entry.file_name()))
-            .map_err(|e| format!("拷贝 {} 失败: {e}", entry.file_name().to_string_lossy()))?;
-    }
-    if let Err(e) = verify_manifest(&dest) {
-        let _ = fs::remove_dir_all(&dest);
-        return Err(e);
-    }
+    validate_theme_id(&theme_id)?;
+    install_pack(&themes_dir(&app)?, &theme_id, &src)?;
     Ok(theme_id)
 }
 
@@ -153,7 +206,9 @@ pub fn import_theme_pack_zip(app: AppHandle, zip_path: String) -> Result<String,
         }
     };
 
-    // 主题 id：优先用包根目录名；zip 根平铺时用 zip 文件名（去扩展名）
+    // 主题 id：优先用包根目录名；zip 根平铺时用 zip 文件名（去扩展名）。
+    // 后者是**用户选中的任意文件名**，必须过 validate_theme_id：`...zip` 的
+    // file_stem 是 `..`，没这道闸下面的安装会打到 app_data_dir 上。
     let theme_id = if pack_root == extract_dir {
         Path::new(&zip_path)
             .file_stem()
@@ -163,19 +218,9 @@ pub fn import_theme_pack_zip(app: AppHandle, zip_path: String) -> Result<String,
     } else {
         pack_root.file_name().unwrap().to_string_lossy().into_owned()
     };
+    validate_theme_id(&theme_id).map_err(&cleanup)?;
 
-    verify_manifest(&pack_root).map_err(&cleanup)?;
-
-    let dest = themes.join(&theme_id);
-    let _ = fs::remove_dir_all(&dest);
-    fs::create_dir_all(&dest).map_err(|e| cleanup(e.to_string()))?;
-    for entry in fs::read_dir(&pack_root).map_err(|e| cleanup(e.to_string()))?.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        fs::copy(&path, dest.join(entry.file_name())).map_err(|e| cleanup(e.to_string()))?;
-    }
+    install_pack(&themes, &theme_id, &pack_root).map_err(&cleanup)?;
     let _ = fs::remove_dir_all(&extract_dir);
     Ok(theme_id)
 }
@@ -184,10 +229,9 @@ pub fn import_theme_pack_zip(app: AppHandle, zip_path: String) -> Result<String,
 /// asset 协议加载失败时的前端兜底通道（CSS 背景图加载失败是静默的）。
 #[tauri::command]
 pub fn read_theme_asset(app: AppHandle, theme_id: String, file: String) -> Result<String, String> {
-    for part in [&theme_id, &file] {
-        if part.is_empty() || part.contains(['/', '\\']) || part.contains("..") {
-            return Err(format!("非法路径分量: {part}"));
-        }
+    validate_theme_id(&theme_id)?;
+    if file.is_empty() || file.contains(['/', '\\', ':']) || file.contains("..") {
+        return Err(format!("非法路径分量: {file}"));
     }
     let path = themes_dir(&app)?.join(&theme_id).join(&file);
     let data = fs::read(&path).map_err(|e| format!("读取 {theme_id}/{file} 失败: {e}"))?;
@@ -198,9 +242,7 @@ pub fn read_theme_asset(app: AppHandle, theme_id: String, file: String) -> Resul
 /// 删除主题包目录。
 #[tauri::command]
 pub fn delete_theme_pack(app: AppHandle, theme_id: String) -> Result<(), String> {
-    if theme_id.is_empty() || theme_id.contains(['/', '\\']) || theme_id.contains("..") {
-        return Err(format!("非法主题 id: {theme_id}"));
-    }
+    validate_theme_id(&theme_id)?;
     let dir = themes_dir(&app)?.join(&theme_id);
     if !dir.is_dir() {
         return Err(format!("主题包不存在: {theme_id}"));
@@ -250,4 +292,95 @@ fn verify_manifest(dir: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unique_test_root(label: &str) -> PathBuf {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mini-term-theme-test-{label}-{ts}"));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn write_pack(dir: &Path, theme_json: &str) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join("theme.json"), theme_json).unwrap();
+    }
+
+    /// 回归测试（PR #43 评审）：zip 根平铺时 theme_id 取自 zip 文件名，
+    /// `Path::new("...zip").file_stem()` 返回 `".."`、`"..zip"` 返回 `"."`。
+    /// 没有这道校验，`themes.join(id)` 会指向 app_data_dir 或 themes 本身，
+    /// 而安装路径紧接着就要删掉那个目录——config.json 与全部皮肤一起没。
+    #[test]
+    fn theme_id_from_dotted_zip_name_is_rejected() {
+        assert_eq!(Path::new("...zip").file_stem().unwrap(), "..");
+        assert_eq!(Path::new("..zip").file_stem().unwrap(), ".");
+
+        for bad in ["..", ".", "", "a/b", "a\\b", "..\\x", "C:", "x..y"] {
+            assert!(validate_theme_id(bad).is_err(), "应拒绝: {bad:?}");
+        }
+        for ok in ["dracula", "my theme", "主题-1", "a.b"] {
+            assert!(validate_theme_id(ok).is_ok(), "应放行: {ok:?}");
+        }
+    }
+
+    /// 导入同名主题时若包校验不过，既有皮肤必须原样还在
+    /// （此前是先删/先建 dest 再校验，坏包会连带删掉用户手工调过的主题）。
+    #[test]
+    fn failed_import_keeps_existing_pack_intact() {
+        let root = unique_test_root("import-atomic");
+        let themes = root.join("themes");
+        let existing = themes.join("dracula");
+        write_pack(&existing, r#"{"name":"用户改过的版本"}"#);
+
+        // 坏包：manifest 声明的 sha256 对不上
+        let src = root.join("src");
+        write_pack(&src, r#"{"name":"坏包"}"#);
+        fs::write(
+            src.join("manifest.json"),
+            r#"{"files":[{"path":"theme.json","bytes":999,"sha256":"00"}]}"#,
+        )
+        .unwrap();
+
+        let err = install_pack(&themes, "dracula", &src).unwrap_err();
+        assert!(err.contains("大小不符"), "实际错误: {err}");
+        assert_eq!(
+            fs::read_to_string(existing.join("theme.json")).unwrap(),
+            r#"{"name":"用户改过的版本"}"#
+        );
+        assert!(!themes.join(".tmp-install-dracula").exists(), "暂存目录未清理");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 成功路径：同名覆盖后是新包内容，且不留暂存/备份目录
+    #[test]
+    fn successful_import_replaces_pack_and_cleans_staging() {
+        let root = unique_test_root("import-replace");
+        let themes = root.join("themes");
+        write_pack(&themes.join("dracula"), r#"{"name":"旧"}"#);
+        // 旧包独有的文件在替换后不该残留（rename 换目录，不是逐文件覆盖）
+        fs::write(themes.join("dracula").join("theme.css"), "/* 旧 */").unwrap();
+
+        let src = root.join("src");
+        write_pack(&src, r#"{"name":"新"}"#);
+
+        install_pack(&themes, "dracula", &src).unwrap();
+        assert_eq!(
+            fs::read_to_string(themes.join("dracula").join("theme.json")).unwrap(),
+            r#"{"name":"新"}"#
+        );
+        assert!(!themes.join("dracula").join("theme.css").exists());
+        assert!(!themes.join(".tmp-install-dracula").exists());
+        assert!(!themes.join(".tmp-old-dracula").exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
 }

@@ -99,7 +99,12 @@ pub fn lookup_ai_session_cwd(session_id: String) -> Option<String> {
                 .take(50)
                 .collect();
             if let Some(cwd) = extract_session_cwd(&head.join("\n")) {
-                return Some(cwd);
+                // 目录可能已经不在了（worktree 被移除、项目搬家）。返回它只会让
+                // 续接时的 create_pty 直接失败、pane 变 error —— 不如当作查不到，
+                // 让前端回落 pane 自己的 cwd。
+                if std::path::Path::new(&cwd).is_dir() {
+                    return Some(cwd);
+                }
             }
         }
     }

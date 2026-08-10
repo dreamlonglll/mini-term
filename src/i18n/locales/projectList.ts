@@ -13,6 +13,7 @@ export const projectList = {
     preview: {
       notStarted: "未启动",
       disconnected: "已断开",
+      neverOpened: "尚未打开过终端",
     },
     remoteBrokenTitle: "SSH 连接已被删除，该远程项目暂不可用（可删除项目，或重新创建同名连接后重试）",
     newGroup: "新建分组",
@@ -71,6 +72,7 @@ export const projectList = {
     preview: {
       notStarted: "Not started",
       disconnected: "Disconnected",
+      neverOpened: "No terminal opened yet",
     },
     remoteBrokenTitle: "The SSH connection was deleted; this remote project is unavailable (delete the project, or recreate the connection and retry)",
     newGroup: "New Group",

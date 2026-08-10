@@ -618,6 +618,14 @@ pub fn start_hook_server(
                     if let Some(sid) = payload.session_id.clone() {
                         hook_state.note_session_active(pty_id, &sid);
                         if hook_state.record_session(pty_id, payload.agent.clone(), sid.clone()) {
+                            // hook 端点无鉴权,cwd 是任何本地进程都能塞的字段,而前端会
+                            // 把它持久化成「未来某次 PTY 的启动目录」。只放行确实存在的
+                            // 目录:构造出来的假路径与已被删掉的 worktree 一并挡在这里,
+                            // 续接时回落 pane 自己的 cwd,而不是让 create_pty 直接失败。
+                            let cwd = payload
+                                .cwd
+                                .clone()
+                                .filter(|p| std::path::Path::new(p).is_dir());
                             // 会话身份变化(新会话/换会话)时通知前端,供布局持久化
                             // 记录「退出时该 pane 正跑着哪个 AI 会话」以便重启续接
                             let _ = tauri::Emitter::emit(
@@ -629,7 +637,7 @@ pub fn start_hook_server(
                                     "sessionId": sid,
                                     // 会话启动目录:claude --resume 只认该目录的会话桶,
                                     // 前端随身份持久化,重启续接时 PTY 直接以它为 cwd
-                                    "cwd": payload.cwd.clone(),
+                                    "cwd": cwd,
                                 }),
                             );
                         }

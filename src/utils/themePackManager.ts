@@ -123,6 +123,12 @@ export function parseThemePack(themeId: string, jsonText: string): ThemePackJson
   if (def.tokens !== undefined && (typeof def.tokens !== 'object' || def.tokens === null)) {
     throw new Error('tokens 必须是对象');
   }
+  // 空串在这里归一化掉而不是放行：`image: ""` 曾能通过校验，此后
+  // hasBackgroundImage（`!!def.image`）说"没有背景图"、isTransparentThemeActive
+  // （`image !== undefined`）说"有"，终端被透明化并丢掉 WebGL，背景层却没挂。
+  if (def.image !== undefined && typeof def.image === 'string' && !def.image.trim()) {
+    delete def.image;
+  }
   if (def.image !== undefined && (typeof def.image !== 'string' || /[/\\]|\.\./.test(def.image))) {
     throw new Error(`image 必须是包内文件名: ${String(def.image)}`);
   }
@@ -273,15 +279,42 @@ function deriveTerminalTheme(variant: ThemeVariantDef, mode: 'dark' | 'light', w
 const THEME_CSS_MAX_BYTES = 256 * 1024;
 const STYLE_ATTR = 'data-mt-theme-css';
 
+/** 还原 CSS 转义序列（`\68 ` → `h`、`\.` → `.`），**仅供卫生检查取样**。
+ *
+ *  注入的仍是原文：CSS 词法层在解析时本就会做这一步，于是 `@\69 mport` 与
+ *  `url(\68 ttps://evil/x.png)` 对浏览器等价于 `@import` / `url(https://…)`，
+ *  而正则直接打在原文上一个都拦不住（三个 payload 实测全部放行）。 */
+function decodeCssEscapes(css: string): string {
+  return css.replace(/\\(?:([0-9a-fA-F]{1,6})[ \t\n\r\f]?|([^]))/g, (_m, hex, ch) => {
+    if (!hex) return ch;
+    const cp = parseInt(hex, 16);
+    // CSS 规定 0 / 代理区 / 超出 Unicode 范围一律替换为 U+FFFD
+    return cp === 0 || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)
+      ? '�'
+      : String.fromCodePoint(cp);
+  });
+}
+
 /** 本地信任模型下的轻量卫生检查：字节上限、禁 @import 与外链 url。
+ *
+ *  皮肤本身是从别处下载来的共享产物（自带 zip 导入），而 `tauri.conf.json` 的
+ *  csp 是 null，没有第二道防线——一个外链 url() 就能把应用启动时机与 IP 回传。
+ *  因此 url() 走白名单：只放行包内相对路径与 data:，带 scheme 的和协议相对的
+ *  `//host/…` 一律拒。检查在**转义还原后**的取样上做，见 decodeCssEscapes。
+ *
  *  同时把 Dream Skin 的 ds 前缀转译为 mt（选择器锚点与旋钮变量同构）。 */
-function sanitizeThemeCss(css: string): string {
+export function sanitizeThemeCss(css: string): string {
   if (new Blob([css]).size > THEME_CSS_MAX_BYTES) {
     throw new Error('theme.css 超过 256KB 上限');
   }
-  if (/@import/i.test(css)) throw new Error('theme.css 不允许 @import');
-  if (/url\(\s*['"]?\s*(?:https?:)?\/\//i.test(css)) {
-    throw new Error('theme.css 不允许外链 url');
+  const probe = decodeCssEscapes(css);
+  if (/@import/i.test(probe)) throw new Error('theme.css 不允许 @import');
+  for (const m of probe.matchAll(/url\(\s*(['"]?)([^'")]*)\1\s*\)/gi)) {
+    const ref = m[2].trim();
+    if (!ref || ref.startsWith('data:')) continue;
+    if (ref.startsWith('//') || /^[a-z][a-z0-9+.-]*:/i.test(ref)) {
+      throw new Error(`theme.css 的 url() 只允许包内相对路径或 data:，实际: ${ref}`);
+    }
   }
   return css
     .split('data-ds-part').join('data-mt-part')
@@ -305,6 +338,19 @@ function removeThemeCss(): void {
 
 /** 包内资源的可用 URL 缓存（asset 探活或 base64 兜底的结果，按 themeId/file 记） */
 const assetUrlCache = new Map<string, string>();
+
+/** 丢弃某个主题（或全部）的资源 URL 缓存。
+ *  热重载与同名重导入都会换掉文件内容，缓存不清的话缩略图还是旧图 —— asset
+ *  协议的 URL 逐字不变，base64 兜底更是把旧字节整个留在内存里。 */
+export function invalidateThemeAssets(themeId?: string): void {
+  if (themeId === undefined) {
+    assetUrlCache.clear();
+    return;
+  }
+  for (const key of [...assetUrlCache.keys()]) {
+    if (key.startsWith(`${themeId}/`)) assetUrlCache.delete(key);
+  }
+}
 
 /** 解析包内资源的可显示 URL：优先 asset 协议，加载失败回退 base64 数据 URL。
  *  设置页皮肤卡片缩略图使用；结果缓存避免重复 IPC 大文件。 */
@@ -437,7 +483,7 @@ export function applyCustomTheme(def: ThemePackJson, dir: string | null = null, 
 }
 
 /** 只清 DOM 覆盖（变量/背景层/注入 CSS/标记），保留监听与激活态。
- *  供 applyCustomTheme 重算变体时复用——热重载监听跨明暗切换存活。 */
+ *  供 applyCustomTheme 重复应用同一主题（热重载）时复用，监听不受影响。 */
 function clearAppliedDom(): void {
   const root = document.documentElement;
   const props = root.getAttribute(PROPS_ATTR)?.split(' ').filter(Boolean) ?? [];
@@ -514,19 +560,36 @@ let watchedDir: string | null = null;
 let watchListenerReady = false;
 let reloadTimer: ReturnType<typeof setTimeout> | null = null;
 
-async function watchThemeDir(dir: string): Promise<void> {
-  ensureWatchListener();
-  if (watchedDir === dir) return;
-  await unwatchThemeDir();
-  try {
-    await invoke('watch_directory', { path: dir, projectPath: THEME_WATCH_TAG });
-    watchedDir = dir;
-  } catch (e) {
-    console.warn('主题目录监听失败（热重载不可用）:', e);
-  }
+/** watch/unwatch 的串行闸。`watchedDir === dir` 的判断与赋值之间隔着两个 await，
+ *  快速连点两个主题会让两次调用双双越过判断、各注册一个目录，而 watchedDir 只
+ *  留得住后写入的那个 —— 另一个永不 unwatch。 */
+let watchQueue: Promise<unknown> = Promise.resolve();
+
+function serializeWatch<T>(task: () => Promise<T>): Promise<T> {
+  const run = watchQueue.then(task, task);
+  watchQueue = run.catch(() => {});
+  return run;
 }
 
-async function unwatchThemeDir(): Promise<void> {
+function watchThemeDir(dir: string): Promise<void> {
+  ensureWatchListener();
+  return serializeWatch(async () => {
+    if (watchedDir === dir) return;
+    await unwatchInner();
+    try {
+      await invoke('watch_directory', { path: dir, projectPath: THEME_WATCH_TAG });
+      watchedDir = dir;
+    } catch (e) {
+      console.warn('主题目录监听失败（热重载不可用）:', e);
+    }
+  });
+}
+
+function unwatchThemeDir(): Promise<void> {
+  return serializeWatch(unwatchInner);
+}
+
+async function unwatchInner(): Promise<void> {
   if (!watchedDir) return;
   const dir = watchedDir;
   watchedDir = null;
@@ -546,6 +609,8 @@ function ensureWatchListener(): void {
       reloadTimer = null;
       const id = activeThemeId;
       if (!id) return;
+      // 重载前丢掉该包的资源缓存：改的很可能就是背景图，缓存留着会拿旧图重挂
+      invalidateThemeAssets(id);
       loadAndApplyCustomTheme(id)
         .then(() => {
           // 终端配色的联动刷新由 App.tsx 监听此事件完成（避免 store 循环依赖）

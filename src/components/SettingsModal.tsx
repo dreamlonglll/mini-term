@@ -16,7 +16,7 @@ import {
   DEFAULT_TERMINAL_FONT_FAMILY,
 } from '../utils/terminalCache';
 import { applyUiFontFamily } from '../utils/fontManager';
-import { clearCustomTheme, listThemePacks, loadAndApplyCustomTheme, resolveThemeAssetUrl, type ThemePackMeta } from '../utils/themePackManager';
+import { clearCustomTheme, invalidateThemeAssets, listThemePacks, loadAndApplyCustomTheme, resolveThemeAssetUrl, type ThemePackMeta } from '../utils/themePackManager';
 import { MOD_LABEL } from '../utils/platform';
 import { comboLabel, hotkeyGroups } from '../utils/hotkeys';
 import { DEFAULT_REMOTE_PASTE_DIR } from '../utils/pastePath';
@@ -1753,7 +1753,9 @@ function CustomThemePacksSection() {
     });
     if (typeof selected !== 'string' || !selected.trim()) return;
     try {
-      await invoke<string>('import_theme_pack', { srcDir: selected });
+      const themeId = await invoke<string>('import_theme_pack', { srcDir: selected });
+      // 同名覆盖导入换掉的是同一批文件名，缓存不清缩略图还是上一版
+      invalidateThemeAssets(themeId);
       refresh();
     } catch (e) {
       setError(String(e));
@@ -1770,7 +1772,8 @@ function CustomThemePacksSection() {
     });
     if (typeof selected !== 'string' || !selected.trim()) return;
     try {
-      await invoke<string>('import_theme_pack_zip', { zipPath: selected });
+      const themeId = await invoke<string>('import_theme_pack_zip', { zipPath: selected });
+      invalidateThemeAssets(themeId);
       refresh();
     } catch (e) {
       setError(String(e));
@@ -1780,16 +1783,22 @@ function CustomThemePacksSection() {
   const deletePack = useCallback(async (pack: ThemePackMeta) => {
     if (!window.confirm(t('settings.themes.deleteConfirm', { name: pack.def.name }))) return;
     setError(null);
+    const cur = useAppStore.getState().config;
+    // 先退出该主题（clearCustomTheme 内含 unwatch）再删目录：反过来的话
+    // notify 的目录句柄还开着，被删目录在 Windows 上处于 delete-pending，
+    // 紧接着重导入同名主题会撞 ERROR_ACCESS_DENIED。
+    const wasActive = cur.customThemeId === pack.themeId;
+    if (wasActive) clearCustomTheme();
+    invalidateThemeAssets(pack.themeId);
     try {
       await invoke('delete_theme_pack', { themeId: pack.themeId });
     } catch (e) {
       setError(String(e));
+      // 删失败就把主题装回去，避免用户界面上皮肤没了、目录还在
+      if (wasActive) void loadAndApplyCustomTheme(pack.themeId).catch(() => {});
       return;
     }
-    const cur = useAppStore.getState().config;
-    if (cur.customThemeId === pack.themeId) {
-      // 删的是当前激活主题：清除并回落内置外观
-      clearCustomTheme();
+    if (wasActive) {
       const newConfig = { ...cur, customThemeId: undefined };
       setConfig(newConfig);
       applyTheme(newConfig.theme ?? 'auto');

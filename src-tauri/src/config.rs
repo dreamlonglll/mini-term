@@ -233,6 +233,12 @@ pub struct SavedAiSession {
     /// 来源 agent(claude-code / codex),缺省按 Claude 处理
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// 会话的启动目录。`claude --resume` 只认「启动目录」对应的会话桶,起于子
+    /// 目录的会话在项目根恢复会报 No conversation found。缺这个字段时 serde 会
+    /// 静默丢弃前端写进 savedLayout 的 cwd,hook 第一手上报的启动目录与
+    /// lookup_ai_session_cwd 的反查结果都存不下来,每次重启只能重查一遍。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
     pub session_id: String,
 }
 

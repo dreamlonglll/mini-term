@@ -171,6 +171,13 @@ export function App() {
           .then(() => updateAllTerminalThemes(cfg.terminalFollowTheme ?? true))
           .catch((e) => {
             console.error(`自定义主题 ${cfg.customThemeId} 加载失败，回落内置外观:`, e);
+            // 运行时 config 里的 id 必须一并清掉：下面的 skin effect 按
+            // customThemeId 收敛，id 还在就把 data-skin 强制置空，用户原本的
+            // 内置皮肤在"回落"时一起没了，设置页还显示着这个包处于激活态。
+            // 只改内存不落盘 —— 主题目录可能只是这次读不到（盘没挂载、文件正
+            // 被替换），落盘会把用户的选择永久抹掉，下次启动就找不回来了。
+            const cur = useAppStore.getState().config;
+            if (cur.customThemeId) setConfig({ ...cur, customThemeId: undefined });
           });
       }
 

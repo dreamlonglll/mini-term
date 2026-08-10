@@ -100,7 +100,15 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
     // 对应的会话桶,起于子目录的会话在项目根恢复会报 No conversation found。
     // 存量记录无 cwd 时向后端反查 jsonl(lookup_ai_session_cwd),查到随身份写回
     // 持久化,下次重启免查;codex 会话不按目录分桶,无需反查。
-    const sessionRef = activePane.resumePending ? activePane.aiSession : undefined;
+    //
+    // 与 resolveAutoResumeCommand 消费同一个 enabled:resumePending 在开关关闭时
+    // 是**刻意保留**的(见 aiResume.ts),只看它会让关掉自动续接的用户拿到「不写
+    // resume 命令、shell 却开在会话子目录里」的割裂结果。开关同样取现值而非
+    // autoResumeEnabled 快照(config 不在 effect deps 里,理由见下方 resumeCmd 处)。
+    const sessionRef =
+      (useAppStore.getState().config.aiAutoResume ?? true) && activePane.resumePending
+        ? activePane.aiSession
+        : undefined;
     const resolveResumeCwd = async (): Promise<string | undefined> => {
       if (remote || !sessionRef) return undefined;
       if (sessionRef.cwd) return sessionRef.cwd;
@@ -117,7 +125,21 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
     resolveResumeCwd()
       .then((cwd) => {
         resumeCwd = cwd;
-        return createProjectPty(project, shell, cwd ?? activePane.cwd);
+        // pane 自己的 cwd 优先:那是用户显式给这个 pane 定的目录(worktree 终端
+        // 靠它),会话 cwd 只在 pane 没指定时兜底。反过来写会让续接把 worktree
+        // 终端带偏到会话记录的目录去。
+        const startCwd = activePane.cwd ?? cwd;
+        if (startCwd === undefined || startCwd === activePane.cwd) {
+          return createProjectPty(project, shell, startCwd);
+        }
+        // 会话 cwd 是持久化下来的旧值,目录可能在这期间没了(worktree 移除、
+        // 项目搬家)。那本是「续接得更准」的优化,不该把 pane 拖成 error ——
+        // 失败就退回项目默认目录重来一次,大不了 resume 找不到会话桶。
+        return createProjectPty(project, shell, startCwd).catch((e) => {
+          console.warn(`以会话目录 ${startCwd} 启动失败，回落项目默认目录:`, e);
+          resumeCwd = undefined;
+          return createProjectPty(project, shell, activePane.cwd);
+        });
       })
       .then((ptyId) => {
         const layout = useAppStore.getState().projectStates.get(projectId)?.layout;

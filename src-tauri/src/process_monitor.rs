@@ -147,19 +147,17 @@ impl StatusEmitter {
 /// 打断并不退出），曾经的 "ai-idle && !is_ai_session → idle" 兜底会把这类
 /// 误差放大成 pane 整个会话期永久显示 idle。
 ///
-/// `hook_server_running` 是 AI 感知总开关（设置「AI HOOK 事件」）：server 未
-/// 运行时降级轮询分不清「完成」与「待确认」——绿灯会把等待授权谎报成任务
-/// 完成、黄灯又永远亮不起来，因此一律返回 idle（残留 hook 状态同样不显示），
-/// pane 回归普通终端；开关重开后 hook 状态仍在，下一个事件即恢复权威判定。
+/// 判定**不看 hook server 是否在运行**：`hook_enabled` 默认关闭，且 WSL / SSH /
+/// opencode / pi 这些 pane 即便 server 开着也从来没有 hook 上报，它们的徽章全
+/// 依赖这里的降级轮询（CLAUDE.md 「只靠输入检测识别的 agent 拿得到状态徽章」）。
+/// 曾短暂加过一条 `if !server_running { return "idle" }` 的「AI 感知总开关」，
+/// 在默认配置下等于把全部 AI 徽章、完成通知、托盘灯静默关掉，且没解决它声称
+/// 要解决的「降级轮询把等待授权谎报成完成」——那条 else-if 分支原样还在。
 pub(crate) fn resolve_status(
     hook_state: &HookState,
     pty_manager: &crate::pty::PtyManager,
     pty_id: u32,
-    hook_server_running: bool,
 ) -> String {
-    if !hook_server_running {
-        return "idle".to_string();
-    }
     if hook_state.is_hook_enabled(pty_id) {
         hook_state
             .get_status(pty_id)
@@ -289,23 +287,21 @@ pub fn start_monitor(
             let pty_ids = pty_manager.get_pty_ids();
 
             for pty_id in &pty_ids {
-                let handled = hook_state.with_running_server(|| {
-                    // 先做停摆收敛（会改写 hook 状态），再按收敛后的状态算本轮值：
-                    // 命中时下面这次 emit 会被去重吞掉，前端只收到带成因的那一条。
+                // 停摆收敛会改写 hook 状态，判据也建立在 hook 状态上，只在 server
+                // 运行时有意义，且需与 server 停止串行化；状态判定本身在锁外，
+                // server 没起来的 pane 照旧走 resolve_status 的降级轮询分支。
+                // 顺序不能颠倒：收敛命中时下面这次 emit 值已相同，会被去重吞掉，
+                // 前端只收到 settle 发出的那条带成因的。
+                hook_state.with_running_server(|| {
                     settle_stalled_ai(&app, &hook_state, &pty_manager, &emitter, *pty_id);
-                    let status = resolve_status(&hook_state, &pty_manager, *pty_id, true);
-                    let agent = if status.starts_with("ai-") {
-                        pty_manager.ai_session_agent(*pty_id)
-                    } else {
-                        None
-                    };
-                    emitter.emit_if_changed(&app, *pty_id, &status, None, agent);
                 });
-
-                if handled.is_none() {
-                    let status = resolve_status(&hook_state, &pty_manager, *pty_id, false);
-                    emitter.emit_if_changed(&app, *pty_id, &status, None, None);
-                }
+                let status = resolve_status(&hook_state, &pty_manager, *pty_id);
+                let agent = if status.starts_with("ai-") {
+                    pty_manager.ai_session_agent(*pty_id)
+                } else {
+                    None
+                };
+                emitter.emit_if_changed(&app, *pty_id, &status, None, agent);
             }
 
             emitter.retain(&pty_ids);
@@ -337,7 +333,7 @@ mod tests {
         mgr.track_input(1, "\x03"); // （claude 未退出，仅回到提示符）
         hooks.update(1, "ai-idle".to_string()); // 打断后 claude 上报 ai-idle
 
-        assert_eq!(resolve_status(&hooks, &mgr, 1, true), "ai-idle");
+        assert_eq!(resolve_status(&hooks, &mgr, 1), "ai-idle");
     }
 
     /// 回归测试（AI 完成通知每 20~50s 重复播报的 bug）：hook 卡在 ai-working
@@ -358,7 +354,7 @@ mod tests {
         mgr.track_input(1, "\x03");
         // 无后续 hook 事件、无 PTY 输出（has_recent_output 为 false）
 
-        assert_eq!(resolve_status(&hooks, &mgr, 1, true), "ai-working");
+        assert_eq!(resolve_status(&hooks, &mgr, 1), "ai-working");
     }
 
     /// 同一 bug 的另一面：monitor 每 500ms 重算一次，只要没有新 hook 事件，
@@ -373,7 +369,7 @@ mod tests {
         hooks.update(1, "ai-working".to_string());
 
         let polls: Vec<String> = (0..5)
-            .map(|_| resolve_status(&hooks, &mgr, 1, true))
+            .map(|_| resolve_status(&hooks, &mgr, 1))
             .collect();
         assert!(
             polls.iter().all(|s| s == "ai-working"),
@@ -391,7 +387,7 @@ mod tests {
 
         hooks.update(1, "ai-idle".to_string()); // hook 正常上报，但输入检测漏了启动
 
-        assert_eq!(resolve_status(&hooks, &mgr, 1, true), "ai-idle");
+        assert_eq!(resolve_status(&hooks, &mgr, 1), "ai-idle");
     }
 
     /// 对照组：输入检测与 hook 一致（未误判退出）时，ai-idle 正常保持。
@@ -403,7 +399,7 @@ mod tests {
         mgr.track_input(1, "claude\r");
         hooks.update(1, "ai-idle".to_string());
 
-        assert_eq!(resolve_status(&hooks, &mgr, 1, true), "ai-idle");
+        assert_eq!(resolve_status(&hooks, &mgr, 1), "ai-idle");
     }
 
     /// 无 hook 的 pane（WSL/SSH/hook 关闭）维持轮询逻辑：
@@ -413,26 +409,26 @@ mod tests {
         let hooks = HookState::new();
         let mgr = PtyManager::new();
 
-        assert_eq!(resolve_status(&hooks, &mgr, 1, true), "idle");
+        assert_eq!(resolve_status(&hooks, &mgr, 1), "idle");
         mgr.track_input(1, "claude\r");
-        assert_eq!(resolve_status(&hooks, &mgr, 1, true), "ai-idle");
+        assert_eq!(resolve_status(&hooks, &mgr, 1), "ai-idle");
     }
 
-    /// hook 总开关关闭(server 未运行)时 AI 感知整体停用:降级轮询分不清
-    /// 「完成」与「待确认」(绿灯会谎报完成、黄灯永远缺席),残留的 hook
-    /// 状态同样不显示;pane 一律回归普通 idle,无蓝/绿灯、无完成通知。
+    /// 回归测试（PR #43 评审）：hook server 未运行**不得**让 AI 感知整体归零。
+    /// `hook_enabled` 默认是 false，曾经的 `if !server_running { return "idle" }`
+    /// 让全新安装与从没进过设置页的存量用户一次性失去全部 AI 徽章、完成通知与
+    /// 托盘灯；WSL/SSH/opencode/pi 这些永远拿不到 hook 上报的 pane 更是彻底没
+    /// 出路。判定只看 pane 自己有没有 hook（is_hook_enabled），与 server 无关。
     #[test]
-    fn server_off_disables_all_ai_status() {
+    fn no_hook_server_still_falls_back_to_polling() {
         let hooks = HookState::new();
         let mgr = PtyManager::new();
 
-        mgr.track_input(
-            1, "claude
-",
-        ); // 输入检测已标记 AI 会话
-        hooks.update(1, "ai-working".to_string()); // 关闭开关前残留的 hook 状态
+        // server 从未启动 → hook_state 里没有该 pty 的任何记录
+        mgr.track_input(1, "claude\r"); // 只有输入检测标记了 AI 会话
+        assert!(!hooks.is_hook_enabled(1));
 
-        assert_eq!(resolve_status(&hooks, &mgr, 1, false), "idle");
+        assert_eq!(resolve_status(&hooks, &mgr, 1), "ai-idle");
     }
 
     // ---- 停摆兜底（stall_settle_target）----
@@ -616,7 +612,7 @@ mod tests {
         // 落盘后即便伪输出继续零星抵达，多轮 resolve_status 也恒定
         mgr.note_output_for_test(1);
         let polls: Vec<String> = (0..5)
-            .map(|_| resolve_status(&hooks, &mgr, 1, true))
+            .map(|_| resolve_status(&hooks, &mgr, 1))
             .collect();
         assert!(
             polls.iter().all(|s| s == "ai-idle"),
@@ -637,7 +633,7 @@ mod tests {
         let target = stall_settle_target(&hooks, &mgr, None, 1, ELAPSED).unwrap();
         hooks.update(1, target.to_string());
 
-        assert_eq!(resolve_status(&hooks, &mgr, 1, true), "idle");
+        assert_eq!(resolve_status(&hooks, &mgr, 1), "idle");
     }
 
     /// 兜底成因不得被前端当成「完成」或「待办」——与
