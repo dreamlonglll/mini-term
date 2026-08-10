@@ -21,11 +21,13 @@ export function ToastContainer() {
         const isMobileSession = n.kind === 'mobile-session';
         // 远程粘贴上传失败:错误态图标,点击仅关闭(项目就在眼前,不需要跳转)
         const isPasteError = n.kind === 'paste-error';
+        // AI 待确认:警告色 + 感叹号,与绿色的「已完成」一眼分得开(两者都带项目跳转)
+        const isAttention = n.kind === 'ai-attention';
         const isInfo = isWslInfo || isMobileSession;
         return (
           <div
             key={n.id}
-            className="toast-card"
+            className={isAttention ? 'toast-card toast-card--attention' : 'toast-card'}
             // 悬停暂停自动消失:5s 硬性倒计时会在鼠标正要点它时把它抽走
             onMouseEnter={() => pauseNotification(n.id, true)}
             onMouseLeave={() => pauseNotification(n.id, false)}
@@ -41,17 +43,23 @@ export function ToastContainer() {
               className={
                 isPasteError
                   ? 'toast-icon toast-icon--error'
-                  : isInfo
-                    ? 'toast-icon toast-icon--info'
-                    : 'toast-icon'
+                  : isAttention
+                    ? 'toast-icon toast-icon--attention'
+                    : isInfo
+                      ? 'toast-icon toast-icon--info'
+                      : 'toast-icon'
               }
             >
-              {isPasteError ? '!' : isInfo ? 'i' : '✓'}
+              {isPasteError || isAttention ? '!' : isInfo ? 'i' : '✓'}
             </div>
             <div className="toast-body">
               <div className="toast-name">{n.projectName}</div>
               <div className="toast-desc">
-                {isInfo || isPasteError ? (n.message ?? '') : t('toast.aiDone')}
+                {isInfo || isPasteError
+                  ? (n.message ?? '')
+                  : isAttention
+                    ? t('toast.aiAttention')
+                    : t('toast.aiDone')}
               </div>
             </div>
             <button

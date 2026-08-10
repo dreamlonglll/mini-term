@@ -29,6 +29,27 @@ export function isAttentionCause(cause?: string): boolean {
 }
 
 /**
+ * 这次状态变化是否构成「AI 转入待确认」的**上升沿**——待确认通知（提示音 /
+ * 任务栏闪烁 / toast）的唯一判据。
+ *
+ * 必须看上升沿而不能只看 `isAttentionCause`：后端 `StatusEmitter` 把 attention
+ * 类事件显式排除在去重之外（`process_monitor.rs`，为的是同一轮里第二次授权请求
+ * 不被吞掉），所以同一次待确认完全可能连着推来多条（PermissionRequest 后跟
+ * Elicitation、或同一事件重发）。不看上升沿就是一次待确认响好几声。
+ *
+ * 黄灯已亮着时新来的 attention 事件不再响，正对应「用户还没处理，提醒过了」；
+ * 用户对该 pane 键入会清掉 attention（`clearPaneAttentionByPty`），下一次授权
+ * 请求于是重新构成上升沿、重新提醒。
+ *
+ * @param prevAttention 该 pane 变化前的 attention 标记（黄灯是否已亮）
+ * @param cause 后端 `pty-status-change` 带的成因；无 hook 的降级路径没有事件名，
+ *   压根产生不了 attention，这里自然返回 false
+ */
+export function isAttentionRise(prevAttention: boolean | undefined, cause?: string): boolean {
+  return isAttentionCause(cause) && !prevAttention;
+}
+
+/**
  * 判断一次 pane 状态变化是否构成"AI 任务完成"，即该不该播提示音 / 闪任务栏 /
  * 推 toast。
  *

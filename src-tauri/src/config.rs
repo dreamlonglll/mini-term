@@ -84,6 +84,10 @@ pub struct AppConfig {
     pub ai_completion_sound: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai_completion_sound_path: Option<String>,
+    /// AI 转入「待确认」时是否也走完成通知的三个通道（弹框 / 任务栏 / 提示音）。
+    /// 旧配置没有该字段，`default_true` 让升级上来的用户默认拿到提醒
+    #[serde(default = "default_true")]
+    pub ai_attention_notify: bool,
     #[serde(default)]
     pub editors: Vec<EditorConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -412,6 +416,7 @@ impl Default for AppConfig {
             ai_completion_taskbar_flash: default_ai_completion_taskbar_flash(),
             ai_completion_sound: true,
             ai_completion_sound_path: None,
+            ai_attention_notify: true,
             editors: vec![],
             default_editor: None,
             vscode_path: None,

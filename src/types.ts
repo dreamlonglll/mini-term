@@ -33,6 +33,9 @@ export interface AppConfig {
   aiCompletionTaskbarFlash: boolean;
   aiCompletionSound: boolean;
   aiCompletionSoundPath?: string;
+  /** AI 转入「待确认」（权限审批 / MCP 表单 / 回合因 API 错误结束）时也走一遍
+   *  上面三个通道提醒。与完成通知共用开关与自定义提示音，这里只管开不开 */
+  aiAttentionNotify: boolean;
   editors: EditorConfig[];
   defaultEditor?: string;
   gitChangesViewMode: 'list' | 'tree';
@@ -287,10 +290,11 @@ export interface AiCompletionNotification {
   projectName: string;
   timestamp: number;
   /** 通知类型,默认 'ai-completion'(AI 任务完成,点击跳到对应项目);
+   *  'ai-attention' 用于 AI 转入待确认(警告色,点击跳到对应项目);
    *  'wsl-info' 用于 WSL 启动器重写提示,不携带 projectId 跳转语义;
    *  'mobile-session' 用于移动端远程发起的新会话(点击跳到对应项目);
    *  'paste-error' 用于远程粘贴上传失败(错误态图标,点击仅关闭)。 */
-  kind?: 'ai-completion' | 'wsl-info' | 'mobile-session' | 'paste-error';
+  kind?: 'ai-completion' | 'ai-attention' | 'wsl-info' | 'mobile-session' | 'paste-error';
   /** kind='wsl-info' / 'mobile-session' 时的自定义消息文本,渲染时直接展示。 */
   message?: string;
 }

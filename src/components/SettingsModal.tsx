@@ -1166,7 +1166,7 @@ function AiHookSettings() {
   );
 }
 
-// ─── AiNotificationSettings（AI › 完成通知）───
+// ─── AiNotificationSettings（AI › 通知提醒）───
 
 function AiNotificationSettings() {
   const t = useT();
@@ -1242,6 +1242,16 @@ function AiNotificationSettings() {
         </SettingRow>
 
         <Hint>{t("settings.aiNotification.footer")}</Hint>
+      </Section>
+
+      <Section title={t("settings.aiNotification.trigger")}>
+        <ToggleRow
+          title={t("settings.aiNotification.attention")}
+          desc={t("settings.aiNotification.attentionDesc")}
+          checked={config.aiAttentionNotify}
+          onChange={(v) => patchConfig({ aiAttentionNotify: v })}
+        />
+        <Hint>{t("settings.aiNotification.attentionFooter")}</Hint>
       </Section>
     </div>
   );

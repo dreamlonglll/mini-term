@@ -19,7 +19,7 @@ import type {
   MobileRelayStatusPayload,
   ProjectKind,
 } from './types';
-import { isAiCompletion, isAttentionCause } from './utils/aiCompletion';
+import { isAiCompletion, isAttentionCause, isAttentionRise } from './utils/aiCompletion';
 import { restoreSavedProjectLayout } from './utils/layoutRestore';
 import { playNotificationSound } from './utils/notificationSound';
 import { t } from './i18n';
@@ -685,6 +685,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
     aiCompletionPopup: true,
     aiCompletionTaskbarFlash: true,
     aiCompletionSound: true,
+    aiAttentionNotify: true,
     editors: [],
     gitChangesViewMode: 'list',
     longPasteToFile: true,
@@ -890,6 +891,8 @@ export const useAppStore = create<AppStore>((set, get) => ({
     set((state) => {
       // 1. 找到 pane 所属项目并捕获 oldStatus
       let oldStatus: PaneStatus | null = null;
+      // 变化前黄灯是否已亮 —— 待确认提醒只认上升沿(见 isAttentionRise)
+      let oldAttention = false;
       let owningProjectId: string | null = null;
       let foundPaneId: string | null = null;
       for (const [pid, ps] of state.projectStates) {
@@ -897,6 +900,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
         const found = findPaneByPty(ps.layout, ptyId);
         if (found) {
           oldStatus = found.status;
+          oldAttention = !!found.attention;
           owningProjectId = pid;
           foundPaneId = found.id;
           break;
@@ -980,11 +984,14 @@ export const useAppStore = create<AppStore>((set, get) => ({
             // 设置 needsAttention（防重：已为 true 时不重复）
             newStates.set(owningProjectId, { ...ps, needsAttention: true });
 
-            // 推 toast（同项目当前没有未消失的 toast 才推）
+            // 推 toast（同项目当前没有未消失的**完成** toast 才推。不能只按
+            // projectId 判:待确认 toast 也挂同一个 projectId,批准后马上完成时
+            // 会把完成 toast 一并吞掉。kind 缺省即完成态,老记录同样算在内）
             if (state.config.aiCompletionPopup) {
               const project = state.config.projects.find((p) => p.id === owningProjectId);
               const hasExisting = state.notifications.some(
-                (n) => n.projectId === owningProjectId
+                (n) => n.projectId === owningProjectId &&
+                  (n.kind === undefined || n.kind === 'ai-completion')
               );
               if (project && !hasExisting) {
                 const projectName = project.name;
@@ -997,6 +1004,51 @@ export const useAppStore = create<AppStore>((set, get) => ({
                 );
               }
             }
+          }
+        }
+      }
+
+      // 4. 待确认提醒 —— AI 停下来等你批权限 / 填 MCP 表单,或这一轮因 API 错误
+      // 结束需要你回来重发。与完成同样是「AI 不再往前走了」,同样该把人叫回来,
+      // 走完成通知的三个通道与同一份自定义提示音,只是开关独立:它的触发频率远高于
+      // 完成(每次工具授权都算一次),想只留完成通知的用户得能单独关掉。
+      //
+      // 判据取 attention 的**上升沿**而非「本次 cause 是 attention 类」:后端
+      // StatusEmitter 把 attention 类事件显式排除在去重之外,同一次待确认会连推
+      // 多条(见 isAttentionRise),按 cause 判会一次待确认响好几声。
+      if (state.config.aiAttentionNotify && isAttentionRise(oldAttention, cause)) {
+        // 4a. 提示音 / 4b. 任务栏闪烁 — 与完成一致,不区分激活项目
+        if (state.config.aiCompletionSound) {
+          queueMicrotask(() => {
+            playNotificationSound(state.config.aiCompletionSoundPath);
+          });
+        }
+        if (state.config.aiCompletionTaskbarFlash) {
+          queueMicrotask(() => {
+            getCurrentWindow()
+              .requestUserAttention(UserAttentionType.Informational)
+              .catch(() => {});
+          });
+        }
+
+        // 4c. Toast — 仅非激活项目(当前项目就在眼前,pane 上的黄灯已经在说话)。
+        // 不设 needsAttention:那是项目行上绿色的「完成」标,语义对不上;防重于是
+        // 按「同项目还有没有未消失的待确认 toast」判,与完成的 toast 各计各的。
+        if (state.config.aiCompletionPopup && owningProjectId !== state.activeProjectId) {
+          const project = state.config.projects.find((p) => p.id === owningProjectId);
+          const hasExisting = state.notifications.some(
+            (n) => n.projectId === owningProjectId && n.kind === 'ai-attention'
+          );
+          if (project && !hasExisting) {
+            const projectName = project.name;
+            const targetPid = owningProjectId;
+            queueMicrotask(() =>
+              useAppStore.getState().pushNotification({
+                projectId: targetPid,
+                projectName,
+                kind: 'ai-attention',
+              })
+            );
           }
         }
       }

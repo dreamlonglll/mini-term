@@ -577,6 +577,9 @@ body.ssh-conn-dragging {
 }
 .toast-icon--info { background: var(--color-info); }
 .toast-icon--error { background: var(--color-error); }
+/* AI 待确认:与项目行/托盘的黄灯同色,和绿色的「已完成」区分开 */
+.toast-icon--attention { background: var(--color-warning); }
+.toast-card--attention { border-left-color: var(--color-warning); }
 
 .toast-body { flex: 1; min-width: 0; }
 .toast-name {

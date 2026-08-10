@@ -91,6 +91,7 @@ Mini-Term solves all of the above with one lightweight desktop app.
   - Taskbar flashing (Windows) / Dock bouncing (macOS), triggered only when the window is unfocused.
   - A notification sound (a default tone synthesized via the Web Audio API, with support for a custom audio file).
   - All notification toggles are independently configurable, managed together under "Settings → AI → Notifications" (hook registration lives on the sibling "Hook events" page).
+- **Awaiting-confirmation alert** — When the AI stops to ask for tool permission, needs an MCP form filled in, or ends a turn on an API error (`PermissionRequest` / `Elicitation` / `StopFailure` — the same rule that lights the project row amber), it fires one more alert through the same channels as above. Independently toggled and on by default (Settings → AI → Notifications → Trigger; it fires far more often than completion, so anyone who only wants completion alerts must be able to turn it off). The trigger is the **rising edge** of the amber light rather than "this cause is an awaiting-type one": the backend deliberately exempts these events from deduplication (a second authorization request in the same turn must not be swallowed), so keying off the cause alone would alert several times for one pending request. While the amber light stays on there are no repeat alerts; typing into that terminal counts as handling it (clearing the light), so only the next request forms a new rising edge. The toast uses the warning color plus an exclamation mark to stay distinct from the green "finished" one, and sets no DONE badge (that marks completion).
 - **Tray status light** — A persistent system-tray light for global AI status: yellow = awaiting confirmation, blue = working, green = unread completion, gray = quiet, rotating through coexisting states while the window is unfocused; the right-click tray menu lists **every project with an AI session** and its status (including ⚪ AI-idle ones, not just the busy ones; ordered awaiting > working > done > idle, entry cap configurable, idle entries never light the lamp) and picking a project jumps straight to its most urgent pane, while a left click summons the main window and jumps to the session that needs you next (the same landing logic as the title bar status light; a setting turns the jump off so it only summons the window — Linux offers the right-click menu only). Notification classification only treats permission / confirmation wording as "awaiting" — API errors and retry waits never light yellow. Can be disabled in Settings.
 - **Automatic session resume** — After a restart, each split pane automatically writes `claude --resume` / `codex resume` to reconnect its previous session: session identity comes from hook reports and persists with the layout across one restart; everything written back is allowlist-checked (alphanumerics plus `-_` only, max length 128), remote panes are excluded, and anything unrecognizable is never written. Can be turned off under Settings → System → General (terminals still come back, they just don't run the resume command).
 - **Session enter/exit detection** — Recognizes entering AI via command echo; recognizes exit via a double `Ctrl+C` / `Ctrl+D` or `exit` / `quit` / `:quit` / `/logout`.
@@ -276,7 +277,7 @@ mini-term/
 │   │   ├── RelayStatusBadge.tsx  # Relay connection status badge
 │   │   ├── SettingsModal.tsx     # Settings dialog (two-level menu: terminal / appearance / AI / system + shortcuts / about)
 │   │   ├── LanguageToggle.tsx    # Chinese / English switcher
-│   │   ├── ToastContainer.tsx    # AI completion toast notifications
+│   │   ├── ToastContainer.tsx    # AI completion / awaiting-confirmation toasts
 │   │   ├── DoneTag.tsx           # Project list DONE badge
 │   │   └── StatusDot.tsx         # Status indicator dot
 │   ├── hooks/
@@ -359,7 +360,8 @@ Rust PTY reader → 16ms batch buffer → emit('pty-output') → term.write()
 Process exit       → emit('pty-exit')          → store.updatePaneStatusByPty('error')
 Process monitor 500ms → emit('pty-status-change') → StatusDot update
 File change notify  → emit('fs-change')          → FileTree refresh
-ai-working → ai-idle → Toast + DONE Tag + requestUserAttention
+ai-working → ai-idle(Stop)          → Toast + DONE Tag + requestUserAttention
+attention rising edge(PermissionRequest…) → Toast(warning) + sound + requestUserAttention
 ```
 
 ### Tauri Interface Overview

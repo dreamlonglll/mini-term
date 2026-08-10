@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict');
 
-const { isAiCompletion, isAttentionCause } = require('../.tmp-tests/utils/aiCompletion.js');
+const { isAiCompletion, isAttentionCause, isAttentionRise } = require('../.tmp-tests/utils/aiCompletion.js');
 
 // Stop 是唯一表示"任务做完了"的 hook 事件
 {
@@ -72,6 +72,31 @@ const { isAiCompletion, isAttentionCause } = require('../.tmp-tests/utils/aiComp
   for (const cause of ['Stop', 'Interrupt', 'Notification', 'SessionStart', 'SessionEnd',
     'PermissionDenied', 'ElicitationResult', 'UserPromptSubmit', undefined]) {
     assert.equal(isAttentionCause(cause), false, String(cause));
+  }
+}
+
+// 待确认提醒只在上升沿响:黄灯没亮 + attention 类成因 = 提醒
+{
+  for (const cause of ['PermissionRequest', 'Elicitation', 'StopFailure']) {
+    assert.equal(isAttentionRise(false, cause), true, cause);
+    assert.equal(isAttentionRise(undefined, cause), true, cause);
+  }
+}
+
+// 黄灯已亮着,后续 attention 事件不再响 —— 后端把 attention 类成因排除在去重之外
+// (同一轮第二次授权请求不能被吞),所以同一次待确认完全可能连推多条
+{
+  assert.equal(isAttentionRise(true, 'PermissionRequest'), false);
+  assert.equal(isAttentionRise(true, 'Elicitation'), false);
+  // 用户对该 pane 键入会把 attention 清掉,下一次请求于是重新构成上升沿
+  assert.equal(isAttentionRise(false, 'PermissionRequest'), true);
+}
+
+// 非 attention 成因一律不提醒,哪怕黄灯此前没亮 —— 完成/打断/停摆兜底各有各的路径
+{
+  for (const cause of ['Stop', 'Interrupt', 'Notification', 'SessionStart', 'SessionEnd',
+    'Stall', 'StallExit', 'PermissionDenied', 'ElicitationResult', undefined]) {
+    assert.equal(isAttentionRise(false, cause), false, String(cause));
   }
 }
 
