@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.11.1-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.11.2-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -54,6 +54,8 @@ Status aggregates layer by layer from pane → tab → project (`error > ai-work
 - A **DONE** badge in the project list
 - Taskbar flashing (Windows) / Dock bouncing (macOS), only when the window is unfocused
 - A notification sound (a built-in synthesized tone, or your own audio file)
+
+Not just "it finished" — when the AI stops to **ask for tool permission**, needs an MCP form filled in, or ends a turn on an API error, the same alerts fire (the toast turns amber, and no DONE badge is set). This one is on by default and can be turned off on its own under Settings → AI → Notifications → Trigger — it fires far more often than "finished" does. One alert per pending request; typing into that terminal counts as handling it, so only the next request alerts again.
 
 And once the window is out of sight, the **status bar icon** takes over (Windows tray / macOS menu bar): yellow = awaiting confirmation, blue = working, green = unread completion, gray = quiet. Left-click and you land **on the session that needs you** — it switches projects, activates the specific pane and focuses the terminal, prioritized as "awaiting confirmation / error > finished first > working", the same ordering the title bar status light uses. The right-click menu lists **every project with an AI session** and its status (including ⚪ idle ones — not just the busy ones); picking a project jumps to the pane in it most in need of attention. If you'd rather it not change your current view, turn that off in Settings.
 

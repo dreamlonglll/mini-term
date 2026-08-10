@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.11.1-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.11.2-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -54,6 +54,8 @@ Mini-Term 就是为这件事做的：项目列表上的状态灯实时跳动，A
 - 项目列表 **DONE** 徽章
 - 任务栏闪烁（Windows）/ Dock 跳动（macOS），仅窗口失焦时触发
 - 提示音（内置合成音，也可以换成你自己的音频文件）
+
+不只是「跑完了」——AI 停下来**等你批工具权限**、等你填 MCP 表单，或这一轮因 API 错误结束时，同样走上面这套提醒（Toast 换成警告色，不发 DONE 徽章）。这一档默认开着，可以在「设置 → AI → 通知提醒 → 触发时机」单独关掉——它比「跑完」触发得频繁得多。同一次待确认只响一次；你往那个终端里敲字就算已经在处理，下一次请求才会再响。
 
 窗口切走之后还有**状态栏图标**接力（Windows 托盘 / macOS 菜单栏）：黄=待确认、蓝=处理中、绿=完成未读、灰=安静。左键点一下**直接落到该处理的那个会话**——切项目 + 激活到具体分屏并聚焦终端，优先级是「待确认/异常 > 最先完成 > 处理中」，与标题栏状态灯同一套口径；右键菜单列出**所有进入 AI 会话的项目**及各自状态（含 ⚪ 空闲待命的，不只是有动静的），点某个项目则定位到该项目内最该处理的分屏。不想让它改变当前视图的话，设置里可以关掉。
 
