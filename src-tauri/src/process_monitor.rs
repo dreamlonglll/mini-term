@@ -368,9 +368,7 @@ mod tests {
         mgr.track_input(1, "claude\r");
         hooks.update(1, "ai-working".to_string());
 
-        let polls: Vec<String> = (0..5)
-            .map(|_| resolve_status(&hooks, &mgr, 1))
-            .collect();
+        let polls: Vec<String> = (0..5).map(|_| resolve_status(&hooks, &mgr, 1)).collect();
         assert!(
             polls.iter().all(|s| s == "ai-working"),
             "hook 未更新时状态应恒定，实测 {:?}",
@@ -523,10 +521,7 @@ mod tests {
         mgr.track_input(1, "claude\r");
         hooks.update(1, "ai-working".to_string());
 
-        assert_eq!(
-            stall_settle_target(&hooks, &mgr, None, 1, NOT_ELAPSED),
-            None
-        );
+        assert_eq!(stall_settle_target(&hooks, &mgr, None, 1, NOT_ELAPSED), None);
     }
 
     /// 有近期输出不动手：真在干活的 TUI 一直在重绘，这是最主要的活体证据。
@@ -540,10 +535,7 @@ mod tests {
         mgr.note_output_for_test(1);
 
         // 状态静置窗口已过，但输出窗口没过 → 不收敛
-        assert_eq!(
-            stall_settle_target(&hooks, &mgr, None, 1, NOT_ELAPSED),
-            None
-        );
+        assert_eq!(stall_settle_target(&hooks, &mgr, None, 1, NOT_ELAPSED), None);
     }
 
     /// Codex 的 PermissionRequest 映射为 ai-working 且点着黄灯：审批框弹出后
@@ -611,9 +603,7 @@ mod tests {
 
         // 落盘后即便伪输出继续零星抵达，多轮 resolve_status 也恒定
         mgr.note_output_for_test(1);
-        let polls: Vec<String> = (0..5)
-            .map(|_| resolve_status(&hooks, &mgr, 1))
-            .collect();
+        let polls: Vec<String> = (0..5).map(|_| resolve_status(&hooks, &mgr, 1)).collect();
         assert!(
             polls.iter().all(|s| s == "ai-idle"),
             "收敛后状态应恒定，实测 {:?}",

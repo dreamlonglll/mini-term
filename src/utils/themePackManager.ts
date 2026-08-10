@@ -411,23 +411,38 @@ function applyBackgroundLayer(def: ThemePackJson, variant: ThemeVariantDef, dir:
   const rootEl = document.getElementById('root');
   if (!rootEl) return;
   const image = def.image!;
+  const themeId = dir.split(/[/\\]/).filter(Boolean).pop() ?? def.id;
+  const cacheKey = `${themeId}/${image}`;
+  // 缩略图（resolveThemeAssetUrl）已解析过同一文件时直接用结论,
+  // 不再探活、也不再对同一文件各发一次 read_theme_asset IPC
+  const cached = assetUrlCache.get(cacheKey);
+  if (cached) {
+    setRootBackground(rootEl, def, variant, cached);
+    document.documentElement.dataset.customThemeBg = '1';
+    return;
+  }
   const url = convertFileSrc(`${dir}/${image}`);
   setRootBackground(rootEl, def, variant, url);
   // 噪点层随背景主题归零（styles.css 的 :root[data-custom-theme-bg] 规则）
   document.documentElement.dataset.customThemeBg = '1';
 
   // 探活：CSS 背景图加载失败是静默的，用 Image 预载检测 asset URL；
-  // 失败则走 Rust 读文件转 base64 数据 URL 兜底，并把根因留在控制台
+  // 失败则走 Rust 读文件转 base64 数据 URL 兜底，并把根因留在控制台。
+  // 两个分支的结论都进 assetUrlCache 与缩略图共享（按文件 key,主题切换不影响其有效性）
   const token = ++bgProbeToken;
-  const themeId = dir.split(/[/\\]/).filter(Boolean).pop() ?? def.id;
   const probe = new Image();
+  probe.onload = () => {
+    assetUrlCache.set(cacheKey, url);
+  };
   probe.onerror = () => {
     if (token !== bgProbeToken) return;
     console.warn(`背景图 asset URL 加载失败，回退 base64 通道: ${url}`);
     invoke<string>('read_theme_asset', { themeId, file: image })
       .then((b64) => {
+        const dataUrl = `data:${mimeOf(image)};base64,${b64}`;
+        assetUrlCache.set(cacheKey, dataUrl);
         if (token !== bgProbeToken) return;
-        setRootBackground(rootEl, def, variant, `data:${mimeOf(image)};base64,${b64}`);
+        setRootBackground(rootEl, def, variant, dataUrl);
       })
       .catch((e) => console.error('背景图兜底读取也失败:', e));
   };
