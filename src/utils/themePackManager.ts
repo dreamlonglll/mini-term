@@ -120,8 +120,31 @@ export function parseThemePack(themeId: string, jsonText: string): ThemePackJson
     throw new Error(`appearance 必须为 dark 或 light，实际: ${String(def.appearance)}`);
   }
   validateColors(def.colors, 'colors');
-  if (def.tokens !== undefined && (typeof def.tokens !== 'object' || def.tokens === null)) {
-    throw new Error('tokens 必须是对象');
+  if (def.tokens !== undefined) {
+    if (typeof def.tokens !== 'object' || def.tokens === null) {
+      throw new Error('tokens 必须是对象');
+    }
+    validateTokenOverrides(def.tokens as Record<string, unknown>, 'tokens');
+  }
+  // terminal 直接喂给 xterm，坏色值会让 setTheme 抛在 updateAllTerminalThemes
+  // 半途——换主题只改到一半，剩下的终端停在旧配色。与 colors 同一把尺子先拦掉。
+  if (def.terminal !== undefined) {
+    if (typeof def.terminal !== 'object' || def.terminal === null) {
+      throw new Error('terminal 必须是对象');
+    }
+    for (const [key, value] of Object.entries(def.terminal)) {
+      if (!isValidColor(value)) {
+        throw new Error(`terminal.${key} 不是合法色值: ${String(value)}`);
+      }
+    }
+  }
+  // 这两个旋钮进的是 CSS 变量，theme.css 里一句 `background: var(--mt-theme-surface-blur)`
+  // 就能把它当引用使——与 tokens 同源的敞口，同样走外链闸
+  for (const key of ['surfaceRadius', 'surfaceBlur'] as const) {
+    const v = def.effects?.[key];
+    if (v === undefined) continue;
+    if (typeof v !== 'string') throw new Error(`effects.${key} 必须是字符串`);
+    assertNoRemoteRef(decodeCssEscapes(v), `effects.${key}`);
   }
   // 空串在这里归一化掉而不是放行：`image: ""` 曾能通过校验，此后
   // hasBackgroundImage（`!!def.image`）说"没有背景图"、isTransparentThemeActive
@@ -260,6 +283,11 @@ function buildTokenMap(variant: ThemeVariantDef, withBackground: boolean): Recor
 function deriveTerminalTheme(variant: ThemeVariantDef, mode: 'dark' | 'light', withBackground: boolean): TerminalTheme {
   const base = BUILTIN_TERMINAL_THEMES[mode];
   const c = variant.colors;
+  // 带背景图时丢掉作者写的 terminal.background:overrides 在展开顺序上排在下面
+  // 那次透明化之后,一个照着内置主题抄全 24 字段的皮肤会把氛围图整块盖死,
+  // 而且没有任何提示——声明里写的是"完整/部分 xterm 24 字段",抄全是自然做法
+  const overrides = { ...variant.terminal };
+  if (withBackground) delete overrides.background;
   return {
     ...base,
     // 背景图模式下 xterm 自身背景全透明（保留 RGB 供对比度计算），
@@ -270,7 +298,7 @@ function deriveTerminalTheme(variant: ThemeVariantDef, mode: 'dark' | 'light', w
     cursorAccent: c.background,
     selectionBackground: withAlpha(c.accent, 0.22) ?? base.selectionBackground,
     selectionForeground: c.text,
-    ...variant.terminal,
+    ...overrides,
   };
 }
 
@@ -295,30 +323,74 @@ function decodeCssEscapes(css: string): string {
   });
 }
 
-/** 本地信任模型下的轻量卫生检查：字节上限、禁 @import 与外链 url。
+/** 注释里的 URL 是说明不是引用，取样前先剥掉，免得 `/* 见 https://… *​/` 被误杀。 */
+function stripCssComments(css: string): string {
+  return css.replace(/\/\*[^]*?\*\//g, ' ');
+}
+
+/** 引用是否指向包外：带 scheme（data: 除外）或协议相对的 `//host/…`。 */
+function isRemoteRef(ref: string): boolean {
+  const s = ref.trim();
+  if (!s || s.startsWith('data:')) return false;
+  return s.startsWith('//') || /^[a-z][a-z0-9+.-]*:/i.test(s);
+}
+
+/** 外链闸：`url()` 与**裸字符串字面量**双查，供 theme.css 与 tokens 共用。
  *
- *  皮肤本身是从别处下载来的共享产物（自带 zip 导入），而 `tauri.conf.json` 的
- *  csp 是 null，没有第二道防线——一个外链 url() 就能把应用启动时机与 IP 回传。
- *  因此 url() 走白名单：只放行包内相对路径与 data:，带 scheme 的和协议相对的
- *  `//host/…` 一律拒。检查在**转义还原后**的取样上做，见 decodeCssEscapes。
+ *  皮肤是从别处下载来的共享产物（自带 zip 导入），而 `tauri.conf.json` 的 csp
+ *  是 null，没有第二道防线——一个外链就能把应用启动时机与 IP 回传。
+ *
+ *  只查 `url()` 封不住：Chromium 认 `image-set("https://…" 1x)` 这种不带 url()
+ *  的裸字符串写法，`@font-face` 的 src 同理，一样发请求。所以字符串字面量一并查。
+ *  代价是 `content: "https://…"` 这类纯文本展示也会被拒——本地皮肤里没有正当
+ *  用途，宁可误杀。检查跑在**剥注释 + 转义还原后**的取样上，见 decodeCssEscapes。 */
+function assertNoRemoteRef(probe: string, label: string): void {
+  for (const m of probe.matchAll(/url\(\s*(['"]?)([^'")]*)\1\s*\)/gi)) {
+    if (isRemoteRef(m[2])) {
+      throw new Error(`${label} 的 url() 只允许包内相对路径或 data:，实际: ${m[2].trim()}`);
+    }
+  }
+  for (const m of probe.matchAll(/(['"])((?:(?!\1).)*?)\1/g)) {
+    if (isRemoteRef(m[2])) {
+      throw new Error(`${label} 不允许指向包外的引用: ${m[2].trim()}`);
+    }
+  }
+}
+
+/** theme.css 的卫生检查：字节上限、禁 @import、禁外链。
  *
  *  同时把 Dream Skin 的 ds 前缀转译为 mt（选择器锚点与旋钮变量同构）。 */
 export function sanitizeThemeCss(css: string): string {
   if (new Blob([css]).size > THEME_CSS_MAX_BYTES) {
     throw new Error('theme.css 超过 256KB 上限');
   }
-  const probe = decodeCssEscapes(css);
+  const probe = decodeCssEscapes(stripCssComments(css));
   if (/@import/i.test(probe)) throw new Error('theme.css 不允许 @import');
-  for (const m of probe.matchAll(/url\(\s*(['"]?)([^'")]*)\1\s*\)/gi)) {
-    const ref = m[2].trim();
-    if (!ref || ref.startsWith('data:')) continue;
-    if (ref.startsWith('//') || /^[a-z][a-z0-9+.-]*:/i.test(ref)) {
-      throw new Error(`theme.css 的 url() 只允许包内相对路径或 data:，实际: ${ref}`);
-    }
-  }
+  assertNoRemoteRef(probe, 'theme.css');
   return css
     .split('data-ds-part').join('data-mt-part')
     .split('--ds-theme-').join('--mt-theme-');
+}
+
+/** tokens 逃生舱的闸：只许覆盖 `--` 自定义属性，值不许指向包外。
+ *
+ *  少了它，tokens 就是上面那道白名单的绕行道——键名不以 `--` 开头时
+ *  `setProperty` 设的是**真实 CSS 属性**，`{"background-image":"url(https://…)"}`
+ *  一行就够让 documentElement 去拉外部资源，而 theme.css 那边正为同一件事做
+ *  转义还原加白名单。同一个包、同一个威胁，两处口径必须一致。
+ *
+ *  键名限死还顺带保住了 PROPS_ATTR——它用空格 join 键名，带空格的键会让
+ *  clearAppliedDom 的 split(' ') 清不干净。 */
+function validateTokenOverrides(tokens: Record<string, unknown>, label: string): void {
+  for (const [key, value] of Object.entries(tokens)) {
+    if (!/^--[A-Za-z0-9_-]+$/.test(key)) {
+      throw new Error(`${label} 只能覆盖 -- 开头的 CSS 变量，非法键名: ${key}`);
+    }
+    if (typeof value !== 'string') {
+      throw new Error(`${label}.${key} 必须是字符串`);
+    }
+    assertNoRemoteRef(decodeCssEscapes(value), `${label}.${key}`);
+  }
 }
 
 function injectThemeCss(css: string | null): void {

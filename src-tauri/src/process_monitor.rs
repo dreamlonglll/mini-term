@@ -287,12 +287,12 @@ pub fn start_monitor(
             let pty_ids = pty_manager.get_pty_ids();
 
             for pty_id in &pty_ids {
-                // 停摆收敛会改写 hook 状态，判据也建立在 hook 状态上，只在 server
-                // 运行时有意义，且需与 server 停止串行化；状态判定本身在锁外，
-                // server 没起来的 pane 照旧走 resolve_status 的降级轮询分支。
+                // 停摆收敛会改写 hook 状态，与 server 启停串行化；状态判定本身在
+                // 锁外。server 没起来**不是**跳过收敛的理由：判据是 pane 自己的
+                // hook 记录，AI 跑着时把 hook 开关关掉的 pane 照样得能被拉回来。
                 // 顺序不能颠倒：收敛命中时下面这次 emit 值已相同，会被去重吞掉，
                 // 前端只收到 settle 发出的那条带成因的。
-                hook_state.with_running_server(|| {
+                hook_state.with_server_lock(|| {
                     settle_stalled_ai(&app, &hook_state, &pty_manager, &emitter, *pty_id);
                 });
                 let status = resolve_status(&hook_state, &pty_manager, *pty_id);

@@ -260,11 +260,16 @@ impl HookState {
         self.server.lock().unwrap().is_some()
     }
 
-    /// 仅在 server 运行时执行回调，并与停止操作串行化。
-    pub fn with_running_server<T>(&self, callback: impl FnOnce() -> T) -> Option<T> {
-        let server = self.server.lock().unwrap();
-        server.as_ref()?;
-        Some(callback())
+    /// 与 server 启停串行化地执行回调。
+    ///
+    /// **刻意不检查 server 是否在运行**:调用方(停摆兜底)的判据建立在 pane 自己
+    /// 的 hook 记录上,与 server 活着与否无关。曾在这里 gate 过 `server.as_ref()?`,
+    /// 后果是 AI 正跑着时去设置里关掉 hook 开关,该 pane 的 `is_hook_enabled` 仍为
+    /// true、`resolve_status` 仍认 hook 状态权威,而唯一能把它从 ai-working 拉回来
+    /// 的收敛路径被挡在门外——黄灯从此永久卡死。
+    pub fn with_server_lock<T>(&self, callback: impl FnOnce() -> T) -> T {
+        let _guard = self.server.lock().unwrap();
+        callback()
     }
 }
 
@@ -762,8 +767,23 @@ mod tests {
     use super::*;
     use std::thread;
 
+    /// 回归测试:server 没运行时回调**照样执行**。
+    ///
+    /// 唯一的调用方是停摆兜底,它的判据是 pane 自己的 hook 记录。此前这里 gate 了
+    /// `server.as_ref()?`,于是 AI 跑着时关掉 hook 开关 → `is_hook_enabled` 仍为
+    /// true、`resolve_status` 仍认 hook 状态权威、收敛却被跳过 → 黄灯永久卡死。
     #[test]
-    fn running_server_guard_blocks_stop_until_callback_finishes() {
+    fn server_lock_runs_callback_even_when_server_stopped() {
+        let state = HookState::new();
+        assert!(!state.is_server_running());
+
+        let mut ran = false;
+        state.with_server_lock(|| ran = true);
+        assert!(ran, "server 未运行时回调也必须执行");
+    }
+
+    #[test]
+    fn server_lock_blocks_stop_until_callback_finishes() {
         let state = HookState::new();
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         state.set_server(Some(Arc::new(server)));
@@ -772,7 +792,7 @@ mod tests {
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let worker = thread::spawn(move || {
-            guarded_state.with_running_server(|| {
+            guarded_state.with_server_lock(|| {
                 entered_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
             });

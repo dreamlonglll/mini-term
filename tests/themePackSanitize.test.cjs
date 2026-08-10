@@ -44,6 +44,23 @@ test('未转义的外链、协议相对 url、file: 也拒绝', () => {
   }
 });
 
+test('不带 url() 的裸字符串外链也拒绝（image-set / @font-face src）', () => {
+  // Chromium 认 image-set("…" 1x) 这种写法，只查 url() 的白名单封不住
+  for (const css of [
+    'a { background-image: image-set("https://evil.example/x.png" 1x); }',
+    "a { background-image: image-set('//evil.example/x.png' 1x, 'y.png' 2x); }",
+    '@font-face { font-family: X; src: "https://evil.example/f.woff2"; }',
+    'a { background-image: image-set("\\68 ttps://evil.example/x.png" 1x); }',
+  ]) {
+    assert.throws(() => sanitizeThemeCss(css), /只允许|不允许/, `应拒绝: ${css}`);
+  }
+});
+
+test('注释里的 URL 不误杀', () => {
+  assert.doesNotThrow(() =>
+    sanitizeThemeCss('/* 配色参考 https://example.com/palette 与 "https://x" */\na { color: red; }'));
+});
+
 test('包内相对路径与 data: 正常放行', () => {
   for (const css of [
     'a { background: url(background.jpg); }',
@@ -97,4 +114,60 @@ test('image 为合法包内文件名时原样保留，含路径分量仍拒绝',
       /image 必须是包内文件名/,
     );
   }
+});
+
+// ─── tokens 逃生舱（theme.css 白名单的绕行道）───
+
+test('tokens 键名必须是 -- 变量，否则 setProperty 会设真实 CSS 属性', () => {
+  for (const key of ['background-image', 'background', '-x', 'color', '--a b', '']) {
+    assert.throws(
+      () => parseThemePack('t', JSON.stringify({ ...baseTheme, tokens: { [key]: 'red' } })),
+      /只能覆盖 -- 开头的 CSS 变量/,
+      `应拒绝键名: ${key}`,
+    );
+  }
+});
+
+test('tokens 值不许指向包外，包内相对路径与 data: 放行', () => {
+  const withTokens = (v) => () => parseThemePack('t', JSON.stringify({ ...baseTheme, tokens: { '--x': v } }));
+  for (const bad of [
+    'url(https://evil.example/x.png)',
+    'url(//evil.example/x.png)',
+    'url(\\68 ttps://evil.example/x.png)',
+    'image-set("https://evil.example/x.png" 1x)',
+  ]) {
+    assert.throws(withTokens(bad), /不允许|只允许/, `应拒绝: ${bad}`);
+  }
+  for (const ok of ['12px', '#ff0000', 'url(bg.png)', 'url(data:image/png;base64,AAA=)']) {
+    assert.doesNotThrow(withTokens(ok), `应放行: ${ok}`);
+  }
+  // 非字符串值同样挡掉
+  assert.throws(
+    () => parseThemePack('t', JSON.stringify({ ...baseTheme, tokens: { '--x': 12 } })),
+    /必须是字符串/,
+  );
+});
+
+test('effects 的 surfaceRadius / surfaceBlur 与 tokens 同一把尺子', () => {
+  assert.throws(
+    () => parseThemePack('t', JSON.stringify({
+      ...baseTheme, effects: { surfaceBlur: 'url(https://evil.example/x.png)' },
+    })),
+    /只允许/,
+  );
+  assert.doesNotThrow(() => parseThemePack('t', JSON.stringify({
+    ...baseTheme, effects: { surfaceRadius: '12px', surfaceBlur: '14px' },
+  })));
+});
+
+// ─── terminal 色值（坏值会让 xterm 在 updateAllTerminalThemes 半途抛）───
+
+test('terminal 的每个字段都过色值校验', () => {
+  assert.throws(
+    () => parseThemePack('t', JSON.stringify({ ...baseTheme, terminal: { red: 'not-a-color' } })),
+    /terminal\.red 不是合法色值/,
+  );
+  assert.doesNotThrow(() => parseThemePack('t', JSON.stringify({
+    ...baseTheme, terminal: { red: '#ff0000', foreground: '#ffffff' },
+  })));
 });

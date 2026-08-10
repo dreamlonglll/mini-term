@@ -31,7 +31,7 @@ import { focusAttentionTarget } from './utils/attentionJump';
 import { checkForUpdate, type ReleaseInfo } from './utils/updateChecker';
 import { applyTheme } from './utils/themeManager';
 import { applyUiFontFamily } from './utils/fontManager';
-import { loadAndApplyCustomTheme } from './utils/themePackManager';
+import { clearCustomTheme, loadAndApplyCustomTheme } from './utils/themePackManager';
 import { markAiPty, updateAllTerminalThemes } from './utils/terminalCache';
 import { includeActiveProject } from './utils/projectKeepAlive';
 import { initMobileSessionSync } from './utils/mobileSessionSync';
@@ -171,6 +171,13 @@ export function App() {
           .then(() => updateAllTerminalThemes(cfg.terminalFollowTheme ?? true))
           .catch((e) => {
             console.error(`自定义主题 ${cfg.customThemeId} 加载失败，回落内置外观:`, e);
+            // 失败点未必在读取阶段：applyCustomTheme 跑完之后的任何一步抛（终端
+            // 配色应用是最可能的一处），CSS 变量、背景层、注入的 theme.css 与模块
+            // 内的激活态就都已经挂上了。只清 config 会留下"配置说没启用、DOM 上
+            // 却还挂着"的半死状态，getCustomTerminalTheme() 还会继续把坏配色发给
+            // 每个新建终端。先把 DOM 与模块态整个清掉，再落回内置明暗基线。
+            clearCustomTheme();
+            applyTheme(cfg.theme ?? 'auto');
             // 运行时 config 里的 id 必须一并清掉：下面的 skin effect 按
             // customThemeId 收敛，id 还在就把 data-skin 强制置空，用户原本的
             // 内置皮肤在"回落"时一起没了，设置页还显示着这个包处于激活态。
@@ -178,6 +185,7 @@ export function App() {
             // 被替换），落盘会把用户的选择永久抹掉，下次启动就找不回来了。
             const cur = useAppStore.getState().config;
             if (cur.customThemeId) setConfig({ ...cur, customThemeId: undefined });
+            updateAllTerminalThemes(cur.terminalFollowTheme ?? true);
           });
       }
 
