@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.10.7-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.11.0-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -142,7 +142,7 @@ VS Code 风格的 **Changes 面板**（Staged / Changes / Untracked 分组，单
 | **启动零网络请求** | 字体本地打包（移除 Google Fonts 外链），重型弹窗全部懒加载，主包 gzip 从 631KB 降到 378KB |
 | **全链路背压** | `cat` 大文件、AI 刷屏时，前端积压过高会一路顶回刷屏进程本身——慢终端拖慢进程，而不是把数据全堆进内存；万一渲染进程被系统杀掉重载，上一轮遗留的 PTY 也会先回收，不会崩一次漏一整套 |
 | **三种主题 + 蓝图皮肤** | Auto / Light / Dark（暖炭色调），另有科幻风蓝图皮肤；标题栏与主题同色，启动无浅色闪烁 |
-| **外置主题包** | 兼容 Dream Skin 格式的皮肤：文件夹或 zip 导入、manifest 的 sha256 校验、改文件即热重载；皮肤可自带背景图，终端随之透明化压在氛围层上。设置页卡片直接铺实况缩略图，导入的 theme.css 过卫生检查（禁 `@import`，`url()` 只放行包内相对路径与 `data:`，CSS 转义写法一并挡住） |
+| **外置主题包** | 兼容 Dream Skin 格式的皮肤：文件夹或 zip 导入、manifest 的 sha256 校验、改文件即热重载；皮肤可自带背景图，终端随之透明化压在氛围层上。设置页卡片直接铺实况缩略图，导入的 theme.css 与 theme.json 的 tokens 覆盖过同一道外链闸（禁 `@import`，指向包外的引用一律拒——`url()`、`image-set("…")` 这类裸字符串、CSS 转义写法都挡得住） |
 | **自定义标题栏** | 无边框窗口 + 自绘标题栏，配色跟着主题走不再是系统那条灰白；按平台适配习惯——Windows / Linux 右侧三键并保留 Win11 贴靠布局（悬停最大化按钮弹分屏菜单），macOS 保留原生交通灯。版本号旁是**当前项目切换器**：胶囊按钮常显当前项目与它的 AI 状态色点，下拉列出所有进入 AI 会话的项目及状态、点击即切换；全局状态灯紧随其右，点一下直接跳到下一个该处理的会话（最先完成的排最前） |
 | **项目行悬停预览** | 悬停项目行 250ms 弹出该项目终端区的**微缩布局拼图**：按分屏树等比复现真实排布，与切过去看到的一致，打开期间 500ms 重画所以是活的。每个分屏格显示当前 tab 的画面，隐藏 tab 以「+N」徽章示数并附其中最高优先级的状态点——藏在非激活 tab 里的 AI 状态不漏报；没起过终端的项目显示占位卡 |
 | **中英双语** | 一键切换全界面实时重渲染，首次启动按系统语言探测，自研轻量 i18n 无额外运行时依赖 |

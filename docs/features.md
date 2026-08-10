@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.10.7-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.11.0-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -163,7 +163,7 @@ Watch the AI running on your desktop from your phone while you're out, and send 
   - **Global status light** — Sits right beside the project switcher and aggregates the most urgent state across every pane of every project (error > awaiting confirmation > working > done). Clicking jumps to the session that needs you next: awaiting-confirmation / errored first, then the **earliest finished** one, and only then anything still running. This deliberately differs from the tray context menu's ordering — the tray answers "which projects are still alive", the status light answers "what should I do next".
   - Dragging goes through Tauri's `startDragging` rather than `-webkit-app-region`, avoiding the WebView2 modal-loop input lockup fixed back in v0.2.16; double-clicking the bar toggles maximize.
 - **Blueprint skin** — An optional sci-fi Blueprint skin with a grid background + corner markers + glow effects, supporting both dark and light modes, with the terminal palette switching in sync.
-- **External theme packs (Dream Skin-compatible)** — Settings → Appearance → Theme & language can import third-party skins from a folder or a zip into `{app_data_dir}/themes/<themeId>/` (`theme.json` required; `theme.css` / background image optional). When the pack ships a `manifest.json`, every file is checked against its bytes + sha256 to catch corruption; imports land in a staging directory first and are swapped in atomically only after validation, so a bad pack can't take out an existing skin of the same name. A pack's light/dark nature is fixed by its author via `appearance` in `theme.json`, and the built-in theme buttons show as unselected while it's active. Editing a file in the pack hot-reloads it (300ms debounce). A pack may declare a background image, in which case terminal surfaces turn translucent over that ambient layer and WebGL rendering falls back to DOM (upstream requires an opaque canvas), restored automatically when you switch back to an opaque theme. An imported `theme.css` goes through a hygiene check: 256KB cap, no `@import`, and `url()` limited to in-pack relative paths and `data:` — the check runs on a CSS-unescaped sample, so forms like `url(\68 ttps://…)` are caught too (the csp in `tauri.conf.json` is null, making this the only gate).
+- **External theme packs (Dream Skin-compatible)** — Settings → Appearance → Theme & language can import third-party skins from a folder or a zip into `{app_data_dir}/themes/<themeId>/` (`theme.json` required; `theme.css` / background image optional). When the pack ships a `manifest.json`, every file is checked against its bytes + sha256 to catch corruption; imports land in a staging directory first and are swapped in atomically only after validation, so a bad pack can't take out an existing skin of the same name. A pack's light/dark nature is fixed by its author via `appearance` in `theme.json`, and the built-in theme buttons show as unselected while it's active. Editing a file in the pack hot-reloads it (300ms debounce). A pack may declare a background image, in which case terminal surfaces turn translucent over that ambient layer and WebGL rendering falls back to DOM (upstream requires an opaque canvas), restored automatically when you switch back to an opaque theme; any `terminal.background` the author wrote is dropped in that mode — it expands after the transparency step, so a pack that copied all 24 built-in fields would otherwise bury the ambient image entirely. An imported `theme.css` goes through a hygiene check: 256KB cap, no `@import`, and any reference pointing outside the pack rejected — the check runs on a sample with comments stripped and CSS escapes resolved, and inspects both `url()` and bare string literals (Chromium honors `image-set("https://…" 1x)`, which fires a request without any `url()`), so forms like `url(\68 ttps://…)` are caught too. The `tokens` escape hatch in `theme.json` is held to the same standard: keys must be `--` custom properties and values pass the same gate — without the `--` prefix `setProperty` sets a **real CSS property**, and one line of `{"background-image":"url(https://…)"}` would bypass every check above (the csp in `tauri.conf.json` is null, making this the only gate).
 - **Independent font tuning** — The UI and terminal font sizes (10-20px) / families are adjustable separately, and the terminal can optionally follow the UI theme.
 - **Ligatures** — A terminal ligature toggle that composes glyphs like `==` `=>` `!=` `->` when enabled, requiring a font with a calt table (Fira Code / JetBrains Mono); fully supported on Windows, while macOS / Linux use a 60-entry Iosevka fallback due to webview API limitations.
 - **Layout persistence** — Split ratios, tabs, and window size / position are saved automatically and restored on restart (`tauri-plugin-window-state`).
@@ -300,6 +300,10 @@ mini-term/
 │       ├── mobileStartSession.ts # Desktop landing for phone-started sessions (pane + launch command)
 │       ├── ptyWriteQueue.ts      # PTY write queue (chunked large pastes)
 │       ├── themeManager.ts       # Theme switching + system color watching
+│       ├── builtinThemes.ts      # Single source for the 6 built-in terminal palettes
+│       ├── themePackManager.ts   # External skins: validation / token mapping / background layer / theme.css gate / hot reload
+│       ├── panePreview.ts        # Pane preview: xterm buffer → same-color run grid (pure logic, directly testable)
+│       ├── panePreviewCanvas.ts  # Pane preview: run grid → canvas bitmap (8px cells, scaled proportionally)
 │       └── updateChecker.ts      # GitHub Release version check
 ├── src-tauri/                    # Rust backend (Tauri app + shared crate + sidecars)
 │   ├── src/
@@ -315,6 +319,7 @@ mini-term/
 │   │   ├── editor.rs             # Open in external editor / system default app
 │   │   ├── ai_sessions.rs        # Claude / Codex session record reading (local + WSL UNC)
 │   │   ├── wsl_distros.rs        # WSL distro enumeration (registry Lxss, no wsl.exe spawn)
+│   │   ├── theme_packs.rs        # External skin scanning / folder & zip import / manifest sha256 verification
 │   │   ├── hook_server.rs        # Hook HTTP server (receives AI tool events)
 │   │   ├── hook_registry.rs      # Hook register / unregister (Claude Code + Codex)
 │   │   ├── ssh.rs                # SSH connection management + password auto-fill / key handling
@@ -340,7 +345,7 @@ mini-term/
 ├── scripts/
 │   ├── stage-sidecars.mjs        # Builds sidecars and stages them per-triple as Tauri externalBin
 │   └── stage-conpty.mjs          # Downloads, verifies and stages the pinned ConPTY runtime (Windows)
-├── tests/                        # Node-side tests (18 files, 77 cases: ConPTY bundling / TUI scrollback / layout restore / theme compat / WSL path / worktree reconcile ...)
+├── tests/                        # Node-side tests (20 files, 99 cases: ConPTY bundling / TUI scrollback / layout restore / theme compat / WSL path / worktree reconcile ...)
 └── package.json
 ```
 
@@ -404,7 +409,7 @@ Before submitting, please run:
 # Frontend type check (tsc + vite build)
 npm run build
 
-# Node-side tests (18 files, 77 cases)
+# Node-side tests (20 files, 99 cases)
 node --test "tests/*.test.cjs"
 
 # Desktop Rust tests (556)
