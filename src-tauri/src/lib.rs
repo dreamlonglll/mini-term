@@ -17,6 +17,7 @@ mod ssh;
 mod ssh_mcp_registry;
 mod ssh_skill_registry;
 mod startup_trace;
+mod theme_packs;
 mod tray;
 mod usage_stats;
 mod window_input_recovery;
@@ -143,6 +144,13 @@ pub fn run() {
             startup_trace::startup_report,
             config::load_config,
             config::save_config,
+            theme_packs::list_theme_packs,
+            theme_packs::read_theme_pack,
+            theme_packs::get_themes_dir,
+            theme_packs::import_theme_pack,
+            theme_packs::import_theme_pack_zip,
+            theme_packs::delete_theme_pack,
+            theme_packs::read_theme_asset,
             tray::set_tray_status,
             pty::create_pty,
             pty::write_pty,
@@ -163,6 +171,7 @@ pub fn run() {
             fs::delete_entry,
             fs::filter_directories,
             ai_sessions::get_ai_sessions,
+            ai_sessions::lookup_ai_session_cwd,
             ai_sessions::get_wsl_ai_sessions,
             ai_sessions::get_ai_session_content,
             remote_ssh::ssh_remote_list_directory,

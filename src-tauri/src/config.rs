@@ -145,6 +145,10 @@ pub struct AppConfig {
     /// 移动端中转配置(docs/adr/0001)。None = 未启用;序列化时省略保持文件干净。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mobile_relay: Option<MobileRelayConfig>,
+    /// 激活的外置主题包 id（themes/ 下目录名）。None = 内置外观模式;
+    /// 激活时 theme/skin 保持不动，退出自定义主题可无损回落。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_theme_id: Option<String>,
 }
 
 /// 移动端中转体系的持久化配置。
@@ -229,6 +233,12 @@ pub struct SavedAiSession {
     /// 来源 agent(claude-code / codex),缺省按 Claude 处理
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// 会话的启动目录。`claude --resume` 只认「启动目录」对应的会话桶,起于子
+    /// 目录的会话在项目根恢复会报 No conversation found。缺这个字段时 serde 会
+    /// 静默丢弃前端写进 savedLayout 的 cwd,hook 第一手上报的启动目录与
+    /// lookup_ai_session_cwd 的反查结果都存不下来,每次重启只能重查一遍。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
     pub session_id: String,
 }
 
@@ -423,6 +433,7 @@ impl Default for AppConfig {
             ssh_connections: vec![],
             ssh_groups: vec![],
             mobile_relay: None,
+            custom_theme_id: None,
         }
     }
 }

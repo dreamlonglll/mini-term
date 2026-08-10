@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, type ReactNode } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { getVersion } from '@tauri-apps/api/app';
 import { openUrl } from '@tauri-apps/plugin-opener';
+import { revealItemInDir } from '@tauri-apps/plugin-opener';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { useAppStore, saveConfigToDisk } from '../store';
 import { playNotificationSound } from '../utils/notificationSound';
@@ -15,6 +16,7 @@ import {
   DEFAULT_TERMINAL_FONT_FAMILY,
 } from '../utils/terminalCache';
 import { applyUiFontFamily } from '../utils/fontManager';
+import { clearCustomTheme, invalidateThemeAssets, listThemePacks, loadAndApplyCustomTheme, resolveThemeAssetUrl, type ThemePackMeta } from '../utils/themePackManager';
 import { MOD_LABEL } from '../utils/platform';
 import { comboLabel, hotkeyGroups } from '../utils/hotkeys';
 import { DEFAULT_REMOTE_PASTE_DIR } from '../utils/pastePath';
@@ -782,7 +784,9 @@ function AppearanceSettings() {
   const setConfig = useAppStore((s) => s.setConfig);
 
   const handleThemeChange = useCallback((theme: 'auto' | 'light' | 'dark') => {
-    const newConfig = { ...useAppStore.getState().config, theme };
+    // 外置皮肤的明暗由 appearance 定死:切主题 = 退出皮肤回内置
+    clearCustomTheme();
+    const newConfig = { ...useAppStore.getState().config, theme, customThemeId: undefined };
     setConfig(newConfig);
     applyTheme(theme);
     updateAllTerminalThemes(newConfig.terminalFollowTheme ?? true);
@@ -790,8 +794,14 @@ function AppearanceSettings() {
   }, [setConfig]);
 
   const handleSkinChange = useCallback((skin: 'none' | 'blueprint' | 'fluent2') => {
-    const newConfig = { ...useAppStore.getState().config, skin };
+    clearCustomTheme();
+    const newConfig = {
+      ...useAppStore.getState().config,
+      skin,
+      customThemeId: undefined,
+    };
     setConfig(newConfig);
+    applyTheme(newConfig.theme ?? 'auto');
     updateAllTerminalThemes(newConfig.terminalFollowTheme);
     saveConfigToDisk(newConfig);
   }, [setConfig]);
@@ -813,7 +823,7 @@ function AppearanceSettings() {
 
       <Section title={t("settings.appearance.theme")}>
         <ChoiceGroup
-          value={config.theme}
+          value={(config.customThemeId ? '' : config.theme) as typeof config.theme}
           options={[
             { value: 'dark', label: t("settings.appearance.themeDark") },
             { value: 'light', label: t("settings.appearance.themeLight") },
@@ -831,7 +841,7 @@ function AppearanceSettings() {
 
       <Section title={t("settings.appearance.skin")}>
         <ChoiceGroup
-          value={config.skin}
+          value={(config.customThemeId ? '' : config.skin) as typeof config.skin}
           options={[
             { value: 'none', label: t("settings.appearance.skinNone") },
             { value: 'blueprint', label: t("settings.appearance.skinBlueprint") },
@@ -841,6 +851,8 @@ function AppearanceSettings() {
         />
         <Hint>{t("settings.appearance.skinDesc")}</Hint>
       </Section>
+
+      <CustomThemePacksSection />
     </div>
   );
 }
@@ -1589,6 +1601,287 @@ function ShortcutsSettings() {
         </div>
       ))}
       <Hint>{t("settings.shortcuts.footer")}</Hint>
+    </div>
+  );
+}
+
+// ─── CustomThemePacksSection（外置主题包，嵌在系统设置的主题/皮肤下方）───
+
+function ThemeCard({
+  name,
+  colors,
+  imageUrl,
+  focusX,
+  focusY,
+  active,
+  subtitle,
+  onSelect,
+  onDelete,
+}: {
+  name: string;
+  colors: { background: string; panel: string; accent: string; text: string; muted?: string };
+  imageUrl?: string;
+  focusX?: number;
+  focusY?: number;
+  active: boolean;
+  subtitle?: string;
+  onSelect: () => void;
+  onDelete?: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      className={`group/card flex flex-col gap-2 p-3 rounded-[var(--radius-md)] text-left transition-all border ${
+        active
+          ? 'border-[var(--accent)] bg-[var(--accent-subtle)]'
+          : 'border-[var(--border-default)] bg-[var(--bg-base)] hover:border-[var(--accent)]'
+      }`}
+      onClick={onSelect}
+    >
+      {/* 缩小版实际效果:背景图 + 压暗层 + 迷你侧栏/终端界面 */}
+      <div
+        className="relative w-full h-24 rounded-[var(--radius-sm)] border border-[var(--border-subtle)] overflow-hidden"
+        style={{ backgroundColor: colors.background }}
+      >
+        {imageUrl && (
+          <div
+            className="absolute inset-0"
+            style={{
+              backgroundImage: `url("${imageUrl}")`,
+              backgroundSize: 'cover',
+              backgroundPosition: `${(focusX ?? 0.5) * 100}% ${(focusY ?? 0.5) * 100}%`,
+            }}
+          />
+        )}
+        {/* 压暗层,与真实氛围层同款(35%) */}
+        <div
+          className="absolute inset-0"
+          style={{ backgroundColor: `color-mix(in srgb, ${colors.background} 35%, transparent)` }}
+        />
+        {/* 迷你侧栏(72% 半透明面板) */}
+        <div
+          className="absolute left-1.5 top-1.5 bottom-1.5 w-12 rounded-sm px-1.5 py-1 space-y-1"
+          style={{ backgroundColor: `color-mix(in srgb, ${colors.panel} 72%, transparent)` }}
+        >
+          <div className="h-1 w-8 rounded-full" style={{ backgroundColor: colors.accent }} />
+          <div className="h-1 w-6 rounded-full opacity-60" style={{ backgroundColor: colors.text }} />
+          <div className="h-1 w-7 rounded-full opacity-40" style={{ backgroundColor: colors.text }} />
+        </div>
+        {/* 迷你终端区(60% 着色 + 提示符) */}
+        <div
+          className="absolute left-[3.9rem] right-1.5 top-1.5 bottom-1.5 rounded-sm px-1.5 py-1"
+          style={{ backgroundColor: `color-mix(in srgb, ${colors.background} 60%, transparent)` }}
+        >
+          <div className="text-[10px] leading-tight font-mono" style={{ color: colors.accent }}>
+            ❯ <span style={{ color: colors.text }}>Aa 字</span>
+          </div>
+          <div className="mt-0.5 h-1 w-10 rounded-full opacity-50" style={{ backgroundColor: colors.text }} />
+        </div>
+      </div>
+      <div className="flex items-start justify-between gap-2 min-w-0">
+        <div className="min-w-0">
+          <div className={`text-base truncate ${active ? 'text-[var(--accent)]' : 'text-[var(--text-primary)]'}`}>
+            {name}
+          </div>
+          {subtitle && <div className="text-sm text-[var(--text-muted)] truncate">{subtitle}</div>}
+        </div>
+        {onDelete && (
+          <span
+            role="button"
+            className="hidden group-hover/card:block px-1 text-sm text-[var(--text-muted)] hover:text-[var(--color-error)] transition-colors flex-shrink-0"
+            onClick={(e) => { e.stopPropagation(); onDelete(); }}
+          >
+            ✕
+          </span>
+        )}
+      </div>
+    </button>
+  );
+}
+
+function CustomThemePacksSection() {
+  const t = useT();
+  const config = useAppStore((s) => s.config);
+  const setConfig = useAppStore((s) => s.setConfig);
+  const [packs, setPacks] = useState<ThemePackMeta[]>([]);
+  const [thumbUrls, setThumbUrls] = useState<Record<string, string>>({});
+  const [error, setError] = useState<string | null>(null);
+
+  // 缩略图走 asset 探活/base64 兜底通道(asset 协议在部分 WebView 环境不可用,
+  // CSS 背景加载失败是静默的),逐个就绪逐个上屏
+  useEffect(() => {
+    let cancelled = false;
+    for (const pack of packs) {
+      if (!pack.def.image) continue;
+      resolveThemeAssetUrl(pack.dir, pack.themeId, pack.def.image)
+        .then((url) => {
+          if (!cancelled) setThumbUrls((prev) => ({ ...prev, [pack.themeId]: url }));
+        })
+        .catch((e) => console.warn(`皮肤 ${pack.themeId} 缩略图加载失败:`, e));
+    }
+    return () => { cancelled = true; };
+  }, [packs]);
+
+  const refresh = useCallback(() => {
+    setError(null);
+    listThemePacks().then(setPacks).catch((e) => setError(String(e)));
+  }, []);
+
+  useEffect(() => { refresh(); }, [refresh]);
+
+  const selectCustom = useCallback(async (pack: ThemePackMeta) => {
+    setError(null);
+    try {
+      await loadAndApplyCustomTheme(pack.themeId);
+    } catch (e) {
+      setError(t('settings.themes.applyFailed', { detail: String(e) }));
+      return;
+    }
+    const cur = useAppStore.getState().config;
+    const newConfig = { ...cur, customThemeId: pack.themeId };
+    setConfig(newConfig);
+    updateAllTerminalThemes(newConfig.terminalFollowTheme ?? true);
+    saveConfigToDisk(newConfig);
+  }, [setConfig, t]);
+
+  const importPack = useCallback(async () => {
+    setError(null);
+    const selected = await openDialog({
+      title: t('settings.themes.importDialogTitle'),
+      directory: true,
+      multiple: false,
+    });
+    if (typeof selected !== 'string' || !selected.trim()) return;
+    try {
+      const themeId = await invoke<string>('import_theme_pack', { srcDir: selected });
+      // 同名覆盖导入换掉的是同一批文件名，缓存不清缩略图还是上一版
+      invalidateThemeAssets(themeId);
+      refresh();
+    } catch (e) {
+      setError(String(e));
+    }
+  }, [refresh, t]);
+
+  const importZip = useCallback(async () => {
+    setError(null);
+    const selected = await openDialog({
+      title: t('settings.themes.importZipDialogTitle'),
+      directory: false,
+      multiple: false,
+      filters: [{ name: 'Zip', extensions: ['zip'] }],
+    });
+    if (typeof selected !== 'string' || !selected.trim()) return;
+    try {
+      const themeId = await invoke<string>('import_theme_pack_zip', { zipPath: selected });
+      invalidateThemeAssets(themeId);
+      refresh();
+    } catch (e) {
+      setError(String(e));
+    }
+  }, [refresh, t]);
+
+  const deletePack = useCallback(async (pack: ThemePackMeta) => {
+    if (!window.confirm(t('settings.themes.deleteConfirm', { name: pack.def.name }))) return;
+    setError(null);
+    const cur = useAppStore.getState().config;
+    // 先退出该主题（clearCustomTheme 内含 unwatch）再删目录：反过来的话
+    // notify 的目录句柄还开着，被删目录在 Windows 上处于 delete-pending，
+    // 紧接着重导入同名主题会撞 ERROR_ACCESS_DENIED。
+    const wasActive = cur.customThemeId === pack.themeId;
+    if (wasActive) clearCustomTheme();
+    invalidateThemeAssets(pack.themeId);
+    try {
+      await invoke('delete_theme_pack', { themeId: pack.themeId });
+    } catch (e) {
+      setError(String(e));
+      // 删失败就把主题装回去，避免用户界面上皮肤没了、目录还在
+      if (wasActive) void loadAndApplyCustomTheme(pack.themeId).catch(() => {});
+      return;
+    }
+    if (wasActive) {
+      const newConfig = { ...cur, customThemeId: undefined };
+      setConfig(newConfig);
+      applyTheme(newConfig.theme ?? 'auto');
+      updateAllTerminalThemes(newConfig.terminalFollowTheme ?? true);
+      saveConfigToDisk(newConfig);
+    }
+    refresh();
+  }, [refresh, setConfig, t]);
+
+  const openThemesDir = useCallback(async () => {
+    try {
+      const dir = await invoke<string>('get_themes_dir');
+      await revealItemInDir(dir);
+    } catch (e) {
+      setError(String(e));
+    }
+  }, []);
+
+  return (
+    <div className="mb-4">
+      <div className="flex items-center justify-between mb-2 mt-4">
+        <div className="text-base text-[var(--text-muted)] uppercase tracking-[0.1em]">
+          {t('settings.themes.customSection')}
+        </div>
+        <div className="flex gap-2">
+          <button
+            className="px-2 py-1 text-sm rounded-[var(--radius-sm)] text-[var(--text-secondary)] border border-[var(--border-default)] hover:border-[var(--accent)] hover:text-[var(--text-primary)] transition-all"
+            onClick={importPack}
+          >
+            {t('settings.themes.addPack')}
+          </button>
+          <button
+            className="px-2 py-1 text-sm rounded-[var(--radius-sm)] text-[var(--text-secondary)] border border-[var(--border-default)] hover:border-[var(--accent)] hover:text-[var(--text-primary)] transition-all"
+            onClick={importZip}
+          >
+            {t('settings.themes.importZip')}
+          </button>
+          <button
+            className="px-2 py-1 text-sm rounded-[var(--radius-sm)] text-[var(--text-secondary)] border border-[var(--border-default)] hover:border-[var(--accent)] hover:text-[var(--text-primary)] transition-all"
+            onClick={openThemesDir}
+          >
+            {t('settings.themes.openDir')}
+          </button>
+          <button
+            className="px-2 py-1 text-sm rounded-[var(--radius-sm)] text-[var(--text-secondary)] border border-[var(--border-default)] hover:border-[var(--accent)] hover:text-[var(--text-primary)] transition-all"
+            onClick={refresh}
+          >
+            {t('settings.themes.refresh')}
+          </button>
+        </div>
+      </div>
+      {packs.length === 0 ? (
+        <div className="px-3 py-4 rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)] text-sm text-[var(--text-muted)]">
+          {t('settings.themes.empty')}
+        </div>
+      ) : (
+        <div className="grid grid-cols-2 gap-2">
+          {packs.map((pack) => (
+            <ThemeCard
+              key={pack.themeId}
+              name={pack.def.name}
+              subtitle={pack.themeId}
+              colors={{
+                background: pack.def.colors.background,
+                panel: pack.def.colors.panel,
+                accent: pack.def.colors.accent,
+                text: pack.def.colors.text,
+              }}
+              imageUrl={thumbUrls[pack.themeId]}
+              focusX={pack.def.art?.focusX}
+              focusY={pack.def.art?.focusY}
+              active={config.customThemeId === pack.themeId}
+              onSelect={() => void selectCustom(pack)}
+              onDelete={() => void deletePack(pack)}
+            />
+          ))}
+        </div>
+      )}
+      {error && (
+        <div className="mt-2 px-3 py-2 rounded-[var(--radius-sm)] border border-[var(--color-error)] text-sm text-[var(--color-error)]">
+          {error}
+        </div>
+      )}
     </div>
   );
 }

@@ -259,6 +259,13 @@ impl HookState {
     pub fn is_server_running(&self) -> bool {
         self.server.lock().unwrap().is_some()
     }
+
+    /// 仅在 server 运行时执行回调，并与停止操作串行化。
+    pub fn with_running_server<T>(&self, callback: impl FnOnce() -> T) -> Option<T> {
+        let server = self.server.lock().unwrap();
+        server.as_ref()?;
+        Some(callback())
+    }
 }
 
 /// Notification 的结构化分类。
@@ -611,6 +618,14 @@ pub fn start_hook_server(
                     if let Some(sid) = payload.session_id.clone() {
                         hook_state.note_session_active(pty_id, &sid);
                         if hook_state.record_session(pty_id, payload.agent.clone(), sid.clone()) {
+                            // hook 端点无鉴权,cwd 是任何本地进程都能塞的字段,而前端会
+                            // 把它持久化成「未来某次 PTY 的启动目录」。只放行确实存在的
+                            // 目录:构造出来的假路径与已被删掉的 worktree 一并挡在这里,
+                            // 续接时回落 pane 自己的 cwd,而不是让 create_pty 直接失败。
+                            let cwd = payload
+                                .cwd
+                                .clone()
+                                .filter(|p| std::path::Path::new(p).is_dir());
                             // 会话身份变化(新会话/换会话)时通知前端,供布局持久化
                             // 记录「退出时该 pane 正跑着哪个 AI 会话」以便重启续接
                             let _ = tauri::Emitter::emit(
@@ -620,6 +635,9 @@ pub fn start_hook_server(
                                     "ptyId": pty_id,
                                     "agent": payload.agent.clone(),
                                     "sessionId": sid,
+                                    // 会话启动目录:claude --resume 只认该目录的会话桶,
+                                    // 前端随身份持久化,重启续接时 PTY 直接以它为 cwd
+                                    "cwd": cwd,
                                 }),
                             );
                         }
@@ -742,6 +760,39 @@ fn delete_port_file(app: &AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::thread;
+
+    #[test]
+    fn running_server_guard_blocks_stop_until_callback_finishes() {
+        let state = HookState::new();
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        state.set_server(Some(Arc::new(server)));
+
+        let guarded_state = state.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            guarded_state.with_running_server(|| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+        });
+
+        entered_rx.recv().unwrap();
+        let stopping_state = state.clone();
+        let (stopped_tx, stopped_rx) = std::sync::mpsc::channel();
+        let stopper = thread::spawn(move || {
+            stopping_state.set_server(None);
+            stopped_tx.send(()).unwrap();
+        });
+
+        assert!(stopped_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        release_tx.send(()).unwrap();
+        stopped_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        worker.join().unwrap();
+        stopper.join().unwrap();
+        assert!(!state.is_server_running());
+    }
 
     #[test]
     fn hook_state_records_and_clears_session_identity() {

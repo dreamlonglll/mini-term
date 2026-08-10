@@ -52,6 +52,65 @@ fn home_dir() -> Option<PathBuf> {
     dirs::home_dir()
 }
 
+/// 从 Claude 会话 jsonl 文本中提取首个非空 `cwd` 字段。
+/// 前部行可能是无 cwd 的 summary/meta,逐行找到即止;非 JSON 行忽略。
+fn extract_session_cwd(jsonl: &str) -> Option<String> {
+    for line in jsonl.lines() {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Some(cwd) = v.get("cwd").and_then(|c| c.as_str()) {
+                if !cwd.is_empty() {
+                    return Some(cwd.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 按 session id 在 `~/.claude/projects` 各桶中反查 Claude 会话的启动 cwd。
+///
+/// `claude --resume` 只在当前目录对应的桶里找会话,起于子目录的会话必须回到
+/// 原目录才能恢复;桶目录名是有损编码(所有非字母数字都变 `-`),不做反解码,
+/// 直接按 `<id>.jsonl` 文件名精确命中后读记录内的真实 cwd。
+/// 供续接链路对无 cwd 的存量 pane 记录做兜底反查,查到由前端写回持久化。
+#[tauri::command]
+pub fn lookup_ai_session_cwd(session_id: String) -> Option<String> {
+    // 与前端 resume 命令的校验同口径,顺带防路径拼接注入
+    if session_id.is_empty()
+        || !session_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return None;
+    }
+    let projects = home_dir()?.join(".claude").join("projects");
+    let target = format!("{}.jsonl", session_id);
+    for entry in std::fs::read_dir(&projects).ok()?.flatten() {
+        let candidate = entry.path().join(&target);
+        if !candidate.is_file() {
+            continue;
+        }
+        // cwd 几乎必在首条正式记录;50 行封顶,病态大文件不整读
+        if let Ok(f) = std::fs::File::open(&candidate) {
+            use std::io::BufRead;
+            let head: Vec<String> = std::io::BufReader::new(f)
+                .lines()
+                .map_while(Result::ok)
+                .take(50)
+                .collect();
+            if let Some(cwd) = extract_session_cwd(&head.join("\n")) {
+                // 目录可能已经不在了（worktree 被移除、项目搬家）。返回它只会让
+                // 续接时的 create_pty 直接失败、pane 变 error —— 不如当作查不到，
+                // 让前端回落 pane 自己的 cwd。
+                if std::path::Path::new(&cwd).is_dir() {
+                    return Some(cwd);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// cwd 比较用的路径语义。Claude/Codex 的会话文件里记录的是运行时 cwd,
 /// Windows 宿主与 WSL 发行版内的 cwd 语义不同,匹配时必须用对应的 normalize。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1039,6 +1098,21 @@ pub fn get_wsl_ai_sessions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extract_session_cwd_skips_lines_without_cwd() {
+        // 会话 jsonl 前部可能是无 cwd 的 summary/meta 行,取首个带 cwd 的记录
+        let jsonl = "{\"type\":\"summary\",\"summary\":\"t\"}\n{\"cwd\":\"/Users/dida/proj/sub\",\"type\":\"user\"}\n{\"cwd\":\"/other\",\"type\":\"user\"}";
+        assert_eq!(extract_session_cwd(jsonl).as_deref(), Some("/Users/dida/proj/sub"));
+    }
+
+    #[test]
+    fn extract_session_cwd_none_when_absent_or_malformed() {
+        assert_eq!(extract_session_cwd("{\"type\":\"summary\"}\nnot json"), None);
+        assert_eq!(extract_session_cwd(""), None);
+        // 空串 cwd 不算有效
+        assert_eq!(extract_session_cwd("{\"cwd\":\"\"}"), None);
+    }
 
     #[test]
     fn sort_newest_session_paths_keeps_recent_files_first() {

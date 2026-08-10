@@ -64,6 +64,8 @@ export interface AppConfig {
   sshGroups?: string[];
   /** 移动端中转配置(docs/adr/0001),未配置时缺省 */
   mobileRelay?: MobileRelayConfig;
+  /** 激活的外置主题包 id（themes/ 下目录名）。undefined = 内置外观模式 */
+  customThemeId?: string;
 }
 
 /** 移动端中转体系的持久化配置。字段对齐后端 #[serde(rename_all = "camelCase")]. */
@@ -239,6 +241,8 @@ export interface SavedPane {
 export interface AiSessionRef {
   agent?: string;
   sessionId: string;
+  /** 会话启动目录:claude --resume 只认该目录对应的会话桶,续接时 PTY 以它为 cwd */
+  cwd?: string;
 }
 
 export type SavedSplitNode =
@@ -315,6 +319,29 @@ export interface PaneState {
   detectedAgent?: string;
   /** ai-idle 的成因是「需要用户确认」(授权/输入请求);运行时状态不持久化 */
   attention?: boolean;
+}
+
+// === pane 预览缩略图(panePreview.ts 提取 → panePreviewCanvas.ts 绘制) ===
+
+/** 同色连续字符段;col 为起始列,绘制定位 x = col × cellW */
+export interface PreviewRun {
+  col: number;
+  text: string;
+  color: string;
+}
+
+export interface PreviewGrid {
+  cols: number;
+  rows: number;
+  /** 每视口行的 runs;空白不产生 run */
+  lines: PreviewRun[][];
+}
+
+export interface PreviewPaletteOptions {
+  /** ANSI 16 色(black..white, brightBlack..brightWhite),来自终端主题 */
+  palette16: string[];
+  /** 默认前景色(theme.foreground) */
+  foreground: string;
 }
 
 // === AI 会话 ===
@@ -409,6 +436,7 @@ export interface PtyAiSessionPayload {
   ptyId: number;
   agent?: string;
   sessionId: string;
+  cwd?: string;
 }
 
 export interface FsChangePayload {

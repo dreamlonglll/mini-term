@@ -31,6 +31,7 @@ import { focusAttentionTarget } from './utils/attentionJump';
 import { checkForUpdate, type ReleaseInfo } from './utils/updateChecker';
 import { applyTheme } from './utils/themeManager';
 import { applyUiFontFamily } from './utils/fontManager';
+import { loadAndApplyCustomTheme } from './utils/themePackManager';
 import { markAiPty, updateAllTerminalThemes } from './utils/terminalCache';
 import { includeActiveProject } from './utils/projectKeepAlive';
 import { initMobileSessionSync } from './utils/mobileSessionSync';
@@ -164,6 +165,22 @@ export function App() {
 
       applyTheme(cfg.theme ?? 'auto');
 
+      // 外置主题异步加载：不进 show() 前关键路径；失败回落内置（上面已应用）
+      if (cfg.customThemeId) {
+        loadAndApplyCustomTheme(cfg.customThemeId)
+          .then(() => updateAllTerminalThemes(cfg.terminalFollowTheme ?? true))
+          .catch((e) => {
+            console.error(`自定义主题 ${cfg.customThemeId} 加载失败，回落内置外观:`, e);
+            // 运行时 config 里的 id 必须一并清掉：下面的 skin effect 按
+            // customThemeId 收敛，id 还在就把 data-skin 强制置空，用户原本的
+            // 内置皮肤在"回落"时一起没了，设置页还显示着这个包处于激活态。
+            // 只改内存不落盘 —— 主题目录可能只是这次读不到（盘没挂载、文件正
+            // 被替换），落盘会把用户的选择永久抹掉，下次启动就找不回来了。
+            const cur = useAppStore.getState().config;
+            if (cur.customThemeId) setConfig({ ...cur, customThemeId: undefined });
+          });
+      }
+
       for (const p of cfg.projects) {
         if (p.savedLayout && p.savedLayout.tabs.length > 0) {
           restoreLayout(p.id, p.savedLayout, cfg);
@@ -220,17 +237,28 @@ export function App() {
     return () => window.removeEventListener('scroll', onScroll, true);
   }, []);
 
-  // 主题变化时应用新主题
+  // 主题变化时应用新主题；外置皮肤激活时 data-theme 由皮肤 appearance 定死
   useEffect(() => {
+    if (config.customThemeId) return;
     applyTheme(config.theme ?? 'auto');
-  }, [config.theme]);
+  }, [config.theme, config.customThemeId]);
 
-  // 皮肤变化时应用
+  // 皮肤变化时应用；自定义主题激活时 data-skin 置空
   useEffect(() => {
     const skin = config.skin ?? 'none';
-    document.documentElement.dataset.skin = skin === 'none' ? '' : skin;
+    document.documentElement.dataset.skin =
+      config.customThemeId || skin === 'none' ? '' : skin;
     updateAllTerminalThemes(config.terminalFollowTheme);
-  }, [config.skin]);
+  }, [config.skin, config.customThemeId]);
+
+  // 主题包热重载（改主题文件即重应用）后联动刷新终端配色
+  useEffect(() => {
+    const onReload = () => {
+      updateAllTerminalThemes(useAppStore.getState().config.terminalFollowTheme ?? true);
+    };
+    window.addEventListener('custom-theme-reloaded', onReload);
+    return () => window.removeEventListener('custom-theme-reloaded', onReload);
+  }, []);
 
   // 启动时获取版本号：喂给自定义标题栏显示，同时写进原生窗口标题 ——
   // 窗口虽已无边框，任务栏悬停预览与 Alt+Tab 仍读这个标题
@@ -290,6 +318,7 @@ export function App() {
     const projectId = setPaneAiSessionByPty(payload.ptyId, {
       agent: payload.agent,
       sessionId: payload.sessionId,
+      cwd: payload.cwd,
     });
     if (projectId) saveLayoutToConfig(projectId);
   }, []));

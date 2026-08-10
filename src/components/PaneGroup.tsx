@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
-import { useAppStore, clearPaneResumePendingByPty } from '../store';
+import { useAppStore, clearPaneResumePendingByPty, setPaneAiSessionByPty, saveLayoutToConfig } from '../store';
 import { TerminalInstance } from './TerminalInstance';
 import { StatusDot } from './StatusDot';
 import { BrandIcon } from './BrandIcon';
@@ -10,7 +10,7 @@ import { showContextMenu } from '../utils/contextMenu';
 import { inferVendor } from '../utils/inferVendor';
 import { paneShowsAiSession, resolveAutoResumeCommand } from '../utils/aiResume';
 import { disposeTerminal, writePtyInput } from '../utils/terminalCache';
-import { createProjectPty, isRemoteProject, remotePaneLabel } from '../utils/remoteProject';
+import { createProjectPty, isRemoteProject, paneDisplayLabel } from '../utils/remoteProject';
 import { findPaneById } from '../utils/layoutOps';
 import {
   activatePane,
@@ -72,11 +72,10 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
   const activePane = node.panes.find((p) => p.id === node.activePaneId) ?? node.panes[0];
 
   // SSH 远程项目:所有 pane 统一按远程方式启动(布局恢复亦然);
-  // pane 显示名用连接名(恢复布局时 shellName 会被映射为本地 shell 名,不可信)。
+  // pane 显示名走 paneDisplayLabel 统一口径(恢复布局时 shellName 会被映射为本地 shell 名,不可信)。
   const project = config.projects.find((p) => p.id === projectId);
   const remote = isRemoteProject(project);
-  const remoteLabel = project && remote ? remotePaneLabel(project) : undefined;
-  const paneLabel = (pane: PaneState) => pane.customTitle || (remote ? remoteLabel! : pane.shellName);
+  const paneLabel = (pane: PaneState) => paneDisplayLabel(pane, project);
   // 缺省开启;既决定起 PTY 时写不写 resume,也决定待续接的 pane 亮不亮 AI 图标
   const autoResumeEnabled = config.aiAutoResume ?? true;
 
@@ -97,9 +96,51 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
     }
 
     hydratingPaneIds.add(activePane.id);
+    // 续接会话时 PTY 直接以会话记录的 cwd 启动:claude --resume 只认「启动目录」
+    // 对应的会话桶,起于子目录的会话在项目根恢复会报 No conversation found。
+    // 存量记录无 cwd 时向后端反查 jsonl(lookup_ai_session_cwd),查到随身份写回
+    // 持久化,下次重启免查;codex 会话不按目录分桶,无需反查。
+    //
+    // 与 resolveAutoResumeCommand 消费同一个 enabled:resumePending 在开关关闭时
+    // 是**刻意保留**的(见 aiResume.ts),只看它会让关掉自动续接的用户拿到「不写
+    // resume 命令、shell 却开在会话子目录里」的割裂结果。开关同样取现值而非
+    // autoResumeEnabled 快照(config 不在 effect deps 里,理由见下方 resumeCmd 处)。
+    const sessionRef =
+      (useAppStore.getState().config.aiAutoResume ?? true) && activePane.resumePending
+        ? activePane.aiSession
+        : undefined;
+    const resolveResumeCwd = async (): Promise<string | undefined> => {
+      if (remote || !sessionRef) return undefined;
+      if (sessionRef.cwd) return sessionRef.cwd;
+      if (sessionRef.agent === 'codex') return undefined;
+      if (!/^[A-Za-z0-9_-]+$/.test(sessionRef.sessionId)) return undefined;
+      const found = await invoke<string | null>('lookup_ai_session_cwd', {
+        sessionId: sessionRef.sessionId,
+      }).catch(() => null);
+      return found ?? undefined;
+    };
+    let resumeCwd: string | undefined;
     // 远程分支:create_pty 带 sshRemote,后端直接 spawn ssh 并预注册密码 autofill;
     // 本地分支:行为与既有链路一致(shell + cwd + envVars),pane 的 cwd 覆盖优先(worktree 终端)。
-    createProjectPty(project, shell, activePane.cwd)
+    resolveResumeCwd()
+      .then((cwd) => {
+        resumeCwd = cwd;
+        // pane 自己的 cwd 优先:那是用户显式给这个 pane 定的目录(worktree 终端
+        // 靠它),会话 cwd 只在 pane 没指定时兜底。反过来写会让续接把 worktree
+        // 终端带偏到会话记录的目录去。
+        const startCwd = activePane.cwd ?? cwd;
+        if (startCwd === undefined || startCwd === activePane.cwd) {
+          return createProjectPty(project, shell, startCwd);
+        }
+        // 会话 cwd 是持久化下来的旧值,目录可能在这期间没了(worktree 移除、
+        // 项目搬家)。那本是「续接得更准」的优化,不该把 pane 拖成 error ——
+        // 失败就退回项目默认目录重来一次,大不了 resume 找不到会话桶。
+        return createProjectPty(project, shell, startCwd).catch((e) => {
+          console.warn(`以会话目录 ${startCwd} 启动失败，回落项目默认目录:`, e);
+          resumeCwd = undefined;
+          return createProjectPty(project, shell, activePane.cwd);
+        });
+      })
       .then((ptyId) => {
         const layout = useAppStore.getState().projectStates.get(projectId)?.layout;
         const pane = layout ? findPaneById(layout, activePane.id) : null;
@@ -123,6 +164,12 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
           if (resumeCmd) {
             clearPaneResumePendingByPty(ptyId);
             void writePtyInput(ptyId, `${resumeCmd}\r`);
+            // 反查所得的启动目录随身份写回并持久化,下次重启直达不再查
+            const session = activePane.aiSession;
+            if (resumeCwd && session && session.cwd !== resumeCwd) {
+              setPaneAiSessionByPty(ptyId, { ...session, cwd: resumeCwd });
+              saveLayoutToConfig(projectId);
+            }
           }
           setSpawnErrors((prev) => {
             if (!(activePane.id in prev)) return prev;
@@ -150,6 +197,8 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
     activePane?.shellName,
     activePane?.status,
     activePane?.cwd,
+    activePane?.aiSession,
+    activePane?.resumePending,
     config.availableShells,
     config.defaultShell,
     project,
@@ -163,7 +212,7 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
   const handleNewTabClick = useCallback((e: React.MouseEvent) => {
     // 远程项目不弹 shell 菜单:pane 固定为 ssh 启动器
     if (remote || config.availableShells.length <= 1) {
-      void newTerminal(projectId);
+      void newTerminal(projectId, undefined, { targetPaneId: activePane?.id });
       return;
     }
     showContextMenu(
@@ -171,10 +220,10 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
       e.clientY,
       config.availableShells.map((shell) => ({
         label: shell.name,
-        onClick: () => void newTerminal(projectId, shell),
+        onClick: () => void newTerminal(projectId, shell, { targetPaneId: activePane?.id }),
       })),
     );
-  }, [remote, config.availableShells, projectId]);
+  }, [remote, config.availableShells, projectId, activePane?.id]);
 
   const [markerOpen, setMarkerOpen] = useState(false);
   const [markerAnchor, setMarkerAnchor] = useState<{ top: number; right: number } | null>(null);
@@ -294,6 +343,13 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
               }}
               onContextMenu={(e) => paneContextMenu(e, pane.id)}
             >
+              {/* 激活指示条:始终占位、未激活透明(同 SettingsModal tab 惯例)。
+                  背景图皮肤下 --bg-terminal 与 --bg-elevated 几乎同色,
+                  仅靠底色分不出激活 tab,accent 条不吃主题 */}
+              <span
+                aria-hidden
+                className={`absolute top-0 left-0 right-0 h-[2px] ${isActive ? 'bg-[var(--accent)]' : 'bg-transparent'}`}
+              />
               <StatusDot status={pane.status} />
               {aiActive && (
                 <BrandIcon

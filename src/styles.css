@@ -148,6 +148,18 @@ html, body, #root {
   background-color: var(--bg-terminal) !important;
 }
 
+/* 背景图主题下终端内层全透明：--bg-terminal 是半透明 rgba,防白屏规则 +
+   TerminalInstance/TerminalArea 容器共 5 层叠乘会把背景图盖死。
+   着色只保留 TerminalArea 容器一层,防闪兜底由其后的背景图 + 压暗层承担 */
+:root[data-custom-theme-bg] .xterm,
+:root[data-custom-theme-bg] .xterm-viewport,
+:root[data-custom-theme-bg] .xterm-screen {
+  background-color: transparent !important;
+}
+:root[data-custom-theme-bg] [data-terminal-drop] {
+  background-color: transparent;
+}
+
 /* ===== 文件拖拽到终端：拖拽期间禁用终端区 pointer-events，让鼠标事件穿透到 drop-zone ===== */
 body.file-dragging [data-terminal-drop] > * {
   pointer-events: none !important;
@@ -985,6 +997,11 @@ body.ssh-conn-dragging {
 }
 
 [data-skin="blueprint"] #root::before {
+  opacity: 0;
+}
+
+/* 背景图主题激活时噪点层归零，避免在图片上蒙沙（参照 blueprint 先例） */
+:root[data-custom-theme-bg] #root::before {
   opacity: 0;
 }
 

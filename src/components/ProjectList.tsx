@@ -1,4 +1,5 @@
 import { useCallback, useState, useRef, useEffect } from 'react';
+import { createPortal } from 'react-dom';
 import { open } from '@tauri-apps/plugin-dialog';
 import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWebview } from '@tauri-apps/api/webview';
@@ -25,6 +26,7 @@ import { PROJECT_KINDS, PROJECT_KIND_LABELS } from '../utils/projectKind';
 import type { ProjectKind } from '../utils/projectKind';
 import { TechIcon } from './TechIcon';
 import { BrandIcon } from './BrandIcon';
+import { ProjectPanePreview } from './ProjectPanePreview';
 import { inferVendor } from '../utils/inferVendor';
 import type { AiVendor } from '../utils/inferVendor';
 import { paneShowsAiSession } from '../utils/aiResume';
@@ -430,6 +432,42 @@ export function ProjectList() {
     setEditingGroupId(null);
   }, [editingGroupId, editingName, renameGroup]);
 
+  // === pane 预览浮层：悬停项目行 250ms 后弹出，移出/按下/滚动/拖拽即关 ===
+
+  const [preview, setPreview] = useState<{ projectId: string; rect: { top: number; right: number } } | null>(null);
+  const previewTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
+
+  const closePreview = useCallback(() => {
+    clearTimeout(previewTimer.current);
+    setPreview(null);
+  }, []);
+
+  const handlePreviewEnter = useCallback((e: React.MouseEvent, projectId: string) => {
+    clearTimeout(previewTimer.current);
+    if (isProjectDragging()) return;
+    // currentTarget 只在事件分发期间有效,先留住 DOM 引用;rect 到点弹时再取,
+    // 悬停期间列表若有增删位置仍准
+    const el = e.currentTarget as HTMLElement;
+    previewTimer.current = setTimeout(() => {
+      if (isProjectDragging() || !el.isConnected) return;
+      const r = el.getBoundingClientRect();
+      setPreview({ projectId, rect: { top: r.top, right: r.right } });
+    }, 250);
+  }, []);
+
+  useEffect(() => () => clearTimeout(previewTimer.current), []);
+
+  // 列表滚动/滚轮时浮层锚点失效,直接关闭(capture 才收得到内部容器的 scroll)
+  useEffect(() => {
+    if (!preview) return;
+    window.addEventListener('scroll', closePreview, true);
+    window.addEventListener('wheel', closePreview, { passive: true });
+    return () => {
+      window.removeEventListener('scroll', closePreview, true);
+      window.removeEventListener('wheel', closePreview);
+    };
+  }, [preview, closePreview]);
+
   // === 拖拽处理（自定义鼠标事件，替代 HTML5 DnD，规避 WebView2 dragDropEnabled 拦截） ===
 
   const handleProjectMouseDown = useCallback((e: React.MouseEvent, projectId: string) => {
@@ -602,9 +640,16 @@ export function ProjectList() {
         role="option"
         aria-selected={isActive}
         tabIndex={0}
-        onMouseDown={(e) => handleProjectMouseDown(e, project.id)}
+        onMouseDown={(e) => {
+          closePreview();
+          handleProjectMouseDown(e, project.id);
+        }}
+        onMouseEnter={(e) => handlePreviewEnter(e, project.id)}
         onMouseMove={isChild ? undefined : (e) => handleMouseMoveOver(e, project.id, false)}
-        onMouseLeave={isChild ? undefined : handleMouseLeaveTarget}
+        onMouseLeave={() => {
+          closePreview();
+          if (!isChild) handleMouseLeaveTarget();
+        }}
         onMouseUp={isChild ? undefined : (e) => handleMouseUpDrop(e, project.id)}
         onClick={() => setActiveProject(project.id)}
         onKeyDown={(e) => {
@@ -623,6 +668,7 @@ export function ProjectList() {
         onContextMenu={(e) => {
           e.preventDefault();
           e.stopPropagation();
+          closePreview();
           // 远程项目 gate:本地专属入口（资源管理器打开 / 关联 SSH MCP / 环境变量 /
           // WSL 会话）一律隐藏 —— agent 已在远程机、envVars 不注入远程 shell（二期）,
           // 路径也不是本机可打开的位置。保留:重命名 / 复制绝对路径（远程 POSIX）/ 分组操作。
@@ -754,7 +800,6 @@ export function ProjectList() {
           );
           showContextMenu(e.clientX, e.clientY, menuItems);
         }}
-        title={project.path}
       >
         {renderDropLine(project.id, 'before')}
         {isActive && (
@@ -962,7 +1007,7 @@ export function ProjectList() {
   };
 
   return (
-    <div data-panel className="h-full bg-[var(--bg-surface)] flex flex-col select-none">
+    <div data-panel data-mt-part="sidebar" className="h-full bg-[var(--bg-surface)] flex flex-col select-none">
       {/* 项目列表（Sessions 已移至右侧悬浮抽屉） */}
       <div ref={projectListRef} className="relative flex-1 min-h-0 flex flex-col overflow-hidden">
             {isFileDragOver && (
@@ -1089,6 +1134,18 @@ export function ProjectList() {
           </div>
         </div>
       </Modal>
+
+      {/* pane 预览浮层:portal 到 body 越过 Allotment 裁剪;纯展示不参与命中。
+          项目已被删除时 find 落空,静默不渲染 */}
+      {preview && (() => {
+        const p = config.projects.find((x) => x.id === preview.projectId);
+        return p
+          ? createPortal(
+              <ProjectPanePreview project={p} anchorRect={preview.rect} />,
+              document.body,
+            )
+          : null;
+      })()}
     </div>
   );
 }
