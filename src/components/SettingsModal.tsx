@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, type ReactNode } from 'react';
+import { useState, useEffect, useCallback, useMemo, type ReactNode } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { getVersion } from '@tauri-apps/api/app';
 import { openUrl } from '@tauri-apps/plugin-opener';
@@ -16,6 +16,7 @@ import {
   DEFAULT_TERMINAL_FONT_FAMILY,
 } from '../utils/terminalCache';
 import { applyUiFontFamily } from '../utils/fontManager';
+import type { HookRegistration } from '../types';
 import { clearCustomTheme, invalidateThemeAssets, listThemePacks, loadAndApplyCustomTheme, resolveThemeAssetUrl, type ThemePackMeta } from '../utils/themePackManager';
 import { MOD_LABEL } from '../utils/platform';
 import { comboLabel, hotkeyGroups } from '../utils/hotkeys';
@@ -989,6 +990,9 @@ function AiHookSettings() {
   const hookEnabled = config.hookEnabled ?? false;
 
   const [hookStatus, setHookStatus] = useState<{ port: number; running: boolean } | null>(null);
+  const [registrations, setRegistrations] = useState<HookRegistration[]>([]);
+  /** 本次注册/卸载作用于哪几家；null = 还没按注册现状初始化过 */
+  const [selected, setSelected] = useState<Set<string> | null>(null);
   const [registering, setRegistering] = useState(false);
   const [unregistering, setUnregistering] = useState(false);
   const [toggling, setToggling] = useState(false);
@@ -1005,9 +1009,27 @@ function AiHookSettings() {
     invoke<{ port: number; running: boolean }>('get_hook_status').then(setHookStatus);
   }, []);
 
+  /** 拉三家的注册现状；首次拉到时据此定默认勾选（见 setSelected 的注释） */
+  const refreshRegistrations = useCallback(() => {
+    invoke<HookRegistration[]>('get_ai_hook_registrations')
+      .then((list) => {
+        setRegistrations(list);
+        setSelected((prev) => {
+          if (prev) return prev;
+          // 默认勾选「已经装了的那几家」——用户再点一次注册就是补齐新事件，
+          // 不会顺手往没在用的 CLI 里写配置。一家都没装过（首次使用）则全选，
+          // 保住「一键注册」的原有体验。
+          const installed = list.filter((r) => r.registered > 0).map((r) => r.agent);
+          return new Set(installed.length > 0 ? installed : list.map((r) => r.agent));
+        });
+      })
+      .catch(() => setRegistrations([]));
+  }, []);
+
   useEffect(() => {
     refreshHookStatus();
-  }, [refreshHookStatus]);
+    refreshRegistrations();
+  }, [refreshHookStatus, refreshRegistrations]);
 
   const handleToggleHook = useCallback(async (enabled: boolean) => {
     setToggling(true);
@@ -1024,31 +1046,45 @@ function AiHookSettings() {
     }
   }, [setConfig, refreshHookStatus]);
 
-  const handleRegister = useCallback(async () => {
-    setRegistering(true);
-    setResultMsg('');
-    try {
-      const msg = await invoke<string>('register_ai_hooks');
-      setResultMsg(msg);
-    } catch (e: unknown) {
-      setResultMsg(e instanceof Error ? e.message : String(e));
-    } finally {
-      setRegistering(false);
-    }
+  const agents = useMemo(() => [...(selected ?? [])], [selected]);
+
+  const toggleAgent = useCallback((agent: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev ?? []);
+      if (next.has(agent)) next.delete(agent);
+      else next.add(agent);
+      return next;
+    });
   }, []);
 
-  const handleUnregister = useCallback(async () => {
-    setUnregistering(true);
-    setResultMsg('');
-    try {
-      const msg = await invoke<string>('unregister_ai_hooks');
-      setResultMsg(msg);
-    } catch (e: unknown) {
-      setResultMsg(e instanceof Error ? e.message : String(e));
-    } finally {
-      setUnregistering(false);
-    }
-  }, []);
+  const runHookAction = useCallback(
+    async (cmd: 'register_ai_hooks' | 'unregister_ai_hooks', setBusy: (v: boolean) => void) => {
+      setBusy(true);
+      setResultMsg('');
+      try {
+        // agents 显式传：后端对空/缺省会回落成三家全上，而这里空选择
+        // 由按钮 disabled 挡住，两边不会互相误解
+        const msg = await invoke<string>(cmd, { agents });
+        setResultMsg(msg);
+      } catch (e: unknown) {
+        setResultMsg(e instanceof Error ? e.message : String(e));
+      } finally {
+        setBusy(false);
+        refreshRegistrations();
+      }
+    },
+    [agents, refreshRegistrations],
+  );
+
+  const handleRegister = useCallback(
+    () => runHookAction('register_ai_hooks', setRegistering),
+    [runHookAction],
+  );
+
+  const handleUnregister = useCallback(
+    () => runHookAction('unregister_ai_hooks', setUnregistering),
+    [runHookAction],
+  );
 
   const handleShowSnippet = useCallback(async () => {
     if (showSnippet) {
@@ -1100,22 +1136,71 @@ function AiHookSettings() {
           </div>
         </div>
 
+        {/* 按 CLI 选择注入目标：三家的配置文件互不相干，只装自己在用的那家 */}
+        <div className="rounded-[var(--radius-md)] bg-[var(--bg-base)] border border-[var(--border-subtle)] overflow-hidden">
+          <div className="px-3 pt-2.5 pb-1 text-sm text-[var(--text-muted)]">
+            {t("settings.aiHook.targetsLabel")}
+          </div>
+          {registrations.map((r) => {
+            const checked = selected?.has(r.agent) ?? false;
+            const state =
+              r.registered === 0
+                ? { text: t("settings.aiHook.stateAbsent"), color: 'var(--text-muted)' }
+                : r.registered < r.total
+                  ? {
+                      text: t("settings.aiHook.stateStale", { n: r.registered, total: r.total }),
+                      color: 'var(--color-warning)',
+                    }
+                  : {
+                      text: t("settings.aiHook.stateReady", { n: r.total }),
+                      color: 'var(--color-success)',
+                    };
+            return (
+              <label
+                key={r.agent}
+                className="flex items-center gap-2.5 px-3 py-2 cursor-pointer hover:bg-[var(--border-subtle)] transition-colors"
+              >
+                <input
+                  type="checkbox"
+                  className="accent-[var(--accent)] cursor-pointer"
+                  checked={checked}
+                  onChange={() => toggleAgent(r.agent)}
+                />
+                <div className="min-w-0 flex-1">
+                  <div className="text-base text-[var(--text-primary)]">{r.label}</div>
+                  <div className="text-sm text-[var(--text-muted)] truncate" title={r.file}>
+                    {r.file}
+                  </div>
+                </div>
+                <span className="text-sm shrink-0" style={{ color: state.color }}>
+                  {state.text}
+                </span>
+              </label>
+            );
+          })}
+        </div>
+
         <div className="flex gap-2">
           <button
             className="flex-1 py-2 bg-[var(--accent)] text-[var(--bg-base)] rounded-[var(--radius-sm)] text-base hover:opacity-90 transition-opacity disabled:opacity-50"
             onClick={handleRegister}
-            disabled={registering}
+            disabled={registering || agents.length === 0}
           >
             {registering ? t("settings.aiHook.registering") : t("settings.aiHook.register")}
           </button>
           <button
             className="flex-1 py-2 bg-[var(--bg-base)] text-[var(--text-secondary)] border border-[var(--border-default)] rounded-[var(--radius-sm)] text-base hover:border-[var(--accent)] hover:text-[var(--accent)] transition-all disabled:opacity-50"
             onClick={handleUnregister}
-            disabled={unregistering}
+            disabled={unregistering || agents.length === 0}
           >
             {unregistering ? t("settings.aiHook.unregistering") : t("settings.aiHook.unregister")}
           </button>
         </div>
+        {agents.length === 0 && (
+          <div className="text-sm text-[var(--text-muted)] text-center">
+            {t("settings.aiHook.noTargetSelected")}
+          </div>
+        )}
 
         <button
           className="w-full py-2 text-base text-[var(--text-muted)] hover:text-[var(--accent)] transition-colors"

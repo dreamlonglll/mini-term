@@ -214,6 +214,7 @@ pub fn run() {
             search::cancel_search,
             hook_registry::register_ai_hooks,
             hook_registry::unregister_ai_hooks,
+            hook_registry::get_ai_hook_registrations,
             hook_registry::get_hook_config_snippet,
             hook_registry::get_hook_status,
             hook_server::toggle_hook_server,

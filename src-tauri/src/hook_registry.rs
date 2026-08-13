@@ -299,21 +299,23 @@ fn unregister_claude_hooks() -> Result<String, String> {
     Ok(format!("Claude Code: 已移除 {} 个 hook 条目", removed))
 }
 
-/// settings.json 里已写入 miniterm-hook 条目的事件名集合。
+/// 某个 hook 配置文件里已写入 miniterm-hook 条目的事件名集合。
+///
+/// 三家的文件在这一层同构（`{ "hooks": { "<Event>": [entry, …] } }`），共用本函数。
 /// 读不到 / 解析失败一律返回空集 —— 空集的语义是「没注册过」，调用方据此不动手，
 /// 比冒险改写一个读不懂的配置文件安全。
-fn registered_claude_events() -> std::collections::HashSet<String> {
+fn registered_events_in(path: Option<PathBuf>) -> std::collections::HashSet<String> {
     let mut set = std::collections::HashSet::new();
-    let Some(path) = claude_settings_path() else {
+    let Some(path) = path else {
         return set;
     };
     let Ok(content) = std::fs::read_to_string(&path) else {
         return set;
     };
-    let Ok(settings) = serde_json::from_str::<Value>(&content) else {
+    let Ok(config) = serde_json::from_str::<Value>(&content) else {
         return set;
     };
-    let Some(hooks) = settings.get("hooks").and_then(|h| h.as_object()) else {
+    let Some(hooks) = config.get("hooks").and_then(|h| h.as_object()) else {
         return set;
     };
     for (event, entries) in hooks {
@@ -325,6 +327,14 @@ fn registered_claude_events() -> std::collections::HashSet<String> {
         }
     }
     set
+}
+
+fn registered_claude_events() -> std::collections::HashSet<String> {
+    registered_events_in(claude_settings_path())
+}
+
+fn registered_codex_events() -> std::collections::HashSet<String> {
+    registered_events_in(codex_hooks_path())
 }
 
 /// 需要补注册的事件（`sync_claude_hooks_if_registered` 的纯判定部分，抽出来是
@@ -718,31 +728,8 @@ fn unregister_grok_hooks() -> Result<String, String> {
     Ok(format!("Grok: 已移除 {} 个 hook 条目", removed))
 }
 
-/// 已注册的 grok 事件集合（语义与 `registered_claude_events` 相同：
-/// 读不到/解析失败一律返回空集 = 「没注册过」，调用方据此不动手）
 fn registered_grok_events() -> std::collections::HashSet<String> {
-    let mut set = std::collections::HashSet::new();
-    let Some(path) = grok_hooks_path() else {
-        return set;
-    };
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return set;
-    };
-    let Ok(config) = serde_json::from_str::<Value>(&content) else {
-        return set;
-    };
-    let Some(hooks) = config.get("hooks").and_then(|h| h.as_object()) else {
-        return set;
-    };
-    for (event, entries) in hooks {
-        if entries
-            .as_array()
-            .is_some_and(|arr| arr.iter().any(entry_is_miniterm))
-        {
-            set.insert(event.clone());
-        }
-    }
-    set
+    registered_events_in(grok_hooks_path())
 }
 
 fn missing_grok_events(registered: &std::collections::HashSet<String>) -> Vec<&'static str> {
@@ -783,54 +770,185 @@ pub fn sync_grok_hooks_if_registered() {
     }
 }
 
+// ─── 注册目标 ───
+
+/// 可单独注册/卸载的 CLI。
+///
+/// 三家的事件集、配置文件位置与命令写法都不同（见各自的 `register_*`），但对外
+/// 是同一套动作，所以用本枚举做选择而不是铺三对命令：前端只传一个列表，将来
+/// 加第四家时命令签名不变。serde 层拒收未知值——未知 agent 若静默退化成
+/// 「全量注册」，会往用户根本没在用的 CLI 里写配置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HookAgent {
+    Claude,
+    Codex,
+    Grok,
+}
+
+impl HookAgent {
+    const ALL: &'static [HookAgent] = &[HookAgent::Claude, HookAgent::Codex, HookAgent::Grok];
+
+    fn key(self) -> &'static str {
+        match self {
+            HookAgent::Claude => "claude",
+            HookAgent::Codex => "codex",
+            HookAgent::Grok => "grok",
+        }
+    }
+
+    /// 面板展示名（与 UI 里的品牌写法一致）
+    fn label(self) -> &'static str {
+        match self {
+            HookAgent::Claude => "Claude Code",
+            HookAgent::Codex => "Codex",
+            HookAgent::Grok => "Grok",
+        }
+    }
+
+    fn events(self) -> &'static [&'static str] {
+        match self {
+            HookAgent::Claude => CLAUDE_HOOK_EVENTS,
+            HookAgent::Codex => CODEX_HOOK_EVENTS,
+            HookAgent::Grok => GROK_HOOK_EVENTS,
+        }
+    }
+
+    fn registered_events(self) -> std::collections::HashSet<String> {
+        match self {
+            HookAgent::Claude => registered_claude_events(),
+            HookAgent::Codex => registered_codex_events(),
+            HookAgent::Grok => registered_grok_events(),
+        }
+    }
+
+    /// 配置文件路径的展示形式（`~` 缩写，面板里直接给用户看到写去了哪）
+    fn display_path(self) -> String {
+        let raw = match self {
+            HookAgent::Claude => claude_settings_path(),
+            HookAgent::Codex => codex_hooks_path(),
+            HookAgent::Grok => grok_hooks_path(),
+        };
+        let Some(raw) = raw else {
+            return String::new();
+        };
+        let text = raw.to_string_lossy().replace('\\', "/");
+        match dirs::home_dir() {
+            Some(home) => {
+                let home = home.to_string_lossy().replace('\\', "/");
+                text.strip_prefix(&home)
+                    .map(|rest| format!("~{}", rest))
+                    .unwrap_or(text)
+            }
+            None => text,
+        }
+    }
+
+    fn register(self, hook_path: &str) -> Result<String, String> {
+        match self {
+            HookAgent::Claude => register_claude_hooks(hook_path),
+            HookAgent::Codex => register_codex_hooks(hook_path),
+            HookAgent::Grok => register_grok_hooks(hook_path),
+        }
+    }
+
+    fn unregister(self) -> Result<String, String> {
+        match self {
+            HookAgent::Claude => unregister_claude_hooks(),
+            HookAgent::Codex => unregister_codex_hooks(),
+            HookAgent::Grok => unregister_grok_hooks(),
+        }
+    }
+}
+
+/// 入参缺省 / 空列表时的目标：三家全上，保持「一键注册」的原有语义。
+fn resolve_targets(agents: Option<Vec<HookAgent>>) -> Vec<HookAgent> {
+    match agents {
+        Some(list) if !list.is_empty() => {
+            // 去重：同一项传两次会把该配置文件写两遍（幂等，但白跑一趟）
+            let mut out: Vec<HookAgent> = Vec::new();
+            for a in list {
+                if !out.contains(&a) {
+                    out.push(a);
+                }
+            }
+            out
+        }
+        _ => HookAgent::ALL.to_vec(),
+    }
+}
+
+/// 单个 CLI 的 hook 注册现状，供面板显示「装没装 / 是不是旧事件集」。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HookRegistrationInfo {
+    /// 与 `HookAgent` 的 serde 表示一致，前端按它回传选择
+    pub agent: String,
+    pub label: String,
+    /// 配置文件路径（`~` 缩写）
+    pub file: String,
+    /// 该文件里属于 mini-term 的事件条目数
+    pub registered: usize,
+    /// 当前版本应注册的事件总数；`0 < registered < total` = 老用户的旧事件集
+    pub total: usize,
+}
+
 // ─── Tauri Commands ───
 
-/// 注册 AI hooks（Claude Code + Codex + Grok Build）
+/// 注册 AI hooks。`agents` 缺省 = 三家全注册（保持「一键注册」的原语义）。
 #[tauri::command]
-pub fn register_ai_hooks(_app: AppHandle) -> Result<String, String> {
+pub fn register_ai_hooks(
+    _app: AppHandle,
+    agents: Option<Vec<HookAgent>>,
+) -> Result<String, String> {
     let hook_path = get_hook_binary_path()?;
-
-    let mut results = Vec::new();
-
-    match register_claude_hooks(&hook_path) {
-        Ok(msg) => results.push(msg),
-        Err(e) => results.push(format!("Claude Code 注册失败: {}", e)),
-    }
-
-    match register_codex_hooks(&hook_path) {
-        Ok(msg) => results.push(msg),
-        Err(e) => results.push(format!("Codex 注册失败: {}", e)),
-    }
-
-    match register_grok_hooks(&hook_path) {
-        Ok(msg) => results.push(msg),
-        Err(e) => results.push(format!("Grok 注册失败: {}", e)),
-    }
-
+    let results: Vec<String> = resolve_targets(agents)
+        .into_iter()
+        .map(|agent| match agent.register(&hook_path) {
+            Ok(msg) => msg,
+            // 单家失败不打断其余：三个配置文件互不相干，一家读不动不该
+            // 让另外两家也注册不上
+            Err(e) => format!("{} 注册失败: {}", agent.label(), e),
+        })
+        .collect();
     Ok(results.join("\n"))
 }
 
-/// 卸载 AI hooks（Claude Code + Codex + Grok Build）
+/// 卸载 AI hooks。`agents` 缺省 = 三家全卸载。
 #[tauri::command]
-pub fn unregister_ai_hooks(_app: AppHandle) -> Result<String, String> {
-    let mut results = Vec::new();
-
-    match unregister_claude_hooks() {
-        Ok(msg) => results.push(msg),
-        Err(e) => results.push(format!("Claude Code 卸载失败: {}", e)),
-    }
-
-    match unregister_codex_hooks() {
-        Ok(msg) => results.push(msg),
-        Err(e) => results.push(format!("Codex 卸载失败: {}", e)),
-    }
-
-    match unregister_grok_hooks() {
-        Ok(msg) => results.push(msg),
-        Err(e) => results.push(format!("Grok 卸载失败: {}", e)),
-    }
-
+pub fn unregister_ai_hooks(
+    _app: AppHandle,
+    agents: Option<Vec<HookAgent>>,
+) -> Result<String, String> {
+    let results: Vec<String> = resolve_targets(agents)
+        .into_iter()
+        .map(|agent| match agent.unregister() {
+            Ok(msg) => msg,
+            Err(e) => format!("{} 卸载失败: {}", agent.label(), e),
+        })
+        .collect();
     Ok(results.join("\n"))
+}
+
+/// 三家各自的注册现状（面板据此定默认勾选、显示状态徽章）。
+#[tauri::command]
+pub fn get_ai_hook_registrations(_app: AppHandle) -> Vec<HookRegistrationInfo> {
+    HookAgent::ALL
+        .iter()
+        .map(|&agent| {
+            let events = agent.events();
+            let registered = agent.registered_events();
+            HookRegistrationInfo {
+                agent: agent.key().to_string(),
+                label: agent.label().to_string(),
+                file: agent.display_path(),
+                // 只数当前版本要求的事件：配置里残留的已下线事件名不该
+                // 让计数超过 total、显示成「17/16」
+                registered: events.iter().filter(|e| registered.contains(**e)).count(),
+                total: events.len(),
+            }
+        })
+        .collect()
 }
 
 /// 获取 hook 配置片段供用户手动粘贴（结构化返回）
@@ -1050,6 +1168,45 @@ mod tests {
         assert!(!command.starts_with('~'), "前导 ~ 同样会触发 shell 分支");
         assert!(entry.get("matcher").is_none(), "grok 条目不该写 matcher");
         assert!(entry_is_miniterm(&entry));
+    }
+
+    /// 选择性注入的目标解析：显式列表按原样（去重），缺省/空列表回落三家全上
+    /// —— 「一键注册」在前端不勾选任何项时仍是全量，语义不因本功能改变。
+    #[test]
+    fn targets_default_to_all_and_dedupe_explicit_lists() {
+        assert_eq!(resolve_targets(None), HookAgent::ALL.to_vec());
+        assert_eq!(resolve_targets(Some(vec![])), HookAgent::ALL.to_vec());
+        assert_eq!(
+            resolve_targets(Some(vec![HookAgent::Grok])),
+            vec![HookAgent::Grok]
+        );
+        // 重复项会让同一个配置文件被写两遍(幂等但白跑)
+        assert_eq!(
+            resolve_targets(Some(vec![HookAgent::Codex, HookAgent::Codex, HookAgent::Claude])),
+            vec![HookAgent::Codex, HookAgent::Claude]
+        );
+    }
+
+    /// 未知 agent 必须在 serde 层被拒——静默退化成「全量注册」会往用户
+    /// 根本没在用的 CLI 里写配置。
+    #[test]
+    fn unknown_agent_is_rejected_at_deserialization() {
+        assert!(serde_json::from_str::<HookAgent>("\"grok\"").is_ok());
+        assert!(serde_json::from_str::<HookAgent>("\"gemini\"").is_err());
+        assert!(serde_json::from_str::<HookAgent>("\"Claude\"").is_err());
+    }
+
+    /// 每家的元信息都得齐：key 唯一、事件集非空、展示名不空——
+    /// 面板的勾选项与状态徽章全靠它们渲染。
+    #[test]
+    fn every_agent_exposes_complete_metadata() {
+        let mut keys = std::collections::HashSet::new();
+        for &agent in HookAgent::ALL {
+            assert!(keys.insert(agent.key()), "key 重复: {}", agent.key());
+            assert!(!agent.label().is_empty());
+            assert!(!agent.events().is_empty(), "{} 的事件集为空", agent.key());
+        }
+        assert_eq!(keys.len(), 3);
     }
 
     /// 与 Claude 同样的自愈语义：从未注册过的用户不写配置，已是最新的不重复补
