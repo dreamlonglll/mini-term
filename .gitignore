@@ -47,3 +47,6 @@ src-tauri/resources/portable-conpty/
 # mini-term SSH skill（本机相关生成物，勿提交）
 .claude/skills/mini-term-ssh/
 .codex/skills/mini-term-ssh/
+
+# release-build.mjs 收集的安装包
+release/
