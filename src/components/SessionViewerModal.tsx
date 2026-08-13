@@ -164,8 +164,12 @@ export function SessionViewerModal({ open, onClose, session, projectPath }: Prop
   // 这期间沿用最后一次的 session 渲染
   if (!present || !shown) return null;
 
-  const typeName = shown.sessionType === 'claude' ? 'Claude' : 'Codex';
-  const typeColor = shown.sessionType === 'claude' ? 'var(--color-ai)' : 'var(--color-success)';
+  const TYPE_BADGE: Record<string, { name: string; color: string }> = {
+    claude: { name: 'Claude', color: 'var(--color-ai)' },
+    codex: { name: 'Codex', color: 'var(--color-success)' },
+    grok: { name: 'Grok', color: 'var(--color-info)' },
+  };
+  const { name: typeName, color: typeColor } = TYPE_BADGE[shown.sessionType] ?? TYPE_BADGE.claude;
   const isMatch = (i: number) => q && matchIndices.includes(i);
   const isCurrentMatch = (i: number) => q && matchIndices[matchIdx] === i;
 

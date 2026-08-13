@@ -352,7 +352,7 @@ export interface PreviewPaletteOptions {
 
 export interface AiSession {
   id: string;
-  sessionType: 'claude' | 'codex';
+  sessionType: 'claude' | 'codex' | 'grok';
   title: string;
   timestamp: string; // ISO 8601
   /** 会话来源:有值 = 该 WSL 发行版内的会话,undefined = Windows 宿主会话 */

@@ -45,10 +45,11 @@ function formatTime(iso: string): string {
   return y === currentYear ? t('sessionList.time.monthDay', { m, d }) : `${y}/${m}/${d}`;
 }
 
-/** 会话来源 → 品牌图标厂商 key(codex 是 OpenAI 家的 CLI)。 */
+/** 会话来源 → 品牌图标厂商 key(codex 是 OpenAI 家的 CLI,grok 是 xAI 的)。 */
 const TYPE_VENDOR: Record<string, AiVendor> = {
   claude: 'claude',
   codex: 'openai',
+  grok: 'grok',
 };
 
 /** 项目是否有 WSL 会话来源:WSL 根项目(UNC)自动启用,或显式配置了发行版 */
