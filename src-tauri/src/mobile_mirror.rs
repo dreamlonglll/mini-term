@@ -29,6 +29,7 @@ pub const MIRROR_PAGE_SIZE: usize = 50;
 pub enum MirrorAgent {
     Claude,
     Codex,
+    Grok,
 }
 
 /// 增量解析器:按字节块喂入,只消费完整行(以 `\n` 结尾),半行留待下一块拼接。
@@ -37,6 +38,9 @@ pub struct MirrorParser {
     agent: MirrorAgent,
     next_seq: u64,
     partial: Vec<u8>,
+    /// grok 专用:消息被拆成任意多个 chunk 行,要攒到边界才成一条。
+    /// 其余两家一行即一条,该状态机不参与。
+    grok: Option<ai_sessions::GrokUpdateParser>,
 }
 
 impl MirrorParser {
@@ -45,10 +49,15 @@ impl MirrorParser {
             agent,
             next_seq: 0,
             partial: Vec::new(),
+            grok: (agent == MirrorAgent::Grok).then(ai_sessions::GrokUpdateParser::new),
         }
     }
 
     /// 喂入新到的字节,返回其中完整行解析出的镜像消息(噪音行静默跳过)。
+    ///
+    /// grok 的尾部消息会**滞留**到下一个边界行到达才产出:回合收尾时 grok 会
+    /// 落一条 `turn_completed`,它就是边界,所以正常对话不会卡住最后一条;
+    /// 真正流式写到一半的那条本就不完整,晚一秒出比碎成几十条强。
     pub fn feed(&mut self, chunk: &[u8]) -> Vec<MirrorMessage> {
         self.partial.extend_from_slice(chunk);
         let mut out = Vec::new();
@@ -70,6 +79,7 @@ impl MirrorParser {
         let raw = match self.agent {
             MirrorAgent::Claude => ai_sessions::claude_message_from_line(line)?,
             MirrorAgent::Codex => ai_sessions::codex_message_from_line(line)?,
+            MirrorAgent::Grok => self.grok.as_mut()?.feed_line(line)?,
         };
         // 来源标注:user = 桌面输入,assistant = AI 回复;与最近移动端指令匹配的
         // user 消息由 mobile_relay::relabel_mobile_sources 改标为 "mobile"
@@ -177,40 +187,74 @@ fn fresh_since(
     }
 }
 
-/// 该 agent 是否有本模块能解析的会话记录文件(只有 Claude 与 Codex 两家)。
+/// 项目的最新 grok 会话文件(`{组目录}/{session-id}/updates.jsonl`)。
+/// grok 一个会话是一整个目录,这里只在项目命中的组目录里逐会话取 updates.jsonl。
+fn newest_grok_file(project_path: &str) -> Option<(PathBuf, SystemTime)> {
+    let mut newest: Option<(PathBuf, SystemTime)> = None;
+    for group in ai_sessions::find_grok_cwd_dirs(project_path) {
+        let Ok(entries) = fs::read_dir(&group) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let Some(path) = ai_sessions::grok_updates_path(&dir) else {
+                continue;
+            };
+            let Some(t) = mtime(&path) else { continue };
+            if newest.as_ref().is_none_or(|(_, cur)| t > *cur) {
+                newest = Some((path, t));
+            }
+        }
+    }
+    newest
+}
+
+/// 该 agent 是否有本模块能解析的会话记录(Claude / Codex / Grok 三家)。
 ///
 /// 输入检测能认出的 agent 比这宽(pi / opencode 也在 `AI_COMMANDS` 里),它们**没有**
 /// 可解析的记录文件。调用方必须据此跳过启发式绑定:`resolve_session_file` 只按项目
-/// 找"最新的 claude/codex 文件",对一个 pi pane 调它,会把同项目里 Claude 的对话
+/// 找"最新的 claude/codex/grok 记录",对一个 pi pane 调它,会把同项目里别家的对话
 /// 贴到这个 pane 上(串台)。宁可空镜像。
 ///
 /// 用 `contains` 而非全等:hook 上报的 agent 是 `claude-code`,输入检测是 `claude`。
 pub fn agent_has_session_log(agent: &str) -> bool {
     let agent = agent.to_ascii_lowercase();
-    agent.contains("claude") || agent.contains("codex")
+    agent.contains("claude") || agent.contains("codex") || agent.contains("grok")
 }
 
-/// 解析 pane 所属项目当前应镜像的会话文件:Claude 与 Codex 里最新修改的那个。
+/// 解析 pane 所属项目当前应镜像的会话记录:三家里最新修改的那个。
 /// `min_mtime` 是本轮 AI 会话的启动时刻:更早的文件属于以前的会话,一律不绑,
 /// 宁可先给空镜像等新会话落盘(代价:`--resume` 恢复的旧记录在下一条消息前不显示)。
 pub fn resolve_session_file(
     project_path: &str,
     min_mtime: Option<SystemTime>,
 ) -> Option<(PathBuf, MirrorAgent)> {
-    let claude = fresh_since(newest_claude_file(project_path), min_mtime);
-    let codex = fresh_since(newest_codex_file(project_path), min_mtime);
-    match (claude, codex) {
-        (Some((cp, ct)), Some((xp, xt))) => {
-            if ct >= xt {
-                Some((cp, MirrorAgent::Claude))
-            } else {
-                Some((xp, MirrorAgent::Codex))
-            }
+    let candidates = [
+        (
+            fresh_since(newest_claude_file(project_path), min_mtime),
+            MirrorAgent::Claude,
+        ),
+        (
+            fresh_since(newest_codex_file(project_path), min_mtime),
+            MirrorAgent::Codex,
+        ),
+        (
+            fresh_since(newest_grok_file(project_path), min_mtime),
+            MirrorAgent::Grok,
+        ),
+    ];
+    let mut best: Option<(PathBuf, SystemTime, MirrorAgent)> = None;
+    for (candidate, agent) in candidates {
+        let Some((path, t)) = candidate else { continue };
+        // 严格大于:同刻并列时保留先出现的(Claude > Codex > Grok)
+        if best.as_ref().is_none_or(|(_, cur, _)| t > *cur) {
+            best = Some((path, t, agent));
         }
-        (Some((cp, _)), None) => Some((cp, MirrorAgent::Claude)),
-        (None, Some((xp, _))) => Some((xp, MirrorAgent::Codex)),
-        (None, None) => None,
     }
+    best.map(|(path, _, agent)| (path, agent))
 }
 
 /// session_id 应为 UUID 形态;拒绝任何可构成路径穿越的字符——hook 端口对
@@ -265,10 +309,13 @@ pub fn resolve_session_file_by_id(
     if !valid_session_id(session_id) {
         return None;
     }
-    let is_codex = agent.is_some_and(|a| a.to_ascii_lowercase().contains("codex"));
-    if is_codex {
+    let agent_lower = agent.map(|a| a.to_ascii_lowercase()).unwrap_or_default();
+    if agent_lower.contains("codex") {
         let sessions_dir = dirs::home_dir()?.join(".codex").join("sessions");
         codex_session_file_in(&sessions_dir, session_id).map(|p| (p, MirrorAgent::Codex))
+    } else if agent_lower.contains("grok") {
+        let dir = ai_sessions::find_grok_session_dir(project_path, session_id)?;
+        ai_sessions::grok_updates_path(&dir).map(|p| (p, MirrorAgent::Grok))
     } else {
         let dirs = ai_sessions::find_claude_project_dirs(project_path);
         claude_session_file_in(&dirs, session_id).map(|p| (p, MirrorAgent::Claude))
@@ -303,16 +350,87 @@ mod tests {
         )
     }
 
-    /// 只有 Claude/Codex 有可解析的记录;pi/opencode 必须落在白名单外,
-    /// 否则镜像会退启发式绑到同项目 Claude/Codex 的会话文件(串台)。
+    /// 只有 Claude/Codex/Grok 有可解析的记录;pi/opencode 必须落在白名单外,
+    /// 否则镜像会退启发式绑到同项目别家的会话文件(串台)。
     #[test]
-    fn only_claude_and_codex_have_session_logs() {
-        for agent in ["claude", "claude-code", "codex", "Codex"] {
+    fn only_claude_codex_and_grok_have_session_logs() {
+        for agent in ["claude", "claude-code", "codex", "Codex", "grok", "Grok"] {
             assert!(agent_has_session_log(agent), "{agent} 应有会话记录");
         }
         for agent in ["pi", "opencode", "", "gemini"] {
             assert!(!agent_has_session_log(agent), "{agent} 不应被认为有会话记录");
         }
+    }
+
+    /// grok 把一条消息拆成任意多个 chunk 行:必须攒到边界才产出一条,
+    /// 否则一句回答会在镜像里碎成几十条。
+    #[test]
+    fn parser_joins_grok_chunks_into_one_message() {
+        let mut parser = MirrorParser::new(MirrorAgent::Grok);
+        let chunk = |tag: &str, text: &str, ts: u64| {
+            format!(
+                r#"{{"timestamp":{ts},"method":"session/update","params":{{"sessionId":"s","update":{{"sessionUpdate":"{tag}","content":{{"type":"text","text":"{text}"}}}}}}}}"#
+            )
+        };
+        let data = format!(
+            "{}\n{}\n{}\n{}\n{}\n{}\n",
+            chunk("user_message_chunk", "fix ", 1_800_000_000),
+            chunk("user_message_chunk", "the bug", 1_800_000_001),
+            // 工具调用是边界:用户消息在此收尾
+            r#"{"timestamp":1800000002,"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","title":"read_file"}}}"#,
+            chunk("agent_message_chunk", "done", 1_800_000_003),
+            chunk("agent_message_chunk", " ✅", 1_800_000_004),
+            // 回合收尾(xAI 扩展轨)同样是边界:AI 回复在此收尾
+            r#"{"timestamp":1800000005,"method":"_x.ai/session/update","params":{"sessionId":"s","update":{"sessionUpdate":"turn_completed","stop_reason":"end_turn"}}}"#,
+        );
+        let msgs = parser.feed(data.as_bytes());
+        assert_eq!(msgs.len(), 2, "chunk 未合并: {msgs:?}");
+        assert_eq!(msgs[0].source, "desktop");
+        assert_eq!(msgs[0].content, "fix the bug");
+        assert_eq!(msgs[0].seq, 0);
+        assert_eq!(msgs[1].source, "assistant");
+        assert_eq!(msgs[1].content, "done ✅");
+        assert_eq!(msgs[1].seq, 1);
+        // 时间戳取该消息**第一个** chunk 的时刻
+        assert!(msgs[0].timestamp.starts_with("2027-01-15T"), "{}", msgs[0].timestamp);
+    }
+
+    /// 宿主注入的回合(工具结果/系统提醒)与 `!bash` 直通命令的回显都不是
+    /// 用户说的话,镜像里不该出现——与 grok 自身的提示词抽取口径一致。
+    #[test]
+    fn parser_skips_grok_injected_user_chunks() {
+        let mut parser = MirrorParser::new(MirrorAgent::Grok);
+        let data = concat!(
+            r#"{"timestamp":1,"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"tool result"},"_meta":{"hostTurn":true}}}}"#,
+            "\n",
+            r#"{"timestamp":2,"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"ls -la","_meta":{"bash_command":"ls -la"}}}}}"#,
+            "\n",
+            r#"{"timestamp":3,"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"real prompt"}}}}"#,
+            "\n",
+            r#"{"timestamp":4,"method":"session/update","params":{"update":{"sessionUpdate":"tool_call"}}}"#,
+            "\n",
+        );
+        let msgs = parser.feed(data.as_bytes());
+        assert_eq!(msgs.len(), 1, "注入行未被跳过: {msgs:?}");
+        assert_eq!(msgs[0].content, "real prompt");
+    }
+
+    /// 半行拼接对 grok 同样成立(轮询按字节读,行边界不保证)
+    #[test]
+    fn parser_handles_grok_partial_line_across_chunks() {
+        let mut parser = MirrorParser::new(MirrorAgent::Grok);
+        let line = r#"{"timestamp":9,"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"split me"}}}}"#;
+        let bytes = format!("{line}\n");
+        let (head, tail) = bytes.as_bytes().split_at(bytes.len() / 2);
+        assert!(parser.feed(head).is_empty(), "半行不应产出消息");
+        // 补齐后仍在缓冲(等边界),再喂一个边界行才收尾
+        assert!(parser.feed(tail).is_empty());
+        let out = parser.feed(
+            b"{\"method\":\"session/update\",\"params\":{\"update\":{\"sessionUpdate\":\"tool_call\"}}}\n",
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].content, "split me");
+        assert_eq!(out[0].seq, 0);
     }
 
     #[test]

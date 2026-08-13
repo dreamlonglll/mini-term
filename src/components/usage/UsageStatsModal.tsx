@@ -41,7 +41,7 @@ function savePref(key: string, v: string) {
   }
 }
 
-const SCOPES: readonly UsageAgentFilter[] = ['all', 'claude', 'codex'];
+const SCOPES: readonly UsageAgentFilter[] = ['all', 'claude', 'codex', 'grok'];
 // 范围清单同源于 utils/usageDates(设计合同:不提供 all,全盘扫描太重);
 // 存量 localStorage 里的 'all' 不在白名单,loadPref 自动回落 days30
 const RANGES = USAGE_RANGES;
@@ -220,8 +220,13 @@ export function UsageStatsModal({ open, onClose }: { open: boolean; onClose: () 
     });
   }, []);
 
+  const SCOPE_NAMES: Record<Exclude<UsageAgentFilter, 'all'>, string> = {
+    claude: 'Claude',
+    codex: 'Codex',
+    grok: 'Grok',
+  };
   const scopeLabel = (v: UsageAgentFilter) =>
-    v === 'all' ? t('usageStats.scope.all') : v === 'claude' ? 'Claude' : 'Codex';
+    v === 'all' ? t('usageStats.scope.all') : SCOPE_NAMES[v];
   const rangeLabel = (v: UsageRange) => t(`usageStats.range.${v}`);
 
   /** 按模型排行：前 6 + Others 合并；全 $0 时按 tokens 排比例 */
@@ -379,7 +384,8 @@ export function UsageStatsModal({ open, onClose }: { open: boolean; onClose: () 
   const viewerSession: AiSession | null = viewer
     ? {
         id: viewer.sessionId,
-        sessionType: viewer.agent === 'codex' ? 'codex' : 'claude',
+        sessionType:
+          viewer.agent === 'codex' ? 'codex' : viewer.agent === 'grok' ? 'grok' : 'claude',
         title: viewer.title,
         timestamp: viewer.timestamp,
       }

@@ -348,11 +348,25 @@ export interface PreviewPaletteOptions {
   foreground: string;
 }
 
+/** `get_ai_hook_registrations` 返回的单条注册现状。对齐后端 HookRegistrationInfo。 */
+export interface HookRegistration {
+  /** 注册目标 key,回传给 register/unregister_ai_hooks 的 agents 参数 */
+  agent: 'claude' | 'codex' | 'grok';
+  /** 展示名(Claude Code / Codex / Grok) */
+  label: string;
+  /** 配置文件路径(~ 缩写) */
+  file: string;
+  /** 该文件里属于 mini-term 的事件条目数;0 = 没注册过 */
+  registered: number;
+  /** 当前版本应注册的事件总数;0 < registered < total = 旧事件集,需重新注册补齐 */
+  total: number;
+}
+
 // === AI 会话 ===
 
 export interface AiSession {
   id: string;
-  sessionType: 'claude' | 'codex';
+  sessionType: 'claude' | 'codex' | 'grok';
   title: string;
   timestamp: string; // ISO 8601
   /** 会话来源:有值 = 该 WSL 发行版内的会话,undefined = Windows 宿主会话 */
@@ -586,7 +600,7 @@ export interface AiMarker {
 
 // === 使用统计（对齐 Rust usage_stats camelCase 序列化） ===
 
-export type UsageAgentFilter = 'all' | 'claude' | 'codex';
+export type UsageAgentFilter = 'all' | 'claude' | 'codex' | 'grok';
 export type UsageRange = 'today' | 'days7' | 'days30' | 'month' | 'months3' | 'months6' | 'custom';
 
 /** 单模型价格（$/token，前端拉 models.dev 后 ÷1e6 归一） */

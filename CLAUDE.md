@@ -105,5 +105,7 @@ Rust reader → 有界 channel → 16ms 批量缓冲 → emit('pty-output') → 
 - 文件拖拽到终端会将文件路径作为文本写入 PTY（不是上传文件）
 - `WebkitAppRegion: 'drag'` 用于自定义标题栏拖拽，菜单项需设置 `no-drag` 区域
 - 分屏关闭最后一个 pane 时会关闭整个 tab（`removePane` 返回 `null` 时触发）
-- AI 会话识别有两层：Claude/Codex hook 上报（`hook_server.rs`，权威）+ 输入检测（`pty.rs` 识别键入的 `claude`/`codex`/`opencode`/`pi` 命令，含 ↑ 历史/Tab 补全的行快照兜底与输出回扫）；不做子进程名轮询
-- 只有 Claude/Codex 有可解析的会话记录文件（`mobile_mirror::agent_has_session_log`）。opencode/pi 这类**只靠输入检测识别**的 agent 拿得到状态徽章与移动端指令，但没有对话镜像、AI 历史面板与用量统计——镜像必须据此跳过启发式绑定，否则会绑到同项目 Claude/Codex 的最新会话文件，把别人的对话贴到该 pane 上
+- AI 会话识别有两层：Claude/Codex/Grok hook 上报（`hook_server.rs`，权威）+ 输入检测（`pty.rs` 识别键入的 `claude`/`codex`/`opencode`/`pi`/`grok` 命令，含 ↑ 历史/Tab 补全的行快照兜底与输出回扫）；不做子进程名轮询
+- Grok 的 hook 接入与另外两家有两处结构性差异，改动前先看 `hook_registry::register_grok_hooks` 的注释：① grok 默认还会扫描 `~/.claude/settings.json` 的 hooks（Claude 兼容层），同一事件会来两趟，sidecar 靠 `GROK_SESSION_ID` + 是否带 argv 丢弃兼容层那趟（只注册了 Claude 的用户必须放行——那是唯一来源，判据落在原生 hook 文件是否在场）；② 注册进 `~/.grok/hooks/` 的命令必须是**不含空格的裸文件名**（hook 二进制随注册复制进该目录），带空格会被 grok 丢给 shell，而 Windows 上具体是 git-bash/pwsh/powershell/cmd 由环境决定、四家引号语义互斥；事件名改由 grok 注入的 `GROK_HOOK_EVENT` 传递
+- 只有 Claude/Codex/Grok 有可解析的会话记录（`mobile_mirror::agent_has_session_log`）。opencode/pi 这类**只靠输入检测识别**的 agent 拿得到状态徽章与移动端指令，但没有对话镜像、AI 历史面板与用量统计——镜像必须据此跳过启发式绑定，否则会绑到同项目其它 agent 的最新会话文件，把别人的对话贴到该 pane 上
+- Grok 的会话记录形态与另外两家不同：一个会话是**一整个目录**（`{grok_home}/sessions/{URL 编码的 cwd}/{session-id}/`，正文 `updates.jsonl` 是 ACP 更新流，一条消息拆成多个 chunk 行、攒到边界才成一条；元信息在 `summary.json`）。定位项目走**解码目录名**而非编码项目路径，详见 `ai_sessions` 的 Grok 段注释
