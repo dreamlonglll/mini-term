@@ -6,6 +6,7 @@ import { TerminalInstance } from './TerminalInstance';
 import { StatusDot } from './StatusDot';
 import { BrandIcon } from './BrandIcon';
 import { MarkerList } from './MarkerList';
+import { PaneTabPreview } from './PaneTabPreview';
 import { showContextMenu } from '../utils/contextMenu';
 import { inferVendor } from '../utils/inferVendor';
 import { paneShowsAiSession, resolveAutoResumeCommand } from '../utils/aiResume';
@@ -225,6 +226,51 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
     );
   }, [remote, config.availableShells, projectId, activePane?.id]);
 
+  // === 非激活 tab 悬停缩略图:250ms 后弹出,移出/点击/滚动即关(时序同项目行预览) ===
+  const [tabPreview, setTabPreview] = useState<{
+    paneId: string;
+    rect: { left: number; top: number; bottom: number };
+  } | null>(null);
+  const tabPreviewTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
+
+  const closeTabPreview = useCallback(() => {
+    clearTimeout(tabPreviewTimer.current);
+    setTabPreview(null);
+  }, []);
+
+  const handleTabPreviewEnter = useCallback((e: React.MouseEvent, paneId: string) => {
+    clearTimeout(tabPreviewTimer.current);
+    // currentTarget 只在事件分发期间有效,先留住 DOM 引用;rect 到点弹时再取
+    const el = e.currentTarget as HTMLElement;
+    tabPreviewTimer.current = setTimeout(() => {
+      if (!el.isConnected) return;
+      const r = el.getBoundingClientRect();
+      setTabPreview({ paneId, rect: { left: r.left, top: r.top, bottom: r.bottom } });
+    }, 250);
+  }, []);
+
+  useEffect(() => () => clearTimeout(tabPreviewTimer.current), []);
+
+  // 渲染 gate 之外把 state 也收掉(与 ProjectList 同一双闸模式):用 X 关掉被
+  // 悬停的 tab 时点击被 stopPropagation 拦下,closeTabPreview 不触发,旧锚点
+  // 会一直残留到下次悬停
+  useEffect(() => {
+    if (!tabPreview) return;
+    const pane = node.panes.find((p) => p.id === tabPreview.paneId);
+    if (!pane || pane.id === activePane?.id) closeTabPreview();
+  }, [tabPreview, node.panes, activePane?.id, closeTabPreview]);
+
+  // tab 栏可横向滚动,布局变化时锚点失效,直接关闭
+  useEffect(() => {
+    if (!tabPreview) return;
+    window.addEventListener('scroll', closeTabPreview, true);
+    window.addEventListener('wheel', closeTabPreview, { passive: true });
+    return () => {
+      window.removeEventListener('scroll', closeTabPreview, true);
+      window.removeEventListener('wheel', closeTabPreview);
+    };
+  }, [tabPreview, closeTabPreview]);
+
   const [markerOpen, setMarkerOpen] = useState(false);
   const [markerAnchor, setMarkerAnchor] = useState<{ top: number; right: number } | null>(null);
   const markers = useAppStore(
@@ -333,15 +379,26 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
                   ? 'bg-[var(--bg-terminal)] text-[var(--text-primary)]'
                   : 'text-[var(--text-muted)] hover:text-[var(--text-secondary)] hover:bg-[var(--border-subtle)]'
               }`}
-              onClick={() => activatePane(projectId, pane.id)}
+              onClick={() => {
+                closeTabPreview();
+                activatePane(projectId, pane.id);
+              }}
               onDoubleClick={() => void renamePane(projectId, pane.id)}
+              onMouseEnter={(e) => {
+                // 激活 tab 的画面就在眼前,只有隐藏 tab 需要预览
+                if (!isActive) handleTabPreviewEnter(e, pane.id);
+              }}
+              onMouseLeave={closeTabPreview}
               onKeyDown={(e) => {
                 if (e.key === 'Enter' || e.key === ' ') {
                   e.preventDefault();
                   activatePane(projectId, pane.id);
                 }
               }}
-              onContextMenu={(e) => paneContextMenu(e, pane.id)}
+              onContextMenu={(e) => {
+                closeTabPreview();
+                paneContextMenu(e, pane.id);
+              }}
             >
               {/* 激活指示条:始终占位、未激活透明(同 SettingsModal tab 惯例)。
                   背景图皮肤下 --bg-terminal 与 --bg-elevated 几乎同色,
@@ -512,6 +569,16 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
         </div>,
         document.body,
       )}
+
+      {/* 悬停缩略图:渲染处每次重判 —— tab 被关闭/被激活那一帧就不画,不留旧锚点 */}
+      {tabPreview && (() => {
+        const previewPane = node.panes.find((p) => p.id === tabPreview.paneId);
+        if (!previewPane || previewPane.id === activePane.id) return null;
+        return createPortal(
+          <PaneTabPreview pane={previewPane} anchorRect={tabPreview.rect} />,
+          document.body,
+        );
+      })()}
     </div>
   );
 }

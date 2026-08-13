@@ -42,7 +42,7 @@ const THEME_PALETTE_KEYS = [
   'brightBlue', 'brightMagenta', 'brightCyan', 'brightWhite',
 ] as const;
 
-function themeColors(theme: Record<string, string | undefined> | undefined) {
+export function themeColors(theme: Record<string, string | undefined> | undefined) {
   const t = theme ?? {};
   return {
     palette16: THEME_PALETTE_KEYS.map((k, i) => t[k] ?? DEFAULT_PREVIEW_PALETTE[i]),
