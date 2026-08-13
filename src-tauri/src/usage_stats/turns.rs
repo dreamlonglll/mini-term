@@ -137,7 +137,7 @@ fn push_tool_events(
 /// 单个会话解析结果（Claude 主转录 + 子代理转录已合并；Codex 一文件一会话）。
 #[derive(Debug, Clone)]
 pub struct ParsedSession {
-    pub agent: &'static str, // "claude" | "codex"
+    pub agent: &'static str, // "claude" | "codex" | "grok"
     pub session_id: String,
     pub cwd: Option<String>,
     pub title: Option<String>,
@@ -695,9 +695,273 @@ pub(crate) fn parse_codex_session(
     })
 }
 
+// ─── Grok Build 会话解析 ───────────────────────────────────────
+//
+// 计费口径来自 `updates.jsonl` 里的 xAI 扩展更新 `turn_completed`,它自带
+// `usage`(整轮汇总 + 按模型分解),官方注释称其为「durable, replayable」——
+// 就是为「重连后从重放里补齐回合结局」准备的,不是流式中间态。
+//
+// **不做工具排行**:持久化的 ACP `tool_call` 更新只带人类可读的 `title`
+// (「Read file src/x.rs」这类),真正的工具名不落盘。拿 title 当工具名会往
+// Claude/Codex 的工具排行里灌进一堆自然语言标签,不如不出——token/成本/模型/
+// 会话四类统计不受影响。
+
+/// 一个 `turn_completed` 里的 usage 行 → 互斥语义的 UsageTotals。
+///
+/// grok(ACP 口径)的 `inputTokens` 是**整段 prompt 输入**,缓存读与缓存写都
+/// 折在里面;`outputTokens` 含 `reasoningTokens`。官方 headless 投影就是这么
+/// 把三个输入桶拆成互斥的(`input − cacheRead − cacheCreation`),这里照抄,
+/// 与 Claude/Codex 两侧的分桶语义对齐。
+fn usage_from_grok(u: &serde_json::Value) -> UsageTotals {
+    let full_input = u64_at(u, "inputTokens");
+    let cache_read = u64_at(u, "cachedReadTokens");
+    let cache_write = u64_at(u, "cacheCreationTokens");
+    let raw_output = u64_at(u, "outputTokens");
+    let reasoning = u64_at(u, "reasoningTokens");
+    UsageTotals {
+        input: full_input
+            .saturating_sub(cache_read)
+            .saturating_sub(cache_write),
+        output: raw_output.saturating_sub(reasoning),
+        reasoning,
+        cache_read,
+        cache_write,
+        cache_write_1h: 0, // xAI 不区分缓存写的存活期
+    }
+}
+
+/// 从一行 `updates.jsonl` 取出 `turn_completed` 的 (prompt_id, usage, 时刻)
+fn grok_turn_completed(line: &str) -> Option<(Option<String>, serde_json::Value, Option<i64>)> {
+    // 判别式在压缩 JSON 里逐字出现,先做个廉价预筛
+    if !line.contains("\"turn_completed\"") {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    let ts = v
+        .get("timestamp")
+        .and_then(|t| t.as_i64())
+        .map(|s| s * 1000);
+    let params = v.get("params").unwrap_or(&v);
+    let update = params.get("update")?;
+    if update.get("sessionUpdate").and_then(|t| t.as_str()) != Some("turn_completed") {
+        return None;
+    }
+    let usage = update.get("usage")?.clone();
+    let prompt_id = update
+        .get("prompt_id")
+        .and_then(|p| p.as_str())
+        .map(str::to_string);
+    Some((prompt_id, usage, ts))
+}
+
+/// 解析一个 grok 会话目录(`summary.json` + `updates.jsonl`)。
+///
+/// 一个 `turn_completed` 可能跨多个模型(主模型 + 子代理/小模型),`modelUsage`
+/// 按模型给出分解:每个模型出一条 Turn,模型维度的排行才不会全压在主模型上。
+/// 缺 `modelUsage`(单模型回合)时退回整轮汇总,模型名取 summary 里的当前模型。
+pub(crate) fn parse_grok_session(session_dir: &Path) -> Option<ParsedSession> {
+    let session_id = session_dir.file_name()?.to_str()?.to_string();
+    let updates = session_dir.join("updates.jsonl");
+    let lines = read_lines(&updates)?;
+
+    let summary: serde_json::Value = fs::read_to_string(session_dir.join("summary.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(serde_json::Value::Null);
+    let cwd = summary
+        .pointer("/info/cwd")
+        .and_then(|c| c.as_str())
+        .map(str::to_string);
+    let title = summary
+        .get("session_summary")
+        .and_then(|t| t.as_str())
+        .filter(|t| !t.trim().is_empty())
+        .map(str::to_string);
+    let default_model = summary
+        .get("current_model_id")
+        .and_then(|m| m.as_str())
+        .map(str::to_string);
+
+    let mut turns: Vec<Turn> = Vec::new();
+    for line in &lines {
+        let Some((prompt_id, usage, ts)) = grok_turn_completed(line) else {
+            continue;
+        };
+        // 去重键:fork 会把父会话的 updates 整段复制进新会话目录,同一个回合
+        // 因此会在两个文件里各出现一次。prompt_id 是回合的唯一标识,叠上模型名
+        // 后逐条唯一,交给聚合层的跨会话 message_id 去重(与 Claude 同一条路)。
+        let mut push = |model: Option<String>, usage: &serde_json::Value| {
+            let totals = usage_from_grok(usage);
+            if totals.total() == 0 {
+                return; // 无计费的回合(纯本地/取消)不占 calls
+            }
+            let message_id = prompt_id.as_ref().map(|p| match &model {
+                Some(m) => format!("{p}#{m}"),
+                None => p.clone(),
+            });
+            turns.push(Turn {
+                message_id,
+                model,
+                timestamp_ms: ts,
+                usage: totals,
+            });
+        };
+
+        match usage.get("modelUsage").and_then(|m| m.as_object()) {
+            Some(rows) if !rows.is_empty() => {
+                for (model, row) in rows {
+                    push(Some(model.clone()), row);
+                }
+            }
+            _ => push(default_model.clone(), &usage),
+        }
+    }
+
+    Some(ParsedSession {
+        agent: "grok",
+        session_id,
+        cwd,
+        title,
+        // 供应商归属由扫描层按 agent 归到 api.x.ai(会话本身不记 baseurl,
+        // 与 Claude 同处境)
+        provider: None,
+        mtime_ms: mtime_ms(&updates),
+        turns,
+        tool_uses: Vec::new(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- Grok Build ----
+
+    /// ACP 口径的 `inputTokens` 是整段 prompt 输入(缓存读写都折在里面),
+    /// `outputTokens` 含 reasoning。拆成互斥桶后必须与 `totalTokens` 对齐,
+    /// 否则同一批 token 会被重复计价。
+    #[test]
+    fn grok_usage_buckets_are_disjoint_and_sum_to_total() {
+        let usage = serde_json::json!({
+            "inputTokens": 1000,   // = 未缓存 300 + 缓存读 600 + 缓存写 100
+            "cachedReadTokens": 600,
+            "cacheCreationTokens": 100,
+            "outputTokens": 250,   // 含 reasoning 200
+            "reasoningTokens": 200,
+            "totalTokens": 1250
+        });
+        let t = usage_from_grok(&usage);
+        assert_eq!(t.input, 300);
+        assert_eq!(t.cache_read, 600);
+        assert_eq!(t.cache_write, 100);
+        assert_eq!(t.output, 50);
+        assert_eq!(t.reasoning, 200);
+        assert_eq!(t.total(), 1250, "分桶之和须等于 totalTokens");
+
+        // 字段缺失/异常(缓存读大于输入)时钳到 0,不出现回绕的天文数字
+        let weird = serde_json::json!({ "inputTokens": 10, "cachedReadTokens": 999 });
+        assert_eq!(usage_from_grok(&weird).input, 0);
+    }
+
+    fn grok_session_fixture(tag: &str, updates: &str, summary: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "mt-grok-usage-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let session = dir.join("0198c2f4-7e4a-7b3c-9d2e-1f0a2b3c4d5e");
+        fs::create_dir_all(&session).unwrap();
+        fs::write(session.join("updates.jsonl"), updates).unwrap();
+        fs::write(session.join("summary.json"), summary).unwrap();
+        session
+    }
+
+    const GROK_SUMMARY: &str = r#"{"info":{"id":"0198c2f4-7e4a-7b3c-9d2e-1f0a2b3c4d5e","cwd":"D:\\Git\\proj"},
+        "session_summary":"接入 grok","created_at":"2026-08-01T10:00:00Z",
+        "updated_at":"2026-08-01T11:00:00Z","current_model_id":"grok-4-1"}"#;
+
+    /// 主路径:turn_completed 的 modelUsage 按模型各出一条 turn,
+    /// 会话元信息取自 summary.json。
+    #[test]
+    fn grok_turn_completed_yields_per_model_turns() {
+        let updates = concat!(
+            // 非计费更新一律跳过
+            r#"{"timestamp":1785000000,"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hi"}}}}"#,
+            "\n",
+            r#"{"timestamp":1785000060,"method":"_x.ai/session/update","params":{"sessionId":"s","update":{"sessionUpdate":"turn_completed","prompt_id":"p1","stop_reason":"end_turn","usage":{"inputTokens":100,"outputTokens":20,"totalTokens":120,"modelUsage":{"grok-4-1":{"inputTokens":80,"outputTokens":16,"totalTokens":96},"grok-4-fast":{"inputTokens":20,"outputTokens":4,"totalTokens":24}}}}}}"#,
+            "\n",
+        );
+        let dir = grok_session_fixture("permodel", updates, GROK_SUMMARY);
+        let s = parse_grok_session(&dir).expect("应解析出会话");
+
+        assert_eq!(s.agent, "grok");
+        assert_eq!(s.session_id, "0198c2f4-7e4a-7b3c-9d2e-1f0a2b3c4d5e");
+        assert_eq!(s.cwd.as_deref(), Some(r"D:\Git\proj"));
+        assert_eq!(s.title.as_deref(), Some("接入 grok"));
+        assert_eq!(s.turns.len(), 2, "modelUsage 每个模型各出一条");
+
+        let mut models: Vec<&str> = s.turns.iter().filter_map(|t| t.model.as_deref()).collect();
+        models.sort();
+        assert_eq!(models, ["grok-4-1", "grok-4-fast"]);
+        // 时刻取信封的 unix 秒 ×1000
+        assert!(s.turns.iter().all(|t| t.timestamp_ms == Some(1_785_000_060_000)));
+        // 去重键含模型名:同一回合的两条不得互相吸收
+        let keys: std::collections::HashSet<_> =
+            s.turns.iter().filter_map(|t| t.message_id.clone()).collect();
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains("p1#grok-4-1"));
+
+        fs::remove_dir_all(dir.parent().unwrap()).ok();
+    }
+
+    /// 单模型回合没有 modelUsage:退回整轮汇总,模型名取 summary 的当前模型;
+    /// 零用量回合(取消/纯本地)不得虚增 calls。
+    #[test]
+    fn grok_falls_back_to_totals_and_drops_zero_usage() {
+        let updates = concat!(
+            r#"{"timestamp":1785000060,"method":"_x.ai/session/update","params":{"update":{"sessionUpdate":"turn_completed","prompt_id":"p1","usage":{"inputTokens":50,"outputTokens":10,"totalTokens":60}}}}"#,
+            "\n",
+            r#"{"timestamp":1785000120,"method":"_x.ai/session/update","params":{"update":{"sessionUpdate":"turn_completed","prompt_id":"p2","stop_reason":"cancelled","usage":{"inputTokens":0,"outputTokens":0,"totalTokens":0}}}}"#,
+            "\n",
+        );
+        let dir = grok_session_fixture("totals", updates, GROK_SUMMARY);
+        let s = parse_grok_session(&dir).unwrap();
+
+        assert_eq!(s.turns.len(), 1, "零用量回合应被丢弃");
+        assert_eq!(s.turns[0].model.as_deref(), Some("grok-4-1"));
+        assert_eq!(s.turns[0].usage.input, 50);
+        assert_eq!(s.turns[0].message_id.as_deref(), Some("p1#grok-4-1"));
+
+        fs::remove_dir_all(dir.parent().unwrap()).ok();
+    }
+
+    /// updates.jsonl 缺失(会话刚建)不该 panic,坏行只跳过该行
+    #[test]
+    fn grok_tolerates_missing_and_broken_lines() {
+        let updates = concat!(
+            "not json at all\n",
+            r#"{"params":{"update":{"sessionUpdate":"turn_completed"}}}"#,
+            "\n",
+            r#"{"params":{"update":{"sessionUpdate":"turn_completed","prompt_id":"p9","usage":{"inputTokens":7,"totalTokens":7}}}}"#,
+            "\n",
+        );
+        let dir = grok_session_fixture("broken", updates, "{}");
+        let s = parse_grok_session(&dir).unwrap();
+        assert_eq!(s.turns.len(), 1);
+        assert_eq!(s.turns[0].usage.input, 7);
+        // 无 summary 字段时模型未知,不能编一个
+        assert!(s.turns[0].model.is_none());
+        assert!(s.turns[0].timestamp_ms.is_none(), "无信封 timestamp 时留空");
+
+        // 会话目录里没有 updates.jsonl:返回 None,不 panic
+        let empty = dir.parent().unwrap().join("no-updates");
+        fs::create_dir_all(&empty).unwrap();
+        assert!(parse_grok_session(&empty).is_none());
+
+        fs::remove_dir_all(dir.parent().unwrap()).ok();
+    }
 
     #[test]
     fn parse_rfc3339_variants() {

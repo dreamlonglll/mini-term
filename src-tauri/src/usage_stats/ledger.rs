@@ -20,7 +20,10 @@ use tauri::{AppHandle, Emitter, Manager};
 use super::aggregate::{Aggregator, UsageStatsPayload};
 use super::pricing::{ModelPrice, PricingTable};
 use super::turns::{self, ParsedSession, Turn, UsageTotals};
-use super::{collect_claude_jobs, collect_codex_jobs, AgentFilter, ProviderResolver, SessionJob};
+use super::{
+    collect_claude_jobs, collect_codex_jobs, collect_grok_jobs, AgentFilter, ProviderResolver,
+    SessionJob,
+};
 
 /// 账本 schema 版本：结构变更时 +1。open 时版本不匹配即删表重建（账本可从
 /// JSONL 再生，空 sync_state 自动触发 backfill，无需逐版本迁移脚本）。
@@ -223,6 +226,7 @@ impl Ledger {
         let parsed = match job {
             SessionJob::Claude { main, subagents } => turns::parse_claude_session(main, subagents),
             SessionJob::Codex { path } => turns::parse_codex_session(path, thread_names),
+            SessionJob::Grok { dir } => turns::parse_grok_session(dir),
         };
         // 解析失败（文件消失/无读权限）：不记指纹，下轮枚举到再试
         let Some(s) = parsed else { return Ok(false) };
@@ -258,6 +262,9 @@ impl Ledger {
                 // 消息时由 ON CONFLICT 在会话内吸收
                 let request_id = match (&t.message_id, s.agent) {
                     (Some(id), "claude") => format!("claude:{id}"),
+                    // grok 的键是 `prompt_id#model`（一个回合可跨多个模型），
+                    // 与 Claude 同理靠它在会话内吸收 fork 复制来的重复回合
+                    (Some(id), "grok") => format!("grok:{id}"),
                     (_, "codex") => format!("codex:{i}"),
                     _ => format!("noid:{i}"),
                 };
@@ -317,6 +324,7 @@ impl Ledger {
             AgentFilter::All => None,
             AgentFilter::Claude => Some("claude"),
             AgentFilter::Codex => Some("codex"),
+            AgentFilter::Grok => Some("grok"),
         };
         let mut stmt = self.conn.prepare_cached(
             "SELECT t.session_id, t.ts_ms, t.model,
@@ -336,7 +344,7 @@ impl Ledger {
                 let agent: String = row.get(9)?;
                 sessions.push(ParsedSession {
                     // &'static str 映射（账本只会存这两种值）
-                    agent: if agent == "codex" { "codex" } else { "claude" },
+                    agent: super::agent_from_db(&agent),
                     session_id,
                     cwd: row.get(10)?,
                     title: row.get(11)?,
@@ -390,7 +398,7 @@ impl Ledger {
                 None => {
                     let agent: String = row.get(5)?;
                     sessions.push(ParsedSession {
-                        agent: if agent == "codex" { "codex" } else { "claude" },
+                        agent: super::agent_from_db(&agent),
                         session_id: session_id.clone(),
                         cwd: row.get(6)?,
                         title: row.get(7)?,
@@ -441,6 +449,13 @@ fn job_fingerprint(job: &SessionJob) -> (PathBuf, i64, i64) {
             (main.clone(), mtime, size)
         }
         SessionJob::Codex { path } => (path.clone(), turns::mtime_ms(path), size_of(path)),
+        // 指纹落在 updates.jsonl 上：目录本身的 mtime 不随正文追加推进
+        SessionJob::Grok { dir } => {
+            let updates = dir.join("updates.jsonl");
+            let mtime = turns::mtime_ms(&updates);
+            let size = size_of(&updates);
+            (updates, mtime, size)
+        }
     }
 }
 
@@ -543,6 +558,9 @@ fn sync_round(app: &AppHandle, db_path: &Path) {
     let mut jobs: Vec<SessionJob> = Vec::new();
     collect_claude_jobs(&home, &mut jobs);
     collect_codex_jobs(&home, &mut jobs);
+    if let Some(grok_home) = crate::hook_registry::grok_home() {
+        collect_grok_jobs(&grok_home.join("sessions"), &mut jobs);
+    }
     let thread_names = crate::ai_sessions::load_codex_thread_names(&home.join(".codex"));
 
     let backfill = ledger.sync_state_empty().unwrap_or(false);
@@ -761,6 +779,7 @@ mod tests {
             .filter_map(|j| match j {
                 SessionJob::Claude { main, subagents } => turns::parse_claude_session(main, subagents),
                 SessionJob::Codex { path } => turns::parse_codex_session(path, &names),
+                SessionJob::Grok { dir } => turns::parse_grok_session(dir),
             })
             .collect();
         mem.sort_by(|a, b| a.session_id.cmp(&b.session_id));

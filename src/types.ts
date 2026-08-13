@@ -586,7 +586,7 @@ export interface AiMarker {
 
 // === 使用统计（对齐 Rust usage_stats camelCase 序列化） ===
 
-export type UsageAgentFilter = 'all' | 'claude' | 'codex';
+export type UsageAgentFilter = 'all' | 'claude' | 'codex' | 'grok';
 export type UsageRange = 'today' | 'days7' | 'days30' | 'month' | 'months3' | 'months6' | 'custom';
 
 /** 单模型价格（$/token，前端拉 models.dev 后 ÷1e6 归一） */
