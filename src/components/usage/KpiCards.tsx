@@ -1,6 +1,6 @@
 import { useT } from '../../i18n';
 import type { UsageStatsPayload } from '../../types';
-import { cacheHitRate, formatCost, formatCount } from './format';
+import { cacheHitRate, formatCost, formatCount, formatTokens } from './format';
 import { useTweenedNumber } from './useTween';
 
 // === 图标（统一 16 viewBox / stroke currentColor，对齐 ActivityBar 画风）===
@@ -23,6 +23,13 @@ const ICON_CHAT = (
 const ICON_BOLT = (
   <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round">
     <path d="M8.5 2 3.5 9h3.5l-.5 5 5-7H8l.5-5z" />
+  </svg>
+);
+const ICON_STACK = (
+  <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round">
+    <ellipse cx="8" cy="3.8" rx="5" ry="1.8" />
+    <path d="M3 3.8v8.4c0 1 2.2 1.8 5 1.8s5-.8 5-1.8V3.8" />
+    <path d="M3 8c0 1 2.2 1.8 5 1.8S13 9 13 8" />
   </svg>
 );
 
@@ -59,19 +66,28 @@ function KpiCard({ icon, iconColor, label, value, valueColor }: KpiCardProps) {
 export function KpiCards({ stats }: { stats: UsageStatsPayload }) {
   const t = useT();
   const hit = cacheHitRate(stats.inputTokens, stats.cacheReadTokens, stats.cacheWriteTokens);
+  // 总 token = 副行四项之和，与排行榜 tokens（后端 UsageTotals::total）同口径
+  const totalTokens = stats.inputTokens + stats.outputTokens + stats.cacheReadTokens + stats.cacheWriteTokens;
   // 数字滚动:数据更新时从旧值补间到新值(等宽字体下无位移)
   const cost = useTweenedNumber(stats.totalCost);
+  const tokensN = useTweenedNumber(totalTokens);
   const callsN = useTweenedNumber(stats.totalCalls);
   const sessionsN = useTweenedNumber(stats.sessionCount);
   const hitN = useTweenedNumber(hit ?? 0);
   return (
-    <div className="grid grid-cols-4 gap-3">
+    <div className="grid grid-cols-5 gap-3">
       <KpiCard
         icon={ICON_WALLET}
         iconColor="var(--color-info)"
         label={t('usageStats.kpi.cost')}
         value={formatCost(cost)}
         valueColor="var(--accent)"
+      />
+      <KpiCard
+        icon={ICON_STACK}
+        iconColor="var(--color-info)"
+        label={t('usageStats.kpi.tokens')}
+        value={formatTokens(Math.round(tokensN))}
       />
       <KpiCard
         icon={ICON_PULSE}

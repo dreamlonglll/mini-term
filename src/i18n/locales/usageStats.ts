@@ -16,6 +16,7 @@ export const usageStats = {
     },
     kpi: {
       cost: "总成本",
+      tokens: "Token 数",
       calls: "调用数",
       sessions: "会话数",
       cacheHit: "缓存命中",
@@ -70,6 +71,7 @@ export const usageStats = {
     },
     kpi: {
       cost: "Cost",
+      tokens: "Tokens",
       calls: "Calls",
       sessions: "Sessions",
       cacheHit: "Cache hit",
