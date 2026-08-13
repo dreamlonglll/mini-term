@@ -294,10 +294,26 @@ fn classify_notification(notification_type: Option<&str>) -> NotificationKind {
         Some("permission_prompt") | Some("elicitation_dialog") | Some("agent_needs_input") => {
             NotificationKind::Confirmation
         }
+        // `task_complete` 是 grok 的类型（回合做完时的知会）。它必须归 Passive:
+        // 判 Confirmation 会让每次任务完成都点亮「有事等你确认」的黄灯,
+        // 而真正的完成播报另有 Stop 事件负责。
         Some("idle_prompt") | Some("auth_success") | Some("elicitation_complete")
-        | Some("elicitation_response") | Some("agent_completed") => NotificationKind::Passive,
+        | Some("elicitation_response") | Some("agent_completed") | Some("task_complete") => {
+            NotificationKind::Passive
+        }
         _ => NotificationKind::Unknown,
     }
+}
+
+/// 该 `Stop` 是否只是会话收尾时补发的那一发（grok 特有）。
+///
+/// grok 在会话结束时会额外发一次 `Stop`（`reason` 为 `channel_closed` /
+/// `shutdown`），官方文档明说它的决策输出会被忽略、只是个观察点。若照常映射成
+/// `ai-idle` + cause=`Stop`，前端 `isAiCompletion` 会认成「任务完成」——用户每次
+/// 退出 grok 都白挨一次完成提示音，紧接着 SessionEnd 才把 pane 收到 idle。
+/// Claude/Codex 的 Stop 不带 reason，判据对它们恒为假。
+fn is_session_teardown_stop(event: &str, reason: Option<&str>) -> bool {
+    event == "Stop" && matches!(reason, Some("channel_closed") | Some("shutdown"))
 }
 
 /// Notification 文案是否为「API 错误/自动重试中」类:此时 AI 仍在自己重试,
@@ -382,7 +398,12 @@ fn map_event_to_status(
     agent: Option<&str>,
     notification_type: Option<&str>,
     message: Option<&str>,
+    reason: Option<&str>,
 ) -> Option<&'static str> {
+    // grok 会话收尾补发的 Stop：不是完成，交给紧随其后的 SessionEnd 收状态
+    if is_session_teardown_stop(event, reason) {
+        return None;
+    }
     // Codex 的 PermissionRequest 在审批 UI 弹出前触发，批准后直接执行工具，
     // 直到 PostToolUse 之前不再有任何 hook 事件。若映射为 ai-idle，批准后
     // 整个命令执行期间状态都会卡在 ai-idle，且审批弹出时误报"任务完成"，
@@ -652,6 +673,7 @@ pub fn start_hook_server(
                         payload.agent.as_deref(),
                         payload.notification_type.as_deref(),
                         payload.message.as_deref(),
+                        payload.reason.as_deref(),
                     );
                     if let Some(status) = mapped {
                         // hook 事件是 AI 进程存活的直接证据:输入检测漏判启动
@@ -942,9 +964,9 @@ mod tests {
         assert!(state.is_session_ended(1, &format!("sid-{}", ENDED_SESSIONS_CAP + 1)));
     }
 
-    /// 测试便捷包装:多数用例不关心 notification_type
+    /// 测试便捷包装:多数用例不关心 notification_type / reason
     fn map_event(event: &str, agent: Option<&str>, message: Option<&str>) -> Option<&'static str> {
-        map_event_to_status(event, agent, None, message)
+        map_event_to_status(event, agent, None, message, None)
     }
 
     #[test]
@@ -1090,6 +1112,7 @@ mod tests {
                 Some("claude-code"),
                 Some("permission_prompt"),
                 Some("Allow Bash to run `gh api --rate-limit`?"),
+                None,
             ),
             Some("ai-idle")
         );
@@ -1100,6 +1123,7 @@ mod tests {
                 Some("claude-code"),
                 None,
                 Some("API Error: 529 Overloaded · Retrying…"),
+                None,
             ),
             Some("ai-working")
         );
@@ -1175,5 +1199,90 @@ mod tests {
         assert_eq!(event_cause("Elicitation", None, None), "Elicitation");
         assert_eq!(event_cause("Stop", None, None), "Stop");
         assert_eq!(event_cause("UserPromptSubmit", None, None), "UserPromptSubmit");
+    }
+
+    // ---- Grok Build 特有语义 ----
+
+    /// grok 没有 PermissionRequest 事件,「等待授权」只从 Notification 的
+    /// `permission_prompt` 类型认出来——这是它唯一的黄灯来源。
+    #[test]
+    fn grok_permission_prompt_lights_the_attention_lamp() {
+        assert_eq!(
+            event_cause("Notification", Some("permission_prompt"), None),
+            "PermissionRequest"
+        );
+        assert!(is_attention_cause(event_cause(
+            "Notification",
+            Some("permission_prompt"),
+            None
+        )));
+    }
+
+    /// grok 的 `task_complete` 是「回合做完了」的知会,不是待办:归 Passive,
+    /// 否则每完成一次任务就点一盏「有事等你确认」的黄灯。
+    #[test]
+    fn grok_task_complete_notification_is_passive() {
+        assert_eq!(
+            classify_notification(Some("task_complete")),
+            NotificationKind::Passive
+        );
+        assert_eq!(
+            event_cause("Notification", Some("task_complete"), None),
+            "Notification"
+        );
+        assert!(!is_attention_cause("Notification"));
+    }
+
+    /// 会话收尾补发的 Stop 不得被当成任务完成(否则每次退出 grok 都白响一声)。
+    /// 收状态交给紧随其后的 SessionEnd。
+    #[test]
+    fn grok_teardown_stop_is_not_a_completion() {
+        for reason in ["channel_closed", "shutdown"] {
+            assert!(is_session_teardown_stop("Stop", Some(reason)));
+            assert_eq!(
+                map_event_to_status("Stop", Some("grok"), None, None, Some(reason)),
+                None,
+                "reason={reason} 的 Stop 不该改写状态"
+            );
+        }
+        // 正常回合结束的 Stop 照旧映射 ai-idle 并被前端认作完成
+        assert_eq!(
+            map_event_to_status("Stop", Some("grok"), None, None, Some("end_turn")),
+            Some("ai-idle")
+        );
+        // Claude/Codex 的 Stop 不带 reason,判据对它们恒为假
+        assert!(!is_session_teardown_stop("Stop", None));
+        assert_eq!(
+            map_event_to_status("Stop", Some("claude-code"), None, None, None),
+            Some("ai-idle")
+        );
+        // SessionEnd 自带的 reason 不能被这条规则误伤(它走的是另一条分支)
+        assert!(!is_session_teardown_stop("SessionEnd", Some("shutdown")));
+    }
+
+    /// grok 会用到的其余事件都必须有状态映射,漏一个就是一段状态空洞
+    #[test]
+    fn grok_event_set_is_fully_mapped() {
+        for (event, expected) in [
+            ("SessionStart", "ai-idle"),
+            ("UserPromptSubmit", "ai-working"),
+            ("PreToolUse", "ai-working"),
+            ("PostToolUse", "ai-working"),
+            ("PostToolUseFailure", "ai-working"),
+            ("PermissionDenied", "ai-working"),
+            ("SubagentStart", "ai-working"),
+            ("SubagentStop", "ai-working"),
+            ("PreCompact", "ai-working"),
+            ("PostCompact", "ai-working"),
+            ("Stop", "ai-idle"),
+            ("StopFailure", "ai-idle"),
+            ("Notification", "ai-idle"),
+        ] {
+            assert_eq!(
+                map_event(event, Some("grok"), None),
+                Some(expected),
+                "{event} 无状态映射"
+            );
+        }
     }
 }

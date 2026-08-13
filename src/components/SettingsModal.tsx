@@ -996,9 +996,10 @@ function AiHookSettings() {
   const [snippetData, setSnippetData] = useState<{
     claude: { file: string; content: string };
     codex: { files: { file: string; content: string; note?: string }[] };
+    grok: { files: { file: string; content: string; note?: string }[] };
   } | null>(null);
   const [showSnippet, setShowSnippet] = useState(false);
-  const [snippetTab, setSnippetTab] = useState<'claude' | 'codex'>('claude');
+  const [snippetTab, setSnippetTab] = useState<'claude' | 'codex' | 'grok'>('claude');
 
   const refreshHookStatus = useCallback(() => {
     invoke<{ port: number; running: boolean }>('get_hook_status').then(setHookStatus);
@@ -1126,7 +1127,7 @@ function AiHookSettings() {
         {showSnippet && snippetData && (
           <div className="rounded-[var(--radius-sm)] bg-[var(--bg-base)] border border-[var(--border-default)] overflow-hidden">
             <div className="flex border-b border-[var(--border-subtle)]">
-              {(['claude', 'codex'] as const).map((tab) => (
+              {(['claude', 'codex', 'grok'] as const).map((tab) => (
                 <button
                   key={tab}
                   className={`flex-1 py-1.5 text-sm transition-colors ${
@@ -1136,7 +1137,7 @@ function AiHookSettings() {
                   }`}
                   onClick={() => setSnippetTab(tab)}
                 >
-                  {tab === 'claude' ? 'Claude Code' : 'Codex'}
+                  {tab === 'claude' ? 'Claude Code' : tab === 'codex' ? 'Codex' : 'Grok'}
                 </button>
               ))}
             </div>
@@ -1147,7 +1148,7 @@ function AiHookSettings() {
                   {snippetData.claude.content}
                 </>
               ) : (
-                snippetData.codex.files.map((f, i) => (
+                (snippetTab === 'codex' ? snippetData.codex : snippetData.grok).files.map((f, i) => (
                   <div key={f.file} className={i > 0 ? 'mt-3 pt-3 border-t border-[var(--border-subtle)]' : ''}>
                     <div className="text-[var(--text-secondary)] mb-1">
                       {f.file}{f.note ? ` (${f.note})` : ''}

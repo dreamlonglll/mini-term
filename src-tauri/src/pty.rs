@@ -383,7 +383,11 @@ impl InputState {
 /// basename **全等**，`pip install` / `ping` / `pi.py` 都不会命中；它的
 /// `-p/--print`、`-h/--help`、`-v/--version` 与下面的非交互标志逐一对齐，
 /// 退出用的 `/quit` 也已在 `AI_EXIT_COMMANDS` 里，无需为它开特例。
-const AI_COMMANDS: &[&str] = &["claude", "codex", "opencode", "pi"];
+///
+/// `grok`（xai-org/grok-build）的官方安装把二进制铺成 `grok`（artifact 名是
+/// `xai-grok-pager`），非交互用 `-p`、`--version`/`--help` 也与下面对齐；
+/// `--resume` / `--trust` 都是交互式启动，不该进非交互列表。
+const AI_COMMANDS: &[&str] = &["claude", "codex", "opencode", "pi", "grok"];
 
 /// 这些标志表示非交互命令（仅输出信息后退出），不应触发 AI 会话状态
 const NON_INTERACTIVE_FLAGS: &[&str] = &["-v", "--version", "-h", "--help", "-p", "--print"];
@@ -1788,6 +1792,34 @@ mod tests {
         let mgr = PtyManager::new();
         mgr.track_input(1, "pi\r");
         assert!(mgr.is_ai_session(1));
+    }
+
+    #[test]
+    fn detect_grok_command() {
+        let mgr = PtyManager::new();
+        mgr.track_input(1, "grok\r");
+        assert!(mgr.is_ai_session(1));
+        assert_eq!(mgr.ai_session_agent(1).as_deref(), Some("grok"));
+    }
+
+    /// `--resume` / `--trust` 是交互式启动（前者恢复会话、后者授信项目 hook），
+    /// 不能因为带参数就被当成非交互命令。
+    #[test]
+    fn grok_with_interactive_args() {
+        for cmd in ["grok --resume\r", "grok --trust\r", "grok --resume sid-1\r"] {
+            let mgr = PtyManager::new();
+            mgr.track_input(1, cmd);
+            assert!(mgr.is_ai_session(1), "{cmd} 应进入 AI 会话");
+        }
+    }
+
+    #[test]
+    fn grok_non_interactive_flags_not_ai_session() {
+        for cmd in ["grok -p \"hello\"\r", "grok --version\r", "grok -h\r"] {
+            let mgr = PtyManager::new();
+            mgr.track_input(1, cmd);
+            assert!(!mgr.is_ai_session(1), "{cmd} 不应进入 AI 会话");
+        }
     }
 
     #[test]
