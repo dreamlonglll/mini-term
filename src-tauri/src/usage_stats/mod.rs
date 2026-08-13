@@ -12,6 +12,8 @@ enum SessionJob {
     /// Claude 主转录 + 其子代理转录（subagents/ 下全部 .jsonl，独立计费必须纳入）
     Claude { main: PathBuf, subagents: Vec<PathBuf> },
     Codex { path: PathBuf },
+    /// Grok 一个会话是一整个目录（summary.json + updates.jsonl）
+    Grok { dir: PathBuf },
 }
 
 impl SessionJob {
@@ -23,6 +25,9 @@ impl SessionJob {
                 .map(|p| turns::mtime_ms(p))
                 .fold(turns::mtime_ms(main), i64::max),
             SessionJob::Codex { path } => turns::mtime_ms(path),
+            // 取 updates.jsonl 而非目录：目录 mtime 在多数文件系统上只反映
+            // 条目增删，正文追加不会推进它，增量同步会因此漏掉新回合
+            SessionJob::Grok { dir } => turns::mtime_ms(&dir.join("updates.jsonl")),
         }
     }
 }
@@ -88,6 +93,32 @@ fn collect_codex_jobs(home: &Path, jobs: &mut Vec<SessionJob>) {
     jobs.extend(paths.into_iter().map(|path| SessionJob::Codex { path }));
 }
 
+/// 枚举 `{grok_home}/sessions/<编码 cwd>/<session-id>/` 下的全部会话。
+///
+/// 与另外两家一样全量入账本，项目 scope 交给查询层按 cwd 终判——这里刻意
+/// **不**解码组目录名去筛：cwd 以 `summary.json` 里的 `info.cwd` 为准，
+/// 会话迁移（`/fork --worktree`、目录改名）后目录名会与之不一致。
+fn collect_grok_jobs(sessions_root: &Path, jobs: &mut Vec<SessionJob>) {
+    let Ok(groups) = fs::read_dir(sessions_root) else {
+        return;
+    };
+    for group in groups.flatten() {
+        let group_path = group.path();
+        if !group_path.is_dir() {
+            continue;
+        }
+        let Ok(entries) = fs::read_dir(&group_path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if dir.is_dir() && dir.join("updates.jsonl").is_file() {
+                jobs.push(SessionJob::Grok { dir });
+            }
+        }
+    }
+}
+
 /// baseurl → 展示 host（保留端口，中转站常以端口区分）。
 fn url_host(url: &str) -> Option<String> {
     let s = url.trim();
@@ -103,11 +134,17 @@ fn url_host(url: &str) -> Option<String> {
     }
 }
 
+/// grok 的 API 归属。会话记录不带 baseurl（与 Claude 同处境），而 grok 的自定义
+/// 模型 baseUrl 是按模型配的、不是按会话记的，无从对历史会话精确归因——统一归到
+/// 官方 host，与 Claude 缺省回落 api.anthropic.com 同口径。
+const GROK_HOST: &str = "api.x.ai";
+
 /// 供应商归属解析（baseurl 维度排行）。
 /// - Claude 转录不记录 baseurl：整体按当前 ~/.claude/settings.json 的
 ///   env.ANTHROPIC_BASE_URL 归桶（缺省 api.anthropic.com）——历史会话按当前配置近似。
 /// - Codex 按 session_meta.model_provider 查 ~/.codex/config.toml 的
 ///   model_providers.<id>.base_url；查不到回退 id（内置 "openai" → api.openai.com）。
+/// - Grok 恒为 `api.x.ai`（见 `GROK_HOST`）。
 struct ProviderResolver {
     claude_host: String,
     codex_hosts: HashMap<String, String>,
@@ -144,6 +181,9 @@ impl ProviderResolver {
         if s.agent == "claude" {
             return self.claude_host.clone();
         }
+        if s.agent == "grok" {
+            return GROK_HOST.to_string();
+        }
         match s.provider.as_deref() {
             Some(id) => self.codex_hosts.get(id).cloned().unwrap_or_else(|| {
                 if id == "openai" { "api.openai.com".into() } else { id.to_string() }
@@ -172,6 +212,17 @@ pub enum AgentFilter {
     All,
     Claude,
     Codex,
+    Grok,
+}
+
+/// 账本里存的 agent 字符串 → `ParsedSession` 要的 `&'static str`。
+/// 未知值一律按 claude（账本只会写入这三种，兜底只为不 panic）。
+pub(super) fn agent_from_db(agent: &str) -> &'static str {
+    match agent {
+        "codex" => "codex",
+        "grok" => "grok",
+        _ => "claude",
+    }
 }
 
 #[cfg(test)]

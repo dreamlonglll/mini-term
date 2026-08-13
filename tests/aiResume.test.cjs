@@ -16,10 +16,19 @@ test('claude UUID 形态拼出 --resume 命令', () => {
   );
 });
 
-test('codex 走 codex resume,其余 agent 值一律按 claude', () => {
+test('codex/grok 各走各的续接命令,其余 agent 值一律按 claude', () => {
   assert.equal(buildResumeCommand('codex', 'abc_DEF-123'), 'codex resume abc_DEF-123');
+  assert.equal(
+    buildResumeCommand('grok', '0198c2f4-7e4a-7b3c-9d2e-1f0a2b3c4d5e'),
+    'grok --resume 0198c2f4-7e4a-7b3c-9d2e-1f0a2b3c4d5e',
+  );
   assert.equal(buildResumeCommand('claude', 'abc'), 'claude --resume abc');
   assert.equal(buildResumeCommand(undefined, 'abc'), 'claude --resume abc');
+});
+
+test('grok 的 id 同样过白名单:元字符不得被拼进命令行', () => {
+  assert.equal(buildResumeCommand('grok', 'a; rm -rf ~'), null);
+  assert.equal(buildResumeCommand('grok', ''), null);
 });
 
 // --- 注入面:id 来自持久化布局与会话 JSONL,均不可信 ---

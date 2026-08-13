@@ -1197,13 +1197,16 @@ mod tests {
         // "面板说没问题、手机上却永远等不到 AI 会话")
         assert!(mobile_relay_check_launcher_command("claude".into()));
         assert!(mobile_relay_check_launcher_command("  codex  ".into()));
+        assert!(mobile_relay_check_launcher_command("grok".into()));
         assert!(mobile_relay_check_launcher_command(
             "claude --dangerously-skip-permissions".into()
         ));
+        assert!(mobile_relay_check_launcher_command("grok --resume".into()));
         // 非 AI CLI / 非交互标志:提示会被识别不了
         assert!(!mobile_relay_check_launcher_command("npm test".into()));
         assert!(!mobile_relay_check_launcher_command("claude -p 'hi'".into()));
         assert!(!mobile_relay_check_launcher_command("codex --version".into()));
+        assert!(!mobile_relay_check_launcher_command("grok -p 'hi'".into()));
         assert!(!mobile_relay_check_launcher_command(String::new()));
     }
 

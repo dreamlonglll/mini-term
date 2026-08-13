@@ -22,10 +22,12 @@ const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 /** 缓存格式版本：建键规则变更时 +1。旧缓存不再当新鲜值用（仍可离线兜底） */
 const CACHE_VERSION = 2;
 
-/** 一方 provider：同一模型被多家登记时，官方目录的价格权威 */
-const FIRST_PARTY_PROVIDERS = new Set(['anthropic', 'openai']);
+/** 一方 provider：同一模型被多家登记时，官方目录的价格权威。
+ *  随 grok 用量统计一并纳入 xai —— models.dev 上 `grok-*` 同样被几十家聚合商
+ *  以各自的价登记，不加进来 grok 的成本会按某个随机聚合商的报价算。 */
+const FIRST_PARTY_PROVIDERS = new Set(['anthropic', 'openai', 'xai']);
 /** 模型 id 自带一方前缀的次优先（如 `anthropic/claude-opus-5` 来自聚合商目录） */
-const FIRST_PARTY_HINTS = ['anthropic', 'openai'];
+const FIRST_PARTY_HINTS = ['anthropic', 'openai', 'xai'];
 
 interface CachedPricing {
   /** v1 缓存无此字段（按原始 modelId 建的键） */

@@ -98,8 +98,12 @@ pub fn run() {
                 }
                 // 注册过的用户补上新版本新增的 hook 事件（详见
                 // hook_registry::sync_claude_hooks_if_registered）。读写用户配置
-                // 文件，扔后台线程做，不挡启动。
-                std::thread::spawn(hook_registry::sync_claude_hooks_if_registered);
+                // 文件，扔后台线程做，不挡启动。grok 那条还兼职刷新 hooks 目录里
+                // 的二进制副本（mini-term 升级后旧副本会滞留）。
+                std::thread::spawn(|| {
+                    hook_registry::sync_claude_hooks_if_registered();
+                    hook_registry::sync_grok_hooks_if_registered();
+                });
             }
 
             // 启动进程监控（传入 hook_state 实现 hook 优先 + 轮询降级）
@@ -210,6 +214,7 @@ pub fn run() {
             search::cancel_search,
             hook_registry::register_ai_hooks,
             hook_registry::unregister_ai_hooks,
+            hook_registry::get_ai_hook_registrations,
             hook_registry::get_hook_config_snippet,
             hook_registry::get_hook_status,
             hook_server::toggle_hook_server,

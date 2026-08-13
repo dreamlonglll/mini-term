@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.11.3-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.12.0-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -59,7 +59,9 @@ Not just "it finished" — when the AI stops to **ask for tool permission**, nee
 
 And once the window is out of sight, the **status bar icon** takes over (Windows tray / macOS menu bar): yellow = awaiting confirmation, blue = working, green = unread completion, gray = quiet. Left-click and you land **on the session that needs you** — it switches projects, activates the specific pane and focuses the terminal, prioritized as "awaiting confirmation / error > finished first > working", the same ordering the title bar status light uses. The right-click menu lists **every project with an AI session** and its status (including ⚪ idle ones — not just the busy ones); picking a project jumps to the pane in it most in need of attention. If you'd rather it not change your current view, turn that off in Settings.
 
-Beyond Claude / Codex, **opencode and pi** are recognized too — not through hooks, but by detecting the command you type. Status lights, completion announcements, and phone-side commands all work the same. What they don't have is a parseable local session log, so the conversation mirror, the AI history panel, and usage stats stay empty for them — and they never latch onto a Claude / Codex session from the same project instead.
+**Grok Build** (xAI's terminal agent, `grok`) is a first-class citizen alongside Claude and Codex: hook-reported status, conversation mirror, AI history panel, and usage stats all work. Two quirks are handled for you, worth knowing only if something looks off: it also reads hooks out of `~/.claude/settings.json` by default, so the same event can arrive twice — Mini-Term recognizes and drops the duplicate; and it delivers "waiting for your approval" as a notification type rather than a dedicated permission event, which still lights the amber lamp.
+
+Beyond Claude / Codex / Grok, **opencode and pi** are recognized too — not through hooks, but by detecting the command you type. Status lights, completion announcements, and phone-side commands all work the same. What they don't have is a parseable local session log, so the conversation mirror, the AI history panel, and usage stats stay empty for them — and they never latch onto another agent's session from the same project instead.
 
 Once hooks are reporting, they are the status source for that pane: completion is keyed to the `Stop` event alone, so a permission prompt — also a "waiting for you" state — is not announced as a finished task. The remaining trouble is a **stuck badge**: `Stop` simply doesn't fire in several cases (a turn ending on an API error, you hitting Esc to interrupt), each of which is now covered by its own official event. On top of that sits a stall check: when both the status and the terminal output have been silent for 10 seconds the badge comes down, and if an exit was already triggered (Ctrl+D, double Ctrl+C, `/exit`) the pane is treated as exited. The fallback's verdict is written once and never oscillates, so there is no repeat of the early-version behavior where one task announced itself complete every twenty-odd seconds.
 
