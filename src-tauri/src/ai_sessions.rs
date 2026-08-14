@@ -1406,9 +1406,243 @@ fn read_grok_session_content(
     read_grok_messages_from_file(&path)
 }
 
+// ===== 会话分支链路（session lineage，设计: docs/plans/2026-08-14-session-branch-tree-design.md）=====
+
+/// Claude 分支会话的复制行从文件头就带 forkedFrom（首行即含），普通会话则整
+/// 个文件都没有；前部可能垫着若干 summary/meta 行，因此扫头部一段而非只看首行。
+const CLAUDE_LINEAGE_HEAD_LINES: usize = 100;
+
+/// 会话分支边：session_id fork 自 parent_session_id。
+/// agent 字段随边携带（"claude" | "codex"），新 agent 只需产出同构边即可入树。
+#[derive(serde::Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct LineageEdge {
+    pub agent: String,
+    pub session_id: String,
+    pub parent_session_id: String,
+    /// 分叉点在父会话中的消息 uuid，仅 Claude 有此精度
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fork_point_uuid: Option<String>,
+}
+
+/// 从 Claude 会话 jsonl 头部行中提取分支边。行级纯函数。
+/// 取首个 `forkedFrom: {sessionId, messageUuid}`；坏行跳过继续。
+pub(crate) fn claude_fork_edge_from_lines<'a>(
+    session_id: &str,
+    lines: impl Iterator<Item = &'a str>,
+) -> Option<LineageEdge> {
+    for line in lines.take(CLAUDE_LINEAGE_HEAD_LINES) {
+        // 便宜的字符串预筛：绝大多数行不含该键，省掉 JSON 解析
+        if !line.contains("\"forkedFrom\"") {
+            continue;
+        }
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(ff) = obj.get("forkedFrom") else {
+            continue;
+        };
+        let parent = ff.get("sessionId").and_then(|v| v.as_str()).unwrap_or("");
+        if parent.is_empty() || parent == session_id {
+            continue;
+        }
+        return Some(LineageEdge {
+            agent: "claude".to_string(),
+            session_id: session_id.to_string(),
+            parent_session_id: parent.to_string(),
+            fork_point_uuid: ff
+                .get("messageUuid")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+        });
+    }
+    None
+}
+
+/// 从 Codex session_meta 行中提取分支边。行级纯函数。
+/// subagent 线程（thread_source == "subagent"）也带 forked_from_id，但那是主会
+/// 话派生的子 agent 而非用户分支，丢弃；自身 id 取 payload.id —— fork 场景下
+/// payload.session_id 是根线程 id，不可用作自身身份。
+pub(crate) fn codex_fork_edge_from_meta_line(line: &str) -> Option<LineageEdge> {
+    let obj: serde_json::Value = serde_json::from_str(line).ok()?;
+    if obj.get("type").and_then(|t| t.as_str()) != Some("session_meta") {
+        return None;
+    }
+    if obj.pointer("/payload/thread_source").and_then(|v| v.as_str()) == Some("subagent") {
+        return None;
+    }
+    let id = obj.pointer("/payload/id").and_then(|v| v.as_str())?;
+    let parent = obj
+        .pointer("/payload/forked_from_id")
+        .and_then(|v| v.as_str())?;
+    if id.is_empty() || parent.is_empty() || parent == id {
+        return None;
+    }
+    Some(LineageEdge {
+        agent: "codex".to_string(),
+        session_id: id.to_string(),
+        parent_session_id: parent.to_string(),
+        fork_point_uuid: None,
+    })
+}
+
+fn scan_claude_lineage(project_path: &str) -> Vec<LineageEdge> {
+    let Some(home) = home_dir() else {
+        return vec![];
+    };
+    let projects_dir = home.join(".claude").join("projects");
+    if !projects_dir.exists() {
+        return vec![];
+    }
+    let mut edges = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for dir in find_claude_project_dirs_in(&projects_dir, project_path, PathStyle::Windows) {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(id) = path.file_stem().and_then(|s| s.to_str()).map(String::from) else {
+                continue;
+            };
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            let Ok(file) = fs::File::open(&path) else {
+                continue;
+            };
+            let head: Vec<String> = BufReader::new(file)
+                .lines()
+                .map_while(Result::ok)
+                .take(CLAUDE_LINEAGE_HEAD_LINES)
+                .collect();
+            if let Some(edge) = claude_fork_edge_from_lines(&id, head.iter().map(String::as_str)) {
+                edges.push(edge);
+            }
+        }
+    }
+    edges
+}
+
+fn scan_codex_lineage(project_path: &str) -> Vec<LineageEdge> {
+    let Some(home) = home_dir() else {
+        return vec![];
+    };
+    let sessions_dir = home.join(".codex").join("sessions");
+    if !sessions_dir.exists() {
+        return vec![];
+    }
+    let normalized_project = PathStyle::Windows.normalize(project_path);
+    let mut paths = Vec::new();
+    collect_codex_session_paths(&sessions_dir, &mut paths);
+    sort_newest_session_paths(&mut paths, MAX_CODEX_SESSION_FILES_TO_SCAN);
+    let mut edges = Vec::new();
+    for path in paths {
+        let Ok(file) = fs::File::open(&path) else {
+            continue;
+        };
+        // 与 try_read_codex_session 同口径：前 5 行找 session_meta，cwd 精确匹配本项目
+        for line in BufReader::new(file).lines().map_while(Result::ok).take(5) {
+            let Some(meta) = codex_meta_from_line(&line) else {
+                continue;
+            };
+            if PathStyle::Windows.normalize(&meta.cwd) == normalized_project {
+                if let Some(edge) = codex_fork_edge_from_meta_line(&line) {
+                    edges.push(edge);
+                }
+            }
+            break;
+        }
+    }
+    edges
+}
+
+/// 扫描项目的会话分支链路。Claude 消息级（forkedFrom）+ Codex 会话级
+/// （forked_from_id）；Grok 的 summary.json parent 引用与 WSL / SSH 远程来源
+/// 暂不参与（能力位预留，见设计文档）。
+#[tauri::command]
+pub fn scan_session_lineage(project_path: String) -> Vec<LineageEdge> {
+    let mut edges = scan_claude_lineage(&project_path);
+    edges.extend(scan_codex_lineage(&project_path));
+    edges
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- 会话分支链路 ----
+
+    #[test]
+    fn claude_fork_edge_takes_first_forked_from() {
+        let lines = [
+            r#"{"type":"summary","summary":"t","leafUuid":"x"}"#,
+            r#"{"uuid":"u1","sessionId":"child","forkedFrom":{"sessionId":"parent","messageUuid":"m1"},"type":"user"}"#,
+            r#"{"uuid":"u2","sessionId":"child","forkedFrom":{"sessionId":"other","messageUuid":"m2"},"type":"user"}"#,
+        ];
+        let edge = claude_fork_edge_from_lines("child", lines.iter().copied()).unwrap();
+        assert_eq!(edge.agent, "claude");
+        assert_eq!(edge.session_id, "child");
+        assert_eq!(edge.parent_session_id, "parent");
+        assert_eq!(edge.fork_point_uuid.as_deref(), Some("m1"));
+    }
+
+    #[test]
+    fn claude_fork_edge_none_without_pointer_and_skips_bad_lines() {
+        let plain = [r#"{"uuid":"u1","sessionId":"s","type":"user"}"#];
+        assert!(claude_fork_edge_from_lines("s", plain.iter().copied()).is_none());
+        // 坏 JSON 行含关键字也不 panic，继续找到后面的合法行
+        let mixed = [
+            r#"{"forkedFrom": 截断坏行"#,
+            r#"{"forkedFrom":{"sessionId":"p"},"type":"user"}"#,
+        ];
+        let edge = claude_fork_edge_from_lines("c", mixed.iter().copied()).unwrap();
+        assert_eq!(edge.parent_session_id, "p");
+        assert_eq!(edge.fork_point_uuid, None);
+    }
+
+    #[test]
+    fn claude_fork_edge_rejects_self_and_empty_parent() {
+        let self_ref = [r#"{"forkedFrom":{"sessionId":"c","messageUuid":"m"}}"#];
+        assert!(claude_fork_edge_from_lines("c", self_ref.iter().copied()).is_none());
+        let empty = [r#"{"forkedFrom":{"sessionId":"","messageUuid":"m"}}"#];
+        assert!(claude_fork_edge_from_lines("c", empty.iter().copied()).is_none());
+    }
+
+    #[test]
+    fn claude_fork_edge_ignores_beyond_head_cap() {
+        let mut lines: Vec<String> = (0..CLAUDE_LINEAGE_HEAD_LINES)
+            .map(|i| format!(r#"{{"uuid":"u{i}","type":"user"}}"#))
+            .collect();
+        lines.push(r#"{"forkedFrom":{"sessionId":"p","messageUuid":"m"}}"#.to_string());
+        assert!(claude_fork_edge_from_lines("c", lines.iter().map(String::as_str)).is_none());
+    }
+
+    #[test]
+    fn codex_fork_edge_from_meta() {
+        let line = r#"{"type":"session_meta","payload":{"id":"child","session_id":"root","forked_from_id":"parent","thread_source":"user","cwd":"/p"}}"#;
+        let edge = codex_fork_edge_from_meta_line(line).unwrap();
+        assert_eq!(edge.agent, "codex");
+        // 自身 id 必须取 payload.id，不能取 payload.session_id（fork 下那是根线程 id）
+        assert_eq!(edge.session_id, "child");
+        assert_eq!(edge.parent_session_id, "parent");
+        assert_eq!(edge.fork_point_uuid, None);
+    }
+
+    #[test]
+    fn codex_fork_edge_skips_subagent_and_missing_pointer() {
+        let subagent = r#"{"type":"session_meta","payload":{"id":"c","forked_from_id":"p","thread_source":"subagent"}}"#;
+        assert!(codex_fork_edge_from_meta_line(subagent).is_none());
+        let no_pointer = r#"{"type":"session_meta","payload":{"id":"c","cwd":"/p"}}"#;
+        assert!(codex_fork_edge_from_meta_line(no_pointer).is_none());
+        let self_ref = r#"{"type":"session_meta","payload":{"id":"c","forked_from_id":"c"}}"#;
+        assert!(codex_fork_edge_from_meta_line(self_ref).is_none());
+        let not_meta = r#"{"type":"response_item","payload":{"id":"c","forked_from_id":"p"}}"#;
+        assert!(codex_fork_edge_from_meta_line(not_meta).is_none());
+    }
 
     // ---- Grok Build ----
 
