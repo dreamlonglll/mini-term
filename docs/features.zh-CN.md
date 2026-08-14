@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.12.0-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.12.1-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -166,7 +166,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
   - **全局状态灯** — 紧挨项目切换器右侧，汇总所有项目所有 pane 的最紧急一档（异常 > 待确认 > 处理中 > 已完成），点击跳到「下一个该我处理」的会话：待确认 / 异常优先，其次是**最先完成**的那个，最后才是还在跑的。与托盘右键菜单的排序有意不同——托盘回答「哪些项目还活着」，状态灯回答「下一件该做什么」
   - 拖拽走 Tauri `startDragging` 而非 `-webkit-app-region`，避开 WebView2 模态循环导致的输入锁定（v0.2.16 修过的老问题）；双击顶栏最大化 / 还原
 - **Blueprint 蓝图皮肤** — 可选科幻风蓝图皮肤，网格背景 + 角标记 + 光晕效果，支持深色 / 日间两种模式，终端配色同步切换
-- **外置主题包（Dream Skin 兼容）** — 「设置 → 外观 → 主题与语言」可从文件夹或 zip 导入第三方皮肤，落在 `{app_data_dir}/themes/<themeId>/`（`theme.json` 必需，`theme.css` / 背景图可选）。同一区的「生成示例」把一份可直接改的示例皮肤写进 `themes/example/`（`theme.json` + `theme.css` + 逐字段说明的 `README.md`，改完保存即热重载）；示例内容与仓库 [`docs/theme-pack-example/`](theme-pack-example/) 是**同一份文件**（`include_str!` 编译期嵌入，文档与产物不会漂开），目录已存在时报错而非覆盖，用户改过的那份不会被静默抹掉。包内带 `manifest.json` 时逐文件核对 bytes + sha256 防损坏；导入先落暂存目录、校验通过才原子换入，坏包不会连累同名的既有皮肤。皮肤的明暗由作者在 `theme.json` 的 `appearance` 定死，激活期间内置主题按钮置为未选中态。改动包内文件即热重载（300ms 防抖）。皮肤可声明背景图，此时终端底色转半透明压在氛围层上，WebGL 渲染退回 DOM（上游 canvas 不透明限制），切回不透明主题自动恢复；此时作者写在 `terminal.background` 的底色会被忽略——它在展开顺序上排在透明化之后，照着内置主题抄全 24 字段的皮肤本会把氛围图整块盖死。导入的 `theme.css` 过卫生检查：256KB 上限、禁 `@import`、指向包外的引用一律拒 —— 检查在剥掉注释、还原 CSS 转义后的取样上做，`url()` 与裸字符串双查（Chromium 认 `image-set("https://…" 1x)`，不带 `url()` 照样发请求），`url(\68 ttps://…)` 这类转义写法同样挡得住。`theme.json` 的 `tokens` 逃生舱走同一把尺子：键名限 `--` 开头的 CSS 变量、值过同一道闸——键名不带 `--` 时 `setProperty` 设的是**真实 CSS 属性**，否则一行 `{"background-image":"url(https://…)"}` 就绕开了上面所有检查（`tauri.conf.json` 的 csp 为 null，这是唯一一道闸）
+- **外置主题包（Dream Skin 兼容）** — 「设置 → 外观 → 主题与语言」可从文件夹或 zip 导入第三方皮肤，落在 `{app_data_dir}/themes/<themeId>/`（`theme.json` 必需，`theme.css` / 背景图可选）。同一区的「生成示例」把一份可直接改的示例皮肤写进 `themes/example/`（`theme.json` + `theme.css` + 逐字段说明的 `README.md`，改完保存即热重载）；示例内容与仓库 [`docs/theme-pack-example/`](theme-pack-example/) 是**同一份文件**（`include_str!` 编译期嵌入，文档与产物不会漂开），目录已存在时报错而非覆盖，用户改过的那份不会被静默抹掉。包内带 `manifest.json` 时逐文件核对 bytes + sha256 防损坏；导入先落暂存目录、校验通过才原子换入，坏包不会连累同名的既有皮肤。皮肤的明暗由作者在 `theme.json` 的 `appearance` 定死，激活期间内置主题按钮置为未选中态。改动包内文件即热重载（300ms 防抖）。皮肤可声明背景图，此时终端底色转半透明压在氛围层上，WebGL 渲染退回 DOM（上游 canvas 不透明限制），切回不透明主题自动恢复；DOM 路径的字符格宽按整设备像素量化与 WebGL 对齐、终端字体栈显式补 CJK 回退字体，字距与全角标点均与内置主题一致，不再显得更松；此时作者写在 `terminal.background` 的底色会被忽略——它在展开顺序上排在透明化之后，照着内置主题抄全 24 字段的皮肤本会把氛围图整块盖死。导入的 `theme.css` 过卫生检查：256KB 上限、禁 `@import`、指向包外的引用一律拒 —— 检查在剥掉注释、还原 CSS 转义后的取样上做，`url()` 与裸字符串双查（Chromium 认 `image-set("https://…" 1x)`，不带 `url()` 照样发请求），`url(\68 ttps://…)` 这类转义写法同样挡得住。`theme.json` 的 `tokens` 逃生舱走同一把尺子：键名限 `--` 开头的 CSS 变量、值过同一道闸——键名不带 `--` 时 `setProperty` 设的是**真实 CSS 属性**，否则一行 `{"background-image":"url(https://…)"}` 就绕开了上面所有检查（`tauri.conf.json` 的 csp 为 null，这是唯一一道闸）
 - **字体独立调节** — UI 与终端的字号（10-20px）/ 字体 family 分别可调，终端可选是否跟随 UI 主题
 - **连体字 (ligatures)** — 终端连体字渲染开关，开启后 `==` `=>` `!=` `->` 等合成 ligature glyph，需字体含 calt 表（Fira Code / JetBrains Mono）；Windows 完整支持，macOS / Linux 受 webview API 限制使用 60 条 Iosevka fallback
 - **布局持久化** — 分屏比例、标签页、窗口大小 / 位置自动保存，重启恢复（`tauri-plugin-window-state`）
