@@ -5,7 +5,7 @@ import { activatePane, newTerminal } from './paneActions';
 import { branchCapsForAgent } from './sessionBranch';
 import { writePtyInput } from './terminalCache';
 import { t } from '../i18n';
-import type { AiSession } from '../types';
+import type { AiSession, PaneState } from '../types';
 
 /**
  * 点击分支树/浮层里的会话节点该发生什么（设计文档「节点点击行为」）：
@@ -16,7 +16,7 @@ import type { AiSession } from '../types';
 /** 按 sessionId 跨全部项目找「活着」的 pane（pty 在且未退出）。 */
 export function findLiveSessionPane(
   sessionId: string,
-): { projectId: string; paneId: string } | null {
+): { projectId: string; paneId: string; status: PaneState['status'] } | null {
   const { projectStates, exitedPtyIds } = useAppStore.getState();
   for (const [projectId, ps] of projectStates) {
     if (!ps.layout) continue;
@@ -26,7 +26,7 @@ export function findLiveSessionPane(
         && pane.ptyId !== undefined
         && !exitedPtyIds.has(pane.ptyId)
       ) {
-        return { projectId, paneId: pane.id };
+        return { projectId, paneId: pane.id, status: pane.status };
       }
     }
   }

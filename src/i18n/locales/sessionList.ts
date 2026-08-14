@@ -20,6 +20,14 @@ export const sessionList = {
     wslLoading: "正在加载 WSL 会话…",
     remoteLoading: "正在加载远程会话…",
     remoteBadgeTitle: "远程会话 · {name}",
+    viewFlat: "切到平铺视图",
+    viewTree: "切到分支树视图",
+    branchTree: {
+      runningIn: "正在「{project}」运行，点击跳转",
+      clickToResume: "点击在新终端恢复此会话",
+      forkedFromTip: "分支自父会话",
+      remoteResumeUnsupported: "WSL / 远程来源的会话无法在本机恢复",
+    },
   },
   en: {
     time: {
@@ -42,5 +50,13 @@ export const sessionList = {
     wslLoading: "Loading WSL sessions…",
     remoteLoading: "Loading remote sessions…",
     remoteBadgeTitle: "Remote session · {name}",
+    viewFlat: "Switch to flat view",
+    viewTree: "Switch to branch tree view",
+    branchTree: {
+      runningIn: "Running in \"{project}\", click to jump",
+      clickToResume: "Click to resume in a new terminal",
+      forkedFromTip: "Forked from parent session",
+      remoteResumeUnsupported: "WSL / remote sessions can't be resumed on this machine",
+    },
   },
 } as const;
