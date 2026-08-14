@@ -249,12 +249,18 @@ export function SessionList() {
   // 两种模式共用同一渲染,树只是列表长出了结构
   const rows = useMemo(() => {
     if (viewMode !== 'tree') {
-      return visibleSessions.map((s) => ({ session: s, prefix: '' }));
+      return visibleSessions.map((s) => ({ session: s, prefix: '', displayTitle: s.title }));
     }
     const merged = mergeLineageEdges(lineageEdges, config.sessionLineage ?? []);
     return flattenSessionTree(buildSessionTree(allSessions, merged))
       .slice(0, displayCount)
-      .map((r) => ({ session: r.node.session, prefix: r.prefix }));
+      .map((r) => ({
+        session: r.node.session,
+        prefix: r.prefix,
+        // fork 整份复制让标题继承根会话,分支之间全同名 —— 分支节点优先显示
+        // 「分叉后第一问」(LineageEdge.branchTitle),没有再回落会话标题
+        displayTitle: r.node.edge?.branchTitle ?? r.node.session.title,
+      }));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [viewMode, visibleSessions, allSessions, lineageEdges, config.sessionLineage, displayCount]);
 
@@ -323,7 +329,7 @@ export function SessionList() {
           </Suspense>
         )}
 
-        {rows.map(({ session, prefix }) => {
+        {rows.map(({ session, prefix, displayTitle }) => {
           const vendor = TYPE_VENDOR[session.sessionType] ?? 'claude';
           // 远程会话标识:显示来源连接名(连接被删时回退 'SSH')
           const remoteConnName = session.sshConnectionId
@@ -345,7 +351,7 @@ export function SessionList() {
                 viewMode === 'tree'
                   ? (live
                     ? t('sessionList.branchTree.runningIn', { project: liveProjectName })
-                    : `${session.title}\n${t('sessionList.branchTree.clickToResume')}`)
+                    : `${displayTitle}\n${t('sessionList.branchTree.clickToResume')}`)
                   : session.title
               }
               onClick={() => {
@@ -402,7 +408,7 @@ export function SessionList() {
                 <div className="flex items-center gap-1.5 min-w-0">
                   {live && <StatusDot status={live.status} />}
                   <span className="truncate text-[var(--text-secondary)] group-hover:text-[var(--text-primary)] transition-colors leading-snug">
-                    {session.title}
+                    {displayTitle}
                   </span>
                 </div>
                 <div className="text-[var(--text-muted)] text-xs mt-0.5 leading-none">

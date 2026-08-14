@@ -1423,6 +1423,11 @@ pub struct LineageEdge {
     /// 分叉点在父会话中的消息 uuid，仅 Claude 有此精度
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fork_point_uuid: Option<String>,
+    /// 分支自己的首条用户消息（分叉之后第一问）。fork 是整份复制，标题字段
+    /// 会连同首条消息一起继承自根会话——分支之间全都同名；真正区分一条分支
+    /// 的是它岔开后干了什么。None = 分支里还没提过问（UI 回落会话标题）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_title: Option<String>,
 }
 
 /// 从 Claude 会话 jsonl 头部行中提取分支边。行级纯函数。
@@ -1454,6 +1459,7 @@ pub(crate) fn claude_fork_edge_from_lines<'a>(
                 .get("messageUuid")
                 .and_then(|v| v.as_str())
                 .map(String::from),
+            branch_title: None,
         });
     }
     None
@@ -1483,7 +1489,29 @@ pub(crate) fn codex_fork_edge_from_meta_line(line: &str) -> Option<LineageEdge> 
         session_id: id.to_string(),
         parent_session_id: parent.to_string(),
         fork_point_uuid: None,
+        // Codex 文件没有行级复制标记，分不出「继承的历史」与「分支自己的消息」
+        branch_title: None,
     })
+}
+
+/// 分支自己的首条用户消息：过滤掉从父会话复制来的 forkedFrom 行后，取首条
+/// 用户消息（复用 claude_session_info_from_lines 的提取口径）。行级纯函数。
+/// None = 分支里还没有自己的提问。
+pub(crate) fn claude_branch_title_from_lines<'a>(
+    lines: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    let own_lines = lines
+        .into_iter()
+        .filter(|l| !l.contains("\"forkedFrom\""));
+    let (title, _) = claude_session_info_from_lines(own_lines);
+    (title != "Untitled").then_some(title)
+}
+
+/// 全文件读取版（只对确认是分支的文件调用；非分支文件不付这份 IO）。
+fn claude_branch_title(path: &Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    let lines: Vec<String> = BufReader::new(file).lines().map_while(Result::ok).collect();
+    claude_branch_title_from_lines(lines.iter().map(String::as_str))
 }
 
 fn scan_claude_lineage(project_path: &str) -> Vec<LineageEdge> {
@@ -1519,7 +1547,8 @@ fn scan_claude_lineage(project_path: &str) -> Vec<LineageEdge> {
                 .map_while(Result::ok)
                 .take(CLAUDE_LINEAGE_HEAD_LINES)
                 .collect();
-            if let Some(edge) = claude_fork_edge_from_lines(&id, head.iter().map(String::as_str)) {
+            if let Some(mut edge) = claude_fork_edge_from_lines(&id, head.iter().map(String::as_str)) {
+                edge.branch_title = claude_branch_title(&path);
                 edges.push(edge);
             }
         }
@@ -1642,6 +1671,26 @@ mod tests {
         assert!(codex_fork_edge_from_meta_line(self_ref).is_none());
         let not_meta = r#"{"type":"response_item","payload":{"id":"c","forked_from_id":"p"}}"#;
         assert!(codex_fork_edge_from_meta_line(not_meta).is_none());
+    }
+
+    #[test]
+    fn claude_branch_title_skips_copied_lines() {
+        // 复制行（带 forkedFrom）里的首条用户消息是根会话的标题，必须跳过；
+        // 标题取分叉后第一条自己的提问
+        let lines = [
+            r#"{"type":"user","forkedFrom":{"sessionId":"p","messageUuid":"m"},"message":{"role":"user","content":"根会话的第一问"}}"#,
+            r#"{"type":"assistant","forkedFrom":{"sessionId":"p","messageUuid":"m2"},"message":{"role":"assistant","content":"回答"}}"#,
+            r#"{"type":"user","message":{"role":"user","content":"分支里改走流式方案"},"timestamp":"2026-08-15T10:00:00Z"}"#,
+        ];
+        assert_eq!(
+            claude_branch_title_from_lines(lines.iter().copied()).as_deref(),
+            Some("分支里改走流式方案"),
+        );
+        // 只有复制行（分支还没提问）→ None
+        assert_eq!(claude_branch_title_from_lines(lines[..2].iter().copied()), None);
+        // 系统注入(< 开头)不算标题
+        let injected = [r#"{"type":"user","message":{"role":"user","content":"<local-command-caveat>x</local-command-caveat>"}}"#];
+        assert_eq!(claude_branch_title_from_lines(injected.iter().copied()), None);
     }
 
     // ---- Grok Build ----

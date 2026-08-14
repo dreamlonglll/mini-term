@@ -84,6 +84,9 @@ export interface LineageEdge {
   parentSessionId: string;
   /** 分叉点在父会话中的消息 uuid,仅 Claude 有此精度 */
   forkPointUuid?: string;
+  /** 分支自己的首条用户消息(分叉后第一问)。fork 整份复制会让标题字段继承
+   *  根会话,分支之间全同名——展示时优先用它;undefined 回落会话标题 */
+  branchTitle?: string;
 }
 
 /** 移动端中转体系的持久化配置。字段对齐后端 #[serde(rename_all = "camelCase")]. */

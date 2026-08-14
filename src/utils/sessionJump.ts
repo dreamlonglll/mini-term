@@ -1,11 +1,19 @@
 import { invoke } from '@tauri-apps/api/core';
 import { useAppStore } from '../store';
 import { collectPanes } from './layoutOps';
-import { activatePane, newTerminal } from './paneActions';
-import { branchCapsForAgent } from './sessionBranch';
+import { activatePane, forkPaneSession, newTerminal } from './paneActions';
+import {
+  branchCapsForAgent,
+  buildSessionTree,
+  findFamilyRoot,
+  flattenSessionTree,
+  mergeLineageEdges,
+  type FlatSessionRow,
+} from './sessionBranch';
 import { writePtyInput } from './terminalCache';
 import { t } from '../i18n';
-import type { AiSession, PaneState } from '../types';
+import type { MenuEntry } from './contextMenu';
+import type { AiSession, LineageEdge, PaneState } from '../types';
 
 /**
  * 点击分支树/浮层里的会话节点该发生什么（设计文档「节点点击行为」）：
@@ -31,6 +39,52 @@ export function findLiveSessionPane(
     }
   }
   return null;
+}
+
+/** sessionId 所在家族的连线行（右键子菜单 / 树视图共用的取数口径：
+ *  磁盘扫描边 + 自记账边合并，磁盘优先）。找不到家族返回空数组。 */
+export async function fetchFamilyRows(
+  projectPath: string,
+  sessionId: string,
+): Promise<FlatSessionRow[]> {
+  const [sessions, edges] = await Promise.all([
+    invoke<AiSession[]>('get_ai_sessions', { projectPath }),
+    invoke<LineageEdge[]>('scan_session_lineage', { projectPath }).catch(() => [] as LineageEdge[]),
+  ]);
+  const merged = mergeLineageEdges(edges, useAppStore.getState().config.sessionLineage ?? []);
+  const family = findFamilyRoot(buildSessionTree(sessions, merged), sessionId);
+  return family ? flattenSessionTree([family]) : [];
+}
+
+/**
+ * 「查看会话分支」的悬停子菜单（TerminalInstance 终端右键与 PaneGroup tab
+ * 右键共用）。行 = 连线前缀 + 分支标题（分叉后第一问，见 LineageEdge.branchTitle，
+ * 无则回落会话标题）；当前会话禁用并标记；末项「再岔一条 ⇢ 新分屏」。
+ */
+export function buildBranchSubmenu(
+  rows: FlatSessionRow[],
+  opts: { projectId: string; paneId: string; currentSessionId: string },
+): MenuEntry[] {
+  const items: MenuEntry[] = rows.length === 0
+    ? [{ label: t('paneGroup.branchPopover.empty'), disabled: true }]
+    : rows.map(({ node, prefix }) => {
+        const isCurrent = node.session.id === opts.currentSessionId;
+        const title = node.edge?.branchTitle ?? node.session.title;
+        const short = [...title].length > 32 ? `${[...title].slice(0, 32).join('')}…` : title;
+        return {
+          label: `${prefix}${short}${isCurrent ? ` ${t('paneGroup.branchPopover.current')}` : ''}`,
+          disabled: isCurrent,
+          onClick: () => void jumpToSession(opts.projectId, node.session),
+        };
+      });
+  return [
+    ...items,
+    { separator: true },
+    {
+      label: t('paneGroup.branchPopover.forkAgain'),
+      onClick: () => void forkPaneSession(opts.projectId, opts.paneId),
+    },
+  ];
 }
 
 export async function jumpToSession(projectId: string, session: AiSession): Promise<void> {
