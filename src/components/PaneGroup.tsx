@@ -7,6 +7,7 @@ import { StatusDot } from './StatusDot';
 import { BrandIcon } from './BrandIcon';
 import { MarkerList } from './MarkerList';
 import { PaneTabPreview } from './PaneTabPreview';
+import { PaneBranchPopover } from './PaneBranchPopover';
 import { showContextMenu } from '../utils/contextMenu';
 import { inferVendor } from '../utils/inferVendor';
 import { paneShowsAiSession, resolveAutoResumeCommand } from '../utils/aiResume';
@@ -274,6 +275,12 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
   }, [tabPreview, closeTabPreview]);
 
   const [markerOpen, setMarkerOpen] = useState(false);
+  // 「查看会话分支」浮层(挂 portal,anchor 取右键点)
+  const [branchPopover, setBranchPopover] = useState<{
+    paneId: string;
+    sessionId: string;
+    anchor: { x: number; y: number };
+  } | null>(null);
   const [markerAnchor, setMarkerAnchor] = useState<{ top: number; right: number } | null>(null);
   const markers = useAppStore(
     (s) => (activePane?.ptyId !== undefined && s.markersByPty.get(activePane.ptyId)) || EMPTY_MARKERS,
@@ -346,6 +353,14 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
         { separator: true as const },
         // 新 pane 是新进程,「本会话允许」的权限授权不迁移(官方行为)
         { label: t('paneGroup.forkSession'), onClick: () => void forkPaneSession(projectId, paneId) },
+        {
+          label: t('paneGroup.viewSessionBranches'),
+          onClick: () => setBranchPopover({
+            paneId,
+            sessionId: session!.sessionId,
+            anchor: { x: e.clientX, y: e.clientY },
+          }),
+        },
       ] : []),
       { separator: true },
       { label: t('paneGroup.closeTab'), onClick: () => void closePane(projectId, paneId) },
@@ -590,6 +605,19 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
           document.body,
         );
       })()}
+
+      {/* 会话分支浮层:pane 被关掉那一帧就不画（同缩略图的渲染 gate 口径） */}
+      {branchPopover && node.panes.some((p) => p.id === branchPopover.paneId) && createPortal(
+        <PaneBranchPopover
+          projectId={projectId}
+          projectPath={projectPath}
+          paneId={branchPopover.paneId}
+          sessionId={branchPopover.sessionId}
+          anchor={branchPopover.anchor}
+          onClose={() => setBranchPopover(null)}
+        />,
+        document.body,
+      )}
     </div>
   );
 }
