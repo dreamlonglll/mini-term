@@ -8,9 +8,10 @@
  * 这些函数直接读写 store（不依赖 React），因此 hook 与普通事件回调都能调用。
  */
 import { invoke } from '@tauri-apps/api/core';
-import { useAppStore, genId, saveLayoutToConfig } from '../store';
+import { useAppStore, genId, saveLayoutToConfig, registerPendingFork } from '../store';
 import { createProjectPty, isRemoteProject, remotePaneLabel } from './remoteProject';
-import { disposeTerminal, getCachedTerminal } from './terminalCache';
+import { disposeTerminal, getCachedTerminal, writePtyInput } from './terminalCache';
+import { branchCapsForAgent } from './sessionBranch';
 import { showAlert, showConfirm, showPrompt } from './prompt';
 import { closeTerminalSearchFor } from './terminalSearch';
 import {
@@ -133,23 +134,26 @@ export async function newTerminal(
   return pane;
 }
 
-/** 在指定 pane 处分屏；不传 paneId 时对当前活动 pane 分。 */
+/** 在指定 pane 处分屏；不传 paneId 时对当前活动 pane 分。
+ *  返回新 pane（未能分出返回 null）；`opts.cwd` 显式指定新 PTY 的启动目录
+ *  （fork 会话需要落在会话记录的目录，见 forkPaneSession）。 */
 export async function splitPane(
   projectId: string,
   direction: 'horizontal' | 'vertical',
   paneId?: string,
-): Promise<void> {
+  opts?: { cwd?: string },
+): Promise<PaneState | null> {
   const { state, project, layout } = snapshot(projectId);
-  if (!project || !layout) return;
+  if (!project || !layout) return null;
   const target = paneId ?? resolveActivePane(layout)?.id;
-  if (!target) return;
+  if (!target) return null;
   const resolved = isRemoteProject(project) ? undefined : resolveShell(state.config);
-  if (!isRemoteProject(project) && !resolved) return;
+  if (!isRemoteProject(project) && !resolved) return null;
 
   // 分屏继承源 pane 的 cwd 覆盖:worktree 终端分出来的屏理应还在 worktree 里
   const sourceCwd = findPaneById(layout, target)?.cwd;
-  const pane = await spawnPane(project, resolved, undefined, sourceCwd);
-  if (!pane) return;
+  const pane = await spawnPane(project, resolved, undefined, opts?.cwd ?? sourceCwd);
+  if (!pane) return null;
 
   // spawn 期间布局可能已变：目标 pane 被关掉、或整个项目的终端都关光了。
   // 这两种情况下新 PTY 无处安放，必须显式回收 —— 否则后端留一个谁也看不见、
@@ -158,11 +162,37 @@ export async function splitPane(
   const stillThere = current ? !!findPaneById(current, target) : false;
   if (!current || !stillThere) {
     await disposePane(pane);
-    return;
+    return null;
   }
   const newLeaf: SplitNode = { type: 'leaf', panes: [pane], activePaneId: pane.id };
   commit(projectId, insertSplit(current, target, direction, newLeaf));
   focusPane(pane.ptyId);
+  return pane;
+}
+
+/**
+ * 把 pane 里跑着的 AI 会话分支到新分屏（设计: docs/plans/2026-08-14-session-branch-tree-design.md）。
+ * 原 pane 原会话继续跑；右侧分出的新 pane 写入 fork 命令（Claude:
+ * `--resume {id} --fork-session`，Codex: `codex fork {id}`），PTY 内核缓冲
+ * stdin、shell 就绪前写入不丢（与重启自动续接同一时序）。
+ *
+ * 新 PTY 的启动目录优先取会话记录的 cwd —— claude --resume 只认「启动目录」
+ * 对应的会话桶（与 PaneGroup 续接链路同一坑）；无记录时继承源 pane。
+ * 自记账：新会话身份由 hook 上报后落边，见 store.consumePendingFork。
+ */
+export async function forkPaneSession(projectId: string, paneId: string): Promise<void> {
+  const { layout } = snapshot(projectId);
+  const source = layout ? findPaneById(layout, paneId) : null;
+  const session = source?.aiSession;
+  if (!session) return;
+  const agent = (session.agent ?? 'claude').toLowerCase();
+  const cmd = branchCapsForAgent(agent)?.forkCommand(session.sessionId);
+  if (!cmd) return;
+
+  const pane = await splitPane(projectId, 'horizontal', paneId, { cwd: session.cwd });
+  if (!pane || pane.ptyId === undefined) return;
+  registerPendingFork(pane.ptyId, agent, session.sessionId);
+  void writePtyInput(pane.ptyId, `${cmd}\r`);
 }
 
 /** 回收一个 pane 的运行时资源（后端 PTY 子进程 + 前端 xterm 实例 + markers）。 */

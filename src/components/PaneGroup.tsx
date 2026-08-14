@@ -17,10 +17,12 @@ import {
   activatePane,
   closeLeaf,
   closePane,
+  forkPaneSession,
   newTerminal,
   renamePane,
   splitPane,
 } from '../utils/paneActions';
+import { branchCapsForAgent } from '../utils/sessionBranch';
 import { hotkeyLabel } from '../utils/hotkeys';
 import { openTerminalSearch } from '../utils/terminalSearch';
 import { MOD_LABEL } from '../utils/platform';
@@ -331,16 +333,25 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
   const paneContextMenu = useCallback((e: React.MouseEvent, paneId: string) => {
     e.preventDefault();
     e.stopPropagation();
+    // 会话分支入口:pane 有 AI 会话身份且该 agent 有 fork 能力位才出现
+    // (claude/codex;grok 无 CLI 级 fork,opencode/pi 无会话记录,均隐藏)
+    const session = node.panes.find((p) => p.id === paneId)?.aiSession;
+    const canFork = !!session && !!branchCapsForAgent(session.agent)?.forkCommand(session.sessionId);
     showContextMenu(e.clientX, e.clientY, [
       { label: t('paneGroup.rename'), shortcut: hotkeyLabel('renamePane'), onClick: () => void renamePane(projectId, paneId) },
       { separator: true },
       { label: t('paneGroup.splitRight'), shortcut: hotkeyLabel('splitRight'), onClick: () => void splitPane(projectId, 'horizontal', paneId) },
       { label: t('paneGroup.splitDown'), shortcut: hotkeyLabel('splitDown'), onClick: () => void splitPane(projectId, 'vertical', paneId) },
+      ...(canFork ? [
+        { separator: true as const },
+        // 新 pane 是新进程,「本会话允许」的权限授权不迁移(官方行为)
+        { label: t('paneGroup.forkSession'), onClick: () => void forkPaneSession(projectId, paneId) },
+      ] : []),
       { separator: true },
       { label: t('paneGroup.closeTab'), onClick: () => void closePane(projectId, paneId) },
       { label: t('paneGroup.closePane'), shortcut: hotkeyLabel('closePane'), danger: true, onClick: () => void closeLeaf(projectId, paneId) },
     ]);
-  }, [projectId, t]);
+  }, [projectId, t, node.panes]);
 
   if (!activePane) return null;
 

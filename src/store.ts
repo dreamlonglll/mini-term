@@ -18,6 +18,7 @@ import type {
   AiUserSubmitPayload,
   MobileRelayStatusPayload,
   ProjectKind,
+  LineageEdge,
 } from './types';
 import { isAiCompletion, isAttentionCause, isAttentionRise } from './utils/aiCompletion';
 import { restoreSavedProjectLayout } from './utils/layoutRestore';
@@ -161,7 +162,47 @@ export function setPaneAiSessionByPty(
     newStates.set(ctx.projectId, { ...ps, layout: patchPaneByPty(ps.layout, ptyId, { aiSession }) });
     return { projectStates: newStates };
   });
+  if (aiSession) consumePendingFork(ptyId, aiSession);
   return ctx.projectId;
+}
+
+// ===== 会话分支自记账（设计: docs/plans/2026-08-14-session-branch-tree-design.md）=====
+// mini-term 自己发起的 fork（paneActions.forkPaneSession）在新 pane 的 PTY 上登记
+// 「等新会话身份」，hook 上报新 id 时落成 child→parent 边写进 config.sessionLineage。
+// 磁盘扫描（scan_session_lineage）是权威且合并时优先，这里只兜文件未落盘的窗口期。
+const pendingForks = new Map<number, { agent: string; parentSessionId: string }>();
+
+export function registerPendingFork(ptyId: number, agent: string, parentSessionId: string): void {
+  pendingForks.set(ptyId, { agent: agent.toLowerCase(), parentSessionId });
+}
+
+/** pty 退出时调用：fork 命令没成功起会话的登记不该等到下一个进程头上。 */
+export function clearPendingFork(ptyId: number): void {
+  pendingForks.delete(ptyId);
+}
+
+/** 消费一次性的 fork 登记。agent 不符（fork 失败后用户在同 pane 起了别家）只
+ *  作废不记边；同 agent 的全新会话被误记仍有残余风险——磁盘合并优先 + 该 pane
+ *  首次身份即消费，把窗口压到最小。 */
+function consumePendingFork(ptyId: number, aiSession: AiSessionRef): void {
+  const pending = pendingForks.get(ptyId);
+  if (!pending) return;
+  pendingForks.delete(ptyId);
+  const agent = (aiSession.agent ?? 'claude').toLowerCase();
+  if (agent !== pending.agent) return;
+  if (!aiSession.sessionId || aiSession.sessionId === pending.parentSessionId) return;
+  const edge: LineageEdge = {
+    agent,
+    sessionId: aiSession.sessionId,
+    parentSessionId: pending.parentSessionId,
+  };
+  useAppStore.setState((state) => {
+    const existing = state.config.sessionLineage ?? [];
+    // child 已有边则不覆盖（先记为准，磁盘合并层还会再压一层）
+    if (existing.some((e) => e.sessionId === edge.sessionId)) return state;
+    return { config: { ...state.config, sessionLineage: [...existing, edge] } };
+  });
+  void saveConfigToDisk();
 }
 
 /** 清除 pane 的待续接标记(resume 命令已写入;身份 aiSession 保留)。 */
