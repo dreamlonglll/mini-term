@@ -41,9 +41,17 @@ export const AGENT_BRANCH_CAPS: Record<string, AgentBranchCaps> = {
   },
 };
 
-/** agent 标识归一化后查能力表（pane.aiSession.agent 缺省按 claude，与 inferVendor 同则） */
+/**
+ * agent 标识 → 能力表，与 buildResumeCommand 同一归一化口径：codex/grok 显式
+ * 分流，**其余一律按 Claude**（hook 上报的标识是 `claude-code`，不是 `claude`；
+ * AiSessionRef 的约定即「agent 缺省按 Claude 处理」）。grok 无 CLI 级 fork、
+ * opencode/pi 无会话记录，显式排除。
+ */
 export function branchCapsForAgent(agent: string | undefined): AgentBranchCaps | null {
-  return AGENT_BRANCH_CAPS[(agent ?? 'claude').toLowerCase()] ?? null;
+  const a = (agent ?? 'claude').toLowerCase();
+  if (a === 'codex') return AGENT_BRANCH_CAPS.codex;
+  if (a === 'grok' || a === 'opencode' || a === 'pi') return null;
+  return AGENT_BRANCH_CAPS.claude;
 }
 
 export interface SessionTreeNode {
