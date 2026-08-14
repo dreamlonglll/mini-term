@@ -14,6 +14,7 @@ import { WebglAddon } from '@xterm/addon-webgl';
 import { LigaturesAddon } from '@xterm/addon-ligatures';
 import type { SearchAddon } from '@xterm/addon-search';
 import { activateUnicodeWidth } from './terminalUnicodeWidth';
+import { quantizeCharMeasurement } from './terminalCharMeasure';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { readText, readImage, writeText } from '@tauri-apps/plugin-clipboard-manager';
@@ -34,12 +35,26 @@ export interface CachedTerminal {
   wrapper: HTMLDivElement;
 }
 
+/** 全角字符的确定性 CJK 回退，追加在任何终端字体栈末尾。
+ *
+ *  少了它，全角标点交给引擎启发式回退，而 DOM 渲染器的网格正确性依赖
+ *  「测量与渲染选中同一字体」：WidthCache 对单字符**孤立**测量，行渲染则按
+ *  **上下文**逐段选字体。实测 WebView2 上两者对全角标点（U+FF0C 等）会选出
+ *  不同结果——孤立测量未落到 CJK 字体（量出半角步进 8.625px），行内渲染跟着
+ *  相邻汉字落到全角字体（14px），letter-spacing 按错误测量补 +7.4px，每个
+ *  全角标点比 WebGL 宽出 6~7px；汉字是 Han script，两种场景必然同一回退，
+ *  所以只有标点出问题。显式列出 CJK 字体后两条路径都走确定的字体匹配，
+ *  不再依赖引擎回退。Chrome / 桌面 Edge 实测无此分歧，但显式栈对其无害。 */
+const CJK_FALLBACK_FONTS = "'Microsoft YaHei', 'PingFang SC', 'Noto Sans CJK SC', monospace";
+
 export const DEFAULT_TERMINAL_FONT_FAMILY =
-  "'JetBrainsMono Nerd Font', 'CaskaydiaCove Nerd Font', 'JetBrains Mono', 'Cascadia Code', Consolas, monospace";
+  `'JetBrainsMono Nerd Font', 'CaskaydiaCove Nerd Font', 'JetBrains Mono', 'Cascadia Code', Consolas, ${CJK_FALLBACK_FONTS}`;
 
 export function resolveTerminalFontFamily(value: string | undefined): string {
   const trimmed = value?.trim();
-  return trimmed ? trimmed : DEFAULT_TERMINAL_FONT_FAMILY;
+  // 用户自选字体同样补 CJK 回退；若用户字体自带 CJK（如更纱黑体），
+  // CSS 按先到先得取用户字体，追加项自然失效
+  return trimmed ? `${trimmed}, ${CJK_FALLBACK_FONTS}` : DEFAULT_TERMINAL_FONT_FAMILY;
 }
 
 export { DEFAULT_SCROLLBACK, MAX_SCROLLBACK, resolveScrollback };
@@ -238,6 +253,10 @@ export function getOrCreateTerminal(ptyId: number): CachedTerminal {
   activateUnicodeWidth(term);
 
   term.open(wrapper);
+
+  // 字符宽度量化到整设备像素：让透明主题下的 DOM 渲染与 WebGL 格宽一致
+  // （WebGL floor / DOM 不 floor 的上游差异），详见 terminalCharMeasure.ts。
+  quantizeCharMeasurement(term);
 
   // 这里曾拦截 alternate screen 切换(DECSET/DECRST 47/1047/1049),把 TUI 输出摁在
   // 主缓冲区以保住 scrollback。前提"TUI 的清屏/重绘仅影响可视区域"只在一帧不高于
