@@ -132,3 +132,27 @@ export function findFamilyRoot(roots: SessionTreeNode[], sessionId: string): Ses
     node.session.id === sessionId || node.children.some(contains);
   return roots.find(contains) ?? null;
 }
+
+export interface FlatSessionRow {
+  node: SessionTreeNode;
+  /** 渲染在行首的连线前缀（制表符：│ ├ └），根为空串。等宽字体下对齐。 */
+  prefix: string;
+}
+
+/** 森林 → 带连线前缀的平铺行（先根深度优先，与视觉树一致）。 */
+export function flattenSessionTree(roots: SessionTreeNode[]): FlatSessionRow[] {
+  const out: FlatSessionRow[] = [];
+  // ancestorsLast[i] = 第 i 层祖先是否是其父的最后一个孩子（决定画 │ 还是留白）
+  const walk = (node: SessionTreeNode, ancestorsLast: boolean[]) => {
+    const depth = ancestorsLast.length;
+    let prefix = '';
+    if (depth > 0) {
+      for (let i = 0; i < depth - 1; i += 1) prefix += ancestorsLast[i] ? '   ' : '│  ';
+      prefix += ancestorsLast[depth - 1] ? '└─ ' : '├─ ';
+    }
+    out.push({ node, prefix });
+    node.children.forEach((c, i) => walk(c, [...ancestorsLast, i === node.children.length - 1]));
+  };
+  for (const r of roots) walk(r, []);
+  return out;
+}

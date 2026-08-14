@@ -7,6 +7,7 @@ const {
   mergeLineageEdges,
   buildSessionTree,
   findFamilyRoot,
+  flattenSessionTree,
 } = require('../.tmp-tests/utils/sessionBranch.js');
 
 const S = (id, timestamp = '2026-08-14T10:00:00Z', sessionType = 'claude') => ({
@@ -77,4 +78,27 @@ test('自指边忽略；findFamilyRoot 命中任意层级', () => {
   assert.equal(findFamilyRoot(roots, 'c1').session.id, 'r');
   assert.equal(findFamilyRoot(roots, 'r').session.id, 'r');
   assert.equal(findFamilyRoot(roots, 'nope'), null);
+});
+
+test('flattenSessionTree：先根 DFS，连线前缀正确（├ └ │ 与留白）', () => {
+  const sessions = [
+    S('r', '2026-08-14T10:00:00Z'),
+    S('a', '2026-08-14T10:10:00Z'),
+    S('a1', '2026-08-14T10:20:00Z'),
+    S('b', '2026-08-14T10:30:00Z'),
+  ];
+  // r ├── a（a 下还有 a1）└── b：a 非末子 → a1 行的上层画 │
+  const rows = flattenSessionTree(buildSessionTree(sessions, [E('a', 'r'), E('a1', 'a'), E('b', 'r')]));
+  assert.deepEqual(
+    rows.map((x) => [x.prefix, x.node.session.id]),
+    [
+      ['', 'r'],
+      ['├─ ', 'a'],
+      ['│  └─ ', 'a1'],
+      ['└─ ', 'b'],
+    ],
+  );
+  // 末子的后代:上层留白不画 │
+  const rows2 = flattenSessionTree(buildSessionTree(sessions, [E('a', 'r'), E('b', 'a'), E('a1', 'b')]));
+  assert.deepEqual(rows2.map((x) => x.prefix), ['', '└─ ', '   └─ ', '      └─ ']);
 });
