@@ -69,6 +69,21 @@ export interface AppConfig {
   mobileRelay?: MobileRelayConfig;
   /** 激活的外置主题包 id（themes/ 下目录名）。undefined = 内置外观模式 */
   customThemeId?: string;
+  /** AI 历史面板的会话列表视图;undefined = 平铺 */
+  sessionListView?: 'flat' | 'tree';
+  /** 会话分支自记账边(mini-term 自己发起的 fork)。磁盘扫描权威,这里兜
+   *  「会话文件尚未落盘的窗口期」;合并按 child id 去重、磁盘优先 */
+  sessionLineage?: LineageEdge[];
+}
+
+/** 会话分支边:sessionId fork 自 parentSessionId。与后端
+ *  ai_sessions::LineageEdge / config::SavedLineageEdge 同构。 */
+export interface LineageEdge {
+  agent: string;
+  sessionId: string;
+  parentSessionId: string;
+  /** 分叉点在父会话中的消息 uuid,仅 Claude 有此精度 */
+  forkPointUuid?: string;
 }
 
 /** 移动端中转体系的持久化配置。字段对齐后端 #[serde(rename_all = "camelCase")]. */
