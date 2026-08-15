@@ -166,8 +166,13 @@ export function SessionList() {
         setLoading(false);
       });
 
-    // 分支边并行拉取:只读文件头,与会话列表同量级,失败按无分支处理
-    invoke<LineageEdge[]>('scan_session_lineage', { projectPath: project.path })
+    // 分支边并行拉取:只读文件头,与会话列表同量级,失败按无分支处理。
+    // 自记账边一并传给后端:claude 的 CLI fork 不写磁盘指针,这些边的
+    // 「分叉后第一问」标题只能由后端拿父子文件比对补出
+    invoke<LineageEdge[]>('scan_session_lineage', {
+      projectPath: project.path,
+      bookkept: useAppStore.getState().config.sessionLineage ?? [],
+    })
       .then((result) => {
         if (requestIdRef.current !== reqId) return;
         setLineageEdges(result);

@@ -52,7 +52,11 @@ export async function fetchFamilyRows(
 ): Promise<FlatSessionRow[]> {
   const [sessions, edges] = await Promise.all([
     invoke<AiSession[]>('get_ai_sessions', { projectPath }),
-    invoke<LineageEdge[]>('scan_session_lineage', { projectPath }).catch(() => [] as LineageEdge[]),
+    // 自记账边传给后端补「分叉后第一问」标题(claude CLI fork 无磁盘指针)
+    invoke<LineageEdge[]>('scan_session_lineage', {
+      projectPath,
+      bookkept: useAppStore.getState().config.sessionLineage ?? [],
+    }).catch(() => [] as LineageEdge[]),
   ]);
   const merged = mergeLineageEdges(edges, useAppStore.getState().config.sessionLineage ?? []);
   const family = findFamilyRoot(buildSessionTree(sessions, merged), sessionId);

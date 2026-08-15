@@ -1532,10 +1532,12 @@ fn codex_user_texts(path: &Path, cap: usize) -> Vec<String> {
     out
 }
 
-/// Codex 分支自己的第一问：子会话的用户消息按顺序前缀匹配父会话，
-/// 首条对不上的即分叉后的第一条自己的提问。纯函数。
+/// 分支自己的第一问：子会话的用户消息按顺序前缀匹配父会话，首条对不上的
+/// 即分叉后的第一条自己的提问。纯函数，Claude / Codex 共用 —— 它对落盘格式
+/// 零假设（Claude 的 forkedFrom 标记只有 /branch 路径写，CLI fork 不写，
+/// 实测两条路径行为不一致，行级标记不可依赖）。
 /// None = 子消息全是复制来的（分支还没提问）。
-pub(crate) fn codex_branch_title_from_texts(parent: &[String], child: &[String]) -> Option<String> {
+pub(crate) fn branch_title_from_texts(parent: &[String], child: &[String]) -> Option<String> {
     let mut idx = 0;
     for text in child {
         if idx < parent.len() && &parent[idx] == text {
@@ -1609,6 +1611,38 @@ fn latest_model_from_file_tail(path: &Path) -> Option<String> {
     latest_model_from_lines(text.lines())
 }
 
+/// Claude 文件里全部「真实用户输入」的标题序列（跳过 `<...>` 系统注入，
+/// 截断 100 字符 —— 两侧同口径截断，等值比较成立）。含 forkedFrom 复制行：
+/// 复制行的文本与父会话逐条相同，前缀比对天然消化，无需过滤。
+fn claude_user_texts(path: &Path, cap: usize) -> Vec<String> {
+    let Ok(file) = fs::File::open(path) else {
+        return vec![];
+    };
+    let mut out = Vec::new();
+    let mut rest: Vec<String> = Vec::new();
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        if !line.contains("\"type\":\"user\"") {
+            continue;
+        }
+        rest.clear();
+        rest.push(line);
+        let (title, _) = claude_session_info_from_lines(rest.iter().map(String::as_str));
+        if title != "Untitled" {
+            out.push(title);
+            if out.len() >= cap {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// 在项目的 Claude 桶目录里按 id 找会话文件。
+fn find_claude_session_file(project_dirs: &[PathBuf], session_id: &str) -> Option<PathBuf> {
+    let name = format!("{session_id}.jsonl");
+    project_dirs.iter().map(|d| d.join(&name)).find(|p| p.is_file())
+}
+
 fn scan_claude_lineage(project_path: &str) -> Vec<LineageEdge> {
     let Some(home) = home_dir() else {
         return vec![];
@@ -1617,10 +1651,11 @@ fn scan_claude_lineage(project_path: &str) -> Vec<LineageEdge> {
     if !projects_dir.exists() {
         return vec![];
     }
+    let dirs = find_claude_project_dirs_in(&projects_dir, project_path, PathStyle::Windows);
     let mut edges = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for dir in find_claude_project_dirs_in(&projects_dir, project_path, PathStyle::Windows) {
-        let Ok(entries) = fs::read_dir(&dir) else {
+    for dir in &dirs {
+        let Ok(entries) = fs::read_dir(dir) else {
             continue;
         };
         for entry in entries.flatten() {
@@ -1643,7 +1678,12 @@ fn scan_claude_lineage(project_path: &str) -> Vec<LineageEdge> {
                 .take(CLAUDE_LINEAGE_HEAD_LINES)
                 .collect();
             if let Some(mut edge) = claude_fork_edge_from_lines(&id, head.iter().map(String::as_str)) {
-                edge.branch_title = claude_branch_title(&path);
+                // 标题主路:与父会话前缀比对(格式零假设);父文件已清理时
+                // 退回 forkedFrom 过滤(仅 /branch 路径的文件有标记)
+                edge.branch_title = find_claude_session_file(&dirs, &edge.parent_session_id)
+                    .map(|pp| claude_user_texts(&pp, 300))
+                    .and_then(|pt| branch_title_from_texts(&pt, &claude_user_texts(&path, 300)))
+                    .or_else(|| claude_branch_title(&path));
                 edges.push(edge);
             }
         }
@@ -1681,7 +1721,7 @@ fn scan_codex_lineage(project_path: &str) -> Vec<LineageEdge> {
                         find_codex_session_file(&sessions_dir, &edge.parent_session_id)
                             .map(|pp| codex_user_texts(&pp, 300))
                             .and_then(|pt| {
-                                codex_branch_title_from_texts(&pt, &codex_user_texts(&path, 300))
+                                branch_title_from_texts(&pt, &codex_user_texts(&path, 300))
                             });
                     edges.push(edge);
                 }
@@ -1695,11 +1735,70 @@ fn scan_codex_lineage(project_path: &str) -> Vec<LineageEdge> {
 /// 扫描项目的会话分支链路。Claude 消息级（forkedFrom）+ Codex 会话级
 /// （forked_from_id）；Grok 的 summary.json parent 引用与 WSL / SSH 远程来源
 /// 暂不参与（能力位预留，见设计文档）。
+///
+/// `bookkept` = 前端自记账边（mini-term 自己发起的 fork）。Claude 的 CLI fork
+/// 不写任何磁盘指针（forkedFrom 只有 /branch 路径写），这些边只存在于自记账，
+/// 标题必须在这里补：按 agent 找到父子文件做同一套前缀比对后并入返回；
+/// 已有磁盘边的 child 不重复。
 #[tauri::command]
-pub fn scan_session_lineage(project_path: String) -> Vec<LineageEdge> {
+pub fn scan_session_lineage(
+    project_path: String,
+    bookkept: Option<Vec<crate::config::SavedLineageEdge>>,
+) -> Vec<LineageEdge> {
     let mut edges = scan_claude_lineage(&project_path);
     edges.extend(scan_codex_lineage(&project_path));
+    if let Some(extra) = bookkept {
+        enrich_bookkept_edges(&project_path, extra, &mut edges);
+    }
     edges
+}
+
+fn enrich_bookkept_edges(
+    project_path: &str,
+    extra: Vec<crate::config::SavedLineageEdge>,
+    edges: &mut Vec<LineageEdge>,
+) {
+    let have: std::collections::HashSet<String> =
+        edges.iter().map(|e| e.session_id.clone()).collect();
+    let home = home_dir();
+    let claude_dirs: Vec<PathBuf> = home
+        .as_ref()
+        .map(|h| {
+            let pd = h.join(".claude").join("projects");
+            if pd.exists() {
+                find_claude_project_dirs_in(&pd, project_path, PathStyle::Windows)
+            } else {
+                vec![]
+            }
+        })
+        .unwrap_or_default();
+    let codex_dir = home.map(|h| h.join(".codex").join("sessions"));
+    for e in extra {
+        if have.contains(&e.session_id) {
+            continue;
+        }
+        let branch_title = if e.agent.to_lowercase() == "codex" {
+            codex_dir.as_ref().filter(|d| d.exists()).and_then(|d| {
+                let child = find_codex_session_file(d, &e.session_id)?;
+                let parent = find_codex_session_file(d, &e.parent_session_id)?;
+                branch_title_from_texts(&codex_user_texts(&parent, 300), &codex_user_texts(&child, 300))
+            })
+        } else {
+            // claude 系(含 hook 上报的 claude-code)
+            (|| {
+                let child = find_claude_session_file(&claude_dirs, &e.session_id)?;
+                let parent = find_claude_session_file(&claude_dirs, &e.parent_session_id)?;
+                branch_title_from_texts(&claude_user_texts(&parent, 300), &claude_user_texts(&child, 300))
+            })()
+        };
+        edges.push(LineageEdge {
+            agent: e.agent,
+            session_id: e.session_id,
+            parent_session_id: e.parent_session_id,
+            fork_point_uuid: e.fork_point_uuid,
+            branch_title,
+        });
+    }
 }
 
 #[cfg(test)]
@@ -1777,21 +1876,21 @@ mod tests {
     }
 
     #[test]
-    fn codex_branch_title_prefix_matches_parent() {
+    fn branch_title_prefix_matches_parent() {
         let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         // 复制来的前缀(你好)匹配父序列,第一条对不上的是分支自己的第一问
         assert_eq!(
-            codex_branch_title_from_texts(&s(&["你好", "改走流式"]), &s(&["你好", "试试批处理"])).as_deref(),
+            branch_title_from_texts(&s(&["你好", "改走流式"]), &s(&["你好", "试试批处理"])).as_deref(),
             Some("试试批处理"),
         );
         // 从中间分叉:子只复制了父的前缀
         assert_eq!(
-            codex_branch_title_from_texts(&s(&["a", "b", "c"]), &s(&["a", "分支问题"])).as_deref(),
+            branch_title_from_texts(&s(&["a", "b", "c"]), &s(&["a", "分支问题"])).as_deref(),
             Some("分支问题"),
         );
         // 分支还没提问 → None
-        assert_eq!(codex_branch_title_from_texts(&s(&["a", "b"]), &s(&["a", "b"])), None);
-        assert_eq!(codex_branch_title_from_texts(&s(&["a"]), &s(&[])), None);
+        assert_eq!(branch_title_from_texts(&s(&["a", "b"]), &s(&["a", "b"])), None);
+        assert_eq!(branch_title_from_texts(&s(&["a"]), &s(&[])), None);
     }
 
     #[test]
