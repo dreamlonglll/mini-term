@@ -124,8 +124,6 @@ A VS Code-style **Changes panel** (Staged / Changes / Untracked groups, per-file
 
 **Worktree management** is especially handy for running several agents in parallel: when the project root isn't a repo itself, it **scans downward for sub-repos** and groups them by main worktree, with checkable group headers (multi-select / select-all) so you can **create one worktree per checked repo in a single action** (the branch dropdown offers the intersection of all repos' branches). Any worktree can be turned into a project in one click — mounted under its parent as a sub-project — or just opened in a terminal. **When an AI agent deletes a worktree from the terminal**, the list reconciles itself the moment the window regains focus: sub-projects whose directory is gone are removed along with their terminal resources, leaving no stale entries (cleanup only runs while the parent project still exists, so a disconnected drive can't wipe entries).
 
-![Git integration](docs/screenshots/git.png)
-
 ---
 
 ## And a pile of details tuned for working alongside AI

@@ -153,8 +153,6 @@ Watch the AI running on your desktop from your phone while you're out, and send 
 - **Multi-repo discovery** — Automatically scans all Git repos under the project directory (recursing 5 levels, skipping `node_modules` etc.).
 - **Worktree management** — Right-click a project or the repo bar at the top of the Git panel to open the "Worktree management" dialog: list every worktree, create one from an existing branch or a new branch, remove it (force optional), and prune stale entries, with the repo list refreshing immediately after any change; a worktree can be turned into a project in one click or opened directly in a terminal, and panes support a working-directory override that persists with the layout and is inherited by splits. When the project root itself isn't a repo, it scans downward for sub-repos and groups them by main worktree into a list whose group headers are checkable (multi-select / select-all), creating one worktree per checked repo in a single action — the branch dropdown then offers the intersection of all repos' branches, the path field becomes a parent directory previewing the `<repo>-<branch>` landing spot, and failures are listed per repo.
 
-![Git integration](screenshots/git.png)
-
 ### Appearance & Configuration
 
 - **Icon sidebar + three-column layout** — A persistent icon bar on the far left (collapse middle column / Sessions / Git / Settings / SSH); the middle column stacks Projects over Files and collapses as a whole; the terminal sits on the right. Sessions / Git are now floating drawers that slide out from the right edge over the terminal (mutually exclusive single panel, left-edge drag to resize with persisted width, ✕ to close), with a blue vertical bar indicating the active state.
