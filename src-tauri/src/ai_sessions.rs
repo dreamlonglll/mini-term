@@ -1638,7 +1638,16 @@ fn claude_user_texts(path: &Path, cap: usize) -> Vec<String> {
 }
 
 /// 在项目的 Claude 桶目录里按 id 找会话文件。
+/// id 会拼进路径,而自记账边的来源是前端持久化 config(不可信输入),
+/// 白名单同 lookup_ai_session_cwd,防 `../` 一类拼接。
 fn find_claude_session_file(project_dirs: &[PathBuf], session_id: &str) -> Option<PathBuf> {
+    if session_id.is_empty()
+        || !session_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return None;
+    }
     let name = format!("{session_id}.jsonl");
     project_dirs.iter().map(|d| d.join(&name)).find(|p| p.is_file())
 }
@@ -1806,6 +1815,15 @@ mod tests {
     use super::*;
 
     // ---- 会话分支链路 ----
+
+    #[test]
+    fn find_claude_session_file_rejects_non_whitelist_id() {
+        // 自记账边 id 来自前端持久化 config,拼路径前必须过白名单
+        let dirs = vec![PathBuf::from("/nonexistent")];
+        assert!(find_claude_session_file(&dirs, "../../etc/passwd").is_none());
+        assert!(find_claude_session_file(&dirs, "a b").is_none());
+        assert!(find_claude_session_file(&dirs, "").is_none());
+    }
 
     #[test]
     fn claude_fork_edge_takes_first_forked_from() {
