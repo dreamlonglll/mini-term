@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
+import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { useAppStore, findPaneContextByPty } from '../store';
 import { getOrCreateTerminal, getCachedTerminal, activateWebgl, getTerminalTheme, DARK_TERMINAL_THEME, writePtyInput, copyTerminalSelection, pasteToTerminal, resolveTerminalFontFamily, reloadLigaturesForPty, resetRenderStateForPty } from '../utils/terminalCache';
@@ -7,7 +8,7 @@ import { showContextMenu, type MenuEntry } from '../utils/contextMenu';
 import { isFileDragging, getFileDragPath, FILE_DRAG_CANCEL_EVENT } from '../utils/fileDragState';
 import { branchCapsForAgent } from '../utils/sessionBranch';
 import { forkPaneSession } from '../utils/paneActions';
-import { buildBranchSubmenu, fetchFamilyRows } from '../utils/sessionJump';
+import { PaneBranchPopover } from './PaneBranchPopover';
 import { useT, t } from '../i18n';
 import type { SshConnection } from '../types';
 import '@xterm/xterm/css/xterm.css';
@@ -84,6 +85,14 @@ export function TerminalInstance({ ptyId }: Props) {
   const t = useT();
   const containerRef = useRef<HTMLDivElement>(null);
   const [fileDrag, setFileDrag] = useState(false);
+  // 终端右键「查看会话分支」的浮层(与 PaneGroup 的 tab 右键入口同一浮层组件)
+  const [branchPopover, setBranchPopover] = useState<{
+    projectId: string;
+    projectPath: string;
+    paneId: string;
+    sessionId: string;
+    anchor: { x: number; y: number };
+  } | null>(null);
   // 拖选停留 2s 自动复制:气泡位置(相对终端容器),null = 不显示
   const [copiedTip, setCopiedTip] = useState<{ x: number; y: number } | null>(null);
   const terminalFontSize = useAppStore((s) => s.config.terminalFontSize);
@@ -332,22 +341,15 @@ export function TerminalInstance({ ptyId }: Props) {
     }
   }, [ptyId]);
 
-  const handleContextMenu = async (e: React.MouseEvent<HTMLDivElement>) => {
+  const handleContextMenu = (e: React.MouseEvent<HTMLDivElement>) => {
     e.preventDefault();
     const { clientX, clientY } = e;
     const hasSelection = !!getCachedTerminal(ptyId)?.term.getSelection();
     // 会话分支入口:终端本体右键与 tab 右键同权(用户在哪右键都找得到)。
-    // 显隐同 PaneGroup 口径:有 hook 上报的会话身份且 agent 有 fork 能力位。
-    // 分支列表做成悬停展开的子菜单 —— 弹菜单前先取家族(读文件头,本地毫秒级)
+    // 显隐同 PaneGroup 口径:有 hook 上报的会话身份且 agent 有 fork 能力位
     const paneCtx = findPaneContextByPty(ptyId);
     const session = paneCtx?.pane.aiSession;
     const forkCmd = session ? branchCapsForAgent(session.agent)?.forkCommand(session.sessionId) : null;
-    const projectPath = paneCtx
-      ? useAppStore.getState().config.projects.find((p) => p.id === paneCtx.projectId)?.path
-      : undefined;
-    const familyRows = paneCtx && session && forkCmd && projectPath
-      ? await fetchFamilyRows(projectPath, session.sessionId).catch(() => [])
-      : null;
     const menu: MenuEntry[] = [
       {
         label: t('terminal.copy'),
@@ -361,7 +363,7 @@ export function TerminalInstance({ ptyId }: Props) {
           getCachedTerminal(ptyId)?.term.focus();
         },
       },
-      ...(paneCtx && session && familyRows !== null ? [
+      ...(paneCtx && session && forkCmd ? [
         { separator: true as const },
         {
           label: t('paneGroup.forkSession'),
@@ -369,11 +371,18 @@ export function TerminalInstance({ ptyId }: Props) {
         },
         {
           label: t('paneGroup.viewSessionBranches'),
-          submenu: buildBranchSubmenu(familyRows, {
-            projectId: paneCtx.projectId,
-            paneId: paneCtx.pane.id,
-            currentSessionId: session.sessionId,
-          }),
+          onClick: () => {
+            const projectPath = useAppStore.getState().config.projects
+              .find((p) => p.id === paneCtx.projectId)?.path;
+            if (!projectPath) return;
+            setBranchPopover({
+              projectId: paneCtx.projectId,
+              projectPath,
+              paneId: paneCtx.pane.id,
+              sessionId: session.sessionId,
+              anchor: { x: clientX, y: clientY },
+            });
+          },
         },
       ] : []),
       { separator: true },
@@ -425,6 +434,19 @@ export function TerminalInstance({ ptyId }: Props) {
           </div>
         )}
       </div>
+
+      {/* 会话分支浮层:portal 到 body,onClose 收 state */}
+      {branchPopover && createPortal(
+        <PaneBranchPopover
+          projectId={branchPopover.projectId}
+          projectPath={branchPopover.projectPath}
+          paneId={branchPopover.paneId}
+          sessionId={branchPopover.sessionId}
+          anchor={branchPopover.anchor}
+          onClose={() => setBranchPopover(null)}
+        />,
+        document.body,
+      )}
     </div>
   );
 }

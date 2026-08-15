@@ -216,6 +216,7 @@ export type AiVendor =
   | 'grok'
   | 'qwen'
   | 'deepseek'
+  | 'zhipu'
   | 'copilot'
   | 'ollama';
 
@@ -387,6 +388,9 @@ export interface AiSession {
   sessionType: 'claude' | 'codex' | 'grok';
   title: string;
   timestamp: string; // ISO 8601
+  /** 会话最新使用的模型(后端尾窗反扫)。CLI ≠ 模型厂商——分支 UI 按它推
+   *  厂商图标(vendorForSession);undefined = 识别不出,回落 CLI 图标 */
+  model?: string;
   /** 会话来源:有值 = 该 WSL 发行版内的会话,undefined = Windows 宿主会话 */
   wslDistro?: string;
   /** 会话来源:有值 = 该 SSH 连接指向的远程机器上的会话（与 wslDistro 互斥） */

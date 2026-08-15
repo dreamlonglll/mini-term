@@ -22,6 +22,8 @@ const RULES: [AiVendor, RegExp][] = [
   ['grok', /\b(grok|xai)\b/i],
   ['qwen', /\b(qwen|dashscope)\b/i],
   ['deepseek', /\bdeepseek\b/i],
+  // chatglm 后常直接跟版本号(chatglm3)无词边界,单独放行
+  ['zhipu', /\b(glm|zhipu)\b|chatglm/i],
   ['copilot', /\bcopilot\b/i],
   ['ollama', /\bollama\b/i],
   ['openai', /\b(codex|openai|gpt|o[1-4])\b/i],
@@ -35,4 +37,20 @@ export function inferVendor(input: { agent?: string; command?: string }): AiVend
     }
   }
   return null;
+}
+
+/** CLI 类型 → 厂商(会话记录来源的兜底图标)。 */
+const CLI_VENDOR: Record<string, AiVendor> = { claude: 'claude', codex: 'openai', grok: 'grok' };
+
+/**
+ * 会话的厂商图标口径(分支树/浮层用):**最新模型名优先**——claude CLI 挂
+ * GLM/DeepSeek 中转是常见用法,CLI ≠ 模型厂商;模型识别不出回落 CLI 图标。
+ * pane tab 的图标刻意**不用**这个口径(它表达「跑的是哪个 CLI」,与状态灯/hook 语义绑定)。
+ */
+export function vendorForSession(session: { sessionType: string; model?: string }): AiVendor | null {
+  return (
+    (session.model ? inferVendor({ command: session.model }) : null)
+    ?? CLI_VENDOR[session.sessionType]
+    ?? null
+  );
 }

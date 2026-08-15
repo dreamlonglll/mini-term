@@ -809,6 +809,8 @@ async fn scan_remote_claude(
             session_type: "claude".to_string(),
             title,
             timestamp,
+            // 远程文件尾窗反扫要再走一趟 SFTP,不值当;识别不出回落 CLI 图标
+            model: None,
             wsl_distro: None,
             ssh_connection_id: Some(conn_id.to_string()),
         });
@@ -936,6 +938,7 @@ async fn scan_remote_codex(
             session_type: "codex".to_string(),
             title,
             timestamp,
+            model: None,
             wsl_distro: None,
             ssh_connection_id: Some(conn_id.to_string()),
         });

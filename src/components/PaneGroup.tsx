@@ -23,7 +23,7 @@ import {
   splitPane,
 } from '../utils/paneActions';
 import { branchCapsForAgent } from '../utils/sessionBranch';
-import { buildBranchSubmenu, fetchFamilyRows } from '../utils/sessionJump';
+import { PaneBranchPopover } from './PaneBranchPopover';
 import { hotkeyLabel } from '../utils/hotkeys';
 import { openTerminalSearch } from '../utils/terminalSearch';
 import { MOD_LABEL } from '../utils/platform';
@@ -275,6 +275,12 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
   }, [tabPreview, closeTabPreview]);
 
   const [markerOpen, setMarkerOpen] = useState(false);
+  // 「查看会话分支」浮层(挂 portal,anchor 取右键点)
+  const [branchPopover, setBranchPopover] = useState<{
+    paneId: string;
+    sessionId: string;
+    anchor: { x: number; y: number };
+  } | null>(null);
   const [markerAnchor, setMarkerAnchor] = useState<{ top: number; right: number } | null>(null);
   const markers = useAppStore(
     (s) => (activePane?.ptyId !== undefined && s.markersByPty.get(activePane.ptyId)) || EMPTY_MARKERS,
@@ -331,33 +337,29 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
     useAppStore.getState().resetPaneForReconnect(projectId, activePane.id);
   }, [activePane, projectId]);
 
-  const paneContextMenu = useCallback(async (e: React.MouseEvent, paneId: string) => {
+  const paneContextMenu = useCallback((e: React.MouseEvent, paneId: string) => {
     e.preventDefault();
     e.stopPropagation();
     const { clientX, clientY } = e;
     // 会话分支入口:pane 有 AI 会话身份且该 agent 有 fork 能力位才出现
-    // (claude/codex;grok 无 CLI 级 fork,opencode/pi 无会话记录,均隐藏)。
-    // 分支列表是悬停展开的子菜单,弹菜单前先取家族(读文件头,本地毫秒级)
+    // (claude/codex;grok 无 CLI 级 fork,opencode/pi 无会话记录,均隐藏)
     const session = node.panes.find((p) => p.id === paneId)?.aiSession;
     const canFork = !!session && !!branchCapsForAgent(session.agent)?.forkCommand(session.sessionId);
-    const familyRows = canFork && session
-      ? await fetchFamilyRows(projectPath, session.sessionId).catch(() => [])
-      : null;
     showContextMenu(clientX, clientY, [
       { label: t('paneGroup.rename'), shortcut: hotkeyLabel('renamePane'), onClick: () => void renamePane(projectId, paneId) },
       { separator: true },
       { label: t('paneGroup.splitRight'), shortcut: hotkeyLabel('splitRight'), onClick: () => void splitPane(projectId, 'horizontal', paneId) },
       { label: t('paneGroup.splitDown'), shortcut: hotkeyLabel('splitDown'), onClick: () => void splitPane(projectId, 'vertical', paneId) },
-      ...(session && familyRows !== null ? [
+      ...(canFork && session ? [
         { separator: true as const },
         // 新 pane 是新进程,「本会话允许」的权限授权不迁移(官方行为)
         { label: t('paneGroup.forkSession'), onClick: () => void forkPaneSession(projectId, paneId) },
         {
           label: t('paneGroup.viewSessionBranches'),
-          submenu: buildBranchSubmenu(familyRows, {
-            projectId,
+          onClick: () => setBranchPopover({
             paneId,
-            currentSessionId: session.sessionId,
+            sessionId: session.sessionId,
+            anchor: { x: clientX, y: clientY },
           }),
         },
       ] : []),
@@ -365,7 +367,7 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
       { label: t('paneGroup.closeTab'), onClick: () => void closePane(projectId, paneId) },
       { label: t('paneGroup.closePane'), shortcut: hotkeyLabel('closePane'), danger: true, onClick: () => void closeLeaf(projectId, paneId) },
     ]);
-  }, [projectId, projectPath, t, node.panes]);
+  }, [projectId, t, node.panes]);
 
   if (!activePane) return null;
 
@@ -604,6 +606,19 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
           document.body,
         );
       })()}
+
+      {/* 会话分支浮层:pane 被关掉那一帧就不画（同缩略图的渲染 gate 口径） */}
+      {branchPopover && node.panes.some((p) => p.id === branchPopover.paneId) && createPortal(
+        <PaneBranchPopover
+          projectId={projectId}
+          projectPath={projectPath}
+          paneId={branchPopover.paneId}
+          sessionId={branchPopover.sessionId}
+          anchor={branchPopover.anchor}
+          onClose={() => setBranchPopover(null)}
+        />,
+        document.body,
+      )}
     </div>
   );
 }

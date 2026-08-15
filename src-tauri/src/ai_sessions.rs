@@ -38,6 +38,12 @@ pub struct AiSession {
     pub session_type: String, // "claude" | "codex" | "grok"
     pub title: String,
     pub timestamp: String, // ISO 8601
+    /// 会话最新使用的模型（Claude: 尾窗反扫 assistant 行 message.model;
+    /// Codex: turn_context 的 payload.model; Grok: summary.json 的
+    /// current_model_id）。前端按模型名推厂商图标——CLI ≠ 模型厂商
+    /// （claude CLI 挂 GLM/DeepSeek 中转是常见用法）。None = 识别不出,回落 CLI 图标。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// 会话来源:Some = 该 WSL 发行版内的会话,None = Windows 宿主会话。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wsl_distro: Option<String>,
@@ -376,6 +382,7 @@ fn get_claude_sessions_in(
             session_type: "claude".to_string(),
             title,
             timestamp,
+            model: latest_model_from_file_tail(&path),
             wsl_distro: wsl_distro.map(String::from),
             ssh_connection_id: None,
         });
@@ -726,6 +733,7 @@ fn try_read_codex_session(
         session_type: "codex".to_string(),
         title,
         timestamp,
+        model: latest_model_from_file_tail(path),
         wsl_distro: wsl_distro.map(String::from),
         ssh_connection_id: None,
     })
@@ -1193,6 +1201,7 @@ struct GrokSummary {
     id: String,
     title: String,
     timestamp: String,
+    model: Option<String>,
 }
 
 fn read_grok_summary(session_dir: &Path) -> Option<GrokSummary> {
@@ -1221,7 +1230,12 @@ fn read_grok_summary(session_dir: &Path) -> Option<GrokSummary> {
         .filter(|s| !s.trim().is_empty())
         .unwrap_or("(无标题)")
         .to_string();
-    Some(GrokSummary { id, title, timestamp })
+    let model = v
+        .get("current_model_id")
+        .and_then(|s| s.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    Some(GrokSummary { id, title, timestamp, model })
 }
 
 /// Windows 宿主视角的 grok 会话扫描
@@ -1245,6 +1259,7 @@ fn get_grok_sessions(project_path: &str) -> Vec<AiSession> {
                     session_type: "grok".to_string(),
                     title: s.title,
                     timestamp: s.timestamp,
+                    model: s.model,
                     wsl_distro: None,
                     ssh_connection_id: None,
                 });
@@ -1514,6 +1529,48 @@ fn claude_branch_title(path: &Path) -> Option<String> {
     claude_branch_title_from_lines(lines.iter().map(String::as_str))
 }
 
+/// 从行迭代器（按文件顺序）提取**最后一个**模型名。Claude 的 assistant 行在
+/// `message.model`，Codex 的 turn_context 行在 `payload.model`，一个口径通吃；
+/// `<synthetic>`（错误占位）与空串不算。行级纯函数。
+pub(crate) fn latest_model_from_lines<'a>(
+    lines: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    let mut model = None;
+    for line in lines {
+        if !line.contains("\"model\"") {
+            continue;
+        }
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let m = obj
+            .pointer("/message/model")
+            .or_else(|| obj.pointer("/payload/model"))
+            .and_then(|v| v.as_str());
+        if let Some(m) = m {
+            if !m.is_empty() && !m.starts_with('<') {
+                model = Some(m.to_string());
+            }
+        }
+    }
+    model
+}
+
+/// 最新模型只会在文件尾部：读尾窗而不是整个文件（会话文件可达数 MB）。
+/// 尾窗起点可能切进半行/多字节字符，lossy 转换后那半行 JSON 解析自然失败跳过。
+const MODEL_TAIL_WINDOW: u64 = 64 * 1024;
+
+fn latest_model_from_file_tail(path: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    f.seek(SeekFrom::Start(len.saturating_sub(MODEL_TAIL_WINDOW))).ok()?;
+    let mut bytes = Vec::new();
+    f.read_to_end(&mut bytes).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    latest_model_from_lines(text.lines())
+}
+
 fn scan_claude_lineage(project_path: &str) -> Vec<LineageEdge> {
     let Some(home) = home_dir() else {
         return vec![];
@@ -1671,6 +1728,21 @@ mod tests {
         assert!(codex_fork_edge_from_meta_line(self_ref).is_none());
         let not_meta = r#"{"type":"response_item","payload":{"id":"c","forked_from_id":"p"}}"#;
         assert!(codex_fork_edge_from_meta_line(not_meta).is_none());
+    }
+
+    #[test]
+    fn latest_model_takes_last_and_skips_synthetic() {
+        let lines = [
+            r#"{"type":"assistant","message":{"model":"claude-opus-5","usage":{}}}"#,
+            r#"{"type":"turn_context","payload":{"model":"gpt-5.2-codex"}}"#,
+            r#"{"type":"assistant","message":{"model":"<synthetic>","usage":{}}}"#,
+        ];
+        // 取最后一个合法命中(<synthetic> 不算),message.model 与 payload.model 一个口径
+        assert_eq!(
+            latest_model_from_lines(lines.iter().copied()).as_deref(),
+            Some("gpt-5.2-codex"),
+        );
+        assert_eq!(latest_model_from_lines([r#"{"type":"user"}"#].iter().copied()), None);
     }
 
     #[test]
@@ -1969,6 +2041,7 @@ mod tests {
             session_type: "claude".into(),
             title: "t".into(),
             timestamp: "2026-07-05T00:00:00Z".into(),
+            model: None,
             wsl_distro: None,
             ssh_connection_id: None,
         };

@@ -14,6 +14,7 @@ import { BrandIcon } from './BrandIcon';
 import { StatusDot } from './StatusDot';
 import { useT, t } from '../i18n';
 import type { AiVendor } from '../utils/inferVendor';
+import { vendorForSession } from '../utils/inferVendor';
 import type { AiSession, LineageEdge, ProjectConfig } from '../types';
 
 // 懒加载：SessionViewerModal 连带 react-markdown（数百 KB），首次查看会话正文才拉 chunk
@@ -330,7 +331,10 @@ export function SessionList() {
         )}
 
         {rows.map(({ session, prefix, displayTitle }) => {
-          const vendor = TYPE_VENDOR[session.sessionType] ?? 'claude';
+          // 树视图按最新模型推厂商图标(CLI ≠ 模型厂商);平铺沿用 CLI 图标
+          const vendor = viewMode === 'tree'
+            ? vendorForSession(session)
+            : (TYPE_VENDOR[session.sessionType] ?? 'claude');
           // 远程会话标识:显示来源连接名(连接被删时回退 'SSH')
           const remoteConnName = session.sshConnectionId
             ? (config.sshConnections.find((c) => c.id === session.sshConnectionId)?.name ?? 'SSH')
