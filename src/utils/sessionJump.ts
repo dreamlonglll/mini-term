@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import { useAppStore } from '../store';
+import { useAppStore, saveLayoutToConfig, setPaneAiSessionByPty } from '../store';
 import { collectPanes } from './layoutOps';
 import { activatePane, newTerminal } from './paneActions';
 import {
@@ -94,4 +94,14 @@ export async function jumpToSession(projectId: string, session: AiSession): Prom
   const pane = await newTerminal(projectId, undefined, { cwd });
   if (!pane || pane.ptyId === undefined) return;
   void writePtyInput(pane.ptyId, `${cmd}\r`);
+  // 恢复出的会话身份当场写回 pane，不等 hook —— codex resume 不会重新上报
+  // SessionStart（与 PaneGroup 续接链路同一口径），干等会让新 pane 永远拿不到
+  // 身份，右键的分支入口随之消失；claude 会上报同 id 幂等覆盖。身份随布局
+  // 持久化，重启自动续接顺带受益。
+  setPaneAiSessionByPty(pane.ptyId, {
+    agent: session.sessionType,
+    sessionId: session.id,
+    cwd,
+  });
+  saveLayoutToConfig(projectId);
 }
