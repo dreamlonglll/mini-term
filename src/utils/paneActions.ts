@@ -176,9 +176,13 @@ export async function splitPane(
  * `--resume {id} --fork-session`，Codex: `codex fork {id}`），PTY 内核缓冲
  * stdin、shell 就绪前写入不丢（与重启自动续接同一时序）。
  *
- * 新 PTY 的启动目录优先取会话记录的 cwd —— claude --resume 只认「启动目录」
- * 对应的会话桶（与 PaneGroup 续接链路同一坑）；无记录时继承源 pane。
- * 自记账：新会话身份由 hook 上报后落边，见 store.consumePendingFork。
+ * 新 PTY 的启动目录与源会话保持一致，取值链：hook 上报的 session.cwd →
+ * （claude 系且无记录时）lookup_ai_session_cwd 反查（服务端带 is_dir 校验）→
+ * 源 pane 目录。claude --resume 只认「启动目录」对应的会话桶，起于子目录的
+ * 会话在别的目录 fork 会报 No conversation found（与 PaneGroup 续接同一坑）；
+ * codex 不按目录分桶，继承源 pane 目录即可（还避开它的 resume_cwd 选目录提问）。
+ * 会话目录可能已删（worktree 移除）——spawn 失败回落源 pane 默认目录重试，
+ * 不让分支动作失败了事。自记账：新会话身份由 hook 上报后落边，见 store.consumePendingFork。
  */
 export async function forkPaneSession(projectId: string, paneId: string): Promise<void> {
   const { layout } = snapshot(projectId);
@@ -189,7 +193,15 @@ export async function forkPaneSession(projectId: string, paneId: string): Promis
   const cmd = branchCapsForAgent(agent)?.forkCommand(session.sessionId);
   if (!cmd) return;
 
-  const pane = await splitPane(projectId, 'horizontal', paneId, { cwd: session.cwd });
+  let cwd = session.cwd;
+  if (!cwd && agent !== 'codex' && /^[A-Za-z0-9_-]+$/.test(session.sessionId)) {
+    cwd = (await invoke<string | null>('lookup_ai_session_cwd', { sessionId: session.sessionId })
+      .catch(() => null)) ?? undefined;
+  }
+  let pane = await splitPane(projectId, 'horizontal', paneId, { cwd });
+  if (!pane && cwd) {
+    pane = await splitPane(projectId, 'horizontal', paneId);
+  }
   if (!pane || pane.ptyId === undefined) return;
   registerPendingFork(pane.ptyId, agent, session.sessionId);
   void writePtyInput(pane.ptyId, `${cmd}\r`);

@@ -25,7 +25,6 @@ export const sessionList = {
     branchTree: {
       runningIn: "正在「{project}」运行，点击跳转",
       clickToResume: "点击在新终端恢复此会话",
-      forkedFromTip: "分支自父会话",
       remoteResumeUnsupported: "WSL / 远程来源的会话无法在本机恢复",
     },
   },
@@ -55,7 +54,6 @@ export const sessionList = {
     branchTree: {
       runningIn: "Running in \"{project}\", click to jump",
       clickToResume: "Click to resume in a new terminal",
-      forkedFromTip: "Forked from parent session",
       remoteResumeUnsupported: "WSL / remote sessions can't be resumed on this machine",
     },
   },

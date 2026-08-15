@@ -20,7 +20,10 @@ import type { AiSession, LineageEdge, PaneState } from '../types';
  * tab 写 resume 命令恢复。
  */
 
-/** 按 sessionId 跨全部项目找「活着」的 pane（pty 在且未退出）。 */
+/** 按 sessionId 跨全部项目找「在跑」的 pane。三个条件缺一不可：会话身份匹配、
+ *  PTY 活着、状态是 ai-working/ai-idle —— aiSession 在 AI 退出后为续接语义
+ *  刻意保留（status 落回 idle），只看身份会把「claude 已退出的 shell」当成
+ *  在跑，点击分支节点跳过去对着一个死会话，而不是按口径新终端恢复。 */
 export function findLiveSessionPane(
   sessionId: string,
 ): { projectId: string; paneId: string; status: PaneState['status'] } | null {
@@ -32,6 +35,7 @@ export function findLiveSessionPane(
         pane.aiSession?.sessionId === sessionId
         && pane.ptyId !== undefined
         && !exitedPtyIds.has(pane.ptyId)
+        && (pane.status === 'ai-working' || pane.status === 'ai-idle')
       ) {
         return { projectId, paneId: pane.id, status: pane.status };
       }
@@ -40,7 +44,7 @@ export function findLiveSessionPane(
   return null;
 }
 
-/** sessionId 所在家族的连线行（右键子菜单 / 树视图共用的取数口径：
+/** sessionId 所在家族的连线行（悬停面板 BranchFamilyPanel 的取数口径：
  *  磁盘扫描边 + 自记账边合并，磁盘优先）。找不到家族返回空数组。 */
 export async function fetchFamilyRows(
   projectPath: string,
