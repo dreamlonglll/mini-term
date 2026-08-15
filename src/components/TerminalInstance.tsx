@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { createPortal } from 'react-dom';
+import { createRoot } from 'react-dom/client';
+import { flushSync } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { useAppStore, findPaneContextByPty } from '../store';
 import { getOrCreateTerminal, getCachedTerminal, activateWebgl, getTerminalTheme, DARK_TERMINAL_THEME, writePtyInput, copyTerminalSelection, pasteToTerminal, resolveTerminalFontFamily, reloadLigaturesForPty, resetRenderStateForPty } from '../utils/terminalCache';
@@ -8,7 +9,7 @@ import { showContextMenu, type MenuEntry } from '../utils/contextMenu';
 import { isFileDragging, getFileDragPath, FILE_DRAG_CANCEL_EVENT } from '../utils/fileDragState';
 import { branchCapsForAgent } from '../utils/sessionBranch';
 import { forkPaneSession } from '../utils/paneActions';
-import { PaneBranchPopover } from './PaneBranchPopover';
+import { BranchFamilyPanel } from './BranchFamilyPanel';
 import { useT, t } from '../i18n';
 import type { SshConnection } from '../types';
 import '@xterm/xterm/css/xterm.css';
@@ -85,14 +86,6 @@ export function TerminalInstance({ ptyId }: Props) {
   const t = useT();
   const containerRef = useRef<HTMLDivElement>(null);
   const [fileDrag, setFileDrag] = useState(false);
-  // 终端右键「查看会话分支」的浮层(与 PaneGroup 的 tab 右键入口同一浮层组件)
-  const [branchPopover, setBranchPopover] = useState<{
-    projectId: string;
-    projectPath: string;
-    paneId: string;
-    sessionId: string;
-    anchor: { x: number; y: number };
-  } | null>(null);
   // 拖选停留 2s 自动复制:气泡位置(相对终端容器),null = 不显示
   const [copiedTip, setCopiedTip] = useState<{ x: number; y: number } | null>(null);
   const terminalFontSize = useAppStore((s) => s.config.terminalFontSize);
@@ -371,17 +364,20 @@ export function TerminalInstance({ ptyId }: Props) {
         },
         {
           label: t('paneGroup.viewSessionBranches'),
-          onClick: () => {
+          // 悬停展开家族树面板(连线/标题/厂商图标由 React 渲染)。
+          // flushSync 同步出首帧,contextMenu 依赖真实尺寸定位
+          submenuRender: (host: HTMLElement) => {
             const projectPath = useAppStore.getState().config.projects
               .find((p) => p.id === paneCtx.projectId)?.path;
-            if (!projectPath) return;
-            setBranchPopover({
-              projectId: paneCtx.projectId,
-              projectPath,
-              paneId: paneCtx.pane.id,
-              sessionId: session.sessionId,
-              anchor: { x: clientX, y: clientY },
-            });
+            const root = createRoot(host);
+            flushSync(() => root.render(
+              <BranchFamilyPanel
+                projectId={paneCtx.projectId}
+                projectPath={projectPath ?? ''}
+                sessionId={session.sessionId}
+              />,
+            ));
+            return () => root.unmount();
           },
         },
       ] : []),
@@ -434,19 +430,6 @@ export function TerminalInstance({ ptyId }: Props) {
           </div>
         )}
       </div>
-
-      {/* 会话分支浮层:portal 到 body,onClose 收 state */}
-      {branchPopover && createPortal(
-        <PaneBranchPopover
-          projectId={branchPopover.projectId}
-          projectPath={branchPopover.projectPath}
-          paneId={branchPopover.paneId}
-          sessionId={branchPopover.sessionId}
-          anchor={branchPopover.anchor}
-          onClose={() => setBranchPopover(null)}
-        />,
-        document.body,
-      )}
     </div>
   );
 }

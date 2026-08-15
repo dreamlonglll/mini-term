@@ -13,10 +13,8 @@ export const paneGroup = {
     forkSession: "分支会话到新分屏",
     viewSessionBranches: "查看会话分支",
     branchPopover: {
-      title: "会话分支",
       empty: "该会话没有分支记录",
       current: "← 当前",
-      forkAgain: "从当前分支再岔一条 ⇢ 新分屏",
     },
     closeTab: "关闭此终端",
     closeTabLabel: "关闭终端「{label}」",
@@ -43,10 +41,8 @@ export const paneGroup = {
     forkSession: "Fork session to new split",
     viewSessionBranches: "View session branches",
     branchPopover: {
-      title: "Session branches",
       empty: "No branch records for this session",
       current: "← current",
-      forkAgain: "Fork again from current ⇢ new split",
     },
     closeTab: "Close this terminal",
     closeTabLabel: "Close terminal \"{label}\"",

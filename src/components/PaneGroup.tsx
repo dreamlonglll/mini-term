@@ -1,5 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { createPortal } from 'react-dom';
+import { createRoot } from 'react-dom/client';
+import { flushSync } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { useAppStore, clearPaneResumePendingByPty, setPaneAiSessionByPty, saveLayoutToConfig } from '../store';
 import { TerminalInstance } from './TerminalInstance';
@@ -23,7 +25,7 @@ import {
   splitPane,
 } from '../utils/paneActions';
 import { branchCapsForAgent } from '../utils/sessionBranch';
-import { PaneBranchPopover } from './PaneBranchPopover';
+import { BranchFamilyPanel } from './BranchFamilyPanel';
 import { hotkeyLabel } from '../utils/hotkeys';
 import { openTerminalSearch } from '../utils/terminalSearch';
 import { MOD_LABEL } from '../utils/platform';
@@ -275,12 +277,6 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
   }, [tabPreview, closeTabPreview]);
 
   const [markerOpen, setMarkerOpen] = useState(false);
-  // 「查看会话分支」浮层(挂 portal,anchor 取右键点)
-  const [branchPopover, setBranchPopover] = useState<{
-    paneId: string;
-    sessionId: string;
-    anchor: { x: number; y: number };
-  } | null>(null);
   const [markerAnchor, setMarkerAnchor] = useState<{ top: number; right: number } | null>(null);
   const markers = useAppStore(
     (s) => (activePane?.ptyId !== undefined && s.markersByPty.get(activePane.ptyId)) || EMPTY_MARKERS,
@@ -356,11 +352,19 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
         { label: t('paneGroup.forkSession'), onClick: () => void forkPaneSession(projectId, paneId) },
         {
           label: t('paneGroup.viewSessionBranches'),
-          onClick: () => setBranchPopover({
-            paneId,
-            sessionId: session.sessionId,
-            anchor: { x: clientX, y: clientY },
-          }),
+          // 悬停展开家族树面板(连线/标题/厂商图标由 React 渲染)。
+          // flushSync 同步出首帧,contextMenu 依赖真实尺寸定位
+          submenuRender: (host: HTMLElement) => {
+            const root = createRoot(host);
+            flushSync(() => root.render(
+              <BranchFamilyPanel
+                projectId={projectId}
+                projectPath={projectPath}
+                sessionId={session.sessionId}
+              />,
+            ));
+            return () => root.unmount();
+          },
         },
       ] : []),
       { separator: true },
@@ -606,19 +610,6 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
           document.body,
         );
       })()}
-
-      {/* 会话分支浮层:pane 被关掉那一帧就不画（同缩略图的渲染 gate 口径） */}
-      {branchPopover && node.panes.some((p) => p.id === branchPopover.paneId) && createPortal(
-        <PaneBranchPopover
-          projectId={projectId}
-          projectPath={projectPath}
-          paneId={branchPopover.paneId}
-          sessionId={branchPopover.sessionId}
-          anchor={branchPopover.anchor}
-          onClose={() => setBranchPopover(null)}
-        />,
-        document.body,
-      )}
     </div>
   );
 }

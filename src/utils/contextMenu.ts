@@ -9,6 +9,11 @@ export interface MenuItem {
   onClick?: () => void;
   /** 存在时该项为子菜单父项，悬停展开 submenu，自身点击不触发动作 */
   submenu?: MenuEntry[];
+  /** 自定义子面板：悬停时在子菜单的位置挂一个宿主元素，内容交由调用方渲染
+   *  （典型用法：createRoot + flushSync 同步渲染 React 组件，宿主定位依赖
+   *  渲染完成后的真实尺寸）。返回清理函数，面板收起/菜单关闭时调用。
+   *  与 submenu 互斥；悬停展开、互斥、随菜单关闭的生命周期与 submenu 一致。 */
+  submenuRender?: (host: HTMLElement) => () => void;
 }
 
 export interface MenuSeparator {
@@ -38,9 +43,12 @@ export function showContextMenu(x: number, y: number, items: MenuEntry[]) {
   const submenus: HTMLElement[] = [];
   // 与 submenus 同步入栈:记录每层子菜单是从哪一项展开的(ArrowLeft 收起时把焦点还给它)
   const submenuOwners: HTMLElement[] = [];
+  // 与 submenus 同步入栈:submenuRender 面板的清理函数(普通子菜单为 undefined)
+  const submenuDisposers: ((() => void) | undefined)[] = [];
   /** 关掉层级深于 level 的子菜单(level 0 = 根菜单,即全部关掉) */
   const closeSubmenusFrom = (level: number) => {
     while (submenus.length > level) {
+      submenuDisposers.pop()?.();
       submenus.pop()!.remove();
       submenuOwners.pop();
     }
@@ -208,6 +216,7 @@ export function showContextMenu(x: number, y: number, items: MenuEntry[]) {
       if (entry.danger) classes.push('danger');
       if (entry.disabled) classes.push('disabled');
       if (entry.submenu) classes.push('has-submenu');
+      if (entry.submenuRender) classes.push('has-submenu');
       item.className = classes.join(' ');
       item.setAttribute('role', 'menuitem');
       if (!entry.disabled) item.tabIndex = -1;
@@ -224,19 +233,33 @@ export function showContextMenu(x: number, y: number, items: MenuEntry[]) {
         item.appendChild(kbd);
       }
 
-      if (entry.submenu && !entry.disabled) {
+      if ((entry.submenu || entry.submenuRender) && !entry.disabled) {
         const sub = entry.submenu;
+        const render = entry.submenuRender;
         item.setAttribute('aria-haspopup', 'menu');
         item.onmouseenter = () => {
           // 先收掉比本层更深的子菜单(含自己上次展开的那个),本层及祖先原样保留
           closeSubmenusFrom(level);
-          const child = buildMenu(sub, level + 1);
+          let child: HTMLElement;
+          let dispose: (() => void) | undefined;
+          if (sub) {
+            child = buildMenu(sub, level + 1);
+          } else {
+            // 自定义面板宿主:内容样式由调用方负责,这里只管定位与生命周期。
+            // 调用方须同步渲染(flushSync),placeInViewport 依赖真实尺寸做翻转
+            child = document.createElement('div');
+            child.className = 'fixed';
+            child.style.zIndex = '60';
+            child.style.visibility = 'hidden';
+            dispose = render!(child);
+          }
           document.body.appendChild(child);
           const rect = item.getBoundingClientRect();
           // 紧贴父项右缘展开,避免与父项之间出现鼠标可穿过的间隙
           placeInViewport(child, rect.right - 2, rect.top - 4);
           submenus.push(child);
           submenuOwners.push(item);
+          submenuDisposers.push(dispose);
         };
         // 点击子菜单父项本身不触发动作、也不关闭菜单
         item.onclick = (e) => e.stopPropagation();
