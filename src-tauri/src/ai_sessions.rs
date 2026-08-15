@@ -1504,9 +1504,47 @@ pub(crate) fn codex_fork_edge_from_meta_line(line: &str) -> Option<LineageEdge> 
         session_id: id.to_string(),
         parent_session_id: parent.to_string(),
         fork_point_uuid: None,
-        // Codex 文件没有行级复制标记，分不出「继承的历史」与「分支自己的消息」
+        // branch_title 由 scan_codex_lineage 用父会话前缀比对补齐(fork 复制
+        // 历史时连时间戳一起重写,行级标记与时间戳判据都不可用)
         branch_title: None,
     })
+}
+
+/// 文件里全部「真实用户输入」的标题序列（与 codex_user_title_from_line 同口径：
+/// 跳过 `<...>` 系统注入与 AGENTS 前缀，截断 100 字符——两侧同口径截断，等值比较成立）。
+fn codex_user_texts(path: &Path, cap: usize) -> Vec<String> {
+    let Ok(file) = fs::File::open(path) else {
+        return vec![];
+    };
+    let mut out = Vec::new();
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        // 便宜预筛:用户输入行才含 input_text(assistant 是 output_text)
+        if !line.contains("input_text") {
+            continue;
+        }
+        if let Some(t) = codex_user_title_from_line(&line) {
+            out.push(t);
+            if out.len() >= cap {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Codex 分支自己的第一问：子会话的用户消息按顺序前缀匹配父会话，
+/// 首条对不上的即分叉后的第一条自己的提问。纯函数。
+/// None = 子消息全是复制来的（分支还没提问）。
+pub(crate) fn codex_branch_title_from_texts(parent: &[String], child: &[String]) -> Option<String> {
+    let mut idx = 0;
+    for text in child {
+        if idx < parent.len() && &parent[idx] == text {
+            idx += 1;
+            continue;
+        }
+        return Some(text.clone());
+    }
+    None
 }
 
 /// 分支自己的首条用户消息：过滤掉从父会话复制来的 forkedFrom 行后，取首条
@@ -1636,7 +1674,15 @@ fn scan_codex_lineage(project_path: &str) -> Vec<LineageEdge> {
                 continue;
             };
             if PathStyle::Windows.normalize(&meta.cwd) == normalized_project {
-                if let Some(edge) = codex_fork_edge_from_meta_line(&line) {
+                if let Some(mut edge) = codex_fork_edge_from_meta_line(&line) {
+                    // 分支标题:父会话用户消息序列做前缀比对,首条对不上的即
+                    // 分叉后第一问(父文件已清理时拿不到,回落会话标题)
+                    edge.branch_title =
+                        find_codex_session_file(&sessions_dir, &edge.parent_session_id)
+                            .map(|pp| codex_user_texts(&pp, 300))
+                            .and_then(|pt| {
+                                codex_branch_title_from_texts(&pt, &codex_user_texts(&path, 300))
+                            });
                     edges.push(edge);
                 }
             }
@@ -1728,6 +1774,24 @@ mod tests {
         assert!(codex_fork_edge_from_meta_line(self_ref).is_none());
         let not_meta = r#"{"type":"response_item","payload":{"id":"c","forked_from_id":"p"}}"#;
         assert!(codex_fork_edge_from_meta_line(not_meta).is_none());
+    }
+
+    #[test]
+    fn codex_branch_title_prefix_matches_parent() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // 复制来的前缀(你好)匹配父序列,第一条对不上的是分支自己的第一问
+        assert_eq!(
+            codex_branch_title_from_texts(&s(&["你好", "改走流式"]), &s(&["你好", "试试批处理"])).as_deref(),
+            Some("试试批处理"),
+        );
+        // 从中间分叉:子只复制了父的前缀
+        assert_eq!(
+            codex_branch_title_from_texts(&s(&["a", "b", "c"]), &s(&["a", "分支问题"])).as_deref(),
+            Some("分支问题"),
+        );
+        // 分支还没提问 → None
+        assert_eq!(codex_branch_title_from_texts(&s(&["a", "b"]), &s(&["a", "b"])), None);
+        assert_eq!(codex_branch_title_from_texts(&s(&["a"]), &s(&[])), None);
     }
 
     #[test]
