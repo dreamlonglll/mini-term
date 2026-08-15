@@ -13,8 +13,10 @@ import { spawnSync } from 'node:child_process';
 import { copyFileSync, mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
+import { fileURLToPath } from 'node:url';
 
-const root = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
+// URL.pathname 在 Windows 上是 /D:/...（且空格成 %20），必须走 fileURLToPath
+const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const bundleDir = path.join(root, 'src-tauri', 'target', 'release', 'bundle');
 const outDir = path.join(root, 'release');
 const version = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8')).version;
