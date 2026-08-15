@@ -342,10 +342,11 @@ export function TerminalInstance({ ptyId }: Props) {
     // 显隐同 PaneGroup 口径:有 hook 上报的会话身份且 agent 有 fork 能力位
     const paneCtx = findPaneContextByPty(ptyId);
     const session = paneCtx?.pane.aiSession;
-    const forkCmd = session ? branchCapsForAgent(session.agent)?.forkCommand(session.sessionId) : null;
-    // 输入检测认出 AI 在跑但没有 hook 身份——置灰提示原因(与 PaneGroup 同则)
+    const forkCmd = session ? branchCapsForAgent(session.agent)?.forkCommand?.(session.sessionId) : null;
+    // 输入检测认出 AI 在跑但没有 hook 身份——置灰提示原因(与 PaneGroup 同则,
+    // 锚定 fork 位,仅 resume 的 grok 不提示)
     const identityMissing = !session && !!paneCtx?.pane.detectedAgent
-      && !!branchCapsForAgent(paneCtx.pane.detectedAgent);
+      && !!branchCapsForAgent(paneCtx.pane.detectedAgent)?.forkCommand;
     const menu: MenuEntry[] = [
       {
         label: t('terminal.copy'),

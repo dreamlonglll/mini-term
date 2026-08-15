@@ -27,14 +27,17 @@ test('能力位：claude/codex 出命令，非法 id 与未知 agent 拒绝', ()
   assert.equal(AGENT_BRANCH_CAPS.claude.resumeCommand('x;rm -rf'), null);
   // agent 归一化:与 buildResumeCommand 同口径 —— hook 上报的是 'claude-code',
   // 必须落到 claude 能力位(这里回归的是「严格匹配把入口藏掉」的实测 bug);
-  // 缺省/未知按 claude,grok/opencode/pi 显式无能力位
+  // 缺省/未知按 claude;grok 仅 resume 位(树/浮层点击可恢复,fork 入口不出现,
+  // 与平铺视图 buildResumeCommand 同口径);opencode/pi 无能力位
   assert.ok(branchCapsForAgent(undefined));
   assert.equal(
     branchCapsForAgent('claude-code').forkCommand('abc'),
     'claude --resume abc --fork-session',
   );
   assert.ok(branchCapsForAgent('Codex'));
-  assert.equal(branchCapsForAgent('grok'), null);
+  assert.equal(branchCapsForAgent('grok').resumeCommand('0198-abc'), 'grok --resume 0198-abc');
+  assert.equal(branchCapsForAgent('grok').forkCommand, undefined);
+  assert.equal(branchCapsForAgent('grok').resumeCommand('a b'), null);
   assert.equal(branchCapsForAgent('opencode'), null);
   assert.equal(branchCapsForAgent('pi'), null);
 });

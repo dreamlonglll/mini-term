@@ -190,7 +190,7 @@ export async function forkPaneSession(projectId: string, paneId: string): Promis
   const session = source?.aiSession;
   if (!session) return;
   const agent = (session.agent ?? 'claude').toLowerCase();
-  const cmd = branchCapsForAgent(agent)?.forkCommand(session.sessionId);
+  const cmd = branchCapsForAgent(agent)?.forkCommand?.(session.sessionId);
   if (!cmd) return;
 
   let cwd = session.cwd;

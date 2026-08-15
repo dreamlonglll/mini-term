@@ -89,7 +89,8 @@ export async function jumpToSession(projectId: string, session: AiSession): Prom
 
   // claude --resume 只认「启动目录」对应的会话桶：起子目录的会话在项目根恢复
   // 会报 No conversation found，先反查记录的 cwd（与 PaneGroup 续接同一坑）；
-  // codex 不按目录分桶，无需反查。
+  // codex 不按目录分桶，无需反查。grok 虽按 cwd 分桶，但列表只捞「解码目录名
+  // 全等于项目根」的会话（find_grok_cwd_dirs），新终端默认目录即正确目录。
   let cwd: string | undefined;
   if (session.sessionType === 'claude' && /^[A-Za-z0-9_-]+$/.test(session.id)) {
     cwd = (await invoke<string | null>('lookup_ai_session_cwd', { sessionId: session.id })

@@ -16,8 +16,8 @@ import type { AiSession, LineageEdge } from '../types';
 const SESSION_ID_RE = /^[A-Za-z0-9_-]+$/;
 
 export interface AgentBranchCaps {
-  /** 在新 PTY 中把 sessionId fork 成新会话的命令 */
-  forkCommand: (sessionId: string) => string | null;
+  /** 在新 PTY 中把 sessionId fork 成新会话的命令；缺席 = 该 agent 无 CLI 级 fork（grok） */
+  forkCommand?: (sessionId: string) => string | null;
   /** 在新 PTY 中恢复(接管)sessionId 的命令 */
   resumeCommand: (sessionId: string) => string | null;
 }
@@ -27,8 +27,10 @@ function guarded(template: (id: string) => string): (id: string) => string | nul
 }
 
 /**
- * 分支能力表。grok 刻意缺席：无 CLI 级 fork，`grok --resume` 是接管原会话
- * 而非复制，两处同写有风险；opencode/pi 无会话记录，同样缺席。
+ * 分支能力表。grok 只有 resume 位：无 CLI 级 fork（`--resume` 是接管原会话
+ * 而非复制），forkCommand 缺席即 pane 菜单不出分支入口；「已在跑还再恢复」
+ * 的两处同写由 jumpToSession 的 findLiveSessionPane 前置挡下。
+ * opencode/pi 无会话记录，整表缺席。
  */
 export const AGENT_BRANCH_CAPS: Record<string, AgentBranchCaps> = {
   claude: {
@@ -39,18 +41,24 @@ export const AGENT_BRANCH_CAPS: Record<string, AgentBranchCaps> = {
     forkCommand: guarded((id) => `codex fork ${id}`),
     resumeCommand: guarded((id) => `codex resume ${id}`),
   },
+  grok: {
+    // 与 buildResumeCommand 的 grok 模板同一条命令；会话按 cwd 分桶,由调用方
+    // 保证目录正确(树/浮层列表只含「解码目录名全等于项目根」的会话)
+    resumeCommand: guarded((id) => `grok --resume ${id}`),
+  },
 };
 
 /**
  * agent 标识 → 能力表，与 buildResumeCommand 同一归一化口径：codex/grok 显式
  * 分流，**其余一律按 Claude**（hook 上报的标识是 `claude-code`，不是 `claude`；
- * AiSessionRef 的约定即「agent 缺省按 Claude 处理」）。grok 无 CLI 级 fork、
- * opencode/pi 无会话记录，显式排除。
+ * AiSessionRef 的约定即「agent 缺省按 Claude 处理」）。grok 仅 resume 位（无
+ * CLI 级 fork）；opencode/pi 无会话记录，显式排除。
  */
 export function branchCapsForAgent(agent: string | undefined): AgentBranchCaps | null {
   const a = (agent ?? 'claude').toLowerCase();
   if (a === 'codex') return AGENT_BRANCH_CAPS.codex;
-  if (a === 'grok' || a === 'opencode' || a === 'pi') return null;
+  if (a === 'grok') return AGENT_BRANCH_CAPS.grok;
+  if (a === 'opencode' || a === 'pi') return null;
   return AGENT_BRANCH_CAPS.claude;
 }
 
