@@ -31,8 +31,8 @@ use tauri::AppHandle;
 use crate::ai_sessions::{
     claude_message_from_line, claude_session_info_from_lines, codex_message_from_line,
     codex_meta_from_line, codex_user_title_from_line, encode_project_path, is_encoded_variant,
-    normalize_unix_path, session_cache, AiSession, AiSessionMessage, CachedSessions,
-    MAX_SESSIONS_PER_SOURCE, MAX_TOTAL_SESSIONS,
+    normalize_unix_path, session_cache, session_id_path_safe, AiSession, AiSessionMessage,
+    CachedSessions, MAX_SESSIONS_PER_SOURCE, MAX_TOTAL_SESSIONS,
 };
 use crate::fs::{natural_cmp, FileEntry, ALWAYS_IGNORE};
 
@@ -809,6 +809,8 @@ async fn scan_remote_claude(
             session_type: "claude".to_string(),
             title,
             timestamp,
+            // 远程文件尾窗反扫要再走一趟 SFTP,不值当;识别不出回落 CLI 图标
+            model: None,
             wsl_distro: None,
             ssh_connection_id: Some(conn_id.to_string()),
         });
@@ -936,6 +938,7 @@ async fn scan_remote_codex(
             session_type: "codex".to_string(),
             title,
             timestamp,
+            model: None,
             wsl_distro: None,
             ssh_connection_id: Some(conn_id.to_string()),
         });
@@ -969,6 +972,10 @@ pub async fn ssh_remote_ai_session_content(
     project_path: String,
     offset: Option<u64>,
 ) -> Result<RemoteSessionContent, String> {
+    // id 会拼进远程路径(`<id>.jsonl`)与缓存键,统一在 command 口挡穿越
+    if !session_id_path_safe(&session_id) {
+        return Err("非法会话 id".to_string());
+    }
     let conn = find_connection(&app, &connection_id)?;
     let sftp = open_sftp(&state, &conn).await?;
     let result = async {

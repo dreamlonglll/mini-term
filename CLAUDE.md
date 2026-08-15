@@ -46,7 +46,7 @@ cd src-tauri && cargo test
 | `mobile_relay.rs` | 移动端中转体系：对中转服务器的出站 WSS 长连（带桌面端密钥握手、指数退避重连）、配对码/重置配对、项目快照与项目级增量、镜像订阅管理、移动端指令写穿 PTY、移动端发起会话的校验与派发、移动端改会话名的标题收敛 |
 | `mobile_mirror.rs` | 对话镜像：pane → 项目最新会话 JSONL 的增量解析（半行拼接）、分页取数 |
 
-**Tauri Commands**: `load_config`, `save_config`, `create_pty`, `write_pty`, `resize_pty`, `kill_pty`, `kill_all_ptys`, `set_pty_flow_paused`, `list_directory`, `watch_directory`, `unwatch_directory`, `get_ai_sessions`, `mobile_relay_apply`, `mobile_relay_status`, `mobile_relay_request_pairing_code`, `mobile_relay_reset_pairing`, `mobile_relay_update_sessions`, `mobile_relay_launchers_changed`, `mobile_relay_start_session_result`, `mobile_relay_check_launcher_command`
+**Tauri Commands**: `load_config`, `save_config`, `create_pty`, `write_pty`, `resize_pty`, `kill_pty`, `kill_all_ptys`, `set_pty_flow_paused`, `list_directory`, `watch_directory`, `unwatch_directory`, `get_ai_sessions`, `scan_session_lineage`, `mobile_relay_apply`, `mobile_relay_status`, `mobile_relay_request_pairing_code`, `mobile_relay_reset_pairing`, `mobile_relay_update_sessions`, `mobile_relay_launchers_changed`, `mobile_relay_start_session_result`, `mobile_relay_check_launcher_command`
 
 **Tauri Events（后端→前端）**: `pty-output`, `pty-exit`, `pty-status-change`, `fs-change`, `mobile-relay-status`, `mobile-relay-pairing-code`, `mobile-start-session`, `mobile-rename-pane`
 

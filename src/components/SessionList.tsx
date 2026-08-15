@@ -1,17 +1,21 @@
 import { useEffect, useState, useCallback, useRef, useMemo, lazy, Suspense } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { useAppStore } from '../store';
+import { useAppStore, persistConfig } from '../store';
 import { showContextMenu } from '../utils/contextMenu';
 import { isWslPath } from '../utils/wslPath';
 import { buildResumeCommand } from '../utils/aiResume';
 import { writePtyInput } from '../utils/terminalCache';
 import { resolveActivePane } from '../utils/layoutOps';
 import { focusPane, newTerminal } from '../utils/paneActions';
+import { buildSessionTree, flattenSessionTree, mergeLineageEdges } from '../utils/sessionBranch';
+import { findLiveSessionPane, jumpToSession } from '../utils/sessionJump';
 import { useEverOpened } from '../hooks/useOverlayMotion';
 import { BrandIcon } from './BrandIcon';
+import { StatusDot } from './StatusDot';
 import { useT, t } from '../i18n';
 import type { AiVendor } from '../utils/inferVendor';
-import type { AiSession, ProjectConfig } from '../types';
+import { vendorForSession } from '../utils/inferVendor';
+import type { AiSession, LineageEdge, ProjectConfig } from '../types';
 
 // 懒加载：SessionViewerModal 连带 react-markdown（数百 KB），首次查看会话正文才拉 chunk
 const SessionViewerModal = lazy(() => import('./SessionViewerModal').then((m) => ({ default: m.SessionViewerModal })));
@@ -100,6 +104,8 @@ export function SessionList() {
   // Windows 宿主与 WSL 两个来源各自持有 state,渲染时合并排序(分段加载:宿主先出)
   const [hostSessions, setHostSessions] = useState<AiSession[]>([]);
   const [wslSessions, setWslSessions] = useState<AiSession[]>([]);
+  // 分支边(scan_session_lineage):树视图的数据面,平铺视图不消费
+  const [lineageEdges, setLineageEdges] = useState<LineageEdge[]>([]);
   const [displayCount, setDisplayCount] = useState(PAGE_SIZE);
   const [loading, setLoading] = useState(false);
   const [wslLoading, setWslLoading] = useState(false);
@@ -119,6 +125,7 @@ export function SessionList() {
     // WSL 来源与远程互斥)。失败(含断链)后端静默降级返回空列表。
     if (project.sshConnectionId) {
       setWslSessions([]);
+      setLineageEdges([]);
       setWslLoading(false);
       setLoading(true);
       invoke<AiSession[]>('ssh_remote_ai_sessions', {
@@ -159,6 +166,22 @@ export function SessionList() {
         setLoading(false);
       });
 
+    // 分支边并行拉取:只读文件头,与会话列表同量级,失败按无分支处理。
+    // 自记账边一并传给后端:claude 的 CLI fork 不写磁盘指针,这些边的
+    // 「分叉后第一问」标题只能由后端拿父子文件比对补出
+    invoke<LineageEdge[]>('scan_session_lineage', {
+      projectPath: project.path,
+      bookkept: useAppStore.getState().config.sessionLineage ?? [],
+    })
+      .then((result) => {
+        if (requestIdRef.current !== reqId) return;
+        setLineageEdges(result);
+      })
+      .catch(() => {
+        if (requestIdRef.current !== reqId) return;
+        setLineageEdges([]);
+      });
+
     // WSL 来源:并行请求,到达后合并(9P + 可能的 VM 冷启动,秒级,不阻塞宿主显示)
     if (hasWslSource(project)) {
       setWslLoading(true);
@@ -190,11 +213,13 @@ export function SessionList() {
       // 项目切换 / 来源配置变化:先清掉上一来源的条目,避免与新项目混排
       setWslSessions([]);
       setHostSessions([]);
+      setLineageEdges([]);
       fetchSessions(activeProject, false);
     } else {
       requestIdRef.current++;
       setHostSessions([]);
       setWslSessions([]);
+      setLineageEdges([]);
       setLoading(false);
       setWslLoading(false);
       setDisplayCount(PAGE_SIZE);
@@ -212,6 +237,38 @@ export function SessionList() {
 
   const visibleSessions = allSessions.slice(0, displayCount);
   const hasMore = displayCount < allSessions.length;
+
+  // === 分支树视图（设计: docs/plans/2026-08-14-session-branch-tree-design.md）===
+  const viewMode = config.sessionListView ?? 'flat';
+  const setConfig = useAppStore((s) => s.setConfig);
+  const toggleViewMode = useCallback(() => {
+    const next = viewMode === 'flat' ? 'tree' : 'flat';
+    setConfig({ ...useAppStore.getState().config, sessionListView: next });
+    void persistConfig();
+  }, [viewMode, setConfig]);
+
+  // 树模式在跑徽章需要对 pane 状态变化保持反应性；平铺模式不订阅不重渲
+  const projectStates = useAppStore((s) => (viewMode === 'tree' ? s.projectStates : null));
+  void projectStates;
+
+  // 磁盘边 + 自记账边（磁盘优先）→ 森林 → 连线前缀行；平铺行 prefix 为空串,
+  // 两种模式共用同一渲染,树只是列表长出了结构
+  const rows = useMemo(() => {
+    if (viewMode !== 'tree') {
+      return visibleSessions.map((s) => ({ session: s, prefix: '', displayTitle: s.title }));
+    }
+    const merged = mergeLineageEdges(lineageEdges, config.sessionLineage ?? []);
+    return flattenSessionTree(buildSessionTree(allSessions, merged))
+      .slice(0, displayCount)
+      .map((r) => ({
+        session: r.node.session,
+        prefix: r.prefix,
+        // fork 整份复制让标题继承根会话,分支之间全同名 —— 分支节点优先显示
+        // 「分叉后第一问」(LineageEdge.branchTitle),没有再回落会话标题
+        displayTitle: r.node.edge?.branchTitle ?? r.node.session.title,
+      }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [viewMode, visibleSessions, allSessions, lineageEdges, config.sessionLineage, displayCount]);
 
   const loadMore = useCallback(() => {
     setDisplayCount((c) => Math.min(c + PAGE_SIZE, allSessions.length));
@@ -236,12 +293,22 @@ export function SessionList() {
           )}
         </span>
         {activeProject && (
-          <span
-            className="text-xs normal-case tracking-normal cursor-pointer hover:text-[var(--text-primary)] transition-colors"
-            onClick={() => fetchSessions(activeProject, true)}
-            title={t('sessionList.refresh')}
-          >
-            ↻
+          <span className="flex items-center gap-2 normal-case tracking-normal">
+            {/* 平铺|树 切换:树形态把 fork 会话挂到父会话下(缩进连线) */}
+            <span
+              className="text-xs cursor-pointer hover:text-[var(--text-primary)] transition-colors font-mono"
+              onClick={toggleViewMode}
+              title={viewMode === 'tree' ? t('sessionList.viewFlat') : t('sessionList.viewTree')}
+            >
+              {viewMode === 'tree' ? '≡' : '⑂'}
+            </span>
+            <span
+              className="text-xs cursor-pointer hover:text-[var(--text-primary)] transition-colors"
+              onClick={() => fetchSessions(activeProject, true)}
+              title={t('sessionList.refresh')}
+            >
+              ↻
+            </span>
           </span>
         )}
       </div>
@@ -268,18 +335,39 @@ export function SessionList() {
           </Suspense>
         )}
 
-        {visibleSessions.map((session) => {
-          const vendor = TYPE_VENDOR[session.sessionType] ?? 'claude';
+        {rows.map(({ session, prefix, displayTitle }) => {
+          // 树视图按最新模型推厂商图标(CLI ≠ 模型厂商);平铺沿用 CLI 图标
+          const vendor = viewMode === 'tree'
+            ? vendorForSession(session)
+            : (TYPE_VENDOR[session.sessionType] ?? 'claude');
           // 远程会话标识:显示来源连接名(连接被删时回退 'SSH')
           const remoteConnName = session.sshConnectionId
             ? (config.sshConnections.find((c) => c.id === session.sshConnectionId)?.name ?? 'SSH')
             : undefined;
+          // 树模式:该会话有 pane 在跑 → 状态点 + 点击跳转;否则点击新终端恢复
+          const live = viewMode === 'tree' ? findLiveSessionPane(session.id) : null;
+          const liveProjectName = live
+            ? (config.projects.find((p) => p.id === live.projectId)?.name ?? '')
+            : '';
 
           return (
             <div
               key={`${session.sessionType}-${session.wslDistro ?? session.sshConnectionId ?? 'host'}-${session.id}`}
-              className="flex items-start gap-2 px-2.5 py-1.5 rounded-[var(--radius-sm)] text-xs group hover:bg-[var(--border-subtle)] transition-colors cursor-default"
-              title={session.title}
+              className={`flex items-start gap-2 px-2.5 py-1.5 rounded-[var(--radius-sm)] text-xs group hover:bg-[var(--border-subtle)] transition-colors ${
+                viewMode === 'tree' ? 'cursor-pointer' : 'cursor-default'
+              }`}
+              title={
+                viewMode === 'tree'
+                  ? (live
+                    ? t('sessionList.branchTree.runningIn', { project: liveProjectName })
+                    : `${displayTitle}\n${t('sessionList.branchTree.clickToResume')}`)
+                  : session.title
+              }
+              onClick={() => {
+                if (viewMode === 'tree' && activeProjectId) {
+                  void jumpToSession(activeProjectId, session);
+                }
+              }}
               onContextMenu={(e) => {
                 e.preventDefault();
                 e.stopPropagation();
@@ -313,6 +401,12 @@ export function SessionList() {
                 ]);
               }}
             >
+              {/* 树连线前缀:等宽字体保证 │├└ 对齐;平铺模式为空串零占位 */}
+              {prefix && (
+                <span className="flex-shrink-0 font-mono whitespace-pre text-[var(--text-muted)] leading-snug mt-0.5">
+                  {prefix}
+                </span>
+              )}
               {/* 来源品牌图标(Mono 变体走 currentColor 跟随主题) */}
               <span className="flex-shrink-0 w-4 h-4 flex items-center justify-center mt-0.5 text-[var(--text-secondary)]">
                 <BrandIcon vendor={vendor} size={14} title={session.sessionType} />
@@ -320,8 +414,11 @@ export function SessionList() {
 
               {/* 标题 + 时间 */}
               <div className="flex-1 min-w-0">
-                <div className="truncate text-[var(--text-secondary)] group-hover:text-[var(--text-primary)] transition-colors leading-snug">
-                  {session.title}
+                <div className="flex items-center gap-1.5 min-w-0">
+                  {live && <StatusDot status={live.status} />}
+                  <span className="truncate text-[var(--text-secondary)] group-hover:text-[var(--text-primary)] transition-colors leading-snug">
+                    {displayTitle}
+                  </span>
                 </div>
                 <div className="text-[var(--text-muted)] text-xs mt-0.5 leading-none">
                   {formatTime(session.timestamp)}

@@ -5,7 +5,7 @@ import { getVersion } from '@tauri-apps/api/app';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { ask } from '@tauri-apps/plugin-dialog';
-import { useAppStore, restoreLayout, flushLayoutToConfig, initExpandedDirs, flushExpandedDirsToConfig, flushProjectToConfig, persistConfig, setPaneAiSessionByPty, saveLayoutToConfig, syncTrayStatus, setWindowFocused, saveConfigToDisk, setConfigToken } from './store';
+import { useAppStore, restoreLayout, flushLayoutToConfig, initExpandedDirs, flushExpandedDirsToConfig, flushProjectToConfig, persistConfig, setPaneAiSessionByPty, saveLayoutToConfig, syncTrayStatus, setWindowFocused, saveConfigToDisk, setConfigToken, clearPendingFork } from './store';
 import { TerminalArea } from './components/TerminalArea';
 import { ProjectList } from './components/ProjectList';
 import { FileTree } from './components/FileTree';
@@ -357,6 +357,8 @@ export function App() {
     // 登记已退出的 PTY:远程项目 pane 据此叠加「连接已断开,点击重连」覆盖层
     // (不区分用户主动 exit 与异常断线);本地 pane 不消费该集合,登记无副作用。
     useAppStore.getState().markPtyExited(payload.ptyId);
+    // fork 命令没起成会话的自记账登记随进程一并作废,不留给下一个进程
+    clearPendingFork(payload.ptyId);
     if (payload.exitCode !== 0) {
       updatePaneStatusByPty(payload.ptyId, 'error');
     }

@@ -376,7 +376,7 @@ export function GitHistory() {
               )}
             </div>
             {repoDropdownOpen && (
-              <div className="absolute left-1.5 right-2 top-full z-50 mt-0.5 bg-[var(--bg-elevated)] border border-[var(--border-default)] rounded-[var(--radius-sm)] shadow-[var(--shadow-overlay)] overflow-hidden">
+              <div className="absolute left-1.5 right-2 top-full z-50 mt-0.5 bg-[var(--bg-elevated)] backdrop-blur-[12px] border border-[var(--border-default)] rounded-[var(--radius-sm)] shadow-[var(--shadow-overlay)] overflow-hidden">
                 {repos.map((r) => (
                   <div
                     key={r.path}

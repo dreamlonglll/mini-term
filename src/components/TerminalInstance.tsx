@@ -1,10 +1,15 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
+import { createRoot } from 'react-dom/client';
+import { flushSync } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
-import { useAppStore } from '../store';
+import { useAppStore, findPaneContextByPty } from '../store';
 import { getOrCreateTerminal, getCachedTerminal, activateWebgl, getTerminalTheme, DARK_TERMINAL_THEME, writePtyInput, copyTerminalSelection, pasteToTerminal, resolveTerminalFontFamily, reloadLigaturesForPty, resetRenderStateForPty } from '../utils/terminalCache';
 import { getResolvedTheme } from '../utils/themeManager';
 import { showContextMenu, type MenuEntry } from '../utils/contextMenu';
 import { isFileDragging, getFileDragPath, FILE_DRAG_CANCEL_EVENT } from '../utils/fileDragState';
+import { branchCapsForAgent } from '../utils/sessionBranch';
+import { forkPaneSession } from '../utils/paneActions';
+import { BranchFamilyPanel } from './BranchFamilyPanel';
 import { useT, t } from '../i18n';
 import type { SshConnection } from '../types';
 import '@xterm/xterm/css/xterm.css';
@@ -331,7 +336,17 @@ export function TerminalInstance({ ptyId }: Props) {
 
   const handleContextMenu = (e: React.MouseEvent<HTMLDivElement>) => {
     e.preventDefault();
+    const { clientX, clientY } = e;
     const hasSelection = !!getCachedTerminal(ptyId)?.term.getSelection();
+    // 会话分支入口:终端本体右键与 tab 右键同权(用户在哪右键都找得到)。
+    // 显隐同 PaneGroup 口径:有 hook 上报的会话身份且 agent 有 fork 能力位
+    const paneCtx = findPaneContextByPty(ptyId);
+    const session = paneCtx?.pane.aiSession;
+    const forkCmd = session ? branchCapsForAgent(session.agent)?.forkCommand?.(session.sessionId) : null;
+    // 输入检测认出 AI 在跑但没有 hook 身份——置灰提示原因(与 PaneGroup 同则,
+    // 锚定 fork 位,仅 resume 的 grok 不提示)
+    const identityMissing = !session && !!paneCtx?.pane.detectedAgent
+      && !!branchCapsForAgent(paneCtx.pane.detectedAgent)?.forkCommand;
     const menu: MenuEntry[] = [
       {
         label: t('terminal.copy'),
@@ -345,12 +360,41 @@ export function TerminalInstance({ ptyId }: Props) {
           getCachedTerminal(ptyId)?.term.focus();
         },
       },
+      ...(paneCtx && session && forkCmd ? [
+        { separator: true as const },
+        {
+          label: t('paneGroup.forkSession'),
+          onClick: () => void forkPaneSession(paneCtx.projectId, paneCtx.pane.id),
+        },
+        {
+          label: t('paneGroup.viewSessionBranches'),
+          // 悬停展开家族树面板(连线/标题/厂商图标由 React 渲染)。
+          // flushSync 同步出首帧,contextMenu 依赖真实尺寸定位
+          submenuRender: (host: HTMLElement) => {
+            const projectPath = useAppStore.getState().config.projects
+              .find((p) => p.id === paneCtx.projectId)?.path;
+            const root = createRoot(host);
+            flushSync(() => root.render(
+              <BranchFamilyPanel
+                projectId={paneCtx.projectId}
+                projectPath={projectPath ?? ''}
+                sessionId={session.sessionId}
+              />,
+            ));
+            return () => root.unmount();
+          },
+        },
+      ] : []),
+      ...(identityMissing ? [
+        { separator: true as const },
+        { label: t('paneGroup.forkNeedsIdentity'), disabled: true },
+      ] : []),
       { separator: true },
       sshConnections.length > 0
         ? { label: t('terminal.sshConnect'), submenu: buildSshSubmenu(sshConnections, ptyId) }
         : { label: t('terminal.sshConnectEmpty'), disabled: true },
     ];
-    showContextMenu(e.clientX, e.clientY, menu);
+    showContextMenu(clientX, clientY, menu);
   };
 
   return (

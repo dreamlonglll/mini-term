@@ -1,7 +1,7 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 
-const { inferVendor } = require('../.tmp-tests/utils/inferVendor.js');
+const { inferVendor, vendorForSession } = require('../.tmp-tests/utils/inferVendor.js');
 
 // --- agent(hook 上报)优先于 command ---
 
@@ -27,6 +27,20 @@ test('命令文本关键词映射', () => {
   assert.equal(inferVendor({ command: 'deepseek-cli' }), 'deepseek');
   assert.equal(inferVendor({ command: 'copilot suggest' }), 'copilot');
   assert.equal(inferVendor({ command: 'ollama run llama3' }), 'ollama');
+  assert.equal(inferVendor({ command: 'glm-5.2' }), 'zhipu');
+  assert.equal(inferVendor({ command: 'chatglm3' }), 'zhipu');
+});
+
+test('vendorForSession:模型名优先,识别不出回落 CLI 厂商', () => {
+  // claude CLI 挂第三方模型:按真实模型厂商亮 icon
+  assert.equal(vendorForSession({ sessionType: 'claude', model: 'glm-5.2' }), 'zhipu');
+  assert.equal(vendorForSession({ sessionType: 'claude', model: 'deepseek-v4-pro' }), 'deepseek');
+  assert.equal(vendorForSession({ sessionType: 'claude', model: 'claude-opus-5' }), 'claude');
+  assert.equal(vendorForSession({ sessionType: 'codex', model: 'gpt-5.2-codex' }), 'openai');
+  assert.equal(vendorForSession({ sessionType: 'grok', model: 'grok-4' }), 'grok');
+  // 模型缺失/怪名字(自定义中转)→ CLI 厂商兜底
+  assert.equal(vendorForSession({ sessionType: 'claude' }), 'claude');
+  assert.equal(vendorForSession({ sessionType: 'codex', model: 'my-custom-proxy' }), 'openai');
 });
 
 // --- pi(多模型 harness,规则排在最前) ---

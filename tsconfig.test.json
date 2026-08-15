@@ -27,6 +27,7 @@
     "src/utils/modelPricing.ts",
     "src/utils/aiCompletion.ts",
     "src/utils/aiResume.ts",
-    "src/utils/attentionTarget.ts"
+    "src/utils/attentionTarget.ts",
+    "src/utils/sessionBranch.ts"
   ]
 }

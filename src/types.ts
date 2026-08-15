@@ -69,6 +69,24 @@ export interface AppConfig {
   mobileRelay?: MobileRelayConfig;
   /** 激活的外置主题包 id（themes/ 下目录名）。undefined = 内置外观模式 */
   customThemeId?: string;
+  /** AI 历史面板的会话列表视图;undefined = 平铺 */
+  sessionListView?: 'flat' | 'tree';
+  /** 会话分支自记账边(mini-term 自己发起的 fork)。磁盘扫描权威,这里兜
+   *  「会话文件尚未落盘的窗口期」;合并按 child id 去重、磁盘优先 */
+  sessionLineage?: LineageEdge[];
+}
+
+/** 会话分支边:sessionId fork 自 parentSessionId。与后端
+ *  ai_sessions::LineageEdge / config::SavedLineageEdge 同构。 */
+export interface LineageEdge {
+  agent: string;
+  sessionId: string;
+  parentSessionId: string;
+  /** 分叉点在父会话中的消息 uuid,仅 Claude 有此精度 */
+  forkPointUuid?: string;
+  /** 分支自己的首条用户消息(分叉后第一问)。fork 整份复制会让标题字段继承
+   *  根会话,分支之间全同名——展示时优先用它;undefined 回落会话标题 */
+  branchTitle?: string;
 }
 
 /** 移动端中转体系的持久化配置。字段对齐后端 #[serde(rename_all = "camelCase")]. */
@@ -198,6 +216,7 @@ export type AiVendor =
   | 'grok'
   | 'qwen'
   | 'deepseek'
+  | 'zhipu'
   | 'copilot'
   | 'ollama';
 
@@ -369,6 +388,9 @@ export interface AiSession {
   sessionType: 'claude' | 'codex' | 'grok';
   title: string;
   timestamp: string; // ISO 8601
+  /** 会话最新使用的模型(后端尾窗反扫)。CLI ≠ 模型厂商——分支 UI 按它推
+   *  厂商图标(vendorForSession);undefined = 识别不出,回落 CLI 图标 */
+  model?: string;
   /** 会话来源:有值 = 该 WSL 发行版内的会话,undefined = Windows 宿主会话 */
   wslDistro?: string;
   /** 会话来源:有值 = 该 SSH 连接指向的远程机器上的会话（与 wslDistro 互斥） */

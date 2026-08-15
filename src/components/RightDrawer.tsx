@@ -64,7 +64,7 @@ export function RightDrawer({ initialWidth, onResizeEnd }: RightDrawerProps) {
     <div
       // z-[45]：要压过 allotment 分隔条的 z-index:35，否则那根线会画在抽屉上面；
       // 同时低于弹窗(50)，抽屉开着时弹窗仍在最前
-      className={`absolute top-0 right-0 h-full z-[45] flex flex-col bg-[var(--bg-surface)] border-l border-[var(--border-default)] shadow-[var(--shadow-overlay)] overlay-drawer ${
+      className={`absolute top-0 right-0 h-full z-[45] flex flex-col bg-[var(--bg-overlay)] border-l border-[var(--border-default)] shadow-[var(--shadow-overlay)] overlay-drawer ${
         closing ? 'is-closing' : ''
       }`}
       aria-hidden={closing || undefined}

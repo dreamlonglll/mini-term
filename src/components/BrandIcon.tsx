@@ -14,6 +14,7 @@ import ClaudeColor from '@lobehub/icons/es/Claude/components/Color';
 import GeminiColor from '@lobehub/icons/es/Gemini/components/Color';
 import QwenColor from '@lobehub/icons/es/Qwen/components/Color';
 import DeepSeekColor from '@lobehub/icons/es/DeepSeek/components/Color';
+import ZhipuColor from '@lobehub/icons/es/Zhipu/components/Color';
 import OpenAIMono from '@lobehub/icons/es/OpenAI/components/Mono';
 import GrokMono from '@lobehub/icons/es/Grok/components/Mono';
 import OpenCodeMono from '@lobehub/icons/es/OpenCode/components/Mono';
@@ -57,6 +58,7 @@ const BRAND_ICONS: Record<AiVendor, ComponentType<{ size?: number | string }>> =
   grok: GrokMono,
   qwen: QwenColor,
   deepseek: DeepSeekColor,
+  zhipu: ZhipuColor,
   copilot: GithubCopilotMono,
   ollama: OllamaMono,
 };

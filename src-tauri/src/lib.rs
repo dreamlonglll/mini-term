@@ -176,6 +176,7 @@ pub fn run() {
             fs::delete_entry,
             fs::filter_directories,
             ai_sessions::get_ai_sessions,
+            ai_sessions::scan_session_lineage,
             ai_sessions::lookup_ai_session_cwd,
             ai_sessions::get_wsl_ai_sessions,
             ai_sessions::get_ai_session_content,

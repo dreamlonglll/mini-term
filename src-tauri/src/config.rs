@@ -153,6 +153,27 @@ pub struct AppConfig {
     /// 激活时 theme/skin 保持不动，退出自定义主题可无损回落。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_theme_id: Option<String>,
+    /// AI 历史面板的会话列表视图。None = 前端默认平铺（"flat" | "tree"）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_list_view: Option<String>,
+    /// 会话分支自记账边（mini-term 自己发起的 fork 当场记下 child→parent）。
+    /// 磁盘扫描（scan_session_lineage）是权威来源，这里只兜「会话文件尚未落盘
+    /// 的窗口期」与无磁盘指针的场景；合并时按 child id 去重、磁盘优先。
+    /// 缺字段会被 save_config 的强类型反序列化静默丢弃，default 必须齐。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub session_lineage: Vec<SavedLineageEdge>,
+}
+
+/// 自记账的会话分支边（与 ai_sessions::LineageEdge 同构，独立定义避免
+/// config 序列化面依赖扫描模块的输出类型）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedLineageEdge {
+    pub agent: String,
+    pub session_id: String,
+    pub parent_session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_point_uuid: Option<String>,
 }
 
 /// 移动端中转体系的持久化配置。
@@ -439,6 +460,8 @@ impl Default for AppConfig {
             ssh_groups: vec![],
             mobile_relay: None,
             custom_theme_id: None,
+            session_list_view: None,
+            session_lineage: vec![],
         }
     }
 }
