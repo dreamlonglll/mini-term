@@ -12,6 +12,7 @@ export const paneGroup = {
     splitDown: "向下分屏",
     forkSession: "分支会话到新分屏",
     viewSessionBranches: "查看会话分支",
+    forkNeedsIdentity: "分支会话（未获会话身份，需注册 Hook 事件）",
     branchPopover: {
       empty: "该会话没有分支记录",
       current: "← 当前",
@@ -40,6 +41,7 @@ export const paneGroup = {
     splitDown: "Split down",
     forkSession: "Fork session to new split",
     viewSessionBranches: "View session branches",
+    forkNeedsIdentity: "Fork session (no session identity — register hook events)",
     branchPopover: {
       empty: "No branch records for this session",
       current: "← current",

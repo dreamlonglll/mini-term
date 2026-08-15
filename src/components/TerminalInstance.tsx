@@ -343,6 +343,9 @@ export function TerminalInstance({ ptyId }: Props) {
     const paneCtx = findPaneContextByPty(ptyId);
     const session = paneCtx?.pane.aiSession;
     const forkCmd = session ? branchCapsForAgent(session.agent)?.forkCommand(session.sessionId) : null;
+    // 输入检测认出 AI 在跑但没有 hook 身份——置灰提示原因(与 PaneGroup 同则)
+    const identityMissing = !session && !!paneCtx?.pane.detectedAgent
+      && !!branchCapsForAgent(paneCtx.pane.detectedAgent);
     const menu: MenuEntry[] = [
       {
         label: t('terminal.copy'),
@@ -380,6 +383,10 @@ export function TerminalInstance({ ptyId }: Props) {
             return () => root.unmount();
           },
         },
+      ] : []),
+      ...(identityMissing ? [
+        { separator: true as const },
+        { label: t('paneGroup.forkNeedsIdentity'), disabled: true },
       ] : []),
       { separator: true },
       sshConnections.length > 0

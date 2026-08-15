@@ -339,8 +339,13 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
     const { clientX, clientY } = e;
     // 会话分支入口:pane 有 AI 会话身份且该 agent 有 fork 能力位才出现
     // (claude/codex;grok 无 CLI 级 fork,opencode/pi 无会话记录,均隐藏)
-    const session = node.panes.find((p) => p.id === paneId)?.aiSession;
+    const pane = node.panes.find((p) => p.id === paneId);
+    const session = pane?.aiSession;
     const canFork = !!session && !!branchCapsForAgent(session.agent)?.forkCommand(session.sessionId);
+    // 输入检测认出 AI 在跑但没有 hook 身份(hook 未注册/身份未达)——置灰提示
+    // 原因,不再静默消失让人以为功能坏了
+    const identityMissing = !session && !!pane?.detectedAgent
+      && !!branchCapsForAgent(pane.detectedAgent);
     showContextMenu(clientX, clientY, [
       { label: t('paneGroup.rename'), shortcut: hotkeyLabel('renamePane'), onClick: () => void renamePane(projectId, paneId) },
       { separator: true },
@@ -366,6 +371,10 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
             return () => root.unmount();
           },
         },
+      ] : []),
+      ...(identityMissing ? [
+        { separator: true as const },
+        { label: t('paneGroup.forkNeedsIdentity'), disabled: true },
       ] : []),
       { separator: true },
       { label: t('paneGroup.closeTab'), onClick: () => void closePane(projectId, paneId) },
