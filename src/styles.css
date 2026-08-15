@@ -334,6 +334,10 @@ body.ssh-conn-dragging {
 
 .overlay-drawer {
   animation: drawerSlideIn var(--motion-overlay-in) var(--ease-overlay-in);
+  /* 抽屉盖在终端文字上。背景图皮肤把 --bg-surface 派生成 0.72 半透明
+     (氛围层设计,假设压在壁纸上),没有毛玻璃托底时终端内容直接透出来
+     砸掉可读性 —— 与 .ctx-menu 同配方补 blur;内置主题变量不透明,无感知 */
+  backdrop-filter: blur(12px);
 }
 
 .overlay-drawer.is-closing {
