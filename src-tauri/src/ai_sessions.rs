@@ -79,14 +79,17 @@ fn extract_session_cwd(jsonl: &str) -> Option<String> {
 /// 原目录才能恢复;桶目录名是有损编码(所有非字母数字都变 `-`),不做反解码,
 /// 直接按 `<id>.jsonl` 文件名精确命中后读记录内的真实 cwd。
 /// 供续接链路对无 cwd 的存量 pane 记录做兜底反查,查到由前端写回持久化。
+/// session id 白名单:字母数字与 `-` `_`(Claude UUID / Codex rollout id /
+/// Grok UUIDv7 均落在其中)。id 来自前端 invoke 参数或持久化数据,不可信,
+/// 拼进文件路径前必须过这道,挡 `../` 一类穿越。
+pub(crate) fn session_id_path_safe(id: &str) -> bool {
+    !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 #[tauri::command]
 pub fn lookup_ai_session_cwd(session_id: String) -> Option<String> {
     // 与前端 resume 命令的校验同口径,顺带防路径拼接注入
-    if session_id.is_empty()
-        || !session_id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
+    if !session_id_path_safe(&session_id) {
         return None;
     }
     let projects = home_dir()?.join(".claude").join("projects");
@@ -976,6 +979,10 @@ pub fn get_ai_session_content(
     project_path: String,
     wsl_distro: Option<String>,
 ) -> Result<Vec<AiSessionMessage>, String> {
+    // id 会拼进各家会话文件路径(本机/WSL 的 `<id>.jsonl`),统一在分发口挡穿越
+    if !session_id_path_safe(&session_id) {
+        return Err("非法会话 id".to_string());
+    }
     if let Some(distro) = wsl_distro.filter(|d| !d.is_empty()) {
         // WSL 根项目的 distro 以路径解析为准(与 get_wsl_ai_sessions 口径一致)
         let (distro, unix_cwd) = derive_wsl_target(&project_path, Some(distro))
@@ -1641,11 +1648,7 @@ fn claude_user_texts(path: &Path, cap: usize) -> Vec<String> {
 /// id 会拼进路径,而自记账边的来源是前端持久化 config(不可信输入),
 /// 白名单同 lookup_ai_session_cwd,防 `../` 一类拼接。
 fn find_claude_session_file(project_dirs: &[PathBuf], session_id: &str) -> Option<PathBuf> {
-    if session_id.is_empty()
-        || !session_id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
+    if !session_id_path_safe(session_id) {
         return None;
     }
     let name = format!("{session_id}.jsonl");
@@ -1944,6 +1947,30 @@ mod tests {
         // 系统注入(< 开头)不算标题
         let injected = [r#"{"type":"user","message":{"role":"user","content":"<local-command-caveat>x</local-command-caveat>"}}"#];
         assert_eq!(claude_branch_title_from_lines(injected.iter().copied()), None);
+    }
+
+    // ---- session id 白名单 ----
+
+    #[test]
+    fn session_id_path_safe_rejects_traversal_and_metachars() {
+        assert!(session_id_path_safe("0198c2f4-7e4a-7b3c-9d2e-1f0a2b3c4d5e"));
+        assert!(session_id_path_safe("abc_123"));
+        assert!(!session_id_path_safe(""));
+        assert!(!session_id_path_safe("../../etc/passwd"));
+        assert!(!session_id_path_safe("a/b"));
+        assert!(!session_id_path_safe("a b"));
+    }
+
+    #[test]
+    fn get_ai_session_content_rejects_bad_id_before_fs() {
+        // 分发口即拒绝,不落到任何文件系统访问
+        let r = get_ai_session_content(
+            "claude".into(),
+            "../../etc/passwd".into(),
+            "/tmp".into(),
+            None,
+        );
+        assert!(r.is_err());
     }
 
     // ---- Grok Build ----
