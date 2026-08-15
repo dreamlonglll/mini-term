@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.12.0-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.12.1-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -46,7 +46,7 @@ That is what Mini-Term is for. Status lights in the project list update live; th
 
 ### 🔔 Know the moment your AI is done
 
-Not by guessing at process names — Mini-Term plugs directly into the **official Claude Code / Codex Hook APIs**. SessionStart / ToolUse and friends are reported in real time, which is both more accurate and faster than polling (process polling is kept as a fallback). One click in Settings registers or unregisters the hooks, **merging with rather than overwriting** your existing hook config.
+Not by guessing at process names — Mini-Term plugs directly into the **official Claude Code / Codex / Grok Build Hook APIs**. SessionStart / ToolUse and friends are reported in real time, which is both more accurate and faster than polling (process polling is kept as a fallback). Hooks are **registered / unregistered per CLI** in Settings: one row each for the three, showing that CLI's config file path and registration state (not registered / registered / outdated — with a prompt to re-register for newly added events), so using only one of them never writes config into the other two; whatever is written **merges with rather than overwrites** your existing hook config.
 
 Status aggregates layer by layer from pane → tab → project (`error > ai-working > ai-idle > idle`). The moment a task flips from working to idle, four things fire, each independently toggleable:
 
@@ -83,13 +83,13 @@ The security boundaries were designed on purpose: pairing codes are single-use a
 
 ### 📊 See what your AI spent this month, at a glance
 
-The "Stats" panel in the top bar aggregates Claude Code / Codex **cost, calls, and sessions** across every dimension: daily / hourly trend charts, model and project rankings, top sessions, with ranges and scopes one click away.
+The "Stats" panel in the top bar aggregates Claude Code / Codex / Grok **cost, calls, and sessions** across every dimension: daily / hourly trend charts, model and project rankings, top sessions, with ranges and scopes one click away.
 
 Data is parsed from your local session records into a **rusqlite ledger** — the panel answers in milliseconds while incremental sync catches up in the background. Forked-session history is **never double-billed**, and cache reads/writes are priced precisely at the official rate differentials. The price table refreshes daily from models.dev (a read-only public price list — **no usage data is ever uploaded**); if it can't be fetched, the cache is used — you're never shown made-up numbers.
 
 ### 🔁 Restart without losing your AI sessions
 
-Close Mini-Term and open it again: the Claude / Codex session that was running in each split pane **resumes automatically via `--resume`** — session identity comes from hook reports, persists with the layout, and survives the restart. An allowlist guards everything written back into the terminal: unrecognizable ids are never written, remote panes are excluded — better to not resume than to type the wrong command. Don't want it typing commands for you? One switch under Settings → System → General turns it off — terminals still come back, they just don't run the resume.
+Close Mini-Term and open it again: the Claude / Codex / Grok session that was running in each split pane **resumes automatically via `--resume`** — session identity comes from hook reports, persists with the layout, and survives the restart. An allowlist guards everything written back into the terminal: unrecognizable ids are never written, remote panes are excluded — better to not resume than to type the wrong command. Don't want it typing commands for you? One switch under Settings → System → General turns it off — terminals still come back, they just don't run the resume.
 
 ### 🧰 Turn your SSH connections into tools your AI can call
 
@@ -115,7 +115,7 @@ Behind the CLI is a **machine-wide singleton daemon** holding the persistent con
 - **Arbitrarily nested horizontal / vertical splits**, drag to adjust ratios; tabs, splits, and window geometry all persist and restore on restart
 - **Terminal caching** — switching projects, tabs, or panes never rebuilds the xterm instance, so nothing is lost; lazy startup creates a PTY only for the visible pane, so more history projects never means a slower launch
 - **Configurable scrollback** (10,000 lines by default; lowering it in Settings takes effect immediately and frees the memory) with correct CSI 3J handling, so Codex transcript folding and `/clear` behave faithfully; the Windows build bundles a pinned official ConPTY runtime for consistent behavior across Windows versions
-- **AI session history** — read local Claude / Codex records, right-click to copy the resume command, or read the full conversation right there (Markdown rendering + `Ctrl+F` search)
+- **AI session history** — read local Claude / Codex / Grok records, right-click to copy the resume command, or read the full conversation right there (Markdown rendering + `Ctrl+F` search)
 - **AI session branch tree** — want to try two approaches to one task side by side? Right-click a pane and "Fork session to new split": the original keeps running in place, while the new pane next to it holds a copy of the conversation (Claude via `--resume --fork-session`, Codex via `codex fork`). The history panel gains a "branch tree view" where forked sessions hang under their parents with indent lines (driven by the pointers the CLIs themselves write to disk), running nodes carry a status dot, and clicking any node either jumps to its live pane or resumes it in a new terminal. The right-click "View session branches" entry expands the whole family on hover; vendor icons in the tree and panel follow the session's **latest model** — a claude CLI running GLM/DeepSeek through a proxy lights up the real vendor's icon (pane tab icons stay CLI-based)
 - **AI task markers** — every Enter inside a session drops a marker; `Ctrl+Shift+↑/↓` jumps between past submissions
 

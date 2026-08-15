@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.12.0-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.12.1-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -46,7 +46,7 @@ Mini-Term 就是为这件事做的：项目列表上的状态灯实时跳动，A
 
 ### 🔔 AI 跑完了，你第一时间知道
 
-不是靠猜进程名——Mini-Term 直接接入了 **Claude Code / Codex 官方 Hook API**，SessionStart / ToolUse 等事件实时上报，比轮询更准更快（进程轮询作为降级兜底保留）。设置里一键注册 / 卸载 Hook，**合并而不是覆盖**你已有的 hook 配置。
+不是靠猜进程名——Mini-Term 直接接入了 **Claude Code / Codex / Grok Build 官方 Hook API**，SessionStart / ToolUse 等事件实时上报，比轮询更准更快（进程轮询作为降级兜底保留）。设置里**按 CLI 勾选注册 / 卸载 Hook**：三家各一行，看得到各自配置文件的路径与注册现状（未注册 / 已注册 / 旧版本提示重新注册补齐新事件），只用其中一家就不会被写入另外两家的配置；写入时**合并而不是覆盖**你已有的 hook 配置。
 
 状态从「面板 → 标签页 → 项目」逐层聚合（`error > ai-working > ai-idle > idle`），任务从 working 转 idle 的瞬间触发四件事，每一项都能单独开关：
 
@@ -83,13 +83,13 @@ Hook 一旦接入，就是该面板的状态来源：完成信号只认 `Stop` �
 
 ### 📊 这个月 AI 花了多少钱，一眼看到
 
-顶栏「统计」打开使用统计面板：Claude Code / Codex 的**成本、调用、会话数**多维聚合，按日 / 按小时趋势图，模型、项目排行与 Top 会话，范围和口径随手切。
+顶栏「统计」打开使用统计面板：Claude Code / Codex / Grok 的**成本、调用、会话数**多维聚合，按日 / 按小时趋势图，模型、项目排行与 Top 会话，范围和口径随手切。
 
 数据从本地会话记录解析进 **rusqlite 账本**——面板毫秒级出数，后台增量同步补新账；fork 复制出来的历史**不会重复计费**，缓存读写按官方价差精确计价。价格表每天从 models.dev 拉一次（只读公开价目，**不上传任何用量数据**），拉不到就用缓存，绝不拿假数据糊你。
 
 ### 🔁 重启不断线：AI 会话自动续接
 
-关掉 Mini-Term 再打开，上次每个分屏里跑着的 Claude / Codex 会**自动 `--resume` 续回原会话**——会话身份来自 hook 上报、随布局一起持久化，跨一次重启还在。写回终端前有白名单校验兜底：识别不了的一律不写，远程 pane 不参与，宁可不续也不敲错命令。不想让它自己敲命令的，「设置 → 系统 → 常规」一个开关关掉——终端照常恢复，只是不自动跑续接。
+关掉 Mini-Term 再打开，上次每个分屏里跑着的 Claude / Codex / Grok 会**自动 `--resume` 续回原会话**——会话身份来自 hook 上报、随布局一起持久化，跨一次重启还在。写回终端前有白名单校验兜底：识别不了的一律不写，远程 pane 不参与，宁可不续也不敲错命令。不想让它自己敲命令的，「设置 → 系统 → 常规」一个开关关掉——终端照常恢复，只是不自动跑续接。
 
 ### 🧰 把你的 SSH 连接，变成 AI 能调用的工具
 
@@ -115,7 +115,7 @@ CLI 背后是**全机单例 daemon** 持有的持久连接池：首次调用自�
 - **横竖任意嵌套的递归分屏**，拖拽调比例；标签 / 分屏 / 窗口大小位置全部持久化，重启原样恢复
 - **终端缓存**——切项目、切标签、切分屏都不重建 xterm 实例，内容不丢；启动按需懒加载，只给当前可见的 pane 建 PTY，历史项目再多也不拖慢启动
 - **滚动缓冲行数可调**（默认 1 万行，设置里改小当场生效并释放内存），正确处理 CSI 3J，Codex 的流式内容折叠与 `/clear` 都能如实反映；Windows 版内置固定版本官方 ConPTY 运行时，跨 Windows 版本行为一致
-- **AI 会话历史**——读本地 Claude / Codex 记录，右键复制恢复命令快速续接，也能直接看完整对话正文（Markdown 渲染 + `Ctrl+F` 搜索）
+- **AI 会话历史**——读本地 Claude / Codex / Grok 记录，右键复制恢复命令快速续接，也能直接看完整对话正文（Markdown 渲染 + `Ctrl+F` 搜索）
 - **AI 会话分支树**——想在同一个任务上并排试两条思路？pane 右键「分支会话到新分屏」：原会话原地继续跑，旁边分出的新 pane 里是复制出来的分支（Claude 走 `--resume --fork-session`，Codex 走 `codex fork`）。历史面板可切「分支树视图」，fork 出的会话按缩进连线挂在父会话下（数据来自 CLI 亲写的磁盘指针），正在跑的节点带状态点；点任意节点——已开的切过去聚焦，没开的新终端自动恢复。右键菜单里「查看会话分支」悬停即展开当前家族全貌；树与面板的厂商图标按会话**最新使用的模型**显示——claude CLI 挂 GLM/DeepSeek 中转时亮的是真实厂商的 icon（pane 标签上的 CLI 图标不变）
 - **AI 任务标记**——会话里每次按 Enter 自动打点，`Ctrl+Shift+↑/↓` 在历史提交之间跳转
 

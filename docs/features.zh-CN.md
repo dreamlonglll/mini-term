@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.12.0-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-0.12.1-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -80,7 +80,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 
 ### AI 进程感知
 
-- **Hook 事件系统** — 接入 Claude Code / Codex / Grok Build 官方 Hook API，接收 AI 工具事件（SessionStart / End、ToolUse 等），比进程轮询更精准及时；内置 `miniterm-hook` CLI 工具供 Hook 系统调用，自动 POST 事件到本地服务器；设置界面一键注册 / 卸载 Hook 配置，合并而非覆盖用户已有 hook。Codex 权限请求从审批到工具执行完成期间持续保持 `ai-working`，避免提前触发任务完成提醒
+- **Hook 事件系统** — 接入 Claude Code / Codex / Grok Build 官方 Hook API，接收 AI 工具事件（SessionStart / End、ToolUse 等），比进程轮询更精准及时；内置 `miniterm-hook` CLI 工具供 Hook 系统调用，自动 POST 事件到本地服务器；设置界面按「注入目标」勾选注册 / 卸载 Hook 配置——Claude Code / Codex / Grok 三家各一行可选，注册与卸载只作用于所选（三份配置文件互不相干，只用其中一家的用户没理由被写另外两家的配置）；每行显示该家的配置文件路径与注册现状（未注册 / 已注册 N 个事件 / 旧版本 N⁄M，黄色提示重新注册可补齐新增事件），默认勾选已经装了的那几家（老用户再点注册就是纯补齐），一家都没装过时全选保住首次一键注册的体验；写入合并而非覆盖用户已有 hook。Codex 权限请求从审批到工具执行完成期间持续保持 `ai-working`，避免提前触发任务完成提醒
 - **实时状态检测** — Hook 一旦接入即为该面板的状态来源，逐轮状态直接由 hook 事件决定，不看输出活跃度（AI 空闲期 TUI 的定时重绘曾被误判为「又在工作」，导致完成通知反复触发）；无 hook 的面板降级为输入检测（识别键入的 `claude` / `codex` / `opencode` / `pi` / `grok` 命令，含 ↑ 历史与 Tab 补全的行快照兜底）加 500ms 输出活跃度轮询，显示 idle / working / error 状态
 - **Grok Build 的 hook 接入** — `grok`（xAI 的终端 agent）走与 Claude / Codex 同一套 hook 链路，状态徽章、完成播报、AI 启动器与移动端发起会话全通。三处结构性差异各有对策：① grok 默认还会扫描 `~/.claude/settings.json` 的 hooks（Claude 兼容层），同一事件因此会来两趟——sidecar 按 `GROK_SESSION_ID` 加「有没有 argv」判出兼容层那趟并丢弃，而用户只注册了 Claude 时又必须放行（那是唯一来源），判据落在「原生 hook 文件是否在场」上；② 注册进 `~/.grok/hooks/` 的命令是**不含空格的裸文件名**（注册时把 hook 二进制复制进同目录），因为带空格的命令会被 grok 丢给 shell，而 Windows 上具体是 git-bash / pwsh / powershell / cmd 由环境决定、四家引号语义互斥，事件名改由 grok 注入的 `GROK_HOOK_EVENT` 传递；③ grok 没有 `PermissionRequest` 事件，「等你批准」是 `Notification` 的 `permission_prompt` 类型，归一化后点同一盏黄灯，而它的 `task_complete` 是知会不是待办，不点灯。另有一处专门抹平：grok 在会话收尾时会补发一次 `Stop`（`reason` 为 `channel_closed` / `shutdown`），不拦掉的话每次退出 grok 都要白响一声「任务完成」
 - **Grok 的会话记录形态** — 与另外两家「一个文件一个会话」不同，grok 一个会话是**一整个目录**：`{grok_home}/sessions/{URL 编码的 cwd}/{session-id}/`，正文在 `updates.jsonl`（ACP 会话更新流），元信息在 `summary.json`。定位项目走**解码目录名**而不是编码项目路径（后者要逐字复刻它所用编码库的转义集；超长路径退化成 `{slug}-{hash}` 形态时回落读目录内的 `.cwd`）。正文一条消息会被拆成任意多个 chunk 行流式落盘，必须攒到边界（工具调用、回合收尾、对方开口）才算一条，否则一句回答在镜像里会碎成几十条。用量取 `turn_completed` 自带的 usage（按模型分解，ACP 口径的输入含缓存读写，拆成互斥桶后与 `totalTokens` 对齐）；**工具排行对 grok 为空**——持久化的 ACP `tool_call` 只带人类可读的 title，真正的工具名不落盘，拿 title 顶替会往排行里灌自然语言标签
@@ -95,9 +95,9 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
   - 所有通知开关独立可配，在「设置 → AI → 通知提醒」页统一管理（Hook 注册另在同组的「Hook 事件」页）
 - **待确认提醒** — AI 停下来等你批工具权限、填 MCP 表单，或这一轮因 API 错误结束（`PermissionRequest` / `Elicitation` / `StopFailure`，与项目行黄灯同一判定）时，走上面同一套通道再提醒一次，开关独立、默认开（「设置 → AI → 通知提醒 → 触发时机」；它的触发频率远高于完成，只想留完成通知的人得能单独关掉）。判据取黄灯的**上升沿**而非「本次成因属待确认类」：后端把这类事件显式排除在去重之外（同一轮里第二次授权请求不能被吞掉），按成因判会一次待确认响好几声；黄灯亮着期间不重复提醒，你对该终端键入即视为已在处理（黄灯清除），下一次请求才重新构成上升沿。Toast 用警告色 + 感叹号与绿色的「已完成」区分，不设 DONE 徽章（那是完成态的标）
 - **托盘状态灯** — 系统托盘常驻全局 AI 状态灯：黄=待确认、蓝=处理中、绿=完成未读、灰=安静，多状态并存且窗口失焦时轮播展示；右键托盘菜单列出**所有进入 AI 会话的项目**及各自状态（含 ⚪ AI 空闲待命的，不只列有动静的；排序 待确认 > 处理中 > 已完成 > 空闲，条数上限可配，空闲只进菜单不点灯）、点某项即定位到该项目内最该处理的那个 pane，左键唤起主窗口并跳到「下一个该我处理」的会话（与标题栏状态灯同一套落点，可在设置里关掉只唤起窗口；Linux 下仅右键菜单可用）；Notification 判定只认权限 / 确认类文案，API 错误与重试等待不点黄灯；可在设置中关闭
-- **会话自动续接** — 重启后每个分屏 pane 自动写入 `claude --resume` / `codex resume` 续回上次会话：会话身份由 hook 上报、随布局持久化，跨一次重启保留；写入终端前经白名单校验（仅字母数字与 `-_`、长度上限 128），远程 pane 不参与，识别不了的一律不写；可在「设置 → 系统 → 常规」关闭（关掉后终端照常恢复，只是不自动跑续接命令）
+- **会话自动续接** — 重启后每个分屏 pane 自动写入 `claude --resume` / `codex resume` / `grok --resume` 续回上次会话：会话身份由 hook 上报、随布局持久化，跨一次重启保留；写入终端前经白名单校验（仅字母数字与 `-_`、长度上限 128），远程 pane 不参与，识别不了的一律不写；可在「设置 → 系统 → 常规」关闭（关掉后终端照常恢复，只是不自动跑续接命令）
 - **会话进出检测** — 命令 echo 识别进入 AI；双击 `Ctrl+C` / `Ctrl+D` 或 `exit` / `quit` / `:quit` / `/logout` 识别退出
-- **会话历史** — 读取本地 Claude / Codex 历史会话记录，右键复制恢复命令快速续接；首屏仅渲染 20 条，底部「加载更多」按钮按需展开（不再滚动即触发）
+- **会话历史** — 读取本地 Claude / Codex / Grok 历史会话记录，右键复制恢复命令快速续接；首屏仅渲染 20 条，底部「加载更多」按钮按需展开（不再滚动即触发）
 - **会话分支** — 把「在同一任务上并行试多条思路」做成一等公民（设计: `docs/plans/2026-08-14-session-branch-tree-design.md`）。**分支动作**：pane 右键「分支会话到新分屏」——原会话原地继续跑，右侧分出的新 pane 写入 fork 命令（Claude `--resume {id} --fork-session`，Codex `codex fork {id}`；命令模板走能力位表 `sessionBranch.ts`，sessionId 白名单校验，新接一家 AI 只需声明能力位；新 pane 是新进程，「本会话允许」的权限授权不迁移）。新 PTY 启动目录优先取会话记录 cwd（`claude --resume` 只认启动目录的会话桶）。**分支树**：历史面板「平铺|树」切换（持久化），fork 会话按缩进连线挂在父会话下——链路来自 CLI 亲写的磁盘指针（Claude：jsonl 复制行的 `forkedFrom.{sessionId,messageUuid}`，消息级；Codex：`session_meta.payload.forked_from_id`，会话级，按 `thread_source=="subagent"` 过滤掉子 agent 线程），mini-term 自己发起的 fork 另有**自记账**兜「会话文件未落盘的窗口期」（合并按 child 去重、磁盘优先）；悬空父落为根、环防御，树构建纯逻辑 node 直测。**节点点击**：会话已有 pane 在跑 → 切项目激活聚焦；没开 → 新终端自动 resume（WSL/远程来源提示不可本机恢复）。pane 右键菜单的「查看会话分支」**悬停即展开**家族树面板（contextMenu 的 submenuRender 自定义子面板：展开/互斥/定位/随菜单关闭复用 submenu 机制，内容由 React 渲染）——当前家族全貌 + 「← 当前」标记。树与面板的**厂商图标按会话最新使用的模型**显示（`vendorForSession`：后端 64KB 尾窗反扫最新模型名过 `inferVendor` 规则，claude CLI 挂 GLM/DeepSeek 中转时亮真实厂商 icon，识别不出回落 CLI 图标；pane tab 的 CLI 图标刻意不变）。Grok 预留：无 CLI 级 fork，能力位缺席即菜单隐藏
 - **会话查看** — 右键「查看」展示完整对话内容，User 纯文本 / Assistant Markdown 渲染（外链点击二次确认后调系统默认浏览器打开），支持 `Ctrl+F` 搜索高亮和 User 消息快速导航
 - **WSL 会话** — Windows 下直接读取 WSL 发行版内的 Claude / Codex 历史会话（不 spawn `wsl.exe`，走 `\\wsl$` UNC + 注册表枚举发行版）：WSL 根项目自动推导发行版与路径零配置加载；Windows 路径项目右键「WSL 会话」子菜单选择发行版后按 `/mnt` 规则映射扫描，靠会话内 cwd 精确校验防串项目；WSL 会话与本机会话按时间混排并带 WSL 标识，加载中头部显示 spinner，查看正文同样支持
@@ -105,7 +105,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 
 ### 使用统计
 
-- **多维聚合面板** — 顶栏「统计」打开：Claude Code / Codex 的成本、调用次数、会话数三组 KPI，按日 / 按小时趋势图（recharts），模型排行、项目排行与 Top 会话；agent / 时间范围 / 项目过滤随手切换
+- **多维聚合面板** — 顶栏「统计」打开：Claude Code / Codex / Grok 的成本、调用次数、会话数三组 KPI，按日 / 按小时趋势图（recharts），模型排行、项目排行与 Top 会话；agent / 时间范围 / 项目过滤随手切换
 - **rusqlite 本地账本** — 本地会话 JSONL 解析进 SQLite 账本，面板查询毫秒级返回，打开与常驻期间后台增量同步（文件指纹变化才重解析）；账本定位为「可从原始记录再生的缓存」，损坏自动重建，无迁移负担
 - **计费准确性** — fork 复制的历史消息按血缘去重，不重复计费；缓存写 / 缓存读按官方价差精确计价（1h 缓存写 2× 输入价、1h 子集只补差价）；未知模型按 Claude 主力档均价估算
 - **价格表** — 每日从 models.dev 拉取一次公开价目（只读 GET，**不上传任何用量数据**），拉取失败回退本地缓存，面板绝不显示凭空编造的数字
@@ -117,7 +117,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 **前提**：需要一台你自己的、可公网访问的服务器来跑中转（1C1G 足够，Docker 一条命令起，另需一个解析到它的域名做 TLS，见[部署文档](deploy-relay.zh-CN.md)）。
 
 - **一站式连接与配对** — 顶栏「移动端」面板里填中转地址 → 保存并连接 → 生成配对二维码，全流程一个面板走完；手机相机扫码即打开 PWA 自动配对，配对码一次性有效（10 分钟），新设备配对自动顶替旧设备，「重置配对」立即吊销全部凭证
-- **活跃 AI 会话列表** — 手机端按项目分组展示正在跑的 Claude / Codex 会话，状态灯与桌面端实时同步增删变色；桌面端离线时顶部横幅提示并置灰，恢复后自动消除
+- **活跃 AI 会话列表** — 手机端按项目分组展示正在跑的 Claude / Codex / Grok 会话，状态灯与桌面端实时同步增删变色；桌面端离线时顶部横幅提示并置灰，恢复后自动消除
 - **手机发起新会话** — 右下角 + → 选项目 → 选 AI 启动器，桌面端在该项目后台开一个终端标签并把 agent 拉起来，会话真起来后手机自动进入它的对话镜像（不打断你桌面上正在看的现场）；项目按桌面端的分组层级展示，可折叠。启动器是桌面端配置的具名条目，手机只按 id 引用、看得到名字，**命令文本从不经过手机或中转**
 - **会话重命名** — 手机上给会话改个看得懂的名字（列表行的 ✎ 或镜像页标题），同步显示在桌面端的终端标签上；留空恢复默认名
 - **对话镜像（只读）** — 点进任一会话实时查看对话内容，AI 回复 Markdown 渲染、桌面输入原文展示，滚动到顶自动分页加载更早消息；镜像绑定经 Hook 会话身份精确到 pane，同项目并行开多个 AI 也不会互相串台
@@ -167,7 +167,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
   - **全局状态灯** — 紧挨项目切换器右侧，汇总所有项目所有 pane 的最紧急一档（异常 > 待确认 > 处理中 > 已完成），点击跳到「下一个该我处理」的会话：待确认 / 异常优先，其次是**最先完成**的那个，最后才是还在跑的。与托盘右键菜单的排序有意不同——托盘回答「哪些项目还活着」，状态灯回答「下一件该做什么」
   - 拖拽走 Tauri `startDragging` 而非 `-webkit-app-region`，避开 WebView2 模态循环导致的输入锁定（v0.2.16 修过的老问题）；双击顶栏最大化 / 还原
 - **Blueprint 蓝图皮肤** — 可选科幻风蓝图皮肤，网格背景 + 角标记 + 光晕效果，支持深色 / 日间两种模式，终端配色同步切换
-- **外置主题包（Dream Skin 兼容）** — 「设置 → 外观 → 主题与语言」可从文件夹或 zip 导入第三方皮肤，落在 `{app_data_dir}/themes/<themeId>/`（`theme.json` 必需，`theme.css` / 背景图可选）。同一区的「生成示例」把一份可直接改的示例皮肤写进 `themes/example/`（`theme.json` + `theme.css` + 逐字段说明的 `README.md`，改完保存即热重载）；示例内容与仓库 [`docs/theme-pack-example/`](theme-pack-example/) 是**同一份文件**（`include_str!` 编译期嵌入，文档与产物不会漂开），目录已存在时报错而非覆盖，用户改过的那份不会被静默抹掉。包内带 `manifest.json` 时逐文件核对 bytes + sha256 防损坏；导入先落暂存目录、校验通过才原子换入，坏包不会连累同名的既有皮肤。皮肤的明暗由作者在 `theme.json` 的 `appearance` 定死，激活期间内置主题按钮置为未选中态。改动包内文件即热重载（300ms 防抖）。皮肤可声明背景图，此时终端底色转半透明压在氛围层上，WebGL 渲染退回 DOM（上游 canvas 不透明限制），切回不透明主题自动恢复；此时作者写在 `terminal.background` 的底色会被忽略——它在展开顺序上排在透明化之后，照着内置主题抄全 24 字段的皮肤本会把氛围图整块盖死。导入的 `theme.css` 过卫生检查：256KB 上限、禁 `@import`、指向包外的引用一律拒 —— 检查在剥掉注释、还原 CSS 转义后的取样上做，`url()` 与裸字符串双查（Chromium 认 `image-set("https://…" 1x)`，不带 `url()` 照样发请求），`url(\68 ttps://…)` 这类转义写法同样挡得住。`theme.json` 的 `tokens` 逃生舱走同一把尺子：键名限 `--` 开头的 CSS 变量、值过同一道闸——键名不带 `--` 时 `setProperty` 设的是**真实 CSS 属性**，否则一行 `{"background-image":"url(https://…)"}` 就绕开了上面所有检查（`tauri.conf.json` 的 csp 为 null，这是唯一一道闸）
+- **外置主题包（Dream Skin 兼容）** — 「设置 → 外观 → 主题与语言」可从文件夹或 zip 导入第三方皮肤，落在 `{app_data_dir}/themes/<themeId>/`（`theme.json` 必需，`theme.css` / 背景图可选）。同一区的「生成示例」把一份可直接改的示例皮肤写进 `themes/example/`（`theme.json` + `theme.css` + 逐字段说明的 `README.md`，改完保存即热重载）；示例内容与仓库 [`docs/theme-pack-example/`](theme-pack-example/) 是**同一份文件**（`include_str!` 编译期嵌入，文档与产物不会漂开），目录已存在时报错而非覆盖，用户改过的那份不会被静默抹掉。包内带 `manifest.json` 时逐文件核对 bytes + sha256 防损坏；导入先落暂存目录、校验通过才原子换入，坏包不会连累同名的既有皮肤。皮肤的明暗由作者在 `theme.json` 的 `appearance` 定死，激活期间内置主题按钮置为未选中态。改动包内文件即热重载（300ms 防抖）。皮肤可声明背景图，此时终端底色转半透明压在氛围层上，WebGL 渲染退回 DOM（上游 canvas 不透明限制），切回不透明主题自动恢复；DOM 路径的字符格宽按整设备像素量化与 WebGL 对齐、终端字体栈显式补 CJK 回退字体，字距与全角标点均与内置主题一致，不再显得更松；此时作者写在 `terminal.background` 的底色会被忽略——它在展开顺序上排在透明化之后，照着内置主题抄全 24 字段的皮肤本会把氛围图整块盖死。导入的 `theme.css` 过卫生检查：256KB 上限、禁 `@import`、指向包外的引用一律拒 —— 检查在剥掉注释、还原 CSS 转义后的取样上做，`url()` 与裸字符串双查（Chromium 认 `image-set("https://…" 1x)`，不带 `url()` 照样发请求），`url(\68 ttps://…)` 这类转义写法同样挡得住。`theme.json` 的 `tokens` 逃生舱走同一把尺子：键名限 `--` 开头的 CSS 变量、值过同一道闸——键名不带 `--` 时 `setProperty` 设的是**真实 CSS 属性**，否则一行 `{"background-image":"url(https://…)"}` 就绕开了上面所有检查（`tauri.conf.json` 的 csp 为 null，这是唯一一道闸）
 - **字体独立调节** — UI 与终端的字号（10-20px）/ 字体 family 分别可调，终端可选是否跟随 UI 主题
 - **连体字 (ligatures)** — 终端连体字渲染开关，开启后 `==` `=>` `!=` `->` 等合成 ligature glyph，需字体含 calt 表（Fira Code / JetBrains Mono）；Windows 完整支持，macOS / Linux 受 webview API 限制使用 60 条 Iosevka fallback
 - **布局持久化** — 分屏比例、标签页、窗口大小 / 位置自动保存，重启恢复（`tauri-plugin-window-state`）
@@ -258,7 +258,7 @@ mini-term/
 │   │   ├── ProjectList.tsx       # 项目列表 + 嵌套分组 + DONE 徽章
 │   │   ├── AddRemoteProjectModal.tsx # 添加 SSH 远程项目弹窗（选连接 + 远程路径验证）
 │   │   ├── ProjectEnvVarsModal.tsx   # 项目级环境变量管理弹窗（POSIX 校验）
-│   │   ├── SessionList.tsx       # AI 会话历史列表（Claude / Codex）
+│   │   ├── SessionList.tsx       # AI 会话历史列表（Claude / Codex / Grok）
 │   │   ├── FileTree.tsx          # 文件目录树 + Git 状态 + 新建 / 重命名
 │   │   ├── TerminalArea.tsx      # 标签管理 + 分屏树操作
 │   │   ├── SplitLayout.tsx       # 递归渲染 SplitNode 分屏树
@@ -321,11 +321,11 @@ mini-term/
 │   │   ├── search.rs             # 全局文件搜索（文件名 + 内容，流式推送）
 │   │   ├── clipboard.rs          # 剪贴板图片读取 + 长文本转存临时文件
 │   │   ├── editor.rs             # 外部编辑器 / 系统默认应用打开
-│   │   ├── ai_sessions.rs        # Claude / Codex 会话记录读取（本机 + WSL UNC）
+│   │   ├── ai_sessions.rs        # Claude / Codex / Grok 会话记录读取（本机 + WSL UNC，Grok 仅本机）
 │   │   ├── wsl_distros.rs        # WSL 发行版枚举（读注册表 Lxss，不 spawn wsl.exe）
 │   │   ├── theme_packs.rs        # 外置皮肤目录扫描 / 文件夹与 zip 导入 / manifest sha256 校验
 │   │   ├── hook_server.rs        # Hook HTTP 服务器（接收 AI 工具事件）
-│   │   ├── hook_registry.rs      # Hook 注册 / 卸载（Claude Code + Codex）
+│   │   ├── hook_registry.rs      # Hook 注册 / 卸载（Claude Code + Codex + Grok，按 CLI 勾选）
 │   │   ├── ssh.rs                # SSH 连接管理 + 密码自动填充 / 私钥处理
 │   │   ├── remote_ssh.rs         # SSH 远程项目（SFTP 列目录 / 目录验证 / 远程会话读取）
 │   │   ├── ssh_skill_registry.rs # 按项目启用 SSH 工具（生成 Claude / Codex 两份 SKILL.md）
@@ -369,7 +369,7 @@ attention 上升沿(PermissionRequest…) → Toast(警告色) + 提示音 + req
 
 ### Tauri 接口一览
 
-- **Commands（69 个）** — PTY: `create_pty` · `write_pty` · `resize_pty` · `kill_pty`；FS: `list_directory` · `read_file_content` · `watch_directory` · `unwatch_directory` · `create_file` · `create_directory` · `rename_entry` · `delete_entry` · `filter_directories`；Search: `start_search` · `cancel_search`；Git: `get_git_status` · `get_git_diff` · `discover_git_repos` · `get_git_log` · `get_repo_branches` · `get_commit_files` · `get_commit_file_diff` · `git_pull` · `git_push` · `get_changes_status` · `git_stage` · `git_unstage` · `git_stage_all` · `git_unstage_all` · `git_commit` · `git_discard_file` · `list_worktrees` · `add_worktree` · `remove_worktree` · `prune_worktrees` · `get_worktree_branches`；Config: `load_config` · `save_config`；Editor: `open_in_editor` · `open_path_with_default_app`；Clipboard: `read_clipboard_image` · `save_clipboard_text`；AI: `get_ai_sessions` · `get_wsl_ai_sessions` · `get_ai_session_content`；WSL: `list_wsl_distros`；Hook: `register_ai_hooks` · `unregister_ai_hooks` · `get_hook_config_snippet` · `get_hook_status` · `toggle_hook_server`；SSH: `arm_ssh_autofill` · `prepare_ssh_key`；SSH 工具: `enable_ssh_tools` · `disable_ssh_tools`；SSH 远程: `ssh_remote_list_directory` · `ssh_remote_validate_dir` · `ssh_remote_ai_sessions` · `ssh_remote_ai_session_content` · `ssh_remote_upload_paste`；主题: `set_window_dark_mode`；移动端中转: `mobile_relay_apply` · `mobile_relay_status` · `mobile_relay_request_pairing_code` · `mobile_relay_reset_pairing` · `mobile_relay_update_sessions` · `mobile_relay_launchers_changed` · `mobile_relay_start_session_result` · `mobile_relay_check_launcher_command`
+- **Commands（70 个）** — PTY: `create_pty` · `write_pty` · `resize_pty` · `kill_pty`；FS: `list_directory` · `read_file_content` · `watch_directory` · `unwatch_directory` · `create_file` · `create_directory` · `rename_entry` · `delete_entry` · `filter_directories`；Search: `start_search` · `cancel_search`；Git: `get_git_status` · `get_git_diff` · `discover_git_repos` · `get_git_log` · `get_repo_branches` · `get_commit_files` · `get_commit_file_diff` · `git_pull` · `git_push` · `get_changes_status` · `git_stage` · `git_unstage` · `git_stage_all` · `git_unstage_all` · `git_commit` · `git_discard_file` · `list_worktrees` · `add_worktree` · `remove_worktree` · `prune_worktrees` · `get_worktree_branches`；Config: `load_config` · `save_config`；Editor: `open_in_editor` · `open_path_with_default_app`；Clipboard: `read_clipboard_image` · `save_clipboard_text`；AI: `get_ai_sessions` · `get_wsl_ai_sessions` · `get_ai_session_content`；WSL: `list_wsl_distros`；Hook: `register_ai_hooks` · `unregister_ai_hooks` · `get_ai_hook_registrations` · `get_hook_config_snippet` · `get_hook_status` · `toggle_hook_server`；SSH: `arm_ssh_autofill` · `prepare_ssh_key`；SSH 工具: `enable_ssh_tools` · `disable_ssh_tools`；SSH 远程: `ssh_remote_list_directory` · `ssh_remote_validate_dir` · `ssh_remote_ai_sessions` · `ssh_remote_ai_session_content` · `ssh_remote_upload_paste`；主题: `set_window_dark_mode`；移动端中转: `mobile_relay_apply` · `mobile_relay_status` · `mobile_relay_request_pairing_code` · `mobile_relay_reset_pairing` · `mobile_relay_update_sessions` · `mobile_relay_launchers_changed` · `mobile_relay_start_session_result` · `mobile_relay_check_launcher_command`
 - **Events（12 个，后端 → 前端）** — `pty-output` · `pty-exit` · `pty-status-change` · `ai-user-submit`（AI 会话内用户按 Enter，用于打标记）· `fs-change` · `search-results` · `search-complete` · `wsl-shell-override` · `mobile-relay-status` · `mobile-relay-pairing-code` · `mobile-start-session` · `mobile-rename-pane`
 
 ### 状态优先级
