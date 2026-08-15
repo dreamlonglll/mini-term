@@ -396,7 +396,7 @@ export function UsageStatsModal({ open, onClose }: { open: boolean; onClose: () 
       <Modal
         open={open}
         onClose={onClose}
-        panelClassName="w-[960px] max-h-[85vh]"
+        panelClassName="w-[80vw] max-h-[85vh]"
         ariaLabel={t('usageStats.title')}
       >
         {/* 自定义头部：标题 + Scope/Range 分段 + 刷新 + 关闭 */}
