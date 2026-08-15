@@ -371,7 +371,7 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
       { label: t('paneGroup.closeTab'), onClick: () => void closePane(projectId, paneId) },
       { label: t('paneGroup.closePane'), shortcut: hotkeyLabel('closePane'), danger: true, onClick: () => void closeLeaf(projectId, paneId) },
     ]);
-  }, [projectId, t, node.panes]);
+  }, [projectId, projectPath, t, node.panes]);
 
   if (!activePane) return null;
 
