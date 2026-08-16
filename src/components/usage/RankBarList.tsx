@@ -43,11 +43,11 @@ export function RankBarList({ rows, emptyText }: { rows: RankRow[]; emptyText: s
               }}
             />
           </span>
-          <span className="w-14 text-right text-[13px] font-medium text-[var(--text-primary)] flex-shrink-0">
+          <span className="min-w-14 text-right text-[13px] font-medium text-[var(--text-primary)] flex-shrink-0 whitespace-nowrap">
             {r.primary}
           </span>
           {r.secondary !== undefined && (
-            <span className="w-10 text-right text-xs text-[var(--text-muted)] flex-shrink-0">
+            <span className="min-w-10 text-right text-xs text-[var(--text-muted)] flex-shrink-0 whitespace-nowrap">
               {r.secondary}
             </span>
           )}

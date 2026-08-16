@@ -45,10 +45,10 @@ export function TopSessions({ sessions, onOpen }: Props) {
               }}
             />
           </span>
-          <span className="w-14 text-right text-[13px] font-medium text-[var(--text-primary)] flex-shrink-0">
+          <span className="min-w-14 text-right text-[13px] font-medium text-[var(--text-primary)] flex-shrink-0 whitespace-nowrap">
             {formatCost(s.cost)}
           </span>
-          <span className="w-12 text-right text-xs text-[var(--text-muted)] flex-shrink-0">
+          <span className="min-w-12 text-right text-xs text-[var(--text-muted)] flex-shrink-0 whitespace-nowrap">
             {formatCount(s.calls)}
           </span>
         </button>

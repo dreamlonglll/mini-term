@@ -329,7 +329,8 @@ export function UsageStatsModal({ open, onClose }: { open: boolean; onClose: () 
         <div className="flex gap-4 items-start">
           <div className="flex-1 min-w-0">
             <Section title={t('usageStats.byProject')}>
-              <div className="max-h-[216px] overflow-y-auto">
+              {/* -mx+px 吸收可点击行 hover 的 -mx-1.5 出血：滚动容器 overflow-x 被强制为 auto，行超宽会恒出横向滚动条 */}
+              <div className="max-h-[216px] overflow-y-auto -mx-1.5 px-1.5">
                 <RankBarList
                   emptyText={t('usageStats.noSessions')}
                   rows={stats.byProject.map((p) => {
