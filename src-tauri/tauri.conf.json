@@ -5,7 +5,7 @@
   "identifier": "com.mini-term.app",
   "build": {
     "beforeDevCommand": "npm run dev",
-    "devUrl": "http://localhost:1450",
+    "devUrl": "http://127.0.0.1:1450",
     "beforeBuildCommand": "npm run build",
     "frontendDist": "../dist"
   },
