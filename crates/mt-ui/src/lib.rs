@@ -26,7 +26,16 @@
 //! `gpui_component::theme` 已有 JSON schema + 运行时注册表,mini-term 的主题包
 //! 里「配色」那一半映射过去,「背景图 / 字体 / 终端配色」留在 `mt-config`。
 //!
-//! # 尚未动工
+//! # 进度
 //!
-//! 骨架阶段本 crate 刻意为空 —— 先让工作区与依赖树立起来并编译通过,
-//! 再按上面的顺序逐项填。
+//! - ✅ `TerminalElement`(见 [`terminal`] 模块):逐 cell 绘制、ANSI/256/truecolor、
+//!   bold/italic/underline/inverse、块状光标、滚轮回看、鼠标选择 + 剪贴板。
+//! - ⬜ 布局复用件、主题桥:未动工。
+//! - ⬜ IME:结构上已留出挂载点([`terminal::InstallInputHandler`]),尚未接。
+
+pub mod terminal;
+
+pub use terminal::{
+    InstallInputHandler, OnGridResize, OnInput, TerminalElement, TerminalStyle, TerminalTheme,
+    keystroke_to_bytes, paste_to_bytes, rgb8,
+};

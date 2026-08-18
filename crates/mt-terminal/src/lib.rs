@@ -31,10 +31,15 @@
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::term::{Config, Term};
+use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
 use parking_lot::Mutex;
 use std::sync::Arc;
+
+/// 把 alacritty 整个重新导出。渲染层(`mt-ui`)要用 `Cell` / `Flags` / `Color` /
+/// `TermMode` / `Selection` 这些类型,统一从这里取,避免各 crate 各自写一份
+/// `alacritty_terminal` 依赖后版本漂移导致类型不互通。
+pub use alacritty_terminal;
 
 /// 终端尺寸。alacritty_terminal 只要求实现 `Dimensions`,不提供现成类型。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,5 +132,73 @@ impl TerminalEmulator {
 
     pub fn events(&self) -> &EventQueue {
         &self.events
+    }
+
+    /// 当前 grid 尺寸。渲染层每帧按可用像素算出目标尺寸,与这里比对后才决定
+    /// 要不要 `resize` —— 免得每帧都去动 grid。
+    pub fn term_size(&self) -> TermSize {
+        let term = self.term.lock();
+        TermSize::new(term.columns(), term.screen_lines())
+    }
+
+    /// 当前 VT 模式位(APP_CURSOR / BRACKETED_PASTE / ALT_SCREEN ...)。
+    /// 键盘编码与粘贴编码都要看它。
+    pub fn mode(&self) -> TermMode {
+        *self.term.lock().mode()
+    }
+
+    /// 借出 grid 只读地做一件事。比裸拿 `term()` 少一次「忘了尽早放锁」的机会。
+    pub fn with_term<R>(&self, f: impl FnOnce(&Term<EventQueue>) -> R) -> R {
+        f(&self.term.lock())
+    }
+
+    /// 借出 grid 做一次可变操作(滚动回看、选择区、清屏……)。
+    pub fn with_term_mut<R>(&self, f: impl FnOnce(&mut Term<EventQueue>) -> R) -> R {
+        f(&mut self.term.lock())
+    }
+
+    /// 可视区逐行文本(行尾空格已裁掉)。
+    ///
+    /// 这是**给测试与诊断用的**读回口:PTY 里跑一条 `echo`,从这里断言回显成立,
+    /// 整条链路不需要起 GPUI 窗口就能验。宽字符只在它自己的列上出现一次,
+    /// WIDE_CHAR_SPACER 那一列直接跳过 —— 所以返回的字符串里
+    /// 「字符数」不等于「列数」,列位置要用 [`Self::visible_columns`] 取。
+    pub fn visible_lines(&self) -> Vec<String> {
+        self.visible_columns()
+            .into_iter()
+            .map(|row| {
+                let mut s: String = row.into_iter().map(|(_, c)| c).collect();
+                while s.ends_with(' ') {
+                    s.pop();
+                }
+                s
+            })
+            .collect()
+    }
+
+    /// 可视区逐行的 `(列号, 字符)`。宽字符只出现一次,列号是它**起始**的那一列;
+    /// 它占掉的第二列(WIDE_CHAR_SPACER)不出现。
+    ///
+    /// 中英混排的对齐断言就靠这个:`你好abc` 里 `a` 必须落在第 4 列而不是第 2 列。
+    pub fn visible_columns(&self) -> Vec<Vec<(usize, char)>> {
+        use alacritty_terminal::term::cell::Flags;
+
+        let term = self.term.lock();
+        let mut rows: Vec<Vec<(usize, char)>> = vec![Vec::new(); term.screen_lines()];
+        let display_offset = term.grid().display_offset() as i32;
+        for indexed in term.grid().display_iter() {
+            if indexed
+                .cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                continue;
+            }
+            let row = (indexed.point.line.0 + display_offset) as usize;
+            if let Some(cells) = rows.get_mut(row) {
+                cells.push((indexed.point.column.0, indexed.cell.c));
+            }
+        }
+        rows
     }
 }

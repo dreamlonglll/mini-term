@@ -3855,7 +3855,9 @@ name = "mt-relay"
 version = "0.13.1"
 dependencies = [
  "anyhow",
+ "dirs 6.0.0",
  "futures-util",
+ "mt-ai",
  "mt-relay-protocol",
  "rustls",
  "serde",

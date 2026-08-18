@@ -24,7 +24,7 @@
 | C | mt-project | fs/git/search/editor/wsl_distros；emit 改注入回调；**不搬 remote_ssh** | fs.rs、git.rs、search.rs、editor.rs、wsl_distros.rs | ✅ | 2026-08-18 主会话独立 target 复跑 76/76 绿；FsWatcher 注入 sink、search_id 消失改 SearchHandle、editor 拆纯函数不依赖 mt-config、opener 改平台原生 spawn；顺修 get_worktree_branches 的 UNC 判断隐性 bug；⚠️ git 阻塞调用需调用方自己丢后台执行器 |
 | D | mt-ai | hook 体系+状态判定+会话记录**逐字搬运**；StatusSink 注入；去重表与「降级结论落盘」铁律保留 | hook_server.rs、hook_registry.rs、process_monitor.rs、ai_sessions.rs、pty.rs 的 AI 识别段 | ✅ | 2026-08-18 主会话独立 target 复跑 181/181 绿；AiPerception 装配层出 observe_input/observe_output 两入口；PtyManager 的 AI 半边拆为 SessionTracker（8 张旁路表）；StatusEmitter 去重表与落盘铁律逐字保留；hook-server.json 端口文件格式不变 |
 | E | mt-pty | conpty_bootstrap + pty.rs 存留部分；**公开 API 只增不改**；净删除三件套不搬 | pty.rs、conpty_bootstrap.rs | ✅ | 2026-08-18 主会话独立 target 复跑 59+1 doctest 全绿（含真起 cmd.exe 的端到端 6 条）；spawn 等原签名未动；退出监听改 try_wait 轮询（实测 Windows 下 reader EOF 路径等于本地 exit 不报退出）；autofill 抽成状态机且密码直写 writer 不过输入观察器 |
-| F | mt-ui + mt-app | 自研 TerminalElement（逐 cell 绘制/宽字符对齐/默认背景不发 quad）+ 真实 PTY 端到端 demo | —（全新自研，替 xterm.js） | 🔵 | |
+| F | mt-ui + mt-app | 自研 TerminalElement（逐 cell 绘制/宽字符对齐/默认背景不发 quad）+ 真实 PTY 端到端 demo | —（全新自研，替 xterm.js） | ✅ | 2026-08-18 主会话复核 8 测试绿+6s 启动冒烟通过（像素级人工验收见下方清单）：gpui Element 三段式实现；对齐方案=可合并 cell 拼 ShapedLine+不可合并（宽字符/回退/组合符）单独 shape 钉在 col×cell_width；事件驱动唤醒+16ms 节流；选择/滚动/256 色+truecolor/光标四态齐；实机 PostMessageW 注入按键跑通完整链路；**IME 未实现**（挂载点已留）、鼠标上报/damage 追踪未做 |
 
 **并行纪律**（agent 提示词里已固化）：每个 agent 只写自己的 crate 目录；根 Cargo.toml 禁改；构建测试永远 `-p`；不自行 commit，由主会话验收后统一提交。
 
@@ -32,10 +32,23 @@
 
 | 任务 | 依赖 | 说明 |
 |---|---|---|
-| mt-relay 搬运 | mt-ai（会话记录/镜像绑定判定） | mobile_relay.rs + mobile_mirror.rs；协议与 mobile/ 完全不动 |
+| mt-relay 搬运 🔵 | mt-ai（✅ 已落库） | 2026-08-18 提前派出（不等 Wave 1 收口）；mobile_relay.rs + mobile_mirror.rs；协议与 mobile/ 完全不动；桌面侧状态依赖全部抽注入 trait |
 | mt-app 全壳 | Wave 1 全部 | store（对应 src/store.ts）、三栏 resizable、Tab 栏、SplitNode 树、文件树接 mt-project、状态灯接 mt-ai |
 | 面板与 Modal | mt-app 全壳 | 终端配置 / AI 历史 / 用量统计 / 移动端面板 / 分支树 |
 | i18n + 主题桥 | mt-app 全壳 | rust-i18n 字典从 src/locales/*.ts 转；theme_packs 配色映射 gpui-component 主题层 |
+
+## TerminalElement 人工验收清单（等 F 验收提交后执行，复选框由验收人勾）
+
+`$env:MT_UI_DEBUG_METRICS=1; cargo run -p mt-app`（该开关会打印字体度量，且字体被静默回退成非等宽时往 stderr 报警）
+
+- [ ] **中英混排逐列对齐（最高优先）**：打多行 `你好abc世界XY`，与 xterm.js 版双开截图逐列量（复用 v0.12.1 手法）
+- [ ] 颜色：16 色 + 256 色 + truecolor 色表脚本，bold/italic/underline/inverse 组合
+- [ ] 光标：聚焦实心块+字反白，失焦空心框
+- [ ] 滚轮方向：上滚见历史（若反了是 ScrollDelta.y 符号问题，一行取反）
+- [ ] 选择：拖选松手自动复制、双击选词、三击选行、Ctrl+Shift+C/V
+- [ ] resize：拖窗口边跑 vim 看重排
+- [ ] alt screen：vim 里滚轮等价上下方向键
+- [ ] IME 输中文：预期不工作，确认不崩即可（IME 是下一批交付项）
 
 ## 已验收提交
 
@@ -43,8 +56,8 @@
 
 ## 技术债与待修清单（迁移期产生）
 
-- **mt-usage/ai_shim.rs**：复制了 mt-ai 的 6 个纯函数（normalize_path / collect_codex_session_paths / codex_meta_from_line / codex_user_title_from_line / load_codex_thread_names / grok_home），等 mt-ai 验收后删文件改 `use mt_ai::{...}`；在此之前两份实现同步维护。
-- **ledger `journal_mode=WAL` 的 BUSY 竞态是真缺陷**（迁移中定位，非迁移引入）：SQLite 对 journal-mode 转换不调 busy handler，首次启动时查询与后台同步同刻 open 非 WAL 库，输者报「账本打开失败: database is locked」。修法：`open_raw` 对该 pragma 按 busy_timeout 预算做 BUSY 限定重试。独立提交、独立 review，不混进迁移。
+- ~~mt-usage/ai_shim.rs~~ **已收编**（`826071a`）：删除临时副本，六处调用直连 mt-ai，grok_home 提为 pub。
+- ~~ledger WAL BUSY 竞态~~ **已修复**（`f42ccce`）：open_raw 对该 pragma 按 5s 预算做 BUSY 限定重试；原单跑挂 5~8/10 轮的并发测试连跑 6 轮全绿。
 - Cargo.lock 已把 rusqlite/libsqlite3-sys pin 到与 src-tauri 完全一致（0.40.1/0.38.1）。
 - **SshConnection 归属决议**：mt-config 内复刻了 mt-core 的同形结构（serde 形状有回归测试钉住）。决议：config 是 sshConnections 的持久化归属方，其他 crate 统一引用 `mt_config::SshConnection`；mt-core 移入 crates/ 后改 re-export。
 - `atomic_write` 在 mt-config 与 mt-project 各一份私有复刻，等共享工具 crate 时合并。

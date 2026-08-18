@@ -21,3 +21,6 @@ mt-ai.workspace = true
 mt-usage.workspace = true
 mt-relay.workspace = true
 anyhow.workspace = true
+# PTY reader 线程 → 主线程的唤醒信号(gpui 的 AsyncApp 是 Rc,不能跨线程)。
+# gpui 自己也依赖 futures 0.3,不会多拉一棵依赖树。
+futures = "0.3"
