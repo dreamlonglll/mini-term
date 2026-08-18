@@ -21,7 +21,7 @@
 | 1 | **IME 接线**：`pane.rs` 换用 `mt_ui::TerminalView`；`clear_preedit()` 两调用点（activate_pane/dispose_terminal）；OSC 应答改 `terminal_color_rgb` | 小 | mt-app | ✅ J 批。gpui 派发顺序（action 先于 key 监听）已实证等价原版 capture-consume，机制写进 pane.rs 注释 |
 | 2 | **快捷键对齐**：ctrl-shift-b 修正 / ClosePane→close_leaf（关整组）/ 补 Ctrl+Tab、Ctrl+Shift+Tab、Ctrl+1..9 | 小 | mt-app | 🟡 J 批完成本体；剩 switchProject/globalSearch/terminalSearch/markerPrev/Next 5 条随对应功能批落地（未占位）；Ctrl+Shift+A/U/J 三条原版没有、保留并已注明 |
 | 3 | ~~窗口聚焦即清未读~~ | 小 | mt-app | ✅ G 收尾已补 |
-| 4 | **i18n 接线**：mt-app 挂 mt-i18n 依赖（根 Cargo.toml 已加行）；启动 `set_locale(cfg.locale)` + `add_locale_observer` 桥接 gpui-component 的 rust-i18n；AppConfig 加 locale 字段；首启检测走 Win32 GetUserDefaultLocaleName；替换约 80 处硬编码文案；语言切换入口 | 中 | mt-app + mt-config | ❌ |
+| 4 | **i18n 接线** | 中 | mt-app + mt-config | ✅ L 批。90 调用点 84 key 覆盖 8 文件，key 逐条照 TSX 抄并有「84 key×双语全在」测试防字典重生成漂移；AppConfig.locale 存 String 防手改坏值拖垮整份 config；首启 Win32 探测不落盘（对齐 detectInitialLang 跟随系统）；gpui-component 桥必须传 bcp47 而非 code（其 ui.yml 键是 zh-CN，传 zh 会静默回英文）；语言切换入口在设置对话框；ElementId 改用 key() 防随语言变。**留 7 条缺 key 文案（TODO(i18n) 注释在位）+1 条 pricingLocalHint → 转 M 批走 TS 源头补+重生成** |
 | 5 | **主题桥接线** | 中 | mt-app + mt-ui | 🟡 J 批：theme.rs 唯一装配入口（light/dark/auto + customThemeId 失败回落只清内存不落盘）、ui.rs 改 Palette（dark/light 逐值抄 styles.css、from_pack 对齐 buildTokenMap，函数签名零改动走 thread_local）、terminalFollowTheme 含存量终端热更、切换 pub 入口全备且起 PTY 前装配。剩：`config.skin` 皮肤色表（blueprint/fluent2）、appearance 设置页 UI（→#19）、背景图渲染（→K 批 mt-ui） |
 | 6 | **AI 自动 resume** | 中 | mt-app | ✅ J 批。resume_pending 置位只看 ai_session（遵原版：开关关着也保留标记）；磁盘格式零改动有测试钉住；pane 自带 cwd 优先防 worktree 带偏；lookup_ai_session_cwd 为同步调用（仅存量无 cwd 记录触发，理论卡顿已记档） |
 

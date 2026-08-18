@@ -36,6 +36,7 @@
 mod ai;
 mod file_tree;
 mod focus_nav;
+mod i18n;
 mod modal;
 mod notify;
 mod pane;
@@ -62,11 +63,13 @@ use gpui::{
 };
 use gpui_component::notification::Notification;
 use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel};
+use gpui_component::tooltip::Tooltip;
 use gpui_component::{Root, WindowExt as _};
 
 use crate::ai::AiBridge;
 use crate::file_tree::FileTree;
 use crate::focus_nav::Direction;
+use crate::i18n::t;
 use crate::notify::ToastKind;
 use crate::project_list::ProjectList;
 use crate::session_panel::SessionPanel;
@@ -268,16 +271,26 @@ impl Workspace {
                 }
             });
         };
+        // 旧版 toast 是「项目名一行 + 描述一行」(`ToastContainer.tsx`),
+        // gpui-component 的通知只有一段正文,拼成一行。
         let note = match kind {
             ToastKind::Completion => {
-                Notification::success(format!("{} · AI 任务完成", alert.project_name))
-                    .id1::<CompletionToast>(key)
-                    .on_click(on_click)
+                Notification::success(format!(
+                    "{} · {}",
+                    alert.project_name,
+                    t("toast", "aiDone")
+                ))
+                .id1::<CompletionToast>(key)
+                .on_click(on_click)
             }
             ToastKind::Attention => {
-                Notification::warning(format!("{} · 等待你确认", alert.project_name))
-                    .id1::<AttentionToast>(key)
-                    .on_click(on_click)
+                Notification::warning(format!(
+                    "{} · {}",
+                    alert.project_name,
+                    t("toast", "aiAttention")
+                ))
+                .id1::<AttentionToast>(key)
+                .on_click(on_click)
             }
         };
         window.push_notification(note, cx);
@@ -551,8 +564,17 @@ impl Render for Workspace {
                 });
             });
 
-        // 左侧窄边条:中间栏折叠开关 + 面板开关 + 待办跳转
-        let strip_button = |id: &'static str, label: &'static str, active: bool| {
+        // 左侧窄边条:中间栏折叠开关 + 面板开关 + 待办跳转。
+        //
+        // 字形一律用**与语言无关的符号**:这条边栏只有 14px 宽,塞不下「会话」
+        // 或 "Sessions",而原来的「会 / 量 / 设」单字在英文界面里就是三个方块。
+        // 含义靠 tooltip 交代 —— 原版 ActivityBar 同样是「图标 + title 提示」
+        // (`src/components/ActivityBar.tsx` 的 `title={t('app.activityBar.*')}`),
+        // 真图标等图标体系落地(审计缺口 #9)后再换。
+        let strip_button = |id: &'static str,
+                            glyph: &'static str,
+                            tip: &'static str,
+                            active: bool| {
             div()
                 .id(id)
                 .flex()
@@ -564,7 +586,8 @@ impl Render for Workspace {
                 .cursor_pointer()
                 .text_color(if active { ui::accent() } else { ui::text_muted() })
                 .hover(|el| el.text_color(ui::accent()))
-                .child(label)
+                .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
+                .child(glyph)
         };
         let toggle_strip = div()
             .flex_none()
@@ -579,36 +602,62 @@ impl Render for Workspace {
             .border_r_1()
             .border_color(ui::border_subtle())
             .child(
-                strip_button("toggle-middle", if middle_visible { "‹" } else { "›" }, false)
-                    .on_click(cx.listener(|this, _event, _window, cx| {
-                        this.store.update(cx, |store, cx| store.toggle_middle_column(cx));
-                    })),
-            )
-            .child(
-                strip_button("toggle-sessions", "会", self.sessions_open).on_click(cx.listener(
-                    |this, _event, _window, cx| this.toggle_sessions(cx),
-                )),
-            )
-            .child(
-                strip_button("toggle-usage", "量", self.usage_open).on_click(cx.listener(
-                    |this, _event, _window, cx| this.toggle_usage(cx),
-                )),
-            )
-            .child(
-                strip_button("open-settings", "设", false).on_click(cx.listener(
-                    |this, _event, window, cx| {
-                        modal::open_terminal_settings(this.store.clone(), window, cx);
+                strip_button(
+                    "toggle-middle",
+                    if middle_visible { "‹" } else { "›" },
+                    if middle_visible {
+                        t("app", "activityBar.collapse")
+                    } else {
+                        t("app", "activityBar.expand")
                     },
-                )),
+                    false,
+                )
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.store.update(cx, |store, cx| store.toggle_middle_column(cx));
+                })),
+            )
+            .child(
+                strip_button(
+                    "toggle-sessions",
+                    "≡",
+                    t("app", "activityBar.sessions"),
+                    self.sessions_open,
+                )
+                .on_click(cx.listener(|this, _event, _window, cx| this.toggle_sessions(cx))),
+            )
+            .child(
+                strip_button(
+                    "toggle-usage",
+                    "▤",
+                    t("app", "activityBar.stats"),
+                    self.usage_open,
+                )
+                .on_click(cx.listener(|this, _event, _window, cx| this.toggle_usage(cx))),
+            )
+            .child(
+                strip_button(
+                    "open-settings",
+                    "⚙",
+                    t("app", "activityBar.settings"),
+                    false,
+                )
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    modal::open_terminal_settings(this.store.clone(), window, cx);
+                })),
             )
             // 未读完成计数:点一下跳到最先完成的那个 pane(旧版托盘绿灯的入口)
             .when(unread > 0, |el| {
                 el.child(
-                    strip_button("jump-attention", "●", true)
-                        .text_color(ui::color_success())
-                        .on_click(cx.listener(|this, _event, window, cx| {
-                            this.on_jump_attention(&JumpAttention, window, cx);
-                        })),
+                    strip_button(
+                        "jump-attention",
+                        "●",
+                        t("app", "titleBar.status.done"),
+                        true,
+                    )
+                    .text_color(ui::color_success())
+                    .on_click(cx.listener(|this, _event, window, cx| {
+                        this.on_jump_attention(&JumpAttention, window, cx);
+                    })),
                 )
             });
 
@@ -638,7 +687,7 @@ impl Render for Workspace {
                             div()
                                 .text_size(px(12.0))
                                 .text_color(ui::text_primary())
-                                .child("用量统计"),
+                                .child(t("usageStats", "title")),
                         )
                         .child(
                             div()
@@ -750,9 +799,16 @@ fn main() {
                 }
             }
         };
+        // 界面语言必须在**任何视图建出来之前**定下来:`t()` 读的是进程级全局量,
+        // 晚一步的话首帧会以默认中文画出来再被刷成英文(闪一下)。
+        // 首启没有 config.locale 时按系统语言探测,探测结果不落盘 —— 与 TS 侧
+        // `detectInitialLang()` 一致,用户没显式选过就一直跟随系统。
+        let startup_config = config_store.read();
+        i18n::install(startup_config.locale.as_deref());
+
         // hook 开关取自配置(与装机版同一字段);start_hook_server 的数据目录统一
         // 走 mt_config::app_data_dir(),端口文件与装机版落在同一处。
-        let hook_enabled = config_store.read().hook_enabled;
+        let hook_enabled = startup_config.hook_enabled;
         let (ai_bridge, ai_events) = AiBridge::new(hook_enabled);
         let ai_for_quit = ai_bridge.clone();
 

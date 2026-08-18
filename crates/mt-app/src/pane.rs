@@ -368,7 +368,7 @@ impl Render for TerminalPane {
                 .justify_center()
                 .text_size(px(13.0))
                 .text_color(crate::ui::color_error())
-                .child(format!("终端启动失败:{err}"));
+                .child(format!("{}:{err}", crate::i18n::t("paneGroup", "startFailed")));
         }
 
         // 焦点 / key_context / 按键 / 左键聚焦全在 TerminalView 里,这里只剩一行。
@@ -387,6 +387,9 @@ impl Render for TerminalPane {
                         .right_3()
                         .text_size(px(12.0))
                         .text_color(crate::ui::color_error())
+                        // TODO(i18n): 旧版没有这个角标(子进程退出后 pane 直接标红),
+                        // 字典里也就没有对应 key。等 TS 侧补 `paneGroup.shellExited`
+                        // (zh「shell 已退出」/ en "shell exited")后换过来。
                         .child("shell 已退出"),
                 )
             })

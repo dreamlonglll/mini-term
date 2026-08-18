@@ -26,8 +26,10 @@ use gpui::{
     SharedString, StatefulInteractiveElement, Styled, Task, Window, div, prelude::FluentBuilder,
     px,
 };
+use gpui_component::tooltip::Tooltip;
 use mt_ai::sessions::{AiSession, AiSessionMessage};
 
+use crate::i18n::{t, tr};
 use crate::store::AppStore;
 use crate::ui;
 
@@ -77,23 +79,28 @@ fn format_time(iso: &str) -> String {
     let now = chrono::Local::now();
     let minutes = (now.timestamp() - ts.timestamp()) / 60;
     if minutes < 1 {
-        return "刚刚".into();
+        return t("sessionList", "time.justNow").to_string();
     }
     if minutes < 60 {
-        return format!("{minutes} 分钟前");
+        return tr!("sessionList", "time.minutesAgo", n = minutes);
     }
     let hours = minutes / 60;
     if hours < 24 {
-        return format!("{hours} 小时前");
+        return tr!("sessionList", "time.hoursAgo", n = hours);
     }
     let days = hours / 24;
     if days < 7 {
-        return format!("{days} 天前");
+        return tr!("sessionList", "time.daysAgo", n = days);
     }
     let local = ts.with_timezone(&chrono::Local);
     use chrono::Datelike;
     if local.year() == now.year() {
-        format!("{}/{}", local.month(), local.day())
+        tr!(
+            "sessionList",
+            "time.monthDay",
+            m = local.month(),
+            d = local.day()
+        )
     } else {
         format!("{}/{}/{}", local.year(), local.month(), local.day())
     }
@@ -331,7 +338,7 @@ impl SessionPanel {
                     .py(px(12.0))
                     .text_size(px(12.0))
                     .text_color(ui::text_muted())
-                    .child("读取会话正文…"),
+                    .child(t("sessionViewer", "loading")),
             );
         }
         if let Some(err) = &preview.error {
@@ -361,7 +368,9 @@ impl SessionPanel {
                         div()
                             .text_size(px(10.0))
                             .text_color(ui::text_muted())
-                            .child(if is_user { "你" } else { "AI" }),
+                            // 旧版 `SessionViewerModal.tsx` 这两个角色名就是硬编码的
+                            // 英文字面量(不进字典),照抄
+                            .child(if is_user { "User" } else { "Assistant" }),
                     )
                     .child(
                         div()
@@ -387,12 +396,14 @@ impl SessionPanel {
                     .border_b_1()
                     .border_color(ui::border_subtle())
                     .child(
-                        ui::ghost_button("session-preview-back", "‹ 返回").on_click(cx.listener(
-                            |this: &mut Self, _, _window, cx| {
-                                this.preview = None;
-                                cx.notify();
-                            },
-                        )),
+                        ui::ghost_button(
+                            "session-preview-back",
+                            format!("‹ {}", t("fileViewer", "back")),
+                        )
+                        .on_click(cx.listener(|this: &mut Self, _, _window, cx| {
+                            this.preview = None;
+                            cx.notify();
+                        })),
                     )
                     .child(
                         div()
@@ -404,13 +415,15 @@ impl SessionPanel {
                     )
                     .when_some(command, |el, command| {
                         el.child(
-                            ui::ghost_button("session-copy-cmd", "复制命令").on_click(
-                                move |_, _window, cx| {
-                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                                        command.clone(),
-                                    ));
-                                },
-                            ),
+                            ui::ghost_button(
+                                "session-copy-cmd",
+                                t("sessionList", "copyResumeCommand"),
+                            )
+                            .on_click(move |_, _window, cx| {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                    command.clone(),
+                                ));
+                            }),
                         )
                     }),
             )
@@ -460,7 +473,7 @@ impl Render for SessionPanel {
                     .py(px(12.0))
                     .text_size(px(12.0))
                     .text_color(ui::text_muted())
-                    .child("加载中…"),
+                    .child(t("sessionList", "loading")),
             );
         } else if sessions.is_empty() {
             list = list.child(
@@ -469,9 +482,9 @@ impl Render for SessionPanel {
                     .text_size(px(12.0))
                     .text_color(ui::text_muted())
                     .child(if has_project {
-                        "该项目还没有 AI 会话记录"
+                        t("sessionList", "empty")
                     } else {
-                        "先选一个项目"
+                        t("sessionList", "selectProject")
                     }),
             );
         }
@@ -542,27 +555,38 @@ impl Render for SessionPanel {
                                     .text_size(px(10.0))
                                     .text_color(ui::text_muted())
                                     .child(match wsl_badge {
-                                        Some(distro) => format!("{time} · WSL·{distro}"),
+                                        Some(distro) => format!(
+                                            "{time} · {}·{distro}",
+                                            t("sessionList", "wslBadge")
+                                        ),
                                         None => time,
                                     }),
                             )
                             .child(
                                 ui::ghost_button(
                                     SharedString::from(format!("view-{key}")),
-                                    "查看",
+                                    t("sessionList", "view"),
                                 )
                                 .flex_none()
                                 .on_click(cx.listener(move |this: &mut Self, _, _window, cx| {
                                     this.open_preview(&session_for_preview, cx);
                                 })),
                             )
+                            // 两个恢复动作在旧版是右键菜单项,文案是整句
+                            // (「在当前终端恢复」/ "Resume in current terminal");
+                            // 抽屉最窄 240px,整句并排必然溢出,于是**字面量放
+                            // tooltip、按钮上只留箭头**。字典 key 仍是原版那两条。
                             .when(can_resume_here, |el| {
                                 el.child(
                                     ui::ghost_button(
                                         SharedString::from(format!("resume-{key}")),
-                                        "恢复",
+                                        "↩",
                                     )
                                     .flex_none()
+                                    .tooltip(|window, cx| {
+                                        Tooltip::new(t("sessionList", "resumeHere"))
+                                            .build(window, cx)
+                                    })
                                     .on_click(cx.listener(
                                         move |this: &mut Self, _, window, cx| {
                                             if let Some(cmd) = cmd_here.clone() {
@@ -574,9 +598,13 @@ impl Render for SessionPanel {
                                 .child(
                                     ui::ghost_button(
                                         SharedString::from(format!("resume-tab-{key}")),
-                                        "新标签",
+                                        "↗",
                                     )
                                     .flex_none()
+                                    .tooltip(|window, cx| {
+                                        Tooltip::new(t("sessionList", "resumeInNewTab"))
+                                            .build(window, cx)
+                                    })
                                     .on_click(cx.listener(
                                         move |this: &mut Self, _, window, cx| {
                                             if let Some(cmd) = cmd_tab.clone() {
@@ -604,7 +632,7 @@ impl Render for SessionPanel {
                         this.display_count += PAGE_SIZE;
                         cx.notify();
                     }))
-                    .child(format!("加载更多({remaining})")),
+                    .child(tr!("sessionList", "loadMore", n = remaining)),
             );
         }
 
@@ -627,14 +655,14 @@ impl Render for SessionPanel {
                                 div()
                                     .text_size(px(11.0))
                                     .text_color(ui::text_muted())
-                                    .child("AI 会话"),
+                                    .child(t("panels", "sessions")),
                             )
                             .when(wsl_loading, |el| {
                                 el.child(
                                     div()
                                         .text_size(px(10.0))
                                         .text_color(ui::text_muted())
-                                        .child("WSL 加载中…"),
+                                        .child(t("sessionList", "wslLoading")),
                                 )
                             }),
                     )
@@ -646,6 +674,9 @@ impl Render for SessionPanel {
                             .text_color(ui::text_muted())
                             .cursor_pointer()
                             .hover(|el| el.text_color(ui::accent()))
+                            .tooltip(|window, cx| {
+                                Tooltip::new(t("sessionList", "refresh")).build(window, cx)
+                            })
                             .on_click(cx.listener(|this: &mut Self, _, _window, cx| {
                                 this.refresh(true, cx);
                             }))

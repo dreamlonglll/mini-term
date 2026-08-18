@@ -16,6 +16,7 @@ mt-ui.workspace = true
 mt-terminal.workspace = true
 mt-pty.workspace = true
 mt-config.workspace = true
+mt-i18n.workspace = true
 mt-project.workspace = true
 mt-ai.workspace = true
 mt-usage.workspace = true
@@ -39,6 +40,9 @@ iana-time-zone = "0.1"
 # 版本跟随 gpui 已经在用的那个,不给依赖树引入第二份 windows crate。
 windows = { version = "0.61", features = [
     "Win32_Foundation",
+    # 首启探测界面语言:GetUserDefaultLocaleName。Windows 上 LANG/LC_ALL 这些
+    # 环境变量通常不存在,只能问系统(见 i18n::system_locale)。
+    "Win32_Globalization",
     "Win32_Media_Audio",
     # MessageBeep 住在这个模块里(不是 WindowsAndMessaging)
     "Win32_System_Diagnostics_Debug",

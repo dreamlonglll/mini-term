@@ -99,6 +99,17 @@ pub struct AppConfig {
     pub theme: String,
     #[serde(default = "default_skin")]
     pub skin: String,
+    /// 界面语言。取值 `"zh"` / `"en"`，与 TS 侧存进 localStorage 的那个字符串
+    /// 一模一样（`mt_i18n::Locale` 的序列化约定就是这两个小写码），迁移期两套
+    /// 可互读。`None` = 用户从未选过，由 mt-app 首启按系统语言探测。
+    ///
+    /// **存 String 而不是枚举**:与紧邻的 `theme` / `skin` 同一取舍 —— 这个字段
+    /// 手改坏了（比如填了 `"fr"`）不该让整份 `config.json` 反序列化失败，那会
+    /// 连带把项目列表一起丢掉。合法性交给使用点的 `Locale::from_code` 判，
+    /// 认不出就当没设过。Tauri 版的 `AppConfig` 没有这个字段，但它同样不开
+    /// `deny_unknown_fields`，多出来的键会被静默忽略（见 `locale_是纯增量字段`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locale: Option<String>,
     #[serde(default = "default_terminal_follow_theme")]
     pub terminal_follow_theme: bool,
     #[serde(default = "default_ai_completion_popup")]
@@ -457,6 +468,7 @@ impl Default for AppConfig {
             middle_column_sizes: None,
             theme: default_theme(),
             skin: default_skin(),
+            locale: None,
             terminal_follow_theme: default_terminal_follow_theme(),
             ai_completion_popup: default_ai_completion_popup(),
             ai_completion_taskbar_flash: default_ai_completion_taskbar_flash(),
@@ -950,6 +962,57 @@ mod tests {
         let config: AppConfig = serde_json::from_str(json).unwrap();
         assert!(config.ui_font_family.is_none());
         assert!(config.terminal_font_family.is_none());
+    }
+
+    /// `locale` 是纯增量字段:旧 config.json 没有它照样读得进来,没设过时不写盘
+    /// (Tauri 版读到多余键会静默忽略,但少写一个键更省心),设过之后原样往返。
+    #[test]
+    fn locale_是纯增量字段() {
+        let legacy = r#"{
+            "projects": [],
+            "defaultShell": "cmd",
+            "availableShells": [],
+            "uiFontSize": 13,
+            "terminalFontSize": 14
+        }"#;
+        let config: AppConfig = serde_json::from_str(legacy).unwrap();
+        assert!(config.locale.is_none(), "旧配置没有该字段不许炸");
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(
+            !json.contains("locale"),
+            "没选过语言就不该往磁盘上写这个键: {json}"
+        );
+
+        let with_locale = r#"{
+            "projects": [],
+            "defaultShell": "cmd",
+            "availableShells": [],
+            "uiFontSize": 13,
+            "terminalFontSize": 14,
+            "locale": "en"
+        }"#;
+        let config: AppConfig = serde_json::from_str(with_locale).unwrap();
+        assert_eq!(config.locale.as_deref(), Some("en"));
+        let reparsed: AppConfig =
+            serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        assert_eq!(reparsed.locale.as_deref(), Some("en"), "取值原样往返");
+    }
+
+    /// 取值认不出来时**不许**让整份配置反序列化失败 —— 那会连带丢掉项目列表。
+    /// 合法性由使用点(`mt_i18n::Locale::from_code`)判,这里只保证读得进来。
+    #[test]
+    fn locale_取值非法不拖垮整份配置() {
+        let json = r#"{
+            "projects": [{"id": "1", "name": "test", "path": "/tmp"}],
+            "defaultShell": "cmd",
+            "availableShells": [],
+            "uiFontSize": 13,
+            "terminalFontSize": 14,
+            "locale": "fr"
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.projects.len(), 1, "项目列表不受连累");
+        assert_eq!(config.locale.as_deref(), Some("fr"));
     }
 
     #[test]

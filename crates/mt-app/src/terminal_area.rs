@@ -39,6 +39,7 @@ use gpui::{
 use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel, v_resizable};
 
 use crate::focus_nav::{self, Direction, PaneRect};
+use crate::i18n::{t, tr};
 use crate::modal;
 use crate::store::AppStore;
 use crate::tree::{SplitDirection, SplitNode};
@@ -506,7 +507,7 @@ impl TerminalArea {
                                 .items_center()
                                 .justify_center()
                                 .text_color(ui::text_muted())
-                                .child("终端启动中…"),
+                                .child(t("paneGroup", "starting")),
                         ),
                     }),
             )
@@ -539,7 +540,7 @@ impl Render for TerminalArea {
                 .justify_center()
                 .text_color(ui::text_muted())
                 .text_size(px(13.0))
-                .child("先在左侧添加一个项目");
+                .child(t("app", "emptyState"));
         };
         let project_id = project.id.clone();
         let project_name = project.name.clone();
@@ -559,7 +560,7 @@ impl Render for TerminalArea {
                     div()
                         .text_color(ui::text_secondary())
                         .text_size(px(13.0))
-                        .child(format!("{project_name} 还没有终端")),
+                        .child(tr!("terminalArea", "emptyTitle", project = project_name)),
                 )
                 .child(
                     div()
@@ -578,7 +579,10 @@ impl Render for TerminalArea {
                                 store.new_terminal(&pid, None, None, window, cx);
                             });
                         }))
-                        .child("+ 新建终端  (Ctrl+Shift+T)"),
+                        .child(format!(
+                            "+ {}  (Ctrl+Shift+T)",
+                            t("terminalArea", "newTerminal")
+                        )),
                 );
         };
 

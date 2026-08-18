@@ -6,6 +6,7 @@ use gpui::{
     StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
 
+use crate::i18n::t;
 use crate::modal;
 use crate::store::AppStore;
 use crate::tree::PaneStatus;
@@ -159,7 +160,7 @@ impl Render for ProjectList {
                         div()
                             .text_size(px(11.0))
                             .text_color(ui::text_muted())
-                            .child("项目"),
+                            .child(t("panels", "projects")),
                     )
                     .child(
                         div()

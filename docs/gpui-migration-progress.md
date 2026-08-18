@@ -13,7 +13,7 @@
 | Wave 1 | 后端五块并行搬运 + TerminalElement 端到端 | ✅ 2026-08-18 全部验收入库（6/6） |
 | Wave 2 | mt-relay、mt-app 全壳（store/三栏/Tab/分屏树） | ✅ 2026-08-18 两件均验收入库；面板/Modal/i18n/主题桥移入 Wave 3 |
 | Wave 3 | G=mt-app UI 批（Modal/AI 历史+用量面板/通知/分屏比例+焦点导航）；H=mt-ui 渲染批（IME/鼠标上报/damage/主题桥）；I=mt-i18n 字典基建 | ✅ 2026-08-18 全部验收入库。G 经收尾 agent 补验：66 单测+4 集成全绿（老断言零改动），六模块齐（托盘明确未做），收尾另修 3 个真 bug（分屏比例恢复首帧 FALLBACK_AREA 基准错→改首帧量尺下帧铺树；窗口聚焦不清未读；折叠栏把 sizes 抹成最小值）+ 2 处资源问题（会话面板惰性加载防 WSL 冷启动、用量面板 Task 句柄无界增长）+6 单测；I ✅（`d2af55f`）；H ✅（`92390d4`） |
-| Wave 4+ | 按 docs/gpui-parity-audit.md 30 条缺口逐批清零（第 0 层接线 → 基建 → 面板 → 整块新功能） | 🔵 2026-08-18 J=mt-app 接线批 ✅（`9246abf`，84+4 绿）；K=mt-ui 视觉批 ✅ 验收（100 测绿 +52、零新依赖：图标全自绘矢量因 gpui svg 单色掩膜+Image SVG 红蓝互换 bug、滚动条、背景图 CSS focus 对齐自算、停留复制状态机、三条追加 API；接线清单见「Wave 4.5」）；L=i18n 接线批进行中 |
+| Wave 4+ | 按 docs/gpui-parity-audit.md 30 条缺口逐批清零（第 0 层接线 → 基建 → 面板 → 整块新功能） | 🔵 2026-08-18 J=mt-app 接线批 ✅（`9246abf`）；K=mt-ui 视觉批 ✅（`b2fa0a0`，100 测绿）；L=i18n 接线批 ✅ 验收（88+4 与 43+1 绿：90 调用点 84 key、locale 全链路、bcp47 桥接坑、语言切换入口在设置框；7 缺 key 转 M）；下一波：M=mt-app 消费批（K 组件接线+i18n 补词条）∥ O=mt-ui 终端查找引擎 |
 | 收尾 | mt-ssh/mt-core 移入 crates/、删 src-tauri/ 与 src/、发版切换 | ⬜ |
 
 ## Wave 1 —— 2026-08-18 派出 6 个并行 agent
@@ -52,8 +52,8 @@
 - [x] 切 tab/关 pane 调 `clear_preedit()`（J 批：activate_pane 收上一焦点 pane + dispose_terminal 先收再 kill）
 - [x] OSC 应答改 `mt_ui::terminal_color_rgb`（J 批，顺带消灭了旧 theme_color_rgb 把查背景答成前景的 bug 副本）
 - [x] 主题切换入口（J 批：因 AppliedThemePack 缺语义色，绕开 switch_to_theme_pack 手拆四步；mt-ui 补 API 后可收回单函数——已转 K 批）
-- [ ] i18n：各 crate 挂 `mt-i18n.workspace = true`（根 Cargo.toml 的 path 行已加）；启动时 `set_locale(cfg.locale)` + `add_locale_observer(|l| rust_i18n::set_locale(l.code()))` 桥接 gpui-component 内置组件；AppConfig 加 locale 字段；首启语言检测走 Win32 GetUserDefaultLocaleName → Locale::from_system_tag（Windows 上 LANG 环境变量通常不存在）
-- [ ] 文案替换：TS 的 `t('ns.key')` → `t("ns", "key")` 或 `t_path("ns.key")`，key 一字未变可照 TSX 抄
+- [x] i18n 装配（L 批）：mt-app 挂 mt-i18n；启动 `i18n::install` 早于任何视图；⚠️ gpui-component 桥接**必须传 `Locale::bcp47()` 不是 `code()`**（其 ui.yml 键是 zh-CN，传 zh 静默回英文）且 install 时先手动桥一次（set_locale 只在变化时通知）；观察者只做进程级副作用，重绘走 `i18n::switch(locale, cx)`（观察者拿不到 &mut App）
+- [x] 文案替换（L 批）：90 调用点 84 key；缺 key 的 7 条带 TODO(i18n) 待 TS 源头补后重生成字典（→ M 批）
 - [ ] IME 人工验收 8 步（微软拼音组合/候选框跟随/方向键不漏/Esc 取消/失焦/emoji/英文直打回归）——用户已豁免 E2E，留给日后真机自验；跑 app 前必设 MT_APP_DATA_DIR
 
 ## Wave 4.5 接线清单（K 批 mt-ui 组件交付后累积，mt-app 消费批照抄）

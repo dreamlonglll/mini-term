@@ -1186,6 +1186,36 @@ impl AppStore {
         cx.notify();
     }
 
+    // === 界面语言 ===
+
+    /// 当前界面语言。取自配置,认不出(或没设过)时回落到**进程内实际生效**的那个
+    /// —— 也就是启动时 `i18n::install` 按系统语言探测出来的结果,这样语言切换
+    /// 段控件的高亮与眼前看到的文案始终一致。
+    pub fn locale(&self) -> mt_i18n::Locale {
+        self.config
+            .locale
+            .as_deref()
+            .and_then(mt_i18n::Locale::from_code)
+            .unwrap_or_else(mt_i18n::locale)
+    }
+
+    /// 切界面语言。对应 TS 侧 `useI18nStore.setLang`,只是落点从 localStorage
+    /// 换成了 `config.locale`(GPUI 没有 localStorage,配置文件是唯一的持久层)。
+    ///
+    /// **一定要落盘**:探测出来的语言不写、用户选的语言必写 —— 否则下次启动又被
+    /// 系统语言盖回去,选择等于没生效。
+    pub fn set_locale(&mut self, locale: mt_i18n::Locale, cx: &mut Context<Self>) {
+        let code = locale.code().to_string();
+        if self.config.locale.as_deref() == Some(code.as_str()) && mt_i18n::locale() == locale {
+            return;
+        }
+        self.config.locale = Some(code);
+        // 进程内切换 + 全窗口重绘(观察者顺带把 gpui-component 的 rust-i18n 也改了)
+        crate::i18n::switch(locale, cx);
+        self.save_config_soon(cx);
+        cx.notify();
+    }
+
     // === pane 重命名 ===
 
     /// 改 tab 标题。空字符串 = 恢复默认(shell 名)。

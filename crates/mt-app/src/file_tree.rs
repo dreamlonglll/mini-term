@@ -24,6 +24,7 @@ use gpui::{
 use mt_project::fs::FileEntry;
 use mt_project::watch::FsWatcher;
 
+use crate::i18n::t;
 use crate::store::AppStore;
 use crate::ui;
 
@@ -258,7 +259,7 @@ impl Render for FileTree {
             .border_color(ui::border_subtle())
             .text_size(px(11.0))
             .text_color(ui::text_muted())
-            .child("文件");
+            .child(t("panels", "files"));
 
         let Some(project_id) = self.current_project.clone() else {
             return div()

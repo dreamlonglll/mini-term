@@ -3797,6 +3797,7 @@ dependencies = [
  "iana-time-zone",
  "mt-ai",
  "mt-config",
+ "mt-i18n",
  "mt-project",
  "mt-pty",
  "mt-relay",

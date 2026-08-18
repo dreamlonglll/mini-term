@@ -29,11 +29,13 @@ use gpui::{
     Context, Div, Entity, InteractiveElement, IntoElement, ParentElement, Render, SharedString,
     Stateful, StatefulInteractiveElement, Styled, Task, Window, div, prelude::FluentBuilder, px,
 };
+use gpui_component::tooltip::Tooltip;
 use mt_usage::{
     AgentFilter, ModelPrice, SyncEvent, UsageStatsPayload, ledger_db_path,
     spawn_usage_ledger_sync, usage_ledger_query,
 };
 
+use crate::i18n::{t, tr};
 use crate::store::AppStore;
 use crate::ui;
 
@@ -61,14 +63,31 @@ impl UsageRange {
         Self::Months6,
     ];
 
+    /// 稳定标识:元素 id 与字典 key 的后半段都用它。
+    ///
+    /// **不能拿 [`label`](Self::label) 当 id** —— 那是随语言变的文案,
+    /// 切一次语言全部 `ElementId` 都换人,点击态/滚动位置一起丢。
+    /// 取值与 TS 侧 `UsageRange` 的联合类型字面量一字不差。
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Today => "today",
+            Self::Days7 => "days7",
+            Self::Days30 => "days30",
+            Self::Month => "month",
+            Self::Months3 => "months3",
+            Self::Months6 => "months6",
+        }
+    }
+
+    /// 分段控件上的文案(对齐旧版 `usageStats.range.{v}`)。
     pub fn label(self) -> &'static str {
         match self {
-            Self::Today => "今天",
-            Self::Days7 => "7 天",
-            Self::Days30 => "30 天",
-            Self::Month => "本月",
-            Self::Months3 => "3 个月",
-            Self::Months6 => "6 个月",
+            Self::Today => t("usageStats", "range.today"),
+            Self::Days7 => t("usageStats", "range.days7"),
+            Self::Days30 => t("usageStats", "range.days30"),
+            Self::Month => t("usageStats", "range.month"),
+            Self::Months3 => t("usageStats", "range.months3"),
+            Self::Months6 => t("usageStats", "range.months6"),
         }
     }
 
@@ -292,9 +311,20 @@ enum Scope {
 impl Scope {
     const ALL: [Scope; 4] = [Self::All, Self::Claude, Self::Codex, Self::Grok];
 
+    /// 稳定标识(元素 id 用)。理由同 [`UsageRange::key`]。
+    const fn key(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Grok => "grok",
+        }
+    }
+
     fn label(self) -> &'static str {
         match self {
-            Self::All => "全部",
+            // 厂商名不翻译(旧版 `SCOPE_NAMES` 同样是裸字面量)
+            Self::All => t("usageStats", "scope.all"),
             Self::Claude => "Claude",
             Self::Codex => "Codex",
             Self::Grok => "Grok",
@@ -557,6 +587,17 @@ impl Render for UsagePanel {
         let range = self.range;
         let project_scoped = self.project_scope.is_some();
         let has_pricing = !self.pricing.is_empty();
+        // 项目开关的文案照搬旧版那个下拉框:未限定时显示「全部项目」,限定时
+        // 显示项目名 —— 于是不必造一条「仅当前项目」的新词条。
+        let project_scope_label = if project_scoped {
+            self.store
+                .read(cx)
+                .active_project()
+                .map(|p| p.name.clone())
+                .unwrap_or_else(|| t("usageStats", "scope.allProjects").to_string())
+        } else {
+            t("usageStats", "scope.allProjects").to_string()
+        };
 
         // 分段控件
         let mut scope_bar = div().flex().gap(px(4.0));
@@ -564,7 +605,7 @@ impl Render for UsagePanel {
             let active = s == scope;
             scope_bar = scope_bar.child(
                 div()
-                    .id(SharedString::from(format!("usage-scope-{}", s.label())))
+                    .id(SharedString::from(format!("usage-scope-{}", s.key())))
                     .px(px(8.0))
                     .py(px(2.0))
                     .rounded(px(3.0))
@@ -586,7 +627,7 @@ impl Render for UsagePanel {
             let active = r == range;
             range_bar = range_bar.child(
                 div()
-                    .id(SharedString::from(format!("usage-range-{}", r.label())))
+                    .id(SharedString::from(format!("usage-range-{}", r.key())))
                     .px(px(8.0))
                     .py(px(2.0))
                     .rounded(px(3.0))
@@ -629,7 +670,7 @@ impl Render for UsagePanel {
                     .on_click(cx.listener(|this: &mut Self, _, _window, cx| {
                         this.toggle_project_scope(cx);
                     }))
-                    .child("仅当前项目"),
+                    .child(project_scope_label),
             )
             .child(
                 div()
@@ -640,6 +681,9 @@ impl Render for UsagePanel {
                     .text_color(ui::text_muted())
                     .cursor_pointer()
                     .hover(|el| el.text_color(ui::accent()))
+                    .tooltip(|window, cx| {
+                        Tooltip::new(t("usageStats", "refresh")).build(window, cx)
+                    })
                     .on_click(cx.listener(|this: &mut Self, _, _window, cx| this.refresh(cx)))
                     .child("↻"),
             );
@@ -659,7 +703,16 @@ impl Render for UsagePanel {
                 div()
                     .text_size(px(11.0))
                     .text_color(ui::text_muted())
-                    .child(format!("首次建账本中… {processed}/{total}")),
+                    .child(format!(
+                        "{} {}",
+                        t("usageStats", "backfilling"),
+                        tr!(
+                            "usageStats",
+                            "progress",
+                            processed = processed,
+                            total = total
+                        )
+                    )),
             );
         }
         if !has_pricing {
@@ -671,11 +724,13 @@ impl Render for UsagePanel {
                     .border_color(ui::color_ai_working())
                     .text_size(px(11.0))
                     .text_color(ui::text_secondary())
-                    .child(
-                        "未接价格表:金额一律按 $0 计,只有次数与 token 是真值。\
-                         把 models.dev 的价格表(canonical 模型名 → $/token)存成 \
-                         model-pricing.json 放进应用数据目录即可。",
-                    ),
+                    // 旧版是 fetch models.dev 失败时的 `pricingError` 提示;
+                    // GPUI 侧改读本地 model-pricing.json,场景一致(拿不到价格 →
+                    // 成本不可信),文案沿用同一条 key。
+                    // TODO(i18n): 「把 models.dev 的价格表存成 model-pricing.json 放进
+                    // 应用数据目录即可」这句怎么补救是 GPUI 特有的,原版没有对应
+                    // key,等 TS 侧补 `usageStats.pricingLocalHint` 后接在后面。
+                    .child(t("usageStats", "pricingError")),
             );
         }
         if let Some(err) = &self.error {
@@ -693,7 +748,9 @@ impl Render for UsagePanel {
                     div()
                         .text_size(px(12.0))
                         .text_color(ui::text_muted())
-                        .child("查询中…"),
+                        // 旧版这一档画的是骨架屏(没有文字),先用会话列表那条
+                        // 通用「加载中…」占位,骨架屏见审计缺口 #17。
+                        .child(t("sessionList", "loading")),
                 );
             }
             None => {}
@@ -707,14 +764,27 @@ impl Render for UsagePanel {
                     div()
                         .flex()
                         .gap(px(8.0))
-                        .child(kpi("总花费", format_cost(stats.total_cost), None))
                         .child(kpi(
-                            "调用",
-                            format_count(stats.total_calls),
-                            Some(format!("{} 个会话", stats.session_count)),
+                            t("usageStats", "kpi.cost"),
+                            format_cost(stats.total_cost),
+                            None,
                         ))
                         .child(kpi(
-                            "输入 / 输出",
+                            t("usageStats", "kpi.calls"),
+                            format_count(stats.total_calls),
+                            // 旧版会话数是独立一格 KPI,这里并成副标题(四格排满了)
+                            Some(format!(
+                                "{} {}",
+                                t("usageStats", "kpi.sessions"),
+                                stats.session_count
+                            )),
+                        ))
+                        .child(kpi(
+                            &format!(
+                                "{} / {}",
+                                t("usageStats", "tokens.in"),
+                                t("usageStats", "tokens.out")
+                            ),
                             format!(
                                 "{} / {}",
                                 format_tokens(stats.input_tokens),
@@ -723,9 +793,13 @@ impl Render for UsagePanel {
                             None,
                         ))
                         .child(kpi(
-                            "缓存命中",
+                            t("usageStats", "kpi.cacheHit"),
                             hit.map(|h| format!("{h:.0}%")).unwrap_or_else(|| "—".into()),
-                            Some(format!("读 {}", format_tokens(stats.cache_read_tokens))),
+                            Some(format!(
+                                "{} {}",
+                                t("usageStats", "tokens.cached"),
+                                format_tokens(stats.cache_read_tokens)
+                            )),
                         )),
                 );
 
@@ -760,7 +834,7 @@ impl Render for UsagePanel {
                     let last = stats.daily.last().map(|d| d.date.clone()).unwrap_or_default();
                     body = body.child(
                         div()
-                            .child(ui::section_title("趋势"))
+                            .child(ui::section_title(t("usageStats", "dailyActivity")))
                             .child(chart)
                             .child(
                                 div()
@@ -793,7 +867,7 @@ impl Render for UsagePanel {
                             format!("{} · {}", format_cost(p.cost), format_tokens(p.tokens)),
                         ));
                     }
-                    body = body.child(div().child(ui::section_title("按项目")).child(rows));
+                    body = body.child(div().child(ui::section_title(t("usageStats", "byProject"))).child(rows));
                 }
 
                 // 按模型
@@ -806,7 +880,7 @@ impl Render for UsagePanel {
                     let mut rows = div().flex().flex_col();
                     for (i, m) in top.iter().enumerate() {
                         let name = if m.model.is_empty() {
-                            "未知模型".to_string()
+                            t("usageStats", "unknownModel").to_string()
                         } else {
                             model_short_name(&m.model)
                         };
@@ -817,7 +891,7 @@ impl Render for UsagePanel {
                             format!("{} · {}", format_cost(m.cost), format_tokens(m.tokens)),
                         ));
                     }
-                    body = body.child(div().child(ui::section_title("按模型")).child(rows));
+                    body = body.child(div().child(ui::section_title(t("usageStats", "byModel"))).child(rows));
                 }
 
                 // 按供应商
@@ -839,7 +913,7 @@ impl Render for UsagePanel {
                             format!("{} · {}", format_cost(p.cost), format_count(p.calls)),
                         ));
                     }
-                    body = body.child(div().child(ui::section_title("按供应商")).child(rows));
+                    body = body.child(div().child(ui::section_title(t("usageStats", "byProvider"))).child(rows));
                 }
 
                 // Top 会话
@@ -880,14 +954,20 @@ impl Render for UsagePanel {
                                 ),
                         );
                     }
-                    body = body.child(div().child(ui::section_title("Top 会话")).child(rows));
+                    body = body.child(div().child(ui::section_title(t("usageStats", "topSessions"))).child(rows));
                 }
 
-                // 工具 / Shell / MCP 计数排行
-                for (title, items) in [
-                    ("工具", &stats.by_tool),
-                    ("Shell 命令", &stats.by_shell),
-                    ("MCP", &stats.by_mcp),
+                // 工具 / Shell / MCP 计数排行。
+                //
+                // TODO(i18n): 这三块是 GPUI 侧新加的(`byTool`/`byShell`/`byMcp` 在
+                // `types.ts` 里有类型,旧版面板从没渲染过),字典里没有对应 key。
+                // 等 TS 侧补 `usageStats.byTool` / `usageStats.byShell` 后换过来
+                // (zh「工具」「Shell 命令」/ en "Tools" "Shell commands");
+                // `id` 用不随语言变的稳定前缀,免得切语言把元素身份也换了。
+                for (id, title, items) in [
+                    ("tool", "工具", &stats.by_tool),
+                    ("shell", "Shell 命令", &stats.by_shell),
+                    ("mcp", "MCP", &stats.by_mcp),
                 ] {
                     if items.is_empty() {
                         continue;
@@ -896,7 +976,7 @@ impl Render for UsagePanel {
                     let mut rows = div().flex().flex_col();
                     for (i, c) in items.iter().enumerate() {
                         rows = rows.child(rank_row(
-                            format!("{title}-{}", c.name),
+                            format!("{id}-{}", c.name),
                             c.name.clone(),
                             ratios.get(i).copied().unwrap_or(0.0),
                             format_count(c.count),

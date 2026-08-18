@@ -1,0 +1,253 @@
+//! 文案层接线:把 [`mt_i18n`] 装进 GPUI 壳。
+//!
+//! # 三件事
+//!
+//! 1. **启动装配**([`install`]):`config.locale` 优先,没有就按系统语言探测
+//!    ([`system_locale`]),定下来之后立刻挂观察者;
+//! 2. **桥接 gpui-component**([`bridge_component_locale`]):组件库内部走
+//!    rust-i18n(`locales/ui.yml`),日期选择器的星期名、输入框的右键菜单都取
+//!    自那份字典。它的语言键是 **BCP 47**(`zh-CN` / `en`),所以桥过去的是
+//!    [`Locale::bcp47`] 而不是 `code()` —— 传 `"zh"` 的话组件库会当成未知语言
+//!    回落英文,于是自研文案是中文、组件库文案是英文,半页中半页英;
+//! 3. **切换与重绘**([`switch`]):写全局语言 → 观察者顺带把 rust-i18n 也改了
+//!    → `cx.refresh_windows()` 让每个窗口重新渲染。
+//!
+//! # 为什么重绘不在观察者里做
+//!
+//! [`mt_i18n::add_locale_observer`] 只收 `fn(Locale)` 裸函数指针(见它的注释:
+//! 静态全局里放 `Box<dyn Fn>` 有销毁顺序问题),而 GPUI 的重绘需要 `&mut App`,
+//! 拿不到也不能安全地全局持有。于是分工:**进程级副作用**(rust-i18n)放观察者,
+//! 保证任何调用方切语言都生效;**重绘**放 [`switch`] —— UI 上切语言只有那一条路。
+//!
+//! # 文案 key 从哪来
+//!
+//! 一律照抄 TS 侧 `src/i18n/locales/*.ts` 里同一句文案的 `ns.key`,
+//! 不新造 key:字典是 `tools/gen_from_ts.mjs` 从 TS 生成的,手加的条目下次
+//! 重新生成就没了。原版没有对应文案的 GPUI 专属串留 `TODO(i18n)` 注释,
+//! 等 TS 侧补齐后再换过来。
+
+use gpui::App;
+
+pub use mt_i18n::{Locale, t, tr};
+
+/// 启动装配。`cfg_locale` 是 `config.locale` 里那个字符串(可能是 `None`、
+/// 也可能被手改成了认不出的值,两种情况都退到系统语言)。
+///
+/// 返回最终生效的语言,调用方据此决定要不要回写配置(首启探测出来的结果
+/// **不落盘**:与 TS 侧 `detectInitialLang()` 一致,用户没选过就一直跟随系统)。
+pub fn install(cfg_locale: Option<&str>) -> Locale {
+    let locale = cfg_locale
+        .and_then(Locale::from_code)
+        .unwrap_or_else(system_locale);
+    mt_i18n::set_locale(locale);
+    // set_locale 只在**变化时**通知观察者,而这一次多半没变(默认就是 Zh),
+    // 所以先手动桥一次,再挂观察者管后续切换。
+    bridge_component_locale(locale);
+    mt_i18n::add_locale_observer(bridge_component_locale);
+    locale
+}
+
+/// 把语言同步给 gpui-component 内部的 rust-i18n 字典。
+///
+/// 注册进 [`mt_i18n::add_locale_observer`],所以任何一处 `set_locale` 都会带上它。
+fn bridge_component_locale(locale: Locale) {
+    // gpui-component 的 locales/ui.yml 用 BCP 47 键(en / zh-CN / zh-HK / it),
+    // 传 "zh" 匹配不上会回落到 fallback = "en"。
+    gpui_component::set_locale(locale.bcp47());
+}
+
+/// 切换界面语言并让全部窗口重画。
+///
+/// 只改进程内状态;写回 `config.locale`(防抖落盘)是 [`crate::store::AppStore`]
+/// 的事,见 `AppStore::set_locale`。
+pub fn switch(locale: Locale, cx: &mut App) {
+    if !mt_i18n::set_locale(locale) {
+        return;
+    }
+    // 文案散在几十个 `render` 里,没有哪个 Entity 能代表"全部文案"。
+    // 语言切换一辈子点不了几次,直接让所有窗口重新渲染最省心也最不会漏。
+    cx.refresh_windows();
+}
+
+/// 系统语言 → [`Locale`]。规则同 TS 侧 `detectInitialLang()`:`zh*` → 中文,其余英文。
+///
+/// Windows 走 Win32 `GetUserDefaultLocaleName`(`LANG` / `LC_ALL` 在 Windows 上
+/// 通常压根不存在,读环境变量等于永远拿默认值);其余平台走环境变量。
+pub fn system_locale() -> Locale {
+    #[cfg(windows)]
+    {
+        if let Some(tag) = win32_user_locale_name() {
+            return Locale::from_system_tag(&tag);
+        }
+    }
+    mt_i18n::detect_from_env()
+}
+
+/// `GetUserDefaultLocaleName` 的安全包装,返回形如 `"zh-CN"` / `"en-US"` 的标签。
+#[cfg(windows)]
+fn win32_user_locale_name() -> Option<String> {
+    use windows::Win32::Globalization::GetUserDefaultLocaleName;
+
+    /// `LOCALE_NAME_MAX_LENGTH`(winnls.h)。这个常量在 windows crate 里没有随
+    /// `Win32_Globalization` 一起导出,而它是**写死在 SDK 头文件里**的固定值
+    /// (自 Vista 起从未变过,MSDN `GetUserDefaultLocaleName` 明确要求缓冲区
+    /// 按它开),照抄字面量即可 —— 不为一个常量去动 windows crate 的版本/feature。
+    const LOCALE_NAME_MAX_LENGTH: usize = 85;
+
+    let mut buf = [0u16; LOCALE_NAME_MAX_LENGTH];
+    // 返回值是**含结尾 NUL 的字符数**;0 = 失败。
+    let len = unsafe { GetUserDefaultLocaleName(&mut buf) };
+    if len <= 1 {
+        return None;
+    }
+    Some(String::from_utf16_lossy(&buf[..(len as usize - 1)]))
+}
+
+/// mt-app 用到的**全部**文案 key(`ns.key` 全路径,按字典序)。
+///
+/// 存在的意义只有一个:让 [`tests::用到的每个_key_两种语言都在`] 能一次性验完。
+/// `t()` 自带的 `debug_assert` 只在那段界面真被渲染时才炸,而这张表在 `cargo test`
+/// 里必然跑到 —— TS 侧改名/删词条后重新生成字典,这里立刻红。
+///
+/// **新增 `t()` 调用点时同步往这里加一行**。取全表的命令:
+/// ```text
+/// grep -rhoE '(t|tr!)\(\s*"[a-zA-Z]+",\s*"[a-zA-Z0-9._-]+"' crates/mt-app/src/*.rs \
+///   | sed -E 's/^(t|tr!)\(\s*//; s/,\s*/./; s/"//g' | sort -u
+/// ```
+#[cfg(test)]
+const USED_KEYS: &[&str] = &[
+    "app.activityBar.collapse",
+    "app.activityBar.expand",
+    "app.activityBar.sessions",
+    "app.activityBar.settings",
+    "app.activityBar.stats",
+    "app.emptyState",
+    "app.titleBar.status.done",
+    "envVars.hasErrors",
+    "fileTree.prompt.renameMessage",
+    "fileViewer.back",
+    "paneGroup.renameTerminal",
+    "paneGroup.startFailed",
+    "paneGroup.starting",
+    "panels.files",
+    "panels.projects",
+    "panels.sessions",
+    "projectList.menu.addProject",
+    "projectList.removeConfirm.cancel",
+    "projectList.removeConfirm.confirm",
+    "projectList.removeConfirm.messagePrefix",
+    "projectList.removeConfirm.messageSuffix",
+    "projectList.removeConfirm.title",
+    "prompt.cancel",
+    "prompt.confirm",
+    "sessionList.copyResumeCommand",
+    "sessionList.empty",
+    "sessionList.loadMore",
+    "sessionList.loading",
+    "sessionList.refresh",
+    "sessionList.resumeHere",
+    "sessionList.resumeInNewTab",
+    "sessionList.selectProject",
+    "sessionList.time.daysAgo",
+    "sessionList.time.hoursAgo",
+    "sessionList.time.justNow",
+    "sessionList.time.minutesAgo",
+    "sessionList.view",
+    "sessionList.wslBadge",
+    "sessionList.wslLoading",
+    "sessionViewer.loading",
+    "settings.appearance.language",
+    "settings.appearance.languageLabel",
+    "settings.common.add",
+    "settings.common.cancel",
+    "settings.common.delete",
+    "settings.common.edit",
+    "settings.common.save",
+    "settings.font.terminalFontSize",
+    "settings.terminal.addTerminal",
+    "settings.terminal.availableTerminals",
+    "settings.terminal.newArgsPlaceholder",
+    "settings.terminal.newCommandPlaceholder",
+    "settings.terminal.newNamePlaceholder",
+    "settings.title",
+    "terminalArea.emptyTitle",
+    "terminalArea.newTerminal",
+    "toast.aiAttention",
+    "toast.aiDone",
+    "usageStats.backfilling",
+    "usageStats.byModel",
+    "usageStats.byProject",
+    "usageStats.byProvider",
+    "usageStats.dailyActivity",
+    "usageStats.kpi.cacheHit",
+    "usageStats.kpi.calls",
+    "usageStats.kpi.cost",
+    "usageStats.kpi.sessions",
+    "usageStats.pricingError",
+    "usageStats.range.days30",
+    "usageStats.range.days7",
+    "usageStats.range.month",
+    "usageStats.range.months3",
+    "usageStats.range.months6",
+    "usageStats.range.today",
+    "usageStats.refresh",
+    "usageStats.scope.all",
+    "usageStats.scope.allProjects",
+    "usageStats.title",
+    "usageStats.tokens.cached",
+    "usageStats.tokens.in",
+    "usageStats.tokens.out",
+    "usageStats.topSessions",
+    "usageStats.unknownModel",
+    "worktree.browse",
+];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 每个用到的 key 在 **zh 与 en 两侧都必须有条目**。
+    ///
+    /// 少了任何一边都是界面上的中英混排(英文缺条目会静默回落中文),
+    /// 而这条在真机上要点开对应面板才看得见,必须在测试里挡下来。
+    #[test]
+    fn 用到的每个_key_两种语言都在() {
+        for path in USED_KEYS {
+            let (ns, key) = path.split_once('.').expect("key 必须带命名空间");
+            for locale in Locale::ALL {
+                assert!(
+                    mt_i18n::lookup(locale, ns, key).is_some(),
+                    "字典缺条目:{path}({locale})"
+                );
+            }
+        }
+    }
+
+    /// 表本身要按字典序去重排好 —— 否则新增时容易重复登记、也不好比对。
+    #[test]
+    fn key_清单有序且不重复() {
+        let mut sorted = USED_KEYS.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.as_slice(), USED_KEYS, "USED_KEYS 必须字典序且无重复");
+    }
+
+    /// 配置里那个字符串说了算;认不出(或没有)才退到系统探测。
+    /// 系统语言是环境相关的,这里只钉"不 panic 且落在两个合法值之一"。
+    #[test]
+    fn 配置取值优先于系统探测() {
+        assert_eq!(Locale::from_code("en"), Some(Locale::En));
+        assert_eq!(Locale::from_code("zh"), Some(Locale::Zh));
+        assert_eq!(Locale::from_code("fr"), None, "认不出就该退到系统探测");
+        assert!(Locale::ALL.contains(&system_locale()));
+    }
+
+    /// 桥给 gpui-component 的必须是 BCP 47,不是 `code()`——
+    /// 它的 ui.yml 键是 `zh-CN`,传 `zh` 会静默回落英文。
+    #[test]
+    fn 桥接用的是_bcp47_不是语言码() {
+        assert_eq!(Locale::Zh.bcp47(), "zh-CN");
+        assert_eq!(Locale::En.bcp47(), "en");
+        assert_ne!(Locale::Zh.bcp47(), Locale::Zh.code());
+    }
+}

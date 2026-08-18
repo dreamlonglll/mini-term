@@ -29,6 +29,7 @@ use gpui_component::dialog::DialogButtonProps;
 use gpui_component::input::{Input, InputState};
 use mt_config::ShellConfig;
 
+use crate::i18n::{Locale, t};
 use crate::shell_ops::{parse_args, valid_shell};
 use crate::store::AppStore;
 use crate::ui;
@@ -50,10 +51,16 @@ impl ShellForm {
     fn new(window: &mut Window, cx: &mut App) -> Self {
         Self {
             editing: None,
-            name: cx.new(|cx| InputState::new(window, cx).placeholder("名称,如 PowerShell")),
-            command: cx
-                .new(|cx| InputState::new(window, cx).placeholder("可执行文件,如 pwsh.exe")),
-            args: cx.new(|cx| InputState::new(window, cx).placeholder("参数(空格分隔,可留空)")),
+            name: cx.new(|cx| {
+                InputState::new(window, cx).placeholder(t("settings", "terminal.newNamePlaceholder"))
+            }),
+            command: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder(t("settings", "terminal.newCommandPlaceholder"))
+            }),
+            args: cx.new(|cx| {
+                InputState::new(window, cx).placeholder(t("settings", "terminal.newArgsPlaceholder"))
+            }),
             error: None,
         }
     }
@@ -67,12 +74,20 @@ impl ShellForm {
             ),
             None => (String::new(), String::new(), String::new()),
         };
-        self.name
-            .update(cx, |s, cx| s.set_value(name, window, cx));
-        self.command
-            .update(cx, |s, cx| s.set_value(command, window, cx));
-        self.args
-            .update(cx, |s, cx| s.set_value(args, window, cx));
+        // 占位串在 `new` 里只取过一次;这里重设一遍,免得对话框开着的时候切了
+        // 语言(语言段控件就在同一个对话框里),下次点「添加终端」还是旧语言。
+        self.name.update(cx, |s, cx| {
+            s.set_placeholder(t("settings", "terminal.newNamePlaceholder"), window, cx);
+            s.set_value(name, window, cx);
+        });
+        self.command.update(cx, |s, cx| {
+            s.set_placeholder(t("settings", "terminal.newCommandPlaceholder"), window, cx);
+            s.set_value(command, window, cx);
+        });
+        self.args.update(cx, |s, cx| {
+            s.set_placeholder(t("settings", "terminal.newArgsPlaceholder"), window, cx);
+            s.set_value(args, window, cx);
+        });
         self.error = None;
     }
 
@@ -96,7 +111,7 @@ pub fn open_terminal_settings(store: Entity<AppStore>, window: &mut Window, cx: 
     window.open_dialog(cx, move |dialog, window, cx| {
         let body = render_terminal_settings(&store, &form, window, cx);
         dialog
-            .title("终端配置")
+            .title(t("settings", "title"))
             .w(px(560.0))
             .child(div().px(px(20.0)).child(body))
     });
@@ -188,35 +203,41 @@ fn render_terminal_settings(
                         ),
                 )
                 .child(
-                    ui::ghost_button(SharedString::from(format!("shell-edit-{idx}")), "编辑")
-                        .on_click(move |_, window, cx| {
-                            let shell = store_edit
-                                .read(cx)
-                                .config()
-                                .available_shells
-                                .get(idx)
-                                .cloned();
-                            form_edit.update(cx, |form, cx| {
-                                form.editing = Some(Some(idx));
-                                form.fill(shell.as_ref(), window, cx);
-                                cx.notify();
-                            });
-                        }),
+                    ui::ghost_button(
+                        SharedString::from(format!("shell-edit-{idx}")),
+                        t("settings", "common.edit"),
+                    )
+                    .on_click(move |_, window, cx| {
+                        let shell = store_edit
+                            .read(cx)
+                            .config()
+                            .available_shells
+                            .get(idx)
+                            .cloned();
+                        form_edit.update(cx, |form, cx| {
+                            form.editing = Some(Some(idx));
+                            form.fill(shell.as_ref(), window, cx);
+                            cx.notify();
+                        });
+                    }),
                 )
                 .child(
-                    ui::danger_button(SharedString::from(format!("shell-del-{idx}")), "删除")
-                        .on_click(move |_, _window, cx| {
-                            store_delete.update(cx, |store, cx| {
-                                let mut list = store.shell_list();
-                                list.remove(idx);
-                                store.apply_shell_list(list, cx);
-                            });
-                            // 编辑中的行号会被这次删除搞错位,一并收掉表单
-                            form_delete.update(cx, |form, cx| {
-                                form.editing = None;
-                                cx.notify();
-                            });
-                        }),
+                    ui::danger_button(
+                        SharedString::from(format!("shell-del-{idx}")),
+                        t("settings", "common.delete"),
+                    )
+                    .on_click(move |_, _window, cx| {
+                        store_delete.update(cx, |store, cx| {
+                            let mut list = store.shell_list();
+                            list.remove(idx);
+                            store.apply_shell_list(list, cx);
+                        });
+                        // 编辑中的行号会被这次删除搞错位,一并收掉表单
+                        form_delete.update(cx, |form, cx| {
+                            form.editing = None;
+                            cx.notify();
+                        });
+                    }),
                 ),
         );
     }
@@ -233,27 +254,27 @@ fn render_terminal_settings(
         .flex()
         .flex_col()
         .gap(px(14.0))
+        .child(render_language_section(store, cx))
         .child(
             div()
-                .child(ui::section_title("可用终端"))
+                .child(ui::section_title(t("settings", "terminal.availableTerminals")))
                 .child(rows)
                 .child(
                     div().mt(px(8.0)).child(
-                        ui::ghost_button("shell-add", "+ 添加终端").on_click(
-                            move |_, window, cx| {
+                        ui::ghost_button("shell-add", t("settings", "terminal.addTerminal"))
+                            .on_click(move |_, window, cx| {
                                 form_add.update(cx, |form, cx| {
                                     form.editing = Some(None);
                                     form.fill(None, window, cx);
                                     cx.notify();
                                 });
-                            },
-                        ),
+                            }),
                     ),
                 ),
         )
         .child(
             div()
-                .child(ui::section_title("字号"))
+                .child(ui::section_title(t("settings", "font.terminalFontSize")))
                 .child(
                     div()
                         .flex()
@@ -282,9 +303,70 @@ fn render_terminal_settings(
                             div()
                                 .text_size(px(11.0))
                                 .text_color(ui::text_muted())
+                                // TODO(i18n): 原版终端字号是热更新的,没有这句提示,
+                                // 字典里也就没有对应 key。等 TS 侧补
+                                // `settings.terminal.fontSizeNewOnly` 后换过来。
                                 .child("改动作用于新建的终端"),
                         ),
                 ),
+        )
+        .into_any_element()
+}
+
+/// 语言切换段控件。逐条对照 `src/components/LanguageToggle.tsx`:
+/// 两个选项、各写各自的母语名(中文 / English —— endonym 不翻译)、
+/// 选中项 accent 底色白字,未选中透明底淡字。位置也照搬 ——
+/// 原版挂在设置面板「主题与语言」页的第一节(`SettingsModal.tsx` 的
+/// `<Section title={t('settings.appearance.language')}>`),GPUI 的设置对话框
+/// 目前只有这一页,于是放在最上面。
+fn render_language_section(store: &Entity<AppStore>, cx: &mut App) -> gpui::AnyElement {
+    let current = store.read(cx).locale();
+
+    let mut seg = div()
+        .flex()
+        .rounded(px(4.0))
+        .overflow_hidden()
+        .border_1()
+        .border_color(ui::border_default());
+    for option in Locale::ALL {
+        let active = option == current;
+        let store = store.clone();
+        seg = seg.child(
+            div()
+                .id(SharedString::from(format!("lang-{}", option.code())))
+                .px(px(12.0))
+                .py(px(3.0))
+                .text_size(px(12.0))
+                .cursor_pointer()
+                .when(active, |el| {
+                    el.bg(ui::accent()).text_color(ui::bg_base())
+                })
+                .when(!active, |el| {
+                    el.text_color(ui::text_muted())
+                        .hover(|el| el.text_color(ui::text_primary()))
+                })
+                .on_click(move |_, _window, cx| {
+                    store.update(cx, |store, cx| store.set_locale(option, cx));
+                })
+                // 永远显示母语名,不随当前语言变
+                .child(option.native_name()),
+        );
+    }
+
+    div()
+        .child(ui::section_title(t("settings", "appearance.language")))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(ui::text_secondary())
+                        .child(t("settings", "appearance.languageLabel")),
+                )
+                .child(seg),
         )
         .into_any_element()
 }
@@ -326,11 +408,13 @@ fn render_shell_form(
             div()
                 .flex()
                 .gap(px(6.0))
-                .child(ui::primary_button("shell-save", "保存").on_click(
+                .child(ui::primary_button("shell-save", t("settings", "common.save")).on_click(
                     move |_, _window, cx| {
                         let Some(shell) = form_save.read(cx).to_shell(cx) else {
                             form_save.update(cx, |form, cx| {
-                                form.error = Some("名称与可执行文件都不能为空");
+                                // 原版是「名字/命令为空时保存按钮直接不响应」,没有这句
+                                // 提示文案 —— 借用 envVars 里语义最近的那条通用校验串。
+                                form.error = Some(t("envVars", "hasErrors"));
                                 cx.notify();
                             });
                             return;
@@ -350,7 +434,7 @@ fn render_shell_form(
                         });
                     },
                 ))
-                .child(ui::ghost_button("shell-cancel", "取消").on_click(
+                .child(ui::ghost_button("shell-cancel", t("settings", "common.cancel")).on_click(
                     move |_, _window, cx| {
                         form_cancel.update(cx, |form, cx| {
                             form.editing = None;
@@ -378,7 +462,7 @@ pub fn open_rename_pane(
 ) {
     let input = cx.new(|cx| {
         InputState::new(window, cx)
-            .placeholder("留空恢复默认名称")
+            .placeholder(t("fileTree", "prompt.renameMessage"))
             .default_value(current)
     });
     // 打开即可直接改名,不必先点一下输入框
@@ -390,10 +474,14 @@ pub fn open_rename_pane(
         let pane_id = pane_id.clone();
         let input_for_ok = input.clone();
         dialog
-            .title("重命名标签")
+            .title(t("paneGroup", "renameTerminal"))
             .w(px(380.0))
             .confirm()
-            .button_props(DialogButtonProps::default().ok_text("确定").cancel_text("取消"))
+            .button_props(
+                DialogButtonProps::default()
+                    .ok_text(t("prompt", "confirm"))
+                    .cancel_text(t("prompt", "cancel")),
+            )
             .child(div().px(px(20.0)).child(Input::new(&input)))
             .on_ok(move |_: &ClickEvent, _window, cx| {
                 let title = input_for_ok.read(cx).value().to_string();
@@ -423,13 +511,13 @@ pub fn open_confirm_remove_project(
         let store = store.clone();
         let project_id = project_id.clone();
         dialog
-            .title("移除项目")
+            .title(t("projectList", "removeConfirm.title"))
             .w(px(420.0))
             .confirm()
             .button_props(
                 DialogButtonProps::default()
-                    .ok_text("移除")
-                    .cancel_text("取消"),
+                    .ok_text(t("projectList", "removeConfirm.confirm"))
+                    .cancel_text(t("projectList", "removeConfirm.cancel")),
             )
             .child(
                 div()
@@ -437,23 +525,24 @@ pub fn open_confirm_remove_project(
                     .flex()
                     .flex_col()
                     .gap(px(6.0))
+                    // 正文与原版一样是「前缀 + 项目名 + 后缀」三段拼(后缀那半句
+                    // 已经把"只从列表移除、不删文件"说清楚了,不必另起一行)
                     .child(
                         div()
                             .text_size(px(13.0))
                             .text_color(ui::text_primary())
-                            .child(format!("从列表中移除「{project_name}」?")),
+                            .child(format!(
+                                "{}{}{}",
+                                t("projectList", "removeConfirm.messagePrefix"),
+                                project_name,
+                                t("projectList", "removeConfirm.messageSuffix"),
+                            )),
                     )
                     .child(
                         div()
                             .text_size(px(11.0))
                             .text_color(ui::text_muted())
                             .child(project_path.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.0))
-                            .text_color(ui::text_secondary())
-                            .child("该项目的终端会被关闭,保存的分屏布局与展开目录一并清除。磁盘上的文件不受影响。"),
                     ),
             )
             .on_ok(move |_: &ClickEvent, _window, cx| {
@@ -470,6 +559,9 @@ pub fn open_confirm_remove_project(
 /// gpui 直接给了 `prompt_for_paths`,不必自己造;手输那一路留着,是因为 UNC /
 /// WSL 路径在目录选择框里常常点不到。
 pub fn open_add_project(store: Entity<AppStore>, window: &mut Window, cx: &mut App) {
+    // TODO(i18n): 原版加项目走的是系统目录选择框,没有手输框,字典里也就没有
+    // 这条占位串与下面的「浏览目标」提示。等 TS 侧补 `projectList.pathPlaceholder`
+    // 与 `projectList.pathHint` 后换过来。
     let input = cx.new(|cx| {
         InputState::new(window, cx).placeholder("项目目录,如 D:\\Git\\mini-term")
     });
@@ -480,13 +572,13 @@ pub fn open_add_project(store: Entity<AppStore>, window: &mut Window, cx: &mut A
         let input_for_ok = input.clone();
         let input_for_browse = input.clone();
         dialog
-            .title("添加项目")
+            .title(t("projectList", "menu.addProject"))
             .w(px(460.0))
             .confirm()
             .button_props(
                 DialogButtonProps::default()
-                    .ok_text("添加")
-                    .cancel_text("取消"),
+                    .ok_text(t("settings", "common.add"))
+                    .cancel_text(t("settings", "common.cancel")),
             )
             .child(
                 div()
@@ -499,9 +591,11 @@ pub fn open_add_project(store: Entity<AppStore>, window: &mut Window, cx: &mut A
                             .flex()
                             .gap(px(6.0))
                             .child(div().flex_1().child(Input::new(&input)))
-                            .child(ui::ghost_button("browse-dir", "浏览…").on_click(
+                            .child(ui::ghost_button("browse-dir", t("worktree", "browse")).on_click(
                                 move |_, window, cx| {
                                     let paths = cx.prompt_for_paths(PathPromptOptions {
+                                        // TODO(i18n): 系统目录选择框的标题;原版没有
+                                        // 对应 key(它用的是 Tauri 的默认标题)。
                                         files: false,
                                         directories: true,
                                         multiple: false,
@@ -531,6 +625,7 @@ pub fn open_add_project(store: Entity<AppStore>, window: &mut Window, cx: &mut A
                         div()
                             .text_size(px(11.0))
                             .text_color(ui::text_muted())
+                            // TODO(i18n): 见上面手输框的说明,原版没有这条提示。
                             .child("目录不存在时不会添加。"),
                     ),
             )
