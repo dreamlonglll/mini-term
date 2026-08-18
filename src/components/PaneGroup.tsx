@@ -711,8 +711,11 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
         {tabDrop && (
           <span
             aria-hidden
-            className="absolute top-0 bottom-0 w-[2px] bg-[var(--accent)] pointer-events-none z-10"
-            style={{ left: Math.max(tabDrop.x - 1, 0) }}
+            className="absolute top-[2px] bottom-[2px] w-[3px] rounded-full bg-[var(--accent)] pointer-events-none z-10"
+            style={{
+              left: Math.max(tabDrop.x - 1.5, 0),
+              boxShadow: '0 0 6px var(--accent), 0 0 2px var(--accent)',
+            }}
           />
         )}
       </div>
