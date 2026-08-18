@@ -3826,6 +3826,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "mt-i18n"
+version = "0.13.1"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "mt-project"
 version = "0.13.1"
 dependencies = [

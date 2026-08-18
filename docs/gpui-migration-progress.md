@@ -12,7 +12,7 @@
 | 骨架 | 工作区 9 crate + 依赖选型 + 迁移映射（`aa9a7fc`） | ✅ 2026-08-18 |
 | Wave 1 | 后端五块并行搬运 + TerminalElement 端到端 | ✅ 2026-08-18 全部验收入库（6/6） |
 | Wave 2 | mt-relay、mt-app 全壳（store/三栏/Tab/分屏树） | ✅ 2026-08-18 两件均验收入库；面板/Modal/i18n/主题桥移入 Wave 3 |
-| Wave 3 | Modal 批、分屏比例恢复+焦点导航、通知/托盘批、AI 历史+用量面板批、i18n+主题桥、IME/鼠标上报/damage、五项人工验收 | ⬜ **暂停中：等用户决定下一步**（拆法建议见下）|
+| Wave 3 | G=mt-app UI 批（Modal/AI 历史+用量面板/通知/分屏比例+焦点导航）；H=mt-ui 渲染批（IME/鼠标上报/damage/主题桥）；I=mt-i18n 字典基建 | 🔵 G/H 进行中；I ✅ 2026-08-18 交付：32 ns、zh/en 各 727 条全对账零差异，自研零依赖零分配 API（t/t_args/tr!），转换脚本留痕可重跑；⚠️ Wave 3.5 须桥接 gpui-component 内置组件的 rust-i18n locale（add_locale_observer 一行）|
 | 收尾 | mt-ssh/mt-core 移入 crates/、删 src-tauri/ 与 src/、发版切换 | ⬜ |
 
 ## Wave 1 —— 2026-08-18 派出 6 个并行 agent
