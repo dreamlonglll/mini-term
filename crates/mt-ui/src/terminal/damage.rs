@@ -63,6 +63,14 @@ pub struct CellSignature {
     pub selected: bool,
     /// 0 = 不是光标格；否则是光标形状的判别值 + 1。
     pub cursor: u8,
+    /// 查找命中的高亮档位:0 = 没命中,1 = 普通命中,2 = 当前命中
+    /// (见 [`super::search::HighlightKind::code`])。
+    ///
+    /// 它进签名是「查找高亮与行缓存共存」的**全部机关**:命中集合一变,只有真正
+    /// 涉及的那几行签名会变、被重建,其余行照旧命中缓存;当前命中在两条之间移动时
+    /// 同理只重建两行。不进签名的话只有两种结局 —— 要么把整表作废(缓存白做)、
+    /// 要么高亮残留在旧行上。
+    pub search: u8,
 }
 
 impl CellSignature {
@@ -78,6 +86,7 @@ impl CellSignature {
             flags: Flags::empty(),
             selected: false,
             cursor: 0,
+            search: 0,
         }
     }
 }
@@ -102,6 +111,7 @@ impl Hash for CellSignature {
         self.flags.bits().hash(state);
         self.selected.hash(state);
         self.cursor.hash(state);
+        self.search.hash(state);
     }
 }
 
@@ -353,6 +363,61 @@ mod tests {
         let mut beam = base.clone();
         beam[1].cursor = 3;
         assert_ne!(row_signature(&cursor), row_signature(&beam));
+    }
+
+    /// 查找高亮进签名 —— 这是「高亮变化只重建受影响行」的地基。
+    #[test]
+    fn 查找命中进签名() {
+        let base = row("error: boom", 20);
+        let mut hit = base.clone();
+        for cell in hit.iter_mut().take(5) {
+            cell.search = 1;
+        }
+        assert_ne!(row_signature(&base), row_signature(&hit));
+
+        // 普通命中 → 当前命中:同一批格子,画面颜色不同,签名必须跟着变
+        let mut current = hit.clone();
+        for cell in current.iter_mut().take(5) {
+            cell.search = 2;
+        }
+        assert_ne!(row_signature(&hit), row_signature(&current));
+
+        // 没被命中碰到的行签名一个比特都不能动(否则整屏缓存被打穿)
+        let untouched = row("error: boom", 20);
+        assert_eq!(row_signature(&base), row_signature(&untouched));
+    }
+
+    /// 场景 D:查找条打开、当前命中在两行之间跳 —— 只有那两行重建。
+    #[test]
+    fn 场景_当前命中移动只重建两行() {
+        const ROWS: usize = 50;
+        let mut cache: RowCache<u64> = RowCache::new();
+        let key = FrameKey::builder().push("search").finish();
+
+        // 第 10 行与第 30 行各有一条命中,当前命中在第 10 行
+        let build = |current_row: usize| -> Vec<u64> {
+            (0..ROWS)
+                .map(|r| {
+                    let mut cells = row(&format!("line {r} error"), 80);
+                    if r == 10 || r == 30 {
+                        for cell in cells.iter_mut().skip(8).take(5) {
+                            cell.search = if r == current_row { 2 } else { 1 };
+                        }
+                    }
+                    row_signature(&cells)
+                })
+                .collect()
+        };
+
+        run_frame(&mut cache, key, &build(10));
+        assert_eq!(cache.stats().rows_rebuilt, ROWS as u64);
+        // 按「下一个」把当前命中挪到第 30 行
+        run_frame(&mut cache, key, &build(30));
+        assert_eq!(
+            cache.stats().rows_rebuilt,
+            ROWS as u64 + 2,
+            "只有第 10 / 30 行该重建"
+        );
     }
 
     #[test]

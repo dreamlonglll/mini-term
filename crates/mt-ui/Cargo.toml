@@ -15,6 +15,9 @@ alacritty_terminal.workspace = true
 # 主题桥:读 themes/ 下的主题包(ThemePacks)并把配色映射成 TerminalTheme /
 # gpui-component 的 ThemeConfig。mt-config 不依赖 gpui,映射代码只能住在这边。
 mt-config.workspace = true
+# 终端查找条的文案(terminalSearch 命名空间)。mt-i18n 零第三方依赖、
+# 查表是 &'static str,渲染热路径直接调也不心疼。
+mt-i18n.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true

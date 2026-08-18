@@ -3909,6 +3909,7 @@ dependencies = [
  "gpui",
  "gpui-component",
  "mt-config",
+ "mt-i18n",
  "mt-terminal",
  "parking_lot",
  "serde",

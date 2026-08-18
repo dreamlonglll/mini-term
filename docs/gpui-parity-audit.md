@@ -55,7 +55,7 @@
 | 20 | **自定义标题栏**：拖拽区 + 最小化/最大化/关闭 + Win11 贴靠（set_max_button_rect）+ 项目切换胶囊 + 全局状态灯（~~窗口标题带版本号~~ ✅ J 批已改 `Mini-Term v{ver}`） | 大 | mt-app | ❌ |
 | 21 | **系统托盘**：三色灯 + 右键项目菜单 + 点击定位 + trayStatusEnabled/trayMaxProjects/trayClickFocus（config 字段已在；`unread_done_count()`/`next_attention_target()` 是现成消费口） | 大 | mt-app（Windows API） | ❌ |
 | 22 | **移动端中转**：mt_relay 实际接线（RelayHost/RelayEvents 实现）+ MobileRelayModal（地址/密钥/状态徽章/配对二维码/重置）+ AiLauncherSection CRUD + 5 条事件落点（status/pairing-code/start-session/rename-pane/会话结构同步）+ store 补 rename_pane_by_id | 大 | mt-app | ❌ |
-| 23 | 终端查找（TerminalSearchBar 浮条 + Aa/ab/.* + 搜索引擎） | 中 | mt-ui + mt-app | ❌ |
+| 23 | 终端查找 | 中 | mt-ui + mt-app | 🟡 O 批完成 mt-ui 侧全部：RegexIter 一次枚举共用结果集（计数/跳转/高亮一套口径）、smart case 用内联 (?i)/(?-i) 绕开、\b 不可用改邻格判定整词、200ms 去抖+内容指纹不含 display_offset（回看不触发重搜）、命中进行签名+配色进帧指纹与 damage 缓存共存、配色逐字照抄旧版 decorations 有 pin 测试；剩 mt-app 宿主接线 5 步（search_bar.rs 模块注释可照抄，Ctrl+F 绑 pane 容器，⚠️ 焦点归还是硬要求） |
 | 24 | 全局搜索 UI（SearchModal，后端 mt-project/search.rs 669 行已就绪，Ctrl+Shift+F） | 中 | mt-app | ❌ |
 | 25 | AI 任务 marker 体系（markersByPty store + 按钮 + 浮层 + markerPrev/Next 快捷键） | 中 | mt-app | ❌ |
 | 26 | ProjectSwitcher（Ctrl+Shift+P 模糊匹配 + 高亮 + 键盘导航） | 中 | mt-app | ❌ |

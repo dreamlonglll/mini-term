@@ -184,7 +184,7 @@
 //! **更推荐窗口级铺**（原版就是挂在 `#root` 上，三栏都透着同一张图）——
 //! 见 [`crate::background`] 模块注释里的接法与 overdraw 提醒。
 
-use std::cell::Cell as StdCell;
+use std::cell::{Cell as StdCell, RefCell};
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -202,8 +202,9 @@ use super::element::{FrameGeometry, OnGridResize, OnInput, PreeditText, Terminal
 use super::ime::{ImeState, commit_to_bytes};
 use super::input::{is_text_input_key, keystroke_to_bytes, paste_to_bytes};
 use super::scrollbar::ScrollbarStyle;
+use super::search::TerminalSearch;
 use super::selection_dwell::{DwellConfig, OnSelectionCopied};
-use super::theme::{TerminalStyle, TerminalTheme};
+use super::theme::{SearchColors, TerminalStyle, TerminalTheme};
 use crate::theme_bridge::BackgroundArt;
 
 pub struct TerminalView {
@@ -223,6 +224,8 @@ pub struct TerminalView {
     dwell: DwellConfig,
     on_selection_copied: Option<OnSelectionCopied>,
     background_art: Option<BackgroundArt>,
+    search: Option<Rc<RefCell<TerminalSearch>>>,
+    search_colors: SearchColors,
 }
 
 impl TerminalView {
@@ -252,6 +255,43 @@ impl TerminalView {
             dwell: DwellConfig::default(),
             on_selection_copied: None,
             background_art: None,
+            search: None,
+            search_colors: SearchColors::default(),
+        }
+    }
+
+    /// 接上终端内查找(Ctrl+F)。引擎实例与
+    /// [`TerminalSearchBar`](super::TerminalSearchBar) **共用同一个**
+    /// `Rc<RefCell<_>>` —— 计数与高亮从此是同一份状态。
+    ///
+    /// 接上之后视图每帧替引擎跑一次去抖后的重搜,命中格子自动画上底色;
+    /// 行渲染缓存不受影响(命中状态进的是行签名,不是帧指纹)。
+    pub fn search(mut self, search: Rc<RefCell<TerminalSearch>>) -> Self {
+        self.search = Some(search);
+        self
+    }
+
+    /// 运行时挂上 / 摘掉查找引擎。
+    pub fn set_search(
+        &mut self,
+        search: Option<Rc<RefCell<TerminalSearch>>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.search = search;
+        cx.notify();
+    }
+
+    /// 查找命中的高亮配色。见 [`SearchColors`](super::SearchColors)。
+    pub fn search_colors(mut self, colors: SearchColors) -> Self {
+        self.search_colors = colors;
+        self
+    }
+
+    /// 运行时换查找高亮配色。
+    pub fn set_search_colors(&mut self, colors: SearchColors, cx: &mut Context<Self>) {
+        if self.search_colors != colors {
+            self.search_colors = colors;
+            cx.notify();
         }
     }
 
@@ -475,6 +515,8 @@ impl Render for TerminalView {
             cursor_byte: p.cursor_byte(),
         }))
         .scrollbar(self.scrollbar.clone())
+        .search(self.search.clone())
+        .search_colors(self.search_colors)
         .selection_dwell(self.dwell)
         .background_art(self.background_art.clone())
         .geometry_sink(self.geometry.clone())

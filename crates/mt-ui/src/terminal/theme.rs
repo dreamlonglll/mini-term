@@ -72,6 +72,38 @@ impl Default for TerminalTheme {
     }
 }
 
+/// 查找命中的高亮配色(Ctrl+F 的两档底色 + 当前命中的描边)。
+///
+/// **刻意不并进 [`TerminalTheme`]**:旧版这三个色是写死在
+/// `terminalSearch.ts` 的 `decorations` 里的,不随主题包走 —— 主题一换,
+/// 「哪个是当前命中」这条最要紧的信息就可能被配色淹掉。默认值逐字照抄旧版,
+/// 需要跟主题时由宿主自己算一份传进来。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SearchColors {
+    /// 普通命中的底色(旧版 `matchBackground: #c8805a55`)。
+    pub matched: Hsla,
+    /// 当前命中的底色(旧版 `activeMatchBackground: #c8805aaa`)。
+    pub current: Hsla,
+    /// 当前命中的描边(旧版 `activeMatchBorder: #f0ece6`)。
+    pub current_border: Hsla,
+}
+
+impl Default for SearchColors {
+    fn default() -> Self {
+        Self {
+            matched: Hsla {
+                a: 0x55 as f32 / 255.0,
+                ..rgb8(0xc8, 0x80, 0x5a)
+            },
+            current: Hsla {
+                a: 0xaa as f32 / 255.0,
+                ..rgb8(0xc8, 0x80, 0x5a)
+            },
+            current_border: rgb8(0xf0, 0xec, 0xe6),
+        }
+    }
+}
+
 /// 终端字体参数。cell 宽高由这套参数经字体度量算出,不由调用方指定 ——
 /// 逐列对齐的前提就是 cell 宽度**只有一个来源**。
 #[derive(Clone, Debug, PartialEq)]
@@ -99,6 +131,30 @@ impl Default for TerminalStyle {
             font_size: px(14.0),
             line_height: 1.3,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 查找高亮的三个色**逐字**照抄旧版 `terminalSearch.ts` 的 `decorations`。
+    /// 这条钉住「换渲染器不换外观」——颜色对不上,用户第一眼就会说「不一样了」。
+    #[test]
+    fn 查找高亮配色对齐旧版() {
+        let c = SearchColors::default();
+        let base = rgb8(0xc8, 0x80, 0x5a);
+        // #c8805a55 / #c8805aaa:同一个底色,两档不透明度
+        assert_eq!(c.matched.h, base.h);
+        assert_eq!(c.matched.s, base.s);
+        assert_eq!(c.matched.l, base.l);
+        assert!((c.matched.a - 0x55 as f32 / 255.0).abs() < 1e-6);
+        assert_eq!(c.current.h, base.h);
+        assert!((c.current.a - 0xaa as f32 / 255.0).abs() < 1e-6);
+        assert!(c.current.a > c.matched.a, "当前命中必须更实");
+        // #f0ece6:描边不透明
+        assert_eq!(c.current_border, rgb8(0xf0, 0xec, 0xe6));
+        assert_eq!(c.current_border.a, 1.0);
     }
 }
 

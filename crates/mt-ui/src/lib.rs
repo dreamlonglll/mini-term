@@ -25,6 +25,13 @@
 //! (无资产、无宿主接线、可多色、几何可单测)。替掉 mt-app 现有的
 //! 「CL/CX/GK 两字母文本」与「三形圆点」两处占位 —— 接线总表见该模块注释。
 //!
+//! ## 3.5 终端内查找(`terminal::search` + `terminal::search_bar`)
+//!
+//! 替掉 xterm.js 的 `@xterm/addon-search`:引擎建在 alacritty 的
+//! `RegexIter` 上,一次枚举完全 buffer 的命中,计数 / 跳转 / 高亮三件事共用一份
+//! 结果集;查找条是普通的 `absolute` 子元素,旧版那条「rAF 每帧量 pane 矩形」
+//! 的定位轮询整个删掉。宿主接线见 [`terminal::search_bar`] 的模块注释。
+//!
 //! ## 4. 背景图([`background`])
 //!
 //! 主题包背景图的 cover/focus 铺放 + 压暗纱罩。原版挂在 `#root`(窗口级),
@@ -50,6 +57,8 @@
 //! - ✅ 主题桥([`theme_bridge`])+ 背景图渲染([`background`])
 //! - ✅ 滚动条([`terminal::scrollbar`]):拖滑块 / 点轨道翻页 / 闲置淡出 / alt screen 不画
 //! - ✅ 拖选停留自动复制([`terminal::selection_dwell`]),默认关闭以兼容旧语义
+//! - ✅ 终端内查找([`terminal::search`] 引擎 + [`terminal::search_bar`] 浮动查找条):
+//!   字面/大小写/正则三模式 × 整词、全 buffer 计数、环形上下一个、两档命中高亮
 //! - ✅ 图标体系([`icons`])
 //! - ⬜ 下划线花样(DOUBLE/DOTTED/DASHED 统一降级实线,gpui 只有 wavy 一种)
 //! - ⬜ 回退字形溢出裁剪(宽字符回退到非等宽字体时可能糊出格子边界)
@@ -64,9 +73,12 @@ pub use icons::{
     AiVendor, BrandIcon, FileIcon, FileKind, ProjectKind, StatusDot, StatusKind, TechIcon,
 };
 pub use terminal::{
-    CopiedTip, DamageStats, DwellConfig, FrameGeometry, InstallInputHandler, OnGridResize, OnInput,
-    OnSelectionCopied, PreeditText, ScrollbarStyle, TerminalElement, TerminalStyle, TerminalTheme,
-    TerminalView, color_request_rgb, is_text_input_key, keystroke_to_bytes, paste_to_bytes, rgb8,
+    CopiedTip, DamageStats, DwellConfig, FrameGeometry, HighlightKind, HighlightSpan,
+    InstallInputHandler, OnGridResize, OnInput, OnSearchClose, OnSelectionCopied, PreeditText,
+    ScrollbarStyle, SearchBarEvent, SearchBarLabels, SearchColors, SearchDirection,
+    SearchHighlights, SearchLimits, SearchMatch, SearchOptions, TerminalElement, TerminalSearch,
+    TerminalSearchBar, TerminalStyle, TerminalTheme, TerminalView, color_request_rgb,
+    is_text_input_key, keystroke_to_bytes, paste_to_bytes, rgb8,
 };
 pub use theme_bridge::{
     AppliedThemePack, Appearance, BackgroundArt, ThemePackColors, ThemePackDef, switch_to_builtin,

@@ -42,6 +42,18 @@
 //! 缓存的键是**行内容签名**而不是行号,几何全部按行内相对坐标存 —— 于是滚屏时
 //! 「只是换了个 y」的行照样命中。细节与量化数据见 [`super::damage`]。
 //!
+//! # 查找高亮怎么与行缓存共存
+//!
+//! 接了 [`TerminalElement::search`] 之后,prepaint 会在**拿 grid 锁之前**替
+//! [`TerminalSearch`] 跑一次(带去抖的)重搜,拿到按行拍平的命中索引;
+//! 逐 cell 解析时把「这一格是普通命中 / 当前命中 / 没命中」写进
+//! [`CellSignature::search`]。
+//!
+//! 于是命中集合变化只会让**真正带高亮的那几行**签名变、被重建,其余行照旧命中
+//! 缓存;当前命中在两条之间移动时同理只重建两行。高亮配色则进
+//! [`FrameKey`](super::damage::FrameKey) —— 它变了每一行的画面都会变而签名不动。
+//! 两条路各管一段,既不会把整屏缓存打穿,也不会留下高亮残影。
+//!
 //! # 背景图透出
 //!
 //! 背景色是「默认背景」的格子**不发 quad**(见 [`super::colors::is_default_background`])。
@@ -76,8 +88,9 @@ use super::mouse::{
     mouse_report_bytes, mouse_reporting_active, prefers_local_handling,
 };
 use super::scrollbar::{self, ScrollbarDrag, ScrollbarHit, ScrollbarLayout, ScrollbarStyle};
+use super::search::{HighlightSpan, SearchHighlights, TerminalSearch};
 use super::selection_dwell::{DwellConfig, DwellTracker, OnSelectionCopied, ReleaseAction};
-use super::theme::{TerminalStyle, TerminalTheme};
+use super::theme::{SearchColors, TerminalStyle, TerminalTheme};
 use crate::background::BackgroundArtElement;
 use crate::theme_bridge::BackgroundArt;
 
@@ -145,6 +158,8 @@ pub struct TerminalElement {
     dwell: DwellConfig,
     on_selection_copied: Option<OnSelectionCopied>,
     background_art: Option<BackgroundArtElement>,
+    search: Option<Rc<RefCell<TerminalSearch>>>,
+    search_colors: SearchColors,
 }
 
 impl TerminalElement {
@@ -172,7 +187,24 @@ impl TerminalElement {
             dwell: DwellConfig::default(),
             on_selection_copied: None,
             background_art: None,
+            search: None,
+            search_colors: SearchColors::default(),
         }
+    }
+
+    /// 接上查找引擎:每帧同步命中集合并把命中格子画上底色。
+    ///
+    /// 引擎实例由宿主持有(`Rc<RefCell<_>>`),同一份还要交给
+    /// [`super::TerminalSearchBar`] —— 计数与高亮共用一份状态,不必对账。
+    pub fn search(mut self, search: Option<Rc<RefCell<TerminalSearch>>>) -> Self {
+        self.search = search;
+        self
+    }
+
+    /// 查找高亮的两档底色与当前命中描边。见 [`SearchColors`]。
+    pub fn search_colors(mut self, colors: SearchColors) -> Self {
+        self.search_colors = colors;
+        self
     }
 
     /// 滚动条外观与行为。见 [`ScrollbarStyle`];`enabled: false` 可整条关掉。
@@ -307,6 +339,8 @@ struct CursorLayout {
 struct RowRender {
     backgrounds: Vec<(Bounds<Pixels>, Hsla)>,
     selections: Vec<Bounds<Pixels>>,
+    /// 查找命中段。`bool` = 是不是当前命中(要额外描一圈边)。
+    searches: Vec<(Bounds<Pixels>, bool)>,
     texts: Vec<TextPiece>,
     cursor: Option<CursorLayout>,
 }
@@ -1080,7 +1114,20 @@ impl Element for TerminalElement {
         let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
         let focused = self.focus.is_focused(window);
 
+        // ── 查找命中:在拿 grid 锁**之前**同步(引擎内部自己会短暂持锁)。
+        //    引擎有去抖 + 内容指纹两道闸,这一句在空闲帧几乎是零成本。
+        let highlights: Option<Rc<SearchHighlights>> = self.search.as_ref().map(|search| {
+            let mut search = search.borrow_mut();
+            search.sync(&self.emulator);
+            search.highlights()
+        });
+        let highlights = highlights.filter(|h| !h.is_empty());
+
         // ── 帧指纹:这些变了,每一行的画面都会变而行签名不动 → 整表作废
+        //
+        //  命中集合**不进**帧指纹:它进的是每个格子的行签名(`CellSignature::search`),
+        //  于是查找条一开只重建真正带高亮的那几行,整屏缓存不被打穿。
+        //  只有配色这种「每一行都会变、签名却不动」的参数才配进这里。
         let frame_key = FrameKey::builder()
             .push_f32(f(cell_width))
             .push_f32(f(line_height))
@@ -1098,6 +1145,9 @@ impl Element for TerminalElement {
             .push_hsla(self.theme.selection)
             .push_hsla(self.theme.cursor)
             .push_hsla(self.theme.cursor_text)
+            .push_hsla(self.search_colors.matched)
+            .push_hsla(self.search_colors.current)
+            .push_hsla(self.search_colors.current_border)
             .finish();
         state.rows.borrow_mut().begin_frame(frame_key);
 
@@ -1124,6 +1174,8 @@ impl Element for TerminalElement {
             let mut cache = state.rows.borrow_mut();
             let mut scratch: Vec<CellSignature> = Vec::with_capacity(columns);
             let mut current_row: Option<usize> = None;
+            // 命中按行取一次就够:逐格去问 1000 条命中是一屏一千万次比较。
+            let mut row_spans: &[HighlightSpan] = &[];
 
             let flush_row = |row: usize,
                                  scratch: &mut Vec<CellSignature>,
@@ -1154,6 +1206,10 @@ impl Element for TerminalElement {
                     }
                     current_row = Some(row);
                     scratch.reserve(columns);
+                    row_spans = highlights
+                        .as_ref()
+                        .map(|h| h.row(indexed.point.line.0))
+                        .unwrap_or(&[]);
                 }
                 let col = indexed.point.column.0;
                 let cell: &Cell = indexed.cell;
@@ -1187,6 +1243,12 @@ impl Element for TerminalElement {
                     }
                 }
 
+                let search = row_spans
+                    .iter()
+                    .find(|s| col >= s.start && col <= s.end)
+                    .map(|s| s.kind.code())
+                    .unwrap_or(0);
+
                 scratch.push(CellSignature {
                     col,
                     ch: cell.c,
@@ -1201,6 +1263,7 @@ impl Element for TerminalElement {
                     } else {
                         0
                     },
+                    search,
                 });
             }
             if let Some(row) = current_row {
@@ -1367,6 +1430,26 @@ impl Element for TerminalElement {
                     window.paint_quad(fill(translate(*rect, delta), *color));
                 }
             }
+            // ── 查找命中垫在选择区**下面**:选择区是半透明蓝(alpha 0.30),
+            //    压在命中底色之上仍然认得出「这块被选中了」;反过来叠的话
+            //    命中的暖色会把选择区吃掉,拖选复制搜索结果时看不出选到哪。
+            for (y, render) in prepared.rows.iter() {
+                let delta = point(origin.x, origin.y + *y);
+                for (rect, current) in render.searches.iter() {
+                    let rect = translate(*rect, delta);
+                    let color = if *current {
+                        self.search_colors.current
+                    } else {
+                        self.search_colors.matched
+                    };
+                    window.paint_quad(fill(rect, color));
+                    // 当前命中再描一圈亮边:一屏几十条同色底块时,光靠深浅
+                    // 分不出「我现在在第几条」
+                    if *current {
+                        paint_hollow_rect(window, rect, self.search_colors.current_border);
+                    }
+                }
+            }
             for (y, render) in prepared.rows.iter() {
                 let delta = point(origin.x, origin.y + *y);
                 for rect in render.selections.iter() {
@@ -1483,11 +1566,13 @@ fn build_row(
     let cell_size = size(cell_width, line_height);
     let mut backgrounds: Vec<(Bounds<Pixels>, Hsla)> = Vec::new();
     let mut selections: Vec<Bounds<Pixels>> = Vec::new();
+    let mut searches: Vec<(Bounds<Pixels>, bool)> = Vec::new();
     let mut pieces: Vec<PendingPiece> = Vec::new();
     let mut cursor: Option<CursorLayout> = None;
 
     let mut bg_run: Option<(usize, usize, Hsla)> = None;
     let mut sel_run: Option<(usize, usize)> = None;
+    let mut search_run: Option<(usize, usize, u8)> = None;
     let mut text_run: Option<PendingRun> = None;
 
     for cell in cells {
@@ -1517,6 +1602,19 @@ fn build_row(
             }
         } else {
             flush_sel(&mut sel_run, cell_size, &mut selections);
+        }
+
+        // ── 查找命中(普通 / 当前两档,同档连续格子并成一段)
+        if cell.search != 0 {
+            match search_run.as_mut() {
+                Some((_, end, kind)) if *kind == cell.search && *end + 1 == col => *end = col,
+                _ => {
+                    flush_search(&mut search_run, cell_size, &mut searches);
+                    search_run = Some((col, col, cell.search));
+                }
+            }
+        } else {
+            flush_search(&mut search_run, cell_size, &mut searches);
         }
 
         // ── 光标
@@ -1604,6 +1702,7 @@ fn build_row(
     }
     flush_bg(&mut bg_run, cell_size, &mut backgrounds);
     flush_sel(&mut sel_run, cell_size, &mut selections);
+    flush_search(&mut search_run, cell_size, &mut searches);
     flush_text(&mut text_run, &mut pieces);
 
     let mut texts = Vec::with_capacity(pieces.len());
@@ -1642,6 +1741,7 @@ fn build_row(
     RowRender {
         backgrounds,
         selections,
+        searches,
         texts,
         cursor,
     }
@@ -1677,6 +1777,17 @@ fn flush_sel(run: &mut Option<(usize, usize)>, cell: Size<Pixels>, out: &mut Vec
         return;
     };
     out.push(rect_for(start, end, cell));
+}
+
+fn flush_search(
+    run: &mut Option<(usize, usize, u8)>,
+    cell: Size<Pixels>,
+    out: &mut Vec<(Bounds<Pixels>, bool)>,
+) {
+    let Some((start, end, kind)) = run.take() else {
+        return;
+    };
+    out.push((rect_for(start, end, cell), kind == 2));
 }
 
 /// 行内相对矩形(y 恒为 0)。

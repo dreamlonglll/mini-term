@@ -14,6 +14,8 @@ pub mod ime;
 mod input;
 pub mod mouse;
 pub mod scrollbar;
+pub mod search;
+pub mod search_bar;
 pub mod selection_dwell;
 mod theme;
 mod view;
@@ -26,12 +28,20 @@ pub use element::{
 pub use ime::{ImeState, Preedit, commit_to_bytes};
 pub use input::{is_text_input_key, keystroke_to_bytes, paste_to_bytes};
 pub use scrollbar::{ScrollbarHit, ScrollbarLayout, ScrollbarStyle};
+pub use search::{
+    HighlightKind, HighlightSpan, SearchDirection, SearchHighlights, SearchLimits, SearchMatch,
+    SearchOptions, TerminalSearch, advance_index, build_pattern, escape_literal, index_at_or_after,
+    is_word_char, whole_word_ok,
+};
+pub use search_bar::{
+    OnSearchClose, SearchBarEvent, SearchBarLabels, TerminalSearchBar, counter_text,
+};
 pub use selection_dwell::{CopiedTip, DwellConfig, DwellTracker, OnSelectionCopied, ReleaseAction};
 pub use mouse::{
     GridPos, MouseAction, MouseBtn, MouseMods, WheelDir, mouse_report_bytes,
     mouse_reporting_active, prefers_local_handling,
 };
-pub use theme::{TerminalStyle, TerminalTheme, rgb8};
+pub use theme::{SearchColors, TerminalStyle, TerminalTheme, rgb8};
 pub use view::TerminalView;
 
 /// OSC 调色板查询的应答色。见 [`colors::color_request_rgb`]。
