@@ -18,12 +18,12 @@
 
 | # | 缺口 | 规模 | 落点 | 状态 |
 |---|---|---|---|---|
-| 1 | **IME 接线**：`pane.rs` 换用 `mt_ui::TerminalView`（view.rs 注释有四步改法）；切 tab/关 pane 调 `clear_preedit()`；OSC 应答改 `terminal_color_rgb` | 小 | mt-app | ❌ |
-| 2 | **快捷键对齐**：`ToggleMiddleColumn` 应为 `ctrl-shift-b`（现错绑 `ctrl-b`）；`ClosePane`(Ctrl+Shift+W) 应调 `close_leaf`（关整组）而非 `close_pane`；缺 nextPane(Ctrl+Tab)/prevPane/selectPaneN(Ctrl+1..9)/switchProject(Ctrl+Shift+P)/globalSearch(Ctrl+Shift+F)/terminalSearch(Ctrl+F)/markerPrev/markerNext 共 8 条；GPUI 多出 3 条原版没有的（Ctrl+Shift+A/U/J，保留） | 小 | mt-app | ❌ |
+| 1 | **IME 接线**：`pane.rs` 换用 `mt_ui::TerminalView`；`clear_preedit()` 两调用点（activate_pane/dispose_terminal）；OSC 应答改 `terminal_color_rgb` | 小 | mt-app | ✅ J 批。gpui 派发顺序（action 先于 key 监听）已实证等价原版 capture-consume，机制写进 pane.rs 注释 |
+| 2 | **快捷键对齐**：ctrl-shift-b 修正 / ClosePane→close_leaf（关整组）/ 补 Ctrl+Tab、Ctrl+Shift+Tab、Ctrl+1..9 | 小 | mt-app | 🟡 J 批完成本体；剩 switchProject/globalSearch/terminalSearch/markerPrev/Next 5 条随对应功能批落地（未占位）；Ctrl+Shift+A/U/J 三条原版没有、保留并已注明 |
 | 3 | ~~窗口聚焦即清未读~~ | 小 | mt-app | ✅ G 收尾已补 |
-| 4 | **i18n 接线**：mt-app 挂 mt-i18n 依赖（根 Cargo.toml 由主会话加行）；启动 `set_locale(cfg.locale)` + `add_locale_observer` 桥接 gpui-component 的 rust-i18n；AppConfig 加 locale 字段；首启检测走 Win32 GetUserDefaultLocaleName；替换约 80 处硬编码文案；语言切换入口 | 中 | mt-app + mt-config | ❌ |
-| 5 | **主题桥接线**：`switch_to_theme_pack`/`install_gpui_theme` 调起来；`ui.rs` 常量表改读主题；亮/暗/auto 切换（config.theme）；皮肤 skin；外置主题包 customThemeId + 失败回落；背景图渲染（theme_bridge 已备好 BackgroundArt 数据，mt-ui 渲染未做）；terminalFollowTheme + 全终端配色热更新（现 `store.rs` 固定 `TerminalTheme::default()`） | 中 | mt-app + mt-ui | ❌ |
-| 6 | **AI 自动 resume**（aiAutoResume）：`tree.rs::PaneState` 加 `resume_pending`；`persist.rs` 恢复时置位；`hydrate_project` 以会话 cwd 起 PTY 并写 `claude --resume {id}\r`；反查回写 | 中 | mt-app | ❌ |
+| 4 | **i18n 接线**：mt-app 挂 mt-i18n 依赖（根 Cargo.toml 已加行）；启动 `set_locale(cfg.locale)` + `add_locale_observer` 桥接 gpui-component 的 rust-i18n；AppConfig 加 locale 字段；首启检测走 Win32 GetUserDefaultLocaleName；替换约 80 处硬编码文案；语言切换入口 | 中 | mt-app + mt-config | ❌ |
+| 5 | **主题桥接线** | 中 | mt-app + mt-ui | 🟡 J 批：theme.rs 唯一装配入口（light/dark/auto + customThemeId 失败回落只清内存不落盘）、ui.rs 改 Palette（dark/light 逐值抄 styles.css、from_pack 对齐 buildTokenMap，函数签名零改动走 thread_local）、terminalFollowTheme 含存量终端热更、切换 pub 入口全备且起 PTY 前装配。剩：`config.skin` 皮肤色表（blueprint/fluent2）、appearance 设置页 UI（→#19）、背景图渲染（→K 批 mt-ui） |
+| 6 | **AI 自动 resume** | 中 | mt-app | ✅ J 批。resume_pending 置位只看 ai_session（遵原版：开关关着也保留标记）；磁盘格式零改动有测试钉住；pane 自带 cwd 优先防 worktree 带偏；lookup_ai_session_cwd 为同步调用（仅存量无 cwd 记录触发，理论卡顿已记档） |
 
 ### 第 1 层：基建型——挡住一大片功能
 
@@ -52,7 +52,7 @@
 
 | # | 缺口 | 规模 | 落点 | 状态 |
 |---|---|---|---|---|
-| 20 | **自定义标题栏**：拖拽区 + 最小化/最大化/关闭 + Win11 贴靠（set_max_button_rect）+ 项目切换胶囊 + 全局状态灯 + 窗口标题带版本号 | 大 | mt-app | ❌ |
+| 20 | **自定义标题栏**：拖拽区 + 最小化/最大化/关闭 + Win11 贴靠（set_max_button_rect）+ 项目切换胶囊 + 全局状态灯（~~窗口标题带版本号~~ ✅ J 批已改 `Mini-Term v{ver}`） | 大 | mt-app | ❌ |
 | 21 | **系统托盘**：三色灯 + 右键项目菜单 + 点击定位 + trayStatusEnabled/trayMaxProjects/trayClickFocus（config 字段已在；`unread_done_count()`/`next_attention_target()` 是现成消费口） | 大 | mt-app（Windows API） | ❌ |
 | 22 | **移动端中转**：mt_relay 实际接线（RelayHost/RelayEvents 实现）+ MobileRelayModal（地址/密钥/状态徽章/配对二维码/重置）+ AiLauncherSection CRUD + 5 条事件落点（status/pairing-code/start-session/rename-pane/会话结构同步）+ store 补 rename_pane_by_id | 大 | mt-app | ❌ |
 | 23 | 终端查找（TerminalSearchBar 浮条 + Aa/ab/.* + 搜索引擎） | 中 | mt-ui + mt-app | ❌ |

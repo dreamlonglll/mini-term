@@ -7,6 +7,16 @@
 //! 3. **退出上报**:子进程退出 → 发 [`PaneEvent::Exited`],由 store 落成 `error`
 //!    状态(与旧版 `pty-exit` → `updatePaneStatusByPty('error')` 同语义)。
 //!
+//! # 渲染/键盘/IME 归 [`mt_ui::TerminalView`]
+//!
+//! 本模块**不**处理按键:`TerminalView` 自己 `track_focus` + `key_context("Terminal")`
+//! + `on_key_down`,并按 `is_text_input_key` 分流(可打印键放行走 WM_CHAR/IME,
+//! 其余键转义序列 + `stop_propagation`)。宿主再挂一份就会双份处理,中文输入法下
+//! 一个字变两个。应用级快捷键仍然通:gpui 的按键派发是**先匹配 action 绑定、
+//! 后跑 key 监听**(`Window::dispatch_key_event`),所以 `Workspace` 上绑的
+//! Ctrl+Shift+T 之类根本轮不到终端;Ctrl+Shift+C/V 没有绑定,由 `TerminalView`
+//! 自己消费,其余 Ctrl+Shift 组合它原样冒泡。
+//!
 //! # 重绘唤醒
 //!
 //! PTY reader 在**独立线程**上,gpui 的 `AsyncApp` 内部是 `Weak<AppCell>`(Rc),
@@ -24,15 +34,13 @@ use std::time::Duration;
 use futures::StreamExt;
 use futures::channel::mpsc;
 use gpui::{
-    App, ClipboardItem, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, KeyDownEvent, MouseButton, ParentElement, Render, Styled, Task, Window, div,
-    prelude::FluentBuilder, px,
+    App, AppContext, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    IntoElement, ParentElement, Render, Styled, Task, Window, div, prelude::FluentBuilder, px,
 };
 use mt_pty::{PtySession, PtySpawn};
 use mt_terminal::alacritty_terminal::event::Event as TermEvent;
-use mt_terminal::alacritty_terminal::grid::Scroll;
 use mt_terminal::{TermSize, TerminalEmulator};
-use mt_ui::{TerminalElement, TerminalStyle, TerminalTheme, keystroke_to_bytes, paste_to_bytes};
+use mt_ui::{TerminalStyle, TerminalTheme, TerminalView};
 
 use crate::ai::AiBridge;
 
@@ -57,6 +65,15 @@ pub struct TerminalPane {
     emulator: Arc<TerminalEmulator>,
     pty: Option<PtySession>,
     focus: FocusHandle,
+    /// 渲染 + 键盘 + IME 全在这一层([`mt_ui::TerminalView`])。
+    ///
+    /// **宿主不再自己 `track_focus` / `key_context` / `on_key_down` / 左键聚焦** ——
+    /// 留着会让按键被处理两遍,而且 IME 分流依赖「可打印键放行走 WM_CHAR」,
+    /// 宿主抢先把字节写进 PTY 的话中文输入法下一个字会变两个。
+    view: Entity<TerminalView>,
+    /// 建视图时用过一次;留着是为了字号/字族热更新那一批(`view.set_style`)
+    /// 能拿到「当前是什么」来做比较。
+    #[allow(dead_code)]
     style: TerminalStyle,
     theme: TerminalTheme,
     ai: AiBridge,
@@ -151,7 +168,47 @@ impl TerminalPane {
             }
         });
 
+        // 焦点句柄由宿主持有(切 tab / 点分屏要 `window.focus(&handle)`),
+        // 但 `track_focus` 由 TerminalView 自己调 —— 见 view.rs 的接线说明。
         let focus = cx.focus_handle();
+
+        let view = {
+            let this = cx.weak_entity();
+            let this_for_input = this.clone();
+            cx.new(|vcx| {
+                TerminalView::new(
+                    ("terminal", pty_id),
+                    emulator.clone(),
+                    focus.clone(),
+                    style.clone(),
+                    theme.clone(),
+                    vcx,
+                )
+                .on_grid_resize(move |size: TermSize, _window, cx| {
+                    // grid 尺寸是渲染侧量出来的(可用像素 ÷ cell 尺寸),PTY 必须跟着改,
+                    // 否则 shell 换行位置与画面对不上。
+                    let _ = this.update(cx, |pane: &mut TerminalPane, _cx| {
+                        let Some(pty) = pane.pty.as_ref() else { return };
+                        match pty.resize_if_changed(size.screen_lines as u16, size.columns as u16) {
+                            // 只有**真实下发**的 resize 才开重绘冷却窗口:同尺寸的
+                            // resize 不会引起 TUI 重绘,平白开冷却会漏掉真的 AI 活跃
+                            Ok(true) => pane.ai.perception().note_resize(pane.pty_id),
+                            Ok(false) => {}
+                            Err(err) => eprintln!("[pane {}] resize 失败: {err:#}", pane.pty_id),
+                        }
+                    });
+                })
+                // **唯一**的写 PTY 通道:键盘 / 粘贴 / IME 提交 / 鼠标上报 /
+                // alt screen 滚轮全走这里,`write()` 里的 AI 感知旁路一处不落。
+                .on_input(move |bytes, _window, cx| {
+                    let bytes = bytes.to_vec();
+                    let _ = this_for_input.update(cx, |pane: &mut TerminalPane, cx| {
+                        pane.write(&bytes, cx);
+                    });
+                })
+            })
+        };
+
         ai.add_pane(pty_id);
 
         Self {
@@ -159,6 +216,7 @@ impl TerminalPane {
             emulator,
             pty,
             focus,
+            view,
             style,
             theme,
             ai,
@@ -220,8 +278,10 @@ impl TerminalPane {
                     let payload = format(text.as_deref().unwrap_or(""));
                     self.write_raw(payload.as_bytes());
                 }
+                // index 不止 0..16:256/257/258 是前景/背景/光标,而且 OSC 4 改过的
+                // 调色板要优先于主题 —— 两件事都在 `terminal_color_rgb` 里。
                 TermEvent::ColorRequest(index, format) => {
-                    let rgb = self.theme_color_rgb(index);
+                    let rgb = mt_ui::terminal_color_rgb(&self.emulator, &self.theme, index);
                     self.write_raw(format(rgb).as_bytes());
                 }
                 TermEvent::TextAreaSizeRequest(format) => {
@@ -248,24 +308,25 @@ impl TerminalPane {
         }
     }
 
-    /// 调色板查询的应答:按当前主题回真值(ANSI 0..16 之外回默认前景)。
-    fn theme_color_rgb(&self, index: usize) -> mt_terminal::alacritty_terminal::vte::ansi::Rgb {
-        let hsla = self
-            .theme
-            .ansi
-            .get(index)
-            .copied()
-            .unwrap_or(self.theme.foreground);
-        let rgba = gpui::Rgba::from(hsla);
-        mt_terminal::alacritty_terminal::vte::ansi::Rgb {
-            r: (rgba.r * 255.0).round() as u8,
-            g: (rgba.g * 255.0).round() as u8,
-            b: (rgba.b * 255.0).round() as u8,
-        }
-    }
-
     pub fn focus(&self, window: &mut Window) {
         window.focus(&self.focus);
+    }
+
+    /// 换终端配色(主题包切换 / 亮暗切换)。
+    ///
+    /// 宿主这份 `theme` 也要更新 —— `.bg()` 与 OSC 调色板应答用得着。
+    pub fn set_theme(&mut self, theme: TerminalTheme, cx: &mut Context<Self>) {
+        if self.theme == theme {
+            return;
+        }
+        self.theme = theme.clone();
+        self.view.update(cx, |view, cx| view.set_theme(theme, cx));
+        cx.notify();
+    }
+
+    /// 丢弃组合中的预编辑串。切 tab / 关 pane 之前调,免得残影留在画面上。
+    pub fn clear_preedit(&mut self, cx: &mut Context<Self>) {
+        self.view.update(cx, |view, cx| view.clear_preedit(cx));
     }
 
     /// 关闭 pane:杀子进程 + 清掉 AI 感知里的一切痕迹。
@@ -277,45 +338,6 @@ impl TerminalPane {
         }
         self.pty = None;
         self.ai.remove_pane(self.pty_id);
-    }
-
-    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        let keystroke = &event.keystroke;
-        let mods = &keystroke.modifiers;
-
-        // 应用层快捷键:Ctrl+Shift+C / Ctrl+Shift+V。
-        if mods.control && mods.shift {
-            match keystroke.key.as_str() {
-                "c" => {
-                    if let Some(text) = self.emulator.with_term(|t| t.selection_to_string())
-                        && !text.is_empty()
-                    {
-                        cx.write_to_clipboard(ClipboardItem::new_string(text));
-                    }
-                }
-                "v" => self.paste(cx),
-                _ => {}
-            }
-            return;
-        }
-
-        let Some(bytes) = keystroke_to_bytes(keystroke, self.emulator.mode()) else {
-            return;
-        };
-        // 有键入就回到底部 —— 和所有终端一样。
-        self.emulator
-            .with_term_mut(|term| term.scroll_display(Scroll::Bottom));
-        self.write(&bytes, cx);
-        cx.notify();
-    }
-
-    fn paste(&mut self, cx: &mut Context<Self>) {
-        let Some(text) = cx.read_from_clipboard().and_then(|it| it.text()) else {
-            return;
-        };
-        let bytes = paste_to_bytes(&text, self.emulator.mode());
-        self.write(&bytes, cx);
-        cx.notify();
     }
 }
 
@@ -336,7 +358,7 @@ impl Focusable for TerminalPane {
 }
 
 impl Render for TerminalPane {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(err) = self.spawn_error.clone() {
             return div()
                 .size_full()
@@ -349,53 +371,13 @@ impl Render for TerminalPane {
                 .child(format!("终端启动失败:{err}"));
         }
 
-        let element = {
-            let this = cx.weak_entity();
-            let this_for_input = this.clone();
-            TerminalElement::new(
-                ("terminal", self.pty_id),
-                self.emulator.clone(),
-                self.focus.clone(),
-                self.style.clone(),
-                self.theme.clone(),
-            )
-            .on_grid_resize(move |size: TermSize, _window, cx| {
-                // grid 尺寸是渲染侧量出来的(可用像素 ÷ cell 尺寸),PTY 必须跟着改,
-                // 否则 shell 换行位置与画面对不上。
-                let _ = this.update(cx, |pane: &mut TerminalPane, _cx| {
-                    let Some(pty) = pane.pty.as_ref() else { return };
-                    match pty.resize_if_changed(size.screen_lines as u16, size.columns as u16) {
-                        // 只有**真实下发**的 resize 才开重绘冷却窗口:同尺寸的
-                        // resize 不会引起 TUI 重绘,平白开冷却会漏掉真的 AI 活跃
-                        Ok(true) => pane.ai.perception().note_resize(pane.pty_id),
-                        Ok(false) => {}
-                        Err(err) => eprintln!("[pane {}] resize 失败: {err:#}", pane.pty_id),
-                    }
-                });
-            })
-            // alt screen 里滚轮 → 方向键。元素不持有 PTY,字节从这里回来。
-            .on_input(move |bytes, _window, cx| {
-                let bytes = bytes.to_vec();
-                let _ = this_for_input.update(cx, |pane: &mut TerminalPane, cx| {
-                    pane.write(&bytes, cx);
-                });
-            })
-        };
-
+        // 焦点 / key_context / 按键 / 左键聚焦全在 TerminalView 里,这里只剩一行。
+        // `.bg()` 留在宿主:主题带背景图时终端背景是半透明的,画两层等于把透明度平方。
         div()
             .size_full()
             .relative()
             .bg(self.theme.background)
-            .track_focus(&self.focus)
-            .key_context("Terminal")
-            .on_key_down(cx.listener(Self::on_key_down))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _event, window, _cx| {
-                    window.focus(&this.focus);
-                }),
-            )
-            .child(element)
+            .child(self.view.clone())
             // 子进程没了但 pane 留着(与旧版一致:画面可回看,不自动关)
             .when(self.exited, |el| {
                 el.child(

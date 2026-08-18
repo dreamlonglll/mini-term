@@ -140,6 +140,13 @@ fn restore_node(saved: &SavedSplitNode, config: &AppConfig) -> Option<SplitNode>
                     session_id: s.session_id.clone(),
                     cwd: s.cwd.clone(),
                 });
+                // 上次退出时的 AI 会话身份 → 待续接标记(运行时派生,磁盘上没有这个
+                // 字段)。`hydrate_project` 起 PTY 后据此写 resume 命令;写完只清标记、
+                // **保留身份**(codex resume 不重报 SessionStart,清了第二次重启就断代)。
+                //
+                // 置位不看 `aiAutoResume`:标记是「这个 pane 还没续过」,开关在写命令
+                // 那一刻才判(`src/utils/layoutRestore.ts` 同一口径)。
+                p.resume_pending = p.ai_session.is_some();
                 restored.push(p);
             }
             if restored.is_empty() {
@@ -343,6 +350,54 @@ mod tests {
         assert_eq!(s.session_id, "sess-1");
         assert_eq!(s.agent.as_deref(), Some("claude"));
         assert_eq!(s.cwd.as_deref(), Some("D:/proj"));
+    }
+
+    /// 恢复布局时按「落盘过 ai_session」置起待续接标记;没有身份的 pane 不置位。
+    ///
+    /// 置位**不看** `aiAutoResume` 开关 —— 标记的语义是「这个 pane 还没续过」,
+    /// 开关在写 resume 命令那一刻才判(`src/utils/layoutRestore.ts` 同一口径)。
+    #[test]
+    fn 恢复布局按会话身份置起待续接标记() {
+        let mut tree = leaf("cmd");
+        let with_session = tree.panes()[0].id.clone();
+        tree.pane_mut(&with_session).unwrap().ai_session = Some(AiSessionRef {
+            agent: Some("claude".into()),
+            session_id: "sess-1".into(),
+            cwd: Some("D:/proj".into()),
+        });
+        tree.append_pane(None, PaneState::new("cmd")); // 没有会话身份的那个
+
+        let saved = serialize_layout(Some(&tree));
+        // 关掉自动续接也照样置位
+        let mut cfg = config();
+        cfg.ai_auto_resume = Some(false);
+        let back = restore_layout(&saved, &cfg).unwrap();
+
+        let panes = back.panes();
+        assert_eq!(panes.len(), 2);
+        assert!(panes[0].resume_pending, "落盘过 ai_session 的 pane 要置位");
+        assert!(!panes[1].resume_pending, "没有会话身份的不置位");
+
+        // 开着开关时同样置位(置位与开关无关)
+        let back = restore_layout(&saved, &config()).unwrap();
+        assert!(back.panes()[0].resume_pending);
+    }
+
+    /// 待续接标记是运行时派生的,**磁盘格式一个字都不多** —— 序列化只写
+    /// shellName/cwd/aiSession 三项。
+    #[test]
+    fn 待续接标记不进磁盘格式() {
+        let mut tree = leaf("cmd");
+        let id = tree.panes()[0].id.clone();
+        tree.pane_mut(&id).unwrap().resume_pending = true;
+
+        let saved = serialize_layout(Some(&tree));
+        let json = serde_json::to_string(&saved).unwrap();
+        assert!(!json.contains("resume"), "磁盘格式里不许出现这个字段: {json}");
+
+        // 没有 ai_session 的 pane 转一圈回来标记必须是 false(不是被"记住"了)
+        let back = restore_layout(&saved, &config()).unwrap();
+        assert!(!back.panes()[0].resume_pending);
     }
 
     #[test]

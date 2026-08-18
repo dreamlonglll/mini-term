@@ -25,12 +25,14 @@ use std::time::Duration;
 use gpui::{App, AppContext, Context, Entity, Global, Subscription, Task, Window};
 use mt_config::{AppConfig, ConfigStore, ProjectConfig, SaveError, ShellConfig};
 use mt_pty::PtySpawn;
+use mt_ui::theme_bridge::BackgroundArt;
 use mt_ui::{TerminalStyle, TerminalTheme};
 
 use crate::ai::{AiBridge, AiEvent};
 use crate::notify::{AlertPlan, DoneTracker, NotifyPrefs, PaneRef, StatusTransition};
 use crate::pane::{PaneEvent, TerminalPane};
 use crate::persist;
+use crate::session_panel::build_resume_command;
 use crate::shell_ops::ShellList;
 use crate::tree::{
     AiSessionRef, PaneState, PaneStatus, SplitDirection, SplitNode, gen_id,
@@ -88,6 +90,12 @@ pub struct AppStore {
 
     next_pty_id: u32,
     ai: AiBridge,
+
+    /// 当前生效的终端配色(主题装配的产物,见 [`crate::theme`])。
+    /// 新建终端拿它,已存在的终端由 [`AppStore::apply_theme_from_config`] 热更新。
+    terminal_theme: TerminalTheme,
+    /// 当前主题的背景图氛围层参数。**渲染归 mt-ui,这里只是数据落点**。
+    background_art: Option<BackgroundArt>,
 
     /// 展开的目录(按项目)。运行时态,落盘走 `ProjectConfig::expanded_dirs`。
     expanded_dirs: HashMap<String, HashSet<String>>,
@@ -150,6 +158,10 @@ impl AppStore {
             focused_pane_id: None,
             next_pty_id: 1,
             ai,
+            // 真正的配色在 `apply_theme_from_config` 里装配(要 `&mut App` 取系统
+            // 外观 / 装 gpui-component 主题层),这里先给个能跑的初值
+            terminal_theme: TerminalTheme::default(),
+            background_art: None,
             expanded_dirs,
             done: DoneTracker::default(),
             window_focused: true,
@@ -405,6 +417,19 @@ impl AppStore {
         self.after_layout_change(project_id, cx);
     }
 
+    /// 关掉某个 pane **所在的整组**(Ctrl+Shift+W 的落点)。
+    pub fn close_leaf_of_pane(&mut self, project_id: &str, pane_id: &str, cx: &mut Context<Self>) {
+        let leaf_id = self
+            .project_states
+            .get(project_id)
+            .and_then(|s| s.layout.as_ref())
+            .and_then(|l| l.leaf_of_pane(pane_id))
+            .map(|node| node.id().to_string());
+        if let Some(leaf_id) = leaf_id {
+            self.close_leaf(project_id, &leaf_id, cx);
+        }
+    }
+
     /// 关闭一整个叶子(它的全部 tab)。
     pub fn close_leaf(&mut self, project_id: &str, leaf_id: &str, cx: &mut Context<Self>) {
         let pane_ids: Vec<String> = self
@@ -431,6 +456,9 @@ impl AppStore {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // 切走之前把上一个 pane 的 IME 预编辑串收掉,否则组合中失焦会在画面上
+        // 留一串下划线残影(而且那次组合的候选框还挂在旧位置)。
+        self.clear_preedit_of_focused(cx);
         if let Some(state) = self.project_states.get_mut(project_id)
             && let Some(layout) = state.layout.as_mut()
         {
@@ -438,6 +466,59 @@ impl AppStore {
         }
         self.focus_pane(project_id, pane_id, window, cx);
         self.save_layout_soon(project_id, cx);
+    }
+
+    /// 叶内环形切 tab(Ctrl+Tab / Ctrl+Shift+Tab)。只有一个 tab 时什么也不做。
+    pub fn cycle_pane(
+        &mut self,
+        project_id: &str,
+        from_pane_id: &str,
+        delta: i32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = self
+            .project_states
+            .get(project_id)
+            .and_then(|s| s.layout.as_ref())
+            .and_then(|l| l.cycle_target(from_pane_id, delta));
+        if let Some(target) = target {
+            self.activate_pane(project_id, &target, window, cx);
+        }
+    }
+
+    /// 选中叶内第 `index` 个 tab(Ctrl+1..9,**1-based**)。越界不动。
+    pub fn select_pane_by_index(
+        &mut self,
+        project_id: &str,
+        from_pane_id: &str,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let target = self
+            .project_states
+            .get(project_id)
+            .and_then(|s| s.layout.as_ref())
+            .and_then(|l| l.pane_at_index(from_pane_id, index));
+        if let Some(target) = target {
+            self.activate_pane(project_id, &target, window, cx);
+        }
+    }
+
+    /// 把当前焦点 pane 的 IME 预编辑串收掉(切 tab / 关 pane 之前)。
+    fn clear_preedit_of_focused(&mut self, cx: &mut Context<Self>) {
+        let Some(pane_id) = self.focused_pane_id.clone() else {
+            return;
+        };
+        let pty_id = self
+            .project_states
+            .values()
+            .filter_map(|s| s.layout.as_ref())
+            .find_map(|l| l.pane(&pane_id).and_then(|p| p.pty_id));
+        if let Some(entity) = pty_id.and_then(|id| self.terminals.get(&id)).cloned() {
+            entity.update(cx, |pane, cx| pane.clear_preedit(cx));
+        }
     }
 
     /// 把键盘焦点交给某个 pane。
@@ -536,35 +617,122 @@ impl AppStore {
 
     /// 恢复出来的布局里,pane 还没有 PTY(重启后 PTY 当然不在了)。
     /// 项目第一次被显示时把它们补起来 —— 与旧版「PaneGroup 懒创建」同一时机。
+    ///
+    /// # AI 自动续接
+    ///
+    /// 逐条搬运 `src/components/PaneGroup.tsx` 的那个 effect 与
+    /// `src/utils/aiResume.ts`:
+    ///
+    /// 1. **起 PTY 的目录**用会话记录的 cwd —— `claude --resume` 只认「启动目录」
+    ///    对应的会话桶,起于子目录的会话在项目根恢复会报 `No conversation found`;
+    ///    但 **pane 自己的 cwd 优先**(那是用户显式给这个 pane 定的目录,worktree
+    ///    终端靠它),会话 cwd 只在 pane 没指定时兜底;
+    /// 2. 存量记录没有 cwd 时向 `mt_ai` 反查 jsonl,查到随身份写回并持久化,
+    ///    下次重启免查;codex 会话不按目录分桶,不反查;
+    /// 3. 写完 resume **只清 `resume_pending`、保留 `ai_session`** ——
+    ///    codex resume 不会重新上报 SessionStart,身份清了第二次重启就断代;
+    /// 4. 否决条件全在 [`resolve_auto_resume_command`]。
     pub fn hydrate_project(&mut self, project_id: &str, cx: &mut Context<Self>) {
         let Some(project) = self.project(project_id).cloned() else {
             return;
         };
-        let pending: Vec<(String, String, Option<String>)> = self
+        // SSH 远程项目的 PTY 是 ssh 启动器,启动初期可能停在口令交互上,预写的
+        // 命令会被当口令消费;远端会话身份也不来自本机 hook(mt-ssh 尚未进
+        // crates/,这里只把这条守卫先立住)。
+        let remote = project.ssh_connection_id.is_some();
+        // 缺省开启(`config.aiAutoResume`)
+        let auto_resume = self.config.ai_auto_resume.unwrap_or(true);
+
+        struct Pending {
+            pane_id: String,
+            shell_name: String,
+            cwd: Option<String>,
+            ai_session: Option<AiSessionRef>,
+            resume_pending: bool,
+        }
+        let pending: Vec<Pending> = self
             .project_states
             .get(project_id)
             .and_then(|s| s.layout.as_ref())
             .map(|l| {
                 l.panes()
                     .into_iter()
-                    .filter(|p| p.pty_id.is_none())
-                    .map(|p| (p.id.clone(), p.shell_name.clone(), p.cwd.clone()))
+                    // status == error 的 pane 不重开(旧版 effect 的同一条守卫):
+                    // 它上次就是起不来 / 已退出,自动重来只会刷屏
+                    .filter(|p| p.pty_id.is_none() && p.status != PaneStatus::Error)
+                    .map(|p| Pending {
+                        pane_id: p.id.clone(),
+                        shell_name: p.shell_name.clone(),
+                        cwd: p.cwd.clone(),
+                        ai_session: p.ai_session.clone(),
+                        resume_pending: p.resume_pending,
+                    })
                     .collect()
             })
             .unwrap_or_default();
         if pending.is_empty() {
             return;
         }
-        for (pane_id, shell_name, cwd) in pending {
-            let Some(shell) = self.resolve_shell(Some(&shell_name)) else {
+
+        for item in pending {
+            let Some(shell) = self.resolve_shell(Some(&item.shell_name)) else {
+                // 一个 shell 都没有 —— 旧版把 pane 标成 error 而不是静默跳过
+                if let Some(state) = self.project_states.get_mut(project_id)
+                    && let Some(layout) = state.layout.as_mut()
+                    && let Some(pane) = layout.pane_mut(&item.pane_id)
+                {
+                    pane.status = PaneStatus::Error;
+                }
                 continue;
             };
-            let pty_id = self.start_pty(&project, &shell, cwd.as_deref(), cx);
+
+            // 这一轮要不要续接(开关 + 标记 + 远程),决定了会不会去查会话 cwd
+            let session = (auto_resume && item.resume_pending && !remote)
+                .then(|| item.ai_session.clone())
+                .flatten();
+            let resume_cwd = session.as_ref().and_then(resolve_resume_cwd);
+            // pane 自己的 cwd 优先,会话 cwd 兜底
+            let start_cwd = item.cwd.clone().or_else(|| resume_cwd.clone());
+
+            let pty_id = self.start_pty(&project, &shell, start_cwd.as_deref(), cx);
             if let Some(state) = self.project_states.get_mut(project_id)
                 && let Some(layout) = state.layout.as_mut()
-                && let Some(pane) = layout.pane_mut(&pane_id)
+                && let Some(pane) = layout.pane_mut(&item.pane_id)
             {
                 pane.pty_id = Some(pty_id);
+            }
+
+            let Some(command) = resolve_auto_resume_command(
+                auto_resume,
+                item.resume_pending,
+                item.ai_session.as_ref(),
+                remote,
+            ) else {
+                continue;
+            };
+
+            // 先清标记再写命令(顺序同旧版):标记的语义是「这个 pane 还没续过」
+            let mut session_patch: Option<AiSessionRef> = None;
+            if let Some(state) = self.project_states.get_mut(project_id)
+                && let Some(layout) = state.layout.as_mut()
+                && let Some(pane) = layout.pane_mut(&item.pane_id)
+            {
+                pane.resume_pending = false;
+                // 反查所得的启动目录随身份写回,下次重启直达不再查
+                if let Some(cwd) = resume_cwd.as_ref()
+                    && let Some(sess) = pane.ai_session.as_mut()
+                    && sess.cwd.as_deref() != Some(cwd.as_str())
+                {
+                    sess.cwd = Some(cwd.clone());
+                    session_patch = Some(sess.clone());
+                }
+            }
+            // PTY 内核缓冲 stdin,shell 就绪前写入不丢(与移动端发起会话同一时序)。
+            // 走 `write_to_pane` 而不是裸 PTY 写:AI 输入检测那一路要看得见这条命令,
+            // pane 才会正常进入 AI 会话状态。
+            self.write_to_pane(project_id, &item.pane_id, &format!("{command}\r"), cx);
+            if session_patch.is_some() {
+                self.save_layout_soon(project_id, cx);
             }
         }
         cx.notify();
@@ -630,7 +798,7 @@ impl AppStore {
             .collect();
 
         let style = self.terminal_style();
-        let theme = TerminalTheme::default();
+        let theme = self.terminal_theme.clone();
         let ai = self.ai.clone();
         let entity = cx.new(|cx| {
             TerminalPane::new(pty_id, spec, user_env, style, theme, ai, cx)
@@ -673,7 +841,12 @@ impl AppStore {
     /// 回收一个终端:kill 子进程 + 清 AI 感知痕迹 + 摘掉视图与订阅。
     fn dispose_terminal(&mut self, pty_id: u32, cx: &mut Context<Self>) {
         if let Some(entity) = self.terminals.remove(&pty_id) {
-            entity.update(cx, |pane, _| pane.shutdown());
+            // 组合中关 pane:先把预编辑收掉,免得 IME 还挂在一个即将消失的
+            // 输入宿主上(marked range 不收回,下一次按键会被 IME 永久劫持)
+            entity.update(cx, |pane, cx| {
+                pane.clear_preedit(cx);
+                pane.shutdown();
+            });
         }
         self.pane_subs.remove(&pty_id);
     }
@@ -897,6 +1070,92 @@ impl AppStore {
         if changed {
             cx.notify();
         }
+    }
+
+    // === 主题 ===
+
+    /// 按当前配置装配主题:gpui-component 主题层 + 壳配色 + 终端配色。
+    ///
+    /// **已存在的终端也热更新** —— 对应旧版
+    /// `terminalCache.ts::updateAllTerminalThemes`,不然换主题只有新开的终端跟着变。
+    ///
+    /// 启动、切亮暗、切皮肤、开关 `terminalFollowTheme` 全走这一条路。
+    pub fn apply_theme_from_config(
+        &mut self,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        let applied = crate::theme::apply(&self.config, window, cx);
+        if let Some(failed) = &applied.failed_pack {
+            // 只清内存不落盘:主题目录可能只是这次读不到(盘没挂载、文件正被替换),
+            // 落盘会把用户的选择永久抹掉,下次启动就找不回来了(旧版同一红线)。
+            self.config.custom_theme_id = None;
+            eprintln!("[store] 主题包 {failed} 本次不可用,已回落内置外观(配置未改盘)");
+        }
+        crate::ui::set_palette(applied.palette);
+        self.background_art = applied.background;
+        self.terminal_theme = applied.terminal.clone();
+
+        let entities: Vec<Entity<TerminalPane>> = self.terminals.values().cloned().collect();
+        for entity in entities {
+            let theme = applied.terminal.clone();
+            entity.update(cx, |pane, cx| pane.set_theme(theme, cx));
+        }
+        cx.notify();
+    }
+
+    /// 当前主题的背景图参数(渲染归 mt-ui,这里只是取数口)。
+    #[allow(dead_code)] // 消费方是 mt-ui 的背景图渲染,尚未落地
+    pub fn background_art(&self) -> Option<&BackgroundArt> {
+        self.background_art.as_ref()
+    }
+
+    /// 切内置亮/暗/跟随系统(`light` / `dark` / `auto`)。
+    ///
+    /// **切亮暗 = 退出外置皮肤** —— 皮肤的明暗由作者在 `theme.json` 里定死,
+    /// 留着它这一步就没有效果(旧版 themePackManager 的同一条约定)。
+    #[allow(dead_code)] // 设置面板「外观」页的落点(下一批)
+    pub fn set_theme_mode(&mut self, mode: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.config.theme = mode.to_string();
+        self.config.custom_theme_id = None;
+        self.apply_theme_from_config(Some(window), cx);
+        self.save_config_soon(cx);
+    }
+
+    /// 切外置主题包;`None` = 退出皮肤回内置外观。
+    ///
+    /// 装不上返回 `false` 且**不落盘**:内存里已经回落内置,配置里那条
+    /// `customThemeId` 不该被这次失败改掉。
+    #[allow(dead_code)] // 设置面板「外观」页的落点(下一批)
+    pub fn set_theme_pack(
+        &mut self,
+        theme_id: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.config.custom_theme_id = theme_id.clone();
+        self.apply_theme_from_config(Some(window), cx);
+        if self.config.custom_theme_id != theme_id {
+            return false;
+        }
+        self.save_config_soon(cx);
+        true
+    }
+
+    /// 终端配色跟不跟随主题。关掉 = 终端固定内置暗色(旧版同一行为)。
+    #[allow(dead_code)] // 设置面板「外观」页的落点(下一批)
+    pub fn set_terminal_follow_theme(
+        &mut self,
+        follow: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.config.terminal_follow_theme == follow {
+            return;
+        }
+        self.config.terminal_follow_theme = follow;
+        self.apply_theme_from_config(Some(window), cx);
+        self.save_config_soon(cx);
     }
 
     // === 终端配置(shell 列表)===
@@ -1123,6 +1382,51 @@ impl AppStore {
     }
 }
 
+/// 启动恢复某个 pane 时该不该自动续接、续接命令是什么
+/// (逐条对照 `src/utils/aiResume.ts::resolveAutoResumeCommand`)。
+///
+/// 汇总全部否决条件,返回 `None` = 不写命令:
+/// - `enabled`:系统设置里的「启动自动续接 AI 会话」开关(`config.aiAutoResume`,
+///   缺省开启)。关掉只影响写不写命令,`ai_session` 身份照旧随布局持久化;
+/// - `resume_pending`:布局恢复置位、写一次即清,防重复写;
+/// - `remote`:远程 pane 的 PTY 是 ssh 启动器,启动初期可能停在口令交互上,
+///   预写的命令会被当口令消费;
+/// - id 非法:见 [`build_resume_command`] 的白名单。
+///
+/// **`enabled == false` 时调用方不该清 `resume_pending`** —— 标记的语义是
+/// 「这个 pane 还没续过」,不是「这次启动没续」;清了开关中途打开也续不上。
+pub fn resolve_auto_resume_command(
+    enabled: bool,
+    resume_pending: bool,
+    session: Option<&AiSessionRef>,
+    remote: bool,
+) -> Option<String> {
+    if !enabled || !resume_pending || remote {
+        return None;
+    }
+    let session = session?;
+    build_resume_command(session.agent.as_deref().unwrap_or(""), &session.session_id)
+}
+
+/// 续接时 PTY 该以哪个目录启动(`PaneGroup.tsx` 的 `resolveResumeCwd`)。
+///
+/// 会话记录里带 cwd 就用它;存量记录没有就按 id 反查 jsonl —— `claude --resume`
+/// 只认「启动目录」对应的会话桶,起于子目录的会话在项目根恢复会报
+/// `No conversation found`。**codex 的会话不按目录分桶,不反查**。
+///
+/// 目录不在盘上(worktree 移除、项目搬家)一律当查不到:那本是「续接得更准」的
+/// 优化,不该把 pane 拖成起不来 —— 退回 pane 自己的 cwd / 项目根,
+/// 大不了 resume 找不到会话桶。
+fn resolve_resume_cwd(session: &AiSessionRef) -> Option<String> {
+    if let Some(cwd) = session.cwd.as_deref() {
+        return Path::new(cwd).is_dir().then(|| cwd.to_string());
+    }
+    if session.agent.as_deref() == Some("codex") {
+        return None;
+    }
+    mt_ai::sessions::lookup_ai_session_cwd(session.session_id.clone())
+}
+
 fn collect_node_ids(node: &SplitNode, out: &mut HashSet<String>) {
     out.insert(node.id().to_string());
     if let SplitNode::Split { children, .. } = node {
@@ -1141,4 +1445,82 @@ fn remove_from_tree(tree: &mut Vec<mt_config::ProjectTreeItem>, project_id: &str
             true
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session(agent: Option<&str>, id: &str) -> AiSessionRef {
+        AiSessionRef {
+            agent: agent.map(str::to_string),
+            session_id: id.to_string(),
+            cwd: None,
+        }
+    }
+
+    /// 命令按 agent 分派;未知 / 缺省 agent 兜底 claude(与旧版一致)。
+    #[test]
+    fn 自动续接命令按_agent_分派() {
+        let s = session(Some("codex"), "rollout_9");
+        assert_eq!(
+            resolve_auto_resume_command(true, true, Some(&s), false).as_deref(),
+            Some("codex resume rollout_9")
+        );
+        let s = session(Some("grok"), "0199-x");
+        assert_eq!(
+            resolve_auto_resume_command(true, true, Some(&s), false).as_deref(),
+            Some("grok --resume 0199-x")
+        );
+        let s = session(None, "abc-123");
+        assert_eq!(
+            resolve_auto_resume_command(true, true, Some(&s), false).as_deref(),
+            Some("claude --resume abc-123")
+        );
+    }
+
+    /// 四条否决条件逐条生效。
+    #[test]
+    fn 自动续接的四条否决() {
+        let s = session(Some("claude"), "abc-123");
+        // 开关关掉
+        assert!(resolve_auto_resume_command(false, true, Some(&s), false).is_none());
+        // 标记已清(写过一次了)
+        assert!(resolve_auto_resume_command(true, false, Some(&s), false).is_none());
+        // 远程 pane
+        assert!(resolve_auto_resume_command(true, true, Some(&s), true).is_none());
+        // 没有会话身份
+        assert!(resolve_auto_resume_command(true, true, None, false).is_none());
+    }
+
+    /// id 白名单:这条命令是要原样写进 PTY 的,shell 元字符一律拦下。
+    #[test]
+    fn 自动续接的_id_白名单() {
+        for bad in ["a b", "a;rm -rf /", "a|b", "a\nb", "a$(x)", "a`x`", "a'b", ""] {
+            let s = session(Some("claude"), bad);
+            assert!(
+                resolve_auto_resume_command(true, true, Some(&s), false).is_none(),
+                "应拒绝: {bad:?}"
+            );
+        }
+    }
+
+    /// 会话 cwd:目录不在盘上一律当查不到,不能把 pane 拖成起不来。
+    #[test]
+    fn 会话目录不存在时不作数() {
+        let mut s = session(Some("claude"), "abc-123");
+        s.cwd = Some("D:/definitely-not-here/xyz".into());
+        assert_eq!(resolve_resume_cwd(&s), None);
+
+        let tmp = std::env::temp_dir();
+        s.cwd = Some(tmp.to_string_lossy().to_string());
+        assert_eq!(resolve_resume_cwd(&s), Some(tmp.to_string_lossy().to_string()));
+    }
+
+    /// codex 会话不按目录分桶 —— 没有 cwd 就是没有,不去反查。
+    #[test]
+    fn codex_会话不反查目录() {
+        let s = session(Some("codex"), "rollout_9");
+        assert_eq!(resolve_resume_cwd(&s), None);
+    }
 }

@@ -13,7 +13,7 @@
 | Wave 1 | 后端五块并行搬运 + TerminalElement 端到端 | ✅ 2026-08-18 全部验收入库（6/6） |
 | Wave 2 | mt-relay、mt-app 全壳（store/三栏/Tab/分屏树） | ✅ 2026-08-18 两件均验收入库；面板/Modal/i18n/主题桥移入 Wave 3 |
 | Wave 3 | G=mt-app UI 批（Modal/AI 历史+用量面板/通知/分屏比例+焦点导航）；H=mt-ui 渲染批（IME/鼠标上报/damage/主题桥）；I=mt-i18n 字典基建 | ✅ 2026-08-18 全部验收入库。G 经收尾 agent 补验：66 单测+4 集成全绿（老断言零改动），六模块齐（托盘明确未做），收尾另修 3 个真 bug（分屏比例恢复首帧 FALLBACK_AREA 基准错→改首帧量尺下帧铺树；窗口聚焦不清未读；折叠栏把 sizes 抹成最小值）+ 2 处资源问题（会话面板惰性加载防 WSL 冷启动、用量面板 Task 句柄无界增长）+6 单测；I ✅（`d2af55f`）；H ✅（`92390d4`） |
-| Wave 4+ | 按 docs/gpui-parity-audit.md 30 条缺口逐批清零（第 0 层接线 → 基建 → 面板 → 整块新功能） | 🔵 2026-08-18 审计任务书落盘；J=mt-app 接线批 + K=mt-ui 视觉批已派出 |
+| Wave 4+ | 按 docs/gpui-parity-audit.md 30 条缺口逐批清零（第 0 层接线 → 基建 → 面板 → 整块新功能） | 🔵 2026-08-18 J=mt-app 接线批 ✅ 验收（84 单测+4 集成绿，IME/快捷键/主题桥/AI 自动 resume/标题版本号；三条 mt-ui API 缺口转 K 追加）；K=mt-ui 视觉批进行中（图标/滚动条/背景图/拖选停留复制） |
 | 收尾 | mt-ssh/mt-core 移入 crates/、删 src-tauri/ 与 src/、发版切换 | ⬜ |
 
 ## Wave 1 —— 2026-08-18 派出 6 个并行 agent
@@ -48,13 +48,13 @@
 
 ## Wave 3.5 接线清单（H/I 交付后累积，逐项做完勾掉）
 
-- [ ] **TerminalPane 换用 TerminalView**：四步接线代码片段在 `crates/mt-ui/src/terminal/view.rs` 模块注释「宿主接线」段，照抄即可；**必须删掉**宿主的 track_focus/key_context/on_key_down/左键聚焦 on_mouse_down（IME 分流依赖按键放行，留着会双份处理且中文输入会漏 `n` 进 shell）
-- [ ] 宿主在切 tab/关 pane 时调 `clear_preedit()`（防组合中失焦留预编辑残影）
-- [ ] OSC 应答改 `mt_ui::terminal_color_rgb(&emulator, &theme, index)`，删 pane 里的 theme_color_rgb
-- [ ] 主题切换入口接 `switch_to_theme_pack(&ThemePacks, id, window, cx)`；内置亮暗切换走 `switch_to_builtin`
-- [ ] i18n：各 crate 挂 `mt-i18n.workspace = true`（先在根 Cargo.toml 的 workspace.dependencies 加 path 行——之前的 agent 都被禁改根文件）；启动时 `set_locale(cfg.locale)` + `add_locale_observer(|l| rust_i18n::set_locale(l.code()))` 桥接 gpui-component 内置组件；AppConfig 加 locale 字段；首启语言检测走 Win32 GetUserDefaultLocaleName → Locale::from_system_tag（Windows 上 LANG 环境变量通常不存在）
+- [x] **TerminalPane 换用 TerminalView**（J 批）：track_focus/key_context/on_key_down/左键聚焦 on_mouse_down 已删干净；gpui 派发顺序（action 先于 key 监听）实证等价原版 capture-consume，写进 pane.rs 注释
+- [x] 切 tab/关 pane 调 `clear_preedit()`（J 批：activate_pane 收上一焦点 pane + dispose_terminal 先收再 kill）
+- [x] OSC 应答改 `mt_ui::terminal_color_rgb`（J 批，顺带消灭了旧 theme_color_rgb 把查背景答成前景的 bug 副本）
+- [x] 主题切换入口（J 批：因 AppliedThemePack 缺语义色，绕开 switch_to_theme_pack 手拆四步；mt-ui 补 API 后可收回单函数——已转 K 批）
+- [ ] i18n：各 crate 挂 `mt-i18n.workspace = true`（根 Cargo.toml 的 path 行已加）；启动时 `set_locale(cfg.locale)` + `add_locale_observer(|l| rust_i18n::set_locale(l.code()))` 桥接 gpui-component 内置组件；AppConfig 加 locale 字段；首启语言检测走 Win32 GetUserDefaultLocaleName → Locale::from_system_tag（Windows 上 LANG 环境变量通常不存在）
 - [ ] 文案替换：TS 的 `t('ns.key')` → `t("ns", "key")` 或 `t_path("ns.key")`，key 一字未变可照 TSX 抄
-- [ ] IME 人工验收 8 步（微软拼音组合/候选框跟随/方向键不漏/Esc 取消/失焦/emoji/英文直打回归）——H 报告原文已并入下方人工验收清单语境，跑 app 前必设 MT_APP_DATA_DIR
+- [ ] IME 人工验收 8 步（微软拼音组合/候选框跟随/方向键不漏/Esc 取消/失焦/emoji/英文直打回归）——用户已豁免 E2E，留给日后真机自验；跑 app 前必设 MT_APP_DATA_DIR
 
 ## Wave 3 拆法建议（mt-app 全壳 agent 留下的，已采信记档）
 
@@ -110,6 +110,7 @@
 - hook 二进制仍按「与主程序同目录 miniterm-hook(.exe)」定位；GPUI 壳产物布局定型后与 scripts/stage-sidecars.mjs 一起复查。
 - `is_wsl_unc_path`/parse_wsl_unc 判定已是工作区**第三份**复刻（mt-ai / mt-pty 走 mt-core / mt-relay），收尾统一去重。
 - mt-relay 默认自持 2 线程 tokio 运行时（apply 惰性创建）；mt-app 若有全局运行时应改用 `with_runtime` 注入，避免进程双线程池。
+- **J 批（122b5ca 后）记档**：`ThemePacks::open()` 钉死 `mt_config::paths::themes_dir()` 不认 `MT_APP_DATA_DIR`（mt-app 用 `ThemePacks::at()` 绕开，待 mt-config 统一）；`lookup_ai_session_cwd` 同步阻塞（仅存量无 cwd 会话触发）；resume 的会话 cwd 起 PTY 失败拿不到信号，以 `is_dir()` 预检代偿；`config.skin`（blueprint/fluent2）无对应色表未实现。
 
 ## 风险与决议记录
 

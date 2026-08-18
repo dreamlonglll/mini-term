@@ -45,6 +45,7 @@ mod session_panel;
 mod shell_ops;
 mod store;
 mod terminal_area;
+mod theme;
 mod tree;
 mod ui;
 mod usage_panel;
@@ -79,14 +80,21 @@ actions!(
     [
         /// 新建终端标签(Ctrl+Shift+T)
         NewTerminal,
-        /// 关闭当前 pane(Ctrl+Shift+W)
+        /// 关闭当前**整组**(Ctrl+Shift+W)。
+        ///
+        /// 原版 `closePane` 调的是 `closeLeaf` —— 关的是当前分屏格里的全部 tab,
+        /// 不是单个 tab(单个 tab 走 tab 上的 × )。
         ClosePane,
         /// 向右分屏(Ctrl+Shift+D)
         SplitRight,
         /// 向下分屏(Ctrl+Shift+E)
         SplitDown,
-        /// 折叠/展开中间栏(Ctrl+B)
+        /// 折叠/展开中间栏(Ctrl+Shift+B)
         ToggleMiddleColumn,
+        /// 叶内切到下一个 tab(Ctrl+Tab)
+        NextPane,
+        /// 叶内切到上一个 tab(Ctrl+Shift+Tab)
+        PrevPane,
         /// 重命名当前标签(F2)
         RenamePane,
         /// 终端配置(Ctrl+,)
@@ -107,6 +115,14 @@ actions!(
         FocusDown,
     ]
 );
+
+/// 选中叶内第 N 个 tab(Ctrl+1..9,**1-based**;越界不动)。
+///
+/// 带数据的 action 必须走 `derive(Action)`(`actions!` 只生成单元结构),
+/// `no_json` 让它不要求 serde/schemars —— 这个 action 只从代码里绑,不进键位 JSON。
+#[derive(Clone, PartialEq, Default, Debug, gpui::Action)]
+#[action(namespace = mini_term, no_json)]
+pub struct SelectPane(pub usize);
 
 /// toast 的去重键类型(gpui-component 按 `TypeId + key` 唯一化通知)。
 /// 完成与待确认各一个键空间 —— 旧版同样把两种 toast 分开计数。
@@ -285,12 +301,42 @@ impl Workspace {
         });
     }
 
+    /// Ctrl+Shift+W = 关**整组**(原版 `closePane` 调的是 `closeLeaf`),
+    /// 不是关当前这一个 tab —— 单个 tab 走 tab 上的 ×。
     fn on_close_pane(&mut self, _: &ClosePane, _window: &mut Window, cx: &mut Context<Self>) {
         let Some((project_id, pane_id)) = self.target_pane(cx) else {
             return;
         };
-        self.store
-            .update(cx, |store, cx| store.close_pane(&project_id, &pane_id, cx));
+        self.store.update(cx, |store, cx| {
+            store.close_leaf_of_pane(&project_id, &pane_id, cx)
+        });
+    }
+
+    fn on_next_pane(&mut self, _: &NextPane, window: &mut Window, cx: &mut Context<Self>) {
+        self.cycle_pane(1, window, cx);
+    }
+
+    fn on_prev_pane(&mut self, _: &PrevPane, window: &mut Window, cx: &mut Context<Self>) {
+        self.cycle_pane(-1, window, cx);
+    }
+
+    fn cycle_pane(&mut self, delta: i32, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((project_id, pane_id)) = self.target_pane(cx) else {
+            return;
+        };
+        self.store.update(cx, |store, cx| {
+            store.cycle_pane(&project_id, &pane_id, delta, window, cx)
+        });
+    }
+
+    fn on_select_pane(&mut self, action: &SelectPane, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((project_id, pane_id)) = self.target_pane(cx) else {
+            return;
+        };
+        let index = action.0;
+        self.store.update(cx, |store, cx| {
+            store.select_pane_by_index(&project_id, &pane_id, index, window, cx)
+        });
     }
 
     fn on_split_right(&mut self, _: &SplitRight, window: &mut Window, cx: &mut Context<Self>) {
@@ -622,6 +668,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_close_pane))
             .on_action(cx.listener(Self::on_split_right))
             .on_action(cx.listener(Self::on_split_down))
+            .on_action(cx.listener(Self::on_next_pane))
+            .on_action(cx.listener(Self::on_prev_pane))
+            .on_action(cx.listener(Self::on_select_pane))
             .on_action(cx.listener(Self::on_toggle_middle))
             .on_action(cx.listener(Self::on_rename_pane))
             .on_action(cx.listener(Self::on_open_settings))
@@ -644,19 +693,30 @@ impl Render for Workspace {
 fn main() {
     Application::new().run(|cx: &mut App| {
         gpui_component::init(cx);
-        // 壳的配色是写死的暗色(ui.rs 逐值取自 styles.css 的 :root),Dialog / Input
-        // 走 gpui-component 的主题层 —— 不钉成暗色的话浮层会跟随系统变成亮色,
-        // 与整个应用撞在一起。主题桥接上后这一行由主题包接管。
+        // 真正的主题在 store 装好之后按 config 装配(`apply_theme_from_config`):
+        // 亮/暗/auto + 外置主题包 + 终端配色一次算全。这里先钉一个暗色兜底,
+        // 免得从 init 到装配之间有一帧走 gpui-component 的默认亮色。
         gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
 
-        cx.bind_keys([
+        // 键位表的唯一事实来源是 `src/utils/hotkeys.ts`,逐条对齐。
+        //
+        // 应用级动作统一走 `Ctrl+Shift+*`(Windows Terminal / VS Code 终端的惯例)——
+        // 裸 Ctrl+B/Ctrl+T/Ctrl+W/Ctrl+P 在 shell 行编辑里都有既定语义,占了就是吞键;
+        // 只有确实不冲突的才用裸 Ctrl(Ctrl+Tab、Ctrl+1..9、Ctrl+,)。
+        //
+        // gpui 的按键派发**先匹配 action 绑定、后跑 key 监听**,所以这里绑上就等于
+        // 拿到了原版 capture 阶段 `consume(e)` 的效果:终端看不到这些键。
+        let mut bindings = vec![
             KeyBinding::new("ctrl-shift-t", NewTerminal, Some("Workspace")),
             KeyBinding::new("ctrl-shift-w", ClosePane, Some("Workspace")),
             KeyBinding::new("ctrl-shift-d", SplitRight, Some("Workspace")),
             KeyBinding::new("ctrl-shift-e", SplitDown, Some("Workspace")),
-            KeyBinding::new("ctrl-b", ToggleMiddleColumn, Some("Workspace")),
+            KeyBinding::new("ctrl-shift-b", ToggleMiddleColumn, Some("Workspace")),
             KeyBinding::new("f2", RenamePane, Some("Workspace")),
             KeyBinding::new("ctrl-,", OpenTerminalSettings, Some("Workspace")),
+            KeyBinding::new("ctrl-tab", NextPane, Some("Workspace")),
+            KeyBinding::new("ctrl-shift-tab", PrevPane, Some("Workspace")),
+            // 原版没有的三条,保留
             KeyBinding::new("ctrl-shift-a", ToggleSessions, Some("Workspace")),
             KeyBinding::new("ctrl-shift-u", ToggleUsage, Some("Workspace")),
             KeyBinding::new("ctrl-shift-j", JumpAttention, Some("Workspace")),
@@ -664,7 +724,17 @@ fn main() {
             KeyBinding::new("alt-right", FocusRight, Some("Workspace")),
             KeyBinding::new("alt-up", FocusUp, Some("Workspace")),
             KeyBinding::new("alt-down", FocusDown, Some("Workspace")),
-        ]);
+        ];
+        // Ctrl+1..9:选中叶内第 N 个 tab(原版键位表里存的是占位串 '1…9',
+        // 由 useGlobalHotkeys 单独判 `/^[1-9]$/`)
+        for n in 1..=9usize {
+            bindings.push(KeyBinding::new(
+                &format!("ctrl-{n}"),
+                SelectPane(n),
+                Some("Workspace"),
+            ));
+        }
+        cx.bind_keys(bindings);
 
         let config_store = if std::env::var_os("MT_APP_DATA_DIR").is_some() {
             // 隔离模式:配置也落在覆盖目录里,不碰装机版那份
@@ -690,6 +760,11 @@ fn main() {
         // 往后所有视图都从 Global 取这一份 store(等价于 zustand 的 useAppStore)
         let store = AppStore::global(cx);
 
+        // 主题必须在**起 PTY 之前**装配:新建终端拿的是 store 里那份终端配色,
+        // 晚一步的话首批终端会以默认配色建出来,再被热更新刷一遍(闪一下)。
+        // 窗口还没开,`window` 传 None —— Theme::change 只是少一次 refresh。
+        store.update(cx, |store, cx| store.apply_theme_from_config(None, cx));
+
         // 启动即把当前项目的终端补起来(布局是从 config.json 恢复的,PTY 当然没了)
         let active = store.read(cx).active_project_id.clone();
         if let Some(project_id) = active {
@@ -710,7 +785,9 @@ fn main() {
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
-                    title: Some("mini-term".into()),
+                    // 与装机版一致(`App.tsx` 的 `setTitle(\`Mini-Term v${ver}\`)`)——
+                    // 窗口虽已无边框,任务栏悬停预览与 Alt+Tab 仍读这个标题
+                    title: Some(format!("Mini-Term v{}", env!("CARGO_PKG_VERSION")).into()),
                     ..Default::default()
                 }),
                 ..Default::default()

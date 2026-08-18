@@ -90,6 +90,14 @@ pub struct PaneState {
     /// 工作目录覆盖;`None` 时用项目根。
     pub cwd: Option<String>,
     pub ai_session: Option<AiSessionRef>,
+    /// 待续接标记:恢复布局时随 `ai_session` 置位,起 PTY 写完 resume 命令后清除
+    /// (**只清标记不清身份**)。
+    ///
+    /// **运行时派生,不进磁盘格式** —— `SavedPane` 里没有这个字段,`persist.rs`
+    /// 在 `restore_layout` 里按「落盘过 ai_session」置位。置位**不看**
+    /// `aiAutoResume` 开关:标记的语义是「这个 pane 还没续过」,不是「这次启动没续」,
+    /// 开关中途打开后点开尚未起 PTY 的 pane 仍应续上(见 `src/utils/aiResume.ts`)。
+    pub resume_pending: bool,
     /// 后端识别到的会话内 AI 命令名(hook / 输入检测),品牌标识兜底用。
     pub detected_agent: Option<String>,
     /// 本次 ai-idle 的成因是「需要用户确认」。
@@ -106,6 +114,7 @@ impl PaneState {
             pty_id: None,
             cwd: None,
             ai_session: None,
+            resume_pending: false,
             detected_agent: None,
             attention: false,
         }
@@ -398,6 +407,32 @@ impl SplitNode {
         true
     }
 
+    /// 叶内环形切 tab(`cyclePane`):`delta` 为 +1/-1。
+    ///
+    /// 只有一个 tab 时返回 `None`(不动),最后一个再往后回到第一个 ——
+    /// Ctrl+Tab 的普遍预期。
+    pub fn cycle_target(&self, from_pane_id: &str, delta: i32) -> Option<String> {
+        let SplitNode::Leaf { panes, .. } = self.leaf_of_pane(from_pane_id)? else {
+            return None;
+        };
+        if panes.len() < 2 {
+            return None;
+        }
+        let idx = panes.iter().position(|p| p.id == from_pane_id)?;
+        let len = panes.len() as i32;
+        // delta 可能是任意整数,先取模再加一圈保证非负
+        let next = ((idx as i32 + delta) % len + len) % len;
+        Some(panes[next as usize].id.clone())
+    }
+
+    /// 叶内第 `index` 个 tab(**1-based**,`selectPaneByIndex`)。越界返回 `None`。
+    pub fn pane_at_index(&self, from_pane_id: &str, index: usize) -> Option<String> {
+        let SplitNode::Leaf { panes, .. } = self.leaf_of_pane(from_pane_id)? else {
+            return None;
+        };
+        panes.get(index.checked_sub(1)?).map(|p| p.id.clone())
+    }
+
     /// 从树里摘掉一个 pane(`removePaneFromLayout`):
     /// - 叶子里还有别的 pane:只摘 pane,必要时把 activePaneId 移到最后一个;
     /// - 叶子空了:从父 split 摘掉;父 split 只剩一个孩子则塌陷成那个孩子;
@@ -480,6 +515,7 @@ impl SplitNode {
         match status {
             PaneStatus::Idle | PaneStatus::Error => {
                 pane.ai_session = None;
+                pane.resume_pending = false;
                 pane.detected_agent = None;
             }
             _ => {
@@ -727,6 +763,80 @@ mod tests {
         };
         assert_eq!(children[0].panes().len(), 1, "锚点不在这格");
         assert_eq!(children[1].panes().len(), 2);
+    }
+
+    /// cyclePane:叶内环形前后切,最后一个再往后回到第一个。
+    #[test]
+    fn 叶内环形切_tab() {
+        let mut root = leaf("a", 1);
+        root.append_pane(None, pane("b", 2));
+        root.append_pane(None, pane("c", 3));
+        let ids: Vec<String> = root.panes().iter().map(|p| p.id.clone()).collect();
+
+        assert_eq!(root.cycle_target(&ids[0], 1).as_ref(), Some(&ids[1]));
+        assert_eq!(root.cycle_target(&ids[2], 1).as_ref(), Some(&ids[0]), "环形回头");
+        assert_eq!(root.cycle_target(&ids[0], -1).as_ref(), Some(&ids[2]), "环形往前");
+        assert_eq!(root.cycle_target(&ids[1], -1).as_ref(), Some(&ids[0]));
+        assert_eq!(root.cycle_target("不存在的 pane", 1), None);
+    }
+
+    /// 只有一个 tab 时 Ctrl+Tab 什么也不做(不是切到自己)。
+    #[test]
+    fn 单_tab_不切() {
+        let root = leaf("a", 1);
+        let id = root.panes()[0].id.clone();
+        assert_eq!(root.cycle_target(&id, 1), None);
+        assert_eq!(root.cycle_target(&id, -1), None);
+    }
+
+    /// 分屏之后 cycle 只在**自己那一格**里绕,不会跳到隔壁格。
+    #[test]
+    fn 环形切_tab_不跨格() {
+        let mut root = leaf("a", 1);
+        let a = root.panes()[0].id.clone();
+        root.insert_split(&a, SplitDirection::Horizontal, leaf("b", 2));
+        let b = root.pane_by_pty(2).unwrap().id.clone();
+        root.append_pane(Some(&b), pane("c", 3));
+
+        // 左格只有一个 tab —— 不动
+        assert_eq!(root.cycle_target(&a, 1), None);
+        // 右格两个 tab —— 在这两个之间绕
+        let c = root.pane_by_pty(3).unwrap().id.clone();
+        assert_eq!(root.cycle_target(&b, 1).as_deref(), Some(c.as_str()));
+        assert_eq!(root.cycle_target(&c, 1).as_deref(), Some(b.as_str()));
+    }
+
+    /// selectPaneByIndex:1-based,越界返回 None。
+    #[test]
+    fn 按序号选叶内_tab() {
+        let mut root = leaf("a", 1);
+        root.append_pane(None, pane("b", 2));
+        let ids: Vec<String> = root.panes().iter().map(|p| p.id.clone()).collect();
+
+        assert_eq!(root.pane_at_index(&ids[1], 1).as_ref(), Some(&ids[0]));
+        assert_eq!(root.pane_at_index(&ids[0], 2).as_ref(), Some(&ids[1]));
+        assert_eq!(root.pane_at_index(&ids[0], 3), None, "越界不动");
+        assert_eq!(root.pane_at_index(&ids[0], 0), None, "0 不是合法序号");
+    }
+
+    /// 退出 AI 会话(idle/error)连带清掉待续接标记 —— 否则下次启动又被 resume 回来。
+    #[test]
+    fn 状态回到_idle_时清掉待续接标记() {
+        let mut root = leaf("a", 1);
+        {
+            let p = root.pane_by_pty_mut(1).unwrap();
+            p.ai_session = Some(AiSessionRef {
+                agent: Some("claude".into()),
+                session_id: "s1".into(),
+                cwd: None,
+            });
+            p.resume_pending = true;
+        }
+        root.update_status_by_pty(1, PaneStatus::AiWorking, false, None);
+        assert!(root.pane_by_pty(1).unwrap().resume_pending, "AI 态不清标记");
+
+        root.update_status_by_pty(1, PaneStatus::Idle, false, None);
+        assert!(!root.pane_by_pty(1).unwrap().resume_pending);
     }
 
     #[test]
