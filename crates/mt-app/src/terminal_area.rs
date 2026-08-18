@@ -33,15 +33,17 @@ use std::collections::HashMap;
 
 use gpui::{
     AnyElement, App, AppContext, Bounds, ClickEvent, Context, Entity, InteractiveElement,
-    IntoElement, ParentElement, Pixels, Render, SharedString, Size, StatefulInteractiveElement,
-    Styled, Window, canvas, div, prelude::FluentBuilder, px,
+    IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Render, SharedString, Size,
+    StatefulInteractiveElement, Styled, Window, canvas, div, prelude::FluentBuilder, px,
 };
 use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel, v_resizable};
 use mt_ui::icons::{AiVendor, BrandIcon};
 
 use crate::focus_nav::{self, Direction, PaneRect};
 use crate::i18n::{t, tr};
+use crate::menu::{self, MenuEntry, MenuItem, hotkey_label};
 use crate::modal;
+use crate::pane_actions;
 use crate::store::AppStore;
 use crate::tree::{SplitDirection, SplitNode};
 use crate::ui;
@@ -90,6 +92,111 @@ fn sizes_to_percent(pixels: &[f64]) -> Option<Vec<f64>> {
         return None;
     }
     Some(pixels.iter().map(|p| p / total * 100.0).collect())
+}
+
+// ─── tab 右键菜单 ─────────────────────────────────────────────
+
+/// tab 右键菜单的**项序**。`None` = 分隔线。
+///
+/// 对照 `PaneGroup.tsx:336-383`。**跳过「分支会话 / 查看会话分支」** ——
+/// fork 那套(能力位表 / 家族树面板 / 自记账)在 GPUI 侧还没有;
+/// 原版那条「未获会话身份」的置灰提示同样属于 fork 位,一并不出现。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabMenuAction {
+    Rename,
+    SplitRight,
+    SplitDown,
+    CloseTab,
+    ClosePane,
+}
+
+fn tab_menu_actions() -> Vec<Option<TabMenuAction>> {
+    use TabMenuAction::*;
+    vec![
+        Some(Rename),
+        None,
+        Some(SplitRight),
+        Some(SplitDown),
+        None,
+        Some(CloseTab),
+        Some(ClosePane),
+    ]
+}
+
+/// 组装一个 tab 的右键菜单。`label` 是它当前的显示名(重命名的默认值)。
+fn tab_menu(
+    store: &Entity<AppStore>,
+    project_id: &str,
+    pane_id: &str,
+    label: &str,
+) -> Vec<MenuEntry> {
+    let mut entries = Vec::new();
+    for action in tab_menu_actions() {
+        let Some(action) = action else {
+            entries.push(menu::separator());
+            continue;
+        };
+        let store = store.clone();
+        let pid = project_id.to_string();
+        let pane = pane_id.to_string();
+        entries.push(match action {
+            TabMenuAction::Rename => {
+                let label = label.to_string();
+                MenuItem::new(t("paneGroup", "rename"))
+                    // 键位表见 main.rs 的 KeyBinding(F2 = RenamePane)
+                    .shortcut(hotkey_label(false, false, false, "F2"))
+                    .on_click(move |window, cx| {
+                        // 复用既有的重命名对话框(双击 tab 走的也是它)
+                        modal::open_rename_pane(
+                            store.clone(),
+                            pid.clone(),
+                            pane.clone(),
+                            label.clone(),
+                            window,
+                            cx,
+                        );
+                    })
+                    .into()
+            }
+            TabMenuAction::SplitRight => MenuItem::new(t("paneGroup", "splitRight"))
+                .shortcut(hotkey_label(true, true, false, "D"))
+                .on_click(move |window, cx| {
+                    store.update(cx, |store, cx| {
+                        store.split_pane(&pid, &pane, SplitDirection::Horizontal, window, cx);
+                    });
+                })
+                .into(),
+            TabMenuAction::SplitDown => MenuItem::new(t("paneGroup", "splitDown"))
+                .shortcut(hotkey_label(true, true, false, "E"))
+                .on_click(move |window, cx| {
+                    store.update(cx, |store, cx| {
+                        store.split_pane(&pid, &pane, SplitDirection::Vertical, window, cx);
+                    });
+                })
+                .into(),
+            // 关闭两项都走 pane_actions —— 与 tab 上的 ×、Ctrl+Shift+W 同一个
+            // AI 感知确认入口
+            TabMenuAction::CloseTab => MenuItem::new(t("paneGroup", "closeTab"))
+                .on_click(move |window, cx| {
+                    pane_actions::close_pane(store.clone(), pid.clone(), pane.clone(), window, cx);
+                })
+                .into(),
+            TabMenuAction::ClosePane => MenuItem::new(t("paneGroup", "closePane"))
+                .danger()
+                .shortcut(hotkey_label(true, true, false, "W"))
+                .on_click(move |window, cx| {
+                    pane_actions::close_leaf_of_pane(
+                        store.clone(),
+                        pid.clone(),
+                        pane.clone(),
+                        window,
+                        cx,
+                    );
+                })
+                .into(),
+        });
+    }
+    entries
 }
 
 impl TerminalArea {
@@ -289,9 +396,12 @@ impl TerminalArea {
             let pane_id_rename = pane.id.clone();
             let pid_click = pid.clone();
             let pane_id_close = pane.id.clone();
+            let pane_id_menu = pane.id.clone();
             let pid_close = pid.clone();
             let pid_rename = pid.clone();
+            let pid_menu = pid.clone();
             let label = pane.label().to_string();
+            let label_menu = label.clone();
             let has_unread = unread.get(idx).copied().unwrap_or(false);
             let vendor = vendors.get(idx).copied().flatten();
             bar = bar.child(
@@ -336,6 +446,16 @@ impl TerminalArea {
                             store.activate_pane(&pid_click, &pane_id, window, cx)
                         });
                     }))
+                    // tab 右键菜单(`PaneGroup.tsx` 的 paneContextMenu)
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            let entries =
+                                tab_menu(&this.store, &pid_menu, &pane_id_menu, &label_menu);
+                            menu::show(event.position, entries, window, cx);
+                        }),
+                    )
                     // 动画 id 拿 pane id 拼(跨帧稳定、逐 tab 唯一);**不能用循环
                     // 下标** —— 删掉中间一个 tab 会让后面所有状态灯的动画进度跳一格
                     .child(ui::status_dot(
@@ -379,11 +499,17 @@ impl TerminalArea {
                             .rounded(px(3.0))
                             .text_color(ui::text_muted())
                             .hover(|el| el.bg(ui::bg_overlay()).text_color(ui::color_error()))
-                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                            // tab 上的 × 与右键「关闭此终端」同一个入口:关之前
+                            // 盘点 AI 会话并确认(原版 `closePane` 默认 confirm)
+                            .on_click(cx.listener(move |this, _event, window, cx| {
                                 cx.stop_propagation();
-                                this.store.update(cx, |store, cx| {
-                                    store.close_pane(&pid_close, &pane_id_close, cx)
-                                });
+                                pane_actions::close_pane(
+                                    this.store.clone(),
+                                    pid_close.clone(),
+                                    pane_id_close.clone(),
+                                    window,
+                                    cx,
+                                );
                             }))
                             .child("×"),
                     ),
@@ -476,10 +602,15 @@ impl TerminalArea {
                         .id(gpui::SharedString::from(format!("close-leaf-{leaf}")))
                         .cursor_pointer()
                         .hover(|el| el.text_color(ui::color_error()))
-                        .on_click(cx.listener(move |this, _event, _window, cx| {
-                            this.store.update(cx, |store, cx| {
-                                store.close_leaf(&pid_close_leaf, &leaf_for_close, cx)
-                            });
+                        // 控制条的 × 关的是**整组**,同样先确认(原版 closeLeaf)
+                        .on_click(cx.listener(move |this, _event, window, cx| {
+                            pane_actions::close_leaf(
+                                this.store.clone(),
+                                pid_close_leaf.clone(),
+                                leaf_for_close.clone(),
+                                window,
+                                cx,
+                            );
                         }))
                         .child(ctrl("×")),
                 ),
@@ -703,6 +834,38 @@ mod tests {
         assert!(sizes_to_percent(&[0.0, 0.0]).is_none());
         assert!(sizes_to_percent(&[]).is_none());
         assert!(sizes_to_percent(&[f64::NAN]).is_none());
+    }
+
+    /// tab 右键菜单的项序照抄原版(去掉 fork 那一段),两条分隔线。
+    #[test]
+    fn tab_右键菜单项序与原版一致() {
+        use TabMenuAction::*;
+        let actions = tab_menu_actions();
+        assert_eq!(
+            actions,
+            vec![
+                Some(Rename),
+                None,
+                Some(SplitRight),
+                Some(SplitDown),
+                None,
+                Some(CloseTab),
+                Some(ClosePane),
+            ]
+        );
+        assert_eq!(actions.iter().filter(|a| a.is_none()).count(), 2);
+    }
+
+    /// 快捷键标签与 `main.rs` 里绑的键位一致(改键位时这条会提醒改标签)。
+    #[test]
+    fn tab_菜单快捷键标签() {
+        if cfg!(target_os = "macos") {
+            return;
+        }
+        assert_eq!(hotkey_label(false, false, false, "F2"), "F2");
+        assert_eq!(hotkey_label(true, true, false, "D"), "Ctrl+Shift+D");
+        assert_eq!(hotkey_label(true, true, false, "E"), "Ctrl+Shift+E");
+        assert_eq!(hotkey_label(true, true, false, "W"), "Ctrl+Shift+W");
     }
 
     /// 换算一圈回来不变形:百分比 → 像素 → 百分比。

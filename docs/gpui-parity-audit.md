@@ -29,21 +29,21 @@
 
 | # | 缺口 | 规模 | 落点 | 状态 |
 |---|---|---|---|---|
-| 7 | **上下文菜单基建**（gpui-component popup_menu）——挡住项目列表 12 项、文件树 8 项、tab 7 项、终端 5 项四处右键菜单 | 中 | mt-ui/mt-app | ❌ |
+| 7 | **上下文菜单基建** | 中 | mt-app | ✅ N 批自建 menu.rs（gpui-component 菜单四条硬伤记档：IconName 无资产/无 danger 态与快捷键标签/配色走它自己的 theme token/ContextMenu 包装器过不了 prefers_local_handling 闸门）；样式逐条对照 styles.css，勾选「✓ 」文本方案与原版一字不差；焦点开时收走关时先还再跑动作。遗留：键盘方向键导航、menuPopIn 进场动画、遮罩吃掉关闭那一下点击 |
 | 8 | **拖放基建**——项目拖拽排序、拖文件夹加项目、拖文件进终端（外部资源管理器 + 内部 FileTree 两条链路 + 虚线高亮框） | 中 | mt-ui + mt-app | ❌ |
 | 9 | **图标体系** | 中 | mt-ui | ✅ K 批组件（BrandIcon 11 家/TechIcon 12 种/FileIcon 53 类/StatusDot 四态勾叉+900ms 旋转；全自绘矢量，判据在 vector.rs 头注释）+ M 批消费（状态灯/tab 与会话面板品牌图标含 or_else(infer) 补 opencode/pi、项目列表 TechIcon、文件树 FileIcon、边条 44px 图标化逐点照抄 ActivityBar SVG + 全局 AI 徽标）。留：dirKinds 探测（TechIcon 现只认 kindOverride）、文件树 git 着色、项目行状态灯位置（原版行尾且 idle 不显示） |
-| 10 | **通用命令式弹窗**（prompt/confirm/alert）+ 关闭 pane/整组的 AI 感知确认框（现直接关不确认） | 小 | mt-app | ❌ |
+| 10 | **通用命令式弹窗 + 关闭确认** | 小 | mt-app | ✅ N 批。prompt/confirm/alert + open_guarded 按种类防叠开（不同种类可叠，摘表挂 on_close 五条关闭路全覆盖）；关闭确认盘点口径逐字照原版（status∈{ai-working,ai-idle} 不看 ai_session 身份），四条关闭路径统一走 pane_actions，确认后按 id 从最新布局重取；缺 2 词条 fileTree.dialog.createFailed*（原版该处也是静默失败，非回退） |
 | 11 | **终端滚动条** | 中 | mt-ui | ✅ K 批。6px 样式照抄 styles.css；alt screen 不画；不打穿 damage 缓存（只在 paint 发 quad）；滑块分母 total-screen；闲置按时间算 alpha 淡出（不用 with_animation 防持续请求帧）、回看中保留 50% 残留；宿主零改动默认生效 |
 
 ### 第 2 层：面板补全
 
 | # | 缺口 | 规模 | 落点 | 状态 |
 |---|---|---|---|---|
-| 12 | 项目列表：右键菜单 12+ 项 + 内联重命名（F2）+ 键盘（Enter/Delete）+ 底部三按钮 + 领位图标 + AI 厂商图标堆叠 + worktree 徽章/子项目缩进 + hover 250ms 缩略图 | 中 | mt-app | ❌ |
+| 12 | 项目列表补全 | 中 | mt-app | 🟡 N 批落地右键菜单可行项（重命名/编辑描述/资源管理器/复制路径/项目类型子菜单直喂 TechIcon/移除 danger；store 补 rename_project 与 set_project_description）；剩：内联重命名（F2）+ 键盘 + 底部三按钮 + AI 厂商图标堆叠 + worktree 徽章/子项目缩进 + hover 250ms 缩略图 + 菜单里 SSH/环境变量/Worktrees/分组项（随对应功能批） |
 | 13 | **项目分组**：分组行渲染 + 折叠 + createGroup/removeGroup/renameGroup/toggleGroupCollapse/moveItem 五个 action + 拖拽 + 分组右键菜单（`ProjectTreeItem::Group` 已有数据从不渲染） | 大 | mt-app | ❌ |
-| 14 | 文件树：右键菜单 8 项（后端 fs.rs 已备）+ 头部三按钮（搜索/刷新/外部编辑器选择器）+ loading/错误态 + 键盘导航 + git 状态着色 + 根级单链目录压缩 + 技术栈图标 | 中 | mt-app | ❌ |
-| 15 | tab 栏：右键菜单 7 项 + 新建按钮 shell 选择菜单 + 横向滚动 + hover 缩略图 + AI 品牌图标 + 关闭确认 | 中 | mt-app | ❌ |
-| 16 | 终端右键菜单（复制/粘贴/fork 会话/分支树/SSH 子菜单） | 中 | mt-app + mt-ui | 🟡 拖选停留复制+「已复制」气泡 ✅（K 组件+M 接线，selection_auto_copy_secs.unwrap_or(1.0) 对齐前端 ?? 1；设置项 UI 归 #19，接上时须连带给存量终端 set_selection_dwell）；右键菜单仍缺（→#7 基建批） |
+| 14 | 文件树补全 | 中 | mt-app | 🟡 N 批落地右键菜单（文件 8 项/目录 9 项/根空白新建两项，文件操作走 background executor，新建自动展开父目录；reveal 自落 explorer /select）；剩：头部三按钮（搜索/刷新/外部编辑器选择器）+ loading/错误态 + 键盘导航 + git 状态着色 + 根级单链目录压缩 + 技术栈图标 |
+| 15 | tab 栏补全 | 中 | mt-app | 🟡 N 批落地右键菜单（重命名/两向分屏/关闭两项含 danger 与快捷键标签）与关闭确认（#10）；M 批已加 AI 品牌图标；剩：新建按钮 shell 选择菜单 + 横向滚动 + hover 缩略图 + 分支会话两项（随 fork 批） |
+| 16 | 终端右键菜单 | 中 | mt-app + mt-ui | 🟡 停留复制+气泡 ✅（K+M）；N 批落地复制（无选区置灰）/粘贴（还焦点），与鼠标上报共存走 prefers_local_handling 同源判定（三模式×修饰键有单测）；剩 fork 会话/分支树/SSH 子菜单（随对应功能批） |
 | 17 | 用量面板：custom 自选起止日期 + 自动刷新档位（0/5/10/30/60s 默认 5s）+ 单项目下拉（现仅当前项目开关）+ 排行条点击切 scope + Top 会话点开查看 + 骨架屏/数字滚动 + 偏好持久化 + **价格表拉取**（原版 fetch models.dev，Rust 侧需 HTTP 依赖，现读本地 model-pricing.json 缺省按 $0） | 中 | mt-app | ❌ |
 | 18 | 会话面板：平铺⇄树视图切换 + scan_session_lineage 分支连线 + live pane 状态点跳转 + 品牌图标 + spinner；（SSH 远程来源等 mt-ssh 进 crates 后再说） | 中 | mt-app | ❌ |
 | 19 | 设置面板剩余 9 分页：clipboard / appearance / font / ai-notification / ai-hook / system / editor / shortcuts / about（通知三开关现只能手改 config.json）+ 连字/scrollback/UI 字号字族/终端字号热更新（现只作用于新终端） | 大 | mt-app | ❌ |

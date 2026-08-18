@@ -278,6 +278,64 @@ impl AppStore {
         cx.notify();
     }
 
+    /// 改项目显示名(`store.ts::renameProject`)。空名不接受 —— 列表上会变成
+    /// 一行只有路径的空条目,而原版的内联重命名框同样在空串时直接放弃。
+    pub fn rename_project(&mut self, id: &str, name: &str, cx: &mut Context<Self>) {
+        let name = name.trim();
+        if name.is_empty() {
+            return;
+        }
+        let Some(project) = self.config.projects.iter_mut().find(|p| p.id == id) else {
+            return;
+        };
+        if project.name == name {
+            return;
+        }
+        project.name = name.to_string();
+        self.save_config_soon(cx);
+        cx.notify();
+    }
+
+    /// 设置项目需求描述;空串 = 清除(`store.ts::setProjectDescription` 的
+    /// `description || undefined` 同语义 —— 存空串会让 `skip_serializing_if`
+    /// 失效,配置文件里留一堆 `"description": ""`)。
+    pub fn set_project_description(&mut self, id: &str, description: &str, cx: &mut Context<Self>) {
+        let next = match description.trim() {
+            "" => None,
+            text => Some(text.to_string()),
+        };
+        let Some(project) = self.config.projects.iter_mut().find(|p| p.id == id) else {
+            return;
+        };
+        if project.description == next {
+            return;
+        }
+        project.description = next;
+        self.save_config_soon(cx);
+        cx.notify();
+    }
+
+    /// 项目类型徽标覆盖:`None` = 自动探测,`Some("none")` = 不显示,
+    /// 其余是技术栈 key(直接喂 `TechIcon`)。对应 `ProjectList.tsx` 的
+    /// `setProjectKindOverride`(它是「改 config + 立刻落盘」两步)。
+    pub fn set_project_kind_override(
+        &mut self,
+        id: &str,
+        kind: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        let next = kind.map(|k| k.to_string());
+        let Some(project) = self.config.projects.iter_mut().find(|p| p.id == id) else {
+            return;
+        };
+        if project.kind_override == next {
+            return;
+        }
+        project.kind_override = next;
+        self.save_config_soon(cx);
+        cx.notify();
+    }
+
     /// 移除项目:先回收它所有 pane 的 PTY,再从配置里摘掉。
     pub fn remove_project(&mut self, id: &str, cx: &mut Context<Self>) {
         let pty_ids: Vec<u32> = self

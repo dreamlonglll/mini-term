@@ -24,12 +24,12 @@ use gpui::{
     PathPromptOptions, SharedString, StatefulInteractiveElement, Styled, Window, div,
     prelude::FluentBuilder, px,
 };
-use gpui_component::WindowExt as _;
 use gpui_component::dialog::DialogButtonProps;
 use gpui_component::input::{Input, InputState};
 use mt_config::ShellConfig;
 
 use crate::i18n::{Locale, t};
+use crate::prompt::{kind, open_guarded};
 use crate::shell_ops::{parse_args, valid_shell};
 use crate::store::AppStore;
 use crate::ui;
@@ -108,7 +108,9 @@ impl ShellForm {
 /// 打开「终端配置」。
 pub fn open_terminal_settings(store: Entity<AppStore>, window: &mut Window, cx: &mut App) {
     let form = cx.new(|cx| ShellForm::new(window, cx));
-    window.open_dialog(cx, move |dialog, window, cx| {
+    // 走 open_guarded 而不是 window.open_dialog:连按两次 Ctrl+, 会摞出两个
+    // 一模一样的设置框(见 `prompt::open_guarded` 的说明)。
+    open_guarded(kind::SETTINGS, window, cx, move |dialog, window, cx| {
         let body = render_terminal_settings(&store, &form, window, cx);
         dialog
             .title(t("settings", "title"))
@@ -467,7 +469,7 @@ pub fn open_rename_pane(
     // 打开即可直接改名,不必先点一下输入框
     input.update(cx, |state, cx| state.focus(window, cx));
 
-    window.open_dialog(cx, move |dialog, _window, _cx| {
+    open_guarded(kind::RENAME_PANE, window, cx, move |dialog, _window, _cx| {
         let store = store.clone();
         let project_id = project_id.clone();
         let pane_id = pane_id.clone();
@@ -506,7 +508,11 @@ pub fn open_confirm_remove_project(
     window: &mut Window,
     cx: &mut App,
 ) {
-    window.open_dialog(cx, move |dialog, _window, _cx| {
+    open_guarded(
+        kind::REMOVE_PROJECT,
+        window,
+        cx,
+        move |dialog, _window, _cx| {
         let store = store.clone();
         let project_id = project_id.clone();
         dialog
@@ -548,7 +554,8 @@ pub fn open_confirm_remove_project(
                 store.update(cx, |store, cx| store.remove_project(&project_id, cx));
                 true
             })
-    });
+        },
+    );
 }
 
 // ─── 添加项目 ─────────────────────────────────────────────────
@@ -564,7 +571,7 @@ pub fn open_add_project(store: Entity<AppStore>, window: &mut Window, cx: &mut A
         cx.new(|cx| InputState::new(window, cx).placeholder(t("projectList", "pathPlaceholder")));
     input.update(cx, |state, cx| state.focus(window, cx));
 
-    window.open_dialog(cx, move |dialog, _window, _cx| {
+    open_guarded(kind::ADD_PROJECT, window, cx, move |dialog, _window, _cx| {
         let store = store.clone();
         let input_for_ok = input.clone();
         let input_for_browse = input.clone();

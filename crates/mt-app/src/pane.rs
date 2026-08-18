@@ -35,15 +35,19 @@ use futures::StreamExt;
 use futures::channel::mpsc;
 use gpui::{
     App, AppContext, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    IntoElement, ParentElement, Pixels, Point, Render, Styled, Task, Window, div,
-    prelude::FluentBuilder, px,
+    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Point,
+    Render, Styled, Task, Window, div, prelude::FluentBuilder, px,
 };
 use mt_pty::{PtySession, PtySpawn};
 use mt_terminal::alacritty_terminal::event::Event as TermEvent;
+use mt_terminal::alacritty_terminal::term::TermMode;
 use mt_terminal::{TermSize, TerminalEmulator};
+use mt_ui::terminal::{MouseMods, prefers_local_handling};
 use mt_ui::{CopiedTip, DwellConfig, TerminalStyle, TerminalTheme, TerminalView};
 
 use crate::ai::AiBridge;
+use crate::i18n::t;
+use crate::menu::{self, MenuItem};
 
 /// pane 发给上层的事件。
 pub enum PaneEvent {
@@ -343,6 +347,13 @@ impl TerminalPane {
         window.focus(&self.focus);
     }
 
+    /// 当前有没有可复制的选区(空串不算 —— 选中一段空白后「复制」该是灰的)。
+    fn has_selection(&self) -> bool {
+        self.emulator
+            .with_term(|term| term.selection_to_string())
+            .is_some_and(|text| !text.is_empty())
+    }
+
     /// 换终端配色(主题包切换 / 亮暗切换)。
     ///
     /// 宿主这份 `theme` 也要更新 —— `.bg()` 与 OSC 调色板应答用得着。
@@ -372,6 +383,35 @@ impl TerminalPane {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 没开鼠标上报 = 本地菜单照弹(修饰键无关)。
+    #[test]
+    fn 未上报时右键弹本地菜单() {
+        let mode = TermMode::empty();
+        assert!(allows_local_menu(mode, false, false, false));
+        assert!(allows_local_menu(mode, true, false, false));
+    }
+
+    /// 应用抓着鼠标时右键让位给应用;**按住 Shift 强制借回本地**。
+    #[test]
+    fn 上报模式下只有_shift_能弹() {
+        for mode in [
+            TermMode::MOUSE_REPORT_CLICK,
+            TermMode::MOUSE_DRAG,
+            TermMode::MOUSE_MOTION,
+        ] {
+            assert!(!allows_local_menu(mode, false, false, false), "{mode:?}");
+            assert!(allows_local_menu(mode, true, false, false), "{mode:?}");
+            // Alt / Ctrl 不是借回手势,不许放行
+            assert!(!allows_local_menu(mode, false, true, false), "{mode:?}");
+            assert!(!allows_local_menu(mode, false, false, true), "{mode:?}");
+        }
+    }
+}
+
 impl Drop for TerminalPane {
     fn drop(&mut self) {
         // pane 实体被丢弃(项目移除 / 应用退出)时同样要回收 —— 否则后端留一个
@@ -388,8 +428,21 @@ impl Focusable for TerminalPane {
     }
 }
 
+/// 终端里的右键该弹**本地菜单**吗。
+///
+/// 判据只有一条,且必须与 mt-ui 的元素侧同源([`prefers_local_handling`]):
+/// 应用开着鼠标上报时右键属于**应用**(vim 的右键菜单、tmux 的选择),本地菜单
+/// 让位;按住 Shift 强制回本地 —— 这是终端界通行的「借回鼠标」手势。
+///
+/// 元素侧那份 `MouseDownEvent` 监听是 `window.on_mouse_event` 挂的、不吃
+/// `stop_propagation`,所以两边**各判各的**,这里判错就会出现「菜单弹出来了、
+/// 同时 vim 也收到了一次右键」。
+fn allows_local_menu(mode: TermMode, shift: bool, alt: bool, control: bool) -> bool {
+    prefers_local_handling(mode, MouseMods::new(shift, alt, control))
+}
+
 impl Render for TerminalPane {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(err) = self.spawn_error.clone() {
             return div()
                 .size_full()
@@ -408,6 +461,45 @@ impl Render for TerminalPane {
             .size_full()
             .relative()
             .bg(self.theme.background)
+            // 终端右键菜单(`TerminalInstance.tsx` 的 handleContextMenu):
+            // 只有「复制 / 粘贴」—— fork 会话、分支树、SSH 子菜单三段的功能
+            // GPUI 侧都还没有,不放占位。
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    let mods = event.modifiers;
+                    if !allows_local_menu(
+                        this.emulator.mode(),
+                        mods.shift,
+                        mods.alt,
+                        mods.control,
+                    ) {
+                        return;
+                    }
+                    cx.stop_propagation();
+                    let has_selection = this.has_selection();
+                    let view_copy = this.view.clone();
+                    let view_paste = this.view.clone();
+                    let focus = this.focus.clone();
+                    let entries = vec![
+                        MenuItem::new(t("terminal", "copy"))
+                            // 没有选区时置灰(原版 `disabled: !hasSelection`)
+                            .disabled(!has_selection)
+                            .on_click(move |_window, cx| {
+                                view_copy.update(cx, |view, cx| {
+                                    view.copy_selection(cx);
+                                });
+                            })
+                            .into(),
+                        menu::item(t("terminal", "paste"), move |window, cx| {
+                            view_paste.update(cx, |view, cx| view.paste(window, cx));
+                            // 粘完把键盘还给终端(原版 `term.focus()`)
+                            window.focus(&focus);
+                        }),
+                    ];
+                    menu::show(event.position, entries, window, cx);
+                }),
+            )
             .child(self.view.clone())
             // 「已复制」气泡:叠在终端之上,坐标是元素相对值
             .when_some(self.copied_tip, |el, origin| {

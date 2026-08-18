@@ -39,12 +39,16 @@ mod activity_bar;
 mod ai;
 mod file_tree;
 mod focus_nav;
+mod fs_ops;
 mod i18n;
+mod menu;
 mod modal;
 mod notify;
 mod pane;
+mod pane_actions;
 mod persist;
 mod project_list;
+mod prompt;
 mod session_panel;
 mod shell_ops;
 mod store;
@@ -155,6 +159,9 @@ pub fn app_data_dir() -> PathBuf {
 
 struct Workspace {
     store: Entity<AppStore>,
+    /// 右键菜单浮层。状态住在全局(任何视图都能 `menu::show`),这里只是把它
+    /// **画出来**的那个位置 —— 与 `Root::render_dialog_layer` 同一种分工。
+    menu_layer: Entity<menu::ContextMenu>,
     project_list: Entity<ProjectList>,
     file_tree: Entity<FileTree>,
     terminal_area: Entity<TerminalArea>,
@@ -233,6 +240,7 @@ impl Workspace {
 
         Self {
             store,
+            menu_layer: menu::layer(cx),
             project_list,
             file_tree,
             terminal_area,
@@ -320,13 +328,14 @@ impl Workspace {
 
     /// Ctrl+Shift+W = 关**整组**(原版 `closePane` 调的是 `closeLeaf`),
     /// 不是关当前这一个 tab —— 单个 tab 走 tab 上的 ×。
-    fn on_close_pane(&mut self, _: &ClosePane, _window: &mut Window, cx: &mut Context<Self>) {
+    ///
+    /// 走 [`pane_actions::close_leaf_of_pane`] 而不是直接调 store:关闭前要盘点
+    /// 组里活着的 AI 会话并确认(三条关闭路径共用同一个入口)。
+    fn on_close_pane(&mut self, _: &ClosePane, window: &mut Window, cx: &mut Context<Self>) {
         let Some((project_id, pane_id)) = self.target_pane(cx) else {
             return;
         };
-        self.store.update(cx, |store, cx| {
-            store.close_leaf_of_pane(&project_id, &pane_id, cx)
-        });
+        pane_actions::close_leaf_of_pane(self.store.clone(), project_id, pane_id, window, cx);
     }
 
     fn on_next_pane(&mut self, _: &NextPane, window: &mut Window, cx: &mut Context<Self>) {
@@ -770,12 +779,26 @@ impl Render for Workspace {
             // Modal 与通知层由 Root 持有,但要由应用视图**画出来**
             .children(Root::render_dialog_layer(window, cx))
             .children(Root::render_notification_layer(window, cx))
+            // 右键菜单层。零尺寸的绝对定位壳子 —— 菜单自己走 anchored(窗口坐标)
+            // + deferred,不参与这里的 flex 布局,收着的时候一个像素都不占。
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .w_0()
+                    .h_0()
+                    .child(self.menu_layer.clone()),
+            )
     }
 }
 
 fn main() {
     Application::new().run(|cx: &mut App| {
         gpui_component::init(cx);
+        // 右键菜单层的状态是全局的(项目列表 / 文件树 / tab / 终端四处都要弹),
+        // 必须早于任何视图建出来 —— 视图的右键回调里直接取它。
+        menu::init(cx);
         // 真正的主题在 store 装好之后按 config 装配(`apply_theme_from_config`):
         // 亮/暗/auto + 外置主题包 + 终端配色一次算全。这里先钉一个暗色兜底,
         // 免得从 init 到装配之间有一帧走 gpui-component 的默认亮色。
