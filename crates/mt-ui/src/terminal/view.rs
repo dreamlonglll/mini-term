@@ -114,6 +114,75 @@
 //!
 //! `self.view.update(cx, |v, cx| v.set_theme(theme, cx))`；`TerminalPane` 自己那份
 //! `theme` 字段仍要更新（`.bg()` 与 OSC 应答用得着）。
+//!
+//! # 后加的三件(滚动条 / 停留复制 / 背景图)——都是**可选**的
+//!
+//! 三样都有默认值，`TerminalView::new` 之后什么都不接也能跑：
+//! 滚动条默认**已开**（视觉照抄 `styles.css` 的 `::-webkit-scrollbar`），
+//! 停留复制默认**关**（维持「松手即复制」），背景图默认**无**。
+//!
+//! ## 5. 滚动条(可选)
+//!
+//! ```ignore
+//! // 默认就够用；只有要改宽度/淡出时长时才需要这行
+//! .scrollbar(mt_ui::ScrollbarStyle {
+//!     width: px(6.0),
+//!     fade_delay: std::time::Duration::from_millis(900),
+//!     ..Default::default()
+//! })
+//! ```
+//!
+//! 关掉：`ScrollbarStyle { enabled: false, ..Default::default() }`。
+//!
+//! ## 6. 拖选停留自动复制 +「已复制」气泡(可选)
+//!
+//! 原版是「按住左键、鼠标停住 `selectionAutoCopySecs` 秒」才复制并弹气泡，
+//! 不是松手就复制。接上它需要**两步**：
+//!
+//! ```ignore
+//! let this_for_tip = cx.weak_entity();
+//! TerminalView::new(…)
+//!     // ① 停留时长从 config 取（0 或缺省 = 关闭 = 维持现有的松手即复制）
+//!     .selection_dwell(mt_ui::DwellConfig::from_secs(
+//!         config.selection_auto_copy_secs.unwrap_or(1.0),
+//!     ))
+//!     // ② 复制发生时弹气泡；origin 是**元素相对**坐标，已按容器宽度贴边收拢
+//!     .on_selection_copied(move |_text, origin, _window, cx| {
+//!         let _ = this_for_tip.update(cx, |pane: &mut TerminalPane, cx| {
+//!             pane.copied_tip = Some(origin);
+//!             cx.notify();
+//!             // 1s 后自己撤掉（原版 tipTimer 就是这么做的）
+//!             cx.spawn(async move |pane, cx| {
+//!                 cx.background_executor().timer(Duration::from_secs(1)).await;
+//!                 let _ = pane.update(cx, |p, cx| { p.copied_tip = None; cx.notify(); });
+//!             })
+//!             .detach();
+//!         });
+//!     })
+//! ```
+//!
+//! 气泡本体用 [`mt_ui::CopiedTip`](crate::CopiedTip)，叠在终端之上：
+//!
+//! ```ignore
+//! div().size_full().relative()
+//!     .child(self.view.clone())
+//!     .when_some(self.copied_tip, |this, origin| {
+//!         this.child(
+//!             div().absolute().left(origin.x).top(origin.y)
+//!                 .child(mt_ui::CopiedTip::new(t("terminal.copied"))),
+//!         )
+//!     })
+//! ```
+//!
+//! ## 7. 背景图(可选，且**与窗口级二选一**)
+//!
+//! ```ignore
+//! self.view.update(cx, |v, cx| v.set_background_art(store.background_art().cloned(), cx));
+//! ```
+//!
+//! `AppStore::background_art()` 就是 `AppliedThemePack::background`。
+//! **更推荐窗口级铺**（原版就是挂在 `#root` 上，三栏都透着同一张图）——
+//! 见 [`crate::background`] 模块注释里的接法与 overdraw 提醒。
 
 use std::cell::Cell as StdCell;
 use std::ops::Range;
@@ -132,7 +201,10 @@ use super::damage::DamageStats;
 use super::element::{FrameGeometry, OnGridResize, OnInput, PreeditText, TerminalElement};
 use super::ime::{ImeState, commit_to_bytes};
 use super::input::{is_text_input_key, keystroke_to_bytes, paste_to_bytes};
+use super::scrollbar::ScrollbarStyle;
+use super::selection_dwell::{DwellConfig, OnSelectionCopied};
 use super::theme::{TerminalStyle, TerminalTheme};
+use crate::theme_bridge::BackgroundArt;
 
 pub struct TerminalView {
     id: ElementId,
@@ -147,6 +219,10 @@ pub struct TerminalView {
     damage: Rc<StdCell<DamageStats>>,
     on_input: Option<OnInput>,
     on_grid_resize: Option<OnGridResize>,
+    scrollbar: ScrollbarStyle,
+    dwell: DwellConfig,
+    on_selection_copied: Option<OnSelectionCopied>,
+    background_art: Option<BackgroundArt>,
 }
 
 impl TerminalView {
@@ -172,7 +248,63 @@ impl TerminalView {
             damage: Rc::new(StdCell::new(DamageStats::default())),
             on_input: None,
             on_grid_resize: None,
+            scrollbar: ScrollbarStyle::default(),
+            dwell: DwellConfig::default(),
+            on_selection_copied: None,
+            background_art: None,
         }
+    }
+
+    /// 滚动条外观(默认已开,见 [`ScrollbarStyle`])。
+    pub fn scrollbar(mut self, style: ScrollbarStyle) -> Self {
+        self.scrollbar = style;
+        self
+    }
+
+    /// 运行时换滚动条配置(设置页改宽度/淡出时长)。
+    pub fn set_scrollbar(&mut self, style: ScrollbarStyle, cx: &mut Context<Self>) {
+        if self.scrollbar != style {
+            self.scrollbar = style;
+            cx.notify();
+        }
+    }
+
+    /// 拖选停留自动复制。**不设 = 维持旧的「松手即复制」**,见 [`DwellConfig`]。
+    pub fn selection_dwell(mut self, dwell: DwellConfig) -> Self {
+        self.dwell = dwell;
+        self
+    }
+
+    /// 运行时改停留时长(`config.selectionAutoCopySecs` 变了就调这个)。
+    pub fn set_selection_dwell(&mut self, dwell: DwellConfig, cx: &mut Context<Self>) {
+        if self.dwell != dwell {
+            self.dwell = dwell;
+            cx.notify();
+        }
+    }
+
+    /// 复制发生时回调宿主(弹「已复制」气泡)。见 [`OnSelectionCopied`]。
+    pub fn on_selection_copied(
+        mut self,
+        f: impl Fn(&str, Point<Pixels>, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_selection_copied = Some(std::rc::Rc::new(f));
+        self
+    }
+
+    /// 只在**这个终端**底下铺主题包背景图。
+    ///
+    /// 原版是窗口级(`#root`),推荐仍走窗口级 —— 详见 [`crate::background`]
+    /// 模块注释里的 overdraw 提醒,两者别同时开。
+    pub fn background_art(mut self, art: Option<BackgroundArt>) -> Self {
+        self.background_art = art;
+        self
+    }
+
+    /// 换主题包时更新背景图(`AppStore::background_art()` 的产物)。
+    pub fn set_background_art(&mut self, art: Option<BackgroundArt>, cx: &mut Context<Self>) {
+        self.background_art = art;
+        cx.notify();
     }
 
     /// 视图要往 PTY 写字节时的出口。**所有**输入都走这一条:键盘、粘贴、
@@ -342,6 +474,9 @@ impl Render for TerminalView {
             text: p.text.clone().into(),
             cursor_byte: p.cursor_byte(),
         }))
+        .scrollbar(self.scrollbar.clone())
+        .selection_dwell(self.dwell)
+        .background_art(self.background_art.clone())
         .geometry_sink(self.geometry.clone())
         .damage_sink(self.damage.clone())
         // 每帧重新登记:`Window::handle_input` 只在**当前焦点是这个句柄**时才生效,
@@ -359,6 +494,10 @@ impl Render for TerminalView {
         }
         if let Some(cb) = self.on_input.clone() {
             element = element.on_input(move |bytes, window, cx| cb(bytes, window, cx));
+        }
+        if let Some(cb) = self.on_selection_copied.clone() {
+            element = element
+                .on_selection_copied(move |text, origin, window, cx| cb(text, origin, window, cx));
         }
 
         div()

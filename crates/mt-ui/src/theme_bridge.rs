@@ -20,18 +20,19 @@
 //! mt-config 只管「目录里有哪些包、原文是什么」。这条分界是 `theme_packs.rs`
 //! 模块注释里就写好的。
 //!
-//! # 背景图（未完成，见文件末尾 TODO）
+//! # 背景图
 //!
-//! 本轮只把**数据**准备好（[`BackgroundArt`]：图片路径、焦点、压暗、终端透明度），
-//! 渲染没做。终端侧「默认背景不发 quad」的路早就留好了，缺的是窗口级的
-//! 背景图 element 与 cover/contain 的 bounds 自算。
+//! 本模块只出**数据**（[`BackgroundArt`]：图片路径、焦点、压暗色），渲染在
+//! [`crate::background`]：cover/contain 的 bounds 自算 + `focus` 的百分比定位 +
+//! 压暗纱罩。终端侧「默认背景不发 quad」+ 半透明的 `TerminalTheme::background`
+//! 是它能透上来的前提，两边合起来才是一套。
 
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use gpui::{App, Hsla, Rgba, Window};
-use gpui_component::{Theme, ThemeConfig, ThemeMode};
+use gpui_component::{Theme, ThemeConfig, ThemeMode, ThemeRegistry};
 use serde::Deserialize;
 
 use crate::terminal::{TerminalTheme, rgb8};
@@ -435,6 +436,16 @@ pub struct AppliedThemePack {
     pub theme_id: String,
     pub name: String,
     pub appearance: Appearance,
+    /// 主题包声明的 10 个语义色**原文**（`panel` / `panelAlt` / `muted` / `line` …）。
+    ///
+    /// `gpui_theme` 只承载 gpui-component 认得的那套键，而 mt-app 的壳配色表
+    /// （`ui.rs` 里 `bg_surface` / `bg_elevated` / `text_muted` / `border_*` 那一串）
+    /// 是 mini-term 自己的语义，两边不是一一对应。少了这份原文，宿主就得绕开
+    /// [`switch_to_theme_pack`] 自己手拆四步（read → parse → resolve → install）
+    /// 才拿得到 —— 所以直接带出来。
+    ///
+    /// 要 `Hsla` 用 [`Self::color`]。
+    pub colors: ThemePackColors,
     /// 递给 [`crate::TerminalElement`] / `TerminalView` 的终端配色。
     pub terminal: TerminalTheme,
     /// 递给 gpui-component 主题层的配置。
@@ -443,6 +454,59 @@ pub struct AppliedThemePack {
     pub background: Option<BackgroundArt>,
     /// 面板不透明度（背景图模式下 UI 表面要半透明才看得见图）。
     pub surface_opacity: f32,
+}
+
+/// [`AppliedThemePack::colors`] 里的一个语义槽位。
+///
+/// 命名与 theme.json 的键一致（camelCase → 这里的蛇形），与
+/// `src/utils/themePackManager.ts` 往 CSS 变量里塞的那批是同一批。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ThemeSlot {
+    /// 窗口底色 `--bg-base`
+    Background,
+    /// 面板底色 `--bg-surface`
+    Panel,
+    /// 次级面板 / 悬浮层 `--bg-elevated`
+    PanelAlt,
+    /// 强调色 `--accent`
+    Accent,
+    /// 主文本 `--text-primary`
+    Text,
+    /// 次要文本 `--text-muted`
+    Muted,
+    /// 分隔线 `--border-default`
+    Line,
+    /// 第二强调色（可选，未声明时回落 `Accent`）
+    AccentAlt,
+    /// 辅助色（可选，回落 `Accent`）
+    Secondary,
+    /// 高亮色（可选，回落 `Accent`）
+    Highlight,
+}
+
+impl AppliedThemePack {
+    /// 取某个语义色。可选槽位未声明时回落到 `accent`——与
+    /// `themePackManager.ts` 写 CSS 变量时的回落一致（那边是
+    /// `c.accentAlt ?? c.accent`）。
+    ///
+    /// 色值在 [`parse_theme_pack`] 阶段就校验过，这里不会失败。
+    pub fn color(&self, slot: ThemeSlot) -> Hsla {
+        let c = &self.colors;
+        let fallback = || color_or(&c.accent, Hsla::default());
+        let pick = |v: &Option<String>| v.as_ref().map(|s| color_or(s, fallback()));
+        match slot {
+            ThemeSlot::Background => color_or(&c.background, Hsla::default()),
+            ThemeSlot::Panel => color_or(&c.panel, Hsla::default()),
+            ThemeSlot::PanelAlt => color_or(&c.panel_alt, Hsla::default()),
+            ThemeSlot::Accent => fallback(),
+            ThemeSlot::Text => color_or(&c.text, Hsla::default()),
+            ThemeSlot::Muted => color_or(&c.muted, Hsla::default()),
+            ThemeSlot::Line => color_or(&c.line, Hsla::default()),
+            ThemeSlot::AccentAlt => pick(&c.accent_alt).unwrap_or_else(fallback),
+            ThemeSlot::Secondary => pick(&c.secondary).unwrap_or_else(fallback),
+            ThemeSlot::Highlight => pick(&c.highlight).unwrap_or_else(fallback),
+        }
+    }
 }
 
 fn surface_opacity_of(effects: &ThemePackEffects) -> f32 {
@@ -701,6 +765,7 @@ pub fn resolve_theme_pack(def: &ThemePackDef, dir: Option<&Path>) -> AppliedThem
         theme_id: def.id.clone(),
         name: def.name.clone(),
         appearance: def.appearance,
+        colors: def.colors.clone(),
         terminal: to_terminal_theme(def, with_background),
         gpui_theme: to_gpui_theme_config(def, with_background),
         background,
@@ -760,13 +825,42 @@ pub fn switch_to_theme_pack(
 }
 
 /// 退出皮肤，回内置明暗态。返回该明暗的内置终端配色。
+///
+/// ⚠️ **不能只调 `Theme::change`**。[`install_gpui_theme`] 是把皮肤的
+/// `ThemeConfig` **持久写进** `Theme::dark_theme` / `light_theme` 的
+/// —— 那两个字段就是「这个明暗态长什么样」的唯一来源。只切 mode 的话
+/// 全局主题仍然指着皮肤那份配置，面板/按钮/浮层会原地停在皮肤配色上，
+/// 用户会看到「退出皮肤了但界面没变」。所以这里必须先把两份配置从
+/// `ThemeRegistry` 的内置基线恢复回去，再切 mode。
 pub fn switch_to_builtin(
     appearance: Appearance,
     window: Option<&mut Window>,
     cx: &mut App,
 ) -> TerminalTheme {
+    restore_builtin_gpui_theme(cx);
     Theme::change(appearance.theme_mode(), window, cx);
     builtin_terminal_theme(appearance)
+}
+
+/// 把 gpui-component 全局主题的明暗两份配置恢复成内置基线。
+///
+/// 单独暴露是给「只想撤掉皮肤、暂时不切明暗」的宿主用（比如主题包读取失败
+/// 要回退时）。调完记得 `Theme::change(mode, window, cx)` 让窗口重绘。
+pub fn restore_builtin_gpui_theme(cx: &mut App) {
+    if !cx.has_global::<Theme>() {
+        // 还没 init 过：没有被污染的字段，也就没什么好恢复的
+        return;
+    }
+    let (light, dark) = {
+        let registry = ThemeRegistry::global(cx);
+        (
+            registry.default_light_theme().clone(),
+            registry.default_dark_theme().clone(),
+        )
+    };
+    let theme = Theme::global_mut(cx);
+    theme.light_theme = light;
+    theme.dark_theme = dark;
 }
 
 /// 扫一遍 themes/ 目录，返回能用的包（坏包跳过并打日志，不阻塞列表）。
@@ -783,17 +877,13 @@ pub fn list_theme_packs(packs: &mt_config::ThemePacks) -> Result<Vec<(ThemePackD
     Ok(out)
 }
 
-// TODO(背景图，本轮未做)：
-// 1. 数据已经齐了（[`BackgroundArt`]：图片路径 / 焦点 / 压暗色）；
-// 2. 缺的是一个窗口级的背景 element：`img(path)` 铺在三栏之下，按 cover 语义
-//    自算 bounds —— 容器宽高比 vs 图片宽高比，取较大的缩放系数，
-//    再按 focus 把溢出的那一维平移 `(container - scaled) * focus`；
-//    contain 是取较小系数 + 居中，两者共用同一个函数，差一个 `min`/`max`；
-// 3. 压暗层就是在图上盖一个 `fill(bounds, art.dim)` 的 quad；
-// 4. 终端侧的路已经通了：「默认背景不发 quad」+ 本模块给的半透明 `background`，
-//    背景图会自动透上来，**不需要改 TerminalElement 一行**；
-// 5. 唯一要留神的是 overdraw：三栏面板都半透明时会叠好几层，
-//    `docs/gpui-migration.md` 第 5 节的坑位表里点了这条。
+// 背景图渲染已落在 [`crate::background`]：
+//   - `fit_bounds` 按 cover/contain 算 bounds（取较大/较小缩放系数，
+//     再按 focus 平移 `(container - scaled) * focus`）；
+//   - `BackgroundArtElement` 画图 + 盖一层 `fill(bounds, art.dim)` 的纱罩；
+//   - 终端侧不用改一行：「默认背景不发 quad」+ 本模块给的半透明 `background`。
+// 仍要留神的是 overdraw：窗口级铺一张之后**不要**再给每个终端铺一张
+// （两层纱罩会把 dim 平方），`docs/gpui-migration.md` 第 5 节的坑位表里点了这条。
 
 #[cfg(test)]
 mod tests {
@@ -936,6 +1026,33 @@ mod tests {
         assert!(applied.background.is_none());
         // 终端不能被透明化 —— 否则用户看到的是一个纯黑窗口
         assert_eq!(applied.terminal.background.a, 1.0);
+    }
+
+    #[test]
+    fn 产物带出主题包的十个语义色原文() {
+        // mt-app 的壳配色表(bg_surface / text_muted / border_* …)要的是这份原文,
+        // gpui_theme 那份键名对不上。少了它宿主只能绕开 switch_to_theme_pack 手拆四步
+        // 注意 minimal_json 的 extra 是插在 colors **之后**(根级),
+        // 可选语义色必须写进 colors 里面,所以这条自己拼
+        let json = minimal_json("").replace(
+            r##""line": "#404040""##,
+            r##""line": "#404040", "accentAlt": "#f0b429", "highlight": "#7bd88f""##,
+        );
+        let def = parse_theme_pack("t", &json).unwrap();
+        let applied = resolve_theme_pack(&def, None);
+        assert_eq!(applied.colors.panel, "#202020");
+        assert_eq!(applied.colors.panel_alt, "#303030");
+        assert_eq!(to_hex(applied.color(ThemeSlot::Panel)), "#202020ff");
+        assert_eq!(to_hex(applied.color(ThemeSlot::PanelAlt)), "#303030ff");
+        assert_eq!(to_hex(applied.color(ThemeSlot::Muted)), "#888888ff");
+        assert_eq!(to_hex(applied.color(ThemeSlot::Line)), "#404040ff");
+        assert_eq!(to_hex(applied.color(ThemeSlot::AccentAlt)), "#f0b429ff");
+        assert_eq!(to_hex(applied.color(ThemeSlot::Highlight)), "#7bd88fff");
+        // 可选槽位没写就回落 accent —— 与 themePackManager.ts 的 `?? c.accent` 同
+        assert_eq!(
+            to_hex(applied.color(ThemeSlot::Secondary)),
+            to_hex(applied.color(ThemeSlot::Accent))
+        );
     }
 
     #[test]

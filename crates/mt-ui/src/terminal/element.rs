@@ -52,15 +52,16 @@ use std::cell::{Cell as StdCell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use alacritty_terminal::grid::Scroll;
+use alacritty_terminal::grid::{Dimensions as _, Scroll};
 use alacritty_terminal::index::{Column, Line, Point as AlacPoint, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::TermMode;
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::vte::ansi::CursorShape;
 use gpui::{
-    App, Bounds, ClipboardItem, ContentMask, DispatchPhase, Element, ElementId, FocusHandle,
+    App, Bounds, ClipboardItem, ContentMask, Corners, DispatchPhase, Element, ElementId, FocusHandle,
     FontId, GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement,
     LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point,
     ScrollDelta, ScrollWheelEvent, ShapedLine, SharedString, Size, Style, StrikethroughStyle,
@@ -74,7 +75,11 @@ use super::mouse::{
     GridPos, MouseAction, MouseBtn, MouseMods, WheelDir, alt_screen_scroll_bytes,
     mouse_report_bytes, mouse_reporting_active, prefers_local_handling,
 };
+use super::scrollbar::{self, ScrollbarDrag, ScrollbarHit, ScrollbarLayout, ScrollbarStyle};
+use super::selection_dwell::{DwellConfig, DwellTracker, OnSelectionCopied, ReleaseAction};
 use super::theme::{TerminalStyle, TerminalTheme};
+use crate::background::BackgroundArtElement;
+use crate::theme_bridge::BackgroundArt;
 
 /// 一屏最多认多少列/行。窗口被拖到荒谬尺寸时防止 grid 爆掉。
 const MAX_COLUMNS: usize = 1024;
@@ -136,6 +141,10 @@ pub struct TerminalElement {
     preedit: Option<PreeditText>,
     geometry_sink: Option<Rc<StdCell<FrameGeometry>>>,
     damage_sink: Option<Rc<StdCell<DamageStats>>>,
+    scrollbar: ScrollbarStyle,
+    dwell: DwellConfig,
+    on_selection_copied: Option<OnSelectionCopied>,
+    background_art: Option<BackgroundArtElement>,
 }
 
 impl TerminalElement {
@@ -158,7 +167,41 @@ impl TerminalElement {
             preedit: None,
             geometry_sink: None,
             damage_sink: None,
+            scrollbar: ScrollbarStyle::default(),
+            // 默认 `Duration::ZERO` = 停留语义关闭,维持「松手即复制」的旧行为
+            dwell: DwellConfig::default(),
+            on_selection_copied: None,
+            background_art: None,
         }
+    }
+
+    /// 滚动条外观与行为。见 [`ScrollbarStyle`];`enabled: false` 可整条关掉。
+    pub fn scrollbar(mut self, style: ScrollbarStyle) -> Self {
+        self.scrollbar = style;
+        self
+    }
+
+    /// 拖选停留自动复制。见 [`DwellConfig`] —— **不设就是旧的「松手即复制」**。
+    pub fn selection_dwell(mut self, dwell: DwellConfig) -> Self {
+        self.dwell = dwell;
+        self
+    }
+
+    /// 复制发生时通知宿主(弹「已复制」气泡)。见 [`OnSelectionCopied`]。
+    pub fn on_selection_copied(
+        mut self,
+        f: impl Fn(&str, Point<Pixels>, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_selection_copied = Some(Rc::new(f));
+        self
+    }
+
+    /// 在 grid **底下**铺一层主题包背景图。
+    ///
+    /// 窗口级已经铺过就别再开这个(见 [`crate::background`] 的 overdraw 提醒)。
+    pub fn background_art(mut self, art: Option<BackgroundArt>) -> Self {
+        self.background_art = art.map(BackgroundArtElement::new);
+        self
     }
 
     /// grid 尺寸变了就回调。宿主在这里把 PTY resize 到同样的 rows/cols。
@@ -214,6 +257,16 @@ struct TerminalElementState {
     last_reported_cell: Rc<StdCell<Option<(usize, usize)>>>,
     /// 行渲染缓存,见 [`super::damage`]。
     rows: Rc<RefCell<RowCache<Rc<RowRender>>>>,
+    /// 滚动条的拖动/悬停状态。
+    scrollbar: Rc<StdCell<ScrollbarDrag>>,
+    /// 上一次「滚动条该亮起来」的时刻(滚动、拖动、悬停)。淡出计时的起点。
+    scrollbar_touched: Rc<StdCell<Option<Instant>>>,
+    /// 上一帧的 display_offset。变了就说明滚过,滚动条要重新亮起。
+    last_offset: Rc<StdCell<usize>>,
+    /// 拖选停留复制的状态机。
+    dwell: Rc<RefCell<DwellTracker>>,
+    /// 在飞的 dwell 定时器。**必须留着句柄** —— gpui 的 `Task` 一 drop 就取消。
+    dwell_task: Rc<RefCell<Option<gpui::Task<()>>>>,
 }
 
 impl Default for TerminalElementState {
@@ -224,6 +277,11 @@ impl Default for TerminalElementState {
             reported_button: Rc::new(StdCell::new(None)),
             last_reported_cell: Rc::new(StdCell::new(None)),
             rows: Rc::new(RefCell::new(RowCache::new())),
+            scrollbar: Rc::new(StdCell::new(ScrollbarDrag::default())),
+            scrollbar_touched: Rc::new(StdCell::new(None)),
+            last_offset: Rc::new(StdCell::new(0)),
+            dwell: Rc::new(RefCell::new(DwellTracker::default())),
+            dwell_task: Rc::new(RefCell::new(None)),
         }
     }
 }
@@ -275,6 +333,8 @@ pub struct PreparedFrame {
     /// 光标(已换算到元素相对坐标)。
     cursor: Option<CursorLayout>,
     preedit: Option<PreeditLayout>,
+    /// 滚动条几何。`None` = 这一帧不画(无回看缓冲 / alt screen / 被关掉)。
+    scrollbar: Option<ScrollbarLayout>,
 }
 
 // 「这个字符在这套字体里的步进正好是一列宽吗」的缓存。
@@ -391,6 +451,67 @@ impl TerminalElement {
         AlacPoint::new(Line(row as i32 - display_offset as i32), Column(col))
     }
 
+    /// 滚动条的两个 quad(轨道可选 + 滑块)。
+    ///
+    /// 淡出是「按时间算 alpha + 没淡完就再要一帧」,不走 `with_animation` ——
+    /// 那玩意要求一个稳定的 ElementId 且会持续请求帧,而滚动条**大多数时候
+    /// 应该是完全静止的**,空转帧对一个终端来说太贵。
+    fn paint_scrollbar(&self, prepared: &PreparedFrame, window: &mut Window) {
+        let Some(layout) = prepared.scrollbar else {
+            return;
+        };
+        let drag = prepared.state.scrollbar.get();
+        let idle = prepared
+            .state
+            .scrollbar_touched
+            .get()
+            .map(|t| t.elapsed())
+            .unwrap_or(Duration::MAX);
+        let active = drag.active();
+        let alpha = scrollbar::alpha(&self.scrollbar, idle, active, layout.at_bottom());
+
+        if alpha > 0.004 {
+            if let Some(track) = self.scrollbar.track {
+                window.paint_quad(
+                    fill(
+                        layout.track,
+                        Hsla {
+                            a: track.a * alpha,
+                            ..track
+                        },
+                    )
+                    .corner_radii(Corners::all(self.scrollbar.radius)),
+                );
+            }
+            let base = if active {
+                self.scrollbar.thumb_active.unwrap_or(Hsla {
+                    a: self.scrollbar.active_alpha,
+                    ..self.theme.foreground
+                })
+            } else {
+                self.scrollbar.thumb.unwrap_or(Hsla {
+                    a: self.scrollbar.idle_alpha,
+                    ..self.theme.foreground
+                })
+            };
+            window.paint_quad(
+                fill(
+                    layout.thumb,
+                    Hsla {
+                        a: base.a * alpha,
+                        ..base
+                    },
+                )
+                .corner_radii(Corners::all(self.scrollbar.radius)),
+            );
+        }
+
+        // 淡出还没走完就再要一帧;走完了就此打住,不空转
+        if scrollbar::needs_animation_frame(&self.scrollbar, idle, active) {
+            window.request_animation_frame();
+        }
+    }
+
     fn paint_mouse_listeners(&self, prepared: &PreparedFrame, window: &mut Window, _cx: &mut App) {
         let hitbox = prepared.hitbox.clone();
         let origin = prepared.origin;
@@ -400,6 +521,13 @@ impl TerminalElement {
         let state = prepared.state.clone();
         let mode = prepared.mode;
         let alt_screen = mode.contains(TermMode::ALT_SCREEN);
+        let bar = prepared.scrollbar;
+        let element_size = (
+            f32::from(prepared.hitbox.bounds.size.width),
+            f32::from(prepared.hitbox.bounds.size.height),
+        );
+        // 6px 的条子精确命中太难点,左右各放宽 3px(与原生滚动条的手感一致)
+        const GRAB_SLACK: Pixels = px(3.0);
 
         // ── 滚轮
         //
@@ -411,6 +539,7 @@ impl TerminalElement {
             let hitbox = hitbox.clone();
             let remainder = state.scroll_remainder.clone();
             let on_input = self.on_input.clone();
+            let touched = state.scrollbar_touched.clone();
             let app_cursor = mode.contains(TermMode::APP_CURSOR);
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
                 if phase != DispatchPhase::Bubble || !hitbox.should_handle_scroll(window) {
@@ -468,6 +597,8 @@ impl TerminalElement {
                 }
 
                 emulator.with_term_mut(|term| term.scroll_display(Scroll::Delta(whole as i32)));
+                // 滚了就把滚动条亮起来(淡出重新计时)
+                touched.set(Some(Instant::now()));
                 window.refresh();
             });
         }
@@ -480,6 +611,13 @@ impl TerminalElement {
             let reported = state.reported_button.clone();
             let last_cell = state.last_reported_cell.clone();
             let on_input = self.on_input.clone();
+            let bar_drag = state.scrollbar.clone();
+            let touched = state.scrollbar_touched.clone();
+            let dwell_state = state.dwell.clone();
+            let dwell_task = state.dwell_task.clone();
+            let dwell_cfg = self.dwell;
+            let this_emulator = self.emulator.clone();
+            let on_copied = self.on_selection_copied.clone();
             window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
                 if phase != DispatchPhase::Bubble || !hitbox.is_hovered(window) {
                     return;
@@ -487,6 +625,42 @@ impl TerminalElement {
                 let mods = modifiers_of(&event.modifiers);
                 let (col, row, side) =
                     Self::hit_cell(event.position, origin, cell_size, columns, screen_lines);
+
+                // ── 滚动条先于一切:滑块上按下只能是拖滚动条,不能顺带起一个选区,
+                //    也不能被鼠标上报吃掉(TUI 收到一个它没法解释的点击更糟)
+                if let Some(layout) = bar
+                    && event.button == MouseButton::Left
+                {
+                    match layout.hit(event.position, GRAB_SLACK) {
+                        ScrollbarHit::Thumb => {
+                            let grab =
+                                f32::from(event.position.y) - f32::from(layout.thumb.origin.y);
+                            bar_drag.set(ScrollbarDrag {
+                                grab_offset: Some(grab),
+                                hovered: true,
+                            });
+                            touched.set(Some(Instant::now()));
+                            window.refresh();
+                            return;
+                        }
+                        ScrollbarHit::Track => {
+                            let target = layout.offset_for_track_click(event.position);
+                            let delta = target as i32 - layout.display_offset as i32;
+                            if delta != 0 {
+                                this_emulator
+                                    .with_term_mut(|t| t.scroll_display(Scroll::Delta(delta)));
+                            }
+                            bar_drag.set(ScrollbarDrag {
+                                grab_offset: None,
+                                hovered: true,
+                            });
+                            touched.set(Some(Instant::now()));
+                            window.refresh();
+                            return;
+                        }
+                        ScrollbarHit::Miss => {}
+                    }
+                }
 
                 if !prefers_local_handling(mode, mods) {
                     let Some(btn) = map_button(event.button) else {
@@ -529,6 +703,29 @@ impl TerminalElement {
                     ));
                 });
                 selecting.set(event.click_count == 1);
+
+                // ── 拖选停留复制:按下就起表(停留语义关掉时 on_press 返回 None)
+                // 存**元素相对**坐标:气泡落点要按元素宽度贴边收拢
+                //(原版是 `lastX - rect.left`),存绝对坐标会让分屏右侧的终端算歪
+                let generation = dwell_state.borrow_mut().on_press(
+                    &dwell_cfg,
+                    (
+                        f32::from(event.position.x - origin.x),
+                        f32::from(event.position.y - origin.y),
+                    ),
+                );
+                if let Some(generation) = generation {
+                    *dwell_task.borrow_mut() = Some(arm_dwell(
+                        generation,
+                        dwell_cfg,
+                        dwell_state.clone(),
+                        this_emulator.clone(),
+                        on_copied.clone(),
+                        element_size,
+                        window,
+                        cx,
+                    ));
+                }
                 window.refresh();
             });
         }
@@ -541,10 +738,68 @@ impl TerminalElement {
             let reported = state.reported_button.clone();
             let last_cell = state.last_reported_cell.clone();
             let on_input = self.on_input.clone();
+            let bar_drag = state.scrollbar.clone();
+            let touched = state.scrollbar_touched.clone();
+            let dwell_state = state.dwell.clone();
+            let dwell_task = state.dwell_task.clone();
+            let dwell_cfg = self.dwell;
+            let on_copied = self.on_selection_copied.clone();
+            let this_emulator = self.emulator.clone();
             window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
                 if phase != DispatchPhase::Bubble {
                     return;
                 }
+
+                // ── 拖着滑块:全局跟手,拖出元素也继续(和所有滚动条一样)
+                if let Some(layout) = bar {
+                    let drag = bar_drag.get();
+                    if let Some(grab) = drag.grab_offset {
+                        let target = layout
+                            .offset_for_thumb_top(px(f32::from(event.position.y) - grab));
+                        let delta = target as i32 - layout.display_offset as i32;
+                        if delta != 0 {
+                            this_emulator.with_term_mut(|t| t.scroll_display(Scroll::Delta(delta)));
+                        }
+                        touched.set(Some(Instant::now()));
+                        window.refresh();
+                        return;
+                    }
+                    let hovered = hitbox.is_hovered(window)
+                        && layout.hit(event.position, GRAB_SLACK) != ScrollbarHit::Miss;
+                    if hovered != drag.hovered {
+                        bar_drag.set(ScrollbarDrag { hovered, ..drag });
+                        touched.set(Some(Instant::now()));
+                        window.refresh();
+                    }
+                    // 悬在条上时不要顺手延伸选区;已经在拖选的除外(选区拖过条子底下)
+                    if hovered && !selecting.get() {
+                        return;
+                    }
+                } else if bar_drag.get() != ScrollbarDrag::default() {
+                    bar_drag.set(ScrollbarDrag::default());
+                }
+
+                // ── 停留复制:越过 4px 阈值才重新计时
+                let rearm = dwell_state.borrow_mut().on_move(
+                    &dwell_cfg,
+                    (
+                        f32::from(event.position.x - origin.x),
+                        f32::from(event.position.y - origin.y),
+                    ),
+                );
+                if let Some(generation) = rearm {
+                    *dwell_task.borrow_mut() = Some(arm_dwell(
+                        generation,
+                        dwell_cfg,
+                        dwell_state.clone(),
+                        this_emulator.clone(),
+                        on_copied.clone(),
+                        element_size,
+                        window,
+                        cx,
+                    ));
+                }
+
                 let mods = modifiers_of(&event.modifiers);
                 let held = reported.get();
 
@@ -602,8 +857,26 @@ impl TerminalElement {
             let reported = state.reported_button.clone();
             let last_cell = state.last_reported_cell.clone();
             let on_input = self.on_input.clone();
+            let bar_drag = state.scrollbar.clone();
+            let touched = state.scrollbar_touched.clone();
+            let dwell_state = state.dwell.clone();
+            let dwell_task = state.dwell_task.clone();
+            let dwell_cfg = self.dwell;
             window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
                 if phase != DispatchPhase::Bubble {
+                    return;
+                }
+
+                // ── 松开滑块。**不判 hover**:拖到窗口外松手也得收尾,
+                //    否则滑块会一直粘在鼠标上
+                let drag = bar_drag.get();
+                if drag.grab_offset.is_some() && event.button == MouseButton::Left {
+                    bar_drag.set(ScrollbarDrag {
+                        grab_offset: None,
+                        ..drag
+                    });
+                    touched.set(Some(Instant::now()));
+                    window.refresh();
                     return;
                 }
                 // 按下时上报过的键,松开必须配对上报 —— 否则 TUI 会一直以为鼠标还按着。
@@ -635,17 +908,81 @@ impl TerminalElement {
                     return;
                 }
 
-                if event.button != MouseButton::Left || !selecting.replace(false) {
+                if event.button != MouseButton::Left {
                     return;
                 }
-                if let Some(text) = emulator.with_term(|t| t.selection_to_string())
-                    && !text.is_empty()
-                {
-                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                let was_selecting = selecting.replace(false);
+                // 定时器一律作废:松手之后不该再弹「已复制」
+                dwell_task.borrow_mut().take();
+                let action = dwell_state.borrow_mut().on_release(&dwell_cfg);
+                match action {
+                    // 停留语义关掉 = 旧行为,松手即复制(X11 primary selection 的习惯)
+                    ReleaseAction::CopyNow if was_selecting => {
+                        if let Some(text) = emulator.with_term(|t| t.selection_to_string())
+                            && !text.is_empty()
+                        {
+                            cx.write_to_clipboard(ClipboardItem::new_string(text));
+                        }
+                    }
+                    // 停留期间已经复制过一次:拖到边缘触发自动滚屏时选区可能还在长,
+                    // 松手时若已变化就补一刀,让剪贴板与用户最终看到的选区一致。
+                    // **不重弹气泡** —— 「已复制」对最终内容依然成立。
+                    ReleaseAction::ReconcileIfChanged => {
+                        let text = emulator
+                            .with_term(|t| t.selection_to_string())
+                            .unwrap_or_default();
+                        if !text.is_empty() && dwell_state.borrow().needs_reconcile(&text) {
+                            cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                            dwell_state.borrow_mut().note_copied(text);
+                        }
+                    }
+                    _ => {}
                 }
             });
         }
     }
+}
+
+/// 起一个 dwell 定时器。返回的 `Task` **必须被宿主持有** —— 一 drop 就取消,
+/// 这正好是「鼠标动了要重新计时」的实现方式(直接覆盖掉旧句柄)。
+///
+/// 代号(`generation`)是第二道闸:定时器已经飞出去、句柄又被覆盖不掉的竞态下,
+/// 回来的那一发靠代号自己认赔。
+#[allow(clippy::too_many_arguments)]
+fn arm_dwell(
+    generation: u64,
+    cfg: DwellConfig,
+    tracker: Rc<RefCell<DwellTracker>>,
+    emulator: Arc<TerminalEmulator>,
+    on_copied: Option<OnSelectionCopied>,
+    element_size: (f32, f32),
+    window: &mut Window,
+    cx: &mut App,
+) -> gpui::Task<()> {
+    let delay = cfg.dwell;
+    window.spawn(cx, async move |cx| {
+        cx.background_executor().timer(delay).await;
+        let _ = cx.update(|window, cx| {
+            let text = emulator
+                .with_term(|t| t.selection_to_string())
+                .unwrap_or_default();
+            if !tracker
+                .borrow()
+                .on_dwell_elapsed(generation, !text.is_empty())
+            {
+                return;
+            }
+            cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+            let origin = tracker.borrow().tip_origin(element_size);
+            tracker.borrow_mut().note_copied(text.clone());
+            if let Some(cb) = on_copied.as_ref() {
+                // 落点是**元素相对**坐标(tip_origin 已按元素尺寸贴边收拢):
+                // 宿主把气泡 absolute 放在终端容器里就地对得上
+                cb(&text, origin, window, cx);
+            }
+            window.refresh();
+        });
+    })
 }
 
 /// gpui 的按键 → 协议按键。没有对应编码的一律丢弃。
@@ -768,11 +1105,16 @@ impl Element for TerminalElement {
         let mut pending: Vec<RowPending> = Vec::new();
         let mode;
         let mut rows_seen = 0usize;
+        // 滚动条要用:整条内容有多长、视口顶在哪
+        let total_lines;
+        let frame_display_offset;
 
         {
             let term_lock = self.emulator.term().lock();
+            total_lines = term_lock.grid().total_lines();
             let content = term_lock.renderable_content();
             let display_offset = content.display_offset;
+            frame_display_offset = display_offset;
             mode = content.mode;
             let colors_table = content.colors;
             let selection_range = content.selection;
@@ -961,6 +1303,25 @@ impl Element for TerminalElement {
             });
         }
 
+        // ── 滚动条几何
+        //
+        //  alt screen(vim / less / htop)没有回看缓冲,画一条永远满格的条子纯属误导。
+        //  offset 变了就把淡出计时重新起表 —— 包括程序化滚动,不只是鼠标滚。
+        if state.last_offset.replace(frame_display_offset) != frame_display_offset {
+            state.scrollbar_touched.set(Some(Instant::now()));
+        }
+        let scrollbar = if mode.contains(TermMode::ALT_SCREEN) {
+            None
+        } else {
+            scrollbar::layout(
+                bounds,
+                &self.scrollbar,
+                total_lines,
+                screen_lines,
+                frame_display_offset,
+            )
+        };
+
         PreparedFrame {
             hitbox,
             state,
@@ -972,6 +1333,7 @@ impl Element for TerminalElement {
             rows,
             cursor,
             preedit,
+            scrollbar,
         }
     }
 
@@ -989,6 +1351,12 @@ impl Element for TerminalElement {
 
         if let Some(install) = self.install_input_handler.clone() {
             install(bounds, window, cx);
+        }
+
+        // ── 背景图铺在最底下。grid 侧「默认背景不发 quad」的路早就通了,
+        //    再加上半透明的 TerminalTheme::background,图自然透上来。
+        if let Some(art) = self.background_art.as_ref() {
+            art.paint_into(bounds, window, cx);
         }
 
         let origin = bounds.origin;
@@ -1068,6 +1436,10 @@ impl Element for TerminalElement {
                     self.theme.cursor,
                 ));
             }
+
+            // ── 滚动条画在最上层。**只发 quad,不碰 RowCache 也不碰帧指纹** ——
+            //    拖滑块时行缓存该命中还是命中(滚屏行只是换了个 y)。
+            self.paint_scrollbar(prepared, window);
         });
 
         self.paint_mouse_listeners(prepared, window, cx);

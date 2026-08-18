@@ -31,9 +31,9 @@
 |---|---|---|---|---|
 | 7 | **上下文菜单基建**（gpui-component popup_menu）——挡住项目列表 12 项、文件树 8 项、tab 7 项、终端 5 项四处右键菜单 | 中 | mt-ui/mt-app | ❌ |
 | 8 | **拖放基建**——项目拖拽排序、拖文件夹加项目、拖文件进终端（外部资源管理器 + 内部 FileTree 两条链路 + 虚线高亮框） | 中 | mt-ui + mt-app | ❌ |
-| 9 | **图标体系**（BrandIcon 厂商 / TechIcon 技术栈 / 文件图标 / SVG 状态灯勾叉字形 + 旋转动画）——现用 "CL/CX/GK" 文本与三形圆点代替 | 中 | mt-ui | ❌ |
+| 9 | **图标体系** | 中 | mt-ui | 🟡 K 批完成 mt-ui 侧组件（BrandIcon 11 家/TechIcon 12 种/FileIcon 53 类含特殊文件名压扩展名/StatusDot 四态勾叉+900ms 旋转动画；全自绘矢量——gpui 0.2.2 的 svg() 是单色掩膜、Image SVG 分支漏 BGRA 交换红蓝互换，判据在 vector.rs 头注释）；剩 mt-app 消费替换（接线清单在看板「Wave 4.5」段） |
 | 10 | **通用命令式弹窗**（prompt/confirm/alert）+ 关闭 pane/整组的 AI 感知确认框（现直接关不确认） | 小 | mt-app | ❌ |
-| 11 | **终端滚动条**（mt-ui/terminal 现只有滚轮回看，无滚动条） | 中 | mt-ui | ❌ |
+| 11 | **终端滚动条** | 中 | mt-ui | ✅ K 批。6px 样式照抄 styles.css；alt screen 不画；不打穿 damage 缓存（只在 paint 发 quad）；滑块分母 total-screen；闲置按时间算 alpha 淡出（不用 with_animation 防持续请求帧）、回看中保留 50% 残留；宿主零改动默认生效 |
 
 ### 第 2 层：面板补全
 

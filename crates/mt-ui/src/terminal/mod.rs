@@ -13,6 +13,8 @@ mod element;
 pub mod ime;
 mod input;
 pub mod mouse;
+pub mod scrollbar;
+pub mod selection_dwell;
 mod theme;
 mod view;
 
@@ -23,6 +25,8 @@ pub use element::{
 };
 pub use ime::{ImeState, Preedit, commit_to_bytes};
 pub use input::{is_text_input_key, keystroke_to_bytes, paste_to_bytes};
+pub use scrollbar::{ScrollbarHit, ScrollbarLayout, ScrollbarStyle};
+pub use selection_dwell::{CopiedTip, DwellConfig, DwellTracker, OnSelectionCopied, ReleaseAction};
 pub use mouse::{
     GridPos, MouseAction, MouseBtn, MouseMods, WheelDir, mouse_report_bytes,
     mouse_reporting_active, prefers_local_handling,

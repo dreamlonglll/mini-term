@@ -19,7 +19,18 @@
 //! 终端配色 [`TerminalTheme`] + `gpui_component` 的 `ThemeConfig`,
 //! 外加「按主题包 id 切换」的运行时入口。
 //!
-//! ## 3. 布局复用件(尽量用 gpui-component,别自己造)
+//! ## 3. 图标体系([`icons`])
+//!
+//! 厂商图标 / 技术栈徽标 / 文件树图标 / 四态状态灯,全部**自绘矢量**
+//! (无资产、无宿主接线、可多色、几何可单测)。替掉 mt-app 现有的
+//! 「CL/CX/GK 两字母文本」与「三形圆点」两处占位 —— 接线总表见该模块注释。
+//!
+//! ## 4. 背景图([`background`])
+//!
+//! 主题包背景图的 cover/focus 铺放 + 压暗纱罩。原版挂在 `#root`(窗口级),
+//! 这里既可以窗口级铺,也可以只铺终端区([`TerminalView::set_background_art`])。
+//!
+//! ## 5. 布局复用件(尽量用 gpui-component,别自己造)
 //!
 //! | mini-term 现状 | GPUI 侧对应 |
 //! |---|---|
@@ -36,20 +47,30 @@
 //! - ✅ IME 预编辑([`TerminalView`](terminal::TerminalView) 实现 `EntityInputHandler`)
 //! - ✅ 鼠标上报(1000/1002/1003 × X10/1005/1006)
 //! - ✅ 行级 damage 追踪([`terminal::damage`])
-//! - ✅ 主题桥([`theme_bridge`]);背景图**只备好了数据**,渲染未做(见该模块 TODO)
+//! - ✅ 主题桥([`theme_bridge`])+ 背景图渲染([`background`])
+//! - ✅ 滚动条([`terminal::scrollbar`]):拖滑块 / 点轨道翻页 / 闲置淡出 / alt screen 不画
+//! - ✅ 拖选停留自动复制([`terminal::selection_dwell`]),默认关闭以兼容旧语义
+//! - ✅ 图标体系([`icons`])
 //! - ⬜ 下划线花样(DOUBLE/DOTTED/DASHED 统一降级实线,gpui 只有 wavy 一种)
 //! - ⬜ 回退字形溢出裁剪(宽字符回退到非等宽字体时可能糊出格子边界)
 
+pub mod background;
+pub mod icons;
 pub mod terminal;
 pub mod theme_bridge;
 
+pub use background::{BackgroundArtElement, Fit, background_art, fit_bounds};
+pub use icons::{
+    AiVendor, BrandIcon, FileIcon, FileKind, ProjectKind, StatusDot, StatusKind, TechIcon,
+};
 pub use terminal::{
-    DamageStats, FrameGeometry, InstallInputHandler, OnGridResize, OnInput, PreeditText,
-    TerminalElement, TerminalStyle, TerminalTheme, TerminalView, color_request_rgb,
-    is_text_input_key, keystroke_to_bytes, paste_to_bytes, rgb8,
+    CopiedTip, DamageStats, DwellConfig, FrameGeometry, InstallInputHandler, OnGridResize, OnInput,
+    OnSelectionCopied, PreeditText, ScrollbarStyle, TerminalElement, TerminalStyle, TerminalTheme,
+    TerminalView, color_request_rgb, is_text_input_key, keystroke_to_bytes, paste_to_bytes, rgb8,
 };
 pub use theme_bridge::{
-    AppliedThemePack, Appearance, ThemePackDef, switch_to_builtin, switch_to_theme_pack,
+    AppliedThemePack, Appearance, BackgroundArt, ThemePackColors, ThemePackDef, switch_to_builtin,
+    switch_to_theme_pack,
 };
 
 /// OSC 调色板查询的应答色(`TermEvent::ColorRequest` 的处理)。
