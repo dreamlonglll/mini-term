@@ -176,7 +176,26 @@ impl Ledger {
         conn.busy_timeout(Duration::from_millis(5000))?;
         // journal_mode 语句有返回行，走 query_row；synchronous=NORMAL 在 WAL 下
         // 每事务免 fsync（只在 checkpoint），backfill 数千文件的落库才够快
-        let _mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))?;
+        //
+        // SQLite 对 journal-mode 转换不调用 busy handler（要拿 EXCLUSIVE 锁却绕过
+        // busy_timeout）：首次启动（或撞版重建）时查询与后台同步同刻打开一个还是
+        // delete 模式的库，只有一个连接能完成转换，输者 0ms 即得 BUSY 而非等满 5s。
+        // 按 busy_timeout 同等预算自行重试，只认 BUSY；其余错误照常上抛，
+        // 不碰外层 is_corruption 的删库重建路径。
+        let mut waited = Duration::ZERO;
+        loop {
+            match conn.query_row("PRAGMA journal_mode=WAL", [], |r| r.get::<_, String>(0)) {
+                Ok(_mode) => break,
+                Err(rusqlite::Error::SqliteFailure(e, _))
+                    if e.code == rusqlite::ErrorCode::DatabaseBusy
+                        && waited < Duration::from_millis(5000) =>
+                {
+                    std::thread::sleep(Duration::from_millis(20));
+                    waited += Duration::from_millis(20);
+                }
+                Err(e) => return Err(e),
+            }
+        }
         conn.execute_batch("PRAGMA synchronous=NORMAL;")?;
         // 版本不匹配（含旧库）→ 删表重建，空 sync_state 触发 backfill。
         // IMMEDIATE 事务先取写锁再复读版本：并发打开（查询命令 vs 后台同步）
