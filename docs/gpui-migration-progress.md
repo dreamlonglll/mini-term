@@ -10,8 +10,8 @@
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | 骨架 | 工作区 9 crate + 依赖选型 + 迁移映射（`aa9a7fc`） | ✅ 2026-08-18 |
-| Wave 1 | 后端五块并行搬运 + TerminalElement 端到端 | 🔵 2026-08-18 派出 |
-| Wave 2 | mt-relay、mt-app 全壳（store/三栏/Tab/分屏树）、面板与 Modal、i18n、主题桥 | ⬜ 等 Wave 1 |
+| Wave 1 | 后端五块并行搬运 + TerminalElement 端到端 | ✅ 2026-08-18 全部验收入库（6/6） |
+| Wave 2 | mt-relay、mt-app 全壳（store/三栏/Tab/分屏树）、面板与 Modal、i18n、主题桥 | 🔵 2026-08-18 mt-relay 与 mt-app 全壳两 agent 并行中 |
 | Wave 3 | 五项验收（对齐/IME/选择剪贴板/拖拽/背景图与主题）、托盘、收尾清理 | ⬜ |
 | 收尾 | mt-ssh/mt-core 移入 crates/、删 src-tauri/ 与 src/、发版切换 | ⬜ |
 
@@ -32,8 +32,8 @@
 
 | 任务 | 依赖 | 说明 |
 |---|---|---|
-| mt-relay 搬运 🔵 | mt-ai（✅ 已落库） | 2026-08-18 提前派出（不等 Wave 1 收口）；mobile_relay.rs + mobile_mirror.rs；协议与 mobile/ 完全不动；桌面侧状态依赖全部抽注入 trait |
-| mt-app 全壳 | Wave 1 全部 | store（对应 src/store.ts）、三栏 resizable、Tab 栏、SplitNode 树、文件树接 mt-project、状态灯接 mt-ai |
+| mt-relay 搬运 ✅ | mt-ai（✅ 已落库） | 2026-08-18 主会话复跑 32/32 绿；RelayHost/RelayEvents 两注入 trait（回调可能在 tokio 线程上来，实现方自己跳回 GPUI 主线程）；接线三硬要求：write_pty 必须全语义写穿口、start_session 后必回执 start_session_result、启动器命令文本绝不进快照（ADR 0002） |
+| mt-app 全壳 🔵 | Wave 1 全部（✅） | 2026-08-18 派出；store（对应 src/store.ts）、三栏 resizable、Tab 栏、SplitNode 树、文件树接 mt-project、状态灯接 mt-ai；Modal/面板/i18n/主题桥明确排除在外 |
 | 面板与 Modal | mt-app 全壳 | 终端配置 / AI 历史 / 用量统计 / 移动端面板 / 分支树 |
 | i18n + 主题桥 | mt-app 全壳 | rust-i18n 字典从 src/locales/*.ts 转；theme_packs 配色映射 gpui-component 主题层 |
 
@@ -71,6 +71,8 @@
 - **mt-ai 同步化的两个慢函数**：get_ai_session_content / get_wsl_ai_sessions 原是 async command（WSL 9P+VM 冷启动秒级），现为同步函数，mt-app 接线时必须丢后台线程。
 - mt-ai 也 vendored 了 parse_wsl_unc / strip_ansi_codes / atomic_write 三个纯函数（与 mt-pty 走 mt-core 路径依赖是两种解法），收尾统一去重。
 - hook 二进制仍按「与主程序同目录 miniterm-hook(.exe)」定位；GPUI 壳产物布局定型后与 scripts/stage-sidecars.mjs 一起复查。
+- `is_wsl_unc_path`/parse_wsl_unc 判定已是工作区**第三份**复刻（mt-ai / mt-pty 走 mt-core / mt-relay），收尾统一去重。
+- mt-relay 默认自持 2 线程 tokio 运行时（apply 惰性创建）；mt-app 若有全局运行时应改用 `with_runtime` 注入，避免进程双线程池。
 
 ## 风险与决议记录
 

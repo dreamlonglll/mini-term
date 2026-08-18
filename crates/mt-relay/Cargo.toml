@@ -11,6 +11,11 @@ serde_json.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 uuid.workspace = true
+# 会话记录解析(Claude/Codex/Grok 三家的行级解析器、项目目录定位、grok chunk
+# 状态机)与「该 agent 有没有可解析的会话记录」判定,对话镜像整块建在其上。
+mt-ai.workspace = true
+# Codex/grok 会话目录在用户家目录下(~/.codex/sessions 等)
+dirs.workspace = true
 # 与中转服务端共享的协议消息 crate。relay-server 是独立工作区,
 # 这条 path 依赖跨工作区,Cargo 允许。
 mt-relay-protocol = { path = "../../relay-server/protocol" }
