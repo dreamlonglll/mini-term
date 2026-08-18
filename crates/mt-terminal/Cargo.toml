@@ -1,0 +1,12 @@
+[package]
+name = "mt-terminal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+alacritty_terminal.workspace = true
+mt-pty.workspace = true
+anyhow.workspace = true
+parking_lot.workspace = true

@@ -1,0 +1,78 @@
+# mini-term GPUI 改造工作区
+#
+# 这个工作区**只包含 `crates/`**。现有的 Tauri 应用(`src-tauri/`)、中转服务端
+# (`relay-server/`)、移动端 PWA(`mobile/`) 全部排除在外，各自保持独立构建 ——
+# 迁移期间 `npm run tauri dev` 与 CI 不受任何影响，新旧两套并存到功能对齐为止。
+#
+# 对齐之后的收尾动作(不要提前做):
+#   1. `src-tauri/mt-core` `src-tauri/mt-ssh` 物理移入 `crates/`
+#      (同时要改 `src-tauri/mt-sidecars` 的 path 依赖与 `scripts/stage-sidecars.mjs`)
+#   2. 删除 `src-tauri/` 与 `src/`，本文件的 exclude 随之清空
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+exclude = ["src-tauri", "relay-server", "mobile", ".tmp-tests"]
+
+[workspace.package]
+version = "0.13.1"
+edition = "2024"
+# 与 src-tauri 保持同一底线(libsqlite3-sys 0.38 的 build.rs 用 cfg_select!)
+rust-version = "1.95"
+authors = ["mini-term"]
+
+[workspace.dependencies]
+# ---------------------------------------------------------------------------
+# GPUI 栈
+# ---------------------------------------------------------------------------
+# 全部取自 crates.io，不用 git 依赖 —— 可复现、可锁版本。
+#
+# ⚠️ 不要换成 `gpui-ce`:gpui-component 依赖的是 Zed 官方 `gpui ^0.2.2`，
+#    混用会在依赖树里出现两个不同的 `gpui` crate，类型无法互通。
+#    (gpui-ce 的卖点是 wgpu 单一后端，代价是没有任何组件库可用，且
+#     crates.io 版本停在 0.3.3 / 2025-12-27。)
+#
+# ⚠️ Linux 构建需要额外打开 gpui 的 `x11` / `wayland` feature，
+#    Windows / macOS 默认 feature 即可。
+gpui = "0.2.2"
+# 组件库:Resizable(替 Allotment) / Tree(替 FileTree) / TabBar / Modal / Input /
+# Table，以及 JSON 驱动的主题层 + 运行时主题注册表(替自研 theme_packs 的一部分)。
+gpui-component = "0.5.1"
+
+# ---------------------------------------------------------------------------
+# 终端
+# ---------------------------------------------------------------------------
+# VT 状态机。取代 xterm.js:字节直接喂进 Term 的 grid，没有 IPC、没有 JSON、
+# 没有 Base64、没有前端解析 pass —— 现有的 16ms 批缓冲 / 有界 channel /
+# 4MB-1MB 双水位背压 / set_pty_flow_paused / 30s 超时兜底整套随之作废。
+alacritty_terminal = "0.26"
+portable-pty = "0.8"
+
+# ---------------------------------------------------------------------------
+# 通用
+# ---------------------------------------------------------------------------
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+parking_lot = "0.12"
+dirs = "6"
+regex = "1"
+uuid = { version = "1", features = ["v4"] }
+chrono = "0.4"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "io-util", "macros"] }
+
+# ---------------------------------------------------------------------------
+# 工作区内部
+# ---------------------------------------------------------------------------
+mt-ai = { path = "crates/mt-ai" }
+mt-config = { path = "crates/mt-config" }
+mt-project = { path = "crates/mt-project" }
+mt-pty = { path = "crates/mt-pty" }
+mt-relay = { path = "crates/mt-relay" }
+mt-terminal = { path = "crates/mt-terminal" }
+mt-ui = { path = "crates/mt-ui" }
+mt-usage = { path = "crates/mt-usage" }
+
+# 迁移期把编译时间压下来:GPUI + wgpu/blade 的依赖树很大，
+# dev 下依赖走 opt-level 1，自己的 crate 保持 0 以留调试信息。
+[profile.dev.package."*"]
+opt-level = 1

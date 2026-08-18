@@ -1,0 +1,23 @@
+[package]
+name = "mt-relay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+# 与中转服务端共享的协议消息 crate。relay-server 是独立工作区,
+# 这条 path 依赖跨工作区,Cargo 允许。
+mt-relay-protocol = { path = "../../relay-server/protocol" }
+tokio-tungstenite = { version = "0.27", features = ["rustls-tls-native-roots"] }
+# rustls 显式关默认 feature 并选 ring 后端,避免 aws-lc-rs 在 Windows MSVC 上的
+# NASM 工具链依赖(见 spec/backend/rust-crypto-on-windows-msvc.md);
+# 运行时需 install ring provider。
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+futures-util = "0.3"
+sha2 = "0.11.0"

@@ -1,0 +1,11 @@
+[package]
+name = "mt-pty"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+portable-pty.workspace = true
+anyhow.workspace = true
+parking_lot.workspace = true

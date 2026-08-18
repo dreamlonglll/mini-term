@@ -1,0 +1,14 @@
+[package]
+name = "mt-usage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+chrono-tz = "0.10"
+rusqlite = { version = "0.40.1", features = ["bundled"] }
