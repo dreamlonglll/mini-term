@@ -3904,6 +3904,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "dirs 6.0.0",
+ "mt-ai",
  "rusqlite",
  "serde",
  "serde_json",

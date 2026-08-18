@@ -149,7 +149,7 @@ fn codex_config_path() -> Option<PathBuf> {
 
 /// grok 的用户级配置根目录：`$GROK_HOME` 优先，否则 `~/.grok`
 /// （与 grok 自身 `grok_home()` 的口径一致）
-pub(crate) fn grok_home() -> Option<PathBuf> {
+pub fn grok_home() -> Option<PathBuf> {
     match std::env::var("GROK_HOME") {
         Ok(h) if !h.is_empty() => Some(PathBuf::from(h)),
         _ => dirs::home_dir().map(|h| h.join(".grok")),

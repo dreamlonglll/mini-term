@@ -543,7 +543,7 @@ pub(crate) fn parse_codex_session(
                     // 本文件的创建时刻:早于它的 token_count 只能是 fork/resume
                     // 复制进来的父会话历史(复制行原样保留原时间戳)
                     meta_ts = line_ts;
-                    if let Some(meta) = crate::ai_shim::codex_meta_from_line(line) {
+                    if let Some(meta) = mt_ai::sessions::codex_meta_from_line(line) {
                         session_id = meta.id;
                         if !meta.cwd.is_empty() {
                             cwd = Some(meta.cwd);
@@ -572,7 +572,7 @@ pub(crate) fn parse_codex_session(
                 // 兜底标题(旧格式无 user_message 事件)；developer 注入行由
                 // codex_user_title_from_line 的 `<`/`# AGENTS.md` 过滤挡住
                 if title.is_none() {
-                    title = crate::ai_shim::codex_user_title_from_line(line);
+                    title = mt_ai::sessions::codex_user_title_from_line(line);
                 }
                 // 工具调用事件(实测形状:function_call / custom_tool_call)。
                 // fork 复制的行原样保留 call_id → 聚合层按 call_id 去重,

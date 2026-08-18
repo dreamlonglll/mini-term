@@ -19,7 +19,6 @@
 //! 分桶按**记录自身时刻**求当地偏移（`chrono-tz` 带 IANA 数据），DST 地区的历史
 //! 记录才不会错日——这条不许简化成固定偏移。
 
-mod ai_shim;
 
 pub mod aggregate;
 pub mod ledger;
@@ -123,7 +122,7 @@ fn collect_codex_jobs(home: &Path, jobs: &mut Vec<SessionJob>) {
         return;
     }
     let mut paths = Vec::new();
-    crate::ai_shim::collect_codex_session_paths(&sessions_dir, &mut paths);
+    mt_ai::sessions::collect_codex_session_paths(&sessions_dir, &mut paths);
     jobs.extend(paths.into_iter().map(|path| SessionJob::Codex { path }));
 }
 
@@ -232,9 +231,9 @@ impl ProviderResolver {
 /// 会话枚举永远全量入账本、scope 只在查询层按本函数过滤——从项目子目录
 /// 启动(目录名编码与项目根不同)的 Claude 会话也能被计入。
 pub(crate) fn session_in_scope(cwd: Option<&str>, project: &str) -> bool {
-    let proj = crate::ai_shim::normalize_path(project);
+    let proj = mt_ai::sessions::normalize_path(project);
     cwd.is_some_and(|c| {
-        let c = crate::ai_shim::normalize_path(c);
+        let c = mt_ai::sessions::normalize_path(c);
         c == proj || c.starts_with(&format!("{proj}\\"))
     })
 }

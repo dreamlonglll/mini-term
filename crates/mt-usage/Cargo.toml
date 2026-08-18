@@ -18,3 +18,5 @@ chrono-tz = "0.10"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 # 读 ~/.codex/config.toml 的 model_providers.<id>.base_url(供应商归属)
 toml_edit = "0.22"
+# 会话文件枚举/元信息行解析/grok_home 直连 mt-ai(ai_shim 临时副本已删)
+mt-ai.workspace = true
