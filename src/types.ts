@@ -301,6 +301,9 @@ export interface ProjectState {
   /** 由 layout 聚合出的项目级状态（error > ai-working > ai-idle > idle） */
   status: PaneStatus;
   needsAttention?: boolean;
+  /** 双击最大化的 pane：TerminalArea 只渲染其所在 leaf。运行时状态，不持久化；
+   *  pane 关掉后按 id 查不到 leaf 即自然回落整树渲染。 */
+  maximizedPaneId?: string;
 }
 
 export interface AiCompletionNotification {

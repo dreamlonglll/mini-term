@@ -114,16 +114,79 @@ export function insertSplit(
   direction: 'horizontal' | 'vertical',
   newLeaf: SplitNode,
 ): SplitNode {
+  return insertSplitAt(node, targetPaneId, direction, newLeaf, 'after');
+}
+
+/** insertSplit 的带方位版：`before` 把新 leaf 放在第一格（拖拽到左/上侧用）。 */
+export function insertSplitAt(
+  node: SplitNode,
+  targetPaneId: string,
+  direction: 'horizontal' | 'vertical',
+  newLeaf: SplitNode,
+  position: 'before' | 'after',
+): SplitNode {
   if (node.type === 'leaf') {
     if (node.panes.some((p) => p.id === targetPaneId)) {
-      return { type: 'split', direction, children: [node, newLeaf], sizes: [50, 50] };
+      const children = position === 'before' ? [newLeaf, node] : [node, newLeaf];
+      return { type: 'split', direction, children, sizes: [50, 50] };
     }
     return node;
   }
   return {
     ...node,
-    children: node.children.map((c) => insertSplit(c, targetPaneId, direction, newLeaf)),
+    children: node.children.map((c) => insertSplitAt(c, targetPaneId, direction, newLeaf, position)),
   };
+}
+
+/** 拖拽落点：center = 并入目标 leaf 的 tab 栏；四边 = 在对应方向分屏。 */
+export type DropZone = 'center' | 'left' | 'right' | 'top' | 'bottom';
+
+/**
+ * 把已有 pane 移动到目标 pane 所在位置（拖拽移动/合并）。
+ * 返回新树；无需变化（拖到自己身上、并入自己所在组）时返回 null，调用方跳过写入。
+ *
+ * 锚点修正：目标锚 pane 恰好是被拖的 pane 自己时（拖到自己组的终端区域上），
+ * 换用同组另一个 pane 做锚——先摘除再插入的两步里，锚 pane 必须在摘除后仍存在。
+ */
+export function movePaneInLayout(
+  root: SplitNode,
+  paneId: string,
+  targetPaneId: string,
+  zone: DropZone,
+): SplitNode | null {
+  const pane = findPaneById(root, paneId);
+  if (!pane) return null;
+  const sourceLeaf = findLeafContainingPane(root, paneId);
+  const targetLeaf = findLeafContainingPane(root, targetPaneId);
+  if (!sourceLeaf || !targetLeaf) return null;
+
+  let anchorId = targetPaneId;
+  if (anchorId === paneId) {
+    const other = targetLeaf.panes.find((p) => p.id !== paneId);
+    if (!other) {
+      // 独占一个 leaf 的 pane 拖回自己身上：center 无事可做；四边等价于原位
+      return null;
+    }
+    anchorId = other.id;
+  }
+
+  if (zone === 'center') {
+    if (sourceLeaf === targetLeaf) return null; // 已在同一组
+    const removed = removePaneFromLayout(root, paneId);
+    if (!removed) return null;
+    return updateLeafOfPane(removed, anchorId, (leaf) => ({
+      ...leaf,
+      panes: [...leaf.panes, pane],
+      activePaneId: pane.id,
+    }));
+  }
+
+  const removed = removePaneFromLayout(root, paneId);
+  if (!removed || !findPaneById(removed, anchorId)) return null;
+  const direction = zone === 'left' || zone === 'right' ? 'horizontal' : 'vertical';
+  const position = zone === 'left' || zone === 'top' ? 'before' : 'after';
+  const newLeaf: SplitNode = { type: 'leaf', panes: [pane], activePaneId: pane.id };
+  return insertSplitAt(removed, anchorId, direction, newLeaf, position);
 }
 
 /**

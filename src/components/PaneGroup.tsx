@@ -20,10 +20,13 @@ import {
   closeLeaf,
   closePane,
   forkPaneSession,
+  movePane,
   newTerminal,
   renamePane,
   splitPane,
 } from '../utils/paneActions';
+import { getDragPayload, setDragPayload } from '../utils/dragState';
+import type { DropZone } from '../utils/layoutOps';
 import { branchCapsForAgent } from '../utils/sessionBranch';
 import { BranchFamilyPanel } from './BranchFamilyPanel';
 import { hotkeyLabel } from '../utils/hotkeys';
@@ -58,6 +61,16 @@ const ICON_SEARCH = (
   <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round">
     <circle cx="7" cy="7" r="4.2" />
     <path d="M10.2 10.2L14 14" />
+  </svg>
+);
+const ICON_MAXIMIZE = (
+  <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M9.5 2.5h4v4M13.5 2.5L9 7M6.5 13.5h-4v-4M2.5 13.5L7 9" />
+  </svg>
+);
+const ICON_RESTORE = (
+  <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M13.5 6.5h-4v-4M9.5 6.5L14 2M2.5 9.5h4v4M6.5 9.5L2 14" />
   </svg>
 );
 
@@ -333,6 +346,87 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
     useAppStore.getState().resetPaneForReconnect(projectId, activePane.id);
   }, [activePane, projectId]);
 
+  // === pane 拖拽移动/合并 + 双击最大化 ===
+  // 拖拽走全局 dragState 模块级 payload（与项目行拖拽同一模式），HTML5 DnD 的
+  // dataTransfer 在 dragover 阶段读不到内容，跨组件判定只能靠它。
+  const [dropZone, setDropZone] = useState<DropZone | null>(null);
+  const [tabBarDrop, setTabBarDrop] = useState(false);
+  const maximizedPaneId = useAppStore((s) => s.projectStates.get(projectId)?.maximizedPaneId);
+  const layoutIsSplit = useAppStore(
+    (s) => s.projectStates.get(projectId)?.layout?.type === 'split',
+  );
+  const isMaximized = maximizedPaneId !== undefined
+    && node.panes.some((p) => p.id === maximizedPaneId);
+
+  const toggleMaximize = useCallback(() => {
+    const store = useAppStore.getState();
+    if (node.panes.some((p) => p.id === store.projectStates.get(projectId)?.maximizedPaneId)) {
+      store.toggleMaximizedPane(projectId, null);
+    } else if (store.projectStates.get(projectId)?.layout?.type === 'split') {
+      store.toggleMaximizedPane(projectId, activePane?.id ?? null);
+    }
+  }, [projectId, node.panes, activePane?.id]);
+
+  /** 本组是否可作为当前拖拽 pane 的落点（同项目的 pane 拖拽才响应）。 */
+  const acceptsPaneDrag = useCallback(() => {
+    const p = getDragPayload();
+    return p?.type === 'pane' && p.projectId === projectId ? p : null;
+  }, [projectId]);
+
+  const zoneFromEvent = (e: React.DragEvent): DropZone => {
+    const r = e.currentTarget.getBoundingClientRect();
+    const x = (e.clientX - r.left) / Math.max(r.width, 1);
+    const y = (e.clientY - r.top) / Math.max(r.height, 1);
+    // 四边各 1/4 进深算分屏落点，中间一块并入 tab 组
+    if (x >= 0.25 && x <= 0.75 && y >= 0.25 && y <= 0.75) return 'center';
+    const d = [
+      { zone: 'left' as const, v: x },
+      { zone: 'right' as const, v: 1 - x },
+      { zone: 'top' as const, v: y },
+      { zone: 'bottom' as const, v: 1 - y },
+    ];
+    d.sort((a, b) => a.v - b.v);
+    return d[0].zone;
+  };
+
+  const handleBodyDragOver = (e: React.DragEvent) => {
+    if (!acceptsPaneDrag()) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    const zone = zoneFromEvent(e);
+    setDropZone((prev) => (prev === zone ? prev : zone));
+  };
+
+  const handleBodyDrop = (e: React.DragEvent) => {
+    const payload = acceptsPaneDrag();
+    setDropZone(null);
+    if (!payload) return;
+    e.preventDefault();
+    movePane(projectId, payload.paneId, node.activePaneId, zoneFromEvent(e));
+    setDragPayload(null);
+  };
+
+  const handleTabBarDragOver = (e: React.DragEvent) => {
+    if (!acceptsPaneDrag()) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    setTabBarDrop(true);
+  };
+
+  const handleTabBarDrop = (e: React.DragEvent) => {
+    const payload = acceptsPaneDrag();
+    setTabBarDrop(false);
+    if (!payload) return;
+    e.preventDefault();
+    e.stopPropagation();
+    movePane(projectId, payload.paneId, node.activePaneId, 'center');
+    setDragPayload(null);
+  };
+
+  /** dragleave 在跨子元素时也触发，只有真正离开容器才清高亮。 */
+  const leftContainer = (e: React.DragEvent) =>
+    !(e.currentTarget as HTMLElement).contains(e.relatedTarget as Node | null);
+
   const paneContextMenu = useCallback((e: React.MouseEvent, paneId: string) => {
     e.preventDefault();
     e.stopPropagation();
@@ -387,6 +481,14 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
   const ctrlBtn =
     'w-6 h-6 flex items-center justify-center rounded-[var(--radius-sm)] text-[var(--text-muted)] opacity-60 hover:opacity-100 hover:text-[var(--accent)] hover:bg-[var(--border-subtle)] transition-all';
 
+  const overlayRect: Record<DropZone, string> = {
+    center: 'inset-0',
+    left: 'top-0 bottom-0 left-0 right-1/2',
+    right: 'top-0 bottom-0 left-1/2 right-0',
+    top: 'top-0 left-0 right-0 bottom-1/2',
+    bottom: 'top-1/2 left-0 right-0 bottom-0',
+  };
+
   return (
     // pane-enter：新分出来的格子淡入并放大到位。项目切到后台是 display:none
     // 留着不卸载，不会重播；只有真正新建/重排分屏时这层才重挂载
@@ -394,9 +496,21 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
       {/* Tab bar */}
       <div
         data-panel-header
-        className="flex items-stretch bg-[var(--bg-elevated)] border-b border-[var(--border-subtle)] text-xs overflow-x-auto select-none shrink-0"
+        className={`flex items-stretch bg-[var(--bg-elevated)] border-b text-xs overflow-x-auto select-none shrink-0 ${
+          tabBarDrop
+            ? 'border-[var(--accent)] bg-[var(--border-subtle)]'
+            : 'border-[var(--border-subtle)]'
+        }`}
         role="tablist"
         aria-label={t('paneGroup.tablistLabel')}
+        onDragOver={handleTabBarDragOver}
+        onDrop={handleTabBarDrop}
+        onDragLeave={(e) => { if (leftContainer(e)) setTabBarDrop(false); }}
+        onDoubleClick={(e) => {
+          // 只认空白区：tab 双击是重命名，按钮双击不该误触
+          if ((e.target as Element).closest('[data-pane-tab],button')) return;
+          toggleMaximize();
+        }}
       >
         {node.panes.map((pane) => {
           const isActive = pane.id === activePane.id;
@@ -409,6 +523,15 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
               key={pane.id}
               data-pane-tab
               role="tab"
+              draggable
+              onDragStart={(e) => {
+                setDragPayload({ type: 'pane', projectId, paneId: pane.id });
+                e.dataTransfer.effectAllowed = 'move';
+                // Windows WebView2 上不 setData 拖拽不会真正开始
+                e.dataTransfer.setData('text/plain', '');
+                closeTabPreview();
+              }}
+              onDragEnd={() => setDragPayload(null)}
               tabIndex={isActive ? 0 : -1}
               aria-selected={isActive}
               // 状态点 + 标题 + 关闭按钮作为一组在 tab 内居中：左右 padding 对称，
@@ -512,6 +635,17 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
               {ICON_SEARCH}
             </button>
           )}
+          {(layoutIsSplit || isMaximized) && (
+            <button
+              type="button"
+              className={ctrlBtn}
+              title={isMaximized ? t('paneGroup.restorePane') : t('paneGroup.maximizePane')}
+              aria-label={isMaximized ? t('paneGroup.restorePane') : t('paneGroup.maximizePane')}
+              onClick={toggleMaximize}
+            >
+              {isMaximized ? ICON_RESTORE : ICON_MAXIMIZE}
+            </button>
+          )}
           <button
             type="button"
             className={ctrlBtn}
@@ -543,7 +677,12 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
       </div>
 
       {/* Active terminal */}
-      <div className="flex-1 overflow-hidden relative">
+      <div
+        className="flex-1 overflow-hidden relative"
+        onDragOver={handleBodyDragOver}
+        onDrop={handleBodyDrop}
+        onDragLeave={(e) => { if (leftContainer(e)) setDropZone(null); }}
+      >
         <div className="absolute inset-0">
           {activePane.ptyId !== undefined ? (
             <>
@@ -588,6 +727,13 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
             </div>
           )}
         </div>
+        {/* 拖拽落点预览：center 铺满 = 并入本组，半屏 = 往该方向分屏 */}
+        {dropZone && (
+          <div
+            aria-hidden
+            className={`absolute z-20 pointer-events-none border-2 border-[var(--accent)] bg-[var(--accent)]/20 ${overlayRect[dropZone]}`}
+          />
+        )}
       </div>
 
       {activePane.ptyId !== undefined && markerOpen && markerAnchor && createPortal(

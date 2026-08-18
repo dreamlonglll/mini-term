@@ -1,6 +1,7 @@
 export type DragPayload =
   | { type: 'project'; projectId: string }
-  | { type: 'group'; groupId: string };
+  | { type: 'group'; groupId: string }
+  | { type: 'pane'; projectId: string; paneId: string };
 
 let _payload: DragPayload | null = null;
 

@@ -21,11 +21,13 @@ import {
   findPaneById,
   findPaneByPtyId,
   insertSplit,
+  movePaneInLayout,
   removePaneFromLayout,
   replaceNode,
   resolveActivePane,
   updateLeafOfPane,
   type Direction,
+  type DropZone,
 } from './layoutOps';
 import { t } from '../i18n';
 import type { PaneState, ProjectConfig, ShellConfig, SplitNode } from '../types';
@@ -166,8 +168,28 @@ export async function splitPane(
   }
   const newLeaf: SplitNode = { type: 'leaf', panes: [pane], activePaneId: pane.id };
   commit(projectId, insertSplit(current, target, direction, newLeaf));
+  // 最大化状态下分出的新屏在隐藏的整树里，看不见会让人以为分屏坏了——先还原
+  useAppStore.getState().toggleMaximizedPane(projectId, null);
   focusPane(pane.ptyId);
   return pane;
+}
+
+/**
+ * 拖拽移动 pane：center 并入目标组 tab 栏，四边在目标组对应方向分屏。
+ * 树变换是纯函数（movePaneInLayout），返回 null 表示无需变化（拖回原位）。
+ */
+export function movePane(
+  projectId: string,
+  paneId: string,
+  targetPaneId: string,
+  zone: DropZone,
+): void {
+  const { layout } = snapshot(projectId);
+  if (!layout) return;
+  const next = movePaneInLayout(layout, paneId, targetPaneId, zone);
+  if (!next) return;
+  commit(projectId, next);
+  focusPane(findPaneById(next, paneId)?.ptyId);
 }
 
 /**
