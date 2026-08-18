@@ -130,6 +130,51 @@ fn 中英混排的列位置对得上() {
     assert_eq!(emulator.visible_lines()[0], "你好abc世界");
 }
 
+/// 多 pane 各自独立:两个 PTY 各写一条不同的命令,各自的 grid 只出现自己那条。
+///
+/// 这是分屏/多 tab 的地基 —— 一旦 emulator 或 reader 线程被共享错了(比如
+/// 两个 pane 复用同一个 `TerminalEmulator`),这条会立刻抓到:两块 grid 会
+/// 互相串字。渲染那半截仍然只能人眼验,数据这半截可以钉死。
+#[test]
+fn 两个_pane_的_grid_互不串字() {
+    let size = TermSize::new(100, 30);
+    let (mut pty_a, term_a) = spawn_shell(size);
+    let (mut pty_b, term_b) = spawn_shell(size);
+
+    for term in [&term_a, &term_b] {
+        let ready = wait_for(term, Duration::from_secs(20), |lines| {
+            lines.iter().any(|l| !l.trim().is_empty()).then_some(())
+        });
+        assert!(ready.is_some(), "shell 20s 内没有任何输出");
+    }
+
+    pty_a.write(b"echo MT_PANE_AAA1\r").expect("写 PTY A 失败");
+    pty_b.write(b"echo MT_PANE_BBB2\r").expect("写 PTY B 失败");
+
+    let hit_a = wait_for(&term_a, Duration::from_secs(20), |lines| {
+        (lines.iter().filter(|l| l.contains("MT_PANE_AAA1")).count() >= 2).then_some(())
+    });
+    let hit_b = wait_for(&term_b, Duration::from_secs(20), |lines| {
+        (lines.iter().filter(|l| l.contains("MT_PANE_BBB2")).count() >= 2).then_some(())
+    });
+    assert!(hit_a.is_some(), "A 的输出没回到 A 的 grid");
+    assert!(hit_b.is_some(), "B 的输出没回到 B 的 grid");
+
+    let lines_a = term_a.visible_lines().join("\n");
+    let lines_b = term_b.visible_lines().join("\n");
+    assert!(
+        !lines_a.contains("MT_PANE_BBB2"),
+        "B 的输出串进了 A 的 grid:\n{lines_a}"
+    );
+    assert!(
+        !lines_b.contains("MT_PANE_AAA1"),
+        "A 的输出串进了 B 的 grid:\n{lines_b}"
+    );
+
+    let _ = pty_a.kill();
+    let _ = pty_b.kill();
+}
+
 #[test]
 fn 宽字符换行时不会被劈成两半() {
     // 40 列的终端,第 39 列(0-based)放不下一个宽字符,应整体折到下一行。

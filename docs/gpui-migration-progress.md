@@ -11,8 +11,8 @@
 |---|---|---|
 | 骨架 | 工作区 9 crate + 依赖选型 + 迁移映射（`aa9a7fc`） | ✅ 2026-08-18 |
 | Wave 1 | 后端五块并行搬运 + TerminalElement 端到端 | ✅ 2026-08-18 全部验收入库（6/6） |
-| Wave 2 | mt-relay、mt-app 全壳（store/三栏/Tab/分屏树）、面板与 Modal、i18n、主题桥 | 🔵 2026-08-18 mt-relay 与 mt-app 全壳两 agent 并行中 |
-| Wave 3 | 五项验收（对齐/IME/选择剪贴板/拖拽/背景图与主题）、托盘、收尾清理 | ⬜ |
+| Wave 2 | mt-relay、mt-app 全壳（store/三栏/Tab/分屏树） | ✅ 2026-08-18 两件均验收入库；面板/Modal/i18n/主题桥移入 Wave 3 |
+| Wave 3 | Modal 批、分屏比例恢复+焦点导航、通知/托盘批、AI 历史+用量面板批、i18n+主题桥、IME/鼠标上报/damage、五项人工验收 | ⬜ **暂停中：等用户决定下一步**（拆法建议见下）|
 | 收尾 | mt-ssh/mt-core 移入 crates/、删 src-tauri/ 与 src/、发版切换 | ⬜ |
 
 ## Wave 1 —— 2026-08-18 派出 6 个并行 agent
@@ -33,9 +33,27 @@
 | 任务 | 依赖 | 说明 |
 |---|---|---|
 | mt-relay 搬运 ✅ | mt-ai（✅ 已落库） | 2026-08-18 主会话复跑 32/32 绿；RelayHost/RelayEvents 两注入 trait（回调可能在 tokio 线程上来，实现方自己跳回 GPUI 主线程）；接线三硬要求：write_pty 必须全语义写穿口、start_session 后必回执 start_session_result、启动器命令文本绝不进快照（ADR 0002） |
-| mt-app 全壳 🔵 | Wave 1 全部（✅） | 2026-08-18 派出；store（对应 src/store.ts）、三栏 resizable、Tab 栏、SplitNode 树、文件树接 mt-project、状态灯接 mt-ai；Modal/面板/i18n/主题桥明确排除在外 |
+| mt-app 全壳 ✅ | Wave 1 全部（✅） | 2026-08-18 主会话复跑 29/29 绿 + 隔离数据目录 8s 启动冒烟通过；9 模块 ~3.4k 行：tree.rs 纯数据层（17 测）/persist.rs 磁盘格式一字不改（7 测）/store.rs=AppStore Entity/pane/terminal_area/project_list/file_tree/ai 桥/ui 配色；实机三轮确认「恢复布局→hydrate→起 PTY」链路真跑通 |
 | 面板与 Modal | mt-app 全壳 | 终端配置 / AI 历史 / 用量统计 / 移动端面板 / 分支树 |
 | i18n + 主题桥 | mt-app 全壳 | rust-i18n 字典从 src/locales/*.ts 转；theme_packs 配色映射 gpui-component 主题层 |
+
+## Wave 3 拆法建议（mt-app 全壳 agent 留下的，已采信记档）
+
+1. **Modal 批**（独立）：gpui_component::dialog + input → 终端配置/重命名/移除确认/添加项目；收编 pending_remove「点两次确认」临时方案
+2. **分屏比例恢复 + 焦点导航**（小，独立）：ResizablePanel 喂像素初值或给 gpui-component 提百分比 API；focusAdjacentPane 几何最近邻
+3. **通知/托盘批**（依赖 1）：unreadDonePaneIds / aiDoneOrder / 提示音 / 任务栏闪烁 / 托盘菜单；apply_ai_event 已留完成判定落点
+4. **面板批**（独立，可与 1 并行）：AI 历史（mt_ai::sessions，两个慢函数必须丢后台）+ 用量统计（mt-usage）
+5. **i18n + 主题桥**（独立）：字典从 src/locales/*.ts 转；ui.rs 常量表是唯一替换点；主题包接 mt_config::theme_packs → TerminalTheme + gpui-component 主题
+6. 另有渲染侧缺口：IME（挂载点已留）、鼠标上报（MOUSE_MODE/SGR_MOUSE）、damage 追踪、下划线花样、split_states 塌陷不回收（极小泄漏）
+
+## mt-app 全壳已知缺口（本轮明确不做，验收时别当回归）
+
+- 分屏比例跨重启回均分（百分比照常写盘，装机版仍读得对）；tab 重命名/右键菜单/拖拽排序/项目分组/AI 自动 resume/文件拖入终端未做
+- 状态灯是三形（空心圈/实心点/环+芯），未复刻原版勾叉字形与旋转动画；中间栏折叠后仍渲染分隔条把手（gpui-component 行为）
+
+## 开发纪律（跑 GPUI dev 实例）
+
+- **必设 `MT_APP_DATA_DIR`** 指到隔离目录再 `cargo run -p mt-app`，否则会与装机版抢 `%APPDATA%\com.mini-term.app\`——2026-08-18 已发生一次：dev 实例 hook server 退到 23457 并覆盖 hook-server.json，装机版 hook 上报被指向死端口（已手工修复回 23456）。与 Tauri 侧 `--config` 覆盖 identifier 是同一目的。
 
 ## TerminalElement 人工验收清单（等 F 验收提交后执行，复选框由验收人勾）
 

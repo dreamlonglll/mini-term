@@ -3801,6 +3801,7 @@ dependencies = [
  "mt-terminal",
  "mt-ui",
  "mt-usage",
+ "parking_lot",
 ]
 
 [[package]]

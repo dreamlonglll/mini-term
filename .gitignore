@@ -53,3 +53,6 @@ release/
 
 # GPUI 改造工作区（根 Cargo.toml，members = crates/*）的构建产物
 /target/
+
+# GPUI 迁移主会话独立复核用的 target 目录
+target-verify/
