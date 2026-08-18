@@ -931,15 +931,26 @@ export const useAppStore = create<AppStore>((set, get) => ({
   },
 
   toggleMaximizedPane: (projectId, paneId) => {
+    let changed = false;
     set((state) => {
       const ps = state.projectStates.get(projectId);
       if (!ps) return state;
       const next = paneId !== null && ps.maximizedPaneId !== paneId ? paneId : undefined;
       if (ps.maximizedPaneId === next) return state;
+      changed = true;
       const newStates = new Map(state.projectStates);
       newStates.set(projectId, { ...ps, maximizedPaneId: next });
       return { projectStates: newStates };
     });
+    // 最大化/还原只是同一批终端换个容器渲染，PaneGroup 重挂载不该重播
+    // pane-enter（新分屏的淡入放大）——还原时整棵树一起重播，满屏闪动像重新
+    // 分了屏。真正状态变化时短窗抑制该动画；两帧后移除，不影响后续新分屏。
+    if (changed) {
+      document.body.classList.add('suppress-pane-enter');
+      requestAnimationFrame(() =>
+        requestAnimationFrame(() => document.body.classList.remove('suppress-pane-enter')),
+      );
+    }
   },
 
   updatePaneStatusByPty: (ptyId, status, cause, agent) => {

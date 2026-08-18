@@ -435,7 +435,11 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
   };
 
   const handleTabBarDragMove = (e: React.MouseEvent) => {
-    if (!acceptsPaneDrag()) return;
+    const payload = acceptsPaneDrag();
+    if (!payload) return;
+    // 本组只有被拖的这一个 tab 时组内换位无意义，落下也不会有动作——
+    // 不显示插入指示线，避免「指示了却静默无动作」的口径不一致
+    if (!node.panes.some((p) => p.id !== payload.paneId)) return;
     const next = tabDropFromEvent(e);
     setTabDrop((prev) =>
       prev && prev.index === next.index && prev.x === next.x ? prev : next,

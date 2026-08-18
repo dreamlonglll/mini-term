@@ -28,6 +28,7 @@
     "src/utils/aiCompletion.ts",
     "src/utils/aiResume.ts",
     "src/utils/attentionTarget.ts",
-    "src/utils/sessionBranch.ts"
+    "src/utils/sessionBranch.ts",
+    "src/utils/layoutOps.ts"
   ]
 }

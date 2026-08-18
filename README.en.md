@@ -113,6 +113,7 @@ Behind the CLI is a **machine-wide singleton daemon** holding the persistent con
 
 - A **project sidebar** for multiple workspaces, with **up to 3 levels of nested groups**, drag-to-reorder, and drag-a-folder-from-Explorer to add
 - **Arbitrarily nested horizontal / vertical splits**, drag to adjust ratios; tabs, splits, and window geometry all persist and restore on restart
+- **Drag panes to rearrange & maximize** — drag a terminal tab into another group to merge (with an insertion indicator on the tab bar; dragging within the bar reorders), or onto a terminal-area edge to split off a new pane, with a live drop preview; double-click the tab bar's empty area to temporarily fill the terminal area with that group, double-click again to restore — terminal content survives throughout
 - **Terminal caching** — switching projects, tabs, or panes never rebuilds the xterm instance, so nothing is lost; lazy startup creates a PTY only for the visible pane, so more history projects never means a slower launch
 - **Configurable scrollback** (10,000 lines by default; lowering it in Settings takes effect immediately and frees the memory) with correct CSI 3J handling, so Codex transcript folding and `/clear` behave faithfully; the Windows build bundles a pinned official ConPTY runtime for consistent behavior across Windows versions
 - **AI session history** — read local Claude / Codex / Grok records, right-click to copy the resume command, or read the full conversation right there (Markdown rendering + `Ctrl+F` search)

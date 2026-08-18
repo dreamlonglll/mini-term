@@ -355,6 +355,11 @@ body.ssh-conn-dragging {
   animation: paneEnter var(--motion-pane-enter) var(--ease-overlay-in);
 }
 
+/* pane 最大化/还原是同一批终端换容器重挂载，不重播新分屏动画（store.toggleMaximizedPane 短窗置类） */
+body.suppress-pane-enter .pane-enter {
+  animation: none !important;
+}
+
 .panel-swap-in {
   animation: panelSwapIn var(--motion-terminal-swap) var(--ease-overlay-in);
 }
