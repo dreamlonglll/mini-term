@@ -1,24 +1,51 @@
-//! 配置持久化与主题包。
+//! 配置持久化与主题包。**不依赖 gpui,也不依赖 tauri**。
 //!
-//! # 待移入
+//! 从 `src-tauri/src/config.rs`(1298 行)与 `src-tauri/src/theme_packs.rs`(429 行)
+//! 移入。序列化面(`config.json` 的字段与 camelCase 名)一个字都没改 —— 装机版写下的
+//! 配置,新壳必须原样读得进来。
 //!
-//! | 来源 | 说明 |
+//! # 三个入口
+//!
+//! | 类型 | 职责 |
 //! |---|---|
-//! | `src-tauri/src/config.rs` (1298 行) | `AppConfig` 与 `{app_data_dir}/config.json` 读写、跨平台预置 shell 列表、`migrate_legacy_app_data` |
-//! | `src-tauri/src/theme_packs.rs` (429 行) | 主题包的列举/导入/删除/资源读取 |
+//! | [`ConfigStore`] | `config.json` 的读/写 + 写盘令牌(乐观并发) |
+//! | [`ThemePacks`](theme_packs::ThemePacks) | `{app_data_dir}/themes` 的列举 / 导入 / 删除 / 资源读取 |
+//! | [`paths`] | app data 目录定位与历史 identifier 迁移 |
 //!
-//! # 移植时要改的
+//! ```no_run
+//! let store = mt_config::ConfigStore::open()?;   // 顺带跑 identifier 迁移
+//! let loaded = store.load()?;                     // 拿到配置 + 本次令牌
+//! store.save(loaded.token, &loaded.config)?;      // 令牌过期则拒写,调用方须重读
+//! # Ok::<(), anyhow::Error>(())
+//! ```
 //!
-//! - `app_data_dir` 原本从 `tauri::AppHandle` 取,改成 `dirs::data_dir()` 自己拼
-//!   (identifier 曾从 `com.tauri-app.tauri-app` 迁到 `com.mini-term.app`,
-//!   `migrate_legacy_app_data` 的兼容分支要原样保留)。
-//! - `#[tauri::command] load_config / save_config` 去掉宏,变普通函数。
-//! - **`ConfigToken`** 这个 Tauri managed state 的乐观并发计数在 GPUI 下改成
-//!   放进全局 App state,语义不变(前端两处同时改配置时后写者必须重读)。
+//! # 去 Tauri 化改了什么
 //!
-//! # 与 gpui-component 主题层的关系
+//! - 路径不再走 `AppHandle::path().app_data_dir()`,改由 [`paths`] 用 `dirs` 自己拼。
+//!   Tauri v2 的实现就是 `dirs::data_dir()?.join(identifier)`,磁盘位置一致,
+//!   论证与实测见 [`paths`] 模块文档。
+//! - `#[tauri::command] load_config / save_config` 去掉宏,成为 [`ConfigStore`] 的方法。
+//! - Tauri managed state `ConfigToken(AtomicU64)` 变成 [`ConfigStore`] 自己的字段,
+//!   语义逐字不变:两处同时改配置时,后写者的令牌已过期,必须重读再写。
+//! - 主题包的 `read_theme_asset` 原本返回 base64(WebView asset 协议的兜底通道),
+//!   现在直接给 `Vec<u8>` —— 单进程里没有跨边界传输。
 //!
-//! `theme_packs` 里「配色」那一半可以直接映射到 `gpui_component::theme` 的
-//! JSON schema + `registry` 运行时切换,不必自己再造一套 token 系统;
-//! 「背景图 / 字体 / 终端配色」那一半是 mini-term 特有的,留在本 crate。
-//! 决定映射边界前先读 `gpui-component/crates/ui/src/theme/schema.rs`。
+//! 这两个源文件里没有 `emit` 事件出口,所以"事件改回调"这条对本 crate 无适用项;
+//! 唯一的外发信号是写盘令牌,已经是返回值。
+
+pub mod paths;
+pub mod theme_packs;
+
+mod config;
+
+pub use config::{
+    AiLauncher, AppConfig, ConfigStore, EditorConfig, LoadedConfig, MobileRelayConfig,
+    OldProjectGroup, ProjectConfig, ProjectEnvVar, ProjectGroup, ProjectTreeItem, SaveError,
+    SavedAiSession, SavedLineageEdge, SavedPane, SavedProjectLayout, SavedSplitNode, SavedTab,
+    ShellConfig, SshConnection, default_remote_paste_dir, migrate_config, read_config_from,
+};
+pub use paths::{
+    APP_IDENTIFIER, LEGACY_IDENTIFIER, app_data_dir, config_path, migrate_legacy_app_data,
+    themes_dir,
+};
+pub use theme_packs::{ThemePackData, ThemePackEntry, ThemePacks};

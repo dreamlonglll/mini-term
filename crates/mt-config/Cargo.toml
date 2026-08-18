@@ -10,3 +10,7 @@ serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 dirs.workspace = true
+# 主题包导入:zip 解包 + manifest.json 的 sha256 校验。
+# 版本与 src-tauri/Cargo.toml 保持一致,避免同一功能在两套构建里行为漂开。
+sha2 = "0.11.0"
+zip = "8.6.0"
