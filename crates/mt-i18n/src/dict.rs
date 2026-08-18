@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 32;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 727;
+pub const ZH_ENTRY_COUNT: usize = 735;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 727;
+pub const EN_ENTRY_COUNT: usize = 735;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -543,6 +543,7 @@ static PANE_GROUP_ZH: &[(&str, &str)] = &[
     ("rename", "重命名"),
     ("renameTerminal", "重命名终端"),
     ("retry", "重试"),
+    ("shellExited", "shell 已退出"),
     ("splitDown", "向下分屏"),
     ("splitRight", "向右分屏"),
     ("startFailed", "终端启动失败"),
@@ -571,6 +572,7 @@ static PANE_GROUP_EN: &[(&str, &str)] = &[
     ("rename", "Rename"),
     ("renameTerminal", "Rename Terminal"),
     ("retry", "Retry"),
+    ("shellExited", "shell exited"),
     ("splitDown", "Split down"),
     ("splitRight", "Split right"),
     ("startFailed", "Failed to start terminal"),
@@ -628,6 +630,7 @@ static PANELS_EN: &[(&str, &str)] = &[
 static PROJECT_LIST_ZH: &[(&str, &str)] = &[
     ("addProject", "+ 添加项目"),
     ("addRemoteProject", "添加远程项目（SSH）"),
+    ("chooseDirDialogTitle", "选择项目目录"),
     ("deleteGroupConfirm.message", "确定要删除分组「{name}」吗？组内 {count} 个项目会移到上一级，不会被删除。"),
     ("deleteGroupConfirm.title", "删除分组"),
     ("descriptionPlaceholder", "请输入需求描述,留空清除"),
@@ -661,6 +664,8 @@ static PROJECT_LIST_ZH: &[(&str, &str)] = &[
     ("newGroupPlaceholder", "请输入分组名称"),
     ("newSubgroup", "新建子组"),
     ("newSubgroupPlaceholder", "请输入子组名称"),
+    ("pathHint", "目录不存在时不会添加。"),
+    ("pathPlaceholder", "项目目录，如 D:\\Git\\mini-term"),
     ("preview.disconnected", "已断开"),
     ("preview.neverOpened", "尚未打开过终端"),
     ("preview.notStarted", "未启动"),
@@ -678,6 +683,7 @@ static PROJECT_LIST_ZH: &[(&str, &str)] = &[
 static PROJECT_LIST_EN: &[(&str, &str)] = &[
     ("addProject", "+ Add Project"),
     ("addRemoteProject", "Add Remote Project (SSH)"),
+    ("chooseDirDialogTitle", "Choose project directory"),
     ("deleteGroupConfirm.message", "Delete group “{name}”? Its {count} project(s) will move up one level and won't be deleted."),
     ("deleteGroupConfirm.title", "Delete Group"),
     ("descriptionPlaceholder", "Enter description, leave empty to clear"),
@@ -711,6 +717,8 @@ static PROJECT_LIST_EN: &[(&str, &str)] = &[
     ("newGroupPlaceholder", "Enter group name"),
     ("newSubgroup", "New Subgroup"),
     ("newSubgroupPlaceholder", "Enter subgroup name"),
+    ("pathHint", "Nothing is added when the directory does not exist."),
+    ("pathPlaceholder", "Project directory, e.g. D:\\Git\\mini-term"),
     ("preview.disconnected", "Disconnected"),
     ("preview.neverOpened", "No terminal opened yet"),
     ("preview.notStarted", "Not started"),
@@ -1077,6 +1085,7 @@ static SETTINGS_ZH: &[(&str, &str)] = &[
     ("terminal.availableTerminals", "可用终端（●= 默认）"),
     ("terminal.behavior", "终端行为"),
     ("terminal.defaultHint", "点击圆点设为默认终端 · 新建终端标签页时可选择类型"),
+    ("terminal.fontSizeNewOnly", "改动作用于新建的终端"),
     ("terminal.newArgsPlaceholder", "启动参数（空格分隔，可选）"),
     ("terminal.newCommandPlaceholder", "命令路径（如 pwsh 或 C:\\...\\bash.exe）"),
     ("terminal.newNamePlaceholder", "名称（如 pwsh）"),
@@ -1263,6 +1272,7 @@ static SETTINGS_EN: &[(&str, &str)] = &[
     ("terminal.availableTerminals", "Available terminals (● = default)"),
     ("terminal.behavior", "Terminal behavior"),
     ("terminal.defaultHint", "Click the dot to set the default terminal · Choose a type when opening a new tab"),
+    ("terminal.fontSizeNewOnly", "Applies to newly opened terminals"),
     ("terminal.newArgsPlaceholder", "Launch args (space-separated, optional)"),
     ("terminal.newCommandPlaceholder", "Command path (e.g. pwsh or C:\\...\\bash.exe)"),
     ("terminal.newNamePlaceholder", "Name (e.g. pwsh)"),
@@ -1520,6 +1530,8 @@ static USAGE_STATS_ZH: &[(&str, &str)] = &[
     ("byModel", "按模型"),
     ("byProject", "按项目"),
     ("byProvider", "按供应商"),
+    ("byShell", "Shell 命令"),
+    ("byTool", "工具"),
     ("callsCount", "{count} 次调用"),
     ("dailyActivity", "使用趋势"),
     ("empty", "所选范围内没有 AI 会话"),
@@ -1533,6 +1545,7 @@ static USAGE_STATS_ZH: &[(&str, &str)] = &[
     ("othersModels", "其它 {count} 个模型"),
     ("pricingError", "模型价格获取失败，成本无法计算"),
     ("pricingLoading", "正在获取模型价格..."),
+    ("pricingLocalHint", "把 models.dev 的价格表存成 model-pricing.json 放进应用数据目录即可"),
     ("progress", "{processed}/{total} 个文件"),
     ("range.custom", "自定义"),
     ("range.days30", "近 30 天"),
@@ -1566,6 +1579,8 @@ static USAGE_STATS_EN: &[(&str, &str)] = &[
     ("byModel", "By model"),
     ("byProject", "By project"),
     ("byProvider", "By provider"),
+    ("byShell", "Shell commands"),
+    ("byTool", "Tools"),
     ("callsCount", "{count} calls"),
     ("dailyActivity", "Usage trend"),
     ("empty", "No AI sessions in the selected range"),
@@ -1579,6 +1594,7 @@ static USAGE_STATS_EN: &[(&str, &str)] = &[
     ("othersModels", "Others ({count} models)"),
     ("pricingError", "Failed to fetch model pricing; costs unavailable"),
     ("pricingLoading", "Fetching model pricing..."),
+    ("pricingLocalHint", "Save the models.dev pricing table as model-pricing.json in the app data directory"),
     ("progress", "{processed}/{total} files"),
     ("range.custom", "Custom"),
     ("range.days30", "Last 30 days"),

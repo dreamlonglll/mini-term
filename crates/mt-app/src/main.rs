@@ -5,6 +5,8 @@
 //! ```text
 //! Root(gpui_component 的根,承载 Dialog / 通知层;Input 也要求它在场)
 //!  └─ Workspace(持有 AppStore 与各栏视图)
+//!      ├─ background_art(主题包背景图,窗口级,必须是第一个 child)
+//!      ├─ ActivityBar(44px 窄边条)                   ← 替 ActivityBar.tsx
 //!      ├─ h_resizable "columns"                      ← 替 Allotment 外层
 //!      │   ├─ panel(可折叠,宽度落 config.layoutSizes[0])
 //!      │   │   └─ h_resizable "middle"               ← 替 Allotment 内层
@@ -33,6 +35,7 @@
 //!
 //! 状态形状与操作语义对照 `src/store.ts`,见 [`store`] 与 [`tree`] 两个模块的注释。
 
+mod activity_bar;
 mod ai;
 mod file_tree;
 mod focus_nav;
@@ -65,6 +68,7 @@ use gpui_component::notification::Notification;
 use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel};
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{Root, WindowExt as _};
+use mt_ui::icons::{StatusDot, StatusKind};
 
 use crate::ai::AiBridge;
 use crate::file_tree::FileTree;
@@ -472,7 +476,7 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (columns, middle, middle_visible, drawer_width, unread) = {
+        let (columns, middle, middle_visible, drawer_width, unread, global_status, background) = {
             let store = self.store.read(cx);
             let config = store.config();
             let columns = config
@@ -491,6 +495,8 @@ impl Render for Workspace {
                 config.middle_column_visible,
                 store.right_drawer_width(),
                 store.unread_done_count(),
+                store.global_ai_status(),
+                store.background_art().cloned(),
             )
         };
 
@@ -564,80 +570,79 @@ impl Render for Workspace {
                 });
             });
 
-        // 左侧窄边条:中间栏折叠开关 + 面板开关 + 待办跳转。
+        // 左侧窄边条(ActivityBar):折叠中间栏 / AI 历史 / 用量统计 / 设置。
         //
-        // 字形一律用**与语言无关的符号**:这条边栏只有 14px 宽,塞不下「会话」
-        // 或 "Sessions",而原来的「会 / 量 / 设」单字在英文界面里就是三个方块。
-        // 含义靠 tooltip 交代 —— 原版 ActivityBar 同样是「图标 + title 提示」
-        // (`src/components/ActivityBar.tsx` 的 `title={t('app.activityBar.*')}`),
-        // 真图标等图标体系落地(审计缺口 #9)后再换。
-        let strip_button = |id: &'static str,
-                            glyph: &'static str,
-                            tip: &'static str,
-                            active: bool| {
-            div()
-                .id(id)
-                .flex()
-                .items_center()
-                .justify_center()
-                .w(px(14.0))
-                .h(px(20.0))
-                .text_size(px(10.0))
-                .cursor_pointer()
-                .text_color(if active { ui::accent() } else { ui::text_muted() })
-                .hover(|el| el.text_color(ui::accent()))
-                .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
-                .child(glyph)
-        };
+        // 尺寸与配色照抄 `src/components/ActivityBar.tsx`(44px 宽、32px 方按钮、
+        // 18px 图标、激活态左侧 accent 竖条);图形是原版那几条 SVG path 的
+        // 逐点搬运,见 [`activity_bar`] 模块注释(以及「为什么不用 IconName」)。
+        // SSH / 移动端 / Git / 更新提醒四个入口 GPUI 侧还没有功能,**不放占位**。
         let toggle_strip = div()
             .flex_none()
-            .w(px(14.0))
+            .w(px(activity_bar::WIDTH))
             .h_full()
             .flex()
             .flex_col()
             .items_center()
-            .gap(px(6.0))
-            .py(px(6.0))
+            .gap(px(4.0))
+            .py(px(8.0))
             .bg(ui::bg_surface())
             .border_r_1()
             .border_color(ui::border_subtle())
             .child(
-                strip_button(
+                activity_bar::strip_button(
                     "toggle-middle",
-                    if middle_visible { "‹" } else { "›" },
+                    activity_bar::PANEL,
                     if middle_visible {
                         t("app", "activityBar.collapse")
                     } else {
                         t("app", "activityBar.expand")
                     },
-                    false,
+                    middle_visible,
                 )
+                // 全局 AI 状态徽标挂在这颗按钮上(中间栏承载项目列表)。
+                // 口径与原版一致:只反映 AI 状态,**error 不往上冒** ——
+                // 某个 shell `exit 1` 不该让整条边栏亮红点、盖住真在跑的 AI。
+                .when(global_status != crate::tree::PaneStatus::Idle, |el| {
+                    el.child(
+                        div()
+                            .absolute()
+                            .top(px(-1.0))
+                            .right(px(-1.0))
+                            .w(px(8.0))
+                            .h(px(8.0))
+                            .rounded_full()
+                            .border_1()
+                            .border_color(ui::bg_surface())
+                            .bg(ui::status_color(global_status)),
+                    )
+                })
                 .on_click(cx.listener(|this, _event, _window, cx| {
                     this.store.update(cx, |store, cx| store.toggle_middle_column(cx));
                 })),
             )
             .child(
-                strip_button(
+                activity_bar::strip_button(
                     "toggle-sessions",
-                    "≡",
+                    activity_bar::SESSIONS,
                     t("app", "activityBar.sessions"),
                     self.sessions_open,
                 )
                 .on_click(cx.listener(|this, _event, _window, cx| this.toggle_sessions(cx))),
             )
+            .child(activity_bar::divider())
             .child(
-                strip_button(
+                activity_bar::strip_button(
                     "toggle-usage",
-                    "▤",
+                    activity_bar::STATS,
                     t("app", "activityBar.stats"),
                     self.usage_open,
                 )
                 .on_click(cx.listener(|this, _event, _window, cx| this.toggle_usage(cx))),
             )
             .child(
-                strip_button(
+                activity_bar::strip_button(
                     "open-settings",
-                    "⚙",
+                    activity_bar::SETTINGS,
                     t("app", "activityBar.settings"),
                     false,
                 )
@@ -645,19 +650,33 @@ impl Render for Workspace {
                     modal::open_terminal_settings(this.store.clone(), window, cx);
                 })),
             )
-            // 未读完成计数:点一下跳到最先完成的那个 pane(旧版托盘绿灯的入口)
+            // 未读完成计数:点一下跳到最先完成的那个 pane(旧版托盘绿灯的入口;
+            // 原版边栏没有这颗按钮,所以借状态灯的「实心圆 + 勾」当图形)
             .when(unread > 0, |el| {
                 el.child(
-                    strip_button(
-                        "jump-attention",
-                        "●",
-                        t("app", "titleBar.status.done"),
-                        true,
-                    )
-                    .text_color(ui::color_success())
-                    .on_click(cx.listener(|this, _event, window, cx| {
-                        this.on_jump_attention(&JumpAttention, window, cx);
-                    })),
+                    div()
+                        .id("jump-attention")
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .w(px(32.0))
+                        .h(px(32.0))
+                        .flex_none()
+                        .rounded(px(4.0))
+                        .cursor_pointer()
+                        .hover(|el| el.bg(ui::border_subtle()))
+                        .tooltip(move |window, cx| {
+                            Tooltip::new(t("app", "titleBar.status.done")).build(window, cx)
+                        })
+                        .child(
+                            StatusDot::new("strip-unread-done", StatusKind::AiIdle)
+                                .size(px(14.0))
+                                .color(ui::color_success())
+                                .contrast(ui::bg_surface()),
+                        )
+                        .on_click(cx.listener(|this, _event, window, cx| {
+                            this.on_jump_attention(&JumpAttention, window, cx);
+                        })),
                 )
             });
 
@@ -712,6 +731,21 @@ impl Render for Workspace {
             .flex()
             .bg(ui::bg_base())
             .text_color(ui::text_primary())
+            // 主题包背景图:**窗口级**铺一张,与原版挂 `#root` 同位置 ——
+            // 三栏都透着同一张图(面板底色带 surface_opacity、终端「默认背景不发
+            // quad」,两条一起让图透上来)。
+            //
+            // ⚠️ 与 `TerminalView::set_background_art` 的逐终端那一路**二选一**:
+            // 同时开等于同一块像素画两遍图、两层纱罩把 dim 平方。逐终端那路
+            // 从没接过线(`pane.rs` 不调 `set_background_art`),这里是唯一一处。
+            .when_some(background, |el, art| {
+                el.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .child(mt_ui::background_art(art)),
+                )
+            })
             .key_context("Workspace")
             .on_action(cx.listener(Self::on_new_terminal))
             .on_action(cx.listener(Self::on_close_pane))

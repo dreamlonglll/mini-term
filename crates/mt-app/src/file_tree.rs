@@ -23,6 +23,7 @@ use gpui::{
 };
 use mt_project::fs::FileEntry;
 use mt_project::watch::FsWatcher;
+use mt_ui::icons::FileIcon;
 
 use crate::i18n::t;
 use crate::store::AppStore;
@@ -313,6 +314,19 @@ impl FileTree {
         } else {
             ui::color_file()
         };
+        // 图标按文件名/是否目录/是否展开取类别(`FileIcon` 内含 53 类映射,
+        // 「特殊文件名压扩展名」的语义也在那边:Cargo.lock 是锁文件不是 toml)。
+        //
+        // `.gitignore` 掉的条目统一压成 muted,与文字同色;其余用类别自带的
+        // 语言色。git 状态着色(修改/新增/冲突)是后续批次,这里先不传。
+        let icon = {
+            let icon = FileIcon::new(&row.name, row.is_dir, row.expanded).size(px(14.0));
+            if row.ignored {
+                icon.color(ui::text_muted())
+            } else {
+                icon
+            }
+        };
 
         div()
             .id(SharedString::from(format!("fs-{}", row.path.display())))
@@ -341,6 +355,7 @@ impl FileTree {
                         el.child(if row.expanded { "▾" } else { "▸" })
                     }),
             )
+            .child(icon)
             .child(div().child(row.name))
             .into_any_element()
     }

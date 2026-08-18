@@ -1,16 +1,52 @@
 //! 左栏:项目列表。对应 `src/components/ProjectList.tsx` 的主干
 //!(分组 / 拖拽排序 / 右键菜单 / worktree 子项目是后续批次)。
+//!
+//! # 领位图标
+//!
+//! 原版是「SSH > 技术栈 > 通用」三选一,**恒显**(每行都有图标,缩进才对得齐)。
+//! 这里没有 SSH 远程项目(mt-ssh 未进 crates/),所以只剩两档:
+//! 技术栈徽标([`mt_ui::icons::TechIcon`])/ 通用目录图标。
+//!
+//! ⚠️ 技术栈**只认 `kindOverride`**:原版还有一路 `useProjectKinds` 探测
+//! (扫项目根的 `Cargo.toml` / `package.json` 之类),那是带缓存的异步批量任务,
+//! 留给后续批次;探测接上之前,没手动设过类型的项目一律走通用图标。
 
 use gpui::{
-    Context, Entity, InteractiveElement, IntoElement, ParentElement, Render, SharedString,
-    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
+    AnyElement, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
+    SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
+use mt_ui::icons::{FileIcon, FileKind, ProjectKind, TechIcon};
 
 use crate::i18n::t;
 use crate::modal;
 use crate::store::AppStore;
 use crate::tree::PaneStatus;
 use crate::ui;
+
+/// 项目行的领位图标。`kind` 认得出就是技术栈徽标,否则退通用目录图标
+/// (对应原版认不出时的 `Package` 兜底,同样取 `--color-file`)。
+fn project_icon(kind: Option<ProjectKind>) -> AnyElement {
+    match kind {
+        Some(kind) => TechIcon::new(kind).size(px(14.0)).into_any_element(),
+        None => FileIcon::of_kind(FileKind::Directory)
+            .size(px(14.0))
+            .color(ui::color_file())
+            .into_any_element(),
+    }
+}
+
+/// 一行要画的东西。渲染前先从 store 抠出来 —— `store.read(cx)` 的借用
+/// 活不过 `cx.listener`,一行 6 个字段用元组已经读不清了。
+struct Row {
+    id: String,
+    name: String,
+    path: String,
+    status: PaneStatus,
+    /// 非激活项目里有 AI 任务完成(行尾那颗绿点)。
+    needs_attention: bool,
+    /// 领位图标的技术栈;`None` = 走通用目录图标。
+    kind: Option<ProjectKind>,
+}
 
 pub struct ProjectList {
     store: Entity<AppStore>,
@@ -27,23 +63,33 @@ impl Render for ProjectList {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let store = self.store.read(cx);
         let active = store.active_project_id.clone();
-        let rows: Vec<(String, String, String, PaneStatus, bool)> = store
+        let rows: Vec<Row> = store
             .projects()
             .iter()
             .map(|p| {
                 let state = store.project_state(&p.id);
-                (
-                    p.id.clone(),
-                    p.name.clone(),
-                    p.path.clone(),
-                    state.map(|s| s.status).unwrap_or(PaneStatus::Idle),
-                    state.map(|s| s.needs_attention).unwrap_or(false),
-                )
+                Row {
+                    id: p.id.clone(),
+                    name: p.name.clone(),
+                    path: p.path.clone(),
+                    status: state.map(|s| s.status).unwrap_or(PaneStatus::Idle),
+                    needs_attention: state.map(|s| s.needs_attention).unwrap_or(false),
+                    // "none" = 用户选了「不显示」,认不出的值同样落到通用图标
+                    kind: p.kind_override.as_deref().and_then(ProjectKind::from_str),
+                }
             })
             .collect();
 
         let mut list = div().flex().flex_col().flex_1().overflow_hidden();
-        for (id, name, path, status, needs_attention) in rows {
+        for Row {
+            id,
+            name,
+            path,
+            status,
+            needs_attention,
+            kind,
+        } in rows
+        {
             let is_active = active.as_deref() == Some(id.as_str());
             let id_click = id.clone();
             let id_remove = id.clone();
@@ -71,7 +117,14 @@ impl Render for ProjectList {
                         this.store
                             .update(cx, |store, cx| store.set_active_project(&id_click, cx));
                     }))
-                    .child(ui::status_dot(status))
+                    // 领位是**项目身份图标**(原版的顺序:身份图标 → … → 状态灯),
+                    // 每行都有、缩进才对得齐
+                    .child(project_icon(kind))
+                    // 状态灯的动画 id 拿项目 id 拼:跨帧稳定、逐行唯一
+                    .child(ui::status_dot(
+                        SharedString::from(format!("status-project-{id}")),
+                        status,
+                    ))
                     .child(
                         div()
                             .flex_1()

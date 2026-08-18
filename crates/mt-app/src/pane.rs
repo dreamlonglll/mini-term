@@ -35,12 +35,13 @@ use futures::StreamExt;
 use futures::channel::mpsc;
 use gpui::{
     App, AppContext, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    IntoElement, ParentElement, Render, Styled, Task, Window, div, prelude::FluentBuilder, px,
+    IntoElement, ParentElement, Pixels, Point, Render, Styled, Task, Window, div,
+    prelude::FluentBuilder, px,
 };
 use mt_pty::{PtySession, PtySpawn};
 use mt_terminal::alacritty_terminal::event::Event as TermEvent;
 use mt_terminal::{TermSize, TerminalEmulator};
-use mt_ui::{TerminalStyle, TerminalTheme, TerminalView};
+use mt_ui::{CopiedTip, DwellConfig, TerminalStyle, TerminalTheme, TerminalView};
 
 use crate::ai::AiBridge;
 
@@ -81,6 +82,12 @@ pub struct TerminalPane {
     exited: bool,
     /// PTY 起不来时的错误文本(直接显示给用户,不吞)。
     spawn_error: Option<String>,
+    /// 「已复制」气泡的落点(**元素相对**坐标)。`None` = 不显示。
+    /// 1s 后由自撤任务清掉,与旧版 `tipTimer` 同语义。
+    copied_tip: Option<Point<Pixels>>,
+    /// 气泡自撤任务的句柄。存着是为了「连着复制两次」时上一个计时器被丢弃 ——
+    /// 否则第一次的计时器到点会把第二次刚弹出来的气泡提前抹掉。
+    _tip_timer: Option<Task<()>>,
     /// 唤醒任务的句柄。掉了任务就没了,必须存着。
     _wake: Task<()>,
 }
@@ -97,6 +104,7 @@ impl TerminalPane {
         user_env: Vec<(String, String)>,
         style: TerminalStyle,
         theme: TerminalTheme,
+        dwell: DwellConfig,
         ai: AiBridge,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -175,6 +183,8 @@ impl TerminalPane {
         let view = {
             let this = cx.weak_entity();
             let this_for_input = this.clone();
+            let this_for_tip = this.clone();
+            let tip_duration = dwell.tip_duration;
             cx.new(|vcx| {
                 TerminalView::new(
                     ("terminal", pty_id),
@@ -206,6 +216,25 @@ impl TerminalPane {
                         pane.write(&bytes, cx);
                     });
                 })
+                // 拖选停留自动复制(`config.selectionAutoCopySecs`)。剪贴板由
+                // mt-ui 写,宿主只负责那颗「已复制」气泡:origin 是**元素相对**
+                // 坐标(mt-ui 已按容器宽度贴边收拢),分屏右侧也不会算歪。
+                .selection_dwell(dwell)
+                .on_selection_copied(move |_text, origin, _window, cx| {
+                    let _ = this_for_tip.update(cx, |pane: &mut TerminalPane, cx| {
+                        pane.copied_tip = Some(origin);
+                        cx.notify();
+                        // 1s 后自撤(旧版 tipTimer 就是这么做的);句柄存回字段,
+                        // 连着复制两次时上一个计时器随之被丢弃
+                        pane._tip_timer = Some(cx.spawn(async move |pane, cx| {
+                            cx.background_executor().timer(tip_duration).await;
+                            let _ = pane.update(cx, |pane: &mut TerminalPane, cx| {
+                                pane.copied_tip = None;
+                                cx.notify();
+                            });
+                        }));
+                    });
+                })
             })
         };
 
@@ -222,6 +251,8 @@ impl TerminalPane {
             ai,
             exited: false,
             spawn_error,
+            copied_tip: None,
+            _tip_timer: None,
             _wake: wake,
         }
     }
@@ -378,6 +409,15 @@ impl Render for TerminalPane {
             .relative()
             .bg(self.theme.background)
             .child(self.view.clone())
+            // 「已复制」气泡:叠在终端之上,坐标是元素相对值
+            .when_some(self.copied_tip, |el, origin| {
+                el.child(
+                    div().absolute().left(origin.x).top(origin.y).child(
+                        CopiedTip::new(crate::i18n::t("terminal", "copied"))
+                            .colors(crate::ui::bg_overlay(), crate::ui::text_primary()),
+                    ),
+                )
+            })
             // 子进程没了但 pane 留着(与旧版一致:画面可回看,不自动关)
             .when(self.exited, |el| {
                 el.child(
@@ -387,10 +427,9 @@ impl Render for TerminalPane {
                         .right_3()
                         .text_size(px(12.0))
                         .text_color(crate::ui::color_error())
-                        // TODO(i18n): 旧版没有这个角标(子进程退出后 pane 直接标红),
-                        // 字典里也就没有对应 key。等 TS 侧补 `paneGroup.shellExited`
-                        // (zh「shell 已退出」/ en "shell exited")后换过来。
-                        .child("shell 已退出"),
+                        // 旧版没有这个角标(子进程退出后 pane 直接标红),
+                        // `paneGroup.shellExited` 是 M 批往 TS 源头补的条目。
+                        .child(crate::i18n::t("paneGroup", "shellExited")),
                 )
             })
     }

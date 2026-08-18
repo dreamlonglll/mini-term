@@ -31,16 +31,15 @@
 //! # 已知缺口
 //!
 //! `skin`(内置皮肤 blueprint / fluent2)没有实现:GPUI 侧还没有对应的
-//! 内置皮肤色表,当前一律按 `none` 处理。背景图([`BackgroundArt`])只把数据
-//! 带出来,渲染归 mt-ui(见 `theme_bridge` 末尾的 TODO)。
+//! 内置皮肤色表,当前一律按 `none` 处理。背景图([`BackgroundArt`])在这里只
+//! 算出参数,**渲染由 `main.rs` 的根容器窗口级铺**(与原版挂 `#root` 同位置)。
 
 use gpui::{App, Window, WindowAppearance};
-use gpui_component::{Theme, ThemeMode, ThemeRegistry};
 use mt_config::AppConfig;
 use mt_ui::TerminalTheme;
 use mt_ui::theme_bridge::{
-    self, Appearance, AppliedThemePack, BackgroundArt, ThemePackDef, builtin_dark_terminal_theme,
-    builtin_terminal_theme,
+    self, Appearance, BackgroundArt, ThemePackDef, builtin_dark_terminal_theme,
+    builtin_terminal_theme, switch_to_builtin, switch_to_theme_pack,
 };
 
 use crate::ui::Palette;
@@ -55,7 +54,8 @@ pub struct AppliedTheme {
     pub palette: Palette,
     /// 终端配色(已经过 `terminalFollowTheme` 这一闸)。
     pub terminal: TerminalTheme,
-    /// 有背景图时的氛围层参数。**渲染未实现**,先把数据带出来。
+    /// 有背景图时的氛围层参数。落进 `AppStore::background_art`,由 `Workspace`
+    /// 的根容器窗口级铺(`mt_ui::background_art`)。
     pub background: Option<BackgroundArt>,
     /// 外置主题包加载失败时带回那个 id —— 调用方据此清掉内存里的
     /// `config.custom_theme_id`(不落盘)。
@@ -82,15 +82,6 @@ fn theme_packs() -> mt_config::ThemePacks {
     mt_config::ThemePacks::at(crate::app_data_dir().join("themes"))
 }
 
-/// 读一个外置主题包并算出全部产物(不改任何全局状态)。
-fn load_pack(theme_id: &str) -> anyhow::Result<(ThemePackDef, AppliedThemePack)> {
-    let packs = theme_packs();
-    let data = packs.read(theme_id)?;
-    let def = theme_bridge::parse_theme_pack(theme_id, &data.theme_json)?;
-    let applied = theme_bridge::resolve_theme_pack(&def, Some(&data.dir));
-    Ok((def, applied))
-}
-
 /// 可用的外置主题包(坏包跳过,设置页的皮肤列表用它)。
 #[allow(dead_code)] // 设置面板「外观」页的落点(下一批)
 pub fn list_packs() -> Vec<(ThemePackDef, std::path::PathBuf)> {
@@ -100,49 +91,25 @@ pub fn list_packs() -> Vec<(ThemePackDef, std::path::PathBuf)> {
     })
 }
 
-/// 把 gpui-component 的主题层恢复成内置明暗基线。
-///
-/// **不能只调 `Theme::change(mode)`**:`install_gpui_theme` 会把皮肤的
-/// `ThemeConfig` 写进 `Theme::dark_theme`/`light_theme`,那是**持久**的覆盖 ——
-/// 退出皮肤时不把它换回注册表里的默认值,浮层会一直停在皮肤配色上。
-fn install_builtin_gpui_theme(appearance: Appearance, window: Option<&mut Window>, cx: &mut App) {
-    let dark = appearance.is_dark();
-    let mode = if dark { ThemeMode::Dark } else { ThemeMode::Light };
-    // Theme 全局可能还没建(`gpui_component::init` 之前),先建一个
-    if !cx.has_global::<Theme>() {
-        Theme::change(mode, None, cx);
-    }
-    let default = {
-        let registry = ThemeRegistry::global(cx);
-        if dark {
-            registry.default_dark_theme().clone()
-        } else {
-            registry.default_light_theme().clone()
-        }
-    };
-    {
-        let theme = Theme::global_mut(cx);
-        if dark {
-            theme.dark_theme = default;
-        } else {
-            theme.light_theme = default;
-        }
-    }
-    Theme::change(mode, window, cx);
-}
-
 /// 按配置装配主题。**这是唯一的装配入口**(启动、切亮暗、切皮肤都走它)。
-pub fn apply(config: &AppConfig, window: Option<&mut Window>, cx: &mut App) -> AppliedTheme {
+///
+/// 两条分支各自只有一个 mt-ui 调用:
+///
+/// - 有皮肤 → [`switch_to_theme_pack`](mt_ui::theme_bridge::switch_to_theme_pack)
+///   (读包 → 校验 → 装进 gpui-component 主题层,一步到位);
+/// - 无皮肤 / 皮肤读不出来 → [`switch_to_builtin`](mt_ui::theme_bridge::switch_to_builtin)
+///   (**内含**把 `Theme::dark_theme`/`light_theme` 从 `ThemeRegistry` 恢复回内置基线
+///   这一步 —— 少了它「退出皮肤」只切 mode,浮层会原地停在皮肤配色上)。
+pub fn apply(config: &AppConfig, mut window: Option<&mut Window>, cx: &mut App) -> AppliedTheme {
     let follow = config.terminal_follow_theme;
 
     if let Some(theme_id) = config.custom_theme_id.as_deref() {
-        match load_pack(theme_id) {
-            Ok((def, applied)) => {
-                theme_bridge::install_gpui_theme(&applied, window, cx);
-                let palette = Palette::from_pack(&def, &applied);
+        // 失败时还要用 window 走回落分支,所以这里传一份重借
+        match switch_to_theme_pack(&theme_packs(), theme_id, window.as_deref_mut(), cx) {
+            Ok(applied) => {
                 return AppliedTheme {
-                    appearance: def.appearance,
-                    palette,
+                    appearance: applied.appearance,
+                    palette: Palette::from_pack(&applied),
                     // 终端不跟随主题时用内置暗色 —— 与旧版一字不差
                     terminal: if follow {
                         applied.terminal.clone()
@@ -156,7 +123,9 @@ pub fn apply(config: &AppConfig, window: Option<&mut Window>, cx: &mut App) -> A
             Err(err) => {
                 eprintln!("[theme] 自定义主题 {theme_id} 加载失败,回落内置外观: {err:#}");
                 let appearance = resolve_appearance(&config.theme, cx);
-                install_builtin_gpui_theme(appearance, window, cx);
+                // 返回值就是该明暗的内置终端配色;`terminalFollowTheme` 那道闸
+                // 在 builtin_terminal 里(关掉时固定暗色),所以这里不直接用它
+                let _ = switch_to_builtin(appearance, window, cx);
                 return AppliedTheme {
                     appearance,
                     palette: builtin_palette(appearance),
@@ -169,7 +138,7 @@ pub fn apply(config: &AppConfig, window: Option<&mut Window>, cx: &mut App) -> A
     }
 
     let appearance = resolve_appearance(&config.theme, cx);
-    install_builtin_gpui_theme(appearance, window, cx);
+    let _ = switch_to_builtin(appearance, window, cx);
     AppliedTheme {
         appearance,
         palette: builtin_palette(appearance),
@@ -261,7 +230,7 @@ mod tests {
     fn 主题包映射进壳配色() {
         let def = theme_bridge::parse_theme_pack("t", &minimal_pack_json("")).unwrap();
         let applied = theme_bridge::resolve_theme_pack(&def, None);
-        let p = Palette::from_pack(&def, &applied);
+        let p = Palette::from_pack(&applied);
 
         let hex = |c: gpui::Hsla| {
             let rgba = gpui::Rgba::from(c);
@@ -297,7 +266,7 @@ mod tests {
         );
         let def = theme_bridge::parse_theme_pack("t", &json).unwrap();
         let applied = theme_bridge::resolve_theme_pack(&def, None);
-        let p = Palette::from_pack(&def, &applied);
+        let p = Palette::from_pack(&applied);
         assert_ne!(p.color_success, Palette::dark().color_success);
         assert_ne!(p.color_info, Palette::dark().color_info);
     }
@@ -308,7 +277,7 @@ mod tests {
         let json = minimal_pack_json("").replace("\"dark\"", "\"light\"");
         let def = theme_bridge::parse_theme_pack("t", &json).unwrap();
         let applied = theme_bridge::resolve_theme_pack(&def, None);
-        let p = Palette::from_pack(&def, &applied);
+        let p = Palette::from_pack(&applied);
         assert_eq!(p.color_error, Palette::light().color_error);
         assert_eq!(p.color_folder, Palette::light().color_folder);
     }

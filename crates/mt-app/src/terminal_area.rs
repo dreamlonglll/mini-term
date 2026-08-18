@@ -37,6 +37,7 @@ use gpui::{
     Styled, Window, canvas, div, prelude::FluentBuilder, px,
 };
 use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel, v_resizable};
+use mt_ui::icons::{AiVendor, BrandIcon};
 
 use crate::focus_nav::{self, Direction, PaneRect};
 use crate::i18n::{t, tr};
@@ -251,6 +252,22 @@ impl TerminalArea {
             .map(|id| panes.iter().any(|p| p.id == id))
             .unwrap_or(false);
         let unread: Vec<bool> = panes.iter().map(|p| store.is_pane_unread_done(&p.id)).collect();
+        // tab 上的 AI 品牌图标:显示条件与 agent 取值都照抄原版(见 PaneState 上
+        // 的两个方法);`aiAutoResume` 缺省开启,与 store 里那处取值同口径
+        let auto_resume = store.config().ai_auto_resume.unwrap_or(true);
+        let vendors: Vec<Option<AiVendor>> = panes
+            .iter()
+            .map(|p| {
+                if !p.shows_ai_session(auto_resume) {
+                    return None;
+                }
+                let agent = p.ai_agent()?;
+                // CLI 名直取(claude/codex/grok),其余 CLI(opencode/pi/gemini…)
+                // 走与前端 `inferVendor` 同规则同优先级的词匹配 —— 原版 tab 上
+                // 调的就是 `inferVendor({ agent })`,只认三家会漏掉它们的图标
+                AiVendor::from_session_type(agent).or_else(|| AiVendor::infer(Some(agent), None))
+            })
+            .collect();
 
         let active_id = active.id.clone();
         let pid = project_id.to_string();
@@ -276,6 +293,7 @@ impl TerminalArea {
             let pid_rename = pid.clone();
             let label = pane.label().to_string();
             let has_unread = unread.get(idx).copied().unwrap_or(false);
+            let vendor = vendors.get(idx).copied().flatten();
             bar = bar.child(
                 div()
                     .id(gpui::SharedString::from(format!("tab-{}", pane.id)))
@@ -318,7 +336,27 @@ impl TerminalArea {
                             store.activate_pane(&pid_click, &pane_id, window, cx)
                         });
                     }))
-                    .child(ui::status_dot(pane.status))
+                    // 动画 id 拿 pane id 拼(跨帧稳定、逐 tab 唯一);**不能用循环
+                    // 下标** —— 删掉中间一个 tab 会让后面所有状态灯的动画进度跳一格
+                    .child(ui::status_dot(
+                        gpui::SharedString::from(format!("status-pane-{}", pane.id)),
+                        pane.status,
+                    ))
+                    // AI 品牌图标(原版 `PaneGroup.tsx` 的 `aiActive && <BrandIcon/>`):
+                    // 只在这个 pane 真有 AI 会话身份时出现,认不出厂商就不占位
+                    .when_some(vendor, |el, vendor| {
+                        el.child(
+                            BrandIcon::new(Some(vendor))
+                                .size(px(12.0))
+                                // VectorIcon 不继承 text_color,跟着 tab 的明暗自己喂
+                                .color(if is_active {
+                                    ui::text_primary()
+                                } else {
+                                    ui::text_muted()
+                                })
+                                .contrast(ui::bg_elevated()),
+                        )
+                    })
                     .child(div().child(pane.label().to_string()))
                     // 未读完成标(窗口没聚焦时完成的任务)
                     .when(has_unread, |el| {

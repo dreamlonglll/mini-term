@@ -22,9 +22,13 @@
 //! # 文案 key 从哪来
 //!
 //! 一律照抄 TS 侧 `src/i18n/locales/*.ts` 里同一句文案的 `ns.key`,
-//! 不新造 key:字典是 `tools/gen_from_ts.mjs` 从 TS 生成的,手加的条目下次
-//! 重新生成就没了。原版没有对应文案的 GPUI 专属串留 `TODO(i18n)` 注释,
-//! 等 TS 侧补齐后再换过来。
+//! **不在 Rust 侧新造 key**:字典是 `tools/gen_from_ts.mjs` 从 TS 生成的,
+//! 手加进 `dict.rs` 的条目下次重新生成就没了。
+//!
+//! GPUI 专属的文案(原版界面上压根没有的串)照样走这条路:先在 TS 侧
+//! `locales/<ns>.ts` 里 zh/en 双语加词条,再 `node crates/mt-i18n/tools/gen_from_ts.mjs`
+//! 重生成字典,并把 `mt-i18n/tests/consistency.rs` 里的条目总数对账常量改成
+//! 新数目 —— 这是文档记载的正常再生成流程,不是「改断言迁就实现」。
 
 use gpui::App;
 
@@ -127,12 +131,16 @@ const USED_KEYS: &[&str] = &[
     "fileTree.prompt.renameMessage",
     "fileViewer.back",
     "paneGroup.renameTerminal",
+    "paneGroup.shellExited",
     "paneGroup.startFailed",
     "paneGroup.starting",
     "panels.files",
     "panels.projects",
     "panels.sessions",
+    "projectList.chooseDirDialogTitle",
     "projectList.menu.addProject",
+    "projectList.pathHint",
+    "projectList.pathPlaceholder",
     "projectList.removeConfirm.cancel",
     "projectList.removeConfirm.confirm",
     "projectList.removeConfirm.messagePrefix",
@@ -166,10 +174,12 @@ const USED_KEYS: &[&str] = &[
     "settings.font.terminalFontSize",
     "settings.terminal.addTerminal",
     "settings.terminal.availableTerminals",
+    "settings.terminal.fontSizeNewOnly",
     "settings.terminal.newArgsPlaceholder",
     "settings.terminal.newCommandPlaceholder",
     "settings.terminal.newNamePlaceholder",
     "settings.title",
+    "terminal.copied",
     "terminalArea.emptyTitle",
     "terminalArea.newTerminal",
     "toast.aiAttention",
@@ -178,12 +188,15 @@ const USED_KEYS: &[&str] = &[
     "usageStats.byModel",
     "usageStats.byProject",
     "usageStats.byProvider",
+    "usageStats.byShell",
+    "usageStats.byTool",
     "usageStats.dailyActivity",
     "usageStats.kpi.cacheHit",
     "usageStats.kpi.calls",
     "usageStats.kpi.cost",
     "usageStats.kpi.sessions",
     "usageStats.pricingError",
+    "usageStats.pricingLocalHint",
     "usageStats.range.days30",
     "usageStats.range.days7",
     "usageStats.range.month",

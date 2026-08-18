@@ -726,11 +726,13 @@ impl Render for UsagePanel {
                     .text_color(ui::text_secondary())
                     // 旧版是 fetch models.dev 失败时的 `pricingError` 提示;
                     // GPUI 侧改读本地 model-pricing.json,场景一致(拿不到价格 →
-                    // 成本不可信),文案沿用同一条 key。
-                    // TODO(i18n): 「把 models.dev 的价格表存成 model-pricing.json 放进
-                    // 应用数据目录即可」这句怎么补救是 GPUI 特有的,原版没有对应
-                    // key,等 TS 侧补 `usageStats.pricingLocalHint` 后接在后面。
-                    .child(t("usageStats", "pricingError")),
+                    // 成本不可信),文案沿用同一条 key,后面接上 GPUI 特有的补救
+                    // 办法(`pricingLocalHint` 是 M 批往 TS 源头补的条目)。
+                    .child(format!(
+                        "{} · {}",
+                        t("usageStats", "pricingError"),
+                        t("usageStats", "pricingLocalHint")
+                    )),
             );
         }
         if let Some(err) = &self.error {
@@ -959,14 +961,13 @@ impl Render for UsagePanel {
 
                 // 工具 / Shell / MCP 计数排行。
                 //
-                // TODO(i18n): 这三块是 GPUI 侧新加的(`byTool`/`byShell`/`byMcp` 在
-                // `types.ts` 里有类型,旧版面板从没渲染过),字典里没有对应 key。
-                // 等 TS 侧补 `usageStats.byTool` / `usageStats.byShell` 后换过来
-                // (zh「工具」「Shell 命令」/ en "Tools" "Shell commands");
+                // 这三块是 GPUI 侧新加的(`byTool`/`byShell`/`byMcp` 在 `types.ts`
+                // 里有类型,旧版面板从没渲染过),`usageStats.{byTool,byShell}`
+                // 由 M 批补进 TS 源头;MCP 是专有名词,与厂商名一样不进字典。
                 // `id` 用不随语言变的稳定前缀,免得切语言把元素身份也换了。
                 for (id, title, items) in [
-                    ("tool", "工具", &stats.by_tool),
-                    ("shell", "Shell 命令", &stats.by_shell),
+                    ("tool", t("usageStats", "byTool"), &stats.by_tool),
+                    ("shell", t("usageStats", "byShell"), &stats.by_shell),
                     ("mcp", "MCP", &stats.by_mcp),
                 ] {
                     if items.is_empty() {

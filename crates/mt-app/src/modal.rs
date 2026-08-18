@@ -303,10 +303,9 @@ fn render_terminal_settings(
                             div()
                                 .text_size(px(11.0))
                                 .text_color(ui::text_muted())
-                                // TODO(i18n): 原版终端字号是热更新的,没有这句提示,
-                                // 字典里也就没有对应 key。等 TS 侧补
-                                // `settings.terminal.fontSizeNewOnly` 后换过来。
-                                .child("改动作用于新建的终端"),
+                                // 原版终端字号是热更新的,没有这句提示;
+                                // `settings.terminal.fontSizeNewOnly` 是 M 批补的条目。
+                                .child(t("settings", "terminal.fontSizeNewOnly")),
                         ),
                 ),
         )
@@ -559,12 +558,10 @@ pub fn open_confirm_remove_project(
 /// gpui 直接给了 `prompt_for_paths`,不必自己造;手输那一路留着,是因为 UNC /
 /// WSL 路径在目录选择框里常常点不到。
 pub fn open_add_project(store: Entity<AppStore>, window: &mut Window, cx: &mut App) {
-    // TODO(i18n): 原版加项目走的是系统目录选择框,没有手输框,字典里也就没有
-    // 这条占位串与下面的「浏览目标」提示。等 TS 侧补 `projectList.pathPlaceholder`
-    // 与 `projectList.pathHint` 后换过来。
-    let input = cx.new(|cx| {
-        InputState::new(window, cx).placeholder("项目目录,如 D:\\Git\\mini-term")
-    });
+    // 原版加项目走的是系统目录选择框,没有手输框;这条占位串与下面的路径提示
+    // 是 GPUI 侧独有的,`projectList.{pathPlaceholder,pathHint}` 由 M 批补进 TS 源头。
+    let input =
+        cx.new(|cx| InputState::new(window, cx).placeholder(t("projectList", "pathPlaceholder")));
     input.update(cx, |state, cx| state.focus(window, cx));
 
     window.open_dialog(cx, move |dialog, _window, _cx| {
@@ -594,12 +591,14 @@ pub fn open_add_project(store: Entity<AppStore>, window: &mut Window, cx: &mut A
                             .child(ui::ghost_button("browse-dir", t("worktree", "browse")).on_click(
                                 move |_, window, cx| {
                                     let paths = cx.prompt_for_paths(PathPromptOptions {
-                                        // TODO(i18n): 系统目录选择框的标题;原版没有
-                                        // 对应 key(它用的是 Tauri 的默认标题)。
                                         files: false,
                                         directories: true,
                                         multiple: false,
-                                        prompt: Some("选择项目目录".into()),
+                                        // 系统目录选择框的标题。原版用的是 Tauri
+                                        // 的默认标题,这条 key 是 M 批新补的
+                                        prompt: Some(
+                                            t("projectList", "chooseDirDialogTitle").into(),
+                                        ),
                                     });
                                     let input = input_for_browse.clone();
                                     window
@@ -625,8 +624,8 @@ pub fn open_add_project(store: Entity<AppStore>, window: &mut Window, cx: &mut A
                         div()
                             .text_size(px(11.0))
                             .text_color(ui::text_muted())
-                            // TODO(i18n): 见上面手输框的说明,原版没有这条提示。
-                            .child("目录不存在时不会添加。"),
+                            // 见上面手输框的说明,原版没有这条提示。
+                            .child(t("projectList", "pathHint")),
                     ),
             )
             .on_ok(move |_: &ClickEvent, _window, cx| {

@@ -28,6 +28,7 @@ use gpui::{
 };
 use gpui_component::tooltip::Tooltip;
 use mt_ai::sessions::{AiSession, AiSessionMessage};
+use mt_ui::icons::{AiVendor, BrandIcon};
 
 use crate::i18n::{t, tr};
 use crate::store::AppStore;
@@ -501,11 +502,10 @@ impl Render for SessionPanel {
             let can_resume_here = command.is_some() && session.wsl_distro.is_none();
             let title = session.title.clone();
             let time = format_time(&session.timestamp);
-            let badge = match session.session_type.as_str() {
-                "codex" => "CX",
-                "grok" => "GK",
-                _ => "CL",
-            };
+            // 会话行的厂商图标走**模型优先**口径(`vendorForSession`):claude CLI
+            // 挂 GLM / DeepSeek 中转是常见用法,CLI ≠ 模型厂商,认不出模型才回落 CLI。
+            // (pane tab 刻意用另一套口径,见 `PaneState::ai_agent`。)
+            let vendor = AiVendor::for_session(&session.session_type, session.model.as_deref());
             let wsl_badge = session.wsl_distro.clone();
             let session_for_preview = session.clone();
             let cmd_here = command.clone();
@@ -528,11 +528,14 @@ impl Render for SessionPanel {
                             .items_center()
                             .gap(px(6.0))
                             .child(
-                                div()
-                                    .flex_none()
-                                    .text_size(px(10.0))
-                                    .text_color(ui::text_muted())
-                                    .child(badge),
+                                div().flex_none().child(
+                                    BrandIcon::new(vendor)
+                                        .size(px(13.0))
+                                        // VectorIcon 自己画,不继承 text_color:
+                                        // 单色厂商图标与品牌色片上的字形都得显式喂色
+                                        .color(ui::text_secondary())
+                                        .contrast(ui::bg_elevated()),
+                                ),
                             )
                             .child(
                                 div()

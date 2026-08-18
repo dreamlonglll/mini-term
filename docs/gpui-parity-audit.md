@@ -31,7 +31,7 @@
 |---|---|---|---|---|
 | 7 | **上下文菜单基建**（gpui-component popup_menu）——挡住项目列表 12 项、文件树 8 项、tab 7 项、终端 5 项四处右键菜单 | 中 | mt-ui/mt-app | ❌ |
 | 8 | **拖放基建**——项目拖拽排序、拖文件夹加项目、拖文件进终端（外部资源管理器 + 内部 FileTree 两条链路 + 虚线高亮框） | 中 | mt-ui + mt-app | ❌ |
-| 9 | **图标体系** | 中 | mt-ui | 🟡 K 批完成 mt-ui 侧组件（BrandIcon 11 家/TechIcon 12 种/FileIcon 53 类含特殊文件名压扩展名/StatusDot 四态勾叉+900ms 旋转动画；全自绘矢量——gpui 0.2.2 的 svg() 是单色掩膜、Image SVG 分支漏 BGRA 交换红蓝互换，判据在 vector.rs 头注释）；剩 mt-app 消费替换（接线清单在看板「Wave 4.5」段） |
+| 9 | **图标体系** | 中 | mt-ui | ✅ K 批组件（BrandIcon 11 家/TechIcon 12 种/FileIcon 53 类/StatusDot 四态勾叉+900ms 旋转；全自绘矢量，判据在 vector.rs 头注释）+ M 批消费（状态灯/tab 与会话面板品牌图标含 or_else(infer) 补 opencode/pi、项目列表 TechIcon、文件树 FileIcon、边条 44px 图标化逐点照抄 ActivityBar SVG + 全局 AI 徽标）。留：dirKinds 探测（TechIcon 现只认 kindOverride）、文件树 git 着色、项目行状态灯位置（原版行尾且 idle 不显示） |
 | 10 | **通用命令式弹窗**（prompt/confirm/alert）+ 关闭 pane/整组的 AI 感知确认框（现直接关不确认） | 小 | mt-app | ❌ |
 | 11 | **终端滚动条** | 中 | mt-ui | ✅ K 批。6px 样式照抄 styles.css；alt screen 不画；不打穿 damage 缓存（只在 paint 发 quad）；滑块分母 total-screen；闲置按时间算 alpha 淡出（不用 with_animation 防持续请求帧）、回看中保留 50% 残留；宿主零改动默认生效 |
 
@@ -43,7 +43,7 @@
 | 13 | **项目分组**：分组行渲染 + 折叠 + createGroup/removeGroup/renameGroup/toggleGroupCollapse/moveItem 五个 action + 拖拽 + 分组右键菜单（`ProjectTreeItem::Group` 已有数据从不渲染） | 大 | mt-app | ❌ |
 | 14 | 文件树：右键菜单 8 项（后端 fs.rs 已备）+ 头部三按钮（搜索/刷新/外部编辑器选择器）+ loading/错误态 + 键盘导航 + git 状态着色 + 根级单链目录压缩 + 技术栈图标 | 中 | mt-app | ❌ |
 | 15 | tab 栏：右键菜单 7 项 + 新建按钮 shell 选择菜单 + 横向滚动 + hover 缩略图 + AI 品牌图标 + 关闭确认 | 中 | mt-app | ❌ |
-| 16 | 终端右键菜单（复制/粘贴/fork 会话/分支树/SSH 子菜单）+ 拖选**停留 1s**自动复制（selectionAutoCopySecs 可配，现为松开即复制）+「已复制」气泡 | 中 | mt-app + mt-ui | ❌ |
+| 16 | 终端右键菜单（复制/粘贴/fork 会话/分支树/SSH 子菜单） | 中 | mt-app + mt-ui | 🟡 拖选停留复制+「已复制」气泡 ✅（K 组件+M 接线，selection_auto_copy_secs.unwrap_or(1.0) 对齐前端 ?? 1；设置项 UI 归 #19，接上时须连带给存量终端 set_selection_dwell）；右键菜单仍缺（→#7 基建批） |
 | 17 | 用量面板：custom 自选起止日期 + 自动刷新档位（0/5/10/30/60s 默认 5s）+ 单项目下拉（现仅当前项目开关）+ 排行条点击切 scope + Top 会话点开查看 + 骨架屏/数字滚动 + 偏好持久化 + **价格表拉取**（原版 fetch models.dev，Rust 侧需 HTTP 依赖，现读本地 model-pricing.json 缺省按 $0） | 中 | mt-app | ❌ |
 | 18 | 会话面板：平铺⇄树视图切换 + scan_session_lineage 分支连线 + live pane 状态点跳转 + 品牌图标 + spinner；（SSH 远程来源等 mt-ssh 进 crates 后再说） | 中 | mt-app | ❌ |
 | 19 | 设置面板剩余 9 分页：clipboard / appearance / font / ai-notification / ai-hook / system / editor / shortcuts / about（通知三开关现只能手改 config.json）+ 连字/scrollback/UI 字号字族/终端字号热更新（现只作用于新终端） | 大 | mt-app | ❌ |
@@ -66,7 +66,7 @@
 
 ### 其他细项（散落，随所在批次带走）
 
-- ActivityBar：现是 14px 中文字「会/量/设」，应为 44px 图标栏 8 按钮 + accent 指示条 + 全局 AI 徽标闪烁；缺 SSH/移动端/Git 入口与更新红点
+- ActivityBar：🟡 M 批已成 44px 图标栏（PANEL/SESSIONS/STATS/SETTINGS 四钮逐点照抄原版 SVG + accent 竖条 + 全局 AI 徽标 + 跳完成钮）；SSH/移动端/Git 入口与更新红点随对应功能批加，徽标闪烁动画未做
 - 右抽屉应为**悬浮层**（absolute 覆盖在终端上），现做成了第三栏
 - Toast：缺悬停暂停 / × 关闭 / 最多 5 条 / wsl-info、mobile-session、paste-error 三种 kind / 点击跳项目细节
 - Modal 行为：无 overlayStack 快捷键让路；同一 modal 可叠开（缺 isOpen 守卫）

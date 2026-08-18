@@ -26,7 +26,7 @@ use gpui::{App, AppContext, Context, Entity, Global, Subscription, Task, Window}
 use mt_config::{AppConfig, ConfigStore, ProjectConfig, SaveError, ShellConfig};
 use mt_pty::PtySpawn;
 use mt_ui::theme_bridge::BackgroundArt;
-use mt_ui::{TerminalStyle, TerminalTheme};
+use mt_ui::{DwellConfig, TerminalStyle, TerminalTheme};
 
 use crate::ai::{AiBridge, AiEvent};
 use crate::notify::{AlertPlan, DoneTracker, NotifyPrefs, PaneRef, StatusTransition};
@@ -799,10 +799,10 @@ impl AppStore {
 
         let style = self.terminal_style();
         let theme = self.terminal_theme.clone();
+        let dwell = self.selection_dwell();
         let ai = self.ai.clone();
-        let entity = cx.new(|cx| {
-            TerminalPane::new(pty_id, spec, user_env, style, theme, ai, cx)
-        });
+        let entity =
+            cx.new(|cx| TerminalPane::new(pty_id, spec, user_env, style, theme, dwell, ai, cx));
 
         // 子进程退出 → pane 状态 error(与旧版 pty-exit 同语义);
         // 用户键入 → 清 attention 黄灯(与旧版 clearPaneAttentionByPty 同语义)
@@ -815,6 +815,16 @@ impl AppStore {
         self.pane_subs.insert(pty_id, sub);
         self.terminals.insert(pty_id, entity);
         pty_id
+    }
+
+    /// 拖选停留自动复制的参数(`config.selectionAutoCopySecs`)。
+    ///
+    /// **缺省 1 秒**,与前端 `config.selectionAutoCopySecs ?? 1` 一字不差;填 0
+    /// 就是关掉停留语义(退回「松手即复制」)。设置页还没有这一项(GPUI 的设置
+    /// 对话框目前只有字号/终端/语言三段),接上之后要连带给存量终端下发
+    /// `TerminalView::set_selection_dwell` —— 与 `apply_theme` 那条路同形。
+    fn selection_dwell(&self) -> DwellConfig {
+        DwellConfig::from_secs(self.config.selection_auto_copy_secs.unwrap_or(1.0) as f32)
     }
 
     fn terminal_style(&self) -> TerminalStyle {
@@ -1019,6 +1029,23 @@ impl AppStore {
     /// 未读完成数(旧版托盘绿灯的计数,这里给壳内徽章用)。
     pub fn unread_done_count(&self) -> usize {
         self.done.unread_count()
+    }
+
+    /// 全局 AI 状态(边条上那颗徽标点)。逐条对照 `ActivityBar.tsx` 的 `globalStatus`:
+    /// 取所有项目里优先级最高的一档,**`error` 先压成 `idle`** —— 某个 shell
+    /// `exit 1` 不该让整条边栏亮红点,那会盖住真正在跑的 AI。
+    pub fn global_ai_status(&self) -> PaneStatus {
+        let mut highest = PaneStatus::Idle;
+        for state in self.project_states.values() {
+            let status = match state.status {
+                PaneStatus::Error => PaneStatus::Idle,
+                other => other,
+            };
+            if status.priority() > highest.priority() {
+                highest = status;
+            }
+        }
+        highest
     }
 
     pub fn is_pane_unread_done(&self, pane_id: &str) -> bool {

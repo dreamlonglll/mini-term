@@ -124,6 +124,34 @@ impl PaneState {
     pub fn label(&self) -> &str {
         self.custom_title.as_deref().unwrap_or(&self.shell_name)
     }
+
+    /// 这个 pane 该不该显示「AI 会话」身份(tab 上的品牌图标)。
+    /// 逐条照抄 `src/utils/aiResume.ts::paneShowsAiSession`。
+    ///
+    /// 第三条是关键:**待续接**的 pane 只有在自动续接开着时才算「有会话」——
+    /// 开关关着时那份会话身份只是留着备查(用户手动点才续),tab 上挂个品牌图标
+    /// 会让人以为 AI 正跑着。
+    pub fn shows_ai_session(&self, auto_resume_enabled: bool) -> bool {
+        if matches!(self.status, PaneStatus::AiWorking | PaneStatus::AiIdle) {
+            return true;
+        }
+        if self.ai_session.is_none() {
+            return false;
+        }
+        !self.resume_pending || auto_resume_enabled
+    }
+
+    /// tab 上品牌图标该显示哪家。口径与原版 `inferVendor({ agent })` 一致:
+    /// hook 上报的 agent 优先,退到输入检测认出来的 agent。
+    ///
+    /// **不是 `for_session` 的「模型优先」口径** —— tab 表达的是「跑的是哪个 CLI」,
+    /// claude CLI 挂 GLM 中转时 tab 上仍该是 claude。
+    pub fn ai_agent(&self) -> Option<&str> {
+        self.ai_session
+            .as_ref()
+            .and_then(|s| s.agent.as_deref())
+            .or(self.detected_agent.as_deref())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -724,6 +752,40 @@ mod tests {
         let p = root.pane_by_pty(1).unwrap();
         assert!(p.ai_session.is_none(), "退出 AI 会话必须清身份");
         assert!(p.detected_agent.is_none());
+    }
+
+    /// tab 品牌图标的显示条件,逐条对照 `aiResume.ts::paneShowsAiSession`。
+    #[test]
+    fn 是否显示_ai_会话身份() {
+        let mut p = PaneState::new("pwsh");
+        assert!(!p.shows_ai_session(true), "光有 idle 状态不算");
+
+        // AI 态一律算
+        p.status = PaneStatus::AiWorking;
+        assert!(p.shows_ai_session(false));
+        p.status = PaneStatus::AiIdle;
+        assert!(p.shows_ai_session(false));
+
+        // 非 AI 态时看会话身份 + 待续接标记
+        p.status = PaneStatus::Idle;
+        p.ai_session = Some(AiSessionRef {
+            agent: Some("codex".into()),
+            session_id: "s1".into(),
+            cwd: None,
+        });
+        assert!(p.shows_ai_session(false), "有身份且不待续接 → 算");
+        p.resume_pending = true;
+        assert!(
+            !p.shows_ai_session(false),
+            "待续接 + 自动续接关着 → 不算(挂图标会让人以为 AI 在跑)"
+        );
+        assert!(p.shows_ai_session(true), "待续接 + 自动续接开着 → 算");
+
+        // agent 取值:hook 上报优先于输入检测
+        p.detected_agent = Some("claude".into());
+        assert_eq!(p.ai_agent(), Some("codex"));
+        p.ai_session = None;
+        assert_eq!(p.ai_agent(), Some("claude"));
     }
 
     /// attention 与状态解耦:codex 的 PermissionRequest 状态是 ai-working 但要点黄灯。

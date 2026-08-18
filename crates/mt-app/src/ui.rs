@@ -25,8 +25,9 @@ use gpui::{
     Div, ElementId, Hsla, InteractiveElement, IntoElement, ParentElement, Stateful, Styled, div,
     px,
 };
+use mt_ui::icons::{StatusDot, StatusKind};
 use mt_ui::rgb8;
-use mt_ui::theme_bridge::{AppliedThemePack, ThemePackDef, parse_color};
+use mt_ui::theme_bridge::{AppliedThemePack, ThemeSlot};
 
 use crate::tree::PaneStatus;
 
@@ -130,29 +131,29 @@ impl Palette {
 
     /// 外置主题包 → token 表。映射逐条对齐 `themePackManager.ts::buildTokenMap`。
     ///
-    /// `applied` 只用来拿两个已经算好的量:`surface_opacity`(面板半透明度,
-    /// 无背景图时是 1.0)与终端背景色(已含 `terminalOpacity`)。
+    /// 入参只要 [`AppliedThemePack`] 一个:它自带 `colors` 原文与
+    /// [`AppliedThemePack::color`],宿主不必再手拆 read → parse → resolve 四步
+    /// 去够 `ThemePackDef`(见 `crate::theme::apply` 的说明)。这里从它身上取三样:
+    /// 10 个语义色、`surface_opacity`(面板半透明度,无背景图时是 1.0)、
+    /// 终端背景色(已含 `terminalOpacity`)。
     ///
     /// 包里没有的语义色(error / ai-working / folder / file)保留该明暗的内置值 ——
     /// 前端同样不映射它们。`accentAlt` 在前端归到 `--color-warning`,壳里目前没有
     /// 对应 token,丢掉不用。
-    pub fn from_pack(def: &ThemePackDef, applied: &AppliedThemePack) -> Self {
-        let base = if def.appearance.is_dark() {
+    pub fn from_pack(applied: &AppliedThemePack) -> Self {
+        let base = if applied.appearance.is_dark() {
             Self::dark()
         } else {
             Self::light()
         };
-        let c = &def.colors;
-        let color = |raw: &str, fallback: Hsla| -> Hsla {
-            parse_color(raw).map(Into::into).unwrap_or(fallback)
-        };
-        let background = color(&c.background, base.bg_base);
-        let panel = color(&c.panel, background);
-        let panel_alt = color(&c.panel_alt, panel);
-        let accent = color(&c.accent, base.accent);
-        let text = color(&c.text, base.text_primary);
-        let muted = color(&c.muted, base.text_muted);
-        let line = color(&c.line, base.border_default);
+        // 必填槽位在 parse_theme_pack 阶段已校验过色值,color() 不会失败
+        let background = applied.color(ThemeSlot::Background);
+        let panel = applied.color(ThemeSlot::Panel);
+        let panel_alt = applied.color(ThemeSlot::PanelAlt);
+        let accent = applied.color(ThemeSlot::Accent);
+        let text = applied.color(ThemeSlot::Text);
+        let muted = applied.color(ThemeSlot::Muted);
+        let line = applied.color(ThemeSlot::Line);
         let so = applied.surface_opacity;
 
         Self {
@@ -170,16 +171,17 @@ impl Palette {
             accent_subtle: alpha(accent, 0.18),
             border_subtle: alpha(line, 0.6),
             border_default: line,
-            color_success: c
-                .highlight
-                .as_deref()
-                .map(|v| color(v, base.color_success))
-                .unwrap_or(base.color_success),
-            color_info: c
-                .secondary
-                .as_deref()
-                .map(|v| color(v, base.color_info))
-                .unwrap_or(base.color_info),
+            // `color(Highlight/Secondary)` 在包里没声明时会回落 accent(那是
+            // themePackManager 写 CSS 变量的口径),而壳这两格的语义是「成功/信息」,
+            // 回落 accent 会让完成态变成强调色 —— 所以先看 Option 在不在
+            color_success: match applied.colors.highlight {
+                Some(_) => applied.color(ThemeSlot::Highlight),
+                None => base.color_success,
+            },
+            color_info: match applied.colors.secondary {
+                Some(_) => applied.color(ThemeSlot::Secondary),
+                None => base.color_info,
+            },
             ..base
         }
     }
@@ -383,45 +385,29 @@ pub fn status_color(status: PaneStatus) -> Hsla {
     }
 }
 
-/// 四态状态灯。
+/// 四态状态灯([`mt_ui::icons::StatusDot`])。
 ///
-/// 原版是 SVG 的**形状 + 颜色**双编码(空心圈 / 实心带勾 / 半填充圆环 / 实心带叉),
-/// 这里先用「空心圈 vs 实心点 + 外环」表达同一层区分:色觉障碍下仍能靠填充与否
-/// 分出 idle 与其余三态。勾/叉字形等图标体系接上后再补(见交付说明的已知缺口)。
-pub fn status_dot(status: PaneStatus) -> impl IntoElement {
-    let color = status_color(status);
-    let outer = div()
-        .flex()
-        .items_center()
-        .justify_center()
-        .w(px(11.0))
-        .h(px(11.0));
-    match status {
-        // 空心细圈
-        PaneStatus::Idle => outer.child(
-            div()
-                .w(px(9.0))
-                .h(px(9.0))
-                .rounded_full()
-                .border_1()
-                .border_color(color),
-        ),
-        // 实心点(已完成 / 异常)
-        PaneStatus::AiIdle | PaneStatus::Error => {
-            outer.child(div().w(px(9.0)).h(px(9.0)).rounded_full().bg(color))
-        }
-        // 环 + 芯:「进行中」在静态下也要能与「已完成」分开
-        PaneStatus::AiWorking => outer.child(
-            div()
-                .w(px(11.0))
-                .h(px(11.0))
-                .rounded_full()
-                .border_2()
-                .border_color(color)
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(div().w(px(3.0)).h(px(3.0)).rounded_full().bg(color)),
-        ),
-    }
+/// 形状 + 颜色双编码(空心圈 / 实心带勾 / 底环+亮弧 / 实心带叉),`ai-working`
+/// 那段弧 900ms 转一圈 —— 几何与动画都在 mt-ui 侧照抄原版 `StatusDot.tsx`,
+/// 这里只做两件事:`PaneStatus → StatusKind` 的转换,以及把壳的配色表喂进去
+/// (勾/叉是**挖空**语义,`contrast` 必须给面板底色,换主题包时跟着变)。
+///
+/// # ⚠️ `id` 必须逐处唯一且跨帧稳定
+///
+/// `with_animation` 拿它当元素状态的 key:同一帧里两个状态灯共用 id 会共享动画
+/// 进度(看着像同步闪),id 随帧变化则每帧从头转(看着像卡住)。所以调用方一律
+/// 拿 **pane id / 项目 id** 拼,**不许**用循环下标(删掉中间一个 pane 后,后面所有
+/// 状态灯的动画进度会集体跳一格)。
+pub fn status_dot(id: impl Into<ElementId>, status: PaneStatus) -> impl IntoElement {
+    // PaneStatus 住在 mt-app(tree.rs),mt-ui 不能反向依赖,所以在这里转一次
+    let kind = match status {
+        PaneStatus::Idle => StatusKind::Idle,
+        PaneStatus::AiIdle => StatusKind::AiIdle,
+        PaneStatus::AiWorking => StatusKind::AiWorking,
+        PaneStatus::Error => StatusKind::Error,
+    };
+    StatusDot::new(id, kind)
+        .size(px(11.0))
+        .color(status_color(status))
+        .contrast(bg_elevated())
 }

@@ -16,9 +16,14 @@ use mt_i18n::{
 
 /// TS 侧 `src/i18n/locales/*.ts` 数出来的对账数字（生成器 2026-08-18 跑出）：
 /// 32 个命名空间文件（`locales/index.ts` 里 32 条 import 一一对上），
-/// 每种语言 727 条叶子文案。改字典后重跑生成器，这里的数字随 dict.rs 一起更新。
+/// 每种语言 735 条叶子文案。改字典后重跑生成器，这里的数字随 dict.rs 一起更新。
+///
+/// 727 → 735：M 批(mt-app 消费批)补齐 GPUI 侧 8 条缺 key 文案
+/// （`paneGroup.shellExited` / `settings.terminal.fontSizeNewOnly` /
+/// `projectList.{pathPlaceholder,pathHint,chooseDirDialogTitle}` /
+/// `usageStats.{byTool,byShell,pricingLocalHint}`）。
 const EXPECTED_NAMESPACES: usize = 32;
-const EXPECTED_ENTRIES_PER_LANG: usize = 727;
+const EXPECTED_ENTRIES_PER_LANG: usize = 735;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。
