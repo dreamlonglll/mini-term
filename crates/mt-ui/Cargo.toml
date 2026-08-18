@@ -12,5 +12,10 @@ mt-terminal.workspace = true
 # TerminalElement 直接读 alacritty 的 Cell / Flags / Color / Selection。
 # 与 mt-terminal 取同一个 workspace 版本,类型才互通。
 alacritty_terminal.workspace = true
+# 主题桥:读 themes/ 下的主题包(ThemePacks)并把配色映射成 TerminalTheme /
+# gpui-component 的 ThemeConfig。mt-config 不依赖 gpui,映射代码只能住在这边。
+mt-config.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 anyhow.workspace = true
 parking_lot.workspace = true

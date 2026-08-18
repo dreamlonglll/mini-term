@@ -12,7 +12,7 @@
 | 骨架 | 工作区 9 crate + 依赖选型 + 迁移映射（`aa9a7fc`） | ✅ 2026-08-18 |
 | Wave 1 | 后端五块并行搬运 + TerminalElement 端到端 | ✅ 2026-08-18 全部验收入库（6/6） |
 | Wave 2 | mt-relay、mt-app 全壳（store/三栏/Tab/分屏树） | ✅ 2026-08-18 两件均验收入库；面板/Modal/i18n/主题桥移入 Wave 3 |
-| Wave 3 | G=mt-app UI 批（Modal/AI 历史+用量面板/通知/分屏比例+焦点导航）；H=mt-ui 渲染批（IME/鼠标上报/damage/主题桥）；I=mt-i18n 字典基建 | 🔵 G/H 进行中；I ✅ 2026-08-18 交付：32 ns、zh/en 各 727 条全对账零差异，自研零依赖零分配 API（t/t_args/tr!），转换脚本留痕可重跑；⚠️ Wave 3.5 须桥接 gpui-component 内置组件的 rust-i18n locale（add_locale_observer 一行）|
+| Wave 3 | G=mt-app UI 批（Modal/AI 历史+用量面板/通知/分屏比例+焦点导航）；H=mt-ui 渲染批（IME/鼠标上报/damage/主题桥）；I=mt-i18n 字典基建 | 🔵 G 进行中；I ✅（`d2af55f`）32 ns、727×2 条零差异，⚠️ Wave 3.5 须桥接 gpui-component 的 rust-i18n locale；H ✅ 主会话独立 target 复跑 48/48 绿：TerminalView(Entity) 含 IME 全套+宿主接线四步写在 view.rs 注释、鼠标上报三模式三编码、damage 行签名缓存（打字 96%/滚屏 94% 省重建，弃用 alacritty 自带 damage 因滚动全量失效）、主题桥含 OSC ColorRequest 修复（256/257/258 语义）；mt-app 零改动可编译 |
 | 收尾 | mt-ssh/mt-core 移入 crates/、删 src-tauri/ 与 src/、发版切换 | ⬜ |
 
 ## Wave 1 —— 2026-08-18 派出 6 个并行 agent
@@ -36,6 +36,16 @@
 | mt-app 全壳 ✅ | Wave 1 全部（✅） | 2026-08-18 主会话复跑 29/29 绿 + 隔离数据目录 8s 启动冒烟通过；9 模块 ~3.4k 行：tree.rs 纯数据层（17 测）/persist.rs 磁盘格式一字不改（7 测）/store.rs=AppStore Entity/pane/terminal_area/project_list/file_tree/ai 桥/ui 配色；实机三轮确认「恢复布局→hydrate→起 PTY」链路真跑通 |
 | 面板与 Modal | mt-app 全壳 | 终端配置 / AI 历史 / 用量统计 / 移动端面板 / 分支树 |
 | i18n + 主题桥 | mt-app 全壳 | rust-i18n 字典从 src/locales/*.ts 转；theme_packs 配色映射 gpui-component 主题层 |
+
+## Wave 3.5 接线清单（H/I 交付后累积，逐项做完勾掉）
+
+- [ ] **TerminalPane 换用 TerminalView**：四步接线代码片段在 `crates/mt-ui/src/terminal/view.rs` 模块注释「宿主接线」段，照抄即可；**必须删掉**宿主的 track_focus/key_context/on_key_down/左键聚焦 on_mouse_down（IME 分流依赖按键放行，留着会双份处理且中文输入会漏 `n` 进 shell）
+- [ ] 宿主在切 tab/关 pane 时调 `clear_preedit()`（防组合中失焦留预编辑残影）
+- [ ] OSC 应答改 `mt_ui::terminal_color_rgb(&emulator, &theme, index)`，删 pane 里的 theme_color_rgb
+- [ ] 主题切换入口接 `switch_to_theme_pack(&ThemePacks, id, window, cx)`；内置亮暗切换走 `switch_to_builtin`
+- [ ] i18n：各 crate 挂 `mt-i18n.workspace = true`（先在根 Cargo.toml 的 workspace.dependencies 加 path 行——之前的 agent 都被禁改根文件）；启动时 `set_locale(cfg.locale)` + `add_locale_observer(|l| rust_i18n::set_locale(l.code()))` 桥接 gpui-component 内置组件；AppConfig 加 locale 字段；首启语言检测走 Win32 GetUserDefaultLocaleName → Locale::from_system_tag（Windows 上 LANG 环境变量通常不存在）
+- [ ] 文案替换：TS 的 `t('ns.key')` → `t("ns", "key")` 或 `t_path("ns.key")`，key 一字未变可照 TSX 抄
+- [ ] IME 人工验收 8 步（微软拼音组合/候选框跟随/方向键不漏/Esc 取消/失焦/emoji/英文直打回归）——H 报告原文已并入下方人工验收清单语境，跑 app 前必设 MT_APP_DATA_DIR
 
 ## Wave 3 拆法建议（mt-app 全壳 agent 留下的，已采信记档）
 

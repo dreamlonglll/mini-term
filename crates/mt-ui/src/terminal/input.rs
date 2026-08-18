@@ -11,7 +11,56 @@
 use alacritty_terminal::term::TermMode;
 use gpui::Keystroke;
 
+/// 这个按键该不该**让给平台的文本输入通道**(IME / `WM_CHAR`)。
+///
+/// # 为什么必须有这道分流
+///
+/// gpui 在 Windows 上是这样走的:`WM_KEYDOWN` 先派发成 `KeyDownEvent`,**只有在
+/// 没人 `stop_propagation` 时**才调 `TranslateMessage`,进而产生 `WM_CHAR` /
+/// IME 的 `WM_IME_COMPOSITION`。于是同一次按键有两条可能的出口:
+///
+/// - 走 `KeyDownEvent`:拿得到 `key_char`,但 **IME 完全被绕过** —— 中文输入法下
+///   按 `n` 会既写一个 `n` 进 PTY,又在候选框里开始组合,一个字变两个;
+/// - 走 `replace_text_in_range`:IME 组合、候选、上屏全都正常,代价是必须让
+///   `KeyDownEvent` 原样冒泡出去。
+///
+/// 所以「可打印字符」一律走后者,其余(方向键 / 功能键 / Ctrl 组合 / Enter / Tab /
+/// Esc / Backspace)走前者并 `stop_propagation`。这条分界与 gpui 的
+/// `parse_char_message` 正好对齐:它会把控制字符(0x00-0x1F、0x7F)过滤掉,
+/// 也就是说 Enter/Tab/Esc/Ctrl+字母 **本来就不会**从文本通道回来,不存在漏键。
+///
+/// 判据:单字符键名 + 无 Ctrl / Alt / Win。
+/// - `space` / `enter` / `up` 这类**多字符键名**归 [`keystroke_to_bytes`];
+/// - Alt 组合要发 `ESC` 前缀(Meta 语义),文本通道给不出来,也归按键路径;
+/// - Ctrl 组合要发 C0 控制码,同上。
+pub fn is_text_input_key(keystroke: &Keystroke) -> bool {
+    let m = &keystroke.modifiers;
+    if m.platform || m.function {
+        return false;
+    }
+    // AltGr 的例外:Windows 把 AltGr 报成 Ctrl+Alt,而德语的 `@`(AltGr+Q)、
+    // 波兰语的 `ą`(AltGr+A)、法语的 `€`(AltGr+E) 全走这条。判据是 gpui 有没有
+    // 给出 `key_char` —— 它是 `ToUnicode` 的结果并**已经把控制字符过滤掉**,
+    // 所以真正的 Ctrl+组合(结果是 0x01..0x1A)在这里一律拿不到 key_char,
+    // 不会被误判成文本。
+    if m.control && m.alt {
+        return keystroke
+            .key_char
+            .as_deref()
+            .is_some_and(|s| !s.is_empty() && !s.chars().any(char::is_control));
+    }
+    if m.control || m.alt {
+        return false;
+    }
+    let mut chars = keystroke.key.chars();
+    chars.next().is_some() && chars.next().is_none()
+}
+
 /// 一次按键要写进 PTY 的字节。`None` 表示这个键终端不消费(交给上层做快捷键)。
+///
+/// **注意**:这个函数对可打印字符仍然会给出字节(键盘直通语义,给不接 IME 的
+/// 调用方兜底)。接了 IME 的调用方必须先过 [`is_text_input_key`] 分流,
+/// 否则可打印字符会被写两遍 —— 一遍这里,一遍 `replace_text_in_range`。
 pub fn keystroke_to_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u8>> {
     let m = &keystroke.modifiers;
     let key = keystroke.key.as_str();
@@ -234,6 +283,71 @@ mod tests {
             paste_to_bytes("ab", TermMode::BRACKETED_PASTE),
             b"\x1b[200~ab\x1b[201~".to_vec()
         );
+    }
+
+    #[test]
+    fn 可打印字符让给_ime_通道() {
+        // 裸字母 / 数字 / 符号:交给 replace_text_in_range,否则中文输入法下一个字变两个
+        for name in ["a", "Z", "1", "!", "你"] {
+            assert!(
+                is_text_input_key(&key(name, Modifiers::default())),
+                "{name} 应走文本通道"
+            );
+        }
+        // 多字符键名一律走按键路径(gpui 的 parse_char_message 会把控制码滤掉,
+        // 指望文本通道送 Enter/Tab/Esc 是收不到的)
+        for name in ["enter", "tab", "escape", "backspace", "space", "up", "f5"] {
+            assert!(
+                !is_text_input_key(&key(name, Modifiers::default())),
+                "{name} 应走按键路径"
+            );
+        }
+    }
+
+    #[test]
+    fn 带修饰键的字符不走文本通道() {
+        // Ctrl+c 要发 0x03、Alt+a 要发 ESC a,文本通道都给不出来
+        assert!(!is_text_input_key(&key("c", Modifiers::control())));
+        assert!(!is_text_input_key(&key("a", Modifiers::alt())));
+        assert!(!is_text_input_key(&key(
+            "v",
+            Modifiers {
+                platform: true,
+                ..Default::default()
+            }
+        )));
+        // Shift 不影响:大写字母仍然是文本
+        assert!(is_text_input_key(&key(
+            "a",
+            Modifiers {
+                shift: true,
+                ..Default::default()
+            }
+        )));
+    }
+
+    #[test]
+    fn altgr_算文本_ctrl_alt_组合不算() {
+        let ctrl_alt = Modifiers {
+            control: true,
+            alt: true,
+            ..Default::default()
+        };
+        // AltGr+Q 在德语布局上是 `@`:gpui 给得出 key_char,该走文本通道
+        let altgr = Keystroke {
+            modifiers: ctrl_alt,
+            key: "q".into(),
+            key_char: Some("@".into()),
+        };
+        assert!(is_text_input_key(&altgr));
+
+        // 真正的 Ctrl+Alt 组合:ToUnicode 的结果是控制码,已被 gpui 过滤成 None
+        let combo = Keystroke {
+            modifiers: ctrl_alt,
+            key: "a".into(),
+            key_char: None,
+        };
+        assert!(!is_text_input_key(&combo));
     }
 
     #[test]

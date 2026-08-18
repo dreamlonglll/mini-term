@@ -122,10 +122,151 @@ pub fn background(cell_bg: Color, colors: &Colors, theme: &TerminalTheme) -> Hsl
     }
 }
 
+/// OSC 调色板查询(`ColorRequest`)的应答色。
+///
+/// # 这个函数解决什么
+///
+/// `OSC 4 ; n ; ?`(查第 n 号色)、`OSC 10/11/12 ; ?`(查前景/背景/光标)是 TUI
+/// 程序**探测终端配色**的标准手段:vim 的 `background` 自动判定、delta / bat 的
+/// 主题自适应、Claude Code 的配色协商全靠它。答错的直接后果是暗色终端里跑出
+/// 一套浅色高亮(或反过来),而且用户完全不知道该去哪调。
+///
+/// alacritty 把 index 直接给成 [`NamedColor`] 的判别值,所以取值范围**不是**
+/// 0..16,而是三段:
+///
+/// | index | 含义 |
+/// |---|---|
+/// | 0..=15 | ANSI 16 色 |
+/// | 16..=255 | 256 色的色立方与灰阶(按公式算,不查表) |
+/// | 256.. | [`NamedColor`] 的具名槽:前景 / 背景 / 光标 / Dim 系 / 亮前景 |
+///
+/// 只按 `theme.ansi.get(index)` 取、越界回前景的写法会让「查背景色」答成前景色 ——
+/// 对比度算出来是 1.0,程序多半会认定这是一个纯黑终端。
+///
+/// `colors` 里 OSC 4 改过的值优先(程序自己刚设过的色,查回去必须是它设的那个)。
+pub fn color_request_rgb(index: usize, colors: &Colors, theme: &TerminalTheme) -> Rgb {
+    let hsla = match index {
+        0..=15 => named_by_index(index, colors, theme),
+        16..=255 => indexed(index as u8, colors, theme),
+        _ => match named_from_index(index) {
+            Some(name) => named(name, colors, theme),
+            // 认不出来的槽位:回默认前景。比回黑色好 —— 至少是个「亮」的答案,
+            // 不会让程序把终端判成纯黑。
+            None => theme.foreground,
+        },
+    };
+    to_rgb(hsla)
+}
+
+/// 0..16 走 `NamedColor`(这样 OSC 4 改过的值同样优先)。
+fn named_by_index(index: usize, colors: &Colors, theme: &TerminalTheme) -> Hsla {
+    match named_from_index(index) {
+        Some(name) => named(name, colors, theme),
+        None => theme.foreground,
+    }
+}
+
+/// 判别值 → [`NamedColor`]。`NamedColor` 没有 `TryFrom<usize>`,只能自己列。
+fn named_from_index(index: usize) -> Option<NamedColor> {
+    use NamedColor::*;
+    Some(match index {
+        0 => Black,
+        1 => Red,
+        2 => Green,
+        3 => Yellow,
+        4 => Blue,
+        5 => Magenta,
+        6 => Cyan,
+        7 => White,
+        8 => BrightBlack,
+        9 => BrightRed,
+        10 => BrightGreen,
+        11 => BrightYellow,
+        12 => BrightBlue,
+        13 => BrightMagenta,
+        14 => BrightCyan,
+        15 => BrightWhite,
+        256 => Foreground,
+        257 => Background,
+        258 => Cursor,
+        259 => DimBlack,
+        260 => DimRed,
+        261 => DimGreen,
+        262 => DimYellow,
+        263 => DimBlue,
+        264 => DimMagenta,
+        265 => DimCyan,
+        266 => DimWhite,
+        267 => BrightForeground,
+        268 => DimForeground,
+        _ => return None,
+    })
+}
+
+/// [`Hsla`] → alacritty 的 [`Rgb`](应答里要写十六进制原值)。
+pub fn to_rgb(color: Hsla) -> Rgb {
+    let rgba = gpui::Rgba::from(color);
+    let byte = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    Rgb {
+        r: byte(rgba.r),
+        g: byte(rgba.g),
+        b: byte(rgba.b),
+    }
+}
+
 /// 这个 cell 的背景是不是「默认背景」。
 ///
 /// **这是背景图能透出来的唯一判据** —— 返回 true 的格子一律不发背景 quad。
 /// 注意不能拿解析后的颜色去比:主题背景与某个 ANSI 色撞色时会误判成透明。
 pub fn is_default_background(cell_bg: Color, flags: Flags) -> bool {
     matches!(cell_bg, Color::Named(NamedColor::Background)) && !flags.contains(Flags::INVERSE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn osc_查询答的是真配色而不是占位值() {
+        let theme = TerminalTheme::default();
+        let colors = Colors::default();
+
+        // 具名槽:背景 / 前景 / 光标各答各的,不能一律回前景
+        assert_eq!(color_request_rgb(257, &colors, &theme), to_rgb(theme.background));
+        assert_eq!(color_request_rgb(256, &colors, &theme), to_rgb(theme.foreground));
+        assert_eq!(color_request_rgb(258, &colors, &theme), to_rgb(theme.cursor));
+        assert_ne!(
+            color_request_rgb(257, &colors, &theme),
+            color_request_rgb(256, &colors, &theme),
+            "查背景答成前景 → 程序算出的对比度是 1.0,会把终端判成纯黑"
+        );
+
+        // ANSI 16 色
+        assert_eq!(color_request_rgb(1, &colors, &theme), to_rgb(theme.ansi[1]));
+        assert_eq!(color_request_rgb(15, &colors, &theme), to_rgb(theme.ansi[15]));
+
+        // 256 色的色立方与灰阶按公式算
+        assert_eq!(color_request_rgb(196, &colors, &theme), Rgb { r: 255, g: 0, b: 0 });
+        assert_eq!(color_request_rgb(232, &colors, &theme), Rgb { r: 8, g: 8, b: 8 });
+
+        // 认不出来的槽位不崩
+        let _ = color_request_rgb(9999, &colors, &theme);
+    }
+
+    #[test]
+    fn osc_4_改过的调色板优先于主题() {
+        let theme = TerminalTheme::default();
+        let mut colors = Colors::default();
+        let custom = Rgb {
+            r: 0x12,
+            g: 0x34,
+            b: 0x56,
+        };
+        colors[NamedColor::Red] = Some(custom);
+        // 程序自己刚设过的色,查回去必须是它设的那个
+        assert_eq!(color_request_rgb(1, &colors, &theme), custom);
+
+        colors[NamedColor::Background] = Some(custom);
+        assert_eq!(color_request_rgb(257, &colors, &theme), custom);
+    }
 }
