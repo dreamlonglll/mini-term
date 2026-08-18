@@ -3790,6 +3790,7 @@ name = "mt-app"
 version = "0.13.1"
 dependencies = [
  "anyhow",
+ "futures",
  "gpui",
  "gpui-component",
  "mt-ai",
