@@ -12,7 +12,7 @@
 | 骨架 | 工作区 9 crate + 依赖选型 + 迁移映射（`aa9a7fc`） | ✅ 2026-08-18 |
 | Wave 1 | 后端五块并行搬运 + TerminalElement 端到端 | ✅ 2026-08-18 全部验收入库（6/6） |
 | Wave 2 | mt-relay、mt-app 全壳（store/三栏/Tab/分屏树） | ✅ 2026-08-18 两件均验收入库；面板/Modal/i18n/主题桥移入 Wave 3 |
-| Wave 3 | G=mt-app UI 批（Modal/AI 历史+用量面板/通知/分屏比例+焦点导航）；H=mt-ui 渲染批（IME/鼠标上报/damage/主题桥）；I=mt-i18n 字典基建 | 🔵 G 进行中；I ✅（`d2af55f`）32 ns、727×2 条零差异，⚠️ Wave 3.5 须桥接 gpui-component 的 rust-i18n locale；H ✅ 主会话独立 target 复跑 48/48 绿：TerminalView(Entity) 含 IME 全套+宿主接线四步写在 view.rs 注释、鼠标上报三模式三编码、damage 行签名缓存（打字 96%/滚屏 94% 省重建，弃用 alacritty 自带 damage 因滚动全量失效）、主题桥含 OSC ColorRequest 修复（256/257/258 语义）；mt-app 零改动可编译 |
+| Wave 3 | G=mt-app UI 批（Modal/AI 历史+用量面板/通知/分屏比例+焦点导航）；H=mt-ui 渲染批（IME/鼠标上报/damage/主题桥）；I=mt-i18n 字典基建 | ⏸ 2026-08-18 用户叫停；G 在「编译通过、未跑测试」节点被中断，**未提交工作留在工作区**（见下「中断现场」）；I ✅（`d2af55f`）32 ns、727×2 条零差异，⚠️ Wave 3.5 须桥接 gpui-component 的 rust-i18n locale；H ✅ 主会话独立 target 复跑 48/48 绿：TerminalView(Entity) 含 IME 全套+宿主接线四步写在 view.rs 注释、鼠标上报三模式三编码、damage 行签名缓存（打字 96%/滚屏 94% 省重建，弃用 alacritty 自带 damage 因滚动全量失效）、主题桥含 OSC ColorRequest 修复（256/257/258 语义）；mt-app 零改动可编译 |
 | 收尾 | mt-ssh/mt-core 移入 crates/、删 src-tauri/ 与 src/、发版切换 | ⬜ |
 
 ## Wave 1 —— 2026-08-18 派出 6 个并行 agent
@@ -36,6 +36,15 @@
 | mt-app 全壳 ✅ | Wave 1 全部（✅） | 2026-08-18 主会话复跑 29/29 绿 + 隔离数据目录 8s 启动冒烟通过；9 模块 ~3.4k 行：tree.rs 纯数据层（17 测）/persist.rs 磁盘格式一字不改（7 测）/store.rs=AppStore Entity/pane/terminal_area/project_list/file_tree/ai 桥/ui 配色；实机三轮确认「恢复布局→hydrate→起 PTY」链路真跑通 |
 | 面板与 Modal | mt-app 全壳 | 终端配置 / AI 历史 / 用量统计 / 移动端面板 / 分支树 |
 | i18n + 主题桥 | mt-app 全壳 | rust-i18n 字典从 src/locales/*.ts 转；theme_packs 配色映射 gpui-component 主题层 |
+
+## 中断现场（2026-08-18 用户叫停时的工作区状态）
+
+G（mt-app UI 批）agent 被停时自称「编译通过」、尚未跑测试，其**未提交**改动全部在 crates/mt-app/：
+- 新文件：modal.rs / notify.rs / session_panel.rs / usage_panel.rs / focus_nav.rs / shell_ops.rs
+- 修改：Cargo.toml（新增 chrono/iana-time-zone/raw-window-handle/serde_json/windows 依赖）、main.rs / pane.rs / project_list.rs / store.rs / terminal_area.rs / ui.rs
+- Cargo.lock 含上述依赖的未提交增量；仓库根另有 G 留下的 .tmp-smoke-config.json / .tmp-smoke-drive.ps1 两个临时文件（未跟踪，可删）
+
+**续作方式二选一**：① 重派 agent 收尾（跑 `cargo test -p mt-app` 补测试并自查六模块完成度，交付报告后走验收提交流程）；② 人工 `cargo test -p mt-app` 复核后直接验收。G 没交最终报告，六模块的完成度未知，验收时逐个对照任务书（Modal/AI 历史/用量/通知/分屏比例+焦点导航）。
 
 ## Wave 3.5 接线清单（H/I 交付后累积，逐项做完勾掉）
 
