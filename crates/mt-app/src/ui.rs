@@ -3,7 +3,10 @@
 //! 配色逐值取自 `src/styles.css` 的**暗色**变量(`:root`)。i18n 与亮色/主题包
 //! 桥接是后续批次的事,这里先把值钉死,免得各处各写一个近似色。
 
-use gpui::{Hsla, IntoElement, ParentElement, Styled, div, px};
+use gpui::{
+    Div, ElementId, Hsla, InteractiveElement, IntoElement, ParentElement, Stateful, Styled, div,
+    px,
+};
 use mt_ui::rgb8;
 
 use crate::tree::PaneStatus;
@@ -91,6 +94,98 @@ pub fn color_folder() -> Hsla {
 /// `--color-file`
 pub fn color_file() -> Hsla {
     rgb8(0x7d, 0xcf, 0xb8)
+}
+
+/// `--color-info`(统计面板的区块标题竖条等)
+pub fn color_info() -> Hsla {
+    rgb8(0x6a, 0x9f, 0xd4)
+}
+
+// --- 复用小件 ---
+//
+// 面板/Modal 里反复出现的三种东西:次要按钮、主按钮、区块标题。写死在各处的话
+// 改一次配色要翻十个文件,而 i18n 与主题桥都指着这一张表做替换点。
+
+/// 次要按钮(边框 + 淡色文字,hover 转 accent)。
+pub fn ghost_button(id: impl Into<ElementId>, label: impl Into<String>) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .px(px(10.0))
+        .py(px(4.0))
+        .rounded(px(4.0))
+        .border_1()
+        .border_color(border_default())
+        .text_size(px(12.0))
+        .text_color(text_secondary())
+        .cursor_pointer()
+        .hover(|el| el.border_color(accent()).text_color(accent()))
+        .child(label.into())
+}
+
+/// 主按钮(实心 accent)。
+pub fn primary_button(id: impl Into<ElementId>, label: impl Into<String>) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .px(px(12.0))
+        .py(px(4.0))
+        .rounded(px(4.0))
+        .bg(accent())
+        .text_size(px(12.0))
+        .text_color(bg_base())
+        .cursor_pointer()
+        .hover(|el| el.opacity(0.9))
+        .child(label.into())
+}
+
+/// 危险动作按钮(删除类)。
+///
+/// **单独一个函数而不是 `ghost_button(..).hover(..)`** —— gpui 的 `Div` 只允许设一次
+/// hover 样式,第二次直接 panic(`hover style already set`),而 `ghost_button`
+/// 里已经设过了。
+pub fn danger_button(id: impl Into<ElementId>, label: impl Into<String>) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .px(px(10.0))
+        .py(px(4.0))
+        .rounded(px(4.0))
+        .border_1()
+        .border_color(border_default())
+        .text_size(px(12.0))
+        .text_color(text_secondary())
+        .cursor_pointer()
+        .hover(|el| el.border_color(color_error()).text_color(color_error()))
+        .child(label.into())
+}
+
+/// 区块标题:左侧竖条 + 文字(对齐 `usage/UsageStatsModal.tsx` 的 `Section`)。
+pub fn section_title(text: impl Into<String>) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .mb(px(8.0))
+        .child(
+            div()
+                .w(px(2.0))
+                .h(px(12.0))
+                .rounded(px(1.0))
+                .bg(color_info()),
+        )
+        .child(
+            div()
+                .text_size(px(12.0))
+                .text_color(text_primary())
+                .child(text.into()),
+        )
 }
 
 /// 状态灯的颜色(对齐 `src/components/StatusDot.tsx` 的 `STATUS_COLORS`)。

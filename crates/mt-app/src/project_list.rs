@@ -2,52 +2,23 @@
 //!(分组 / 拖拽排序 / 右键菜单 / worktree 子项目是后续批次)。
 
 use gpui::{
-    Context, Entity, InteractiveElement, IntoElement, ParentElement, PathPromptOptions, Render,
-    SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
+    Context, Entity, InteractiveElement, IntoElement, ParentElement, Render, SharedString,
+    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
 
+use crate::modal;
 use crate::store::AppStore;
 use crate::tree::PaneStatus;
 use crate::ui;
 
 pub struct ProjectList {
     store: Entity<AppStore>,
-    /// 已经点过一次「移除」的项目 —— 第二次点才真删。
-    ///
-    /// 移除项目是不可逆的(配置里的布局、展开目录一起没),旧版为此弹确认框;
-    /// Modal 是后续批次的交付物,这里先用「点两次」把误触挡住,而不是让一个
-    /// 单击就能抹掉用户的项目。
-    pending_remove: Option<String>,
 }
 
 impl ProjectList {
     pub fn new(store: Entity<AppStore>, cx: &mut Context<Self>) -> Self {
         cx.observe(&store, |_, _, cx| cx.notify()).detach();
-        Self {
-            store,
-            pending_remove: None,
-        }
-    }
-
-    /// 选目录加项目。gpui 直接给了平台对话框,不必自己造。
-    fn pick_project(&mut self, cx: &mut Context<Self>) {
-        let paths = cx.prompt_for_paths(PathPromptOptions {
-            files: false,
-            directories: true,
-            multiple: false,
-            prompt: Some("选择项目目录".into()),
-        });
-        let store = self.store.clone();
-        cx.spawn(async move |_this, cx| {
-            let Ok(Ok(Some(paths))) = paths.await else {
-                return;
-            };
-            let Some(path) = paths.into_iter().next() else {
-                return;
-            };
-            let _ = store.update(cx, |store, cx| store.add_project(&path, cx));
-        })
-        .detach();
+        Self { store }
     }
 }
 
@@ -96,8 +67,6 @@ impl Render for ProjectList {
                     })
                     .hover(|el| el.bg(ui::bg_overlay()))
                     .on_click(cx.listener(move |this, _event, _window, cx| {
-                        // 点别处 = 放弃刚才那次「移除」的待确认
-                        this.pending_remove = None;
                         this.store
                             .update(cx, |store, cx| store.set_active_project(&id_click, cx));
                     }))
@@ -108,6 +77,7 @@ impl Render for ProjectList {
                             .overflow_hidden()
                             .child(
                                 div()
+                                    .truncate()
                                     .text_size(px(13.0))
                                     .text_color(if is_active {
                                         ui::text_primary()
@@ -118,6 +88,7 @@ impl Render for ProjectList {
                             )
                             .child(
                                 div()
+                                    .truncate()
                                     .text_size(px(11.0))
                                     .text_color(ui::text_muted())
                                     .child(path),
@@ -133,38 +104,40 @@ impl Render for ProjectList {
                                 .bg(ui::color_success()),
                         )
                     })
-                    .child({
-                        let confirming = self.pending_remove.as_deref() == Some(id.as_str());
+                    // 移除:弹确认框(不可逆,布局与展开目录一起没)
+                    .child(
                         div()
                             .id(SharedString::from(format!("project-remove-{id}")))
+                            .w(px(16.0))
                             .h(px(16.0))
                             .flex()
                             .items_center()
                             .justify_center()
                             .rounded(px(3.0))
                             .text_size(px(12.0))
-                            .when(confirming, |el| {
-                                el.px(px(5.0))
-                                    .text_size(px(11.0))
-                                    .text_color(ui::color_error())
-                                    .bg(ui::bg_overlay())
-                            })
-                            .when(!confirming, |el| el.w(px(16.0)).text_color(ui::text_muted()))
+                            .text_color(ui::text_muted())
                             .hover(|el| el.text_color(ui::color_error()).bg(ui::bg_overlay()))
-                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                            .on_click(cx.listener(move |this, _event, window, cx| {
                                 cx.stop_propagation();
-                                if this.pending_remove.as_deref() == Some(id_remove.as_str()) {
-                                    this.pending_remove = None;
-                                    this.store.update(cx, |store, cx| {
-                                        store.remove_project(&id_remove, cx)
-                                    });
-                                } else {
-                                    this.pending_remove = Some(id_remove.clone());
-                                    cx.notify();
-                                }
+                                let Some((name, path)) = this
+                                    .store
+                                    .read(cx)
+                                    .project(&id_remove)
+                                    .map(|p| (p.name.clone(), p.path.clone()))
+                                else {
+                                    return;
+                                };
+                                modal::open_confirm_remove_project(
+                                    this.store.clone(),
+                                    id_remove.clone(),
+                                    name,
+                                    path,
+                                    window,
+                                    cx,
+                                );
                             }))
-                            .child(if confirming { "确认移除" } else { "×" })
-                    }),
+                            .child("×"),
+                    ),
             );
         }
 
@@ -200,8 +173,8 @@ impl Render for ProjectList {
                             .cursor_pointer()
                             .text_color(ui::text_muted())
                             .hover(|el| el.text_color(ui::accent()).bg(ui::bg_overlay()))
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.pick_project(cx);
+                            .on_click(cx.listener(|this, _event, window, cx| {
+                                modal::open_add_project(this.store.clone(), window, cx);
                             }))
                             .child("+"),
                     ),

@@ -65,6 +65,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "io-util
 # ---------------------------------------------------------------------------
 mt-ai = { path = "crates/mt-ai" }
 mt-config = { path = "crates/mt-config" }
+mt-i18n = { path = "crates/mt-i18n" }
 mt-project = { path = "crates/mt-project" }
 mt-pty = { path = "crates/mt-pty" }
 mt-relay = { path = "crates/mt-relay" }

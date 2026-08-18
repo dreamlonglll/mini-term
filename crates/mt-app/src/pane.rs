@@ -40,6 +40,9 @@ use crate::ai::AiBridge;
 pub enum PaneEvent {
     /// 子进程退出(退出码取不到为 `None`)。
     Exited(Option<u32>),
+    /// 用户往这个 pane 里键入了东西 —— store 据此清掉 attention 黄灯
+    /// (旧版 `clearPaneAttentionByPty`:键入即视为「已在处理待确认事项」)。
+    UserInput,
 }
 
 /// reader / watcher 线程 → 主线程的信号。
@@ -169,7 +172,7 @@ impl TerminalPane {
     ///
     /// **`observe_input` 必须在字节交给 PTY 之前调** —— 焦点冷却窗口要早于 TUI 对
     /// 焦点事件的重绘响应抵达,否则那波重绘会被当成 AI 活跃(与原 `write_pty` 同序)。
-    pub fn write(&mut self, bytes: &[u8]) {
+    pub fn write(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
         // 行快照:↑ 历史召回 / Tab 补全会让 shell 整行改写,本地输入缓冲重建不出来,
         // 只能在回车前抓一份当前可见行补判(见 observe_input_with_line_snapshot)。
         let snapshot = if bytes.contains(&b'\r') {
@@ -182,6 +185,7 @@ impl TerminalPane {
             bytes,
             snapshot.as_deref(),
         );
+        cx.emit(PaneEvent::UserInput);
 
         if let Some(pty) = self.pty.as_ref()
             && let Err(err) = pty.write(bytes)
@@ -301,7 +305,7 @@ impl TerminalPane {
         // 有键入就回到底部 —— 和所有终端一样。
         self.emulator
             .with_term_mut(|term| term.scroll_display(Scroll::Bottom));
-        self.write(&bytes);
+        self.write(&bytes, cx);
         cx.notify();
     }
 
@@ -310,7 +314,7 @@ impl TerminalPane {
             return;
         };
         let bytes = paste_to_bytes(&text, self.emulator.mode());
-        self.write(&bytes);
+        self.write(&bytes, cx);
         cx.notify();
     }
 }
@@ -372,8 +376,8 @@ impl Render for TerminalPane {
             // alt screen 里滚轮 → 方向键。元素不持有 PTY,字节从这里回来。
             .on_input(move |bytes, _window, cx| {
                 let bytes = bytes.to_vec();
-                let _ = this_for_input.update(cx, |pane: &mut TerminalPane, _cx| {
-                    pane.write(&bytes);
+                let _ = this_for_input.update(cx, |pane: &mut TerminalPane, cx| {
+                    pane.write(&bytes, cx);
                 });
             })
         };

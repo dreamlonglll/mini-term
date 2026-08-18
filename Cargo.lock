@@ -3790,9 +3790,11 @@ name = "mt-app"
 version = "0.13.1"
 dependencies = [
  "anyhow",
+ "chrono",
  "futures",
  "gpui",
  "gpui-component",
+ "iana-time-zone",
  "mt-ai",
  "mt-config",
  "mt-project",
@@ -3802,6 +3804,9 @@ dependencies = [
  "mt-ui",
  "mt-usage",
  "parking_lot",
+ "raw-window-handle",
+ "serde_json",
+ "windows 0.61.3",
 ]
 
 [[package]]
@@ -3902,8 +3907,11 @@ dependencies = [
  "anyhow",
  "gpui",
  "gpui-component",
+ "mt-config",
  "mt-terminal",
  "parking_lot",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

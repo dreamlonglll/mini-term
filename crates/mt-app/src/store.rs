@@ -28,8 +28,10 @@ use mt_pty::PtySpawn;
 use mt_ui::{TerminalStyle, TerminalTheme};
 
 use crate::ai::{AiBridge, AiEvent};
+use crate::notify::{AlertPlan, DoneTracker, NotifyPrefs, PaneRef, StatusTransition};
 use crate::pane::{PaneEvent, TerminalPane};
 use crate::persist;
+use crate::shell_ops::ShellList;
 use crate::tree::{
     AiSessionRef, PaneState, PaneStatus, SplitDirection, SplitNode, gen_id,
 };
@@ -57,6 +59,18 @@ impl ProjectState {
 struct GlobalStore(Entity<AppStore>);
 impl Global for GlobalStore {}
 
+/// 一次 AI 事件算出来的提醒动作 + 播报所需的上下文。
+///
+/// 提示音与任务栏闪烁要碰 `Window`(拿 HWND),而 AI 事件是从后台 channel 泵进来的
+/// —— store 只算「该做什么」,真正执行留给持有 window 的 [`crate::Workspace`]。
+pub struct PendingAlert {
+    pub plan: AlertPlan,
+    pub project_id: String,
+    pub project_name: String,
+    /// 自定义提示音路径(`config.aiCompletionSoundPath`)。
+    pub sound_path: Option<String>,
+}
+
 pub struct AppStore {
     config: AppConfig,
     /// 写盘令牌(乐观并发);0 = 还没成功 load 过,此时一律不写盘。
@@ -77,6 +91,11 @@ pub struct AppStore {
 
     /// 展开的目录(按项目)。运行时态,落盘走 `ProjectConfig::expanded_dirs`。
     expanded_dirs: HashMap<String, HashSet<String>>,
+
+    /// 完成队列(未读集合 + 完成序号),对应旧版的 unreadDonePaneIds / aiDoneOrder。
+    done: DoneTracker,
+    /// 主窗口是否聚焦。聚焦时完成的任务用户正看着,不计入「未读完成」。
+    window_focused: bool,
 
     /// 防抖保存的代号:只有最后一次排上的任务才真写盘。
     save_generation: u64,
@@ -132,6 +151,8 @@ impl AppStore {
             next_pty_id: 1,
             ai,
             expanded_dirs,
+            done: DoneTracker::default(),
+            window_focused: true,
             save_generation: 0,
             _save_task: None,
         }
@@ -259,6 +280,7 @@ impl AppStore {
 
         self.project_states.remove(id);
         self.expanded_dirs.remove(id);
+        self.done.retain_panes(&self.live_pane_ids());
         self.config.projects.retain(|p| p.id != id);
         if let Some(tree) = self.config.project_tree.as_mut() {
             remove_from_tree(tree, id);
@@ -439,6 +461,45 @@ impl AppStore {
         cx.notify();
     }
 
+    /// 当前项目里该操作哪个 pane:焦点 pane → 布局里第一个激活 pane
+    /// (旧版 `resolveActivePane`,它以 DOM 焦点为准)。
+    pub fn active_pane_id(&self, project_id: &str) -> Option<String> {
+        let layout = self.project_states.get(project_id)?.layout.as_ref()?;
+        self.focused_pane_id
+            .clone()
+            .filter(|id| layout.pane(id).is_some())
+            .or_else(|| layout.first_active_pane().map(|p| p.id.clone()))
+    }
+
+    /// 把一段文本当作用户键入写进某个 pane。
+    ///
+    /// 走 `TerminalPane::write` 而不是裸 PTY 写,是为了保住 AI 输入检测那一路 ——
+    /// 与用户自己敲这条命令完全同一条链路,pane 因此能正常进入 AI 会话状态
+    /// (旧版 `writePtyInput` 的同一条红线)。
+    pub fn write_to_pane(
+        &mut self,
+        project_id: &str,
+        pane_id: &str,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(pty_id) = self
+            .project_states
+            .get(project_id)
+            .and_then(|s| s.layout.as_ref())
+            .and_then(|l| l.pane(pane_id))
+            .and_then(|p| p.pty_id)
+        else {
+            return false;
+        };
+        let Some(entity) = self.terminals.get(&pty_id).cloned() else {
+            return false;
+        };
+        let bytes = text.as_bytes().to_vec();
+        entity.update(cx, |pane, cx| pane.write(&bytes, cx));
+        true
+    }
+
     /// 分屏分隔条拖动后的比例回写。
     pub fn set_split_sizes(
         &mut self,
@@ -575,10 +636,13 @@ impl AppStore {
             TerminalPane::new(pty_id, spec, user_env, style, theme, ai, cx)
         });
 
-        // 子进程退出 → pane 状态 error(与旧版 pty-exit 同语义)
+        // 子进程退出 → pane 状态 error(与旧版 pty-exit 同语义);
+        // 用户键入 → 清 attention 黄灯(与旧版 clearPaneAttentionByPty 同语义)
         let sub = cx.subscribe(&entity, move |store, _entity, event: &PaneEvent, cx| {
-            let PaneEvent::Exited(code) = event;
-            store.on_pty_exit(pty_id, *code, cx);
+            match event {
+                PaneEvent::Exited(code) => store.on_pty_exit(pty_id, *code, cx),
+                PaneEvent::UserInput => store.clear_pane_attention_by_pty(pty_id, cx),
+            }
         });
         self.pane_subs.insert(pty_id, sub);
         self.terminals.insert(pty_id, entity);
@@ -649,12 +713,17 @@ impl AppStore {
     // === AI 事件 ===
 
     /// 后台线程送上来的 AI 事件(见 `ai.rs` 的接线图)。
-    pub fn apply_ai_event(&mut self, event: AiEvent, cx: &mut Context<Self>) {
+    ///
+    /// 返回值是要执行的提醒动作(提示音 / 任务栏闪烁 / toast),由调用方在持有
+    /// `Window` 的地方兑现 —— 见 [`PendingAlert`]。
+    pub fn apply_ai_event(
+        &mut self,
+        event: AiEvent,
+        cx: &mut Context<Self>,
+    ) -> Option<PendingAlert> {
         match event {
             AiEvent::Status(change) => {
-                let Some(status) = PaneStatus::from_str(&change.status) else {
-                    return;
-                };
+                let status = PaneStatus::from_str(&change.status)?;
                 // attention 与状态解耦:codex 的 PermissionRequest 状态是 ai-working
                 // 但同样要点黄灯。判定按事件名,与旧版 isAttentionCause 同一张表。
                 let attention = change
@@ -664,7 +733,9 @@ impl AppStore {
                     .unwrap_or(false);
 
                 let mut owner: Option<String> = None;
+                let mut pane_id = String::new();
                 let mut old_status = PaneStatus::Idle;
+                let mut old_attention = false;
                 for (pid, state) in self.project_states.iter_mut() {
                     let Some(layout) = state.layout.as_mut() else {
                         continue;
@@ -673,6 +744,8 @@ impl AppStore {
                         continue;
                     };
                     old_status = pane.status;
+                    old_attention = pane.attention;
+                    pane_id = pane.id.clone();
                     layout.update_status_by_pty(
                         change.pty_id,
                         status,
@@ -683,20 +756,40 @@ impl AppStore {
                     owner = Some(pid.clone());
                     break;
                 }
-                let Some(owner) = owner else { return };
+                let owner = owner?;
+                let project_active = self.active_project_id.as_deref() == Some(owner.as_str());
 
-                // 完成判定:ai-working → ai-idle 的下降沿,且成因不是「等你确认」。
-                // 无成因 = 无 hook 的降级路径,下降沿是唯一完成信号,放行。
-                let is_completion = old_status == PaneStatus::AiWorking
-                    && status == PaneStatus::AiIdle
-                    && !attention;
-                if is_completion
-                    && self.active_project_id.as_deref() != Some(owner.as_str())
+                let plan = self.done.apply(
+                    &StatusTransition {
+                        pane_id: &pane_id,
+                        old_status,
+                        new_status: status,
+                        old_attention,
+                        cause: change.cause.as_deref(),
+                        window_focused: self.window_focused,
+                        project_active,
+                    },
+                    &self.notify_prefs(),
+                );
+                if plan.mark_needs_attention
                     && let Some(state) = self.project_states.get_mut(&owner)
                 {
                     state.needs_attention = true;
                 }
                 cx.notify();
+
+                if plan.is_empty() {
+                    return None;
+                }
+                Some(PendingAlert {
+                    plan,
+                    project_name: self
+                        .project(&owner)
+                        .map(|p| p.name.clone())
+                        .unwrap_or_else(|| owner.clone()),
+                    project_id: owner,
+                    sound_path: self.config.ai_completion_sound_path.clone(),
+                })
             }
             AiEvent::Session(identity) => {
                 let mut owner: Option<String> = None;
@@ -718,8 +811,162 @@ impl AppStore {
                     self.save_layout_soon(&owner, cx);
                     cx.notify();
                 }
+                None
             }
         }
+    }
+
+    fn notify_prefs(&self) -> NotifyPrefs {
+        NotifyPrefs {
+            sound: self.config.ai_completion_sound,
+            flash: self.config.ai_completion_taskbar_flash,
+            popup: self.config.ai_completion_popup,
+            attention_notify: self.config.ai_attention_notify,
+        }
+    }
+
+    // === 通知 / 待办 ===
+
+    /// 主窗口聚焦状态(旧版 `setWindowFocused`)。聚焦时完成的任务不计未读。
+    ///
+    /// **聚焦即已读**:旧版 `App.tsx` 的 `onFocusChanged` 里 `focused` 一到就
+    /// `clearUnreadDone()` —— 人已经回到窗口前了,绿灯必须熄,否则它会一直亮到
+    /// 下次手动点掉为止。少了这一句「未读完成」就成了只增不减的计数。
+    pub fn set_window_focused(&mut self, focused: bool, cx: &mut Context<Self>) {
+        if self.window_focused == focused {
+            return;
+        }
+        self.window_focused = focused;
+        if focused {
+            self.done.clear_unread();
+        }
+        cx.notify();
+    }
+
+    /// 未读完成数(旧版托盘绿灯的计数,这里给壳内徽章用)。
+    pub fn unread_done_count(&self) -> usize {
+        self.done.unread_count()
+    }
+
+    pub fn is_pane_unread_done(&self, pane_id: &str) -> bool {
+        self.done.is_unread(pane_id)
+    }
+
+    pub fn clear_unread_done(&mut self, cx: &mut Context<Self>) {
+        self.done.clear_unread();
+        cx.notify();
+    }
+
+    /// 「下一件该我做的事」在哪个 pane。`only_project` 限定项目内挑。
+    pub fn next_attention_target(&self, only_project: Option<&str>) -> Option<(String, String)> {
+        let refs: Vec<PaneRef<'_>> = self
+            .project_states
+            .iter()
+            .filter(|(pid, _)| only_project.is_none_or(|only| only == pid.as_str()))
+            .filter_map(|(pid, state)| state.layout.as_ref().map(|l| (pid, l)))
+            .flat_map(|(pid, layout)| {
+                layout.panes().into_iter().map(move |p| PaneRef {
+                    project_id: pid.as_str(),
+                    pane_id: p.id.as_str(),
+                    status: p.status,
+                    attention: p.attention,
+                })
+            })
+            .collect();
+        crate::notify::pick_attention_target(refs, self.done.order())
+    }
+
+    /// 用户对 pane 键入 = 已在处理待确认事项,清掉 attention 黄灯
+    /// (旧版 `clearPaneAttentionByPty`)。
+    ///
+    /// codex 批准后直到 PostToolUse 没有任何 hook 事件,不清会误挂整个执行期。
+    pub fn clear_pane_attention_by_pty(&mut self, pty_id: u32, cx: &mut Context<Self>) {
+        let mut changed = false;
+        for state in self.project_states.values_mut() {
+            let Some(layout) = state.layout.as_mut() else {
+                continue;
+            };
+            if let Some(pane) = layout.pane_by_pty_mut(pty_id)
+                && pane.attention
+            {
+                pane.attention = false;
+                changed = true;
+                break;
+            }
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
+    // === 终端配置(shell 列表)===
+
+    pub fn shell_list(&self) -> ShellList {
+        ShellList {
+            shells: self.config.available_shells.clone(),
+            default_shell: self.config.default_shell.clone(),
+        }
+    }
+
+    pub fn apply_shell_list(&mut self, list: ShellList, cx: &mut Context<Self>) {
+        self.config.available_shells = list.shells;
+        self.config.default_shell = list.default_shell;
+        self.save_config_soon(cx);
+        cx.notify();
+    }
+
+    /// 终端字号。改完立刻作用于**新建**的终端;已开的终端沿用创建时的样式
+    /// (旧版靠 xterm 的 options 热改,自研渲染器的样式热更新留给渲染批)。
+    pub fn set_terminal_font_size(&mut self, size: f64, cx: &mut Context<Self>) {
+        let size = size.clamp(8.0, 32.0);
+        if (self.config.terminal_font_size - size).abs() < f64::EPSILON {
+            return;
+        }
+        self.config.terminal_font_size = size;
+        self.save_config_soon(cx);
+        cx.notify();
+    }
+
+    // === pane 重命名 ===
+
+    /// 改 tab 标题。空字符串 = 恢复默认(shell 名)。
+    ///
+    /// **不落盘** —— `SavedPane` 里没有这个字段,装机版同样只在运行时保留
+    /// (`serializeSplitNode` 只写 shellName/cwd/aiSession)。磁盘格式一字不改。
+    pub fn rename_pane(
+        &mut self,
+        project_id: &str,
+        pane_id: &str,
+        title: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let title = title.trim();
+        if let Some(state) = self.project_states.get_mut(project_id)
+            && let Some(layout) = state.layout.as_mut()
+            && let Some(pane) = layout.pane_mut(pane_id)
+        {
+            pane.custom_title = if title.is_empty() {
+                None
+            } else {
+                Some(title.to_string())
+            };
+            cx.notify();
+        }
+    }
+
+    // === 右侧抽屉宽度 ===
+
+    pub fn right_drawer_width(&self) -> f64 {
+        self.config.right_drawer_width.unwrap_or(320.0).clamp(240.0, 720.0)
+    }
+
+    pub fn set_right_drawer_width(&mut self, width: f64, cx: &mut Context<Self>) {
+        let width = width.clamp(240.0, 720.0);
+        if self.config.right_drawer_width == Some(width) {
+            return;
+        }
+        self.config.right_drawer_width = Some(width);
+        self.save_config_soon(cx);
     }
 
     // === 文件树展开状态 ===
@@ -791,8 +1038,31 @@ impl AppStore {
                 .map(|l| l.highest_status())
                 .unwrap_or(PaneStatus::Idle);
         }
+        // 关掉的 pane 一并撤出完成队列:否则未读计数会往一个已经不存在的 pane
+        // 上跳,两张表也会随开关终端无界增长(旧版 setProjectLayout 的同一段)。
+        self.done.retain_panes(&self.live_pane_ids());
         self.save_layout_soon(project_id, cx);
         cx.notify();
+    }
+
+    /// 全部项目里活着的 pane id。
+    fn live_pane_ids(&self) -> HashSet<String> {
+        self.project_states
+            .values()
+            .filter_map(|s| s.layout.as_ref())
+            .flat_map(|l| l.panes().into_iter().map(|p| p.id.clone()))
+            .collect()
+    }
+
+    /// 全部项目里活着的 split/leaf 节点 id —— 供 `TerminalArea` 回收分隔条状态。
+    pub fn live_node_ids(&self) -> HashSet<String> {
+        let mut out = HashSet::new();
+        for state in self.project_states.values() {
+            if let Some(layout) = state.layout.as_ref() {
+                collect_node_ids(layout, &mut out);
+            }
+        }
+        out
     }
 
     fn save_layout_soon(&mut self, project_id: &str, cx: &mut Context<Self>) {
@@ -849,6 +1119,15 @@ impl AppStore {
                 Err(err) => eprintln!("[store] 令牌过期后重读配置失败: {err:#}"),
             },
             Err(err) => eprintln!("[store] 配置保存失败: {err}"),
+        }
+    }
+}
+
+fn collect_node_ids(node: &SplitNode, out: &mut HashSet<String>) {
+    out.insert(node.id().to_string());
+    if let SplitNode::Split { children, .. } = node {
+        for c in children {
+            collect_node_ids(c, out);
         }
     }
 }

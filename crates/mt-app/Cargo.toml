@@ -26,3 +26,23 @@ parking_lot.workspace = true
 # PTY reader 线程 → 主线程的唤醒信号(gpui 的 AsyncApp 是 Rc,不能跨线程)。
 # gpui 自己也依赖 futures 0.3,不会多拉一棵依赖树。
 futures = "0.3"
+# 会话列表的相对时间、用量面板的本地日历日窗口。
+chrono.workspace = true
+# 可选的本地价格表(model-pricing.json)。
+serde_json.workspace = true
+# 用量分桶要 IANA 时区名:mt-usage 按每条记录自身时刻求当地偏移,
+# 只给固定偏移的话 DST 地区的历史记录会错日。
+iana-time-zone = "0.1"
+
+[target.'cfg(windows)'.dependencies]
+# 任务栏闪烁(FlashWindowEx)与提示音(MessageBeep / PlaySoundW)。
+# 版本跟随 gpui 已经在用的那个,不给依赖树引入第二份 windows crate。
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    # MessageBeep 住在这个模块里(不是 WindowsAndMessaging)
+    "Win32_System_Diagnostics_Debug",
+    "Win32_UI_WindowsAndMessaging",
+] }
+# 从 gpui 的 Window 取 HWND。
+raw-window-handle = "0.6"

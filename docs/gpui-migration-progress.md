@@ -12,7 +12,8 @@
 | 骨架 | 工作区 9 crate + 依赖选型 + 迁移映射（`aa9a7fc`） | ✅ 2026-08-18 |
 | Wave 1 | 后端五块并行搬运 + TerminalElement 端到端 | ✅ 2026-08-18 全部验收入库（6/6） |
 | Wave 2 | mt-relay、mt-app 全壳（store/三栏/Tab/分屏树） | ✅ 2026-08-18 两件均验收入库；面板/Modal/i18n/主题桥移入 Wave 3 |
-| Wave 3 | G=mt-app UI 批（Modal/AI 历史+用量面板/通知/分屏比例+焦点导航）；H=mt-ui 渲染批（IME/鼠标上报/damage/主题桥）；I=mt-i18n 字典基建 | ⏸ 2026-08-18 用户叫停；G 在「编译通过、未跑测试」节点被中断，**未提交工作留在工作区**（见下「中断现场」）；I ✅（`d2af55f`）32 ns、727×2 条零差异，⚠️ Wave 3.5 须桥接 gpui-component 的 rust-i18n locale；H ✅ 主会话独立 target 复跑 48/48 绿：TerminalView(Entity) 含 IME 全套+宿主接线四步写在 view.rs 注释、鼠标上报三模式三编码、damage 行签名缓存（打字 96%/滚屏 94% 省重建，弃用 alacritty 自带 damage 因滚动全量失效）、主题桥含 OSC ColorRequest 修复（256/257/258 语义）；mt-app 零改动可编译 |
+| Wave 3 | G=mt-app UI 批（Modal/AI 历史+用量面板/通知/分屏比例+焦点导航）；H=mt-ui 渲染批（IME/鼠标上报/damage/主题桥）；I=mt-i18n 字典基建 | ✅ 2026-08-18 全部验收入库。G 经收尾 agent 补验：66 单测+4 集成全绿（老断言零改动），六模块齐（托盘明确未做），收尾另修 3 个真 bug（分屏比例恢复首帧 FALLBACK_AREA 基准错→改首帧量尺下帧铺树；窗口聚焦不清未读；折叠栏把 sizes 抹成最小值）+ 2 处资源问题（会话面板惰性加载防 WSL 冷启动、用量面板 Task 句柄无界增长）+6 单测；I ✅（`d2af55f`）；H ✅（`92390d4`） |
+| Wave 4+ | 按 docs/gpui-parity-audit.md 30 条缺口逐批清零（第 0 层接线 → 基建 → 面板 → 整块新功能） | 🔵 2026-08-18 审计任务书落盘；J=mt-app 接线批 + K=mt-ui 视觉批已派出 |
 | 收尾 | mt-ssh/mt-core 移入 crates/、删 src-tauri/ 与 src/、发版切换 | ⬜ |
 
 ## Wave 1 —— 2026-08-18 派出 6 个并行 agent
@@ -37,14 +38,13 @@
 | 面板与 Modal | mt-app 全壳 | 终端配置 / AI 历史 / 用量统计 / 移动端面板 / 分支树 |
 | i18n + 主题桥 | mt-app 全壳 | rust-i18n 字典从 src/locales/*.ts 转；theme_packs 配色映射 gpui-component 主题层 |
 
-## 中断现场（2026-08-18 用户叫停时的工作区状态）
+## 中断现场（已解除）
 
-G（mt-app UI 批）agent 被停时自称「编译通过」、尚未跑测试，其**未提交**改动全部在 crates/mt-app/：
-- 新文件：modal.rs / notify.rs / session_panel.rs / usage_panel.rs / focus_nav.rs / shell_ops.rs
-- 修改：Cargo.toml（新增 chrono/iana-time-zone/raw-window-handle/serde_json/windows 依赖）、main.rs / pane.rs / project_list.rs / store.rs / terminal_area.rs / ui.rs
-- Cargo.lock 含上述依赖的未提交增量；仓库根另有 G 留下的 .tmp-smoke-config.json / .tmp-smoke-drive.ps1 两个临时文件（未跟踪，可删）
+2026-08-18 G 批中断现场经收尾 agent 处理完毕并验收入库，此段仅留档：当时六个新模块+七处修改未提交、未跑测试；收尾走了方式①（重派 agent），补验+修复+补测后由主会话复跑 66+4 全绿提交。
 
-**续作方式二选一**：① 重派 agent 收尾（跑 `cargo test -p mt-app` 补测试并自查六模块完成度，交付报告后走验收提交流程）；② 人工 `cargo test -p mt-app` 复核后直接验收。G 没交最终报告，六模块的完成度未知，验收时逐个对照任务书（Modal/AI 历史/用量/通知/分屏比例+焦点导航）。
+## Wave 4 起的任务书
+
+**docs/gpui-parity-audit.md** 是 UI/UX 对照审计产出的 30 条缺口清单（分 4 层：接线型/基建型/面板补全/整块新功能），Wave 4 起每批从该清单挑条目，做完在清单上勾状态+注提交号。审计同时纠正了本看板 4 条旧记录：鼠标上报其实已接线；tab 拖拽排序/中键关闭 tab 原版本来就没有（撤销）；分屏比例跨重启问题已被 G 收尾修掉。
 
 ## Wave 3.5 接线清单（H/I 交付后累积，逐项做完勾掉）
 
@@ -65,10 +65,10 @@ G（mt-app UI 批）agent 被停时自称「编译通过」、尚未跑测试，
 5. **i18n + 主题桥**（独立）：字典从 src/locales/*.ts 转；ui.rs 常量表是唯一替换点；主题包接 mt_config::theme_packs → TerminalTheme + gpui-component 主题
 6. 另有渲染侧缺口：IME（挂载点已留）、鼠标上报（MOUSE_MODE/SGR_MOUSE）、damage 追踪、下划线花样、split_states 塌陷不回收（极小泄漏）
 
-## mt-app 全壳已知缺口（本轮明确不做，验收时别当回归）
+## mt-app 全壳已知缺口（此段过时，以 docs/gpui-parity-audit.md 为准）
 
-- 分屏比例跨重启回均分（百分比照常写盘，装机版仍读得对）；tab 重命名/右键菜单/拖拽排序/项目分组/AI 自动 resume/文件拖入终端未做
-- 状态灯是三形（空心圈/实心点/环+芯），未复刻原版勾叉字形与旋转动画；中间栏折叠后仍渲染分隔条把手（gpui-component 行为）
+- ~~分屏比例跨重启回均分~~（G 收尾已修）；~~tab 重命名~~（G 已做）；~~tab 拖拽排序~~（原版也没有，撤销）；右键菜单/项目分组/AI 自动 resume/文件拖入终端 → 已并入审计清单
+- 状态灯三形未复刻勾叉字形与旋转动画 → 审计清单 #9；中间栏折叠后仍渲染分隔条把手（gpui-component 行为）
 
 ## 开发纪律（跑 GPUI dev 实例）
 
@@ -112,6 +112,8 @@ G（mt-app UI 批）agent 被停时自称「编译通过」、尚未跑测试，
 - mt-relay 默认自持 2 线程 tokio 运行时（apply 惰性创建）；mt-app 若有全局运行时应改用 `with_runtime` 注入，避免进程双线程池。
 
 ## 风险与决议记录
+
+- **允许第三方 GPUI UI 库**（2026-08-18 用户决议）：为达到与 Tauri 版类似的 UI/UX，允许引入第三方组件库——icon、table、tab、动画效果等均可用现成轮子，不必手搓。首选已在工作区的 `gpui-component`（Icon/lucide 图标、TabBar、Table、Modal、Dialog、Resizable、Switch、Tooltip、动画等）；它不够用时可再评估其他 crates.io 上的 gpui 生态库（注意必须兼容 `gpui 0.2.x`，避免依赖树出现两个 gpui）。新增 workspace 依赖需主会话在根 Cargo.toml 加行（子 agent 禁改根文件的纪律不变，需要时在报告里提出）。
 
 - **TerminalElement 是全项目最高风险件**：中英文混排逐列对齐 / IME / 选择剪贴板 / 拖拽 / 背景图五项验收，任意两条卡死即触发路线重估（gpui fork 或换路线），见方案文档第 6 节。
 - Wave 1 期间 mt-pty 公开 API 冻结为「只增不改」，解除时间：Wave 1 全部验收后。
