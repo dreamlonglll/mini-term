@@ -21,6 +21,7 @@ import {
   closePane,
   forkPaneSession,
   movePane,
+  movePaneToTab,
   newTerminal,
   renamePane,
   splitPane,
@@ -351,7 +352,8 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
   // 文件树拖拽同一模式）——Tauri dragDropEnabled 拦截了 WebView 内部的
   // HTML5 DnD 事件，draggable/dragover/drop 在本应用里根本不触发。
   const [dropZone, setDropZone] = useState<DropZone | null>(null);
-  const [tabBarDrop, setTabBarDrop] = useState(false);
+  // tab 栏拖拽悬停的插入位：index 用于落子，x 是指示线的容器内容坐标
+  const [tabDrop, setTabDrop] = useState<{ index: number; x: number } | null>(null);
   const maximizedPaneId = useAppStore((s) => s.projectStates.get(projectId)?.maximizedPaneId);
   const layoutIsSplit = useAppStore(
     (s) => s.projectStates.get(projectId)?.layout?.type === 'split',
@@ -378,7 +380,7 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
   useEffect(() => {
     const clear = () => {
       setDropZone(null);
-      setTabBarDrop(false);
+      setTabDrop(null);
     };
     window.addEventListener(PANE_DRAG_CANCEL_EVENT, clear);
     return () => window.removeEventListener(PANE_DRAG_CANCEL_EVENT, clear);
@@ -413,19 +415,45 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
     movePane(projectId, payload.paneId, node.activePaneId, zoneFromEvent(e));
   };
 
-  const handleTabBarDragMove = () => {
+  /** 由指针位置算 tab 栏插入位：落在某 tab 中线左侧即插到它前面，否则继续向右。 */
+  const tabDropFromEvent = (e: React.MouseEvent): { index: number; x: number } => {
+    const bar = e.currentTarget as HTMLElement;
+    const barRect = bar.getBoundingClientRect();
+    const tabs = Array.from(bar.querySelectorAll<HTMLElement>('[data-pane-tab]'));
+    let index = tabs.length;
+    let x = 0;
+    for (let i = 0; i < tabs.length; i++) {
+      const r = tabs[i].getBoundingClientRect();
+      if (e.clientX < r.left + r.width / 2) {
+        index = i;
+        x = r.left - barRect.left + bar.scrollLeft;
+        break;
+      }
+      x = r.right - barRect.left + bar.scrollLeft;
+    }
+    return { index, x };
+  };
+
+  const handleTabBarDragMove = (e: React.MouseEvent) => {
     if (!acceptsPaneDrag()) return;
-    setTabBarDrop(true);
+    const next = tabDropFromEvent(e);
+    setTabDrop((prev) =>
+      prev && prev.index === next.index && prev.x === next.x ? prev : next,
+    );
   };
 
   // 不能 stopPropagation：paneDragState 的收尾（清拖拽态/卸监听/抑制 click）
   // 挂在 document 的 mouseup 上，截断传播会让拖拽态永久残留，
   // 表现为落子后高亮框跟着鼠标走、下一次点击又移动一遍
-  const handleTabBarDrop = () => {
+  const handleTabBarDrop = (e: React.MouseEvent) => {
     const payload = acceptsPaneDrag();
-    setTabBarDrop(false);
+    setTabDrop(null);
     if (!payload) return;
-    movePane(projectId, payload.paneId, node.activePaneId, 'center');
+    // anchor 只为定位本 leaf，不能是被拖的 pane 自己；找不到说明本组只有
+    // 被拖的这一个 tab，组内换位无意义
+    const anchor = node.panes.find((p) => p.id !== payload.paneId);
+    if (!anchor) return;
+    movePaneToTab(projectId, payload.paneId, anchor.id, tabDropFromEvent(e).index);
   };
 
   const paneContextMenu = useCallback((e: React.MouseEvent, paneId: string) => {
@@ -497,8 +525,8 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
       {/* Tab bar */}
       <div
         data-panel-header
-        className={`flex items-stretch bg-[var(--bg-elevated)] border-b text-xs overflow-x-auto select-none shrink-0 ${
-          tabBarDrop
+        className={`relative flex items-stretch bg-[var(--bg-elevated)] border-b text-xs overflow-x-auto select-none shrink-0 ${
+          tabDrop
             ? 'border-[var(--accent)] bg-[var(--border-subtle)]'
             : 'border-[var(--border-subtle)]'
         }`}
@@ -506,7 +534,7 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
         aria-label={t('paneGroup.tablistLabel')}
         onMouseMove={handleTabBarDragMove}
         onMouseUp={handleTabBarDrop}
-        onMouseLeave={() => setTabBarDrop(false)}
+        onMouseLeave={() => setTabDrop(null)}
         onDoubleClick={(e) => {
           // 只认空白区：tab 双击是重命名，按钮双击不该误触
           if ((e.target as Element).closest('[data-pane-tab],button')) return;
@@ -678,6 +706,15 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
             {ICON_CLOSE}
           </button>
         </div>
+
+        {/* 插入位指示线：随内容坐标定位，跟着 tab 栏横向滚动 */}
+        {tabDrop && (
+          <span
+            aria-hidden
+            className="absolute top-0 bottom-0 w-[2px] bg-[var(--accent)] pointer-events-none z-10"
+            style={{ left: Math.max(tabDrop.x - 1, 0) }}
+          />
+        )}
       </div>
 
       {/* Active terminal */}

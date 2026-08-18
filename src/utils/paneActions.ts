@@ -22,6 +22,7 @@ import {
   findPaneByPtyId,
   insertSplit,
   movePaneInLayout,
+  movePaneToTabIndex,
   removePaneFromLayout,
   replaceNode,
   resolveActivePane,
@@ -187,6 +188,21 @@ export function movePane(
   const { layout } = snapshot(projectId);
   if (!layout) return;
   const next = movePaneInLayout(layout, paneId, targetPaneId, zone);
+  if (!next) return;
+  commit(projectId, next);
+  focusPane(findPaneById(next, paneId)?.ptyId);
+}
+
+/** 拖拽到 tab 栏的精确落位：同组内前后换位，跨组按插入位并入。 */
+export function movePaneToTab(
+  projectId: string,
+  paneId: string,
+  anchorPaneId: string,
+  index: number,
+): void {
+  const { layout } = snapshot(projectId);
+  if (!layout) return;
+  const next = movePaneToTabIndex(layout, paneId, anchorPaneId, index);
   if (!next) return;
   commit(projectId, next);
   focusPane(findPaneById(next, paneId)?.ptyId);

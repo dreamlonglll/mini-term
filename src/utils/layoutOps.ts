@@ -190,6 +190,41 @@ export function movePaneInLayout(
 }
 
 /**
+ * 把 pane 挪到 anchor 所在 leaf 的 tab 栏第 index 位（拖拽到 tab 栏的精确落位）。
+ * 同一 leaf 内是纯重排；跨 leaf 则先摘除再按位插入。落回原位返回 null。
+ * anchor 只用来定位目标 leaf，必须不是被拖的 pane 自己。
+ */
+export function movePaneToTabIndex(
+  root: SplitNode,
+  paneId: string,
+  anchorPaneId: string,
+  index: number,
+): SplitNode | null {
+  const pane = findPaneById(root, paneId);
+  if (!pane) return null;
+  const targetLeaf = findLeafContainingPane(root, anchorPaneId);
+  if (!targetLeaf) return null;
+
+  if (targetLeaf.panes.some((p) => p.id === paneId)) {
+    const from = targetLeaf.panes.findIndex((p) => p.id === paneId);
+    // 先摘掉自己，插入位在自己右侧时左移一格补位
+    const to = index > from ? index - 1 : index;
+    if (to === from) return null;
+    const panes = targetLeaf.panes.filter((p) => p.id !== paneId);
+    panes.splice(Math.min(to, panes.length), 0, pane);
+    return replaceNode(root, targetLeaf, { ...targetLeaf, panes, activePaneId: paneId });
+  }
+
+  const removed = removePaneFromLayout(root, paneId);
+  if (!removed) return null;
+  return updateLeafOfPane(removed, anchorPaneId, (leaf) => {
+    const panes = [...leaf.panes];
+    panes.splice(Math.min(index, panes.length), 0, pane);
+    return { ...leaf, panes, activePaneId: paneId };
+  });
+}
+
+/**
  * 从树里摘掉一个 pane。
  * - leaf 里还有别的 pane：只摘 pane，必要时改 activePaneId
  * - leaf 空了：把 leaf 从父 split 摘掉；父 split 只剩一个孩子则塌陷成那个孩子
