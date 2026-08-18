@@ -25,7 +25,7 @@ import {
   renamePane,
   splitPane,
 } from '../utils/paneActions';
-import { getDragPayload, setDragPayload } from '../utils/dragState';
+import { getPaneDragPayload, initPaneDrag, PANE_DRAG_CANCEL_EVENT } from '../utils/paneDragState';
 import type { DropZone } from '../utils/layoutOps';
 import { branchCapsForAgent } from '../utils/sessionBranch';
 import { BranchFamilyPanel } from './BranchFamilyPanel';
@@ -347,8 +347,9 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
   }, [activePane, projectId]);
 
   // === pane 拖拽移动/合并 + 双击最大化 ===
-  // 拖拽走全局 dragState 模块级 payload（与项目行拖拽同一模式），HTML5 DnD 的
-  // dataTransfer 在 dragover 阶段读不到内容，跨组件判定只能靠它。
+  // 拖拽走 paneDragState 的 mousedown/mousemove/mouseup 自绘链路（与项目行、
+  // 文件树拖拽同一模式）——Tauri dragDropEnabled 拦截了 WebView 内部的
+  // HTML5 DnD 事件，draggable/dragover/drop 在本应用里根本不触发。
   const [dropZone, setDropZone] = useState<DropZone | null>(null);
   const [tabBarDrop, setTabBarDrop] = useState(false);
   const maximizedPaneId = useAppStore((s) => s.projectStates.get(projectId)?.maximizedPaneId);
@@ -369,11 +370,21 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
 
   /** 本组是否可作为当前拖拽 pane 的落点（同项目的 pane 拖拽才响应）。 */
   const acceptsPaneDrag = useCallback(() => {
-    const p = getDragPayload();
-    return p?.type === 'pane' && p.projectId === projectId ? p : null;
+    const p = getPaneDragPayload();
+    return p && p.projectId === projectId ? p : null;
   }, [projectId]);
 
-  const zoneFromEvent = (e: React.DragEvent): DropZone => {
+  // Esc 取消拖拽时鼠标不动、收不到 mouseleave，高亮靠取消事件撤下来
+  useEffect(() => {
+    const clear = () => {
+      setDropZone(null);
+      setTabBarDrop(false);
+    };
+    window.addEventListener(PANE_DRAG_CANCEL_EVENT, clear);
+    return () => window.removeEventListener(PANE_DRAG_CANCEL_EVENT, clear);
+  }, []);
+
+  const zoneFromEvent = (e: React.MouseEvent): DropZone => {
     const r = e.currentTarget.getBoundingClientRect();
     const x = (e.clientX - r.left) / Math.max(r.width, 1);
     const y = (e.clientY - r.top) / Math.max(r.height, 1);
@@ -389,43 +400,31 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
     return d[0].zone;
   };
 
-  const handleBodyDragOver = (e: React.DragEvent) => {
+  const handleBodyDragMove = (e: React.MouseEvent) => {
     if (!acceptsPaneDrag()) return;
-    e.preventDefault();
-    e.dataTransfer.dropEffect = 'move';
     const zone = zoneFromEvent(e);
     setDropZone((prev) => (prev === zone ? prev : zone));
   };
 
-  const handleBodyDrop = (e: React.DragEvent) => {
+  const handleBodyDrop = (e: React.MouseEvent) => {
     const payload = acceptsPaneDrag();
     setDropZone(null);
     if (!payload) return;
-    e.preventDefault();
     movePane(projectId, payload.paneId, node.activePaneId, zoneFromEvent(e));
-    setDragPayload(null);
   };
 
-  const handleTabBarDragOver = (e: React.DragEvent) => {
+  const handleTabBarDragMove = () => {
     if (!acceptsPaneDrag()) return;
-    e.preventDefault();
-    e.dataTransfer.dropEffect = 'move';
     setTabBarDrop(true);
   };
 
-  const handleTabBarDrop = (e: React.DragEvent) => {
+  const handleTabBarDrop = (e: React.MouseEvent) => {
     const payload = acceptsPaneDrag();
     setTabBarDrop(false);
     if (!payload) return;
-    e.preventDefault();
     e.stopPropagation();
     movePane(projectId, payload.paneId, node.activePaneId, 'center');
-    setDragPayload(null);
   };
-
-  /** dragleave 在跨子元素时也触发，只有真正离开容器才清高亮。 */
-  const leftContainer = (e: React.DragEvent) =>
-    !(e.currentTarget as HTMLElement).contains(e.relatedTarget as Node | null);
 
   const paneContextMenu = useCallback((e: React.MouseEvent, paneId: string) => {
     e.preventDefault();
@@ -503,9 +502,9 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
         }`}
         role="tablist"
         aria-label={t('paneGroup.tablistLabel')}
-        onDragOver={handleTabBarDragOver}
-        onDrop={handleTabBarDrop}
-        onDragLeave={(e) => { if (leftContainer(e)) setTabBarDrop(false); }}
+        onMouseMove={handleTabBarDragMove}
+        onMouseUp={handleTabBarDrop}
+        onMouseLeave={() => setTabBarDrop(false)}
         onDoubleClick={(e) => {
           // 只认空白区：tab 双击是重命名，按钮双击不该误触
           if ((e.target as Element).closest('[data-pane-tab],button')) return;
@@ -523,15 +522,18 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
               key={pane.id}
               data-pane-tab
               role="tab"
-              draggable
-              onDragStart={(e) => {
-                setDragPayload({ type: 'pane', projectId, paneId: pane.id });
-                e.dataTransfer.effectAllowed = 'move';
-                // Windows WebView2 上不 setData 拖拽不会真正开始
-                e.dataTransfer.setData('text/plain', '');
+              onMouseDown={(e) => {
+                // 左键、且不落在关闭按钮上才启动拖拽跟踪；未越过 5px 阈值仍是普通点击
+                if (e.button !== 0) return;
+                if ((e.target as Element).closest('button')) return;
                 closeTabPreview();
+                initPaneDrag(
+                  { projectId, paneId: pane.id },
+                  e.currentTarget as HTMLElement,
+                  e.clientX,
+                  e.clientY,
+                );
               }}
-              onDragEnd={() => setDragPayload(null)}
               tabIndex={isActive ? 0 : -1}
               aria-selected={isActive}
               // 状态点 + 标题 + 关闭按钮作为一组在 tab 内居中：左右 padding 对称，
@@ -679,9 +681,9 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
       {/* Active terminal */}
       <div
         className="flex-1 overflow-hidden relative"
-        onDragOver={handleBodyDragOver}
-        onDrop={handleBodyDrop}
-        onDragLeave={(e) => { if (leftContainer(e)) setDropZone(null); }}
+        onMouseMove={handleBodyDragMove}
+        onMouseUp={handleBodyDrop}
+        onMouseLeave={() => setDropZone(null)}
       >
         <div className="absolute inset-0">
           {activePane.ptyId !== undefined ? (

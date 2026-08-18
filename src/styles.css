@@ -161,11 +161,13 @@ html, body, #root {
 }
 
 /* ===== 文件拖拽到终端：拖拽期间禁用终端区 pointer-events，让鼠标事件穿透到 drop-zone ===== */
-body.file-dragging [data-terminal-drop] > * {
+body.file-dragging [data-terminal-drop] > *,
+body.pane-dragging [data-terminal-drop] > * {
   pointer-events: none !important;
 }
 body.file-dragging,
 body.project-dragging,
+body.pane-dragging,
 body.ssh-conn-dragging {
   cursor: grabbing !important;
   user-select: none !important;
