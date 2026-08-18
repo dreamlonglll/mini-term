@@ -418,11 +418,13 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
     setTabBarDrop(true);
   };
 
-  const handleTabBarDrop = (e: React.MouseEvent) => {
+  // 不能 stopPropagation：paneDragState 的收尾（清拖拽态/卸监听/抑制 click）
+  // 挂在 document 的 mouseup 上，截断传播会让拖拽态永久残留，
+  // 表现为落子后高亮框跟着鼠标走、下一次点击又移动一遍
+  const handleTabBarDrop = () => {
     const payload = acceptsPaneDrag();
     setTabBarDrop(false);
     if (!payload) return;
-    e.stopPropagation();
     movePane(projectId, payload.paneId, node.activePaneId, 'center');
   };
 
