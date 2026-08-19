@@ -41,11 +41,12 @@
 //!
 //! # 未决
 //!
-//! **远程 SSH 项目**(`remote_ssh.rs` 1281 行)依赖 `src-tauri/mt-ssh`,
-//! 而 `mt-ssh` / `mt-core` 目前仍留在 `src-tauri/` 下(还被 `mt-sidecars` 引用)。
-//! 等到要移植远程项目时再一并把这两个 crate 挪进 `crates/`,同时改
-//! `mt-sidecars` 的 path 依赖与 `scripts/stage-sidecars.mjs`。**不要提前挪。**
-//! 届时远程文件树复用 [`fs::natural_cmp`],与本地树保持同一排序观感。
+//! **远程 SSH 项目**(`remote_ssh.rs` 1281 行)依赖 `mt-ssh`。收尾-1 批已把
+//! `mt-ssh` / `mt-core` 从 `src-tauri/` 物理移入 `crates/`(两者同时仍作为跨工作区
+//! path 依赖服务 `src-tauri` 与 `src-tauri/mt-sidecars`,老构建不受影响),
+//! 前置条件已就绪;远程项目本体的移植归 BB 批(#28),届时按需在本 crate
+//! 加 `mt-ssh.workspace = true`。
+//! 远程文件树复用 [`fs::natural_cmp`],与本地树保持同一排序观感。
 
 pub mod editor;
 pub mod fs;

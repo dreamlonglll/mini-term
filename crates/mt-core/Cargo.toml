@@ -1,0 +1,24 @@
+[package]
+name = "mt-core"
+# ⚠️ version / edition 刻意保持**显式**值,不走 `workspace.package` 继承:
+# 本 crate 同时是 GPUI 工作区(根 Cargo.toml,edition 2024 / version 0.13.1)的成员
+# **和**旧 Tauri 侧 `src-tauri` / `src-tauri/mt-sidecars` 两个工作区的 path 依赖。
+# 两套 workspace.package 取值不同,显式写死才能保证移动前后语义一字不变。
+# version 与 mt-sidecars 的 0.4.8 成对(sidecar 版本不跟随主程序发版),勿动。
+version = "0.4.8"
+description = "mini-term shared core: tauri-free logic reusable by the app and sidecar binaries"
+edition = "2021"
+
+# ⚠️ 依赖方向铁律:本 crate 是**叶子**。它被 miniterm-hook / mt-ssh-mcp / mt-ssh-cli
+# 三个独立 sidecar 二进制直接链接,依赖表只许有 std 级别的小东西。
+# 具体地:`SshConnection` 由本 crate 定义、`mt-config` 反向 `pub use` 过去
+# (config.json 仍是它的持久化归属方),**不能**倒过来让 mt-core 依赖 mt-config
+# —— 那会把 zip / sha2 / anyhow 整棵树拖进 hook 小二进制。
+
+[lib]
+name = "mt_core"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "6"

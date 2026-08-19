@@ -4,9 +4,14 @@
 # (`relay-server/`)、移动端 PWA(`mobile/`) 全部排除在外，各自保持独立构建 ——
 # 迁移期间 `npm run tauri dev` 与 CI 不受任何影响，新旧两套并存到功能对齐为止。
 #
-# 对齐之后的收尾动作(不要提前做):
-#   1. `src-tauri/mt-core` `src-tauri/mt-ssh` 物理移入 `crates/`
-#      (同时要改 `src-tauri/mt-sidecars` 的 path 依赖与 `scripts/stage-sidecars.mjs`)
+# 对齐之后的收尾动作:
+#   1. ✅ 已完成(收尾-1 批):`mt-core` / `mt-ssh` 已从 `src-tauri/` 物理移入
+#      `crates/`。它们同时是本工作区的成员**和** `src-tauri` / `src-tauri/mt-sidecars`
+#      两个旧工作区的跨工作区 path 依赖(与 `relay-server/protocol` 同一种用法)。
+#      ⚠️ 这两个 crate 的 `edition` / `version` 保持**显式**值(2021 / 各自原版本号),
+#      不改用 `workspace.package` 继承 —— 旧 Tauri 侧仍在编译它们,语义必须一字不变。
+#      `scripts/stage-sidecars.mjs` 无需改动:`mt-sidecars` 本身仍在 `src-tauri/` 下,
+#      manifest 路径与产物目录(`src-tauri/mt-sidecars/target/`)都没变。
 #   2. 删除 `src-tauri/` 与 `src/`，本文件的 exclude 随之清空
 [workspace]
 resolver = "3"
@@ -68,10 +73,19 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "io-util
 # ---------------------------------------------------------------------------
 mt-ai = { path = "crates/mt-ai" }
 mt-config = { path = "crates/mt-config" }
+# tauri-free 的叶子共享库(收尾-1 批自 `src-tauri/mt-core` 移入):WSL UNC 解析 /
+# SSH 提示扫描 + ANSI 剥离 / 原子写 / SshConnection / 临时私钥落盘。
+# ⚠️ 依赖方向铁律:mt-core **只依赖 serde/serde_json/dirs**,绝不反向依赖
+# mt-config 等上层 crate —— 它同时被三个 sidecar 二进制(miniterm-hook /
+# mt-ssh-mcp / mt-ssh-cli)与 mt-ssh 链接,加一层就把整套上层依赖拖进小二进制。
+mt-core = { path = "crates/mt-core" }
 mt-i18n = { path = "crates/mt-i18n" }
 mt-project = { path = "crates/mt-project" }
 mt-pty = { path = "crates/mt-pty" }
 mt-relay = { path = "crates/mt-relay" }
+# 共享 SSH 通信层(russh 持久会话池 + SFTP 原语),收尾-1 批自 `src-tauri/mt-ssh`
+# 移入;BB 批(SSH 全套 UI)接线用。
+mt-ssh = { path = "crates/mt-ssh" }
 mt-terminal = { path = "crates/mt-terminal" }
 mt-ui = { path = "crates/mt-ui" }
 mt-usage = { path = "crates/mt-usage" }
