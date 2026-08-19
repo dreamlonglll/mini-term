@@ -345,6 +345,20 @@ impl TerminalPane {
         self.spawn_error.as_deref()
     }
 
+    /// grid 的只读句柄。给悬停缩略图([`crate::pane_preview`])用 ——
+    /// [`mt_ui::MiniTerminalElement`] 只读不写、不 resize、不接输入。
+    ///
+    /// ⚠️ 别拿它去建第二个 [`mt_ui::TerminalElement`]:那个件会在 prepaint 里
+    /// 按自己的可用像素 `resize` emulator,等于让缩略图去改真终端的行列。
+    pub fn emulator(&self) -> Arc<TerminalEmulator> {
+        self.emulator.clone()
+    }
+
+    /// 当前终端配色。缩略图要用同一份,否则浮层里的画面配色与切过去看到的不一致。
+    pub fn theme(&self) -> &TerminalTheme {
+        &self.theme
+    }
+
     /// Ctrl+F。打开查找条,已经开着就把焦点送回输入框并全选。
     ///
     /// # 与原版的两处口径差

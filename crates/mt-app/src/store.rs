@@ -26,6 +26,7 @@ use gpui::{App, AppContext, Context, Entity, Global, Subscription, Task, Window}
 use mt_config::{AiLauncher, AppConfig, ConfigStore, MobileRelayConfig, ProjectConfig, SaveError, ShellConfig};
 use mt_relay::MobileRelayStatusPayload;
 use mt_pty::PtySpawn;
+use mt_ui::icons::ProjectKind;
 use mt_ui::theme_bridge::BackgroundArt;
 use mt_ui::{DwellConfig, TerminalStyle, TerminalTheme};
 
@@ -136,6 +137,19 @@ pub struct AppStore {
     /// 展开的目录(按项目)。运行时态,落盘走 `ProjectConfig::expanded_dirs`。
     expanded_dirs: HashMap<String, HashSet<String>>,
 
+    /// 目录技术栈探测缓存(`src/store.ts:708` 的 `dirKinds`)。
+    /// key = 目录路径**原样**;`None` = 已探测但识别不出(**不再重探**)。
+    /// 项目根与文件树里的子工程目录共用这一份。
+    dir_kinds: HashMap<String, Option<ProjectKind>>,
+    /// 在途探测(`useProjectKinds.ts` 那个模块级 `pending`)。
+    /// **不是可订阅状态**,只为去重 —— 变化不 notify。
+    dir_kinds_pending: HashSet<String>,
+
+    /// 已退出的 PTY(`src/store.ts:660` 的 `exitedPtyIds`,`pty-exit` 登记)。
+    /// 悬停缩略图据此画「已断开」遮罩;远程 pane 的重连覆盖层随 #28。
+    /// **纯运行时,不落盘**;pane 一没跟着没(见 [`Self::dispose_terminal`])。
+    exited_ptys: HashSet<u32>,
+
     /// 完成队列(未读集合 + 完成序号),对应旧版的 unreadDonePaneIds / aiDoneOrder。
     done: DoneTracker,
     /// 主窗口是否聚焦。聚焦时完成的任务用户正看着,不计入「未读完成」。
@@ -203,6 +217,9 @@ impl AppStore {
             terminal_theme: TerminalTheme::default(),
             background_art: None,
             expanded_dirs,
+            dir_kinds: HashMap::new(),
+            dir_kinds_pending: HashSet::new(),
+            exited_ptys: HashSet::new(),
             done: DoneTracker::default(),
             window_focused: true,
             save_generation: 0,
@@ -251,6 +268,57 @@ impl AppStore {
 
     pub fn terminal(&self, pty_id: u32) -> Option<&Entity<TerminalPane>> {
         self.terminals.get(&pty_id)
+    }
+
+    /// 这个 PTY 已经退出了吗(`exitedPtyIds.has`)。
+    pub fn is_pty_exited(&self, pty_id: u32) -> bool {
+        self.exited_ptys.contains(&pty_id)
+    }
+
+    // === 目录技术栈探测(`useProjectKinds.ts`) ===
+
+    /// 读缓存。`None` = 还没探过;`Some(None)` = 探过但识别不出。
+    pub fn dir_kind(&self, path: &str) -> Option<Option<ProjectKind>> {
+        self.dir_kinds.get(path).copied()
+    }
+
+    /// 批量探测(去重 + 带缓存)。**只接本地路径**,远程由调用方跳过。
+    ///
+    /// 每条路径一个后台任务:`detect_local` 要读目录、可能还读 `package.json`,
+    /// 在主线程上跑会把网络盘/WSL 上的一次悬停做成秒级卡顿。
+    pub fn ensure_dir_kinds(&mut self, paths: Vec<String>, cx: &mut Context<Self>) {
+        for path in paths {
+            if self.dir_kinds.contains_key(&path) || !self.dir_kinds_pending.insert(path.clone()) {
+                continue;
+            }
+            cx.spawn(async move |this, cx| {
+                let probe = path.clone();
+                let kind = cx
+                    .background_executor()
+                    .spawn(async move {
+                        crate::project_kind::detect_local(std::path::Path::new(&probe))
+                    })
+                    .await;
+                let _ = this.update(cx, |store: &mut AppStore, cx| {
+                    store.dir_kinds_pending.remove(&path);
+                    store.set_dir_kind(path, kind, cx);
+                });
+            })
+            .detach();
+        }
+    }
+
+    /// 写缓存并通知(`setDirKind`)。识别不出也要写 —— 否则每帧重探。
+    pub fn set_dir_kind(&mut self, path: String, kind: Option<ProjectKind>, cx: &mut Context<Self>) {
+        self.dir_kinds.insert(path, kind);
+        cx.notify();
+    }
+
+    /// 失效(`removeDirKind`):项目根的标记文件变动时调。下一轮 `ensure` 会重探。
+    pub fn remove_dir_kind(&mut self, path: &str, cx: &mut Context<Self>) {
+        if self.dir_kinds.remove(path).is_some() {
+            cx.notify();
+        }
     }
 
     // === 项目 ===
@@ -1358,6 +1426,8 @@ impl AppStore {
         self.clear_markers_for_pty(pty_id);
         // 分支登记同理:留着会让复用同一编号的新 PTY 认领上一任的 fork 登记
         self.clear_pending_fork(pty_id);
+        // 退出登记同理:留着会让复用同一编号的新 PTY 一开就顶着「已断开」遮罩
+        self.exited_ptys.remove(&pty_id);
         if let Some(entity) = self.terminals.remove(&pty_id) {
             // 组合中关 pane:先把预编辑收掉,免得 IME 还挂在一个即将消失的
             // 输入宿主上(marked range 不收回,下一次按键会被 IME 永久劫持)
@@ -1389,6 +1459,8 @@ impl AppStore {
         // fork 命令没能起起会话就退了 —— 这条登记不该等到下一个进程头上
         // (原版把 `clearPendingFork` 挂在 `pty-exit` 监听里,同一时机)
         self.clear_pending_fork(pty_id);
+        // 原版 `App.tsx:359` 的 `markPtyExited`:与状态落 error 同一时机
+        self.exited_ptys.insert(pty_id);
         let mut touched: Option<String> = None;
         for (pid, state) in self.project_states.iter_mut() {
             if let Some(layout) = state.layout.as_mut()

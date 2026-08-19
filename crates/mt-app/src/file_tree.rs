@@ -68,6 +68,9 @@ pub struct FileTree {
     root_loading: bool,
     /// 上一次列根目录的错误原文。
     root_error: Option<String>,
+    /// 每行一个焦点句柄(原版每行 `tabIndex={0}`)。行拿到焦点后 Enter/Space
+    /// 与 ←→ 才有落点,见 [`Self::on_row_key`]。
+    row_focus: HashMap<PathBuf, gpui::FocusHandle>,
     _fs_task: Task<()>,
     _git_task: Task<()>,
 }
@@ -80,24 +83,27 @@ impl FileTree {
         })
         .detach();
 
+        // 丢过去的是**变动文件的完整路径**:重列只要它的父目录,但技术栈缓存的
+        // 失效判据要看文件名本身(`Cargo.toml` / `package.json` 之类)
         let (tx, mut rx) = mpsc::unbounded::<PathBuf>();
         let watcher = Arc::new(FsWatcher::new(move |change| {
-            // notify 自己的线程:只把「哪个目录变了」丢过去,重列在主线程排。
-            let dir = match change.path.parent() {
-                Some(parent) => parent.to_path_buf(),
-                None => change.path.clone(),
-            };
-            let _ = tx.unbounded_send(dir);
+            // notify 自己的线程:只把「什么变了」丢过去,重列在主线程排。
+            let _ = tx.unbounded_send(change.path);
         }));
 
         let fs_task = cx.spawn(async move |this, cx| {
-            while let Some(dir) = rx.next().await {
+            while let Some(path) = rx.next().await {
+                let dir = match path.parent() {
+                    Some(parent) => parent.to_path_buf(),
+                    None => path.clone(),
+                };
                 if this
                     .update(cx, |tree: &mut FileTree, cx| {
                         tree.invalidate(&dir, cx);
                         // 原版第二条:`fs-change` 且属于当前项目 → 500ms 去抖刷 git 状态。
                         // watcher 是按项目根注册的,能走到这儿的必然属于当前项目。
                         tree.schedule_git_refresh();
+                        tree.invalidate_dir_kind(&path, &dir, cx);
                     })
                     .is_err()
                 {
@@ -134,6 +140,7 @@ impl FileTree {
             chain_owner: HashMap::new(),
             root_loading: false,
             root_error: None,
+            row_focus: HashMap::new(),
             _fs_task: fs_task,
             _git_task: git_task,
         };
@@ -299,6 +306,18 @@ impl FileTree {
                             }
                             entries.push(entry);
                         }
+                        // 根目录一级子目录的子工程探测(原版 `FileTree.tsx:488-491`
+                        // 那个 effect):不必展开就能在树里看到技术栈图标。
+                        // 忽略项不探 —— 图标那一路也只在 `!entry.ignored` 时才换
+                        if is_root {
+                            let probe: Vec<String> = entries
+                                .iter()
+                                .filter(|e| e.is_dir && !e.ignored)
+                                .map(|e| e.path.to_string_lossy().to_string())
+                                .collect();
+                            tree.store
+                                .update(cx, |store, cx| store.ensure_dir_kinds(probe, cx));
+                        }
                         tree.entries.insert(dir, entries);
                     }
                     Err(err) => {
@@ -346,6 +365,78 @@ impl FileTree {
             return;
         };
         self.load_dir(root, target, cx);
+    }
+
+    /// 技术栈缓存的失效(`useProjectKinds.ts:88-103` 的 `fs-change` 监听)。
+    ///
+    /// 判据逐条照抄:变动的**文件名**在标记文件表里,且它的**父目录正好是某个
+    /// 本地项目的根**。原版注释点明了为什么只认项目根 —— 只有活跃项目的根目录
+    /// 被 watch,那正是唯一能在应用内改到这些文件的场景。
+    fn invalidate_dir_kind(&mut self, path: &Path, dir: &Path, cx: &mut Context<Self>) {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            return;
+        };
+        if !crate::project_kind::is_marker_file(name) {
+            return;
+        }
+        let parent = crate::project_kind::norm_path(&dir.to_string_lossy());
+        let target = self
+            .store
+            .read(cx)
+            .projects()
+            .iter()
+            .find(|p| {
+                p.ssh_connection_id.is_none() && crate::project_kind::norm_path(&p.path) == parent
+            })
+            .map(|p| p.path.clone());
+        if let Some(target) = target {
+            self.store
+                .update(cx, |store, cx| store.remove_dir_kind(&target, cx));
+        }
+    }
+
+    // ─── 键盘导航(`FileTree.tsx:197-209`) ─────────────────────
+
+    /// 行的焦点句柄(按需建、跨帧稳定)。
+    fn row_focus(&mut self, path: &Path, cx: &mut Context<Self>) -> gpui::FocusHandle {
+        self.row_focus
+            .entry(path.to_path_buf())
+            .or_insert_with(|| cx.focus_handle())
+            .clone()
+    }
+
+    /// 行按键。逐条照抄原版:目录 Enter/Space/→ 展开、← 折叠;文件 Enter/Space 开预览。
+    ///
+    /// ⚠️ **→ 只在折叠时生效、← 只在展开时生效**(原版那两个 `&& !expanded` /
+    /// `&& expanded`),否则方向键会变成 toggle,在展开的目录上按 → 反而折叠。
+    fn on_row_key(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        path: &Path,
+        is_dir: bool,
+        expanded: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event.keystroke.key.as_str() {
+            "enter" | "space" => {
+                cx.stop_propagation();
+                if is_dir {
+                    self.toggle_dir(path.to_path_buf(), cx);
+                } else {
+                    self.open_file(path.to_path_buf(), window, cx);
+                }
+            }
+            "right" if is_dir && !expanded => {
+                cx.stop_propagation();
+                self.toggle_dir(path.to_path_buf(), cx);
+            }
+            "left" if is_dir && expanded => {
+                cx.stop_propagation();
+                self.toggle_dir(path.to_path_buf(), cx);
+            }
+            _ => {}
+        }
     }
 
     fn toggle_dir(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -455,6 +546,12 @@ impl FileTree {
                 expanded,
                 rel,
                 git,
+                // 一级子目录被识别为子工程时领位换技术栈徽标(`FileTree.tsx:346-351`)。
+                // 条件一字不差:目录、depth == 0、非远程、未被 gitignore
+                kind: (entry.is_dir && depth == 0 && !entry.ignored)
+                    .then(|| store.dir_kind(&key))
+                    .flatten()
+                    .flatten(),
             });
             if expanded {
                 self.rows(project_id, root, &entry.path, depth + 1, cx, out);
@@ -475,6 +572,8 @@ struct Row {
     rel: String,
     /// git 状态字母 + **是不是汇总来的**(汇总的那枚画淡一档)。
     git: Option<(String, bool)>,
+    /// 一级子目录的技术栈徽标(`None` = 用普通文件夹图标)。
+    kind: Option<mt_ui::icons::ProjectKind>,
 }
 
 // ─── 右键菜单 ─────────────────────────────────────────────────
@@ -1076,6 +1175,20 @@ impl Render for FileTree {
 
         let mut rows = Vec::new();
         self.rows(&project_id, &root, &root, 0, cx, &mut rows);
+        // 行焦点句柄按**当前可见行**补齐并回收(折叠掉的行不必留着句柄)。
+        // 句柄要跨帧稳定 —— 每帧新建的话 Tab 过去的焦点每帧都会丢
+        {
+            let visible: HashSet<&PathBuf> = rows.iter().map(|r| &r.path).collect();
+            self.row_focus.retain(|path, _| visible.contains(path));
+            let missing: Vec<PathBuf> = rows
+                .iter()
+                .filter(|r| !self.row_focus.contains_key(&r.path))
+                .map(|r| r.path.clone())
+                .collect();
+            for path in missing {
+                self.row_focus(&path, cx);
+            }
+        }
 
         // 三态占位:**都以「一行都没有」为前置** —— 有缓存内容时不整块盖掉
         if rows.is_empty() && (self.root_loading || self.root_error.is_some()) {
@@ -1332,17 +1445,43 @@ impl FileTree {
         // 语言色。**git 状态着的是行尾那枚状态字母,不是文件名本身的颜色**
         // (`FileTree.tsx:565` 的注释专门点了这条)。
         let git_badge = row.git.clone();
-        let icon = {
-            let icon = FileIcon::new(&row.name, row.is_dir, row.expanded).size(px(14.0));
-            if row.ignored {
-                icon.color(ui::text_muted())
-            } else {
-                icon
+        // 一级子工程目录优先显示技术栈徽标(原版那段 IIFE 的第一条分支)
+        let icon: AnyElement = match row.kind {
+            Some(kind) => mt_ui::icons::TechIcon::new(kind)
+                .size(px(14.0))
+                .into_any_element(),
+            None => {
+                let icon = FileIcon::new(&row.name, row.is_dir, row.expanded).size(px(14.0));
+                if row.ignored {
+                    icon.color(ui::text_muted()).into_any_element()
+                } else {
+                    icon.into_any_element()
+                }
             }
         };
+        let focus = self.row_focus.get(&row.path).cloned();
+        let key_path = row.path.clone();
+        let key_expanded = row.expanded;
 
         div()
             .id(SharedString::from(format!("fs-{}", row.path.display())))
+            // 行级焦点 + tab 停靠点(原版每行 `tabIndex={0}` + `role=treeitem`)
+            .when_some(focus, |el, focus| el.track_focus(&focus).tab_index(0))
+            .on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, window, cx| {
+                this.on_row_key(event, &key_path, is_dir, key_expanded, window, cx);
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener({
+                    let path = row.path.clone();
+                    move |this, _event: &MouseDownEvent, window, _cx| {
+                        // 浏览器点 `tabIndex=0` 的行就会聚焦,←→ 折叠展开靠这一条才够得着
+                        if let Some(focus) = this.row_focus.get(&path) {
+                            window.focus(focus);
+                        }
+                    }
+                }),
+            )
             .flex()
             .items_center()
             .gap(px(4.0))

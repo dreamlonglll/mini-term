@@ -1,5 +1,4 @@
-//! 左栏:项目列表。对应 `src/components/ProjectList.tsx` 的主干
-//!(hover 缩略图 / worktree 徽章 / 内联重命名是后续批次)。
+//! 左栏:项目列表。对应 `src/components/ProjectList.tsx` 的主干。
 //!
 //! # 领位图标
 //!
@@ -7,9 +6,18 @@
 //! 这里没有 SSH 远程项目(mt-ssh 未进 crates/),所以只剩两档:
 //! 技术栈徽标([`mt_ui::icons::TechIcon`])/ 通用目录图标。
 //!
-//! ⚠️ 技术栈**只认 `kindOverride`**:原版还有一路 `useProjectKinds` 探测
-//! (扫项目根的 `Cargo.toml` / `package.json` 之类),那是带缓存的异步批量任务,
-//! 留给后续批次;探测接上之前,没手动设过类型的项目一律走通用图标。
+//! 技术栈取值走 [`resolve_project_kind`]:手动 `kindOverride` 优先,没设过就用
+//! [`crate::project_kind`] 的目录探测缓存(结果住在 store 的 `dir_kinds`,
+//! 探测本身丢后台)。
+//!
+//! # 键盘与悬停(清尾批)
+//!
+//! - 每行 `track_focus` + `tab_index`(原版的 `tabIndex={0}`),Enter/Space 打开、
+//!   Delete 移除(带确认)、F2 重命名。**F2 不在行上绑** —— 它与全局键位表
+//!   (`renamePane`)同一条绑定,由 `main.rs` 按焦点分流,见
+//!   [`ProjectList::rename_focused_row`];
+//! - 悬停 250ms 弹 pane 缩略图([`crate::pane_preview`]),开闸条件是「这个项目
+//!   里有 AI 会话 pane」,移出 / 按下 / 右键 / 滚动即关。
 //!
 //! # 分组与拖放(X 批)
 //!
@@ -32,13 +40,14 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use gpui::{
-    AnyElement, App, AppContext, ClipboardItem, Context, DragMoveEvent, Entity, ExternalPaths,
-    FontWeight,
+    AnyElement, App, AppContext, Bounds, ClipboardItem, Context, DragMoveEvent, Entity,
+    ExternalPaths, FocusHandle, Focusable, FontWeight,
     InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement,
-    Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div,
+    Pixels, Render, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled,
+    Subscription, Task, Window, anchored, canvas, deferred, div,
     prelude::FluentBuilder, px,
 };
-use gpui_component::input::{Input, InputEvent, InputState};
+use gpui_component::input::{Input, InputEvent, InputState, SelectAll};
 use mt_config::{ProjectConfig, ProjectTreeItem};
 use mt_ui::icons::vector::VectorIcon;
 use mt_ui::icons::{
@@ -52,6 +61,7 @@ use crate::fs_ops;
 use crate::i18n::{t, tr};
 use crate::menu::{self, MenuEntry, MenuItem};
 use crate::modal;
+use crate::pane_preview::{self, MiniLayout};
 use crate::project_tree::{self, MAX_DEPTH, OrderedItem};
 use crate::store::AppStore;
 use crate::tree::PaneStatus;
@@ -92,6 +102,24 @@ fn done_tag() -> AnyElement {
         .text_color(ui::bg_base())
         .child(t("panels", "done"))
         .into_any_element()
+}
+
+/// 领位徽标最终显示哪种技术栈(`ProjectList.tsx:629-632`)。
+///
+/// 原式:`kindOverride === 'none' ? null : kindOverride ?? detected ?? null`。
+/// 两条不显然的地方:
+/// - `'none'` 是「用户明确关掉徽标」,**不回退**到探测结果;
+/// - 覆盖值一旦存在就压过探测(认不出的覆盖值也一样落到通用图标 —— `??` 链
+///   只看 `kindOverride` 有没有值,不看它认不认得出)。
+fn resolve_project_kind(
+    kind_override: Option<&str>,
+    detected: Option<ProjectKind>,
+) -> Option<ProjectKind> {
+    match kind_override {
+        Some("none") => None,
+        Some(other) => ProjectKind::from_str(other),
+        None => detected,
+    }
 }
 
 /// 项目行的左内边距。原版这两条公式**不能合并**(`ProjectList.tsx:660-666` 有
@@ -206,7 +234,11 @@ struct Row {
     /// 非激活项目里有 AI 任务完成(行尾那颗绿点)。
     needs_attention: bool,
     /// 领位图标的技术栈;`None` = 走通用目录图标。
+    /// 口径 `kindOverride === 'none' ? null : kindOverride ?? detected`。
     kind: Option<ProjectKind>,
+    /// 探测结果本身(与 `kind` 分开存):「项目类型 → 自动识别」那一项要把它
+    /// 写进括号里,而 `kind` 在用户手动指定后就不是探测值了。
+    detected_kind: Option<ProjectKind>,
     /// 需求描述(右键「编辑描述」的默认值)。
     description: Option<String>,
     /// `kindOverride` 原文:`None` = 自动,`Some("none")` = 不显示,
@@ -299,12 +331,16 @@ fn check_prefix(selected: bool) -> &'static str {
     if selected { "✓ " } else { "　" }
 }
 
-/// 「项目类型」子菜单。`current` 是 `kindOverride` 原文。
-fn kind_submenu(store: &Entity<AppStore>, project_id: &str, current: Option<&str>) -> Vec<MenuEntry> {
+/// 「项目类型」子菜单。`current` 是 `kindOverride` 原文,`detected` 是探测结果
+/// (`ProjectList.tsx:773`)。
+fn kind_submenu(
+    store: &Entity<AppStore>,
+    project_id: &str,
+    current: Option<&str>,
+    detected: Option<ProjectKind>,
+) -> Vec<MenuEntry> {
     let mut entries: Vec<MenuEntry> = Vec::new();
 
-    // 自动识别。原版这里还会把探测到的类型写进括号里(`（Rust）`),
-    // GPUI 侧还没有探测那一路(useProjectKinds 未移植),所以不带括号。
     let set = |kind: Option<&'static str>| {
         let store = store.clone();
         let project_id = project_id.to_string();
@@ -317,9 +353,11 @@ fn kind_submenu(store: &Entity<AppStore>, project_id: &str, current: Option<&str
 
     entries.push(
         MenuItem::new(format!(
-            "{}{}",
+            "{}{}{}",
             check_prefix(current.is_none()),
-            t("projectList", "menu.projectKindAuto")
+            t("projectList", "menu.projectKindAuto"),
+            // 探测到什么写进**全角**括号里(原版 `（Rust）`);还没探完就不带括号
+            detected.map(|k| format!("（{}）", k.label())).unwrap_or_default()
         ))
         .on_click(set(None))
         .into(),
@@ -544,7 +582,12 @@ fn project_menu(
             }
             ProjectMenuAction::ProjectKind => {
                 let entry: MenuEntry = MenuItem::new(t("projectList", "menu.projectKind"))
-                    .submenu(kind_submenu(store, &row.id, row.kind_override.as_deref()))
+                    .submenu(kind_submenu(
+                        store,
+                        &row.id,
+                        row.kind_override.as_deref(),
+                        row.detected_kind,
+                    ))
                     .into();
                 entries.push(entry);
                 // 分组段紧跟在「项目类型」之后(原版就是这个位置),自带前置分隔线
@@ -704,6 +747,14 @@ struct Editing {
     _sub: Subscription,
 }
 
+/// 悬停缩略图的开启态。`anchor` 是弹出那一刻行的屏幕矩形 ——
+/// 与原版「到点时才 `getBoundingClientRect()`」同一时机(悬停这 250ms 里
+/// 列表可能增删过行,进入那一刻的矩形已经不作数)。
+struct RowPreview {
+    project_id: String,
+    anchor: Bounds<Pixels>,
+}
+
 pub struct ProjectList {
     store: Entity<AppStore>,
     /// 正在被拖的节点 id(拖影起来那一刻记下),源行据此变淡。
@@ -723,6 +774,17 @@ pub struct ProjectList {
     probe_key: String,
     /// 上次看到的窗口聚焦态。`false → true` 是原版 `onFocusChanged` 那条重探时机。
     was_focused: bool,
+    /// 每行一个焦点句柄(原版每行 `tabIndex={0}`)。行拿到焦点之后
+    /// Enter/Space、Delete、F2 才有落点,见 [`Self::on_project_key`]。
+    row_focus: HashMap<String, FocusHandle>,
+    /// 悬停缩略图当前开在哪一行。
+    preview: Option<RowPreview>,
+    /// 250ms 计时 + 开着之后的 500ms 续活节拍。**丢掉句柄就等于 `clearTimeout`**。
+    _preview_task: Option<Task<()>>,
+    /// 正被悬停的那一行的屏幕矩形(只给被悬停的那一行挂 `canvas` 量)。
+    hover_rect: Option<Bounds<Pixels>>,
+    /// 刚进编辑态、还等着「默认全选」的那个输入框。见 [`Self::start_rename`]。
+    pending_select_all: Option<FocusHandle>,
 }
 
 impl ProjectList {
@@ -730,6 +792,9 @@ impl ProjectList {
         cx.observe(&store, |this: &mut Self, _, cx| {
             // 项目路径集合变了(增删项目 / worktree 变项目)→ 重探徽章
             this.probe_worktrees(false, cx);
+            // 技术栈探测(原版 `useProjectKinds` 那个 effect):列表变了就补探,
+            // 缓存失效(`removeDirKind`)后同样由这条重跑补上
+            this.ensure_project_kinds(cx);
             // 窗口重新聚焦:分支切换与 `git worktree remove` 都发生在窗外,
             // 回来时既重探徽章也做一次失效清理(原版 `onFocusChanged` 同款)
             let focused = this.store.read(cx).window_focused();
@@ -751,21 +816,56 @@ impl ProjectList {
             worktree_branches: HashMap::new(),
             probe_key: String::new(),
             was_focused: true,
+            row_focus: HashMap::new(),
+            preview: None,
+            _preview_task: None,
+            hover_rect: None,
+            pending_select_all: None,
             };
         // 挂载时先探一次(原版两个 effect 都在挂载时跑一遍)
         this.probe_worktrees(true, cx);
         this.reconcile_worktrees(cx);
+        this.ensure_project_kinds(cx);
         this
+    }
+
+    /// 补探项目根目录的技术栈(原版 `useProjectKinds` 的 effect)。
+    ///
+    /// **远程项目不探**:领位固定 SSH 图标,路径也不是本机能列的位置
+    /// (GPUI 侧还没有远程项目,判据照写,mt-ssh 接上自动生效)。
+    /// 去重与「探过就不再探」都在 store 那边,这里每次全量喂即可。
+    fn ensure_project_kinds(&mut self, cx: &mut Context<Self>) {
+        let paths: Vec<String> = self
+            .store
+            .read(cx)
+            .projects()
+            .iter()
+            .filter(|p| p.ssh_connection_id.is_none())
+            .map(|p| p.path.clone())
+            .collect();
+        if paths.is_empty() {
+            return;
+        }
+        self.store
+            .update(cx, |store, cx| store.ensure_dir_kinds(paths, cx));
     }
 
     // ─── 行内重命名(`ProjectList.tsx:415-444`) ───────────────
 
-    /// 进入编辑态。右键菜单的「重命名」与(将来的)F2 走同一个入口。
+    /// 进入编辑态。右键菜单的「重命名」与 F2 走同一个入口。
     ///
-    /// ⚠️ **做不到「默认全选」**:`InputState::select_all` 是 `pub(super)`,
-    /// 组件库没给公开入口(N 批为 `show_prompt` 记过同一条)。这里退到
-    /// `set_value` 的副作用 —— 单行模式下它把光标放到**行尾**,
-    /// 比 `default_value`(光标在行首)接近原版的 `select()` 一档。
+    /// # 「默认全选」怎么绕过 `pub(super)`(Y 批记档的复查结论)
+    ///
+    /// `InputState::select_all` 确实是 `pub(super)`,组件库没有任何公开的
+    /// setter 能改选区(`set_cursor_position` 只动光标)。但它是一个
+    /// **action handler** —— `input::SelectAll` 是 `actions!` 导出的公开类型,
+    /// `Input` 元素上挂着 `on_action(InputState::select_all)`。于是把动作
+    /// **派发到输入框的焦点节点**就等价于用户按了 Ctrl+A。
+    ///
+    /// 时机是唯一的坑:`FocusHandle::dispatch_action` 查的是
+    /// `rendered_frame` 的 dispatch tree,而输入框这一刻还没被画出来。
+    /// 所以这里只登记,真正派发在 `render` 里挂 `window.on_next_frame`
+    /// (那时 `rendered_frame` 正是刚画完、含输入框的那一帧)。
     fn start_rename(
         &mut self,
         id: String,
@@ -779,6 +879,7 @@ impl ProjectList {
             state.set_value(current.to_string(), window, cx);
             state.focus(window, cx);
         });
+        self.pending_select_all = Some(input.read(cx).focus_handle(cx));
         // 回车 = 提交,失焦 = 提交(原版 onKeyDown Enter / onBlur 两条都提交)
         let sub = cx.subscribe(&input, |this: &mut Self, _input, event: &InputEvent, cx| {
             if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
@@ -833,6 +934,219 @@ impl ProjectList {
             })
             .child(Input::new(input).appearance(false))
             .into_any_element()
+    }
+
+    // ─── 键盘导航(`ProjectList.tsx:686-698` / `954-964`) ───────
+
+    /// 行的焦点句柄(按需建、跨帧稳定)。
+    fn row_focus(&mut self, id: &str, cx: &mut Context<Self>) -> FocusHandle {
+        self.row_focus
+            .entry(id.to_string())
+            .or_insert_with(|| cx.focus_handle())
+            .clone()
+    }
+
+    /// 项目行按键。**F2 不在这里** —— 它是全局 action(`RenamePane`),
+    /// 由 `main.rs` 的处理器按「有没有行拿着焦点」分流,见
+    /// [`Self::rename_focused_row`];两处各绑一次就会出现两套 F2 语义。
+    fn on_project_key(
+        &mut self,
+        event: &KeyDownEvent,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // 编辑态里这一行的按键整体让给输入框(原版那句 `if (editing) return`)
+        if self.editing.is_some() {
+            return;
+        }
+        match event.keystroke.key.as_str() {
+            "enter" | "space" => {
+                cx.stop_propagation();
+                self.store
+                    .update(cx, |store, cx| store.set_active_project(id, cx));
+            }
+            "delete" => {
+                cx.stop_propagation();
+                let Some((name, path)) = self
+                    .store
+                    .read(cx)
+                    .project(id)
+                    .map(|p| (p.name.clone(), p.path.clone()))
+                else {
+                    return;
+                };
+                modal::open_confirm_remove_project(
+                    self.store.clone(),
+                    id.to_string(),
+                    name,
+                    path,
+                    window,
+                    cx,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    /// 分组行按键(原版只有 Enter/Space 折叠 + F2 改名,**没有 Delete**——
+    /// 删组是不可逆的结构变更,只留在右键菜单里并带确认)。
+    fn on_group_key(&mut self, event: &KeyDownEvent, id: &str, cx: &mut Context<Self>) {
+        if self.editing.is_some() {
+            return;
+        }
+        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+            cx.stop_propagation();
+            self.store
+                .update(cx, |store, cx| store.toggle_group_collapse(id, cx));
+        }
+    }
+
+    /// 全局 F2 落到项目列表时的分流:**有行拿着焦点就改那一行的名字**,
+    /// 返回 `true` 表示这次 F2 由本视图消费掉了(否则由 `main.rs` 去改终端 tab)。
+    ///
+    /// 这是「同源判定」的落点:F2 只有一条 KeyBinding(`hotkeys.rs` 的
+    /// `renamePane`)、只有一个处理器,分流靠焦点而不是靠第二条绑定。
+    pub fn rename_focused_row(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        // 同一时刻最多只有一个句柄是聚焦的,HashMap 的遍历序不影响结果
+        let Some(id) = self
+            .row_focus
+            .iter()
+            .find(|(_, f)| f.is_focused(window))
+            .map(|(id, _)| id.clone())
+        else {
+            return false;
+        };
+        // 行 id 与分组 id 不同名空间,查一次就知道是哪种
+        let store = self.store.read(cx);
+        if let Some(project) = store.project(&id) {
+            let name = project.name.clone();
+            self.start_rename(id, false, &name, window, cx);
+            return true;
+        }
+        let name = project_tree::find_group_in_tree(
+            store.config().project_tree.as_deref().unwrap_or(&[]),
+            &id,
+        )
+        .map(|g| g.name.clone());
+        match name {
+            Some(name) => {
+                self.start_rename(id, true, &name, window, cx);
+                true
+            }
+            None => false,
+        }
+    }
+
+    // ─── 悬停缩略图(`ProjectList.tsx:446-496`) ────────────────
+
+    /// 收起浮层并取消在飞的计时(原版 `closePreview`)。
+    fn close_preview(&mut self, cx: &mut Context<Self>) {
+        self._preview_task = None;
+        if self.preview.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// 进入某一行:排一次 250ms 的计时。
+    ///
+    /// **AI 判定放在到点时而非进入时**(原版专门记了这条):这 250ms 里 AI 完全
+    /// 可能刚起来,读当下的 store 才拿得到最新一份。矩形同理到点再取。
+    fn schedule_preview(&mut self, project_id: String, cx: &mut Context<Self>) {
+        self._preview_task = None;
+        self.preview = None;
+        self._preview_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(pane_preview::HOVER_DELAY_MS))
+                .await;
+            if this
+                .update(cx, |this: &mut ProjectList, cx| this.fire_preview(&project_id, cx))
+                .unwrap_or(false)
+            {
+                // 开着期间按原版的 500ms 节拍重画 —— 缩略图是活的。
+                // MiniTerminalElement 自己也按这个节拍取数,更密的重画只命中缓存
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(mt_ui::MINI_REFRESH_MS))
+                        .await;
+                    let alive = this
+                        .update(cx, |this: &mut ProjectList, cx| {
+                            if this.preview.is_some() {
+                                cx.notify();
+                                true
+                            } else {
+                                false
+                            }
+                        })
+                        .unwrap_or(false);
+                    if !alive {
+                        return;
+                    }
+                }
+            }
+        }));
+    }
+
+    /// 计时到点:三道闸(还悬着同一行 / 量到过矩形 / 项目里真有 AI 会话)。
+    fn fire_preview(&mut self, project_id: &str, cx: &mut Context<Self>) -> bool {
+        if self.hovered.as_deref() != Some(project_id) {
+            return false;
+        }
+        let Some(anchor) = self.hover_rect else {
+            return false;
+        };
+        let store = self.store.read(cx);
+        let auto_resume = store.config().ai_auto_resume.unwrap_or(true);
+        let layout = store.project_state(project_id).and_then(|s| s.layout.as_ref());
+        if !pane_preview::has_ai_pane(layout, auto_resume) {
+            return false;
+        }
+        self.preview = Some(RowPreview {
+            project_id: project_id.to_string(),
+            anchor,
+        });
+        cx.notify();
+        true
+    }
+
+    /// 组装浮层。渲染处**每帧重判开闸**(原版的双闸模式):AI 退出后不光不画,
+    /// 状态本身也收掉 —— 留着的话同一次悬停里 AI 再起来会拿**旧锚点**复活。
+    fn render_preview(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let preview = self.preview.as_ref()?;
+        let store = self.store.read(cx);
+        let auto_resume = store.config().ai_auto_resume.unwrap_or(true);
+        let Some(project) = store.project(&preview.project_id) else {
+            self.preview = None;
+            return None;
+        };
+        let (name, path) = (project.name.clone(), project.path.clone());
+        let layout = store
+            .project_state(&preview.project_id)
+            .and_then(|s| s.layout.as_ref());
+        if !pane_preview::has_ai_pane(layout, auto_resume) {
+            self.preview = None;
+            return None;
+        }
+        let mini: Option<MiniLayout> =
+            layout.and_then(|l| pane_preview::snapshot_layout(l, store, auto_resume, cx));
+        let style = pane_preview::preview_style(store);
+        let at = pane_preview::project_anchor(preview.anchor);
+        Some(
+            deferred(
+                anchored()
+                    .position(at)
+                    // 原版那两句 `Math.min/max` 的贴边收拢在 gpui 里是白拿的
+                    .snap_to_window_with_margin(px(8.0))
+                    .child(pane_preview::project_preview_card(
+                        &name,
+                        &path,
+                        mini.as_ref(),
+                        &style,
+                    )),
+            )
+            .with_priority(1)
+            .into_any_element(),
+        )
     }
 
     // ─── worktree 徽章与失效清理(`ProjectList.tsx:186-254`) ───
@@ -1146,7 +1460,15 @@ impl ProjectList {
 }
 
 impl Render for ProjectList {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 行内重命名的「默认全选」:输入框在**上一帧**才被画进 dispatch tree,
+        // 所以派发挂在 `on_next_frame`(那时 rendered_frame 正是这一帧)。
+        // 见 `start_rename` 的注释。
+        if let Some(focus) = self.pending_select_all.take() {
+            window.on_next_frame(move |window, cx| {
+                focus.dispatch_action(&SelectAll, window, cx);
+            });
+        }
         // 拖拽中断(松手在窗外 / 被别人吃掉)后 gpui 会清 active_drag 并重画:
         // 借这一帧把残留的 view state 一并清掉(**不 notify** —— 正在渲染,
         // 再触发一次重画就是死循环)。高亮另外还与 `drag_active` 与门,
@@ -1165,6 +1487,27 @@ impl Render for ProjectList {
             let store = self.store.read(cx);
             project_tree::get_ordered_tree(store.config())
         };
+        // 行焦点句柄按当前行集合补齐并回收(`render_project`/`render_group` 拿的是
+        // `&self`,不能在那里现建)。句柄要**跨帧稳定**,不能每帧新建 ——
+        // 那样 Tab 过去的焦点每帧都会丢
+        {
+            let ids: HashSet<&str> = ordered
+                .iter()
+                .map(|item| match item {
+                    OrderedItem::Group { id, .. } | OrderedItem::Project { id, .. } => id.as_str(),
+                })
+                .collect();
+            self.row_focus.retain(|id, _| ids.contains(id.as_str()));
+            let missing: Vec<String> = ids
+                .into_iter()
+                .filter(|id| !self.row_focus.contains_key(*id))
+                .map(|id| id.to_string())
+                .collect();
+            for id in missing {
+                self.row_focus(&id, cx);
+            }
+        }
+        let preview = self.render_preview(cx);
         let store_ref = self.store.read(cx);
         let active = store_ref.active_project_id.clone();
         // 缺省开启,与 store 里那处取值同口径
@@ -1180,7 +1523,11 @@ impl Render for ProjectList {
             .flex()
             .flex_col()
             .flex_1()
-            .overflow_y_scroll();
+            .overflow_y_scroll()
+            // 列表一滚锚点就失效 —— 原版挂 window 的 scroll/wheel 直接关掉
+            .on_scroll_wheel(cx.listener(|this, _event: &ScrollWheelEvent, _window, cx| {
+                this.close_preview(cx);
+            }));
         for item in ordered {
             match item {
                 OrderedItem::Group {
@@ -1222,14 +1569,16 @@ impl Render for ProjectList {
                             .filter(|pane| pane.shows_ai_session(auto_resume))
                             .map(|pane| pane.ai_agent()),
                     );
+                    // 探测缓存:`None` = 还没探完 / 已探但认不出,两种都走通用图标
+                    let detected_kind = store.dir_kind(&p.path).flatten();
                     let row = Row {
                         id: p.id.clone(),
                         name: p.name.clone(),
                         path: p.path.clone(),
                         status: state.map(|s| s.status).unwrap_or(PaneStatus::Idle),
                         needs_attention: state.map(|s| s.needs_attention).unwrap_or(false),
-                        // "none" = 用户选了「不显示」,认不出的值同样落到通用图标
-                        kind: p.kind_override.as_deref().and_then(ProjectKind::from_str),
+                        kind: resolve_project_kind(p.kind_override.as_deref(), detected_kind),
+                        detected_kind,
                         description: p.description.clone(),
                         kind_override: p.kind_override.clone(),
                         depth,
@@ -1356,6 +1705,9 @@ impl Render for ProjectList {
             )
             .child(list)
             .child(footer)
+            // 悬停缩略图。`deferred(priority 1)` 画在所有常规内容之上,
+            // 卡本身不带 `.id()` → 无 hitbox → 等价原版的 pointer-events-none
+            .children(preview)
             // 三态提示框:盖住整栏,`pointer-events` 不用管 —— gpui 的 drop 分发
             // 按 hitbox 命中走,这层没有 `.id()` 也就没有 hitbox
             .when_some(external, |el, kind| {
@@ -1425,9 +1777,12 @@ impl ProjectList {
         let id_move = id.clone();
         let id_drop = id.clone();
         let id_drag = id.clone();
+        let id_key = id.clone();
+        let id_focus = id.clone();
         let name_drag = name.clone();
         let row_menu = row.clone();
         let this = cx.entity();
+        let focus = self.row_focus.get(id.as_str()).cloned();
         // 编辑中的那一行:名字换成内联输入框,行本身的点击/按键让给它
         let editing = self
             .editing
@@ -1440,6 +1795,22 @@ impl ProjectList {
             .child(
                 div()
                     .id(SharedString::from(format!("group-{id}")))
+                    // 分组行同样可 Tab 可聚焦(原版 `tabIndex={0}` + `role=treeitem`)
+                    .when_some(focus, |el, focus| el.track_focus(&focus).tab_index(0))
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _window, cx| {
+                        this.on_group_key(event, &id_key, cx);
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _event: &MouseDownEvent, window, cx| {
+                            this.close_preview(cx);
+                            if this.editing.is_none()
+                                && let Some(focus) = this.row_focus.get(id_focus.as_str())
+                            {
+                                window.focus(focus);
+                            }
+                        }),
+                    )
                     .flex()
                     .items_center()
                     .gap(px(6.0))
@@ -1598,16 +1969,43 @@ impl ProjectList {
         // 走 view state 而不是 `group_hover` + 透明度:透明的按钮仍然吃点击,
         // 而这个按钮的动作是「移除项目」,看不见还能点中是实打实的事故。
         let hovered = self.hovered.as_deref() == Some(id.as_str());
+        let focus = self.row_focus.get(id.as_str()).cloned();
+        let id_key = id.clone();
+        let id_focus = id.clone();
         // 完成提示:非激活项目里有 AI 任务完成时画 DONE 标,否则才轮到状态灯;
         // **idle 且没有完成标时两个都不画**(原版 `ProjectList.tsx:912`)
         let show_done_tag = needs_attention && !is_active;
 
         div()
             .relative()
+            // 被悬停的那一行挂一块 canvas 量矩形 —— 缩略图的锚点要它。
+            // **只给悬停中的那一行挂**:每行常驻一块的话,一屏几十个项目就是
+            // 几十个白量的元素
+            .when(hovered, |el| {
+                let this = cx.entity();
+                el.child(
+                    canvas(
+                        move |bounds, _window, cx| {
+                            this.update(cx, |list: &mut ProjectList, _cx| {
+                                list.hover_rect = Some(bounds);
+                            });
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .size_full(),
+                )
+            })
             .child(
                 div()
                     .id(SharedString::from(format!("project-{id}")))
                     .group(SharedString::from(format!("project-row-{id}")))
+                    // 行级焦点 + tab 停靠点(原版每行 `tabIndex={0}`)。
+                    // 整栏是一个 tab group,组内序号从 0 起,不与别处的 tab 序打架
+                    .when_some(focus, |el, focus| el.track_focus(&focus).tab_index(0))
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                        this.on_project_key(event, &id_key, window, cx);
+                    }))
                     .flex()
                     .items_center()
                     .gap(px(6.0))
@@ -1626,22 +2024,38 @@ impl ProjectList {
                             .hover(|el| el.bg(ui::border_subtle()).text_color(ui::text_primary()))
                     })
                     // 绝对路径挂 tooltip。原版是 `title={aiVendors.length>0 ? undefined
-                    // : project.path}`(有 AI 会话时路径改由悬停缩略图的卡头显示,
-                    // 原生 tooltip 会盖住那张卡)—— GPUI 侧缩略图还没做,
-                    // 条件挂等于让跑着 AI 的项目路径彻底不可见,故**恒挂**
-                    .tooltip({
-                        let path = path.clone();
-                        move |window, cx| {
-                            gpui_component::tooltip::Tooltip::new(path.clone()).build(window, cx)
-                        }
+                    // : project.path}` —— 有 AI 会话时路径改由缩略图卡头显示,
+                    // 原生 tooltip 会盖住那张卡。这里同款条件挂
+                    .when(ai_vendors.is_empty(), |el| {
+                        el.tooltip({
+                            let path = path.clone();
+                            move |window, cx| {
+                                gpui_component::tooltip::Tooltip::new(path.clone())
+                                    .build(window, cx)
+                            }
+                        })
                     })
-                    // 悬停记到 view state 上 —— 行尾 ✕ 的显隐要它
+                    // 悬停记到 view state 上 —— 行尾 ✕ 的显隐与缩略图计时都要它。
+                    // ⚠️ 离开分支必须先核对「离开的正是我们记着的那一行」:相邻
+                    // 行的 enter/leave 到达顺序不保证,直接清会把刚进来的那一行
+                    // 抹掉(鼠标沿列表纵扫时预览再也弹不出来)
                     .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
-                        let next = hovered.then(|| id_hover.clone());
-                        if this.hovered != next {
-                            this.hovered = next;
-                            cx.notify();
+                        let mine = this.hovered.as_deref() == Some(id_hover.as_str());
+                        if *hovered {
+                            if mine {
+                                return;
+                            }
+                            this.hovered = Some(id_hover.clone());
+                            this.schedule_preview(id_hover.clone(), cx);
+                        } else {
+                            if !mine {
+                                return;
+                            }
+                            this.hovered = None;
+                            // 移出即关(原版 onMouseLeave 的 closePreview)
+                            this.close_preview(cx);
                         }
+                        cx.notify();
                     }))
                     .on_drag(
                         DragProjectItem {
@@ -1671,6 +2085,20 @@ impl ProjectList {
                             this.on_row_drop(item, &id_drop, cx);
                         }))
                     })
+                    // 按下即收缩略图(原版 onMouseDown 的第一句),顺带把行焦点
+                    // 收过来 —— 浏览器点 `tabIndex=0` 的元素就会聚焦,原版的
+                    // 「点完项目按 Delete 能删」正是靠这一条
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _event: &MouseDownEvent, window, cx| {
+                            this.close_preview(cx);
+                            if this.editing.is_none()
+                                && let Some(focus) = this.row_focus.get(id_focus.as_str())
+                            {
+                                window.focus(focus);
+                            }
+                        }),
+                    )
                     .on_click(cx.listener(move |this, _event, _window, cx| {
                         // 编辑态里点自己不切项目(交互全让给输入框)
                         if this.editing.is_some() {
@@ -1688,12 +2116,13 @@ impl ProjectList {
                             }
                         }))
                     })
-                    // 右键菜单(`ProjectList.tsx` 的 onContextMenu)。原版会先
-                    // `closePreview()` 收掉悬停缩略图 —— GPUI 侧还没有那层浮层。
+                    // 右键菜单(`ProjectList.tsx` 的 onContextMenu),开菜单前先
+                    // 收掉悬停缩略图(原版第一句就是 `closePreview()`)
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                             cx.stop_propagation();
+                            this.close_preview(cx);
                             let entries = project_menu(
                                 &cx.entity(),
                                 &this.store,
@@ -1881,6 +2310,44 @@ mod tests {
         );
         // 未建功能不占位:SSH / 环境变量 / WSL / 分组一个都不许出现
         assert_eq!(actions.iter().filter(|a| a.is_none()).count(), 2);
+    }
+
+    /// 领位徽标:手动指定压过探测,`'none'` 是「明确关掉」不回退。
+    #[test]
+    fn 领位徽标手动优先于探测() {
+        // 没设过 → 用探测结果
+        assert_eq!(
+            resolve_project_kind(None, Some(ProjectKind::Rust)),
+            Some(ProjectKind::Rust)
+        );
+        // 探测没就绪 / 认不出 → 通用图标
+        assert_eq!(resolve_project_kind(None, None), None);
+        // 手动指定压过探测
+        assert_eq!(
+            resolve_project_kind(Some("go"), Some(ProjectKind::Rust)),
+            Some(ProjectKind::Go)
+        );
+        // 'none' = 明确关掉,**不回退到探测**
+        assert_eq!(resolve_project_kind(Some("none"), Some(ProjectKind::Rust)), None);
+        // 手改坏的覆盖值同样不回退(与原版 `?? ` 链一致:有值就不看探测)
+        assert_eq!(
+            resolve_project_kind(Some("莫名其妙的值"), Some(ProjectKind::Rust)),
+            None
+        );
+    }
+
+    /// 「自动识别」那一项在探测出结果时带**全角**括号(原版 `（Rust）`),
+    /// 没探到就不带 —— 括号里空着比没有更糟。
+    #[test]
+    fn 自动识别项带探测结果括号() {
+        let suffix = |detected: Option<ProjectKind>| {
+            detected
+                .map(|k| format!("（{}）", k.label()))
+                .unwrap_or_default()
+        };
+        assert_eq!(suffix(Some(ProjectKind::Rust)), "（Rust）");
+        assert_eq!(suffix(Some(ProjectKind::Node)), "（Node.js）");
+        assert_eq!(suffix(None), "");
     }
 
     /// 勾选前缀是「✓ 」/ 全角空格 —— 两者等宽,菜单项文字才不会左右跳。

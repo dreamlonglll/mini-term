@@ -62,8 +62,10 @@ mod notify;
 mod overlay;
 mod pane;
 mod pane_actions;
+mod pane_preview;
 mod persist;
 mod pricing;
+mod project_kind;
 mod project_list;
 mod project_switcher;
 mod project_tree;
@@ -612,8 +614,22 @@ impl Workspace {
         self.store.update(cx, |store, cx| store.toggle_middle_column(cx));
     }
 
+    /// F2。**这是全仓唯一一条 F2 绑定的唯一处理器** —— 项目列表里那三条行级
+    /// 按键(Enter/Space、Delete、F2)只有 F2 与全局键位表撞车,所以它不在行上
+    /// 另绑一条 action,而是从这里按「有没有列表行拿着焦点」分流。
+    ///
+    /// 两处各绑一条 F2 的话,gpui 会按 dispatch 深度选行上那条(比 workspace 深),
+    /// 于是终端里按 F2 与列表里按 F2 变成两套语义、且谁赢取决于焦点在哪 ——
+    /// 正是 Y 批记档要求避免的「同源判定」问题。
     fn on_rename_pane(&mut self, _: &RenamePane, window: &mut Window, cx: &mut Context<Self>) {
         if yields_to_overlay(window, cx) {
+            return;
+        }
+        // 项目列表的行拿着焦点 → 改那一行的名字(项目行 / 分组行都算)
+        if self
+            .project_list
+            .update(cx, |list, cx| list.rename_focused_row(window, cx))
+        {
             return;
         }
         let Some((project_id, pane_id)) = self.target_pane(cx) else {

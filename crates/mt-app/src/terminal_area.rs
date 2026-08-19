@@ -34,7 +34,7 @@ use std::collections::HashMap;
 use gpui::{
     AnyElement, App, AppContext, Bounds, ClickEvent, Context, Entity, FocusHandle,
     InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement,
-    Pixels, Render, SharedString, Size, StatefulInteractiveElement, Styled, Window, anchored,
+    Pixels, Render, SharedString, Size, StatefulInteractiveElement, Styled, Task, Window, anchored,
     canvas, deferred, div, point, prelude::FluentBuilder, px,
 };
 use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel, v_resizable};
@@ -49,6 +49,7 @@ use crate::menu::{self, MenuEntry, MenuItem, hotkey_label};
 use crate::modal;
 use crate::overlay;
 use crate::pane_actions;
+use crate::pane_preview;
 use crate::session_branch::{BranchMenuSegment, branch_menu_segment};
 use crate::store::AppStore;
 use crate::tree::{SplitDirection, SplitNode};
@@ -84,6 +85,17 @@ pub struct TerminalArea {
     /// 正拖着文件悬停在哪个 pane 上(文件树的 `DragFilePath` 与系统的
     /// `ExternalPaths` 共用)。`on_drop` 不带位置,高亮只能从这里来。
     file_drop_pane: Option<String>,
+    /// 每个 tab 一个焦点句柄(原版 tab 上的 `tabIndex` + `role="tab"`)。
+    /// 拿到焦点后 Enter/Space 才能激活它。
+    tab_focus: HashMap<String, FocusHandle>,
+    /// 鼠标停在哪个 tab 上(缩略图计时要它)。
+    hovered_tab: Option<String>,
+    /// 被悬停 tab 的屏幕矩形(只给悬停中的那个挂 `canvas` 量)。
+    tab_hover_rect: Option<Bounds<Pixels>>,
+    /// 缩略图开在哪个 tab 上 + 弹出那一刻的矩形。
+    tab_preview: Option<(String, Bounds<Pixels>)>,
+    /// 250ms 计时 + 开着之后的 500ms 续活节拍。**丢掉句柄等于 `clearTimeout`**。
+    _tab_preview_task: Option<Task<()>>,
 }
 
 /// 控件簇里 marker 按钮**右缘**到叶子右边缘的距离。
@@ -297,7 +309,107 @@ impl TerminalArea {
             marker_focus: cx.focus_handle(),
             marker_prev_focus: None,
             file_drop_pane: None,
+            tab_focus: HashMap::new(),
+            hovered_tab: None,
+            tab_hover_rect: None,
+            tab_preview: None,
+            _tab_preview_task: None,
         }
+    }
+
+    // ─── 非激活 tab 的悬停缩略图(`PaneGroup.tsx:234-277`) ─────
+
+    /// 收起浮层并取消在飞的计时。
+    fn close_tab_preview(&mut self, cx: &mut Context<Self>) {
+        self._tab_preview_task = None;
+        if self.tab_preview.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// 悬停到某个**非激活** tab:排一次 250ms 计时;到点后按 500ms 节拍续活。
+    fn schedule_tab_preview(&mut self, pane_id: String, cx: &mut Context<Self>) {
+        self._tab_preview_task = None;
+        self.tab_preview = None;
+        self._tab_preview_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(
+                    pane_preview::HOVER_DELAY_MS,
+                ))
+                .await;
+            let opened = this
+                .update(cx, |this: &mut TerminalArea, cx| {
+                    // 到点时再核对:还悬着同一个 tab、且量到过矩形
+                    if this.hovered_tab.as_deref() != Some(pane_id.as_str()) {
+                        return false;
+                    }
+                    let Some(rect) = this.tab_hover_rect else {
+                        return false;
+                    };
+                    this.tab_preview = Some((pane_id.clone(), rect));
+                    cx.notify();
+                    true
+                })
+                .unwrap_or(false);
+            if !opened {
+                return;
+            }
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(mt_ui::MINI_REFRESH_MS))
+                    .await;
+                let alive = this
+                    .update(cx, |this: &mut TerminalArea, cx| {
+                        if this.tab_preview.is_some() {
+                            cx.notify();
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                    .unwrap_or(false);
+                if !alive {
+                    return;
+                }
+            }
+        }));
+    }
+
+    /// 组装 tab 缩略图浮层。
+    ///
+    /// 渲染处每帧重判(原版的双闸模式):tab 被关掉 / 被激活的那一帧就不画,
+    /// **状态本身也收掉** —— 用 ✕ 关掉被悬停的 tab 时点击被 `stop_propagation`
+    /// 拦下,`on_hover(false)` 不一定来得及,旧锚点会残留到下次悬停。
+    fn render_tab_preview(
+        &mut self,
+        layout: &SplitNode,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let (pane_id, rect) = self.tab_preview.clone()?;
+        let store = self.store.read(cx);
+        let leaf = layout.leaf_of_pane(&pane_id);
+        let still_hidden = match leaf {
+            Some(SplitNode::Leaf { active_pane_id, .. }) => active_pane_id != &pane_id,
+            _ => false,
+        };
+        let Some(pane) = layout.pane(&pane_id).filter(|_| still_hidden) else {
+            self.tab_preview = None;
+            return None;
+        };
+        let auto_resume = store.config().ai_auto_resume.unwrap_or(true);
+        let info = pane_preview::snapshot_pane(pane, 0, None, store, auto_resume, cx);
+        let style = pane_preview::preview_style(store);
+        Some(
+            deferred(
+                anchored()
+                    .position(pane_preview::tab_anchor(rect))
+                    // 「底下放不下就翻到 tab 上方」由贴边收拢代劳
+                    .snap_to_window_with_margin(px(6.0))
+                    .child(pane_preview::tab_preview_card(&info, &style)),
+            )
+            .with_priority(1)
+            .into_any_element(),
+        )
     }
 
     /// 开 / 关标记浮层(按钮是 **toggle**,与 Ctrl+F 的「只开不关」不同)。
@@ -700,9 +812,22 @@ impl TerminalArea {
             .border_color(ui::border_subtle())
             .text_size(ui::font_px(12.0));
 
+        // tab 焦点句柄先补齐(下面的循环里 `cx` 要交给 listener,腾不出可变借用)
+        for pane in panes.iter() {
+            if !self.tab_focus.contains_key(&pane.id) {
+                let handle = cx.focus_handle();
+                self.tab_focus.insert(pane.id.clone(), handle);
+            }
+        }
+
         for (idx, pane) in panes.iter().enumerate() {
             let is_active = pane.id == active_id;
             let pane_id = pane.id.clone();
+            let pane_id_key = pane.id.clone();
+            let pane_id_hover = pane.id.clone();
+            let pid_key = pid.clone();
+            let tab_focus = self.tab_focus.get(&pane.id).cloned();
+            let tab_hovered = self.hovered_tab.as_deref() == Some(pane.id.as_str());
             let pane_id_rename = pane.id.clone();
             let pid_click = pid.clone();
             let pane_id_close = pane.id.clone();
@@ -714,9 +839,66 @@ impl TerminalArea {
             let label_menu = label.clone();
             let has_unread = unread.get(idx).copied().unwrap_or(false);
             let vendor = vendors.get(idx).copied().flatten();
+            let this_area = cx.entity();
             bar = bar.child(
                 div()
                     .id(gpui::SharedString::from(format!("tab-{}", pane.id)))
+                    // 量矩形的 canvas 要一个定位上下文;`relative` 对 flex 项
+                    // 本身的布局没有影响
+                    .relative()
+                    // tab 键盘可达(原版 `role="tab"` + `tabIndex`):拿到焦点后
+                    // Enter/Space 激活。原版是 roving tabindex(只有激活 tab 是
+                    // 0),这里所有 tab 都可 Tab 到 —— gpui 没有 roving 语义,
+                    // 而「Tab 只能到激活 tab」等于隐藏 tab 键盘不可达
+                    .when_some(tab_focus, |el, focus| el.track_focus(&focus).tab_index(0))
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                            cx.stop_propagation();
+                            this.store.update(cx, |store, cx| {
+                                store.activate_pane(&pid_key, &pane_id_key, window, cx)
+                            });
+                        }
+                    }))
+                    // 激活 tab 的画面就在眼前,只有隐藏 tab 需要预览。
+                    // ⚠️ 离开分支必须先核对「离开的正是我们记着的那一个」:相邻
+                    // 元素的 enter/leave 到达顺序不保证,直接清会把刚进来的那个
+                    // 抹掉(鼠标沿 tab 栏横扫时预览再也弹不出来)
+                    .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
+                        let mine = this.hovered_tab.as_deref() == Some(pane_id_hover.as_str());
+                        if *hovered {
+                            if mine {
+                                return;
+                            }
+                            this.hovered_tab = Some(pane_id_hover.clone());
+                            if is_active {
+                                this.close_tab_preview(cx);
+                            } else {
+                                this.schedule_tab_preview(pane_id_hover.clone(), cx);
+                            }
+                        } else {
+                            if !mine {
+                                return;
+                            }
+                            this.hovered_tab = None;
+                            this.close_tab_preview(cx);
+                        }
+                        cx.notify();
+                    }))
+                    .when(tab_hovered && !is_active, |el| {
+                        let this = this_area.clone();
+                        el.child(
+                            canvas(
+                                move |bounds, _window, cx| {
+                                    this.update(cx, |area: &mut TerminalArea, _cx| {
+                                        area.tab_hover_rect = Some(bounds);
+                                    });
+                                },
+                                |_, _, _, _| {},
+                            )
+                            .absolute()
+                            .size_full(),
+                        )
+                    })
                     .flex()
                     .items_center()
                     .justify_center()
@@ -740,6 +922,7 @@ impl TerminalArea {
                     })
                     // 单击切 tab,双击改名(旧版是右键菜单里的「重命名」)
                     .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                        this.close_tab_preview(cx);
                         if click_count(event) >= 2 {
                             let (label, store) = (label.clone(), this.store.clone());
                             modal::open_rename_pane(
@@ -761,6 +944,8 @@ impl TerminalArea {
                         MouseButton::Right,
                         cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                             cx.stop_propagation();
+                            // 开菜单前先收缩略图(原版 onContextMenu 第一句)
+                            this.close_tab_preview(cx);
                             let entries =
                                 tab_menu(&this.store, &pid_menu, &pane_id_menu, &label_menu, cx);
                             menu::show(event.position, entries, window, cx);
@@ -1302,6 +1487,9 @@ impl Render for TerminalArea {
         let alive: std::collections::HashSet<String> =
             layout.panes().into_iter().map(|p| p.id.clone()).collect();
         self.pane_rects.retain(|id, _| alive.contains(id));
+        // tab 焦点句柄同理回收(切项目/关 tab 之后那些行不在了)。⚠️ 句柄必须
+        // 跨帧稳定,不能每帧重建 —— 那样 Tab 过去的焦点每帧都会丢
+        self.tab_focus.retain(|id, _| alive.contains(id));
 
         // 首帧只量不画:百分比要按真实可用尺寸换算,而 ResizablePanel 只认第一帧的
         // 初值(见模块注释)。量到之后主动 notify 一次,下一帧把分屏树铺上去。
@@ -1311,6 +1499,7 @@ impl Render for TerminalArea {
         // 浮层在分屏树**之后**组装:它要读 render_node 刚更新过的 pane 矩形,
         // 而且要画在所有常规内容之上(deferred priority 1)
         let marker_popover = self.render_marker_popover(&layout, window, cx);
+        let tab_preview = self.render_tab_preview(&layout, cx);
         let this = cx.entity();
         div()
             .size_full()
@@ -1340,6 +1529,8 @@ impl Render for TerminalArea {
             )
             .children(content.map(|c| div().size_full().child(c)))
             .children(marker_popover)
+            // 非激活 tab 的悬停缩略图。卡不带 `.id()` → 无 hitbox → 不吃鼠标
+            .children(tab_preview)
     }
 }
 
