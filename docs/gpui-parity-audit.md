@@ -59,7 +59,7 @@
 | 24 | 全局搜索 UI（SearchModal，后端 mt-project/search.rs 669 行已就绪，Ctrl+Shift+F） | 中 | mt-app | 🟡 P 批。`start_search` 起专用后台线程 + `futures::mpsc` 回主线程（**不占 background_executor**——那是给会 await 的 future 用的）；换搜索直接换掉前台任务，旧结果自然到不了，不必比对 searchId；1000 条封顶、按文件分组保序、`.*` 开关、四态状态条全部照抄且有单测。剩：点结果开 `FileViewerModal`（依赖 #29，现退到原版**双击**那条动作=外部编辑器打开）、分组头 sticky（gpui 无 sticky）、结果列表无虚拟化（原版也没有） |
 | 25 | AI 任务 marker 体系（markersByPty store + 按钮 + 浮层 + markerPrev/Next 快捷键） | 中 | mt-app | ❌ |
 | 26 | ProjectSwitcher（Ctrl+Shift+P 模糊匹配 + 高亮 + 键盘导航） | 中 | mt-app | ✅ P 批。子序列模糊匹配 + 分组路径兜底匹配 + 命中字符高亮 + ↑↓ 环形导航 + Enter 切项目 + Esc 关闭，逐条照 TSX；分组路径从 `config.project_tree` 现算（项目分组 #13 还没做，但读它不需要）。⚠️ 方向键必须用 `"ProjectSwitcher > Input"` 谓词绑 action —— 与 `Input` 自带的 `up`/`down` **同深度**才压得过它（单行输入框那两个处理器 return 且不 propagate，容器上的 on_key_down 永远收不到），机制有单测钉住 |
-| 27 | **Git 全套 UI**：GitChanges/GitHistory/CommitDiffModal/DiffModal/GitWorktreeModal/BranchFamilyPanel + 右抽屉 sessions⇄git 互斥切换（后端 git.rs 1559 行已就绪） | 大 | mt-app | ❌ |
+| 27 | **Git 全套 UI**：GitChanges/GitHistory/CommitDiffModal/DiffModal/GitWorktreeModal + 右抽屉 sessions⇄git 互斥切换（后端 git.rs 1559 行已就绪）。~~BranchFamilyPanel~~ 系审计误归——它是 AI 会话家族树（scan_session_lineage），已划回 #18 的 fork 批遗留 | 大 | mt-app | ✅ V 批（`a7e9e85`，合并 `9c70bde`）。六组件+拓扑图+pty-output 输出旁路全落地；遗留两入口转 Y 批：FileTree「查看变更」与项目列表「Worktrees」（open_file_diff/git_worktree::open 已就绪，只差菜单项+菜单序断言同步） |
 | 28 | **SSH 全套 UI**：SshModal/SshAssocModal/AddRemoteProjectModal/远程项目/断线重连覆盖层/exitedPtyIds 体系（依赖 mt-ssh 进 crates/，属收尾阶段联动件） | 大 | mt-app | ❌ |
 | 29 | 文件预览与编辑器（FileViewerModal/CodeEditor） | 大 | mt-app | ❌ |
 | 30 | 壳层杂项：关窗确认（盘点活 AI 会话列名）+ 版本检查/更新提醒 + FirstRunGuide 完整版（两入口+键位提示）+ 长文本粘贴转文件（4 配置字段已在）+ WSL 启动器重写提示 + 启动埋点 + dirKinds 技术栈探测缓存 + pane 进场动画 | 中 | mt-app | ❌ |

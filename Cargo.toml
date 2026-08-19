@@ -58,6 +58,9 @@ dirs = "6"
 regex = "1"
 uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
+# 移动端配对二维码(U 批)。default-features=false 砍掉 image 输出后端 ——
+# 只要 QrCode 的位矩阵，渲染由 mt-app 自绘(静区 1 模块 / EC level M)。
+qrcode = { version = "0.14", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "io-util", "macros"] }
 
 # ---------------------------------------------------------------------------
