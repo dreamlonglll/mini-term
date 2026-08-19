@@ -480,14 +480,21 @@ impl Render for ToastLayer {
             // `toastSlideIn 0.25s ease-out`:opacity 0→1 且 translateX(100%)→0。
             // gpui 没有 transform,用相对定位的 `left` 补一条等效位移
             // (容器宽度就是卡片宽度,所以 100% = CARD_WIDTH)。
-            stack = stack.child(
+            //
+            // ⚠️ 过减弱动效的闸:`.toast-card` **不在**原版 reduce 的豁免名单里
+            // (豁免的是浮层进出场、切终端、用量面板那几类),通配规则把它压成
+            // 瞬时 —— 这里等价成「直接上终态,连动画元素都不挂」。
+            stack = stack.child(if mt_ui::motion::reduce_motion() {
+                card.into_any_element()
+            } else {
                 card.with_animation(
                     SharedString::from(format!("toast-slide-{id}")),
                     gpui::Animation::new(Duration::from_millis(SLIDE_IN_MS))
                         .with_easing(ui::cubic_bezier(0.0, 0.0, 0.58, 1.0)),
                     |el, delta| el.opacity(delta).left(px(CARD_WIDTH * (1.0 - delta))),
-                ),
-            );
+                )
+                .into_any_element()
+            });
         }
         stack
     }

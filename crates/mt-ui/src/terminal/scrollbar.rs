@@ -69,6 +69,25 @@ pub struct ScrollbarStyle {
     pub resting: f32,
 }
 
+impl ScrollbarStyle {
+    /// 过一遍减弱动效的闸:淡出**时长**归零(延迟保留)。
+    ///
+    /// 原版这条滚动条是浏览器原生的、常显不淡出,没有直接对应物;按 `styles.css`
+    /// reduce 段的通配口径处理 —— 「一次性动画保留但压到瞬时」(它压的是
+    /// `animation-duration`,`animation-delay` 不动),所以这里也只把补间干掉,
+    /// 「闲置 0.9s 后收起来」这条时序保持不变。
+    pub fn gated(&self) -> Self {
+        if crate::motion::reduce_motion() {
+            Self {
+                fade_duration: Duration::ZERO,
+                ..self.clone()
+            }
+        } else {
+            self.clone()
+        }
+    }
+}
+
 impl Default for ScrollbarStyle {
     fn default() -> Self {
         Self {
@@ -405,6 +424,23 @@ mod tests {
             ..s
         };
         assert_eq!(alpha(&instant, Duration::from_secs(1), false, false), 0.5);
+    }
+
+    #[test]
+    fn 减弱动效下淡出瞬时完成但延迟不变() {
+        let s = ScrollbarStyle::default();
+        crate::motion::with_reduce(false, || {
+            assert_eq!(s.gated().fade_duration, s.fade_duration, "没开减弱就原样");
+        });
+        crate::motion::with_reduce(true, || {
+            let g = s.gated();
+            assert!(g.fade_duration.is_zero(), "补间归零");
+            assert_eq!(g.fade_delay, s.fade_delay, "「闲置多久才收」不是动画,不动它");
+            // 延迟内照常全亮,过了延迟直接落到静息值(没有中间帧)
+            assert_eq!(alpha(&g, Duration::from_millis(500), false, false), 1.0);
+            assert_eq!(alpha(&g, Duration::from_millis(901), false, false), g.resting);
+            assert!(!needs_animation_frame(&g, Duration::from_millis(901), false));
+        });
     }
 
     #[test]

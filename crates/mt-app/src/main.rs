@@ -58,6 +58,7 @@ mod menu;
 mod mobile_panel;
 mod mobile_relay;
 mod modal;
+mod motion;
 mod notify;
 mod overlay;
 mod pane;
@@ -327,6 +328,11 @@ impl Workspace {
         let activation = cx.observe_window_activation(window, move |_, window, cx| {
             let active = window.is_window_active();
             store_for_focus.update(cx, |store, cx| store.set_window_focused(active, cx));
+            // 顺手重探一次「减少动画」:用户多半是切到系统设置里改完再切回来的。
+            // 变了才刷窗口(闪烁类动画的挂/摘只发生在 render 里)。
+            if active && motion::refresh() {
+                cx.refresh_windows();
+            }
         });
 
         // AI 状态泵:后台线程(hook server / 500ms 轮询)→ channel → 这里改 store。
@@ -1065,19 +1071,12 @@ impl Render for Workspace {
                 // 全局 AI 状态徽标挂在这颗按钮上(中间栏承载项目列表)。
                 // 口径与原版一致:只反映 AI 状态,**error 不往上冒** ——
                 // 某个 shell `exit 1` 不该让整条边栏亮红点、盖住真在跑的 AI。
+                // 徽标本体(含 ai-working 档的闪烁)在 `activity_bar::status_badge`。
                 .when(global_status != crate::tree::PaneStatus::Idle, |el| {
-                    el.child(
-                        div()
-                            .absolute()
-                            .top(px(-1.0))
-                            .right(px(-1.0))
-                            .w(px(8.0))
-                            .h(px(8.0))
-                            .rounded_full()
-                            .border_1()
-                            .border_color(ui::bg_surface())
-                            .bg(ui::status_color(global_status)),
-                    )
+                    el.child(activity_bar::status_badge(
+                        "activity-bar-ai-badge",
+                        global_status,
+                    ))
                 })
                 .on_click(cx.listener(|this, _event, _window, cx| {
                     this.store.update(cx, |store, cx| store.toggle_middle_column(cx));
@@ -1468,6 +1467,11 @@ fn main() {
         // 亮/暗/auto + 外置主题包 + 终端配色一次算全。这里先钉一个暗色兜底,
         // 免得从 init 到装配之间有一帧走 gpui-component 的默认亮色。
         gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
+
+        // 「减少动画」也必须在**任何视图建出来之前**定下来:动画消费方读的是
+        // 进程级闸(`mt_ui::motion`),晚一步的话首帧会按「允许动画」画出来 ——
+        // 状态灯闪一下再停,正是这条设置想避免的东西。
+        motion::install();
 
         // 键位表的唯一事实来源在 [`hotkeys`](crate::hotkeys) —— 它同时喂给
         // `bind_keys` 与设置面板的「快捷键」页,重演原版 `src/utils/hotkeys.ts`

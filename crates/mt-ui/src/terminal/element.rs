@@ -537,7 +537,9 @@ impl TerminalElement {
             .map(|t| t.elapsed())
             .unwrap_or(Duration::MAX);
         let active = drag.active();
-        let alpha = scrollbar::alpha(&self.scrollbar, idle, active, layout.at_bottom());
+        // 减弱动效下淡出补间归零(延迟不变),见 `ScrollbarStyle::gated`
+        let style = self.scrollbar.gated();
+        let alpha = scrollbar::alpha(&style, idle, active, layout.at_bottom());
 
         if alpha > 0.004 {
             if let Some(track) = self.scrollbar.track {
@@ -576,7 +578,7 @@ impl TerminalElement {
         }
 
         // 淡出还没走完就再要一帧;走完了就此打住,不空转
-        if scrollbar::needs_animation_frame(&self.scrollbar, idle, active) {
+        if scrollbar::needs_animation_frame(&style, idle, active) {
             window.request_animation_frame();
         }
     }

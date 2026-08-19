@@ -21,12 +21,14 @@
 //! 移动端那颗由 U 批补上,位置照原版排在「设置」之前。)
 
 use gpui::{
-    Div, ElementId, InteractiveElement, ParentElement, Stateful, StatefulInteractiveElement,
-    Styled, div, prelude::FluentBuilder as _, px,
+    AnimationExt as _, AnyElement, Animation, Div, ElementId, InteractiveElement, IntoElement,
+    ParentElement, Stateful, StatefulInteractiveElement, Styled, div,
+    prelude::FluentBuilder as _, px,
 };
 use gpui_component::tooltip::Tooltip;
 use mt_ui::icons::{Geom, Ink, Shape, VectorIcon};
 
+use crate::tree::PaneStatus;
 use crate::ui;
 
 /// 边条宽度。原版 `style={{ width: 44 }}`。
@@ -272,6 +274,65 @@ pub fn strip_button(
         .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
 }
 
+/// 全局 AI 状态徽标(挂在「折叠中间栏」那颗按钮的右上角)。
+///
+/// 原版 `ActivityBar.tsx:122-129`:`absolute -top-0.5 -right-0.5 w-2 h-2
+/// rounded-full border border-[var(--bg-surface)]`,**`ai-working` 档加
+/// `animate-blink`**(`alertBlink 0.8s ease-in-out infinite`:
+/// `50%` 处 `opacity .2` + `scale(.75)`)。
+///
+/// gpui 没有 transform,缩放用「改宽高 + 同步挪 top/right 半个差值」等价 ——
+/// 差值补偿是为了绕**中心**缩,不补的话会朝右上角缩过去。
+///
+/// ⚠️ 闪烁过 [`crate::motion`] 的闸:原版 reduce 段的通配规则把 `.animate-blink`
+/// 停在第一帧(它**不在**豁免名单里),用户机器上装机版就是不闪的。
+pub fn status_badge(id: impl Into<ElementId>, status: PaneStatus) -> AnyElement {
+    /// 原版 `w-2 h-2`。
+    const SIZE: f32 = 8.0;
+    /// 原版 `-top-0.5 -right-0.5`(Tailwind 的 0.5 = 2px;这里的边框占 1px,
+    /// 与 M 批落地时的取值保持一致)。
+    const INSET: f32 = -1.0;
+
+    let badge = div()
+        .absolute()
+        .top(px(INSET))
+        .right(px(INSET))
+        .w(px(SIZE))
+        .h(px(SIZE))
+        .rounded_full()
+        .border_1()
+        .border_color(ui::bg_surface())
+        .bg(ui::status_color(status));
+
+    if !badge_blinks(status) {
+        return badge.into_any_element();
+    }
+    badge
+        .with_animation(
+            id.into(),
+            Animation::new(BLINK_PERIOD).repeat(),
+            |el, delta| {
+                let phase = crate::title_bar::blink_phase(delta);
+                let side = SIZE - SIZE * 0.25 * phase;
+                let inset = INSET + (SIZE - side) / 2.0;
+                el.w(px(side))
+                    .h(px(side))
+                    .top(px(inset))
+                    .right(px(inset))
+                    .opacity(1.0 - 0.8 * phase)
+            },
+        )
+        .into_any_element()
+}
+
+/// `alertBlink` 的周期(原版 `animation: alertBlink 0.8s ease-in-out infinite`)。
+const BLINK_PERIOD: std::time::Duration = std::time::Duration::from_millis(800);
+
+/// 这一档该不该闪。**纯判定**,单测钉在这上面。
+pub fn badge_blinks(status: PaneStatus) -> bool {
+    status == PaneStatus::AiWorking && mt_ui::motion::blinks()
+}
+
 /// 按钮分组之间的细分隔线(原版 `w-6 h-px bg-[var(--border-default)] my-1`)。
 pub fn divider() -> Div {
     div()
@@ -315,5 +376,27 @@ mod tests {
         };
         assert_eq!(pts.len(), 24);
         assert!(matches!(SETTINGS[1].geom, Geom::Circle { .. }));
+    }
+
+    /// 只有 `ai-working` 闪,且减弱动效下一律不闪(原版 `.animate-blink`
+    /// 不在 reduce 豁免名单里)。
+    #[test]
+    fn 徽标只在跑起来时闪且过减弱动效的闸() {
+        crate::motion::with_reduce(false, || {
+            assert!(badge_blinks(PaneStatus::AiWorking));
+            for s in [PaneStatus::Idle, PaneStatus::AiIdle, PaneStatus::Error] {
+                assert!(!badge_blinks(s), "{s:?} 不该闪");
+            }
+        });
+        crate::motion::with_reduce(true, || {
+            for s in [
+                PaneStatus::Idle,
+                PaneStatus::AiIdle,
+                PaneStatus::AiWorking,
+                PaneStatus::Error,
+            ] {
+                assert!(!badge_blinks(s), "减弱动效下 {s:?} 一律不闪");
+            }
+        });
     }
 }
