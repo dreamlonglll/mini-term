@@ -28,10 +28,27 @@
 //! Git 面板收起 / 切到 sessions 时 [`set_enabled`] 关掉旁路,常态下这条路
 //! 只剩一次原子读。
 //!
-//! ⚠️ **本模块与后续 Y 批的 git 状态着色共用**:文件树的 git 着色同样要在
-//! 「外部跑了 git 命令」之后刷新(`FileTree.tsx:670` 是同一份嗅探代码)。
-//! 再加消费方时**不要**各自开一条旁路 —— 那样 reader 上就有 N 次拷贝了;
-//! 应当扩 [`drain_hit`] 为多订阅者(每个订阅者一个 dirty 位,缓冲共用一份)。
+//! # 多订阅者(Y 批扩)
+//!
+//! 文件树的 git 状态着色要在「外部跑了 git 命令」之后刷新(`FileTree.tsx:667-674`
+//! 与 `GitChanges.tsx:134-145` 是同一份嗅探代码),于是这条旁路现在有两个消费方
+//! (见 [`Subscriber`])。**没有另开第二条旁路**:reader 线程上仍然只有一次拷贝,
+//! 缓冲共用一份,逐订阅者的只有一个读游标。
+//!
+//! 原注释设想的是「每人一个 dirty 位」,落地时换成了**游标**,因为光有 dirty 位
+//! 过不去这一关:命中之后要清空缓冲(否则同一段文字每个节拍都会再命中一次),
+//! 而缓冲是共享的 —— A 命中清了缓冲,还没轮到的 B 就扫了个空,文件树静默漏刷。
+//! 游标版本里「已经扫到哪」是逐订阅者的,A 清不掉 B 的那一份。
+//!
+//! ```text
+//! ring:  … create mode 100644 a.txt …
+//!        ↑head_seq                   ↑total = head_seq + ring.len()
+//!              ↑GitPanel.cursor   ↑FileTree.cursor
+//! ```
+//!
+//! 每次 [`drain_hit_for`] 从 `cursor - OVERLAP` 扫到 `total`(接缝处被切成两半的
+//! 模式照样拼得回来),扫完把 `cursor` 推到 `total`;**命中的那一次不留接缝** ——
+//! 否则下一拍会把同一段文字再认一遍。
 //!
 //! # 与原版的两处细微差别(都是往严格里走)
 //!
@@ -58,15 +75,59 @@ pub const DEBOUNCE_MS: u64 = 500;
 /// 从 reader 线程挪到了这里。
 pub const POLL_MS: u64 = 100;
 
-/// 旁路总闸。Git 面板可见时才打开 —— 关着的时候这条路只剩一次原子读。
+/// 扫描接缝:两次 drain 之间要多回看这么多字节,免得跨拍被切成两半的模式漏掉。
+/// 取「最长口径 - 1」= `Already up to date`(18 字节)- 1。
+const OVERLAP: u64 = 17;
+
+/// 旁路的消费方。加一个消费方 = 在这里加一个 variant + 把 [`SUB_COUNT`] 加一,
+/// **不是**再抄一条旁路出来(见模块注释)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Subscriber {
+    /// 右抽屉的 Git 面板(变更列表 / 提交历史)。
+    GitPanel,
+    /// 中栏文件树的 git 状态着色。
+    FileTree,
+}
+
+/// 订阅者数量。数组下标即 [`Subscriber`] 的声明序。
+const SUB_COUNT: usize = 2;
+
+impl Subscriber {
+    fn idx(self) -> usize {
+        match self {
+            Subscriber::GitPanel => 0,
+            Subscriber::FileTree => 1,
+        }
+    }
+}
+
+/// 旁路总闸:**任一**订阅者开着就为真。reader 线程只看这一个原子量,
+/// 全关时那条路仍然只剩一次 relaxed 读。
 static ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// 逐订阅者的读状态。
+#[derive(Clone, Copy)]
+struct Sub {
+    enabled: bool,
+    /// 已经扫到的序号(不含);`cursor >= total` 就是「没有新字节」= 原来的 dirty 位。
+    cursor: u64,
+    /// 上一次是命中收的场:这一次从 `cursor` 起扫,不留接缝(否则重复命中)。
+    skip_overlap: bool,
+}
 
 struct Tap {
     /// `aiPtyIds`(`src/utils/terminalCache.ts:106`)的对应物。
     ai_panes: HashSet<u32>,
     ring: VecDeque<u8>,
-    /// 上次 [`drain_hit`] 之后有没有新字节。没有就不必重扫。
-    dirty: bool,
+    /// `ring` 首字节的全局序号。滚掉多少就加多少,单调不回头。
+    head_seq: u64,
+    subs: [Sub; SUB_COUNT],
+}
+
+impl Tap {
+    fn total_seq(&self) -> u64 {
+        self.head_seq + self.ring.len() as u64
+    }
 }
 
 /// `HashSet::new` 不是 const fn(`RandomState` 要随机种子),所以走 `LazyLock`
@@ -75,18 +136,38 @@ static TAP: LazyLock<Mutex<Tap>> = LazyLock::new(|| {
     Mutex::new(Tap {
         ai_panes: HashSet::new(),
         ring: VecDeque::new(),
-        dirty: false,
+        head_seq: 0,
+        subs: [Sub {
+            enabled: false,
+            cursor: 0,
+            skip_overlap: false,
+        }; SUB_COUNT],
     })
 });
 
-/// 开/关旁路。关的时候顺手清空窗口 —— 下次打开不该被上一轮的残留立刻触发。
-pub fn set_enabled(on: bool) {
-    ENABLED.store(on, Ordering::Relaxed);
-    if !on {
-        let mut tap = TAP.lock();
+/// 开/关某个订阅者。
+///
+/// - **开**:游标直接推到窗口末尾 —— 打开的那一刻不该被上一轮的残留立刻触发
+///   (原版每次挂 listener 也是从此刻起才收 payload);
+/// - **关**:全关之后清空窗口,免得白留着 8 KiB。
+pub fn set_enabled_for(sub: Subscriber, on: bool) {
+    let mut tap = TAP.lock();
+    let total = tap.total_seq();
+    let slot = &mut tap.subs[sub.idx()];
+    slot.enabled = on;
+    slot.cursor = total;
+    slot.skip_overlap = true;
+    let any = tap.subs.iter().any(|s| s.enabled);
+    if !any {
+        tap.head_seq = total;
         tap.ring.clear();
-        tap.dirty = false;
     }
+    ENABLED.store(any, Ordering::Relaxed);
+}
+
+/// 老签名 = [`Subscriber::GitPanel`] 的快捷方式(V 批的调用点原样保留)。
+pub fn set_enabled(on: bool) {
+    set_enabled_for(Subscriber::GitPanel, on);
 }
 
 /// 标记某个 PTY 是不是 AI pane。对应 `App.tsx:284` 的
@@ -119,29 +200,46 @@ pub fn observe_output(pty_id: u32, bytes: &[u8]) {
     tap.ring.extend(tail.iter().copied());
     while tap.ring.len() > RING_CAP {
         tap.ring.pop_front();
+        tap.head_seq += 1;
     }
-    tap.dirty = true;
 }
 
-/// 主线程节拍:扫一遍窗口。命中则**清空窗口**并返回 `true`
-/// (不清空的话同一段文字每个节拍都会再命中一次)。
-pub fn drain_hit() -> bool {
+/// 主线程节拍:替**某一个订阅者**扫一遍它还没看过的那段窗口。
+///
+/// 命中后把游标推到末尾并抹掉接缝(不抹的话同一段文字下一拍会再命中一次);
+/// 窗口本身**不清空** —— 那是共享的,清了别的订阅者就扫了个空。
+pub fn drain_hit_for(sub: Subscriber) -> bool {
     if !ENABLED.load(Ordering::Relaxed) {
         return false;
     }
     let mut tap = TAP.lock();
-    if !tap.dirty {
+    let total = tap.total_seq();
+    let head = tap.head_seq;
+    let slot = tap.subs[sub.idx()];
+    if !slot.enabled || slot.cursor >= total {
         return false;
     }
-    tap.dirty = false;
+    // 从上次扫到的地方往回退一个接缝,再与窗口首端取交(滚掉的部分找不回来了)
+    let from = if slot.skip_overlap {
+        slot.cursor
+    } else {
+        slot.cursor.saturating_sub(OVERLAP)
+    }
+    .max(head);
+    let offset = (from - head) as usize;
     let hit = {
         let window = tap.ring.make_contiguous();
-        matches_git_refresh(window)
+        matches_git_refresh(&window[offset.min(window.len())..])
     };
-    if hit {
-        tap.ring.clear();
-    }
+    let slot = &mut tap.subs[sub.idx()];
+    slot.cursor = total;
+    slot.skip_overlap = hit;
     hit
+}
+
+/// 老签名 = [`Subscriber::GitPanel`] 的快捷方式(V 批的调用点原样保留)。
+pub fn drain_hit() -> bool {
+    drain_hit_for(Subscriber::GitPanel)
 }
 
 /// 五条口径,逐条对应原版的 `GIT_REFRESH_PATTERNS`(`GitChanges.tsx:19-25`):
@@ -181,11 +279,17 @@ mod tests {
 
     /// 测试之间共用同一份进程级 tap,每条用例开头先复位。
     fn reset() {
-        set_enabled(false);
+        set_enabled_for(Subscriber::GitPanel, false);
+        set_enabled_for(Subscriber::FileTree, false);
         let mut tap = TAP.lock();
         tap.ai_panes.clear();
         tap.ring.clear();
-        tap.dirty = false;
+        tap.head_seq = 0;
+        tap.subs = [Sub {
+            enabled: false,
+            cursor: 0,
+            skip_overlap: false,
+        }; SUB_COUNT];
     }
 
     /// 五条口径逐条命中;不相干的输出不命中。
@@ -275,6 +379,52 @@ mod tests {
         forget_pane(3);
         observe_output(3, b"Already up to date.");
         assert!(drain_hit());
+
+        // ─── 以下是 Y 批扩多订阅者补的用例 ───────────────────
+        // 同样只能挂在这一条测试里:`TAP` / `ENABLED` 是进程级的,
+        // 单开一个 `#[test]` 会与上面这段并行互踩(实测必炸)。
+
+        // ⑨ 两家各收一份,**谁先扫都不会把另一家饿死**。这是本次扩展的核心
+        //    不变量 —— 旧实现命中即清空共享窗口,换成两个消费方之后就是
+        //    「Git 面板刷了、文件树静默漏刷」
+        reset();
+        set_enabled_for(Subscriber::GitPanel, true);
+        set_enabled_for(Subscriber::FileTree, true);
+
+        observe_output(1, b" 2 files changed, 5 deletions(-)");
+        assert!(drain_hit_for(Subscriber::GitPanel));
+        assert!(
+            drain_hit_for(Subscriber::FileTree),
+            "先扫的那家不许把窗口清空"
+        );
+        // 各自都只认一次
+        assert!(!drain_hit_for(Subscriber::GitPanel));
+        assert!(!drain_hit_for(Subscriber::FileTree));
+
+        // 只开一家时另一家一律不响(reader 侧总闸仍然开着)
+        set_enabled_for(Subscriber::GitPanel, false);
+        observe_output(1, b"Switched to branch 'y'");
+        assert!(!drain_hit_for(Subscriber::GitPanel));
+        assert!(drain_hit_for(Subscriber::FileTree));
+
+        // 后开的那家不吃开闸之前的存货(与原版「此刻起才挂 listener」同口径)
+        set_enabled_for(Subscriber::GitPanel, true);
+        assert!(!drain_hit_for(Subscriber::GitPanel));
+
+        // 两家全关 = reader 侧总闸也关掉
+        set_enabled_for(Subscriber::FileTree, false);
+        set_enabled_for(Subscriber::GitPanel, false);
+        observe_output(1, b"create mode 100644 a.txt");
+        assert!(TAP.lock().ring.is_empty());
+
+        // ⑩ 命中之后不留接缝:同一段文字不会因为回看窗口被认第二次
+        reset();
+        set_enabled_for(Subscriber::FileTree, true);
+        observe_output(1, b"Already up to date.");
+        assert!(drain_hit_for(Subscriber::FileTree));
+        // 紧接着来一段无关输出:回看接缝里还压着上一段,但命中过的不再算数
+        observe_output(1, b"$ ls");
+        assert!(!drain_hit_for(Subscriber::FileTree));
 
         reset();
     }

@@ -636,11 +636,20 @@ impl TerminalArea {
         let pid = project_id.to_string();
         let leaf = leaf_id.clone();
 
+        // tab 栏横向滚动(E.2):tab **不压缩**(`min_w` 之下就溢出),
+        // 溢出时整条可横向滚。`overflow_x_scroll` 要求元素是 stateful(有 `.id()`)。
+        //
+        // **垂直滚轮不必自己映射**:gpui 只在 `overflow.x == Scroll && overflow.y != Scroll`
+        // 且 `restrict_scroll_to_axis == false`(默认)时把 `delta.y` 记到 x 上
+        // (gpui-0.2.2 `elements/div.rs:2422-2428`,默认值见 `style.rs:741`)——
+        // 与原版靠 WebView 免费拿到的那条行为等价。
         let mut bar = div()
+            .id(gpui::SharedString::from(format!("tabbar-{leaf}")))
             .flex()
             .items_center()
             .flex_none()
             .h(px(26.0))
+            .overflow_x_scroll()
             .bg(ui::bg_elevated())
             .border_b_1()
             .border_color(ui::border_subtle())
@@ -784,10 +793,34 @@ impl TerminalArea {
                 .cursor_pointer()
                 .text_color(ui::text_muted())
                 .hover(|el| el.text_color(ui::accent()))
-                .on_click(cx.listener(move |this, _event, window, cx| {
-                    this.store.update(cx, |store, cx| {
-                        store.new_terminal(&pid_new, None, Some(anchor_new.clone()), window, cx);
-                    });
+                // 左键单击**直接弹 shell 选择菜单**(不是长按、不是下拉箭头);
+                // 只有一个 shell 时不弹 —— 否则单 shell 用户每次多点一下
+                // (`PaneGroup.tsx:218-232` 那道 `<= 1` 的闸)
+                .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                    let shells = this.store.read(cx).config().available_shells.clone();
+                    if shells.len() <= 1 {
+                        this.store.update(cx, |store, cx| {
+                            store.new_terminal(&pid_new, None, Some(anchor_new.clone()), window, cx);
+                        });
+                        return;
+                    }
+                    // 无勾选标记、无分隔线,就是一列 shell 名
+                    let entries: Vec<menu::MenuEntry> = shells
+                        .into_iter()
+                        .map(|shell| {
+                            let store = this.store.clone();
+                            let (pid, anchor) = (pid_new.clone(), anchor_new.clone());
+                            let name = shell.name.clone();
+                            menu::item(name, move |window, cx| {
+                                let (pid, anchor, shell) =
+                                    (pid.clone(), anchor.clone(), shell.clone());
+                                store.update(cx, |store, cx| {
+                                    store.new_terminal(&pid, Some(shell), Some(anchor), window, cx);
+                                });
+                            })
+                        })
+                        .collect();
+                    menu::show(click_position(event, window), entries, window, cx);
                 }))
                 .child("+"),
         );
@@ -1134,6 +1167,15 @@ fn click_count(event: &ClickEvent) -> usize {
     match event {
         ClickEvent::Mouse(e) => e.up.click_count,
         ClickEvent::Keyboard(_) => 1,
+    }
+}
+
+/// 点击位置(弹菜单要它)。键盘触发的「点击」没有坐标,退回当前鼠标位置 ——
+/// 菜单总得有个锚点,而这一条在真机上走不到(那个 `+` 没有键盘入口)。
+fn click_position(event: &ClickEvent, window: &Window) -> gpui::Point<gpui::Pixels> {
+    match event {
+        ClickEvent::Mouse(e) => e.up.position,
+        ClickEvent::Keyboard(_) => window.mouse_position(),
     }
 }
 

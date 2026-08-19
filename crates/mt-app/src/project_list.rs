@@ -28,16 +28,22 @@
 //! 三态提示框与原版同构;目录判定(`filter_directories`)是阻塞 stat,一次性丢后台
 //! 算完存进 `external`,`on_drag_move` 只读缓存 —— 逐帧 `is_dir()` 在网络盘上会卡死主线程。
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use gpui::{
-    AnyElement, App, ClipboardItem, Context, DragMoveEvent, Entity, ExternalPaths,
-    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Render,
-    SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
+    AnyElement, App, AppContext, ClipboardItem, Context, DragMoveEvent, Entity, ExternalPaths,
+    FontWeight,
+    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement,
+    Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Window, div,
+    prelude::FluentBuilder, px,
 };
-use mt_config::ProjectTreeItem;
+use gpui_component::input::{Input, InputEvent, InputState};
+use mt_config::{ProjectConfig, ProjectTreeItem};
 use mt_ui::icons::vector::VectorIcon;
-use mt_ui::icons::{ALL_PROJECT_KINDS, FileIcon, FileKind, ProjectKind, TechIcon};
+use mt_ui::icons::{
+    ALL_PROJECT_KINDS, AiVendor, BrandIcon, FileIcon, FileKind, ProjectKind, TechIcon,
+};
 
 use crate::dnd::{
     self, DragProjectItem, DropPosition, ExternalDropKind, PreviewIcon,
@@ -51,6 +57,12 @@ use crate::store::AppStore;
 use crate::tree::PaneStatus;
 use crate::ui;
 
+/// AI 品牌图标尺寸(`ProjectList.tsx:144` 的 `AI_ICON_SIZE`)。
+const AI_ICON_SIZE: f32 = 14.0;
+
+/// worktree 徽章最多显示多宽(原版 `max-w-[100px] truncate`)。
+const WORKTREE_BADGE_MAX_W: f32 = 100.0;
+
 /// 项目行的领位图标。`kind` 认得出就是技术栈徽标,否则退通用目录图标
 /// (对应原版认不出时的 `Package` 兜底,同样取 `--color-file`)。
 fn project_icon(kind: Option<ProjectKind>) -> AnyElement {
@@ -63,6 +75,25 @@ fn project_icon(kind: Option<ProjectKind>) -> AnyElement {
     }
 }
 
+/// 完成标(原版的 `<DoneTag/>`,样式在 `styles.css:509-524`)。
+///
+/// 实心 success 底 + **底色字**(不是白字:浅色主题下白字配浅绿看不见,
+/// 与 StatusDot 的 `contrast` 同一条理由)、圆角 10px、字号 `0.77rem`≈10px、粗体。
+/// 原版还有一层 success 色的外发光,gpui 的 div 没有 box-shadow,省掉。
+fn done_tag() -> AnyElement {
+    div()
+        .flex_shrink_0()
+        .px(px(8.0))
+        .py(px(2.0))
+        .rounded(px(10.0))
+        .bg(ui::color_success())
+        .text_size(ui::font_px(10.0))
+        .font_weight(FontWeight::BOLD)
+        .text_color(ui::bg_base())
+        .child(t("panels", "done"))
+        .into_any_element()
+}
+
 /// 项目行的左内边距。原版这两条公式**不能合并**(`ProjectList.tsx:660-666` 有
 /// 踩坑记录):组内项目要对齐父级分组那个倒三角的位置;顶层项目及其 worktree
 /// 子项目以 10px 为基准每层 +16 —— 共用组内公式会把顶层子项目的相对缩进压到 6px。
@@ -72,6 +103,96 @@ fn project_indent(depth: usize, in_group: bool) -> f32 {
     } else {
         10.0 + depth as f32 * 16.0
     }
+}
+
+/// 项目行上的 AI 品牌堆叠(`ProjectList.tsx:636-650`)。
+///
+/// 入参是「这个项目里**显示 AI 会话**的那些 pane 的 agent 名」,判定口径与
+/// tab 上的品牌图标共用(`PaneState::shows_ai_session` / `ai_agent`)。
+///
+/// 三条规则逐条照抄:
+/// - **按厂商去重**(同款 AI 开多个 pane 只显示一枚,认不出厂商的算作同一个 `unknown`);
+/// - **字母序**排列,不随开 pane 的顺序漂移;
+/// - **未知厂商固定排最后**。
+///
+/// 数量**无上限** —— 原版就没有,去重之后厂商总共 11 家,天然收敛。
+fn ai_vendor_stack<'a>(agents: impl IntoIterator<Item = Option<&'a str>>) -> Vec<Option<AiVendor>> {
+    let mut seen: HashSet<&'static str> = HashSet::new();
+    let mut out: Vec<Option<AiVendor>> = Vec::new();
+    for agent in agents {
+        // 与 tab 同一条:CLI 名直取,其余走词匹配(只认三家会漏掉 gemini 之类)
+        let vendor = agent.and_then(|agent| {
+            AiVendor::from_session_type(agent).or_else(|| AiVendor::infer(Some(agent), None))
+        });
+        let key = vendor.map(|v| v.as_str()).unwrap_or("unknown");
+        if seen.insert(key) {
+            out.push(vendor);
+        }
+    }
+    out.sort_by(|a, b| match (a, b) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, _) => std::cmp::Ordering::Greater,
+        (_, None) => std::cmp::Ordering::Less,
+        (Some(a), Some(b)) => a.as_str().cmp(b.as_str()),
+    });
+    out
+}
+
+// ─── 失效 worktree 清理(`src/utils/worktreeReconcile.ts` 逐字移植) ───
+
+/// UNC 路径(`\\wsl$` 等):存在性探测依赖 WSL / 网络状态,误判风险高,不参与清理。
+fn is_unc_path(path: &str) -> bool {
+    path.starts_with(r"\\")
+}
+
+/// 可参与失效清理的 worktree 子项目:本地路径、父项目存在且也是本地路径。
+fn reconcilable_children(projects: &[ProjectConfig]) -> Vec<(&ProjectConfig, &ProjectConfig)> {
+    let mut out = Vec::new();
+    for p in projects {
+        let Some(parent_id) = p.parent_project_id.as_deref() else {
+            continue;
+        };
+        if p.ssh_connection_id.is_some() || is_unc_path(&p.path) {
+            continue;
+        }
+        let Some(parent) = projects.iter().find(|q| q.id == parent_id) else {
+            continue;
+        };
+        if parent.ssh_connection_id.is_some() || is_unc_path(&parent.path) {
+            continue;
+        }
+        out.push((p, parent));
+    }
+    out
+}
+
+/// 待探测的路径集合(去重):worktree 子项目自身路径 + 其父项目路径。
+///
+/// 父项目路径也要探测:整棵目录树一起消失(盘符拔出等)时不能把子项目误判成
+/// 「worktree 被外部删除」而清掉。
+fn collect_worktree_probe_paths(projects: &[ProjectConfig]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for (child, parent) in reconcilable_children(projects) {
+        for path in [&child.path, &parent.path] {
+            if seen.insert(path.clone()) {
+                out.push(path.clone());
+            }
+        }
+    }
+    out
+}
+
+/// 应清理的失效 worktree 子项目(返回项目 id):自身目录已不存在、而父项目目录仍在。
+fn find_stale_worktree_projects(
+    projects: &[ProjectConfig],
+    alive: &HashSet<String>,
+) -> Vec<String> {
+    reconcilable_children(projects)
+        .into_iter()
+        .filter(|(child, parent)| !alive.contains(&child.path) && alive.contains(&parent.path))
+        .map(|(child, _)| child.id.clone())
+        .collect()
 }
 
 /// 一行要画的东西。渲染前先从 store 抠出来 —— `store.read(cx)` 的借用
@@ -98,6 +219,10 @@ struct Row {
     parent_group_id: Option<String>,
     /// worktree 子项目:位置由父项目派生,**不作为落点**(自身仍可拖走 = 脱离父项目)。
     is_child: bool,
+    /// 行上的 AI 品牌堆叠(去重 + 字母序,见 [`ai_vendor_stack`])。
+    ai_vendors: Vec<Option<AiVendor>>,
+    /// 项目路径是某仓库的 linked worktree → `⎇ 分支名` 徽章。
+    worktree_branch: Option<String>,
 }
 
 /// 分组行要画的东西。
@@ -144,6 +269,8 @@ enum ProjectMenuAction {
     EditDescription,
     OpenInFolder,
     CopyAbsolutePath,
+    /// Worktree 管理弹窗(V 批建好的 `git_worktree::open`)。
+    Worktrees,
     /// 「项目类型」子菜单。
     ProjectKind,
     Remove,
@@ -156,6 +283,10 @@ fn project_menu_actions() -> Vec<Option<ProjectMenuAction>> {
         Some(EditDescription),
         Some(OpenInFolder),
         Some(CopyAbsolutePath),
+        // 原版这条分隔线之后是「关联 SSH / 环境变量 / Worktree 管理」三连,
+        // 前两项在 GPUI 侧还没有功能,只剩 Worktrees 一项
+        None,
+        Some(Worktrees),
         Some(ProjectKind),
         None,
         Some(Remove),
@@ -323,8 +454,14 @@ fn group_section(store: &Entity<AppStore>, row: &Row, tree: &[ProjectTreeItem]) 
     entries
 }
 
-/// 组装一行的右键菜单。
-fn project_menu(store: &Entity<AppStore>, row: &Row, tree: &[ProjectTreeItem]) -> Vec<MenuEntry> {
+/// 组装一行的右键菜单。`view` 是列表本体 —— 「重命名」是**行内编辑**,
+/// 得回到视图里置编辑态(原版右键菜单与 F2 调的是同一个 `startRenameProject`)。
+fn project_menu(
+    view: &Entity<ProjectList>,
+    store: &Entity<AppStore>,
+    row: &Row,
+    tree: &[ProjectTreeItem],
+) -> Vec<MenuEntry> {
     let mut entries = Vec::new();
     for action in project_menu_actions() {
         let Some(action) = action else {
@@ -333,19 +470,28 @@ fn project_menu(store: &Entity<AppStore>, row: &Row, tree: &[ProjectTreeItem]) -
         };
         entries.push(match action {
             ProjectMenuAction::Rename => {
-                let store = store.clone();
+                let view = view.clone();
                 let id = row.id.clone();
                 let name = row.name.clone();
                 menu::item(t("projectList", "menu.rename"), move |window, cx| {
-                    let store = store.clone();
-                    let id = id.clone();
-                    crate::prompt::show_prompt(
-                        t("projectList", "menu.rename"),
-                        t("fileTree", "prompt.renameMessage"),
-                        name.clone(),
-                        move |value, _window, cx| {
-                            store.update(cx, |store, cx| store.rename_project(&id, &value, cx));
-                        },
+                    let (id, name) = (id.clone(), name.clone());
+                    view.update(cx, |this: &mut ProjectList, cx| {
+                        this.start_rename(id, false, &name, window, cx);
+                    });
+                })
+            }
+            ProjectMenuAction::Worktrees => {
+                let path = row.path.clone();
+                let id = row.id.clone();
+                menu::item(t("projectList", "menu.worktrees"), move |window, cx| {
+                    crate::git_worktree::open(
+                        path.clone(),
+                        // 项目里可能挂着多个仓库,与原版的项目级入口同口径
+                        true,
+                        Some(id.clone()),
+                        // 原版这个入口的 onChanged 是空的(项目列表自己有
+                        // 焦点重探那条路把新 worktree 的徽章补上)
+                        |_cx| {},
                         window,
                         cx,
                     );
@@ -430,28 +576,23 @@ fn project_menu(store: &Entity<AppStore>, row: &Row, tree: &[ProjectTreeItem]) -
 
 /// 分组行右键菜单(`ProjectList.tsx:965-1007`)。六项连排、**无分隔线**;
 /// 其中「添加远程项目」需要 SSH,GPUI 侧没有这个功能,本批不放这项。
-fn group_menu(store: &Entity<AppStore>, group: &GroupRow) -> Vec<MenuEntry> {
+fn group_menu(
+    view: &Entity<ProjectList>,
+    store: &Entity<AppStore>,
+    group: &GroupRow,
+) -> Vec<MenuEntry> {
     let mut entries: Vec<MenuEntry> = Vec::new();
 
     entries.push({
-        let store = store.clone();
+        let view = view.clone();
         let id = group.id.clone();
         let name = group.name.clone();
         menu::item(t("projectList", "menu.renameGroup"), move |window, cx| {
-            let store = store.clone();
-            let id = id.clone();
-            // 原版这里是**行内编辑**(C.1),GPUI 侧的内联编辑与项目重命名同属
-            // 后续批次 —— 两处一起改才不会一半弹窗一半行内,现在先与项目行同款走弹窗。
-            crate::prompt::show_prompt(
-                t("projectList", "menu.renameGroup"),
-                t("projectList", "newGroupPlaceholder"),
-                name.clone(),
-                move |value, _window, cx| {
-                    store.update(cx, |store, cx| store.rename_group(&id, &value, cx));
-                },
-                window,
-                cx,
-            );
+            let (id, name) = (id.clone(), name.clone());
+            // 与项目行同一条:行内编辑(原版 `startRenameGroup`)
+            view.update(cx, |this: &mut ProjectList, cx| {
+                this.start_rename(id, true, &name, window, cx);
+            });
         })
     });
 
@@ -553,6 +694,16 @@ fn new_group_menu(store: &Entity<AppStore>) -> Vec<MenuEntry> {
 
 // ─── 视图 ─────────────────────────────────────────────────────
 
+/// 行内重命名的编辑态(项目行与分组行共用一份 —— 同时只可能编辑一行)。
+struct Editing {
+    id: String,
+    is_group: bool,
+    input: Entity<InputState>,
+    /// 提交路径之一:输入框失焦。**取消时必须连它一起丢掉**,
+    /// 否则丢焦点那一下又把值提交回去了(Esc 等于没按)。
+    _sub: Subscription,
+}
+
 pub struct ProjectList {
     store: Entity<AppStore>,
     /// 正在被拖的节点 id(拖影起来那一刻记下),源行据此变淡。
@@ -562,17 +713,218 @@ pub struct ProjectList {
     drop_indicator: Option<DropIndicator>,
     /// 外部文件拖到列表上方时的三态提示。
     external: Option<ExternalDrag>,
+    /// 正在行内重命名的那一行。
+    editing: Option<Editing>,
+    /// 鼠标停在哪一行 —— 行尾的 ✕ 只在 hover 时出现(原版 `hidden group-hover:inline`)。
+    hovered: Option<String>,
+    /// 项目路径 → worktree 分支名。批量探测的结果,见 [`Self::probe_worktrees`]。
+    worktree_branches: HashMap<String, String>,
+    /// 上次探测用的路径清单(拼成一条),变了才重探。
+    probe_key: String,
+    /// 上次看到的窗口聚焦态。`false → true` 是原版 `onFocusChanged` 那条重探时机。
+    was_focused: bool,
 }
 
 impl ProjectList {
     pub fn new(store: Entity<AppStore>, cx: &mut Context<Self>) -> Self {
-        cx.observe(&store, |_, _, cx| cx.notify()).detach();
-        Self {
+        cx.observe(&store, |this: &mut Self, _, cx| {
+            // 项目路径集合变了(增删项目 / worktree 变项目)→ 重探徽章
+            this.probe_worktrees(false, cx);
+            // 窗口重新聚焦:分支切换与 `git worktree remove` 都发生在窗外,
+            // 回来时既重探徽章也做一次失效清理(原版 `onFocusChanged` 同款)
+            let focused = this.store.read(cx).window_focused();
+            if focused && !this.was_focused {
+                this.probe_worktrees(true, cx);
+                this.reconcile_worktrees(cx);
+            }
+            this.was_focused = focused;
+            cx.notify();
+        })
+        .detach();
+        let mut this = Self {
             store,
             dragging: None,
             drop_indicator: None,
             external: None,
+            editing: None,
+            hovered: None,
+            worktree_branches: HashMap::new(),
+            probe_key: String::new(),
+            was_focused: true,
+            };
+        // 挂载时先探一次(原版两个 effect 都在挂载时跑一遍)
+        this.probe_worktrees(true, cx);
+        this.reconcile_worktrees(cx);
+        this
+    }
+
+    // ─── 行内重命名(`ProjectList.tsx:415-444`) ───────────────
+
+    /// 进入编辑态。右键菜单的「重命名」与(将来的)F2 走同一个入口。
+    ///
+    /// ⚠️ **做不到「默认全选」**:`InputState::select_all` 是 `pub(super)`,
+    /// 组件库没给公开入口(N 批为 `show_prompt` 记过同一条)。这里退到
+    /// `set_value` 的副作用 —— 单行模式下它把光标放到**行尾**,
+    /// 比 `default_value`(光标在行首)接近原版的 `select()` 一档。
+    fn start_rename(
+        &mut self,
+        id: String,
+        is_group: bool,
+        current: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = cx.new(|cx| InputState::new(window, cx));
+        input.update(cx, |state, cx| {
+            state.set_value(current.to_string(), window, cx);
+            state.focus(window, cx);
+        });
+        // 回车 = 提交,失焦 = 提交(原版 onKeyDown Enter / onBlur 两条都提交)
+        let sub = cx.subscribe(&input, |this: &mut Self, _input, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {
+                this.commit_rename(cx);
+            }
+        });
+        self.editing = Some(Editing {
+            id,
+            is_group,
+            input,
+            _sub: sub,
+        });
+        cx.notify();
+    }
+
+    /// 提交:`trim` 之后非空才改名,**无论如何退出编辑态**(原版同一条)。
+    fn commit_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(editing) = self.editing.take() else {
+            return;
+        };
+        let value = editing.input.read(cx).value().trim().to_string();
+        if !value.is_empty() {
+            self.store.update(cx, |store, cx| {
+                if editing.is_group {
+                    store.rename_group(&editing.id, &value, cx);
+                } else {
+                    store.rename_project(&editing.id, &value, cx);
+                }
+            });
         }
+        cx.notify();
+    }
+
+    /// Esc 放弃。**先把编辑态连订阅一起丢掉**,随之而来的失焦才不会变成提交。
+    fn cancel_rename(&mut self, cx: &mut Context<Self>) {
+        if self.editing.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// 编辑中的输入框。原版是「只有一条 accent 下划线、无边框无背景」。
+    fn rename_input(&self, input: &Entity<InputState>, size: f32) -> AnyElement {
+        div()
+            .flex_1()
+            .border_b_1()
+            .border_color(ui::accent())
+            .text_size(ui::font_px(size))
+            .text_color(ui::text_primary())
+            // 点输入框不该顺带切项目 / 折叠分组(原版那句 stopPropagation)
+            .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
+                cx.stop_propagation();
+            })
+            .child(Input::new(input).appearance(false))
+            .into_any_element()
+    }
+
+    // ─── worktree 徽章与失效清理(`ProjectList.tsx:186-254`) ───
+
+    /// 批量探测哪些项目路径是 linked worktree。`force` = 路径没变也重探
+    /// (窗口重获焦点那条:分支切换发生在窗外,路径清单不会变)。
+    ///
+    /// `get_worktree_branches` 逐个 `Repository::open`,**阻塞**,必须丢后台。
+    fn probe_worktrees(&mut self, force: bool, cx: &mut Context<Self>) {
+        // 这个方法挂在 store 观察者上、每次 notify 都会走一遍(AI 状态变化就有一次),
+        // 所以先只拼一条比较用的键,确定要探了才真去收集路径
+        let mut key = String::new();
+        for p in self
+            .store
+            .read(cx)
+            .projects()
+            .iter()
+            .filter(|p| p.ssh_connection_id.is_none())
+        {
+            key.push_str(&p.path);
+            key.push('\n');
+        }
+        if !force && key == self.probe_key {
+            return;
+        }
+        let paths: Vec<String> = self
+            .store
+            .read(cx)
+            .projects()
+            .iter()
+            .filter(|p| p.ssh_connection_id.is_none())
+            .map(|p| p.path.clone())
+            .collect();
+        self.probe_key = key;
+        if paths.is_empty() {
+            self.worktree_branches.clear();
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let probe: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+            let branches = cx
+                .background_executor()
+                .spawn(async move { mt_project::git::get_worktree_branches(&probe) })
+                .await;
+            let _ = this.update(cx, |this: &mut ProjectList, cx| {
+                this.worktree_branches = paths
+                    .into_iter()
+                    .zip(branches)
+                    .filter_map(|(path, branch)| branch.map(|b| (path, b)))
+                    .collect();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 失效 worktree 子项目自动清理:目录已消失(**且父项目目录仍在**,排除盘符级
+    /// 整树消失的误判)的子项目连终端资源一起移除。
+    ///
+    /// 外部 / AI agent 在终端里 `git worktree remove` 之后没有任何事件通知,
+    /// 只能在挂载与窗口重获焦点时探一次。
+    fn reconcile_worktrees(&mut self, cx: &mut Context<Self>) {
+        let projects: Vec<ProjectConfig> = self.store.read(cx).projects().to_vec();
+        let probe = collect_worktree_probe_paths(&projects);
+        if probe.is_empty() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let paths: Vec<PathBuf> = probe.iter().map(PathBuf::from).collect();
+            let alive = cx
+                .background_executor()
+                .spawn(async move { mt_project::fs::filter_directories(paths) })
+                .await;
+            let alive: HashSet<String> = alive
+                .into_iter()
+                .map(|p| p.to_string_lossy().to_string())
+                .collect();
+            let _ = this.update(cx, |this: &mut ProjectList, cx| {
+                // 探测回来时项目表可能已经变了 —— 按**当下**的表重算一遍
+                let projects: Vec<ProjectConfig> = this.store.read(cx).projects().to_vec();
+                let stale = find_stale_worktree_projects(&projects, &alive);
+                if stale.is_empty() {
+                    return;
+                }
+                this.store.update(cx, |store, cx| {
+                    for id in stale {
+                        store.remove_project(&id, cx);
+                    }
+                });
+            });
+        })
+        .detach();
     }
 
     /// `on_drag_move` 的落点判定。`allow_inside` 只有分组行为真。
@@ -815,13 +1167,20 @@ impl Render for ProjectList {
         };
         let store_ref = self.store.read(cx);
         let active = store_ref.active_project_id.clone();
+        // 缺省开启,与 store 里那处取值同口径
+        let auto_resume = store_ref.config().ai_auto_resume.unwrap_or(true);
         let tree_snapshot: Vec<ProjectTreeItem> = store_ref
             .config()
             .project_tree
             .clone()
             .unwrap_or_default();
 
-        let mut list = div().flex().flex_col().flex_1().overflow_hidden();
+        let mut list = div()
+            .id("project-list-rows")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .overflow_y_scroll();
         for item in ordered {
             match item {
                 OrderedItem::Group {
@@ -852,6 +1211,17 @@ impl Render for ProjectList {
                         continue;
                     };
                     let state = store.project_state(&id);
+                    // 行上的 AI 品牌堆叠:递归收布局树里「显示 AI 会话」的 pane,
+                    // 判定与 tab 上的品牌图标共用同一把尺子
+                    let ai_vendors = ai_vendor_stack(
+                        state
+                            .and_then(|s| s.layout.as_ref())
+                            .map(|layout| layout.panes())
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|pane| pane.shows_ai_session(auto_resume))
+                            .map(|pane| pane.ai_agent()),
+                    );
                     let row = Row {
                         id: p.id.clone(),
                         name: p.name.clone(),
@@ -865,6 +1235,8 @@ impl Render for ProjectList {
                         depth,
                         parent_group_id,
                         is_child,
+                        ai_vendors,
+                        worktree_branch: self.worktree_branches.get(&p.path).cloned(),
                     };
                     let is_active = active.as_deref() == Some(row.id.as_str());
                     list = list.child(self.render_project(
@@ -879,7 +1251,64 @@ impl Render for ProjectList {
             }
         }
 
-        let store_for_menu = self.store.clone();
+        // 底部按钮条(`ProjectList.tsx:1087-1113`)。原版三个,中间那个 `SSH`
+        // 要 AddRemoteProjectModal,GPUI 侧没有 SSH 功能 —— 本批不放,已记档。
+        let dashed_button = |id: &'static str, label: SharedString, wide: bool| {
+            div()
+                .id(id)
+                .when(wide, |el| el.flex_1())
+                .flex()
+                .items_center()
+                .justify_center()
+                .px(px(12.0))
+                .py(px(8.0))
+                .rounded(px(6.0))
+                .border_1()
+                .border_dashed()
+                .border_color(ui::border_default())
+                .cursor_pointer()
+                .text_size(ui::font_px(11.4))
+                .text_color(ui::text_muted())
+                .hover(|el| el.border_color(ui::accent()).text_color(ui::accent()))
+                .child(label)
+        };
+        let store_for_add = self.store.clone();
+        let footer = div()
+            .flex()
+            .flex_none()
+            .gap(px(6.0))
+            .p(px(8.0))
+            .child(
+                dashed_button(
+                    "add-project",
+                    t("projectList", "addProject").into(),
+                    true,
+                )
+                .on_click(move |_event, window, cx| {
+                    modal::open_add_project(store_for_add.clone(), window, cx);
+                }),
+            )
+            .child(
+                dashed_button("new-group", "+".into(), false)
+                    .tooltip(|window, cx| {
+                        gpui_component::tooltip::Tooltip::new(t("projectList", "newGroup"))
+                            .build(window, cx)
+                    })
+                    .on_click(cx.listener(|this, _event, window, cx| {
+                        let store = this.store.clone();
+                        crate::prompt::show_prompt(
+                            t("projectList", "newGroup"),
+                            t("projectList", "newGroupPlaceholder"),
+                            "",
+                            move |value, _window, cx| {
+                                store.update(cx, |store, cx| store.create_group(&value, None, cx));
+                            },
+                            window,
+                            cx,
+                        );
+                    })),
+            );
+
         div()
             .id("project-list")
             .size_full()
@@ -916,31 +1345,17 @@ impl Render for ProjectList {
                             menu::show(event.position, entries, window, cx);
                         }),
                     )
+                    // 原版头部只有 "PROJECTS" 文本 + 空白右键菜单,没有 `+` 按钮
+                    // (添加项目在底部按钮条)
                     .child(
                         div()
                             .text_size(ui::font_px(11.0))
                             .text_color(ui::text_muted())
                             .child(t("panels", "projects")),
-                    )
-                    .child(
-                        div()
-                            .id("add-project")
-                            .w(px(18.0))
-                            .h(px(18.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(3.0))
-                            .cursor_pointer()
-                            .text_color(ui::text_muted())
-                            .hover(|el| el.text_color(ui::accent()).bg(ui::bg_overlay()))
-                            .on_click(move |_event, window, cx| {
-                                modal::open_add_project(store_for_menu.clone(), window, cx);
-                            })
-                            .child("+"),
                     ),
             )
             .child(list)
+            .child(footer)
             // 三态提示框:盖住整栏,`pointer-events` 不用管 —— gpui 的 drop 分发
             // 按 hitbox 命中走,这层没有 `.id()` 也就没有 hitbox
             .when_some(external, |el, kind| {
@@ -1013,6 +1428,12 @@ impl ProjectList {
         let name_drag = name.clone();
         let row_menu = row.clone();
         let this = cx.entity();
+        // 编辑中的那一行:名字换成内联输入框,行本身的点击/按键让给它
+        let editing = self
+            .editing
+            .as_ref()
+            .filter(|e| e.is_group && e.id == id)
+            .map(|e| e.input.clone());
 
         div()
             .relative()
@@ -1065,15 +1486,30 @@ impl ProjectList {
                         this.on_row_drop(item, &id_drop, cx);
                     }))
                     .on_click(cx.listener(move |this, _event, _window, cx| {
+                        // 编辑态里点自己不该顺带折叠(原版行的 onKeyDown 整体 return
+                        // 是同一个道理:这一行的交互全让给输入框)
+                        if this.editing.is_some() {
+                            return;
+                        }
                         this.store.update(cx, |store, cx| {
                             store.toggle_group_collapse(&id_toggle, cx)
                         });
                     }))
+                    // Esc 放弃重命名。输入框自己不吃 Escape(`clean_on_escape` 没开,
+                    // 它 `cx.propagate()`),所以在承载它的这一层收
+                    .when(editing.is_some(), |el| {
+                        el.on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+                            if event.keystroke.key == "escape" {
+                                cx.stop_propagation();
+                                this.cancel_rename(cx);
+                            }
+                        }))
+                    })
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                             cx.stop_propagation();
-                            let entries = group_menu(&this.store, &row_menu);
+                            let entries = group_menu(&cx.entity(), &this.store, &row_menu);
                             menu::show(event.position, entries, window, cx);
                         }),
                     )
@@ -1091,7 +1527,17 @@ impl ProjectList {
                         VectorIcon::new(dnd::BOXES_SHAPES, px(13.0))
                             .ink(ui::color_folder()),
                     )
-                    .child(div().flex_1().truncate().child(name))
+                    .map(|el| match &editing {
+                        // 组名输入框比项目行小一档(原版 `text-sm` vs `text-base`)
+                        Some(input) => el.child(self.rename_input(input, 11.4)),
+                        None => el.child(
+                            div()
+                                .flex_1()
+                                .truncate()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(name),
+                        ),
+                    })
                     .child(
                         div()
                             .flex_shrink_0()
@@ -1135,10 +1581,26 @@ impl ProjectList {
         let id_move = id.clone();
         let id_drop = id.clone();
         let id_line = id.clone();
+        let id_hover = id.clone();
         let name_drag = name.clone();
+        let description = row.description.clone();
+        let ai_vendors = row.ai_vendors.clone();
+        let worktree_branch = row.worktree_branch.clone();
         let row_for_menu = row.clone();
         let tree_for_menu: Vec<ProjectTreeItem> = tree.to_vec();
         let this = cx.entity();
+        let editing = self
+            .editing
+            .as_ref()
+            .filter(|e| !e.is_group && e.id == id)
+            .map(|e| e.input.clone());
+        // 行尾的 ✕ 只在**这一行**被悬停时出现(原版 `hidden group-hover:inline`)。
+        // 走 view state 而不是 `group_hover` + 透明度:透明的按钮仍然吃点击,
+        // 而这个按钮的动作是「移除项目」,看不见还能点中是实打实的事故。
+        let hovered = self.hovered.as_deref() == Some(id.as_str());
+        // 完成提示:非激活项目里有 AI 任务完成时画 DONE 标,否则才轮到状态灯;
+        // **idle 且没有完成标时两个都不画**(原版 `ProjectList.tsx:912`)
+        let show_done_tag = needs_attention && !is_active;
 
         div()
             .relative()
@@ -1152,18 +1614,35 @@ impl ProjectList {
                     .pl(px(indent))
                     .pr(px(10.0))
                     .py(px(6.0))
+                    .rounded(px(3.0))
                     .cursor_pointer()
+                    .text_size(ui::font_px(13.0))
                     .when(is_source, |el| el.opacity(0.4))
                     .when(is_active, |el| {
-                        el.bg(ui::accent_subtle()).border_l_2().border_color(ui::accent())
+                        el.bg(ui::accent_subtle()).text_color(ui::accent())
                     })
                     .when(!is_active, |el| {
-                        el.border_l_2().border_color(gpui::Hsla {
-                            a: 0.0,
-                            ..ui::accent()
-                        })
+                        el.text_color(ui::text_secondary())
+                            .hover(|el| el.bg(ui::border_subtle()).text_color(ui::text_primary()))
                     })
-                    .hover(|el| el.bg(ui::bg_overlay()))
+                    // 绝对路径挂 tooltip。原版是 `title={aiVendors.length>0 ? undefined
+                    // : project.path}`(有 AI 会话时路径改由悬停缩略图的卡头显示,
+                    // 原生 tooltip 会盖住那张卡)—— GPUI 侧缩略图还没做,
+                    // 条件挂等于让跑着 AI 的项目路径彻底不可见,故**恒挂**
+                    .tooltip({
+                        let path = path.clone();
+                        move |window, cx| {
+                            gpui_component::tooltip::Tooltip::new(path.clone()).build(window, cx)
+                        }
+                    })
+                    // 悬停记到 view state 上 —— 行尾 ✕ 的显隐要它
+                    .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
+                        let next = hovered.then(|| id_hover.clone());
+                        if this.hovered != next {
+                            this.hovered = next;
+                            cx.notify();
+                        }
+                    }))
                     .on_drag(
                         DragProjectItem {
                             id: id.clone(),
@@ -1193,94 +1672,175 @@ impl ProjectList {
                         }))
                     })
                     .on_click(cx.listener(move |this, _event, _window, cx| {
+                        // 编辑态里点自己不切项目(交互全让给输入框)
+                        if this.editing.is_some() {
+                            return;
+                        }
                         this.store
                             .update(cx, |store, cx| store.set_active_project(&id_click, cx));
                     }))
+                    // Esc 放弃重命名(见分组行上的同一条注释)
+                    .when(editing.is_some(), |el| {
+                        el.on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+                            if event.keystroke.key == "escape" {
+                                cx.stop_propagation();
+                                this.cancel_rename(cx);
+                            }
+                        }))
+                    })
                     // 右键菜单(`ProjectList.tsx` 的 onContextMenu)。原版会先
                     // `closePreview()` 收掉悬停缩略图 —— GPUI 侧还没有那层浮层。
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                             cx.stop_propagation();
-                            let entries = project_menu(&this.store, &row_for_menu, &tree_for_menu);
+                            let entries = project_menu(
+                                &cx.entity(),
+                                &this.store,
+                                &row_for_menu,
+                                &tree_for_menu,
+                            );
                             menu::show(event.position, entries, window, cx);
                         }),
                     )
-                    // 领位是**项目身份图标**(原版的顺序:身份图标 → … → 状态灯),
-                    // 每行都有、缩进才对得齐
-                    .child(project_icon(kind))
-                    // 状态灯的动画 id 拿项目 id 拼:跨帧稳定、逐行唯一
-                    .child(ui::status_dot(
-                        SharedString::from(format!("status-project-{id}")),
-                        status,
-                    ))
+                    // 行首那道 accent 竖条(原版 `w-0.5 h-4 rounded-full`)。
+                    // ⚠️ 原版只在选中时才渲染这个 span,于是选中的一瞬整行内容右移
+                    // 10px;这里**恒占位**、未选中时透明,视觉一致但不抖。
                     .child(
                         div()
-                            .flex_1()
-                            .overflow_hidden()
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_size(ui::font_px(13.0))
-                                    .text_color(if is_active {
-                                        ui::text_primary()
-                                    } else {
-                                        ui::text_secondary()
-                                    })
-                                    .child(name),
-                            )
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_size(ui::font_px(11.0))
-                                    .text_color(ui::text_muted())
-                                    .child(path),
-                            ),
-                    )
-                    // 完成提示点:非激活项目里有 AI 任务完成
-                    .when(needs_attention, |el| {
-                        el.child(
-                            div()
-                                .w(px(6.0))
-                                .h(px(6.0))
-                                .rounded_full()
-                                .bg(ui::color_success()),
-                        )
-                    })
-                    // 移除:弹确认框(不可逆,布局与展开目录一起没)
-                    .child(
-                        div()
-                            .id(SharedString::from(format!("project-remove-{id}")))
-                            .w(px(16.0))
+                            .w(px(2.0))
                             .h(px(16.0))
+                            .flex_shrink_0()
+                            .rounded_full()
+                            .bg(if is_active {
+                                ui::accent()
+                            } else {
+                                ui::with_alpha(ui::accent(), 0.0)
+                            }),
+                    )
+                    // 领位是**项目身份图标**,每行都有、缩进才对得齐
+                    .child(project_icon(kind))
+                    // AI 品牌堆叠:领位图标之后、名字之前,**只追加不覆盖**。
+                    // 负边距抵掉行内 gap(6px),与领位图标只留 2px;图标之间同样 2px
+                    .when(!ai_vendors.is_empty(), |el| {
+                        let mut stack = div()
                             .flex()
                             .items_center()
-                            .justify_center()
-                            .rounded(px(3.0))
-                            .text_size(ui::font_px(12.0))
-                            .text_color(ui::text_muted())
-                            .hover(|el| el.text_color(ui::color_error()).bg(ui::bg_overlay()))
-                            .on_click(cx.listener(move |this, _event, window, cx| {
-                                cx.stop_propagation();
-                                let Some((name, path)) = this
-                                    .store
-                                    .read(cx)
-                                    .project(&id_remove)
-                                    .map(|p| (p.name.clone(), p.path.clone()))
-                                else {
-                                    return;
-                                };
-                                modal::open_confirm_remove_project(
-                                    this.store.clone(),
-                                    id_remove.clone(),
-                                    name,
-                                    path,
-                                    window,
-                                    cx,
-                                );
-                            }))
-                            .child("×"),
-                    ),
+                            .flex_shrink_0()
+                            .ml(px(-4.0))
+                            .gap(px(2.0));
+                        for vendor in &ai_vendors {
+                            stack = stack.child(
+                                BrandIcon::new(*vendor)
+                                    .size(px(AI_ICON_SIZE))
+                                    // 固定 text-secondary 上下文:单色品牌图标不随
+                                    // 选中行的 accent 变色(与 tab 上观感一致)
+                                    .color(ui::text_secondary())
+                                    .contrast(ui::bg_surface()),
+                            );
+                        }
+                        el.child(stack)
+                    })
+                    .map(|el| match &editing {
+                        Some(input) => el.child(self.rename_input(input, 13.0)),
+                        None => el.child(
+                            div()
+                                .flex_1()
+                                .overflow_hidden()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                // 原版**没有**副行显示路径:路径只在 title / 预览卡头里出现
+                                .child(div().truncate().child(name))
+                                .when_some(description, |el, desc| {
+                                    el.child(
+                                        div()
+                                            .truncate()
+                                            .text_size(ui::font_px(9.75))
+                                            .text_color(ui::text_muted())
+                                            .child(desc),
+                                    )
+                                }),
+                        ),
+                    })
+                    // worktree 徽章:`⎇ 分支名`(U+2387 是**文本**,不是图标)
+                    .when_some(worktree_branch, |el, branch| {
+                        el.child(
+                            div()
+                                .id(SharedString::from(format!("worktree-{id}")))
+                                .flex_shrink_0()
+                                .max_w(px(WORKTREE_BADGE_MAX_W))
+                                .truncate()
+                                .px(px(3.0))
+                                .rounded(px(3.0))
+                                .text_size(ui::font_px(9.75))
+                                .text_color(ui::text_muted())
+                                .bg(ui::border_subtle())
+                                .tooltip({
+                                    let branch = branch.clone();
+                                    move |window, cx| {
+                                        gpui_component::tooltip::Tooltip::new(tr!(
+                                            "projectList",
+                                            "worktreeBadgeTitle",
+                                            branch = branch.clone()
+                                        ))
+                                        .build(window, cx)
+                                    }
+                                })
+                                .child(format!("⎇ {branch}")),
+                        )
+                    })
+                    // 完成标 / 状态灯二选一,**idle 时两个都不画**
+                    .map(|el| {
+                        if show_done_tag {
+                            el.child(done_tag())
+                        } else if status != PaneStatus::Idle {
+                            // 状态灯的动画 id 拿项目 id 拼:跨帧稳定、逐行唯一
+                            el.child(ui::status_dot(
+                                SharedString::from(format!("status-project-{id}")),
+                                status,
+                            ))
+                        } else {
+                            el
+                        }
+                    })
+                    // 移除:弹确认框(不可逆,布局与展开目录一起没)。只在行悬停时出现
+                    .when(hovered, |el| {
+                        el.child(
+                            div()
+                                .id(SharedString::from(format!("project-remove-{id}")))
+                                .w(px(16.0))
+                                .h(px(16.0))
+                                .flex_shrink_0()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(3.0))
+                                .text_size(ui::font_px(11.4))
+                                .text_color(ui::text_muted())
+                                .hover(|el| el.text_color(ui::color_error()).bg(ui::bg_overlay()))
+                                .on_click(cx.listener(move |this, _event, window, cx| {
+                                    cx.stop_propagation();
+                                    let Some((name, path)) = this
+                                        .store
+                                        .read(cx)
+                                        .project(&id_remove)
+                                        .map(|p| (p.name.clone(), p.path.clone()))
+                                    else {
+                                        return;
+                                    };
+                                    modal::open_confirm_remove_project(
+                                        this.store.clone(),
+                                        id_remove.clone(),
+                                        name,
+                                        path,
+                                        window,
+                                        cx,
+                                    );
+                                }))
+                                .child("✕"),
+                        )
+                    }),
             )
             // 子项目不是落点,指示线自然也不该出现在它上下
             .when(!is_child, |el| {
@@ -1295,7 +1855,12 @@ impl ProjectList {
 mod tests {
     use super::*;
 
-    /// 菜单项序照抄原版(去掉功能未建的那几项),分隔线只在「移除项目」之前一条。
+    /// 菜单项序照抄原版(去掉功能未建的那几项)。
+    ///
+    /// ⚠️ Y 批把「Worktree 管理」接了上去(V 批的 `git_worktree::open` 已就绪),
+    /// 位置与原版一致:「复制绝对路径」之后那条分隔线之下、「项目类型」之上
+    /// (原版那一段是「关联 SSH / 环境变量 / Worktree 管理」三连,前两项仍未建)。
+    /// 于是期望向量多了一条分隔线与一项,分隔线总数 1 → 2。
     #[test]
     fn 右键菜单项序与原版一致() {
         use ProjectMenuAction::*;
@@ -1307,13 +1872,15 @@ mod tests {
                 Some(EditDescription),
                 Some(OpenInFolder),
                 Some(CopyAbsolutePath),
+                None,
+                Some(Worktrees),
                 Some(ProjectKind),
                 None,
                 Some(Remove),
             ]
         );
-        // 未建功能不占位:SSH / 环境变量 / Worktree / WSL / 分组一个都不许出现
-        assert_eq!(actions.iter().filter(|a| a.is_none()).count(), 1);
+        // 未建功能不占位:SSH / 环境变量 / WSL / 分组一个都不许出现
+        assert_eq!(actions.iter().filter(|a| a.is_none()).count(), 2);
     }
 
     /// 勾选前缀是「✓ 」/ 全角空格 —— 两者等宽,菜单项文字才不会左右跳。
@@ -1386,5 +1953,125 @@ mod tests {
         for depth in 0..3usize {
             assert_eq!(depth as f32 * 16.0, (depth * 16) as f32);
         }
+    }
+
+    // ─── AI 品牌堆叠(C.4) ───────────────────────────────────
+
+    /// 按厂商去重、字母序、未知厂商排最后 —— 三条一次验完。
+    #[test]
+    fn ai堆叠去重并按字母序() {
+        // 同款 AI 开三个 pane 只出一枚
+        let stack = ai_vendor_stack([Some("claude"), Some("claude"), Some("claude")]);
+        assert_eq!(stack, vec![Some(AiVendor::Claude)]);
+
+        // 字母序:claude < codex(openai) ... 直接比 as_str
+        let stack = ai_vendor_stack([Some("codex"), Some("claude"), Some("gemini")]);
+        let keys: Vec<&str> = stack
+            .iter()
+            .map(|v| v.map(|v| v.as_str()).unwrap_or("unknown"))
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        assert_eq!(keys, sorted, "必须是厂商名的字母序");
+
+        // 未知厂商固定排最后,且认不出的几个 agent 只占一枚
+        let stack = ai_vendor_stack([
+            Some("某个没听过的 agent"),
+            Some("claude"),
+            Some("另一个没听过的"),
+        ]);
+        assert_eq!(stack.len(), 2, "认不出的全算 unknown,合成一枚");
+        assert_eq!(stack.first().copied(), Some(Some(AiVendor::Claude)));
+        assert_eq!(stack.last().copied(), Some(None));
+
+        // 一个 AI pane 都没有 = 一枚都不画(领位图标照旧)
+        assert!(ai_vendor_stack(std::iter::empty()).is_empty());
+    }
+
+    /// 没有 agent 名(hook 没上报、输入检测也没认出)的 pane 归 unknown,不占两枚。
+    #[test]
+    fn ai堆叠里无名字的算unknown() {
+        let stack = ai_vendor_stack([None, None, Some("claude")]);
+        assert_eq!(stack, vec![Some(AiVendor::Claude), None]);
+    }
+
+    // ─── 失效 worktree 清理(C.5) ────────────────────────────
+
+    fn project(id: &str, path: &str, parent: Option<&str>) -> ProjectConfig {
+        ProjectConfig {
+            id: id.to_string(),
+            name: id.to_string(),
+            path: path.to_string(),
+            description: None,
+            saved_layout: None,
+            expanded_dirs: Vec::new(),
+            ssh_mcp_enabled: false,
+            ssh_cli_token: None,
+            ssh_connection_ids: None,
+            env_vars: Vec::new(),
+            wsl_sessions_distro: None,
+            ssh_connection_id: None,
+            parent_project_id: parent.map(str::to_string),
+            kind_override: None,
+        }
+    }
+
+    /// 探测清单 = 子项目路径 + 父项目路径,**去重**;没有子项目就一条都不探。
+    #[test]
+    fn 探测清单含父项目且去重() {
+        let projects = vec![
+            project("root", r"D:\repo", None),
+            project("wt1", r"D:\wt\a", Some("root")),
+            project("wt2", r"D:\wt\b", Some("root")),
+        ];
+        let paths = collect_worktree_probe_paths(&projects);
+        assert_eq!(paths, vec![r"D:\wt\a", r"D:\repo", r"D:\wt\b"]);
+
+        // 没有 worktree 子项目 = 不必探测(原版 `probe.length === 0` 直接 return)
+        assert!(collect_worktree_probe_paths(&[project("root", r"D:\repo", None)]).is_empty());
+    }
+
+    /// 只清「自己没了、父项目还在」的那些;整棵树一起消失时一个都不动。
+    #[test]
+    fn 只清父项目仍在的失效子项目() {
+        let projects = vec![
+            project("root", r"D:\repo", None),
+            project("gone", r"D:\wt\gone", Some("root")),
+            project("alive", r"D:\wt\alive", Some("root")),
+        ];
+
+        let alive: HashSet<String> = [r"D:\repo", r"D:\wt\alive"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(find_stale_worktree_projects(&projects, &alive), vec!["gone"]);
+
+        // 盘符整个不见了(父项目也探不到)→ 一个都不清
+        let none: HashSet<String> = HashSet::new();
+        assert!(find_stale_worktree_projects(&projects, &none).is_empty());
+    }
+
+    /// UNC(WSL)路径两侧都不参与:存在性探测依赖 WSL 状态,误判风险高。
+    #[test]
+    fn unc路径不参与清理() {
+        let projects = vec![
+            project("root", r"\\wsl$\Ubuntu\repo", None),
+            project("child", r"\\wsl$\Ubuntu\wt", Some("root")),
+            project("local", r"D:\repo", None),
+            // 本地子项目挂在 UNC 父项目下:父那侧不可靠,同样不清
+            project("mixed", r"D:\wt\x", Some("root")),
+        ];
+        assert!(collect_worktree_probe_paths(&projects).is_empty());
+        assert!(is_unc_path(r"\\wsl$\Ubuntu"));
+        assert!(!is_unc_path(r"D:\repo"));
+    }
+
+    /// 父项目不存在(配置被手改坏)时不清 —— 判据缺一半,宁可留着。
+    #[test]
+    fn 父项目缺失时不清() {
+        let projects = vec![project("orphan", r"D:\wt\x", Some("没有这个父项目"))];
+        assert!(collect_worktree_probe_paths(&projects).is_empty());
+        let alive: HashSet<String> = HashSet::new();
+        assert!(find_stale_worktree_projects(&projects, &alive).is_empty());
     }
 }
