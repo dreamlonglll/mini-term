@@ -13,7 +13,7 @@
 | Wave 1 | 后端五块并行搬运 + TerminalElement 端到端 | ✅ 2026-08-18 全部验收入库（6/6） |
 | Wave 2 | mt-relay、mt-app 全壳（store/三栏/Tab/分屏树） | ✅ 2026-08-18 两件均验收入库；面板/Modal/i18n/主题桥移入 Wave 3 |
 | Wave 3 | G=mt-app UI 批（Modal/AI 历史+用量面板/通知/分屏比例+焦点导航）；H=mt-ui 渲染批（IME/鼠标上报/damage/主题桥）；I=mt-i18n 字典基建 | ✅ 2026-08-18 全部验收入库。G 经收尾 agent 补验：66 单测+4 集成全绿（老断言零改动），六模块齐（托盘明确未做），收尾另修 3 个真 bug（分屏比例恢复首帧 FALLBACK_AREA 基准错→改首帧量尺下帧铺树；窗口聚焦不清未读；折叠栏把 sizes 抹成最小值）+ 2 处资源问题（会话面板惰性加载防 WSL 冷启动、用量面板 Task 句柄无界增长）+6 单测；I ✅（`d2af55f`）；H ✅（`92390d4`） |
-| Wave 4+ | 按 docs/gpui-parity-audit.md 30 条缺口逐批清零（第 0 层接线 → 基建 → 面板 → 整块新功能） | 🔵 J ✅（`9246abf`）；K ✅（`b2fa0a0`）；L ✅（`04ee62b`）；M ✅（`14c84e9`，⚠️ gpui-component 无 svg 资产，图标一律走 mt-ui VectorIcon）；O ✅（`2bb0205`）；N ✅（`e91bb03`）；P ✅（`944baff`，主会话复跑 139+4 绿：搜索三连 #23/#24/#26 + overlay.rs 快捷键让路 + 三条快捷键；SearchModal 点结果暂走外部编辑器待 #29 回接）；Q ✅（主会话复跑 167+4 + mt-config 45+1 绿：#17 用量面板全套含 pricing.rs models.dev 拉取、#18 会话面板本体、右抽屉悬浮层化；BranchFamilyPanel 判归 fork 批；zed-reqwest 净新增 crate=0）；**batch-specs/ 已备齐 8 份规格**（设置/面板/移动端/GitUI/托盘/标题栏杂项/拖放分组列表/marker 文件预览），后续批次任务书直接引用；下一波候选=设置面板 #19（规格最全）/ Git UI #27 / 标题栏 #20 |
+| Wave 4+ | 按 docs/gpui-parity-audit.md 30 条缺口逐批清零（第 0 层接线 → 基建 → 面板 → 整块新功能） | 🔵 J ✅（`9246abf`）；K ✅（`b2fa0a0`）；L ✅（`04ee62b`）；M ✅（`14c84e9`，⚠️ gpui-component 无 svg 资产，图标一律走 mt-ui VectorIcon）；O ✅（`2bb0205`）；N ✅（`e91bb03`）；P ✅（`944baff`，主会话复跑 139+4 绿：搜索三连 #23/#24/#26 + overlay.rs 快捷键让路 + 三条快捷键；SearchModal 点结果暂走外部编辑器待 #29 回接）；Q ✅（主会话复跑 167+4 + mt-config 45+1 绿：#17 用量面板全套含 pricing.rs models.dev 拉取、#18 会话面板本体、右抽屉悬浮层化；BranchFamilyPanel 判归 fork 批；zed-reqwest 净新增 crate=0）；**batch-specs/ 已备齐 8 份规格**（设置/面板/移动端/GitUI/托盘/标题栏杂项/拖放分组列表/marker 文件预览），后续批次任务书直接引用；R ✅（`cb3282d`，主会话复跑 mt-app 188+4/mt-terminal 3/mt-i18n 12+3/mt-ui 129/mt-config 45+7+1 全绿）；V 🔵（worktree gpui-batch-v）；S 🔵（worktree gpui-batch-s） |
 | 收尾 | mt-ssh/mt-core 移入 crates/、删 src-tauri/ 与 src/、发版切换 | ⬜ |
 
 ## Wave 1 —— 2026-08-18 派出 6 个并行 agent
@@ -132,6 +132,7 @@
   - `mt_project::search::start_search` 自带专用后台线程，结果走 `futures::mpsc` 回主线程；**不要**塞进 `background_executor`（那是给会 await 的 future 用的，同步闭包会占死一根工作线程）。
   - `Palette` 补 `color_warning`（`--color-warning`；主题包按 `accentAlt` 映射，与 `themePackManager.ts` 同口径）。
   - 遗留：SearchModal 点结果依赖 `FileViewerModal`（#29）未迁移，现退到外部编辑器打开；结果列表无虚拟化；分组头无 sticky；`ProjectSwitcher` 面板高度按候选条数估算（`Dialog` 只吃固定高度，没有 `max-h` 语义）。
+- **R 批（cb3282d 后）记档**：UI 间距不随 uiFontSize 缩放（原版 Tailwind 的 rem 连内边距一起缩，GPUI 侧间距是像素字面量，10px/20px 极端档观感有差）；uiFontFamily 只取首个族名（gpui `font_family` 单值，整串仍原样落盘）；提示音自定义仅认 .wav——选择时非 wav 出警告条，但**已存的旧值不再提示**；skin（blueprint/fluent2）与终端连字 UI 置灰待底层能力；⚠️ USED_KEYS 大半 key 是动态传进 `t()` 的（section()/toggle_row()/MENU_GROUPS/hotkeys 表），文档注释那条 grep 抓不到，取全表必须连 settings.rs/hotkeys.rs 的 key 字面量一起扫（i18n.rs 表头已加警告）；`AppStore::background_art()` 的 dead_code 标注属误标（main.rs 实际在用）；深链 initial_page 已打通但两处入口都传 None（与原版一致）。
 - **N 批（2bb0205 后）记档**：mt-project 无 reveal 语义（mt-app 自落 explorer `/select,` 走 raw_arg 防空格路径二次转义，建议上收 mt_project::editor）；`fs::delete_entry` 是硬删非回收站（文案「无法撤销」相符，后续可接 trash crate）；gpui-component `InputState::select_all` 是 pub(super)，prompt 默认值全选做不到；菜单键盘方向键导航/进场动画未做。
 
 ## Wave 5 批次排程（2026-08-19 主会话规划；当前为用户指示的暂停点，下午继续）
@@ -140,7 +141,7 @@
 
 | 批 | 内容（审计条目） | 任务书（docs/batch-specs/） | 派发前决策 / 前置 |
 |---|---|---|---|
-| R | 设置面板 9 分页 + skin 色表（#19 + #5 剩余） | settings-pages.md | 连字/皮肤两段置灰或不渲染（底层无能力）；UI 字号字族建 thread_local 快照真接上；about 页 HTTP 复用 zed-reqwest（Q 批已引入）；Toggle/NumberRow 等原语自绘，勿用 gpui-component Switch/setting |
+| R ✅（`cb3282d` 2026-08-19） | 设置面板 9 分页 + skin 色表（#19 + #5 剩余） | settings-pages.md | 已按决策落地：连字/皮肤渲染但置灰+说明词条；UI 字号字族 thread_local 快照真接上（84 处 text_size 换 ui::font_px）；about 页复用 zed-reqwest；原语全自绘；另收编键位表 hotkeys.rs 为唯一事实来源 |
 | S | 自定义标题栏（#20） | titlebar-shell-misc.md §A | TitlebarOptions.appears_transparent + window_control_area 直翻 HTCAPTION 系；关闭键禁自挂 on_click→remove_window（绕过关窗确认钩子）；项目胶囊需 collectAiProjects 等价物（与 T 批共用，见 tray.md §9） |
 | T | 系统托盘（#21） | tray.md | Win32 直写 Shell_NotifyIconW（不引 tray-icon）；mt-app 的 windows 依赖加 Win32_UI_Shell + Win32_Graphics_Gdi feature；HICON 换图必 DestroyIcon |
 | U | 移动端中转（#22） | mobile-relay.md | 根 Cargo.toml 加 `qrcode = { version="0.14", default-features=false }`（主会话动手）+ 自绘渲染（静区1/EC-M）；shell 下拉走自建 menu.rs；start_session 内层 Result 外层统一回执 |
