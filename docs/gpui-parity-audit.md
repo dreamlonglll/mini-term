@@ -62,7 +62,7 @@
 | 27 | **Git 全套 UI**：GitChanges/GitHistory/CommitDiffModal/DiffModal/GitWorktreeModal + 右抽屉 sessions⇄git 互斥切换（后端 git.rs 1559 行已就绪）。~~BranchFamilyPanel~~ 系审计误归——它是 AI 会话家族树（scan_session_lineage），已划回 #18 的 fork 批遗留 | 大 | mt-app | ✅ V 批（`a7e9e85`，合并 `9c70bde`）。六组件+拓扑图+pty-output 输出旁路全落地；遗留两入口转 Y 批：FileTree「查看变更」与项目列表「Worktrees」（open_file_diff/git_worktree::open 已就绪，只差菜单项+菜单序断言同步） |
 | 28 | **SSH 全套 UI**：SshModal/SshAssocModal/AddRemoteProjectModal/远程项目/断线重连覆盖层/exitedPtyIds 体系（依赖 mt-ssh 进 crates/，属收尾阶段联动件） | 大 | mt-app | ❌ |
 | 29 | 文件预览与编辑器（FileViewerModal/CodeEditor） | 大 | mt-app | ❌ |
-| 30 | 壳层杂项：关窗确认（盘点活 AI 会话列名）+ 版本检查/更新提醒 + FirstRunGuide 完整版（两入口+键位提示）+ 长文本粘贴转文件（4 配置字段已在）+ WSL 启动器重写提示 + 启动埋点 + dirKinds 技术栈探测缓存 + pane 进场动画 | 中 | mt-app | ❌ |
+| 30 | 壳层杂项：关窗确认（盘点活 AI 会话列名）+ 版本检查/更新提醒 + FirstRunGuide 完整版（两入口+键位提示）+ 长文本粘贴转文件（4 配置字段已在）+ WSL 启动器重写提示 + 启动埋点 + dirKinds 技术栈探测缓存 + pane 进场动画 | 中 | mt-app | 🟡 Z 批（合并 `2dbc52f`）落地：关窗确认（on_window_should_close→allow_close 单闸+FORCE_CLOSE）、自建 toast 体系（替换 Notification，右下角起堆）、双音 WAV 合成、长粘贴转文件（SSH 分支随 #28）、WSL 覆盖提示、smartCopyPaste。剩（清尾批）：版本自检+边条红点（settings.rs 的 check_update 已就绪只差启动跑一次）、FirstRunGuide、启动埋点、dirKinds 探测、pane 进场动画 |
 
 ### 其他细项（散落，随所在批次带走）
 
