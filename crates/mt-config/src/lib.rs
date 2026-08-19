@@ -45,7 +45,7 @@ pub use config::{
     ShellConfig, SshConnection, default_remote_paste_dir, migrate_config, read_config_from,
 };
 pub use paths::{
-    APP_IDENTIFIER, LEGACY_IDENTIFIER, app_data_dir, config_path, migrate_legacy_app_data,
-    themes_dir,
+    APP_IDENTIFIER, DATA_DIR_ENV, LEGACY_IDENTIFIER, active_data_dir, app_data_dir, config_path,
+    migrate_legacy_app_data, themes_dir,
 };
 pub use theme_packs::{ThemePackData, ThemePackEntry, ThemePacks};

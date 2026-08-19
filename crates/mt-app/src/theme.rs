@@ -38,7 +38,7 @@ use gpui::{App, Window, WindowAppearance};
 use mt_config::AppConfig;
 use mt_ui::TerminalTheme;
 use mt_ui::theme_bridge::{
-    self, Appearance, BackgroundArt, ThemePackDef, builtin_dark_terminal_theme,
+    self, Appearance, BackgroundArt, ThemePackListing, builtin_dark_terminal_theme,
     builtin_terminal_theme, switch_to_builtin, switch_to_theme_pack,
 };
 
@@ -75,15 +75,18 @@ pub fn resolve_appearance(theme: &str, cx: &App) -> Appearance {
     }
 }
 
-/// themes/ 目录。**走 [`crate::app_data_dir`] 而不是
-/// `mt_config::ThemePacks::open()`** —— 后者钉死在装机版目录上,
-/// `MT_APP_DATA_DIR` 隔离模式下会读到装机版的皮肤。
+/// themes/ 目录。
+///
+/// `ThemePacks::open()` 现在认 `MT_APP_DATA_DIR`(`mt_config::active_data_dir`,
+/// 与 [`crate::app_data_dir`] 同一口径),J 批那条「钉死装机版目录、mt-app 用
+/// `ThemePacks::at()` 绕开」的记档已结清 —— 这里只保留定位不到数据目录时的兜底。
 pub fn theme_packs() -> mt_config::ThemePacks {
-    mt_config::ThemePacks::at(crate::app_data_dir().join("themes"))
+    mt_config::ThemePacks::open()
+        .unwrap_or_else(|_| mt_config::ThemePacks::at(crate::app_data_dir().join("themes")))
 }
 
 /// 可用的外置主题包(坏包跳过,设置页的皮肤列表用它)。
-pub fn list_packs() -> Vec<(ThemePackDef, std::path::PathBuf)> {
+pub fn list_packs() -> Vec<ThemePackListing> {
     theme_bridge::list_theme_packs(&theme_packs()).unwrap_or_else(|err| {
         eprintln!("[theme] 主题目录读取失败: {err:#}");
         Vec::new()

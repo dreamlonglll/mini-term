@@ -433,6 +433,11 @@ pub struct BackgroundArt {
 /// 一次主题应用的产物。
 #[derive(Debug, Clone)]
 pub struct AppliedThemePack {
+    /// 主题包身份 = **themes/ 下的目录名**（`config.custom_theme_id` 存的就是它）。
+    ///
+    /// 不是 theme.json 里的 `id` 字段：两者允许不一致（用户改过目录名），
+    /// 一致性口径见 [`mt_config::ThemePackEntry::theme_id`]。目录未知时
+    /// （单测直接喂 `def`）才退回 `def.id`。
     pub theme_id: String,
     pub name: String,
     pub appearance: Appearance,
@@ -762,7 +767,12 @@ pub fn resolve_theme_pack(def: &ThemePackDef, dir: Option<&Path>) -> AppliedThem
     let with_background = background.is_some();
 
     AppliedThemePack {
-        theme_id: def.id.clone(),
+        // 身份取目录名（`themes/<theme_id>/`），theme.json 的 `id` 只是包作者
+        // 自己写的展示值 —— 两者不一致时按目录名走，与 `packs.read()` 同一把尺子
+        theme_id: dir
+            .and_then(|d| d.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| def.id.clone()),
         name: def.name.clone(),
         appearance: def.appearance,
         colors: def.colors.clone(),
@@ -863,14 +873,35 @@ pub fn restore_builtin_gpui_theme(cx: &mut App) {
     theme.dark_theme = dark;
 }
 
+/// 皮肤列表里的一项：**目录名（身份）+ 解析好的定义 + 包目录**。
+///
+/// 对应原版 `ThemePackMeta`（`themePackManager.ts:75-81`）的三个字段，
+/// 一字不差地包括那条注释：`themeId` 是「themes/ 下目录名（read_theme_pack
+/// 用它定位）」。此前这里只返回 `(def, dir)` 把目录名丢了，调用方只好拿
+/// `def.id` 当身份 —— 目录名与 `id` 不一致的包（`themes/ember-new/` 里写着
+/// `"id": "ember-dusk"`）于是列得出来、一点「应用」就 `read("ember-dusk")`
+/// 找不到目录，报「皮肤应用失败」。
+pub struct ThemePackListing {
+    /// themes/ 下的目录名。应用 / 删除 / 读资源全用它。
+    pub theme_id: String,
+    /// theme.json 解析校验后的定义（`def.id` 只用于展示与告警）。
+    pub def: ThemePackDef,
+    /// 包目录绝对路径（缩略图、背景图拼路径用）。
+    pub dir: PathBuf,
+}
+
 /// 扫一遍 themes/ 目录，返回能用的包（坏包跳过并打日志，不阻塞列表）。
 ///
 /// 设置页的皮肤列表用这个：一个坏包不该让整张列表打不开。
-pub fn list_theme_packs(packs: &mt_config::ThemePacks) -> Result<Vec<(ThemePackDef, PathBuf)>> {
+pub fn list_theme_packs(packs: &mt_config::ThemePacks) -> Result<Vec<ThemePackListing>> {
     let mut out = Vec::new();
     for entry in packs.list()? {
         match parse_theme_pack(&entry.theme_id, &entry.theme_json) {
-            Ok(def) => out.push((def, entry.dir)),
+            Ok(def) => out.push(ThemePackListing {
+                theme_id: entry.theme_id,
+                def,
+                dir: entry.dir,
+            }),
             Err(e) => eprintln!("[mt-ui] 主题包 {} 无效，已跳过: {e:#}", entry.theme_id),
         }
     }
@@ -1079,6 +1110,47 @@ mod tests {
         // 空串：归一成「没有背景图」，两处判据不能各说各话
         let def = parse_theme_pack("t", &minimal_json(r#", "image": "  ""#)).unwrap();
         assert!(def.image.is_none());
+    }
+
+    /// 回归测试（用户真机 v0.13.x GPUI 版）：目录名与 theme.json 的 `id` 不一致的
+    /// 包，列表项的身份必须是**目录名**，拿它回头 `read` 得读得到。
+    ///
+    /// 此前 `list_theme_packs` 只返回 `(def, dir)`，设置页只好拿 `def.id` 当身份
+    /// 去应用 —— 落到 `packs.read("ember-dusk")` 上找不到 `themes/ember-dusk/`，
+    /// 红条报「皮肤应用失败: ember-dusk」。
+    #[test]
+    fn 列表项的身份是目录名而非_json_里的_id() {
+        let root = std::env::temp_dir().join(format!(
+            "mt-ui-theme-listing-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let packs = mt_config::ThemePacks::at(root.join("themes"));
+        let dir = packs.root().join("ember-new");
+        std::fs::create_dir_all(&dir).unwrap();
+        let json = minimal_json("").replace(r#""id": "t""#, r#""id": "ember-dusk""#);
+        std::fs::write(dir.join("theme.json"), &json).unwrap();
+
+        let listed = list_theme_packs(&packs).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].theme_id, "ember-new", "身份=目录名");
+        assert_eq!(listed[0].def.id, "ember-dusk", "定义里仍是作者写的 id");
+        assert_eq!(listed[0].dir, dir);
+
+        // 拿列表项的身份回头读包 —— 这正是「应用皮肤」那条路的第一步
+        assert!(packs.read(&listed[0].theme_id).is_ok());
+        assert!(
+            packs.read(&listed[0].def.id).is_err(),
+            "按 json 的 id 定位必然落空，别再走这条"
+        );
+
+        // resolve 出来的产物同样带目录名，免得下游又把 def.id 当身份写回配置
+        let applied = resolve_theme_pack(&listed[0].def, Some(&dir));
+        assert_eq!(applied.theme_id, "ember-new");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

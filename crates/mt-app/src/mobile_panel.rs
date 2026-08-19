@@ -38,10 +38,17 @@ use crate::prompt::{Confirm, kind, open_guarded};
 use crate::store::AppStore;
 use crate::ui;
 
-/// 面板宽度(原版 `w-[440px]`)。
+/// 面板宽度(原版 `w-[440px]`)。窄窗口下由
+/// [`ui::clamp_dialog_width`] 压回窗口内。
 const PANEL_W: f32 = 440.0;
-/// 正文最大高度(原版 `max-h-[76vh]`;gpui 没有视口单位,取一个够用的定值)。
+/// 正文最大高度的**舒适上限**。原版是 `max-h-[76vh]`,实际生效值由
+/// [`ui::clamp_dialog_body_height`] 按视口现算(U 批那条「定值 540px」的记档
+/// 到此结清:定值在矮窗口上会把面板顶出视口底边)。
 const BODY_MAX_H: f32 = 540.0;
+/// 正文之外那圈的高度:`Dialog` 默认内边距 24 上 + 24 下、标题行约 19、
+/// 标题与正文之间 `gap` 16(`dialog.rs:373/430-432`)。正文高度按它扣,
+/// 面板整体才落在 76vh 内。
+const CHROME_H: f32 = 83.0;
 
 /// 编辑中的启动器草稿。`id` 为空串 = 新增(与原版 `DraftState` 一致)。
 struct Draft {
@@ -163,11 +170,18 @@ pub fn open(window: &mut Window, cx: &mut App) {
     let status = bridge.read(cx).manager().current_status();
     store.update(cx, |store, cx| store.set_mobile_relay_status(status, cx));
 
-    open_guarded(kind::MOBILE_RELAY, window, cx, move |dialog, _window, cx| {
-        let body = render_body(&state, cx);
+    open_guarded(kind::MOBILE_RELAY, window, cx, move |dialog, window, cx| {
+        // 原版 `w-[440px] max-h-[76vh]`(`MobileRelayModal.tsx:119`)——
+        // 两个尺寸都按视口现算,窄/矮窗口下面板才不会出界
+        let viewport = window.viewport_size();
+        let body = render_body(
+            &state,
+            ui::clamp_dialog_body_height(px(BODY_MAX_H), viewport, 0.76, px(CHROME_H)),
+            cx,
+        );
         dialog
             .title(t("mobileRelay", "modal.title"))
-            .w(px(PANEL_W))
+            .w(ui::clamp_dialog_width(px(PANEL_W), viewport))
             // 面板内有未保存的地址/密钥输入与配对操作,误点外侧关闭会丢内容;
             // Esc 仍可退(原版 `closeOnOverlay={false}`)
             .overlay_closable(false)
@@ -282,7 +296,14 @@ fn read_frame(state: &Entity<MobilePanel>, cx: &App) -> Frame {
     }
 }
 
-fn render_body(state: &Entity<MobilePanel>, cx: &mut App) -> gpui::AnyElement {
+/// `max_body_h` 由调用方按视口现算(见 [`open`] 与
+/// [`ui::clamp_dialog_body_height`]),不是常量 —— 矮窗口下定值会把面板
+/// 顶出视口底边。
+fn render_body(
+    state: &Entity<MobilePanel>,
+    max_body_h: gpui::Pixels,
+    cx: &mut App,
+) -> gpui::AnyElement {
     let frame = read_frame(state, cx);
     let Frame {
         relay_url,
@@ -298,7 +319,7 @@ fn render_body(state: &Entity<MobilePanel>, cx: &mut App) -> gpui::AnyElement {
 
     let mut body = div()
         .id("mobile-relay-body")
-        .max_h(px(BODY_MAX_H))
+        .max_h(max_body_h)
         .overflow_y_scroll()
         .px(px(20.0))
         .py(px(16.0))

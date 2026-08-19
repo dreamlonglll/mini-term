@@ -22,7 +22,14 @@ use sha2::{Digest, Sha256};
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThemePackEntry {
-    /// themes/ 下的目录名，作为主题包 id
+    /// themes/ 下的**目录名**,即主题包 id。
+    ///
+    /// ⚠️ 与 theme.json 里的 `id` 字段**不是一回事**:两者不一致时(用户把目录
+    /// 改了名 / 从别处拷来的包)以目录名为准 —— [`ThemePacks::read`]、
+    /// [`ThemePacks::delete`]、[`ThemePacks::read_asset`] 全按目录名定位,
+    /// 上层拿这个字段当身份就永远对得上。原版口径同此
+    /// (`themePackManager.ts:75-81` 的 `ThemePackMeta.themeId` +
+    /// `parseThemePack` 的「以目录名为准」告警)。
     pub theme_id: String,
     /// theme.json 原文，由上层解析校验
     pub theme_json: String,
@@ -56,7 +63,11 @@ pub struct ThemePacks {
 }
 
 impl ThemePacks {
-    /// 指向 `{app_data_dir}/themes`。
+    /// 指向 `{active_data_dir}/themes` —— 认 `MT_APP_DATA_DIR`
+    /// (见 [`crate::paths::active_data_dir`])。
+    ///
+    /// 此前 [`crate::paths::themes_dir`] 钉死在装机版目录上,dev 实例只能
+    /// 自己拼路径走 [`Self::at`] 绕开;现在两条路重合,宿主直接用这个入口。
     pub fn open() -> Result<Self> {
         Ok(Self::at(crate::paths::themes_dir()?))
     }
@@ -82,6 +93,9 @@ impl ThemePacks {
     }
 
     /// 列举全部主题包（按 id 排序）。
+    ///
+    /// id = **目录名**(见 [`ThemePackEntry::theme_id`]);theme.json 的语义解析
+    /// 归上层,本层连它的 `id` 字段都不看。
     pub fn list(&self) -> Result<Vec<ThemePackEntry>> {
         let dir = self.ensure_root()?;
         let mut out = Vec::new();
@@ -110,7 +124,8 @@ impl ThemePacks {
         Ok(out)
     }
 
-    /// 读一个主题包的 theme.json / theme.css 原文。
+    /// 读一个主题包的 theme.json / theme.css 原文。`theme_id` 是**目录名**
+    /// (`themes/<theme_id>/`),不是 theme.json 里的 `id` 字段。
     pub fn read(&self, theme_id: &str) -> Result<ThemePackData> {
         validate_theme_id(theme_id)?;
         let dir = self.ensure_root()?.join(theme_id);
@@ -497,6 +512,37 @@ mod tests {
         assert!(!themes.join("dracula").join("theme.css").exists());
         assert!(!themes.join(".tmp-install-dracula").exists());
         assert!(!themes.join(".tmp-old-dracula").exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 回归测试(用户真机 v0.13.x GPUI 版):目录名与 theme.json 的 `id` 不一致的
+    /// 包(`themes/ember-new/` 里写着 `"id": "ember-dusk"`)必须**按目录名**被列出
+    /// 与读取 —— 上层若拿 json 的 `id` 去 `read`,就是「列表看得见、一点应用就报
+    /// 皮肤应用失败」那个 bug。
+    #[test]
+    fn 目录名与_json_里的_id_不一致时以目录名为准() {
+        let root = unique_test_root("id-mismatch");
+        let packs = ThemePacks::at(root.join("themes"));
+        write_pack(
+            &packs.root().join("ember-new"),
+            r#"{"id":"ember-dusk","name":"Ember Dusk"}"#,
+        );
+
+        let listed = packs.list().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].theme_id, "ember-new", "身份是目录名");
+        assert!(listed[0].theme_json.contains("ember-dusk"), "原文原样带出");
+
+        // 目录名读得到,json 的 id 读不到(没有这个目录)
+        assert!(packs.read("ember-new").is_ok());
+        assert!(packs.read("ember-dusk").is_err());
+        // 资源读取与删除同一把尺子
+        fs::write(packs.root().join("ember-new").join("background.png"), b"x").unwrap();
+        assert_eq!(packs.read_asset("ember-new", "background.png").unwrap(), b"x");
+        assert!(packs.read_asset("ember-dusk", "background.png").is_err());
+        assert!(packs.delete("ember-dusk").is_err());
+        assert!(packs.delete("ember-new").is_ok());
 
         let _ = fs::remove_dir_all(&root);
     }

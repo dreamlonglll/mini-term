@@ -20,6 +20,7 @@
 //! (那是 `app_local_data_dir`,与本模块无关)。sidecar 侧的
 //! `mt-core::config_reader::config_json_path` 也是按 `%APPDATA%` 分支自己拼的同一条路径。
 
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -32,6 +33,14 @@ pub const APP_IDENTIFIER: &str = "com.mini-term.app";
 /// `com.mini-term.app`。首次启动时一次性把旧目录下的 config.json 拷到新目录,
 /// 旧文件保留不删,作为回退兜底。
 pub const LEGACY_IDENTIFIER: &str = "com.tauri-app.tauri-app";
+
+/// **开发隔离逃生门**:设了它,用户数据目录整个换到这个路径。
+///
+/// 装机版正在跑的时候直接 `cargo run` 会与它共用同一个目录 —— 配置被两边轮流
+/// 改写、皮肤目录也是同一份。设了这个环境变量就整个隔离出去,与 Tauri 那边
+/// 靠 `--config` 覆盖 identifier 是同一招。`mt-app::app_data_dir` 与
+/// [`active_data_dir`] 是同一口径的两个入口(前者是后者的不返错版本)。
+pub const DATA_DIR_ENV: &str = "MT_APP_DATA_DIR";
 
 /// 用户数据根目录(identifier 的上一级)。
 pub fn data_root() -> Result<PathBuf> {
@@ -56,9 +65,33 @@ pub fn config_path() -> Result<PathBuf> {
     Ok(ensure_app_data_dir()?.join("config.json"))
 }
 
-/// `{app_data_dir}/themes`。
+/// `MT_APP_DATA_DIR` 的取值 → 覆盖目录。空串按「没设」处理
+/// (`MT_APP_DATA_DIR=` 这种写法在 shell 里等同于取消设置,不该把数据目录
+/// 指到当前工作目录上)。纯函数,便于单测 —— 直接 `set_var` 会污染同进程里
+/// 并行跑的其它测试。
+fn data_dir_override(raw: Option<&OsStr>) -> Option<PathBuf> {
+    raw.filter(|v| !v.is_empty()).map(PathBuf::from)
+}
+
+/// **生效中**的用户数据目录:`MT_APP_DATA_DIR` 优先,否则 [`app_data_dir`]。
+///
+/// config.json 与 themes/ 都按这条口径落盘 —— dev 实例开着隔离目录时,
+/// 皮肤列表理应看见隔离目录里的包(此前 [`themes_dir`] 钉死在装机版目录上,
+/// mt-app 只能自己拼路径绕开)。
+///
+/// ⚠️ **hook 端口文件刻意不走这条**:`hook-server.json` 由 sidecar 侧按装机版
+/// 路径去找(`mt-core::config_reader`),跟着换会让 dev 实例收不到任何 hook 事件。
+/// 那一路仍旧调 [`app_data_dir`]。
+pub fn active_data_dir() -> Result<PathBuf> {
+    match data_dir_override(std::env::var_os(DATA_DIR_ENV).as_deref()) {
+        Some(dir) => Ok(dir),
+        None => app_data_dir(),
+    }
+}
+
+/// `{active_data_dir}/themes`。
 pub fn themes_dir() -> Result<PathBuf> {
-    Ok(app_data_dir()?.join("themes"))
+    Ok(active_data_dir()?.join("themes"))
 }
 
 /// 在应用启动早期调用,保证所有配置读取之前完成 identifier 迁移。
@@ -170,6 +203,32 @@ mod tests {
         assert!(!new_dir.join("config.json").exists());
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    /// `MT_APP_DATA_DIR` 的解析口径:非空即覆盖,空串按「没设」。
+    ///
+    /// 直接 `set_var` 会污染同进程里并行跑的其它测试(且 2024 edition 起是
+    /// `unsafe`),所以钉的是纯函数那一层。
+    #[test]
+    fn 数据目录覆盖只认非空取值() {
+        assert_eq!(
+            data_dir_override(Some(OsStr::new(r"D:\dev\mini-term-gpui-dev"))),
+            Some(PathBuf::from(r"D:\dev\mini-term-gpui-dev"))
+        );
+        assert_eq!(data_dir_override(Some(OsStr::new(""))), None, "空串=没设");
+        assert_eq!(data_dir_override(None), None);
+    }
+
+    /// 皮肤目录挂在**生效中**的数据目录下 —— dev 实例设了 `MT_APP_DATA_DIR`
+    /// 就该看见隔离目录里的皮肤包(此前钉死在装机版目录上,
+    /// mt-app 只好自己拼路径绕开 `ThemePacks::open()`)。
+    #[test]
+    fn 皮肤目录跟随生效数据目录() {
+        assert_eq!(themes_dir().unwrap(), active_data_dir().unwrap().join("themes"));
+        // 没设环境变量时两条口径重合(CI 与开发机的常态)
+        if std::env::var_os(DATA_DIR_ENV).is_none() {
+            assert_eq!(active_data_dir().unwrap(), app_data_dir().unwrap());
+        }
     }
 
     /// 去 Tauri 化后路径必须与 `AppHandle::path().app_data_dir()` 逐段一致:
