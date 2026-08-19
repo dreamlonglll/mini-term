@@ -22,9 +22,10 @@
 use std::cell::RefCell;
 
 use gpui::{
-    Div, ElementId, Hsla, InteractiveElement, IntoElement, ParentElement, Stateful, Styled, div,
-    px,
+    Animation, AnimationExt as _, Div, ElementId, Hsla, InteractiveElement, IntoElement,
+    ParentElement, Pixels, Stateful, Styled, div, px,
 };
+use mt_ui::icons::vector::{Geom, Ink, Shape, VectorIcon};
 use mt_ui::icons::{StatusDot, StatusKind};
 use mt_ui::rgb8;
 use mt_ui::theme_bridge::{AppliedThemePack, ThemeSlot};
@@ -46,6 +47,7 @@ pub struct Palette {
     pub accent_subtle: Hsla,
     pub border_subtle: Hsla,
     pub border_default: Hsla,
+    pub border_strong: Hsla,
     pub color_success: Hsla,
     pub color_error: Hsla,
     pub color_warning: Hsla,
@@ -53,6 +55,9 @@ pub struct Palette {
     pub color_folder: Hsla,
     pub color_file: Hsla,
     pub color_info: Hsla,
+    /// `--color-ai`。排行条渐变的右端。主题包**不映射**它
+    /// （`themePackManager.ts::buildTokenMap` 没有这一条），恒用内置值。
+    pub color_ai: Hsla,
 }
 
 /// 乘性改 alpha(与前端 `withAlpha` / `scaleAlpha` 同语义)。
@@ -88,6 +93,10 @@ impl Palette {
                 a: 0.08,
                 ..rgb8(0xff, 0xff, 0xff)
             },
+            border_strong: Hsla {
+                a: 0.12,
+                ..rgb8(0xff, 0xff, 0xff)
+            },
             color_success: rgb8(0x6b, 0xb8, 0x7a),
             color_error: rgb8(0xd4, 0x60, 0x5a),
             color_warning: rgb8(0xd4, 0xa8, 0x4a),
@@ -95,6 +104,7 @@ impl Palette {
             color_folder: rgb8(0xd4, 0xc8, 0xa0),
             color_file: rgb8(0x7d, 0xcf, 0xb8),
             color_info: rgb8(0x6a, 0x9f, 0xd4),
+            color_ai: rgb8(0xb0, 0x8c, 0xd4),
         }
     }
 
@@ -122,6 +132,10 @@ impl Palette {
                 a: 0.10,
                 ..rgb8(0x00, 0x00, 0x00)
             },
+            border_strong: Hsla {
+                a: 0.15,
+                ..rgb8(0x00, 0x00, 0x00)
+            },
             color_success: rgb8(0x2d, 0x8a, 0x46),
             color_error: rgb8(0xc0, 0x39, 0x2b),
             color_warning: rgb8(0xb0, 0x86, 0x20),
@@ -129,6 +143,7 @@ impl Palette {
             color_folder: rgb8(0x8a, 0x7a, 0x40),
             color_file: rgb8(0x1a, 0x8a, 0x6a),
             color_info: rgb8(0x28, 0x60, 0xa0),
+            color_ai: rgb8(0x8a, 0x5c, 0xb8),
         }
     }
 
@@ -175,6 +190,8 @@ impl Palette {
             accent_subtle: alpha(accent, 0.18),
             border_subtle: alpha(line, 0.6),
             border_default: line,
+            // `--border-strong: scaleAlpha(c.line, 1.4)`（buildTokenMap 那一行）
+            border_strong: alpha(line, 1.4),
             // `color(Highlight/Secondary)` 在包里没声明时会回落 accent(那是
             // themePackManager 写 CSS 变量的口径),而壳这两格的语义是「成功/信息」,
             // 回落 accent 会让完成态变成强调色 —— 所以先看 Option 在不在
@@ -271,6 +288,10 @@ pub fn border_subtle() -> Hsla {
 pub fn border_default() -> Hsla {
     token(|p| p.border_default)
 }
+/// `--border-strong`(Token 副行的分隔符、浮层描边)
+pub fn border_strong() -> Hsla {
+    token(|p| p.border_strong)
+}
 
 // --- 语义色 ---
 /// `--color-success`
@@ -309,6 +330,11 @@ pub fn color_file() -> Hsla {
 /// `--color-info`(统计面板的区块标题竖条等)
 pub fn color_info() -> Hsla {
     token(|p| p.color_info)
+}
+
+/// `--color-ai`(排行条渐变的右端)
+pub fn color_ai() -> Hsla {
+    token(|p| p.color_ai)
 }
 
 // --- 复用小件 ---
@@ -395,6 +421,39 @@ pub fn section_title(text: impl Into<String>) -> Div {
                 .text_size(px(12.0))
                 .text_color(text_primary())
                 .child(text.into()),
+        )
+}
+
+/// 缺一段的圆环 —— 原版 `border ... border-t-transparent rounded-full` 那个
+/// spinner 的几何(270° 弧,起点在 12 点、顺时针)。
+const SPINNER_ARC: &[Shape] = &[Shape::line(
+    Ink::Current,
+    // `border`(1px)÷ 12px 直径 ≈ 0.083
+    0.083,
+    Geom::Arc {
+        c: (0.5, 0.5),
+        // 描边居中:半径留出半个线宽,否则弧会被裁掉外缘
+        r: 0.458,
+        from: -90.0,
+        sweep: 270.0,
+    },
+)];
+
+/// 加载中的转圈。**自绘** —— gpui-component 的 `Spinner` 默认图标是
+/// `IconName::Loader`,而 0.5.1 不带 svg 资产,转的是个空框(见 `menu` 模块注释)。
+///
+/// 周期 1s 匀速(Tailwind `animate-spin` 的默认值)。
+///
+/// ⚠️ `with_animation` **持续请求帧**:加载态结束时必须让整个元素
+/// **从树上消失**,不能留着靠 `opacity(0)` 藏起来。
+pub fn spinner(id: impl Into<ElementId>, size: Pixels, color: Hsla) -> impl IntoElement {
+    VectorIcon::new(SPINNER_ARC, size)
+        .ink(color)
+        .with_animation(
+            id.into(),
+            Animation::new(std::time::Duration::from_secs(1)).repeat(),
+            // delta 就是 0..1 的一圈,`VectorIcon::rotation` 的单位也是「圈」
+            |icon, delta| icon.rotation(delta),
         )
 }
 

@@ -48,10 +48,12 @@ mod overlay;
 mod pane;
 mod pane_actions;
 mod persist;
+mod pricing;
 mod project_list;
 mod project_switcher;
 mod prompt;
 mod search_modal;
+mod session_branch;
 mod session_panel;
 mod shell_ops;
 mod store;
@@ -189,6 +191,17 @@ pub fn app_data_dir() -> PathBuf {
     mt_config::app_data_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
+/// 右抽屉左缘拖拽的一次会话。
+#[derive(Clone, Copy)]
+struct DrawerDrag {
+    /// 按下时的鼠标 x(窗口坐标)。
+    start_x: gpui::Pixels,
+    /// 按下时的宽度。
+    start_width: f64,
+    /// 当前宽度(已钳到 240..720)。
+    width: f64,
+}
+
 struct Workspace {
     store: Entity<AppStore>,
     /// 右键菜单浮层。状态住在全局(任何视图都能 `menu::show`),这里只是把它
@@ -204,6 +217,8 @@ struct Workspace {
     middle_state: Entity<ResizableState>,
     /// 右侧 AI 历史抽屉是否展开(运行时态,不持久化 —— 与旧版一致)。
     sessions_open: bool,
+    /// 抽屉左缘正在被拖。`Some` 期间宽度由本结构自持,松手才落盘。
+    drawer_drag: Option<DrawerDrag>,
     usage_open: bool,
     _ai_pump: Task<()>,
     _activation: Subscription,
@@ -281,6 +296,7 @@ impl Workspace {
             columns_state,
             middle_state,
             sessions_open: false,
+            drawer_drag: None,
             usage_open: false,
             _ai_pump: ai_pump,
             _activation: activation,
@@ -504,15 +520,21 @@ impl Workspace {
         if yields_to_overlay(window, cx) {
             return;
         }
-        self.toggle_usage(cx);
+        self.toggle_usage(window, cx);
     }
 
-    fn toggle_usage(&mut self, cx: &mut Context<Self>) {
+    /// 开合用量面板。可见性要透给面板 —— 它常驻不销毁,自动刷新定时器只能靠
+    /// 这个开关闸住(不然关掉之后还在每 5s 扫会话文件)。
+    fn toggle_usage(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.usage_open = !self.usage_open;
         if self.usage_open && self.usage_panel.is_none() {
             let store = self.store.clone();
             let dir = app_data_dir();
-            self.usage_panel = Some(cx.new(|cx| UsagePanel::new(store, dir, cx)));
+            self.usage_panel = Some(cx.new(|cx| UsagePanel::new(store, dir, window, cx)));
+        }
+        let open = self.usage_open;
+        if let Some(panel) = self.usage_panel.as_ref() {
+            panel.update(cx, |panel, cx| panel.set_visible(open, cx));
         }
         cx.notify();
     }
@@ -638,7 +660,8 @@ impl Render for Workspace {
 
         let store_for_columns = self.store.clone();
         let store_for_middle = self.store.clone();
-        let sessions_open = self.sessions_open;
+        // 拖拽期间宽度自持,松手才落盘(与原版 `RightDrawer` 的 `onResizeEnd` 同)
+        let drawer_width = self.drawer_drag.map(|d| d.width).unwrap_or(drawer_width);
 
         let middle_group = h_resizable("middle-column")
             .with_state(&self.middle_state)
@@ -669,15 +692,6 @@ impl Render for Workspace {
                     .child(middle_group),
             )
             .child(resizable_panel().child(self.terminal_area.clone()))
-            // 右侧 AI 历史:与旧版的「悬浮抽屉」不同,这里是第三栏 —— 分隔条拖拽
-            // 与宽度持久化跟着 resizable 白拿,不必自己写一套拖拽
-            .child(
-                resizable_panel()
-                    .visible(self.sessions_open)
-                    .size(px(drawer_width as f32))
-                    .size_range(px(240.0)..px(720.0))
-                    .child(self.session_panel.clone()),
-            )
             .on_resize(move |state, _window, cx| {
                 let sizes: Vec<f64> = state.read(cx).sizes().iter().map(|p| f32::from(*p) as f64).collect();
                 store_for_columns.update(cx, |store, cx| {
@@ -685,7 +699,7 @@ impl Render for Workspace {
                     // `ResizableState` 按 children 个数占位,不可见的面板既不
                     // 渲染也不上报自己的尺寸,`sizes[i]` 停在建组时的最小值上。
                     // 照抄回去的话「收起中间栏后拖一下右边的分隔条」就把中间栏
-                    // 宽度和抽屉宽度双双抹成最小值,再展开时只剩一条缝。
+                    // 宽度抹成最小值,再展开时只剩一条缝。
                     let mut columns = store
                         .config()
                         .layout_sizes
@@ -700,9 +714,6 @@ impl Render for Workspace {
                     }
                     // layoutSizes 恒为两项 —— 磁盘格式与装机版共用,不许长出第三项
                     store.set_layout_sizes(columns, cx);
-                    if sessions_open && let Some(w) = sizes.get(2) {
-                        store.set_right_drawer_width(*w, cx);
-                    }
                 });
             });
 
@@ -773,7 +784,7 @@ impl Render for Workspace {
                     t("app", "activityBar.stats"),
                     self.usage_open,
                 )
-                .on_click(cx.listener(|this, _event, _window, cx| this.toggle_usage(cx))),
+                .on_click(cx.listener(|this, _event, window, cx| this.toggle_usage(window, cx))),
             )
             .child(
                 activity_bar::strip_button(
@@ -816,6 +827,60 @@ impl Render for Workspace {
                 )
             });
 
+        // 右侧 AI 历史抽屉:**absolute 悬浮层**,贴右边缘盖在终端之上。
+        //
+        // 原版就是这个形态(`RightDrawer.tsx:67`:`absolute top-0 right-0 h-full
+        // z-[45]`),GPUI 侧此前借 resizable 的第三栏实现,代价是**开合会改终端
+        // 宽度、连带触发一次 PTY resize**(刷屏进程正在跑时肉眼可见地重排)。
+        // 改成悬浮层之后终端尺寸不动,PTY 也就不再收到 SIGWINCH。
+        //
+        // 层级对照:原版 `z-45` 压过 allotment 分隔条(35)、低于弹窗(50)——
+        // 这里 `.children(...)` 的顺序等价:抽屉排在三栏之后、弹窗/菜单层之前。
+        // 抽屉**不进 [`overlay`] 栈**(原版 `RightDrawer` 同样没压栈),
+        // 所以它开着时全局快捷键照常生效。
+        let drawer_layer = self.sessions_open.then(|| {
+            div()
+                .absolute()
+                .top_0()
+                .right_0()
+                .h_full()
+                .w(px(drawer_width as f32))
+                .occlude()
+                .flex()
+                .flex_col()
+                .bg(ui::bg_overlay())
+                // `--shadow-overlay`(`RightDrawer.tsx:67`);gpui 侧用同一档
+                // 阴影,与 `menu.rs` 的浮层一致
+                .shadow_lg()
+                .child(self.session_panel.clone())
+                // 左缘拖拽手柄:抽屉贴右边缘,把左缘往左拖 = 变宽,
+                // 所以位移取 `start_x - 当前 x`(照抄 `RightDrawer.tsx:48`)
+                .child(
+                    div()
+                        .id("drawer-resize-handle")
+                        .absolute()
+                        // 原版用 `-translate-x-1/2` 骑在边缘上;gpui 侧整条留在
+                        // 抽屉内(压着左边框那 6px),免得被父级裁掉
+                        .left_0()
+                        .top_0()
+                        .h_full()
+                        .w(px(6.0))
+                        .cursor_col_resize()
+                        .hover(|el| el.bg(ui::with_alpha(ui::accent(), 0.4)))
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(move |this: &mut Self, event: &gpui::MouseDownEvent, _window, cx| {
+                                cx.stop_propagation();
+                                this.drawer_drag = Some(DrawerDrag {
+                                    start_x: event.position.x,
+                                    start_width: drawer_width,
+                                    width: drawer_width,
+                                });
+                            }),
+                        ),
+                )
+        });
+
         let usage_layer = self.usage_panel.clone().filter(|_| self.usage_open).map(|panel| {
             div()
                 .absolute()
@@ -851,9 +916,12 @@ impl Render for Workspace {
                                 .text_color(ui::text_muted())
                                 .cursor_pointer()
                                 .hover(|el| el.text_color(ui::color_error()))
-                                .on_click(cx.listener(|this, _event, _window, cx| {
-                                    this.usage_open = false;
-                                    cx.notify();
+                                // 走 toggle 而不是直接改标志位 —— 可见性要透给
+                                // 面板,否则关掉之后自动刷新定时器还在每 5s 跑
+                                .on_click(cx.listener(|this, _event, window, cx| {
+                                    if this.usage_open {
+                                        this.toggle_usage(window, cx);
+                                    }
                                 }))
                                 .child("×"),
                         ),
@@ -903,8 +971,31 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_terminal_search))
             .on_action(cx.listener(Self::on_global_search))
             .on_action(cx.listener(Self::on_switch_project))
+            // 拖拽期间鼠标可能划出手柄(甚至划过终端),所以移动/松手挂在**根**上
+            // —— 等价于原版往 document 上挂 mousemove/mouseup
+            .when(self.drawer_drag.is_some(), |el| {
+                el.on_mouse_move(cx.listener(|this: &mut Self, event: &gpui::MouseMoveEvent, _window, cx| {
+                    if let Some(drag) = this.drawer_drag.as_mut() {
+                        let delta = f32::from(drag.start_x - event.position.x) as f64;
+                        drag.width = (drag.start_width + delta).clamp(240.0, 720.0);
+                        cx.notify();
+                    }
+                }))
+                .on_mouse_up(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this: &mut Self, _event: &gpui::MouseUpEvent, _window, cx| {
+                        let Some(drag) = this.drawer_drag.take() else {
+                            return;
+                        };
+                        this.store
+                            .update(cx, |store, cx| store.set_right_drawer_width(drag.width, cx));
+                        cx.notify();
+                    }),
+                )
+            })
             .child(toggle_strip)
             .child(div().flex_1().h_full().child(columns_group))
+            .children(drawer_layer)
             .children(usage_layer)
             // Modal 与通知层由 Root 持有,但要由应用视图**画出来**
             .children(Root::render_dialog_layer(window, cx))

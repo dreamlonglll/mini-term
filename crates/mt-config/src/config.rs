@@ -198,6 +198,33 @@ pub struct AppConfig {
     /// 缺字段会被保存路径的强类型反序列化静默丢弃，default 必须齐。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub session_lineage: Vec<SavedLineageEdge>,
+    // === 用量面板偏好 ===
+    //
+    // 旧版存 localStorage 六个键（`UsageStatsModal.tsx:15-20`）；GPUI 壳里没有
+    // localStorage，配置文件是唯一的持久层（与 `locale` 同一条理由）。
+    //
+    // **全部 Option/宽松类型**:手改坏值不许拖垮整份 config 连带丢掉项目列表。
+    // 读取端一律过白名单/正则，认不出就回默认（**不写回、不报错**，与旧版
+    // `loadPref` 同）。`skip_serializing_if` 保旧格式互读。
+    /// `"all" | "claude" | "codex" | "grok"`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_scope: Option<String>,
+    /// `"today" | "days7" | "days30" | "month" | "months3" | "months6" | "custom"`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_range: Option<String>,
+    /// 单项目 scope 的**原始路径**;None = 整机。项目被移除时渲染期回落整机，
+    /// 不在读盘时一次性判定（面板开着时项目也可能被删）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_project: Option<String>,
+    /// 自动刷新间隔(秒);0 = 关。合法档位 0/5/10/30/60。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_auto_refresh: Option<u32>,
+    /// custom range 起始日 `"YYYY-MM-DD"`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_custom_from: Option<String>,
+    /// custom range 截止日 `"YYYY-MM-DD"`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_custom_to: Option<String>,
 }
 
 /// 自记账的会话分支边（与 `mt-ai` 侧 `LineageEdge` 同构，独立定义避免
@@ -499,6 +526,12 @@ impl Default for AppConfig {
             custom_theme_id: None,
             session_list_view: None,
             session_lineage: vec![],
+            usage_scope: None,
+            usage_range: None,
+            usage_project: None,
+            usage_auto_refresh: None,
+            usage_custom_from: None,
+            usage_custom_to: None,
         }
     }
 }
@@ -1013,6 +1046,72 @@ mod tests {
         let config: AppConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.projects.len(), 1, "项目列表不受连累");
         assert_eq!(config.locale.as_deref(), Some("fr"));
+    }
+
+    /// 用量面板六个偏好键是纯增量字段:旧 config.json 读得进来、没设过不写盘、
+    /// 设过之后原样往返(与 `locale_是纯增量字段` 同一条口径)。
+    #[test]
+    fn 用量偏好是纯增量字段() {
+        let legacy = r#"{
+            "projects": [],
+            "defaultShell": "cmd",
+            "availableShells": [],
+            "uiFontSize": 13,
+            "terminalFontSize": 14
+        }"#;
+        let config: AppConfig = serde_json::from_str(legacy).unwrap();
+        assert!(config.usage_scope.is_none());
+        assert!(config.usage_range.is_none());
+        assert!(config.usage_project.is_none());
+        assert!(config.usage_auto_refresh.is_none());
+        assert!(config.usage_custom_from.is_none());
+        assert!(config.usage_custom_to.is_none());
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(!json.contains("usage"), "没设过就不该往磁盘上写这些键: {json}");
+
+        let with_prefs = r#"{
+            "projects": [],
+            "defaultShell": "cmd",
+            "availableShells": [],
+            "uiFontSize": 13,
+            "terminalFontSize": 14,
+            "usageScope": "codex",
+            "usageRange": "custom",
+            "usageProject": "D:\\Git\\x",
+            "usageAutoRefresh": 30,
+            "usageCustomFrom": "2026-01-01",
+            "usageCustomTo": "2026-02-01"
+        }"#;
+        let config: AppConfig = serde_json::from_str(with_prefs).unwrap();
+        let reparsed: AppConfig =
+            serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        assert_eq!(reparsed.usage_scope.as_deref(), Some("codex"));
+        assert_eq!(reparsed.usage_range.as_deref(), Some("custom"));
+        assert_eq!(reparsed.usage_project.as_deref(), Some("D:\\Git\\x"));
+        assert_eq!(reparsed.usage_auto_refresh, Some(30));
+        assert_eq!(reparsed.usage_custom_from.as_deref(), Some("2026-01-01"));
+        assert_eq!(reparsed.usage_custom_to.as_deref(), Some("2026-02-01"));
+    }
+
+    /// 用量偏好被手改成坏值时**不许**拖垮整份配置 —— 合法性交给使用点的白名单。
+    #[test]
+    fn 用量偏好取值非法不拖垮整份配置() {
+        let json = r#"{
+            "projects": [{"id": "1", "name": "test", "path": "/tmp"}],
+            "defaultShell": "cmd",
+            "availableShells": [],
+            "uiFontSize": 13,
+            "terminalFontSize": 14,
+            "usageScope": "gemini",
+            "usageRange": "all",
+            "usageAutoRefresh": 7,
+            "usageCustomFrom": "昨天"
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.projects.len(), 1, "项目列表不受连累");
+        assert_eq!(config.usage_scope.as_deref(), Some("gemini"));
+        assert_eq!(config.usage_range.as_deref(), Some("all"));
+        assert_eq!(config.usage_auto_refresh, Some(7));
     }
 
     #[test]

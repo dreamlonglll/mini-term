@@ -44,8 +44,8 @@
 | 14 | 文件树补全 | 中 | mt-app | 🟡 N 批落地右键菜单（文件 8 项/目录 9 项/根空白新建两项，文件操作走 background executor，新建自动展开父目录；reveal 自落 explorer /select）；剩：头部三按钮（搜索/刷新/外部编辑器选择器）+ loading/错误态 + 键盘导航 + git 状态着色 + 根级单链目录压缩 + 技术栈图标 |
 | 15 | tab 栏补全 | 中 | mt-app | 🟡 N 批落地右键菜单（重命名/两向分屏/关闭两项含 danger 与快捷键标签）与关闭确认（#10）；M 批已加 AI 品牌图标；剩：新建按钮 shell 选择菜单 + 横向滚动 + hover 缩略图 + 分支会话两项（随 fork 批） |
 | 16 | 终端右键菜单 | 中 | mt-app + mt-ui | 🟡 停留复制+气泡 ✅（K+M）；N 批落地复制（无选区置灰）/粘贴（还焦点），与鼠标上报共存走 prefers_local_handling 同源判定（三模式×修饰键有单测）；剩 fork 会话/分支树/SSH 子菜单（随对应功能批） |
-| 17 | 用量面板：custom 自选起止日期 + 自动刷新档位（0/5/10/30/60s 默认 5s）+ 单项目下拉（现仅当前项目开关）+ 排行条点击切 scope + Top 会话点开查看 + 骨架屏/数字滚动 + 偏好持久化 + **价格表拉取**（原版 fetch models.dev，Rust 侧需 HTTP 依赖，现读本地 model-pricing.json 缺省按 $0） | 中 | mt-app | ❌ |
-| 18 | 会话面板：平铺⇄树视图切换 + scan_session_lineage 分支连线 + live pane 状态点跳转 + 品牌图标 + spinner；（SSH 远程来源等 mt-ssh 进 crates 后再说） | 中 | mt-app | ❌ |
+| 17 | 用量面板：custom 自选起止日期 + 自动刷新档位（0/5/10/30/60s 默认 5s）+ 单项目下拉（现仅当前项目开关）+ 排行条点击切 scope + Top 会话点开查看 + 骨架屏/数字滚动 + 偏好持久化 + **价格表拉取**（原版 fetch models.dev，Rust 侧需 HTTP 依赖，现读本地 model-pricing.json 缺省按 $0） | 中 | mt-app | ✅ Q 批。pricing.rs 走「手工裸表→新鲜缓存→拉网(zed-reqwest blocking，净新增 crate=0)→过期缓存→报错」，canonical 建键+全序比较器+0/0 占位丢弃；定时器挂 set_visible 闸；六相位纯函数分派、价格未就绪不渲染 KPI；custom 日期用 Input+纯函数闸门（无日历弹层，原版是浏览器原生 date input）。留：趋势图面积曲线/网格/双轴刻度（需自绘 path chart 件）、.usage-fade-in 与排行条宽度补间（等一次性过渡基件，勿用 with_animation） |
+| 18 | 会话面板：平铺⇄树视图切换 + scan_session_lineage 分支连线 + live pane 状态点跳转 + 品牌图标 + spinner；（SSH 远程来源等 mt-ssh 进 crates 后再说） | 中 | mt-app | 🟡 Q 批完成本体（树视图/lineage 连线走 session_branch.rs 纯函数、挂 visible/stale 惰性闸+request_id 守卫、live 三条件 find_live_session_pane、跳转带 claude cwd 反查并回写 ai_session、四项右键菜单收编行内按钮、WSL spinner 自绘）。剩：SSH 远程来源（等 mt-ssh）、BranchFamilyPanel→fork 批（pane 右键 submenuRender 挂载，只画单支家族，且 menu.rs 需先扩自定义元素子菜单能力）、remoteResumeUnsupported 的 alert→toast 回换（TODO(toast) 在位） |
 | 19 | 设置面板剩余 9 分页：clipboard / appearance / font / ai-notification / ai-hook / system / editor / shortcuts / about（通知三开关现只能手改 config.json）+ 连字/scrollback/UI 字号字族/终端字号热更新（现只作用于新终端） | 大 | mt-app | ❌ |
 
 ### 第 3 层：整块新功能
@@ -67,7 +67,7 @@
 ### 其他细项（散落，随所在批次带走）
 
 - ActivityBar：🟡 M 批已成 44px 图标栏（PANEL/SESSIONS/STATS/SETTINGS 四钮逐点照抄原版 SVG + accent 竖条 + 全局 AI 徽标 + 跳完成钮）；SSH/移动端/Git 入口与更新红点随对应功能批加，徽标闪烁动画未做
-- 右抽屉应为**悬浮层**（absolute 覆盖在终端上），现做成了第三栏
+- ~~右抽屉应为悬浮层~~ ✅ Q 批：absolute right-0 + occlude + shadow，画在三栏后弹窗前（对应原版 z-45）；自建 6px 左缘拖拽手柄（移动/松手挂根容器，松手才落宽度）；开合不再触发 PTY resize；对照源码确认原版 RightDrawer 不压 overlayStack，GPUI 同步不进 overlay 栈。注：用量面板按源码实况保持居中 Modal（原版 UsageStatsModal 本就不在抽屉里，审计此前括注有误）；抽屉标题栏 chrome（sessions|git 分段+✕）留 V 批
 - Toast：缺悬停暂停 / × 关闭 / 最多 5 条 / wsl-info、mobile-session、paste-error 三种 kind / 点击跳项目细节
 - ~~Modal 行为：无 overlayStack 快捷键让路；同一 modal 可叠开（缺 isOpen 守卫）~~ ✅ N 批（防叠开）+ P 批（让路）：`overlay.rs` 是唯一的覆盖物栈，弹窗/右键菜单/终端查找条全部登记；全局 action 处理器开头两道闸——① `has_focused_input`（等价原版 `isTypingTarget`，终端不是 Input 所以在终端里敲字不受影响）② 覆盖物压着让路，白名单只有 openSettings / globalSearch。**Esc 只关最上层在 GPUI 里是结构性免费的**（按键沿焦点链派发），原版那套栈顶判定不必复刻
 - store 缺失 action：renameProject / setProjectDescription / renamePaneById / exitedPtyIds 系列 / markers 系列 / dirKinds / pendingFork 系列 / collectAiProjects / addProject 的 parentProjectId

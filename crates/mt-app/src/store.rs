@@ -61,6 +61,20 @@ impl ProjectState {
 struct GlobalStore(Entity<AppStore>);
 impl Global for GlobalStore {}
 
+/// 用量面板的六个偏好(对应旧版那六个 localStorage 键)。
+///
+/// 一把传是为了只触发一次 500ms 去抖写盘 —— 连点分段控件不该连写六次。
+/// 取值合法性由面板侧的白名单/正则保证,store 只负责搬运。
+pub struct UsagePrefs {
+    pub scope: String,
+    pub range: String,
+    /// 项目**原始路径**;`None` = 整机。
+    pub project: Option<String>,
+    pub auto_refresh: u32,
+    pub custom_from: String,
+    pub custom_to: String,
+}
+
 /// 一次 AI 事件算出来的提醒动作 + 播报所需的上下文。
 ///
 /// 提示音与任务栏闪烁要碰 `Window`(拿 HWND),而 AI 事件是从后台 channel 泵进来的
@@ -377,9 +391,28 @@ impl AppStore {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<String> {
+        self.new_terminal_with_cwd(project_id, shell, anchor_pane_id, None, window, cx)
+    }
+
+    /// 新建终端并指定启动目录。
+    ///
+    /// 单独一个入口是因为 `claude --resume` 只认「启动目录」对应的会话桶 ——
+    /// 子目录里起的会话在项目根恢复会报 `No conversation found`
+    /// (对应 `src/utils/sessionJump.ts:90-99`)。除此之外与 [`new_terminal`] 同。
+    ///
+    /// [`new_terminal`]: Self::new_terminal
+    pub fn new_terminal_with_cwd(
+        &mut self,
+        project_id: &str,
+        shell: Option<ShellConfig>,
+        anchor_pane_id: Option<String>,
+        cwd: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
         let project = self.project(project_id)?.clone();
         let shell = shell.or_else(|| self.resolve_shell(None))?;
-        let pane = self.spawn_pane(&project, &shell, None, window, cx)?;
+        let pane = self.spawn_pane(&project, &shell, cwd, window, cx)?;
         let pane_id = pane.id.clone();
 
         let anchor = anchor_pane_id.or_else(|| self.focused_pane_id.clone());
@@ -1132,6 +1165,98 @@ impl AppStore {
             })
             .collect();
         crate::notify::pick_attention_target(refs, self.done.order())
+    }
+
+    /// 按 `session_id` 跨**全部项目**找「在跑」的 pane。对应
+    /// `src/utils/sessionJump.ts::findLiveSessionPane`。
+    ///
+    /// 三个条件缺一不可:① 会话身份匹配;② PTY 活着;③ 状态在
+    /// `{AiWorking, AiIdle}` 里。第三条不能省 —— `ai_session` 在 AI 退出后为
+    /// **续接语义刻意保留**(status 落回 idle),只看身份会把「claude 已退出的
+    /// shell」当成在跑,点过去对着一个死会话。
+    ///
+    /// # `exitedPtyIds` 的等价物
+    ///
+    /// 原版第二条查的是 `!exitedPtyIds.has(pane.ptyId)`,而 mt-app 没有这张表
+    /// (审计第 73 行记着这条缺失)。PTY 退出时 store 会把 pane 打成
+    /// [`PaneStatus::Error`],而 `Error` 本就不在第三条的白名单里 —— 两条合起来
+    /// **实际等价**,不必为此新增一份状态。
+    pub fn find_live_session_pane(&self, session_id: &str) -> Option<(String, String, PaneStatus)> {
+        for (project_id, state) in self.project_states.iter() {
+            let Some(layout) = state.layout.as_ref() else {
+                continue;
+            };
+            for pane in layout.panes() {
+                let matches = pane
+                    .ai_session
+                    .as_ref()
+                    .is_some_and(|s| s.session_id == session_id);
+                if matches
+                    && pane.pty_id.is_some()
+                    && matches!(pane.status, PaneStatus::AiWorking | PaneStatus::AiIdle)
+                {
+                    return Some((project_id.clone(), pane.id.clone(), pane.status));
+                }
+            }
+        }
+        None
+    }
+
+    /// 把恢复出来的会话身份**当场**写回 pane(对应 `setPaneAiSessionByPty`)。
+    ///
+    /// 不能干等 hook:codex resume 不会重新上报 SessionStart,新 pane 会永远
+    /// 拿不到身份,右键的分支入口随之消失(claude 会上报同 id 幂等覆盖)。
+    /// 身份随布局持久化,重启自动续接顺带受益。
+    pub fn set_pane_ai_session(
+        &mut self,
+        project_id: &str,
+        pane_id: &str,
+        session: AiSessionRef,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(state) = self.project_states.get_mut(project_id)
+            && let Some(layout) = state.layout.as_mut()
+            && let Some(pane) = layout.pane_mut(pane_id)
+        {
+            pane.ai_session = Some(session);
+            // 身份是自己写进去的,不是「待续接」——别让下次启动再敲一遍命令
+            pane.resume_pending = false;
+            self.save_layout_soon(project_id, cx);
+            cx.notify();
+        }
+    }
+
+    // === AI 历史面板视图偏好 ===
+
+    /// 会话列表视图(`"flat"` | `"tree"`)。认不出/没设过 = 平铺
+    /// (原版 `SessionList.tsx:242` 的 `?? 'flat'`)。
+    pub fn session_list_view(&self) -> &str {
+        match self.config.session_list_view.as_deref() {
+            Some("tree") => "tree",
+            _ => "flat",
+        }
+    }
+
+    pub fn set_session_list_view(&mut self, view: &str, cx: &mut Context<Self>) {
+        if self.session_list_view() == view {
+            return;
+        }
+        self.config.session_list_view = Some(view.to_string());
+        self.save_config_soon(cx);
+        cx.notify();
+    }
+
+    // === 用量面板偏好 ===
+
+    /// 六个偏好**一把写** —— 六个 setter 各自触发一次 500ms 去抖没有意义。
+    pub fn set_usage_prefs(&mut self, prefs: UsagePrefs, cx: &mut Context<Self>) {
+        self.config.usage_scope = Some(prefs.scope);
+        self.config.usage_range = Some(prefs.range);
+        self.config.usage_project = prefs.project;
+        self.config.usage_auto_refresh = Some(prefs.auto_refresh);
+        self.config.usage_custom_from = Some(prefs.custom_from);
+        self.config.usage_custom_to = Some(prefs.custom_to);
+        self.save_config_soon(cx);
     }
 
     /// 用户对 pane 键入 = 已在处理待确认事项,清掉 attention 黄灯

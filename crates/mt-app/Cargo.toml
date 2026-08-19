@@ -29,11 +29,27 @@ parking_lot.workspace = true
 futures = "0.3"
 # 会话列表的相对时间、用量面板的本地日历日窗口。
 chrono.workspace = true
-# 可选的本地价格表(model-pricing.json)。
+# 价格表缓存信封的读写(model-pricing.json / .cache.json)。
+serde.workspace = true
 serde_json.workspace = true
 # 用量分桶要 IANA 时区名:mt-usage 按每条记录自身时刻求当地偏移,
 # 只给固定偏移的话 DST 地区的历史记录会错日。
 iana-time-zone = "0.1"
+# 价格表拉取(https://models.dev/api.json,一次 HTTPS GET)。
+#
+# **净新增 crate = 0**:`zed-reqwest` 已经在依赖树里(gpui → gpui_http_client),
+# `blocking` feature 只额外要 futures-channel + tokio/sync,两者也都在树里。
+# 不用 `cx.http_client()`:gpui 的默认实现是 `NullHttpClient`,`send()` 直接
+# `bail!("No HttpClient available")`,而 `gpui_http_client` 只提供 trait、不带
+# reqwest 后端(Zed 把那部分放在未发布的 reqwest_client crate 里)。
+# blocking 客户端自己起 current-thread 运行时,mt-app 不必接 tokio;
+# 调用一律丢 background executor(见 `pricing::fetch_models_dev` 的注释)。
+reqwest = { package = "zed-reqwest", version = "0.12.15-zed", default-features = false, features = [
+    "blocking",
+    "rustls-tls-native-roots",
+    "charset",
+    "http2",
+] }
 
 [target.'cfg(windows)'.dependencies]
 # 任务栏闪烁(FlashWindowEx)与提示音(MessageBeep / PlaySoundW)。

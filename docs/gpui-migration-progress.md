@@ -13,7 +13,7 @@
 | Wave 1 | 后端五块并行搬运 + TerminalElement 端到端 | ✅ 2026-08-18 全部验收入库（6/6） |
 | Wave 2 | mt-relay、mt-app 全壳（store/三栏/Tab/分屏树） | ✅ 2026-08-18 两件均验收入库；面板/Modal/i18n/主题桥移入 Wave 3 |
 | Wave 3 | G=mt-app UI 批（Modal/AI 历史+用量面板/通知/分屏比例+焦点导航）；H=mt-ui 渲染批（IME/鼠标上报/damage/主题桥）；I=mt-i18n 字典基建 | ✅ 2026-08-18 全部验收入库。G 经收尾 agent 补验：66 单测+4 集成全绿（老断言零改动），六模块齐（托盘明确未做），收尾另修 3 个真 bug（分屏比例恢复首帧 FALLBACK_AREA 基准错→改首帧量尺下帧铺树；窗口聚焦不清未读；折叠栏把 sizes 抹成最小值）+ 2 处资源问题（会话面板惰性加载防 WSL 冷启动、用量面板 Task 句柄无界增长）+6 单测；I ✅（`d2af55f`）；H ✅（`92390d4`） |
-| Wave 4+ | 按 docs/gpui-parity-audit.md 30 条缺口逐批清零（第 0 层接线 → 基建 → 面板 → 整块新功能） | 🔵 J ✅（`9246abf`）；K ✅（`b2fa0a0`）；L ✅（`04ee62b`）；M ✅（`14c84e9`，⚠️ gpui-component 无 svg 资产，图标一律走 mt-ui VectorIcon）；O ✅（`2bb0205`）；N ✅（`e91bb03`）；P 🟡 已交付待验收（139+4 绿：搜索三连 #23/#24/#26 + overlay.rs 快捷键让路 + 三条快捷键）；下一波候选=marker 体系 #25 / 设置面板 #19 / Git UI #27 |
+| Wave 4+ | 按 docs/gpui-parity-audit.md 30 条缺口逐批清零（第 0 层接线 → 基建 → 面板 → 整块新功能） | 🔵 J ✅（`9246abf`）；K ✅（`b2fa0a0`）；L ✅（`04ee62b`）；M ✅（`14c84e9`，⚠️ gpui-component 无 svg 资产，图标一律走 mt-ui VectorIcon）；O ✅（`2bb0205`）；N ✅（`e91bb03`）；P ✅（`944baff`，主会话复跑 139+4 绿：搜索三连 #23/#24/#26 + overlay.rs 快捷键让路 + 三条快捷键；SearchModal 点结果暂走外部编辑器待 #29 回接）；Q ✅（主会话复跑 167+4 + mt-config 45+1 绿：#17 用量面板全套含 pricing.rs models.dev 拉取、#18 会话面板本体、右抽屉悬浮层化；BranchFamilyPanel 判归 fork 批；zed-reqwest 净新增 crate=0）；**batch-specs/ 已备齐 8 份规格**（设置/面板/移动端/GitUI/托盘/标题栏杂项/拖放分组列表/marker 文件预览），后续批次任务书直接引用；下一波候选=设置面板 #19（规格最全）/ Git UI #27 / 标题栏 #20 |
 | 收尾 | mt-ssh/mt-core 移入 crates/、删 src-tauri/ 与 src/、发版切换 | ⬜ |
 
 ## Wave 1 —— 2026-08-18 派出 6 个并行 agent
