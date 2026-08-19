@@ -30,7 +30,7 @@
 | # | 缺口 | 规模 | 落点 | 状态 |
 |---|---|---|---|---|
 | 7 | **上下文菜单基建** | 中 | mt-app | ✅ N 批自建 menu.rs（gpui-component 菜单四条硬伤记档：IconName 无资产/无 danger 态与快捷键标签/配色走它自己的 theme token/ContextMenu 包装器过不了 prefers_local_handling 闸门）；样式逐条对照 styles.css，勾选「✓ 」文本方案与原版一字不差；焦点开时收走关时先还再跑动作。遗留：键盘方向键导航、menuPopIn 进场动画、遮罩吃掉关闭那一下点击 |
-| 8 | **拖放基建**——项目拖拽排序、拖文件夹加项目、拖文件进终端（外部资源管理器 + 内部 FileTree 两条链路 + 虚线高亮框） | 中 | mt-ui + mt-app | ❌ |
+| 8 | **拖放基建**——项目拖拽排序、拖文件夹加项目、拖文件进终端（外部资源管理器 + 内部 FileTree 两条链路 + 虚线高亮框） | 中 | mt-ui + mt-app | ✅ X 批（合并 `266696e`）。内外拖统一 gpui on_drop（dnd.rs）；⚠️ on_drag_move 无 hitbox 判定、命中闸必须自做（hit_ratio），已进注释；Esc 取消内部拖拽未做（记档） |
 | 9 | **图标体系** | 中 | mt-ui | ✅ K 批组件（BrandIcon 11 家/TechIcon 12 种/FileIcon 53 类/StatusDot 四态勾叉+900ms 旋转；全自绘矢量，判据在 vector.rs 头注释）+ M 批消费（状态灯/tab 与会话面板品牌图标含 or_else(infer) 补 opencode/pi、项目列表 TechIcon、文件树 FileIcon、边条 44px 图标化逐点照抄 ActivityBar SVG + 全局 AI 徽标）。留：dirKinds 探测（TechIcon 现只认 kindOverride）、文件树 git 着色、项目行状态灯位置（原版行尾且 idle 不显示） |
 | 10 | **通用命令式弹窗 + 关闭确认** | 小 | mt-app | ✅ N 批。prompt/confirm/alert + open_guarded 按种类防叠开（不同种类可叠，摘表挂 on_close 五条关闭路全覆盖）；关闭确认盘点口径逐字照原版（status∈{ai-working,ai-idle} 不看 ai_session 身份），四条关闭路径统一走 pane_actions，确认后按 id 从最新布局重取；缺 2 词条 fileTree.dialog.createFailed*（原版该处也是静默失败，非回退） |
 | 11 | **终端滚动条** | 中 | mt-ui | ✅ K 批。6px 样式照抄 styles.css；alt screen 不画；不打穿 damage 缓存（只在 paint 发 quad）；滑块分母 total-screen；闲置按时间算 alpha 淡出（不用 with_animation 防持续请求帧）、回看中保留 50% 残留；宿主零改动默认生效 |
@@ -40,7 +40,7 @@
 | # | 缺口 | 规模 | 落点 | 状态 |
 |---|---|---|---|---|
 | 12 | 项目列表补全 | 中 | mt-app | 🟡 N 批落地右键菜单可行项（重命名/编辑描述/资源管理器/复制路径/项目类型子菜单直喂 TechIcon/移除 danger；store 补 rename_project 与 set_project_description）；剩：内联重命名（F2）+ 键盘 + 底部三按钮 + AI 厂商图标堆叠 + worktree 徽章/子项目缩进 + hover 250ms 缩略图 + 菜单里 SSH/环境变量/Worktrees/分组项（随对应功能批） |
-| 13 | **项目分组**：分组行渲染 + 折叠 + createGroup/removeGroup/renameGroup/toggleGroupCollapse/moveItem 五个 action + 拖拽 + 分组右键菜单（`ProjectTreeItem::Group` 已有数据从不渲染） | 大 | mt-app | ❌ |
+| 13 | **项目分组**：分组行渲染 + 折叠 + createGroup/removeGroup/renameGroup/toggleGroupCollapse/moveItem 五个 action + 拖拽 + 分组右键菜单（`ProjectTreeItem::Group` 已有数据从不渲染） | 大 | mt-app | ✅ X 批（合并 `266696e`）。project_tree.rs 纯函数 41 测；磁盘格式一字不改与 Tauri 互读；分组重命名暂走弹窗（行内编辑归 Y 批）；底部三按钮归 Y 批 §C.3；原版 moveItem 丢子树 bug 已兜底 |
 | 14 | 文件树补全 | 中 | mt-app | 🟡 N 批落地右键菜单（文件 8 项/目录 9 项/根空白新建两项，文件操作走 background executor，新建自动展开父目录；reveal 自落 explorer /select）；剩：头部三按钮（搜索/刷新/外部编辑器选择器）+ loading/错误态 + 键盘导航 + git 状态着色 + 根级单链目录压缩 + 技术栈图标 |
 | 15 | tab 栏补全 | 中 | mt-app | 🟡 N 批落地右键菜单（重命名/两向分屏/关闭两项含 danger 与快捷键标签）与关闭确认（#10）；M 批已加 AI 品牌图标；剩：新建按钮 shell 选择菜单 + 横向滚动 + hover 缩略图 + 分支会话两项（随 fork 批） |
 | 16 | 终端右键菜单 | 中 | mt-app + mt-ui | 🟡 停留复制+气泡 ✅（K+M）；N 批落地复制（无选区置灰）/粘贴（还焦点），与鼠标上报共存走 prefers_local_handling 同源判定（三模式×修饰键有单测）；剩 fork 会话/分支树/SSH 子菜单（随对应功能批） |
@@ -57,7 +57,7 @@
 | 22 | **移动端中转**：mt_relay 实际接线（RelayHost/RelayEvents 实现）+ MobileRelayModal（地址/密钥/状态徽章/配对二维码/重置）+ AiLauncherSection CRUD + 5 条事件落点（status/pairing-code/start-session/rename-pane/会话结构同步）+ store 补 rename_pane_by_id | 大 | mt-app | ✅ U 批（`d3ad441`，合并 `dccbc4f`）。全套落地：RelaySignal 泵/150ms 去抖结构同步/自绘二维码/启动器 CRUD；镜像 opencode/pi 跳过规则经 AiBridge 如实透传不被绕开；记档见进度看板 U 批段 |
 | 23 | 终端查找 | 中 | mt-ui + mt-app | ✅ O 批 mt-ui 引擎 + P 批宿主接线：引擎常驻 `TerminalPane`（关键词活过开关）、查找条是终端容器里的 `absolute` 子元素（旧版那条 rAF 定位轮询整个不需要）、Esc/✕ 关闭时 `window.focus(&pane.focus)` 还焦点。⚠️ Ctrl+F **必须绑 action 不能绑 pane 容器的 on_key_down**（TerminalView 认得 Ctrl+F 并 stop_propagation，key 监听是从焦点节点往上冒泡）——search_bar.rs 模块注释已就地更正。偏差两条：逐 pane 一条（原版是 portal 单例）、Ctrl+F 不是 toggle（照原版 `openTerminalSearch` 只开不关） |
 | 24 | 全局搜索 UI（SearchModal，后端 mt-project/search.rs 669 行已就绪，Ctrl+Shift+F） | 中 | mt-app | 🟡 P 批。`start_search` 起专用后台线程 + `futures::mpsc` 回主线程（**不占 background_executor**——那是给会 await 的 future 用的）；换搜索直接换掉前台任务，旧结果自然到不了，不必比对 searchId；1000 条封顶、按文件分组保序、`.*` 开关、四态状态条全部照抄且有单测。剩：点结果开 `FileViewerModal`（依赖 #29，现退到原版**双击**那条动作=外部编辑器打开）、分组头 sticky（gpui 无 sticky）、结果列表无虚拟化（原版也没有） |
-| 25 | AI 任务 marker 体系（markersByPty store + 按钮 + 浮层 + markerPrev/Next 快捷键） | 中 | mt-app | ❌ |
+| 25 | AI 任务 marker 体系（markersByPty store + 按钮 + 浮层 + markerPrev/Next 快捷键） | 中 | mt-app | ✅ W 批（`c15d4e0` 合并 `dfe612d`）。锚点算术推导+饱和整份作废；marker 活得过 TUI excursion（优于原版退 alt 全清）；回滚装满后该 pane 停摆已拍板不做文本重定位补路 |
 | 26 | ProjectSwitcher（Ctrl+Shift+P 模糊匹配 + 高亮 + 键盘导航） | 中 | mt-app | ✅ P 批。子序列模糊匹配 + 分组路径兜底匹配 + 命中字符高亮 + ↑↓ 环形导航 + Enter 切项目 + Esc 关闭，逐条照 TSX；分组路径从 `config.project_tree` 现算（项目分组 #13 还没做，但读它不需要）。⚠️ 方向键必须用 `"ProjectSwitcher > Input"` 谓词绑 action —— 与 `Input` 自带的 `up`/`down` **同深度**才压得过它（单行输入框那两个处理器 return 且不 propagate，容器上的 on_key_down 永远收不到），机制有单测钉住 |
 | 27 | **Git 全套 UI**：GitChanges/GitHistory/CommitDiffModal/DiffModal/GitWorktreeModal + 右抽屉 sessions⇄git 互斥切换（后端 git.rs 1559 行已就绪）。~~BranchFamilyPanel~~ 系审计误归——它是 AI 会话家族树（scan_session_lineage），已划回 #18 的 fork 批遗留 | 大 | mt-app | ✅ V 批（`a7e9e85`，合并 `9c70bde`）。六组件+拓扑图+pty-output 输出旁路全落地；遗留两入口转 Y 批：FileTree「查看变更」与项目列表「Worktrees」（open_file_diff/git_worktree::open 已就绪，只差菜单项+菜单序断言同步） |
 | 28 | **SSH 全套 UI**：SshModal/SshAssocModal/AddRemoteProjectModal/远程项目/断线重连覆盖层/exitedPtyIds 体系（依赖 mt-ssh 进 crates/，属收尾阶段联动件） | 大 | mt-app | ❌ |
