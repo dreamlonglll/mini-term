@@ -11,11 +11,18 @@ interface Props {
   onLayoutChange?: (updatedNode: SplitNode) => void;
 }
 
-// 稳定 key：递归取第一个叶节点的 pane ID。
+// 稳定 key：递归取第一个叶节点里最小的 pane ID。
 // 当 leaf 被 insertSplit 变为 split 时，原 leaf 始终是 children[0]，
 // key 不变 → 父级 Allotment 不会重新分配尺寸。
+// 取最小值而不是 panes[0]：tab 拖拽重排（尤其插到首位）会换掉 panes[0]，
+// 用它当 key 会让整个 PaneGroup 卸载重挂，pane-enter 动画整屏重播像新开了分屏。
 function getNodeKey(node: SplitNode): string {
-  if (node.type === 'leaf') return node.panes[0]?.id ?? 'empty';
+  if (node.type === 'leaf') {
+    return node.panes.reduce<string | null>(
+      (min, p) => (min === null || p.id < min ? p.id : min),
+      null,
+    ) ?? 'empty';
+  }
   return getNodeKey(node.children[0]);
 }
 

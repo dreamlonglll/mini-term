@@ -27,6 +27,8 @@ export const paneGroup = {
     starting: "正在启动终端...",
     remoteDisconnected: "连接已断开",
     reconnect: "点击重连",
+    maximizePane: "最大化此区域（双击标签栏空白处）",
+    restorePane: "还原分屏布局",
   },
   en: {
     closeAiTitle: "Close AI Session",
@@ -56,5 +58,7 @@ export const paneGroup = {
     starting: "Starting terminal...",
     remoteDisconnected: "Connection lost",
     reconnect: "Click to reconnect",
+    maximizePane: "Maximize this pane (double-click empty tab bar area)",
+    restorePane: "Restore split layout",
   },
 } as const;

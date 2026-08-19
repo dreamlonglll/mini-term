@@ -1,9 +1,11 @@
 import { useCallback } from 'react';
 import { useAppStore, saveLayoutToConfig } from '../store';
 import { SplitLayout } from './SplitLayout';
+import { PaneGroup } from './PaneGroup';
 import { showContextMenu } from '../utils/contextMenu';
 import { isRemoteProject } from '../utils/remoteProject';
 import { newTerminal } from '../utils/paneActions';
+import { findLeafContainingPane } from '../utils/layoutOps';
 import { hotkeyLabel } from '../utils/hotkeys';
 import { useT } from '../i18n';
 import type { SplitNode } from '../types';
@@ -25,6 +27,12 @@ export function TerminalArea({ projectId, projectPath }: Props) {
   const projectStates = useAppStore((s) => s.projectStates);
   const setProjectLayout = useAppStore((s) => s.setProjectLayout);
   const layout = projectStates.get(projectId)?.layout ?? null;
+  // 双击最大化：只在真的分了屏（根是 split）时生效；leaf 查不到（pane 已关）回落整树
+  const maximizedPaneId = projectStates.get(projectId)?.maximizedPaneId;
+  const maximizedLeaf =
+    layout && layout.type === 'split' && maximizedPaneId
+      ? findLeafContainingPane(layout, maximizedPaneId)
+      : null;
   // SSH 远程项目:新开 pane 一律 spawn ssh 启动器(shell 选择无意义)
   const project = config.projects.find((p) => p.id === projectId);
   const remote = isRemoteProject(project);
@@ -61,7 +69,13 @@ export function TerminalArea({ projectId, projectPath }: Props) {
   return (
     <div data-panel data-mt-part="terminal-area" className="flex flex-col h-full bg-[var(--bg-terminal)]">
       <div className="flex-1 overflow-hidden relative">
-        {layout ? (
+        {layout && maximizedLeaf ? (
+          // 最大化：只渲染目标 leaf，整树其余 pane 卸载（xterm 实例由 terminalCache
+          // 按 ptyId 缓存存活，还原时原样重挂）。pane 关掉后查不到 leaf 即自然回落。
+          <div className="absolute inset-0">
+            <PaneGroup projectId={projectId} node={maximizedLeaf} projectPath={projectPath} />
+          </div>
+        ) : layout ? (
           <div className="absolute inset-0">
             <SplitLayout
               projectId={projectId}

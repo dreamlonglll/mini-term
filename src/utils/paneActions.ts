@@ -21,11 +21,14 @@ import {
   findPaneById,
   findPaneByPtyId,
   insertSplit,
+  movePaneInLayout,
+  movePaneToTabIndex,
   removePaneFromLayout,
   replaceNode,
   resolveActivePane,
   updateLeafOfPane,
   type Direction,
+  type DropZone,
 } from './layoutOps';
 import { t } from '../i18n';
 import type { PaneState, ProjectConfig, ShellConfig, SplitNode } from '../types';
@@ -166,8 +169,46 @@ export async function splitPane(
   }
   const newLeaf: SplitNode = { type: 'leaf', panes: [pane], activePaneId: pane.id };
   commit(projectId, insertSplit(current, target, direction, newLeaf));
+  // 最大化状态下分出的新屏在隐藏的整树里，看不见会让人以为分屏坏了——先还原
+  useAppStore.getState().toggleMaximizedPane(projectId, null);
   focusPane(pane.ptyId);
   return pane;
+}
+
+/**
+ * 拖拽移动 pane：center 并入目标组 tab 栏，四边在目标组对应方向分屏。
+ * 树变换是纯函数（movePaneInLayout），返回 null 表示无需变化（拖回原位）。
+ */
+export function movePane(
+  projectId: string,
+  paneId: string,
+  targetPaneId: string,
+  zone: DropZone,
+): void {
+  const { layout } = snapshot(projectId);
+  if (!layout) return;
+  const next = movePaneInLayout(layout, paneId, targetPaneId, zone);
+  if (!next) return;
+  commit(projectId, next);
+  // 与 splitPane 同一处理:最大化状态下四边分屏会落进隐藏的整树,先还原;
+  // movePaneToTab 不需要——最大化时 tab 栏只能同组重排,结果可见且合理
+  useAppStore.getState().toggleMaximizedPane(projectId, null);
+  focusPane(findPaneById(next, paneId)?.ptyId);
+}
+
+/** 拖拽到 tab 栏的精确落位：同组内前后换位，跨组按插入位并入。 */
+export function movePaneToTab(
+  projectId: string,
+  paneId: string,
+  anchorPaneId: string,
+  index: number,
+): void {
+  const { layout } = snapshot(projectId);
+  if (!layout) return;
+  const next = movePaneToTabIndex(layout, paneId, anchorPaneId, index);
+  if (!next) return;
+  commit(projectId, next);
+  focusPane(findPaneById(next, paneId)?.ptyId);
 }
 
 /**

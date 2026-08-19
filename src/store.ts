@@ -636,6 +636,8 @@ interface AppStore {
   /** 写入项目的终端布局树；`null` = 清空（最后一个 pane 被关掉）。
    *  布局里消失的 pane，其 AI markers 一并回收。 */
   setProjectLayout: (projectId: string, layout: SplitNode | null) => void;
+  /** 双击最大化/还原：同一 pane 再切一次即还原；传 null 强制还原。 */
+  toggleMaximizedPane: (projectId: string, paneId: string | null) => void;
 
   // Pane 状态
   /** @param cause `pty-status-change` 带的(归一化)hook 事件名:决定这次变化
@@ -926,6 +928,29 @@ export const useAppStore = create<AppStore>((set, get) => ({
     });
     // pane 被关掉时托盘也要跟着变(蓝/黄灯不残留)
     queueMicrotask(syncTrayStatus);
+  },
+
+  toggleMaximizedPane: (projectId, paneId) => {
+    let changed = false;
+    set((state) => {
+      const ps = state.projectStates.get(projectId);
+      if (!ps) return state;
+      const next = paneId !== null && ps.maximizedPaneId !== paneId ? paneId : undefined;
+      if (ps.maximizedPaneId === next) return state;
+      changed = true;
+      const newStates = new Map(state.projectStates);
+      newStates.set(projectId, { ...ps, maximizedPaneId: next });
+      return { projectStates: newStates };
+    });
+    // 最大化/还原只是同一批终端换个容器渲染，PaneGroup 重挂载不该重播
+    // pane-enter（新分屏的淡入放大）——还原时整棵树一起重播，满屏闪动像重新
+    // 分了屏。真正状态变化时短窗抑制该动画；两帧后移除，不影响后续新分屏。
+    if (changed) {
+      document.body.classList.add('suppress-pane-enter');
+      requestAnimationFrame(() =>
+        requestAnimationFrame(() => document.body.classList.remove('suppress-pane-enter')),
+      );
+    }
   },
 
   updatePaneStatusByPty: (ptyId, status, cause, agent) => {
