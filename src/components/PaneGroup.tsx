@@ -403,8 +403,20 @@ export function PaneGroup({ projectId, node, projectPath }: Props) {
   };
 
   const handleBodyDragMove = (e: React.MouseEvent) => {
-    if (!acceptsPaneDrag()) return;
+    const payload = acceptsPaneDrag();
+    if (!payload) return;
+    // 落下无动作的场景不显示落点预览（与 tab 栏指示线同一口径）：
+    // 独占一组的 pane 拖自己身上四边/中央均为 no-op；own pane 的 center 已在同组
+    const own = node.panes.some((p) => p.id === payload.paneId);
+    if (own && node.panes.length === 1) {
+      setDropZone(null);
+      return;
+    }
     const zone = zoneFromEvent(e);
+    if (own && zone === 'center') {
+      setDropZone(null);
+      return;
+    }
     setDropZone((prev) => (prev === zone ? prev : zone));
   };
 

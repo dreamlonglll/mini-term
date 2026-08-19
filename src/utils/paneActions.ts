@@ -190,6 +190,9 @@ export function movePane(
   const next = movePaneInLayout(layout, paneId, targetPaneId, zone);
   if (!next) return;
   commit(projectId, next);
+  // 与 splitPane 同一处理:最大化状态下四边分屏会落进隐藏的整树,先还原;
+  // movePaneToTab 不需要——最大化时 tab 栏只能同组重排,结果可见且合理
+  useAppStore.getState().toggleMaximizedPane(projectId, null);
   focusPane(findPaneById(next, paneId)?.ptyId);
 }
 
