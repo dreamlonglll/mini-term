@@ -1244,6 +1244,16 @@ impl Render for TerminalArea {
 
         let store = self.store.read(cx);
         let Some(project) = store.active_project() else {
+            // 一个项目都没有 = 首启,换成引导页(audit #30 的 FirstRunGuide):
+            // 原版判据就是 `config.projects.length === 0`(`App.tsx:534`),
+            // 没有任何「首启标记」字段,添完项目自然消失。
+            //
+            // 「有项目但没选中」不走引导页 —— 原版那种情形是**整块空白**
+            // (FirstRunGuide 不显示、每个 TerminalArea 都 display:none),
+            // 下面这句是 GPUI 侧原有的兜底提示,保持不动。
+            if store.config().projects.is_empty() {
+                return crate::first_run::guide(self.store.clone());
+            }
             return div()
                 .size_full()
                 .bg(ui::bg_terminal())
@@ -1286,10 +1296,34 @@ impl Render for TerminalArea {
                         .text_size(ui::font_px(13.0))
                         .cursor_pointer()
                         .hover(|el| el.border_color(ui::accent()).text_color(ui::accent()))
-                        .on_click(cx.listener(move |this, _event, window, cx| {
-                            this.store.update(cx, |store, cx| {
-                                store.new_terminal(&pid, None, None, window, cx);
-                            });
+                        // 空态那颗按钮**也弹 shell 选择菜单**(`TerminalArea.tsx:32-46`
+                        // 的 `handleNewTabClick`,与 tab 栏那颗「+」逐字同形、同一份
+                        // `config.availableShells` 数据源、同一道 `<= 1` 闸)。
+                        // 唯一差别是 anchor:空态没有「当前 pane」可挨着放,传 None
+                        // (原版那边也是 `newTerminal(projectId)` 不带 targetPaneId)。
+                        .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                            let shells = this.store.read(cx).config().available_shells.clone();
+                            if shells.len() <= 1 {
+                                this.store.update(cx, |store, cx| {
+                                    store.new_terminal(&pid, None, None, window, cx);
+                                });
+                                return;
+                            }
+                            let entries: Vec<menu::MenuEntry> = shells
+                                .into_iter()
+                                .map(|shell| {
+                                    let store = this.store.clone();
+                                    let pid = pid.clone();
+                                    let name = shell.name.clone();
+                                    menu::item(name, move |window, cx| {
+                                        let (pid, shell) = (pid.clone(), shell.clone());
+                                        store.update(cx, |store, cx| {
+                                            store.new_terminal(&pid, Some(shell), None, window, cx);
+                                        });
+                                    })
+                                })
+                                .collect();
+                            menu::show(click_position(event, window), entries, window, cx);
                         }))
                         .child(format!(
                             "+ {}  (Ctrl+Shift+T)",

@@ -122,7 +122,9 @@ fn win32_user_locale_name() -> Option<String> {
 /// ⚠️ **grep 抓不到「key 由函数返回」的调用点**,得手工补:
 /// `app.titleBar.status.*` 来自 `store::TitleBarLight::i18n_key`,
 /// `app.trayStatus.*` 来自 `store::AiProjectKind::tray_status_key`,
-/// `app.titleBar.{maximize,restore}` 来自 `title_bar::max_button_face`。
+/// `app.titleBar.{maximize,restore}` 来自 `title_bar::max_button_face`,
+/// 首启引导那三条键位说明来自 `hotkeys::hotkey_desc_key`(值是 `hotkeys.rs`
+/// 表里的 `shortcuts.*` 字面量,已在下面的 settings 段里)。
 #[cfg(test)]
 const USED_KEYS: &[&str] = &[
     "app.activityBar.closeDrawer",
@@ -136,6 +138,10 @@ const USED_KEYS: &[&str] = &[
     "app.closeConfirm.messageWithSessions",
     "app.closeConfirm.titleAi",
     "app.emptyState",
+    "app.firstRun.addLocal",
+    "app.firstRun.hintsTitle",
+    "app.firstRun.subtitle",
+    "app.firstRun.title",
     "app.mobileStartSession",
     "app.titleBar.close",
     "app.titleBar.maximize",
@@ -155,6 +161,7 @@ const USED_KEYS: &[&str] = &[
     "app.trayStatus.idle",
     "app.trayStatus.working",
     "app.trayWorking",
+    "app.update.title",
     "app.wslOverride",
     "commitDiff.binaryFile",
     "commitDiff.fileCount",

@@ -21,8 +21,8 @@
 //! 移动端那颗由 U 批补上,位置照原版排在「设置」之前。)
 
 use gpui::{
-    Div, ElementId, InteractiveElement, ParentElement, Stateful, StatefulInteractiveElement,
-    Styled, div, prelude::FluentBuilder as _, px,
+    Div, ElementId, InteractiveElement, ParentElement, SharedString, Stateful,
+    StatefulInteractiveElement, Styled, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::tooltip::Tooltip;
 use mt_ui::icons::{Geom, Ink, Shape, VectorIcon};
@@ -226,6 +226,81 @@ pub const SETTINGS: &[Shape] = &[
     ),
 ];
 
+/// 有新版本时才出现的「更新提醒」。原版 `ICON_UPDATE`(`ActivityBar.tsx:60-65`)——
+/// 一根向上的箭头 + 底下一道横线(「上传/升级」的常见字形):
+///
+/// ```text
+/// <path d="M8 10.5V3M5 6l3-3 3 3" />
+/// <path d="M3 12.5h10" />
+/// ```
+///
+/// 第一条 path 是两笔:竖干 `M8 10.5 V3`,再抬笔画箭头 `M5 6 l3 -3 l3 3`。
+/// 这里拆成两条 `Polyline` —— 形状 DSL 没有「抬笔」语义,一条折线连起来会
+/// 多出一道从 (8,3) 斜拉到 (5,6) 的假边。
+pub const UPDATE: &[Shape] = &[
+    // 竖干
+    Shape::line(
+        Ink::Current,
+        STROKE,
+        Geom::Polyline(&[(u(8.0), u(10.5)), (u(8.0), u(3.0))]),
+    ),
+    // 箭头(左肩 → 顶点 → 右肩)
+    Shape::line(
+        Ink::Current,
+        STROKE,
+        Geom::Polyline(&[(u(5.0), u(6.0)), (u(8.0), u(3.0)), (u(11.0), u(6.0))]),
+    ),
+    // 底线
+    Shape::line(
+        Ink::Current,
+        STROKE,
+        Geom::Polyline(&[(u(3.0), u(12.5)), (u(13.0), u(12.5))]),
+    ),
+];
+
+/// 「有新版本」按钮(不含 `on_click`,由调用方挂 —— 点下去是外链到 release 页)。
+///
+/// 与 [`strip_button`] **不同形**,所以另起一个构造器:原版这颗是 accent 配色、
+/// 没有激活态也没有左侧竖条,而且右上角恒挂一颗 accent 圆点
+/// (`ActivityBar.tsx:173-182`)。
+///
+/// ⚠️ **圆点在原版带 `animate-blink`(0.8s 闪烁),这里是静态的**。两条理由:
+/// ① 用户机器的「减少动画」是开着的,原版 `styles.css:391` 的通配 reduce 规则
+///    正好把 `.animate-blink` 停掉 —— 装机版在这台机器上本来就不闪;
+/// ② GPUI 没有媒体查询等价物,要闪就得先有全局「减少动画」闸(并行批在做)。
+///    闸就位后在这里补 `with_animation` 即可,**这里就是唯一挂接点**。
+pub fn update_button(id: impl Into<ElementId>, tip: SharedString) -> Stateful<Div> {
+    div()
+        .id(id)
+        .relative()
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(BUTTON))
+        .h(px(BUTTON))
+        .flex_none()
+        .rounded(px(4.0))
+        .cursor_pointer()
+        // 原版 `hover:bg-[var(--accent)]/15`
+        .hover(|el| el.bg(ui::with_alpha(ui::accent(), 0.15)))
+        .child(VectorIcon::new(UPDATE, px(ICON)).ink(ui::accent()))
+        .child(
+            // `absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-accent
+            //  border border-[var(--bg-surface)]`(位置取值与上方全局 AI 徽标同款)
+            div()
+                .absolute()
+                .top(px(-1.0))
+                .right(px(-1.0))
+                .w(px(8.0))
+                .h(px(8.0))
+                .rounded_full()
+                .border_1()
+                .border_color(ui::bg_surface())
+                .bg(ui::accent()),
+        )
+        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+}
+
 /// 一个边条按钮的外壳(不含 `on_click`,由调用方挂)。
 ///
 /// 配色逐条对照原版 `btnClass`:激活 = 主文本色 + `--border-subtle` 底,
@@ -290,7 +365,7 @@ mod tests {
     #[test]
     fn 边条图标的点全在单位方框内() {
         let mut points = 0usize;
-        for shapes in [PANEL, SESSIONS, GIT, STATS, SETTINGS, MOBILE] {
+        for shapes in [PANEL, SESSIONS, GIT, STATS, SETTINGS, MOBILE, UPDATE] {
             for shape in shapes {
                 let (pts, _) = shape.geom.points();
                 for (x, y) in pts {
@@ -315,5 +390,25 @@ mod tests {
         };
         assert_eq!(pts.len(), 24);
         assert!(matches!(SETTINGS[1].geom, Geom::Circle { .. }));
+    }
+
+    /// 更新图标是**三笔**:竖干 / 箭头 / 底线。
+    ///
+    /// 合并成两笔(把竖干与箭头连成一条折线)会多出一道 (8,3)→(5,6) 的假边 ——
+    /// 原版那条 path 在那里是 `M`(抬笔),形状 DSL 没有抬笔语义,只能拆笔。
+    #[test]
+    fn 更新图标是三笔且箭头顶点与竖干顶端重合() {
+        assert_eq!(UPDATE.len(), 3);
+        let Geom::Polyline(stem) = UPDATE[0].geom else {
+            panic!("第一笔应该是竖干");
+        };
+        let Geom::Polyline(head) = UPDATE[1].geom else {
+            panic!("第二笔应该是箭头");
+        };
+        // 竖干顶端 = 箭头顶点,错开一点点在 18px 下就是肉眼可见的缺口
+        assert_eq!(stem[1], head[1]);
+        // 箭头左右肩对称
+        assert_eq!(head[0].1, head[2].1);
+        assert!((head[1].0 - head[0].0 - (head[2].0 - head[1].0)).abs() < 1e-6);
     }
 }

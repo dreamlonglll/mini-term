@@ -389,6 +389,28 @@ fn fetch_latest_release() -> Result<ReleaseInfo, String> {
     })
 }
 
+/// 「比当前版本新才算数」的那道闸(`updateChecker.ts:30` 那行三元)。
+///
+/// 抽成纯函数只为可测 —— [`newer_release`] 的另一半是网络,测不了。
+pub fn pick_newer(release: ReleaseInfo, current: &str) -> Option<ReleaseInfo> {
+    compare_versions(&release.version, current)
+        .is_gt()
+        .then_some(release)
+}
+
+/// **启动自检**用的一次性检查,等价于原版 `checkForUpdate(currentVersion)`
+/// (`updateChecker.ts:21-31`):拉最新 release,比当前版本新才返回 `Some`,
+/// 否则(含任何失败)返回 `None`。
+///
+/// 原版那边是 `checkForUpdate(ver).then(...).catch(() => {})` ——
+/// **失败静默**,启动时联不上网 / GitHub 限流都不该弹任何东西给用户看。
+/// 这里同样把错误吃掉(只留一行 stderr,`fetch_latest_release` 已经打了)。
+///
+/// **整体阻塞**,调用方一律丢 `cx.background_executor()`。
+pub fn newer_release(current: &str) -> Option<ReleaseInfo> {
+    pick_newer(fetch_latest_release().ok()?, current)
+}
+
 // ─── 外置皮肤卡片的数据 ───────────────────────────────────────
 
 /// 一张皮肤卡片要画的东西(刷新列表时算一次,不每帧重解析色值)。
@@ -3312,6 +3334,25 @@ mod tests {
         assert_eq!(compare_versions("0.9.9", "0.10.0"), Ordering::Less);
         // 带后缀的段取前导数字
         assert_eq!(compare_versions("1.2.3-beta", "1.2.3"), Ordering::Equal);
+    }
+
+    /// 启动自检那道闸:只有**严格更新**才算数,同版本 / 更旧一律 `None`
+    /// (原版 `updateChecker.ts:30` 的 `> 0 ? release : null`)。
+    #[test]
+    fn 启动自检只认更新的版本() {
+        let release = |v: &str| ReleaseInfo {
+            version: v.to_string(),
+            url: "https://example.invalid/r".to_string(),
+            published_at: "2026-08-19T00:00:00Z".to_string(),
+        };
+        assert!(pick_newer(release("v0.14.0"), "0.13.1").is_some());
+        // 带 `v` 前缀的 tag 与不带的当前版本要能对上(GitHub tag 是 `v0.13.1`)
+        assert!(pick_newer(release("v0.13.1"), "0.13.1").is_none());
+        assert!(pick_newer(release("0.13.0"), "0.13.1").is_none());
+        assert_eq!(
+            pick_newer(release("v1.0.0"), "0.13.1").map(|r| r.version),
+            Some("v1.0.0".to_string())
+        );
     }
 
     /// 发布日期:ISO → `2026/8/19`(locale 写死,与原版一致)。

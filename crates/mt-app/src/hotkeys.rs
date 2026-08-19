@@ -340,6 +340,30 @@ pub fn combo_label(combo: &Combo) -> String {
     parts.join(sep)
 }
 
+/// 按 id 取一条快捷键的显示串(`hotkeys.ts::hotkeyLabel`)。
+///
+/// 表里没有这个 id 时返回空串 —— 原版那边是 `hotkeys[id]` 取 `undefined` 再拼成
+/// 空,同样不炸。调用方(首启引导的键位提示)拿到空串只是少显示一颗键帽。
+pub fn hotkey_label(id: &str) -> String {
+    HOTKEYS
+        .iter()
+        .find(|def| def.id == id)
+        .map(|def| combo_label(&def.combo))
+        .unwrap_or_default()
+}
+
+/// 按 id 取一条快捷键的**描述**文案 key(`settings` 命名空间内的相对 key)。
+///
+/// 首启引导那三条提示原版是手写 `t('settings.shortcuts.newTerminal')` 之类
+/// (`FirstRunGuide.tsx:36-40`),这里改从表里取同一个 `desc_key` —— 串完全一样,
+/// 但改键位表时不会漏掉引导页。
+pub fn hotkey_desc_key(id: &str) -> Option<&'static str> {
+    HOTKEYS
+        .iter()
+        .find(|def| def.id == id)
+        .map(|def| def.desc_key)
+}
+
 /// 设置页用:按 `group_key` 归组,保持表内声明顺序
 /// (`hotkeys.ts::hotkeyGroups` 同一算法)。
 pub fn groups() -> Vec<(&'static str, Vec<&'static HotkeyDef>)> {
@@ -549,6 +573,18 @@ mod tests {
             assert!(def.combo.modifier && def.combo.shift && !def.combo.alt, "{}", def.id);
             assert_eq!(def.group_key, G_MARKER);
         }
+    }
+
+    /// 按 id 取显示串 / 描述 key:表里有就取到,没有则空 / None。
+    #[test]
+    fn 按_id_取显示串与描述key() {
+        assert_eq!(hotkey_label("newTerminal"), combo_label(&HOTKEYS[0].combo));
+        assert_eq!(hotkey_desc_key("newTerminal"), Some("shortcuts.newTerminal"));
+        assert_eq!(hotkey_desc_key("switchProject"), Some("shortcuts.switchProject"));
+        assert_eq!(hotkey_desc_key("terminalSearch"), Some("shortcuts.terminalSearch"));
+        // 认不出的 id 不炸(原版 `hotkeys[id]` 取 undefined 也不炸)
+        assert_eq!(hotkey_label("没有这个键位"), "");
+        assert_eq!(hotkey_desc_key("没有这个键位"), None);
     }
 
     #[cfg(not(target_os = "macos"))]

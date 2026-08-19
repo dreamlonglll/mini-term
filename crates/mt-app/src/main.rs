@@ -42,6 +42,7 @@ mod clipboard;
 mod dnd;
 mod file_tree;
 mod file_viewer;
+mod first_run;
 mod focus_nav;
 mod fs_ops;
 mod git_changes;
@@ -73,6 +74,7 @@ mod session_branch;
 mod session_panel;
 mod settings;
 mod shell_ops;
+mod startup_trace;
 mod store;
 mod terminal_area;
 mod theme;
@@ -101,7 +103,7 @@ use mt_ui::icons::{StatusDot, StatusKind};
 use crate::ai::AiBridge;
 use crate::file_tree::FileTree;
 use crate::focus_nav::Direction;
-use crate::i18n::t;
+use crate::i18n::{t, tr};
 use crate::project_list::ProjectList;
 use crate::session_panel::SessionPanel;
 use crate::store::{AppStore, DoneScope, PendingAlert};
@@ -284,9 +286,16 @@ struct Workspace {
     /// 抽屉左缘正在被拖。`Some` 期间宽度由本结构自持,松手才落盘。
     drawer_drag: Option<DrawerDrag>,
     usage_open: bool,
+    /// 启动自检发现的新版本(`None` = 没有 / 还没查完 / 查失败)。
+    ///
+    /// 与原版 `App.tsx:89` 的 `updateInfo` 同一份状态:只在进程内活着,不落盘,
+    /// **也没有「忽略此版本」** —— 原版查完就一直亮着那颗按钮,直到升级为止。
+    update_release: Option<settings::ReleaseInfo>,
     /// 系统托盘(状态灯 + 项目菜单)。**drop 即摘图标**,所以必须由 Workspace
     /// 持有而不是丢进全局:窗口没了托盘也就该没了。
     tray: Tray,
+    /// 启动版本自检的那条任务(丢了句柄它就被取消)。
+    _update_check: Task<()>,
     _ai_pump: Task<()>,
     /// 移动端中转桥(泵 + store 观察者 + 去抖同步靠它的生命周期保活,
     /// 与 [`Self::_ai_pump`] 同一种分工)。见 [`mobile_relay`]。
@@ -387,6 +396,22 @@ impl Workspace {
             });
         }
 
+        // 启动版本自检(audit #30)。原版在拿到版本号之后立刻 `checkForUpdate(ver)`
+        // 并 `.catch(() => {})`(`App.tsx:273-281`)—— 每次启动查一次、失败静默、
+        // 没有开关也没有「忽略此版本」。HTTP 是阻塞的,丢后台执行器,回主线程只
+        // 改一个字段(与 `pricing.rs` 拉价格表同一套路)。
+        let update_check = cx.spawn(async move |this, cx| {
+            let found = cx
+                .background_executor()
+                .spawn(async { settings::newer_release(env!("CARGO_PKG_VERSION")) })
+                .await;
+            let Some(release) = found else { return };
+            let _ = this.update(cx, |workspace: &mut Self, cx| {
+                workspace.update_release = Some(release);
+                cx.notify();
+            });
+        });
+
         let mut workspace = Self {
             store,
             menu_layer: menu::layer(cx),
@@ -404,7 +429,9 @@ impl Workspace {
             drawer_exit: None,
             drawer_drag: None,
             usage_open: false,
+            update_release: None,
             tray,
+            _update_check: update_check,
             _ai_pump: ai_pump,
             _relay: relay,
             _tray_pump: tray_pump,
@@ -1140,6 +1167,20 @@ impl Render for Workspace {
                     settings::open_settings(this.store.clone(), None, window, cx);
                 })),
             )
+            // 「有新版本」按钮。**只在查到更新时才出现**(原版 `updateVersion &&`,
+            // `ActivityBar.tsx:173-182`),点一下外链到那条 release 的页面。
+            // 位置照原版:排在全部常规按钮之后(下面那颗「跳到已完成」是 GPUI
+            // 独有的,继续留在最末)。
+            .children(self.update_release.as_ref().map(|release| {
+                let url = release.url.clone();
+                activity_bar::update_button(
+                    "open-update",
+                    tr!("app", "update.title", version = release.version.as_str()).into(),
+                )
+                .on_click(move |_event, _window, cx: &mut gpui::App| {
+                    cx.open_url(&url);
+                })
+            }))
             // 未读完成计数:点一下跳到最先完成的那个 pane(旧版托盘绿灯的入口;
             // 原版边栏没有这颗按钮,所以借状态灯的「实心圆 + 勾」当图形)
             .when(unread > 0, |el| {
@@ -1451,7 +1492,11 @@ impl Render for Workspace {
 }
 
 fn main() {
+    // 启动链路埋点的 T0。**必须是第一行** —— 往后每个 `startup_trace::mark`
+    // 打的都是相对这一刻的偏移(装机版 `lib.rs::run()` 同位置)。
+    startup_trace::init();
     Application::new().run(|cx: &mut App| {
+        startup_trace::mark("setup enter");
         gpui_component::init(cx);
         // 右键菜单层的状态是全局的(项目列表 / 文件树 / tab / 终端四处都要弹),
         // 必须早于任何视图建出来 —— 视图的右键回调里直接取它。
@@ -1473,6 +1518,7 @@ fn main() {
         // `bind_keys` 与设置面板的「快捷键」页,重演原版 `src/utils/hotkeys.ts`
         // 的结构(此前这里是一串裸 `KeyBinding::new`,与设置页各写各的会漂移)。
         hotkeys::bind_keys(cx);
+        startup_trace::mark("setup: init + cleanups done");
 
         let config_store = if std::env::var_os("MT_APP_DATA_DIR").is_some() {
             // 隔离模式:配置也落在覆盖目录里,不碰装机版那份
@@ -1493,6 +1539,7 @@ fn main() {
         // 首启没有 config.locale 时按系统语言探测,探测结果不落盘 —— 与 TS 侧
         // `detectInitialLang()` 一致,用户没显式选过就一直跟随系统。
         let startup_config = config_store.read();
+        startup_trace::mark("setup: read_config done");
         i18n::install(startup_config.locale.as_deref());
 
         // hook 开关取自配置(与装机版同一字段);start_hook_server 的数据目录统一
@@ -1519,6 +1566,7 @@ fn main() {
         if let Some(project_id) = active {
             store.update(cx, |store, cx| store.hydrate_project(&project_id, cx));
         }
+        startup_trace::mark("setup: config applied (layout restored)");
 
         // 退出前把配置刷下去(不等 500ms 防抖),顺手收掉 hook server 的端口文件
         let store_for_quit = store.clone();
@@ -1572,5 +1620,9 @@ fn main() {
             return;
         }
         cx.activate(true);
+        // 装机版最后一个节点是前端的 `show() call (main UI first frame done)`;
+        // GPUI 侧窗口一建出来元素树就已经构造完(`Workspace::new` 是同步的),
+        // 差的只有 GPU 那一帧,于是收在这里。
+        startup_trace::mark("setup exit (window opened)");
     });
 }
