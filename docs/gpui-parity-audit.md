@@ -31,7 +31,7 @@
 |---|---|---|---|---|
 | 7 | **上下文菜单基建** | 中 | mt-app | ✅ N 批自建 menu.rs（gpui-component 菜单四条硬伤记档：IconName 无资产/无 danger 态与快捷键标签/配色走它自己的 theme token/ContextMenu 包装器过不了 prefers_local_handling 闸门）；样式逐条对照 styles.css，勾选「✓ 」文本方案与原版一字不差；焦点开时收走关时先还再跑动作。遗留：键盘方向键导航、menuPopIn 进场动画、遮罩吃掉关闭那一下点击 |
 | 8 | **拖放基建**——项目拖拽排序、拖文件夹加项目、拖文件进终端（外部资源管理器 + 内部 FileTree 两条链路 + 虚线高亮框） | 中 | mt-ui + mt-app | ✅ X 批（合并 `266696e`）。内外拖统一 gpui on_drop（dnd.rs）；⚠️ on_drag_move 无 hitbox 判定、命中闸必须自做（hit_ratio），已进注释；Esc 取消内部拖拽未做（记档） |
-| 9 | **图标体系** | 中 | mt-ui | ✅ K 批组件（BrandIcon 11 家/TechIcon 12 种/FileIcon 53 类/StatusDot 四态勾叉+900ms 旋转；全自绘矢量，判据在 vector.rs 头注释）+ M 批消费（状态灯/tab 与会话面板品牌图标含 or_else(infer) 补 opencode/pi、项目列表 TechIcon、文件树 FileIcon、边条 44px 图标化逐点照抄 ActivityBar SVG + 全局 AI 徽标）。留：dirKinds 探测（TechIcon 现只认 kindOverride）、文件树 git 着色、项目行状态灯位置（原版行尾且 idle 不显示） |
+| 9 | **图标体系** | 中 | mt-ui | ✅ K 批组件（BrandIcon 11 家/TechIcon 12 种/FileIcon 53 类/StatusDot 四态勾叉+900ms 旋转；全自绘矢量，判据在 vector.rs 头注释）+ M 批消费（状态灯/tab 与会话面板品牌图标含 or_else(infer) 补 opencode/pi、项目列表 TechIcon、文件树 FileIcon、边条 44px 图标化逐点照抄 ActivityBar SVG + 全局 AI 徽标）。留档清零：dirKinds 探测 ✅ tail-lists 批（探测缓存+三消费点）、文件树 git 着色 ✅ Y 批、项目行状态灯位置 ✅ Y 批 |
 | 10 | **通用命令式弹窗 + 关闭确认** | 小 | mt-app | ✅ N 批。prompt/confirm/alert + open_guarded 按种类防叠开（不同种类可叠，摘表挂 on_close 五条关闭路全覆盖）；关闭确认盘点口径逐字照原版（status∈{ai-working,ai-idle} 不看 ai_session 身份），四条关闭路径统一走 pane_actions，确认后按 id 从最新布局重取；缺 2 词条 fileTree.dialog.createFailed*（原版该处也是静默失败，非回退） |
 | 11 | **终端滚动条** | 中 | mt-ui | ✅ K 批。6px 样式照抄 styles.css；alt screen 不画；不打穿 damage 缓存（只在 paint 发 quad）；滑块分母 total-screen；闲置按时间算 alpha 淡出（不用 with_animation 防持续请求帧）、回看中保留 50% 残留；宿主零改动默认生效 |
 
@@ -39,12 +39,12 @@
 
 | # | 缺口 | 规模 | 落点 | 状态 |
 |---|---|---|---|---|
-| 12 | 项目列表补全 | 中 | mt-app | ✅ Y 批（`f609bfd`）落地：行内重命名（项目+分组）、AI 厂商图标堆叠、worktree ⎇ 徽章与失效子项目清理、DoneTag、accent 竖条恒占位、底部按钮条（SSH 钮随 #28）、菜单补 Worktrees。剩（记档不阻塞）：键盘导航（F2/Enter/Delete 行级，与全局 F2 绑定同源判定牵 main.rs）、hover 250ms 缩略图（需 MiniTerminalElement 独立件）、菜单 SSH/环境变量项（随 #28/#30） |
+| 12 | 项目列表补全 | 中 | mt-app | ✅ Y 批（`f609bfd`）落地：行内重命名（项目+分组）、AI 厂商图标堆叠、worktree ⎇ 徽章与失效子项目清理、DoneTag、accent 竖条恒占位、底部按钮条（SSH 钮随 #28）、菜单补 Worktrees。键盘导航 ✅ tail-lists 批（F2 走 main.rs 唯一处理器按持焦分流）、hover 250ms 缩略图 ✅ tail-lists 批（MiniTerminalElement）。剩：菜单 SSH/环境变量项（随 #28/#30） |
 | 13 | **项目分组**：分组行渲染 + 折叠 + createGroup/removeGroup/renameGroup/toggleGroupCollapse/moveItem 五个 action + 拖拽 + 分组右键菜单（`ProjectTreeItem::Group` 已有数据从不渲染） | 大 | mt-app | ✅ X 批（合并 `266696e`）。project_tree.rs 纯函数 41 测；磁盘格式一字不改与 Tauri 互读；分组重命名暂走弹窗（行内编辑归 Y 批）；底部三按钮归 Y 批 §C.3；原版 moveItem 丢子树 bug 已兜底 |
-| 14 | 文件树补全 | 中 | mt-app | ✅ Y 批（`f609bfd`）落地：git 状态着色（含目录汇总，git_watch 多订阅者触发+isAiPty 跳过）、头部三按钮、三态、单链目录压缩（链深 8 封顶）、「查看变更」菜单项。剩（记档不阻塞）：键盘导航 ←→ |
-| 15 | tab 栏补全 | 中 | mt-app | ✅ Y 批（`f609bfd`）落地：新建按钮 shell 选择菜单（<=1 不弹照抄）+ 横向滚动。剩（记档不阻塞）：hover 缩略图（MiniTerminalElement 独立件）+ 分支会话两项（随 fork 批） |
+| 14 | 文件树补全 | 中 | mt-app | ✅ Y 批（`f609bfd`）落地：git 状态着色（含目录汇总，git_watch 多订阅者触发+isAiPty 跳过）、头部三按钮、三态、单链目录压缩（链深 8 封顶）、「查看变更」菜单项；键盘导航 ←→ ✅ tail-lists 批 |
+| 15 | tab 栏补全 | 中 | mt-app | ✅ Y 批（`f609bfd`）落地：新建按钮 shell 选择菜单（<=1 不弹照抄）+ 横向滚动；hover 缩略图 ✅ tail-lists 批 + 分支会话两项 ✅ fork 批 |
 | 16 | 终端右键菜单 | 中 | mt-app + mt-ui | ✅ fork 批（合并 `c337716`）补齐分支段：「分支到新分屏/查看会话分支/未获身份置灰提示」tab 与终端右键同源判据同份实现（branch_entries_for_pty）。唯一遗留：SSH 子菜单段（等 mt-ssh 进 crates/，#28） |
-| 17 | 用量面板：custom 自选起止日期 + 自动刷新档位（0/5/10/30/60s 默认 5s）+ 单项目下拉（现仅当前项目开关）+ 排行条点击切 scope + Top 会话点开查看 + 骨架屏/数字滚动 + 偏好持久化 + **价格表拉取**（原版 fetch models.dev，Rust 侧需 HTTP 依赖，现读本地 model-pricing.json 缺省按 $0） | 中 | mt-app | ✅ Q 批。pricing.rs 走「手工裸表→新鲜缓存→拉网(zed-reqwest blocking，净新增 crate=0)→过期缓存→报错」，canonical 建键+全序比较器+0/0 占位丢弃；定时器挂 set_visible 闸；六相位纯函数分派、价格未就绪不渲染 KPI；custom 日期用 Input+纯函数闸门（无日历弹层，原版是浏览器原生 date input）。留：趋势图面积曲线/网格/双轴刻度（需自绘 path chart 件）、.usage-fade-in 与排行条宽度补间（等一次性过渡基件，勿用 with_animation） |
+| 17 | 用量面板：custom 自选起止日期 + 自动刷新档位（0/5/10/30/60s 默认 5s）+ 单项目下拉（现仅当前项目开关）+ 排行条点击切 scope + Top 会话点开查看 + 骨架屏/数字滚动 + 偏好持久化 + **价格表拉取**（原版 fetch models.dev，Rust 侧需 HTTP 依赖，现读本地 model-pricing.json 缺省按 $0） | 中 | mt-app | ✅ Q 批。pricing.rs 走「手工裸表→新鲜缓存→拉网(zed-reqwest blocking，净新增 crate=0)→过期缓存→报错」，canonical 建键+全序比较器+0/0 占位丢弃；定时器挂 set_visible 闸；六相位纯函数分派、价格未就绪不渲染 KPI；custom 日期用 Input+纯函数闸门（无日历弹层，原版是浏览器原生 date input）。留项清零（tail-anim 批）：趋势图面积曲线/网格/双轴刻度 ✅（mt_ui::chart 自绘）、.usage-fade-in 与排行条宽度补间 ✅（mt_ui::motion 一次性过渡基件） |
 | 18 | 会话面板：平铺⇄树视图切换 + scan_session_lineage 分支连线 + live pane 状态点跳转 + 品牌图标 + spinner；（SSH 远程来源等 mt-ssh 进 crates 后再说） | 中 | mt-app | 🟡 Q 批完成本体（树视图/lineage 连线走 session_branch.rs 纯函数、挂 visible/stale 惰性闸+request_id 守卫、live 三条件 find_live_session_pane、跳转带 claude cwd 反查并回写 ai_session、四项右键菜单收编行内按钮、WSL spinner 自绘）。fork 批（合并 `c337716`）已清：BranchFamilyPanel（menu.rs 自定义元素子菜单能力+单支家族过滤）与 remoteResumeUnsupported 的 alert→toast 回换。唯一遗留：SSH 远程来源（等 mt-ssh，#28） |
 | 19 | 设置面板剩余 9 分页：clipboard / appearance / font / ai-notification / ai-hook / system / editor / shortcuts / about（通知三开关现只能手改 config.json）+ 连字/scrollback/UI 字号字族/终端字号热更新（现只作用于新终端） | 大 | mt-app | ❌ |
 
@@ -62,7 +62,7 @@
 | 27 | **Git 全套 UI**：GitChanges/GitHistory/CommitDiffModal/DiffModal/GitWorktreeModal + 右抽屉 sessions⇄git 互斥切换（后端 git.rs 1559 行已就绪）。~~BranchFamilyPanel~~ 系审计误归——它是 AI 会话家族树（scan_session_lineage），已划回 #18 的 fork 批遗留 | 大 | mt-app | ✅ V 批（`a7e9e85`，合并 `9c70bde`）。六组件+拓扑图+pty-output 输出旁路全落地；遗留两入口转 Y 批：FileTree「查看变更」与项目列表「Worktrees」（open_file_diff/git_worktree::open 已就绪，只差菜单项+菜单序断言同步） |
 | 28 | **SSH 全套 UI**：SshModal/SshAssocModal/AddRemoteProjectModal/远程项目/断线重连覆盖层/exitedPtyIds 体系（依赖 mt-ssh 进 crates/，属收尾阶段联动件） | 大 | mt-app | ❌ |
 | 29 | 文件预览与编辑器（FileViewerModal/CodeEditor） | 大 | mt-app | ✅ AA 批（合并 `a2295a5`）。tree-sitter 多语言高亮（cc 降级 1.2.67 解锁）、CRLF 往返真文件测试钉住、SearchModal/文件树两入口回接。剩记档：Markdown 链接/跳转历史栈整块缺（gpui-component 链接无回调口，待上游）、HTML 只源码态、avif 兜底「默认工具打开」 |
-| 30 | 壳层杂项：关窗确认（盘点活 AI 会话列名）+ 版本检查/更新提醒 + FirstRunGuide 完整版（两入口+键位提示）+ 长文本粘贴转文件（4 配置字段已在）+ WSL 启动器重写提示 + 启动埋点 + dirKinds 技术栈探测缓存 + pane 进场动画 | 中 | mt-app | 🟡 Z 批（合并 `2dbc52f`）：关窗确认、自建 toast、双音 WAV、长粘贴转文件（SSH 分支随 #28）、WSL 覆盖提示、smartCopyPaste。tail-shell 批（`5b98de1`）：版本自检+ActivityBar 更新按钮（纠正口径：原版是**有新版本才出现的独立按钮**非设置钮红点，圆点闪烁待 reduce 闸）、FirstRunGuide（🟡 缺 SSH 远程入口随 #28）、启动埋点（本地 stderr 计时非遥测，单进程砍掉 epoch 对齐半场）。剩：dirKinds 探测（tail-lists 批）、pane 进场动画（tail-anim 批） |
+| 30 | 壳层杂项：关窗确认（盘点活 AI 会话列名）+ 版本检查/更新提醒 + FirstRunGuide 完整版（两入口+键位提示）+ 长文本粘贴转文件（4 配置字段已在）+ WSL 启动器重写提示 + 启动埋点 + dirKinds 技术栈探测缓存 + pane 进场动画 | 中 | mt-app | 🟡 Z 批（合并 `2dbc52f`）：关窗确认、自建 toast、双音 WAV、长粘贴转文件（SSH 分支随 #28）、WSL 覆盖提示、smartCopyPaste。tail-shell 批（`5b98de1`）：版本自检+ActivityBar 更新按钮（纠正口径：原版是**有新版本才出现的独立按钮**非设置钮红点，圆点闪烁待 reduce 闸）、FirstRunGuide（🟡 缺 SSH 远程入口随 #28）、启动埋点（本地 stderr 计时非遥测，单进程砍掉 epoch 对齐半场）。dirKinds 探测 ✅ tail-lists 批、pane 进场动画 ✅ tail-anim 批（淡入不缩放，理由见进度看板记档）。非 SSH 部分至此全清，剩 FirstRunGuide SSH 入口与长粘贴 SSH 分支随 #28 |
 
 ### 其他细项（散落，随所在批次带走）
 
