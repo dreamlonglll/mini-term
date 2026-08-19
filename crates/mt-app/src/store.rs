@@ -84,10 +84,6 @@ pub struct UsagePrefs {
 
 /// 一次「关联 SSH」保存的结果(`SshAssocModal.tsx::handleSave` 收尾那一段
 /// 要的全部素材)。由 [`AppStore::apply_ssh_assoc`] 返回。
-///
-/// ⚠️ `allow(dead_code)` 与 SSH 那一整块 impl 同理:读这些字段的是 BB-b 的
-/// 弹窗(三档提示文案 + 范围计数)。**BB-b 接完线后删掉这一行**。
-#[allow(dead_code)]
 pub struct SshAssocOutcome {
     /// 保存后该项目是否处于「已启用 SSH 工具」状态。
     pub enabled: bool,
@@ -102,6 +98,11 @@ pub struct SshAssocOutcome {
     /// 这里带回只为调用方需要时展示/排查)。
     pub project_token: Option<String>,
     /// 注册器返回的中文提示(与装机版一字不差,不走 mt-i18n)。
+    /// ⚠️ **当前没有读者**,与原版一致:`EnableSshToolsResult` 也带 `message`,
+    /// 而 `SshAssocModal.tsx` 只取 `projectToken` —— 提示文案是弹窗自己按
+    /// 启用/更新/停用三档拼的,注册器那句只进日志面。字段留着是为了不丢
+    /// 服务层的返回信息(要排查「注册器到底做了什么」时它是唯一线索)。
+    #[allow(dead_code)]
     pub message: String,
 }
 
@@ -529,6 +530,28 @@ impl AppStore {
         }
         project.description = next;
         self.save_config_soon(cx);
+        cx.notify();
+    }
+
+    /// 项目级环境变量(`ProjectEnvVarsModal` 的落盘那一半)。
+    ///
+    /// **立即落盘**而不是 500ms 防抖:整屏手填的键值对不该在防抖窗口里被一次
+    /// 崩溃吃掉(与 SSH 连接同一条理由)。入参已由弹窗清洗过 —— 这里不做校验,
+    /// 校验的唯一实现在 `env_vars::compute_errors`(单测钉死)。
+    ///
+    /// 生效面:只影响**之后新建**的终端(`start_pty` 里读 `env_vars`),
+    /// 已有终端不受影响 —— 弹窗底栏那句脚注说的就是这件事。
+    pub fn set_project_env_vars(
+        &mut self,
+        project_id: &str,
+        vars: Vec<mt_config::ProjectEnvVar>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(project) = self.config.projects.iter_mut().find(|p| p.id == project_id) else {
+            return;
+        };
+        project.env_vars = vars;
+        self.save_config_now();
         cx.notify();
     }
 
@@ -2370,10 +2393,9 @@ impl AppStore {
 // ③ 「关联 SSH」的启用/停用(`SshAssocModal.tsx::handleSave`);
 // 外加断线重连(`PaneGroup.tsx::handleReconnect` + `resetPaneForReconnect`)。
 //
-// ⚠️ 整块挂 `allow(dead_code)`:BB-a 只做数据层,消费方(BB-b 的三个 Modal +
-// 远程项目 UI + 断线遮罩)还不存在。**BB-b 接完线后把这行删掉** —— 留着会
-// 把「某个入口忘了接」也一并盖住。
-#[allow(dead_code)]
+// BB-b 已把消费方全部接上(三个弹窗 + 远程项目 UI + 断线遮罩 + 文件树/会话
+// 面板的远程分流),BB-a 留的 `allow(dead_code)` 随之删除 —— 从此这里多一个
+// 没人调的函数就会在 `cargo check` 里红。
 impl AppStore {
     /// 已保存的 SSH 连接(`config.sshConnections`)。
     pub fn ssh_connections(&self) -> &[SshConnection] {
@@ -2685,12 +2707,10 @@ impl AppStore {
     // 断线重连(exitedPtyIds 体系的写侧)
     // =======================================================================
 
-    /// 摘掉一个 PTY 的「已退出」登记(`store.ts::clearPtyExited`)。
-    pub fn clear_pty_exited(&mut self, pty_id: u32, cx: &mut Context<Self>) {
-        if self.exited_ptys.remove(&pty_id) {
-            cx.notify();
-        }
-    }
+    // 原版 `store.ts::clearPtyExited` 在这里**刻意没有对应物**:
+    // GPUI 侧唯一的调用时机是重连,而 `reset_pane_for_reconnect` 走的
+    // `dispose_terminal` 已经把退出登记连同标记/游标一起摘了(见那边的注释)。
+    // 再留一个公开的单点摘除函数只会多一条会漂移的路。
 
     /// 远程 pane 重连:回收旧 PTY(连同标记/退出登记),就地起一条新的。
     ///

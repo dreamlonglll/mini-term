@@ -228,6 +228,42 @@ pub const SETTINGS: &[Shape] = &[
     ),
 ];
 
+/// SSH 连接。原版 `ICON_SSH`(`ActivityBar.tsx:42-47`)—— 一个终端窗口:
+///
+/// ```text
+/// <rect x="2" y="3" width="12" height="10" rx="1.5" />
+/// <path d="M4.8 6.5 6.6 8l-1.8 1.5M8.4 10h2.8" />
+/// ```
+///
+/// 那条 path 是**两笔**:提示符 `>`(折线 4.8,6.5 → 6.6,8 → 4.8,9.5)与光标
+/// 下划线(8.4,10 → 11.2,10)。中间的 `M` 是抬笔,形状 DSL 没有抬笔语义,
+/// 连成一条会多出一道从 (4.8,9.5) 斜拉到 (8.4,10) 的假边(与 [`UPDATE`] 同款拆笔)。
+pub const SSH: &[Shape] = &[
+    Shape::line(
+        Ink::Current,
+        STROKE,
+        Geom::Rect {
+            x: u(2.0),
+            y: u(3.0),
+            w: u(12.0),
+            h: u(10.0),
+            round: u(1.5),
+        },
+    ),
+    // 提示符 `>`:`M4.8 6.5 L6.6 8 l-1.8 1.5`
+    Shape::line(
+        Ink::Current,
+        STROKE,
+        Geom::Polyline(&[(u(4.8), u(6.5)), (u(6.6), u(8.0)), (u(4.8), u(9.5))]),
+    ),
+    // 光标下划线:`M8.4 10 h2.8`
+    Shape::line(
+        Ink::Current,
+        STROKE,
+        Geom::Polyline(&[(u(8.4), u(10.0)), (u(11.2), u(10.0))]),
+    ),
+];
+
 /// 有新版本时才出现的「更新提醒」。原版 `ICON_UPDATE`(`ActivityBar.tsx:60-65`)——
 /// 一根向上的箭头 + 底下一道横线(「上传/升级」的常见字形):
 ///
@@ -440,7 +476,7 @@ mod tests {
     #[test]
     fn 边条图标的点全在单位方框内() {
         let mut points = 0usize;
-        for shapes in [PANEL, SESSIONS, GIT, STATS, SETTINGS, MOBILE, UPDATE] {
+        for shapes in [PANEL, SESSIONS, GIT, STATS, SETTINGS, MOBILE, SSH, UPDATE] {
             for shape in shapes {
                 let (pts, _) = shape.geom.points();
                 for (x, y) in pts {
@@ -507,6 +543,31 @@ mod tests {
                 assert!(!badge_blinks(s), "减弱动效下 {s:?} 一律不闪");
             }
         });
+    }
+
+    /// SSH 图标是**三笔**:窗口框 / 提示符 `>` / 光标下划线。
+    ///
+    /// 合并成两笔(把提示符与下划线连成一条折线)会多出一道
+    /// (4.8,9.5)→(8.4,10) 的假边 —— 原版那条 path 在那里是 `M`(抬笔)。
+    #[test]
+    fn ssh图标是三笔且提示符对称() {
+        assert_eq!(SSH.len(), 3);
+        assert!(matches!(SSH[0].geom, Geom::Rect { .. }), "第一笔是窗口框");
+        let Geom::Polyline(caret) = SSH[1].geom else {
+            panic!("第二笔应该是提示符折线");
+        };
+        // `>` 的上下两臂等长、尖端在中间高度
+        assert_eq!(caret.len(), 3);
+        assert_eq!(caret[0].0, caret[2].0, "两臂起点横坐标相同");
+        assert!(
+            ((caret[1].1 - caret[0].1) - (caret[2].1 - caret[1].1)).abs() < 1e-6,
+            "尖端上下对称"
+        );
+        let Geom::Polyline(underline) = SSH[2].geom else {
+            panic!("第三笔应该是光标下划线");
+        };
+        assert_eq!(underline.len(), 2);
+        assert_eq!(underline[0].1, underline[1].1, "下划线是水平的");
     }
 
     /// 更新圆点**恒闪**(原版没有状态之分),只过减弱动效那道闸。

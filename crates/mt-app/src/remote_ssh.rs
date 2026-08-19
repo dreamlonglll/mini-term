@@ -46,12 +46,6 @@
 //! [`SshConnection`] 再传进来** —— 断链(连接已删)判定前移到
 //! [`find_connection`],它是纯函数、有单测。
 
-// ⚠️ BB-a 只做数据层/服务层,本模块的消费方(BB-b 的三个 Modal + 远程项目 UI +
-// 断线遮罩 + 文件树/会话面板的远程分流)还不存在,`dead_code` 会把整份公开
-// API 报成未使用。**BB-b 接完线后删掉这一行** —— 留着会把「某个入口忘了接」
-// 也一并盖住。
-#![allow(dead_code)]
-
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -721,6 +715,11 @@ pub fn validate_dir(conn: &SshConnection, path: &str) -> Result<String, String> 
 /// 原版没有独立的「测试连接」command(SshModal 只做 CRUD),这里把
 /// [`validate_dir`] 的前半段单独暴露,BB-b 若要做「测试」按钮可以直接用 ——
 /// 不新增任何行为,失败文案与真实使用同源。
+/// ⚠️ **有意保留的无调用点代码**(窄作用域 `allow`,不是整模块的那种):
+/// BB-b 逐字复刻 `SshModal.tsx` 时确认原版**没有**「测试连接」按钮,所以没有
+/// 入口接它。删掉的话哪天要加这颗按钮又得把同一段重写一遍,而它与
+/// [`validate_dir`] 共用同一条失败面 —— 留着零成本。
+#[allow(dead_code)]
 pub fn probe_connection(conn: &SshConnection) -> Result<String, String> {
     validate_dir(conn, "~")
 }
@@ -1124,6 +1123,11 @@ pub struct RemoteSessionContent {
     pub messages: Vec<AiSessionMessage>,
     /// 下次增量读取应传入的字节偏移(指向已解析的最后一个完整行之后)。
     /// 首次调用传 offset=0 拿全量;之后传上次返回的 `next_offset` 拿增量。
+    ///
+    /// ⚠️ **当前没有读者**,与原版一致:`SessionViewerModal.tsx:70-72` 的注释
+    /// 原话是「后端支持增量 offset(返回 nextOffset 供下次续读),
+    /// nextOffset 留给后续需要增量刷新的调用方」—— 两侧都只做一次性全量读。
+    #[allow(dead_code)]
     pub next_offset: u64,
 }
 

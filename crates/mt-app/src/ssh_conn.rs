@@ -10,12 +10,6 @@
 //!
 //! 全是纯函数,不碰 store、不碰网络,单测直接钉。
 
-// ⚠️ BB-a 只做数据层/服务层,本模块的消费方(BB-b 的三个 Modal + 远程项目 UI +
-// 断线遮罩 + 文件树/会话面板的远程分流)还不存在,`dead_code` 会把整份公开
-// API 报成未使用。**BB-b 接完线后删掉这一行** —— 留着会把「某个入口忘了接」
-// 也一并盖住。
-#![allow(dead_code)]
-
 use mt_config::{ProjectConfig, SshConnection};
 
 /// `user@host:port` 摘要(端口为 22 时省略)。

@@ -40,6 +40,7 @@ use gpui::{
     InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Point,
     Render, Styled, Task, Window, div, prelude::FluentBuilder, px,
 };
+use mt_config::SshConnection;
 use mt_pty::{PtySession, PtySpawn};
 use mt_terminal::alacritty_terminal::event::Event as TermEvent;
 use mt_terminal::alacritty_terminal::grid::{Dimensions as _, Scroll};
@@ -630,6 +631,21 @@ impl TerminalPane {
         window.focus(&self.focus);
     }
 
+    /// 注册 SSH 密码自动填充(原版的 `arm_ssh_autofill` command)。
+    ///
+    /// 两个调用点、两种 `disarm_on_input`:
+    /// - 远程项目起 pane 时(`RemoteLaunchExtras`)传 `true` —— 那条链路 ssh 是
+    ///   PTY 的子进程本身,用户一打字就说明认证已经过去了;
+    /// - 终端右键「SSH 连接」传 `false`(与原版 command 同参)—— 那是往一个
+    ///   活着的 shell 里敲 `ssh …`,写命令这个动作本身会经过输入观察器。
+    ///
+    /// PTY 已经没了(pane 起失败 / 已退出)时静默不做。
+    pub fn arm_ssh_autofill(&self, password: String, disarm_on_input: bool) {
+        if let Some(session) = self.pty.as_ref() {
+            session.arm_ssh_autofill(password, disarm_on_input);
+        }
+    }
+
     /// 当前有没有可复制的选区(空串不算 —— 选中一段空白后「复制」该是灰的)。
     fn has_selection(&self) -> bool {
         self.emulator
@@ -705,6 +721,68 @@ impl TerminalPane {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn conn(name: &str, group: Option<&str>) -> SshConnection {
+        SshConnection {
+            id: format!("id-{name}"),
+            name: name.to_string(),
+            host: "h".into(),
+            port: 22,
+            user: "u".into(),
+            password: None,
+            identity_file: None,
+            group: group.map(str::to_string),
+        }
+    }
+
+    /// 分桶保持**首次出现顺序**,未分组桶留在它自然出现的位置
+    /// (与三个 SSH 弹窗那份「未分组恒在最后」的口径**不同**,别混用)。
+    #[test]
+    fn ssh子菜单按首次出现顺序分桶() {
+        let list = vec![
+            conn("a", None),
+            conn("b", Some("内网")),
+            conn("c", None),
+            conn("d", Some("内网")),
+            conn("e", Some("客户A")),
+        ];
+        let buckets = ssh_submenu_buckets(&list);
+        assert_eq!(buckets.len(), 3);
+        assert_eq!(buckets[0].0, None, "未分组桶先出现就排第一");
+        assert_eq!(buckets[0].1.len(), 2);
+        assert_eq!(buckets[1].0.as_deref(), Some("内网"));
+        assert_eq!(buckets[1].1.len(), 2);
+        assert_eq!(buckets[2].0.as_deref(), Some("客户A"));
+    }
+
+    /// 空白组名视为未分组(与 `normalizeGroup` 同)。
+    #[test]
+    fn ssh子菜单空白组名算未分组() {
+        let list = vec![conn("a", Some("  ")), conn("b", Some(""))];
+        let buckets = ssh_submenu_buckets(&list);
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0].0, None);
+    }
+
+    /// 命令行:默认端口不写 `-p`,私钥路径**反斜杠换正斜杠并加引号**。
+    #[test]
+    fn ssh命令行拼装() {
+        let mut c = conn("x", None);
+        assert_eq!(build_ssh_command(&c, None), "ssh u@h");
+        c.port = 2222;
+        assert_eq!(build_ssh_command(&c, None), "ssh -p 2222 u@h");
+        // 端口 0(配置缺省)按默认端口处理
+        c.port = 0;
+        assert_eq!(build_ssh_command(&c, None), "ssh u@h");
+        c.port = 22;
+        assert_eq!(
+            build_ssh_command(&c, Some(r"C:\keys\id_rsa")),
+            "ssh -i \"C:/keys/id_rsa\" u@h",
+            "双引号里的反斜杠会被 bash/Nushell 当转义符"
+        );
+        // 空白私钥路径等于没配
+        assert_eq!(build_ssh_command(&c, Some("   ")), "ssh u@h");
+    }
 
     /// 没开鼠标上报 = 本地菜单照弹(修饰键无关)。
     #[test]
@@ -940,6 +1018,133 @@ fn branch_entries_for_pty(pty_id: u32, cx: &mut gpui::App) -> Vec<menu::MenuEntr
     crate::branch_family::branch_menu_entries(&store, &project_id, &pane_id, project_path, &segment)
 }
 
+// ─── 终端右键的「SSH 连接」子菜单(`TerminalInstance.tsx:60-82`) ───
+
+/// 按 `group` 归类,**保持首次出现顺序**且未分组桶留在它自然出现的位置。
+///
+/// ⚠️ 与 [`crate::ssh_conn::build_group_buckets`] **不是同一个口径**:那个是
+/// 三个 SSH 弹窗用的「具名组在前、未分组桶恒在最后」;这里照抄原版
+/// `buildSshSubmenu` 的就地分桶 —— 菜单是按连接表原序读下来的。
+fn ssh_submenu_buckets(connections: &[SshConnection]) -> Vec<(Option<String>, Vec<SshConnection>)> {
+    let mut buckets: Vec<(Option<String>, Vec<SshConnection>)> = Vec::new();
+    for conn in connections {
+        let group = conn
+            .group
+            .as_deref()
+            .map(str::trim)
+            .filter(|g| !g.is_empty())
+            .map(str::to_string);
+        match buckets.iter_mut().find(|(g, _)| *g == group) {
+            Some((_, items)) => items.push(conn.clone()),
+            None => buckets.push((group, vec![conn.clone()])),
+        }
+    }
+    buckets
+}
+
+/// 把一条连接拼成 `ssh` 命令行(`buildSshCommand`)。
+///
+/// `identity_path` 是解析后的私钥路径(可能是 `prepare_ssh_key` 收紧权限后的
+/// 临时副本),未配置私钥时传 `None`。
+///
+/// **反斜杠一律换成正斜杠**:Nushell / bash 会把双引号里的 `\` 当转义符从而报错,
+/// 而 Windows OpenSSH 接受正斜杠路径 —— 正斜杠在所有 shell 里都安全(原版原话)。
+fn build_ssh_command(conn: &SshConnection, identity_path: Option<&str>) -> String {
+    let mut parts = vec!["ssh".to_string()];
+    if conn.port != 0 && conn.port != 22 {
+        parts.push("-p".into());
+        parts.push(conn.port.to_string());
+    }
+    if let Some(identity) = identity_path.map(str::trim).filter(|p| !p.is_empty()) {
+        parts.push("-i".into());
+        parts.push(format!("\"{}\"", identity.replace('\\', "/")));
+    }
+    parts.push(format!("{}@{}", conn.user, conn.host));
+    parts.join(" ")
+}
+
+/// 在指定终端里连 SSH:有密码先注册自动填充,再写入 `ssh` 命令并回车。
+///
+/// 私钥那一步(`mt_core::prepare_ssh_key`:复制成权限收紧的临时副本,绕开
+/// OpenSSH 的 `UNPROTECTED PRIVATE KEY FILE` 拒绝)是**阻塞文件 IO**,丢后台;
+/// 失败**回退原始路径**让 ssh 自己报错(原版 `console.error` 后照走)。
+fn connect_ssh(pty_id: u32, conn: SshConnection, window: &mut Window, cx: &mut App) {
+    let Some(terminal) = AppStore::global(cx).read(cx).terminal(pty_id).cloned() else {
+        return;
+    };
+    if let Some(password) = conn.password.clone().filter(|p| !p.is_empty()) {
+        // `disarm_on_input = false`:与原版 `arm_ssh_autofill` command 同参
+        // (那条路是用户手动敲 `ssh`,首次输入不该把 autofill 解掉)
+        terminal.read(cx).arm_ssh_autofill(password, false);
+    }
+    let identity = conn
+        .identity_file
+        .clone()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty());
+    window
+        .spawn(cx, async move |cx| {
+            let identity = match identity {
+                Some(path) => {
+                    let source = path.clone();
+                    let prepared = cx
+                        .background_executor()
+                        .spawn(async move { mt_core::prepare_ssh_key(&source) })
+                        .await;
+                    match prepared {
+                        Ok(temp) => Some(temp),
+                        Err(err) => {
+                            eprintln!("[ssh] 准备私钥临时副本失败,回退原始路径: {err}");
+                            Some(path)
+                        }
+                    }
+                }
+                None => None,
+            };
+            let command = build_ssh_command(&conn, identity.as_deref());
+            let _ = cx.update(|window, cx| {
+                let line = format!("{command}\r");
+                terminal.update(cx, |pane, cx| pane.write(line.as_bytes(), cx));
+                // 写完把键盘还给终端(原版 `term.focus()`)
+                terminal.read(cx).focus(window);
+            });
+        })
+        .detach();
+}
+
+/// 右键菜单里的 SSH 那一项:有连接就是子菜单,没有就是一项置灰的占位
+/// (原版 `sshConnections.length > 0 ? {submenu} : {disabled}`)。
+fn ssh_menu_entry(pty_id: u32, cx: &App) -> menu::MenuEntry {
+    let connections = AppStore::global(cx).read(cx).ssh_connections().to_vec();
+    if connections.is_empty() {
+        return MenuItem::new(t("terminal", "sshConnectEmpty"))
+            .disabled(true)
+            .into();
+    }
+    let buckets = ssh_submenu_buckets(&connections);
+    let has_named = buckets.iter().any(|(g, _)| g.is_some());
+    let mut submenu: Vec<menu::MenuEntry> = Vec::new();
+    for (group, items) in buckets {
+        // 只有一个未分组桶时不画分组标题(原版 `bucket.group || hasNamedGroup`)
+        if group.is_some() || has_named {
+            submenu.push(menu::MenuEntry::Header(
+                group
+                    .clone()
+                    .map(gpui::SharedString::from)
+                    .unwrap_or_else(|| t("terminal", "ungrouped").into()),
+            ));
+        }
+        for conn in items {
+            submenu.push(menu::item(conn.name.clone(), move |window, cx| {
+                connect_ssh(pty_id, conn.clone(), window, cx);
+            }));
+        }
+    }
+    MenuItem::new(t("terminal", "sshConnect"))
+        .submenu(submenu)
+        .into()
+}
+
 /// 终端里的右键该弹**本地菜单**吗。
 ///
 /// 判据只有一条,且必须与 mt-ui 的元素侧同源([`prefers_local_handling`]):
@@ -983,8 +1188,7 @@ impl Render for TerminalPane {
             .relative()
             .bg(self.theme.background)
             // 终端右键菜单(`TerminalInstance.tsx` 的 handleContextMenu):
-            // 「复制 / 粘贴」+ 分支段。SSH 子菜单那一段的功能 GPUI 侧还没有,
-            // 不放占位。
+            // 「复制 / 粘贴」+ 分支段 + SSH 子菜单段。
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
@@ -1024,6 +1228,10 @@ impl Render for TerminalPane {
                     // 会话分支入口:终端本体右键与 tab 右键**同权**(用户在哪儿
                     // 右键都找得到),显隐口径与项的实现都是同一份
                     entries.extend(branch_entries_for_pty(this.pty_id, cx));
+                    // SSH 段:**恒在**(一条连接都没有时是一项置灰的
+                    // 「SSH 连接(暂无)」,原版 `TerminalInstance.tsx:392-395`)
+                    entries.push(menu::separator());
+                    entries.push(ssh_menu_entry(this.pty_id, cx));
                     menu::show(event.position, entries, window, cx);
                 }),
             )

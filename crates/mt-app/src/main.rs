@@ -40,6 +40,7 @@ mod ai;
 mod branch_family;
 mod clipboard;
 mod dnd;
+mod env_vars;
 mod file_tree;
 mod file_viewer;
 mod first_run;
@@ -72,13 +73,16 @@ mod project_list;
 mod project_switcher;
 mod project_tree;
 mod prompt;
+mod remote_project;
 mod remote_ssh;
 mod search_modal;
 mod session_branch;
 mod session_panel;
 mod settings;
 mod shell_ops;
+mod ssh_assoc;
 mod ssh_conn;
+mod ssh_panel;
 mod ssh_registry;
 mod startup_trace;
 mod store;
@@ -1090,7 +1094,8 @@ impl Render for Workspace {
         // 尺寸与配色照抄 `src/components/ActivityBar.tsx`(44px 宽、32px 方按钮、
         // 18px 图标、激活态左侧 accent 竖条);图形是原版那几条 SVG path 的
         // 逐点搬运,见 [`activity_bar`] 模块注释(以及「为什么不用 IconName」)。
-        // SSH / 移动端 / Git / 更新提醒四个入口 GPUI 侧还没有功能,**不放占位**。
+        // 原版 8 颗按钮至此全部就位(BB-b 补上最后一颗 SSH);末尾那颗
+        // 「跳到已完成」是 GPUI 独有的。
         let toggle_strip = div()
             .flex_none()
             .w(px(activity_bar::WIDTH))
@@ -1162,18 +1167,9 @@ impl Render for Workspace {
                 )
                 .on_click(cx.listener(|this, _event, window, cx| this.toggle_usage(window, cx))),
             )
-            // 「移动端」面板。位置照原版排在「设置」之前(`ActivityBar.tsx:167-170`)
-            .child(
-                activity_bar::strip_button(
-                    "open-mobile-relay",
-                    activity_bar::MOBILE,
-                    t("app", "activityBar.mobile"),
-                    false,
-                )
-                .on_click(cx.listener(|_this, _event, window, cx| {
-                    mobile_panel::open(window, cx);
-                })),
-            )
+            // ⚠️ 分隔线之后四颗按钮的**顺序照原版**(`ActivityBar.tsx:155-172`):
+            // 用量 → 设置 → SSH → 移动端。U 批把「移动端」排在了「设置」之前
+            // (那条注释把原版位置写反了),随本批补 SSH 时一并归位。
             .child(
                 activity_bar::strip_button(
                     "open-settings",
@@ -1183,6 +1179,29 @@ impl Render for Workspace {
                 )
                 .on_click(cx.listener(|this, _event, window, cx| {
                     settings::open_settings(this.store.clone(), None, window, cx);
+                })),
+            )
+            // 「SSH 连接」面板(连接与分组的增删改)
+            .child(
+                activity_bar::strip_button(
+                    "open-ssh",
+                    activity_bar::SSH,
+                    t("app", "activityBar.ssh"),
+                    false,
+                )
+                .on_click(cx.listener(|_this, _event, window, cx| {
+                    ssh_panel::open(window, cx);
+                })),
+            )
+            .child(
+                activity_bar::strip_button(
+                    "open-mobile-relay",
+                    activity_bar::MOBILE,
+                    t("app", "activityBar.mobile"),
+                    false,
+                )
+                .on_click(cx.listener(|_this, _event, window, cx| {
+                    mobile_panel::open(window, cx);
                 })),
             )
             // 「有新版本」按钮。**只在查到更新时才出现**(原版 `updateVersion &&`,

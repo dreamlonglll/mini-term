@@ -101,9 +101,8 @@ pub enum MenuEntry {
     Separator,
     /// 不可交互的分组标题(`.ctx-menu-header`)。
     ///
-    /// 基件带着它是因为原版的分组树菜单(「移动到分组」)靠它分段;
-    /// 那批功能还没做,所以本轮四处菜单都没用上。
-    #[allow(dead_code)]
+    /// 唯一的真实消费方是终端右键的「SSH 连接」子菜单(BB-b 接上):
+    /// 连接按 group 分段,段与段之间靠它隔开。
     Header(SharedString),
 }
 

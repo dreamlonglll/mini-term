@@ -93,6 +93,17 @@ pub mod kind {
     /// 「移动端」面板(中转地址 / 配对二维码 / AI 启动器)。原版没有防叠开,
     /// 是 audit 记的缺口;重置配对的确认框是**另一种类**,照样能叠在它之上。
     pub const MOBILE_RELAY: &str = "mobile-relay";
+    /// 「SSH 连接」面板(连接与分组的 CRUD)。删除连接的确认框是**另一种类**
+    /// (`CONFIRM`),叠在它之上,Esc 只关确认框 —— 与原版 `overlayStack` 同语义。
+    pub const SSH_PANEL: &str = "ssh-panel";
+    /// 「关联 SSH」弹窗(项目右键菜单)。与 [`SSH_PANEL`] **不同种类**:
+    /// 两个都开着是合法的(在关联弹窗里发现连接名不对,回头去改)。
+    pub const SSH_ASSOC: &str = "ssh-assoc";
+    /// 「添加远程项目」弹窗。三个入口(项目列表底部 SSH 钮 / 分组右键 /
+    /// 首启引导第二颗按钮)共用这一种类,防的正是「两处入口各开一个」。
+    pub const ADD_REMOTE_PROJECT: &str = "add-remote-project";
+    /// 项目环境变量弹窗。
+    pub const PROJECT_ENV_VARS: &str = "project-env-vars";
 }
 
 /// 栈里的一条。

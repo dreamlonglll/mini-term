@@ -3,8 +3,8 @@
 //! # 领位图标
 //!
 //! 原版是「SSH > 技术栈 > 通用」三选一,**恒显**(每行都有图标,缩进才对得齐)。
-//! 这里没有 SSH 远程项目(mt-ssh 未进 crates/),所以只剩两档:
-//! 技术栈徽标([`mt_ui::icons::TechIcon`])/ 通用目录图标。
+//! BB-b 补上第一档:SSH 远程项目固定画 [`SERVER`] 服务器图标(断链时转 error 色),
+//! 其后才轮到技术栈徽标([`mt_ui::icons::TechIcon`])与通用目录图标。
 //!
 //! 技术栈取值走 [`resolve_project_kind`]:手动 `kindOverride` 优先,没设过就用
 //! [`crate::project_kind`] 的目录探测缓存(结果住在 store 的 `dir_kinds`,
@@ -73,9 +73,69 @@ const AI_ICON_SIZE: f32 = 14.0;
 /// worktree 徽章最多显示多宽(原版 `max-w-[100px] truncate`)。
 const WORKTREE_BADGE_MAX_W: f32 = 100.0;
 
-/// 项目行的领位图标。`kind` 认得出就是技术栈徽标,否则退通用目录图标
-/// (对应原版认不出时的 `Package` 兜底,同样取 `--color-file`)。
-fn project_icon(kind: Option<ProjectKind>) -> AnyElement {
+/// 远程连接名徽章最多多宽(原版 `max-w-[80px] truncate`)。
+const REMOTE_BADGE_MAX_W: f32 = 80.0;
+
+/// SSH 远程项目的领位图标 —— lucide 的 `Server`(原版 `<Server size={14}/>`)。
+///
+/// mt-ui 的图标表里没有对应项,用同一套形状 DSL 在宿主侧拼一份(与
+/// [`crate::dnd::BOXES_SHAPES`] 同一条口径,**不动 mt-ui 的公开 API**)。
+/// 原始 viewBox 是 24,顶点除以 24 归一;`stroke-width=1.5`(lucide 默认 2,
+/// 原版显式传了 1.5)同样除以 24。两颗指示灯用小实心圆代替 lucide 的
+/// 「零长度圆头线段」—— 形状 DSL 没有 linecap 语义。
+const SERVER: &[mt_ui::icons::vector::Shape] = &[
+    mt_ui::icons::vector::Shape::line(
+        mt_ui::icons::vector::Ink::Current,
+        1.5 / 24.0,
+        mt_ui::icons::vector::Geom::Rect {
+            x: 2.0 / 24.0,
+            y: 2.0 / 24.0,
+            w: 20.0 / 24.0,
+            h: 8.0 / 24.0,
+            round: 2.0 / 24.0,
+        },
+    ),
+    mt_ui::icons::vector::Shape::line(
+        mt_ui::icons::vector::Ink::Current,
+        1.5 / 24.0,
+        mt_ui::icons::vector::Geom::Rect {
+            x: 2.0 / 24.0,
+            y: 14.0 / 24.0,
+            w: 20.0 / 24.0,
+            h: 8.0 / 24.0,
+            round: 2.0 / 24.0,
+        },
+    ),
+    mt_ui::icons::vector::Shape::fill(
+        mt_ui::icons::vector::Ink::Current,
+        mt_ui::icons::vector::Geom::Circle {
+            c: (6.0 / 24.0, 6.0 / 24.0),
+            r: 1.1 / 24.0,
+        },
+    ),
+    mt_ui::icons::vector::Shape::fill(
+        mt_ui::icons::vector::Ink::Current,
+        mt_ui::icons::vector::Geom::Circle {
+            c: (6.0 / 24.0, 18.0 / 24.0),
+            r: 1.1 / 24.0,
+        },
+    ),
+];
+
+/// 项目行的领位图标。**远程项目优先**(原版 `isRemote ? <Server/> : ...`):
+/// 断链(连接被删)时转 error 色,否则 info 色;本地项目 `kind` 认得出就是
+/// 技术栈徽标,否则退通用目录图标(对应原版认不出时的 `Package` 兜底,
+/// 同样取 `--color-file`)。
+fn project_icon(kind: Option<ProjectKind>, remote: Option<RemoteBadge>) -> AnyElement {
+    if let Some(remote) = remote {
+        return VectorIcon::new(SERVER, px(14.0))
+            .ink(if remote.broken {
+                ui::color_error()
+            } else {
+                ui::color_info()
+            })
+            .into_any_element();
+    }
     match kind {
         Some(kind) => TechIcon::new(kind).size(px(14.0)).into_any_element(),
         None => FileIcon::of_kind(FileKind::Directory)
@@ -83,6 +143,39 @@ fn project_icon(kind: Option<ProjectKind>) -> AnyElement {
             .color(ui::color_file())
             .into_any_element(),
     }
+}
+
+/// 远程项目行尾那枚徽章要画的东西。`None`(整个 `Option`)= 不是远程项目。
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RemoteBadge {
+    /// 连接名;断链时是空串(徽章改画「断链」两字)。
+    name: String,
+    /// `user@host:port`,挂 tooltip 用;断链时是空串。
+    summary: String,
+    /// 引用的连接已被删除。
+    broken: bool,
+}
+
+/// 项目 + 连接表 → 徽章数据。**不是远程项目返回 `None`**。
+///
+/// 判定与标签都走 [`crate::ssh_conn`] 的谓词,与文件树 / 会话面板 / 断线遮罩
+/// 共用同一把尺子 —— 三处各判一次是 v0.6.x 那批 SSH bug 的来源。
+fn remote_badge(project: &ProjectConfig, connections: &[mt_config::SshConnection]) -> Option<RemoteBadge> {
+    if !crate::ssh_conn::is_remote_project(project) {
+        return None;
+    }
+    Some(match crate::ssh_conn::remote_connection(project, connections) {
+        Some(conn) => RemoteBadge {
+            name: conn.name.clone(),
+            summary: crate::ssh_conn::connection_summary(conn),
+            broken: false,
+        },
+        None => RemoteBadge {
+            name: String::new(),
+            summary: String::new(),
+            broken: true,
+        },
+    })
 }
 
 /// 完成标该不该出现(原版 `ProjectList.tsx:912` 的 `showDoneTag`)。
@@ -272,6 +365,9 @@ struct Row {
     ai_vendors: Vec<Option<AiVendor>>,
     /// 项目路径是某仓库的 linked worktree → `⎇ 分支名` 徽章。
     worktree_branch: Option<String>,
+    /// SSH 远程项目的领位图标 + 行尾徽章;`None` = 本地项目。
+    /// **同时是右键菜单的远程 gate 判据**(见 [`project_menu_actions`])。
+    remote: Option<RemoteBadge>,
 }
 
 /// 分组行要画的东西。
@@ -305,41 +401,58 @@ struct ExternalDrag {
 
 /// 项目行右键菜单的**项序**。`None` = 分隔线。
 ///
-/// 逐条对照 `ProjectList.tsx:699-833`,**只列目标功能已经落地的那几项**:
-/// 关联 SSH / 环境变量 / Worktree 管理 / WSL 会话在 GPUI 侧还没有功能,
-/// 占位一个点不动的菜单项比没有更糟。
+/// 逐条对照 `ProjectList.tsx:699-833`。唯一没搬的是「WSL 会话」子菜单
+/// (那块功能 GPUI 侧还没有,占位一个点不动的菜单项比没有更糟)。
+///
+/// # 远程项目 gate(原版 `isRemote ? [] : [...]`)
+///
+/// 本地专属入口一律隐藏:**资源管理器打开 / 关联 SSH / 环境变量 / Worktree 管理
+/// / 项目类型**。理由照抄原版注释:agent 已在远程机、envVars 不注入远程 shell
+/// (二期)、路径也不是本机可打开的位置、远程项目领位固定 SSH 图标。
+/// 保留的是重命名 / 编辑描述 / 复制绝对路径(远程 POSIX)/ 分组操作 / 移除。
 ///
 /// **分组那一段不在这张表里**:它是条件段(有没有分组、是不是子项目各不相同),
-/// 由 [`group_section`] 在 `ProjectKind` 之后动态插入 —— 位置与原版一致
-/// (项目类型子菜单之后、「移除项目」那条分隔线之前)。
+/// 由 [`group_section`] 在 [`ProjectMenuAction::GroupSection`] 这个位标处动态
+/// 插入(自带前置分隔线,无内容时整段消失)—— 位置与原版一致:项目类型子菜单
+/// 之后、「移除项目」那条分隔线之前;远程项目没有项目类型那一项,它就紧跟在
+/// 「复制绝对路径」后面(同样是原版的位置)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProjectMenuAction {
     Rename,
     EditDescription,
     OpenInFolder,
     CopyAbsolutePath,
+    /// 「关联 SSH」弹窗([`crate::ssh_assoc`])。
+    AssociateSsh,
+    /// 项目环境变量弹窗([`crate::env_vars`])。
+    EnvVars,
     /// Worktree 管理弹窗(V 批建好的 `git_worktree::open`)。
     Worktrees,
     /// 「项目类型」子菜单。
     ProjectKind,
+    /// 分组段的位标,见类型注释。
+    GroupSection,
     Remove,
 }
 
-fn project_menu_actions() -> Vec<Option<ProjectMenuAction>> {
+fn project_menu_actions(is_remote: bool) -> Vec<Option<ProjectMenuAction>> {
     use ProjectMenuAction::*;
-    vec![
-        Some(Rename),
-        Some(EditDescription),
-        Some(OpenInFolder),
-        Some(CopyAbsolutePath),
-        // 原版这条分隔线之后是「关联 SSH / 环境变量 / Worktree 管理」三连,
-        // 前两项在 GPUI 侧还没有功能,只剩 Worktrees 一项
-        None,
-        Some(Worktrees),
-        Some(ProjectKind),
-        None,
-        Some(Remove),
-    ]
+    let mut out = vec![Some(Rename), Some(EditDescription)];
+    if !is_remote {
+        out.push(Some(OpenInFolder));
+    }
+    out.push(Some(CopyAbsolutePath));
+    if !is_remote {
+        out.push(None);
+        out.push(Some(AssociateSsh));
+        out.push(Some(EnvVars));
+        out.push(Some(Worktrees));
+        out.push(Some(ProjectKind));
+    }
+    out.push(Some(GroupSection));
+    out.push(None);
+    out.push(Some(Remove));
+    out
 }
 
 /// 子菜单里「当前选中」的标记。原版是文本方案(不是图标):选中 `✓ `,
@@ -518,7 +631,7 @@ fn project_menu(
     tree: &[ProjectTreeItem],
 ) -> Vec<MenuEntry> {
     let mut entries = Vec::new();
-    for action in project_menu_actions() {
+    for action in project_menu_actions(row.remote.is_some()) {
         let Some(action) = action else {
             entries.push(menu::separator());
             continue;
@@ -597,17 +710,33 @@ fn project_menu(
                     },
                 )
             }
+            ProjectMenuAction::AssociateSsh => {
+                let store = store.clone();
+                let id = row.id.clone();
+                menu::item(t("projectList", "menu.associateSsh"), move |window, cx| {
+                    crate::ssh_assoc::open(store.clone(), &id, window, cx);
+                })
+            }
+            ProjectMenuAction::EnvVars => {
+                let store = store.clone();
+                let id = row.id.clone();
+                menu::item(t("projectList", "menu.envVars"), move |window, cx| {
+                    crate::env_vars::open(store.clone(), &id, window, cx);
+                })
+            }
             ProjectMenuAction::ProjectKind => {
-                let entry: MenuEntry = MenuItem::new(t("projectList", "menu.projectKind"))
+                MenuItem::new(t("projectList", "menu.projectKind"))
                     .submenu(kind_submenu(
                         store,
                         &row.id,
                         row.kind_override.as_deref(),
                         row.detected_kind,
                     ))
-                    .into();
-                entries.push(entry);
-                // 分组段紧跟在「项目类型」之后(原版就是这个位置),自带前置分隔线
+                    .into()
+            }
+            ProjectMenuAction::GroupSection => {
+                // 位标本身不产生菜单项:整段(含前置分隔线)由 group_section 给,
+                // 没内容时一条都不加
                 entries.extend(group_section(store, row, tree));
                 continue;
             }
@@ -634,8 +763,7 @@ fn project_menu(
     entries
 }
 
-/// 分组行右键菜单(`ProjectList.tsx:965-1007`)。六项连排、**无分隔线**;
-/// 其中「添加远程项目」需要 SSH,GPUI 侧没有这个功能,本批不放这项。
+/// 分组行右键菜单(`ProjectList.tsx:965-1007`)。六项连排、**无分隔线**。
 fn group_menu(
     view: &Entity<ProjectList>,
     store: &Entity<AppStore>,
@@ -662,6 +790,19 @@ fn group_menu(
         menu::item(t("projectList", "menu.addProject"), move |window, cx| {
             modal::open_add_project_into(store.clone(), Some(id.clone()), window, cx);
         })
+    });
+
+    // 「添加远程项目」紧跟「添加项目」(原版 `ProjectList.tsx:971`):
+    // 新项目直接落进该分组,分组折叠则展开
+    entries.push({
+        let store = store.clone();
+        let id = group.id.clone();
+        menu::item(
+            t("projectList", "menu.addRemoteProject"),
+            move |window, cx| {
+                crate::remote_project::open(store.clone(), Some(id.clone()), window, cx);
+            },
+        )
     });
 
     if group.depth > 0 {
@@ -1158,8 +1299,9 @@ impl ProjectList {
             self.preview = None;
             return None;
         }
-        let mini: Option<MiniLayout> =
-            layout.and_then(|l| pane_preview::snapshot_layout(l, store, auto_resume, cx));
+        let mini: Option<MiniLayout> = layout.and_then(|l| {
+            pane_preview::snapshot_layout(l, &preview.project_id, store, auto_resume, cx)
+        });
         let style = pane_preview::preview_style(store);
         let at = pane_preview::project_anchor(preview.anchor);
         Some(
@@ -1632,6 +1774,7 @@ impl Render for ProjectList {
                     );
                     // 探测缓存:`None` = 还没探完 / 已探但认不出,两种都走通用图标
                     let detected_kind = store.dir_kind(&p.path).flatten();
+                    let remote = remote_badge(p, store.ssh_connections());
                     let row = Row {
                         id: p.id.clone(),
                         name: p.name.clone(),
@@ -1646,7 +1789,13 @@ impl Render for ProjectList {
                         parent_group_id,
                         is_child,
                         ai_vendors,
-                        worktree_branch: self.worktree_branches.get(&p.path).cloned(),
+                        // 远程项目的路径是远端 POSIX 路径,本机 worktree 探测与它无关
+                        worktree_branch: if remote.is_some() {
+                            None
+                        } else {
+                            self.worktree_branches.get(&p.path).cloned()
+                        },
+                        remote,
                     };
                     let is_active = active.as_deref() == Some(row.id.as_str());
                     list = list.child(self.render_project(
@@ -1661,8 +1810,8 @@ impl Render for ProjectList {
             }
         }
 
-        // 底部按钮条(`ProjectList.tsx:1087-1113`)。原版三个,中间那个 `SSH`
-        // 要 AddRemoteProjectModal,GPUI 侧没有 SSH 功能 —— 本批不放,已记档。
+        // 底部按钮条(`ProjectList.tsx:1087-1113`):添加项目 / SSH / +。
+        // 中间那颗 `SSH` 走 `remote_project::open`(根层),BB-b 补齐。
         let dashed_button = |id: &'static str, label: SharedString, wide: bool| {
             div()
                 .id(id)
@@ -1697,6 +1846,19 @@ impl Render for ProjectList {
                 .on_click(move |_event, window, cx| {
                     modal::open_add_project(store_for_add.clone(), window, cx);
                 }),
+            )
+            .child(
+                dashed_button("add-remote-project", "SSH".into(), false)
+                    .tooltip(|window, cx| {
+                        gpui_component::tooltip::Tooltip::new(t(
+                            "projectList",
+                            "addRemoteProject",
+                        ))
+                        .build(window, cx)
+                    })
+                    .on_click(cx.listener(|this, _event, window, cx| {
+                        crate::remote_project::open(this.store.clone(), None, window, cx);
+                    })),
             )
             .child(
                 dashed_button("new-group", "+".into(), false)
@@ -2018,6 +2180,7 @@ impl ProjectList {
         let description = row.description.clone();
         let ai_vendors = row.ai_vendors.clone();
         let worktree_branch = row.worktree_branch.clone();
+        let remote = row.remote.clone();
         let row_for_menu = row.clone();
         let tree_for_menu: Vec<ProjectTreeItem> = tree.to_vec();
         let this = cx.entity();
@@ -2215,7 +2378,8 @@ impl ProjectList {
                             }),
                     )
                     // 领位是**项目身份图标**,每行都有、缩进才对得齐
-                    .child(project_icon(kind))
+                    // (SSH 远程 > 技术栈 > 通用,原版同序)
+                    .child(project_icon(kind, remote.clone()))
                     // AI 品牌堆叠:领位图标之后、名字之前,**只追加不覆盖**。
                     // 负边距抵掉行内 gap(6px),与领位图标只留 2px;图标之间同样 2px
                     .when(!ai_vendors.is_empty(), |el| {
@@ -2284,6 +2448,47 @@ impl ProjectList {
                                     }
                                 })
                                 .child(format!("⎇ {branch}")),
+                        )
+                    })
+                    // 远程徽章:连接名(断链时「断链」两字 + error 配色)。
+                    // 位置照原版 —— worktree 徽章之后、完成标/状态灯之前
+                    .when_some(remote, |el, remote| {
+                        let (fg, bg) = if remote.broken {
+                            (ui::color_error(), ui::with_alpha(ui::color_error(), 0.15))
+                        } else {
+                            (ui::text_muted(), ui::border_subtle())
+                        };
+                        let tip: SharedString = if remote.broken {
+                            t("projectList", "remoteBrokenTitle").into()
+                        } else {
+                            tr!(
+                                "projectList",
+                                "remoteBadgeTitle",
+                                summary = remote.summary.clone()
+                            )
+                            .into()
+                        };
+                        el.child(
+                            div()
+                                .id(SharedString::from(format!("remote-badge-{id}")))
+                                .flex_shrink_0()
+                                .max_w(px(REMOTE_BADGE_MAX_W))
+                                .truncate()
+                                .px(px(3.0))
+                                .rounded(px(3.0))
+                                .font_family("monospace")
+                                .text_size(ui::font_px(9.75))
+                                .text_color(fg)
+                                .bg(bg)
+                                .tooltip(move |window, cx| {
+                                    gpui_component::tooltip::Tooltip::new(tip.clone())
+                                        .build(window, cx)
+                                })
+                                .child(if remote.broken {
+                                    SharedString::from(t("projectList", "remoteBrokenBadge"))
+                                } else {
+                                    SharedString::from(remote.name.clone())
+                                }),
                         )
                     })
                     // 完成标 / 状态灯二选一,**idle 时两个都不画**
@@ -2374,16 +2579,16 @@ mod tests {
         });
     }
 
-    /// 菜单项序照抄原版(去掉功能未建的那几项)。
+    /// 菜单项序照抄原版。
     ///
-    /// ⚠️ Y 批把「Worktree 管理」接了上去(V 批的 `git_worktree::open` 已就绪),
-    /// 位置与原版一致:「复制绝对路径」之后那条分隔线之下、「项目类型」之上
-    /// (原版那一段是「关联 SSH / 环境变量 / Worktree 管理」三连,前两项仍未建)。
-    /// 于是期望向量多了一条分隔线与一项,分隔线总数 1 → 2。
+    /// ⚠️ 逐批同步的那条断言(V/Y 批口径):Y 批接上「Worktree 管理」;
+    /// BB-b 接上「关联 SSH / 环境变量」,并把分组段从 `ProjectKind` 的实现里
+    /// 提成显式位标 `GroupSection`(远程项目没有项目类型那一项,分组段得另有
+    /// 落点)。仍未建的只剩「WSL 会话」子菜单,不占位。
     #[test]
     fn 右键菜单项序与原版一致() {
         use ProjectMenuAction::*;
-        let actions = project_menu_actions();
+        let actions = project_menu_actions(false);
         assert_eq!(
             actions,
             vec![
@@ -2392,14 +2597,89 @@ mod tests {
                 Some(OpenInFolder),
                 Some(CopyAbsolutePath),
                 None,
+                Some(AssociateSsh),
+                Some(EnvVars),
                 Some(Worktrees),
                 Some(ProjectKind),
+                Some(GroupSection),
                 None,
                 Some(Remove),
             ]
         );
-        // 未建功能不占位:SSH / 环境变量 / WSL / 分组一个都不许出现
         assert_eq!(actions.iter().filter(|a| a.is_none()).count(), 2);
+    }
+
+    /// 远程项目的 gate(原版 `isRemote ? [] : [...]`):本地专属入口一律隐藏,
+    /// 保留重命名 / 编辑描述 / 复制绝对路径 / 分组段 / 移除。
+    #[test]
+    fn 远程项目隐藏本地专属菜单项() {
+        use ProjectMenuAction::*;
+        let actions = project_menu_actions(true);
+        assert_eq!(
+            actions,
+            vec![
+                Some(Rename),
+                Some(EditDescription),
+                Some(CopyAbsolutePath),
+                Some(GroupSection),
+                None,
+                Some(Remove),
+            ]
+        );
+        for hidden in [OpenInFolder, AssociateSsh, EnvVars, Worktrees, ProjectKind] {
+            assert!(
+                !actions.contains(&Some(hidden)),
+                "远程项目不该出现 {hidden:?}"
+            );
+        }
+        // 「复制绝对路径」必须留着 —— 远程 POSIX 路径照样要能复制走
+        assert!(actions.contains(&Some(CopyAbsolutePath)));
+    }
+
+    /// 远程徽章:本地项目没有;远程项目取连接名 + 摘要;连接被删 = 断链态。
+    #[test]
+    fn 远程徽章三态() {
+        let conns = vec![mt_config::SshConnection {
+            id: "c1".into(),
+            name: "生产".into(),
+            host: "h".into(),
+            port: 2222,
+            user: "root".into(),
+            password: None,
+            identity_file: None,
+            group: None,
+        }];
+        let mut p = project("p1", "/home/u/proj", None);
+        assert!(remote_badge(&p, &conns).is_none(), "本地项目没有徽章");
+
+        p.ssh_connection_id = Some("c1".into());
+        let badge = remote_badge(&p, &conns).expect("远程项目要有徽章");
+        assert_eq!(badge.name, "生产");
+        assert_eq!(badge.summary, "root@h:2222");
+        assert!(!badge.broken);
+
+        p.ssh_connection_id = Some("gone".into());
+        let broken = remote_badge(&p, &conns).expect("断链仍是远程项目");
+        assert!(broken.broken);
+        assert!(broken.name.is_empty(), "断链徽章画的是「断链」两字,不是连接名");
+    }
+
+    /// 服务器图标的顶点全在单位方框内(与边条图标同款体检)。
+    #[test]
+    fn 服务器图标在单位方框内() {
+        let mut points = 0usize;
+        for shape in SERVER {
+            let (pts, _) = shape.geom.points();
+            for (x, y) in pts {
+                assert!(
+                    (-0.001..=1.001).contains(&x) && (-0.001..=1.001).contains(&y),
+                    "越界点 ({x}, {y})"
+                );
+                points += 1;
+            }
+        }
+        assert!(points > 0);
+        assert_eq!(SERVER.len(), 4, "两层机箱 + 两颗指示灯");
     }
 
     /// 领位徽标:手动指定压过探测,`'none'` 是「明确关掉」不回退。

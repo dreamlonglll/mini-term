@@ -132,7 +132,12 @@ impl PaneState {
         }
     }
 
-    /// tab 上显示的名字:自定义名 > shell 名(远程连接名那一支等 mt-ssh 移入后再补)。
+    /// tab 上显示的名字:自定义名 > shell 名。
+    ///
+    /// ⚠️ **远程项目不要用这个** —— 三级口径「自定义名 > 远程连接名 > shell 名」
+    /// 要查连接表,只有 store 拿得到:走
+    /// [`AppStore::pane_display_label`](crate::store::AppStore::pane_display_label)。
+    /// 本函数留着是给「压根没有项目上下文」的调用点(纯数据层单测)。
     pub fn label(&self) -> &str {
         self.custom_title.as_deref().unwrap_or(&self.shell_name)
     }

@@ -24,12 +24,6 @@
 //! 配置),调用方丢 `cx.background_executor().spawn(...)`,与 `mt_project::git`
 //! 同一条纪律。
 
-// ⚠️ BB-a 只做数据层/服务层,本模块的消费方(BB-b 的三个 Modal + 远程项目 UI +
-// 断线遮罩 + 文件树/会话面板的远程分流)还不存在,`dead_code` 会把整份公开
-// API 报成未使用。**BB-b 接完线后删掉这一行** —— 留着会把「某个入口忘了接」
-// 也一并盖住。
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 
 use mt_core::atomic_write;

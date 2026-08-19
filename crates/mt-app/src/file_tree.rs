@@ -1,8 +1,21 @@
 //! 中栏:文件树。对应 `src/components/FileTree.tsx` 的主干。
 //!
-//! - 列目录走 [`mt_project::fs::list_directory`](mt_project::fs::list_directory)
-//!   (`.gitignore` 过滤与排序都在那边,这里不重复实现);它是**阻塞**函数,
-//!   一律丢 background executor,不能在主线程上跑;
+//! - 列目录走 [`crate::remote_ssh::list_directory_for`] —— 它是**唯一的本地/远程
+//!   分流开关**:本地项目转 [`mt_project::fs::list_directory`](mt_project::fs::list_directory)
+//!   (`.gitignore` 过滤与排序都在那边,这里不重复实现),SSH 远程项目走 SFTP
+//!   readdir。两条路返回同一个 `FileEntry`,所以整棵树共用同一段加载代码,
+//!   不会出现「树顶刷新走了本地、展开子目录走了远程」这类半截状态。
+//!   两条都是**阻塞**函数,一律丢 background executor,不能在主线程上跑;
+//!
+//! # SSH 远程项目的四条差异(逐条对照 `FileTree.tsx:432-508`)
+//!
+//! 1. **不注册 notify watcher**(远端文件系统本机监听不到);
+//! 2. **不拉 git 状态**(远程 Git 是二期);
+//! 3. **不做单链目录压缩** —— 逐级 SFTP 往返太贵,原版原话「保持原样」;
+//! 4. **不探子工程技术栈**(`ensure_dir_kinds` 是本机 `stat`)。
+//!
+//! 断链(连接被删)不去读本机同名路径:直接给
+//! `fileTree.remote.broken` 那句明确错误(项目仍可见、可删)。
 //! - 目录变化走 [`mt_project::watch::FsWatcher`](mt_project::watch::FsWatcher):
 //!   sink 里往 channel 丢,主线程上的前台任务醒来后失效缓存并重列 ——
 //!   与 AI 状态、终端重绘是同一套跨线程唤醒模式;
@@ -68,6 +81,10 @@ pub struct FileTree {
     root_loading: bool,
     /// 上一次列根目录的错误原文。
     root_error: Option<String>,
+    /// 当前项目是「断链的 SSH 远程项目」——连接被删,什么都列不出来。
+    /// 与 `root_error` 分开存是因为它**不是一次加载失败**,而是一个静态状态:
+    /// 不发请求、不重试,直接画那句提示。
+    remote_broken: bool,
     /// 每行一个焦点句柄(原版每行 `tabIndex={0}`)。行拿到焦点后 Enter/Space
     /// 与 ←→ 才有落点,见 [`Self::on_row_key`]。
     row_focus: HashMap<PathBuf, gpui::FocusHandle>,
@@ -140,6 +157,7 @@ impl FileTree {
             chain_owner: HashMap::new(),
             root_loading: false,
             root_error: None,
+            remote_broken: false,
             row_focus: HashMap::new(),
             _fs_task: fs_task,
             _git_task: git_task,
@@ -200,11 +218,21 @@ impl FileTree {
 
     /// 活动项目变了:清空缓存与监听,重列根目录。
     fn sync_project(&mut self, cx: &mut Context<Self>) {
-        let (project_id, root) = {
+        let (project_id, root, remote, broken) = {
             let store = self.store.read(cx);
             match store.active_project() {
-                Some(p) => (Some(p.id.clone()), Some(PathBuf::from(&p.path))),
-                None => (None, None),
+                Some(p) => {
+                    let is_remote = store.is_remote_project(&p.id);
+                    let conn = store.remote_connection_of(&p.id);
+                    (
+                        Some(p.id.clone()),
+                        Some(PathBuf::from(&p.path)),
+                        conn.is_some(),
+                        // 断链 = 是远程项目但连接查不到
+                        is_remote && conn.is_none(),
+                    )
+                }
+                None => (None, None, false, false),
             }
         };
         if project_id == self.current_project {
@@ -220,16 +248,40 @@ impl FileTree {
         self.git_refresh_at = None;
         self.root_error = None;
         self.current_project = project_id;
-        // 没有项目时把旁路那一份关掉:reader 线程上那道总闸能少开一个人是一个
-        git_watch::set_enabled_for(git_watch::Subscriber::FileTree, root.is_some());
+        self.remote_broken = broken;
+        self.git_status.clear();
+        // 没有项目 / 远程项目都把旁路那一份关掉:远程不拉 git 状态,
+        // reader 线程上那道总闸能少开一个人是一个
+        git_watch::set_enabled_for(
+            git_watch::Subscriber::FileTree,
+            root.is_some() && !remote && !broken,
+        );
+        if broken {
+            // 断链:不发任何请求,直接给那句明确提示(项目仍可见、可删)
+            self.root_loading = false;
+            self.root_error = Some(t("fileTree", "remote.broken").to_string());
+            return;
+        }
         if let Some(root) = root {
             self.root_loading = true;
             self.load_dir(root.clone(), root, cx);
-            // 原版第一条:切项目时与 `list_directory` 并发拉一次
-            self.load_git_status(cx);
+            // 原版第一条:切项目时与 `list_directory` 并发拉一次。
+            // 远程项目跳过(远程 Git 二期)
+            if !remote {
+                self.load_git_status(cx);
+            }
         } else {
             self.root_loading = false;
         }
+    }
+
+    /// 当前项目的远程连接(`None` = 本地项目 **或** 断链)。
+    ///
+    /// 返回克隆:它要被丢进 background executor(`remote_ssh` 的入口全是阻塞函数)。
+    fn remote_conn(&self, cx: &App) -> Option<mt_config::SshConnection> {
+        let store = self.store.read(cx);
+        let id = store.active_project_id.as_deref()?;
+        store.remote_connection_of(id)
     }
 
     fn project_root(&self, cx: &App) -> Option<PathBuf> {
@@ -240,13 +292,29 @@ impl FileTree {
     }
 
     /// 列一个目录(后台线程)+ 挂监听。
+    ///
+    /// `refresh_ignore` **只对远程有效**:强制后端重读远程根 `.gitignore`
+    /// (头部刷新按钮那一路,原版 `loadRootEntries(true)`)。
     fn load_dir(&mut self, root: PathBuf, dir: PathBuf, cx: &mut Context<Self>) {
+        self.load_dir_with(root, dir, false, cx);
+    }
+
+    fn load_dir_with(
+        &mut self,
+        root: PathBuf,
+        dir: PathBuf,
+        refresh_ignore: bool,
+        cx: &mut Context<Self>,
+    ) {
         if self.loading.contains(&dir) {
             return;
         }
         self.loading.insert(dir.clone());
 
-        if self.watched.insert(dir.clone())
+        // 远程项目**不注册 watcher**:远端文件系统本机监听不到
+        let remote = self.remote_conn(cx);
+        if remote.is_none()
+            && self.watched.insert(dir.clone())
             && let Err(err) = self
                 .watcher
                 .watch(&dir, &root.to_string_lossy().to_string())
@@ -259,12 +327,24 @@ impl FileTree {
         // 根目录那一趟额外承担三态占位(loading / 加载失败 / 刷新失败)
         let is_root = dir == root;
         cx.spawn(async move |this, cx| {
-            // list_directory 是阻塞 IO(还要逐级读 .gitignore),必须离开主线程;
-            // 单链压缩最多再串行列 7 层,**整段都在后台**跑完再回来
+            // 两条路都是阻塞 IO(本地要逐级读 .gitignore,远程是 SFTP 往返),
+            // 必须离开主线程;单链压缩最多再串行列 7 层,**整段都在后台**跑完再回来。
+            // 远程**不压缩单链**:逐级 SFTP 往返太贵(原版原话)
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let entries = mt_project::fs::list_directory(&task_root, &task_dir)?;
+                    let entries = crate::remote_ssh::list_directory_for(
+                        remote.as_ref(),
+                        &task_root,
+                        &task_dir,
+                        refresh_ignore,
+                    )
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                    if remote.is_some() {
+                        return anyhow::Ok(
+                            entries.into_iter().map(|e| (e, Vec::new())).collect(),
+                        );
+                    }
                     let chains = compact_dir_chains(entries, |d| {
                         mt_project::fs::list_directory(&task_root, d).unwrap_or_default()
                     });
@@ -308,8 +388,10 @@ impl FileTree {
                         }
                         // 根目录一级子目录的子工程探测(原版 `FileTree.tsx:488-491`
                         // 那个 effect):不必展开就能在树里看到技术栈图标。
-                        // 忽略项不探 —— 图标那一路也只在 `!entry.ignored` 时才换
-                        if is_root {
+                        // 忽略项不探 —— 图标那一路也只在 `!entry.ignored` 时才换。
+                        // **远程项目跳过**:`ensure_dir_kinds` 是本机 `stat`,
+                        // 拿远端 POSIX 路径去探等于探一个不存在的本机目录
+                        if is_root && !tree.is_remote(cx) {
                             let probe: Vec<String> = entries
                                 .iter()
                                 .filter(|e| e.is_dir && !e.ignored)
@@ -336,6 +418,10 @@ impl FileTree {
     /// 头部刷新按钮 / 加载失败后的「重试」:重列根目录 + 重拉 git 状态
     /// (原版 `loadRootEntries() + loadGitStatus()` 那一对)。
     fn refresh_root(&mut self, cx: &mut Context<Self>) {
+        // 断链:没什么可刷的(连接都没了),提示留着
+        if self.remote_broken {
+            return;
+        }
         let Some(root) = self.project_root(cx) else {
             return;
         };
@@ -343,9 +429,23 @@ impl FileTree {
         if !self.entries.contains_key(&root) {
             self.root_loading = true;
         }
-        self.load_dir(root.clone(), root, cx);
-        self.load_git_status(cx);
+        let remote = self.is_remote(cx);
+        // 手动刷新时强制重读远程根 `.gitignore`(原版 `loadRootEntries(true)`);
+        // 本地那一路后端不认这个参数,传什么都一样
+        self.load_dir_with(root.clone(), root, remote, cx);
+        if !remote {
+            self.load_git_status(cx);
+        }
         cx.notify();
+    }
+
+    /// 当前项目是 SSH 远程项目吗(**断链也算** —— 那仍是个远程项目)。
+    fn is_remote(&self, cx: &App) -> bool {
+        let store = self.store.read(cx);
+        store
+            .active_project_id
+            .as_deref()
+            .is_some_and(|id| store.is_remote_project(id))
     }
 
     /// 目录内容变了:已列过的重列一次。
@@ -1077,6 +1177,7 @@ impl Render for FileTree {
             .filter(|name| editors.iter().any(|e| e == name))
             .or_else(|| editors.first().cloned());
 
+        let is_remote = self.is_remote(cx);
         let mut header = div()
             .flex()
             .items_center()
@@ -1130,8 +1231,18 @@ impl Render for FileTree {
                     )
                     .child(
                         header_button("file-tree-refresh")
-                            .tooltip(|window, cx| {
-                                Tooltip::new(t("fileTree", "header.refresh")).build(window, cx)
+                            // 远程项目多一句:刷新会重读远程根 `.gitignore`
+                            // (原版 `FileTree.tsx` 的 `remote.refreshTitle`)
+                            .tooltip({
+                                let remote = is_remote;
+                                move |window, cx| {
+                                    Tooltip::new(if remote {
+                                        t("fileTree", "remote.refreshTitle")
+                                    } else {
+                                        t("fileTree", "header.refresh")
+                                    })
+                                    .build(window, cx)
+                                }
                             })
                             .on_click(cx.listener(|this, _event, _window, cx| {
                                 this.refresh_root(cx);
@@ -1188,6 +1299,27 @@ impl Render for FileTree {
             for path in missing {
                 self.row_focus(&path, cx);
             }
+        }
+
+        // 断链的远程项目:静态提示,**没有重试按钮**(连接都没了,重试也是白试)
+        if self.remote_broken {
+            return div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .bg(ui::bg_surface())
+                .child(header)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .py(px(32.0))
+                        .px(px(12.0))
+                        .text_size(ui::font_px(11.4))
+                        .text_color(ui::color_error())
+                        .child(t("fileTree", "remote.broken")),
+                );
         }
 
         // 三态占位:**都以「一行都没有」为前置** —— 有缓存内容时不整块盖掉

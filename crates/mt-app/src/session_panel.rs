@@ -17,11 +17,26 @@
 //! **惰性加载那道闸不许绕过**:`visible` / `stale` 双标记(收起时项目切换不去扫)
 //! 是 GPUI 侧补的防线 —— 旧版收起时组件根本没挂载。分支边扫描同样挂在这道闸后面。
 //!
+//! # 来源三选一(唯一分流开关)
+//!
+//! [`crate::ssh_conn::session_source`] 是**唯一**判据(BB-b 接上):
+//!
+//! ```text
+//! Remote(conn)  → 只走 remote_ssh::ai_sessions([后台]);宿主 / lineage / WSL
+//!                 三路一条都不发 —— 本地 `get_ai_sessions` 对远程 POSIX 路径
+//!                 会去本机 `~/.claude/projects` 找同名编码目录,命中的是
+//!                 **另一台机器**上同路径的会话
+//! BrokenRemote  → 空表 + 断链提示。**绝不退回 Local**(同上,会把本机会话
+//!                 贴到远程项目上)
+//! Local         → 宿主 + lineage + 可选 WSL,三路并发,照旧
+//! ```
+//!
 //! # 与旧版的偏差
 //!
-//! - SSH 远程来源(`ssh_remote_ai_sessions`)没搬:mt-ssh 还没进 crates/。
-//!   `AiSession::ssh_connection_id` 字段照留,本机来源恒 `None`。
-//! - 会话正文查看是**面板内预览**而不是独立弹窗(形态不同,动作齐全)。
+//! - 会话正文查看是**面板内预览**而不是独立弹窗(形态不同,动作齐全);
+//! - **断链时多一句提示**(原版是静默空列表:它的 `ssh_remote_ai_sessions`
+//!   在后端把断链吞成空表,前端看不出区别)。空列表配「一条会话都没有」会让人
+//!   以为远端真没会话,而实情是连接被删了 —— 记为改良。
 //!
 //! # 与 [`crate::branch_family`] 的分工
 //!
@@ -286,6 +301,10 @@ pub struct SessionPanel {
     visible: bool,
     /// 关着的时候项目切过 → 打开时补拉一次。
     stale: bool,
+    /// 当前项目是 SSH 远程项目(转圈提示要区分 WSL 与远程两种来源)。
+    remote: bool,
+    /// 断链的远程项目:列表恒空,头部给一句断链提示。
+    remote_broken: bool,
     preview: Option<Preview>,
     _tasks: Vec<Task<()>>,
 }
@@ -325,6 +344,8 @@ impl SessionPanel {
             request_id: 0,
             visible: false,
             stale: true,
+            remote: false,
+            remote_broken: false,
             preview: None,
             _tasks: Vec::new(),
         }
@@ -356,11 +377,18 @@ impl SessionPanel {
     ///
     /// [`set_visible`]: Self::set_visible
     pub fn refresh(&mut self, force: bool, cx: &mut Context<Self>) {
-        let project = self
-            .store
-            .read(cx)
-            .active_project()
-            .map(|p| (p.path.clone(), p.wsl_sessions_distro.clone()));
+        let (project, source) = {
+            let store = self.store.read(cx);
+            let project = store
+                .active_project()
+                .map(|p| (p.path.clone(), p.wsl_sessions_distro.clone()));
+            // **唯一的来源分流开关**(见模块注释):三条并发请求与远程那一条
+            // 不会同时发出
+            let source = store.active_project().map(|p| {
+                crate::ssh_conn::session_source(p, store.ssh_connections())
+            });
+            (project, source)
+        };
         // 自记账边:mini-term 自己发起的 fork 当场记下的 child→parent。
         // **必须传** —— Claude 的 CLI fork 不写磁盘指针,这些边的「分叉后第一问」
         // 标题只能由 mt-ai 拿父子文件比对补出。两个 crate 各持一份同构结构,
@@ -400,11 +428,57 @@ impl SessionPanel {
             self.project_path = None;
             self.loading = false;
             self.wsl_loading = false;
+            self.remote = false;
+            self.remote_broken = false;
             cx.notify();
             return;
         };
         self.project_path = Some(path.clone());
         self.loading = true;
+
+        // ── SSH 远程项目:**只**取远程来源 ────────────────────────
+        match source {
+            Some(crate::ssh_conn::SessionSource::BrokenRemote) => {
+                // 连接被删:什么都取不到。**绝不退回本地扫描** —— 那会把本机
+                // 同路径的会话贴到这个远程项目上(见 `ssh_conn::SessionSource`)
+                self.remote = true;
+                self.remote_broken = true;
+                self.loading = false;
+                self.wsl_loading = false;
+                cx.notify();
+                return;
+            }
+            Some(crate::ssh_conn::SessionSource::Remote(conn)) => {
+                self.remote = true;
+                self.remote_broken = false;
+                self.wsl_loading = false;
+                let remote_path = path.clone();
+                self._tasks.push(cx.spawn(async move |this, cx| {
+                    // [后台] SFTP 往返,秒级;`ai_sessions` 永不返 Err
+                    // (失败静默降级为空表,与原版同)
+                    let result = cx
+                        .background_executor()
+                        .spawn(async move {
+                            crate::remote_ssh::ai_sessions(&conn, &remote_path, force)
+                        })
+                        .await;
+                    let _ = this.update(cx, |this: &mut Self, cx| {
+                        if this.request_id != req {
+                            return;
+                        }
+                        this.host = result.unwrap_or_default();
+                        this.loading = false;
+                        cx.notify();
+                    });
+                }));
+                cx.notify();
+                return;
+            }
+            _ => {
+                self.remote = false;
+                self.remote_broken = false;
+            }
+        }
 
         // 宿主来源:秒出,先显示
         let host_path = path.clone();
@@ -605,17 +679,38 @@ impl SessionPanel {
         let session_type = session.session_type.clone();
         let session_id = session.id.clone();
         let distro = session.wsl_distro.clone();
+        // 远程会话的正文在**另一台机器**上,只能走 SFTP 读(`ai_session_content`);
+        // 连接从主线程取好再传进后台(`remote_ssh` 的线程口径)
+        let remote = {
+            let store = self.store.read(cx);
+            store
+                .active_project_id
+                .as_deref()
+                .and_then(|id| store.remote_connection_of(id))
+        };
         self._tasks.push(cx.spawn(async move |this, cx| {
-            // 正文可能几 MB + WSL 9P,雷打不动丢后台
+            // 正文可能几 MB + WSL 9P / SFTP 往返,雷打不动丢后台
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    mt_ai::sessions::get_ai_session_content(
-                        session_type,
-                        session_id,
-                        project_path,
-                        distro,
-                    )
+                    match remote {
+                        // 首次取全量(offset=0);增量刷新是原版也没接的能力,
+                        // `next_offset` 在这里被丢弃(见交付报告的遗留清单)
+                        Some(conn) => crate::remote_ssh::ai_session_content(
+                            &conn,
+                            &session_type,
+                            &session_id,
+                            &project_path,
+                            0,
+                        )
+                        .map(|c| c.messages),
+                        None => mt_ai::sessions::get_ai_session_content(
+                            session_type,
+                            session_id,
+                            project_path,
+                            distro,
+                        ),
+                    }
                 })
                 .await;
             let _ = this.update(cx, |this: &mut Self, cx| {
@@ -769,6 +864,22 @@ impl Render for SessionPanel {
         let wsl_loading = self.wsl_loading;
         let has_project = self.project_path.is_some();
         let tree = self.view == ViewMode::Tree;
+        let remote = self.remote;
+        let remote_broken = self.remote_broken;
+        // 行尾的远程来源标识:连接名(连接被删时回退 'SSH')。
+        // 逐行现查连接表,规模是连接条数
+        let remote_name_of = |session: &AiSession| -> Option<String> {
+            let id = session.ssh_connection_id.as_deref()?;
+            Some(
+                self.store
+                    .read(cx)
+                    .ssh_connections()
+                    .iter()
+                    .find(|c| c.id == id)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_else(|| "SSH".to_string()),
+            )
+        };
         // 树模式的在跑徽章要对 pane 状态保持反应性 —— 面板已经 observe 了 store,
         // 这里逐行现查即可(跨项目遍历,规模是 pane 数)
         let live_of: Vec<Option<(String, PaneStatus)>> = if tree {
@@ -802,7 +913,16 @@ impl Render for SessionPanel {
             .flex()
             .flex_col();
 
-        if loading && sessions.is_empty() {
+        if remote_broken {
+            // 断链:列表恒空 + 一句明确提示(原版是静默空表,见模块注释)
+            list = list.child(
+                div()
+                    .py(px(12.0))
+                    .text_size(ui::font_px(12.0))
+                    .text_color(ui::color_error())
+                    .child(t("projectList", "remoteBrokenTitle")),
+            );
+        } else if loading && sessions.is_empty() {
             list = list.child(
                 div()
                     .py(px(12.0))
@@ -828,9 +948,14 @@ impl Render for SessionPanel {
             let key = format!(
                 "{}-{}-{}",
                 session.session_type,
-                session.wsl_distro.as_deref().unwrap_or("host"),
+                session
+                    .wsl_distro
+                    .as_deref()
+                    .or(session.ssh_connection_id.as_deref())
+                    .unwrap_or("host"),
                 session.id
             );
+            let remote_badge = remote_name_of(&session);
             let time = format_time(&session.timestamp);
             // 行图标**两套口径**(`SessionList.tsx:339-342`):
             // 树模式按最新模型推厂商(claude CLI 挂 GLM / DeepSeek 中转是常见用法,
@@ -966,12 +1091,14 @@ impl Render for SessionPanel {
                                     // 靠 `--text-muted` 拉开层次
                                     .mt(px(2.0))
                                     .text_color(ui::text_muted())
-                                    .child(match wsl_badge {
-                                        Some(distro) => format!(
+                                    .child(match (wsl_badge, remote_badge) {
+                                        (Some(distro), _) => format!(
                                             "{time} · {}·{distro}",
                                             t("sessionList", "wslBadge")
                                         ),
-                                        None => time,
+                                        // 远程会话标识:显示来源连接名
+                                        (None, Some(name)) => format!("{time} · {name}"),
+                                        (None, None) => time,
                                     }),
                             ),
                     ),
@@ -1031,6 +1158,24 @@ impl Render for SessionPanel {
                                         })
                                         .child(ui::spinner(
                                             "session-wsl-spin",
+                                            px(12.0),
+                                            ui::text_muted(),
+                                        )),
+                                )
+                            })
+                            // 远程来源加载中的转圈(原版 `loading && sshConnectionId`)
+                            .when(loading && remote, |el| {
+                                el.child(
+                                    div()
+                                        .id("session-remote-spinner")
+                                        .flex()
+                                        .items_center()
+                                        .tooltip(|window, cx| {
+                                            Tooltip::new(t("sessionList", "remoteLoading"))
+                                                .build(window, cx)
+                                        })
+                                        .child(ui::spinner(
+                                            "session-remote-spin",
                                             px(12.0),
                                             ui::text_muted(),
                                         )),

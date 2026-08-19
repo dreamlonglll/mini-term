@@ -8,18 +8,17 @@
 //! [`crate::overlay`] 覆盖物栈、不走 [`crate::prompt`]**,就是
 //! [`TerminalArea`](crate::terminal_area::TerminalArea) 的一个早退分支。
 //!
-//! # 与原版的两处偏差(都有理由,见报告)
+//! # 与原版的一处偏差(有理由,见报告)
 //!
-//! 1. **只有「添加本地项目」一个入口**。原版第二个入口是
-//!    `AddRemoteProjectModal`(SSH 远程项目),它属 audit #28 的 mt-ssh 整块,
-//!    GPUI 侧还没有落点。放一颗点不动的灰按钮比没有更让人困惑
-//!    (与 `activity_bar` 模块注释里「不放占位」同一条口径),等 #28 落地后
-//!    在这里补第二颗 —— 词条 `app.firstRun.addRemote` 字典里已经就位。
-//! 2. **「添加本地项目」走 [`crate::modal::open_add_project`]**(路径输入框 +
-//!    「浏览…」)而不是像原版那样直接弹系统目录选择框。理由是 GPUI 侧「添加项目」
-//!    只该有一条路:项目列表底部那颗按钮已经是这个弹窗,而它多出来的手输那一路
-//!    是有意保留的(UNC / WSL 路径在目录选择框里常常点不到,见 `modal.rs`)。
-//!    同一个动作在两处表现不同才是真的坏体验。
+//! **「添加本地项目」走 [`crate::modal::open_add_project`]**(路径输入框 +
+//! 「浏览…」)而不是像原版那样直接弹系统目录选择框。理由是 GPUI 侧「添加项目」
+//! 只该有一条路:项目列表底部那颗按钮已经是这个弹窗,而它多出来的手输那一路
+//! 是有意保留的(UNC / WSL 路径在目录选择框里常常点不到,见 `modal.rs`)。
+//! 同一个动作在两处表现不同才是真的坏体验。
+//!
+//! 第二颗按钮「添加 SSH 远程项目」由 BB-b 补上,走
+//! [`crate::remote_project::open`] —— 与项目列表底部那颗 `SSH` 钮同一种覆盖物,
+//! 两处入口不会各开一个。
 
 use gpui::{
     App, ClickEvent, Div, Entity, FontWeight, InteractiveElement, IntoElement, ParentElement,
@@ -81,7 +80,8 @@ pub fn guide(store: Entity<AppStore>) -> Div {
                 .items_center()
                 .justify_center()
                 .gap(px(8.0))
-                .child(add_local_button(store)),
+                .child(add_local_button(store.clone()))
+                .child(add_remote_button(store)),
         )
         .child(hints())
 }
@@ -104,6 +104,27 @@ fn add_local_button(store: Entity<AppStore>) -> impl IntoElement {
         .child(t("app", "firstRun.addLocal"))
         .on_click(move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
             modal::open_add_project(store.clone(), window, cx);
+        })
+}
+
+/// 次按钮:边框 + 淡字,hover 转 accent(`FirstRunGuide.tsx:32-34` 的 `secondary`)。
+///
+/// 点开的是与项目列表底部 `SSH` 钮**同一个**弹窗(同一种覆盖物,防叠开)。
+fn add_remote_button(store: Entity<AppStore>) -> impl IntoElement {
+    div()
+        .id("first-run-add-remote")
+        .px(px(16.0))
+        .py(px(10.0))
+        .rounded(px(6.0))
+        .border_1()
+        .border_color(ui::border_default())
+        .text_size(ui::font_px(13.0))
+        .text_color(ui::text_secondary())
+        .cursor_pointer()
+        .hover(|el| el.border_color(ui::accent()).text_color(ui::accent()))
+        .child(t("app", "firstRun.addRemote"))
+        .on_click(move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+            crate::remote_project::open(store.clone(), None, window, cx);
         })
 }
 

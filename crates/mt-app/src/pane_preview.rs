@@ -143,6 +143,7 @@ pub enum MiniLayout {
 /// 从 store 抠一棵微缩布局树。
 pub fn snapshot_layout(
     node: &SplitNode,
+    project_id: &str,
     store: &AppStore,
     auto_resume: bool,
     cx: &App,
@@ -160,6 +161,7 @@ pub fn snapshot_layout(
             let hidden: Vec<&PaneState> = panes.iter().filter(|p| p.id != active.id).collect();
             Some(MiniLayout::Leaf(Box::new(snapshot_pane(
                 active,
+                project_id,
                 hidden.len(),
                 hidden_top_status(&hidden),
                 store,
@@ -177,15 +179,19 @@ pub fn snapshot_layout(
             sizes: sizes.clone(),
             children: children
                 .iter()
-                .filter_map(|c| snapshot_layout(c, store, auto_resume, cx))
+                .filter_map(|c| snapshot_layout(c, project_id, store, auto_resume, cx))
                 .collect(),
         }),
     }
 }
 
 /// 单个 pane 的快照(tab 卡直接用这一条)。
+#[allow(clippy::too_many_arguments)]
+/// 卡上的名字走 store 的三级口径(自定义名 > 远程连接名 > shell 名),
+/// 所以要 `project_id` —— 远程那一档得查连接表。
 pub fn snapshot_pane(
     pane: &PaneState,
+    project_id: &str,
     hidden_count: usize,
     hidden_top: Option<PaneStatus>,
     store: &AppStore,
@@ -199,7 +205,8 @@ pub fn snapshot_pane(
     let shows_ai = pane.shows_ai_session(auto_resume);
     MiniPaneInfo {
         pane_id: pane.id.clone(),
-        label: pane.label().to_string(),
+        // 与 tab 栏同一口径(自定义名 > 远程连接名 > shell 名)
+        label: store.pane_display_label(project_id, pane),
         status: pane.status,
         // tab 上那条口径:CLI 名直取,其余走词匹配
         vendor: pane.ai_agent().and_then(|agent| {

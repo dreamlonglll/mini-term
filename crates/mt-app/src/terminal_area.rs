@@ -420,7 +420,10 @@ impl TerminalArea {
             return None;
         };
         let auto_resume = store.config().ai_auto_resume.unwrap_or(true);
-        let info = pane_preview::snapshot_pane(pane, 0, None, store, auto_resume, cx);
+        // 卡上的名字与 tab 同口径,要项目 id 才查得到远程连接名
+        let project_id = store.active_project_id.clone().unwrap_or_default();
+        let info =
+            pane_preview::snapshot_pane(pane, &project_id, 0, None, store, auto_resume, cx);
         let style = pane_preview::preview_style(store);
         Some(
             deferred(
@@ -835,6 +838,17 @@ impl TerminalArea {
             return div().into_any_element();
         };
         let terminal = active.pty_id.and_then(|id| store.terminal(id)).cloned();
+        // 远程 pane 的断线覆盖层(`PaneGroup.tsx:329-333` 的 `showReconnect`):
+        // 判据是「项目是 SSH 远程项目 **且** 这条 PTY 已登记退出」。
+        // ⚠️ **本地 pane 不进这条路** —— 本地退出仍走既有的 error 状态 + 右下角
+        // 「shell 已退出」角标(原版 `remote &&` 那一半就是这个闸)。
+        // 断链(连接被删)照样算远程项目,遮罩照出:重连会再失败一次并把明确的
+        // 断链错误画进 pane,比静默什么都不发生强。
+        let show_reconnect = store.is_remote_project(project_id)
+            && active
+                .pty_id
+                .map(|id| store.is_pty_exited(id))
+                .unwrap_or(false);
         // AI 任务标记数。**列表为空就整个不画按钮**(`PaneGroup.tsx:489`),
         // 这就是「⚑ 平时看不见」的直接原因 —— 见 `markers` 模块注释的 alt screen 段。
         let marker_count = active
@@ -910,8 +924,12 @@ impl TerminalArea {
             let pid_close = pid.clone();
             let pid_rename = pid.clone();
             let pid_menu = pid.clone();
-            let label = pane.label().to_string();
+            // tab 标题走 store 的统一口径:自定义名 > 远程连接名 > shell 名。
+            // 恢复布局时远程 pane 的 shellName 会被映射成本地 shell 名、**不可信**,
+            // 所以远程那一档必须由 store 查连接表补上(`remoteProject.ts::paneDisplayLabel`)
+            let label = store.pane_display_label(&pid, pane);
             let label_menu = label.clone();
+            let label_text = label.clone();
             let has_unread = unread.get(idx).copied().unwrap_or(false);
             let vendor = vendors.get(idx).copied().flatten();
             let this_area = cx.entity();
@@ -1047,7 +1065,7 @@ impl TerminalArea {
                                 .contrast(ui::bg_elevated()),
                         )
                     })
-                    .child(div().child(pane.label().to_string()))
+                    .child(div().child(label_text.clone()))
                     // 未读完成标(窗口没聚焦时完成的任务)
                     .when(has_unread, |el| {
                         el.child(
@@ -1249,6 +1267,8 @@ impl TerminalArea {
         let active_for_focus = active_id.clone();
         let pid_drop = pid.clone();
         let drop_pane_id = active_id.clone();
+        let pid_reconnect = pid.clone();
+        let pane_reconnect = active_id.clone();
         // 拖拽中断(松手在窗外)后 gpui 会清 active_drag 并重画,与它与门就不必
         // 到处补清理 —— 与 `project_list.rs` 里那份高亮同一套判据。
         let file_drop_over =
@@ -1360,7 +1380,50 @@ impl TerminalArea {
                     })
                     // 「释放以插入路径」的虚线框。与 `cx.has_active_drag()` 与门:
                     // 拖拽被中断时 gpui 会清 active_drag 并重画,残留状态自动失效。
-                    .when(file_drop_over, |el| el.child(drop_hint())),
+                    .when(file_drop_over, |el| el.child(drop_hint()))
+                    // 远程断线覆盖层:**保留 pane**,点一下在同一 pane 重连
+                    .when(show_reconnect, |el| {
+                        let (pid, pane_id) = (pid_reconnect.clone(), pane_reconnect.clone());
+                        el.child(
+                            div()
+                                .id(gpui::SharedString::from(format!("reconnect-{leaf}")))
+                                .absolute()
+                                .inset_0()
+                                // 遮罩自己吃点击:底下终端的聚焦监听不该抢走这一下
+                                .occlude()
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .justify_center()
+                                .gap(px(12.0))
+                                // 原版 `bg-black/55 backdrop-blur-[1px]`;gpui 没有
+                                // backdrop-filter,只留半透明黑
+                                .bg(gpui::rgba(0x0000008c))
+                                .child(
+                                    div()
+                                        .text_size(ui::font_px(12.0))
+                                        .text_color(ui::text_secondary())
+                                        .child(t("paneGroup", "remoteDisconnected")),
+                                )
+                                .child(
+                                    ui::ghost_button(
+                                        gpui::SharedString::from(format!("reconnect-btn-{leaf}")),
+                                        t("paneGroup", "reconnect"),
+                                    )
+                                    .on_click(cx.listener(
+                                        move |this: &mut TerminalArea, _event, window, cx| {
+                                            let (pid, pane_id) = (pid.clone(), pane_id.clone());
+                                            this.store.update(cx, |store, cx| {
+                                                // 一步含:kill 旧 PTY / 清标记与退出登记 /
+                                                // 起新 PTY / 回写 pane(见 store 那边的注释)
+                                                store.reset_pane_for_reconnect(&pid, &pane_id, cx);
+                                                store.focus_pane(&pid, &pane_id, window, cx);
+                                            });
+                                        },
+                                    )),
+                                ),
+                        )
+                    }),
             )
             .into_any_element()
     }
