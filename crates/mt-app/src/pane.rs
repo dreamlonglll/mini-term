@@ -133,10 +133,33 @@ const FLASH_DURATION: Duration = Duration::from_millis(300);
 
 impl EventEmitter<PaneEvent> for TerminalPane {}
 
+/// 起 pane 时的 SSH 远程附加项(本地 pane 传 [`Default::default()`])。
+///
+/// 单独一个结构体是为了不让 [`TerminalPane::new`] 的参数列表再长两格 ——
+/// 两项都只在「项目是 SSH 远程项目」时才非空。
+#[derive(Default)]
+pub struct RemoteLaunchExtras {
+    /// SSH 登录密码。spawn 成功后**立刻**注册 autofill。
+    ///
+    /// ⚠️ 装机版是在 `openpty` 之后、`spawn_command` 之前 arm 的(那里 PTY 与
+    /// reader 是两步)。GPUI 侧 `PtySession::spawn` 一步就把 reader 线程起了,
+    /// 只能事后 arm —— 窗口是「spawn 返回」到「下一行」的几微秒,而 ssh 的密码
+    /// 提示要等 TCP 连接 + 版本协商 + 密钥交换(最快也几十毫秒),够不着。
+    /// 真要彻底消除得给 `mt_pty::PtyOptions` 加一个 autofill 字段,那是改
+    /// mt-pty 公开 API,本批不做(记档见 BB-a 报告)。
+    pub ssh_password: Option<String>,
+    /// 预检失败(断链 / 本机缺 ssh 客户端):**不 spawn**,直接把这条错误画在
+    /// pane 里 —— 与装机版 `create_pty` 返回 `Err` 后前端落 `spawnErrors` 同样效果。
+    pub preflight_error: Option<String>,
+}
+
 impl TerminalPane {
     /// `user_env` 是项目级环境变量:走 [`mt_pty::PtyOptions::user_env`] 而不是
     /// `spec.env`,因为前者会被 `MINITERM_` 前缀过滤挡一道 —— 用户手改
     /// `config.json` 也覆盖不掉内部协议变量。
+    ///
+    /// `remote` 见 [`RemoteLaunchExtras`];本地 pane 传 `Default::default()`。
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         pty_id: u32,
         spec: PtySpawn,
@@ -146,6 +169,7 @@ impl TerminalPane {
         dwell: DwellConfig,
         scrollback: usize,
         ai: AiBridge,
+        remote: RemoteLaunchExtras,
         cx: &mut Context<Self>,
     ) -> Self {
         // 首帧还没量过字体,先给个能跑的初值;真正的尺寸在元素 prepaint 里量出来
@@ -166,7 +190,11 @@ impl TerminalPane {
                 let _ = exit_tx.unbounded_send(PaneSignal::Exit(code));
             });
 
-        let pty = {
+        // 远程预检失败:根本不 spawn(装机版是 `create_pty` 直接返回 Err,
+        // 连 PTY 都不开 —— 这里同样不留半开的会话)。
+        let pty = if let Some(err) = remote.preflight_error.clone() {
+            Err(anyhow::anyhow!(err))
+        } else {
             let emulator = emulator.clone();
             let ai = ai.clone();
             PtySession::spawn_with_options(spec, options, move |bytes| {
@@ -191,6 +219,14 @@ impl TerminalPane {
                 (None, Some(msg))
             }
         };
+
+        // SSH 远程 pane:密码自动填充**紧贴 spawn** 注册(见 `RemoteLaunchExtras`
+        // 的字段注释)。`disarm_on_input = true`:远程项目 pane 起来之后不再写
+        // 任何命令,首个 `write` 即用户交互 —— 一打字就解除,避免 SSH 登录密码
+        // 被灌进后续 `su` / `mysql -p` / `passwd` 的提示里。
+        if let (Some(session), Some(password)) = (pty.as_ref(), remote.ssh_password) {
+            session.arm_ssh_autofill(password, true);
+        }
 
         // WSL 启动器重写的一次性告知(`App.tsx:367-379`)。判定与重写早在
         // `mt_pty::launch::plan` 里做完了,结论挂在会话上 —— 这里只是**唯一的
@@ -746,17 +782,18 @@ impl Focusable for TerminalPane {
 ///
 /// ```text
 /// 剪贴板取文本 → 空则什么都不做
-/// 开关开着 && 不是远程 pane && 命中阈值
-///   ├─ 转存成功 → 写 "{映射后的路径}"(裸写,不走 bracketed paste)
-///   └─ 转存失败 → 弹一条 paste-error toast,**继续往下粘原文**(老行为)
+/// 开关开着 && 命中阈值
+///   ├─ 远程 pane 且连接在场 → 交给后台任务(转存 + SFTP 上传 + 写远端路径),
+///   │                        当场返回 None(语义 = 宿主已接管)
+///   ├─ 本地/WSL 转存成功    → 写 "{映射后的路径}"(裸写,不走 bracketed paste)
+///   └─ 转存失败             → 弹一条 paste-error toast,**继续往下粘原文**(老行为)
 /// 否则 → 按 bracketed paste 粘原文
 /// ```
 ///
-/// # 与原版的三处偏差(逐条有理由)
+/// # 与原版的两处偏差(逐条有理由)
 ///
 /// 1. **剪贴板图片不处理** —— 那是另一个缺口,见 [`crate::clipboard`] 模块注释;
-/// 2. **远程(SSH)pane 一律粘原文** —— 上传通道还没有,见 [`PasteTarget::Ssh`];
-/// 3. **本地转存失败也弹 toast**。原版 `notifyPasteFailure` 开头就
+/// 2. **本地转存失败也弹 toast**。原版 `notifyPasteFailure` 开头就
 ///    `if (target.kind !== 'ssh') return`,本地写盘失败只有 console.error ——
 ///    规格把这条记成原版的隐性缺陷并建议「补一个兜底项目名」,这里照办:
 ///    项目名取该 pane 所属项目,取不到就退回 pane 的显示名。
@@ -775,7 +812,17 @@ fn resolve_paste(pty_id: u32, cx: &mut gpui::App) -> PasteAction {
     }
 
     let store = AppStore::global(cx);
-    let (enabled, line_threshold, char_threshold, target, project_id, project_name) = {
+    #[allow(clippy::type_complexity)]
+    let (
+        enabled,
+        line_threshold,
+        char_threshold,
+        target,
+        project_id,
+        project_name,
+        remote_ctx,
+        remote_paste_dir,
+    ) = {
         let s = store.read(cx);
         let cfg = s.config();
         let owner = s.pane_of_pty(pty_id);
@@ -795,6 +842,12 @@ fn resolve_paste(pty_id: u32, cx: &mut gpui::App) -> PasteAction {
                 })
             })
             .unwrap_or_else(|| format!("pane {pty_id}"));
+        // 远程 pane 的上传素材:连接(断链时为 None,退化成粘原文)+ 远程项目路径。
+        let remote = owner.as_ref().and_then(|(pid, _)| {
+            let project = s.project(pid)?;
+            let conn = s.remote_connection_of(pid)?;
+            Some((conn, project.path.clone()))
+        });
         (
             cfg.long_paste_to_file,
             cfg.long_paste_line_threshold,
@@ -802,8 +855,31 @@ fn resolve_paste(pty_id: u32, cx: &mut gpui::App) -> PasteAction {
             clipboard::resolve_paste_target(s, pty_id),
             owner.map(|(pid, _)| pid).unwrap_or_default(),
             name,
+            remote,
+            cfg.remote_paste_dir.clone(),
         )
     };
+
+    // SSH 远程 pane:转存 + SFTP 上传是异步的,交给后台任务,钩子当场返回
+    // `None`(语义 = 宿主已接管)。断链(连接被删)时 `remote_ctx` 为 None ——
+    // 没有上传通道,退回粘原文,与 mt-ssh 进 crates 之前的行为一致。
+    if enabled
+        && target == PasteTarget::Ssh
+        && clipboard::is_long_text(&text, line_threshold, char_threshold)
+        && let Some((conn, project_path)) = remote_ctx
+    {
+        clipboard::spawn_remote_paste(
+            pty_id,
+            text,
+            conn,
+            project_path,
+            project_id,
+            project_name,
+            remote_paste_dir,
+            cx,
+        );
+        return PasteAction::None;
+    }
 
     if enabled
         && target != PasteTarget::Ssh

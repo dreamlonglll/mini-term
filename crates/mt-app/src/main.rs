@@ -72,11 +72,14 @@ mod project_list;
 mod project_switcher;
 mod project_tree;
 mod prompt;
+mod remote_ssh;
 mod search_modal;
 mod session_branch;
 mod session_panel;
 mod settings;
 mod shell_ops;
+mod ssh_conn;
+mod ssh_registry;
 mod startup_trace;
 mod store;
 mod terminal_area;
@@ -1524,6 +1527,14 @@ fn main() {
         cx.background_executor()
             .spawn(async { clipboard::cleanup_old_files() })
             .detach();
+        // SSH 临时私钥副本的清理(装机版 `lib.rs::setup` 里的
+        // `ssh::cleanup_ssh_temp_keys()`)。远程 pane 起 ssh 前会把私钥复制成
+        // 权限收紧的临时文件(`mt_core::prepare_ssh_key`),上一轮的副本必须在
+        // 启动时清掉 —— 否则那个目录随连接次数无界增长,且留着别人机器上的
+        // 私钥明文副本。同样丢后台:它要遍历目录。
+        cx.background_executor()
+            .spawn(async { mt_core::cleanup_ssh_temp_keys() })
+            .detach();
         // 真正的主题在 store 装好之后按 config 装配(`apply_theme_from_config`):
         // 亮/暗/auto + 外置主题包 + 终端配色一次算全。这里先钉一个暗色兜底,
         // 免得从 init 到装配之间有一帧走 gpui-component 的默认亮色。
@@ -1593,6 +1604,9 @@ fn main() {
         cx.on_app_quit(move |cx| {
             store_for_quit.update(cx, |store, _| store.save_config_now());
             ai_for_quit.shutdown();
+            // SSH 会话池优雅断开(对齐装机版 `RunEvent::Exit` 里的那一调)。
+            // 池没建过时是 no-op,不会为此现起 tokio 运行时。
+            remote_ssh::shutdown_on_exit();
             async {}
         })
         .detach();

@@ -30,6 +30,33 @@ mt-project.workspace = true
 mt-ai.workspace = true
 mt-usage.workspace = true
 mt-relay.workspace = true
+# SSH 远程项目(audit #28):russh 持久会话池 + SFTP 只读/上传原语。
+# 服务层在 `remote_ssh.rs`,自持一个小 tokio 运行时(见该模块的线程口径说明)。
+mt-ssh.workspace = true
+mt-core.workspace = true
+# `remote_ssh` 的 tokio 边界:russh / russh-sftp 的 IO 要 tokio driver,
+# gpui 的执行器喂不动。工作区里已有这一行(mt-relay 用同一份 feature 集),
+# 这里只是引用,**没有改根 Cargo.toml**。
+#
+# ⚠️ 追加 `net`:`Builder::enable_all()` 只在 tokio 开了 `net` 时才顺带
+# `enable_io()`,否则 IO 驱动缺席、russh 建 TcpStream 时 panic
+# 「there is no reactor running」。目前 `net` 靠 russh 的特性统一带进来,
+# 但那是**别人的**依赖声明 —— 显式写出来,免得哪天依赖树一变就静默失灵。
+# (feature 是可加的,workspace 依赖之上追加不需要动根 manifest,
+#  与本文件里 gpui-component 的 `tree-sitter-languages` 同一手法。)
+tokio = { workspace = true, features = ["net"] }
+# SSH 工具(CLI + Skill)按项目启用时的能力令牌(UUID v4)。
+uuid.workspace = true
+# `~/.claude/settings.json` / `~/.codex/config.toml` 的 home 定位(ssh_registry)。
+dirs.workspace = true
+# 项目级 / 全局 Codex 配置的 TOML 编辑(ssh_registry 摘除历史 MCP 注册 +
+# 写项目信任)。**保留用户自己的注释与排版**,故用 toml_edit 而非 toml。
+#
+# ⚠️ 这一条不在 `workspace.dependencies` 里 —— 与 `mt-ai` / `mt-usage` 的
+# `toml_edit = "0.22"` 同一写法(那两个 crate 也是直接钉版本)。选择跟随既有
+# 先例而不是动根 manifest:版本与它们一字不差,依赖树里因此仍只有一个
+# toml_edit,Cargo.lock 零新包。
+toml_edit = "0.22"
 anyhow.workspace = true
 # 活 pane 列表要在 GPUI 主线程与 mt-ai 的 500ms 轮询线程之间共享。
 parking_lot.workspace = true

@@ -46,7 +46,7 @@ use std::time::{Duration, SystemTime};
 use futures::StreamExt;
 use futures::channel::mpsc::{self, UnboundedSender};
 use gpui::{App, AppContext, Context, Entity, Global, Subscription, Task, WeakEntity, Window};
-use mt_config::{AiLauncher, AppConfig};
+use mt_config::{AiLauncher, AppConfig, ProjectConfig};
 use mt_relay::host::{HookSessionId, RelayEvents, RelayHost, RelayProject};
 use mt_relay::{
     MobileRelayManager, MobileRelayStatusPayload, RenamePanePayload, StartSessionFailReason,
@@ -106,6 +106,20 @@ fn to_relay_launcher(l: &AiLauncher) -> mt_relay::AiLauncher {
         name: l.name.clone(),
         shell: l.shell.clone(),
         command: l.command.clone(),
+    }
+}
+
+/// `mt_config::ProjectConfig` → `mt_relay::RelayProject`(镜像里的项目切面)。
+///
+/// 只搬两个字段,但它们**共同决定移动端能不能在该项目发起新会话**
+/// (`mt_relay::can_start_session`:远程项目与 WSL 根项目一律置灰)。
+/// `ssh_connection_id` **照实读**:U 批时全仓没有任何项目带它,于是远程项目
+/// 被误判为可发起;BB-a 批把「添加远程项目」接上之后这条判据自动生效 ——
+/// 单测钉的就是这条(`远程项目镜像照实带连接id且不可发起会话`)。
+fn to_relay_project(p: &ProjectConfig) -> RelayProject {
+    RelayProject {
+        path: p.path.clone(),
+        ssh_connection_id: p.ssh_connection_id.clone(),
     }
 }
 
@@ -736,16 +750,7 @@ impl RelayBridge {
         let mut projects = HashMap::new();
         let mut live_ptys = HashSet::new();
         for project in store.projects() {
-            projects.insert(
-                project.id.clone(),
-                RelayProject {
-                    // ⚠️ 照实读,不造假值:mt-ssh 还没进 crates/,这里恒 None,
-                    // 于是 `can_start_session` 对远程项目会误判为 true。远程项目
-                    // 本来也还开不出来,SSH 批接上就自动对了。
-                    path: project.path.clone(),
-                    ssh_connection_id: project.ssh_connection_id.clone(),
-                },
-            );
+            projects.insert(project.id.clone(), to_relay_project(project));
             if let Some(layout) = store.project_state(&project.id).and_then(|s| s.layout.as_ref()) {
                 live_ptys.extend(layout.pty_ids());
             }
@@ -872,7 +877,7 @@ pub fn install(store: Entity<AppStore>, window: &mut Window, cx: &mut App) -> En
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mt_config::{ProjectConfig, ProjectGroup, ProjectTreeItem};
+    use mt_config::{ProjectGroup, ProjectTreeItem};
 
     fn project(id: &str, name: &str) -> ProjectConfig {
         ProjectConfig {
@@ -900,6 +905,33 @@ mod tests {
             status,
             pty_id: pty,
         }
+    }
+
+    // ── RelayHost 镜像里的项目切面(U 批遗留的 can_start_session 误判)──
+
+    /// U 批记档:「`can_start_session` 对 SSH 远程项目误判 true」的根因是
+    /// **当时全仓没有任何项目带 `ssh_connection_id`**(没有「添加远程项目」入口),
+    /// 而不是镜像造假。BB-a 把入口接上之后这条判据自动生效 —— 这里钉死。
+    #[test]
+    fn 远程项目镜像照实带连接id且不可发起会话() {
+        let mut remote = project("p1", "远程");
+        remote.path = "/home/u/proj".into();
+        remote.ssh_connection_id = Some("conn-1".into());
+        let facet = to_relay_project(&remote);
+        assert_eq!(facet.ssh_connection_id.as_deref(), Some("conn-1"));
+        assert!(
+            !mt_relay::can_start_session(&facet.path, facet.ssh_connection_id.as_deref()),
+            "远程项目的镜像一定是空的,移动端不该能在上面发起会话"
+        );
+
+        // 本地项目照旧可发起(同一条映射,不许把 None 造成 Some)
+        let local = project("p2", "本地");
+        let facet2 = to_relay_project(&local);
+        assert!(facet2.ssh_connection_id.is_none());
+        assert!(mt_relay::can_start_session(
+            &facet2.path,
+            facet2.ssh_connection_id.as_deref()
+        ));
     }
 
     // ── relayHttpBase 四种前缀 ──────────────────────────────
