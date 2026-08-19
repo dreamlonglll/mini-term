@@ -52,16 +52,23 @@ reqwest = { package = "zed-reqwest", version = "0.12.15-zed", default-features =
 ] }
 
 [target.'cfg(windows)'.dependencies]
-# 任务栏闪烁(FlashWindowEx)与提示音(MessageBeep / PlaySoundW)。
+# 任务栏闪烁(FlashWindowEx)、提示音(MessageBeep / PlaySoundW)与系统托盘。
 # 版本跟随 gpui 已经在用的那个,不给依赖树引入第二份 windows crate。
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     # 首启探测界面语言:GetUserDefaultLocaleName。Windows 上 LANG/LC_ALL 这些
     # 环境变量通常不存在,只能问系统(见 i18n::system_locale)。
     "Win32_Globalization",
+    # 托盘图标逐像素画:CreateDIBSection 造 32bpp 预乘 BGRA 位图,
+    # 再由 CreateIconIndirect 变成 HICON(见 tray.rs)。
+    "Win32_Graphics_Gdi",
     "Win32_Media_Audio",
     # MessageBeep 住在这个模块里(不是 WindowsAndMessaging)
     "Win32_System_Diagnostics_Debug",
+    # 托盘线程要注册自己的窗口类,RegisterClassW 的 hInstance 来自 GetModuleHandleW。
+    "Win32_System_LibraryLoader",
+    # Shell_NotifyIconW / NOTIFYICONDATAW —— 系统托盘图标的唯一入口。
+    "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
 # 从 gpui 的 Window 取 HWND。

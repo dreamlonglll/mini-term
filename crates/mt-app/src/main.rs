@@ -69,6 +69,7 @@ mod store;
 mod terminal_area;
 mod theme;
 mod title_bar;
+mod tray;
 mod tree;
 mod ui;
 mod usage_panel;
@@ -96,9 +97,10 @@ use crate::i18n::t;
 use crate::notify::ToastKind;
 use crate::project_list::ProjectList;
 use crate::session_panel::SessionPanel;
-use crate::store::{AppStore, PendingAlert};
+use crate::store::{AppStore, DoneScope, PendingAlert};
 use crate::terminal_area::TerminalArea;
 use crate::title_bar::TitleBar;
+use crate::tray::{Tray, TrayEvent};
 use crate::tree::SplitDirection;
 use crate::usage_panel::UsagePanel;
 
@@ -273,7 +275,11 @@ struct Workspace {
     /// 抽屉左缘正在被拖。`Some` 期间宽度由本结构自持,松手才落盘。
     drawer_drag: Option<DrawerDrag>,
     usage_open: bool,
+    /// 系统托盘(状态灯 + 项目菜单)。**drop 即摘图标**,所以必须由 Workspace
+    /// 持有而不是丢进全局:窗口没了托盘也就该没了。
+    tray: Tray,
     _ai_pump: Task<()>,
+    _tray_pump: Task<()>,
     _activation: Subscription,
 }
 
@@ -284,7 +290,16 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        cx.observe(&store, |_, _, cx| cx.notify()).detach();
+        // store 的每一次 notify 都顺带刷一遍托盘。**推送时机就这一处** ——
+        // 原版在七个调用点上手动 `queueMicrotask(syncTrayStatus)`(状态变化 /
+        // 关项目 / 改布局 / 清未读 / 焦点变化 / 托盘配置变化 …),而这些在 GPUI
+        // 侧无一例外都以 `cx.notify()` 收尾,挂观察者等于把七处一次覆盖全。
+        // 代价是会被无关变化(改个字号)带着跑一遍,由 [`Tray::push`] 的签名去重挡住。
+        cx.observe(&store, |this, _, cx| {
+            this.sync_tray(cx);
+            cx.notify();
+        })
+        .detach();
 
         let title_bar = cx.new(|cx| TitleBar::new(store.clone(), cx));
         let project_list = cx.new(|cx| ProjectList::new(store.clone(), cx));
@@ -324,6 +339,22 @@ impl Workspace {
             }
         });
 
+        // 系统托盘:图标住在另一条线程上(自己的隐藏窗口 + 消息循环),
+        // 交互经 channel 回到这里 —— 与 AI 状态泵同一套路数。
+        let (tray, mut tray_events) = Tray::start(window);
+        let tray_pump = cx.spawn_in(window, async move |this, cx| {
+            while let Some(event) = tray_events.next().await {
+                if this
+                    .update_in(cx, |workspace, window, cx| {
+                        workspace.on_tray_event(event, window, cx)
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+
         // 恢复出来的布局已经把 PTY 补齐了,键盘焦点也该落到当前 pane 上 ——
         // 否则用户得先点一下终端才能打字。
         let initial = {
@@ -340,7 +371,7 @@ impl Workspace {
             });
         }
 
-        Self {
+        let mut workspace = Self {
             store,
             menu_layer: menu::layer(cx),
             title_bar,
@@ -356,9 +387,81 @@ impl Workspace {
             drawer_exit: None,
             drawer_drag: None,
             usage_open: false,
+            tray,
             _ai_pump: ai_pump,
+            _tray_pump: tray_pump,
             _activation: activation,
+        };
+        // 开机第一帧就把灯点上:观察者只在 store **变化**时才响,而恢复出来的
+        // 布局里本来就可能有跑着的 AI 会话。
+        workspace.sync_tray(cx);
+        workspace
+    }
+
+    /// 把 store 的当前状态压成一份托盘快照推下去(`store.ts::syncTrayStatus`)。
+    ///
+    /// done 判据取 [`DoneScope::Unread`] —— 与标题栏胶囊的 `All` **有意不同**:
+    /// 托盘绿灯是「有你还没看过的回答」,窗口一聚焦就该灭;标题栏那颗灯不看焦点。
+    fn sync_tray(&mut self, cx: &mut App) {
+        let snapshot = {
+            let store = self.store.read(cx);
+            let config = store.config();
+            tray::build_snapshot(
+                config.tray_status_enabled.unwrap_or(true),
+                store.window_focused(),
+                &store.ai_projects(DoneScope::Unread),
+                config.tray_max_projects.unwrap_or(5) as usize,
+            )
+        };
+        self.tray.push(snapshot);
+    }
+
+    /// 托盘上的一次交互。
+    ///
+    /// 两条路的门控**有意不同**(`App.tsx:303-315`):左键受
+    /// `trayClickFocus` 管辖(关掉时窗口已被托盘线程唤起,这里就什么都不做、
+    /// 留在原地);右键菜单点项目**不受它管辖** —— 用户点的是具体项目,
+    /// 那就是明确要求跳过去。
+    fn on_tray_event(&mut self, event: TrayEvent, window: &mut Window, cx: &mut Context<Self>) {
+        match event {
+            TrayEvent::Clicked => {
+                if !self.store.read(cx).config().tray_click_focus.unwrap_or(true) {
+                    return;
+                }
+                self.focus_attention_target(None, window, cx);
+            }
+            TrayEvent::ProjectClicked(project_id) => {
+                // 菜单是上一次推送的快照,点下去时那个项目可能已经被删了
+                if self.store.read(cx).project(&project_id).is_none() {
+                    return;
+                }
+                // 那些 pane 也可能已经安静了 —— 定位不到目标也要把项目切过去,
+                // 不能让这一下没反应
+                if !self.focus_attention_target(Some(&project_id), window, cx) {
+                    self.store
+                        .update(cx, |store, cx| store.set_active_project(&project_id, cx));
+                }
+            }
         }
+    }
+
+    /// 跳到「下一件该我做的事」(`utils/attentionJump.ts::focusAttentionTarget`)。
+    /// 返回是否找到了目标 —— false = 全都闲着,调用方自己决定要不要兜底。
+    fn focus_attention_target(
+        &mut self,
+        only_project: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some((project_id, pane_id)) = self.store.read(cx).next_attention_target(only_project)
+        else {
+            return false;
+        };
+        self.store.update(cx, |store, cx| {
+            store.set_active_project(&project_id, cx);
+            store.activate_pane(&project_id, &pane_id, window, cx);
+        });
+        true
     }
 
     /// 兑现一次提醒:提示音 / 任务栏闪烁 / toast。
@@ -640,6 +743,9 @@ impl Workspace {
     }
 
     /// 跳到「下一件该我做的事」(旧版点标题栏状态灯的动作)。
+    ///
+    /// 落点算法与托盘左键**共用** [`Self::focus_attention_target`](原版也是同一个
+    /// `focusAttentionTarget`);这里多一句清未读 —— 点状态灯就是「我看过了」。
     fn on_jump_attention(
         &mut self,
         _: &JumpAttention,
@@ -649,14 +755,9 @@ impl Workspace {
         if yields_to_overlay(window, cx) {
             return;
         }
-        let Some((project_id, pane_id)) = self.store.read(cx).next_attention_target(None) else {
-            return;
-        };
-        self.store.update(cx, |store, cx| {
-            store.set_active_project(&project_id, cx);
-            store.activate_pane(&project_id, &pane_id, window, cx);
-            store.clear_unread_done(cx);
-        });
+        if self.focus_attention_target(None, window, cx) {
+            self.store.update(cx, |store, cx| store.clear_unread_done(cx));
+        }
     }
 
     fn on_focus_left(&mut self, _: &FocusLeft, window: &mut Window, cx: &mut Context<Self>) {
