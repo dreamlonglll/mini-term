@@ -198,7 +198,9 @@ use gpui::{
 use mt_terminal::{TermSize, TerminalEmulator};
 
 use super::damage::DamageStats;
-use super::element::{FrameGeometry, OnGridResize, OnInput, PreeditText, TerminalElement};
+use super::element::{
+    FlashLine, FrameGeometry, OnGridResize, OnInput, PreeditText, TerminalElement,
+};
 use super::ime::{ImeState, commit_to_bytes};
 use super::input::{is_text_input_key, keystroke_to_bytes, paste_to_bytes};
 use super::scrollbar::ScrollbarStyle;
@@ -226,6 +228,9 @@ pub struct TerminalView {
     background_art: Option<BackgroundArt>,
     search: Option<Rc<RefCell<TerminalSearch>>>,
     search_colors: SearchColors,
+    /// 一次性的整行闪烁(跳到 AI 任务标记之后的可见反馈)。见 [`FlashLine`]。
+    /// **到期撤销由宿主负责** —— 视图不起计时器,免得它替宿主管生命周期。
+    flash: Option<FlashLine>,
 }
 
 impl TerminalView {
@@ -257,6 +262,7 @@ impl TerminalView {
             background_art: None,
             search: None,
             search_colors: SearchColors::default(),
+            flash: None,
         }
     }
 
@@ -291,6 +297,16 @@ impl TerminalView {
     pub fn set_search_colors(&mut self, colors: SearchColors, cx: &mut Context<Self>) {
         if self.search_colors != colors {
             self.search_colors = colors;
+            cx.notify();
+        }
+    }
+
+    /// 让某一行整行闪一下(`None` = 撤掉)。见 [`FlashLine`]。
+    ///
+    /// 值没变就不 `notify`:跳到同一条 marker 两次不该白重画一帧。
+    pub fn set_flash(&mut self, flash: Option<FlashLine>, cx: &mut Context<Self>) {
+        if self.flash != flash {
+            self.flash = flash;
             cx.notify();
         }
     }
@@ -517,6 +533,7 @@ impl Render for TerminalView {
         .scrollbar(self.scrollbar.clone())
         .search(self.search.clone())
         .search_colors(self.search_colors)
+        .flash(self.flash)
         .selection_dwell(self.dwell)
         .background_art(self.background_art.clone())
         .geometry_sink(self.geometry.clone())

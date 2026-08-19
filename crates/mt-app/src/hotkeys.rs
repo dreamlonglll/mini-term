@@ -18,23 +18,21 @@
 //! 终端的惯例),只有确实不与行编辑冲突的才用裸 `Ctrl`
 //! (`Ctrl+Tab`、`Ctrl+1..9`、`Ctrl+,`)。
 //!
-//! # 与原版表的三处差异(都有意)
+//! # 与原版表的两处差异(都有意)
 //!
-//! 1. **`markerPrev` / `markerNext` 不列**:AI 任务标记(audit #25)GPUI 侧还没有,
-//!    列出来就是「设置页写着能按、按了没反应」;
-//! 2. **多出 GPUI 独有的三条**(`ctrl-shift-a` / `u` / `j`):原版边栏没有这几个
+//! 1. **多出 GPUI 独有的三条**(`ctrl-shift-a` / `u` / `j`):原版边栏没有这几个
 //!    面板,描述文案是 R 批往 TS 源头补的;
-//! 3. 剪贴板那两条(`Ctrl+Shift+C/V`)在原版是「xterm 的 customKeyEventHandler 消费,
+//! 2. 剪贴板那两条(`Ctrl+Shift+C/V`)在原版是「xterm 的 customKeyEventHandler 消费,
 //!    表里只为设置页展示」,GPUI 侧同样如此 —— 由 `mt_ui::TerminalView::on_key_down`
 //!    自己吃掉,这里 `keystroke = None`,**不绑 action**(绑了就轮不到终端)。
 
 use gpui::{App, KeyBinding};
 
 use crate::{
-    ClosePane, FocusDown, FocusLeft, FocusRight, FocusUp, GlobalSearch, JumpAttention, NewTerminal,
-    NextPane, OpenTerminalSettings, PrevPane, RenamePane, SelectPane, SplitDown, SplitRight,
-    SwitchProject, TerminalSearch, ToggleMiddleColumn, ToggleSessions, ToggleUsage, git_changes,
-    project_switcher,
+    ClosePane, FocusDown, FocusLeft, FocusRight, FocusUp, GlobalSearch, JumpAttention, MarkerNext,
+    MarkerPrev, NewTerminal, NextPane, OpenTerminalSettings, PrevPane, RenamePane, SelectPane,
+    SplitDown, SplitRight, SwitchProject, TerminalSearch, ToggleMiddleColumn, ToggleSessions,
+    ToggleUsage, git_changes, project_switcher,
 };
 
 /// 应用级动作的 key context(与 `Workspace::render` 的 `key_context` 一致)。
@@ -80,6 +78,7 @@ pub struct HotkeyDef {
 const G_TERMINAL: &str = "shortcuts.terminalOps";
 const G_NAV: &str = "shortcuts.navigation";
 const G_GLOBAL: &str = "shortcuts.global";
+const G_MARKER: &str = "shortcuts.aiTaskMarks";
 const G_CLIPBOARD: &str = "shortcuts.clipboard";
 
 /// 便捷构造:大多数条目只差修饰键与键名。
@@ -277,6 +276,29 @@ pub const HOTKEYS: &[HotkeyDef] = &[
         G_GLOBAL,
         "shortcuts.jumpAttention",
     ),
+    // ── AI 任务标记(`hotkeys.ts:73-74`)──
+    //
+    // 键名 `up`/`down` 与项目切换器那两条一致。原版这两条**不走 useGlobalHotkeys**
+    // (那边显式把它们排除),自己挂 capture 阶段的 window 监听,于是绕过了
+    // `isTypingTarget` 与 overlay 两道闸;GPUI 侧照常走 `yields_to_overlay` ——
+    // 方向键在输入框里有明确语义,在设置对话框里按 Ctrl+Shift+↑ 跳终端是意外行为。
+    // 这是刻意偏差,见 `main.rs::Workspace::on_marker_prev`。
+    def(
+        "markerPrev",
+        Some("ctrl-shift-up"),
+        combo(true, true, false, "↑"),
+        Scope::Global,
+        G_MARKER,
+        "shortcuts.jumpPrevAi",
+    ),
+    def(
+        "markerNext",
+        Some("ctrl-shift-down"),
+        combo(true, true, false, "↓"),
+        Scope::Global,
+        G_MARKER,
+        "shortcuts.jumpNextAi",
+    ),
     // ── 剪贴板(终端内,由 TerminalView 消费;这里只为设置页展示)──
     def(
         "copySelection",
@@ -413,6 +435,8 @@ fn binding_for(id: &str, keystroke: &str) -> Option<KeyBinding> {
         "toggleSessions" => KeyBinding::new(keystroke, ToggleSessions, Some(WORKSPACE)),
         "toggleUsage" => KeyBinding::new(keystroke, ToggleUsage, Some(WORKSPACE)),
         "jumpAttention" => KeyBinding::new(keystroke, JumpAttention, Some(WORKSPACE)),
+        "markerPrev" => KeyBinding::new(keystroke, MarkerPrev, Some(WORKSPACE)),
+        "markerNext" => KeyBinding::new(keystroke, MarkerNext, Some(WORKSPACE)),
         _ => return None,
     })
 }
@@ -487,13 +511,16 @@ mod tests {
     }
 
     /// 分组保持声明顺序、组内保持表内顺序(设置页照这个顺序画)。
+    ///
+    /// 组序与原版 `hotkeys.ts:42-46` 一致:终端 / 导航 / 全局 / AI 任务标记 / 剪贴板。
     #[test]
     fn 分组保持声明顺序() {
         let groups = groups();
         let keys: Vec<&str> = groups.iter().map(|(k, _)| *k).collect();
-        assert_eq!(keys, vec![G_TERMINAL, G_NAV, G_GLOBAL, G_CLIPBOARD]);
+        assert_eq!(keys, vec![G_TERMINAL, G_NAV, G_GLOBAL, G_MARKER, G_CLIPBOARD]);
         assert_eq!(groups[0].1[0].id, "newTerminal");
-        assert_eq!(groups[3].1.len(), 2, "剪贴板组两条");
+        assert_eq!(groups[3].1.len(), 2, "AI 任务标记组两条");
+        assert_eq!(groups[4].1.len(), 2, "剪贴板组两条");
     }
 
     /// id 不重复 —— 设置页拿 id 当行 key。
@@ -506,11 +533,22 @@ mod tests {
         assert_eq!(ids.len(), count);
     }
 
-    /// AI 任务标记(audit #25)还没实现,**不许**出现在表里 ——
-    /// 列出来就是「写着能按、按了没反应」。
+    /// AI 任务标记(audit #25)的两条键位齐了 —— W 批把功能补上,这条断言随之
+    /// **翻面**:R 批当时钉的是「还没实现就不许列出来」,现在钉的是「实现了就必须
+    /// 列出来」,两个方向守的是同一条红线(设置页写着能按 ⇔ 按了真有反应)。
     #[test]
-    fn 未实现的标记跳转不在表里() {
-        assert!(!HOTKEYS.iter().any(|d| d.id.starts_with("marker")));
+    fn 标记跳转两条键位都在表里() {
+        let ids: Vec<&str> = HOTKEYS
+            .iter()
+            .filter(|d| d.id.starts_with("marker"))
+            .map(|d| d.id)
+            .collect();
+        assert_eq!(ids, vec!["markerPrev", "markerNext"]);
+        // 与原版 `hotkeys.ts:73-74` 同键位:Ctrl+Shift+↑ / ↓
+        for def in HOTKEYS.iter().filter(|d| d.id.starts_with("marker")) {
+            assert!(def.combo.modifier && def.combo.shift && !def.combo.alt, "{}", def.id);
+            assert_eq!(def.group_key, G_MARKER);
+        }
     }
 
     #[cfg(not(target_os = "macos"))]

@@ -42,16 +42,18 @@ use gpui::{
 };
 use mt_pty::{PtySession, PtySpawn};
 use mt_terminal::alacritty_terminal::event::Event as TermEvent;
+use mt_terminal::alacritty_terminal::grid::{Dimensions as _, Scroll};
 use mt_terminal::alacritty_terminal::term::TermMode;
 use mt_terminal::{TermSize, TerminalEmulator};
 use mt_ui::terminal::{MouseMods, prefers_local_handling};
 use mt_ui::{
-    CopiedTip, DwellConfig, TerminalSearch, TerminalSearchBar, TerminalStyle, TerminalTheme,
-    TerminalView,
+    CopiedTip, DwellConfig, FlashLine, TerminalSearch, TerminalSearchBar, TerminalStyle,
+    TerminalTheme, TerminalView,
 };
 
 use crate::ai::AiBridge;
 use crate::i18n::t;
+use crate::markers::MarkerBatch;
 use crate::menu::{self, MenuItem};
 use crate::overlay;
 
@@ -62,6 +64,12 @@ pub enum PaneEvent {
     /// 用户往这个 pane 里键入了东西 —— store 据此清掉 attention 黄灯
     /// (旧版 `clearPaneAttentionByPty`:键入即视为「已在处理待确认事项」)。
     UserInput,
+    /// 用户往 AI 会话里提交了一行 → 打一批任务标记(⚑),锚点已经取好。
+    ///
+    /// 走事件而不是在 [`TerminalPane::write`] 里直接写 store:`write` 有一条
+    /// 调用路径是 `AppStore::write_to_pane`(在 `store.update` 里调),那里再去
+    /// `AppStore::global(cx).update` 就是同一实体的嵌套 update,gpui 直接 panic。
+    AiMarks(MarkerBatch),
 }
 
 /// reader / watcher 线程 → 主线程的信号。
@@ -104,9 +112,20 @@ pub struct TerminalPane {
     /// 浮动查找条。`None` = 没打开。**逐 pane 一条**(原版是全局单例,见
     /// [`Self::open_search`] 的说明)。
     search_bar: Option<Entity<TerminalSearchBar>>,
+    /// 标记跳转后那 300ms 闪烁的撤销计时器。与 `_tip_timer` 同理必须存句柄:
+    /// 连着跳两条时上一个计时器随之被丢弃,否则第一次的到点回调会把第二次刚
+    /// 亮起来的那一行提前抹掉。
+    _flash_timer: Option<Task<()>>,
     /// 唤醒任务的句柄。掉了任务就没了,必须存着。
     _wake: Task<()>,
 }
+
+/// 标记跳转后整行闪烁的底色与时长(`terminalCache.ts:193-194` 的
+/// `rgba(245, 197, 24, 0.33)` / `300ms`)。
+///
+/// 原版这两个值是写死的字面量、不走 CSS 变量,所以这里也不进 [`crate::ui`] 调色板。
+const FLASH_COLOR: u32 = 0xf5_c5_18_54;
+const FLASH_DURATION: Duration = Duration::from_millis(300);
 
 impl EventEmitter<PaneEvent> for TerminalPane {}
 
@@ -287,6 +306,7 @@ impl TerminalPane {
             _tip_timer: None,
             search,
             search_bar: None,
+            _flash_timer: None,
             _wake: wake,
         }
     }
@@ -371,12 +391,109 @@ impl TerminalPane {
             snapshot.as_deref(),
         );
         cx.emit(PaneEvent::UserInput);
+        // AI 任务标记:**必须在这里取,不能挪到异步 tick 上**。`observe_input` 是
+        // 同步的,回车那一刻 `pending_submits` 里已经有这条了;而此刻 PTY 还没回显
+        // 换行(`pty.write` 在下面几行),光标仍停在用户输入的那一行上 —— 锚点直接
+        // 取 `cursor.point.line` 即可,不需要原版 `registerMarker(-1)` 的减一
+        // (`terminalCache.ts:558-559` 的 `-1` 正是为了补偿「回显已换行」)。
+        // 一挪到 tick 上就得重新面对「减几行」这个问题。
+        if let Some(batch) = self.take_marker_batch() {
+            cx.emit(PaneEvent::AiMarks(batch));
+        }
 
         if let Some(pty) = self.pty.as_ref()
             && let Err(err) = pty.write(bytes)
         {
             eprintln!("[pane {}] 写 PTY 失败: {err:#}", self.pty_id);
         }
+    }
+
+    /// 取走这一轮的用户提交并当场折算成锚点。`None` = 没有提交 / 不该打点。
+    ///
+    /// **alt screen 一律跳过**(照抄 `terminalCache.ts:554-557`):alt grid 的
+    /// `max_scroll_limit` 是 0,没有回看缓冲,打了也无处可跳 —— 走 TUI 的 AI
+    /// (Claude Code / Codex)基本全落在这个分支,这正是「⚑ 按钮平时不出现」的原因。
+    /// 注意 `drain_submits` 是**取走即清**,所以这一句要放在闸门之后:
+    /// 提前抽干等于把 alt screen 期间的提交默默吞掉,退出 TUI 后也补不回来。
+    fn take_marker_batch(&self) -> Option<MarkerBatch> {
+        if self.emulator.mode().contains(TermMode::ALT_SCREEN) {
+            return None;
+        }
+        let submits: Vec<(String, i64)> = self
+            .ai
+            .perception()
+            .drain_submits(self.pty_id)
+            .into_iter()
+            .map(|s| (s.line, s.ts))
+            .collect();
+        if submits.is_empty() {
+            return None;
+        }
+        let (line, history) = self
+            .emulator
+            .with_term(|term| (term.grid().cursor.point.line.0, term.history_size() as i32));
+        Some(MarkerBatch {
+            submits,
+            anchor: line + history,
+            history,
+            max_scrollback: self.emulator.scrollback() as i32,
+        })
+    }
+
+    /// 当前的 `(history_size, max_scroll_limit)` —— store 侧剪枝的判据。
+    ///
+    /// alt screen 期间 `history_size` 读的是**备用 grid**(恒为 0),那会让剪枝
+    /// 误判,所以这里直接如实回报 `(0, 0)`:[`crate::markers::is_saturated`] 对
+    /// `max <= 0` 不判废,等于「TUI 期间不剪枝」——正是我们要的(主屏 scrollback
+    /// 在 TUI 期间原封不动,退出后标记照样有效)。
+    pub fn scrollback_state(&self) -> (i32, i32) {
+        if self.emulator.mode().contains(TermMode::ALT_SCREEN) {
+            return (0, 0);
+        }
+        let history = self.emulator.with_term(|term| term.history_size() as i32);
+        (history, self.emulator.scrollback() as i32)
+    }
+
+    /// 跳到某条标记:把那一行滚到**视口顶部**并闪 300ms。
+    ///
+    /// 与终端查找的 `scroll_to_current`(「已在视口里就一动不动,否则滚到视口中间」)
+    /// **语义不同**:原版 `scrollToMarker` 调的是 `term.scrollToLine(marker.line)`,
+    /// 贴视口顶部且**无条件滚动**(哪怕这一行已经在视口里)。别照抄查找那一份。
+    ///
+    /// alt screen 期间不动:`scroll_display` 作用在当前 grid 上,TUI 里滚它既没有
+    /// 回看缓冲、画面也不是主屏,纯属乱动。返回 `false` = 这次没跳(调用方据此
+    /// **不推进游标** —— 连按方向键不该在跳不动的时候空走格子)。
+    pub fn scroll_to_marker(&mut self, anchor: i32, cx: &mut Context<Self>) -> bool {
+        if self.emulator.mode().contains(TermMode::ALT_SCREEN) {
+            return false;
+        }
+        let line = self.emulator.with_term_mut(|term| {
+            let history = term.history_size() as i32;
+            let line = crate::markers::marker_line(anchor, history);
+            let offset = term.grid().display_offset() as i32;
+            let delta = scroll_delta_to_top(line, offset, history);
+            if delta != 0 {
+                term.scroll_display(Scroll::Delta(delta));
+            }
+            line
+        });
+        self.flash_line(line, cx);
+        true
+    }
+
+    /// 让某一行整行闪一下,到点自己撤掉(原版是 300ms 后 `decoration.dispose()`)。
+    fn flash_line(&mut self, line: i32, cx: &mut Context<Self>) {
+        let flash = FlashLine {
+            line,
+            color: gpui::rgba(FLASH_COLOR).into(),
+        };
+        self.view.update(cx, |view, cx| view.set_flash(Some(flash), cx));
+        self._flash_timer = Some(cx.spawn(async move |pane, cx| {
+            cx.background_executor().timer(FLASH_DURATION).await;
+            let _ = pane.update(cx, |pane: &mut TerminalPane, cx| {
+                pane.view.update(cx, |view, cx| view.set_flash(None, cx));
+            });
+        }));
     }
 
     /// 光标所在的可见行文本(取不到返回 `None`)。
@@ -538,6 +655,34 @@ mod tests {
             assert!(!allows_local_menu(mode, false, false, true), "{mode:?}");
         }
     }
+
+    /// 标记跳转把目标行顶到视口**第一行**(不是居中,也不是「已在视口就不动」)。
+    #[test]
+    fn 标记跳转把目标行滚到视口顶部() {
+        // 回看缓冲里第 100 行(line = -100),当前贴底(offset = 0):往回滚 100
+        assert_eq!(scroll_delta_to_top(-100, 0, 500), 100);
+        // 已经滚到位就不动 —— 短路判据
+        assert_eq!(scroll_delta_to_top(-100, 100, 500), 0);
+        // 滚过头了就往回补
+        assert_eq!(scroll_delta_to_top(-100, 300, 500), -200);
+    }
+
+    /// 屏幕内的行(line >= 0)目标偏移是 0:**无条件**滚回底部,
+    /// 哪怕那一行本来就在视口里 —— 原版 `scrollToLine` 就是这个语义。
+    #[test]
+    fn 屏幕内的标记也照样滚() {
+        assert_eq!(scroll_delta_to_top(5, 0, 500), 0, "已在底部,delta 为零");
+        assert_eq!(scroll_delta_to_top(5, 42, 500), -42, "回看态下拉回底部");
+    }
+
+    /// 目标偏移钳在 `[0, history]`:历史比锚点短(热改小了回滚行数)时不越界。
+    #[test]
+    fn 目标偏移钳在历史长度内() {
+        assert_eq!(scroll_delta_to_top(-900, 0, 100), 100, "最多滚到历史顶端");
+        assert_eq!(scroll_delta_to_top(-900, 0, 0), 0, "没有历史就不滚");
+        // history 传了负数(不该发生)也不许算出负的目标偏移
+        assert_eq!(scroll_delta_to_top(-900, 0, -3), 0);
+    }
 }
 
 impl Drop for TerminalPane {
@@ -570,6 +715,15 @@ impl Focusable for TerminalPane {
 /// 同时 vim 也收到了一次右键」。
 fn allows_local_menu(mode: TermMode, shift: bool, alt: bool, control: bool) -> bool {
     prefers_local_handling(mode, MouseMods::new(shift, alt, control))
+}
+
+/// 把 grid 绝对行 `line` 滚到**视口顶部**所需的 `Scroll::Delta`。
+///
+/// `display_offset` 是「往回看多少行」,屏幕行 `row = line + display_offset`,
+/// 要 `row == 0` 即 `display_offset == -line`。目标偏移钳在 `[0, history]` 内
+/// (grid 自己也会钳一次,先钳是为了让 `delta == 0` 的短路判得准)。
+fn scroll_delta_to_top(line: i32, display_offset: i32, history: i32) -> i32 {
+    (-line).clamp(0, history.max(0)) - display_offset
 }
 
 impl Render for TerminalPane {

@@ -66,6 +66,14 @@ pub mod kind {
     pub const PROJECT_SWITCHER: &str = "project-switcher";
     /// 终端内查找条(Ctrl+F)。**逐 pane 一条**,slot 存 `pty_id`。
     pub const TERMINAL_SEARCH: &str = "terminal-search";
+    /// AI 任务标记浮层(tab 栏上那个 ⚑ 按钮弹出来的列表)。
+    ///
+    /// **原版没把它放进 `overlayStack`**(`PaneGroup.tsx:279-308` 是自己挂 document
+    /// 的 mousedown,连 Esc 都没有)。这里登记一条,理由与查找条并进来那次一样:
+    /// 不登记的话「浮层开着时按 Ctrl+Shift+F」会同时开两层而浮层无人关闭。
+    /// 登记之后 Esc 关闭是 GPUI 结构性免费的(按键沿焦点链派发)—— 比原版多一条
+    /// 关闭路,记为改善。
+    pub const MARKER_LIST: &str = "marker-list";
     /// 工作区 / 暂存区的单文件 diff(`DiffModal`)。
     pub const GIT_DIFF: &str = "git-diff";
     /// 某次 commit 的多文件 diff(`CommitDiffModal`)。
@@ -104,9 +112,12 @@ pub fn terminal_search(pty_id: u32) -> OverlayKey {
 
 /// 这种覆盖物压着时,挡不挡全局快捷键。
 ///
-/// 只有终端查找条不挡 —— 见模块注释里对 `isTypingTarget` 的说明。
+/// 两类不挡:终端查找条(见模块注释里对 `isTypingTarget` 的说明)与 AI 任务标记
+/// 浮层。后者的理由一样 —— 原版这两件都**没进** `overlayStack`,它们进栈只是为了
+/// 防叠开与「栈顶是谁」有唯一真相;挡住全局快捷键会凭空多出一条原版没有的限制
+/// (标记浮层开着时按 Ctrl+Shift+↑ 该照跳,原版就是这么走的)。
 pub fn blocks_hotkeys(kind: &str) -> bool {
-    kind != self::kind::TERMINAL_SEARCH
+    kind != self::kind::TERMINAL_SEARCH && kind != self::kind::MARKER_LIST
 }
 
 /// 覆盖物压着时,这个动作还派不派发。
@@ -279,6 +290,21 @@ mod tests {
         assert!(stack.allows(Yield::ToOverlay));
         // 但只要上面再压一个真弹窗,照样让路
         stack.push(key(kind::CONFIRM));
+        assert!(!stack.allows(Yield::ToOverlay));
+    }
+
+    /// AI 任务标记浮层同样**不挡**全局快捷键 —— 原版压根没把它放进 overlayStack,
+    /// 进栈只为防叠开与 Esc;挡住就等于凭空多一条原版没有的限制。
+    #[test]
+    fn 标记浮层不挡全局快捷键() {
+        let mut stack = Stack::default();
+        stack.push(key(kind::MARKER_LIST));
+        assert!(!stack.blocking());
+        assert!(stack.allows(Yield::ToOverlay));
+        // 防叠开照旧生效
+        assert!(!stack.push(key(kind::MARKER_LIST)));
+        // 上面再压一个真弹窗就照样让路
+        stack.push(key(kind::SETTINGS));
         assert!(!stack.allows(Yield::ToOverlay));
     }
 

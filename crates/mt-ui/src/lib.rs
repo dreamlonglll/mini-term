@@ -73,7 +73,7 @@ pub use icons::{
     AiVendor, BrandIcon, FileIcon, FileKind, ProjectKind, StatusDot, StatusKind, TechIcon,
 };
 pub use terminal::{
-    CopiedTip, DamageStats, DwellConfig, FrameGeometry, HighlightKind, HighlightSpan,
+    CopiedTip, DamageStats, DwellConfig, FlashLine, FrameGeometry, HighlightKind, HighlightSpan,
     InstallInputHandler, OnGridResize, OnInput, OnSearchClose, OnSelectionCopied, PreeditText,
     ScrollbarStyle, SearchBarEvent, SearchBarLabels, SearchColors, SearchDirection,
     SearchHighlights, SearchLimits, SearchMatch, SearchOptions, TerminalElement, TerminalSearch,

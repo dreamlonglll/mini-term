@@ -49,6 +49,7 @@ mod git_watch;
 mod git_worktree;
 mod hotkeys;
 mod i18n;
+mod markers;
 mod menu;
 mod mobile_panel;
 mod mobile_relay;
@@ -150,6 +151,10 @@ actions!(
         GlobalSearch,
         /// 项目快速切换器(Ctrl+Shift+P)
         SwitchProject,
+        /// 跳到上一个 AI 任务标记(Ctrl+Shift+↑)
+        MarkerPrev,
+        /// 跳到下一个 AI 任务标记(Ctrl+Shift+↓)
+        MarkerNext,
     ]
 );
 
@@ -829,6 +834,30 @@ impl Workspace {
         search_modal::toggle(self.store.clone(), window, cx);
     }
 
+    /// Ctrl+Shift+↑:跳到上一个 AI 任务标记。首次按跳**最新一条**,
+    /// 之后每按一次往上一格,到顶停住(非环形,见 [`markers::next_index`])。
+    ///
+    /// ⚠️ **加了 `yields_to_overlay`,与原版有意不同**:原版这两条不走
+    /// `useGlobalHotkeys`,自己挂 capture 阶段的 window 监听
+    /// (`useMarkerHotkeys.ts:59`),因此绕过了「焦点在输入框里」与「弹窗压着」
+    /// 两道闸。方向键在输入框里有明确语义,在设置对话框里按 Ctrl+Shift+↑ 去跳终端
+    /// 是意外行为 —— 这里让它与其余全局动作同口径。
+    fn on_marker_prev(&mut self, _: &MarkerPrev, window: &mut Window, cx: &mut Context<Self>) {
+        if yields_to_overlay(window, cx) {
+            return;
+        }
+        self.store.update(cx, |store, cx| store.step_marker(-1, cx));
+    }
+
+    /// Ctrl+Shift+↓:跳到下一个 AI 任务标记。首次按跳**最早一条**。
+    /// 让路口径见 [`Self::on_marker_prev`]。
+    fn on_marker_next(&mut self, _: &MarkerNext, window: &mut Window, cx: &mut Context<Self>) {
+        if yields_to_overlay(window, cx) {
+            return;
+        }
+        self.store.update(cx, |store, cx| store.step_marker(1, cx));
+    }
+
     /// 抽屉标题条(`RightDrawer.tsx:80-124`):h-9 的段控件 + ✕。
     ///
     /// 段控件的选中态底块是一个**滑动的绝对定位块**(`absolute inset-y-0 left-0
@@ -1400,6 +1429,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_terminal_search))
             .on_action(cx.listener(Self::on_global_search))
             .on_action(cx.listener(Self::on_switch_project))
+            .on_action(cx.listener(Self::on_marker_prev))
+            .on_action(cx.listener(Self::on_marker_next))
             // 拖拽期间鼠标可能划出手柄(甚至划过终端),所以移动/松手挂在**根**上
             // —— 等价于原版往 document 上挂 mousemove/mouseup
             .when(self.drawer_drag.is_some(), |el| {
