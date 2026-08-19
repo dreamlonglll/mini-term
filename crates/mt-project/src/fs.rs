@@ -16,50 +16,12 @@ use serde::Serialize;
 
 /// 原子写文件:先写到同目录的临时文件,fsync 后再 rename 覆盖目标。
 ///
-/// rename 在同一卷上是原子操作(Windows 下 Rust 的 std::fs::rename 走
-/// MOVEFILE_REPLACE_EXISTING,可原子替换已存在文件),因此即便写入过程中崩溃/断电/
-/// 磁盘满,目标文件要么是旧内容、要么是完整新内容,绝不会留下被截断的半截文件。
-/// 用于所有「覆盖用户/全局既有配置」的写入(config.json、config.toml、.mcp.json、
-/// settings.json、hooks.json 等),避免裸 fs::write 的 truncate-then-write 损坏用户配置。
-pub fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    let dir = path.parent().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "目标路径没有父目录")
-    })?;
-    // 临时文件必须与目标同目录,保证同卷,rename 才能原子
-    let seq = COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
-    let stem = path.file_name().and_then(|s| s.to_str()).unwrap_or("tmp");
-    let tmp = dir.join(format!(".{}.{}.{}.tmp", stem, std::process::id(), seq));
-
-    let write_result = (|| -> std::io::Result<()> {
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(contents)?;
-        f.flush()?;
-        let _ = f.sync_all(); // sync 失败不致命,尽力而为
-        Ok(())
-    })();
-    if let Err(e) = write_result {
-        let _ = fs::remove_file(&tmp);
-        return Err(e);
-    }
-
-    // 若目标已存在,把其权限位复制到临时文件,避免 rename 后权限退化为 umask 默认值
-    // (Unix 下保护用户 chmod 600 的含 token 配置不被降级为 0644;Windows 上对应只读位)。
-    if let Ok(meta) = fs::metadata(path) {
-        let _ = fs::set_permissions(&tmp, meta.permissions());
-    }
-
-    match fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = fs::remove_file(&tmp);
-            Err(e)
-        }
-    }
-}
+/// 收尾-1 批把工作区里的三份逐字副本(本模块、`mt_config::config`、`mt_ai::util`)
+/// 合并进叶子 crate `mt-core`,这里改为再导出 —— 公开路径
+/// `mt_project::fs::atomic_write` 与函数签名一字未改,本模块内的调用点
+/// (`write_file_content`)和下面的回归测试也照旧。
+/// 实现与「为什么必须原子写」的完整说明见 `mt_core::atomic_write`。
+pub use mt_core::atomic_write;
 
 /// 自然排序比较(数字段按数值比)。公开出去:远程文件树(尚未移植的
 /// `remote_ssh.rs`)将复用同一排序规则,保证本地/远程树观感一致。

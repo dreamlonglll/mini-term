@@ -5,37 +5,10 @@
 
 /// 去除 ANSI 转义序列，返回纯文本。
 ///
-/// 逐字复制自 `mt_core::strip_ansi_codes`(见 `crate::util` 顶部关于为什么
-/// 不直接依赖 `src-tauri/mt-core` 的说明)。
-pub(crate) fn strip_ansi_codes(s: &str) -> String {
-    let mut result = String::new();
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            match chars.peek() {
-                Some(&'[') => {
-                    chars.next(); // consume '['
-                                  // CSI sequence: skip until final byte (0x40–0x7E)
-                    for c2 in chars.by_ref() {
-                        if ('\x40'..='\x7e').contains(&c2) {
-                            break;
-                        }
-                    }
-                }
-                Some(&'O') => {
-                    chars.next();
-                    chars.next();
-                } // SS3: ESC O <final>
-                _ => {
-                    chars.next();
-                } // other two-char escape
-            }
-        } else {
-            result.push(c);
-        }
-    }
-    result
-}
+/// 收尾-1 批之前这里是 `mt_core::strip_ansi_codes` 的逐字副本(那时 mt-core 还在
+/// `src-tauri/` 下,新工作区不能反向依赖旧目录树)。mt-core 移入 `crates/` 后
+/// 副本已删,改为再导出 —— 本模块内的两处调用与下面的回归测试都一字未动。
+pub(crate) use mt_core::strip_ansi_codes;
 
 /// 交互式 AI CLI 的命令名。
 ///

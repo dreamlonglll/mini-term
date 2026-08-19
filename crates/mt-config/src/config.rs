@@ -11,29 +11,27 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
-/// SSH 连接。
+/// SSH 连接(`config.json` 的 `sshConnections` 数组元素)。
 ///
-/// **临时定义**:原本来自 `src-tauri/mt-core::SshConnection`,而 `mt-core` 按
-/// `docs/gpui-migration.md` 第 7 节要留在 `src-tauri/` 下直到 `remote_ssh.rs`
-/// 迁移(它还被 `mt-sidecars` 引用,提前挪会打断 sidecar 构建管线)。
-/// 这里逐字段复刻同一份 serde 形状(camelCase + 全部 Option 带 default),
-/// 保证 `config.json` 双向兼容。
-/// **TODO**:`mt-core` 物理移入 `crates/` 后,本类型改为 `pub use mt_core::SshConnection`。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SshConnection {
-    pub id: String,
-    pub name: String,
-    pub host: String,
-    pub port: u16,
-    pub user: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub password: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub identity_file: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub group: Option<String>,
-}
+/// 收尾-1 批去重:迁移期这里是 `mt_core::SshConnection` 的逐字段复刻(那时
+/// mt-core 还在 `src-tauri/` 下,新工作区反向依赖旧目录树会把整套 Tauri 依赖
+/// 拖进来)。mt-core 物理移入 `crates/` 后复刻已删,改为**再导出 mt-core 的定义**。
+///
+/// **方向为什么是 mt-config → mt-core,而不是反过来**:两个方向都不成环
+/// (mt-core 依赖表只有 serde/serde_json/dirs,mt-config 此前不依赖 mt-core),
+/// 但 mt-core 是依赖图的**叶子**,被 miniterm-hook / mt-ssh-mcp / mt-ssh-cli
+/// 三个独立小二进制与 mt-ssh 直接链接。若反过来让 mt-core `pub use`
+/// mt-config 的定义,zip / sha2 / anyhow 整棵树会被拖进 hook 小二进制,而且
+/// mt-core 的 `config_reader`(sidecar 自持的 config.json 读取器)会与
+/// mt-config 的 `paths` / `ConfigStore` 在同一依赖树里重影。取代价小的那个。
+///
+/// 「config 是 sshConnections 的持久化归属方」这条决议本身不变:
+/// - 名字仍是 `mt_config::SshConnection`,其他 crate 的引用一行不用改;
+/// - `config.json` 仍由本 crate 读写;
+/// - 钉住磁盘格式的 serde 形状回归测试
+///   (`tests::ssh_connection_uses_camel_case_and_skips_none`)原样保留,
+///   现在钉的直接是那份共享定义,护栏比原来更硬。
+pub use mt_core::SshConnection;
 
 // 注意：variant 顺序不可调换！untagged 按声明顺序尝试匹配
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -902,48 +900,12 @@ impl ConfigStore {
 
 /// 同目录临时文件 + rename 的原子写。
 ///
-/// 与 `src-tauri/src/fs.rs::atomic_write`(去向 `mt-project`)是同一份实现的副本:
-/// 配置写盘是本 crate 的核心不变量,不能为了一个 20 行的工具函数把 mt-config
-/// 挂到 mt-project 上(依赖方向会倒过来)。
-/// **TODO**:等工作区出现共享工具 crate 后合并成一份。
-fn atomic_write(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    let dir = path.parent().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::InvalidInput, "目标路径没有父目录")
-    })?;
-    // 临时文件必须与目标同目录,保证同卷,rename 才能原子
-    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let stem = path.file_name().and_then(|s| s.to_str()).unwrap_or("tmp");
-    let tmp = dir.join(format!(".{}.{}.{}.tmp", stem, std::process::id(), seq));
-
-    let write_result = (|| -> std::io::Result<()> {
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(contents)?;
-        f.flush()?;
-        let _ = f.sync_all(); // sync 失败不致命,尽力而为
-        Ok(())
-    })();
-    if let Err(e) = write_result {
-        let _ = fs::remove_file(&tmp);
-        return Err(e);
-    }
-
-    // 若目标已存在,把其权限位复制到临时文件,避免 rename 后权限退化为 umask 默认值
-    // (Unix 下保护用户 chmod 600 的含 token 配置不被降级为 0644;Windows 上对应只读位)。
-    if let Ok(meta) = fs::metadata(path) {
-        let _ = fs::set_permissions(&tmp, meta.permissions());
-    }
-
-    match fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = fs::remove_file(&tmp);
-            Err(e)
-        }
-    }
-}
+/// 收尾-1 批把工作区里的三份逐字副本(本模块、`mt_project::fs`、`mt_ai::util`)
+/// 合并进叶子 crate `mt-core`。原先「不能为一个 20 行工具函数把 mt-config 挂到
+/// mt-project 上(依赖方向会倒过来)」的顾虑消失了:mt-core 依赖表只有
+/// serde/serde_json/dirs,谁依赖它都不会把方向弄反。
+/// 实现见 `mt_core::atomic_write`,行为与本文件原副本一字不差。
+use mt_core::atomic_write;
 
 #[cfg(test)]
 mod tests {

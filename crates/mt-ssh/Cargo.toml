@@ -1,12 +1,16 @@
 [package]
 name = "mt-ssh"
+# ⚠️ version / edition 与 mt-core 同理保持**显式**值:本 crate 收尾-1 批移入
+# `crates/` 后既是 GPUI 工作区成员,也仍是 `src-tauri` / `src-tauri/mt-sidecars`
+# 两个旧工作区的跨工作区 path 依赖,不能改用 workspace.package 继承(取值不同)。
 version = "0.6.5"
 description = "mini-term shared SSH layer: russh persistent session pool + SFTP transfer primitives, shared by the app and the mt-ssh-mcp sidecar"
 edition = "2021"
 
 # 共享 SSH 通信层 crate(task 07-05-ssh-remote-projects PR1,自 mt-sidecars/src/pool.rs 抽出):
 # 不依赖 tauri / rmcp。`mt-sidecars`(mt-ssh-mcp sidecar)与主程序 `src-tauri` 各自以
-# 路径依赖引用,各持一个池实例;本 crate 单独 `cargo test` 时生成自己的 Cargo.lock。
+# 路径依赖引用,各持一个池实例;GPUI 侧则走根工作区的 `mt-ssh.workspace = true`。
+# 收尾-1 批移入 `crates/` 后本 crate 归根工作区的 Cargo.lock 管,不再自持 lock。
 # MCP/rmcp 胶水、工具 schema、审计日志等 sidecar 专属逻辑留在 mt-sidecars,不进本 crate。
 
 [lib]
@@ -14,6 +18,8 @@ name = "mt_ssh"
 
 [dependencies]
 # SshConnection 类型(含明文 password / identityFile)来自 tauri-free 共享 crate。
+# 相对路径写法保留:同一份 manifest 要在根工作区与两个旧 Tauri 工作区里都解析得动,
+# `../mt-core` 三处都指向 `crates/mt-core`,比 workspace 继承少一层解析假设。
 mt-core = { path = "../mt-core" }
 # SSH 客户端实现:纯 Rust + tokio 原生 async;
 # 持久会话池由它建/维持单条 SSH 连接,channel 用于 exec。
