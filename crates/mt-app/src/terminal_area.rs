@@ -64,6 +64,9 @@ pub struct TerminalArea {
     measured: bool,
     /// 每个 pane 在屏幕上的矩形 —— 方向导航按几何最近邻挑目标。
     pane_rects: HashMap<String, PaneRect>,
+    /// 正拖着文件悬停在哪个 pane 上(文件树的 `DragFilePath` 与系统的
+    /// `ExternalPaths` 共用)。`on_drop` 不带位置,高亮只能从这里来。
+    file_drop_pane: Option<String>,
 }
 
 /// 各子节点占主轴的比例(和为 1)。
@@ -208,6 +211,7 @@ impl TerminalArea {
             area_size: FALLBACK_AREA,
             measured: false,
             pane_rects: HashMap::new(),
+            file_drop_pane: None,
         }
     }
 
@@ -618,6 +622,12 @@ impl TerminalArea {
 
         let pid_focus = pid.clone();
         let active_for_focus = active_id.clone();
+        let pid_drop = pid.clone();
+        let drop_pane_id = active_id.clone();
+        // 拖拽中断(松手在窗外)后 gpui 会清 active_drag 并重画,与它与门就不必
+        // 到处补清理 —— 与 `project_list.rs` 里那份高亮同一套判据。
+        let file_drop_over =
+            cx.has_active_drag() && self.file_drop_pane.as_deref() == Some(active_id.as_str());
         // 方向导航要知道每个 pane 画在哪 —— canvas 只量不画,量完存进本视图。
         // 这里**故意不 notify**:量尺寸再触发重画就是每帧一个死循环。
         let this = cx.entity();
@@ -645,6 +655,50 @@ impl TerminalArea {
                         this.store.update(cx, |store, cx| {
                             store.focus_pane(&pid_focus, &active_for_focus, window, cx)
                         });
+                    }))
+                    // ── 拖文件进终端(改造清单 #8 链路③)────────────────
+                    //
+                    // 两个来源共用这一处落点:文件树的 `DragFilePath` 与资源管理器的
+                    // `ExternalPaths`(gpui 把系统 FileDrop 翻译成内部 drag,见 `dnd` 模块)。
+                    // 写入走 `AppStore::write_to_pane` —— 它刻意经 `TerminalPane::write`,
+                    // 好让 AI 输入检测那条链路看得见这段文本,**不许改成裸 PTY 写**。
+                    .on_drag_move(cx.listener({
+                        let pane_id = drop_pane_id.clone();
+                        move |this: &mut TerminalArea,
+                              event: &gpui::DragMoveEvent<crate::dnd::DragFilePath>,
+                              _window,
+                              cx| {
+                            this.note_file_drag_over(&pane_id, event.bounds, event.event.position, cx);
+                        }
+                    }))
+                    .on_drag_move(cx.listener({
+                        let pane_id = drop_pane_id.clone();
+                        move |this: &mut TerminalArea,
+                              event: &gpui::DragMoveEvent<gpui::ExternalPaths>,
+                              _window,
+                              cx| {
+                            this.note_file_drag_over(&pane_id, event.bounds, event.event.position, cx);
+                        }
+                    }))
+                    .on_drop(cx.listener({
+                        let (pid, pane_id) = (pid_drop.clone(), drop_pane_id.clone());
+                        move |this: &mut TerminalArea,
+                              item: &crate::dnd::DragFilePath,
+                              window,
+                              cx| {
+                            let text = crate::dnd::quote_path(&item.0);
+                            this.insert_path_into_pane(&pid, &pane_id, &text, window, cx);
+                        }
+                    }))
+                    .on_drop(cx.listener({
+                        let (pid, pane_id) = (pid_drop.clone(), drop_pane_id.clone());
+                        move |this: &mut TerminalArea,
+                              item: &gpui::ExternalPaths,
+                              window,
+                              cx| {
+                            let text = crate::dnd::quote_paths(item.paths());
+                            this.insert_path_into_pane(&pid, &pane_id, &text, window, cx);
+                        }
                     }))
                     .child(
                         canvas(
@@ -678,10 +732,84 @@ impl TerminalArea {
                                 .text_color(ui::text_muted())
                                 .child(t("paneGroup", "starting")),
                         ),
-                    }),
+                    })
+                    // 「释放以插入路径」的虚线框。与 `cx.has_active_drag()` 与门:
+                    // 拖拽被中断时 gpui 会清 active_drag 并重画,残留状态自动失效。
+                    .when(file_drop_over, |el| el.child(drop_hint())),
             )
             .into_any_element()
     }
+
+    /// `on_drag_move` 的落点记录。见 [`crate::dnd`] 模块注释第 2 条:这个回调会
+    /// 打给**每一个**注册者(不只鼠标底下那个),命中判定必须自己做。
+    fn note_file_drag_over(
+        &mut self,
+        pane_id: &str,
+        bounds: Bounds<Pixels>,
+        position: gpui::Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let hit = bounds.contains(&position);
+        let next = if hit {
+            Some(pane_id.to_string())
+        } else if self.file_drop_pane.as_deref() == Some(pane_id) {
+            // 只收自己那一份,别人的留给别人清
+            None
+        } else {
+            return;
+        };
+        if self.file_drop_pane != next {
+            self.file_drop_pane = next;
+            cx.notify();
+        }
+    }
+
+    /// 把路径文本当作用户键入写进 pane,并把键盘还给终端(原版 `term.focus()`)。
+    fn insert_path_into_pane(
+        &mut self,
+        project_id: &str,
+        pane_id: &str,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.file_drop_pane = None;
+        if text.is_empty() {
+            cx.notify();
+            return;
+        }
+        self.store.update(cx, |store, cx| {
+            store.write_to_pane(project_id, pane_id, text, cx);
+            store.focus_pane(project_id, pane_id, window, cx);
+        });
+        cx.notify();
+    }
+}
+
+/// 拖文件悬停时盖在终端上的虚线提示框(`TerminalInstance.tsx:430-442`)。
+fn drop_hint() -> AnyElement {
+    div()
+        .absolute()
+        .inset(px(4.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(6.0))
+        .border_2()
+        .border_dashed()
+        .border_color(ui::accent())
+        .bg(ui::accent_subtle())
+        .child(
+            div()
+                .px(px(12.0))
+                .py(px(6.0))
+                .rounded(px(6.0))
+                .bg(ui::bg_overlay())
+                .text_size(ui::font_px(9.75))
+                .text_color(ui::accent())
+                .child(t("terminal", "dropToInsertPath")),
+        )
+        .into_any_element()
 }
 
 /// 点击次数(键盘触发的「点击」按一次算)。
@@ -698,6 +826,11 @@ impl Render for TerminalArea {
         // 一个 Entity(极小但确实的泄漏,看板已记)。
         let live_nodes = self.store.read(cx).live_node_ids();
         self.split_states.retain(|id, _| live_nodes.contains(id));
+        // 拖拽结束后借这一帧清掉落点残留(**不 notify**,正在渲染)。
+        // 高亮另外还与 `has_active_drag` 与门,见 `render_leaf`。
+        if !cx.has_active_drag() {
+            self.file_drop_pane = None;
+        }
 
         let store = self.store.read(cx);
         let Some(project) = store.active_project() else {

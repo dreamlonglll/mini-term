@@ -33,6 +33,7 @@ use crate::ai::{AiBridge, AiEvent};
 use crate::notify::{AlertPlan, DoneTracker, NotifyPrefs, PaneRef, StatusTransition};
 use crate::pane::{PaneEvent, TerminalPane};
 use crate::persist;
+use crate::project_tree;
 use crate::session_panel::build_resume_command;
 use crate::shell_ops::ShellList;
 use crate::tree::{
@@ -464,6 +465,171 @@ impl AppStore {
         }
         self.save_config_soon(cx);
         cx.notify();
+    }
+
+    // === 项目分组(`store.ts:1266-1313` 的五个 action) ===
+
+    /// `ensureTree`(`store.ts:611-617`)的 Rust 版:第一次碰分组时把
+    /// `projectTree` 补齐,免得后面的树操作全落进 `None` 里静默失效。
+    ///
+    /// **旧格式迁移不在这里**:`projectGroups`/`projectOrdering` → `projectTree`
+    /// 已经由 `mt_config::migrate_config` 在读盘时做过一遍(config.rs:646-676),
+    /// 这里只补「压根没有过分组」的那一档。
+    ///
+    /// ⚠️ 与 TS 的一处有意偏差:铺初值时**跳过 worktree 子项目**。那边是
+    /// `projects.map(p => p.id)` 一个不落,但「子项目不进 projectTree」是两侧
+    /// 共同的不变量(见 [`Self::add_project_at`]),把它们塞进去会让
+    /// `get_ordered_tree` 同时按树序和父项目序各排一次。
+    fn ensure_tree(&mut self) {
+        if self
+            .config
+            .project_tree
+            .as_ref()
+            .is_some_and(|tree| !tree.is_empty())
+        {
+            return;
+        }
+        let ids: Vec<mt_config::ProjectTreeItem> = self
+            .config
+            .projects
+            .iter()
+            .filter(|p| p.parent_project_id.is_none())
+            .map(|p| mt_config::ProjectTreeItem::ProjectId(p.id.clone()))
+            .collect();
+        self.config.project_tree = Some(ids);
+    }
+
+    /// 新建分组。`parent_group_id` 为 `None` = 建在顶层,**一律追加到末尾**。
+    ///
+    /// 父组找不到时 `insert_into_tree` 返回 false,原版就此**静默丢弃**
+    /// (`store.ts:1266-1273` 不看返回值)—— 这里照抄:能走到这一步说明右键菜单
+    /// 拿的是刚渲染过的组 id,丢弃比"悄悄建到顶层"更容易暴露真正的 bug。
+    pub fn create_group(
+        &mut self,
+        name: &str,
+        parent_group_id: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        let name = name.trim();
+        if name.is_empty() {
+            return;
+        }
+        self.ensure_tree();
+        let group = mt_config::ProjectGroup {
+            id: gen_id("group"),
+            name: name.to_string(),
+            collapsed: false,
+            children: Vec::new(),
+        };
+        let tree = self.config.project_tree.get_or_insert_with(Vec::new);
+        project_tree::insert_into_tree(
+            tree,
+            parent_group_id,
+            mt_config::ProjectTreeItem::Group(group),
+            None,
+        );
+        self.save_config_soon(cx);
+        cx.notify();
+    }
+
+    /// 删分组。**组员(含子组)原位晋升到父级,一个都不删** —— 与原版
+    /// `removeGroupAndPromoteChildren` 同语义,所以确认框那句"会移到上一级"是真的。
+    pub fn remove_group(&mut self, group_id: &str, cx: &mut Context<Self>) {
+        let Some(tree) = self.config.project_tree.as_mut() else {
+            return;
+        };
+        if !project_tree::remove_group_and_promote_children(tree, group_id) {
+            return;
+        }
+        self.save_config_soon(cx);
+        cx.notify();
+    }
+
+    /// 改分组名。空名不接受(调用方那边也 `trim` 过一道,两处都拦)。
+    pub fn rename_group(&mut self, group_id: &str, name: &str, cx: &mut Context<Self>) {
+        let name = name.trim();
+        if name.is_empty() {
+            return;
+        }
+        let Some(tree) = self.config.project_tree.as_mut() else {
+            return;
+        };
+        let Some(group) = project_tree::find_group_in_tree_mut(tree, group_id) else {
+            return;
+        };
+        if group.name == name {
+            return;
+        }
+        group.name = name.to_string();
+        self.save_config_soon(cx);
+        cx.notify();
+    }
+
+    /// 折叠 / 展开。**只影响侧栏渲染**:移动端快照那条路
+    /// (`mobile_relay::ordered_projects`)刻意不跳过折叠组,折不折叠由手机自己决定。
+    pub fn toggle_group_collapse(&mut self, group_id: &str, cx: &mut Context<Self>) {
+        let Some(tree) = self.config.project_tree.as_mut() else {
+            return;
+        };
+        let Some(group) = project_tree::find_group_in_tree_mut(tree, group_id) else {
+            return;
+        };
+        group.collapsed = !group.collapsed;
+        self.save_config_soon(cx);
+        cx.notify();
+    }
+
+    /// 把节点(项目或分组)移到 `target_group_id` 里的 `index` 位置。
+    /// `target_group_id = None` = 根层;`index = None` = 追加到末尾。
+    ///
+    /// 两条边界逐条对照 `store.ts:1296-1313`:
+    /// - **树里找不到**:那多半是 worktree 子项目(它按设计就不在树里,位置由
+    ///   父项目派生)。此时「移动 = 脱离父项目」:清掉 `parentProjectId`,再把裸
+    ///   id 当普通树节点插进去。既不是子项目又不在树里 → 什么都不做。
+    /// - **目标组找不到**:原版此时节点已经被摘下来却插不回去(`insertIntoTree`
+    ///   返回 false 就丢了)。这里退回根层末尾 —— 分组被并发删掉是唯一能触发的
+    ///   路径,丢掉一整个子树换不来任何好处。
+    ///
+    /// 返回值 = 这次有没有真的动过树。
+    pub fn move_item(
+        &mut self,
+        item_id: &str,
+        target_group_id: Option<&str>,
+        index: Option<usize>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.ensure_tree();
+        let removed = self
+            .config
+            .project_tree
+            .as_mut()
+            .and_then(|tree| project_tree::remove_from_tree(tree, item_id));
+
+        let removed = match removed {
+            Some(item) => item,
+            None => {
+                let Some(child) = self
+                    .config
+                    .projects
+                    .iter_mut()
+                    .find(|p| p.id == item_id && p.parent_project_id.is_some())
+                else {
+                    return false;
+                };
+                child.parent_project_id = None;
+                mt_config::ProjectTreeItem::ProjectId(item_id.to_string())
+            }
+        };
+
+        let tree = self.config.project_tree.get_or_insert_with(Vec::new);
+        if !project_tree::insert_into_tree(tree, target_group_id, removed, index) {
+            // 上面那段注释的第二条:目标组没了,退回根层末尾而不是把子树扔掉
+            let fallback = mt_config::ProjectTreeItem::ProjectId(item_id.to_string());
+            project_tree::insert_into_tree(tree, None, fallback, None);
+        }
+        self.save_config_soon(cx);
+        cx.notify();
+        true
     }
 
     // === 终端 ===

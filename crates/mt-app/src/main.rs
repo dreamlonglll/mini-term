@@ -37,6 +37,7 @@
 
 mod activity_bar;
 mod ai;
+mod dnd;
 mod file_tree;
 mod focus_nav;
 mod fs_ops;
@@ -61,6 +62,7 @@ mod persist;
 mod pricing;
 mod project_list;
 mod project_switcher;
+mod project_tree;
 mod prompt;
 mod search_modal;
 mod session_branch;
