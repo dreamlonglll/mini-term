@@ -99,7 +99,15 @@ pub fn list_packs() -> Vec<(ThemePackDef, std::path::PathBuf)> {
 /// - 无皮肤 / 皮肤读不出来 → [`switch_to_builtin`](mt_ui::theme_bridge::switch_to_builtin)
 ///   (**内含**把 `Theme::dark_theme`/`light_theme` 从 `ThemeRegistry` 恢复回内置基线
 ///   这一步 —— 少了它「退出皮肤」只切 mode,浮层会原地停在皮肤配色上)。
-pub fn apply(config: &AppConfig, mut window: Option<&mut Window>, cx: &mut App) -> AppliedTheme {
+pub fn apply(config: &AppConfig, window: Option<&mut Window>, cx: &mut App) -> AppliedTheme {
+    let applied = apply_inner(config, window, cx);
+    // 代码高亮配色跟着壳配色走(见 [`install_highlight_theme`])。放在这里而不是
+    // 三个 return 分支里各写一遍 —— 装配入口只有一个,高亮表也只在这一处装。
+    install_highlight_theme(&applied.palette, applied.appearance, cx);
+    applied
+}
+
+fn apply_inner(config: &AppConfig, mut window: Option<&mut Window>, cx: &mut App) -> AppliedTheme {
     let follow = config.terminal_follow_theme;
 
     if let Some(theme_id) = config.custom_theme_id.as_deref() {
@@ -145,6 +153,136 @@ pub fn apply(config: &AppConfig, mut window: Option<&mut Window>, cx: &mut App) 
         background: None,
         failed_pack: None,
     }
+}
+
+// ─── 代码高亮配色(`--syn-*` 九色 → gpui-component 的 HighlightTheme) ───
+
+/// 把壳配色映射成 gpui-component 的语法高亮表,并装进 `Theme` 全局。
+///
+/// 消费方有两处,都读 `cx.theme().highlight_theme`:
+/// 内置编辑器(`input/element.rs:773`)与 Markdown 预览里的代码块
+/// (`text/node.rs:343`)—— 同一份表保证两处颜色一致。
+///
+/// # 为什么是九色而不是四十色
+///
+/// 原版 `CodeEditor.tsx:75-103` 的 `HighlightStyle` 只用了九个 CSS 变量
+/// (`--syn-keyword` / `--syn-string` / `--syn-number` / `--syn-function` /
+/// `--syn-type` / `--syn-property` / `--syn-tag` / `--syn-comment` / `--syn-operator`,
+/// 定义在 `src/styles.css:50-59`,各自指向应用现有色板)。gpui-component 的
+/// `SyntaxColors` 有 40 个名字,这里把它们**归到原版那九组**里 ——
+/// 同一份主题在新旧两版里长得一样是本次迁移的硬指标,多分几档反而对不上。
+///
+/// # 为什么走 JSON 而不是结构体字面量
+///
+/// `ThemeStyle` 的三个字段是**私有**的(`highlighter/registry.rs:201-205`),
+/// 组件库只留了 serde 这一条构造路(它本来就是给 Zed 主题 JSON 用的)。
+/// 于是这里把颜色打成 `#rrggbbaa` 再 `from_value` —— 不是绕路,是唯一的公开入口。
+fn install_highlight_theme(palette: &Palette, appearance: Appearance, cx: &mut App) {
+    use gpui_component::highlighter::{HighlightTheme, HighlightThemeStyle, SyntaxColors};
+    use gpui_component::{Theme, ThemeMode};
+
+    /// `#rrggbbaa`。`Hsla` 的 `Deserialize` 走 `Rgba`,认的就是这种串。
+    fn hex(color: gpui::Hsla) -> String {
+        let rgba = gpui::Rgba::from(color);
+        let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+        format!(
+            "#{:02x}{:02x}{:02x}{:02x}",
+            b(rgba.r),
+            b(rgba.g),
+            b(rgba.b),
+            b(rgba.a)
+        )
+    }
+    /// 一条 `ThemeStyle`。`italic` / `bold` 对应原版那两条 `fontStyle` / `fontWeight`。
+    fn style(color: gpui::Hsla, italic: bool, bold: bool) -> Option<gpui_component::highlighter::ThemeStyle> {
+        let mut obj = serde_json::json!({ "color": hex(color) });
+        if italic {
+            obj["font_style"] = serde_json::json!("italic");
+        }
+        if bold {
+            obj["font_weight"] = serde_json::json!(600);
+        }
+        serde_json::from_value(obj).ok()
+    }
+
+    let plain = |c: gpui::Hsla| style(c, false, false);
+
+    // 九组,逐条对着 `CodeEditor.tsx:75-103` 的 tag 清单分派
+    let keyword = plain(palette.color_ai); // --syn-keyword
+    let string = plain(palette.color_success); // --syn-string
+    let number = plain(palette.color_warning); // --syn-number(含 bool/null/atom/self)
+    let function = plain(palette.color_file); // --syn-function
+    let type_ = plain(palette.color_folder); // --syn-type(含 class/namespace/annotation)
+    let property = plain(palette.color_info); // --syn-property(含 attribute/label/link)
+    let tag = plain(palette.color_error); // --syn-tag
+    let comment = style(palette.text_muted, true, false); // --syn-comment,原版带斜体
+    let operator = plain(palette.text_secondary); // --syn-operator(含 punctuation/bracket)
+    let primary = plain(palette.text_primary);
+
+    let syntax = SyntaxColors {
+        keyword,
+        boolean: number,
+        constant: number,
+        number,
+        variable_special: number,
+        string,
+        string_escape: string,
+        string_regex: string,
+        string_special: string,
+        string_special_symbol: string,
+        text_literal: string,
+        comment,
+        comment_doc: comment,
+        // 原版 `meta` / `processingInstruction` 也走 --syn-comment
+        preproc: comment,
+        function,
+        constructor: function,
+        type_,
+        enum_: type_,
+        variant: type_,
+        property,
+        attribute: property,
+        label: property,
+        link_text: property,
+        link_uri: property,
+        tag,
+        tag_doctype: tag,
+        operator,
+        punctuation: operator,
+        punctuation_bracket: operator,
+        punctuation_delimiter: operator,
+        punctuation_list_marker: operator,
+        punctuation_special: operator,
+        // 标题在原版是 accent + 600(Markdown 源码态)
+        title: style(palette.accent, false, true),
+        emphasis: style(palette.text_primary, true, false),
+        emphasis_strong: style(palette.text_primary, false, true),
+        variable: primary,
+        primary,
+        embedded: primary,
+        // 补全提示类:灰掉(原版没有对应 tag,取 --text-muted 最接近)
+        hint: plain(palette.text_muted),
+        predictive: plain(palette.text_muted),
+    };
+
+    let theme = HighlightTheme {
+        name: "mini-term".to_string(),
+        appearance: match appearance {
+            Appearance::Dark => ThemeMode::Dark,
+            Appearance::Light => ThemeMode::Light,
+        },
+        style: HighlightThemeStyle {
+            editor_background: Some(palette.bg_base),
+            editor_foreground: Some(palette.text_primary),
+            // 活动行:accent 的极淡一档(原版 `.cm-activeLine` 用 --accent-subtle)
+            editor_active_line: Some(palette.accent_subtle),
+            editor_line_number: Some(palette.text_muted),
+            editor_active_line_number: Some(palette.text_primary),
+            syntax,
+            ..Default::default()
+        },
+    };
+    Theme::global_mut(cx).highlight_theme = std::sync::Arc::new(theme);
 }
 
 fn builtin_palette(appearance: Appearance) -> Palette {

@@ -11,7 +11,16 @@ path = "src/main.rs"
 
 [dependencies]
 gpui.workspace = true
-gpui-component.workspace = true
+# `tree-sitter-languages` 是文件预览器(`file_viewer.rs`)语法高亮的唯一来源:
+# 不开这个 feature 时 gpui-component 的 `Language` 枚举**只有 Json**
+# (`src/highlighter/languages.rs:5-8`),.rs / .ts / .py 一律画成纯文本;开了得 30 种,
+# 与原版 CodeMirror `@codemirror/language-data` 的覆盖面同量级。
+# 代价是 30 个带 `cc` build script 的 tree-sitter 语言 crate 的首次编译时间 ——
+# 一次性成本,换的是「内置编辑器与装机版观感一致」这条产品目标。
+#
+# **写在这里而不是根 `Cargo.toml`**:workspace 依赖允许成员 crate 在
+# `workspace = true` 之上追加 feature(feature 是可加的),于是根文件保持不动。
+gpui-component = { workspace = true, features = ["tree-sitter-languages"] }
 mt-ui.workspace = true
 mt-terminal.workspace = true
 mt-pty.workspace = true
