@@ -1217,6 +1217,12 @@ impl AppStore {
         cx.notify();
     }
 
+    /// 主窗口是否聚焦。托盘的闪烁策略要看它(聚焦不闪),而托盘的推送发生在
+    /// store 观察者里、手上没有 `Window`,只能从这里读。
+    pub fn window_focused(&self) -> bool {
+        self.window_focused
+    }
+
     /// 未读完成数(旧版托盘绿灯的计数,这里给壳内徽章用)。
     pub fn unread_done_count(&self) -> usize {
         self.done.unread_count()
@@ -2081,11 +2087,8 @@ pub enum DoneScope {
     /// 全部完成记录(旧版 `aiDoneOrder`)。**不看窗口焦点** —— 标题栏胶囊与
     /// 全局状态灯用这一套(`TitleBar.tsx:118` 原注释)。
     All,
-    /// 未读完成(旧版 `unreadDonePaneIds`,聚焦即清)。托盘用这一套。
-    ///
-    /// 托盘(audit #21 / T 批)还没接线,所以本轮没有调用点 —— 留着是因为
-    /// 「两套 done 判据」正是这个枚举存在的理由,砍掉一半等于把差异藏起来。
-    #[allow(dead_code)]
+    /// 未读完成(旧版 `unreadDonePaneIds`,聚焦即清)。托盘用这一套 ——
+    /// 绿灯的语义是「有你还没看过的回答」,窗口一聚焦就该灭。
     Unread,
 }
 
@@ -2106,8 +2109,12 @@ pub enum AiProjectKind {
 impl AiProjectKind {
     /// 与 TS 侧 `AiProjectEntry['kind']` 一字不差的字符串口径。
     ///
-    /// 本轮只有单测在用(标题栏渲染直接 match 枚举);托盘菜单的
-    /// `emoji + 名 + 状态` 那串标签会用到它。
+    /// **仍然只有单测在用**(所以 `allow(dead_code)` 还留着)。此前这里预告
+    /// 「托盘菜单的标签会用到它」—— 实际没有:TS 侧是拿 kind 字符串去拼
+    /// `app.trayStatus.${kind}` 这个 key,而 Rust 的 `t()` 只吃 `&'static str`,
+    /// 拼不出来,于是那条路走的是 [`Self::tray_status_key`](见下),emoji 那半
+    /// 走 [`crate::tray::kind_emoji`] 的 match。留着它是为了钉住四个档位的对外
+    /// 字符串口径与 TS 一致。
     #[allow(dead_code)]
     pub fn as_str(self) -> &'static str {
         match self {
