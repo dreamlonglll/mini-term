@@ -22,9 +22,13 @@
 //! - SSH 远程来源(`ssh_remote_ai_sessions`)没搬:mt-ssh 还没进 crates/。
 //!   `AiSession::ssh_connection_id` 字段照留,本机来源恒 `None`。
 //! - 会话正文查看是**面板内预览**而不是独立弹窗(形态不同,动作齐全)。
-//! - `BranchFamilyPanel`(pane 右键「查看会话分支」的悬停家族树)没搬:它挂在
-//!   pane 菜单的 `submenuRender` 上、取数口是 pane 自己的 `ai_session`,与本面板的
-//!   树视图是两个组件,留给 fork 批(见交付说明的归属判断)。
+//!
+//! # 与 [`crate::branch_family`] 的分工
+//!
+//! pane 右键「查看会话分支」的悬停家族面板是**另一个组件**:它挂在菜单的自绘
+//! 子菜单挂载点上、取数口是 pane 自己的 `ai_session`、只画那一支家族。两边共用
+//! 的是纯逻辑([`crate::session_branch`])与节点点击行为([`jump_to_session`])
+//! —— 点同一种节点必须有同一种行为。
 
 use gpui::{
     AnyElement, App, Context, Entity, InteractiveElement, IntoElement, MouseButton,
@@ -37,9 +41,10 @@ use mt_ui::icons::{AiVendor, BrandIcon, StatusDot, StatusKind};
 
 use crate::i18n::{t, tr};
 use crate::menu;
-use crate::prompt;
+use crate::notify::ToastKind;
 use crate::session_branch::{build_session_tree, flatten_session_tree, merge_lineage_edges};
 use crate::store::AppStore;
+use crate::toast;
 use crate::tree::{AiSessionRef, PaneStatus};
 use crate::ui;
 
@@ -66,6 +71,103 @@ pub fn build_resume_command(agent: &str, session_id: &str) -> Option<String> {
         "codex" => format!("codex resume {session_id}"),
         "grok" => format!("grok --resume {session_id}"),
         _ => format!("claude --resume {session_id}"),
+    })
+}
+
+/// 点一个会话节点该发生什么。对应 `src/utils/sessionJump.ts::jumpToSession`。
+///
+/// ```text
+/// live 存在   → 切项目 + 激活那个 pane
+/// live 不存在 →
+///   ├─ 会话来自 WSL / 远程 → 提示「无法在本机恢复」,不做任何事
+///   ├─ agent 无 resume 能力 → 静默不做
+///   └─ 否则 → 新开终端 + 写 resume 命令 + 回写会话身份
+/// ```
+///
+/// **自由函数**而不是 [`SessionPanel`] 的方法:分支树视图(本面板)与
+/// pane 右键的悬停家族面板([`crate::branch_family`])是两个组件、点同一种节点,
+/// 行为必须逐字相同。返回的 `Task` 由调用方持有 —— 丢掉就等于取消。
+pub(crate) fn jump_to_session(
+    store: &Entity<AppStore>,
+    session: AiSession,
+    window: &mut Window,
+    cx: &mut App,
+) -> Task<()> {
+    if let Some((project_id, pane_id, _)) = store.read(cx).find_live_session_pane(&session.id) {
+        store.update(cx, |store, cx| {
+            store.set_active_project(&project_id, cx);
+            store.activate_pane(&project_id, &pane_id, window, cx);
+        });
+        return Task::ready(());
+    }
+
+    // WSL / SSH 远程来源的会话记录在别的机器/发行版里,本地 resume 恢复不了。
+    // 走 toast(原版 `pushNotification`,kind `wsl-info`)—— Q 批写这段时
+    // mt-app 还没有 toast 体系,退而用通用提示框;Z 批的 `toast.rs` 到位后回换,
+    // 与原版同形(不打断、右下角自动消失)。
+    if session.wsl_distro.is_some() || session.ssh_connection_id.is_some() {
+        let (project_id, project_name) = store
+            .read(cx)
+            .active_project()
+            .map(|p| (p.id.clone(), p.name.clone()))
+            .unwrap_or_default();
+        toast::push_message(
+            ToastKind::WslInfo,
+            project_id,
+            project_name,
+            t("sessionList", "branchTree.remoteResumeUnsupported").to_string(),
+            cx,
+        );
+        return Task::ready(());
+    }
+
+    let Some(command) = build_resume_command(&session.session_type, &session.id) else {
+        // opencode / pi 之类没有 resume 能力的 agent:静默不做
+        return Task::ready(());
+    };
+    let Some(project_id) = store.read(cx).active_project_id.clone() else {
+        return Task::ready(());
+    };
+    let anchor = store.read(cx).active_pane_id(&project_id);
+    // `claude --resume` 只认「启动目录」对应的会话桶:子目录里起的会话在项目根
+    // 恢复会报 `No conversation found`,先反查记录的 cwd。codex 不按目录分桶;
+    // grok 虽按 cwd 分桶,但列表只捞「解码目录名全等于项目根」的会话。
+    // 反查是**同步磁盘遍历**,跳转路径上照样丢后台。
+    let needs_cwd = session.session_type == "claude";
+    let session_id = session.id.clone();
+    let store = store.clone();
+    window.spawn(cx, async move |cx| {
+        let cwd = if needs_cwd {
+            cx.background_executor()
+                .spawn(async move { mt_ai::sessions::lookup_ai_session_cwd(session_id) })
+                .await
+        } else {
+            None
+        };
+        let _ = cx.update(|window, cx| {
+            store.update(cx, |store, cx| {
+                // 用**返回的那个 pane**,不能事后再取活动 pane:焦点还没落下去
+                let Some(pane_id) =
+                    store.new_terminal_with_cwd(&project_id, None, anchor, cwd.clone(), window, cx)
+                else {
+                    return;
+                };
+                store.write_to_pane(&project_id, &pane_id, &format!("{command}\r"), cx);
+                // 恢复出的会话身份**当场**写回 pane,不等 hook ——
+                // codex resume 不会重新上报 SessionStart
+                store.set_pane_ai_session(
+                    &project_id,
+                    &pane_id,
+                    AiSessionRef {
+                        agent: Some(session.session_type.clone()),
+                        session_id: session.id.clone(),
+                        cwd,
+                    },
+                    cx,
+                );
+                store.focus_pane(&project_id, &pane_id, window, cx);
+            });
+        });
     })
 }
 
@@ -167,8 +269,9 @@ pub struct SessionPanel {
     wsl: Vec<AiSession>,
     /// 磁盘扫描出来的分支边。树视图的数据面,平铺不消费。
     lineage: Vec<LineageEdge>,
-    /// 自记账边(`AppConfig::session_lineage`)。**本批只读不写** ——
-    /// 写入端是 pane 右键的「分支会话」,属 fork 批。
+    /// 自记账边(`AppConfig::session_lineage`)。本面板**只读**;
+    /// 写入端是 pane 右键的「分支会话到新分屏」
+    /// (`pane_actions::fork_pane_session` → `AppStore::consume_pending_fork`)。
     bookkept: Vec<LineageEdge>,
     loading: bool,
     wsl_loading: bool,
@@ -412,94 +515,6 @@ impl SessionPanel {
                 Some(((*session).clone(), row.prefix, title))
             })
             .collect()
-    }
-
-    /// 点一行(树模式)。对应 `src/utils/sessionJump.ts::jumpToSession`。
-    ///
-    /// ```text
-    /// live 存在   → 切项目 + 激活那个 pane
-    /// live 不存在 →
-    ///   ├─ 会话来自 WSL / 远程 → 提示「无法在本机恢复」,不做任何事
-    ///   ├─ agent 无 resume 能力 → 静默不做
-    ///   └─ 否则 → 新开终端 + 写 resume 命令 + 回写会话身份
-    /// ```
-    fn jump_to_session(&mut self, session: AiSession, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some((project_id, pane_id, _)) =
-            self.store.read(cx).find_live_session_pane(&session.id)
-        {
-            self.store.update(cx, |store, cx| {
-                store.set_active_project(&project_id, cx);
-                store.activate_pane(&project_id, &pane_id, window, cx);
-            });
-            return;
-        }
-
-        // WSL / SSH 远程来源的会话记录在别的机器/发行版里,本地 resume 恢复不了。
-        // TODO(toast): 原版走的是 toast(`pushNotification`,kind `wsl-info`),
-        // mt-app 还没有 toast 体系(见 `docs/gpui-parity-audit.md` 的「无 toast」条),
-        // 先用通用提示框代替。
-        if session.wsl_distro.is_some() || session.ssh_connection_id.is_some() {
-            prompt::show_alert(
-                t("panels", "sessions"),
-                t("sessionList", "branchTree.remoteResumeUnsupported"),
-                window,
-                cx,
-            );
-            return;
-        }
-
-        let Some(command) = build_resume_command(&session.session_type, &session.id) else {
-            // opencode / pi 之类没有 resume 能力的 agent:静默不做
-            return;
-        };
-        let Some(project_id) = self.store.read(cx).active_project_id.clone() else {
-            return;
-        };
-        let anchor = self.store.read(cx).active_pane_id(&project_id);
-        // `claude --resume` 只认「启动目录」对应的会话桶:子目录里起的会话在项目根
-        // 恢复会报 `No conversation found`,先反查记录的 cwd。codex 不按目录分桶;
-        // grok 虽按 cwd 分桶,但列表只捞「解码目录名全等于项目根」的会话。
-        // 反查是**同步磁盘遍历**,跳转路径上照样丢后台。
-        let needs_cwd = session.session_type == "claude";
-        let session_id = session.id.clone();
-        self._tasks.push(cx.spawn_in(window, async move |this, cx| {
-            let cwd = if needs_cwd {
-                cx.background_executor()
-                    .spawn(async move { mt_ai::sessions::lookup_ai_session_cwd(session_id) })
-                    .await
-            } else {
-                None
-            };
-            let _ = this.update_in(cx, |this: &mut Self, window, cx| {
-                this.store.update(cx, |store, cx| {
-                    // 用**返回的那个 pane**,不能事后再取活动 pane:焦点还没落下去
-                    let Some(pane_id) = store.new_terminal_with_cwd(
-                        &project_id,
-                        None,
-                        anchor,
-                        cwd.clone(),
-                        window,
-                        cx,
-                    ) else {
-                        return;
-                    };
-                    store.write_to_pane(&project_id, &pane_id, &format!("{command}\r"), cx);
-                    // 恢复出的会话身份**当场**写回 pane,不等 hook ——
-                    // codex resume 不会重新上报 SessionStart
-                    store.set_pane_ai_session(
-                        &project_id,
-                        &pane_id,
-                        AiSessionRef {
-                            agent: Some(session.session_type.clone()),
-                            session_id: session.id.clone(),
-                            cwd,
-                        },
-                        cx,
-                    );
-                    store.focus_pane(&project_id, &pane_id, window, cx);
-                });
-            });
-        }));
     }
 
     /// 在当前活动 pane 里恢复会话。没有终端时退化成「开一个新的再恢复」。
@@ -866,7 +881,9 @@ impl Render for SessionPanel {
                     .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
                     .when(tree, |el| {
                         el.on_click(cx.listener(move |this: &mut Self, _, window, cx| {
-                            this.jump_to_session(session_for_click.clone(), window, cx);
+                            let task =
+                                jump_to_session(&this.store, session_for_click.clone(), window, cx);
+                            this._tasks.push(task);
                         }))
                     })
                     // 四项右键菜单(N 批的 `menu.rs` 已就位,行内按钮随之收回)

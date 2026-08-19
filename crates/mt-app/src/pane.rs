@@ -816,6 +816,40 @@ fn resolve_paste(pty_id: u32, cx: &mut gpui::App) -> PasteAction {
     PasteAction::Text(text)
 }
 
+/// 按 pty 编号取「分支那一段」的菜单项(含前导分隔线)。
+///
+/// 显隐口径与 tab 右键**逐字相同**(`branch_menu_segment` 一处判据),
+/// 项的实现也是同一份(`branch_family` 的三个构造器)——
+/// 「用户在哪儿右键都找得到同一个入口」是这条功能的设计前提。
+///
+/// # 为什么是自由函数
+///
+/// 与 [`resolve_paste`] 同一条理由:它在 `TerminalPane` 被可变借用时调用,
+/// 方法版会诱使人写 `self.view.update(...)` 那种同实体嵌套 update。
+fn branch_entries_for_pty(pty_id: u32, cx: &mut gpui::App) -> Vec<menu::MenuEntry> {
+    let store = AppStore::global(cx);
+    let Some((project_id, pane_id)) = store.read(cx).pane_of_pty(pty_id) else {
+        return Vec::new();
+    };
+    let (segment, project_path) = {
+        let s = store.read(cx);
+        let segment = s
+            .project_state(&project_id)
+            .and_then(|st| st.layout.as_ref())
+            .and_then(|l| l.pane(&pane_id))
+            .map(|p| {
+                crate::session_branch::branch_menu_segment(
+                    p.ai_session.as_ref(),
+                    p.detected_agent.as_deref(),
+                )
+            })
+            .unwrap_or(crate::session_branch::BranchMenuSegment::None);
+        let path = s.project(&project_id).map(|p| p.path.clone()).unwrap_or_default();
+        (segment, path)
+    };
+    crate::branch_family::branch_menu_entries(&store, &project_id, &pane_id, project_path, &segment)
+}
+
 /// 终端里的右键该弹**本地菜单**吗。
 ///
 /// 判据只有一条,且必须与 mt-ui 的元素侧同源([`prefers_local_handling`]):
@@ -859,8 +893,8 @@ impl Render for TerminalPane {
             .relative()
             .bg(self.theme.background)
             // 终端右键菜单(`TerminalInstance.tsx` 的 handleContextMenu):
-            // 只有「复制 / 粘贴」—— fork 会话、分支树、SSH 子菜单三段的功能
-            // GPUI 侧都还没有,不放占位。
+            // 「复制 / 粘贴」+ 分支段。SSH 子菜单那一段的功能 GPUI 侧还没有,
+            // 不放占位。
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
@@ -878,7 +912,7 @@ impl Render for TerminalPane {
                     let view_copy = this.view.clone();
                     let view_paste = this.view.clone();
                     let focus = this.focus.clone();
-                    let entries = vec![
+                    let mut entries = vec![
                         MenuItem::new(t("terminal", "copy"))
                             // 没有选区时置灰(原版 `disabled: !hasSelection`)
                             .disabled(!has_selection)
@@ -897,6 +931,9 @@ impl Render for TerminalPane {
                             window.focus(&focus);
                         }),
                     ];
+                    // 会话分支入口:终端本体右键与 tab 右键**同权**(用户在哪儿
+                    // 右键都找得到),显隐口径与项的实现都是同一份
+                    entries.extend(branch_entries_for_pty(this.pty_id, cx));
                     menu::show(event.position, entries, window, cx);
                 }),
             )
