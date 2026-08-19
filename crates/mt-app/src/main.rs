@@ -61,6 +61,7 @@ mod shell_ops;
 mod store;
 mod terminal_area;
 mod theme;
+mod title_bar;
 mod tree;
 mod ui;
 mod usage_panel;
@@ -90,6 +91,7 @@ use crate::project_list::ProjectList;
 use crate::session_panel::SessionPanel;
 use crate::store::{AppStore, PendingAlert};
 use crate::terminal_area::TerminalArea;
+use crate::title_bar::TitleBar;
 use crate::tree::SplitDirection;
 use crate::usage_panel::UsagePanel;
 
@@ -209,6 +211,8 @@ struct Workspace {
     /// 右键菜单浮层。状态住在全局(任何视图都能 `menu::show`),这里只是把它
     /// **画出来**的那个位置 —— 与 `Root::render_dialog_layer` 同一种分工。
     menu_layer: Entity<menu::ContextMenu>,
+    /// 自绘标题栏(无边框窗口的拖拽区 + 三键 + 项目胶囊 + 全局状态灯)。
+    title_bar: Entity<TitleBar>,
     project_list: Entity<ProjectList>,
     file_tree: Entity<FileTree>,
     terminal_area: Entity<TerminalArea>,
@@ -235,6 +239,7 @@ impl Workspace {
     ) -> Self {
         cx.observe(&store, |_, _, cx| cx.notify()).detach();
 
+        let title_bar = cx.new(|cx| TitleBar::new(store.clone(), cx));
         let project_list = cx.new(|cx| ProjectList::new(store.clone(), cx));
         let file_tree = cx.new(|cx| FileTree::new(store.clone(), cx));
         let terminal_area = cx.new(|cx| TerminalArea::new(store.clone(), cx));
@@ -290,6 +295,7 @@ impl Workspace {
         Self {
             store,
             menu_layer: menu::layer(cx),
+            title_bar,
             project_list,
             file_tree,
             terminal_area,
@@ -931,10 +937,35 @@ impl Render for Workspace {
                 .child(div().flex_1().overflow_hidden().child(panel))
         });
 
+        // 三栏 + 悬浮抽屉/浮层的那一层。标题栏之下的**全部**内容都在这里 ——
+        // 原版同款(`App.tsx:478` 的 `flex-1 overflow-hidden flex`),抽屉与用量
+        // 面板的 `absolute` 于是不会盖到标题栏上。
+        let body = div()
+            .flex_1()
+            .overflow_hidden()
+            .relative()
+            .flex()
+            .child(toggle_strip)
+            .child(div().flex_1().h_full().child(columns_group))
+            .children(drawer_layer)
+            .children(usage_layer)
+            // 通知层放在**标题栏之下**这一层里:`render_notification_layer` 内部写死
+            // `absolute top-0 right-0`(gpui-component 的 `root.rs:294-300`),挂在根上
+            // 会正好压住窗口控制三键。挂进 `body`(它是 `relative`)之后 toast 从
+            // 标题栏下沿开始堆 —— 原版 `.toast-stack` 是 `fixed right/bottom: 16px`,
+            // 本来也碰不到标题栏。**右上角起堆**这条差异是 gpui-component 自带的,
+            // 与本批无关。
+            .children(Root::render_notification_layer(window, cx));
+
         div()
             .size_full()
             .relative()
             .flex()
+            // 标题栏是根 flex-col 的**首个** child(`App.tsx:474-478`)。
+            // ⚠️ 它**不受配置加载失败门控** —— 配置读不出来时用户也得有地方把
+            // 窗口关掉(原版那句原注释)。GPUI 侧配置目录不可用时压根开不出窗口
+            // (`main()` 里直接 return),这条门控在这边只剩语义上的对齐。
+            .flex_col()
             .bg(ui::bg_base())
             .text_color(ui::text_primary())
             // 界面字族(`config.uiFontFamily`)。gpui 的 `font_family` 会**继承**给
@@ -999,13 +1030,12 @@ impl Render for Workspace {
                     }),
                 )
             })
-            .child(toggle_strip)
-            .child(div().flex_1().h_full().child(columns_group))
-            .children(drawer_layer)
-            .children(usage_layer)
-            // Modal 与通知层由 Root 持有,但要由应用视图**画出来**
+            .child(self.title_bar.clone())
+            .child(body)
+            // Modal 由 Root 持有,但要由应用视图**画出来**。
+            // (它自己走 `anchored()` 定在视口中央,挂哪一层都一样;
+            //  通知层不同 —— 见 `body` 那边的注释。)
             .children(Root::render_dialog_layer(window, cx))
-            .children(Root::render_notification_layer(window, cx))
             // 右键菜单层。零尺寸的绝对定位壳子 —— 菜单自己走 anchored(窗口坐标)
             // + deferred,不参与这里的 flex 布局,收着的时候一个像素都不占。
             .child(
@@ -1099,7 +1129,18 @@ fn main() {
                     // 与装机版一致(`App.tsx` 的 `setTitle(\`Mini-Term v${ver}\`)`)——
                     // 窗口虽已无边框,任务栏悬停预览与 Alt+Tab 仍读这个标题
                     title: Some(format!("Mini-Term v{}", env!("CARGO_PKG_VERSION")).into()),
-                    ..Default::default()
+                    // **自绘标题栏的总开关**(Windows / macOS 都认)。Windows 侧映射成
+                    // `hide_title_bar`,驱动 `WM_NCCALCSIZE` 吃掉系统 caption 高度、
+                    // 并让 `WM_NCHITTEST` 去问 [`title_bar`] 登记的
+                    // `WindowControlArea` hitbox。
+                    //
+                    // ⚠️ 不要碰 `WindowOptions::window_decorations` —— 那是 Wayland 专用
+                    // (字段注释原文 "Wayland only"),Windows 上 `window_decorations()`
+                    // 恒返回 `Server`。
+                    appears_transparent: true,
+                    // macOS 的交通灯落点(标题栏 32px 高,9,9 让三颗灯居中偏上)。
+                    // 本仓主力 Windows,这行留着不亏 —— 那边三键根本不渲染。
+                    traffic_light_position: Some(gpui::point(px(9.0), px(9.0))),
                 }),
                 ..Default::default()
             },

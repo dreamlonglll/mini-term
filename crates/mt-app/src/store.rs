@@ -1140,19 +1140,15 @@ impl AppStore {
         highest
     }
 
-    pub fn is_pane_unread_done(&self, pane_id: &str) -> bool {
-        self.done.is_unread(pane_id)
-    }
-
-    pub fn clear_unread_done(&mut self, cx: &mut Context<Self>) {
-        self.done.clear_unread();
-        cx.notify();
-    }
-
-    /// 「下一件该我做的事」在哪个 pane。`only_project` 限定项目内挑。
-    pub fn next_attention_target(&self, only_project: Option<&str>) -> Option<(String, String)> {
-        let refs: Vec<PaneRef<'_>> = self
-            .project_states
+    /// 全部(或某个项目的)pane 的一份只读快照。
+    ///
+    /// 三处聚合(挑待办 / 按项目聚合 / 标题栏状态灯)都从这一份出发,免得各写
+    /// 一遍「跳过还没有 layout 的项目」这类边角。
+    ///
+    /// ⚠️ **顺序不确定**:`project_states` 是 `HashMap`,遍历顺序每次都可能不同。
+    /// 消费方要么与顺序无关(取最高档),要么自己排序(见 [`collect_ai_projects`])。
+    fn pane_refs(&self, only_project: Option<&str>) -> Vec<PaneRef<'_>> {
+        self.project_states
             .iter()
             .filter(|(pid, _)| only_project.is_none_or(|only| only == pid.as_str()))
             .filter_map(|(pid, state)| state.layout.as_ref().map(|l| (pid, l)))
@@ -1164,8 +1160,50 @@ impl AppStore {
                     attention: p.attention,
                 })
             })
-            .collect();
-        crate::notify::pick_attention_target(refs, self.done.order())
+            .collect()
+    }
+
+    /// 「进入 AI agent 的项目」按项目聚合(`store.ts::collectAiProjects` 等价物)。
+    ///
+    /// 标题栏的项目切换胶囊与托盘菜单(T 批)共用这一份,唯一的差别是 done 判据
+    /// 从哪来 —— 见 [`DoneScope`]。
+    pub fn ai_projects(&self, scope: DoneScope) -> AiProjects {
+        let panes = self.pane_refs(None);
+        match scope {
+            DoneScope::All => {
+                let order = self.done.order();
+                collect_ai_projects(panes, self.config.projects.as_slice(), |id| {
+                    order.contains_key(id)
+                })
+            }
+            DoneScope::Unread => collect_ai_projects(panes, self.config.projects.as_slice(), |id| {
+                self.done.is_unread(id)
+            }),
+        }
+    }
+
+    /// 标题栏那颗全局状态灯(`TitleBar.tsx::computeLight`)。
+    ///
+    /// ⚠️ 与边条徽标的 [`AppStore::global_ai_status`] **口径不同**:边条把 `error`
+    /// 压成 `idle`(一个 `exit 1` 的 shell 不该盖住真在跑的 AI),标题栏灯反过来
+    /// 把 `error` 列为最高一档,另外还多一个 `done` 档。两处不可互相复用。
+    pub fn title_bar_light(&self) -> TitleBarLight {
+        let order = self.done.order();
+        compute_title_bar_light(self.pane_refs(None), |id| order.contains_key(id))
+    }
+
+    pub fn is_pane_unread_done(&self, pane_id: &str) -> bool {
+        self.done.is_unread(pane_id)
+    }
+
+    pub fn clear_unread_done(&mut self, cx: &mut Context<Self>) {
+        self.done.clear_unread();
+        cx.notify();
+    }
+
+    /// 「下一件该我做的事」在哪个 pane。`only_project` 限定项目内挑。
+    pub fn next_attention_target(&self, only_project: Option<&str>) -> Option<(String, String)> {
+        crate::notify::pick_attention_target(self.pane_refs(only_project), self.done.order())
     }
 
     /// 按 `session_id` 跨**全部项目**找「在跑」的 pane。对应
@@ -1746,6 +1784,219 @@ impl AppStore {
     }
 }
 
+// ─── AI 项目聚合 / 标题栏状态灯的纯函数(可测) ────────────────
+
+/// [`AppStore::ai_projects`] 的 done 判据取哪一套。
+///
+/// 原版 `collectAiProjects` 把这件事做成了参数(`donePaneIds`),两个调用点各传
+/// 各的集合;这里把选择权收成一个枚举,判据本身仍住在 `DoneTracker` 里。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DoneScope {
+    /// 全部完成记录(旧版 `aiDoneOrder`)。**不看窗口焦点** —— 标题栏胶囊与
+    /// 全局状态灯用这一套(`TitleBar.tsx:118` 原注释)。
+    All,
+    /// 未读完成(旧版 `unreadDonePaneIds`,聚焦即清)。托盘用这一套。
+    ///
+    /// 托盘(audit #21 / T 批)还没接线,所以本轮没有调用点 —— 留着是因为
+    /// 「两套 done 判据」正是这个枚举存在的理由,砍掉一半等于把差异藏起来。
+    #[allow(dead_code)]
+    Unread,
+}
+
+/// 一个项目在托盘菜单 / 标题栏胶囊里的档位。
+///
+/// **声明顺序即排序**(`AI_PROJECT_KIND_ORDER`:attention 0 > working 1 >
+/// done 2 > idle 3),`derive(Ord)` 直接给出同一个次序。
+/// ⚠️ 与「点击跳转」的优先级有意不同(那条是 待确认 > 最先完成 > 处理中,
+/// 见 [`crate::notify::pick_attention_target`])。
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum AiProjectKind {
+    Attention,
+    Working,
+    Done,
+    Idle,
+}
+
+impl AiProjectKind {
+    /// 与 TS 侧 `AiProjectEntry['kind']` 一字不差的字符串口径。
+    ///
+    /// 本轮只有单测在用(标题栏渲染直接 match 枚举);托盘菜单的
+    /// `emoji + 名 + 状态` 那串标签会用到它。
+    #[allow(dead_code)]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Attention => "attention",
+            Self::Working => "working",
+            Self::Done => "done",
+            Self::Idle => "idle",
+        }
+    }
+
+    /// 下拉行右侧那句状态文案的 key(`app.trayStatus.{kind}`,与托盘菜单共用)。
+    pub fn tray_status_key(self) -> &'static str {
+        match self {
+            Self::Attention => "trayStatus.attention",
+            Self::Working => "trayStatus.working",
+            Self::Done => "trayStatus.done",
+            Self::Idle => "trayStatus.idle",
+        }
+    }
+}
+
+/// 进入 AI agent 的一个项目(对应 TS 的 `AiProjectEntry`)。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct AiProjectEntry {
+    pub id: String,
+    pub name: String,
+    pub kind: AiProjectKind,
+}
+
+/// [`collect_ai_projects`] 的产物:三个 **pane 级**计数 + 按项目聚合的明细。
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+pub struct AiProjects {
+    pub attention: usize,
+    pub working: usize,
+    pub done: usize,
+    pub entries: Vec<AiProjectEntry>,
+}
+
+/// 按项目聚合出「进入 AI agent 的项目」。逐条照抄 `store.ts:273-315`:
+///
+/// - **入选**:项目下任一 pane 处于 attention / working / ai-idle / done 四态之一
+///   (`ai-idle` 只是「agent 在场」,照样入列,但**不点灯**);
+/// - **档位**:项目内取最高一档 attention > working > done > idle;
+/// - **pane 级计数**:`status == error || attention` 记 attention,`ai-working` 记
+///   working,`is_done(pane) && status != ai-working` 记 done ——
+///   注意 done 与前三条**不是** if/else 链,一个 pane 可以同时进 attention 与 done
+///   的计数(原版就是两段独立判断);
+/// - **名字**:配置里查不到就退回项目 id(原版 `?? pid`)。
+///
+/// # 与原版唯一的偏差:同档内的先后
+///
+/// TS 侧 `entries.sort()` 是**稳定**排序,同档内保留 `projectStates` 的插入序;
+/// Rust 侧的来源是 `HashMap`,遍历序每次都可能不同。这里改用**配置里的项目次序**
+/// 当同档内的第二关键字 —— 既确定,又与项目列表上下顺序一致。
+pub fn collect_ai_projects<'a>(
+    panes: impl IntoIterator<Item = PaneRef<'a>>,
+    projects: &[ProjectConfig],
+    is_done: impl Fn(&str) -> bool,
+) -> AiProjects {
+    // 项目 id → (最高档的四个标志位, 配置里的次序)
+    let mut acc: HashMap<&'a str, [bool; 4]> = HashMap::new();
+    let mut out = AiProjects::default();
+
+    for pane in panes {
+        let slot = acc.entry(pane.project_id).or_insert([false; 4]);
+        if pane.status == PaneStatus::Error || pane.attention {
+            out.attention += 1;
+            slot[0] = true;
+        } else if pane.status == PaneStatus::AiWorking {
+            out.working += 1;
+            slot[1] = true;
+        } else if pane.status == PaneStatus::AiIdle {
+            slot[3] = true;
+        }
+        // 只数仍存在的 pane(关掉即失效);又开始工作的不再算「已完成」
+        if is_done(pane.pane_id) && pane.status != PaneStatus::AiWorking {
+            out.done += 1;
+            slot[2] = true;
+        }
+    }
+
+    let rank = |id: &str| {
+        projects
+            .iter()
+            .position(|p| p.id == id)
+            .unwrap_or(usize::MAX)
+    };
+    let mut entries: Vec<(usize, AiProjectEntry)> = acc
+        .into_iter()
+        .filter_map(|(id, [attention, working, done, idle])| {
+            if !(attention || working || done || idle) {
+                return None;
+            }
+            let kind = if attention {
+                AiProjectKind::Attention
+            } else if working {
+                AiProjectKind::Working
+            } else if done {
+                AiProjectKind::Done
+            } else {
+                AiProjectKind::Idle
+            };
+            let name = projects
+                .iter()
+                .find(|p| p.id == id)
+                .map(|p| p.name.clone())
+                .unwrap_or_else(|| id.to_string());
+            Some((
+                rank(id),
+                AiProjectEntry {
+                    id: id.to_string(),
+                    name,
+                    kind,
+                },
+            ))
+        })
+        .collect();
+    entries.sort_by(|a, b| a.1.kind.cmp(&b.1.kind).then(a.0.cmp(&b.0)));
+    out.entries = entries.into_iter().map(|(_, e)| e).collect();
+    out
+}
+
+/// 标题栏那颗全局状态灯的五档(`TitleBar.tsx:57` 的 `LightKind`)。
+///
+/// **声明顺序即优先级**(idle 最低、error 最高),`derive(Ord)` 直接可比 ——
+/// 原版那张 `LIGHT_ORDER` 表不必再抄一遍。
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Debug)]
+pub enum TitleBarLight {
+    #[default]
+    Idle,
+    Done,
+    Working,
+    Attention,
+    Error,
+}
+
+impl TitleBarLight {
+    /// tooltip / aria-label 的 key(`app.titleBar.status.{light}`)。
+    pub fn i18n_key(self) -> &'static str {
+        match self {
+            Self::Error => "titleBar.status.error",
+            Self::Attention => "titleBar.status.attention",
+            Self::Working => "titleBar.status.working",
+            Self::Done => "titleBar.status.done",
+            Self::Idle => "titleBar.status.idle",
+        }
+    }
+}
+
+/// 遍历所有项目所有 pane,取最紧急的一档(`TitleBar.tsx::computeLight`)。
+///
+/// 判据是 **if/else 链,先中先算**:`error` → `attention` → `ai-working` →
+/// 「完成过」。一个 pane 只贡献一档。
+pub fn compute_title_bar_light<'a>(
+    panes: impl IntoIterator<Item = PaneRef<'a>>,
+    is_done: impl Fn(&str) -> bool,
+) -> TitleBarLight {
+    let mut light = TitleBarLight::Idle;
+    for pane in panes {
+        let bump = if pane.status == PaneStatus::Error {
+            TitleBarLight::Error
+        } else if pane.attention {
+            TitleBarLight::Attention
+        } else if pane.status == PaneStatus::AiWorking {
+            TitleBarLight::Working
+        } else if is_done(pane.pane_id) {
+            TitleBarLight::Done
+        } else {
+            continue;
+        };
+        light = light.max(bump);
+    }
+    light
+}
+
 // ─── 终端渲染参数的纯函数(可测) ──────────────────────────────
 
 /// 回滚行数上限(`src/utils/terminalScrollback.ts::MAX_SCROLLBACK`)。
@@ -1873,6 +2124,264 @@ fn remove_from_tree(tree: &mut Vec<mt_config::ProjectTreeItem>, project_id: &str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn project(id: &str, name: &str) -> ProjectConfig {
+        ProjectConfig {
+            id: id.to_string(),
+            name: name.to_string(),
+            path: format!("/tmp/{id}"),
+            description: None,
+            saved_layout: None,
+            expanded_dirs: Vec::new(),
+            ssh_mcp_enabled: false,
+            ssh_cli_token: None,
+            ssh_connection_ids: None,
+            env_vars: Vec::new(),
+            wsl_sessions_distro: None,
+            ssh_connection_id: None,
+            parent_project_id: None,
+            kind_override: None,
+        }
+    }
+
+    fn pane<'a>(project_id: &'a str, pane_id: &'a str, status: PaneStatus, attention: bool) -> PaneRef<'a> {
+        PaneRef {
+            project_id,
+            pane_id,
+            status,
+            attention,
+        }
+    }
+
+    fn kinds(projects: &AiProjects) -> Vec<(&str, &'static str)> {
+        projects
+            .entries
+            .iter()
+            .map(|e| (e.id.as_str(), e.kind.as_str()))
+            .collect()
+    }
+
+    /// 入选口径:任一 pane 有 AI 会话(含 ai-idle)即入列;纯 shell 的项目不入列。
+    #[test]
+    fn ai项目入选只看有没有_ai会话() {
+        let projects = [project("p1", "一"), project("p2", "二"), project("p3", "三")];
+        let panes = vec![
+            // p1:只有裸 shell —— 不入列
+            pane("p1", "a", PaneStatus::Idle, false),
+            // p2:agent 在场但空闲 —— 入列,档位 idle
+            pane("p2", "b", PaneStatus::AiIdle, false),
+            // p3:正在跑
+            pane("p3", "c", PaneStatus::AiWorking, false),
+        ];
+        let out = collect_ai_projects(panes, &projects, |_| false);
+        assert_eq!(kinds(&out), vec![("p3", "working"), ("p2", "idle")]);
+        assert_eq!((out.attention, out.working, out.done), (0, 1, 0));
+    }
+
+    /// 项目内取最高一档:attention > working > done > idle。
+    #[test]
+    fn ai项目档位取项目内最高一档() {
+        let projects = [project("p1", "一")];
+        // 同一个项目里三个 pane,最高的是 attention
+        let panes = vec![
+            pane("p1", "a", PaneStatus::AiIdle, false),
+            pane("p1", "b", PaneStatus::AiWorking, false),
+            pane("p1", "c", PaneStatus::AiIdle, true),
+        ];
+        let out = collect_ai_projects(panes, &projects, |_| false);
+        assert_eq!(kinds(&out), vec![("p1", "attention")]);
+        // pane 级计数与项目档位是两回事:working 那个照样计数
+        assert_eq!((out.attention, out.working, out.done), (1, 1, 0));
+    }
+
+    /// `error` 与 `attention` 同归 attention 一档(原版 `status==='error' || pane.attention`)。
+    #[test]
+    fn 异常_pane_算待确认() {
+        let projects = [project("p1", "一")];
+        let out = collect_ai_projects(
+            vec![pane("p1", "a", PaneStatus::Error, false)],
+            &projects,
+            |_| false,
+        );
+        assert_eq!(kinds(&out), vec![("p1", "attention")]);
+        assert_eq!(out.attention, 1);
+    }
+
+    /// done 判据:在集合里且**不在跑**才算;又开始工作的不再算「已完成」。
+    #[test]
+    fn 已完成判据排除又开始跑的() {
+        let projects = [project("p1", "一"), project("p2", "二")];
+        let panes = vec![
+            pane("p1", "a", PaneStatus::AiIdle, false),
+            pane("p2", "b", PaneStatus::AiWorking, false),
+        ];
+        // 两个 pane 都在 done 集合里,但 b 正在跑 —— 只有 a 算完成
+        let out = collect_ai_projects(panes, &projects, |_| true);
+        assert_eq!(out.done, 1);
+        assert_eq!(kinds(&out), vec![("p2", "working"), ("p1", "done")]);
+    }
+
+    /// 排序:attention > working > done > idle;同档内按**配置里的项目次序**。
+    #[test]
+    fn ai项目排序按档位再按配置次序() {
+        let projects = [
+            project("p1", "一"),
+            project("p2", "二"),
+            project("p3", "三"),
+            project("p4", "四"),
+            project("p5", "五"),
+        ];
+        let panes = vec![
+            pane("p5", "e", PaneStatus::AiIdle, false),
+            pane("p4", "d", PaneStatus::AiIdle, false),
+            pane("p3", "c", PaneStatus::AiWorking, false),
+            pane("p2", "b", PaneStatus::AiWorking, false),
+            pane("p1", "a", PaneStatus::AiIdle, true),
+        ];
+        let out = collect_ai_projects(panes, &projects, |_| false);
+        assert_eq!(
+            kinds(&out),
+            vec![
+                ("p1", "attention"),
+                ("p2", "working"),
+                ("p3", "working"),
+                ("p4", "idle"),
+                ("p5", "idle"),
+            ]
+        );
+    }
+
+    /// 名字取配置;配置里查不到就退回项目 id(原版 `?? pid`)。
+    #[test]
+    fn ai项目名缺配置时退回_id() {
+        let projects = [project("p1", "正经名字")];
+        let panes = vec![
+            pane("p1", "a", PaneStatus::AiIdle, false),
+            pane("ghost", "b", PaneStatus::AiIdle, false),
+        ];
+        let out = collect_ai_projects(panes, &projects, |_| false);
+        let names: Vec<&str> = out.entries.iter().map(|e| e.name.as_str()).collect();
+        // 查不到的排在最后(rank = usize::MAX)
+        assert_eq!(names, vec!["正经名字", "ghost"]);
+    }
+
+    /// **不裁剪、不限条数**(与托盘的 `trayMaxProjects` 不同 —— 那道闸在调用方)。
+    #[test]
+    fn ai项目列表不做截断() {
+        let projects: Vec<ProjectConfig> = (0..30)
+            .map(|i| project(&format!("p{i}"), &format!("项目{i}")))
+            .collect();
+        let ids: Vec<String> = (0..30).map(|i| format!("p{i}")).collect();
+        let panes: Vec<PaneRef<'_>> = ids
+            .iter()
+            .map(|id| pane(id.as_str(), id.as_str(), PaneStatus::AiIdle, false))
+            .collect();
+        let out = collect_ai_projects(panes, &projects, |_| false);
+        assert_eq!(out.entries.len(), 30);
+    }
+
+    /// 空输入 = 空结果(下拉里那条「暂无进入 AI 会话的项目」的判据)。
+    #[test]
+    fn 没有_ai_会话时列表为空() {
+        let out = collect_ai_projects(Vec::new(), &[], |_| false);
+        assert_eq!(out, AiProjects::default());
+    }
+
+    /// 状态灯五档的优先级:error 最高,idle 兜底(**与边条口径相反**)。
+    #[test]
+    fn 状态灯取最紧急一档() {
+        let done = |id: &str| id == "d";
+        // 空 = idle
+        assert_eq!(compute_title_bar_light(Vec::new(), done), TitleBarLight::Idle);
+        // 完成
+        assert_eq!(
+            compute_title_bar_light(vec![pane("p", "d", PaneStatus::Idle, false)], done),
+            TitleBarLight::Done
+        );
+        // 处理中压过完成
+        assert_eq!(
+            compute_title_bar_light(
+                vec![
+                    pane("p", "d", PaneStatus::Idle, false),
+                    pane("p", "w", PaneStatus::AiWorking, false),
+                ],
+                done
+            ),
+            TitleBarLight::Working
+        );
+        // 待确认压过处理中
+        assert_eq!(
+            compute_title_bar_light(
+                vec![
+                    pane("p", "w", PaneStatus::AiWorking, false),
+                    pane("p", "a", PaneStatus::AiIdle, true),
+                ],
+                done
+            ),
+            TitleBarLight::Attention
+        );
+        // error 压过一切 —— 标题栏灯**保留** error,不像边条那样压成 idle
+        assert_eq!(
+            compute_title_bar_light(
+                vec![
+                    pane("p", "a", PaneStatus::AiIdle, true),
+                    pane("p", "e", PaneStatus::Error, false),
+                ],
+                done
+            ),
+            TitleBarLight::Error
+        );
+    }
+
+    /// 判据是 if/else 链,一个 pane 只贡献一档:`error` 的 pane 即便也在 done
+    /// 集合里,也只按 error 算(不会因为「完成过」被降档)。
+    #[test]
+    fn 状态灯一个_pane_只贡献一档() {
+        // attention 的 pane 同时在 done 集合里 —— 取 attention 不取 done
+        assert_eq!(
+            compute_title_bar_light(vec![pane("p", "x", PaneStatus::AiIdle, true)], |_| true),
+            TitleBarLight::Attention
+        );
+        // 正在跑的 pane 同时在 done 集合里 —— 取 working
+        assert_eq!(
+            compute_title_bar_light(vec![pane("p", "x", PaneStatus::AiWorking, false)], |_| true),
+            TitleBarLight::Working
+        );
+    }
+
+    /// 五档各自的 tooltip key 都指向 `app.titleBar.status.*`(拼错就是空 tooltip)。
+    #[test]
+    fn 状态灯文案_key_齐全() {
+        for (light, key) in [
+            (TitleBarLight::Error, "titleBar.status.error"),
+            (TitleBarLight::Attention, "titleBar.status.attention"),
+            (TitleBarLight::Working, "titleBar.status.working"),
+            (TitleBarLight::Done, "titleBar.status.done"),
+            (TitleBarLight::Idle, "titleBar.status.idle"),
+        ] {
+            assert_eq!(light.i18n_key(), key);
+            for locale in mt_i18n::Locale::ALL {
+                assert!(
+                    mt_i18n::lookup(locale, "app", key).is_some(),
+                    "字典缺条目 app.{key}({locale})"
+                );
+            }
+        }
+        for kind in [
+            AiProjectKind::Attention,
+            AiProjectKind::Working,
+            AiProjectKind::Done,
+            AiProjectKind::Idle,
+        ] {
+            for locale in mt_i18n::Locale::ALL {
+                assert!(
+                    mt_i18n::lookup(locale, "app", kind.tray_status_key()).is_some(),
+                    "字典缺条目 app.{}({locale})",
+                    kind.tray_status_key()
+                );
+            }
+        }
+    }
 
     fn session(agent: Option<&str>, id: &str) -> AiSessionRef {
         AiSessionRef {
