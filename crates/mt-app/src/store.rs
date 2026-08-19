@@ -891,9 +891,15 @@ impl AppStore {
         let style = self.terminal_style();
         let theme = self.terminal_theme.clone();
         let dwell = self.selection_dwell();
+        // 回滚行数在**建终端时**就要喂进 alacritty 的 `term::Config` ——
+        // 它决定 grid 的历史容量,晚一步只能靠 `set_options` 补(见 `apply_scrollback`)
+        let scrollback = resolve_scrollback(self.config.terminal_scrollback as f64) as usize;
         let ai = self.ai.clone();
-        let entity =
-            cx.new(|cx| TerminalPane::new(pty_id, spec, user_env, style, theme, dwell, ai, cx));
+        let entity = cx.new(|cx| {
+            TerminalPane::new(
+                pty_id, spec, user_env, style, theme, dwell, scrollback, ai, cx,
+            )
+        });
 
         // 子进程退出 → pane 状态 error(与旧版 pty-exit 同语义);
         // 用户键入 → 清 attention 黄灯(与旧版 clearPaneAttentionByPty 同语义)
@@ -911,22 +917,17 @@ impl AppStore {
     /// 拖选停留自动复制的参数(`config.selectionAutoCopySecs`)。
     ///
     /// **缺省 1 秒**,与前端 `config.selectionAutoCopySecs ?? 1` 一字不差;填 0
-    /// 就是关掉停留语义(退回「松手即复制」)。设置页还没有这一项(GPUI 的设置
-    /// 对话框目前只有字号/终端/语言三段),接上之后要连带给存量终端下发
-    /// `TerminalView::set_selection_dwell` —— 与 `apply_theme` 那条路同形。
+    /// 就是关掉停留语义(退回「松手即复制」)。设置页改了这一项之后走
+    /// [`Self::apply_selection_dwell`] 给存量终端下发 —— 与 `apply_theme` 同形。
     fn selection_dwell(&self) -> DwellConfig {
         DwellConfig::from_secs(self.config.selection_auto_copy_secs.unwrap_or(1.0) as f32)
     }
 
     fn terminal_style(&self) -> TerminalStyle {
-        let mut style = TerminalStyle::default();
-        style.font_size = gpui::px(self.config.terminal_font_size as f32);
-        if let Some(family) = &self.config.terminal_font_family
-            && !family.trim().is_empty()
-        {
-            style.font_family = family.clone().into();
-        }
-        style
+        terminal_style_from(
+            self.config.terminal_font_size,
+            self.config.terminal_font_family.as_deref(),
+        )
     }
 
     /// 解析要用的 shell:指定名 → `defaultShell` → 列表首项。
@@ -1324,7 +1325,6 @@ impl AppStore {
     ///
     /// **切亮暗 = 退出外置皮肤** —— 皮肤的明暗由作者在 `theme.json` 里定死,
     /// 留着它这一步就没有效果(旧版 themePackManager 的同一条约定)。
-    #[allow(dead_code)] // 设置面板「外观」页的落点(下一批)
     pub fn set_theme_mode(&mut self, mode: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.config.theme = mode.to_string();
         self.config.custom_theme_id = None;
@@ -1336,7 +1336,6 @@ impl AppStore {
     ///
     /// 装不上返回 `false` 且**不落盘**:内存里已经回落内置,配置里那条
     /// `customThemeId` 不该被这次失败改掉。
-    #[allow(dead_code)] // 设置面板「外观」页的落点(下一批)
     pub fn set_theme_pack(
         &mut self,
         theme_id: Option<String>,
@@ -1353,7 +1352,6 @@ impl AppStore {
     }
 
     /// 终端配色跟不跟随主题。关掉 = 终端固定内置暗色(旧版同一行为)。
-    #[allow(dead_code)] // 设置面板「外观」页的落点(下一批)
     pub fn set_terminal_follow_theme(
         &mut self,
         follow: bool,
@@ -1384,16 +1382,142 @@ impl AppStore {
         cx.notify();
     }
 
-    /// 终端字号。改完立刻作用于**新建**的终端;已开的终端沿用创建时的样式
-    /// (旧版靠 xterm 的 options 热改,自研渲染器的样式热更新留给渲染批)。
+    // === 通用配置补丁 ===
+
+    /// 写一份配置补丁并落盘(对应原版 `SettingsModal.tsx:59-70` 的 `useConfigPatch`)。
+    ///
+    /// 设置页上百个开关全走这一条:改字段 → 500ms 防抖落盘 → `cx.notify()`。
+    /// 需要**额外副作用**的那几项(主题 / 字号 / 字族 / 回滚行数 / 停留时长)
+    /// 各有自己的 setter,不要拿这个入口去改它们 —— 热更新会漏。
+    pub fn patch_config(&mut self, edit: impl FnOnce(&mut AppConfig), cx: &mut Context<Self>) {
+        edit(&mut self.config);
+        self.save_config_soon(cx);
+        cx.notify();
+    }
+
+    // === 终端渲染参数(四项热更新)===
+
+    /// 终端字号。**热更新全部已开终端** —— 原版由 `TerminalInstance` 订阅 config
+    /// 改 `term.options.fontSize`,这里走 `TerminalView::set_style`(cell 尺寸随之
+    /// 变化,下一帧连带 resize grid 与 PTY)。
     pub fn set_terminal_font_size(&mut self, size: f64, cx: &mut Context<Self>) {
         let size = size.clamp(8.0, 32.0);
         if (self.config.terminal_font_size - size).abs() < f64::EPSILON {
             return;
         }
         self.config.terminal_font_size = size;
+        self.apply_terminal_style(cx);
         self.save_config_soon(cx);
         cx.notify();
+    }
+
+    /// 终端字族。空串 = 回落默认(写 `None`,不落空串)。
+    ///
+    /// 用户自选字体也会**自动补 CJK 回退**,与原版 `resolveTerminalFontFamily`
+    /// (terminalCache.ts:53-58)同语义 —— 见 [`terminal_style_from`]。
+    pub fn set_terminal_font_family(&mut self, family: Option<String>, cx: &mut Context<Self>) {
+        let next = family
+            .map(|f| f.trim().to_string())
+            .filter(|f| !f.is_empty());
+        if self.config.terminal_font_family == next {
+            return;
+        }
+        self.config.terminal_font_family = next;
+        self.apply_terminal_style(cx);
+        self.save_config_soon(cx);
+        cx.notify();
+    }
+
+    /// 回滚行数。**热更新全部已开终端**:调小时 alacritty 的 `update_history`
+    /// 当场裁掉多余历史并释放内存(原版 `updateAllTerminalScrollback` 同效果)。
+    pub fn set_terminal_scrollback(&mut self, lines: u32, cx: &mut Context<Self>) {
+        let lines = resolve_scrollback(lines as f64);
+        if self.config.terminal_scrollback == lines {
+            return;
+        }
+        self.config.terminal_scrollback = lines;
+        let entities: Vec<Entity<TerminalPane>> = self.terminals.values().cloned().collect();
+        for entity in entities {
+            entity.update(cx, |pane, _| pane.set_scrollback(lines as usize));
+        }
+        self.save_config_soon(cx);
+        cx.notify();
+    }
+
+    /// 拖选停留自动复制时长。`0` = 关掉停留语义(退回「松手即复制」)。
+    ///
+    /// 存量终端要连带下发 —— 不然改了只对新开的终端生效。
+    pub fn set_selection_auto_copy_secs(&mut self, secs: f64, cx: &mut Context<Self>) {
+        if self.config.selection_auto_copy_secs == Some(secs) {
+            return;
+        }
+        self.config.selection_auto_copy_secs = Some(secs);
+        let dwell = self.selection_dwell();
+        let entities: Vec<Entity<TerminalPane>> = self.terminals.values().cloned().collect();
+        for entity in entities {
+            entity.update(cx, |pane, cx| pane.set_selection_dwell(dwell, cx));
+        }
+        self.save_config_soon(cx);
+        cx.notify();
+    }
+
+    /// 把当前的终端字号/字族下发给**全部**已开终端。
+    fn apply_terminal_style(&mut self, cx: &mut Context<Self>) {
+        let style = self.terminal_style();
+        let entities: Vec<Entity<TerminalPane>> = self.terminals.values().cloned().collect();
+        for entity in entities {
+            let style = style.clone();
+            entity.update(cx, |pane, cx| pane.set_style(style, cx));
+        }
+    }
+
+    // === 界面字号 / 字族 ===
+
+    /// 把 `uiFontSize` / `uiFontFamily` 装进 [`crate::ui`] 的快照。
+    ///
+    /// **启动时也要调**(在建任何视图之前),否则首帧按默认 13px 画出来再被刷一遍。
+    /// 与 `apply_theme_from_config` 同形:改一次快照,下一帧所有视图跟着变。
+    pub fn apply_ui_font(&self) {
+        crate::ui::set_ui_font(
+            self.config.ui_font_size,
+            self.config.ui_font_family.as_deref(),
+        );
+    }
+
+    /// 界面字号(滑块 10..20)。**即时全局**,等价于原版改 `html` 的 `font-size`。
+    pub fn set_ui_font_size(&mut self, size: f64, cx: &mut Context<Self>) {
+        if (self.config.ui_font_size - size).abs() < f64::EPSILON {
+            return;
+        }
+        self.config.ui_font_size = size;
+        self.apply_ui_font();
+        // 字号散在几十个 `render` 里,没有哪个 Entity 能代表「全部文字」——
+        // 与切语言同一处理:让所有窗口重画(设置页一辈子也拖不了几次滑块)
+        cx.refresh_windows();
+        self.save_config_soon(cx);
+        cx.notify();
+    }
+
+    /// 界面字族。空串 = 回落平台默认(写 `None`,不落空串)。
+    pub fn set_ui_font_family(&mut self, family: Option<String>, cx: &mut Context<Self>) {
+        let next = family
+            .map(|f| f.trim().to_string())
+            .filter(|f| !f.is_empty());
+        if self.config.ui_font_family == next {
+            return;
+        }
+        self.config.ui_font_family = next;
+        self.apply_ui_font();
+        cx.refresh_windows();
+        self.save_config_soon(cx);
+        cx.notify();
+    }
+
+    // === AI 感知(hook 页要用)===
+
+    /// AI 桥的一份克隆(hook 服务器开关 / 状态查询)。
+    pub fn ai(&self) -> AiBridge {
+        self.ai.clone()
     }
 
     // === 界面语言 ===
@@ -1622,6 +1746,65 @@ impl AppStore {
     }
 }
 
+// ─── 终端渲染参数的纯函数(可测) ──────────────────────────────
+
+/// 回滚行数上限(`src/utils/terminalScrollback.ts::MAX_SCROLLBACK`)。
+pub const MAX_SCROLLBACK: u32 = 200_000;
+/// 回滚行数缺省值(同上的 `DEFAULT_SCROLLBACK`;`config.rs` 的 serde 默认同值)。
+pub const DEFAULT_SCROLLBACK: u32 = 10_000;
+
+/// 回滚行数的钳制,逐条对照 `terminalScrollback.ts::resolveScrollback`:
+/// **非数字 / NaN / 负数 → 回落 10000**;否则 `min(round(v), 200000)`。
+///
+/// 入参取 `f64` 是为了把「用户在输入框里打了什么」这一路也覆盖进来 ——
+/// 配置字段虽是 `u32`,设置页拿到的是一串文本。
+pub fn resolve_scrollback(raw: f64) -> u32 {
+    if !raw.is_finite() || raw < 0.0 {
+        return DEFAULT_SCROLLBACK;
+    }
+    (raw.round() as u64).min(MAX_SCROLLBACK as u64) as u32
+}
+
+/// CSS 通用族名。gpui 的字体解析不认它们,留在回退串里等于占一个查不到的位置。
+const GENERIC_FAMILIES: [&str; 5] = ["monospace", "sans-serif", "serif", "system-ui", "ui-monospace"];
+
+/// CJK 回退串(`terminalCache.ts:48` 的 `CJK_FALLBACK_FONTS`)。
+/// 原版把它接在**用户自选字体**后面,这里同样。
+const CJK_FALLBACK_FONTS: [&str; 3] = ["Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC"];
+/// emoji 回退。`TerminalStyle::default()` 里本来就有,自定义字族时别弄丢。
+const EMOJI_FALLBACK: &str = "Segoe UI Emoji";
+
+/// `config.terminalFontSize` + `terminalFontFamily` → [`TerminalStyle`]。
+///
+/// 字族那一串是 CSS `font-family` 语法(原版直接喂 xterm),而
+/// [`TerminalStyle`] 是「主字体 + 回退列表」两段式:取首项当主字体,其余进回退,
+/// 再自动补 CJK 与 emoji —— 与原版 `resolveTerminalFontFamily` 同语义
+/// (它是往用户串后面拼 `CJK_FALLBACK_FONTS`)。
+///
+/// 字族为空 / 只写了通用族名时整段回落 [`TerminalStyle::default`]。
+pub fn terminal_style_from(size: f64, family: Option<&str>) -> TerminalStyle {
+    let mut style = TerminalStyle {
+        font_size: gpui::px(size as f32),
+        ..TerminalStyle::default()
+    };
+    let Some(list) = family.map(str::trim).filter(|s| !s.is_empty()) else {
+        return style;
+    };
+    let mut families = crate::ui::font_family_list(list);
+    families.retain(|f| !GENERIC_FAMILIES.contains(&f.to_ascii_lowercase().as_str()));
+    if families.is_empty() {
+        return style;
+    }
+    style.font_family = families.remove(0).into();
+    for extra in CJK_FALLBACK_FONTS.iter().chain([&EMOJI_FALLBACK]) {
+        if !families.iter().any(|f| f == extra) {
+            families.push((*extra).to_string());
+        }
+    }
+    style.font_fallbacks = families.into_iter().map(Into::into).collect();
+    style
+}
+
 /// 启动恢复某个 pane 时该不该自动续接、续接命令是什么
 /// (逐条对照 `src/utils/aiResume.ts::resolveAutoResumeCommand`)。
 ///
@@ -1762,5 +1945,65 @@ mod tests {
     fn codex_会话不反查目录() {
         let s = session(Some("codex"), "rollout_9");
         assert_eq!(resolve_resume_cwd(&s), None);
+    }
+
+    /// 回滚行数的四条钳制分支(`resolveScrollback` 逐条对照)。
+    #[test]
+    fn 回滚行数钳制的四个分支() {
+        // 0 是合法值(等于不留历史),**不能**被当成「没设」回落默认
+        assert_eq!(resolve_scrollback(0.0), 0);
+        assert_eq!(resolve_scrollback(-1.0), DEFAULT_SCROLLBACK);
+        assert_eq!(resolve_scrollback(999_999.0), MAX_SCROLLBACK);
+        assert_eq!(resolve_scrollback(f64::NAN), DEFAULT_SCROLLBACK);
+        assert_eq!(resolve_scrollback(f64::INFINITY), DEFAULT_SCROLLBACK);
+        // 小数四舍五入
+        assert_eq!(resolve_scrollback(1234.6), 1235);
+        assert_eq!(resolve_scrollback(MAX_SCROLLBACK as f64), MAX_SCROLLBACK);
+    }
+
+    /// 终端字族:首项当主字体,其余进回退,并**自动补 CJK 与 emoji**。
+    #[test]
+    fn 终端字族自动补_cjk_回退() {
+        let style = terminal_style_from(
+            15.0,
+            Some("'JetBrainsMono Nerd Font', 'Cascadia Code', monospace"),
+        );
+        assert_eq!(style.font_size, gpui::px(15.0));
+        assert_eq!(style.font_family.as_ref(), "JetBrainsMono Nerd Font");
+        let fallbacks: Vec<String> = style
+            .font_fallbacks
+            .iter()
+            .map(|f| f.to_string())
+            .collect();
+        assert_eq!(fallbacks[0], "Cascadia Code");
+        // 通用族名 `monospace` 被丢掉(gpui 认不出来)
+        assert!(!fallbacks.iter().any(|f| f == "monospace"));
+        for cjk in CJK_FALLBACK_FONTS {
+            assert!(fallbacks.iter().any(|f| f == cjk), "缺 CJK 回退 {cjk}");
+        }
+        assert!(fallbacks.iter().any(|f| f == EMOJI_FALLBACK));
+    }
+
+    /// 字族为空 / 只有通用族名时整段回落默认样式(只改字号)。
+    #[test]
+    fn 终端字族为空时回落默认() {
+        let default = TerminalStyle::default();
+        for family in [None, Some(""), Some("   "), Some("monospace, serif")] {
+            let style = terminal_style_from(14.0, family);
+            assert_eq!(style.font_family, default.font_family, "{family:?}");
+            assert_eq!(style.font_fallbacks, default.font_fallbacks, "{family:?}");
+        }
+    }
+
+    /// 重复声明 CJK 字体时不该在回退串里出现两次。
+    #[test]
+    fn 终端字族回退不重复() {
+        let style = terminal_style_from(14.0, Some("Consolas, 'Microsoft YaHei'"));
+        let yahei = style
+            .font_fallbacks
+            .iter()
+            .filter(|f| f.as_ref() == "Microsoft YaHei")
+            .count();
+        assert_eq!(yahei, 1);
     }
 }

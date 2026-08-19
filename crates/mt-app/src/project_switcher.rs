@@ -323,7 +323,7 @@ fn kbd(label: &'static str) -> impl IntoElement {
         .bg(ui::bg_elevated())
         .border_1()
         .border_color(ui::border_default())
-        .text_size(px(10.0))
+        .text_size(ui::font_px(10.0))
         .text_color(ui::text_secondary())
         .child(label)
 }
@@ -336,7 +336,7 @@ fn hint(keys: &[&'static str], label: &'static str) -> impl IntoElement {
     row.child(
         div()
             .ml(px(4.0))
-            .text_size(px(10.0))
+            .text_size(ui::font_px(10.0))
             .text_color(ui::text_muted())
             .child(label),
     )
@@ -361,7 +361,7 @@ impl Render for ProjectSwitcher {
                     .px(px(16.0))
                     .py(px(24.0))
                     .text_center()
-                    .text_size(px(12.0))
+                    .text_size(ui::font_px(12.0))
                     .text_color(ui::text_muted())
                     .child(t("projectSwitcher", "noMatch")),
             );
@@ -379,7 +379,7 @@ impl Render for ProjectSwitcher {
                 name_line = name_line.child(
                     div()
                         .flex_none()
-                        .text_size(px(12.0))
+                        .text_size(ui::font_px(12.0))
                         .when(hit, |el| {
                             el.text_color(ui::accent()).font_weight(FontWeight::SEMIBOLD)
                         })
@@ -393,7 +393,7 @@ impl Render for ProjectSwitcher {
                     div()
                         .ml(px(6.0))
                         .flex_none()
-                        .text_size(px(10.0))
+                        .text_size(ui::font_px(10.0))
                         .text_color(ui::text_muted())
                         .child(t("projectSwitcher", "current")),
                 );
@@ -431,7 +431,7 @@ impl Render for ProjectSwitcher {
                             .child(
                                 div()
                                     .truncate()
-                                    .text_size(px(10.0))
+                                    .text_size(ui::font_px(10.0))
                                     .text_color(ui::text_muted())
                                     .child(subtitle(&row.group_path, &row.path)),
                             ),
@@ -440,7 +440,7 @@ impl Render for ProjectSwitcher {
                         el.child(
                             div()
                                 .flex_none()
-                                .text_size(px(10.0))
+                                .text_size(ui::font_px(10.0))
                                 .text_color(ui::color_success())
                                 .child(t("panels", "done")),
                         )

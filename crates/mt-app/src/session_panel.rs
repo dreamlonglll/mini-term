@@ -635,7 +635,7 @@ impl SessionPanel {
             body = body.child(
                 div()
                     .py(px(12.0))
-                    .text_size(px(12.0))
+                    .text_size(ui::font_px(12.0))
                     .text_color(ui::text_muted())
                     .child(t("sessionViewer", "loading")),
             );
@@ -644,7 +644,7 @@ impl SessionPanel {
             body = body.child(
                 div()
                     .py(px(12.0))
-                    .text_size(px(12.0))
+                    .text_size(ui::font_px(12.0))
                     .text_color(ui::color_error())
                     .child(err.clone()),
             );
@@ -665,7 +665,7 @@ impl SessionPanel {
                     })
                     .child(
                         div()
-                            .text_size(px(10.0))
+                            .text_size(ui::font_px(10.0))
                             .text_color(ui::text_muted())
                             // 旧版 `SessionViewerModal.tsx` 这两个角色名就是硬编码的
                             // 英文字面量(不进字典),照抄
@@ -673,7 +673,7 @@ impl SessionPanel {
                     )
                     .child(
                         div()
-                            .text_size(px(12.0))
+                            .text_size(ui::font_px(12.0))
                             .text_color(ui::text_secondary())
                             .child(msg.content.clone()),
                     ),
@@ -708,7 +708,7 @@ impl SessionPanel {
                         div()
                             .flex_1()
                             .overflow_hidden()
-                            .text_size(px(12.0))
+                            .text_size(ui::font_px(12.0))
                             .text_color(ui::text_primary())
                             .child(preview_title),
                     )
@@ -791,7 +791,7 @@ impl Render for SessionPanel {
             list = list.child(
                 div()
                     .py(px(12.0))
-                    .text_size(px(12.0))
+                    .text_size(ui::font_px(12.0))
                     .text_color(ui::text_muted())
                     .child(t("sessionList", "loading")),
             );
@@ -799,7 +799,7 @@ impl Render for SessionPanel {
             list = list.child(
                 div()
                     .py(px(12.0))
-                    .text_size(px(12.0))
+                    .text_size(ui::font_px(12.0))
                     .text_color(ui::text_muted())
                     .child(if has_project {
                         t("sessionList", "empty")
@@ -859,7 +859,7 @@ impl Render for SessionPanel {
                     .px(px(10.0))
                     .py(px(6.0))
                     .rounded(px(4.0))
-                    .text_size(px(12.0))
+                    .text_size(ui::font_px(12.0))
                     .hover(|el| el.bg(ui::border_subtle()))
                     // 树模式整行可点(跳转 / 恢复),平铺不可点
                     .when(tree, |el| el.cursor_pointer())
@@ -967,7 +967,7 @@ impl Render for SessionPanel {
                 div()
                     .id("session-load-more")
                     .py(px(6.0))
-                    .text_size(px(11.0))
+                    .text_size(ui::font_px(11.0))
                     .text_color(ui::text_muted())
                     .cursor_pointer()
                     .hover(|el| el.text_color(ui::accent()))
@@ -996,7 +996,7 @@ impl Render for SessionPanel {
                             .items_center()
                             .child(
                                 div()
-                                    .text_size(px(11.0))
+                                    .text_size(ui::font_px(11.0))
                                     .text_color(ui::text_muted())
                                     .child(t("panels", "sessions")),
                             )
@@ -1033,7 +1033,7 @@ impl Render for SessionPanel {
                                         .id("session-view-toggle")
                                         .px(px(4.0))
                                         .font_family("monospace")
-                                        .text_size(px(12.0))
+                                        .text_size(ui::font_px(12.0))
                                         .text_color(ui::text_muted())
                                         .cursor_pointer()
                                         .hover(|el| el.text_color(ui::text_primary()))
@@ -1055,7 +1055,7 @@ impl Render for SessionPanel {
                                 div()
                                     .id("session-refresh")
                                     .px(px(4.0))
-                                    .text_size(px(12.0))
+                                    .text_size(ui::font_px(12.0))
                                     .text_color(ui::text_muted())
                                     .cursor_pointer()
                                     .hover(|el| el.text_color(ui::accent()))

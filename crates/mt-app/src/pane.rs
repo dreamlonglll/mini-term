@@ -82,9 +82,8 @@ pub struct TerminalPane {
     /// 留着会让按键被处理两遍,而且 IME 分流依赖「可打印键放行走 WM_CHAR」,
     /// 宿主抢先把字节写进 PTY 的话中文输入法下一个字会变两个。
     view: Entity<TerminalView>,
-    /// 建视图时用过一次;留着是为了字号/字族热更新那一批(`view.set_style`)
-    /// 能拿到「当前是什么」来做比较。
-    #[allow(dead_code)]
+    /// 当前的渲染样式。留着是给字号/字族热更新做「值变了没」的比较
+    /// (视图侧自己也比一次,这里比是为了省掉一次 entity update)。
     style: TerminalStyle,
     theme: TerminalTheme,
     ai: AiBridge,
@@ -122,15 +121,19 @@ impl TerminalPane {
         style: TerminalStyle,
         theme: TerminalTheme,
         dwell: DwellConfig,
+        scrollback: usize,
         ai: AiBridge,
         cx: &mut Context<Self>,
     ) -> Self {
         // 首帧还没量过字体,先给个能跑的初值;真正的尺寸在元素 prepaint 里量出来
         // 之后通过 on_grid_resize 回来纠正。
-        let emulator = Arc::new(TerminalEmulator::new(TermSize::new(
-            spec.cols as usize,
-            spec.rows as usize,
-        )));
+        //
+        // 回滚行数(`config.terminalScrollback`)必须在这一刻喂进 alacritty 的
+        // `term::Config`:它决定 grid 的历史容量,建完再改只能靠 `set_options`。
+        let emulator = Arc::new(TerminalEmulator::with_scrollback(
+            TermSize::new(spec.cols as usize, spec.rows as usize),
+            scrollback,
+        ));
 
         let (tx, mut rx) = mpsc::unbounded::<PaneSignal>();
         let exit_tx = tx.clone();
@@ -440,6 +443,32 @@ impl TerminalPane {
         cx.notify();
     }
 
+    /// 换字号 / 字族(设置页「字体」页的落点)。
+    ///
+    /// cell 尺寸随之变化,下一帧渲染层会连带 resize grid 与 PTY ——
+    /// 与原版改 `term.options.fontSize` 后 fit addon 重排是同一条链路。
+    pub fn set_style(&mut self, style: TerminalStyle, cx: &mut Context<Self>) {
+        if self.style == style {
+            return;
+        }
+        self.style = style.clone();
+        self.view.update(cx, |view, cx| view.set_style(style, cx));
+        cx.notify();
+    }
+
+    /// 换拖选停留自动复制时长(`config.selectionAutoCopySecs`)。
+    pub fn set_selection_dwell(&mut self, dwell: DwellConfig, cx: &mut Context<Self>) {
+        self.view
+            .update(cx, |view, cx| view.set_selection_dwell(dwell, cx));
+    }
+
+    /// 换回滚行数。调小时 alacritty 当场裁历史并释放内存。
+    ///
+    /// **不碰视图**:grid 的容量变化不改任何渲染参数,下一帧照常读当前 grid。
+    pub fn set_scrollback(&mut self, lines: usize) {
+        self.emulator.set_scrollback(lines);
+    }
+
     /// 丢弃组合中的预编辑串。切 tab / 关 pane 之前调,免得残影留在画面上。
     pub fn clear_preedit(&mut self, cx: &mut Context<Self>) {
         self.view.update(cx, |view, cx| view.clear_preedit(cx));
@@ -537,7 +566,7 @@ impl Render for TerminalPane {
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_size(px(13.0))
+                .text_size(crate::ui::font_px(13.0))
                 .text_color(crate::ui::color_error())
                 .child(format!("{}:{err}", crate::i18n::t("paneGroup", "startFailed")));
         }
@@ -610,7 +639,7 @@ impl Render for TerminalPane {
                         .absolute()
                         .bottom_2()
                         .right_3()
-                        .text_size(px(12.0))
+                        .text_size(crate::ui::font_px(12.0))
                         .text_color(crate::ui::color_error())
                         // 旧版没有这个角标(子进程退出后 pane 直接标红),
                         // `paneGroup.shellExited` 是 M 批往 TS 源头补的条目。

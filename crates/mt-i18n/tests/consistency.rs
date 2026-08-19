@@ -22,8 +22,15 @@ use mt_i18n::{
 /// （`paneGroup.shellExited` / `settings.terminal.fontSizeNewOnly` /
 /// `projectList.{pathPlaceholder,pathHint,chooseDirDialogTitle}` /
 /// `usageStats.{byTool,byShell,pricingLocalHint}`）。
+///
+/// 735 → 741：R 批(设置面板 10 分页)补 6 条 GPUI 专属文案 ——
+/// 快捷键页那三条 GPUI 独有动作的描述
+/// （`settings.shortcuts.{toggleSessions,toggleUsage,jumpAttention}`）、
+/// 两条「底层暂未实现」说明（`settings.appearance.skinUnavailable` /
+/// `settings.font.ligaturesUnavailable`），以及自定义提示音只认 .wav 的提示
+/// （`settings.aiNotification.wavOnly`）。
 const EXPECTED_NAMESPACES: usize = 32;
-const EXPECTED_ENTRIES_PER_LANG: usize = 735;
+const EXPECTED_ENTRIES_PER_LANG: usize = 741;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

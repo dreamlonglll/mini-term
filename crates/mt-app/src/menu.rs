@@ -356,7 +356,7 @@ impl ContextMenu {
                             .px(px(12.0))
                             .pt(px(6.0))
                             .pb(px(3.0))
-                            .text_size(px(10.0))
+                            .text_size(ui::font_px(10.0))
                             .text_color(ui::text_muted())
                             .child(text.clone()),
                     );
@@ -402,7 +402,7 @@ impl ContextMenu {
             .px(px(12.0))
             .py(px(6.0))
             .rounded(px(4.0))
-            .text_size(px(12.0))
+            .text_size(ui::font_px(12.0))
             .text_color(text_color)
             // 禁用项:原版是 `opacity: .4` + hover 不变色
             .when(disabled, |el| el.opacity(0.4))
@@ -437,7 +437,7 @@ impl ContextMenu {
             row = row.child(
                 div()
                     .flex_none()
-                    .text_size(px(11.0))
+                    .text_size(ui::font_px(11.0))
                     .text_color(ui::text_muted())
                     .opacity(0.8)
                     .child(shortcut),
@@ -448,7 +448,7 @@ impl ContextMenu {
             row = row.child(
                 div()
                     .flex_none()
-                    .text_size(px(10.0))
+                    .text_size(ui::font_px(10.0))
                     .text_color(ui::text_muted())
                     .child("▸"),
             );

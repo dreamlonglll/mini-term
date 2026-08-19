@@ -388,7 +388,7 @@ impl TerminalArea {
             .bg(ui::bg_elevated())
             .border_b_1()
             .border_color(ui::border_subtle())
-            .text_size(px(12.0));
+            .text_size(ui::font_px(12.0));
 
         for (idx, pane) in panes.iter().enumerate() {
             let is_active = pane.id == active_id;
@@ -708,7 +708,7 @@ impl Render for TerminalArea {
                 .items_center()
                 .justify_center()
                 .text_color(ui::text_muted())
-                .text_size(px(13.0))
+                .text_size(ui::font_px(13.0))
                 .child(t("app", "emptyState"));
         };
         let project_id = project.id.clone();
@@ -728,7 +728,7 @@ impl Render for TerminalArea {
                 .child(
                     div()
                         .text_color(ui::text_secondary())
-                        .text_size(px(13.0))
+                        .text_size(ui::font_px(13.0))
                         .child(tr!("terminalArea", "emptyTitle", project = project_name)),
                 )
                 .child(
@@ -740,7 +740,7 @@ impl Render for TerminalArea {
                         .border_1()
                         .border_color(ui::border_default())
                         .text_color(ui::text_muted())
-                        .text_size(px(13.0))
+                        .text_size(ui::font_px(13.0))
                         .cursor_pointer()
                         .hover(|el| el.border_color(ui::accent()).text_color(ui::accent()))
                         .on_click(cx.listener(move |this, _event, window, cx| {

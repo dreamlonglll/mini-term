@@ -235,7 +235,7 @@ fn body(message: &str, detail: &[String]) -> gpui::AnyElement {
     for line in message.split('\n') {
         el = el.child(
             div()
-                .text_size(px(13.0))
+                .text_size(ui::font_px(13.0))
                 .text_color(ui::text_primary())
                 // 空行也要占一行高,不然 `\n\n` 排版会塌掉
                 .child(if line.is_empty() {
@@ -250,7 +250,7 @@ fn body(message: &str, detail: &[String]) -> gpui::AnyElement {
         for line in detail {
             list = list.child(
                 div()
-                    .text_size(px(11.0))
+                    .text_size(ui::font_px(11.0))
                     .text_color(ui::text_muted())
                     .child(line.clone()),
             );

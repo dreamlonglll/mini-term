@@ -21,9 +21,12 @@
 
 use std::cell::RefCell;
 
+use std::rc::Rc;
+
 use gpui::{
-    Animation, AnimationExt as _, Div, ElementId, Hsla, InteractiveElement, IntoElement,
-    ParentElement, Pixels, Stateful, Styled, div, px,
+    Animation, AnimationExt as _, AnyElement, App, Div, ElementId, Hsla, InteractiveElement,
+    IntoElement, MouseButton, MouseMoveEvent, ParentElement, Pixels, SharedString, Stateful,
+    StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px, white,
 };
 use mt_ui::icons::vector::{Geom, Ink, Shape, VectorIcon};
 use mt_ui::icons::{StatusDot, StatusKind};
@@ -45,6 +48,9 @@ pub struct Palette {
     pub text_muted: Hsla,
     pub accent: Hsla,
     pub accent_subtle: Hsla,
+    /// `--accent-muted`(styles.css:18/94)。比 `accent_subtle` 更实的一档，
+    /// 设置页单选段(`ChoiceGroup`)的选中底色用它。
+    pub accent_muted: Hsla,
     pub border_subtle: Hsla,
     pub border_default: Hsla,
     pub border_strong: Hsla,
@@ -85,6 +91,10 @@ impl Palette {
                 a: 0.10,
                 ..rgb8(0xc8, 0x80, 0x5a)
             },
+            accent_muted: Hsla {
+                a: 0.20, // #c8805a33
+                ..rgb8(0xc8, 0x80, 0x5a)
+            },
             border_subtle: Hsla {
                 a: 0.05,
                 ..rgb8(0xff, 0xff, 0xff)
@@ -122,6 +132,10 @@ impl Palette {
             accent: rgb8(0xb0, 0x68, 0x30),
             accent_subtle: Hsla {
                 a: 0.094, // #b0683018
+                ..rgb8(0xb0, 0x68, 0x30)
+            },
+            accent_muted: Hsla {
+                a: 0.20, // #b0683033
                 ..rgb8(0xb0, 0x68, 0x30)
             },
             border_subtle: Hsla {
@@ -188,6 +202,8 @@ impl Palette {
             text_muted: muted,
             accent,
             accent_subtle: alpha(accent, 0.18),
+            // `--accent-muted: withAlpha(c.accent, 0.33)`(themePackManager.ts:243)
+            accent_muted: alpha(accent, 0.33),
             border_subtle: alpha(line, 0.6),
             border_default: line,
             // `--border-strong: scaleAlpha(c.line, 1.4)`（buildTokenMap 那一行）
@@ -226,9 +242,98 @@ pub fn set_palette(palette: Palette) {
 }
 
 /// 当前配色的一份拷贝。
-#[allow(dead_code)] // 设置面板的预览卡片要整套取(下一批)
+#[allow(dead_code)] // 整套取色的口子(皮肤预览卡片改成逐色取,暂无调用点)
 pub fn palette() -> Palette {
     CURRENT.with(|p| p.borrow().clone())
+}
+
+// ─── 界面字号 / 字族 ──────────────────────────────────────────
+//
+// 原版把 `uiFontSize` 写进 `html` 的 inline `font-size`(App.tsx:141),Tailwind 的
+// `text-base/sm/xs` 都是 rem，于是一改全跟着变；`uiFontFamily` 走两个 CSS 变量
+// (fontManager.ts:8-18)。GPUI 侧没有 rem 继承这回事，所以照 [`set_palette`] 的
+// 同一套路来:一份 thread_local 快照 + 一个替换点，各处字号改走 [`font_px`]。
+//
+// ⚠️ **只缩放字号,不缩放间距**:原版 Tailwind 的 `px-3` / `gap-2` 同样是 rem，
+// 改 `uiFontSize` 连带把内边距一起放大。GPUI 侧的间距是像素字面量,本批不动 ——
+// 差异在极端档位(10px / 20px)下看得出来,记档在交付说明里。
+
+/// 原版 `html` 的默认 `font-size`(`config.uiFontSize ?? 13`,App.tsx:141)。
+/// 各处 `font_px(13.0)` 之类的字面量就是按这个基准写的。
+pub const BASE_UI_FONT_SIZE: f32 = 13.0;
+
+/// 界面字号 / 字族快照。改它的唯一入口是 [`set_ui_font`]。
+#[derive(Clone, Debug, PartialEq)]
+pub struct UiFont {
+    /// `config.uiFontSize`。滑块范围 10..20(与原版一致)。
+    pub size: f32,
+    /// `config.uiFontFamily` 的**首个**字体族。`None` = 平台默认。
+    ///
+    /// 原版存的是一整串 CSS `font-family`(带回退列表),而 gpui 的
+    /// `Styled::font_family` 只收一个族名 —— 取首项,其余靠平台字体回退。
+    pub family: Option<SharedString>,
+}
+
+impl Default for UiFont {
+    fn default() -> Self {
+        Self {
+            size: BASE_UI_FONT_SIZE,
+            family: None,
+        }
+    }
+}
+
+thread_local! {
+    static UI_FONT: RefCell<UiFont> = RefCell::new(UiFont::default());
+}
+
+/// 换界面字号 / 字族。**唯一替换点**,调用方随后 `cx.refresh_windows()`。
+///
+/// `size` 钳在 10..20(滑块范围);`family` 传整串 CSS font-family,这里取首项。
+pub fn set_ui_font(size: f64, family: Option<&str>) {
+    let family = family
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| first_font_family(s))
+        .map(SharedString::from);
+    let next = UiFont {
+        size: (size as f32).clamp(10.0, 20.0),
+        family,
+    };
+    UI_FONT.with(|f| *f.borrow_mut() = next);
+}
+
+/// 当前界面字族(挂在 `Workspace` 根上,靠继承透给所有子元素)。
+pub fn ui_font_family() -> Option<SharedString> {
+    UI_FONT.with(|f| f.borrow().family.clone())
+}
+
+/// 把「按 13px 基准写死的像素字号」换算到当前基准。
+///
+/// 各视图里写死的 `text_size(px(12.0))` 一律改成 `text_size(ui::font_px(12.0))` ——
+/// 默认基准下等值,改了 `uiFontSize` 才整体跟着缩放(等价于原版的 rem 继承)。
+pub fn font_px(base: f32) -> Pixels {
+    let scale = UI_FONT.with(|f| f.borrow().size) / BASE_UI_FONT_SIZE;
+    px(base * scale)
+}
+
+/// CSS `font-family` 串的首个族名(剥引号与空白)。
+///
+/// `'JetBrainsMono Nerd Font', monospace` → `JetBrainsMono Nerd Font`。
+/// 全是空项时返回 `None`(等价于「没设」)。
+pub fn first_font_family(list: &str) -> Option<String> {
+    font_family_list(list).into_iter().next()
+}
+
+/// CSS `font-family` 串拆成族名列表(剥引号与空白,丢掉空项)。
+///
+/// **不丢 `monospace` 这类通用族名**:调用方(终端字族)自己决定要不要。
+pub fn font_family_list(list: &str) -> Vec<String> {
+    list.split(',')
+        .map(|part| part.trim().trim_matches(['"', '\'']).trim())
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn token(pick: impl Fn(&Palette) -> Hsla) -> Hsla {
@@ -279,6 +384,10 @@ pub fn accent() -> Hsla {
 /// `--accent-subtle`(原值是带 alpha 的 accent)
 pub fn accent_subtle() -> Hsla {
     token(|p| p.accent_subtle)
+}
+/// `--accent-muted`(设置页单选段的选中底色)
+pub fn accent_muted() -> Hsla {
+    token(|p| p.accent_muted)
 }
 /// `--border-subtle`
 pub fn border_subtle() -> Hsla {
@@ -354,7 +463,7 @@ pub fn ghost_button(id: impl Into<ElementId>, label: impl Into<String>) -> State
         .rounded(px(4.0))
         .border_1()
         .border_color(border_default())
-        .text_size(px(12.0))
+        .text_size(font_px(12.0))
         .text_color(text_secondary())
         .cursor_pointer()
         .hover(|el| el.border_color(accent()).text_color(accent()))
@@ -372,7 +481,7 @@ pub fn primary_button(id: impl Into<ElementId>, label: impl Into<String>) -> Sta
         .py(px(4.0))
         .rounded(px(4.0))
         .bg(accent())
-        .text_size(px(12.0))
+        .text_size(font_px(12.0))
         .text_color(bg_base())
         .cursor_pointer()
         .hover(|el| el.opacity(0.9))
@@ -395,7 +504,7 @@ pub fn danger_button(id: impl Into<ElementId>, label: impl Into<String>) -> Stat
         .rounded(px(4.0))
         .border_1()
         .border_color(border_default())
-        .text_size(px(12.0))
+        .text_size(font_px(12.0))
         .text_color(text_secondary())
         .cursor_pointer()
         .hover(|el| el.border_color(color_error()).text_color(color_error()))
@@ -418,9 +527,292 @@ pub fn section_title(text: impl Into<String>) -> Div {
         )
         .child(
             div()
-                .text_size(px(12.0))
+                .text_size(font_px(12.0))
                 .text_color(text_primary())
                 .child(text.into()),
+        )
+}
+
+// ─── 设置面板的通用原语 ───────────────────────────────────────
+//
+// 逐条对应 `src/components/SettingsModal.tsx:52-256` 那批组件(动机见它的注释:
+// 同一个 toggle 的 15 行 JSX 曾复制十来份)。**全部自绘**,不用
+// `gpui_component::switch` / `setting`:前者的配色走组件库自己的 theme token,
+// 与这里的 [`Palette`] 对不上;后者是一整套带 reset 按钮 + rust-i18n 的设置框架,
+// 与原版「两级侧栏 + 自定义行」不同形,硬套只会打架(见批次规格 §7 坑 4)。
+
+/// 设置页的分节标题(`SettingsModal.tsx:73-80` 的 `Section` 标题行)。
+///
+/// **与 [`section_title`] 不是一回事**:那个是用量面板那种「竖条 + 文字」,
+/// 这个是大写 + 字距的灰色小标题。
+pub fn settings_section_title(text: impl Into<SharedString>) -> Div {
+    div()
+        .mb(px(2.0))
+        .text_size(font_px(12.0))
+        .text_color(text_muted())
+        // 原版是 `uppercase tracking-[0.1em]`;gpui 没有 text-transform,
+        // 中文文案本来也没有大小写,只把字距做出来
+        .child(text.into())
+}
+
+/// 分节末尾的补充说明(`SettingsModal.tsx:83-85` 的 `Hint`)。
+pub fn hint(text: impl Into<SharedString>) -> Div {
+    div()
+        .text_size(font_px(11.0))
+        .text_color(text_muted())
+        .child(text.into())
+}
+
+/// 设置行里的说明文字(`text-sm text-[var(--text-muted)]`)。
+pub fn desc_text(text: impl Into<SharedString>) -> Div {
+    div()
+        .text_size(font_px(11.0))
+        .text_color(text_muted())
+        .child(text.into())
+}
+
+/// 设置行/卡片的外壳:`px-3 py-2.5 rounded-md bg-base border-subtle`。
+pub fn settings_card() -> Div {
+    div()
+        .px(px(12.0))
+        .py(px(10.0))
+        .rounded(px(6.0))
+        .bg(bg_base())
+        .border_1()
+        .border_color(border_subtle())
+}
+
+/// 一行设置:左标题 + 说明,右控件(`SettingsModal.tsx:88-113` 的 `SettingRow`)。
+///
+/// `disabled` = 从属项的总开关关着 —— 原版是 `opacity-50 pointer-events-none`,
+/// 这里同样只压透明度,交互由调用方**不挂 on_click** 来断(gpui 没有
+/// pointer-events 这个属性)。
+pub fn setting_row(
+    title: impl Into<SharedString>,
+    desc: Option<AnyElement>,
+    disabled: bool,
+    control: impl IntoElement,
+) -> Div {
+    settings_card()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(12.0))
+        .when(disabled, |el| el.opacity(0.5))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .child(
+                    div()
+                        .text_size(font_px(13.0))
+                        .text_color(text_primary())
+                        .child(title.into()),
+                )
+                .children(desc),
+        )
+        .child(div().flex_none().child(control))
+}
+
+/// 开关(`SettingsModal.tsx:115-142` 的 `Toggle`)。
+///
+/// 几何逐值照抄:`w-9 h-5`(36×20)的圆角胶囊 + `w-4 h-4`(16)的白滑块,
+/// 开时 `translate-x-[18px]`、关时 `translate-x-0.5`。
+/// **不随 `uiFontSize` 缩放** —— 原版这几个值是 Tailwind 的固定尺寸类。
+pub fn toggle(id: impl Into<ElementId>, checked: bool) -> Stateful<Div> {
+    div()
+        .id(id)
+        .relative()
+        .w(px(36.0))
+        .h(px(20.0))
+        .flex_none()
+        .rounded_full()
+        .cursor_pointer()
+        .bg(if checked { accent() } else { border_strong() })
+        .child(
+            div()
+                .absolute()
+                .top(px(2.0))
+                .left(px(if checked { 18.0 } else { 2.0 }))
+                .w(px(16.0))
+                .h(px(16.0))
+                .rounded_full()
+                .bg(white()),
+        )
+}
+
+/// 复选框(hook 页的注入目标列表,原版是 `<input type=checkbox accent-[var(--accent)]>`)。
+pub fn checkbox(id: impl Into<ElementId>, checked: bool) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .w(px(14.0))
+        .h(px(14.0))
+        .rounded(px(3.0))
+        .border_1()
+        .cursor_pointer()
+        .border_color(if checked { accent() } else { border_strong() })
+        .when(checked, |el| el.bg(accent()))
+        .when(checked, |el| {
+            el.child(
+                div()
+                    .text_size(font_px(10.0))
+                    .text_color(bg_base())
+                    .child("\u{2713}"),
+            )
+        })
+}
+
+/// 单选段里的一项(`SettingsModal.tsx:229-256` 的 `ChoiceGroup`)。
+///
+/// `disabled` 的那一项**画出来但不给 on_click**(调用方负责),用于
+/// 「UI 有、底层没有」的功能(内置皮肤 blueprint / fluent2)。
+pub fn choice_button(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    selected: bool,
+    disabled: bool,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .flex_1()
+        .flex()
+        .items_center()
+        .justify_center()
+        .py(px(8.0))
+        .rounded(px(4.0))
+        .border_1()
+        .text_size(font_px(13.0))
+        .when(disabled, |el| el.opacity(0.5))
+        .when(!disabled, |el| el.cursor_pointer())
+        .when(selected, |el| {
+            el.bg(accent_muted())
+                .text_color(accent())
+                .border_color(accent())
+        })
+        .when(!selected, |el| {
+            el.bg(bg_base())
+                .text_color(text_secondary())
+                .border_color(border_default())
+        })
+        .child(label.into())
+}
+
+/// 键帽(`styles.css:494-506` 的 `.kbd`)。
+///
+/// **自绘而不是 `gpui_component::kbd::Kbd`**:那个要一个真实的
+/// [`gpui::Keystroke`],而键位表里有 `1…9` 这种占位串根本解析不出来;
+/// 它的配色也走组件库自己的 theme token。`border-bottom-width: 2px`
+/// 是那个「键帽」立体感的来源,别漏。
+pub fn kbd(text: impl Into<SharedString>) -> Div {
+    div()
+        .flex_none()
+        .px(px(5.0))
+        .py(px(1.0))
+        .rounded(px(4.0))
+        .bg(bg_elevated())
+        .border_1()
+        .border_b_2()
+        .border_color(border_default())
+        .text_size(font_px(11.0))
+        .text_color(text_secondary())
+        .child(text.into())
+}
+
+/// 字号滑块(`SettingsModal.tsx:744-778` 的 `FontSizeSlider`)。
+///
+/// **拖动即时提交**(原版 `onChange` 直连,没有草稿态)—— 与 [`NumberRow`] 那种
+/// 「失焦/回车才归一」的语义相反,别统一。
+///
+/// # 为什么是分段而不是连续轨道
+///
+/// 原版是 `<input type=range step=1>`,取值本就是整数档。gpui 里做连续轨道要
+/// 先把元素 bounds 回填出来(canvas sink)再做像素→比例换算;而档位只有十来个,
+/// 直接铺成 `max-min+1` 段可点/可拖的格子,行为(点哪跳哪、按住拖过去连续变)
+/// 与 range 完全一致,还省掉一份每帧回填的几何状态。
+///
+/// [`NumberRow`]: crate::settings
+pub fn font_size_slider(
+    id_prefix: &'static str,
+    label: impl Into<SharedString>,
+    value: i32,
+    min: i32,
+    max: i32,
+    on_change: impl Fn(i32, &mut Window, &mut App) + 'static,
+) -> Div {
+    let on_change = Rc::new(on_change);
+    let mut track = div().flex().flex_1().items_center().gap(px(1.0));
+    for step in min..=max {
+        let filled = step <= value;
+        let cb_click = on_change.clone();
+        let cb_move = on_change.clone();
+        track = track.child(
+            div()
+                .id(SharedString::from(format!("{id_prefix}-{step}")))
+                .flex_1()
+                .h(px(14.0))
+                .flex()
+                .items_center()
+                .cursor_pointer()
+                .child(
+                    div()
+                        .w_full()
+                        .h(px(6.0))
+                        .bg(if filled { accent() } else { border_strong() }),
+                )
+                .on_click(move |_, window, cx| cb_click(step, window, cx))
+                // 按住左键划过 = 连续拖动(等价于 range 的拖拽)
+                .on_mouse_move(move |event: &MouseMoveEvent, window, cx| {
+                    if event.pressed_button == Some(MouseButton::Left) {
+                        cb_move(step, window, cx);
+                    }
+                }),
+        );
+    }
+
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .text_size(font_px(13.0))
+                        .text_color(text_primary())
+                        .child(label.into()),
+                )
+                .child(
+                    div()
+                        .text_size(font_px(13.0))
+                        .text_color(accent())
+                        .child(format!("{value}px")),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(12.0))
+                .child(
+                    div()
+                        .text_size(font_px(11.0))
+                        .text_color(text_muted())
+                        .child(min.to_string()),
+                )
+                .child(track)
+                .child(
+                    div()
+                        .text_size(font_px(11.0))
+                        .text_color(text_muted())
+                        .child(max.to_string()),
+                ),
         )
 }
 

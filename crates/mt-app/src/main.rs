@@ -40,6 +40,7 @@ mod ai;
 mod file_tree;
 mod focus_nav;
 mod fs_ops;
+mod hotkeys;
 mod i18n;
 mod menu;
 mod modal;
@@ -55,6 +56,7 @@ mod prompt;
 mod search_modal;
 mod session_branch;
 mod session_panel;
+mod settings;
 mod shell_ops;
 mod store;
 mod terminal_area;
@@ -69,7 +71,7 @@ use std::sync::Arc;
 use futures::StreamExt;
 use gpui::{
     App, AppContext, Application, Bounds, Context, Entity, InteractiveElement, IntoElement,
-    KeyBinding, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
+    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
     Subscription, Task, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div,
     prelude::FluentBuilder, px, size,
 };
@@ -491,7 +493,7 @@ impl Workspace {
         if yields_to_typing(window, cx) {
             return;
         }
-        modal::open_terminal_settings(self.store.clone(), window, cx);
+        settings::open_settings(self.store.clone(), None, window, cx);
     }
 
     fn on_toggle_sessions(
@@ -794,7 +796,7 @@ impl Render for Workspace {
                     false,
                 )
                 .on_click(cx.listener(|this, _event, window, cx| {
-                    modal::open_terminal_settings(this.store.clone(), window, cx);
+                    settings::open_settings(this.store.clone(), None, window, cx);
                 })),
             )
             // 未读完成计数:点一下跳到最先完成的那个 pane(旧版托盘绿灯的入口;
@@ -905,7 +907,7 @@ impl Render for Workspace {
                         .bg(ui::bg_elevated())
                         .child(
                             div()
-                                .text_size(px(12.0))
+                                .text_size(crate::ui::font_px(12.0))
                                 .text_color(ui::text_primary())
                                 .child(t("usageStats", "title")),
                         )
@@ -935,6 +937,10 @@ impl Render for Workspace {
             .flex()
             .bg(ui::bg_base())
             .text_color(ui::text_primary())
+            // 界面字族(`config.uiFontFamily`)。gpui 的 `font_family` 会**继承**给
+            // 所有没自己设过字族的子元素 —— 等价于原版把它写进 `--app-font-family`
+            // 这个 CSS 变量,一处替换全局跟随。字号那一路走 `ui::font_px`。
+            .when_some(ui::ui_font_family(), |el, family| el.font_family(family))
             // 主题包背景图:**窗口级**铺一张,与原版挂 `#root` 同位置 ——
             // 三栏都透着同一张图(面板底色带 surface_opacity、终端「默认背景不发
             // quad」,两条一起让图透上来)。
@@ -1025,64 +1031,10 @@ fn main() {
         // 免得从 init 到装配之间有一帧走 gpui-component 的默认亮色。
         gpui_component::Theme::change(gpui_component::ThemeMode::Dark, None, cx);
 
-        // 键位表的唯一事实来源是 `src/utils/hotkeys.ts`,逐条对齐。
-        //
-        // 应用级动作统一走 `Ctrl+Shift+*`(Windows Terminal / VS Code 终端的惯例)——
-        // 裸 Ctrl+B/Ctrl+T/Ctrl+W/Ctrl+P 在 shell 行编辑里都有既定语义,占了就是吞键;
-        // 只有确实不冲突的才用裸 Ctrl(Ctrl+Tab、Ctrl+1..9、Ctrl+,)。
-        //
-        // gpui 的按键派发**先匹配 action 绑定、后跑 key 监听**,所以这里绑上就等于
-        // 拿到了原版 capture 阶段 `consume(e)` 的效果:终端看不到这些键。
-        let mut bindings = vec![
-            KeyBinding::new("ctrl-shift-t", NewTerminal, Some("Workspace")),
-            KeyBinding::new("ctrl-shift-w", ClosePane, Some("Workspace")),
-            KeyBinding::new("ctrl-shift-d", SplitRight, Some("Workspace")),
-            KeyBinding::new("ctrl-shift-e", SplitDown, Some("Workspace")),
-            KeyBinding::new("ctrl-shift-b", ToggleMiddleColumn, Some("Workspace")),
-            KeyBinding::new("f2", RenamePane, Some("Workspace")),
-            KeyBinding::new("ctrl-,", OpenTerminalSettings, Some("Workspace")),
-            KeyBinding::new("ctrl-tab", NextPane, Some("Workspace")),
-            KeyBinding::new("ctrl-shift-tab", PrevPane, Some("Workspace")),
-            // 搜索三连(原版 hotkeys.ts 的 terminalSearch / globalSearch / switchProject)。
-            // 键位与原版逐条对齐:Ctrl+F 在终端里本是 `\x06`,原版同样把它整个吃掉
-            // (`consume(e)` 连 stopPropagation 一起),这里靠 action 绑定天然做到。
-            KeyBinding::new("ctrl-f", TerminalSearch, Some("Workspace")),
-            KeyBinding::new("ctrl-shift-f", GlobalSearch, Some("Workspace")),
-            KeyBinding::new("ctrl-shift-p", SwitchProject, Some("Workspace")),
-            // 项目切换器的方向键。谓词写成 `"ProjectSwitcher > Input"` 而不是
-            // `"ProjectSwitcher"` —— 只有与 `Input` **同深度**才压得过组件库自带的
-            // `up`/`down`(单行输入框那两个处理器直接 return,不 propagate,
-            // 挂在容器上的 on_key_down 永远收不到)。详见 project_switcher 模块注释,
-            // 机制有单测钉住。
-            KeyBinding::new(
-                "up",
-                project_switcher::SwitcherPrev,
-                Some("ProjectSwitcher > Input"),
-            ),
-            KeyBinding::new(
-                "down",
-                project_switcher::SwitcherNext,
-                Some("ProjectSwitcher > Input"),
-            ),
-            // 原版没有的三条,保留
-            KeyBinding::new("ctrl-shift-a", ToggleSessions, Some("Workspace")),
-            KeyBinding::new("ctrl-shift-u", ToggleUsage, Some("Workspace")),
-            KeyBinding::new("ctrl-shift-j", JumpAttention, Some("Workspace")),
-            KeyBinding::new("alt-left", FocusLeft, Some("Workspace")),
-            KeyBinding::new("alt-right", FocusRight, Some("Workspace")),
-            KeyBinding::new("alt-up", FocusUp, Some("Workspace")),
-            KeyBinding::new("alt-down", FocusDown, Some("Workspace")),
-        ];
-        // Ctrl+1..9:选中叶内第 N 个 tab(原版键位表里存的是占位串 '1…9',
-        // 由 useGlobalHotkeys 单独判 `/^[1-9]$/`)
-        for n in 1..=9usize {
-            bindings.push(KeyBinding::new(
-                &format!("ctrl-{n}"),
-                SelectPane(n),
-                Some("Workspace"),
-            ));
-        }
-        cx.bind_keys(bindings);
+        // 键位表的唯一事实来源在 [`hotkeys`](crate::hotkeys) —— 它同时喂给
+        // `bind_keys` 与设置面板的「快捷键」页,重演原版 `src/utils/hotkeys.ts`
+        // 的结构(此前这里是一串裸 `KeyBinding::new`,与设置页各写各的会漂移)。
+        hotkeys::bind_keys(cx);
 
         let config_store = if std::env::var_os("MT_APP_DATA_DIR").is_some() {
             // 隔离模式:配置也落在覆盖目录里,不碰装机版那份
@@ -1114,6 +1066,10 @@ fn main() {
         AppStore::set_global(cx.new(|cx| AppStore::new(config_store, ai_bridge, cx)), cx);
         // 往后所有视图都从 Global 取这一份 store(等价于 zustand 的 useAppStore)
         let store = AppStore::global(cx);
+
+        // 界面字号 / 字族同样要在**任何视图建出来之前**定下来:`ui::font_px` 读的是
+        // 进程级快照,晚一步首帧会按默认 13px 画出来再被刷一遍(闪一下)。
+        store.read(cx).apply_ui_font();
 
         // 主题必须在**起 PTY 之前**装配:新建终端拿的是 store 里那份终端配色,
         // 晚一步的话首批终端会以默认配色建出来,再被热更新刷一遍(闪一下)。

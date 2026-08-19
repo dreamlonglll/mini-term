@@ -78,12 +78,11 @@ pub fn resolve_appearance(theme: &str, cx: &App) -> Appearance {
 /// themes/ 目录。**走 [`crate::app_data_dir`] 而不是
 /// `mt_config::ThemePacks::open()`** —— 后者钉死在装机版目录上,
 /// `MT_APP_DATA_DIR` 隔离模式下会读到装机版的皮肤。
-fn theme_packs() -> mt_config::ThemePacks {
+pub fn theme_packs() -> mt_config::ThemePacks {
     mt_config::ThemePacks::at(crate::app_data_dir().join("themes"))
 }
 
 /// 可用的外置主题包(坏包跳过,设置页的皮肤列表用它)。
-#[allow(dead_code)] // 设置面板「外观」页的落点(下一批)
 pub fn list_packs() -> Vec<(ThemePackDef, std::path::PathBuf)> {
     theme_bridge::list_theme_packs(&theme_packs()).unwrap_or_else(|err| {
         eprintln!("[theme] 主题目录读取失败: {err:#}");

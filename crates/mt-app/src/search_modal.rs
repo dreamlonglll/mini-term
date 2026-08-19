@@ -341,7 +341,7 @@ fn highlighted(text: &str, ranges: &[(usize, usize)], size: f32) -> impl IntoEle
         row = row.child(
             div()
                 .flex_none()
-                .text_size(px(size))
+                .text_size(ui::font_px(size))
                 .when(hit, |el| {
                     el.px(px(1.0))
                         .rounded(px(4.0))
@@ -364,7 +364,7 @@ impl SearchModal {
                 .id(id)
                 .px(px(10.0))
                 .py(px(4.0))
-                .text_size(px(10.0))
+                .text_size(ui::font_px(10.0))
                 .cursor_pointer()
                 .when(active, |el| el.bg(ui::accent()).text_color(ui::bg_base()))
                 .when(!active, |el| {
@@ -390,7 +390,7 @@ impl SearchModal {
                     .gap(px(12.0))
                     .child(
                         div()
-                            .text_size(px(13.0))
+                            .text_size(ui::font_px(13.0))
                             .text_color(ui::accent())
                             .child(t("search", "title")),
                     )
@@ -427,7 +427,7 @@ impl SearchModal {
                 div()
                     .id("search-close")
                     .px(px(4.0))
-                    .text_size(px(15.0))
+                    .text_size(ui::font_px(15.0))
                     .text_color(ui::text_muted())
                     .cursor_pointer()
                     .hover(|el| el.text_color(ui::text_primary()))
@@ -463,7 +463,7 @@ impl SearchModal {
                     .py(px(6.0))
                     .rounded(px(4.0))
                     .border_1()
-                    .text_size(px(10.0))
+                    .text_size(ui::font_px(10.0))
                     .cursor_pointer()
                     .when(regex_on, |el| {
                         el.bg(ui::accent())
@@ -491,7 +491,7 @@ impl SearchModal {
                     .py(px(6.0))
                     .rounded(px(4.0))
                     .bg(ui::accent())
-                    .text_size(px(10.0))
+                    .text_size(ui::font_px(10.0))
                     .text_color(ui::bg_base())
                     .when(!can_search, |el| el.opacity(0.5))
                     .when(can_search, |el| {
@@ -558,7 +558,7 @@ impl SearchModal {
                 div()
                     .w(px(40.0))
                     .flex_none()
-                    .text_size(px(10.0))
+                    .text_size(ui::font_px(10.0))
                     .text_color(ui::text_muted())
                     .child(line_no),
             )
@@ -600,7 +600,7 @@ impl SearchModal {
             .child(
                 div()
                     .truncate()
-                    .text_size(px(10.0))
+                    .text_size(ui::font_px(10.0))
                     .text_color(ui::text_muted())
                     .child(path),
             )
@@ -628,7 +628,7 @@ impl Render for SearchModal {
                         .items_center()
                         .justify_center()
                         .h_full()
-                        .text_size(px(12.0))
+                        .text_size(ui::font_px(12.0))
                         .text_color(ui::text_muted())
                         .child(hint),
                 );
@@ -649,7 +649,7 @@ impl Render for SearchModal {
                         .px(px(16.0))
                         .py(px(6.0))
                         .bg(ui::bg_elevated())
-                        .text_size(px(10.0))
+                        .text_size(ui::font_px(10.0))
                         .text_color(ui::accent())
                         .child(div().flex_none().child(head))
                         .child(
@@ -677,7 +677,7 @@ impl Render for SearchModal {
                     .px(px(16.0))
                     .py(px(8.0))
                     .bg(ui::bg_elevated())
-                    .text_size(px(10.0))
+                    .text_size(ui::font_px(10.0))
                     .text_color(ui::color_warning())
                     .child(t("search", "truncated")),
             );
@@ -700,7 +700,7 @@ impl Render for SearchModal {
                     .py(px(6.0))
                     .border_t_1()
                     .border_color(ui::border_subtle())
-                    .text_size(px(10.0))
+                    .text_size(ui::font_px(10.0))
                     .text_color(ui::text_muted())
                     .child(status_text(
                         self.status,

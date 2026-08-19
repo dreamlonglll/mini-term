@@ -345,7 +345,7 @@ impl Render for ProjectList {
                             .child(
                                 div()
                                     .truncate()
-                                    .text_size(px(13.0))
+                                    .text_size(ui::font_px(13.0))
                                     .text_color(if is_active {
                                         ui::text_primary()
                                     } else {
@@ -356,7 +356,7 @@ impl Render for ProjectList {
                             .child(
                                 div()
                                     .truncate()
-                                    .text_size(px(11.0))
+                                    .text_size(ui::font_px(11.0))
                                     .text_color(ui::text_muted())
                                     .child(path),
                             ),
@@ -381,7 +381,7 @@ impl Render for ProjectList {
                             .items_center()
                             .justify_center()
                             .rounded(px(3.0))
-                            .text_size(px(12.0))
+                            .text_size(ui::font_px(12.0))
                             .text_color(ui::text_muted())
                             .hover(|el| el.text_color(ui::color_error()).bg(ui::bg_overlay()))
                             .on_click(cx.listener(move |this, _event, window, cx| {
@@ -424,7 +424,7 @@ impl Render for ProjectList {
                     .border_color(ui::border_subtle())
                     .child(
                         div()
-                            .text_size(px(11.0))
+                            .text_size(ui::font_px(11.0))
                             .text_color(ui::text_muted())
                             .child(t("panels", "projects")),
                     )

@@ -549,7 +549,7 @@ impl Render for FileTree {
             .py(px(6.0))
             .border_b_1()
             .border_color(ui::border_subtle())
-            .text_size(px(11.0))
+            .text_size(ui::font_px(11.0))
             .text_color(ui::text_muted())
             .child(t("panels", "files"));
 
@@ -669,7 +669,7 @@ impl FileTree {
             .pr(px(6.0))
             .py(px(2.0))
             .cursor_pointer()
-            .text_size(px(12.0))
+            .text_size(ui::font_px(12.0))
             .text_color(color)
             .hover(|el| el.bg(ui::bg_overlay()))
             .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _window, cx| {

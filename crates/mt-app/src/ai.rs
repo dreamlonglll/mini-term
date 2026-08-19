@@ -91,6 +91,21 @@ impl AiBridge {
         self.perception.hooks().get_port()
     }
 
+    /// 运行时开关 hook server(设置页「Hook 事件」的落点,原 `toggle_hook_server`)。
+    ///
+    /// **起服务器要绑端口 + 写 `hook-server.json`**,调用方一律丢
+    /// `cx.background_executor()`;成功了才写配置(原版 `handleToggleHook` 的同一
+    /// 顺序 —— 端口被占时配置不该记成「已开」)。
+    pub fn set_hook_enabled(&self, enabled: bool) -> Result<(), String> {
+        self.perception
+            .set_hook_server_enabled(&self.data_dir, enabled)
+    }
+
+    /// hook server 当前状态(原 `get_hook_status`)。纯内存读,不碰盘。
+    pub fn hook_status(&self) -> mt_ai::HookStatusInfo {
+        mt_ai::hook_server::hook_status(self.perception.hooks())
+    }
+
     /// 登记一个活着的 pane(新建 PTY 之后立刻调)。
     pub fn add_pane(&self, pane_id: u32) {
         let mut panes = self.live_panes.lock();

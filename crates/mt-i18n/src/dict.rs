@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 32;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 735;
+pub const ZH_ENTRY_COUNT: usize = 741;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 735;
+pub const EN_ENTRY_COUNT: usize = 741;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -969,12 +969,14 @@ static SETTINGS_ZH: &[(&str, &str)] = &[
     ("aiNotification.taskbarFlash", "任务栏闪烁"),
     ("aiNotification.taskbarFlashDesc", "窗口失焦时请求用户注意（Windows 闪烁任务栏，macOS 跳动 Dock）"),
     ("aiNotification.trigger", "触发时机"),
+    ("aiNotification.wavOnly", "当前仅支持 .wav 自定义提示音，其它格式会回落到系统提示音"),
     ("appearance.language", "语言"),
     ("appearance.languageLabel", "界面语言"),
     ("appearance.skin", "皮肤"),
     ("appearance.skinBlueprint", "蓝图"),
     ("appearance.skinDesc", "皮肤在深色 / 浅色之上换一整套配色与质感；开启「终端跟随主题」时终端配色也随之切换"),
     ("appearance.skinNone", "无"),
+    ("appearance.skinUnavailable", "GPUI 版尚未实现内置皮肤色表，当前一律按「无」渲染；外置皮肤不受影响"),
     ("appearance.terminalFollowTheme", "终端跟随主题"),
     ("appearance.terminalFollowThemeDesc", "关闭时终端始终使用深色方案"),
     ("appearance.theme", "主题"),
@@ -1023,6 +1025,7 @@ static SETTINGS_ZH: &[(&str, &str)] = &[
     ("font.ligaturesDescPrefix", "开启后 "),
     ("font.ligaturesDescSuffix", " 等会合成 ligature glyph，需字体本身含 calt 表（如 Fira Code、JetBrains Mono）· Windows 完整支持；macOS / Linux 受 webview API 限制，仅 ~60 条内置 Iosevka fallback"),
     ("font.ligaturesTitle", "启用终端连体字 (ligatures)"),
+    ("font.ligaturesUnavailable", "GPUI 版终端是自绘渲染器，按「一个字符一列」摆放，暂不支持连体字"),
     ("font.terminalFont", "终端字体"),
     ("font.terminalFontSize", "终端字体大小"),
     ("font.uiFont", "界面字体"),
@@ -1054,6 +1057,7 @@ static SETTINGS_ZH: &[(&str, &str)] = &[
     ("shortcuts.focusUp", "焦点移到上方分屏"),
     ("shortcuts.footer", "输入框获得焦点时，应用级快捷键让位给输入；「复制粘贴」仅在终端内生效"),
     ("shortcuts.global", "全局"),
+    ("shortcuts.jumpAttention", "跳到下一件待办"),
     ("shortcuts.jumpNextAi", "跳转到下一个 AI 任务提交"),
     ("shortcuts.jumpPrevAi", "跳转到上一个 AI 任务提交"),
     ("shortcuts.navigation", "导航"),
@@ -1070,7 +1074,9 @@ static SETTINGS_ZH: &[(&str, &str)] = &[
     ("shortcuts.terminalOps", "终端操作"),
     ("shortcuts.terminalSearch", "在当前终端中查找"),
     ("shortcuts.toggleGlobalSearch", "打开/关闭全局搜索"),
+    ("shortcuts.toggleSessions", "开合 AI 会话面板"),
     ("shortcuts.toggleSidebar", "折叠/展开侧栏"),
+    ("shortcuts.toggleUsage", "开合用量统计面板"),
     ("system.aiAutoResumeDesc", "恢复上次布局后，自动在终端里执行 claude --resume / codex resume 续接退出前的会话；关闭后终端照常恢复，只是不自动跑续接命令（仍可在「会话」面板手动恢复）"),
     ("system.aiAutoResumeTitle", "启动时自动续接 AI 会话"),
     ("system.startupGroup", "启动"),
@@ -1156,12 +1162,14 @@ static SETTINGS_EN: &[(&str, &str)] = &[
     ("aiNotification.taskbarFlash", "Taskbar flash"),
     ("aiNotification.taskbarFlashDesc", "Request attention when the window is unfocused (flash taskbar on Windows, bounce Dock on macOS)"),
     ("aiNotification.trigger", "Trigger"),
+    ("aiNotification.wavOnly", "Only .wav custom sounds are supported for now; other formats fall back to the system beep"),
     ("appearance.language", "Language"),
     ("appearance.languageLabel", "Interface language"),
     ("appearance.skin", "Skin"),
     ("appearance.skinBlueprint", "Blueprint"),
     ("appearance.skinDesc", "A skin swaps the whole palette and texture on top of light / dark; the terminal palette follows too while \"Terminal follows theme\" is on"),
     ("appearance.skinNone", "None"),
+    ("appearance.skinUnavailable", "The GPUI build has no built-in skin palettes yet; everything renders as \"None\". External theme packs are unaffected"),
     ("appearance.terminalFollowTheme", "Terminal follows theme"),
     ("appearance.terminalFollowThemeDesc", "When off, the terminal always uses the dark scheme"),
     ("appearance.theme", "Theme"),
@@ -1210,6 +1218,7 @@ static SETTINGS_EN: &[(&str, &str)] = &[
     ("font.ligaturesDescPrefix", "When enabled, "),
     ("font.ligaturesDescSuffix", " and similar combine into ligature glyphs. The font itself must include a calt table (e.g. Fira Code, JetBrains Mono) · Fully supported on Windows; on macOS / Linux, webview API limits restrict it to ~60 built-in Iosevka fallbacks"),
     ("font.ligaturesTitle", "Enable terminal ligatures"),
+    ("font.ligaturesUnavailable", "The GPUI terminal draws glyphs itself, one character per column, so ligatures are not supported yet"),
     ("font.terminalFont", "Terminal font"),
     ("font.terminalFontSize", "Terminal font size"),
     ("font.uiFont", "UI font"),
@@ -1241,6 +1250,7 @@ static SETTINGS_EN: &[(&str, &str)] = &[
     ("shortcuts.focusUp", "Focus pane above"),
     ("shortcuts.footer", "App shortcuts yield to text fields while typing; \"Copy & paste\" applies inside the terminal only"),
     ("shortcuts.global", "Global"),
+    ("shortcuts.jumpAttention", "Jump to the next pending task"),
     ("shortcuts.jumpNextAi", "Jump to next AI task commit"),
     ("shortcuts.jumpPrevAi", "Jump to previous AI task commit"),
     ("shortcuts.navigation", "Navigation"),
@@ -1257,7 +1267,9 @@ static SETTINGS_EN: &[(&str, &str)] = &[
     ("shortcuts.terminalOps", "Terminal actions"),
     ("shortcuts.terminalSearch", "Find in current terminal"),
     ("shortcuts.toggleGlobalSearch", "Toggle global search"),
+    ("shortcuts.toggleSessions", "Toggle the AI session panel"),
     ("shortcuts.toggleSidebar", "Toggle sidebar"),
+    ("shortcuts.toggleUsage", "Toggle the usage stats panel"),
     ("system.aiAutoResumeDesc", "After the previous layout is restored, run claude --resume / codex resume in the terminal to continue the session you left off. Turn off and terminals still come back — they just don't run the resume command (you can still resume manually from the Sessions panel)"),
     ("system.aiAutoResumeTitle", "Auto-resume AI session on startup"),
     ("system.startupGroup", "Startup"),

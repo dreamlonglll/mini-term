@@ -35,6 +35,7 @@ use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
 use parking_lot::Mutex;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// 把 alacritty 整个重新导出。渲染层(`mt-ui`)要用 `Cell` / `Flags` / `Color` /
 /// `TermMode` / `Selection` 这些类型,统一从这里取,避免各 crate 各自写一份
@@ -101,17 +102,57 @@ pub struct TerminalEmulator {
     term: Arc<Mutex<Term<EventQueue>>>,
     parser: Mutex<Processor>,
     events: EventQueue,
+    /// 当前的回滚行数。**自己记一份**:`Term` 的 `config` 字段是私有的、
+    /// alacritty 也没给读回口,而 [`Self::set_scrollback`] 要靠它做「值没变就不动」
+    /// 的短路(`set_options` 会把整屏标脏并发一次 title 事件)。
+    scrollback: AtomicUsize,
 }
 
 impl TerminalEmulator {
+    /// 用 alacritty 的默认回滚行数(10000 行)建一个。
     pub fn new(size: TermSize) -> Self {
+        Self::with_scrollback(size, Config::default().scrolling_history)
+    }
+
+    /// 指定回滚行数(`config.terminalScrollback`)。
+    ///
+    /// **必须在建终端时就喂进去**:`scrolling_history` 决定 grid 的历史容量,
+    /// 默认值(10000)与配置默认值撞上纯属巧合 —— 用户把它调到 5 万,
+    /// 不喂的话新终端照样只留 1 万行。
+    pub fn with_scrollback(size: TermSize, scrollback: usize) -> Self {
         let events = EventQueue::default();
-        let term = Term::new(Config::default(), &size, events.clone());
+        let config = Config {
+            scrolling_history: scrollback,
+            ..Config::default()
+        };
+        let term = Term::new(config, &size, events.clone());
         Self {
             term: Arc::new(Mutex::new(term)),
             parser: Mutex::new(Processor::new()),
             events,
+            scrollback: AtomicUsize::new(scrollback),
         }
+    }
+
+    /// 当前的回滚行数。
+    pub fn scrollback(&self) -> usize {
+        self.scrollback.load(Ordering::Relaxed)
+    }
+
+    /// 热改回滚行数(设置页改动那一刻)。
+    ///
+    /// 走 `Term::set_options`,它内部会 `grid.update_history` —— 调小时**当场**
+    /// 裁掉多余历史并释放内存(与原版 `updateAllTerminalScrollback` 同效果)。
+    /// 值没变就不动:`set_options` 会把整屏标脏并发一次 title 事件。
+    pub fn set_scrollback(&self, scrollback: usize) {
+        if self.scrollback.swap(scrollback, Ordering::Relaxed) == scrollback {
+            return;
+        }
+        let config = Config {
+            scrolling_history: scrollback,
+            ..Config::default()
+        };
+        self.term.lock().set_options(config);
     }
 
     /// 把刚从 PTY 读到的字节推进状态机。直接接 [`mt_pty::PtySession::spawn`]
@@ -157,6 +198,12 @@ impl TerminalEmulator {
         f(&mut self.term.lock())
     }
 
+    /// 历史区里存着的行数(不含可视区)。回滚行数的验收口。
+    pub fn history_lines(&self) -> usize {
+        let term = self.term.lock();
+        term.grid().total_lines().saturating_sub(term.grid().screen_lines())
+    }
+
     /// 可视区逐行文本(行尾空格已裁掉)。
     ///
     /// 这是**给测试与诊断用的**读回口:PTY 里跑一条 `echo`,从这里断言回显成立,
@@ -200,5 +247,58 @@ impl TerminalEmulator {
             }
         }
         rows
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 往终端里推 `n` 行文本。
+    fn feed_lines(e: &TerminalEmulator, n: usize) {
+        for i in 0..n {
+            e.advance(format!("line{i}\r\n").as_bytes());
+        }
+    }
+
+    /// 回滚行数**建终端时就要生效**:默认值(10000)与配置默认值撞上纯属巧合,
+    /// 不喂进 `term::Config` 的话用户调高/调低都没效果。
+    #[test]
+    fn 回滚行数在建终端时生效() {
+        let e = TerminalEmulator::with_scrollback(TermSize::new(20, 4), 2);
+        assert_eq!(e.scrollback(), 2);
+        feed_lines(&e, 20);
+        // 历史区被 scrolling_history 封顶
+        assert_eq!(e.history_lines(), 2);
+    }
+
+    /// 热改回滚行数:**调小时当场裁掉多余历史**(设置页那一刻就释放内存,
+    /// 与原版 `updateAllTerminalScrollback` 同效果)。
+    #[test]
+    fn 热改回滚行数当场裁历史() {
+        let e = TerminalEmulator::with_scrollback(TermSize::new(20, 4), 50);
+        feed_lines(&e, 30);
+        let before = e.history_lines();
+        assert!(before > 3, "先攒出一段历史,实际 {before}");
+
+        e.set_scrollback(3);
+        assert_eq!(e.scrollback(), 3);
+        assert_eq!(e.history_lines(), 3, "调小后历史必须当场被裁到新上限");
+
+        // 调大不会凭空长出历史,但上限跟着变
+        e.set_scrollback(40);
+        assert_eq!(e.scrollback(), 40);
+        assert_eq!(e.history_lines(), 3);
+    }
+
+    /// 值没变就不动 —— `set_options` 会把整屏标脏并发一次 title 事件。
+    #[test]
+    fn 回滚行数没变时不重设() {
+        let e = TerminalEmulator::with_scrollback(TermSize::new(20, 4), 10);
+        let _ = e.events().drain();
+        e.set_scrollback(10);
+        assert!(e.events().drain().is_empty(), "同值 set 不该发事件");
+        e.set_scrollback(11);
+        assert!(!e.events().drain().is_empty(), "值变了才走 set_options");
     }
 }

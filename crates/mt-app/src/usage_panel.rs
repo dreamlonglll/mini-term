@@ -1416,13 +1416,13 @@ fn kpi(
                 .min_w(px(0.0))
                 .child(
                     div()
-                        .text_size(px(10.0))
+                        .text_size(ui::font_px(10.0))
                         .text_color(ui::text_muted())
                         .child(label.to_string()),
                 )
                 .child(
                     div()
-                        .text_size(px(20.0))
+                        .text_size(ui::font_px(20.0))
                         .truncate()
                         .text_color(value_color)
                         .child(value),
@@ -1461,7 +1461,7 @@ fn rank_row(
                 .flex_1()
                 .min_w(px(0.0))
                 .truncate()
-                .text_size(px(13.0))
+                .text_size(ui::font_px(13.0))
                 .text_color(ui::text_secondary())
                 .child(label),
         )
@@ -1490,7 +1490,7 @@ fn rank_row(
             div()
                 .flex_none()
                 .min_w(px(56.0))
-                .text_size(px(13.0))
+                .text_size(ui::font_px(13.0))
                 .text_color(ui::text_primary())
                 .child(primary),
         )
@@ -1499,7 +1499,7 @@ fn rank_row(
                 div()
                     .flex_none()
                     .min_w(px(40.0))
-                    .text_size(px(11.0))
+                    .text_size(ui::font_px(11.0))
                     .text_color(ui::text_muted())
                     .child(s),
             )
@@ -1542,7 +1542,7 @@ fn state_hint(
         })
         .child(
             div()
-                .text_size(px(13.0))
+                .text_size(ui::font_px(13.0))
                 .text_color(ui::text_secondary())
                 .child(text.to_string()),
         )
@@ -1552,7 +1552,7 @@ fn state_hint(
                     .id("usage-state-detail")
                     .max_w(px(480.0))
                     .truncate()
-                    .text_size(px(11.0))
+                    .text_size(ui::font_px(11.0))
                     .text_color(ui::text_muted())
                     // 截断之后 hover 出全文(原版靠 `title=`)
                     .tooltip({
@@ -1601,14 +1601,14 @@ impl Render for UsagePanel {
                 .justify_between()
                 .child(
                     div()
-                        .text_size(px(12.0))
+                        .text_size(ui::font_px(12.0))
                         .text_color(ui::text_secondary())
                         .child(format!("{} · {}", self.scope.label(), self.range.label())),
                 )
                 .when_some(self.progress, |el, (processed, total)| {
                     el.child(
                         div()
-                            .text_size(px(11.0))
+                            .text_size(ui::font_px(11.0))
                             .text_color(ui::text_muted())
                             .child(format!(
                                 "{} {}",
@@ -1784,7 +1784,7 @@ impl UsagePanel {
                         // 日期分隔符不进字典(原版 `:434` 就是裸字面量)
                         .child(
                             div()
-                                .text_size(px(11.0))
+                                .text_size(ui::font_px(11.0))
                                 .text_color(ui::text_muted())
                                 .child("–"),
                         )
@@ -1943,7 +1943,7 @@ impl UsagePanel {
             .items_center()
             .gap(px(12.0))
             .px(px(4.0))
-            .text_size(px(13.0))
+            .text_size(ui::font_px(13.0))
             .text_color(ui::text_muted());
         for (i, (v, key)) in [
             (stats.input_tokens, "tokens.in"),
@@ -2188,7 +2188,7 @@ impl UsagePanel {
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_size(px(13.0))
+                .text_size(ui::font_px(13.0))
                 .text_color(ui::text_muted())
                 .child(t("usageStats", "noDailyData"))
                 .into_any_element();
@@ -2211,19 +2211,19 @@ impl UsagePanel {
                 .gap(px(6.0))
                 .child(
                     div()
-                        .text_size(px(11.0))
+                        .text_size(ui::font_px(11.0))
                         .text_color(ui::text_muted())
                         .child(d.date.clone()),
                 )
                 .child(
                     div()
-                        .text_size(px(30.0))
+                        .text_size(ui::font_px(30.0))
                         .text_color(ui::accent())
                         .child(format_cost(d.cost)),
                 )
                 .child(
                     div()
-                        .text_size(px(13.0))
+                        .text_size(ui::font_px(13.0))
                         .text_color(ui::text_secondary())
                         .child(tr!(
                             "usageStats",
@@ -2297,7 +2297,7 @@ impl UsagePanel {
                 div()
                     .flex()
                     .justify_between()
-                    .text_size(px(9.0))
+                    .text_size(ui::font_px(9.0))
                     .text_color(ui::text_muted())
                     .child(buckets.first().map(|d| d.date.clone()).unwrap_or_default())
                     // 双轴的量纲:左 = 成本峰值,右 = 调用数峰值
@@ -2359,7 +2359,7 @@ impl UsagePanel {
                             .flex_none()
                             .w(px(76.0))
                             .truncate()
-                            .text_size(px(11.0))
+                            .text_size(ui::font_px(11.0))
                             .text_color(ui::text_muted())
                             .child(s.timestamp.clone()),
                     )
@@ -2368,7 +2368,7 @@ impl UsagePanel {
                             .flex_none()
                             .w(px(150.0))
                             .truncate()
-                            .text_size(px(13.0))
+                            .text_size(ui::font_px(13.0))
                             .text_color(ui::text_secondary())
                             .child(s.project_name.clone()),
                     )
@@ -2377,7 +2377,7 @@ impl UsagePanel {
                             .flex_1()
                             .min_w(px(0.0))
                             .truncate()
-                            .text_size(px(13.0))
+                            .text_size(ui::font_px(13.0))
                             .text_color(ui::text_primary())
                             .child(title),
                     )
@@ -2405,7 +2405,7 @@ impl UsagePanel {
                         div()
                             .flex_none()
                             .min_w(px(56.0))
-                            .text_size(px(13.0))
+                            .text_size(ui::font_px(13.0))
                             .text_color(ui::text_primary())
                             .child(format_cost(s.cost)),
                     )
@@ -2413,7 +2413,7 @@ impl UsagePanel {
                         div()
                             .flex_none()
                             .min_w(px(48.0))
-                            .text_size(px(11.0))
+                            .text_size(ui::font_px(11.0))
                             .text_color(ui::text_muted())
                             .child(format_count(s.calls)),
                     ),
@@ -2440,7 +2440,7 @@ impl UsagePanel {
             body = body.child(
                 div()
                     .py(px(12.0))
-                    .text_size(px(12.0))
+                    .text_size(ui::font_px(12.0))
                     .text_color(ui::text_muted())
                     .child(t("sessionViewer", "loading")),
             );
@@ -2449,7 +2449,7 @@ impl UsagePanel {
             body = body.child(
                 div()
                     .py(px(12.0))
-                    .text_size(px(12.0))
+                    .text_size(ui::font_px(12.0))
                     .text_color(ui::color_error())
                     .child(err.clone()),
             );
@@ -2470,7 +2470,7 @@ impl UsagePanel {
                     })
                     .child(
                         div()
-                            .text_size(px(10.0))
+                            .text_size(ui::font_px(10.0))
                             .text_color(ui::text_muted())
                             // 旧版 `SessionViewerModal.tsx` 这两个角色名就是硬编码的
                             // 英文字面量(不进字典),照抄
@@ -2478,7 +2478,7 @@ impl UsagePanel {
                     )
                     .child(
                         div()
-                            .text_size(px(12.0))
+                            .text_size(ui::font_px(12.0))
                             .text_color(ui::text_secondary())
                             .child(msg.content.clone()),
                     ),
@@ -2512,7 +2512,7 @@ impl UsagePanel {
                         div()
                             .flex_1()
                             .overflow_hidden()
-                            .text_size(px(12.0))
+                            .text_size(ui::font_px(12.0))
                             .text_color(ui::text_primary())
                             .child(title),
                     ),
@@ -2528,7 +2528,7 @@ fn empty_hint() -> Div {
         .py(px(32.0))
         .flex()
         .justify_center()
-        .text_size(px(13.0))
+        .text_size(ui::font_px(13.0))
         .text_color(ui::text_muted())
         .child(t("usageStats", "noSessions"))
 }
@@ -2558,7 +2558,7 @@ fn segment(id: SharedString, label: &str, active: bool) -> Stateful<Div> {
         .id(id)
         .px(px(10.0))
         .py(px(4.0))
-        .text_size(px(11.0))
+        .text_size(ui::font_px(11.0))
         .flex_none()
         .cursor_pointer()
         .when(active, |el| el.bg(ui::accent()).text_color(ui::bg_base()))
@@ -2584,7 +2584,7 @@ fn dropdown(id: &'static str, label: String, max_w: gpui::Pixels) -> Stateful<Di
         .border_1()
         .border_color(ui::border_default())
         .bg(ui::bg_base())
-        .text_size(px(11.0))
+        .text_size(ui::font_px(11.0))
         .text_color(ui::text_secondary())
         .cursor_pointer()
         .hover(|el| el.border_color(ui::accent()))
@@ -2647,7 +2647,7 @@ impl ChartTip {
             .child(
                 div()
                     .mb(px(6.0))
-                    .text_size(px(11.0))
+                    .text_size(ui::font_px(11.0))
                     .text_color(ui::text_primary())
                     .child(self.date.clone()),
             );
@@ -2658,7 +2658,7 @@ impl ChartTip {
                     .items_center()
                     .gap(px(8.0))
                     .py(px(1.0))
-                    .text_size(px(11.0))
+                    .text_size(ui::font_px(11.0))
                     .child(
                         div()
                             .flex_none()

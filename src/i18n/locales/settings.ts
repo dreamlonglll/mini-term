@@ -60,6 +60,7 @@ export const settings = {
       skinNone: "无",
       skinBlueprint: "蓝图",
       skinDesc: "皮肤在深色 / 浅色之上换一整套配色与质感；开启「终端跟随主题」时终端配色也随之切换",
+      skinUnavailable: "GPUI 版尚未实现内置皮肤色表，当前一律按「无」渲染；外置皮肤不受影响",
     },
     system: {
       trayGroup: "状态栏",
@@ -112,6 +113,7 @@ export const settings = {
       fontFamilyFooterSuffix: "）",
       ligaturesDescPrefix: "开启后 ",
       ligaturesDescSuffix: " 等会合成 ligature glyph，需字体本身含 calt 表（如 Fira Code、JetBrains Mono）· Windows 完整支持；macOS / Linux 受 webview API 限制，仅 ~60 条内置 Iosevka fallback",
+      ligaturesUnavailable: "GPUI 版终端是自绘渲染器，按「一个字符一列」摆放，暂不支持连体字",
     },
     aiHook: {
       title: "AI Hook 事件",
@@ -154,6 +156,7 @@ export const settings = {
       attention: "待确认时也提醒",
       attentionDesc: "AI 停下来等你批准工具权限、填 MCP 表单，或这一轮因 API 错误结束时，按上面的方式提醒一次（与项目行的黄灯同一判定）",
       attentionFooter: "同一次待确认只提醒一次；你对该终端键入即视为已在处理，下一次请求才会再响",
+      wavOnly: "当前仅支持 .wav 自定义提示音，其它格式会回落到系统提示音",
     },
     about: {
       versionInfo: "版本信息",
@@ -197,6 +200,9 @@ export const settings = {
       copySelected: "复制终端选中文本",
       pasteToTerminal: "粘贴到终端",
       copyDesc: "复制选中文本（无选区时中断程序）",
+      toggleSessions: "开合 AI 会话面板",
+      toggleUsage: "开合用量统计面板",
+      jumpAttention: "跳到下一件待办",
       footer: "输入框获得焦点时，应用级快捷键让位给输入；「复制粘贴」仅在终端内生效",
     },
     menu: {
@@ -280,6 +286,7 @@ export const settings = {
       skinNone: "None",
       skinBlueprint: "Blueprint",
       skinDesc: "A skin swaps the whole palette and texture on top of light / dark; the terminal palette follows too while \"Terminal follows theme\" is on",
+      skinUnavailable: "The GPUI build has no built-in skin palettes yet; everything renders as \"None\". External theme packs are unaffected",
     },
     system: {
       trayGroup: "Status bar",
@@ -332,6 +339,7 @@ export const settings = {
       fontFamilyFooterSuffix: ")",
       ligaturesDescPrefix: "When enabled, ",
       ligaturesDescSuffix: " and similar combine into ligature glyphs. The font itself must include a calt table (e.g. Fira Code, JetBrains Mono) · Fully supported on Windows; on macOS / Linux, webview API limits restrict it to ~60 built-in Iosevka fallbacks",
+      ligaturesUnavailable: "The GPUI terminal draws glyphs itself, one character per column, so ligatures are not supported yet",
     },
     aiHook: {
       title: "AI hook events",
@@ -374,6 +382,7 @@ export const settings = {
       attention: "Also alert when waiting for you",
       attentionDesc: "Alert once (using the methods above) when the AI stops to ask for tool permission, needs an MCP form filled in, or ends a turn on an API error — same rule as the amber dot on the project row",
       attentionFooter: "One alert per pending request; typing into that terminal counts as handling it, so only the next request alerts again",
+      wavOnly: "Only .wav custom sounds are supported for now; other formats fall back to the system beep",
     },
     about: {
       versionInfo: "Version info",
@@ -417,6 +426,9 @@ export const settings = {
       copySelected: "Copy selected terminal text",
       pasteToTerminal: "Paste into terminal",
       copyDesc: "Copy selected text (interrupt program when no selection)",
+      toggleSessions: "Toggle the AI session panel",
+      toggleUsage: "Toggle the usage stats panel",
+      jumpAttention: "Jump to the next pending task",
       footer: "App shortcuts yield to text fields while typing; \"Copy & paste\" applies inside the terminal only",
     },
     menu: {
