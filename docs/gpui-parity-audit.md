@@ -62,7 +62,7 @@
 | 27 | **Git 全套 UI**：GitChanges/GitHistory/CommitDiffModal/DiffModal/GitWorktreeModal + 右抽屉 sessions⇄git 互斥切换（后端 git.rs 1559 行已就绪）。~~BranchFamilyPanel~~ 系审计误归——它是 AI 会话家族树（scan_session_lineage），已划回 #18 的 fork 批遗留 | 大 | mt-app | ✅ V 批（`a7e9e85`，合并 `9c70bde`）。六组件+拓扑图+pty-output 输出旁路全落地；遗留两入口转 Y 批：FileTree「查看变更」与项目列表「Worktrees」（open_file_diff/git_worktree::open 已就绪，只差菜单项+菜单序断言同步） |
 | 28 | **SSH 全套 UI**：SshModal/SshAssocModal/AddRemoteProjectModal/远程项目/断线重连覆盖层/exitedPtyIds 体系（依赖 mt-ssh 进 crates/，属收尾阶段联动件） | 大 | mt-app | ❌ |
 | 29 | 文件预览与编辑器（FileViewerModal/CodeEditor） | 大 | mt-app | ✅ AA 批（合并 `a2295a5`）。tree-sitter 多语言高亮（cc 降级 1.2.67 解锁）、CRLF 往返真文件测试钉住、SearchModal/文件树两入口回接。剩记档：Markdown 链接/跳转历史栈整块缺（gpui-component 链接无回调口，待上游）、HTML 只源码态、avif 兜底「默认工具打开」 |
-| 30 | 壳层杂项：关窗确认（盘点活 AI 会话列名）+ 版本检查/更新提醒 + FirstRunGuide 完整版（两入口+键位提示）+ 长文本粘贴转文件（4 配置字段已在）+ WSL 启动器重写提示 + 启动埋点 + dirKinds 技术栈探测缓存 + pane 进场动画 | 中 | mt-app | 🟡 Z 批（合并 `2dbc52f`）落地：关窗确认（on_window_should_close→allow_close 单闸+FORCE_CLOSE）、自建 toast 体系（替换 Notification，右下角起堆）、双音 WAV 合成、长粘贴转文件（SSH 分支随 #28）、WSL 覆盖提示、smartCopyPaste。剩（清尾批）：版本自检+边条红点（settings.rs 的 check_update 已就绪只差启动跑一次）、FirstRunGuide、启动埋点、dirKinds 探测、pane 进场动画 |
+| 30 | 壳层杂项：关窗确认（盘点活 AI 会话列名）+ 版本检查/更新提醒 + FirstRunGuide 完整版（两入口+键位提示）+ 长文本粘贴转文件（4 配置字段已在）+ WSL 启动器重写提示 + 启动埋点 + dirKinds 技术栈探测缓存 + pane 进场动画 | 中 | mt-app | 🟡 Z 批（合并 `2dbc52f`）：关窗确认、自建 toast、双音 WAV、长粘贴转文件（SSH 分支随 #28）、WSL 覆盖提示、smartCopyPaste。tail-shell 批（`5b98de1`）：版本自检+ActivityBar 更新按钮（纠正口径：原版是**有新版本才出现的独立按钮**非设置钮红点，圆点闪烁待 reduce 闸）、FirstRunGuide（🟡 缺 SSH 远程入口随 #28）、启动埋点（本地 stderr 计时非遥测，单进程砍掉 epoch 对齐半场）。剩：dirKinds 探测（tail-lists 批）、pane 进场动画（tail-anim 批） |
 
 ### 其他细项（散落，随所在批次带走）
 
@@ -72,8 +72,8 @@
 - ~~Modal 行为：无 overlayStack 快捷键让路；同一 modal 可叠开（缺 isOpen 守卫）~~ ✅ N 批（防叠开）+ P 批（让路）：`overlay.rs` 是唯一的覆盖物栈，弹窗/右键菜单/终端查找条全部登记；全局 action 处理器开头两道闸——① `has_focused_input`（等价原版 `isTypingTarget`，终端不是 Input 所以在终端里敲字不受影响）② 覆盖物压着让路，白名单只有 openSettings / globalSearch。**Esc 只关最上层在 GPUI 里是结构性免费的**（按键沿焦点链派发），原版那套栈顶判定不必复刻
 - store 缺失 action：renameProject / setProjectDescription / renamePaneById / exitedPtyIds 系列 / markers 系列 / dirKinds / pendingFork 系列 / collectAiProjects / addProject 的 parentProjectId
 - 提示音：Win32 PlaySoundW 只认 .wav（原版支持 mp3/ogg）；无自定义音时回落 MessageBeep 而非原版 880→660Hz 双音
-- 空态右键弹 shell 菜单；tab 键盘可达（Enter/Space）
-- 孤儿 PTY 回收（kill_all_ptys 等价物）：GPUI 单进程风险低，崩溃重启场景仍有
+- ~~空态右键弹 shell 菜单~~ ✅ tail-shell 批（`5b98de1`）——审计口径纠正：原版无空态右键处理（main.tsx 全局 preventDefault），实为空态「+ 新建终端」按钮**左键**弹 shell 菜单，已与 tab 栏「+」同源实现；tab 键盘可达（Enter/Space）随 tail-lists 批
+- ~~孤儿 PTY 回收~~ **已评估不做**（tail-shell 批）：GPUI 单进程无「页面重载旧 PTY 失引用」链路（PtyManager 注册表结构性缺席+TerminalPane/PtySession 双层 Drop+异常退出由内核收 HPCON/管道句柄、conhost 自退）；脱离控制台的孙进程两侧同款管不到，非迁移缺口
 - 链接点击（OSC 8/URL）：**两侧都没有**，非迁移缺口，不追
 
 ### 已排除的伪缺口（审计纠错，别再当任务）
