@@ -134,6 +134,27 @@
   - 遗留：SearchModal 点结果依赖 `FileViewerModal`（#29）未迁移，现退到外部编辑器打开；结果列表无虚拟化；分组头无 sticky；`ProjectSwitcher` 面板高度按候选条数估算（`Dialog` 只吃固定高度，没有 `max-h` 语义）。
 - **N 批（2bb0205 后）记档**：mt-project 无 reveal 语义（mt-app 自落 explorer `/select,` 走 raw_arg 防空格路径二次转义，建议上收 mt_project::editor）；`fs::delete_entry` 是硬删非回收站（文案「无法撤销」相符，后续可接 trash crate）；gpui-component `InputState::select_all` 是 pub(super)，prompt 默认值全选做不到；菜单键盘方向键导航/进场动画未做。
 
+## Wave 5 批次排程（2026-08-19 主会话规划；当前为用户指示的暂停点，下午继续）
+
+编排规矩（用户指令，已入长期记忆）：开发一律 Opus subagent；同时运行 subagent **≤3**；后台静默等通知、不主动读运行中 agent 输出；禁止 agent 套娃派子 agent；不做 E2E。节奏：交付 → 主会话独立复跑测试验收 → 提交 → 补位派下一批。跑 dev 实例给用户看效果用 `MT_APP_DATA_DIR=%LOCALAPPDATA%\mini-term-gpui-dev`。
+
+| 批 | 内容（审计条目） | 任务书（docs/batch-specs/） | 派发前决策 / 前置 |
+|---|---|---|---|
+| R | 设置面板 9 分页 + skin 色表（#19 + #5 剩余） | settings-pages.md | 连字/皮肤两段置灰或不渲染（底层无能力）；UI 字号字族建 thread_local 快照真接上；about 页 HTTP 复用 zed-reqwest（Q 批已引入）；Toggle/NumberRow 等原语自绘，勿用 gpui-component Switch/setting |
+| S | 自定义标题栏（#20） | titlebar-shell-misc.md §A | TitlebarOptions.appears_transparent + window_control_area 直翻 HTCAPTION 系；关闭键禁自挂 on_click→remove_window（绕过关窗确认钩子）；项目胶囊需 collectAiProjects 等价物（与 T 批共用，见 tray.md §9） |
+| T | 系统托盘（#21） | tray.md | Win32 直写 Shell_NotifyIconW（不引 tray-icon）；mt-app 的 windows 依赖加 Win32_UI_Shell + Win32_Graphics_Gdi feature；HICON 换图必 DestroyIcon |
+| U | 移动端中转（#22） | mobile-relay.md | 根 Cargo.toml 加 `qrcode = { version="0.14", default-features=false }`（主会话动手）+ 自绘渲染（静区1/EC-M）；shell 下拉走自建 menu.rs；start_session 内层 Result 外层统一回执 |
+| V | Git 全套 UI（#27） | git-ui.md | pty-output 观察点方案先定（输出旁路 / .git FsWatcher / 手动刷新），与 Y 批 git 着色共用；悬浮层壳已就位（Q 批），补 sessions⇄git 分段与 ✕；git.rs 阻塞调用全丢后台（git_commit 无超时）；大 diff 用 uniform_list |
+| W | marker 体系（#25） | markers-fileviewer.md §A | 锚点漂移补路二选一（文本重定位 / 饱和剪枝）；alt screen 不打点是正确行为 |
+| X | 拖放基建 + 项目分组（#8 + #13） | dnd-groups-lists.md §A/§B | gpui 内外拖同一套 on_drop API（原版两套 pointer 脚手架不搬）；on_drop 不带位置，before/inside/after 由 on_drag_move 存 view state |
+| Y | 三列表收尾（#12/#14/#15/#9 剩余） | dnd-groups-lists.md §C/§D/§E | 重命名从 N 批弹窗改回行内编辑（顺带解 select_all 记档）；git 着色的 pty-output 触发必须 isAiPty 跳过 |
+| Z | 壳层杂项 + Toast + 提示音（#30 + 细项） | titlebar-shell-misc.md §B/§C | 关窗确认=同步钩子返 false + 弹框 + force_close 标志再 remove_window；自建 toast.rs（gpui-component Notification 四条结构性缺口）；双音走内存合成 WAV + PlaySoundW(SND_MEMORY|SND_ASYNC)，Beep 会阻塞 UI 线程 |
+| AA | 文件预览与编辑器（#29） | markers-fileviewer.md §B | CRLF 往返必实测；tree-sitter-languages feature 依赖决议（不开只有 JSON 一种语言，开了拖 30 个 cc crate，主会话拍板）；落地后回接 SearchModal 结果点击与文件树打开 |
+| 收尾-1 | mt-core/mt-ssh 进 crates/ + 三方复刻去重 | 本文档技术债段 | BB 的前置；含 mt-sidecars path 依赖与 stage-sidecars.mjs 联动 |
+| BB | SSH 全套 UI（#28） | 未提取（届时补规格） | 依赖收尾-1 |
+
+另注：**fork 批**（BranchFamilyPanel + menu.rs 扩自定义元素子菜单 + pendingFork 体系 + tab/终端右键 fork 项 + session_lineage 写入端）不在上表，Q 批已把判断依据记进 session_panel.rs 模块注释，届时单独成批；趋势图 path chart 件与「一次性跑完自停」过渡动画基件为可选自绘基建，随需求批带走。
+
 ## 风险与决议记录
 
 - **允许第三方 GPUI UI 库**（2026-08-18 用户决议）：为达到与 Tauri 版类似的 UI/UX，允许引入第三方组件库——icon、table、tab、动画效果等均可用现成轮子，不必手搓。首选已在工作区的 `gpui-component`（Icon/lucide 图标、TabBar、Table、Modal、Dialog、Resizable、Switch、Tooltip、动画等）；它不够用时可再评估其他 crates.io 上的 gpui 生态库（注意必须兼容 `gpui 0.2.x`，避免依赖树出现两个 gpui）。新增 workspace 依赖需主会话在根 Cargo.toml 加行（子 agent 禁改根文件的纪律不变，需要时在报告里提出）。
