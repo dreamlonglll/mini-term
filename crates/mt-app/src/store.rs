@@ -23,7 +23,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{App, AppContext, Context, Entity, Global, Subscription, Task, Window};
-use mt_config::{AppConfig, ConfigStore, ProjectConfig, SaveError, ShellConfig};
+use mt_config::{AiLauncher, AppConfig, ConfigStore, MobileRelayConfig, ProjectConfig, SaveError, ShellConfig};
+use mt_relay::MobileRelayStatusPayload;
 use mt_pty::PtySpawn;
 use mt_ui::theme_bridge::BackgroundArt;
 use mt_ui::{DwellConfig, TerminalStyle, TerminalTheme};
@@ -102,6 +103,10 @@ pub struct AppStore {
     /// 当前拿着键盘焦点的 pane(旧版靠 DOM `activeElement` 推,这里显式维护)。
     pub focused_pane_id: Option<String>,
 
+    /// 移动端中转的连接状态(`src/store.ts:702` 的 `mobileRelayStatus`)。
+    /// **纯运行时,不落盘** —— 与 [`Self::focused_pane_id`] 同类。
+    mobile_relay_status: Option<MobileRelayStatusPayload>,
+
     next_pty_id: u32,
     ai: AiBridge,
 
@@ -170,6 +175,7 @@ impl AppStore {
             terminals: HashMap::new(),
             pane_subs: HashMap::new(),
             focused_pane_id: None,
+            mobile_relay_status: None,
             next_pty_id: 1,
             ai,
             // 真正的配色在 `apply_theme_from_config` 里装配(要 `&mut App` 取系统
@@ -1670,6 +1676,170 @@ impl AppStore {
         }
     }
 
+    /// 移动端改会话名:按 `pane_id` **全局**定位 —— 移动端只认得 pane,
+    /// 不知道它挂在哪个项目下(`src/store.ts:1163-1180`)。
+    ///
+    /// 空串 = 清除自定义名、回落 shell 名。**不落盘**:`SavedPane` 里没有
+    /// `customTitle`,AI 会话本来也活不过重启。
+    ///
+    /// 与 [`Self::rename_pane`] 并存:那条是 F2 / 右键改名(知道项目、要 trim),
+    /// 这条是移动端来的 —— 标题**已经在 mt-relay 里收敛过**
+    /// (trim + 去控制字符 + 64 字符限长,`relay.rs:709-716`),
+    /// 这里不再叠加任何收敛,否则两处限长会打架。
+    pub fn rename_pane_by_id(&mut self, pane_id: &str, title: &str, cx: &mut Context<Self>) {
+        if rename_pane_in_states(&mut self.project_states, pane_id, title) {
+            cx.notify();
+        }
+    }
+
+    // === 移动端中转 ===
+
+    /// `pty_id` → `(project_id, pane_id)` 反查。
+    ///
+    /// 移动端指令只带 PTY 编号,而 [`Self::write_to_pane`] 要「项目 + pane」。
+    pub fn pane_of_pty(&self, pty_id: u32) -> Option<(String, String)> {
+        find_pane_of_pty(&self.project_states, pty_id)
+    }
+
+    /// 这个 pane 的 PTY 起来了吗。
+    ///
+    /// `spawn_pane` 就算 PTY 起不来也照样返回 `PaneState`(视图里画一行红字),
+    /// 而 [`Self::write_to_pane`] 在没有 PTY 时是静默丢弃的 —— 移动端发起会话的
+    /// 回执要靠这一条把「终端根本没起来」与「命令已写入」分开。
+    pub fn pane_pty_alive(&self, pty_id: u32, cx: &App) -> bool {
+        self.terminals
+            .get(&pty_id)
+            .is_some_and(|entity| entity.read(cx).spawn_error().is_none())
+    }
+
+    /// 中转连接状态(`RelayEvents::status_changed` 的落点)。
+    pub fn mobile_relay_status(&self) -> Option<&MobileRelayStatusPayload> {
+        self.mobile_relay_status.as_ref()
+    }
+
+    pub fn set_mobile_relay_status(
+        &mut self,
+        status: MobileRelayStatusPayload,
+        cx: &mut Context<Self>,
+    ) {
+        if self.mobile_relay_status.as_ref() == Some(&status) {
+            return;
+        }
+        self.mobile_relay_status = Some(status);
+        cx.notify();
+    }
+
+    /// 移动端中转配置的**读**口径:整块缺失时回落 `Default`(含预置两条启动器),
+    /// 与 `mt_config` 的迁移(`config.rs:666`)同口径。
+    pub fn mobile_relay(&self) -> MobileRelayConfig {
+        self.config.mobile_relay.clone().unwrap_or_default()
+    }
+
+    /// 移动端中转配置的**改**口径,对应原版 `withMobileRelayDefaults` 的
+    /// `{ relayUrl:'', desktopKey:'', launchers:[], ...current, ...patch }`:
+    /// 整块缺失时 `launchers` 取**空列表而不是预置两条** ——
+    /// 凭空补预置会跟后端「用户删光是有意结果」的迁移规则打架
+    /// (`src/utils/mobileRelayConfig.ts:8-10`)。
+    ///
+    /// 与 [`Self::mobile_relay`] 的差别只在「整块缺失」这一种情况下可见,
+    /// 而 `load()` 的迁移保证了正常路径上这一块必然在场。
+    fn mobile_relay_for_patch(&self) -> MobileRelayConfig {
+        self.config
+            .mobile_relay
+            .clone()
+            .unwrap_or_else(|| MobileRelayConfig {
+                relay_url: String::new(),
+                desktop_key: String::new(),
+                launchers: Vec::new(),
+            })
+    }
+
+    /// 写中转地址 + 桌面端密钥,**其余字段(启动器)一个不动**。
+    ///
+    /// 立即落盘而不是 500ms 防抖(坑 8):原版是 `await saveConfigToDisk` 之后
+    /// 才 `apply`,用户点完「保存并连接」立刻关掉应用,地址不该丢。
+    pub fn set_mobile_relay_endpoint(&mut self, url: &str, key: &str, cx: &mut Context<Self>) {
+        let mut relay = self.mobile_relay_for_patch();
+        relay.relay_url = url.to_string();
+        relay.desktop_key = key.to_string();
+        self.config.mobile_relay = Some(relay);
+        self.save_config_now();
+        cx.notify();
+    }
+
+    /// 写启动器名单,**地址与密钥一个不动**。同样立即落盘。
+    pub fn set_launchers(&mut self, launchers: Vec<AiLauncher>, cx: &mut Context<Self>) {
+        let mut relay = self.mobile_relay_for_patch();
+        relay.launchers = launchers;
+        self.config.mobile_relay = Some(relay);
+        self.save_config_now();
+        cx.notify();
+    }
+
+    /// 移动端发起会话时挂 pane:追加到布局树**最左侧叶子**的 tab 栏末尾,
+    /// **不激活、不抢焦点、不切项目**(远程操作不抢桌面现场,
+    /// `src/utils/mobileStartSession.ts:100-110`)。
+    ///
+    /// 与 [`Self::new_terminal`] 的差别只有这一条 —— 那个走「锚点叶子 + 激活 +
+    /// 抢焦点」。**别把两者合并**:手机上点一下就把桌面正在看的终端顶掉,
+    /// 是原版专门避开的行为。
+    ///
+    /// 原版步 6「先建终端实例再写命令」在这里**自动满足**:`spawn_pane` 建 PTY 的
+    /// 同时就把 `TerminalPane` 插进 `self.terminals`,不存在旧版那个
+    /// 「pty-output 到了但实例还没建、AI 起来那一整段输出丢在地上」的窗口期。
+    pub fn append_pane_background(
+        &mut self,
+        project_id: &str,
+        shell: ShellConfig,
+        custom_title: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let project = self.project(project_id)?.clone();
+        let mut pane = self.spawn_pane(&project, &shell, None, window, cx)?;
+        pane.custom_title = custom_title;
+        let pane_id = pane.id.clone();
+        let pty_id = pane.pty_id;
+
+        let Some(state) = self.project_states.get_mut(project_id) else {
+            // 项目在起 PTY 期间被移除了 —— 新 PTY 无处安放,显式回收
+            if let Some(pty_id) = pty_id {
+                self.dispose_terminal(pty_id, cx);
+            }
+            return None;
+        };
+        match state.layout.as_mut() {
+            // 项目还一个终端都没有:新建根叶子,否则终端区仍是空白
+            None => state.layout = Some(SplitNode::leaf(pane)),
+            Some(layout) => {
+                // `append_pane(None, ..)` 的落点正是 `first_leaf_id()` = 最左侧叶子,
+                // 但它顺手把 `active_pane_id` 指到了新 pane 上,而原版
+                // `appendPaneToFirstLeaf` 明确**不动 activePaneId** —— 记下原值再还原。
+                let leaf_id = layout.first_leaf_id();
+                let prev_active = leaf_id
+                    .as_deref()
+                    .and_then(|id| layout.node(id))
+                    .and_then(|node| match node {
+                        SplitNode::Leaf { active_pane_id, .. } => Some(active_pane_id.clone()),
+                        SplitNode::Split { .. } => None,
+                    });
+                if !layout.append_pane(None, pane) {
+                    if let Some(pty_id) = pty_id {
+                        self.dispose_terminal(pty_id, cx);
+                    }
+                    return None;
+                }
+                if let (Some(leaf_id), Some(prev)) = (leaf_id, prev_active)
+                    && let Some(SplitNode::Leaf { active_pane_id, .. }) = layout.node_mut(&leaf_id)
+                {
+                    *active_pane_id = prev;
+                }
+            }
+        }
+        self.after_layout_change(project_id, cx);
+        Some(pane_id)
+    }
+
     // === 右侧抽屉宽度 ===
 
     /// 抽屉宽度。缺省 **340**(`App.tsx:541` 的 `?? 340`),钳在 240~720
@@ -1862,6 +2032,56 @@ impl AppStore {
     }
 }
 
+// ─── 移动端中转的纯逻辑(可测) ───────────────────────────────
+//
+// 两条都拆成自由函数,是因为它们的语义(全局定位、空串清名、命中即收工)
+// 比调用点更值得钉住,而 `AppStore` 的方法要 `Context<Self>` —— 单测里没有。
+
+/// 在**全部项目**的布局里按 `pane_id` 定位并改自定义名。返回「有没有真改动」。
+///
+/// - 空标题 = 清除自定义名(回落 shell 名);
+/// - `pane_id` 全局唯一,命中即收工,不再看其它项目;
+/// - 一个都没命中:什么都不改。
+fn rename_pane_in_states(
+    states: &mut HashMap<String, ProjectState>,
+    pane_id: &str,
+    title: &str,
+) -> bool {
+    let next = if title.is_empty() {
+        None
+    } else {
+        Some(title.to_string())
+    };
+    for state in states.values_mut() {
+        let Some(layout) = state.layout.as_mut() else {
+            continue;
+        };
+        let Some(pane) = layout.pane_mut(pane_id) else {
+            continue;
+        };
+        if pane.custom_title == next {
+            return false;
+        }
+        pane.custom_title = next;
+        return true;
+    }
+    false
+}
+
+/// `pty_id` → `(project_id, pane_id)`。
+fn find_pane_of_pty(
+    states: &HashMap<String, ProjectState>,
+    pty_id: u32,
+) -> Option<(String, String)> {
+    states.iter().find_map(|(project_id, state)| {
+        state
+            .layout
+            .as_ref()
+            .and_then(|layout| layout.pane_by_pty(pty_id))
+            .map(|pane| (project_id.clone(), pane.id.clone()))
+    })
+}
+
 // ─── 终端渲染参数的纯函数(可测) ──────────────────────────────
 
 /// 回滚行数上限(`src/utils/terminalScrollback.ts::MAX_SCROLLBACK`)。
@@ -1996,6 +2216,87 @@ mod tests {
             session_id: id.to_string(),
             cwd: None,
         }
+    }
+
+    // ─── 移动端改会话名 / pty 反查 ───────────────────────────
+
+    /// 两个项目各一棵布局,pane id 与 pty id 都在其中。
+    fn two_projects() -> (HashMap<String, ProjectState>, String, String) {
+        let mut a = PaneState::new("pwsh");
+        a.pty_id = Some(1);
+        let mut b = PaneState::new("bash");
+        b.pty_id = Some(2);
+        let (a_id, b_id) = (a.id.clone(), b.id.clone());
+
+        let mut states = HashMap::new();
+        let mut sa = ProjectState::new();
+        sa.layout = Some(SplitNode::leaf(a));
+        states.insert("p-a".to_string(), sa);
+        let mut sb = ProjectState::new();
+        sb.layout = Some(SplitNode::leaf(b));
+        states.insert("p-b".to_string(), sb);
+        // 布局还没建出来的项目也要能安全跳过
+        states.insert("p-empty".to_string(), ProjectState::new());
+        (states, a_id, b_id)
+    }
+
+    fn title_of(states: &HashMap<String, ProjectState>, pane_id: &str) -> Option<String> {
+        states
+            .values()
+            .filter_map(|s| s.layout.as_ref())
+            .find_map(|l| l.pane(pane_id))
+            .and_then(|p| p.custom_title.clone())
+    }
+
+    /// 移动端只认得 pane —— 改名必须跨项目找,而且找的是**第二个**项目里那个
+    /// 也要能命中(HashMap 的遍历顺序不定,这条同时钉住「不依赖顺序」)。
+    #[test]
+    fn 改会话名按_pane_id_跨项目定位() {
+        let (mut states, _a_id, b_id) = two_projects();
+        assert!(rename_pane_in_states(&mut states, &b_id, "手机改的名"));
+        assert_eq!(title_of(&states, &b_id).as_deref(), Some("手机改的名"));
+    }
+
+    /// 空串 = 清掉自定义名、回落 shell 名(不是存一个空标题)。
+    #[test]
+    fn 改会话名传空串等于清除自定义名() {
+        let (mut states, a_id, _) = two_projects();
+        assert!(rename_pane_in_states(&mut states, &a_id, "X"));
+        assert!(rename_pane_in_states(&mut states, &a_id, ""));
+        assert_eq!(title_of(&states, &a_id), None);
+        // 已经是默认名了,再清一次不算改动(省掉一次无谓的重绘)
+        assert!(!rename_pane_in_states(&mut states, &a_id, ""));
+    }
+
+    /// 一个都没命中:什么都不改,也不报错(pane 可能刚被关掉)。
+    #[test]
+    fn 改会话名未命中时什么都不改() {
+        let (mut states, a_id, b_id) = two_projects();
+        assert!(!rename_pane_in_states(&mut states, "pane-不存在", "X"));
+        assert_eq!(title_of(&states, &a_id), None);
+        assert_eq!(title_of(&states, &b_id), None);
+    }
+
+    /// 同名再改一次不算改动 —— 结构同步的内容去重靠它少发一轮。
+    #[test]
+    fn 改会话名同名时不算改动() {
+        let (mut states, a_id, _) = two_projects();
+        assert!(rename_pane_in_states(&mut states, &a_id, "同一个名"));
+        assert!(!rename_pane_in_states(&mut states, &a_id, "同一个名"));
+    }
+
+    #[test]
+    fn pty_反查得到项目与_pane() {
+        let (states, a_id, b_id) = two_projects();
+        assert_eq!(
+            find_pane_of_pty(&states, 1),
+            Some(("p-a".to_string(), a_id))
+        );
+        assert_eq!(
+            find_pane_of_pty(&states, 2),
+            Some(("p-b".to_string(), b_id))
+        );
+        assert_eq!(find_pane_of_pty(&states, 99), None);
     }
 
     /// 命令按 agent 分派;未知 / 缺省 agent 兜底 claude(与旧版一致)。

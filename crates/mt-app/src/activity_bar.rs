@@ -14,10 +14,11 @@
 //!
 //! # 只画有落点的按钮
 //!
-//! 原版 8 个按钮里 SSH / 移动端 / 更新提醒三个在 GPUI 侧还没有对应功能,
-//! **不放占位**(灰着点不动的按钮比没有更让人困惑)。其余五个:
-//! 折叠中间栏 / AI 历史 / Git 变更 / 用量统计 / 设置,外加一个原版没有的
-//! 「跳到已完成」。(Git 那颗由 V 批补上,与右抽屉的 sessions⇄git 段控件同一个开关。)
+//! 原版 8 个按钮里 SSH / 更新提醒两个在 GPUI 侧还没有对应功能,
+//! **不放占位**(灰着点不动的按钮比没有更让人困惑)。其余六个:
+//! 折叠中间栏 / AI 历史 / Git 变更 / 用量统计 / 移动端 / 设置,外加一个原版没有的
+//! 「跳到已完成」。(Git 那颗由 V 批补上,与右抽屉的 sessions⇄git 段控件同一个开关;
+//! 移动端那颗由 U 批补上,位置照原版排在「设置」之前。)
 
 use gpui::{
     Div, ElementId, InteractiveElement, ParentElement, Stateful, StatefulInteractiveElement,
@@ -159,6 +160,28 @@ pub const STATS: &[Shape] = &[
     ),
 ];
 
+/// 移动端。原版 `ICON_MOBILE`(`ActivityBar.tsx:48-53`)—— 一部竖着的手机:
+/// `<rect x="4.5" y="1.5" width="7" height="13" rx="1.5"/>` + `<path d="M7 12.5h2"/>`
+/// (机身圆角矩形 + 底部那道 Home 键短横)。
+pub const MOBILE: &[Shape] = &[
+    Shape::line(
+        Ink::Current,
+        STROKE,
+        Geom::Rect {
+            x: u(4.5),
+            y: u(1.5),
+            w: u(7.0),
+            h: u(13.0),
+            round: u(1.5),
+        },
+    ),
+    Shape::line(
+        Ink::Current,
+        STROKE,
+        Geom::Polyline(&[(u(7.0), u(12.5)), (u(9.0), u(12.5))]),
+    ),
+];
+
 /// 设置。原版 `ICON_SETTINGS` 的 6 齿齿轮轮廓 + 中心轴孔 —— 那条 `path` 的
 /// 24 个顶点逐个抄下来(原版注释写明:轮缘必须是连续的、齿长在轮廓上,
 /// 「中心小圆 + 放射短线」画出来是太阳不是齿轮;18px 下取 6 齿才咬得出形状)。
@@ -267,7 +290,7 @@ mod tests {
     #[test]
     fn 边条图标的点全在单位方框内() {
         let mut points = 0usize;
-        for shapes in [PANEL, SESSIONS, GIT, STATS, SETTINGS] {
+        for shapes in [PANEL, SESSIONS, GIT, STATS, SETTINGS, MOBILE] {
             for shape in shapes {
                 let (pts, _) = shape.geom.points();
                 for (x, y) in pts {

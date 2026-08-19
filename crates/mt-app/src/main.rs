@@ -50,6 +50,8 @@ mod git_worktree;
 mod hotkeys;
 mod i18n;
 mod menu;
+mod mobile_panel;
+mod mobile_relay;
 mod modal;
 mod notify;
 mod overlay;
@@ -270,6 +272,9 @@ struct Workspace {
     drawer_drag: Option<DrawerDrag>,
     usage_open: bool,
     _ai_pump: Task<()>,
+    /// 移动端中转桥(泵 + store 观察者 + 去抖同步靠它的生命周期保活,
+    /// 与 [`Self::_ai_pump`] 同一种分工)。见 [`mobile_relay`]。
+    _relay: Entity<mobile_relay::RelayBridge>,
     _activation: Subscription,
 }
 
@@ -319,6 +324,10 @@ impl Workspace {
             }
         });
 
+        // 移动端中转:建桥 + 登记全局 + 按配置建连一次。放在这里(而不是 `main`)
+        // 是因为泵要 `spawn_in` 拿窗口 —— 移动端发起会话得建 pane、弹 toast。
+        let relay = mobile_relay::install(store.clone(), window, cx);
+
         // 恢复出来的布局已经把 PTY 补齐了,键盘焦点也该落到当前 pane 上 ——
         // 否则用户得先点一下终端才能打字。
         let initial = {
@@ -351,6 +360,7 @@ impl Workspace {
             drawer_drag: None,
             usage_open: false,
             _ai_pump: ai_pump,
+            _relay: relay,
             _activation: activation,
         }
     }
@@ -997,6 +1007,18 @@ impl Render for Workspace {
                     self.usage_open,
                 )
                 .on_click(cx.listener(|this, _event, window, cx| this.toggle_usage(window, cx))),
+            )
+            // 「移动端」面板。位置照原版排在「设置」之前(`ActivityBar.tsx:167-170`)
+            .child(
+                activity_bar::strip_button(
+                    "open-mobile-relay",
+                    activity_bar::MOBILE,
+                    t("app", "activityBar.mobile"),
+                    false,
+                )
+                .on_click(cx.listener(|_this, _event, window, cx| {
+                    mobile_panel::open(window, cx);
+                })),
             )
             .child(
                 activity_bar::strip_button(

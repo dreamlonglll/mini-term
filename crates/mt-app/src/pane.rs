@@ -291,6 +291,16 @@ impl TerminalPane {
         }
     }
 
+    /// PTY 起不来时的错误原文;`None` = 起来了。
+    ///
+    /// 视图里已经把它画成一行红字(见 `Render` 实现),这个访问器是给**回执**用的:
+    /// 移动端发起会话要区分「pane 建出来了」与「PTY 真的起来了」——
+    /// [`Self::write`] 在没有 PTY 时是静默丢弃的,不看这一条就会把「终端起不来」
+    /// 报成成功,手机侧只能干等 15s 超时。
+    pub fn spawn_error(&self) -> Option<&str> {
+        self.spawn_error.as_deref()
+    }
+
     /// Ctrl+F。打开查找条,已经开着就把焦点送回输入框并全选。
     ///
     /// # 与原版的两处口径差

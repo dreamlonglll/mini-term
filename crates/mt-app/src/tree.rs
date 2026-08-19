@@ -62,6 +62,18 @@ impl PaneStatus {
         }
     }
 
+    /// [`from_str`] 的反向。移动端快照里 pane 状态是**字符串**上报的
+    /// (`SyncPane::status`,协议 v2 的 wire 口径),这里是唯一的产出口。
+    ///
+    /// [`from_str`]: Self::from_str
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::AiIdle => "ai-idle",
+            Self::AiWorking => "ai-working",
+            Self::Error => "error",
+        }
+    }
 }
 
 /// hook 上报的 AI 会话身份(对应 `types.ts` 的 `AiSessionRef`)。
@@ -568,6 +580,25 @@ mod tests {
 
     fn leaf(name: &str, pty: u32) -> SplitNode {
         SplitNode::leaf(pane(name, pty))
+    }
+
+    /// 状态串的两个方向必须一一对应:`as_str` 是移动端快照的产出口、
+    /// `from_str` 是 hook/monitor 的入口,任一侧改字面量而另一侧没跟上,
+    /// 手机上的状态徽章就会静默停在 idle。
+    #[test]
+    fn 状态串两个方向可往返() {
+        for status in [
+            PaneStatus::Idle,
+            PaneStatus::AiIdle,
+            PaneStatus::AiWorking,
+            PaneStatus::Error,
+        ] {
+            assert_eq!(PaneStatus::from_str(status.as_str()), Some(status));
+        }
+        // 反向:后端口径里的四个字面量都认得
+        for s in ["idle", "ai-idle", "ai-working", "error"] {
+            assert_eq!(PaneStatus::from_str(s).unwrap().as_str(), s);
+        }
     }
 
     /// getHighestStatus:error > ai-working > ai-idle > idle,跨层聚合。
