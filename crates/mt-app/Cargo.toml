@@ -29,6 +29,9 @@ parking_lot.workspace = true
 futures = "0.3"
 # 会话列表的相对时间、用量面板的本地日历日窗口。
 chrono.workspace = true
+# 移动端配对二维码(工作区里已 default-features=false，只要位矩阵)。
+# 渲染由 `mobile_relay::qr` 自绘 quad —— 不引 image 后端、不落临时文件。
+qrcode.workspace = true
 # 价格表缓存信封的读写(model-pricing.json / .cache.json)。
 serde.workspace = true
 serde_json.workspace = true

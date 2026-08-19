@@ -75,3 +75,11 @@ pub use relay::{
     can_start_session, check_launcher_command, MobileRelayManager, MobileRelayStatusPayload,
     RenamePanePayload, StartSessionPayload, SyncPane, SyncProject,
 };
+
+/// 发起会话失败的**闭集**原因(协议类型)。
+///
+/// [`MobileRelayManager::start_session_result`] 的入参里就有它,宿主不可能不
+/// 提到这个名字 —— 而 `mt_relay_protocol` 是本 crate 的私有依赖(边界见模块头:
+/// 只有本 crate 认识 wire 协议)。所以在这里把它接出去,宿主不必反过来依赖
+/// 协议 crate。**闭集不带自由文本**,ADR 0002 的边界(命令文本不外泄)靠它守住。
+pub use mt_relay_protocol::StartSessionFailReason;
