@@ -1,6 +1,6 @@
-//! 关终端 / 关整组的**唯一入口**(带 AI 感知确认框)。
+//! 关终端 / 关整组的**唯一入口**(带 AI 感知确认框),外加「分支会话到新分屏」。
 //!
-//! 对应 `src/utils/paneActions.ts` 的 `closePane` / `closeLeaf`。
+//! 对应 `src/utils/paneActions.ts` 的 `closePane` / `closeLeaf` / `forkPaneSession`。
 //!
 //! # 为什么必须收成一个入口
 //!
@@ -25,8 +25,9 @@ use gpui::{App, Entity, Window};
 
 use crate::i18n::{t, tr};
 use crate::prompt::Confirm;
-use crate::store::AppStore;
-use crate::tree::{PaneState, PaneStatus, SplitNode};
+use crate::session_branch::{BranchMenuSegment, branch_menu_segment};
+use crate::store::{AppStore, resolve_fork_cwd};
+use crate::tree::{PaneState, PaneStatus, SplitDirection, SplitNode};
 
 /// 这个状态算「AI 会话还活着」吗。
 pub fn is_ai_alive(status: PaneStatus) -> bool {
@@ -192,6 +193,85 @@ pub fn close_leaf(
         window,
         cx,
     );
+}
+
+/// 把 pane 里跑着的 AI 会话**分支到新分屏**(`paneActions.ts::forkPaneSession`)。
+///
+/// ```text
+/// pane 的 ai_session ──→ 能力位查命令(claude --resume … --fork-session / codex fork …)
+///                        └─ 拼不出(无身份 / grok / 坏 id)→ 什么都不做
+/// 后台线程:resolve_fork_cwd(会话 cwd 预检 → claude 系反查 → None)
+///     ↓ 回主线程
+/// split_pane_with_cwd(横向) → register_pending_fork(新 ptyId) → 写 fork 命令
+/// ```
+///
+/// 原 pane 的原会话继续跑;右侧分出来的新 pane 起一个新进程跑 fork 出来的会话。
+/// PTY 内核缓冲 stdin,shell 就绪前写入不丢(与重启自动续接同一时序)。
+/// **新进程 = 新权限上下文**:原会话里「本会话允许」的授权不迁移(CLI 官方行为)。
+///
+/// 登记必须在写命令**之前** —— hook 可能在命令刚回车就把新会话身份报上来,
+/// 晚一步这条 child→parent 边就永远记不上了(Claude 的 CLI fork 不写磁盘指针,
+/// 自记账是唯一来源)。
+pub fn fork_pane_session(
+    store: Entity<AppStore>,
+    project_id: String,
+    pane_id: String,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(session) = store
+        .read(cx)
+        .project_state(&project_id)
+        .and_then(|s| s.layout.as_ref())
+        .and_then(|l| l.pane(&pane_id))
+        .and_then(|p| p.ai_session.clone())
+    else {
+        return;
+    };
+    // 命令与归一化 agent 都由菜单那份判据产出 —— 菜单出得来的项,动作就跑得通
+    let BranchMenuSegment::Fork { command, agent, .. } = branch_menu_segment(Some(&session), None)
+    else {
+        return;
+    };
+    let parent_session_id = session.session_id.clone();
+
+    window
+        .spawn(cx, async move |cx| {
+            // 反查是**同步磁盘遍历**(`~/.claude/projects` 逐桶找文件),
+            // 落在 GPUI 主线程上就是整个窗口卡住
+            let cwd = cx
+                .background_executor()
+                .spawn(async move { resolve_fork_cwd(&session) })
+                .await;
+            let _ = cx.update(|window, cx| {
+                store.update(cx, |store, cx| {
+                    let Some(new_pane) = store.split_pane_with_cwd(
+                        &project_id,
+                        &pane_id,
+                        SplitDirection::Horizontal,
+                        cwd,
+                        window,
+                        cx,
+                    ) else {
+                        // 源 pane 在这期间被关掉了 —— 分不出屏,什么都不做
+                        // (原版那条「带 cwd 失败就不带 cwd 重试」在这里是死路:
+                        // GPUI 侧 spawn_pane 从不因目录失败而返回 None,
+                        // 起不来的 PTY 会以错误文本留在 pane 里,见 `start_pty`)
+                        return;
+                    };
+                    let pty_id = store
+                        .project_state(&project_id)
+                        .and_then(|s| s.layout.as_ref())
+                        .and_then(|l| l.pane(&new_pane))
+                        .and_then(|p| p.pty_id);
+                    if let Some(pty_id) = pty_id {
+                        store.register_pending_fork(pty_id, &agent, &parent_session_id);
+                    }
+                    store.write_to_pane(&project_id, &new_pane, &format!("{command}\r"), cx);
+                });
+            });
+        })
+        .detach();
 }
 
 /// 「关整组」的确认框(两条入口共用)。组是空的就什么都不做。

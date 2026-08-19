@@ -37,6 +37,7 @@
 
 mod activity_bar;
 mod ai;
+mod branch_family;
 mod clipboard;
 mod dnd;
 mod file_tree;

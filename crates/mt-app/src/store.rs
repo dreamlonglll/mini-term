@@ -118,6 +118,12 @@ pub struct AppStore {
     /// 「pty id 复用后游标是旧的」的边界)。这里与标记表同生共死,顺手修掉。
     marker_cursor: HashMap<u32, String>,
 
+    /// 会话分支的**自记账登记**(`src/store.ts:173` 的 `pendingForks`)。
+    /// mini-term 自己发起的 fork 在新 pane 的 PTY 上登记「等新会话身份」,
+    /// hook 上报新 id 时落成 child→parent 边写进 `config.session_lineage`。
+    /// **纯运行时,不落盘**;见 [`AppStore::register_pending_fork`]。
+    pending_forks: HashMap<u32, PendingFork>,
+
     next_pty_id: u32,
     ai: AiBridge,
 
@@ -189,6 +195,7 @@ impl AppStore {
             mobile_relay_status: None,
             markers_by_pty: HashMap::new(),
             marker_cursor: HashMap::new(),
+            pending_forks: HashMap::new(),
             next_pty_id: 1,
             ai,
             // 真正的配色在 `apply_theme_from_config` 里装配(要 `&mut App` 取系统
@@ -708,13 +715,34 @@ impl AppStore {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<String> {
+        self.split_pane_with_cwd(project_id, pane_id, direction, None, window, cx)
+    }
+
+    /// 分屏并**显式指定**新 PTY 的启动目录。
+    ///
+    /// 单独一个入口是给「分支会话到新分屏」用的:fork 出的会话必须落在源会话
+    /// 记录的目录(`splitPane(…, { cwd })` 的等价物),见 [`resolve_fork_cwd`]。
+    /// `cwd = None` 时与 [`split_pane`] 完全相同 —— 继承源 pane 的 cwd 覆盖
+    /// (worktree 终端分出来的屏理应还在 worktree 里)。
+    ///
+    /// [`split_pane`]: Self::split_pane
+    pub fn split_pane_with_cwd(
+        &mut self,
+        project_id: &str,
+        pane_id: &str,
+        direction: SplitDirection,
+        cwd: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
         let project = self.project(project_id)?.clone();
-        let source_cwd = self
-            .project_states
-            .get(project_id)
-            .and_then(|s| s.layout.as_ref())
-            .and_then(|l| l.pane(pane_id))
-            .and_then(|p| p.cwd.clone());
+        let source_cwd = cwd.or_else(|| {
+            self.project_states
+                .get(project_id)
+                .and_then(|s| s.layout.as_ref())
+                .and_then(|l| l.pane(pane_id))
+                .and_then(|p| p.cwd.clone())
+        });
         let shell_name = self
             .project_states
             .get(project_id)
@@ -1328,6 +1356,8 @@ impl AppStore {
         // (原版分散在 `setProjectLayout` 的 ptyId 集合比对、`disposePane`、
         // `removeProject` 三处,漏一处就是「pty id 复用后接手了上一任的标记」)
         self.clear_markers_for_pty(pty_id);
+        // 分支登记同理:留着会让复用同一编号的新 PTY 认领上一任的 fork 登记
+        self.clear_pending_fork(pty_id);
         if let Some(entity) = self.terminals.remove(&pty_id) {
             // 组合中关 pane:先把预编辑收掉,免得 IME 还挂在一个即将消失的
             // 输入宿主上(marked range 不收回,下一次按键会被 IME 永久劫持)
@@ -1356,6 +1386,9 @@ impl AppStore {
         {
             eprintln!("[store] pane {pty_id} 子进程退出,退出码 {code}");
         }
+        // fork 命令没能起起会话就退了 —— 这条登记不该等到下一个进程头上
+        // (原版把 `clearPendingFork` 挂在 `pty-exit` 监听里,同一时机)
+        self.clear_pending_fork(pty_id);
         let mut touched: Option<String> = None;
         for (pid, state) in self.project_states.iter_mut() {
             if let Some(layout) = state.layout.as_mut()
@@ -1461,15 +1494,16 @@ impl AppStore {
             }
             AiEvent::Session(identity) => {
                 let mut owner: Option<String> = None;
+                let session = AiSessionRef {
+                    agent: identity.agent.clone(),
+                    session_id: identity.session_id.clone(),
+                    cwd: identity.cwd.clone(),
+                };
                 for (pid, state) in self.project_states.iter_mut() {
                     if let Some(layout) = state.layout.as_mut()
                         && let Some(pane) = layout.pane_by_pty_mut(identity.pty_id)
                     {
-                        pane.ai_session = Some(AiSessionRef {
-                            agent: identity.agent.clone(),
-                            session_id: identity.session_id.clone(),
-                            cwd: identity.cwd.clone(),
-                        });
+                        pane.ai_session = Some(session.clone());
                         owner = Some(pid.clone());
                         break;
                     }
@@ -1479,6 +1513,10 @@ impl AppStore {
                     self.save_layout_soon(&owner, cx);
                     cx.notify();
                 }
+                // 分支自记账:这个 pane 是 fork 出来的话,新身份到手即落边。
+                // **必须在这里**而不是等 pane 变 ai-working —— 身份只上报一次,
+                // 错过就再没有第二次机会把 child→parent 记下来。
+                self.consume_pending_fork(identity.pty_id, &session, cx);
                 None
             }
         }
@@ -1652,15 +1690,70 @@ impl AppStore {
         session: AiSessionRef,
         cx: &mut Context<Self>,
     ) {
+        let mut pty_id = None;
         if let Some(state) = self.project_states.get_mut(project_id)
             && let Some(layout) = state.layout.as_mut()
             && let Some(pane) = layout.pane_mut(pane_id)
         {
-            pane.ai_session = Some(session);
+            pane.ai_session = Some(session.clone());
             // 身份是自己写进去的,不是「待续接」——别让下次启动再敲一遍命令
             pane.resume_pending = false;
+            pty_id = pane.pty_id;
             self.save_layout_soon(project_id, cx);
             cx.notify();
+        }
+        // 与 hook 上报那条路同一个消费点(原版两条都走 `setPaneAiSessionByPty`)。
+        // 走到这里的多半是 resume/跳转,没有登记 → 空操作。
+        if let Some(pty_id) = pty_id {
+            self.consume_pending_fork(pty_id, &session, cx);
+        }
+    }
+
+    // === 会话分支自记账 ===
+    //
+    // 设计: `docs/plans/2026-08-14-session-branch-tree-design.md`。
+    // mini-term 自己发起的 fork 在新 pane 的 PTY 上登记「等新会话身份」,hook 上报
+    // 新 id 时落成 child→parent 边写进 `config.session_lineage`。磁盘扫描
+    // (`scan_session_lineage`)是权威且合并时优先,这里只兜两件事:文件尚未落盘的
+    // 窗口期,以及 **Claude 的 CLI fork 压根不写磁盘指针**(`forkedFrom` 只有
+    // `/branch` 路径写)——那种边只存在于自记账。
+
+    /// 登记一次 fork:`pty_id` 上跑起来的下一个会话身份是 `parent_session_id` 的孩子。
+    pub fn register_pending_fork(&mut self, pty_id: u32, agent: &str, parent_session_id: &str) {
+        self.pending_forks.insert(
+            pty_id,
+            PendingFork {
+                agent: agent.to_ascii_lowercase(),
+                parent_session_id: parent_session_id.to_string(),
+            },
+        );
+    }
+
+    /// 丢掉一个 PTY 的登记(子进程退出 / 终端回收)。
+    ///
+    /// 不清的话:fork 命令没起成会话,这条登记会一直挂着,等 pty id 被复用之后
+    /// 认领**下一个进程**的会话身份,凭空造出一条假分支边(原版 `clearPendingFork`
+    /// 挂在 `pty-exit` 上是同一条理由)。
+    pub fn clear_pending_fork(&mut self, pty_id: u32) {
+        self.pending_forks.remove(&pty_id);
+    }
+
+    /// 消费**一次性**的 fork 登记。判据是纯函数 [`resolve_fork_edge`];
+    /// 无论落不落边,登记都当场作废(agent 不符 = fork 失败后起了别家)。
+    fn consume_pending_fork(
+        &mut self,
+        pty_id: u32,
+        session: &AiSessionRef,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pending) = self.pending_forks.remove(&pty_id) else {
+            return;
+        };
+        let Some(edge) = resolve_fork_edge(&pending, session) else {
+            return;
+        };
+        if push_lineage_edge(&mut self.config.session_lineage, edge) {
+            self.save_config_soon(cx);
         }
     }
 
@@ -2738,6 +2831,78 @@ fn resolve_resume_cwd(session: &AiSessionRef) -> Option<String> {
     mt_ai::sessions::lookup_ai_session_cwd(session.session_id.clone())
 }
 
+/// fork 出的新 PTY 该以哪个目录启动。
+///
+/// 取值链与续接**完全同一条**([`resolve_resume_cwd`]):hook 上报的 `session.cwd`
+/// (带 `is_dir` 预检)→(claude 系)`lookup_ai_session_cwd` 反查 → `None` 回落
+/// 源 pane 目录。`claude --resume … --fork-session` 与 `--resume` 一样只认
+/// 「启动目录」对应的会话桶,起于子目录的会话在别处 fork 会报
+/// `No conversation found`;codex 不按目录分桶,继承源 pane 目录即可
+/// (还避开它的 `resume_cwd` 选目录提问)。
+///
+/// **同步磁盘遍历**,调用方必须丢后台(见 [`fork_pane_session`])。
+pub fn resolve_fork_cwd(session: &AiSessionRef) -> Option<String> {
+    resolve_resume_cwd(session)
+}
+
+/// 一条待落账的 fork 登记(`src/store.ts:173` 的 `pendingForks` 值)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingFork {
+    /// 归一化(小写)的 agent 标识。
+    pub agent: String,
+    /// 被 fork 的那个会话 id。
+    pub parent_session_id: String,
+}
+
+/// 一次 pending 登记遇上新会话身份时该不该落边(纯逻辑,`consumePendingFork` 的判据)。
+///
+/// 三条否决(逐条照抄原版):
+/// 1. **agent 不符** —— fork 失败后用户在同一个 pane 里起了别家,登记只作废不记边;
+/// 2. **id 为空** —— 身份还没成形;
+/// 3. **id 等于父** —— claude 的 `--resume` 幂等上报同一个 id(没真分出去)。
+///
+/// 归一化口径与 [`crate::session_branch::branch_caps_for_agent`] 同:两边都先小写。
+/// 同 agent 的**全新**会话被误记仍有残余风险 —— 磁盘边合并时优先、且该 pane
+/// 首次身份即消费,窗口压到最小(原版同一条注释)。
+pub fn resolve_fork_edge(
+    pending: &PendingFork,
+    session: &AiSessionRef,
+) -> Option<mt_config::SavedLineageEdge> {
+    let agent = session
+        .agent
+        .as_deref()
+        .unwrap_or("claude")
+        .to_ascii_lowercase();
+    if agent != pending.agent {
+        return None;
+    }
+    if session.session_id.is_empty() || session.session_id == pending.parent_session_id {
+        return None;
+    }
+    Some(mt_config::SavedLineageEdge {
+        agent,
+        session_id: session.session_id.clone(),
+        parent_session_id: pending.parent_session_id.clone(),
+        // 分叉点 uuid 只有 Claude 的磁盘指针有这个精度;自记账拿不到
+        fork_point_uuid: None,
+    })
+}
+
+/// 把一条边并进自记账表;child 已有边就**不覆盖**,返回是否真写了。
+///
+/// 「先记为准」:同一个 child 不可能有两个父,后来的那条只可能是误记
+/// (磁盘合并层还会再压一层,见 `session_branch::merge_lineage_edges`)。
+pub fn push_lineage_edge(
+    existing: &mut Vec<mt_config::SavedLineageEdge>,
+    edge: mt_config::SavedLineageEdge,
+) -> bool {
+    if existing.iter().any(|e| e.session_id == edge.session_id) {
+        return false;
+    }
+    existing.push(edge);
+    true
+}
+
 fn collect_node_ids(node: &SplitNode, out: &mut HashSet<String>) {
     out.insert(node.id().to_string());
     if let SplitNode::Split { children, .. } = node {
@@ -3232,5 +3397,142 @@ mod tests {
             .filter(|f| f.as_ref() == "Microsoft YaHei")
             .count();
         assert_eq!(yahei, 1);
+    }
+
+    // ---- 会话分支自记账 ----
+
+    fn pending(agent: &str, parent: &str) -> PendingFork {
+        PendingFork {
+            agent: agent.to_string(),
+            parent_session_id: parent.to_string(),
+        }
+    }
+
+    fn identity(agent: Option<&str>, id: &str) -> AiSessionRef {
+        AiSessionRef {
+            agent: agent.map(str::to_string),
+            session_id: id.to_string(),
+            cwd: None,
+        }
+    }
+
+    /// 正常流转:登记 claude 的 fork,新身份到手 → 落一条 child→parent 边。
+    #[test]
+    fn fork_登记遇上新身份落边() {
+        let edge = resolve_fork_edge(&pending("claude", "parent-1"), &identity(Some("claude"), "child-1"))
+            .expect("该落边");
+        assert_eq!(edge.agent, "claude");
+        assert_eq!(edge.session_id, "child-1");
+        assert_eq!(edge.parent_session_id, "parent-1");
+        assert_eq!(edge.fork_point_uuid, None, "自记账拿不到分叉点 uuid");
+
+        // hook 上报 `claude-code`,登记时已归一化成小写;两边都归一化后才比得上
+        assert!(
+            resolve_fork_edge(&pending("claude-code", "p"), &identity(Some("Claude-Code"), "c"))
+                .is_some(),
+            "大小写不该拦下自己人"
+        );
+        // agent 缺省按 claude
+        assert!(resolve_fork_edge(&pending("claude", "p"), &identity(None, "c")).is_some());
+    }
+
+    /// 三条否决:agent 不符 / 身份为空 / 新 id 等于父。
+    #[test]
+    fn fork_登记的三条否决() {
+        // fork 失败后用户在同一个 pane 里起了别家 —— 只作废不记边
+        assert!(
+            resolve_fork_edge(&pending("claude", "p"), &identity(Some("codex"), "c")).is_none(),
+            "agent 不符"
+        );
+        assert!(
+            resolve_fork_edge(&pending("claude", "p"), &identity(Some("claude"), "")).is_none(),
+            "身份还没成形"
+        );
+        // claude 的 --resume 幂等上报同一个 id:没真分出去,不该记一条自环
+        assert!(
+            resolve_fork_edge(&pending("claude", "same"), &identity(Some("claude"), "same"))
+                .is_none(),
+            "自指边"
+        );
+    }
+
+    /// 「先记为准」:同一个 child 已有边就不覆盖(同一个孩子不可能有两个父)。
+    #[test]
+    fn 自记账表按_child_去重() {
+        let mut table = Vec::new();
+        let edge = |child: &str, parent: &str| mt_config::SavedLineageEdge {
+            agent: "claude".into(),
+            session_id: child.into(),
+            parent_session_id: parent.into(),
+            fork_point_uuid: None,
+        };
+        assert!(push_lineage_edge(&mut table, edge("c", "p1")));
+        assert!(!push_lineage_edge(&mut table, edge("c", "p2")), "不覆盖");
+        assert_eq!(table.len(), 1);
+        assert_eq!(table[0].parent_session_id, "p1", "先记的那条留下");
+        // 别的 child 照常进表
+        assert!(push_lineage_edge(&mut table, edge("c2", "p2")));
+        assert_eq!(table.len(), 2);
+    }
+
+    /// **落盘格式与 Tauri 版一字不差**(`src-tauri/src/config.rs::SavedLineageEdge`
+    /// 与 `src/types.ts::LineageEdge` 同构):camelCase 键、`forkPointUuid` 为空时
+    /// **整个键省略**。两版共用同一个 `config.json`,多一个 `"forkPointUuid":null`
+    /// 就是脏文件;少一个 `parentSessionId` 就是整条边读不回来。
+    #[test]
+    fn 自记账边磁盘格式与_tauri_版互读() {
+        let edge = mt_config::SavedLineageEdge {
+            agent: "claude".into(),
+            session_id: "child-1".into(),
+            parent_session_id: "parent-1".into(),
+            fork_point_uuid: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&edge).unwrap(),
+            r#"{"agent":"claude","sessionId":"child-1","parentSessionId":"parent-1"}"#,
+            "自记账写出去的形状 = TS 侧 consumePendingFork 写的那三个键"
+        );
+
+        // 带分叉点 uuid 的形态(磁盘扫描补出来的边回写时可能带)
+        let with_uuid = mt_config::SavedLineageEdge {
+            fork_point_uuid: Some("m1".into()),
+            ..edge
+        };
+        assert_eq!(
+            serde_json::to_string(&with_uuid).unwrap(),
+            r#"{"agent":"claude","sessionId":"child-1","parentSessionId":"parent-1","forkPointUuid":"m1"}"#
+        );
+
+        // 反向:Tauri 版写的两种形状都读得回来
+        let parsed: mt_config::SavedLineageEdge = serde_json::from_str(
+            r#"{"agent":"codex","sessionId":"c","parentSessionId":"p"}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.agent, "codex");
+        assert_eq!(parsed.session_id, "c");
+        assert_eq!(parsed.parent_session_id, "p");
+        assert_eq!(parsed.fork_point_uuid, None, "缺字段按 None,不许炸");
+    }
+
+    /// 自记账边喂给 mt-ai 的转换是逐字段直传(`session_panel` / `branch_family`
+    /// 两处各写一遍,漂了就会出现「传过去的父 id 是空的」)。
+    #[test]
+    fn 自记账边转成_mt_ai_形态逐字段直传() {
+        let saved = mt_config::SavedLineageEdge {
+            agent: "claude".into(),
+            session_id: "c".into(),
+            parent_session_id: "p".into(),
+            fork_point_uuid: Some("m1".into()),
+        };
+        let bookkept = mt_ai::sessions::BookkeptLineageEdge {
+            agent: saved.agent.clone(),
+            session_id: saved.session_id.clone(),
+            parent_session_id: saved.parent_session_id.clone(),
+            fork_point_uuid: saved.fork_point_uuid.clone(),
+        };
+        assert_eq!(bookkept.agent, "claude");
+        assert_eq!(bookkept.session_id, "c");
+        assert_eq!(bookkept.parent_session_id, "p");
+        assert_eq!(bookkept.fork_point_uuid.as_deref(), Some("m1"));
     }
 }

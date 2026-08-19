@@ -36,6 +36,20 @@
 //! 贴边翻转由 `snap_to_window_with_margin` 白拿(原版是自己算 `placeInViewport`);
 //! **子菜单不翻转** —— 它挂在父项右缘,窗口右边缘外的那点差别留作已知缺口。
 //!
+//! # 自定义元素子菜单([`MenuItem::submenu_element`])
+//!
+//! 原版 `MenuEntry.submenuRender(host) => cleanup` 的等价物:菜单项悬停时在旁侧
+//! 挂**任意自绘面板**(会话分支家族树就是这么挂上去的)。与普通子菜单共用同一套
+//! 坐标(父项右缘 `left:100% / top:-4px` + `anchored` 贴边收拢)、同一套展开互斥
+//! (`open_path`)与同一套关闭语义(点外 / Esc / 悬停同层别的项),差别只在
+//! 内容由调用方给一个 `Fn(&mut Window, &mut App) -> AnyElement`。
+//!
+//! **清理**:原版返回一个 `cleanup`(`root.unmount()`),这里靠**闭包本身的所有权**
+//! —— 菜单收起时 `entries` 整份 drop,闭包捕获的东西(通常是个 `Entity`)随之释放。
+//! 与原版的一处偏差:原版在子菜单**收起**时就 unmount(再悬停要重新拉数据),
+//! 这里闭包活到整个菜单关闭为止,所以调用方缓存的实体在一次菜单生命周期内复用,
+//! 反复悬停不重扫磁盘。
+//!
 //! # 焦点
 //!
 //! 打开时把焦点收到菜单上(Esc 要有人接),关闭时**先还给打开前那个元素、再执行
@@ -62,6 +76,13 @@ use crate::ui;
 /// 菜单项被点中时跑的动作。
 pub type MenuHandler = Rc<dyn Fn(&mut Window, &mut App)>;
 
+/// 自绘子菜单面板的内容构造器(原版 `submenuRender`)。
+///
+/// 子菜单展开期间**每次菜单重绘都会调一遍**,所以里面别做重活 —— 有状态的面板
+/// (要拉数据那种)在闭包里懒建一次 `Entity` 缓存起来,之后只
+/// `clone().into_any_element()`。
+pub type SubmenuRender = Rc<dyn Fn(&mut Window, &mut App) -> AnyElement>;
+
 /// 菜单里的一条。与 `contextMenu.ts` 的 `MenuEntry` 一一对应。
 pub enum MenuEntry {
     Item(MenuItem),
@@ -83,6 +104,9 @@ pub struct MenuItem {
     disabled: bool,
     /// 非空 = 该项是子菜单父项:悬停展开,自身点击不触发动作。
     submenu: Vec<MenuEntry>,
+    /// 自绘子菜单面板。与 [`submenu`](Self::submenu) 互斥(两者都给时以它为准),
+    /// 展开/坐标/关闭语义完全相同,只是内容由调用方画。
+    submenu_element: Option<SubmenuRender>,
     on_click: Option<MenuHandler>,
 }
 
@@ -94,6 +118,7 @@ impl MenuItem {
             danger: false,
             disabled: false,
             submenu: Vec::new(),
+            submenu_element: None,
             on_click: None,
         }
     }
@@ -124,10 +149,32 @@ impl MenuItem {
         self
     }
 
+    /// 挂一块**自绘面板**当子菜单(原版 `submenuRender`)。
+    ///
+    /// 悬停展开、坐标、贴边、关闭全部走菜单机制,调用方只管内容。
+    /// 有状态的面板(要拉数据的那种)在闭包外建 `Entity`,闭包里只 clone:
+    ///
+    /// ```ignore
+    /// let panel = cx.new(|cx| BranchFamilyPanel::new(..., cx));
+    /// MenuItem::new(label).submenu_element(move |_window, _cx| panel.clone().into_any_element())
+    /// ```
+    pub fn submenu_element(
+        mut self,
+        render: impl Fn(&mut Window, &mut App) -> AnyElement + 'static,
+    ) -> Self {
+        self.submenu_element = Some(Rc::new(render));
+        self
+    }
+
+    /// 这一项是子菜单父项吗(普通子菜单 / 自绘面板都算)。
+    fn has_submenu(&self) -> bool {
+        !self.submenu.is_empty() || self.submenu_element.is_some()
+    }
+
     /// 这一项点得动吗(禁用 / 子菜单父项 / 没挂动作都点不动)。
     /// 渲染与测试共用同一个判据,免得两边漂移。
     pub fn is_actionable(&self) -> bool {
-        !self.disabled && self.submenu.is_empty() && self.on_click.is_some()
+        !self.disabled && !self.has_submenu() && self.on_click.is_some()
     }
 }
 
@@ -238,9 +285,11 @@ pub fn show(
 /// 关掉当前菜单(幂等)。焦点还给打开菜单前的那个元素。
 ///
 /// 基件的对称入口:菜单内部的三条关闭路径(点项 / 点外 / Esc)都走
-/// [`ContextMenu::dismiss`],这个是留给**外部**主动收菜单用的
-/// (切项目、窗口失焦之类),本轮还没有调用点。
-#[allow(dead_code)]
+/// [`ContextMenu::dismiss`],这个是留给**外部**主动收菜单用的。
+///
+/// 目前唯一的调用点是自绘子菜单面板里的可点节点([`crate::branch_family`]):
+/// 面板嵌在菜单项里、被菜单面板的 `occlude` 挡着,点击冒泡不到全窗遮罩,
+/// 只能自己把菜单收掉。
 pub fn close(window: &mut Window, cx: &mut App) {
     let entity = layer(cx);
     entity.update(cx, |menu, cx| menu.dismiss(window, cx));
@@ -307,9 +356,12 @@ impl ContextMenu {
     }
 
     /// 根面板。单独一层是为了让 `self` 的不可变借用不跨到 `render` 的其余部分。
-    fn render_root_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+    ///
+    /// `window` 一路透传到项级 —— 自绘子菜单面板([`MenuItem::submenu_element`])
+    /// 的构造器要它。
+    fn render_root_panel(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         match self.open.as_ref() {
-            Some(open) => self.render_panel(&open.entries, Vec::new(), cx),
+            Some(open) => self.render_panel(&open.entries, Vec::new(), window, cx),
             None => div().into_any_element(),
         }
     }
@@ -318,6 +370,7 @@ impl ContextMenu {
         &self,
         entries: &[MenuEntry],
         ancestors: Vec<usize>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let open_path = self
@@ -362,7 +415,8 @@ impl ContextMenu {
                     );
                 }
                 MenuEntry::Item(item) => {
-                    panel = panel.child(self.render_item(item, &ancestors, index, &open_path, cx));
+                    panel = panel
+                        .child(self.render_item(item, &ancestors, index, &open_path, window, cx));
                 }
             }
         }
@@ -376,9 +430,10 @@ impl ContextMenu {
         ancestors: &[usize],
         index: usize,
         open_path: &[usize],
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let has_submenu = !item.submenu.is_empty();
+        let has_submenu = item.has_submenu();
         let disabled = item.disabled;
         let danger = item.danger;
         let handler = item.on_click.clone();
@@ -462,7 +517,11 @@ impl ContextMenu {
         if submenu_open {
             let mut child_path = ancestors.to_vec();
             child_path.push(index);
-            let submenu = self.render_panel(&item.submenu, child_path, cx);
+            // 自绘面板优先:两者都给时以它为准(见 `submenu_element` 的字段注释)
+            let submenu = match item.submenu_element.as_ref() {
+                Some(render) => render(window, cx),
+                None => self.render_panel(&item.submenu, child_path, window, cx),
+            };
             row = row.child(
                 div()
                     .absolute()
@@ -499,7 +558,7 @@ impl Render for ContextMenu {
         else {
             return div();
         };
-        let panel = self.render_root_panel(cx);
+        let panel = self.render_root_panel(window, cx);
         let size = window.viewport_size();
 
         div().child(
@@ -598,6 +657,26 @@ mod tests {
             assert_eq!(hotkey_label(false, false, false, "F2"), "F2");
             assert_eq!(hotkey_label(true, false, true, "←"), "Ctrl+Alt+←");
         }
+    }
+
+    /// 自绘子菜单(`submenu_element`)与普通子菜单在**父项语义**上完全等价:
+    /// 都算子菜单父项(画 `▸`、悬停展开),自身都点不动。
+    #[test]
+    fn 自绘子菜单与普通子菜单父项语义一致() {
+        let plain = MenuItem::new("a").submenu(vec![separator()]);
+        let custom = MenuItem::new("a").submenu_element(|_, _| div().into_any_element());
+        assert!(plain.has_submenu());
+        assert!(custom.has_submenu(), "自绘面板也算子菜单父项");
+        assert!(!MenuItem::new("a").has_submenu());
+
+        // 挂了动作也点不动 —— 悬停展开的项点自己不该触发动作
+        let custom = MenuItem::new("a")
+            .on_click(|_, _| {})
+            .submenu_element(|_, _| div().into_any_element());
+        assert!(!custom.is_actionable());
+
+        // 展开路径的计算对两种父项同一套(`has_submenu` 是唯一入参)
+        assert_eq!(next_open_path(&[], 2, custom.has_submenu()), vec![2]);
     }
 
     /// 「点得动」的判据:禁用 / 子菜单父项 / 没挂动作都点不动。

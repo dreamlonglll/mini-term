@@ -41,6 +41,7 @@ use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel, v_
 use gpui_component::tooltip::Tooltip;
 use mt_ui::icons::{AiVendor, BrandIcon};
 
+use crate::branch_family;
 use crate::focus_nav::{self, Direction, PaneRect};
 use crate::i18n::{t, tr};
 use crate::markers;
@@ -48,6 +49,7 @@ use crate::menu::{self, MenuEntry, MenuItem, hotkey_label};
 use crate::modal;
 use crate::overlay;
 use crate::pane_actions;
+use crate::session_branch::{BranchMenuSegment, branch_menu_segment};
 use crate::store::AppStore;
 use crate::tree::{SplitDirection, SplitNode};
 use crate::ui;
@@ -138,29 +140,41 @@ fn sizes_to_percent(pixels: &[f64]) -> Option<Vec<f64>> {
 
 /// tab 右键菜单的**项序**。`None` = 分隔线。
 ///
-/// 对照 `PaneGroup.tsx:336-383`。**跳过「分支会话 / 查看会话分支」** ——
-/// fork 那套(能力位表 / 家族树面板 / 自记账)在 GPUI 侧还没有;
-/// 原版那条「未获会话身份」的置灰提示同样属于 fork 位,一并不出现。
+/// 对照 `PaneGroup.tsx:336-383`,逐项照抄(含分支那一段的条件出现)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TabMenuAction {
     Rename,
     SplitRight,
     SplitDown,
+    /// 「分支会话到新分屏」。有会话身份 + 该 agent 有 fork 能力位时才出。
+    ForkSession,
+    /// 「查看会话分支」—— 悬停展开家族面板,与上一项同进同出。
+    ViewSessionBranches,
+    /// 「分支会话(未获会话身份…)」置灰提示。与上面两项**互斥**:
+    /// 前者要有身份,它要的恰恰是没身份。
+    ForkNeedsIdentity,
     CloseTab,
     ClosePane,
 }
 
-fn tab_menu_actions() -> Vec<Option<TabMenuAction>> {
+/// 项序按分支段的两种形态展开。两个入参互斥(有身份就不会缺身份),
+/// 判据在 [`branch_menu_segment`] 一处。
+fn tab_menu_actions(can_fork: bool, identity_missing: bool) -> Vec<Option<TabMenuAction>> {
     use TabMenuAction::*;
-    vec![
+    let mut actions = vec![
         Some(Rename),
         None,
         Some(SplitRight),
         Some(SplitDown),
-        None,
-        Some(CloseTab),
-        Some(ClosePane),
-    ]
+    ];
+    if can_fork {
+        actions.extend([None, Some(ForkSession), Some(ViewSessionBranches)]);
+    }
+    if identity_missing {
+        actions.extend([None, Some(ForkNeedsIdentity)]);
+    }
+    actions.extend([None, Some(CloseTab), Some(ClosePane)]);
+    actions
 }
 
 /// 组装一个 tab 的右键菜单。`label` 是它当前的显示名(重命名的默认值)。
@@ -169,9 +183,31 @@ fn tab_menu(
     project_id: &str,
     pane_id: &str,
     label: &str,
+    cx: &App,
 ) -> Vec<MenuEntry> {
+    let pane_state = store
+        .read(cx)
+        .project_state(project_id)
+        .and_then(|s| s.layout.as_ref())
+        .and_then(|l| l.pane(pane_id));
+    let segment = pane_state
+        .map(|p| branch_menu_segment(p.ai_session.as_ref(), p.detected_agent.as_deref()))
+        .unwrap_or(BranchMenuSegment::None);
+    let project_path = store
+        .read(cx)
+        .project(project_id)
+        .map(|p| p.path.clone())
+        .unwrap_or_default();
+    let fork_session_id = match &segment {
+        BranchMenuSegment::Fork { session_id, .. } => session_id.clone(),
+        _ => String::new(),
+    };
+
     let mut entries = Vec::new();
-    for action in tab_menu_actions() {
+    for action in tab_menu_actions(
+        matches!(segment, BranchMenuSegment::Fork { .. }),
+        segment == BranchMenuSegment::NeedsIdentity,
+    ) {
         let Some(action) = action else {
             entries.push(menu::separator());
             continue;
@@ -214,6 +250,15 @@ fn tab_menu(
                     });
                 })
                 .into(),
+            // 分支三项:出不出由 `segment` 决定(项序表已经据此排好),
+            // 内容与终端本体右键**同一份实现**(`branch_family` 里那三个构造器)
+            TabMenuAction::ForkSession => branch_family::fork_menu_item(&store, pid, pane),
+            TabMenuAction::ViewSessionBranches => branch_family::view_branches_menu_item(
+                &store,
+                project_path.clone(),
+                fork_session_id.clone(),
+            ),
+            TabMenuAction::ForkNeedsIdentity => branch_family::needs_identity_menu_item(),
             // 关闭两项都走 pane_actions —— 与 tab 上的 ×、Ctrl+Shift+W 同一个
             // AI 感知确认入口
             TabMenuAction::CloseTab => MenuItem::new(t("paneGroup", "closeTab"))
@@ -717,7 +762,7 @@ impl TerminalArea {
                         cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                             cx.stop_propagation();
                             let entries =
-                                tab_menu(&this.store, &pid_menu, &pane_id_menu, &label_menu);
+                                tab_menu(&this.store, &pid_menu, &pane_id_menu, &label_menu, cx);
                             menu::show(event.position, entries, window, cx);
                         }),
                     )
@@ -1338,11 +1383,12 @@ mod tests {
         assert!(sizes_to_percent(&[f64::NAN]).is_none());
     }
 
-    /// tab 右键菜单的项序照抄原版(去掉 fork 那一段),两条分隔线。
+    /// tab 右键菜单的项序照抄原版(没有 AI 会话的那一支:分支段整段不出),
+    /// 两条分隔线。
     #[test]
     fn tab_右键菜单项序与原版一致() {
         use TabMenuAction::*;
-        let actions = tab_menu_actions();
+        let actions = tab_menu_actions(false, false);
         assert_eq!(
             actions,
             vec![
@@ -1356,6 +1402,75 @@ mod tests {
             ]
         );
         assert_eq!(actions.iter().filter(|a| a.is_none()).count(), 2);
+    }
+
+    /// 分支段的两种形态各自插在**分屏两项之后、关闭段之前**,各带一条前导分隔线
+    /// (逐条对照 `PaneGroup.tsx:354-372`)。
+    #[test]
+    fn tab_菜单分支段项序() {
+        use TabMenuAction::*;
+        // 有会话身份 + 有 fork 能力位
+        assert_eq!(
+            tab_menu_actions(true, false),
+            vec![
+                Some(Rename),
+                None,
+                Some(SplitRight),
+                Some(SplitDown),
+                None,
+                Some(ForkSession),
+                Some(ViewSessionBranches),
+                None,
+                Some(CloseTab),
+                Some(ClosePane),
+            ]
+        );
+
+        // 输入检测认出 AI 但没拿到 hook 身份 —— 置灰提示占同一个位置
+        assert_eq!(
+            tab_menu_actions(false, true),
+            vec![
+                Some(Rename),
+                None,
+                Some(SplitRight),
+                Some(SplitDown),
+                None,
+                Some(ForkNeedsIdentity),
+                None,
+                Some(CloseTab),
+                Some(ClosePane),
+            ]
+        );
+
+        // 两者互斥(有身份就不会缺身份),真同时为真也不该塌成畸形菜单:
+        // 段与段之间各自带分隔线,关闭段照旧在最后
+        let both = tab_menu_actions(true, true);
+        assert_eq!(both.last(), Some(&Some(ClosePane)));
+        assert_eq!(both.iter().filter(|a| a.is_none()).count(), 4);
+    }
+
+    /// 菜单显隐的判据与 `session_branch` 那份纯逻辑同源 —— 两处漂了就会出现
+    /// 「菜单出了 fork 项、点下去什么都不发生」。
+    #[test]
+    fn tab_菜单分支段判据取自能力位表() {
+        use crate::tree::AiSessionRef;
+        let id = "0199a1b2-c3d4-7e8f-9012-3456789abcde";
+        let session = AiSessionRef {
+            agent: Some("claude-code".into()),
+            session_id: id.into(),
+            cwd: None,
+        };
+        assert!(matches!(
+            branch_menu_segment(Some(&session), None),
+            BranchMenuSegment::Fork { .. }
+        ));
+        // 输入检测到 claude 但没身份 → 置灰提示那一支
+        assert_eq!(
+            branch_menu_segment(None, Some("claude")),
+            BranchMenuSegment::NeedsIdentity
+        );
+        // 普通 shell:整段不出
+        assert_eq!(branch_menu_segment(None, None), BranchMenuSegment::None);
     }
 
     /// 快捷键标签与 `main.rs` 里绑的键位一致(改键位时这条会提醒改标签)。
