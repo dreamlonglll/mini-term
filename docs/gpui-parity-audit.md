@@ -68,7 +68,7 @@
 
 - ActivityBar：🟡 M 批已成 44px 图标栏（PANEL/SESSIONS/STATS/SETTINGS 四钮逐点照抄原版 SVG + accent 竖条 + 全局 AI 徽标 + 跳完成钮）；SSH/移动端/Git 入口与更新红点随对应功能批加，徽标闪烁动画未做
 - ~~右抽屉应为悬浮层~~ ✅ Q 批：absolute right-0 + occlude + shadow，画在三栏后弹窗前（对应原版 z-45）；自建 6px 左缘拖拽手柄（移动/松手挂根容器，松手才落宽度）；开合不再触发 PTY resize；对照源码确认原版 RightDrawer 不压 overlayStack，GPUI 同步不进 overlay 栈。注：用量面板按源码实况保持居中 Modal（原版 UsageStatsModal 本就不在抽屉里，审计此前括注有误）；抽屉标题栏 chrome（sessions|git 分段+✕）留 V 批
-- Toast：缺悬停暂停 / × 关闭 / 最多 5 条 / wsl-info、mobile-session、paste-error 三种 kind / 点击跳项目细节
+- ~~Toast 五小项~~ ✅ Z 批自建 toast.rs 全覆盖（主会话复核 2026-08-19 夜）：悬停暂停=丢定时器句柄且移开重计满 5s、MAX_VISIBLE=5 超出排队不丢、WslInfo/MobileSession/PasteError 三 kind、点击按 jumps_to_project 跳项目、× 关闭
 - ~~Modal 行为：无 overlayStack 快捷键让路；同一 modal 可叠开（缺 isOpen 守卫）~~ ✅ N 批（防叠开）+ P 批（让路）：`overlay.rs` 是唯一的覆盖物栈，弹窗/右键菜单/终端查找条全部登记；全局 action 处理器开头两道闸——① `has_focused_input`（等价原版 `isTypingTarget`，终端不是 Input 所以在终端里敲字不受影响）② 覆盖物压着让路，白名单只有 openSettings / globalSearch。**Esc 只关最上层在 GPUI 里是结构性免费的**（按键沿焦点链派发），原版那套栈顶判定不必复刻
 - store 缺失 action：renameProject / setProjectDescription / renamePaneById / exitedPtyIds 系列 / markers 系列 / dirKinds / pendingFork 系列 / collectAiProjects / addProject 的 parentProjectId
 - 提示音：Win32 PlaySoundW 只认 .wav（原版支持 mp3/ogg）；无自定义音时回落 MessageBeep 而非原版 880→660Hz 双音
