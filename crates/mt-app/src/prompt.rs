@@ -13,34 +13,35 @@
 //!
 //! 审计记的「同一 modal 可叠开(缺 isOpen 守卫)」就修在这儿:`window.open_dialog`
 //! 是**栈**,连按两次 Ctrl+, 会摞出两个一模一样的设置框(下面那个永远关不掉,
-//! 因为 Esc 只关栈顶)。这里按 `kind` 记一张「开着的种类」表:同种类第二次直接
-//! 忽略,**不同**种类照样能叠(设置框里再弹确认框是合法的,原版 `prompt.ts` 也
-//! 专门为此写了栈顶判定)。
+//! 因为 Esc 只关栈顶)。守卫走 [`crate::overlay`] 那个统一的覆盖物栈:同种类第二次
+//! 直接忽略,**不同**种类照样能叠(设置框里再弹确认框是合法的,原版 `prompt.ts`
+//! 也专门为此写了栈顶判定)。P 批把右键菜单与三件新浮层一并并进那个栈,
+//! 全局快捷键的让路判据从此只有它一处。
 //!
 //! 摘表放在 `Dialog::on_close` 里 —— 它在确定 / 取消 / Esc / 遮罩 / 关闭按钮
 //! **五条路**上都会被调到(见 dialog.rs 的 `render`),不会漏掉某一条把种类
-//! 永久钉在表里。
+//! 永久钉在表里。**第六条路是程序化关闭**([`close_guarded`]):
+//! `window.close_dialog` 只弹 Root 的栈、**不会**触发 `on_close`,所以那条路要
+//! 自己摘表,否则该种类再也开不出来。
 
-use std::collections::HashSet;
 use std::rc::Rc;
 
 use gpui::{
-    App, AppContext, ClickEvent, Global, IntoElement, ParentElement, SharedString, Styled, Window,
-    div, px,
+    App, AppContext, ClickEvent, IntoElement, ParentElement, SharedString, Styled, Window, div, px,
 };
 use gpui_component::WindowExt as _;
 use gpui_component::dialog::{Dialog, DialogButtonProps};
 use gpui_component::input::{Input, InputState};
 
 use crate::i18n::t;
+use crate::overlay;
 use crate::ui;
 
 // ─── 防叠开 ───────────────────────────────────────────────────
 
-/// 当前开着的弹窗种类。
-#[derive(Default)]
-struct OpenDialogs(HashSet<&'static str>);
-impl Global for OpenDialogs {}
+/// 弹窗种类标识。真身在 [`crate::overlay::kind`](crate::overlay::kind) ——
+/// 弹窗只是覆盖物的一种,常量表和右键菜单/浮层共用一份。
+pub use crate::overlay::kind;
 
 /// 同种类只允许开一个的 `open_dialog`。`kind` 是种类标识,取值见
 /// [`kind`] 模块里的常量 —— 写字面量容易打错,而打错的后果是守卫静默失效。
@@ -48,36 +49,35 @@ pub fn open_guarded<F>(kind: &'static str, window: &mut Window, cx: &mut App, bu
 where
     F: Fn(Dialog, &mut Window, &mut App) -> Dialog + 'static,
 {
-    if !cx.default_global::<OpenDialogs>().0.insert(kind) {
+    if !overlay::push(overlay::key(kind)) {
         return;
     }
     window.open_dialog(cx, move |dialog, window, cx| {
         // on_close 放在最后 —— 它会覆盖 build 里设过的同名回调,而这一条
         // (摘掉种类标记)漏了就再也开不出同种类的弹窗了
-        build(dialog, window, cx).on_close(move |_: &ClickEvent, _window, cx| {
-            cx.default_global::<OpenDialogs>().0.remove(kind);
+        build(dialog, window, cx).on_close(move |_: &ClickEvent, _window, _cx| {
+            overlay::pop(overlay::key(kind));
         })
     });
 }
 
-/// 这种弹窗现在开着吗。给「开之前要先做点别的」的调用方提前判一次用
-/// (见 [`show_prompt`]:它得先建输入框实体并抢焦点,被守卫拦下就白抢了)。
-fn is_open(kind: &'static str, cx: &mut App) -> bool {
-    cx.default_global::<OpenDialogs>().0.contains(kind)
+/// 主动关掉某种弹窗(Ctrl+Shift+F 第二次按下要能把搜索框关回去)。
+///
+/// 只在它**正在栈顶**时才动手:上面还压着别人(比如搜索框里又弹了确认框)的话,
+/// `window.close_dialog` 关掉的会是那个别人。返回值 = 这次有没有真关。
+pub fn close_guarded(kind: &'static str, window: &mut Window, cx: &mut App) -> bool {
+    if !overlay::is_top(overlay::key(kind)) {
+        return false;
+    }
+    overlay::pop(overlay::key(kind));
+    window.close_dialog(cx);
+    true
 }
 
-/// 弹窗种类标识。一个常量 = 一种「同时只能开一个」的弹窗。
-pub mod kind {
-    pub const SETTINGS: &str = "settings";
-    pub const ADD_PROJECT: &str = "add-project";
-    pub const RENAME_PANE: &str = "rename-pane";
-    pub const REMOVE_PROJECT: &str = "remove-project";
-    /// 通用输入框(重命名 / 新建文件 / 编辑描述…)。
-    pub const PROMPT: &str = "prompt";
-    /// 通用确认框(关终端 / 删文件…)。
-    pub const CONFIRM: &str = "confirm";
-    /// 通用提示框(操作失败)。
-    pub const ALERT: &str = "alert";
+/// 这种弹窗现在开着吗。给「开之前要先做点别的」的调用方提前判一次用
+/// (见 [`show_prompt`]:它得先建输入框实体并抢焦点,被守卫拦下就白抢了)。
+fn is_open(kind: &'static str) -> bool {
+    overlay::contains(overlay::key(kind))
 }
 
 // ─── prompt ───────────────────────────────────────────────────
@@ -98,7 +98,7 @@ pub fn show_prompt(
 ) {
     // 守卫要在**建输入框之前**判:open_guarded 里那道判定拦下来的时候,
     // 焦点已经被下面这个新输入框抢走了(而它永远不会被画出来)
-    if is_open(kind::PROMPT, cx) {
+    if is_open(kind::PROMPT) {
         return;
     }
     let title = title.into();

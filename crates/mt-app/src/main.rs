@@ -44,11 +44,14 @@ mod i18n;
 mod menu;
 mod modal;
 mod notify;
+mod overlay;
 mod pane;
 mod pane_actions;
 mod persist;
 mod project_list;
+mod project_switcher;
 mod prompt;
+mod search_modal;
 mod session_panel;
 mod shell_ops;
 mod store;
@@ -124,8 +127,37 @@ actions!(
         FocusUp,
         /// 焦点移到下方分屏(Alt+↓)
         FocusDown,
+        /// 终端内查找(Ctrl+F)
+        TerminalSearch,
+        /// 全局搜索(Ctrl+Shift+F,toggle)
+        GlobalSearch,
+        /// 项目快速切换器(Ctrl+Shift+P)
+        SwitchProject,
     ]
 );
+
+/// 这次全局动作要不要让路。对应原版 `useGlobalHotkeys` 里连着的那两道闸:
+///
+/// ```text
+/// if (isTypingTarget(e.target)) return;                    // ① 焦点在输入框里
+/// if (overlayOpen && id !== 'openSettings' && id !== 'globalSearch') return;  // ②
+/// ```
+///
+/// ① 用 `gpui_component` 的 `has_focused_input`(它按 `Input` 元素的
+/// 聚焦/失焦维护 `Root::focused_input`,语义等价于原版那个「是不是 input /
+/// textarea / contenteditable」的判定;终端**不是** `Input`,所以在终端里敲字
+/// 照样能用快捷键 —— 与原版排除 `xterm-helper-textarea` 同效)。
+/// 注意它**优先于**白名单:原版在输入框里连 openSettings / globalSearch 也让路。
+///
+/// ② 判据统一在 [`overlay`]。白名单那两条(`OpenTerminalSettings` /
+/// `GlobalSearch`)的处理器里只保留 ①,不加 ②。
+fn yields_to_typing(window: &mut Window, cx: &mut App) -> bool {
+    window.has_focused_input(cx)
+}
+
+fn yields_to_overlay(window: &mut Window, cx: &mut App) -> bool {
+    yields_to_typing(window, cx) || !overlay::allows(overlay::Yield::ToOverlay)
+}
 
 /// 选中叶内第 N 个 tab(Ctrl+1..9,**1-based**;越界不动)。
 ///
@@ -317,6 +349,9 @@ impl Workspace {
     }
 
     fn on_new_terminal(&mut self, _: &NewTerminal, window: &mut Window, cx: &mut Context<Self>) {
+        if yields_to_overlay(window, cx) {
+            return;
+        }
         let Some(project_id) = self.store.read(cx).active_project_id.clone() else {
             return;
         };
@@ -332,6 +367,9 @@ impl Workspace {
     /// 走 [`pane_actions::close_leaf_of_pane`] 而不是直接调 store:关闭前要盘点
     /// 组里活着的 AI 会话并确认(三条关闭路径共用同一个入口)。
     fn on_close_pane(&mut self, _: &ClosePane, window: &mut Window, cx: &mut Context<Self>) {
+        if yields_to_overlay(window, cx) {
+            return;
+        }
         let Some((project_id, pane_id)) = self.target_pane(cx) else {
             return;
         };
@@ -339,10 +377,16 @@ impl Workspace {
     }
 
     fn on_next_pane(&mut self, _: &NextPane, window: &mut Window, cx: &mut Context<Self>) {
+        if yields_to_overlay(window, cx) {
+            return;
+        }
         self.cycle_pane(1, window, cx);
     }
 
     fn on_prev_pane(&mut self, _: &PrevPane, window: &mut Window, cx: &mut Context<Self>) {
+        if yields_to_overlay(window, cx) {
+            return;
+        }
         self.cycle_pane(-1, window, cx);
     }
 
@@ -356,6 +400,9 @@ impl Workspace {
     }
 
     fn on_select_pane(&mut self, action: &SelectPane, window: &mut Window, cx: &mut Context<Self>) {
+        if yields_to_overlay(window, cx) {
+            return;
+        }
         let Some((project_id, pane_id)) = self.target_pane(cx) else {
             return;
         };
@@ -366,10 +413,16 @@ impl Workspace {
     }
 
     fn on_split_right(&mut self, _: &SplitRight, window: &mut Window, cx: &mut Context<Self>) {
+        if yields_to_overlay(window, cx) {
+            return;
+        }
         self.split(SplitDirection::Horizontal, window, cx);
     }
 
     fn on_split_down(&mut self, _: &SplitDown, window: &mut Window, cx: &mut Context<Self>) {
+        if yields_to_overlay(window, cx) {
+            return;
+        }
         self.split(SplitDirection::Vertical, window, cx);
     }
 
@@ -385,13 +438,19 @@ impl Workspace {
     fn on_toggle_middle(
         &mut self,
         _: &ToggleMiddleColumn,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if yields_to_overlay(window, cx) {
+            return;
+        }
         self.store.update(cx, |store, cx| store.toggle_middle_column(cx));
     }
 
     fn on_rename_pane(&mut self, _: &RenamePane, window: &mut Window, cx: &mut Context<Self>) {
+        if yields_to_overlay(window, cx) {
+            return;
+        }
         let Some((project_id, pane_id)) = self.target_pane(cx) else {
             return;
         };
@@ -411,15 +470,23 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // 白名单动作:覆盖物压着照样开(设置面板本身就是弹窗),但**焦点在输入框
+        // 里时仍然让路** —— 原版 isTypingTarget 那道闸排在白名单之前
+        if yields_to_typing(window, cx) {
+            return;
+        }
         modal::open_terminal_settings(self.store.clone(), window, cx);
     }
 
     fn on_toggle_sessions(
         &mut self,
         _: &ToggleSessions,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if yields_to_overlay(window, cx) {
+            return;
+        }
         self.toggle_sessions(cx);
     }
 
@@ -433,7 +500,10 @@ impl Workspace {
         cx.notify();
     }
 
-    fn on_toggle_usage(&mut self, _: &ToggleUsage, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_toggle_usage(&mut self, _: &ToggleUsage, window: &mut Window, cx: &mut Context<Self>) {
+        if yields_to_overlay(window, cx) {
+            return;
+        }
         self.toggle_usage(cx);
     }
 
@@ -454,6 +524,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if yields_to_overlay(window, cx) {
+            return;
+        }
         let Some((project_id, pane_id)) = self.store.read(cx).next_attention_target(None) else {
             return;
         };
@@ -478,8 +551,62 @@ impl Workspace {
     }
 
     fn focus_adjacent(&mut self, dir: Direction, window: &mut Window, cx: &mut Context<Self>) {
+        // 这四条只从快捷键进来,守卫放这一处就够(Alt+方向键在文本输入框里
+        // 还是「按词移动」,让路给弹窗是必须的)
+        if yields_to_overlay(window, cx) {
+            return;
+        }
         self.terminal_area
             .update(cx, |area, cx| area.focus_adjacent(dir, window, cx));
+    }
+
+    /// Ctrl+F:在**当前焦点 pane** 上开查找条。
+    ///
+    /// 与原版有一处差:原版在「当前 pane 还没有 ptyId」时**不拦**这次按键
+    /// (让 Ctrl+F 原样落进终端,发 `\x06`),而 gpui 的 action 一旦绑上就必然吞掉
+    /// 按键、没有「退回按键」的通路。取舍是:PTY 还没起来的空 pane 上按 Ctrl+F
+    /// 什么也不发生 —— 那个 pane 本来也没有终端能收这个字节。
+    fn on_terminal_search(&mut self, _: &TerminalSearch, window: &mut Window, cx: &mut Context<Self>) {
+        if yields_to_overlay(window, cx) {
+            return;
+        }
+        let Some((project_id, pane_id)) = self.target_pane(cx) else {
+            return;
+        };
+        let pane = {
+            let store = self.store.read(cx);
+            store
+                .project_state(&project_id)
+                .and_then(|state| state.layout.as_ref())
+                .and_then(|layout| layout.pane(&pane_id))
+                .and_then(|pane| pane.pty_id)
+                .and_then(|pty_id| store.terminal(pty_id).cloned())
+        };
+        let Some(pane) = pane else { return };
+        pane.update(cx, |pane, cx| pane.open_search(window, cx));
+    }
+
+    /// Ctrl+Shift+F:开合全局搜索。
+    ///
+    /// **两道闸都不加**,与原版有一处有意的偏差:原版把 globalSearch 放进白名单
+    /// 时写着「它是 toggle,弹窗开着时按第二次才能关掉」,可搜索框一打开焦点就在
+    /// 它自己的输入框里,`isTypingTarget` 那道闸先一步把这条挡掉了 —— 注释里的
+    /// toggle 实际做不到。这里让它真的 toggle(按注释的意图,不是按它的 bug)。
+    fn on_global_search(&mut self, _: &GlobalSearch, window: &mut Window, cx: &mut Context<Self>) {
+        search_modal::toggle(self.store.clone(), window, cx);
+    }
+
+    /// Ctrl+Shift+P:项目快速切换器。
+    fn on_switch_project(
+        &mut self,
+        _: &SwitchProject,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if yields_to_overlay(window, cx) {
+            return;
+        }
+        project_switcher::open(self.store.clone(), window, cx);
     }
 }
 
@@ -773,6 +900,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_focus_right))
             .on_action(cx.listener(Self::on_focus_up))
             .on_action(cx.listener(Self::on_focus_down))
+            .on_action(cx.listener(Self::on_terminal_search))
+            .on_action(cx.listener(Self::on_global_search))
+            .on_action(cx.listener(Self::on_switch_project))
             .child(toggle_strip)
             .child(div().flex_1().h_full().child(columns_group))
             .children(usage_layer)
@@ -822,6 +952,27 @@ fn main() {
             KeyBinding::new("ctrl-,", OpenTerminalSettings, Some("Workspace")),
             KeyBinding::new("ctrl-tab", NextPane, Some("Workspace")),
             KeyBinding::new("ctrl-shift-tab", PrevPane, Some("Workspace")),
+            // 搜索三连(原版 hotkeys.ts 的 terminalSearch / globalSearch / switchProject)。
+            // 键位与原版逐条对齐:Ctrl+F 在终端里本是 `\x06`,原版同样把它整个吃掉
+            // (`consume(e)` 连 stopPropagation 一起),这里靠 action 绑定天然做到。
+            KeyBinding::new("ctrl-f", TerminalSearch, Some("Workspace")),
+            KeyBinding::new("ctrl-shift-f", GlobalSearch, Some("Workspace")),
+            KeyBinding::new("ctrl-shift-p", SwitchProject, Some("Workspace")),
+            // 项目切换器的方向键。谓词写成 `"ProjectSwitcher > Input"` 而不是
+            // `"ProjectSwitcher"` —— 只有与 `Input` **同深度**才压得过组件库自带的
+            // `up`/`down`(单行输入框那两个处理器直接 return,不 propagate,
+            // 挂在容器上的 on_key_down 永远收不到)。详见 project_switcher 模块注释,
+            // 机制有单测钉住。
+            KeyBinding::new(
+                "up",
+                project_switcher::SwitcherPrev,
+                Some("ProjectSwitcher > Input"),
+            ),
+            KeyBinding::new(
+                "down",
+                project_switcher::SwitcherNext,
+                Some("ProjectSwitcher > Input"),
+            ),
             // 原版没有的三条,保留
             KeyBinding::new("ctrl-shift-a", ToggleSessions, Some("Workspace")),
             KeyBinding::new("ctrl-shift-u", ToggleUsage, Some("Workspace")),

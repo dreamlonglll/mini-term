@@ -48,6 +48,7 @@ pub struct Palette {
     pub border_default: Hsla,
     pub color_success: Hsla,
     pub color_error: Hsla,
+    pub color_warning: Hsla,
     pub color_ai_working: Hsla,
     pub color_folder: Hsla,
     pub color_file: Hsla,
@@ -89,6 +90,7 @@ impl Palette {
             },
             color_success: rgb8(0x6b, 0xb8, 0x7a),
             color_error: rgb8(0xd4, 0x60, 0x5a),
+            color_warning: rgb8(0xd4, 0xa8, 0x4a),
             color_ai_working: rgb8(0xf5, 0xc5, 0x18),
             color_folder: rgb8(0xd4, 0xc8, 0xa0),
             color_file: rgb8(0x7d, 0xcf, 0xb8),
@@ -122,6 +124,7 @@ impl Palette {
             },
             color_success: rgb8(0x2d, 0x8a, 0x46),
             color_error: rgb8(0xc0, 0x39, 0x2b),
+            color_warning: rgb8(0xb0, 0x86, 0x20),
             color_ai_working: rgb8(0xc4, 0x52, 0x1a),
             color_folder: rgb8(0x8a, 0x7a, 0x40),
             color_file: rgb8(0x1a, 0x8a, 0x6a),
@@ -138,8 +141,9 @@ impl Palette {
     /// 终端背景色(已含 `terminalOpacity`)。
     ///
     /// 包里没有的语义色(error / ai-working / folder / file)保留该明暗的内置值 ——
-    /// 前端同样不映射它们。`accentAlt` 在前端归到 `--color-warning`,壳里目前没有
-    /// 对应 token,丢掉不用。
+    /// 前端同样不映射它们。`accentAlt` 在前端归到 `--color-warning`(见
+    /// `themePackManager.ts` 的 `map['--color-warning'] = c.accentAlt`),P 批补上
+    /// 这一格之后照着映;包里没声明就退回该明暗的内置值。
     pub fn from_pack(applied: &AppliedThemePack) -> Self {
         let base = if applied.appearance.is_dark() {
             Self::dark()
@@ -181,6 +185,13 @@ impl Palette {
             color_info: match applied.colors.secondary {
                 Some(_) => applied.color(ThemeSlot::Secondary),
                 None => base.color_info,
+            },
+            // 同上:`color(AccentAlt)` 未声明时回落 accent(那是写 CSS 变量的口径),
+            // 而这一格的语义是「警告/高亮」,回落 accent 会让搜索命中的底色与强调色
+            // 撞成一片 —— 所以先看 Option 在不在
+            color_warning: match applied.colors.accent_alt {
+                Some(_) => applied.color(ThemeSlot::AccentAlt),
+                None => base.color_warning,
             },
             ..base
         }
@@ -270,9 +281,21 @@ pub fn color_success() -> Hsla {
 pub fn color_error() -> Hsla {
     token(|p| p.color_error)
 }
+/// `--color-warning`(搜索命中高亮、结果截断提示)
+pub fn color_warning() -> Hsla {
+    token(|p| p.color_warning)
+}
 /// `--color-ai-working`
 pub fn color_ai_working() -> Hsla {
     token(|p| p.color_ai_working)
+}
+
+/// 乘性改 alpha 的公开入口(`bg-[var(--x)]/30` 那种写法的对应物)。
+pub fn with_alpha(color: Hsla, a: f32) -> Hsla {
+    Hsla {
+        a: a.clamp(0.0, 1.0),
+        ..color
+    }
 }
 /// `--color-folder`
 pub fn color_folder() -> Hsla {
@@ -410,4 +433,108 @@ pub fn status_dot(id: impl Into<ElementId>, status: PaneStatus) -> impl IntoElem
         .size(px(11.0))
         .color(status_color(status))
         .contrast(bg_elevated())
+}
+
+/// 把一行文本按「命中区间」切成 `(片段, 是否命中)` 序列 —— 搜索结果与项目切换器
+/// 的关键词高亮共用这一份。
+///
+/// # 两条与原版不一样的地方,都是有意的
+///
+/// 1. **区间按 char 计**,不是字节:`mt_project::search` 的 `match_ranges` 就是
+///    char 口径(它自己做了 byte→char 换算),TS 侧的 `String.slice` 也是按码元切。
+///    直接拿去切 `&str[..]` 会在中文行上 panic。
+/// 2. **相邻命中段合并**:原版 `HighlightText` 逐区间各发一个 `<span>`,而每个
+///    span 带 `px-[1px]` 内边距 —— 两段紧挨着时会多出 2px 缝。合并之后视觉一致。
+///
+/// 坏区间(越界 / 逆序 / 与前一段重叠)一律跳过而不是 panic:结果是后端给的,
+/// 一条坏区间不该把整行吞掉。
+pub fn highlight_runs(text: &str, ranges: &[(usize, usize)]) -> Vec<(String, bool)> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut runs: Vec<(String, bool)> = Vec::new();
+    let mut push = |slice: &[char], hit: bool| {
+        if slice.is_empty() {
+            return;
+        }
+        match runs.last_mut() {
+            Some((buf, last_hit)) if *last_hit == hit => buf.extend(slice.iter()),
+            _ => runs.push((slice.iter().collect(), hit)),
+        }
+    };
+
+    let mut cursor = 0usize;
+    for &(start, end) in ranges {
+        let start = start.max(cursor).min(chars.len());
+        let end = end.min(chars.len());
+        if end <= start {
+            continue;
+        }
+        push(&chars[cursor..start], false);
+        push(&chars[start..end], true);
+        cursor = end;
+    }
+    push(&chars[cursor..], false);
+    runs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn 高亮切段_无区间时原样一段() {
+        assert_eq!(highlight_runs("abc", &[]), vec![("abc".into(), false)]);
+        assert!(highlight_runs("", &[]).is_empty());
+    }
+
+    #[test]
+    fn 高亮切段_首尾与中间() {
+        assert_eq!(
+            highlight_runs("abcdef", &[(2, 4)]),
+            vec![("ab".into(), false), ("cd".into(), true), ("ef".into(), false)]
+        );
+        // 命中在开头 / 结尾时不产生空段
+        assert_eq!(
+            highlight_runs("abc", &[(0, 1)]),
+            vec![("a".into(), true), ("bc".into(), false)]
+        );
+        assert_eq!(
+            highlight_runs("abc", &[(2, 3)]),
+            vec![("ab".into(), false), ("c".into(), true)]
+        );
+    }
+
+    /// 相邻命中段合并成一段(原版每段带 1px 内边距,不合并会多出缝)。
+    #[test]
+    fn 高亮切段_相邻命中合并() {
+        assert_eq!(
+            highlight_runs("abcd", &[(0, 1), (1, 2)]),
+            vec![("ab".into(), true), ("cd".into(), false)]
+        );
+    }
+
+    /// 区间是 **char** 口径:中文行按字节切会 panic,按 char 切才对得上。
+    #[test]
+    fn 高亮切段_按字符不按字节() {
+        assert_eq!(
+            highlight_runs("你好世界", &[(1, 3)]),
+            vec![("你".into(), false), ("好世".into(), true), ("界".into(), false)]
+        );
+    }
+
+    /// 坏区间(越界 / 逆序 / 重叠)跳过而不是 panic。
+    #[test]
+    fn 高亮切段_坏区间不炸() {
+        assert_eq!(highlight_runs("abc", &[(5, 9)]), vec![("abc".into(), false)]);
+        assert_eq!(highlight_runs("abc", &[(2, 1)]), vec![("abc".into(), false)]);
+        // 重叠:后一段被夹到前一段末尾之后,字符不会重复出现
+        assert_eq!(
+            highlight_runs("abcdef", &[(0, 3), (1, 5)]),
+            vec![("abcde".into(), true), ("f".into(), false)]
+        );
+        // 越界的右端夹到行尾
+        assert_eq!(
+            highlight_runs("abc", &[(1, 99)]),
+            vec![("a".into(), false), ("bc".into(), true)]
+        );
+    }
 }

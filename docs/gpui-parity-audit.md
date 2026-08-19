@@ -19,7 +19,7 @@
 | # | 缺口 | 规模 | 落点 | 状态 |
 |---|---|---|---|---|
 | 1 | **IME 接线**：`pane.rs` 换用 `mt_ui::TerminalView`；`clear_preedit()` 两调用点（activate_pane/dispose_terminal）；OSC 应答改 `terminal_color_rgb` | 小 | mt-app | ✅ J 批。gpui 派发顺序（action 先于 key 监听）已实证等价原版 capture-consume，机制写进 pane.rs 注释 |
-| 2 | **快捷键对齐**：ctrl-shift-b 修正 / ClosePane→close_leaf（关整组）/ 补 Ctrl+Tab、Ctrl+Shift+Tab、Ctrl+1..9 | 小 | mt-app | 🟡 J 批完成本体；剩 switchProject/globalSearch/terminalSearch/markerPrev/Next 5 条随对应功能批落地（未占位）；Ctrl+Shift+A/U/J 三条原版没有、保留并已注明 |
+| 2 | **快捷键对齐**：ctrl-shift-b 修正 / ClosePane→close_leaf（关整组）/ 补 Ctrl+Tab、Ctrl+Shift+Tab、Ctrl+1..9 | 小 | mt-app | 🟡 J 批完成本体；P 批补齐 terminalSearch=Ctrl+F / globalSearch=Ctrl+Shift+F / switchProject=Ctrl+Shift+P（键位逐条对 `hotkeys.ts`）；剩 markerPrev/Next 随 marker 批（#25）；Ctrl+Shift+A/U/J 三条原版没有、保留并已注明 |
 | 3 | ~~窗口聚焦即清未读~~ | 小 | mt-app | ✅ G 收尾已补 |
 | 4 | **i18n 接线** | 中 | mt-app + mt-config | ✅ L 批。90 调用点 84 key 覆盖 8 文件，key 逐条照 TSX 抄并有「84 key×双语全在」测试防字典重生成漂移；AppConfig.locale 存 String 防手改坏值拖垮整份 config；首启 Win32 探测不落盘（对齐 detectInitialLang 跟随系统）；gpui-component 桥必须传 bcp47 而非 code（其 ui.yml 键是 zh-CN，传 zh 会静默回英文）；语言切换入口在设置对话框；ElementId 改用 key() 防随语言变。**留 7 条缺 key 文案（TODO(i18n) 注释在位）+1 条 pricingLocalHint → 转 M 批走 TS 源头补+重生成** |
 | 5 | **主题桥接线** | 中 | mt-app + mt-ui | 🟡 J 批：theme.rs 唯一装配入口（light/dark/auto + customThemeId 失败回落只清内存不落盘）、ui.rs 改 Palette（dark/light 逐值抄 styles.css、from_pack 对齐 buildTokenMap，函数签名零改动走 thread_local）、terminalFollowTheme 含存量终端热更、切换 pub 入口全备且起 PTY 前装配。剩：`config.skin` 皮肤色表（blueprint/fluent2）、appearance 设置页 UI（→#19）、背景图渲染（→K 批 mt-ui） |
@@ -55,10 +55,10 @@
 | 20 | **自定义标题栏**：拖拽区 + 最小化/最大化/关闭 + Win11 贴靠（set_max_button_rect）+ 项目切换胶囊 + 全局状态灯（~~窗口标题带版本号~~ ✅ J 批已改 `Mini-Term v{ver}`） | 大 | mt-app | ❌ |
 | 21 | **系统托盘**：三色灯 + 右键项目菜单 + 点击定位 + trayStatusEnabled/trayMaxProjects/trayClickFocus（config 字段已在；`unread_done_count()`/`next_attention_target()` 是现成消费口） | 大 | mt-app（Windows API） | ❌ |
 | 22 | **移动端中转**：mt_relay 实际接线（RelayHost/RelayEvents 实现）+ MobileRelayModal（地址/密钥/状态徽章/配对二维码/重置）+ AiLauncherSection CRUD + 5 条事件落点（status/pairing-code/start-session/rename-pane/会话结构同步）+ store 补 rename_pane_by_id | 大 | mt-app | ❌ |
-| 23 | 终端查找 | 中 | mt-ui + mt-app | 🟡 O 批完成 mt-ui 侧全部：RegexIter 一次枚举共用结果集（计数/跳转/高亮一套口径）、smart case 用内联 (?i)/(?-i) 绕开、\b 不可用改邻格判定整词、200ms 去抖+内容指纹不含 display_offset（回看不触发重搜）、命中进行签名+配色进帧指纹与 damage 缓存共存、配色逐字照抄旧版 decorations 有 pin 测试；剩 mt-app 宿主接线 5 步（search_bar.rs 模块注释可照抄，Ctrl+F 绑 pane 容器，⚠️ 焦点归还是硬要求） |
-| 24 | 全局搜索 UI（SearchModal，后端 mt-project/search.rs 669 行已就绪，Ctrl+Shift+F） | 中 | mt-app | ❌ |
+| 23 | 终端查找 | 中 | mt-ui + mt-app | ✅ O 批 mt-ui 引擎 + P 批宿主接线：引擎常驻 `TerminalPane`（关键词活过开关）、查找条是终端容器里的 `absolute` 子元素（旧版那条 rAF 定位轮询整个不需要）、Esc/✕ 关闭时 `window.focus(&pane.focus)` 还焦点。⚠️ Ctrl+F **必须绑 action 不能绑 pane 容器的 on_key_down**（TerminalView 认得 Ctrl+F 并 stop_propagation，key 监听是从焦点节点往上冒泡）——search_bar.rs 模块注释已就地更正。偏差两条：逐 pane 一条（原版是 portal 单例）、Ctrl+F 不是 toggle（照原版 `openTerminalSearch` 只开不关） |
+| 24 | 全局搜索 UI（SearchModal，后端 mt-project/search.rs 669 行已就绪，Ctrl+Shift+F） | 中 | mt-app | 🟡 P 批。`start_search` 起专用后台线程 + `futures::mpsc` 回主线程（**不占 background_executor**——那是给会 await 的 future 用的）；换搜索直接换掉前台任务，旧结果自然到不了，不必比对 searchId；1000 条封顶、按文件分组保序、`.*` 开关、四态状态条全部照抄且有单测。剩：点结果开 `FileViewerModal`（依赖 #29，现退到原版**双击**那条动作=外部编辑器打开）、分组头 sticky（gpui 无 sticky）、结果列表无虚拟化（原版也没有） |
 | 25 | AI 任务 marker 体系（markersByPty store + 按钮 + 浮层 + markerPrev/Next 快捷键） | 中 | mt-app | ❌ |
-| 26 | ProjectSwitcher（Ctrl+Shift+P 模糊匹配 + 高亮 + 键盘导航） | 中 | mt-app | ❌ |
+| 26 | ProjectSwitcher（Ctrl+Shift+P 模糊匹配 + 高亮 + 键盘导航） | 中 | mt-app | ✅ P 批。子序列模糊匹配 + 分组路径兜底匹配 + 命中字符高亮 + ↑↓ 环形导航 + Enter 切项目 + Esc 关闭，逐条照 TSX；分组路径从 `config.project_tree` 现算（项目分组 #13 还没做，但读它不需要）。⚠️ 方向键必须用 `"ProjectSwitcher > Input"` 谓词绑 action —— 与 `Input` 自带的 `up`/`down` **同深度**才压得过它（单行输入框那两个处理器 return 且不 propagate，容器上的 on_key_down 永远收不到），机制有单测钉住 |
 | 27 | **Git 全套 UI**：GitChanges/GitHistory/CommitDiffModal/DiffModal/GitWorktreeModal/BranchFamilyPanel + 右抽屉 sessions⇄git 互斥切换（后端 git.rs 1559 行已就绪） | 大 | mt-app | ❌ |
 | 28 | **SSH 全套 UI**：SshModal/SshAssocModal/AddRemoteProjectModal/远程项目/断线重连覆盖层/exitedPtyIds 体系（依赖 mt-ssh 进 crates/，属收尾阶段联动件） | 大 | mt-app | ❌ |
 | 29 | 文件预览与编辑器（FileViewerModal/CodeEditor） | 大 | mt-app | ❌ |
@@ -69,7 +69,7 @@
 - ActivityBar：🟡 M 批已成 44px 图标栏（PANEL/SESSIONS/STATS/SETTINGS 四钮逐点照抄原版 SVG + accent 竖条 + 全局 AI 徽标 + 跳完成钮）；SSH/移动端/Git 入口与更新红点随对应功能批加，徽标闪烁动画未做
 - 右抽屉应为**悬浮层**（absolute 覆盖在终端上），现做成了第三栏
 - Toast：缺悬停暂停 / × 关闭 / 最多 5 条 / wsl-info、mobile-session、paste-error 三种 kind / 点击跳项目细节
-- Modal 行为：无 overlayStack 快捷键让路；同一 modal 可叠开（缺 isOpen 守卫）
+- ~~Modal 行为：无 overlayStack 快捷键让路；同一 modal 可叠开（缺 isOpen 守卫）~~ ✅ N 批（防叠开）+ P 批（让路）：`overlay.rs` 是唯一的覆盖物栈，弹窗/右键菜单/终端查找条全部登记；全局 action 处理器开头两道闸——① `has_focused_input`（等价原版 `isTypingTarget`，终端不是 Input 所以在终端里敲字不受影响）② 覆盖物压着让路，白名单只有 openSettings / globalSearch。**Esc 只关最上层在 GPUI 里是结构性免费的**（按键沿焦点链派发），原版那套栈顶判定不必复刻
 - store 缺失 action：renameProject / setProjectDescription / renamePaneById / exitedPtyIds 系列 / markers 系列 / dirKinds / pendingFork 系列 / collectAiProjects / addProject 的 parentProjectId
 - 提示音：Win32 PlaySoundW 只认 .wav（原版支持 mp3/ogg）；无自定义音时回落 MessageBeep 而非原版 880→660Hz 双音
 - 空态右键弹 shell 菜单；tab 键盘可达（Enter/Space）

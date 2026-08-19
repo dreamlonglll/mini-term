@@ -82,18 +82,22 @@
 //! }
 //! ```
 //!
-//! 挂到键上(`ctrl-f` / macOS `cmd-f`):`TerminalView` 只吞它认识的键,
-//! `Ctrl+F` 会原样冒泡上来,所以在 pane 的容器 div 上加一句就行:
+//! 挂到键上(`ctrl-f` / macOS `cmd-f`)—— ⚠️ **不能**在 pane 的容器 div 上挂
+//! `on_key_down`:`TerminalView` 的 `on_key_down` 认得 `Ctrl+F`(它不是可打印键,
+//! `keystroke_to_bytes` 给出 `\x06`),写进 PTY 之后就 `stop_propagation` 了,
+//! 而 gpui 的 key 监听是**从焦点节点往上冒泡**,终端那一层在容器之前。
+//!
+//! 正确做法是绑成 **action**:gpui 的按键派发「先匹配 action 绑定、后跑 key 监听」,
+//! 绑上就等于旧版 capture 阶段那句 `consume(e)`,终端根本看不到这个键。
 //!
 //! ```ignore
-//! .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
-//!     let ks = &ev.keystroke;
-//!     if ks.key == "f" && (ks.modifiers.control || ks.modifiers.platform) && !ks.modifiers.shift {
-//!         this.toggle_search(window, cx);
-//!         cx.stop_propagation();
-//!     }
-//! }))
+//! // main.rs
+//! actions!(mini_term, [TerminalSearch]);
+//! KeyBinding::new("ctrl-f", TerminalSearch, Some("Workspace"))
+//! // Workspace 的处理器里找到焦点 pane,调 pane.open_search(window, cx)
 //! ```
+//!
+//! (mt-app 侧的实现见 `crates/mt-app/src/main.rs::on_terminal_search`。)
 //!
 //! ⚠️ **焦点归还是必须的**:不还的话焦点停在已卸载的输入框上,用户接着敲的字
 //! 全部落空 —— 旧版注释里那条踩过的坑([`crate::terminal::search`] 一样适用)。

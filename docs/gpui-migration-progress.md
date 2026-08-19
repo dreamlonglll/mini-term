@@ -13,7 +13,7 @@
 | Wave 1 | 后端五块并行搬运 + TerminalElement 端到端 | ✅ 2026-08-18 全部验收入库（6/6） |
 | Wave 2 | mt-relay、mt-app 全壳（store/三栏/Tab/分屏树） | ✅ 2026-08-18 两件均验收入库；面板/Modal/i18n/主题桥移入 Wave 3 |
 | Wave 3 | G=mt-app UI 批（Modal/AI 历史+用量面板/通知/分屏比例+焦点导航）；H=mt-ui 渲染批（IME/鼠标上报/damage/主题桥）；I=mt-i18n 字典基建 | ✅ 2026-08-18 全部验收入库。G 经收尾 agent 补验：66 单测+4 集成全绿（老断言零改动），六模块齐（托盘明确未做），收尾另修 3 个真 bug（分屏比例恢复首帧 FALLBACK_AREA 基准错→改首帧量尺下帧铺树；窗口聚焦不清未读；折叠栏把 sizes 抹成最小值）+ 2 处资源问题（会话面板惰性加载防 WSL 冷启动、用量面板 Task 句柄无界增长）+6 单测；I ✅（`d2af55f`）；H ✅（`92390d4`） |
-| Wave 4+ | 按 docs/gpui-parity-audit.md 30 条缺口逐批清零（第 0 层接线 → 基建 → 面板 → 整块新功能） | 🔵 J ✅（`9246abf`）；K ✅（`b2fa0a0`）；L ✅（`04ee62b`）；M ✅（`14c84e9`，⚠️ gpui-component 无 svg 资产，图标一律走 mt-ui VectorIcon）；O ✅（`2bb0205`）；N ✅ 验收（113+4 绿：自建 menu.rs 基建+四处右键菜单+通用弹窗防叠开+关闭确认四路径统一）；下一波 P=搜索三连（终端查找接线/SearchModal/ProjectSwitcher）+快捷键让路 |
+| Wave 4+ | 按 docs/gpui-parity-audit.md 30 条缺口逐批清零（第 0 层接线 → 基建 → 面板 → 整块新功能） | 🔵 J ✅（`9246abf`）；K ✅（`b2fa0a0`）；L ✅（`04ee62b`）；M ✅（`14c84e9`，⚠️ gpui-component 无 svg 资产，图标一律走 mt-ui VectorIcon）；O ✅（`2bb0205`）；N ✅（`e91bb03`）；P 🟡 已交付待验收（139+4 绿：搜索三连 #23/#24/#26 + overlay.rs 快捷键让路 + 三条快捷键）；下一波候选=marker 体系 #25 / 设置面板 #19 / Git UI #27 |
 | 收尾 | mt-ssh/mt-core 移入 crates/、删 src-tauri/ 与 src/、发版切换 | ⬜ |
 
 ## Wave 1 —— 2026-08-18 派出 6 个并行 agent
@@ -122,6 +122,16 @@
 - `is_wsl_unc_path`/parse_wsl_unc 判定已是工作区**第三份**复刻（mt-ai / mt-pty 走 mt-core / mt-relay），收尾统一去重。
 - mt-relay 默认自持 2 线程 tokio 运行时（apply 惰性创建）；mt-app 若有全局运行时应改用 `with_runtime` 注入，避免进程双线程池。
 - **J 批（122b5ca 后）记档**：`ThemePacks::open()` 钉死 `mt_config::paths::themes_dir()` 不认 `MT_APP_DATA_DIR`（mt-app 用 `ThemePacks::at()` 绕开，待 mt-config 统一）；`lookup_ai_session_cwd` 同步阻塞（仅存量无 cwd 会话触发）；resume 的会话 cwd 起 PTY 失败拿不到信号，以 `is_dir()` 预检代偿；`config.skin`（blueprint/fluent2）无对应色表未实现。
+- **P 批记档（搜索三连 + 快捷键让路）**：
+  - `overlay.rs` 是覆盖物栈的唯一真相（`thread_local`，不是 gpui `Global` —— `TerminalPane::drop` 要摘登记而那里拿不到 `cx`）。**Esc 只关最上层在 GPUI 里是结构性免费的**（按键沿焦点链派发），原版 `overlayStack` 那套栈顶判定只需保留「防叠开 + 快捷键让路」两件。
+  - **让路两道闸**：① `Window::has_focused_input`（gpui-component 按 `Input` 的聚焦/失焦维护 `Root::focused_input`）等价原版 `isTypingTarget`；② `overlay::allows`。⚠️ 若哪天 `focused_input` 卡在 `Some`（输入框被聚焦着卸载且没触发 blur），**全部全局快捷键会一起哑** —— 点一下别处即恢复，排障先看这里。
+  - **`Ctrl+F` 必须绑 action，不能绑 pane 容器的 `on_key_down`**：`TerminalView` 认得 Ctrl+F（`keystroke_to_bytes` → `\x06`）并 `stop_propagation`，而 key 监听从焦点节点往上冒泡、终端那层在容器之前。search_bar.rs 的模块注释已就地更正。
+  - **`Input` 的 `up`/`down`/`enter` 是 action**，且单行模式下 `MoveUp`/`MoveDown` 直接 return 不 propagate → 外层容器的 `on_key_down` 收不到方向键。破法：谓词写 `"ProjectSwitcher > Input"`（`depth_of` 对 `Descendant` 返回最深层深度，与裸 `"Input"` 打平）+ 打平后按注册顺序**倒序**决胜负（壳的 `cx.bind_keys` 在 `gpui_component::init` 之后）。`enter` 不走这条：单行 `Enter` 处理器会 propagate 且无条件 `emit(PressEnter)`，订阅它更直白。
+  - `Dialog` 当自绘浮层用的三件套：`.p_0()`（默认 24px 内边距会把自画的分隔线切断）、`.close_button(false)`（它画 `IconName::Close`，0.5.1 无 svg 资产 → 空白）、聚焦输入框要 `window.defer`（`open_dialog` 会在之后把焦点抢到面板上）。
+  - `window.close_dialog` **不触发** `Dialog::on_close` → 程序化关闭必须走 `prompt::close_guarded`（自己摘覆盖物栈），否则该种类再也开不出来。
+  - `mt_project::search::start_search` 自带专用后台线程，结果走 `futures::mpsc` 回主线程；**不要**塞进 `background_executor`（那是给会 await 的 future 用的，同步闭包会占死一根工作线程）。
+  - `Palette` 补 `color_warning`（`--color-warning`；主题包按 `accentAlt` 映射，与 `themePackManager.ts` 同口径）。
+  - 遗留：SearchModal 点结果依赖 `FileViewerModal`（#29）未迁移，现退到外部编辑器打开；结果列表无虚拟化；分组头无 sticky；`ProjectSwitcher` 面板高度按候选条数估算（`Dialog` 只吃固定高度，没有 `max-h` 语义）。
 - **N 批（2bb0205 后）记档**：mt-project 无 reveal 语义（mt-app 自落 explorer `/select,` 走 raw_arg 防空格路径二次转义，建议上收 mt_project::editor）；`fs::delete_entry` 是硬删非回收站（文案「无法撤销」相符，后续可接 trash crate）；gpui-component `InputState::select_all` 是 pub(super)，prompt 默认值全选做不到；菜单键盘方向键导航/进场动画未做。
 
 ## 风险与决议记录

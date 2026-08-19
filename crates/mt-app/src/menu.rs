@@ -41,6 +41,11 @@
 //! 打开时把焦点收到菜单上(Esc 要有人接),关闭时**先还给打开前那个元素、再执行
 //! 菜单项动作**。顺序照抄原版的注释:动作可能同步打开一个输入弹窗并聚焦输入框,
 //! 反过来的话还原焦点会把光标从那个输入框上抢走。
+//!
+//! # 覆盖物栈
+//!
+//! 菜单开着时全局快捷键要让路(原版把 `'menu'` 也压进 `overlayStack`),所以
+//! [`show`] / [`ContextMenu::dismiss`] 各自压栈/摘栈,见 [`crate::overlay`]。
 
 use std::rc::Rc;
 
@@ -51,6 +56,7 @@ use gpui::{
     prelude::FluentBuilder, px, relative,
 };
 
+use crate::overlay;
 use crate::ui;
 
 /// 菜单项被点中时跑的动作。
@@ -214,6 +220,8 @@ pub fn show(
             Some(prev) => prev.prev_focus,
             None => window.focused(cx),
         };
+        // 换菜单时这一步是空操作(已经在栈里),照调不误 —— 压栈是幂等的
+        overlay::push(overlay::key(overlay::kind::MENU));
         let focus = cx.focus_handle();
         window.focus(&focus);
         menu.open = Some(OpenMenu {
@@ -291,6 +299,7 @@ impl ContextMenu {
         let Some(open) = self.open.take() else {
             return;
         };
+        overlay::pop(overlay::key(overlay::kind::MENU));
         if let Some(prev) = open.prev_focus {
             window.focus(&prev);
         }

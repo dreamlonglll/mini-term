@@ -28,6 +28,8 @@
 //! 的 16ms 节流:刷屏时 reader 每读一块就发一个信号,不节流会让重绘频率跟着 read
 //! 次数走(远高于 60fps)。
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,11 +45,15 @@ use mt_terminal::alacritty_terminal::event::Event as TermEvent;
 use mt_terminal::alacritty_terminal::term::TermMode;
 use mt_terminal::{TermSize, TerminalEmulator};
 use mt_ui::terminal::{MouseMods, prefers_local_handling};
-use mt_ui::{CopiedTip, DwellConfig, TerminalStyle, TerminalTheme, TerminalView};
+use mt_ui::{
+    CopiedTip, DwellConfig, TerminalSearch, TerminalSearchBar, TerminalStyle, TerminalTheme,
+    TerminalView,
+};
 
 use crate::ai::AiBridge;
 use crate::i18n::t;
 use crate::menu::{self, MenuItem};
+use crate::overlay;
 
 /// pane 发给上层的事件。
 pub enum PaneEvent {
@@ -92,6 +98,13 @@ pub struct TerminalPane {
     /// 气泡自撤任务的句柄。存着是为了「连着复制两次」时上一个计时器被丢弃 ——
     /// 否则第一次的计时器到点会把第二次刚弹出来的气泡提前抹掉。
     _tip_timer: Option<Task<()>>,
+    /// 终端内查找引擎。与查找条、渲染层**共用同一份**(计数与高亮从此是同一份
+    /// 状态),所以关键词/选项活得过查找条的一次次开关 —— 与原版
+    /// `useTerminalSearchStore` 把关键词留在 store 里同语义。
+    search: Rc<RefCell<TerminalSearch>>,
+    /// 浮动查找条。`None` = 没打开。**逐 pane 一条**(原版是全局单例,见
+    /// [`Self::open_search`] 的说明)。
+    search_bar: Option<Entity<TerminalSearchBar>>,
     /// 唤醒任务的句柄。掉了任务就没了,必须存着。
     _wake: Task<()>,
 }
@@ -184,6 +197,11 @@ impl TerminalPane {
         // 但 `track_focus` 由 TerminalView 自己调 —— 见 view.rs 的接线说明。
         let focus = cx.focus_handle();
 
+        // 查找引擎常驻(关键词要活过一次次开关),一开始是关着的 —— 关着时
+        // 渲染层不跑重搜、不画高亮,零开销。
+        let search = Rc::new(RefCell::new(TerminalSearch::new()));
+        search.borrow_mut().set_enabled(false);
+
         let view = {
             let this = cx.weak_entity();
             let this_for_input = this.clone();
@@ -198,6 +216,8 @@ impl TerminalPane {
                     theme.clone(),
                     vcx,
                 )
+                // 查找命中的底色/描边由渲染层自己画,宿主只管开关引擎
+                .search(search.clone())
                 .on_grid_resize(move |size: TermSize, _window, cx| {
                     // grid 尺寸是渲染侧量出来的(可用像素 ÷ cell 尺寸),PTY 必须跟着改,
                     // 否则 shell 换行位置与画面对不上。
@@ -257,8 +277,62 @@ impl TerminalPane {
             spawn_error,
             copied_tip: None,
             _tip_timer: None,
+            search,
+            search_bar: None,
             _wake: wake,
         }
+    }
+
+    /// Ctrl+F。打开查找条,已经开着就把焦点送回输入框并全选。
+    ///
+    /// # 与原版的两处口径差
+    ///
+    /// 1. **逐 pane 一条,不是全局单例**。原版 `TerminalSearchBar` 是 portal 到
+    ///    body 的单例,靠 rAF 每帧量目标 pane 的矩形贴过去,换 pane 就把上一条挪走。
+    ///    GPUI 侧查找条是终端容器里的 `absolute` 子元素,分屏/拖分隔条/切 tab 全由
+    ///    布局自动跟随 —— 单例反而要额外簿记「现在贴着谁」。代价:两个分屏可以各开
+    ///    一条(各搜各的),原版做不到。
+    /// 2. **不是 toggle**。原版 `openTerminalSearch()` 只开不关(再按一次是「回到
+    ///    查找条接着改关键词」,焦点在输入框里时那一下压根到不了全局 handler),
+    ///    关闭走 Esc / `✕`。这里照此:第二次按 Ctrl+F = 聚焦 + 全选。
+    pub fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(bar) = self.search_bar.clone() {
+            bar.update(cx, |bar, cx| bar.focus_input(window, cx));
+            return;
+        }
+        // 覆盖物栈里登记一条(按 pty_id 区分)。它**不挡**全局快捷键,
+        // 只是防叠开 + 让「现在压着什么」有唯一真相,见 `overlay` 模块注释。
+        if !overlay::push(overlay::terminal_search(self.pty_id)) {
+            return;
+        }
+        let search = self.search.clone();
+        let emulator = self.emulator.clone();
+        let this = cx.weak_entity();
+        let bar = cx.new(|cx| {
+            TerminalSearchBar::new(search, emulator, window, cx).on_close(move |window, cx| {
+                let _ = this.update(cx, |pane: &mut TerminalPane, cx| {
+                    pane.dismiss_search(window, cx);
+                });
+            })
+        });
+        // 开引擎 + 按已有关键词搜一遍 + 聚焦全选
+        bar.update(cx, |bar, cx| bar.open(window, cx));
+        self.search_bar = Some(bar);
+        cx.notify();
+    }
+
+    /// 收起查找条(Esc / `✕` 都走这里)。
+    ///
+    /// ⚠️ **焦点必须还给终端**:不还的话焦点停在已卸载的输入框上,用户接着敲的字
+    /// 全部落空,还得先用鼠标点一下终端才能继续 —— 原版 `closeTerminalSearch()`
+    /// 里那句 `term.focus()` 就是为这个。
+    fn dismiss_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.search_bar.take().is_none() {
+            return;
+        }
+        overlay::pop(overlay::terminal_search(self.pty_id));
+        window.focus(&self.focus);
+        cx.notify();
     }
 
     /// 往 PTY 写字节。
@@ -371,7 +445,7 @@ impl TerminalPane {
         self.view.update(cx, |view, cx| view.clear_preedit(cx));
     }
 
-    /// 关闭 pane:杀子进程 + 清掉 AI 感知里的一切痕迹。
+    /// 关闭 pane:杀子进程 + 清掉 AI 感知里的一切痕迹 + 收掉查找条。
     pub fn shutdown(&mut self) {
         if let Some(pty) = self.pty.as_mut()
             && let Err(err) = pty.kill()
@@ -380,6 +454,16 @@ impl TerminalPane {
         }
         self.pty = None;
         self.ai.remove_pane(self.pty_id);
+        self.close_search_state();
+    }
+
+    /// 丢掉查找状态(关键词一并清掉)。**不碰焦点** —— 这条路上终端马上就没了,
+    /// 与原版 `closeTerminalSearchFor(ptyId)` 同语义(它同样不去 focus 已死的终端)。
+    fn close_search_state(&mut self) {
+        self.search.borrow_mut().clear();
+        if self.search_bar.take().is_some() {
+            overlay::pop(overlay::terminal_search(self.pty_id));
+        }
     }
 }
 
@@ -419,6 +503,9 @@ impl Drop for TerminalPane {
         if self.pty.is_some() {
             self.shutdown();
         }
+        // shutdown 走过就已经摘干净了;这一条兜住「PTY 起失败的 pane 被丢弃」
+        // ——覆盖物栈里留一条死登记,那个 pty_id 复用之后查找条就再也开不出来。
+        self.close_search_state();
     }
 }
 
@@ -501,6 +588,12 @@ impl Render for TerminalPane {
                 }),
             )
             .child(self.view.clone())
+            // 终端内查找条:右上角,距顶 6px、距右 14px —— 与原版
+            // `rect.top + 6` / `rect.right - w - 14` 同款(那边是 rAF 每帧算出来的
+            // fixed 坐标,这里由布局白拿)
+            .when_some(self.search_bar.clone(), |el, bar| {
+                el.child(div().absolute().top(px(6.0)).right(px(14.0)).child(bar))
+            })
             // 「已复制」气泡:叠在终端之上,坐标是元素相对值
             .when_some(self.copied_tip, |el, origin| {
                 el.child(

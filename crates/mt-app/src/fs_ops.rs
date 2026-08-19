@@ -104,6 +104,43 @@ pub fn reveal_in_file_manager(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// 按配置挑出「该用哪个外部编辑器」。`None` = 没配 → 调用方退到系统默认程序。
+///
+/// 纯函数,不碰 `App` —— 调用点普遍是「先 `store.read(cx)` 拿配置、再拿
+/// `&mut App` 丢后台」,两次借用必须分开两句写才过得了借用检查。
+pub fn configured_editor(config: &mt_config::AppConfig) -> Option<mt_project::editor::Editor> {
+    let editors: Vec<mt_project::editor::Editor> = config
+        .editors
+        .iter()
+        .map(|e| mt_project::editor::Editor {
+            name: e.name.clone(),
+            command: e.command.clone(),
+        })
+        .collect();
+    mt_project::editor::select_editor(&editors, config.default_editor.as_deref(), None).cloned()
+}
+
+/// 用挑好的编辑器打开路径(`None` = 系统默认程序)。**丢后台**跑 ——
+/// spawn 外部进程在网络盘 / 杀软环境下同样会卡住调用线程。
+pub fn open_path_with(
+    editor: Option<mt_project::editor::Editor>,
+    path: std::path::PathBuf,
+    cx: &mut gpui::App,
+) {
+    cx.background_executor()
+        .spawn(async move {
+            let result = match editor {
+                Some(_) => mt_project::editor::open_in_editor(editor.as_ref(), &path),
+                // 没配编辑器就用系统默认程序打开,别只给一句报错
+                None => mt_project::editor::open_path_with_default_app(&path),
+            };
+            if let Err(err) = result {
+                eprintln!("[files] 打开失败: {err:#}");
+            }
+        })
+        .detach();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

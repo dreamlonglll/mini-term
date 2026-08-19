@@ -188,35 +188,10 @@ impl FileTree {
     }
 
     fn open_file(&self, path: PathBuf, cx: &mut Context<Self>) {
-        let store = self.store.read(cx);
-        let config = store.config();
-        let editors: Vec<mt_project::editor::Editor> = config
-            .editors
-            .iter()
-            .map(|e| mt_project::editor::Editor {
-                name: e.name.clone(),
-                command: e.command.clone(),
-            })
-            .collect();
-        let editor = mt_project::editor::select_editor(
-            &editors,
-            config.default_editor.as_deref(),
-            None,
-        )
-        .cloned();
-        // spawn 外部进程同样可能卡(网络盘 / 杀软),丢后台
-        cx.background_executor()
-            .spawn(async move {
-                let result = match editor {
-                    Some(_) => mt_project::editor::open_in_editor(editor.as_ref(), &path),
-                    // 没配编辑器就用系统默认程序打开,别只给一句报错
-                    None => mt_project::editor::open_path_with_default_app(&path),
-                };
-                if let Err(err) = result {
-                    eprintln!("[files] 打开失败: {err:#}");
-                }
-            })
-            .detach();
+        // 两句写:第一句借完配置就还,第二句才拿可变借用丢后台
+        // (同一套挑编辑器 + 后台打开的逻辑,全局搜索点结果时也走它)
+        let editor = crate::fs_ops::configured_editor(self.store.read(cx).config());
+        crate::fs_ops::open_path_with(editor, path, cx);
     }
 
     /// 展开某个目录并(重)列它。新建文件/文件夹之后要用:原版是
