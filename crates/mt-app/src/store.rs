@@ -244,6 +244,89 @@ impl AppStore {
         cx.notify();
     }
 
+    /// 按路径找项目(`store.ts::findProjectByPath`)。
+    ///
+    /// 比对走 [`normalize_path`](crate::git_worktree::normalize_path)(分隔符统一 +
+    /// 去尾斜杠 + 转小写),与 worktree「是否已是项目」的判据同一份。
+    /// SSH 远程项目排除在外 —— worktree 的路径是本机路径。
+    pub fn find_project_by_path(&self, path: &str) -> Option<&ProjectConfig> {
+        let target = crate::git_worktree::normalize_path(path);
+        self.config.projects.iter().find(|p| {
+            p.ssh_connection_id.is_none() && crate::git_worktree::normalize_path(&p.path) == target
+        })
+    }
+
+    /// 添加项目并**返回它的 id**;`parent` 非空时挂成子项目。
+    ///
+    /// 对应 `store.ts:777-799` 的 `addProject(project, parentProjectId)`:
+    /// - 父项目必须真实存在,否则回落为普通顶层项目(防止产生渲染不出来的孤儿);
+    /// - **子项目不进 `projectTree`**(移动出去时才转成普通树节点);
+    /// - 路径已经是项目 → 返回既有 id,不重复添加(`GitWorktreeModal.tsx:341-351`)。
+    ///
+    /// 与 [`add_project`](Self::add_project) 的差别只有「带父项目 + 返回 id +
+    /// 不自动切过去」三条 —— worktree「设为项目」要自己决定切不切。
+    pub fn add_project_at(
+        &mut self,
+        path: &Path,
+        parent: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> String {
+        let path_str = path.to_string_lossy().to_string();
+        if let Some(existing) = self.find_project_by_path(&path_str).map(|p| p.id.clone()) {
+            return existing;
+        }
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path_str.clone());
+        let id = gen_id("proj");
+        let parent_ok = parent.filter(|pid| self.config.projects.iter().any(|p| p.id == *pid));
+
+        self.config.projects.push(ProjectConfig {
+            id: id.clone(),
+            name,
+            path: path_str,
+            description: None,
+            saved_layout: None,
+            expanded_dirs: Vec::new(),
+            ssh_mcp_enabled: false,
+            ssh_cli_token: None,
+            ssh_connection_ids: None,
+            env_vars: Vec::new(),
+            wsl_sessions_distro: None,
+            ssh_connection_id: None,
+            parent_project_id: parent_ok.map(str::to_string),
+            kind_override: None,
+        });
+        if parent_ok.is_none() {
+            let tree = self.config.project_tree.get_or_insert_with(Vec::new);
+            tree.push(mt_config::ProjectTreeItem::ProjectId(id.clone()));
+        }
+        self.project_states.insert(id.clone(), ProjectState::new());
+        self.expanded_dirs.insert(id.clone(), HashSet::new());
+        self.save_config_soon(cx);
+        cx.notify();
+        id
+    }
+
+    /// 只回收某个项目的终端,**不删项目**(`projectActions.ts:25-32` 的
+    /// `disposeProjectTerminals`)。
+    ///
+    /// worktree 删除必须先走这一步:Windows 上 shell 占着目录会让
+    /// `git worktree remove` 直接失败。
+    pub fn dispose_project_terminals(&mut self, project_id: &str, cx: &mut Context<Self>) {
+        let pty_ids: Vec<u32> = self
+            .project_states
+            .get(project_id)
+            .and_then(|s| s.layout.as_ref())
+            .map(|l| l.pty_ids())
+            .unwrap_or_default();
+        for pty_id in pty_ids {
+            self.dispose_terminal(pty_id, cx);
+        }
+        cx.notify();
+    }
+
     /// 添加项目(目录路径)。名字取目录名。
     pub fn add_project(&mut self, path: &Path, cx: &mut Context<Self>) {
         let path_str = path.to_string_lossy().to_string();
@@ -941,6 +1024,9 @@ impl AppStore {
 
     /// 回收一个终端:kill 子进程 + 清 AI 感知痕迹 + 摘掉视图与订阅。
     fn dispose_terminal(&mut self, pty_id: u32, cx: &mut Context<Self>) {
+        // 对应 `terminalCache.ts:546` 的 `aiPtyIds.delete(ptyId)` ——
+        // 不摘的话新 PTY 复用同一个编号时会被误当成 AI pane(嗅探静默失效)
+        crate::git_watch::forget_pane(pty_id);
         if let Some(entity) = self.terminals.remove(&pty_id) {
             // 组合中关 pane:先把预编辑收掉,免得 IME 还挂在一个即将消失的
             // 输入宿主上(marked range 不收回,下一次按键会被 IME 永久劫持)
@@ -998,6 +1084,13 @@ impl AppStore {
         match event {
             AiEvent::Status(change) => {
                 let status = PaneStatus::from_str(&change.status)?;
+                // Git 面板的 pty-output 嗅探要跳过 AI pane 的输出。判据与
+                // `App.tsx:284` 的 `markAiPty(ptyId, status === 'ai-working' ||
+                // status === 'ai-idle')` 一字不差(见 `git_watch` 模块注释)。
+                crate::git_watch::set_ai_pane(
+                    change.pty_id,
+                    matches!(status, PaneStatus::AiWorking | PaneStatus::AiIdle),
+                );
                 // attention 与状态解耦:codex 的 PermissionRequest 状态是 ai-working
                 // 但同样要点黄灯。判定按事件名,与旧版 isAttentionCause 同一张表。
                 let attention = change
@@ -1455,8 +1548,31 @@ impl AppStore {
 
     // === 右侧抽屉宽度 ===
 
+    /// 抽屉宽度。缺省 **340**(`App.tsx:541` 的 `?? 340`),钳在 240~720
+    /// (`RightDrawer.tsx:8-9`)。
     pub fn right_drawer_width(&self) -> f64 {
-        self.config.right_drawer_width.unwrap_or(320.0).clamp(240.0, 720.0)
+        self.config.right_drawer_width.unwrap_or(340.0).clamp(240.0, 720.0)
+    }
+
+    // === Git 「更改」区的视图模式 ===
+
+    /// `config.gitChangesViewMode`。**是 String 不是枚举**(磁盘格式与装机版共用),
+    /// 手改成坏值不能拖垮整份 config —— 认不出一律回落 `"list"`(照 `locale` 的做法)。
+    pub fn git_changes_view_mode(&self) -> &str {
+        match self.config.git_changes_view_mode.as_str() {
+            "tree" => "tree",
+            _ => "list",
+        }
+    }
+
+    pub fn set_git_changes_view_mode(&mut self, mode: &str, cx: &mut Context<Self>) {
+        let mode = if mode == "tree" { "tree" } else { "list" };
+        if self.config.git_changes_view_mode == mode {
+            return;
+        }
+        self.config.git_changes_view_mode = mode.to_string();
+        self.save_config_soon(cx);
+        cx.notify();
     }
 
     pub fn set_right_drawer_width(&mut self, width: f64, cx: &mut Context<Self>) {
