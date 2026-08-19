@@ -30,6 +30,7 @@ use mt_ui::theme_bridge::BackgroundArt;
 use mt_ui::{DwellConfig, TerminalStyle, TerminalTheme};
 
 use crate::ai::{AiBridge, AiEvent};
+use crate::markers::{self, AiMarker, MarkerBatch};
 use crate::notify::{AlertPlan, DoneTracker, NotifyPrefs, PaneRef, StatusTransition};
 use crate::pane::{PaneEvent, TerminalPane};
 use crate::persist;
@@ -107,6 +108,15 @@ pub struct AppStore {
     /// **纯运行时,不落盘** —— 与 [`Self::focused_pane_id`] 同类。
     mobile_relay_status: Option<MobileRelayStatusPayload>,
 
+    /// AI 任务标记(`src/store.ts:666-671` 的 `markersByPty`)。
+    /// **纯运行时,不落盘**;pane 一没,这一份跟着没(见 [`Self::dispose_terminal`])。
+    markers_by_pty: HashMap<u32, Vec<AiMarker>>,
+    /// 「这个 pane 上次跳到哪条标记」的游标(`useMarkerHotkeys.ts:19` 的 `lastJumpRef`)。
+    ///
+    /// 原版那份是模块级 ref、**从不清理**(pane 关了条目还在,微量泄漏 +
+    /// 「pty id 复用后游标是旧的」的边界)。这里与标记表同生共死,顺手修掉。
+    marker_cursor: HashMap<u32, String>,
+
     next_pty_id: u32,
     ai: AiBridge,
 
@@ -176,6 +186,8 @@ impl AppStore {
             pane_subs: HashMap::new(),
             focused_pane_id: None,
             mobile_relay_status: None,
+            markers_by_pty: HashMap::new(),
+            marker_cursor: HashMap::new(),
             next_pty_id: 1,
             ai,
             // 真正的配色在 `apply_theme_from_config` 里装配(要 `&mut App` 取系统
@@ -996,6 +1008,11 @@ impl AppStore {
             match event {
                 PaneEvent::Exited(code) => store.on_pty_exit(pty_id, *code, cx),
                 PaneEvent::UserInput => store.clear_pane_attention_by_pty(pty_id, cx),
+                // AI 任务标记。**必须走事件而不是在 write 里直接 update store** ——
+                // `write_to_pane` 是在 `store.update` 里调 `pane.write` 的,那里再去
+                // `AppStore::global(cx).update` 就是同一实体的嵌套 update(gpui 直接 panic)。
+                // `cx.emit` 是延后派发的,天然绕开。
+                PaneEvent::AiMarks(batch) => store.add_markers(pty_id, batch.clone(), cx),
             }
         });
         self.pane_subs.insert(pty_id, sub);
@@ -1029,11 +1046,119 @@ impl AppStore {
             .cloned()
     }
 
+    // === AI 任务标记(⚑)===
+
+    /// 某个 pane 的标记列表(没有就是空)。对应 `store.ts:1225` 的 `getMarkersForPty`。
+    pub fn markers_for_pty(&self, pty_id: u32) -> &[AiMarker] {
+        self.markers_by_pty
+            .get(&pty_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// 落一批标记(pane 在 [`crate::pane::TerminalPane::write`] 里当场取好锚点后发来)。
+    ///
+    /// 节奏照抄 `useAiSubmitMarker.ts:20-23`:**追加之后立刻剪一遍枝**,
+    /// 不在渲染路径上剪(见 [`crate::markers`] 的模块注释)。
+    fn add_markers(&mut self, pty_id: u32, batch: MarkerBatch, cx: &mut Context<Self>) {
+        if batch.submits.is_empty() {
+            return;
+        }
+        let list = self.markers_by_pty.entry(pty_id).or_default();
+        for (line, ts) in batch.submits {
+            markers::push_marker(list, pty_id, line, ts, batch.anchor);
+        }
+        markers::prune(list, batch.history, batch.max_scrollback);
+        // 过滤后为空则连键一起删(`store.ts:1219` 的同一处置)
+        if list.is_empty() {
+            self.markers_by_pty.remove(&pty_id);
+            self.marker_cursor.remove(&pty_id);
+        }
+        cx.notify();
+    }
+
+    /// 整份丢掉(`store.ts:1205-1211` 的 `clearMarkersForPty`)。游标一并清 ——
+    /// 原版那份游标从不清理,这里顺手修掉。
+    fn clear_markers_for_pty(&mut self, pty_id: u32) {
+        self.markers_by_pty.remove(&pty_id);
+        self.marker_cursor.remove(&pty_id);
+    }
+
+    /// 跳到某一条标记:滚到视口顶部 + 闪 300ms,并把游标推到它身上。
+    ///
+    /// 浮层点击与 Ctrl+Shift+↑/↓ **走的是同一条路**(原版 `useMarkerHotkeys.ts:56`
+    /// 与 `MarkerList.tsx:36-39` 调的都是 `scrollToMarker`),**不关任何东西**。
+    pub fn jump_to_marker(&mut self, pty_id: u32, marker_id: &str, cx: &mut Context<Self>) {
+        let Some(entity) = self.terminals.get(&pty_id).cloned() else {
+            return;
+        };
+        // 跳之前先剪一遍:锚点已经不可信的话宁可什么都不做,也不能跳到错的行上
+        let (history, max) = entity.read(cx).scrollback_state();
+        if let Some(list) = self.markers_by_pty.get_mut(&pty_id)
+            && markers::prune(list, history, max)
+        {
+            self.markers_by_pty.remove(&pty_id);
+            self.marker_cursor.remove(&pty_id);
+            cx.notify();
+        }
+        let Some(anchor) = self
+            .markers_for_pty(pty_id)
+            .iter()
+            .find(|m| m.id == marker_id)
+            .map(|m| m.anchor)
+        else {
+            return;
+        };
+        // 跳不动(pane 正在 alt screen 里)就不推游标 —— 连按方向键不该空走格子
+        if entity.update(cx, |pane, cx| pane.scroll_to_marker(anchor, cx)) {
+            self.marker_cursor.insert(pty_id, marker_id.to_string());
+        }
+    }
+
+    /// Ctrl+Shift+↑ / ↓。`dir = -1` 上一条、`+1` 下一条,**非环形**。
+    ///
+    /// 目标 pane 的解析与其它全局动作同口径:焦点 pane → 布局里第一个激活 pane
+    /// ([`Self::active_pane_id`],原版是 `focusedPtyIdFromDom()` → `resolveActivePane`)。
+    /// 列表空 / 到头都是静默不动,不弹任何提示(`useMarkerHotkeys.ts:39`、`:50`)。
+    pub fn step_marker(&mut self, dir: i32, cx: &mut Context<Self>) {
+        let Some(project_id) = self.active_project_id.clone() else {
+            return;
+        };
+        let Some(pty_id) = self
+            .active_pane_id(&project_id)
+            .and_then(|pane_id| {
+                self.project_states
+                    .get(&project_id)
+                    .and_then(|s| s.layout.as_ref())
+                    .and_then(|l| l.pane(&pane_id))
+                    .and_then(|p| p.pty_id)
+            })
+        else {
+            return;
+        };
+        let cursor = self
+            .marker_cursor
+            .get(&pty_id)
+            .and_then(|id| self.markers_for_pty(pty_id).iter().position(|m| &m.id == id));
+        let len = self.markers_for_pty(pty_id).len();
+        let Some(next) = markers::next_index(cursor, len, dir) else {
+            return;
+        };
+        let Some(target) = self.markers_for_pty(pty_id).get(next).map(|m| m.id.clone()) else {
+            return;
+        };
+        self.jump_to_marker(pty_id, &target, cx);
+    }
+
     /// 回收一个终端:kill 子进程 + 清 AI 感知痕迹 + 摘掉视图与订阅。
     fn dispose_terminal(&mut self, pty_id: u32, cx: &mut Context<Self>) {
         // 对应 `terminalCache.ts:546` 的 `aiPtyIds.delete(ptyId)` ——
         // 不摘的话新 PTY 复用同一个编号时会被误当成 AI pane(嗅探静默失效)
         crate::git_watch::forget_pane(pty_id);
+        // 关 pane / 关整组 / 项目移除三条路的唯一汇合点,标记与游标在这里一并回收
+        // (原版分散在 `setProjectLayout` 的 ptyId 集合比对、`disposePane`、
+        // `removeProject` 三处,漏一处就是「pty id 复用后接手了上一任的标记」)
+        self.clear_markers_for_pty(pty_id);
         if let Some(entity) = self.terminals.remove(&pty_id) {
             // 组合中关 pane:先把预编辑收掉,免得 IME 还挂在一个即将消失的
             // 输入宿主上(marked range 不收回,下一次按键会被 IME 永久劫持)

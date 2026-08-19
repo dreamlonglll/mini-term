@@ -32,17 +32,21 @@
 use std::collections::HashMap;
 
 use gpui::{
-    AnyElement, App, AppContext, Bounds, ClickEvent, Context, Entity, InteractiveElement,
-    IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Render, SharedString, Size,
-    StatefulInteractiveElement, Styled, Window, canvas, div, prelude::FluentBuilder, px,
+    AnyElement, App, AppContext, Bounds, ClickEvent, Context, Entity, FocusHandle,
+    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement,
+    Pixels, Render, SharedString, Size, StatefulInteractiveElement, Styled, Window, anchored,
+    canvas, deferred, div, point, prelude::FluentBuilder, px,
 };
 use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel, v_resizable};
+use gpui_component::tooltip::Tooltip;
 use mt_ui::icons::{AiVendor, BrandIcon};
 
 use crate::focus_nav::{self, Direction, PaneRect};
 use crate::i18n::{t, tr};
+use crate::markers;
 use crate::menu::{self, MenuEntry, MenuItem, hotkey_label};
 use crate::modal;
+use crate::overlay;
 use crate::pane_actions;
 use crate::store::AppStore;
 use crate::tree::{SplitDirection, SplitNode};
@@ -64,7 +68,40 @@ pub struct TerminalArea {
     measured: bool,
     /// 每个 pane 在屏幕上的矩形 —— 方向导航按几何最近邻挑目标。
     pane_rects: HashMap<String, PaneRect>,
+    /// AI 任务标记浮层开在哪个 pane 上(`None` = 没开)。存 `(pane_id, pty_id)`:
+    /// 前者用来实现原版那条「activePane 的 ptyId 一变就无条件关」。
+    marker_open: Option<(String, u32)>,
+    /// 浮层的焦点句柄。收着焦点才有人接 Esc(与 `menu.rs` 同一套路)。
+    marker_focus: FocusHandle,
+    /// 开浮层之前焦点在谁身上,关的时候还回去。
+    ///
+    /// 不还的话焦点停在已经不画了的浮层上,用户接着敲的字全部落空,还得先用鼠标
+    /// 点一下终端才能继续 —— 与 `pane.rs::dismiss_search` 那句 `window.focus` 同一条红线
+    /// (原版这个浮层压根不收焦点,所以没有这个问题)。
+    marker_prev_focus: Option<FocusHandle>,
 }
+
+/// 控件簇里 marker 按钮**右缘**到叶子右边缘的距离。
+///
+/// 簇是 `.gap(2).px(6)` 后跟三个 22×22 的方钮(分屏右 / 分屏下 / 关整组),
+/// marker 按钮排在它们之前(原版 `PaneGroup.tsx:489` 同样排在「终端内查找」之前,
+/// 而 GPUI 侧没有查找按钮),自己还带 4px 右外边距(原版的 `mr-1`)。
+/// 原版是 `getBoundingClientRect()` 量出来的,这里由布局常量算 ——
+/// 加减控件时**必须同步改这个常量**,有单测钉着组成。
+const MARKER_ANCHOR_INSET: f32 =
+    CTRL_CLUSTER_PAD + 3.0 * (CTRL_BTN + CTRL_GAP) + MARKER_BTN_MARGIN_RIGHT;
+const CTRL_CLUSTER_PAD: f32 = 6.0;
+const CTRL_BTN: f32 = 22.0;
+const CTRL_GAP: f32 = 2.0;
+const MARKER_BTN_MARGIN_RIGHT: f32 = 4.0;
+
+/// 浮层宽度。原版是 `min-w-[280px]` + 内容撑开,gpui 侧要给正文列一个确定宽度
+/// 才truncate得动,取固定值 —— 差别只在「超长正文时原版会更宽」。
+const MARKER_PANEL_WIDTH: f32 = 300.0;
+/// 列表最大高度(`MarkerList.tsx:30` 的 `max-h-80` = 20rem)。
+const MARKER_PANEL_MAX_HEIGHT: f32 = 320.0;
+/// 正文截断字数(`MarkerList.tsx:16` 的 `truncate(s, 40)`)。
+const MARKER_LINE_MAX: usize = 40;
 
 /// 各子节点占主轴的比例(和为 1)。
 ///
@@ -208,7 +245,43 @@ impl TerminalArea {
             area_size: FALLBACK_AREA,
             measured: false,
             pane_rects: HashMap::new(),
+            marker_open: None,
+            marker_focus: cx.focus_handle(),
+            marker_prev_focus: None,
         }
+    }
+
+    /// 开 / 关标记浮层(按钮是 **toggle**,与 Ctrl+F 的「只开不关」不同)。
+    fn toggle_marker_popover(
+        &mut self,
+        pane_id: &str,
+        pty_id: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.marker_open.is_some() {
+            self.close_marker_popover(window, cx);
+            return;
+        }
+        if !overlay::push(overlay::key(overlay::kind::MARKER_LIST)) {
+            return;
+        }
+        self.marker_open = Some((pane_id.to_string(), pty_id));
+        self.marker_prev_focus = window.focused(cx);
+        window.focus(&self.marker_focus);
+        cx.notify();
+    }
+
+    /// 收起浮层(幂等),焦点还给打开浮层前的那个元素(多半是终端)。
+    fn close_marker_popover(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.marker_open.take().is_none() {
+            return;
+        }
+        overlay::pop(overlay::key(overlay::kind::MARKER_LIST));
+        if let Some(prev) = self.marker_prev_focus.take() {
+            window.focus(&prev);
+        }
+        cx.notify();
     }
 
     fn split_state(&mut self, node_id: &str, cx: &mut App) -> Entity<ResizableState> {
@@ -244,6 +317,179 @@ impl TerminalArea {
         self.store.update(cx, |store, cx| {
             store.activate_pane(&project_id, &target, window, cx)
         });
+    }
+
+    /// AI 任务标记浮层。`None` = 没开 / 那个 pane 已经不在了。
+    ///
+    /// 层级照 `menu.rs` 的套路:`deferred(priority 1)` → 全窗透明遮罩(`occlude` +
+    /// 按下即关)→ `anchored(按钮下缘).snap_to_window_with_margin(4px)` → 面板。
+    /// **不复用 `menu::show`**:`MenuItem` 只有 label/shortcut/danger/disabled/submenu
+    /// 五种表达,装不下「#seq + 时间 + 正文 + 进行中圆点」四栏。
+    fn render_marker_popover(
+        &mut self,
+        layout: &SplitNode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let (pane_id, pty_id) = self.marker_open.clone()?;
+        // 切 tab / 关 pane / 分屏切换 → 无条件关(`PaneGroup.tsx:306-308`)
+        if !marker_popover_alive(layout, &pane_id, pty_id) {
+            self.close_marker_popover(window, cx);
+            return None;
+        }
+        // 按钮的位置由 pane 矩形反推:pane body 的上缘就是 tab 栏下缘,
+        // 右缘就是叶子右缘(见 MARKER_ANCHOR_INSET 的说明)
+        let rect = self.pane_rects.get(&pane_id)?;
+        let anchor = point(
+            px(rect.left + rect.width - MARKER_ANCHOR_INSET - MARKER_PANEL_WIDTH),
+            // 原版是「按钮下缘 + 4」;按钮在 26px 的 tab 栏里居中,下缘约在栏底上方 2px
+            px(rect.top + 2.0),
+        );
+
+        let markers = self.store.read(cx).markers_for_pty(pty_id).to_vec();
+        // 列表本体单独一层:`overflow_y_scroll` 要 Stateful(必须带 id),
+        // 而外层要 `track_focus`(Esc 的落点),两件事分层最省心
+        let mut list = div()
+            .id(SharedString::from(format!("marker-list-{pty_id}")))
+            .w_full()
+            .max_h(px(MARKER_PANEL_MAX_HEIGHT))
+            .overflow_y_scroll();
+
+        if markers.is_empty() {
+            // 到不了(按钮在 count == 0 时就不画了),照抄空态兜底 `MarkerList.tsx:22-28`
+            list = list.child(
+                div()
+                    .px(px(12.0))
+                    .py(px(8.0))
+                    .text_size(ui::font_px(12.0))
+                    .text_color(ui::text_muted())
+                    .child(t("markerList", "empty")),
+            );
+        } else {
+            list = list.py(px(4.0));
+            for marker in markers {
+                let marker_id = marker.id.clone();
+                let store = self.store.clone();
+                list = list.child(
+                    div()
+                        .id(SharedString::from(format!("marker-{}", marker.id)))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .px(px(12.0))
+                        .py(px(6.0))
+                        .cursor_pointer()
+                        .text_size(ui::font_px(12.0))
+                        .text_color(ui::text_primary())
+                        // `--bg-hover` 在 ui::Palette 里没有对应项,统一用 bg_overlay
+                        // (与文件树行 hover 同一档)
+                        .hover(|el| el.bg(ui::bg_overlay()))
+                        // 悬停看全文(含粘贴多行时的换行)
+                        .tooltip({
+                            let full = SharedString::from(marker.line.clone());
+                            move |window, cx| Tooltip::new(full.clone()).build(window, cx)
+                        })
+                        .on_click(cx.listener(move |this, _event, window, cx| {
+                            cx.stop_propagation();
+                            let id = marker_id.clone();
+                            store.update(cx, |store, cx| store.jump_to_marker(pty_id, &id, cx));
+                            // 跳转**并关闭浮层**(`MarkerList.tsx:36-39`)
+                            this.close_marker_popover(window, cx);
+                        }))
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(px(28.0))
+                                .text_color(ui::text_muted())
+                                .child(format!("#{}", marker.seq)),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(px(36.0))
+                                .text_color(ui::text_muted())
+                                .child(markers::format_time(marker.ts)),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .overflow_hidden()
+                                .child(markers::truncate_line(&marker.line, MARKER_LINE_MAX)),
+                        )
+                        // 进行中圆点。⚠️ 最后一条**永远**亮着 —— 原版没有任何地方
+                        // 在 AI 完成时把它翻掉,照抄(见 markers::AiMarker::in_progress)
+                        .when(marker.in_progress, |el| {
+                            el.child(
+                                div()
+                                    .id(SharedString::from(format!("marker-dot-{}", marker.id)))
+                                    .flex_none()
+                                    .w(px(6.0))
+                                    .h(px(6.0))
+                                    .rounded_full()
+                                    .bg(ui::color_ai_working())
+                                    // 原版是 aria-label,gpui 没有 aria,落成 tooltip
+                                    .tooltip(move |window, cx| {
+                                        Tooltip::new(t("markerList", "inProgress")).build(window, cx)
+                                    }),
+                            )
+                        }),
+                );
+            }
+        }
+
+        let panel = div()
+            .track_focus(&self.marker_focus)
+            .key_context("MarkerList")
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key == "escape" {
+                    cx.stop_propagation();
+                    this.close_marker_popover(window, cx);
+                }
+            }))
+            .w(px(MARKER_PANEL_WIDTH))
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(ui::border_subtle())
+            .bg(ui::bg_elevated())
+            .shadow_lg()
+            // 面板内的按下不算「点外」—— 遮罩的 on_mouse_down 靠 hitbox 判定
+            .occlude()
+            .child(list);
+
+        let size = window.viewport_size();
+        Some(
+            deferred(
+                anchored().position(point(px(0.0), px(0.0))).child(
+                    div()
+                        .w(size.width)
+                        .h(size.height)
+                        // 点浮层外任意处关闭(原版挂 document 的 mousedown)。
+                        // occlude 让这一层吃掉这次按下 —— 否则关浮层那一下会顺手
+                        // 点到底下的终端/tab
+                        .occlude()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _event: &MouseDownEvent, window, cx| {
+                                this.close_marker_popover(window, cx);
+                            }),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(|this, _event: &MouseDownEvent, window, cx| {
+                                this.close_marker_popover(window, cx);
+                            }),
+                        )
+                        .child(
+                            anchored()
+                                .position(anchor)
+                                .snap_to_window_with_margin(px(4.0))
+                                .child(panel),
+                        ),
+                ),
+            )
+            .with_priority(1)
+            .into_any_element(),
+        )
     }
 
     fn render_node(
@@ -353,6 +599,12 @@ impl TerminalArea {
             return div().into_any_element();
         };
         let terminal = active.pty_id.and_then(|id| store.terminal(id)).cloned();
+        // AI 任务标记数。**列表为空就整个不画按钮**(`PaneGroup.tsx:489`),
+        // 这就是「⚑ 平时看不见」的直接原因 —— 见 `markers` 模块注释的 alt screen 段。
+        let marker_count = active
+            .pty_id
+            .map(|id| store.markers_for_pty(id).len())
+            .unwrap_or(0);
         // 焦点落在本组内 = 高亮边框(旧版靠 tab 的 accent 条 + xterm 焦点两处表达)
         let group_focused = focused_pane
             .as_deref()
@@ -542,12 +794,46 @@ impl TerminalArea {
                 .flex()
                 .items_center()
                 .justify_center()
-                .w(px(22.0))
-                .h(px(22.0))
+                .w(px(CTRL_BTN))
+                .h(px(CTRL_BTN))
                 .rounded(px(3.0))
                 .text_color(ui::text_muted())
                 .child(label)
         };
+        // ⚑ N:图标是**文本字符**,不是 SVG(与 menu.rs 的 `✓ ` 同一套理由);
+        // 宽度不固定,所以不复用上面那个 22×22 的方钮。
+        let marker_pty = active.pty_id.filter(|_| marker_count > 0);
+        let marker_pane_id = active_id.clone();
+        let marker_btn = marker_pty.map(|pty_id| {
+            div()
+                .id(gpui::SharedString::from(format!("markers-{leaf}")))
+                .mr(px(MARKER_BTN_MARGIN_RIGHT))
+                .px(px(6.0))
+                .py(px(2.0))
+                .rounded(px(3.0))
+                .flex()
+                .items_center()
+                .gap(px(4.0))
+                .cursor_pointer()
+                .text_color(ui::text_muted())
+                .hover(|el| el.text_color(ui::accent()).bg(ui::border_subtle()))
+                .tooltip(move |window, cx| {
+                    // `{mod}` 的插值不能走 `tr!`:那个宏的参数位是 `$name:ident`,
+                    // 而 `mod` 是 Rust 关键字塞不进去(`search_modal.rs:320` 同样的坑)
+                    Tooltip::new(mt_i18n::t_args(
+                        "paneGroup",
+                        "markerTooltip",
+                        &[("mod", mod_label())],
+                    ))
+                    .build(window, cx)
+                })
+                .on_click(cx.listener(move |this, _event, window, cx| {
+                    cx.stop_propagation();
+                    this.toggle_marker_popover(&marker_pane_id, pty_id, window, cx);
+                }))
+                .child("⚑")
+                .child(div().child(marker_count.to_string()))
+        });
         let pid_right = pid.clone();
         let anchor_right = active_id.clone();
         let pid_down = pid.clone();
@@ -559,8 +845,9 @@ impl TerminalArea {
                 .ml_auto()
                 .flex()
                 .items_center()
-                .gap(px(2.0))
-                .px(px(6.0))
+                .gap(px(CTRL_GAP))
+                .px(px(CTRL_CLUSTER_PAD))
+                .children(marker_btn)
                 .child(
                     div()
                         .id(gpui::SharedString::from(format!("split-right-{leaf}")))
@@ -684,6 +971,36 @@ impl TerminalArea {
     }
 }
 
+/// `paneGroup.markerTooltip` 里 `{mod}` 的取值。与 `search_modal.rs:324-326`
+/// 那一份同源(那边是私有的,不为一行去开放它)。
+fn mod_label() -> &'static str {
+    if cfg!(target_os = "macos") { "⌘" } else { "Ctrl" }
+}
+
+/// 标记浮层还该开着吗:那个 pane 得还在布局里、pty 没换,而且**仍是所在叶子的
+/// 激活 tab**。
+///
+/// 对应原版 `PaneGroup.tsx:306-308` 的
+/// `useEffect(() => setMarkerOpen(false), [activePane?.ptyId])` —— 切 tab、
+/// 关 pane、分屏切换都靠它收场(浮层里那份列表是**激活 pane** 的,换了人还开着
+/// 就是在看别人的标记)。
+fn marker_popover_alive(layout: &SplitNode, pane_id: &str, pty_id: u32) -> bool {
+    let Some(SplitNode::Leaf {
+        panes,
+        active_pane_id,
+        ..
+    }) = layout.leaf_of_pane(pane_id)
+    else {
+        return false;
+    };
+    // 激活 tab 的解析与 render_leaf 同口径:找不到就退回第一个
+    let active = panes
+        .iter()
+        .find(|p| &p.id == active_pane_id)
+        .or_else(|| panes.first());
+    active.is_some_and(|p| p.id == pane_id && p.pty_id == Some(pty_id))
+}
+
 /// 点击次数(键盘触发的「点击」按一次算)。
 fn click_count(event: &ClickEvent) -> usize {
     match event {
@@ -698,6 +1015,12 @@ impl Render for TerminalArea {
         // 一个 Entity(极小但确实的泄漏,看板已记)。
         let live_nodes = self.store.read(cx).live_node_ids();
         self.split_states.retain(|id, _| live_nodes.contains(id));
+
+        // 切走项目 / 关光了终端 → 浮层无处可挂。下面两条早退路径压根走不到浮层
+        // 组装那一步,不在这里收掉的话覆盖物栈里会留一条永远摘不掉的登记。
+        if self.marker_open.is_some() && self.store.read(cx).active_layout().is_none() {
+            self.close_marker_popover(window, cx);
+        }
 
         let store = self.store.read(cx);
         let Some(project) = store.active_project() else {
@@ -765,6 +1088,9 @@ impl Render for TerminalArea {
         let content = self
             .measured
             .then(|| self.render_node(&layout, &project_id, self.area_size, window, cx));
+        // 浮层在分屏树**之后**组装:它要读 render_node 刚更新过的 pane 矩形,
+        // 而且要画在所有常规内容之上(deferred priority 1)
+        let marker_popover = self.render_marker_popover(&layout, window, cx);
         let this = cx.entity();
         div()
             .size_full()
@@ -793,6 +1119,7 @@ impl Render for TerminalArea {
                 .size_full(),
             )
             .children(content.map(|c| div().size_full().child(c)))
+            .children(marker_popover)
     }
 }
 
@@ -866,6 +1193,49 @@ mod tests {
         assert_eq!(hotkey_label(true, true, false, "D"), "Ctrl+Shift+D");
         assert_eq!(hotkey_label(true, true, false, "E"), "Ctrl+Shift+E");
         assert_eq!(hotkey_label(true, true, false, "W"), "Ctrl+Shift+W");
+    }
+
+    /// marker 按钮的锚点由控件簇的布局常量算出(原版是量 DOM 矩形)。
+    /// 加减控件时这条会提醒同步改 [`MARKER_ANCHOR_INSET`]。
+    #[test]
+    fn 标记浮层锚点按控件簇布局算() {
+        // 右侧簇:px-6 + 三个 22×22 方钮(各带 2px gap)+ marker 自己的 4px 右边距
+        assert_eq!(MARKER_ANCHOR_INSET, 6.0 + 3.0 * 24.0 + 4.0);
+        assert_eq!(MARKER_ANCHOR_INSET, 82.0);
+        // 面板右缘贴按钮右缘 → 左缘 = 叶右缘 - inset - 面板宽
+        let leaf_right = 1000.0_f32;
+        let left = leaf_right - MARKER_ANCHOR_INSET - MARKER_PANEL_WIDTH;
+        assert_eq!(left, 1000.0 - 82.0 - 300.0);
+    }
+
+    /// 浮层的存活判据:pane 还在、还是激活 tab、pty 没换。
+    #[test]
+    fn 切换激活_tab_后浮层判定为该关() {
+        use crate::tree::PaneState;
+
+        let mut first = PaneState::new("pwsh");
+        first.pty_id = Some(7);
+        let first_id = first.id.clone();
+        let mut layout = SplitNode::leaf(first);
+
+        let mut second = PaneState::new("pwsh");
+        second.pty_id = Some(8);
+        let second_id = second.id.clone();
+        layout.append_pane(Some(&first_id), second);
+
+        // append_pane 会把新 tab 设成激活的 → 原来那条浮层该关
+        assert!(layout.activate_pane(&first_id));
+        assert!(marker_popover_alive(&layout, &first_id, 7));
+        assert!(!marker_popover_alive(&layout, &second_id, 8), "不是激活 tab");
+
+        assert!(layout.activate_pane(&second_id));
+        assert!(!marker_popover_alive(&layout, &first_id, 7), "切走了就该关");
+        assert!(marker_popover_alive(&layout, &second_id, 8));
+
+        // pty 换了(重连 / 重建)同样算不在了
+        assert!(!marker_popover_alive(&layout, &second_id, 99));
+        // pane 压根不在布局里
+        assert!(!marker_popover_alive(&layout, "pane-nonexistent", 7));
     }
 
     /// 换算一圈回来不变形:百分比 → 像素 → 百分比。

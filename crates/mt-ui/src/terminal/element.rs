@@ -160,6 +160,32 @@ pub struct TerminalElement {
     background_art: Option<BackgroundArtElement>,
     search: Option<Rc<RefCell<TerminalSearch>>>,
     search_colors: SearchColors,
+    flash: Option<FlashLine>,
+}
+
+/// 一次性的「整行闪一下」。跳到某一行之后给的可见反馈,到期由**宿主**撤掉
+/// (元素不持有计时器 —— 它每帧重建,存不下跨帧状态)。
+///
+/// `line` 是 **grid 绝对行号**,与 [`super::search::SearchMatch`] 的 `Point::line`
+/// 同一坐标系(0 = 屏幕第一行,负数 = 回看缓冲),所以它跟着 display_offset 走:
+/// 用户滚开之后那一行自然滚出视口、这一帧就不画了。
+///
+/// **不进行签名**:它是 paint 阶段独立发的一块 quad,不参与 `CellSignature`
+/// (查找高亮那条路必须进签名,因为它改的是**格子**的画法;这里改的是叠在
+/// 行上的一层浮标,每帧照当前状态重发,撤掉时自然消失)。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FlashLine {
+    pub line: i32,
+    pub color: Hsla,
+}
+
+/// 闪烁行在**本帧**落在屏幕第几行。`None` = 不在视口里(这一帧不画)。
+///
+/// `row = line + display_offset`,与 prepaint 里那句
+/// `indexed.point.line.0 + display_offset` 同一换算。
+fn flash_row(line: i32, display_offset: usize, screen_lines: usize) -> Option<usize> {
+    let row = line + display_offset as i32;
+    (row >= 0 && (row as usize) < screen_lines).then_some(row as usize)
 }
 
 impl TerminalElement {
@@ -189,6 +215,7 @@ impl TerminalElement {
             background_art: None,
             search: None,
             search_colors: SearchColors::default(),
+            flash: None,
         }
     }
 
@@ -204,6 +231,12 @@ impl TerminalElement {
     /// 查找高亮的两档底色与当前命中描边。见 [`SearchColors`]。
     pub fn search_colors(mut self, colors: SearchColors) -> Self {
         self.search_colors = colors;
+        self
+    }
+
+    /// 让某一行整行闪一下。见 [`FlashLine`]。
+    pub fn flash(mut self, flash: Option<FlashLine>) -> Self {
+        self.flash = flash;
         self
     }
 
@@ -369,6 +402,8 @@ pub struct PreparedFrame {
     preedit: Option<PreeditLayout>,
     /// 滚动条几何。`None` = 这一帧不画(无回看缓冲 / alt screen / 被关掉)。
     scrollbar: Option<ScrollbarLayout>,
+    /// 整行闪烁的矩形与颜色(已换算到窗口坐标)。`None` = 没设 / 不在视口里。
+    flash: Option<(Bounds<Pixels>, Hsla)>,
 }
 
 // 「这个字符在这套字体里的步进正好是一列宽吗」的缓存。
@@ -1385,6 +1420,19 @@ impl Element for TerminalElement {
             )
         };
 
+        // ── 整行闪烁:跳到 marker 之后那 300ms 的提示。落在视口外就不画
+        //    (用户跳完又自己滚开了)。
+        let flash = self.flash.and_then(|flash| {
+            let row = flash_row(flash.line, frame_display_offset, screen_lines)?;
+            Some((
+                Bounds::new(
+                    point(bounds.origin.x, bounds.origin.y + line_height * row as f32),
+                    size(bounds.size.width, line_height),
+                ),
+                flash.color,
+            ))
+        });
+
         PreparedFrame {
             hitbox,
             state,
@@ -1397,6 +1445,7 @@ impl Element for TerminalElement {
             cursor,
             preedit,
             scrollbar,
+            flash,
         }
     }
 
@@ -1429,6 +1478,11 @@ impl Element for TerminalElement {
                 for (rect, color) in render.backgrounds.iter() {
                     window.paint_quad(fill(translate(*rect, delta), *color));
                 }
+            }
+            // ── 整行闪烁垫在格子底色之上、查找命中之下:它是半透明的一次性提示,
+            //    压住底色即可,不该盖过查找/选择这两种「持续态」的表达。
+            if let Some((rect, color)) = prepared.flash {
+                window.paint_quad(fill(rect, color));
             }
             // ── 查找命中垫在选择区**下面**:选择区是半透明蓝(alpha 0.30),
             //    压在命中底色之上仍然认得出「这块被选中了」;反过来叠的话
@@ -1906,4 +1960,31 @@ fn paint_hollow_rect(window: &mut Window, bounds: Bounds<Pixels>, color: Hsla) {
         Bounds::new(point(origin.x + s.width - t, origin.y), size(t, s.height)),
         color,
     ));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 闪烁行的 grid 绝对行号 → 屏幕行:`row = line + display_offset`。
+    /// 视口顶在最新内容时(offset = 0),正数行号就是屏幕行本身。
+    #[test]
+    fn 闪烁行按显示偏移换算屏幕行() {
+        assert_eq!(flash_row(0, 0, 24), Some(0));
+        assert_eq!(flash_row(23, 0, 24), Some(23));
+        // 回看缓冲里的行(负号)只有在往回滚够了之后才落进视口
+        assert_eq!(flash_row(-5, 0, 24), None);
+        assert_eq!(flash_row(-5, 5, 24), Some(0));
+        assert_eq!(flash_row(-5, 10, 24), Some(5));
+    }
+
+    /// 落在视口外一律不画 —— 用户跳完又自己滚开了,不该在别的行上留一道底色。
+    #[test]
+    fn 闪烁行滚出视口就不画() {
+        assert_eq!(flash_row(24, 0, 24), None, "越过最后一行");
+        assert_eq!(flash_row(-1, 0, 24), None, "在视口上方");
+        // 往回滚太多:那一行被顶到视口下面去了
+        assert_eq!(flash_row(0, 24, 24), None);
+        assert_eq!(flash_row(0, 23, 24), Some(23));
+    }
 }
