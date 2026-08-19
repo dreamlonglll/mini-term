@@ -118,6 +118,11 @@ fn win32_user_locale_name() -> Option<String> {
 /// grep -rhoE '(t|tr!)\(\s*"[a-zA-Z]+",\s*"[a-zA-Z0-9._-]+"' crates/mt-app/src/*.rs \
 ///   | sed -E 's/^(t|tr!)\(\s*//; s/,\s*/./; s/"//g' | sort -u
 /// ```
+///
+/// ⚠️ **grep 抓不到「key 由函数返回」的调用点**,得手工补:
+/// `app.titleBar.status.*` 来自 `store::TitleBarLight::i18n_key`,
+/// `app.trayStatus.*` 来自 `store::AiProjectKind::tray_status_key`,
+/// `app.titleBar.{maximize,restore}` 来自 `title_bar::max_button_face`。
 #[cfg(test)]
 const USED_KEYS: &[&str] = &[
     "app.activityBar.closeDrawer",
@@ -128,7 +133,21 @@ const USED_KEYS: &[&str] = &[
     "app.activityBar.settings",
     "app.activityBar.stats",
     "app.emptyState",
+    "app.titleBar.close",
+    "app.titleBar.maximize",
+    "app.titleBar.minimize",
+    "app.titleBar.noAiProjects",
+    "app.titleBar.projectSwitcher",
+    "app.titleBar.restore",
+    "app.titleBar.status.attention",
     "app.titleBar.status.done",
+    "app.titleBar.status.error",
+    "app.titleBar.status.idle",
+    "app.titleBar.status.working",
+    "app.trayStatus.attention",
+    "app.trayStatus.done",
+    "app.trayStatus.idle",
+    "app.trayStatus.working",
     "commitDiff.binaryFile",
     "commitDiff.fileCount",
     "commitDiff.inline",
