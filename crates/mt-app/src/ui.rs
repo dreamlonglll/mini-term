@@ -940,12 +940,16 @@ const SPINNER_ARC: &[Shape] = &[Shape::line(
 ///
 /// ⚠️ `with_animation` **持续请求帧**:加载态结束时必须让整个元素
 /// **从树上消失**,不能留着靠 `opacity(0)` 藏起来。
+///
+/// 减弱动效下**不停,只放慢到 2.4s**(`mt_ui::motion::spin_period`)——
+/// 原版 `styles.css:404-413` 专门为「进行中」指示器开了这条豁免:
+/// 停住的 spinner 不是安静,是看着像卡死。
 pub fn spinner(id: impl Into<ElementId>, size: Pixels, color: Hsla) -> impl IntoElement {
     VectorIcon::new(SPINNER_ARC, size)
         .ink(color)
         .with_animation(
             id.into(),
-            Animation::new(std::time::Duration::from_secs(1)).repeat(),
+            Animation::new(mt_ui::motion::spin_period(std::time::Duration::from_secs(1))).repeat(),
             // delta 就是 0..1 的一圈,`VectorIcon::rotation` 的单位也是「圈」
             |icon, delta| icon.rotation(delta),
         )

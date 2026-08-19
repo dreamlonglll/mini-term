@@ -719,7 +719,10 @@ impl TitleBar {
             .bg(ui::with_alpha(color, alpha));
         // `working` 档闪烁(`animate-blink`)。⚠️ `with_animation` 持续请求帧 ——
         // 所以只在这一档挂,别的档位必须让它整个从树上消失。
-        let dot: AnyElement = if light == TitleBarLight::Working {
+        // ⚠️ 还要过减弱动效的闸(`mt_ui::motion`):原版的通配规则把
+        // `.animate-blink` 停在第一帧 —— 它**不在** reduce 的豁免名单里,
+        // 装机版在用户机器上就是不闪的。
+        let dot: AnyElement = if light == TitleBarLight::Working && mt_ui::motion::blinks() {
             dot.with_animation(
                 "titlebar-light-blink",
                 Animation::new(std::time::Duration::from_millis(800)).repeat(),

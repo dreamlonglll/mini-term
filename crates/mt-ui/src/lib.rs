@@ -37,6 +37,15 @@
 //! 主题包背景图的 cover/focus 铺放 + 压暗纱罩。原版挂在 `#root`(窗口级),
 //! 这里既可以窗口级铺,也可以只铺终端区([`TerminalView::set_background_art`])。
 //!
+//! ## 4.5 动效([`motion`])+ 趋势图([`chart`])
+//!
+//! [`motion`] 是全仓动画行为的**唯一闸门**:`prefers-reduced-motion` 的等价开关
+//! (探测在 mt-app,这里只存结论)+ 一次性过渡基件(跑完自停,不走
+//! `with_animation`)。谁停谁豁免的逐条对照表在该模块注释里。
+//!
+//! [`chart`] 是自绘的双轴趋势图(面积曲线 + 柱 + 网格),替 recharts;
+//! 几何全是纯函数,轴标签由宿主摆。
+//!
 //! ## 5. 布局复用件(尽量用 gpui-component,别自己造)
 //!
 //! | mini-term 现状 | GPUI 侧对应 |
@@ -64,11 +73,15 @@
 //! - ⬜ 回退字形溢出裁剪(宽字符回退到非等宽字体时可能糊出格子边界)
 
 pub mod background;
+pub mod chart;
 pub mod icons;
+pub mod motion;
 pub mod terminal;
 pub mod theme_bridge;
 
 pub use background::{BackgroundArtElement, Fit, background_art, fit_bounds};
+pub use chart::{ChartCanvas, ChartColors, ChartKey, ChartModel, ChartStyle};
+pub use motion::{Transition, TransitionSpec, TweenMap, reduce_motion, set_reduce_motion};
 pub use icons::{
     AiVendor, BrandIcon, FileIcon, FileKind, ProjectKind, StatusDot, StatusKind, TechIcon,
 };

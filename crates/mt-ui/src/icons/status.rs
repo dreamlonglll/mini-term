@@ -20,11 +20,15 @@
 //! 加载指示器 —— 原版为此专门加了 `animate-status-spin`,这里用
 //! [`gpui::Animation`] 的 `repeat()` 驱动 [`VectorIcon::rotation`] 做到同一件事。
 //!
+//! # 减弱动效
+//!
+//! 原版在 `prefers-reduced-motion: reduce` 下**不停这条旋转**,只把周期从 0.9s
+//! 放慢到 2.4s(`styles.css:404-413` 的豁免段,理由写在那儿:一个停住的 spinner
+//! 不是「安静」,是在说谎)。这里照抄:周期过一道 [`crate::motion::spin_period`],
+//! 停不停由它说了算,组件自己不做判断。想彻底静止仍可用 [`StatusDot::animated`]。
+//!
 //! # 与原版的已知偏差
 //!
-//! - 原版的呼吸动画由 `prefers-reduced-motion` 兜底(用户机器上就是 `reduce`)。
-//!   GPUI 侧读不到这个系统偏好,旋转**恒定开启**;需要时用
-//!   [`StatusDot::animated`] 关掉(传 `false` 就是静态的弧);
 //! - tooltip 文案(`panels.statusDot.*`)走 i18n,归宿主 —— 本组件只画图形。
 //!
 //! # 宿主接线(mt-app)
@@ -213,6 +217,8 @@ pub(super) fn shape_tables() -> Vec<&'static [Shape]> {
 }
 
 /// spinner 转一圈的时长。原版 `animate-status-spin` 是 0.9s 匀速。
+///
+/// ⚠️ 实际用的是 [`crate::motion::spin_period`] 过闸之后的值(减弱动效下 2.4s)。
 pub const SPIN_PERIOD: Duration = Duration::from_millis(900);
 
 /// 状态灯。
@@ -275,7 +281,8 @@ impl RenderOnce for StatusDot {
             icon = icon.contrast(c);
         }
         if self.status.spins() && self.animated {
-            icon.with_animation(self.id, Animation::new(SPIN_PERIOD).repeat(), |icon, delta| {
+            let period = crate::motion::spin_period(SPIN_PERIOD);
+            icon.with_animation(self.id, Animation::new(period).repeat(), |icon, delta| {
                 // delta 就是 0..1 的一圈,VectorIcon::rotation 的单位也是「圈」
                 icon.rotation(delta)
             })

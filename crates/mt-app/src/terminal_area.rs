@@ -84,6 +84,14 @@ pub struct TerminalArea {
     /// 正拖着文件悬停在哪个 pane 上(文件树的 `DragFilePath` 与系统的
     /// `ExternalPaths` 共用)。`on_drop` 不带位置,高亮只能从这里来。
     file_drop_pane: Option<String>,
+    /// 每个叶子的进场动画(`.pane-enter`),按 `项目\u{1}叶子` 索引。
+    ///
+    /// 键里带项目 id 是为了**切项目不重播**:原版切项目是 `display:none`
+    /// 留着不卸载,CSS 动画自然不会重来(`PaneGroup.tsx:391` 的注释原文)。
+    /// 这张表也照此**不按帧回收** —— 跑完的条目只剩一个 `Instant`,与
+    /// `split_states` 同属「关掉的项目会留下几十字节」那一档,不值得为它
+    /// 每帧去遍历全部项目的布局树。
+    pane_enter: HashMap<String, mt_ui::motion::Transition>,
 }
 
 /// 控件簇里 marker 按钮**右缘**到叶子右边缘的距离。
@@ -122,6 +130,13 @@ fn split_fractions(sizes: &[f64], count: usize) -> Vec<f64> {
     }
     let total: f64 = sizes.iter().sum();
     sizes.iter().map(|s| s / total).collect()
+}
+
+/// 分屏进场这一帧的不透明度。**纯函数**,单测钉在这上面。
+///
+/// 只有淡入没有缩放,理由见 [`TerminalArea::wrap_pane_enter`]。
+fn pane_enter_opacity(progress: f32) -> f32 {
+    progress.clamp(0.0, 1.0)
 }
 
 /// 分隔条拖完后的像素 → 百分比(和为 100,与磁盘格式同口径)。
@@ -297,6 +312,7 @@ impl TerminalArea {
             marker_focus: cx.focus_handle(),
             marker_prev_focus: None,
             file_drop_pane: None,
+            pane_enter: HashMap::new(),
         }
     }
 
@@ -550,7 +566,11 @@ impl TerminalArea {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         match node {
-            SplitNode::Leaf { .. } => self.render_leaf(node, project_id, window, cx),
+            SplitNode::Leaf { id, .. } => {
+                let leaf_id = id.clone();
+                let el = self.render_leaf(node, project_id, window, cx);
+                self.wrap_pane_enter(&leaf_id, project_id, el, window)
+            }
             SplitNode::Split {
                 id,
                 direction,
@@ -620,6 +640,54 @@ impl TerminalArea {
                     .into_any_element()
             }
         }
+    }
+
+    /// 叶子的进场动画(`styles.css` 的 `.pane-enter` /
+    /// `@keyframes paneEnter`:`opacity 0→1` + `scale(0.97)→scale(1)`,
+    /// 0.26s `--ease-overlay-in`)。
+    ///
+    /// # 三条照抄来的语义
+    ///
+    /// 1. **每个叶子只播一次**:第一次渲染到这个 `(项目, 叶子)` 时起表,
+    ///    之后拿同一条进度 —— 等价于 React 里「这层 DOM 只挂载一次」;
+    /// 2. **切项目不重播**(原版是 `display:none` 不卸载),所以键里带项目 id
+    ///    且不按帧回收;
+    /// 3. **不过减弱动效的闸**:`.pane-enter` 在原版 reduce 段里被**点名豁免**
+    ///    (`styles.css:441-443`),开了「减弱动态效果」照样播。
+    ///
+    /// # ⚠️ 刻意只做淡入,不做 `scale(0.97)`
+    ///
+    /// gpui 没有 transform,能等价缩放的只有「改内边距/尺寸」——而那是**会改布局**
+    /// 的:pane 内容框在这 260ms 里窄十几个像素,`TerminalView` 就会按小一号的
+    /// 格子数回调 `on_grid_resize`,一路 resize 到 PTY(启动时每个叶子都来一遍,
+    /// 首个 PTY 甚至会以缩小后的尺寸建出来再被改回去)。原版的 `transform: scale`
+    /// 压根不参与布局,没有这条代价。
+    ///
+    /// 3% 的缩放本来就是「看得出这里多了一块」的附加提示,淡入才是主信号 ——
+    /// 拿一次终端重排去换它不划算。上游哪天给 Element 通用变换再补。
+    fn wrap_pane_enter(
+        &mut self,
+        leaf_id: &str,
+        project_id: &str,
+        el: AnyElement,
+        window: &Window,
+    ) -> AnyElement {
+        let key = format!("{project_id}\u{1}{leaf_id}");
+        let progress = self
+            .pane_enter
+            .entry(key)
+            .or_insert_with(|| mt_ui::motion::Transition::new(mt_ui::motion::PANE_ENTER))
+            .drive(window);
+        if progress >= 1.0 {
+            // 跑完就把包装层整个摘掉:少一层空 div,也少一次 opacity 合成。
+            // (匿名 div 不带 ElementId,加/摘不影响子树的元素状态路径)
+            return el;
+        }
+        div()
+            .size_full()
+            .opacity(pane_enter_opacity(progress))
+            .child(el)
+            .into_any_element()
     }
 
     fn render_leaf(
@@ -1389,6 +1457,36 @@ mod tests {
         // 和不是 100 的老数据(拖动写回时有浮点误差)照样归一
         let f = split_fractions(&[1.0, 1.0, 2.0], 3);
         assert_eq!(f, vec![0.25, 0.25, 0.5]);
+    }
+
+    /// 进场只淡入:终点必须是**完全**不透明,越界进度一律钳住
+    /// (残留的 0.99 会让整块 pane 永远蒙一层灰)。
+    #[test]
+    fn 进场淡入端点严丝合缝() {
+        assert_eq!(pane_enter_opacity(0.0), 0.0);
+        assert_eq!(pane_enter_opacity(1.0), 1.0);
+        assert_eq!(pane_enter_opacity(1.5), 1.0);
+        assert_eq!(pane_enter_opacity(-0.5), 0.0);
+        assert!((pane_enter_opacity(0.5) - 0.5).abs() < 1e-6);
+    }
+
+    /// 进场动画属原版 reduce 段**点名豁免**的那一档:开着减弱动效照播。
+    #[test]
+    fn 进场动画不受减弱动效影响() {
+        assert!(
+            !mt_ui::motion::PANE_ENTER.respects_reduce,
+            "styles.css:441-443 明确豁免 .pane-enter"
+        );
+        assert_eq!(
+            mt_ui::motion::PANE_ENTER.duration,
+            std::time::Duration::from_millis(260),
+            "--motion-pane-enter: 0.26s"
+        );
+        crate::motion::with_reduce(true, || {
+            let spec = mt_ui::motion::PANE_ENTER;
+            assert!(spec.running_at(std::time::Duration::ZERO, true));
+            assert!(spec.progress_at(std::time::Duration::ZERO, true) < 0.01);
+        });
     }
 
     /// 子节点数与存的百分比对不上 / 有非法值 → 均分,不许拿 0 去乘。

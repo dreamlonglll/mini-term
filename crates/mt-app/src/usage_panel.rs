@@ -25,6 +25,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -840,6 +841,40 @@ impl Scope {
 const AUTO_REFRESH_OPTIONS: [u32; 5] = [0, 5, 10, 30, 60];
 /// 模型排行前 N,其余合并成一行 Others。
 const TOP_MODELS: usize = 6;
+/// `@keyframes usageFadeIn` 的 `translateY(6px)`。
+const USAGE_FADE_SHIFT: f32 = 6.0;
+
+// ─── 趋势图版式(逐条抄 `DailyChart.tsx`)────────────────────
+//
+// recharts 的 `<ComposedChart width height={232} margin={{top:10,right:4,bottom:0,left:4}}>`
+// 里,232 是**含轴**的总高:上留白 10 + 绘图区 + X 轴 30(recharts 默认轴高)。
+// 两个 Y 轴的宽度是 JSX 上写死的 `width={52}` / `width={44}`。
+
+/// 图表总高(原版 `height={232}`)。
+const CHART_HEIGHT: f32 = 232.0;
+/// 绘图区上留白(原版 margin.top)。
+const CHART_MARGIN_TOP: f32 = 10.0;
+/// X 轴条高度(recharts `XAxis` 默认 `height={30}`)。
+const CHART_X_AXIS: f32 = 30.0;
+/// 绘图区净高。
+const CHART_PLOT_HEIGHT: f32 = CHART_HEIGHT - CHART_MARGIN_TOP - CHART_X_AXIS;
+/// 左轴(成本)标签列宽,原版 `<YAxis yAxisId="cost" width={52}>`。
+const CHART_LEFT_AXIS: f32 = 52.0;
+/// 右轴(调用数)标签列宽,原版 `<YAxis yAxisId="calls" width={44}>`。
+const CHART_RIGHT_AXIS: f32 = 44.0;
+/// 轴刻度字号(原版 `AXIS_TICK = { fontSize: 9 }`)。
+const CHART_TICK_FONT: f32 = 9.0;
+/// recharts 默认 `tickCount`。
+const CHART_TICK_COUNT: usize = 5;
+/// X 轴标签的最小间距(原版 `minTickGap={24}`)。
+const CHART_X_MIN_GAP: f32 = 24.0;
+/// 一个 X 标签的估计宽度(`MM-DD` / `HH:00` 在 9px 下约 28px)。
+const CHART_X_LABEL_WIDTH: f32 = 28.0;
+/// 绘图区还没量出宽度时的兜底(首帧)。标签疏密可能差一档,下一帧即修正。
+const CHART_FALLBACK_WIDTH: f32 = 600.0;
+/// 轴刻度标签的行高(9px 字号 + 上下各 1.5px)。定位时要减半个高度才能
+/// 让文字**居中压在刻度线上**。
+const CHART_TICK_LINE_HEIGHT: f32 = 12.0;
 
 /// Top 会话点开后的正文预览。
 ///
@@ -880,6 +915,22 @@ pub struct UsagePanel {
     /// 抽屉是否展开。实体常驻,定时器必须靠它闸住。
     visible: bool,
     tweens: Tweens,
+    /// 主体入场淡入(`.usage-fade-in`)。**相位切进 Ready 才重播** ——
+    /// 等价原版「那层 div 重新挂载」;自动刷新期间相位不变,于是不闪。
+    fade_in: mt_ui::motion::Transition,
+    /// 上一帧的相位。判「刚进 Ready」用,别的地方不要读。
+    last_phase: Option<Phase>,
+    /// 排行条宽度补间(`.usage-rank-bar` 的 `transition-[width] duration-500
+    /// ease-out`)。首次出现直接落目标值(浏览器同款:新元素没有旧值可补),
+    /// 之后数据一变就从旧宽度补过去。
+    rank_bars: mt_ui::motion::TweenMap,
+    /// 趋势图几何缓存。数据没变就复用同一份 [`mt_ui::chart::ChartModel`] ——
+    /// 性能红线:不许每帧重建曲线。
+    chart_cache: Option<(mt_ui::chart::ChartKey, Rc<mt_ui::chart::ChartModel>)>,
+    /// 趋势图绘图区的实测宽度(canvas 量的,跨帧保留)。X 轴标签隔几格摆一个
+    /// 得按它算(原版 `minTickGap` 比的是真实像素)。首帧用兜底值,
+    /// **量完刻意不 notify** —— 量尺寸再触发重画就是每帧一个死循环。
+    chart_width: f32,
     preview: Option<Preview>,
     /// 查询序号:切参数后旧查询返回时不得覆盖新结果。
     query_seq: u64,
@@ -970,6 +1021,13 @@ impl UsagePanel {
             syncing: false,
             visible: true,
             tweens: Tweens::zeroed(),
+            // 首帧就是 Skeleton/PricingLoading,建成「已跑完」的,
+            // 等真进了 Ready 再 restart
+            fade_in: mt_ui::motion::Transition::settled(mt_ui::motion::USAGE_FADE_IN),
+            last_phase: None,
+            rank_bars: mt_ui::motion::TweenMap::new(mt_ui::motion::RANK_BAR),
+            chart_cache: None,
+            chart_width: CHART_FALLBACK_WIDTH,
             preview: None,
             query_seq: 0,
             _query_task: None,
@@ -1506,13 +1564,116 @@ fn rank_row(
         })
 }
 
-/// 骨架块:`rounded-md` + `--border-subtle` + 2s 脉冲(`opacity 1 → .5 → 1`)。
-fn skeleton_block(id: &'static str, h: f32) -> AnyElement {
+// ─── 趋势图的三个文本层 ──────────────────────────────────────
+
+/// 左轴刻度文案(`DailyChart.tsx` 的 `axisCost`:
+/// `v >= 1000 ? $X.XK : $X.XX`)。
+fn axis_cost(v: f64) -> String {
+    if v >= 1000.0 {
+        format!("${:.1}K", v / 1000.0)
+    } else {
+        format!("${v:.2}")
+    }
+}
+
+/// X 轴刻度文案(`tickDate`:小时桶原样,日期桶切掉年份留 `MM-DD`)。
+fn axis_date(date: &str) -> String {
+    if date.contains(':') {
+        date.to_string()
+    } else {
+        date.chars().skip(5).collect()
+    }
+}
+
+/// 一侧的 Y 轴刻度标签列。
+///
+/// 刻度是等距的,所以第 i 条线落在绘图区高度的 `1 - i/(n-1)` 处;标签绝对定位、
+/// **纵向压在线上**(减半个行高)。原版是 SVG 的 `<text dominant-baseline>`,
+/// 效果一样。只有一条刻度(全 0)时贴底。
+fn axis_labels(ticks: &[f64], left: bool, fmt: impl Fn(f64) -> String) -> Div {
+    let mut column = div()
+        .relative()
+        .flex_none()
+        .w(px(if left {
+            CHART_LEFT_AXIS
+        } else {
+            CHART_RIGHT_AXIS
+        }))
+        .h(px(CHART_PLOT_HEIGHT))
+        .text_size(ui::font_px(CHART_TICK_FONT))
+        .text_color(ui::text_muted());
+    let last = ticks.len().saturating_sub(1);
+    for (i, v) in ticks.iter().enumerate() {
+        let ratio = if last == 0 { 0.0 } else { i as f32 / last as f32 };
+        let y = CHART_PLOT_HEIGHT * (1.0 - ratio) - CHART_TICK_LINE_HEIGHT / 2.0;
+        column = column.child(
+            div()
+                .absolute()
+                .top(px(y))
+                .left_0()
+                .right_0()
+                .h(px(CHART_TICK_LINE_HEIGHT))
+                .when(left, |el| el.text_right().pr(px(4.0)))
+                .when(!left, |el| el.pl(px(4.0)))
+                .child(fmt(*v)),
+        );
+    }
+    column
+}
+
+/// X 轴标签条。格子与绘图区的 band 一一对应(所以标签正对柱心),
+/// 两侧留出 Y 轴列的宽度让它与绘图区对齐。
+///
+/// `step` 由 [`mt_ui::chart::label_step`] 按实测宽度算 —— 等价原版
+/// `minTickGap={24}`(recharts 是逐个量文本宽度后跳过挤在一起的那些)。
+fn x_axis_labels(buckets: &[DailyStat], plot_width: f32) -> Div {
+    let step = mt_ui::chart::label_step(
+        buckets.len(),
+        plot_width,
+        CHART_X_LABEL_WIDTH,
+        CHART_X_MIN_GAP,
+    );
+    let mut row = div().flex().flex_1().min_w(px(0.0));
+    for (i, d) in buckets.iter().enumerate() {
+        row = row.child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .overflow_hidden()
+                .text_center()
+                .child(if i % step == 0 {
+                    axis_date(&d.date)
+                } else {
+                    String::new()
+                }),
+        );
+    }
     div()
+        .flex()
+        .h(px(CHART_X_AXIS))
+        .pt(px(4.0))
+        .text_size(ui::font_px(CHART_TICK_FONT))
+        .text_color(ui::text_muted())
+        .child(div().flex_none().w(px(CHART_LEFT_AXIS)))
+        .child(row)
+        .child(div().flex_none().w(px(CHART_RIGHT_AXIS)))
+}
+
+/// 骨架块:`rounded-md` + `--border-subtle` + 2s 脉冲(`opacity 1 → .5 → 1`)。
+///
+/// ⚠️ 脉冲过减弱动效的闸:原版这是 Tailwind 的 `.animate-pulse`,reduce 段的
+/// 通配规则把它**停在第一帧**(它不在豁免名单里 —— 那段注释还专门点了
+/// `animate-pulse` 的名)。停下来就是一块静止的浅色占位,信息量不减。
+fn skeleton_block(id: &'static str, h: f32) -> AnyElement {
+    let block = div()
         .h(px(h))
         .flex_1()
         .rounded(px(6.0))
-        .bg(ui::border_subtle())
+        .bg(ui::border_subtle());
+    if !mt_ui::motion::blinks() {
+        return block.into_any_element();
+    }
+    block
         .with_animation(
             id,
             Animation::new(Duration::from_secs(2))
@@ -1571,7 +1732,7 @@ fn state_hint(
 }
 
 impl Render for UsagePanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Top 会话点开 → 面板内正文预览(带「‹ 返回」)
         if self.preview.is_some() {
             return div()
@@ -1627,6 +1788,14 @@ impl Render for UsagePanel {
             self.progress.is_some_and(|(_, total)| total > 0),
         );
 
+        // `.usage-fade-in` 是挂在**主体那层 div** 上的一次性动画,只在它被挂载时
+        // 播 —— 相位从别的档切进 Ready 就是「挂载」。停在 Ready 上的自动刷新
+        // (每 5s 一次)不该让整个面板反复淡入。
+        if phase == Phase::Ready && self.last_phase != Some(Phase::Ready) {
+            self.fade_in.restart();
+        }
+        self.last_phase = Some(phase);
+
         let entity = cx.entity();
         body = match phase {
             Phase::PricingError => body.child(state_hint(
@@ -1669,7 +1838,7 @@ impl Render for UsagePanel {
             // 必须立刻**从树上消失**,不能靠 opacity 藏起来
             Phase::Skeleton => body.child(render_skeleton()),
             Phase::Empty => body.child(state_hint(t("usageStats", "empty"), None, false, None)),
-            Phase::Ready => self.render_main(body, cx),
+            Phase::Ready => self.render_main(body, window, cx),
         };
 
         div()
@@ -1880,10 +2049,21 @@ impl UsagePanel {
     }
 
     /// 主体:KPI 五格 + Token 副行 + 趋势图 + 三卡同行 + Top 会话 + 三段计数排行。
-    fn render_main(&mut self, mut body: Stateful<Div>, cx: &mut Context<Self>) -> Stateful<Div> {
+    /// 主体(`UsageStatsModal.tsx:300` 那层 `space-y-4 usage-fade-in`)。
+    ///
+    /// 整块内容装在**一个** `main` 容器里而不是直接挂到 `body` 上,就是为了给
+    /// `.usage-fade-in` 一个落点:淡入是整块一起淡,不是逐个区块各淡各的。
+    /// `gap` 与 `body` 同值,所以拆出这一层之后间距与之前一模一样。
+    fn render_main(
+        &mut self,
+        body: Stateful<Div>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
         let Some(stats) = self.stats.clone() else {
             return body;
         };
+        let mut main = div().flex().flex_col().gap(px(14.0));
         let now = Instant::now();
         let hit = cache_hit_rate(
             stats.input_tokens,
@@ -1892,7 +2072,7 @@ impl UsagePanel {
         );
 
         // --- KPI 五格(数字滚动) ---
-        body = body.child(
+        main = main.child(
             div()
                 .flex()
                 .gap(px(12.0))
@@ -1974,12 +2154,12 @@ impl UsagePanel {
                     .child(t("usageStats", key)),
             );
         }
-        body = body.child(token_row);
+        main = main.child(token_row);
 
         // --- 趋势图 ---
-        body = body.child(section(
+        main = main.child(section(
             t("usageStats", "dailyActivity"),
-            self.render_chart(&stats),
+            self.render_chart(&stats, cx),
         ));
 
         // --- 三卡同行:项目 | 模型 | 供应商 ---
@@ -2014,11 +2194,15 @@ impl UsagePanel {
                     .map(|(_, path)| path.clone());
                 let entity = entity.clone();
                 let target_for_click = target.clone();
+                let id = format!("proj-{}", p.path);
+                let ratio = self
+                    .rank_bars
+                    .value(&id, ratios.get(i).copied().unwrap_or(0.0));
                 project_rows = project_rows.child(
                     rank_row(
-                        format!("proj-{}", p.path),
+                        id,
                         p.name.clone(),
-                        ratios.get(i).copied().unwrap_or(0.0),
+                        ratio,
                         format_cost(p.cost),
                         Some(p.sessions.to_string()),
                         target.is_some(),
@@ -2055,20 +2239,27 @@ impl UsagePanel {
                 } else {
                     model_short_name(&m.model)
                 };
+                let id = format!("model-{}", m.model);
+                let ratio = self
+                    .rank_bars
+                    .value(&id, ratios.get(i).copied().unwrap_or(0.0));
                 model_rows = model_rows.child(rank_row(
-                    format!("model-{}", m.model),
+                    id,
                     name,
-                    ratios.get(i).copied().unwrap_or(0.0),
+                    ratio,
                     format_cost(m.cost),
                     Some(format_tokens(m.tokens)),
                     false,
                 ));
             }
             if !rest.is_empty() {
+                let ratio = self
+                    .rank_bars
+                    .value("model-others", ratios.last().copied().unwrap_or(0.0));
                 model_rows = model_rows.child(rank_row(
                     "model-others",
                     tr!("usageStats", "othersModels", count = rest.len()),
-                    ratios.last().copied().unwrap_or(0.0),
+                    ratio,
                     format_cost(others_cost),
                     Some(format_tokens(others_tokens)),
                     false,
@@ -2094,10 +2285,14 @@ impl UsagePanel {
                 } else {
                     p.provider.clone()
                 };
+                let id = format!("provider-{}", p.provider);
+                let ratio = self
+                    .rank_bars
+                    .value(&id, ratios.get(i).copied().unwrap_or(0.0));
                 provider_rows = provider_rows.child(rank_row(
-                    format!("provider-{}", p.provider),
+                    id,
                     name,
-                    ratios.get(i).copied().unwrap_or(0.0),
+                    ratio,
                     format_cost(p.cost),
                     Some(format_tokens(p.tokens)),
                     false,
@@ -2105,7 +2300,7 @@ impl UsagePanel {
             }
         }
 
-        body = body.child(
+        main = main.child(
             div()
                 .flex()
                 .items_start()
@@ -2138,7 +2333,7 @@ impl UsagePanel {
         );
 
         // --- Top 会话 ---
-        body = body.child(section(
+        main = main.child(section(
             t("usageStats", "topSessions"),
             self.render_top_sessions(&stats, cx),
         ));
@@ -2159,32 +2354,64 @@ impl UsagePanel {
             let ratios = bar_ratios(&items.iter().map(|c| c.count as f64).collect::<Vec<_>>());
             let mut rows = div().flex().flex_col();
             for (i, c) in items.iter().enumerate() {
+                let row_id = format!("{id}-{}", c.name);
+                let ratio = self
+                    .rank_bars
+                    .value(&row_id, ratios.get(i).copied().unwrap_or(0.0));
                 rows = rows.child(rank_row(
-                    format!("{id}-{}", c.name),
+                    row_id,
                     c.name.clone(),
-                    ratios.get(i).copied().unwrap_or(0.0),
+                    ratio,
                     format_count(c.count),
                     None,
                     false,
                 ));
             }
-            body = body.child(section(title, rows));
+            main = main.child(section(title, rows));
         }
 
-        body
+        // 本帧读完排行条,把界面上已经没有的行丢掉(等价于 DOM 元素被卸载)
+        self.rank_bars.sweep();
+        self.rank_bars.drive(window);
+
+        // `@keyframes usageFadeIn`:`opacity 0→1` + `translateY(6px)→0`。
+        // gpui 没有 transform,位移用上外边距等价(与 `main.rs` 的 `panelSwapIn`
+        // 同一套路);跑完直接不挂包装层。
+        let fade = self.fade_in.drive(window);
+        body.child(if fade >= 1.0 {
+            main.into_any_element()
+        } else {
+            div()
+                .opacity(fade)
+                .mt(px(USAGE_FADE_SHIFT * (1.0 - fade)))
+                .child(main)
+                .into_any_element()
+        })
     }
 
-    /// 趋势图。**补空桶**是第一优先(后端快照稀疏,不补画不出完整时间轴);
-    /// 补齐后仍只有 1 个桶时退化成摘要卡(孤点图没有信息量)。
+    /// 趋势图(`DailyChart.tsx`)。**补空桶**是第一优先(后端快照稀疏,不补
+    /// 画不出完整时间轴);补齐后仍只有 1 个桶时退化成摘要卡(孤点图没有信息量)。
     ///
-    /// 与原版的偏差:recharts 的面积曲线 / 网格 / 双轴刻度这里简化成
-    /// 「成本柱(accent) + 调用数柱(muted,右轴口径)」两组等宽柱,
-    /// hover 详情六行照抄(见交付说明的偏差清单)。
-    fn render_chart(&self, stats: &UsageStatsPayload) -> AnyElement {
+    /// 版式与 recharts 的 `ComposedChart` 对齐:
+    ///
+    /// ```text
+    /// ┌───────────────────────────────────────────────┐ ↑ margin.top 10
+    /// │  $0.40 ┊······················· 40           │
+    /// │  $0.30 ┊······················· 30           │ 绘图区(ChartCanvas)
+    /// │        ┊    ╭──╮                             │ 左轴成本 / 右轴调用数
+    /// │  $0.00 ┊────┴──┴────────────── 0            │ ↓
+    /// │  08-01     08-08     08-15     08-22          │ X 轴 30
+    /// └───────────────────────────────────────────────┘
+    /// ```
+    ///
+    /// 几何(曲线采样 / 刻度取值 / 标签稀释)全在 [`mt_ui::chart`],**这里只负责
+    /// 摆文本和挂 hover**:轴标签是普通 `div`(自绘元素画字要自己 shape,而字号
+    /// 字族是壳的主题量),hover 列是盖在画布上的透明格子。
+    fn render_chart(&mut self, stats: &UsageStatsPayload, cx: &mut Context<Self>) -> AnyElement {
         let now = chrono::Local::now();
         if stats.daily.is_empty() {
             return div()
-                .h(px(232.0))
+                .h(px(CHART_HEIGHT))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -2203,7 +2430,7 @@ impl UsagePanel {
         if buckets.len() == 1 {
             let d = &buckets[0];
             return div()
-                .h(px(232.0))
+                .h(px(CHART_HEIGHT))
                 .flex()
                 .flex_col()
                 .items_center()
@@ -2234,80 +2461,99 @@ impl UsagePanel {
                 .into_any_element();
         }
 
-        let max_cost = buckets.iter().map(|d| d.cost).fold(0.0_f64, f64::max);
-        let max_calls = buckets.iter().map(|d| d.calls).max().unwrap_or(0) as f64;
-        let mut chart = div()
-            .flex()
-            .items_end()
-            .gap(px(2.0))
-            .h(px(200.0))
-            .w_full();
+        // 几何缓存:数据没变就复用上一份(性能红线 —— 不许每帧重建曲线)。
+        // 归一化坐标与像素无关,所以拖窗口改宽度**不**让缓存失效。
+        let costs: Vec<f64> = buckets.iter().map(|d| d.cost).collect();
+        let calls: Vec<f64> = buckets.iter().map(|d| d.calls as f64).collect();
+        let key = mt_ui::chart::ChartKey::of(&costs, &calls);
+        let model = match &self.chart_cache {
+            Some((cached, model)) if *cached == key => model.clone(),
+            _ => {
+                let model = Rc::new(mt_ui::chart::ChartModel::build(
+                    &costs,
+                    &calls,
+                    CHART_TICK_COUNT,
+                ));
+                self.chart_cache = Some((key, model.clone()));
+                model
+            }
+        };
+
+        let colors = mt_ui::chart::ChartColors {
+            // `<linearGradient>` 的两个 stop:accent 0.3 → accent 0.02
+            area_top: ui::with_alpha(ui::accent(), 0.3),
+            area_bottom: ui::with_alpha(ui::accent(), 0.02),
+            line: ui::accent(),
+            // `<Bar fill="var(--text-muted)" opacity={0.28}>`
+            bar: ui::with_alpha(ui::text_muted(), 0.28),
+            grid: ui::border_default(),
+            dot: ui::accent(),
+        };
+
+        // hover 列:盖在画布上的透明格子,一格一个桶(原版是 recharts 的
+        // Tooltip + cursor,这里保留 M/Q 批就有的「整列淡底 + 六行详情」)
+        let mut hover_row = div().absolute().inset_0().flex();
         for d in &buckets {
-            let cost_ratio = if max_cost > 0.0 {
-                (d.cost / max_cost) as f32
-            } else {
-                0.0
-            };
-            let calls_ratio = if max_calls > 0.0 {
-                (d.calls as f64 / max_calls) as f32
-            } else {
-                0.0
-            };
             let tip = ChartTip::from(d);
-            chart = chart.child(
+            hover_row = hover_row.child(
                 div()
                     .id(SharedString::from(format!("bar-{}", d.date)))
                     .flex_1()
                     .min_w(px(1.0))
                     .h_full()
-                    .flex()
-                    .items_end()
-                    .justify_center()
-                    .gap(px(1.0))
+                    // 与改造前同一档淡底(`--border-subtle`)。⚠️ 这层盖在画布
+                    // **之上**,别顺手 `with_alpha` 加浓 —— 那个函数是**赋值**
+                    // 不是乘,给 0.5 会直接变成半透明白把曲线洗掉
                     .hover(|el| el.bg(ui::border_subtle()))
                     .tooltip(move |window, cx| {
                         let tip = tip.clone();
                         Tooltip::element(move |_window, _cx| tip.render()).build(window, cx)
-                    })
-                    // 调用数(右轴口径,淡)
-                    .child(
-                        div()
-                            .flex_1()
-                            .h(relative(calls_ratio.max(0.004)))
-                            .rounded(px(2.0))
-                            .bg(ui::with_alpha(ui::text_muted(), 0.28)),
-                    )
-                    // 成本(左轴口径)
-                    .child(
-                        div()
-                            .flex_1()
-                            .h(relative(cost_ratio.max(0.004)))
-                            .rounded(px(2.0))
-                            .bg(ui::accent()),
-                    ),
+                    }),
             );
         }
+
+        // 绘图区宽度只有布局阶段才知道,拿 canvas 量下来供**下一帧**的标签
+        // 稀释用(与 `terminal_area` 量分屏尺寸同一套路,同样刻意不 notify)
+        let entity = cx.entity();
+        let measure = gpui::canvas(
+            move |bounds: gpui::Bounds<gpui::Pixels>, _window, cx| {
+                entity.update(cx, |this: &mut Self, _cx| {
+                    this.chart_width = f32::from(bounds.size.width);
+                });
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .size_full();
+
+        let plot = div()
+            .relative()
+            .flex_1()
+            .min_w(px(0.0))
+            .h(px(CHART_PLOT_HEIGHT))
+            .child(measure)
+            .child(mt_ui::chart::ChartCanvas::new(
+                model.clone(),
+                colors,
+                px(CHART_PLOT_HEIGHT),
+            ))
+            .child(hover_row);
 
         div()
             .flex()
             .flex_col()
-            .gap(px(4.0))
-            .child(chart)
             .child(
                 div()
                     .flex()
-                    .justify_between()
-                    .text_size(ui::font_px(9.0))
-                    .text_color(ui::text_muted())
-                    .child(buckets.first().map(|d| d.date.clone()).unwrap_or_default())
-                    // 双轴的量纲:左 = 成本峰值,右 = 调用数峰值
-                    .child(format!(
-                        "{} · {}",
-                        format_cost(max_cost),
-                        format_count(max_calls as u64)
-                    ))
-                    .child(buckets.last().map(|d| d.date.clone()).unwrap_or_default()),
+                    .items_end()
+                    .pt(px(CHART_MARGIN_TOP))
+                    .child(axis_labels(&model.left_ticks, true, axis_cost))
+                    .child(plot)
+                    .child(axis_labels(&model.right_ticks, false, |v| {
+                        format_count(v.round().max(0.0) as u64)
+                    })),
             )
+            .child(x_axis_labels(&buckets, self.chart_width))
             .into_any_element()
     }
 
@@ -3014,5 +3260,80 @@ mod tests {
         assert_eq!(auto_refresh_label(5), "5s");
         assert_eq!(auto_refresh_label(60), "60s");
         assert_eq!(auto_refresh_label(0), t("usageStats", "autoRefreshOff"));
+    }
+
+    /// 左轴刻度文案(`DailyChart.tsx` 的 `axisCost`)。
+    #[test]
+    fn 成本轴刻度上千才换_k() {
+        assert_eq!(axis_cost(0.0), "$0.00");
+        assert_eq!(axis_cost(0.07), "$0.07");
+        assert_eq!(axis_cost(12.5), "$12.50");
+        assert_eq!(axis_cost(999.994), "$999.99");
+        // 1000 起换算成 K,一位小数
+        assert_eq!(axis_cost(1000.0), "$1.0K");
+        assert_eq!(axis_cost(1446.8), "$1.4K");
+    }
+
+    /// X 轴刻度文案(`tickDate`:小时桶原样,日期桶切掉年份)。
+    #[test]
+    fn 时间轴刻度切年份保留小时() {
+        assert_eq!(axis_date("2026-08-19"), "08-19");
+        assert_eq!(axis_date("09:00"), "09:00");
+        assert_eq!(axis_date("00:00"), "00:00");
+    }
+
+    /// 图表版式常量与 recharts 的 JSX 逐条对齐 —— 改了任何一个都要在这里同步。
+    #[test]
+    fn 图表版式常量对齐原版() {
+        assert_eq!(CHART_HEIGHT, 232.0, "<ComposedChart height={{232}}>");
+        assert_eq!(CHART_MARGIN_TOP, 10.0, "margin.top");
+        assert_eq!(CHART_LEFT_AXIS, 52.0, "<YAxis yAxisId=cost width={{52}}>");
+        assert_eq!(CHART_RIGHT_AXIS, 44.0, "<YAxis yAxisId=calls width={{44}}>");
+        assert_eq!(CHART_X_MIN_GAP, 24.0, "<XAxis minTickGap={{24}}>");
+        assert_eq!(CHART_TICK_FONT, 9.0, "AXIS_TICK.fontSize");
+        // 绘图区 = 总高 − 上留白 − X 轴,必须为正且是三者的差
+        assert_eq!(
+            CHART_PLOT_HEIGHT,
+            CHART_HEIGHT - CHART_MARGIN_TOP - CHART_X_AXIS
+        );
+        assert!(CHART_PLOT_HEIGHT > 0.0);
+    }
+
+    /// 用量面板的两条动效在原版 reduce 段里被**点名豁免**,GPUI 侧不许过闸。
+    #[test]
+    fn 用量面板动效属豁免面() {
+        assert!(
+            !mt_ui::motion::USAGE_FADE_IN.respects_reduce,
+            "styles.css:471-473 豁免 .usage-fade-in"
+        );
+        assert!(
+            !mt_ui::motion::RANK_BAR.respects_reduce,
+            "styles.css:475-477 豁免 .usage-rank-bar"
+        );
+        assert_eq!(
+            mt_ui::motion::USAGE_FADE_IN.duration,
+            Duration::from_millis(350)
+        );
+        assert_eq!(mt_ui::motion::RANK_BAR.duration, Duration::from_millis(500));
+        // 骨架屏的脉冲相反:`.animate-pulse` 不在豁免名单,reduce 下必须停
+        crate::motion::with_reduce(true, || assert!(!mt_ui::motion::blinks()));
+    }
+
+    /// 排行条:首次出现直接落目标(浏览器同款),数据变了才补间。
+    #[test]
+    fn 排行条首帧不补间_变值才补() {
+        let t0 = Instant::now();
+        let mut bars = mt_ui::motion::TweenMap::new(mt_ui::motion::RANK_BAR);
+        assert_eq!(bars.value_at("proj-a", 0.75, t0), 0.75);
+        // 同一帧重复读同一行(渲染里每帧都读)不该把它拖回起点
+        assert_eq!(bars.value_at("proj-a", 0.75, t0), 0.75);
+        // 数据刷新:从 0.75 补到 0.25,半程(250ms)在中间
+        bars.value_at("proj-a", 0.25, t0);
+        let mid = t0 + Duration::from_millis(250);
+        let v = bars.value_at("proj-a", 0.25, mid);
+        assert!(v < 0.75 && v > 0.25, "半程应在两值之间,实际 {v}");
+        let end = t0 + Duration::from_millis(500);
+        assert!((bars.value_at("proj-a", 0.25, end) - 0.25).abs() < 1e-4);
+        assert!(!bars.running_at(end), "跑完就不该再要帧");
     }
 }
