@@ -635,6 +635,45 @@ pub fn section_title(text: impl Into<String>) -> Div {
         )
 }
 
+// ─── 弹窗尺寸的视口钳制 ───────────────────────────────────────
+//
+// 原版 `Modal.tsx:159-179` 的面板是 `fixed inset-0 flex justify-center` 里的
+// flex 子项,自带 `overflow-hidden`:窗口比面板窄时 flex-shrink 直接把它压回
+// 窗口内(CSS 里 `min-width:auto` 对 overflow≠visible 的盒子解析为 0),
+// 高度则由调用方的 `max-h-[80vh]` 管住。
+//
+// gpui-component 的 `Dialog` 两条都没有:宽是定值,位置按「视口中心 − 宽/2」
+// 现算(`dialog.rs:368`),窗口比面板窄时面板**两侧一起出界**;高度是调用方
+// 自己填的定值。这两个 helper 把口径收在一处 —— `Dialog` 的 builder 闭包每帧
+// 都会被 `Root` 重新调一遍,所以拖窗口改大小时钳制值跟着变。
+
+/// 弹窗宽度按视口钳制。`preferred` 是原版那个 `w-[..px]`。
+///
+/// 不留左右外边距 —— 原版那个 flex 容器也没有(只有 `justify-center`),
+/// 极窄窗口下面板正好铺满窗口宽。
+pub fn clamp_dialog_width(preferred: Pixels, viewport: gpui::Size<Pixels>) -> Pixels {
+    preferred.min(viewport.width)
+}
+
+/// 弹窗**正文**高度按视口钳制:`ratio` 是原版的 `max-h-[{ratio}vh]`,
+/// `preferred` 是本弹窗自己的舒适上限,`chrome` 是标题栏之类正文之外的固定占用。
+///
+/// `Dialog` 的顶距默认 `视口高/10`(= 原版 `pt-[10vh]`),所以整块面板高不超过
+/// 80% 时底边恰好落在视口内。返回值有 [`MIN_DIALOG_BODY`] 下限:窗口被拖到只剩
+/// 一条时,面板宁可溢出也不该塌成一条缝。
+pub fn clamp_dialog_body_height(
+    preferred: Pixels,
+    viewport: gpui::Size<Pixels>,
+    ratio: f32,
+    chrome: Pixels,
+) -> Pixels {
+    let total = (viewport.height * ratio).min(preferred);
+    (total - chrome).max(px(MIN_DIALOG_BODY))
+}
+
+/// [`clamp_dialog_body_height`] 的下限。
+const MIN_DIALOG_BODY: f32 = 120.0;
+
 // ─── 设置面板的通用原语 ───────────────────────────────────────
 //
 // 逐条对应 `src/components/SettingsModal.tsx:52-256` 那批组件(动机见它的注释:
@@ -1036,6 +1075,39 @@ pub fn highlight_runs(text: &str, ranges: &[(usize, usize)]) -> Vec<(String, boo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 弹窗宽度:够宽时用原版那个定值,窗口比它窄就压回窗口宽
+    /// (原版靠 flex-shrink + `overflow-hidden`,gpui 的 `Dialog` 是定值宽,
+    /// 不钳制的话按「中心 − 宽/2」定位会两侧一起出界)。
+    #[test]
+    fn 弹窗宽度按视口钳制() {
+        let wide = gpui::size(px(1400.0), px(900.0));
+        let narrow = gpui::size(px(600.0), px(900.0));
+        assert_eq!(clamp_dialog_width(px(680.0), wide), px(680.0));
+        assert_eq!(clamp_dialog_width(px(680.0), narrow), px(600.0));
+    }
+
+    /// 弹窗正文高度:`min(80vh, 舒适上限) − 头部`,并留 120px 下限。
+    #[test]
+    fn 弹窗正文高度按视口钳制() {
+        let tall = gpui::size(px(1400.0), px(1200.0));
+        // 1200*0.8 = 960 > 640 → 舒适上限封顶,再扣掉头部
+        assert_eq!(
+            clamp_dialog_body_height(px(640.0), tall, 0.8, px(52.0)),
+            px(588.0)
+        );
+        // 矮窗口:80vh 说了算,面板整体(头部 + 正文)= 0.8vh,顶距 0.1vh → 不出界
+        let short = gpui::size(px(1400.0), px(500.0));
+        let body = clamp_dialog_body_height(px(640.0), short, 0.8, px(52.0));
+        assert_eq!(body, px(348.0));
+        assert!(body + px(52.0) + short.height * 0.1 <= short.height);
+        // 极端窄高:宁可溢出也不塌成一条缝
+        let sliver = gpui::size(px(1400.0), px(120.0));
+        assert_eq!(
+            clamp_dialog_body_height(px(640.0), sliver, 0.8, px(52.0)),
+            px(MIN_DIALOG_BODY)
+        );
+    }
 
     #[test]
     fn 高亮切段_无区间时原样一段() {

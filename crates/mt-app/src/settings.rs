@@ -51,7 +51,7 @@ use gpui::{
 use gpui_component::input::{Input, InputEvent, InputState};
 use mt_ai::hook_registry::{self, HookAgent, HookRegistrationInfo};
 use mt_config::{EditorConfig, ShellConfig};
-use mt_ui::theme_bridge::{ThemeSlot, resolve_theme_pack};
+use mt_ui::theme_bridge::{ThemePackListing, ThemeSlot, resolve_theme_pack};
 
 use crate::hotkeys;
 use crate::i18n::{Locale, t, tr};
@@ -415,6 +415,8 @@ pub fn newer_release(current: &str) -> Option<ReleaseInfo> {
 
 /// 一张皮肤卡片要画的东西(刷新列表时算一次,不每帧重解析色值)。
 struct ThemeCard {
+    /// **themes/ 下的目录名**,卡片副标题、应用、删除、读资源全用它。
+    /// 见 [`ThemeCard::from_listing`]。
     theme_id: String,
     name: String,
     background: Hsla,
@@ -423,6 +425,37 @@ struct ThemeCard {
     text: Hsla,
     /// 背景图绝对路径(包里没声明 / 文件不在盘上 = `None`)。
     image: Option<PathBuf>,
+}
+
+impl ThemeCard {
+    /// 列表项 → 卡片。
+    ///
+    /// **身份取 `listing.theme_id`(目录名),不是 `def.id`** —— 原版
+    /// `SettingsModal.tsx:1982-1984` 的 `key` / `subtitle` 与
+    /// `selectCustom`(`:1834`)、`deletePack`(`:1893`)用的都是
+    /// `ThemePackMeta.themeId`,而那个字段是「themes/ 下目录名」
+    /// (`themePackManager.ts:75-81`)。
+    ///
+    /// 拿 `def.id` 当身份的后果实测过:用户把包目录改名成 `ember-new`、
+    /// theme.json 里仍写着 `"id": "ember-dusk"`,卡片列得出来,一点「应用」
+    /// 就落到 `packs.read("ember-dusk")` 上找不到目录,红条「皮肤应用失败」。
+    fn from_listing(listing: &ThemePackListing) -> Self {
+        let ThemePackListing { theme_id, def, dir } = listing;
+        let applied = resolve_theme_pack(def, Some(dir));
+        Self {
+            theme_id: theme_id.clone(),
+            name: def.name.clone(),
+            background: applied.color(ThemeSlot::Background),
+            panel: applied.color(ThemeSlot::Panel),
+            accent: applied.color(ThemeSlot::Accent),
+            text: applied.color(ThemeSlot::Text),
+            image: def
+                .image
+                .as_deref()
+                .map(|name| dir.join(name))
+                .filter(|p| p.is_file()),
+        }
+    }
 }
 
 // ─── 面板视图 ─────────────────────────────────────────────────
@@ -493,6 +526,60 @@ pub struct SettingsView {
     _subs: Vec<Subscription>,
 }
 
+/// 面板头部高度(含 1px 下边框)。正文高度按它扣,见 [`render_dialog_header`]。
+const HEADER_H: f32 = 52.0;
+
+/// 面板头部:标题 + ✕。逐条对照原版 `Modal.tsx:186-194` 的 header
+/// (`px-5 py-4` + 下边框 + `text-lg font-semibold` 标题 + `ModalCloseButton`)。
+///
+/// **不用 `Dialog::title`**:设置面板要 `p_0()`(左右两列自己贴边铺满),而
+/// `Dialog` 的标题内边距跟着同一个 padding 走 —— 一 `p_0()` 标题就贴死在面板
+/// 左上角的圆角上,而且没有分隔线。它自带的 ✕ 画 `IconName::Close`
+/// (0.5.1 无 svg 资产 → 空白),同样只能自绘。
+fn render_dialog_header() -> impl IntoElement {
+    div()
+        .flex()
+        .flex_none()
+        .h(px(HEADER_H))
+        .items_center()
+        .justify_between()
+        .gap(px(12.0))
+        .px(px(20.0))
+        .border_b_1()
+        .border_color(ui::border_subtle())
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_size(ui::font_px(15.0))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(ui::text_primary())
+                .child(t("settings", "title")),
+        )
+        .child(
+            div()
+                .id("settings-close")
+                .flex_none()
+                .w(px(28.0))
+                .h(px(28.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(4.0))
+                .text_size(ui::font_px(15.0))
+                .text_color(ui::text_muted())
+                .cursor_pointer()
+                .hover(|el| el.bg(ui::border_subtle()).text_color(ui::text_primary()))
+                .child("✕")
+                // 程序化关闭必须走 `close_guarded`:`window.close_dialog` 不触发
+                // `Dialog::on_close`,覆盖物栈里的登记摘不掉就再也开不出设置面板
+                .on_click(|_, window, cx| {
+                    crate::prompt::close_guarded(kind::SETTINGS, window, cx);
+                }),
+        )
+}
+
 /// 打开设置面板。`initial_page` 是深链入口(原版留的口子,目前恒传 `None`)。
 pub fn open_settings(
     store: Entity<AppStore>,
@@ -511,15 +598,30 @@ pub fn open_settings(
     open_guarded(kind::SETTINGS, window, cx, {
         let view = view.clone();
         move |dialog, window, _cx| {
-            // 原版 `w-[680px] max-h-[80vh]`
-            let height = (window.viewport_size().height * 0.8).min(px(640.0));
+            // 原版 `w-[680px] max-h-[80vh]`(`SettingsModal.tsx:2099`)。两条都要
+            // 按视口现算:`Dialog` 的宽是定值、位置按「视口中心 − 宽/2」推,
+            // 窗口比 680 窄时面板两侧一起出界(原版那边 flex-shrink 会把它压回来)
+            let viewport = window.viewport_size();
+            let width = ui::clamp_dialog_width(px(680.0), viewport);
+            let body = ui::clamp_dialog_body_height(px(640.0), viewport, 0.8, px(HEADER_H));
             dialog
-                .title(t("settings", "title"))
-                .w(px(680.0))
+                .w(width)
                 .p_0()
+                // 头部自绘(见 [`render_dialog_header`]):`p_0()` 之下 `Dialog`
+                // 自带的 title 内边距是 0,标题会贴死在面板左上角圆角上;
+                // 它自带的 ✕ 画的是 `IconName::Close`,0.5.1 无 svg 资产 →
+                // 渲染成空白,留着等于在右上角埋一个看不见的可点区
+                .close_button(false)
                 // 改了半天设置、误点遮罩就没了 —— 面板里还有编辑中的表单
                 .overlay_closable(false)
-                .child(div().h(height).child(view.clone()))
+                .child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_col()
+                        .child(render_dialog_header())
+                        .child(div().h(body).child(view.clone())),
+                )
         }
     });
 
@@ -766,23 +868,8 @@ impl SettingsView {
         self.theme_error = None;
         self.theme_notice = None;
         self.theme_cards = crate::theme::list_packs()
-            .into_iter()
-            .map(|(def, dir)| {
-                let applied = resolve_theme_pack(&def, Some(&dir));
-                ThemeCard {
-                    theme_id: def.id.clone(),
-                    name: def.name.clone(),
-                    background: applied.color(ThemeSlot::Background),
-                    panel: applied.color(ThemeSlot::Panel),
-                    accent: applied.color(ThemeSlot::Accent),
-                    text: applied.color(ThemeSlot::Text),
-                    image: def
-                        .image
-                        .as_deref()
-                        .map(|name| dir.join(name))
-                        .filter(|p| p.is_file()),
-                }
-            })
+            .iter()
+            .map(ThemeCard::from_listing)
             .collect();
         cx.notify();
     }
@@ -999,6 +1086,20 @@ impl Render for SettingsView {
                 div()
                     .id("settings-page")
                     .flex_1()
+                    // ⚠️ 少了 `min_w_0()` 这一列会**撑破面板**:taffy 按 CSS 的
+                    // 「flex 子项 min-width:auto = min-content」给它兜底,而 gpui
+                    // 量 min-content 时不给换行宽度(`elements/text.rs:347`:
+                    // `AvailableSpace::MinContent` → `wrap_width = None`),于是最长
+                    // 的那条中文说明(回滚行数 desc)整行不折,成了这一列的宽度下限。
+                    // 列宽越过 680 的面板后被 `overflow_hidden` 裁掉 —— 用户看到的
+                    // 就是「卡片 / 按钮 / 说明文字被右缘切断」。
+                    //
+                    // 原版没有这条:`overflow-y-auto` 让 overflow-x 的计算值变成
+                    // auto,`min-width:auto` 随之解析为 0,列被压回可用宽、文字换行
+                    // (`SettingsModal.tsx:2166` 那一列就是 `flex-1 overflow-y-auto`)。
+                    // taffy 只按本轴的 overflow 判(`compute/flexbox.rs:791`),
+                    // 不做 CSS 那个跨轴的 visible→auto 修正,所以得显式写。
+                    .min_w_0()
                     .h_full()
                     .overflow_y_scroll()
                     .px(px(20.0))
@@ -1778,7 +1879,10 @@ impl SettingsView {
         div()
             .id(SharedString::from(format!("theme-card-{idx}")))
             .group(SharedString::from(format!("theme-card-group-{idx}")))
-            .w(px(300.0))
+            // 300 是上限不是定值:面板宽被视口钳到很窄时(内容列 < 300),
+            // 定值宽的卡片会横着捅出去被裁掉 —— 与「内容列不许越过面板」同一条
+            .w_full()
+            .max_w(px(300.0))
             .flex()
             .flex_col()
             .gap(px(8.0))
@@ -3191,6 +3295,38 @@ fn snippet_lines(content: &str) -> Vec<gpui::Div> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 回归测试(用户真机 v0.13.x GPUI 版):皮肤卡片的身份必须是**目录名**。
+    ///
+    /// `themes/ember-new/theme.json` 里写着 `"id": "ember-dusk"` —— 卡片此前取
+    /// `def.id`,于是点「应用」落到 `packs.read("ember-dusk")` 上找不到目录,
+    /// 红条报「皮肤应用失败: ember-dusk」。副标题同样要显示目录名
+    /// (原版 `SettingsModal.tsx:1984` 的 `subtitle={pack.themeId}`)。
+    #[test]
+    fn 皮肤卡片的身份取目录名() {
+        let json = r##"{
+          "id": "ember-dusk", "name": "Ember Dusk", "appearance": "dark",
+          "colors": {
+            "background": "#120d1c", "panel": "#1c1329", "panelAlt": "#251937",
+            "accent": "#ff9a62", "text": "#ede4f2", "muted": "#9a8caf", "line": "#3a2d52"
+          },
+          "image": "background.png"
+        }"##;
+        let dir = PathBuf::from("/themes/ember-new");
+        let listing = ThemePackListing {
+            // 列表项的 id 由 mt-config 按目录名给出
+            theme_id: "ember-new".to_string(),
+            def: mt_ui::theme_bridge::parse_theme_pack("ember-new", json).unwrap(),
+            dir: dir.clone(),
+        };
+
+        let card = ThemeCard::from_listing(&listing);
+        assert_eq!(card.theme_id, "ember-new", "应用/删除/副标题都按目录名");
+        assert_ne!(card.theme_id, listing.def.id, "别再回到 theme.json 的 id");
+        assert_eq!(card.name, "Ember Dusk", "显示名仍取 theme.json 的 name");
+        // 图不在盘上 → 不画缩略图(路径也是按目录拼的)
+        assert!(card.image.is_none());
+    }
 
     /// 分页 id 与原版**一字不差** —— 改了会让外部深链(`initialPage`)失效。
     #[test]

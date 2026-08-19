@@ -219,11 +219,12 @@ const MOTION_PANEL_SWAP_MS: u64 = 200;
 /// 共用同一个目录 —— 配置被两边轮流改写,hook 端口文件更是直接互抢(装机版占了
 /// 23456,新起的这个退到 23457 并把端口文件覆盖成自己的)。设了这个环境变量就整
 /// 个隔离出去,与 Tauri 那边靠 `--config` 覆盖 identifier 是同一招。
+///
+/// 判据本体在 [`mt_config::active_data_dir`](mt_config::paths::active_data_dir)
+/// —— themes/ 也走同一口径(`ThemePacks::open()`),这里只是它的「不返错」版本,
+/// 两处各判一次环境变量的旧写法已收掉。
 pub fn app_data_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("MT_APP_DATA_DIR") {
-        return PathBuf::from(dir);
-    }
-    mt_config::app_data_dir().unwrap_or_else(|_| PathBuf::from("."))
+    mt_config::active_data_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
 /// 右抽屉里当前是哪一块。对应 `store.ts:685` 的
