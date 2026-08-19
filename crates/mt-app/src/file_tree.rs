@@ -8,7 +8,9 @@
 //!   与 AI 状态、终端重绘是同一套跨线程唤醒模式;
 //! - 双击文件用 [`mt_project::editor`](mt_project::editor) 打开(编辑器取自配置)。
 //!
-//! 文件拖进终端(旧版把路径写进 PTY)本轮不做,gpui 的拖放另开一批。
+//! 文件拖进终端(把路径当文本写进 PTY)走 gpui 原生 drag:这边只在行上挂
+//! [`on_drag`](gpui::StatefulInteractiveElement::on_drag) 交出
+//! [`crate::dnd::DragFilePath`],落点与写入在 `terminal_area.rs`。
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -638,6 +640,9 @@ impl FileTree {
         let path = row.path.clone();
         let is_dir = row.is_dir;
         let row_for_menu = row.clone();
+        let drag_path = row.path.clone();
+        let drag_name = row.name.clone();
+        let drag_is_dir = row.is_dir;
         let indent = px(6.0 + row.depth as f32 * 12.0);
         let color = if row.ignored {
             ui::text_muted()
@@ -679,6 +684,27 @@ impl FileTree {
                     this.open_file(path.clone(), cx);
                 }
             }))
+            // 拖进终端 = 把路径当文本写进 PTY(不是上传文件)。目录同样可拖,
+            // 与原版一致(`FileTree.tsx:326-328` 的 `initFileDrag(entry.path)`
+            // 不区分文件/目录)。落点在 `terminal_area.rs` 的 pane 主体。
+            //
+            // 原版为此自研了一整套 pointer 跟踪 + `body.file-dragging` 的
+            // `pointer-events:none` 穿透规则(要让鼠标穿过 xterm 的子 DOM 打到
+            // drop-zone 上);gpui 侧终端是自绘 Element、drop 目标就是它的容器,
+            // 那条穿透规则一行都不必移植。
+            .on_drag(
+                crate::dnd::DragFilePath(drag_path),
+                move |_item, _offset, _window, cx| {
+                    crate::dnd::preview(
+                        drag_name.clone(),
+                        crate::dnd::PreviewIcon::File {
+                            name: drag_name.clone(),
+                            is_dir: drag_is_dir,
+                        },
+                        cx,
+                    )
+                },
+            )
             // 行的右键菜单。**必须 stop_propagation** —— 否则会连带触发列表容器
             // 那个「空白处右键 = 新建」的菜单(原版靠 `e.stopPropagation()` 同理)
             .on_mouse_down(

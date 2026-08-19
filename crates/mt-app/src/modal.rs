@@ -151,6 +151,19 @@ pub fn open_confirm_remove_project(
 /// gpui 直接给了 `prompt_for_paths`,不必自己造;手输那一路留着,是因为 UNC /
 /// WSL 路径在目录选择框里常常点不到。
 pub fn open_add_project(store: Entity<AppStore>, window: &mut Window, cx: &mut App) {
+    open_add_project_into(store, None, window, cx);
+}
+
+/// 「添加项目」的分组版:落进 `target_group` 里,目标组若折叠**自动展开**
+/// (`ProjectList.tsx:358-372` —— 不展开的话新项目加完就看不见,像是没生效)。
+///
+/// `target_group = None` 时与 [`open_add_project`] 完全一致。
+pub fn open_add_project_into(
+    store: Entity<AppStore>,
+    target_group: Option<String>,
+    window: &mut Window,
+    cx: &mut App,
+) {
     // 原版加项目走的是系统目录选择框,没有手输框;这条占位串与下面的路径提示
     // 是 GPUI 侧独有的,`projectList.{pathPlaceholder,pathHint}` 由 M 批补进 TS 源头。
     let input =
@@ -159,6 +172,7 @@ pub fn open_add_project(store: Entity<AppStore>, window: &mut Window, cx: &mut A
 
     open_guarded(kind::ADD_PROJECT, window, cx, move |dialog, _window, _cx| {
         let store = store.clone();
+        let target_group = target_group.clone();
         let input_for_ok = input.clone();
         let input_for_browse = input.clone();
         dialog
@@ -228,7 +242,27 @@ pub fn open_add_project(store: Entity<AppStore>, window: &mut Window, cx: &mut A
                 if raw.is_empty() || !path.is_dir() {
                     return false;
                 }
-                store.update(cx, |store, cx| store.add_project(&path, cx));
+                match target_group.clone() {
+                    // 顶层:走 `add_project`(它会顺带切过去,与原版一致)
+                    None => store.update(cx, |store, cx| store.add_project(&path, cx)),
+                    Some(group_id) => store.update(cx, |store, cx| {
+                        // 分组版要拿到 id 才能挪进组,所以走 `add_project_at`
+                        // (它不自动切项目 —— 与原版 `handleAddProject(groupId)` 同口径)
+                        let id = store.add_project_at(&path, None, cx);
+                        store.move_item(&id, Some(&group_id), None, cx);
+                        if store
+                            .config()
+                            .project_tree
+                            .as_ref()
+                            .and_then(|tree| {
+                                crate::project_tree::find_group_in_tree(tree, &group_id)
+                            })
+                            .is_some_and(|g| g.collapsed)
+                        {
+                            store.toggle_group_collapse(&group_id, cx);
+                        }
+                    }),
+                }
                 true
             })
     });
