@@ -231,7 +231,71 @@ pub struct TerminalView {
     /// 一次性的整行闪烁(跳到 AI 任务标记之后的可见反馈)。见 [`FlashLine`]。
     /// **到期撤销由宿主负责** —— 视图不起计时器,免得它替宿主管生命周期。
     flash: Option<FlashLine>,
+    /// 宿主接管粘贴。见 [`TerminalView::on_paste`]。
+    on_paste: Option<OnPaste>,
+    /// 「智能 Ctrl+C / Ctrl+V」现在开着吗。见 [`TerminalView::smart_copy_paste`]。
+    smart_copy_paste: Option<SmartCopyPaste>,
 }
+
+/// 宿主对一次粘贴的裁决。
+///
+/// ⚠️ **必须是返回值,不能让宿主自己去写**:钩子是在 `TerminalView` 正被可变
+/// 借用的时候调的(按键与右键菜单两条路都是),宿主若在钩子里回头
+/// `view.update(...)` 就是同一实体的嵌套 update —— gpui 当场 panic。
+/// 让宿主把内容**交回来**由视图写,这条路天然没有再入。
+pub enum PasteAction {
+    /// 什么都别写(宿主已处理完,或已失败并提示过)。
+    None,
+    /// 按 bracketed paste 粘这段文本。
+    Text(String),
+    /// **原样**写入(不走 bracketed paste)—— 长文本转存后的那条路径。
+    Raw(String),
+}
+
+/// 宿主接管的粘贴动作(长文本转文件、远程上传之类)。
+///
+/// 视图**不读剪贴板**,全权交给宿主 —— 阈值判定要读 `AppConfig`,那是壳的
+/// 东西,mt-ui 不该知道。没设就走内建的 [`TerminalView::paste`]。
+pub type OnPaste = Rc<dyn Fn(&mut Window, &mut App) -> PasteAction>;
+
+/// 「智能 Ctrl+C / Ctrl+V」的开关判据,由宿主每次按键**现问**。
+///
+/// 做成闭包而不是 `bool` 字段是为了免掉一整条配置下发链路:设置页一改
+/// `config.smartCopyPaste`,下一次按键就是新值,不需要挨个终端推。
+pub type SmartCopyPaste = Rc<dyn Fn(&App) -> bool>;
+
+/// 智能 Ctrl+C/V 这一下该做什么(`terminalCache.ts:292-309` 的判定链)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SmartAction {
+    /// 有选区的 Ctrl+C:复制并**清掉选区**,吞掉按键。
+    CopySelection,
+    /// Ctrl+V:粘贴,吞掉按键。
+    Paste,
+    /// 不接管 —— 照常翻成字节送进 PTY(无选区的 Ctrl+C 于是发 SIGINT)。
+    PassThrough,
+}
+
+/// 智能 Ctrl+C/V 的纯判定。
+///
+/// 逐条照抄原版 `attachCustomKeyEventHandler` 的第三段:
+/// `mod = ctrlKey || metaKey`,且**不带 Shift / Alt**;`KeyC` 有选区才接管
+/// (没选区 `return true` = 透传 SIGINT,这是这个功能的全部意义),`KeyV` 一律接管。
+pub(crate) fn smart_key_action(
+    enabled: bool,
+    mods: &gpui::Modifiers,
+    key: &str,
+    has_selection: bool,
+) -> SmartAction {
+    if !enabled || !(mods.control || mods.platform) || mods.shift || mods.alt {
+        return SmartAction::PassThrough;
+    }
+    match key {
+        "c" if has_selection => SmartAction::CopySelection,
+        "v" => SmartAction::Paste,
+        _ => SmartAction::PassThrough,
+    }
+}
+
 
 impl TerminalView {
     /// `focus` 由宿主给:宿主往往要自己 `window.focus(&handle)`(切 tab、点分屏),
@@ -263,8 +327,29 @@ impl TerminalView {
             search: None,
             search_colors: SearchColors::default(),
             flash: None,
+            on_paste: None,
+            smart_copy_paste: None,
         }
     }
+
+    /// 宿主接管粘贴。设了之后 Ctrl+Shift+V、智能 Ctrl+V 与
+    /// [`request_paste`](Self::request_paste) 全部改走它,视图侧不再读剪贴板。
+    ///
+    /// 宿主返回 [`PasteAction`] 说明该写什么 —— **不要**在钩子里回头动这个视图,
+    /// 原因见 [`PasteAction`] 的注释。
+    pub fn on_paste(mut self, f: impl Fn(&mut Window, &mut App) -> PasteAction + 'static) -> Self {
+        self.on_paste = Some(Rc::new(f));
+        self
+    }
+
+    /// 接上「智能 Ctrl+C / Ctrl+V」的开关判据(`config.smartCopyPaste`)。
+    ///
+    /// 不设 = 永远关着,Ctrl+C/Ctrl+V 照常当控制字符送进 PTY。
+    pub fn smart_copy_paste(mut self, f: impl Fn(&App) -> bool + 'static) -> Self {
+        self.smart_copy_paste = Some(Rc::new(f));
+        self
+    }
+
 
     /// 接上终端内查找(Ctrl+F)。引擎实例与
     /// [`TerminalSearchBar`](super::TerminalSearchBar) **共用同一个**
@@ -440,16 +525,67 @@ impl TerminalView {
         }
     }
 
+    /// 当前有没有可复制的选区(空串不算 —— 选中一段空白后 Ctrl+C 该照发 SIGINT)。
+    ///
+    /// ⚠️ 与 xterm 的 `hasSelection()` 有一档差:那边只看「有没有选择范围」,
+    /// 全是空白的选区它也算有。这里取「选出来的文本非空」,与右键菜单里
+    /// 「复制」置灰的判据同源。
+    pub fn has_selection(&self) -> bool {
+        self.emulator
+            .with_term(|t| t.selection_to_string())
+            .is_some_and(|text| !text.is_empty())
+    }
+
+    /// 清掉选区(智能 Ctrl+C 复制完就撤选,照抄 `term.clearSelection()`)。
+    pub fn clear_selection(&mut self, cx: &mut Context<Self>) {
+        self.emulator.with_term_mut(|term| term.selection = None);
+        cx.notify();
+    }
+
     /// 粘贴剪贴板内容(按 bracketed paste 模式编码)。
+    ///
+    /// **宿主接管时不要调这个** —— 走 [`request_paste`](Self::request_paste)。
     pub fn paste(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(text) = cx.read_from_clipboard().and_then(|it| it.text()) else {
             return;
         };
-        let bytes = paste_to_bytes(&text, self.emulator.mode());
+        self.paste_text(&text, window, cx);
+    }
+
+    /// 走一次粘贴:宿主接管了就交给它,否则走内建的 [`paste`](Self::paste)。
+    ///
+    /// **所有粘贴入口都该走这里**(Ctrl+Shift+V、智能 Ctrl+V、右键菜单),
+    /// 否则长文本转文件这类宿主逻辑会被某一条入口绕过去。
+    pub fn request_paste(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(cb) = self.on_paste.clone() else {
+            self.paste(window, cx);
+            return;
+        };
+        match cb(window, cx) {
+            PasteAction::None => {}
+            PasteAction::Text(text) => self.paste_text(&text, window, cx),
+            PasteAction::Raw(text) => self.insert_text(&text, window, cx),
+        }
+    }
+
+    /// 把一段文本当成粘贴内容送进 PTY(bracketed paste 编码)。
+    pub fn paste_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let bytes = paste_to_bytes(text, self.emulator.mode());
         self.scroll_to_bottom();
         self.write(&bytes, window, cx);
         cx.notify();
     }
+
+    /// 原样写入一段文本,**不走 bracketed paste**。
+    ///
+    /// 长文本转存后粘的那条 `"C:\...\paste-*.txt"` 走这一条 —— 原版同样是
+    /// `enqueuePtyWrite` 裸写(`terminalCache.ts:757`),而不是 `term.paste()`。
+    pub fn insert_text(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.scroll_to_bottom();
+        self.write(text.as_bytes(), window, cx);
+        cx.notify();
+    }
+
 
     /// 直接写字节(宿主的程序化输入,如「发送到终端」)。
     pub fn write(&mut self, bytes: &[u8], window: &mut Window, cx: &mut Context<Self>) {
@@ -482,13 +618,45 @@ impl TerminalView {
                     cx.stop_propagation();
                 }
                 "v" => {
-                    self.paste(window, cx);
+                    self.request_paste(window, cx);
                     cx.stop_propagation();
                 }
                 // 其余 Ctrl+Shift 组合留给宿主(新建标签 / 切 pane…),继续冒泡
                 _ => {}
             }
             return;
+        }
+
+        // 智能 Ctrl+C / Ctrl+V(`config.smartCopyPaste`)。判定链见
+        // [`smart_key_action`];**排在可打印字符放行之前**,否则带 Ctrl 的 c/v
+        // 会先被当成文本键放走。无选区的 Ctrl+C 一路落到下面照发 SIGINT。
+        //
+        // 先用最便宜的判据筛一道:`has_selection()` 要锁住 term 再把整段选区拼成
+        // String,放在这里等于**每敲一个字都扫一遍选区**。真正的判定仍然只有
+        // [`smart_key_action`] 一处(单测覆盖的也是它),这一步纯粹是闸门。
+        let smart_key = (mods.control || mods.platform)
+            && !mods.shift
+            && !mods.alt
+            && matches!(keystroke.key.as_str(), "c" | "v");
+        let action = if smart_key {
+            let on = self.smart_copy_paste.clone().is_some_and(|probe| probe(cx));
+            smart_key_action(on, mods, keystroke.key.as_str(), self.has_selection())
+        } else {
+            SmartAction::PassThrough
+        };
+        match action {
+            SmartAction::CopySelection => {
+                self.copy_selection(cx);
+                self.clear_selection(cx);
+                cx.stop_propagation();
+                return;
+            }
+            SmartAction::Paste => {
+                self.request_paste(window, cx);
+                cx.stop_propagation();
+                return;
+            }
+            SmartAction::PassThrough => {}
         }
 
         // 可打印字符:**必须**放行,让 TranslateMessage 走到 IME / WM_CHAR。
@@ -676,5 +844,115 @@ impl EntityInputHandler for TerminalView {
         // 「鼠标点在文档的第几个字符」——终端没有可编辑文档,不支持。
         // macOS 的字典查词(三指轻点)会用它,返回 None 表示这里没有可查的文本。
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SmartAction, smart_key_action};
+    use gpui::Modifiers;
+
+    fn ctrl() -> Modifiers {
+        Modifiers {
+            control: true,
+            ..Default::default()
+        }
+    }
+
+    /// 关着的时候一律不接管 —— Ctrl+C 照发 SIGINT、Ctrl+V 照走 xterm 的老路。
+    #[test]
+    fn 开关关着时智能键位不接管() {
+        assert_eq!(
+            smart_key_action(false, &ctrl(), "c", true),
+            SmartAction::PassThrough
+        );
+        assert_eq!(
+            smart_key_action(false, &ctrl(), "v", false),
+            SmartAction::PassThrough
+        );
+    }
+
+    /// 这个功能的**全部意义**:有选区才复制,没选区必须原样透传成 SIGINT。
+    #[test]
+    fn ctrl_c_按选区分叉() {
+        assert_eq!(
+            smart_key_action(true, &ctrl(), "c", true),
+            SmartAction::CopySelection
+        );
+        assert_eq!(
+            smart_key_action(true, &ctrl(), "c", false),
+            SmartAction::PassThrough,
+            "没选区的 Ctrl+C 必须能中断程序"
+        );
+    }
+
+    /// Ctrl+V 一律接管(有没有选区都一样)。
+    #[test]
+    fn ctrl_v_一律接管粘贴() {
+        assert_eq!(
+            smart_key_action(true, &ctrl(), "v", false),
+            SmartAction::Paste
+        );
+        assert_eq!(
+            smart_key_action(true, &ctrl(), "v", true),
+            SmartAction::Paste
+        );
+    }
+
+    /// mac 的 ⌘ 同样算 mod(原版 `e.ctrlKey || e.metaKey`)。
+    #[test]
+    fn platform_键与_ctrl_同权() {
+        let cmd = Modifiers {
+            platform: true,
+            ..Default::default()
+        };
+        assert_eq!(smart_key_action(true, &cmd, "v", false), SmartAction::Paste);
+    }
+
+    /// 带 Shift / Alt 的组合不归智能键位管:Ctrl+Shift+C/V 是另一条**始终生效**
+    /// 的路(在 `on_key_down` 里更早就返回了),Alt+Ctrl+V 该原样进 PTY。
+    #[test]
+    fn 带_shift_或_alt_的组合不接管() {
+        let ctrl_shift = Modifiers {
+            control: true,
+            shift: true,
+            ..Default::default()
+        };
+        let ctrl_alt = Modifiers {
+            control: true,
+            alt: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            smart_key_action(true, &ctrl_shift, "v", false),
+            SmartAction::PassThrough
+        );
+        assert_eq!(
+            smart_key_action(true, &ctrl_alt, "c", true),
+            SmartAction::PassThrough
+        );
+    }
+
+    /// 没有修饰键 = 普通打字,一个字都不许吞。
+    #[test]
+    fn 裸键不接管() {
+        let none = Modifiers::default();
+        assert_eq!(
+            smart_key_action(true, &none, "c", true),
+            SmartAction::PassThrough
+        );
+        assert_eq!(
+            smart_key_action(true, &none, "v", false),
+            SmartAction::PassThrough
+        );
+    }
+
+    /// c/v 之外的键一概不管(Ctrl+D 之类必须原样进 PTY)。
+    #[test]
+    fn 其余键一概透传() {
+        assert_eq!(
+            smart_key_action(true, &ctrl(), "d", true),
+            SmartAction::PassThrough
+        );
     }
 }

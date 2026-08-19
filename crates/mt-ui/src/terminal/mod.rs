@@ -42,7 +42,7 @@ pub use mouse::{
     mouse_reporting_active, prefers_local_handling,
 };
 pub use theme::{SearchColors, TerminalStyle, TerminalTheme, rgb8};
-pub use view::TerminalView;
+pub use view::{OnPaste, PasteAction, SmartCopyPaste, TerminalView};
 
 /// OSC 调色板查询的应答色。见 [`colors::color_request_rgb`]。
 pub use colors::color_request_rgb;

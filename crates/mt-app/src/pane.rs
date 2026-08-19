@@ -47,15 +47,19 @@ use mt_terminal::alacritty_terminal::term::TermMode;
 use mt_terminal::{TermSize, TerminalEmulator};
 use mt_ui::terminal::{MouseMods, prefers_local_handling};
 use mt_ui::{
-    CopiedTip, DwellConfig, FlashLine, TerminalSearch, TerminalSearchBar, TerminalStyle,
-    TerminalTheme, TerminalView,
+    CopiedTip, DwellConfig, FlashLine, PasteAction, TerminalSearch, TerminalSearchBar,
+    TerminalStyle, TerminalTheme, TerminalView,
 };
 
 use crate::ai::AiBridge;
-use crate::i18n::t;
+use crate::clipboard::{self, PasteTarget};
+use crate::i18n::{t, tr};
 use crate::markers::MarkerBatch;
 use crate::menu::{self, MenuItem};
+use crate::notify::ToastKind;
 use crate::overlay;
+use crate::store::AppStore;
+use crate::toast;
 
 /// pane 发给上层的事件。
 pub enum PaneEvent {
@@ -188,6 +192,16 @@ impl TerminalPane {
             }
         };
 
+        // WSL 启动器重写的一次性告知(`App.tsx:367-379`)。判定与重写早在
+        // `mt_pty::launch::plan` 里做完了,结论挂在会话上 —— 这里只是**唯一的
+        // 读取方**(此前全仓零调用,提示因此一直缺着)。
+        //
+        // 「一次性」= 每个新 PTY 各推一次,不去重(原版同款):同一个项目开两个
+        // 终端就该看到两条,那正是「这两个都被改用 wsl.exe 启动了」的意思。
+        if let Some(wsl) = pty.as_ref().and_then(|p| p.wsl_override()) {
+            toast::push_wsl_override(&wsl.distro, &wsl.unix_path, cx);
+        }
+
         let wake = cx.spawn(async move |this, cx| {
             while let Some(signal) = rx.next().await {
                 let mut exit: Option<Option<u32>> = None;
@@ -270,6 +284,16 @@ impl TerminalPane {
                 // 拖选停留自动复制(`config.selectionAutoCopySecs`)。剪贴板由
                 // mt-ui 写,宿主只负责那颗「已复制」气泡:origin 是**元素相对**
                 // 坐标(mt-ui 已按容器宽度贴边收拢),分屏右侧也不会算歪。
+                // 长文本粘贴转文件(audit #30)。视图把控制权交出来,
+                // 阈值/落盘/路径映射全在 [`resolve_paste`] 里 —— 那需要 AppConfig,
+                // mt-ui 不该知道它。
+                .on_paste(move |_window, cx| resolve_paste(pty_id, cx))
+                // 「智能 Ctrl+C / Ctrl+V」的开关**每次按键现问 store**:
+                // 设置页一改立刻生效,不必再造一条「配置变了挨个终端下发」的链路
+                // (字号/主题那几条都得那么做,这条不用)。
+                .smart_copy_paste(|cx: &gpui::App| {
+                    AppStore::global(cx).read(cx).config().smart_copy_paste
+                })
                 .selection_dwell(dwell)
                 .on_selection_copied(move |_text, origin, _window, cx| {
                     let _ = this_for_tip.update(cx, |pane: &mut TerminalPane, cx| {
@@ -704,6 +728,94 @@ impl Focusable for TerminalPane {
     }
 }
 
+/// 一次粘贴该往终端里写什么(`terminalCache.ts::pasteToTerminalInner` 的文本那一半)。
+///
+/// ```text
+/// 剪贴板取文本 → 空则什么都不做
+/// 开关开着 && 不是远程 pane && 命中阈值
+///   ├─ 转存成功 → 写 "{映射后的路径}"(裸写,不走 bracketed paste)
+///   └─ 转存失败 → 弹一条 paste-error toast,**继续往下粘原文**(老行为)
+/// 否则 → 按 bracketed paste 粘原文
+/// ```
+///
+/// # 与原版的三处偏差(逐条有理由)
+///
+/// 1. **剪贴板图片不处理** —— 那是另一个缺口,见 [`crate::clipboard`] 模块注释;
+/// 2. **远程(SSH)pane 一律粘原文** —— 上传通道还没有,见 [`PasteTarget::Ssh`];
+/// 3. **本地转存失败也弹 toast**。原版 `notifyPasteFailure` 开头就
+///    `if (target.kind !== 'ssh') return`,本地写盘失败只有 console.error ——
+///    规格把这条记成原版的隐性缺陷并建议「补一个兜底项目名」,这里照办:
+///    项目名取该 pane 所属项目,取不到就退回 pane 的显示名。
+///
+/// # 为什么是自由函数而不是 `TerminalPane` 的方法
+///
+/// 钩子在 `TerminalView` 被可变借用时调用;方法版会诱使人写
+/// `self.view.update(...)`,那就是同一实体的嵌套 update(gpui 当场 panic)。
+/// 自由函数只拿 `pty_id` + `&mut App`,连碰到视图的机会都没有。
+fn resolve_paste(pty_id: u32, cx: &mut gpui::App) -> PasteAction {
+    let Some(text) = cx.read_from_clipboard().and_then(|it| it.text()) else {
+        return PasteAction::None;
+    };
+    if text.is_empty() {
+        return PasteAction::None;
+    }
+
+    let store = AppStore::global(cx);
+    let (enabled, line_threshold, char_threshold, target, project_id, project_name) = {
+        let s = store.read(cx);
+        let cfg = s.config();
+        let owner = s.pane_of_pty(pty_id);
+        // 失败提示的标题行:项目名 →(取不到)pane 标签 →(还取不到)pty 编号。
+        // 规格把「原版本地失败时拿到 undefined 项目名」记成隐性缺陷并要求补兜底,
+        // 这一串就是那个兜底 —— 标题行永远不为空。
+        let name = owner
+            .as_ref()
+            .and_then(|(pid, _)| s.project(pid))
+            .map(|p| p.name.clone())
+            .or_else(|| {
+                owner.as_ref().and_then(|(pid, pane_id)| {
+                    s.project_state(pid)
+                        .and_then(|st| st.layout.as_ref())
+                        .and_then(|l| l.pane(pane_id))
+                        .map(|p| p.label().to_string())
+                })
+            })
+            .unwrap_or_else(|| format!("pane {pty_id}"));
+        (
+            cfg.long_paste_to_file,
+            cfg.long_paste_line_threshold,
+            cfg.long_paste_char_threshold,
+            clipboard::resolve_paste_target(s, pty_id),
+            owner.map(|(pid, _)| pid).unwrap_or_default(),
+            name,
+        )
+    };
+
+    if enabled
+        && target != PasteTarget::Ssh
+        && clipboard::is_long_text(&text, line_threshold, char_threshold)
+    {
+        match clipboard::save_clipboard_text(&text) {
+            Ok(path) => {
+                let mapped = clipboard::map_pasted_path(&path, target);
+                return PasteAction::Raw(clipboard::quote_path(&mapped));
+            }
+            Err(detail) => {
+                eprintln!("[pane {pty_id}] 粘贴内容转存失败: {detail}");
+                toast::push_message(
+                    ToastKind::PasteError,
+                    project_id,
+                    project_name,
+                    tr!("terminal", "pasteUploadFailed", detail = detail),
+                    cx,
+                );
+                // 提示完继续往下粘原文 —— 与原版一致(就是长了点,比什么都没有强)
+            }
+        }
+    }
+    PasteAction::Text(text)
+}
+
 /// 终端里的右键该弹**本地菜单**吗。
 ///
 /// 判据只有一条,且必须与 mt-ui 的元素侧同源([`prefers_local_handling`]):
@@ -776,8 +888,11 @@ impl Render for TerminalPane {
                                 });
                             })
                             .into(),
+                        // 走 `request_paste` 而不是 `paste`:长文本转文件挂在
+                        // 宿主钩子上,直接调 `paste` 会绕过它(Ctrl+Shift+V 与
+                        // 智能 Ctrl+V 同理,那两条在 mt-ui 侧已经改过来了)
                         menu::item(t("terminal", "paste"), move |window, cx| {
-                            view_paste.update(cx, |view, cx| view.paste(window, cx));
+                            view_paste.update(cx, |view, cx| view.request_paste(window, cx));
                             // 粘完把键盘还给终端(原版 `term.focus()`)
                             window.focus(&focus);
                         }),

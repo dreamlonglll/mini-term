@@ -467,6 +467,9 @@ impl AppStore {
         self.project_states.remove(id);
         self.expanded_dirs.remove(id);
         self.done.retain_panes(&self.live_pane_ids());
+        // 它的 toast 一并撤掉(`store.ts:859`)—— 留着的话点下去会跳向一个
+        // 已经不存在的项目
+        crate::toast::remove_project(id, cx);
         self.config.projects.retain(|p| p.id != id);
         if let Some(tree) = self.config.project_tree.as_mut() {
             remove_from_tree(tree, id);

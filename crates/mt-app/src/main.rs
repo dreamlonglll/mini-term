@@ -37,6 +37,7 @@
 
 mod activity_bar;
 mod ai;
+mod clipboard;
 mod dnd;
 mod file_tree;
 mod focus_nav;
@@ -74,6 +75,7 @@ mod store;
 mod terminal_area;
 mod theme;
 mod title_bar;
+mod toast;
 mod tray;
 mod tree;
 mod ui;
@@ -89,7 +91,6 @@ use gpui::{
     Subscription, Task, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div,
     prelude::FluentBuilder, px, size,
 };
-use gpui_component::notification::Notification;
 use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel};
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{Root, WindowExt as _};
@@ -99,7 +100,6 @@ use crate::ai::AiBridge;
 use crate::file_tree::FileTree;
 use crate::focus_nav::Direction;
 use crate::i18n::t;
-use crate::notify::ToastKind;
 use crate::project_list::ProjectList;
 use crate::session_panel::SessionPanel;
 use crate::store::{AppStore, DoneScope, PendingAlert};
@@ -191,11 +191,6 @@ fn yields_to_overlay(window: &mut Window, cx: &mut App) -> bool {
 #[action(namespace = mini_term, no_json)]
 pub struct SelectPane(pub usize);
 
-/// toast 的去重键类型(gpui-component 按 `TypeId + key` 唯一化通知)。
-/// 完成与待确认各一个键空间 —— 旧版同样把两种 toast 分开计数。
-struct CompletionToast;
-struct AttentionToast;
-
 /// 三栏默认宽度(像素),与 `src/App.tsx` 的 Allotment 默认值一致。
 const DEFAULT_COLUMNS: [f64; 2] = [520.0, 1000.0];
 const DEFAULT_MIDDLE: [f64; 2] = [320.0, 380.0];
@@ -265,6 +260,9 @@ struct Workspace {
     menu_layer: Entity<menu::ContextMenu>,
     /// 自绘标题栏(无边框窗口的拖拽区 + 三键 + 项目胶囊 + 全局状态灯)。
     title_bar: Entity<TitleBar>,
+    /// 自建 toast 层。与 [`Self::menu_layer`] 同一种分工:状态住在全局
+    /// (AI 泵 / pane / store 三处都要往里推),这里只是把它**画出来**的位置。
+    toast_layer: Entity<toast::ToastLayer>,
     project_list: Entity<ProjectList>,
     file_tree: Entity<FileTree>,
     terminal_area: Entity<TerminalArea>,
@@ -390,6 +388,7 @@ impl Workspace {
         let mut workspace = Self {
             store,
             menu_layer: menu::layer(cx),
+            toast_layer: toast::layer(cx),
             title_bar,
             project_list,
             file_tree,
@@ -482,6 +481,12 @@ impl Workspace {
     }
 
     /// 兑现一次提醒:提示音 / 任务栏闪烁 / toast。
+    ///
+    /// toast 走自建的 [`toast`] 层。gpui-component 的 `Notification` 有四条
+    /// **结构性**缺口(没有悬停暂停、上限写死 10 条、× 只在 hover 时显形且图标走
+    /// `IconName` 渲染成空白、去重是「替换」而原版是「忽略」),外加右上角 448px
+    /// 的位置尺寸 —— 都不是宿主能绕过去的,见 `toast.rs` 模块注释。跳转与去重
+    /// 语义一并搬进那一层,这里只剩「推一条」。
     fn deliver_alert(
         &mut self,
         alert: PendingAlert,
@@ -495,43 +500,7 @@ impl Workspace {
             notify::flash_taskbar(window);
         }
         let Some(kind) = alert.plan.toast else { return };
-
-        let store = self.store.clone();
-        let project_id = alert.project_id.clone();
-        let key = SharedString::from(alert.project_id.clone());
-        // 点 toast = 跳到那个项目的待办 pane(旧版 toast 的同一行为)
-        let on_click = move |_: &gpui::ClickEvent, window: &mut Window, cx: &mut App| {
-            let target = store.read(cx).next_attention_target(Some(&project_id));
-            store.update(cx, |store, cx| {
-                store.set_active_project(&project_id, cx);
-                if let Some((pid, pane_id)) = target {
-                    store.activate_pane(&pid, &pane_id, window, cx);
-                }
-            });
-        };
-        // 旧版 toast 是「项目名一行 + 描述一行」(`ToastContainer.tsx`),
-        // gpui-component 的通知只有一段正文,拼成一行。
-        let note = match kind {
-            ToastKind::Completion => {
-                Notification::success(format!(
-                    "{} · {}",
-                    alert.project_name,
-                    t("toast", "aiDone")
-                ))
-                .id1::<CompletionToast>(key)
-                .on_click(on_click)
-            }
-            ToastKind::Attention => {
-                Notification::warning(format!(
-                    "{} · {}",
-                    alert.project_name,
-                    t("toast", "aiAttention")
-                ))
-                .id1::<AttentionToast>(key)
-                .on_click(on_click)
-            }
-        };
-        window.push_notification(note, cx);
+        toast::push_alert(kind, alert.project_id, alert.project_name, cx);
     }
 
     /// 当前该操作哪个 pane:焦点 pane,没有就落到布局里第一个激活 pane。
@@ -1372,12 +1341,16 @@ impl Render for Workspace {
             .child(div().flex_1().h_full().child(columns_group))
             .children(drawer_layer)
             .children(usage_layer)
-            // 通知层放在**标题栏之下**这一层里:`render_notification_layer` 内部写死
-            // `absolute top-0 right-0`(gpui-component 的 `root.rs:294-300`),挂在根上
-            // 会正好压住窗口控制三键。挂进 `body`(它是 `relative`)之后 toast 从
-            // 标题栏下沿开始堆 —— 原版 `.toast-stack` 是 `fixed right/bottom: 16px`,
-            // 本来也碰不到标题栏。**右上角起堆**这条差异是 gpui-component 自带的,
-            // 与本批无关。
+            // 自建 toast 层。挂在 `body`(它是 `relative`)里而不是根上 ——
+            // 原版 `.toast-stack` 贴的是视口右下角(`fixed right:16 bottom:16`),
+            // 标题栏在上面本来就碰不到它;挂进 body 后底边就是窗口底边,等价。
+            // 排在抽屉与用量面板**之后** = 画在它们之上,对应原版 `z-index:70`
+            // (浮层 50 / 分隔条 35)。
+            //
+            // S 批记档的「gpui-component 是右上角起堆」这条差异到此为止:自建层
+            // 按原版右下角起堆。`render_notification_layer` 留着不动(组件库内部
+            // 别处可能还用),只是 mt-app 不再往它里面推东西。
+            .child(self.toast_layer.clone())
             .children(Root::render_notification_layer(window, cx));
 
         div()
@@ -1481,6 +1454,14 @@ fn main() {
         // 右键菜单层的状态是全局的(项目列表 / 文件树 / tab / 终端四处都要弹),
         // 必须早于任何视图建出来 —— 视图的右键回调里直接取它。
         menu::init(cx);
+        // toast 层同理,而且要更早一档:启动补 PTY(`hydrate_project`)就可能推
+        // 一条 WSL 提示,那发生在窗口打开**之前**。
+        toast::init(cx);
+        // 粘贴转存的临时文件清理(24h),启动时跑一次。丢后台线程:它要 stat
+        // 整个目录,不该占住首帧(装机版是在 Rust 侧 setup 里同步跑的)。
+        cx.background_executor()
+            .spawn(async { clipboard::cleanup_old_files() })
+            .detach();
         // 真正的主题在 store 装好之后按 config 装配(`apply_theme_from_config`):
         // 亮/暗/auto + 外置主题包 + 终端配色一次算全。这里先钉一个暗色兜底,
         // 免得从 init 到装配之间有一帧走 gpui-component 的默认亮色。
@@ -1570,6 +1551,14 @@ fn main() {
                 ..Default::default()
             },
             |window, cx| {
+                // 关窗确认(audit #30)。Windows 上标题栏 ✕ / Alt+F4 / 任务栏右键
+                // 关闭全都走系统 `WM_CLOSE` → gpui 的 `handle_close_msg` → 这个回调,
+                // 返回 false 就把这条消息吞掉。判定与 Linux 降级路径的 ✕ 共用同一道闸
+                // (`title_bar::allow_close`),口径于是只有一份。
+                //
+                // ⚠️ 必须**同步**返回 bool,而确认框是异步的 —— 套路见 `title_bar`
+                // 的「关窗确认」段注释。
+                window.on_window_should_close(cx, title_bar::allow_close);
                 // 窗口的第一层必须是 gpui_component::Root:Dialog / 通知 / Input
                 // 的焦点登记都挂在它身上(Root::update 取不到就直接 panic)。
                 let workspace = cx.new(|cx| Workspace::new(store, ai_events, window, cx));
