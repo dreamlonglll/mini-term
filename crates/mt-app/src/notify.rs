@@ -74,13 +74,52 @@ pub struct NotifyPrefs {
     pub attention_notify: bool,
 }
 
-/// toast 的两种口径,与旧版 `Notification.kind` 同集。
+/// toast 的五种口径,与旧版 `AiCompletionNotification['kind']` 同集
+/// (旧版 `kind` 缺省即 [`Completion`](Self::Completion),`store.ts:1035` 的判据
+/// 显式把 `undefined` 算进完成态)。
+///
+/// [`AlertPlan`] 只会产出前两种 —— 后三种由别处直接推(见 [`crate::toast`])。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToastKind {
     /// AI 任务完成。
     Completion,
     /// AI 停下来等你批权限 / 填表单 / 这轮因 API 错误结束。
     Attention,
+    /// WSL 项目改用 `wsl.exe` 启动的一次性告知(`App.tsx:367-379`)。
+    WslInfo,
+    /// 移动端发起了一个新会话(`mobileStartSession.ts`)。
+    MobileSession,
+    /// 长文本转存 / 远程上传失败(`terminalCache.ts:690-695`)。
+    PasteError,
+}
+
+impl ToastKind {
+    /// 圆形图标里那个字符。**原版就是文本字符**(`ToastContainer.tsx:53`),
+    /// 不是 svg —— 照抄反而与原版一字不差,也绕开本仓没注册 `AssetSource` 的坑。
+    pub fn icon_char(self) -> &'static str {
+        match self {
+            Self::Completion => "✓",
+            Self::Attention | Self::PasteError => "!",
+            Self::WslInfo | Self::MobileSession => "i",
+        }
+    }
+
+    /// 点这条 toast 要不要顺带切到那个项目。
+    ///
+    /// `wsl-info` 的 projectId 是占位串(压根不是项目)、`paste-error` 的项目就在
+    /// 眼前 —— 两者点击**仅关闭**(`ToastContainer.tsx:35-38`)。
+    pub fn jumps_to_project(self) -> bool {
+        matches!(
+            self,
+            Self::Completion | Self::Attention | Self::MobileSession
+        )
+    }
+
+    /// 正文取自 `message` 字段吗(`false` = 按 kind 取固定文案)。
+    /// 判定链照抄 `ToastContainer.tsx:57-63`。
+    pub fn uses_message(self) -> bool {
+        matches!(self, Self::WslInfo | Self::MobileSession | Self::PasteError)
+    }
 }
 
 /// 这次变化要执行的提醒动作。
@@ -229,15 +268,97 @@ pub fn pick_attention_target<'a>(
         .or(working)
 }
 
+// ─── 提示音的双音合成 ────────────────────────────────────────
+
+/// 采样率 / 位深 / 声道:44.1kHz、16-bit、单声道 —— `PlaySoundW` 最保守的兼容组合。
+const SAMPLE_RATE: u32 = 44_100;
+/// 峰值增益(线性),与 `gain.setValueAtTime(0.3, ...)` 同值。
+const PEAK_GAIN: f32 = 0.3;
+/// 指数衰减的落点,与 `exponentialRampToValueAtTime(0.01, ...)` 同值(≈ -30dB)。
+const FLOOR_GAIN: f32 = 0.01;
+/// 两段正弦:`(频率 Hz, 起点秒, 终点秒)`。逐字照抄
+/// `src/utils/notificationSound.ts:14-33` —— 880Hz(A5)→ 660Hz(E5) 的下行纯四度,
+/// 中间 10ms 静默,总长 280ms。
+const TONES: [(f32, f32, f32); 2] = [(880.0, 0.0, 0.12), (660.0, 0.13, 0.28)];
+/// 整段波形的时长(秒)。
+const WAVE_SECONDS: f32 = 0.28;
+/// WAV 头固定 44 字节(RIFF + fmt(16) + data)。
+const WAV_HEADER_LEN: usize = 44;
+
+/// 内置双音的 WAV 字节(合成一次、进程内长活)。
+///
+/// `SND_ASYNC` 下 `PlaySoundW` 立刻返回、后台继续读那块内存,所以缓冲区**必须
+/// 在播放期间存活**。波形是常量,`OnceLock` 既解决存活问题又省掉每次合成的开销。
+static NOTIFICATION_WAVE: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+
+fn notification_wave() -> &'static [u8] {
+    NOTIFICATION_WAVE.get_or_init(build_notification_wave)
+}
+
+/// 合成 880Hz→660Hz 双音的完整 RIFF/WAVE 字节。
+///
+/// 包络 `env(t) = PEAK * (FLOOR/PEAK)^(t/dur)` 与 Web Audio 的
+/// `exponentialRampToValueAtTime` **同形**(指数插值,端点分别是 0.3 与 0.01),
+/// 因此听感与旧版一致 —— 这正是不用 `Beep()` 的理由:方波、无包络、还阻塞线程。
+fn build_notification_wave() -> Vec<u8> {
+    let total = (WAVE_SECONDS * SAMPLE_RATE as f32).round() as usize;
+    let mut samples = vec![0i16; total];
+    for (freq, start, end) in TONES {
+        let dur = end - start;
+        let from = (start * SAMPLE_RATE as f32).round() as usize;
+        let to = ((end * SAMPLE_RATE as f32).round() as usize).min(total);
+        for i in from..to {
+            // 段内时间从 0 重新起算(两段各自完整衰减一次)
+            let t = (i - from) as f32 / SAMPLE_RATE as f32;
+            let env = PEAK_GAIN * (FLOOR_GAIN / PEAK_GAIN).powf(t / dur);
+            let s = (std::f32::consts::TAU * freq * t).sin() * env;
+            samples[i] = (s * i16::MAX as f32).clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+        }
+    }
+    encode_wav_mono16(&samples, SAMPLE_RATE)
+}
+
+/// 16-bit 单声道 PCM → 完整 RIFF/WAVE 字节(小端)。
+fn encode_wav_mono16(samples: &[i16], sample_rate: u32) -> Vec<u8> {
+    let data_len = (samples.len() * 2) as u32;
+    let mut out = Vec::with_capacity(WAV_HEADER_LEN + data_len as usize);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36 + data_len).to_le_bytes());
+    out.extend_from_slice(b"WAVE");
+    out.extend_from_slice(b"fmt ");
+    out.extend_from_slice(&16u32.to_le_bytes()); // fmt chunk 长度
+    out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    out.extend_from_slice(&1u16.to_le_bytes()); // 单声道
+    out.extend_from_slice(&sample_rate.to_le_bytes());
+    out.extend_from_slice(&(sample_rate * 2).to_le_bytes()); // byte rate = rate × block_align
+    out.extend_from_slice(&2u16.to_le_bytes()); // block align
+    out.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data_len.to_le_bytes());
+    for s in samples {
+        out.extend_from_slice(&s.to_le_bytes());
+    }
+    out
+}
+
 // ─── 平台提醒 ────────────────────────────────────────────────
 
-/// 提示音。自定义路径只认 `.wav`(`PlaySoundW` 的能力边界),其余一律回落系统音。
+/// 提示音。三级回落:
 ///
-/// 旧版走浏览器 `Audio`,mp3/ogg 都能放;这里是 Win32 直调,格式支持窄一档,
-/// 已记入交付说明的偏差清单。
+/// 1. 自定义 `.wav` → `PlaySoundW(SND_FILENAME)`,放得出来就到此为止;
+/// 2. **内置 880→660 双音**(内存合成的 WAV,`SND_MEMORY`)—— 与旧版 Web Audio
+///    那两段正弦的频率 / 时长 / 间隔 / 指数包络一一对应;
+/// 3. `MessageBeep(MB_OK)` 兜底(前两条都失败时才轮到它)。
+///
+/// **不用 `Beep(freq, ms)`**:它同步阻塞调用线程 280ms —— GPUI 是单线程 UI,
+/// 那是肉眼可见的 17 帧卡顿;而且它只有方波、没有音量与包络。
+///
+/// 已知偏差:自定义音只认 `.wav`(旧版走浏览器 `Audio`,mp3/ogg 都能放)。
 #[cfg(windows)]
 pub fn play_sound(custom_path: Option<&str>) {
-    use windows::Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_FILENAME, SND_NODEFAULT};
+    use windows::Win32::Media::Audio::{
+        PlaySoundW, SND_ASYNC, SND_FILENAME, SND_MEMORY, SND_NODEFAULT,
+    };
     use windows::Win32::System::Diagnostics::Debug::MessageBeep;
     use windows::Win32::UI::WindowsAndMessaging::MB_OK;
     use windows::core::HSTRING;
@@ -255,8 +376,23 @@ pub fn play_sound(custom_path: Option<&str>) {
         if ok.as_bool() {
             return;
         }
-        // 放不出来(文件没了 / 格式不认)时退回系统音,而不是静默什么都不响
+        // 放不出来(文件没了 / 格式不认)时继续往下走内置双音,而不是静默
     }
+
+    let wave = notification_wave();
+    // SAFETY: `SND_MEMORY` 下第一个参数是**内存镜像指针**而非字符串;缓冲区来自
+    // `OnceLock`,进程内永久存活,满足 `SND_ASYNC` 播放期间不得释放的要求。
+    let ok = unsafe {
+        PlaySoundW(
+            windows::core::PCWSTR(wave.as_ptr() as *const u16),
+            None,
+            SND_MEMORY | SND_ASYNC | SND_NODEFAULT,
+        )
+    };
+    if ok.as_bool() {
+        return;
+    }
+
     // SAFETY: 无参数系统调用
     unsafe {
         let _ = MessageBeep(MB_OK);
@@ -302,6 +438,174 @@ pub fn flash_taskbar(window: &gpui::Window) {
 
 #[cfg(not(windows))]
 pub fn flash_taskbar(_window: &gpui::Window) {}
+
+#[cfg(test)]
+mod wave_tests {
+    use super::*;
+
+    fn samples(wave: &[u8]) -> Vec<i16> {
+        wave[WAV_HEADER_LEN..]
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]))
+            .collect()
+    }
+
+    /// 44 字节 RIFF 头逐字段对账 —— 头写错的表现是「一声都不响」,且没有任何日志。
+    #[test]
+    fn wav_头是合法的单声道_16bit_44k() {
+        let wave = build_notification_wave();
+        let data_len = (wave.len() - WAV_HEADER_LEN) as u32;
+        assert_eq!(&wave[0..4], b"RIFF");
+        assert_eq!(
+            u32::from_le_bytes(wave[4..8].try_into().unwrap()),
+            36 + data_len
+        );
+        assert_eq!(&wave[8..12], b"WAVE");
+        assert_eq!(&wave[12..16], b"fmt ");
+        assert_eq!(u32::from_le_bytes(wave[16..20].try_into().unwrap()), 16);
+        assert_eq!(
+            u16::from_le_bytes(wave[20..22].try_into().unwrap()),
+            1,
+            "PCM"
+        );
+        assert_eq!(
+            u16::from_le_bytes(wave[22..24].try_into().unwrap()),
+            1,
+            "单声道"
+        );
+        assert_eq!(u32::from_le_bytes(wave[24..28].try_into().unwrap()), 44_100);
+        assert_eq!(
+            u32::from_le_bytes(wave[28..32].try_into().unwrap()),
+            88_200,
+            "byte rate = 44100 × 2"
+        );
+        assert_eq!(
+            u16::from_le_bytes(wave[32..34].try_into().unwrap()),
+            2,
+            "block align"
+        );
+        assert_eq!(
+            u16::from_le_bytes(wave[34..36].try_into().unwrap()),
+            16,
+            "位深"
+        );
+        assert_eq!(&wave[36..40], b"data");
+        assert_eq!(
+            u32::from_le_bytes(wave[40..44].try_into().unwrap()),
+            data_len
+        );
+    }
+
+    /// 总长 280ms = 12348 采样(0.28 × 44100),一个采样两字节。
+    #[test]
+    fn 采样数对应_280ms() {
+        let wave = build_notification_wave();
+        assert_eq!(samples(&wave).len(), 12_348);
+        assert_eq!(wave.len(), WAV_HEADER_LEN + 12_348 * 2);
+    }
+
+    /// 两段之间那 10ms(0.12→0.13)必须是**真静默** —— 少了它两个音会连成一个滑音。
+    #[test]
+    fn 两段之间有_10ms_静默() {
+        let s = samples(&build_notification_wave());
+        let from = (0.12 * SAMPLE_RATE as f32) as usize;
+        let to = (0.13 * SAMPLE_RATE as f32) as usize;
+        assert_eq!(to - from, 441, "10ms @44.1kHz = 441 采样");
+        assert!(s[from..to].iter().all(|&v| v == 0), "段间不是静默");
+    }
+
+    /// 包络:每段起头接近峰值 0.3,段尾衰减到 0.01 附近(指数衰减,不是硬切)。
+    #[test]
+    fn 每段包络从峰值指数衰减() {
+        let s = samples(&build_notification_wave());
+        let peak = (PEAK_GAIN * i16::MAX as f32) as i32; // ≈ 9830
+        for (label, start, end) in [("段1", 0.0f32, 0.12f32), ("段2", 0.13, 0.28)] {
+            let from = (start * SAMPLE_RATE as f32) as usize;
+            let to = (end * SAMPLE_RATE as f32) as usize;
+            // 起头 10ms 内必然扫过一整个正弦周期(880/660Hz 周期都 < 1.6ms),
+            // 所以峰值取得到
+            let head = s[from..from + 441]
+                .iter()
+                .map(|v| (*v as i32).abs())
+                .max()
+                .unwrap();
+            assert!(
+                (head - peak).abs() < peak / 10,
+                "{label} 起头应接近峰值 {peak},实测 {head}"
+            );
+            // 段尾 5ms:包络已落到 ~0.012,幅值不该超过峰值的 5%
+            let tail = s[to - 220..to]
+                .iter()
+                .map(|v| (*v as i32).abs())
+                .max()
+                .unwrap();
+            assert!(tail < peak / 20, "{label} 段尾应已衰减,实测 {tail}");
+        }
+    }
+
+    /// 频率对账:数过零次数反推基频 —— 880Hz 与 660Hz 差一个纯四度,
+    /// 写反了听感完全不同,而这是唯一能在无声环境里验的判据。
+    #[test]
+    fn 两段基频分别是_880_与_660() {
+        let s = samples(&build_notification_wave());
+        // 只数每段起头 60ms:再往后包络压到量化噪声里,过零会数不准
+        for (freq, start) in [(880.0f32, 0.0f32), (660.0, 0.13)] {
+            let from = (start * SAMPLE_RATE as f32) as usize;
+            let window = (0.06 * SAMPLE_RATE as f32) as usize;
+            let seg = &s[from..from + window];
+            let crossings = seg
+                .windows(2)
+                .filter(|w| (w[0] >= 0) != (w[1] >= 0))
+                .count();
+            let expected = (freq * 0.06 * 2.0).round() as usize;
+            assert!(
+                crossings.abs_diff(expected) <= 2,
+                "{freq}Hz 段过零应约 {expected} 次,实测 {crossings}"
+            );
+        }
+    }
+
+    /// 合成结果进程内只算一次并长活(`SND_ASYNC` 要求缓冲区在播放期间不被释放)。
+    #[test]
+    fn 波形缓冲是同一块内存() {
+        let a = notification_wave();
+        let b = notification_wave();
+        assert_eq!(a.as_ptr(), b.as_ptr());
+        assert_eq!(a, build_notification_wave().as_slice());
+    }
+}
+
+#[cfg(test)]
+mod toast_kind_tests {
+    use super::*;
+
+    /// 图标字符 / 跳转语义 / 正文来源三张表,逐 kind 对着
+    /// `ToastContainer.tsx:42-63` 钉死。
+    #[test]
+    fn 五种_kind_的图标与点击语义() {
+        use ToastKind::*;
+        assert_eq!(Completion.icon_char(), "✓");
+        assert_eq!(Attention.icon_char(), "!");
+        assert_eq!(PasteError.icon_char(), "!");
+        assert_eq!(WslInfo.icon_char(), "i");
+        assert_eq!(MobileSession.icon_char(), "i");
+
+        assert!(Completion.jumps_to_project());
+        assert!(Attention.jumps_to_project());
+        assert!(MobileSession.jumps_to_project());
+        assert!(
+            !WslInfo.jumps_to_project(),
+            "wsl-info 的 projectId 是占位串"
+        );
+        assert!(!PasteError.jumps_to_project(), "粘贴失败的项目就在眼前");
+
+        assert!(!Completion.uses_message());
+        assert!(!Attention.uses_message());
+        assert!(WslInfo.uses_message());
+        assert!(MobileSession.uses_message());
+        assert!(PasteError.uses_message());
+    }
+}
 
 #[cfg(test)]
 mod tests {

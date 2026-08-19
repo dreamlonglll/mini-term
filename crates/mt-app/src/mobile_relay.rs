@@ -45,11 +45,7 @@ use std::time::{Duration, SystemTime};
 
 use futures::StreamExt;
 use futures::channel::mpsc::{self, UnboundedSender};
-use gpui::{
-    App, AppContext, Context, Entity, Global, SharedString, Subscription, Task, WeakEntity, Window,
-};
-use gpui_component::WindowExt as _;
-use gpui_component::notification::Notification;
+use gpui::{App, AppContext, Context, Entity, Global, Subscription, Task, WeakEntity, Window};
 use mt_config::{AiLauncher, AppConfig};
 use mt_relay::host::{HookSessionId, RelayEvents, RelayHost, RelayProject};
 use mt_relay::{
@@ -70,10 +66,6 @@ use crate::tree::PaneStatus;
 /// 焦点、布局全在同一个 entity 上)。去掉去抖或内容去重,WebSocket 上就会出现
 /// 每秒几十条 `SessionsDelta`。
 const SYNC_DEBOUNCE: Duration = Duration::from_millis(150);
-
-/// 发起会话 toast 的去重键类型(gpui-component 按 `TypeId + key` 唯一化通知)。
-/// **必须与 AI 完成 / 待确认 toast 分开**,否则互相顶掉。
-struct MobileSessionToast;
 
 // ─── 跨线程信号 ───────────────────────────────────────────────
 
@@ -680,14 +672,25 @@ impl RelayBridge {
         }
 
         // 9. 桌面端 toast。凭证被盗时这是唯一的审计迹象,所以即便不切过去也要弹。
-        //    去重键带 pane_id —— 连开两个会话该看到两条,不该互相顶掉。
-        window.push_notification(
-            Notification::info(tr!(
+        //    走自建 toast 层的 `mobile-session` 档:info 图标 + 点击切项目
+        //    (原版 `mobileStartSession.ts:122-127` 就是这一档)。**不去重** ——
+        //    连开两个会话该看到两条,原版这条也是裸 `pushNotification`。
+        //    项目名由标题行展示,正文只补启动器名。
+        let project_name = self
+            .store
+            .read(cx)
+            .project(&payload.project_id)
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
+        crate::toast::push_message(
+            crate::notify::ToastKind::MobileSession,
+            payload.project_id.clone(),
+            project_name,
+            tr!(
                 "app",
                 "mobileStartSession",
                 launcher = payload.launcher_name.clone()
-            ))
-            .id1::<MobileSessionToast>(SharedString::from(pane_id.clone())),
+            ),
             cx,
         );
         Ok(pane_id)

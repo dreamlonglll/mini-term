@@ -61,6 +61,7 @@ use mt_ui::icons::{Geom, Ink, Shape, VectorIcon};
 use mt_ui::rgb8;
 
 use crate::i18n::t;
+use crate::prompt::Confirm;
 use crate::store::{AiProjectEntry, AiProjectKind, AppStore, DoneScope, TitleBarLight};
 use crate::ui;
 
@@ -240,19 +241,105 @@ pub fn blink_phase(delta: f32) -> f32 {
 
 // ─── 窗口动作 ────────────────────────────────────────────────
 
-/// 关闭窗口。
+// ─── 关窗确认(audit #30 / `App.tsx:389-422`)─────────────────
+//
+// # 一条闸,四个入口
+//
+// ```text
+// 系统 WM_CLOSE(标题栏 ✕ / Alt+F4 / 任务栏右键关闭)
+//     └→ gpui handle_close_msg → on_window_should_close(main.rs 注册)
+//                                        ↓
+// Linux 降级路径的 ✕ on_click → request_close_window ─→ allow_close()
+//                                        ↓
+//                        有活着的 AI? ── 否 ─→ 落盘 → true(放行)
+//                              │
+//                              是 ─→ 弹 Confirm → false(这次不关)
+//                                        └─ 点「确定」→ 置 FORCE_CLOSE
+//                                                     → 落盘 → remove_window()
+// ```
+//
+// 托盘没有「退出」项(菜单里只有项目行,见 `tray.rs`),所以关窗路径就这两条口。
+//
+// # 设计意图(`App.tsx:389-391` 原注释,务必保留)
+//
+// > 只在真的会毁掉什么时才拦一下。之前无条件弹确认,日常开关十几次全是噪音,
+// > 用户学会的是「闭眼点确定」——那正好让确认框在唯一该起作用的时候
+// > (AI 正在跑)也失效。
+//
+// # 防重入
+//
+// 两道,各管一头:
+//
+// 1. **确认框开着时再点 ✕**:`Confirm::open` 内部走 `open_guarded`,同种类第二次
+//    直接忽略 —— 于是摞不出第二个框,`allow_close` 照常返回 false,窗口留着。
+//    不需要额外的标志位。
+// 2. **确认之后**:`FORCE_CLOSE` 置位,`allow_close` 从此立刻放行。
+//    `remove_window()` 只是把 `Window::removed` 置 true、由 `App` 下一轮把窗口丢掉
+//    (`gpui-0.2.2/src/window.rs:1375` + `app.rs:1374`),**不会**再投一次
+//    `WM_CLOSE`,所以这一条严格说是冗余的 —— 留着是防线:万一哪个平台的
+//    `remove_window` 走回 should_close,没有它就是「确认框弹到天荒地老」。
+
+thread_local! {
+    /// 已经确认过要关了 —— 之后任何一次询问都直接放行。见上面的防重入说明。
+    static FORCE_CLOSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// 现在可以关窗吗。`false` = 这次别关(确认框已经弹出来了 / 或正开着)。
 ///
-/// # ⚠️ Z 批将在此挂关窗确认钩子(audit #30)
+/// 这是 `on_window_should_close` 的**同步**回调体:gpui 要求当场返回 bool,
+/// 而确认框是异步的(用户点了才有结果)。套路即上图 —— 先返回 false 把这次关闭
+/// 吞掉,确认回调里再走 `remove_window()`(它绕过本函数)。
+pub fn allow_close(window: &mut Window, cx: &mut App) -> bool {
+    if FORCE_CLOSE.with(|f| f.get()) {
+        return true;
+    }
+
+    let live = crate::pane_actions::collect_live_ai_panes(AppStore::global(cx).read(cx));
+    if live.is_empty() {
+        finish_close(cx);
+        return true;
+    }
+
+    let count = live.len();
+    // 正文里那两个换行符由 `prompt::body` 拆成多个 child —— gpui 的文本不认转义符
+    let message = crate::i18n::tr!(
+        "app",
+        "closeConfirm.messageWithSessions",
+        count = count,
+        names = live.join("\n")
+    );
+    Confirm::new(t("app", "closeConfirm.titleAi"), message).open(
+        move |window, cx| {
+            FORCE_CLOSE.with(|f| f.set(true));
+            finish_close(cx);
+            window.remove_window();
+        },
+        window,
+        cx,
+    );
+    false
+}
+
+/// 真关之前把配置刷下去。
 ///
-/// 目标形态是:盘点全部项目里活着的 AI 会话 → 有就弹确认框(取消则不关)→
-/// `save_config_now()` 落盘 → 才真的关。届时**只需要改这一个函数**,再在
-/// `main.rs` 注册一次 `window.on_window_should_close`(Windows 的关闭键走的是
-/// 系统 `WM_CLOSE`,进的是那个回调而不是这里),两条路径就都接上了。
+/// 原版在这里逐项目 `flushLayoutToConfig` / `flushExpandedDirsToConfig` 再
+/// `persistConfig()`;GPUI 侧那两步是**即时**写进 `self.config` 的(布局与展开目录
+/// 一变就落进配置结构,只有写盘走 500ms 去抖),所以只差最后这一次强刷。
 ///
-/// 现在直接关窗是**临时**行为 —— 与装机版 `close()` 而非 `destroy()` 的取舍
-/// (要走 `onCloseRequested`)差的正是那个钩子。
-pub fn request_close_window(window: &mut Window, _cx: &mut App) {
-    window.remove_window();
+/// `cx.on_app_quit` 里也有一次 `save_config_now`(S 批记档)—— 那条管「进程退出」,
+/// 这条管「窗口关闭」,两条都要有:写盘本身是幂等的。
+fn finish_close(cx: &mut App) {
+    AppStore::global(cx).update(cx, |store, _| store.save_config_now());
+}
+
+/// 关闭窗口(Linux 降级路径的 ✕;Windows 上关闭键走系统 `WM_CLOSE`,
+/// 进的是 `main.rs` 注册的 `on_window_should_close`)。
+///
+/// 两条路都过 [`allow_close`],确认口径于是只有一份。
+pub fn request_close_window(window: &mut Window, cx: &mut App) {
+    if allow_close(window, cx) {
+        window.remove_window();
+    }
 }
 
 /// 最小化窗口(Linux 降级路径;Windows 由 `WindowControlArea::Min` 接管)。

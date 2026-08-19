@@ -42,6 +42,48 @@ pub fn ai_session_labels(panes: &[PaneState]) -> Vec<String> {
         .collect()
 }
 
+/// 这个 pane 要计入**关窗**确认吗(`App.tsx:57-60` 的 `collectLiveAiPanes`)。
+///
+/// 比关 tab / 关整组多一条 `ptyId !== undefined`:布局是从 `config.json` 恢复的,
+/// 落盘时带着 `ai-idle` 的 pane 在 PTY 起来之前**什么都不会被杀掉**,
+/// 拿它去拦关窗纯属噪音。状态判据本身与关 tab 完全相同。
+pub fn counts_for_window_close(pane: &PaneState) -> bool {
+    pane.pty_id.is_some() && is_ai_alive(pane.status)
+}
+
+/// 关窗确认正文里的一行:`· {项目名} / {标签}`;项目名为空时退成 `· {标签}`
+/// (`App.tsx:62-63` 一字不差)。
+pub fn window_close_line(project_name: &str, pane: &PaneState) -> String {
+    if project_name.is_empty() {
+        format!("· {}", pane.label())
+    } else {
+        format!("· {project_name} / {}", pane.label())
+    }
+}
+
+/// 关窗前跨**全部项目**盘点活着的 AI 会话,返回正文用的名字列表。
+///
+/// 与 TS 的一处偏差(与 `collect_ai_projects` 同源):那边遍历 `projectStates`
+/// (插入序),Rust 侧那是 `HashMap`、遍历序不定,于是改按**配置里的项目次序**走
+/// —— 既确定,又与项目列表的上下顺序一致。
+pub fn collect_live_ai_panes(store: &AppStore) -> Vec<String> {
+    let mut names = Vec::new();
+    for project in store.projects() {
+        let Some(layout) = store
+            .project_state(&project.id)
+            .and_then(|s| s.layout.as_ref())
+        else {
+            continue;
+        };
+        for pane in layout.panes() {
+            if counts_for_window_close(pane) {
+                names.push(window_close_line(&project.name, pane));
+            }
+        }
+    }
+    names
+}
+
 /// 取一个叶子里的全部 pane(拷贝一份,免得确认框开着的时候借用还挂在 store 上)。
 fn leaf_panes(store: &AppStore, project_id: &str, leaf_id: &str) -> Vec<PaneState> {
     store
@@ -223,5 +265,52 @@ mod tests {
     fn 没有_ai_时盘点为空() {
         let panes = vec![pane("bash", PaneStatus::Idle), pane("cmd", PaneStatus::Error)];
         assert!(ai_session_labels(&panes).is_empty());
+    }
+
+    /// 关窗口径**比关 tab 多一条 pty_id**:恢复出来还没起进程的 pane 关掉不损失
+    /// 任何东西,拿它拦关窗是纯噪音。
+    #[test]
+    fn 关窗盘点要求_pty_已起() {
+        let mut restored = pane("pwsh", PaneStatus::AiIdle);
+        restored.pty_id = None;
+        assert!(!counts_for_window_close(&restored), "没起过 PTY 的不算");
+
+        let mut live = pane("pwsh", PaneStatus::AiIdle);
+        live.pty_id = Some(7);
+        assert!(counts_for_window_close(&live));
+
+        // 关 tab 那条口径**不看** pty_id —— 两者有意不同,别互相同化
+        assert!(is_ai_alive(restored.status));
+    }
+
+    /// 状态判据与关 tab 完全一致:只有两个 AI 态算,idle / error 都不算。
+    #[test]
+    fn 关窗盘点的状态判据与关_tab_同() {
+        for (status, expect) in [
+            (PaneStatus::AiWorking, true),
+            (PaneStatus::AiIdle, true),
+            (PaneStatus::Idle, false),
+            (PaneStatus::Error, false),
+        ] {
+            let mut p = pane("pwsh", status);
+            p.pty_id = Some(1);
+            assert_eq!(counts_for_window_close(&p), expect, "{status:?}");
+        }
+    }
+
+    /// 正文一行的拼串:`· 项目名 / 标签`,项目名为空时退成 `· 标签`;
+    /// 标签取 `customTitle || shellName`。
+    #[test]
+    fn 关窗清单每行的拼串() {
+        let mut p = pane("pwsh", PaneStatus::AiWorking);
+        p.pty_id = Some(1);
+        assert_eq!(window_close_line("mini-term", &p), "· mini-term / pwsh");
+        assert_eq!(window_close_line("", &p), "· pwsh");
+
+        p.custom_title = Some("codex 跑测试".into());
+        assert_eq!(
+            window_close_line("mini-term", &p),
+            "· mini-term / codex 跑测试"
+        );
     }
 }
