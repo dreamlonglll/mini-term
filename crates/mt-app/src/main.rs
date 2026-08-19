@@ -40,6 +40,7 @@ mod ai;
 mod clipboard;
 mod dnd;
 mod file_tree;
+mod file_viewer;
 mod focus_nav;
 mod fs_ops;
 mod git_changes;

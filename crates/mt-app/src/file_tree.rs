@@ -6,7 +6,8 @@
 //! - 目录变化走 [`mt_project::watch::FsWatcher`](mt_project::watch::FsWatcher):
 //!   sink 里往 channel 丢,主线程上的前台任务醒来后失效缓存并重列 ——
 //!   与 AI 状态、终端重绘是同一套跨线程唤醒模式;
-//! - 双击文件用 [`mt_project::editor`](mt_project::editor) 打开(编辑器取自配置)。
+//! - 单击文件开[文件预览器](crate::file_viewer)(AA 批之前是双击调外部编辑器 ——
+//!   预览器缺位时的临时替身,原版文件行上只有预览这一条路)。
 //!
 //! 文件拖进终端(把路径当文本写进 PTY)走 gpui 原生 drag:这边只在行上挂
 //! [`on_drag`](gpui::StatefulInteractiveElement::on_drag) 交出
@@ -370,11 +371,19 @@ impl FileTree {
         cx.notify();
     }
 
-    fn open_file(&self, path: PathBuf, cx: &mut Context<Self>) {
-        // 两句写:第一句借完配置就还,第二句才拿可变借用丢后台
-        // (同一套挑编辑器 + 后台打开的逻辑,全局搜索点结果时也走它)
-        let editor = crate::fs_ops::configured_editor(self.store.read(cx).config());
-        crate::fs_ops::open_path_with(editor, path, cx);
+    /// 单击文件行 = 开文件预览器(`FileTree.tsx:151-155` 的 `handleToggle`:
+    /// `!entry.isDir → onViewFile(entry.path)`)。
+    ///
+    /// **原版没有「双击调外部编辑器」这条路** —— 文件行上只有预览一条,
+    /// 外部编辑器在原版只出现在项目级(头部按钮)与右键「使用默认工具打开」。
+    /// AA 批之前 GPUI 侧的双击调编辑器是预览器缺位时的临时替身,现在撤掉:
+    /// 留着的话双击会先开预览器再拉起编辑器(gpui 的双击是两个 click 事件,
+    /// click_count 依次为 1、2),两个窗口一起冒出来。
+    fn open_file(&self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(root) = self.project_root(cx) else {
+            return;
+        };
+        crate::file_viewer::open(root, path, None, window, cx);
     }
 
     /// 展开某个目录并(重)列它。新建文件/文件夹之后要用:原版是
@@ -1344,11 +1353,13 @@ impl FileTree {
             .text_size(ui::font_px(12.0))
             .text_color(color)
             .hover(|el| el.bg(ui::bg_overlay()))
-            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _window, cx| {
+            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
                 if is_dir {
                     this.toggle_dir(path.clone(), cx);
-                } else if event.click_count() >= 2 {
-                    this.open_file(path.clone(), cx);
+                } else if event.click_count() <= 1 {
+                    // 单击开预览器;双击的第二个事件(click_count == 2)不再做别的,
+                    // 见 `open_file` 的注释
+                    this.open_file(path.clone(), window, cx);
                 }
             }))
             // 拖进终端 = 把路径当文本写进 PTY(不是上传文件)。目录同样可拖,
