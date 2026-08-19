@@ -87,7 +87,8 @@ pub use icons::{
 };
 pub use terminal::{
     CopiedTip, DamageStats, DwellConfig, FlashLine, FrameGeometry, HighlightKind, HighlightSpan,
-    InstallInputHandler, OnGridResize, OnInput, OnPaste, OnSearchClose, OnSelectionCopied,
+    InstallInputHandler, MINI_REFRESH_MS, MiniTerminalElement, OnGridResize, OnInput, OnPaste,
+    OnSearchClose, OnSelectionCopied,
     PasteAction, PreeditText, ScrollbarStyle, SearchBarEvent, SearchBarLabels, SearchColors,
     SearchDirection,
     SearchHighlights, SearchLimits, SearchMatch, SearchOptions, TerminalElement, TerminalSearch,

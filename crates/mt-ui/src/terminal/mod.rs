@@ -12,6 +12,7 @@ pub mod damage;
 mod element;
 pub mod ime;
 mod input;
+mod mini;
 pub mod mouse;
 pub mod scrollbar;
 pub mod search;
@@ -27,6 +28,10 @@ pub use element::{
 };
 pub use ime::{ImeState, Preedit, commit_to_bytes};
 pub use input::{is_text_input_key, keystroke_to_bytes, paste_to_bytes};
+pub use mini::{
+    MINI_REFRESH_MS, MiniCell, MiniGeometry, MiniRun, MiniTerminalElement, build_row_runs,
+    mini_geometry,
+};
 pub use scrollbar::{ScrollbarHit, ScrollbarLayout, ScrollbarStyle};
 pub use search::{
     HighlightKind, HighlightSpan, SearchDirection, SearchHighlights, SearchLimits, SearchMatch,
