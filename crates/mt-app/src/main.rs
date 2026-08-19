@@ -40,6 +40,13 @@ mod ai;
 mod file_tree;
 mod focus_nav;
 mod fs_ops;
+mod git_changes;
+mod git_diff;
+mod git_graph;
+mod git_history;
+mod git_panel;
+mod git_watch;
+mod git_worktree;
 mod hotkeys;
 mod i18n;
 mod menu;
@@ -70,8 +77,8 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use gpui::{
-    App, AppContext, Application, Bounds, Context, Entity, InteractiveElement, IntoElement,
-    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
+    AnimationExt as _, App, AppContext, Application, Bounds, Context, Entity, InteractiveElement,
+    IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
     Subscription, Task, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div,
     prelude::FluentBuilder, px, size,
 };
@@ -180,6 +187,14 @@ struct AttentionToast;
 const DEFAULT_COLUMNS: [f64; 2] = [520.0, 1000.0];
 const DEFAULT_MIDDLE: [f64; 2] = [320.0, 380.0];
 
+/// 浮层退场后 DOM 还留多久(`src/hooks/useOverlayMotion.ts:19` 的 `OVERLAY_EXIT_MS`)。
+const OVERLAY_EXIT_MS: u64 = 400;
+/// `--motion-overlay-in` / `--motion-overlay-out` / `--motion-terminal-swap`
+/// (`styles.css:67-78`)。
+const MOTION_OVERLAY_IN_MS: u64 = 240;
+const MOTION_OVERLAY_OUT_MS: u64 = 140;
+const MOTION_PANEL_SWAP_MS: u64 = 200;
+
 /// 应用数据目录:`config.json`、`hook-server.json` 的落点。
 ///
 /// **开发用逃生门 `MT_APP_DATA_DIR`**:装机版正在跑的时候直接 `cargo run` 会与它
@@ -191,6 +206,32 @@ pub fn app_data_dir() -> PathBuf {
         return PathBuf::from(dir);
     }
     mt_config::app_data_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+/// 右抽屉里当前是哪一块。对应 `store.ts:685` 的
+/// `rightDrawer: 'sessions' | 'git' | null` —— **运行时态,互斥单抽屉,
+/// 不持久化开合**(每次启动收起)。落盘的只有宽度。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DrawerPanel {
+    Sessions,
+    Git,
+}
+
+impl DrawerPanel {
+    fn key(self) -> &'static str {
+        match self {
+            DrawerPanel::Sessions => "sessions",
+            DrawerPanel::Git => "git",
+        }
+    }
+}
+
+/// 抽屉退场动画的驻留。原版 `useOverlayPresence` + `OVERLAY_EXIT_MS = 400`:
+/// 关闭时 DOM 与**面板内容**都多留 400ms,否则「抽屉在滑出的同时内容先空掉」
+/// (`RightDrawer.tsx:29-30` 原注释)。
+struct DrawerExit {
+    panel: DrawerPanel,
+    _timer: Task<()>,
 }
 
 /// 右抽屉左缘拖拽的一次会话。
@@ -213,12 +254,18 @@ struct Workspace {
     file_tree: Entity<FileTree>,
     terminal_area: Entity<TerminalArea>,
     session_panel: Entity<SessionPanel>,
+    /// Git 面板(抽屉的第二块)。与会话面板一样常驻实体,靠
+    /// [`GitPanel::set_visible`](git_panel::GitPanel::set_visible) 闸住扫盘与
+    /// pty 输出旁路。
+    git_panel: Entity<git_panel::GitPanel>,
     /// 用量面板惰性创建:它一开就跑账本同步,没打开过就不该有这笔开销。
     usage_panel: Option<Entity<UsagePanel>>,
     columns_state: Entity<ResizableState>,
     middle_state: Entity<ResizableState>,
-    /// 右侧 AI 历史抽屉是否展开(运行时态,不持久化 —— 与旧版一致)。
-    sessions_open: bool,
+    /// 右侧悬浮抽屉现在开着哪一块(运行时态,不持久化 —— 与旧版一致)。
+    right_drawer: Option<DrawerPanel>,
+    /// 正在播退场动画的那一块(见 [`DrawerExit`])。
+    drawer_exit: Option<DrawerExit>,
     /// 抽屉左缘正在被拖。`Some` 期间宽度由本结构自持,松手才落盘。
     drawer_drag: Option<DrawerDrag>,
     usage_open: bool,
@@ -239,6 +286,7 @@ impl Workspace {
         let file_tree = cx.new(|cx| FileTree::new(store.clone(), cx));
         let terminal_area = cx.new(|cx| TerminalArea::new(store.clone(), cx));
         let session_panel = cx.new(|cx| SessionPanel::new(store.clone(), cx));
+        let git_panel = cx.new(|cx| git_panel::GitPanel::new(store.clone(), window, cx));
         let columns_state = cx.new(|_| ResizableState::default());
         let middle_state = cx.new(|_| ResizableState::default());
 
@@ -294,10 +342,12 @@ impl Workspace {
             file_tree,
             terminal_area,
             session_panel,
+            git_panel,
             usage_panel: None,
             columns_state,
             middle_state,
-            sessions_open: false,
+            right_drawer: None,
+            drawer_exit: None,
             drawer_drag: None,
             usage_open: false,
             _ai_pump: ai_pump,
@@ -505,16 +555,58 @@ impl Workspace {
         if yields_to_overlay(window, cx) {
             return;
         }
-        self.toggle_sessions(cx);
+        self.toggle_drawer(DrawerPanel::Sessions, cx);
     }
 
-    /// 开合 AI 历史抽屉。可见性要透给面板 —— 收着的时候它不该去扫会话
-    /// (WSL 那一路会冷启动整台 VM)。
-    fn toggle_sessions(&mut self, cx: &mut Context<Self>) {
-        self.sessions_open = !self.sessions_open;
-        let open = self.sessions_open;
-        self.session_panel
-            .update(cx, |panel, cx| panel.set_visible(open, cx));
+    /// 边条两颗按钮用的开关:相同则收起,否则换过去
+    /// (`store.ts:686` 的 `toggleRightDrawer`)。
+    fn toggle_drawer(&mut self, panel: DrawerPanel, cx: &mut Context<Self>) {
+        let next = if self.right_drawer == Some(panel) {
+            None
+        } else {
+            Some(panel)
+        };
+        self.set_drawer(next, cx);
+    }
+
+    /// 抽屉内 segmented 切换用的:直接换过去,**不做「再点一次关闭」**
+    /// (`store.ts:687` 原注释)。
+    fn open_drawer(&mut self, panel: DrawerPanel, cx: &mut Context<Self>) {
+        self.set_drawer(Some(panel), cx);
+    }
+
+    /// 换抽屉。可见性要透给两个面板 —— 收着的时候会话面板不该去扫会话
+    /// (WSL 那一路会冷启动整台 VM),Git 面板不该去 `discover_git_repos`(扫盘)。
+    fn set_drawer(&mut self, next: Option<DrawerPanel>, cx: &mut Context<Self>) {
+        if self.right_drawer == next {
+            return;
+        }
+        let prev = self.right_drawer;
+        self.right_drawer = next;
+        self.session_panel.update(cx, |panel, cx| {
+            panel.set_visible(next == Some(DrawerPanel::Sessions), cx)
+        });
+        self.git_panel.update(cx, |panel, cx| {
+            panel.set_visible(next == Some(DrawerPanel::Git), cx)
+        });
+
+        // 整块收起时留 400ms 给退场动画(面板实体必须还在树上,否则「抽屉在
+        // 滑出的同时内容先空掉」)。换面板不进退场:那是 panel-swap 的活。
+        self.drawer_exit = match (prev, next) {
+            (Some(panel), None) => Some(DrawerExit {
+                panel,
+                _timer: cx.spawn(async move |this, cx| {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(OVERLAY_EXIT_MS))
+                        .await;
+                    let _ = this.update(cx, |this: &mut Self, cx| {
+                        this.drawer_exit = None;
+                        cx.notify();
+                    });
+                }),
+            }),
+            _ => None,
+        };
         cx.notify();
     }
 
@@ -618,6 +710,109 @@ impl Workspace {
     /// toggle 实际做不到。这里让它真的 toggle(按注释的意图,不是按它的 bug)。
     fn on_global_search(&mut self, _: &GlobalSearch, window: &mut Window, cx: &mut Context<Self>) {
         search_modal::toggle(self.store.clone(), window, cx);
+    }
+
+    /// 抽屉标题条(`RightDrawer.tsx:80-124`):h-9 的段控件 + ✕。
+    ///
+    /// 段控件的选中态底块是一个**滑动的绝对定位块**(`absolute inset-y-0 left-0
+    /// w-1/2`,`transform: translateX(0% | 100%)`,`--motion-tab-indicator` 0.22s)。
+    /// gpui 没有 transform,这里用 `left` 百分比 + `with_animation` 做等效补间:
+    /// 换面板时 id 里带目标面板名 → 动画重播,底块从 0% 滑到 50%(或反过来)。
+    fn render_drawer_header(
+        &self,
+        panel: DrawerPanel,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let to_git = panel == DrawerPanel::Git;
+        let mut seg = div()
+            .relative()
+            .flex()
+            .flex_1()
+            .h(px(24.0))
+            .rounded(px(4.0))
+            .overflow_hidden()
+            .border_1()
+            .border_color(ui::border_default())
+            // 滑动选中块
+            .child(
+                div()
+                    .id(SharedString::from(format!("drawer-tab-ind-{}", panel.key())))
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .w(gpui::relative(0.5))
+                    .bg(ui::accent_subtle())
+                    .with_animation(
+                        SharedString::from(format!("drawer-tab-slide-{}", panel.key())),
+                        gpui::Animation::new(std::time::Duration::from_millis(220))
+                            .with_easing(ui::cubic_bezier(0.16, 1.0, 0.3, 1.0)),
+                        move |el, delta| {
+                            // 起点是另一半,终点是自己那一半
+                            let from = if to_git { 0.0 } else { 0.5 };
+                            let to = if to_git { 0.5 } else { 0.0 };
+                            el.left(gpui::relative(from + (to - from) * delta))
+                        },
+                    ),
+            );
+        for (tab, label) in [
+            (DrawerPanel::Sessions, t("panels", "sessions")),
+            (DrawerPanel::Git, t("panels", "git")),
+        ] {
+            let active = tab == panel;
+            seg = seg.child(
+                div()
+                    .id(SharedString::from(format!("drawer-tab-{}", tab.key())))
+                    .relative()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .px(px(8.0))
+                    .cursor_pointer()
+                    .text_size(ui::font_px(11.0))
+                    .when(active, |el| el.text_color(ui::accent()))
+                    .when(!active, |el| {
+                        el.text_color(ui::text_muted())
+                            .hover(|el| el.text_color(ui::text_primary()))
+                    })
+                    .child(label)
+                    // 段控件走 open_drawer:**不做「再点一次关闭」**
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.open_drawer(tab, cx)
+                    })),
+            );
+        }
+
+        div()
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .h(px(36.0))
+            .flex_none()
+            .px(px(6.0))
+            .border_b_1()
+            .border_color(ui::border_subtle())
+            .child(seg)
+            .child(
+                div()
+                    .id("drawer-close")
+                    .w(px(24.0))
+                    .h(px(24.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .flex_none()
+                    .rounded(px(4.0))
+                    .cursor_pointer()
+                    .text_size(ui::font_px(11.0))
+                    .text_color(ui::text_muted())
+                    .hover(|el| el.bg(ui::border_subtle()).text_color(ui::text_primary()))
+                    .tooltip(move |window, cx| {
+                        Tooltip::new(t("app", "activityBar.closeDrawer")).build(window, cx)
+                    })
+                    .child("✕")
+                    .on_click(cx.listener(|this, _event, _window, cx| this.set_drawer(None, cx))),
+            )
     }
 
     /// Ctrl+Shift+P:项目快速切换器。
@@ -774,9 +969,24 @@ impl Render for Workspace {
                     "toggle-sessions",
                     activity_bar::SESSIONS,
                     t("app", "activityBar.sessions"),
-                    self.sessions_open,
+                    self.right_drawer == Some(DrawerPanel::Sessions),
                 )
-                .on_click(cx.listener(|this, _event, _window, cx| this.toggle_sessions(cx))),
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.toggle_drawer(DrawerPanel::Sessions, cx)
+                })),
+            )
+            // Git 变更抽屉。位置照原版:紧跟 Sessions、排在分隔线之前
+            // (`ActivityBar.tsx:143-150`)。
+            .child(
+                activity_bar::strip_button(
+                    "toggle-git",
+                    activity_bar::GIT,
+                    t("app", "activityBar.git"),
+                    self.right_drawer == Some(DrawerPanel::Git),
+                )
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.toggle_drawer(DrawerPanel::Git, cx)
+                })),
             )
             .child(activity_bar::divider())
             .child(
@@ -829,7 +1039,7 @@ impl Render for Workspace {
                 )
             });
 
-        // 右侧 AI 历史抽屉:**absolute 悬浮层**,贴右边缘盖在终端之上。
+        // 右侧悬浮抽屉(Sessions ⇄ Git):**absolute 悬浮层**,贴右边缘盖在终端之上。
         //
         // 原版就是这个形态(`RightDrawer.tsx:67`:`absolute top-0 right-0 h-full
         // z-[45]`),GPUI 侧此前借 resizable 的第三栏实现,代价是**开合会改终端
@@ -840,21 +1050,59 @@ impl Render for Workspace {
         // 这里 `.children(...)` 的顺序等价:抽屉排在三栏之后、弹窗/菜单层之前。
         // 抽屉**不进 [`overlay`] 栈**(原版 `RightDrawer` 同样没压栈),
         // 所以它开着时全局快捷键照常生效。
-        let drawer_layer = self.sessions_open.then(|| {
+        //
+        // 动画三条(`styles.css:284-313`):
+        // - 进场 `drawerSlideIn` 240ms:整层从 `translateX(100%)` 滑进来 ——
+        //   gpui 没有 transform,改成把 `right` 从 `-width` 补到 0(等效);
+        // - 退场 `drawerSlideOut` 140ms:反过来,期间**面板实体仍留在树上**
+        //   (`drawer_exit` 驻留 400ms),否则内容会先空掉;
+        // - 换面板 `panelSwapIn` 200ms:内容层的 `ElementId` 带面板名,
+        //   换面板即换 id → 动画重播(等价于原版 `key={panel}` 的重建)。
+        //
+        // ⚠️ 这三条在原版被**显式豁免** `prefers-reduced-motion`
+        // (`styles.css:424-451`),所以 GPUI 侧不加任何减弱动效判定,始终播放。
+        let exiting = self.drawer_exit.as_ref().map(|e| e.panel);
+        let drawer_layer = self.right_drawer.or(exiting).map(|panel| {
+            let leaving = self.right_drawer.is_none();
+            let width = drawer_width as f32;
+            let content: gpui::AnyElement = match panel {
+                DrawerPanel::Sessions => self.session_panel.clone().into_any_element(),
+                DrawerPanel::Git => self.git_panel.clone().into_any_element(),
+            };
             div()
                 .absolute()
                 .top_0()
                 .right_0()
                 .h_full()
-                .w(px(drawer_width as f32))
+                .w(px(width))
                 .occlude()
                 .flex()
                 .flex_col()
                 .bg(ui::bg_overlay())
+                .border_l_1()
+                .border_color(ui::border_default())
                 // `--shadow-overlay`(`RightDrawer.tsx:67`);gpui 侧用同一档
                 // 阴影,与 `menu.rs` 的浮层一致
                 .shadow_lg()
-                .child(self.session_panel.clone())
+                .child(self.render_drawer_header(panel, cx))
+                .child(
+                    div()
+                        // `key={panel}` 的对应物:换面板时这层换 id → 重建 → 动画重播
+                        .id(SharedString::from(format!("drawer-body-{}", panel.key())))
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .overflow_hidden()
+                        .child(content)
+                        .with_animation(
+                            SharedString::from(format!("panel-swap-{}", panel.key())),
+                            gpui::Animation::new(std::time::Duration::from_millis(
+                                MOTION_PANEL_SWAP_MS,
+                            ))
+                            .with_easing(ui::cubic_bezier(0.16, 1.0, 0.3, 1.0)),
+                            // `panelSwapIn`:opacity 0→1 且 translateX(10px)→0
+                            |el, delta| el.opacity(delta).ml(px(10.0 * (1.0 - delta))),
+                        ),
+                )
                 // 左缘拖拽手柄:抽屉贴右边缘,把左缘往左拖 = 变宽,
                 // 所以位移取 `start_x - 当前 x`(照抄 `RightDrawer.tsx:48`)
                 .child(
@@ -880,6 +1128,27 @@ impl Render for Workspace {
                                 });
                             }),
                         ),
+                )
+                .with_animation(
+                    SharedString::from(if leaving {
+                        "drawer-slide-out"
+                    } else {
+                        "drawer-slide-in"
+                    }),
+                    gpui::Animation::new(std::time::Duration::from_millis(if leaving {
+                        MOTION_OVERLAY_OUT_MS
+                    } else {
+                        MOTION_OVERLAY_IN_MS
+                    }))
+                    .with_easing(if leaving {
+                        ui::cubic_bezier(0.4, 0.0, 0.9, 0.6)
+                    } else {
+                        ui::cubic_bezier(0.16, 1.0, 0.3, 1.0)
+                    }),
+                    move |el, delta| {
+                        let offset = if leaving { delta } else { 1.0 - delta };
+                        el.right(px(-width * offset))
+                    },
                 )
         });
 

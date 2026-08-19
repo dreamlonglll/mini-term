@@ -33,7 +33,8 @@ use gpui::{App, KeyBinding};
 use crate::{
     ClosePane, FocusDown, FocusLeft, FocusRight, FocusUp, GlobalSearch, JumpAttention, NewTerminal,
     NextPane, OpenTerminalSettings, PrevPane, RenamePane, SelectPane, SplitDown, SplitRight,
-    SwitchProject, TerminalSearch, ToggleMiddleColumn, ToggleSessions, ToggleUsage, project_switcher,
+    SwitchProject, TerminalSearch, ToggleMiddleColumn, ToggleSessions, ToggleUsage, git_changes,
+    project_switcher,
 };
 
 /// 应用级动作的 key context(与 `Workspace::render` 的 `key_context` 一致)。
@@ -368,6 +369,19 @@ pub fn bind_keys(cx: &mut App) {
         "down",
         project_switcher::SwitcherNext,
         Some("ProjectSwitcher > Input"),
+    ));
+
+    // Git 提交框的 Ctrl/Cmd+Enter(`GitChanges.tsx:411-415`)。**不进快捷键表** ——
+    // 原版它是 textarea 的 onKeyDown,不在 hotkeys.ts 里。谓词同上要与 `Input` 同深度。
+    bindings.push(KeyBinding::new(
+        "ctrl-enter",
+        git_changes::GitCommitMessage,
+        Some("GitChanges > Input"),
+    ));
+    bindings.push(KeyBinding::new(
+        "cmd-enter",
+        git_changes::GitCommitMessage,
+        Some("GitChanges > Input"),
     ));
 
     cx.bind_keys(bindings);

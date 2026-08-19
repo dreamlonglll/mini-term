@@ -14,9 +14,10 @@
 //!
 //! # 只画有落点的按钮
 //!
-//! 原版 8 个按钮里 SSH / 移动端 / Git / 更新提醒四个在 GPUI 侧还没有对应功能,
-//! **不放占位**(灰着点不动的按钮比没有更让人困惑)。剩下四个:
-//! 折叠中间栏 / AI 历史 / 用量统计 / 设置,外加一个原版没有的「跳到已完成」。
+//! 原版 8 个按钮里 SSH / 移动端 / 更新提醒三个在 GPUI 侧还没有对应功能,
+//! **不放占位**(灰着点不动的按钮比没有更让人困惑)。其余五个:
+//! 折叠中间栏 / AI 历史 / Git 变更 / 用量统计 / 设置,外加一个原版没有的
+//! 「跳到已完成」。(Git 那颗由 V 批补上,与右抽屉的 sessions⇄git 段控件同一个开关。)
 
 use gpui::{
     Div, ElementId, InteractiveElement, ParentElement, Stateful, StatefulInteractiveElement,
@@ -75,6 +76,63 @@ pub const SESSIONS: &[Shape] = &[Shape::line(
         (u(2.0), u(14.0)),
     ]),
 )];
+
+/// Git 变更。原版 `ICON_GIT`(`ActivityBar.tsx:24-31`)—— 三个节点 + 一条主干
+/// 加一条并回主干的分支:
+///
+/// ```text
+/// <circle cx="5"  cy="4"  r="1.5"/>
+/// <circle cx="11" cy="4"  r="1.5"/>
+/// <circle cx="5"  cy="12" r="1.5"/>
+/// <path d="M5 5.5v5M11 5.5v1a2 2 0 01-2 2H5"/>
+/// ```
+///
+/// 那条 path 的圆角拐弯(`a2 2 0 01-2 2`)在 18px 下半径只有 2px,
+/// 用折线近似(取圆弧的起点 / 45° 中点 / 终点三个顶点)。
+pub const GIT: &[Shape] = &[
+    Shape::line(
+        Ink::Current,
+        STROKE,
+        Geom::Circle {
+            c: (u(5.0), u(4.0)),
+            r: u(1.5),
+        },
+    ),
+    Shape::line(
+        Ink::Current,
+        STROKE,
+        Geom::Circle {
+            c: (u(11.0), u(4.0)),
+            r: u(1.5),
+        },
+    ),
+    Shape::line(
+        Ink::Current,
+        STROKE,
+        Geom::Circle {
+            c: (u(5.0), u(12.0)),
+            r: u(1.5),
+        },
+    ),
+    // 左侧主干:M5 5.5 v5
+    Shape::line(
+        Ink::Current,
+        STROKE,
+        Geom::Polyline(&[(u(5.0), u(5.5)), (u(5.0), u(10.5))]),
+    ),
+    // 右侧分支:M11 5.5 v1,再向左拐回主干
+    Shape::line(
+        Ink::Current,
+        STROKE,
+        Geom::Polyline(&[
+            (u(11.0), u(5.5)),
+            (u(11.0), u(6.5)),
+            (u(10.41), u(7.91)),
+            (u(9.0), u(8.5)),
+            (u(5.0), u(8.5)),
+        ]),
+    ),
+];
 
 /// 用量统计。原版 `ICON_STATS`:一条底轴 + 三根高低不同的柱子
 /// (`M2.5 13.5h11` / `M4 13.5V9M8 13.5V4.5M12 13.5V7`)。
@@ -209,7 +267,7 @@ mod tests {
     #[test]
     fn 边条图标的点全在单位方框内() {
         let mut points = 0usize;
-        for shapes in [PANEL, SESSIONS, STATS, SETTINGS] {
+        for shapes in [PANEL, SESSIONS, GIT, STATS, SETTINGS] {
             for shape in shapes {
                 let (pts, _) = shape.geom.points();
                 for (x, y) in pts {

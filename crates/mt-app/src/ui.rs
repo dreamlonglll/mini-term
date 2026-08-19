@@ -64,6 +64,17 @@ pub struct Palette {
     /// `--color-ai`。排行条渐变的右端。主题包**不映射**它
     /// （`themePackManager.ts::buildTokenMap` 没有这一条），恒用内置值。
     pub color_ai: Hsla,
+    /// `--diff-add-bg` / `--diff-del-bg` / `--diff-add-text` / `--diff-del-text`
+    /// （diff 视图的四格）。
+    ///
+    /// ⚠️ `mt_ui::theme_bridge::ThemeSlot` **没有 diff 槽位**，主题包里这四个色
+    /// 无来源。取舍：`from_pack` 按 success / error 派生（底色取同色 12% alpha，
+    /// 文字色直接用语义色），**不为此扩 ThemeSlot** —— 那会改动主题包格式，
+    /// 超出本批范围。内置明暗两套仍逐值抄 `styles.css`。
+    pub diff_add_bg: Hsla,
+    pub diff_del_bg: Hsla,
+    pub diff_add_text: Hsla,
+    pub diff_del_text: Hsla,
 }
 
 /// 乘性改 alpha(与前端 `withAlpha` / `scaleAlpha` 同语义)。
@@ -115,6 +126,17 @@ impl Palette {
             color_file: rgb8(0x7d, 0xcf, 0xb8),
             color_info: rgb8(0x6a, 0x9f, 0xd4),
             color_ai: rgb8(0xb0, 0x8c, 0xd4),
+            // `styles.css:40-43`
+            diff_add_bg: Hsla {
+                a: 0.12,
+                ..rgb8(60, 180, 60)
+            },
+            diff_del_bg: Hsla {
+                a: 0.12,
+                ..rgb8(220, 60, 60)
+            },
+            diff_add_text: rgb8(0x6b, 0xb8, 0x7a),
+            diff_del_text: rgb8(0xd4, 0x60, 0x5a),
         }
     }
 
@@ -158,6 +180,17 @@ impl Palette {
             color_file: rgb8(0x1a, 0x8a, 0x6a),
             color_info: rgb8(0x28, 0x60, 0xa0),
             color_ai: rgb8(0x8a, 0x5c, 0xb8),
+            // `styles.css:114-117`
+            diff_add_bg: Hsla {
+                a: 0.10,
+                ..rgb8(40, 140, 40)
+            },
+            diff_del_bg: Hsla {
+                a: 0.10,
+                ..rgb8(200, 50, 40)
+            },
+            diff_add_text: rgb8(0x2d, 0x8a, 0x46),
+            diff_del_text: rgb8(0xc0, 0x39, 0x2b),
         }
     }
 
@@ -189,6 +222,14 @@ impl Palette {
         let line = applied.color(ThemeSlot::Line);
         let so = applied.surface_opacity;
 
+        // diff 四色要按 success / error 派生,先把这两格算出来(struct 字面量里
+        // 引用不到自己的其它字段)
+        let success = match applied.colors.highlight {
+            Some(_) => applied.color(ThemeSlot::Highlight),
+            None => base.color_success,
+        };
+        let error = base.color_error;
+
         Self {
             bg_base: background,
             // 面板半透明才透得出背景图;无背景图时 surface_opacity = 1.0
@@ -211,10 +252,12 @@ impl Palette {
             // `color(Highlight/Secondary)` 在包里没声明时会回落 accent(那是
             // themePackManager 写 CSS 变量的口径),而壳这两格的语义是「成功/信息」,
             // 回落 accent 会让完成态变成强调色 —— 所以先看 Option 在不在
-            color_success: match applied.colors.highlight {
-                Some(_) => applied.color(ThemeSlot::Highlight),
-                None => base.color_success,
-            },
+            color_success: success,
+            // 主题包没有 diff 槽位 —— 见 [`Palette::diff_add_bg`] 的取舍说明
+            diff_add_bg: alpha(success, 0.12),
+            diff_del_bg: alpha(error, 0.12),
+            diff_add_text: success,
+            diff_del_text: error,
             color_info: match applied.colors.secondary {
                 Some(_) => applied.color(ThemeSlot::Secondary),
                 None => base.color_info,
@@ -444,6 +487,65 @@ pub fn color_info() -> Hsla {
 /// `--color-ai`(排行条渐变的右端)
 pub fn color_ai() -> Hsla {
     token(|p| p.color_ai)
+}
+
+// --- diff 四色 ---
+/// `--diff-add-bg`
+pub fn diff_add_bg() -> Hsla {
+    token(|p| p.diff_add_bg)
+}
+/// `--diff-del-bg`
+pub fn diff_del_bg() -> Hsla {
+    token(|p| p.diff_del_bg)
+}
+/// `--diff-add-text`
+pub fn diff_add_text() -> Hsla {
+    token(|p| p.diff_add_text)
+}
+/// `--diff-del-text`
+pub fn diff_del_text() -> Hsla {
+    token(|p| p.diff_del_text)
+}
+
+// --- 缓动 ---
+
+/// CSS `cubic-bezier(x1, y1, x2, y2)` 的等价缓动函数。
+///
+/// `styles.css:67-78` 那两条浮层缓动(`--ease-overlay-in:
+/// cubic-bezier(0.16, 1, 0.3, 1)` / `--ease-overlay-out:
+/// cubic-bezier(0.4, 0, 0.9, 0.6)`)在 gpui 侧没有现成对应物,
+/// `Animation::with_easing` 又只要一个 `Fn(f32) -> f32`,于是自己解一次。
+///
+/// 做法与浏览器一致:x(t) 与 y(t) 都是控制点为 `(0,0) (x1,y1) (x2,y2) (1,1)`
+/// 的三次贝塞尔,给定 `x` 先用二分法反解 `t`,再取 `y(t)`。
+/// 二分 20 次的精度是 1e-6,对 240ms 的动画绰绰有余(比牛顿法慢但恒收敛 ——
+/// 控制点在 0..1 外时牛顿法会跑飞)。
+pub fn cubic_bezier(x1: f32, y1: f32, x2: f32, y2: f32) -> impl Fn(f32) -> f32 {
+    fn bezier(a: f32, b: f32, t: f32) -> f32 {
+        let u = 1.0 - t;
+        3.0 * u * u * t * a + 3.0 * u * t * t * b + t * t * t
+    }
+    move |x: f32| {
+        let x = x.clamp(0.0, 1.0);
+        if x <= 0.0 {
+            return 0.0;
+        }
+        if x >= 1.0 {
+            return 1.0;
+        }
+        let (mut lo, mut hi) = (0.0f32, 1.0f32);
+        let mut t = x;
+        for _ in 0..20 {
+            let sample = bezier(x1, x2, t);
+            if sample < x {
+                lo = t;
+            } else {
+                hi = t;
+            }
+            t = (lo + hi) * 0.5;
+        }
+        bezier(y1, y2, t)
+    }
 }
 
 // --- 复用小件 ---
@@ -970,6 +1072,31 @@ mod tests {
             highlight_runs("你好世界", &[(1, 3)]),
             vec![("你".into(), false), ("好世".into(), true), ("界".into(), false)]
         );
+    }
+
+    /// 缓动曲线:两端钉死、单调不回头、`ease-overlay-in` 前段就冲得很快
+    /// (`cubic-bezier(0.16, 1, 0.3, 1)` 是「快出慢收」)。
+    #[test]
+    fn 三次贝塞尔缓动() {
+        let ease_in = cubic_bezier(0.16, 1.0, 0.3, 1.0);
+        assert_eq!(ease_in(0.0), 0.0);
+        assert_eq!(ease_in(1.0), 1.0);
+        assert_eq!(ease_in(-1.0), 0.0, "越界要夹住");
+        assert_eq!(ease_in(2.0), 1.0);
+        // 单调
+        let mut prev = 0.0;
+        for i in 0..=20 {
+            let v = ease_in(i as f32 / 20.0);
+            assert!(v >= prev - 1e-4, "缓动必须单调:{prev} → {v}");
+            prev = v;
+        }
+        // 快出:走到一半时间已经完成大半位移
+        assert!(ease_in(0.5) > 0.8, "{}", ease_in(0.5));
+
+        // ease-overlay-out 是「慢出快收」,半程时位移不到一半
+        let ease_out = cubic_bezier(0.4, 0.0, 0.9, 0.6);
+        assert!(ease_out(0.5) < 0.5, "{}", ease_out(0.5));
+        assert_eq!(ease_out(1.0), 1.0);
     }
 
     /// 坏区间(越界 / 逆序 / 重叠)跳过而不是 panic。

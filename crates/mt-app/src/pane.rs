@@ -151,6 +151,11 @@ impl TerminalPane {
                 emulator.advance(bytes);
                 // AI 感知的输出旁路(命令 echo 回扫 + 输出活跃度)
                 ai.perception().observe_output(pty_id, bytes);
+                // Git 面板的输出旁路(外部跑了 git 命令 → 刷新变更与仓库元信息)。
+                // **这条线程上不跑任何模式匹配**:总闸关着时只有一次原子读,
+                // 开着时也只是把尾部字节塞进有界环形缓冲,5 条口径在主线程节拍上跑。
+                // 详见 `git_watch` 模块注释(后续 Y 批的 git 着色与本条共用)。
+                crate::git_watch::observe_output(pty_id, bytes);
                 let _ = tx.unbounded_send(PaneSignal::Output);
             })
         };

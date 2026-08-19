@@ -66,6 +66,15 @@ pub mod kind {
     pub const PROJECT_SWITCHER: &str = "project-switcher";
     /// 终端内查找条(Ctrl+F)。**逐 pane 一条**,slot 存 `pty_id`。
     pub const TERMINAL_SEARCH: &str = "terminal-search";
+    /// 工作区 / 暂存区的单文件 diff(`DiffModal`)。
+    pub const GIT_DIFF: &str = "git-diff";
+    /// 某次 commit 的多文件 diff(`CommitDiffModal`)。
+    pub const GIT_COMMIT_DIFF: &str = "git-commit-diff";
+    /// worktree 管理弹窗。
+    pub const GIT_WORKTREE: &str = "git-worktree";
+    /// worktree 删除确认。**与 [`GIT_WORKTREE`] 不同种类**,所以能叠在它之上
+    /// (原版就是嵌套弹窗,`GitWorktreeModal.tsx:779` 的「Esc 归栈顶,不会误关外层」)。
+    pub const GIT_WORKTREE_REMOVE: &str = "git-worktree-remove";
 }
 
 /// 栈里的一条。
