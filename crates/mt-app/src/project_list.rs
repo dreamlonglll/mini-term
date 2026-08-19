@@ -85,21 +85,38 @@ fn project_icon(kind: Option<ProjectKind>) -> AnyElement {
     }
 }
 
+/// 完成标该不该出现(原版 `ProjectList.tsx:912` 的 `showDoneTag`)。
+///
+/// 判据有**两个**读者(行渲染 + `render` 里那张进场表),抽出来免得两边漂移。
+fn shows_done_tag(needs_attention: bool, is_active: bool) -> bool {
+    needs_attention && !is_active
+}
+
 /// 完成标(原版的 `<DoneTag/>`,样式在 `styles.css:509-524`)。
 ///
 /// 实心 success 底 + **底色字**(不是白字:浅色主题下白字配浅绿看不见,
 /// 与 StatusDot 的 `contrast` 同一条理由)、圆角 10px、字号 `0.77rem`≈10px、粗体。
 /// 原版还有一层 success 色的外发光,gpui 的 div 没有 box-shadow,省掉。
-fn done_tag() -> AnyElement {
+///
+/// # 进场(`tagFadeIn` 0.3s)
+///
+/// `progress` 由调用方喂(状态在 [`ProjectList::done_tags`] 里)。关键帧的
+/// `scale(.6) → 1.15 → 1` 在 gpui 里没有 transform 可用,**只让水平内边距跟着
+/// 缩放**:药丸自己横向呼吸 ±2px,字号与行高一动不动 —— 动它们会让整行在这
+/// 300ms 里抖高度。这一档**不在** reduce 豁免名单里(`TAG_FADE_IN` 过闸),
+/// 用户机器上开着「减少动画」就是直接出现。
+fn done_tag(progress: f32) -> AnyElement {
+    let (opacity, scale) = mt_ui::motion::tag_fade_in(progress);
     div()
         .flex_shrink_0()
-        .px(px(8.0))
+        .px(px(8.0 * scale))
         .py(px(2.0))
         .rounded(px(10.0))
         .bg(ui::color_success())
         .text_size(ui::font_px(10.0))
         .font_weight(FontWeight::BOLD)
         .text_color(ui::bg_base())
+        .opacity(opacity)
         .child(t("panels", "done"))
         .into_any_element()
 }
@@ -753,6 +770,10 @@ struct Editing {
 struct RowPreview {
     project_id: String,
     anchor: Bounds<Pixels>,
+    /// 卡片进场(`menuPopIn`)。状态挂在**这里**而不是卡上 —— 卡是纯函数,
+    /// 而这一份的生命周期恰好就是「卡在不在」:收起时随 `RowPreview` 一起没,
+    /// 下次悬停自然从头播。
+    fade: mt_ui::motion::Transition,
 }
 
 pub struct ProjectList {
@@ -785,6 +806,12 @@ pub struct ProjectList {
     hover_rect: Option<Bounds<Pixels>>,
     /// 刚进编辑态、还等着「默认全选」的那个输入框。见 [`Self::start_rename`]。
     pending_select_all: Option<FocusHandle>,
+    /// 各行完成标的进场(`tagFadeIn`),按项目 id 索引。
+    ///
+    /// 生命周期照抄 DOM:**标出现时建、消失时丢** —— 丢掉之后再出现按「新挂载」
+    /// 处理,从头播一遍。表在 `render` 的前置段维护(`render_project` 拿的是
+    /// `&self`,建不了)。
+    done_tags: HashMap<String, mt_ui::motion::Transition>,
 }
 
 impl ProjectList {
@@ -821,6 +848,7 @@ impl ProjectList {
             _preview_task: None,
             hover_rect: None,
             pending_select_all: None,
+            done_tags: HashMap::new(),
             };
         // 挂载时先探一次(原版两个 effect 都在挂载时跑一遍)
         this.probe_worktrees(true, cx);
@@ -1104,6 +1132,7 @@ impl ProjectList {
         self.preview = Some(RowPreview {
             project_id: project_id.to_string(),
             anchor,
+            fade: mt_ui::motion::Transition::new(mt_ui::motion::MENU_IN),
         });
         cx.notify();
         true
@@ -1111,8 +1140,10 @@ impl ProjectList {
 
     /// 组装浮层。渲染处**每帧重判开闸**(原版的双闸模式):AI 退出后不光不画,
     /// 状态本身也收掉 —— 留着的话同一次悬停里 AI 再起来会拿**旧锚点**复活。
-    fn render_preview(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_preview(&mut self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let preview = self.preview.as_ref()?;
+        // 进场进度先取(后面 `self.preview = None` 那两条早退路径会把它拿走)
+        let fade = preview.fade.drive(window);
         let store = self.store.read(cx);
         let auto_resume = store.config().ai_auto_resume.unwrap_or(true);
         let Some(project) = store.project(&preview.project_id) else {
@@ -1142,6 +1173,7 @@ impl ProjectList {
                         &path,
                         mini.as_ref(),
                         &style,
+                        fade,
                     )),
             )
             .with_priority(1)
@@ -1507,7 +1539,36 @@ impl Render for ProjectList {
                 self.row_focus(&id, cx);
             }
         }
-        let preview = self.render_preview(cx);
+        // 完成标的进场表:这一帧哪些行挂着标就留哪些(等价于 DOM 的挂载/卸载)。
+        // 进度在 `render_project` 里读,**请求下一帧只能在这儿**(那边没有 window)。
+        {
+            let store = self.store.read(cx);
+            let active_id = store.active_project_id.clone();
+            let showing: HashSet<String> = ordered
+                .iter()
+                .filter_map(|item| match item {
+                    OrderedItem::Project { id, .. } => {
+                        let needs = store
+                            .project_state(id)
+                            .map(|s| s.needs_attention)
+                            .unwrap_or(false);
+                        shows_done_tag(needs, active_id.as_deref() == Some(id.as_str()))
+                            .then(|| id.clone())
+                    }
+                    OrderedItem::Group { .. } => None,
+                })
+                .collect();
+            self.done_tags.retain(|id, _| showing.contains(id));
+            for id in showing {
+                self.done_tags
+                    .entry(id)
+                    .or_insert_with(|| mt_ui::motion::Transition::new(mt_ui::motion::TAG_FADE_IN));
+            }
+        }
+        if self.done_tags.values().any(|tr| tr.running()) {
+            window.request_animation_frame();
+        }
+        let preview = self.render_preview(window, cx);
         let store_ref = self.store.read(cx);
         let active = store_ref.active_project_id.clone();
         // 缺省开启,与 store 里那处取值同口径
@@ -1974,7 +2035,13 @@ impl ProjectList {
         let id_focus = id.clone();
         // 完成提示:非激活项目里有 AI 任务完成时画 DONE 标,否则才轮到状态灯;
         // **idle 且没有完成标时两个都不画**(原版 `ProjectList.tsx:912`)
-        let show_done_tag = needs_attention && !is_active;
+        let show_done_tag = shows_done_tag(needs_attention, is_active);
+        // 进场进度。表由 `render` 前置段维护;万一没赶上(理论上不会)按已就位画
+        let done_tag_in = self
+            .done_tags
+            .get(id.as_str())
+            .map(|tr| tr.progress())
+            .unwrap_or(1.0);
 
         div()
             .relative()
@@ -2222,7 +2289,7 @@ impl ProjectList {
                     // 完成标 / 状态灯二选一,**idle 时两个都不画**
                     .map(|el| {
                         if show_done_tag {
-                            el.child(done_tag())
+                            el.child(done_tag(done_tag_in))
                         } else if status != PaneStatus::Idle {
                             // 状态灯的动画 id 拿项目 id 拼:跨帧稳定、逐行唯一
                             el.child(ui::status_dot(
@@ -2283,6 +2350,29 @@ impl ProjectList {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 完成标只在「有完成待看 **且** 不是当前项目」时出现 —— 切过去看了就该没。
+    /// 判据有两个读者(行渲染 + 进场表维护),这条钉住两边共用的那一个。
+    #[test]
+    fn 完成标只给非激活且有完成的项目() {
+        assert!(shows_done_tag(true, false));
+        assert!(!shows_done_tag(true, true), "正看着的项目不挂完成标");
+        assert!(!shows_done_tag(false, false));
+        assert!(!shows_done_tag(false, true));
+    }
+
+    /// 完成标的进场**不在** reduce 豁免名单里(原版 `tagFadeIn` 被通配规则
+    /// 压成瞬时),开着减弱动效时第一帧就是终态。
+    #[test]
+    fn 完成标进场过减弱动效的闸() {
+        let spec = mt_ui::motion::TAG_FADE_IN;
+        assert!(spec.respects_reduce);
+        crate::motion::with_reduce(true, || {
+            let tr = mt_ui::motion::Transition::new(spec);
+            assert_eq!(tr.progress(), 1.0);
+            assert!(!tr.running(), "reduce 下一帧都不该请求");
+        });
+    }
 
     /// 菜单项序照抄原版(去掉功能未建的那几项)。
     ///

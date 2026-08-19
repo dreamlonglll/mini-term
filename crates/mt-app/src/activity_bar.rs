@@ -21,7 +21,7 @@
 //! 移动端那颗由 U 批补上,位置照原版排在「设置」之前。)
 
 use gpui::{
-    AnimationExt as _, AnyElement, Animation, Div, ElementId, InteractiveElement, IntoElement,
+    AnimationExt as _, AnyElement, Animation, Div, ElementId, Hsla, InteractiveElement, IntoElement,
     ParentElement, SharedString, Stateful, StatefulInteractiveElement, Styled, div,
     prelude::FluentBuilder as _, px,
 };
@@ -266,11 +266,10 @@ pub const UPDATE: &[Shape] = &[
 /// 没有激活态也没有左侧竖条,而且右上角恒挂一颗 accent 圆点
 /// (`ActivityBar.tsx:173-182`)。
 ///
-/// ⚠️ **圆点在原版带 `animate-blink`(0.8s 闪烁),这里是静态的**。两条理由:
-/// ① 用户机器的「减少动画」是开着的,原版 `styles.css:391` 的通配 reduce 规则
-///    正好把 `.animate-blink` 停掉 —— 装机版在这台机器上本来就不闪;
-/// ② GPUI 没有媒体查询等价物,要闪就得先有全局「减少动画」闸(并行批在做)。
-///    闸就位后在这里补 `with_animation` 即可,**这里就是唯一挂接点**。
+/// 右上角那颗 accent 圆点带 `animate-blink`(0.8s),与全局 AI 徽标共用
+/// [`corner_dot`]。⚠️ 闪烁过 [`mt_ui::motion`] 的闸:`.animate-blink` **不在**
+/// 原版 reduce 段的豁免名单里,系统开着「减少动画」时装机版本来就不闪 ——
+/// 这里同样静止,见 [`update_dot_blinks`]。
 pub fn update_button(id: impl Into<ElementId>, tip: SharedString) -> Stateful<Div> {
     div()
         .id(id)
@@ -286,20 +285,9 @@ pub fn update_button(id: impl Into<ElementId>, tip: SharedString) -> Stateful<Di
         // 原版 `hover:bg-[var(--accent)]/15`
         .hover(|el| el.bg(ui::with_alpha(ui::accent(), 0.15)))
         .child(VectorIcon::new(UPDATE, px(ICON)).ink(ui::accent()))
-        .child(
-            // `absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-accent
-            //  border border-[var(--bg-surface)]`(位置取值与上方全局 AI 徽标同款)
-            div()
-                .absolute()
-                .top(px(-1.0))
-                .right(px(-1.0))
-                .w(px(8.0))
-                .h(px(8.0))
-                .rounded_full()
-                .border_1()
-                .border_color(ui::bg_surface())
-                .bg(ui::accent()),
-        )
+        // `absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-accent
+        //  border border-[var(--bg-surface)] animate-blink`
+        .child(corner_dot("update-dot", ui::accent(), update_dot_blinks()))
         .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
 }
 
@@ -362,42 +350,62 @@ pub fn strip_button(
 /// ⚠️ 闪烁过 [`crate::motion`] 的闸:原版 reduce 段的通配规则把 `.animate-blink`
 /// 停在第一帧(它**不在**豁免名单里),用户机器上装机版就是不闪的。
 pub fn status_badge(id: impl Into<ElementId>, status: PaneStatus) -> AnyElement {
-    /// 原版 `w-2 h-2`。
-    const SIZE: f32 = 8.0;
-    /// 原版 `-top-0.5 -right-0.5`(Tailwind 的 0.5 = 2px;这里的边框占 1px,
-    /// 与 M 批落地时的取值保持一致)。
-    const INSET: f32 = -1.0;
+    corner_dot(id, ui::status_color(status), badge_blinks(status))
+}
 
-    let badge = div()
+/// 按钮右上角那颗 8px 圆点。全局 AI 徽标([`status_badge`])与「有新版本」按钮
+/// ([`update_button`])共用同一颗,差别只有配色与闪不闪。
+///
+/// `blinking` = 挂 `alertBlink`;停的那一档**整个不挂 `with_animation`** ——
+/// 它会持续请求帧,静态档必须让它从元素树上消失。
+fn corner_dot(id: impl Into<ElementId>, color: Hsla, blinking: bool) -> AnyElement {
+    let dot = div()
         .absolute()
-        .top(px(INSET))
-        .right(px(INSET))
-        .w(px(SIZE))
-        .h(px(SIZE))
+        .top(px(DOT_INSET))
+        .right(px(DOT_INSET))
+        .w(px(DOT_SIZE))
+        .h(px(DOT_SIZE))
         .rounded_full()
         .border_1()
         .border_color(ui::bg_surface())
-        .bg(ui::status_color(status));
+        .bg(color);
 
-    if !badge_blinks(status) {
-        return badge.into_any_element();
+    if !blinking {
+        return dot.into_any_element();
     }
-    badge
-        .with_animation(
-            id.into(),
-            Animation::new(BLINK_PERIOD).repeat(),
-            |el, delta| {
-                let phase = crate::title_bar::blink_phase(delta);
-                let side = SIZE - SIZE * 0.25 * phase;
-                let inset = INSET + (SIZE - side) / 2.0;
-                el.w(px(side))
-                    .h(px(side))
-                    .top(px(inset))
-                    .right(px(inset))
-                    .opacity(1.0 - 0.8 * phase)
-            },
-        )
-        .into_any_element()
+    dot.with_animation(
+        id.into(),
+        Animation::new(BLINK_PERIOD).repeat(),
+        |el, delta| {
+            let (side, inset, opacity) = blink_dot_frame(crate::title_bar::blink_phase(delta));
+            el.w(px(side))
+                .h(px(side))
+                .top(px(inset))
+                .right(px(inset))
+                .opacity(opacity)
+        },
+    )
+    .into_any_element()
+}
+
+/// 原版 `w-2 h-2`。
+const DOT_SIZE: f32 = 8.0;
+/// 原版 `-top-0.5 -right-0.5`(Tailwind 的 0.5 = 2px;这里的边框占 1px,
+/// 与 M 批落地时的取值保持一致)。
+const DOT_INSET: f32 = -1.0;
+
+/// `alertBlink` 这一帧的 **(边长, inset, 不透明度)**。
+///
+/// 原版 `50% { opacity: .2; transform: scale(.75) }`。gpui 没有 transform,
+/// 缩放用「改宽高 + 同步挪 top/right 半个差值」等价 —— 差值补偿是为了绕**中心**
+/// 缩,不补的话圆点会朝右上角缩过去(单测钉的就是这条中心不动)。
+fn blink_dot_frame(phase: f32) -> (f32, f32, f32) {
+    let side = DOT_SIZE - DOT_SIZE * 0.25 * phase;
+    (
+        side,
+        DOT_INSET + (DOT_SIZE - side) / 2.0,
+        1.0 - 0.8 * phase,
+    )
 }
 
 /// `alertBlink` 的周期(原版 `animation: alertBlink 0.8s ease-in-out infinite`)。
@@ -406,6 +414,12 @@ const BLINK_PERIOD: std::time::Duration = std::time::Duration::from_millis(800);
 /// 这一档该不该闪。**纯判定**,单测钉在这上面。
 pub fn badge_blinks(status: PaneStatus) -> bool {
     status == PaneStatus::AiWorking && mt_ui::motion::blinks()
+}
+
+/// 「有新版本」那颗圆点该不该闪。与 AI 徽标**不同档**:原版这颗恒带
+/// `animate-blink`(`ActivityBar.tsx:180`),没有状态之分,只过减弱动效那道闸。
+pub fn update_dot_blinks() -> bool {
+    mt_ui::motion::blinks()
 }
 
 /// 按钮分组之间的细分隔线(原版 `w-6 h-px bg-[var(--border-default)] my-1`)。
@@ -493,5 +507,31 @@ mod tests {
                 assert!(!badge_blinks(s), "减弱动效下 {s:?} 一律不闪");
             }
         });
+    }
+
+    /// 更新圆点**恒闪**(原版没有状态之分),只过减弱动效那道闸。
+    #[test]
+    fn 更新圆点恒闪但过减弱动效的闸() {
+        crate::motion::with_reduce(false, || assert!(update_dot_blinks()));
+        crate::motion::with_reduce(true, || {
+            assert!(!update_dot_blinks(), "减弱动效下装机版本来就不闪")
+        });
+    }
+
+    /// `alertBlink` 的缩放绕**中心**:边长变小的同时 inset 补一半,
+    /// 圆点中心在整轮里一动不动(不补的话会朝右上角缩过去)。
+    #[test]
+    fn 圆点闪烁绕中心缩放() {
+        let center = |(side, inset, _): (f32, f32, f32)| inset + side / 2.0;
+        let at0 = blink_dot_frame(0.0);
+        let at1 = blink_dot_frame(1.0);
+        assert_eq!(at0, (DOT_SIZE, DOT_INSET, 1.0), "相位 0 = 原样");
+        assert!((at1.0 - DOT_SIZE * 0.75).abs() < 1e-6, "相位 1 缩到 75%");
+        assert!((at1.2 - 0.2).abs() < 1e-6, "相位 1 的不透明度 = .2");
+        for i in 0..=20 {
+            let f = blink_dot_frame(i as f32 / 20.0);
+            assert!((center(f) - center(at0)).abs() < 1e-6, "中心挪了:{f:?}");
+            assert!(f.0 > 0.0 && f.2 > 0.0);
+        }
     }
 }

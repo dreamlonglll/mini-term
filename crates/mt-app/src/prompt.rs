@@ -24,14 +24,16 @@
 //! `window.close_dialog` 只弹 Root 的栈、**不会**触发 `on_close`,所以那条路要
 //! 自己摘表,否则该种类再也开不出来。
 
+use std::cell::Cell;
 use std::rc::Rc;
 
 use gpui::{
-    App, AppContext, ClickEvent, IntoElement, ParentElement, SharedString, Styled, Window, div, px,
+    App, AppContext, ClickEvent, Focusable as _, IntoElement, ParentElement, SharedString, Styled,
+    Window, div, px,
 };
 use gpui_component::WindowExt as _;
 use gpui_component::dialog::{Dialog, DialogButtonProps};
-use gpui_component::input::{Input, InputState};
+use gpui_component::input::{Input, InputState, SelectAll};
 
 use crate::i18n::t;
 use crate::overlay;
@@ -102,20 +104,34 @@ pub fn show_prompt(
         return;
     }
     let title = title.into();
+    let default_value = default_value.into();
+    // 原版:`if (defaultValue) input.select()` —— 空默认值不全选(没东西可选)
+    let select_all = Cell::new(!default_value.is_empty());
     let input = cx.new(|cx| {
         InputState::new(window, cx)
             .placeholder(placeholder.into())
-            .default_value(default_value.into())
+            .default_value(default_value)
     });
     // 打开即可直接打字,不必先点一下输入框。
-    //
-    // ⚠️ 原版还会在有默认值时 `input.select()` 全选(重命名多半是整个换掉),
-    // 这里做不到:`InputState::select_all` 是 `pub(super)`,组件库没给公开入口 ——
-    // 只能靠用户自己 Ctrl+A。缺口已记入报告,与 `modal::open_rename_pane` 同一条。
     input.update(cx, |state, cx| state.focus(window, cx));
     let on_ok = Rc::new(on_ok);
 
-    open_guarded(kind::PROMPT, window, cx, move |dialog, _window, _cx| {
+    open_guarded(kind::PROMPT, window, cx, move |dialog, window, cx| {
+        // 「有默认值就全选」(重命名多半是整个换掉)。`InputState::select_all`
+        // 是 `pub(super)`,但它是 `input::SelectAll` 这个**公开 action** 的
+        // handler —— 把动作派发到输入框的焦点节点就等价于用户按了 Ctrl+A。
+        // 时机是唯一的坑:`dispatch_action` 查的是 `rendered_frame` 的 dispatch
+        // tree,而输入框这一刻(builder 正在组装本帧的元素)还没画出来,所以挂
+        // `on_next_frame` —— 它在下一帧开画前跑,那时 `rendered_frame` 正是含
+        // 输入框的这一帧。手法与 `project_list::start_rename` 同一条。
+        //
+        // builder 每帧都会被 Root 调一遍,`Cell` 保证只派发**第一帧**那一次。
+        if select_all.take() {
+            let focus = input.read(cx).focus_handle(cx);
+            window.on_next_frame(move |window, cx| {
+                focus.dispatch_action(&SelectAll, window, cx);
+            });
+        }
         let input_for_ok = input.clone();
         let on_ok = on_ok.clone();
         dialog

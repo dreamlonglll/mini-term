@@ -22,7 +22,7 @@
 //! | `.animate-blink`(状态灯闪烁 / 更新红点 / 中转连接中) | **停** | [`blinks`] |
 //! | `.animate-pulse`(骨架屏) | **停** | [`blinks`] |
 //! | `.animate-glow` | **停** | (GPUI 侧无消费方) |
-//! | `.done-tag` 的 `tagFadeIn` | **停**(压成瞬时) | [`TransitionSpec::new`] |
+//! | `.done-tag` 的 `tagFadeIn` | **停**(压成瞬时) | [`TAG_FADE_IN`] |
 //! | `.toast-card` 的 `toastSlideIn` | **停**(压成瞬时) | [`TOAST_SLIDE_IN`] |
 //! | `.animate-status-spin` / `.animate-spin`(**进行中**指示器) | 继续转,周期放慢到 2.4s | [`spin_period`] |
 //! | 浮层进出场(`.overlay-*` / `.ctx-menu` / `.prompt-*`) | **豁免**,原速播完 | [`OVERLAY_IN`] 等 |
@@ -269,6 +269,55 @@ pub const RANK_BAR: TransitionSpec =
 /// reduce 下由通配规则压成瞬时。
 pub const TOAST_SLIDE_IN: TransitionSpec =
     TransitionSpec::new(Duration::from_millis(250), Easing::EaseOut);
+/// `.done-tag` 的 `tagFadeIn 0.3s ease-out`(`styles.css:522`)。原版**没有**
+/// 豁免它 —— 与 toast 同一档,reduce 下由通配规则压成瞬时。
+pub const TAG_FADE_IN: TransitionSpec =
+    TransitionSpec::new(Duration::from_millis(300), Easing::EaseOut);
+
+// ─── 关键帧的 gpui 近似 ──────────────────────────────────────
+
+/// `menuPopIn` 的起始上移量:`styles.css:280` 的 `translateY(-6px)`。
+pub const MENU_POP_RISE_PX: f32 = 6.0;
+
+/// `menuPopIn` 这一帧的 **(不透明度, 上移像素)** —— 位移是负值,直接喂
+/// `.mt(px(..))`(浮层都挂在 `anchored` 里,边距只挪自己)。
+///
+/// # 刻意丢掉 `scale(0.96)`
+///
+/// 原版关键帧是 `opacity 0 → 1` + `translateY(-6px) → 0` + `scale(0.96) → 1`
+/// (`transform-origin: top left`)。gpui 没有 transform,能等价缩放的只有
+/// **改内边距/尺寸**,而那是会改布局的:菜单项的文字会在这 160ms 里跟着挪,
+/// 悬停缩略图卡里的 `MiniTerminalElement` 每帧按新框反解一次字号。与 pane
+/// 进场同一条取舍(见 `terminal_area::wrap_pane_enter` 的注释)——淡入+位移
+/// 是主信号,4% 缩放不值一次逐帧重排。
+pub fn menu_pop_in(progress: f32) -> (f32, f32) {
+    let p = progress.clamp(0.0, 1.0);
+    (p, -MENU_POP_RISE_PX * (1.0 - p))
+}
+
+/// `tagFadeIn` 这一帧的 **(不透明度, 缩放)**。
+///
+/// 关键帧照抄 `styles.css:531-535`:`0% {opacity:0; scale(.6)}` /
+/// `60% {opacity:1; scale(1.15)}` / `100% {scale(1)}` —— 60% 处**过冲**再回落,
+/// 这一下是它区别于普通淡入的全部。`100%` 那帧没写 opacity,按 CSS 规则从 60%
+/// 起保持元素本身的 1。
+///
+/// 缩放怎么用由调用方定(GPUI 侧的 DONE 标是拿它乘水平内边距 —— 只让药丸
+/// 自己横向呼吸,不动字号、不动行高,免得整行在这 300ms 里抖)。
+pub fn tag_fade_in(progress: f32) -> (f32, f32) {
+    /// 过冲那一帧的时间位置。
+    const PEAK_AT: f32 = 0.6;
+    const START_SCALE: f32 = 0.6;
+    const PEAK_SCALE: f32 = 1.15;
+    let p = progress.clamp(0.0, 1.0);
+    if p < PEAK_AT {
+        let k = p / PEAK_AT;
+        (k, START_SCALE + (PEAK_SCALE - START_SCALE) * k)
+    } else {
+        let k = (p - PEAK_AT) / (1.0 - PEAK_AT);
+        (1.0, PEAK_SCALE + (1.0 - PEAK_SCALE) * k)
+    }
+}
 
 // ─── 一次性过渡 ──────────────────────────────────────────────
 
@@ -595,6 +644,56 @@ mod tests {
             TOAST_SLIDE_IN.respects_reduce,
             "toastSlideIn 在原版 reduce 段没有豁免,必须过闸"
         );
+        assert_eq!(TAG_FADE_IN.duration, Duration::from_millis(300));
+        assert!(
+            TAG_FADE_IN.respects_reduce,
+            "tagFadeIn 在原版 reduce 段没有豁免(注释里被点名当反例),必须过闸"
+        );
+    }
+
+    /// `menuPopIn`:淡入 + 从上方 6px 落位,终点严丝合缝(残留位移会让菜单
+    /// 永远偏一点、残留透明度会让它永远蒙一层)。
+    #[test]
+    fn 菜单进场从上方落位() {
+        let (a0, dy0) = menu_pop_in(0.0);
+        assert_eq!(a0, 0.0);
+        assert_eq!(dy0, -MENU_POP_RISE_PX, "起点在终位上方 6px");
+        let (a1, dy1) = menu_pop_in(1.0);
+        assert_eq!(a1, 1.0);
+        assert_eq!(dy1, 0.0);
+        // 越界一律钳住
+        assert_eq!(menu_pop_in(1.5), (1.0, 0.0));
+        assert_eq!(menu_pop_in(-1.0), (0.0, -MENU_POP_RISE_PX));
+        // 半程:位移与不透明度都过半
+        let (a, dy) = menu_pop_in(0.5);
+        assert!((a - 0.5).abs() < 1e-6);
+        assert!((dy + 3.0).abs() < 1e-6, "{dy}");
+    }
+
+    /// `tagFadeIn` 的过冲:60% 处到 1.15 再回落到 1,不透明度**提前**到顶。
+    #[test]
+    fn 完成标进场先过冲再回落() {
+        let (a0, s0) = tag_fade_in(0.0);
+        assert_eq!(a0, 0.0);
+        assert!((s0 - 0.6).abs() < 1e-6);
+        let (a_peak, s_peak) = tag_fade_in(0.6);
+        assert!((a_peak - 1.0).abs() < 1e-6, "60% 处已经全不透明");
+        assert!((s_peak - 1.15).abs() < 1e-6, "60% 处是过冲顶点");
+        let (a1, s1) = tag_fade_in(1.0);
+        assert_eq!(a1, 1.0);
+        assert!((s1 - 1.0).abs() < 1e-6, "终点必须正好回到 1,不许停在 1.15");
+        // 越界钳住 + 前段单调涨、后段单调落
+        assert_eq!(tag_fade_in(2.0), tag_fade_in(1.0));
+        assert_eq!(tag_fade_in(-1.0), tag_fade_in(0.0));
+        assert!(tag_fade_in(0.3).1 < tag_fade_in(0.5).1);
+        assert!(tag_fade_in(0.7).1 > tag_fade_in(0.9).1);
+        // 不透明度全程不回头
+        let mut prev = -1.0;
+        for i in 0..=40 {
+            let a = tag_fade_in(i as f32 / 40.0).0;
+            assert!(a >= prev - 1e-6, "在 {i} 处回头了");
+            prev = a;
+        }
     }
 
     #[test]

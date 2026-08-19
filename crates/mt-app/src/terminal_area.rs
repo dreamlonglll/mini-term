@@ -100,8 +100,9 @@ pub struct TerminalArea {
     hovered_tab: Option<String>,
     /// 被悬停 tab 的屏幕矩形(只给悬停中的那个挂 `canvas` 量)。
     tab_hover_rect: Option<Bounds<Pixels>>,
-    /// 缩略图开在哪个 tab 上 + 弹出那一刻的矩形。
-    tab_preview: Option<(String, Bounds<Pixels>)>,
+    /// 缩略图开在哪个 tab 上 + 弹出那一刻的矩形 + 卡片进场(`menuPopIn`)。
+    /// 进场状态与这一份同生共死:收起时一起没,下次悬停从头播。
+    tab_preview: Option<(String, Bounds<Pixels>, mt_ui::motion::Transition)>,
     /// 250ms 计时 + 开着之后的 500ms 续活节拍。**丢掉句柄等于 `clearTimeout`**。
     _tab_preview_task: Option<Task<()>>,
 }
@@ -362,7 +363,11 @@ impl TerminalArea {
                     let Some(rect) = this.tab_hover_rect else {
                         return false;
                     };
-                    this.tab_preview = Some((pane_id.clone(), rect));
+                    this.tab_preview = Some((
+                        pane_id.clone(),
+                        rect,
+                        mt_ui::motion::Transition::new(mt_ui::motion::MENU_IN),
+                    ));
                     cx.notify();
                     true
                 })
@@ -399,9 +404,11 @@ impl TerminalArea {
     fn render_tab_preview(
         &mut self,
         layout: &SplitNode,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let (pane_id, rect) = self.tab_preview.clone()?;
+        let (pane_id, rect, fade) = self.tab_preview.clone()?;
+        let fade = fade.drive(window);
         let store = self.store.read(cx);
         let leaf = layout.leaf_of_pane(&pane_id);
         let still_hidden = match leaf {
@@ -421,7 +428,7 @@ impl TerminalArea {
                     .position(pane_preview::tab_anchor(rect))
                     // 「底下放不下就翻到 tab 上方」由贴边收拢代劳
                     .snap_to_window_with_margin(px(6.0))
-                    .child(pane_preview::tab_preview_card(&info, &style)),
+                    .child(pane_preview::tab_preview_card(&info, &style, fade)),
             )
             .with_priority(1)
             .into_any_element(),
@@ -1578,10 +1585,20 @@ impl Render for TerminalArea {
                                 .collect();
                             menu::show(click_position(event, window), entries, window, cx);
                         }))
-                        .child(format!(
-                            "+ {}  (Ctrl+Shift+T)",
-                            t("terminalArea", "newTerminal")
-                        )),
+                        .child(format!("+ {}", t("terminalArea", "newTerminal"))),
+                )
+                // 键位提示是**独立一行**(原版 `TerminalArea.tsx:85-88`):
+                // 「也可以按」+ 一颗键帽,不是塞进按钮文字里的括号。串从键位表取,
+                // 改键位不会漏这里(与首启引导同一条路)。
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .text_size(ui::font_px(11.0))
+                        .text_color(ui::text_muted())
+                        .child(t("terminalArea", "emptyHint"))
+                        .child(ui::kbd(crate::hotkeys::hotkey_label("newTerminal"))),
                 );
         };
 
@@ -1601,7 +1618,7 @@ impl Render for TerminalArea {
         // 浮层在分屏树**之后**组装:它要读 render_node 刚更新过的 pane 矩形,
         // 而且要画在所有常规内容之上(deferred priority 1)
         let marker_popover = self.render_marker_popover(&layout, window, cx);
-        let tab_preview = self.render_tab_preview(&layout, cx);
+        let tab_preview = self.render_tab_preview(&layout, window, cx);
         let this = cx.entity();
         div()
             .size_full()

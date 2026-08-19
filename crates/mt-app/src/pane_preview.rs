@@ -21,9 +21,12 @@
 //!    等价且可单测。
 //! 2. **「已断开」判据取 [`AppStore::is_pty_exited`]**,那是本批新补的
 //!    `exitedPtyIds` 等价物(`pty-exit` 登记),与原版同一时机同一集合。
-//! 3. 原版卡上有 `menuPopIn` 淡入进场(在 `prefers-reduced-motion` 豁免名单里)。
-//!    这里**直接出现**,不做过渡 —— 一次性过渡基件还没有(审计 #17 的遗留),
-//!    要补时挂点就是 [`project_preview_card`] / [`tab_preview_card`] 的最外层 div。
+//! 3. 原版卡上的 `menuPopIn` 进场(在 `prefers-reduced-motion` 豁免名单里)
+//!    已经补上,**只是不缩放**:两张卡都收一个 `progress` 入参,由持有
+//!    [`mt_ui::motion::Transition`] 的调用方(项目列表 / 终端区)喂进来 ——
+//!    卡本身是纯函数,没有地方挂状态。`scale(0.96)` 丢掉的理由见
+//!    [`mt_ui::motion::menu_pop_in`](缩放在 gpui 里只能改尺寸,而这张卡里
+//!    `MiniTerminalElement` 会跟着每帧反解一次字号)。
 
 use std::sync::Arc;
 
@@ -356,13 +359,19 @@ fn mini_node(layout: &MiniLayout, style: &TerminalStyle, area: Size<Pixels>) -> 
 }
 
 /// 卡片外壳:半透明底 + 强边框 + 阴影(与 `.ctx-menu` 同配方)。
-fn card_shell() -> Div {
+///
+/// `progress` 是 `menuPopIn` 这一帧的进度(1.0 = 已就位)。两张卡都挂在
+/// `anchored` 里,负 margin 只挪自己、不影响任何别的东西。
+fn card_shell(progress: f32) -> Div {
+    let (opacity, dy) = mt_ui::motion::menu_pop_in(progress);
     div()
         .rounded(px(6.0))
         .border_1()
         .border_color(ui::border_strong())
         .bg(ui::bg_overlay())
         .shadow_lg()
+        .opacity(opacity)
+        .mt(px(dy))
 }
 
 /// 项目行悬停卡。`layout` 为 `None` 时画「尚未打开过终端」占位
@@ -372,9 +381,10 @@ pub fn project_preview_card(
     project_path: &str,
     layout: Option<&MiniLayout>,
     style: &TerminalStyle,
+    progress: f32,
 ) -> AnyElement {
     let board_area = size(px(CARD_WIDTH - BOARD_PAD * 2.0), px(BOARD_HEIGHT));
-    card_shell()
+    card_shell(progress)
         .w(px(CARD_WIDTH))
         // 卡头:项目名 + 绝对路径。原版把路径从行 title 挪到这里 ——
         // 原生 tooltip 会盖住浮层
@@ -429,9 +439,9 @@ pub fn project_preview_card(
 }
 
 /// 非激活 tab 悬停卡(单格版,无卡头、无标签条 —— 原版就只有画面与断开遮罩)。
-pub fn tab_preview_card(info: &MiniPaneInfo, style: &TerminalStyle) -> AnyElement {
+pub fn tab_preview_card(info: &MiniPaneInfo, style: &TerminalStyle, progress: f32) -> AnyElement {
     let area = size(px(TAB_CARD_WIDTH), px(TAB_CARD_HEIGHT));
-    card_shell()
+    card_shell(progress)
         .relative()
         .w(area.width)
         .h(area.height)

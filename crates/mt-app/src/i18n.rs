@@ -600,6 +600,7 @@ const USED_KEYS: &[&str] = &[
     "terminal.dropToInsertPath",
     "terminal.paste",
     "terminal.pasteUploadFailed",
+    "terminalArea.emptyHint",
     "terminalArea.emptyTitle",
     "terminalArea.newTerminal",
     // 提交行的相对时间。命名空间是 **`time`**,不是会话面板那套

@@ -21,12 +21,14 @@
 //! 设置面板(原来那个单页「终端配置」对话框)已经拆去 [`crate::settings`] ——
 //! 它是两级侧栏 + 10 个分页的独立视图,与这里三个「只给标题和文案」的小弹窗不同形。
 
+use std::cell::Cell;
+
 use gpui::{
-    App, AppContext, ClickEvent, Entity, ParentElement, PathPromptOptions,
+    App, AppContext, ClickEvent, Entity, Focusable as _, ParentElement, PathPromptOptions,
     StatefulInteractiveElement, Styled, Window, div, px,
 };
 use gpui_component::dialog::DialogButtonProps;
-use gpui_component::input::{Input, InputState};
+use gpui_component::input::{Input, InputState, SelectAll};
 
 use crate::i18n::t;
 use crate::prompt::{kind, open_guarded};
@@ -47,6 +49,9 @@ pub fn open_rename_pane(
     window: &mut Window,
     cx: &mut App,
 ) {
+    // 原版这条走的是同一个 `showPrompt`(`paneActions.ts:310`,标题当默认值),
+    // 于是也吃到那句 `if (defaultValue) input.select()`
+    let select_all = Cell::new(!current.is_empty());
     let input = cx.new(|cx| {
         InputState::new(window, cx)
             .placeholder(t("fileTree", "prompt.renameMessage"))
@@ -55,7 +60,14 @@ pub fn open_rename_pane(
     // 打开即可直接改名,不必先点一下输入框
     input.update(cx, |state, cx| state.focus(window, cx));
 
-    open_guarded(kind::RENAME_PANE, window, cx, move |dialog, _window, _cx| {
+    open_guarded(kind::RENAME_PANE, window, cx, move |dialog, window, cx| {
+        // 有默认值就全选。手法与时机见 `prompt::show_prompt` 里那段注释
+        if select_all.take() {
+            let focus = input.read(cx).focus_handle(cx);
+            window.on_next_frame(move |window, cx| {
+                focus.dispatch_action(&SelectAll, window, cx);
+            });
+        }
         let store = store.clone();
         let project_id = project_id.clone();
         let pane_id = pane_id.clone();
