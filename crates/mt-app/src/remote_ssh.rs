@@ -1,0 +1,1596 @@
+//! SSH 远程项目的服务层(audit #28 的后端半场,BB-a 批)。
+//!
+//! 自 `src-tauri/src/remote_ssh.rs`(1392 行)逐字等价移植。通过共享 crate
+//! `mt-ssh` 的 russh 持久会话池 + SFTP 只读原语,为「远程项目」提供五个能力:
+//!
+//! | 原版 command | 本模块入口 |
+//! |---|---|
+//! | `ssh_remote_list_directory` | [`list_directory`] |
+//! | `ssh_remote_validate_dir` | [`validate_dir`] |
+//! | `ssh_remote_upload_paste` | [`upload_paste`] |
+//! | `ssh_remote_ai_sessions` | [`ai_sessions`] |
+//! | `ssh_remote_ai_session_content` | [`ai_session_content`] |
+//!
+//! # 线程口径(与 Tauri 版的唯一结构性差异)
+//!
+//! 原版是 `#[tauri::command(async)]`,跑在 Tauri 自带的全局 tokio runtime 上。
+//! GPUI 没有 tokio,主线程也不能阻塞,于是:
+//!
+//! - **本模块自持一个小 tokio 运行时**(见 [`RemoteSshState`] 的 `runtime`),
+//!   与 `mt_relay::MobileRelayManager` 的 `Owned` 分支同一路数 —— 懒建、2 个
+//!   工作线程、进程内唯一;
+//! - **公开入口全是同步阻塞函数**,内部 `block_on`。调用方(BB-b 的视图层)
+//!   **必须**把它们丢进 `cx.background_executor().spawn(...)`,与 `mt_project::git`
+//!   / `pricing::fetch_models_dev` 同一条纪律。主线程直接调 = 卡界面。
+//!   为什么不做成 `async fn` 让 gpui 的执行器 await:那样整条链路要一个
+//!   tokio-compat 的反应堆(russh 的 IO 依赖 tokio driver),不如把 tokio 的边界
+//!   收在本模块内部一层。
+//!
+//! # 池 / 缓存的归属
+//!
+//! 池按 `connection.id` 全局复用,故 [`RemoteSshState`] 是**进程级单例**
+//! ([`state()`]),不挂在 `AppStore` 上 —— 后台任务拿不到 `Entity<AppStore>`,
+//! 而这些函数就是给后台跑的。会话列表缓存复用 `mt_ai::sessions::session_cache()`
+//! 那张全局表(与原版共用同一份、key 掺 `ssh|<connId>|<path>`)。
+//!
+//! # 契约(对齐 spec/backend/wsl-unc-session-scanning.md,一字未改)
+//!
+//! - 缓存锁即取即放,**绝不跨 SFTP 慢 IO 持锁**;
+//! - 会话扫描一切失败静默降级为空列表(不弹错、不 panic);
+//!   文件树 / 目录验证 / 正文读取失败返回明确 `Err(String)`。
+//!
+//! # 连接从哪里来
+//!
+//! 原版每个 command 自己 `read_config(app)` 再按 id 找连接。GPUI 侧配置活在
+//! 主线程的 `AppStore` 里,后台任务读不到,于是**调用方在主线程取好
+//! [`SshConnection`] 再传进来** —— 断链(连接已删)判定前移到
+//! [`find_connection`],它是纯函数、有单测。
+
+// ⚠️ BB-a 只做数据层/服务层,本模块的消费方(BB-b 的三个 Modal + 远程项目 UI +
+// 断线遮罩 + 文件树/会话面板的远程分流)还不存在,`dead_code` 会把整份公开
+// API 报成未使用。**BB-b 接完线后删掉这一行** —— 留着会把「某个入口忘了接」
+// 也一并盖住。
+#![allow(dead_code)]
+
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
+
+use mt_ai::sessions::{
+    AiSession, AiSessionMessage, CachedSessions, MAX_SESSIONS_PER_SOURCE, MAX_TOTAL_SESSIONS,
+    claude_message_from_line, claude_session_info_from_lines, codex_message_from_line,
+    codex_meta_from_line, codex_user_title_from_line, encode_project_path, is_encoded_variant,
+    normalize_unix_path, session_cache, session_id_path_safe,
+};
+use mt_config::SshConnection;
+use mt_project::fs::{ALWAYS_IGNORE, FileEntry, TextGitignore, natural_cmp};
+use mt_ssh::{CachedSession, SftpHandle, SshPool};
+
+/// SFTP 协议层每请求超时(readdir / stat / 单个 read 包)。
+/// 默认仅 10s 且逐请求计时(见 spec/backend/russh-sftp-file-transfer.md 坑 1),
+/// 这里放宽到 20s 覆盖慢链路;整体不设长窗口——只读操作单包粒度小。
+const SFTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+/// 建立(或复用)SSH session 的外层超时:TCP 连接 + 握手 + 认证。
+const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
+/// 粘贴上传的**单请求**超时(`run_sftp_upload_on_session` 把它转成
+/// `SftpSession::set_timeout`,不是整段传输的上限)。慢链路下单个 chunk 包
+/// 不该把整段打断,故比只读的 20s 宽。
+const PASTE_UPLOAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// 粘贴上传的**整体**墙钟上限。必须显式加 —— 上层在上传期间用 in-flight 去重
+/// 挡住重复 Ctrl+V,如果这里没有硬上限,一次卡死的传输会让该 pane 的粘贴
+/// 静默失效且永不恢复。用户此刻正盯着「按了 Ctrl+V 还没出路径」,宁可早报错。
+const PASTE_UPLOAD_TOTAL_TIMEOUT: Duration = Duration::from_secs(90);
+/// 根 `.gitignore` 读取上限。超大 .gitignore 截断(极端场景,规则少截无妨)。
+const GITIGNORE_MAX_BYTES: usize = 256 * 1024;
+/// 远程会话列表缓存 TTL(对齐 WSL 会话的 10s;`force=true` 绕过)。
+const REMOTE_SESSION_CACHE_TTL: Duration = Duration::from_secs(10);
+/// 远程扫描上限:SFTP 逐文件网络往返,全量扫描不可接受(对齐 WSL 侧下调值)。
+const REMOTE_CLAUDE_SCAN_LIMIT: usize = 100;
+const REMOTE_CODEX_SCAN_LIMIT: usize = 200;
+/// Claude 会话标题提取:读文件头部的字节上限(首条 user 消息几乎总在最前面,
+/// 但个别文件首行是巨大的 file-history-snapshot,给足余量)。
+const CLAUDE_TITLE_HEAD_BYTES: usize = 256 * 1024;
+/// Codex 会话 meta + 标题提取:session_meta 在第 1 行,64KB 覆盖含长 instructions 的情况。
+const CODEX_META_HEAD_BYTES: usize = 64 * 1024;
+/// codex session_index.jsonl(thread_name 映射)读取上限。
+const SESSION_INDEX_MAX_BYTES: usize = 1024 * 1024;
+/// 会话正文单次增量读取上限;更多内容由调用方带 next_offset 再次调用。
+const CONTENT_CHUNK_MAX_BYTES: usize = 8 * 1024 * 1024;
+/// 变体目录 cwd 精确校验:读任一 jsonl 头部的字节上限。
+const CWD_PROBE_HEAD_BYTES: usize = 64 * 1024;
+
+/// 远程粘贴落盘目录的缺省值(与 `mt_config::default_remote_paste_dir` 同值)。
+/// 单独一份常量是为了纯函数 [`resolve_paste_dir`] 不必依赖 mt-config。
+const DEFAULT_REMOTE_PASTE_DIR: &str = ".mini-term/pasted";
+
+// ---------------------------------------------------------------------------
+// 进程级状态(池 + 缓存 + tokio 运行时)
+// ---------------------------------------------------------------------------
+
+/// 远程 SSH 的进程级状态。原版是 Tauri managed state,这里是 [`state()`] 后面的
+/// 全局单例 —— 后台任务拿不到 `Entity<AppStore>`,而所有 SFTP 调用都在后台。
+pub struct RemoteSshState {
+    /// 懒初始化的 tokio 运行时。russh / russh-sftp 的 IO 依赖 tokio driver,
+    /// gpui 的执行器喂不动它们,只能自持一个。
+    ///
+    /// 2 个工作线程:全部操作都是网络等待型,与 `mt_relay` 的 `Owned` 分支同值。
+    /// **不主动 shutdown**(见 [`RemoteSshState::shutdown_pool_blocking`] 的注释)。
+    runtime: Mutex<Option<Arc<tokio::runtime::Runtime>>>,
+    /// 懒初始化的 russh 会话池。session 按 `connection.id` 全局复用。
+    pool: Mutex<Option<Arc<SshPool>>>,
+    /// 远程项目根 `.gitignore` 编译结果缓存,key = `<connId>|<projectRoot 小写>`。
+    gitignore_cache: Mutex<HashMap<String, Arc<TextGitignore>>>,
+    /// 远程 `$HOME` 缓存(SFTP canonicalize(".")),key = connection id。
+    home_cache: Mutex<HashMap<String, String>>,
+    /// 会话 id → 远程文件路径映射(列表扫描时填充,正文读取直接命中免再扫)。
+    session_paths: Mutex<HashMap<String, String>>,
+}
+
+/// std Mutex 取锁,poisoned 时取回内部数据继续(缓存均可容忍脏读,绝不 panic)。
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl RemoteSshState {
+    pub fn new() -> Self {
+        Self {
+            runtime: Mutex::new(None),
+            pool: Mutex::new(None),
+            gitignore_cache: Mutex::new(HashMap::new()),
+            home_cache: Mutex::new(HashMap::new()),
+            session_paths: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// 拿(或懒建)tokio 运行时。建不起来时返回明确错误 —— 全部远程能力随之
+    /// 报错,而不是 panic 掉整个应用。
+    fn runtime(&self) -> Result<Arc<tokio::runtime::Runtime>, String> {
+        let mut guard = lock(&self.runtime);
+        if let Some(rt) = guard.as_ref() {
+            return Ok(rt.clone());
+        }
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .thread_name("mt-remote-ssh")
+            .build()
+            .map_err(|e| format!("SSH 运行时不可用: {e}"))?;
+        let rt = Arc::new(rt);
+        *guard = Some(rt.clone());
+        Ok(rt)
+    }
+
+    /// 拿(或懒建)会话池。
+    ///
+    /// **前置**:必须在 tokio runtime 上下文中调用(`SshPool` 构造要 spawn 后台
+    /// reaper task)——本模块只在 [`block_on`](Self::block_on) 内部调用,天然满足。
+    fn pool(&self) -> Arc<SshPool> {
+        let mut guard = lock(&self.pool);
+        guard
+            .get_or_insert_with(|| Arc::new(SshPool::new()))
+            .clone()
+    }
+
+    /// 在自持运行时上跑一段 future 到完成(**阻塞当前线程**)。
+    ///
+    /// 这就是「同步入口 + 内部 tokio」那层胶水:调用方在
+    /// `background_executor` 的线程上调它,阻塞的是那条后台线程。
+    fn block_on<F, T>(&self, fut: F) -> Result<T, String>
+    where
+        F: std::future::Future<Output = Result<T, String>>,
+    {
+        let rt = self.runtime()?;
+        rt.block_on(fut)
+    }
+
+    /// app 退出时优雅关池:abort reaper + 并发 disconnect 全部 session
+    /// (单 session 2s 超时,不 hang 退出)。池未初始化则 no-op。
+    ///
+    /// 运行时**故意不 shutdown**:`Runtime::drop` 会等所有阻塞任务收尾,在退出
+    /// 路径上是净风险(mt-relay 的同款决策见其 U 批记档)。池 drain 完进程就走了。
+    pub fn shutdown_pool_blocking(&self) {
+        let pool = lock(&self.pool).take();
+        let Some(pool) = pool else { return };
+        let Ok(rt) = self.runtime() else { return };
+        eprintln!("[remote-ssh] draining ssh session pool on exit");
+        rt.block_on(async move {
+            pool.shutdown().await;
+        });
+    }
+}
+
+impl Default for RemoteSshState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// 进程级单例。首次取用时构造(不建运行时、不建池,那两步各自更懒)。
+pub fn state() -> &'static RemoteSshState {
+    static STATE: OnceLock<RemoteSshState> = OnceLock::new();
+    STATE.get_or_init(RemoteSshState::new)
+}
+
+/// 退出钩子:优雅关池。对应原版 `lib.rs` 在 `RunEvent::Exit` 里的那一调。
+pub fn shutdown_on_exit() {
+    state().shutdown_pool_blocking();
+}
+
+// ---------------------------------------------------------------------------
+// 连接查找 / session 编排
+// ---------------------------------------------------------------------------
+
+/// 按 id 从连接表找连接。找不到 = 「断链」(连接被删除),给明确错误。
+///
+/// 原版在每个 command 里 `read_config(app)` 后现找;GPUI 侧由主线程从
+/// `AppStore::config().ssh_connections` 取好再调这里,判定与文案一字不变。
+pub fn find_connection(
+    connections: &[SshConnection],
+    connection_id: &str,
+) -> Result<SshConnection, String> {
+    connections
+        .iter()
+        .find(|c| c.id == connection_id)
+        .cloned()
+        .ok_or_else(|| format!("SSH 连接不存在或已被删除 (id={connection_id})"))
+}
+
+/// 从池里拿一条可用 session(带外层超时 + gatetime cooldown 检查)。
+async fn acquire_session(
+    pool: &SshPool,
+    conn: &SshConnection,
+) -> Result<Arc<CachedSession>, String> {
+    let session = tokio::time::timeout(ACQUIRE_TIMEOUT, pool.acquire(conn))
+        .await
+        .map_err(|_| format!("连接 {} 超时({}s)", conn.host, ACQUIRE_TIMEOUT.as_secs()))??;
+    if session.is_unhealthy_now() {
+        return Err("SSH 会话处于冷却期(上次失败后短时间内不再重试),请稍后再试".into());
+    }
+    Ok(session)
+}
+
+/// 开一个 SFTP 会话句柄,**并把承载它的 session 一并返回**。
+/// transport 级失败(死链 race)evict + 重连再试一次,与 mt-ssh-mcp 的
+/// exec/transfer 编排同构。
+///
+/// 需要 session 的场景只有上传(`run_sftp_upload_on_session` 自己另开 channel,
+/// 但要拿同一条已认证 session);只读场景用下面的 [`open_sftp`] 丢掉它即可。
+async fn open_sftp_with_session(
+    st: &RemoteSshState,
+    conn: &SshConnection,
+) -> Result<(Arc<CachedSession>, SftpHandle), String> {
+    let pool = st.pool();
+    let session = acquire_session(&pool, conn).await?;
+    match SftpHandle::open_on_session(&session, SFTP_REQUEST_TIMEOUT).await {
+        Ok(h) => {
+            session.touch();
+            Ok((session, h))
+        }
+        Err(e) if e.is_transport() => {
+            eprintln!("[remote-ssh] sftp open failed (transport), retrying once: {e}");
+            pool.evict(&conn.id).await;
+            let session2 = acquire_session(&pool, conn).await?;
+            let h = SftpHandle::open_on_session(&session2, SFTP_REQUEST_TIMEOUT)
+                .await
+                .map_err(|e| e.message().to_string())?;
+            session2.touch();
+            Ok((session2, h))
+        }
+        Err(e) => Err(e.message().to_string()),
+    }
+}
+
+/// 开一个 SFTP 会话句柄(只读路径用,不需要 session 本身)。
+async fn open_sftp(st: &RemoteSshState, conn: &SshConnection) -> Result<SftpHandle, String> {
+    Ok(open_sftp_with_session(st, conn).await?.1)
+}
+
+/// 远程 `$HOME`(SFTP canonicalize(".")),按连接缓存。锁即取即放。
+async fn remote_home(
+    st: &RemoteSshState,
+    sftp: &SftpHandle,
+    conn_id: &str,
+) -> Result<String, String> {
+    if let Some(h) = lock(&st.home_cache).get(conn_id).cloned() {
+        return Ok(h);
+    }
+    let home = sftp
+        .canonicalize(".")
+        .await
+        .map_err(|e| format!("获取远程 home 目录失败: {}", e.message()))?;
+    lock(&st.home_cache).insert(conn_id.to_string(), home.clone());
+    Ok(home)
+}
+
+// ---------------------------------------------------------------------------
+// 远程 pane 的启动器(原 `src-tauri/src/pty.rs::prepare_ssh_remote_launch`)
+// ---------------------------------------------------------------------------
+
+/// 远程启动器的最终形态:spawn 的程序、参数与(可选)用于 autofill 预注册的密码。
+///
+/// argv 拼装本身在 `mt_pty::ssh`(那一层只关心「用什么 argv 起子进程」);
+/// 这里负责**查连接 → 探 ssh 客户端 → 私钥临时副本**这三件配置层的事,
+/// 与原版 `prepare_ssh_remote_launch` 的分工一字不差。
+#[derive(Debug, Clone)]
+pub struct RemoteLaunch {
+    pub program: String,
+    pub args: Vec<String>,
+    /// 明文登录密码(配置里没填则 `None`)。只交给 PTY 的 autofill 状态机,
+    /// 不进 argv、不进环境变量、不写日志。
+    pub password: Option<String>,
+}
+
+/// 把「连接 + 远程路径」解析成可 spawn 的远程启动器。
+///
+/// 失败面(两条,都给可直接展示的中文):
+/// - 本机没有 OpenSSH 客户端;
+/// - 私钥文件不存在 / 复制临时副本失败(`mt_core::prepare_ssh_key`)。
+///
+/// **断链**(连接被删)由更早的 [`find_connection`] 挡下,不在本函数里。
+pub fn prepare_remote_launch(
+    conn: &SshConnection,
+    remote_path: &str,
+) -> Result<RemoteLaunch, String> {
+    let ssh_program = mt_pty::ssh::find_ssh_client().ok_or_else(|| {
+        "未找到 ssh 客户端(OpenSSH)。Windows 10+ 可在「设置 → 系统 → 可选功能」中安装 \
+        「OpenSSH 客户端」后重试"
+            .to_string()
+    })?;
+
+    // 私钥复制为权限收紧的临时副本(绕过 OpenSSH 的 UNPROTECTED PRIVATE KEY 拒绝),
+    // 复用既有 prepare_ssh_key;失败(源文件不存在等)直接报错。
+    let identity = match conn
+        .identity_file
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(path) => Some(mt_core::prepare_ssh_key(path)?),
+        None => None,
+    };
+
+    let args = mt_pty::ssh::build_ssh_launcher_args(
+        &conn.host,
+        conn.port,
+        &conn.user,
+        identity.as_deref(),
+        remote_path,
+    );
+
+    Ok(RemoteLaunch {
+        program: ssh_program.to_string_lossy().into_owned(),
+        args,
+        password: conn.password.clone().filter(|p| !p.is_empty()),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// POSIX 路径纯函数(单测覆盖)
+// ---------------------------------------------------------------------------
+
+/// POSIX 路径拼接。`dir` 为绝对路径;根目录 `/` 不产生双斜杠。
+pub fn join_posix(dir: &str, name: &str) -> String {
+    let d = dir.trim_end_matches('/');
+    if d.is_empty() {
+        format!("/{name}")
+    } else {
+        format!("{d}/{name}")
+    }
+}
+
+/// 计算 `full` 相对 `root` 的 POSIX 相对路径。不在 root 下返回 None。
+/// **匹配 gitignore 必须用相对路径**:Windows 的 `Path` 语义对 POSIX 绝对路径
+/// 有歧义(`/a/b` 在 Windows 上不是绝对路径),相对路径两平台行为一致。
+pub fn posix_relative(root: &str, full: &str) -> Option<String> {
+    let root_t = root.trim_end_matches('/');
+    let full_t = full.trim_end_matches('/');
+    if root_t.is_empty() {
+        // root 是 `/`
+        return Some(full_t.trim_start_matches('/').to_string());
+    }
+    if full_t == root_t {
+        return Some(String::new());
+    }
+    full_t
+        .strip_prefix(root_t)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .map(str::to_string)
+}
+
+/// 把 `~` / `~/xxx` 展开为远程绝对路径(home 来自 SFTP canonicalize(".")).
+/// 空输入视同 `~`;非 `~` 前缀原样返回(交给 SFTP canonicalize 处理相对路径)。
+fn expand_tilde(path: &str, home: &str) -> String {
+    let home_t = home.trim_end_matches('/');
+    let home_norm = if home_t.is_empty() { "/" } else { home_t };
+    let p = path.trim();
+    if p.is_empty() || p == "~" {
+        return home_norm.to_string();
+    }
+    if let Some(rest) = p.strip_prefix("~/") {
+        let rest = rest.trim_start_matches('/');
+        if rest.is_empty() {
+            return home_norm.to_string();
+        }
+        return join_posix(home_norm, rest);
+    }
+    p.to_string()
+}
+
+/// 把配置里的「远程粘贴落盘目录」解析成远端绝对路径。
+///
+/// 三种写法(对齐 `AppConfig::remote_paste_dir` 的文档):
+/// - 相对路径 `.mini-term/pasted` → 相对**项目根**展开(默认形态,图片落项目内)
+/// - `~` / `~/xxx` → 远程 home 展开
+/// - 绝对路径 `/tmp/mini-term` → 原样
+///
+/// **保证返回的路径不含 `..` 段**。这条路径最终会拼进 SFTP **写**操作 ——
+/// 逃出项目根 / home 的写入不是这个功能该有的能力,宁可报错。
+/// 判定放在归一之后,`project_path`(调用方传入)带 `..` 的情形一并挡掉,
+/// 而不只是校验用户填的 `dest_dir`。
+fn resolve_paste_dir(project_path: &str, home: &str, dest_dir: &str) -> Result<String, String> {
+    // 用户可能顺手填了反斜杠,统一成 POSIX 分隔符再判定。
+    let raw = dest_dir.trim().replace('\\', "/");
+    let raw = if raw.trim().is_empty() {
+        DEFAULT_REMOTE_PASTE_DIR.to_string()
+    } else {
+        raw
+    };
+
+    let abs = if raw.starts_with('/') {
+        raw.clone()
+    } else if raw == "~" || raw.starts_with("~/") {
+        expand_tilde(&raw, home)
+    } else {
+        // 相对项目根。项目根必须是绝对路径(添加远程项目时已 canonicalize)。
+        if !project_path.starts_with('/') {
+            return Err(format!("远程项目路径不是绝对路径: {project_path}"));
+        }
+        join_posix(project_path, raw.trim_start_matches('/'))
+    };
+
+    // 归一:丢掉空段与 `.` 段。`./x` 和 `x` 必须解析成同一条路径,否则
+    // `/proj/.` 这种写法会绕过下游「目录是否严格位于项目内」的判定。
+    // 注意 `.` / `..` 都是**整段**比较,`.mini-term` 这类点开头的目录名不受影响。
+    let normalized: Vec<&str> = abs
+        .split('/')
+        .filter(|seg| !seg.is_empty() && *seg != ".")
+        .collect();
+    if normalized.is_empty() {
+        return Err("远程粘贴目录解析为空".into());
+    }
+    // 归一后再查 `..`:此时 dest_dir 与 project_path 两部分都已合入 abs,
+    // 一处判定覆盖两个来源。
+    if normalized.contains(&"..") {
+        return Err("远程粘贴目录不能包含 `..`".into());
+    }
+    Ok(format!("/{}", normalized.join("/")))
+}
+
+/// 从本地临时文件路径提取文件名。两种分隔符都切 —— 传进来的是 Windows 路径,
+/// 不能让 `\` 残留在远端路径里。
+fn paste_file_name(local_path: &str) -> Result<String, String> {
+    let name = local_path.rsplit(['/', '\\']).next().unwrap_or("").trim();
+    if name.is_empty() || name == "." || name == ".." {
+        return Err(format!("无法从本地路径提取文件名: {local_path}"));
+    }
+    Ok(name.to_string())
+}
+
+/// UNIX 秒 → ISO 8601 UTC 字符串(`YYYY-MM-DDTHH:MM:SSZ`)。
+/// 会话缺失 timestamp 字段时用文件 mtime 兜底,保证时间混排仍可比较。
+fn unix_secs_to_iso(secs: u64) -> String {
+    let days = secs / 86_400;
+    let tod = secs % 86_400;
+    let (hh, mm, ss) = (tod / 3600, (tod % 3600) / 60, tod % 60);
+
+    fn is_leap(year: u64) -> bool {
+        (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
+    }
+    let mut year = 1970u64;
+    let mut day_of_year = days;
+    loop {
+        let year_len = if is_leap(year) { 366 } else { 365 };
+        if day_of_year < year_len {
+            break;
+        }
+        day_of_year -= year_len;
+        year += 1;
+    }
+    let leap = is_leap(year);
+    let month_lens = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    let mut month = 0usize;
+    while month < 12 && day_of_year >= month_lens[month] {
+        day_of_year -= month_lens[month];
+        month += 1;
+    }
+    format!(
+        "{year:04}-{:02}-{:02}T{hh:02}:{mm:02}:{ss:02}Z",
+        month + 1,
+        day_of_year + 1,
+    )
+}
+
+/// 取字节缓冲中「完整行」前缀:截到最后一个 `\n`(含)。返回 (consumed, 完整行切片)。
+/// 尾部无换行的半行不解析、不计入 consumed —— 会话文件可能正被写入,半行下次再读,
+/// 保证增量读取不重复、不丢消息(JSONL 每行都以 `\n` 结束)。
+fn split_complete_lines(bytes: &[u8]) -> (usize, &[u8]) {
+    match bytes.iter().rposition(|&b| b == b'\n') {
+        Some(i) => (i + 1, &bytes[..i + 1]),
+        None => (0, &[]),
+    }
+}
+
+/// codex rollout 文件名是否以该 session id 结尾(`rollout-<ts>-<id>.jsonl`)。
+fn codex_filename_matches_session(path: &str, session_id: &str) -> bool {
+    if session_id.is_empty() {
+        return false;
+    }
+    let name = path.rsplit('/').next().unwrap_or(path);
+    name.strip_suffix(".jsonl")
+        .map(|stem| stem.ends_with(session_id))
+        .unwrap_or(false)
+}
+
+/// 解析 codex session_index.jsonl 内容 → { id: thread_name }。
+fn parse_codex_thread_names(content: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for line in content.lines() {
+        if let Ok(obj) = serde_json::from_str::<serde_json::Value>(line)
+            && let (Some(id), Some(name)) = (
+                obj.get("id").and_then(|v| v.as_str()),
+                obj.get("thread_name").and_then(|v| v.as_str()),
+            )
+        {
+            map.insert(id.to_string(), name.to_string());
+        }
+    }
+    map
+}
+
+// ---------------------------------------------------------------------------
+// 入口 1:远程文件树
+// ---------------------------------------------------------------------------
+
+/// SFTP readdir 远程目录,返回与本地 `mt_project::fs::list_directory` 同构的
+/// [`FileEntry`] 列表。
+///
+/// 忽略过滤 = 项目根 `.gitignore`(读一次、按 connId+projectRoot 缓存)
+/// + [`ALWAYS_IGNORE`] 固定黑名单(目录直接隐藏)。
+/// `refresh_ignore=true` 强制重读 .gitignore(树顶手动刷新按钮用)。
+///
+/// **阻塞**,丢 `background_executor`。
+pub fn list_directory(
+    conn: &SshConnection,
+    path: &str,
+    project_root: &str,
+    refresh_ignore: bool,
+) -> Result<Vec<FileEntry>, String> {
+    let st = state();
+    let ignore_key = format!("{}|{}", conn.id, normalize_unix_path(project_root));
+    if refresh_ignore {
+        lock(&st.gitignore_cache).remove(&ignore_key);
+    }
+    // 锁即取即放;miss 时在 SFTP 打开后无锁读取,再短暂加锁写回。
+    let cached_ignore = lock(&st.gitignore_cache).get(&ignore_key).cloned();
+
+    st.block_on(async move {
+        let sftp = open_sftp(st, conn).await?;
+        let result = async {
+            let gitignore = match cached_ignore {
+                Some(g) => g,
+                None => {
+                    let gi_path = join_posix(project_root, ".gitignore");
+                    // .gitignore 不存在 / 读失败 → 空规则,静默降级。
+                    let content = match sftp.read_head(&gi_path, GITIGNORE_MAX_BYTES).await {
+                        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                        Err(_) => String::new(),
+                    };
+                    let g = Arc::new(TextGitignore::from_text(&content));
+                    lock(&st.gitignore_cache).insert(ignore_key.clone(), g.clone());
+                    g
+                }
+            };
+
+            let entries = sftp
+                .read_dir(path)
+                .await
+                .map_err(|e| format!("读取远程目录失败: {}", e.message()))?;
+
+            let mut out: Vec<FileEntry> = entries
+                .into_iter()
+                .filter_map(|e| {
+                    // ALWAYS_IGNORE 目录完全隐藏(与本地树一致)
+                    if e.is_dir && ALWAYS_IGNORE.contains(&e.name.as_str()) {
+                        return None;
+                    }
+                    let full = join_posix(path, &e.name);
+                    let ignored = posix_relative(project_root, &full)
+                        .map(|rel| gitignore.is_ignored(&rel, e.is_dir))
+                        .unwrap_or(false);
+                    Some(FileEntry {
+                        name: e.name,
+                        // 远程路径是 POSIX 字符串,`PathBuf` 在这里只是容器 ——
+                        // 拼接一律走 `join_posix`,绝不用 `Path::join`(会插 `\`)。
+                        path: PathBuf::from(full),
+                        is_dir: e.is_dir,
+                        ignored,
+                    })
+                })
+                .collect();
+            out.sort_by(|a, b| {
+                b.is_dir
+                    .cmp(&a.is_dir)
+                    .then_with(|| a.ignored.cmp(&b.ignored))
+                    .then_with(|| natural_cmp(&a.name, &b.name))
+            });
+            Ok(out)
+        }
+        .await;
+        sftp.close().await;
+        result
+    })
+}
+
+/// 列一个目录的**分流开关**:远程项目走上面的 SFTP 那条,本地项目走
+/// [`mt_project::fs::list_directory`]。两条路返回同一个 [`FileEntry`]。
+///
+/// 文件树只需问一次「这个项目有没有远程连接」
+/// ([`AppStore::remote_connection_of`](crate::store::AppStore::remote_connection_of),
+/// 断链时是 `None`)就能共用同一段加载代码 —— 分流判据只有这一处,不会出现
+/// 「树顶刷新走了本地、展开子目录走了远程」这类半截状态。
+///
+/// **断链**(项目其实是远程项目但连接已被删)会传进 `None`,于是去读本地的
+/// 同名路径并失败报错 —— 与原版一致(`FileTree.tsx` 那边同样只看得到 undefined)。
+///
+/// **阻塞**,丢 `background_executor`。
+pub fn list_directory_for(
+    remote: Option<&SshConnection>,
+    project_root: &std::path::Path,
+    dir: &std::path::Path,
+    refresh_ignore: bool,
+) -> Result<Vec<FileEntry>, String> {
+    match remote {
+        Some(conn) => list_directory(
+            conn,
+            &dir.to_string_lossy(),
+            &project_root.to_string_lossy(),
+            refresh_ignore,
+        ),
+        None => mt_project::fs::list_directory(project_root, dir).map_err(|e| format!("{e:#}")),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 入口 2:远程目录验证(「添加远程项目」保存前)
+// ---------------------------------------------------------------------------
+
+/// 验证远程路径是一个存在的目录,返回展开后的绝对路径。
+/// `~` / `~/xxx` 用 SFTP canonicalize 展开;不存在或不是目录返回 Err。
+///
+/// 兼作**连接测试**:走完整的「取 session → 认证 → 开 SFTP → canonicalize」,
+/// 连不上时的错误面与真实使用一致(原版没有独立的 test 命令,同一条路)。
+///
+/// **阻塞**,丢 `background_executor`。
+pub fn validate_dir(conn: &SshConnection, path: &str) -> Result<String, String> {
+    let st = state();
+    st.block_on(async move {
+        let sftp = open_sftp(st, conn).await?;
+        let result = async {
+            let trimmed = path.trim();
+            let expanded = if trimmed.is_empty() || trimmed == "~" || trimmed.starts_with("~/") {
+                let home = remote_home(st, &sftp, &conn.id).await?;
+                expand_tilde(trimmed, &home)
+            } else {
+                trimmed.to_string()
+            };
+            let canonical = sftp
+                .canonicalize(&expanded)
+                .await
+                .map_err(|e| format!("远程路径无效: {}", e.message()))?;
+            let is_dir = sftp
+                .is_dir(&canonical)
+                .await
+                .map_err(|e| format!("远程路径不可访问: {}", e.message()))?;
+            if !is_dir {
+                return Err(format!("远程路径不是目录: {canonical}"));
+            }
+            Ok(canonical)
+        }
+        .await;
+        sftp.close().await;
+        result
+    })
+}
+
+/// 连接自检:只探到远程 `$HOME` 为止,返回它。
+///
+/// 原版没有独立的「测试连接」command(SshModal 只做 CRUD),这里把
+/// [`validate_dir`] 的前半段单独暴露,BB-b 若要做「测试」按钮可以直接用 ——
+/// 不新增任何行为,失败文案与真实使用同源。
+pub fn probe_connection(conn: &SshConnection) -> Result<String, String> {
+    validate_dir(conn, "~")
+}
+
+// ---------------------------------------------------------------------------
+// 入口 3:粘贴内容上传(issue #36)
+// ---------------------------------------------------------------------------
+
+/// 把本地临时文件(剪贴板图片 / 长文本转存)上传到远程项目,返回**远端绝对路径**。
+///
+/// 背景:远程项目的 pane 跑的是本地 `ssh` 客户端,粘贴走本地链路只会得到一个
+/// Windows 路径 —— 远端 agent 读不到。这里另开一条 SFTP(池里同一条 session)
+/// 把文件送过去,调用方再把返回的远端路径粘进终端。
+///
+/// 目标目录由 `dest_dir` 决定(见 [`resolve_paste_dir`]),不存在则逐级创建。
+/// 同名覆盖:文件名由调用方生成(`paste-<ms>.txt`),带毫秒时间戳,实际不会撞。
+///
+/// **阻塞**,丢 `background_executor`。
+pub fn upload_paste(
+    conn: &SshConnection,
+    project_path: &str,
+    local_path: &str,
+    dest_dir: &str,
+) -> Result<String, String> {
+    let st = state();
+    let file_name = paste_file_name(local_path)?;
+    st.block_on(async move {
+        let (session, sftp) = open_sftp_with_session(st, conn).await?;
+
+        // 整段(建目录 + 上传)套一层墙钟上限:见 PASTE_UPLOAD_TOTAL_TIMEOUT。
+        let result = tokio::time::timeout(PASTE_UPLOAD_TOTAL_TIMEOUT, async {
+            let home = remote_home(st, &sftp, &conn.id).await?;
+            let dir = resolve_paste_dir(project_path, &home, dest_dir)?;
+            sftp.create_dir_all(&dir)
+                .await
+                .map_err(|e| format!("创建远程粘贴目录失败: {}", e.message()))?;
+
+            // 目录**严格位于**项目内(默认形态)时放一个自忽略的 .gitignore ——
+            // 否则每次粘图都会把用户仓库的 `git status` 弄脏。
+            // CREATE|EXCLUDE 语义天然幂等,已存在就失败,失败也无所谓:这只是体面,
+            // 绝不能拖累粘贴本身。
+            //
+            // 空相对路径(dir 就是项目根)必须排除 —— 那会在仓库根写下一个内容为
+            // `*` 的 .gitignore,把用户整个仓库忽略掉。
+            if posix_relative(project_path, &dir).is_some_and(|rel| !rel.is_empty()) {
+                let _ = sftp
+                    .write_new_file(&join_posix(&dir, ".gitignore"), b"*\n")
+                    .await;
+            }
+
+            let remote_path = join_posix(&dir, &file_name);
+            mt_ssh::run_sftp_upload_on_session(
+                &session,
+                local_path,
+                &remote_path,
+                PASTE_UPLOAD_REQUEST_TIMEOUT,
+            )
+            .await
+            .map_err(|e| format!("上传到远程失败: {}", e.message()))?;
+            session.touch();
+            Ok(remote_path)
+        })
+        .await
+        .unwrap_or_else(|_| {
+            Err(format!(
+                "上传到远程超时({}s)",
+                PASTE_UPLOAD_TOTAL_TIMEOUT.as_secs()
+            ))
+        });
+
+        sftp.close().await;
+        result
+    })
+}
+
+// ---------------------------------------------------------------------------
+// 入口 4:远程 AI 会话列表
+// ---------------------------------------------------------------------------
+
+/// 扫描远程机器上该项目的 claude/codex 历史会话。
+/// - 会话带 `sshConnectionId` 来源标识(对齐 WSL 会话的 `wslDistro`);
+/// - 结果缓存 10s(key 掺 connection id),`force=true` 绕过(手动刷新);
+/// - 远程不可达 / 目录缺失等一切失败:静默降级返回空列表。
+///
+/// 返回类型保留 `Result` 只为与本模块其它入口同形 —— 它**永不返回 Err**
+/// (原版同款:`ssh_remote_ai_sessions` 的 `Err` 分支已被内部吞掉)。
+///
+/// **阻塞**,丢 `background_executor`。
+pub fn ai_sessions(
+    conn: &SshConnection,
+    project_path: &str,
+    force: bool,
+) -> Result<Vec<AiSession>, String> {
+    let cache_key = format!("ssh|{}|{}", conn.id, normalize_unix_path(project_path));
+
+    if !force {
+        // 锁即取即放,扫描期间不持锁(SFTP IO 秒级)。
+        let cached = lock(session_cache()).get(&cache_key).cloned();
+        if let Some(c) = cached
+            && c.loaded_at.elapsed() < REMOTE_SESSION_CACHE_TTL
+        {
+            return Ok(c.sessions);
+        }
+    }
+
+    let sessions = match scan_remote_sessions(conn, project_path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[remote-ssh] session scan failed (degrading to empty): {e}");
+            Vec::new()
+        }
+    };
+
+    lock(session_cache()).insert(
+        cache_key,
+        CachedSessions {
+            loaded_at: Instant::now(),
+            sessions: sessions.clone(),
+        },
+    );
+
+    Ok(sessions)
+}
+
+fn scan_remote_sessions(
+    conn: &SshConnection,
+    project_path: &str,
+) -> Result<Vec<AiSession>, String> {
+    let st = state();
+    st.block_on(async move {
+        let sftp = open_sftp(st, conn).await?;
+        let result = async {
+            let home = remote_home(st, &sftp, &conn.id).await?;
+            let mut sessions = Vec::new();
+            sessions.extend(scan_remote_claude(st, &sftp, &home, &conn.id, project_path).await);
+            sessions.extend(scan_remote_codex(st, &sftp, &home, &conn.id, project_path).await);
+            sessions.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+            sessions.truncate(MAX_TOTAL_SESSIONS);
+            Ok(sessions)
+        }
+        .await;
+        sftp.close().await;
+        result
+    })
+}
+
+/// 记录会话 id → 远程文件路径,正文读取时免再扫。
+fn remember_session_path(st: &RemoteSshState, conn_id: &str, session_id: &str, path: &str) {
+    lock(&st.session_paths).insert(format!("{conn_id}|{session_id}"), path.to_string());
+}
+
+/// 变体目录精确校验:读目录里任一 jsonl 头部的前几行,比对真实 cwd。
+/// 与本地 `dir_matches_project` 语义一致(编码有损,防吃进兄弟项目)。
+async fn remote_claude_dir_matches(
+    sftp: &SftpHandle,
+    dir: &str,
+    normalized_project: &str,
+) -> bool {
+    let Ok(entries) = sftp.read_dir(dir).await else {
+        return false;
+    };
+    for e in entries {
+        if e.is_dir || !e.name.ends_with(".jsonl") {
+            continue;
+        }
+        let path = join_posix(dir, &e.name);
+        let Ok(head) = sftp.read_head(&path, CWD_PROBE_HEAD_BYTES).await else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(&head);
+        for line in text.lines().take(5) {
+            if let Ok(obj) = serde_json::from_str::<serde_json::Value>(line)
+                && let Some(cwd) = obj.get("cwd").and_then(|v| v.as_str())
+            {
+                return normalize_unix_path(cwd) == normalized_project;
+            }
+        }
+    }
+    false
+}
+
+async fn scan_remote_claude(
+    st: &RemoteSshState,
+    sftp: &SftpHandle,
+    home: &str,
+    conn_id: &str,
+    project_path: &str,
+) -> Vec<AiSession> {
+    let projects_dir = join_posix(&join_posix(home, ".claude"), "projects");
+    let Ok(dir_entries) = sftp.read_dir(&projects_dir).await else {
+        return vec![]; // 远程没装 claude / 目录不存在 → 静默空
+    };
+
+    let encoded = encode_project_path(project_path);
+    let normalized_project = normalize_unix_path(project_path);
+
+    let mut matched_dirs: Vec<String> = Vec::new();
+    for entry in dir_entries {
+        if !entry.is_dir {
+            continue;
+        }
+        if entry.name == encoded {
+            matched_dirs.push(join_posix(&projects_dir, &entry.name));
+        } else if is_encoded_variant(&entry.name, &encoded) {
+            let dir_path = join_posix(&projects_dir, &entry.name);
+            if remote_claude_dir_matches(sftp, &dir_path, &normalized_project).await {
+                matched_dirs.push(dir_path);
+            }
+        }
+    }
+
+    // 收集 (path, id, mtime),同 id 去重,按 mtime 降序限量。
+    let mut files: Vec<(String, String, u64)> = Vec::new();
+    let mut seen_ids: HashSet<String> = HashSet::new();
+    for dir in &matched_dirs {
+        let Ok(entries) = sftp.read_dir(dir).await else {
+            continue;
+        };
+        for e in entries {
+            if e.is_dir {
+                continue;
+            }
+            let Some(id) = e.name.strip_suffix(".jsonl") else {
+                continue;
+            };
+            if seen_ids.insert(id.to_string()) {
+                files.push((
+                    join_posix(dir, &e.name),
+                    id.to_string(),
+                    e.mtime_secs.unwrap_or(0),
+                ));
+            }
+        }
+    }
+    files.sort_by(|a, b| b.2.cmp(&a.2));
+    files.truncate(REMOTE_CLAUDE_SCAN_LIMIT);
+
+    let mut sessions = Vec::new();
+    for (path, id, mtime) in files {
+        if sessions.len() >= MAX_SESSIONS_PER_SOURCE {
+            break;
+        }
+        let Ok(head) = sftp.read_head(&path, CLAUDE_TITLE_HEAD_BYTES).await else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(&head);
+        let (title, mut timestamp) = claude_session_info_from_lines(text.lines().take(50));
+        if timestamp.is_empty() && mtime > 0 {
+            timestamp = unix_secs_to_iso(mtime);
+        }
+        remember_session_path(st, conn_id, &id, &path);
+        sessions.push(AiSession {
+            id,
+            session_type: "claude".to_string(),
+            title,
+            timestamp,
+            // 远程文件尾窗反扫要再走一趟 SFTP,不值当;识别不出回落 CLI 图标
+            model: None,
+            wsl_distro: None,
+            ssh_connection_id: Some(conn_id.to_string()),
+        });
+    }
+    sessions
+}
+
+/// 按 `sessions/<year>/<month>/<day>/` 目录名倒序(零填充,字典序即时间序)收集
+/// 最新的 rollout 文件,凑够 `limit` 即停 —— 避免全量递归的 SFTP 往返爆炸。
+async fn collect_remote_codex_files(
+    sftp: &SftpHandle,
+    sessions_dir: &str,
+    limit: usize,
+) -> Vec<(String, u64)> {
+    let mut out: Vec<(String, u64)> = Vec::new();
+    let Ok(mut years) = sftp.read_dir(sessions_dir).await else {
+        return out;
+    };
+    years.retain(|e| e.is_dir);
+    years.sort_by(|a, b| b.name.cmp(&a.name));
+    'outer: for y in years {
+        let ydir = join_posix(sessions_dir, &y.name);
+        let Ok(mut months) = sftp.read_dir(&ydir).await else {
+            continue;
+        };
+        months.retain(|e| e.is_dir);
+        months.sort_by(|a, b| b.name.cmp(&a.name));
+        for m in months {
+            let mdir = join_posix(&ydir, &m.name);
+            let Ok(mut days) = sftp.read_dir(&mdir).await else {
+                continue;
+            };
+            days.retain(|e| e.is_dir);
+            days.sort_by(|a, b| b.name.cmp(&a.name));
+            for d in days {
+                let ddir = join_posix(&mdir, &d.name);
+                let Ok(mut file_entries) = sftp.read_dir(&ddir).await else {
+                    continue;
+                };
+                file_entries.retain(|e| !e.is_dir && e.name.ends_with(".jsonl"));
+                // 同一天内按 mtime 倒序。
+                file_entries
+                    .sort_by(|a, b| b.mtime_secs.unwrap_or(0).cmp(&a.mtime_secs.unwrap_or(0)));
+                for f in file_entries {
+                    out.push((join_posix(&ddir, &f.name), f.mtime_secs.unwrap_or(0)));
+                    if out.len() >= limit {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+async fn scan_remote_codex(
+    st: &RemoteSshState,
+    sftp: &SftpHandle,
+    home: &str,
+    conn_id: &str,
+    project_path: &str,
+) -> Vec<AiSession> {
+    let codex_dir = join_posix(home, ".codex");
+    let sessions_dir = join_posix(&codex_dir, "sessions");
+    let files = collect_remote_codex_files(sftp, &sessions_dir, REMOTE_CODEX_SCAN_LIMIT).await;
+    if files.is_empty() {
+        return vec![];
+    }
+
+    let thread_names = {
+        let index_path = join_posix(&codex_dir, "session_index.jsonl");
+        match sftp.read_head(&index_path, SESSION_INDEX_MAX_BYTES).await {
+            Ok(bytes) => parse_codex_thread_names(&String::from_utf8_lossy(&bytes)),
+            Err(_) => HashMap::new(),
+        }
+    };
+
+    let normalized_project = normalize_unix_path(project_path);
+    let mut sessions = Vec::new();
+    for (path, mtime) in files {
+        if sessions.len() >= MAX_SESSIONS_PER_SOURCE {
+            break;
+        }
+        let Ok(head) = sftp.read_head(&path, CODEX_META_HEAD_BYTES).await else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(&head);
+        let mut lines = text.lines();
+
+        // 前 5 行找 session_meta(实际几乎总在第 1 行),匹配 cwd。
+        let mut meta = None;
+        for line in (&mut lines).take(5) {
+            if let Some(m) = codex_meta_from_line(line) {
+                meta = Some(m);
+                break;
+            }
+        }
+        let Some(meta) = meta else { continue };
+        if meta.id.is_empty() || normalize_unix_path(&meta.cwd) != normalized_project {
+            continue;
+        }
+
+        let mut title = thread_names.get(&meta.id).cloned().unwrap_or_default();
+        if title.is_empty() {
+            for line in lines.take(30) {
+                if let Some(t) = codex_user_title_from_line(line) {
+                    title = t;
+                    break;
+                }
+            }
+        }
+        if title.is_empty() {
+            title = "Untitled".into();
+        }
+
+        let mut timestamp = meta.timestamp;
+        if timestamp.is_empty() && mtime > 0 {
+            timestamp = unix_secs_to_iso(mtime);
+        }
+
+        remember_session_path(st, conn_id, &meta.id, &path);
+        sessions.push(AiSession {
+            id: meta.id,
+            session_type: "codex".to_string(),
+            title,
+            timestamp,
+            model: None,
+            wsl_distro: None,
+            ssh_connection_id: Some(conn_id.to_string()),
+        });
+    }
+    sessions
+}
+
+// ---------------------------------------------------------------------------
+// 入口 5:远程会话正文(支持增量 offset)
+// ---------------------------------------------------------------------------
+
+/// 远程会话正文的增量读取结果。
+#[derive(Debug, Clone, Default)]
+pub struct RemoteSessionContent {
+    /// 本次解析出的消息(与本地 `get_ai_session_content` 的元素同构)。
+    pub messages: Vec<AiSessionMessage>,
+    /// 下次增量读取应传入的字节偏移(指向已解析的最后一个完整行之后)。
+    /// 首次调用传 offset=0 拿全量;之后传上次返回的 `next_offset` 拿增量。
+    pub next_offset: u64,
+}
+
+/// SFTP 读远程会话正文。`offset = 0` 从头读;返回 `next_offset` 供增量刷新。
+///
+/// **阻塞**,丢 `background_executor`。
+pub fn ai_session_content(
+    conn: &SshConnection,
+    session_type: &str,
+    session_id: &str,
+    project_path: &str,
+    offset: u64,
+) -> Result<RemoteSessionContent, String> {
+    // id 会拼进远程路径(`<id>.jsonl`)与缓存键,统一在入口挡穿越
+    if !session_id_path_safe(session_id) {
+        return Err("非法会话 id".to_string());
+    }
+    let st = state();
+    st.block_on(async move {
+        let sftp = open_sftp(st, conn).await?;
+        let result = async {
+            let path = locate_remote_session_file(
+                st,
+                &sftp,
+                &conn.id,
+                session_type,
+                session_id,
+                project_path,
+            )
+            .await?;
+            let bytes = sftp
+                .read_from_offset(&path, offset, CONTENT_CHUNK_MAX_BYTES)
+                .await
+                .map_err(|e| format!("读取会话文件失败: {}", e.message()))?;
+            let (consumed, complete) = split_complete_lines(&bytes);
+            let text = String::from_utf8_lossy(complete);
+            let messages: Vec<AiSessionMessage> = match session_type {
+                "claude" => text.lines().filter_map(claude_message_from_line).collect(),
+                "codex" => text.lines().filter_map(codex_message_from_line).collect(),
+                other => return Err(format!("不支持的会话类型: {other}")),
+            };
+            Ok(RemoteSessionContent {
+                messages,
+                next_offset: offset + consumed as u64,
+            })
+        }
+        .await;
+        sftp.close().await;
+        result
+    })
+}
+
+/// 定位会话对应的远程文件:优先取列表扫描时记下的映射;miss(如 app 重启)
+/// 再按类型回退定位(claude 走编码目录推导,codex 按 rollout 文件名后缀匹配)。
+async fn locate_remote_session_file(
+    st: &RemoteSshState,
+    sftp: &SftpHandle,
+    conn_id: &str,
+    session_type: &str,
+    session_id: &str,
+    project_path: &str,
+) -> Result<String, String> {
+    let key = format!("{conn_id}|{session_id}");
+    // 先绑定再 await:if-let 直接嵌 lock() 会让临时 MutexGuard 活过 await 点,
+    // 破坏 future 的 Send 约束。
+    let cached_path = lock(&st.session_paths).get(&key).cloned();
+    if let Some(p) = cached_path
+        && sftp.exists(&p).await
+    {
+        return Ok(p);
+    }
+
+    let home = remote_home(st, sftp, conn_id).await?;
+    match session_type {
+        "claude" => {
+            let projects_dir = join_posix(&join_posix(&home, ".claude"), "projects");
+            let encoded = encode_project_path(project_path);
+            let normalized = normalize_unix_path(project_path);
+            let filename = format!("{session_id}.jsonl");
+            let entries = sftp
+                .read_dir(&projects_dir)
+                .await
+                .map_err(|_| "会话文件不存在".to_string())?;
+            for e in entries {
+                if !e.is_dir {
+                    continue;
+                }
+                let dir = join_posix(&projects_dir, &e.name);
+                let matches = e.name == encoded
+                    || (is_encoded_variant(&e.name, &encoded)
+                        && remote_claude_dir_matches(sftp, &dir, &normalized).await);
+                if matches {
+                    let p = join_posix(&dir, &filename);
+                    if sftp.exists(&p).await {
+                        remember_session_path(st, conn_id, session_id, &p);
+                        return Ok(p);
+                    }
+                }
+            }
+            Err("会话文件不存在".into())
+        }
+        "codex" => {
+            let sessions_dir = join_posix(&join_posix(&home, ".codex"), "sessions");
+            let files =
+                collect_remote_codex_files(sftp, &sessions_dir, REMOTE_CODEX_SCAN_LIMIT).await;
+            for (path, _) in files {
+                if codex_filename_matches_session(&path, session_id) {
+                    remember_session_path(st, conn_id, session_id, &path);
+                    return Ok(path);
+                }
+            }
+            Err("未找到 Codex 会话文件,请刷新会话列表后重试".into())
+        }
+        other => Err(format!("不支持的会话类型: {other}")),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// tests(全部自 `src-tauri/src/remote_ssh.rs` 的同名测试原样搬来,不触网)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn conn(id: &str) -> SshConnection {
+        SshConnection {
+            id: id.to_string(),
+            name: format!("conn-{id}"),
+            host: "h".into(),
+            port: 22,
+            user: "u".into(),
+            password: None,
+            identity_file: None,
+            group: None,
+        }
+    }
+
+    // --- 断链查找 ---
+
+    #[test]
+    fn find_connection_hits_by_id() {
+        let list = vec![conn("a"), conn("b")];
+        assert_eq!(find_connection(&list, "b").unwrap().id, "b");
+    }
+
+    #[test]
+    fn find_connection_reports_broken_link_with_id() {
+        let err = find_connection(&[conn("a")], "gone").unwrap_err();
+        assert!(err.contains("gone"), "错误文案要带 id 便于排查: {err}");
+        assert!(err.contains("SSH 连接不存在或已被删除"));
+        // 空表同样是断链而不是 panic
+        assert!(find_connection(&[], "x").is_err());
+    }
+
+    // --- POSIX 路径拼接 / 相对化 ---
+
+    #[test]
+    fn join_posix_handles_root_and_trailing_slash() {
+        assert_eq!(join_posix("/", "home"), "/home");
+        assert_eq!(join_posix("/home/u", "proj"), "/home/u/proj");
+        assert_eq!(join_posix("/home/u/", "proj"), "/home/u/proj");
+    }
+
+    #[test]
+    fn posix_relative_computes_relative_paths() {
+        assert_eq!(
+            posix_relative("/home/u/proj", "/home/u/proj/src/main.rs").as_deref(),
+            Some("src/main.rs")
+        );
+        assert_eq!(
+            posix_relative("/home/u/proj", "/home/u/proj").as_deref(),
+            Some("")
+        );
+        // 尾部斜杠不影响
+        assert_eq!(
+            posix_relative("/home/u/proj/", "/home/u/proj/a").as_deref(),
+            Some("a")
+        );
+        // 根目录项目
+        assert_eq!(
+            posix_relative("/", "/etc/hosts").as_deref(),
+            Some("etc/hosts")
+        );
+    }
+
+    #[test]
+    fn posix_relative_rejects_sibling_prefix() {
+        // `/home/u/proj2` 不在 `/home/u/proj` 之下,不能误判
+        assert!(posix_relative("/home/u/proj", "/home/u/proj2/file").is_none());
+        assert!(posix_relative("/home/u/proj", "/other/place").is_none());
+    }
+
+    // --- ~ 展开 ---
+
+    #[test]
+    fn expand_tilde_expands_home_forms() {
+        assert_eq!(expand_tilde("~", "/home/u"), "/home/u");
+        assert_eq!(expand_tilde("", "/home/u"), "/home/u");
+        assert_eq!(expand_tilde("  ~  ", "/home/u"), "/home/u");
+        assert_eq!(expand_tilde("~/proj", "/home/u"), "/home/u/proj");
+        assert_eq!(expand_tilde("~/a/b", "/home/u/"), "/home/u/a/b");
+        assert_eq!(expand_tilde("~/", "/home/u"), "/home/u");
+    }
+
+    #[test]
+    fn expand_tilde_leaves_absolute_and_other_paths_alone() {
+        assert_eq!(expand_tilde("/var/www", "/home/u"), "/var/www");
+        // `~user` 形式不支持展开,原样交给 canonicalize 报错
+        assert_eq!(expand_tilde("~other/x", "/home/u"), "~other/x");
+        assert_eq!(expand_tilde("relative/dir", "/home/u"), "relative/dir");
+    }
+
+    // --- 粘贴落盘目录解析(issue #36) ---
+
+    #[test]
+    fn resolve_paste_dir_defaults_to_project_relative() {
+        // 默认形态:相对项目根,图片落在项目内
+        assert_eq!(
+            resolve_paste_dir("/home/u/proj", "/home/u", ".mini-term/pasted").unwrap(),
+            "/home/u/proj/.mini-term/pasted"
+        );
+        // 空配置回落到默认值,而不是把文件丢到项目根
+        assert_eq!(
+            resolve_paste_dir("/home/u/proj", "/home/u", "   ").unwrap(),
+            "/home/u/proj/.mini-term/pasted"
+        );
+        // 项目根带尾斜杠不产生双斜杠
+        assert_eq!(
+            resolve_paste_dir("/home/u/proj/", "/home/u", "assets").unwrap(),
+            "/home/u/proj/assets"
+        );
+    }
+
+    #[test]
+    fn resolve_paste_dir_default_matches_config_default() {
+        // 本模块的默认值常量与 mt-config 的那份必须同值,
+        // 否则「设置里清空 → 落盘目录」两侧会漂。
+        assert_eq!(
+            DEFAULT_REMOTE_PASTE_DIR,
+            mt_config::default_remote_paste_dir()
+        );
+    }
+
+    #[test]
+    fn resolve_paste_dir_supports_absolute_and_tilde() {
+        assert_eq!(
+            resolve_paste_dir("/home/u/proj", "/home/u", "/tmp/mini-term").unwrap(),
+            "/tmp/mini-term"
+        );
+        assert_eq!(
+            resolve_paste_dir("/home/u/proj", "/home/u", "~/uploads").unwrap(),
+            "/home/u/uploads"
+        );
+        assert_eq!(
+            resolve_paste_dir("/home/u/proj", "/home/u", "~").unwrap(),
+            "/home/u"
+        );
+        // 尾斜杠被归一,避免拼出 `//file`
+        assert_eq!(
+            resolve_paste_dir("/home/u/proj", "/home/u", "/tmp/x/").unwrap(),
+            "/tmp/x"
+        );
+    }
+
+    #[test]
+    fn resolve_paste_dir_rejects_parent_traversal() {
+        // 这条路径会拼进 SFTP 写操作,`..` 逃逸必须挡在解析层
+        assert!(resolve_paste_dir("/home/u/proj", "/home/u", "../outside").is_err());
+        assert!(resolve_paste_dir("/home/u/proj", "/home/u", "a/../../b").is_err());
+        assert!(resolve_paste_dir("/home/u/proj", "/home/u", "/tmp/../etc").is_err());
+        assert!(resolve_paste_dir("/home/u/proj", "/home/u", "~/../root").is_err());
+        // 反斜杠写法先归一再判,不能绕过
+        assert!(resolve_paste_dir("/home/u/proj", "/home/u", r"..\outside").is_err());
+    }
+
+    #[test]
+    fn resolve_paste_dir_rejects_traversal_from_project_path_too() {
+        // `..` 也可能来自 project_path(调用方传入,非用户在设置页填的那半)。
+        // 判定放在归一之后就是为了一处覆盖两个来源 —— 返回值恒不含 `..`。
+        assert!(resolve_paste_dir("/home/u/../etc", "/home/u", "assets").is_err());
+        assert!(resolve_paste_dir("/home/u/proj/..", "/home/u", ".mini-term").is_err());
+        // home 带 `..` 的 `~` 展开同样挡住
+        assert!(resolve_paste_dir("/home/u/proj", "/home/../root", "~/x").is_err());
+    }
+
+    #[test]
+    fn resolve_paste_dir_normalizes_dot_segments_and_double_slash() {
+        // `.` 段必须被吃掉:否则 `/proj/.` 会被下游当成「严格位于项目内」,
+        // 而它其实就是项目根 —— 自忽略 .gitignore 会写到仓库根,忽略整个仓库。
+        assert_eq!(
+            resolve_paste_dir("/home/u/proj", "/home/u", ".").unwrap(),
+            "/home/u/proj"
+        );
+        assert_eq!(
+            resolve_paste_dir("/home/u/proj", "/home/u", "./assets").unwrap(),
+            "/home/u/proj/assets"
+        );
+        assert_eq!(
+            resolve_paste_dir("/home/u/proj", "/home/u", "a//b").unwrap(),
+            "/home/u/proj/a/b"
+        );
+        // 点开头的目录名不是 `.` 段,不能被误删
+        assert_eq!(
+            resolve_paste_dir("/home/u/proj", "/home/u", ".mini-term").unwrap(),
+            "/home/u/proj/.mini-term"
+        );
+    }
+
+    #[test]
+    fn paste_dir_at_project_root_is_not_strictly_inside() {
+        // 自忽略 .gitignore 的守卫条件:rel 非空才写。
+        // 解析成项目根本身时 rel 为空 —— 绝不能在仓库根写下内容为 `*` 的 .gitignore。
+        let dir = resolve_paste_dir("/home/u/proj", "/home/u", ".").unwrap();
+        assert_eq!(posix_relative("/home/u/proj", &dir).as_deref(), Some(""));
+
+        // 默认形态才是「严格位于项目内」,应当写
+        let nested = resolve_paste_dir("/home/u/proj", "/home/u", ".mini-term/pasted").unwrap();
+        assert_eq!(
+            posix_relative("/home/u/proj", &nested).as_deref(),
+            Some(".mini-term/pasted")
+        );
+
+        // 项目外的绝对路径不参与 .gitignore 逻辑
+        let outside = resolve_paste_dir("/home/u/proj", "/home/u", "/tmp/mini-term").unwrap();
+        assert!(posix_relative("/home/u/proj", &outside).is_none());
+    }
+
+    #[test]
+    fn resolve_paste_dir_normalizes_backslash_input() {
+        // 用户顺手填了 Windows 风格分隔符,不该原样拼进远端路径
+        assert_eq!(
+            resolve_paste_dir("/home/u/proj", "/home/u", r".mini-term\pasted").unwrap(),
+            "/home/u/proj/.mini-term/pasted"
+        );
+    }
+
+    #[test]
+    fn resolve_paste_dir_rejects_relative_project_root() {
+        // 相对目录 + 非绝对项目根 = 拼不出合法远端路径,明确报错而不是拼个怪路径
+        assert!(resolve_paste_dir("proj", "/home/u", "assets").is_err());
+        // 但绝对 dest_dir 不依赖项目根,仍应通过
+        assert!(resolve_paste_dir("proj", "/home/u", "/tmp/x").is_ok());
+    }
+
+    // --- 粘贴文件名提取 ---
+
+    #[test]
+    fn paste_file_name_strips_both_separators() {
+        assert_eq!(
+            paste_file_name(r"C:\Users\u\AppData\Local\Temp\clip-123.png").unwrap(),
+            "clip-123.png"
+        );
+        assert_eq!(paste_file_name("/tmp/paste-9.txt").unwrap(), "paste-9.txt");
+        // 混合分隔符:不能让 `\` 残留进远端路径
+        assert_eq!(paste_file_name(r"C:/Temp\clip-1.png").unwrap(), "clip-1.png");
+    }
+
+    #[test]
+    fn paste_file_name_rejects_degenerate_input() {
+        assert!(paste_file_name("").is_err());
+        assert!(paste_file_name(r"C:\Temp\").is_err());
+        assert!(paste_file_name("/tmp/.").is_err());
+        assert!(paste_file_name("..").is_err());
+    }
+
+    // --- 时间戳兜底 ---
+
+    #[test]
+    fn unix_secs_to_iso_known_values() {
+        assert_eq!(unix_secs_to_iso(0), "1970-01-01T00:00:00Z");
+        assert_eq!(unix_secs_to_iso(86_399), "1970-01-01T23:59:59Z");
+        assert_eq!(unix_secs_to_iso(86_400), "1970-01-02T00:00:00Z");
+        // 2000-03-01(闰年 2 月 29 日之后)
+        assert_eq!(unix_secs_to_iso(951_868_800), "2000-03-01T00:00:00Z");
+        // 2026-07-05T12:34:56Z
+        assert_eq!(unix_secs_to_iso(1_783_254_896), "2026-07-05T12:34:56Z");
+    }
+
+    // --- 增量读取的完整行切分 ---
+
+    #[test]
+    fn split_complete_lines_cuts_at_last_newline() {
+        let bytes = b"{\"a\":1}\n{\"b\":2}\n{\"partial";
+        let (consumed, complete) = split_complete_lines(bytes);
+        assert_eq!(consumed, 16);
+        assert_eq!(complete, b"{\"a\":1}\n{\"b\":2}\n");
+    }
+
+    #[test]
+    fn split_complete_lines_no_newline_consumes_nothing() {
+        let (consumed, complete) = split_complete_lines(b"half a line");
+        assert_eq!(consumed, 0);
+        assert!(complete.is_empty());
+    }
+
+    #[test]
+    fn split_complete_lines_empty_input() {
+        let (consumed, complete) = split_complete_lines(b"");
+        assert_eq!(consumed, 0);
+        assert!(complete.is_empty());
+    }
+
+    // --- codex 文件名匹配 ---
+
+    #[test]
+    fn codex_filename_matches_session_by_suffix() {
+        let p = "/home/u/.codex/sessions/2026/07/05/rollout-2026-07-05T10-00-00-abc-123.jsonl";
+        assert!(codex_filename_matches_session(p, "abc-123"));
+        assert!(!codex_filename_matches_session(p, "def-456"));
+        // 空 id 永不匹配(防 ends_with("") 恒真)
+        assert!(!codex_filename_matches_session(p, ""));
+        // 非 .jsonl 不匹配
+        assert!(!codex_filename_matches_session(
+            "/x/rollout-abc-123.txt",
+            "abc-123"
+        ));
+    }
+
+    // --- session_index 解析 ---
+
+    #[test]
+    fn parse_codex_thread_names_extracts_pairs() {
+        let content = "\
+{\"id\":\"s1\",\"thread_name\":\"重构池\"}\n\
+not json\n\
+{\"id\":\"s2\"}\n\
+{\"id\":\"s3\",\"thread_name\":\"fix bug\"}\n";
+        let map = parse_codex_thread_names(content);
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get("s1").map(String::as_str), Some("重构池"));
+        assert_eq!(map.get("s3").map(String::as_str), Some("fix bug"));
+    }
+
+    // --- state 基本行为(不触网) ---
+
+    #[test]
+    fn remote_state_caches_are_isolated_per_key() {
+        let st = RemoteSshState::new();
+        remember_session_path(&st, "c1", "s1", "/p/a.jsonl");
+        remember_session_path(&st, "c2", "s1", "/p/b.jsonl");
+        assert_eq!(
+            lock(&st.session_paths).get("c1|s1").map(String::as_str),
+            Some("/p/a.jsonl")
+        );
+        assert_eq!(
+            lock(&st.session_paths).get("c2|s1").map(String::as_str),
+            Some("/p/b.jsonl")
+        );
+    }
+
+    #[test]
+    fn shutdown_without_pool_is_noop() {
+        // 从未用过远程能力时退出:池与运行时都没建,不该起运行时、更不该 panic。
+        let st = RemoteSshState::new();
+        st.shutdown_pool_blocking();
+        assert!(lock(&st.runtime).is_none(), "不该为了关池现建运行时");
+    }
+
+    #[test]
+    fn session_id_guard_rejects_traversal_before_touching_network() {
+        // 非法 id 必须在开 SFTP 之前就被挡下(否则 `../` 会拼进远端路径)。
+        // 这条不触网:守卫在函数第一行。
+        let c = conn("c1");
+        let err = ai_session_content(&c, "claude", "../etc/passwd", "/p", 0).unwrap_err();
+        assert_eq!(err, "非法会话 id");
+        let err2 = ai_session_content(&c, "claude", "a/b", "/p", 0).unwrap_err();
+        assert_eq!(err2, "非法会话 id");
+    }
+}

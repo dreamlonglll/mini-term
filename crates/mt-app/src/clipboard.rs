@@ -10,18 +10,22 @@
 //! WSL / 远程 —— 那都是壳的东西。`mt_ui::TerminalView` 只留一个
 //! [`on_paste`](mt_ui::TerminalView::on_paste) 钩子,内建的 `paste()` 依旧纯粹。
 //!
-//! # 本批的两处收窄(相对原版)
+//! # 本批的一处收窄(相对原版)
 //!
-//! 1. **剪贴板图片不做**。原版会先问 `clipboardHasImage()`,读 Win32 DIB 存成
-//!    临时 PNG、粘路径,读不到则退 `Alt+V`。那套(`clipboard.rs` 的 `parse_dib`
-//!    含加固与单测)是另一个缺口,audit #30 的措辞里没有它。
-//! 2. **SSH 远程分支不做**(依赖 audit #28 的 mt-ssh 入 crates)。远程项目上
-//!    **一律不转文件**,直接粘原文 —— 见 [`PasteTarget::Ssh`] 的说明:
-//!    没有上传通道时转文件反而更糟(粘进去的本机路径远端根本不存在)。
+//! **剪贴板图片不做**。原版会先问 `clipboardHasImage()`,读 Win32 DIB 存成
+//! 临时 PNG、粘路径,读不到则退 `Alt+V`。那套(`clipboard.rs` 的 `parse_dib`
+//! 含加固与单测)是另一个缺口,audit #30 的措辞里没有它。
+//!
+//! ~~SSH 远程分支不做~~ ✅ BB-a 批补上:见 [`spawn_remote_paste`]。
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
+use crate::notify::ToastKind;
 use crate::store::AppStore;
+use crate::toast;
+use crate::tr;
 
 /// 临时文件目录名。与装机版**共用同一个目录名**(图片与文本同处),
 /// 于是两边的 24h 清理互相覆盖得到。
@@ -132,12 +136,9 @@ pub enum PasteTarget {
     Local,
     /// WSL:转 `/mnt/<盘符>/...`(文件本身经 automount 就能读到,只差路径形式)。
     Wsl,
-    /// SSH 远程项目。
-    ///
-    /// **本批不转文件**:原版这一支要 SFTP 把临时文件传到远端再粘远端路径
-    /// (`ssh_remote_upload_paste`),而 mt-ssh 还没进 crates(audit #28)。
-    /// 没有上传通道时把 `C:\...` 粘给远端 agent 只会得到「文件不存在」,
-    /// 比粘原文(就是长了点)更糟 —— 所以远程 pane 一律走原文。
+    /// SSH 远程项目:转存成本机临时文件后 **SFTP 传到远端**,粘远端绝对路径
+    /// (`ssh_remote_upload_paste`)。这一支是异步的,走 [`spawn_remote_paste`],
+    /// 不经 [`map_pasted_path`]。
     Ssh,
 }
 
@@ -197,7 +198,7 @@ pub fn resolve_paste_target(store: &AppStore, pty_id: u32) -> PasteTarget {
 
 /// 把本机临时文件路径映射成「该终端里真正可读的路径」。
 ///
-/// [`PasteTarget::Ssh`] 走不到这里 —— 调用方在判阈值之前就跳过了转存。
+/// [`PasteTarget::Ssh`] 走不到这里 —— 那一支是异步上传,见 [`spawn_remote_paste`]。
 pub fn map_pasted_path(local: &Path, target: PasteTarget) -> String {
     let local = local.to_string_lossy().into_owned();
     match target {
@@ -205,6 +206,96 @@ pub fn map_pasted_path(local: &Path, target: PasteTarget) -> String {
         // 转不了(UNC 等非盘符路径)就原样返回,行为退回改动前
         PasteTarget::Wsl => windows_path_to_wsl(&local).unwrap_or(local),
     }
+}
+
+// ---------------------------------------------------------------------------
+// SSH 远程 pane 的粘贴(异步:转存 → SFTP 上传 → 写远端路径)
+// ---------------------------------------------------------------------------
+
+/// 正在处理粘贴的 pty(`terminalCache.ts:680` 的 `pasteInFlight`)。
+///
+/// 远程上传要几百毫秒到几秒,这期间用户连按 Ctrl+V 会让多条路径以完成顺序
+/// **乱序**插进命令行;直接丢弃重入的那次,语义上等同「还没粘完」。
+static PASTE_IN_FLIGHT: Mutex<Option<HashSet<u32>>> = Mutex::new(None);
+
+fn in_flight_begin(pty_id: u32) -> bool {
+    let mut guard = PASTE_IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+    guard.get_or_insert_with(HashSet::new).insert(pty_id)
+}
+
+fn in_flight_end(pty_id: u32) {
+    let mut guard = PASTE_IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(set) = guard.as_mut() {
+        set.remove(&pty_id);
+    }
+}
+
+/// 远程 pane 的长文本粘贴:后台转存 + SFTP 上传,完成后把**远端绝对路径**
+/// 写进该 pane。
+///
+/// # 为什么必须异步
+///
+/// `TerminalView` 的粘贴钩子是**同步返回值制**([`mt_ui::PasteAction`] 的注释:
+/// 宿主在钩子里回头 update 视图 = 同一实体嵌套 update,gpui 当场 panic),
+/// 而上传要跨网络。于是钩子当场返回 `PasteAction::None`(语义就是「宿主已接管」),
+/// 真正的写入由这条任务在完成后经 `AppStore::write_to_pane` 补上。
+///
+/// # 失败面(与原版逐条对齐)
+///
+/// - 断链 / 上传失败 / 转存失败 → 弹一条 `paste-error` toast,**并把原文粘进去**
+///   (`notifyPasteFailure` 之后继续走 `enqueuePtyWrite(text)` 的那一支:
+///   就是长了点,比什么都没有强);
+/// - pane 在上传期间被关掉 → `write_to_pane` 返回 false,什么都不发生。
+pub fn spawn_remote_paste(
+    pty_id: u32,
+    text: String,
+    connection: mt_config::SshConnection,
+    project_path: String,
+    project_id: String,
+    project_name: String,
+    dest_dir: String,
+    cx: &mut gpui::App,
+) {
+    if !in_flight_begin(pty_id) {
+        return; // 上一次还没粘完,丢弃这次(原版同款)
+    }
+    let store = AppStore::global(cx);
+    cx.spawn(async move |cx| {
+        let payload = text.clone();
+        let uploaded = cx
+            .background_executor()
+            .spawn(async move {
+                let local = save_clipboard_text(&payload)?;
+                let local = local.to_string_lossy().into_owned();
+                crate::remote_ssh::upload_paste(&connection, &project_path, &local, &dest_dir)
+            })
+            .await;
+        in_flight_end(pty_id);
+
+        let _ = store.update(cx, |store, cx| {
+            let Some((project, pane)) = store.pane_of_pty(pty_id) else {
+                return; // pane 在上传期间被关掉了
+            };
+            match uploaded {
+                Ok(remote_path) => {
+                    store.write_to_pane(&project, &pane, &quote_path(&remote_path), cx);
+                }
+                Err(detail) => {
+                    eprintln!("[pane {pty_id}] 粘贴内容上传到远端失败: {detail}");
+                    toast::push_message(
+                        ToastKind::PasteError,
+                        project_id,
+                        project_name,
+                        tr!("terminal", "pasteUploadFailed", detail = detail),
+                        cx,
+                    );
+                    // 提示完继续粘原文 —— 与原版一致
+                    store.write_to_pane(&project, &pane, &text, cx);
+                }
+            }
+        });
+    })
+    .detach();
 }
 
 /// 粘进终端的那一串:**带英文双引号**(兼容含空格的路径),

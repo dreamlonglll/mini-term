@@ -130,6 +130,40 @@ fn is_path_ignored(gitignores: &[Gitignore], full_path: &Path, is_dir: bool) -> 
     ignored
 }
 
+/// 由**一段文本**构建的 `.gitignore` 匹配器(远程文件树用)。
+///
+/// 本地树走 [`collect_gitignores`],逐级 `Gitignore::new(path)` 读真实文件;
+/// SSH 远程项目的 `.gitignore` 是经 SFTP 读来的字节,**不落本地盘**,只能逐行
+/// `add_line` 喂进 builder —— 于是需要这一层。
+///
+/// 落在 mt-project 而不是调用方(`mt_app::remote_ssh`):`ignore` crate 是本
+/// crate 的既有依赖,`Gitignore` 也是本模块的内部类型,包一层就不用把它连同
+/// 依赖一起暴露给壳层。**匹配一律用相对项目根的 POSIX 路径** —— Windows 的
+/// `Path` 语义对 POSIX 绝对路径有歧义(`/a/b` 在 Windows 上不是绝对路径),
+/// 相对路径两平台行为一致。
+pub struct TextGitignore(Gitignore);
+
+impl TextGitignore {
+    /// 逐行喂 `add_line` 构建。单行非法(坏 glob)忽略该行、不影响其余行,
+    /// 与 git 自身的行为一致;整体构建失败退化为空规则。
+    pub fn from_text(content: &str) -> Self {
+        let mut builder = ignore::gitignore::GitignoreBuilder::new("");
+        for line in content.lines() {
+            let _ = builder.add_line(None, line);
+        }
+        Self(builder.build().unwrap_or_else(|_| Gitignore::empty()))
+    }
+
+    /// `rel_path` 为相对项目根的 POSIX 路径(空串 = 项目根本身,永不忽略)。
+    /// 白名单(`!pattern`)由 `Gitignore` 内部按 gitignore 语义处理(后规则覆盖前规则)。
+    pub fn is_ignored(&self, rel_path: &str, is_dir: bool) -> bool {
+        if rel_path.is_empty() {
+            return false;
+        }
+        self.0.matched(rel_path, is_dir).is_ignore()
+    }
+}
+
 /// 永远不进文件树、也永远不进搜索的目录名。
 pub const ALWAYS_IGNORE: &[&str] = &[
     ".git",
@@ -387,6 +421,41 @@ mod tests {
     #[test]
     fn is_path_ignored_empty_returns_false() {
         assert!(!is_path_ignored(&[], Path::new("/any/path"), false));
+    }
+
+    // --- TextGitignore(远程文件树的根 .gitignore 匹配)---
+    // 三条断言自 `src-tauri/src/remote_ssh.rs` 的同名测试原样搬来:
+    // 那边的 `build_remote_gitignore` + `is_remote_entry_ignored` 就是这一层。
+
+    #[test]
+    fn text_gitignore_matches_relative_paths() {
+        let gi = TextGitignore::from_text("node_modules/\n*.log\nbuild/\n");
+        assert!(gi.is_ignored("node_modules", true));
+        assert!(gi.is_ignored("app.log", false));
+        assert!(gi.is_ignored("src/deep/trace.log", false));
+        assert!(gi.is_ignored("src/build", true));
+        assert!(!gi.is_ignored("src/main.rs", false));
+        // 目录规则(尾 `/`)不忽略同名文件
+        assert!(!gi.is_ignored("build", false));
+    }
+
+    #[test]
+    fn text_gitignore_supports_whitelist_override() {
+        let gi = TextGitignore::from_text("*.log\n!keep.log\n");
+        assert!(gi.is_ignored("a.log", false));
+        assert!(!gi.is_ignored("keep.log", false));
+    }
+
+    #[test]
+    fn text_gitignore_empty_and_invalid_lines_are_safe() {
+        let gi = TextGitignore::from_text("");
+        assert!(!gi.is_ignored("anything", false));
+        // 空相对路径(项目根本身)永不忽略
+        let gi2 = TextGitignore::from_text("*\n");
+        assert!(!gi2.is_ignored("", true));
+        // 坏 glob 只废掉那一行,其余规则照常生效
+        let gi3 = TextGitignore::from_text("[unclosed\n*.tmp\n");
+        assert!(gi3.is_ignored("a.tmp", false));
     }
 
     #[test]
