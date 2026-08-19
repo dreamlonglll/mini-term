@@ -29,7 +29,7 @@
 
 | # | 缺口 | 规模 | 落点 | 状态 |
 |---|---|---|---|---|
-| 7 | **上下文菜单基建** | 中 | mt-app | ✅ N 批自建 menu.rs（gpui-component 菜单四条硬伤记档：IconName 无资产/无 danger 态与快捷键标签/配色走它自己的 theme token/ContextMenu 包装器过不了 prefers_local_handling 闸门）；样式逐条对照 styles.css，勾选「✓ 」文本方案与原版一字不差；焦点开时收走关时先还再跑动作。遗留：键盘方向键导航、menuPopIn 进场动画、遮罩吃掉关闭那一下点击 |
+| 7 | **上下文菜单基建** | 中 | mt-app | ✅ N 批自建 menu.rs（gpui-component 菜单四条硬伤记档：IconName 无资产/无 danger 态与快捷键标签/配色走它自己的 theme token/ContextMenu 包装器过不了 prefers_local_handling 闸门）；样式逐条对照 styles.css，勾选「✓ 」文本方案与原版一字不差；焦点开时收走关时先还再跑动作。遗留清零（polish 批）：键盘方向键导航 ✅、menuPopIn 进场动画 ✅；「遮罩吃掉关闭那一下点击」维持记档不修（与原版差一次点击，自恢复） |
 | 8 | **拖放基建**——项目拖拽排序、拖文件夹加项目、拖文件进终端（外部资源管理器 + 内部 FileTree 两条链路 + 虚线高亮框） | 中 | mt-ui + mt-app | ✅ X 批（合并 `266696e`）。内外拖统一 gpui on_drop（dnd.rs）；⚠️ on_drag_move 无 hitbox 判定、命中闸必须自做（hit_ratio），已进注释；Esc 取消内部拖拽未做（记档） |
 | 9 | **图标体系** | 中 | mt-ui | ✅ K 批组件（BrandIcon 11 家/TechIcon 12 种/FileIcon 53 类/StatusDot 四态勾叉+900ms 旋转；全自绘矢量，判据在 vector.rs 头注释）+ M 批消费（状态灯/tab 与会话面板品牌图标含 or_else(infer) 补 opencode/pi、项目列表 TechIcon、文件树 FileIcon、边条 44px 图标化逐点照抄 ActivityBar SVG + 全局 AI 徽标）。留档清零：dirKinds 探测 ✅ tail-lists 批（探测缓存+三消费点）、文件树 git 着色 ✅ Y 批、项目行状态灯位置 ✅ Y 批 |
 | 10 | **通用命令式弹窗 + 关闭确认** | 小 | mt-app | ✅ N 批。prompt/confirm/alert + open_guarded 按种类防叠开（不同种类可叠，摘表挂 on_close 五条关闭路全覆盖）；关闭确认盘点口径逐字照原版（status∈{ai-working,ai-idle} 不看 ai_session 身份），四条关闭路径统一走 pane_actions，确认后按 id 从最新布局重取；缺 2 词条 fileTree.dialog.createFailed*（原版该处也是静默失败，非回退） |
