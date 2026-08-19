@@ -39,10 +39,10 @@
 
 | # | 缺口 | 规模 | 落点 | 状态 |
 |---|---|---|---|---|
-| 12 | 项目列表补全 | 中 | mt-app | 🟡 N 批落地右键菜单可行项（重命名/编辑描述/资源管理器/复制路径/项目类型子菜单直喂 TechIcon/移除 danger；store 补 rename_project 与 set_project_description）；剩：内联重命名（F2）+ 键盘 + 底部三按钮 + AI 厂商图标堆叠 + worktree 徽章/子项目缩进 + hover 250ms 缩略图 + 菜单里 SSH/环境变量/Worktrees/分组项（随对应功能批） |
+| 12 | 项目列表补全 | 中 | mt-app | ✅ Y 批（`f609bfd`）落地：行内重命名（项目+分组）、AI 厂商图标堆叠、worktree ⎇ 徽章与失效子项目清理、DoneTag、accent 竖条恒占位、底部按钮条（SSH 钮随 #28）、菜单补 Worktrees。剩（记档不阻塞）：键盘导航（F2/Enter/Delete 行级，与全局 F2 绑定同源判定牵 main.rs）、hover 250ms 缩略图（需 MiniTerminalElement 独立件）、菜单 SSH/环境变量项（随 #28/#30） |
 | 13 | **项目分组**：分组行渲染 + 折叠 + createGroup/removeGroup/renameGroup/toggleGroupCollapse/moveItem 五个 action + 拖拽 + 分组右键菜单（`ProjectTreeItem::Group` 已有数据从不渲染） | 大 | mt-app | ✅ X 批（合并 `266696e`）。project_tree.rs 纯函数 41 测；磁盘格式一字不改与 Tauri 互读；分组重命名暂走弹窗（行内编辑归 Y 批）；底部三按钮归 Y 批 §C.3；原版 moveItem 丢子树 bug 已兜底 |
-| 14 | 文件树补全 | 中 | mt-app | 🟡 N 批落地右键菜单（文件 8 项/目录 9 项/根空白新建两项，文件操作走 background executor，新建自动展开父目录；reveal 自落 explorer /select）；剩：头部三按钮（搜索/刷新/外部编辑器选择器）+ loading/错误态 + 键盘导航 + git 状态着色 + 根级单链目录压缩 + 技术栈图标 |
-| 15 | tab 栏补全 | 中 | mt-app | 🟡 N 批落地右键菜单（重命名/两向分屏/关闭两项含 danger 与快捷键标签）与关闭确认（#10）；M 批已加 AI 品牌图标；剩：新建按钮 shell 选择菜单 + 横向滚动 + hover 缩略图 + 分支会话两项（随 fork 批） |
+| 14 | 文件树补全 | 中 | mt-app | ✅ Y 批（`f609bfd`）落地：git 状态着色（含目录汇总，git_watch 多订阅者触发+isAiPty 跳过）、头部三按钮、三态、单链目录压缩（链深 8 封顶）、「查看变更」菜单项。剩（记档不阻塞）：键盘导航 ←→ |
+| 15 | tab 栏补全 | 中 | mt-app | ✅ Y 批（`f609bfd`）落地：新建按钮 shell 选择菜单（<=1 不弹照抄）+ 横向滚动。剩（记档不阻塞）：hover 缩略图（MiniTerminalElement 独立件）+ 分支会话两项（随 fork 批） |
 | 16 | 终端右键菜单 | 中 | mt-app + mt-ui | 🟡 停留复制+气泡 ✅（K+M）；N 批落地复制（无选区置灰）/粘贴（还焦点），与鼠标上报共存走 prefers_local_handling 同源判定（三模式×修饰键有单测）；剩 fork 会话/分支树/SSH 子菜单（随对应功能批） |
 | 17 | 用量面板：custom 自选起止日期 + 自动刷新档位（0/5/10/30/60s 默认 5s）+ 单项目下拉（现仅当前项目开关）+ 排行条点击切 scope + Top 会话点开查看 + 骨架屏/数字滚动 + 偏好持久化 + **价格表拉取**（原版 fetch models.dev，Rust 侧需 HTTP 依赖，现读本地 model-pricing.json 缺省按 $0） | 中 | mt-app | ✅ Q 批。pricing.rs 走「手工裸表→新鲜缓存→拉网(zed-reqwest blocking，净新增 crate=0)→过期缓存→报错」，canonical 建键+全序比较器+0/0 占位丢弃；定时器挂 set_visible 闸；六相位纯函数分派、价格未就绪不渲染 KPI；custom 日期用 Input+纯函数闸门（无日历弹层，原版是浏览器原生 date input）。留：趋势图面积曲线/网格/双轴刻度（需自绘 path chart 件）、.usage-fade-in 与排行条宽度补间（等一次性过渡基件，勿用 with_animation） |
 | 18 | 会话面板：平铺⇄树视图切换 + scan_session_lineage 分支连线 + live pane 状态点跳转 + 品牌图标 + spinner；（SSH 远程来源等 mt-ssh 进 crates 后再说） | 中 | mt-app | 🟡 Q 批完成本体（树视图/lineage 连线走 session_branch.rs 纯函数、挂 visible/stale 惰性闸+request_id 守卫、live 三条件 find_live_session_pane、跳转带 claude cwd 反查并回写 ai_session、四项右键菜单收编行内按钮、WSL spinner 自绘）。剩：SSH 远程来源（等 mt-ssh）、BranchFamilyPanel→fork 批（pane 右键 submenuRender 挂载，只画单支家族，且 menu.rs 需先扩自定义元素子菜单能力）、remoteResumeUnsupported 的 alert→toast 回换（TODO(toast) 在位） |
