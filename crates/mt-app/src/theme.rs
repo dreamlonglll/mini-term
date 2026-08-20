@@ -107,6 +107,12 @@ pub fn apply(config: &AppConfig, window: Option<&mut Window>, cx: &mut App) -> A
     // 代码高亮配色跟着壳配色走(见 [`install_highlight_theme`])。放在这里而不是
     // 三个 return 分支里各写一遍 —— 装配入口只有一个,高亮表也只在这一处装。
     install_highlight_theme(&applied.palette, applied.appearance, cx);
+    // 弹窗遮罩:gpui-component 内置主题的 `overlay` 是 #ffffff08 / #0000000d
+    // (≈3%,肉眼等于没有),而原版所有 Modal 统一压 `bg-black/50`
+    // (`Modal.tsx:171`,亮暗两套同值)。Dialog/Sheet 渲染时读的是
+    // `cx.theme().overlay`,必须放在 apply_inner **之后** ——
+    // switch_to_builtin/switch_to_theme_pack 都会从基线重置整套 colors。
+    gpui_component::Theme::global_mut(cx).colors.overlay = gpui::hsla(0.0, 0.0, 0.0, 0.5);
     applied
 }
 

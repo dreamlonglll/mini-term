@@ -9,9 +9,9 @@
 //!      ├─ ActivityBar(44px 窄边条)                   ← 替 ActivityBar.tsx
 //!      ├─ h_resizable "columns"                      ← 替 Allotment 外层
 //!      │   ├─ panel(可折叠,宽度落 config.layoutSizes[0])
-//!      │   │   └─ h_resizable "middle"               ← 替 Allotment 内层
-//!      │   │       ├─ ProjectList                    ← 项目列表
-//!      │   │       └─ FileTree                       ← 文件树
+//!      │   │   └─ v_resizable "middle"               ← 替 Allotment 内层(vertical)
+//!      │   │       ├─ ProjectList                    ← 项目列表(上)
+//!      │   │       └─ FileTree                       ← 文件树(下)
 //!      │   ├─ panel
 //!      │   │   └─ TerminalArea                       ← SplitNode 树 → 嵌套 resizable
 //!      │   │       └─ (leaf) tab 栏 + TerminalPane 实体
@@ -45,6 +45,7 @@ mod file_tree;
 mod file_viewer;
 mod first_run;
 mod focus_nav;
+mod frost;
 mod fs_ops;
 mod git_changes;
 mod git_diff;
@@ -101,11 +102,13 @@ use std::sync::Arc;
 use futures::StreamExt;
 use gpui::{
     AnimationExt as _, App, AppContext, Application, Bounds, Context, Entity, InteractiveElement,
-    IntoElement, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
+    IntoElement, ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled,
     Subscription, Task, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div,
     prelude::FluentBuilder, px, size,
 };
-use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel};
+// img 的 `object_fit` 是 StyledImage 的方法(毛玻璃背板那两处在用)
+use gpui::StyledImage as _;
+use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel, v_resizable};
 use gpui_component::tooltip::Tooltip;
 use gpui_component::{Root, WindowExt as _};
 use mt_ui::icons::{StatusDot, StatusKind};
@@ -297,6 +300,9 @@ struct Workspace {
     /// 抽屉左缘正在被拖。`Some` 期间宽度由本结构自持,松手才落盘。
     drawer_drag: Option<DrawerDrag>,
     usage_open: bool,
+    /// 弹窗毛玻璃背板的快照(见 [`frost`] 模块注释)。弹窗/用量面板从无到有的
+    /// 第一帧抓一次,期间沿用,全关即弃 —— 开着时再抓会把弹窗自己抓进去。
+    frost: Option<std::sync::Arc<gpui::RenderImage>>,
     /// 启动自检发现的新版本(`None` = 没有 / 还没查完 / 查失败)。
     ///
     /// 与原版 `App.tsx:89` 的 `updateInfo` 同一份状态:只在进程内活着,不落盘,
@@ -445,6 +451,7 @@ impl Workspace {
             drawer_exit: None,
             drawer_drag: None,
             usage_open: false,
+            frost: None,
             update_release: None,
             tray,
             _update_check: update_check,
@@ -1031,23 +1038,38 @@ impl Render for Workspace {
             )
         };
 
+        // 弹窗毛玻璃背板:Dialog 族或用量面板**从无到有的第一帧**抓一次快照
+        // (那一刻 DWM 的上一帧还没有弹窗),期间沿用,全关即弃 —— 开着时再抓
+        // 会把弹窗自己抓进去。时序论证与取舍见 frost.rs 模块注释。
+        let dialog_open = window.has_active_dialog(cx);
+        let frost_wanted = dialog_open || self.usage_open;
+        if frost_wanted {
+            if self.frost.is_none() {
+                self.frost = frost::capture(window);
+            }
+        } else if self.frost.is_some() {
+            self.frost = None;
+        }
+
         let store_for_columns = self.store.clone();
         let store_for_middle = self.store.clone();
         // 拖拽期间宽度自持,松手才落盘(与原版 `RightDrawer` 的 `onResizeEnd` 同)
         let drawer_width = self.drawer_drag.map(|d| d.width).unwrap_or(drawer_width);
 
-        let middle_group = h_resizable("middle-column")
+        // 中间栏是**上下**结构:ProjectList 在上、FileTree 在下(`App.tsx:501-512`
+        // 的 `<Allotment vertical>`,minSize 100/120、无上限,高度落 middleColumnSizes)
+        let middle_group = v_resizable("middle-column")
             .with_state(&self.middle_state)
             .child(
                 resizable_panel()
                     .size(px(middle[0] as f32))
-                    .size_range(px(100.0)..px(600.0))
+                    .size_range(px(100.0)..Pixels::MAX)
                     .child(self.project_list.clone()),
             )
             .child(
                 resizable_panel()
                     .size(px(middle[1] as f32))
-                    .size_range(px(120.0)..px(800.0))
+                    .size_range(px(120.0)..Pixels::MAX)
                     .child(self.file_tree.clone()),
             )
             .on_resize(move |state, _window, cx| {
@@ -1363,56 +1385,84 @@ impl Render for Workspace {
         });
 
         let usage_layer = self.usage_panel.clone().filter(|_| self.usage_open).map(|panel| {
+            // 原版用量统计是 Modal(`UsageStatsModal.tsx:397`,fixed inset-0,
+            // **盖住标题栏**),遮罩统一 `bg-black/50 backdrop-blur-sm`
+            // (`Modal.tsx:171`)。毛玻璃由**根层那张共用快照**承担(与 Dialog
+            // 族同一层,见 render 尾部)—— 挂根层而不是 body:body 版本盖不到
+            // 标题栏、内嵌玻璃还会被拉伸错位,与设置弹窗观感不一致(用户实测)。
+            // 遮罩上**按下**即关(mousedown 语义 —— 面板里按下、拖出去松手
+            // 不误关);面板自己 stop_propagation 挡掉冒泡(`Modal.tsx:180` 同款)。
             div()
                 .absolute()
-                .top(px(24.0))
-                .left(px(60.0))
-                .right(px(60.0))
-                .bottom(px(24.0))
+                .inset_0()
                 .occlude()
-                .rounded(px(6.0))
-                .border_1()
-                .border_color(ui::border_default())
-                .overflow_hidden()
-                .flex()
-                .flex_col()
+                .bg(gpui::hsla(0.0, 0.0, 0.0, 0.5))
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, _event, window, cx| {
+                        if this.usage_open {
+                            this.toggle_usage(window, cx);
+                        }
+                    }),
+                )
                 .child(
                     div()
+                        .absolute()
+                        .top(px(24.0))
+                        .left(px(60.0))
+                        .right(px(60.0))
+                        .bottom(px(24.0))
+                        .occlude()
+                        // 面板内按下不冒泡到遮罩(原版 `Modal.tsx:180` 的
+                        // stopPropagation 同款),否则点面板空白处也会关窗
+                        .on_mouse_down(gpui::MouseButton::Left, |_event, _window, cx| {
+                            cx.stop_propagation();
+                        })
+                        .rounded(px(6.0))
+                        .border_1()
+                        .border_color(ui::border_default())
+                        .overflow_hidden()
                         .flex()
-                        .items_center()
-                        .justify_between()
-                        .px(px(12.0))
-                        .py(px(6.0))
-                        .bg(ui::bg_elevated())
+                        .flex_col()
                         .child(
                             div()
-                                .text_size(crate::ui::font_px(12.0))
-                                .text_color(ui::text_primary())
-                                .child(t("usageStats", "title")),
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .px(px(12.0))
+                                .py(px(6.0))
+                                .bg(ui::bg_elevated())
+                                .child(
+                                    div()
+                                        .text_size(crate::ui::font_px(12.0))
+                                        .text_color(ui::text_primary())
+                                        .child(t("usageStats", "title")),
+                                )
+                                .child(
+                                    div()
+                                        .id("usage-close")
+                                        .px(px(6.0))
+                                        .text_color(ui::text_muted())
+                                        .cursor_pointer()
+                                        .hover(|el| el.text_color(ui::color_error()))
+                                        // 走 toggle 而不是直接改标志位 —— 可见性要透给
+                                        // 面板,否则关掉之后自动刷新定时器还在每 5s 跑
+                                        .on_click(cx.listener(|this, _event, window, cx| {
+                                            if this.usage_open {
+                                                this.toggle_usage(window, cx);
+                                            }
+                                        }))
+                                        .child("×"),
+                                ),
                         )
-                        .child(
-                            div()
-                                .id("usage-close")
-                                .px(px(6.0))
-                                .text_color(ui::text_muted())
-                                .cursor_pointer()
-                                .hover(|el| el.text_color(ui::color_error()))
-                                // 走 toggle 而不是直接改标志位 —— 可见性要透给
-                                // 面板,否则关掉之后自动刷新定时器还在每 5s 跑
-                                .on_click(cx.listener(|this, _event, window, cx| {
-                                    if this.usage_open {
-                                        this.toggle_usage(window, cx);
-                                    }
-                                }))
-                                .child("×"),
-                        ),
+                        .child(div().flex_1().overflow_hidden().child(panel)),
                 )
-                .child(div().flex_1().overflow_hidden().child(panel))
         });
 
-        // 三栏 + 悬浮抽屉/浮层的那一层。标题栏之下的**全部**内容都在这里 ——
-        // 原版同款(`App.tsx:478` 的 `flex-1 overflow-hidden flex`),抽屉与用量
-        // 面板的 `absolute` 于是不会盖到标题栏上。
+        // 三栏 + 悬浮抽屉的那一层。标题栏之下的**全部**内容都在这里 ——
+        // 原版同款(`App.tsx:478` 的 `flex-1 overflow-hidden flex`),抽屉的
+        // `absolute` 于是不会盖到标题栏上。用量面板**不在这里**:它是 Modal
+        // (原版 fixed inset-0,遮罩要盖住标题栏),挂根层与 Dialog 族同构。
         let body = div()
             .flex_1()
             .overflow_hidden()
@@ -1421,7 +1471,6 @@ impl Render for Workspace {
             .child(toggle_strip)
             .child(div().flex_1().h_full().child(columns_group))
             .children(drawer_layer)
-            .children(usage_layer)
             // 自建 toast 层。挂在 `body`(它是 `relative`)里而不是根上 ——
             // 原版 `.toast-stack` 贴的是视口右下角(`fixed right:16 bottom:16`),
             // 标题栏在上面本来就碰不到它;挂进 body 后底边就是窗口底边,等价。
@@ -1511,6 +1560,21 @@ impl Render for Workspace {
             })
             .child(self.title_bar.clone())
             .child(body)
+            // 弹窗毛玻璃背板:垫在用量面板与 Dialog 层之下、其余一切之上
+            // (含标题栏 —— 原版 Modal 是 `fixed inset-0`,遮罩同样盖住标题栏)。
+            // 压暗不在这层:Dialog 走自己的 `cx.theme().overlay`(black/50,
+            // theme.rs::apply 钉的),用量面板走 usage_layer 自己的 black/50 ——
+            // 两族弹窗共用同一张玻璃,观感一致(用户实测口径)。
+            .children(self.frost.clone().filter(|_| frost_wanted).map(|img| {
+                div().absolute().inset_0().child(
+                    gpui::img(img)
+                        .size_full()
+                        .object_fit(gpui::ObjectFit::Fill),
+                )
+            }))
+            // 用量统计(自绘 Modal):玻璃之上、Dialog 层之下 —— Dialog 叠开时
+            // (如面板里再弹确认框)压在它上面,与原版 Modal 叠 Modal 同序。
+            .children(usage_layer)
             // Modal 由 Root 持有,但要由应用视图**画出来**。
             // (它自己走 `anchored()` 定在视口中央,挂哪一层都一样;
             //  通知层不同 —— 见 `body` 那边的注释。)

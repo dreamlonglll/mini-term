@@ -39,7 +39,7 @@ use gpui::{
 };
 use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel, v_resizable};
 use gpui_component::tooltip::Tooltip;
-use mt_ui::icons::{AiVendor, BrandIcon};
+use mt_ui::icons::{AiVendor, BrandIcon, Geom, Ink, Shape, VectorIcon};
 
 use crate::branch_family;
 use crate::focus_nav::{self, Direction, PaneRect};
@@ -109,17 +109,90 @@ pub struct TerminalArea {
 
 /// 控件簇里 marker 按钮**右缘**到叶子右边缘的距离。
 ///
-/// 簇是 `.gap(2).px(6)` 后跟三个 22×22 的方钮(分屏右 / 分屏下 / 关整组),
-/// marker 按钮排在它们之前(原版 `PaneGroup.tsx:489` 同样排在「终端内查找」之前,
-/// 而 GPUI 侧没有查找按钮),自己还带 4px 右外边距(原版的 `mr-1`)。
+/// 簇是 `.gap(2).px(6)` 后跟四个 22×22 的方钮(终端内查找 / 分屏右 / 分屏下 /
+/// 关整组,与原版 `PaneGroup.tsx:489-541` 同序),marker 按钮排在它们之前,
+/// 自己还带 4px 右外边距(原版的 `mr-1`)。查找按钮与 marker 按钮同以
+/// 「pane 有 pty」为前提 —— 凡是 marker 浮层要用这个锚点的场景四钮必然齐。
 /// 原版是 `getBoundingClientRect()` 量出来的,这里由布局常量算 ——
 /// 加减控件时**必须同步改这个常量**,有单测钉着组成。
 const MARKER_ANCHOR_INSET: f32 =
-    CTRL_CLUSTER_PAD + 3.0 * (CTRL_BTN + CTRL_GAP) + MARKER_BTN_MARGIN_RIGHT;
+    CTRL_CLUSTER_PAD + 4.0 * (CTRL_BTN + CTRL_GAP) + MARKER_BTN_MARGIN_RIGHT;
 const CTRL_CLUSTER_PAD: f32 = 6.0;
 const CTRL_BTN: f32 = 22.0;
 const CTRL_GAP: f32 = 2.0;
 const MARKER_BTN_MARGIN_RIGHT: f32 = 4.0;
+
+// ─── 控件簇的描边图标(照抄 `PaneGroup.tsx:40-62` 的 SVG,viewBox 16 归一化;
+//     自绘理由见 `mt_ui::icons::vector` 模块注释,换算套路同 `activity_bar`)───
+
+/// 单位方框换算:原版 viewBox 是 `0 0 16 16`,除以 16 即可。
+const fn cu(v: f32) -> f32 {
+    v / 16.0
+}
+/// 原版这组图标统一 `stroke-width="1.3"`。
+const CTRL_STROKE: f32 = 1.3 / 16.0;
+
+/// 终端内查找。原版 `ICON_SEARCH`:`<circle cx="7" cy="7" r="4.2"/>` +
+/// `<path d="M10.2 10.2L14 14"/>`。
+const ICON_SEARCH: &[Shape] = &[
+    Shape::line(
+        Ink::Current,
+        CTRL_STROKE,
+        Geom::Circle {
+            c: (cu(7.0), cu(7.0)),
+            r: cu(4.2),
+        },
+    ),
+    Shape::line(
+        Ink::Current,
+        CTRL_STROKE,
+        Geom::Polyline(&[(cu(10.2), cu(10.2)), (cu(14.0), cu(14.0))]),
+    ),
+];
+
+/// 向右分屏。原版 `ICON_SPLIT_RIGHT`:
+/// `<rect x="2" y="3" width="12" height="10" rx="1.5"/>` + `<path d="M8 3v10"/>`。
+const ICON_SPLIT_RIGHT: &[Shape] = &[
+    Shape::line(
+        Ink::Current,
+        CTRL_STROKE,
+        Geom::Rect {
+            x: cu(2.0),
+            y: cu(3.0),
+            w: cu(12.0),
+            h: cu(10.0),
+            round: cu(1.5),
+        },
+    ),
+    Shape::line(
+        Ink::Current,
+        CTRL_STROKE,
+        Geom::Polyline(&[(cu(8.0), cu(3.0)), (cu(8.0), cu(13.0))]),
+    ),
+];
+
+/// 向下分屏。原版 `ICON_SPLIT_DOWN`:同一只外框 + `<path d="M2 8h12"/>`。
+const ICON_SPLIT_DOWN: &[Shape] = &[
+    Shape::line(
+        Ink::Current,
+        CTRL_STROKE,
+        Geom::Rect {
+            x: cu(2.0),
+            y: cu(3.0),
+            w: cu(12.0),
+            h: cu(10.0),
+            round: cu(1.5),
+        },
+    ),
+    Shape::line(
+        Ink::Current,
+        CTRL_STROKE,
+        Geom::Polyline(&[(cu(2.0), cu(8.0)), (cu(14.0), cu(8.0))]),
+    ),
+];
+
+/// 图标在 22×22 方钮里的边长(原版 SVG 是 13×13)。
+const CTRL_ICON: f32 = 13.0;
 
 /// 浮层宽度。原版是 `min-w-[280px]` + 内容撑开,gpui 侧要给正文列一个确定宽度
 /// 才truncate得动,取固定值 —— 差别只在「超长正文时原版会更宽」。
@@ -829,7 +902,6 @@ impl TerminalArea {
         };
 
         let store = self.store.read(cx);
-        let focused_pane = store.focused_pane_id.clone();
         let active = panes
             .iter()
             .find(|p| &p.id == active_pane_id)
@@ -855,11 +927,6 @@ impl TerminalArea {
             .pty_id
             .map(|id| store.markers_for_pty(id).len())
             .unwrap_or(0);
-        // 焦点落在本组内 = 高亮边框(旧版靠 tab 的 accent 条 + xterm 焦点两处表达)
-        let group_focused = focused_pane
-            .as_deref()
-            .map(|id| panes.iter().any(|p| p.id == id))
-            .unwrap_or(false);
         let unread: Vec<bool> = panes.iter().map(|p| store.is_pane_unread_done(&p.id)).collect();
         // tab 上的 AI 品牌图标:显示条件与 agent 取值都照抄原版(见 PaneState 上
         // 的两个方法);`aiAutoResume` 缺省开启,与 store 里那处取值同口径
@@ -1148,18 +1215,39 @@ impl TerminalArea {
                 .child("+"),
         );
 
-        // 右侧:分屏 / 关整组
-        let ctrl = |label: &'static str| {
+        // 右侧:查找 / 分屏 / 关整组(原版 `ctrlBtn`:常驻 60% 透明度,hover 全亮
+        // + `--border-subtle` 底。图标是 `PaneGroup.tsx:40-62` 那几条 SVG 的自绘
+        // 搬运;VectorIcon 的 ink 定死在构造期,hover 换色进不去 —— 与
+        // `activity_bar::strip_button` 同取舍,反馈靠透明度与底色变化)
+        let ctrl_icon = |id: gpui::SharedString, shapes: &'static [Shape]| {
             div()
+                .id(id)
                 .flex()
                 .items_center()
                 .justify_center()
                 .w(px(CTRL_BTN))
                 .h(px(CTRL_BTN))
                 .rounded(px(3.0))
-                .text_color(ui::text_muted())
-                .child(label)
+                .cursor_pointer()
+                .opacity(0.6)
+                .hover(|el| el.opacity(1.0).bg(ui::border_subtle()))
+                .child(VectorIcon::new(shapes, px(CTRL_ICON)).ink(ui::text_muted()))
         };
+        // 终端内查找:与 marker 按钮同一道「有 pty 才画」的闸
+        // (原版 `PaneGroup.tsx:504`,`activePane.ptyId !== undefined`)
+        let search_btn = active.pty_id.map(|pty_id| {
+            ctrl_icon(
+                gpui::SharedString::from(format!("term-search-{leaf}")),
+                ICON_SEARCH,
+            )
+            .on_click(cx.listener(move |this, _event, window, cx| {
+                cx.stop_propagation();
+                let pane = this.store.read(cx).terminal(pty_id).cloned();
+                if let Some(pane) = pane {
+                    pane.update(cx, |pane, cx| pane.open_search(window, cx));
+                }
+            }))
+        });
         // ⚑ N:图标是**文本字符**,不是 SVG(与 menu.rs 的 `✓ ` 同一套理由);
         // 宽度不固定,所以不复用上面那个 22×22 的方钮。
         let marker_pty = active.pty_id.filter(|_| marker_count > 0);
@@ -1208,47 +1296,60 @@ impl TerminalArea {
                 .gap(px(CTRL_GAP))
                 .px(px(CTRL_CLUSTER_PAD))
                 .children(marker_btn)
+                .children(search_btn)
                 .child(
-                    div()
-                        .id(gpui::SharedString::from(format!("split-right-{leaf}")))
-                        .cursor_pointer()
-                        .hover(|el| el.text_color(ui::accent()))
-                        .on_click(cx.listener(move |this, _event, window, cx| {
-                            this.store.update(cx, |store, cx| {
-                                store.split_pane(
-                                    &pid_right,
-                                    &anchor_right,
-                                    SplitDirection::Horizontal,
-                                    window,
-                                    cx,
-                                );
-                            });
-                        }))
-                        .child(ctrl("⬓")),
+                    ctrl_icon(
+                        gpui::SharedString::from(format!("split-right-{leaf}")),
+                        ICON_SPLIT_RIGHT,
+                    )
+                    .on_click(cx.listener(move |this, _event, window, cx| {
+                        this.store.update(cx, |store, cx| {
+                            store.split_pane(
+                                &pid_right,
+                                &anchor_right,
+                                SplitDirection::Horizontal,
+                                window,
+                                cx,
+                            );
+                        });
+                    })),
                 )
                 .child(
-                    div()
-                        .id(gpui::SharedString::from(format!("split-down-{leaf}")))
-                        .cursor_pointer()
-                        .hover(|el| el.text_color(ui::accent()))
-                        .on_click(cx.listener(move |this, _event, window, cx| {
-                            this.store.update(cx, |store, cx| {
-                                store.split_pane(
-                                    &pid_down,
-                                    &anchor_down,
-                                    SplitDirection::Vertical,
-                                    window,
-                                    cx,
-                                );
-                            });
-                        }))
-                        .child(ctrl("⬒")),
+                    ctrl_icon(
+                        gpui::SharedString::from(format!("split-down-{leaf}")),
+                        ICON_SPLIT_DOWN,
+                    )
+                    .on_click(cx.listener(move |this, _event, window, cx| {
+                        this.store.update(cx, |store, cx| {
+                            store.split_pane(
+                                &pid_down,
+                                &anchor_down,
+                                SplitDirection::Vertical,
+                                window,
+                                cx,
+                            );
+                        });
+                    })),
                 )
                 .child(
+                    // × 仍是文本字形:hover 转 error 色要跟随文本色,VectorIcon
+                    // 进不去(见 ctrl_icon 的注释);盒子样式与图标钮同一套
                     div()
                         .id(gpui::SharedString::from(format!("close-leaf-{leaf}")))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .w(px(CTRL_BTN))
+                        .h(px(CTRL_BTN))
+                        .rounded(px(3.0))
                         .cursor_pointer()
-                        .hover(|el| el.text_color(ui::color_error()))
+                        .opacity(0.6)
+                        .text_color(ui::text_muted())
+                        .hover(|el| {
+                            el.opacity(1.0)
+                                .bg(ui::border_subtle())
+                                .text_color(ui::color_error())
+                        })
                         // 控制条的 × 关的是**整组**,同样先确认(原版 closeLeaf)
                         .on_click(cx.listener(move |this, _event, window, cx| {
                             pane_actions::close_leaf(
@@ -1259,7 +1360,7 @@ impl TerminalArea {
                                 cx,
                             );
                         }))
-                        .child(ctrl("×")),
+                        .child("×"),
                 ),
         );
 
@@ -1278,17 +1379,20 @@ impl TerminalArea {
         let this = cx.entity();
         let rect_pane_id = active_id.clone();
 
+        // ⚠️ 不刷底色:终端区着色**只保留 TerminalArea 根容器一层**(见 render 尾部
+        // 那句 `.bg(ui::bg_terminal())`)。原版同款口径 —— `styles.css:151` 与
+        // `themePackManager.ts:294`「着色统一由 --bg-terminal 容器层承担,避免
+        // 容器/wrapper/xterm 三层叠加」:背景图主题下 bg_terminal 是半透明 rgba,
+        // 这里再刷一层就是透明度叠乘,图被盖死(原版 PaneGroup 根也没有背景)。
+        //
+        // 也**不画边框**:原版 PaneGroup 根没有任何 border(`PaneGroup.tsx:393`),
+        // 焦点表达靠激活 tab 的 accent 顶线 + 光标实心/空心两处;此前的
+        // group_focused accent 描边是 GPUI 侧自加的,真机上整圈橙线喧宾夺主
+        // (用户报障),按原版口径删除。
         div()
             .size_full()
             .flex()
             .flex_col()
-            .bg(ui::bg_terminal())
-            .border_1()
-            .border_color(if group_focused {
-                ui::accent()
-            } else {
-                ui::border_subtle()
-            })
             .child(bar)
             .child(
                 div()
@@ -1892,13 +1996,15 @@ mod tests {
     /// 加减控件时这条会提醒同步改 [`MARKER_ANCHOR_INSET`]。
     #[test]
     fn 标记浮层锚点按控件簇布局算() {
-        // 右侧簇:px-6 + 三个 22×22 方钮(各带 2px gap)+ marker 自己的 4px 右边距
-        assert_eq!(MARKER_ANCHOR_INSET, 6.0 + 3.0 * 24.0 + 4.0);
-        assert_eq!(MARKER_ANCHOR_INSET, 82.0);
+        // 右侧簇:px-6 + 四个 22×22 方钮(查找/分屏右/分屏下/关整组,各带 2px gap)
+        // + marker 自己的 4px 右边距;查找钮与 marker 同以「有 pty」为前提,
+        // 浮层用到锚点时四钮必然齐
+        assert_eq!(MARKER_ANCHOR_INSET, 6.0 + 4.0 * 24.0 + 4.0);
+        assert_eq!(MARKER_ANCHOR_INSET, 106.0);
         // 面板右缘贴按钮右缘 → 左缘 = 叶右缘 - inset - 面板宽
         let leaf_right = 1000.0_f32;
         let left = leaf_right - MARKER_ANCHOR_INSET - MARKER_PANEL_WIDTH;
-        assert_eq!(left, 1000.0 - 82.0 - 300.0);
+        assert_eq!(left, 1000.0 - 106.0 - 300.0);
     }
 
     /// 浮层的存活判据:pane 还在、还是激活 tab、pty 没换。

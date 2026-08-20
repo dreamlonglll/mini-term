@@ -655,7 +655,8 @@ impl TerminalPane {
 
     /// 换终端配色(主题包切换 / 亮暗切换)。
     ///
-    /// 宿主这份 `theme` 也要更新 —— `.bg()` 与 OSC 调色板应答用得着。
+    /// 宿主这份 `theme` 也要更新 —— OSC 调色板应答用得着(宿主已不再 `.bg()`,
+    /// 终端区着色由 TerminalArea 根容器单层承担)。
     pub fn set_theme(&mut self, theme: TerminalTheme, cx: &mut Context<Self>) {
         if self.theme == theme {
             return;
@@ -1170,9 +1171,10 @@ fn scroll_delta_to_top(line: i32, display_offset: i32, history: i32) -> i32 {
 impl Render for TerminalPane {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(err) = self.spawn_error.clone() {
+            // 不刷底色:着色由 TerminalArea 根容器那层 bg_terminal 承担(单层规则,
+            // 见 terminal_area.rs pane 组容器处的说明)
             return div()
                 .size_full()
-                .bg(self.theme.background)
                 .flex()
                 .items_center()
                 .justify_center()
@@ -1182,11 +1184,13 @@ impl Render for TerminalPane {
         }
 
         // 焦点 / key_context / 按键 / 左键聚焦全在 TerminalView 里,这里只剩一行。
-        // `.bg()` 留在宿主:主题带背景图时终端背景是半透明的,画两层等于把透明度平方。
+        // 宿主**不刷底色**:终端区着色只保留 TerminalArea 根容器一层 bg_terminal
+        // (原版 `themePackManager.ts:294` 的单层口径)。背景图主题下终端背景是
+        // 半透明的,区根/pane 组/宿主逐层重复刷等于透明度叠乘,图会被盖死 ——
+        // 曾经三层 0.6 叠出 ≈0.94,真机实测背景图几乎不可见。
         div()
             .size_full()
             .relative()
-            .bg(self.theme.background)
             // 终端右键菜单(`TerminalInstance.tsx` 的 handleContextMenu):
             // 「复制 / 粘贴」+ 分支段 + SSH 子菜单段。
             .on_mouse_down(

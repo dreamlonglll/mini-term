@@ -1103,10 +1103,33 @@ impl FileViewer {
                     return self.render_markdown(window, cx);
                 }
                 match &self.editor {
-                    Some(editor) => div()
-                        .size_full()
-                        .child(Input::new(editor).h_full().appearance(false).bordered(false))
-                        .into_any_element(),
+                    Some(editor) => {
+                        // 编辑器排版对齐原版 `CodeEditor.tsx:109-129`:固定 13px
+                        // (字面量,**不随 uiFontSize 缩放** —— 原版就是 '13px' 而非
+                        // rem)、行高 1.6、字族 `--app-font-mono`。原版的 mono 链是
+                        // JetBrains Mono → Cascadia Code → Consolas;gpui 字族单值,
+                        // 主族取 Win11 自带的 Cascadia Code,链尾走 font_fallbacks
+                        // (含 CJK/emoji 兜底,文件里的中文注释靠它)。用户配置过
+                        // uiFontFamily 时原版把 `--app-font-mono` 一并覆盖
+                        // (fontManager.ts:8-18),这里同样让它优先。Input 与行号列
+                        // 都吃 window.text_style(),包一层即全部生效。
+                        let mut wrap = div().size_full();
+                        let ts = wrap.text_style().get_or_insert_default();
+                        ts.font_family = Some(
+                            ui::ui_font_family().unwrap_or_else(|| "Cascadia Code".into()),
+                        );
+                        ts.font_fallbacks = Some(gpui::FontFallbacks::from_fonts(vec![
+                            "Cascadia Mono".into(),
+                            "Consolas".into(),
+                            "JetBrains Mono".into(),
+                            "Microsoft YaHei".into(),
+                            "Segoe UI Emoji".into(),
+                        ]));
+                        ts.font_size = Some(px(13.0).into());
+                        ts.line_height = Some(gpui::relative(1.6).into());
+                        wrap.child(Input::new(editor).h_full().appearance(false).bordered(false))
+                            .into_any_element()
+                    }
                     None => div().into_any_element(),
                 }
             }

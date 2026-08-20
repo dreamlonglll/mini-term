@@ -85,7 +85,6 @@
 //! div()
 //!     .size_full()
 //!     .relative()
-//!     .bg(self.theme.background)
 //!     .child(self.view.clone())          // ← 只剩这一行
 //!     .when(self.exited, …)
 //! ```
@@ -95,7 +94,9 @@
 //! ——这四样现在由 [`TerminalView`] 自己做。留着会导致按键被处理两遍。
 //! `TerminalPane::on_key_down` 整个方法可以删（`paste` 同理）。
 //!
-//! `.bg()` 留在宿主：主题带背景图时终端背景是半透明的,画两层等于把透明度平方。
+//! 宿主也**不要 `.bg()`**：主题带背景图时终端背景是半透明的,着色只保留最外层
+//! 容器一层(mt-app 是 TerminalArea 根),宿主/视图再刷就是透明度叠乘把图盖死
+//! (原版 `themePackManager.ts:294` 的单层口径)。
 //!
 //! ## 4. OSC 调色板应答改成一行
 //!
@@ -113,7 +114,7 @@
 //! ## 换主题时
 //!
 //! `self.view.update(cx, |v, cx| v.set_theme(theme, cx))`；`TerminalPane` 自己那份
-//! `theme` 字段仍要更新（`.bg()` 与 OSC 应答用得着）。
+//! `theme` 字段仍要更新（OSC 应答用得着）。
 //!
 //! # 后加的三件(滚动条 / 停留复制 / 背景图)——都是**可选**的
 //!
