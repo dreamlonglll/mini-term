@@ -8,6 +8,7 @@ export const terminal = {
     sshConnectEmpty: "SSH 连接（暂无）",
     dropToInsertPath: "释放以插入路径",
     pasteUploadFailed: "粘贴内容上传到远程失败：{detail}",
+    pasteImageNoRemote: "远程连接不可用，剪贴板图片未粘贴",
   },
   en: {
     ungrouped: "Ungrouped",
@@ -18,5 +19,6 @@ export const terminal = {
     sshConnectEmpty: "SSH Connection (none)",
     dropToInsertPath: "Drop to insert path",
     pasteUploadFailed: "Failed to upload pasted content to the remote host: {detail}",
+    pasteImageNoRemote: "Remote connection unavailable; the clipboard image was not pasted",
   },
 } as const;

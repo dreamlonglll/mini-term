@@ -53,7 +53,7 @@ use mt_ui::{
 };
 
 use crate::ai::AiBridge;
-use crate::clipboard::{self, PasteTarget};
+use crate::clipboard::{self, ClipboardImage, PasteTarget, RemotePaste};
 use crate::i18n::{t, tr};
 use crate::markers::MarkerBatch;
 use crate::menu::{self, MenuItem};
@@ -857,10 +857,70 @@ impl Focusable for TerminalPane {
     }
 }
 
-/// 一次粘贴该往终端里写什么(`terminalCache.ts::pasteToTerminalInner` 的文本那一半)。
+/// 一次粘贴要用到的壳侧上下文(阈值配置 + pane 归属 + 远程连接)。
+///
+/// 图片与长文本两条路线都要它,且都在**读到剪贴板之前**就得备好 ——
+/// 所以单独取一次,不跟着某一条分支走。
+struct PasteContext {
+    /// 长文本转文件的总开关。**图片不看它**:终端本来就粘不了图,不转文件
+    /// 就只剩 `Alt+V`(装机版同款口径)。
+    enabled: bool,
+    line_threshold: u32,
+    char_threshold: u32,
+    target: PasteTarget,
+    /// toast 的归属项目;取不到就是空串(`push_message` 能吃)。
+    project_id: String,
+    project_name: String,
+    /// 远程 pane 的上传素材:连接 + 远程项目路径。断链时为 `None`。
+    remote: Option<(mt_config::SshConnection, String)>,
+    remote_paste_dir: String,
+}
+
+/// 取一次粘贴上下文。失败提示的标题行在这里定死,不会为空。
+fn paste_context(pty_id: u32, cx: &gpui::App) -> PasteContext {
+    let store = AppStore::global(cx);
+    let s = store.read(cx);
+    let cfg = s.config();
+    let owner = s.pane_of_pty(pty_id);
+    // 失败提示的标题行:项目名 →(取不到)pane 标签 →(还取不到)pty 编号。
+    // 规格把「原版本地失败时拿到 undefined 项目名」记成隐性缺陷并要求补兜底,
+    // 这一串就是那个兜底 —— 标题行永远不为空。
+    let project_name = owner
+        .as_ref()
+        .and_then(|(pid, _)| s.project(pid))
+        .map(|p| p.name.clone())
+        .or_else(|| {
+            owner.as_ref().and_then(|(pid, pane_id)| {
+                s.project_state(pid)
+                    .and_then(|st| st.layout.as_ref())
+                    .and_then(|l| l.pane(pane_id))
+                    .map(|p| p.label().to_string())
+            })
+        })
+        .unwrap_or_else(|| format!("pane {pty_id}"));
+    let remote = owner.as_ref().and_then(|(pid, _)| {
+        let project = s.project(pid)?;
+        let conn = s.remote_connection_of(pid)?;
+        Some((conn, project.path.clone()))
+    });
+    PasteContext {
+        enabled: cfg.long_paste_to_file,
+        line_threshold: cfg.long_paste_line_threshold,
+        char_threshold: cfg.long_paste_char_threshold,
+        target: clipboard::resolve_paste_target(s, pty_id),
+        project_id: owner.map(|(pid, _)| pid).unwrap_or_default(),
+        project_name,
+        remote,
+        remote_paste_dir: cfg.remote_paste_dir.clone(),
+    }
+}
+
+/// 一次粘贴该往终端里写什么(`terminalCache.ts::pasteToTerminalInner`)。
 ///
 /// ```text
-/// 剪贴板取文本 → 空则什么都不做
+/// 剪贴板有图 → 落盘 → 写 "{映射后的路径}";远程 pane 交给后台上传
+///   └─ 有图但读不出 → 发 Alt+V,让终端里的 AI 工具自己读剪贴板
+/// 否则取文本 → 空则什么都不做
 /// 开关开着 && 命中阈值
 ///   ├─ 远程 pane 且连接在场 → 交给后台任务(转存 + SFTP 上传 + 写远端路径),
 ///   │                        当场返回 None(语义 = 宿主已接管)
@@ -869,13 +929,12 @@ impl Focusable for TerminalPane {
 /// 否则 → 按 bracketed paste 粘原文
 /// ```
 ///
-/// # 与原版的两处偏差(逐条有理由)
+/// # 与原版的一处偏差
 ///
-/// 1. **剪贴板图片不处理** —— 那是另一个缺口,见 [`crate::clipboard`] 模块注释;
-/// 2. **本地转存失败也弹 toast**。原版 `notifyPasteFailure` 开头就
-///    `if (target.kind !== 'ssh') return`,本地写盘失败只有 console.error ——
-///    规格把这条记成原版的隐性缺陷并建议「补一个兜底项目名」,这里照办:
-///    项目名取该 pane 所属项目,取不到就退回 pane 的显示名。
+/// **本地转存失败也弹 toast**。原版 `notifyPasteFailure` 开头就
+/// `if (target.kind !== 'ssh') return`,本地写盘失败只有 console.error ——
+/// 规格把这条记成原版的隐性缺陷并建议「补一个兜底项目名」,这里照办:
+/// 项目名取该 pane 所属项目,取不到就退回 pane 的显示名。
 ///
 /// # 为什么是自由函数而不是 `TerminalPane` 的方法
 ///
@@ -883,73 +942,50 @@ impl Focusable for TerminalPane {
 /// `self.view.update(...)`,那就是同一实体的嵌套 update(gpui 当场 panic)。
 /// 自由函数只拿 `pty_id` + `&mut App`,连碰到视图的机会都没有。
 fn resolve_paste(pty_id: u32, cx: &mut gpui::App) -> PasteAction {
-    let Some(text) = cx.read_from_clipboard().and_then(|it| it.text()) else {
+    let ctx = paste_context(pty_id, cx);
+    // 剪贴板**只读一次**:判图与取文本看同一份快照,免得用户在两次读之间换了
+    // 内容,出现「判定是图、粘出来是文本」。
+    let item = cx.read_from_clipboard();
+
+    // 图片先判 —— 截图工具放进剪贴板的只有位图,没有文本可粘,这一支不判阈值
+    // 也不看 `enabled`。
+    match clipboard::read_clipboard_image(item.as_ref()) {
+        ClipboardImage::Saved(path) => return paste_image(pty_id, path, ctx, cx),
+        // 有图却读不出(BI_BITFIELDS 之类):退 Alt+V 让 AI 工具自己去读。
+        // **绝不能**掉进下面的文本分支 —— 图文混排时会把 alt 文字当正文粘。
+        ClipboardImage::Unreadable => return PasteAction::Raw(clipboard::ALT_V.to_string()),
+        ClipboardImage::None => {}
+    }
+
+    let Some(text) = item.and_then(|it| it.text()) else {
         return PasteAction::None;
     };
     if text.is_empty() {
         return PasteAction::None;
     }
 
-    let store = AppStore::global(cx);
-    #[allow(clippy::type_complexity)]
-    let (
+    let PasteContext {
         enabled,
         line_threshold,
         char_threshold,
         target,
         project_id,
         project_name,
-        remote_ctx,
+        remote,
         remote_paste_dir,
-    ) = {
-        let s = store.read(cx);
-        let cfg = s.config();
-        let owner = s.pane_of_pty(pty_id);
-        // 失败提示的标题行:项目名 →(取不到)pane 标签 →(还取不到)pty 编号。
-        // 规格把「原版本地失败时拿到 undefined 项目名」记成隐性缺陷并要求补兜底,
-        // 这一串就是那个兜底 —— 标题行永远不为空。
-        let name = owner
-            .as_ref()
-            .and_then(|(pid, _)| s.project(pid))
-            .map(|p| p.name.clone())
-            .or_else(|| {
-                owner.as_ref().and_then(|(pid, pane_id)| {
-                    s.project_state(pid)
-                        .and_then(|st| st.layout.as_ref())
-                        .and_then(|l| l.pane(pane_id))
-                        .map(|p| p.label().to_string())
-                })
-            })
-            .unwrap_or_else(|| format!("pane {pty_id}"));
-        // 远程 pane 的上传素材:连接(断链时为 None,退化成粘原文)+ 远程项目路径。
-        let remote = owner.as_ref().and_then(|(pid, _)| {
-            let project = s.project(pid)?;
-            let conn = s.remote_connection_of(pid)?;
-            Some((conn, project.path.clone()))
-        });
-        (
-            cfg.long_paste_to_file,
-            cfg.long_paste_line_threshold,
-            cfg.long_paste_char_threshold,
-            clipboard::resolve_paste_target(s, pty_id),
-            owner.map(|(pid, _)| pid).unwrap_or_default(),
-            name,
-            remote,
-            cfg.remote_paste_dir.clone(),
-        )
-    };
+    } = ctx;
 
     // SSH 远程 pane:转存 + SFTP 上传是异步的,交给后台任务,钩子当场返回
-    // `None`(语义 = 宿主已接管)。断链(连接被删)时 `remote_ctx` 为 None ——
+    // `None`(语义 = 宿主已接管)。断链(连接被删)时 `remote` 为 None ——
     // 没有上传通道,退回粘原文,与 mt-ssh 进 crates 之前的行为一致。
     if enabled
         && target == PasteTarget::Ssh
         && clipboard::is_long_text(&text, line_threshold, char_threshold)
-        && let Some((conn, project_path)) = remote_ctx
+        && let Some((conn, project_path)) = remote
     {
         clipboard::spawn_remote_paste(
             pty_id,
-            text,
+            RemotePaste::Text(text),
             conn,
             project_path,
             project_id,
@@ -983,6 +1019,49 @@ fn resolve_paste(pty_id: u32, cx: &mut gpui::App) -> PasteAction {
         }
     }
     PasteAction::Text(text)
+}
+
+/// 已落盘的剪贴板图片该怎么粘(`pasteToTerminalInner` 的图片分支)。
+///
+/// 本地 / WSL 直接粘映射后的路径;远程 pane 交给后台 SFTP 上传。
+///
+/// # 远程断链为什么什么都不粘
+///
+/// 图片没有「原文」可退,而 [`ALT_V`](clipboard::ALT_V) 对远程也没用 ——
+/// 那头的 agent 读的是**远端**剪贴板。只剩「提示用户」这一条(装机版同款)。
+fn paste_image(
+    pty_id: u32,
+    local: std::path::PathBuf,
+    ctx: PasteContext,
+    cx: &mut gpui::App,
+) -> PasteAction {
+    if ctx.target == PasteTarget::Ssh {
+        let Some((conn, project_path)) = ctx.remote else {
+            eprintln!("[pane {pty_id}] 远程连接不在场,剪贴板图片未粘贴");
+            toast::push_message(
+                ToastKind::PasteError,
+                ctx.project_id,
+                ctx.project_name,
+                tr!("terminal", "pasteImageNoRemote").to_string(),
+                cx,
+            );
+            return PasteAction::None;
+        };
+        clipboard::spawn_remote_paste(
+            pty_id,
+            RemotePaste::File(local),
+            conn,
+            project_path,
+            ctx.project_id,
+            ctx.project_name,
+            ctx.remote_paste_dir,
+            cx,
+        );
+        return PasteAction::None;
+    }
+
+    let mapped = clipboard::map_pasted_path(&local, ctx.target);
+    PasteAction::Raw(clipboard::quote_path(&mapped))
 }
 
 /// 按 pty 编号取「分支那一段」的菜单项(含前导分隔线)。

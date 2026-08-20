@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 32;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 743;
+pub const ZH_ENTRY_COUNT: usize = 744;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 743;
+pub const EN_ENTRY_COUNT: usize = 744;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -1442,6 +1442,7 @@ static TERMINAL_ZH: &[(&str, &str)] = &[
     ("copy", "复制"),
     ("dropToInsertPath", "释放以插入路径"),
     ("paste", "粘贴"),
+    ("pasteImageNoRemote", "远程连接不可用，剪贴板图片未粘贴"),
     ("pasteUploadFailed", "粘贴内容上传到远程失败：{detail}"),
     ("sshConnect", "SSH 连接"),
     ("sshConnectEmpty", "SSH 连接（暂无）"),
@@ -1453,6 +1454,7 @@ static TERMINAL_EN: &[(&str, &str)] = &[
     ("copy", "Copy"),
     ("dropToInsertPath", "Drop to insert path"),
     ("paste", "Paste"),
+    ("pasteImageNoRemote", "Remote connection unavailable; the clipboard image was not pasted"),
     ("pasteUploadFailed", "Failed to upload pasted content to the remote host: {detail}"),
     ("sshConnect", "SSH Connection"),
     ("sshConnectEmpty", "SSH Connection (none)"),

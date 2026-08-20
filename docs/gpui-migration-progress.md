@@ -104,6 +104,7 @@
 
 ## 技术债与待修清单（迁移期产生）
 
+- ~~剪贴板图片粘贴整块缺失~~ **已补回**（2026-08-20）：Z 批只搬了 audit #30 的长文本那一半，图片这一半连同 `Alt+V` 兜底一并没搬（`clipboard.rs` 模块头当时明写「本批的一处收窄」）。**症状是按 `Ctrl+V` 毫无反应**——gpui 的 Windows 剪贴板只认 `PNG`/`JFIF`/`GIF`/`image/svg+xml` 四个**注册格式**（`platform/windows/clipboard.rs` 的 `FORMATS_SET`），截图工具放的是 `CF_DIB`，于是 `read_from_clipboard()` 连 `None` 都不给，`resolve_paste` 直接静默返回。修法是把装机版 `src-tauri/src/clipboard.rs` 的 `win` 模块整体搬进 `mt-app/src/clipboard.rs`（含 `1fcf1bc` 那轮 `parse_dib` 越界读/整数溢出加固与三个回归测试），另补三处：① `read_bitmap` 的缓冲区尺寸按同口径加固（装机版漏的裸 `width*height*4`，理论上能溢出成小缓冲）；② 读取结果分**「没有图」/「有图但读不出」**两态——后者才退 `Alt+V`，合并成 `Option` 的话 `BI_BITFIELDS` 压缩位图会被当成「剪贴板是空的」，又回到静默；③ 非 Windows 走 gpui 的图片 entry（原始编码字节原样写盘，装机版本就只有 Windows）。远程 pane 复用 BB-a 的 SFTP 通道（`RemotePaste::File`），断链时**只提示不粘**（图片没有原文可退，`Alt+V` 对远端 agent 无效——它读的是远端剪贴板）。⚠️ Win32 直读路径只经编译期校验与 `parse_dib` 单测，真机三查（截图工具粘出路径、图文混排按图片处理、`BI_BITFIELDS` 退 Alt+V）待做。
 - ~~mt-usage/ai_shim.rs~~ **已收编**（`826071a`）：删除临时副本，六处调用直连 mt-ai，grok_home 提为 pub。
 - ~~ledger WAL BUSY 竞态~~ **已修复**（`f42ccce`）：open_raw 对该 pragma 按 5s 预算做 BUSY 限定重试；原单跑挂 5~8/10 轮的并发测试连跑 6 轮全绿。
 - Cargo.lock 已把 rusqlite/libsqlite3-sys pin 到与 src-tauri 完全一致（0.40.1/0.38.1）。

@@ -32,8 +32,12 @@ use mt_i18n::{
 ///
 /// 741 → 743：pane 拖拽批（对齐原版 v0.14.0 / PR #49）补最大化按钮的两条 tooltip
 /// （`paneGroup.{maximizePane,restorePane}`），文案与原版 `paneGroup.ts` 一字不差。
+///
+/// 743 → 744：剪贴板图片粘贴补回（GPUI 迁移期整块缺失）时新增
+/// `terminal.pasteImageNoRemote` —— 远程 pane 断链时图片既没有原文可退、
+/// `Alt+V` 也对远端无效，只能提示，故要一条专属文案。
 const EXPECTED_NAMESPACES: usize = 32;
-const EXPECTED_ENTRIES_PER_LANG: usize = 743;
+const EXPECTED_ENTRIES_PER_LANG: usize = 744;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

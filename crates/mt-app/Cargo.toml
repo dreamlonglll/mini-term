@@ -110,6 +110,12 @@ windows = { version = "0.61", features = [
     "Win32_Media_Audio",
     # MessageBeep 住在这个模块里(不是 WindowsAndMessaging)
     "Win32_System_Diagnostics_Debug",
+    # 剪贴板图片(截图粘贴,见 clipboard::win):OpenClipboard / GetClipboardData /
+    # IsClipboardFormatAvailable 住在 DataExchange,CF_DIB 句柄的
+    # GlobalLock / GlobalSize 住在 Memory。gpui 自己的剪贴板只认
+    # PNG/JFIF/GIF/SVG 四个**注册格式**,截图工具放的 CF_DIB 它一概读不到。
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
     # 托盘线程要注册自己的窗口类,RegisterClassW 的 hInstance 来自 GetModuleHandleW。
     "Win32_System_LibraryLoader",
     # Shell_NotifyIconW / NOTIFYICONDATAW —— 系统托盘图标的唯一入口。
@@ -120,9 +126,13 @@ windows = { version = "0.61", features = [
 ] }
 # 从 gpui 的 Window 取 HWND。
 raw-window-handle = "0.6"
-# 弹窗毛玻璃快照(frost.rs):只用 Frame/RgbaImage 当 RenderImage 的字节容器,
-# 不开任何解码后端;版本跟随 gpui 已锁定的那份(0.25.x),不引第二份 image。
-image = { version = "0.25", default-features = false }
+# 弹窗毛玻璃快照(frost.rs):只用 Frame/RgbaImage 当 RenderImage 的字节容器;
+# 版本跟随 gpui 已锁定的那份(0.25.x),不引第二份 image。
+#
+# `png` 是唯一开的编解码后端 —— 剪贴板图片(clipboard::win)要把 CF_DIB 的
+# 裸像素编成 PNG 落盘。**只要编码器**,解码谁也不用(gpui 那条路拿到的本来
+# 就是编好的字节,原样写盘)。
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(windows)'.build-dependencies]
 # exe 图标与版本资源嵌入(见 build.rs)。build-dependencies 的 cfg 判的是
