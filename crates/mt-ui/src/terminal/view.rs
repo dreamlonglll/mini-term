@@ -826,8 +826,9 @@ impl EntityInputHandler for TerminalView {
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
         let geometry = self.geometry.get();
-        // 组合中:贴着预编辑串里的插入符;否则贴着终端光标格。
-        // 两个都没有(还没画过一帧)时退回元素左上角 —— 总比不弹候选框强。
+        // 组合中:贴着预编辑串里的插入符;否则贴着终端光标格 —— 后者与光标
+        // **可见性无关**,TUI 发 `ESC[?25l` 藏了光标也照样有(见 `FrameGeometry::cursor`)。
+        // 两个都没有只可能是还没画过一帧,退回元素左上角 —— 总比不弹候选框强。
         Some(
             geometry
                 .preedit_caret

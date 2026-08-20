@@ -135,7 +135,9 @@ pub struct FrameGeometry {
     pub cell_size: Size<Pixels>,
     pub columns: usize,
     pub screen_lines: usize,
-    /// 光标格的屏幕矩形。光标隐藏时为 `None`。
+    /// 光标格的屏幕矩形。**与光标可见性无关** —— TUI 藏起光标(`ESC[?25l`)
+    /// 自己画插入符时,这里照样给出那一格,否则 IME 候选框会退到元素左上角。
+    /// `None` 只有一个含义:还没画过任何一帧。
     pub cursor: Option<Bounds<Pixels>>,
     /// 预编辑串内插入符的屏幕矩形。候选框要贴着它,不是贴着终端光标 ——
     /// 组合到第三个字时候选框还停在第一个字下面会挡住正在输入的内容。
@@ -186,6 +188,37 @@ pub struct FlashLine {
 fn flash_row(line: i32, display_offset: usize, screen_lines: usize) -> Option<usize> {
     let row = line + display_offset as i32;
     (row >= 0 && (row as usize) < screen_lines).then_some(row as usize)
+}
+
+/// 光标格在元素坐标系里的矩形。**与「画不画光标」无关**。
+///
+/// 两件事必须分开:「光标可见吗」是 `CursorShape::Hidden` 说了算,
+/// 「光标在哪一格」是 grid 坐标说了算。绑在一起会出这个 bug —— Ink 系的 TUI
+/// (Claude Code 就是)开局发 `ESC[?25l` 藏掉终端光标、自己画一个反色块当插入符,
+/// 于是这一帧没有任何 cell 带光标标记,IME 的候选框和预编辑串双双退回元素左上角,
+/// 中文输入的候选窗糊在终端顶行上。滚出视口同理(往回翻历史时光标在视口下方)。
+///
+/// 所以这里只做换算不做判空:行号与列号一律**钳到视口内最近的边缘**,
+/// 保证任何时候都有一个可用的锚点。行换算与 [`flash_row`] 同一口径
+/// (`row = line + display_offset`),列直接是 grid 列。
+fn cursor_cell_bounds(
+    origin: Point<Pixels>,
+    cell_size: Size<Pixels>,
+    columns: usize,
+    screen_lines: usize,
+    cursor_line: i32,
+    cursor_column: usize,
+    display_offset: usize,
+) -> Bounds<Pixels> {
+    let row = (cursor_line + display_offset as i32).clamp(0, screen_lines.saturating_sub(1) as i32);
+    let col = cursor_column.min(columns.saturating_sub(1));
+    Bounds::new(
+        point(
+            origin.x + cell_size.width * col as f32,
+            origin.y + cell_size.height * row as f32,
+        ),
+        cell_size,
+    )
 }
 
 impl TerminalElement {
@@ -1195,6 +1228,9 @@ impl Element for TerminalElement {
         // 滚动条要用:整条内容有多长、视口顶在哪
         let total_lines;
         let frame_display_offset;
+        // IME 锚点要用:光标在哪一格。**不受 `CursorShape::Hidden` 影响**,
+        // 藏起来的光标照样占着一个格子 —— 见 [`cursor_cell_bounds`]。
+        let frame_cursor_point;
 
         {
             let term_lock = self.emulator.term().lock();
@@ -1207,6 +1243,7 @@ impl Element for TerminalElement {
             let selection_range = content.selection;
             let cursor_point = content.cursor.point;
             let cursor_shape = content.cursor.shape;
+            frame_cursor_point = cursor_point;
 
             let mut cache = state.rows.borrow_mut();
             let mut scratch: Vec<CellSignature> = Vec::with_capacity(columns);
@@ -1362,15 +1399,24 @@ impl Element for TerminalElement {
             })
             .collect();
 
+        // ── 光标格。上面那个 `cursor`(CursorLayout)是「要画的光标」,可能没有;
+        //    这个是「光标占的那一格」,永远有 —— IME 拿它当锚点。
+        let cursor_cell = cursor_cell_bounds(
+            bounds.origin,
+            cell_size,
+            columns,
+            screen_lines,
+            frame_cursor_point.line.0,
+            frame_cursor_point.column.0,
+            frame_display_offset,
+        );
+
         // ── IME 预编辑浮层
         let preedit = self.preedit.as_ref().and_then(|p| {
             if p.text.is_empty() {
                 return None;
             }
-            let anchor = cursor
-                .as_ref()
-                .map(|c| c.bounds.origin)
-                .unwrap_or(bounds.origin);
+            let anchor = cursor_cell.origin;
             let run = TextRun {
                 len: p.text.len(),
                 font: font.clone(),
@@ -1404,7 +1450,7 @@ impl Element for TerminalElement {
                 cell_size,
                 columns,
                 screen_lines,
-                cursor: cursor.as_ref().map(|c| c.bounds),
+                cursor: Some(cursor_cell),
                 preedit_caret: preedit.as_ref().map(|p| {
                     Bounds::new(
                         point(p.origin.x + p.caret_x, p.origin.y),
@@ -1999,5 +2045,54 @@ mod tests {
         // 往回滚太多:那一行被顶到视口下面去了
         assert_eq!(flash_row(0, 24, 24), None);
         assert_eq!(flash_row(0, 23, 24), Some(23));
+    }
+
+    /// 光标格 = 元素原点 + 行列步进。IME 的候选框贴的就是这个矩形。
+    #[test]
+    fn 光标格按行列换算元素坐标() {
+        let origin = point(px(100.0), px(50.0));
+        let cell = size(px(8.0), px(16.0));
+        // 左上角那一格
+        let b = cursor_cell_bounds(origin, cell, 80, 24, 0, 0, 0);
+        assert_eq!(b.origin, origin);
+        assert_eq!(b.size, cell);
+        // 第 3 行第 5 列
+        let b = cursor_cell_bounds(origin, cell, 80, 24, 3, 5, 0);
+        assert_eq!(b.origin, point(px(140.0), px(98.0)));
+        // 回看缓冲里的负行号:滚够了才落回视口(与 flash_row 同一口径)
+        let b = cursor_cell_bounds(origin, cell, 80, 24, -5, 0, 5);
+        assert_eq!(b.origin.y, px(50.0));
+    }
+
+    /// **本 bug 的回归**:Ink 系 TUI(Claude Code)发 `ESC[?25l` 藏掉光标后,
+    /// 没有任何 cell 带光标标记 —— 但光标格照样要算得出来,否则 IME 候选框
+    /// 和预编辑串双双退回元素左上角,中文候选窗糊在终端顶行上。
+    ///
+    /// 这个函数**根本不看 `CursorShape`**,可见性进不来就是这条保证。
+    #[test]
+    fn 光标藏起来时照样给得出格子() {
+        let origin = point(px(0.0), px(0.0));
+        let cell = size(px(10.0), px(20.0));
+        // 光标在第 12 行第 30 列,shape 是 Hidden 与否都不影响这里
+        let b = cursor_cell_bounds(origin, cell, 80, 24, 12, 30, 0);
+        assert_eq!(b.origin, point(px(300.0), px(240.0)));
+        assert_ne!(b.origin, origin, "绝不能退回元素左上角");
+    }
+
+    /// 滚出视口的光标钳到最近边缘,而不是没有 —— 往回翻历史时光标在视口下方,
+    /// 这时候开始打字,候选框贴在底边比贴在顶角合理。
+    #[test]
+    fn 光标滚出视口钳到最近边缘() {
+        let origin = point(px(0.0), px(0.0));
+        let cell = size(px(10.0), px(20.0));
+        // 往回滚 100 行:光标被顶到视口下面 → 钳到最后一行
+        let b = cursor_cell_bounds(origin, cell, 80, 24, 0, 0, 100);
+        assert_eq!(b.origin.y, px(460.0), "第 23 行 = (24-1) * 20");
+        // 列越界钳到最后一列(宽字符占位等边界情形)
+        let b = cursor_cell_bounds(origin, cell, 80, 24, 0, 999, 0);
+        assert_eq!(b.origin.x, px(790.0), "第 79 列 = (80-1) * 10");
+        // 退化尺寸不 panic、不算出负坐标
+        let b = cursor_cell_bounds(origin, cell, 0, 0, 0, 0, 0);
+        assert_eq!(b.origin, origin);
     }
 }
