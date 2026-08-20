@@ -839,6 +839,9 @@ impl Scope {
 
 /// 自动刷新档位(秒);`0 = 关`。默认 5s。
 const AUTO_REFRESH_OPTIONS: [u32; 5] = [0, 5, 10, 30, 60];
+/// custom 起止输入框的宽度。够 `YYYY-MM-DD` 在等宽字族下也整串露出来 ——
+/// 逐层扣法见 [`UsagePanel::render_date_field`]。
+const DATE_INPUT_WIDTH: f32 = 150.0;
 /// 模型排行前 N,其余合并成一行 Others。
 const TOP_MODELS: usize = 6;
 /// `@keyframes usageFadeIn` 的 `translateY(6px)`。
@@ -901,6 +904,10 @@ pub struct UsagePanel {
     /// custom 起止的两个受控输入。闸门在 blur / Enter 上过。
     from_input: Entity<InputState>,
     to_input: Entity<InputState>,
+    /// 打开着的日期选择浮层(起、止共用一格 —— 同时只开一个)。
+    calendar: Option<Entity<crate::date_picker::DatePicker>>,
+    /// 上面那个浮层的事件订阅。与浮层同生共死,换浮层时一起换掉。
+    _calendar_sub: Option<gpui::Subscription>,
     stats: Option<UsageStatsPayload>,
     error: Option<String>,
     /// backfill(账本首建全量同步)进度;非 backfill 期间为 None。
@@ -1012,6 +1019,8 @@ impl UsagePanel {
             auto_refresh,
             from_input,
             to_input,
+            calendar: None,
+            _calendar_sub: None,
             stats: None,
             error: None,
             progress: None,
@@ -1355,6 +1364,80 @@ impl UsagePanel {
         }
         self.save_prefs(cx);
         self.query(cx);
+    }
+
+    /// 日历选中一天:直接落值(不必再过 [`accept_date_input`] 那道闸 —— 日历给出的
+    /// 一定是合法日期),受控输入同步回写。
+    fn set_custom_date(
+        &mut self,
+        is_from: bool,
+        date: chrono::NaiveDate,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let next = date.format("%Y-%m-%d").to_string();
+        let prev = if is_from {
+            &self.custom_from
+        } else {
+            &self.custom_to
+        };
+        if *prev == next {
+            return;
+        }
+        let state = if is_from {
+            self.from_input.clone()
+        } else {
+            self.to_input.clone()
+        };
+        if is_from {
+            self.custom_from = next.clone();
+        } else {
+            self.custom_to = next.clone();
+        }
+        state.update(cx, |s, cx| s.set_value(next, window, cx));
+        self.save_prefs(cx);
+        self.query(cx);
+    }
+
+    /// 弹日期选择浮层。可选范围与查询窗口的钳位同源:下界 [`custom_floor`](近一年),
+    /// 上界今天 —— 免得日历能选出一个查询侧当场就要钳回去的日子。
+    fn open_calendar(
+        &mut self,
+        is_from: bool,
+        anchor: gpui::Point<gpui::Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let today = chrono::Local::now().date_naive();
+        let current = parse_local_date(if is_from {
+            &self.custom_from
+        } else {
+            &self.custom_to
+        });
+        // 先清后建:换浮层时旧实体必须先 drop 掉,否则 overlay 栈会错乱
+        // (理由见 `date_picker::DatePicker::new` 的注释)
+        self.calendar = None;
+        self._calendar_sub = None;
+        let picker = cx.new(|cx| {
+            crate::date_picker::DatePicker::new(anchor, current, today, window, cx)
+                .range(Some(custom_floor(today)), Some(today))
+        });
+        self._calendar_sub = Some(cx.subscribe_in(
+            &picker,
+            window,
+            move |this: &mut Self, _, event, window, cx| {
+                if let crate::date_picker::DatePickerEvent::Picked(date) = event {
+                    this.set_custom_date(is_from, *date, window, cx);
+                }
+                // 只丢实体、不动 `_calendar_sub` —— 那是**正在跑的这条订阅**自己,
+                // 在回调里把自己 drop 掉没必要;实体一没,它下次也不会再触发,
+                // 真正的清理在下一次 `open_calendar` 开头
+                this.calendar = None;
+                cx.notify();
+            },
+        ));
+        self.calendar = Some(picker);
+        cx.notify();
     }
 
     /// 手动刷新:重拉价 → 等增量同步跑完 → 再查。
@@ -1848,6 +1931,9 @@ impl Render for UsagePanel {
             .bg(ui::bg_surface())
             .child(header)
             .child(body)
+            // 日期浮层。挂在这一层是安全的:它自己是 `deferred`,而 gpui 的
+            // `DeferredDraw` 不带祖先的 ContentMask —— 抽屉裁不到它
+            .when_some(self.calendar.clone(), |el, picker| el.child(picker))
     }
 }
 
@@ -1947,9 +2033,10 @@ impl UsagePanel {
                 el.child(
                     div()
                         .flex()
+                        .flex_none()
                         .items_center()
                         .gap(px(4.0))
-                        .child(div().w(px(112.0)).child(Input::new(&self.from_input)))
+                        .child(self.render_date_field(true, cx))
                         // 日期分隔符不进字典(原版 `:434` 就是裸字面量)
                         .child(
                             div()
@@ -1957,7 +2044,7 @@ impl UsagePanel {
                                 .text_color(ui::text_muted())
                                 .child("–"),
                         )
-                        .child(div().w(px(112.0)).child(Input::new(&self.to_input))),
+                        .child(self.render_date_field(false, cx)),
                 )
             })
             .child(div().flex_1())
@@ -1986,6 +2073,49 @@ impl UsagePanel {
             )
     }
 
+    /// 一个 custom 日期输入 + 它的日历触发钮。
+    ///
+    /// 宽度 [`DATE_INPUT_WIDTH`] 而不是原来的 112:`gpui_component::Input` 逐层扣掉
+    /// 左右各 12 的 padding(`input_px(Medium)`)、1px 边框、再给光标留 10
+    /// (`input/element.rs` 的 `RIGHT_MARGIN`),112 只剩 76px 可视;而它的文字是
+    /// **rem 定死的 14px**(`input_text_size` → `text_sm`,**不跟 `ui::font_px`
+    /// 缩放**),等宽字族下 `2026-08-20` 要 84px —— 年份直接被截掉,点到行尾时
+    /// 还会因为「光标要露出来」整行左移。
+    ///
+    /// 另外补 `flex_none`:原来那两层是默认可收缩的,挤的时候还会被压得更窄。
+    fn render_date_field(&mut self, is_from: bool, cx: &mut Context<Self>) -> Div {
+        let state = if is_from {
+            &self.from_input
+        } else {
+            &self.to_input
+        };
+        let entity = cx.entity();
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(2.0))
+            .child(
+                div()
+                    .flex_none()
+                    .w(px(DATE_INPUT_WIDTH))
+                    .child(Input::new(state)),
+            )
+            .child(crate::date_picker::trigger_button(
+                if is_from {
+                    "usage-date-from-pick"
+                } else {
+                    "usage-date-to-pick"
+                },
+                t("usageStats", "pickDate"),
+                move |anchor, window, cx: &mut App| {
+                    entity.update(cx, |this, cx| {
+                        this.open_calendar(is_from, anchor, window, cx)
+                    });
+                },
+            ))
+    }
+
     /// 单项目下拉。**自绘**(走 `menu.rs`)—— `gpui_component::select` 的箭头
     /// 走 `IconName::ChevronDown`,0.5.1 不带 svg 资产,渲染出来是空白。
     ///
@@ -2001,19 +2131,32 @@ impl UsagePanel {
             .iter()
             .map(|p| (p.id.clone(), p.name.clone(), p.path.clone()))
             .collect();
+        // 当前选中项在**打开菜单这一刻**定下(与 projects 快照同一口径)。
+        // 项目一多就得靠这个勾才认得出选的是哪个 —— 菜单基件没有勾选态,
+        // 惯例是「`✓ ` / 全角空格」前缀(见 `menu.rs` 模块注释)
+        let selected = self.effective_project(cx).map(|p| norm_project_path(&p));
         dropdown("usage-project-scope", label, px(160.0)).on_mouse_down(
             MouseButton::Left,
             move |event: &MouseDownEvent, window, cx| {
-                let mut entries = vec![menu::item(t("usageStats", "scope.allProjects"), {
-                    let entity = entity.clone();
-                    move |_window, cx: &mut App| {
-                        entity.update(cx, |this, cx| this.set_project_scope(None, cx));
-                    }
-                })];
+                let mut entries = vec![menu::item(
+                    format!(
+                        "{}{}",
+                        check_mark(selected.is_none()),
+                        t("usageStats", "scope.allProjects")
+                    ),
+                    {
+                        let entity = entity.clone();
+                        move |_window, cx: &mut App| {
+                            entity.update(cx, |this, cx| this.set_project_scope(None, cx));
+                        }
+                    },
+                )];
                 for (_id, name, path) in &projects {
                     let entity = entity.clone();
+                    let on = selected.as_deref() == Some(norm_project_path(path).as_str());
+                    let label = format!("{}{name}", check_mark(on));
                     let path = path.clone();
-                    entries.push(menu::item(name.clone(), move |_window, cx: &mut App| {
+                    entries.push(menu::item(label, move |_window, cx: &mut App| {
                         let path = path.clone();
                         entity.update(cx, |this, cx| this.set_project_scope(Some(path), cx));
                     }));
@@ -2038,7 +2181,9 @@ impl UsagePanel {
                         .into_iter()
                         .map(|secs| {
                             let entity = entity.clone();
-                            menu::item(auto_refresh_label(secs), move |_window, cx: &mut App| {
+                            let label =
+                                format!("{}{}", check_mark(secs == current), auto_refresh_label(secs));
+                            menu::item(label, move |_window, cx: &mut App| {
                                 entity.update(cx, |this, cx| this.set_auto_refresh(secs, cx));
                             })
                         })
@@ -2786,6 +2931,12 @@ fn auto_refresh_label(secs: u32) -> String {
         // 裸模板串,不进字典(原版 `:455` 同)
         format!("{secs}s")
     }
+}
+
+/// 菜单项的勾选前缀。选中是 `✓ `,没选中是**全角空格**(与勾等宽,文字才对得齐)
+/// —— 菜单基件没有勾选态,全仓统一走这套文本方案(`menu.rs` 模块注释第 1 条)。
+fn check_mark(on: bool) -> &'static str {
+    if on { "✓ " } else { "　" }
 }
 
 /// 分段控件外壳(`Segmented`,`:79`)。

@@ -116,11 +116,15 @@ pub fn monotone_tangents(values: &[f32]) -> Vec<f32> {
 
 /// 每格切多少段采样。段数随格数递减,总点数封顶 —— 一年的自定义范围(365 格)
 /// 也不会攒出几千个顶点让 tessellation 变成每帧的大头。
+///
+/// 上限是 24 而不是 8:7 天视图一格能有 70px 宽,8 段折线去拟合一条三次曲线
+/// 每段近 9px,弯处看得出是折的。总点数照旧由 [`MAX_CURVE_POINTS`] 兜住
+/// (格少才吃得满上限,格多时这个 clamp 根本轮不到)。
 pub fn samples_per_segment(count: usize) -> usize {
     if count <= 1 {
         return 1;
     }
-    (MAX_CURVE_POINTS / (count - 1)).clamp(1, 8)
+    (MAX_CURVE_POINTS / (count - 1)).clamp(1, 24)
 }
 
 /// 曲线采样点总数上限。
@@ -178,18 +182,56 @@ pub fn label_step(count: usize, width: f32, label_width: f32, min_gap: f32) -> u
 /// 这里省下来的是实打实的每帧开销)。
 ///
 /// 结果为空或整条贴在 `lo` 上,说明这条带里没有面积,调用方应当整带跳过。
+///
+/// ⚠️ **逐顶点钳位是不够的,必须在穿带处插交点** —— 折线先钳顶点再连线 ≠ 折线
+/// 被钳出来的形状。陡坡上两个相邻采样点跨了好几条带时,每条带都会把「本该只占
+/// 一小截 x」的斜边摊到整段 x 上:各带在同一列各填自己下半截,拼出来是十几条
+/// 横纹而不是一块实心面积(总面积还是对的,所以肉眼看着就是「曲线下方一排锯齿」,
+/// 且色块会溢到曲线上方去)。修这条锯齿的关键就是下面这轮 `t ∈ (0,1)` 的插点。
 pub fn band_top_edge(area: &[(f32, f32)], lo: f32, hi: f32) -> Vec<(f32, f32)> {
+    if area.is_empty() {
+        return Vec::new();
+    }
     let clamp = |y: f32| y.clamp(lo, hi);
+
+    // ① 把折线裁进 [lo, hi] 这条横带:穿过带边界处插交点,其余顶点钳位
+    let mut clipped: Vec<(f32, f32)> = Vec::with_capacity(area.len() + 4);
+    clipped.push((area[0].0, clamp(area[0].1)));
+    for seg in area.windows(2) {
+        let ((x0, y0), (x1, y1)) = (seg[0], seg[1]);
+        let dy = y1 - y0;
+        if dy.abs() > f32::EPSILON {
+            // 两条边界各求一个交点。`t` 严格落在开区间内才算穿越 ——
+            // 端点恰好压在边界上时它自己钳位后就在边界上,不必重复插一个点
+            let mut cuts: [(f32, f32); 2] = [(0.0, 0.0); 2];
+            let mut n = 0;
+            for bound in [lo, hi] {
+                let t = (bound - y0) / dy;
+                if t > 0.0 && t < 1.0 {
+                    cuts[n] = (t, bound);
+                    n += 1;
+                }
+            }
+            // 一升一降两条边界的先后由 t 定(降序段先遇到 hi,升序段先遇到 lo)
+            if n == 2 && cuts[1].0 < cuts[0].0 {
+                cuts.swap(0, 1);
+            }
+            for (t, bound) in &cuts[..n] {
+                clipped.push((x0 + (x1 - x0) * t, *bound));
+            }
+        }
+        clipped.push((x1, clamp(y1)));
+    }
+
+    // ② 压掉水平直线段的中间点(判据与裁剪前同:前后都与自己等高)
     let mut out: Vec<(f32, f32)> = Vec::with_capacity(8);
-    for (i, (x, y)) in area.iter().enumerate() {
-        let cy = clamp(*y);
-        // 前后都与自己等高 = 一段直线的中间点,丢掉
-        let prev_same = i > 0 && clamp(area[i - 1].1) == cy;
-        let next_same = i + 1 < area.len() && clamp(area[i + 1].1) == cy;
+    for (i, (x, y)) in clipped.iter().enumerate() {
+        let prev_same = i > 0 && clipped[i - 1].1 == *y;
+        let next_same = i + 1 < clipped.len() && clipped[i + 1].1 == *y;
         if prev_same && next_same {
             continue;
         }
-        out.push((*x, cy));
+        out.push((*x, *y));
     }
     out
 }
@@ -738,8 +780,13 @@ mod tests {
         // 首尾必须在(带底那条回程线要靠它们定端点)
         assert_eq!(edge.first().map(|p| p.0), Some(0.0));
         assert_eq!(edge.last().map(|p| p.0), Some(0.9));
-        // 三段各自的中间点被压掉:0.1 / 0.5 / 0.9 之类不该全在
-        assert!(edge.len() < area.len(), "没压掉任何点:{edge:?}");
+        // 贴带底/带顶的那几段各自只留端点:0.1 / 0.5 / 0.8 这些中间点都该没了
+        for dropped in [0.1f32, 0.5, 0.8] {
+            assert!(
+                !edge.iter().any(|(x, _)| (*x - dropped).abs() < 1e-6),
+                "共线中间点 x={dropped} 没压掉:{edge:?}"
+            );
+        }
         // 值全被钳进带内
         for (_, y) in &edge {
             assert!((0.4..=0.6).contains(y), "{y} 越出带外");
@@ -750,6 +797,55 @@ mod tests {
         // 退化输入
         assert!(band_top_edge(&[], 0.0, 1.0).is_empty());
         assert_eq!(band_top_edge(&[(0.5, 0.5)], 0.0, 1.0).len(), 1);
+    }
+
+    /// 穿带处必须插交点 —— 这是「面积锯齿」的判据。
+    ///
+    /// 一条从 y=1 直落到 y=0 的陡边,逐顶点钳位的老实现会让**每条带**都在整段 x
+    /// 上摊一条斜边,于是同一列上各带只填自己下半截,拼出来是一排横纹;正确裁剪
+    /// 后每条带只在自己那一小截 x 里有斜边,各带首尾相接拼成实心面积。
+    #[test]
+    fn 陡坡上各带首尾相接不留横纹() {
+        let area = [(0.0, 1.0), (1.0, 0.0)];
+        let bands = 16;
+        // 取正中那一列:真实曲线高度 0.5,各带填出来的区间应当恰好铺满 [0, 0.5]
+        let x = 0.5;
+        let mut filled: Vec<(f32, f32)> = Vec::new();
+        for k in 0..bands {
+            let hi = 1.0 - k as f32 / bands as f32;
+            let lo = 1.0 - (k + 1) as f32 / bands as f32;
+            let top = band_top_edge(&area, lo, hi);
+            if top.len() < 2 || top.iter().all(|(_, y)| *y <= lo + 1e-6) {
+                continue;
+            }
+            // 线性插出该列的上沿
+            let Some(seg) = top.windows(2).find(|s| s[0].0 <= x && x <= s[1].0) else {
+                continue;
+            };
+            let (x0, y0) = seg[0];
+            let (x1, y1) = seg[1];
+            let y = y0 + (y1 - y0) * (x - x0) / (x1 - x0);
+            if y > lo + 1e-6 {
+                filled.push((lo, y));
+            }
+        }
+        filled.sort_by(|a, b| a.0.total_cmp(&b.0));
+        assert!(!filled.is_empty(), "该列一条带都没填");
+        // 从 0 起、到 0.5 止,且相邻两条严丝合缝(上一条的顶 = 下一条的底)
+        assert!(filled[0].0.abs() < 1e-6, "没从底填起:{filled:?}");
+        let top_most = filled.last().unwrap().1;
+        assert!(
+            (top_most - 0.5).abs() < 1e-4,
+            "填到了 {top_most},应当止于曲线高度 0.5:{filled:?}"
+        );
+        for pair in filled.windows(2) {
+            assert!(
+                (pair[0].1 - pair[1].0).abs() < 1e-4,
+                "带间留了横纹:{:?} 之后跳到 {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
     }
 
     #[test]

@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 32;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 744;
+pub const ZH_ENTRY_COUNT: usize = 754;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 744;
+pub const EN_ENTRY_COUNT: usize = 754;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -1507,6 +1507,15 @@ static TIME_ZH: &[(&str, &str)] = &[
     ("hoursAgo", "{n} 小时前"),
     ("justNow", "刚刚"),
     ("minutesAgo", "{n} 分钟前"),
+    ("nextMonth", "下个月"),
+    ("prevMonth", "上个月"),
+    ("weekday.fri", "五"),
+    ("weekday.mon", "一"),
+    ("weekday.sat", "六"),
+    ("weekday.sun", "日"),
+    ("weekday.thu", "四"),
+    ("weekday.tue", "二"),
+    ("weekday.wed", "三"),
 ];
 #[rustfmt::skip]
 static TIME_EN: &[(&str, &str)] = &[
@@ -1514,6 +1523,15 @@ static TIME_EN: &[(&str, &str)] = &[
     ("hoursAgo", "{n} hr ago"),
     ("justNow", "just now"),
     ("minutesAgo", "{n} min ago"),
+    ("nextMonth", "Next month"),
+    ("prevMonth", "Previous month"),
+    ("weekday.fri", "Fr"),
+    ("weekday.mon", "Mo"),
+    ("weekday.sat", "Sa"),
+    ("weekday.sun", "Su"),
+    ("weekday.thu", "Th"),
+    ("weekday.tue", "Tu"),
+    ("weekday.wed", "We"),
 ];
 
 #[rustfmt::skip]
@@ -1561,6 +1579,7 @@ static USAGE_STATS_ZH: &[(&str, &str)] = &[
     ("noDailyData", "暂无数据"),
     ("noSessions", "暂无会话"),
     ("othersModels", "其它 {count} 个模型"),
+    ("pickDate", "选择日期"),
     ("pricingError", "模型价格获取失败，成本无法计算"),
     ("pricingLoading", "正在获取模型价格..."),
     ("pricingLocalHint", "把 models.dev 的价格表存成 model-pricing.json 放进应用数据目录即可"),
@@ -1610,6 +1629,7 @@ static USAGE_STATS_EN: &[(&str, &str)] = &[
     ("noDailyData", "No data"),
     ("noSessions", "No sessions"),
     ("othersModels", "Others ({count} models)"),
+    ("pickDate", "Pick a date"),
     ("pricingError", "Failed to fetch model pricing; costs unavailable"),
     ("pricingLoading", "Fetching model pricing..."),
     ("pricingLocalHint", "Save the models.dev pricing table as model-pricing.json in the app data directory"),

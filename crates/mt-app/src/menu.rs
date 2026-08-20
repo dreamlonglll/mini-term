@@ -36,6 +36,16 @@
 //! 贴边翻转由 `snap_to_window_with_margin` 白拿(原版是自己算 `placeInViewport`);
 //! **子菜单不翻转** —— 它挂在父项右缘,窗口右边缘外的那点差别留作已知缺口。
 //!
+//! # 高度上限与滚动
+//!
+//! `anchored` 的贴边只会**平移**面板:条目多到比视口还高时它把顶边钉在 margin 上,
+//! 下半截直接溢出窗口外 —— 那些条目既看不见也点不到(项目多的机器上,用量面板的
+//! 项目 scope 菜单就是这么丢项的)。所以条目列表另包一层带 [`panel_max_height`]
+//! 上限的滚动容器,**但只给叶子层**(判据与理由见 [`is_scrollable`])。
+//!
+//! 已知缺口:滚动位置不进视图状态,所以 ↑↓ 选到视口外的条目时不会自动滚过去
+//! (鼠标滚轮正常)。全仓的滚动容器都没画滚动条,这里照旧。
+//!
 //! # 自定义元素子菜单([`MenuItem::submenu_element`])
 //!
 //! 原版 `MenuEntry.submenuRender(host) => cleanup` 的等价物:菜单项悬停时在旁侧
@@ -430,6 +440,43 @@ fn is_active_item(active: Option<&[usize]>, ancestors: &[usize], index: usize) -
     }
 }
 
+/// 这一层能不能装进滚动容器。
+///
+/// 判据是**该层没有子菜单父项**:gpui 的 `overflow_y_scroll` 会连同 x 轴一起裁
+/// (`Style::overflow_mask` 对两轴都按元素 bounds 出 ContentMask),而子菜单是
+/// `absolute left:100%` 挂在父项里的 —— 给带子菜单的层开滚动等于把子菜单整块
+/// 裁没。含子菜单的层维持不裁不滚(它们条目都不多),长列表(项目/连接/分支)
+/// 恰恰全是叶子层,正好覆盖。
+fn is_scrollable(entries: &[MenuEntry]) -> bool {
+    entries.iter().all(|entry| match entry {
+        MenuEntry::Item(item) => !item.has_submenu(),
+        _ => true,
+    })
+}
+
+/// 面板高度上限:视口高减去贴边留白与面板自身的边框/内边距。
+///
+/// 不设上限时,条目多到比视口还高的菜单会被 `anchored` 钉住顶边、下半截溢出
+/// 窗口外 —— 那些条目既看不见也点不到(`snap_to_window_with_margin` 只会平移,
+/// 面板比视口高时它无能为力)。
+///
+/// 24 的账:贴边留白 4×2 + 面板 padding 4×2 + 边框 1×2 = 18,余 6px 冗余。
+/// (`anchored` 还会把 `window.client_inset` 加进留白,但本壳没调
+/// `set_client_inset` —— 哪天接了 `window_border` 这里要跟着放大。)
+fn panel_max_height(viewport_height: Pixels) -> Pixels {
+    (viewport_height - px(24.0)).max(px(120.0))
+}
+
+/// 滚动容器的元素 id(逐层稳定,与 [`entry_id`] 同一套路径编码)。
+fn panel_id(ancestors: &[usize]) -> SharedString {
+    let mut s = String::from("ctx-panel");
+    for a in ancestors {
+        s.push('-');
+        s.push_str(&a.to_string());
+    }
+    SharedString::from(s)
+}
+
 /// 元素 id:同一帧里逐项唯一,且跨帧稳定(路径 + 下标)。
 fn entry_id(ancestors: &[usize], index: usize) -> SharedString {
     let mut s = String::from("ctx");
@@ -654,7 +701,7 @@ impl ContextMenu {
             .flatten()
             .map(mt_ui::motion::menu_pop_in);
 
-        let mut panel = div()
+        let panel = div()
             .flex()
             .flex_col()
             .min_w(px(160.0))
@@ -671,10 +718,11 @@ impl ContextMenu {
             // occlude 一挡,遮罩就收不到这一下了
             .occlude();
 
+        let mut list = div().flex().flex_col();
         for (index, entry) in entries.iter().enumerate() {
             match entry {
                 MenuEntry::Separator => {
-                    panel = panel.child(
+                    list = list.child(
                         div()
                             .h(px(1.0))
                             .my(px(4.0))
@@ -682,7 +730,7 @@ impl ContextMenu {
                     );
                 }
                 MenuEntry::Header(text) => {
-                    panel = panel.child(
+                    list = list.child(
                         div()
                             .px(px(12.0))
                             .pt(px(6.0))
@@ -693,7 +741,7 @@ impl ContextMenu {
                     );
                 }
                 MenuEntry::Item(item) => {
-                    panel = panel.child(self.render_item(
+                    list = list.child(self.render_item(
                         item,
                         &ancestors,
                         index,
@@ -706,7 +754,18 @@ impl ContextMenu {
             }
         }
 
-        panel.into_any_element()
+        // 叶子层封顶 + 滚轮可滚(判据见 `is_scrollable`)。项目数上不封顶的那几个
+        // 菜单(用量面板的项目 scope、SSH 连接、分支列表)全走这一支。
+        let list = if is_scrollable(entries) {
+            list.id(panel_id(&ancestors))
+                .max_h(panel_max_height(window.viewport_size().height))
+                .overflow_y_scroll()
+                .into_any_element()
+        } else {
+            list.into_any_element()
+        };
+
+        panel.child(list).into_any_element()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1076,6 +1135,51 @@ mod tests {
         assert!(entries_at(&entries, &[2]).is_none(), "自绘面板没有条目表");
         assert!(entries_at(&entries, &[0]).is_none());
         assert!(entries_at(&entries, &[9]).is_none());
+    }
+
+    /// 滚动只给叶子层开:含子菜单父项的层一旦开滚动,`absolute left:100%` 的
+    /// 子菜单会被 ContentMask 裁没。
+    #[test]
+    fn 只有叶子层可滚() {
+        let leaf = vec![
+            item("a", |_, _| {}),
+            separator(),
+            MenuEntry::Header("组".into()),
+            MenuItem::new("b").disabled(true).into(),
+        ];
+        assert!(is_scrollable(&leaf));
+        assert!(is_scrollable(&[]));
+
+        let with_submenu = vec![
+            item("a", |_, _| {}),
+            MenuItem::new("sub").submenu(vec![item("s0", |_, _| {})]).into(),
+        ];
+        assert!(!is_scrollable(&with_submenu), "普通子菜单父项挡住滚动");
+
+        let with_custom = vec![
+            MenuItem::new("custom")
+                .submenu_element(|_, _| div().into_any_element())
+                .into(),
+        ];
+        assert!(!is_scrollable(&with_custom), "自绘子菜单父项同样挡住滚动");
+    }
+
+    /// 高度上限跟着视口走,并且不会被小窗口压成负数/一条缝。
+    #[test]
+    fn 面板高度上限跟随视口() {
+        assert_eq!(panel_max_height(px(900.0)), px(876.0));
+        // 视口比留白还小(极端拖窄)时兜到一个仍能翻的下限,不给出负高度
+        assert_eq!(panel_max_height(px(100.0)), px(120.0));
+        assert_eq!(panel_max_height(px(0.0)), px(120.0));
+    }
+
+    /// 滚动容器 id 逐层稳定、与条目 id 不撞。
+    #[test]
+    fn 滚动容器_id_逐层唯一() {
+        assert_eq!(panel_id(&[]).to_string(), "ctx-panel");
+        assert_eq!(panel_id(&[2, 1]).to_string(), "ctx-panel-2-1");
+        assert_ne!(panel_id(&[1]), panel_id(&[2]));
+        assert_ne!(panel_id(&[1]).to_string(), entry_id(&[1], 0).to_string());
     }
 
     /// 「点得动」的判据:禁用 / 子菜单父项 / 没挂动作都点不动。
