@@ -299,6 +299,242 @@ pub fn can_edit(is_img: bool, result: Option<&FileContentResult>) -> bool {
 /// 那会引入「外部改写结果恰好等于刚保存的内容」的另一类误判。
 pub const ECHO_WINDOW: Duration = Duration::from_millis(2000);
 
+// ─── markdown 表格分段(自绘表格,见 render_markdown) ─────────────
+//
+// gpui-component 0.5.1 的 TextView 表格是**写死的单行截断**:列宽按字符数
+// 原样占比(`node.rs:1070` 的 `relative(len)`)、格子 `.truncate()` ——
+// 「文件名列 vs 大段职责列」直接把短列压没、长文本裁掉,与原版
+// `.md-preview table`(自动换行 + 浏览器 auto 布局)差一个档次,且
+// `TextViewStyle` 没留任何表格钩子。这里把 GFM 表格从文档里拆出来自绘,
+// 其余段落照走 TextView;格子内容仍按 markdown 渲染,行内 code/加粗不丢。
+
+/// GFM 表格的列对齐(分隔行的 `:---:` 语法)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MdAlign {
+    Left,
+    Center,
+    Right,
+}
+
+/// 一张解析好的 GFM 表格。格子存**原文**,渲染时逐格走 markdown。
+#[derive(Debug, PartialEq)]
+struct MdTable {
+    header: Vec<String>,
+    aligns: Vec<MdAlign>,
+    rows: Vec<Vec<String>>,
+}
+
+#[derive(Debug, PartialEq)]
+enum MdSegment {
+    Text(String),
+    Table(MdTable),
+}
+
+/// 把 markdown 源按 GFM 表格块切段。围栏代码块(``` / ~~~)内的竖线不算表格。
+fn split_md_tables(source: &str) -> Vec<MdSegment> {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut segs = Vec::new();
+    let mut text_start = 0usize;
+    let mut in_fence = false;
+    let mut i = 0usize;
+    while i < lines.len() {
+        let trimmed = lines[i].trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            i += 1;
+            continue;
+        }
+        if !in_fence
+            && lines[i].contains('|')
+            && i + 1 < lines.len()
+            && let Some(aligns) = parse_separator(lines[i + 1])
+        {
+            let header = split_cells(lines[i]);
+            // GFM 规则:分隔行列数与表头一致才成表
+            if !header.is_empty() && header.len() == aligns.len() {
+                if text_start < i {
+                    segs.push(MdSegment::Text(lines[text_start..i].join("\n")));
+                }
+                let mut rows = Vec::new();
+                let mut j = i + 2;
+                while j < lines.len() && lines[j].contains('|') && !lines[j].trim().is_empty() {
+                    let mut cells = split_cells(lines[j]);
+                    cells.resize(header.len(), String::new());
+                    rows.push(cells);
+                    j += 1;
+                }
+                segs.push(MdSegment::Table(MdTable { header, aligns, rows }));
+                text_start = j;
+                i = j;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    if text_start < lines.len() {
+        segs.push(MdSegment::Text(lines[text_start..].join("\n")));
+    }
+    segs
+}
+
+/// 拆一行表格的格子:剥外侧竖线;反引号 code span 里的 `|` 不拆
+/// (`process_monitor.rs` 这类格子里常有内联 code),`\|` 是字面竖线。
+fn split_cells(line: &str) -> Vec<String> {
+    let t = line.trim();
+    let t = t.strip_prefix('|').unwrap_or(t);
+    let t = t.strip_suffix('|').unwrap_or(t);
+    let mut cells = Vec::new();
+    let mut cur = String::new();
+    let mut in_code = false;
+    for ch in t.chars() {
+        match ch {
+            '`' => {
+                in_code = !in_code;
+                cur.push(ch);
+            }
+            '|' if !in_code => {
+                if cur.ends_with('\\') {
+                    cur.pop();
+                    cur.push('|');
+                } else {
+                    cells.push(cur.trim().to_string());
+                    cur.clear();
+                }
+            }
+            _ => cur.push(ch),
+        }
+    }
+    cells.push(cur.trim().to_string());
+    cells
+}
+
+/// 分隔行(`| --- | :---: |`)→ 每列对齐;不是分隔行返回 `None`。
+fn parse_separator(line: &str) -> Option<Vec<MdAlign>> {
+    if !line.contains('-') {
+        return None;
+    }
+    let cells = split_cells(line);
+    let mut aligns = Vec::with_capacity(cells.len());
+    for cell in &cells {
+        let c = cell.trim();
+        let dashes = c.trim_matches(':');
+        if dashes.is_empty() || !dashes.chars().all(|ch| ch == '-') {
+            return None;
+        }
+        aligns.push(match (c.starts_with(':'), c.ends_with(':')) {
+            (true, true) => MdAlign::Center,
+            (false, true) => MdAlign::Right,
+            _ => MdAlign::Left,
+        });
+    }
+    Some(aligns)
+}
+
+/// 列宽权重:各列取最长格子的显示宽(CJK 记 2),clamp 后归一化。
+/// 不 clamp 的话短列会被大段长文列压到读不出字(组件那版第一列
+/// `process_mon…` 被截断的直接原因);上限则挡住「一格超长把别列全挤扁」。
+fn column_weights(table: &MdTable) -> Vec<f32> {
+    let n = table.header.len().max(1);
+    let mut lens = vec![1usize; n];
+    for (ix, cell) in table.header.iter().enumerate() {
+        lens[ix] = lens[ix].max(display_width(cell));
+    }
+    for row in &table.rows {
+        for (ix, cell) in row.iter().enumerate() {
+            if ix < n {
+                lens[ix] = lens[ix].max(display_width(cell));
+            }
+        }
+    }
+    let capped: Vec<f32> = lens.iter().map(|l| (*l).clamp(6, 60) as f32).collect();
+    let total: f32 = capped.iter().sum();
+    capped.iter().map(|l| l / total).collect()
+}
+
+/// 近似显示宽:ASCII 记 1、其余(CJK/全角为主)记 2。行内标记(`` ` ``/`**`)
+/// 会略微虚高,权重口径下无关紧要。
+fn display_width(s: &str) -> usize {
+    s.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum()
+}
+
+/// 自绘一张表。样式逐条对照 `.md-preview table`(styles.css:889-910):
+/// 100% 宽、0.92em、collapse 边框(--border-default)、格子 8×12 padding、
+/// 表头 --bg-elevated + 600、偶数数据行 --bg-surface 斑马纹;格子**自动换行**
+/// (min_w_0,不 truncate),列宽按内容长度加权 —— 浏览器 auto 布局的近似。
+fn render_md_table(
+    seg_ix: usize,
+    table: &MdTable,
+    style: &TextViewStyle,
+    window: &mut Window,
+    cx: &mut App,
+) -> gpui::AnyElement {
+    let weights = column_weights(table);
+    let row_count = table.rows.len() + 1;
+    let mut rows_el = Vec::with_capacity(row_count);
+    for (row_ix, cells) in std::iter::once(&table.header)
+        .chain(table.rows.iter())
+        .enumerate()
+    {
+        let is_header = row_ix == 0;
+        let mut cell_els = Vec::with_capacity(cells.len());
+        for (col_ix, cell) in cells.iter().enumerate() {
+            let weight = weights.get(col_ix).copied().unwrap_or(0.2);
+            let align = table.aligns.get(col_ix).copied().unwrap_or(MdAlign::Left);
+            cell_els.push(
+                div()
+                    .w(gpui::relative(weight))
+                    .min_w(px(0.0))
+                    .px(px(12.0))
+                    .py(px(8.0))
+                    .when(col_ix + 1 != cells.len(), |el| {
+                        el.border_r_1().border_color(ui::border_default())
+                    })
+                    .when(align == MdAlign::Center, |el| el.flex().justify_center())
+                    .when(align == MdAlign::Right, |el| el.flex().justify_end())
+                    .child(
+                        // 格子内容仍按 markdown 渲染:行内 code 胶囊/加粗/链接不丢
+                        TextView::markdown(
+                            gpui::SharedString::from(format!(
+                                "md-tbl-{seg_ix}-{row_ix}-{col_ix}"
+                            )),
+                            cell.clone(),
+                            window,
+                            cx,
+                        )
+                        .style(style.clone()),
+                    )
+                    .into_any_element(),
+            );
+        }
+        rows_el.push(
+            div()
+                .flex()
+                .flex_row()
+                .w_full()
+                .when(is_header, |el| {
+                    el.bg(ui::bg_elevated())
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                })
+                // 原版 `tr:nth-child(even)`:数据行在 tbody 里从 1 数,偶数行上色
+                .when(!is_header && row_ix % 2 == 0, |el| el.bg(ui::bg_surface()))
+                .when(row_ix + 1 != row_count, |el| {
+                    el.border_b_1().border_color(ui::border_default())
+                })
+                .children(cell_els)
+                .into_any_element(),
+        );
+    }
+    div()
+        .w_full()
+        // margin 1em 0,em = 表格自身字号 0.92 × 14
+        .my(ui::font_px(12.9))
+        .text_size(ui::font_px(12.9))
+        .border_1()
+        .border_color(ui::border_default())
+        .children(rows_el)
+        .into_any_element()
+}
+
 // ─── 单例句柄 ─────────────────────────────────────────────────
 
 thread_local! {
@@ -1073,6 +1309,9 @@ impl FileViewer {
             3 => base * 1.15,
             _ => base,
         });
+        // 表格拆出来自绘(组件表格单行截断,见 split_md_tables 一节的说明),
+        // 其余段落照走 TextView;段落 id 按段序编,文档不变即稳定。
+        let segments = split_md_tables(&source);
         div()
             .id("file-viewer-md")
             .size_full()
@@ -1081,10 +1320,34 @@ impl FileViewer {
             .text_size(ui::font_px(14.0))
             .line_height(gpui::relative(1.7))
             .child(
-                div().max_w(px(860.0)).mx_auto().child(
-                    TextView::markdown("file-viewer-md-body", source, window, cx)
-                        .style(style)
-                        .selectable(true),
+                div().max_w(px(860.0)).mx_auto().w_full().children(
+                    segments
+                        .into_iter()
+                        .enumerate()
+                        .filter_map(|(ix, seg)| match seg {
+                            MdSegment::Text(text) => {
+                                if text.trim().is_empty() {
+                                    return None;
+                                }
+                                Some(
+                                    TextView::markdown(
+                                        gpui::SharedString::from(format!(
+                                            "file-viewer-md-body-{ix}"
+                                        )),
+                                        text,
+                                        window,
+                                        cx,
+                                    )
+                                    .style(style.clone())
+                                    .selectable(true)
+                                    .into_any_element(),
+                                )
+                            }
+                            MdSegment::Table(table) => {
+                                Some(render_md_table(ix, &table, &style, window, cx))
+                            }
+                        })
+                        .collect::<Vec<_>>(),
                 ),
             )
             .into_any_element()
@@ -1247,6 +1510,74 @@ mod tests {
 
         // 没有扩展名一律不是
         assert!(!is_markdown_file("Makefile") && !is_image_file("Makefile"));
+    }
+
+    #[test]
+    fn 表格分段_基本两列表() {
+        let src = "前文\n\n| 文件 | 职责 |\n|---|---|\n| `a.rs` | 说明 A |\n| b.rs | 说明 B |\n\n后文";
+        let segs = split_md_tables(src);
+        assert_eq!(segs.len(), 3);
+        assert!(matches!(&segs[0], MdSegment::Text(t) if t.contains("前文")));
+        let MdSegment::Table(t) = &segs[1] else {
+            panic!("第二段应是表格");
+        };
+        assert_eq!(t.header, vec!["文件", "职责"]);
+        assert_eq!(t.rows.len(), 2);
+        assert_eq!(t.rows[0], vec!["`a.rs`", "说明 A"]);
+        assert!(matches!(&segs[2], MdSegment::Text(t) if t.contains("后文")));
+    }
+
+    #[test]
+    fn 表格分段_围栏代码块里的竖线不算表格() {
+        let src = "```\n| a | b |\n|---|---|\n```\n正文";
+        let segs = split_md_tables(src);
+        assert_eq!(segs.len(), 1, "围栏内的表格样式行不拆:{segs:?}");
+    }
+
+    #[test]
+    fn 表格分段_对齐与码段竖线() {
+        // 分隔行的 :---: 语法
+        let src = "| a | b | c |\n| :--- | :---: | ---: |\n| 1 | 2 | 3 |";
+        let MdSegment::Table(t) = &split_md_tables(src)[0] else {
+            panic!()
+        };
+        assert_eq!(t.aligns, vec![MdAlign::Left, MdAlign::Center, MdAlign::Right]);
+
+        // code span 里的 | 不拆格,\| 是字面竖线
+        assert_eq!(split_cells("| `a|b` | c\\|d |"), vec!["`a|b`", "c|d"]);
+
+        // 短行按表头列数补空
+        let src = "| a | b |\n|---|---|\n| 仅一格 |";
+        let MdSegment::Table(t) = &split_md_tables(src)[0] else {
+            panic!()
+        };
+        assert_eq!(t.rows[0], vec!["仅一格", ""]);
+    }
+
+    #[test]
+    fn 表格列宽_短列有底宽_长列封顶() {
+        let t = MdTable {
+            header: vec!["文件".into(), "职责".into()],
+            aligns: vec![MdAlign::Left, MdAlign::Left],
+            rows: vec![vec![
+                "`process_monitor.rs`".into(),
+                "这一格是很长很长的中文说明,足以超过封顶阈值的长度,再加一点点凑数的文字。".into(),
+            ]],
+        };
+        let w = column_weights(&t);
+        assert_eq!(w.len(), 2);
+        // 第一列 20 字符、第二列封顶 60 → 20/80 = 0.25,短列不至于被压没
+        assert!(w[0] > 0.2 && w[0] < 0.3, "第一列权重 {w:?}");
+        assert!((w[0] + w[1] - 1.0).abs() < 1e-5);
+
+        // 纯短表:两列都吃底宽,均分
+        let t2 = MdTable {
+            header: vec!["a".into(), "b".into()],
+            aligns: vec![MdAlign::Left, MdAlign::Left],
+            rows: vec![],
+        };
+        let w2 = column_weights(&t2);
+        assert!((w2[0] - 0.5).abs() < 1e-5);
     }
 
     #[test]

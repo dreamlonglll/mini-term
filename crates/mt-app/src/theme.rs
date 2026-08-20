@@ -112,7 +112,19 @@ pub fn apply(config: &AppConfig, window: Option<&mut Window>, cx: &mut App) -> A
     // (`Modal.tsx:171`,亮暗两套同值)。Dialog/Sheet 渲染时读的是
     // `cx.theme().overlay`,必须放在 apply_inner **之后** ——
     // switch_to_builtin/switch_to_theme_pack 都会从基线重置整套 colors。
-    gpui_component::Theme::global_mut(cx).colors.overlay = gpui::hsla(0.0, 0.0, 0.0, 0.5);
+    {
+        let theme = gpui_component::Theme::global_mut(cx);
+        theme.colors.overlay = gpui::hsla(0.0, 0.0, 0.0, 0.5);
+        // md 行内 code 的胶囊底:TextView 写死取 `theme().accent`(node.rs:651,
+        // 无专用钩子),默认淡紫灰与原版 `.md-preview code` 的 --bg-elevated 深底
+        // 相去甚远。accent 槽位在组件库里只当「选中/悬停底」用(Select/Toggle/
+        // Calendar/补全菜单),mt-app 这些原语全自绘、没有消费方,可以安全借位。
+        // ⚠️ 原版 code 前景还是 --accent 橙,组件对 fg 没有开口 —— 只对齐了底色,
+        // 橙字待上游给 TextViewStyle 加 inline code 钩子(记档)。
+        theme.colors.accent = applied.palette.bg_elevated;
+        // md 链接色:TextView 取 `theme().link`,原版 `.md-preview a` 是 --accent
+        theme.colors.link = applied.palette.accent;
+    }
     applied
 }
 

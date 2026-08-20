@@ -1239,7 +1239,11 @@ impl Render for TerminalPane {
                     menu::show(event.position, entries, window, cx);
                 }),
             )
-            .child(self.view.clone())
+            // 终端内容内边距:GPUI 的 grid 逐格自绘、顶格铺满 bounds,不垫一层
+            // 会贴着 pane 边缘(原版 xterm 靠字形侧空隙 + 列取整余量,视觉上
+            // 不贴边);8px 与 Windows Terminal 默认同档。padding 挤掉的空间由
+            // resize 链自然吸收(cols/rows 按 view 的实际 bounds 算)。
+            .child(div().size_full().p(px(8.0)).child(self.view.clone()))
             // 终端内查找条:右上角,距顶 6px、距右 14px —— 与原版
             // `rect.top + 6` / `rect.right - w - 14` 同款(那边是 rAF 每帧算出来的
             // fixed 坐标,这里由布局白拿)
