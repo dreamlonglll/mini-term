@@ -17,9 +17,10 @@
   <img src="https://img.shields.io/badge/version-1.0.0--beta-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
+  <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
   <img src="https://img.shields.io/badge/React-19-61dafb" alt="react">
-  <img src="https://img.shields.io/badge/Rust-2021-dea584" alt="rust">
+  <img src="https://img.shields.io/badge/Rust-1.95%2B-dea584" alt="rust">
 </p>
 
 <p align="center">
@@ -159,16 +160,18 @@ A VS Code-style **Changes panel** (Staged / Changes / Untracked groups, per-file
 
 ## Tech stack
 
-| Layer | Technology |
-|---|---|
-| Framework | Tauri v2 (Rust backend + system WebView — small installer, low resident memory) |
-| Frontend | React 19 + TypeScript 5.8 + Tailwind CSS v4 + Vite 7 |
-| Terminal | xterm.js v6 (WebGL, automatic Canvas fallback) |
-| State / layout | Zustand single store · Allotment + recursive SplitNode tree |
-| PTY / Git | portable-pty · git2 · notify + ignore |
-| Usage stats | rusqlite local ledger · recharts trend charts |
-| Mobile relay | axum + tokio WebSocket (`relay-server/`) · React + Vite PWA (`mobile/`) |
-| Tests | **609 Rust tests** (556 desktop + 53 relay) plus 77 Node tests |
+Since v1.0.0-beta the repository hosts **two parallel implementations** with matching features; the GPUI-native build is the mainline going forward:
+
+| Layer | GPUI-native build (`crates/`) | Tauri build (`src/` + `src-tauri/`) |
+|---|---|---|
+| Shell / rendering | GPUI 0.2 (the framework behind Zed — GPU-native rendering, single process, no WebView) | Tauri v2 (Rust backend + system WebView) |
+| UI | Pure Rust: gpui-component + hand-drawn widgets | React 19 + TypeScript 5.8 + Tailwind CSS v4 + Vite 7 |
+| Terminal | alacritty_terminal (in-process VT parsing — zero IPC, zero serialization) | xterm.js v6 (WebGL, automatic Canvas fallback) |
+| State / layout | Single store (Rust) · recursive SplitNode tree (isomorphic to the right) | Zustand single store · Allotment + recursive SplitNode tree |
+| PTY / Git | portable-pty · git2 · notify + ignore (same Rust dependencies on both sides) | Same |
+| Usage stats | rusqlite local ledger · hand-drawn trend charts | rusqlite local ledger · recharts trend charts |
+| Mobile relay | axum + tokio WebSocket (`relay-server/`) · React + Vite PWA (`mobile/`) — shared by both builds | Same |
+| Tests | **1,369 Rust tests** (26 test targets) | **609 Rust tests** (556 desktop + 53 relay) plus 77 Node tests |
 
 ---
 
@@ -176,7 +179,10 @@ A VS Code-style **Changes panel** (Staged / Changes / Untracked groups, per-file
 
 ### Download
 
-Grab the latest installer from [Releases](https://github.com/dreamlonglll/mini-term/releases).
+Grab the latest build from [Releases](https://github.com/dreamlonglll/mini-term/releases). Since v1.0.0-beta every release ships in two forms:
+
+- **GPUI-native portable bundle (Windows x64, recommended for early adopters)** — `mini-term-gpui-*-windows-x64.zip`, unzip and run: no installer, no WebView2 dependency, the whole UI rewritten with Rust-native rendering, feature parity with the Tauri build
+- **Tauri installers (three platforms, as usual)** — Windows `*-setup.exe` (NSIS), macOS `.dmg`, Linux `.deb` / `.AppImage`; MSI and rpm reject pre-release version numbers and will return with the stable release
 
 > **Platform support**
 > - **Windows** — the primary platform with guaranteed usability; all daily development and testing happens here
@@ -190,15 +196,23 @@ xattr -cr /Applications/Mini-Term.app
 
 ### Build from source
 
-Requires Node.js >= 20.19 (or >= 22.12), Rust >= 1.85, and the [Tauri v2 CLI](https://v2.tauri.app/start/prerequisites/).
+Requires Rust >= 1.95; the Tauri build additionally needs Node.js >= 20.19 (or >= 22.12) and the [Tauri v2 CLI](https://v2.tauri.app/start/prerequisites/).
 
 ```bash
 git clone https://github.com/dreamlonglll/mini-term.git
 cd mini-term
+
+# GPUI-native build
+cargo run -p mt-app                  # dev
+cargo build --release -p mt-app      # output: target/release/mini-term.exe
+
+# Tauri build
 npm install
 npm run tauri dev      # dev (frontend + backend)
 npm run tauri build    # release bundle
 ```
+
+> The GPUI build locates its sidecars and the portable ConPTY runtime **next to the exe** (hook reporting, `miniterm-hook` / `mt-ssh-cli`, `portable-conpty/`). The release zip ships them all; when running from source, copy them beside the exe for the full experience (see `scripts/stage-sidecars.mjs` for building and staging).
 
 ---
 

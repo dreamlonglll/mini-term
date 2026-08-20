@@ -17,9 +17,10 @@
   <img src="https://img.shields.io/badge/version-1.0.0--beta-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
+  <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
   <img src="https://img.shields.io/badge/React-19-61dafb" alt="react">
-  <img src="https://img.shields.io/badge/Rust-2021-dea584" alt="rust">
+  <img src="https://img.shields.io/badge/Rust-1.95%2B-dea584" alt="rust">
 </p>
 
 <p align="center">
@@ -159,16 +160,18 @@ VS Code 风格的 **Changes 面板**（Staged / Changes / Untracked 分组，单
 
 ## 技术栈
 
-| 层 | 技术 |
-|---|---|
-| 框架 | Tauri v2（Rust 后端 + 系统 WebView，安装包小、常驻内存低） |
-| 前端 | React 19 + TypeScript 5.8 + Tailwind CSS v4 + Vite 7 |
-| 终端 | xterm.js v6（WebGL 加速，自动降级 Canvas） |
-| 状态 / 布局 | Zustand 单一 Store · Allotment + 递归 SplitNode 分屏树 |
-| PTY / Git | portable-pty · git2 · notify + ignore |
-| 用量统计 | rusqlite 本地账本 · recharts 趋势图 |
-| 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`） |
-| 测试 | **609 个 Rust 测试**（桌面端 556 + 中转 53）+ 77 个 Node 测试 |
+v1.0.0-beta 起仓库里是**两套并行实现**，功能已对齐，GPUI 原生版是后续演进的主线：
+
+| 层 | GPUI 原生版（`crates/`） | Tauri 版（`src/` + `src-tauri/`） |
+|---|---|---|
+| 壳 / 渲染 | GPUI 0.2（Zed 同源框架，GPU 原生渲染，单进程、无 WebView） | Tauri v2（Rust 后端 + 系统 WebView） |
+| UI | 纯 Rust：gpui-component + 自绘组件 | React 19 + TypeScript 5.8 + Tailwind CSS v4 + Vite 7 |
+| 终端 | alacritty_terminal（进程内 VT 解析，零 IPC、零序列化） | xterm.js v6（WebGL 加速，自动降级 Canvas） |
+| 状态 / 布局 | 单一 Store（Rust）· 递归 SplitNode 分屏树（与右侧同构） | Zustand 单一 Store · Allotment + 递归 SplitNode 分屏树 |
+| PTY / Git | portable-pty · git2 · notify + ignore（两版同一套 Rust 依赖） | 同左 |
+| 用量统计 | rusqlite 本地账本 · 自绘趋势图 | rusqlite 本地账本 · recharts 趋势图 |
+| 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`），两版共用 | 同左 |
+| 测试 | **1369 个 Rust 测试**（26 个测试目标） | **609 个 Rust 测试**（桌面端 556 + 中转 53）+ 77 个 Node 测试 |
 
 ---
 
@@ -176,7 +179,10 @@ VS Code 风格的 **Changes 面板**（Staged / Changes / Untracked 分组，单
 
 ### 下载安装
 
-前往 [Releases](https://github.com/dreamlonglll/mini-term/releases) 下载最新安装包。
+前往 [Releases](https://github.com/dreamlonglll/mini-term/releases) 下载。v1.0.0-beta 起每个 Release 有两种形态：
+
+- **GPUI 原生版便携包（Windows x64，推荐尝鲜）** — `mini-term-gpui-*-windows-x64.zip`，解压即用：无需安装、不依赖 WebView2，整套 UI 为 Rust 原生渲染重写，功能与 Tauri 版对齐
+- **Tauri 安装包（三平台照常）** — Windows `*-setup.exe`（NSIS）、macOS `.dmg`、Linux `.deb` / `.AppImage`；MSI 与 rpm 不接受预发布版本号，随正式版恢复
 
 > **平台支持**
 > - **Windows** — 主要支持平台，保证可用性，日常开发与测试都在 Windows 上
@@ -190,15 +196,23 @@ xattr -cr /Applications/Mini-Term.app
 
 ### 从源码构建
 
-需要 Node.js >= 20.19（或 >= 22.12）、Rust >= 1.95、[Tauri v2 CLI](https://v2.tauri.app/start/prerequisites/)。
+需要 Rust >= 1.95；构建 Tauri 版另需 Node.js >= 20.19（或 >= 22.12）与 [Tauri v2 CLI](https://v2.tauri.app/start/prerequisites/)。
 
 ```bash
 git clone https://github.com/dreamlonglll/mini-term.git
 cd mini-term
+
+# GPUI 原生版
+cargo run -p mt-app                  # 开发
+cargo build --release -p mt-app      # 产物 target/release/mini-term.exe
+
+# Tauri 版
 npm install
 npm run tauri dev      # 开发（前端 + 后端）
 npm run tauri build    # 构建发布包
 ```
+
+> GPUI 版的 hook 上报与便携 ConPTY 按「与 exe 同目录」定位 sidecar 与资源，发布 zip 已带齐；源码运行要完整体验，需把 `miniterm-hook` / `mt-ssh-cli` 与 `portable-conpty/` 放到 exe 旁（构建与就位见 `scripts/stage-sidecars.mjs`）。
 
 ---
 
