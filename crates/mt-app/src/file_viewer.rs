@@ -1047,16 +1047,39 @@ impl FileViewer {
             .preview_draft
             .clone()
             .unwrap_or_else(|| self.disk.clone());
+        // 排版对齐原版 `.md-preview`(styles.css:814-887):基准 1.08rem ≈ 14px
+        // (root=uiFontSize,走 ui::font_px 保持随设置缩放)、行高 1.7、标题
+        // 1.8/1.4/1.15/1em、段距 0.8em、代码块 0.85em —— TextView 默认基准吃
+        // gpui 的 16px、标题倍率 2/1.5/1.25,整体明显偏大(用户实测)。
+        let mut code_block = gpui::StyleRefinement::default();
+        {
+            // `refine_style` 排在组件自己的 `.text_size(mono_font_size)` 之后,
+            // 这里的字号能赢(node.rs:384-386)
+            let text = code_block.text.get_or_insert_default();
+            text.font_size = Some(ui::font_px(11.9).into());
+            text.line_height = Some(gpui::relative(1.6).into());
+        }
         let style = TextViewStyle {
             highlight_theme: cx.theme().highlight_theme.clone(),
             is_dark: cx.theme().mode.is_dark(),
+            heading_base_font_size: ui::font_px(14.0),
+            paragraph_gap: gpui::rems(0.7),
+            code_block,
             ..Default::default()
-        };
+        }
+        .heading_font_size(|level, base| match level {
+            1 => base * 1.8,
+            2 => base * 1.4,
+            3 => base * 1.15,
+            _ => base,
+        });
         div()
             .id("file-viewer-md")
             .size_full()
             .overflow_y_scroll()
             .p(px(24.0))
+            .text_size(ui::font_px(14.0))
+            .line_height(gpui::relative(1.7))
             .child(
                 div().max_w(px(860.0)).mx_auto().child(
                     TextView::markdown("file-viewer-md-body", source, window, cx)
