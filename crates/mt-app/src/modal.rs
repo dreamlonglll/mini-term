@@ -74,7 +74,8 @@ pub fn open_rename_pane(
         let input_for_ok = input.clone();
         dialog
             .title(t("paneGroup", "renameTerminal"))
-            .w(px(380.0))
+            // 与 `showPrompt` 同宽:原版这条就是走 `.prompt-dialog`(360px)
+            .w(px(360.0))
             .confirm()
             .button_props(
                 DialogButtonProps::default()
@@ -115,7 +116,8 @@ pub fn open_confirm_remove_project(
         let project_id = project_id.clone();
         dialog
             .title(t("projectList", "removeConfirm.title"))
-            .w(px(420.0))
+            // 原版 `ProjectList.tsx` 的删除确认是 `w-[320px]`
+            .w(px(320.0))
             .confirm()
             .button_props(
                 DialogButtonProps::default()

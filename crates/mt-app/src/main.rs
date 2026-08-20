@@ -1405,6 +1405,9 @@ impl Render for Workspace {
                 )
         });
 
+        // 原版 `w-[80vw] max-h-[85vh]` + 外壳默认 `pt-[10vh]`(`Modal.tsx:162`):
+        // 左右各留 10vw,顶 10vh、底 5vh(10vh + 85vh = 95vh)
+        let usage_viewport = window.viewport_size();
         let usage_layer = self.usage_panel.clone().filter(|_| self.usage_open).map(|panel| {
             // 原版用量统计是 Modal(`UsageStatsModal.tsx:397`,fixed inset-0,
             // **盖住标题栏**),遮罩统一 `bg-black/50 backdrop-blur-sm`
@@ -1429,10 +1432,10 @@ impl Render for Workspace {
                 .child(
                     div()
                         .absolute()
-                        .top(px(24.0))
-                        .left(px(60.0))
-                        .right(px(60.0))
-                        .bottom(px(24.0))
+                        .top(usage_viewport.height * 0.10)
+                        .left(usage_viewport.width * 0.10)
+                        .right(usage_viewport.width * 0.10)
+                        .bottom(usage_viewport.height * 0.05)
                         .occlude()
                         // 面板内按下不冒泡到遮罩(原版 `Modal.tsx:180` 的
                         // stopPropagation 同款),否则点面板空白处也会关窗

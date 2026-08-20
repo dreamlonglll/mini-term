@@ -205,7 +205,8 @@ impl Confirm {
             let on_ok = on_ok.clone();
             dialog
                 .title(self.title.clone())
-                .w(px(380.0))
+                // 原版 `.prompt-dialog` 三件套(prompt/confirm/alert)统一 360px
+                .w(px(360.0))
                 .confirm()
                 .overlay_closable(true)
                 .button_props(
@@ -237,7 +238,8 @@ pub fn show_alert(
     open_guarded(kind::ALERT, window, cx, move |dialog, _window, _cx| {
         dialog
             .title(title.clone())
-            .w(px(380.0))
+            // 原版 `.prompt-dialog` 三件套(prompt/confirm/alert)统一 360px
+            .w(px(360.0))
             .alert()
             .button_props(DialogButtonProps::default().ok_text(t("prompt", "ok")))
             .child(body(&message, &[]))

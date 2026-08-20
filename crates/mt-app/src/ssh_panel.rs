@@ -47,9 +47,12 @@ use crate::ui;
 
 /// 面板宽度(原版 `w-[720px]`)。
 pub(crate) const PANEL_W: f32 = 720.0;
-/// 正文高度(原版 `h-[70vh] max-h-[680px]`;gpui 没有视口单位,取上限那一档
-/// 减去标题/底栏后的定值 —— 与「移动端」面板的 540px 同一条取舍)。
-pub(crate) const BODY_H: f32 = 520.0;
+/// 面板总高:原版 `h-[70vh] max-h-[680px]`,三个 720 宽面板同款。
+/// gpui 没有视口单位,按视口现算 —— Dialog 的 builder 每帧重跑,
+/// 拖窗口改大小时跟着变;正文吃掉头/底栏之外的剩余(flex-1),与原版同构。
+pub(crate) fn panel_total_h(viewport: gpui::Size<gpui::Pixels>) -> gpui::Pixels {
+    (viewport.height * 0.70).min(px(680.0))
+}
 /// 左栏宽度(原版 `w-44` = 176px)。
 const SIDEBAR_W: f32 = 176.0;
 
@@ -504,8 +507,9 @@ pub fn open(window: &mut Window, cx: &mut App) {
         _subs: Vec::new(),
     });
 
-    open_guarded(kind::SSH_PANEL, window, cx, move |dialog, _window, cx| {
-        let body = render_body(&state, cx);
+    open_guarded(kind::SSH_PANEL, window, cx, move |dialog, window, cx| {
+        let total = panel_total_h(window.viewport_size());
+        let body = render_body(&state, total, cx);
         dialog
             // 满幅左右栏:默认 24px 内边距会把中缝分隔线切断(见 `panel_header`)
             .p_0()
@@ -789,7 +793,7 @@ fn read_frame(state: &Entity<SshPanel>, cx: &App) -> Frame {
     }
 }
 
-fn render_body(state: &Entity<SshPanel>, cx: &mut App) -> AnyElement {
+fn render_body(state: &Entity<SshPanel>, total: gpui::Pixels, cx: &mut App) -> AnyElement {
     // 拖拽结束 / 中断(松手在窗外、落在非落点上)后 gpui 会清 active_drag 并重画:
     // 借这一帧把残留的 view state 清掉,否则「未分组」那一行会一直钉在栏里。
     // **不 notify** —— 正在渲染,再触发一次重画就是死循环(与 project_list 同一条)
@@ -801,6 +805,7 @@ fn render_body(state: &Entity<SshPanel>, cx: &mut App) -> AnyElement {
     }
     let frame = read_frame(state, cx);
     div()
+        .h(total)
         .flex()
         .flex_col()
         .child(panel_header(
@@ -811,7 +816,7 @@ fn render_body(state: &Entity<SshPanel>, cx: &mut App) -> AnyElement {
         ))
         .child(
             div()
-                .h(px(BODY_H))
+                .flex_1()
                 .flex()
                 .min_h(px(0.0))
                 .child(render_sidebar(state, &frame, cx))

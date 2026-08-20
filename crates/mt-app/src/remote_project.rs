@@ -36,16 +36,13 @@ use crate::i18n::t;
 use crate::prompt::{close_guarded, kind, open_guarded};
 use crate::ssh_conn::{SshGroupBucket, build_group_buckets};
 use crate::ssh_panel::{
-    BODY_H, GroupKey, PANEL_W, bucket_header, bucket_key, conn_card, conn_text, panel_header,
-    resolve_active, sidebar_row, visible_buckets,
+    GroupKey, PANEL_W, bucket_header, bucket_key, conn_card, conn_text, panel_header,
+    panel_total_h, resolve_active, sidebar_row, visible_buckets,
 };
 use crate::store::AppStore;
 use crate::ui;
 
 const SIDEBAR_W: f32 = 176.0;
-/// 连接选择区的高度。下半区(路径 / 项目名)是固定表单,不随列表滚动,
-/// 所以这里比另两个弹窗的正文矮一截。
-const LIST_H: f32 = BODY_H - 140.0;
 
 pub struct AddRemotePanel {
     store: Entity<AppStore>,
@@ -144,7 +141,8 @@ pub fn open(
                 window.defer(cx, move |window, cx| save(&state, window, cx));
             }
             let busy = state.read(cx).busy;
-            let body = render_body(&state, cx);
+            let total = panel_total_h(window.viewport_size());
+            let body = render_body(&state, total, cx);
             dialog
                 .p_0()
                 .close_button(false)
@@ -281,9 +279,10 @@ fn read_frame(state: &Entity<AddRemotePanel>, cx: &App) -> Frame {
     }
 }
 
-fn render_body(state: &Entity<AddRemotePanel>, cx: &mut App) -> AnyElement {
+fn render_body(state: &Entity<AddRemotePanel>, total: gpui::Pixels, cx: &mut App) -> AnyElement {
     let frame = read_frame(state, cx);
     let mut root = div()
+        .h(total)
         .flex()
         .flex_col()
         .child(panel_header(
@@ -297,7 +296,7 @@ fn render_body(state: &Entity<AddRemotePanel>, cx: &mut App) -> AnyElement {
         // 一条连接都没有:整个选择区与表单都不画,只给一句引导
         root = root.child(
             div()
-                .h(px(LIST_H))
+                .flex_1()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -310,7 +309,7 @@ fn render_body(state: &Entity<AddRemotePanel>, cx: &mut App) -> AnyElement {
         root = root
             .child(
                 div()
-                    .h(px(LIST_H))
+                    .flex_1()
                     .flex()
                     .min_h(px(0.0))
                     .child(render_sidebar(state, &frame))

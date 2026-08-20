@@ -36,7 +36,8 @@ use crate::i18n::{t, tr};
 use crate::prompt::{close_guarded, kind, open_guarded, show_alert};
 use crate::ssh_conn::{SshGroupBucket, build_group_buckets, initial_checked};
 use crate::ssh_panel::{
-    BODY_H, GroupKey, PANEL_W, bucket_header, bucket_key, conn_card, conn_text, panel_header,
+    GroupKey, PANEL_W, bucket_header, bucket_key, conn_card, conn_text, panel_header,
+    panel_total_h,
     resolve_active, sidebar_row, visible_buckets,
 };
 use crate::store::{AppStore, SshAssocOutcome};
@@ -91,9 +92,10 @@ pub fn open(store: Entity<AppStore>, project_id: &str, window: &mut Window, cx: 
         _task: None,
     });
 
-    open_guarded(kind::SSH_ASSOC, window, cx, move |dialog, _window, cx| {
+    open_guarded(kind::SSH_ASSOC, window, cx, move |dialog, window, cx| {
         let busy = state.read(cx).busy;
-        let body = render_body(&state, cx);
+        let total = panel_total_h(window.viewport_size());
+        let body = render_body(&state, total, cx);
         dialog
             .p_0()
             .close_button(false)
@@ -255,9 +257,10 @@ fn read_frame(state: &Entity<SshAssocPanel>, cx: &App) -> Frame {
     }
 }
 
-fn render_body(state: &Entity<SshAssocPanel>, cx: &mut App) -> AnyElement {
+fn render_body(state: &Entity<SshAssocPanel>, total: gpui::Pixels, cx: &mut App) -> AnyElement {
     let frame = read_frame(state, cx);
     div()
+        .h(total)
         .flex()
         .flex_col()
         .child(panel_header(
@@ -272,7 +275,7 @@ fn render_body(state: &Entity<SshAssocPanel>, cx: &mut App) -> AnyElement {
         ))
         .child(
             div()
-                .h(px(BODY_H))
+                .flex_1()
                 .flex()
                 .min_h(px(0.0))
                 .child(render_sidebar(state, &frame))

@@ -603,7 +603,9 @@ pub fn open_settings(
             // 窗口比 680 窄时面板两侧一起出界(原版那边 flex-shrink 会把它压回来)
             let viewport = window.viewport_size();
             let width = ui::clamp_dialog_width(px(680.0), viewport);
-            let body = ui::clamp_dialog_body_height(px(640.0), viewport, 0.8, px(HEADER_H));
+            // 原版没有 px 上限(只有 `max-h-[80vh]`),preferred 给视口高
+            // 等于只按 80vh 钳 —— 面板总高与原版内容撑满时一致
+            let body = ui::clamp_dialog_body_height(viewport.height, viewport, 0.8, px(HEADER_H));
             dialog
                 .w(width)
                 .p_0()
