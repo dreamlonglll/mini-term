@@ -97,7 +97,20 @@ struct ProjectScopeView {
 /// 文件不存在 / 路径无法定位 / JSON 解析失败时一律返回空 Vec,绝不 panic
 /// ——sidecar 在 stdio 协议下不能因配置问题崩溃。
 pub fn read_ssh_connections_for_project(project_id: Option<&str>) -> Vec<SshConnection> {
-    let view = parse_config_from(config_json_path());
+    read_ssh_connections_for_project_at(config_json_path(), project_id)
+}
+
+/// [`read_ssh_connections_for_project`] 的按路径版本。
+///
+/// 生产路径永远走上面那个(路径由本模块自己定位)。这一支是给**写方**验证用的:
+/// `config.json` 现在是 `mt-config` 写出来的 SSH 投影,而解析它的是这里 ——
+/// 两边隔着一个 crate 边界、没有共享类型,只靠字段名对齐。mt-config 的测试
+/// 直接拿本函数验投影,「投影漂了但没人发现」这条缝就堵上了。
+pub fn read_ssh_connections_for_project_at(
+    path: Option<PathBuf>,
+    project_id: Option<&str>,
+) -> Vec<SshConnection> {
+    let view = parse_config_from(path);
     scope_connections(view.ssh_connections, &view.projects, project_id)
 }
 
@@ -106,7 +119,16 @@ pub fn read_ssh_connections_for_project(project_id: Option<&str>) -> Vec<SshConn
 /// CLI/daemon 只能走此入口。令牌为空、未知或配置不可读时返回错误，绝不回退到
 /// 全部连接；命中后沿用项目 `sshConnectionIds` 的现有范围语义。
 pub fn read_ssh_connections_for_token(project_token: &str) -> Result<Vec<SshConnection>, String> {
-    let view = parse_config_from(config_json_path());
+    read_ssh_connections_for_token_at(config_json_path(), project_token)
+}
+
+/// [`read_ssh_connections_for_token`] 的按路径版本。用途同
+/// [`read_ssh_connections_for_project_at`] —— 给写方验证投影。
+pub fn read_ssh_connections_for_token_at(
+    path: Option<PathBuf>,
+    project_token: &str,
+) -> Result<Vec<SshConnection>, String> {
+    let view = parse_config_from(path);
     scope_connections_for_token(view.ssh_connections, &view.projects, project_token)
 }
 

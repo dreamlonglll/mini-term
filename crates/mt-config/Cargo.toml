@@ -18,3 +18,14 @@ mt-core.workspace = true
 # 版本与 src-tauri/Cargo.toml 保持一致,避免同一功能在两套构建里行为漂开。
 sha2 = "0.11.0"
 zip = "8.6.0"
+# `config.db`:AppConfig 的持久化归属方(见 src/db.rs 的模块注释)。
+#
+# 版本与 mt-usage / mt-layout 对齐 —— 同一棵依赖树里出现两个 rusqlite 会连带两份
+# libsqlite3-sys,构建直接失败。`backup` feature 供每启动一代的库备份:WAL 模式下
+# 直接 copy 主库文件会漏掉还没 checkpoint 的那部分。
+#
+# ⚠️ 这一行**不影响三个 sidecar 二进制**:它们只依赖 mt-core / mt-ssh
+# (见 sidecars/Cargo.toml),不依赖本 crate。真正的红线只有「绝不让 mt-core
+# 依赖任何带 rusqlite 的 crate」——那才会把 SQLite 静态塞进每次事件都冷启动的
+# hook 小程序里。
+rusqlite = { version = "0.40.1", features = ["bundled", "backup"] }

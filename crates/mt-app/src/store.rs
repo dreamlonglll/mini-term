@@ -212,9 +212,8 @@ pub struct AppStore {
 /// 开布局库,顺带跑一次「从 config.json 迁入」。
 ///
 /// 返回 `None` 的三种情形都按同一档降级处理:**布局本次不落盘**,界面照常用。
-/// 其中迁移失败也返回 `None` 是刻意的 —— 此时 config.json 里的 `savedLayout`
-/// 还原封不动躺着(那些字段已改成只读不写),让本次继续走内存里那份、下次启动
-/// 重试迁移,比拿一份半截数据把用户的布局盖掉强。
+/// 其中迁移失败也返回 `None` 是刻意的 —— 让本次继续走内存里那份、下次启动重试,
+/// 比拿一份半截数据把用户的布局盖掉强。
 fn open_layout_store(config: &AppConfig, may_migrate: bool) -> Option<Arc<mt_layout::LayoutStore>> {
     let dir = match mt_config::active_data_dir() {
         Ok(dir) => dir,
@@ -231,18 +230,47 @@ fn open_layout_store(config: &AppConfig, may_migrate: bool) -> Option<Arc<mt_lay
         }
     };
     if may_migrate && store.needs_config_migration() {
-        match store.migrate_from_config(config) {
+        let fallback = layout_migration_fallback(config, &dir);
+        let source = fallback.as_ref().unwrap_or(config);
+        match store.migrate_from_config(source) {
             Ok(n) => eprintln!(
-                "[layout] 已从 config.json 迁入 {n} 个项目的布局 → {}",
+                "[layout] 已迁入 {n} 个项目的布局 → {}",
                 store.path().display()
             ),
             Err(err) => {
-                eprintln!("[layout] 从 config.json 迁移失败({err:#}),本次布局不落盘");
+                eprintln!("[layout] 布局迁移失败({err:#}),本次布局不落盘");
                 return None;
             }
         }
     }
     Some(Arc::new(store))
+}
+
+/// 布局迁移的**兜底数据源**:`{dir}/config.json.pre-sqlite`(配置搬进 config.db
+/// 时留下的完整旧配置存档)。
+///
+/// 为什么需要它:配置迁移一完成,`config.json` 就被覆盖成只剩 SSH 的投影,而
+/// `savedLayout` 此后只活在「内存里这一份 AppConfig」上。要是布局迁移偏偏在那一次
+/// 失败(盘满 / 库被占用),下次启动的 config 是从 config.db 读的、`savedLayout`
+/// 全是 `None` —— 重试也只会迁出一片空白,旧布局**永久丢失**。
+///
+/// 只在「传进来的 config 一个布局都没有」时才回退去读存档:正常首启走内存那份
+/// (更新、且不必读盘);第二次以后 `needs_config_migration()` 已是 false,根本
+/// 到不了这里。
+fn layout_migration_fallback(config: &AppConfig, dir: &Path) -> Option<AppConfig> {
+    if config.projects.iter().any(|p| p.saved_layout.is_some()) {
+        return None;
+    }
+    let archive = dir.join("config.json.pre-sqlite");
+    let archived = mt_config::read_config_from(&archive).ok().flatten()?;
+    if !archived.projects.iter().any(|p| p.saved_layout.is_some()) {
+        return None;
+    }
+    eprintln!(
+        "[layout] 内存里的配置已无 savedLayout,改从存档迁移: {}",
+        archive.display()
+    );
+    Some(archived)
 }
 
 /// 把库里的布局覆盖进 `config` 的对应字段(内存缓存),并清掉已删项目的残行。
@@ -1601,7 +1629,7 @@ impl AppStore {
         };
         let is_remote = project.ssh_connection_id.is_some();
         // 项目级环境变量走 user_env —— 它会被 `MINITERM_` 前缀过滤挡一道,
-        // 用户手改 config.json 也覆盖不掉内部协议变量。
+        // 用户手改配置(现在是 config.db)也覆盖不掉内部协议变量。
         // 远程 pane 不注入(见上方分支注释)。
         let user_env: Vec<(String, String)> = if is_remote {
             Vec::new()

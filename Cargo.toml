@@ -80,8 +80,10 @@ mt-core = { path = "crates/mt-core" }
 mt-i18n = { path = "crates/mt-i18n" }
 # 界面布局持久化(layout.db)。从 config.json 里搬出来的理由见该 crate 的模块注释:
 # 布局是交互频次的数据,不该每改一次就把整份配置连同 .bak 重写一遍。
-# ⚠️ 只能由 mt-app 依赖 —— 它带 rusqlite,挂到 mt-config/mt-relay 上会把 sqlite
-# 拖进中转与 sidecar 的链路。
+#
+# 它带 rusqlite,但**三个 sidecar 二进制不在影响面内** —— 它们只依赖 mt-core /
+# mt-ssh(见 sidecars/Cargo.toml),既不依赖本 crate 也不依赖 mt-config。真正的
+# 红线只有一条:绝不让 `mt-core` 依赖任何带 rusqlite 的 crate。
 mt-layout = { path = "crates/mt-layout" }
 mt-project = { path = "crates/mt-project" }
 mt-pty = { path = "crates/mt-pty" }

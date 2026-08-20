@@ -188,8 +188,8 @@ pub struct RemoteLaunchExtras {
 
 impl TerminalPane {
     /// `user_env` 是项目级环境变量:走 [`mt_pty::PtyOptions::user_env`] 而不是
-    /// `spec.env`,因为前者会被 `MINITERM_` 前缀过滤挡一道 —— 用户手改
-    /// `config.json` 也覆盖不掉内部协议变量。
+    /// `spec.env`,因为前者会被 `MINITERM_` 前缀过滤挡一道 —— 用户手改配置
+    /// (现在是 `config.db`)也覆盖不掉内部协议变量。
     ///
     /// `remote` 见 [`RemoteLaunchExtras`];本地 pane 传 `Default::default()`。
     #[allow(clippy::too_many_arguments)]

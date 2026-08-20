@@ -37,6 +37,7 @@ pub mod paths;
 pub mod theme_packs;
 
 mod config;
+mod db;
 
 pub use config::{
     AiLauncher, AppConfig, ConfigStore, EditorConfig, LoadedConfig, MobileRelayConfig,

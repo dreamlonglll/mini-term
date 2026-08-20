@@ -35,8 +35,13 @@
 //! PTY reader 线程 → TerminalEmulator::advance + observe_output → 唤醒 channel → 重绘
 //! hook / 500ms 轮询 → StatusSink → channel → Workspace 的前台任务 → AppStore
 //!                                                   └→ PendingAlert → 提示音/闪任务栏/toast
-//! 布局/配置变化 → AppStore::save_config_soon(500ms 防抖)→ ConfigStore::save(带令牌)
+//! 配置变化 → AppStore::save_config_soon(500ms 防抖)→ ConfigStore::save(带令牌,写 config.db)
+//! 布局变化 → AppStore::save_layout_soon(300ms 防抖)→ LayoutStore(写 layout.db)
 //! ```
+//!
+//! 两条落盘路径是分开的:布局是交互频次的数据(拖分隔条/开关终端),配置是月级的,
+//! 共用一个信封时改一次布局要把整份配置重写一遍。详见 `mt-layout` 与
+//! `mt_config::db` 的模块注释。
 //!
 //! 状态形状与操作语义对照 `src/store.ts`,见 [`store`] 与 [`tree`] 两个模块的注释。
 
@@ -227,7 +232,8 @@ const MOTION_OVERLAY_IN_MS: u64 = 240;
 const MOTION_OVERLAY_OUT_MS: u64 = 140;
 const MOTION_PANEL_SWAP_MS: u64 = 200;
 
-/// 应用数据目录:`config.json`、`hook-server.json` 的落点。
+/// 应用数据目录:`config.db`(配置本体)、`layout.db`(界面布局)、
+/// `config.json`(给 sidecar 读的 SSH 投影)、`hook-server.json` 的落点。
 ///
 /// **开发用逃生门 `MT_APP_DATA_DIR`**:装机版正在跑的时候直接 `cargo run` 会与它
 /// 共用同一个目录 —— 配置被两边轮流改写,hook 端口文件更是直接互抢(装机版占了

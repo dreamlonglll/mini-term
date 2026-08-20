@@ -1,8 +1,10 @@
-//! 布局树 ↔ 磁盘格式(`config.json` 里的 `savedLayout`)。
+//! 布局树 ↔ 磁盘格式(`SavedProjectLayout`)。
 //!
 //! 对照 `src/store.ts` 的 `serializeLayout` 与 `src/utils/layoutRestore.ts`。
-//! **磁盘格式一个字都不改** —— 装机版(Tauri 壳)写下的 `config.json`,GPUI 壳
-//! 必须原样读得进来,反之亦然;两套并存到功能对齐为止。
+//! **磁盘格式一个字都不改** —— 这份形状先后经历过两个信封:最早是
+//! `config.json` 里的 `savedLayout` 字段,现在是 `layout.db` 的
+//! `project_layout.layout_json`(见 `mt-layout`)。换信封时本模块一行没动,
+//! 存量数据也是逐字节搬过去的。
 //!
 //! `tabs` 恒为 0 或 1 个元素:项目级 tab 层早已删除,数组只是历史兼容。读到多元素
 //! 时把后续 tab 的 pane 平铺进保留那棵树最左侧叶子的 tab 栏(与 TS 侧同一口径),
