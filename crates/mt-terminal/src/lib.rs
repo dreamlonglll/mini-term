@@ -106,6 +106,31 @@ pub struct TerminalEmulator {
     /// alacritty 也没给读回口,而 [`Self::set_scrollback`] 要靠它做「值没变就不动」
     /// 的短路(`set_options` 会把整屏标脏并发一次 title 事件)。
     scrollback: AtomicUsize,
+    /// 光标绝对行的最低水位。`Some` = 追踪中,见 [`Self::arm_cursor_floor`]。
+    cursor_floor: Mutex<Option<CursorFloor>>,
+}
+
+/// 追踪中的光标水位。
+struct CursorFloor {
+    /// 到达过的最低绝对行。
+    min: i32,
+    /// 还允许逐字节采样多少字节,见 [`FLOOR_SAMPLE_BUDGET`]。
+    budget: usize,
+}
+
+/// 一次追踪最多逐字节采样多少字节,之后退回整批推进(水位保留已经找到的值)。
+///
+/// 要抓的 erase 就在 AI 应答的**头一批**数据里,几 KB 就走完了;这个上限是给
+/// 「在 AI 会话里 `cat` 了个大文件」这类爆发兜底 —— 逐字节推进会让 vte 的批量
+/// 快路径失效,不封顶的话 reader 线程可能被拖出一次可见的卡顿。
+const FLOOR_SAMPLE_BUDGET: usize = 256 * 1024;
+
+/// 光标当前所在的 **grid 绝对行** = `cursor.line + history_size`。
+///
+/// 内容每被顶进历史一行,它的 `Line` 减 1、`history_size` 加 1,两者之和守恒 ——
+/// 所以这个量**可以跨滚动比较**,而裸的 `cursor.point.line` 不行。
+fn cursor_row(term: &Term<EventQueue>) -> i32 {
+    term.grid().cursor.point.line.0 + term.history_size() as i32
 }
 
 impl TerminalEmulator {
@@ -131,6 +156,7 @@ impl TerminalEmulator {
             parser: Mutex::new(Processor::new()),
             events,
             scrollback: AtomicUsize::new(scrollback),
+            cursor_floor: Mutex::new(None),
         }
     }
 
@@ -157,9 +183,55 @@ impl TerminalEmulator {
 
     /// 把刚从 PTY 读到的字节推进状态机。直接接 [`mt_pty::PtySession::spawn`]
     /// 的 `on_output` 回调。
+    ///
+    /// 追踪光标水位时**改成逐字节推进**(见 [`Self::arm_cursor_floor`]):要找的
+    /// 那个位置只在整批数据的**中间态**里存在,喂完再读就已经被后续输出推走了。
     pub fn advance(&self, bytes: &[u8]) {
         let mut term = self.term.lock();
-        self.parser.lock().advance(&mut *term, bytes);
+        let mut parser = self.parser.lock();
+        let mut floor = self.cursor_floor.lock();
+        let Some(floor) = floor.as_mut().filter(|f| f.budget > 0) else {
+            parser.advance(&mut *term, bytes);
+            return;
+        };
+        let (sampled, rest) = bytes.split_at(bytes.len().min(floor.budget));
+        for byte in sampled {
+            parser.advance(&mut *term, std::slice::from_ref(byte));
+            floor.min = floor.min.min(cursor_row(&term));
+        }
+        floor.budget -= sampled.len();
+        if !rest.is_empty() {
+            parser.advance(&mut *term, rest);
+        }
+    }
+
+    /// 开始追踪光标绝对行的**最低水位**,起点是此刻的光标位置。
+    ///
+    /// # 这是给 AI 任务标记(⚑)定锚用的
+    ///
+    /// Claude Code 这类 Ink 应用走 `log-update`:每帧输出 `eraseLines(n)` +
+    /// 块内容 + `\n`,所以**等待输入时光标恒定停在渲染块的下一行**,而用户键入的
+    /// 文字在块里面 —— 拿按 Enter 那一刻的 `cursor.point.line` 当锚点必然偏下,
+    /// 偏多少还随窗口宽度折行、提示行在不在而变(实测 1~3 行都出现过)。
+    ///
+    /// 但提交那一下 Ink 会先发 `eraseLines` 把光标**顶回块首**,再把
+    /// `> 用户输入` 这条 static 消息打在块首 —— 于是「窗口期内光标到达过的最靠上
+    /// 的位置」正好就是那条消息落地的行。这样取锚点**不含任何魔数**,Claude Code
+    /// 改 UI 布局也不会失效。
+    ///
+    /// 不做 erase 的行式 CLI 光标只会往下走,水位停在起点 = 退化成原来的行为。
+    pub fn arm_cursor_floor(&self) {
+        let term = self.term.lock();
+        let min = cursor_row(&term);
+        *self.cursor_floor.lock() = Some(CursorFloor {
+            min,
+            budget: FLOOR_SAMPLE_BUDGET,
+        });
+    }
+
+    /// 取走水位并停止追踪。`None` = 没在追踪(没武装过 / 已经取过一次)。
+    pub fn take_cursor_floor(&self) -> Option<i32> {
+        self.cursor_floor.lock().take().map(|f| f.min)
     }
 
     pub fn resize(&self, size: TermSize) {
@@ -289,6 +361,92 @@ mod tests {
         e.set_scrollback(40);
         assert_eq!(e.scrollback(), 40);
         assert_eq!(e.history_lines(), 3);
+    }
+
+    /// 没武装时什么都不追踪 —— `advance` 走整批快路径。
+    #[test]
+    fn 未武装时取不到光标水位() {
+        let e = TerminalEmulator::new(TermSize::new(40, 10));
+        feed_lines(&e, 3);
+        assert_eq!(e.take_cursor_floor(), None);
+    }
+
+    /// 光标只往下走时,水位停在武装那一刻的位置(不做 erase 的行式 CLI 就是这样,
+    /// 等价于原来「按 Enter 当场取光标行」的行为)。
+    #[test]
+    fn 光标只下行时水位停在起点() {
+        let e = TerminalEmulator::new(TermSize::new(40, 10));
+        e.advance(b"a\r\nb\r\nc"); // 光标落在第 2 行
+        e.arm_cursor_floor();
+        e.advance(b"\r\nd\r\ne");
+        assert_eq!(e.take_cursor_floor(), Some(2));
+        assert_eq!(e.take_cursor_floor(), None, "取走即停止追踪");
+    }
+
+    /// 核心用例:Ink 的 `eraseLines` 把光标顶回块首那一瞬只存在于**整批数据的
+    /// 中间态**里 —— 逐字节采样才抓得住。这里模拟提交一条消息的完整重绘。
+    #[test]
+    fn 水位抓得住整批数据里的中间态() {
+        let e = TerminalEmulator::new(TermSize::new(40, 10));
+        // 第 0~2 行是「渲染块」,光标停在块下方的第 3 行(log-update 尾部那个 \n)
+        e.advance(b"box-top\r\n> hi\r\nbox-bottom\r\n");
+        e.arm_cursor_floor();
+
+        // 提交:一整批里 erase 顶回块首(第 0 行)、打 static、再画新块。
+        // log-update 的 `previousLineCount` 数的是 `块内容 + '\n'` 切出来的段数,
+        // 所以 3 行的块要擦 4 段 = 上移 3 次,正好从第 3 行回到第 0 行。
+        let mut batch = Vec::new();
+        for i in 0..4 {
+            batch.extend_from_slice(b"\x1b[2K");
+            if i < 3 {
+                batch.extend_from_slice(b"\x1b[1A");
+            }
+        }
+        batch.extend_from_slice(b"\r> hi\r\n\r\nthinking...\r\n");
+        e.advance(&batch);
+
+        assert_eq!(
+            e.take_cursor_floor(),
+            Some(0),
+            "锚点必须落在 static 消息所在的块首行,而不是武装时的第 3 行"
+        );
+    }
+
+    /// 追踪期走的是逐字节推进,**多字节字符不能被切坏** —— 中文提交后 AI 正在
+    /// 吐中文正文,那 200ms 的输出全程都在这条路上。
+    #[test]
+    fn 逐字节推进不切坏多字节字符() {
+        let e = TerminalEmulator::new(TermSize::new(40, 6));
+        e.arm_cursor_floor();
+        e.advance("中文字符 · émoji 🎉".as_bytes());
+        assert_eq!(e.visible_lines()[0], "中文字符 · émoji 🎉");
+        e.take_cursor_floor();
+    }
+
+    /// 预算用尽后退回整批推进,但**已经找到的水位不丢** —— 爆发输出只让采样停掉,
+    /// 不该把定好的锚点冲掉。
+    #[test]
+    fn 采样预算用尽后水位保留() {
+        let e = TerminalEmulator::with_scrollback(TermSize::new(40, 6), 10_000);
+        e.advance(b"a\r\nb\r\nc");
+        e.arm_cursor_floor();
+        e.advance(b"\x1b[1A"); // 水位落到第 1 行
+        // 灌爆预算,期间光标一路下行
+        let flood = vec![b'x'; FLOOR_SAMPLE_BUDGET + 4096];
+        e.advance(&flood);
+        assert_eq!(e.take_cursor_floor(), Some(1));
+    }
+
+    /// 水位是**绝对行**,顶进历史后照样可比 —— erase 之后又滚出去若干行时不能错。
+    #[test]
+    fn 水位跨滚动仍然可比() {
+        let e = TerminalEmulator::with_scrollback(TermSize::new(40, 4), 100);
+        feed_lines(&e, 4); // history 1,光标在第 3 行 → 绝对行 4
+        e.arm_cursor_floor();
+        // 先顶回一行(绝对行 3),再吐够把它挤进历史的量
+        e.advance(b"\x1b[1A");
+        feed_lines(&e, 20);
+        assert_eq!(e.take_cursor_floor(), Some(3));
     }
 
     /// 值没变就不动 —— `set_options` 会把整屏标脏并发一次 title 事件。

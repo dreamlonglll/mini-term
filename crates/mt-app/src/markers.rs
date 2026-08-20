@@ -29,6 +29,14 @@
 //! → `increase_scroll_limit`),两者之和守恒 —— **在 scrollback 装满之前这是精确的**,
 //! 而且 `line + history_now == anchor >= 0` 恒成立,即锚点永远落在缓冲区之内。
 //!
+//! ## 「打点时」是哪一刻:不是按下 Enter 那一刻
+//!
+//! 取的是**按下 Enter 之后 200ms 内光标绝对行的最小值**,不是按键当场的光标位置。
+//! Ink 应用等待输入时光标停在渲染块**下方**(`log-update` 每帧尾部多一个 `\n`),
+//! 当场取必然偏下若干行 —— 详见
+//! [`mt_terminal::TerminalEmulator::arm_cursor_floor`] 与
+//! [`crate::pane::TerminalPane::arm_marks`]。
+//!
 //! ## 饱和是唯一的破绽,处置是「剪枝」
 //!
 //! `history_size` 涨到 `max_scroll_limit` 之后,`increase_scroll_limit` 里
@@ -67,7 +75,8 @@ pub struct AiMarker {
     pub line: String,
     /// UTC epoch 毫秒(`mt_ai::UserSubmit::ts`),显示时按本地时区格式化。
     pub ts: i64,
-    /// 稳定绝对行号 = 打点时的 `cursor.point.line` + 当时的 `history_size`。
+    /// 稳定绝对行号 = 定锚时的 `cursor.point.line` + 当时的 `history_size`。
+    /// 「定锚时」不是按下 Enter 那一刻,见模块注释。
     pub anchor: i32,
     /// 最后一条为 true,新标记到来时前一条翻 false。
     ///
@@ -76,17 +85,17 @@ pub struct AiMarker {
     pub in_progress: bool,
 }
 
-/// pane 侧当场取好的一批标记。
+/// pane 侧定好锚的一批标记。
 ///
-/// 一次 `drain_submits` 里的多条提交共用同一个锚点 —— 它们是在**同一个瞬间**
-/// (同一次 `write`,PTY 还没回显换行)取出来的,光标就停在同一行上。
+/// 一次 `drain_submits` 里的多条提交共用同一个锚点 —— 它们是在**同一次 `write`**
+/// 里取出来的,只可能落在同一个位置上。
 #[derive(Clone, Debug, PartialEq)]
 pub struct MarkerBatch {
     /// `(原文, epoch ms)`,顺序即提交顺序。
     pub submits: Vec<(String, i64)>,
     /// 见 [`AiMarker::anchor`]。
     pub anchor: i32,
-    /// 打点那一刻的 `history_size`。
+    /// 定锚那一刻的 `history_size`。
     pub history: i32,
     /// 该 pane 的回滚上限(`max_scroll_limit`)。剪枝判据,见 [`is_saturated`]。
     pub max_scrollback: i32,

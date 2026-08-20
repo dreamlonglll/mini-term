@@ -107,6 +107,18 @@ for submit in self.ai.perception().drain_submits(self.pty_id) {
 （`terminalCache.ts:558-559` 的 `-1` 正是为了补偿「回显已换行」）。这条时序是本节最省事的地方，
 别搬到异步 tick 里去，一搬就得重新面对「减几行」这个问题。
 
+> ⚠️ **上面这段结论后来被推翻了，锚点已改为延后定锚。** 前提「光标仍停在用户输入的
+> 那一行上」只对 shell 成立；而**能攒出标记的恰恰不是 shell** —— alt screen 被闸门
+> 挡掉之后，剩下的只有 Claude Code 这类 Ink 应用，它走 `log-update`，每帧尾部多一个
+> `\n`，等待输入时光标恒定停在渲染块**下方**。实测跳转偏下 1~3 行（偏多少随窗口宽度
+> 折行、提示行在不在而变，所以补任何固定值都不成立）。
+>
+> 现行做法：按 Enter 后武装 `TerminalEmulator::arm_cursor_floor`，取随后 200ms 内
+> **光标绝对行的最小值**当锚点 —— Ink 提交那一下会先 `eraseLines` 把光标顶回块首，
+> 而 `> 用户输入` 这条 static 消息正好打在块首。不含魔数，且对不做 erase 的行式 CLI
+> 自动退化成原来的行为。细节见 `mt_terminal::TerminalEmulator::arm_cursor_floor` 与
+> `mt_app::pane::TerminalPane::arm_marks` 的文档注释。
+
 同理，原版 `useAiSubmitMarker.ts:18-33` 那套「拿不到终端就 rAF 重试一次」的兜底**整个不需要**：
 GPUI 侧 emulator 与 pane 同生共死，`self.emulator` 永远在。
 

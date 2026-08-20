@@ -121,6 +121,11 @@ pub struct TerminalPane {
     /// 连着跳两条时上一个计时器随之被丢弃,否则第一次的到点回调会把第二次刚
     /// 亮起来的那一行提前抹掉。
     _flash_timer: Option<Task<()>>,
+    /// 等着定锚的 AI 任务标记正文 —— Enter 已经按下,锚点还在等 Ink 把光标
+    /// 顶回块首。空 = 没有在等的。见 [`Self::arm_marks`]。
+    pending_marks: Vec<(String, i64)>,
+    /// 待定标记的定锚计时器。掉了任务就没了,必须存着。
+    _marks_timer: Option<Task<()>>,
     /// 唤醒任务的句柄。掉了任务就没了,必须存着。
     _wake: Task<()>,
 }
@@ -131,6 +136,14 @@ pub struct TerminalPane {
 /// 原版这两个值是写死的字面量、不走 CSS 变量,所以这里也不进 [`crate::ui`] 调色板。
 const FLASH_COLOR: u32 = 0xf5_c5_18_54;
 const FLASH_DURATION: Duration = Duration::from_millis(300);
+
+/// 按下 Enter 到给 AI 任务标记定锚之间的等待窗口。
+///
+/// 要等的是 Ink 那一次「erase 顶回块首 + 打 static 消息」的重绘,本机几十毫秒
+/// 就到;放宽到 200ms 是给慢机器 / WSL 留余量。**放长不会变差**:窗口期取的是
+/// 光标绝对行的**最小值**,而 AI 开始输出后光标只会往下走,后续重绘的块首也在
+/// 已打出的消息**之下** —— 多等只是多采样几个更大的值。
+const MARK_SETTLE_DELAY: Duration = Duration::from_millis(200);
 
 impl EventEmitter<PaneEvent> for TerminalPane {}
 
@@ -368,6 +381,8 @@ impl TerminalPane {
             search,
             search_bar: None,
             _flash_timer: None,
+            pending_marks: Vec::new(),
+            _marks_timer: None,
             _wake: wake,
         }
     }
@@ -466,14 +481,11 @@ impl TerminalPane {
             snapshot.as_deref(),
         );
         cx.emit(PaneEvent::UserInput);
-        // AI 任务标记:**必须在这里取,不能挪到异步 tick 上**。`observe_input` 是
-        // 同步的,回车那一刻 `pending_submits` 里已经有这条了;而此刻 PTY 还没回显
-        // 换行(`pty.write` 在下面几行),光标仍停在用户输入的那一行上 —— 锚点直接
-        // 取 `cursor.point.line` 即可,不需要原版 `registerMarker(-1)` 的减一
-        // (`terminalCache.ts:558-559` 的 `-1` 正是为了补偿「回显已换行」)。
-        // 一挪到 tick 上就得重新面对「减几行」这个问题。
-        if let Some(batch) = self.take_marker_batch() {
-            cx.emit(PaneEvent::AiMarks(batch));
+        // AI 任务标记:**正文必须在这里取**(`observe_input` 是同步的,回车那一刻
+        // `pending_submits` 里已经有这条了,而 `drain_submits` 取走即清);
+        // **锚点则必须延后**,理由见 [`mt_terminal::TerminalEmulator::arm_cursor_floor`]。
+        if let Some(submits) = self.take_submits() {
+            self.arm_marks(submits, cx);
         }
 
         if let Some(pty) = self.pty.as_ref()
@@ -483,14 +495,14 @@ impl TerminalPane {
         }
     }
 
-    /// 取走这一轮的用户提交并当场折算成锚点。`None` = 没有提交 / 不该打点。
+    /// 取走这一轮的用户提交。`None` = 没有提交 / 不该打点。
     ///
     /// **alt screen 一律跳过**(照抄 `terminalCache.ts:554-557`):alt grid 的
-    /// `max_scroll_limit` 是 0,没有回看缓冲,打了也无处可跳 —— 走 TUI 的 AI
-    /// (Claude Code / Codex)基本全落在这个分支,这正是「⚑ 按钮平时不出现」的原因。
-    /// 注意 `drain_submits` 是**取走即清**,所以这一句要放在闸门之后:
-    /// 提前抽干等于把 alt screen 期间的提交默默吞掉,退出 TUI 后也补不回来。
-    fn take_marker_batch(&self) -> Option<MarkerBatch> {
+    /// `max_scroll_limit` 是 0,没有回看缓冲,打了也无处可跳 —— 走 alt screen 的
+    /// AI(Codex 这类 ratatui 应用)全落在这个分支。注意 `drain_submits` 是
+    /// **取走即清**,所以这一句要放在闸门之后:提前抽干等于把 alt screen 期间的
+    /// 提交默默吞掉,退出 TUI 后也补不回来。
+    fn take_submits(&self) -> Option<Vec<(String, i64)>> {
         if self.emulator.mode().contains(TermMode::ALT_SCREEN) {
             return None;
         }
@@ -501,18 +513,49 @@ impl TerminalPane {
             .into_iter()
             .map(|s| (s.line, s.ts))
             .collect();
+        (!submits.is_empty()).then_some(submits)
+    }
+
+    /// 收下一批提交,武装光标水位追踪,到点再定锚。
+    ///
+    /// 为什么不当场定锚见 [`mt_terminal::TerminalEmulator::arm_cursor_floor`]:
+    /// Ink 应用等待输入时光标停在渲染块**下方**,提交那一下才会把光标顶回块首 ——
+    /// 而块首正是 `> 用户输入` 这条消息落地的行。
+    fn arm_marks(&mut self, submits: Vec<(String, i64)>, cx: &mut Context<Self>) {
+        // 窗口里又按了一次 Enter:先把上一批按现有水位结清,两批的先后顺序不能乱
+        self.settle_marks(cx);
+        self.pending_marks = submits;
+        self.emulator.arm_cursor_floor();
+        self._marks_timer = Some(cx.spawn(async move |pane, cx| {
+            cx.background_executor().timer(MARK_SETTLE_DELAY).await;
+            let _ = pane.update(cx, |pane: &mut TerminalPane, cx| pane.settle_marks(cx));
+        }));
+    }
+
+    /// 定锚并把这批标记发出去。没有待定的就是空操作(计时器到点 / 又一次 Enter
+    /// 抢先结算 / pane 关掉,三条路都可能重入)。
+    fn settle_marks(&mut self, cx: &mut Context<Self>) {
+        self._marks_timer = None;
+        let floor = self.emulator.take_cursor_floor();
+        let submits = std::mem::take(&mut self.pending_marks);
         if submits.is_empty() {
-            return None;
+            return;
         }
-        let (line, history) = self
-            .emulator
-            .with_term(|term| (term.grid().cursor.point.line.0, term.history_size() as i32));
-        Some(MarkerBatch {
+        // 窗口期里切进了 TUI:`history_size` 读的是备用 grid(恒为 0),锚点无从
+        // 谈起 —— 与 `take_submits` 的闸门同口径,整批丢掉
+        if self.emulator.mode().contains(TermMode::ALT_SCREEN) {
+            return;
+        }
+        let Some(anchor) = floor else {
+            return;
+        };
+        let history = self.emulator.with_term(|term| term.history_size() as i32);
+        cx.emit(PaneEvent::AiMarks(MarkerBatch {
             submits,
-            anchor: line + history,
+            anchor,
             history,
             max_scrollback: self.emulator.scrollback() as i32,
-        })
+        }));
     }
 
     /// 当前的 `(history_size, max_scroll_limit)` —— store 侧剪枝的判据。
