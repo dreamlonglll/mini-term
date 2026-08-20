@@ -42,7 +42,7 @@ use crate::project_tree;
 use crate::session_panel::build_resume_command;
 use crate::shell_ops::ShellList;
 use crate::tree::{
-    AiSessionRef, PaneState, PaneStatus, SplitDirection, SplitNode, gen_id,
+    AiSessionRef, DropZone, PaneState, PaneStatus, SplitDirection, SplitNode, gen_id,
 };
 
 /// 单个项目的运行时状态(对应 `types.ts` 的 `ProjectState`)。
@@ -53,6 +53,12 @@ pub struct ProjectState {
     pub status: PaneStatus,
     /// 非激活项目里有 AI 任务完成 —— 项目行上的提示点。
     pub needs_attention: bool,
+    /// 双击最大化的 pane:终端区只渲染它所在的那个叶子。
+    ///
+    /// **纯运行时,不落盘**(`types.ts::ProjectState.maximizedPaneId` 同样不进
+    /// `savedLayout`,`persist.rs` 里一个字都不该出现它)。语义是「哪个 pane 被
+    /// 铺满了」而不是「哪个叶子」—— 同组内切 tab 仍然保持最大化,与原版一致。
+    pub maximized_pane_id: Option<String>,
 }
 
 impl ProjectState {
@@ -61,6 +67,7 @@ impl ProjectState {
             layout: None,
             status: PaneStatus::Idle,
             needs_attention: false,
+            maximized_pane_id: None,
         }
     }
 }
@@ -890,9 +897,146 @@ impl AppStore {
             }
             return None;
         }
+        // 最大化状态下分出来的新格落在**被隐藏的整树**里,看不见会让人以为分屏坏了
+        // —— 先自动还原(原版 `paneActions.ts::splitPane` 尾部同一句)
+        self.clear_maximized(project_id);
         self.after_layout_change(project_id, cx);
         self.focus_pane(project_id, &new_pane_id, window, cx);
         Some(new_pane_id)
+    }
+
+    // === pane 拖拽移动 / 合并 / 重排(v0.14.0)===
+
+    /// 拖拽移动 pane:`Center` 并入目标组的 tab 栏,四边在目标组对应方向分屏。
+    /// 对应 `paneActions.ts::movePane`。
+    ///
+    /// 树变换是纯函数([`SplitNode::move_pane_in_layout`]),返回 `None` = 拖回
+    /// 原位,这里直接不写 —— 不写就不落盘、不 notify,一次无效拖拽零副作用。
+    pub fn move_pane(
+        &mut self,
+        project_id: &str,
+        pane_id: &str,
+        target_pane_id: &str,
+        zone: DropZone,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(next) = self
+            .project_states
+            .get(project_id)
+            .and_then(|s| s.layout.as_ref())
+            .and_then(|l| l.move_pane_in_layout(pane_id, target_pane_id, zone))
+        else {
+            return;
+        };
+        if let Some(state) = self.project_states.get_mut(project_id) {
+            state.layout = Some(next);
+        }
+        // 与 split_pane 同一处置:最大化状态下四边分屏会落进隐藏的整树,先还原。
+        // `move_pane_to_tab` **不需要** —— 最大化时 tab 栏只能同组重排,结果就在眼前。
+        self.clear_maximized(project_id);
+        self.after_layout_change(project_id, cx);
+        self.focus_pane(project_id, pane_id, window, cx);
+    }
+
+    /// 拖到 tab 栏的精确落位:同组前后换位,跨组按插入位并入并激活。
+    /// 对应 `paneActions.ts::movePaneToTab`。
+    pub fn move_pane_to_tab(
+        &mut self,
+        project_id: &str,
+        pane_id: &str,
+        anchor_pane_id: &str,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(next) = self
+            .project_states
+            .get(project_id)
+            .and_then(|s| s.layout.as_ref())
+            .and_then(|l| l.move_pane_to_tab_index(pane_id, anchor_pane_id, index))
+        else {
+            return;
+        };
+        if let Some(state) = self.project_states.get_mut(project_id) {
+            state.layout = Some(next);
+        }
+        self.after_layout_change(project_id, cx);
+        self.focus_pane(project_id, pane_id, window, cx);
+    }
+
+    // === 双击最大化(v0.14.0,纯运行时状态)===
+
+    /// 当前被最大化的 pane。**只在布局真的分了屏时才作数** —— 单格布局下
+    /// 「最大化」没有意义,原版 `TerminalArea.tsx` 也是拿 `layout.type === 'split'`
+    /// 与门之后才去找那个叶子的。
+    pub fn maximized_pane_id(&self, project_id: &str) -> Option<&str> {
+        let state = self.project_states.get(project_id)?;
+        let layout = state.layout.as_ref()?;
+        if !matches!(layout, SplitNode::Split { .. }) {
+            return None;
+        }
+        state.maximized_pane_id.as_deref()
+    }
+
+    /// 双击 tab 栏空白处 / 点最大化钮的落点,对应 `PaneGroup.tsx::toggleMaximize`:
+    /// **本组**已经是最大化的那一组就还原,否则把本组铺满(仅当真的分了屏)。
+    ///
+    /// 判据落在**叶子**上而不是 pane 上 —— 最大化之后在组内切了 tab,
+    /// `maximized_pane_id` 还指着切换前那个 pane,但用户看到的仍是这一组铺满,
+    /// 这时再双击一次理应还原(拿 pane id 直接比会变成「换成另一个 pane」)。
+    pub fn toggle_maximized_leaf(
+        &mut self,
+        project_id: &str,
+        anchor_pane_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state) = self.project_states.get(project_id) else {
+            return;
+        };
+        let Some(layout) = state.layout.as_ref() else {
+            return;
+        };
+        let anchor_leaf = layout.leaf_of_pane(anchor_pane_id).map(|l| l.id().to_string());
+        let current_leaf = state
+            .maximized_pane_id
+            .as_deref()
+            .and_then(|id| layout.leaf_of_pane(id))
+            .map(|l| l.id().to_string());
+        let is_split = matches!(layout, SplitNode::Split { .. });
+
+        if anchor_leaf.is_some() && anchor_leaf == current_leaf {
+            self.set_maximized(project_id, None, cx);
+        } else if is_split {
+            self.set_maximized(project_id, Some(anchor_pane_id), cx);
+        }
+    }
+
+    /// 切换最大化的底层写入。逐字照抄 `store.ts::toggleMaximizedPane` 的三态口径
+    /// ([`next_maximized`])。
+    ///
+    /// ⚠️ 原版在这里还挂了一段 `suppress-pane-enter`(最大化/还原会让 React 重挂
+    /// `PaneGroup`,整树的淡入动画会重播成满屏闪动)。GPUI 侧**结构性不需要**:
+    /// 进场动画的进度表按 `项目\u{1}叶子` 索引且不按帧回收,同一个叶子换个容器
+    /// 渲染时拿到的还是那条早就跑完的进度(见 `terminal_area::wrap_pane_enter`)。
+    fn set_maximized(&mut self, project_id: &str, pane_id: Option<&str>, cx: &mut Context<Self>) {
+        let Some(state) = self.project_states.get_mut(project_id) else {
+            return;
+        };
+        let next = next_maximized(state.maximized_pane_id.as_deref(), pane_id);
+        if state.maximized_pane_id == next {
+            return;
+        }
+        state.maximized_pane_id = next;
+        cx.notify();
+    }
+
+    /// 无条件还原(分屏 / 拖拽移动落地前调),不 notify —— 调用方随后都会走
+    /// `after_layout_change`,那里统一 notify。
+    fn clear_maximized(&mut self, project_id: &str) {
+        if let Some(state) = self.project_states.get_mut(project_id) {
+            state.maximized_pane_id = None;
+        }
     }
 
     /// 关闭一个 pane:回收 PTY,再把它从树里摘掉(树空了 = 项目回到空态)。
@@ -2938,6 +3082,15 @@ impl AppStore {
                 .as_ref()
                 .map(|l| l.highest_status())
                 .unwrap_or(PaneStatus::Idle);
+            // 被最大化的那个 pane 关掉了 → 自动回落显示整树。原版是在渲染处
+            // 「按 id 查不到叶子就退回整树」,这里顺手把陈旧 id 也清掉:留着它
+            // 只会让 `maximized_pane_id()` 每帧多查一次,且没有任何复活路径
+            // (pane id 是进程内单调递增的,不会被重新分配)。
+            if let Some(id) = state.maximized_pane_id.clone()
+                && state.layout.as_ref().and_then(|l| l.pane(&id)).is_none()
+            {
+                state.maximized_pane_id = None;
+            }
         }
         // 关掉的 pane 一并撤出完成队列:否则未读计数会往一个已经不存在的 pane
         // 上跳,两张表也会随开关终端无界增长(旧版 setProjectLayout 的同一段)。
@@ -3248,6 +3401,18 @@ pub fn compute_title_bar_light<'a>(
 /// - 空标题 = 清除自定义名(回落 shell 名);
 /// - `pane_id` 全局唯一,命中即收工,不再看其它项目;
 /// - 一个都没命中:什么都不改。
+/// 最大化开关的三态口径,抽成纯函数好单测(`store.ts:938` 那一行的等价物):
+/// 传 `Some(id)` 且当前不是它 → 换成它;传 `None`、或传的正是当前值 → 还原。
+///
+/// 「传的正是当前值 → 还原」就是双击/点按钮的 toggle 语义:同一个 pane 再来一次
+/// 就是收回去。
+fn next_maximized(current: Option<&str>, requested: Option<&str>) -> Option<String> {
+    match requested {
+        Some(id) if current != Some(id) => Some(id.to_string()),
+        _ => None,
+    }
+}
+
 fn rename_pane_in_states(
     states: &mut HashMap<String, ProjectState>,
     pane_id: &str,
@@ -4095,5 +4260,19 @@ mod tests {
         assert_eq!(bookkept.session_id, "c");
         assert_eq!(bookkept.parent_session_id, "p");
         assert_eq!(bookkept.fork_point_uuid.as_deref(), Some("m1"));
+    }
+
+    /// 最大化开关的三态:换人 / 同一个再来一次收回 / 显式传 None 收回。
+    #[test]
+    fn 最大化开关三态() {
+        assert_eq!(next_maximized(None, Some("p1")).as_deref(), Some("p1"));
+        assert_eq!(next_maximized(Some("p1"), Some("p1")), None, "再点一次收回");
+        assert_eq!(
+            next_maximized(Some("p1"), Some("p2")).as_deref(),
+            Some("p2"),
+            "换一个组直接换过去,不需要先还原"
+        );
+        assert_eq!(next_maximized(Some("p1"), None), None, "显式还原");
+        assert_eq!(next_maximized(None, None), None);
     }
 }

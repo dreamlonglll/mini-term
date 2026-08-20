@@ -64,6 +64,18 @@
 | 29 | 文件预览与编辑器（FileViewerModal/CodeEditor） | 大 | mt-app | ✅ AA 批（合并 `a2295a5`）。tree-sitter 多语言高亮（cc 降级 1.2.67 解锁）、CRLF 往返真文件测试钉住、SearchModal/文件树两入口回接。剩记档：Markdown 链接/跳转历史栈整块缺（gpui-component 链接无回调口，待上游）、HTML 只源码态、avif 兜底「默认工具打开」 |
 | 30 | 壳层杂项：关窗确认（盘点活 AI 会话列名）+ 版本检查/更新提醒 + FirstRunGuide 完整版（两入口+键位提示）+ 长文本粘贴转文件（4 配置字段已在）+ WSL 启动器重写提示 + 启动埋点 + dirKinds 技术栈探测缓存 + pane 进场动画 | 中 | mt-app | 🟡 Z 批（合并 `2dbc52f`）：关窗确认、自建 toast、双音 WAV、长粘贴转文件（SSH 分支随 #28）、WSL 覆盖提示、smartCopyPaste。tail-shell 批（`5b98de1`）：版本自检+ActivityBar 更新按钮（纠正口径：原版是**有新版本才出现的独立按钮**非设置钮红点，圆点闪烁待 reduce 闸）、FirstRunGuide（🟡 缺 SSH 远程入口随 #28）、启动埋点（本地 stderr 计时非遥测，单进程砍掉 epoch 对齐半场）。dirKinds 探测 ✅ tail-lists 批、pane 进场动画 ✅ tail-anim 批（淡入不缩放，理由见进度看板记档）、FirstRunGuide SSH 入口 ✅ BB-b、长粘贴 SSH 分支 ✅ BB-a。**本条全清** |
 
+### 第 4 层：基线之后原版新增的功能（gpui 分支基线 = main 的 v0.13.1）
+
+> 上面 30 条是「基线之内的奇偶缺口」。本段收的是**基线之后原版才发出的功能**——
+> gpui 分支要追平就得重新实现一遍（两边技术栈不同，无法 cherry-pick）。
+> 每条注明原版版本号与 PR，便于日后对账。
+
+| # | 原版来源 | 功能 | 落点 | 状态 |
+|---|---|---|---|---|
+| 31 | v0.14.0 / PR #49 | **pane 拖拽移动 / 合并 / 分屏**：tab 可拖起（拖影 + 源 tab 变淡）；落到别组 tab 栏或终端区中央 → 并入该组并激活；落到终端区四边（1/4 进深）→ 在该 leaf 对应方向分屏；落点半透明预览 | mt-app（`tree.rs` / `dnd.rs` / `terminal_area.rs` / `store.rs`） | ✅ pane 拖拽批。树变换 `SplitNode::move_pane_in_layout` 为纯函数（取 `&self` 返新树，`None` = 拖回原位）；几何判档 `dnd::pane_drop_zone`；落点档位由 `on_drag_move` 存进视图态（`on_drop` 不带位置，硬约束）。**Esc 取消已补齐**（`capture_key_down` + `App::stop_active_drag`，结清 X 批那条记档）；grabbing 光标 Windows 上拿不到（gpui 把 `ClosedHand` 映射成 `IDC_ARROW`），沿用 gpui 自动提升的「拖源手形光标」并记档 |
+| 32 | v0.14.0 / PR #49 | **tab 栏按插入位落子**：指针落在某 tab 中线左/右决定插入位，同组纯重排（摘除后右侧插入位左移补位，落回原位 no-op），跨组先摘除再按位插入并激活；插入指示线 3px 圆头 + accent 双层光晕 | mt-app | ✅ pane 拖拽批。`SplitNode::move_pane_to_tab_index` + `dnd::tab_insert_index`；tab 屏幕矩形由每个 tab 挂的量尺 canvas 供给（`TerminalArea::tab_rects`，等价原版 `querySelectorAll('[data-pane-tab]')`）；指示线画在 tab 栏**外层非滚动包装**上，避免与 `overflow_x_scroll` 的滚动量双算 |
+| 33 | v0.14.0 / PR #49 | **双击最大化**：双击 tab 栏空白处 / 点控件簇最大化钮 → 本组临时铺满终端区，再来一次还原；运行时状态不落盘；组内最后一个 pane 关闭自动回落整树；最大化下四边分屏与拖拽移动前自动还原 | mt-app | ✅ pane 拖拽批。`ProjectState::maximized_pane_id`（`persist.rs` 一字未动）+ `AppStore::toggle_maximized_leaf`（判据落在**叶子**上，组内切 tab 后再双击仍是还原）；控件簇由四钮变五钮，`marker_anchor_inset(has_maximize)` 与单测同步。原版那段 `suppress-pane-enter` **结构性不需要**（进场进度表按叶子 id 索引且不回收，换容器渲染拿到的是早跑完的那条） |
+
 ### 其他细项（散落，随所在批次带走）
 
 - ActivityBar：🟡 M 批已成 44px 图标栏（PANEL/SESSIONS/STATS/SETTINGS 四钮逐点照抄原版 SVG + accent 竖条 + 全局 AI 徽标 + 跳完成钮）；SSH/移动端/Git 入口与更新红点随对应功能批加，徽标闪烁动画未做
@@ -79,7 +91,8 @@
 ### 已排除的伪缺口（审计纠错，别再当任务）
 
 - ~~鼠标上报接线~~：已完成（`pane.rs` 的 `.on_input()` 覆盖 down/move/up/wheel，三模式三编码全通）
-- ~~tab 拖拽排序~~ / ~~中键关闭 tab~~：原版 Tauri 也没有这两个功能
+- ~~中键关闭 tab~~：原版 Tauri 也没有这个功能
+- ~~tab 拖拽排序：原版也没有~~ **此条已作废**：审计当时（基线 v0.13.1）确实没有，原版 v0.14.0 / PR #49 补上了整套 pane 拖拽——已升格为上面的 #31/#32，别再按「伪缺口」跳过
 - ~~分屏比例跨重启回均分~~：G 收尾已修（首帧只量尺、下一帧铺分屏树）
 
 ## 性能观察（后续量化）

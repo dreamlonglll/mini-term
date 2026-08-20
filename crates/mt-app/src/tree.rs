@@ -7,7 +7,9 @@
 //! |---|---|
 //! | `STATUS_PRIORITY` / `getHighestStatus` | [`PaneStatus::priority`] / [`SplitNode::highest_status`] |
 //! | `collectPanes` / `collectPtyIds` | [`SplitNode::panes`] / [`SplitNode::pty_ids`] |
-//! | `insertSplit` | [`SplitNode::insert_split`] |
+//! | `insertSplit` / `insertSplitAt` | [`SplitNode::insert_split`] / [`SplitNode::insert_split_at`] |
+//! | `movePaneInLayout` | [`SplitNode::move_pane_in_layout`] |
+//! | `movePaneToTabIndex` | [`SplitNode::move_pane_to_tab_index`] |
 //! | `removePaneFromLayout` | [`SplitNode::remove_pane`] |
 //! | `updatePaneStatus`(按 ptyId) | [`SplitNode::update_status_by_pty`] |
 //! | `newTerminal` 里的「加进目标 leaf 的 tab 栏」 | [`SplitNode::append_pane`] |
@@ -197,6 +199,19 @@ impl SplitDirection {
     }
 }
 
+/// pane 拖拽的落点档位(`layoutOps.ts` 的 `DropZone`)。
+///
+/// `Center` = 并入目标叶子的 tab 栏;四边 = 在目标叶子的那个方向分出新格。
+/// 几何判档(哪个坐标算哪一档)在 [`crate::dnd::pane_drop_zone`],这里只管语义。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DropZone {
+    Center,
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
 /// 分屏树。叶子是一组共享同一格子的 pane(tab 栏),split 是可拖拽的分割。
 #[derive(Clone, Debug, PartialEq)]
 pub enum SplitNode {
@@ -342,10 +357,29 @@ impl SplitNode {
         direction: SplitDirection,
         new_leaf: SplitNode,
     ) -> bool {
+        self.insert_split_at(target_pane_id, direction, new_leaf, false)
+    }
+
+    /// [`insert_split`] 的带方位版(`insertSplitAt`):`before = true` 把新叶子放
+    /// **第一格**,拖到目标格的左侧 / 上侧时用。
+    ///
+    /// `before = false`(默认分屏)刻意保持「原叶子仍在第一格」——
+    /// 原版的 `getNodeKey` 稳定性承诺挂在这上面,GPUI 侧同样有价值:
+    /// 叶子 id 不变,[`crate::terminal_area::TerminalArea`] 的进场动画表与
+    /// `ResizableState` 就都不会因为一次分屏而重来(见那边 `wrap_pane_enter`)。
+    ///
+    /// [`insert_split`]: Self::insert_split
+    pub fn insert_split_at(
+        &mut self,
+        target_pane_id: &str,
+        direction: SplitDirection,
+        new_leaf: SplitNode,
+        before: bool,
+    ) -> bool {
         // 叶子在递归里要能「借出去又拿回来」,用 Option 表达最直白:命中的那一层
         // take 走,没命中的层原样留在里面。
         let mut slot = Some(new_leaf);
-        self.insert_split_inner(target_pane_id, direction, &mut slot);
+        self.insert_split_inner(target_pane_id, direction, before, &mut slot);
         slot.is_none()
     }
 
@@ -353,6 +387,7 @@ impl SplitNode {
         &mut self,
         target_pane_id: &str,
         direction: SplitDirection,
+        before: bool,
         new_leaf: &mut Option<SplitNode>,
     ) {
         match self {
@@ -363,7 +398,7 @@ impl SplitNode {
                 let Some(new_leaf) = new_leaf.take() else {
                     return;
                 };
-                // 把自己换成 split(自己成为 children[0])。
+                // 把自己换成 split(自己成为 children[0],`before` 时换成 children[1])。
                 let old = std::mem::replace(
                     self,
                     Self::Split {
@@ -374,8 +409,13 @@ impl SplitNode {
                     },
                 );
                 if let Self::Split { children, .. } = self {
-                    children.push(old);
-                    children.push(new_leaf);
+                    if before {
+                        children.push(new_leaf);
+                        children.push(old);
+                    } else {
+                        children.push(old);
+                        children.push(new_leaf);
+                    }
                 }
             }
             Self::Split { children, .. } => {
@@ -383,7 +423,7 @@ impl SplitNode {
                     if new_leaf.is_none() {
                         return;
                     }
-                    c.insert_split_inner(target_pane_id, direction, new_leaf);
+                    c.insert_split_inner(target_pane_id, direction, before, new_leaf);
                 }
             }
         }
@@ -539,6 +579,143 @@ impl SplitNode {
                 }
             }
         }
+    }
+
+    // ─── pane 拖拽移动 / 合并 / 重排(v0.14.0 / 原版 PR #49)─────────
+    //
+    // 两个入口都取 `&self` 返回新树,而不是 `self` 就地改 —— 与 `remove_pane`
+    // 刻意不同。理由:它们都有「落回原位 = 什么也不做」的返回 `None` 语义,
+    // 若按值消费,一次 no-op 就把调用方手上那棵树吃掉了(store 里 layout 是
+    // `Option<SplitNode>`,take 出来再拿不回去)。多一次整树 clone 的代价可以忽略
+    // —— 一个项目的布局树最多几十个节点,而这是**用户松手那一下**才跑一次的路径。
+
+    /// 把已有 pane 移到目标 pane 所在的位置(拖拽移动 / 合并),对应
+    /// `layoutOps.ts::movePaneInLayout`。
+    ///
+    /// 返回新树;`None` = 不需要变化(拖回原位),调用方据此**跳过写入**。
+    ///
+    /// # 锚点修正
+    ///
+    /// 目标锚 pane 恰好是被拖的 pane 自己时(拖到自己所在格的终端区上),换用
+    /// 同格另一个 pane 做锚 —— 「先摘除再插入」两步里,锚 pane 必须在摘除之后
+    /// 仍然存在。同格再没有别人(独占一格的 pane 拖回自己身上)就是纯 no-op:
+    /// center 无事可做,四边等价于原位。
+    pub fn move_pane_in_layout(
+        &self,
+        pane_id: &str,
+        target_pane_id: &str,
+        zone: DropZone,
+    ) -> Option<SplitNode> {
+        let pane = self.pane(pane_id)?.clone();
+        let source_leaf_id = self.leaf_of_pane(pane_id)?.id().to_string();
+        let target_leaf = self.leaf_of_pane(target_pane_id)?;
+        let target_leaf_id = target_leaf.id().to_string();
+
+        let anchor_id = if target_pane_id == pane_id {
+            let Self::Leaf { panes, .. } = target_leaf else {
+                return None;
+            };
+            // 独占一格 → 找不到别的锚 → no-op
+            panes.iter().find(|p| p.id != pane_id)?.id.clone()
+        } else {
+            target_pane_id.to_string()
+        };
+
+        if zone == DropZone::Center {
+            // 已经在同一格里了,并进去是空操作
+            if source_leaf_id == target_leaf_id {
+                return None;
+            }
+            let mut next = self.clone().remove_pane(pane_id)?;
+            let leaf_id = next.leaf_of_pane(&anchor_id)?.id().to_string();
+            let Some(Self::Leaf {
+                panes,
+                active_pane_id,
+                ..
+            }) = next.node_mut(&leaf_id)
+            else {
+                return None;
+            };
+            // 并入 tab 栏**末尾**并激活(原版 `[...leaf.panes, pane]`)
+            *active_pane_id = pane.id.clone();
+            panes.push(pane);
+            return Some(next);
+        }
+
+        let mut next = self.clone().remove_pane(pane_id)?;
+        // 摘除可能把锚所在的叶子一并收走(锚与被拖 pane 同格且只剩这一个时),
+        // 那种情况下没有可插入的位置 —— 原版同一道 `findPaneById(removed, anchorId)` 闸
+        if next.pane(&anchor_id).is_none() {
+            return None;
+        }
+        let direction = match zone {
+            DropZone::Left | DropZone::Right => SplitDirection::Horizontal,
+            _ => SplitDirection::Vertical,
+        };
+        let before = matches!(zone, DropZone::Left | DropZone::Top);
+        next.insert_split_at(&anchor_id, direction, SplitNode::leaf(pane), before);
+        Some(next)
+    }
+
+    /// 把 pane 挪到锚点所在叶子 tab 栏的第 `index` 位(拖到 tab 栏的精确落位),
+    /// 对应 `layoutOps.ts::movePaneToTabIndex`。
+    ///
+    /// - **同一叶子**:纯重排。先摘掉自己会让右侧的插入位左移一格,所以
+    ///   `index > from` 时插入位要减一;换算后落回原位 → 返回 `None`
+    ///   (原位与「紧邻自己右侧」这两个插入位都是 no-op)。
+    /// - **跨叶子**:先从原处摘除,再按 `index` 插进去并激活;`index` 越界钳到末尾。
+    ///
+    /// `anchor_pane_id` 只用来定位目标叶子,**不能是被拖的 pane 自己**
+    /// (调用方保证:tab 栏落点在本组只有这一个 tab 时压根不给指示线)。
+    pub fn move_pane_to_tab_index(
+        &self,
+        pane_id: &str,
+        anchor_pane_id: &str,
+        index: usize,
+    ) -> Option<SplitNode> {
+        let pane = self.pane(pane_id)?.clone();
+        let target_leaf = self.leaf_of_pane(anchor_pane_id)?;
+        let target_leaf_id = target_leaf.id().to_string();
+        let Self::Leaf { panes, .. } = target_leaf else {
+            return None;
+        };
+        let same_leaf_from = panes.iter().position(|p| p.id == pane_id);
+
+        if let Some(from) = same_leaf_from {
+            let to = if index > from { index - 1 } else { index };
+            if to == from {
+                return None;
+            }
+            let mut next = self.clone();
+            let Some(Self::Leaf {
+                panes,
+                active_pane_id,
+                ..
+            }) = next.node_mut(&target_leaf_id)
+            else {
+                return None;
+            };
+            panes.retain(|p| p.id != pane_id);
+            let at = to.min(panes.len());
+            panes.insert(at, pane);
+            *active_pane_id = pane_id.to_string();
+            return Some(next);
+        }
+
+        let mut next = self.clone().remove_pane(pane_id)?;
+        let leaf_id = next.leaf_of_pane(anchor_pane_id)?.id().to_string();
+        let Some(Self::Leaf {
+            panes,
+            active_pane_id,
+            ..
+        }) = next.node_mut(&leaf_id)
+        else {
+            return None;
+        };
+        let at = index.min(panes.len());
+        panes.insert(at, pane);
+        *active_pane_id = pane_id.to_string();
+        Some(next)
     }
 
     /// 按 ptyId 更新状态(`updatePaneStatus`)。
@@ -935,6 +1112,305 @@ mod tests {
 
         root.update_status_by_pty(1, PaneStatus::Idle, false, None);
         assert!(!root.pane_by_pty(1).unwrap().resume_pending);
+    }
+
+    // ─── pane 拖拽移动 / 合并 / 重排 ───────────────────────────
+    //
+    // 以下用例逐条照抄原版 `tests/paneLayoutOps.test.cjs`(15 例)。
+    // TS 侧的 pane 用字面量 id('a'/'b'/…),这里 id 是 `gen_id` 生成的,
+    // 于是拿 `shell_name` 当**名牌**:`names()` 对应 TS 的 `paneIds()`,
+    // `id_of()` 把名牌翻回真 id 喂给被测函数。
+
+    /// 一组名牌 → 一个叶子(第一个是激活项,与 TS 的 `leaf(ids)` 同默认)。
+    fn leaf_of(names: &[&str]) -> SplitNode {
+        let panes: Vec<PaneState> = names.iter().map(|n| PaneState::new(*n)).collect();
+        let active = panes[0].id.clone();
+        SplitNode::Leaf {
+            id: gen_id("leaf"),
+            panes,
+            active_pane_id: active,
+        }
+    }
+
+    /// 手工拼一个 split(均分),对应 TS 的 `split(direction, children)`。
+    fn split_of(direction: SplitDirection, children: Vec<SplitNode>) -> SplitNode {
+        let n = children.len();
+        SplitNode::Split {
+            id: gen_id("split"),
+            direction,
+            sizes: vec![100.0 / n as f64; n],
+            children,
+        }
+    }
+
+    /// 深度优先的名牌序列(TS 的 `paneIds(node)`)。
+    fn names(node: &SplitNode) -> Vec<String> {
+        node.panes().iter().map(|p| p.shell_name.clone()).collect()
+    }
+
+    /// 名牌 → 真 id。
+    fn id_of(node: &SplitNode, name: &str) -> String {
+        node.panes()
+            .into_iter()
+            .find(|p| p.shell_name == name)
+            .unwrap_or_else(|| panic!("树里没有名牌 {name}"))
+            .id
+            .clone()
+    }
+
+    /// 各子节点的名牌序列(TS 的 `next.children.map(paneIds)`)。
+    fn child_names(node: &SplitNode) -> Vec<Vec<String>> {
+        match node {
+            SplitNode::Split { children, .. } => children.iter().map(names).collect(),
+            _ => panic!("不是 split"),
+        }
+    }
+
+    fn active_of(node: &SplitNode) -> String {
+        match node {
+            SplitNode::Leaf { active_pane_id, .. } => active_pane_id.clone(),
+            _ => panic!("不是叶子"),
+        }
+    }
+
+    // ===== insert_split_at =====
+
+    #[test]
+    fn 分屏_before_把新叶子放第一格() {
+        let mut root = leaf_of(&["a"]);
+        let a = id_of(&root, "a");
+        assert!(root.insert_split_at(&a, SplitDirection::Horizontal, leaf_of(&["b"]), true));
+        assert!(matches!(root, SplitNode::Split { .. }));
+        assert_eq!(child_names(&root), vec![vec!["b"], vec!["a"]]);
+    }
+
+    /// `after` 保持原叶子在第一格 —— 叶子 id 稳定性的前提(见 `insert_split_at` 注释)。
+    #[test]
+    fn 分屏_after_保持原叶子在第一格() {
+        let mut root = leaf_of(&["a"]);
+        let a = id_of(&root, "a");
+        let leaf_id = root.id().to_string();
+        assert!(root.insert_split_at(&a, SplitDirection::Vertical, leaf_of(&["b"]), false));
+        assert_eq!(child_names(&root), vec![vec!["a"], vec!["b"]]);
+        match &root {
+            SplitNode::Split {
+                direction, children, ..
+            } => {
+                assert_eq!(*direction, SplitDirection::Vertical);
+                assert_eq!(children[0].id(), leaf_id, "原叶子 id 不变");
+            }
+            _ => panic!(),
+        }
+    }
+
+    // ===== move_pane_in_layout:四边分屏落点 =====
+
+    #[test]
+    fn 拖到右侧在目标格右边分出新格并塌陷源格() {
+        let root = split_of(
+            SplitDirection::Horizontal,
+            vec![leaf_of(&["a"]), leaf_of(&["b"])],
+        );
+        let (a, b) = (id_of(&root, "a"), id_of(&root, "b"));
+        let next = root.move_pane_in_layout(&a, &b, DropZone::Right).unwrap();
+        // a 那一格空了 → 塌陷;b 处分裂为 [b, a]
+        assert_eq!(names(&next), vec!["b", "a"]);
+        assert!(matches!(next, SplitNode::Split { .. }));
+    }
+
+    #[test]
+    fn 拖到上侧新格在前且方向为纵向() {
+        let root = split_of(
+            SplitDirection::Horizontal,
+            vec![leaf_of(&["a"]), leaf_of(&["b"])],
+        );
+        let (a, b) = (id_of(&root, "a"), id_of(&root, "b"));
+        let next = root.move_pane_in_layout(&a, &b, DropZone::Top).unwrap();
+        match &next {
+            SplitNode::Split { direction, .. } => {
+                assert_eq!(*direction, SplitDirection::Vertical)
+            }
+            _ => panic!("应是 split"),
+        }
+        assert_eq!(child_names(&next), vec![vec!["a"], vec!["b"]]);
+    }
+
+    #[test]
+    fn center_并入目标格末尾并激活() {
+        let root = split_of(
+            SplitDirection::Horizontal,
+            vec![leaf_of(&["a"]), leaf_of(&["b", "c"])],
+        );
+        let (a, b) = (id_of(&root, "a"), id_of(&root, "b"));
+        let a_id = a.clone();
+        let next = root.move_pane_in_layout(&a, &b, DropZone::Center).unwrap();
+        // 源格塌陷后整棵树只剩一个叶子
+        assert!(matches!(next, SplitNode::Leaf { .. }));
+        assert_eq!(names(&next), vec!["b", "c", "a"]);
+        assert_eq!(active_of(&next), a_id);
+    }
+
+    #[test]
+    fn center_拖回自己所在组是空操作() {
+        let root = split_of(
+            SplitDirection::Horizontal,
+            vec![leaf_of(&["a", "b"]), leaf_of(&["c"])],
+        );
+        let (a, b) = (id_of(&root, "a"), id_of(&root, "b"));
+        assert!(root.move_pane_in_layout(&a, &b, DropZone::Center).is_none());
+    }
+
+    #[test]
+    fn 独占一格的_pane_拖自己身上四边也是空操作() {
+        let root = split_of(
+            SplitDirection::Horizontal,
+            vec![leaf_of(&["a"]), leaf_of(&["b"])],
+        );
+        let a = id_of(&root, "a");
+        for zone in [
+            DropZone::Left,
+            DropZone::Right,
+            DropZone::Top,
+            DropZone::Bottom,
+            DropZone::Center,
+        ] {
+            assert!(
+                root.move_pane_in_layout(&a, &a, zone).is_none(),
+                "zone={zone:?}"
+            );
+        }
+    }
+
+    /// 锚点是被拖 pane 自己 → 换锚:从多 tab 组里把自己拆出去。
+    #[test]
+    fn 锚点是自己时换锚从多_tab_组拆出去() {
+        let root = leaf_of(&["a", "b"]);
+        let a = id_of(&root, "a");
+        let next = root.move_pane_in_layout(&a, &a, DropZone::Right).unwrap();
+        assert!(matches!(next, SplitNode::Split { .. }));
+        assert_eq!(child_names(&next), vec![vec!["b"], vec!["a"]]);
+    }
+
+    /// 任意落点前后 pane 集合一致 —— 移动路径上一个 pane 都不许丢。
+    #[test]
+    fn 移动不丢_pane() {
+        let root = split_of(
+            SplitDirection::Vertical,
+            vec![
+                split_of(
+                    SplitDirection::Horizontal,
+                    vec![leaf_of(&["a", "b"]), leaf_of(&["c"])],
+                ),
+                leaf_of(&["d"]),
+            ],
+        );
+        let (a, d) = (id_of(&root, "a"), id_of(&root, "d"));
+        for zone in [
+            DropZone::Left,
+            DropZone::Right,
+            DropZone::Top,
+            DropZone::Bottom,
+            DropZone::Center,
+        ] {
+            let next = root.move_pane_in_layout(&a, &d, zone).unwrap();
+            let mut got = names(&next);
+            got.sort();
+            assert_eq!(got, vec!["a", "b", "c", "d"], "zone={zone:?}");
+        }
+    }
+
+    // ===== move_pane_to_tab_index:tab 栏按位落子 =====
+
+    #[test]
+    fn 同组重排拖到右侧插入位左移补位() {
+        let root = leaf_of(&["a", "b", "c"]);
+        let (a, b) = (id_of(&root, "a"), id_of(&root, "b"));
+        let next = root.move_pane_to_tab_index(&a, &b, 2).unwrap();
+        assert_eq!(names(&next), vec!["b", "a", "c"]);
+        assert_eq!(active_of(&next), a);
+    }
+
+    #[test]
+    fn 同组重排拖到最左与最右() {
+        let root = leaf_of(&["a", "b", "c"]);
+        let (a, b, c) = (id_of(&root, "a"), id_of(&root, "b"), id_of(&root, "c"));
+        assert_eq!(
+            names(&root.move_pane_to_tab_index(&c, &a, 0).unwrap()),
+            vec!["c", "a", "b"]
+        );
+        assert_eq!(
+            names(&root.move_pane_to_tab_index(&a, &b, 3).unwrap()),
+            vec!["b", "c", "a"]
+        );
+    }
+
+    /// 原位与「紧邻自己右侧」这两个插入位落下都没有动作。
+    #[test]
+    fn 同组重排落回原位与紧邻右侧均为空操作() {
+        let root = leaf_of(&["a", "b", "c"]);
+        let (a, b) = (id_of(&root, "a"), id_of(&root, "b"));
+        assert!(root.move_pane_to_tab_index(&b, &a, 1).is_none());
+        assert!(root.move_pane_to_tab_index(&b, &a, 2).is_none());
+    }
+
+    #[test]
+    fn 跨组按位插入源格塌陷并激活() {
+        let root = split_of(
+            SplitDirection::Horizontal,
+            vec![leaf_of(&["a"]), leaf_of(&["b", "c"])],
+        );
+        let (a, b) = (id_of(&root, "a"), id_of(&root, "b"));
+        let next = root.move_pane_to_tab_index(&a, &b, 1).unwrap();
+        assert!(matches!(next, SplitNode::Leaf { .. }));
+        assert_eq!(names(&next), vec!["b", "a", "c"]);
+        assert_eq!(active_of(&next), a);
+    }
+
+    #[test]
+    fn 跨组插入下标越界钳到末尾() {
+        let root = split_of(
+            SplitDirection::Horizontal,
+            vec![leaf_of(&["a"]), leaf_of(&["b"])],
+        );
+        let (a, b) = (id_of(&root, "a"), id_of(&root, "b"));
+        let next = root.move_pane_to_tab_index(&a, &b, 99).unwrap();
+        assert_eq!(names(&next), vec!["b", "a"]);
+    }
+
+    #[test]
+    fn tab_栏落子不丢_pane() {
+        let root = split_of(
+            SplitDirection::Vertical,
+            vec![leaf_of(&["a", "b"]), leaf_of(&["c", "d"])],
+        );
+        let (a, c) = (id_of(&root, "a"), id_of(&root, "c"));
+        for i in 0..=2 {
+            let next = root.move_pane_to_tab_index(&a, &c, i).unwrap();
+            let mut got = names(&next);
+            got.sort();
+            assert_eq!(got, vec!["a", "b", "c", "d"], "index={i}");
+        }
+    }
+
+    /// 移动/重排只换布局树的位置,**pane 自身(含 pty_id)原样搬过去** ——
+    /// GPUI 侧终端实体按 `pty_id` 挂在 store 的 `terminals` 表里,pty_id 不变
+    /// 就意味着 PTY 不断、终端内容不重建(原版 `getNodeKey` 修复的等价保证)。
+    #[test]
+    fn 移动保留_pty_id() {
+        let mut root = split_of(
+            SplitDirection::Horizontal,
+            vec![leaf_of(&["a"]), leaf_of(&["b"])],
+        );
+        let (a, b) = (id_of(&root, "a"), id_of(&root, "b"));
+        root.pane_mut(&a).unwrap().pty_id = Some(7);
+        root.pane_mut(&b).unwrap().pty_id = Some(9);
+
+        let moved = root.move_pane_in_layout(&a, &b, DropZone::Bottom).unwrap();
+        assert_eq!(moved.pane(&a).unwrap().pty_id, Some(7));
+        assert_eq!(moved.pane(&b).unwrap().pty_id, Some(9));
+
+        let reordered = root.move_pane_to_tab_index(&a, &b, 0).unwrap();
+        assert_eq!(reordered.pane(&a).unwrap().pty_id, Some(7));
     }
 
     #[test]

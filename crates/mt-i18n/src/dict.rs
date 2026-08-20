@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 32;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 741;
+pub const ZH_ENTRY_COUNT: usize = 743;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 741;
+pub const EN_ENTRY_COUNT: usize = 743;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -538,10 +538,12 @@ static PANE_GROUP_ZH: &[(&str, &str)] = &[
     ("forkNeedsIdentity", "分支会话（未获会话身份，需注册 Hook 事件）"),
     ("forkSession", "分支会话到新分屏"),
     ("markerTooltip", "AI 任务标记 ({mod}+Shift+↑/↓ 跳转)"),
+    ("maximizePane", "最大化此区域（双击标签栏空白处）"),
     ("reconnect", "点击重连"),
     ("remoteDisconnected", "连接已断开"),
     ("rename", "重命名"),
     ("renameTerminal", "重命名终端"),
+    ("restorePane", "还原分屏布局"),
     ("retry", "重试"),
     ("shellExited", "shell 已退出"),
     ("splitDown", "向下分屏"),
@@ -567,10 +569,12 @@ static PANE_GROUP_EN: &[(&str, &str)] = &[
     ("forkNeedsIdentity", "Fork session (no session identity — register hook events)"),
     ("forkSession", "Fork session to new split"),
     ("markerTooltip", "AI task markers ({mod}+Shift+↑/↓ to jump)"),
+    ("maximizePane", "Maximize this pane (double-click empty tab bar area)"),
     ("reconnect", "Click to reconnect"),
     ("remoteDisconnected", "Connection lost"),
     ("rename", "Rename"),
     ("renameTerminal", "Rename Terminal"),
+    ("restorePane", "Restore split layout"),
     ("retry", "Retry"),
     ("shellExited", "shell exited"),
     ("splitDown", "Split down"),

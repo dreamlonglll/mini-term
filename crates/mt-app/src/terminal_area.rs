@@ -52,7 +52,7 @@ use crate::pane_actions;
 use crate::pane_preview;
 use crate::session_branch::{BranchMenuSegment, branch_menu_segment};
 use crate::store::AppStore;
-use crate::tree::{SplitDirection, SplitNode};
+use crate::tree::{DropZone, SplitDirection, SplitNode};
 use crate::ui;
 
 /// 终端区还没量出尺寸时的兜底(首帧)。比例照样对,只是绝对值不准。
@@ -98,16 +98,32 @@ pub struct TerminalArea {
     tab_focus: HashMap<String, FocusHandle>,
     /// 鼠标停在哪个 tab 上(缩略图计时要它)。
     hovered_tab: Option<String>,
-    /// 被悬停 tab 的屏幕矩形(只给悬停中的那个挂 `canvas` 量)。
-    tab_hover_rect: Option<Bounds<Pixels>>,
+    /// 每个 tab 的屏幕矩形(每个 tab 挂一片只量不画的 `canvas`)。
+    ///
+    /// 两个消费方:① 悬停缩略图的锚点;② tab 栏拖拽插入位要 tab 中线
+    /// (原版是 `bar.querySelectorAll('[data-pane-tab]')` 逐个 `getBoundingClientRect`,
+    /// 这张表就是它的等价物)。
+    tab_rects: HashMap<String, Bounds<Pixels>>,
     /// 缩略图开在哪个 tab 上 + 弹出那一刻的矩形 + 卡片进场(`menuPopIn`)。
     /// 进场状态与这一份同生共死:收起时一起没,下次悬停从头播。
     tab_preview: Option<(String, Bounds<Pixels>, mt_ui::motion::Transition)>,
     /// 250ms 计时 + 开着之后的 500ms 续活节拍。**丢掉句柄等于 `clearTimeout`**。
     _tab_preview_task: Option<Task<()>>,
+
+    // ─── pane 拖拽(v0.14.0 / 原版 PR #49)───────────────────────
+    //
+    // 三份状态都只在拖拽期间有值,`render` 开头与 `cx.has_active_drag()` 对账后
+    // 统一清 —— 与 `file_drop_pane` 同一套(拖拽被中断时 gpui 会自己清 active_drag
+    // 并重画,残留状态自动失效,不必到处补清理)。
+    /// 正被拖着的 pane id —— 源 tab 变淡靠它(原版 `el.style.opacity = '0.4'`)。
+    pane_drag: Option<String>,
+    /// 终端区落点预览:`(leaf_id, 档位)`。**`on_drop` 不带位置,这是唯一通道**。
+    pane_drop: Option<(String, DropZone)>,
+    /// tab 栏插入位:`(leaf_id, 插入下标, 指示线相对 tab 栏左缘的 x)`。
+    tab_drop: Option<(String, usize, f32)>,
 }
 
-/// 控件簇里 marker 按钮**右缘**到叶子右边缘的距离。
+/// 控件簇里 marker 按钮**右缘**到叶子右边缘的距离(最大化钮不在场时)。
 ///
 /// 簇是 `.gap(2).px(6)` 后跟四个 22×22 的方钮(终端内查找 / 分屏右 / 分屏下 /
 /// 关整组,与原版 `PaneGroup.tsx:489-541` 同序),marker 按钮排在它们之前,
@@ -121,6 +137,18 @@ const CTRL_CLUSTER_PAD: f32 = 6.0;
 const CTRL_BTN: f32 = 22.0;
 const CTRL_GAP: f32 = 2.0;
 const MARKER_BTN_MARGIN_RIGHT: f32 = 4.0;
+
+/// marker 锚点的实际内缩。**最大化钮是条件出现的**(只有真分了屏才画,
+/// `PaneGroup.tsx:686` 的 `layoutIsSplit || isMaximized`),在场时簇里就是五个
+/// 方钮而不是四个,锚点要多让出一颗的宽度 —— 原版量 DOM 天然不会错,这边
+/// 靠常量算就必须显式分档。
+fn marker_anchor_inset(has_maximize: bool) -> f32 {
+    if has_maximize {
+        MARKER_ANCHOR_INSET + CTRL_BTN + CTRL_GAP
+    } else {
+        MARKER_ANCHOR_INSET
+    }
+}
 
 // ─── 控件簇的描边图标(照抄 `PaneGroup.tsx:40-62` 的 SVG,viewBox 16 归一化;
 //     自绘理由见 `mt_ui::icons::vector` 模块注释,换算套路同 `activity_bar`)───
@@ -191,8 +219,62 @@ const ICON_SPLIT_DOWN: &[Shape] = &[
     ),
 ];
 
+/// 最大化。原版 `ICON_MAXIMIZE`:`M9.5 2.5h4v4` / `M13.5 2.5L9 7` /
+/// `M6.5 13.5h-4v-4` / `M2.5 13.5L7 9`(右上、左下两只往外指的角标)。
+const ICON_MAXIMIZE: &[Shape] = &[
+    Shape::line(
+        Ink::Current,
+        CTRL_STROKE,
+        Geom::Polyline(&[(cu(9.5), cu(2.5)), (cu(13.5), cu(2.5)), (cu(13.5), cu(6.5))]),
+    ),
+    Shape::line(
+        Ink::Current,
+        CTRL_STROKE,
+        Geom::Polyline(&[(cu(13.5), cu(2.5)), (cu(9.0), cu(7.0))]),
+    ),
+    Shape::line(
+        Ink::Current,
+        CTRL_STROKE,
+        Geom::Polyline(&[(cu(6.5), cu(13.5)), (cu(2.5), cu(13.5)), (cu(2.5), cu(9.5))]),
+    ),
+    Shape::line(
+        Ink::Current,
+        CTRL_STROKE,
+        Geom::Polyline(&[(cu(2.5), cu(13.5)), (cu(7.0), cu(9.0))]),
+    ),
+];
+
+/// 还原。原版 `ICON_RESTORE`:同一组角标翻过来往内指。
+const ICON_RESTORE: &[Shape] = &[
+    Shape::line(
+        Ink::Current,
+        CTRL_STROKE,
+        Geom::Polyline(&[(cu(13.5), cu(6.5)), (cu(9.5), cu(6.5)), (cu(9.5), cu(2.5))]),
+    ),
+    Shape::line(
+        Ink::Current,
+        CTRL_STROKE,
+        Geom::Polyline(&[(cu(9.5), cu(6.5)), (cu(14.0), cu(2.0))]),
+    ),
+    Shape::line(
+        Ink::Current,
+        CTRL_STROKE,
+        Geom::Polyline(&[(cu(2.5), cu(9.5)), (cu(6.5), cu(9.5)), (cu(6.5), cu(13.5))]),
+    ),
+    Shape::line(
+        Ink::Current,
+        CTRL_STROKE,
+        Geom::Polyline(&[(cu(6.5), cu(9.5)), (cu(2.0), cu(14.0))]),
+    ),
+];
+
 /// 图标在 22×22 方钮里的边长(原版 SVG 是 13×13)。
 const CTRL_ICON: f32 = 13.0;
+
+/// tab 栏插入指示线的宽度。原版最初是 2px 细线,评审实测「肉眼难辨」后
+/// 换成 **3px 圆头 + accent 双层光晕**(`0 0 6px` + `0 0 2px`),这里一步到位
+/// 抄加强版,不复刻中间那一版。
+const TAB_DROP_LINE_W: f32 = 3.0;
 
 /// 浮层宽度。原版是 `min-w-[280px]` + 内容撑开,gpui 侧要给正文列一个确定宽度
 /// 才truncate得动,取固定值 —— 差别只在「超长正文时原版会更宽」。
@@ -401,9 +483,12 @@ impl TerminalArea {
             pane_enter: HashMap::new(),
             tab_focus: HashMap::new(),
             hovered_tab: None,
-            tab_hover_rect: None,
+            tab_rects: HashMap::new(),
             tab_preview: None,
             _tab_preview_task: None,
+            pane_drag: None,
+            pane_drop: None,
+            tab_drop: None,
         }
     }
 
@@ -433,7 +518,7 @@ impl TerminalArea {
                     if this.hovered_tab.as_deref() != Some(pane_id.as_str()) {
                         return false;
                     }
-                    let Some(rect) = this.tab_hover_rect else {
+                    let Some(rect) = this.tab_rects.get(&pane_id).copied() else {
                         return false;
                     };
                     this.tab_preview = Some((
@@ -600,8 +685,11 @@ impl TerminalArea {
         // 按钮的位置由 pane 矩形反推:pane body 的上缘就是 tab 栏下缘,
         // 右缘就是叶子右缘(见 MARKER_ANCHOR_INSET 的说明)
         let rect = self.pane_rects.get(&pane_id)?;
+        // 最大化钮在场与否会让簇宽差一颗 —— 判据与 `render_leaf` 那边同一条
+        // (真分了屏才画;最大化态本身就以「分了屏」为前提)
+        let inset = marker_anchor_inset(matches!(layout, SplitNode::Split { .. }));
         let anchor = point(
-            px(rect.left + rect.width - MARKER_ANCHOR_INSET - MARKER_PANEL_WIDTH),
+            px(rect.left + rect.width - inset - MARKER_PANEL_WIDTH),
             // 原版是「按钮下缘 + 4」;按钮在 26px 的 tab 栏里居中,下缘约在栏底上方 2px
             px(rect.top + 2.0),
         );
@@ -948,6 +1036,17 @@ impl TerminalArea {
         let active_id = active.id.clone();
         let pid = project_id.to_string();
         let leaf = leaf_id.clone();
+        // 拖拽相关的三份视图状态一律与它与门(见字段注释)
+        let dragging = cx.has_active_drag();
+        // 最大化钮的出现条件(`PaneGroup.tsx:686`):真分了屏才有意义。
+        // `maximized_pane_id()` 自带「布局是 split」这道闸,所以这里一个判据够用
+        let layout_is_split = store
+            .project_state(project_id)
+            .and_then(|s| s.layout.as_ref())
+            .is_some_and(|l| matches!(l, SplitNode::Split { .. }));
+        let is_maximized = store
+            .maximized_pane_id(project_id)
+            .is_some_and(|id| panes.iter().any(|p| p.id == id));
 
         // tab 栏横向滚动(E.2):tab **不压缩**(`min_w` 之下就溢出),
         // 溢出时整条可横向滚。`overflow_x_scroll` 要求元素是 stateful(有 `.id()`)。
@@ -983,7 +1082,6 @@ impl TerminalArea {
             let pane_id_hover = pane.id.clone();
             let pid_key = pid.clone();
             let tab_focus = self.tab_focus.get(&pane.id).cloned();
-            let tab_hovered = self.hovered_tab.as_deref() == Some(pane.id.as_str());
             let pane_id_rename = pane.id.clone();
             let pid_click = pid.clone();
             let pane_id_close = pane.id.clone();
@@ -1000,6 +1098,11 @@ impl TerminalArea {
             let has_unread = unread.get(idx).copied().unwrap_or(false);
             let vendor = vendors.get(idx).copied().flatten();
             let this_area = cx.entity();
+            let pid_drag = pid.clone();
+            // 与 `has_active_drag` 与门:拖拽被中断(松手在窗外)时 gpui 会清
+            // active_drag 并重画,变淡自动撤销,不必到处补清理
+            let is_dragging_self =
+                dragging && self.pane_drag.as_deref() == Some(pane.id.as_str());
             bar = bar.child(
                 div()
                     .id(gpui::SharedString::from(format!("tab-{}", pane.id)))
@@ -1044,20 +1147,24 @@ impl TerminalArea {
                         }
                         cx.notify();
                     }))
-                    .when(tab_hovered && !is_active, |el| {
+                    // 只量不画:缩略图锚点 + tab 栏拖拽插入位都要 tab 的屏幕矩形。
+                    // **每个 tab 都挂**(原先只挂悬停中的那一个):插入位要算的是
+                    // 「指针落在哪个 tab 的中线哪一侧」,那需要**全部** tab 的横向
+                    // 区间,只有悬停那一个不够用。故意不 notify —— 量完再触发重画
+                    // 就是每帧一个死循环。
+                    .child({
                         let this = this_area.clone();
-                        el.child(
-                            canvas(
-                                move |bounds, _window, cx| {
-                                    this.update(cx, |area: &mut TerminalArea, _cx| {
-                                        area.tab_hover_rect = Some(bounds);
-                                    });
-                                },
-                                |_, _, _, _| {},
-                            )
-                            .absolute()
-                            .size_full(),
+                        let id = pane.id.clone();
+                        canvas(
+                            move |bounds, _window, cx| {
+                                this.update(cx, |area: &mut TerminalArea, _cx| {
+                                    area.tab_rects.insert(id.clone(), bounds);
+                                });
+                            },
+                            |_, _, _, _| {},
                         )
+                        .absolute()
+                        .size_full()
                     })
                     .flex()
                     .items_center()
@@ -1080,8 +1187,41 @@ impl TerminalArea {
                             },
                         )
                     })
-                    // 单击切 tab,双击改名(旧版是右键菜单里的「重命名」)
+                    // ── tab 拖起(v0.14.0):移动 / 合并 / 重排 ─────────────
+                    //
+                    // 照 `project_list.rs` 的既有模式:记下源 id 让本行变淡 +
+                    // 交出一个跟着鼠标走的拖影。**起拖阈值是 gpui 内建的 2px**
+                    // (原版是 5px 曼哈顿),差异见 `dnd` 模块注释第 3 条。
+                    // 原版那套「松手后一次性抑制 click」不需要 —— gpui 拖起时
+                    // 会把 `clicked_state` 清掉。
+                    .on_drag(
+                        crate::dnd::DragPane {
+                            project_id: pid_drag.clone(),
+                            pane_id: pane.id.clone(),
+                        },
+                        {
+                            let this = this_area.clone();
+                            let label = label_text.clone();
+                            move |item: &crate::dnd::DragPane, _offset, _window, cx| {
+                                let id = item.pane_id.clone();
+                                this.update(cx, |area: &mut TerminalArea, _cx| {
+                                    area.pane_drag = Some(id);
+                                });
+                                crate::dnd::preview(
+                                    label.clone(),
+                                    crate::dnd::PreviewIcon::Terminal,
+                                    cx,
+                                )
+                            }
+                        },
+                    )
+                    // 源 tab 变淡(原版 `el.style.opacity = '0.4'`)
+                    .when(is_dragging_self, |el| el.opacity(0.4))
+                    // 单击切 tab,双击改名(旧版是右键菜单里的「重命名」)。
+                    // ⚠️ 必须 `stop_propagation`:tab 栏那层挂着「双击空白处最大化」,
+                    // 不截断的话在 tab 上双击会**同时**改名和最大化
                     .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                        cx.stop_propagation();
                         this.close_tab_preview(cx);
                         if click_count(event) >= 2 {
                             let (label, store) = (label.clone(), this.store.clone());
@@ -1187,6 +1327,8 @@ impl TerminalArea {
                 // 只有一个 shell 时不弹 —— 否则单 shell 用户每次多点一下
                 // (`PaneGroup.tsx:218-232` 那道 `<= 1` 的闸)
                 .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                    // 与 tab 同理:别让这一下冒到 tab 栏的「双击空白处最大化」上
+                    cx.stop_propagation();
                     let shells = this.store.read(cx).config().available_shells.clone();
                     if shells.len() <= 1 {
                         this.store.update(cx, |store, cx| {
@@ -1282,6 +1424,37 @@ impl TerminalArea {
                 .child("⚑")
                 .child(div().child(marker_count.to_string()))
         });
+        // 最大化 / 还原(v0.14.0)。只有真分了屏才画 —— 单格布局下「铺满」是空操作,
+        // 常驻一颗按不动的按钮不如不画(原版 `layoutIsSplit || isMaximized` 同款)。
+        let pid_max = pid.clone();
+        let anchor_max = active_id.clone();
+        let maximize_btn = (layout_is_split || is_maximized).then(|| {
+            ctrl_icon(
+                gpui::SharedString::from(format!("maximize-{leaf}")),
+                if is_maximized {
+                    ICON_RESTORE
+                } else {
+                    ICON_MAXIMIZE
+                },
+            )
+            .tooltip(move |window, cx| {
+                Tooltip::new(t(
+                    "paneGroup",
+                    if is_maximized {
+                        "restorePane"
+                    } else {
+                        "maximizePane"
+                    },
+                ))
+                .build(window, cx)
+            })
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                cx.stop_propagation();
+                let (pid, anchor) = (pid_max.clone(), anchor_max.clone());
+                this.store
+                    .update(cx, |store, cx| store.toggle_maximized_leaf(&pid, &anchor, cx));
+            }))
+        });
         let pid_right = pid.clone();
         let anchor_right = active_id.clone();
         let pid_down = pid.clone();
@@ -1297,12 +1470,14 @@ impl TerminalArea {
                 .px(px(CTRL_CLUSTER_PAD))
                 .children(marker_btn)
                 .children(search_btn)
+                .children(maximize_btn)
                 .child(
                     ctrl_icon(
                         gpui::SharedString::from(format!("split-right-{leaf}")),
                         ICON_SPLIT_RIGHT,
                     )
                     .on_click(cx.listener(move |this, _event, window, cx| {
+                        cx.stop_propagation();
                         this.store.update(cx, |store, cx| {
                             store.split_pane(
                                 &pid_right,
@@ -1320,6 +1495,7 @@ impl TerminalArea {
                         ICON_SPLIT_DOWN,
                     )
                     .on_click(cx.listener(move |this, _event, window, cx| {
+                        cx.stop_propagation();
                         this.store.update(cx, |store, cx| {
                             store.split_pane(
                                 &pid_down,
@@ -1352,6 +1528,7 @@ impl TerminalArea {
                         })
                         // 控制条的 × 关的是**整组**,同样先确认(原版 closeLeaf)
                         .on_click(cx.listener(move |this, _event, window, cx| {
+                            cx.stop_propagation();
                             pane_actions::close_leaf(
                                 this.store.clone(),
                                 pid_close_leaf.clone(),
@@ -1363,6 +1540,89 @@ impl TerminalArea {
                         .child("×"),
                 ),
         );
+
+        // 双击 tab 栏**空白处**最大化 / 还原。原版靠 `e.target.closest('[data-pane-tab],button')`
+        // 排除 tab 与按钮;gpui 侧改由那些子元素自己 `stop_propagation`(见各处注释)
+        // —— 效果相同,而且不需要在这里维护一张「哪些子元素算控件」的名单。
+        let pid_dblclick = pid.clone();
+        let anchor_dblclick = active_id.clone();
+        bar = bar.on_click(cx.listener(move |this, event: &ClickEvent, _window, cx| {
+            if click_count(event) < 2 {
+                return;
+            }
+            let (pid, anchor) = (pid_dblclick.clone(), anchor_dblclick.clone());
+            this.store
+                .update(cx, |store, cx| store.toggle_maximized_leaf(&pid, &anchor, cx));
+        }));
+
+        // ── tab 栏的落点层 ────────────────────────────────────────
+        //
+        // 为什么要在可滚动的 tab 栏**外面**再包一层:
+        // ① 插入指示线是绝对定位的,放进滚动容器里会跟着内容偏移,而 x 又是由
+        //    屏幕坐标现算的(已含滚动量)—— 两下叠加就双算了;包一层非滚动的
+        //    父级,`指示线 x = tab 屏幕左缘 − tab 栏屏幕左缘` 直接可用。
+        // ② `on_drag_move` 的 `event.bounds` 就是挂监听那个元素的矩形,挂在这层
+        //    等于白拿「tab 栏在屏幕上的位置」,不必再为它单开一片量尺 canvas。
+        let leaf_for_bar = leaf.clone();
+        let leaf_for_drop = leaf.clone();
+        let pid_tab_drop = pid.clone();
+        let tab_indicator = self
+            .tab_drop
+            .as_ref()
+            .filter(|(id, _, _)| dragging && id == &leaf)
+            .map(|(_, _, x)| *x);
+        // ⚠️ 必须是**纵向** flex:`bar` 自己带 `flex_none`,放进默认的横向 flex 里
+        // 就变成「宽度按内容撑」,右侧控件簇的 `ml_auto` 会跟着缩到 tab 后面去。
+        // 纵向下 `flex_none` 只钉高度(26),宽度照旧横向铺满 —— 与它原先直接
+        // 挂在叶子那个 `flex_col` 容器里时的表现一字不差。
+        let bar_layer = div()
+            .relative()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .w_full()
+            .on_drag_move(cx.listener({
+                let leaf_id = leaf_for_bar.clone();
+                move |this: &mut TerminalArea,
+                      event: &gpui::DragMoveEvent<crate::dnd::DragPane>,
+                      _window,
+                      cx| {
+                    let dragged = event.drag(cx).clone();
+                    this.note_tab_drag_over(&leaf_id, &dragged, event.bounds, event.event.position, cx);
+                }
+            }))
+            .on_drop(cx.listener({
+                let leaf_id = leaf_for_drop.clone();
+                move |this: &mut TerminalArea, item: &crate::dnd::DragPane, window, cx| {
+                    this.drop_on_tab_bar(&pid_tab_drop, &leaf_id, item, window, cx);
+                }
+            }))
+            .child(bar)
+            // 插入位指示线:3px 圆头 + accent 双层光晕(评审定稿口径,见 TAB_DROP_LINE_W)
+            .children(tab_indicator.map(|x| {
+                div()
+                    .absolute()
+                    .top(px(2.0))
+                    .h(px(22.0))
+                    .left(px((x - TAB_DROP_LINE_W / 2.0).max(0.0)))
+                    .w(px(TAB_DROP_LINE_W))
+                    .rounded_full()
+                    .bg(ui::accent())
+                    .shadow(vec![
+                        gpui::BoxShadow {
+                            color: ui::accent(),
+                            offset: point(px(0.0), px(0.0)),
+                            blur_radius: px(6.0),
+                            spread_radius: px(0.0),
+                        },
+                        gpui::BoxShadow {
+                            color: ui::accent(),
+                            offset: point(px(0.0), px(0.0)),
+                            blur_radius: px(2.0),
+                            spread_radius: px(0.0),
+                        },
+                    ])
+            }));
 
         let pid_focus = pid.clone();
         let active_for_focus = active_id.clone();
@@ -1379,6 +1639,17 @@ impl TerminalArea {
         let this = cx.entity();
         let rect_pane_id = active_id.clone();
 
+        // 终端区落点预览的档位(只画本组自己那一份)
+        let body_zone = self
+            .pane_drop
+            .as_ref()
+            .filter(|(id, _)| dragging && id == &leaf)
+            .map(|(_, zone)| *zone);
+        let leaf_for_body = leaf.clone();
+        let leaf_for_body_drop = leaf.clone();
+        let pid_pane_drop = pid.clone();
+        let anchor_pane_drop = active_id.clone();
+
         // ⚠️ 不刷底色:终端区着色**只保留 TerminalArea 根容器一层**(见 render 尾部
         // 那句 `.bg(ui::bg_terminal())`)。原版同款口径 —— `styles.css:151` 与
         // `themePackManager.ts:294`「着色统一由 --bg-terminal 容器层承担,避免
@@ -1393,13 +1664,43 @@ impl TerminalArea {
             .size_full()
             .flex()
             .flex_col()
-            .child(bar)
+            .child(bar_layer)
             .child(
                 div()
                     .id(gpui::SharedString::from(format!("pane-body-{leaf}")))
                     .flex_1()
                     .relative()
                     .overflow_hidden()
+                    // ── pane 拖到终端区:四边分屏 / 中央并组 ────────────
+                    .on_drag_move(cx.listener({
+                        let leaf_id = leaf_for_body.clone();
+                        move |this: &mut TerminalArea,
+                              event: &gpui::DragMoveEvent<crate::dnd::DragPane>,
+                              _window,
+                              cx| {
+                            let dragged = event.drag(cx).clone();
+                            this.note_pane_drag_over(
+                                &leaf_id,
+                                &dragged,
+                                event.bounds,
+                                event.event.position,
+                                cx,
+                            );
+                        }
+                    }))
+                    .on_drop(cx.listener({
+                        let (pid, leaf_id, anchor) = (
+                            pid_pane_drop.clone(),
+                            leaf_for_body_drop.clone(),
+                            anchor_pane_drop.clone(),
+                        );
+                        move |this: &mut TerminalArea,
+                              item: &crate::dnd::DragPane,
+                              window,
+                              cx| {
+                            this.drop_on_pane_body(&pid, &leaf_id, &anchor, item, window, cx);
+                        }
+                    }))
                     .on_click(cx.listener(move |this, _event, window, cx| {
                         this.store.update(cx, |store, cx| {
                             store.focus_pane(&pid_focus, &active_for_focus, window, cx)
@@ -1485,6 +1786,10 @@ impl TerminalArea {
                     // 「释放以插入路径」的虚线框。与 `cx.has_active_drag()` 与门:
                     // 拖拽被中断时 gpui 会清 active_drag 并重画,残留状态自动失效。
                     .when(file_drop_over, |el| el.child(drop_hint()))
+                    // pane 落点预览:center 铺满 = 并入本组,半屏 = 往那个方向分屏。
+                    // **落下没有动作的场景压根不会有档位**(判档时就滤掉了,
+                    // 见 `note_pane_drag_over`)—— 原版三轮评审的最终口径
+                    .children(body_zone.map(zone_overlay))
                     // 远程断线覆盖层:**保留 pane**,点一下在同一 pane 重连
                     .when(show_reconnect, |el| {
                         let (pid, pane_id) = (pid_reconnect.clone(), pane_reconnect.clone());
@@ -1530,6 +1835,221 @@ impl TerminalArea {
                     }),
             )
             .into_any_element()
+    }
+
+    // ─── pane 拖拽的四个落点处理(v0.14.0)─────────────────────
+    //
+    // 见 [`crate::dnd`] 模块注释第 2 条:`on_drag_move` 会打给**每一个**注册者
+    // (不只鼠标底下那个),所以四个处理里第一句都是自己的命中判定。
+
+    /// 终端区落点判档。
+    ///
+    /// **落下没有动作的场景一律不给预览**(原版三轮评审的最终口径,
+    /// `PaneGroup.tsx::handleBodyDragMove`):
+    /// - 独占一组的 pane 拖回自己身上 —— 四边等价原位、中央本就在同组;
+    /// - 拖到自己所在组的中央 —— 已经在这一组里了。
+    ///
+    /// 这两条与 [`SplitNode::move_pane_in_layout`] 返回 `None` 的条件严格同集,
+    /// 所以「有预览 ⟺ 落下有动作」,不会出现指示了却静默无动作。
+    fn note_pane_drag_over(
+        &mut self,
+        leaf_id: &str,
+        dragged: &crate::dnd::DragPane,
+        bounds: Bounds<Pixels>,
+        position: gpui::Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut next = None;
+        if self.accepts_pane_drag(dragged, cx)
+            && let Some(zone) = crate::dnd::pane_drop_zone(bounds, position)
+            && self.zone_has_effect(leaf_id, dragged, zone, cx)
+        {
+            next = Some((leaf_id.to_string(), zone));
+        }
+
+        // 不命中本组时只收自己那一份,别人的留给别人清
+        if next.is_none() && self.pane_drop.as_ref().is_none_or(|(id, _)| id != leaf_id) {
+            return;
+        }
+        if self.pane_drop != next {
+            self.pane_drop = next;
+            cx.notify();
+        }
+    }
+
+    /// 终端区落地:读上一帧存下的档位,交给 store 的纯函数变换。
+    ///
+    /// 锚点用**本组当前激活的 pane**(原版 `movePane(…, node.activePaneId, …)`),
+    /// `move_pane_in_layout` 内部会在锚点恰是被拖 pane 时自动换锚。
+    fn drop_on_pane_body(
+        &mut self,
+        project_id: &str,
+        leaf_id: &str,
+        anchor_pane_id: &str,
+        dragged: &crate::dnd::DragPane,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let zone = self
+            .pane_drop
+            .take()
+            .filter(|(id, _)| id == leaf_id)
+            .map(|(_, zone)| zone);
+        self.pane_drag = None;
+        cx.notify();
+        let (Some(zone), true) = (zone, self.accepts_pane_drag(dragged, cx)) else {
+            return;
+        };
+        let (pid, pane_id, anchor) = (
+            project_id.to_string(),
+            dragged.pane_id.clone(),
+            anchor_pane_id.to_string(),
+        );
+        self.store.update(cx, |store, cx| {
+            store.move_pane(&pid, &pane_id, &anchor, zone, window, cx);
+        });
+    }
+
+    /// tab 栏插入位判定。
+    ///
+    /// 本组只有被拖的这一个 tab 时**不给指示线** —— 组内换位无意义,落下也不会
+    /// 有动作,画了就是「指示了却静默无动作」的口径不一致(原版评审结论)。
+    fn note_tab_drag_over(
+        &mut self,
+        leaf_id: &str,
+        dragged: &crate::dnd::DragPane,
+        bounds: Bounds<Pixels>,
+        position: gpui::Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut next = None;
+        if bounds.contains(&position)
+            && self.accepts_pane_drag(dragged, cx)
+            && let Some(slots) = self.tab_slots(leaf_id, dragged, cx)
+        {
+            let (index, line_x) = crate::dnd::tab_insert_index(&slots, f32::from(position.x));
+            next = Some((
+                leaf_id.to_string(),
+                index,
+                line_x - f32::from(bounds.origin.x),
+            ));
+        }
+
+        if next.is_none() && self.tab_drop.as_ref().is_none_or(|(id, ..)| id != leaf_id) {
+            return;
+        }
+        if self.tab_drop != next {
+            self.tab_drop = next;
+            cx.notify();
+        }
+    }
+
+    /// tab 栏落地:按插入位落子。
+    ///
+    /// 锚点必须是**本组里不是被拖 pane 的那一个**:它只用来定位目标叶子,
+    /// 找不到就说明本组只有被拖的这一个 tab,组内换位无意义(与判档同一道闸)。
+    fn drop_on_tab_bar(
+        &mut self,
+        project_id: &str,
+        leaf_id: &str,
+        dragged: &crate::dnd::DragPane,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let index = self
+            .tab_drop
+            .take()
+            .filter(|(id, ..)| id == leaf_id)
+            .map(|(_, index, _)| index);
+        self.pane_drag = None;
+        cx.notify();
+        let (Some(index), true) = (index, self.accepts_pane_drag(dragged, cx)) else {
+            return;
+        };
+        let Some(anchor) = self
+            .store
+            .read(cx)
+            .project_state(project_id)
+            .and_then(|s| s.layout.as_ref())
+            .and_then(|l| l.node(leaf_id))
+            .and_then(|node| match node {
+                SplitNode::Leaf { panes, .. } => {
+                    panes.iter().find(|p| p.id != dragged.pane_id).map(|p| p.id.clone())
+                }
+                _ => None,
+            })
+        else {
+            return;
+        };
+        let (pid, pane_id) = (project_id.to_string(), dragged.pane_id.clone());
+        self.store.update(cx, |store, cx| {
+            store.move_pane_to_tab(&pid, &pane_id, &anchor, index, window, cx);
+        });
+    }
+
+    /// 本组能不能接这次 pane 拖拽(原版 `acceptsPaneDrag`):只接**同项目**的。
+    fn accepts_pane_drag(&self, dragged: &crate::dnd::DragPane, cx: &App) -> bool {
+        self.store.read(cx).active_project_id.as_deref() == Some(dragged.project_id.as_str())
+    }
+
+    /// 这一档落下去会不会真有动作 —— 判据与 [`SplitNode::move_pane_in_layout`]
+    /// 返回 `None` 的条件严格同集(见 [`Self::note_pane_drag_over`] 的说明)。
+    fn zone_has_effect(
+        &self,
+        leaf_id: &str,
+        dragged: &crate::dnd::DragPane,
+        zone: DropZone,
+        cx: &App,
+    ) -> bool {
+        let store = self.store.read(cx);
+        let Some(layout) = store
+            .project_state(&dragged.project_id)
+            .and_then(|s| s.layout.as_ref())
+        else {
+            return false;
+        };
+        let Some(SplitNode::Leaf { panes, .. }) = layout.node(leaf_id) else {
+            return false;
+        };
+        if !panes.iter().any(|p| p.id == dragged.pane_id) {
+            // 别的组:哪一档都有动作
+            return true;
+        }
+        // 自己就在这一组里:独占一组时四档全是空操作,多 tab 时只有中央是
+        !(panes.len() == 1 || zone == DropZone::Center)
+    }
+
+    /// 本组各 tab 的横向区间(屏幕坐标,按 tab 顺序)。
+    ///
+    /// 返回 `None` = 这一组不该给指示线:布局里找不到、或组里只有被拖的这一个 tab。
+    /// 矩形取自 [`Self::tab_rects`](每个 tab 挂的量尺 canvas),等价于原版
+    /// `bar.querySelectorAll('[data-pane-tab]')` 那一趟。
+    fn tab_slots(
+        &self,
+        leaf_id: &str,
+        dragged: &crate::dnd::DragPane,
+        cx: &App,
+    ) -> Option<Vec<(f32, f32)>> {
+        let store = self.store.read(cx);
+        let layout = store
+            .project_state(&dragged.project_id)
+            .and_then(|s| s.layout.as_ref())?;
+        let SplitNode::Leaf { panes, .. } = layout.node(leaf_id)? else {
+            return None;
+        };
+        if !panes.iter().any(|p| p.id != dragged.pane_id) {
+            return None;
+        }
+        // 有一个 tab 还没量到就整份作废:区间与 tab 顺序必须**一一对应**,
+        // 缺一个会让后面所有的插入位错一格(比不给指示线糟得多)
+        panes
+            .iter()
+            .map(|p| {
+                self.tab_rects
+                    .get(&p.id)
+                    .map(|r| (f32::from(r.origin.x), f32::from(r.origin.x + r.size.width)))
+            })
+            .collect()
     }
 
     /// `on_drag_move` 的落点记录。见 [`crate::dnd`] 模块注释第 2 条:这个回调会
@@ -1604,6 +2124,27 @@ fn drop_hint() -> AnyElement {
         .into_any_element()
 }
 
+/// pane 拖拽的落点预览:半透明 accent 盖住「松手之后这块地归谁」。
+///
+/// 逐条对照 `PaneGroup.tsx:529-535` 的 `overlayRect`:center 铺满(= 并入本组的
+/// tab 栏),四边各占**半屏**(= 往那个方向分屏之后新格子的位置)。
+/// 注意四边预览是**半屏**而不是判档用的 1/4 进深 —— 前者画的是结果,后者是手感。
+fn zone_overlay(zone: DropZone) -> AnyElement {
+    let base = div()
+        .absolute()
+        .border_2()
+        .border_color(ui::accent())
+        .bg(ui::with_alpha(ui::accent(), 0.2));
+    match zone {
+        DropZone::Center => base.inset_0(),
+        DropZone::Left => base.top_0().bottom_0().left_0().w(gpui::relative(0.5)),
+        DropZone::Right => base.top_0().bottom_0().right_0().w(gpui::relative(0.5)),
+        DropZone::Top => base.left_0().right_0().top_0().h(gpui::relative(0.5)),
+        DropZone::Bottom => base.left_0().right_0().bottom_0().h(gpui::relative(0.5)),
+    }
+    .into_any_element()
+}
+
 /// `paneGroup.markerTooltip` 里 `{mod}` 的取值。与 `search_modal.rs:324-326`
 /// 那一份同源(那边是私有的,不为一行去开放它)。
 fn mod_label() -> &'static str {
@@ -1661,6 +2202,9 @@ impl Render for TerminalArea {
         // 高亮另外还与 `has_active_drag` 与门,见 `render_leaf`。
         if !cx.has_active_drag() {
             self.file_drop_pane = None;
+            self.pane_drag = None;
+            self.pane_drop = None;
+            self.tab_drop = None;
         }
 
         // 切走项目 / 关光了终端 → 浮层无处可挂。下面两条早退路径压根走不到浮层
@@ -1769,19 +2313,46 @@ impl Render for TerminalArea {
                 );
         };
 
-        // 关掉的 pane 的矩形残影一并清掉,免得方向导航挑到不存在的格子
-        let alive: std::collections::HashSet<String> =
-            layout.panes().into_iter().map(|p| p.id.clone()).collect();
+        // 双击最大化(v0.14.0):只渲染目标叶子,整树其余 pane 不进元素树。
+        //
+        // ⚠️ **终端实体不受影响** —— `TerminalPane` 按 `pty_id` 挂在
+        // `AppStore::terminals` 表里(旧版 `terminalCache` 的等价物),这里只是
+        // 换个容器把同一个 `Entity` 画出来:PTY 不断、回滚缓冲不丢、光标不动。
+        // 这就是原版 `getNodeKey` 那轮修复要保住的东西,GPUI 侧由「实体不在树里」
+        // 这条结构天然成立(移动 / 重排 / 最大化都只动布局树的形状)。
+        //
+        // `maximized_pane_id()` 自带「布局是 split」这道闸;pane 被关掉后按 id 查不到
+        // 叶子,自然回落整树(store 那边还会顺手把陈旧 id 清掉)。
+        let maximized_leaf = self
+            .store
+            .read(cx)
+            .maximized_pane_id(&project_id)
+            .and_then(|id| layout.leaf_of_pane(id))
+            .cloned();
+
+        // 关掉的 pane 的矩形残影一并清掉,免得方向导航挑到不存在的格子。
+        // **最大化时只留被铺满那一组的矩形**:方向导航挑的是「屏幕上相邻的格子」,
+        // 藏起来的那些格子不该被挑中(原版 `findAdjacentPtyId` 查的是 DOM,
+        // 卸载掉的 PaneGroup 天然查不到,这里把那条性质补回来)。
+        let alive: std::collections::HashSet<String> = match &maximized_leaf {
+            Some(leaf) => leaf.panes().into_iter().map(|p| p.id.clone()).collect(),
+            None => layout.panes().into_iter().map(|p| p.id.clone()).collect(),
+        };
         self.pane_rects.retain(|id, _| alive.contains(id));
-        // tab 焦点句柄同理回收(切项目/关 tab 之后那些行不在了)。⚠️ 句柄必须
-        // 跨帧稳定,不能每帧重建 —— 那样 Tab 过去的焦点每帧都会丢
-        self.tab_focus.retain(|id, _| alive.contains(id));
+        // tab 焦点句柄与 tab 矩形按**整棵树**回收(切项目/关 tab 之后那些行不在了)。
+        // ⚠️ 句柄必须跨帧稳定,不能每帧重建 —— 那样 Tab 过去的焦点每帧都会丢;
+        // 最大化只是暂时不画,还原后立刻还要用,不跟着 `alive` 收窄。
+        let in_layout: std::collections::HashSet<String> =
+            layout.panes().into_iter().map(|p| p.id.clone()).collect();
+        self.tab_focus.retain(|id, _| in_layout.contains(id));
+        self.tab_rects.retain(|id, _| in_layout.contains(id));
 
         // 首帧只量不画:百分比要按真实可用尺寸换算,而 ResizablePanel 只认第一帧的
         // 初值(见模块注释)。量到之后主动 notify 一次,下一帧把分屏树铺上去。
-        let content = self
-            .measured
-            .then(|| self.render_node(&layout, &project_id, self.area_size, window, cx));
+        let content = self.measured.then(|| match &maximized_leaf {
+            Some(leaf) => self.render_leaf(leaf, &project_id, window, cx),
+            None => self.render_node(&layout, &project_id, self.area_size, window, cx),
+        });
         // 浮层在分屏树**之后**组装:它要读 render_node 刚更新过的 pane 矩形,
         // 而且要画在所有常规内容之上(deferred priority 1)
         let marker_popover = self.render_marker_popover(&layout, window, cx);
@@ -1792,6 +2363,27 @@ impl Render for TerminalArea {
             .bg(ui::bg_terminal())
             .flex()
             .relative()
+            // Esc 中途取消 pane 拖拽(X 批「Esc 取消未做」的结清)。
+            //
+            // **必须是捕获相**:按键沿「根 → 焦点节点」下行时先经过这里,而焦点
+            // 在终端上、`TerminalView` 会把 Esc 翻成 `\x1b` 写进 PTY 并
+            // `stop_propagation` —— 冒泡相挂在这里根本收不到。原版那句
+            // `window.addEventListener('keydown', onKeyDown, true)` 是同一个道理
+            // (`paneDragState.ts` 里点名了这个坑)。
+            //
+            // 只在**真有 pane 拖拽在飞**时吞掉这次 Esc:没拖拽时照常放行,
+            // 终端里按 Esc 的行为一个字节都不变。
+            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key != "escape" || this.pane_drag.is_none() {
+                    return;
+                }
+                this.pane_drag = None;
+                this.pane_drop = None;
+                this.tab_drop = None;
+                cx.stop_active_drag(window);
+                cx.stop_propagation();
+                cx.notify();
+            }))
             .child(
                 canvas(
                     move |bounds: Bounds<Pixels>, _window, cx| {
@@ -1993,7 +2585,7 @@ mod tests {
     }
 
     /// marker 按钮的锚点由控件簇的布局常量算出(原版是量 DOM 矩形)。
-    /// 加减控件时这条会提醒同步改 [`MARKER_ANCHOR_INSET`]。
+    /// 加减控件时这条会提醒同步改 [`MARKER_ANCHOR_INSET`] / [`marker_anchor_inset`]。
     #[test]
     fn 标记浮层锚点按控件簇布局算() {
         // 右侧簇:px-6 + 四个 22×22 方钮(查找/分屏右/分屏下/关整组,各带 2px gap)
@@ -2001,9 +2593,13 @@ mod tests {
         // 浮层用到锚点时四钮必然齐
         assert_eq!(MARKER_ANCHOR_INSET, 6.0 + 4.0 * 24.0 + 4.0);
         assert_eq!(MARKER_ANCHOR_INSET, 106.0);
+        assert_eq!(marker_anchor_inset(false), 106.0);
+        // 分了屏时簇里多一颗「最大化 / 还原」(22 + 2 gap),锚点跟着往左让
+        assert_eq!(marker_anchor_inset(true), 106.0 + 24.0);
+        assert_eq!(marker_anchor_inset(true), 130.0);
         // 面板右缘贴按钮右缘 → 左缘 = 叶右缘 - inset - 面板宽
         let leaf_right = 1000.0_f32;
-        let left = leaf_right - MARKER_ANCHOR_INSET - MARKER_PANEL_WIDTH;
+        let left = leaf_right - marker_anchor_inset(false) - MARKER_PANEL_WIDTH;
         assert_eq!(left, 1000.0 - 106.0 - 300.0);
     }
 
