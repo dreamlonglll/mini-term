@@ -1,0 +1,119 @@
+[package]
+name = "mt-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "mini-term"
+path = "src/main.rs"
+
+[dependencies]
+gpui.workspace = true
+# `tree-sitter-languages` 是文件预览器(`file_viewer.rs`)语法高亮的唯一来源:
+# 不开这个 feature 时 gpui-component 的 `Language` 枚举**只有 Json**
+# (`src/highlighter/languages.rs:5-8`),.rs / .ts / .py 一律画成纯文本;开了得 30 种,
+# 与原版 CodeMirror `@codemirror/language-data` 的覆盖面同量级。
+# 代价是 30 个带 `cc` build script 的 tree-sitter 语言 crate 的首次编译时间 ——
+# 一次性成本,换的是「内置编辑器与装机版观感一致」这条产品目标。
+#
+# **写在这里而不是根 `Cargo.toml`**:workspace 依赖允许成员 crate 在
+# `workspace = true` 之上追加 feature(feature 是可加的),于是根文件保持不动。
+gpui-component = { workspace = true, features = ["tree-sitter-languages"] }
+mt-ui.workspace = true
+mt-terminal.workspace = true
+mt-pty.workspace = true
+mt-config.workspace = true
+mt-i18n.workspace = true
+mt-project.workspace = true
+mt-ai.workspace = true
+mt-usage.workspace = true
+mt-relay.workspace = true
+# SSH 远程项目(audit #28):russh 持久会话池 + SFTP 只读/上传原语。
+# 服务层在 `remote_ssh.rs`,自持一个小 tokio 运行时(见该模块的线程口径说明)。
+mt-ssh.workspace = true
+mt-core.workspace = true
+# `remote_ssh` 的 tokio 边界:russh / russh-sftp 的 IO 要 tokio driver,
+# gpui 的执行器喂不动。工作区里已有这一行(mt-relay 用同一份 feature 集),
+# 这里只是引用,**没有改根 Cargo.toml**。
+#
+# ⚠️ 追加 `net`:`Builder::enable_all()` 只在 tokio 开了 `net` 时才顺带
+# `enable_io()`,否则 IO 驱动缺席、russh 建 TcpStream 时 panic
+# 「there is no reactor running」。目前 `net` 靠 russh 的特性统一带进来,
+# 但那是**别人的**依赖声明 —— 显式写出来,免得哪天依赖树一变就静默失灵。
+# (feature 是可加的,workspace 依赖之上追加不需要动根 manifest,
+#  与本文件里 gpui-component 的 `tree-sitter-languages` 同一手法。)
+tokio = { workspace = true, features = ["net"] }
+# SSH 工具(CLI + Skill)按项目启用时的能力令牌(UUID v4)。
+uuid.workspace = true
+# `~/.claude/settings.json` / `~/.codex/config.toml` 的 home 定位(ssh_registry)。
+dirs.workspace = true
+# 项目级 / 全局 Codex 配置的 TOML 编辑(ssh_registry 摘除历史 MCP 注册 +
+# 写项目信任)。**保留用户自己的注释与排版**,故用 toml_edit 而非 toml。
+#
+# ⚠️ 这一条不在 `workspace.dependencies` 里 —— 与 `mt-ai` / `mt-usage` 的
+# `toml_edit = "0.22"` 同一写法(那两个 crate 也是直接钉版本)。选择跟随既有
+# 先例而不是动根 manifest:版本与它们一字不差,依赖树里因此仍只有一个
+# toml_edit,Cargo.lock 零新包。
+toml_edit = "0.22"
+anyhow.workspace = true
+# 活 pane 列表要在 GPUI 主线程与 mt-ai 的 500ms 轮询线程之间共享。
+parking_lot.workspace = true
+# PTY reader 线程 → 主线程的唤醒信号(gpui 的 AsyncApp 是 Rc,不能跨线程)。
+# gpui 自己也依赖 futures 0.3,不会多拉一棵依赖树。
+futures = "0.3"
+# 会话列表的相对时间、用量面板的本地日历日窗口。
+chrono.workspace = true
+# 移动端配对二维码(工作区里已 default-features=false，只要位矩阵)。
+# 渲染由 `mobile_relay::qr` 自绘 quad —— 不引 image 后端、不落临时文件。
+qrcode.workspace = true
+# 价格表缓存信封的读写(model-pricing.json / .cache.json)。
+serde.workspace = true
+serde_json.workspace = true
+# 用量分桶要 IANA 时区名:mt-usage 按每条记录自身时刻求当地偏移,
+# 只给固定偏移的话 DST 地区的历史记录会错日。
+iana-time-zone = "0.1"
+# 价格表拉取(https://models.dev/api.json,一次 HTTPS GET)。
+#
+# **净新增 crate = 0**:`zed-reqwest` 已经在依赖树里(gpui → gpui_http_client),
+# `blocking` feature 只额外要 futures-channel + tokio/sync,两者也都在树里。
+# 不用 `cx.http_client()`:gpui 的默认实现是 `NullHttpClient`,`send()` 直接
+# `bail!("No HttpClient available")`,而 `gpui_http_client` 只提供 trait、不带
+# reqwest 后端(Zed 把那部分放在未发布的 reqwest_client crate 里)。
+# blocking 客户端自己起 current-thread 运行时,mt-app 不必接 tokio;
+# 调用一律丢 background executor(见 `pricing::fetch_models_dev` 的注释)。
+reqwest = { package = "zed-reqwest", version = "0.12.15-zed", default-features = false, features = [
+    "blocking",
+    "rustls-tls-native-roots",
+    "charset",
+    "http2",
+] }
+
+[target.'cfg(windows)'.dependencies]
+# 任务栏闪烁(FlashWindowEx)、提示音(MessageBeep / PlaySoundW)与系统托盘。
+# 版本跟随 gpui 已经在用的那个,不给依赖树引入第二份 windows crate。
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    # 首启探测界面语言:GetUserDefaultLocaleName。Windows 上 LANG/LC_ALL 这些
+    # 环境变量通常不存在,只能问系统(见 i18n::system_locale)。
+    "Win32_Globalization",
+    # 托盘图标逐像素画:CreateDIBSection 造 32bpp 预乘 BGRA 位图,
+    # 再由 CreateIconIndirect 变成 HICON(见 tray.rs)。
+    "Win32_Graphics_Gdi",
+    "Win32_Media_Audio",
+    # MessageBeep 住在这个模块里(不是 WindowsAndMessaging)
+    "Win32_System_Diagnostics_Debug",
+    # 托盘线程要注册自己的窗口类,RegisterClassW 的 hInstance 来自 GetModuleHandleW。
+    "Win32_System_LibraryLoader",
+    # Shell_NotifyIconW / NOTIFYICONDATAW —— 系统托盘图标的唯一入口。
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    # PrintWindow 住在打印/XPS 模块里(弹窗毛玻璃快照,见 frost.rs)。
+    "Win32_Storage_Xps",
+] }
+# 从 gpui 的 Window 取 HWND。
+raw-window-handle = "0.6"
+# 弹窗毛玻璃快照(frost.rs):只用 Frame/RgbaImage 当 RenderImage 的字节容器,
+# 不开任何解码后端;版本跟随 gpui 已锁定的那份(0.25.x),不引第二份 image。
+image = { version = "0.25", default-features = false }

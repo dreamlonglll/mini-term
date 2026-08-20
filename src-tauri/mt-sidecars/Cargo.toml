@@ -26,12 +26,16 @@ name = "mt-ssh-cli"
 path = "src/bin/mt-ssh-cli.rs"
 
 [dependencies]
-mt-core = { path = "../mt-core" }
+# ⚠️ mt-core / mt-ssh 已随 GPUI 收尾-1 批 git mv 到仓库根的 `crates/` 下。
+# 本 crate 仍留在 `src-tauri/`(仍是自己的工作区根,产物目录
+# `src-tauri/mt-sidecars/target/` 不变,故 scripts/stage-sidecars.mjs 无需改),
+# 只把两条 path 依赖指向新位置。
+mt-core = { path = "../../crates/mt-core" }
 # SSH 持久会话池 + SFTP 传输原语(russh 0.61 + ring 后端、ssh-key/rsa 精确锁、
 # russh-sftp)。task 07-05-ssh-remote-projects PR1 抽到共享 crate mt-ssh,
 # 主程序与 sidecar 共用;russh 类型(如 ChannelMsg)经 `mt_ssh::russh` 再导出取用,
-# 保证与池同一 crate 版本。依赖版本锁的完整说明见 ../mt-ssh/Cargo.toml。
-mt-ssh = { path = "../mt-ssh" }
+# 保证与池同一 crate 版本。依赖版本锁的完整说明见 ../../crates/mt-ssh/Cargo.toml。
+mt-ssh = { path = "../../crates/mt-ssh" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "6"

@@ -1,0 +1,15 @@
+[package]
+name = "mt-pty"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+portable-pty.workspace = true
+anyhow.workspace = true
+parking_lot.workspace = true
+# 纯逻辑共享库:WSL UNC 解析 / SSH 密码提示扫描 / ANSI 剥离。
+# 收尾-1 批 mt-core 已物理移入 `crates/`,过渡期的 `../../src-tauri/mt-core`
+# 路径依赖按原计划换成工作区依赖,代码零改动。
+mt-core.workspace = true

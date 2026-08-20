@@ -1,0 +1,18 @@
+[package]
+name = "mt-i18n"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+description = "mini-term 双语文案层：字典编译期静态化，零依赖，任何 crate 可用"
+
+[features]
+# 默认带 serde：`Locale` 要能直接落进 AppConfig（序列化成 "zh" / "en"，
+# 与 TS 侧 localStorage 里的取值一致，两套并存期可互读）。
+default = ["serde"]
+serde = ["dep:serde"]
+
+[dependencies]
+# 唯一（且可选）的依赖。字典本身是纯静态数据，不需要任何运行时库；
+# **绝不引 gpui** —— 后端 crate 也要能拿文案，不该为此拖进 GPU 栈。
+serde = { workspace = true, optional = true }

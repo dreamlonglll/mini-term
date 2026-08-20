@@ -1,0 +1,22 @@
+[package]
+name = "mt-usage"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+dirs.workspace = true
+chrono.workspace = true
+# 分桶按记录自身时刻求当地偏移(DST 地区历史记录不错日),chrono-tz 带 IANA 数据
+chrono-tz = "0.10"
+# 与 src-tauri 同版本；bundled 拉 libsqlite3-sys 0.38，其 build.rs 用 cfg_select!
+# ——工作区 rust-version = 1.95 的底线就是为它定的
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+# 读 ~/.codex/config.toml 的 model_providers.<id>.base_url(供应商归属)
+toml_edit = "0.22"
+# 会话文件枚举/元信息行解析/grok_home 直连 mt-ai(ai_shim 临时副本已删)
+mt-ai.workspace = true

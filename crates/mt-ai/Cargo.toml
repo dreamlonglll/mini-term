@@ -1,0 +1,25 @@
+[package]
+name = "mt-ai"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+regex.workspace = true
+dirs.workspace = true
+# 收尾-1 批去重:atomic_write / parse_wsl_unc / strip_ansi_codes 三个纯函数
+# 原本在 crate::util、crate::detect 里各存一份逐字副本(mt-core 当时还在
+# `src-tauri/` 下,反向依赖会把整套 Tauri 依赖拖进来)。mt-core 移入 `crates/`
+# 后副本已删,统一走它。mt-core 是叶子(serde/serde_json/dirs),不带包袱。
+mt-core.workspace = true
+# hook 上报接收端。三家 CLI 里已注册的 hook 命令 POST 到 127.0.0.1:23456/hook,
+# 端口/协议/路由都是用户机器上的既成事实,不能改(版本照抄 src-tauri/Cargo.toml)。
+tiny_http = "0.12"
+# Codex 的 ~/.codex/config.toml 要开 features.codex_hooks,改 TOML 得保留用户
+# 自己的注释与排版,故用 toml_edit 而非 toml。
+toml_edit = "0.22"

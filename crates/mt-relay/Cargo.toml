@@ -1,0 +1,31 @@
+[package]
+name = "mt-relay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+# 会话记录解析(Claude/Codex/Grok 三家的行级解析器、项目目录定位、grok chunk
+# 状态机)与「该 agent 有没有可解析的会话记录」判定,对话镜像整块建在其上。
+mt-ai.workspace = true
+# 收尾-1 批去重:`util::is_wsl_unc_path` 原是 WSL UNC 判定的第三份复刻,
+# 现直接问 `mt_core::parse_wsl_unc`。
+mt-core.workspace = true
+# Codex/grok 会话目录在用户家目录下(~/.codex/sessions 等)
+dirs.workspace = true
+# 与中转服务端共享的协议消息 crate。relay-server 是独立工作区,
+# 这条 path 依赖跨工作区,Cargo 允许。
+mt-relay-protocol = { path = "../../relay-server/protocol" }
+tokio-tungstenite = { version = "0.27", features = ["rustls-tls-native-roots"] }
+# rustls 显式关默认 feature 并选 ring 后端,避免 aws-lc-rs 在 Windows MSVC 上的
+# NASM 工具链依赖(见 spec/backend/rust-crypto-on-windows-msvc.md);
+# 运行时需 install ring provider。
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+futures-util = "0.3"
+sha2 = "0.11.0"

@@ -1,0 +1,27 @@
+[package]
+name = "mt-project"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+parking_lot.workspace = true
+regex.workspace = true
+# 收尾-1 批去重:`fs::atomic_write` 的实现收归叶子 crate mt-core,
+# 本 crate 改为再导出(公开路径 `mt_project::fs::atomic_write` 不变)。
+mt-core.workspace = true
+# 以下四个工作区里没有,版本与 feature 照抄 src-tauri/Cargo.toml。
+# git2 必须保留 vendored-openssl:Windows MSVC 上不 vendored 会去找系统 OpenSSL,
+# 依据见 spec/backend/rust-crypto-on-windows-msvc.md。
+git2 = { version = "0.19", features = ["vendored-openssl"] }
+notify = "7"
+ignore = "0.4"
+pathdiff = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# WSL 发行版枚举:读 HKCU\...\Lxss 注册表,不 spawn wsl.exe(避免 UTF-16 stdout 坑)。
+windows-registry = "0.2"
