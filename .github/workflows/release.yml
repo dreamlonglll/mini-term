@@ -128,7 +128,10 @@ jobs:
           $src = (Resolve-Path 'target/release').Path
           $ico = (Resolve-Path 'crates/mt-app/resources/icon.ico').Path
           $out = Join-Path (Resolve-Path 'dist').Path "mini-term-gpui-$tag-windows-x64-setup.exe"
-          makensis /DVERSION=$version /DVERSION_NUM=$versionNum `
+          # runner 镜像带 NSIS 但 makensis 不在 PATH,按固定安装位调用;缺席再 choco 兜底
+          $mk = 'C:\Program Files (x86)\NSIS\makensis.exe'
+          if (-not (Test-Path $mk)) { choco install nsis -y --no-progress }
+          & $mk /DVERSION=$version /DVERSION_NUM=$versionNum `
             /DSOURCE_DIR=$src /DICON_FILE=$ico /DOUT_FILE=$out `
             scripts/windows-installer.nsi
           Get-ChildItem dist
