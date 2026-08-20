@@ -1211,6 +1211,8 @@ impl Element for TerminalElement {
             let mut cache = state.rows.borrow_mut();
             let mut scratch: Vec<CellSignature> = Vec::with_capacity(columns);
             let mut current_row: Option<usize> = None;
+            // 每帧新建:阈值在一帧内恒定,不必进键(见 `ContrastMemo` 的说明)。
+            let mut contrast = colors::ContrastMemo::default();
             // 命中按行取一次就够:逐格去问 1000 条命中是一屏一千万次比较。
             let mut row_spans: &[HighlightSpan] = &[];
 
@@ -1259,6 +1261,15 @@ impl Element for TerminalElement {
                 if flags.contains(Flags::INVERSE) {
                     std::mem::swap(&mut fg, &mut bg);
                     bg_is_default = false;
+                }
+                // ── 最小对比度:前景与背景近似同色时把前景推开。
+                //
+                //    **夹在 INVERSE 与 HIDDEN 之间是硬要求**:在 INVERSE 之后才对得上
+                //    「真正画出来的那一对」;在 HIDDEN 之前才不会把 `read -s` 的密码
+                //    强行显形(HIDDEN 就是靠 fg = bg 实现的,修正跑在它后面等于撤销它)。
+                //    块状光标那格随后会把 fg 覆盖成 cursor_text,这里白算一次但不出错。
+                if colors::has_visible_ink(cell.c, flags) {
+                    fg = contrast.resolve(fg, bg, colors::MIN_CONTRAST_RATIO);
                 }
                 if flags.contains(Flags::HIDDEN) {
                     fg = bg;

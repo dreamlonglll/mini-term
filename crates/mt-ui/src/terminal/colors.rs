@@ -4,6 +4,9 @@
 //! 1. 转义序列里带的真彩值(`Color::Spec`)——直接用;
 //! 2. OSC 4 / OSC 10-11 运行时改过的调色板(`term.colors()`)——覆盖主题;
 //! 3. [`TerminalTheme`] 里的配色 —— 兜底。
+//!
+//! 解析完还有**最后一道**:[`ensure_contrast`] —— 前景与背景近似同色时把前景推开,
+//! 见该函数的文档。
 
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::color::Colors;
@@ -222,6 +225,190 @@ pub fn is_default_background(cell_bg: Color, flags: Flags) -> bool {
     matches!(cell_bg, Color::Named(NamedColor::Background)) && !flags.contains(Flags::INVERSE)
 }
 
+// ─────────────────────────── 最小对比度 ───────────────────────────
+
+/// 前景/背景的最低对比度(WCAG AA 的正文档,与 VS Code、xterm.js 的推荐值同为 4.5)。
+///
+/// 逐字沿用 Tauri 版 `terminalCache.ts` 的 `minimumContrastRatio: 4.5` —— 那条配置
+/// 是为 **Claude Code 的 AskUserQuestion 提问行**加的:它用近黑前景配默认背景,
+/// 暗色主题下与底色几乎同色,不选中根本看不见(修复见 `0e1fea8`)。GPUI 迁移期
+/// 随 `src/` 整块删除而丢失,这里是等价物。
+///
+/// 硬编码而不是配置项:旧版就是硬编码跑了一个多月的行为基线。真要可配,落点是
+/// [`TerminalTheme`] 加一个字段(0 或 1.0 = 关闭),让主题包作者能对自己调好的
+/// 低对比配色关掉它 —— 而不是加一个用户得先知道「对比度」是什么才会去开的开关。
+pub const MIN_CONTRAST_RATIO: f32 = 4.5;
+
+/// 这个格子有没有可见笔画。
+///
+/// 没有笔画的格子前景色不影响画面,可以整个跳过对比度修正 —— 一屏里空格占绝大
+/// 多数,**这条是修正开销能被摊平的关键**(见 [`ContrastMemo`] 的性能说明)。
+/// 注意空格也可能带下划线/删除线,那时前景色是画得出来的。
+pub fn has_visible_ink(ch: char, flags: Flags) -> bool {
+    ch != ' ' || flags.intersects(Flags::ALL_UNDERLINES | Flags::STRIKEOUT)
+}
+
+/// WCAG 的单通道线性化。
+fn linearize(v: u8) -> f32 {
+    let c = v as f32 / 255.0;
+    if c <= 0.03928 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// WCAG 相对亮度。
+fn relative_luminance(rgb: Rgb) -> f32 {
+    0.2126 * linearize(rgb.r) + 0.7152 * linearize(rgb.g) + 0.0722 * linearize(rgb.b)
+}
+
+/// 两个亮度之间的对比度,值域 1.0..=21.0。
+fn contrast_ratio(a: f32, b: f32) -> f32 {
+    let (hi, lo) = if a > b { (a, b) } else { (b, a) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+/// 逐轮把每个通道压掉 10%,直到达标或触底。
+///
+/// 按通道等比推进而不是转 HSL 调 L,是 xterm.js 的刻意取舍(转换比整个修正还贵)。
+/// 任一非零通道每轮至少减 1(`ceil`),所以一定收敛。
+fn darken(fg: Rgb, bg_lum: f32, ratio: f32) -> Rgb {
+    let mut out = fg;
+    while contrast_ratio(relative_luminance(out), bg_lum) < ratio
+        && (out.r > 0 || out.g > 0 || out.b > 0)
+    {
+        let step = |v: u8| v.saturating_sub((v as f32 * 0.1).ceil() as u8);
+        out = Rgb {
+            r: step(out.r),
+            g: step(out.g),
+            b: step(out.b),
+        };
+    }
+    out
+}
+
+/// [`darken`] 的反向:逐轮把每个通道往 255 推 10%。
+fn lighten(fg: Rgb, bg_lum: f32, ratio: f32) -> Rgb {
+    let mut out = fg;
+    while contrast_ratio(relative_luminance(out), bg_lum) < ratio
+        && (out.r < 255 || out.g < 255 || out.b < 255)
+    {
+        let step = |v: u8| v.saturating_add(((255 - v) as f32 * 0.1).ceil() as u8);
+        out = Rgb {
+            r: step(out.r),
+            g: step(out.g),
+            b: step(out.b),
+        };
+    }
+    out
+}
+
+/// 前景与背景对比度不足时,把前景推到达标为止;够了就原样返回。
+///
+/// # 为什么要**双向**试
+///
+/// 直觉做法是「暗前景就压得更暗、亮前景就提得更亮」,把它推离背景。但这在中间调
+/// 背景上会失效:灰底(约 50% 亮度)上的近黑前景一路压到纯黑,对比度也只有 4 左右
+/// —— 单向做法到这里就放弃了,等于没修。所以先按远离方向推一遍,**够不到就换另一
+/// 个方向重推,取对比度高的那个**。少了这一步,中灰底(TUI 状态栏、选中行)上的
+/// 低对比文字仍然看不见。
+///
+/// # 参照色的两条已知不准
+///
+/// 1. **背景图皮肤下 `bg` 是半透明的**(`theme_bridge::to_terminal_theme` 带图时会
+///    给 `TerminalTheme::background` 打 alpha),真正在后面的是氛围图,亮度不可知。
+///    这里与 xterm.js 一样**只看 RGB、忽略 alpha**,算出来是名义对比度;图特别亮的
+///    区域仍可能偏淡。
+/// 2. 选中/查找命中的半透明高亮是**画在文字之下、修正之后**的,不进参照。
+///
+/// 两条都是旧版就有的口径,不是本次引入的回退。
+///
+/// `ratio <= 1.0` 视为关闭。前景的 alpha 原样保留。
+pub fn ensure_contrast(fg: Hsla, bg: Hsla, ratio: f32) -> Hsla {
+    if ratio <= 1.0 {
+        return fg;
+    }
+    let fg_rgb = to_rgb(fg);
+    let bg_lum = relative_luminance(to_rgb(bg));
+    let fg_lum = relative_luminance(fg_rgb);
+    if contrast_ratio(fg_lum, bg_lum) >= ratio {
+        return fg;
+    }
+
+    // 先往「远离背景」的方向推
+    let (away, back): (fn(Rgb, f32, f32) -> Rgb, fn(Rgb, f32, f32) -> Rgb) = if fg_lum < bg_lum {
+        (darken, lighten)
+    } else {
+        (lighten, darken)
+    };
+    let first = away(fg_rgb, bg_lum, ratio);
+    let first_ratio = contrast_ratio(relative_luminance(first), bg_lum);
+    let best = if first_ratio < ratio {
+        // 推到头还是不够:换方向重推,取更好的那个(两边都不达标时也要取最优,
+        // 「都不达标就放弃」会把中灰底上的近黑文字原样留下)
+        let second = back(fg_rgb, bg_lum, ratio);
+        if first_ratio >= contrast_ratio(relative_luminance(second), bg_lum) {
+            first
+        } else {
+            second
+        }
+    } else {
+        first
+    };
+    Hsla {
+        a: fg.a,
+        ..rgb8(best.r, best.g, best.b)
+    }
+}
+
+/// `(前景, 背景) → 修正后前景` 的小型轮转缓存。
+///
+/// # 为什么非有不可
+///
+/// 取色发生在**每帧遍历全部可见格子**的那个循环里(`element.rs` 的 `display_iter`),
+/// 行缓存只缓存 shaping、不缓存取色。一次相对亮度是 3 次 `powf`,一屏 200×50 的
+/// 格子按前后景各算一次就是 6 万次 `powf`/帧,60fps 下能吃掉 1~2ms —— 纯粹为了
+/// 得出「绝大多数格子本来就达标」这个结论。
+///
+/// 两条对策叠加基本抹平:调用方先用 [`has_visible_ink`] 滤掉空格(一屏的大头),
+/// 剩下的走这里 —— 终端一屏用到的色对通常是个位数,线性扫几条 f32 比较远比
+/// `powf` 便宜。槽位满了轮转覆盖:配色异常丰富的画面(真彩色图片、彩虹输出)
+/// 退化成每格现算,与没有缓存时持平,不会更差。
+///
+/// **`ratio` 不进键**:调用方每帧新建一个 memo,阈值在一帧内恒定。要把 memo 提成
+/// 跨帧缓存的话,阈值必须一起进键或在阈值变化时清空。
+pub struct ContrastMemo {
+    slots: [Option<(Hsla, Hsla, Hsla)>; Self::SLOTS],
+    next: usize,
+}
+
+impl Default for ContrastMemo {
+    fn default() -> Self {
+        Self {
+            slots: [None; Self::SLOTS],
+            next: 0,
+        }
+    }
+}
+
+impl ContrastMemo {
+    const SLOTS: usize = 8;
+
+    /// 查缓存,没有就算一次 [`ensure_contrast`] 并记下。
+    pub fn resolve(&mut self, fg: Hsla, bg: Hsla, ratio: f32) -> Hsla {
+        for (cached_fg, cached_bg, fixed) in self.slots.iter().flatten() {
+            if *cached_fg == fg && *cached_bg == bg {
+                return *fixed;
+            }
+        }
+        let fixed = ensure_contrast(fg, bg, ratio);
+        self.slots[self.next] = Some((fg, bg, fixed));
+        self.next = (self.next + 1) % Self::SLOTS;
+        fixed
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,5 +455,157 @@ mod tests {
 
         colors[NamedColor::Background] = Some(custom);
         assert_eq!(color_request_rgb(257, &colors, &theme), custom);
+    }
+
+    // ── 最小对比度
+
+    fn ratio_of(fg: Hsla, bg: Hsla) -> f32 {
+        contrast_ratio(
+            relative_luminance(to_rgb(fg)),
+            relative_luminance(to_rgb(bg)),
+        )
+    }
+
+    fn lum_of(color: Hsla) -> f32 {
+        relative_luminance(to_rgb(color))
+    }
+
+    #[test]
+    fn 对比度够的色对原样不动() {
+        let theme = TerminalTheme::default();
+        assert!(ratio_of(theme.foreground, theme.background) >= MIN_CONTRAST_RATIO);
+        assert_eq!(
+            ensure_contrast(theme.foreground, theme.background, MIN_CONTRAST_RATIO),
+            theme.foreground,
+            "达标的色对必须一个 bit 都不改 —— 否则整套主题配色会被悄悄改写"
+        );
+    }
+
+    #[test]
+    fn 暗底上的近黑前景被提亮到达标() {
+        // 这就是 Claude Code 的 AskUserQuestion 提问行:近黑前景配默认暗背景
+        let bg = rgb8(0x1a, 0x1a, 0x1a);
+        let fg = rgb8(0x30, 0x30, 0x30);
+        assert!(
+            ratio_of(fg, bg) < MIN_CONTRAST_RATIO,
+            "前提:这一对原本就是看不见的"
+        );
+
+        let fixed = ensure_contrast(fg, bg, MIN_CONTRAST_RATIO);
+        assert!(ratio_of(fixed, bg) >= MIN_CONTRAST_RATIO);
+        assert!(lum_of(fixed) > lum_of(fg), "暗底上只能往亮里推");
+    }
+
+    #[test]
+    fn 亮底上的近白前景被压暗到达标() {
+        let bg = rgb8(0xfa, 0xfa, 0xfa);
+        let fg = rgb8(0xf0, 0xf0, 0xf0);
+        assert!(ratio_of(fg, bg) < MIN_CONTRAST_RATIO);
+
+        let fixed = ensure_contrast(fg, bg, MIN_CONTRAST_RATIO);
+        assert!(ratio_of(fixed, bg) >= MIN_CONTRAST_RATIO);
+        assert!(lum_of(fixed) < lum_of(fg), "亮底上只能往暗里推");
+    }
+
+    #[test]
+    fn 中灰底上单向推到头不够时换方向() {
+        // 单向做法(「暗前景就压得更暗」)在中间调背景上会失效:这个底色上前景
+        // 一路压到纯黑也只有 3.9x,到这里就放弃 = 等于没修。必须换方向重推。
+        let bg = rgb8(0x6b, 0x6b, 0x6b);
+        let fg = rgb8(0x1a, 0x1a, 0x1a);
+        assert!(ratio_of(fg, bg) < MIN_CONTRAST_RATIO);
+        assert!(
+            ratio_of(rgb8(0, 0, 0), bg) < MIN_CONTRAST_RATIO,
+            "前提:这个底色上连纯黑都不达标,才轮得到反向兜底"
+        );
+
+        let fixed = ensure_contrast(fg, bg, MIN_CONTRAST_RATIO);
+        assert!(ratio_of(fixed, bg) >= MIN_CONTRAST_RATIO);
+        assert!(
+            lum_of(fixed) > lum_of(bg),
+            "压暗那侧封顶了,结果必须落在背景的另一侧"
+        );
+    }
+
+    #[test]
+    fn 两侧都推到头仍不达标时取更优的一侧() {
+        // 4.5 这个阈值下总有一侧够得着(纯黑/纯白两个 ratio 的较大者下界是 4.58),
+        // 所以这条分支要用极端阈值才走得到。它的意义是「都不达标也别放弃」。
+        let bg = rgb8(0x80, 0x80, 0x80);
+        // 比背景略亮 → 优先往亮里推,但这个底色上提到纯白只有 3.9x、
+        // 压到纯黑有 5.3x —— 优先方向恰恰是差的那个
+        let fg = rgb8(0x85, 0x85, 0x85);
+
+        let fixed = ensure_contrast(fg, bg, 21.0);
+        assert_eq!(
+            to_rgb(fixed),
+            Rgb { r: 0, g: 0, b: 0 },
+            "两侧都不达标时要取对比度高的那一侧,而不是优先方向那一侧"
+        );
+        assert!(ratio_of(fixed, bg) > ratio_of(fg, bg));
+    }
+
+    #[test]
+    fn 阈值不高于_1_视为关闭() {
+        let bg = rgb8(0x1a, 0x1a, 0x1a);
+        let fg = rgb8(0x1b, 0x1b, 0x1b);
+        assert_eq!(ensure_contrast(fg, bg, 1.0), fg);
+        assert_eq!(ensure_contrast(fg, bg, 0.0), fg);
+    }
+
+    #[test]
+    fn 前景的_alpha_原样保留() {
+        let bg = rgb8(0x1a, 0x1a, 0x1a);
+        let fg = Hsla {
+            a: 0.5,
+            ..rgb8(0x20, 0x20, 0x20)
+        };
+        let fixed = ensure_contrast(fg, bg, MIN_CONTRAST_RATIO);
+        assert_ne!(to_rgb(fixed), to_rgb(fg), "前提:这一对确实被改过");
+        assert_eq!(fixed.a, 0.5);
+    }
+
+    #[test]
+    fn 极端色对不死循环也不倒退() {
+        for (fg, bg) in [
+            (rgb8(0, 0, 0), rgb8(0, 0, 0)),
+            (rgb8(255, 255, 255), rgb8(255, 255, 255)),
+            (rgb8(0, 0, 0), rgb8(1, 1, 1)),
+            (rgb8(255, 255, 255), rgb8(254, 254, 254)),
+            (rgb8(0x80, 0x00, 0x40), rgb8(0x80, 0x00, 0x40)),
+        ] {
+            let fixed = ensure_contrast(fg, bg, MIN_CONTRAST_RATIO);
+            assert!(
+                ratio_of(fixed, bg) >= ratio_of(fg, bg),
+                "修完不许比原样还差"
+            );
+        }
+    }
+
+    #[test]
+    fn 空格没有笔画但带下划线的空格有() {
+        assert!(!has_visible_ink(' ', Flags::empty()));
+        assert!(has_visible_ink('a', Flags::empty()));
+        assert!(
+            has_visible_ink(' ', Flags::UNDERLINE),
+            "下划线用的是前景色,空格也画得出来"
+        );
+        assert!(has_visible_ink(' ', Flags::STRIKEOUT));
+    }
+
+    #[test]
+    fn memo_轮转覆盖后仍与直算一致() {
+        let mut memo = ContrastMemo::default();
+        let bg = rgb8(0x1a, 0x1a, 0x1a);
+        // 20 组色对把 8 个槽位轮转好几圈,再复查一遍每一组
+        let fgs: Vec<Hsla> = (0..20u8).map(|i| rgb8(i * 12, i * 9, i * 5)).collect();
+        for _ in 0..3 {
+            for fg in &fgs {
+                assert_eq!(
+                    memo.resolve(*fg, bg, MIN_CONTRAST_RATIO),
+                    ensure_contrast(*fg, bg, MIN_CONTRAST_RATIO)
+                );
+            }
+        }
     }
 }

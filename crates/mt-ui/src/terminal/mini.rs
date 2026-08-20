@@ -258,6 +258,7 @@ impl MiniTerminalElement {
             let colors_table = content.colors;
             let mut cells: Vec<MiniCell> = Vec::new();
             let mut current_row: Option<usize> = None;
+            let mut contrast = colors::ContrastMemo::default();
             for indexed in content.display_iter {
                 let row = (indexed.point.line.0 + display_offset as i32).max(0) as usize;
                 if current_row != Some(row) {
@@ -280,17 +281,24 @@ impl MiniTerminalElement {
                 // 反显。缩略图不画逐格背景,真按反显换成背景色的话,反显块
                 // (fzf 选中行 / vim 状态栏)的文字会变成「底色画在底色上」——
                 // 整段消失,比配色不准糟得多。
-                let color = colors::foreground(cell.fg, flags, colors_table, &self.theme);
+                let mut color = colors::foreground(cell.fg, flags, colors_table, &self.theme);
+                // HIDDEN(SGR 8,`read -s` 之类)当空白处理。原版没有这条
+                // (它的 canvas 照画)—— **刻意加严**:缩略图会出现在别的
+                // 项目的悬停浮层里,把隐藏输入摊在那儿是实打实的泄露面
+                let ch = if flags.contains(Flags::HIDDEN) {
+                    ' '
+                } else {
+                    cell.c
+                };
+                // 最小对比度。这里参照色恒为 `theme.background` —— 缩略图不画逐格
+                // 背景,整块底就是它(见模块注释),所以对得上真正画出来的那一对。
+                // 顺序在 HIDDEN 转空白之后:隐藏输入已经没有笔画,不必也不该修正。
+                if ch != ' ' {
+                    color = contrast.resolve(color, self.theme.background, colors::MIN_CONTRAST_RATIO);
+                }
                 cells.push(MiniCell {
                     col: indexed.point.column.0,
-                    // HIDDEN(SGR 8,`read -s` 之类)当空白处理。原版没有这条
-                    // (它的 canvas 照画)—— **刻意加严**:缩略图会出现在别的
-                    // 项目的悬停浮层里,把隐藏输入摊在那儿是实打实的泄露面
-                    ch: if flags.contains(Flags::HIDDEN) {
-                        ' '
-                    } else {
-                        cell.c
-                    },
+                    ch,
                     width,
                     color,
                 });
