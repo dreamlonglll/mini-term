@@ -1,8 +1,10 @@
 name: Build & Release
 
 # 发布形态(GPUI 原生版,三平台矩阵参考旧 Tauri 流水线):
-# - Windows x64:便携 zip(mini-term.exe + 三个 sidecar + portable-conpty/,
-#   运行时全部按「与 exe 同目录」定位,解压即用)
+# - Windows x64:NSIS 安装包(scripts/windows-installer.nsi,runner 自带 makensis;
+#   身份对齐旧 Tauri NSIS —— HKCU Uninstall\Mini-Term 键 + 读旧 InstallLocation,
+#   老用户原地升级;包内平铺 exe + 三个 sidecar + portable-conpty/,
+#   运行时全部按「与 exe 同目录」定位)
 # - macOS arm64:.app bundle 打成 dmg(无签名,首次打开需 `xattr -cr` 放行,
 #   bundle id 沿用旧 Tauri 版的 com.mini-term.app)
 # - Linux x64:deb + tar.gz(deb 版本号把 `-` 换成 `~`,预发布序才正确 ——
@@ -114,18 +116,21 @@ jobs:
       - name: Build GPUI app
         run: cargo build --release --package mt-app
 
-      - name: Assemble portable bundle (Windows)
+      - name: Build NSIS installer (Windows)
         if: matrix.platform == 'windows-latest'
         shell: pwsh
         run: |
-          $dist = "dist/mini-term"
-          New-Item -ItemType Directory -Force $dist | Out-Null
-          Copy-Item target/release/mini-term.exe $dist/
-          foreach ($name in 'miniterm-hook', 'mt-ssh-cli', 'mt-ssh-mcp') {
-            Copy-Item "target/release/$name.exe" $dist/
-          }
-          Copy-Item -Recurse target/release/portable-conpty "$dist/portable-conpty"
-          Compress-Archive -Path $dist -DestinationPath "dist/mini-term-gpui-${{ github.ref_name }}-windows-x64.zip"
+          $tag = "${{ github.ref_name }}"
+          $version = $tag.TrimStart('v')
+          # VIProductVersion 只收纯数字四段:剥掉预发布/构建元数据再补第四段
+          $versionNum = ($version -split '[-+]')[0] + '.0'
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $src = (Resolve-Path 'target/release').Path
+          $ico = (Resolve-Path 'crates/mt-app/resources/icon.ico').Path
+          $out = Join-Path (Resolve-Path 'dist').Path "mini-term-gpui-$tag-windows-x64-setup.exe"
+          makensis /DVERSION=$version /DVERSION_NUM=$versionNum `
+            /DSOURCE_DIR=$src /DICON_FILE=$ico /DOUT_FILE=$out `
+            scripts/windows-installer.nsi
           Get-ChildItem dist
 
       - name: Assemble .app bundle + dmg (macOS)
@@ -172,7 +177,9 @@ jobs:
         run: |
           TAG="${{ github.ref_name }}"
           VERSION="${TAG#v}"
-          DEB_VERSION="${VERSION//-/~}"
+          # ⚠️ 替换串必须转义:bash 对 ${var//pat/rep} 的 rep 做 tilde 展开,
+          # 裸 ~ 会变成 $HOME,版本号成 1.0.0/home/runnerbeta(首个 tag 踩过)
+          DEB_VERSION="${VERSION//-/\~}"
           STAGE="dist/mini-term"
           mkdir -p "$STAGE"
           for name in mini-term miniterm-hook mt-ssh-cli mt-ssh-mcp; do
@@ -216,7 +223,7 @@ jobs:
         with:
           prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
-            dist/mini-term-gpui-*.zip
+            dist/mini-term-gpui-*-setup.exe
             dist/mini-term-gpui-*.dmg
             dist/mini-term-gpui-*.tar.gz
             dist/mini-term-gpui-*.deb

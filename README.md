@@ -27,7 +27,7 @@
   <a href="docs/deploy-relay.zh-CN.md">中转部署</a>
 </p>
 
-> **GPUI 原生版是当前唯一形态**：Rust 原生渲染、单进程、不依赖 WebView2，Windows x64 便携包解压即用。早期的 Tauri + React 实现已于 v1.0.0-beta 后从仓库移除并停止发布（历史版本安装包仍可在旧 Release 下载，源码看 git 历史）。
+> **GPUI 原生版是当前唯一形态**：Rust 原生渲染、单进程、不依赖 WebView2。早期的 Tauri + React 实现已于 v1.0.0-beta 后从仓库移除并停止发布（历史版本安装包仍可在旧 Release 下载，源码看 git 历史）。
 
 ---
 
@@ -178,7 +178,7 @@ VS Code 风格的 **Changes 面板**（Staged / Changes / Untracked 分组，单
 
 前往 [Releases](https://github.com/dreamlonglll/mini-term/releases) 下载，三平台产物：
 
-- **Windows x64（主要支持平台）** — `mini-term-gpui-*-windows-x64.zip` 便携包，解压即用：无需安装、不依赖 WebView2
+- **Windows x64（主要支持平台）** — `mini-term-gpui-*-windows-x64-setup.exe` 安装包（NSIS，用户级安装免管理员，装过旧版的默认原目录原地升级）
 - **macOS arm64** — `mini-term-gpui-*-macos-arm64.dmg`
 - **Linux x64** — `mini-term-gpui-*-linux-amd64.deb` 或 `mini-term-gpui-*-linux-x64.tar.gz`
 

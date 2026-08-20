@@ -197,7 +197,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 
 前往 [Releases](https://github.com/dreamlonglll/mini-term/releases) 下载，三平台产物：
 
-- **Windows x64（主要支持平台）** — `mini-term-gpui-*-windows-x64.zip` 便携包，解压即用：无需安装、不依赖 WebView2
+- **Windows x64（主要支持平台）** — `mini-term-gpui-*-windows-x64-setup.exe` 安装包（NSIS，用户级安装免管理员，装过旧版的默认原目录原地升级）
 - **macOS arm64** — `mini-term-gpui-*-macos-arm64.dmg`
 - **Linux x64** — `mini-term-gpui-*-linux-amd64.deb` 或 `mini-term-gpui-*-linux-x64.tar.gz`
 

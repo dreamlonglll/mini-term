@@ -123,3 +123,8 @@ raw-window-handle = "0.6"
 # 弹窗毛玻璃快照(frost.rs):只用 Frame/RgbaImage 当 RenderImage 的字节容器,
 # 不开任何解码后端;版本跟随 gpui 已锁定的那份(0.25.x),不引第二份 image。
 image = { version = "0.25", default-features = false }
+
+[target.'cfg(windows)'.build-dependencies]
+# exe 图标与版本资源嵌入(见 build.rs)。build-dependencies 的 cfg 判的是
+# **宿主**平台:mac/Linux 原生构建时这个 crate 根本不进依赖图。
+winresource = "0.1"

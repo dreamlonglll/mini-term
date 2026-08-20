@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - **UI/渲染**: [gpui](https://crates.io/crates/gpui) 0.2.x（Zed 官方，crates.io 版）+ gpui-component（Resizable/Modal/Input/Tree 等）
 - **终端**: alacritty_terminal（VT 状态机，进程内直喂，无 IPC）+ portable-pty
-- **发布形态**: Windows x64 便携 zip（exe + 三个 sidecar + portable-conpty，全部「与 exe 同目录」）
+- **发布形态**: Windows x64 NSIS 安装包（`scripts/windows-installer.nsi`，包内平铺 exe + 三个 sidecar + portable-conpty，全部「与 exe 同目录」）+ macOS dmg + Linux deb/tar.gz
 - **历史**: 项目最初是 Tauri v2 + React 实现，v1.0.0-beta 后整体删除切换到 GPUI 原生版；找旧实现看 git 历史（合并点 `236d5c1`）
 
 ## 开发命令

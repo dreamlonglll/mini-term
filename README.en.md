@@ -27,7 +27,7 @@
   <a href="docs/deploy-relay.md">Relay deployment</a>
 </p>
 
-> **The GPUI-native build is now the only form**: Rust-native rendering, single process, no WebView2 dependency — the Windows x64 portable bundle unzips and runs. The earlier Tauri + React implementation was removed from the repository and discontinued after v1.0.0-beta (old installers remain downloadable on past Releases; the source lives in git history).
+> **The GPUI-native build is now the only form**: Rust-native rendering, single process, no WebView2 dependency. The earlier Tauri + React implementation was removed from the repository and discontinued after v1.0.0-beta (old installers remain downloadable on past Releases; the source lives in git history).
 
 ---
 
@@ -178,7 +178,7 @@ The whole application is **native Rust** (the earlier Tauri + React build was re
 
 Grab the latest build from [Releases](https://github.com/dreamlonglll/mini-term/releases) — three platforms:
 
-- **Windows x64 (primary platform)** — `mini-term-gpui-*-windows-x64.zip` portable bundle, unzip and run: no installer, no WebView2 dependency
+- **Windows x64 (primary platform)** — `mini-term-gpui-*-windows-x64-setup.exe` installer (NSIS, per-user install without admin rights; upgrades in place if an older version is installed)
 - **macOS arm64** — `mini-term-gpui-*-macos-arm64.dmg`
 - **Linux x64** — `mini-term-gpui-*-linux-amd64.deb` or `mini-term-gpui-*-linux-x64.tar.gz`
 
