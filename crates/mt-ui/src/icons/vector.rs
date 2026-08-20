@@ -13,6 +13,10 @@
 //!   红蓝互换;而且 tiny-skia 给的是预乘 alpha,抗锯齿边缘也对不上。上游修好之前不能用 |
 //! | **自绘(本模块)** | 无依赖、无宿主接线、分辨率无关、可多色、几何是纯数据可单测 |
 //!
+//! 注意「自绘」说的是**渲染**这一步。原版 SVG 的那条 `d` 照样能原样搬进来 ——
+//! [`Geom::Path`] 收下 path data,[`super::svg_path`] 解析 + 离散,几何还是官方的
+//! (厂商 logo 就是这么来的)。上表堵死的是「让 gpui 去读 SVG 文件」那三条路。
+//!
 //! # 形状表长什么样
 //!
 //! 每枚图标是一张 `&'static [Shape]`,坐标全在 **0..1 的单位方框**里(照抄原版 SVG 的
@@ -35,8 +39,8 @@
 use std::f32::consts::TAU;
 
 use gpui::{
-    App, Bounds, Element, GlobalElementId, Hsla, InspectorElementId, IntoElement, LayoutId,
-    PathBuilder, Pixels, Point, Style, Window, point, px,
+    App, Bounds, Element, FillOptions, FillRule, GlobalElementId, Hsla, InspectorElementId,
+    IntoElement, LayoutId, PathBuilder, PathStyle, Pixels, Point, Style, Window, point, px,
 };
 
 use crate::terminal::rgb8;
@@ -100,6 +104,16 @@ pub enum Geom {
         h: f32,
         round: f32,
     },
+    /// **原样搬来的 SVG `path`**。`d` 是原版那串 path data,`view` 是它的
+    /// viewBox `(min_x, min_y, 边长)`,`even_odd` 对应 `fill-rule="evenodd"`。
+    ///
+    /// 厂商官方 logo 走这条 —— 几百段贝塞尔没法用上面那几个基本形拼出来。
+    /// 解析与离散在 [`super::svg_path`],结果带缓存。
+    Path {
+        d: &'static str,
+        view: (f32, f32, f32),
+        even_odd: bool,
+    },
 }
 
 /// 图标里的一笔。
@@ -129,7 +143,27 @@ impl Shape {
 }
 
 impl Geom {
+    /// 离散成**若干条**子路径,每条是「单位坐标点列 + 是否闭合」。
+    ///
+    /// 基本形只有一条;[`Geom::Path`] 可以有多条 —— 官方 logo 的洞
+    /// (OpenCode 的内框、Copilot 的眼睛)靠「外框 + 内框 + 填充规则」表达,
+    /// 必须画进**同一个** `PathBuilder` 才挖得出来。
+    pub fn subpaths(&self) -> Vec<(Vec<(f32, f32)>, bool)> {
+        match *self {
+            Geom::Path { d, view, .. } => (*super::svg_path::cached(d, view)).clone(),
+            _ => vec![self.points()],
+        }
+    }
+
+    /// `fill-rule` 是不是 evenodd。基本形没有自交,恒 `false`。
+    pub fn even_odd(&self) -> bool {
+        matches!(*self, Geom::Path { even_odd: true, .. })
+    }
+
     /// 离散成单位坐标点列 + 「是否闭合」。**纯函数,单测就打在这上面**。
+    ///
+    /// [`Geom::Path`] 在这里返回所有子路径**首尾相接**的点列 —— 只够用来做
+    /// 「点是否都在单位方框内」这类包围盒断言,画图请走 [`Self::subpaths`]。
     pub fn points(&self) -> (Vec<(f32, f32)>, bool) {
         match *self {
             Geom::Polygon(pts) => (pts.to_vec(), true),
@@ -154,6 +188,13 @@ impl Geom {
                 h,
                 round,
             } => (round_rect_points(x, y, w, h, round), true),
+            Geom::Path { d, view, .. } => (
+                super::svg_path::cached(d, view)
+                    .iter()
+                    .flat_map(|(pts, _)| pts.iter().copied())
+                    .collect(),
+                true,
+            ),
         }
     }
 }
@@ -355,22 +396,33 @@ impl Element for VectorIcon {
         };
 
         for shape in self.shapes.iter().chain(self.overlay.iter()) {
-            let (pts, closed) = shape.geom.points();
-            if pts.len() < 2 {
-                continue;
-            }
+            let subpaths = shape.geom.subpaths();
             let mut builder = match shape.pen {
+                Pen::Fill if shape.geom.even_odd() => PathBuilder::fill()
+                    .with_style(PathStyle::Fill(
+                        FillOptions::default().with_fill_rule(FillRule::EvenOdd),
+                    )),
                 Pen::Fill => PathBuilder::fill(),
                 // 线宽小于 0.5px 时 lyon 会 tessellate 出近乎空的三角带,
                 // 高 DPI 下反而看不见 —— 兜一个下限
                 Pen::Line(w) => PathBuilder::stroke(px((w * side).max(0.5))),
             };
-            builder.move_to(map(pts[0]));
-            for p in &pts[1..] {
-                builder.line_to(map(*p));
+            let mut drawn = false;
+            for (pts, closed) in &subpaths {
+                if pts.len() < 2 {
+                    continue;
+                }
+                builder.move_to(map(pts[0]));
+                for p in &pts[1..] {
+                    builder.line_to(map(*p));
+                }
+                if *closed {
+                    builder.close();
+                }
+                drawn = true;
             }
-            if closed {
-                builder.close();
+            if !drawn {
+                continue;
             }
             if let Ok(path) = builder.build() {
                 window.paint_path(path, self.resolve(shape.ink));

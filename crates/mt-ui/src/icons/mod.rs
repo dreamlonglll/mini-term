@@ -3,11 +3,12 @@
 //!
 //! ```text
 //! icons
-//! ├── vector   形状 DSL + 唯一的绘制 Element(自绘,不走 asset / 不走位图)
-//! ├── brand    AI 厂商图标 + 厂商推断(BrandIcon.tsx / inferVendor.ts)
-//! ├── tech     技术栈徽标(TechIcon.tsx / projectKind.ts)
-//! ├── file     文件树图标 + 扩展名映射(fileIcon.ts / FileTree.tsx)
-//! └── status   四态状态灯 + spinner 旋转(StatusDot.tsx)
+//! ├── vector    形状 DSL + 唯一的绘制 Element(自绘,不走 asset / 不走位图)
+//! ├── svg_path  SVG `d` 的解析与离散化 —— 品牌 logo 原样搬运官方 path 靠它
+//! ├── brand     AI 厂商图标 + 厂商推断(BrandIcon.tsx / inferVendor.ts)
+//! ├── tech      技术栈徽标(TechIcon.tsx / projectKind.ts)
+//! ├── file      文件树图标 + 扩展名映射(fileIcon.ts / FileTree.tsx)
+//! └── status    四态状态灯 + spinner 旋转(StatusDot.tsx)
 //! ```
 //!
 //! # 为什么全是自绘
@@ -15,6 +16,9 @@
 //! 三条现成的路都走不通,判据写在 [`vector`] 的模块注释里(一句话:`svg()` 要
 //! 宿主注册 asset source 且只出单色掩膜;`img(ImageFormat::Svg)` 在 gpui 0.2.2
 //! 上红蓝互换)。自绘的额外好处是**几何是纯数据**,映射表和形状都能单测。
+//!
+//! 「自绘」不等于「自己重新设计」:厂商 logo 那种几百段贝塞尔的自由曲线,
+//! 走 [`svg_path`] 把原版那条 `d` 原样解析进来 —— 几何是官方的,渲染仍是自绘。
 //!
 //! # 宿主接线总表(mt-app 消费批照抄)
 //!
@@ -51,6 +55,7 @@
 pub mod brand;
 pub mod file;
 pub mod status;
+pub mod svg_path;
 pub mod tech;
 pub mod vector;
 
