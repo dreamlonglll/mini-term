@@ -600,9 +600,11 @@ pub fn open_settings(
         move |dialog, window, _cx| {
             // 原版 `w-[680px] max-h-[80vh]`(`SettingsModal.tsx:2099`)。两条都要
             // 按视口现算:`Dialog` 的宽是定值、位置按「视口中心 − 宽/2」推,
-            // 窗口比 680 窄时面板两侧一起出界(原版那边 flex-shrink 会把它压回来)
+            // 窗口比它窄时面板两侧一起出界(原版那边 flex-shrink 会把它压回来)。
+            // 宽度这条比原版更进一步:680 退居**下限**,常规取 60vw —— 这一页
+            // 是「窄侧栏 + 右侧一长串设置行」,定值宽在大屏上右列被挤成一小条
             let viewport = window.viewport_size();
-            let width = ui::clamp_dialog_width(px(680.0), viewport);
+            let width = ui::ratio_dialog_width(px(680.0), 0.6, viewport);
             // 原版没有 px 上限(只有 `max-h-[80vh]`),preferred 给视口高
             // 等于只按 80vh 钳 —— 面板总高与原版内容撑满时一致
             let body = ui::clamp_dialog_body_height(viewport.height, viewport, 0.8, px(HEADER_H));

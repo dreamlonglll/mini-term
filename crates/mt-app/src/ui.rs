@@ -655,6 +655,16 @@ pub fn clamp_dialog_width(preferred: Pixels, viewport: gpui::Size<Pixels>) -> Pi
     preferred.min(viewport.width)
 }
 
+/// 按视口比例取弹窗宽度,`min_width` 是**下限**(窗口小到 `ratio` 算不出这么宽时
+/// 仍按下限走),最后照例被 [`clamp_dialog_width`] 压回窗口内。
+///
+/// 设置面板这类内容密度高的弹窗用它:定值宽在 2K/4K 屏上只占一小条,右列控件挤
+/// 在一起而两侧全是空遮罩;跟着视口走能把这份空间还给内容,同时保住小窗口下的
+/// 可读宽度。
+pub fn ratio_dialog_width(min_width: Pixels, ratio: f32, viewport: gpui::Size<Pixels>) -> Pixels {
+    clamp_dialog_width((viewport.width * ratio).max(min_width), viewport)
+}
+
 /// 弹窗**正文**高度按视口钳制:`ratio` 是原版的 `max-h-[{ratio}vh]`,
 /// `preferred` 是本弹窗自己的舒适上限,`chrome` 是标题栏之类正文之外的固定占用。
 ///
@@ -1085,6 +1095,19 @@ mod tests {
         let narrow = gpui::size(px(600.0), px(900.0));
         assert_eq!(clamp_dialog_width(px(680.0), wide), px(680.0));
         assert_eq!(clamp_dialog_width(px(680.0), narrow), px(600.0));
+    }
+
+    /// 比例宽:大屏跟着 60vw 走,窗口小到算不出下限时按下限,再窄就压回窗口宽。
+    #[test]
+    fn 弹窗宽度按视口比例取值() {
+        let huge = gpui::size(px(2560.0), px(1440.0));
+        assert_eq!(ratio_dialog_width(px(680.0), 0.6, huge), px(1536.0));
+        // 1000*0.6 = 600 < 680 → 下限说了算
+        let mid = gpui::size(px(1000.0), px(900.0));
+        assert_eq!(ratio_dialog_width(px(680.0), 0.6, mid), px(680.0));
+        // 窗口比下限还窄 → 铺满窗口,不出界
+        let narrow = gpui::size(px(600.0), px(900.0));
+        assert_eq!(ratio_dialog_width(px(680.0), 0.6, narrow), px(600.0));
     }
 
     /// 弹窗正文高度:`min(80vh, 舒适上限) − 头部`,并留 120px 下限。
