@@ -78,6 +78,11 @@ mt-config = { path = "crates/mt-config" }
 # mt-ssh-mcp / mt-ssh-cli)与 mt-ssh 链接,加一层就把整套上层依赖拖进小二进制。
 mt-core = { path = "crates/mt-core" }
 mt-i18n = { path = "crates/mt-i18n" }
+# 界面布局持久化(layout.db)。从 config.json 里搬出来的理由见该 crate 的模块注释:
+# 布局是交互频次的数据,不该每改一次就把整份配置连同 .bak 重写一遍。
+# ⚠️ 只能由 mt-app 依赖 —— 它带 rusqlite,挂到 mt-config/mt-relay 上会把 sqlite
+# 拖进中转与 sidecar 的链路。
+mt-layout = { path = "crates/mt-layout" }
 mt-project = { path = "crates/mt-project" }
 mt-pty = { path = "crates/mt-pty" }
 mt-relay = { path = "crates/mt-relay" }

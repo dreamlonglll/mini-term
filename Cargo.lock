@@ -4260,6 +4260,7 @@ dependencies = [
  "mt-config",
  "mt-core",
  "mt-i18n",
+ "mt-layout",
  "mt-project",
  "mt-pty",
  "mt-relay",
@@ -4307,6 +4308,17 @@ name = "mt-i18n"
 version = "1.0.1-beta"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "mt-layout"
+version = "1.0.1-beta"
+dependencies = [
+ "anyhow",
+ "mt-config",
+ "rusqlite",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -89,9 +89,18 @@ pub struct AppConfig {
     /// (GPUI 侧换 `alacritty_terminal` 的 grid 后单行开销另算,但语义与上限含义不变。)
     #[serde(default = "default_terminal_scrollback")]
     pub terminal_scrollback: u32,
-    #[serde(default)]
+    // ─── 以下五个字段已搬进 `layout.db`(见 `mt-layout`)───────────────────
+    //
+    // **只读不写**:保留反序列化是为了给存量 `config.json` 做一次性迁移,
+    // 顺带让「装了新版又降级回旧版」的用户仍能开起来(布局停在迁移那一刻,
+    // 而不是整个丢失)。序列化一律 skip —— 磁盘归属已经换人,再写回去就成了
+    // 两个来源互相打架。观察一个版本后连字段一起删。
+    //
+    // 运行期这些字段仍是 `AppStore` 手上的**内存缓存**:启动时由 layout.db 的值
+    // 覆盖进来,各处 getter 照旧读它,只有落盘那一步改道。
+    #[serde(default, skip_serializing)]
     pub layout_sizes: Option<Vec<f64>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub middle_column_sizes: Option<Vec<f64>>,
     #[serde(default = "default_theme")]
     pub theme: String,
@@ -146,9 +155,11 @@ pub struct AppConfig {
     // NOTE: 曾有 projects_visible / sessions_visible / files_visible / git_visible
     // 四个面板显隐开关，界面上没有任何入口消费（已被 middle_column_visible 与右侧
     // 抽屉取代），随 UI 改版一并删除。旧 config.json 里残留的这些键会被 serde 忽略。
-    #[serde(default = "default_true")]
+    /// 已搬进 `layout.db`,只读不写(理由见 [`AppConfig::layout_sizes`] 上方那段)。
+    #[serde(default = "default_true", skip_serializing)]
     pub middle_column_visible: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// 已搬进 `layout.db`,只读不写。
+    #[serde(default, skip_serializing)]
     pub right_drawer_width: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_active_project_id: Option<String>,
@@ -382,7 +393,10 @@ pub struct ProjectConfig {
     /// 需求描述,显示在项目名后的灰色小字。`None` = 不显示。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    #[serde(default)]
+    /// 分屏树。**已搬进 `layout.db`,只读不写** —— 保留反序列化供一次性迁移
+    /// (理由见 [`AppConfig::layout_sizes`] 上方那段)。运行期仍作为内存缓存,
+    /// 由 `AppStore` 在启动时用 layout.db 的值填进来。
+    #[serde(default, skip_serializing)]
     pub saved_layout: Option<SavedProjectLayout>,
     #[serde(default)]
     pub expanded_dirs: Vec<String>,
@@ -621,6 +635,16 @@ fn default_shells() -> Vec<ShellConfig> {
     }]
 }
 
+/// 把一份 [`SavedProjectLayout`] 就地归一化(旧格式 `pane` → `panes`)。
+///
+/// 布局搬进 `layout.db` 后,读出来的那一刻同样要过这一遍 —— 迁移是逐字节搬
+/// JSON,旧形状会原样进库。归一化口径只有这一份,`mt-layout` 直接调它。
+pub fn normalize_saved_layout(layout: &mut SavedProjectLayout) {
+    for tab in layout.tabs.iter_mut() {
+        normalize_split_node(&mut tab.split_layout);
+    }
+}
+
 /// 将旧格式 `pane`（单个）迁移到新格式 `panes`（数组）
 fn normalize_split_node(node: &mut SavedSplitNode) {
     match node {
@@ -668,9 +692,7 @@ pub fn migrate_config(mut config: AppConfig) -> AppConfig {
     // 迁移 SavedSplitNode: pane → panes
     for project in config.projects.iter_mut() {
         if let Some(layout) = project.saved_layout.as_mut() {
-            for tab in layout.tabs.iter_mut() {
-                normalize_split_node(&mut tab.split_layout);
-            }
+            normalize_saved_layout(layout);
         }
     }
 
@@ -1134,6 +1156,88 @@ mod tests {
         assert!(config.project_tree.is_none());
         assert!(config.project_groups.is_none());
         assert!(config.project_ordering.is_none());
+    }
+
+    /// **布局字段只读不写**:磁盘归属已经换给 `layout.db`(见 `mt-layout`),
+    /// config.json 再写这些键就成了两个来源互相打架 —— 用户拖完分隔条、
+    /// 布局库写了新值,而后任意一次配置保存又会把旧值原样刷回去。
+    ///
+    /// 这一条钉的是决议本身,删字段那一版把整个测试一起删掉即可。
+    #[test]
+    fn 布局字段不再序列化() {
+        let mut config = AppConfig::default();
+        config.layout_sizes = Some(vec![20.0, 60.0, 20.0]);
+        config.middle_column_sizes = Some(vec![50.0, 50.0]);
+        config.middle_column_visible = false;
+        config.right_drawer_width = Some(400.0);
+        config.projects.push(ProjectConfig {
+            id: "p1".into(),
+            name: "proj".into(),
+            path: "/tmp".into(),
+            description: None,
+            saved_layout: Some(SavedProjectLayout {
+                tabs: vec![SavedTab {
+                    custom_title: None,
+                    split_layout: SavedSplitNode::Leaf {
+                        pane: None,
+                        panes: vec![SavedPane {
+                            shell_name: "cmd".into(),
+                            cwd: None,
+                            ai_session: None,
+                        }],
+                    },
+                }],
+                active_tab_index: 0,
+            }),
+            expanded_dirs: vec![],
+            ssh_mcp_enabled: false,
+            ssh_cli_token: None,
+            ssh_connection_ids: None,
+            env_vars: vec![],
+            wsl_sessions_distro: None,
+            ssh_connection_id: None,
+            parent_project_id: None,
+            kind_override: None,
+        });
+
+        let json = serde_json::to_string(&config).unwrap();
+        for key in [
+            "savedLayout",
+            "layoutSizes",
+            "middleColumnSizes",
+            "middleColumnVisible",
+            "rightDrawerWidth",
+        ] {
+            assert!(!json.contains(key), "{key} 不该再写进 config.json: {json}");
+        }
+    }
+
+    /// 反过来:存量 config.json 里的这些键仍要**读得进来** —— 那是一次性迁移
+    /// 进 `layout.db` 的唯一入口,读不出来存量用户的布局就直接蒸发了。
+    #[test]
+    fn 存量布局字段仍读得进来() {
+        let json = r#"{
+            "projects": [{
+                "id": "1", "name": "test", "path": "/tmp",
+                "savedLayout": {
+                    "tabs": [{"splitLayout": {"type": "leaf", "panes": [{"shellName": "cmd"}]}}],
+                    "activeTabIndex": 0
+                }
+            }],
+            "defaultShell": "cmd",
+            "availableShells": [{"name": "cmd", "command": "cmd"}],
+            "layoutSizes": [20, 60, 20],
+            "middleColumnSizes": [40, 60],
+            "middleColumnVisible": false,
+            "rightDrawerWidth": 400
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.layout_sizes, Some(vec![20.0, 60.0, 20.0]));
+        assert_eq!(config.middle_column_sizes, Some(vec![40.0, 60.0]));
+        assert!(!config.middle_column_visible);
+        assert_eq!(config.right_drawer_width, Some(400.0));
+        let layout = config.projects[0].saved_layout.as_ref().unwrap();
+        assert_eq!(layout.tabs.len(), 1);
     }
 
     #[test]

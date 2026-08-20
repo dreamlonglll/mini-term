@@ -58,7 +58,8 @@ node crates/mt-i18n/tools/gen_from_ts.mjs
 | `mt-pty` | PTY 生命周期（spawn/read/write/resize/kill）+ 便携 ConPTY 预载（`conpty.rs`，从 exe 旁 `portable-conpty/` LoadLibrary 预载） |
 | `mt-ai` | AI 感知：hook server（权威）、hook 注册（`hook_registry.rs`）、输入检测降级（`detect.rs`）、状态判定（`monitor.rs`/`perception.rs`）、会话记录读取（`sessions.rs`） |
 | `mt-project` | 文件树、目录监听、搜索、Git（git2，vendored-openssl 必须保留）、外部编辑器、WSL 发行版枚举 |
-| `mt-config` | 配置持久化与主题包。不依赖 gpui |
+| `mt-config` | 配置持久化(`config.json`)与主题包。不依赖 gpui。⚠️ **界面布局已不在这里**——见 `mt-layout` |
+| `mt-layout` | 界面布局持久化(`layout.db`,rusqlite):三栏比例 / 每项目分屏树 / 窗口几何。**只有 mt-app 依赖它**(它带 rusqlite,挂到下层会把 sqlite 拖进中转与 sidecar 链路);分屏树整棵存 JSON 不拆关系表,理由见模块注释 |
 | `mt-i18n` | 双语文案层。**字典源头是 `locales/*.ts`**（TS 对象字面量，随 Tauri 版下线迁入），`src/dict.rs` 由 `tools/gen_from_ts.mjs` 生成——**禁止手改 dict.rs**，改文案改 locales 后重跑生成器，`tests/consistency.rs` 的对账常量随之更新 |
 | `mt-relay` | 移动端中转桌面侧：出站 WSS 长连、配对、项目快照/增量、对话镜像（`mirror.rs`）、移动端指令写穿 |
 | `mt-ssh` | 共享 SSH 通信层（russh 持久会话池 + SFTP 原语），主程序与 sidecar 共用 |
@@ -70,6 +71,25 @@ node crates/mt-i18n/tools/gen_from_ts.mjs
 reader 线程读 PTY 字节直接喂 `mt-terminal` 的 VT 状态机，UI 按帧取 grid 渲染。
 原 Tauri 版的 16ms 批缓冲 / 有界 channel / 4MB-1MB 双水位背压 / 30s 超时兜底整套
 是为 WebView IPC 边界造的，已随架构作废；孤儿 PTY 回收同理（单进程无失引用链路）。
+
+### 布局持久化（`layout.db`，非 `config.json`）
+
+「启动时还原上次退出的样子」这一整块——三栏比例、中栏比例与显隐、右侧抽屉宽度、
+每个项目的分屏树（含 pane 的 shell / cwd / AI 会话身份）、窗口大小位置与最大化态
+——住在 `{active_data_dir}/layout.db`，由 `mt-layout` 读写。
+
+- **为什么搬出来**：布局是交互频次的数据，config.json 是月级的。此前拖一次分隔条
+  要把整份配置 `to_string_pretty` 重写 + 复制一份等大的 `.bak`（实测 64 KB 配置 →
+  一次拖拽约 128 KB 落盘）；现在是一行 upsert（实测同数据 layout.db 仅 4 KB）
+- **AppConfig 里那五个字段仍在，但 `skip_serializing`**：只读不写，留作一次性迁移
+  入口与「装了新版又降级」的兜底，观察一版后连字段删除。运行期它们是 `AppStore`
+  手上的**内存缓存**（启动时被 layout.db 的值覆盖），各处 getter 照旧读它
+- **迁移幂等靠 meta 标记**，不靠「库里有没有数据」：用户把终端关光后重启，库是空的
+  但迁移确实做过，按后者判会把旧布局从 config.json 里复活
+- **分屏树整棵存 JSON**（`project_layout.layout_json`），与旧 `savedLayout` 逐字段一致，
+  `mt-app::persist` 一行没动。不拆关系表的论证见 `mt-layout` 模块注释
+- 库损坏时挪成 `layout.db.corrupt` 并重建空库；开不起来则**本次布局只在内存里活着**，
+  界面照常用（与配置加载失败时的「只读模式」同一条红线）
 
 ### AI 状态判定（idle / ai-idle / ai-working）
 

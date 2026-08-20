@@ -130,6 +130,21 @@ pub struct AppStore {
     /// 写盘令牌(乐观并发);0 = 还没成功 load 过,此时一律不写盘。
     token: u64,
     config_store: Arc<ConfigStore>,
+    /// 界面布局的落盘口(`layout.db`)。`None` = 库开不起来(盘满 / 权限),
+    /// 此时布局**只在内存里活着**:界面照常用,退出即忘 —— 与配置加载失败时
+    /// 「只读模式」同一条红线,绝不因为存不下就不让用。
+    layout_store: Option<Arc<mt_layout::LayoutStore>>,
+    /// 窗口几何(退出时的大小/位置/最大化态)。config 里没有对应字段 ——
+    /// 这是 GPUI 版新补的能力,只住在 `layout.db` 与这里。
+    window_geometry: Option<mt_layout::WindowGeometry>,
+    /// 攒着待写的项目 id 与「全局项脏了」标记。防抖窗口内拖十次分隔条只落一次盘,
+    /// 且不同项目的改动互不覆盖。
+    layout_dirty_projects: HashSet<String>,
+    layout_globals_dirty: bool,
+    /// 布局防抖的代号,与 [`Self::save_generation`] 同一套路。
+    /// **单独一份**:布局与配置现在写去两个地方,共用代号会让其中一路饿死。
+    layout_save_generation: u64,
+    _layout_save_task: Option<Task<()>>,
 
     pub active_project_id: Option<String>,
     project_states: HashMap<String, ProjectState>,
@@ -194,11 +209,87 @@ pub struct AppStore {
     _save_task: Option<Task<()>>,
 }
 
+/// 开布局库,顺带跑一次「从 config.json 迁入」。
+///
+/// 返回 `None` 的三种情形都按同一档降级处理:**布局本次不落盘**,界面照常用。
+/// 其中迁移失败也返回 `None` 是刻意的 —— 此时 config.json 里的 `savedLayout`
+/// 还原封不动躺着(那些字段已改成只读不写),让本次继续走内存里那份、下次启动
+/// 重试迁移,比拿一份半截数据把用户的布局盖掉强。
+fn open_layout_store(config: &AppConfig, may_migrate: bool) -> Option<Arc<mt_layout::LayoutStore>> {
+    let dir = match mt_config::active_data_dir() {
+        Ok(dir) => dir,
+        Err(err) => {
+            eprintln!("[layout] 定位数据目录失败({err:#}),本次布局不落盘");
+            return None;
+        }
+    };
+    let store = match mt_layout::LayoutStore::open_at(&dir) {
+        Ok(store) => store,
+        Err(err) => {
+            eprintln!("[layout] 布局库打不开({err:#}),本次布局不落盘");
+            return None;
+        }
+    };
+    if may_migrate && store.needs_config_migration() {
+        match store.migrate_from_config(config) {
+            Ok(n) => eprintln!(
+                "[layout] 已从 config.json 迁入 {n} 个项目的布局 → {}",
+                store.path().display()
+            ),
+            Err(err) => {
+                eprintln!("[layout] 从 config.json 迁移失败({err:#}),本次布局不落盘");
+                return None;
+            }
+        }
+    }
+    Some(Arc::new(store))
+}
+
+/// 把库里的布局覆盖进 `config` 的对应字段(内存缓存),并清掉已删项目的残行。
+///
+/// 库里**没有**的全局项保持 config 里的值不动:`None` 的语义是「这个键没存过」,
+/// 不是「用户把它设成了默认值」。项目级则相反 —— 逐个赋值(含赋 `None`),
+/// 库才是唯一真相:用户把某项目的终端关光了,config.json 里的残留不该复活。
+///
+/// 返回窗口几何(config 里没有它的位置,由调用方单独接住)。
+fn apply_layout_db(
+    store: &mt_layout::LayoutStore,
+    config: &mut AppConfig,
+) -> Option<mt_layout::WindowGeometry> {
+    let globals = store.load_globals();
+    if globals.layout_sizes.is_some() {
+        config.layout_sizes = globals.layout_sizes;
+    }
+    if globals.middle_column_sizes.is_some() {
+        config.middle_column_sizes = globals.middle_column_sizes;
+    }
+    if let Some(visible) = globals.middle_column_visible {
+        config.middle_column_visible = visible;
+    }
+    if globals.right_drawer_width.is_some() {
+        config.right_drawer_width = globals.right_drawer_width;
+    }
+
+    let mut layouts = store.load_project_layouts();
+    for project in config.projects.iter_mut() {
+        project.saved_layout = layouts.remove(&project.id);
+    }
+    // 对一次账:删项目那条路径漏调也不会攒出无主行(项目 id 不复用)。
+    let live: HashSet<String> = config.projects.iter().map(|p| p.id.clone()).collect();
+    if let Err(err) = store.retain_projects(&live) {
+        eprintln!("[layout] 清理无主项目行失败: {err:#}");
+    }
+
+    // 明显不可用的几何(尺寸为 0、NaN、小得放不下内容)当没存过 —— 让开窗
+    // 那一步回落默认居中窗口,而不是开出一条缝。
+    globals.window.filter(|geo| geo.is_sane())
+}
+
 impl AppStore {
     /// 装配 store:加载配置 → 恢复各项目布局(不起 PTY,PTY 在首次显示时懒起)。
     pub fn new(config_store: Arc<ConfigStore>, ai: AiBridge, cx: &mut Context<Self>) -> Self {
         let _ = cx;
-        let (config, token) = match config_store.load() {
+        let (mut config, token) = match config_store.load() {
             Ok(loaded) => (loaded.config, loaded.token),
             Err(err) => {
                 // 加载失败**绝不**伪装成空配置:令牌留 0,后续所有保存都会被自己挡下,
@@ -207,6 +298,17 @@ impl AppStore {
                 (AppConfig::default(), 0)
             }
         };
+
+        // 布局库:开库 →(首次)从 config.json 灌一次 → 把库里的值覆盖回
+        // `config` 的对应字段。**覆盖这一步是整个改造的支点** —— 各处 getter
+        // 照旧读 `self.config.*`(它现在是内存缓存),只有落盘那一步改了道。
+        // 配置加载失败(token=0)时不迁移:那份 config 是空默认值,灌进去等于
+        // 拿一份伪造的空布局把用户真实的布局盖掉。
+        let layout_store = open_layout_store(&config, token != 0);
+        let window_geometry = layout_store
+            .as_ref()
+            .map(|store| apply_layout_db(store, &mut config))
+            .unwrap_or_default();
 
         let mut project_states = HashMap::new();
         let mut expanded_dirs = HashMap::new();
@@ -235,6 +337,12 @@ impl AppStore {
             config,
             token,
             config_store,
+            layout_store,
+            window_geometry,
+            layout_dirty_projects: HashSet::new(),
+            layout_globals_dirty: false,
+            layout_save_generation: 0,
+            _layout_save_task: None,
             active_project_id,
             project_states,
             terminals: HashMap::new(),
@@ -609,6 +717,10 @@ impl AppStore {
             self.active_project_id = self.config.projects.first().map(|p| p.id.clone());
             self.config.last_active_project_id = self.active_project_id.clone();
         }
+        // 它在布局库里的那一行一并删掉。`flush_layout_now` 查不到项目时按删行
+        // 处理,所以这里只要把 id 标脏即可(项目 id 不复用,不怕标错)。
+        self.layout_dirty_projects.insert(id.to_string());
+        self.schedule_layout_flush(cx);
         self.save_config_soon(cx);
         cx.notify();
     }
@@ -1115,7 +1227,7 @@ impl AppStore {
             layout.activate_pane(pane_id);
         }
         self.focus_pane(project_id, pane_id, window, cx);
-        self.save_layout_soon(project_id, cx);
+        self.save_project_layout_soon(project_id, cx);
     }
 
     /// 叶内环形切 tab(Ctrl+Tab / Ctrl+Shift+Tab)。只有一个 tab 时什么也不做。
@@ -1261,7 +1373,7 @@ impl AppStore {
             })
             .unwrap_or(false);
         if changed {
-            self.save_layout_soon(project_id, cx);
+            self.save_project_layout_soon(project_id, cx);
         }
     }
 
@@ -1382,7 +1494,7 @@ impl AppStore {
             // pane 才会正常进入 AI 会话状态。
             self.write_to_pane(project_id, &item.pane_id, &format!("{command}\r"), cx);
             if session_patch.is_some() {
-                self.save_layout_soon(project_id, cx);
+                self.save_project_layout_soon(project_id, cx);
             }
         }
         cx.notify();
@@ -1830,7 +1942,7 @@ impl AppStore {
                 }
                 // 会话身份随布局落盘 —— 重启后据此续接
                 if let Some(owner) = owner {
-                    self.save_layout_soon(&owner, cx);
+                    self.save_project_layout_soon(&owner, cx);
                     cx.notify();
                 }
                 // 分支自记账:这个 pane 是 fork 出来的话,新身份到手即落边。
@@ -2019,7 +2131,7 @@ impl AppStore {
             // 身份是自己写进去的,不是「待续接」——别让下次启动再敲一遍命令
             pane.resume_pending = false;
             pty_id = pane.pty_id;
-            self.save_layout_soon(project_id, cx);
+            self.save_project_layout_soon(project_id, cx);
             cx.notify();
         }
         // 与 hook 上报那条路同一个消费点(原版两条都走 `setPaneAiSessionByPty`)。
@@ -3011,7 +3123,7 @@ impl AppStore {
             return;
         }
         self.config.right_drawer_width = Some(width);
-        self.save_config_soon(cx);
+        self.save_layout_soon(cx);
     }
 
     // === 文件树展开状态 ===
@@ -3056,7 +3168,7 @@ impl AppStore {
             return;
         }
         self.config.layout_sizes = Some(sizes);
-        self.save_config_soon(cx);
+        self.save_layout_soon(cx);
     }
 
     pub fn set_middle_column_sizes(&mut self, sizes: Vec<f64>, cx: &mut Context<Self>) {
@@ -3064,12 +3176,12 @@ impl AppStore {
             return;
         }
         self.config.middle_column_sizes = Some(sizes);
-        self.save_config_soon(cx);
+        self.save_layout_soon(cx);
     }
 
     pub fn toggle_middle_column(&mut self, cx: &mut Context<Self>) {
         self.config.middle_column_visible = !self.config.middle_column_visible;
-        self.save_config_soon(cx);
+        self.save_layout_soon(cx);
         cx.notify();
     }
 
@@ -3095,7 +3207,7 @@ impl AppStore {
         // 关掉的 pane 一并撤出完成队列:否则未读计数会往一个已经不存在的 pane
         // 上跳,两张表也会随开关终端无界增长(旧版 setProjectLayout 的同一段)。
         self.done.retain_panes(&self.live_pane_ids());
-        self.save_layout_soon(project_id, cx);
+        self.save_project_layout_soon(project_id, cx);
         cx.notify();
     }
 
@@ -3119,7 +3231,14 @@ impl AppStore {
         out
     }
 
-    fn save_layout_soon(&mut self, project_id: &str, cx: &mut Context<Self>) {
+    // ─── 布局落盘(layout.db)────────────────────────────────────────────
+    //
+    // 与配置分家的理由见 `mt-layout` 的模块注释:布局是交互频次的数据,不该
+    // 每改一次就把整份 config.json 连同 .bak 重写一遍。这里只保留防抖 ——
+    // 一次 upsert 便宜,但拖分隔条期间每帧一次仍是浪费。
+
+    /// 把某个项目当前的树序列化进内存缓存,并排上落盘。
+    fn save_project_layout_soon(&mut self, project_id: &str, cx: &mut Context<Self>) {
         let saved = self
             .project_states
             .get(project_id)
@@ -3133,7 +3252,97 @@ impl AppStore {
         {
             project.saved_layout = Some(saved);
         }
-        self.save_config_soon(cx);
+        self.layout_dirty_projects.insert(project_id.to_string());
+        self.schedule_layout_flush(cx);
+    }
+
+    /// 全局布局项(三栏比例 / 中栏比例 / 中栏显隐 / 抽屉宽度 / 窗口几何)脏了。
+    fn save_layout_soon(&mut self, cx: &mut Context<Self>) {
+        self.layout_globals_dirty = true;
+        self.schedule_layout_flush(cx);
+    }
+
+    /// 防抖 300ms。比配置那条(500ms)短:单行 upsert 的代价远低于整份
+    /// config.json 重写,没必要为攒批多等。
+    fn schedule_layout_flush(&mut self, cx: &mut Context<Self>) {
+        self.layout_save_generation += 1;
+        let generation = self.layout_save_generation;
+        self._layout_save_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(300))
+                .await;
+            let _ = this.update(cx, |store, _cx| {
+                if store.layout_save_generation == generation {
+                    store.flush_layout_now();
+                }
+            });
+        }));
+    }
+
+    /// 立即把攒下的布局写进 `layout.db`(退出前 / 防抖到点)。
+    ///
+    /// 库开不起来时是 no-op —— 脏标记照样清掉,免得每次退出都重试一遍必然失败的
+    /// 写入、把日志刷满。
+    pub fn flush_layout_now(&mut self) {
+        let dirty_projects = std::mem::take(&mut self.layout_dirty_projects);
+        let globals_dirty = std::mem::take(&mut self.layout_globals_dirty);
+        let Some(store) = self.layout_store.clone() else {
+            return;
+        };
+
+        if globals_dirty {
+            let globals = mt_layout::GlobalLayout {
+                layout_sizes: self.config.layout_sizes.clone(),
+                middle_column_sizes: self.config.middle_column_sizes.clone(),
+                middle_column_visible: Some(self.config.middle_column_visible),
+                right_drawer_width: self.config.right_drawer_width,
+                window: self.window_geometry,
+            };
+            if let Err(err) = store.save_globals(&globals) {
+                eprintln!("[layout] 全局布局写盘失败: {err:#}");
+            }
+        }
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        for project_id in dirty_projects {
+            // 项目在防抖窗口里被删掉了 → 删行(它的树已经不在 config 里了)
+            let Some(project) = self.config.projects.iter().find(|p| p.id == project_id) else {
+                if let Err(err) = store.delete_project_layout(&project_id) {
+                    eprintln!("[layout] 删除项目 {project_id} 的布局失败: {err:#}");
+                }
+                continue;
+            };
+            let result = match project.saved_layout.as_ref() {
+                Some(layout) => store.save_project_layout(&project_id, layout, now_ms),
+                None => store.delete_project_layout(&project_id),
+            };
+            if let Err(err) = result {
+                eprintln!("[layout] 项目 {project_id} 的布局写盘失败: {err:#}");
+            }
+        }
+    }
+
+    /// 窗口几何(退出时的样子)。`None` = 没存过 / 存的值不可用,由开窗那一步
+    /// 回落默认居中窗口。
+    pub fn window_geometry(&self) -> Option<mt_layout::WindowGeometry> {
+        self.window_geometry
+    }
+
+    /// 窗口被拖动 / 缩放 / 最大化后记一笔。值没变就不排落盘 ——
+    /// gpui 的 bounds 观察者在拖动期间是每帧回调的。
+    pub fn set_window_geometry(
+        &mut self,
+        geometry: mt_layout::WindowGeometry,
+        cx: &mut Context<Self>,
+    ) {
+        if !geometry.is_sane() || self.window_geometry == Some(geometry) {
+            return;
+        }
+        self.window_geometry = Some(geometry);
+        self.save_layout_soon(cx);
     }
 
     /// 防抖写盘(500ms,与旧版 `saveLayoutToConfig` 同节奏)。
@@ -3157,7 +3366,11 @@ impl AppStore {
     /// 令牌语义与装机版一致:令牌过期说明别处写过配置,必须先重读拿到新令牌。
     /// 单进程壳里「别处」只可能是本进程的另一次 load,手上这份就是最新的,
     /// 于是重读一次令牌后原样重写。
+    ///
+    /// 顺手把布局也刷下去:两条落盘路径分家后,退出钩子只调这一个入口 ——
+    /// 让它把两边都收干净,比要求每个调用点记得调两次可靠。
     pub fn save_config_now(&mut self) {
+        self.flush_layout_now();
         if self.token == 0 {
             return; // 配置没加载成功过,不许写盘覆盖磁盘
         }

@@ -111,7 +111,7 @@ use gpui::{
     AnimationExt as _, App, AppContext, Application, Bounds, Context, Entity, InteractiveElement,
     IntoElement, ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled,
     Subscription, Task, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div,
-    prelude::FluentBuilder, px, size,
+    point, prelude::FluentBuilder, px, size,
 };
 // img 的 `object_fit` 是 StyledImage 的方法(毛玻璃背板那两处在用)
 use gpui::StyledImage as _;
@@ -278,6 +278,52 @@ struct DrawerDrag {
     width: f64,
 }
 
+/// 上次退出时的窗口几何 → 本次开窗参数。
+///
+/// 存过的框必须**与某块屏幕有交集**才用:外接显示器拔掉后原样还原,窗口会开在
+/// 一个看不见的坐标上,用户只能靠任务栏右键「移动」把它捞回来。用交集而不是
+/// 「原点落在屏内」判 —— 窗口探出屏幕一半是用户自己拖的,不该被"纠正"。
+///
+/// GPUI 版此前每次都是写死的居中 1280×800(Tauri 版靠 `tauri-plugin-window-state`
+/// 存 `.window-state.json`,迁移时丢了这块;那个文件的格式与本库不兼容,不迁)。
+fn restore_window_bounds(saved: Option<mt_layout::WindowGeometry>, cx: &App) -> WindowBounds {
+    let default_bounds =
+        || WindowBounds::Windowed(Bounds::centered(None, size(px(1280.0), px(800.0)), cx));
+    let Some(geo) = saved else {
+        return default_bounds();
+    };
+    let bounds = Bounds {
+        origin: point(px(geo.x as f32), px(geo.y as f32)),
+        size: size(px(geo.width as f32), px(geo.height as f32)),
+    };
+    if !cx.displays().iter().any(|d| d.bounds().intersects(&bounds)) {
+        return default_bounds();
+    }
+    match geo.mode {
+        mt_layout::WindowMode::Windowed => WindowBounds::Windowed(bounds),
+        mt_layout::WindowMode::Maximized => WindowBounds::Maximized(bounds),
+        mt_layout::WindowMode::Fullscreen => WindowBounds::Fullscreen(bounds),
+    }
+}
+
+/// 当前窗口几何(供落盘)。取 `window_bounds()` 而不是 `bounds()` —— 前者在
+/// 最大化/全屏时给的是**还原尺寸**,正是下次开窗该用的那个值(gpui 对这个方法的
+/// 原注释就是 "how a window should be opened after it has been closed")。
+fn current_window_geometry(window: &Window) -> mt_layout::WindowGeometry {
+    let (mode, bounds) = match window.window_bounds() {
+        WindowBounds::Windowed(b) => (mt_layout::WindowMode::Windowed, b),
+        WindowBounds::Maximized(b) => (mt_layout::WindowMode::Maximized, b),
+        WindowBounds::Fullscreen(b) => (mt_layout::WindowMode::Fullscreen, b),
+    };
+    mt_layout::WindowGeometry {
+        mode,
+        x: bounds.origin.x.to_f64(),
+        y: bounds.origin.y.to_f64(),
+        width: bounds.size.width.to_f64(),
+        height: bounds.size.height.to_f64(),
+    }
+}
+
 struct Workspace {
     store: Entity<AppStore>,
     /// 右键菜单浮层。状态住在全局(任何视图都能 `menu::show`),这里只是把它
@@ -329,6 +375,8 @@ struct Workspace {
     _relay: Entity<mobile_relay::RelayBridge>,
     _tray_pump: Task<()>,
     _activation: Subscription,
+    /// 窗口大小/位置的观察者 —— 拖动缩放期间每帧回调,由 store 那边的防抖收口。
+    _window_bounds: Subscription,
 }
 
 impl Workspace {
@@ -371,6 +419,14 @@ impl Workspace {
             if active && motion::refresh() {
                 cx.refresh_windows();
             }
+        });
+
+        // 窗口大小/位置/最大化态 → layout.db。这个回调在拖动缩放期间每帧都来,
+        // 值没变直接被 `set_window_geometry` 挡掉,变了也只是标脏 + 300ms 防抖。
+        let store_for_bounds = store.clone();
+        let window_bounds = cx.observe_window_bounds(window, move |_, window, cx| {
+            let geometry = current_window_geometry(window);
+            store_for_bounds.update(cx, |store, cx| store.set_window_geometry(geometry, cx));
         });
 
         // AI 状态泵:后台线程(hook server / 500ms 轮询)→ channel → 这里改 store。
@@ -473,6 +529,7 @@ impl Workspace {
             _relay: relay,
             _tray_pump: tray_pump,
             _activation: activation,
+            _window_bounds: window_bounds,
         };
         // 开机第一帧就把灯点上:观察者只在 store **变化**时才响,而恢复出来的
         // 布局里本来就可能有跑着的 AI 会话。
@@ -1729,10 +1786,12 @@ fn main() {
         })
         .detach();
 
-        let bounds = Bounds::centered(None, size(px(1280.0), px(800.0)), cx);
+        // 上次退出时的窗口大小/位置/最大化态(存在 layout.db)。没存过 / 存的框
+        // 已经不在任何一块屏幕上 → 回落默认居中 1280×800。
+        let window_bounds = restore_window_bounds(store.read(cx).window_geometry(), cx);
         let window = cx.open_window(
             WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_bounds: Some(window_bounds),
                 titlebar: Some(TitlebarOptions {
                     // 与装机版一致(`App.tsx` 的 `setTitle(\`Mini-Term v${ver}\`)`)——
                     // 窗口虽已无边框,任务栏悬停预览与 Alt+Tab 仍读这个标题
