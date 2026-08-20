@@ -330,7 +330,15 @@ enum MdSegment {
     Table(MdTable),
 }
 
-/// 把 markdown 源按 GFM 表格块切段。围栏代码块(``` / ~~~)内的竖线不算表格。
+/// 把 markdown 源切成**块级**段:GFM 表格独立成段,其余文本按空行拆块
+/// (围栏代码块 ``` / ~~~ 内的空行与竖线都不拆)。
+///
+/// 逐块喂 TextView 而不是整篇 —— 除了表格要自绘,还有一条硬理由:
+/// gpui-component 0.5.1 的非虚拟化路径把 `is_last: true` 原样传给 Root 的
+/// **每个**子块(`node.rs:1150-1156`,ListState 路径才逐块算),而
+/// `is_last → paragraph_gap = 0`,整篇喂进去相邻段落会贴死(用户对照原版
+/// 实测)。块间距改由 [`block_top_margin`] 自己控,顺带复刻原版「标题前
+/// 间距更大」的非对称节奏(`.md-preview h* { margin-top: 1.4em }`)。
 fn split_md_tables(source: &str) -> Vec<MdSegment> {
     let lines: Vec<&str> = source.lines().collect();
     let mut segs = Vec::new();
@@ -344,17 +352,25 @@ fn split_md_tables(source: &str) -> Vec<MdSegment> {
             i += 1;
             continue;
         }
-        if !in_fence
-            && lines[i].contains('|')
+        if in_fence {
+            i += 1;
+            continue;
+        }
+        // 空行 = 块边界(围栏外)
+        if lines[i].trim().is_empty() {
+            push_text_block(&lines[text_start..i], &mut segs);
+            text_start = i + 1;
+            i += 1;
+            continue;
+        }
+        if lines[i].contains('|')
             && i + 1 < lines.len()
             && let Some(aligns) = parse_separator(lines[i + 1])
         {
             let header = split_cells(lines[i]);
             // GFM 规则:分隔行列数与表头一致才成表
             if !header.is_empty() && header.len() == aligns.len() {
-                if text_start < i {
-                    segs.push(MdSegment::Text(lines[text_start..i].join("\n")));
-                }
+                push_text_block(&lines[text_start..i], &mut segs);
                 let mut rows = Vec::new();
                 let mut j = i + 2;
                 while j < lines.len() && lines[j].contains('|') && !lines[j].trim().is_empty() {
@@ -371,10 +387,38 @@ fn split_md_tables(source: &str) -> Vec<MdSegment> {
         }
         i += 1;
     }
-    if text_start < lines.len() {
-        segs.push(MdSegment::Text(lines[text_start..].join("\n")));
-    }
+    push_text_block(&lines[text_start..], &mut segs);
     segs
+}
+
+/// 非空才算一块(连续空行 / 段与表格间的空隙都会产生空切片)。
+fn push_text_block(lines: &[&str], segs: &mut Vec<MdSegment>) {
+    if lines.iter().any(|l| !l.trim().is_empty()) {
+        segs.push(MdSegment::Text(lines.join("\n")));
+    }
+}
+
+/// 块顶间距:对照 `.md-preview` 的纵向节奏 —— 段落间 `p { margin: 0.8em }`
+/// (相邻外边距在 CSS 里折叠,取 0.8em ≈ 11px);标题前 `margin-top: 1.4em`
+/// (≈20px,原版按标题自身字号算,这里取 h2/h3 档的近似);表格 `margin: 1em`
+/// (≈13px)。首块为 0,标题后的间距由**下一块**的 11px 承担(原版 0.6em≈10px)。
+fn block_top_margin(ix: usize, seg: &MdSegment) -> f32 {
+    if ix == 0 {
+        return 0.0;
+    }
+    match seg {
+        MdSegment::Table(_) => 13.0,
+        MdSegment::Text(text) => {
+            let first = text.trim_start();
+            // `#`~`######` + 空格才是标题(# 后无空格在 CommonMark 里不算)
+            let hashes = first.chars().take_while(|c| *c == '#').count();
+            if (1..=6).contains(&hashes) && first[hashes..].starts_with(' ') {
+                20.0
+            } else {
+                11.0
+            }
+        }
+    }
 }
 
 /// 拆一行表格的格子:剥外侧竖线;反引号 code span 里的 `|` 不拆
@@ -526,8 +570,7 @@ fn render_md_table(
     }
     div()
         .w_full()
-        // margin 1em 0,em = 表格自身字号 0.92 × 14
-        .my(ui::font_px(12.9))
+        // 上下外边距不在这里:块间距统一由 render_markdown 的 block_top_margin 给
         .text_size(ui::font_px(12.9))
         .border_1()
         .border_color(ui::border_default())
@@ -1299,7 +1342,9 @@ impl FileViewer {
             highlight_theme: cx.theme().highlight_theme.clone(),
             is_dark: cx.theme().mode.is_dark(),
             heading_base_font_size: ui::font_px(14.0),
-            paragraph_gap: gpui::rems(0.7),
+            // 段间距曾按原版 p margin 0.8em 压到 0.7rem,用户体感偏密 ——
+            // 回到组件默认 1rem(16px,也接近原版 ul 的浏览器默认 margin 档)
+            paragraph_gap: gpui::rems(1.0),
             code_block,
             ..Default::default()
         }
@@ -1318,34 +1363,39 @@ impl FileViewer {
             .overflow_y_scroll()
             .p(px(24.0))
             .text_size(ui::font_px(14.0))
-            .line_height(gpui::relative(1.7))
+            // 原版 .md-preview 是 1.7;数值对齐后用户仍觉得密(体感口径),
+            // 放宽到 1.85 —— 表格格子行高同源跟随
+            .line_height(gpui::relative(1.85))
             .child(
                 div().max_w(px(860.0)).mx_auto().w_full().children(
                     segments
                         .into_iter()
                         .enumerate()
-                        .filter_map(|(ix, seg)| match seg {
-                            MdSegment::Text(text) => {
-                                if text.trim().is_empty() {
-                                    return None;
-                                }
-                                Some(
-                                    TextView::markdown(
-                                        gpui::SharedString::from(format!(
-                                            "file-viewer-md-body-{ix}"
-                                        )),
-                                        text,
-                                        window,
-                                        cx,
-                                    )
-                                    .style(style.clone())
-                                    .selectable(true)
-                                    .into_any_element(),
+                        .map(|(ix, seg)| {
+                            // 块间距按原版纵向节奏由这里统一给(em 基准,随
+                            // uiFontSize 缩放),TextView 内部的 paragraph_gap
+                            // 在非虚拟化路径上是坏的(见 split_md_tables 注释)
+                            let mt = block_top_margin(ix, &seg);
+                            let content = match seg {
+                                MdSegment::Text(text) => TextView::markdown(
+                                    gpui::SharedString::from(format!(
+                                        "file-viewer-md-body-{ix}"
+                                    )),
+                                    text,
+                                    window,
+                                    cx,
                                 )
-                            }
-                            MdSegment::Table(table) => {
-                                Some(render_md_table(ix, &table, &style, window, cx))
-                            }
+                                .style(style.clone())
+                                .selectable(true)
+                                .into_any_element(),
+                                MdSegment::Table(table) => {
+                                    render_md_table(ix, &table, &style, window, cx)
+                                }
+                            };
+                            div()
+                                .when(mt > 0.0, |el| el.mt(ui::font_px(mt)))
+                                .child(content)
+                                .into_any_element()
                         })
                         .collect::<Vec<_>>(),
                 ),
@@ -1552,6 +1602,33 @@ mod tests {
             panic!()
         };
         assert_eq!(t.rows[0], vec!["仅一格", ""]);
+    }
+
+    #[test]
+    fn 分段_空行拆块_围栏内空行不拆_块距节奏() {
+        // 空行是块边界:三段文本 + 一个标题 = 四块
+        let segs = split_md_tables("段落一\n\n段落二\n\n### 标题\n\n段落三");
+        assert_eq!(segs.len(), 4, "{segs:?}");
+        // 块距:首块 0、普通块 11、标题块 20(原版 margin-top 1.4em 的近似)
+        assert_eq!(block_top_margin(0, &segs[0]), 0.0);
+        assert_eq!(block_top_margin(1, &segs[1]), 11.0);
+        assert_eq!(block_top_margin(2, &segs[2]), 20.0);
+
+        // 围栏代码块里的空行不拆块
+        let segs = split_md_tables("```\naaa\n\nbbb\n```");
+        assert_eq!(segs.len(), 1, "{segs:?}");
+
+        // `#` 后没空格不算标题;表格块 13(原版 table margin 1em)
+        assert_eq!(
+            block_top_margin(1, &MdSegment::Text("#hash 不是标题".into())),
+            11.0
+        );
+        let t = MdSegment::Table(MdTable {
+            header: vec![],
+            aligns: vec![],
+            rows: vec![],
+        });
+        assert_eq!(block_top_margin(3, &t), 13.0);
     }
 
     #[test]
