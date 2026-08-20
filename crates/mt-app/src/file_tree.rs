@@ -406,6 +406,14 @@ impl FileTree {
                         eprintln!("[files] 列目录失败: {err:#}");
                         if is_root {
                             tree.root_error = Some(format!("{err:#}"));
+                        } else {
+                            // 子目录列失败也要在 `entries` 里留下这一条(空的)——
+                            // 展开态补列(`missing_expanded_dirs`)的判据就是
+                            // 「`entries` 里有没有这一项」,不落这条的话
+                            // render → 补列 → 失败 → notify → render 会绕成死循环。
+                            // `or_default` 不动已有内容:刷新失败时旧内容照旧留着,
+                            // 与根目录那条「有旧内容就静默保留」同一口径
+                            tree.entries.entry(dir).or_default();
                         }
                     }
                 }
@@ -656,6 +664,38 @@ impl FileTree {
             if expanded {
                 self.rows(project_id, root, &entry.path, depth + 1, cx, out);
             }
+        }
+    }
+}
+
+/// 「展开着、却一份内容都没列过」的目录 —— 要补列的那些。
+///
+/// 展开状态存在 [`AppStore`] 里并**落盘**(`ProjectConfig::expanded_dirs`),
+/// 而 [`FileTree::entries`] 是纯内存缓存,[`FileTree::sync_project`] 换项目时整表清掉、
+/// 只重列根目录(面板重建、冷启动同理)。两者一留一清,回到该项目时目录行还是
+/// 展开态(`▾`),但 [`FileTree::rows`] 在 `entries` 里查不到内容 → 那一层一行不画,
+/// 就成了「展开着,里头空的」。补列把两边接回去。
+///
+/// 只顺着**祖先全已列出**的那条链往下走:陈旧的深层展开记录(祖先早折叠了的)
+/// 翻不到,不会白列一趟 —— 远程项目一次列目录是一趟 SFTP 往返,这笔不是小钱。
+/// 一轮只补一层,列回来 notify 触发下一帧再补下一层,逐层收敛。
+fn missing_expanded_dirs(
+    entries: &HashMap<PathBuf, Vec<FileEntry>>,
+    dir: &Path,
+    is_expanded: &dyn Fn(&Path) -> bool,
+    out: &mut Vec<PathBuf>,
+) {
+    let Some(rows) = entries.get(dir) else {
+        return;
+    };
+    for entry in rows {
+        if !entry.is_dir || !is_expanded(&entry.path) {
+            continue;
+        }
+        if entries.contains_key(&entry.path) {
+            missing_expanded_dirs(entries, &entry.path, is_expanded, out);
+        } else {
+            out.push(entry.path.clone());
         }
     }
 }
@@ -1283,6 +1323,24 @@ impl Render for FileTree {
                 .bg(ui::bg_surface())
                 .child(header);
         };
+
+        // 展开态与 `entries` 缓存的对账:展开着却没列过的目录在这儿补列回来
+        // (换项目/面板重建/冷启动都会把缓存清掉,展开状态却是落盘的)。
+        // `load_dir` 自带「同目录不重复排队」的闸门 —— 排队的那几帧重复走到这儿
+        // 只多查一次 HashSet
+        {
+            let mut missing = Vec::new();
+            {
+                let store = self.store.read(cx);
+                let is_expanded = |path: &Path| {
+                    store.is_dir_expanded(&project_id, path.to_string_lossy().as_ref())
+                };
+                missing_expanded_dirs(&self.entries, &root, &is_expanded, &mut missing);
+            }
+            for dir in missing {
+                self.load_dir(root.clone(), dir, cx);
+            }
+        }
 
         let mut rows = Vec::new();
         self.rows(&project_id, &root, &root, 0, cx, &mut rows);
@@ -1929,6 +1987,108 @@ mod tests {
         assert_eq!(chain.len(), MAX_CHAIN);
         assert_eq!(entry.name, "d0/d1/d2/d3/d4/d5/d6/d7");
         assert_eq!(entry.path, PathBuf::from("/p/d7"));
+    }
+
+    // ─── 展开态与缓存的对账 ───────────────────────────────────
+
+    /// `entries` 缓存表:`目录 → 子项`。
+    fn listed(table: Vec<(&'static str, Vec<FileEntry>)>) -> HashMap<PathBuf, Vec<FileEntry>> {
+        table
+            .into_iter()
+            .map(|(k, v)| (PathBuf::from(k), v))
+            .collect()
+    }
+
+    fn expanded_set(paths: &'static [&'static str]) -> impl Fn(&Path) -> bool {
+        let set: HashSet<PathBuf> = paths.iter().map(PathBuf::from).collect();
+        move |p: &Path| set.contains(p)
+    }
+
+    /// 换项目回来的那一刻:只有根列过,展开着的一级目录全要补列。
+    #[test]
+    fn 展开却没列过的目录要补列() {
+        let entries = listed(vec![(
+            "/p",
+            vec![
+                entry("src", "/p/src", true, false),
+                entry("docs", "/p/docs", true, false),
+                entry("readme.md", "/p/readme.md", false, false),
+            ],
+        )]);
+        let mut out = Vec::new();
+        missing_expanded_dirs(
+            &entries,
+            Path::new("/p"),
+            &expanded_set(&["/p/src"]),
+            &mut out,
+        );
+        // 折叠的 docs 与文件 readme.md 都不掺和
+        assert_eq!(out, vec![PathBuf::from("/p/src")]);
+    }
+
+    /// 已列过的目录不重复排队,但要**顺着它往下**继续对账。
+    #[test]
+    fn 已列过的目录只往下走() {
+        let entries = listed(vec![
+            ("/p", vec![entry("src", "/p/src", true, false)]),
+            ("/p/src", vec![entry("core", "/p/src/core", true, false)]),
+        ]);
+        let mut out = Vec::new();
+        missing_expanded_dirs(
+            &entries,
+            Path::new("/p"),
+            &expanded_set(&["/p/src", "/p/src/core"]),
+            &mut out,
+        );
+        assert_eq!(out, vec![PathBuf::from("/p/src/core")]);
+    }
+
+    /// 一轮只补**下一层**:祖先自己都还没列回来时,深层那条陈旧展开记录翻不到 ——
+    /// 远程一次列目录是一趟 SFTP 往返,不能按 `expandedDirs` 整份去列。
+    #[test]
+    fn 祖先没列出来时不越级补列() {
+        let entries = listed(vec![("/p", vec![entry("src", "/p/src", true, false)])]);
+        let mut out = Vec::new();
+        missing_expanded_dirs(
+            &entries,
+            Path::new("/p"),
+            // /p/src/core 也是展开的,但 /p/src 这一层还没内容,够不着
+            &expanded_set(&["/p/src", "/p/src/core"]),
+            &mut out,
+        );
+        assert_eq!(out, vec![PathBuf::from("/p/src")]);
+    }
+
+    /// 列失败时那条空记录(见 `load_dir_with` 的 Err 分支)让补列就此打住 ——
+    /// 否则 render → 补列 → 失败 → notify → render 会绕成死循环。
+    #[test]
+    fn 列过的空目录不再重排() {
+        let entries = listed(vec![
+            ("/p", vec![entry("src", "/p/src", true, false)]),
+            ("/p/src", Vec::new()),
+        ]);
+        let mut out = Vec::new();
+        missing_expanded_dirs(
+            &entries,
+            Path::new("/p"),
+            &expanded_set(&["/p/src"]),
+            &mut out,
+        );
+        assert!(out.is_empty());
+    }
+
+    /// 根目录自己都还没列出来(冷启动第一帧)时一条都不补:根那趟由
+    /// `sync_project` / `refresh_root` 显式排,补列不插手。
+    #[test]
+    fn 根没列出来时什么都不补() {
+        let mut out = Vec::new();
+        missing_expanded_dirs(
+            &HashMap::new(),
+            Path::new("/p"),
+            &expanded_set(&["/p/src"]),
+            &mut out,
+        );
+        assert!(out.is_empty());
     }
 
     /// 优先级表逐条(`PRIORITY = {C:6, D:5, M:4, A:3, R:2, '?':1}`)。
