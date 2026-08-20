@@ -7,6 +7,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -89,9 +90,18 @@ pub struct AppConfig {
     /// (GPUI 侧换 `alacritty_terminal` 的 grid 后单行开销另算,但语义与上限含义不变。)
     #[serde(default = "default_terminal_scrollback")]
     pub terminal_scrollback: u32,
-    #[serde(default)]
+    // ─── 以下五个字段已搬进 `layout.db`(见 `mt-layout`)───────────────────
+    //
+    // **只读不写**:保留反序列化是为了给存量 `config.json` 做一次性迁移,
+    // 顺带让「装了新版又降级回旧版」的用户仍能开起来(布局停在迁移那一刻,
+    // 而不是整个丢失)。序列化一律 skip —— 磁盘归属已经换人,再写回去就成了
+    // 两个来源互相打架。观察一个版本后连字段一起删。
+    //
+    // 运行期这些字段仍是 `AppStore` 手上的**内存缓存**:启动时由 layout.db 的值
+    // 覆盖进来,各处 getter 照旧读它,只有落盘那一步改道。
+    #[serde(default, skip_serializing)]
     pub layout_sizes: Option<Vec<f64>>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub middle_column_sizes: Option<Vec<f64>>,
     #[serde(default = "default_theme")]
     pub theme: String,
@@ -146,9 +156,11 @@ pub struct AppConfig {
     // NOTE: 曾有 projects_visible / sessions_visible / files_visible / git_visible
     // 四个面板显隐开关，界面上没有任何入口消费（已被 middle_column_visible 与右侧
     // 抽屉取代），随 UI 改版一并删除。旧 config.json 里残留的这些键会被 serde 忽略。
-    #[serde(default = "default_true")]
+    /// 已搬进 `layout.db`,只读不写(理由见 [`AppConfig::layout_sizes`] 上方那段)。
+    #[serde(default = "default_true", skip_serializing)]
     pub middle_column_visible: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// 已搬进 `layout.db`,只读不写。
+    #[serde(default, skip_serializing)]
     pub right_drawer_width: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_active_project_id: Option<String>,
@@ -382,7 +394,10 @@ pub struct ProjectConfig {
     /// 需求描述,显示在项目名后的灰色小字。`None` = 不显示。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    #[serde(default)]
+    /// 分屏树。**已搬进 `layout.db`,只读不写** —— 保留反序列化供一次性迁移
+    /// (理由见 [`AppConfig::layout_sizes`] 上方那段)。运行期仍作为内存缓存,
+    /// 由 `AppStore` 在启动时用 layout.db 的值填进来。
+    #[serde(default, skip_serializing)]
     pub saved_layout: Option<SavedProjectLayout>,
     #[serde(default)]
     pub expanded_dirs: Vec<String>,
@@ -621,6 +636,16 @@ fn default_shells() -> Vec<ShellConfig> {
     }]
 }
 
+/// 把一份 [`SavedProjectLayout`] 就地归一化(旧格式 `pane` → `panes`)。
+///
+/// 布局搬进 `layout.db` 后,读出来的那一刻同样要过这一遍 —— 迁移是逐字节搬
+/// JSON,旧形状会原样进库。归一化口径只有这一份,`mt-layout` 直接调它。
+pub fn normalize_saved_layout(layout: &mut SavedProjectLayout) {
+    for tab in layout.tabs.iter_mut() {
+        normalize_split_node(&mut tab.split_layout);
+    }
+}
+
 /// 将旧格式 `pane`（单个）迁移到新格式 `panes`（数组）
 fn normalize_split_node(node: &mut SavedSplitNode) {
     match node {
@@ -668,9 +693,7 @@ pub fn migrate_config(mut config: AppConfig) -> AppConfig {
     // 迁移 SavedSplitNode: pane → panes
     for project in config.projects.iter_mut() {
         if let Some(layout) = project.saved_layout.as_mut() {
-            for tab in layout.tabs.iter_mut() {
-                normalize_split_node(&mut tab.split_layout);
-            }
+            normalize_saved_layout(layout);
         }
     }
 
@@ -743,11 +766,10 @@ pub fn read_config_from(path: &Path) -> Result<Option<AppConfig>> {
     }
 }
 
-/// save 前是否把现有主文件留作 .bak:仅内容仍可解析时才值得备份,
-/// 损坏的主文件绝不覆盖仍有抢救价值的上一代备份。
-fn should_backup(existing: Option<&str>) -> bool {
-    existing.is_some_and(|c| serde_json::from_str::<AppConfig>(c).is_ok())
-}
+// NOTE: 这里曾有 `should_backup` ——「覆写 config.json 前是否留一代 .bak」的判据。
+// 配置本体搬进 `config.db` 后,写 config.json 的只剩派生的 SSH 投影(丢了从库里
+// 随时再生),备份改由 `ConfigDb::backup_to` 在每次 load 后做一代。存量用户那份
+// 完整的旧配置另存为 `config.json.pre-sqlite`,不参与轮换。
 
 /// 一次成功加载的产物:配置 + 本次写盘令牌。
 #[derive(Debug, Clone, Serialize)]
@@ -769,6 +791,8 @@ pub enum SaveError {
     Serialize(serde_json::Error),
     /// 写盘失败(盘满 / 权限 / 杀软锁文件)。
     Io(std::io::Error),
+    /// 配置库写入失败(库损坏 / 盘满 / 被占用)。
+    Db(anyhow::Error),
 }
 
 impl std::fmt::Display for SaveError {
@@ -780,6 +804,7 @@ impl std::fmt::Display for SaveError {
             ),
             Self::Serialize(e) => write!(f, "配置序列化失败: {e}"),
             Self::Io(e) => write!(f, "配置写盘失败: {e}"),
+            Self::Db(e) => write!(f, "配置库写入失败: {e:#}"),
         }
     }
 }
@@ -790,11 +815,67 @@ impl std::error::Error for SaveError {
             Self::StaleToken { .. } => None,
             Self::Serialize(e) => Some(e),
             Self::Io(e) => Some(e),
+            Self::Db(e) => Some(e.as_ref()),
         }
     }
 }
 
-/// `config.json` 的读写口,同时持有**写盘令牌**。
+/// 给 sidecar 读的 `config.json` 投影:只有 `sshConnections` 与 `projects[]` 的
+/// 四个 SSH 字段。
+///
+/// **形状必须与 `mt_core::config_reader::ConfigSshView` 对得上** —— 那边是三个
+/// sidecar 二进制自持的解析器(它们不依赖本 crate,每次请求重读这个文件做能力
+/// 令牌鉴权)。字段名走 camelCase,`None` 直接省略(那边的字段都有 `default`)。
+///
+/// 项目**一个都不筛**:`scope_connections` 把「项目未找到」与「项目没设
+/// sshConnectionIds」都判成"全部连接可见",漏写一个设过范围的项目就等于
+/// 悄悄放宽了它的可见范围。
+fn ssh_projection(config: &AppConfig) -> serde_json::Value {
+    use serde_json::{Map, Value};
+    let projects: Vec<Value> = config
+        .projects
+        .iter()
+        .map(|p| {
+            let mut m = Map::new();
+            m.insert("id".into(), Value::String(p.id.clone()));
+            m.insert("sshMcpEnabled".into(), Value::Bool(p.ssh_mcp_enabled));
+            if let Some(token) = &p.ssh_cli_token {
+                m.insert("sshCliToken".into(), Value::String(token.clone()));
+            }
+            if let Some(ids) = &p.ssh_connection_ids {
+                m.insert(
+                    "sshConnectionIds".into(),
+                    Value::Array(ids.iter().cloned().map(Value::String).collect()),
+                );
+            }
+            Value::Object(m)
+        })
+        .collect();
+
+    let mut root = Map::new();
+    root.insert(
+        "sshConnections".into(),
+        serde_json::to_value(&config.ssh_connections).unwrap_or(Value::Array(vec![])),
+    );
+    root.insert("projects".into(), Value::Array(projects));
+    Value::Object(root)
+}
+
+/// 配置的读写口,同时持有**写盘令牌**。
+///
+/// # 磁盘上有两样东西
+///
+/// | 文件 | 归属 | 谁读 |
+/// |---|---|---|
+/// | `config.db` | **配置本体**(见 [`crate::db`]) | 只有主程序 |
+/// | `config.json` | [`ssh_projection`] 的投影,派生物 | 三个 sidecar 二进制 |
+///
+/// `config.json` 曾经是配置的家,现在瘦身成投影 —— 那条 sidecar 链路必须原地
+/// 不动的理由见 [`crate::db`] 的模块注释。投影**内容没变就不写**,所以改个字号
+/// 不会碰它。
+///
+/// 存量用户的完整 `config.json` 在首次迁移时被另存为 `config.json.pre-sqlite`,
+/// 不删不改 —— 那是回退到旧版本的唯一凭据。
 ///
 /// 令牌是一个乐观并发计数:[`load`](Self::load) 每成功一次就轮换,
 /// [`save`](Self::save) 必须携带当前令牌才允许写盘。不变量:**写盘的每一份配置,
@@ -807,28 +888,61 @@ impl std::error::Error for SaveError {
 /// (`ConfigToken(AtomicU64)`),GPUI 下改由本结构持有,语义逐字不变;
 /// 应用侧把它放进全局状态、各处共享同一个实例即可。
 pub struct ConfigStore {
+    /// `config.json`(投影)的路径。库路径由它的父目录推出来 ——
+    /// 保持这个字段是为了 [`Self::at`] 的签名不变(dev 隔离与测试都传文件路径)。
     path: PathBuf,
     token: AtomicU64,
+    /// 首次用到时才开库。开失败**不缓存**,下次调用重试 —— 盘暂时忙/被杀软
+    /// 锁住这类瞬时故障不该让整个进程此后永远存不下配置。
+    db: Mutex<Option<Arc<crate::db::ConfigDb>>>,
 }
 
 impl ConfigStore {
-    /// 指向 `{app_data_dir}/config.json`,并顺手跑一次 identifier 迁移
+    /// 指向 `{app_data_dir}`,并顺手跑一次 identifier 迁移
     /// ——迁移必须早于任何一次读取,放在这里就无法忘记。
     pub fn open() -> Result<Self> {
         crate::paths::migrate_legacy_app_data();
         Ok(Self::at(crate::paths::config_path()?))
     }
 
-    /// 指向任意路径(测试与"导入/导出配置"用)。
+    /// 指向任意 `config.json` 路径(测试与 dev 隔离目录用);
+    /// `config.db` 落在它的同级目录。
     pub fn at(path: impl Into<PathBuf>) -> Self {
         Self {
             path: path.into(),
             token: AtomicU64::new(0),
+            db: Mutex::new(None),
         }
     }
 
+    /// `config.json`(给 sidecar 读的投影)的路径。
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// 数据目录 —— `config.db` 与投影同级。
+    fn dir(&self) -> &Path {
+        self.path.parent().unwrap_or(Path::new("."))
+    }
+
+    /// 完整旧配置的存档路径。迁移时另存一次,此后不删不改。
+    fn legacy_archive_path(&self) -> PathBuf {
+        self.path.with_extension("json.pre-sqlite")
+    }
+
+    fn db_backup_path(&self) -> PathBuf {
+        self.dir().join("config.db.bak")
+    }
+
+    /// 取(必要时打开)配置库。
+    fn db(&self) -> Result<Arc<crate::db::ConfigDb>> {
+        let mut slot = self.db.lock().map_err(|_| anyhow!("配置库句柄锁中毒"))?;
+        if let Some(db) = slot.as_ref() {
+            return Ok(db.clone());
+        }
+        let db = Arc::new(crate::db::ConfigDb::open_at(self.dir())?);
+        *slot = Some(db.clone());
+        Ok(db)
     }
 
     /// 当前有效令牌。0 = 还没有过一次成功的 [`load`](Self::load)。
@@ -836,32 +950,72 @@ impl ConfigStore {
         self.token.load(Ordering::Acquire)
     }
 
-    /// 严格加载:文件不存在 = 首次启动,正常返回默认配置;
-    /// 文件存在但读不出/解析失败 = 先尝试用上一代备份 .bak 自愈,
-    /// 备份也不行才返回错误——绝不把默认空配置伪装成加载成功
-    /// (那会让调用方拿着空配置开始运行,下一次保存就把磁盘覆盖了)。
+    /// 严格加载:库为空 = 首次启动或存量用户首次升级,前者拿默认配置、后者从
+    /// `config.json` 一次性迁入;库损坏且备份不可用才返回错误——绝不把默认空配置
+    /// 伪装成加载成功(那会让调用方拿着空配置开始运行,下一次保存就把库覆盖了)。
     ///
     /// 加载成功才轮换发放令牌;上一轮的令牌随之作废。
     pub fn load(&self) -> Result<LoadedConfig> {
-        let config = match read_config_from(&self.path)? {
-            Some(config) => config,
-            None => migrate_config(AppConfig::default()),
+        let db = self.db()?;
+        let config = match db.load()? {
+            Some(config) => migrate_config(config),
+            None => self.import_from_json(&db)?,
         };
+        // 每启动留一代库备份(配置不可再生,这是它与 layout.db 的关键差别)。
+        // 失败只记日志:备份不该拦住启动。
+        if let Err(err) = db.backup_to(&self.db_backup_path()) {
+            eprintln!("[config] 配置库备份失败(不影响本次运行): {err:#}");
+        }
+        // 投影与库对齐 —— sidecar 读的是它。内容没变时是 no-op。
+        self.write_ssh_projection(&config);
+
         let token = self.token.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
         eprintln!("[config] load ok, token={token}");
         Ok(LoadedConfig { config, token })
     }
 
+    /// 库是空的 → 从 `config.json` 灌一次(存量用户),或落一份默认配置(全新安装)。
+    ///
+    /// 灌之前先把**完整的**旧 config.json 另存为 `config.json.pre-sqlite`:
+    /// 紧接着投影就会把 config.json 覆盖成只剩 SSH 的小文件,那份存档是回退到
+    /// 旧版本的唯一凭据。
+    fn import_from_json(&self, db: &crate::db::ConfigDb) -> Result<AppConfig> {
+        let legacy = read_config_from(&self.path)?;
+        let config = migrate_config(legacy.clone().unwrap_or_default());
+        if legacy.is_some() {
+            let archive = self.legacy_archive_path();
+            if !archive.exists()
+                && let Err(err) = fs::copy(&self.path, &archive)
+            {
+                eprintln!("[config] 旧 config.json 存档失败: {err}");
+            }
+            eprintln!(
+                "[config] 已把 config.json 迁入 {}(项目 {} / SSH 连接 {},原文件存档于 {})",
+                db.path().display(),
+                config.projects.len(),
+                config.ssh_connections.len(),
+                self.legacy_archive_path().display()
+            );
+        }
+        db.save(&config)?;
+        Ok(config)
+    }
+
     /// 容错加载:任何读取/解析失败都回退默认,且**不轮换令牌**。
     ///
     /// 供后台路径(hook / relay / 新建 PTY 取项目 env)只读取个别字段用——
-    /// 它们不写盘,吞错无害;后台必须能启动,只在主+备均不可用时才按默认运行。
+    /// 它们不写盘,吞错无害;后台必须能启动,只在库与 config.json 均不可用时
+    /// 才按默认运行。
     pub fn read(&self) -> AppConfig {
-        match read_config_from(&self.path) {
-            Ok(Some(config)) => config,
-            Ok(None) => migrate_config(AppConfig::default()),
+        match self.db().and_then(|db| db.load()) {
+            Ok(Some(config)) => migrate_config(config),
+            // 库还没迁移过(主窗口尚未 load 过一次)→ 退回读 config.json
+            Ok(None) => match read_config_from(&self.path) {
+                Ok(Some(config)) => config,
+                _ => migrate_config(AppConfig::default()),
+            },
             Err(e) => {
-                eprintln!("[config] {e}; 后台本次按默认配置启动");
+                eprintln!("[config] {e:#}; 后台本次按默认配置启动");
                 migrate_config(AppConfig::default())
             }
         }
@@ -882,19 +1036,32 @@ impl ConfigStore {
                 current,
             });
         }
-        let json = serde_json::to_string_pretty(config).map_err(SaveError::Serialize)?;
-        // 内容没变不写盘,也避免用相同内容覆盖掉仍有抢救价值的 .bak
-        let existing = fs::read_to_string(&self.path).ok();
-        if existing.as_deref() == Some(json.as_str()) {
-            return Ok(());
+        let db = self.db().map_err(SaveError::Db)?;
+        db.save(config).map_err(SaveError::Db)?;
+        self.write_ssh_projection(config);
+        Ok(())
+    }
+
+    /// 把 SSH 投影写进 `config.json`。**内容没变就不写** ——
+    /// 改个字号、切个主题都会走到这里,不该每次都碰这个文件
+    /// (sidecar 每次请求都在读它)。
+    ///
+    /// 不留 `.bak`:投影是派生物,从库里随时能再生。存量用户那份完整备份叫
+    /// `config.json.pre-sqlite`,由 [`import_from_json`](Self::import_from_json) 存下。
+    fn write_ssh_projection(&self, config: &AppConfig) {
+        let json = match serde_json::to_string_pretty(&ssh_projection(config)) {
+            Ok(json) => json,
+            Err(err) => {
+                eprintln!("[config] SSH 投影序列化失败: {err}");
+                return;
+            }
+        };
+        if fs::read_to_string(&self.path).ok().as_deref() == Some(json.as_str()) {
+            return;
         }
-        // 覆写前留一代备份,任何原因导致配置被写坏都可救回。
-        // 仅当现有主文件仍可解析时才备份——损坏的主文件绝不覆盖仍有抢救价值的 .bak
-        if should_backup(existing.as_deref()) {
-            let _ = fs::copy(&self.path, self.path.with_extension("json.bak"));
+        if let Err(err) = atomic_write(&self.path, json.as_bytes()) {
+            eprintln!("[config] SSH 投影写盘失败(sidecar 会读到上一版): {err}");
         }
-        // 原子写,避免写入中途崩溃留下截断的 config.json 导致全部用户配置丢失
-        atomic_write(&self.path, json.as_bytes()).map_err(SaveError::Io)
     }
 }
 
@@ -1136,6 +1303,88 @@ mod tests {
         assert!(config.project_ordering.is_none());
     }
 
+    /// **布局字段只读不写**:磁盘归属已经换给 `layout.db`(见 `mt-layout`),
+    /// config.json 再写这些键就成了两个来源互相打架 —— 用户拖完分隔条、
+    /// 布局库写了新值,而后任意一次配置保存又会把旧值原样刷回去。
+    ///
+    /// 这一条钉的是决议本身,删字段那一版把整个测试一起删掉即可。
+    #[test]
+    fn 布局字段不再序列化() {
+        let mut config = AppConfig::default();
+        config.layout_sizes = Some(vec![20.0, 60.0, 20.0]);
+        config.middle_column_sizes = Some(vec![50.0, 50.0]);
+        config.middle_column_visible = false;
+        config.right_drawer_width = Some(400.0);
+        config.projects.push(ProjectConfig {
+            id: "p1".into(),
+            name: "proj".into(),
+            path: "/tmp".into(),
+            description: None,
+            saved_layout: Some(SavedProjectLayout {
+                tabs: vec![SavedTab {
+                    custom_title: None,
+                    split_layout: SavedSplitNode::Leaf {
+                        pane: None,
+                        panes: vec![SavedPane {
+                            shell_name: "cmd".into(),
+                            cwd: None,
+                            ai_session: None,
+                        }],
+                    },
+                }],
+                active_tab_index: 0,
+            }),
+            expanded_dirs: vec![],
+            ssh_mcp_enabled: false,
+            ssh_cli_token: None,
+            ssh_connection_ids: None,
+            env_vars: vec![],
+            wsl_sessions_distro: None,
+            ssh_connection_id: None,
+            parent_project_id: None,
+            kind_override: None,
+        });
+
+        let json = serde_json::to_string(&config).unwrap();
+        for key in [
+            "savedLayout",
+            "layoutSizes",
+            "middleColumnSizes",
+            "middleColumnVisible",
+            "rightDrawerWidth",
+        ] {
+            assert!(!json.contains(key), "{key} 不该再写进 config.json: {json}");
+        }
+    }
+
+    /// 反过来:存量 config.json 里的这些键仍要**读得进来** —— 那是一次性迁移
+    /// 进 `layout.db` 的唯一入口,读不出来存量用户的布局就直接蒸发了。
+    #[test]
+    fn 存量布局字段仍读得进来() {
+        let json = r#"{
+            "projects": [{
+                "id": "1", "name": "test", "path": "/tmp",
+                "savedLayout": {
+                    "tabs": [{"splitLayout": {"type": "leaf", "panes": [{"shellName": "cmd"}]}}],
+                    "activeTabIndex": 0
+                }
+            }],
+            "defaultShell": "cmd",
+            "availableShells": [{"name": "cmd", "command": "cmd"}],
+            "layoutSizes": [20, 60, 20],
+            "middleColumnSizes": [40, 60],
+            "middleColumnVisible": false,
+            "rightDrawerWidth": 400
+        }"#;
+        let config: AppConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.layout_sizes, Some(vec![20.0, 60.0, 20.0]));
+        assert_eq!(config.middle_column_sizes, Some(vec![40.0, 60.0]));
+        assert!(!config.middle_column_visible);
+        assert_eq!(config.right_drawer_width, Some(400.0));
+        let layout = config.projects[0].saved_layout.as_ref().unwrap();
+        assert_eq!(layout.tabs.len(), 1);
+    }
+
     #[test]
     fn layout_round_trip() {
         let layout = SavedProjectLayout {
@@ -1240,13 +1489,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn corrupted_main_never_backed_up() {
-        assert!(!should_backup(Some("{ corrupted")));
-        assert!(!should_backup(None));
-        let valid = serde_json::to_string(&AppConfig::default()).unwrap();
-        assert!(should_backup(Some(&valid)));
-    }
+    // NOTE: 这里曾有 `corrupted_main_never_backed_up`(钉 config.json 的 .bak 轮换
+    // 判据)。配置搬进 config.db 后那条路径不存在了,备份语义改由
+    // `db::tests::备份可用于恢复` / `无备份时损坏必须报错` 钉住。
 
     #[test]
     fn env_vars_round_trip() {
@@ -1632,47 +1877,183 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    /// 配置落的是 `config.db`,`config.json` 只剩 SSH 投影;每次 load 留一代库备份。
     #[test]
-    fn save_keeps_previous_generation_as_backup() {
-        let root = unique_test_root("save-backup");
+    fn 配置落库而_config_json_只剩投影() {
+        let root = unique_test_root("save-to-db");
         let store = ConfigStore::at(root.join("config.json"));
         let token = store.load().unwrap().token;
-        store
-            .save(
-                token,
-                &AppConfig {
-                    default_shell: "gen1".into(),
-                    ..AppConfig::default()
-                },
-            )
-            .unwrap();
-        // 同一份内容再存一次:不写盘、也不产生备份
-        store
-            .save(
-                token,
-                &AppConfig {
-                    default_shell: "gen1".into(),
-                    ..AppConfig::default()
-                },
-            )
-            .unwrap();
-        assert!(!root.join("config.json.bak").exists());
 
         store
             .save(
                 token,
                 &AppConfig {
-                    default_shell: "gen2".into(),
+                    default_shell: "gen1".into(),
+                    ui_font_size: 17.0,
                     ..AppConfig::default()
                 },
             )
             .unwrap();
-        let bak: AppConfig =
-            serde_json::from_str(&fs::read_to_string(root.join("config.json.bak")).unwrap())
-                .unwrap();
-        assert_eq!(bak.default_shell, "gen1");
-        assert_eq!(store.read().default_shell, "gen2");
+
+        assert!(root.join("config.db").exists(), "配置本体落在库里");
+        assert!(root.join("config.db.bak").exists(), "load 后留一代库备份");
+        assert_eq!(store.read().default_shell, "gen1");
+        assert_eq!(store.read().ui_font_size, 17.0);
+
+        // config.json 是投影:只有那两个键,一个设置字段都不该有
+        let json = fs::read_to_string(root.join("config.json")).unwrap();
+        let projection: serde_json::Value = serde_json::from_str(&json).unwrap();
+        // 排序后比较:serde_json 在本工作区的 feature 统一下开了 `preserve_order`
+        // (Map 是 IndexMap、保插入序),单独构建 mt-config 时却是 BTreeMap 的字典序
+        // —— 断言键顺序会随「跟谁一起编译」而漂。
+        let mut keys: Vec<&str> = projection
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["projects", "sshConnections"], "投影只该有这两个键: {json}");
+        assert!(!json.contains("defaultShell"), "设置不该出现在投影里: {json}");
+        assert!(!json.contains("uiFontSize"));
+
         fs::remove_dir_all(&root).ok();
+    }
+
+    /// 存量 config.json 首次启动被整份迁进库,原文件另存为 `.pre-sqlite`,
+    /// 且**只迁一次** —— 迁完 config.json 就被投影覆盖,再迁一次会把库清成投影那点内容。
+    #[test]
+    fn 存量配置迁入库且只迁一次() {
+        let root = unique_test_root("import-once");
+        let path = root.join("config.json");
+        let legacy = serde_json::json!({
+            "projects": [
+                {"id": "p1", "name": "甲", "path": "D:/a", "sshMcpEnabled": true,
+                 "sshCliToken": "tok-a", "sshConnectionIds": ["c1"]},
+                {"id": "p2", "name": "乙", "path": "D:/b"}
+            ],
+            "defaultShell": "cmd",
+            "availableShells": [{"name": "cmd", "command": "cmd.exe"}],
+            "uiFontSize": 15.5,
+            "theme": "dark",
+            "sshConnections": [
+                {"id": "c1", "name": "prod", "host": "h1", "port": 22, "user": "root",
+                 "password": "secret"},
+                {"id": "c2", "name": "dev", "host": "h2", "port": 2222, "user": "deploy"}
+            ]
+        });
+        fs::write(&path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
+
+        let store = ConfigStore::at(&path);
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.config.projects.len(), 2);
+        assert_eq!(loaded.config.projects[0].name, "甲");
+        assert_eq!(loaded.config.ui_font_size, 15.5);
+        assert_eq!(loaded.config.theme, "dark");
+        assert_eq!(loaded.config.ssh_connections.len(), 2);
+
+        // 原文件存档,内容仍是完整的旧配置
+        let archived = fs::read_to_string(root.join("config.json.pre-sqlite")).unwrap();
+        assert!(archived.contains("uiFontSize"), "存档必须是完整旧配置");
+
+        // 二次 load 走库,不再碰 config.json(此时它已是投影)
+        let again = store.load().unwrap();
+        assert_eq!(again.config.projects.len(), 2, "二次加载仍拿得到全部项目");
+        assert_eq!(again.config.ui_font_size, 15.5);
+        assert_eq!(again.config.theme, "dark");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// **投影必须让 sidecar 读得懂**。这里直接调 `mt-core` 那份解析器
+    /// ——它就是三个 sidecar 二进制在用的同一段代码,两边隔着 crate 边界、
+    /// 没有共享类型,只靠字段名对齐。少写一个 `sshCliToken` 就是 SSH 工具
+    /// 集体鉴权失败,而那种故障只在装机后才暴露。
+    #[test]
+    fn 投影能被_sidecar_的解析器读懂() {
+        let root = unique_test_root("projection-sidecar");
+        let path = root.join("config.json");
+        let store = ConfigStore::at(&path);
+        let token = store.load().unwrap().token;
+
+        let mut config = AppConfig::default();
+        config.ssh_connections = vec![
+            SshConnection {
+                id: "c1".into(),
+                name: "prod".into(),
+                host: "h1".into(),
+                port: 22,
+                user: "root".into(),
+                password: Some("secret".into()),
+                identity_file: None,
+                group: None,
+            },
+            SshConnection {
+                id: "c2".into(),
+                name: "dev".into(),
+                host: "h2".into(),
+                port: 2222,
+                user: "deploy".into(),
+                password: None,
+                identity_file: None,
+                group: None,
+            },
+        ];
+        config.projects = vec![
+            ProjectConfig {
+                id: "p1".into(),
+                name: "甲".into(),
+                path: "D:/a".into(),
+                ssh_mcp_enabled: true,
+                ssh_cli_token: Some("tok-a".into()),
+                ssh_connection_ids: Some(vec!["c1".into()]),
+                ..project_stub()
+            },
+            ProjectConfig {
+                id: "p2".into(),
+                name: "乙".into(),
+                path: "D:/b".into(),
+                ..project_stub()
+            },
+        ];
+        store.save(token, &config).unwrap();
+
+        // 能力令牌 → 该项目的连接范围
+        let scoped =
+            mt_core::read_ssh_connections_for_token_at(Some(path.clone()), "tok-a").unwrap();
+        let ids: Vec<&str> = scoped.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["c1"], "令牌必须解析到该项目的范围");
+        assert_eq!(scoped[0].password.as_deref(), Some("secret"), "凭据要完整");
+
+        // 未知令牌仍 fail closed
+        assert!(mt_core::read_ssh_connections_for_token_at(Some(path.clone()), "nope").is_err());
+
+        // MCP 那条路:按 project-id 取范围;没设范围的项目看得到全部
+        let by_id = mt_core::read_ssh_connections_for_project_at(Some(path.clone()), Some("p1"));
+        assert_eq!(by_id.len(), 1);
+        let unscoped = mt_core::read_ssh_connections_for_project_at(Some(path), Some("p2"));
+        assert_eq!(unscoped.len(), 2, "没设范围的项目仍是全部可见");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    fn project_stub() -> ProjectConfig {
+        ProjectConfig {
+            id: String::new(),
+            name: String::new(),
+            path: String::new(),
+            description: None,
+            saved_layout: None,
+            expanded_dirs: vec![],
+            ssh_mcp_enabled: false,
+            ssh_cli_token: None,
+            ssh_connection_ids: None,
+            env_vars: vec![],
+            wsl_sessions_distro: None,
+            ssh_connection_id: None,
+            parent_project_id: None,
+            kind_override: None,
+        }
     }
 
     #[test]

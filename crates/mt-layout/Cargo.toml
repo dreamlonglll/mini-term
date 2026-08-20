@@ -1,0 +1,17 @@
+[package]
+name = "mt-layout"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+# 磁盘格式(SavedProjectLayout 那棵树)仍是 mt-config 的定义 —— 本 crate 只换信封,
+# 不换形状。方向 mt-layout → mt-config,反向不可以(会成环)。
+mt-config.workspace = true
+# 版本与 mt-usage 的 usage.db 对齐:同一棵依赖树里出现两个 rusqlite 会连带
+# 两份 libsqlite3-sys,构建直接失败。
+rusqlite = { version = "0.40.1", features = ["bundled"] }

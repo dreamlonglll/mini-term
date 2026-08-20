@@ -4,10 +4,17 @@ version = "0.4.8"
 description = "mini-term sidecar binaries: miniterm-hook (AI hook), mt-ssh-mcp (SSH MCP server) and mt-ssh-cli (SSH CLI + daemon)"
 edition = "2021"
 
-# 独立工作区（根 Cargo.toml 已 exclude "sidecars"）：版本号自成语义 ——
-# daemon 换代靠本 crate 版本判断，不跟随主程序发版，故不并入根 workspace
-# （并入还会触发依赖统一重排根 Cargo.lock）。sidecar 由
-# scripts/stage-sidecars.mjs 构建并就位到主程序 exe 同目录。
+# 独立工作区：版本号自成语义 —— daemon 换代靠本 crate 版本判断，不跟随主程序
+# 发版，故不并入根 workspace（并入还会触发依赖统一重排根 Cargo.lock）。
+# sidecar 由 scripts/stage-sidecars.mjs 构建并就位到主程序 exe 同目录。
+#
+# 这个**空 `[workspace]` 表**是「独立」的自证，不能删：根 Cargo.toml 的
+# `exclude = ["sidecars"]` 只在本目录恰好是那份 manifest 的直接下级时才管用。
+# 在 git worktree（`.claude/worktrees/<name>/sidecars`）里 cargo 会一路向上找到
+# **主仓**的根 Cargo.toml，那份 exclude 的相对路径对不上，于是报
+# 「current package believes it's in a workspace when it's not」而拒绝构建。
+# 有了这一行，无论 checkout 在哪都自成 workspace root。
+[workspace]
 
 # lib target：ssh_service 业务编排共享层，mt-ssh-mcp 与 mt-ssh-cli 两个 bin
 # 都只做传输层、业务转调 lib（ssh-cli-skill spec §3）。
