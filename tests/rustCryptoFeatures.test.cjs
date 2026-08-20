@@ -11,7 +11,7 @@ test('macOS ARM Cargo graph vendors OpenSSL', () => {
     [
       'tree',
       '--manifest-path',
-      'src-tauri/Cargo.toml',
+      'Cargo.toml',
       '--target',
       'aarch64-apple-darwin',
       '-e',

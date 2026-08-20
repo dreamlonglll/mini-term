@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 /**
- * 字典转换器：src/i18n/locales/<ns>.ts  →  crates/mt-i18n/src/dict.rs
+ * 字典转换器：crates/mt-i18n/locales/<ns>.ts  →  crates/mt-i18n/src/dict.rs
  *
- * 为什么是脚本而不是手抄：字典有 1000+ 条，手抄必然漏。脚本留在仓库里，
- * 之后 TS 侧（迁移期两套并存）再改文案，重跑一次即可，不用人肉对账。
+ * locales/*.ts 是文案的**唯一源头**（原是旧 React 前端的字典，随 Tauri 版
+ * 下线整体迁入本 crate，TS 对象字面量格式原样保留——1000+ 条手抄必然漏，
+ * 结构化源 + 脚本生成才能对账）。改文案改 locales/*.ts 后重跑本脚本，
+ * dict.rs 是生成物，禁止手改。
  *
  * 工作原理：
  *   1. 每个 `<ns>.ts` 都是 `export const <ns> = { zh: {...}, en: {...} } as const;`，
@@ -22,9 +24,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const repoRoot = path.resolve(here, '..', '..', '..');
-const localesDir = path.join(repoRoot, 'src', 'i18n', 'locales');
-const outFile = path.join(repoRoot, 'crates', 'mt-i18n', 'src', 'dict.rs');
+const localesDir = path.resolve(here, '..', 'locales');
+const outFile = path.resolve(here, '..', 'src', 'dict.rs');
 
 /** 从 `<ns>.ts` 源码里抠出对象字面量并求值 */
 function evalNsFile(src, file) {
@@ -133,7 +134,7 @@ namespaces.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 // 2. 生成 Rust
 // ---------------------------------------------------------------------------
 const lines = [];
-lines.push('//! 双语字典静态数据 —— 由 `tools/gen_from_ts.mjs` 从 `src/i18n/locales/*.ts` 生成。');
+lines.push('//! 双语字典静态数据 —— 由 `tools/gen_from_ts.mjs` 从 `../locales/*.ts` 生成。');
 lines.push('//!');
 lines.push('//! **不要手改本文件**：文案改动请改 TS 侧字典后重跑生成器');
 lines.push('//! （`node crates/mt-i18n/tools/gen_from_ts.mjs`）。');
@@ -187,7 +188,7 @@ fs.writeFileSync(outFile, lines.join('\n'), 'utf8');
 // 3. 对账报告
 // ---------------------------------------------------------------------------
 console.log(`命名空间 ${namespaces.length} 个；zh ${zhTotal} 条 / en ${enTotal} 条`);
-console.log(`已写出 ${path.relative(repoRoot, outFile)}`);
+console.log(`已写出 ${outFile}`);
 if (report.gaps.length) {
   console.log(`\n两语言 key 差异 ${report.gaps.length} 处：`);
   for (const g of report.gaps) console.log('  ' + g);

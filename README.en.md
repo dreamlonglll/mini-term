@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="src-tauri/icons/icon.png" width="128" height="128" alt="Mini-Term Logo">
+  <img src="docs/icon.png" width="128" height="128" alt="Mini-Term Logo">
 </p>
 
 <h1 align="center">Mini-Term</h1>
@@ -18,8 +18,6 @@
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
-  <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
-  <img src="https://img.shields.io/badge/React-19-61dafb" alt="react">
   <img src="https://img.shields.io/badge/Rust-1.95%2B-dea584" alt="rust">
 </p>
 
@@ -29,7 +27,7 @@
   <a href="docs/deploy-relay.md">Relay deployment</a>
 </p>
 
-> **v1.0.0-beta**: starting with this release, a **GPUI-native build** (Rust-native rendering, full UI rewrite, no WebView2 dependency) ships as a Windows x64 portable bundle `mini-term-gpui-*-windows-x64.zip` — unzip and run, feedback welcome. The three-platform Tauri installers continue to be published as usual.
+> **The GPUI-native build is now the only form**: Rust-native rendering, single process, no WebView2 dependency — the Windows x64 portable bundle unzips and runs. The earlier Tauri + React implementation was removed from the repository and discontinued after v1.0.0-beta (old installers remain downloadable on past Releases; the source lives in git history).
 
 ---
 
@@ -117,7 +115,7 @@ Behind the CLI is a **machine-wide singleton daemon** holding the persistent con
 - A **project sidebar** for multiple workspaces, with **up to 3 levels of nested groups**, drag-to-reorder, and drag-a-folder-from-Explorer to add
 - **Arbitrarily nested horizontal / vertical splits**, drag to adjust ratios; tabs, splits, and window geometry all persist and restore on restart
 - **Drag panes to rearrange & maximize** — drag a terminal tab into another group to merge (with an insertion indicator on the tab bar; dragging within the bar reorders), or onto a terminal-area edge to split off a new pane, with a live drop preview; double-click the tab bar's empty area to temporarily fill the terminal area with that group, double-click again to restore — terminal content survives throughout
-- **Terminal caching** — switching projects, tabs, or panes never rebuilds the xterm instance, so nothing is lost; lazy startup creates a PTY only for the visible pane, so more history projects never means a slower launch
+- **Terminal caching** — switching projects, tabs, or panes never rebuilds the terminal instance, so nothing is lost; lazy startup creates a PTY only for the visible pane, so more history projects never means a slower launch
 - **Configurable scrollback** (10,000 lines by default; lowering it in Settings takes effect immediately and frees the memory) with correct CSI 3J handling, so Codex transcript folding and `/clear` behave faithfully; the Windows build bundles a pinned official ConPTY runtime for consistent behavior across Windows versions
 - **AI session history** — read local Claude / Codex / Grok records, right-click to copy the resume command, or read the full conversation right there (Markdown rendering + `Ctrl+F` search)
 - **AI session branch tree** — want to try two approaches to one task side by side? Right-click a pane and "Fork session to new split": the original keeps running in place, while the new pane next to it holds a copy of the conversation (Claude via `--resume --fork-session`, Codex via `codex fork`). The history panel gains a "branch tree view" where forked sessions hang under their parents with indent lines (driven by the pointers the CLIs themselves write to disk), running nodes carry a status dot, and clicking any node either jumps to its live pane or resumes it in a new terminal. The right-click "View session branches" entry expands the whole family on hover; vendor icons in the tree and panel follow the session's **latest model** — a claude CLI running GLM/DeepSeek through a proxy lights up the real vendor's icon (pane tab icons stay CLI-based)
@@ -138,40 +136,39 @@ A VS Code-style **Changes panel** (Staged / Changes / Untracked groups, per-file
 | **Long-text paste** | Clipboard text ≥10 lines or ≥2000 chars is spilled to a temp `.txt` and pasted as a quoted path — your AI tool never has to swallow a wall of text |
 | **Image paste** | Screenshots in the clipboard are detected, saved as a temp PNG, and pasted as a path; handles non-standard formats like PinPix |
 | **Remote-aware landing** | Both of the above remap in remote terminals: SSH projects upload over SFTP and paste the **remote** path; WSL projects rewrite `C:\...` into `/mnt/c/...` |
-| **File drag & drop** | Drag from the file tree or Explorer onto the terminal to insert a quoted absolute path, landing in the exact split pane; change your mind mid-drag and Esc cancels it on the spot — no path written, and no degrading into a plain click that opens the file |
-| **Built-in file editor** | Click any file in the tree to edit in place: CodeMirror 6 core with lazy-loaded syntax highlighting for 140+ languages, find & replace, code folding, multi-cursor, atomic `Ctrl+S` saves, external-change detection, and live Markdown preview of unsaved drafts |
+| **File drag & drop** | Drag from the file tree or Explorer onto the terminal to insert a quoted absolute path, landing in the exact split pane; dropping anywhere else writes nothing, and never degrades into a plain click that opens the file |
+| **Built-in file editor** | Click any file in the tree to edit in place: tree-sitter syntax highlighting (30+ languages), find & replace, atomic `Ctrl+S` saves, external-change detection, and live Markdown preview of unsaved drafts |
 | **Global search** | `Ctrl+Shift+F` for filename or content search, substring or regex, streamed from the backend and cancellable anytime |
 | **Per-project env vars** | Injected into the PTY child process per project, with strict POSIX validation and a second defensive filter on the Rust side; passes through to WSL via WSLENV |
 | **Smart Ctrl+C/V** | Optional: copy when there's a selection, interrupt the program when there isn't; large Windows pastes are chunked so ConPTY doesn't drop lines |
-| **Icons everywhere** | Material file icons in the tree, AI brand icons and tech-stack icons on project rows — the full icon dataset is a separate lazily-loaded chunk, zero main-bundle growth |
+| **Icons everywhere** | File-type icons in the tree, AI brand icons and tech-stack icons on project rows (official brand SVG shapes, natively drawn) |
 | **Dwell-to-copy selection** | Hold the mouse still after drag-selecting and the selection is copied with a "Copied" tip; dwell time configurable (0 = off) |
 | **Project descriptions** | Right-click to add a gray one-liner next to the project name — tell a row of worktree sub-projects apart at a glance |
-| **Zero network requests at startup** | Fonts bundled locally (Google Fonts link removed), heavy modals all lazy-loaded; main bundle gzip down from 631KB to 378KB |
-| **End-to-end backpressure** | When you `cat` a huge file or an AI floods the pane, a growing frontend backlog pushes back all the way to the flooding process — a slow terminal slows the process down instead of piling everything into memory. And if the renderer ever gets killed and reloads, PTYs left over from the previous round are reclaimed first, so one crash doesn't leak a whole set |
-| **Three themes + Blueprint skin** | Auto / Light / Dark (Warm Carbon), plus an optional sci-fi Blueprint skin; the title bar matches the theme, with no light flash on startup |
+| **Zero network requests at startup** | Native rendering, no web assets — startup makes no network request at all (the price table refreshes daily and falls back to its cache) |
+| **Flood-proof UI** | When you `cat` a huge file or an AI floods the pane, PTY bytes feed the VT state machine on a background thread while the UI samples the grid per frame — single process, zero IPC, no intermediate buffer to pile up, so flooding can't drag the interface down |
+| **Three themes** | Auto / Light / Dark (Warm Carbon); the title bar matches the theme, with no light flash on startup |
 | **External theme packs** | Dream Skin-compatible skins: import from a folder or a zip, sha256-verified against the manifest, hot-reloaded when you edit a file. A pack can ship its own background image, in which case the terminal goes translucent over that ambient layer. Setting cards show live thumbnails, and both an imported `theme.css` and the `tokens` overrides in `theme.json` pass through the same external-reference gate (no `@import`; anything pointing outside the pack is rejected — `url()`, bare strings like `image-set("…")`, and CSS escape sequences alike). Not sure where to start? Hit "Example": a ready-to-edit sample skin lands in the skins folder — theme.json / theme.css plus a README documenting every field — and saving hot-reloads it (literally the same files as [`docs/theme-pack-example/`](docs/theme-pack-example/) in this repo) |
 | **Custom title bar** | Frameless window with a self-drawn title bar that follows your theme instead of the system's grey strip, adapted per platform — window controls on the right for Windows / Linux (Win11 Snap Layouts still pop up when you hover the maximize button), native traffic lights kept on macOS. Next to the version number sits a **project switcher**: a pill button always showing the current project with its AI status dot, whose dropdown lists every project with an AI session and its status — click to switch; the global status light sits right beside it — click to jump to the next session needing you (earliest finished first) |
 | **Hover preview for project rows** | **Only pops up for projects running an AI session** (same test as the row's AI icon: if the icon is lit the preview exists, and it closes as soon as the AI exits; hovering a plain shell project just shows its absolute path as a tooltip instead of interrupting you with a card). Hover for 250ms and a **miniature layout puzzle** of its terminal area appears: split panes reproduced at their real proportions, matching what you'd see after switching, redrawn every 500ms while open so it stays live. Each split cell shows the active tab; hidden tabs are summarized by a "+N" badge carrying the highest-priority status among them, so AI activity buried in an inactive tab isn't missed. **Inactive pane tabs** also pop a single-cell thumbnail after a 250ms hover (same rendering pipeline, equally live), with no AI gate — a hidden tab's content is invisible until you switch to it anyway, and the preview answers exactly "what's on that tab right now" |
 | **Bilingual UI** | One click re-renders the whole interface in English / 中文, auto-detected from the system on first launch; in-house lightweight i18n, no extra runtime dependency |
-| **Ligatures** | Composes `==` `=>` `!=` `->` glyphs (needs a calt-table font such as Fira Code / JetBrains Mono) |
 | **Grouped settings panel** | A two-level sidebar: Terminal (Shell / Copy & paste), Appearance (Theme & language / Font), AI (Notifications / Hook events), System (General / Editors) — every page fits on one screen instead of scrolling half a page to find a toggle |
 
 ---
 
 ## Tech stack
 
-Since v1.0.0-beta the repository hosts **two parallel implementations** with matching features; the GPUI-native build is the mainline going forward:
+The whole application is **native Rust** (the earlier Tauri + React build was removed; its source lives in git history):
 
-| Layer | GPUI-native build (`crates/`) | Tauri build (`src/` + `src-tauri/`) |
-|---|---|---|
-| Shell / rendering | GPUI 0.2 (the framework behind Zed — GPU-native rendering, single process, no WebView) | Tauri v2 (Rust backend + system WebView) |
-| UI | Pure Rust: gpui-component + hand-drawn widgets | React 19 + TypeScript 5.8 + Tailwind CSS v4 + Vite 7 |
-| Terminal | alacritty_terminal (in-process VT parsing — zero IPC, zero serialization) | xterm.js v6 (WebGL, automatic Canvas fallback) |
-| State / layout | Single store (Rust) · recursive SplitNode tree (isomorphic to the right) | Zustand single store · Allotment + recursive SplitNode tree |
-| PTY / Git | portable-pty · git2 · notify + ignore (same Rust dependencies on both sides) | Same |
-| Usage stats | rusqlite local ledger · hand-drawn trend charts | rusqlite local ledger · recharts trend charts |
-| Mobile relay | axum + tokio WebSocket (`relay-server/`) · React + Vite PWA (`mobile/`) — shared by both builds | Same |
-| Tests | **1,369 Rust tests** (26 test targets) | **609 Rust tests** (556 desktop + 53 relay) plus 77 Node tests |
+| Layer | Implementation |
+|---|---|
+| Shell / rendering | GPUI 0.2 (the framework behind Zed — GPU-native rendering, single process, no WebView) |
+| UI | Pure Rust: gpui-component + hand-drawn widgets |
+| Terminal | alacritty_terminal (in-process VT parsing — zero IPC, zero serialization) · portable-pty |
+| State / layout | Single store · recursive SplitNode tree |
+| Git / files | git2 (libgit2) · notify + ignore |
+| Usage stats | rusqlite local ledger · hand-drawn trend charts |
+| Mobile relay | axum + tokio WebSocket (`relay-server/`) · React + Vite PWA (`mobile/`) |
+| Tests | **1,369 Rust tests** (26 test targets) |
 
 ---
 
@@ -179,10 +176,11 @@ Since v1.0.0-beta the repository hosts **two parallel implementations** with mat
 
 ### Download
 
-Grab the latest build from [Releases](https://github.com/dreamlonglll/mini-term/releases). Since v1.0.0-beta every release ships in two forms:
+Grab the latest build from [Releases](https://github.com/dreamlonglll/mini-term/releases) — three platforms:
 
-- **GPUI-native portable bundle (Windows x64, recommended for early adopters)** — `mini-term-gpui-*-windows-x64.zip`, unzip and run: no installer, no WebView2 dependency, the whole UI rewritten with Rust-native rendering, feature parity with the Tauri build
-- **Tauri installers (three platforms, as usual)** — Windows `*-setup.exe` (NSIS), macOS `.dmg`, Linux `.deb` / `.AppImage`; MSI and rpm reject pre-release version numbers and will return with the stable release
+- **Windows x64 (primary platform)** — `mini-term-gpui-*-windows-x64.zip` portable bundle, unzip and run: no installer, no WebView2 dependency
+- **macOS arm64** — `mini-term-gpui-*-macos-arm64.dmg`
+- **Linux x64** — `mini-term-gpui-*-linux-amd64.deb` or `mini-term-gpui-*-linux-x64.tar.gz`
 
 > **Platform support**
 > - **Windows** — the primary platform with guaranteed usability; all daily development and testing happens here
@@ -196,23 +194,18 @@ xattr -cr /Applications/Mini-Term.app
 
 ### Build from source
 
-Requires Rust >= 1.95; the Tauri build additionally needs Node.js >= 20.19 (or >= 22.12) and the [Tauri v2 CLI](https://v2.tauri.app/start/prerequisites/).
+Requires Rust >= 1.95; the sidecar staging script needs Node.js >= 20 (standard library only, no npm dependencies).
 
 ```bash
 git clone https://github.com/dreamlonglll/mini-term.git
 cd mini-term
 
-# GPUI-native build
+node scripts/stage-sidecars.mjs      # build the three sidecars and stage them (plus portable ConPTY) into target/debug/
 cargo run -p mt-app                  # dev
-cargo build --release -p mt-app      # output: target/release/mini-term.exe
-
-# Tauri build
-npm install
-npm run tauri dev      # dev (frontend + backend)
-npm run tauri build    # release bundle
+cargo build --release -p mt-app      # output: target/release/mini-term(.exe)
 ```
 
-> The GPUI build locates its sidecars and the portable ConPTY runtime **next to the exe** (hook reporting, `miniterm-hook` / `mt-ssh-cli`, `portable-conpty/`). The release zip ships them all; when running from source, copy them beside the exe for the full experience (see `scripts/stage-sidecars.mjs` for building and staging).
+> The app locates its sidecars and the portable ConPTY runtime **next to the exe** (hook reporting, `miniterm-hook` / `mt-ssh-cli`, `portable-conpty/`). The release bundles ship them all; when running from source, run `stage-sidecars.mjs` once first (use `--release` for release builds, which stages into `target/release/`).
 
 ---
 

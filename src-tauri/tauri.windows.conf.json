@@ -1,7 +1,0 @@
-{
-  "bundle": {
-    "resources": {
-      "resources/portable-conpty": "portable-conpty"
-    }
-  }
-}

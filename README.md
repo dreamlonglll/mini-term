@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="src-tauri/icons/icon.png" width="128" height="128" alt="Mini-Term Logo">
+  <img src="docs/icon.png" width="128" height="128" alt="Mini-Term Logo">
 </p>
 
 <h1 align="center">Mini-Term</h1>
@@ -18,8 +18,6 @@
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
-  <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
-  <img src="https://img.shields.io/badge/React-19-61dafb" alt="react">
   <img src="https://img.shields.io/badge/Rust-1.95%2B-dea584" alt="rust">
 </p>
 
@@ -29,7 +27,7 @@
   <a href="docs/deploy-relay.zh-CN.md">中转部署</a>
 </p>
 
-> **v1.0.0-beta**：本版起 Release 附带 **GPUI 原生版**（Rust 原生渲染，整套 UI 重写，不再依赖 WebView2）的 Windows x64 便携包 `mini-term-gpui-*-windows-x64.zip`，解压即用，欢迎试用反馈；三平台 Tauri 安装包照常发布。
+> **GPUI 原生版是当前唯一形态**：Rust 原生渲染、单进程、不依赖 WebView2，Windows x64 便携包解压即用。早期的 Tauri + React 实现已于 v1.0.0-beta 后从仓库移除并停止发布（历史版本安装包仍可在旧 Release 下载，源码看 git 历史）。
 
 ---
 
@@ -117,7 +115,7 @@ CLI 背后是**全机单例 daemon** 持有的持久连接池：首次调用自�
 - **左侧项目列表**管理多个工作区，支持**最多 3 级嵌套分组**、拖拽排序、从资源管理器拖文件夹直接添加
 - **横竖任意嵌套的递归分屏**，拖拽调比例；标签 / 分屏 / 窗口大小位置全部持久化，重启原样恢复
 - **pane 拖拽重排与最大化**——终端 tab 拖到别的分组并入（tab 栏带插入位指示线，同组内拖动换位），拖到终端区四边分出新屏，落点实时高亮预览；双击 tab 栏空白处把当前分组临时铺满终端区，再双击还原，终端内容全程不丢
-- **终端缓存**——切项目、切标签、切分屏都不重建 xterm 实例，内容不丢；启动按需懒加载，只给当前可见的 pane 建 PTY，历史项目再多也不拖慢启动
+- **终端缓存**——切项目、切标签、切分屏都不重建终端实例，内容不丢；启动按需懒加载，只给当前可见的 pane 建 PTY，历史项目再多也不拖慢启动
 - **滚动缓冲行数可调**（默认 1 万行，设置里改小当场生效并释放内存），正确处理 CSI 3J，Codex 的流式内容折叠与 `/clear` 都能如实反映；Windows 版内置固定版本官方 ConPTY 运行时，跨 Windows 版本行为一致
 - **AI 会话历史**——读本地 Claude / Codex / Grok 记录，右键复制恢复命令快速续接，也能直接看完整对话正文（Markdown 渲染 + `Ctrl+F` 搜索）
 - **AI 会话分支树**——想在同一个任务上并排试两条思路？pane 右键「分支会话到新分屏」：原会话原地继续跑，旁边分出的新 pane 里是复制出来的分支（Claude 走 `--resume --fork-session`，Codex 走 `codex fork`）。历史面板可切「分支树视图」，fork 出的会话按缩进连线挂在父会话下（数据来自 CLI 亲写的磁盘指针），正在跑的节点带状态点；点任意节点——已开的切过去聚焦，没开的新终端自动恢复。右键菜单里「查看会话分支」悬停即展开当前家族全貌；树与面板的厂商图标按会话**最新使用的模型**显示——claude CLI 挂 GLM/DeepSeek 中转时亮的是真实厂商的 icon（pane 标签上的 CLI 图标不变）
@@ -138,40 +136,39 @@ VS Code 风格的 **Changes 面板**（Staged / Changes / Untracked 分组，单
 | **长文本粘贴** | 剪贴板 ≥10 行或 ≥2000 字符时自动转存临时 `.txt`，粘贴带引号的路径——AI 工具不必硬吞超长内容 |
 | **图片粘贴** | 剪贴板里有截图自动检测，存成临时 PNG 并粘路径，兼容 PinPix 等非标准格式 |
 | **远程自动落地** | 上面两种粘贴在 SSH 远程项目里会经 SFTP 传到远端再粘**远端**路径；WSL 项目自动把 `C:\...` 换算成 `/mnt/c/...` |
-| **文件拖拽** | 从文件树或资源管理器拖文件到终端，插入带引号的绝对路径，精准落到目标分屏；拖到一半改主意按 Esc 就地取消，路径不写入、也不会退化成一次点击打开文件 |
-| **内置文件编辑器** | 文件树点开即改：CodeMirror 6 内核，140+ 语言语法高亮按需加载，查找替换、代码折叠、多光标，`Ctrl+S` 原子落盘，外部改动自动感知，Markdown 实时预览未保存草稿 |
+| **文件拖拽** | 从文件树或资源管理器拖文件到终端，插入带引号的绝对路径，精准落到目标分屏；拖到一半松在别处不会误写入、也不会退化成一次点击打开文件 |
+| **内置文件编辑器** | 文件树点开即改：tree-sitter 语法高亮（30+ 语言），查找替换，`Ctrl+S` 原子落盘，外部改动自动感知，Markdown 实时预览未保存草稿 |
 | **全局搜索** | `Ctrl+Shift+F` 唤起，文件名 / 内容双模式，子串或正则，后端流式推送随时可取消 |
 | **项目级环境变量** | 按项目注入 PTY 子进程，严格 POSIX 校验，Rust 端二次防御，WSL 下经 WSLENV 透传 |
 | **智能 Ctrl+C/V** | 可选开启：有选区时复制、无选区时中断程序；Windows 大段粘贴自动分块防 ConPTY 丢行 |
-| **满屏图标** | 文件树 Material 主题文件图标、项目行 AI 品牌图标与技术栈图标——全量图标数据独立 chunk 按需懒加载，主包零增量 |
+| **满屏图标** | 文件树文件类型图标、项目行 AI 品牌图标与技术栈图标（官方品牌 SVG 形状，原生自绘渲染） |
 | **拖选停留自动复制** | 拖选后按住鼠标静止超过设定时长自动复制选区并弹「已复制」气泡，时长可调（0 = 关闭） |
 | **项目描述** | 右键给项目补一行灰色小字备注，一排 worktree 子项目各自在干什么一眼分清 |
-| **启动零网络请求** | 字体本地打包（移除 Google Fonts 外链），重型弹窗全部懒加载，主包 gzip 从 631KB 降到 378KB |
-| **全链路背压** | `cat` 大文件、AI 刷屏时，前端积压过高会一路顶回刷屏进程本身——慢终端拖慢进程，而不是把数据全堆进内存；万一渲染进程被系统杀掉重载，上一轮遗留的 PTY 也会先回收，不会崩一次漏一整套 |
-| **三种主题 + 蓝图皮肤** | Auto / Light / Dark（暖炭色调），另有科幻风蓝图皮肤；标题栏与主题同色，启动无浅色闪烁 |
+| **启动零网络请求** | 原生渲染无 Web 资源，启动不发任何网络请求（价格表按天拉取，拉不到用缓存） |
+| **刷屏不卡界面** | `cat` 大文件、AI 刷屏时，PTY 字节在后台线程直喂 VT 状态机、UI 按帧取格子渲染——单进程零 IPC，没有中间缓冲可堆积，刷屏拖不垮界面 |
+| **三种主题** | Auto / Light / Dark（暖炭色调）；标题栏与主题同色，启动无浅色闪烁 |
 | **外置主题包** | 兼容 Dream Skin 格式的皮肤：文件夹或 zip 导入、manifest 的 sha256 校验、改文件即热重载；皮肤可自带背景图，终端随之透明化压在氛围层上。设置页卡片直接铺实况缩略图，导入的 theme.css 与 theme.json 的 tokens 覆盖过同一道外链闸（禁 `@import`，指向包外的引用一律拒——`url()`、`image-set("…")` 这类裸字符串、CSS 转义写法都挡得住）。不知道从哪起手就点「生成示例」：一份可直接改的示例皮肤落进皮肤目录，含 theme.json / theme.css 与逐字段说明的 README，改完保存即热重载（与仓库 [`docs/theme-pack-example/`](docs/theme-pack-example/) 是同一份文件） |
 | **自定义标题栏** | 无边框窗口 + 自绘标题栏，配色跟着主题走不再是系统那条灰白；按平台适配习惯——Windows / Linux 右侧三键并保留 Win11 贴靠布局（悬停最大化按钮弹分屏菜单），macOS 保留原生交通灯。版本号旁是**当前项目切换器**：胶囊按钮常显当前项目与它的 AI 状态色点，下拉列出所有进入 AI 会话的项目及状态、点击即切换；全局状态灯紧随其右，点一下直接跳到下一个该处理的会话（最先完成的排最前） |
 | **项目行悬停预览** | **只对跑着 AI 会话的项目弹**（与项目行 AI 图标同口径：行上亮着图标才有预览，AI 退出即收起；普通 shell 项目悬停只出绝对路径提示，不弹卡打断视线）。悬停 250ms 弹出该项目终端区的**微缩布局拼图**：按分屏树等比复现真实排布，与切过去看到的一致，打开期间 500ms 重画所以是活的。每个分屏格显示当前 tab 的画面，隐藏 tab 以「+N」徽章示数并附其中最高优先级的状态点——藏在非激活 tab 里的 AI 状态不漏报。**非激活的 pane tab** 悬停 250ms 也弹单格缩略图（同一渲染链路、同样是活的），且不做 AI 开闸——隐藏 tab 的内容不切过去本来就看不见，预览回答的就是「那个 tab 里现在是什么」 |
 | **中英双语** | 一键切换全界面实时重渲染，首次启动按系统语言探测，自研轻量 i18n 无额外运行时依赖 |
-| **连体字** | `==` `=>` `!=` `->` 合成 ligature glyph（需 Fira Code / JetBrains Mono 等含 calt 表的字体） |
 | **设置面板分组** | 侧栏两级菜单：终端（Shell / 复制粘贴）、外观（主题与语言 / 字体）、AI（通知提醒 / Hook 事件）、系统（常规 / 外部编辑器），每页只剩一屏，不用滚半页找开关 |
 
 ---
 
 ## 技术栈
 
-v1.0.0-beta 起仓库里是**两套并行实现**，功能已对齐，GPUI 原生版是后续演进的主线：
+整套应用为 **Rust 原生实现**（早期 Tauri + React 版已移除，源码看 git 历史）：
 
-| 层 | GPUI 原生版（`crates/`） | Tauri 版（`src/` + `src-tauri/`） |
-|---|---|---|
-| 壳 / 渲染 | GPUI 0.2（Zed 同源框架，GPU 原生渲染，单进程、无 WebView） | Tauri v2（Rust 后端 + 系统 WebView） |
-| UI | 纯 Rust：gpui-component + 自绘组件 | React 19 + TypeScript 5.8 + Tailwind CSS v4 + Vite 7 |
-| 终端 | alacritty_terminal（进程内 VT 解析，零 IPC、零序列化） | xterm.js v6（WebGL 加速，自动降级 Canvas） |
-| 状态 / 布局 | 单一 Store（Rust）· 递归 SplitNode 分屏树（与右侧同构） | Zustand 单一 Store · Allotment + 递归 SplitNode 分屏树 |
-| PTY / Git | portable-pty · git2 · notify + ignore（两版同一套 Rust 依赖） | 同左 |
-| 用量统计 | rusqlite 本地账本 · 自绘趋势图 | rusqlite 本地账本 · recharts 趋势图 |
-| 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`），两版共用 | 同左 |
-| 测试 | **1369 个 Rust 测试**（26 个测试目标） | **609 个 Rust 测试**（桌面端 556 + 中转 53）+ 77 个 Node 测试 |
+| 层 | 实现 |
+|---|---|
+| 壳 / 渲染 | GPUI 0.2（Zed 同源框架，GPU 原生渲染，单进程、无 WebView） |
+| UI | 纯 Rust：gpui-component + 自绘组件 |
+| 终端 | alacritty_terminal（进程内 VT 解析，零 IPC、零序列化）· portable-pty |
+| 状态 / 布局 | 单一 Store · 递归 SplitNode 分屏树 |
+| Git / 文件 | git2（libgit2）· notify + ignore |
+| 用量统计 | rusqlite 本地账本 · 自绘趋势图 |
+| 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`） |
+| 测试 | **1369 个 Rust 测试**（26 个测试目标） |
 
 ---
 
@@ -179,10 +176,11 @@ v1.0.0-beta 起仓库里是**两套并行实现**，功能已对齐，GPUI 原�
 
 ### 下载安装
 
-前往 [Releases](https://github.com/dreamlonglll/mini-term/releases) 下载。v1.0.0-beta 起每个 Release 有两种形态：
+前往 [Releases](https://github.com/dreamlonglll/mini-term/releases) 下载，三平台产物：
 
-- **GPUI 原生版便携包（Windows x64，推荐尝鲜）** — `mini-term-gpui-*-windows-x64.zip`，解压即用：无需安装、不依赖 WebView2，整套 UI 为 Rust 原生渲染重写，功能与 Tauri 版对齐
-- **Tauri 安装包（三平台照常）** — Windows `*-setup.exe`（NSIS）、macOS `.dmg`、Linux `.deb` / `.AppImage`；MSI 与 rpm 不接受预发布版本号，随正式版恢复
+- **Windows x64（主要支持平台）** — `mini-term-gpui-*-windows-x64.zip` 便携包，解压即用：无需安装、不依赖 WebView2
+- **macOS arm64** — `mini-term-gpui-*-macos-arm64.dmg`
+- **Linux x64** — `mini-term-gpui-*-linux-amd64.deb` 或 `mini-term-gpui-*-linux-x64.tar.gz`
 
 > **平台支持**
 > - **Windows** — 主要支持平台，保证可用性，日常开发与测试都在 Windows 上
@@ -196,23 +194,18 @@ xattr -cr /Applications/Mini-Term.app
 
 ### 从源码构建
 
-需要 Rust >= 1.95；构建 Tauri 版另需 Node.js >= 20.19（或 >= 22.12）与 [Tauri v2 CLI](https://v2.tauri.app/start/prerequisites/)。
+需要 Rust >= 1.95；构建 sidecar 就位脚本需要 Node.js >= 20（仅标准库，无 npm 依赖）。
 
 ```bash
 git clone https://github.com/dreamlonglll/mini-term.git
 cd mini-term
 
-# GPUI 原生版
+node scripts/stage-sidecars.mjs      # 构建三个 sidecar 并连同便携 ConPTY 就位到 target/debug/
 cargo run -p mt-app                  # 开发
-cargo build --release -p mt-app      # 产物 target/release/mini-term.exe
-
-# Tauri 版
-npm install
-npm run tauri dev      # 开发（前端 + 后端）
-npm run tauri build    # 构建发布包
+cargo build --release -p mt-app      # 产物 target/release/mini-term(.exe)
 ```
 
-> GPUI 版的 hook 上报与便携 ConPTY 按「与 exe 同目录」定位 sidecar 与资源，发布 zip 已带齐；源码运行要完整体验，需把 `miniterm-hook` / `mt-ssh-cli` 与 `portable-conpty/` 放到 exe 旁（构建与就位见 `scripts/stage-sidecars.mjs`）。
+> hook 上报与便携 ConPTY 按「与 exe 同目录」定位 sidecar 与资源，发布包已带齐；源码运行要完整体验，先跑一次 `stage-sidecars.mjs`（release 构建对应 `--release`，就位到 `target/release/`）。
 
 ---
 

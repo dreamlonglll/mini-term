@@ -14,7 +14,7 @@ use mt_i18n::{
     Locale, Namespace, dict, interpolate, lookup, namespace, namespaces, t_args_in, t_in, t_path,
 };
 
-/// TS 侧 `src/i18n/locales/*.ts` 数出来的对账数字（生成器 2026-08-18 跑出）：
+/// TS 侧 `crates/mt-i18n/locales/*.ts` 数出来的对账数字（生成器 2026-08-18 跑出）：
 /// 32 个命名空间文件（`locales/index.ts` 里 32 条 import 一一对上），
 /// 每种语言 735 条叶子文案。改字典后重跑生成器，这里的数字随 dict.rs 一起更新。
 ///

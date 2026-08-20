@@ -90,6 +90,12 @@ reqwest = { package = "zed-reqwest", version = "0.12.15-zed", default-features =
     "http2",
 ] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Linux 的窗口后端不在 gpui 默认 feature 里(Windows / macOS 默认即可),
+# 不开的话构建出来没有任何 windowing 实现。feature 是可加的,workspace
+# 依赖之上追加不动根 manifest(与 gpui-component 的 tree-sitter 同一手法)。
+gpui = { workspace = true, features = ["x11", "wayland"] }
+
 [target.'cfg(windows)'.dependencies]
 # 任务栏闪烁(FlashWindowEx)、提示音(MessageBeep / PlaySoundW)与系统托盘。
 # 版本跟随 gpui 已经在用的那个,不给依赖树引入第二份 windows crate。

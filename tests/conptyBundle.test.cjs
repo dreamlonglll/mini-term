@@ -1,12 +1,11 @@
 const assert = require('node:assert/strict');
-const { mkdtemp, mkdir, readFile, rm, writeFile } = require('node:fs/promises');
+const { mkdtemp, mkdir, rm, writeFile } = require('node:fs/promises');
 const { tmpdir } = require('node:os');
 const { join } = require('node:path');
 const { pathToFileURL } = require('node:url');
 const test = require('node:test');
 
 const repoRoot = join(__dirname, '..');
-const windowsConfigPath = join(repoRoot, 'src-tauri', 'tauri.windows.conf.json');
 const stagingModuleUrl = pathToFileURL(
   join(repoRoot, 'scripts', 'stage-conpty.mjs'),
 ).href;
@@ -39,13 +38,6 @@ async function writePackageFixture(root) {
     writeFile(join(arm64Host, 'OpenConsole.exe'), minimalPe(0xaa64)),
   ]);
 }
-
-test('Windows bundle 将 staging 目录映射到 portable-conpty 资源目录', async () => {
-  const config = JSON.parse(await readFile(windowsConfigPath, 'utf8'));
-  assert.deepEqual(config.bundle?.resources, {
-    'resources/portable-conpty': 'portable-conpty',
-  });
-});
 
 test('官方 ConPTY 包版本、来源与 SHA-256 固定且可诊断', async () => {
   const { CONPTY_PACKAGE } = await loadStagingModule();

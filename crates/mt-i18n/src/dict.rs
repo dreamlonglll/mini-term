@@ -1,4 +1,4 @@
-//! 双语字典静态数据 —— 由 `tools/gen_from_ts.mjs` 从 `src/i18n/locales/*.ts` 生成。
+//! 双语字典静态数据 —— 由 `tools/gen_from_ts.mjs` 从 `../locales/*.ts` 生成。
 //!
 //! **不要手改本文件**：文案改动请改 TS 侧字典后重跑生成器
 //! （`node crates/mt-i18n/tools/gen_from_ts.mjs`）。
@@ -1027,7 +1027,7 @@ static SETTINGS_ZH: &[(&str, &str)] = &[
     ("font.fontSizeFooter", "界面字体影响侧栏、标签页等 UI 元素 · 终端字体影响终端内文字显示"),
     ("font.ligatures", "连体字"),
     ("font.ligaturesDescPrefix", "开启后 "),
-    ("font.ligaturesDescSuffix", " 等会合成 ligature glyph，需字体本身含 calt 表（如 Fira Code、JetBrains Mono）· Windows 完整支持；macOS / Linux 受 webview API 限制，仅 ~60 条内置 Iosevka fallback"),
+    ("font.ligaturesDescSuffix", " 等会合成 ligature glyph，需字体本身含 calt 表（如 Fira Code、JetBrains Mono）"),
     ("font.ligaturesTitle", "启用终端连体字 (ligatures)"),
     ("font.ligaturesUnavailable", "GPUI 版终端是自绘渲染器，按「一个字符一列」摆放，暂不支持连体字"),
     ("font.terminalFont", "终端字体"),
@@ -1220,7 +1220,7 @@ static SETTINGS_EN: &[(&str, &str)] = &[
     ("font.fontSizeFooter", "UI font affects sidebar, tabs and other UI elements · Terminal font affects text inside the terminal"),
     ("font.ligatures", "Ligatures"),
     ("font.ligaturesDescPrefix", "When enabled, "),
-    ("font.ligaturesDescSuffix", " and similar combine into ligature glyphs. The font itself must include a calt table (e.g. Fira Code, JetBrains Mono) · Fully supported on Windows; on macOS / Linux, webview API limits restrict it to ~60 built-in Iosevka fallbacks"),
+    ("font.ligaturesDescSuffix", " and similar combine into ligature glyphs. The font itself must include a calt table (e.g. Fira Code, JetBrains Mono)"),
     ("font.ligaturesTitle", "Enable terminal ligatures"),
     ("font.ligaturesUnavailable", "The GPUI terminal draws glyphs itself, one character per column, so ligatures are not supported yet"),
     ("font.terminalFont", "Terminal font"),

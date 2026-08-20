@@ -4,108 +4,93 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**mini-term** — 一个基于 Tauri v2 的桌面终端管理器，支持多项目、多标签、分屏布局，并能感知 AI 进程（Claude/Codex）状态。
+**mini-term** — GPUI 原生桌面终端管理器，支持多项目、多标签、分屏布局，并能感知 AI 进程（Claude/Codex/Grok 等）状态；带移动端中转镜像与 SSH 远程项目能力。
 
-- **前端**: React 19 + TypeScript + Tailwind CSS v4 + Vite
-- **后端**: Rust (Tauri v2)，使用 `portable-pty` 管理 PTY
-- **终端渲染**: xterm.js v6（WebGL addon，自动降级为 Canvas）
-- **状态管理**: Zustand（全局单一 store）
-- **布局分割**: Allotment（三栏主布局）+ 递归 SplitNode 树（分屏终端）
+- **UI/渲染**: [gpui](https://crates.io/crates/gpui) 0.2.x（Zed 官方，crates.io 版）+ gpui-component（Resizable/Modal/Input/Tree 等）
+- **终端**: alacritty_terminal（VT 状态机，进程内直喂，无 IPC）+ portable-pty
+- **发布形态**: Windows x64 便携 zip（exe + 三个 sidecar + portable-conpty，全部「与 exe 同目录」）
+- **历史**: 项目最初是 Tauri v2 + React 实现，v1.0.0-beta 后整体删除切换到 GPUI 原生版；找旧实现看 git 历史（合并点 `236d5c1`）
 
 ## 开发命令
 
 ```bash
-# 启动完整 Tauri 开发环境（前端 + 后端一起）
-npm run tauri dev
+# 首次/换版本后：构建三个 sidecar 并连同便携 ConPTY 就位到 target/debug/
+node scripts/stage-sidecars.mjs
 
-# 仅启动 Vite 前端（无后端，Tauri API 不可用）
-npm run dev
+# 启动开发实例（⚠️ 与装机版并跑时必须隔离数据目录）
+MT_APP_DATA_DIR="$LOCALAPPDATA/mini-term-gpui-dev" cargo run -p mt-app
 
-# 构建发布包
-npm run tauri build
+# 全工作区测试（26 个目标 1300+ 例）
+cargo test --workspace
 
-# 仅构建前端
-npm run build
+# 中转服务端协议边界测试 / sidecar 工作区
+cd relay-server && cargo test
+cargo build --manifest-path sidecars/Cargo.toml
 
-# Rust 单元测试（在 src-tauri/ 目录下运行）
-cd src-tauri && cargo test
+# 移动端 PWA
+cd mobile && npm run build
+
+# 改文案后重新生成 i18n 字典
+node crates/mt-i18n/tools/gen_from_ts.mjs
 ```
+
+- ⚠️ **禁跑 `cargo fmt`**：本仓 HEAD 非 rustfmt-clean，全仓 fmt 会重排几十个文件淹没 diff。
+- ⚠️ GPUI dev 实例运行中时 `cargo test -p mt-app` 会卡在「无法替换 target/debug/mini-term.exe」——先关实例，或 `cargo test --no-run --message-format=json` 取出测试二进制直接执行。
 
 ## 架构说明
 
-### Rust 后端 (`src-tauri/src/`)
+### 工作区布局
 
-| 文件 | 职责 |
+| 目录 | 说明 |
 |------|------|
-| `lib.rs` | Tauri app 初始化，注册所有 command 和 plugin |
-| `pty.rs` | PTY 生命周期管理（create/write/resize/kill）；16ms 批量缓冲后通过 `pty-output` 事件推送数据；reader→flush 走**有界** channel，配合前端水位实现全链路背压（见「PTY 数据流」） |
-| `process_monitor.rs` | 后台线程每 500ms 判定各 pane 状态（idle/ai-idle/ai-working）：hook 上报（`hook_server.rs`）一旦启用即为权威，退出以 SessionEnd 为准；无 hook 时降级为输入检测（`pty.rs` 的 AI 命令识别）+ 输出活跃度轮询，通过 `pty-status-change` 事件通知前端。非 hook 的例外有两条。① **用户打断**：Claude 在 Esc/Ctrl+C 中断时不发任何事件（官方文档明示 `Stop` 不触发），由 `write_pty` 识别裸 Esc/Ctrl+C 后调 `hook_server::note_user_interrupt` 把 hook 状态收敛为 ai-idle，cause=`Interrupt` 不算完成。② **停摆兜底**（`stall_settle_target`）：hook 停在 ai-working 且状态与 PTY 输出双双静默 10s 时收敛——此前触发过退出（Ctrl+D/双击 Ctrl+C/`/exit` 且之后无 hook 事件扶正）判为已退出 → `idle`/cause=`StallExit`，否则 → `ai-idle`/cause=`Stall`；正等用户批准的 pane（上次 cause 属 attention 类，如 Codex 的 `PermissionRequest`）豁免，否则黄灯会被抹掉。两条兜底都把结论**落盘**进 hook 状态，触发一次即收敛、不再摆动——这是与 v0.9.3 删掉的无记忆兜底（假完成每 20~50s 重复播报）的分水岭 |
-| `config.rs` | `AppConfig` 持久化到 `{app_data_dir}/config.json`；提供跨平台预置 shell 列表 |
-| `fs.rs` | 目录列表（过滤 `.gitignore`）+ `notify` 文件监听，通过 `fs-change` 事件通知前端 |
-| `ai_sessions.rs` | 读取 Claude/Codex 历史会话记录 |
-| `mobile_relay.rs` | 移动端中转体系：对中转服务器的出站 WSS 长连（带桌面端密钥握手、指数退避重连）、配对码/重置配对、项目快照与项目级增量、镜像订阅管理、移动端指令写穿 PTY、移动端发起会话的校验与派发、移动端改会话名的标题收敛 |
-| `mobile_mirror.rs` | 对话镜像：pane → 项目最新会话 JSONL 的增量解析（半行拼接）、分页取数 |
+| `crates/` | 主工作区（根 Cargo.toml，members = crates/*） |
+| `sidecars/` | sidecar 二进制独立工作区（miniterm-hook / mt-ssh-mcp / mt-ssh-cli）。版本号自成语义——daemon 换代靠它判断，**不跟随主程序发版**，故不并入根 workspace。产物由 `scripts/stage-sidecars.mjs` 就位到主程序 exe 同目录 |
+| `relay-server/` | 移动端中转服务（axum），其 `protocol` crate 被 `mt-relay` 跨工作区 path 依赖 |
+| `mobile/` | 移动端 PWA（React + TS + Vite），产物由中转托管 |
 
-**Tauri Commands**: `load_config`, `save_config`, `create_pty`, `write_pty`, `resize_pty`, `kill_pty`, `kill_all_ptys`, `set_pty_flow_paused`, `list_directory`, `watch_directory`, `unwatch_directory`, `get_ai_sessions`, `scan_session_lineage`, `mobile_relay_apply`, `mobile_relay_status`, `mobile_relay_request_pairing_code`, `mobile_relay_reset_pairing`, `mobile_relay_update_sessions`, `mobile_relay_launchers_changed`, `mobile_relay_start_session_result`, `mobile_relay_check_launcher_command`
+### crates/ 各 crate 职责
 
-**Tauri Events（后端→前端）**: `pty-output`, `pty-exit`, `pty-status-change`, `fs-change`, `mobile-relay-status`, `mobile-relay-pairing-code`, `mobile-start-session`, `mobile-rename-pane`
+| crate | 职责 |
+|-------|------|
+| `mt-app` | GPUI 应用壳：Workspace 组件树、AppStore 全局状态、SplitNode 布局树、各面板/弹窗/托盘/标题栏。组件树图见 `main.rs` 模块注释 |
+| `mt-ui` | GPUI 渲染层：终端 view/element、主题桥。不含业务逻辑 |
+| `mt-terminal` | VT 状态机 + grid 模型（alacritty_terminal 封装）。不依赖 gpui |
+| `mt-pty` | PTY 生命周期（spawn/read/write/resize/kill）+ 便携 ConPTY 预载（`conpty.rs`，从 exe 旁 `portable-conpty/` LoadLibrary 预载） |
+| `mt-ai` | AI 感知：hook server（权威）、hook 注册（`hook_registry.rs`）、输入检测降级（`detect.rs`）、状态判定（`monitor.rs`/`perception.rs`）、会话记录读取（`sessions.rs`） |
+| `mt-project` | 文件树、目录监听、搜索、Git（git2，vendored-openssl 必须保留）、外部编辑器、WSL 发行版枚举 |
+| `mt-config` | 配置持久化与主题包。不依赖 gpui |
+| `mt-i18n` | 双语文案层。**字典源头是 `locales/*.ts`**（TS 对象字面量，随 Tauri 版下线迁入），`src/dict.rs` 由 `tools/gen_from_ts.mjs` 生成——**禁止手改 dict.rs**，改文案改 locales 后重跑生成器，`tests/consistency.rs` 的对账常量随之更新 |
+| `mt-relay` | 移动端中转桌面侧：出站 WSS 长连、配对、项目快照/增量、对话镜像（`mirror.rs`）、移动端指令写穿 |
+| `mt-ssh` | 共享 SSH 通信层（russh 持久会话池 + SFTP 原语），主程序与 sidecar 共用 |
+| `mt-usage` | 用量统计：会话轮次解析 / SQLite 账本 / 聚合 / 计价 |
+| `mt-core` | 叶子共享库（WSL UNC 解析 / SSH 提示扫描 / 原子写等）。⚠️ 依赖方向铁律：只依赖 serde/serde_json/dirs，绝不反向依赖上层 crate——它同时被三个 sidecar 与 mt-ssh 链接 |
 
-### 移动端中转体系（`relay-server/` + `mobile/`）
+### PTY 数据流（进程内，无 IPC）
 
-- `relay-server/protocol`：桌面端与中转共享的协议消息 crate（JSON over WebSocket，serde camelCase，带版本号握手校验，当前 v2）；PWA 侧 TypeScript 类型在 `mobile/src/protocol.ts` 手写镜像，两侧字段必须同步维护
-- `relay-server/server`：axum 中转服务，只做转发不落盘；桌面端接入需携带 `MT_RELAY_DESKTOP_KEY`（未配置即拒绝一切桌面连接，fail-closed）；`cd relay-server && cargo test` 跑 Seam 1 协议边界测试
-- `mobile/`：React + TS + Vite PWA（扫码配对、会话列表、对话镜像、移动端指令、发起新 AI 会话、会话重命名）；`cd mobile && npm run build` 构建，产物由中转托管；部署见 `docs/deploy-relay.zh-CN.md`（英文版 `docs/deploy-relay.md`）
+reader 线程读 PTY 字节直接喂 `mt-terminal` 的 VT 状态机，UI 按帧取 grid 渲染。
+原 Tauri 版的 16ms 批缓冲 / 有界 channel / 4MB-1MB 双水位背压 / 30s 超时兜底整套
+是为 WebView IPC 边界造的，已随架构作废；孤儿 PTY 回收同理（单进程无失引用链路）。
+
+### AI 状态判定（idle / ai-idle / ai-working）
+
+hook 上报（`mt-ai::hook_server`）一旦启用即为权威，退出以 SessionEnd 为准；无 hook 时降级为输入检测（`mt-ai::detect` 识别键入的 `claude`/`codex`/`opencode`/`pi`/`grok` 命令，含 ↑ 历史/Tab 补全的行快照兜底与输出回扫）+ 输出活跃度轮询。非 hook 的例外有两条：
+
+1. **用户打断**：Claude 在 Esc/Ctrl+C 中断时不发任何事件（官方文档明示 `Stop` 不触发），由写入侧识别裸 Esc/Ctrl+C 后调 `note_user_interrupt` 把 hook 状态收敛为 ai-idle，cause=`Interrupt` 不算完成。
+2. **停摆兜底**（`stall_settle_target`）：hook 停在 ai-working 且状态与 PTY 输出双双静默 10s 时收敛——此前触发过退出（Ctrl+D/双击 Ctrl+C/`/exit` 且之后无 hook 事件扶正）判为已退出 → `idle`/cause=`StallExit`，否则 → `ai-idle`/cause=`Stall`；正等用户批准的 pane（上次 cause 属 attention 类，如 Codex 的 `PermissionRequest`）豁免，否则黄灯会被抹掉。
+
+**铁律**：两条兜底都把结论**落盘**进 hook 状态，触发一次即收敛、不再摆动——无记忆兜底（假完成每 20~50s 重复播报）是踩过的坑，别回去。
+
+### 移动端中转体系（`relay-server/` + `mobile/` + `mt-relay`）
+
+- `relay-server/protocol`：桌面端与中转共享的协议消息 crate（JSON over WebSocket，serde camelCase，版本号握手校验，当前 v2）；PWA 侧 TypeScript 类型在 `mobile/src/protocol.ts` 手写镜像，两侧字段必须同步维护
+- `relay-server/server`：axum 中转，只做转发不落盘；桌面端接入需携带 `MT_RELAY_DESKTOP_KEY`（未配置即拒绝一切桌面连接，fail-closed）
 - **AI 启动器**：桌面端配置的具名 `{名称, shell?, 命令}`，移动端只按 id 引用、看得到名字，命令文本从不经过移动端或中转（ADR 0002 的边界）
-
-### 前端 (`src/`)
-
-**数据流**：
-- `store.ts` 是唯一全局状态，用 `Map<projectId, ProjectState>` 存储每个项目的 tabs
-- 每个 Tab 的终端区域是一棵 `SplitNode` 树（leaf = 单个 pane，split = 横/纵分屏）
-- `PaneStatus` 优先级：`error > ai-working > ai-idle > idle`，从叶节点聚合到 Tab 级别
-
-**关键组件**：
-
-| 组件 | 职责 |
-|------|------|
-| `App.tsx` | 三栏 Allotment 主布局（ProjectList \| FileTree \| TerminalArea + AIHistoryPanel） |
-| `TerminalArea.tsx` | Tab 管理 + 分屏逻辑（`insertSplit`/`removePane` 操作 SplitNode 树） |
-| `SplitLayout.tsx` | 递归渲染 SplitNode 树，使用 Allotment 实现可拖拽分屏 |
-| `TerminalInstance.tsx` | xterm.js 终端实例，WebGL 渲染，ResizeObserver 自适应，文件拖拽插入路径 |
-| `TerminalConfigModal.tsx` | 终端配置 modal（shell 列表管理） |
-| `MobileRelayModal.tsx` | 「移动端」面板：中转地址 + 桌面端密钥、连接状态、配对二维码、AI 启动器 |
-| `AiLauncherSection.tsx` | AI 启动器增删改（名称 / shell / 命令 + 命令识别警告），嵌在「移动端」面板 |
-
-**类型系统** (`src/types.ts`): 前端所有类型定义，与后端 Rust 结构通过 `serde(rename_all = "camelCase")` 对齐。
-
-### PTY 数据流
-
-```
-用户键入 → xterm.onData → invoke('write_pty') → Rust writer
-Rust reader → 有界 channel → 16ms 批量缓冲 → emit('pty-output') → term.write()
-                  ↑                                                    │
-                  └── 背压：flush 暂停 → channel 满 → reader 停读 ←────┘
-                      invoke('set_pty_flow_paused')  ← 前端积压过高水位
-进程退出 → emit('pty-exit') → store.updatePaneStatusByPty('error')
-进程监控 → emit('pty-status-change') → store.updatePaneStatusByPty(status)
-页面加载 → invoke('kill_all_ptys') → 回收上一轮遗留的 PTY（早于任何 create_pty）
-```
-
-**背压**：`term.write()` 的完成回调统计「已收到未解析」的字节数，越过 4MB 让后端暂停投递、
-回落到 1MB 恢复。后端暂停时 flush 不取数据，有界 channel 迅速填满，reader 随之停止从 ConPTY 读，
-背压直达刷屏进程本身——和真实终端一样，慢终端拖慢 `cat`，而不是把数据全缓存到内存里。
-后端有 30s 超时兜底，前端崩了也不会把 shell 永久卡在写阻塞上。
-
-**孤儿 PTY**：`PtyManager` 活在主进程里，WebView2 renderer 被 OOM 杀掉后页面重载，
-恢复出的 pane 是全新 id 并各自新建 PTY，旧 PTY 就此无人引用却继续运行（崩一次漏一整套，
-内存压力递增形成正反馈）。前端在 `load_config` 之前先 `kill_all_ptys` 掐断这条链路。
+- 部署见 `docs/deploy-relay.zh-CN.md`（英文版 `docs/deploy-relay.md`）
 
 ## 注意事项
 
-- 文件拖拽到终端会将文件路径作为文本写入 PTY（不是上传文件）
-- `WebkitAppRegion: 'drag'` 用于自定义标题栏拖拽，菜单项需设置 `no-drag` 区域
-- 分屏关闭最后一个 pane 时会关闭整个 tab（`removePane` 返回 `null` 时触发）
-- AI 会话识别有两层：Claude/Codex/Grok hook 上报（`hook_server.rs`，权威）+ 输入检测（`pty.rs` 识别键入的 `claude`/`codex`/`opencode`/`pi`/`grok` 命令，含 ↑ 历史/Tab 补全的行快照兜底与输出回扫）；不做子进程名轮询
-- Grok 的 hook 接入与另外两家有两处结构性差异，改动前先看 `hook_registry::register_grok_hooks` 的注释：① grok 默认还会扫描 `~/.claude/settings.json` 的 hooks（Claude 兼容层），同一事件会来两趟，sidecar 靠 `GROK_SESSION_ID` + 是否带 argv 丢弃兼容层那趟（只注册了 Claude 的用户必须放行——那是唯一来源，判据落在原生 hook 文件是否在场）；② 注册进 `~/.grok/hooks/` 的命令必须是**不含空格的裸文件名**（hook 二进制随注册复制进该目录），带空格会被 grok 丢给 shell，而 Windows 上具体是 git-bash/pwsh/powershell/cmd 由环境决定、四家引号语义互斥；事件名改由 grok 注入的 `GROK_HOOK_EVENT` 传递
-- 只有 Claude/Codex/Grok 有可解析的会话记录（`mobile_mirror::agent_has_session_log`）。opencode/pi 这类**只靠输入检测识别**的 agent 拿得到状态徽章与移动端指令，但没有对话镜像、AI 历史面板与用量统计——镜像必须据此跳过启发式绑定，否则会绑到同项目其它 agent 的最新会话文件，把别人的对话贴到该 pane 上
-- Grok 的会话记录形态与另外两家不同：一个会话是**一整个目录**（`{grok_home}/sessions/{URL 编码的 cwd}/{session-id}/`，正文 `updates.jsonl` 是 ACP 更新流，一条消息拆成多个 chunk 行、攒到边界才成一条；元信息在 `summary.json`）。定位项目走**解码目录名**而非编码项目路径，详见 `ai_sessions` 的 Grok 段注释
+- Grok 的 hook 接入与另外两家有两处结构性差异，改动前先看 `mt-ai::hook_registry::register_grok_hooks` 的注释：① grok 默认还会扫描 `~/.claude/settings.json` 的 hooks（Claude 兼容层），同一事件会来两趟，sidecar 靠 `GROK_SESSION_ID` + 是否带 argv 丢弃兼容层那趟（只注册了 Claude 的用户必须放行——那是唯一来源，判据落在原生 hook 文件是否在场）；② 注册进 `~/.grok/hooks/` 的命令必须是**不含空格的裸文件名**（hook 二进制随注册复制进该目录），带空格会被 grok 丢给 shell，而 Windows 上具体是 git-bash/pwsh/powershell/cmd 由环境决定、四家引号语义互斥；事件名改由 grok 注入的 `GROK_HOOK_EVENT` 传递
+- 只有 Claude/Codex/Grok 有可解析的会话记录（`mt-relay::mirror` 的 `agent_has_session_log`）。opencode/pi 这类**只靠输入检测识别**的 agent 拿得到状态徽章与移动端指令，但没有对话镜像、AI 历史面板与用量统计——镜像必须据此跳过启发式绑定，否则会绑到同项目其它 agent 的最新会话文件，把别人的对话贴到该 pane 上
+- Grok 的会话记录形态与另外两家不同：一个会话是**一整个目录**（`{grok_home}/sessions/{URL 编码的 cwd}/{session-id}/`，正文 `updates.jsonl` 是 ACP 更新流，一条消息拆成多个 chunk 行、攒到边界才成一条；元信息在 `summary.json`）。定位项目走**解码目录名**而非编码项目路径，详见 `mt-ai::sessions` 的 Grok 段注释
+- GPUI 迁移期的逐批决策与「记档不修」清单在 `docs/gpui-migration-progress.md`——改到相关模块（拖拽/托盘/标题栏/关窗/toast 等）前先查该文档对应批次的记档，很多「看起来是 bug」的行为是评审定稿的取舍
+- 领域术语表在 `CONTEXT.md`（会话/会话来源/项目等 ubiquitous language）

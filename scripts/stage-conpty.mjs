@@ -2,7 +2,9 @@
 //
 // mini-term 当前只发布 Windows x64 进程。按 Microsoft NuGet targets 的约定，
 // x64 进程必须携带 x64 conpty.dll，以及 x64/ARM64 两种原生系统 host。
-// 产物由 tauri.windows.conf.json 映射到应用 resource_dir()/portable-conpty。
+// 产物就位到主程序 exe 同目录的 portable-conpty/（运行时 mt-pty 按
+// current_exe().parent() 解析预载）；通常经 stage-sidecars.mjs 按 profile
+// 传入 outputDir 调用，单独执行本脚本则默认就位到 target/debug/。
 
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
@@ -50,8 +52,8 @@ export const CONPTY_PACKAGE = Object.freeze({
   ]),
 });
 
-const CACHE_DIR = join('src-tauri', '.conpty-cache');
-export const STAGED_CONPTY_DIR = join('src-tauri', 'resources', 'portable-conpty');
+const CACHE_DIR = '.conpty-cache';
+export const STAGED_CONPTY_DIR = join('target', 'debug', 'portable-conpty');
 
 function assertSupportedTarget(target) {
   if (target !== WINDOWS_X64_TARGET) {

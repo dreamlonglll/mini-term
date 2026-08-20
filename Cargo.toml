@@ -1,22 +1,20 @@
-# mini-term GPUI 改造工作区
+# mini-term 主工作区(GPUI 原生应用)
 #
-# 这个工作区**只包含 `crates/`**。现有的 Tauri 应用(`src-tauri/`)、中转服务端
-# (`relay-server/`)、移动端 PWA(`mobile/`) 全部排除在外，各自保持独立构建 ——
-# 迁移期间 `npm run tauri dev` 与 CI 不受任何影响，新旧两套并存到功能对齐为止。
+# 这个工作区只包含 `crates/`。其余目录各自独立构建:
+#   - `sidecars/`:sidecar 二进制工作区(miniterm-hook / mt-ssh-mcp / mt-ssh-cli)。
+#     版本号自成语义(daemon 换代靠它判断,不跟随主程序发版),且并入会触发依赖
+#     统一重排本工作区的 Cargo.lock,故保持独立。由 scripts/stage-sidecars.mjs
+#     构建并就位到主程序 exe 同目录。
+#   - `relay-server/`:移动端中转服务(其 protocol crate 被 mt-relay path 依赖,
+#     与 sidecars 依赖 crates/mt-core 是同一种跨工作区用法)。
+#   - `mobile/`:移动端 PWA(纯前端,无 Rust)。
 #
-# 对齐之后的收尾动作:
-#   1. ✅ 已完成(收尾-1 批):`mt-core` / `mt-ssh` 已从 `src-tauri/` 物理移入
-#      `crates/`。它们同时是本工作区的成员**和** `src-tauri` / `src-tauri/mt-sidecars`
-#      两个旧工作区的跨工作区 path 依赖(与 `relay-server/protocol` 同一种用法)。
-#      ⚠️ 这两个 crate 的 `edition` / `version` 保持**显式**值(2021 / 各自原版本号),
-#      不改用 `workspace.package` 继承 —— 旧 Tauri 侧仍在编译它们,语义必须一字不变。
-#      `scripts/stage-sidecars.mjs` 无需改动:`mt-sidecars` 本身仍在 `src-tauri/` 下,
-#      manifest 路径与产物目录(`src-tauri/mt-sidecars/target/`)都没变。
-#   2. 删除 `src-tauri/` 与 `src/`，本文件的 exclude 随之清空
+# 历史:旧 Tauri 版(`src-tauri/` + React 前端 `src/`)已随 v1.0.0-beta 后的
+# 发版切换整体删除,GPUI 版是唯一形态;找旧实现看 git 历史。
 [workspace]
 resolver = "3"
 members = ["crates/*"]
-exclude = ["src-tauri", "relay-server", "mobile", ".tmp-tests"]
+exclude = ["sidecars", "relay-server", "mobile"]
 
 [workspace.package]
 version = "1.0.0-beta"

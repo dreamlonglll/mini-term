@@ -1,12 +1,12 @@
 <p align="center">
-  <img src="../src-tauri/icons/icon.png" width="128" height="128" alt="Mini-Term Logo">
+  <img src="icon.png" width="128" height="128" alt="Mini-Term Logo">
 </p>
 
 <h1 align="center">Mini-Term</h1>
 
 <p align="center">
   <strong>A desktop terminal manager built for the AI era</strong><br>
-  Powered by Tauri v2 · Multi-project · Multi-tab · Split-pane layout · AI process awareness · SSH remote projects · Git worktree management · Watch your AI from your phone
+  GPUI-native · Multi-project · Multi-tab · Split-pane layout · AI process awareness · SSH remote projects · Git worktree management · Watch your AI from your phone
 </p>
 
 <p align="center">
@@ -18,9 +18,8 @@
   <img src="https://img.shields.io/badge/version-1.0.0--beta-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
-  <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
-  <img src="https://img.shields.io/badge/React-19-61dafb" alt="react">
-  <img src="https://img.shields.io/badge/Rust-2021-dea584" alt="rust">
+  <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
+  <img src="https://img.shields.io/badge/Rust-1.95%2B-dea584" alt="rust">
 </p>
 
 ---
@@ -42,19 +41,19 @@ Mini-Term solves all of the above with one lightweight desktop app.
 ### Terminal Core
 
 - **Multi-tab management** — A dedicated tab per project, drag to reorder, status icons at a glance.
-- **Recursive splitting** — Arbitrarily nested horizontal / vertical splits, drag to adjust ratios via Allotment.
-- **Pane drag to rearrange & merge** — Terminal tabs can be dragged as a unit: drop onto another group's tab bar or the center of its terminal area to merge into that group (the tab bar shows an insertion indicator, and dragging within the same bar reorders tabs), or drop onto one of the four edges (25% depth) to split off a new pane in that direction, with a translucent drop preview. Dragging uses a hand-rolled mousedown/mousemove pipeline (Tauri's dragDropEnabled intercepts in-WebView HTML5 DnD), Esc cancels mid-drag, and cached xterm instances migrate intact through the layout-tree rearrangement — terminal content and PTYs are unaffected.
+- **Recursive splitting** — Arbitrarily nested horizontal / vertical splits, drag to adjust ratios.
+- **Pane drag to rearrange & merge** — Terminal tabs can be dragged as a unit: drop onto another group's tab bar or the center of its terminal area to merge into that group (the tab bar shows an insertion indicator, and dragging within the same bar reorders tabs), or drop onto one of the four edges (25% depth) to split off a new pane in that direction, with a translucent drop preview. Dragging uses GPUI's built-in drag & drop (on_drag / on_drop), Esc cancels mid-drag, and cached terminal instances migrate intact through the layout-tree rearrangement — terminal content and PTYs are unaffected.
 - **Pane maximize** — Double-click the tab bar's empty area (or the maximize button on the right) to temporarily fill the terminal area with the current group; double-click or press again to restore. The state is runtime-only (never persisted), closing the maximized pane falls back to the full tree view automatically, and splitting while maximized restores first so the new pane is never invisible.
-- **High-performance rendering** — xterm.js v6 + WebGL acceleration, automatic fallback to Canvas; minimum contrast is enforced, fixing Claude's prompt text being nearly invisible against a dark background.
-- **Configurable scrollback buffer** — The number of retained normal-buffer lines is adjustable in Settings (10,000 by default; lowering it takes effect immediately and frees the memory). xterm allocates per line by column count, so the old hard-coded 100,000 meant a single terminal could hold 200+ MB — and terminals are only disposed when their pane closes, so enough projects and splits would push the renderer to OOM. Standard CSI 3J (ED3) is still honored globally, so applications such as Codex can discard transient output and replay a folded transcript, while `/clear` can truly purge old history; alternate-screen switching remains intercepted so TUI overlays stay in the main buffer with a usable scrollbar. On Windows, mini-term bundles and preloads a pinned official ConPTY compatibility runtime (with a system-ConPTY fallback if validation fails) to keep Codex scrolling and transcript folding consistent across Windows versions.
-- **Terminal caching** — Switching projects / tabs / panes never rebuilds the xterm instance, so existing content is preserved; lazy startup creates a PTY only for the currently visible pane, avoiding the slowdown of spawning more terminals the more history projects you have.
-- **Project-switch caching** — FileTree / GitHistory data is cached per project, so switching back to a visited project renders with zero latency; directory loading and Git status run in parallel, and Git repo scan results are cached for 30 seconds.
+- **High-performance rendering** — alacritty_terminal parses VT in-process with GPU-native rendering — zero IPC, zero serialization; minimum contrast is enforced, fixing Claude's prompt text being nearly invisible against a dark background.
+- **Configurable scrollback buffer** — The number of retained normal-buffer lines is adjustable in Settings (10,000 by default; lowering it takes effect immediately and frees the memory — an early version hard-coded 100,000 lines and could be pushed to out-of-memory across enough projects and splits, a lesson baked into today's default). Standard CSI 3J (ED3) is honored globally, so applications such as Codex can discard transient output and replay a folded transcript, while `/clear` can truly purge old history. On Windows, mini-term bundles and preloads a pinned official ConPTY compatibility runtime (with a system-ConPTY fallback if validation fails) to keep Codex scrolling and transcript folding consistent across Windows versions.
+- **Terminal caching** — Switching projects / tabs / panes never rebuilds the terminal instance, so existing content is preserved; lazy startup creates a PTY only for the currently visible pane, avoiding the slowdown of spawning more terminals the more history projects you have.
+- **Project-switch caching** — File-tree / Git-history data is cached per project, so switching back to a visited project renders with zero latency; directory loading and Git status run in parallel.
 - **Copy & paste** — `Ctrl+Shift+C/V` (macOS `⌘+Shift+C/V`) shortcuts + context menu, with "Copy" auto-greyed when nothing is selected; an optional "Smart `Ctrl+C/V`" mode (copy when there's a selection, interrupt the program when there isn't, and `Ctrl+V` pastes directly); on Windows, large multi-line pastes are chunked to prevent ConPTY from dropping lines.
 - **Dwell-to-copy selection** — After drag-selecting, holding the mouse still past a configurable dwell (default 1s, 0.2–60s, 0 = off) copies the selection and shows a "Copied" tip at the cursor; if the selection kept growing before mouse-up, it copies once more so the clipboard always matches the final selection.
 - **Long-text paste** — When clipboard text is ≥10 lines or ≥2000 chars, it is automatically saved to a temporary `.txt` and a quoted file path is pasted instead, avoiding the performance and paste-bracket issues of feeding huge content straight to AI tools.
 - **Image paste** — Detects screenshots in the clipboard, saves them to a temporary PNG via the Win32 API, and pastes a quoted path; compatible with non-standard formats such as PinPix.
 - **Remote / WSL paste lands where the agent can read it** — Both "save to a file, paste the path" features above automatically remap their destination in remote terminals: SSH remote projects upload the file over SFTP and paste the **remote** path (default `<project root>/.mini-term/pasted`, inside the project so agents need no extra permission; configurable to `/tmp/mini-term`, `~/uploads`, etc., and a self-ignoring `.gitignore` is written so your `git status` stays clean), while WSL projects rewrite `C:\...` into `/mnt/c/...` (no upload needed). Upload failures raise an explicit toast instead of pasting a local path the remote host cannot read.
-- **File drag & drop** — Dragging a file from the file tree or system file explorer onto the terminal inserts its quoted absolute path, targeting the exact split pane and handling paths with spaces. Press `Esc` mid-drag to cancel on the spot: no path is written to the PTY (that Esc is swallowed in the window capture phase, so it never reaches the terminal as `\x1b`), releasing the mouse doesn't degrade into a plain click that opens the file, and the hover outline is cleared along with it. Esc is only swallowed once the drag is actually active (past the 5px threshold), so Esc elsewhere still behaves normally.
+- **File drag & drop** — Dragging a file from the file tree or system file explorer onto the terminal inserts its quoted absolute path, targeting the exact split pane and handling paths with spaces. Press `Esc` mid-drag to cancel on the spot: no path is written to the PTY (the Esc is swallowed by the drag layer, so it never reaches the terminal as `\x1b`), releasing the mouse doesn't degrade into a plain click that opens the file, and the hover indicator is cleared along with it. Esc is only swallowed once the drag is actually active, so Esc elsewhere still behaves normally.
 - **Multiple shell profiles** — Windows (cmd / powershell / pwsh), macOS (zsh / bash), Linux (bash / sh) and more, freely added or removed.
 
 ### SSH Connections
@@ -71,7 +70,7 @@ Mini-Term solves all of the above with one lightweight desktop app.
 
 - **WSL directories as project roots** — Supports adding WSL paths in both `\\wsl$\<distro>\<unix-path>` and `\\wsl.localhost\<distro>\<unix-path>` forms as projects; the displayed path automatically strips the `\\?\UNC\` verbatim prefix, and the file tree expands and previews normally.
 - **Automatic wsl.exe launch** — When the cwd is detected as a WSL UNC path, `create_pty` ignores the user-configured shell (cmd / pwsh, etc.) and forces `wsl.exe -d <distro> --cd <unix-path>`, so the cwd truly lands inside WSL (`pwd` shows `/home/<user>/proj` rather than `C:\Windows`), consistent with Windows Terminal's `MangleStartingDirectoryForWSL` behavior; the distro name is parsed directly from the path without invoking `wsl -l -v`, and a one-time toast appears when the rewrite triggers.
-- **Known limitations** — AI process detection (ai-working / ai-idle states) relies on the host's `process_monitor` reading child process names; after a wsl.exe launch, the `claude` / `codex` processes inside the WSL VM are out of the monitor's scope, so AI status stops working. `notify` file watching very likely loses events on the WSL 9P filesystem, so the file tree needs a manual refresh. Verified only on WSL2; WSL1 compatibility is not guaranteed.
+- **Known limitations** — AI status detection is limited for processes inside the WSL VM, so AI status may stop working. `notify` file watching very likely loses events on the WSL 9P filesystem, so the file tree needs a manual refresh. Verified only on WSL2; WSL1 compatibility is not guaranteed.
 
 ### File Search
 

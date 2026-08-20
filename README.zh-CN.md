@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="src-tauri/icons/icon.png" width="128" height="128" alt="Mini-Term Logo">
+  <img src="docs/icon.png" width="128" height="128" alt="Mini-Term Logo">
 </p>
 
 <h1 align="center">Mini-Term</h1>

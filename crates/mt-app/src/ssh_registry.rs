@@ -39,9 +39,8 @@ const MCP_SERVER_NAME: &str = "mini-term-ssh";
 
 /// 获取 `mt-ssh-cli` sidecar 二进制的绝对路径(与主程序同目录的兄弟 bin)。
 ///
-/// ⚠️ GPUI dev 下 `mini-term.exe` 在根 `target/debug`,而 sidecar 由
-/// `stage-sidecars.mjs` 放进 `src-tauri/target/debug` —— 那是收尾-1 批记档里
-/// 的「GPUI dev 产物布局」遗留,与本模块无关(装机版布局正确)。
+/// dev 下 `stage-sidecars.mjs` 把 sidecar 裸名就位到根 `target/debug`
+/// (与 `mini-term.exe` 同目录),与发布包布局一致。
 fn ssh_cli_binary_path() -> Result<String, String> {
     let exe = std::env::current_exe().map_err(|e| format!("无法获取当前程序路径: {}", e))?;
     let dir = exe

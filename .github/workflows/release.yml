@@ -1,14 +1,18 @@
 name: Build & Release
 
-# v1.0.0-beta 起的发布形态:
-# - 三平台 Tauri 安装包照旧(Windows NSIS/MSI、macOS dmg、Linux deb/rpm/AppImage);
-#   预发布 tag(含 `-`,如 v1.0.0-beta)自动收窄 bundle —— MSI(WiX)要纯数字
-#   版本、rpm 版本不许带 `-`,这两种包只随正式版 tag 发。
-# - 新增 GPUI 原生版(crates/mt-app)Windows x64 便携 zip:mini-term.exe +
-#   三个 sidecar(miniterm-hook / mt-ssh-cli / mt-ssh-mcp,运行时按「与 exe
-#   同目录」定位)+ portable-conpty/(mt-pty 的便携 ConPTY 预载)。
-# - release 壳由 create-release 先建好(prerelease 按 tag 自动标),两路构建
-#   只向其上传产物,避免并行抢建 release。
+# 发布形态(GPUI 原生版,三平台矩阵参考旧 Tauri 流水线):
+# - Windows x64:便携 zip(mini-term.exe + 三个 sidecar + portable-conpty/,
+#   运行时全部按「与 exe 同目录」定位,解压即用)
+# - macOS arm64:.app bundle 打成 dmg(无签名,首次打开需 `xattr -cr` 放行,
+#   bundle id 沿用旧 Tauri 版的 com.mini-term.app)
+# - Linux x64:deb + tar.gz(deb 版本号把 `-` 换成 `~`,预发布序才正确 ——
+#   1.0.0~beta < 1.0.0;rpm 不做了,旧流水线里它本来就进不了预发布版本号)
+# - sidecar 由 stage-sidecars.mjs 就位到 target/release/,组装步骤直接从
+#   该目录收集 —— 目录布局即最终包布局
+# - release 壳由 create-release 先建好(prerelease 按 tag 含 `-` 自动标),
+#   三平台只向其上传产物,避免并行抢建 release
+# ⚠️ macOS / Linux 是「代码支持,可用性欠佳」档,构建线未经真机验证;
+#   fail-fast: false 保证它们失败不拖累 Windows 产物
 
 on:
   push:
@@ -20,8 +24,6 @@ jobs:
     runs-on: ubuntu-22.04
     permissions:
       contents: write
-    outputs:
-      release_id: ${{ steps.create.outputs.id }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -57,7 +59,7 @@ jobs:
           body: ${{ steps.changelog.outputs.body }}
           prerelease: ${{ contains(github.ref_name, '-') }}
 
-  build-tauri:
+  build-gpui:
     needs: create-release
     strategy:
       fail-fast: false
@@ -65,16 +67,10 @@ jobs:
         include:
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
-            # 预发布版本号进不了 MSI(WiX 只收 major.minor.patch.build 纯数字)
-            prerelease_bundles: nsis
           - platform: macos-latest
             target: aarch64-apple-darwin
-            # macOS 两种产物都接受预发布版本号,列全等价于默认 all
-            prerelease_bundles: app dmg
           - platform: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            # rpm 版本不许带 `-`,预发布只出 deb + AppImage
-            prerelease_bundles: deb appimage
 
     runs-on: ${{ matrix.platform }}
     permissions:
@@ -83,18 +79,17 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # gpui Linux 后端(x11/wayland,见 mt-app 的 target 依赖段)的构建依赖:
+      # font-kit 要 fontconfig/freetype,xkb/wayland 头文件给 windowing 层。
       - name: Install Linux dependencies
         if: matrix.platform == 'ubuntu-22.04'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            librsvg2-dev \
-            patchelf \
-            libxdo-dev \
-            libayatana-appindicator3-dev \
-            build-essential \
-            file
+            build-essential clang cmake pkg-config \
+            libfontconfig1-dev libfreetype6-dev \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-dev libxcb1-dev libasound2-dev
 
       - name: Setup Node.js
         uses: actions/setup-node@v5
@@ -109,73 +104,119 @@ jobs:
       - name: Rust cache
         uses: swatinem/rust-cache@v2
         with:
-          workspaces: src-tauri -> target
-
-      - name: Install frontend dependencies
-        run: npm ci
-
-      - name: Build & stage sidecars
-        run: node scripts/stage-sidecars.mjs --release --target ${{ matrix.target }}
-
-      - name: Build Tauri app
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          releaseId: ${{ needs.create-release.outputs.release_id }}
-          args: --target ${{ matrix.target }}${{ contains(github.ref_name, '-') && format(' --bundles {0}', matrix.prerelease_bundles) || '' }}
-
-  build-gpui-windows:
-    needs: create-release
-    runs-on: windows-latest
-    permissions:
-      contents: write
-    env:
-      TARGET: x86_64-pc-windows-msvc
-
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v5
-        with:
-          node-version: 22
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ env.TARGET }}
-
-      - name: Rust cache
-        uses: swatinem/rust-cache@v2
-        with:
           workspaces: |
             . -> target
-            src-tauri/mt-sidecars -> target
+            sidecars -> target
 
-      # sidecar 三件 + 便携 ConPTY:与 Tauri 流水线共用同一脚本,产物落在
-      # src-tauri/binaries/<name>-<triple>.exe 与 src-tauri/resources/portable-conpty/
-      - name: Build & stage sidecars + portable ConPTY
-        run: node scripts/stage-sidecars.mjs --release --target ${{ env.TARGET }}
+      - name: Build & stage sidecars (+ portable ConPTY on Windows)
+        run: node scripts/stage-sidecars.mjs --release --target ${{ matrix.target }}
 
       - name: Build GPUI app
         run: cargo build --release --package mt-app
 
-      - name: Assemble portable bundle
+      - name: Assemble portable bundle (Windows)
+        if: matrix.platform == 'windows-latest'
         shell: pwsh
         run: |
           $dist = "dist/mini-term"
           New-Item -ItemType Directory -Force $dist | Out-Null
           Copy-Item target/release/mini-term.exe $dist/
           foreach ($name in 'miniterm-hook', 'mt-ssh-cli', 'mt-ssh-mcp') {
-            Copy-Item "src-tauri/binaries/$name-${{ env.TARGET }}.exe" "$dist/$name.exe"
+            Copy-Item "target/release/$name.exe" $dist/
           }
-          Copy-Item -Recurse src-tauri/resources/portable-conpty "$dist/portable-conpty"
+          Copy-Item -Recurse target/release/portable-conpty "$dist/portable-conpty"
           Compress-Archive -Path $dist -DestinationPath "dist/mini-term-gpui-${{ github.ref_name }}-windows-x64.zip"
           Get-ChildItem dist
 
-      - name: Upload GPUI bundle to release
+      - name: Assemble .app bundle + dmg (macOS)
+        if: matrix.platform == 'macos-latest'
+        shell: bash
+        run: |
+          TAG="${{ github.ref_name }}"
+          VERSION="${TAG#v}"
+          APP="dist/Mini-Term.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          for name in mini-term miniterm-hook mt-ssh-cli mt-ssh-mcp; do
+            cp "target/release/$name" "$APP/Contents/MacOS/"
+          done
+          mkdir -p icon.iconset
+          for size in 16 32 128 256 512; do
+            sips -z "$size" "$size" docs/icon.png --out "icon.iconset/icon_${size}x${size}.png" >/dev/null
+          done
+          iconutil -c icns icon.iconset -o "$APP/Contents/Resources/icon.icns"
+          cat > "$APP/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>Mini-Term</string>
+            <key>CFBundleDisplayName</key><string>Mini-Term</string>
+            <key>CFBundleIdentifier</key><string>com.mini-term.app</string>
+            <key>CFBundleExecutable</key><string>mini-term</string>
+            <key>CFBundleIconFile</key><string>icon</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>${VERSION}</string>
+            <key>CFBundleVersion</key><string>${VERSION}</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          hdiutil create -volname "Mini-Term" -srcfolder "$APP" -ov -format UDZO \
+            "dist/mini-term-gpui-${TAG}-macos-arm64.dmg"
+          ls -la dist
+
+      - name: Assemble deb + tar.gz (Linux)
+        if: matrix.platform == 'ubuntu-22.04'
+        shell: bash
+        run: |
+          TAG="${{ github.ref_name }}"
+          VERSION="${TAG#v}"
+          DEB_VERSION="${VERSION//-/~}"
+          STAGE="dist/mini-term"
+          mkdir -p "$STAGE"
+          for name in mini-term miniterm-hook mt-ssh-cli mt-ssh-mcp; do
+            cp "target/release/$name" "$STAGE/"
+          done
+          tar -C dist -czf "dist/mini-term-gpui-${TAG}-linux-x64.tar.gz" mini-term
+          # sidecar 按「与 exe 同目录」定位 → 全家落 /usr/lib/mini-term,
+          # /usr/bin 放符号链接(Linux 的 current_exe 走 /proc/self/exe,天然解链接)
+          PKG="dist/deb/mini-term_${DEB_VERSION}_amd64"
+          mkdir -p "$PKG/DEBIAN" "$PKG/usr/bin" "$PKG/usr/lib/mini-term" \
+            "$PKG/usr/share/applications" "$PKG/usr/share/icons/hicolor/512x512/apps"
+          for name in mini-term miniterm-hook mt-ssh-cli mt-ssh-mcp; do
+            cp "target/release/$name" "$PKG/usr/lib/mini-term/"
+          done
+          ln -s ../lib/mini-term/mini-term "$PKG/usr/bin/mini-term"
+          cp docs/icon.png "$PKG/usr/share/icons/hicolor/512x512/apps/mini-term.png"
+          cat > "$PKG/usr/share/applications/mini-term.desktop" <<'DESKTOP'
+          [Desktop Entry]
+          Name=Mini-Term
+          Exec=mini-term
+          Icon=mini-term
+          Type=Application
+          Categories=Development;TerminalEmulator;
+          DESKTOP
+          cat > "$PKG/DEBIAN/control" <<CONTROL
+          Package: mini-term
+          Version: ${DEB_VERSION}
+          Architecture: amd64
+          Maintainer: mini-term
+          Section: devel
+          Priority: optional
+          Description: Desktop terminal manager for the AI era
+           Multi-project tabs, recursive split panes, AI process awareness.
+          CONTROL
+          dpkg-deb --build --root-owner-group "$PKG" \
+            "dist/mini-term-gpui-${TAG}-linux-amd64.deb"
+          ls -la dist
+
+      - name: Upload bundles to release
         uses: softprops/action-gh-release@v2
         with:
           prerelease: ${{ contains(github.ref_name, '-') }}
-          files: dist/mini-term-gpui-*.zip
+          files: |
+            dist/mini-term-gpui-*.zip
+            dist/mini-term-gpui-*.dmg
+            dist/mini-term-gpui-*.tar.gz
+            dist/mini-term-gpui-*.deb
