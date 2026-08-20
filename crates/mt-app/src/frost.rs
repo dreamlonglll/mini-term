@@ -29,8 +29,47 @@
 //!
 //! 捕获失败(非 Windows / GDI 出错)返回 `None`,退回纯 black/50 遮罩。
 
+/// GDI 抓下来的 1/4 尺寸 BGRA 原始快照(还没模糊)。
+///
+/// 抓帧与模糊**拆成两步**:PrintWindow 有窗口线程亲和性,必须留在 UI 线程;
+/// 而盒模糊在 debug 构建下要上百毫秒,同步跑会把弹窗首帧拖出肉眼可感的
+/// 「慢半拍」(用户实测)—— 由 [`finish`] 在后台线程收尾,玻璃晚一两帧
+/// 淡入,压暗层与弹窗本体零延迟。
 #[cfg(windows)]
-pub fn capture(window: &gpui::Window) -> Option<std::sync::Arc<gpui::RenderImage>> {
+pub struct RawSnapshot {
+    buf: Vec<u8>,
+    w: usize,
+    h: usize,
+}
+
+#[cfg(not(windows))]
+pub struct RawSnapshot;
+
+/// 后台收尾:模糊 + 置 alpha + 组 RenderImage。纯 CPU,任意线程可跑。
+#[cfg(windows)]
+pub fn finish(raw: RawSnapshot) -> Option<std::sync::Arc<gpui::RenderImage>> {
+    let RawSnapshot { mut buf, w, h } = raw;
+    // 半径 3 跑两遍(两遍盒 ≈ 高斯,在 1/4 图上等效全尺寸 ~12px)——
+    // 残余的字符列纹理周期只有 2~4px,一遍小半径压不干净。
+    box_blur_bgra(&mut buf, w, h, 3, 2);
+    // GDI 不维护 alpha 通道(常见留 0),RenderImage 是预乘语义,置 255。
+    for px in buf.chunks_exact_mut(4) {
+        px[3] = 0xFF;
+    }
+    // RenderImage 的帧就是 BGRA 字节序(assets.rs 文档明示),GDI 给的
+    // 恰好是 BGRA —— `RgbaImage` 在这里只是字节容器,不做通道解释。
+    let img = image::RgbaImage::from_raw(w as u32, h as u32, buf)?;
+    let frame = image::Frame::new(img);
+    Some(std::sync::Arc::new(gpui::RenderImage::new(vec![frame])))
+}
+
+#[cfg(not(windows))]
+pub fn finish(_raw: RawSnapshot) -> Option<std::sync::Arc<gpui::RenderImage>> {
+    None
+}
+
+#[cfg(windows)]
+pub fn capture_raw(window: &gpui::Window) -> Option<RawSnapshot> {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use std::ffi::c_void;
     use windows::Win32::Foundation::{HWND, RECT};
@@ -159,25 +198,16 @@ pub fn capture(window: &gpui::Window) -> Option<std::sync::Arc<gpui::RenderImage
         let _ = DeleteDC(half_dc);
         let _ = DeleteDC(small_dc);
 
-        let mut buf = out?;
-        // 半径 3 跑两遍(两遍盒 ≈ 高斯,在 1/4 图上等效全尺寸 ~12px)——
-        // 残余的字符列纹理周期只有 2~4px,一遍小半径压不干净。
-        box_blur_bgra(&mut buf, sw as usize, sh as usize, 3, 2);
-        // GDI 不维护 alpha 通道(常见留 0),RenderImage 是预乘语义,置 255。
-        for px in buf.chunks_exact_mut(4) {
-            px[3] = 0xFF;
-        }
-
-        // RenderImage 的帧就是 BGRA 字节序(assets.rs 文档明示),GDI 给的
-        // 恰好是 BGRA —— `RgbaImage` 在这里只是字节容器,不做通道解释。
-        let img = image::RgbaImage::from_raw(sw as u32, sh as u32, buf)?;
-        let frame = image::Frame::new(img);
-        Some(std::sync::Arc::new(gpui::RenderImage::new(vec![frame])))
+        Some(RawSnapshot {
+            buf: out?,
+            w: sw as usize,
+            h: sh as usize,
+        })
     }
 }
 
 #[cfg(not(windows))]
-pub fn capture(_window: &gpui::Window) -> Option<std::sync::Arc<gpui::RenderImage>> {
+pub fn capture_raw(_window: &gpui::Window) -> Option<RawSnapshot> {
     None
 }
 

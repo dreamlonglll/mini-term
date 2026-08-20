@@ -303,6 +303,9 @@ struct Workspace {
     /// 弹窗毛玻璃背板的快照(见 [`frost`] 模块注释)。弹窗/用量面板从无到有的
     /// 第一帧抓一次,期间沿用,全关即弃 —— 开着时再抓会把弹窗自己抓进去。
     frost: Option<std::sync::Arc<gpui::RenderImage>>,
+    /// 后台模糊任务(抓帧在 UI 线程、模糊在后台,见 [`frost::finish`])。
+    /// drop 即取消 —— 弹窗在模糊完成前就关掉时,结果直接作废。
+    frost_task: Option<Task<()>>,
     /// 启动自检发现的新版本(`None` = 没有 / 还没查完 / 查失败)。
     ///
     /// 与原版 `App.tsx:89` 的 `updateInfo` 同一份状态:只在进程内活着,不落盘,
@@ -452,6 +455,7 @@ impl Workspace {
             drawer_drag: None,
             usage_open: false,
             frost: None,
+            frost_task: None,
             update_release: None,
             tray,
             _update_check: update_check,
@@ -1040,15 +1044,32 @@ impl Render for Workspace {
 
         // 弹窗毛玻璃背板:Dialog 族或用量面板**从无到有的第一帧**抓一次快照
         // (那一刻 DWM 的上一帧还没有弹窗),期间沿用,全关即弃 —— 开着时再抓
-        // 会把弹窗自己抓进去。时序论证与取舍见 frost.rs 模块注释。
+        // 会把弹窗自己抓进去。抓帧同步(PrintWindow 有窗口线程亲和性,也快),
+        // 模糊丢后台 —— 同步跑 debug 构建的模糊会把弹窗首帧拖出「慢半拍」
+        // (用户实测);玻璃晚一两帧淡入,压暗层与弹窗本体零延迟。
         let dialog_open = window.has_active_dialog(cx);
         let frost_wanted = dialog_open || self.usage_open;
         if frost_wanted {
-            if self.frost.is_none() {
-                self.frost = frost::capture(window);
+            if self.frost.is_none() && self.frost_task.is_none() {
+                if let Some(raw) = frost::capture_raw(window) {
+                    self.frost_task = Some(cx.spawn(async move |this, cx| {
+                        let img = cx
+                            .background_executor()
+                            .spawn(async move { frost::finish(raw) })
+                            .await;
+                        let _ = this.update(cx, |this, cx| {
+                            this.frost_task = None;
+                            if let Some(img) = img {
+                                this.frost = Some(img);
+                                cx.notify();
+                            }
+                        });
+                    }));
+                }
             }
-        } else if self.frost.is_some() {
+        } else if self.frost.is_some() || self.frost_task.is_some() {
             self.frost = None;
+            self.frost_task = None;
         }
 
         let store_for_columns = self.store.clone();
