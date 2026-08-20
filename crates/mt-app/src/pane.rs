@@ -24,9 +24,18 @@
 //! `futures::mpsc` 无界 channel 丢信号,主线程上 `cx.spawn` 起的前台任务 `await`
 //! 它,醒来后 `cx.notify()`。
 //!
-//! 这是**事件驱动**,不是定时轮询 —— 空闲时一帧都不画。唯一的定时器是收到信号后
-//! 的 16ms 节流:刷屏时 reader 每读一块就发一个信号,不节流会让重绘频率跟着 read
-//! 次数走(远高于 60fps)。
+//! 这是**事件驱动**,不是定时轮询 —— 空闲时一帧都不画。
+//!
+//! 醒来之后分两条路,**节奏不同**:
+//!
+//! | 走什么 | 归谁管 | 节拍 |
+//! |--------|--------|------|
+//! | `drain_term_events`(PtyWrite/DA/DSR 应答) | 本循环 | [`DRAIN_PERIOD`] 恒 16ms |
+//! | `cx.notify()`(重绘) | [`crate::redraw`] | 前台 33ms / 后台 200ms,**全局共用一条** |
+//!
+//! 分开是因为两者的「晚一拍」代价完全不同:应答晚了对面的 TUI 干等,画面晚一拍
+//! 没人看得出来。此前两件事绑在同一个 16ms 定时器上,于是每个 pane 各自按 62fps
+//! 请求整窗重绘 —— N 个 pane 相位错开,等于每个 vsync 都撞上一次 dirty。
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -59,6 +68,7 @@ use crate::markers::MarkerBatch;
 use crate::menu::{self, MenuItem};
 use crate::notify::ToastKind;
 use crate::overlay;
+use crate::redraw;
 use crate::store::AppStore;
 use crate::toast;
 
@@ -144,6 +154,15 @@ const FLASH_DURATION: Duration = Duration::from_millis(300);
 /// 光标绝对行的**最小值**,而 AI 开始输出后光标只会往下走,后续重绘的块首也在
 /// 已打出的消息**之下** —— 多等只是多采样几个更大的值。
 const MARK_SETTLE_DELAY: Duration = Duration::from_millis(200);
+
+/// 唤醒循环合并 PTY 读信号的窗口。刷屏时 reader 每读一块就发一个信号,不合并的话
+/// 这条循环会跟着 read 次数空转。
+///
+/// ⚠️ 这**不是**重绘节拍 —— 那个在 [`crate::redraw`],前台 33ms / 后台 200ms。
+/// 这一档管的是 [`TerminalPane::drain_term_events`]:终端要回给程序的应答
+/// (PtyWrite / DA / DSR)走它,晚一拍对面的 TUI 就多等一拍,所以它跟着读节奏走、
+/// **不随窗口前后台变**。
+const DRAIN_PERIOD: Duration = Duration::from_millis(16);
 
 impl EventEmitter<PaneEvent> for TerminalPane {}
 
@@ -271,16 +290,21 @@ impl TerminalPane {
                         if let Some(code) = exit {
                             pane.exited = true;
                             cx.emit(PaneEvent::Exited(code));
+                            // 退出是一次性事件:不进节拍器,当场画完收工
+                            cx.notify();
                         }
-                        cx.notify();
                     })
                     .is_err()
                 {
                     return;
                 }
-                cx.background_executor()
-                    .timer(Duration::from_millis(16))
-                    .await;
+                // 重绘交给全局节拍器:多个 pane 一起刷屏也只出一帧,窗口在后台
+                // 时还会自动降到 5fps。**这里不再自己 `notify`** —— 缘由见
+                // `crate::redraw` 的模块注释。
+                if exit.is_none() && cx.update(|cx| redraw::request(this.clone(), cx)).is_err() {
+                    return;
+                }
+                cx.background_executor().timer(DRAIN_PERIOD).await;
             }
         });
 

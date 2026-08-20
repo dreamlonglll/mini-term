@@ -79,6 +79,7 @@ mod project_list;
 mod project_switcher;
 mod project_tree;
 mod prompt;
+mod redraw;
 mod remote_project;
 mod remote_ssh;
 mod search_modal;
@@ -361,6 +362,9 @@ impl Workspace {
         let activation = cx.observe_window_activation(window, move |_, window, cx| {
             let active = window.is_window_active();
             store_for_focus.update(cx, |store, cx| store.set_window_focused(active, cx));
+            // 终端重绘的节拍跟着前后台切档:后台按 5fps 画就够了,挂着 AI 跑、
+            // 人切去别的窗口时按满帧重绘整窗是纯浪费。见 `crate::redraw`。
+            redraw::set_window_active(active, cx);
             // 顺手重探一次「减少动画」:用户多半是切到系统设置里改完再切回来的。
             // 变了才刷窗口(闪烁类动画的挂/摘只发生在 render 里)。
             if active && motion::refresh() {
