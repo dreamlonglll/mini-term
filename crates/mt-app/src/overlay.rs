@@ -104,6 +104,9 @@ pub mod kind {
     pub const ADD_REMOTE_PROJECT: &str = "add-remote-project";
     /// 项目环境变量弹窗。
     pub const PROJECT_ENV_VARS: &str = "project-env-vars";
+    /// 日期选择浮层(用量面板的自定义起止)。种类唯一 —— 起、止两个输入框各点一次
+    /// 只该开一个:第二次点会顶掉第一个(宿主换掉实体,旧的 drop 时摘栈)。
+    pub const DATE_PICKER: &str = "date-picker";
 }
 
 /// 栈里的一条。

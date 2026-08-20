@@ -44,6 +44,7 @@ mod activity_bar;
 mod ai;
 mod branch_family;
 mod clipboard;
+mod date_picker;
 mod dnd;
 mod env_vars;
 mod file_tree;
