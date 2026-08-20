@@ -1,22 +1,80 @@
 name: Build & Release
 
+# v1.0.0-beta 起的发布形态:
+# - 三平台 Tauri 安装包照旧(Windows NSIS/MSI、macOS dmg、Linux deb/rpm/AppImage);
+#   预发布 tag(含 `-`,如 v1.0.0-beta)自动收窄 bundle —— MSI(WiX)要纯数字
+#   版本、rpm 版本不许带 `-`,这两种包只随正式版 tag 发。
+# - 新增 GPUI 原生版(crates/mt-app)Windows x64 便携 zip:mini-term.exe +
+#   三个 sidecar(miniterm-hook / mt-ssh-cli / mt-ssh-mcp,运行时按「与 exe
+#   同目录」定位)+ portable-conpty/(mt-pty 的便携 ConPTY 预载)。
+# - release 壳由 create-release 先建好(prerelease 按 tag 自动标),两路构建
+#   只向其上传产物,避免并行抢建 release。
+
 on:
   push:
     tags:
       - 'v*'
 
 jobs:
-  build:
+  create-release:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    outputs:
+      release_id: ${{ steps.create.outputs.id }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Generate changelog
+        id: changelog
+        shell: bash
+        run: |
+          CURRENT_TAG="${{ github.ref_name }}"
+          PREV_TAG=$(git tag --sort=-v:refname | grep '^v' | sed -n '2p')
+          if [ -z "$PREV_TAG" ]; then
+            RANGE="$CURRENT_TAG"
+          else
+            RANGE="${PREV_TAG}..${CURRENT_TAG}"
+          fi
+          LOGS=$(git log "$RANGE" --pretty=format:"- %s" --no-merges)
+          # write to GITHUB_OUTPUT using delimiter
+          {
+            echo "body<<CHANGELOG_EOF"
+            echo "## 更新内容"
+            echo ""
+            echo "$LOGS"
+            echo ""
+            echo "CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        id: create
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Mini-Term ${{ github.ref_name }}
+          body: ${{ steps.changelog.outputs.body }}
+          prerelease: ${{ contains(github.ref_name, '-') }}
+
+  build-tauri:
+    needs: create-release
     strategy:
       fail-fast: false
       matrix:
         include:
           - platform: windows-latest
             target: x86_64-pc-windows-msvc
+            # 预发布版本号进不了 MSI(WiX 只收 major.minor.patch.build 纯数字)
+            prerelease_bundles: nsis
           - platform: macos-latest
             target: aarch64-apple-darwin
+            # macOS 两种产物都接受预发布版本号,列全等价于默认 all
+            prerelease_bundles: app dmg
           - platform: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
+            # rpm 版本不许带 `-`,预发布只出 deb + AppImage
+            prerelease_bundles: deb appimage
 
     runs-on: ${{ matrix.platform }}
     permissions:
@@ -24,8 +82,6 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
 
       - name: Install Linux dependencies
         if: matrix.platform == 'ubuntu-22.04'
@@ -55,28 +111,6 @@ jobs:
         with:
           workspaces: src-tauri -> target
 
-      - name: Generate changelog
-        id: changelog
-        shell: bash
-        run: |
-          CURRENT_TAG="${{ github.ref_name }}"
-          PREV_TAG=$(git tag --sort=-v:refname | grep '^v' | sed -n '2p')
-          if [ -z "$PREV_TAG" ]; then
-            RANGE="$CURRENT_TAG"
-          else
-            RANGE="${PREV_TAG}..${CURRENT_TAG}"
-          fi
-          LOGS=$(git log "$RANGE" --pretty=format:"- %s" --no-merges)
-          # write to GITHUB_OUTPUT using delimiter
-          {
-            echo "body<<CHANGELOG_EOF"
-            echo "## 更新内容"
-            echo ""
-            echo "$LOGS"
-            echo ""
-            echo "CHANGELOG_EOF"
-          } >> "$GITHUB_OUTPUT"
-
       - name: Install frontend dependencies
         run: npm ci
 
@@ -88,9 +122,60 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: Mini-Term ${{ github.ref_name }}
-          releaseBody: ${{ steps.changelog.outputs.body }}
-          releaseDraft: false
-          prerelease: false
-          args: --target ${{ matrix.target }}
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          args: --target ${{ matrix.target }}${{ contains(github.ref_name, '-') && format(' --bundles {0}', matrix.prerelease_bundles) || '' }}
+
+  build-gpui-windows:
+    needs: create-release
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    env:
+      TARGET: x86_64-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            src-tauri/mt-sidecars -> target
+
+      # sidecar 三件 + 便携 ConPTY:与 Tauri 流水线共用同一脚本,产物落在
+      # src-tauri/binaries/<name>-<triple>.exe 与 src-tauri/resources/portable-conpty/
+      - name: Build & stage sidecars + portable ConPTY
+        run: node scripts/stage-sidecars.mjs --release --target ${{ env.TARGET }}
+
+      - name: Build GPUI app
+        run: cargo build --release --package mt-app
+
+      - name: Assemble portable bundle
+        shell: pwsh
+        run: |
+          $dist = "dist/mini-term"
+          New-Item -ItemType Directory -Force $dist | Out-Null
+          Copy-Item target/release/mini-term.exe $dist/
+          foreach ($name in 'miniterm-hook', 'mt-ssh-cli', 'mt-ssh-mcp') {
+            Copy-Item "src-tauri/binaries/$name-${{ env.TARGET }}.exe" "$dist/$name.exe"
+          }
+          Copy-Item -Recurse src-tauri/resources/portable-conpty "$dist/portable-conpty"
+          Compress-Archive -Path $dist -DestinationPath "dist/mini-term-gpui-${{ github.ref_name }}-windows-x64.zip"
+          Get-ChildItem dist
+
+      - name: Upload GPUI bundle to release
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: dist/mini-term-gpui-*.zip

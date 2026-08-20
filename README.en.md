@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.14.0-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.0.0--beta-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -27,6 +27,8 @@
   <a href="docs/features.md">Full feature list</a> ·
   <a href="docs/deploy-relay.md">Relay deployment</a>
 </p>
+
+> **v1.0.0-beta**: starting with this release, a **GPUI-native build** (Rust-native rendering, full UI rewrite, no WebView2 dependency) ships as a Windows x64 portable bundle `mini-term-gpui-*-windows-x64.zip` — unzip and run, feedback welcome. The three-platform Tauri installers continue to be published as usual.
 
 ---
 

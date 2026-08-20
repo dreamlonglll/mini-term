@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.14.0-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.0.0--beta-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/Tauri-v2-orange" alt="tauri">
@@ -27,6 +27,8 @@
   <a href="docs/features.zh-CN.md">完整功能清单</a> ·
   <a href="docs/deploy-relay.zh-CN.md">中转部署</a>
 </p>
+
+> **v1.0.0-beta**：本版起 Release 附带 **GPUI 原生版**（Rust 原生渲染，整套 UI 重写，不再依赖 WebView2）的 Windows x64 便携包 `mini-term-gpui-*-windows-x64.zip`，解压即用，欢迎试用反馈；三平台 Tauri 安装包照常发布。
 
 ---
 

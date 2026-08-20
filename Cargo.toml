@@ -19,7 +19,7 @@ members = ["crates/*"]
 exclude = ["src-tauri", "relay-server", "mobile", ".tmp-tests"]
 
 [workspace.package]
-version = "0.13.1"
+version = "1.0.0-beta"
 edition = "2024"
 # 与 src-tauri 保持同一底线(libsqlite3-sys 0.38 的 build.rs 用 cfg_select!)
 rust-version = "1.95"
