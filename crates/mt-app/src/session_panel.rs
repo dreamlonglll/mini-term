@@ -1044,10 +1044,8 @@ impl Render for SessionPanel {
                             .child(
                                 BrandIcon::new(vendor)
                                     .size(px(14.0))
-                                    // VectorIcon 自己画,不继承 text_color:
-                                    // 单色厂商图标与品牌色片上的字形都得显式喂色
-                                    .color(ui::text_secondary())
-                                    .contrast(ui::bg_elevated()),
+                                    // VectorIcon 自己画,不继承 text_color
+                                    .color(ui::text_secondary()),
                             ),
                     )
                     .child(

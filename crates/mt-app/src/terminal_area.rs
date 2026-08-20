@@ -1268,8 +1268,7 @@ impl TerminalArea {
                                     ui::text_primary()
                                 } else {
                                     ui::text_muted()
-                                })
-                                .contrast(ui::bg_elevated()),
+                                }),
                         )
                     })
                     .child(div().child(label_text.clone()))

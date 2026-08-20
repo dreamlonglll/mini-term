@@ -392,8 +392,7 @@ impl BranchFamilyPanel {
                         BrandIcon::new(vendor)
                             .size(px(12.0))
                             // VectorIcon 自己画,不继承 text_color
-                            .color(ui::text_secondary())
-                            .contrast(ui::bg_overlay()),
+                            .color(ui::text_secondary()),
                     ),
             )
             .child(

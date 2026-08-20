@@ -2395,8 +2395,7 @@ impl ProjectList {
                                     .size(px(AI_ICON_SIZE))
                                     // 固定 text-secondary 上下文:单色品牌图标不随
                                     // 选中行的 accent 变色(与 tab 上观感一致)
-                                    .color(ui::text_secondary())
-                                    .contrast(ui::bg_surface()),
+                                    .color(ui::text_secondary()),
                             );
                         }
                         el.child(stack)

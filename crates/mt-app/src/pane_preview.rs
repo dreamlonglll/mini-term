@@ -276,8 +276,7 @@ fn mini_pane(info: &MiniPaneInfo, style: &TerminalStyle, area: Size<Pixels>) -> 
         label_bar = label_bar.child(
             BrandIcon::new(info.vendor)
                 .size(px(11.0))
-                .color(ui::text_secondary())
-                .contrast(ui::bg_overlay()),
+                .color(ui::text_secondary()),
         );
     }
     label_bar = label_bar.child(div().flex_1().truncate().child(info.label.clone()));

@@ -453,19 +453,17 @@ pub const ALL_VENDORS: &[AiVendor] = &[
 /// ```ignore
 /// BrandIcon::new(AiVendor::from_session_type(&pane.agent)).size(px(13.0))
 /// ```
+///
+/// 没有 `contrast()` —— 官方 path 全是单色填充,`Ink::Contrast`(实心底上的字形色)
+/// 一处也用不上;那是自绘简化标记时代「品牌色片 + 内嵌字形」双色结构留下的,
+/// 已随官方 path 一起去掉。[`StatusDot`](super::status::StatusDot) /
+/// [`TechIcon`](super::tech::TechIcon) 仍有这档墨水,别照着它们抄。
 #[derive(IntoElement)]
 pub struct BrandIcon {
     vendor: Option<AiVendor>,
     size: Pixels,
     /// `Ink::Current` 的取色(Grok / OpenCode / Ollama / pi / 未知回退跟这个走)。
     color: Option<Hsla>,
-    /// `Ink::Contrast` 的取色。
-    ///
-    /// ⚠️ **当前一枚品牌图标都用不到它** —— 官方 path 全是单色填充,
-    /// `Ink::Contrast`(实心底上的字形色)是自绘简化标记时代「品牌色片 +
-    /// 内嵌字形」那套双色结构留下的。留着是因为调用方已经在传,而
-    /// [`VectorIcon`] 本身仍支持这档墨水;真要清掉得连调用方一起改。
-    contrast: Option<Hsla>,
 }
 
 impl BrandIcon {
@@ -475,7 +473,6 @@ impl BrandIcon {
             vendor,
             size: px(13.0),
             color: None,
-            contrast: None,
         }
     }
 
@@ -488,12 +485,6 @@ impl BrandIcon {
         self.color = Some(color);
         self
     }
-
-    /// 见字段注释:官方 path 全是单色填充,这条**当前不影响任何一枚图标**。
-    pub fn contrast(mut self, color: Hsla) -> Self {
-        self.contrast = Some(color);
-        self
-    }
 }
 
 impl RenderOnce for BrandIcon {
@@ -502,9 +493,6 @@ impl RenderOnce for BrandIcon {
         let mut icon = VectorIcon::new(shapes, self.size);
         if let Some(c) = self.color {
             icon = icon.ink(c);
-        }
-        if let Some(c) = self.contrast {
-            icon = icon.contrast(c);
         }
         icon
     }
