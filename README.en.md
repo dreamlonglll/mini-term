@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.0.1--beta-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.0.2--beta-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -165,10 +165,11 @@ The whole application is **native Rust** (the earlier Tauri + React build was re
 | UI | Pure Rust: gpui-component + hand-drawn widgets |
 | Terminal | alacritty_terminal (in-process VT parsing — zero IPC, zero serialization) · portable-pty |
 | State / layout | Single store · recursive SplitNode tree |
+| Config / layout persistence | rusqlite (`config.db` for settings · `layout.db` for the UI layout) |
 | Git / files | git2 (libgit2) · notify + ignore |
 | Usage stats | rusqlite local ledger · hand-drawn trend charts |
 | Mobile relay | axum + tokio WebSocket (`relay-server/`) · React + Vite PWA (`mobile/`) |
-| Tests | **1,369 Rust tests** (26 test targets) |
+| Tests | **1,439 Rust tests** (27 test targets) |
 
 ---
 
