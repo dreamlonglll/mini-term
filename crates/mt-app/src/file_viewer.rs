@@ -577,7 +577,7 @@ fn title_of(tail: &str) -> Option<String> {
 enum MdImageSrc {
     /// 本地文件(相对路径已按当前文件所在目录解析)
     Local(PathBuf),
-    /// 远程图片:**不自动去取**,画成一枚可点的占位(见 [`FileViewer::render_md_images`])
+    /// 远程图片:字节由 [`PreviewHttpClient`] 拉回来(见 [`FileViewer::render_md_remote_image`])
     Remote(String),
     /// `data:` / 认不出的 scheme
     Unsupported,
@@ -642,26 +642,33 @@ fn to_file_url(path: &Path) -> Option<String> {
     Url::from_file_path(path).ok().map(|url| url.to_string())
 }
 
-/// 只认 `file://` 的 HTTP 客户端,装在 `main` 里(`cx.set_http_client`)。
+/// 预览器的 HTTP 客户端,装在 `main` 里(`cx.set_http_client`)。
 ///
 /// gpui 默认那份是 `NullHttpClient`(`gpui/app.rs:2343`,`send()` 直接报错),
 /// 而 gpui-component 的富文本渲染器把图片一律画成 `img(SharedUri)`
-/// (`text/node.rs:609`)—— URI 走的就是 http client。于是预览里那些**内联**图片
-/// (块级图片行由 [`FileViewer::render_md_images`] 自绘)全靠这条路:渲染前源码里
-/// 的本地路径被改写成 `file:///…`([`rewrite_md_image_urls`] / [`rewrite_html_urls`]),
-/// 到这里读盘返回。
+/// (`text/node.rs:609`)—— URI 走的就是 http client。于是预览里的图片全靠这条路:
 ///
-/// **不代理真实网络**:非 `file` 的 scheme 一律拒绝 —— 打开一份文档就静默向外
-/// 发一串请求不该是默认(原版跑在 WebView 里没得选,这里有得选)。远程图片画成
-/// 一枚可点的占位,点了才用系统浏览器打开。
-pub struct LocalFileHttpClient;
+/// - `file://`:本地图片。md / html 源里的相对路径在渲染前被改写成绝对 file URL
+///   ([`rewrite_md_image_urls`] / [`rewrite_html_urls`]),到这里读盘返回。
+/// - `http(s)://`:网络图片(README 顶上的徽章、外链截图)。`reqwest::blocking`
+///   拉回来 —— 与价格表那条链同一个客户端库(见 `pricing::fetch_models_dev`)。
+///
+/// 其余 scheme 一律拒绝。出网那支有两条硬约束:**10s 超时**(`reqwest::blocking`
+/// 默认无限等)与 **32MB 上限**(坏 URL 不该把内存拖垮),详见 [`fetch_remote_bytes`]。
+pub struct PreviewHttpClient;
 
-impl HttpClient for LocalFileHttpClient {
+impl HttpClient for PreviewHttpClient {
     fn type_name(&self) -> &'static str {
-        "LocalFileHttpClient"
+        "PreviewHttpClient"
     }
 
     fn user_agent(&self) -> Option<&HeaderValue> {
+        None
+    }
+
+    /// 代理由 `reqwest` 自己按环境变量认(`HTTP_PROXY` / `HTTPS_PROXY`),
+    /// 这里不额外指定 —— gpui 只拿它做展示,不参与请求构造。
+    fn proxy(&self) -> Option<&Url> {
         None
     }
 
@@ -672,13 +679,18 @@ impl HttpClient for LocalFileHttpClient {
         let uri = req.uri().to_string();
         Box::pin(async move {
             let url = Url::parse(&uri).with_context(|| format!("URL 解析失败: {uri}"))?;
-            anyhow::ensure!(url.scheme() == "file", "只读本地文件,拒绝请求: {uri}");
-            let path = url
-                .to_file_path()
-                .map_err(|_| anyhow::anyhow!("不是本地文件路径: {uri}"))?;
-            // 读盘是阻塞的,但这条 future 由 gpui 的 asset 系统丢在后台执行器上跑
-            let bytes = std::fs::read(&path)
-                .with_context(|| format!("读不到 {}", path.display()))?;
+            // 读盘与出网都是**阻塞**的,但这条 future 由 gpui 的 asset 系统
+            // 丢在后台执行器上跑,不落主线程
+            let bytes = match url.scheme() {
+                "file" => {
+                    let path = url
+                        .to_file_path()
+                        .map_err(|_| anyhow::anyhow!("不是本地文件路径: {uri}"))?;
+                    std::fs::read(&path).with_context(|| format!("读不到 {}", path.display()))?
+                }
+                "http" | "https" => fetch_remote_bytes(&uri)?,
+                other => anyhow::bail!("预览不支持的协议 {other}: {uri}"),
+            };
             Ok(Response::builder()
                 .status(StatusCode::OK)
                 .body(AsyncBody::from(bytes))?)
@@ -686,11 +698,51 @@ impl HttpClient for LocalFileHttpClient {
     }
 }
 
+/// 一次 GET,把响应体整个读回来。**阻塞**,只许在后台执行器上调 —— gpui 的
+/// asset 系统正是这么跑的(`app.rs:2018` 的 `background_executor().spawn`)。
+///
+/// 客户端存成进程级单例:每次请求现建一个要重做 TLS 栈初始化,而 README 顶上
+/// 一排徽章就是一串并发请求。
+///
+/// ⚠️ 已知取舍:每个请求会占住一个后台线程直到超时,一屏全是拉不动的远程图片时
+/// (离线 / 墙)线程池会被占满 10s。超时因此压得比价格表那条链(15s)短 ——
+/// 图片拉不回来只是少一张图,不值得把后台线程按住更久。
+fn fetch_remote_bytes(url: &str) -> anyhow::Result<Vec<u8>> {
+    /// 徽章服务(shields.io 之流)对没有 UA 的请求有的直接 403
+    const UA: &str = concat!("mini-term/", env!("CARGO_PKG_VERSION"));
+    /// 单张图片的字节上限。超了宁可不画,也不把几百 MB 读进内存
+    const MAX_BYTES: u64 = 32 * 1024 * 1024;
+    static CLIENT: std::sync::OnceLock<reqwest::blocking::Client> = std::sync::OnceLock::new();
+    use std::io::Read as _;
+
+    let client = CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .user_agent(UA)
+            .build()
+            .unwrap_or_default()
+    });
+    let resp = client.get(url).send()?;
+    anyhow::ensure!(
+        resp.status().is_success(),
+        "HTTP {} — {url}",
+        resp.status().as_u16()
+    );
+    // content-length 可能缺席(chunked),所以读的时候再兜一次上限
+    if let Some(len) = resp.content_length() {
+        anyhow::ensure!(len <= MAX_BYTES, "图片过大({len} 字节): {url}");
+    }
+    let mut body = Vec::new();
+    resp.take(MAX_BYTES + 1).read_to_end(&mut body)?;
+    anyhow::ensure!(body.len() as u64 <= MAX_BYTES, "图片过大: {url}");
+    Ok(body)
+}
+
 /// 把 md 源里图片的**本地**目标改写成 `file:///…` 绝对 URL。
 ///
 /// 整行只有图片的那些行由 [`FileViewer::render_md_images`] 自绘、不经过这里;
 /// 这条是给**内联**图片兜底的(列表项 `- ![a](b)`、引用块、表格格子里的图片)——
-/// 它们要走 TextView,而那条路只认网络 URI,配上 [`LocalFileHttpClient`] 才画得出来。
+/// 它们要走 TextView,而那条路只认网络 URI,配上 [`PreviewHttpClient`] 才画得出来。
 ///
 /// 围栏代码块与行内 code 里的图片语法是**代码不是图片**,原样留着。
 fn rewrite_md_image_urls(source: &str, base_dir: &Path) -> String {
@@ -757,7 +809,7 @@ fn rewrite_md_line_into(line: &str, base_dir: &Path, out: &mut String) {
 ///
 /// 逐条对照原版 `htmlSrcDoc`(`FileViewerModal.tsx:134-143`)那条正则,排除清单
 /// 也一样(http(s) / data / blob / mailto / tel / `#` / javascript)。原版靠
-/// `convertFileSrc` 转 asset 协议,这里转 `file://` 交给 [`LocalFileHttpClient`]。
+/// `convertFileSrc` 转 asset 协议,这里转 `file://` 交给 [`PreviewHttpClient`]。
 fn rewrite_html_urls(source: &str, base_dir: &Path) -> String {
     // 大小写不敏感的定位副本。`to_ascii_lowercase` 只动 ASCII,**字节长度不变**,
     // 索引因此能直接拿回原文切片(`to_lowercase` 就不行,有字符会变长)
@@ -1042,11 +1094,31 @@ fn render_md_table(
         .into_any_element()
 }
 
+/// 目标是不是 svg。远程 URL 只看路径末尾 —— 查询串(`?style=flat`)不算扩展名,
+/// 徽章那类 URL 常带。
+fn is_svg_target(url: &str) -> bool {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    file_name_of(path)
+        .rsplit_once('.')
+        .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("svg"))
+}
+
+/// 图片该占多宽(逻辑像素):原尺寸与可用宽取小 —— 小图保持原大(原版
+/// `max-width:100%` 也不放大),大图压到可用宽。
+///
+/// `size()` 给的是**设备像素**。svg 那条路 gpui 按 `SMOOTH_SVG_SCALE_FACTOR`
+/// 放大后光栅化(`elements/img.rs:696-706`),换算回逻辑像素要除回去 —— 那个常量
+/// 没从 gpui 导出(私有 mod + `use`,不是 `pub use`),只能照抄它的值 2.0。
+fn image_display_width(data: &gpui::RenderImage, is_svg: bool, avail_w: f32) -> f32 {
+    let scale = if is_svg { 2.0 } else { 1.0 };
+    (data.size(0).width.0 as f32 / scale).clamp(1.0, avail_w.max(1.0))
+}
+
 /// 图片画不出来时的占位:一枚描边小卡片,写 alt(没有就写文件名)。
 ///
-/// 三种情况共用 —— 还在读盘、读不出来(文件不在 / 格式解不了)、远程图片。
-/// `hint` 给悬停提示(远程 URL / 解析后的本地路径),`open` 有值时可点,
-/// 点了用系统浏览器打开。
+/// 三种情况共用 —— 还在取(读盘 / 拉网)、取不到(文件不在、格式解不了、403、
+/// 离线)、`data:` 之类不支持的目标。`hint` 给悬停提示(远程 URL / 解析后的
+/// 本地路径),`open` 有值时可点,点了用系统浏览器打开原图。
 fn md_image_placeholder(
     id: gpui::SharedString,
     label: gpui::SharedString,
@@ -1845,9 +1917,8 @@ impl FileViewer {
     /// 在预览里什么都不出 —— 原版是 `convertFileSrc(fileDir + '/' + src)`。
     /// 这里按当前文件所在目录解析成 `Resource::Path` 自己画。
     ///
-    /// **远程图片不自动去取**:gpui 默认的 `NullHttpClient`(`gpui/app.rs:2343`)
-    /// 压根发不出请求,而「打开一份 md 就静默向外发一串请求」也不该是默认。
-    /// 画成一枚可点的占位,点了才用系统浏览器打开。
+    /// 远程图片(徽章、外链截图)走 `Resource::Uri`,字节由 [`PreviewHttpClient`]
+    /// 拉回来 —— gpui 默认的 `NullHttpClient`(`gpui/app.rs:2343`)压根发不出请求。
     ///
     /// 宽度自己算而不是甩给 `max_w`:gpui 的 `img` 在宽高都是 `Auto` 时把两轴
     /// 一起填成图片原尺寸(`elements/img.rs:337-363`),此后 `max_w` 只压得住宽、
@@ -1877,7 +1948,7 @@ impl FileViewer {
                     self.render_md_local_image(id, label, &path, each_w, window, cx)
                 }
                 MdImageSrc::Remote(url) => {
-                    md_image_placeholder(id, label, Some(url.clone()), Some(url))
+                    self.render_md_remote_image(id, label, &url, each_w, window, cx)
                 }
                 MdImageSrc::Unsupported => {
                     md_image_placeholder(id, label, Some(image.url.clone()), None)
@@ -1927,30 +1998,44 @@ impl FileViewer {
         let resource = Resource::Path(Arc::from(path));
         let hint = path.to_string_lossy().to_string();
         match window.use_asset::<ImageAssetLoader>(&resource, cx) {
-            None => md_image_placeholder(id, label, Some(hint), None),
-            Some(Err(_)) => md_image_placeholder(id, label, Some(hint), None),
-            Some(Ok(data)) => {
-                // `data.size()` 是**设备像素**。svg 那条路 gpui 按
-                // `SMOOTH_SVG_SCALE_FACTOR` 放大后光栅化(`elements/img.rs:696-706`),
-                // 换算回逻辑像素要除回去 —— 那个常量没从 gpui 导出(私有 mod +
-                // `use`,不是 `pub use`),只能照抄它的值 2.0
-                let svg_scale = if path
-                    .extension()
-                    .is_some_and(|e| e.eq_ignore_ascii_case("svg"))
-                {
-                    2.0
-                } else {
-                    1.0
-                };
-                let natural_w = data.size(0).width.0 as f32 / svg_scale;
-                // 小图保持原大(原版 `max-width:100%` 也不放大),大图压到可用宽
-                let w = natural_w.min(avail_w).max(1.0);
-                img(path.to_path_buf())
-                    .id(id)
-                    .object_fit(gpui::ObjectFit::Contain)
-                    .w(px(w))
-                    .into_any_element()
-            }
+            // 还在读 / 读不出来(文件不在、格式解不了)都给占位,不留白
+            None | Some(Err(_)) => md_image_placeholder(id, label, Some(hint), None),
+            Some(Ok(data)) => img(path.to_path_buf())
+                .id(id)
+                .object_fit(gpui::ObjectFit::Contain)
+                .w(px(image_display_width(&data, is_svg_target(&hint), avail_w)))
+                .into_any_element(),
+        }
+    }
+
+    /// 一张网络图片(徽章、外链截图)。与本地那支同一套尺寸规则,差别只在资源
+    /// 是 URI —— 字节由 [`PreviewHttpClient`] 拉回来。
+    ///
+    /// 拉不动(离线 / 403 / 超时)时占位**可点**,用系统浏览器打开原图:总比
+    /// 一个死框强。还在拉的时候也是占位,拿到字节后自然换成图。
+    fn render_md_remote_image(
+        &self,
+        id: gpui::SharedString,
+        label: gpui::SharedString,
+        url: &str,
+        avail_w: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let uri = gpui::SharedUri::from(url.to_string());
+        let resource = Resource::Uri(uri.clone());
+        match window.use_asset::<ImageAssetLoader>(&resource, cx) {
+            None | Some(Err(_)) => md_image_placeholder(
+                id,
+                label,
+                Some(url.to_string()),
+                Some(url.to_string()),
+            ),
+            Some(Ok(data)) => img(uri)
+                .id(id)
+                .object_fit(gpui::ObjectFit::Contain)
+                .w(px(image_display_width(&data, is_svg_target(url), avail_w)))
+                .into_any_element(),
         }
     }
 
@@ -2083,7 +2168,7 @@ impl FileViewer {
     /// 这正是当初「只留源码态」的理由(模块注释偏差 2)。现在改为提供,配套两条:
     /// 顶上一句说明写清楚它是简版,工具栏常驻「用浏览器打开」给真效果的出口。
     /// 图片与其它本地资源靠 [`rewrite_html_urls`] 转 `file://`(原版是
-    /// `convertFileSrc`),由 [`LocalFileHttpClient`] 读盘。
+    /// `convertFileSrc`),由 [`PreviewHttpClient`] 读盘。
     fn render_html(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let source = rewrite_html_urls(&self.preview_source(), &self.preview_base_dir());
         let style = self.preview_text_style(cx);
@@ -2483,6 +2568,15 @@ mod tests {
     }
 
     #[test]
+    fn svg_判定_不被查询串骗到() {
+        // 徽章 URL 常带 `?style=`,扩展名只看路径那一截
+        assert!(is_svg_target("https://img.shields.io/badge/a-b.svg?style=flat"));
+        assert!(is_svg_target("D:\\icons\\a.SVG"));
+        assert!(!is_svg_target("https://x.dev/a.png"));
+        assert!(!is_svg_target("a/b.svg.png"), "只看最后一段扩展名");
+    }
+
+    #[test]
     fn md_内联图片的本地路径改写成_file_url() {
         let base = Path::new("D:\\Git\\mini-term\\docs");
         // 列表项里的内联图片(块级图片行走自绘,不经过这条)
@@ -2522,7 +2616,8 @@ mod tests {
         for keep in [
             r#"<a href="https://x.dev">x</a>"#,
             r#"<img src="data:image/png;base64,AAA">"#,
-            r#"<a href="#anchor">锚</a>"#,
+            // 井号锚点:`"#` 会提前结束 `r#"…"#`,这条必须用 `r##"…"##`
+            r##"<a href="#anchor">锚</a>"##,
             r#"<a href="mailto:a@b.c">mail</a>"#,
             r#"<a href="javascript:void(0)">js</a>"#,
             r#"<img src="file:///D:/site/a.png">"#,
