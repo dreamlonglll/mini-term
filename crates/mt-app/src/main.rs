@@ -115,7 +115,7 @@ use futures::StreamExt;
 use gpui::{
     AnimationExt as _, App, AppContext, Application, Bounds, Context, Entity, InteractiveElement,
     IntoElement, ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled,
-    Subscription, Task, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div,
+    Size, Subscription, Task, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div,
     point, prelude::FluentBuilder, px, size,
 };
 // img 的 `object_fit` 是 StyledImage 的方法(毛玻璃背板那两处在用)
@@ -352,6 +352,9 @@ struct Workspace {
     usage_panel: Option<Entity<UsagePanel>>,
     columns_state: Entity<ResizableState>,
     middle_state: Entity<ResizableState>,
+    /// 上一帧的视口尺寸,给上面两个分栏状态判「该不该重新播种」。
+    /// 见 [`Workspace::reseed_resizables_on_viewport_change`]。
+    last_viewport: Size<Pixels>,
     /// 右侧悬浮抽屉现在开着哪一块(运行时态,不持久化 —— 与旧版一致)。
     right_drawer: Option<DrawerPanel>,
     /// 正在播退场动画的那一块(见 [`DrawerExit`])。
@@ -522,6 +525,7 @@ impl Workspace {
             usage_panel: None,
             columns_state,
             middle_state,
+            last_viewport: window.viewport_size(),
             right_drawer: None,
             drawer_exit: None,
             drawer_drag: None,
@@ -1087,10 +1091,52 @@ impl Workspace {
         }
         project_switcher::open(self.store.clone(), window, cx);
     }
+
+    /// 视口尺寸一变,就把对应的 [`ResizableState`] 换成一个新的空实体 ——
+    /// 下一帧那一组分栏会重新以**持久化的绝对像素**做种(`.size(px(...))`)。
+    ///
+    /// 为什么非这么干不可(gpui-component 0.5.1 的两条行为叠加):
+    ///
+    /// 1. `resizable_panel().size(..)` 传的是 **initial_size**,只在面板 state 还是
+    ///    `None` 的那一帧读一次(`resizable/panel.rs` 里 `panel_state.size` 的
+    ///    `match`:一旦是 `Some` 就改按它算 flex_basis)。此后我们每帧照传,全被忽略。
+    /// 2. 组容器尺寸一变,`ResizableState::adjust_to_container_size()` 就把各面板
+    ///    **按当前比例**重新分配(`resizable/mod.rs`)—— 绝对像素被换算成百分比再乘回去。
+    ///
+    /// 于是只要**容器尺寸在首帧之后还会变**,还原进去的绝对像素就被乘上一个
+    /// 「新容器 / 旧容器」的系数。而这在 Windows 上是常态:窗口先按 windowed 尺寸
+    /// 画出第一帧、`ShowWindowAsync(SW_MAXIMIZE)` 是之后才异步生效的
+    /// (gpui `platform/windows/window.rs` 的 `set_window_placement`),用户拖窗口边框、
+    /// 换显示器同理。实测:layout.db 里存的左栏 400px,1280 开窗时首帧正确还原成 400,
+    /// 窗口一最大化(容器 1236 → 2516)当场变成 **814.24 = 400 × 2516/1236** ——
+    /// 用户看到的就是「上次拖好的左栏宽度重启后没保住」。
+    ///
+    /// 顺带把「缩放窗口时左栏跟着按比例伸缩」改成了「左栏宽度不动、终端区吸收差额」,
+    /// 与 VS Code / Zed 的侧栏一致;中栏上下比例同理。
+    ///
+    /// **不会与拖分隔条打架**:拖分隔条不改视口尺寸,压根走不到这里。宽高分开判,
+    /// 免得只拉宽窗口却把中栏的上下比例也一起重播。
+    fn reseed_resizables_on_viewport_change(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let viewport = window.viewport_size();
+        if viewport == self.last_viewport {
+            return;
+        }
+        if viewport.width != self.last_viewport.width {
+            self.columns_state = cx.new(|_| ResizableState::default());
+        }
+        if viewport.height != self.last_viewport.height {
+            self.middle_state = cx.new(|_| ResizableState::default());
+        }
+        self.last_viewport = viewport;
+    }
 }
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 窗口尺寸变了就让两组分栏重新以持久化的绝对像素做种(见该函数注释)——
+        // 否则 gpui-component 会把还原进去的宽度按容器比例重算掉。
+        self.reseed_resizables_on_viewport_change(window, cx);
+
         let (columns, middle, middle_visible, drawer_width, unread, global_status, background) = {
             let store = self.store.read(cx);
             let config = store.config();
@@ -1152,6 +1198,12 @@ impl Render for Workspace {
 
         // 中间栏是**上下**结构:ProjectList 在上、FileTree 在下(`App.tsx:501-512`
         // 的 `<Allotment vertical>`,minSize 100/120、无上限,高度落 middleColumnSizes)
+        //
+        // ⚠️ **只给上面那块播种,下面那块留空**(与三栏那组同一手法)。两块都传
+        // `.size()` 的话,两个绝对值之和几乎不可能正好等于容器高,gpui-component
+        // 会在首帧之后 `adjust_to_container_size()` 把它们**按比例**摊回容器高 ——
+        // 存的 300/400 于是被拉成 583/777,「上次拖的高度」永远保不住(实测)。
+        // 留空的那块 `initial_size` 是 `None`,自动吸收差额,上面那块就纹丝不动。
         let middle_group = v_resizable("middle-column")
             .with_state(&self.middle_state)
             .child(
@@ -1162,7 +1214,6 @@ impl Render for Workspace {
             )
             .child(
                 resizable_panel()
-                    .size(px(middle[1] as f32))
                     .size_range(px(120.0)..Pixels::MAX)
                     .child(self.file_tree.clone()),
             )
