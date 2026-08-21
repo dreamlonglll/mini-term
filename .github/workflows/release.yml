@@ -3,7 +3,8 @@ name: Build & Release
 # 发布形态(GPUI 原生版,三平台矩阵参考旧 Tauri 流水线):
 # - Windows x64:NSIS 安装包(scripts/windows-installer.nsi,runner 自带 makensis;
 #   身份对齐旧 Tauri NSIS —— HKCU Uninstall\Mini-Term 键 + 读旧 InstallLocation,
-#   老用户原地升级;包内平铺 exe + 三个 sidecar + portable-conpty/,
+#   老用户原地升级:装过就先弹框告知、再跑旧版卸载器,不是文件覆盖写;
+#   包内平铺 exe + 三个 sidecar + portable-conpty/,
 #   运行时全部按「与 exe 同目录」定位)
 # - macOS arm64:.app bundle 打成 dmg(无签名,首次打开需 `xattr -cr` 放行,
 #   bundle id 沿用旧 Tauri 版的 com.mini-term.app)
