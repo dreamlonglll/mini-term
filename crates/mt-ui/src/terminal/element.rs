@@ -1205,6 +1205,10 @@ impl Element for TerminalElement {
             .push(columns)
             .push(focused)
             .push(self.style.font_family.as_ref())
+            // 连字开关**必须**进帧指纹:它改的是 shaping 结果而不是任何一个 cell 的
+            // 内容,行签名一个字节都不会动 —— 漏了这一条,切开关后整屏行缓存照旧命中,
+            // 表现成「开关点了没反应」。
+            .push(self.style.ligatures)
             .push(
                 self.style
                     .font_fallbacks
@@ -1369,6 +1373,7 @@ impl Element for TerminalElement {
                 cell_width,
                 line_height,
                 &self.theme,
+                self.style.ligatures,
             ));
             state.rows.borrow_mut().insert(row.sig, render.clone());
             placed.push((row.row, render));
@@ -1660,8 +1665,27 @@ struct PendingRun {
 /// 未 shape 的绘制片段(合并段落地后、或单格的宽字符)。
 struct PendingPiece {
     start: usize,
+    /// 合并段占的列数(段内每个格子都是窄字符、无组合符号,所以列数 = 字符数)。
+    ///
+    /// `None` = 单格片段(宽字符 / 缺字回退 / 带组合符号)。它本来就允许糊出格子
+    /// 边界(模块注释的第二类),没有「该占几列」可言,不参与总宽校验。
+    cols: Option<usize>,
     text: String,
     style: RunStyle,
+}
+
+/// 合并段总宽与「列数 × 列宽」的容差(px)。
+///
+/// 守恒的连字字体这里恒等于 0,给 0.5px 是留给浮点累加的余量 —— 半个像素以内
+/// 肉眼看不出,超过就说明这个字体的连字压根不按等宽网格设计。
+const LIGATURE_WIDTH_SLACK: f32 = 0.5;
+
+/// 合并段 shape 完还落在列格上吗。
+///
+/// 连字把 N 个字符换成别的字形是允许的,**换完总共还得占 N 列**——
+/// 这是段内后续字符仍对得上列的唯一前提。见 [`super::theme::TerminalStyle::font`]。
+fn width_fits_columns(shaped: Pixels, cell_width: Pixels, cols: usize) -> bool {
+    (f(shaped) - f(cell_width) * cols as f32).abs() <= LIGATURE_WIDTH_SLACK
 }
 
 /// 把一行解析好的格子变成可绘制产物。**几何全部相对行首**。
@@ -1675,6 +1699,7 @@ fn build_row(
     cell_width: Pixels,
     line_height: Pixels,
     theme: &TerminalTheme,
+    ligatures: bool,
 ) -> RowRender {
     let cell_size = size(cell_width, line_height);
     let mut backgrounds: Vec<(Bounds<Pixels>, Hsla)> = Vec::new();
@@ -1808,6 +1833,7 @@ fn build_row(
             }
             pieces.push(PendingPiece {
                 start: col,
+                cols: None,
                 text,
                 style: style_key,
             });
@@ -1841,10 +1867,37 @@ fn build_row(
             underline: piece.style.underline,
             strikethrough: piece.style.strikethrough,
         };
-        let shaped =
+        let text = SharedString::from(piece.text);
+        let mut shaped =
             window
                 .text_system()
-                .shape_line(SharedString::from(piece.text), font_size, &[run], None);
+                .shape_line(text.clone(), font_size, std::slice::from_ref(&run), None);
+
+        // ── 连字兜底:合并段的总宽必须仍等于「列数 × 列宽」。
+        //
+        //  编程连字字体都守恒(N 个字符换成的连字仍占 N 列),这一句恒不触发。
+        //  但字体是用户配的,遇上一个把连字做成「两个字符宽的形状塞进一列」的
+        //  字体,段内连字之后的每个字符都会左移一列 —— 段与段之间各按列定位挡住了
+        //  扩散,这里把这一段也拉回来:退回禁连字重 shape 一次。
+        //
+        //  只在开了连字时校验。关着还对不上说明这个字族根本不等宽,那是
+        //  `report_metrics_once` 该喊的事,重 shape 一遍也救不回来。
+        if ligatures
+            && let Some(cols) = piece.cols
+            && !width_fits_columns(shaped.width, cell_width, cols)
+        {
+            let mut plain_font = run.font.clone();
+            plain_font.features = gpui::FontFeatures::disable_ligatures();
+            let plain = TextRun {
+                font: plain_font,
+                ..run
+            };
+            shaped =
+                window
+                    .text_system()
+                    .shape_line(text, font_size, std::slice::from_ref(&plain), None);
+        }
+
         texts.push(TextPiece {
             origin: point(cell_width * piece.start as f32, px(0.0)),
             line: shaped,
@@ -1868,6 +1921,7 @@ fn flush_text(run: &mut Option<PendingRun>, out: &mut Vec<PendingPiece>) {
     if let Some(r) = run.take() {
         out.push(PendingPiece {
             start: r.start,
+            cols: Some(r.len),
             text: r.text,
             style: r.style,
         });
@@ -2077,6 +2131,24 @@ mod tests {
         let b = cursor_cell_bounds(origin, cell, 80, 24, 12, 30, 0);
         assert_eq!(b.origin, point(px(300.0), px(240.0)));
         assert_ne!(b.origin, origin, "绝不能退回元素左上角");
+    }
+
+    /// 连字可以换字形,但**换完总共还得占 N 列**。守恒才放行,不守恒就退回禁连字
+    /// 重 shape —— 否则这一段里连字之后的每个字符都会整体左移。
+    #[test]
+    fn 连字总宽守恒才放行() {
+        let cell = px(8.0);
+        // `=>` 换成一个两列宽的连字:总宽不变
+        assert!(width_fits_columns(px(16.0), cell, 2));
+        // 浮点累加的余量以内照样算守恒
+        assert!(width_fits_columns(px(16.4), cell, 2));
+        assert!(width_fits_columns(px(15.6), cell, 2));
+        // 两个字符缩成一列宽:段内后面的字全要左移一列
+        assert!(!width_fits_columns(px(8.0), cell, 2));
+        assert!(!width_fits_columns(px(16.6), cell, 2));
+        // 长段里塌掉一列也判负(80 列的整行是常态)
+        assert!(width_fits_columns(px(640.0), cell, 80));
+        assert!(!width_fits_columns(px(632.0), cell, 80));
     }
 
     /// 滚出视口的光标钳到最近边缘,而不是没有 —— 往回翻历史时光标在视口下方,

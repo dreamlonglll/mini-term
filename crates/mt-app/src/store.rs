@@ -1686,6 +1686,7 @@ impl AppStore {
         terminal_style_from(
             self.config.terminal_font_size,
             self.config.terminal_font_family.as_deref(),
+            self.config.terminal_ligatures,
         )
     }
 
@@ -2437,6 +2438,20 @@ impl AppStore {
             return;
         }
         self.config.terminal_font_family = next;
+        self.apply_terminal_style(cx);
+        self.save_config_soon(cx);
+        cx.notify();
+    }
+
+    /// 连体字开关。**字族本身得带 `calt` 表**才看得见效果 —— 默认的
+    /// Cascadia **Mono** 是去连字版,开了也没东西可连(设置页那行提示说的就是这个)。
+    ///
+    /// 存量终端连带下发,不然只对新开的终端生效。
+    pub fn set_terminal_ligatures(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.config.terminal_ligatures == enabled {
+            return;
+        }
+        self.config.terminal_ligatures = enabled;
         self.apply_terminal_style(cx);
         self.save_config_soon(cx);
         cx.notify();
@@ -3754,9 +3769,10 @@ const EMOJI_FALLBACK: &str = "Segoe UI Emoji";
 /// (它是往用户串后面拼 `CJK_FALLBACK_FONTS`)。
 ///
 /// 字族为空 / 只写了通用族名时整段回落 [`TerminalStyle::default`]。
-pub fn terminal_style_from(size: f64, family: Option<&str>) -> TerminalStyle {
+pub fn terminal_style_from(size: f64, family: Option<&str>, ligatures: bool) -> TerminalStyle {
     let mut style = TerminalStyle {
         font_size: gpui::px(size as f32),
+        ligatures,
         ..TerminalStyle::default()
     };
     let Some(list) = family.map(str::trim).filter(|s| !s.is_empty()) else {
@@ -4350,6 +4366,7 @@ mod tests {
         let style = terminal_style_from(
             15.0,
             Some("'JetBrainsMono Nerd Font', 'Cascadia Code', monospace"),
+            false,
         );
         assert_eq!(style.font_size, gpui::px(15.0));
         assert_eq!(style.font_family.as_ref(), "JetBrainsMono Nerd Font");
@@ -4372,7 +4389,7 @@ mod tests {
     fn 终端字族为空时回落默认() {
         let default = TerminalStyle::default();
         for family in [None, Some(""), Some("   "), Some("monospace, serif")] {
-            let style = terminal_style_from(14.0, family);
+            let style = terminal_style_from(14.0, family, false);
             assert_eq!(style.font_family, default.font_family, "{family:?}");
             assert_eq!(style.font_fallbacks, default.font_fallbacks, "{family:?}");
         }
@@ -4381,13 +4398,25 @@ mod tests {
     /// 重复声明 CJK 字体时不该在回退串里出现两次。
     #[test]
     fn 终端字族回退不重复() {
-        let style = terminal_style_from(14.0, Some("Consolas, 'Microsoft YaHei'"));
+        let style = terminal_style_from(14.0, Some("Consolas, 'Microsoft YaHei'"), false);
         let yahei = style
             .font_fallbacks
             .iter()
             .filter(|f| f.as_ref() == "Microsoft YaHei")
             .count();
         assert_eq!(yahei, 1);
+    }
+
+    /// 连字开关一路穿到 [`TerminalStyle`],**不被字族解析那一段吃掉** ——
+    /// 早退分支(字族为空 / 只剩通用族名)也得带着它走。
+    #[test]
+    fn 连字开关穿到样式并存活于早退分支() {
+        let on = terminal_style_from(14.0, Some("Fira Code"), true);
+        assert!(on.ligatures);
+        assert!(!terminal_style_from(14.0, Some("Fira Code"), false).ligatures);
+        // 这两条走的是 `terminal_style_from` 里的两个 `return style` 早退
+        assert!(terminal_style_from(14.0, None, true).ligatures);
+        assert!(terminal_style_from(14.0, Some("monospace"), true).ligatures);
     }
 
     // ---- 会话分支自记账 ----

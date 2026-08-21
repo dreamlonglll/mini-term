@@ -497,6 +497,7 @@ pub fn preview_style(store: &AppStore) -> TerminalStyle {
     crate::store::terminal_style_from(
         store.config().terminal_font_size,
         store.config().terminal_font_family.as_deref(),
+        store.config().terminal_ligatures,
     )
 }
 

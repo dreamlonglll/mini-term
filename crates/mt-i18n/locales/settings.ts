@@ -113,7 +113,7 @@ export const settings = {
       fontFamilyFooterSuffix: "）",
       ligaturesDescPrefix: "开启后 ",
       ligaturesDescSuffix: " 等会合成 ligature glyph，需字体本身含 calt 表（如 Fira Code、JetBrains Mono）",
-      ligaturesUnavailable: "GPUI 版终端是自绘渲染器，按「一个字符一列」摆放，暂不支持连体字",
+      ligaturesUnavailable: "默认的 Cascadia Mono 是去连字版本，开了也看不到效果 —— 需先把上面的终端字体换成 Cascadia Code、Fira Code 这类带连字的字族",
     },
     aiHook: {
       title: "AI Hook 事件",
@@ -339,7 +339,7 @@ export const settings = {
       fontFamilyFooterSuffix: ")",
       ligaturesDescPrefix: "When enabled, ",
       ligaturesDescSuffix: " and similar combine into ligature glyphs. The font itself must include a calt table (e.g. Fira Code, JetBrains Mono)",
-      ligaturesUnavailable: "The GPUI terminal draws glyphs itself, one character per column, so ligatures are not supported yet",
+      ligaturesUnavailable: "The default Cascadia Mono is the ligature-free variant, so enabling this changes nothing — switch the terminal font above to a ligature-carrying family such as Cascadia Code or Fira Code first",
     },
     aiHook: {
       title: "AI hook events",

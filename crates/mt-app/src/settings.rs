@@ -2222,7 +2222,8 @@ impl SettingsView {
             )
             .child(
                 section("font.ligatures")
-                    // 底层没有连字:整行置灰(不挂 on_click),下面一句说明为什么
+                    // 描述是拼出来的(中间嵌一串 `== => != ->` 样例),用不了
+                    // `toggle_row` 的单 key 形状,只能手写一行
                     .child(ui::setting_row(
                         t("settings", "font.ligaturesTitle"),
                         Some(
@@ -2233,8 +2234,14 @@ impl SettingsView {
                             ))
                             .into_any_element(),
                         ),
-                        true,
-                        ui::toggle("font-ligatures", ligatures),
+                        false,
+                        ui::toggle("font-ligatures", ligatures).on_click(cx.listener(
+                            move |this, _, _window, cx| {
+                                this.store.update(cx, |store, cx| {
+                                    store.set_terminal_ligatures(!ligatures, cx);
+                                });
+                            },
+                        )),
                     ))
                     .child(ui::hint(t("settings", "font.ligaturesUnavailable"))),
             )

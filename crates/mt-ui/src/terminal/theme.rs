@@ -115,6 +115,8 @@ pub struct TerminalStyle {
     pub font_size: Pixels,
     /// 行高倍数(相对 font_size)。
     pub line_height: f32,
+    /// 连体字(`=>` `!=` `->` 合成一个字形)。见 [`TerminalStyle::font`]。
+    pub ligatures: bool,
 }
 
 impl Default for TerminalStyle {
@@ -130,6 +132,10 @@ impl Default for TerminalStyle {
             ],
             font_size: px(14.0),
             line_height: 1.3,
+            // 默认关:默认字族 Cascadia **Mono** 本来就是去连字版,开了也没东西可连,
+            // 徒增一次总宽校验。要连字的用户得先把字族换成 Cascadia Code 这类带
+            // `calt` 表的字体 —— 设置页那行提示说的就是这件事。
+            ligatures: false,
         }
     }
 }
@@ -156,18 +162,66 @@ mod tests {
         assert_eq!(c.current_border, rgb8(0xf0, 0xec, 0xe6));
         assert_eq!(c.current_border.a, 1.0);
     }
+
+    /// 连字开关只动 `calt` 一个 feature —— 编程连字(`=>` `!=` `->`)恰好全在它里面。
+    ///
+    /// **两档都必须是显式值,`None`(空 features)是错的**:gpui 的 Windows 后端
+    /// 无条件下发 `SetTypography`,空 typography 会被 DirectWrite 当成「一个排版特性
+    /// 都不要」,连字反而全灭。这条钉住那个坑,见 [`TerminalStyle::font`]。
+    #[test]
+    fn 连字开关只切_calt() {
+        let mut style = TerminalStyle::default();
+        assert!(!style.ligatures, "默认关:默认字族 Cascadia Mono 是去连字版");
+        assert_eq!(style.font().features.is_calt_enabled(), Some(false));
+
+        style.ligatures = true;
+        assert_eq!(
+            style.font().features.is_calt_enabled(),
+            Some(true),
+            "开 = 显式 calt=1,**不能**是 None —— 空 features 会被 DirectWrite 当成全关"
+        );
+        // 其余解析结果不受连字开关影响
+        assert_eq!(style.font().family, style.font_family);
+        assert_eq!(style.font().weight, gpui::FontWeight::NORMAL);
+    }
 }
 
 impl TerminalStyle {
     /// 组装 gpui 的 [`gpui::Font`]。
     ///
-    /// **连字必须关掉**:渲染是按「一个字符一列」摆的,`=>` 合成一个 glyph 会让
-    /// 字符数与 glyph 数对不上,逐列对齐直接崩。终端里要连字得另设计,
-    /// 不能靠字体的 `calt` 白送。
+    /// # 连体字为什么开得起
+    ///
+    /// 这里原先硬关 `calt`,理由写的是「`=>` 合成一个 glyph 会让字符数与 glyph 数
+    /// 对不上,逐列对齐直接崩」—— 那说的是 gpui `shape_line(.., force_width)`
+    /// 那条按 glyph 序号硬掰位置的路,而本渲染器**从来没走那条路**
+    /// (见 `mt_ui::terminal::element` 的模块注释)。现在的摆法是:同款式相邻窄
+    /// 字符合并成一段、整段一次 shape,段的原点钉死在 `cell_width × 起始列`,
+    /// 段内位置由 shaping 的自然步进给出。于是
+    ///
+    /// - 连字总 advance 守恒(编程连字字体的通行设计:N 个字符 → N 列宽)时,
+    ///   段内后续字符照旧落在列格上;
+    /// - 万一某个字体不守恒,错位也**只在这一段里** —— 段与段之间各自按列定位,
+    ///   传不到下一段。`build_row` 另有一道总宽校验把这一段也救回来。
+    ///
+    /// 背景 / 选区 / 查找高亮 / 光标 / 鼠标命中一律按列独立算,一个 glyph 都不看。
+    ///
+    /// 动的只有 `calt` 一个 tag —— 编程连字恰好全在它里面。
+    ///
+    /// ⚠️ **开的那一档必须显式给 `calt = 1`,不能图省事传 `FontFeatures::default()`**:
+    /// gpui 的 Windows 后端**无条件**调 `IDWriteTextLayout::SetTypography`
+    /// (`direct_write.rs` 的 `layout_line`),而它的 `apply_font_features` 对空
+    /// features 直接 return —— 于是交给 DirectWrite 的是一个**空 typography 对象**,
+    /// 那被理解成「显式指定了排版特性、且一个都不要」,liga/clig/calt 反而全灭。
+    /// 空 features ≠ 平台默认,这条 2026-08-21 实测栽过。
+    /// 显式给了值之后 gpui 会连 `liga`/`clig` 一起补成 1,三个 tag 都到位。
     pub fn font(&self) -> gpui::Font {
         gpui::Font {
             family: self.font_family.clone(),
-            features: gpui::FontFeatures::disable_ligatures(),
+            features: if self.ligatures {
+                gpui::FontFeatures(std::sync::Arc::new(vec![("calt".into(), 1)]))
+            } else {
+                gpui::FontFeatures::disable_ligatures()
+            },
             fallbacks: if self.font_fallbacks.is_empty() {
                 None
             } else {

@@ -429,6 +429,9 @@ impl Element for MiniTerminalElement {
         f(bounds.size.height).to_bits().hash(&mut hasher);
         f(geometry.font_size).to_bits().hash(&mut hasher);
         self.style.font_family.hash(&mut hasher);
+        // 与 `TerminalElement` 的帧指纹同理:连字改的是 shaping 结果而不是内容,
+        // 不进键的话切开关后缩略图会一直停在旧画面
+        self.style.ligatures.hash(&mut hasher);
         self.theme.background.h.to_bits().hash(&mut hasher);
         self.theme.foreground.h.to_bits().hash(&mut hasher);
         self.theme.foreground.l.to_bits().hash(&mut hasher);
