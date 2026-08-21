@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 32;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 760;
+pub const ZH_ENTRY_COUNT: usize = 761;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 760;
+pub const EN_ENTRY_COUNT: usize = 761;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -438,11 +438,13 @@ static GIT_HISTORY_CONTENT_EN: &[(&str, &str)] = &[
 static MARKER_LIST_ZH: &[(&str, &str)] = &[
     ("empty", "暂无标记"),
     ("inProgress", "正在进行"),
+    ("pendingAnchor", "这条还在 AI 的队列里，等它被处理后才能跳转到对应位置"),
 ];
 #[rustfmt::skip]
 static MARKER_LIST_EN: &[(&str, &str)] = &[
     ("empty", "No markers"),
     ("inProgress", "In progress"),
+    ("pendingAnchor", "Still queued in the AI session — jumping to it becomes available once the AI gets to it"),
 ];
 
 #[rustfmt::skip]

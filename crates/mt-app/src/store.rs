@@ -1718,30 +1718,68 @@ impl AppStore {
         if batch.submits.is_empty() {
             return;
         }
-        // 先把「锚点行已经不是原来那行」的旧条目剪掉,再追加新的:`/new` 清屏之后
-        // 用户发的第一条消息就是这一刻,趁机把上一屏被就地擦掉的标记清干净 ——
-        // 否则「⚑ N」的计数会一直挂着已经跳不对的条目(见 markers 模块注释)。
+        // 先把旧条目收拾一遍(挂着的补锚、锚点行已经不是原来那行的剪掉),再追加新的:
+        // `/new` 清屏之后用户发的第一条消息就是这一刻,趁机把上一屏被就地擦掉的标记
+        // 清干净 —— 否则「⚑ N」的计数会一直挂着已经跳不对的条目。
         // 新条目要在这之后 push:它的指纹刚取,自己校验自己没有意义。
-        if let Some(entity) = self.terminals.get(&pty_id).cloned() {
-            let pane = entity.read(cx);
-            // alt screen 期间读的是备用 grid,校验会把整份标记误杀
-            if pane.can_probe_lines()
-                && let Some(list) = self.markers_by_pty.get_mut(&pty_id)
-            {
-                markers::prune_stale(list, |anchor| pane.line_fingerprint(anchor));
-            }
-        }
+        self.refresh_markers(pty_id, cx);
         let list = self.markers_by_pty.entry(pty_id).or_default();
         for (line, ts) in batch.submits {
-            markers::push_marker(list, pty_id, line, ts, batch.anchor, batch.fingerprint);
+            markers::push_marker(list, pty_id, line, ts, batch.anchor);
         }
         markers::prune(list, batch.history, batch.max_scrollback);
         // 过滤后为空则连键一起删(`store.ts:1219` 的同一处置)
-        if list.is_empty() {
+        let empty = list.is_empty();
+        if empty {
             self.markers_by_pty.remove(&pty_id);
             self.marker_cursor.remove(&pty_id);
         }
         cx.notify();
+    }
+
+    /// 收拾一遍某个 pane 的标记:**挂着的补锚 + 失效的剪掉**,返回「列表变过没有」。
+    ///
+    /// 三件事按这个顺序,少一步或者换个顺序都不对:
+    ///
+    /// 1. [`markers::prune`] —— scrollback 装满,整份作废(算术锚点从此不可信);
+    /// 2. [`markers::relocate_pending`] —— 给还没定位的条目补锚。AI 把队列里那条
+    ///    处理掉、消息落到屏幕上的那一刻,它就自己好了;
+    /// 3. [`markers::prune_stale`] —— 校验已定锚的那些。**必须排在补锚之后**:
+    ///    刚补上的指纹是从同一份 grid 读的,校验必然通过,反过来排就白跑一遍。
+    ///
+    /// 跑的时机:新增标记时、跳转前、下拉打开时 —— **一律不在渲染路径上**
+    /// (见 [`crate::markers`] 模块注释)。
+    fn refresh_markers(&mut self, pty_id: u32, cx: &mut Context<Self>) -> bool {
+        let Some(entity) = self.terminals.get(&pty_id).cloned() else {
+            return false;
+        };
+        let pane = entity.read(cx);
+        let (history, max) = pane.scrollback_state();
+        // alt screen 期间读的是备用 grid,校验会把整份标记误杀、回扫也扫不到主屏
+        let probe_ok = pane.can_probe_lines();
+        let (bottom, viewport) = pane.scan_bounds();
+        let Some(list) = self.markers_by_pty.get_mut(&pty_id) else {
+            return false;
+        };
+        let mut changed = markers::prune(list, history, max);
+        if probe_ok {
+            changed |= markers::relocate_pending(list, bottom, viewport, |row| pane.line_text(row));
+            changed |= markers::prune_stale(list, |anchor| pane.line_fingerprint(anchor));
+        }
+        let empty = list.is_empty();
+        if empty {
+            self.markers_by_pty.remove(&pty_id);
+            self.marker_cursor.remove(&pty_id);
+        }
+        changed
+    }
+
+    /// 打开「⚑」下拉之前收拾一遍 —— 用户要看的这一眼必须是最新的:AI 刚把排队的
+    /// 那条处理掉的话,这次补锚就能让它从「灰的、点不动」变回可跳。
+    pub fn refresh_markers_for_pty(&mut self, pty_id: u32, cx: &mut Context<Self>) {
+        if self.refresh_markers(pty_id, cx) {
+            cx.notify();
+        }
     }
 
     /// 整份丢掉(`store.ts:1205-1211` 的 `clearMarkersForPty`)。游标一并清 ——
@@ -1755,42 +1793,35 @@ impl AppStore {
     ///
     /// 浮层点击与 Ctrl+Shift+↑/↓ **走的是同一条路**(原版 `useMarkerHotkeys.ts:56`
     /// 与 `MarkerList.tsx:36-39` 调的都是 `scrollToMarker`),**不关任何东西**。
-    pub fn jump_to_marker(&mut self, pty_id: u32, marker_id: &str, cx: &mut Context<Self>) {
+    ///
+    /// 返回「这一下真的跳了没有」:跳不动的三种情形(pane 没了 / 标记还挂着没定位 /
+    /// pane 正在 alt screen 里)都是 `false`,调用方据此**不推游标、不关浮层**。
+    pub fn jump_to_marker(&mut self, pty_id: u32, marker_id: &str, cx: &mut Context<Self>) -> bool {
         let Some(entity) = self.terminals.get(&pty_id).cloned() else {
-            return;
+            return false;
         };
-        // 跳之前先剪两遍:锚点已经不可信的话宁可什么都不做,也不能跳到错的行上。
-        // ① 算术不可信(scrollback 装满) ② 算术还对但那一行的内容已经不是原来那行
-        // (清屏就地擦 / reflow),见 [`crate::markers`] 模块注释
-        let pane = entity.read(cx);
-        let (history, max) = pane.scrollback_state();
-        let probe_ok = pane.can_probe_lines();
-        let mut dropped = false;
-        if let Some(list) = self.markers_by_pty.get_mut(&pty_id) {
-            dropped |= markers::prune(list, history, max);
-            if probe_ok {
-                dropped |= markers::prune_stale(list, |anchor| pane.line_fingerprint(anchor));
-            }
-            if list.is_empty() {
-                self.markers_by_pty.remove(&pty_id);
-                self.marker_cursor.remove(&pty_id);
-            }
-        }
-        if dropped {
+        // 跳之前先收拾一遍:挂着的趁机补锚(点的可能正是刚被 AI 处理掉的那条),
+        // 锚点已经不可信的宁可什么都不做,也不能跳到错的行上 —— 见
+        // [`Self::refresh_markers`] 与 [`crate::markers`] 模块注释
+        if self.refresh_markers(pty_id, cx) {
             cx.notify();
         }
         let Some(anchor) = self
             .markers_for_pty(pty_id)
             .iter()
             .find(|m| m.id == marker_id)
-            .map(|m| m.anchor)
+            // 还挂着的跳不了:那条消息还没上屏,没有目标行可跳。**静默不动**,
+            // 与「列表空 / 到头」同一个处置(`useMarkerHotkeys.ts:39`、`:50`)
+            .and_then(|m| m.anchor.settled())
         else {
-            return;
+            return false;
         };
         // 跳不动(pane 正在 alt screen 里)就不推游标 —— 连按方向键不该空走格子
         if entity.update(cx, |pane, cx| pane.scroll_to_marker(anchor, cx)) {
             self.marker_cursor.insert(pty_id, marker_id.to_string());
+            return true;
         }
+        false
     }
 
     /// Ctrl+Shift+↑ / ↓。`dir = -1` 上一条、`+1` 下一条,**非环形**。
@@ -1814,16 +1845,25 @@ impl AppStore {
         else {
             return;
         };
-        let cursor = self
+        // 先收拾一遍再挑目标:否则刚被 AI 处理掉的那条还挂着「跳不了」的旧状态,
+        // 这一下会白白跳过它
+        self.refresh_markers_for_pty(pty_id, cx);
+        let mut cursor = self
             .marker_cursor
             .get(&pty_id)
             .and_then(|id| self.markers_for_pty(pty_id).iter().position(|m| &m.id == id));
         let len = self.markers_for_pty(pty_id).len();
-        let Some(next) = markers::next_index(cursor, len, dir) else {
-            return;
-        };
-        let Some(target) = self.markers_for_pty(pty_id).get(next).map(|m| m.id.clone()) else {
-            return;
+        // 还挂着的条目跳不动,连按时要**跨过去**继续找下一条 —— 停在它身上的话
+        // 游标不会推进,再按一次还是它,方向键就卡死了
+        let target = loop {
+            let Some(next) = markers::next_index(cursor, len, dir) else {
+                return;
+            };
+            match self.markers_for_pty(pty_id).get(next) {
+                Some(marker) if marker.anchor.settled().is_some() => break marker.id.clone(),
+                Some(_) => cursor = Some(next),
+                None => return,
+            }
         };
         self.jump_to_marker(pty_id, &target, cx);
     }

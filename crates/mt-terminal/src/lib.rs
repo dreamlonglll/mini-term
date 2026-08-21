@@ -488,6 +488,44 @@ mod tests {
         assert_eq!(e.line_text(anchor).as_deref(), Some("> hi"));
     }
 
+    /// 上一条的**对照组:AI 正忙时提交**。
+    ///
+    /// 那一句被排进队列,根本没打成 static 消息 —— 这 200ms 里的 erase 只是动态块
+    /// 自己在重绘。水位照样落地,但落到的是**块首这一行动态内容**,读回来不是用户
+    /// 正文,而且下一帧就变。这正是「AI 忙的时候追加的那句,标记下拉里根本没有」
+    /// 的物理成因:拿它的指纹当锚点,下一次校验必然失配、条目被剪光。
+    ///
+    /// mt-app 的 `markers::settle_anchor` 据此判「挂起」而不是硬定一个锚。
+    #[test]
+    fn ai忙时水位落在动态区而不是用户正文() {
+        let e = TerminalEmulator::new(TermSize::new(40, 10));
+        // line0 是已经落地的 static,line1..3 是还在重绘的动态块,光标停在块下方
+        e.advance(b"> previous question\r\nbox-top\r\nThinking...\r\nbox-bottom\r\n");
+        e.arm_cursor_floor();
+
+        // 用户追加一句:agent 只是把动态块重绘一遍(队列计数进去了),没有 static 落地
+        let mut batch = Vec::new();
+        for i in 0..4 {
+            batch.extend_from_slice(b"\x1b[2K");
+            if i < 3 {
+                batch.extend_from_slice(b"\x1b[1A");
+            }
+        }
+        batch.extend_from_slice(b"\rbox-top\r\nThinking... (1 queued)\r\nbox-bottom\r\n");
+        e.advance(&batch);
+
+        let anchor = e.take_cursor_floor().expect("水位照样落地 —— 问题不在这");
+        assert_eq!(
+            e.line_text(anchor).as_deref(),
+            Some("box-top"),
+            "落的是动态块块首,不是用户正文 —— 指纹方案的支点在这里塌了"
+        );
+
+        // 下一帧重绘,同一行的内容说变就变
+        e.advance(b"\x1b[3A\x1b[2K\rbox-top-v2\r\n");
+        assert_eq!(e.line_text(anchor).as_deref(), Some("box-top-v2"));
+    }
+
     /// 追踪期走的是逐字节推进,**多字节字符不能被切坏** —— 中文提交后 AI 正在
     /// 吐中文正文,那 200ms 的输出全程都在这条路上。
     #[test]

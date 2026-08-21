@@ -611,6 +611,11 @@ impl TerminalArea {
         if !overlay::push(overlay::key(overlay::kind::MARKER_LIST)) {
             return;
         }
+        // 开之前收拾一遍:还挂着的条目趁这一下补锚(AI 刚把排队的那条处理掉的话,
+        // 它就从「灰的、点不动」变回可跳)。放在这里而不是渲染里 —— 回扫要读
+        // scrollback,不能每帧跑,见 `store::refresh_markers`
+        self.store
+            .update(cx, |store, cx| store.refresh_markers_for_pty(pty_id, cx));
         self.marker_open = Some((pane_id.to_string(), pty_id));
         self.marker_prev_focus = window.focused(cx);
         window.focus(&self.marker_focus);
@@ -718,6 +723,10 @@ impl TerminalArea {
             for marker in markers {
                 let marker_id = marker.id.clone();
                 let store = self.store.clone();
+                // 还没定位的条目:那条消息还在 AI 的队列里没上屏,没有行可跳。
+                // **照样进列表**(用户看得到自己追加过什么),只是画成灰的,
+                // 见 `markers::MarkerAnchor::Pending`
+                let pending = marker.anchor.is_pending();
                 list = list.child(
                     div()
                         .id(SharedString::from(format!("marker-{}", marker.id)))
@@ -728,21 +737,35 @@ impl TerminalArea {
                         .py(px(6.0))
                         .cursor_pointer()
                         .text_size(ui::font_px(12.0))
-                        .text_color(ui::text_primary())
+                        .text_color(if pending {
+                            ui::text_muted()
+                        } else {
+                            ui::text_primary()
+                        })
                         // `--bg-hover` 在 ui::Palette 里没有对应项,统一用 bg_overlay
                         // (与文件树行 hover 同一档)
                         .hover(|el| el.bg(ui::bg_overlay()))
-                        // 悬停看全文(含粘贴多行时的换行)
+                        // 悬停看全文(含粘贴多行时的换行);挂着的再补一句为什么跳不了
                         .tooltip({
-                            let full = SharedString::from(marker.line.clone());
+                            let full = SharedString::from(if pending {
+                                format!("{}\n\n{}", marker.line, t("markerList", "pendingAnchor"))
+                            } else {
+                                marker.line.clone()
+                            });
                             move |window, cx| Tooltip::new(full.clone()).build(window, cx)
                         })
                         .on_click(cx.listener(move |this, _event, window, cx| {
                             cx.stop_propagation();
                             let id = marker_id.clone();
-                            store.update(cx, |store, cx| store.jump_to_marker(pty_id, &id, cx));
-                            // 跳转**并关闭浮层**(`MarkerList.tsx:36-39`)
-                            this.close_marker_popover(window, cx);
+                            // 挂着的条目点一下也有意义:`jump_to_marker` 会先补一次锚,
+                            // AI 刚把它处理掉的话这一下就跳过去了
+                            let jumped = store
+                                .update(cx, |store, cx| store.jump_to_marker(pty_id, &id, cx));
+                            // 跳转**并关闭浮层**(`MarkerList.tsx:36-39`);跳不动就不关 ——
+                            // 关掉的话「点了没反应」会让人以为是坏的
+                            if jumped {
+                                this.close_marker_popover(window, cx);
+                            }
                         }))
                         .child(
                             div()

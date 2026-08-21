@@ -43,8 +43,12 @@ use mt_i18n::{
 /// 758 → 760：HTML 预览补回（原先只有源码态）时新增
 /// `fileViewer.{openInBrowser,htmlPreviewNote}` —— 内嵌的是富文本简版渲染
 /// （无 CSS / 无 JS），得有一句说明与一条去浏览器看真效果的出口。
+///
+/// 760 → 761：AI 任务标记补「还没定位」态时新增 `markerList.pendingAnchor` ——
+/// AI 忙时追加的那句是排进队列的，属于它的消息还没上屏就没有锚点可定，
+/// 条目先挂着（灰的、点不动），得有一句说明它为什么跳不了。
 const EXPECTED_NAMESPACES: usize = 32;
-const EXPECTED_ENTRIES_PER_LANG: usize = 760;
+const EXPECTED_ENTRIES_PER_LANG: usize = 761;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

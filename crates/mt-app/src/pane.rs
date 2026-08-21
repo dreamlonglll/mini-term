@@ -64,7 +64,7 @@ use mt_ui::{
 use crate::ai::AiBridge;
 use crate::clipboard::{self, ClipboardImage, PasteTarget, RemotePaste};
 use crate::i18n::{t, tr};
-use crate::markers::MarkerBatch;
+use crate::markers::{self, MarkerBatch};
 use crate::menu::{self, MenuItem};
 use crate::notify::ToastKind;
 use crate::overlay;
@@ -570,16 +570,23 @@ impl TerminalPane {
         if self.emulator.mode().contains(TermMode::ALT_SCREEN) {
             return;
         }
-        let Some(anchor) = floor else {
+        let Some(floor) = floor else {
             return;
         };
         let history = self.emulator.with_term(|term| term.history_size() as i32);
+        // 等了 MARK_SETTLE_DELAY 之后再取,是因为 `> 用户输入` 那条 static 消息要在
+        // erase 顶回块首之后才打出来。但**它未必真的打出来了**:AI 正忙时这一句是
+        // 被排进队列的,那 200ms 里水位只落得到还在重绘的动态区上 —— 拿那一行的指纹
+        // 当锚点,下一次校验必然对不上,这条标记就凭空消失了。所以定不住就先挂起,
+        // 等 `relocate_pending` 补,见 [`crate::markers`] 模块注释第三个破绽。
+        let text = self.emulator.line_text(floor);
+        let anchor = {
+            let heads: Vec<&str> = submits.iter().map(|(line, _)| line.as_str()).collect();
+            markers::settle_anchor(floor, text.as_deref(), &heads)
+        };
         cx.emit(PaneEvent::AiMarks(MarkerBatch {
             submits,
             anchor,
-            // 这一刻取指纹是对的:`> 用户输入` 那条 static 消息在 erase 顶回块首之后
-            // **紧接着**就打出来了,而我们已经等了 MARK_SETTLE_DELAY
-            fingerprint: self.line_fingerprint(anchor),
             history,
             max_scrollback: self.emulator.scrollback() as i32,
         }));
@@ -602,6 +609,29 @@ impl TerminalPane {
     /// 走岔。为什么需要它见 [`crate::markers`] 模块注释的「第二个破绽」。
     ///
     /// 调用前先过 [`Self::can_probe_lines`]。
+    /// 某个绝对行当前的文本 —— [`crate::markers::relocate_pending`] 回扫用的探针。
+    ///
+    /// 与 [`Self::line_fingerprint`] 同一个读回口,只是补锚要拿原文做匹配、不是比指纹。
+    /// 调用前先过 [`Self::can_probe_lines`]。
+    pub fn line_text(&self, row: i32) -> Option<String> {
+        self.emulator.line_text(row)
+    }
+
+    /// 回扫的边界:`(最底下那一行的绝对行号, 可视区行数)`。
+    ///
+    /// 底行是 `history + screen_lines - 1` ——
+    /// [`mt_terminal::TerminalEmulator::line_text`] 的合法区间是
+    /// `[0, history + screen_lines)`,再往下就是 `None`。可视区行数给
+    /// [`crate::markers::relocate_pending`] 决定「推进起点时留多少行不算已扫」。
+    ///
+    /// 两个量**一次持锁取齐**:分两次读的话中间可能滚过一批输出,底行与屏高对不上。
+    pub fn scan_bounds(&self) -> (i32, i32) {
+        self.emulator.with_term(|term| {
+            let viewport = term.screen_lines() as i32;
+            ((term.history_size() as i32 + viewport) - 1, viewport)
+        })
+    }
+
     pub fn line_fingerprint(&self, anchor: i32) -> Option<u64> {
         self.emulator
             .line_text(anchor)
