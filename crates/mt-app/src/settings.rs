@@ -28,11 +28,12 @@
 //! Toggle / SettingRow / ChoiceGroup / 滑块 / 键帽全部**自绘**在 [`crate::ui`]
 //! (不用 `gpui_component` 的 `switch` 与 `setting`,理由见那边的注释)。
 //!
-//! # 「UI 有、底层没有」的两项
+//! # 「UI 有、底层没有」的一项
 //!
-//! 内置皮肤 blueprint / fluent2(`theme.rs` 按 `none` 处理)与终端连体字
-//! (自绘渲染器按「一个字符一列」摆放)在 GPUI 侧都还没有。**照原版画出来但置灰**,
-//! 各配一句说明 —— 不做成「看着能点、点了没反应」。
+//! 内置皮肤 blueprint / fluent2(`theme.rs` 按 `none` 处理)在 GPUI 侧还没有。
+//! **照原版画出来但置灰**,配一句说明 —— 不做成「看着能点、点了没反应」。
+//!
+//! (终端连体字原本也在这一栏,已接通:见 `mt_ui::TerminalStyle::font`。)
 //!
 //! # 无消费方的设置项
 //!
