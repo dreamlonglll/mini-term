@@ -577,9 +577,35 @@ impl TerminalPane {
         cx.emit(PaneEvent::AiMarks(MarkerBatch {
             submits,
             anchor,
+            // 这一刻取指纹是对的:`> 用户输入` 那条 static 消息在 erase 顶回块首之后
+            // **紧接着**就打出来了,而我们已经等了 MARK_SETTLE_DELAY
+            fingerprint: self.line_fingerprint(anchor),
             history,
             max_scrollback: self.emulator.scrollback() as i32,
         }));
+    }
+
+    /// 现在读得到主屏的行吗 —— [`Self::line_fingerprint`] 的前置闸门。
+    ///
+    /// ⚠️ **alt screen 期间必须返回 false**:那时 `line_text` 读的是**备用 grid**,
+    /// 主屏攒下的锚点一行都读不到、指纹全变 `None`,[`crate::markers::prune_stale`]
+    /// 会把整份标记误杀。与 [`Self::scrollback_state`] 里那句 `(0, 0)` 是同一个坑、
+    /// 同一条处置:**TUI 期间干脆不校验**(主屏内容在 TUI 期间原封不动,退出后
+    /// 指纹照样对得上)。
+    pub fn can_probe_lines(&self) -> bool {
+        !self.emulator.mode().contains(TermMode::ALT_SCREEN)
+    }
+
+    /// 某个锚点当前指向那一行的内容指纹。`None` = 那一行已不在缓冲区里。
+    ///
+    /// 定锚(上面)与校验([`crate::markers::prune_stale`])共用这一个口,取法不会
+    /// 走岔。为什么需要它见 [`crate::markers`] 模块注释的「第二个破绽」。
+    ///
+    /// 调用前先过 [`Self::can_probe_lines`]。
+    pub fn line_fingerprint(&self, anchor: i32) -> Option<u64> {
+        self.emulator
+            .line_text(anchor)
+            .map(|text| crate::markers::fingerprint_line(&text))
     }
 
     /// 当前的 `(history_size, max_scroll_limit)` —— store 侧剪枝的判据。

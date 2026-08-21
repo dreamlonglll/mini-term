@@ -1717,9 +1717,22 @@ impl AppStore {
         if batch.submits.is_empty() {
             return;
         }
+        // 先把「锚点行已经不是原来那行」的旧条目剪掉,再追加新的:`/new` 清屏之后
+        // 用户发的第一条消息就是这一刻,趁机把上一屏被就地擦掉的标记清干净 ——
+        // 否则「⚑ N」的计数会一直挂着已经跳不对的条目(见 markers 模块注释)。
+        // 新条目要在这之后 push:它的指纹刚取,自己校验自己没有意义。
+        if let Some(entity) = self.terminals.get(&pty_id).cloned() {
+            let pane = entity.read(cx);
+            // alt screen 期间读的是备用 grid,校验会把整份标记误杀
+            if pane.can_probe_lines()
+                && let Some(list) = self.markers_by_pty.get_mut(&pty_id)
+            {
+                markers::prune_stale(list, |anchor| pane.line_fingerprint(anchor));
+            }
+        }
         let list = self.markers_by_pty.entry(pty_id).or_default();
         for (line, ts) in batch.submits {
-            markers::push_marker(list, pty_id, line, ts, batch.anchor);
+            markers::push_marker(list, pty_id, line, ts, batch.anchor, batch.fingerprint);
         }
         markers::prune(list, batch.history, batch.max_scrollback);
         // 过滤后为空则连键一起删(`store.ts:1219` 的同一处置)
@@ -1745,13 +1758,24 @@ impl AppStore {
         let Some(entity) = self.terminals.get(&pty_id).cloned() else {
             return;
         };
-        // 跳之前先剪一遍:锚点已经不可信的话宁可什么都不做,也不能跳到错的行上
-        let (history, max) = entity.read(cx).scrollback_state();
-        if let Some(list) = self.markers_by_pty.get_mut(&pty_id)
-            && markers::prune(list, history, max)
-        {
-            self.markers_by_pty.remove(&pty_id);
-            self.marker_cursor.remove(&pty_id);
+        // 跳之前先剪两遍:锚点已经不可信的话宁可什么都不做,也不能跳到错的行上。
+        // ① 算术不可信(scrollback 装满) ② 算术还对但那一行的内容已经不是原来那行
+        // (清屏就地擦 / reflow),见 [`crate::markers`] 模块注释
+        let pane = entity.read(cx);
+        let (history, max) = pane.scrollback_state();
+        let probe_ok = pane.can_probe_lines();
+        let mut dropped = false;
+        if let Some(list) = self.markers_by_pty.get_mut(&pty_id) {
+            dropped |= markers::prune(list, history, max);
+            if probe_ok {
+                dropped |= markers::prune_stale(list, |anchor| pane.line_fingerprint(anchor));
+            }
+            if list.is_empty() {
+                self.markers_by_pty.remove(&pty_id);
+                self.marker_cursor.remove(&pty_id);
+            }
+        }
+        if dropped {
             cx.notify();
         }
         let Some(anchor) = self

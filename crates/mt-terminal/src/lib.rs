@@ -295,6 +295,51 @@ impl TerminalEmulator {
             .collect()
     }
 
+    /// **任意** grid 绝对行的内容指纹(行尾空格已裁)。`None` = 该行不在缓冲区里。
+    ///
+    /// 参数是 [`crate`] 里到处用的那个**绝对行**(`line + history_size` 守恒的那个),
+    /// 不是 `Line`:调用方拿着的锚点就是绝对行,自己换算一次容易错。合法区间是
+    /// `[0, history + screen_lines)` —— 越界返回 `None`,那正是「锚点已经不指向
+    /// 任何东西」的信号。
+    ///
+    /// # 这是给 AI 任务标记(⚑)校验锚点用的
+    ///
+    /// 算术锚点只保证「内容被顶进 scrollback 时行号跟着走」,**保证不了内容还在**:
+    /// Claude Code 的 `/new` 清屏是从屏幕顶部逐行 `ESC[2K` **原地擦**,不产生滚动,
+    /// `history_size` 一动不动 —— 锚点算得出行号,那一行却已经被抹白、随后被新会话
+    /// 的输出覆盖。列宽变化触发的 reflow 同理。指纹是唯一不依赖「是谁、发了什么
+    /// 序列」的判据,详见 mt-app 的 `markers` 模块注释。
+    ///
+    /// 口径与 [`Self::visible_lines`] 一致(跳过宽字符 spacer、裁行尾空格),
+    /// 这样定锚与校验两侧不会因为取法不同而假性失配。
+    pub fn line_text(&self, abs_line: i32) -> Option<String> {
+        use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::term::cell::Flags;
+
+        let term = self.term.lock();
+        let history = term.history_size() as i32;
+        let line = abs_line - history;
+        if line < -history || line >= term.screen_lines() as i32 {
+            return None;
+        }
+        let row = &term.grid()[Line(line)];
+        let mut s = String::new();
+        for col in 0..term.columns() {
+            let cell = &row[Column(col)];
+            if cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                continue;
+            }
+            s.push(cell.c);
+        }
+        while s.ends_with(' ') {
+            s.pop();
+        }
+        Some(s)
+    }
+
     /// 可视区逐行的 `(列号, 字符)`。宽字符只出现一次,列号是它**起始**的那一列;
     /// 它占掉的第二列(WIDE_CHAR_SPACER)不出现。
     ///
@@ -412,6 +457,37 @@ mod tests {
         );
     }
 
+    /// **整个指纹方案的支点**:定锚定出来的那一行,`line_text` 读回来必须正好是
+    /// `> 用户输入` 那条 static 消息 —— 不是它上面的空行、也不是它下面被 log-update
+    /// 反复重绘的动态区。落到动态区的话指纹每帧都变,标记会被校验全部剪光。
+    #[test]
+    fn 定锚那一行读回的是用户提交那条消息() {
+        let e = TerminalEmulator::new(TermSize::new(40, 10));
+        e.advance(b"box-top\r\n> hi\r\nbox-bottom\r\n");
+        e.arm_cursor_floor();
+
+        let mut batch = Vec::new();
+        for i in 0..4 {
+            batch.extend_from_slice(b"\x1b[2K");
+            if i < 3 {
+                batch.extend_from_slice(b"\x1b[1A");
+            }
+        }
+        batch.extend_from_slice(b"\r> hi\r\n\r\nthinking...\r\n");
+        e.advance(&batch);
+
+        let anchor = e.take_cursor_floor().expect("水位必须落地");
+        assert_eq!(
+            e.line_text(anchor).as_deref(),
+            Some("> hi"),
+            "指纹取的是这一行 —— 取空行或动态区都会让校验失灵"
+        );
+
+        // 动态区继续重绘,static 那一行必须岿然不动(指纹稳定的前提)
+        e.advance(b"\x1b[1A\x1b[2K\rdone.\r\n");
+        assert_eq!(e.line_text(anchor).as_deref(), Some("> hi"));
+    }
+
     /// 追踪期走的是逐字节推进,**多字节字符不能被切坏** —— 中文提交后 AI 正在
     /// 吐中文正文,那 200ms 的输出全程都在这条路上。
     #[test]
@@ -447,6 +523,67 @@ mod tests {
         e.advance(b"\x1b[1A");
         feed_lines(&e, 20);
         assert_eq!(e.take_cursor_floor(), Some(3));
+    }
+
+    /// 绝对行读回口:视口、scrollback 都读得到,越界给 `None`。
+    #[test]
+    fn 按绝对行读回文本() {
+        let e = TerminalEmulator::with_scrollback(TermSize::new(40, 10), 10_000);
+        feed_lines(&e, 30); // history 21,视口是 line21..line29 + 光标那一空行
+        assert_eq!(e.line_text(0).as_deref(), Some("line0"), "scrollback 最顶上那行");
+        assert_eq!(e.line_text(24).as_deref(), Some("line24"), "视口里的行");
+        assert_eq!(e.line_text(30).as_deref(), Some(""), "光标停的空行");
+        assert_eq!(e.line_text(31), None, "越过视口底部");
+        assert_eq!(e.line_text(-1), None, "越过缓冲区顶端");
+    }
+
+    /// 回归:**Claude Code 的清屏不产生滚动** —— 锚点算术照样成立,内容却没了。
+    ///
+    /// 这是「AI 任务标记跳到不相干的行」那个 bug 的机制,判据只能是内容指纹
+    /// (见 mt-app 的 `markers` 模块注释)。对照组 `ESC[2J` 走 `clear_viewport`
+    /// → `scroll_up`,内容进 scrollback、锚点完好 —— 两条路必须区分得开。
+    #[test]
+    fn 就地清屏抹掉锚点行而历史不动() {
+        // Claude Code 2.1.x: ESC[H + (ESC[2K + ESC[1B) x viewportRows + ESC[H
+        let mut 清屏 = b"\x1b[H".to_vec();
+        for _ in 0..10 {
+            清屏.extend_from_slice(b"\x1b[2K\x1b[1B");
+        }
+        清屏.extend_from_slice(b"\x1b[H");
+
+        let e = TerminalEmulator::with_scrollback(TermSize::new(40, 10), 10_000);
+        feed_lines(&e, 30);
+        let h0 = e.history_lines();
+        assert_eq!(e.line_text(24).as_deref(), Some("line24"));
+
+        e.advance(&清屏);
+        assert_eq!(e.history_lines(), h0, "逐行 2K 不产生滚动,history 必须纹丝不动");
+        assert_eq!(
+            e.line_text(24).as_deref(),
+            Some(""),
+            "算术还指得到这一行,内容却被抹白了 —— 只有指纹测得到"
+        );
+        assert_eq!(e.line_text(0).as_deref(), Some("line0"), "scrollback 不受影响");
+
+        // 对照组:ESC[2J 是滚上去,不是抹掉
+        let e2 = TerminalEmulator::with_scrollback(TermSize::new(40, 10), 10_000);
+        feed_lines(&e2, 30);
+        e2.advance(b"\x1b[2J\x1b[0f");
+        assert!(e2.history_lines() > h0, "2J 把整屏顶进了 scrollback");
+        assert_eq!(e2.line_text(24).as_deref(), Some("line24"), "内容跟着锚点走,完好");
+    }
+
+    /// `ESC[3J` / RIS 把历史清零 → 锚点整体越界,读回口如实交回 `None`。
+    #[test]
+    fn 清历史后锚点越界() {
+        for seq in [&b"\x1b[3J"[..], &b"\x1bc"[..]] {
+            let e = TerminalEmulator::with_scrollback(TermSize::new(40, 10), 10_000);
+            feed_lines(&e, 30);
+            assert_eq!(e.line_text(24).as_deref(), Some("line24"));
+            e.advance(seq);
+            assert_eq!(e.history_lines(), 0, "历史被清空");
+            assert_eq!(e.line_text(24), None, "锚点越界,判废");
+        }
     }
 
     /// 值没变就不动 —— `set_options` 会把整屏标脏并发一次 title 事件。
