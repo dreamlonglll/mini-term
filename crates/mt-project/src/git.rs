@@ -714,6 +714,10 @@ pub fn get_commit_file_diff(
 const MAX_DIFF_BYTES: usize = 1_048_576;
 
 /// LCS 的 O(m·n) DP 表在超大文件上会吃爆内存,越过这条线就退化成「整块替换」。
+///
+/// ⚠️ 这条线量的是**剥掉公共前后缀之后**的中段(见 [`lcs_workload`])。按整文件
+/// 量的话,一个 4000 行的文件只改一行也会越线 —— 退化出来的「整块替换」把全文
+/// 标成一删一增,等于没 diff。
 const MAX_LCS_CELLS: u64 = 10_000_000;
 
 fn binary_diff_result() -> GitDiffResult {
@@ -741,8 +745,7 @@ fn diff_two_texts(old_content: String, new_content: String) -> GitDiffResult {
     let old_lines: Vec<&str> = old_content.lines().collect();
     let new_lines: Vec<&str> = new_content.lines().collect();
 
-    let cells = old_lines.len() as u64 * new_lines.len() as u64;
-    let hunks = if cells > MAX_LCS_CELLS {
+    let hunks = if lcs_workload(&old_lines, &new_lines) > MAX_LCS_CELLS {
         full_replace_diff(&old_content, &new_content)
     } else {
         build_hunks(&old_lines, &new_lines)
@@ -779,16 +782,47 @@ fn get_head_content(repo: &Repository, rel_path: &str) -> Result<Option<String>>
     Ok(Some(content))
 }
 
-/// 基于 LCS 的行 diff,上下文 3 行。
-fn build_hunks(old_lines: &[&str], new_lines: &[&str]) -> Vec<DiffHunk> {
-    let m = old_lines.len();
-    let n = new_lines.len();
+/// 两段行序列的公共前缀 / 后缀行数(前缀优先,后缀在剩下的范围里数)。
+fn common_affix(old_lines: &[&str], new_lines: &[&str]) -> (usize, usize) {
+    let max = old_lines.len().min(new_lines.len());
+    let mut head = 0;
+    while head < max && old_lines[head] == new_lines[head] {
+        head += 1;
+    }
+    let mut tail = 0;
+    while tail < max - head
+        && old_lines[old_lines.len() - 1 - tail] == new_lines[new_lines.len() - 1 - tail]
+    {
+        tail += 1;
+    }
+    (head, tail)
+}
+
+/// 剥掉公共前后缀之后,LCS 还要开多大的 DP 表(格子数)。
+///
+/// 「大文件」与「大改动」不是一回事:1 万行的文件改一行,中段只剩几行,
+/// DP 表小到可以忽略;整份重写才是真的要退化。
+fn lcs_workload(old_lines: &[&str], new_lines: &[&str]) -> u64 {
+    let (head, tail) = common_affix(old_lines, new_lines);
+    (old_lines.len() - head - tail) as u64 * (new_lines.len() - head - tail) as u64
+}
+
+/// 编辑序列: `('=', old_i, new_j)` | `('-', old_i, _)` | `('+', _, new_j)`。
+///
+/// 两头对得上的行直接抄成 `=`,只有中段跑 LCS —— DP 表按 [`lcs_workload`] 算。
+fn edit_script(old_lines: &[&str], new_lines: &[&str]) -> Vec<(char, usize, usize)> {
+    let (head, tail) = common_affix(old_lines, new_lines);
+    let mut flat: Vec<(char, usize, usize)> = (0..head).map(|i| ('=', i, i)).collect();
+
+    let a = &old_lines[head..old_lines.len() - tail];
+    let b = &new_lines[head..new_lines.len() - tail];
+    let (m, n) = (a.len(), b.len());
 
     // LCS DP table
     let mut dp = vec![vec![0usize; n + 1]; m + 1];
     for i in (0..m).rev() {
         for j in (0..n).rev() {
-            if old_lines[i] == new_lines[j] {
+            if a[i] == b[j] {
                 dp[i][j] = dp[i + 1][j + 1] + 1;
             } else {
                 dp[i][j] = dp[i + 1][j].max(dp[i][j + 1]);
@@ -796,23 +830,41 @@ fn build_hunks(old_lines: &[&str], new_lines: &[&str]) -> Vec<DiffHunk> {
         }
     }
 
-    // 拍平成编辑序列: ('=', old_i, new_j) | ('-', old_i, _) | ('+', _, new_j)
-    let mut flat: Vec<(char, usize, usize)> = Vec::new();
+    // 回溯。下标要加回 head —— 外面拿它当行号用
+    //
+    // ⚠️ 平局时**先走删除**(`>` 而不是 `>=`)。换行改动的 LCS 是平的,
+    // 取 `>=` 会先吐 `+` 再吐 `-` —— 一行改写显示成「先增后删」,与 git 的习惯
+    // 相反,并排视图的配对(`mt-app::git_diff::pair_rows` 只认「delete 段紧跟
+    // add 段」)也因此永远对不上,左右两侧各占一行错开显示。
     let mut i = 0;
     let mut j = 0;
     while i < m || j < n {
-        if i < m && j < n && old_lines[i] == new_lines[j] {
-            flat.push(('=', i, j));
+        if i < m && j < n && a[i] == b[j] {
+            flat.push(('=', head + i, head + j));
             i += 1;
             j += 1;
-        } else if j < n && (i >= m || dp[i][j + 1] >= dp[i + 1][j]) {
-            flat.push(('+', i, j));
+        } else if j < n && (i >= m || dp[i][j + 1] > dp[i + 1][j]) {
+            flat.push(('+', head + i, head + j));
             j += 1;
         } else {
-            flat.push(('-', i, j));
+            flat.push(('-', head + i, head + j));
             i += 1;
         }
     }
+
+    for k in 0..tail {
+        flat.push((
+            '=',
+            old_lines.len() - tail + k,
+            new_lines.len() - tail + k,
+        ));
+    }
+    flat
+}
+
+/// 基于 LCS 的行 diff,上下文 3 行。
+fn build_hunks(old_lines: &[&str], new_lines: &[&str]) -> Vec<DiffHunk> {
+    let flat = edit_script(old_lines, new_lines);
 
     // 按上下文 3 行分组成 hunk
     const CONTEXT: usize = 3;
@@ -1525,6 +1577,60 @@ mod tests {
         assert_eq!(result.hunks.len(), 1);
         assert_eq!(result.hunks[0].old_start, 1);
         assert_eq!(result.hunks[0].old_lines, 4000);
+    }
+
+    #[test]
+    fn common_affix_counts_both_ends() {
+        assert_eq!(common_affix(&["a", "b", "c"], &["a", "x", "c"]), (1, 1));
+        // 前缀吃完就没有后缀可数(不能把同一行数两遍)
+        assert_eq!(common_affix(&["a", "b"], &["a", "b", "c"]), (2, 0));
+        assert_eq!(common_affix(&["a"], &["b"]), (0, 0));
+        assert_eq!(common_affix(&[], &["a"]), (0, 0));
+    }
+
+    /// **大文件 ≠ 大改动**:上万行的文件只改一行,剥完公共前后缀中段只剩一两行,
+    /// 不该被 `MAX_LCS_CELLS` 判去「整块替换」(那等于没 diff)。
+    #[test]
+    fn huge_file_with_one_changed_line_still_gets_a_real_diff() {
+        let mut old: Vec<String> = (0..5000).map(|i| format!("line {i}")).collect();
+        let mut new = old.clone();
+        new[2500] = "line 2500 changed".to_string();
+        old.push(String::new());
+        new.push(String::new());
+
+        let result = diff_two_texts(old.join("\n"), new.join("\n"));
+        assert_eq!(result.hunks.len(), 1, "只改一行应该只出一个 hunk");
+        let hunk = &result.hunks[0];
+        // 一删一增 + 上下 3 行上下文
+        assert_eq!(hunk.lines.iter().filter(|l| l.kind == "delete").count(), 1);
+        assert_eq!(hunk.lines.iter().filter(|l| l.kind == "add").count(), 1);
+        assert_eq!(hunk.lines.iter().filter(|l| l.kind == "context").count(), 6);
+        assert_eq!(hunk.old_start, 2498);
+    }
+
+    /// 一行改写要吐成「先删后增」——并排视图靠这个顺序把两行配成一行(顺序反了
+    /// 左右就各占一行错开),而且与 git 的习惯一致。
+    #[test]
+    fn replacement_emits_delete_before_add() {
+        let hunks = build_hunks(&["a", "b", "c"], &["a", "x", "c"]);
+        let kinds: Vec<&str> = hunks[0].lines.iter().map(|l| l.kind.as_str()).collect();
+        assert_eq!(kinds, vec!["context", "delete", "add", "context"]);
+    }
+
+    /// 剥前后缀不能把行号剥歪:`=` 行的下标必须还是原文里的下标。
+    #[test]
+    fn edit_script_keeps_absolute_line_indices() {
+        let flat = edit_script(&["a", "b", "c", "d"], &["a", "x", "c", "d"]);
+        assert_eq!(
+            flat,
+            vec![
+                ('=', 0, 0),
+                ('-', 1, 1),
+                ('+', 2, 1),
+                ('=', 2, 2),
+                ('=', 3, 3),
+            ]
+        );
     }
 
     #[test]

@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 32;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 754;
+pub const ZH_ENTRY_COUNT: usize = 760;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 754;
+pub const EN_ENTRY_COUNT: usize = 760;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -111,7 +111,9 @@ static COMMIT_DIFF_ZH: &[(&str, &str)] = &[
     ("fileCount", "{count} 个文件变更"),
     ("inline", "内联"),
     ("loading", "加载中..."),
+    ("nextChange", "下一处改动"),
     ("noChanges", "该提交无文件变更"),
+    ("prevChange", "上一处改动"),
     ("sideBySide", "并排"),
     ("tooLarge", "文件过大（>1MB），不支持 diff 预览"),
 ];
@@ -121,7 +123,9 @@ static COMMIT_DIFF_EN: &[(&str, &str)] = &[
     ("fileCount", "{count} files changed"),
     ("inline", "Inline"),
     ("loading", "Loading..."),
+    ("nextChange", "Next change"),
     ("noChanges", "No file changes in this commit"),
+    ("prevChange", "Previous change"),
     ("sideBySide", "Side by side"),
     ("tooLarge", "File too large (>1MB), diff preview not supported"),
 ];
@@ -131,6 +135,8 @@ static DIFF_MODAL_ZH: &[(&str, &str)] = &[
     ("binaryNotSupported", "二进制文件，不支持 diff 预览"),
     ("inline", "内联"),
     ("loading", "加载中..."),
+    ("nextChange", "下一处改动"),
+    ("prevChange", "上一处改动"),
     ("sideBySide", "并排"),
     ("tooLarge", "文件过大（>1MB），不支持 diff 预览"),
 ];
@@ -139,6 +145,8 @@ static DIFF_MODAL_EN: &[(&str, &str)] = &[
     ("binaryNotSupported", "Binary file, diff preview not supported"),
     ("inline", "Inline"),
     ("loading", "Loading..."),
+    ("nextChange", "Next change"),
+    ("prevChange", "Previous change"),
     ("sideBySide", "Side by side"),
     ("tooLarge", "File too large (>1MB), diff preview not supported"),
 ];
@@ -307,7 +315,9 @@ static FILE_VIEWER_ZH: &[(&str, &str)] = &[
     ("back", "返回"),
     ("binaryNotSupported", "二进制文件，不支持预览"),
     ("externallyChanged", "文件已被外部修改"),
+    ("htmlPreviewNote", "简版渲染：不跑 CSS 与脚本，需要真实效果请用浏览器打开"),
     ("loading", "加载中..."),
+    ("openInBrowser", "用浏览器打开"),
     ("openWithDefaultApp", "使用默认工具打开"),
     ("preview", "预览"),
     ("reloadDiscard", "重新加载（丢弃修改）"),
@@ -325,7 +335,9 @@ static FILE_VIEWER_EN: &[(&str, &str)] = &[
     ("back", "Back"),
     ("binaryNotSupported", "Binary file, preview not supported"),
     ("externallyChanged", "File was modified externally"),
+    ("htmlPreviewNote", "Simplified rendering: no CSS or scripts — open in a browser for the real thing"),
     ("loading", "Loading..."),
+    ("openInBrowser", "Open in browser"),
     ("openWithDefaultApp", "Open with default app"),
     ("preview", "Preview"),
     ("reloadDiscard", "Reload (discard changes)"),

@@ -507,6 +507,23 @@ pub fn diff_del_text() -> Hsla {
     token(|p| p.diff_del_text)
 }
 
+// --- diff 的行内(词级)底色 ---
+//
+// 原版没有这两个色:一行里只改了一个字符,整行也被涂成红/绿,改哪儿要自己找。
+// 主题包同样没有对应槽位(与 `Palette::diff_add_bg` 同一处取舍),所以按
+// 「文字色 + 固定透明度」现调 —— 比整行底色实一档,叠在整行底色上刚好点出片段,
+// 而且深浅两套主题、换肤主题都跟着走。
+
+/// 新增行里**真正变了的片段**的底色。
+pub fn diff_add_word_bg() -> Hsla {
+    alpha(token(|p| p.diff_add_text), 0.3)
+}
+
+/// 删除行里**真正变了的片段**的底色。
+pub fn diff_del_word_bg() -> Hsla {
+    alpha(token(|p| p.diff_del_text), 0.3)
+}
+
 // --- 缓动 ---
 
 /// CSS `cubic-bezier(x1, y1, x2, y2)` 的等价缓动函数。

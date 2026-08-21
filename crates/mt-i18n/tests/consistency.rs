@@ -36,8 +36,15 @@ use mt_i18n::{
 /// 743 → 744：剪贴板图片粘贴补回（GPUI 迁移期整块缺失）时新增
 /// `terminal.pasteImageNoRemote` —— 远程 pane 断链时图片既没有原文可退、
 /// `Alt+V` 也对远端无效，只能提示，故要一条专属文案。
+/// 754 → 758：diff 弹窗补「上一处/下一处改动」跳转按钮的 tooltip
+/// （`diffModal.{prevChange,nextChange}` 与 `commitDiff.{prevChange,nextChange}`，
+/// 两个弹窗各用各的命名空间，与既有的 `sideBySide`/`inline` 同一口径）。
+///
+/// 758 → 760：HTML 预览补回（原先只有源码态）时新增
+/// `fileViewer.{openInBrowser,htmlPreviewNote}` —— 内嵌的是富文本简版渲染
+/// （无 CSS / 无 JS），得有一句说明与一条去浏览器看真效果的出口。
 const EXPECTED_NAMESPACES: usize = 32;
-const EXPECTED_ENTRIES_PER_LANG: usize = 754;
+const EXPECTED_ENTRIES_PER_LANG: usize = 760;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。
