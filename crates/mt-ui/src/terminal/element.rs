@@ -1309,7 +1309,9 @@ impl Element for TerminalElement {
                 //    「真正画出来的那一对」;在 HIDDEN 之前才不会把 `read -s` 的密码
                 //    强行显形(HIDDEN 就是靠 fg = bg 实现的,修正跑在它后面等于撤销它)。
                 //    块状光标那格随后会把 fg 覆盖成 cursor_text,这里白算一次但不出错。
-                if colors::has_visible_ink(cell.c, flags) {
+                //    powerline 分隔符/块元素这类「拿字符当色块画」的字形不在修正之列,
+                //    理由见 [`colors::is_fill_glyph`]。
+                if colors::wants_contrast_fix(cell.c, flags) {
                     fg = contrast.resolve(fg, bg, colors::MIN_CONTRAST_RATIO);
                 }
                 if flags.contains(Flags::HIDDEN) {

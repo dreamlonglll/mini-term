@@ -293,7 +293,9 @@ impl MiniTerminalElement {
                 // 最小对比度。这里参照色恒为 `theme.background` —— 缩略图不画逐格
                 // 背景,整块底就是它(见模块注释),所以对得上真正画出来的那一对。
                 // 顺序在 HIDDEN 转空白之后:隐藏输入已经没有笔画,不必也不该修正。
-                if ch != ' ' {
+                // 色块类字形(powerline 分隔符/块元素)同样豁免,见 [`colors::is_fill_glyph`]
+                // —— 缩略图里它们是「画」,推成近黑/近白只会多出一块假亮斑。
+                if ch != ' ' && !colors::is_fill_glyph(ch) {
                     color = contrast.resolve(color, self.theme.background, colors::MIN_CONTRAST_RATIO);
                 }
                 cells.push(MiniCell {

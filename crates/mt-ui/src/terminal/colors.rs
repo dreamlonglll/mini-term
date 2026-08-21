@@ -248,6 +248,35 @@ pub fn has_visible_ink(ch: char, flags: Flags) -> bool {
     ch != ' ' || flags.intersects(Flags::ALL_UNDERLINES | Flags::STRIKEOUT)
 }
 
+/// 「拿字符当色块画」的字形:powerline 私用区 + 块元素/框线绘制。
+///
+/// # 为什么必须把它们排除在对比度修正之外
+///
+/// 对比度修正的前提是「前景是要**读**的字」。这两段不是:
+///
+/// - **powerline 分隔符**(`U+E0B0` 系那些实心三角/半圆)那一格的前景色语义是
+///   **隔壁段的底色** —— 它跟本格背景一起拼出一条斜边。相邻两段的底色天然常
+///   落在 4.5 以下(实测 ccstatusline 的 monokai 主题里紫→淡黄是 1.81、青→紫
+///   是 1.64),修正会把三角推到近黑/近白,分隔处变成一块脏色;
+/// - **块元素与框线**(`▄█▌▐░▒▓` / `─│┌┐`)同理 —— TUI 的面板边框、进度条、
+///   半格块拼出来的图,前景色是「画」的一部分,不是可读性问题。
+///
+/// 这条豁免不是本仓的发明:Tauri 版靠 xterm.js 的 `minimumContrastRatio` 拿到
+/// 同一效果,而 xterm.js 自带 `excludeFromContrastRatioDemands`(powerline
+/// `U+E0A4..=U+E0D6` + 块/框 `U+2500..=U+259F`)。GPUI 重写时把 4.5 这个阈值搬
+/// 过来了、**豁免名单漏了**,于是所有 powerline 提示符(Claude Code 状态栏、
+/// oh-my-posh、starship)的三角箭头集体串色。范围逐字沿用 xterm.js 的两段。
+pub fn is_fill_glyph(ch: char) -> bool {
+    matches!(ch as u32, 0x2500..=0x259F | 0xE0A4..=0xE0D6)
+}
+
+/// 这一格该不该跑对比度修正 —— 有笔画、且不是拿来当色块用的字形。
+///
+/// 两个调用方(主终端 `element.rs` 与缩略图 `mini.rs`)共用这一条,别各判各的。
+pub fn wants_contrast_fix(ch: char, flags: Flags) -> bool {
+    has_visible_ink(ch, flags) && !is_fill_glyph(ch)
+}
+
 /// WCAG 的单通道线性化。
 fn linearize(v: u8) -> f32 {
     let c = v as f32 / 255.0;
@@ -591,6 +620,52 @@ mod tests {
             "下划线用的是前景色,空格也画得出来"
         );
         assert!(has_visible_ink(' ', Flags::STRIKEOUT));
+    }
+
+    #[test]
+    fn 色块类字形豁免对比度修正() {
+        // 三组都是从截图逐像素量出来的真实色对(ccstatusline 的 monokai powerline
+        // 配本仓默认底),原始对比度 1.98 / 1.81 / 1.64,右列是没有豁免时被推成的
+        // 那个脏色 —— 分隔符三角当时就是这么串色的。
+        for (fg, bg, 串成) in [
+            (rgb8(0x44, 0x44, 0x44), rgb8(0x0d, 0x0c, 0x1e), rgb8(0x86, 0x86, 0x86)),
+            (rgb8(0xaf, 0x87, 0xff), rgb8(0xd7, 0xd7, 0x87), rgb8(0x65, 0x4e, 0x95)),
+            (rgb8(0x5f, 0xd7, 0xff), rgb8(0xaf, 0x87, 0xff), rgb8(0x18, 0x39, 0x46)),
+        ] {
+            assert_eq!(
+                to_rgb(ensure_contrast(fg, bg, MIN_CONTRAST_RATIO)),
+                to_rgb(串成),
+                "前提:这一对不豁免的话确实会被改写成这个脏色"
+            );
+        }
+
+        // powerline 分隔符/端帽:那一格的前景是「隔壁段的底色」,不是要读的字
+        for ch in ['\u{e0b0}', '\u{e0b2}', '\u{e0b4}', '\u{e0b6}'] {
+            assert!(is_fill_glyph(ch));
+            assert!(!wants_contrast_fix(ch, Flags::empty()));
+        }
+        // 块元素与框线同理:TUI 边框、进度条、半格块拼的图都是「画」
+        for ch in ['█', '▄', '▌', '░', '─', '┌'] {
+            assert!(!wants_contrast_fix(ch, Flags::empty()));
+        }
+        // 正文照常修正,空格照常跳过
+        assert!(wants_contrast_fix('a', Flags::empty()));
+        assert!(wants_contrast_fix('中', Flags::empty()));
+        assert!(!wants_contrast_fix(' ', Flags::empty()));
+
+        // 两段范围的上下界各差一位都不许误伤
+        for (ch, 命中) in [
+            ('\u{24ff}', false),
+            ('\u{2500}', true),
+            ('\u{259f}', true),
+            ('\u{25a0}', false),
+            ('\u{e0a3}', false),
+            ('\u{e0a4}', true),
+            ('\u{e0d6}', true),
+            ('\u{e0d7}', false),
+        ] {
+            assert_eq!(is_fill_glyph(ch), 命中, "U+{:04X}", ch as u32);
+        }
     }
 
     #[test]
