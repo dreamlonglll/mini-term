@@ -1612,6 +1612,20 @@ impl FileViewer {
         }
     }
 
+    /// 「用浏览器打开」。走**协议**关联而不是文件关联 —— `.html` 的默认程序常被
+    /// 设成编辑器(用户实测 notepad--),那样点一下只是再开一个编辑器,拿不到
+    /// 这个按钮真正想要的东西(见 `mt_project::editor::open_path_in_browser`)。
+    fn open_in_browser(&self, cx: &mut App) {
+        let path = self.current_path.clone();
+        cx.background_executor()
+            .spawn(async move {
+                if let Err(err) = mt_project::editor::open_path_in_browser(&path) {
+                    eprintln!("[file-viewer] 浏览器打开失败: {err:#}");
+                }
+            })
+            .detach();
+    }
+
     fn open_with_default_app(&self, cx: &mut App) {
         let path = self.current_path.clone();
         cx.background_executor()
@@ -1733,7 +1747,7 @@ impl FileViewer {
                                 })
                                 .child(t("fileViewer", "openInBrowser"))
                                 .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                                    this.open_with_default_app(cx)
+                                    this.open_in_browser(cx)
                                 })),
                         )
                     })
