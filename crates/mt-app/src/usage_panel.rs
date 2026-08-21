@@ -33,9 +33,9 @@ use futures::StreamExt;
 use futures::channel::mpsc;
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, AppContext as _, Context, Div, Entity,
-    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Render,
-    SharedString, Stateful, StatefulInteractiveElement, Styled, Task, Window, bounce, div,
-    ease_in_out, prelude::FluentBuilder, px, relative,
+    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Point,
+    Render, SharedString, Stateful, StatefulInteractiveElement, Styled, Task, Window, bounce, div,
+    ease_in_out, point, prelude::FluentBuilder, px, relative,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 use mt_ui::tooltip::Tooltip;
@@ -842,6 +842,12 @@ const AUTO_REFRESH_OPTIONS: [u32; 5] = [0, 5, 10, 30, 60];
 /// custom 起止输入框的宽度。够 `YYYY-MM-DD` 在等宽字族下也整串露出来 ——
 /// 逐层扣法见 [`UsagePanel::render_date_field`]。
 const DATE_INPUT_WIDTH: f32 = 150.0;
+/// 项目下拉菜单与触发框之间的缝(与日历浮层贴触发钮的手感同一档)。
+const PROJECT_MENU_GAP: gpui::Pixels = px(4.0);
+/// 项目下拉菜单的高度上限。项目多的机器上这个菜单能长到顶满整屏 ——
+/// 它是**挂在弹窗里的下拉**,不是右键菜单,长过弹窗本身就不像一件东西了。
+/// 280 ≈ 10 项(行高 25 + 面板 padding 8),再多滚轮翻。
+const PROJECT_MENU_MAX_HEIGHT: gpui::Pixels = px(280.0);
 /// 模型排行前 N,其余合并成一行 Others。
 const TOP_MODELS: usize = 6;
 /// `@keyframes usageFadeIn` 的 `translateY(6px)`。
@@ -938,6 +944,11 @@ pub struct UsagePanel {
     /// 得按它算(原版 `minTickGap` 比的是真实像素)。首帧用兜底值,
     /// **量完刻意不 notify** —— 量尺寸再触发重画就是每帧一个死循环。
     chart_width: f32,
+    /// 「选择项目」下拉框的左下角(canvas 量的窗口坐标,跨帧保留)。菜单要贴在
+    /// 框底而不是鼠标点上,而元素 bounds 只有布局阶段才知道 —— 与
+    /// [`Self::chart_width`] 同一套路(量完同样刻意不 notify)。
+    /// 首帧还没量到时退回鼠标点。
+    project_dropdown_anchor: Option<Point<Pixels>>,
     preview: Option<Preview>,
     /// 查询序号:切参数后旧查询返回时不得覆盖新结果。
     query_seq: u64,
@@ -1037,6 +1048,7 @@ impl UsagePanel {
             rank_bars: mt_ui::motion::TweenMap::new(mt_ui::motion::RANK_BAR),
             chart_cache: None,
             chart_width: CHART_FALLBACK_WIDTH,
+            project_dropdown_anchor: None,
             preview: None,
             query_seq: 0,
             _query_task: None,
@@ -2141,35 +2153,60 @@ impl UsagePanel {
         // 项目一多就得靠这个勾才认得出选的是哪个 —— 菜单基件没有勾选态,
         // 惯例是「`✓ ` / 全角空格」前缀(见 `menu.rs` 模块注释)
         let selected = self.effective_project(cx).map(|p| norm_project_path(&p));
-        dropdown("usage-project-scope", label, px(160.0)).on_mouse_down(
-            MouseButton::Left,
-            move |event: &MouseDownEvent, window, cx| {
-                let mut entries = vec![menu::item(
-                    format!(
-                        "{}{}",
-                        check_mark(selected.is_none()),
-                        t("usageStats", "scope.allProjects")
-                    ),
-                    {
-                        let entity = entity.clone();
-                        move |_window, cx: &mut App| {
-                            entity.update(cx, |this, cx| this.set_project_scope(None, cx));
-                        }
-                    },
-                )];
-                for (_id, name, path) in &projects {
-                    let entity = entity.clone();
-                    let on = selected.as_deref() == Some(norm_project_path(path).as_str());
-                    let label = format!("{}{name}", check_mark(on));
-                    let path = path.clone();
-                    entries.push(menu::item(label, move |_window, cx: &mut App| {
-                        let path = path.clone();
-                        entity.update(cx, |this, cx| this.set_project_scope(Some(path), cx));
-                    }));
-                }
-                menu::show(event.position, entries, window, cx);
+        // 菜单要贴在框底:量下这一帧的 bounds 供**下一次点开**用(与趋势图量
+        // 绘图区宽度同一套路,同样刻意不 notify)
+        let measure_entity = cx.entity();
+        let measure = gpui::canvas(
+            move |bounds: gpui::Bounds<Pixels>, _window, cx| {
+                measure_entity.update(cx, |this: &mut Self, _cx| {
+                    this.project_dropdown_anchor =
+                        Some(point(bounds.origin.x, bounds.bottom() + PROJECT_MENU_GAP));
+                });
             },
+            |_, _, _, _| {},
         )
+        .absolute()
+        .size_full();
+        let anchor = self.project_dropdown_anchor;
+        dropdown("usage-project-scope", label, px(160.0))
+            .relative()
+            .child(measure)
+            .on_mouse_down(
+                MouseButton::Left,
+                move |event: &MouseDownEvent, window, cx| {
+                    let mut entries = vec![menu::item(
+                        format!(
+                            "{}{}",
+                            check_mark(selected.is_none()),
+                            t("usageStats", "scope.allProjects")
+                        ),
+                        {
+                            let entity = entity.clone();
+                            move |_window, cx: &mut App| {
+                                entity.update(cx, |this, cx| this.set_project_scope(None, cx));
+                            }
+                        },
+                    )];
+                    for (_id, name, path) in &projects {
+                        let entity = entity.clone();
+                        let on = selected.as_deref() == Some(norm_project_path(path).as_str());
+                        let label = format!("{}{name}", check_mark(on));
+                        let path = path.clone();
+                        entries.push(menu::item(label, move |_window, cx: &mut App| {
+                            let path = path.clone();
+                            entity.update(cx, |this, cx| this.set_project_scope(Some(path), cx));
+                        }));
+                    }
+                    // 首帧还没量到 bounds 时退回鼠标点(旧行为)
+                    menu::show_with(
+                        anchor.unwrap_or(event.position),
+                        entries,
+                        menu::MenuOptions::max_height(PROJECT_MENU_MAX_HEIGHT),
+                        window,
+                        cx,
+                    );
+                },
+            )
     }
 
     /// 自动刷新档位下拉。`0` 显示 `autoRefreshOff`,其余是裸模板串 `"{n}s"`

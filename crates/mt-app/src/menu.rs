@@ -43,8 +43,18 @@
 //! 项目 scope 菜单就是这么丢项的)。所以条目列表另包一层带 [`panel_max_height`]
 //! 上限的滚动容器,**但只给叶子层**(判据与理由见 [`is_scrollable`])。
 //!
+//! 那个上限是「不溢出窗口」的兜底,长列表照样会长到几乎顶满视口 —— 挂在弹窗里的
+//! 下拉(用量面板的项目 scope)看着就像整屏被一列项目占了。调用方想要更紧的上限
+//! 走 [`show_with`] + [`MenuOptions::max_height`],**只作用于根面板**(子菜单的
+//! 版式与滚动另有一套顾虑,见 [`is_scrollable`])。
+//!
+//! 滚动条走 `gpui_component::scroll::Scrollbar`(常显档):它 absolute 铺满宿主,
+//! 所以可滚的那层要多包一层 `relative` 的壳。配色不必操心 —— 主题桥已经把
+//! `scrollbar.*` 三个 token 同步成本仓那套(`mt_ui::theme_bridge`),不会像模块
+//! 开头列的第 3 条硬伤那样与面板脱节。
+//!
 //! 已知缺口:滚动位置不进视图状态,所以 ↑↓ 选到视口外的条目时不会自动滚过去
-//! (鼠标滚轮正常)。全仓的滚动容器都没画滚动条,这里照旧。
+//! (鼠标滚轮与拖滚动条正常)。
 //!
 //! # 自定义元素子菜单([`MenuItem::submenu_element`])
 //!
@@ -83,14 +93,17 @@
 //! 菜单开着时全局快捷键要让路(原版把 `'menu'` 也压进 `overlayStack`),所以
 //! [`show`] / [`ContextMenu::dismiss`] 各自压栈/摘栈,见 [`crate::overlay`]。
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, FocusHandle, Global, Hsla, InteractiveElement,
     IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Render,
-    SharedString, StatefulInteractiveElement, Styled, Window, anchored, deferred, div, point,
-    prelude::FluentBuilder, px, relative,
+    ScrollHandle, SharedString, StatefulInteractiveElement, Styled, Window, anchored, deferred,
+    div, point, prelude::FluentBuilder, px, relative,
 };
+use gpui_component::scroll::{Scrollbar, ScrollbarShow};
 
 use crate::overlay;
 use crate::ui;
@@ -237,11 +250,30 @@ pub fn hotkey_label(with_mod: bool, shift: bool, alt: bool, key: &str) -> String
 
 // ─── 全局状态 ─────────────────────────────────────────────────
 
+/// [`show_with`] 的可选参数。默认值等价于 [`show`]。
+#[derive(Clone, Copy, Default)]
+pub struct MenuOptions {
+    /// 根面板高度上限。`None` = 只受视口约束([`panel_max_height`])。
+    ///
+    /// 给的值再大也超不过视口那道兜底 —— 两者取小。
+    pub max_height: Option<Pixels>,
+}
+
+impl MenuOptions {
+    /// 只想封个高度时的简写。
+    pub fn max_height(height: Pixels) -> Self {
+        Self {
+            max_height: Some(height),
+        }
+    }
+}
+
 /// 当前打开的那一个菜单。同时只可能有一个(原版靠模块级 `currentCleanup` 保证,
 /// 这里靠「状态只有一份」天然保证)。
 struct OpenMenu {
-    /// 鼠标点(窗口坐标)。
+    /// 菜单左上角要贴的窗口坐标。右键菜单是鼠标点,下拉菜单是触发框的左下角。
     position: Point<Pixels>,
+    options: MenuOptions,
     entries: Vec<MenuEntry>,
     /// 展开中的子菜单路径(逐层下标)。`[]` = 没展开任何子菜单。
     open_path: Vec<usize>,
@@ -262,6 +294,12 @@ struct OpenMenu {
 #[derive(Default)]
 pub struct ContextMenu {
     open: Option<OpenMenu>,
+    /// 每个可滚层的滚动句柄(滚动条要拿它算 thumb)。键是层路径,与 [`panel_id`]
+    /// 同一套编码。**换菜单即清空** —— 留着会把上一个菜单滚到一半的位置带进
+    /// 新菜单(路径相同的层就会撞上)。
+    ///
+    /// 放在这里而不是 `OpenMenu` 里:`render_panel` 只有 `&self`,句柄得懒建。
+    scrolls: RefCell<HashMap<Vec<usize>, ScrollHandle>>,
 }
 
 struct GlobalContextMenu(Entity<ContextMenu>);
@@ -286,6 +324,17 @@ pub fn show(
     window: &mut Window,
     cx: &mut App,
 ) {
+    show_with(position, entries, MenuOptions::default(), window, cx);
+}
+
+/// [`show`] 带参数的那一版(目前只有高度上限一个旋钮,见 [`MenuOptions`])。
+pub fn show_with(
+    position: Point<Pixels>,
+    entries: Vec<MenuEntry>,
+    options: MenuOptions,
+    window: &mut Window,
+    cx: &mut App,
+) {
     if entries.is_empty() {
         return;
     }
@@ -299,10 +348,13 @@ pub fn show(
         };
         // 换菜单时这一步是空操作(已经在栈里),照调不误 —— 压栈是幂等的
         overlay::push(overlay::key(overlay::kind::MENU));
+        // 上一个菜单的滚动位置不带进这一个(见 `scrolls` 的字段注释)
+        menu.scrolls.borrow_mut().clear();
         let focus = cx.focus_handle();
         window.focus(&focus);
         menu.open = Some(OpenMenu {
             position,
+            options,
             entries,
             open_path: Vec::new(),
             active: None,
@@ -467,6 +519,22 @@ fn panel_max_height(viewport_height: Pixels) -> Pixels {
     (viewport_height - px(24.0)).max(px(120.0))
 }
 
+/// 这一层实际用的高度上限。
+///
+/// 调用方给的那道([`MenuOptions::max_height`])**只管根面板**,且与视口那道取小
+/// —— 视口兜底是「别溢出窗口」的硬约束,调用方给多大都不该越过它。
+fn effective_max_height(
+    viewport_height: Pixels,
+    requested: Option<Pixels>,
+    is_root: bool,
+) -> Pixels {
+    let cap = panel_max_height(viewport_height);
+    match requested {
+        Some(height) if is_root => height.min(cap),
+        _ => cap,
+    }
+}
+
 /// 滚动容器的元素 id(逐层稳定,与 [`entry_id`] 同一套路径编码)。
 fn panel_id(ancestors: &[usize]) -> SharedString {
     let mut s = String::from("ctx-panel");
@@ -475,6 +543,21 @@ fn panel_id(ancestors: &[usize]) -> SharedString {
         s.push_str(&a.to_string());
     }
     SharedString::from(s)
+}
+
+/// 给滚动条让出来的右侧宽度。
+///
+/// 等于 `gpui_component::scroll::Scrollbar` 那个元素的整宽(`THUMB_ACTIVE_INSET`
+/// ×2 + `THUMB_ACTIVE_WIDTH` = 16),它是 `pub(crate)` 拿不到,只能对齐着写。
+/// 不让位的话,常显档的轨道底色会盖在条目右端 —— 选中行的高亮末尾看着像褪了色。
+const SCROLLBAR_GUTTER: Pixels = px(16.0);
+
+/// 滚动条的元素 id。
+///
+/// **必须显式给**:`Scrollbar` 默认拿 `Location::caller()` 当 id,而根面板与
+/// 子面板走的是同一行代码 —— 两层同时可滚时 id 会撞在一起。
+fn scrollbar_id(ancestors: &[usize]) -> SharedString {
+    SharedString::from(format!("{}-bar", panel_id(ancestors)))
 }
 
 /// 元素 id:同一帧里逐项唯一,且跨帧稳定(路径 + 下标)。
@@ -532,6 +615,16 @@ impl ContextMenu {
         let open = self.open.as_ref()?;
         let (&index, ancestors) = open.active.as_deref()?.split_last()?;
         panel_open(&open.open_path, ancestors).then(|| (ancestors.to_vec(), index))
+    }
+
+    /// 这一层的滚动句柄(没有就建一个)。滚动容器与滚动条得共用同一个,
+    /// 否则滚动条量不到内容高度、永远不画。
+    fn scroll_handle(&self, ancestors: &[usize]) -> ScrollHandle {
+        self.scrolls
+            .borrow_mut()
+            .entry(ancestors.to_vec())
+            .or_insert_with(ScrollHandle::new)
+            .clone()
     }
 
     /// 取某一项(层 + 下标)。
@@ -757,9 +850,43 @@ impl ContextMenu {
         // 叶子层封顶 + 滚轮可滚(判据见 `is_scrollable`)。项目数上不封顶的那几个
         // 菜单(用量面板的项目 scope、SSH 连接、分支列表)全走这一支。
         let list = if is_scrollable(entries) {
-            list.id(panel_id(&ancestors))
-                .max_h(panel_max_height(window.viewport_size().height))
-                .overflow_y_scroll()
+            let requested = self.open.as_ref().and_then(|o| o.options.max_height);
+            let handle = self.scroll_handle(&ancestors);
+            // 真溢出了才给滚动条让位:`max_offset` 是**上一帧**量的,与滚动条
+            // 自己「不溢出就不画」的判据同源,所以两者同帧一致(首帧双双为零,
+            // 菜单进场动画会驱动下一帧补上)。不判就等于短菜单也白留一条边。
+            let overflowing = handle.max_offset().height > px(0.0);
+            let list = list
+                .id(panel_id(&ancestors))
+                .track_scroll(&handle)
+                .max_h(effective_max_height(
+                    window.viewport_size().height,
+                    requested,
+                    ancestors.is_empty(),
+                ))
+                .when(overflowing, |el| el.pr(SCROLLBAR_GUTTER))
+                .overflow_y_scroll();
+            // 滚动条要**自己再套一层 `absolute` + 四边贴 0** 的壳(与
+            // `gpui_component::scroll::scrollable` 的包法一致)。`Scrollbar`
+            // 元素自身虽是 absolute,却不带 inset —— 只给尺寸不给位置,taffy
+            // 就按「静态位置」把它摆在列表**下方**,滚动条会掉到菜单外面去。
+            // 内容不溢出时它自己不画(`scroll_area_size <= container_size` 那一支)。
+            div()
+                .relative()
+                .child(list)
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .child(
+                            Scrollbar::vertical(&handle)
+                                .id(scrollbar_id(&ancestors))
+                                .scrollbar_show(ScrollbarShow::Always),
+                        ),
+                )
                 .into_any_element()
         } else {
             list.into_any_element()
@@ -1173,6 +1300,21 @@ mod tests {
         assert_eq!(panel_max_height(px(0.0)), px(120.0));
     }
 
+    /// 调用方那道上限只封根面板,且封不过视口那道兜底。
+    #[test]
+    fn 调用方上限只作用于根面板() {
+        // 根面板:两者取小
+        assert_eq!(effective_max_height(px(900.0), Some(px(280.0)), true), px(280.0));
+        assert_eq!(
+            effective_max_height(px(200.0), Some(px(280.0)), true),
+            px(176.0),
+            "给的比视口兜底还大 → 仍按视口封顶"
+        );
+        // 子面板 / 没给上限:照旧只受视口约束
+        assert_eq!(effective_max_height(px(900.0), Some(px(280.0)), false), px(876.0));
+        assert_eq!(effective_max_height(px(900.0), None, true), px(876.0));
+    }
+
     /// 滚动容器 id 逐层稳定、与条目 id 不撞。
     #[test]
     fn 滚动容器_id_逐层唯一() {
@@ -1180,6 +1322,15 @@ mod tests {
         assert_eq!(panel_id(&[2, 1]).to_string(), "ctx-panel-2-1");
         assert_ne!(panel_id(&[1]), panel_id(&[2]));
         assert_ne!(panel_id(&[1]).to_string(), entry_id(&[1], 0).to_string());
+    }
+
+    /// 滚动条 id 同样逐层唯一,且不与它宿主那个滚动容器撞。
+    #[test]
+    fn 滚动条_id_逐层唯一() {
+        assert_eq!(scrollbar_id(&[]).to_string(), "ctx-panel-bar");
+        assert_eq!(scrollbar_id(&[2, 1]).to_string(), "ctx-panel-2-1-bar");
+        assert_ne!(scrollbar_id(&[1]), scrollbar_id(&[2]));
+        assert_ne!(scrollbar_id(&[1]), panel_id(&[1]));
     }
 
     /// 「点得动」的判据:禁用 / 子菜单父项 / 没挂动作都点不动。
