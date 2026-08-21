@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.0.2--beta-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.0.3--beta-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -123,7 +123,7 @@ CLI 背后是**全机单例 daemon** 持有的持久连接池：首次调用自�
 
 ### 🌿 Git 集成 + Worktree 批量管理
 
-VS Code 风格的 **Changes 面板**（Staged / Changes / Untracked 分组，单文件或全量 stage / discard，`Ctrl+Enter` 提交），并排 / 内联双视图 Diff，游标分页的提交历史，以及**手绘 SVG 分支拓扑图**（按 lane 布局与上色，合并提交实心点套外环，后端 revwalk 加 TOPOLOGICAL 排序避免 rebase 后连线断裂）。Git 面板为**上下两个可折叠区块**——更改在上、提交历史在下，同屏可见、中缝拖拽调比例、折叠展开带动画；顶部仓库栏下拉切换仓库，分支徽章一键切换历史查看分支（不 checkout），刷新 / Pull / Push 也收在栏上。
+VS Code 风格的 **Changes 面板**（Staged / Changes / Untracked 分组，单文件或全量 stage / discard，`Ctrl+Enter` 提交），并排 / 内联双视图 Diff（弹窗铺到 80vw × 85vh，长行横向滚动、两栏纵向同步、`@@` hunk 分隔与「上一处 / 下一处改动」跳转，配对上的删 / 增行再做词级高亮，只涂真正变了的片段），游标分页的提交历史，以及**手绘 SVG 分支拓扑图**（按 lane 布局与上色，合并提交实心点套外环，后端 revwalk 加 TOPOLOGICAL 排序避免 rebase 后连线断裂）。Git 面板为**上下两个可折叠区块**——更改在上、提交历史在下，同屏可见、中缝拖拽调比例、折叠展开带动画；顶部仓库栏下拉切换仓库，分支徽章一键切换历史查看分支（不 checkout），刷新 / Pull / Push 也收在栏上。
 
 **Worktree 管理**对多 Agent 并行开发特别有用：项目根目录本身不是仓库时会**向下扫描子仓库**并按主工作区归并，组头可勾选多选 / 全选，**一次为每个勾选的仓库各建一个 worktree**（分支下拉取各仓库分支的交集）。建好的 worktree 可以一键「设为项目」挂到主项目下面成为子项目，或者直接开个终端进去。**AI agent 在终端里把 worktree 删掉之后**，回到窗口时列表会自动把目录已消失的子项目连同终端资源一起收掉，不留失效条目（只在父项目还在时清理，盘符掉线不会误删）。
 
@@ -138,6 +138,7 @@ VS Code 风格的 **Changes 面板**（Staged / Changes / Untracked 分组，单
 | **远程自动落地** | 上面两种粘贴在 SSH 远程项目里会经 SFTP 传到远端再粘**远端**路径；WSL 项目自动把 `C:\...` 换算成 `/mnt/c/...` |
 | **文件拖拽** | 从文件树或资源管理器拖文件到终端，插入带引号的绝对路径，精准落到目标分屏；拖到一半松在别处不会误写入、也不会退化成一次点击打开文件 |
 | **内置文件编辑器** | 文件树点开即改：tree-sitter 语法高亮（30+ 语言），查找替换，`Ctrl+S` 原子落盘，外部改动自动感知，Markdown 实时预览未保存草稿 |
+| **带图的文档预览** | Markdown / HTML 预览里的图片真的会显示——相对路径按文件所在目录解析，README 顶上那排徽章之类的网络图直接拉回来（10s 超时 + 32MB 上限，其余协议一律拒），大图按原尺寸与正文宽取小不再被压成一条。HTML 另有一个「用浏览器打开」，走 https 协议关联而不是 `.html` 的文件关联——默认程序被设成编辑器的机器上，这个按钮开出来的仍是浏览器 |
 | **全局搜索** | `Ctrl+Shift+F` 唤起，文件名 / 内容双模式，子串或正则，后端流式推送随时可取消 |
 | **项目级环境变量** | 按项目注入 PTY 子进程，严格 POSIX 校验，Rust 端二次防御，WSL 下经 WSLENV 透传 |
 | **智能 Ctrl+C/V** | 可选开启：有选区时复制、无选区时中断程序；Windows 大段粘贴自动分块防 ConPTY 丢行 |
@@ -146,6 +147,7 @@ VS Code 风格的 **Changes 面板**（Staged / Changes / Untracked 分组，单
 | **项目描述** | 右键给项目补一行灰色小字备注，一排 worktree 子项目各自在干什么一眼分清 |
 | **启动零网络请求** | 原生渲染无 Web 资源，启动不发任何网络请求（价格表按天拉取，拉不到用缓存） |
 | **刷屏不卡界面** | `cat` 大文件、AI 刷屏时，PTY 字节在后台线程直喂 VT 状态机、UI 按帧取格子渲染——单进程零 IPC，没有中间缓冲可堆积，刷屏拖不垮界面 |
+| **终端连体字** | 「设置 → 外观 → 字体」一个开关，`=>` `!=` `->` 按字体的连字规则合并显示，逐列对齐不受影响（连字总宽不守恒的字体自动退回不连字重排）。注意默认的 Cascadia **Mono** 是去连字版，得换 Cascadia Code / Fira Code 这类才看得见效果 |
 | **三种主题** | Auto / Light / Dark（暖炭色调）；标题栏与主题同色，启动无浅色闪烁 |
 | **外置主题包** | 兼容 Dream Skin 格式的皮肤：文件夹或 zip 导入、manifest 的 sha256 校验、改文件即热重载；皮肤可自带背景图，终端随之透明化压在氛围层上。设置页卡片直接铺实况缩略图，导入的 theme.css 与 theme.json 的 tokens 覆盖过同一道外链闸（禁 `@import`，指向包外的引用一律拒——`url()`、`image-set("…")` 这类裸字符串、CSS 转义写法都挡得住）。不知道从哪起手就点「生成示例」：一份可直接改的示例皮肤落进皮肤目录，含 theme.json / theme.css 与逐字段说明的 README，改完保存即热重载（与仓库 [`docs/theme-pack-example/`](docs/theme-pack-example/) 是同一份文件） |
 | **自定义标题栏** | 无边框窗口 + 自绘标题栏，配色跟着主题走不再是系统那条灰白；按平台适配习惯——Windows / Linux 右侧三键并保留 Win11 贴靠布局（悬停最大化按钮弹分屏菜单），macOS 保留原生交通灯。版本号旁是**当前项目切换器**：胶囊按钮常显当前项目与它的 AI 状态色点，下拉列出所有进入 AI 会话的项目及状态、点击即切换；全局状态灯紧随其右，点一下直接跳到下一个该处理的会话（最先完成的排最前） |
@@ -169,7 +171,7 @@ VS Code 风格的 **Changes 面板**（Staged / Changes / Untracked 分组，单
 | Git / 文件 | git2（libgit2）· notify + ignore |
 | 用量统计 | rusqlite 本地账本 · 自绘趋势图 |
 | 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`） |
-| 测试 | **1439 个 Rust 测试**（27 个测试目标） |
+| 测试 | **1475 个 Rust 测试**（28 个测试目标） |
 
 ---
 

@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.0.1--beta-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.0.3--beta-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -138,6 +138,8 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 - **文件树** — 集成目录浏览器，自然排序（V1 → V2 → V10 而非字典序），嵌套 `.gitignore` 置灰（每层子目录的忽略规则与 `!pattern` 白名单都会生效，与 git 行为一致），`notify` 文件监听实时刷新
 - **文件操作** — 文件树内新建文件 / 文件夹、重命名、删除、查看内容（Markdown 渲染，图片格式直接展示，二进制与超大文件友好提示）
 - **内置文件编辑器** — 文件树点开文件即可就地编辑：tree-sitter 语法高亮（30+ 语言）按文件类型自动匹配，查找替换（`Ctrl+F`）；`Ctrl+S` 原子落盘（临时文件 + rename，不怕写坏），CRLF 文件按原行尾往返不产生全文件 diff；有未保存修改时关闭先确认，文件被外部改动时干净则静默重载、脏则出提示条；Markdown 预览实时渲染未保存草稿；语法配色跟随主题皮肤
+- **文档预览里的图片** — Markdown 与 HTML 预览都能显示图片：相对路径按当前文件所在目录解析成本地资源，「整行只有图片」的行拆出来自绘，宽度取图片原尺寸与正文可用宽的小值（大图不再被 object-fit 压成一条）；SVG 按 2 倍光栅化换算。网络图片（README 顶上的徽章、外链截图）经内置 HTTP 客户端真加载——只放行 `file://` 与 `http(s)://`，10s 超时 + 32MB 响应上限，客户端为进程级单例；拉不动时画成带 alt 的可点占位，点了用系统浏览器打开原图
+- **HTML 预览** — `.html` 除源码编辑器外另有预览态（简版渲染，顶部一条「无 CSS / 无脚本」说明），`src` / `href` / `poster` 的本地目标改写成 `file://` 才看得到图片与本地资源；工具栏常驻「用浏览器打开」，走 **https 协议关联**而非 `.html` 文件关联（后者常被设成编辑器，点了只会再开一个编辑器）——Windows 读 `https` 的 UserChoice ProgId 再取 `shell\open\command`，三层退让 https → http → 系统级 `HKCR\http`，找不到浏览器直接报错而不悄悄退回文件关联；路径转 URL 时转义 `%`、空格、`#`、`?`
 - **外部编辑器打开** — 文件树右上角按钮一键用配置的编辑器（默认 VS Code）打开当前项目，路径可在「设置 → 系统 → 外部编辑器」自定义；文件可用系统默认应用打开
 - **项目级环境变量** — 项目右键菜单「环境变量…」打开管理弹窗，行级 `[启用 checkbox][key][value][✕]` 布局，启动该项目终端时按项目注入到 PTY 子进程；严格 POSIX 校验（key 匹配 `^[A-Za-z_][A-Za-z0-9_]*$`、非 `MINITERM_` 前缀、不可用 `WSLENV`、项目内不重复，value 禁 `\n/\r/\0`）；校验之外再加 `MINITERM_` 前缀 + `WSLENV` 防御性过滤，即便手改 `config.json` 绕过 UI 校验也无法破坏 hook 协议或 WSLENV 拼接；WSL 项目下环境变量通过 WSLENV 机制透传至 Linux bash（`/u` 单向不做路径翻译；`~/.bashrc` 中 `export` 同名变量会覆盖）
 
@@ -145,7 +147,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 
 - **文件状态** — 文件树显示 Git 状态颜色（修改 / 新增 / 删除 / 冲突）
 - **变更 / 历史同屏** — Git 面板为上下两个可折叠区块：更改在上、提交历史在下，中缝可拖拽调节比例（钳 15%~85%），折叠 / 展开带动画且会话内记住折叠态与比例；面板顶部仓库栏下拉切换仓库（worktree 条目标 ⎇），分支徽章点击只切历史查看分支（不 checkout，查看非 HEAD 分支时高亮提示），刷新 / Pull / Push 集中在栏上，右键仓库名可在终端打开或进入 Worktree 管理
-- **变更 Diff** — 工作区文件变更的详细 Diff，Hunk 行级解析，并排 / 内联双视图，并排模式支持拖拽调节分隔比例，字号跟随终端字体设置
+- **变更 Diff** — 工作区文件变更的详细 Diff，Hunk 行级解析，并排 / 内联双视图，并排模式支持拖拽调节分隔比例，字号跟随终端字体设置。单文件与 commit 两个 diff 弹窗统一 80vw × 85vh（与用量统计面板外框重合）；长行横向滚动、并排两栏纵向同步、`@@` hunk 头分隔与「上一处 / 下一处改动」跳转；LCS 回溯的平局偏向已修（此前删 / 增行永远配不上对、左右各占一行错开），配对成功的行再做词级高亮只涂真正变了的片段；diff 规模判据按剥掉公共前后缀后的中段算，几千行文件改一行不再退化成「整块替换」
 - **提交历史** — 平铺展示顶部仓库栏选中仓库的提交记录，游标分页加载（默认 30 条）
 - **分支拓扑图** — 提交历史每行左侧绘制 SVG 拓扑图，按 lane 布局画出分支、合并与直穿连线，节点按 lane 上色、合并提交实心点套外环，汇入线用分支自身颜色的贝塞尔曲线并在根部渐变融入主线；后端 revwalk 追加 TOPOLOGICAL 排序，避免时钟偏移或 rebase 后父提交排在子提交之前导致连线断裂；commit 行只标注本仓库自己检出的分支，不再把其他工作区 / 远程分支全挂上来
 - **提交 Diff** — 查看任意提交的文件变更，逐文件切换
@@ -167,6 +169,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
   - 拖拽与窗口控制走 GPUI 原生 WindowControlArea；双击顶栏最大化 / 还原
 - **外置主题包（Dream Skin 兼容）** — 「设置 → 外观 → 主题与语言」可从文件夹或 zip 导入第三方皮肤，落在 `{app_data_dir}/themes/<themeId>/`（`theme.json` 必需，`theme.css` / 背景图可选）。同一区的「生成示例」把一份可直接改的示例皮肤写进 `themes/example/`（`theme.json` + `theme.css` + 逐字段说明的 `README.md`，改完保存即热重载）；示例内容与仓库 [`docs/theme-pack-example/`](theme-pack-example/) 是**同一份文件**（`include_str!` 编译期嵌入，文档与产物不会漂开），目录已存在时报错而非覆盖，用户改过的那份不会被静默抹掉。包内带 `manifest.json` 时逐文件核对 bytes + sha256 防损坏；导入先落暂存目录、校验通过才原子换入，坏包不会连累同名的既有皮肤。皮肤的明暗由作者在 `theme.json` 的 `appearance` 定死，激活期间内置主题按钮置为未选中态。改动包内文件即热重载。皮肤可声明背景图，此时终端底色转半透明压在氛围层上，设置页卡片直接铺实况缩略图。导入的 `theme.css` 与 `theme.json` 的 `tokens` 覆盖过同一道外链闸：禁 `@import`、指向包外的引用一律拒 —— 检查在剥掉注释、还原 CSS 转义后的取样上做，`url()` 与 `image-set("…")` 这类裸字符串双查，`url(\68 ttps://…)` 之类的转义写法同样挡得住
 - **字体独立调节** — UI 与终端的字号（10-20px）/ 字体 family 分别可调，终端可选是否跟随 UI 主题
+- **终端连体字** — 「设置 → 外观 → 字体」的「启用终端连体字」开关（默认关），开启后 `=>` `!=` `->` 等按字体自身的连字规则合并显示。合并段整段一次 shape、段原点钉在 `cell_width × 起始列`，连字总宽守恒时段内字符照旧落在列格上；shape 完若总宽不等于「列数 × 列宽」则退回禁连字重 shape 一次，防住连字不守恒的字体。注意默认字族 Cascadia **Mono** 是去连字版，要换 Cascadia Code / Fira Code 这类才看得见效果
 - **布局持久化** — 分屏比例、标签页、窗口大小 / 位置自动保存，重启恢复
 - **关闭确认** — 关闭窗口时只按 AI 会话数量盘点（ai-working / ai-idle 的 pane），裸 shell 终端不计入，仅当存在 AI 会话时才弹确认并列出会话名清单；无论是否弹窗都会 flush 所有项目布局
 - **版本检查** — 启动时拉取 GitHub Release，有新版本时侧栏图标高亮提示、点击前往下载；版本号写入原生窗口标题

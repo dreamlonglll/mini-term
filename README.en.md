@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.0.2--beta-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.0.3--beta-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -123,7 +123,7 @@ Behind the CLI is a **machine-wide singleton daemon** holding the persistent con
 
 ### 🌿 Git integration + batch worktree management
 
-A VS Code-style **Changes panel** (Staged / Changes / Untracked groups, per-file or bulk stage / discard, `Ctrl+Enter` to commit), side-by-side and inline diff views, cursor-paginated commit history, and a **hand-drawn SVG branch topology graph** (lane-based layout and coloring, merge commits as a filled dot inside a ring, with TOPOLOGICAL sorting in the backend revwalk so a rebase can't break the lines). The Git panel stacks **two collapsible sections** — Changes on top, commit history below — visible at the same time, with a draggable divider and animated collapse / expand; a repo bar at the top switches repos via a dropdown, the branch badge switches which branch's history is shown (no checkout), and refresh / Pull / Push live on the same bar.
+A VS Code-style **Changes panel** (Staged / Changes / Untracked groups, per-file or bulk stage / discard, `Ctrl+Enter` to commit), side-by-side and inline diff views (the dialog fills 80vw × 85vh, with horizontal scrolling for long lines, vertically synced columns, `@@` hunk separators and prev / next-change jumps, plus word-level highlighting on paired delete / add lines so only what actually changed is painted), cursor-paginated commit history, and a **hand-drawn SVG branch topology graph** (lane-based layout and coloring, merge commits as a filled dot inside a ring, with TOPOLOGICAL sorting in the backend revwalk so a rebase can't break the lines). The Git panel stacks **two collapsible sections** — Changes on top, commit history below — visible at the same time, with a draggable divider and animated collapse / expand; a repo bar at the top switches repos via a dropdown, the branch badge switches which branch's history is shown (no checkout), and refresh / Pull / Push live on the same bar.
 
 **Worktree management** is especially handy for running several agents in parallel: when the project root isn't a repo itself, it **scans downward for sub-repos** and groups them by main worktree, with checkable group headers (multi-select / select-all) so you can **create one worktree per checked repo in a single action** (the branch dropdown offers the intersection of all repos' branches). Any worktree can be turned into a project in one click — mounted under its parent as a sub-project — or just opened in a terminal. **When an AI agent deletes a worktree from the terminal**, the list reconciles itself the moment the window regains focus: sub-projects whose directory is gone are removed along with their terminal resources, leaving no stale entries (cleanup only runs while the parent project still exists, so a disconnected drive can't wipe entries).
 
@@ -138,6 +138,7 @@ A VS Code-style **Changes panel** (Staged / Changes / Untracked groups, per-file
 | **Remote-aware landing** | Both of the above remap in remote terminals: SSH projects upload over SFTP and paste the **remote** path; WSL projects rewrite `C:\...` into `/mnt/c/...` |
 | **File drag & drop** | Drag from the file tree or Explorer onto the terminal to insert a quoted absolute path, landing in the exact split pane; dropping anywhere else writes nothing, and never degrades into a plain click that opens the file |
 | **Built-in file editor** | Click any file in the tree to edit in place: tree-sitter syntax highlighting (30+ languages), find & replace, atomic `Ctrl+S` saves, external-change detection, and live Markdown preview of unsaved drafts |
+| **Documents preview with images** | Images actually render in the Markdown / HTML preview: relative paths resolve against the file's own directory, and remote images (the badge row at the top of a README, say) are fetched for real — 10s timeout, 32MB cap, every other scheme refused. Large images take the smaller of their natural size and the text width instead of being squashed into a strip. HTML previews also get an "Open in browser" button that resolves through the https protocol handler rather than the `.html` file association — on machines where `.html` opens an editor, that button still opens a browser |
 | **Global search** | `Ctrl+Shift+F` for filename or content search, substring or regex, streamed from the backend and cancellable anytime |
 | **Per-project env vars** | Injected into the PTY child process per project, with strict POSIX validation and a second defensive filter on the Rust side; passes through to WSL via WSLENV |
 | **Smart Ctrl+C/V** | Optional: copy when there's a selection, interrupt the program when there isn't; large Windows pastes are chunked so ConPTY doesn't drop lines |
@@ -146,6 +147,7 @@ A VS Code-style **Changes panel** (Staged / Changes / Untracked groups, per-file
 | **Project descriptions** | Right-click to add a gray one-liner next to the project name — tell a row of worktree sub-projects apart at a glance |
 | **Zero network requests at startup** | Native rendering, no web assets — startup makes no network request at all (the price table refreshes daily and falls back to its cache) |
 | **Flood-proof UI** | When you `cat` a huge file or an AI floods the pane, PTY bytes feed the VT state machine on a background thread while the UI samples the grid per frame — single process, zero IPC, no intermediate buffer to pile up, so flooding can't drag the interface down |
+| **Terminal ligatures** | One toggle under Appearance → Font: `=>` `!=` `->` merge per the font's ligature rules while column alignment stays intact (fonts whose ligatures don't preserve total width fall back to a non-ligature reshape). Note the default Cascadia **Mono** is the de-ligatured cut — switch to Cascadia Code, Fira Code, or similar to see any effect |
 | **Three themes** | Auto / Light / Dark (Warm Carbon); the title bar matches the theme, with no light flash on startup |
 | **External theme packs** | Dream Skin-compatible skins: import from a folder or a zip, sha256-verified against the manifest, hot-reloaded when you edit a file. A pack can ship its own background image, in which case the terminal goes translucent over that ambient layer. Setting cards show live thumbnails, and both an imported `theme.css` and the `tokens` overrides in `theme.json` pass through the same external-reference gate (no `@import`; anything pointing outside the pack is rejected — `url()`, bare strings like `image-set("…")`, and CSS escape sequences alike). Not sure where to start? Hit "Example": a ready-to-edit sample skin lands in the skins folder — theme.json / theme.css plus a README documenting every field — and saving hot-reloads it (literally the same files as [`docs/theme-pack-example/`](docs/theme-pack-example/) in this repo) |
 | **Custom title bar** | Frameless window with a self-drawn title bar that follows your theme instead of the system's grey strip, adapted per platform — window controls on the right for Windows / Linux (Win11 Snap Layouts still pop up when you hover the maximize button), native traffic lights kept on macOS. Next to the version number sits a **project switcher**: a pill button always showing the current project with its AI status dot, whose dropdown lists every project with an AI session and its status — click to switch; the global status light sits right beside it — click to jump to the next session needing you (earliest finished first) |
@@ -169,7 +171,7 @@ The whole application is **native Rust** (the earlier Tauri + React build was re
 | Git / files | git2 (libgit2) · notify + ignore |
 | Usage stats | rusqlite local ledger · hand-drawn trend charts |
 | Mobile relay | axum + tokio WebSocket (`relay-server/`) · React + Vite PWA (`mobile/`) |
-| Tests | **1,439 Rust tests** (27 test targets) |
+| Tests | **1,475 Rust tests** (28 test targets) |
 
 ---
 
