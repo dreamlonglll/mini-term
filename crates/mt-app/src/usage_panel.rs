@@ -2068,7 +2068,13 @@ impl UsagePanel {
                                 this.refresh(cx)
                             }))
                     })
-                    .tooltip(|window, cx| Tooltip::new(t("usageStats", "refresh")).build(window, cx))
+                    // 纯图标键,提示晚弹等于认不出来 → 免掉额外停留(见
+                    // `mt_ui::tooltip` 的二段延迟说明),回落到 gpui 的 500ms
+                    .tooltip(|window, cx| {
+                        Tooltip::new(t("usageStats", "refresh"))
+                            .instant()
+                            .build(window, cx)
+                    })
                     .child(VectorIcon::new(ICON_REFRESH, px(14.0)).ink(ui::text_muted())),
             )
     }

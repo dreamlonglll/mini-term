@@ -21,6 +21,10 @@
 //! 鼠标中途离开 → gpui 把视图整个收掉 → 计时 `Task` 随之 drop,不会补弹一下。
 //! 这是「延后」而不是「延后+补偿」,正是想要的语义。
 //!
+//! 个别调用点想要「快弹」(如用量统计弹窗工具栏的图标按钮 —— 那里是纯图标,
+//! 不弹提示就认不出是什么键),挂 [`Tooltip::instant`] 即可把这段额外延迟归零,
+//! 手感回落到 gpui 原生的 500ms。**默认仍是 1200ms**,别顺手全仓铺开。
+//!
 //! 已知的小代价:气泡锚点取的是 gpui 建视图那一刻(第 500ms)的鼠标位置,
 //! 后面 700ms 里鼠标在同一元素内移动不会重新贴位。与上游非 hoverable tooltip
 //! 一贯的行为一致(它本来也只在建视图时取一次 `mouse_position`)。
@@ -57,6 +61,9 @@ enum TooltipContent {
 /// ```
 pub struct Tooltip {
     content: TooltipContent,
+    /// 这一条要在 gpui 那 500ms 之后再等多久。默认 [`EXTRA_SHOW_DELAY`],
+    /// 被 [`Tooltip::instant`] 归零。
+    extra_delay: Duration,
     /// 额外停留时间到了没。false 期间 render 出的是空 div。
     visible: bool,
     /// 持有即计时;视图被 gpui 收掉时一起 drop,计时随之作废。
@@ -68,9 +75,18 @@ impl Tooltip {
     pub fn new(text: impl Into<Text>) -> Self {
         Self {
             content: TooltipContent::Text(text.into()),
+            extra_delay: EXTRA_SHOW_DELAY,
             visible: false,
             _delay: None,
         }
+    }
+
+    /// 免掉额外停留:总时长 = gpui 原生的 500ms。
+    ///
+    /// 只给「不弹提示就看不懂」的纯图标按钮用。
+    pub fn instant(mut self) -> Self {
+        self.extra_delay = Duration::ZERO;
+        self
     }
 
     /// 自定义元素气泡(用量面板的趋势图六行详情就是这条)。
@@ -83,6 +99,7 @@ impl Tooltip {
             content: TooltipContent::Element(Box::new(move |window, cx| {
                 builder(window, cx).into_any_element()
             })),
+            extra_delay: EXTRA_SHOW_DELAY,
             visible: false,
             _delay: None,
         }
@@ -91,8 +108,17 @@ impl Tooltip {
     /// 建成 `AnyView` 交给 gpui。**额外的停留计时从这一刻起算**。
     pub fn build(self, _: &mut Window, cx: &mut App) -> AnyView {
         cx.new(|cx| {
+            if self.extra_delay.is_zero() {
+                // 不排计时:gpui 建视图那一刻就是该弹的一刻,首帧直接画出来
+                // (走 Task 的话至少要多等一帧,纯图标按钮上看得出来一顿)
+                return Self {
+                    visible: true,
+                    ..self
+                };
+            }
+            let extra_delay = self.extra_delay;
             let delay = cx.spawn(async move |this, cx| {
-                cx.background_executor().timer(EXTRA_SHOW_DELAY).await;
+                cx.background_executor().timer(extra_delay).await;
                 let _ = this.update(cx, |this: &mut Self, cx| {
                     this.visible = true;
                     cx.notify();
@@ -157,6 +183,21 @@ mod tests {
     #[test]
     fn 额外延迟明显大于零() {
         assert!(EXTRA_SHOW_DELAY >= Duration::from_millis(300));
+    }
+
+    /// 默认档不受 [`Tooltip::instant`] 那条支线影响 —— 新建的气泡照旧要等满。
+    #[test]
+    fn 默认仍走额外延迟() {
+        let t = Tooltip::new("x");
+        assert_eq!(t.extra_delay, EXTRA_SHOW_DELAY);
+        assert!(!t.visible);
+    }
+
+    /// `instant()` 必须真把额外那段归零(`build` 靠 `is_zero()` 走免计时分支)。
+    #[test]
+    fn instant_免掉额外延迟() {
+        assert!(Tooltip::new("x").instant().extra_delay.is_zero());
+        assert!(Tooltip::element(|_, _| div()).instant().extra_delay.is_zero());
     }
 
     /// 字号必须比上游的 0.875rem 小,否则这个模块就白抄了。
