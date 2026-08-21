@@ -64,7 +64,7 @@ use mt_ui::{
 use crate::ai::AiBridge;
 use crate::clipboard::{self, ClipboardImage, PasteTarget, RemotePaste};
 use crate::i18n::{t, tr};
-use crate::markers::{self, MarkerBatch};
+use crate::markers::{self, MarkerBatch, MarkerSubmit};
 use crate::menu::{self, MenuItem};
 use crate::notify::ToastKind;
 use crate::overlay;
@@ -133,7 +133,7 @@ pub struct TerminalPane {
     _flash_timer: Option<Task<()>>,
     /// 等着定锚的 AI 任务标记正文 —— Enter 已经按下,锚点还在等 Ink 把光标
     /// 顶回块首。空 = 没有在等的。见 [`Self::arm_marks`]。
-    pending_marks: Vec<(String, i64)>,
+    pending_marks: Vec<MarkerSubmit>,
     /// 待定标记的定锚计时器。掉了任务就没了,必须存着。
     _marks_timer: Option<Task<()>>,
     /// 唤醒任务的句柄。掉了任务就没了,必须存着。
@@ -526,16 +526,22 @@ impl TerminalPane {
     /// AI(Codex 这类 ratatui 应用)全落在这个分支。注意 `drain_submits` 是
     /// **取走即清**,所以这一句要放在闸门之后:提前抽干等于把 alt screen 期间的
     /// 提交默默吞掉,退出 TUI 后也补不回来。
-    fn take_submits(&self) -> Option<Vec<(String, i64)>> {
+    fn take_submits(&self) -> Option<Vec<MarkerSubmit>> {
         if self.emulator.mode().contains(TermMode::ALT_SCREEN) {
             return None;
         }
-        let submits: Vec<(String, i64)> = self
+        let submits: Vec<MarkerSubmit> = self
             .ai
             .perception()
             .drain_submits(self.pty_id)
             .into_iter()
-            .map(|s| (s.line, s.ts))
+            .map(|s| MarkerSubmit {
+                line: s.line,
+                ts: s.ts,
+                // 从屏幕上猜来的正文要验明正身之后才示人,见 markers 模块注释
+                // 的「第四个破绽」
+                confirmed: !s.from_snapshot,
+            })
             .collect();
         (!submits.is_empty()).then_some(submits)
     }
@@ -545,7 +551,7 @@ impl TerminalPane {
     /// 为什么不当场定锚见 [`mt_terminal::TerminalEmulator::arm_cursor_floor`]:
     /// Ink 应用等待输入时光标停在渲染块**下方**,提交那一下才会把光标顶回块首 ——
     /// 而块首正是 `> 用户输入` 这条消息落地的行。
-    fn arm_marks(&mut self, submits: Vec<(String, i64)>, cx: &mut Context<Self>) {
+    fn arm_marks(&mut self, submits: Vec<MarkerSubmit>, cx: &mut Context<Self>) {
         // 窗口里又按了一次 Enter:先把上一批按现有水位结清,两批的先后顺序不能乱
         self.settle_marks(cx);
         self.pending_marks = submits;
@@ -581,8 +587,20 @@ impl TerminalPane {
         // 等 `relocate_pending` 补,见 [`crate::markers`] 模块注释第三个破绽。
         let text = self.emulator.line_text(floor);
         let anchor = {
-            let heads: Vec<&str> = submits.iter().map(|(line, _)| line.as_str()).collect();
-            markers::settle_anchor(floor, text.as_deref(), &heads)
+            // **只拿确凿的正文去判定**。从屏幕上猜来的那些不许参与:候选取自光标
+            // 所在行,而水位在 agent 还没重绘时也落在那一行 —— 让它走定锚判定就是
+            // 拿输入框证明输入框。整批都是猜的就一律挂起,等 relocate 在别处找到
+            // 才算数(见 markers 模块注释的「第四个破绽」)
+            let heads: Vec<&str> = submits
+                .iter()
+                .filter(|s| s.confirmed)
+                .map(|s| s.line.as_str())
+                .collect();
+            if heads.is_empty() {
+                markers::MarkerAnchor::Pending { from: floor }
+            } else {
+                markers::settle_anchor(floor, text.as_deref(), &heads)
+            }
         };
         cx.emit(PaneEvent::AiMarks(MarkerBatch {
             submits,

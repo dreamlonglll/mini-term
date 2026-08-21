@@ -102,6 +102,27 @@ pub(crate) fn output_ai_command_name(output: &str) -> Option<&'static str> {
         .find_map(line_ai_command_name)
 }
 
+/// 从可见行快照里剥出「用户即将发出去的那句」。
+///
+/// # 为什么需要它:内容根本没经过终端
+///
+/// TUI 自己往输入框里**回填**内容时 —— Esc 撤回上一条重发、↑ 召回历史、
+/// 斜杠命令菜单选中 —— 终端这边只收到一个**裸 Enter**,本地输入缓冲是空的,
+/// 内容全程在 agent 进程自己手里。屏幕上那一行是唯一的线索。
+///
+/// 剥装饰走 [`mt_core::strip_tui_decoration`],与 `mt_app::markers` 回扫时**同一份**
+/// 字符集:剥法差一点,拿它去屏幕上比对就永远对不上。
+///
+/// ⚠️ **交回来的东西是猜的,绝不能当真**:权限审批框里按 Enter 选 `1. Yes`、
+/// 在 `/model` 菜单里按 Enter 选一项,这里照样会剥出一串文本来。调用方必须拿它
+/// 去屏幕上验明正身(见 `mt_app::markers::AiMarker::confirmed`),验不过就当没有过
+/// —— 直接采信的话,每批准一次权限就多一条假标记,列表会被淹掉。
+pub(crate) fn snapshot_submit_text(line: &str) -> Option<String> {
+    let text = strip_ansi_codes(line);
+    let body = mt_core::strip_tui_decoration(&text);
+    (!body.is_empty()).then(|| body.to_string())
+}
+
 /// 这一次写入是否为「打断当前 AI 任务」的按键。
 ///
 /// 只认单独一个字节的裸 Esc / Ctrl+C：终端把方向键、功能键等 CSI 序列

@@ -712,7 +712,9 @@ impl TerminalArea {
             px(rect.top + 2.0),
         );
 
-        let markers = self.store.read(cx).markers_for_pty(pty_id).to_vec();
+        // 只画验明正身的那些 —— 与 `⚑ N` 的计数同一个口,否则会出现
+        // 「按钮写着 5 条、点开只有 3 条」
+        let markers = self.store.read(cx).visible_markers_for_pty(pty_id);
         // 列表本体单独一层:`overflow_y_scroll` 要 Stateful(必须带 id),
         // 而外层要 `track_focus`(Esc 的落点),两件事分层最省心
         let mut list = div()
@@ -733,7 +735,7 @@ impl TerminalArea {
             );
         } else {
             list = list.py(px(4.0));
-            for marker in markers {
+            for (idx, marker) in markers.into_iter().enumerate() {
                 let marker_id = marker.id.clone();
                 let store = self.store.clone();
                 // 还没定位的条目:那条消息还在 AI 的队列里没上屏,没有行可跳。
@@ -789,7 +791,11 @@ impl TerminalArea {
                                 .min_w(ui::font_px(MARKER_SEQ_W))
                                 .whitespace_nowrap()
                                 .text_color(ui::text_muted())
-                                .child(format!("#{}", marker.seq)),
+                                // 按**可见列表**里的位置编号,不用 `marker.seq`
+                                // (那是全量列表里的位置,过滤掉候选条目之后会跳号:
+                                // #1、#3、#4)。原版 seq 的语义本就是「它在列表里
+                                // 排第几」,这里的「列表」就是用户看到的这一份
+                                .child(format!("#{}", idx + 1)),
                         )
                         .child(
                             div()
@@ -1058,7 +1064,7 @@ impl TerminalArea {
         // 这就是「⚑ 平时看不见」的直接原因 —— 见 `markers` 模块注释的 alt screen 段。
         let marker_count = active
             .pty_id
-            .map(|id| store.markers_for_pty(id).len())
+            .map(|id| markers::visible(store.markers_for_pty(id)).count())
             .unwrap_or(0);
         let unread: Vec<bool> = panes.iter().map(|p| store.is_pane_unread_done(&p.id)).collect();
         // tab 上的 AI 品牌图标:显示条件与 agent 取值都照抄原版(见 PaneState 上

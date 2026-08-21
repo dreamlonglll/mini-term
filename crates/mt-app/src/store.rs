@@ -1703,11 +1703,21 @@ impl AppStore {
     // === AI 任务标记(⚑)===
 
     /// 某个 pane 的标记列表(没有就是空)。对应 `store.ts:1225` 的 `getMarkersForPty`。
+    ///
+    /// ⚠️ 这是**内部全量**,含正文还没验明正身的候选条目。给用户看的一律走
+    /// [`Self::visible_markers_for_pty`] —— 见 [`crate::markers::AiMarker::confirmed`]。
     pub fn markers_for_pty(&self, pty_id: u32) -> &[AiMarker] {
         self.markers_by_pty
             .get(&pty_id)
             .map(Vec::as_slice)
             .unwrap_or(&[])
+    }
+
+    /// 能给用户看的那些(`⚑ N` 的计数与下拉列表**共用这一个口**)。
+    pub fn visible_markers_for_pty(&self, pty_id: u32) -> Vec<AiMarker> {
+        markers::visible(self.markers_for_pty(pty_id))
+            .cloned()
+            .collect()
     }
 
     /// 落一批标记(pane 在 [`crate::pane::TerminalPane::write`] 里当场取好锚点后发来)。
@@ -1724,8 +1734,8 @@ impl AppStore {
         // 新条目要在这之后 push:它的指纹刚取,自己校验自己没有意义。
         self.refresh_markers(pty_id, cx);
         let list = self.markers_by_pty.entry(pty_id).or_default();
-        for (line, ts) in batch.submits {
-            markers::push_marker(list, pty_id, line, ts, batch.anchor);
+        for submit in batch.submits {
+            markers::push_marker(list, pty_id, submit, batch.anchor);
         }
         markers::prune(list, batch.history, batch.max_scrollback);
         // 过滤后为空则连键一起删(`store.ts:1219` 的同一处置)

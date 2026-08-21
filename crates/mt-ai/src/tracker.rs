@@ -46,6 +46,15 @@ pub(crate) const FOCUS_OUT_SEQ: &str = "\x1b[O";
 pub struct UserSubmit {
     pub line: String,
     pub ts: i64,
+    /// 正文是**从屏幕上猜的**,不是从本地输入缓冲抓的。
+    ///
+    /// TUI 自己往输入框里回填内容时(Esc 撤回上一条重发、↑ 召回历史、命令菜单
+    /// 选中),终端只收到一个裸 Enter,缓冲是空的,只能拿可见行当候选
+    /// (见 [`crate::detect::snapshot_submit_text`])。
+    ///
+    /// ⚠️ **为真时这条不可当真**:权限审批框、`/model` 菜单里按 Enter 同样会走到
+    /// 这条路上。上层必须先拿它去屏幕上验明正身才能展示给用户。
+    pub from_snapshot: bool,
 }
 
 #[derive(Clone)]
@@ -385,6 +394,20 @@ impl SessionTracker {
         {
             let mut states = self.input_states.lock().unwrap();
             let state = states.entry(pane_id).or_default();
+            // 单独一个字节的裸 Esc 是**用户按了 Esc 键**,不是转义序列的开头
+            // (判据与 [`crate::detect::is_interrupt_key`] 同一条:终端把方向键、
+            // 功能键等 CSI 序列一次性交给输入回调,长度一律大于 1)。
+            //
+            // ⚠️ 当成序列开头的话,状态机会把**紧接着那个字符**当作序列的第二字节
+            // 吞掉 —— 而「Esc 撤回上一条、再按 Enter 重发」正是最常见的组合,
+            // 被吞掉的就是那个 Enter,整条提交连 Enter 分支都进不去。
+            // Esc 在行编辑里的语义本就是清空当前行,当场清掉即可。
+            if data == "\x1b" {
+                state.clear_line();
+                // 裸 Esc 不进/不出 AI 会话(单次 Esc 只是打断,退出由
+                // `note_user_interrupt` 与 SessionEnd 那条路管),直接收工
+                return;
+            }
             for ch in data.chars() {
                 if state.consume_escape_char(ch) {
                     continue;
@@ -444,20 +467,34 @@ impl SessionTracker {
                                 .unwrap()
                                 .insert(pane_id, Instant::now());
                         }
-                        if !trimmed.is_empty() && self.is_ai_session(pane_id) {
-                            let ts = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_millis() as i64)
-                                .unwrap_or(0);
-                            self.pending_submits
-                                .lock()
-                                .unwrap()
-                                .entry(pane_id)
-                                .or_default()
-                                .push(UserSubmit {
-                                    line: trimmed.to_string(),
-                                    ts,
-                                });
+                        if self.is_ai_session(pane_id) {
+                            // 缓冲是空的但 pane 在 AI 会话里:内容多半在 TUI 自己
+                            // 手上(Esc 撤回重发 / ↑ 召回历史 / 菜单选中),终端这边
+                            // 只看得见一个裸 Enter —— 拿可见行当候选,标成「猜的」
+                            // 交给上层去屏幕上验明正身(见 UserSubmit::from_snapshot)
+                            let submit = if trimmed.is_empty() {
+                                line_snapshot
+                                    .and_then(crate::detect::snapshot_submit_text)
+                                    .map(|line| (line, true))
+                            } else {
+                                Some((trimmed.to_string(), false))
+                            };
+                            if let Some((line, from_snapshot)) = submit {
+                                let ts = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_millis() as i64)
+                                    .unwrap_or(0);
+                                self.pending_submits
+                                    .lock()
+                                    .unwrap()
+                                    .entry(pane_id)
+                                    .or_default()
+                                    .push(UserSubmit {
+                                        line,
+                                        ts,
+                                        from_snapshot,
+                                    });
+                            }
                         }
                         let cmd = trimmed.to_lowercase();
                         if in_ai {
@@ -856,16 +893,52 @@ mod tests {
         assert!(mgr.is_ai_session(1));
     }
 
+    /// 转义序列被拆成两次写入时仍要正确处理。
+    ///
+    /// ⚠️ **拆点不能落在 `\x1b` 之后**:单独一个字节的 `\x1b` 现在被判为「用户按了
+    /// Esc 键」(判据见 `track_input_with_line_snapshot` 开头),不再当作序列开头 ——
+    /// 否则 Esc 之后紧跟的那个字符会被吞掉。终端本来也不会那样拆:CSI 序列一律
+    /// 一次性交给输入回调。
     #[test]
     fn split_escape_sequence_still_moves_cursor() {
         let mgr = SessionTracker::new();
         mgr.track_input(1, "clade");
-        mgr.track_input(1, "\x1b");
-        mgr.track_input(1, "[D");
-        mgr.track_input(1, "\x1b");
-        mgr.track_input(1, "[D");
+        mgr.track_input(1, "\x1b[");
+        mgr.track_input(1, "D");
+        mgr.track_input(1, "\x1b[");
+        mgr.track_input(1, "D");
         mgr.track_input(1, "u\r");
         assert!(mgr.is_ai_session(1));
+    }
+
+    /// 裸 Esc **不吞掉紧接着的那个字符**。
+    ///
+    /// 回归:此前 `\x1b` 会把状态机推进 Escape 态,下一个字符被当成序列第二字节
+    /// 消费掉 —— 「Esc 撤回、Enter 重发」这一组里被吞的正是那个 Enter,整条提交
+    /// 连 Enter 分支都进不去,标记列表里什么都没有。
+    #[test]
+    fn bare_esc_does_not_swallow_next_key() {
+        let mgr = SessionTracker::new();
+        mgr.track_input(1, "claude\r");
+        mgr.track_input(1, "\x1b");
+        // Esc 之后接着键入并提交:一个字符都不能少
+        mgr.track_input(1, "fix the bug\r");
+        let submits = mgr.drain_submits(1);
+        assert_eq!(submits.len(), 1);
+        assert_eq!(submits[0].line, "fix the bug", "首字符被吞的话这里会少一个 f");
+    }
+
+    /// Esc 清空当前行(行编辑里 Esc 的本义),半截输入不会粘到下一条上。
+    #[test]
+    fn bare_esc_clears_pending_line() {
+        let mgr = SessionTracker::new();
+        mgr.track_input(1, "claude\r");
+        mgr.track_input(1, "打了一半");
+        mgr.track_input(1, "\x1b");
+        mgr.track_input(1, "重新写过\r");
+        let submits = mgr.drain_submits(1);
+        assert_eq!(submits.len(), 1);
+        assert_eq!(submits[0].line, "重新写过");
     }
 
     #[test]
@@ -894,6 +967,7 @@ mod tests {
             .push(UserSubmit {
                 line: "test".into(),
                 ts: 0,
+                from_snapshot: false,
             });
         let first = mgr.drain_submits(1);
         assert_eq!(first.len(), 1);
@@ -990,6 +1064,59 @@ mod tests {
         let submits = mgr.drain_submits(1);
         assert_eq!(submits.len(), 1);
         assert_eq!(submits[0].line, "first pasted line\nsecond pasted line");
+    }
+
+    /// **Esc 撤回重发那条路**:内容被 TUI 退回输入框,用户再按 Enter —— 终端只
+    /// 收到一个裸 Enter,行缓冲是空的,内容全程在 agent 进程手里。此时拿可见行
+    /// 快照当候选,并标成 `from_snapshot`(上层要验明正身才敢示人)。
+    #[test]
+    fn bare_enter_in_ai_session_falls_back_to_line_snapshot() {
+        let mgr = SessionTracker::new();
+        mgr.track_input(1, "claude\r");
+        // 用户按 Esc 打断 → 内容回到输入框 → 直接按 Enter(没有键入任何字符)
+        mgr.track_input(1, "\x1b");
+        mgr.track_input_with_line_snapshot(1, "\r", Some("│ > 帮我看看这段代码 │"));
+
+        let submits = mgr.drain_submits(1);
+        assert_eq!(submits.len(), 1, "裸 Enter 也得记下这条提交");
+        assert_eq!(submits[0].line, "帮我看看这段代码", "框线与提示符要剥掉");
+        assert!(submits[0].from_snapshot, "必须标成「猜的」");
+    }
+
+    /// 键入的内容照旧从**本地缓冲**走,不去碰快照 —— 快照只是裸 Enter 的兜底。
+    #[test]
+    fn typed_line_is_not_marked_as_snapshot() {
+        let mgr = SessionTracker::new();
+        mgr.track_input(1, "claude\r");
+        mgr.track_input_with_line_snapshot(1, "fix the bug\r", Some("│ > 屏幕上的别的东西 │"));
+
+        let submits = mgr.drain_submits(1);
+        assert_eq!(submits.len(), 1);
+        assert_eq!(submits[0].line, "fix the bug", "缓冲有内容就以缓冲为准");
+        assert!(!submits[0].from_snapshot);
+    }
+
+    /// 空输入框上的裸 Enter 不记 —— 剥完装饰什么都不剩。
+    #[test]
+    fn bare_enter_with_empty_input_box_submits_nothing() {
+        let mgr = SessionTracker::new();
+        mgr.track_input(1, "claude\r");
+        for snapshot in [Some("│ > │"), Some("   "), Some(""), None] {
+            mgr.track_input_with_line_snapshot(1, "\r", snapshot);
+            assert!(
+                mgr.drain_submits(1).is_empty(),
+                "空输入框不该记提交: {snapshot:?}"
+            );
+        }
+    }
+
+    /// AI 会话**之外**的裸 Enter 一律不记:shell 里空敲回车是最常见的动作,
+    /// 拿 prompt 那一行当提交会把标记列表塞满。
+    #[test]
+    fn bare_enter_outside_ai_session_submits_nothing() {
+        let mgr = SessionTracker::new();
+        mgr.track_input_with_line_snapshot(1, "\r", Some("PS D:\\Git\\mini-term>"));
+        assert!(mgr.drain_submits(1).is_empty());
     }
 
     #[test]
@@ -1183,6 +1310,7 @@ mod tests {
             .push(UserSubmit {
                 line: "hi".into(),
                 ts: 0,
+                from_snapshot: false,
             });
 
         mgr.purge_pane(id);

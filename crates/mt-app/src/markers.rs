@@ -118,6 +118,41 @@
 //! scrollback 饱和后拿文本去**纠正已经定过的锚**(会把「跳错行」换成「跳到另一个
 //! 错行」);这里是给**从来没定过锚**的条目找它唯一的落点,找不到就继续挂着,
 //! 不会产生「看起来能跳、跳过去是错的」这种更糟的结果。
+//!
+//! # 第四个破绽:正文根本没经过终端
+//!
+//! 上面两节默认了「正文是抓得到的」—— `mt-ai` 从写往 PTY 的字节里重建行缓冲。
+//! 但 TUI 会**自己往输入框里回填内容**:
+//!
+//! - 用户 Esc 撤回上一条,内容退回输入框,再按 Enter 重发;
+//! - ↑ 召回历史消息;
+//! - 斜杠命令菜单里选中一项。
+//!
+//! 这几下终端只收到一个**裸 Enter**,行缓冲是空的,内容全程在 agent 进程自己手里
+//! —— 于是「空回车不打点」这条既有规则把它整条吞掉,标记列表里什么都没有。
+//!
+//! ## 处置:拿屏幕上那行当候选,验明正身之前不示人
+//!
+//! `mt-ai` 在这种裸 Enter 上拿**可见行快照**剥出候选正文
+//! (`detect::snapshot_submit_text`),标成 `from_snapshot`;这边落成
+//! [`AiMarker::confirmed`]`= false`,**不进 [`visible`]**、不计入 `⚑ N`。
+//! 等 [`relocate_pending`] 在屏幕上找到那条消息,才置 `confirmed` 放出来。
+//!
+//! **为什么必须验**:权限审批框里按 Enter 选 `1. Yes`、`/model` 菜单里选一项,
+//! 走的是同一条裸 Enter 路径,快照照样剥得出文本。直接采信的话每批准一次权限
+//! 就多一条假标记 —— 而 Claude Code 用起来批准是最频繁的动作,列表会被淹掉。
+//! 假候选永远等不到「自己作为一条消息出现在屏幕上」,所以永远不会被放出来。
+//!
+//! ⚠️ **候选条目一律先判 `Pending`,不许走 [`settle_anchor`]**:候选正文取自光标
+//! 所在行,而定锚水位在 agent 还没重绘时**也**落在那一行 —— 让它走定锚判定就是
+//! 拿输入框去证明输入框,自己证明自己,验证形同虚设。这条闸门在
+//! [`crate::pane::TerminalPane::settle_marks`] 里。
+//!
+//! ⚠️ **已知边界:输入框里折行的长内容只抓得到光标那一行**。快照是单行的,
+//! 一条超过终端宽度的 prompt 被 Esc 退回来重发时,候选正文只是它的末段,
+//! 列表里显示的正文也就跟着是末段。回扫的双向前缀匹配仍能认出它(块尾那一行),
+//! 所以跳转是准的。要修得先界定「输入框」在屏幕上的范围,那就得认某一家的框线
+//! 画法了 —— 与本模块「不认具体 UI」的口径冲突,故留档不修。
 
 use crate::tree::gen_id;
 
@@ -152,18 +187,19 @@ impl MarkerAnchor {
     }
 }
 
-/// 一条 AI 任务标记。字段与原版 `types.ts:607-620` 一一对应,只有一处换了:
-/// `xtermMarkerId` → [`Self::anchor`](见模块注释)。
+/// 一条 AI 任务标记。字段对着原版 `types.ts:607-620`,有三处出入:
+///
+/// - `xtermMarkerId` → [`Self::anchor`](见模块注释);
+/// - 多了 [`Self::confirmed`](见模块注释的「第四个破绽」);
+/// - **没有 `seq`**。原版那个是「它在列表里排第几」(`store.ts:1191` 的
+///   `updated.length + 1`),存下来只会与列表本身脱节 —— 这边列表里还躺着没验明
+///   正身的候选条目,存的序号与用户看到的位置对不上,画出来就是 `#1 #3 #4`。
+///   编号改由 UI 按 [`visible`] 的位置当场算(语义与原版一致,只是「列表」指的是
+///   用户看到的那一份)。
 #[derive(Clone, Debug, PartialEq)]
 pub struct AiMarker {
     /// store 索引与列表行 key。
     pub id: String,
-    /// 该 pane 内的序号,UI 上显示成 `#N`。
-    ///
-    /// **不是自增计数器**:原版 `store.ts:1191` 取的是 `updated.length + 1`,
-    /// 也就是「它在(可能已被剪过的)列表里排第几」。剪枝之后新标记的序号会与
-    /// 之前用过的重复 —— 照抄。
-    pub seq: usize,
     pub pty_id: u32,
     /// 用户输入原文(已 trim)。括号粘贴的多行是**一条**,`line` 里带 `\n`。
     pub line: String,
@@ -172,11 +208,29 @@ pub struct AiMarker {
     /// 锚点。「定锚时」不是按下 Enter 那一刻(见模块注释),而且**可能定不下来**
     /// —— AI 忙时提交的那条消息要等回合结束才上屏,见 [`MarkerAnchor::Pending`]。
     pub anchor: MarkerAnchor,
+    /// 正文可不可信 —— 与 [`Self::anchor`] **正交**:那个说的是「位置定没定」,
+    /// 这个说的是「内容是抓来的还是猜来的」。
+    ///
+    /// `false` = 正文是从屏幕上猜的(`mt_ai::UserSubmit::from_snapshot`):TUI 自己
+    /// 回填输入框时终端只收到一个裸 Enter,缓冲是空的。**这种条目在屏幕上验明
+    /// 正身之前不进列表**,见模块注释的「第四个破绽」。
+    pub confirmed: bool,
     /// 最后一条为 true,新标记到来时前一条翻 false。
     ///
     /// ⚠️ **没有任何地方在 AI 完成时把最后一条翻 false**(`store.ts:1182-1203`
     /// 是唯一改写它的地方)。所以「最后一条永远亮着进行中圆点」是原版行为,照抄。
     pub in_progress: bool,
+}
+
+/// 一条待落库的提交。
+#[derive(Clone, Debug, PartialEq)]
+pub struct MarkerSubmit {
+    /// 用户输入原文(已 trim)。
+    pub line: String,
+    /// UTC epoch 毫秒。
+    pub ts: i64,
+    /// 见 [`AiMarker::confirmed`]。
+    pub confirmed: bool,
 }
 
 /// pane 侧定好锚的一批标记。
@@ -185,8 +239,8 @@ pub struct AiMarker {
 /// 里取出来的,只可能落在同一个位置上。挂起时同理:同一个 `Pending::from`。
 #[derive(Clone, Debug, PartialEq)]
 pub struct MarkerBatch {
-    /// `(原文, epoch ms)`,顺序即提交顺序。
-    pub submits: Vec<(String, i64)>,
+    /// 顺序即提交顺序。
+    pub submits: Vec<MarkerSubmit>,
     /// 见 [`AiMarker::anchor`]。
     pub anchor: MarkerAnchor,
     /// 定锚那一刻的 `history_size`。
@@ -198,12 +252,11 @@ pub struct MarkerBatch {
 /// 往列表尾部追加一条,返回新条目的 id。
 ///
 /// 逐条对照 `store.ts:1182-1203`:**先把最后一条的 `in_progress` 翻 false**,
-/// 再追加(`seq = 列表长度 + 1`、`in_progress: true`)。
+/// 再追加(`in_progress: true`)。
 pub fn push_marker(
     list: &mut Vec<AiMarker>,
     pty_id: u32,
-    line: String,
-    ts: i64,
+    submit: MarkerSubmit,
     anchor: MarkerAnchor,
 ) -> String {
     if let Some(last) = list.last_mut() {
@@ -212,14 +265,22 @@ pub fn push_marker(
     let id = gen_id("marker");
     list.push(AiMarker {
         id: id.clone(),
-        seq: list.len() + 1,
         pty_id,
-        line,
-        ts,
+        line: submit.line,
+        ts: submit.ts,
         anchor,
+        confirmed: submit.confirmed,
         in_progress: true,
     });
     id
+}
+
+/// 能给用户看的那些 —— 正文还没验明正身的不算(见 [`AiMarker::confirmed`])。
+///
+/// `⚑ N` 的计数与下拉列表**都走这一个口**:两处口径分家的话,会出现
+/// 「按钮写着 5 条、点开只有 3 条」。
+pub fn visible(list: &[AiMarker]) -> impl Iterator<Item = &AiMarker> {
+    list.iter().filter(|m| m.confirmed)
 }
 
 /// 一行文本的指纹。定锚与校验**必须走同一个函数** —— 两侧取法只要差一点
@@ -349,22 +410,13 @@ fn line_matches_submit(text: &str, submit: &str) -> bool {
 /// 回扫认定所需的最少字符数,见 [`line_matches_submit`]。
 const MIN_MATCH_CHARS: usize = 3;
 
-/// 剥掉行首常见的提示符/框线装饰(`> hi` → `hi`)。
+/// 剥掉行首行尾的提示符/框线装饰(`│ > hi │` → `hi`)。
 ///
-/// 只剥**行首**、只剥这几个符号加空白,循环剥是因为 TUI 常常套两层
-/// (`│ > hi`)。剥不动就原样返回。
+/// 走 [`mt_core::strip_tui_decoration`] —— 与 `mt-ai` 从输入框里剥候选正文
+/// **共用同一份字符集**。这两处是配对使用的:一边剥出候选,另一边拿它在屏幕上
+/// 找落点,剥法差一点就永远对不上,而那种失配是静默的。
 fn strip_line_decoration(text: &str) -> &str {
-    let mut s = text.trim();
-    loop {
-        let next = s
-            .strip_prefix(['>', '❯', '›', '»', '│', '|', '┃', '⏵'])
-            .unwrap_or(s)
-            .trim_start();
-        if next.len() == s.len() {
-            return s;
-        }
-        s = next;
-    }
+    mt_core::strip_tui_decoration(text)
 }
 
 /// 给还挂着的标记补锚:拿正文在 `[from, bottom]` 里从上往下找它真正落地的行。
@@ -426,6 +478,9 @@ pub fn relocate_pending(
                     anchor: row,
                     fingerprint: fingerprint_line(&text),
                 };
+                // 在屏幕上找到了 = **验明正身**:猜来的正文到这一刻才敢示人
+                // (见 AiMarker::confirmed)。已经确凿的条目置一次也无妨。
+                list[idx].confirmed = true;
                 settled_at = Some(row);
                 changed = true;
             }
@@ -525,13 +580,29 @@ pub fn truncate_line(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
+    /// 正文确凿(从本地输入缓冲抓到的)的一条提交。
+    fn submit(line: &str) -> MarkerSubmit {
+        MarkerSubmit {
+            line: line.to_string(),
+            ts: 0,
+            confirmed: true,
+        }
+    }
+
+    /// 正文是从屏幕上猜的(TUI 自己回填输入框,终端只收到一个裸 Enter)。
+    fn guessed(line: &str) -> MarkerSubmit {
+        MarkerSubmit {
+            confirmed: false,
+            ..submit(line)
+        }
+    }
+
     fn marker(list: &mut Vec<AiMarker>, line: &str, anchor: i32) -> String {
         // 指纹默认拿正文本身当那一行的内容,校验用例里再按需伪造
         push_marker(
             list,
             7,
-            line.to_string(),
-            0,
+            submit(line),
             MarkerAnchor::Settled {
                 anchor,
                 fingerprint: fingerprint_line(line),
@@ -541,7 +612,12 @@ mod tests {
 
     /// 还挂着的条目(AI 忙时提交,那条消息还没上屏)。
     fn pending(list: &mut Vec<AiMarker>, line: &str, from: i32) -> String {
-        push_marker(list, 7, line.to_string(), 0, MarkerAnchor::Pending { from })
+        push_marker(list, 7, submit(line), MarkerAnchor::Pending { from })
+    }
+
+    /// 还挂着**且正文是猜的**的条目(Esc 撤回重发那条路)。
+    fn guessed_pending(list: &mut Vec<AiMarker>, line: &str, from: i32) -> String {
+        push_marker(list, 7, guessed(line), MarkerAnchor::Pending { from })
     }
 
     /// 大到不会触发「没找到就把起点往下推」的屏高 —— 推进另有专测
@@ -557,19 +633,17 @@ mod tests {
         }
     }
 
-    /// 追加时把上一条的「进行中」翻掉,序号是列表长度 + 1(照抄 store.ts:1191)。
+    /// 追加时把上一条的「进行中」翻掉(照抄 store.ts:1182-1203)。
     #[test]
     fn 追加标记时上一条翻为已完成() {
         let mut list = Vec::new();
         marker(&mut list, "a", 10);
-        assert_eq!(list[0].seq, 1);
         assert!(list[0].in_progress);
 
         marker(&mut list, "b", 12);
         assert_eq!(list.len(), 2);
         assert!(!list[0].in_progress, "上一条必须翻 false");
         assert!(list[1].in_progress, "最后一条永远是进行中");
-        assert_eq!(list[1].seq, 2);
     }
 
     /// id 逐条唯一 —— 列表行 key 与游标都拿它当身份。
@@ -952,7 +1026,7 @@ mod tests {
 
         // ② 照样进列表 —— 用户看得到自己追加过什么
         let mut list = Vec::new();
-        push_marker(&mut list, 7, "顺便把测试也补上".into(), 0, anchor);
+        push_marker(&mut list, 7, submit("顺便把测试也补上"), anchor);
         assert_eq!(list.len(), 1);
 
         // ③ 期间 AI 一直在吐东西,指纹校验一遍遍地跑,但一条都不许剪
@@ -965,6 +1039,89 @@ mod tests {
         let 屏幕 = screen(&[(240, "> 顺便把测试也补上")]);
         assert!(relocate_pending(&mut list, 260, NO_ADVANCE, &屏幕));
         assert_eq!(list[0].anchor.settled(), Some(240));
+    }
+
+    // ---- 正文验明正身(模块注释的「第四个破绽」)----
+
+    /// 猜来的正文在验明正身之前**不进列表** —— `⚑ N` 的计数与下拉都走 [`visible`]。
+    #[test]
+    fn 没验明正身的条目不进列表() {
+        let mut list = Vec::new();
+        marker(&mut list, "键入并提交的一句", 10);
+        guessed_pending(&mut list, "从屏幕上猜的一句", 20);
+
+        assert_eq!(list.len(), 2, "内部列表两条都在");
+        let shown: Vec<&str> = visible(&list).map(|m| m.line.as_str()).collect();
+        assert_eq!(shown, vec!["键入并提交的一句"], "只放出确凿的那条");
+    }
+
+    /// **Esc 撤回重发那条路的正面用例**:候选在屏幕上找到了 = 验明正身,
+    /// 这一刻才连同锚点一起放出来。
+    #[test]
+    fn 候选在屏幕上找到后才放出来() {
+        let mut list = Vec::new();
+        guessed_pending(&mut list, "帮我看看这段代码", 100);
+        assert_eq!(visible(&list).count(), 0, "还没验证,不许示人");
+
+        // AI 把它作为一条消息打了出来
+        let 屏幕 = screen(&[(120, "> 帮我看看这段代码")]);
+        assert!(relocate_pending(&mut list, 140, NO_ADVANCE, &屏幕));
+        assert_eq!(visible(&list).count(), 1, "验明正身,放出来");
+        assert_eq!(list[0].anchor.settled(), Some(120), "同时也能跳了");
+        assert!(list[0].confirmed);
+    }
+
+    /// **假候选永远出不来**:权限审批框里按 Enter 选 `1. Yes` 走的是同一条裸 Enter
+    /// 路径,快照照样剥得出文本 —— 但它永远不会作为一条消息出现在屏幕上。
+    ///
+    /// 直接采信的话每批准一次权限就多一条假标记,而批准是 Claude Code 里最频繁的
+    /// 动作,列表会被淹掉。
+    #[test]
+    fn 假候选永远不会被放出来() {
+        let mut list = Vec::new();
+        guessed_pending(&mut list, "1. Yes", 100);
+
+        // 审批框那一屏后来被重绘成了别的东西,没有任何一行是这条「消息」
+        let 屏幕 = screen(&[
+            (100, "✻ 正在执行工具调用…"),
+            (101, "─────────────"),
+            (102, "工具返回 128 行"),
+        ]);
+        assert!(!relocate_pending(&mut list, 110, NO_ADVANCE, &屏幕));
+        assert_eq!(visible(&list).count(), 0, "验不过就一直不示人");
+        assert!(!list[0].confirmed);
+    }
+
+    /// 确凿的条目补锚时 `confirmed` 保持为真(置一次也无妨,别写反)。
+    #[test]
+    fn 补锚不会把确凿的条目改成未验明() {
+        let mut list = Vec::new();
+        pending(&mut list, "键入并提交的一句", 100);
+        assert_eq!(visible(&list).count(), 1, "确凿的条目挂着也照样示人");
+        let 屏幕 = screen(&[(120, "> 键入并提交的一句")]);
+        assert!(relocate_pending(&mut list, 140, NO_ADVANCE, &屏幕));
+        assert!(list[0].confirmed);
+    }
+
+    /// 端到端:Esc 撤回重发的那句,从「终端只看见一个裸 Enter」到能跳的完整一条命。
+    #[test]
+    fn 撤回重发的那句从候选到可跳() {
+        // ① 终端只收到裸 Enter,正文是从输入框那行猜的 → 挂起且不示人
+        let mut list = Vec::new();
+        guessed_pending(&mut list, "顺便把测试也补上", 300);
+        assert_eq!(visible(&list).count(), 0);
+
+        // ② 期间指纹校验照跑,一条都不许剪(它压根没定过锚)
+        for _ in 0..5 {
+            assert!(!prune_stale(&mut list, |_| Some(fingerprint_line("变了"))));
+        }
+
+        // ③ AI 把它打成一条消息 → 验明正身 + 定锚,同时出现在列表里且可跳
+        let 屏幕 = screen(&[(330, "> 顺便把测试也补上")]);
+        assert!(relocate_pending(&mut list, 360, NO_ADVANCE, &屏幕));
+        let shown: Vec<&AiMarker> = visible(&list).collect();
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].anchor.settled(), Some(330));
     }
 
     /// 推进规则:首次 ↑ 到最新一条、首次 ↓ 到最早一条(`useMarkerHotkeys.ts:44-48`)。
