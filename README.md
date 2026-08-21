@@ -119,7 +119,7 @@ CLI 背后是**全机单例 daemon** 持有的持久连接池：首次调用自�
 - **滚动缓冲行数可调**（默认 1 万行，设置里改小当场生效并释放内存），正确处理 CSI 3J，Codex 的流式内容折叠与 `/clear` 都能如实反映；Windows 版内置固定版本官方 ConPTY 运行时，跨 Windows 版本行为一致
 - **AI 会话历史**——读本地 Claude / Codex / Grok 记录，右键复制恢复命令快速续接，也能直接看完整对话正文（Markdown 渲染 + `Ctrl+F` 搜索）
 - **AI 会话分支树**——想在同一个任务上并排试两条思路？pane 右键「分支会话到新分屏」：原会话原地继续跑，旁边分出的新 pane 里是复制出来的分支（Claude 走 `--resume --fork-session`，Codex 走 `codex fork`）。历史面板可切「分支树视图」，fork 出的会话按缩进连线挂在父会话下（数据来自 CLI 亲写的磁盘指针），正在跑的节点带状态点；点任意节点——已开的切过去聚焦，没开的新终端自动恢复。右键菜单里「查看会话分支」悬停即展开当前家族全貌；树与面板的厂商图标按会话**最新使用的模型**显示——claude CLI 挂 GLM/DeepSeek 中转时亮的是真实厂商的 icon（pane 标签上的 CLI 图标不变）
-- **AI 任务标记**——会话里每次按 Enter 自动打点，`Ctrl+Shift+↑/↓` 在历史提交之间跳转
+- **AI 任务标记**——会话里每次按 Enter 自动打点，`Ctrl+Shift+↑/↓` 在历史提交之间跳转；AI 正忙时追加的那句会先挂起，等它真的上屏再自动补上定位
 
 ### 🌿 Git 集成 + Worktree 批量管理
 
@@ -171,7 +171,7 @@ VS Code 风格的 **Changes 面板**（Staged / Changes / Untracked 分组，单
 | Git / 文件 | git2（libgit2）· notify + ignore |
 | 用量统计 | rusqlite 本地账本 · 自绘趋势图 |
 | 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`） |
-| 测试 | **1475 个 Rust 测试**（28 个测试目标） |
+| 测试 | **1513 个 Rust 测试**（28 个测试目标） |
 
 ---
 
@@ -181,7 +181,7 @@ VS Code 风格的 **Changes 面板**（Staged / Changes / Untracked 分组，单
 
 前往 [Releases](https://github.com/dreamlonglll/mini-term/releases) 下载，三平台产物：
 
-- **Windows x64（主要支持平台）** — `mini-term-gpui-*-windows-x64-setup.exe` 安装包（NSIS，用户级安装免管理员，装过旧版的默认原目录原地升级）
+- **Windows x64（主要支持平台）** — `mini-term-gpui-*-windows-x64-setup.exe` 安装包（NSIS，用户级安装免管理员；装过旧版的默认原目录升级，且**先卸载旧版再装**而不是文件覆盖写，残留的旧 sidecar 不会留在原地）
 - **macOS arm64** — `mini-term-gpui-*-macos-arm64.dmg`
 - **Linux x64** — `mini-term-gpui-*-linux-amd64.deb` 或 `mini-term-gpui-*-linux-x64.tar.gz`
 

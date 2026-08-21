@@ -119,7 +119,7 @@ Behind the CLI is a **machine-wide singleton daemon** holding the persistent con
 - **Configurable scrollback** (10,000 lines by default; lowering it in Settings takes effect immediately and frees the memory) with correct CSI 3J handling, so Codex transcript folding and `/clear` behave faithfully; the Windows build bundles a pinned official ConPTY runtime for consistent behavior across Windows versions
 - **AI session history** — read local Claude / Codex / Grok records, right-click to copy the resume command, or read the full conversation right there (Markdown rendering + `Ctrl+F` search)
 - **AI session branch tree** — want to try two approaches to one task side by side? Right-click a pane and "Fork session to new split": the original keeps running in place, while the new pane next to it holds a copy of the conversation (Claude via `--resume --fork-session`, Codex via `codex fork`). The history panel gains a "branch tree view" where forked sessions hang under their parents with indent lines (driven by the pointers the CLIs themselves write to disk), running nodes carry a status dot, and clicking any node either jumps to its live pane or resumes it in a new terminal. The right-click "View session branches" entry expands the whole family on hover; vendor icons in the tree and panel follow the session's **latest model** — a claude CLI running GLM/DeepSeek through a proxy lights up the real vendor's icon (pane tab icons stay CLI-based)
-- **AI task markers** — every Enter inside a session drops a marker; `Ctrl+Shift+↑/↓` jumps between past submissions
+- **AI task markers** — every Enter inside a session drops a marker; `Ctrl+Shift+↑/↓` jumps between past submissions. A line queued while the AI is still working stays pending and picks up its anchor once the message actually lands on screen
 
 ### 🌿 Git integration + batch worktree management
 
@@ -171,7 +171,7 @@ The whole application is **native Rust** (the earlier Tauri + React build was re
 | Git / files | git2 (libgit2) · notify + ignore |
 | Usage stats | rusqlite local ledger · hand-drawn trend charts |
 | Mobile relay | axum + tokio WebSocket (`relay-server/`) · React + Vite PWA (`mobile/`) |
-| Tests | **1,475 Rust tests** (28 test targets) |
+| Tests | **1,513 Rust tests** (28 test targets) |
 
 ---
 
@@ -181,7 +181,7 @@ The whole application is **native Rust** (the earlier Tauri + React build was re
 
 Grab the latest build from [Releases](https://github.com/dreamlonglll/mini-term/releases) — three platforms:
 
-- **Windows x64 (primary platform)** — `mini-term-gpui-*-windows-x64-setup.exe` installer (NSIS, per-user install without admin rights; upgrades in place if an older version is installed)
+- **Windows x64 (primary platform)** — `mini-term-gpui-*-windows-x64-setup.exe` installer (NSIS, per-user install without admin rights; upgrades in the same directory, and **uninstalls the old build first** instead of overwriting files, so stale sidecars don't linger)
 - **macOS arm64** — `mini-term-gpui-*-macos-arm64.dmg`
 - **Linux x64** — `mini-term-gpui-*-linux-amd64.deb` or `mini-term-gpui-*-linux-x64.tar.gz`
 
