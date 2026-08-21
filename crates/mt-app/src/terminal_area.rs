@@ -278,11 +278,21 @@ const TAB_DROP_LINE_W: f32 = 3.0;
 
 /// 浮层宽度。原版是 `min-w-[280px]` + 内容撑开,gpui 侧要给正文列一个确定宽度
 /// 才truncate得动,取固定值 —— 差别只在「超长正文时原版会更宽」。
+///
+/// ⚠️ 下面这三个尺寸都是**13px 基准下的值**,用的时候一律过
+/// [`ui::font_px`] 换算 —— 原版是 `rem`,跟着根字号走;这边写死 `px` 的话,
+/// 用户把 `uiFontSize` 调大之后列就装不下内容了(时间列 `15:29` 会折成两行)。
 const MARKER_PANEL_WIDTH: f32 = 300.0;
 /// 列表最大高度(`MarkerList.tsx:30` 的 `max-h-80` = 20rem)。
 const MARKER_PANEL_MAX_HEIGHT: f32 = 320.0;
 /// 正文截断字数(`MarkerList.tsx:16` 的 `truncate(s, 40)`)。
 const MARKER_LINE_MAX: usize = 40;
+/// `#seq` 列宽(`MarkerList.tsx:41` 的 `w-8`)。
+const MARKER_SEQ_W: f32 = 32.0;
+/// 时间列宽(`MarkerList.tsx:42` 的 `w-10`)。**别再往下调**:`HH:mm` 是五个
+/// 字符,收窄到装不下就会折行 —— 两列都用 `min_w` 而不是 `w`,宽度算漏时
+/// 宁可把列撑开也别把字折了。
+const MARKER_TIME_W: f32 = 40.0;
 
 /// 各子节点占主轴的比例(和为 1)。
 ///
@@ -693,8 +703,11 @@ impl TerminalArea {
         // 最大化钮在场与否会让簇宽差一颗 —— 判据与 `render_leaf` 那边同一条
         // (真分了屏才画;最大化态本身就以「分了屏」为前提)
         let inset = marker_anchor_inset(matches!(layout, SplitNode::Split { .. }));
+        // 面板宽度跟着界面字号缩放,锚点必须用**换算之后**的值,否则字号一调大
+        // 面板就从按钮右缘溢出去了
+        let panel_width = ui::font_px(MARKER_PANEL_WIDTH);
         let anchor = point(
-            px(rect.left + rect.width - inset - MARKER_PANEL_WIDTH),
+            px(rect.left + rect.width - inset - f32::from(panel_width)),
             // 原版是「按钮下缘 + 4」;按钮在 26px 的 tab 栏里居中,下缘约在栏底上方 2px
             px(rect.top + 2.0),
         );
@@ -705,7 +718,7 @@ impl TerminalArea {
         let mut list = div()
             .id(SharedString::from(format!("marker-list-{pty_id}")))
             .w_full()
-            .max_h(px(MARKER_PANEL_MAX_HEIGHT))
+            .max_h(ui::font_px(MARKER_PANEL_MAX_HEIGHT))
             .overflow_y_scroll();
 
         if markers.is_empty() {
@@ -767,24 +780,33 @@ impl TerminalArea {
                                 this.close_marker_popover(window, cx);
                             }
                         }))
+                        // 两列都是 min_w + nowrap:宽度跟着界面字号缩放,万一还是
+                        // 算窄了(字族不同、`#100` 这种三位数),让它把列撑开,
+                        // 而不是把 `15:29` 折成两行
                         .child(
                             div()
                                 .flex_none()
-                                .w(px(28.0))
+                                .min_w(ui::font_px(MARKER_SEQ_W))
+                                .whitespace_nowrap()
                                 .text_color(ui::text_muted())
                                 .child(format!("#{}", marker.seq)),
                         )
                         .child(
                             div()
                                 .flex_none()
-                                .w(px(36.0))
+                                .min_w(ui::font_px(MARKER_TIME_W))
+                                .whitespace_nowrap()
                                 .text_color(ui::text_muted())
                                 .child(markers::format_time(marker.ts)),
                         )
+                        // 原版是 CSS `truncate`(= hidden + ellipsis + nowrap):
+                        // 40 字是**字数**上限,窄面板里照样宽过一行,不 nowrap 会折
                         .child(
                             div()
                                 .flex_1()
                                 .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
                                 .child(markers::truncate_line(&marker.line, MARKER_LINE_MAX)),
                         )
                         // 进行中圆点。⚠️ 最后一条**永远**亮着 —— 原版没有任何地方
@@ -817,7 +839,7 @@ impl TerminalArea {
                     this.close_marker_popover(window, cx);
                 }
             }))
-            .w(px(MARKER_PANEL_WIDTH))
+            .w(panel_width)
             .rounded(px(6.0))
             .border_1()
             .border_color(ui::border_subtle())
@@ -2623,6 +2645,37 @@ mod tests {
         let leaf_right = 1000.0_f32;
         let left = leaf_right - marker_anchor_inset(false) - MARKER_PANEL_WIDTH;
         assert_eq!(left, 1000.0 - 106.0 - 300.0);
+    }
+
+    /// 浮层里那些写死的像素尺寸**必须跟着界面字号一起缩放**。
+    ///
+    /// 回归:写死 `px` 的那一版有实际后果 —— 用户把 `uiFontSize` 调大之后,
+    /// 36px 的时间列装不下 `15:29`,五个字符被折成了两行。
+    #[test]
+    fn 标记浮层尺寸跟着界面字号缩放() {
+        // 默认基准下就是常量本身(所以锚点那条测试拿裸常量算仍然成立)
+        assert_eq!(f32::from(crate::ui::font_px(MARKER_TIME_W)), MARKER_TIME_W);
+        assert_eq!(f32::from(crate::ui::font_px(MARKER_SEQ_W)), MARKER_SEQ_W);
+
+        // 调到滑块上限:三个尺寸都得跟着变大,不能纹丝不动
+        crate::ui::set_ui_font(20.0, None);
+        for (base, name) in [
+            (MARKER_TIME_W, "时间列"),
+            (MARKER_SEQ_W, "序号列"),
+            (MARKER_PANEL_WIDTH, "面板宽"),
+        ] {
+            let scaled = f32::from(crate::ui::font_px(base));
+            assert!(scaled > base, "{name}在大字号下必须变宽,实际 {scaled}");
+        }
+        // 「装不装得下」的真正判据是**列宽相对正文字号的倍数**,它必须恒定
+        let ratio = f32::from(crate::ui::font_px(MARKER_TIME_W))
+            / f32::from(crate::ui::font_px(12.0));
+        assert!(
+            (ratio - MARKER_TIME_W / 12.0).abs() < 0.01,
+            "列宽与字号脱钩了,实际倍数 {ratio}"
+        );
+
+        crate::ui::set_ui_font(13.0, None);
     }
 
     /// 浮层的存活判据:pane 还在、还是激活 tab、pty 没换。
