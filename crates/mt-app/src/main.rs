@@ -121,9 +121,9 @@ use gpui::{
 // img 的 `object_fit` 是 StyledImage 的方法(毛玻璃背板那两处在用)
 use gpui::StyledImage as _;
 use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel, v_resizable};
-use gpui_component::tooltip::Tooltip;
 use gpui_component::{Root, WindowExt as _};
 use mt_ui::icons::{StatusDot, StatusKind};
+use mt_ui::tooltip::Tooltip;
 
 use crate::ai::AiBridge;
 use crate::file_tree::FileTree;

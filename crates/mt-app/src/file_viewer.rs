@@ -62,7 +62,7 @@ use gpui::{
 use gpui_component::ActiveTheme as _;
 use gpui_component::input::{Input, InputEvent, InputState, Position};
 use gpui_component::text::{TextView, TextViewStyle};
-use gpui_component::tooltip::Tooltip;
+use mt_ui::tooltip::Tooltip;
 use mt_project::fs::FileContentResult;
 use mt_project::watch::FsWatcher;
 use mt_ui::icons::FileIcon;

@@ -38,7 +38,7 @@ use gpui::{
     canvas, deferred, div, point, prelude::FluentBuilder, px,
 };
 use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel, v_resizable};
-use gpui_component::tooltip::Tooltip;
+use mt_ui::tooltip::Tooltip;
 use mt_ui::icons::{AiVendor, BrandIcon, Geom, Ink, Shape, VectorIcon};
 
 use crate::branch_family;

@@ -44,7 +44,7 @@ use gpui::{
     ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Task, Window, div, px,
 };
 
-use gpui_component::tooltip::Tooltip;
+use mt_ui::tooltip::Tooltip;
 
 use crate::i18n::t;
 use crate::notify::ToastKind;

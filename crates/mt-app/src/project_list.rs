@@ -1850,7 +1850,7 @@ impl Render for ProjectList {
             .child(
                 dashed_button("add-remote-project", "SSH".into(), false)
                     .tooltip(|window, cx| {
-                        gpui_component::tooltip::Tooltip::new(t(
+                        mt_ui::tooltip::Tooltip::new(t(
                             "projectList",
                             "addRemoteProject",
                         ))
@@ -1863,7 +1863,7 @@ impl Render for ProjectList {
             .child(
                 dashed_button("new-group", "+".into(), false)
                     .tooltip(|window, cx| {
-                        gpui_component::tooltip::Tooltip::new(t("projectList", "newGroup"))
+                        mt_ui::tooltip::Tooltip::new(t("projectList", "newGroup"))
                             .build(window, cx)
                     })
                     .on_click(cx.listener(|this, _event, window, cx| {
@@ -2260,7 +2260,7 @@ impl ProjectList {
                         el.tooltip({
                             let path = path.clone();
                             move |window, cx| {
-                                gpui_component::tooltip::Tooltip::new(path.clone())
+                                mt_ui::tooltip::Tooltip::new(path.clone())
                                     .build(window, cx)
                             }
                         })
@@ -2438,7 +2438,7 @@ impl ProjectList {
                                 .tooltip({
                                     let branch = branch.clone();
                                     move |window, cx| {
-                                        gpui_component::tooltip::Tooltip::new(tr!(
+                                        mt_ui::tooltip::Tooltip::new(tr!(
                                             "projectList",
                                             "worktreeBadgeTitle",
                                             branch = branch.clone()
@@ -2480,7 +2480,7 @@ impl ProjectList {
                                 .text_color(fg)
                                 .bg(bg)
                                 .tooltip(move |window, cx| {
-                                    gpui_component::tooltip::Tooltip::new(tip.clone())
+                                    mt_ui::tooltip::Tooltip::new(tip.clone())
                                         .build(window, cx)
                                 })
                                 .child(if remote.broken {

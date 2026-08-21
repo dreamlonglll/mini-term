@@ -47,7 +47,7 @@ use gpui::{
     MouseButton, MouseDownEvent, ParentElement, Render, SharedString, StatefulInteractiveElement,
     Styled, Task, Window, div, prelude::FluentBuilder, px,
 };
-use gpui_component::tooltip::Tooltip;
+use mt_ui::tooltip::Tooltip;
 use mt_project::fs::FileEntry;
 use mt_project::watch::FsWatcher;
 use mt_ui::icons::FileIcon;

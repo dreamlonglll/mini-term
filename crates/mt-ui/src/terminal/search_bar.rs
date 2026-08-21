@@ -133,12 +133,14 @@ use std::sync::Arc;
 use gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Render, SharedString,
-    Styled, Subscription, Window, div, px,
+    StatefulInteractiveElement as _, Styled, Subscription, Window, div, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::{ActiveTheme as _, Disableable as _, Selectable as _, Sizable as _, h_flex};
 use mt_terminal::TerminalEmulator;
+
+use crate::tooltip::Tooltip;
 
 use super::search::{SearchDirection, SearchOptions, TerminalSearch};
 
@@ -410,6 +412,19 @@ pub fn counter_text(active: bool, index: usize, count: usize, no_results: &str) 
     format!("{index}/{count}")
 }
 
+/// 给查找条上的按钮套一层带 tooltip 的壳。
+///
+/// 为什么不用 `Button::tooltip(..)`:那条在 gpui-component 内部直接建它自带的气泡,
+/// 字号和停留时长都绕不过去(理由见 [`crate::tooltip`])。壳是个 `flex_none` 的裸
+/// div,在 `h_flex` 里既不撑也不缩,排布与之前一致。
+fn with_tip(id: &'static str, tip: SharedString, button: Button) -> impl IntoElement {
+    div()
+        .id(id)
+        .flex_none()
+        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+        .child(button)
+}
+
 impl Render for TerminalSearchBar {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let labels = self.resolved_labels();
@@ -459,10 +474,11 @@ impl Render for TerminalSearchBar {
                     .text_color(if has_error { danger } else { muted })
                     .child(counter),
             )
-            .child(
+            .child(with_tip(
+                "case-sensitive-tip",
+                labels.case_sensitive.clone(),
                 Button::new("case-sensitive")
                     .label("Aa")
-                    .tooltip(labels.case_sensitive.clone())
                     .xsmall()
                     .compact()
                     .ghost()
@@ -470,11 +486,12 @@ impl Render for TerminalSearchBar {
                     .on_click(cx.listener(|this, _, _window, cx| {
                         this.toggle_option(|o| o.case_sensitive = !o.case_sensitive, cx);
                     })),
-            )
-            .child(
+            ))
+            .child(with_tip(
+                "whole-word-tip",
+                labels.whole_word.clone(),
                 Button::new("whole-word")
                     .label("ab")
-                    .tooltip(labels.whole_word.clone())
                     .xsmall()
                     .compact()
                     .ghost()
@@ -482,11 +499,12 @@ impl Render for TerminalSearchBar {
                     .on_click(cx.listener(|this, _, _window, cx| {
                         this.toggle_option(|o| o.whole_word = !o.whole_word, cx);
                     })),
-            )
-            .child(
+            ))
+            .child(with_tip(
+                "regex-tip",
+                labels.regex.clone(),
                 Button::new("regex")
                     .label(".*")
-                    .tooltip(labels.regex.clone())
                     .xsmall()
                     .compact()
                     .ghost()
@@ -494,36 +512,39 @@ impl Render for TerminalSearchBar {
                     .on_click(cx.listener(|this, _, _window, cx| {
                         this.toggle_option(|o| o.regex = !o.regex, cx);
                     })),
-            )
-            .child(
+            ))
+            .child(with_tip(
+                "previous-tip",
+                labels.previous.clone(),
                 Button::new("previous")
                     .label("↑")
-                    .tooltip(labels.previous.clone())
                     .xsmall()
                     .compact()
                     .ghost()
                     .disabled(!has_query)
                     .on_click(cx.listener(|this, _, _window, cx| this.find_previous(cx))),
-            )
-            .child(
+            ))
+            .child(with_tip(
+                "next-tip",
+                labels.next.clone(),
                 Button::new("next")
                     .label("↓")
-                    .tooltip(labels.next.clone())
                     .xsmall()
                     .compact()
                     .ghost()
                     .disabled(!has_query)
                     .on_click(cx.listener(|this, _, _window, cx| this.find_next(cx))),
-            )
-            .child(
+            ))
+            .child(with_tip(
+                "close-tip",
+                labels.close.clone(),
                 Button::new("close")
                     .label("✕")
-                    .tooltip(labels.close.clone())
                     .xsmall()
                     .compact()
                     .ghost()
                     .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
-            )
+            ))
     }
 }
 

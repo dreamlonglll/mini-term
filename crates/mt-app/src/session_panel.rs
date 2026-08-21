@@ -50,7 +50,7 @@ use gpui::{
     MouseDownEvent, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Task,
     Window, div, prelude::FluentBuilder, px,
 };
-use gpui_component::tooltip::Tooltip;
+use mt_ui::tooltip::Tooltip;
 use mt_ai::sessions::{AiSession, AiSessionMessage, LineageEdge};
 use mt_ui::icons::{AiVendor, BrandIcon, StatusDot, StatusKind};
 

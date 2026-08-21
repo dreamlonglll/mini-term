@@ -56,7 +56,7 @@ use gpui::{
     Render, SharedString, Stateful, StatefulInteractiveElement, Styled, Window, WindowControlArea,
     anchored, deferred, div, point, prelude::FluentBuilder, px, relative,
 };
-use gpui_component::tooltip::Tooltip;
+use mt_ui::tooltip::Tooltip;
 use mt_ui::icons::{Geom, Ink, Shape, VectorIcon};
 use mt_ui::rgb8;
 

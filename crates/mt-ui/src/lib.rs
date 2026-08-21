@@ -46,6 +46,12 @@
 //! [`chart`] 是自绘的双轴趋势图(面积曲线 + 柱 + 网格),替 recharts;
 //! 几何全是纯函数,轴标签由宿主摆。
 //!
+//! ## 4.6 tooltip([`tooltip`])
+//!
+//! 全仓 tooltip 的**唯一入口**(mt-app 也从这里取)。上游 gpui-component 那款
+//! 字号写死、gpui 的 500ms 停留时长是私有常量,两个都调不动,所以自己包一层:
+//! 字号降一档 + 在 gpui 那 500ms 后再接一段延迟。理由与做法见该模块注释。
+//!
 //! ## 5. 布局复用件(尽量用 gpui-component,别自己造)
 //!
 //! | mini-term 现状 | GPUI 侧对应 |
@@ -78,6 +84,7 @@ pub mod icons;
 pub mod motion;
 pub mod terminal;
 pub mod theme_bridge;
+pub mod tooltip;
 
 pub use background::{BackgroundArtElement, Fit, background_art, fit_bounds};
 pub use chart::{ChartCanvas, ChartColors, ChartKey, ChartModel, ChartStyle};

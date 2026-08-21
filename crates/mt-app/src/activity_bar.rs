@@ -25,7 +25,7 @@ use gpui::{
     ParentElement, SharedString, Stateful, StatefulInteractiveElement, Styled, div,
     prelude::FluentBuilder as _, px,
 };
-use gpui_component::tooltip::Tooltip;
+use mt_ui::tooltip::Tooltip;
 use mt_ui::icons::{Geom, Ink, Shape, VectorIcon};
 
 use crate::tree::PaneStatus;

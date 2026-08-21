@@ -853,7 +853,7 @@ impl GitPanel {
             })
             .child(glyph)
             .tooltip(move |window, cx| {
-                gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+                mt_ui::tooltip::Tooltip::new(tip.clone()).build(window, cx)
             })
             .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
                 this.run_sync(pull, cx)

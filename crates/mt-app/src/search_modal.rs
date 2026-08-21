@@ -34,7 +34,7 @@ use gpui::{
     Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::tooltip::Tooltip;
+use mt_ui::tooltip::Tooltip;
 use mt_project::search::{
     SearchEvent, SearchHandle, SearchMode, SearchRequest, SearchResultItem, start_search,
 };

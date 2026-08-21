@@ -341,7 +341,7 @@ fn render_body(state: &Entity<EnvVarsPanel>, cx: &mut App) -> AnyElement {
                         .child(
                             ui::checkbox(SharedString::from(format!("env-on-{rid}")), enabled)
                                 .tooltip(move |window, cx| {
-                                    gpui_component::tooltip::Tooltip::new(if enabled {
+                                    mt_ui::tooltip::Tooltip::new(if enabled {
                                         t("envVars", "rowEnabled")
                                     } else {
                                         t("envVars", "rowDisabled")
@@ -401,7 +401,7 @@ fn render_body(state: &Entity<EnvVarsPanel>, cx: &mut App) -> AnyElement {
                                 .text_color(ui::text_muted())
                                 .hover(|el| el.text_color(ui::color_error()))
                                 .tooltip(|window, cx| {
-                                    gpui_component::tooltip::Tooltip::new(t("envVars", "removeRow"))
+                                    mt_ui::tooltip::Tooltip::new(t("envVars", "removeRow"))
                                         .build(window, cx)
                                 })
                                 .child("✕")

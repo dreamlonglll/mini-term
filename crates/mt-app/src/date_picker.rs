@@ -258,7 +258,7 @@ impl DatePicker {
             .text_color(ui::text_muted())
             .hover(|el| el.bg(ui::border_subtle()).text_color(ui::text_primary()))
             .tooltip(move |window, cx| {
-                gpui_component::tooltip::Tooltip::new(tip).build(window, cx)
+                mt_ui::tooltip::Tooltip::new(tip).build(window, cx)
             })
             .on_click(cx.listener(move |this: &mut Self, _, _window, cx| {
                 this.step_month(delta, cx);
@@ -462,7 +462,7 @@ pub fn trigger_button(
         .cursor_pointer()
         .text_color(ui::text_muted())
         .hover(|el| el.bg(ui::border_subtle()).text_color(ui::text_primary()))
-        .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::new(tip).build(window, cx))
+        .tooltip(move |window, cx| mt_ui::tooltip::Tooltip::new(tip).build(window, cx))
         .on_click(move |event: &gpui::ClickEvent, window, cx| {
             let at = event.position();
             on_open(point(at.x - px(24.0), at.y + px(14.0)), window, cx);

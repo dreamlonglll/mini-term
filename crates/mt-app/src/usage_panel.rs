@@ -38,7 +38,7 @@ use gpui::{
     ease_in_out, prelude::FluentBuilder, px, relative,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
-use gpui_component::tooltip::Tooltip;
+use mt_ui::tooltip::Tooltip;
 use mt_ui::icons::vector::{Geom, Ink, Shape, VectorIcon};
 use mt_usage::{
     AgentFilter, DailyStat, ModelPrice, SyncEvent, TopSessionStat, UsageStatsPayload,
