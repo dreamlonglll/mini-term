@@ -40,9 +40,11 @@
 //!    `cx.open_url(&link.url)`(`text/node.rs:622`、`text/inline.rs:359`),没有回调口。
 //!    于是原版三条链接处置(外链弹确认框 / 文档内锚点滚动 / 本地文件在弹窗内跳转)
 //!    都做不到,**弹窗内跳转历史栈(`←` 返回)随之整条不做**。记档。
-//! 2. **HTML 只有源码态**:GPUI 侧没有 iframe 等价物,`TextView::html` 是富文本渲染器
-//!    (无 CSS / 无 JS / 无相对资源),画出来的东西与浏览器差得远,比不提供更误导人。
-//!    按规格 B.6.3 的建议选「只留源码编辑器」。
+//! 2. **HTML 是简版渲染,不是浏览器**:GPUI 侧没有 iframe 等价物,`TextView::html`
+//!    与 markdown 那支是同一个富文本渲染器(无 CSS / 无 JS)。此处曾按规格 B.6.3
+//!    的建议「只留源码编辑器」,**已翻案**(用户要求):现在给预览态,但配一条
+//!    说明 + 工具栏常驻「用浏览器打开」——走样的排版有解释、真效果有出口,
+//!    比对着一屏源码有用。相对资源不再是问题,见 [`rewrite_html_urls`]。
 //! 3. **遮罩点击不关窗**:Dialog 的遮罩关闭无法拦截,而关闭要先过「未保存确认」——
 //!    留着就等于给草稿开了一条静默丢弃的路。改为只能 ✕ / Esc 关。
 
@@ -51,13 +53,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use anyhow::Context as _;
 use futures::StreamExt;
 use futures::channel::mpsc;
+use futures::future::BoxFuture;
 use gpui::{
     App, AppContext, ClickEvent, Context, Entity, FocusHandle, Focusable, ImageAssetLoader,
     InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Render, Resource,
-    StatefulInteractiveElement, Styled, Subscription, Task, WeakEntity, Window, div, img,
-    prelude::FluentBuilder as _, px,
+    StatefulInteractiveElement, Styled, StyledImage as _, Subscription, Task, WeakEntity, Window,
+    div, img, prelude::FluentBuilder as _, px,
+};
+use gpui::http_client::{
+    AsyncBody, HttpClient, Request, Response, StatusCode, Url, http::HeaderValue,
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::input::{Input, InputEvent, InputState, Position};
@@ -299,7 +306,7 @@ pub fn can_edit(is_img: bool, result: Option<&FileContentResult>) -> bool {
 /// 那会引入「外部改写结果恰好等于刚保存的内容」的另一类误判。
 pub const ECHO_WINDOW: Duration = Duration::from_millis(2000);
 
-// ─── markdown 表格分段(自绘表格,见 render_markdown) ─────────────
+// ─── markdown 分段(表格与图片自绘,见 render_markdown) ─────────────
 //
 // gpui-component 0.5.1 的 TextView 表格是**写死的单行截断**:列宽按字符数
 // 原样占比(`node.rs:1070` 的 `relative(len)`)、格子 `.truncate()` ——
@@ -307,6 +314,14 @@ pub const ECHO_WINDOW: Duration = Duration::from_millis(2000);
 // `.md-preview table`(自动换行 + 浏览器 auto 布局)差一个档次,且
 // `TextViewStyle` 没留任何表格钩子。这里把 GFM 表格从文档里拆出来自绘,
 // 其余段落照走 TextView;格子内容仍按 markdown 渲染,行内 code/加粗不丢。
+//
+// **图片同理,而且更硬**:TextView 把图片 URL 一律当网络 URI
+// (`node.rs:609` 的 `img(image.url)` 收的是 `SharedUri` → `Resource::Uri`
+// → 走 http client),于是 md 里的相对路径图片(README 的截图)在预览里
+// 什么都不出;原版靠 `convertFileSrc(fileDir + '/' + src)` 转 asset 协议
+// (`FileViewerModal.tsx:145-150`)。这里把「整行只有图片」的行拆出来自绘,
+// 相对路径按当前文件所在目录解析成 `Resource::Path`,见 [`parse_image_line`]
+// 与 [`FileViewer::render_md_images`]。
 
 /// GFM 表格的列对齐(分隔行的 `:---:` 语法)。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -324,14 +339,28 @@ struct MdTable {
     rows: Vec<Vec<String>>,
 }
 
+/// markdown 里的一张图片。整行只有图片时被拆出来自绘(见 [`parse_image_line`])。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct MdImage {
+    /// 原文里的目标,**未解码也未解析** —— 落地在 [`resolve_image_src`]
+    url: String,
+    alt: String,
+    /// `![alt](url "title")` 的 title,悬停显示
+    title: Option<String>,
+    /// `[![alt](img)](link)` 外层链接:点图开外链(徽章行的写法)
+    link: Option<String>,
+}
+
 #[derive(Debug, PartialEq)]
 enum MdSegment {
     Text(String),
     Table(MdTable),
+    /// 一整行的图片(徽章行可能并排多张)
+    Images(Vec<MdImage>),
 }
 
-/// 把 markdown 源切成**块级**段:GFM 表格独立成段,其余文本按空行拆块
-/// (围栏代码块 ``` / ~~~ 内的空行与竖线都不拆)。
+/// 把 markdown 源切成**块级**段:GFM 表格与整行图片各自独立成段,其余文本
+/// 按空行拆块(围栏代码块 ``` / ~~~ 内的空行、竖线、图片语法都不拆)。
 ///
 /// 逐块喂 TextView 而不是整篇 —— 除了表格要自绘,还有一条硬理由:
 /// gpui-component 0.5.1 的非虚拟化路径把 `is_last: true` 原样传给 Root 的
@@ -339,7 +368,7 @@ enum MdSegment {
 /// `is_last → paragraph_gap = 0`,整篇喂进去相邻段落会贴死(用户对照原版
 /// 实测)。块间距改由 [`block_top_margin`] 自己控,顺带复刻原版「标题前
 /// 间距更大」的非对称节奏(`.md-preview h* { margin-top: 1.4em }`)。
-fn split_md_tables(source: &str) -> Vec<MdSegment> {
+fn split_md_blocks(source: &str) -> Vec<MdSegment> {
     let lines: Vec<&str> = source.lines().collect();
     let mut segs = Vec::new();
     let mut text_start = 0usize;
@@ -391,11 +420,444 @@ fn split_md_tables(source: &str) -> Vec<MdSegment> {
     segs
 }
 
-/// 非空才算一块(连续空行 / 段与表格间的空隙都会产生空切片)。
+/// 收一个文本块,顺手把**整行只有图片**的行拆成 [`MdSegment::Images`] 自绘。
+///
+/// 图片行不必单独成段(README 里「一段说明紧跟一张截图」中间常常没有空行),
+/// 所以切分落在这一层而不是 [`split_md_blocks`] 的块级循环里。围栏代码块
+/// 内的行不参与 —— ` ```md ` 示例里的 `![](…)` 是代码,不是图片。
 fn push_text_block(lines: &[&str], segs: &mut Vec<MdSegment>) {
+    let mut start = 0usize;
+    let mut in_fence = false;
+    for (ix, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        let Some(images) = parse_image_line(line) else {
+            continue;
+        };
+        push_plain_text(&lines[start..ix], segs);
+        segs.push(MdSegment::Images(images));
+        start = ix + 1;
+    }
+    push_plain_text(&lines[start..], segs);
+}
+
+/// 非空才算一块(连续空行 / 段与表格间的空隙都会产生空切片)。
+fn push_plain_text(lines: &[&str], segs: &mut Vec<MdSegment>) {
     if lines.iter().any(|l| !l.trim().is_empty()) {
         segs.push(MdSegment::Text(lines.join("\n")));
     }
+}
+
+/// 一行**只有图片**时解析出其中的图片,否则 `None`(那一行照旧交给 TextView)。
+///
+/// 认的形态就是 README 里图片的常见写法:`![alt](url)`、带 title 的
+/// `![alt](url "标题")`、当链接用的 `[![alt](url)](link)`,以及同一行并排多张
+/// (徽章行)。**行里混了文字就整行放弃** —— 拆一半会把段落切碎,而内联图片
+/// 本来就是少数派。
+///
+/// 已知不覆盖(记档,不修):列表项 `- ![a](b)`、引用块 `> ![a](b)`、表格格子
+/// 里的图片 —— 这些行有前缀语法,拆出来会毁掉列表/引用结构,仍走 TextView
+/// (于是本地路径图片在那些位置依旧不显示)。
+fn parse_image_line(line: &str) -> Option<Vec<MdImage>> {
+    // 四个空格 / 制表符缩进是代码块,里面的图片语法是代码
+    if line.starts_with("    ") || line.starts_with('\t') {
+        return None;
+    }
+    let mut rest = line.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    let mut images = Vec::new();
+    while !rest.is_empty() {
+        let (image, tail) = parse_image_at(rest)?;
+        images.push(image);
+        rest = tail.trim_start();
+    }
+    (!images.is_empty()).then_some(images)
+}
+
+/// 从开头吃掉一张图片(可带外层链接),返回图片与剩余部分。
+fn parse_image_at(s: &str) -> Option<(MdImage, &str)> {
+    // `[![alt](img)](link)`:方括号里必须**整体**是一张图片,别的都不认
+    if let Some(after) = s.strip_prefix('[') {
+        let (inner, tail) = take_balanced(after, '[', ']')?;
+        let (mut image, inner_tail) = parse_bang_image(inner.trim())?;
+        if !inner_tail.trim().is_empty() {
+            return None;
+        }
+        let tail = tail.strip_prefix('(')?;
+        let (dest, tail) = take_balanced(tail, '(', ')')?;
+        let (link, _) = split_dest(dest);
+        if link.is_empty() {
+            return None;
+        }
+        image.link = Some(link);
+        return Some((image, tail));
+    }
+    parse_bang_image(s)
+}
+
+/// `![alt](url "title")`。
+fn parse_bang_image(s: &str) -> Option<(MdImage, &str)> {
+    let after = s.strip_prefix("![")?;
+    let (alt, tail) = take_balanced(after, '[', ']')?;
+    let tail = tail.strip_prefix('(')?;
+    let (dest, tail) = take_balanced(tail, '(', ')')?;
+    let (url, title) = split_dest(dest);
+    if url.is_empty() {
+        return None;
+    }
+    Some((
+        MdImage {
+            url,
+            alt: alt.trim().to_string(),
+            title,
+            link: None,
+        },
+        tail,
+    ))
+}
+
+/// 吃到与开头配对的 `close`(允许嵌套、`\` 转义),入参是**开符之后**的部分,
+/// 返回 `(括号内, 闭合符之后)`;没配上返回 `None`。
+fn take_balanced(s: &str, open: char, close: char) -> Option<(&str, &str)> {
+    let mut depth = 1usize;
+    let mut escaped = false;
+    for (ix, ch) in s.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            c if c == open => depth += 1,
+            c if c == close => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((&s[..ix], &s[ix + ch.len_utf8()..]));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// 括号里的目标 → `(url, title)`。认 `<路径 带空格>` 与 `url "标题"` 两种写法。
+fn split_dest(dest: &str) -> (String, Option<String>) {
+    let d = dest.trim();
+    if let Some(rest) = d.strip_prefix('<')
+        && let Some((url, tail)) = rest.split_once('>')
+    {
+        return (url.trim().to_string(), title_of(tail));
+    }
+    match d.find(char::is_whitespace) {
+        Some(cut) => (d[..cut].to_string(), title_of(&d[cut..])),
+        None => (d.to_string(), None),
+    }
+}
+
+/// 目标后面那截 → title(剥 `"`/`'`/`(`)。空的算没有。
+fn title_of(tail: &str) -> Option<String> {
+    let t = tail
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'' || c == '(' || c == ')')
+        .trim();
+    (!t.is_empty()).then(|| t.to_string())
+}
+
+/// 图片目标的落点。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MdImageSrc {
+    /// 本地文件(相对路径已按当前文件所在目录解析)
+    Local(PathBuf),
+    /// 远程图片:**不自动去取**,画成一枚可点的占位(见 [`FileViewer::render_md_images`])
+    Remote(String),
+    /// `data:` / 认不出的 scheme
+    Unsupported,
+}
+
+/// 图片 URL → 落点。相对路径按**当前 md 文件所在目录**解析,与原版
+/// `resolveImgSrc`(`FileViewerModal.tsx:145-150` 的
+/// `convertFileSrc(fileDir + '/' + src)`)同一口径。
+fn resolve_image_src(url: &str, base_dir: &Path) -> MdImageSrc {
+    let raw = url.trim();
+    if raw.is_empty() {
+        return MdImageSrc::Unsupported;
+    }
+    let lower = raw.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        return MdImageSrc::Remote(raw.to_string());
+    }
+    if lower.starts_with("file://") {
+        let rest = percent_decode(&raw["file://".len()..]);
+        // `file:///D:/a.png` → `D:/a.png`;UNC(`file://host/share`)原样留着
+        let rest = match rest.strip_prefix('/') {
+            Some(tail) if looks_like_drive(tail) => tail.to_string(),
+            _ => rest,
+        };
+        return MdImageSrc::Local(PathBuf::from(rest));
+    }
+    // 其它 scheme(`data:` / `blob:` / `mailto:` …)一律不认。**两个字母起**才算
+    // scheme —— 单字母加冒号是 Windows 盘符(`D:\shots\a.png`)
+    if scheme_len(raw).is_some_and(|len| len >= 2) {
+        return MdImageSrc::Unsupported;
+    }
+    let decoded = percent_decode(raw);
+    let path = Path::new(&decoded);
+    if path.is_absolute() {
+        MdImageSrc::Local(path.to_path_buf())
+    } else {
+        MdImageSrc::Local(base_dir.join(path))
+    }
+}
+
+/// `D:/…` / `d:\…` 这种盘符开头。
+fn looks_like_drive(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!((chars.next(), chars.next()), (Some(c), Some(':')) if c.is_ascii_alphabetic())
+}
+
+/// URL scheme 的字母数(`https://` → 5);不是 scheme 返回 `None`。
+fn scheme_len(s: &str) -> Option<usize> {
+    let cut = s.find(':')?;
+    let head = &s[..cut];
+    (!head.is_empty()
+        && head.starts_with(|c: char| c.is_ascii_alphabetic())
+        && head
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
+    .then_some(cut)
+}
+
+/// 本地路径 → `file:///…` URL(百分号编码交给 url crate)。相对路径转不了,
+/// 那时返回 `None`、调用方保留原文。
+fn to_file_url(path: &Path) -> Option<String> {
+    Url::from_file_path(path).ok().map(|url| url.to_string())
+}
+
+/// 只认 `file://` 的 HTTP 客户端,装在 `main` 里(`cx.set_http_client`)。
+///
+/// gpui 默认那份是 `NullHttpClient`(`gpui/app.rs:2343`,`send()` 直接报错),
+/// 而 gpui-component 的富文本渲染器把图片一律画成 `img(SharedUri)`
+/// (`text/node.rs:609`)—— URI 走的就是 http client。于是预览里那些**内联**图片
+/// (块级图片行由 [`FileViewer::render_md_images`] 自绘)全靠这条路:渲染前源码里
+/// 的本地路径被改写成 `file:///…`([`rewrite_md_image_urls`] / [`rewrite_html_urls`]),
+/// 到这里读盘返回。
+///
+/// **不代理真实网络**:非 `file` 的 scheme 一律拒绝 —— 打开一份文档就静默向外
+/// 发一串请求不该是默认(原版跑在 WebView 里没得选,这里有得选)。远程图片画成
+/// 一枚可点的占位,点了才用系统浏览器打开。
+pub struct LocalFileHttpClient;
+
+impl HttpClient for LocalFileHttpClient {
+    fn type_name(&self) -> &'static str {
+        "LocalFileHttpClient"
+    }
+
+    fn user_agent(&self) -> Option<&HeaderValue> {
+        None
+    }
+
+    fn send(
+        &self,
+        req: Request<AsyncBody>,
+    ) -> BoxFuture<'static, anyhow::Result<Response<AsyncBody>>> {
+        let uri = req.uri().to_string();
+        Box::pin(async move {
+            let url = Url::parse(&uri).with_context(|| format!("URL 解析失败: {uri}"))?;
+            anyhow::ensure!(url.scheme() == "file", "只读本地文件,拒绝请求: {uri}");
+            let path = url
+                .to_file_path()
+                .map_err(|_| anyhow::anyhow!("不是本地文件路径: {uri}"))?;
+            // 读盘是阻塞的,但这条 future 由 gpui 的 asset 系统丢在后台执行器上跑
+            let bytes = std::fs::read(&path)
+                .with_context(|| format!("读不到 {}", path.display()))?;
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .body(AsyncBody::from(bytes))?)
+        })
+    }
+}
+
+/// 把 md 源里图片的**本地**目标改写成 `file:///…` 绝对 URL。
+///
+/// 整行只有图片的那些行由 [`FileViewer::render_md_images`] 自绘、不经过这里;
+/// 这条是给**内联**图片兜底的(列表项 `- ![a](b)`、引用块、表格格子里的图片)——
+/// 它们要走 TextView,而那条路只认网络 URI,配上 [`LocalFileHttpClient`] 才画得出来。
+///
+/// 围栏代码块与行内 code 里的图片语法是**代码不是图片**,原样留着。
+fn rewrite_md_image_urls(source: &str, base_dir: &Path) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut in_fence = false;
+    for (ix, line) in source.split('\n').enumerate() {
+        if ix > 0 {
+            out.push('\n');
+        }
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            out.push_str(line);
+            continue;
+        }
+        // 围栏内 / 四空格缩进的代码块原样
+        if in_fence || line.starts_with("    ") || line.starts_with('\t') {
+            out.push_str(line);
+            continue;
+        }
+        rewrite_md_line_into(line, base_dir, &mut out);
+    }
+    out
+}
+
+/// 一行里的图片目标逐个改写(行内 code 跳过)。
+fn rewrite_md_line_into(line: &str, base_dir: &Path, out: &mut String) {
+    let mut rest = line;
+    let mut in_code = false;
+    while let Some(ch) = rest.chars().next() {
+        if ch == '`' {
+            in_code = !in_code;
+            out.push('`');
+            rest = &rest[1..];
+            continue;
+        }
+        if !in_code
+            && rest.starts_with("![")
+            && let Some((image, tail)) = parse_bang_image(rest)
+        {
+            let url = match resolve_image_src(&image.url, base_dir) {
+                MdImageSrc::Local(path) => to_file_url(&path).unwrap_or(image.url.clone()),
+                _ => image.url.clone(),
+            };
+            out.push_str("![");
+            out.push_str(&image.alt);
+            out.push_str("](");
+            out.push_str(&url);
+            if let Some(title) = &image.title {
+                out.push_str(" \"");
+                out.push_str(title);
+                out.push('"');
+            }
+            out.push(')');
+            rest = tail;
+            continue;
+        }
+        out.push(ch);
+        rest = &rest[ch.len_utf8()..];
+    }
+}
+
+/// 把 HTML 源里 `src` / `href` / `poster` 的**本地**目标改写成 `file:///…`。
+///
+/// 逐条对照原版 `htmlSrcDoc`(`FileViewerModal.tsx:134-143`)那条正则,排除清单
+/// 也一样(http(s) / data / blob / mailto / tel / `#` / javascript)。原版靠
+/// `convertFileSrc` 转 asset 协议,这里转 `file://` 交给 [`LocalFileHttpClient`]。
+fn rewrite_html_urls(source: &str, base_dir: &Path) -> String {
+    // 大小写不敏感的定位副本。`to_ascii_lowercase` 只动 ASCII,**字节长度不变**,
+    // 索引因此能直接拿回原文切片(`to_lowercase` 就不行,有字符会变长)
+    let lower = source.to_ascii_lowercase();
+    let mut out = String::with_capacity(source.len());
+    let mut pos = 0usize;
+    while let Some((value_start, quote)) = find_next_url_attr(&lower, pos) {
+        let Some(rel) = lower[value_start..].find(quote) else {
+            break;
+        };
+        let value_end = value_start + rel;
+        out.push_str(&source[pos..value_start]);
+        out.push_str(&rewrite_html_value(&source[value_start..value_end], base_dir));
+        pos = value_end;
+    }
+    out.push_str(&source[pos..]);
+    out
+}
+
+/// 找下一个 `src=` / `href=` / `poster=` 的**值起点**与它的引号。
+fn find_next_url_attr(lower: &str, from: usize) -> Option<(usize, char)> {
+    const ATTRS: [&str; 3] = ["src", "href", "poster"];
+    let mut best: Option<(usize, usize, char)> = None;
+    for attr in ATTRS {
+        let mut at = from;
+        while let Some(rel) = lower[at..].find(attr) {
+            let name_start = at + rel;
+            at = name_start + attr.len();
+            // 属性名前面必须是空白 —— 挡住 `data-src` / `xlink:href` 这类
+            if !lower[..name_start]
+                .chars()
+                .next_back()
+                .is_some_and(char::is_whitespace)
+            {
+                continue;
+            }
+            // 后面得是 `\s*=\s*` 加引号
+            let after_name = &lower[at..];
+            let trimmed = after_name.trim_start();
+            let Some(after_eq) = trimmed.strip_prefix('=') else {
+                continue;
+            };
+            let value = after_eq.trim_start();
+            let Some(quote) = value.chars().next().filter(|c| *c == '"' || *c == '\'') else {
+                continue;
+            };
+            // `after_name` 与 `value` 的长度差,正好是「空白 + `=` + 空白」那一截
+            let quote_at = at + (after_name.len() - value.len());
+            let candidate = (name_start, quote_at + 1, quote);
+            if best.is_none_or(|(best_start, _, _)| candidate.0 < best_start) {
+                best = Some(candidate);
+            }
+            break;
+        }
+    }
+    best.map(|(_, value_start, quote)| (value_start, quote))
+}
+
+/// 一个属性值:本地目标转 `file://`,其余原样(排除清单同原版正则)。
+fn rewrite_html_value(value: &str, base_dir: &Path) -> String {
+    const SKIP: [&str; 8] = [
+        "http:",
+        "https:",
+        "data:",
+        "blob:",
+        "mailto:",
+        "tel:",
+        "javascript:",
+        "file:",
+    ];
+    let target = value.trim();
+    let lower = target.to_ascii_lowercase();
+    if target.is_empty() || target.starts_with('#') || SKIP.iter().any(|p| lower.starts_with(p)) {
+        return value.to_string();
+    }
+    match resolve_image_src(target, base_dir) {
+        MdImageSrc::Local(path) => to_file_url(&path).unwrap_or_else(|| value.to_string()),
+        _ => value.to_string(),
+    }
+}
+
+/// `%20` 之类还原成字符(md 里带空格的路径常这么写);非法转义原样留着。
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3])
+            && let Ok(byte) = u8::from_str_radix(hex, 16)
+        {
+            out.push(byte);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// 块顶间距:对照 `.md-preview` 的纵向节奏 —— 段落间 `p { margin: 0.8em }`
@@ -407,7 +869,9 @@ fn block_top_margin(ix: usize, seg: &MdSegment) -> f32 {
         return 0.0;
     }
     match seg {
-        MdSegment::Table(_) => 13.0,
+        // 图片与表格同档:原版 `.md-preview img` 吃 p 的 0.8em,块级化之后
+        // 按「独立块」给 1em(≈13px),与表格一致
+        MdSegment::Table(_) | MdSegment::Images(_) => 13.0,
         MdSegment::Text(text) => {
             let first = text.trim_start();
             // `#`~`######` + 空格才是标题(# 后无空格在 CommonMark 里不算)
@@ -575,6 +1039,41 @@ fn render_md_table(
         .border_1()
         .border_color(ui::border_default())
         .children(rows_el)
+        .into_any_element()
+}
+
+/// 图片画不出来时的占位:一枚描边小卡片,写 alt(没有就写文件名)。
+///
+/// 三种情况共用 —— 还在读盘、读不出来(文件不在 / 格式解不了)、远程图片。
+/// `hint` 给悬停提示(远程 URL / 解析后的本地路径),`open` 有值时可点,
+/// 点了用系统浏览器打开。
+fn md_image_placeholder(
+    id: gpui::SharedString,
+    label: gpui::SharedString,
+    hint: Option<String>,
+    open: Option<String>,
+) -> gpui::AnyElement {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .px(px(10.0))
+        .py(px(6.0))
+        .rounded(px(4.0))
+        .border_1()
+        .border_color(ui::border_default())
+        .bg(ui::bg_elevated())
+        .text_size(ui::font_px(12.0))
+        .text_color(ui::text_muted())
+        .child(label)
+        .when_some(hint, |el, hint| {
+            el.tooltip(move |window, cx| Tooltip::new(hint.clone()).build(window, cx))
+        })
+        .when_some(open, |el, url| {
+            el.cursor_pointer()
+                .hover(|el| el.text_color(ui::text_primary()))
+                .on_click(move |_: &ClickEvent, _window, cx| cx.open_url(&url))
+        })
         .into_any_element()
 }
 
@@ -789,19 +1288,17 @@ impl FileViewer {
         is_image_file(&self.path_str())
     }
 
-    /// 「预览 / 源码」段控件的显示条件。
+    /// 「预览 / 源码」段控件的显示条件:`(isMd || isHtml) && canEdit`
+    /// (`FileViewerModal.tsx:355`,与原版同口径)。
     ///
-    /// 原版是 `(isMd || isHtml) && canEdit`(`FileViewerModal.tsx:355`)。
-    /// **HTML 那一半在 GPUI 侧被摘掉**(见模块注释偏差 2):没有 iframe 等价物,
-    /// 只留源码编辑器,于是也就没有第二态可切。下面那道 `is_html_file` 判定
-    /// 在语义上是冗余的(`.html` 本来也不是 Markdown),留着是为了让这条偏差
-    /// 在代码里有落点 —— 上游哪天给了 WebView 等价物,把它换成 `|| is_html` 即可。
+    /// HTML 那一半曾经被摘掉(模块注释偏差 2 的旧结论:没有 iframe 等价物,
+    /// 富文本渲染器画出来的东西「比不提供更误导人」)。现在**改为提供** ——
+    /// 见 [`Self::render_html`]:简版渲染 + 顶上一条说明 + 工具栏常驻
+    /// 「用浏览器打开」,把真效果的出口摆明,比只给一屏源码有用。
     fn has_preview_toggle(&self) -> bool {
         let path = self.path_str();
-        if is_html_file(&path) {
-            return false;
-        }
-        is_markdown_file(&path) && can_edit(self.is_img(), self.result.as_ref())
+        (is_markdown_file(&path) || is_html_file(&path))
+            && can_edit(self.is_img(), self.result.as_ref())
     }
 
     // ── 读盘 ──────────────────────────────────────────────
@@ -1059,6 +1556,7 @@ impl FileViewer {
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let name = self.file_name();
         let path = self.path_str();
+        let is_html = is_html_file(&path);
         let can_edit = can_edit(self.is_img(), self.result.as_ref());
         let dirty = self.dirty;
         let saving = self.saving;
@@ -1142,6 +1640,30 @@ impl FileViewer {
                                 .child(label)
                                 .into_any_element()
                         })
+                    })
+                    // HTML 常驻「用浏览器打开」:内嵌的那份是无 CSS / 无 JS 的
+                    // 简版渲染(见 render_html),真效果只有浏览器给得了
+                    .when(is_html, |el| {
+                        el.child(
+                            div()
+                                .id("file-viewer-open-browser")
+                                .px(px(10.0))
+                                .py(px(4.0))
+                                .rounded(px(4.0))
+                                .border_1()
+                                .border_color(ui::border_default())
+                                .text_size(ui::font_px(12.0))
+                                .text_color(ui::text_muted())
+                                .cursor_pointer()
+                                .hover(|el| {
+                                    el.text_color(ui::text_primary())
+                                        .border_color(ui::border_strong())
+                                })
+                                .child(t("fileViewer", "openInBrowser"))
+                                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                    this.open_with_default_app(cx)
+                                })),
+                        )
                     })
                     .when(self.has_preview_toggle(), |el| {
                         el.child(self.render_preview_toggle(cx))
@@ -1316,20 +1838,145 @@ impl FileViewer {
         }
     }
 
-    /// Markdown 预览。样式对照 `src/styles.css:813-943` 的 `.md-preview`:
-    /// 容器 `p-6 max-w-[860px] mx-auto`、段间距 1 rem、正文 1.08rem/1.7。
+    /// 自绘一行 md 图片(整行只有图片的那些行,见 [`parse_image_line`])。
     ///
-    /// 代码块高亮是**改善**(原版 `.md-preview pre code` 只设颜色不做高亮),
-    /// 且与编辑器同一份 `highlight_theme`,两处颜色一致。
-    fn render_markdown(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let source = self
-            .preview_draft
+    /// TextView 那条路把图片目标一律当**网络 URI**(见本模块「markdown 分段」
+    /// 一节),于是 README 里 `![主界面](docs/screenshots/main.png)` 这种相对路径
+    /// 在预览里什么都不出 —— 原版是 `convertFileSrc(fileDir + '/' + src)`。
+    /// 这里按当前文件所在目录解析成 `Resource::Path` 自己画。
+    ///
+    /// **远程图片不自动去取**:gpui 默认的 `NullHttpClient`(`gpui/app.rs:2343`)
+    /// 压根发不出请求,而「打开一份 md 就静默向外发一串请求」也不该是默认。
+    /// 画成一枚可点的占位,点了才用系统浏览器打开。
+    ///
+    /// 宽度自己算而不是甩给 `max_w`:gpui 的 `img` 在宽高都是 `Auto` 时把两轴
+    /// 一起填成图片原尺寸(`elements/img.rs:337-363`),此后 `max_w` 只压得住宽、
+    /// 高度还是原值,大图会被 `object_fit` 缩成一小条飘在大片留白里。**给定宽度
+    /// 之后**高度那一支才会按比例算。
+    fn render_md_images(
+        &self,
+        seg_ix: usize,
+        images: &[MdImage],
+        avail_w: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let base_dir = self.preview_base_dir();
+        // 并排多张(徽章行)时按张数分宽;单张吃满
+        let each_w = (avail_w / images.len().max(1) as f32 - 8.0).max(24.0);
+        let mut els = Vec::with_capacity(images.len());
+        for (ix, image) in images.iter().enumerate() {
+            let id = gpui::SharedString::from(format!("file-viewer-md-img-{seg_ix}-{ix}"));
+            let label = gpui::SharedString::from(if image.alt.is_empty() {
+                file_name_of(&image.url).to_string()
+            } else {
+                image.alt.clone()
+            });
+            let el = match resolve_image_src(&image.url, &base_dir) {
+                MdImageSrc::Local(path) => {
+                    self.render_md_local_image(id, label, &path, each_w, window, cx)
+                }
+                MdImageSrc::Remote(url) => {
+                    md_image_placeholder(id, label, Some(url.clone()), Some(url))
+                }
+                MdImageSrc::Unsupported => {
+                    md_image_placeholder(id, label, Some(image.url.clone()), None)
+                }
+            };
+            // 外层链接(`[![alt](img)](link)`):点图开外链。只认 http(s) ——
+            // 本地目标要走「弹窗内跳转」,而那条路整条不做(见模块注释偏差 1)
+            let el = match image.link.as_deref().map(str::trim) {
+                Some(link)
+                    if link.starts_with("http://") || link.starts_with("https://") =>
+                {
+                    let url = link.to_string();
+                    let tip = link.to_string();
+                    div()
+                        .id(gpui::SharedString::from(format!(
+                            "file-viewer-md-img-link-{seg_ix}-{ix}"
+                        )))
+                        .cursor_pointer()
+                        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                        .on_click(move |_: &ClickEvent, _window, cx| cx.open_url(&url))
+                        .child(el)
+                        .into_any_element()
+                }
+                _ => el,
+            };
+            els.push(el);
+        }
+        div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(px(8.0))
+            .children(els)
+            .into_any_element()
+    }
+
+    /// 一张本地图片:读得出来画图,读不出来 / 还在读画占位。
+    fn render_md_local_image(
+        &self,
+        id: gpui::SharedString,
+        label: gpui::SharedString,
+        path: &Path,
+        avail_w: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let resource = Resource::Path(Arc::from(path));
+        let hint = path.to_string_lossy().to_string();
+        match window.use_asset::<ImageAssetLoader>(&resource, cx) {
+            None => md_image_placeholder(id, label, Some(hint), None),
+            Some(Err(_)) => md_image_placeholder(id, label, Some(hint), None),
+            Some(Ok(data)) => {
+                // `data.size()` 是**设备像素**。svg 那条路 gpui 按
+                // `SMOOTH_SVG_SCALE_FACTOR` 放大后光栅化(`elements/img.rs:696-706`),
+                // 换算回逻辑像素要除回去 —— 那个常量没从 gpui 导出(私有 mod +
+                // `use`,不是 `pub use`),只能照抄它的值 2.0
+                let svg_scale = if path
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("svg"))
+                {
+                    2.0
+                } else {
+                    1.0
+                };
+                let natural_w = data.size(0).width.0 as f32 / svg_scale;
+                // 小图保持原大(原版 `max-width:100%` 也不放大),大图压到可用宽
+                let w = natural_w.min(avail_w).max(1.0);
+                img(path.to_path_buf())
+                    .id(id)
+                    .object_fit(gpui::ObjectFit::Contain)
+                    .w(px(w))
+                    .into_any_element()
+            }
+        }
+    }
+
+    /// 预览态的正文当前目录:相对路径的图片 / 资源按它解析。
+    fn preview_base_dir(&self) -> PathBuf {
+        self.current_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default()
+    }
+
+    /// 预览态要渲染的源码:切到预览那一刻的草稿快照,没有草稿就用磁盘现内容。
+    fn preview_source(&self) -> String {
+        self.preview_draft
             .clone()
-            .unwrap_or_else(|| self.disk.clone());
-        // 排版对齐原版 `.md-preview`(styles.css:814-887):基准 1.08rem ≈ 14px
-        // (root=uiFontSize,走 ui::font_px 保持随设置缩放)、行高 1.7、标题
-        // 1.8/1.4/1.15/1em、段距 0.8em、代码块 0.85em —— TextView 默认基准吃
-        // gpui 的 16px、标题倍率 2/1.5/1.25,整体明显偏大(用户实测)。
+            .unwrap_or_else(|| self.disk.clone())
+    }
+
+    /// 富文本排版。markdown 与 html 两支预览共用一份 —— 两边走的是
+    /// gpui-component 的同一个渲染器,样式没有理由分家。
+    ///
+    /// 对齐原版 `.md-preview`(styles.css:814-887):基准 1.08rem ≈ 14px
+    /// (root=uiFontSize,走 ui::font_px 保持随设置缩放)、行高 1.7、标题
+    /// 1.8/1.4/1.15/1em、段距 0.8em、代码块 0.85em —— TextView 默认基准吃
+    /// gpui 的 16px、标题倍率 2/1.5/1.25,整体明显偏大(用户实测)。
+    fn preview_text_style(&self, cx: &mut Context<Self>) -> TextViewStyle {
         let mut code_block = gpui::StyleRefinement::default();
         {
             // `refine_style` 排在组件自己的 `.text_size(mono_font_size)` 之后,
@@ -1338,7 +1985,7 @@ impl FileViewer {
             text.font_size = Some(ui::font_px(11.9).into());
             text.line_height = Some(gpui::relative(1.6).into());
         }
-        let style = TextViewStyle {
+        TextViewStyle {
             highlight_theme: cx.theme().highlight_theme.clone(),
             is_dark: cx.theme().mode.is_dark(),
             heading_base_font_size: ui::font_px(14.0),
@@ -1353,10 +2000,29 @@ impl FileViewer {
             2 => base * 1.4,
             3 => base * 1.15,
             _ => base,
-        });
-        // 表格拆出来自绘(组件表格单行截断,见 split_md_tables 一节的说明),
-        // 其余段落照走 TextView;段落 id 按段序编,文档不变即稳定。
-        let segments = split_md_tables(&source);
+        })
+    }
+
+    /// 正文可用宽度:弹窗宽是 viewport*0.9(见 [`open`]),减掉两侧 24px padding,
+    /// 再夹到正文的 860px 上限。图片自绘要按它定尺寸。
+    fn preview_avail_width(&self, window: &Window) -> f32 {
+        (f32::from(window.viewport_size().width) * 0.9 - 48.0).clamp(80.0, 860.0)
+    }
+
+    /// Markdown 预览。样式对照 `src/styles.css:813-943` 的 `.md-preview`:
+    /// 容器 `p-6 max-w-[860px] mx-auto`、段间距 1 rem、正文 1.08rem/1.7。
+    ///
+    /// 代码块高亮是**改善**(原版 `.md-preview pre code` 只设颜色不做高亮),
+    /// 且与编辑器同一份 `highlight_theme`,两处颜色一致。
+    fn render_markdown(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let base_dir = self.preview_base_dir();
+        let source = self.preview_source();
+        let style = self.preview_text_style(cx);
+        // 表格与图片拆出来自绘(组件表格单行截断、图片只认网络 URI,见
+        // split_md_blocks 一节的说明),其余段落照走 TextView;段落 id 按段序编,
+        // 文档不变即稳定。
+        let segments = split_md_blocks(&source);
+        let avail_w = self.preview_avail_width(window);
         div()
             .id("file-viewer-md")
             .size_full()
@@ -1374,14 +2040,18 @@ impl FileViewer {
                         .map(|(ix, seg)| {
                             // 块间距按原版纵向节奏由这里统一给(em 基准,随
                             // uiFontSize 缩放),TextView 内部的 paragraph_gap
-                            // 在非虚拟化路径上是坏的(见 split_md_tables 注释)
+                            // 在非虚拟化路径上是坏的(见 split_md_blocks 注释)
                             let mt = block_top_margin(ix, &seg);
                             let content = match seg {
+                                // 交给 TextView 的段里还可能有**内联**图片
+                                // (列表项 / 引用块 / 表格格子),它们的本地路径
+                                // 得先转成 file:// 才画得出来(见 rewrite_md_image_urls);
+                                // 块级图片行不走这里,拿的是拆好的原始 url
                                 MdSegment::Text(text) => TextView::markdown(
                                     gpui::SharedString::from(format!(
                                         "file-viewer-md-body-{ix}"
                                     )),
-                                    text,
+                                    rewrite_md_image_urls(&text, &base_dir),
                                     window,
                                     cx,
                                 )
@@ -1391,6 +2061,9 @@ impl FileViewer {
                                 MdSegment::Table(table) => {
                                     render_md_table(ix, &table, &style, window, cx)
                                 }
+                                MdSegment::Images(images) => {
+                                    self.render_md_images(ix, &images, avail_w, window, cx)
+                                }
                             };
                             div()
                                 .when(mt > 0.0, |el| el.mt(ui::font_px(mt)))
@@ -1399,6 +2072,54 @@ impl FileViewer {
                         })
                         .collect::<Vec<_>>(),
                 ),
+            )
+            .into_any_element()
+    }
+
+    /// HTML 预览。**富文本简版渲染,不是浏览器** —— GPUI 侧没有 iframe 等价物,
+    /// `TextView::html` 与 markdown 那支是同一个渲染器:标题 / 段落 / 列表 /
+    /// 表格 / 图片 / 链接认得,CSS 与脚本一概不跑,带样式的页面会走样。
+    ///
+    /// 这正是当初「只留源码态」的理由(模块注释偏差 2)。现在改为提供,配套两条:
+    /// 顶上一句说明写清楚它是简版,工具栏常驻「用浏览器打开」给真效果的出口。
+    /// 图片与其它本地资源靠 [`rewrite_html_urls`] 转 `file://`(原版是
+    /// `convertFileSrc`),由 [`LocalFileHttpClient`] 读盘。
+    fn render_html(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let source = rewrite_html_urls(&self.preview_source(), &self.preview_base_dir());
+        let style = self.preview_text_style(cx);
+        div()
+            .id("file-viewer-html")
+            .size_full()
+            .overflow_y_scroll()
+            .p(px(24.0))
+            .text_size(ui::font_px(14.0))
+            .line_height(gpui::relative(1.85))
+            .child(
+                div()
+                    .max_w(px(860.0))
+                    .mx_auto()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap(px(12.0))
+                    // 说明条:别让人对着走样的排版猜是不是文件坏了
+                    .child(
+                        div()
+                            .px(px(10.0))
+                            .py(px(6.0))
+                            .rounded(px(4.0))
+                            .border_1()
+                            .border_color(ui::border_subtle())
+                            .bg(ui::bg_elevated())
+                            .text_size(ui::font_px(12.0))
+                            .text_color(ui::text_muted())
+                            .child(t("fileViewer", "htmlPreviewNote")),
+                    )
+                    .child(
+                        TextView::html("file-viewer-html-body", source, window, cx)
+                            .style(style)
+                            .selectable(true),
+                    ),
             )
             .into_any_element()
     }
@@ -1436,7 +2157,11 @@ impl FileViewer {
                 .into_any_element(),
             Branch::Editor => {
                 if self.has_preview_toggle() && self.preview {
-                    return self.render_markdown(window, cx);
+                    return if is_markdown_file(&self.path_str()) {
+                        self.render_markdown(window, cx)
+                    } else {
+                        self.render_html(window, cx)
+                    };
                 }
                 match &self.editor {
                     Some(editor) => {
@@ -1565,7 +2290,7 @@ mod tests {
     #[test]
     fn 表格分段_基本两列表() {
         let src = "前文\n\n| 文件 | 职责 |\n|---|---|\n| `a.rs` | 说明 A |\n| b.rs | 说明 B |\n\n后文";
-        let segs = split_md_tables(src);
+        let segs = split_md_blocks(src);
         assert_eq!(segs.len(), 3);
         assert!(matches!(&segs[0], MdSegment::Text(t) if t.contains("前文")));
         let MdSegment::Table(t) = &segs[1] else {
@@ -1580,7 +2305,7 @@ mod tests {
     #[test]
     fn 表格分段_围栏代码块里的竖线不算表格() {
         let src = "```\n| a | b |\n|---|---|\n```\n正文";
-        let segs = split_md_tables(src);
+        let segs = split_md_blocks(src);
         assert_eq!(segs.len(), 1, "围栏内的表格样式行不拆:{segs:?}");
     }
 
@@ -1588,7 +2313,7 @@ mod tests {
     fn 表格分段_对齐与码段竖线() {
         // 分隔行的 :---: 语法
         let src = "| a | b | c |\n| :--- | :---: | ---: |\n| 1 | 2 | 3 |";
-        let MdSegment::Table(t) = &split_md_tables(src)[0] else {
+        let MdSegment::Table(t) = &split_md_blocks(src)[0] else {
             panic!()
         };
         assert_eq!(t.aligns, vec![MdAlign::Left, MdAlign::Center, MdAlign::Right]);
@@ -1598,7 +2323,7 @@ mod tests {
 
         // 短行按表头列数补空
         let src = "| a | b |\n|---|---|\n| 仅一格 |";
-        let MdSegment::Table(t) = &split_md_tables(src)[0] else {
+        let MdSegment::Table(t) = &split_md_blocks(src)[0] else {
             panic!()
         };
         assert_eq!(t.rows[0], vec!["仅一格", ""]);
@@ -1607,7 +2332,7 @@ mod tests {
     #[test]
     fn 分段_空行拆块_围栏内空行不拆_块距节奏() {
         // 空行是块边界:三段文本 + 一个标题 = 四块
-        let segs = split_md_tables("段落一\n\n段落二\n\n### 标题\n\n段落三");
+        let segs = split_md_blocks("段落一\n\n段落二\n\n### 标题\n\n段落三");
         assert_eq!(segs.len(), 4, "{segs:?}");
         // 块距:首块 0、普通块 11、标题块 20(原版 margin-top 1.4em 的近似)
         assert_eq!(block_top_margin(0, &segs[0]), 0.0);
@@ -1615,7 +2340,7 @@ mod tests {
         assert_eq!(block_top_margin(2, &segs[2]), 20.0);
 
         // 围栏代码块里的空行不拆块
-        let segs = split_md_tables("```\naaa\n\nbbb\n```");
+        let segs = split_md_blocks("```\naaa\n\nbbb\n```");
         assert_eq!(segs.len(), 1, "{segs:?}");
 
         // `#` 后没空格不算标题;表格块 13(原版 table margin 1em)
@@ -1655,6 +2380,158 @@ mod tests {
         };
         let w2 = column_weights(&t2);
         assert!((w2[0] - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn 图片行_认得四种常见写法() {
+        // 单张
+        let imgs = parse_image_line("![主界面](docs/screenshots/main.png)").unwrap();
+        assert_eq!(imgs.len(), 1);
+        assert_eq!(imgs[0].url, "docs/screenshots/main.png");
+        assert_eq!(imgs[0].alt, "主界面");
+        assert!(imgs[0].link.is_none());
+
+        // 带 title
+        let imgs = parse_image_line(r#"  ![图](a.png "标题")  "#).unwrap();
+        assert_eq!(imgs[0].url, "a.png");
+        assert_eq!(imgs[0].title.as_deref(), Some("标题"));
+
+        // 链接包裹(徽章)
+        let imgs = parse_image_line("[![CI](https://img.shields.io/x.svg)](https://ci.example)")
+            .unwrap();
+        assert_eq!(imgs[0].url, "https://img.shields.io/x.svg");
+        assert_eq!(imgs[0].link.as_deref(), Some("https://ci.example"));
+
+        // 一行并排两张
+        let imgs = parse_image_line("![a](1.png) ![b](2.png)").unwrap();
+        assert_eq!(imgs.len(), 2);
+        assert_eq!(imgs[1].url, "2.png");
+
+        // 尖括号写法(路径里有空格)
+        let imgs = parse_image_line("![x](<my shots/a b.png>)").unwrap();
+        assert_eq!(imgs[0].url, "my shots/a b.png");
+    }
+
+    #[test]
+    fn 图片行_混了别的东西就整行放弃() {
+        // 前后有文字 → 交给 TextView(内联图片不自绘)
+        assert!(parse_image_line("看这张 ![a](1.png)").is_none());
+        assert!(parse_image_line("![a](1.png) 就是主界面").is_none());
+        // 列表项 / 引用块有前缀语法,拆出来会毁结构
+        assert!(parse_image_line("- ![a](1.png)").is_none());
+        assert!(parse_image_line("> ![a](1.png)").is_none());
+        // 四空格缩进是代码块
+        assert!(parse_image_line("    ![a](1.png)").is_none());
+        // 空目标 / 只是链接不是图片
+        assert!(parse_image_line("![a]()").is_none());
+        assert!(parse_image_line("[文档](a.md)").is_none());
+        assert!(parse_image_line("").is_none());
+    }
+
+    #[test]
+    fn 图片行_从文本块里拆出来自绘() {
+        let src = "# 标题\n\n上面一句说明\n![主界面](docs/main.png)\n下面一句\n\n结尾";
+        let segs = split_md_blocks(src);
+        // 标题 / 说明 / 图片 / 下面一句 / 结尾
+        assert_eq!(segs.len(), 5, "{segs:?}");
+        let MdSegment::Images(imgs) = &segs[2] else {
+            panic!("第三段应是图片:{segs:?}");
+        };
+        assert_eq!(imgs[0].url, "docs/main.png");
+        assert!(matches!(&segs[1], MdSegment::Text(t) if t == "上面一句说明"));
+        assert!(matches!(&segs[3], MdSegment::Text(t) if t == "下面一句"));
+
+        // 围栏代码块里的图片语法是代码,不拆
+        let segs = split_md_blocks("```md\n![a](1.png)\n```");
+        assert_eq!(segs.len(), 1, "{segs:?}");
+        assert!(matches!(&segs[0], MdSegment::Text(_)));
+    }
+
+    #[test]
+    fn 图片目标_相对路径按当前文件目录解析() {
+        let base = Path::new("D:\\Git\\mini-term");
+        // 相对路径 → 落到当前文件所在目录(原版 convertFileSrc(fileDir + '/' + src))
+        assert_eq!(
+            resolve_image_src("docs/a.png", base),
+            MdImageSrc::Local(base.join("docs/a.png"))
+        );
+        // %20 还原
+        assert_eq!(
+            resolve_image_src("my%20shots/a.png", base),
+            MdImageSrc::Local(base.join("my shots/a.png"))
+        );
+        // 绝对路径原样(Windows 盘符不能被当成 scheme)
+        assert_eq!(
+            resolve_image_src("D:/shots/a.png", base),
+            MdImageSrc::Local(PathBuf::from("D:/shots/a.png"))
+        );
+        // file:// 三斜杠
+        assert_eq!(
+            resolve_image_src("file:///D:/shots/a.png", base),
+            MdImageSrc::Local(PathBuf::from("D:/shots/a.png"))
+        );
+        // 远程与不认识的 scheme
+        assert_eq!(
+            resolve_image_src("https://x.dev/a.png", base),
+            MdImageSrc::Remote("https://x.dev/a.png".into())
+        );
+        assert_eq!(
+            resolve_image_src("data:image/png;base64,AAA", base),
+            MdImageSrc::Unsupported
+        );
+        assert_eq!(resolve_image_src("  ", base), MdImageSrc::Unsupported);
+    }
+
+    #[test]
+    fn md_内联图片的本地路径改写成_file_url() {
+        let base = Path::new("D:\\Git\\mini-term\\docs");
+        // 列表项里的内联图片(块级图片行走自绘,不经过这条)
+        let out = rewrite_md_image_urls("- ![图](shots/a.png) 说明", base);
+        assert!(
+            out.starts_with("- ![图](file:///D:/Git/mini-term/docs/shots/a.png)"),
+            "{out}"
+        );
+        // title 保留
+        let out = rewrite_md_image_urls(r#"![图](a.png "标题")"#, base);
+        assert!(out.contains(r#""标题""#), "{out}");
+        // 远程与 data: 原样
+        let remote = "![x](https://x.dev/a.png)";
+        assert_eq!(rewrite_md_image_urls(remote, base), remote);
+        let data = "![x](data:image/png;base64,AAA)";
+        assert_eq!(rewrite_md_image_urls(data, base), data);
+        // 围栏代码块 / 行内 code 里的图片语法是代码,不许动
+        let fenced = "```md\n![a](b.png)\n```";
+        assert_eq!(rewrite_md_image_urls(fenced, base), fenced);
+        let inline_code = "写法是 `![a](b.png)` 这样";
+        assert_eq!(rewrite_md_image_urls(inline_code, base), inline_code);
+    }
+
+    #[test]
+    fn html_的本地资源改写成_file_url() {
+        let base = Path::new("D:\\site");
+        let out = rewrite_html_urls(r#"<img src="img/a.png" alt="a">"#, base);
+        assert_eq!(out, r#"<img src="file:///D:/site/img/a.png" alt="a">"#);
+        // 单引号 / 大写属性名 / 等号旁的空白都认
+        let out = rewrite_html_urls("<img SRC = 'a.png'>", base);
+        assert_eq!(out, "<img SRC = 'file:///D:/site/a.png'>");
+        // href / poster 同样处理
+        let out = rewrite_html_urls(r#"<video poster="p.jpg"></video>"#, base);
+        assert!(out.contains("file:///D:/site/p.jpg"), "{out}");
+
+        // 排除清单(原版正则那一串)一律原样
+        for keep in [
+            r#"<a href="https://x.dev">x</a>"#,
+            r#"<img src="data:image/png;base64,AAA">"#,
+            r#"<a href="#anchor">锚</a>"#,
+            r#"<a href="mailto:a@b.c">mail</a>"#,
+            r#"<a href="javascript:void(0)">js</a>"#,
+            r#"<img src="file:///D:/site/a.png">"#,
+        ] {
+            assert_eq!(rewrite_html_urls(keep, base), keep, "不该改:{keep}");
+        }
+        // `data-src` 不是 src
+        let keep = r#"<img data-src="a.png">"#;
+        assert_eq!(rewrite_html_urls(keep, base), keep);
     }
 
     #[test]
