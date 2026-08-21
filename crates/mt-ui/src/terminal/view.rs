@@ -31,6 +31,14 @@
 //! 判据只有一个:[`is_text_input_key`]。它与 `parse_char_message` 的过滤规则对齐,
 //! 两边加起来不重不漏。
 //!
+//! ⚠️ **上面这张图的前提是 `KeyDown` 真能走到这里**。gpui 的按键派发是
+//! 「先匹配 keymap 里的 action 绑定,匹配上就 dispatch 并结束,匹配不上才跑
+//! `on_key_down`」——所以任何绑到本 `key_context`(`Terminal`)或其祖先 context
+//! 上的裸键位,终端一个字节都收不到。组件库 `gpui_component::Root` 就在
+//! `Root` context 上绑了裸 `tab` / `shift-tab`(焦点导航),宿主必须用
+//! `NoAction` 在 `Terminal` context 上压掉,见 `mt-app::hotkeys::bind_keys`。
+//! 症状是「按 Tab 没反应,而且焦点被挪走、要重新点终端才能打字」。
+//!
 //! # 组合期间不会漏键
 //!
 //! 平台在派发 `KeyDown` 之前会先问 `marked_text_range()`,非 `None` 就把这次按键

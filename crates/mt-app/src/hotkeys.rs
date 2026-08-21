@@ -26,7 +26,7 @@
 //!    表里只为设置页展示」,GPUI 侧同样如此 —— 由 `mt_ui::TerminalView::on_key_down`
 //!    自己吃掉,这里 `keystroke = None`,**不绑 action**(绑了就轮不到终端)。
 
-use gpui::{App, KeyBinding};
+use gpui::{App, KeyBinding, NoAction};
 
 use crate::{
     ClosePane, FocusDown, FocusLeft, FocusRight, FocusUp, GlobalSearch, JumpAttention, MarkerNext,
@@ -37,6 +37,9 @@ use crate::{
 
 /// 应用级动作的 key context(与 `Workspace::render` 的 `key_context` 一致)。
 const WORKSPACE: &str = "Workspace";
+
+/// 终端本体的 key context(与 `mt_ui::TerminalView::render` 的 `key_context` 一致)。
+const TERMINAL: &str = "Terminal";
 
 /// 快捷键作用域。决定按键在什么情况下被拦截 —— 与 `hotkeys.ts::HotkeyScope` 同义。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -430,6 +433,23 @@ pub fn bind_keys(cx: &mut App) {
         Some("GitChanges > Input"),
     ));
 
+    // 终端里的裸 Tab / Shift+Tab 必须归终端(shell 补全、Claude 的 Tab 切模式全靠它)。
+    //
+    // 组件库的 `Root` 在 `root::init` 里把这两个键绑成了 `focus_next` / `focus_prev`,
+    // 而按上面那条铁律「先匹配 action 绑定、后跑 key 监听」—— 于是在终端里按 Tab
+    // 只会把焦点挪到下一个可聚焦元素,`TerminalView::on_key_down` 一个字节都收不到,
+    // 表现就是「Tab 没反应,而且之后要重新点一下终端才能继续打字」。
+    //
+    // 解法是在**更深**的 `Terminal` context 上用 `NoAction` 把它们压掉:
+    // `Keymap::bindings_for_input` 先按 context 深度排序,遇到 `NoAction` 直接 break,
+    // 更浅的 `Root` 那两条不再参与,这次按键退回 key 监听路径,由终端自己翻成
+    // `\t` / `ESC [ Z`。深度优先的用法与上面 `ProjectSwitcher > Input` 同源。
+    //
+    // **不进快捷键表**:它不是一条「应用快捷键」,而是解除组件库对终端的抢键,
+    // 设置页列出来只会让人以为 Tab 是个可改键位的功能。
+    bindings.push(KeyBinding::new("tab", NoAction, Some(TERMINAL)));
+    bindings.push(KeyBinding::new("shift-tab", NoAction, Some(TERMINAL)));
+
     cx.bind_keys(bindings);
 }
 
@@ -545,6 +565,48 @@ mod tests {
         assert_eq!(groups[0].1[0].id, "newTerminal");
         assert_eq!(groups[3].1.len(), 2, "AI 任务标记组两条");
         assert_eq!(groups[4].1.len(), 2, "剪贴板组两条");
+    }
+
+    // 组件库 `Root` 那两条绑定的替身:它的 action 类型(`gpui_component::root::Tab`)
+    // 没有 pub 出来,这里只需要「同一个键位、更浅的 context、某个会被消费的 action」。
+    gpui::actions!(root_stub, [RootTab, RootTabPrev]);
+
+    /// 终端里的 Tab / Shift+Tab 必须**匹配不出任何 action** —— 只有一条 binding 都
+    /// 没匹配上,gpui 才会走到 `finish_dispatch_key_event`,按键才到得了
+    /// `TerminalView::on_key_down` 翻成 `\t` / `ESC [ Z`。
+    ///
+    /// 复刻的是真实注册顺序:`gpui_component::init` 先绑 `Root` 的 tab/shift-tab
+    /// (`focus_next` / `focus_prev`),`bind_keys` 后绑我们的 `NoAction`。
+    #[test]
+    fn 终端里的_tab_压得过组件库的焦点导航() {
+        use gpui::{KeyContext, Keymap, Keystroke};
+
+        let mut keymap = Keymap::new(vec![
+            KeyBinding::new("tab", RootTab, Some("Root")),
+            KeyBinding::new("shift-tab", RootTabPrev, Some("Root")),
+        ]);
+        keymap.add_bindings([
+            KeyBinding::new("tab", NoAction, Some(TERMINAL)),
+            KeyBinding::new("shift-tab", NoAction, Some(TERMINAL)),
+        ]);
+
+        // 焦点在终端上时的 context 栈(外层 Root → 终端本体)
+        let in_terminal = [
+            KeyContext::parse("Root").unwrap(),
+            KeyContext::parse(TERMINAL).unwrap(),
+        ];
+        for ks in ["tab", "shift-tab"] {
+            let (bindings, pending) =
+                keymap.bindings_for_input(&[Keystroke::parse(ks).unwrap()], &in_terminal);
+            assert!(bindings.is_empty(), "{ks} 在终端里不该匹配到 action");
+            assert!(!pending, "{ks} 不该挂起等后续按键");
+        }
+
+        // 反面:终端之外(文件树 / 面板)照旧是组件库的焦点导航,别把 Tab 一并废掉
+        let outside = [KeyContext::parse("Root").unwrap()];
+        let (bindings, _) =
+            keymap.bindings_for_input(&[Keystroke::parse("tab").unwrap()], &outside);
+        assert_eq!(bindings.len(), 1, "终端之外 Tab 仍该是焦点导航");
     }
 
     /// id 不重复 —— 设置页拿 id 当行 key。
