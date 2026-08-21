@@ -28,8 +28,8 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use gpui::{
-    App, AppContext, ClickEvent, Focusable as _, IntoElement, ParentElement, SharedString, Styled,
-    Window, div, px,
+    App, AppContext, ClickEvent, Focusable as _, InteractiveElement, IntoElement, ParentElement,
+    SharedString, StatefulInteractiveElement, Styled, Window, div, px,
 };
 use gpui_component::WindowExt as _;
 use gpui_component::dialog::{Dialog, DialogButtonProps};
@@ -55,11 +55,14 @@ where
         return;
     }
     window.open_dialog(cx, move |dialog, window, cx| {
-        // on_close 放在最后 —— 它会覆盖 build 里设过的同名回调,而这一条
-        // (摘掉种类标记)漏了就再也开不出同种类的弹窗了
-        build(dialog, window, cx).on_close(move |_: &ClickEvent, _window, _cx| {
-            overlay::pop(overlay::key(kind));
-        })
+        // on_close 与 close_button 都放在最后 —— 它们会覆盖 build 里设过的同名
+        // 设置:on_close 漏了(摘不掉种类标记)就再也开不出同种类的弹窗;
+        // close_button 见 [`dialog_title`] 的注释,画出来是**空白但仍可点**的一块。
+        build(dialog, window, cx)
+            .close_button(false)
+            .on_close(move |_: &ClickEvent, _window, _cx| {
+                overlay::pop(overlay::key(kind));
+            })
     });
 }
 
@@ -74,6 +77,52 @@ pub fn close_guarded(kind: &'static str, window: &mut Window, cx: &mut App) -> b
     overlay::pop(overlay::key(kind));
     window.close_dialog(cx);
     true
+}
+
+// ─── 标题行 ───────────────────────────────────────────────────
+
+/// 弹窗标题行:标题 + 右上角**自绘**的 ✕。
+///
+/// **为什么不用 `Dialog::close_button`**:它画的是 `IconName::Close` → `svg()`
+/// → `AssetSource`,而本仓没注册任何 asset source(判据见
+/// `mt_ui::icons::vector` 模块注释),渲染出来是**空白但仍可点**的一块 ——
+/// 用户点得到、看不见。[`open_guarded`] 因此统一把它关掉,需要 ✕ 的弹窗
+/// 改用本函数。
+///
+/// 给**没有底部按钮**的弹窗用(移动端中转、worktree 这类):它们唯一的出口就是
+/// 右上角(Esc 也行,但那是看不见的知识)。带「取消」的确认框不必用 —— 底部
+/// 那颗就是出口。
+///
+/// 关窗走 [`close_guarded`](自己摘覆盖物栈的登记),与三个 SSH 弹窗的
+/// `panel_header` 同一条路。
+pub fn dialog_title(kind: &'static str, title: impl Into<SharedString>) -> impl IntoElement {
+    let title = title.into();
+    div()
+        .w_full()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(12.0))
+        .child(div().flex_1().truncate().child(title))
+        .child(
+            div()
+                .id(SharedString::from(format!("{kind}-close")))
+                .flex_none()
+                .w(px(20.0))
+                .h(px(20.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(4.0))
+                .text_size(ui::font_px(12.0))
+                .text_color(ui::text_muted())
+                .cursor_pointer()
+                .hover(|el| el.text_color(ui::text_primary()).bg(ui::bg_overlay()))
+                .child("✕")
+                .on_click(move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                    close_guarded(kind, window, cx);
+                }),
+        )
 }
 
 /// 这种弹窗现在开着吗。给「开之前要先做点别的」的调用方提前判一次用

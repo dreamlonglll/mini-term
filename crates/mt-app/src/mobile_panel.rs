@@ -34,7 +34,7 @@ use crate::mobile_relay::{
     self, QR_CANVAS_PX, QR_QUIET_MODULES, QrMatrix, RelayBridge, command_warning,
     launcher_draft_valid, launcher_subtitle, upsert_launcher,
 };
-use crate::prompt::{Confirm, kind, open_guarded};
+use crate::prompt::{Confirm, dialog_title, kind, open_guarded};
 use crate::store::AppStore;
 use crate::ui;
 
@@ -180,7 +180,9 @@ pub fn open(window: &mut Window, cx: &mut App) {
             cx,
         );
         dialog
-            .title(t("mobileRelay", "modal.title"))
+            // 面板没有底部按钮,右上角这颗 ✕ 是唯一看得见的出口 —— 必须自绘,
+            // `Dialog::close_button` 画的是空白(见 `prompt::dialog_title`)
+            .title(dialog_title(kind::MOBILE_RELAY, t("mobileRelay", "modal.title")))
             .w(ui::clamp_dialog_width(px(PANEL_W), viewport))
             // 面板内有未保存的地址/密钥输入与配对操作,误点外侧关闭会丢内容;
             // Esc 仍可退(原版 `closeOnOverlay={false}`)

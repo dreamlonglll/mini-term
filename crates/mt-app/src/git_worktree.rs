@@ -39,7 +39,7 @@ use mt_project::git::{BranchInfo, WorktreeInfo};
 
 use crate::i18n::{t, tr};
 use crate::menu::{self, MenuItem};
-use crate::prompt::{kind, open_guarded};
+use crate::prompt::{dialog_title, kind, open_guarded};
 use crate::store::AppStore;
 use crate::ui;
 
@@ -288,7 +288,11 @@ pub fn open(
     open_guarded(kind::GIT_WORKTREE, window, cx, move |dialog, window, cx| {
         let body = render_body(&state, window, cx);
         dialog
-            .title(tr!("worktree", "title", name = root_name.clone()))
+            // 无底部按钮,右上角 ✕ 是唯一看得见的出口(见 `prompt::dialog_title`)
+            .title(dialog_title(
+                kind::GIT_WORKTREE,
+                tr!("worktree", "title", name = root_name.clone()),
+            ))
             .w(px(600.0))
             .child(div().px(px(16.0)).child(body))
     });
