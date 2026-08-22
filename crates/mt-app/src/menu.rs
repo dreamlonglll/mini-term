@@ -53,6 +53,12 @@
 //! `scrollbar.*` 三个 token 同步成本仓那套(`mt_ui::theme_bridge`),不会像模块
 //! 开头列的第 3 条硬伤那样与面板脱节。
 //!
+//! ⚠️ **滚动条只给「调用方封了高」的根面板**(判据见 [`wants_scrollbar`]),不是
+//! 给所有可滚层。「可滚」的判据宽得很 —— 只要这一层没有子菜单父项就算,右键菜单
+//! 几乎全中(文件树那几个就是),它们套上壳之后右侧会多出一条轨道/让位边,而它们
+//! 本来短得根本滚不动。下拉式菜单(封了高的那种)才是真会溢出、真需要一条能拖的
+//! 轨道的那一类。
+//!
 //! 已知缺口:滚动位置不进视图状态,所以 ↑↓ 选到视口外的条目时不会自动滚过去
 //! (鼠标滚轮与拖滚动条正常)。
 //!
@@ -294,7 +300,10 @@ struct OpenMenu {
 #[derive(Default)]
 pub struct ContextMenu {
     open: Option<OpenMenu>,
-    /// 每个可滚层的滚动句柄(滚动条要拿它算 thumb)。键是层路径,与 [`panel_id`]
+    /// 每个**配了滚动条**的层的滚动句柄(滚动条要拿它算 thumb)。配不配见
+    /// [`wants_scrollbar`] —— 右键菜单不配,那些层这里根本不留条目。
+    ///
+    /// 键是层路径,与 [`panel_id`]
     /// 同一套编码。**换菜单即清空** —— 留着会把上一个菜单滚到一半的位置带进
     /// 新菜单(路径相同的层就会撞上)。
     ///
@@ -534,6 +543,25 @@ fn effective_max_height(
         _ => cap,
     }
 }
+
+/// 这一层配不配滚动条。
+///
+/// 判据与 [`effective_max_height`] 同源:**调用方主动封了高的根面板**才配 ——
+/// 那是下拉式菜单(用量面板的项目 scope)的形状,长到必须滚,得给一条能拖的轨道。
+///
+/// 反过来,「可滚」([`is_scrollable`])这个判据宽得多:只要这一层没有子菜单父项
+/// 就成立,于是几乎所有右键菜单都中招。给它们套上滚动条壳,换来的只有右侧一条
+/// 轨道/让位边 —— 它们十来项、离视口封顶差得远,压根滚不动。
+fn wants_scrollbar(requested: Option<Pixels>, is_root: bool) -> bool {
+    requested.is_some() && is_root
+}
+
+/// 溢出多少才算「真溢出」(值来自上一帧的 `ScrollHandle::max_offset`)。
+///
+/// 不取 0:内容高与容器高是 taffy 分两路算出来的(容器走 `size`,内容走子元素
+/// bounds 的并集),整行高度带小数时两边的取整可能差出零点几像素 —— 按 0 判就会
+/// 给一个根本滚不动的菜单挂上一条永远在的轨道。
+const SCROLLBAR_EPSILON: Pixels = px(1.0);
 
 /// 滚动容器的元素 id(逐层稳定,与 [`entry_id`] 同一套路径编码)。
 fn panel_id(ancestors: &[usize]) -> SharedString {
@@ -848,45 +876,50 @@ impl ContextMenu {
         }
 
         // 叶子层封顶 + 滚轮可滚(判据见 `is_scrollable`)。项目数上不封顶的那几个
-        // 菜单(用量面板的项目 scope、SSH 连接、分支列表)全走这一支。
+        // 菜单(用量面板的项目 scope、SSH 连接、分支列表)全走这一支。**能滚 ≠ 配
+        // 滚动条**,后者另有一道更窄的判据(见 `wants_scrollbar`)。
         let list = if is_scrollable(entries) {
             let requested = self.open.as_ref().and_then(|o| o.options.max_height);
+            let is_root = ancestors.is_empty();
+            let max_h = effective_max_height(window.viewport_size().height, requested, is_root);
+            let list = list.id(panel_id(&ancestors)).max_h(max_h);
+            // 滚动条只给下拉式菜单(判据见 `wants_scrollbar`)。右键菜单走这一支,
+            // 与加滚动条之前逐字一致 —— 封高 + 滚轮,不套壳、不留边。
+            if !wants_scrollbar(requested, is_root) {
+                return panel.child(list.overflow_y_scroll()).into_any_element();
+            }
             let handle = self.scroll_handle(&ancestors);
-            // 真溢出了才给滚动条让位:`max_offset` 是**上一帧**量的,与滚动条
-            // 自己「不溢出就不画」的判据同源,所以两者同帧一致(首帧双双为零,
-            // 菜单进场动画会驱动下一帧补上)。不判就等于短菜单也白留一条边。
-            let overflowing = handle.max_offset().height > px(0.0);
+            // 真溢出了才画滚动条、才给它让位:`max_offset` 是**上一帧**量的
+            // (首帧为零,菜单进场动画会驱动下一帧补上)。阈值不取 0 的理由见
+            // `SCROLLBAR_EPSILON`;`Scrollbar` 自己那道「不溢出就不画」比这道
+            // 松,所以由这道说了算 —— 不满足时它压根不进元素树。
+            let overflowing = handle.max_offset().height > SCROLLBAR_EPSILON;
             let list = list
-                .id(panel_id(&ancestors))
                 .track_scroll(&handle)
-                .max_h(effective_max_height(
-                    window.viewport_size().height,
-                    requested,
-                    ancestors.is_empty(),
-                ))
                 .when(overflowing, |el| el.pr(SCROLLBAR_GUTTER))
                 .overflow_y_scroll();
             // 滚动条要**自己再套一层 `absolute` + 四边贴 0** 的壳(与
             // `gpui_component::scroll::scrollable` 的包法一致)。`Scrollbar`
             // 元素自身虽是 absolute,却不带 inset —— 只给尺寸不给位置,taffy
             // 就按「静态位置」把它摆在列表**下方**,滚动条会掉到菜单外面去。
-            // 内容不溢出时它自己不画(`scroll_area_size <= container_size` 那一支)。
             div()
                 .relative()
                 .child(list)
-                .child(
-                    div()
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .right_0()
-                        .bottom_0()
-                        .child(
-                            Scrollbar::vertical(&handle)
-                                .id(scrollbar_id(&ancestors))
-                                .scrollbar_show(ScrollbarShow::Always),
-                        ),
-                )
+                .when(overflowing, |el| {
+                    el.child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .right_0()
+                            .bottom_0()
+                            .child(
+                                Scrollbar::vertical(&handle)
+                                    .id(scrollbar_id(&ancestors))
+                                    .scrollbar_show(ScrollbarShow::Always),
+                            ),
+                    )
+                })
                 .into_any_element()
         } else {
             list.into_any_element()
@@ -1313,6 +1346,16 @@ mod tests {
         // 子面板 / 没给上限:照旧只受视口约束
         assert_eq!(effective_max_height(px(900.0), Some(px(280.0)), false), px(876.0));
         assert_eq!(effective_max_height(px(900.0), None, true), px(876.0));
+    }
+
+    /// 滚动条只跟着「调用方封了高」的根面板走 —— 右键菜单(走 `show`,不带上限)
+    /// 一律不配,否则它们右侧会白多一条轨道/让位边。
+    #[test]
+    fn 只有封了高的根面板才配滚动条() {
+        assert!(wants_scrollbar(Some(px(280.0)), true), "下拉:配");
+        assert!(!wants_scrollbar(None, true), "右键菜单的根面板:不配");
+        assert!(!wants_scrollbar(Some(px(280.0)), false), "下拉的子面板:不配");
+        assert!(!wants_scrollbar(None, false), "右键菜单的子面板:不配");
     }
 
     /// 滚动容器 id 逐层稳定、与条目 id 不撞。
