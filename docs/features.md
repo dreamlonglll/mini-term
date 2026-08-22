@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.0.3--beta-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.0.5--beta-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -107,6 +107,7 @@ Mini-Term solves all of the above with one lightweight desktop app.
 ### Usage Statistics
 
 - **Multi-dimensional panel** — The "Stats" button in the top bar opens a panel aggregating Claude Code / Codex / Grok cost, call count, and session count as KPI groups, with daily / hourly trend charts (custom-drawn rendering), model rankings, project rankings, and top sessions; agent / time-range / project filters are one click away, and the custom date range comes with a hand-drawn calendar picker (clamped to the past year).
+- **Panel interaction details** — The project filter dropdown pops out anchored to its trigger button and is capped to the viewport height, so it never overflows the screen no matter how many projects there are; anything beyond the cap gets a draggable scrollbar. The refresh button shows its tooltip after a 500ms hover. Scrollbars are reserved for dropdown-style menus like this one (the caller caps their height) — context menus never get one, since a dozen entries cannot scroll anyway and the bar would only add a stray track and gutter.
 - **rusqlite local ledger** — Local session JSONL files are parsed into a SQLite ledger; panel queries return in milliseconds while incremental sync catches up in the background, both on open and while the app stays resident (files are re-parsed only when their fingerprint changes). The ledger is positioned as "a cache regenerable from the raw records": corruption triggers an automatic rebuild, and there is no migration burden.
 - **Billing accuracy** — History duplicated by session forks is deduplicated by lineage and never double-billed; cache writes / reads are priced precisely at the official rate differentials (1h cache writes at 2× input price, 1h subsets pay only the difference); unknown models are estimated at the average of Claude's mainline tiers.
 - **Price table** — Fetched once a day from models.dev (a read-only GET of a public price list — **no usage data is ever uploaded**); on failure the local cache is used, and the panel never shows made-up numbers.
@@ -192,7 +193,7 @@ The whole application is **native Rust** (the earlier Tauri + React build was re
 | Git / files | git2 (libgit2) · notify + ignore |
 | Usage stats | rusqlite local ledger · hand-drawn trend charts |
 | Mobile relay | axum + tokio WebSocket (`relay-server/`) · React + Vite PWA (`mobile/`) |
-| Tests | **1,369 Rust tests** (26 test targets) + relay-server protocol boundary tests |
+| Tests | **1,514 Rust tests** (28 test targets) + relay-server protocol boundary tests |
 
 ## Getting Started
 
@@ -332,7 +333,7 @@ Issues and PRs are welcome. External contributions are merged after functional v
 Before submitting, please run:
 
 ```bash
-# Workspace-wide Rust tests (26 test targets, 1,369 cases)
+# Workspace-wide Rust tests (28 test targets, 1,514 cases)
 cargo test --workspace
 
 # Node-side tests (just 2 files: ConPTY bundling / vendored-openssl guard)

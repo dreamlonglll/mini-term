@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.0.3--beta-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.0.5--beta-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -107,6 +107,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 ### 使用统计
 
 - **多维聚合面板** — 顶栏「统计」打开：Claude Code / Codex / Grok 的成本、调用次数、会话数三组 KPI，按日 / 按小时趋势图（自绘渲染），模型排行、项目排行与 Top 会话；agent / 时间范围 / 项目过滤随手切换，自定义起止日期带日历选择器（自绘，范围钳在近一年内）
+- **面板交互细节** — 项目过滤下拉贴着触发按钮弹出并按视口封高，项目再多也顶不出屏幕，超出部分带一条可拖的滚动条；刷新按钮悬停 500ms 出提示。滚动条只给这类「调用方封了高」的下拉式菜单，右键菜单一律不配——它们十来项本就滚不动，套上只会白多一条轨道与让位边
 - **rusqlite 本地账本** — 本地会话 JSONL 解析进 SQLite 账本，面板查询毫秒级返回，打开与常驻期间后台增量同步（文件指纹变化才重解析）；账本定位为「可从原始记录再生的缓存」，损坏自动重建，无迁移负担
 - **计费准确性** — fork 复制的历史消息按血缘去重，不重复计费；缓存写 / 缓存读按官方价差精确计价（1h 缓存写 2× 输入价、1h 子集只补差价）；未知模型按 Claude 主力档均价估算
 - **价格表** — 每日从 models.dev 拉取一次公开价目（只读 GET，**不上传任何用量数据**），拉取失败回退本地缓存，面板绝不显示凭空编造的数字
@@ -192,7 +193,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 | Git / 文件 | git2（libgit2）· notify + ignore |
 | 用量统计 | rusqlite 本地账本 · 自绘趋势图 |
 | 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`） |
-| 测试 | **1369 个 Rust 测试**（26 个测试目标）+ 中转服务端协议边界测试 |
+| 测试 | **1514 个 Rust 测试**（28 个测试目标）+ 中转服务端协议边界测试 |
 
 ## 快速开始
 
@@ -332,7 +333,7 @@ Root（gpui-component 根，承载 Dialog / 通知层）
 提交代码前请运行：
 
 ```bash
-# 全工作区 Rust 测试（26 个测试目标、1369 例）
+# 全工作区 Rust 测试（28 个测试目标、1514 例）
 cargo test --workspace
 
 # Node 侧测试（仅 2 个文件：ConPTY 打包 / vendored-openssl 守卫）
