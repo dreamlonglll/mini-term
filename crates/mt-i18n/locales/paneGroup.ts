@@ -30,6 +30,7 @@ export const paneGroup = {
     reconnect: "点击重连",
     maximizePane: "最大化此区域（双击标签栏空白处）",
     restorePane: "还原分屏布局",
+    collapsedHint: "点击铺满此区域",
   },
   en: {
     closeAiTitle: "Close AI Session",
@@ -62,5 +63,6 @@ export const paneGroup = {
     reconnect: "Click to reconnect",
     maximizePane: "Maximize this pane (double-click empty tab bar area)",
     restorePane: "Restore split layout",
+    collapsedHint: "Click to maximize this pane",
   },
 } as const;

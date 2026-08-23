@@ -281,6 +281,30 @@ impl SplitNode {
         }
     }
 
+    /// 深度优先(左到右)收集所有叶子节点 —— 与 [`panes`] 同序,也就是与屏幕上
+    /// 从左上到右下的排列同序。
+    ///
+    /// 唯一消费方是最大化时的折叠标题条(`terminal_area`):被铺满的那一格之外
+    /// 的叶子按这个顺序码在底部,顺序稳定才不会因为一次重绘就跳位。
+    ///
+    /// [`panes`]: Self::panes
+    pub fn leaves(&self) -> Vec<&SplitNode> {
+        let mut out = Vec::new();
+        self.collect_leaves(&mut out);
+        out
+    }
+
+    fn collect_leaves<'a>(&'a self, out: &mut Vec<&'a SplitNode>) {
+        match self {
+            Self::Leaf { .. } => out.push(self),
+            Self::Split { children, .. } => {
+                for c in children {
+                    c.collect_leaves(out);
+                }
+            }
+        }
+    }
+
     pub fn pty_ids(&self) -> Vec<u32> {
         self.panes().iter().filter_map(|p| p.pty_id).collect()
     }
@@ -1171,6 +1195,31 @@ mod tests {
             SplitNode::Leaf { active_pane_id, .. } => active_pane_id.clone(),
             _ => panic!("不是叶子"),
         }
+    }
+
+    // ===== leaves =====
+
+    /// 折叠标题条按这个序码,所以顺序必须与 `panes()` 的深度优先序一致。
+    #[test]
+    fn 叶子收集与_panes_同序() {
+        let root = split_of(
+            SplitDirection::Horizontal,
+            vec![
+                leaf_of(&["a", "b"]),
+                split_of(
+                    SplitDirection::Vertical,
+                    vec![leaf_of(&["c"]), leaf_of(&["d", "e"])],
+                ),
+            ],
+        );
+        let leaves = root.leaves();
+        assert_eq!(leaves.len(), 3);
+        assert_eq!(
+            leaves.iter().map(|l| names(l)).collect::<Vec<_>>(),
+            vec![vec!["a", "b"], vec!["c"], vec!["d", "e"]]
+        );
+        // 单格布局:自己就是唯一的叶子(最大化在这种树上不成立,但不许 panic)
+        assert_eq!(leaf_of(&["a"]).leaves().len(), 1);
     }
 
     // ===== insert_split_at =====

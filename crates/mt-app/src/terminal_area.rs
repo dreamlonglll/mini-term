@@ -52,7 +52,7 @@ use crate::pane_actions;
 use crate::pane_preview;
 use crate::session_branch::{BranchMenuSegment, branch_menu_segment};
 use crate::store::AppStore;
-use crate::tree::{DropZone, SplitDirection, SplitNode};
+use crate::tree::{DropZone, PaneStatus, SplitDirection, SplitNode};
 use crate::ui;
 
 /// 终端区还没量出尺寸时的兜底(首帧)。比例照样对,只是绝对值不准。
@@ -149,6 +149,14 @@ fn marker_anchor_inset(has_maximize: bool) -> f32 {
         MARKER_ANCHOR_INSET
     }
 }
+
+/// tab 栏高度 —— 折叠标题条与它等高(折叠条就是「只剩标题栏的那一格」,
+/// 高度对不上会让最大化前后的视线落点跳一下)。
+const TAB_BAR_H: f32 = 26.0;
+
+/// 折叠标题条区最多吃掉终端区多高。叶子多到码不下时那一区自己滚,
+/// **绝不挤掉铺满的那一格** —— 最大化的本意就是给它腾地方。
+const COLLAPSED_ZONE_MAX: f32 = 0.4;
 
 // ─── 控件簇的描边图标(照抄 `PaneGroup.tsx:40-62` 的 SVG,viewBox 16 归一化;
 //     自绘理由见 `mt_ui::icons::vector` 模块注释,换算套路同 `activity_bar`)───
@@ -578,18 +586,25 @@ impl TerminalArea {
         let (pane_id, rect, fade) = self.tab_preview.clone()?;
         let fade = fade.drive(window);
         let store = self.store.read(cx);
+        // 卡上的名字与 tab 同口径,要项目 id 才查得到远程连接名
+        let project_id = store.active_project_id.clone().unwrap_or_default();
         let leaf = layout.leaf_of_pane(&pane_id);
-        let still_hidden = match leaf {
-            Some(SplitNode::Leaf { active_pane_id, .. }) => active_pane_id != &pane_id,
-            _ => false,
-        };
+        // 最大化时**折叠掉的那些组整组都不在屏幕上**,连它们的「激活 tab」也该给
+        // 预览 —— 展开态那条「只有非激活 tab 需要」的判据在这里不成立
+        let folded_away = store
+            .maximized_pane_id(&project_id)
+            .and_then(|id| layout.leaf_of_pane(id))
+            .is_some_and(|max_leaf| leaf.map(|l| l.id()) != Some(max_leaf.id()));
+        let still_hidden = folded_away
+            || match leaf {
+                Some(SplitNode::Leaf { active_pane_id, .. }) => active_pane_id != &pane_id,
+                _ => false,
+            };
         let Some(pane) = layout.pane(&pane_id).filter(|_| still_hidden) else {
             self.tab_preview = None;
             return None;
         };
         let auto_resume = store.config().ai_auto_resume.unwrap_or(true);
-        // 卡上的名字与 tab 同口径,要项目 id 才查得到远程连接名
-        let project_id = store.active_project_id.clone().unwrap_or_default();
         let info =
             pane_preview::snapshot_pane(pane, &project_id, 0, None, store, auto_resume, cx);
         let style = pane_preview::preview_style(store);
@@ -1024,6 +1039,289 @@ impl TerminalArea {
             .into_any_element()
     }
 
+    /// 最大化视图 = 铺满的那一格 + 其余叶子的折叠标题条(码在底部)。
+    ///
+    /// v0.14.0 的最大化是「整树其余 pane 直接不进元素树」,别的终端连状态灯都
+    /// 看不见 —— 另一格里的 AI 跑完了毫无提示,只能先还原再找。折叠条把
+    /// 「看得见 + 点得回去」补回来,代价只有每格 26px。
+    ///
+    /// **折叠条不按原方位摆**(左右分屏的那格也码到底部):26px 宽的竖条上放不下
+    /// 横排文字,只剩一颗状态灯的话还不如统一成整宽横条 —— 标题、品牌图标、
+    /// 未读标都能完整显示。原布局树一个字没动,还原后照旧。
+    fn render_maximized(
+        &mut self,
+        layout: &SplitNode,
+        leaf: &SplitNode,
+        project_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let body = self.render_leaf(leaf, project_id, window, cx);
+        let leaf_id = leaf.id().to_string();
+        let others: Vec<&SplitNode> = layout
+            .leaves()
+            .into_iter()
+            .filter(|l| l.id() != leaf_id)
+            .collect();
+        let bars: Vec<AnyElement> = others
+            .into_iter()
+            .map(|l| self.render_collapsed_leaf(l, project_id, cx))
+            .collect();
+        // 折叠区自己滚,铺满那格恒占剩下的全部(`min_h(0)` 是 flex 子项能收缩的
+        // 前提 —— 缺了它内容撑高时会把折叠区顶出可视区)
+        let zone_max = (self.area_size.height * COLLAPSED_ZONE_MAX).max(px(TAB_BAR_H));
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(div().flex_1().min_h(px(0.0)).child(body))
+            .child(
+                div()
+                    .id("collapsed-zone")
+                    .flex()
+                    .flex_col()
+                    .flex_none()
+                    .max_h(zone_max)
+                    .overflow_y_scroll()
+                    .children(bars),
+            )
+            .into_any_element()
+    }
+
+    /// 一条折叠标题条:该叶子的每个 tab 一颗状态灯 + 品牌图标 + 标题 + 未读标。
+    ///
+    /// 刻意**不画**新建 / 查找 / 分屏 / 关组那套控件簇 —— 折叠条是导航件不是
+    /// 工作区,按钮挤在 26px 里全是误点。关闭 / 重命名仍走 tab 右键菜单(与展开态
+    /// 同一个 [`tab_menu`]),悬停缩略图也照给。
+    fn render_collapsed_leaf(
+        &mut self,
+        node: &SplitNode,
+        project_id: &str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let SplitNode::Leaf {
+            id: leaf_id,
+            panes,
+            active_pane_id,
+        } = node
+        else {
+            return div().into_any_element();
+        };
+        let store = self.store.read(cx);
+        let Some(active_id) = panes
+            .iter()
+            .find(|p| &p.id == active_pane_id)
+            .or_else(|| panes.first())
+            .map(|p| p.id.clone())
+        else {
+            return div().into_any_element();
+        };
+        let auto_resume = store.config().ai_auto_resume.unwrap_or(true);
+        let pid = project_id.to_string();
+        let leaf = leaf_id.clone();
+        // 显示数据先摘成 owned:下面每个 tab 都要往 move 闭包里搬,借着 store 走不了
+        let tabs: Vec<(String, String, PaneStatus, Option<AiVendor>, bool)> = panes
+            .iter()
+            .map(|pane| {
+                // 品牌图标的取值口径与展开态 tab 逐字一致(见 render_leaf 的 vendors)
+                let vendor = pane
+                    .shows_ai_session(auto_resume)
+                    .then(|| pane.ai_agent())
+                    .flatten()
+                    .and_then(|agent| {
+                        AiVendor::from_session_type(agent)
+                            .or_else(|| AiVendor::infer(Some(agent), None))
+                    });
+                (
+                    pane.id.clone(),
+                    store.pane_display_label(&pid, pane),
+                    pane.status,
+                    vendor,
+                    store.is_pane_unread_done(&pane.id),
+                )
+            })
+            .collect();
+
+        // 焦点句柄与展开态共用 `tab_focus` 那张表(它按整棵树保留,见 render 里的
+        // retain):折叠 ↔ 展开来回切时 Tab 焦点不丢
+        for (pane_id, ..) in &tabs {
+            if !self.tab_focus.contains_key(pane_id) {
+                let handle = cx.focus_handle();
+                self.tab_focus.insert(pane_id.clone(), handle);
+            }
+        }
+
+        let mut bar = div()
+            .id(SharedString::from(format!("collapsed-{leaf}")))
+            .flex()
+            .items_center()
+            .flex_none()
+            .h(px(TAB_BAR_H))
+            .w_full()
+            .overflow_hidden()
+            .bg(ui::bg_elevated())
+            .border_t_1()
+            .border_color(ui::border_subtle())
+            .text_size(ui::font_px(12.0))
+            .cursor_pointer()
+            .hover(|el| el.bg(ui::bg_overlay()))
+            // 条上任意空白处点一下 = 这一组接管铺满(不必瞄准 tab)
+            .on_click(cx.listener({
+                let (pid, anchor) = (pid.clone(), active_id.clone());
+                move |this: &mut TerminalArea, _event: &ClickEvent, window, cx| {
+                    this.take_over_maximized(&pid, &anchor, window, cx);
+                }
+            }));
+
+        let this_area = cx.entity();
+        for (pane_id, label, status, vendor, unread) in tabs {
+            let is_active = pane_id == active_id;
+            let focus = self.tab_focus.get(&pane_id).cloned();
+            let (pid_click, pane_click) = (pid.clone(), pane_id.clone());
+            let (pid_key, pane_key) = (pid.clone(), pane_id.clone());
+            let (pid_menu, pane_menu, label_menu) =
+                (pid.clone(), pane_id.clone(), label.clone());
+            let pane_hover = pane_id.clone();
+            let pane_rect = pane_id.clone();
+            let this_rect = this_area.clone();
+            bar = bar.child(
+                div()
+                    .id(SharedString::from(format!("collapsed-tab-{pane_id}")))
+                    .relative()
+                    .flex()
+                    .items_center()
+                    .h_full()
+                    .gap(px(6.0))
+                    .px(px(10.0))
+                    .flex_none()
+                    .when_some(focus, |el, focus| el.track_focus(&focus).tab_index(0))
+                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                        if matches!(event.keystroke.key.as_str(), "enter" | "space") {
+                            cx.stop_propagation();
+                            this.take_over_maximized(&pid_key, &pane_key, window, cx);
+                        }
+                    }))
+                    // 悬停缩略图:折叠条上**每个** tab 都值得预览 —— 这一整组的画面
+                    // 一个都不在屏幕上(展开态是「只有非激活 tab 需要」,判据在
+                    // `render_tab_preview` 里按最大化态放宽)
+                    .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
+                        let mine = this.hovered_tab.as_deref() == Some(pane_hover.as_str());
+                        if *hovered {
+                            if mine {
+                                return;
+                            }
+                            this.hovered_tab = Some(pane_hover.clone());
+                            this.schedule_tab_preview(pane_hover.clone(), cx);
+                        } else {
+                            if !mine {
+                                return;
+                            }
+                            this.hovered_tab = None;
+                            this.close_tab_preview(cx);
+                        }
+                        cx.notify();
+                    }))
+                    // 缩略图的锚点(与展开态 tab 共用 `tab_rects`:两者互斥,
+                    // 同一个 pane 不会在一帧里既折叠又展开)。故意不 notify
+                    .child({
+                        canvas(
+                            move |bounds, _window, cx| {
+                                this_rect.update(cx, |area: &mut TerminalArea, _cx| {
+                                    area.tab_rects.insert(pane_rect.clone(), bounds);
+                                });
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .size_full()
+                    })
+                    .text_color(if is_active {
+                        ui::text_primary()
+                    } else {
+                        ui::text_muted()
+                    })
+                    .on_click(cx.listener(move |this, _event: &ClickEvent, window, cx| {
+                        cx.stop_propagation();
+                        this.take_over_maximized(&pid_click, &pane_click, window, cx);
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.close_tab_preview(cx);
+                            let entries =
+                                tab_menu(&this.store, &pid_menu, &pane_menu, &label_menu, cx);
+                            menu::show(event.position, entries, window, cx);
+                        }),
+                    )
+                    .child(ui::status_dot(
+                        SharedString::from(format!("collapsed-status-{pane_id}")),
+                        status,
+                    ))
+                    .when_some(vendor, |el, vendor| {
+                        el.child(BrandIcon::new(Some(vendor)).size(px(12.0)).color(
+                            if is_active {
+                                ui::text_primary()
+                            } else {
+                                ui::text_muted()
+                            },
+                        ))
+                    })
+                    .child(div().child(label))
+                    .when(unread, |el| {
+                        el.child(
+                            div()
+                                .w(px(5.0))
+                                .h(px(5.0))
+                                .rounded_full()
+                                .bg(ui::color_success()),
+                        )
+                    }),
+            );
+        }
+
+        // 右端那颗「点这里铺满」的提示图标。**不挂自己的点击** —— 整条都是热区,
+        // 它只是把可点性说出来,顺便当那句 tooltip 的锚点。
+        //
+        // tooltip 刻意**不挂在整条上**:挂上去的话鼠标停在 tab 上会与悬停缩略图
+        // 两个浮层一起弹(tooltip 认的是父元素的 hitbox,子元素挡不住)。
+        bar.child(
+            div()
+                .id(SharedString::from(format!("collapsed-hint-{leaf}")))
+                .ml_auto()
+                .flex()
+                .items_center()
+                .h_full()
+                .px(px(CTRL_CLUSTER_PAD))
+                .opacity(0.5)
+                .hover(|el| el.opacity(1.0))
+                .tooltip(|window, cx| Tooltip::new(t("paneGroup", "collapsedHint")).build(window, cx))
+                .child(VectorIcon::new(ICON_MAXIMIZE, px(CTRL_ICON)).ink(ui::text_muted())),
+        )
+        .into_any_element()
+    }
+
+    /// 折叠条的落点:这一组接管铺满,原先铺满的那组缩回折叠区。
+    ///
+    /// 顺序是**先换铺满再激活**:`activate_pane` 末尾会把焦点交给终端,那时候
+    /// 布局状态得已经是新的,否则焦点会落在这一帧还没画出来的那格上。
+    /// [`AppStore::toggle_maximized_leaf`] 在这里恒等于「设成最大化」——
+    /// 折叠条上的叶子按定义就不是当前铺满的那一个。
+    fn take_over_maximized(
+        &mut self,
+        project_id: &str,
+        pane_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_tab_preview(cx);
+        self.hovered_tab = None;
+        self.store.update(cx, |store, cx| {
+            store.toggle_maximized_leaf(project_id, pane_id, cx);
+            store.activate_pane(project_id, pane_id, window, cx);
+        });
+    }
+
     fn render_leaf(
         &mut self,
         node: &SplitNode,
@@ -1111,7 +1409,7 @@ impl TerminalArea {
             .flex()
             .items_center()
             .flex_none()
-            .h(px(26.0))
+            .h(px(TAB_BAR_H))
             .overflow_x_scroll()
             .bg(ui::bg_elevated())
             .border_b_1()
@@ -2363,7 +2661,9 @@ impl Render for TerminalArea {
                 );
         };
 
-        // 双击最大化(v0.14.0):只渲染目标叶子,整树其余 pane 不进元素树。
+        // 双击最大化(v0.14.0):只渲染目标叶子,整树其余 pane 的**终端主体**
+        // 不进元素树 —— 它们只留一条 26px 的折叠标题条码在底部
+        // (见 [`Self::render_maximized`];v0.14.0 时是整组消失,连状态灯都没有)。
         //
         // ⚠️ **终端实体不受影响** —— `TerminalPane` 按 `pty_id` 挂在
         // `AppStore::terminals` 表里(旧版 `terminalCache` 的等价物),这里只是
@@ -2384,6 +2684,8 @@ impl Render for TerminalArea {
         // **最大化时只留被铺满那一组的矩形**:方向导航挑的是「屏幕上相邻的格子」,
         // 藏起来的那些格子不该被挑中(原版 `findAdjacentPtyId` 查的是 DOM,
         // 卸载掉的 PaneGroup 天然查不到,这里把那条性质补回来)。
+        // 折叠标题条**只写 `tab_rects` 不写 `pane_rects`**,这条性质原样成立 ——
+        // 条上没有终端主体,方向导航跳过去也没有格子可落。
         let alive: std::collections::HashSet<String> = match &maximized_leaf {
             Some(leaf) => leaf.panes().into_iter().map(|p| p.id.clone()).collect(),
             None => layout.panes().into_iter().map(|p| p.id.clone()).collect(),
@@ -2391,7 +2693,8 @@ impl Render for TerminalArea {
         self.pane_rects.retain(|id, _| alive.contains(id));
         // tab 焦点句柄与 tab 矩形按**整棵树**回收(切项目/关 tab 之后那些行不在了)。
         // ⚠️ 句柄必须跨帧稳定,不能每帧重建 —— 那样 Tab 过去的焦点每帧都会丢;
-        // 最大化只是暂时不画,还原后立刻还要用,不跟着 `alive` 收窄。
+        // 折叠掉的组照样在画(标题条上那些 tab 要焦点、要缩略图锚点),
+        // 更不跟着 `alive` 收窄。
         let in_layout: std::collections::HashSet<String> =
             layout.panes().into_iter().map(|p| p.id.clone()).collect();
         self.tab_focus.retain(|id, _| in_layout.contains(id));
@@ -2400,7 +2703,7 @@ impl Render for TerminalArea {
         // 首帧只量不画:百分比要按真实可用尺寸换算,而 ResizablePanel 只认第一帧的
         // 初值(见模块注释)。量到之后主动 notify 一次,下一帧把分屏树铺上去。
         let content = self.measured.then(|| match &maximized_leaf {
-            Some(leaf) => self.render_leaf(leaf, &project_id, window, cx),
+            Some(leaf) => self.render_maximized(&layout, leaf, &project_id, window, cx),
             None => self.render_node(&layout, &project_id, self.area_size, window, cx),
         });
         // 浮层在分屏树**之后**组装:它要读 render_node 刚更新过的 pane 矩形,

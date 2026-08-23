@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 32;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 761;
+pub const ZH_ENTRY_COUNT: usize = 762;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 761;
+pub const EN_ENTRY_COUNT: usize = 762;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -549,6 +549,7 @@ static PANE_GROUP_ZH: &[(&str, &str)] = &[
     ("closeTabLabel", "关闭终端「{label}」"),
     ("closeTabMessage", "确定要关闭终端「{label}」吗？"),
     ("closeTerminalTitle", "关闭终端"),
+    ("collapsedHint", "点击铺满此区域"),
     ("forkNeedsIdentity", "分支会话（未获会话身份，需注册 Hook 事件）"),
     ("forkSession", "分支会话到新分屏"),
     ("markerTooltip", "AI 任务标记 ({mod}+Shift+↑/↓ 跳转)"),
@@ -580,6 +581,7 @@ static PANE_GROUP_EN: &[(&str, &str)] = &[
     ("closeTabLabel", "Close terminal \"{label}\""),
     ("closeTabMessage", "Close terminal \"{label}\"?"),
     ("closeTerminalTitle", "Close Terminal"),
+    ("collapsedHint", "Click to maximize this pane"),
     ("forkNeedsIdentity", "Fork session (no session identity — register hook events)"),
     ("forkSession", "Fork session to new split"),
     ("markerTooltip", "AI task markers ({mod}+Shift+↑/↓ to jump)"),

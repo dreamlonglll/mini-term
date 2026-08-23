@@ -327,6 +327,7 @@ const USED_KEYS: &[&str] = &[
     "paneGroup.closeTabAiMessage",
     "paneGroup.closeTabMessage",
     "paneGroup.closeTerminalTitle",
+    "paneGroup.collapsedHint",
     "paneGroup.forkNeedsIdentity",
     "paneGroup.forkSession",
     "paneGroup.markerTooltip",
