@@ -32,10 +32,10 @@
 use std::collections::HashMap;
 
 use gpui::{
-    AnyElement, App, AppContext, Bounds, ClickEvent, Context, Entity, FocusHandle,
-    InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, ParentElement,
-    Pixels, Render, SharedString, Size, StatefulInteractiveElement, Styled, Task, Window, anchored,
-    canvas, deferred, div, point, prelude::FluentBuilder, px,
+    Animation, AnimationExt as _, AnyElement, App, AppContext, Bounds, ClickEvent, Context, Entity,
+    FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
+    ParentElement, Pixels, Render, SharedString, Size, StatefulInteractiveElement, Styled, Task,
+    Window, anchored, canvas, deferred, div, point, prelude::FluentBuilder, px,
 };
 use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel, v_resizable};
 use mt_ui::tooltip::Tooltip;
@@ -60,6 +60,109 @@ const FALLBACK_AREA: Size<Pixels> = Size {
     width: px(1200.0),
     height: px(800.0),
 };
+
+// ─── 方向性换场(面板切换 / 最大化开合 / 叶内切 tab)────────────
+//
+// 形态是**整幅 push**(浏览器翻页那种):新内容按方向推入的同时,旧内容同向
+// 推出。方向跟随入口控件的排列轴 —— 叶内切 tab 走**左右**(tab 栏横排:往右边
+// 的 tab 切,新内容从右进、旧内容向左出);切面板走**上下**(右缘竖条纵排:
+// 往下面的面板切,新面板从下进、旧面板向上出);反向一律镜像。内容全程不透明,
+// 不用淡入(opacity 从 0 起播读作「闪一下」,用户明确否掉)。
+//
+// 机制分两半:
+// - **状态记录**([`TabSwap`] / [`AreaSwap`]):render 里对比上一帧的
+//   「谁在台上」,变了就记一条带方向与序号的过渡、起一只到点摘除的计时器。
+//   出场层只在记录在场时渲染 —— 没切换就零包装,也不会因为重挂而误播;
+// - **画法**:relative + overflow_hidden 的壳里放两个 absolute 全尺寸层
+//   (出场层画旧内容、进场层画新内容),各自补间 `left`(容器宽度的分数,
+//   [`push_enter_x`] / [`push_exit_x`]),`with_animation` 的 id 带序号。
+//
+// ⚠️ 三条红线:
+// 1. **零尺寸变化** —— margin/宽高类补间会让 pane 内容框逐帧变宽窄,
+//    `TerminalView` 一路 resize 到 PTY(SIGWINCH 刷屏);absolute 层只动
+//    `left`,尺寸从头到尾不变,PTY 一次 resize 都不会收到;
+// 2. **不过减弱动效的闸,始终播放** —— 与抽屉进出场/pane-enter 同一先例
+//    (原版 reduce 段显式豁免这一族换场动画),用户系统开着「减少动画」时
+//    这批动画是被点名要保留的;
+// 3. **同一个 pane 实体不许同帧双挂** —— 最大化开合的前后两个视图共享同一批
+//    pane,出场层只好省略(enter-only);切 tab / 切面板的新旧两侧 pane 天然
+//    互斥,才有资格上双层。
+
+/// 分屏进场的滑入偏移(新格子从右滑到位;它没有「旧内容」,不走 push)。
+const SWAP_SLIDE_PX: f32 = 14.0;
+/// 面板切换 / 最大化还原的整块换场时长。
+const AREA_SWAP_MS: u64 = 240;
+/// 叶内切 tab 的换场时长(比整块略快,切 tab 是高频操作)。
+const TAB_SWAP_MS: u64 = 200;
+
+/// 分屏进场滑入这一帧的偏移量。**纯函数**,单测钉在这上面:终点必须精确归零,
+/// 残留半像素会让终端内容永久错位半格。
+fn swap_slide_offset(delta: f32) -> f32 {
+    SWAP_SLIDE_PX * (1.0 - delta.clamp(0.0, 1.0))
+}
+
+/// push 进场层这一帧的横向位置(容器宽度的分数)。`dir = +1` 时从 `+1.0`
+/// (整幅在右侧屏外)推进到 `0.0`。**纯函数**,端点单测钉住。
+fn push_enter_x(dir: f32, delta: f32) -> f32 {
+    dir * (1.0 - delta.clamp(0.0, 1.0))
+}
+
+/// push 出场层这一帧的横向位置。`dir = +1` 时从 `0.0` 推出到 `-1.0`
+/// (整幅移出左侧)—— 与进场层首尾相接,像一条整带往左拉。
+fn push_exit_x(dir: f32, delta: f32) -> f32 {
+    -dir * delta.clamp(0.0, 1.0)
+}
+
+/// Reveal 裁剪窗的补间:`from → to` 的线性插值(进度已被 easing 处理过)。
+/// 端点必须精确到位 —— 起点差一像素是「从错的格子放大」,终点差一像素是
+/// 裁剪窗永远盖不满整幅。
+fn reveal_lerp(from: f32, to: f32, delta: f32) -> f32 {
+    let d = delta.clamp(0.0, 1.0);
+    from + (to - from) * d
+}
+
+/// 某个叶子在整树铺满 `(w, h)` 时占的矩形(相对终端区原点)。
+/// 与 [`TerminalArea::render_node`] 同一套比例换算([`split_fractions`]),
+/// 还原动画的目标矩形靠它 —— 还原那一帧整树还没画,`pane_rects` 里没有现成值。
+fn leaf_rect_in(
+    node: &SplitNode,
+    leaf_id: &str,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+) -> Option<RevealFrom> {
+    match node {
+        SplitNode::Leaf { id, .. } => (id == leaf_id).then_some(RevealFrom {
+            left: x,
+            top: y,
+            width: w,
+            height: h,
+        }),
+        SplitNode::Split {
+            direction,
+            children,
+            sizes,
+            ..
+        } => {
+            let fractions = split_fractions(sizes, children.len());
+            let mut off = 0.0f32;
+            for (i, child) in children.iter().enumerate() {
+                let f = fractions.get(i).copied().unwrap_or(0.0) as f32;
+                let found = if *direction == SplitDirection::Horizontal {
+                    leaf_rect_in(child, leaf_id, x + off * w, y, w * f, h)
+                } else {
+                    leaf_rect_in(child, leaf_id, x, y + off * h, w, h * f)
+                };
+                if found.is_some() {
+                    return found;
+                }
+                off += f;
+            }
+            None
+        }
+    }
+}
 
 pub struct TerminalArea {
     store: Entity<AppStore>,
@@ -121,6 +224,91 @@ pub struct TerminalArea {
     pane_drop: Option<(String, DropZone)>,
     /// tab 栏插入位:`(leaf_id, 插入下标, 指示线相对 tab 栏左缘的 x)`。
     tab_drop: Option<(String, usize, f32)>,
+
+    // ─── 方向性换场(push 过渡,见文件头「换场」注释)──────────────
+    /// 叶内切 tab 的换场记录(key = leaf id)。在场期间旧 pane 还要画
+    /// (出场层),计时到点摘除。
+    tab_swaps: HashMap<String, TabSwap>,
+    /// 整块(面板切换 / 最大化开合)的换场记录。
+    area_swap: Option<AreaSwap>,
+    /// 上一帧「每个叶子的激活 pane」—— 检测切 tab 用。**不按帧回收**
+    /// (与 `pane_enter` 同理:切面板再回来不该被误判成一次切换)。
+    last_leaf_active: HashMap<String, String>,
+    /// 上一帧的整块内容键:(项目, 面板, 最大化叶)。项目一换只记不播。
+    last_area_key: Option<(String, String, Option<String>)>,
+    /// 换场动画序号:同一处连续快速切换时,上一场动画的 id 必须让位。
+    swap_seq: u64,
+    /// 终端区在窗口里的原点(量尺 canvas 顺手记的)。`pane_rects` 是窗口坐标,
+    /// Reveal 的起点矩形要换算成相对终端区的坐标。
+    area_origin: gpui::Point<Pixels>,
+    /// RevealBack 在飞期间,整树里这个 pane 的格子只画底色不挂实体 ——
+    /// 实体在飞行层上,同帧双挂会撞元素 id。只在渲染进场内容时置位。
+    suppress_entity_pane: Option<String>,
+}
+
+/// 叶内切 tab 的一次 push 过渡。
+struct TabSwap {
+    seq: u64,
+    /// `+1.0` = 目标在右侧(新内容从右推入、旧内容向左推出);`-1.0` 反之。
+    dir: f32,
+    /// 出场层要画的旧 pane。
+    old_pane_id: String,
+    /// 到点摘除出场层(丢句柄即取消)。
+    _timer: Task<()>,
+}
+
+/// 整块内容(面板切换 / 最大化开合 / 折叠条换铺满组)的一次换场。
+struct AreaSwap {
+    seq: u64,
+    /// Push/Drift 的方向号(`+1` = 从下方推入 / 上浮落位)。Reveal 不用。
+    dir: f32,
+    motion: AreaMotion,
+    exit: AreaExitSrc,
+    _timer: Task<()>,
+}
+
+/// 换场的运动形态。
+#[derive(Clone, Copy)]
+enum AreaMotion {
+    /// 整幅竖直 push(切面板)。
+    Push,
+    /// 14px 竖直落位 —— 只剩兜底路径(算不出矩形时的最大化/还原)。
+    Drift,
+    /// 最大化:裁剪窗从原格子的矩形**展开**到整幅(`from` 为相对终端区
+    /// 原点的旧格矩形)。内容从第 0 帧就按最终全尺寸排版 —— 终端只在真正
+    /// 最大化那一下 resize 一次,展开过程零 PTY resize。
+    Reveal { from: RevealFrom },
+    /// 还原:[`Reveal`](Self::Reveal) 的反向 —— 裁剪窗从整幅**收回**到该格
+    /// 还原后的目标矩形(按分屏比例算,见 [`leaf_rect_in`])。飞行层里是旧铺满
+    /// 主体(拿 `exit` 的 MaxBody 画),底下的整树把该格挖成空洞
+    /// (`suppress_entity_pane`)—— 同一个终端实体不许同帧双挂。
+    ///
+    /// 最大化状态下**换铺满组刻意没有动画**:整块过渡在满屏尺度上一律读作
+    /// 闪烁(push / 淡化都试过,用户点名不要),瞬时切换即可。
+    RevealBack { to: RevealFrom },
+}
+
+/// Reveal 的起点矩形(相对终端区原点,px)。
+#[derive(Clone, Copy)]
+struct RevealFrom {
+    left: f32,
+    top: f32,
+    width: f32,
+    height: f32,
+}
+
+/// push 出场层画什么。
+#[derive(Clone)]
+enum AreaExitSrc {
+    /// 没有出场层(微滑;或旧内容已不可得)。
+    None,
+    /// 旧面板的整树(切面板)。
+    Panel(String),
+    /// 旧铺满叶的**终端主体**(折叠条上换铺满组)。只画主体不画 tab 栏/折叠条
+    /// —— 新旧两侧的 pane 实体天然互斥,但 tab 的焦点句柄两边都要挂,双挂
+    /// 只能砍出场层这边。`bar_count` 用来按旧折叠区同高占位:出场层里终端的
+    /// 尺寸必须与在台上时一字不差,差出一格就是一次多余的 PTY reflow。
+    MaxBody { pane_id: String, bar_count: usize },
 }
 
 /// 控件簇里 marker 按钮**右缘**到叶子右边缘的距离(最大化钮不在场时)。
@@ -318,13 +506,6 @@ fn split_fractions(sizes: &[f64], count: usize) -> Vec<f64> {
     sizes.iter().map(|s| s / total).collect()
 }
 
-/// 分屏进场这一帧的不透明度。**纯函数**,单测钉在这上面。
-///
-/// 只有淡入没有缩放,理由见 [`TerminalArea::wrap_pane_enter`]。
-fn pane_enter_opacity(progress: f32) -> f32 {
-    progress.clamp(0.0, 1.0)
-}
-
 /// 分隔条拖完后的像素 → 百分比(和为 100,与磁盘格式同口径)。
 ///
 /// 总和非正(面板还没量出来 / 全被折叠)时返回 `None`,调用方据此**不写回** ——
@@ -508,6 +689,13 @@ impl TerminalArea {
             pane_drag: None,
             pane_drop: None,
             tab_drop: None,
+            tab_swaps: HashMap::new(),
+            area_swap: None,
+            last_leaf_active: HashMap::new(),
+            last_area_key: None,
+            swap_seq: 0,
+            area_origin: gpui::Point::default(),
+            suppress_entity_pane: None,
         }
     }
 
@@ -992,9 +1180,12 @@ impl TerminalArea {
         }
     }
 
-    /// 叶子的进场动画(`styles.css` 的 `.pane-enter` /
-    /// `@keyframes paneEnter`:`opacity 0→1` + `scale(0.97)→scale(1)`,
-    /// 0.26s `--ease-overlay-in`)。
+    /// 叶子的进场动画(对应原版 `styles.css` 的 `.pane-enter`,0.26s)。
+    /// 形态改成与换场滑入同款的**纯滑入**(见文件头注释)—— 原版的
+    /// `opacity 0→1 + scale(0.97)` 两截都不用了:淡入在深色终端上读作
+    /// 「闪一下」(用户否掉);缩放在 gpui 没有 transform,只能改尺寸去凑,
+    /// 而那会让 `TerminalView` 按小一号的格子数一路 resize 到 PTY
+    /// (启动时每个叶子都来一遍)。滑入的 absolute 层尺寸恒定,两条都躲开。
     ///
     /// # 三条照抄来的语义
     ///
@@ -1004,17 +1195,6 @@ impl TerminalArea {
     ///    且不按帧回收;
     /// 3. **不过减弱动效的闸**:`.pane-enter` 在原版 reduce 段里被**点名豁免**
     ///    (`styles.css:441-443`),开了「减弱动态效果」照样播。
-    ///
-    /// # ⚠️ 刻意只做淡入,不做 `scale(0.97)`
-    ///
-    /// gpui 没有 transform,能等价缩放的只有「改内边距/尺寸」——而那是**会改布局**
-    /// 的:pane 内容框在这 260ms 里窄十几个像素,`TerminalView` 就会按小一号的
-    /// 格子数回调 `on_grid_resize`,一路 resize 到 PTY(启动时每个叶子都来一遍,
-    /// 首个 PTY 甚至会以缩小后的尺寸建出来再被改回去)。原版的 `transform: scale`
-    /// 压根不参与布局,没有这条代价。
-    ///
-    /// 3% 的缩放本来就是「看得出这里多了一块」的附加提示,淡入才是主信号 ——
-    /// 拿一次终端重排去换它不划算。上游哪天给 Element 通用变换再补。
     fn wrap_pane_enter(
         &mut self,
         leaf_id: &str,
@@ -1029,14 +1209,25 @@ impl TerminalArea {
             .or_insert_with(|| mt_ui::motion::Transition::new(mt_ui::motion::PANE_ENTER))
             .drive(window);
         if progress >= 1.0 {
-            // 跑完就把包装层整个摘掉:少一层空 div,也少一次 opacity 合成。
+            // 跑完就把包装层整个摘掉:少两层空 div,也少一次裁剪。
             // (匿名 div 不带 ElementId,加/摘不影响子树的元素状态路径)
             return el;
         }
+        // 与换场滑入同一形态(见文件头注释):新格子从右侧滑到位,内容全程
+        // 不透明 —— 淡入在深色终端上读作「闪一下」,已被否掉。
         div()
             .size_full()
-            .opacity(pane_enter_opacity(progress))
-            .child(el)
+            .relative()
+            .overflow_hidden()
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left(px(swap_slide_offset(progress)))
+                    .w_full()
+                    .h_full()
+                    .child(el),
+            )
             .into_any_element()
     }
 
@@ -1339,7 +1530,6 @@ impl TerminalArea {
             return div().into_any_element();
         };
 
-        let store = self.store.read(cx);
         let active = panes
             .iter()
             .find(|p| &p.id == active_pane_id)
@@ -1347,7 +1537,77 @@ impl TerminalArea {
         let Some(active) = active else {
             return div().into_any_element();
         };
-        let terminal = active.pty_id.and_then(|id| store.terminal(id)).cloned();
+
+        // ── 检测叶内切 tab,起一条方向性 push 过渡(见文件头注释)────
+        // 放在借出 store 之前:要改 self、还要 spawn 计时器。
+        match self.last_leaf_active.get(leaf_id) {
+            Some(prev) if prev != &active.id => {
+                let old = prev.clone();
+                let old_idx = panes.iter().position(|p| p.id == old);
+                let new_idx = panes.iter().position(|p| p.id == active.id);
+                if let (Some(o), Some(n)) = (old_idx, new_idx) {
+                    let dir = if n > o { 1.0 } else { -1.0 };
+                    self.swap_seq += 1;
+                    let seq = self.swap_seq;
+                    let lid = leaf_id.clone();
+                    let timer = cx.spawn(async move |this, cx| {
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(TAB_SWAP_MS))
+                            .await;
+                        let _ = this.update(cx, |area: &mut TerminalArea, cx| {
+                            if area.tab_swaps.get(&lid).is_some_and(|s| s.seq == seq) {
+                                area.tab_swaps.remove(&lid);
+                                cx.notify();
+                            }
+                        });
+                    });
+                    self.tab_swaps.insert(
+                        leaf_id.clone(),
+                        TabSwap {
+                            seq,
+                            dir,
+                            old_pane_id: old,
+                            _timer: timer,
+                        },
+                    );
+                } else {
+                    // 旧 pane 已不在(被 × 掉 / 拖去别的组):终端实体已回收,
+                    // 出场层无从画起,这一次不做过渡
+                    self.tab_swaps.remove(leaf_id);
+                }
+                self.last_leaf_active
+                    .insert(leaf_id.clone(), active.id.clone());
+            }
+            None => {
+                self.last_leaf_active
+                    .insert(leaf_id.clone(), active.id.clone());
+            }
+            _ => {}
+        }
+        // 本帧要画的过渡(拷出所需,store 马上要长借)
+        let tab_swap: Option<(u64, f32, String)> = self
+            .tab_swaps
+            .get(leaf_id)
+            .map(|s| (s.seq, s.dir, s.old_pane_id.clone()));
+
+        // RevealBack 的空洞:实体此刻在飞行层上,这格只画底色(见 render 里的置位)
+        let suppressed = self.suppress_entity_pane.as_deref() == Some(active.id.as_str());
+
+        let store = self.store.read(cx);
+        let terminal = if suppressed {
+            None
+        } else {
+            active.pty_id.and_then(|id| store.terminal(id)).cloned()
+        };
+        // 出场层的旧终端实体(旧 pane 还没起 PTY 时出场层只好省略)
+        let exit_terminal = tab_swap.as_ref().and_then(|(_, _, old)| {
+            store
+                .project_state(project_id)
+                .and_then(|s| s.pane(old))
+                .and_then(|p| p.pty_id)
+                .and_then(|id| store.terminal(id))
+                .cloned()
+        });
         // 远程 pane 的断线覆盖层(`PaneGroup.tsx:329-333` 的 `showReconnect`):
         // 判据是「项目是 SSH 远程项目 **且** 这条 PTY 已登记退出」。
         // ⚠️ **本地 pane 不进这条路** —— 本地退出仍走既有的 error 状态 + 右下角
@@ -2121,15 +2381,87 @@ impl TerminalArea {
                         .size_full(),
                     )
                     .map(|el| match terminal {
-                        Some(entity) => el.child(entity),
+                        // 叶内切 tab 的方向性 push(见文件头注释):新 pane 按
+                        // 方向推入、旧 pane 同向推出;两层都是全尺寸 absolute,
+                        // 只动 left,PTY 不收 resize。没有在场记录时零包装。
+                        // 只包终端主体,tab 栏不参与(它没换内容,动了反而怪)
+                        Some(entity) => match tab_swap.as_ref() {
+                            Some((seq, dir, _old)) => {
+                                let (seq, dir) = (*seq, *dir);
+                                el.child(
+                                    div()
+                                        .size_full()
+                                        .relative()
+                                        .overflow_hidden()
+                                        .children(exit_terminal.clone().map(|old_entity| {
+                                            div()
+                                                .absolute()
+                                                .top_0()
+                                                .w_full()
+                                                .h_full()
+                                                .child(old_entity)
+                                                .with_animation(
+                                                    gpui::SharedString::from(format!(
+                                                        "tab-exit-{seq}"
+                                                    )),
+                                                    Animation::new(
+                                                        std::time::Duration::from_millis(
+                                                            TAB_SWAP_MS,
+                                                        ),
+                                                    )
+                                                    .with_easing(ui::cubic_bezier(
+                                                        0.16, 1.0, 0.3, 1.0,
+                                                    )),
+                                                    move |el, delta| {
+                                                        el.left(gpui::relative(push_exit_x(
+                                                            dir, delta,
+                                                        )))
+                                                    },
+                                                )
+                                        }))
+                                        .child(
+                                            div()
+                                                .absolute()
+                                                .top_0()
+                                                .w_full()
+                                                .h_full()
+                                                .child(entity)
+                                                .with_animation(
+                                                    gpui::SharedString::from(format!(
+                                                        "tab-enter-{seq}"
+                                                    )),
+                                                    Animation::new(
+                                                        std::time::Duration::from_millis(
+                                                            TAB_SWAP_MS,
+                                                        ),
+                                                    )
+                                                    .with_easing(ui::cubic_bezier(
+                                                        0.16, 1.0, 0.3, 1.0,
+                                                    )),
+                                                    move |el, delta| {
+                                                        el.left(gpui::relative(push_enter_x(
+                                                            dir, delta,
+                                                        )))
+                                                    },
+                                                ),
+                                        ),
+                                )
+                            }
+                            None => el.child(entity),
+                        },
+                        // 空洞态(RevealBack 在飞)只画底色,不出「正在启动」——
+                        // 那行字会在飞行层落位前闪一下
                         None => el.child(
-                            div()
-                                .size_full()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .text_color(ui::text_muted())
-                                .child(t("paneGroup", "starting")),
+                            div().size_full().bg(ui::bg_terminal()).when(
+                                !suppressed,
+                                |el| {
+                                    el.flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .text_color(ui::text_muted())
+                                        .child(t("paneGroup", "starting"))
+                                },
+                            ),
                         ),
                     })
                     // 「释放以插入路径」的虚线框。与 `cx.has_active_drag()` 与门:
@@ -2681,6 +3013,175 @@ impl Render for TerminalArea {
             .and_then(|id| layout.leaf_of_pane(id))
             .cloned();
 
+        // ── 检测整块内容换了没(面板切换 / 最大化开合),起方向性 push ──
+        // (见文件头「方向性换场」注释)
+        let (active_panel_id, panel_order) = {
+            let store = self.store.read(cx);
+            let state = store.project_state(&project_id);
+            (
+                state
+                    .and_then(|s| s.active_panel())
+                    .map(|p| p.id.clone())
+                    .unwrap_or_default(),
+                state
+                    .map(|s| s.panels.iter().map(|p| p.id.clone()).collect::<Vec<_>>())
+                    .unwrap_or_default(),
+            )
+        };
+        let area_key = (
+            project_id.clone(),
+            active_panel_id.clone(),
+            maximized_leaf.as_ref().map(|l| l.id().to_string()),
+        );
+        if self.last_area_key.as_ref() != Some(&area_key) {
+            let prev = self.last_area_key.replace(area_key.clone());
+            // 项目一换只记不播:旧面板属于别的项目,出场层无从画起,
+            // 换项目本来也不该有「翻页」感
+            if let Some((prev_project, prev_panel, prev_max)) = prev
+                && prev_project == project_id
+            {
+                let panel_changed = prev_panel != active_panel_id;
+                // `None` = 这次变化不做动画(最大化状态下换铺满组 —— 整块过渡
+                // 在满屏尺度上读作闪烁,用户点名不要)
+                let swap: Option<(f32, AreaMotion, AreaExitSrc)> = if panel_changed {
+                    // 切面板:整幅竖直 push,方向按竖条上的上下次序 ——
+                    // 切到更靠下的面板,新内容从下方推入(dir=+1);往上切镜像
+                    let old_i = panel_order.iter().position(|id| *id == prev_panel);
+                    let new_i = panel_order.iter().position(|id| *id == active_panel_id);
+                    let dir = match (old_i, new_i) {
+                        (Some(o), Some(n)) if n < o => -1.0,
+                        _ => 1.0,
+                    };
+                    // close_panel 之后旧面板已不在表里 → 只做进场
+                    let exit = if panel_order.iter().any(|id| *id == prev_panel) {
+                        AreaExitSrc::Panel(prev_panel)
+                    } else {
+                        AreaExitSrc::None
+                    };
+                    Some((dir, AreaMotion::Push, exit))
+                } else {
+                    // 旧铺满叶的主体(实体 + 占位高度)—— 换组的淡出层与还原的
+                    // 飞行层共用这一份取法
+                    let max_body_exit = |old_leaf: &str| -> AreaExitSrc {
+                        layout
+                            .node(old_leaf)
+                            .and_then(|node| match node {
+                                SplitNode::Leaf {
+                                    panes,
+                                    active_pane_id,
+                                    ..
+                                } => panes
+                                    .iter()
+                                    .find(|p| &p.id == active_pane_id)
+                                    .or_else(|| panes.first())
+                                    .map(|p| p.id.clone()),
+                                _ => None,
+                            })
+                            .map(|pane_id| AreaExitSrc::MaxBody {
+                                pane_id,
+                                bar_count: layout.leaves().len().saturating_sub(1),
+                            })
+                            .unwrap_or(AreaExitSrc::None)
+                    };
+                    match (&prev_max, &area_key.2) {
+                        // 最大化状态下换铺满组:**瞬时切换,不做动画**。
+                        // 顺手把新铺满叶的「上一帧激活 tab」对齐 —— 折叠条上点的
+                        // 是非激活 tab 时,activate_pane 已经换了它的激活项,不对齐
+                        // 的话叶内 push 会在满屏尺度上再放一次
+                        (Some(_), Some(new_leaf)) => {
+                            if let Some(SplitNode::Leaf {
+                                panes,
+                                active_pane_id,
+                                ..
+                            }) = layout.node(new_leaf)
+                            {
+                                if let Some(p) = panes
+                                    .iter()
+                                    .find(|p| &p.id == active_pane_id)
+                                    .or_else(|| panes.first())
+                                {
+                                    self.last_leaf_active
+                                        .insert(new_leaf.clone(), p.id.clone());
+                                }
+                            }
+                            None
+                        }
+                        // 进最大化:裁剪窗从被铺满 pane 的**原格子矩形**展开到
+                        // 整幅(用户点名要「从当前位置放大到全屏」)。矩形取
+                        // 上一帧量到的 pane_rects(此刻还没被 retain 收窄),
+                        // 拿不到就退回上浮落位
+                        (None, Some(_)) => {
+                            let from = self
+                                .store
+                                .read(cx)
+                                .maximized_pane_id(&project_id)
+                                .and_then(|pane_id| self.pane_rects.get(pane_id))
+                                .map(|r| RevealFrom {
+                                    left: r.left - f32::from(self.area_origin.x),
+                                    top: r.top - f32::from(self.area_origin.y),
+                                    width: r.width,
+                                    height: r.height,
+                                });
+                            match from {
+                                Some(from) => {
+                                    Some((1.0, AreaMotion::Reveal { from }, AreaExitSrc::None))
+                                }
+                                None => Some((1.0, AreaMotion::Drift, AreaExitSrc::None)),
+                            }
+                        }
+                        // 还原:最大化的反向 —— 裁剪窗从整幅收回到该格还原后的
+                        // 目标矩形(按分屏比例现算,那一帧整树还没画、量不到)
+                        (Some(old_leaf), None) => {
+                            let to = leaf_rect_in(
+                                &layout,
+                                old_leaf,
+                                0.0,
+                                0.0,
+                                f32::from(self.area_size.width),
+                                f32::from(self.area_size.height),
+                            );
+                            let exit = max_body_exit(old_leaf);
+                            match (to, &exit) {
+                                (Some(to), AreaExitSrc::MaxBody { .. }) => {
+                                    Some((-1.0, AreaMotion::RevealBack { to }, exit))
+                                }
+                                _ => Some((-1.0, AreaMotion::Drift, AreaExitSrc::None)),
+                            }
+                        }
+                        // 键变了但面板与最大化都没变 —— 理论走不到,不做动画
+                        (None, None) => None,
+                    }
+                };
+                match swap {
+                    Some((dir, motion, exit)) => {
+                        self.swap_seq += 1;
+                        let seq = self.swap_seq;
+                        let timer = cx.spawn(async move |this, cx| {
+                            cx.background_executor()
+                                .timer(std::time::Duration::from_millis(AREA_SWAP_MS))
+                                .await;
+                            let _ = this.update(cx, |area: &mut TerminalArea, cx| {
+                                if area.area_swap.as_ref().is_some_and(|s| s.seq == seq) {
+                                    area.area_swap = None;
+                                    cx.notify();
+                                }
+                            });
+                        });
+                        self.area_swap = Some(AreaSwap {
+                            seq,
+                            dir,
+                            motion,
+                            exit,
+                            _timer: timer,
+                        });
+                    }
+                    // 不做动画的变化:把可能还在飞的上一场也收掉,
+                    // 免得它的出场层引用着已换掉的内容
+                    None => self.area_swap = None,
+                }
+            }
+        }
+
         // 关掉的 pane 的矩形残影一并清掉,免得方向导航挑到不存在的格子。
         // **最大化时只留被铺满那一组的矩形**:方向导航挑的是「屏幕上相邻的格子」,
         // 藏起来的那些格子不该被挑中(原版 `findAdjacentPtyId` 查的是 DOM,
@@ -2701,12 +3202,77 @@ impl Render for TerminalArea {
         self.tab_focus.retain(|id, _| in_layout.contains(id));
         self.tab_rects.retain(|id, _| in_layout.contains(id));
 
+        // push 过渡的出场层。先把要画的东西摘成 owned 再渲染(render_node /
+        // 实体查表都要各自借 self);**先画出场层再画进场层** —— 两边都会往
+        // pane_rects 等视图表里写,后画的(进场层 = 真正在台上的)覆盖为准。
+        let exit_src = self
+            .area_swap
+            .as_ref()
+            .map(|s| s.exit.clone())
+            .unwrap_or(AreaExitSrc::None);
+        let exit_content: Option<AnyElement> = match (exit_src, self.measured) {
+            // 切面板:旧面板的整树
+            (AreaExitSrc::Panel(panel_id), true) => self
+                .store
+                .read(cx)
+                .project_state(&project_id)
+                .and_then(|st| st.panels.iter().find(|p| p.id == panel_id))
+                .map(|p| p.layout.clone())
+                .map(|l| self.render_node(&l, &project_id, self.area_size, window, cx)),
+            // 折叠条换铺满组:旧铺满叶的终端主体 + 按旧折叠区同高占位
+            (AreaExitSrc::MaxBody { pane_id, bar_count }, true) => {
+                let entity = {
+                    let store = self.store.read(cx);
+                    store
+                        .project_state(&project_id)
+                        .and_then(|s| s.pane(&pane_id))
+                        .and_then(|p| p.pty_id)
+                        .and_then(|id| store.terminal(id))
+                        .cloned()
+                };
+                entity.map(|entity| {
+                    // 占位高度 = render_maximized 里折叠区的实际高度公式:
+                    // min(条数 × 26, 区上限);对不齐就是滑出途中一次 PTY reflow
+                    let zone_h = (self.area_size.height * COLLAPSED_ZONE_MAX)
+                        .max(px(TAB_BAR_H))
+                        .min(px(bar_count as f32 * TAB_BAR_H));
+                    div()
+                        .size_full()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_h(px(0.0))
+                                .bg(ui::bg_terminal())
+                                .child(entity),
+                        )
+                        .child(div().flex_none().h(zone_h))
+                        .into_any_element()
+                })
+            }
+            _ => None,
+        };
+        let area_anim = self.area_swap.as_ref().map(|s| (s.seq, s.dir, s.motion));
+
         // 首帧只量不画:百分比要按真实可用尺寸换算,而 ResizablePanel 只认第一帧的
         // 初值(见模块注释)。量到之后主动 notify 一次,下一帧把分屏树铺上去。
+        //
+        // RevealBack 在飞时,进场内容里那个 pane 的格子挖成空洞(实体在飞行层),
+        // 只在这一次 render 调用期间置位 —— 出了这里谁也别受影响
+        self.suppress_entity_pane = self.area_swap.as_ref().and_then(|s| {
+            match (&s.motion, &s.exit) {
+                (AreaMotion::RevealBack { .. }, AreaExitSrc::MaxBody { pane_id, .. }) => {
+                    Some(pane_id.clone())
+                }
+                _ => None,
+            }
+        });
         let content = self.measured.then(|| match &maximized_leaf {
             Some(leaf) => self.render_maximized(&layout, leaf, &project_id, window, cx),
             None => self.render_node(&layout, &project_id, self.area_size, window, cx),
         });
+        self.suppress_entity_pane = None;
         // 浮层在分屏树**之后**组装:它要读 render_node 刚更新过的 pane 矩形,
         // 而且要画在所有常规内容之上(deferred priority 1)
         let marker_popover = self.render_marker_popover(&layout, window, cx);
@@ -2745,6 +3311,7 @@ impl Render for TerminalArea {
                             if bounds.size.width > px(0.0) && bounds.size.height > px(0.0) {
                                 let first = !area.measured;
                                 area.area_size = bounds.size;
+                                area.area_origin = bounds.origin;
                                 area.measured = true;
                                 // 只在第一次量到时唤起重画 —— 之后每帧都 notify
                                 // 就是个死循环
@@ -2759,7 +3326,161 @@ impl Render for TerminalArea {
                 .absolute()
                 .size_full(),
             )
-            .children(content.map(|c| div().size_full().child(c)))
+            .children(content.map(|c| {
+                // 整块换场:有在场记录才包动画层,否则零包装
+                let mk_anim = || {
+                    Animation::new(std::time::Duration::from_millis(AREA_SWAP_MS))
+                        .with_easing(ui::cubic_bezier(0.16, 1.0, 0.3, 1.0))
+                };
+                match area_anim {
+                    // 整幅竖直 push:出场层(如有)与进场层首尾相接
+                    Some((seq, dir, AreaMotion::Push)) => div()
+                        .size_full()
+                        .relative()
+                        .overflow_hidden()
+                        .children(exit_content.map(|old| {
+                            div()
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .w_full()
+                                .h_full()
+                                .child(old)
+                                .with_animation(
+                                    gpui::SharedString::from(format!("area-exit-{seq}")),
+                                    mk_anim(),
+                                    move |el, delta| {
+                                        el.top(gpui::relative(push_exit_x(dir, delta)))
+                                    },
+                                )
+                        }))
+                        .child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .w_full()
+                                .h_full()
+                                .child(c)
+                                .with_animation(
+                                    gpui::SharedString::from(format!("area-enter-{seq}")),
+                                    mk_anim(),
+                                    move |el, delta| {
+                                        el.top(gpui::relative(push_enter_x(dir, delta)))
+                                    },
+                                ),
+                        )
+                        .into_any_element(),
+                    // 14px 竖直落位(还原下沉 / 最大化兜底上浮)
+                    Some((seq, dir, AreaMotion::Drift)) => div()
+                        .size_full()
+                        .relative()
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .w_full()
+                                .h_full()
+                                .child(c)
+                                .with_animation(
+                                    gpui::SharedString::from(format!("area-drift-{seq}")),
+                                    mk_anim(),
+                                    move |el, delta| {
+                                        el.top(px(dir * swap_slide_offset(delta)))
+                                    },
+                                ),
+                        )
+                        .into_any_element(),
+                    // 最大化:裁剪窗从原格矩形展开到整幅。内层按最终全尺寸排版
+                    // 且反向抵消裁剪窗原点 —— 内容在屏幕上纹丝不动,只是
+                    // 「看得见的窗口」在长大(终端因此零逐帧 resize)
+                    // 还原:Reveal 的反向 —— 底下是整树(该格挖了洞),飞行层带着
+                    // 旧铺满主体从整幅收回到目标格;内层反向抵消,画面纹丝不动、
+                    // 只是「窗口」在收小
+                    Some((seq, _dir, AreaMotion::RevealBack { to })) => {
+                        let (area_w, area_h) =
+                            (f32::from(self.area_size.width), f32::from(self.area_size.height));
+                        let flying = exit_content.map(|old| {
+                            let inner = div()
+                                .absolute()
+                                .w(px(area_w))
+                                .h(px(area_h))
+                                .child(old)
+                                .with_animation(
+                                    gpui::SharedString::from(format!(
+                                        "area-shrink-inner-{seq}"
+                                    )),
+                                    mk_anim(),
+                                    move |el, delta| {
+                                        el.left(px(-reveal_lerp(0.0, to.left, delta)))
+                                            .top(px(-reveal_lerp(0.0, to.top, delta)))
+                                    },
+                                );
+                            div()
+                                .absolute()
+                                .overflow_hidden()
+                                .child(inner)
+                                .with_animation(
+                                    gpui::SharedString::from(format!("area-shrink-{seq}")),
+                                    mk_anim(),
+                                    move |el, delta| {
+                                        el.left(px(reveal_lerp(0.0, to.left, delta)))
+                                            .top(px(reveal_lerp(0.0, to.top, delta)))
+                                            .w(px(reveal_lerp(area_w, to.width, delta)))
+                                            .h(px(reveal_lerp(area_h, to.height, delta)))
+                                    },
+                                )
+                        });
+                        div()
+                            .size_full()
+                            .relative()
+                            .child(div().absolute().inset_0().child(c))
+                            .children(flying)
+                            .into_any_element()
+                    }
+                    Some((seq, _dir, AreaMotion::Reveal { from })) => {
+                        let (area_w, area_h) =
+                            (f32::from(self.area_size.width), f32::from(self.area_size.height));
+                        // 内层:最终全尺寸 + 反向抵消裁剪窗原点(先挂子再包动画)
+                        let inner = div()
+                            .absolute()
+                            .w(px(area_w))
+                            .h(px(area_h))
+                            .child(c)
+                            .with_animation(
+                                gpui::SharedString::from(format!("area-reveal-inner-{seq}")),
+                                mk_anim(),
+                                move |el, delta| {
+                                    el.left(px(-reveal_lerp(from.left, 0.0, delta)))
+                                        .top(px(-reveal_lerp(from.top, 0.0, delta)))
+                                },
+                            );
+                        div()
+                            .size_full()
+                            .relative()
+                            .child(
+                                div()
+                                    .absolute()
+                                    .overflow_hidden()
+                                    .child(inner)
+                                    .with_animation(
+                                        gpui::SharedString::from(format!("area-reveal-{seq}")),
+                                        mk_anim(),
+                                        move |el, delta| {
+                                            el.left(px(reveal_lerp(from.left, 0.0, delta)))
+                                                .top(px(reveal_lerp(from.top, 0.0, delta)))
+                                                .w(px(reveal_lerp(from.width, area_w, delta)))
+                                                .h(px(reveal_lerp(from.height, area_h, delta)))
+                                        },
+                                    ),
+                            )
+                            .into_any_element()
+                    }
+                    None => div().size_full().child(c).into_any_element(),
+                }
+            }))
             .children(marker_popover)
             // 非激活 tab 的悬停缩略图。卡不带 `.id()` → 无 hitbox → 不吃鼠标
             .children(tab_preview)
@@ -2780,15 +3501,71 @@ mod tests {
         assert_eq!(f, vec![0.25, 0.25, 0.5]);
     }
 
-    /// 进场只淡入:终点必须是**完全**不透明,越界进度一律钳住
-    /// (残留的 0.99 会让整块 pane 永远蒙一层灰)。
+    /// 分屏进场滑入的端点严丝合缝:起点满偏移、终点精确归零,越界进度一律钳住
+    /// (残留半像素会让终端内容永久错位半格)。
     #[test]
-    fn 进场淡入端点严丝合缝() {
-        assert_eq!(pane_enter_opacity(0.0), 0.0);
-        assert_eq!(pane_enter_opacity(1.0), 1.0);
-        assert_eq!(pane_enter_opacity(1.5), 1.0);
-        assert_eq!(pane_enter_opacity(-0.5), 0.0);
-        assert!((pane_enter_opacity(0.5) - 0.5).abs() < 1e-6);
+    fn 换场滑入端点严丝合缝() {
+        assert_eq!(swap_slide_offset(0.0), SWAP_SLIDE_PX);
+        assert_eq!(swap_slide_offset(1.0), 0.0);
+        assert_eq!(swap_slide_offset(1.5), 0.0, "越界进度不许滑过头再回弹");
+        assert_eq!(swap_slide_offset(-0.5), SWAP_SLIDE_PX);
+        assert!((swap_slide_offset(0.5) - SWAP_SLIDE_PX * 0.5).abs() < 1e-6);
+    }
+
+    /// 还原动画的目标矩形按分屏比例换算:嵌套 split 里也要算对,
+    /// 端点(原点/尺寸)与 render_node 的铺法一致。
+    #[test]
+    fn 还原目标矩形按分屏比例换算() {
+        use crate::tree::{PaneState, gen_id};
+        let leaf = |name: &str| SplitNode::leaf(PaneState::new(name));
+        // [a(30%) | [b(50%) / c(50%)](70%)],区域 1000×800
+        let (a, b, c) = (leaf("a"), leaf("b"), leaf("c"));
+        let (aid, bid, cid) = (
+            a.id().to_string(),
+            b.id().to_string(),
+            c.id().to_string(),
+        );
+        let inner = SplitNode::Split {
+            id: gen_id("split"),
+            direction: SplitDirection::Vertical,
+            sizes: vec![50.0, 50.0],
+            children: vec![b, c],
+        };
+        let root = SplitNode::Split {
+            id: gen_id("split"),
+            direction: SplitDirection::Horizontal,
+            sizes: vec![30.0, 70.0],
+            children: vec![a, inner],
+        };
+
+        let ra = leaf_rect_in(&root, &aid, 0.0, 0.0, 1000.0, 800.0).unwrap();
+        assert_eq!((ra.left, ra.top, ra.width, ra.height), (0.0, 0.0, 300.0, 800.0));
+        let rb = leaf_rect_in(&root, &bid, 0.0, 0.0, 1000.0, 800.0).unwrap();
+        assert_eq!((rb.left, rb.top, rb.width, rb.height), (300.0, 0.0, 700.0, 400.0));
+        let rc = leaf_rect_in(&root, &cid, 0.0, 0.0, 1000.0, 800.0).unwrap();
+        assert_eq!((rc.left, rc.top, rc.width, rc.height), (300.0, 400.0, 700.0, 400.0));
+        assert!(leaf_rect_in(&root, "leaf-不存在", 0.0, 0.0, 1000.0, 800.0).is_none());
+    }
+
+    /// push 两层首尾相接:往右切(dir=+1)时,进场层从整幅在右(+1)推到 0、
+    /// 出场层从 0 推到整幅在左(-1);任一时刻两层相距恒为一幅宽,中间不裂缝
+    /// 不重叠。往左切整体镜像。终点必须精确归零/归幅。
+    #[test]
+    fn push两层首尾相接且端点精确() {
+        for dir in [1.0f32, -1.0] {
+            assert_eq!(push_enter_x(dir, 0.0), dir, "进场起点在屏外整幅处");
+            assert_eq!(push_enter_x(dir, 1.0), 0.0, "进场终点精确归零");
+            assert_eq!(push_exit_x(dir, 0.0), 0.0, "出场起点在原位");
+            assert_eq!(push_exit_x(dir, 1.0), -dir, "出场终点整幅移出");
+            // 越界进度钳住,不许滑过头
+            assert_eq!(push_enter_x(dir, 1.5), 0.0);
+            assert_eq!(push_exit_x(dir, -0.5), 0.0);
+            for i in 0..=10 {
+                let d = i as f32 / 10.0;
+                let gap = push_enter_x(dir, d) - push_exit_x(dir, d);
+                assert!((gap - dir).abs() < 1e-6, "两层间距恒为一幅: dir={dir} d={d}");
+            }
+        }
     }
 
     /// 进场动画属原版 reduce 段**点名豁免**的那一档:开着减弱动效照播。
