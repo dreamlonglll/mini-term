@@ -1033,8 +1033,7 @@ fn paste_context(pty_id: u32, cx: &gpui::App) -> PasteContext {
         .or_else(|| {
             owner.as_ref().and_then(|(pid, pane_id)| {
                 s.project_state(pid)
-                    .and_then(|st| st.layout.as_ref())
-                    .and_then(|l| l.pane(pane_id))
+                    .and_then(|st| st.pane(pane_id))
                     .map(|p| p.label().to_string())
             })
         })
@@ -1224,8 +1223,7 @@ fn branch_entries_for_pty(pty_id: u32, cx: &mut gpui::App) -> Vec<menu::MenuEntr
         let s = store.read(cx);
         let segment = s
             .project_state(&project_id)
-            .and_then(|st| st.layout.as_ref())
-            .and_then(|l| l.pane(&pane_id))
+            .and_then(|st| st.pane(&pane_id))
             .map(|p| {
                 crate::session_branch::branch_menu_segment(
                     p.ai_session.as_ref(),

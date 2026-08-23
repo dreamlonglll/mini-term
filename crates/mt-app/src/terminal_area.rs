@@ -371,7 +371,9 @@ fn tab_menu_actions(can_fork: bool, identity_missing: bool) -> Vec<Option<TabMen
 }
 
 /// 组装一个 tab 的右键菜单。`label` 是它当前的显示名(重命名的默认值)。
-fn tab_menu(
+/// `pub(crate)`:终端列表竖条([`crate::terminals_panel`])的行右键与 tab 右键
+/// **必须同一份菜单** —— 同一个 pane 在两处的操作面不该有差异。
+pub(crate) fn tab_menu(
     store: &Entity<AppStore>,
     project_id: &str,
     pane_id: &str,
@@ -381,8 +383,7 @@ fn tab_menu(
     let pane_state = store
         .read(cx)
         .project_state(project_id)
-        .and_then(|s| s.layout.as_ref())
-        .and_then(|l| l.pane(pane_id));
+        .and_then(|s| s.pane(pane_id));
     let segment = pane_state
         .map(|p| branch_menu_segment(p.ai_session.as_ref(), p.detected_agent.as_deref()))
         .unwrap_or(BranchMenuSegment::None);
@@ -1093,7 +1094,7 @@ impl TerminalArea {
         // `maximized_pane_id()` 自带「布局是 split」这道闸,所以这里一个判据够用
         let layout_is_split = store
             .project_state(project_id)
-            .and_then(|s| s.layout.as_ref())
+            .and_then(|s| s.active_layout())
             .is_some_and(|l| matches!(l, SplitNode::Split { .. }));
         let is_maximized = store
             .maximized_pane_id(project_id)
@@ -2020,7 +2021,7 @@ impl TerminalArea {
             .store
             .read(cx)
             .project_state(project_id)
-            .and_then(|s| s.layout.as_ref())
+            .and_then(|s| s.active_layout())
             .and_then(|l| l.node(leaf_id))
             .and_then(|node| match node {
                 SplitNode::Leaf { panes, .. } => {
@@ -2054,7 +2055,7 @@ impl TerminalArea {
         let store = self.store.read(cx);
         let Some(layout) = store
             .project_state(&dragged.project_id)
-            .and_then(|s| s.layout.as_ref())
+            .and_then(|s| s.active_layout())
         else {
             return false;
         };
@@ -2083,7 +2084,7 @@ impl TerminalArea {
         let store = self.store.read(cx);
         let layout = store
             .project_state(&dragged.project_id)
-            .and_then(|s| s.layout.as_ref())?;
+            .and_then(|s| s.active_layout())?;
         let SplitNode::Leaf { panes, .. } = layout.node(leaf_id)? else {
             return None;
         };
@@ -2226,7 +2227,7 @@ fn marker_popover_alive(layout: &SplitNode, pane_id: &str, pty_id: u32) -> bool 
 }
 
 /// 点击次数(键盘触发的「点击」按一次算)。
-fn click_count(event: &ClickEvent) -> usize {
+pub(crate) fn click_count(event: &ClickEvent) -> usize {
     match event {
         ClickEvent::Mouse(e) => e.up.click_count,
         ClickEvent::Keyboard(_) => 1,
@@ -2235,7 +2236,7 @@ fn click_count(event: &ClickEvent) -> usize {
 
 /// 点击位置(弹菜单要它)。键盘触发的「点击」没有坐标,退回当前鼠标位置 ——
 /// 菜单总得有个锚点,而这一条在真机上走不到(那个 `+` 没有键盘入口)。
-fn click_position(event: &ClickEvent, window: &Window) -> gpui::Point<gpui::Pixels> {
+pub(crate) fn click_position(event: &ClickEvent, window: &Window) -> gpui::Point<gpui::Pixels> {
     match event {
         ClickEvent::Mouse(e) => e.up.position,
         ClickEvent::Keyboard(_) => window.mouse_position(),

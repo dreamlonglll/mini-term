@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 32;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 761;
+pub const ZH_ENTRY_COUNT: usize = 766;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 761;
+pub const EN_ENTRY_COUNT: usize = 766;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -27,6 +27,7 @@ static APP_ZH: &[(&str, &str)] = &[
     ("activityBar.settings", "设置"),
     ("activityBar.ssh", "SSH 连接"),
     ("activityBar.stats", "使用统计"),
+    ("activityBar.terminals", "终端面板"),
     ("closeConfirm.messageWithSessions", "还有 {count} 个 AI 会话，关闭后它们会被终止：\n\n{names}\n\n确定退出吗？"),
     ("closeConfirm.titleAi", "有 AI 会话正在运行"),
     ("configLoadFailed", "配置加载失败，为防止覆盖已有配置，本次运行禁止保存。请重启应用重试。\n\n错误：{detail}"),
@@ -71,6 +72,7 @@ static APP_EN: &[(&str, &str)] = &[
     ("activityBar.settings", "Settings"),
     ("activityBar.ssh", "SSH connections"),
     ("activityBar.stats", "Statistics"),
+    ("activityBar.terminals", "Terminal panels"),
     ("closeConfirm.messageWithSessions", "{count} AI session(s) are still running and will be terminated:\n\n{names}\n\nQuit anyway?"),
     ("closeConfirm.titleAi", "AI sessions still running"),
     ("configLoadFailed", "Failed to load config. Saving is disabled for this run to protect your existing config. Please restart the app.\n\nError: {detail}"),
@@ -1477,17 +1479,25 @@ static TERMINAL_EN: &[(&str, &str)] = &[
 
 #[rustfmt::skip]
 static TERMINAL_AREA_ZH: &[(&str, &str)] = &[
+    ("closePanel", "关闭面板"),
     ("emptyHint", "也可以按"),
     ("emptyTitle", "「{project}」还没有打开终端"),
+    ("newPanel", "新建终端面板"),
     ("newTerminal", "新建终端"),
+    ("panelN", "面板 {n}"),
     ("remoteConnectFailedTitle", "远程连接失败"),
+    ("renamePanel", "重命名面板"),
 ];
 #[rustfmt::skip]
 static TERMINAL_AREA_EN: &[(&str, &str)] = &[
+    ("closePanel", "Close panel"),
     ("emptyHint", "or press"),
     ("emptyTitle", "No terminal open in \"{project}\""),
+    ("newPanel", "New terminal panel"),
     ("newTerminal", "New Terminal"),
+    ("panelN", "Panel {n}"),
     ("remoteConnectFailedTitle", "Remote Connection Failed"),
+    ("renamePanel", "Rename panel"),
 ];
 
 #[rustfmt::skip]

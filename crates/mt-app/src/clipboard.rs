@@ -661,8 +661,7 @@ pub fn resolve_paste_target(store: &AppStore, pty_id: u32) -> PasteTarget {
     // 本地项目但 pane 自己配了 wsl.exe 当 shell
     let shell_name = store
         .project_state(&project_id)
-        .and_then(|s| s.layout.as_ref())
-        .and_then(|l| l.pane(&pane_id))
+        .and_then(|s| s.pane(&pane_id))
         .map(|p| p.shell_name.clone());
     let runs_wsl = shell_name
         .and_then(|name| {

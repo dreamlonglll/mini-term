@@ -137,6 +137,46 @@ pub const GIT: &[Shape] = &[
     ),
 ];
 
+/// 终端列表竖条(GPUI 版新增,原版没有对应按钮,无 SVG 可抄)。字形是竖条
+/// 自己的缩影 —— 一列带树状连接线的条目:左侧 `⌐`+`├`+`∟` 的连线骨架,
+/// 右侧三道短横当条目。骨架拆两笔:上下拐角连成一条折线,中间那根分支单独一笔
+/// (连进折线会多出斜边,与 [`UPDATE`] 同款拆笔理由)。
+pub const TERMINALS: &[Shape] = &[
+    // 连线骨架:⌐ 拐角 → 竖干 → ∟ 拐角
+    Shape::line(
+        Ink::Current,
+        STROKE,
+        Geom::Polyline(&[
+            (u(7.0), u(4.0)),
+            (u(4.0), u(4.0)),
+            (u(4.0), u(12.0)),
+            (u(7.0), u(12.0)),
+        ]),
+    ),
+    // 中间分支
+    Shape::line(
+        Ink::Current,
+        STROKE,
+        Geom::Polyline(&[(u(4.0), u(8.0)), (u(7.0), u(8.0))]),
+    ),
+    // 三道条目短横
+    Shape::line(
+        Ink::Current,
+        STROKE,
+        Geom::Polyline(&[(u(9.0), u(4.0)), (u(13.5), u(4.0))]),
+    ),
+    Shape::line(
+        Ink::Current,
+        STROKE,
+        Geom::Polyline(&[(u(9.0), u(8.0)), (u(13.5), u(8.0))]),
+    ),
+    Shape::line(
+        Ink::Current,
+        STROKE,
+        Geom::Polyline(&[(u(9.0), u(12.0)), (u(13.5), u(12.0))]),
+    ),
+];
+
 /// 用量统计。原版 `ICON_STATS`:一条底轴 + 三根高低不同的柱子
 /// (`M2.5 13.5h11` / `M4 13.5V9M8 13.5V4.5M12 13.5V7`)。
 pub const STATS: &[Shape] = &[
@@ -476,7 +516,9 @@ mod tests {
     #[test]
     fn 边条图标的点全在单位方框内() {
         let mut points = 0usize;
-        for shapes in [PANEL, SESSIONS, GIT, STATS, SETTINGS, MOBILE, SSH, UPDATE] {
+        for shapes in [
+            PANEL, SESSIONS, GIT, TERMINALS, STATS, SETTINGS, MOBILE, SSH, UPDATE,
+        ] {
             for shape in shapes {
                 let (pts, _) = shape.geom.points();
                 for (x, y) in pts {

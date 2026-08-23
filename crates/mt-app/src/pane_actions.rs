@@ -70,13 +70,10 @@ pub fn window_close_line(project_name: &str, pane: &PaneState) -> String {
 pub fn collect_live_ai_panes(store: &AppStore) -> Vec<String> {
     let mut names = Vec::new();
     for project in store.projects() {
-        let Some(layout) = store
-            .project_state(&project.id)
-            .and_then(|s| s.layout.as_ref())
-        else {
+        let Some(state) = store.project_state(&project.id) else {
             continue;
         };
-        for pane in layout.panes() {
+        for pane in state.all_panes() {
             if counts_for_window_close(pane) {
                 names.push(window_close_line(&project.name, pane));
             }
@@ -89,8 +86,7 @@ pub fn collect_live_ai_panes(store: &AppStore) -> Vec<String> {
 fn leaf_panes(store: &AppStore, project_id: &str, leaf_id: &str) -> Vec<PaneState> {
     store
         .project_state(project_id)
-        .and_then(|s| s.layout.as_ref())
-        .and_then(|l| l.node(leaf_id))
+        .and_then(|s| s.node(leaf_id))
         .map(|node| match node {
             SplitNode::Leaf { panes, .. } => panes.clone(),
             _ => Vec::new(),
@@ -109,8 +105,7 @@ pub fn close_pane(
     let Some(pane) = store
         .read(cx)
         .project_state(&project_id)
-        .and_then(|s| s.layout.as_ref())
-        .and_then(|l| l.pane(&pane_id))
+        .and_then(|s| s.pane(&pane_id))
         .cloned()
     else {
         return;
@@ -153,8 +148,7 @@ pub fn close_leaf_of_pane(
     let Some(leaf_id) = store
         .read(cx)
         .project_state(&project_id)
-        .and_then(|s| s.layout.as_ref())
-        .and_then(|l| l.leaf_of_pane(&pane_id))
+        .and_then(|s| s.leaf_of_pane(&pane_id))
         .map(|node| node.id().to_string())
     else {
         return;
@@ -195,6 +189,33 @@ pub fn close_leaf(
     );
 }
 
+/// 关闭一整个项目级面板(它的全部 pane,含所有分屏格)。
+/// 确认口径与关整组一致 —— 盘点面板里活着的 AI 会话。
+pub fn close_panel(
+    store: Entity<AppStore>,
+    project_id: String,
+    panel_id: String,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let panes: Vec<PaneState> = store
+        .read(cx)
+        .project_state(&project_id)
+        .and_then(|s| s.panels.iter().find(|p| p.id == panel_id))
+        .map(|p| p.layout.panes().into_iter().cloned().collect())
+        .unwrap_or_default();
+    confirm_close_group(
+        panes,
+        move |_window, cx| {
+            store.update(cx, |store, cx| {
+                store.close_panel(&project_id, &panel_id, cx);
+            });
+        },
+        window,
+        cx,
+    );
+}
+
 /// 把 pane 里跑着的 AI 会话**分支到新分屏**(`paneActions.ts::forkPaneSession`)。
 ///
 /// ```text
@@ -222,8 +243,7 @@ pub fn fork_pane_session(
     let Some(session) = store
         .read(cx)
         .project_state(&project_id)
-        .and_then(|s| s.layout.as_ref())
-        .and_then(|l| l.pane(&pane_id))
+        .and_then(|s| s.pane(&pane_id))
         .and_then(|p| p.ai_session.clone())
     else {
         return;
@@ -261,8 +281,7 @@ pub fn fork_pane_session(
                     };
                     let pty_id = store
                         .project_state(&project_id)
-                        .and_then(|s| s.layout.as_ref())
-                        .and_then(|l| l.pane(&new_pane))
+                        .and_then(|s| s.pane(&new_pane))
                         .and_then(|p| p.pty_id);
                     if let Some(pty_id) = pty_id {
                         store.register_pending_fork(pty_id, &agent, &parent_session_id);

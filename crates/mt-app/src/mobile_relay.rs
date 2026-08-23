@@ -675,8 +675,7 @@ impl RelayBridge {
             let written = store.write_to_pane(&payload.project_id, &pane_id, &data, cx);
             let alive = store
                 .project_state(&payload.project_id)
-                .and_then(|s| s.layout.as_ref())
-                .and_then(|l| l.pane(&pane_id))
+                .and_then(|s| s.pane(&pane_id))
                 .and_then(|p| p.pty_id)
                 .is_some_and(|pty_id| store.pane_pty_alive(pty_id, cx));
             (written, alive)
@@ -751,8 +750,8 @@ impl RelayBridge {
         let mut live_ptys = HashSet::new();
         for project in store.projects() {
             projects.insert(project.id.clone(), to_relay_project(project));
-            if let Some(layout) = store.project_state(&project.id).and_then(|s| s.layout.as_ref()) {
-                live_ptys.extend(layout.pty_ids());
+            if let Some(state) = store.project_state(&project.id) {
+                live_ptys.extend(state.pty_ids());
             }
         }
         *self.mirror.lock() = HostMirror {
@@ -771,12 +770,12 @@ impl RelayBridge {
             let ordered = ordered_projects(store.config());
             let mut panes: HashMap<String, Vec<PaneFacet>> = HashMap::new();
             for project in &ordered {
+                // 跨全部面板平铺:移动端不感知面板层,后台面板的终端一样要能看
                 let facets = store
                     .project_state(&project.id)
-                    .and_then(|s| s.layout.as_ref())
-                    .map(|layout| {
-                        layout
-                            .panes()
+                    .map(|state| {
+                        state
+                            .all_panes()
                             .into_iter()
                             .map(|pane| PaneFacet {
                                 id: pane.id.clone(),

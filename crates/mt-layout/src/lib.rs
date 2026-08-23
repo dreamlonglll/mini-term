@@ -74,6 +74,8 @@ const KEY_MIDDLE_COLUMN_SIZES: &str = "middleColumnSizes";
 const KEY_MIDDLE_COLUMN_VISIBLE: &str = "middleColumnVisible";
 const KEY_RIGHT_DRAWER_WIDTH: &str = "rightDrawerWidth";
 const KEY_WINDOW: &str = "window";
+// GPUI 版新增的键(旧 config.json 里没有对应物),沿用 camelCase 命名口径。
+const KEY_TERMINALS_PANEL_VISIBLE: &str = "terminalsPanelVisible";
 
 /// 窗口的开合状态。gpui 的 `WindowBounds` 三个变体的镜像 —— 那个类型不实现
 /// serde,而本 crate 刻意**不依赖 gpui**(布局存储不该把整个 GPU 栈拖进来,
@@ -123,6 +125,8 @@ pub struct GlobalLayout {
     pub middle_column_sizes: Option<Vec<f64>>,
     pub middle_column_visible: Option<bool>,
     pub right_drawer_width: Option<f64>,
+    /// 终端区右缘「终端列表」竖条面板的显隐(GPUI 版新增,无旧 config 对应物)。
+    pub terminals_panel_visible: Option<bool>,
     pub window: Option<WindowGeometry>,
 }
 
@@ -264,6 +268,7 @@ impl LayoutStore {
             middle_column_sizes: from_kv(&map, KEY_MIDDLE_COLUMN_SIZES),
             middle_column_visible: from_kv(&map, KEY_MIDDLE_COLUMN_VISIBLE),
             right_drawer_width: from_kv(&map, KEY_RIGHT_DRAWER_WIDTH),
+            terminals_panel_visible: from_kv(&map, KEY_TERMINALS_PANEL_VISIBLE),
             window: from_kv(&map, KEY_WINDOW),
         }
     }
@@ -291,6 +296,10 @@ impl LayoutStore {
                 to_json(&globals.middle_column_visible),
             )?;
             put(KEY_RIGHT_DRAWER_WIDTH, to_json(&globals.right_drawer_width))?;
+            put(
+                KEY_TERMINALS_PANEL_VISIBLE,
+                to_json(&globals.terminals_panel_visible),
+            )?;
             put(KEY_WINDOW, to_json(&globals.window))?;
         }
         tx.commit()?;
@@ -390,8 +399,10 @@ impl LayoutStore {
             // 与「从来没设过」。一律搬:值本身就是当前生效的那个,搬过来语义不变。
             middle_column_visible: Some(config.middle_column_visible),
             right_drawer_width: config.right_drawer_width,
-            // 窗口几何是 GPUI 版新加的能力,旧 config.json 里没有对应物
-            // (Tauri 版存在另一个文件 `.window-state.json`,格式不兼容,不迁)
+            // 终端列表竖条与窗口几何都是 GPUI 版新加的能力,旧 config.json 里
+            // 没有对应物(窗口几何在 Tauri 版存在另一个文件 `.window-state.json`,
+            // 格式不兼容,不迁)
+            terminals_panel_visible: None,
             window: None,
         };
         if !globals.is_empty() {

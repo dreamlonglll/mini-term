@@ -47,8 +47,12 @@ use mt_i18n::{
 /// 760 → 761：AI 任务标记补「还没定位」态时新增 `markerList.pendingAnchor` ——
 /// AI 忙时追加的那句是排进队列的，属于它的消息还没上屏就没有锚点可定，
 /// 条目先挂着（灰的、点不动），得有一句说明它为什么跳不了。
+///
+/// 761 → 766：项目级终端面板（一个项目多个独立终端工作面 + 右缘图标竖条）
+/// 新增 `app.activityBar.terminals`（边条开关的 tooltip）与
+/// `terminalArea.{panelN,newPanel,renamePanel,closePanel}`（序号名/新建/右键两项）。
 const EXPECTED_NAMESPACES: usize = 32;
-const EXPECTED_ENTRIES_PER_LANG: usize = 761;
+const EXPECTED_ENTRIES_PER_LANG: usize = 766;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。
