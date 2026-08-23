@@ -1355,6 +1355,12 @@ impl SettingsView {
     fn render_terminal_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let list = self.store.read(cx).shell_list();
         let editing = self.shell_editing;
+        let animations = self
+            .store
+            .read(cx)
+            .config()
+            .terminal_animations
+            .unwrap_or(true);
 
         let mut rows = div().flex().flex_col().gap(px(8.0));
         for (idx, shell) in list.shells.iter().enumerate() {
@@ -1463,12 +1469,31 @@ impl SettingsView {
                     )
                     .child(ui::hint(t("settings", "terminal.defaultHint"))),
             )
-            .child(section("terminal.behavior").child(number_row(
-                "terminal.scrollback",
-                "terminal.scrollbackDesc",
-                &self.num_scrollback,
-                false,
-            )))
+            .child(
+                section("terminal.behavior")
+                    .child(number_row(
+                        "terminal.scrollback",
+                        "terminal.scrollbackDesc",
+                        &self.num_scrollback,
+                        false,
+                    ))
+                    // 终端区换场动画总开关。⚠️ 只管终端区那批(切 tab/面板/
+                    // 最大化/拆分),抽屉进出场等浮层动画不归它 ——
+                    // 那批是布局反馈不是装饰
+                    .child(toggle_row(
+                        "terminal-animations",
+                        "terminal.animationsTitle",
+                        "terminal.animationsDesc",
+                        animations,
+                        false,
+                        |this, next, _window, cx| {
+                            this.store.update(cx, |store, cx| {
+                                store.patch_config(|c| c.terminal_animations = Some(next), cx)
+                            });
+                        },
+                        cx,
+                    )),
+            )
             .into_any_element()
     }
 

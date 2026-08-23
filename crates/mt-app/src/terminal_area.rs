@@ -1106,8 +1106,9 @@ impl TerminalArea {
         match node {
             SplitNode::Leaf { id, .. } => {
                 let leaf_id = id.clone();
+                let animate = self.animations_enabled(cx);
                 let el = self.render_leaf(node, project_id, window, cx);
-                self.wrap_pane_enter(&leaf_id, project_id, el, window)
+                self.wrap_pane_enter(&leaf_id, project_id, el, animate, window)
             }
             SplitNode::Split {
                 id,
@@ -1200,6 +1201,7 @@ impl TerminalArea {
         leaf_id: &str,
         project_id: &str,
         el: AnyElement,
+        animate: bool,
         window: &Window,
     ) -> AnyElement {
         let key = format!("{project_id}\u{1}{leaf_id}");
@@ -1208,7 +1210,8 @@ impl TerminalArea {
             .entry(key)
             .or_insert_with(|| mt_ui::motion::Transition::new(mt_ui::motion::PANE_ENTER))
             .drive(window);
-        if progress >= 1.0 {
+        // 「启用动画」关着时进度照走(静默跑完),中途打开不补播
+        if progress >= 1.0 || !animate {
             // 跑完就把包装层整个摘掉:少两层空 div,也少一次裁剪。
             // (匿名 div 不带 ElementId,加/摘不影响子树的元素状态路径)
             return el;
@@ -1493,6 +1496,16 @@ impl TerminalArea {
         .into_any_element()
     }
 
+    /// 终端区换场动画总开关(设置页「启用动画」)。缺省开启。
+    /// 只闸终端区这批(切 tab/切面板/最大化/拆分);抽屉等浮层动画不归它。
+    fn animations_enabled(&self, cx: &App) -> bool {
+        self.store
+            .read(cx)
+            .config()
+            .terminal_animations
+            .unwrap_or(true)
+    }
+
     /// 折叠条的落点:这一组接管铺满,原先铺满的那组缩回折叠区。
     ///
     /// 顺序是**先换铺满再激活**:`activate_pane` 末尾会把焦点交给终端,那时候
@@ -1540,12 +1553,16 @@ impl TerminalArea {
 
         // ── 检测叶内切 tab,起一条方向性 push 过渡(见文件头注释)────
         // 放在借出 store 之前:要改 self、还要 spawn 计时器。
+        let animations_enabled = self.animations_enabled(cx);
         match self.last_leaf_active.get(leaf_id) {
             Some(prev) if prev != &active.id => {
                 let old = prev.clone();
                 let old_idx = panes.iter().position(|p| p.id == old);
                 let new_idx = panes.iter().position(|p| p.id == active.id);
-                if let (Some(o), Some(n)) = (old_idx, new_idx) {
+                if !animations_enabled {
+                    // 开关关着:只对齐记录,不起过渡(也把可能在飞的收掉)
+                    self.tab_swaps.remove(leaf_id);
+                } else if let (Some(o), Some(n)) = (old_idx, new_idx) {
                     let dir = if n > o { 1.0 } else { -1.0 };
                     self.swap_seq += 1;
                     let seq = self.swap_seq;
@@ -3036,9 +3053,10 @@ impl Render for TerminalArea {
         if self.last_area_key.as_ref() != Some(&area_key) {
             let prev = self.last_area_key.replace(area_key.clone());
             // 项目一换只记不播:旧面板属于别的项目,出场层无从画起,
-            // 换项目本来也不该有「翻页」感
+            // 换项目本来也不该有「翻页」感;「启用动画」关着时同样只记不播
             if let Some((prev_project, prev_panel, prev_max)) = prev
                 && prev_project == project_id
+                && self.animations_enabled(cx)
             {
                 let panel_changed = prev_panel != active_panel_id;
                 // `None` = 这次变化不做动画(最大化状态下换铺满组 —— 整块过渡

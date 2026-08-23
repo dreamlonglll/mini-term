@@ -181,6 +181,9 @@ pub struct AppConfig {
     /// `None` = UI 层默认开启;关掉则只唤起窗口，不改变当前视图。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tray_click_focus: Option<bool>,
+    /// 终端区换场动画总开关（切 tab/切面板/最大化/拆分）。`None` = UI 层默认开启。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_animations: Option<bool>,
     /// 启动恢复布局后是否自动续接上次的 AI 会话（往 pane 写 resume 命令）。
     /// `None` = UI 层默认开启（保持旧行为）。关掉只是不写命令，会话身份仍随布局
     /// 持久化，重新打开开关后下次启动照样能续上。
@@ -532,6 +535,7 @@ impl Default for AppConfig {
             tray_status_enabled: None,
             tray_max_projects: None,
             tray_click_focus: None,
+            terminal_animations: None,
             ai_auto_resume: None,
             ssh_connections: vec![],
             ssh_groups: vec![],

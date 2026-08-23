@@ -27,6 +27,8 @@ export const settings = {
       behavior: "终端行为",
       scrollback: "回滚行数",
       scrollbackDesc: "每个终端保留的历史行数。这是内存占用的大头：约每行每 100 列 1.2 KB，且每个终端各算一份。改小立即生效并释放内存",
+      animationsTitle: "启用动画",
+      animationsDesc: "终端区的换场动画：切换标签 / 切换面板 / 最大化与还原 / 拆分终端。关闭后这些操作瞬时完成",
     },
     clipboard: {
       copyPaste: "复制粘贴",
@@ -253,6 +255,8 @@ export const settings = {
       behavior: "Terminal behavior",
       scrollback: "Scrollback lines",
       scrollbackDesc: "History lines kept per terminal. This dominates memory use: roughly 1.2 KB per line per 100 columns, counted separately for every terminal. Lowering it takes effect immediately and frees memory",
+      animationsTitle: "Enable animations",
+      animationsDesc: "Terminal-area transitions: switching tabs / panels, maximize & restore, splitting. When off these happen instantly",
     },
     clipboard: {
       copyPaste: "Copy & paste",

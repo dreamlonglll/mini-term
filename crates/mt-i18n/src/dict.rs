@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 32;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 767;
+pub const ZH_ENTRY_COUNT: usize = 769;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 767;
+pub const EN_ENTRY_COUNT: usize = 769;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -1110,6 +1110,8 @@ static SETTINGS_ZH: &[(&str, &str)] = &[
     ("system.trayStatusDesc", "在系统状态栏（Windows 托盘 / macOS 菜单栏）显示 AI 状态灯（黄=待确认 蓝=处理中 绿=完成未读），右键可查看各项目状态；关闭后图标隐藏"),
     ("system.trayStatusTitle", "状态栏图标"),
     ("terminal.addTerminal", "+ 添加终端"),
+    ("terminal.animationsDesc", "终端区的换场动画：切换标签 / 切换面板 / 最大化与还原 / 拆分终端。关闭后这些操作瞬时完成"),
+    ("terminal.animationsTitle", "启用动画"),
     ("terminal.availableTerminals", "可用终端（●= 默认）"),
     ("terminal.behavior", "终端行为"),
     ("terminal.defaultHint", "点击圆点设为默认终端 · 新建终端标签页时可选择类型"),
@@ -1303,6 +1305,8 @@ static SETTINGS_EN: &[(&str, &str)] = &[
     ("system.trayStatusDesc", "Show an AI status light in the system status area (Windows tray / macOS menu bar): yellow=awaiting confirmation, blue=working, green=unread completion; right-click for per-project status. Turn off to hide the icon"),
     ("system.trayStatusTitle", "Status bar icon"),
     ("terminal.addTerminal", "+ Add terminal"),
+    ("terminal.animationsDesc", "Terminal-area transitions: switching tabs / panels, maximize & restore, splitting. When off these happen instantly"),
+    ("terminal.animationsTitle", "Enable animations"),
     ("terminal.availableTerminals", "Available terminals (● = default)"),
     ("terminal.behavior", "Terminal behavior"),
     ("terminal.defaultHint", "Click the dot to set the default terminal · Choose a type when opening a new tab"),
