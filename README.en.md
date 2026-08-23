@@ -103,6 +103,8 @@ The built-in `mt-ssh-cli` sidecar provides four subcommands — `list`, `exec`, 
 
 - A **project sidebar** for multiple workspaces, with up to 3 levels of nested groups, drag-to-reorder, and drag-a-folder-from-Explorer to add
 - **Arbitrarily nested horizontal / vertical splits**, drag to adjust ratios; tabs, splits, and window geometry all persist and restore on restart
+- **Project-level terminal panels** — an icon strip on the terminal area's right edge gives one project multiple **independent terminal workspaces**, each holding its own splits and tabs (one face for the AI session, another split for frontend + backend; click an icon to switch the whole face); buttons carry an AI progress light and a terminal-count badge, double-click to rename, everything restores on restart
+- **Transition animations** — directional pushes when switching tabs / panels, maximize expands from the pane's own cell and restore reverses it back; a single switch in Settings turns them all off
 - **Drag panes to rearrange & maximize** — drag a tab into another group to merge, or onto a terminal-area edge to split off a new pane, with a live drop preview; double-click the tab bar's empty area to temporarily fill the terminal area, and content survives throughout
 - **Terminal caching** — switching projects, tabs, or panes never rebuilds the terminal instance; lazy startup creates a PTY only for the visible pane, so more history projects never means a slower launch
 - **Configurable scrollback** (10,000 lines by default, lowering it takes effect immediately and frees the memory) with correct CSI 3J handling; the Windows build bundles a pinned official ConPTY runtime
