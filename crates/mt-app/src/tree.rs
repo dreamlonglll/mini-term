@@ -173,6 +173,31 @@ impl PaneState {
     }
 }
 
+/// 一个「项目级终端面板」:项目下的一个独立终端工作面,自带一整棵分屏树,
+/// 面板之间互不影响(VS Code 终端面板右侧列表的那层语义)。
+///
+/// 对应磁盘格式的 `SavedTab` —— GPUI 迁移期这一层曾被收成单元素数组
+/// (persist.rs 旧注释「项目级 tab 层早已删除」),现按原语义复活;
+/// 磁盘格式本来就是 `tabs[]` + `activeTabIndex`,一个字都不用改。
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProjectPanel {
+    /// 运行时 id(`panel-N`),与叶子/split 的 id 同理**不落盘**。
+    pub id: String,
+    /// 自定义名。`None` = 界面按序号显示。随布局落盘(`SavedTab.customTitle`)。
+    pub custom_title: Option<String>,
+    pub layout: SplitNode,
+}
+
+impl ProjectPanel {
+    pub fn new(layout: SplitNode) -> Self {
+        Self {
+            id: gen_id("panel"),
+            custom_title: None,
+            layout,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SplitDirection {
     /// 左右并排(「向右分屏」)。
@@ -300,6 +325,37 @@ impl SplitNode {
             Self::Split { children, .. } => {
                 for c in children {
                     c.collect_leaves(out);
+                }
+            }
+        }
+    }
+
+    /// 收集「切到这棵树就能看见」的 pane —— 每个叶子的激活 tab(DFS 序)。
+    /// 被压在后台的 tab 不在内;面板竖条的呼吸灯按这份算,后台 tab 不亮灯。
+    pub fn visible_panes(&self) -> Vec<&PaneState> {
+        let mut out = Vec::new();
+        self.collect_visible_panes(&mut out);
+        out
+    }
+
+    fn collect_visible_panes<'a>(&'a self, out: &mut Vec<&'a PaneState>) {
+        match self {
+            Self::Leaf {
+                panes,
+                active_pane_id,
+                ..
+            } => {
+                if let Some(p) = panes
+                    .iter()
+                    .find(|p| &p.id == active_pane_id)
+                    .or_else(|| panes.first())
+                {
+                    out.push(p);
+                }
+            }
+            Self::Split { children, .. } => {
+                for c in children {
+                    c.collect_visible_panes(out);
                 }
             }
         }
@@ -1165,6 +1221,35 @@ mod tests {
             sizes: vec![100.0 / n as f64; n],
             children,
         }
+    }
+
+    /// `visible_panes()`:每个叶子只出激活 tab,后台 tab 不在内;
+    /// 分屏的各格都算「看得见」。
+    #[test]
+    fn 可见pane只含各叶子的激活tab() {
+        // 叶子 a 有两个 tab,激活第二个;叶子 b 单 tab —— 可见 = [a2, b]
+        let mut la = leaf("a1", 1);
+        la.append_pane(None, pane("a2", 2));
+        let a2 = la.panes()[1].id.clone();
+        la.activate_pane(&a2);
+        let root = split_of(SplitDirection::Horizontal, vec![la, leaf("b", 3)]);
+
+        let visible: Vec<&str> = root
+            .visible_panes()
+            .iter()
+            .map(|p| p.shell_name.as_str())
+            .collect();
+        assert_eq!(visible, ["a2", "b"], "后台 tab a1 不该出现");
+    }
+
+    /// `ProjectPanel::new`:运行时 id 逐个唯一、初始无自定义名。
+    #[test]
+    fn 面板构造带唯一id且无自定义名() {
+        let a = ProjectPanel::new(leaf("a", 1));
+        let b = ProjectPanel::new(leaf("b", 2));
+        assert_ne!(a.id, b.id);
+        assert!(a.id.starts_with("panel-"));
+        assert_eq!(a.custom_title, None);
     }
 
     /// 深度优先的名牌序列(TS 的 `paneIds(node)`)。

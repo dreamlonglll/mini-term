@@ -6,30 +6,28 @@
 //! `project_layout.layout_json`(见 `mt-layout`)。换信封时本模块一行没动,
 //! 存量数据也是逐字节搬过去的。
 //!
-//! `tabs` 恒为 0 或 1 个元素:项目级 tab 层早已删除,数组只是历史兼容。读到多元素
-//! 时把后续 tab 的 pane 平铺进保留那棵树最左侧叶子的 tab 栏(与 TS 侧同一口径),
-//! 不静默吃掉用户的终端。
+//! `tabs` 的每个元素对应一个**项目级终端面板**([`ProjectPanel`]):GPUI 迁移期
+//! 这一层曾被收成单元素数组(彼时读到多元素会把后续 tab 的 pane 平铺进第一棵树),
+//! 现按磁盘格式的原语义复活 —— 一个 tab 一个面板,`activeTabIndex` 指活动面板。
+//! 迁移期落盘的单元素数据在新读法下就是「只有一个面板」,天然兼容。
 
 use mt_config::{
     AppConfig, SavedAiSession, SavedPane, SavedProjectLayout, SavedSplitNode, SavedTab,
 };
 
-use crate::tree::{AiSessionRef, PaneState, SplitDirection, SplitNode};
+use crate::tree::{AiSessionRef, PaneState, ProjectPanel, SplitDirection, SplitNode};
 
-/// 运行时布局 → 磁盘格式。
-pub fn serialize_layout(layout: Option<&SplitNode>) -> SavedProjectLayout {
-    match layout {
-        None => SavedProjectLayout {
-            tabs: Vec::new(),
-            active_tab_index: 0,
-        },
-        Some(node) => SavedProjectLayout {
-            tabs: vec![SavedTab {
-                custom_title: None,
-                split_layout: serialize_node(node),
-            }],
-            active_tab_index: 0,
-        },
+/// 运行时布局 → 磁盘格式:每个面板一个 `SavedTab`(自定义名随之落盘)。
+pub fn serialize_layout(panels: &[ProjectPanel], active_index: usize) -> SavedProjectLayout {
+    SavedProjectLayout {
+        tabs: panels
+            .iter()
+            .map(|panel| SavedTab {
+                custom_title: panel.custom_title.clone(),
+                split_layout: serialize_node(&panel.layout),
+            })
+            .collect(),
+        active_tab_index: active_index.min(panels.len().saturating_sub(1)),
     }
 }
 
@@ -64,61 +62,31 @@ fn serialize_node(node: &SplitNode) -> SavedSplitNode {
     }
 }
 
-/// 磁盘格式 → 运行时布局。shell 名对不上(用户删了某个 shell)时按
-/// `defaultShell` → 列表首项回落;一个都没有则这个 pane 丢弃。
-pub fn restore_layout(saved: &SavedProjectLayout, config: &AppConfig) -> Option<SplitNode> {
-    let trees: Vec<SplitNode> = saved
-        .tabs
-        .iter()
-        .filter_map(|tab| restore_node(&tab.split_layout, config))
-        .collect();
-    if trees.is_empty() {
-        return None;
-    }
-
-    let keep = if saved.active_tab_index < trees.len() {
-        saved.active_tab_index
-    } else {
-        0
-    };
-    let mut extras: Vec<PaneState> = Vec::new();
-    let mut kept: Option<SplitNode> = None;
-    for (i, tree) in trees.into_iter().enumerate() {
-        if i == keep {
-            kept = Some(tree);
-        } else {
-            extras.extend(tree.panes().into_iter().cloned());
+/// 磁盘格式 → 运行时面板列表 + 活动面板 id。shell 名对不上(用户删了某个 shell)
+/// 时按 `defaultShell` → 列表首项回落;一个都没有则这个 pane 丢弃,pane 全丢的
+/// tab 整个不还原(`activeTabIndex` 随之按「幸存前的原始下标」重新对位)。
+pub fn restore_layout(
+    saved: &SavedProjectLayout,
+    config: &AppConfig,
+) -> (Vec<ProjectPanel>, Option<String>) {
+    let mut panels = Vec::new();
+    let mut active_id: Option<String> = None;
+    for (i, tab) in saved.tabs.iter().enumerate() {
+        let Some(layout) = restore_node(&tab.split_layout, config) else {
+            continue;
+        };
+        let mut panel = ProjectPanel::new(layout);
+        panel.custom_title = tab.custom_title.clone();
+        if i == saved.active_tab_index {
+            active_id = Some(panel.id.clone());
         }
+        panels.push(panel);
     }
-    let mut layout = kept?;
-    for pane in extras {
-        // 追加到最左侧叶子的 tab 栏末尾,不动 activePaneId(与 TS 版一致)
-        let active_before = active_pane_of_first_leaf(&layout);
-        layout.append_pane(None, pane);
-        if let Some(active) = active_before {
-            restore_active(&mut layout, &active);
-        }
+    // 指着的那个 tab 没能还原(或下标越界)→ 回落第一个幸存面板
+    if active_id.is_none() {
+        active_id = panels.first().map(|p| p.id.clone());
     }
-    Some(layout)
-}
-
-fn active_pane_of_first_leaf(node: &SplitNode) -> Option<String> {
-    match node {
-        SplitNode::Leaf { active_pane_id, .. } => Some(active_pane_id.clone()),
-        SplitNode::Split { children, .. } => children.first().and_then(active_pane_of_first_leaf),
-    }
-}
-
-fn restore_active(node: &mut SplitNode, pane_id: &str) {
-    if let SplitNode::Leaf { active_pane_id, .. } = node {
-        *active_pane_id = pane_id.to_string();
-        return;
-    }
-    if let SplitNode::Split { children, .. } = node
-        && let Some(first) = children.first_mut()
-    {
-        restore_active(first, pane_id);
-    }
+    (panels, active_id)
 }
 
 fn restore_node(saved: &SavedSplitNode, config: &AppConfig) -> Option<SplitNode> {
@@ -231,12 +199,22 @@ mod tests {
         SplitNode::leaf(PaneState::new(shell))
     }
 
+    /// 单面板包一下(多数用例只关心一棵树)。
+    fn one_panel(tree: SplitNode) -> Vec<ProjectPanel> {
+        vec![ProjectPanel::new(tree)]
+    }
+
+    /// 还原并取第一个面板的树(单面板用例的捷径)。
+    fn restore_first(saved: &SavedProjectLayout, config: &AppConfig) -> SplitNode {
+        let (panels, _) = restore_layout(saved, config);
+        panels.into_iter().next().expect("至少一个面板").layout
+    }
+
     #[test]
     fn 单叶子往返() {
-        let tree = leaf("cmd");
-        let saved = serialize_layout(Some(&tree));
+        let saved = serialize_layout(&one_panel(leaf("cmd")), 0);
         assert_eq!(saved.tabs.len(), 1);
-        let back = restore_layout(&saved, &config()).unwrap();
+        let back = restore_first(&saved, &config());
         assert_eq!(back.panes().len(), 1);
         assert_eq!(back.panes()[0].shell_name, "cmd");
     }
@@ -250,8 +228,8 @@ mod tests {
             *sizes = vec![30.0, 70.0];
         }
 
-        let saved = serialize_layout(Some(&tree));
-        let back = restore_layout(&saved, &config()).unwrap();
+        let saved = serialize_layout(&one_panel(tree), 0);
+        let back = restore_first(&saved, &config());
         let SplitNode::Split {
             direction, sizes, ..
         } = &back
@@ -261,6 +239,34 @@ mod tests {
         assert_eq!(*direction, SplitDirection::Vertical);
         assert_eq!(sizes, &vec![30.0, 70.0]);
         assert_eq!(back.panes().len(), 2);
+    }
+
+    /// 多面板往返:面板数、每个面板的树、自定义名、活动下标全数保留。
+    #[test]
+    fn 多面板往返保留自定义名与活动面板() {
+        let mut second = ProjectPanel::new(leaf("PowerShell"));
+        second.custom_title = Some("构建".into());
+        let panels = vec![ProjectPanel::new(leaf("cmd")), second];
+
+        let saved = serialize_layout(&panels, 1);
+        assert_eq!(saved.tabs.len(), 2);
+        assert_eq!(saved.active_tab_index, 1);
+        assert_eq!(saved.tabs[1].custom_title.as_deref(), Some("构建"));
+
+        let (back, active) = restore_layout(&saved, &config());
+        assert_eq!(back.len(), 2);
+        assert_eq!(back[0].custom_title, None);
+        assert_eq!(back[1].custom_title.as_deref(), Some("构建"));
+        assert_eq!(active.as_deref(), Some(back[1].id.as_str()), "活动面板是第 1 个");
+    }
+
+    /// 活动下标越界(手改/旧数据)→ 回落第一个面板,不 panic。
+    #[test]
+    fn 活动下标越界回落第一个面板() {
+        let mut saved = serialize_layout(&one_panel(leaf("cmd")), 0);
+        saved.active_tab_index = 9;
+        let (back, active) = restore_layout(&saved, &config());
+        assert_eq!(active.as_deref(), Some(back[0].id.as_str()));
     }
 
     #[test]
@@ -279,13 +285,14 @@ mod tests {
             }],
             active_tab_index: 0,
         };
-        let back = restore_layout(&saved, &config()).unwrap();
+        let back = restore_first(&saved, &config());
         assert_eq!(back.panes()[0].shell_name, "PowerShell");
     }
 
-    /// 旧配置的多 tab:保留 activeTabIndex 指的那棵,其余 pane 平铺进它最左叶子。
+    /// 存量多 tab 数据按原语义恢复成多个面板,一个终端都不丢,
+    /// `activeTabIndex` 指的那个成为活动面板。
     #[test]
-    fn 多_tab_旧配置合并进一棵树() {
+    fn 多_tab_恢复为多个面板() {
         let mk = |name: &str| SavedTab {
             custom_title: None,
             split_layout: SavedSplitNode::Leaf {
@@ -301,17 +308,10 @@ mod tests {
             tabs: vec![mk("cmd"), mk("PowerShell"), mk("cmd")],
             active_tab_index: 1,
         };
-        let back = restore_layout(&saved, &config()).unwrap();
-        assert_eq!(back.panes().len(), 3, "一个终端都不能丢");
-        assert_eq!(back.panes()[0].shell_name, "PowerShell", "留的是第 1 棵");
-        match &back {
-            SplitNode::Leaf {
-                panes,
-                active_pane_id,
-                ..
-            } => assert_eq!(active_pane_id, &panes[0].id, "激活项不该被追加的 pane 抢走"),
-            _ => panic!(),
-        }
+        let (back, active) = restore_layout(&saved, &config());
+        assert_eq!(back.len(), 3, "一个面板都不能丢");
+        assert_eq!(back[1].layout.panes()[0].shell_name, "PowerShell");
+        assert_eq!(active.as_deref(), Some(back[1].id.as_str()), "活动面板对位");
     }
 
     /// 旧格式的 `pane`(单数)字段仍读得进来。
@@ -331,7 +331,7 @@ mod tests {
             }],
             active_tab_index: 0,
         };
-        let back = restore_layout(&saved, &config()).unwrap();
+        let back = restore_first(&saved, &config());
         assert_eq!(back.panes()[0].shell_name, "cmd");
         assert_eq!(back.panes()[0].cwd.as_deref(), Some("D:/x"));
     }
@@ -346,8 +346,8 @@ mod tests {
             session_id: "sess-1".into(),
             cwd: Some("D:/proj".into()),
         });
-        let saved = serialize_layout(Some(&tree));
-        let back = restore_layout(&saved, &config()).unwrap();
+        let saved = serialize_layout(&one_panel(tree), 0);
+        let back = restore_first(&saved, &config());
         let s = back.panes()[0].ai_session.as_ref().unwrap();
         assert_eq!(s.session_id, "sess-1");
         assert_eq!(s.agent.as_deref(), Some("claude"));
@@ -369,11 +369,11 @@ mod tests {
         });
         tree.append_pane(None, PaneState::new("cmd")); // 没有会话身份的那个
 
-        let saved = serialize_layout(Some(&tree));
+        let saved = serialize_layout(&one_panel(tree), 0);
         // 关掉自动续接也照样置位
         let mut cfg = config();
         cfg.ai_auto_resume = Some(false);
-        let back = restore_layout(&saved, &cfg).unwrap();
+        let back = restore_first(&saved, &cfg);
 
         let panes = back.panes();
         assert_eq!(panes.len(), 2);
@@ -381,7 +381,7 @@ mod tests {
         assert!(!panes[1].resume_pending, "没有会话身份的不置位");
 
         // 开着开关时同样置位(置位与开关无关)
-        let back = restore_layout(&saved, &config()).unwrap();
+        let back = restore_first(&saved, &config());
         assert!(back.panes()[0].resume_pending);
     }
 
@@ -393,19 +393,21 @@ mod tests {
         let id = tree.panes()[0].id.clone();
         tree.pane_mut(&id).unwrap().resume_pending = true;
 
-        let saved = serialize_layout(Some(&tree));
+        let saved = serialize_layout(&one_panel(tree), 0);
         let json = serde_json::to_string(&saved).unwrap();
         assert!(!json.contains("resume"), "磁盘格式里不许出现这个字段: {json}");
 
         // 没有 ai_session 的 pane 转一圈回来标记必须是 false(不是被"记住"了)
-        let back = restore_layout(&saved, &config()).unwrap();
+        let back = restore_first(&saved, &config());
         assert!(!back.panes()[0].resume_pending);
     }
 
     #[test]
     fn 空布局序列化为空_tabs() {
-        let saved = serialize_layout(None);
+        let saved = serialize_layout(&[], 0);
         assert!(saved.tabs.is_empty());
-        assert!(restore_layout(&saved, &config()).is_none());
+        let (panels, active) = restore_layout(&saved, &config());
+        assert!(panels.is_empty());
+        assert!(active.is_none());
     }
 }

@@ -42,14 +42,17 @@ use crate::project_tree;
 use crate::session_panel::build_resume_command;
 use crate::shell_ops::ShellList;
 use crate::tree::{
-    AiSessionRef, DropZone, PaneState, PaneStatus, SplitDirection, SplitNode, gen_id,
+    AiSessionRef, DropZone, PaneState, PaneStatus, ProjectPanel, SplitDirection, SplitNode, gen_id,
 };
 
 /// 单个项目的运行时状态(对应 `types.ts` 的 `ProjectState`)。
 pub struct ProjectState {
-    /// 终端布局树;`None` = 还没有终端(渲染空态)。
-    pub layout: Option<SplitNode>,
-    /// 由 layout 聚合出的项目级状态(error > ai-working > ai-idle > idle)。
+    /// 项目级终端面板列表(空 = 还没有终端,渲染空态)。每个面板自带一整棵
+    /// 分屏树,终端区只渲染活动面板那棵;其余面板的 PTY 照常在后台跑。
+    pub panels: Vec<ProjectPanel>,
+    /// 活动面板 id。列表非空时恒有效([`Self::active_panel`] 兜底取第一个)。
+    pub active_panel_id: Option<String>,
+    /// 由**全部面板**聚合出的项目级状态(error > ai-working > ai-idle > idle)。
     pub status: PaneStatus,
     /// 非激活项目里有 AI 任务完成 —— 项目行上的提示点。
     pub needs_attention: bool,
@@ -58,16 +61,171 @@ pub struct ProjectState {
     /// **纯运行时,不落盘**(`types.ts::ProjectState.maximizedPaneId` 同样不进
     /// `savedLayout`,`persist.rs` 里一个字都不该出现它)。语义是「哪个 pane 被
     /// 铺满了」而不是「哪个叶子」—— 同组内切 tab 仍然保持最大化,与原版一致。
+    /// 只对活动面板有意义,切面板时清掉。
     pub maximized_pane_id: Option<String>,
 }
 
 impl ProjectState {
     fn new() -> Self {
         Self {
-            layout: None,
+            panels: Vec::new(),
+            active_panel_id: None,
             status: PaneStatus::Idle,
             needs_attention: false,
             maximized_pane_id: None,
+        }
+    }
+
+    // ── 面板访问 ──────────────────────────────────────────────
+    //
+    // 调用侧的两类语义在这里分流:围绕**看得见的那棵树**的操作
+    // (渲染/切 tab/分屏/最大化)走 `active_*`;按 id / pty 找 pane 的操作
+    // (状态回报/改名/移动端写入/关闭)跨全部面板 —— pane id 与 pty id
+    // 全局唯一,漏了后台面板就是「后台 AI 的状态灯永远不亮」这类静默 bug。
+
+    /// 活动面板。`active_panel_id` 失配/缺失时兜底取第一个 —— 恢复期/关面板的
+    /// 中间态不该让整个终端区渲染成空白。
+    pub fn active_panel(&self) -> Option<&ProjectPanel> {
+        self.active_panel_id
+            .as_deref()
+            .and_then(|id| self.panels.iter().find(|p| p.id == id))
+            .or_else(|| self.panels.first())
+    }
+
+    pub fn active_layout(&self) -> Option<&SplitNode> {
+        self.active_panel().map(|p| &p.layout)
+    }
+
+    pub fn active_layout_mut(&mut self) -> Option<&mut SplitNode> {
+        let id = self.active_panel()?.id.clone();
+        self.panels
+            .iter_mut()
+            .find(|p| p.id == id)
+            .map(|p| &mut p.layout)
+    }
+
+    /// 活动面板在列表里的下标(落盘的 `activeTabIndex`)。
+    pub fn active_panel_index(&self) -> usize {
+        self.active_panel()
+            .and_then(|active| self.panels.iter().position(|p| p.id == active.id))
+            .unwrap_or(0)
+    }
+
+    pub fn panel_mut(&mut self, panel_id: &str) -> Option<&mut ProjectPanel> {
+        self.panels.iter_mut().find(|p| p.id == panel_id)
+    }
+
+    /// 全部面板的树,面板序。
+    pub fn layouts(&self) -> impl Iterator<Item = &SplitNode> {
+        self.panels.iter().map(|p| &p.layout)
+    }
+
+    pub fn layouts_mut(&mut self) -> impl Iterator<Item = &mut SplitNode> {
+        self.panels.iter_mut().map(|p| &mut p.layout)
+    }
+
+    /// 持有该 pane 的面板 id(跨全部面板)。
+    pub fn panel_id_of_pane(&self, pane_id: &str) -> Option<&str> {
+        self.panels
+            .iter()
+            .find(|p| p.layout.pane(pane_id).is_some())
+            .map(|p| p.id.as_str())
+    }
+
+    pub fn layout_of_pane(&self, pane_id: &str) -> Option<&SplitNode> {
+        self.layouts().find(|l| l.pane(pane_id).is_some())
+    }
+
+    pub fn layout_of_pane_mut(&mut self, pane_id: &str) -> Option<&mut SplitNode> {
+        self.panels
+            .iter_mut()
+            .map(|p| &mut p.layout)
+            .find(|l| l.pane(pane_id).is_some())
+    }
+
+    /// 按 pane id 找(跨全部面板)。
+    pub fn pane(&self, pane_id: &str) -> Option<&PaneState> {
+        self.layouts().find_map(|l| l.pane(pane_id))
+    }
+
+    pub fn pane_mut(&mut self, pane_id: &str) -> Option<&mut PaneState> {
+        self.panels
+            .iter_mut()
+            .find_map(|p| p.layout.pane_mut(pane_id))
+    }
+
+    pub fn pane_by_pty_mut(&mut self, pty_id: u32) -> Option<&mut PaneState> {
+        self.panels
+            .iter_mut()
+            .find_map(|p| p.layout.pane_by_pty_mut(pty_id))
+    }
+
+    /// 全部面板的全部 pane,面板序 × 树内 DFS 序。
+    pub fn all_panes(&self) -> Vec<&PaneState> {
+        self.layouts().flat_map(|l| l.panes()).collect()
+    }
+
+    pub fn pty_ids(&self) -> Vec<u32> {
+        self.layouts().flat_map(|l| l.pty_ids()).collect()
+    }
+
+    /// 跨全部面板的聚合状态。
+    pub fn highest_status(&self) -> PaneStatus {
+        self.layouts().fold(PaneStatus::Idle, |acc, l| {
+            let s = l.highest_status();
+            if s.priority() > acc.priority() { s } else { acc }
+        })
+    }
+
+    /// 按节点 id 找叶子/split(跨全部面板;节点 id 全局唯一)。
+    pub fn node(&self, node_id: &str) -> Option<&SplitNode> {
+        self.layouts().find_map(|l| l.node(node_id))
+    }
+
+    pub fn node_mut(&mut self, node_id: &str) -> Option<&mut SplitNode> {
+        self.panels
+            .iter_mut()
+            .find_map(|p| p.layout.node_mut(node_id))
+    }
+
+    /// 持有该 pane 的叶子(跨全部面板)。
+    pub fn leaf_of_pane(&self, pane_id: &str) -> Option<&SplitNode> {
+        self.layouts().find_map(|l| l.leaf_of_pane(pane_id))
+    }
+
+    /// 把 pane 从它所在的面板里摘掉;面板随最后一个 pane 一起消失,
+    /// 活动指针挪到邻位(原下标处的右邻,没有则末位)。
+    pub fn remove_pane(&mut self, pane_id: &str) {
+        let Some(idx) = self
+            .panels
+            .iter()
+            .position(|p| p.layout.pane(pane_id).is_some())
+        else {
+            return;
+        };
+        let ProjectPanel {
+            id,
+            custom_title,
+            layout,
+        } = self.panels.remove(idx);
+        match layout.remove_pane(pane_id) {
+            Some(layout) => self.panels.insert(
+                idx,
+                ProjectPanel {
+                    id,
+                    custom_title,
+                    layout,
+                },
+            ),
+            None => {
+                if self.active_panel_id.as_deref() == Some(id.as_str()) {
+                    self.active_panel_id = self
+                        .panels
+                        .get(idx)
+                        .or_else(|| self.panels.last())
+                        .map(|p| p.id.clone());
+                }
+            }
         }
     }
 }
@@ -137,6 +295,9 @@ pub struct AppStore {
     /// 窗口几何(退出时的大小/位置/最大化态)。config 里没有对应字段 ——
     /// 这是 GPUI 版新补的能力,只住在 `layout.db` 与这里。
     window_geometry: Option<mt_layout::WindowGeometry>,
+    /// 终端区右缘「终端列表」竖条的显隐。与 [`Self::window_geometry`] 同类:
+    /// config 里没有对应字段,只住在 `layout.db` 与这里。
+    terminals_panel_visible: bool,
     /// 攒着待写的项目 id 与「全局项脏了」标记。防抖窗口内拖十次分隔条只落一次盘,
     /// 且不同项目的改动互不覆盖。
     layout_dirty_projects: HashSet<String>,
@@ -279,11 +440,12 @@ fn layout_migration_fallback(config: &AppConfig, dir: &Path) -> Option<AppConfig
 /// 不是「用户把它设成了默认值」。项目级则相反 —— 逐个赋值(含赋 `None`),
 /// 库才是唯一真相:用户把某项目的终端关光了,config.json 里的残留不该复活。
 ///
-/// 返回窗口几何(config 里没有它的位置,由调用方单独接住)。
+/// 返回窗口几何与终端列表竖条显隐(config 里没有它们的位置 —— 都是 GPUI 版
+/// 新加的能力,只住在 `layout.db` 与 `AppStore` 的字段上,由调用方单独接住)。
 fn apply_layout_db(
     store: &mt_layout::LayoutStore,
     config: &mut AppConfig,
-) -> Option<mt_layout::WindowGeometry> {
+) -> (Option<mt_layout::WindowGeometry>, Option<bool>) {
     let globals = store.load_globals();
     if globals.layout_sizes.is_some() {
         config.layout_sizes = globals.layout_sizes;
@@ -310,7 +472,10 @@ fn apply_layout_db(
 
     // 明显不可用的几何(尺寸为 0、NaN、小得放不下内容)当没存过 —— 让开窗
     // 那一步回落默认居中窗口,而不是开出一条缝。
-    globals.window.filter(|geo| geo.is_sane())
+    (
+        globals.window.filter(|geo| geo.is_sane()),
+        globals.terminals_panel_visible,
+    )
 }
 
 impl AppStore {
@@ -333,7 +498,7 @@ impl AppStore {
         // 配置加载失败(token=0)时不迁移:那份 config 是空默认值,灌进去等于
         // 拿一份伪造的空布局把用户真实的布局盖掉。
         let layout_store = open_layout_store(&config, token != 0);
-        let window_geometry = layout_store
+        let (window_geometry, terminals_panel_visible) = layout_store
             .as_ref()
             .map(|store| apply_layout_db(store, &mut config))
             .unwrap_or_default();
@@ -343,10 +508,10 @@ impl AppStore {
         for project in &config.projects {
             let mut state = ProjectState::new();
             if let Some(saved) = &project.saved_layout {
-                state.layout = persist::restore_layout(saved, &config);
-                if let Some(layout) = &state.layout {
-                    state.status = layout.highest_status();
-                }
+                let (panels, active) = persist::restore_layout(saved, &config);
+                state.panels = panels;
+                state.active_panel_id = active;
+                state.status = state.highest_status();
             }
             project_states.insert(project.id.clone(), state);
             expanded_dirs.insert(
@@ -367,6 +532,8 @@ impl AppStore {
             config_store,
             layout_store,
             window_geometry,
+            // 缺省展开:面板是发现型入口,收着的话没人知道它存在
+            terminals_panel_visible: terminals_panel_visible.unwrap_or(true),
             layout_dirty_projects: HashSet::new(),
             layout_globals_dirty: false,
             layout_save_generation: 0,
@@ -433,7 +600,7 @@ impl AppStore {
         self.active_project_id
             .as_deref()
             .and_then(|id| self.project_states.get(id))
-            .and_then(|s| s.layout.as_ref())
+            .and_then(|s| s.active_layout())
     }
 
     pub fn terminal(&self, pty_id: u32) -> Option<&Entity<TerminalPane>> {
@@ -582,8 +749,7 @@ impl AppStore {
         let pty_ids: Vec<u32> = self
             .project_states
             .get(project_id)
-            .and_then(|s| s.layout.as_ref())
-            .map(|l| l.pty_ids())
+            .map(|s| s.pty_ids())
             .unwrap_or_default();
         for pty_id in pty_ids {
             self.dispose_terminal(pty_id, cx);
@@ -724,8 +890,7 @@ impl AppStore {
         let pty_ids: Vec<u32> = self
             .project_states
             .get(id)
-            .and_then(|s| s.layout.as_ref())
-            .map(|l| l.pty_ids())
+            .map(|s| s.pty_ids())
             .unwrap_or_default();
         for pty_id in pty_ids {
             self.dispose_terminal(pty_id, cx);
@@ -958,12 +1123,21 @@ impl AppStore {
 
         let anchor = anchor_pane_id.or_else(|| self.focused_pane_id.clone());
         let state = self.project_states.get_mut(project_id)?;
-        match state.layout.as_mut() {
-            None => state.layout = Some(SplitNode::leaf(pane)),
-            Some(layout) => {
-                let anchor = anchor.filter(|id| layout.pane(id).is_some());
-                layout.append_pane(anchor.as_deref(), pane);
-            }
+        if state.panels.is_empty() {
+            let panel = ProjectPanel::new(SplitNode::leaf(pane));
+            state.active_panel_id = Some(panel.id.clone());
+            state.panels.push(panel);
+        } else {
+            // 锚点在哪个面板就落哪个面板(缺省的焦点 pane 就在活动面板上),
+            // 锚点失效则回落活动面板
+            let anchor = anchor.filter(|id| state.pane(id).is_some());
+            let target = anchor
+                .as_deref()
+                .and_then(|id| state.panel_id_of_pane(id))
+                .map(str::to_string)
+                .or_else(|| state.active_panel().map(|p| p.id.clone()))?;
+            let layout = &mut state.panel_mut(&target)?.layout;
+            layout.append_pane(anchor.as_deref(), pane);
         }
         self.after_layout_change(project_id, cx);
         self.focus_pane(project_id, &pane_id, window, cx);
@@ -1003,15 +1177,13 @@ impl AppStore {
         let source_cwd = cwd.or_else(|| {
             self.project_states
                 .get(project_id)
-                .and_then(|s| s.layout.as_ref())
-                .and_then(|l| l.pane(pane_id))
+                .and_then(|s| s.pane(pane_id))
                 .and_then(|p| p.cwd.clone())
         });
         let shell_name = self
             .project_states
             .get(project_id)
-            .and_then(|s| s.layout.as_ref())
-            .and_then(|l| l.pane(pane_id))
+            .and_then(|s| s.pane(pane_id))
             .map(|p| p.shell_name.clone());
         let shell = self.resolve_shell(shell_name.as_deref())?;
 
@@ -1020,10 +1192,13 @@ impl AppStore {
         let new_leaf = SplitNode::leaf(pane);
 
         let state = self.project_states.get_mut(project_id)?;
-        let Some(layout) = state.layout.as_mut() else {
-            return None;
-        };
-        if !layout.insert_split(pane_id, direction, new_leaf) {
+        // 在目标 pane 所在的面板里分屏;pane 没了(含整个面板没了)与树变换
+        // 未命中同一档处置 —— 回收无处安放的新 PTY
+        let inserted = state
+            .layout_of_pane_mut(pane_id)
+            .map(|layout| layout.insert_split(pane_id, direction, new_leaf))
+            .unwrap_or(false);
+        if !inserted {
             // 目标 pane 在起 PTY 期间被关掉了 —— 新 PTY 无处安放,显式回收,
             // 否则后端留一个谁也看不见、谁也杀不掉的孤儿子进程。
             let orphan: Vec<u32> = self
@@ -1061,16 +1236,19 @@ impl AppStore {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // 拖拽只发生在看得见的那棵树上 —— 源与目标都在活动面板里
         let Some(next) = self
             .project_states
             .get(project_id)
-            .and_then(|s| s.layout.as_ref())
+            .and_then(|s| s.active_layout())
             .and_then(|l| l.move_pane_in_layout(pane_id, target_pane_id, zone))
         else {
             return;
         };
-        if let Some(state) = self.project_states.get_mut(project_id) {
-            state.layout = Some(next);
+        if let Some(state) = self.project_states.get_mut(project_id)
+            && let Some(layout) = state.active_layout_mut()
+        {
+            *layout = next;
         }
         // 与 split_pane 同一处置:最大化状态下四边分屏会落进隐藏的整树,先还原。
         // `move_pane_to_tab` **不需要** —— 最大化时 tab 栏只能同组重排,结果就在眼前。
@@ -1093,13 +1271,15 @@ impl AppStore {
         let Some(next) = self
             .project_states
             .get(project_id)
-            .and_then(|s| s.layout.as_ref())
+            .and_then(|s| s.active_layout())
             .and_then(|l| l.move_pane_to_tab_index(pane_id, anchor_pane_id, index))
         else {
             return;
         };
-        if let Some(state) = self.project_states.get_mut(project_id) {
-            state.layout = Some(next);
+        if let Some(state) = self.project_states.get_mut(project_id)
+            && let Some(layout) = state.active_layout_mut()
+        {
+            *layout = next;
         }
         self.after_layout_change(project_id, cx);
         self.focus_pane(project_id, pane_id, window, cx);
@@ -1112,7 +1292,7 @@ impl AppStore {
     /// 与门之后才去找那个叶子的。
     pub fn maximized_pane_id(&self, project_id: &str) -> Option<&str> {
         let state = self.project_states.get(project_id)?;
-        let layout = state.layout.as_ref()?;
+        let layout = state.active_layout()?;
         if !matches!(layout, SplitNode::Split { .. }) {
             return None;
         }
@@ -1134,7 +1314,7 @@ impl AppStore {
         let Some(state) = self.project_states.get(project_id) else {
             return;
         };
-        let Some(layout) = state.layout.as_ref() else {
+        let Some(layout) = state.active_layout() else {
             return;
         };
         let anchor_leaf = layout.leaf_of_pane(anchor_pane_id).map(|l| l.id().to_string());
@@ -1179,13 +1359,13 @@ impl AppStore {
         }
     }
 
-    /// 关闭一个 pane:回收 PTY,再把它从树里摘掉(树空了 = 项目回到空态)。
+    /// 关闭一个 pane:回收 PTY,再把它从所在面板的树里摘掉
+    /// (面板随最后一个 pane 一起消失;面板全没了 = 项目回到空态)。
     pub fn close_pane(&mut self, project_id: &str, pane_id: &str, cx: &mut Context<Self>) {
         let pty_id = self
             .project_states
             .get(project_id)
-            .and_then(|s| s.layout.as_ref())
-            .and_then(|l| l.pane(pane_id))
+            .and_then(|s| s.pane(pane_id))
             .and_then(|p| p.pty_id);
         if let Some(pty_id) = pty_id {
             self.dispose_terminal(pty_id, cx);
@@ -1193,17 +1373,18 @@ impl AppStore {
         let Some(state) = self.project_states.get_mut(project_id) else {
             return;
         };
-        if let Some(layout) = state.layout.take() {
-            state.layout = layout.remove_pane(pane_id);
-        }
+        state.remove_pane(pane_id);
         if self.focused_pane_id.as_deref() == Some(pane_id) {
             self.focused_pane_id = self
                 .project_states
                 .get(project_id)
-                .and_then(|s| s.layout.as_ref())
+                .and_then(|s| s.active_layout())
                 .and_then(|l| l.first_active_pane())
                 .map(|p| p.id.clone());
         }
+        // 关掉的可能是活动面板的最后一个 pane → 活动指针挪到了邻位面板,
+        // 而那个面板可能是恢复出来、从没显示过的(pane 还没有 PTY)—— 补起来
+        self.hydrate_project(project_id, cx);
         self.after_layout_change(project_id, cx);
     }
 
@@ -1212,8 +1393,7 @@ impl AppStore {
         let leaf_id = self
             .project_states
             .get(project_id)
-            .and_then(|s| s.layout.as_ref())
-            .and_then(|l| l.leaf_of_pane(pane_id))
+            .and_then(|s| s.leaf_of_pane(pane_id))
             .map(|node| node.id().to_string());
         if let Some(leaf_id) = leaf_id {
             self.close_leaf(project_id, &leaf_id, cx);
@@ -1225,11 +1405,9 @@ impl AppStore {
         let pane_ids: Vec<String> = self
             .project_states
             .get(project_id)
-            .and_then(|s| s.layout.as_ref())
-            .map(|l| match l.node(leaf_id) {
-                Some(SplitNode::Leaf { panes, .. }) => {
-                    panes.iter().map(|p| p.id.clone()).collect()
-                }
+            .and_then(|s| s.node(leaf_id))
+            .map(|node| match node {
+                SplitNode::Leaf { panes, .. } => panes.iter().map(|p| p.id.clone()).collect(),
                 _ => Vec::new(),
             })
             .unwrap_or_default();
@@ -1249,8 +1427,18 @@ impl AppStore {
         // 切走之前把上一个 pane 的 IME 预编辑串收掉,否则组合中失焦会在画面上
         // 留一串下划线残影(而且那次组合的候选框还挂在旧位置)。
         self.clear_preedit_of_focused(cx);
+        // 目标 pane 可能在别的面板上(跳待办/会话跳转/未读完成都按 pane 定位)——
+        // 先把那个面板切成活动的,否则「跳过去了但画面没变」
+        let owner_panel = self
+            .project_states
+            .get(project_id)
+            .and_then(|s| s.panel_id_of_pane(pane_id))
+            .map(str::to_string);
+        if let Some(panel_id) = owner_panel {
+            self.set_active_panel(project_id, &panel_id, cx);
+        }
         if let Some(state) = self.project_states.get_mut(project_id)
-            && let Some(layout) = state.layout.as_mut()
+            && let Some(layout) = state.layout_of_pane_mut(pane_id)
         {
             layout.activate_pane(pane_id);
         }
@@ -1270,7 +1458,7 @@ impl AppStore {
         let target = self
             .project_states
             .get(project_id)
-            .and_then(|s| s.layout.as_ref())
+            .and_then(|s| s.layout_of_pane(from_pane_id))
             .and_then(|l| l.cycle_target(from_pane_id, delta));
         if let Some(target) = target {
             self.activate_pane(project_id, &target, window, cx);
@@ -1289,7 +1477,7 @@ impl AppStore {
         let target = self
             .project_states
             .get(project_id)
-            .and_then(|s| s.layout.as_ref())
+            .and_then(|s| s.layout_of_pane(from_pane_id))
             .and_then(|l| l.pane_at_index(from_pane_id, index));
         if let Some(target) = target {
             self.activate_pane(project_id, &target, window, cx);
@@ -1304,8 +1492,7 @@ impl AppStore {
         let pty_id = self
             .project_states
             .values()
-            .filter_map(|s| s.layout.as_ref())
-            .find_map(|l| l.pane(&pane_id).and_then(|p| p.pty_id));
+            .find_map(|s| s.pane(&pane_id).and_then(|p| p.pty_id));
         if let Some(entity) = pty_id.and_then(|id| self.terminals.get(&id)).cloned() {
             entity.update(cx, |pane, cx| pane.clear_preedit(cx));
         }
@@ -1323,8 +1510,7 @@ impl AppStore {
         let pty_id = self
             .project_states
             .get(project_id)
-            .and_then(|s| s.layout.as_ref())
-            .and_then(|l| l.pane(pane_id))
+            .and_then(|s| s.pane(pane_id))
             .and_then(|p| p.pty_id);
         if let Some(entity) = pty_id.and_then(|id| self.terminals.get(&id)) {
             entity.update(cx, |pane, _| pane.focus(window));
@@ -1335,7 +1521,7 @@ impl AppStore {
     /// 当前项目里该操作哪个 pane:焦点 pane → 布局里第一个激活 pane
     /// (旧版 `resolveActivePane`,它以 DOM 焦点为准)。
     pub fn active_pane_id(&self, project_id: &str) -> Option<String> {
-        let layout = self.project_states.get(project_id)?.layout.as_ref()?;
+        let layout = self.project_states.get(project_id)?.active_layout()?;
         self.focused_pane_id
             .clone()
             .filter(|id| layout.pane(id).is_some())
@@ -1357,8 +1543,7 @@ impl AppStore {
         let Some(pty_id) = self
             .project_states
             .get(project_id)
-            .and_then(|s| s.layout.as_ref())
-            .and_then(|l| l.pane(pane_id))
+            .and_then(|s| s.pane(pane_id))
             .and_then(|p| p.pty_id)
         else {
             return false;
@@ -1382,8 +1567,7 @@ impl AppStore {
         let changed = self
             .project_states
             .get_mut(project_id)
-            .and_then(|s| s.layout.as_mut())
-            .and_then(|l| l.node_mut(node_id))
+            .and_then(|s| s.node_mut(node_id))
             .map(|node| match node {
                 SplitNode::Split {
                     sizes: current,
@@ -1440,10 +1624,12 @@ impl AppStore {
             ai_session: Option<AiSessionRef>,
             resume_pending: bool,
         }
+        // 只补**活动面板**:后台面板与后台项目同一档懒创建时机,
+        // 切过去(`set_active_panel`)才起 PTY
         let pending: Vec<Pending> = self
             .project_states
             .get(project_id)
-            .and_then(|s| s.layout.as_ref())
+            .and_then(|s| s.active_layout())
             .map(|l| {
                 l.panes()
                     .into_iter()
@@ -1468,8 +1654,7 @@ impl AppStore {
             let Some(shell) = self.resolve_shell(Some(&item.shell_name)) else {
                 // 一个 shell 都没有 —— 旧版把 pane 标成 error 而不是静默跳过
                 if let Some(state) = self.project_states.get_mut(project_id)
-                    && let Some(layout) = state.layout.as_mut()
-                    && let Some(pane) = layout.pane_mut(&item.pane_id)
+                    && let Some(pane) = state.pane_mut(&item.pane_id)
                 {
                     pane.status = PaneStatus::Error;
                 }
@@ -1486,8 +1671,7 @@ impl AppStore {
 
             let pty_id = self.start_pty(&project, &shell, start_cwd.as_deref(), cx);
             if let Some(state) = self.project_states.get_mut(project_id)
-                && let Some(layout) = state.layout.as_mut()
-                && let Some(pane) = layout.pane_mut(&item.pane_id)
+                && let Some(pane) = state.pane_mut(&item.pane_id)
             {
                 pane.pty_id = Some(pty_id);
             }
@@ -1504,8 +1688,7 @@ impl AppStore {
             // 先清标记再写命令(顺序同旧版):标记的语义是「这个 pane 还没续过」
             let mut session_patch: Option<AiSessionRef> = None;
             if let Some(state) = self.project_states.get_mut(project_id)
-                && let Some(layout) = state.layout.as_mut()
-                && let Some(pane) = layout.pane_mut(&item.pane_id)
+                && let Some(pane) = state.pane_mut(&item.pane_id)
             {
                 pane.resume_pending = false;
                 // 反查所得的启动目录随身份写回,下次重启直达不再查
@@ -1848,8 +2031,7 @@ impl AppStore {
             .and_then(|pane_id| {
                 self.project_states
                     .get(&project_id)
-                    .and_then(|s| s.layout.as_ref())
-                    .and_then(|l| l.pane(&pane_id))
+                    .and_then(|s| s.pane(&pane_id))
                     .and_then(|p| p.pty_id)
             })
         else {
@@ -1905,7 +2087,7 @@ impl AppStore {
     fn pty_in_any_layout(&self, pty_id: u32) -> bool {
         self.project_states
             .values()
-            .filter_map(|s| s.layout.as_ref())
+            .flat_map(|s| s.layouts())
             .any(|l| l.pane_by_pty(pty_id).is_some())
     }
 
@@ -1926,10 +2108,11 @@ impl AppStore {
         self.exited_ptys.insert(pty_id);
         let mut touched: Option<String> = None;
         for (pid, state) in self.project_states.iter_mut() {
-            if let Some(layout) = state.layout.as_mut()
-                && layout.update_status_by_pty(pty_id, PaneStatus::Error, false, None)
-            {
-                state.status = layout.highest_status();
+            let hit = state
+                .layouts_mut()
+                .any(|layout| layout.update_status_by_pty(pty_id, PaneStatus::Error, false, None));
+            if hit {
+                state.status = state.highest_status();
                 touched = Some(pid.clone());
                 break;
             }
@@ -1972,25 +2155,30 @@ impl AppStore {
                 let mut pane_id = String::new();
                 let mut old_status = PaneStatus::Idle;
                 let mut old_attention = false;
-                for (pid, state) in self.project_states.iter_mut() {
-                    let Some(layout) = state.layout.as_mut() else {
-                        continue;
-                    };
-                    let Some(pane) = layout.pane_by_pty(change.pty_id) else {
-                        continue;
-                    };
-                    old_status = pane.status;
-                    old_attention = pane.attention;
-                    pane_id = pane.id.clone();
-                    layout.update_status_by_pty(
-                        change.pty_id,
-                        status,
-                        attention,
-                        change.agent.as_deref(),
-                    );
-                    state.status = layout.highest_status();
-                    owner = Some(pid.clone());
-                    break;
+                'projects: for (pid, state) in self.project_states.iter_mut() {
+                    let mut hit = false;
+                    // 跨全部面板找:后台面板里的 AI 状态一样要亮灯
+                    for layout in state.layouts_mut() {
+                        let Some(pane) = layout.pane_by_pty(change.pty_id) else {
+                            continue;
+                        };
+                        old_status = pane.status;
+                        old_attention = pane.attention;
+                        pane_id = pane.id.clone();
+                        layout.update_status_by_pty(
+                            change.pty_id,
+                            status,
+                            attention,
+                            change.agent.as_deref(),
+                        );
+                        hit = true;
+                        break;
+                    }
+                    if hit {
+                        state.status = state.highest_status();
+                        owner = Some(pid.clone());
+                        break 'projects;
+                    }
                 }
                 let owner = owner?;
                 let project_active = self.active_project_id.as_deref() == Some(owner.as_str());
@@ -2035,9 +2223,7 @@ impl AppStore {
                     cwd: identity.cwd.clone(),
                 };
                 for (pid, state) in self.project_states.iter_mut() {
-                    if let Some(layout) = state.layout.as_mut()
-                        && let Some(pane) = layout.pane_by_pty_mut(identity.pty_id)
-                    {
+                    if let Some(pane) = state.pane_by_pty_mut(identity.pty_id) {
                         pane.ai_session = Some(session.clone());
                         owner = Some(pid.clone());
                         break;
@@ -2123,9 +2309,8 @@ impl AppStore {
         self.project_states
             .iter()
             .filter(|(pid, _)| only_project.is_none_or(|only| only == pid.as_str()))
-            .filter_map(|(pid, state)| state.layout.as_ref().map(|l| (pid, l)))
-            .flat_map(|(pid, layout)| {
-                layout.panes().into_iter().map(move |p| PaneRef {
+            .flat_map(|(pid, state)| {
+                state.all_panes().into_iter().map(move |p| PaneRef {
                     project_id: pid.as_str(),
                     pane_id: p.id.as_str(),
                     status: p.status,
@@ -2194,10 +2379,7 @@ impl AppStore {
     /// **实际等价**,不必为此新增一份状态。
     pub fn find_live_session_pane(&self, session_id: &str) -> Option<(String, String, PaneStatus)> {
         for (project_id, state) in self.project_states.iter() {
-            let Some(layout) = state.layout.as_ref() else {
-                continue;
-            };
-            for pane in layout.panes() {
+            for pane in state.all_panes() {
                 let matches = pane
                     .ai_session
                     .as_ref()
@@ -2227,8 +2409,7 @@ impl AppStore {
     ) {
         let mut pty_id = None;
         if let Some(state) = self.project_states.get_mut(project_id)
-            && let Some(layout) = state.layout.as_mut()
-            && let Some(pane) = layout.pane_mut(pane_id)
+            && let Some(pane) = state.pane_mut(pane_id)
         {
             pane.ai_session = Some(session.clone());
             // 身份是自己写进去的,不是「待续接」——别让下次启动再敲一遍命令
@@ -2332,10 +2513,7 @@ impl AppStore {
     pub fn clear_pane_attention_by_pty(&mut self, pty_id: u32, cx: &mut Context<Self>) {
         let mut changed = false;
         for state in self.project_states.values_mut() {
-            let Some(layout) = state.layout.as_mut() else {
-                continue;
-            };
-            if let Some(pane) = layout.pane_by_pty_mut(pty_id)
+            if let Some(pane) = state.pane_by_pty_mut(pty_id)
                 && pane.attention
             {
                 pane.attention = false;
@@ -2644,8 +2822,7 @@ impl AppStore {
     ) {
         let title = title.trim();
         if let Some(state) = self.project_states.get_mut(project_id)
-            && let Some(layout) = state.layout.as_mut()
-            && let Some(pane) = layout.pane_mut(pane_id)
+            && let Some(pane) = state.pane_mut(pane_id)
         {
             pane.custom_title = if title.is_empty() {
                 None
@@ -3109,8 +3286,7 @@ impl AppStore {
         let old_pty = self
             .project_states
             .get(project_id)
-            .and_then(|s| s.layout.as_ref())
-            .and_then(|l| l.pane(pane_id))
+            .and_then(|s| s.pane(pane_id))
             .and_then(|p| p.pty_id);
         // dispose 里已经做了:kill 子进程 + 清标记与游标 + 摘退出登记
         // (`clearMarkersForPty` / `clearPtyExited` 在原版是分开两调,这里同源)
@@ -3122,19 +3298,17 @@ impl AppStore {
             let pane = self
                 .project_states
                 .get(project_id)
-                .and_then(|s| s.layout.as_ref())
-                .and_then(|l| l.pane(pane_id))?;
+                .and_then(|s| s.pane(pane_id))?;
             (pane.shell_name.clone(), pane.cwd.clone())
         };
         let shell = self.resolve_shell(Some(&shell_name))?;
         let new_pty = self.start_pty(&project, &shell, cwd.as_deref(), cx);
 
         let state = self.project_states.get_mut(project_id)?;
-        let layout = state.layout.as_mut()?;
-        let pane = layout.pane_mut(pane_id)?;
+        let pane = state.pane_mut(pane_id)?;
         pane.pty_id = Some(new_pty);
         pane.status = PaneStatus::Idle;
-        state.status = layout.highest_status();
+        state.status = state.highest_status();
         self.after_layout_change(project_id, cx);
         Some(new_pty)
     }
@@ -3173,36 +3347,146 @@ impl AppStore {
             }
             return None;
         };
-        match state.layout.as_mut() {
-            // 项目还一个终端都没有:新建根叶子,否则终端区仍是空白
-            None => state.layout = Some(SplitNode::leaf(pane)),
-            Some(layout) => {
-                // `append_pane(None, ..)` 的落点正是 `first_leaf_id()` = 最左侧叶子,
-                // 但它顺手把 `active_pane_id` 指到了新 pane 上,而原版
-                // `appendPaneToFirstLeaf` 明确**不动 activePaneId** —— 记下原值再还原。
-                let leaf_id = layout.first_leaf_id();
-                let prev_active = leaf_id
-                    .as_deref()
-                    .and_then(|id| layout.node(id))
-                    .and_then(|node| match node {
-                        SplitNode::Leaf { active_pane_id, .. } => Some(active_pane_id.clone()),
-                        SplitNode::Split { .. } => None,
-                    });
-                if !layout.append_pane(None, pane) {
-                    if let Some(pty_id) = pty_id {
-                        self.dispose_terminal(pty_id, cx);
-                    }
-                    return None;
+        if state.panels.is_empty() {
+            // 项目还一个终端都没有:新建面板(含根叶子),否则终端区仍是空白
+            let panel = ProjectPanel::new(SplitNode::leaf(pane));
+            state.active_panel_id = Some(panel.id.clone());
+            state.panels.push(panel);
+        } else {
+            // 挂进**活动面板**的最左侧叶子 —— 「不抢桌面现场」的语义下也不该
+            // 去动用户看不见的后台面板
+            let Some(layout) = state.active_layout_mut() else {
+                if let Some(pty_id) = pty_id {
+                    self.dispose_terminal(pty_id, cx);
                 }
-                if let (Some(leaf_id), Some(prev)) = (leaf_id, prev_active)
-                    && let Some(SplitNode::Leaf { active_pane_id, .. }) = layout.node_mut(&leaf_id)
-                {
-                    *active_pane_id = prev;
+                return None;
+            };
+            // `append_pane(None, ..)` 的落点正是 `first_leaf_id()` = 最左侧叶子,
+            // 但它顺手把 `active_pane_id` 指到了新 pane 上,而原版
+            // `appendPaneToFirstLeaf` 明确**不动 activePaneId** —— 记下原值再还原。
+            let leaf_id = layout.first_leaf_id();
+            let prev_active = leaf_id
+                .as_deref()
+                .and_then(|id| layout.node(id))
+                .and_then(|node| match node {
+                    SplitNode::Leaf { active_pane_id, .. } => Some(active_pane_id.clone()),
+                    SplitNode::Split { .. } => None,
+                });
+            if !layout.append_pane(None, pane) {
+                if let Some(pty_id) = pty_id {
+                    self.dispose_terminal(pty_id, cx);
                 }
+                return None;
+            }
+            if let (Some(leaf_id), Some(prev)) = (leaf_id, prev_active)
+                && let Some(SplitNode::Leaf { active_pane_id, .. }) = layout.node_mut(&leaf_id)
+            {
+                *active_pane_id = prev;
             }
         }
         self.after_layout_change(project_id, cx);
         Some(pane_id)
+    }
+
+    // === 项目级终端面板 ===
+
+    /// 换活动面板。目标不存在 / 已是活动的都是 no-op。
+    /// 切过去才起 PTY(与切项目同一懒创建时机);最大化态只对上一个面板有意义,
+    /// 一并清掉;活动下标随布局落盘。
+    pub fn set_active_panel(&mut self, project_id: &str, panel_id: &str, cx: &mut Context<Self>) {
+        let Some(state) = self.project_states.get_mut(project_id) else {
+            return;
+        };
+        if !state.panels.iter().any(|p| p.id == panel_id)
+            || state.active_panel_id.as_deref() == Some(panel_id)
+        {
+            return;
+        }
+        state.active_panel_id = Some(panel_id.to_string());
+        state.maximized_pane_id = None;
+        self.hydrate_project(project_id, cx);
+        self.save_project_layout_soon(project_id, cx);
+        cx.notify();
+    }
+
+    /// 换活动面板并把键盘焦点交给它当前激活的 pane(竖条点击的落点)。
+    pub fn switch_panel(
+        &mut self,
+        project_id: &str,
+        panel_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_active_panel(project_id, panel_id, cx);
+        let target = self
+            .project_states
+            .get(project_id)
+            .and_then(|s| s.active_layout())
+            .and_then(|l| l.first_active_pane())
+            .map(|p| p.id.clone());
+        if let Some(pane_id) = target {
+            self.focus_pane(project_id, &pane_id, window, cx);
+        }
+    }
+
+    /// 新建一个项目级面板(单 pane 起步),设为活动并聚焦。
+    pub fn new_panel(
+        &mut self,
+        project_id: &str,
+        shell: Option<ShellConfig>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let project = self.project(project_id)?.clone();
+        let shell = shell.or_else(|| self.resolve_shell(None))?;
+        let pane = self.spawn_pane(&project, &shell, None, window, cx)?;
+        let pane_id = pane.id.clone();
+
+        let state = self.project_states.get_mut(project_id)?;
+        let panel = ProjectPanel::new(SplitNode::leaf(pane));
+        state.active_panel_id = Some(panel.id.clone());
+        state.panels.push(panel);
+        state.maximized_pane_id = None;
+        self.after_layout_change(project_id, cx);
+        self.focus_pane(project_id, &pane_id, window, cx);
+        Some(pane_id)
+    }
+
+    /// 关闭一整个面板(它的全部 pane)。复用 [`Self::close_pane`] 的回收链路,
+    /// 最后一个 pane 关掉时面板自然消失、活动指针挪到邻位。
+    pub fn close_panel(&mut self, project_id: &str, panel_id: &str, cx: &mut Context<Self>) {
+        let pane_ids: Vec<String> = self
+            .project_states
+            .get(project_id)
+            .and_then(|s| s.panels.iter().find(|p| p.id == panel_id))
+            .map(|p| p.layout.panes().into_iter().map(|x| x.id.clone()).collect())
+            .unwrap_or_default();
+        for pane_id in pane_ids {
+            self.close_pane(project_id, &pane_id, cx);
+        }
+    }
+
+    /// 改面板名。空字符串 = 恢复默认(按序号显示)。
+    /// 与 pane 改名不同,这个**落盘**(磁盘格式的 `SavedTab.customTitle` 本来就在)。
+    pub fn rename_panel(
+        &mut self,
+        project_id: &str,
+        panel_id: &str,
+        title: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let title = title.trim();
+        if let Some(state) = self.project_states.get_mut(project_id)
+            && let Some(panel) = state.panel_mut(panel_id)
+        {
+            panel.custom_title = if title.is_empty() {
+                None
+            } else {
+                Some(title.to_string())
+            };
+            self.save_project_layout_soon(project_id, cx);
+            cx.notify();
+        }
     }
 
     // === 右侧抽屉宽度 ===
@@ -3302,21 +3586,30 @@ impl AppStore {
         cx.notify();
     }
 
+    // === 终端列表竖条 ===
+
+    /// 终端区右缘的「终端列表」竖条是否展开。
+    pub fn terminals_panel_visible(&self) -> bool {
+        self.terminals_panel_visible
+    }
+
+    pub fn toggle_terminals_panel(&mut self, cx: &mut Context<Self>) {
+        self.terminals_panel_visible = !self.terminals_panel_visible;
+        self.save_layout_soon(cx);
+        cx.notify();
+    }
+
     // === 持久化 ===
 
     fn after_layout_change(&mut self, project_id: &str, cx: &mut Context<Self>) {
         if let Some(state) = self.project_states.get_mut(project_id) {
-            state.status = state
-                .layout
-                .as_ref()
-                .map(|l| l.highest_status())
-                .unwrap_or(PaneStatus::Idle);
-            // 被最大化的那个 pane 关掉了 → 自动回落显示整树。原版是在渲染处
-            // 「按 id 查不到叶子就退回整树」,这里顺手把陈旧 id 也清掉:留着它
-            // 只会让 `maximized_pane_id()` 每帧多查一次,且没有任何复活路径
-            // (pane id 是进程内单调递增的,不会被重新分配)。
+            state.status = state.highest_status();
+            // 被最大化的那个 pane 关掉了(或随面板切换离开了活动面板)→ 自动回落
+            // 显示整树。原版是在渲染处「按 id 查不到叶子就退回整树」,这里顺手把
+            // 陈旧 id 也清掉:留着它只会让 `maximized_pane_id()` 每帧多查一次,
+            // 且没有任何复活路径(pane id 是进程内单调递增的,不会被重新分配)。
             if let Some(id) = state.maximized_pane_id.clone()
-                && state.layout.as_ref().and_then(|l| l.pane(&id)).is_none()
+                && state.active_layout().and_then(|l| l.pane(&id)).is_none()
             {
                 state.maximized_pane_id = None;
             }
@@ -3332,8 +3625,7 @@ impl AppStore {
     fn live_pane_ids(&self) -> HashSet<String> {
         self.project_states
             .values()
-            .filter_map(|s| s.layout.as_ref())
-            .flat_map(|l| l.panes().into_iter().map(|p| p.id.clone()))
+            .flat_map(|s| s.all_panes().into_iter().map(|p| p.id.clone()))
             .collect()
     }
 
@@ -3341,7 +3633,7 @@ impl AppStore {
     pub fn live_node_ids(&self) -> HashSet<String> {
         let mut out = HashSet::new();
         for state in self.project_states.values() {
-            if let Some(layout) = state.layout.as_ref() {
+            for layout in state.layouts() {
                 collect_node_ids(layout, &mut out);
             }
         }
@@ -3359,7 +3651,7 @@ impl AppStore {
         let saved = self
             .project_states
             .get(project_id)
-            .map(|s| persist::serialize_layout(s.layout.as_ref()));
+            .map(|s| persist::serialize_layout(&s.panels, s.active_panel_index()));
         if let Some(saved) = saved
             && let Some(project) = self
                 .config
@@ -3413,6 +3705,7 @@ impl AppStore {
                 middle_column_sizes: self.config.middle_column_sizes.clone(),
                 middle_column_visible: Some(self.config.middle_column_visible),
                 right_drawer_width: self.config.right_drawer_width,
+                terminals_panel_visible: Some(self.terminals_panel_visible),
                 window: self.window_geometry,
             };
             if let Err(err) = store.save_globals(&globals) {
@@ -3754,10 +4047,7 @@ fn rename_pane_in_states(
         Some(title.to_string())
     };
     for state in states.values_mut() {
-        let Some(layout) = state.layout.as_mut() else {
-            continue;
-        };
-        let Some(pane) = layout.pane_mut(pane_id) else {
+        let Some(pane) = state.pane_mut(pane_id) else {
             continue;
         };
         if pane.custom_title == next {
@@ -3776,9 +4066,8 @@ fn find_pane_of_pty(
 ) -> Option<(String, String)> {
     states.iter().find_map(|(project_id, state)| {
         state
-            .layout
-            .as_ref()
-            .and_then(|layout| layout.pane_by_pty(pty_id))
+            .layouts()
+            .find_map(|layout| layout.pane_by_pty(pty_id))
             .map(|pane| (project_id.clone(), pane.id.clone()))
     })
 }
@@ -4262,10 +4551,10 @@ mod tests {
 
         let mut states = HashMap::new();
         let mut sa = ProjectState::new();
-        sa.layout = Some(SplitNode::leaf(a));
+        sa.panels.push(ProjectPanel::new(SplitNode::leaf(a)));
         states.insert("p-a".to_string(), sa);
         let mut sb = ProjectState::new();
-        sb.layout = Some(SplitNode::leaf(b));
+        sb.panels.push(ProjectPanel::new(SplitNode::leaf(b)));
         states.insert("p-b".to_string(), sb);
         // 布局还没建出来的项目也要能安全跳过
         states.insert("p-empty".to_string(), ProjectState::new());
@@ -4275,8 +4564,7 @@ mod tests {
     fn title_of(states: &HashMap<String, ProjectState>, pane_id: &str) -> Option<String> {
         states
             .values()
-            .filter_map(|s| s.layout.as_ref())
-            .find_map(|l| l.pane(pane_id))
+            .find_map(|s| s.pane(pane_id))
             .and_then(|p| p.custom_title.clone())
     }
 

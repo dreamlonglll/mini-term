@@ -1266,7 +1266,7 @@ impl ProjectList {
         };
         let store = self.store.read(cx);
         let auto_resume = store.config().ai_auto_resume.unwrap_or(true);
-        let layout = store.project_state(project_id).and_then(|s| s.layout.as_ref());
+        let layout = store.project_state(project_id).and_then(|s| s.active_layout());
         if !pane_preview::has_ai_pane(layout, auto_resume) {
             return false;
         }
@@ -1294,7 +1294,7 @@ impl ProjectList {
         let (name, path) = (project.name.clone(), project.path.clone());
         let layout = store
             .project_state(&preview.project_id)
-            .and_then(|s| s.layout.as_ref());
+            .and_then(|s| s.active_layout());
         if !pane_preview::has_ai_pane(layout, auto_resume) {
             self.preview = None;
             return None;
@@ -1765,8 +1765,7 @@ impl Render for ProjectList {
                     // 判定与 tab 上的品牌图标共用同一把尺子
                     let ai_vendors = ai_vendor_stack(
                         state
-                            .and_then(|s| s.layout.as_ref())
-                            .map(|layout| layout.panes())
+                            .map(|s| s.all_panes())
                             .unwrap_or_default()
                             .into_iter()
                             .filter(|pane| pane.shows_ai_session(auto_resume))

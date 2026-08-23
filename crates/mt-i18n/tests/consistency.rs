@@ -51,8 +51,12 @@ use mt_i18n::{
 /// 761 → 762：最大化改成「其余组折成标题条码在底部」时新增
 /// `paneGroup.collapsedHint` —— 折叠条整条都是热区，得有一句说明点它会发生什么
 /// （原先其余组整个不画，压根没有这个交互）。
+///
+/// 762 → 767：项目级终端面板（一个项目多个独立终端工作面 + 右缘图标竖条）
+/// 新增 `app.activityBar.terminals`（边条开关的 tooltip）与
+/// `terminalArea.{panelN,newPanel,renamePanel,closePanel}`（序号名/新建/右键两项）。
 const EXPECTED_NAMESPACES: usize = 32;
-const EXPECTED_ENTRIES_PER_LANG: usize = 762;
+const EXPECTED_ENTRIES_PER_LANG: usize = 767;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

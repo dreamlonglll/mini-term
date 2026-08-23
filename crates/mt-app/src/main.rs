@@ -18,8 +18,9 @@
 //!      │   │       ├─ ProjectList                    ← 项目列表(上)
 //!      │   │       └─ FileTree                       ← 文件树(下)
 //!      │   ├─ panel
-//!      │   │   └─ TerminalArea                       ← SplitNode 树 → 嵌套 resizable
-//!      │   │       └─ (leaf) tab 栏 + TerminalPane 实体
+//!      │   │   ├─ TerminalArea                       ← 活动面板的 SplitNode 树 → 嵌套 resizable
+//!      │   │   │   └─ (leaf) tab 栏 + TerminalPane 实体
+//!      │   │   └─ TerminalsPanel                     ← 项目级面板切换竖条(44px 图标列,可开合)
 //!      │   └─ panel(可折叠)
 //!      │       └─ SessionPanel                       ← AI 历史(右侧抽屉)
 //!      ├─ UsagePanel(浮层)                           ← 用量统计
@@ -100,6 +101,7 @@ mod ssh_registry;
 mod startup_trace;
 mod store;
 mod terminal_area;
+mod terminals_panel;
 mod theme;
 mod title_bar;
 mod toast;
@@ -343,6 +345,9 @@ struct Workspace {
     project_list: Entity<ProjectList>,
     file_tree: Entity<FileTree>,
     terminal_area: Entity<TerminalArea>,
+    /// 终端区右缘的「项目级终端面板」切换竖条。显隐住在 store
+    /// (`terminals_panel_visible`,落 layout.db),收起时整个不进元素树。
+    terminals_panel: Entity<terminals_panel::TerminalsPanel>,
     session_panel: Entity<SessionPanel>,
     /// Git 面板(抽屉的第二块)。与会话面板一样常驻实体,靠
     /// [`GitPanel::set_visible`](git_panel::GitPanel::set_visible) 闸住扫盘与
@@ -410,6 +415,8 @@ impl Workspace {
         let project_list = cx.new(|cx| ProjectList::new(store.clone(), cx));
         let file_tree = cx.new(|cx| FileTree::new(store.clone(), cx));
         let terminal_area = cx.new(|cx| TerminalArea::new(store.clone(), cx));
+        let terminals_panel =
+            cx.new(|cx| terminals_panel::TerminalsPanel::new(store.clone(), cx));
         let session_panel = cx.new(|cx| SessionPanel::new(store.clone(), cx));
         let git_panel = cx.new(|cx| git_panel::GitPanel::new(store.clone(), window, cx));
         let columns_state = cx.new(|_| ResizableState::default());
@@ -520,6 +527,7 @@ impl Workspace {
             project_list,
             file_tree,
             terminal_area,
+            terminals_panel,
             session_panel,
             git_panel,
             usage_panel: None,
@@ -933,8 +941,7 @@ impl Workspace {
             let store = self.store.read(cx);
             store
                 .project_state(&project_id)
-                .and_then(|state| state.layout.as_ref())
-                .and_then(|layout| layout.pane(&pane_id))
+                .and_then(|state| state.pane(&pane_id))
                 .and_then(|pane| pane.pty_id)
                 .and_then(|pty_id| store.terminal(pty_id).cloned())
         };
@@ -1137,7 +1144,16 @@ impl Render for Workspace {
         // 否则 gpui-component 会把还原进去的宽度按容器比例重算掉。
         self.reseed_resizables_on_viewport_change(window, cx);
 
-        let (columns, middle, middle_visible, drawer_width, unread, global_status, background) = {
+        let (
+            columns,
+            middle,
+            middle_visible,
+            terminals_visible,
+            drawer_width,
+            unread,
+            global_status,
+            background,
+        ) = {
             let store = self.store.read(cx);
             let config = store.config();
             let columns = config
@@ -1154,6 +1170,7 @@ impl Render for Workspace {
                 columns,
                 middle,
                 config.middle_column_visible,
+                store.terminals_panel_visible(),
                 store.right_drawer_width(),
                 store.unread_done_count(),
                 store.global_ai_status(),
@@ -1231,7 +1248,26 @@ impl Render for Workspace {
                     .size_range(px(180.0)..px(700.0))
                     .child(middle_group),
             )
-            .child(resizable_panel().child(self.terminal_area.clone()))
+            // 面板切换竖条停靠在终端区**里侧**右缘(固定 44px、不进 resizable
+            // 的分栏账),与 VS Code 终端面板右侧的列表同位。开合会改终端宽度
+            // 并触发一次 PTY resize —— 停靠面板的正常代价,与折叠中间栏同档;
+            // 悬浮的右抽屉(Sessions/Git)另有考量,见下方 drawer_layer 注释。
+            .child(
+                resizable_panel().child(
+                    div()
+                        .size_full()
+                        .flex()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .child(self.terminal_area.clone()),
+                        )
+                        .when(terminals_visible, |el| {
+                            el.child(self.terminals_panel.clone())
+                        }),
+                ),
+            )
             .on_resize(move |state, _window, cx| {
                 let sizes: Vec<f64> = state.read(cx).sizes().iter().map(|p| f32::from(*p) as f64).collect();
                 store_for_columns.update(cx, |store, cx| {
@@ -1323,6 +1359,20 @@ impl Render for Workspace {
                 )
                 .on_click(cx.listener(|this, _event, _window, cx| {
                     this.toggle_drawer(DrawerPanel::Git, cx)
+                })),
+            )
+            // 终端列表竖条(GPUI 版新增,原版边条没有这颗)。开关的是终端区
+            // 右缘的**停靠竖条**而不是右抽屉,所以激活态跟 store 的持久化显隐走
+            .child(
+                activity_bar::strip_button(
+                    "toggle-terminals",
+                    activity_bar::TERMINALS,
+                    t("app", "activityBar.terminals"),
+                    terminals_visible,
+                )
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.store
+                        .update(cx, |store, cx| store.toggle_terminals_panel(cx));
                 })),
             )
             .child(activity_bar::divider())
