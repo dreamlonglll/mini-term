@@ -72,16 +72,32 @@
 //! 2. **列宽变化触发的 reflow**。alacritty 只在**列数**变化时重排折行,行被拆/合
 //!    之后 `history_size` 任意跳变,守恒直接失效(行数变化只是 grow/shrink,守恒仍在)。
 //!
-//! 这两条 [`is_saturated`] 一条都测不到 —— 它判的是「scrollback 装满」。
+//! 就地改写还有一个**每天都在发生**的来源:回答流式期间属于 Ink 的动态帧,帧高一
+//! 超过 pane 行数,Ink 就退化成**逐帧整屏就地重画**(与 1 同族的序列)——那期间视口
+//! 里没有一行是稳定的,还留在视口里的锚点(通常是最近一两条)会成片失配。它不是
+//! `/new` 那样的显式动作,「长回答 + 矮 pane」就躲不开。
 //!
-//! ## 处置:锚点行内容指纹,对不上就判废
+//! 这几条 [`is_saturated`] 一条都测不到 —— 它判的是「scrollback 装满」。
 //!
-//! 定锚时连**那一行的文本指纹**一起记([`MarkerAnchor::Settled`]),取用前重算比对,
-//! 不匹配就剪掉([`prune_stale`])。**刻意不认任何 agent 的具体转义序列**:
+//! ## 处置:锚点行内容指纹,对不上就处置 —— 键入的降级重扫,猜来的删
+//!
+//! 定锚时连**那一行的文本指纹**一起记([`MarkerAnchor::Settled`]),取用前重算比对
+//! ([`prune_stale`])。**刻意不认任何 agent 的具体转义序列**:
 //! 序列匹配只能覆盖「今天的 Claude Code」,Codex 关掉 alt screen
 //! (`--no-alt-screen` / `NO_ALT_SCREEN` / `[tui] alternate_screen = false`)之后走的是
 //! ratatui/crossterm 另一套,Grok 又是一套,agent 改一次渲染器补丁就失效。指纹不问
 //! 「谁、发了什么」,只问「那一行还是不是原来那行」,顺带把 reflow 也一并盖住。
+//!
+//! 失配的处置分两支(2026-08-24 实测日志定的案):
+//!
+//! - **键入的正文**([`AiMarker::guessed`] = false)**降级回 [`MarkerAnchor::Pending`]
+//!   重扫,不删**。用户确凿键入过的提交,删掉的表现就是「标记凭空消失」——而整屏
+//!   重画后真正文多半还在 scrollback 里,只是行号变了。降级后交给
+//!   [`relocate_pending`] 从头回扫找回;找不回就一直灰着留档 ——
+//!   「绝不指向错误的行」的红线不动,只把「删」换成「不可跳」。
+//! - **猜来的正文**(`guessed` = true)**照旧删**。它的「验明正身」只是「在屏幕上
+//!   撞见过一次」,那一行死了就什么凭据都不剩;留着会让权限审批框里的假候选
+//!   (`1. Yes` 能匹配到审批框自己那行)以灰条形式永久还魂,冲掉「第四个破绽」的闸门。
 //!
 //! ⚠️ **已知边界:锚点行本身为空时判据失灵**。空行的指纹与被擦白之后相同,校验会
 //! 放行。正常路径落不到这里 —— 锚点定在 static 区的 `> 用户输入` 那一行,它必然
@@ -215,6 +231,11 @@ pub struct AiMarker {
     /// 回填输入框时终端只收到一个裸 Enter,缓冲是空的。**这种条目在屏幕上验明
     /// 正身之前不进列表**,见模块注释的「第四个破绽」。
     pub confirmed: bool,
+    /// 正文的**出身**是不是「从屏幕上猜的」,落库后不再变 —— [`Self::confirmed`]
+    /// 会在验明正身时翻 true,这里保留原始出身,给 [`prune_stale`] 分流:
+    /// 键入的锚坏了降级重扫,猜来的锚坏了直接删(凭据只有「在屏幕上撞见过一次」,
+    /// 那一行死了就什么都不剩)。
+    pub guessed: bool,
     /// 最后一条为 true,新标记到来时前一条翻 false。
     ///
     /// ⚠️ **没有任何地方在 AI 完成时把最后一条翻 false**(`store.ts:1182-1203`
@@ -270,6 +291,7 @@ pub fn push_marker(
         ts: submit.ts,
         anchor,
         confirmed: submit.confirmed,
+        guessed: !submit.confirmed,
         in_progress: true,
     });
     id
@@ -295,30 +317,46 @@ pub fn fingerprint_line(text: &str) -> u64 {
     hasher.finish()
 }
 
-/// 剪掉锚点行**内容已经对不上**的标记,返回「有没有真的删掉东西」。
+/// 校验已定锚的标记,处置锚点行**内容已经对不上**的:键入的降级回挂起重扫、
+/// 猜来的删掉(分流理由见模块注释「第二个破绽」的处置段)。返回「列表变过没有」
+/// —— 降级也算变过,调用方要重画。
 ///
 /// `probe(anchor)` 交回该锚点当前指向那一行的指纹,`None` = 那一行已不在缓冲区里
 /// (被 `ESC[3J` / RIS 清掉了历史,或被 reflow 重排到界外)。调用方接
 /// [`mt_terminal::TerminalEmulator::line_text`] + [`fingerprint_line`]。
 ///
-/// 与 [`prune`] 的分工:那一条判「scrollback 装满,算术不可信」,这一条判
-/// 「算术还对,但那一行已经不是原来那行」。两条都在**同一个节奏**上跑
-/// (push 之后、跳转之前),不进渲染路径 —— 每次要读 N 行 cell,N 是列表长度。
+/// 降级的 `from` 取 0:整屏重画后真正文可能在原锚点上方也可能在下方,只有从头扫
+/// 才不漏。代价可控 —— 回扫只在同一个节奏上跑(push 之后、跳转之前、下拉打开时),
+/// 且 [`relocate_pending`] 找不到时会把起点推进到已扫过的地方,不会反复全量扫。
 ///
-/// ⚠️ [`MarkerAnchor::Pending`] 的条目**一条都不剪**:它们压根没定过锚,拿什么比
+/// 与 [`prune`] 的分工:那一条判「scrollback 装满,算术不可信」,这一条判
+/// 「算术还对,但那一行已经不是原来那行」。
+///
+/// ⚠️ [`MarkerAnchor::Pending`] 的条目**一概不动**:它们压根没定过锚,拿什么比
 /// 都是错的。它们的归宿是 [`relocate_pending`] 补锚成功,或者跟着
 /// [`prune`] 在 scrollback 饱和时一起走。
 pub fn prune_stale(list: &mut Vec<AiMarker>, probe: impl Fn(i32) -> Option<u64>) -> bool {
-    let before = list.len();
-    list.retain(|m| match m.anchor {
-        // 还没定位的留着:内容对用户仍然有用,锚点等 AI 把队列消化掉再补
-        MarkerAnchor::Pending { .. } => true,
-        MarkerAnchor::Settled {
+    let mut changed = false;
+    list.retain_mut(|m| {
+        let MarkerAnchor::Settled {
             anchor,
             fingerprint,
-        } => probe(anchor) == Some(fingerprint),
+        } = m.anchor
+        else {
+            // 还没定位的留着:内容对用户仍然有用,锚点等 AI 把队列消化掉再补
+            return true;
+        };
+        if probe(anchor) == Some(fingerprint) {
+            return true;
+        }
+        changed = true;
+        if m.guessed {
+            return false;
+        }
+        m.anchor = MarkerAnchor::Pending { from: 0 };
+        true
     });
-    list.len() != before
+    changed
 }
 
 /// 定锚那一刻的判定:水位落到的这一行,**看得见这批提交的正文吗**?
@@ -710,10 +748,11 @@ mod tests {
         assert_ne!(fingerprint_line(""), fingerprint_line("> a"));
     }
 
-    /// **清屏就地擦**的核心用例:`history` 没动、锚点算术照样成立,但那一行已经空了。
-    /// 只有指纹测得到,[`is_saturated`] 一条都测不到。
+    /// **清屏/整屏重画就地擦**的核心用例:`history` 没动、锚点算术照样成立,但那
+    /// 一行已经不是原来那行。键入的条目**降级重扫而不是删** —— 删就是
+    /// 「标记凭空消失」(2026-08-24 实测的主诉)。
     #[test]
-    fn 锚点行被就地擦掉时判废() {
+    fn 锚点行被就地擦掉时降级重扫() {
         let mut list = Vec::new();
         marker(&mut list, "> 第一问", 100);
         marker(&mut list, "> 第二问", 140);
@@ -721,32 +760,75 @@ mod tests {
         // scrollback 远没装满,老判据放行
         assert!(!prune(&mut list, 500, 10_000), "算术判据测不到这一类");
 
-        // Claude Code 的 /new:视口那一屏被逐行 2K 抹白,history 一动不动
+        // Claude Code 的 /new(或长流式回合的整屏重画):视口那一屏被就地改写,
+        // history 一动不动;100 那条已经滚进 scrollback,完好
         let 清屏后 = |anchor: i32| -> Option<u64> {
-            // 140 那条落在视口里、被擦成空行;100 那条已经滚进 scrollback,完好
             if anchor == 140 {
                 Some(fingerprint_line(""))
             } else {
                 Some(fingerprint_line("> 第一问"))
             }
         };
-        assert!(prune_stale(&mut list, 清屏后), "视口内那条必须被剪掉");
-        assert_eq!(list.len(), 1);
-        assert_eq!(list[0].line, "> 第一问", "scrollback 里的那条内容完好,必须留住");
+        assert!(prune_stale(&mut list, 清屏后), "降级也要如实回报「变过」");
+        assert_eq!(list.len(), 2, "键入的条目一条都不许删");
+        assert_eq!(list[0].anchor.settled(), Some(100), "对得上的不动");
+        assert_eq!(
+            list[1].anchor,
+            MarkerAnchor::Pending { from: 0 },
+            "失配的降级重扫,从头找"
+        );
+        assert_eq!(visible(&list).count(), 2, "灰着也照样示人");
 
-        // 再跑一遍是空操作 —— 剩下的那条仍然对得上
+        // 再跑一遍是空操作 —— 降级过的不再参与校验,剩下那条仍对得上
         assert!(!prune_stale(&mut list, 清屏后));
     }
 
-    /// `ESC[3J` / RIS 把 history 清零 → 锚点整体越界,`probe` 交回 `None`,全剪。
+    /// `ESC[3J` / RIS 把 history 清零 → 锚点整体越界,`probe` 交回 `None`:
+    /// 键入的降级、猜来的删(假候选的「验明正身」凭据已死,留着会灰条还魂)。
     #[test]
-    fn 锚点越界时判废() {
+    fn 锚点越界时键入的降级猜来的删() {
         let mut list = Vec::new();
         marker(&mut list, "> a", 100);
-        marker(&mut list, "> b", 140);
+        push_marker(
+            &mut list,
+            7,
+            guessed("1. Yes"),
+            MarkerAnchor::Settled {
+                anchor: 140,
+                fingerprint: fingerprint_line("❯ 1. Yes"),
+            },
+        );
+        // 模拟它曾被 relocate 验明正身放出来过:confirmed 翻 true,出身 guessed 不变
+        list[1].confirmed = true;
         assert!(prune_stale(&mut list, |_| None));
-        assert!(list.is_empty());
-        assert!(!prune_stale(&mut list, |_| None), "空列表上是空操作");
+        assert_eq!(list.len(), 1, "猜来的删掉,键入的留下");
+        assert_eq!(list[0].line, "> a");
+        assert_eq!(list[0].anchor, MarkerAnchor::Pending { from: 0 });
+        assert!(!prune_stale(&mut list, |_| None), "降级过的不再参与校验");
+    }
+
+    /// 端到端:长流式回合把 Ink 动态帧撑过 pane 高度 → 整屏重画改写锚点行 →
+    /// 条目降级 → 回合结束后回扫把真正文找回来。修复前它在第 ① 步就被删了
+    /// (实测日志:「效果挺好的,再来多次读文件」@226 → 那一行变成 "  01 ▓")。
+    #[test]
+    fn 整屏重画后降级回扫找回() {
+        let mut list = Vec::new();
+        marker(&mut list, "效果挺好的", 226);
+
+        // ① 流式帧把 226 行改写成输出内容 → 降级,不删
+        assert!(prune_stale(&mut list, |_| Some(fingerprint_line("  01 ▓"))));
+        assert!(list[0].anchor.is_pending());
+        assert_eq!(visible(&list).count(), 1, "降级期间照样示人(灰)");
+
+        // ② 回合结束,正文躺在 scrollback 里(行号变了) → 找回、可跳
+        let 屏幕 = screen(&[(230, "❯ 效果挺好的")]);
+        assert!(relocate_pending(&mut list, 260, NO_ADVANCE, &屏幕));
+        assert_eq!(list[0].anchor.settled(), Some(230));
+
+        // ③ 找回之后指纹校验放行,不再摆动
+        assert!(!prune_stale(&mut list, |anchor| 屏幕(anchor)
+            .as_deref()
+            .map(fingerprint_line)));
     }
 
     /// **还挂着的条目一条都不剪**。这是「AI 忙时追加的那句在下拉里凭空消失」那个

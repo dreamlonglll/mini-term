@@ -1911,9 +1911,8 @@ impl AppStore {
         if batch.submits.is_empty() {
             return;
         }
-        // 先把旧条目收拾一遍(挂着的补锚、锚点行已经不是原来那行的剪掉),再追加新的:
-        // `/new` 清屏之后用户发的第一条消息就是这一刻,趁机把上一屏被就地擦掉的标记
-        // 清干净 —— 否则「⚑ N」的计数会一直挂着已经跳不对的条目。
+        // 先把旧条目收拾一遍(锚点行已经不是原来那行的降级或删、挂着的补锚),再追加
+        // 新的 —— 「⚑ N」不能一直挂着已经跳不对的条目。
         // 新条目要在这之后 push:它的指纹刚取,自己校验自己没有意义。
         self.refresh_markers(pty_id, cx);
         let list = self.markers_by_pty.entry(pty_id).or_default();
@@ -1930,15 +1929,16 @@ impl AppStore {
         cx.notify();
     }
 
-    /// 收拾一遍某个 pane 的标记:**挂着的补锚 + 失效的剪掉**,返回「列表变过没有」。
+    /// 收拾一遍某个 pane 的标记:**失效的处置 + 挂着的补锚**,返回「列表变过没有」。
     ///
     /// 三件事按这个顺序,少一步或者换个顺序都不对:
     ///
     /// 1. [`markers::prune`] —— scrollback 装满,整份作废(算术锚点从此不可信);
-    /// 2. [`markers::relocate_pending`] —— 给还没定位的条目补锚。AI 把队列里那条
-    ///    处理掉、消息落到屏幕上的那一刻,它就自己好了;
-    /// 3. [`markers::prune_stale`] —— 校验已定锚的那些。**必须排在补锚之后**:
-    ///    刚补上的指纹是从同一份 grid 读的,校验必然通过,反过来排就白跑一遍。
+    /// 2. [`markers::prune_stale`] —— 校验已定锚的那些:锚点行已经不是原来那行的,
+    ///    键入的降级回挂起、猜来的删(分流理由见 [`crate::markers`] 模块注释);
+    /// 3. [`markers::relocate_pending`] —— 给挂着的(含上一步刚降级的)补锚。
+    ///    **必须排在校验之后**:刚补上的指纹是从同一份 grid 读的,当轮自校必过、
+    ///    白跑;而这个顺序让降级的条目当轮就能回扫找回,不用灰一拍等下一次。
     ///
     /// 跑的时机:新增标记时、跳转前、下拉打开时 —— **一律不在渲染路径上**
     /// (见 [`crate::markers`] 模块注释)。
@@ -1956,8 +1956,8 @@ impl AppStore {
         };
         let mut changed = markers::prune(list, history, max);
         if probe_ok {
-            changed |= markers::relocate_pending(list, bottom, viewport, |row| pane.line_text(row));
             changed |= markers::prune_stale(list, |anchor| pane.line_fingerprint(anchor));
+            changed |= markers::relocate_pending(list, bottom, viewport, |row| pane.line_text(row));
         }
         let empty = list.is_empty();
         if empty {
