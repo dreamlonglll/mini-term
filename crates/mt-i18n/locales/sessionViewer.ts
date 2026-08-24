@@ -7,6 +7,8 @@ export const sessionViewer = {
     noMatch: "无匹配",
     loading: "加载中...",
     emptyContent: "无消息内容",
+    copyMessage: "复制",
+    copyAll: "复制全文",
   },
   en: {
     messageCount: "{count} messages",
@@ -16,5 +18,7 @@ export const sessionViewer = {
     noMatch: "No matches",
     loading: "Loading...",
     emptyContent: "No messages",
+    copyMessage: "Copy",
+    copyAll: "Copy all",
   },
 } as const;

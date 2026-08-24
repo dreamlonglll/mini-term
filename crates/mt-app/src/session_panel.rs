@@ -50,6 +50,8 @@ use gpui::{
     MouseDownEvent, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Task,
     Window, div, prelude::FluentBuilder, px,
 };
+use gpui_component::ActiveTheme as _;
+use gpui_component::text::{TextView, TextViewStyle};
 use mt_ui::tooltip::Tooltip;
 use mt_ai::sessions::{AiSession, AiSessionMessage, LineageEdge};
 use mt_ui::icons::{AiVendor, BrandIcon, StatusDot, StatusKind};
@@ -65,6 +67,14 @@ use crate::ui;
 
 /// 一页多少条(与旧版 `PAGE_SIZE` 同值)。
 const PAGE_SIZE: usize = 20;
+
+/// 会话正文一屏渲染多少条消息。
+///
+/// **不是观感取舍,是硬约束**:每条消息的正文是一个 [`TextView`],首帧那次
+/// markdown 解析(含代码块高亮)是**同步**跑在主线程上的(组件只把后续更新
+/// 丢后台),且每个 TextView 常驻一前一后两个 task。一个长会话上千条消息全铺
+/// 出去就是开面板即卡窗口 —— 所以按页给,底下留「加载更多」。
+const PREVIEW_PAGE_SIZE: usize = 40;
 
 /// 该会话对应的 resume 命令;id 形态异常返回 `None`。
 ///
@@ -243,14 +253,84 @@ fn format_time(iso: &str) -> String {
     }
 }
 
+/// 消息头那一行的时间(ISO 8601 → 本地时钟 `月-日 时:分:秒`)。
+///
+/// 会话列表那边给的是「几分钟前」(找会话用),正文里要的是**绝对时刻** ——
+/// 看一段对话是什么时候发生的、两条之间隔了多久,相对时间答不了。带秒是因为
+/// 相邻消息常落在同一分钟内。
+///
+/// 时间戳解析不出来(远古记录 / 字段缺失)返回 `None`,那条就不显示时间 ——
+/// 宁可少一行灰字,也不显示 `1970-01-01`。
+fn format_message_time(iso: &str) -> Option<String> {
+    let ts = chrono::DateTime::parse_from_rfc3339(iso.trim()).ok()?;
+    Some(
+        ts.with_timezone(&chrono::Local)
+            .format("%m-%d %H:%M:%S")
+            .to_string(),
+    )
+}
+
+/// 会话正文的富文本排版。取自 [`crate::file_viewer`] 的 markdown 预览那份,
+/// 按抽屉里的 12px 正文重新定基准(那边是 14px 的文档视图)。
+fn preview_text_style(cx: &mut App) -> TextViewStyle {
+    let mut code_block = gpui::StyleRefinement::default();
+    {
+        let text = code_block.text.get_or_insert_default();
+        text.font_size = Some(ui::font_px(11.0).into());
+        text.line_height = Some(gpui::relative(1.5).into());
+    }
+    TextViewStyle {
+        highlight_theme: cx.theme().highlight_theme.clone(),
+        is_dark: cx.theme().mode.is_dark(),
+        heading_base_font_size: ui::font_px(12.0),
+        // 抽屉窄,段距按文档视图的 1rem 给会把一条消息撑得很散
+        paragraph_gap: gpui::rems(0.5),
+        code_block,
+        ..Default::default()
+    }
+    .heading_font_size(|level, base| match level {
+        1 => base * 1.4,
+        2 => base * 1.2,
+        3 => base * 1.1,
+        _ => base,
+    })
+}
+
 /// 会话正文预览的一次加载。
 struct Preview {
+    /// 会话 id。只用于给每条消息的 [`TextView`] 拼稳定且**跨会话不撞**的
+    /// element id —— 光按序号编的话,换一个会话看会命中上一个会话同序号那条
+    /// 的缓存状态,首帧显示的是别人的正文。
+    session_id: String,
     title: String,
     loading: bool,
     error: Option<String>,
     messages: Vec<AiSessionMessage>,
+    /// 已铺出去的条数(见 [`PREVIEW_PAGE_SIZE`])。
+    shown: usize,
     /// 可复制的 resume 命令(拼不出来则为 None)。
     command: Option<String>,
+}
+
+impl Preview {
+    /// 「复制全文」的文本:整份对话按 `角色 · 时间` + 正文平铺。
+    ///
+    /// 逐条选中复制是 [`TextView`] 的能力,但它的选区**只在单个 TextView 内**
+    /// (选区坐标是相对自己 bounds 算的),跨消息拖不出来 —— 整份对话只能由
+    /// 这里拼。
+    fn all_text(&self) -> String {
+        self.messages
+            .iter()
+            .map(|m| {
+                let role = if m.role == "user" { "User" } else { "Assistant" };
+                match format_message_time(&m.timestamp) {
+                    Some(time) => format!("{role} · {time}\n{}", m.content),
+                    None => format!("{role}\n{}", m.content),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
 }
 
 /// 平铺 / 分支树两种视图。取值与 `AppConfig::session_list_view` 的字面量同。
@@ -670,10 +750,12 @@ impl SessionPanel {
             return;
         };
         self.preview = Some(Preview {
+            session_id: session.id.clone(),
             title: session.title.clone(),
             loading: true,
             error: None,
             messages: Vec::new(),
+            shown: PREVIEW_PAGE_SIZE,
             command: build_resume_command(&session.session_type, &session.id),
         });
         let session_type = session.session_type.clone();
@@ -728,10 +810,33 @@ impl SessionPanel {
         cx.notify();
     }
 
-    fn render_preview(&mut self, preview_title: String, cx: &mut Context<Self>) -> AnyElement {
+    /// 会话正文预览。
+    ///
+    /// **正文走 [`TextView`] 而不是静态文本**:GPUI 的 `div().child(文本)` 画出来
+    /// 的字一个都选不中,而 gpui-component 里唯一带选区的文本渲染器就是它
+    /// (`selectable(true)` + `Ctrl/Cmd+C`,与文件查看器的 markdown 预览同一个)。
+    /// 顺带把会话正文按 markdown 排出来 —— 三家 agent 的回复本来就是 markdown。
+    ///
+    /// 选区**跨不了消息**(组件的选区坐标相对单个 TextView 自己的 bounds),
+    /// 所以每条消息头上留一颗「复制」、顶上留一颗「复制全文」把整条/整份兜住。
+    fn render_preview(
+        &mut self,
+        preview_title: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let Some(preview) = self.preview.as_ref() else {
             return div().into_any_element();
         };
+        let loading = preview.loading;
+        let error = preview.error.clone();
+        let command = preview.command.clone();
+        let session_key = preview.session_id.clone();
+        let total = preview.messages.len();
+        let shown = preview.shown.min(total);
+        let has_messages = total > 0;
+        let text_style = preview_text_style(cx);
+
         let mut body = div()
             .id("session-preview-body")
             .flex_1()
@@ -741,7 +846,7 @@ impl SessionPanel {
             .flex_col()
             .gap(px(8.0));
 
-        if preview.loading {
+        if loading {
             body = body.child(
                 div()
                     .py(px(12.0))
@@ -750,17 +855,37 @@ impl SessionPanel {
                     .child(t("sessionViewer", "loading")),
             );
         }
-        if let Some(err) = &preview.error {
+        if let Some(err) = error {
             body = body.child(
                 div()
                     .py(px(12.0))
                     .text_size(ui::font_px(12.0))
                     .text_color(ui::color_error())
-                    .child(err.clone()),
+                    .child(err),
             );
         }
-        for msg in &preview.messages {
+        if !loading && !has_messages {
+            body = body.child(
+                div()
+                    .py(px(12.0))
+                    .text_size(ui::font_px(12.0))
+                    .text_color(ui::text_muted())
+                    .child(t("sessionViewer", "emptyContent")),
+            );
+        }
+
+        // 逐条引用着画,不整页 clone:终端一跑起来整窗每帧重绘(GPUI 的
+        // notify 是整窗口口径),一页几十条正文每帧复制一遍就是白烧内存带宽
+        for (ix, msg) in self
+            .preview
+            .iter()
+            .flat_map(|p| p.messages.iter())
+            .take(shown)
+            .enumerate()
+        {
             let is_user = msg.role == "user";
+            let time = format_message_time(&msg.timestamp);
+            let content = msg.content.clone();
             body = body.child(
                 div()
                     .flex()
@@ -775,22 +900,67 @@ impl SessionPanel {
                     })
                     .child(
                         div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
                             .text_size(ui::font_px(10.0))
                             .text_color(ui::text_muted())
                             // 旧版 `SessionViewerModal.tsx` 这两个角色名就是硬编码的
                             // 英文字面量(不进字典),照抄
-                            .child(if is_user { "User" } else { "Assistant" }),
+                            .child(if is_user { "User" } else { "Assistant" })
+                            .child(div().flex_1().when_some(time, |el, time| el.child(time)))
+                            .child(
+                                div()
+                                    .id(SharedString::from(format!("session-msg-copy-{ix}")))
+                                    .cursor_pointer()
+                                    .hover(|el| el.text_color(ui::accent()))
+                                    .child(t("sessionViewer", "copyMessage"))
+                                    .on_click(move |_, _window, cx| {
+                                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                            content.clone(),
+                                        ));
+                                    }),
+                            ),
                     )
                     .child(
                         div()
                             .text_size(ui::font_px(12.0))
                             .text_color(ui::text_secondary())
-                            .child(msg.content.clone()),
+                            .child(
+                                TextView::markdown(
+                                    // id 带会话 id:换会话看时不复用上一份的解析缓存
+                                    SharedString::from(format!("session-msg-{session_key}-{ix}")),
+                                    msg.content.clone(),
+                                    window,
+                                    cx,
+                                )
+                                .style(text_style.clone())
+                                .selectable(true),
+                            ),
                     ),
             );
         }
 
-        let command = preview.command.clone();
+        if shown < total {
+            let remaining = total - shown;
+            body = body.child(
+                div()
+                    .id("session-preview-more")
+                    .py(px(8.0))
+                    .text_size(ui::font_px(11.0))
+                    .text_color(ui::text_muted())
+                    .cursor_pointer()
+                    .hover(|el| el.text_color(ui::accent()))
+                    .child(tr!("sessionList", "loadMore", n = remaining))
+                    .on_click(cx.listener(|this: &mut Self, _, _window, cx| {
+                        if let Some(preview) = this.preview.as_mut() {
+                            preview.shown += PREVIEW_PAGE_SIZE;
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
+
         div()
             .size_full()
             .flex()
@@ -822,6 +992,23 @@ impl SessionPanel {
                             .text_color(ui::text_primary())
                             .child(preview_title),
                     )
+                    .when(has_messages, |el| {
+                        el.child(
+                            ui::ghost_button("session-copy-all", t("sessionViewer", "copyAll"))
+                                .tooltip(move |window, cx| {
+                                    Tooltip::new(tr!("sessionViewer", "messageCount", count = total))
+                                        .build(window, cx)
+                                })
+                                .on_click(cx.listener(|this: &mut Self, _, _window, cx| {
+                                    let Some(preview) = this.preview.as_ref() else {
+                                        return;
+                                    };
+                                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                        preview.all_text(),
+                                    ));
+                                })),
+                        )
+                    })
                     .when_some(command, |el, command| {
                         el.child(
                             ui::ghost_button(
@@ -842,7 +1029,7 @@ impl SessionPanel {
 }
 
 impl Render for SessionPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let container = div()
             .size_full()
             .flex()
@@ -852,7 +1039,7 @@ impl Render for SessionPanel {
             .border_color(ui::border_default());
 
         if let Some(title) = self.preview.as_ref().map(|p| p.title.clone()) {
-            let body = self.render_preview(title, cx);
+            let body = self.render_preview(title, window, cx);
             return container.child(body);
         }
 
@@ -1293,5 +1480,74 @@ mod tests {
     fn 时间戳解析不出来时不显示() {
         assert_eq!(format_time("不是时间"), "");
         assert_eq!(format_time(""), "");
+    }
+
+    /// 消息头的时间是绝对时刻(本地时区),解析不出来就整个不显示。
+    #[test]
+    fn 消息时间按本地时钟成串() {
+        // 固定偏移写死时区,断言与运行机器的时区无关:UTC+8 的 00:30
+        let got = format_message_time("2026-08-24T00:30:05+08:00").expect("应能解析");
+        let expect = chrono::DateTime::parse_from_rfc3339("2026-08-24T00:30:05+08:00")
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%m-%d %H:%M:%S")
+            .to_string();
+        assert_eq!(got, expect);
+        // 带毫秒与 Z 的形态(三家 agent 的记录里都出现过)照样认
+        assert!(format_message_time("2026-08-24T00:30:05.123Z").is_some());
+        assert!(format_message_time("").is_none());
+        assert!(format_message_time("不是时间").is_none());
+    }
+
+    /// 「复制全文」拼的是 `角色 · 时间` + 正文,时间戳缺失时只留角色。
+    #[test]
+    fn 复制全文按角色与时间平铺() {
+        let msg = |role: &str, content: &str, ts: &str| AiSessionMessage {
+            role: role.to_string(),
+            content: content.to_string(),
+            timestamp: ts.to_string(),
+        };
+        let preview = Preview {
+            session_id: "s1".into(),
+            title: "t".into(),
+            loading: false,
+            error: None,
+            messages: vec![
+                msg("user", "问题", "2026-08-24T00:30:05+08:00"),
+                msg("assistant", "回答", ""),
+            ],
+            shown: PREVIEW_PAGE_SIZE,
+            command: None,
+        };
+        let text = preview.all_text();
+        assert!(text.contains("User · "), "{text}");
+        assert!(text.contains("\n问题"));
+        // 时间戳缺失的那条不留悬空的分隔符
+        assert!(text.contains("Assistant\n回答"), "{text}");
+        // 两条之间空一行
+        assert!(text.contains("问题\n\nAssistant"));
+    }
+
+    /// 分页只影响铺出去多少条,「复制全文」始终是整份。
+    #[test]
+    fn 复制全文不受分页影响() {
+        let messages: Vec<AiSessionMessage> = (0..PREVIEW_PAGE_SIZE + 5)
+            .map(|i| AiSessionMessage {
+                role: "user".into(),
+                content: format!("第{i}条"),
+                timestamp: String::new(),
+            })
+            .collect();
+        let preview = Preview {
+            session_id: "s1".into(),
+            title: "t".into(),
+            loading: false,
+            error: None,
+            messages,
+            shown: PREVIEW_PAGE_SIZE,
+            command: None,
+        };
+        let text = preview.all_text();
+        assert!(text.contains(&format!("第{}条", PREVIEW_PAGE_SIZE + 4)));
     }
 }

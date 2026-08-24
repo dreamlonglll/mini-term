@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 32;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 769;
+pub const ZH_ENTRY_COUNT: usize = 771;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 769;
+pub const EN_ENTRY_COUNT: usize = 771;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -922,6 +922,8 @@ static SESSION_LIST_EN: &[(&str, &str)] = &[
 
 #[rustfmt::skip]
 static SESSION_VIEWER_ZH: &[(&str, &str)] = &[
+    ("copyAll", "复制全文"),
+    ("copyMessage", "复制"),
     ("emptyContent", "无消息内容"),
     ("loading", "加载中..."),
     ("messageCount", "{count} 条消息"),
@@ -932,6 +934,8 @@ static SESSION_VIEWER_ZH: &[(&str, &str)] = &[
 ];
 #[rustfmt::skip]
 static SESSION_VIEWER_EN: &[(&str, &str)] = &[
+    ("copyAll", "Copy all"),
+    ("copyMessage", "Copy"),
     ("emptyContent", "No messages"),
     ("loading", "Loading..."),
     ("messageCount", "{count} messages"),
