@@ -22,12 +22,35 @@ function sourceKey(source: string): string {
   }
 }
 
+/**
+ * ISO 8601 → 本地时钟「月-日 时:分:秒」。
+ *
+ * 与桌面端会话查看**同一口径**(`session_panel::format_message_time`):同一条
+ * 消息在两端读出来的时刻必须一样,否则对着两块屏幕核对时会以为丢了消息。
+ * 不用 `toLocaleString`——它随系统区域在 `8/24/2026` 与 `2026/8/24` 之间跳,
+ * 两端对不齐。
+ *
+ * 解析不出来返回 `null`,那条就不显示时间:宁可少一行灰字,也不显示
+ * `1970-01-01`(桌面端同规矩)。
+ */
+function formatTime(raw: string): string | null {
+  if (!raw) return null;
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) return null;
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
 function MessageRow({ msg }: { msg: MirrorMessage }) {
   const t = useT();
   const isAssistant = msg.source === 'assistant';
+  const time = formatTime(msg.timestamp);
   return (
     <div className={`mirror-msg ${isAssistant ? 'from-assistant' : 'from-input'}`}>
-      <div className="mirror-msg-source">{t(sourceKey(msg.source))}</div>
+      <div className="mirror-msg-source">
+        <span>{t(sourceKey(msg.source))}</span>
+        {time && <time className="mirror-msg-time">{time}</time>}
+      </div>
       <div className="mirror-msg-body">
         {isAssistant ? (
           <div className="markdown">

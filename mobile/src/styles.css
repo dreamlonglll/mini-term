@@ -446,9 +446,18 @@ body {
 }
 
 .mirror-msg-source {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
   font-size: 11px;
   color: var(--text-muted);
   padding: 0 4px;
+}
+
+/* 消息时刻。等宽数字:一列时间左右跳动读起来很吵 */
+.mirror-msg-time {
+  font-variant-numeric: tabular-nums;
+  opacity: 0.8;
 }
 
 .mirror-msg-body {
