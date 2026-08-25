@@ -105,13 +105,15 @@ pub struct AppConfig {
     pub middle_column_sizes: Option<Vec<f64>>,
     #[serde(default = "default_theme")]
     pub theme: String,
-    #[serde(default = "default_skin")]
-    pub skin: String,
+    // ⚠️ 曾经这里还有个 `skin`（内置皮肤 none/blueprint/fluent2）。GPUI 侧从来
+    // 没有对应的色表，一律按 `none` 渲染，设置里那一栏也已整段移除，字段随之删掉。
+    // 存量库/存量 `config.json` 里残留的 `skin` 键会被静默忽略（本结构不开
+    // `deny_unknown_fields`），下一次落盘时由 `db.rs` 的 stale key 清理顺手删掉。
     /// 界面语言。取值 `"zh"` / `"en"`，与 TS 侧存进 localStorage 的那个字符串
     /// 一模一样（`mt_i18n::Locale` 的序列化约定就是这两个小写码），迁移期两套
     /// 可互读。`None` = 用户从未选过，由 mt-app 首启按系统语言探测。
     ///
-    /// **存 String 而不是枚举**:与紧邻的 `theme` / `skin` 同一取舍 —— 这个字段
+    /// **存 String 而不是枚举**:与紧邻的 `theme` 同一取舍 —— 这个字段
     /// 手改坏了（比如填了 `"fr"`）不该让整份 `config.json` 反序列化失败，那会
     /// 连带把项目列表一起丢掉。合法性交给使用点的 `Locale::from_code` 判，
     /// 认不出就当没设过。Tauri 版的 `AppConfig` 没有这个字段，但它同样不开
@@ -199,7 +201,7 @@ pub struct AppConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mobile_relay: Option<MobileRelayConfig>,
     /// 激活的外置主题包 id（themes/ 下目录名）。None = 内置外观模式;
-    /// 激活时 theme/skin 保持不动，退出自定义主题可无损回落。
+    /// 激活时 `theme` 保持不动，退出自定义主题可无损回落。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_theme_id: Option<String>,
     /// AI 历史面板的会话列表视图。None = 默认平铺（"flat" | "tree"）。
@@ -462,9 +464,6 @@ fn default_terminal_scrollback() -> u32 {
 fn default_theme() -> String {
     "auto".into()
 }
-fn default_skin() -> String {
-    "none".into()
-}
 fn default_terminal_follow_theme() -> bool {
     true
 }
@@ -510,7 +509,6 @@ impl Default for AppConfig {
             layout_sizes: None,
             middle_column_sizes: None,
             theme: default_theme(),
-            skin: default_skin(),
             locale: None,
             terminal_follow_theme: default_terminal_follow_theme(),
             ai_completion_popup: default_ai_completion_popup(),

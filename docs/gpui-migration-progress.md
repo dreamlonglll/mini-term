@@ -123,7 +123,7 @@
 - hook 二进制仍按「与主程序同目录 miniterm-hook(.exe)」定位；GPUI 壳产物布局定型后与 scripts/stage-sidecars.mjs 一起复查。
 - ~~is_wsl_unc_path 第三份复刻~~ **已去重（收尾-1）**：mt-relay 判定体改调 `mt_core::parse_wsl_unc(path).is_some()`，函数与测试原样保留。
 - mt-relay 默认自持 2 线程 tokio 运行时（apply 惰性创建）；mt-app 若有全局运行时应改用 `with_runtime` 注入，避免进程双线程池。
-- **J 批（122b5ca 后）记档**：~~ThemePacks::open() 不认 MT_APP_DATA_DIR~~（fix1 已统一：mt-config 新增 active_data_dir，theme.rs 绕路结清）；`lookup_ai_session_cwd` 同步阻塞（仅存量无 cwd 会话触发）；resume 的会话 cwd 起 PTY 失败拿不到信号，以 `is_dir()` 预检代偿；`config.skin`（blueprint/fluent2）无对应色表未实现。
+- **J 批（122b5ca 后）记档**：~~ThemePacks::open() 不认 MT_APP_DATA_DIR~~（fix1 已统一：mt-config 新增 active_data_dir，theme.rs 绕路结清）；`lookup_ai_session_cwd` 同步阻塞（仅存量无 cwd 会话触发）；resume 的会话 cwd 起 PTY 失败拿不到信号，以 `is_dir()` 预检代偿；~~`config.skin`（blueprint/fluent2）无对应色表未实现~~ **已结清为「不做」（2026-08-25，用户指示）**：设置里的「皮肤」单选段整段移除，`AppConfig::skin` 字段与五条 `settings.appearance.skin*` 词条一并删除（存量键靠 serde 忽略 + db 侧 stale key 清理自然消散）。皮肤自此只有两档——默认（主题段 dark/light/auto）与外置主题包。
 - **P 批记档（搜索三连 + 快捷键让路）**：
   - `overlay.rs` 是覆盖物栈的唯一真相（`thread_local`，不是 gpui `Global` —— `TerminalPane::drop` 要摘登记而那里拿不到 `cx`）。**Esc 只关最上层在 GPUI 里是结构性免费的**（按键沿焦点链派发），原版 `overlayStack` 那套栈顶判定只需保留「防叠开 + 快捷键让路」两件。
   - **让路两道闸**：① `Window::has_focused_input`（gpui-component 按 `Input` 的聚焦/失焦维护 `Root::focused_input`）等价原版 `isTypingTarget`；② `overlay::allows`。⚠️ 若哪天 `focused_input` 卡在 `Some`（输入框被聚焦着卸载且没触发 blur），**全部全局快捷键会一起哑** —— 点一下别处即恢复，排障先看这里。
@@ -197,7 +197,7 @@
 
 | 批 | 内容（审计条目） | 任务书（docs/batch-specs/） | 派发前决策 / 前置 |
 |---|---|---|---|
-| R ✅（`cb3282d` 2026-08-19） | 设置面板 9 分页 + skin 色表（#19 + #5 剩余） | settings-pages.md | 已按决策落地：连字/皮肤渲染但置灰+说明词条；UI 字号字族 thread_local 快照真接上（84 处 text_size 换 ui::font_px）；about 页复用 zed-reqwest；原语全自绘；另收编键位表 hotkeys.rs 为唯一事实来源 |
+| R ✅（`cb3282d` 2026-08-19） | 设置面板 9 分页 + skin 色表（#19 + #5 剩余） | settings-pages.md | 已按决策落地：连字/皮肤渲染但置灰+说明词条（**皮肤那一栏已于 2026-08-25 整段移除**，见上方 J 批记档）；UI 字号字族 thread_local 快照真接上（84 处 text_size 换 ui::font_px）；about 页复用 zed-reqwest；原语全自绘；另收编键位表 hotkeys.rs 为唯一事实来源 |
 | S ✅（`75ef401` 合并 `ca74978` 2026-08-19） | 自定义标题栏（#20） | titlebar-shell-misc.md §A | 已按决策落地：gpui 原生 WindowControlArea（源码核实直翻 HT* 系，Snap Layouts 免费，双击最大化落 DefWindowProc；Drag 区「正列」不挖洞——命中按 paint 序）；request_close_window 是 Z 批关窗确认唯一挂点（on_window_should_close 全仓仍未注册）；collect_ai_projects 已就位，DoneScope::Unread 留 T 批 |
 | T ✅（合并 `8b1cc30` 2026-08-19） | 系统托盘（#21） | tray.md | 已按决策落地：独立 mt-tray 线程自建顶层隐藏窗口（不用 HWND_MESSAGE——收不到 TaskbarCreated）；HICON/HBITMAP 全 RAII；TrackPopupMenu 模态期 reentrancy 加固；推送收成 store 观察者一处+签名去重；⚠️ Win32 层仅编译期校验，真机三查（图标出现/emoji 菜单/HiDPI 尺寸）留收尾 |
 | U ✅（`d3ad441` 合并 `dccbc4f` 2026-08-19） | 移动端中转（#22） | mobile-relay.md | 已按决策落地：qrcode 位矩阵自绘（码下附配对码文本，属新增信息面但不越 ADR 0002）；RelaySignal channel 泵回主线程（spawn_in）；write_pty 预检+乐观回执；发起会话多一道 PTY 存活预检（PTY 起不来时 pane 保留给用户看红字，与原版「建 pane 前 return」不同，属改良） |

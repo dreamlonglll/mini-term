@@ -820,7 +820,7 @@ pub fn install_gpui_theme(applied: &AppliedThemePack, window: Option<&mut Window
 /// ```
 ///
 /// 只做「读包 → 校验 → 应用」。**不写 config.json**：持久化归 mt-app
-/// （它才知道要不要连带改 `theme` / `skin` 字段）。
+/// （它才知道要不要连带改 `theme` 字段）。
 pub fn switch_to_theme_pack(
     packs: &mt_config::ThemePacks,
     theme_id: &str,

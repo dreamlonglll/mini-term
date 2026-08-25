@@ -28,10 +28,12 @@
 //!   (旧版 `getTerminalTheme` 的 `if (!terminalFollowTheme) return DARK_TERMINAL_THEME`),
 //!   壳配色不受影响。
 //!
-//! # 已知缺口
+//! # 皮肤只有两档
 //!
-//! `skin`(内置皮肤 blueprint / fluent2)没有实现:GPUI 侧还没有对应的
-//! 内置皮肤色表,当前一律按 `none` 处理。背景图([`BackgroundArt`])在这里只
+//! 原版的内置皮肤(`skin` = blueprint / fluent2)GPUI 侧从来没有对应色表,
+//! 一律按 `none` 渲染;设置里那一栏与 `AppConfig::skin` 字段都已删除。现在
+//! 只有**默认皮肤**(`config.theme` 的 dark/light/auto)与**外置皮肤**
+//! (`custom_theme_id` 指向的主题包)两条路。背景图([`BackgroundArt`])在这里只
 //! 算出参数,**渲染由 `main.rs` 的根容器窗口级铺**(与原版挂 `#root` 同位置)。
 
 use gpui::{App, Window, WindowAppearance};

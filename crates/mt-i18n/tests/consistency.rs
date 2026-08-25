@@ -64,8 +64,13 @@ use mt_i18n::{
 ///
 /// 771 → 776：项目类型从 12 种扩到 51 种后，「手动指定类型」的菜单改成按类别的
 /// 二级子菜单，补五个分组标题：`projectList.menu.kindCategory.*`。
+///
+/// 776 → 771：外观页的「皮肤」单选段整段移除（GPUI 侧从来没有内置皮肤色表，
+/// 那一栏只有「无」能点、blueprint / fluent2 长期置灰），随之删掉
+/// `settings.appearance.{skin,skinNone,skinBlueprint,skinDesc,skinUnavailable}`。
+/// 皮肤只剩默认（主题段）与外置（`settings.themes.*`）两档。
 const EXPECTED_NAMESPACES: usize = 32;
-const EXPECTED_ENTRIES_PER_LANG: usize = 776;
+const EXPECTED_ENTRIES_PER_LANG: usize = 771;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

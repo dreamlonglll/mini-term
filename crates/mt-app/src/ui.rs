@@ -836,13 +836,13 @@ pub fn checkbox(id: impl Into<ElementId>, checked: bool) -> Stateful<Div> {
 
 /// 单选段里的一项(`SettingsModal.tsx:229-256` 的 `ChoiceGroup`)。
 ///
-/// `disabled` 的那一项**画出来但不给 on_click**(调用方负责),用于
-/// 「UI 有、底层没有」的功能(内置皮肤 blueprint / fluent2)。
+/// 原先还有个 `disabled` 形参,专给「UI 有、底层没有」的内置皮肤那一栏画置灰项;
+/// 那一栏已整段移除(见 `settings.rs` 模块注释),形参随之删掉 —— 现存唯一的
+/// 单选段(主题)三项都是可点的。
 pub fn choice_button(
     id: impl Into<ElementId>,
     label: impl Into<SharedString>,
     selected: bool,
-    disabled: bool,
 ) -> Stateful<Div> {
     div()
         .id(id)
@@ -854,8 +854,7 @@ pub fn choice_button(
         .rounded(px(4.0))
         .border_1()
         .text_size(font_px(13.0))
-        .when(disabled, |el| el.opacity(0.5))
-        .when(!disabled, |el| el.cursor_pointer())
+        .cursor_pointer()
         .when(selected, |el| {
             el.bg(accent_muted())
                 .text_color(accent())

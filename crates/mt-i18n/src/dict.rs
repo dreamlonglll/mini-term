@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 32;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 776;
+pub const ZH_ENTRY_COUNT: usize = 771;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 776;
+pub const EN_ENTRY_COUNT: usize = 771;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -1008,11 +1008,6 @@ static SETTINGS_ZH: &[(&str, &str)] = &[
     ("aiNotification.wavOnly", "当前仅支持 .wav 自定义提示音，其它格式会回落到系统提示音"),
     ("appearance.language", "语言"),
     ("appearance.languageLabel", "界面语言"),
-    ("appearance.skin", "皮肤"),
-    ("appearance.skinBlueprint", "蓝图"),
-    ("appearance.skinDesc", "皮肤在深色 / 浅色之上换一整套配色与质感；开启「终端跟随主题」时终端配色也随之切换"),
-    ("appearance.skinNone", "无"),
-    ("appearance.skinUnavailable", "GPUI 版尚未实现内置皮肤色表，当前一律按「无」渲染；外置皮肤不受影响"),
     ("appearance.terminalFollowTheme", "终端跟随主题"),
     ("appearance.terminalFollowThemeDesc", "关闭时终端始终使用深色方案"),
     ("appearance.theme", "主题"),
@@ -1203,11 +1198,6 @@ static SETTINGS_EN: &[(&str, &str)] = &[
     ("aiNotification.wavOnly", "Only .wav custom sounds are supported for now; other formats fall back to the system beep"),
     ("appearance.language", "Language"),
     ("appearance.languageLabel", "Interface language"),
-    ("appearance.skin", "Skin"),
-    ("appearance.skinBlueprint", "Blueprint"),
-    ("appearance.skinDesc", "A skin swaps the whole palette and texture on top of light / dark; the terminal palette follows too while \"Terminal follows theme\" is on"),
-    ("appearance.skinNone", "None"),
-    ("appearance.skinUnavailable", "The GPUI build has no built-in skin palettes yet; everything renders as \"None\". External theme packs are unaffected"),
     ("appearance.terminalFollowTheme", "Terminal follows theme"),
     ("appearance.terminalFollowThemeDesc", "When off, the terminal always uses the dark scheme"),
     ("appearance.theme", "Theme"),

@@ -58,11 +58,6 @@ export const settings = {
       themeAuto: "跟随系统",
       terminalFollowTheme: "终端跟随主题",
       terminalFollowThemeDesc: "关闭时终端始终使用深色方案",
-      skin: "皮肤",
-      skinNone: "无",
-      skinBlueprint: "蓝图",
-      skinDesc: "皮肤在深色 / 浅色之上换一整套配色与质感；开启「终端跟随主题」时终端配色也随之切换",
-      skinUnavailable: "GPUI 版尚未实现内置皮肤色表，当前一律按「无」渲染；外置皮肤不受影响",
     },
     system: {
       trayGroup: "状态栏",
@@ -286,11 +281,6 @@ export const settings = {
       themeAuto: "Follow system",
       terminalFollowTheme: "Terminal follows theme",
       terminalFollowThemeDesc: "When off, the terminal always uses the dark scheme",
-      skin: "Skin",
-      skinNone: "None",
-      skinBlueprint: "Blueprint",
-      skinDesc: "A skin swaps the whole palette and texture on top of light / dark; the terminal palette follows too while \"Terminal follows theme\" is on",
-      skinUnavailable: "The GPUI build has no built-in skin palettes yet; everything renders as \"None\". External theme packs are unaffected",
     },
     system: {
       trayGroup: "Status bar",

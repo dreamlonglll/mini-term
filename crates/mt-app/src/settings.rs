@@ -28,12 +28,12 @@
 //! Toggle / SettingRow / ChoiceGroup / 滑块 / 键帽全部**自绘**在 [`crate::ui`]
 //! (不用 `gpui_component` 的 `switch` 与 `setting`,理由见那边的注释)。
 //!
-//! # 「UI 有、底层没有」的一项
+//! # 外观页只剩两档皮肤
 //!
-//! 内置皮肤 blueprint / fluent2(`theme.rs` 按 `none` 处理)在 GPUI 侧还没有。
-//! **照原版画出来但置灰**,配一句说明 —— 不做成「看着能点、点了没反应」。
-//!
-//! (终端连体字原本也在这一栏,已接通:见 `mt_ui::TerminalStyle::font`。)
+//! 原版的「皮肤」单选段(none / blueprint / fluent2)**整段已移除**:GPUI 侧
+//! 从来没有内置皮肤色表,那一栏长期是「无」可选、另两项置灰,留着只是噪声。
+//! 现在的口径是**默认皮肤**(主题段的深色 / 浅色 / 跟随系统)与**外置皮肤**
+//! (用户自己导入的主题包卡片)两档,`AppConfig` 的 `skin` 字段随之删除。
 //!
 //! # 无消费方的设置项
 //!
@@ -249,13 +249,13 @@ pub fn normalize_remote_paste_dir(draft: &str) -> String {
     }
 }
 
-// ─── 三字段联动(外观页,纯函数) ──────────────────────────────
+// ─── 两字段联动(外观页,纯函数) ──────────────────────────────
 
-/// 主题 / 皮肤单选段的当前选中值。
+/// 主题单选段的当前选中值。
 ///
 /// **激活外置皮肤时返回空串** —— 三个按钮全不高亮(`SettingsModal.tsx:827`
-/// 的 `config.customThemeId ? '' : config.theme`)。这不是 bug:外置皮肤既不是
-/// dark/light/auto 里的任何一个,也不是 none/blueprint/fluent2 里的任何一个。
+/// 的 `config.customThemeId ? '' : config.theme`)。这不是 bug:外置皮肤
+/// 不是 dark/light/auto 里的任何一个,高亮谁都是撒谎。
 pub fn choice_value<'a>(custom_theme_id: Option<&str>, value: &'a str) -> &'a str {
     if custom_theme_id.is_some() { "" } else { value }
 }
@@ -1697,10 +1697,9 @@ impl SettingsView {
         let config = self.store.read(cx).config();
         let custom = config.custom_theme_id.clone();
         let theme = config.theme.clone();
-        let skin = config.skin.clone();
         let follow = config.terminal_follow_theme;
 
-        // 主题段:激活外置皮肤时三个按钮全不高亮
+        // 主题段:激活自定义皮肤时三个按钮全不高亮
         let theme_value = choice_value(custom.as_deref(), &theme).to_string();
         let mut theme_group = choice_group();
         for (value, label_key) in [
@@ -1714,7 +1713,6 @@ impl SettingsView {
                     SharedString::from(format!("theme-{value}")),
                     t("settings", label_key),
                     selected,
-                    false,
                 )
                 .on_click(cx.listener(move |this, _, window, cx| {
                     // 切主题 = 退出外置皮肤(`set_theme_mode` 内部自己清
@@ -1722,35 +1720,6 @@ impl SettingsView {
                     this.store
                         .update(cx, |store, cx| store.set_theme_mode(value, window, cx));
                 })),
-            );
-        }
-
-        // 皮肤段:GPUI 侧没有内置皮肤色表,blueprint / fluent2 **置灰**
-        let skin_value = choice_value(custom.as_deref(), &skin).to_string();
-        let mut skin_group = choice_group();
-        for (value, label, available) in [
-            ("none", t("settings", "appearance.skinNone"), true),
-            ("blueprint", t("settings", "appearance.skinBlueprint"), false),
-            // 原版这一项是字面量,不走 i18n(`SettingsModal.tsx:849`)
-            ("fluent2", "Fluent 2", false),
-        ] {
-            let selected = skin_value == value;
-            skin_group = skin_group.child(
-                ui::choice_button(
-                    SharedString::from(format!("skin-{value}")),
-                    label,
-                    selected,
-                    !available,
-                )
-                .when(available, |el| {
-                    el.on_click(cx.listener(move |this, _, window, cx| {
-                        this.store.update(cx, |store, cx| {
-                            store.patch_config(|c| c.skin = value.to_string(), cx);
-                            // 与 handleSkinChange 同序:清皮肤 → 重装主题
-                            store.set_theme_pack(None, window, cx);
-                        });
-                    }))
-                }),
             );
         }
 
@@ -1777,12 +1746,6 @@ impl SettingsView {
                         },
                         cx,
                     )),
-            )
-            .child(
-                section("appearance.skin")
-                    .child(skin_group)
-                    .child(ui::hint(t("settings", "appearance.skinDesc")))
-                    .child(ui::hint(t("settings", "appearance.skinUnavailable"))),
             )
             .child(self.render_theme_packs(cx))
             .into_any_element()
@@ -3542,13 +3505,13 @@ mod tests {
         assert_eq!(normalize_remote_paste_dir("../x"), "../x");
     }
 
-    /// 外观三字段联动:激活外置皮肤时主题/皮肤两段**全不高亮**。
+    /// 外观页联动:激活外置皮肤时主题段**三个按钮全不高亮**。
     #[test]
-    fn 皮肤激活时单选段全不选中() {
+    fn 皮肤激活时主题段不选中() {
         assert_eq!(choice_value(None, "dark"), "dark");
-        assert_eq!(choice_value(None, "none"), "none");
+        assert_eq!(choice_value(None, "auto"), "auto");
         assert_eq!(choice_value(Some("neon"), "dark"), "");
-        assert_eq!(choice_value(Some("neon"), "none"), "");
+        assert_eq!(choice_value(Some("neon"), "auto"), "");
     }
 
     fn reg(agent: &str, registered: usize, total: usize) -> HookRegistrationInfo {
