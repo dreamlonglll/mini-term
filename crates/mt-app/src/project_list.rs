@@ -51,7 +51,7 @@ use gpui_component::input::{Input, InputEvent, InputState, SelectAll};
 use mt_config::{ProjectConfig, ProjectTreeItem};
 use mt_ui::icons::vector::VectorIcon;
 use mt_ui::icons::{
-    ALL_PROJECT_KINDS, AiVendor, BrandIcon, FileIcon, ProjectKind, TechIcon,
+    ALL_PROJECT_KINDS, ALL_TECH_CATEGORIES, AiVendor, BrandIcon, FileIcon, ProjectKind, TechIcon,
 };
 
 use crate::dnd::{
@@ -502,15 +502,36 @@ fn kind_submenu(
         .into(),
     );
     entries.push(menu::separator());
-    for kind in ALL_PROJECT_KINDS {
-        let key = kind.as_str();
+    // 五十多种平铺成一条长龙没法用,按 TechCategory 分二级子菜单
+    // (与「移动到分组」同一套嵌套菜单机制)。`ALL_PROJECT_KINDS` 已按分组聚拢,
+    // 顺序扫一遍即可分段,不必先排序 —— 这条由 mt-ui 侧的单测钉着。
+    for category in ALL_TECH_CATEGORIES {
+        let kinds: Vec<&ProjectKind> = ALL_PROJECT_KINDS
+            .iter()
+            .filter(|k| k.category() == *category)
+            .collect();
+        if kinds.is_empty() {
+            continue;
+        }
+        // 选中项藏在某个子菜单里时,父项也要标 ✓ —— 否则「现在选的是哪个」
+        // 得逐个分组展开才找得到
+        let selected_here = kinds.iter().any(|k| current == Some(k.as_str()));
+        let children: Vec<MenuEntry> = kinds
+            .iter()
+            .map(|k| {
+                let key = k.as_str();
+                MenuItem::new(format!("{}{}", check_prefix(current == Some(key)), k.label()))
+                    .on_click(set(Some(key)))
+                    .into()
+            })
+            .collect();
         entries.push(
             MenuItem::new(format!(
                 "{}{}",
-                check_prefix(current == Some(key)),
-                kind.label()
+                check_prefix(selected_here),
+                t("projectList", category.i18n_key())
             ))
-            .on_click(set(Some(key)))
+            .submenu(children)
             .into(),
         );
     }
@@ -2742,10 +2763,10 @@ mod tests {
         }
     }
 
-    /// 12 种技术栈一个不漏(原版 `PROJECT_KINDS` 就是这 12 个)。
+    /// 原版那 12 种一个不漏 —— 它们的取值**落在用户配置**里(`kindOverride`),
+    /// 少一个,存量项目的手动指定就读不回来了。
     #[test]
     fn 项目类型子菜单列全集() {
-        assert_eq!(ALL_PROJECT_KINDS.len(), 12);
         let keys: Vec<&str> = ALL_PROJECT_KINDS.iter().map(|k| k.as_str()).collect();
         for expected in [
             "java", "rust", "go", "python", "nodejs", "react", "vuejs", "nextjs", "svelte", "vite",
@@ -2753,6 +2774,28 @@ mod tests {
         ] {
             assert!(keys.contains(&expected), "少了 {expected}");
         }
+        // 扩到五十多种是本次改造的目的;掉回十几种说明生成器的 CATALOG 被误删
+        assert!(keys.len() >= 50, "只剩 {} 种", keys.len());
+    }
+
+    /// 菜单是「每个分组一个二级子菜单」,所以每个分组都得有货,
+    /// 且每种类型必须**恰好**落进一个分组(不重不漏)。
+    #[test]
+    fn 项目类型按分组分完且无遗漏() {
+        let mut covered = 0usize;
+        for category in ALL_TECH_CATEGORIES {
+            let n = ALL_PROJECT_KINDS
+                .iter()
+                .filter(|k| k.category() == *category)
+                .count();
+            assert!(n > 0, "{category:?} 分组是空的,菜单里会出现一个点不开的项");
+            covered += n;
+        }
+        assert_eq!(
+            covered,
+            ALL_PROJECT_KINDS.len(),
+            "有类型的分组不在菜单顺序表里,它会从菜单上消失"
+        );
     }
 
     // ─── 缩进(`ProjectList.tsx:660-666` 的两条公式) ─────────

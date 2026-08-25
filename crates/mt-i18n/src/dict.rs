@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 32;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 771;
+pub const ZH_ENTRY_COUNT: usize = 776;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 771;
+pub const EN_ENTRY_COUNT: usize = 776;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -667,6 +667,11 @@ static PROJECT_LIST_ZH: &[(&str, &str)] = &[
     ("menu.detachFromParent", "脱离父项目（转为顶层项目）"),
     ("menu.editDescription", "编辑描述"),
     ("menu.envVars", "环境变量"),
+    ("menu.kindCategory.backend", "后端框架"),
+    ("menu.kindCategory.frontend", "前端框架"),
+    ("menu.kindCategory.infra", "基础设施"),
+    ("menu.kindCategory.language", "语言"),
+    ("menu.kindCategory.mobile", "移动与跨端"),
     ("menu.moveOutOfGroup", "移出分组"),
     ("menu.moveToGroup", "移动到分组"),
     ("menu.moveToThisGroup", "移动到此分组"),
@@ -720,6 +725,11 @@ static PROJECT_LIST_EN: &[(&str, &str)] = &[
     ("menu.detachFromParent", "Detach from Parent (Make Top-Level)"),
     ("menu.editDescription", "Edit Description"),
     ("menu.envVars", "Environment Variables"),
+    ("menu.kindCategory.backend", "Backend"),
+    ("menu.kindCategory.frontend", "Frontend"),
+    ("menu.kindCategory.infra", "Infrastructure"),
+    ("menu.kindCategory.language", "Languages"),
+    ("menu.kindCategory.mobile", "Mobile & Cross-platform"),
     ("menu.moveOutOfGroup", "Move Out of Group"),
     ("menu.moveToGroup", "Move to Group"),
     ("menu.moveToThisGroup", "Move to This Group"),
