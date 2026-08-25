@@ -41,12 +41,10 @@
 //! UI 照原版做出来,但 GPUI 侧还没有消费方(分别属 audit #30 / #28 / #21 与
 //! 终端剪贴板批)。改了会落盘、重启后还在,只是暂时没有效果。
 
-use std::path::PathBuf;
-
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, FocusHandle, Hsla, InteractiveElement,
     IntoElement, KeyDownEvent, ParentElement, PathPromptOptions, Render, SharedString,
-    StatefulInteractiveElement, Styled, Subscription, Task, Window, div, img,
+    StatefulInteractiveElement, Styled, Subscription, Task, Window, div,
     prelude::FluentBuilder, px,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -507,17 +505,28 @@ pub fn newer_release(current: &str) -> Option<ReleaseInfo> {
 // ─── 外置皮肤卡片的数据 ───────────────────────────────────────
 
 /// 一张皮肤卡片要画的东西(刷新列表时算一次,不每帧重解析色值)。
+///
+/// **每一项都取 [`resolve_theme_pack`] 算出来的成品值,不再自己拍脑袋** ——
+/// 预览与真实界面必须是同一份数据喂出来的,否则卡片是「看着像」而不是「就是」。
+/// 三个半透明度尤其不能写死:`surfaceOpacity` / `terminalOpacity` /
+/// `backgroundDim` 都是包作者能在 theme.json 的 `effects` 里改的。
 struct ThemeCard {
     /// **themes/ 下的目录名**,卡片副标题、应用、删除、读资源全用它。
     /// 见 [`ThemeCard::from_listing`]。
     theme_id: String,
     name: String,
     background: Hsla,
-    panel: Hsla,
+    /// 迷你侧栏底色,已含 `surfaceOpacity`(无背景图的包 = 不透明)。
+    panel_surface: Hsla,
+    /// 迷你终端区底色,已含 `terminalOpacity`(同上)。
+    terminal_surface: Hsla,
     accent: Hsla,
     text: Hsla,
-    /// 背景图绝对路径(包里没声明 / 文件不在盘上 = `None`)。
-    image: Option<PathBuf>,
+    /// 背景图氛围层参数(包里没声明 / 文件不在盘上 = `None`)。
+    ///
+    /// 与窗口级那一层(`main.rs` 的 `mt_ui::background_art`)**是同一份数据、
+    /// 同一个 Element**:cover + `focus` 百分比定位 + 包声明的压暗纱罩。
+    art: Option<mt_ui::theme_bridge::BackgroundArt>,
 }
 
 impl ThemeCard {
@@ -539,14 +548,18 @@ impl ThemeCard {
             theme_id: theme_id.clone(),
             name: def.name.clone(),
             background: applied.color(ThemeSlot::Background),
-            panel: applied.color(ThemeSlot::Panel),
+            panel_surface: ui::with_alpha(
+                applied.color(ThemeSlot::Panel),
+                applied.surface_opacity,
+            ),
+            // 终端底色直接取成品:带图的包这里已经是 `background × terminalOpacity`,
+            // 不带图的包是作者声明的 `terminal.background` 原色(不透明)
+            terminal_surface: applied.terminal.background,
             accent: applied.color(ThemeSlot::Accent),
             text: applied.color(ThemeSlot::Text),
-            image: def
-                .image
-                .as_deref()
-                .map(|name| dir.join(name))
-                .filter(|p| p.is_file()),
+            // 图找不找得到由 `resolve_theme_pack` 判(它按不到图 = 没有背景图处理,
+            // 与真实应用时同一条判据),这里不再自己 `is_file()` 一遍
+            art: applied.background.clone(),
         }
     }
 }
@@ -1897,26 +1910,31 @@ impl SettingsView {
         let theme_id = card.theme_id.clone();
         let name = card.name.clone();
 
-        let preview = div()
+        // 背景图走**与窗口级同一个** `BackgroundArtElement`:cover 铺满 + focus
+        // 百分比定位 + 包声明的压暗纱罩。
+        //
+        // ⚠️ 别退回 `img(path).size_full()`:gpui 的 `img()` 默认
+        // `ObjectFit::Contain`(整图塞进框、两侧留白)且**恒定居中**,与真实界面的
+        // cover + focus 是两种铺法 —— 用户实测「卡片里的图和应用后不是一回事」
+        // 就是这么来的。压暗也别再写死 0.35:那只是 `backgroundDim` 的默认值。
+        let mut preview = div();
+        // 预览框按 **16:9** 走(壁纸的常见比例):此前是定高 96px、宽随卡片 ——
+        // 276×96 是 2.9:1 的细条,cover 只截得到焦点附近一横条,与真实窗口
+        // (接近 16:10)差着一个量级。`aspect_ratio` 由宽推高,卡片被面板压窄时
+        // 比例照旧,不像定高那样越窄越接近正方。
+        preview.style().aspect_ratio = Some(16.0 / 9.0);
+        let preview = preview
             .relative()
             .w_full()
-            .h(px(96.0))
             .rounded(px(4.0))
             .overflow_hidden()
             .border_1()
             .border_color(ui::border_subtle())
             .bg(card.background)
-            .when_some(card.image.clone(), |el, path| {
-                el.child(img(path).absolute().inset_0().size_full())
+            .when_some(card.art.clone(), |el, art| {
+                el.child(div().absolute().inset_0().child(mt_ui::background_art(art)))
             })
-            // 压暗层,与真实氛围层同款(35%)
-            .child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .bg(ui::with_alpha(card.background, 0.35)),
-            )
-            // 迷你侧栏(72% 半透明面板)
+            // 迷你侧栏(带包声明的 surfaceOpacity)
             .child(
                 div()
                     .absolute()
@@ -1930,12 +1948,16 @@ impl SettingsView {
                     .flex()
                     .flex_col()
                     .gap(px(4.0))
-                    .bg(ui::with_alpha(card.panel, 0.72))
+                    .bg(card.panel_surface)
+                    // 条目数随框变高补到 5 条:16:9 的框比原先的细条高一半,
+                    // 只画 3 条会在下半截空出一片,不像「项目列表」
                     .child(mini_bar(32.0, card.accent, 1.0))
                     .child(mini_bar(24.0, card.text, 0.6))
-                    .child(mini_bar(28.0, card.text, 0.4)),
+                    .child(mini_bar(28.0, card.text, 0.4))
+                    .child(mini_bar(22.0, card.text, 0.32))
+                    .child(mini_bar(26.0, card.text, 0.24)),
             )
-            // 迷你终端区(60% 着色 + 提示符)
+            // 迷你终端区(带包声明的 terminalOpacity + 提示符)
             .child(
                 div()
                     .absolute()
@@ -1949,7 +1971,7 @@ impl SettingsView {
                     .flex()
                     .flex_col()
                     .gap(px(2.0))
-                    .bg(ui::with_alpha(card.background, 0.6))
+                    .bg(card.terminal_surface)
                     .child(
                         div()
                             .flex()
@@ -1958,7 +1980,10 @@ impl SettingsView {
                             .child(div().text_color(card.accent).child("\u{276f}"))
                             .child(div().text_color(card.text).child("Aa 字")),
                     )
-                    .child(mini_bar(40.0, card.text, 0.5)),
+                    // 同上:多两行「输出」把 16:9 的框填满
+                    .child(mini_bar(40.0, card.text, 0.5))
+                    .child(mini_bar(56.0, card.text, 0.34))
+                    .child(mini_bar(30.0, card.text, 0.24)),
             );
 
         div()
@@ -3386,6 +3411,8 @@ fn snippet_lines(content: &str) -> Vec<gpui::Div> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     /// 回归测试(用户真机 v0.13.x GPUI 版):皮肤卡片的身份必须是**目录名**。
@@ -3416,8 +3443,55 @@ mod tests {
         assert_eq!(card.theme_id, "ember-new", "应用/删除/副标题都按目录名");
         assert_ne!(card.theme_id, listing.def.id, "别再回到 theme.json 的 id");
         assert_eq!(card.name, "Ember Dusk", "显示名仍取 theme.json 的 name");
-        // 图不在盘上 → 不画缩略图(路径也是按目录拼的)
-        assert!(card.image.is_none());
+        // 图不在盘上 → 没有氛围层可画(判据与真实应用时同一处:resolve_theme_pack)
+        assert!(card.art.is_none());
+        // 没有背景图的包不做半透明:面板与终端底色都是实色,与真实界面一致
+        assert_eq!(card.panel_surface.a, 1.0);
+        assert_eq!(card.terminal_surface.a, 1.0);
+    }
+
+    /// 回归测试(用户报:「示例皮肤的图片效果和真实效果存在差异」):
+    /// 卡片预览的三个半透明度必须取**包声明的 effects**,不是写死的默认值,
+    /// 背景图也必须带着 `focus` 走氛围层(cover + 百分比定位),不是裸 `img()`。
+    #[test]
+    fn 卡片取包声明的_effects_与_focus() {
+        let dir = std::env::temp_dir().join("mt-theme-card-effects");
+        std::fs::create_dir_all(&dir).unwrap();
+        let image = dir.join("background.png");
+        // 只判 `is_file()`,不解码 —— 解码是渲染期 gpui 资产系统的事
+        std::fs::write(&image, b"stub").unwrap();
+
+        let json = r##"{
+          "id": "ember-dusk", "name": "Ember Dusk", "appearance": "dark",
+          "colors": {
+            "background": "#120d1c", "panel": "#1c1329", "panelAlt": "#251937",
+            "accent": "#ff9a62", "text": "#ede4f2", "muted": "#9a8caf", "line": "#3a2d52"
+          },
+          "image": "background.png",
+          "art": { "focusX": 0.2, "focusY": 0.9 },
+          "effects": { "surfaceOpacity": 0.4, "terminalOpacity": 0.25, "backgroundDim": 0.8 }
+        }"##;
+        let listing = ThemePackListing {
+            theme_id: "ember-dusk".to_string(),
+            def: mt_ui::theme_bridge::parse_theme_pack("ember-dusk", json).unwrap(),
+            dir: dir.clone(),
+        };
+
+        let card = ThemeCard::from_listing(&listing);
+        let art = card.art.expect("图在盘上就该有氛围层");
+        assert_eq!(art.image, image);
+        assert_eq!(art.focus, (0.2, 0.9), "焦点要带到预览里(默认值是 0.5/0.5)");
+        assert!((art.dim.a - 0.8).abs() < 1e-6, "压暗取 backgroundDim,不是 0.35");
+        assert!(
+            (card.panel_surface.a - 0.4).abs() < 1e-6,
+            "侧栏取 surfaceOpacity,不是 0.72"
+        );
+        assert!(
+            (card.terminal_surface.a - 0.25).abs() < 1e-6,
+            "终端区取 terminalOpacity,不是 0.6"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 分页 id 与原版**一字不差** —— 改了会让外部深链(`initialPage`)失效。
