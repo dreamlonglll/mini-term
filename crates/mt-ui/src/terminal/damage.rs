@@ -26,9 +26,18 @@
 //!
 //! # 哈希碰撞
 //!
-//! 64 位 SipHash-1-3（std 默认）。碰撞意味着「把另一行的画面贴到这一行」，概率在
-//! 每帧几十行、缓存几百条的量级下可以忽略（生日界约 2^-45 量级/帧）。这是所有
-//! 基于内容哈希的增量渲染共有的取舍，记在这里以免将来有人当灵异事件查。
+//! 行签名走的是 **64 位 FxHash**（异或 + 循环移位 + 乘法那一族，rustc 自己的
+//! 符号表就用它），收尾补一次 xor-shift 把高位混匀。它不是密码学哈希，但这里
+//! 也用不着：签名是**行级缓存的键**，输入是用户自己的进程写出来的字节，
+//! 而碰撞的后果只有一条 —— 这一行复用了另一行的画面，且**下一帧就自愈**
+//! （内容再动一下签名就变了，缓存重新落表；缓存本身也按帧淘汰）。
+//!
+//! 概率上仍然可以忽略：每帧几十行、缓存几百条的量级下，64 位空间里的生日界
+//! 约 2^-45/帧 —— 与换掉之前的 SipHash-1-3 同一个量级（碰撞概率看的是**位宽**，
+//! 不是抗攻击强度）。换掉它纯粹因为这条路太热：一屏 200×50 = 一万个格子，
+//! 每格逐字段喂进去要十几次零碎 write，而 `row_signature` **每帧每行都要跑**
+//! （缓存命中与否都得先算出签名才知道）。这是所有基于内容哈希的增量渲染共有的
+//! 取舍，记在这里以免将来有人当灵异事件查。
 //!
 //! # 什么会让整表作废
 //!
@@ -100,28 +109,105 @@ fn hash_hsla<H: Hasher>(color: &Hsla, state: &mut H) {
     color.a.to_bits().hash(state);
 }
 
+/// 一个颜色打包成两个 64 位字（每个字装两个 f32 的位模式）。
+///
+/// 与 [`hash_hsla`] 同样是「按位」口径，只是不再一个分量一次 write。
+#[inline]
+fn hsla_words(color: &Hsla) -> [u64; 2] {
+    [
+        ((color.h.to_bits() as u64) << 32) | color.s.to_bits() as u64,
+        ((color.l.to_bits() as u64) << 32) | color.a.to_bits() as u64,
+    ]
+}
+
+impl CellSignature {
+    /// 把这个格子摊成若干个 64 位字，逐个喂给 `push`。
+    ///
+    /// 逐字段 `Hash::hash` 一趟是 19 次零碎 write（char / usize / bool / u8
+    /// 各自一次），这里手工打包成 **6 个字**（带组合符号的格子再加 3 个），
+    /// 写入次数掉到三分之一，且每个字都已经是对齐好的 u64 —— 哈希器不用再走
+    /// 小写入的缓冲逻辑。[`Hash`] 与 [`row_signature`] 共用这一份口径，
+    /// 免得两条路各写一遍迟早写漂。
+    #[inline]
+    fn write_words(&self, mut push: impl FnMut(u64)) {
+        // 列号在高 32 位、字符在低 32 位：列号是 grid 列下标（上限是元素侧的
+        // `MAX_COLUMNS` = 1024），char 是 21 位，两个都塞得进 32 位。
+        push(((self.col as u64) << 32) | self.ch as u64);
+        // 属性位（u16）与那几个小标量拼成一个字。**组合符号有没有货也记在这里**：
+        // 有货才多喂 3 个字，而「多喂了几个字」本身不能是唯一的区分依据 ——
+        // 记进这个字之后，带组合符号与不带的格子第一处差异就落在这里。
+        push(
+            ((self.flags.bits() as u64) << 32)
+                | ((self.search as u64) << 24)
+                | ((self.cursor as u64) << 16)
+                | ((self.selected as u64) << 8)
+                | ((self.bg_default as u64) << 1)
+                | (self.zerowidth[0] != '\0') as u64,
+        );
+        for word in hsla_words(&self.fg) {
+            push(word);
+        }
+        for word in hsla_words(&self.bg) {
+            push(word);
+        }
+        if self.zerowidth[0] != '\0' {
+            // 两个组合符号挤一个字（不足补 0）
+            for pair in self.zerowidth.chunks(2) {
+                let hi = pair[0] as u64;
+                let lo = pair.get(1).map_or(0, |c| *c as u64);
+                push((hi << 32) | lo);
+            }
+        }
+    }
+}
+
 impl Hash for CellSignature {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.col.hash(state);
-        self.ch.hash(state);
-        self.zerowidth.hash(state);
-        hash_hsla(&self.fg, state);
-        hash_hsla(&self.bg, state);
-        self.bg_default.hash(state);
-        self.flags.bits().hash(state);
-        self.selected.hash(state);
-        self.cursor.hash(state);
-        self.search.hash(state);
+        self.write_words(|word| state.write_u64(word));
+    }
+}
+
+/// 行签名用的快速哈希：FxHash 那族的「异或 + 循环移位 + 乘法」核心。
+///
+/// 一个 64 位字只花一次乘法加一次旋转；std 默认的 SipHash-1-3 每 8 字节要跑一轮
+/// 压缩，还要为零碎 write 维护缓冲。碰撞语义的论证见模块注释。
+#[derive(Clone, Copy)]
+struct FxHasher(u64);
+
+impl FxHasher {
+    /// 与 rustc-hash 同一个常数（黄金比例的 64 位定点）。
+    const SEED: u64 = 0x517c_c1b7_2722_0a95;
+
+    #[inline]
+    fn new() -> Self {
+        // 种子非零：全零状态遇上全零输入是不动点，起手就避开
+        Self(Self::SEED)
+    }
+
+    #[inline]
+    fn write_u64(&mut self, value: u64) {
+        self.0 = (self.0.rotate_left(5) ^ value).wrapping_mul(Self::SEED);
+    }
+
+    #[inline]
+    fn finish(self) -> u64 {
+        // FxHash 的低位混得不如高位匀，而这里整个 u64 都当键用（不是取模成桶号）。
+        // 收尾补一次 xor-shift 混合，每行只跑一次，成本可以忽略。
+        let mut h = self.0;
+        h ^= h >> 32;
+        h = h.wrapping_mul(0xd6e8_feb8_6659_fd93);
+        h ^= h >> 32;
+        h
     }
 }
 
 /// 一行的内容签名。空行（全部是默认属性的空格）也会得到一个稳定值。
 pub fn row_signature(cells: &[CellSignature]) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut hasher = FxHasher::new();
     // 长度先进哈希：`["ab"]` 与 `["a","b"]` 这类拼接歧义直接堵死。
-    cells.len().hash(&mut hasher);
+    hasher.write_u64(cells.len() as u64);
     for cell in cells {
-        cell.hash(&mut hasher);
+        cell.write_words(|word| hasher.write_u64(word));
     }
     hasher.finish()
 }
@@ -436,6 +522,60 @@ mod tests {
         let mut opaque = base.clone();
         opaque[0].bg_default = false;
         assert_ne!(row_signature(&base), row_signature(&opaque));
+    }
+
+    /// 那几个小标量（`bg_default` / `selected` / `cursor` / `search`）被打包进
+    /// **同一个 64 位字的不同位段**，这条钉住它们没有互相串位 —— 串了的话
+    /// 「有选区」与「有光标」会算出同一个签名，画面直接张冠李戴。
+    #[test]
+    fn 小标量各占各的位段() {
+        let base = row("abc", 6);
+        let mut sigs = vec![row_signature(&base)];
+        for tweak in [
+            (|c: &mut CellSignature| c.bg_default = false) as fn(&mut CellSignature),
+            |c: &mut CellSignature| c.selected = true,
+            |c: &mut CellSignature| c.cursor = 1,
+            |c: &mut CellSignature| c.search = 1,
+        ] {
+            let mut cells = base.clone();
+            tweak(&mut cells[0]);
+            sigs.push(row_signature(&cells));
+        }
+        for (i, a) in sigs.iter().enumerate() {
+            for b in sigs.iter().skip(i + 1) {
+                assert_ne!(a, b, "第 {i} 个签名与后面某个撞了");
+            }
+        }
+    }
+
+    /// 打包成 u64 字之后，`Hash` 与 [`row_signature`] 必须还是同一份口径 ——
+    /// 两条路各写一遍字段顺序,迟早写漂。
+    #[test]
+    fn hash_与行签名同源() {
+        use std::hash::{Hash, Hasher};
+        let cells = row("hi", 4);
+        let words_of = |cell: &CellSignature| {
+            let mut got = Vec::new();
+            cell.write_words(|w| got.push(w));
+            got
+        };
+        // 同一个格子摊出来的字流稳定
+        assert_eq!(words_of(&cells[0]), words_of(&cells[0]));
+        assert_ne!(words_of(&cells[0]), words_of(&cells[1]));
+        // `Hash` 走的就是这份字流
+        let hashed = |cell: &CellSignature| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            cell.hash(&mut h);
+            h.finish()
+        };
+        let manual = |cell: &CellSignature| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            for w in words_of(cell) {
+                h.write_u64(w);
+            }
+            h.finish()
+        };
+        assert_eq!(hashed(&cells[0]), manual(&cells[0]));
     }
 
     #[test]

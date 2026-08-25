@@ -37,12 +37,14 @@
 //! - [`Ink::Rgb`] 是品牌固定色,不跟主题走 —— 品牌 logo 换色就不是那个牌子了。
 
 use std::f32::consts::TAU;
+use std::rc::Rc;
 
 use gpui::{
     App, Bounds, Element, FillOptions, FillRule, GlobalElementId, Hsla, InspectorElementId,
     IntoElement, LayoutId, PathBuilder, PathStyle, Pixels, Point, Style, Window, point, px,
 };
 
+use super::svg_path::SubPath;
 use crate::terminal::rgb8;
 
 /// 圆/弧离散成多少段。10px 的状态灯到 40px 的空态图标都够圆,再多是白费顶点。
@@ -148,10 +150,15 @@ impl Geom {
     /// 基本形只有一条;[`Geom::Path`] 可以有多条 —— 官方 logo 的洞
     /// (OpenCode 的内框、Copilot 的眼睛)靠「外框 + 内框 + 填充规则」表达,
     /// 必须画进**同一个** `PathBuilder` 才挖得出来。
-    pub fn subpaths(&self) -> Vec<(Vec<(f32, f32)>, bool)> {
+    ///
+    /// 返回 `Rc` 而不是 `Vec`:[`Geom::Path`] 那条本来就有一份 thread_local 缓存
+    /// (见 [`super::svg_path::cached`]),从前在这里 `.clone()` 一下等于把上千个
+    /// 离散点整份深拷贝 —— 文件树满屏时每行每帧都要付一遍。基本形那条包一次
+    /// `Rc::new`,换来两条路同型、调用方一律按引用迭代。
+    pub fn subpaths(&self) -> Rc<Vec<SubPath>> {
         match *self {
-            Geom::Path { d, view, .. } => (*super::svg_path::cached(d, view)).clone(),
-            _ => vec![self.points()],
+            Geom::Path { d, view, .. } => super::svg_path::cached(d, view),
+            _ => Rc::new(vec![self.points()]),
         }
     }
 
@@ -431,7 +438,7 @@ impl Element for VectorIcon {
                 Pen::Line(w) => PathBuilder::stroke(px((w * side).max(0.5))),
             };
             let mut drawn = false;
-            for (pts, closed) in &subpaths {
+            for (pts, closed) in subpaths.iter() {
                 if pts.len() < 2 {
                     continue;
                 }

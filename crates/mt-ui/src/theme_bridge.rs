@@ -419,7 +419,8 @@ pub fn builtin_terminal_theme(appearance: Appearance) -> TerminalTheme {
 
 // ───────────────────────── 映射 ─────────────────────────
 
-/// 背景图氛围层的参数。渲染尚未实现，见文件末尾 TODO。
+/// 背景图氛围层的参数。渲染在 [`crate::background`]（`BackgroundArtElement`）——
+/// cover 缩放、focus 百分比定位、纱罩三条语义照搬原版，判据见那个模块的注释。
 #[derive(Debug, Clone, PartialEq)]
 pub struct BackgroundArt {
     /// 图片绝对路径。

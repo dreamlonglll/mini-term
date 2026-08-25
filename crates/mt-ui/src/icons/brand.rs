@@ -579,7 +579,7 @@ mod tests {
     fn pi_的官方_path_落在四分格上_且洞还是洞() {
         // 官方 path 在 viewBox 165.29..634.72 下全是轴对齐矩形,归一后每个
         // 坐标都该落在 1/4 格上 —— viewBox 传错(比如照抄了 0 0 24 24)会立刻炸
-        let subs: Vec<_> = PI.iter().flat_map(|s| s.geom.subpaths()).collect();
+        let subs: Vec<_> = PI.iter().flat_map(|s| s.geom.subpaths().to_vec()).collect();
         assert_eq!(subs.len(), 3, "外框 + 洞 + 右竖");
         for (pts, _) in &subs {
             for (x, y) in pts {
@@ -613,7 +613,11 @@ mod tests {
             (AiVendor::Ollama, 8),
         ];
         for (vendor, subpaths) in want {
-            let got: Vec<_> = vendor.shapes().iter().flat_map(|s| s.geom.subpaths()).collect();
+            let got: Vec<_> = vendor
+                .shapes()
+                .iter()
+                .flat_map(|s| s.geom.subpaths().to_vec())
+                .collect();
             assert_eq!(got.len(), *subpaths, "{} 的子路径数不对", vendor.label());
             let points: usize = got.iter().map(|(p, _)| p.len()).sum();
             assert!(points > 8, "{} 只解析出 {points} 个点", vendor.label());
@@ -639,7 +643,7 @@ mod tests {
             let even_odd = shape.geom.even_odd();
             let mut winding = 0i32;
             let mut crossings = 0u32;
-            for (pts, _) in shape.geom.subpaths() {
+            for (pts, _) in shape.geom.subpaths().iter() {
                 for i in 0..pts.len() {
                     let (x0, y0) = pts[i];
                     let (x1, y1) = pts[(i + 1) % pts.len()];

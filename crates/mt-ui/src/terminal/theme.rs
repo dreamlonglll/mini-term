@@ -4,6 +4,8 @@
 //! 由 `mt-config` / 主题桥负责,最终转成一份 [`TerminalTheme`] 递给
 //! [`super::TerminalElement`]。
 
+use std::cell::RefCell;
+
 use gpui::{Hsla, Pixels, Rgba, SharedString, px};
 
 /// 把 8bit RGB 转成 gpui 的 [`Hsla`]。alacritty 侧的颜色全是 `Rgb { r, g, b }`。
@@ -140,6 +142,33 @@ impl Default for TerminalStyle {
     }
 }
 
+/// [`TerminalStyle::font`] 的缓存键 —— 就是那个方法真正读到的三个字段。
+///
+/// 字号 / 行高**不在**里面:它们不参与 Font 的组装(字号是 shape 时另给的参数)。
+struct FontKey {
+    family: SharedString,
+    fallbacks: Vec<SharedString>,
+    ligatures: bool,
+}
+
+impl FontKey {
+    fn of(style: &TerminalStyle) -> Self {
+        Self {
+            family: style.font_family.clone(),
+            fallbacks: style.font_fallbacks.clone(),
+            ligatures: style.ligatures,
+        }
+    }
+
+    /// 先比布尔与条数,不相等就不必去比字符串。
+    fn matches(&self, style: &TerminalStyle) -> bool {
+        self.ligatures == style.ligatures
+            && self.fallbacks.len() == style.font_fallbacks.len()
+            && self.family == style.font_family
+            && self.fallbacks == style.font_fallbacks
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,6 +213,28 @@ mod tests {
         assert_eq!(style.font().family, style.font_family);
         assert_eq!(style.font().weight, gpui::FontWeight::NORMAL);
     }
+
+    /// [`TerminalStyle::font`] 带缓存,而这个结构体的字段是 `pub` 且可变的 ——
+    /// 缓存键必须盖住它读到的**每一个**字段,少一个就会发回一份陈的字体
+    /// (只在「先问过一次再改字段」这个顺序下复现,是个很难查的鬼故事)。
+    #[test]
+    fn 字体缓存跟着字段走() {
+        let mut style = TerminalStyle::default();
+        assert_eq!(style.font().family, style.font_family);
+
+        style.font_family = "Fira Code".into();
+        assert_eq!(style.font().family, SharedString::from("Fira Code"));
+
+        style.font_fallbacks = vec!["Consolas".into()];
+        let fallbacks = style.font().fallbacks.expect("回退列表还在");
+        assert_eq!(fallbacks.fallback_list(), ["Consolas".to_string()]);
+
+        style.font_fallbacks.clear();
+        assert!(style.font().fallbacks.is_none(), "回退清空了就不该再发旧列表");
+
+        // 同一份样式连问两次必须一模一样(命中缓存那条路)
+        assert_eq!(style.font(), style.font());
+    }
 }
 
 impl TerminalStyle {
@@ -214,7 +265,46 @@ impl TerminalStyle {
     /// 那被理解成「显式指定了排版特性、且一个都不要」,liga/clig/calt 反而全灭。
     /// 空 features ≠ 平台默认,这条 2026-08-21 实测栽过。
     /// 显式给了值之后 gpui 会连 `liga`/`clig` 一起补成 1,三个 tag 都到位。
+    ///
+    /// # 为什么带缓存,又为什么缓存不挂在自己身上
+    ///
+    /// 造一份 Font 要七八次堆分配(4 个回退字族名各一次 `to_string`、装它们的 Vec、
+    /// `FontFallbacks` 与 `FontFeatures` 两个 Arc、features 里那个小 vec 与
+    /// `"calt"`),而**每帧每个 pane 都要造一次**(`element.rs` 的 prepaint 开头、
+    /// mini 预览同理),内容却几乎从不变。
+    ///
+    /// 缓存没有做成 `TerminalStyle` 的字段,是因为这个结构体的字段是 `pub` 且
+    /// 可变的:宿主用 `TerminalStyle { .., ..Default::default() }` 造完还会接着改
+    /// `ligatures` / 字号(本文件的 `连字开关只切_calt` 测试就是这个形状),
+    /// 惰性缓存一填就有读到陈值的路。而且加私有字段会直接堵死跨 crate 的
+    /// `..Default::default()` 构造(E0451)。
+    ///
+    /// 所以缓存放在线程局部的一张小表上,键就是 `font()` **真正读到**的那三个
+    /// 字段 —— 改完任何一个立刻算另一份,不存在陈值。表按线性扫描:同时在用的样式
+    /// 最多两三份(主终端 + 预览),比哈希一串字符串还便宜。
     pub fn font(&self) -> gpui::Font {
+        thread_local! {
+            static MEMO: RefCell<Vec<(FontKey, gpui::Font)>> = const { RefCell::new(Vec::new()) };
+        }
+        MEMO.with(|memo| {
+            let mut memo = memo.borrow_mut();
+            if let Some((_, font)) = memo.iter().find(|(key, _)| key.matches(self)) {
+                // Font 的 clone 只是引用计数:family 是 SharedString,
+                // features / fallbacks 各是一个 Arc(gpui 0.2.2),不碰堆
+                return font.clone();
+            }
+            let font = self.build_font();
+            // 涨过头就整表丢掉重来 —— 设置页里逐字符改字族名时不该把每个中间值都留着
+            if memo.len() >= 8 {
+                memo.clear();
+            }
+            memo.push((FontKey::of(self), font.clone()));
+            font
+        })
+    }
+
+    /// 真正组装一份 [`gpui::Font`]。缓存未命中时才走。
+    fn build_font(&self) -> gpui::Font {
         gpui::Font {
             family: self.font_family.clone(),
             features: if self.ligatures {

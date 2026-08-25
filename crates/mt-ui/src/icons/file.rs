@@ -53,9 +53,17 @@ use super::vector::VectorIcon;
 ///
 /// 认不出来也总有图可画(通用文件/文件夹),所以不返回 `Option`。
 pub fn art_of(name: &str, is_dir: bool, is_open: bool) -> &'static FileArt {
-    let lower = name.to_ascii_lowercase();
+    // 绝大多数文件名本来就是小写:先扫一眼,真有大写才分配那份 String
+    // (文件树满屏时这条每行每帧都要走一遍)
+    let lowered: String;
+    let lower: &str = if name.bytes().any(|b| b.is_ascii_uppercase()) {
+        lowered = name.to_ascii_lowercase();
+        &lowered
+    } else {
+        name
+    };
     if is_dir {
-        let idx = lookup_pair(FOLDER_NAMES, &lower)
+        let idx = lookup_pair(FOLDER_NAMES, lower)
             .map(|(closed, open)| if is_open { open } else { closed })
             .unwrap_or(if is_open {
                 FOLDER_OPEN_FALLBACK
@@ -66,7 +74,7 @@ pub fn art_of(name: &str, is_dir: bool, is_open: bool) -> &'static FileArt {
     }
 
     // 1. 整名命中(Cargo.lock 不是 toml,Dockerfile 没有扩展名)
-    if let Some(idx) = lookup(FILE_EXACT, &lower) {
+    if let Some(idx) = lookup(FILE_EXACT, lower) {
         return art(idx);
     }
     // 2. 前缀命中(.env.production / Dockerfile.dev / docker-compose.override.yml)。
@@ -77,7 +85,7 @@ pub fn art_of(name: &str, is_dir: bool, is_open: bool) -> &'static FileArt {
         }
     }
     // 3. 扩展名。`.gitignore` 这类点开头的裸文件没有扩展名(整名已在第 1 步兜住)
-    if let Some(idx) = extension_of(&lower).and_then(|ext| lookup(FILE_EXT, ext)) {
+    if let Some(idx) = extension_of(lower).and_then(|ext| lookup(FILE_EXT, ext)) {
         return art(idx);
     }
     art(FILE_FALLBACK)

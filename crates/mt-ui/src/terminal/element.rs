@@ -355,6 +355,15 @@ struct TerminalElementState {
     last_reported_cell: Rc<StdCell<Option<(usize, usize)>>>,
     /// 行渲染缓存,见 [`super::damage`]。
     rows: Rc<RefCell<RowCache<Rc<RowRender>>>>,
+    /// 逐行解析出来的格子的暂存区(arena)。**跨帧复用**:每帧开头清空、容量留着 ——
+    /// 未命中的行原地留在里面等 shaping,命中的行解析完就把尾巴截掉。
+    ///
+    /// 从前这里是「一根 scratch + `mem::take`」:每个未命中的行都要重新分配一次
+    /// (200 列 × 72B ≈ 14KB),而刷屏时整屏都是未命中。容量按「一帧未命中行数 ×
+    /// 列数」的高水位收敛,一屏满打满算几百 KB —— 与行缓存自己那份产物同一量级。
+    cells: Rc<RefCell<Vec<CellSignature>>>,
+    /// 「字符步进是否恰好一列宽」的缓存,见 [`AdvanceCache`]。
+    advance: Rc<RefCell<AdvanceCache>>,
     /// 滚动条的拖动/悬停状态。
     scrollbar: Rc<StdCell<ScrollbarDrag>>,
     /// 上一次「滚动条该亮起来」的时刻(滚动、拖动、悬停)。淡出计时的起点。
@@ -375,6 +384,8 @@ impl Default for TerminalElementState {
             reported_button: Rc::new(StdCell::new(None)),
             last_reported_cell: Rc::new(StdCell::new(None)),
             rows: Rc::new(RefCell::new(RowCache::new())),
+            cells: Rc::new(RefCell::new(Vec::new())),
+            advance: Rc::new(RefCell::new(AdvanceCache::default())),
             scrollbar: Rc::new(StdCell::new(ScrollbarDrag::default())),
             scrollbar_touched: Rc::new(StdCell::new(None)),
             last_offset: Rc::new(StdCell::new(0)),
@@ -439,32 +450,90 @@ pub struct PreparedFrame {
     flash: Option<(Bounds<Pixels>, Hsla)>,
 }
 
-// 「这个字符在这套字体里的步进正好是一列宽吗」的缓存。
-//
-// 每帧对每个格子问一次,不缓存就是每帧几千次 DirectWrite 往返。key 带 font_id
-// 与字号,粗体/斜体是不同的 font_id,各自算各自的。
-thread_local! {
-    static ADVANCE_FITS: RefCell<HashMap<(FontId, u32, char), bool>> = RefCell::new(HashMap::new());
+/// 「这个字符在这套字体里的步进正好是一列宽吗」的缓存。
+///
+/// 每帧对每个格子问一次,不缓存就是每帧几千次 DirectWrite 往返。挂在
+/// [`TerminalElementState`] 上(跨帧存活),prepaint 开头借一次、整帧共用 ——
+/// 从前它是个 thread_local,于是**每个格子**都要走一趟 TLS + RefCell + SipHash。
+///
+/// 分两层:
+///
+/// - **ASCII 直接下标**。一屏一万个格子里九成九是 ASCII,查一次表不该有哈希成本。
+///   小表按「字形变体 × 码位」分层,`[Option<bool>; 128] × 4` 一共 512 字节;
+///   四档 FontId / 字号 / 列宽任一变化就整体清掉(那时 [`FrameKey`] 也变,
+///   行缓存本来就要全量重建)。
+/// - **非 ASCII 走 HashMap**,键里带 font_id 与字号 —— 粗体 / 斜体是不同的
+///   font_id,各自算各自的。列宽不进键:它本来就是 (font_id, 字号) 算出来的
+///   ('M' 的 advance),同一个键对应的答案不会变。
+struct AdvanceCache {
+    /// ASCII 快表的有效性判据:四档变体的 FontId + 字号 + 列宽。
+    key: Option<([FontId; 4], u32, u32)>,
+    /// 下标 = [`VariantFonts::slot`] 的四档(正 / 粗 / 斜 / 粗斜)。
+    ascii: [[Option<bool>; 128]; 4],
+    wide: HashMap<(FontId, u32, char), bool>,
 }
 
-fn advance_fits_cell(
-    window: &Window,
-    font_id: FontId,
-    font_size: Pixels,
-    ch: char,
-    cell_width: Pixels,
-) -> bool {
-    let key = (font_id, f(font_size).to_bits(), ch);
-    if let Some(hit) = ADVANCE_FITS.with(|c| c.borrow().get(&key).copied()) {
-        return hit;
+impl Default for AdvanceCache {
+    fn default() -> Self {
+        Self {
+            key: None,
+            ascii: [[None; 128]; 4],
+            wide: HashMap::new(),
+        }
     }
-    let fits = window
-        .text_system()
-        .advance(font_id, font_size, ch)
-        .map(|adv| (f(adv.width) - f(cell_width)).abs() < 0.01)
-        .unwrap_or(false);
-    ADVANCE_FITS.with(|c| c.borrow_mut().insert(key, fits));
-    fits
+}
+
+impl AdvanceCache {
+    /// 每帧开头对一次表:字体度量换了就把 ASCII 快表清掉。
+    fn begin_frame(&mut self, fonts: &VariantFonts, font_size: Pixels, cell_width: Pixels) {
+        let key = (fonts.ids, f(font_size).to_bits(), f(cell_width).to_bits());
+        if self.key != Some(key) {
+            self.key = Some(key);
+            self.ascii = [[None; 128]; 4];
+        }
+    }
+
+    fn fits(
+        &mut self,
+        window: &Window,
+        slot: usize,
+        font_id: FontId,
+        font_size: Pixels,
+        ch: char,
+        cell_width: Pixels,
+    ) -> bool {
+        let code = ch as usize;
+        if code < 128 {
+            if let Some(hit) = self.ascii[slot][code] {
+                return hit;
+            }
+            let fits = self.measure(window, font_id, font_size, ch, cell_width);
+            self.ascii[slot][code] = Some(fits);
+            return fits;
+        }
+        self.measure(window, font_id, font_size, ch, cell_width)
+    }
+
+    fn measure(
+        &mut self,
+        window: &Window,
+        font_id: FontId,
+        font_size: Pixels,
+        ch: char,
+        cell_width: Pixels,
+    ) -> bool {
+        let key = (font_id, f(font_size).to_bits(), ch);
+        if let Some(hit) = self.wide.get(&key).copied() {
+            return hit;
+        }
+        let fits = window
+            .text_system()
+            .advance(font_id, font_size, ch)
+            .map(|adv| (f(adv.width) - f(cell_width)).abs() < 0.01)
+            .unwrap_or(false);
+        self.wide.insert(key, fits);
+        fits
+    }
 }
 
 /// 参与「能否与相邻格子合并成一个 ShapedLine」判定的款式。
@@ -1198,7 +1267,7 @@ impl Element for TerminalElement {
         //  命中集合**不进**帧指纹:它进的是每个格子的行签名(`CellSignature::search`),
         //  于是查找条一开只重建真正带高亮的那几行,整屏缓存不被打穿。
         //  只有配色这种「每一行都会变、签名却不动」的参数才配进这里。
-        let frame_key = FrameKey::builder()
+        let mut key = FrameKey::builder()
             .push_f32(f(cell_width))
             .push_f32(f(line_height))
             .push_f32(f(font_size))
@@ -1209,13 +1278,13 @@ impl Element for TerminalElement {
             // 内容,行签名一个字节都不会动 —— 漏了这一条,切开关后整屏行缓存照旧命中,
             // 表现成「开关点了没反应」。
             .push(self.style.ligatures)
-            .push(
-                self.style
-                    .font_fallbacks
-                    .iter()
-                    .map(|s| s.as_ref())
-                    .collect::<Vec<_>>(),
-            )
+            // 回退字族逐个进,不再 collect 成一个中间 Vec(每帧每 pane 一次分配)。
+            // 条数先进哈希,免得「少一条回退」与「某条名字接在了前一条后面」撞上。
+            .push(self.style.font_fallbacks.len());
+        for fallback in &self.style.font_fallbacks {
+            key = key.push(fallback.as_ref());
+        }
+        let frame_key = key
             .push_hsla(self.theme.selection)
             .push_hsla(self.theme.cursor)
             .push_hsla(self.theme.cursor_text)
@@ -1250,7 +1319,16 @@ impl Element for TerminalElement {
             frame_cursor_point = cursor_point;
 
             let mut cache = state.rows.borrow_mut();
-            let mut scratch: Vec<CellSignature> = Vec::with_capacity(columns);
+            // 逐行解析出来的格子写进这根跨帧复用的 arena(见 `TerminalElementState::cells`):
+            // 一行解析完就算签名,命中缓存的把尾巴截掉、未命中的原地留着,
+            // 只把「这一段的下标」交给 shaping —— 全程零分配、零拷贝。
+            let mut arena = state.cells.borrow_mut();
+            arena.clear();
+            // 一帧最多用到「可视行 × 列」这么多格子。窗口拖小 / 字号调大之后按新的
+            // 上限收一收容量,免得旧的高水位一路留到进程退出(只在真的超了才重分配)。
+            arena.shrink_to(columns.saturating_mul(screen_lines));
+            // 当前行在 arena 里的起点。命中就退回它,未命中就前进到行尾。
+            let mut row_start = 0usize;
             let mut current_row: Option<usize> = None;
             // 每帧新建:阈值在一帧内恒定,不必进键(见 `ContrastMemo` 的说明)。
             let mut contrast = colors::ContrastMemo::default();
@@ -1258,34 +1336,50 @@ impl Element for TerminalElement {
             let mut row_spans: &[HighlightSpan] = &[];
 
             let flush_row = |row: usize,
-                                 scratch: &mut Vec<CellSignature>,
+                                 arena: &mut Vec<CellSignature>,
+                                 row_start: &mut usize,
                                  cache: &mut RowCache<Rc<RowRender>>,
                                  placed: &mut Vec<(usize, Rc<RowRender>)>,
                                  pending: &mut Vec<RowPending>| {
-                if scratch.is_empty() {
+                let start = *row_start;
+                if arena.len() == start {
                     return;
                 }
-                let sig = row_signature(scratch);
+                let sig = row_signature(&arena[start..]);
                 match cache.get(sig) {
-                    Some(render) => placed.push((row, render)),
-                    None => pending.push(RowPending {
-                        row,
-                        sig,
-                        cells: std::mem::take(scratch),
-                    }),
+                    // 命中:格子已经没用了,截回行首让下一行接着写这段容量
+                    Some(render) => {
+                        placed.push((row, render));
+                        arena.truncate(start);
+                    }
+                    // 未命中:留在 arena 里等放锁之后 shape,只记一段下标
+                    None => {
+                        pending.push(RowPending {
+                            row,
+                            sig,
+                            cells: start..arena.len(),
+                        });
+                        *row_start = arena.len();
+                    }
                 }
-                scratch.clear();
             };
 
             for indexed in content.display_iter {
                 let row = (indexed.point.line.0 + display_offset as i32).max(0) as usize;
                 if current_row != Some(row) {
                     if let Some(prev) = current_row {
-                        flush_row(prev, &mut scratch, &mut cache, &mut placed, &mut pending);
+                        flush_row(
+                            prev,
+                            &mut arena,
+                            &mut row_start,
+                            &mut cache,
+                            &mut placed,
+                            &mut pending,
+                        );
                         rows_seen += 1;
                     }
                     current_row = Some(row);
-                    scratch.reserve(columns);
+                    arena.reserve(columns);
                     row_spans = highlights
                         .as_ref()
                         .map(|h| h.row(indexed.point.line.0))
@@ -1340,7 +1434,7 @@ impl Element for TerminalElement {
                     .map(|s| s.kind.code())
                     .unwrap_or(0);
 
-                scratch.push(CellSignature {
+                arena.push(CellSignature {
                     col,
                     ch: cell.c,
                     zerowidth,
@@ -1358,27 +1452,41 @@ impl Element for TerminalElement {
                 });
             }
             if let Some(row) = current_row {
-                flush_row(row, &mut scratch, &mut cache, &mut placed, &mut pending);
+                flush_row(
+                    row,
+                    &mut arena,
+                    &mut row_start,
+                    &mut cache,
+                    &mut placed,
+                    &mut pending,
+                );
                 rows_seen += 1;
             }
         }
 
         // ── shape 只发生在「内容真的变了」的行上。
         //    锁已经放掉了 —— shaping 会往 DirectWrite 里跑,别拿着 grid 锁做。
-        for row in pending {
-            let render = Rc::new(build_row(
-                window,
-                &row.cells,
-                &font,
-                font_size,
-                &variant_fonts,
-                cell_width,
-                line_height,
-                &self.theme,
-                self.style.ligatures,
-            ));
-            state.rows.borrow_mut().insert(row.sig, render.clone());
-            placed.push((row.row, render));
+        {
+            // arena 与「步进是否一列宽」的表都借一次,整批 shape 共用。
+            let arena = state.cells.borrow();
+            let mut advance = state.advance.borrow_mut();
+            advance.begin_frame(&variant_fonts, font_size, cell_width);
+            for row in pending {
+                let render = Rc::new(build_row(
+                    window,
+                    &arena[row.cells],
+                    &font,
+                    font_size,
+                    &variant_fonts,
+                    &mut advance,
+                    cell_width,
+                    line_height,
+                    &self.theme,
+                    self.style.ligatures,
+                ));
+                state.rows.borrow_mut().insert(row.sig, render.clone());
+                placed.push((row.row, render));
+            }
         }
 
         {
@@ -1650,10 +1758,13 @@ impl Element for TerminalElement {
 }
 
 /// 一行「内容变了、需要重建」的暂存。
+///
+/// `cells` 是它在 arena(`TerminalElementState::cells`)里的下标区间,不是自己的
+/// 一份 Vec —— 每个未命中的行一次分配是刷屏时最贵的一笔。
 struct RowPending {
     row: usize,
     sig: u64,
-    cells: Vec<CellSignature>,
+    cells: std::ops::Range<usize>,
 }
 
 /// 未 shape 的合并运行段。
@@ -1698,6 +1809,7 @@ fn build_row(
     font: &gpui::Font,
     font_size: Pixels,
     variant_fonts: &VariantFonts,
+    advance: &mut AdvanceCache,
     cell_width: Pixels,
     line_height: Pixels,
     theme: &TerminalTheme,
@@ -1800,13 +1912,14 @@ fn build_row(
         };
 
         let has_zerowidth = cell.zerowidth[0] != '\0';
-        let run_font_id = variant_fonts.id(style_key.bold, style_key.italic);
+        let slot = VariantFonts::slot(style_key.bold, style_key.italic);
+        let run_font_id = variant_fonts.id_at(slot);
         // 可合并的条件:窄字符、无组合符号、不是光标格(光标格颜色单独)、
         // 且主字体里这个字形的步进恰好一列宽。
         let mergeable = !cell.flags.contains(Flags::WIDE_CHAR)
             && !has_zerowidth
             && cell.cursor == 0
-            && advance_fits_cell(window, run_font_id, font_size, cell.ch, cell_width);
+            && advance.fits(window, slot, run_font_id, font_size, cell.ch, cell_width);
 
         if mergeable {
             match text_run.as_mut() {
@@ -2057,8 +2170,17 @@ impl VariantFonts {
         }
     }
 
+    /// 四档变体的下标。[`AsciiAdvance`] 的表也按它分层。
+    fn slot(bold: bool, italic: bool) -> usize {
+        usize::from(bold) + 2 * usize::from(italic)
+    }
+
     fn id(&self, bold: bool, italic: bool) -> FontId {
-        self.ids[usize::from(bold) + 2 * usize::from(italic)]
+        self.ids[Self::slot(bold, italic)]
+    }
+
+    fn id_at(&self, slot: usize) -> FontId {
+        self.ids[slot]
     }
 }
 
