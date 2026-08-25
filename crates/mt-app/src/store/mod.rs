@@ -53,12 +53,15 @@ use crate::persist;
 use crate::tree::{PaneState, PaneStatus, ProjectPanel, SplitNode};
 
 mod ai;
+mod config_writer;
 mod layout;
 mod panes;
 mod prefs;
 mod projects;
 mod pure;
 mod ssh;
+
+use config_writer::ConfigWriter;
 
 // 纯函数与它们的类型原本就住在 store.rs 顶层;拆进 `pure` 后原样再导出,
 // `crate::store::Xxx` 这条对外路径一字不变(全仓其它文件零改动的前提)。
@@ -307,6 +310,10 @@ pub struct AppStore {
     /// 写盘令牌(乐观并发);0 = 还没成功 load 过,此时一律不写盘。
     token: u64,
     config_store: Arc<ConfigStore>,
+    /// 配置落盘的单写者后台线程。主线程只把**完整快照**入队(见
+    /// [`crate::store::config_writer`]):那条链末端是 `synchronous=FULL` 的
+    /// SQLite 事务加一次投影文件 fsync,慢盘上几百毫秒,不能留在 UI 线程上。
+    config_writer: ConfigWriter,
     /// 界面布局的落盘口(`layout.db`)。`None` = 库开不起来(盘满 / 权限),
     /// 此时布局**只在内存里活着**:界面照常用,退出即忘 —— 与配置加载失败时
     /// 「只读模式」同一条红线,绝不因为存不下就不让用。
@@ -500,7 +507,6 @@ fn apply_layout_db(
 impl AppStore {
     /// 装配 store:加载配置 → 恢复各项目布局(不起 PTY,PTY 在首次显示时懒起)。
     pub fn new(config_store: Arc<ConfigStore>, ai: AiBridge, cx: &mut Context<Self>) -> Self {
-        let _ = cx;
         let (mut config, token) = match config_store.load() {
             Ok(loaded) => (loaded.config, loaded.token),
             Err(err) => {
@@ -545,10 +551,32 @@ impl AppStore {
             .filter(|id| project_states.contains_key(id))
             .or_else(|| config.projects.first().map(|p| p.id.clone()));
 
+        // 配置落盘搬去后台线程之后,退出前必须有人把队列排干。挂在这里而不是
+        // `main.rs`:`AppStore` 是配置写入的唯一入口,排干义务跟着它走才不会
+        // 因为壳那边改动漏掉。
+        //
+        // 时序靠 gpui 的 `App::shutdown` 兜住 —— 它**先把所有退出观察者的函数体
+        // 跑完**(`main.rs` 那个在函数体里补的最后一次 `save_config_now()` 于是
+        // 已经入队),**再**统一 await 收上来的 future。所以本观察者虽然注册得更
+        // 早,轮到它的 future 被 poll 时看到的已是最终队列。
+        let config_writer = ConfigWriter::spawn(config_store.clone());
+        let drain = config_writer.drain_handle();
+        // 显式走 `App::on_app_quit` 而不是 `Context::on_app_quit`:排干不需要
+        // `&mut AppStore`,而后者会在退出那一刻回头 `update` 本实体 —— 平白多一
+        // 条「实体还在不在」的依赖。
+        App::on_app_quit(cx, move |_cx| {
+            let drain = drain.clone();
+            async move {
+                drain.drain();
+            }
+        })
+        .detach();
+
         Self {
             config,
             token,
             config_store,
+            config_writer,
             layout_store,
             window_geometry,
             // 缺省展开:面板是发现型入口,收着的话没人知道它存在

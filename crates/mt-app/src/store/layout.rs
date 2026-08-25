@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use gpui::{Context, Window};
-use mt_config::{SaveError, ShellConfig};
+use mt_config::ShellConfig;
 
 use crate::persist;
 use crate::tree::{ProjectPanel, SplitNode};
@@ -478,31 +478,44 @@ impl AppStore {
         }));
     }
 
-    /// 立即写盘(退出前 / 项目切换)。
+    /// 立即把配置**排上落盘**(退出前 / 项目切换 / 那十来个不肯等防抖的写入点)。
+    ///
+    /// # 「立即」现在的含义:入队即快照,不是同步写完
+    ///
+    /// 方法名与全部调用点保持原样,但这一调不再在 UI 线程上碰磁盘:它把
+    /// `self.config` 克隆一份交给单写者后台线程(见
+    /// [`crate::store::config_writer`]),自己毫秒级返回。
+    ///
+    /// **语义没有退回防抖**:调用方之所以选这条而不是 500ms 的
+    /// [`Self::save_config_soon`],要的是「这一刻的内容已经定死、崩溃也不会丢」
+    /// (SSH 密码、私钥路径、项目环境变量)。克隆发生在返回之前,写线程一直阻塞
+    /// 在条件变量上、入队即被唤醒 —— 风险窗口是一次线程唤醒加一次事务,不是
+    /// 半秒钟的防抖窗。丢失窗口内多次调用会被折叠成最新一份(全量快照,
+    /// 合法性论证见那个模块的注释)。
     ///
     /// 令牌语义与装机版一致:令牌过期说明别处写过配置,必须先重读拿到新令牌。
     /// 单进程壳里「别处」只可能是本进程的另一次 load,手上这份就是最新的,
-    /// 于是重读一次令牌后原样重写。
+    /// 于是重读一次令牌后原样重写。**这一步刻意留在主线程** —— 它要回写
+    /// `self.token`,而且实际走不到(load 只发生在启动)。
     ///
     /// 顺手把布局也刷下去:两条落盘路径分家后,退出钩子只调这一个入口 ——
-    /// 让它把两边都收干净,比要求每个调用点记得调两次可靠。
+    /// 让它把两边都收干净,比要求每个调用点记得调两次可靠。布局那次仍是同步的:
+    /// 一行 upsert、库也没开 `synchronous=FULL`,搬去后台换不来什么。
     pub fn save_config_now(&mut self) {
         self.flush_layout_now();
         if self.token == 0 {
             return; // 配置没加载成功过,不许写盘覆盖磁盘
         }
-        match self.config_store.save(self.token, &self.config) {
-            Ok(()) => {}
-            Err(SaveError::StaleToken { .. }) => match self.config_store.load() {
-                Ok(loaded) => {
-                    self.token = loaded.token;
-                    if let Err(err) = self.config_store.save(self.token, &self.config) {
-                        eprintln!("[store] 配置重试保存失败: {err}");
-                    }
+        if self.token != self.config_store.current_token() {
+            match self.config_store.load() {
+                Ok(loaded) => self.token = loaded.token,
+                Err(err) => {
+                    eprintln!("[store] 令牌过期后重读配置失败: {err:#}");
+                    return;
                 }
-                Err(err) => eprintln!("[store] 令牌过期后重读配置失败: {err:#}"),
-            },
-            Err(err) => eprintln!("[store] 配置保存失败: {err}"),
+            }
         }
+        self.config_writer
+            .enqueue(&self.config_store, self.token, self.config.clone());
     }
 }
