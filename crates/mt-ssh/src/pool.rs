@@ -201,21 +201,37 @@ impl SshPool {
     /// 若返回的 session `is_unhealthy_now() == true`,调用方应立即返错而不去开 channel,
     /// 实现 30s gatetime cooldown 的语义。
     pub async fn acquire(&self, conn: &SshConnection) -> Result<Arc<CachedSession>, String> {
-        {
+        // **持池锁期间只克隆 Arc,立刻放锁**。下面的 `is_closed()` 要 await 单会话锁,
+        // 而传输操作(`run_sftp_upload_on_session` / `run_sftp_download_on_session`)
+        // 全程持有单会话锁 —— 若在池锁里等它,任何一条连接传大文件都会把**其它所有
+        // 连接**的 acquire 一起堵死(全池 head-of-line 阻塞)。池锁只保护 map 本身。
+        let cached = {
             let inner = self.inner.lock().await;
-            if let Some(s) = inner.sessions.get(&conn.id) {
-                // 复用前只检查 underlying handle 是否还活着。
-                //
-                // **不要在这里同时检查 is_unhealthy_now**:cooldown 的意图是「上一次失败
-                // 后 30s 内立即返错、不再去打远端」,需要把带 unhealthy 标记的 session
-                // 原样返给调用方,由 ssh_exec 那边的 is_unhealthy_now 分支返错。如果
-                // 在这里把 unhealthy session 当作 miss 跳过去走重建,acquire 会真的重连
-                // 远端、并返回一个 unhealthy_until=0 的新 session,调用方永远看不到
-                // cooldown,gatetime 语义彻底失效。
-                if !s.handle.lock().await.is_closed() {
-                    s.touch();
-                    return Ok(s.clone());
-                }
+            inner.sessions.get(&conn.id).cloned()
+        };
+        if let Some(s) = cached {
+            // 复用前只检查 underlying handle 是否还活着。
+            //
+            // **不要在这里同时检查 is_unhealthy_now**:cooldown 的意图是「上一次失败
+            // 后 30s 内立即返错、不再去打远端」,需要把带 unhealthy 标记的 session
+            // 原样返给调用方,由 ssh_exec 那边的 is_unhealthy_now 分支返错。如果
+            // 在这里把 unhealthy session 当作 miss 跳过去走重建,acquire 会真的重连
+            // 远端、并返回一个 unhealthy_until=0 的新 session,调用方永远看不到
+            // cooldown,gatetime 语义彻底失效。
+            if !s.handle.lock().await.is_closed() {
+                s.touch();
+                return Ok(s);
+            }
+            // 已死:重新取池锁把它剔掉(否则 build 失败时死条目会一直占着 max_sessions)。
+            // **TOCTOU**:放锁的这段空档里别人可能已经重建过同 id 的 session,
+            // 用 `Arc::ptr_eq` 确认 map 里还是当初那一条再删,别误删新的。
+            let mut inner = self.inner.lock().await;
+            if inner
+                .sessions
+                .get(&conn.id)
+                .is_some_and(|cur| Arc::ptr_eq(cur, &s))
+            {
+                inner.sessions.remove(&conn.id);
             }
         }
 
@@ -496,6 +512,9 @@ impl std::fmt::Display for SftpTransferError {
 /// 全程持有 `session.lock()`(沿用现有 channel 串行化语义),用 `open_with_flags`
 /// 拿到流式 `File`,以固定大小缓冲分块 `read`→`write_all`,内存占用恒定。
 ///
+/// 与下载侧同款:先写远端临时文件(`<remote>.mt-sftp-partial`)再改名到目标,
+/// **中断绝不会把远端原文件截成半截**;失败时清理临时文件。
+///
 /// 返回写入的字节数。错误区分 transport(可 evict 重连)与 SFTP 业务错(不 evict)。
 pub async fn run_sftp_upload_on_session(
     session: &CachedSession,
@@ -529,39 +548,86 @@ pub async fn run_sftp_upload_on_session(
     // 放宽协议层每请求超时(默认 10s),避免慢链路下单个 chunk 包就把整段传输打断。
     sftp.set_timeout(sftp_request_timeout_secs(transfer_timeout));
 
+    // 临时文件路径:目标旁边加后缀,与下载侧同一套命名(`sftp_partial_path`)。
+    // 传输期间远端目标文件**一个字节都不会被动**,中断只会留下一个临时文件。
+    let tmp_path = sftp_partial_path(remote_path);
+
     let mut remote = sftp
         .open_with_flags(
-            remote_path,
+            tmp_path.as_str(),
             OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
         )
         .await
-        .map_err(|e| SftpTransferError::Sftp(format!("sftp open '{remote_path}' failed: {e}")))?;
+        .map_err(|e| SftpTransferError::Sftp(format!("sftp open '{tmp_path}' failed: {e}")))?;
 
     let mut buf = vec![0u8; SFTP_CHUNK_BYTES];
     let mut total: u64 = 0;
-    loop {
-        let n = local.read(&mut buf).await.map_err(|e| {
-            SftpTransferError::Sftp(format!("read local file '{local_path}' failed: {e}"))
-        })?;
-        if n == 0 {
-            break;
+    let copy_result: Result<(), SftpTransferError> = async {
+        loop {
+            let n = local.read(&mut buf).await.map_err(|e| {
+                SftpTransferError::Sftp(format!("read local file '{local_path}' failed: {e}"))
+            })?;
+            if n == 0 {
+                break;
+            }
+            remote.write_all(&buf[..n]).await.map_err(|e| {
+                SftpTransferError::Sftp(format!("sftp write to '{tmp_path}' failed: {e}"))
+            })?;
+            total += n as u64;
         }
-        remote.write_all(&buf[..n]).await.map_err(|e| {
-            SftpTransferError::Sftp(format!("sftp write to '{remote_path}' failed: {e}"))
+        remote.flush().await.map_err(|e| {
+            SftpTransferError::Sftp(format!("sftp flush '{tmp_path}' failed: {e}"))
         })?;
-        total += n as u64;
+        remote.shutdown().await.map_err(|e| {
+            SftpTransferError::Sftp(format!("sftp close remote '{tmp_path}' failed: {e}"))
+        })?;
+
+        // 收尾改名 —— 必须在本 sftp 会话关闭前做。
+        //
+        // ⚠️ SFTP 的 rename 语义:标准 `SSH_FXP_RENAME` 在目标已存在时会失败
+        // (OpenSSH 行为),而 russh-sftp **没有** `posix-rename@openssh.com`
+        // 扩展 —— 主工作区的 2.4 与 sidecars 工作区的 2.3 都只有
+        // limits/hardlink/fsync/statvfs(+2.4 的 expand-path),两边一致。
+        // 故先直接 rename:目标不存在时一次成功、**零空窗**;只有「目标已存在」
+        // 才回退到 remove + rename,留一个极小的空窗 —— 仍远好于原先
+        // CREATE|TRUNCATE 的「一中断就把远端原文件截成半截」。
+        if let Err(first) = sftp.rename(tmp_path.as_str(), remote_path).await {
+            // remove 对「目标本就不存在」容错:那说明 rename 是别的原因失败,
+            // 下面这次重试会把真正的错误报出来。
+            let _ = sftp.remove_file(remote_path).await;
+            sftp.rename(tmp_path.as_str(), remote_path)
+                .await
+                .map_err(|e| {
+                    SftpTransferError::Sftp(format!(
+                        "failed to move uploaded file into place '{remote_path}': {e} \
+                        (first rename attempt: {first})"
+                    ))
+                })?;
+        }
+        Ok(())
     }
-    remote
-        .flush()
-        .await
-        .map_err(|e| SftpTransferError::Sftp(format!("sftp flush '{remote_path}' failed: {e}")))?;
-    remote.shutdown().await.map_err(|e| {
-        SftpTransferError::Sftp(format!("sftp close remote '{remote_path}' failed: {e}"))
-    })?;
+    .await;
+
+    // 失败:清掉远端半截临时文件(目标文件从头到尾没被动过),再把错误返出去。
+    if let Err(e) = copy_result {
+        let _ = sftp.remove_file(tmp_path.as_str()).await;
+        let _ = sftp.close().await; // best-effort
+        drop(handle_guard);
+        return Err(e);
+    }
+
     let _ = sftp.close().await; // best-effort
     drop(handle_guard);
 
     Ok(total)
+}
+
+/// 传输中途落地的临时文件名:目标旁边加 `.mt-sftp-partial` 后缀。
+///
+/// 上传(远端)与下载(本地)共用同一套命名 —— 同目录保证 rename 是同一文件系统
+/// 内的原子改名而非跨盘拷贝,后缀也让用户一眼认出「这是没传完的残留」。
+fn sftp_partial_path(target: &str) -> String {
+    format!("{target}.mt-sftp-partial")
 }
 
 /// 在已 acquire 到的 session 上开 SFTP channel,把远程文件流式下载并**落盘**到本地路径。
@@ -580,7 +646,7 @@ pub async fn run_sftp_download_on_session(
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     // 临时文件路径:目标旁边加后缀,与目标同盘保证 rename 是原子改名而非跨盘拷贝。
-    let tmp_path = format!("{local_path}.mt-sftp-partial");
+    let tmp_path = sftp_partial_path(local_path);
 
     let handle_guard = session.lock().await;
     let channel = handle_guard
@@ -1013,6 +1079,23 @@ mod tests {
         assert_eq!(sftp_request_timeout_secs(Duration::from_secs(0)), 1);
         // 亚秒窗口(被 caller .max(1) 前可能出现)也至少 1s。
         assert_eq!(sftp_request_timeout_secs(Duration::from_millis(500)), 1);
+    }
+
+    /// 临时文件名:上传(远端路径)与下载(本地路径)共用同一后缀,
+    /// 且**永远落在目标同目录**(同文件系统 → rename 是原子改名)。
+    #[test]
+    fn sftp_partial_path_appends_suffix_next_to_target() {
+        assert_eq!(
+            sftp_partial_path("/home/u/.mini-term/pasted/a.png"),
+            "/home/u/.mini-term/pasted/a.png.mt-sftp-partial"
+        );
+        // Windows 本地路径(下载侧)同理:只加后缀,目录部分一字不动。
+        assert_eq!(
+            sftp_partial_path(r"D:\dl\a.zip"),
+            r"D:\dl\a.zip.mt-sftp-partial"
+        );
+        // 无扩展名 / 带空格的目标也只是加后缀。
+        assert_eq!(sftp_partial_path("/tmp/my file"), "/tmp/my file.mt-sftp-partial");
     }
 
     #[test]

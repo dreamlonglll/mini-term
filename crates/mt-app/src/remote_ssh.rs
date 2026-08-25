@@ -178,6 +178,40 @@ impl RemoteSshState {
         rt.block_on(fut)
     }
 
+    /// 一条 SSH 连接的配置被改动/删除时,把它在本进程里的**全部残留**作废:
+    /// 池里那条 session + 两张按连接缓存(`home_cache` / `gitignore_cache`)+
+    /// 会话路径映射。
+    ///
+    /// 为什么必须有:池键是纯 `connection.id`,`CachedSession` 不存 host/user/port,
+    /// acquire 也不比对配置。用户把 host 改成另一台服务器却保留同一个 id 时,
+    /// 旧服务器的 session 会一直被复用到 reaper 回收(idle 10min / lifetime 2h),
+    /// 期间文件树、粘贴上传、会话扫描全打在**旧机器**上。
+    ///
+    /// **边界**:只作废本进程的池。三个 sidecar 是独立进程、各自另一份池,
+    /// 它们每次请求重读 `config.json` 拿连接信息,自己的 session 仍可能是旧的 ——
+    /// 那条链路不在本函数职责内(sidecar 的池由其自身生命周期收敛)。
+    ///
+    /// 可在主线程调用:**不阻塞**。evict 是 async,丢给自持运行时后台跑;
+    /// 池还没懒建起来时直接跳过(没有池就没有 session 可踢)。
+    fn invalidate_connection(&self, conn_id: &str) {
+        // 1) 按连接缓存:home 一条,gitignore 是 `<connId>|<projectRoot>` 前缀的一族,
+        //    session_paths 同为 `<connId>|<sessionId>` 前缀族。
+        let prefix = format!("{conn_id}|");
+        lock(&self.home_cache).remove(conn_id);
+        lock(&self.gitignore_cache).retain(|k, _| !k.starts_with(&prefix));
+        lock(&self.session_paths).retain(|k, _| !k.starts_with(&prefix));
+
+        // 2) 池里的 session。池未建 = 没连过任何远程,无事可做;池已建则运行时
+        //    必然也已建(池只在 `block_on` 内部懒建),`runtime()` 不会新建一个。
+        let pool = lock(&self.pool).clone();
+        let Some(pool) = pool else { return };
+        let Ok(rt) = self.runtime() else { return };
+        let id = conn_id.to_string();
+        rt.spawn(async move {
+            pool.evict(&id).await;
+        });
+    }
+
     /// app 退出时优雅关池:abort reaper + 并发 disconnect 全部 session
     /// (单 session 2s 超时,不 hang 退出)。池未初始化则 no-op。
     ///
@@ -209,6 +243,13 @@ pub fn state() -> &'static RemoteSshState {
 /// 退出钩子:优雅关池。对应原版 `lib.rs` 在 `RunEvent::Exit` 里的那一调。
 pub fn shutdown_on_exit() {
     state().shutdown_pool_blocking();
+}
+
+/// 连接配置被改动 / 删除后的失效入口(见
+/// [`RemoteSshState::invalidate_connection`])。**由 `AppStore` 的写入侧调用**,
+/// 主线程直接调即可,不阻塞。
+pub fn invalidate_connection(conn_id: &str) {
+    state().invalidate_connection(conn_id);
 }
 
 // ---------------------------------------------------------------------------
@@ -1577,6 +1618,42 @@ not json\n\
             lock(&st.session_paths).get("c2|s1").map(String::as_str),
             Some("/p/b.jsonl")
         );
+    }
+
+    #[test]
+    fn invalidate_connection_clears_only_that_connections_caches() {
+        let st = RemoteSshState::new();
+        remember_session_path(&st, "c1", "s1", "/p/a.jsonl");
+        remember_session_path(&st, "c2", "s1", "/p/b.jsonl");
+        lock(&st.home_cache).insert("c1".into(), "/home/u1".into());
+        lock(&st.home_cache).insert("c2".into(), "/home/u2".into());
+        lock(&st.gitignore_cache).insert(
+            "c1|/home/u1/proj".into(),
+            Arc::new(TextGitignore::from_text("target/\n")),
+        );
+        lock(&st.gitignore_cache).insert(
+            "c2|/home/u2/proj".into(),
+            Arc::new(TextGitignore::from_text("target/\n")),
+        );
+
+        st.invalidate_connection("c1");
+
+        // c1 的三张缓存全清。
+        assert!(lock(&st.session_paths).get("c1|s1").is_none());
+        assert!(lock(&st.home_cache).get("c1").is_none());
+        assert!(lock(&st.gitignore_cache).get("c1|/home/u1/proj").is_none());
+        // c2 一条都不许被误伤(前缀匹配必须带上分隔符)。
+        assert_eq!(
+            lock(&st.session_paths).get("c2|s1").map(String::as_str),
+            Some("/p/b.jsonl")
+        );
+        assert_eq!(
+            lock(&st.home_cache).get("c2").map(String::as_str),
+            Some("/home/u2")
+        );
+        assert!(lock(&st.gitignore_cache).get("c2|/home/u2/proj").is_some());
+        // 池没建过 → 不该为了 evict 现建一个运行时。
+        assert!(lock(&st.runtime).is_none(), "不该为了 evict 现建运行时");
     }
 
     #[test]

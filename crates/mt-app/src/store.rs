@@ -2961,15 +2961,29 @@ impl AppStore {
     ///
     /// **立即落盘**而不是 500ms 防抖:原版这条路是 `await saveConfigToDisk`,
     /// 密码/私钥路径这类东西不该在防抖窗口里被一次崩溃吃掉。
+    ///
+    /// 改动落库后,若「连到哪台机器、以什么身份登录」变了就**作废池里那条
+    /// session**:池键是纯 `connection.id`,不作废的话旧服务器的连接会一直被
+    /// 复用到 reaper 回收(idle 10min / lifetime 2h)。判据见
+    /// [`crate::ssh_conn::ssh_session_identity_changed`]。
+    /// (只作废本进程的池;三个 sidecar 各自独立进程独立池,不在这条链路上。)
     pub fn upsert_ssh_connection(&mut self, conn: SshConnection, cx: &mut Context<Self>) {
+        let id = conn.id.clone();
+        let mut identity_changed = false;
         match self
             .config
             .ssh_connections
             .iter_mut()
             .find(|c| c.id == conn.id)
         {
-            Some(slot) => *slot = conn,
+            Some(slot) => {
+                identity_changed = crate::ssh_conn::ssh_session_identity_changed(slot, &conn);
+                *slot = conn;
+            }
             None => self.config.ssh_connections.push(conn),
+        }
+        if identity_changed {
+            crate::remote_ssh::invalidate_connection(&id);
         }
         self.save_config_now();
         cx.notify();
@@ -2979,12 +2993,17 @@ impl AppStore {
     ///
     /// **不级联清理**引用它的项目 / `sshConnectionIds`:原版就是这个语义,
     /// 远程项目因此进入「断链」错误态(仍可见、可删),关联范围静默收窄。
+    ///
+    /// 但**池里那条 session 必须无条件作废** —— 连接都删了还留着一条活的 TCP
+    /// 长连(以及 home / gitignore 缓存)没有任何道理,且新建一条同 id 的连接
+    /// (id 由调用方生成,理论上可复用)会直接命中旧机器的 session。
     pub fn remove_ssh_connection(&mut self, id: &str, cx: &mut Context<Self>) {
         let before = self.config.ssh_connections.len();
         self.config.ssh_connections.retain(|c| c.id != id);
         if self.config.ssh_connections.len() == before {
             return;
         }
+        crate::remote_ssh::invalidate_connection(id);
         self.save_config_now();
         cx.notify();
     }

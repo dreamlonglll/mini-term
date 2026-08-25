@@ -273,6 +273,29 @@ pub fn session_source(project: &ProjectConfig, connections: &[SshConnection]) ->
     }
 }
 
+/// 两条同 id 的连接,「连到哪台机器、以什么身份登录」是否变了。
+///
+/// 会话池按 `connection.id` 缓存 session,`CachedSession` 不存这些字段;用户在
+/// 弹窗里把 host 改成另一台服务器却保留同一个 id 时,旧 session 会被继续复用。
+/// 本函数就是那道判据 —— 返回 `true` 即必须作废池里那条 session
+/// (`remote_ssh::invalidate_connection`)。
+///
+/// **只看会话身份字段**:host / port / user / password / identity_file。
+/// `name` 与 `group` 纯展示,改它们不该白扔一条已建好的连接。
+///
+/// 端口 0 与 22 等价(`build_session` 把 0 归一成 22),否则「补填默认端口」这种
+/// 无实质变化的编辑会白白重连一次。
+pub fn ssh_session_identity_changed(old: &SshConnection, new: &SshConnection) -> bool {
+    fn norm_port(p: u16) -> u16 {
+        if p == 0 { 22 } else { p }
+    }
+    old.host != new.host
+        || norm_port(old.port) != norm_port(new.port)
+        || old.user != new.user
+        || old.password != new.password
+        || old.identity_file != new.identity_file
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -544,5 +567,61 @@ mod tests {
         assert!(is_remote_project(&p));
         assert!(remote_connection(&p, &conns).is_none());
         assert_eq!(remote_pane_label(&p, &conns), "ssh");
+    }
+
+    // --- 池失效判据 --------------------------------------------------------
+
+    #[test]
+    fn identity_change_ignores_cosmetic_fields() {
+        let old = conn("c1", None);
+        let mut next = conn("c1", Some("生产"));
+        next.name = "改了个名".into();
+        assert!(
+            !ssh_session_identity_changed(&old, &next),
+            "改名 / 改分组不该白扔一条已建好的 session"
+        );
+        // 完全没改也不该失效。
+        assert!(!ssh_session_identity_changed(&old, &conn("c1", None)));
+    }
+
+    #[test]
+    fn identity_change_detects_each_session_field() {
+        let base = conn("c1", None);
+
+        let mut host = base.clone();
+        host.host = "other.example.com".into();
+        assert!(ssh_session_identity_changed(&base, &host), "换 host");
+
+        let mut port = base.clone();
+        port.port = 2222;
+        assert!(ssh_session_identity_changed(&base, &port), "换端口");
+
+        let mut user = base.clone();
+        user.user = "deploy".into();
+        assert!(ssh_session_identity_changed(&base, &user), "换登录用户");
+
+        let mut pw = base.clone();
+        pw.password = Some("s3cret".into());
+        assert!(ssh_session_identity_changed(&base, &pw), "改密码");
+
+        let mut key = base.clone();
+        key.identity_file = Some("/home/u/.ssh/id_ed25519".into());
+        assert!(ssh_session_identity_changed(&base, &key), "改密钥路径");
+    }
+
+    #[test]
+    fn identity_change_treats_port_zero_as_22() {
+        // `build_session` 把 0 归一成 22 —— 「补填默认端口」是无实质变化的编辑,
+        // 不该触发一次白重连。
+        let mut zero = conn("c1", None);
+        zero.port = 0;
+        let mut twenty_two = conn("c1", None);
+        twenty_two.port = 22;
+        assert!(!ssh_session_identity_changed(&zero, &twenty_two));
+        assert!(!ssh_session_identity_changed(&twenty_two, &zero));
+        // 但 0 → 2222 仍算换了。
+        let mut other = conn("c1", None);
+        other.port = 2222;
+        assert!(ssh_session_identity_changed(&zero, &other));
     }
 }
