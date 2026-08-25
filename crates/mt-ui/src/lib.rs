@@ -90,7 +90,7 @@ pub use background::{BackgroundArtElement, Fit, background_art, fit_bounds};
 pub use chart::{ChartCanvas, ChartColors, ChartKey, ChartModel, ChartStyle};
 pub use motion::{Transition, TransitionSpec, TweenMap, reduce_motion, set_reduce_motion};
 pub use icons::{
-    AiVendor, BrandIcon, FileIcon, FileKind, ProjectKind, StatusDot, StatusKind, TechIcon,
+    AiVendor, BrandIcon, FileArt, FileIcon, ProjectKind, StatusDot, StatusKind, TechIcon,
 };
 pub use terminal::{
     CopiedTip, DamageStats, DwellConfig, FlashLine, FrameGeometry, HighlightKind, HighlightSpan,

@@ -260,6 +260,9 @@ pub struct VectorIcon {
     size: Pixels,
     ink: Hsla,
     contrast: Hsla,
+    /// 压过每一笔自带颜色的「统一色」。多色图标（官方 logo、文件图标）要被
+    /// 染成单色时走它 —— 那些笔写死的是 `Ink::Rgb`，[`Self::ink`] 管不着。
+    force: Option<Hsla>,
     rotation: f32,
     opacity: f32,
 }
@@ -272,6 +275,7 @@ impl VectorIcon {
             size,
             ink: rgb8(0xf0, 0xec, 0xe6),
             contrast: rgb8(0x1c, 0x1a, 0x18),
+            force: None,
             rotation: 0.0,
             opacity: 1.0,
         }
@@ -292,6 +296,18 @@ impl VectorIcon {
     /// `Ink::Contrast` 的取色(实心底上的勾/叉)。默认 `--bg-elevated`。
     pub fn contrast(mut self, color: Hsla) -> Self {
         self.contrast = color;
+        self
+    }
+
+    /// 把**整枚图标**染成一个颜色,压过每一笔自带的品牌色/语言色。
+    ///
+    /// 与 [`Self::ink`] 的分工:`ink` 只喂 `Ink::Current` 那些「跟随主题」的笔,
+    /// 写死 `Ink::Rgb` 的笔不受它影响;这个是「不管你原本什么色,一律按这个画」——
+    /// 文件树里 `.gitignore` 掉的行要压成 muted 就靠它。
+    ///
+    /// 各笔之间的**透明度层次保留**(衬底、高光仍然更淡),只统一色相。
+    pub fn force_ink(mut self, color: Hsla) -> Self {
+        self.force = Some(color);
         self
     }
 
@@ -318,6 +334,13 @@ impl VectorIcon {
             Ink::Rgb(r, g, b) => rgb8(r, g, b),
             Ink::RgbAlpha(r, g, b, a) => Hsla { a, ..rgb8(r, g, b) },
         };
+        if let Some(forced) = self.force {
+            // 只换色相,把这一笔原本的透明度乘进去 —— 否则衬底层会跟主体一样浓
+            color = Hsla {
+                a: color.a * forced.a,
+                ..forced
+            };
+        }
         color.a *= self.opacity;
         color
     }
@@ -492,10 +515,19 @@ mod tests {
         let mut checked = 0usize;
         for shapes in crate::icons::all_shape_tables() {
             for shape in shapes {
+                // 自绘的几何是我们自己摆的,严格按 0..1 要求;`Geom::Path` 是**原样搬运
+                // 的官方 path**,Material 那边有四枚(go / hpp / hbs / .git)本就画出
+                // viewBox 半个百分点,原版靠 SVG 视口裁掉、自绘不裁 —— 14px 上是 0.08px,
+                // 为这点误差去动官方几何不值当,但也不能放任到看得见的量级
+                let tol = if matches!(shape.geom, Geom::Path { .. }) {
+                    0.01
+                } else {
+                    0.001
+                };
                 let (pts, _) = shape.geom.points();
                 for (x, y) in pts {
                     assert!(
-                        (-0.001..=1.001).contains(&x) && (-0.001..=1.001).contains(&y),
+                        (-tol..=1.0 + tol).contains(&x) && (-tol..=1.0 + tol).contains(&y),
                         "越界点 ({x}, {y})"
                     );
                     checked += 1;

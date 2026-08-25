@@ -7,7 +7,8 @@
 //! ├── svg_path  SVG `d` 的解析与离散化 —— 品牌 logo 原样搬运官方 path 靠它
 //! ├── brand     AI 厂商图标 + 厂商推断(BrandIcon.tsx / inferVendor.ts)
 //! ├── tech      技术栈徽标(TechIcon.tsx / projectKind.ts)
-//! ├── file      文件树图标 + 扩展名映射(fileIcon.ts / FileTree.tsx)
+//! ├── file      文件树图标的查表规则与 Element(fileIcon.ts / FileTree.tsx)
+//! ├── file_art  ↑ 用的 263 枚官方图形状表 —— **生成物**,见 tools/gen_file_icons.mjs
 //! └── status    四态状态灯 + spinner 旋转(StatusDot.tsx)
 //! ```
 //!
@@ -54,13 +55,15 @@
 
 pub mod brand;
 pub mod file;
+pub mod file_art;
 pub mod status;
 pub mod svg_path;
 pub mod tech;
 pub mod vector;
 
 pub use brand::{ALL_VENDORS, AiVendor, BrandIcon};
-pub use file::{ALL_FILE_KINDS, FileIcon, FileKind};
+pub use file::{FileIcon, art_of as file_art_of};
+pub use file_art::FileArt;
 pub use status::{ALL_STATUS_KINDS, SPIN_PERIOD, StatusDot, StatusKind};
 pub use tech::{ALL_PROJECT_KINDS, ProjectKind, TechIcon};
 pub use vector::{Geom, Ink, Pen, Shape, VectorIcon};

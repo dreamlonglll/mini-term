@@ -1,0 +1,17 @@
+{
+  "name": "mt-ui-icon-tools",
+  "private": true,
+  "type": "module",
+  "description": "生成期依赖：gen_file_icons.mjs 把 Material Icon Theme 的官方 SVG 烘焙成 src/icons/file_art.rs。产物落库，运行/构建 mini-term 都用不到这里。",
+  "scripts": {
+    "gen": "node gen_file_icons.mjs",
+    "preview": "node gen_file_icons.mjs --preview"
+  },
+  "devDependencies": {
+    "@baybreezy/file-extension-icon": "^0.0.5",
+    "@resvg/resvg-js": "^2.6.2",
+    "polygon-clipping": "^0.15.7",
+    "svgo": "^4.0.0",
+    "svgpath": "^2.6.0"
+  }
+}

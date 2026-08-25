@@ -51,7 +51,7 @@ use gpui_component::input::{Input, InputEvent, InputState, SelectAll};
 use mt_config::{ProjectConfig, ProjectTreeItem};
 use mt_ui::icons::vector::VectorIcon;
 use mt_ui::icons::{
-    ALL_PROJECT_KINDS, AiVendor, BrandIcon, FileIcon, FileKind, ProjectKind, TechIcon,
+    ALL_PROJECT_KINDS, AiVendor, BrandIcon, FileIcon, ProjectKind, TechIcon,
 };
 
 use crate::dnd::{
@@ -138,7 +138,7 @@ fn project_icon(kind: Option<ProjectKind>, remote: Option<RemoteBadge>) -> AnyEl
     }
     match kind {
         Some(kind) => TechIcon::new(kind).size(px(14.0)).into_any_element(),
-        None => FileIcon::of_kind(FileKind::Directory)
+        None => FileIcon::folder(false)
             .size(px(14.0))
             .color(ui::color_file())
             .into_any_element(),
