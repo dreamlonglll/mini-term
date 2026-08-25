@@ -1162,17 +1162,76 @@ async fn scan_remote_codex(
 pub struct RemoteSessionContent {
     /// 本次解析出的消息(与本地 `get_ai_session_content` 的元素同构)。
     pub messages: Vec<AiSessionMessage>,
-    /// 下次增量读取应传入的字节偏移(指向已解析的最后一个完整行之后)。
-    /// 首次调用传 offset=0 拿全量;之后传上次返回的 `next_offset` 拿增量。
+    /// 已解析到的字节偏移(指向本段最后一个完整行之后),续读传它即可。
+    /// 首次调用传 offset=0;之后传上次返回的 `next_offset` 拿下一段。
     ///
-    /// ⚠️ **当前没有读者**,与原版一致:`SessionViewerModal.tsx:70-72` 的注释
-    /// 原话是「后端支持增量 offset(返回 nextOffset 供下次续读),
-    /// nextOffset 留给后续需要增量刷新的调用方」—— 两侧都只做一次性全量读。
-    #[allow(dead_code)]
+    /// 读者是 [`accumulate_session_content`] 的续读循环 —— 单次 SFTP 读封顶
+    /// [`CONTENT_CHUNK_MAX_BYTES`],大会话必须靠它才能读全。
+    /// **它没有前进(`<= 传入的 offset`)就等于「没得读了」**:要么到了 EOF,
+    /// 要么整段找不到换行,两种情况都必须停,别指望下一轮会不一样。
     pub next_offset: u64,
 }
 
-/// SFTP 读远程会话正文。`offset = 0` 从头读;返回 `next_offset` 供增量刷新。
+/// 一次全量读取([`ai_session_content_all`])允许拼接的正文总量上限。
+/// 护栏而非功能上限:正常 Claude/Codex 会话是几百 KB 到几 MB,64 MB 已经离谱;
+/// 设它是为了不让某个病态(或被构造的)远程会话文件把桌面端内存吃光 ——
+/// 触到上限就带着已解析内容收尾,不报错、不死循环。
+const CONTENT_TOTAL_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// 循环续读的通用核:反复调 `fetch(offset)` 并按 `next_offset` 推进,直到读完。
+/// 抽成泛型是为了能不触网单测 —— 真调用见 [`ai_session_content_all`]。
+///
+/// **前进保证**(死循环护栏,三条任一命中即收尾并保留已得内容):
+/// - `next_offset <= cursor`:偏移没前进。既覆盖读到 EOF(本段无字节可读),
+///   也覆盖「单行 ≥ [`CONTENT_CHUNK_MAX_BYTES`]、整段找不到换行」的病态会话
+///   —— 后者再读一次只会拿回同一段字节;
+/// - 累计偏移撞上 [`CONTENT_TOTAL_MAX_BYTES`];
+/// - 读出错:**首段就失败才报错**,已经拿到内容的后续段失败按截断处理,
+///   宁可少给几条也别让用户看见空白预览。
+fn accumulate_session_content<F>(mut fetch: F) -> Result<Vec<AiSessionMessage>, String>
+where
+    F: FnMut(u64) -> Result<RemoteSessionContent, String>,
+{
+    let mut messages: Vec<AiSessionMessage> = Vec::new();
+    let mut cursor: u64 = 0;
+    loop {
+        let chunk = match fetch(cursor) {
+            Ok(c) => c,
+            Err(e) if messages.is_empty() => return Err(e),
+            Err(_) => break,
+        };
+        messages.extend(chunk.messages);
+        if chunk.next_offset <= cursor {
+            break;
+        }
+        cursor = chunk.next_offset;
+        if cursor >= CONTENT_TOTAL_MAX_BYTES {
+            break;
+        }
+    }
+    Ok(messages)
+}
+
+/// 读整篇远程会话正文:从 0 起循环续读拼接,直到文件读完。
+///
+/// 单次 SFTP 读封顶 [`CONTENT_CHUNK_MAX_BYTES`](8 MB),此前调用方只读一段就
+/// 返回,超过这个体量的会话余下正文被**静默丢弃**;现在按 `next_offset` 续读,
+/// 只在撞上 [`CONTENT_TOTAL_MAX_BYTES`] 护栏时才截断。
+///
+/// **阻塞**(内部每段各一次 `block_on`),丢 `background_executor`。
+pub fn ai_session_content_all(
+    conn: &SshConnection,
+    session_type: &str,
+    session_id: &str,
+    project_path: &str,
+) -> Result<Vec<AiSessionMessage>, String> {
+    accumulate_session_content(|offset| {
+        ai_session_content(conn, session_type, session_id, project_path, offset)
+    })
+}
+
+/// SFTP 读远程会话正文的**一段**。`offset = 0` 从头读;返回 `next_offset` 供续读。
+/// 整篇读取走 [`ai_session_content_all`],别直接拿这个的结果当全量。
 ///
 /// **阻塞**,丢 `background_executor`。
 pub fn ai_session_content(
@@ -1203,6 +1262,8 @@ pub fn ai_session_content(
                 .read_from_offset(&path, offset, CONTENT_CHUNK_MAX_BYTES)
                 .await
                 .map_err(|e| format!("读取会话文件失败: {}", e.message()))?;
+            // 只取到最后一个换行为止:分段边界永远落在行边界上,多字节字符不会被
+            // 拦腰截断,逐段 from_utf8_lossy 与一次性读全量等价
             let (consumed, complete) = split_complete_lines(&bytes);
             let text = String::from_utf8_lossy(complete);
             let messages: Vec<AiSessionMessage> = match session_type {
@@ -1673,5 +1734,105 @@ not json\n\
         assert_eq!(err, "非法会话 id");
         let err2 = ai_session_content(&c, "claude", "a/b", "/p", 0).unwrap_err();
         assert_eq!(err2, "非法会话 id");
+        // 全量入口共用同一道守卫
+        let err3 = ai_session_content_all(&c, "claude", "../etc/passwd", "/p").unwrap_err();
+        assert_eq!(err3, "非法会话 id");
+    }
+
+    // --- 会话正文续读循环 ---
+
+    fn msg(text: &str) -> AiSessionMessage {
+        AiSessionMessage {
+            role: "user".into(),
+            content: text.into(),
+            timestamp: String::new(),
+        }
+    }
+
+    #[test]
+    fn accumulate_session_content_concatenates_until_exhausted() {
+        // 三段:每段推进偏移,最后一段偏移不再前进(EOF)→ 拼接全部消息
+        let chunks = vec![
+            (vec![msg("a"), msg("b")], 10u64),
+            (vec![msg("c")], 20u64),
+            (vec![], 20u64),
+        ];
+        let mut calls: Vec<u64> = Vec::new();
+        let mut i = 0usize;
+        let out = accumulate_session_content(|offset| {
+            calls.push(offset);
+            let (messages, next_offset) = chunks[i].clone();
+            i += 1;
+            Ok(RemoteSessionContent {
+                messages,
+                next_offset,
+            })
+        })
+        .unwrap();
+
+        assert_eq!(calls, vec![0, 10, 20], "每轮都应带上上次的 next_offset 续读");
+        let texts: Vec<&str> = out.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(texts, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn accumulate_session_content_stops_when_offset_does_not_advance() {
+        // consumed == 0(整段没有换行,单行 ≥ 8MB 的病态会话):next_offset 原地
+        // 不动。必须**只调一次**就收尾,否则是死循环。
+        let mut calls = 0usize;
+        let out = accumulate_session_content(|offset| {
+            calls += 1;
+            assert!(calls < 5, "偏移不前进却仍在续读 —— 死循环");
+            Ok(RemoteSessionContent {
+                messages: vec![msg("partial")],
+                next_offset: offset, // 一步没走
+            })
+        })
+        .unwrap();
+
+        assert_eq!(calls, 1, "偏移不前进应立即停");
+        assert_eq!(out.len(), 1, "已解析到的内容要保留,不能连带丢掉");
+    }
+
+    #[test]
+    fn accumulate_session_content_caps_total_bytes() {
+        // 每轮都「读满」一整块:撞到总量护栏就停,不会无限吃内存
+        let mut calls = 0usize;
+        let out = accumulate_session_content(|offset| {
+            calls += 1;
+            assert!(calls < 1000, "总量护栏没生效");
+            Ok(RemoteSessionContent {
+                messages: vec![msg("chunk")],
+                next_offset: offset + CONTENT_CHUNK_MAX_BYTES as u64,
+            })
+        })
+        .unwrap();
+
+        let expected = (CONTENT_TOTAL_MAX_BYTES / CONTENT_CHUNK_MAX_BYTES as u64) as usize;
+        assert_eq!(calls, expected, "读满 64 MB 即止");
+        assert_eq!(out.len(), expected);
+    }
+
+    #[test]
+    fn accumulate_session_content_error_policy() {
+        // 首段就失败 → 报错(用户看得到原因)
+        let err = accumulate_session_content(|_| Err("boom".to_string())).unwrap_err();
+        assert_eq!(err, "boom");
+
+        // 后续段失败 → 按截断处理,保留已拿到的内容
+        let mut calls = 0usize;
+        let out = accumulate_session_content(|offset| {
+            calls += 1;
+            if calls == 1 {
+                Ok(RemoteSessionContent {
+                    messages: vec![msg("first")],
+                    next_offset: offset + 8,
+                })
+            } else {
+                Err("网络断了".to_string())
+            }
+        })
+        .unwrap();
+        assert_eq!(out.len(), 1);
     }
 }

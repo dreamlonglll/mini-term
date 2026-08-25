@@ -223,7 +223,10 @@ pub fn strip_verbatim_prefix(p: PathBuf) -> PathBuf {
 ///
 /// 返回校验后的绝对路径(Windows 上已剥 `\\?\` 前缀),后续 IO 直接用它,
 /// 避免重复访问磁盘。
-fn verify_under_project_root(
+///
+/// `pub(crate)`:目录监听([`crate::watch::FsWatcher::watch`])要用同一把尺子
+/// 校验待监听目录,不再单独造一份口径不同的实现。
+pub(crate) fn verify_under_project_root(
     project_root: &Path,
     target: &Path,
     must_exist: bool,

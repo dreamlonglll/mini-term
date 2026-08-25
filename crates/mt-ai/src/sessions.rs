@@ -10,12 +10,13 @@
 //! mobile_mirror)迁移后各自成 crate,只能从这里 `pub` 出去。
 
 use serde::Serialize;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 const MAX_CLAUDE_SESSION_FILES_TO_SCAN: usize = 300;
 const MAX_CODEX_SESSION_FILES_TO_SCAN: usize = 500;
@@ -589,17 +590,28 @@ pub fn load_codex_thread_names(codex_dir: &Path) -> HashMap<String, String> {
     map
 }
 
+/// 按 mtime 降序排列会话文件路径并截到 limit。
+/// decorate-sort-undecorate:每个 path 只 stat 一次,而不是在比较器里 stat
+/// (比较器每次 2 次 syscall × O(n log n) 次,数百个 Codex rollout 文件时是可观的 IO)。
+/// 取不到 mtime(扫描后刚被删/无权限)的一律沉到末尾,彼此之间按路径降序 ——
+/// Codex/Claude 的文件名带时间戳前缀,路径序近似时间序。旧比较器对这类路径
+/// 给的是不满足传递性的序,顺带一并修正。
 pub fn sort_newest_session_paths(paths: &mut Vec<PathBuf>, limit: usize) {
-    paths.sort_by(|a, b| {
-        let mt = |p: &PathBuf| p.metadata().and_then(|m| m.modified()).ok();
-        match (mt(a), mt(b)) {
-            (Some(ta), Some(tb)) => tb.cmp(&ta),
-            _ => b.cmp(a),
-        }
+    let mut decorated: Vec<(Option<SystemTime>, PathBuf)> = std::mem::take(paths)
+        .into_iter()
+        .map(|p| (p.metadata().and_then(|m| m.modified()).ok(), p))
+        .collect();
+
+    decorated.sort_by(|(ta, pa), (tb, pb)| match (ta, tb) {
+        (Some(ta), Some(tb)) => tb.cmp(ta),
+        // 有 mtime 的一律排在无 mtime 的前面,两边都没有则退回路径降序
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => pb.cmp(pa),
     });
-    if paths.len() > limit {
-        paths.truncate(limit);
-    }
+
+    decorated.truncate(limit);
+    paths.extend(decorated.into_iter().map(|(_, p)| p));
 }
 
 /// 递归遍历 sessions/<year>/<month>/<day>/ 目录,仅收集文件路径。
@@ -1031,14 +1043,18 @@ pub fn get_ai_session_content(
 
 pub fn get_ai_sessions(project_path: String) -> Result<Vec<AiSession>, String> {
     let cache_key = normalize_path(&project_path);
-    let mut cache = session_cache()
-        .lock()
-        .map_err(|_| "session cache lock poisoned".to_string())?;
 
-    if let Some(cached) = cache.get(&cache_key) {
-        if cached.loaded_at.elapsed() < SESSION_CACHE_TTL {
-            return Ok(cached.sessions.clone());
+    {
+        let cache = session_cache()
+            .lock()
+            .map_err(|_| "session cache lock poisoned".to_string())?;
+        if let Some(cached) = cache.get(&cache_key) {
+            if cached.loaded_at.elapsed() < SESSION_CACHE_TTL {
+                return Ok(cached.sessions.clone());
+            }
         }
+        // 扫描期间不持锁:三家会话目录全量扫盘可能秒级,别把 WSL 侧
+        // get_wsl_ai_sessions 与其它项目的查询一起卡住(与下方 WSL 侧同一口径)
     }
 
     let mut sessions = Vec::new();
@@ -1053,6 +1069,11 @@ pub fn get_ai_sessions(project_path: String) -> Result<Vec<AiSession>, String> {
         sessions.truncate(MAX_TOTAL_SESSIONS);
     }
 
+    // 重新取锁写回:两次锁窗口之间可能有并发扫描先写入,与 WSL 侧一致地后来者覆盖
+    // (两份结果扫的是同一批文件,取更新的那份没有正确性差别)
+    let mut cache = session_cache()
+        .lock()
+        .map_err(|_| "session cache lock poisoned".to_string())?;
     cache.insert(
         cache_key,
         CachedSessions {
@@ -1866,6 +1887,61 @@ mod tests {
         for agent in ["pi", "opencode", "", "gemini"] {
             assert!(!agent_has_session_log(agent), "{agent} 不应被认为有会话记录");
         }
+    }
+
+    // ---- 会话文件排序 ----
+
+    /// decorate-sort 后的结果必须与 mtime 降序一致(每个 path 只 stat 一次)。
+    #[test]
+    fn sort_newest_session_paths_orders_by_mtime_desc() {
+        let dir = std::env::temp_dir().join(format!(
+            "mini-term-sort-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        // 文件名故意与时间序相反(z 最老、a 最新),证明排的是 mtime 不是路径
+        let names = ["z.jsonl", "m.jsonl", "a.jsonl"];
+        let mut created = Vec::new();
+        for name in names {
+            let p = dir.join(name);
+            fs::write(&p, b"{}\n").unwrap();
+            // 文件系统 mtime 分辨率有限,逐个拉开间隔
+            std::thread::sleep(Duration::from_millis(20));
+            created.push(p);
+        }
+
+        let mut paths = created.clone();
+        sort_newest_session_paths(&mut paths, 10);
+        let expect: Vec<PathBuf> = created.iter().rev().cloned().collect();
+        assert_eq!(paths, expect, "应按 mtime 降序(最新在前)");
+
+        // limit 生效:只留最新的两个
+        let mut paths = created.clone();
+        sort_newest_session_paths(&mut paths, 2);
+        assert_eq!(paths, expect[..2].to_vec());
+
+        // 取不到 mtime 的排在有 mtime 的后面,且不丢元素
+        let ghost = dir.join("nonexistent.jsonl");
+        let mut paths = vec![ghost.clone(), created[0].clone()];
+        sort_newest_session_paths(&mut paths, 10);
+        assert_eq!(paths, vec![created[0].clone(), ghost]);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sort_newest_session_paths_handles_empty_and_zero_limit() {
+        let mut empty: Vec<PathBuf> = Vec::new();
+        sort_newest_session_paths(&mut empty, 5);
+        assert!(empty.is_empty());
+
+        let mut one = vec![PathBuf::from("/nonexistent/x.jsonl")];
+        sort_newest_session_paths(&mut one, 0);
+        assert!(one.is_empty(), "limit=0 应清空");
     }
 
     // ---- 会话分支链路 ----

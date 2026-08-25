@@ -776,16 +776,14 @@ impl SessionPanel {
                 .background_executor()
                 .spawn(async move {
                     match remote {
-                        // 首次取全量(offset=0);增量刷新是原版也没接的能力,
-                        // `next_offset` 在这里被丢弃(见交付报告的遗留清单)
-                        Some(conn) => crate::remote_ssh::ai_session_content(
+                        // 循环续读到文件末尾:单次 SFTP 读封顶 8 MB,只读一段的话
+                        // 大会话后半截会被静默丢掉(前进保证与总量护栏在 all 里)
+                        Some(conn) => crate::remote_ssh::ai_session_content_all(
                             &conn,
                             &session_type,
                             &session_id,
                             &project_path,
-                            0,
-                        )
-                        .map(|c| c.messages),
+                        ),
                         None => mt_ai::sessions::get_ai_session_content(
                             session_type,
                             session_id,

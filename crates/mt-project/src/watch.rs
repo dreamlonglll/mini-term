@@ -62,7 +62,18 @@ impl FsWatcher {
 
     /// 开始监听目录(非递归)。同一路径重复调用只递增引用计数,不重建 watcher
     /// —— notify 后端重复注册同一路径会浪费句柄。
+    ///
+    /// `path` 必须在 `project_path` 之内:与 `fs.rs` 各入口共用
+    /// [`crate::fs::verify_under_project_root`] 这一把尺子(canonicalize 解 `..`
+    /// 与符号链接)。现有调用方(文件树、文件查看器)传的本来就是根内路径,
+    /// 属纵深防御——挡住将来有人拿拖放/输入框来的路径直接开监听。
+    /// WSL UNC(`\\wsl.localhost\...`)项目走同一条路:文件树列目录本就每次
+    /// 过这个校验,监听侧口径一致即可,不额外分叉。
     pub fn watch(&self, path: &Path, project_path: &str) -> Result<()> {
+        // 只做校验,**不拿返回的规范化路径当 key** —— unwatch 收到的是调用方
+        // 手上的原始路径,两边 key 必须同形,否则引用计数对不上、watcher 摘不掉
+        crate::fs::verify_under_project_root(Path::new(project_path), path, true)?;
+
         let key = path.to_path_buf();
         // 已有同路径 watcher:仅计数 +1
         {
@@ -136,13 +147,18 @@ mod tests {
         dir
     }
 
+    /// 测试里项目根就是被监听目录本身(watch 现在会校验路径在根内)。
+    fn proj(dir: &Path) -> String {
+        dir.to_string_lossy().to_string()
+    }
+
     #[test]
     fn watch_refcounts_same_path() {
         let dir = temp_dir("refcount");
         let (w, _rx) = FsWatcher::with_channel();
 
-        w.watch(&dir, "proj").unwrap();
-        w.watch(&dir, "proj").unwrap();
+        w.watch(&dir, &proj(&dir)).unwrap();
+        w.watch(&dir, &proj(&dir)).unwrap();
         assert_eq!(w.watched_count(), 1, "同一路径只应有一个 watcher");
 
         // 第一次 unwatch 只把计数降到 1,watcher 必须还在
@@ -161,7 +177,8 @@ mod tests {
     fn sink_receives_change_for_watched_dir() {
         let dir = temp_dir("sink");
         let (w, rx) = FsWatcher::with_channel();
-        w.watch(&dir, "proj-a").unwrap();
+        let root = proj(&dir);
+        w.watch(&dir, &root).unwrap();
 
         std::fs::write(dir.join("new.txt"), "hello").unwrap();
 
@@ -178,7 +195,7 @@ mod tests {
             }
         }
         let change = got.expect("10s 内未收到任何 fs 变更事件");
-        assert_eq!(change.project_path, "proj-a");
+        assert_eq!(change.project_path, root);
         assert!(!change.kind.is_empty());
 
         w.unwatch(&dir);
@@ -194,7 +211,7 @@ mod tests {
         let w = FsWatcher::new(move |_change| {
             hits_clone.fetch_add(1, Ordering::Relaxed);
         });
-        w.watch(&dir, "proj").unwrap();
+        w.watch(&dir, &proj(&dir)).unwrap();
         std::fs::write(dir.join("a.txt"), "x").unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -210,8 +227,35 @@ mod tests {
     #[test]
     fn watch_nonexistent_path_errors() {
         let (w, _rx) = FsWatcher::with_channel();
-        let missing = std::env::temp_dir().join("mini-term-watch-definitely-missing-xyz");
-        assert!(w.watch(&missing, "proj").is_err());
+        let root = temp_dir("missing-root");
+        let missing = root.join("definitely-missing-xyz");
+        assert!(w.watch(&missing, &proj(&root)).is_err());
         assert_eq!(w.watched_count(), 0, "失败的 watch 不应留下条目");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn watch_rejects_path_outside_project_root() {
+        // root/sub 与 root 平级的 outside:拿 `..` 逃出去的路径不许开监听
+        let root = temp_dir("escape-root");
+        let outside = temp_dir("escape-outside");
+        let (w, _rx) = FsWatcher::with_channel();
+
+        let escaped = root.join("..").join(outside.file_name().unwrap());
+        assert!(
+            w.watch(&escaped, &proj(&root)).is_err(),
+            "越出项目根的路径必须拒绝"
+        );
+        assert_eq!(w.watched_count(), 0, "被拒的 watch 不应留下条目");
+
+        // 同一目录换成从根内进入则放行,证明拒绝的是「越界」而非「路径带 ..」
+        let inside = root.join("sub");
+        std::fs::create_dir_all(&inside).unwrap();
+        w.watch(&root.join("sub").join("..").join("sub"), &proj(&root))
+            .unwrap();
+        assert_eq!(w.watched_count(), 1);
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&outside).ok();
     }
 }
