@@ -52,7 +52,7 @@ use crate::pane_actions;
 use crate::pane_preview;
 use crate::session_branch::{BranchMenuSegment, branch_menu_segment};
 use crate::store::AppStore;
-use crate::tree::{DropZone, PaneStatus, SplitDirection, SplitNode};
+use crate::tree::{DropZone, PaneState, PaneStatus, SplitDirection, SplitNode};
 use crate::ui;
 
 /// 终端区还没量出尺寸时的兜底(首帧)。比例照样对,只是绝对值不准。
@@ -1534,38 +1534,23 @@ impl TerminalArea {
         });
     }
 
-    fn render_leaf(
+    /// 叶内切 tab 的方向性 push 过渡检测(见文件头「换场」注释)。
+    ///
+    /// **必须在借出 store 之前调** —— 要改 `self`、还要 spawn 计时器,两样都要
+    /// `&mut`。返回的是本帧要画的那一场过渡(拷成 owned:store 马上要长借)。
+    fn note_leaf_tab_swap(
         &mut self,
-        node: &SplitNode,
-        project_id: &str,
-        _window: &mut Window,
+        leaf_id: &str,
+        panes: &[PaneState],
+        active_id: &str,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let SplitNode::Leaf {
-            id: leaf_id,
-            panes,
-            active_pane_id,
-        } = node
-        else {
-            return div().into_any_element();
-        };
-
-        let active = panes
-            .iter()
-            .find(|p| &p.id == active_pane_id)
-            .or_else(|| panes.first());
-        let Some(active) = active else {
-            return div().into_any_element();
-        };
-
-        // ── 检测叶内切 tab,起一条方向性 push 过渡(见文件头注释)────
-        // 放在借出 store 之前:要改 self、还要 spawn 计时器。
+    ) -> Option<(u64, f32, String)> {
         let animations_enabled = self.animations_enabled(cx);
         match self.last_leaf_active.get(leaf_id) {
-            Some(prev) if prev != &active.id => {
+            Some(prev) if prev.as_str() != active_id => {
                 let old = prev.clone();
                 let old_idx = panes.iter().position(|p| p.id == old);
-                let new_idx = panes.iter().position(|p| p.id == active.id);
+                let new_idx = panes.iter().position(|p| p.id == active_id);
                 if !animations_enabled {
                     // 开关关着:只对齐记录,不起过渡(也把可能在飞的收掉)
                     self.tab_swaps.remove(leaf_id);
@@ -1573,7 +1558,7 @@ impl TerminalArea {
                     let dir = if n > o { 1.0 } else { -1.0 };
                     self.swap_seq += 1;
                     let seq = self.swap_seq;
-                    let lid = leaf_id.clone();
+                    let lid = leaf_id.to_string();
                     let timer = cx.spawn(async move |this, cx| {
                         cx.background_executor()
                             .timer(std::time::Duration::from_millis(TAB_SWAP_MS))
@@ -1586,7 +1571,7 @@ impl TerminalArea {
                         });
                     });
                     self.tab_swaps.insert(
-                        leaf_id.clone(),
+                        leaf_id.to_string(),
                         TabSwap {
                             seq,
                             dir,
@@ -1600,55 +1585,33 @@ impl TerminalArea {
                     self.tab_swaps.remove(leaf_id);
                 }
                 self.last_leaf_active
-                    .insert(leaf_id.clone(), active.id.clone());
+                    .insert(leaf_id.to_string(), active_id.to_string());
             }
             None => {
                 self.last_leaf_active
-                    .insert(leaf_id.clone(), active.id.clone());
+                    .insert(leaf_id.to_string(), active_id.to_string());
             }
             _ => {}
         }
-        // 本帧要画的过渡(拷出所需,store 马上要长借)
-        let tab_swap: Option<(u64, f32, String)> = self
-            .tab_swaps
+        self.tab_swaps
             .get(leaf_id)
-            .map(|s| (s.seq, s.dir, s.old_pane_id.clone()));
+            .map(|s| (s.seq, s.dir, s.old_pane_id.clone()))
+    }
 
-        // RevealBack 的空洞:实体此刻在飞行层上,这格只画底色(见 render 里的置位)
-        let suppressed = self.suppress_entity_pane.as_deref() == Some(active.id.as_str());
-
+    /// 一个叶子的 tab 栏本体:每个 pane 一颗 tab(含拖起 / 合并 / 重排的拖拽
+    /// 挂载)+ 末尾那颗新建终端的 `+`。右侧控件簇与落点层分别在
+    /// [`Self::render_leaf_controls`] 与 [`Self::render_leaf_drop_layer`]。
+    fn render_leaf_tab_bar(
+        &mut self,
+        panes: &[PaneState],
+        active: &PaneState,
+        project_id: &str,
+        leaf_id: &str,
+        dragging: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        // 借的是 `*cx` 不是 `self`,所以下面补焦点句柄那段照样能改 self
         let store = self.store.read(cx);
-        let terminal = if suppressed {
-            None
-        } else {
-            active.pty_id.and_then(|id| store.terminal(id)).cloned()
-        };
-        // 出场层的旧终端实体(旧 pane 还没起 PTY 时出场层只好省略)
-        let exit_terminal = tab_swap.as_ref().and_then(|(_, _, old)| {
-            store
-                .project_state(project_id)
-                .and_then(|s| s.pane(old))
-                .and_then(|p| p.pty_id)
-                .and_then(|id| store.terminal(id))
-                .cloned()
-        });
-        // 远程 pane 的断线覆盖层(`PaneGroup.tsx:329-333` 的 `showReconnect`):
-        // 判据是「项目是 SSH 远程项目 **且** 这条 PTY 已登记退出」。
-        // ⚠️ **本地 pane 不进这条路** —— 本地退出仍走既有的 error 状态 + 右下角
-        // 「shell 已退出」角标(原版 `remote &&` 那一半就是这个闸)。
-        // 断链(连接被删)照样算远程项目,遮罩照出:重连会再失败一次并把明确的
-        // 断链错误画进 pane,比静默什么都不发生强。
-        let show_reconnect = store.is_remote_project(project_id)
-            && active
-                .pty_id
-                .map(|id| store.is_pty_exited(id))
-                .unwrap_or(false);
-        // AI 任务标记数。**列表为空就整个不画按钮**(`PaneGroup.tsx:489`),
-        // 这就是「⚑ 平时看不见」的直接原因 —— 见 `markers` 模块注释的 alt screen 段。
-        let marker_count = active
-            .pty_id
-            .map(|id| markers::visible(store.markers_for_pty(id)).count())
-            .unwrap_or(0);
         let unread: Vec<bool> = panes.iter().map(|p| store.is_pane_unread_done(&p.id)).collect();
         // tab 上的 AI 品牌图标:显示条件与 agent 取值都照抄原版(见 PaneState 上
         // 的两个方法);`aiAutoResume` 缺省开启,与 store 里那处取值同口径
@@ -1667,21 +1630,6 @@ impl TerminalArea {
             })
             .collect();
 
-        let active_id = active.id.clone();
-        let pid = project_id.to_string();
-        let leaf = leaf_id.clone();
-        // 拖拽相关的三份视图状态一律与它与门(见字段注释)
-        let dragging = cx.has_active_drag();
-        // 最大化钮的出现条件(`PaneGroup.tsx:686`):真分了屏才有意义。
-        // `maximized_pane_id()` 自带「布局是 split」这道闸,所以这里一个判据够用
-        let layout_is_split = store
-            .project_state(project_id)
-            .and_then(|s| s.active_layout())
-            .is_some_and(|l| matches!(l, SplitNode::Split { .. }));
-        let is_maximized = store
-            .maximized_pane_id(project_id)
-            .is_some_and(|id| panes.iter().any(|p| p.id == id));
-
         // tab 栏横向滚动(E.2):tab **不压缩**(`min_w` 之下就溢出),
         // 溢出时整条可横向滚。`overflow_x_scroll` 要求元素是 stateful(有 `.id()`)。
         //
@@ -1690,7 +1638,7 @@ impl TerminalArea {
         // (gpui-0.2.2 `elements/div.rs:2422-2428`,默认值见 `style.rs:741`)——
         // 与原版靠 WebView 免费拿到的那条行为等价。
         let mut bar = div()
-            .id(gpui::SharedString::from(format!("tabbar-{leaf}")))
+            .id(gpui::SharedString::from(format!("tabbar-{leaf_id}")))
             .flex()
             .items_center()
             .flex_none()
@@ -1710,29 +1658,29 @@ impl TerminalArea {
         }
 
         for (idx, pane) in panes.iter().enumerate() {
-            let is_active = pane.id == active_id;
+            let is_active = pane.id == active.id;
             let pane_id = pane.id.clone();
             let pane_id_key = pane.id.clone();
             let pane_id_hover = pane.id.clone();
-            let pid_key = pid.clone();
+            let pid_key = project_id.to_string();
             let tab_focus = self.tab_focus.get(&pane.id).cloned();
             let pane_id_rename = pane.id.clone();
-            let pid_click = pid.clone();
+            let pid_click = project_id.to_string();
             let pane_id_close = pane.id.clone();
             let pane_id_menu = pane.id.clone();
-            let pid_close = pid.clone();
-            let pid_rename = pid.clone();
-            let pid_menu = pid.clone();
+            let pid_close = project_id.to_string();
+            let pid_rename = project_id.to_string();
+            let pid_menu = project_id.to_string();
             // tab 标题走 store 的统一口径:自定义名 > 远程连接名 > shell 名。
             // 恢复布局时远程 pane 的 shellName 会被映射成本地 shell 名、**不可信**,
             // 所以远程那一档必须由 store 查连接表补上(`remoteProject.ts::paneDisplayLabel`)
-            let label = store.pane_display_label(&pid, pane);
+            let label = store.pane_display_label(project_id, pane);
             let label_menu = label.clone();
             let label_text = label.clone();
             let has_unread = unread.get(idx).copied().unwrap_or(false);
             let vendor = vendors.get(idx).copied().flatten();
             let this_area = cx.entity();
-            let pid_drag = pid.clone();
+            let pid_drag = project_id.to_string();
             // 与 `has_active_drag` 与门:拖拽被中断(松手在窗外)时 gpui 会清
             // active_drag 并重画,变淡自动撤销,不必到处补清理
             let is_dragging_self =
@@ -1945,11 +1893,11 @@ impl TerminalArea {
         }
 
         // 新建终端
-        let pid_new = pid.clone();
-        let anchor_new = active_id.clone();
+        let pid_new = project_id.to_string();
+        let anchor_new = active.id.clone();
         bar = bar.child(
             div()
-                .id(gpui::SharedString::from(format!("tab-new-{leaf}")))
+                .id(gpui::SharedString::from(format!("tab-new-{leaf_id}")))
                 .px(px(8.0))
                 .flex()
                 .items_center()
@@ -1990,6 +1938,35 @@ impl TerminalArea {
                 .child("+"),
         );
 
+        bar
+    }
+
+    /// tab 栏右侧的控件簇:⚑N / 查找 / 最大化 / 左右分屏 / 上下分屏 / 关整组。
+    /// 挂在 tab 栏的 `ml_auto` 那一格里(见 [`Self::render_leaf_tab_bar`])。
+    fn render_leaf_controls(
+        &mut self,
+        panes: &[PaneState],
+        active: &PaneState,
+        project_id: &str,
+        leaf_id: &str,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let store = self.store.read(cx);
+        // AI 任务标记数。**列表为空就整个不画按钮**(`PaneGroup.tsx:489`),
+        // 这就是「⚑ 平时看不见」的直接原因 —— 见 `markers` 模块注释的 alt screen 段。
+        let marker_count = active
+            .pty_id
+            .map(|id| markers::visible(store.markers_for_pty(id)).count())
+            .unwrap_or(0);
+        // 最大化钮的出现条件(`PaneGroup.tsx:686`):真分了屏才有意义。
+        // `maximized_pane_id()` 自带「布局是 split」这道闸,所以这里一个判据够用
+        let layout_is_split = store
+            .project_state(project_id)
+            .and_then(|s| s.active_layout())
+            .is_some_and(|l| matches!(l, SplitNode::Split { .. }));
+        let is_maximized = store
+            .maximized_pane_id(project_id)
+            .is_some_and(|id| panes.iter().any(|p| p.id == id));
         // 右侧:查找 / 分屏 / 关整组(原版 `ctrlBtn`:常驻 60% 透明度,hover 全亮
         // + `--border-subtle` 底。图标是 `PaneGroup.tsx:40-62` 那几条 SVG 的自绘
         // 搬运;VectorIcon 的 ink 定死在构造期,hover 换色进不去 —— 与
@@ -2012,7 +1989,7 @@ impl TerminalArea {
         // (原版 `PaneGroup.tsx:504`,`activePane.ptyId !== undefined`)
         let search_btn = active.pty_id.map(|pty_id| {
             ctrl_icon(
-                gpui::SharedString::from(format!("term-search-{leaf}")),
+                gpui::SharedString::from(format!("term-search-{leaf_id}")),
                 ICON_SEARCH,
             )
             .on_click(cx.listener(move |this, _event, window, cx| {
@@ -2026,10 +2003,10 @@ impl TerminalArea {
         // ⚑ N:图标是**文本字符**,不是 SVG(与 menu.rs 的 `✓ ` 同一套理由);
         // 宽度不固定,所以不复用上面那个 22×22 的方钮。
         let marker_pty = active.pty_id.filter(|_| marker_count > 0);
-        let marker_pane_id = active_id.clone();
+        let marker_pane_id = active.id.clone();
         let marker_btn = marker_pty.map(|pty_id| {
             div()
-                .id(gpui::SharedString::from(format!("markers-{leaf}")))
+                .id(gpui::SharedString::from(format!("markers-{leaf_id}")))
                 .mr(px(MARKER_BTN_MARGIN_RIGHT))
                 .px(px(6.0))
                 .py(px(2.0))
@@ -2059,11 +2036,11 @@ impl TerminalArea {
         });
         // 最大化 / 还原(v0.14.0)。只有真分了屏才画 —— 单格布局下「铺满」是空操作,
         // 常驻一颗按不动的按钮不如不画(原版 `layoutIsSplit || isMaximized` 同款)。
-        let pid_max = pid.clone();
-        let anchor_max = active_id.clone();
+        let pid_max = project_id.to_string();
+        let anchor_max = active.id.clone();
         let maximize_btn = (layout_is_split || is_maximized).then(|| {
             ctrl_icon(
-                gpui::SharedString::from(format!("maximize-{leaf}")),
+                gpui::SharedString::from(format!("maximize-{leaf_id}")),
                 if is_maximized {
                     ICON_RESTORE
                 } else {
@@ -2088,106 +2065,107 @@ impl TerminalArea {
                     .update(cx, |store, cx| store.toggle_maximized_leaf(&pid, &anchor, cx));
             }))
         });
-        let pid_right = pid.clone();
-        let anchor_right = active_id.clone();
-        let pid_down = pid.clone();
-        let anchor_down = active_id.clone();
-        let pid_close_leaf = pid.clone();
-        let leaf_for_close = leaf.clone();
-        bar = bar.child(
-            div()
-                .ml_auto()
-                .flex()
-                .items_center()
-                .gap(px(CTRL_GAP))
-                .px(px(CTRL_CLUSTER_PAD))
-                .children(marker_btn)
-                .children(search_btn)
-                .children(maximize_btn)
-                .child(
-                    ctrl_icon(
-                        gpui::SharedString::from(format!("split-right-{leaf}")),
-                        ICON_SPLIT_RIGHT,
-                    )
+        let pid_right = project_id.to_string();
+        let anchor_right = active.id.clone();
+        let pid_down = project_id.to_string();
+        let anchor_down = active.id.clone();
+        let pid_close_leaf = project_id.to_string();
+        let leaf_for_close = leaf_id.to_string();
+        div()
+            .ml_auto()
+            .flex()
+            .items_center()
+            .gap(px(CTRL_GAP))
+            .px(px(CTRL_CLUSTER_PAD))
+            .children(marker_btn)
+            .children(search_btn)
+            .children(maximize_btn)
+            .child(
+                ctrl_icon(
+                    gpui::SharedString::from(format!("split-right-{leaf_id}")),
+                    ICON_SPLIT_RIGHT,
+                )
+                .on_click(cx.listener(move |this, _event, window, cx| {
+                    cx.stop_propagation();
+                    this.store.update(cx, |store, cx| {
+                        store.split_pane(
+                            &pid_right,
+                            &anchor_right,
+                            SplitDirection::Horizontal,
+                            window,
+                            cx,
+                        );
+                    });
+                })),
+            )
+            .child(
+                ctrl_icon(
+                    gpui::SharedString::from(format!("split-down-{leaf_id}")),
+                    ICON_SPLIT_DOWN,
+                )
+                .on_click(cx.listener(move |this, _event, window, cx| {
+                    cx.stop_propagation();
+                    this.store.update(cx, |store, cx| {
+                        store.split_pane(
+                            &pid_down,
+                            &anchor_down,
+                            SplitDirection::Vertical,
+                            window,
+                            cx,
+                        );
+                    });
+                })),
+            )
+            .child(
+                // × 仍是文本字形:hover 转 error 色要跟随文本色,VectorIcon
+                // 进不去(见 ctrl_icon 的注释);盒子样式与图标钮同一套
+                div()
+                    .id(gpui::SharedString::from(format!("close-leaf-{leaf_id}")))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(px(CTRL_BTN))
+                    .h(px(CTRL_BTN))
+                    .rounded(px(3.0))
+                    .cursor_pointer()
+                    .opacity(0.6)
+                    .text_color(ui::text_muted())
+                    .hover(|el| {
+                        el.opacity(1.0)
+                            .bg(ui::border_subtle())
+                            .text_color(ui::color_error())
+                    })
+                    // 控制条的 × 关的是**整组**,同样先确认(原版 closeLeaf)
                     .on_click(cx.listener(move |this, _event, window, cx| {
                         cx.stop_propagation();
-                        this.store.update(cx, |store, cx| {
-                            store.split_pane(
-                                &pid_right,
-                                &anchor_right,
-                                SplitDirection::Horizontal,
-                                window,
-                                cx,
-                            );
-                        });
-                    })),
-                )
-                .child(
-                    ctrl_icon(
-                        gpui::SharedString::from(format!("split-down-{leaf}")),
-                        ICON_SPLIT_DOWN,
-                    )
-                    .on_click(cx.listener(move |this, _event, window, cx| {
-                        cx.stop_propagation();
-                        this.store.update(cx, |store, cx| {
-                            store.split_pane(
-                                &pid_down,
-                                &anchor_down,
-                                SplitDirection::Vertical,
-                                window,
-                                cx,
-                            );
-                        });
-                    })),
-                )
-                .child(
-                    // × 仍是文本字形:hover 转 error 色要跟随文本色,VectorIcon
-                    // 进不去(见 ctrl_icon 的注释);盒子样式与图标钮同一套
-                    div()
-                        .id(gpui::SharedString::from(format!("close-leaf-{leaf}")))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .w(px(CTRL_BTN))
-                        .h(px(CTRL_BTN))
-                        .rounded(px(3.0))
-                        .cursor_pointer()
-                        .opacity(0.6)
-                        .text_color(ui::text_muted())
-                        .hover(|el| {
-                            el.opacity(1.0)
-                                .bg(ui::border_subtle())
-                                .text_color(ui::color_error())
-                        })
-                        // 控制条的 × 关的是**整组**,同样先确认(原版 closeLeaf)
-                        .on_click(cx.listener(move |this, _event, window, cx| {
-                            cx.stop_propagation();
-                            pane_actions::close_leaf(
-                                this.store.clone(),
-                                pid_close_leaf.clone(),
-                                leaf_for_close.clone(),
-                                window,
-                                cx,
-                            );
-                        }))
-                        .child("×"),
-                ),
-        );
+                        pane_actions::close_leaf(
+                            this.store.clone(),
+                            pid_close_leaf.clone(),
+                            leaf_for_close.clone(),
+                            window,
+                            cx,
+                        );
+                    }))
+                    .child("×"),
+            )
+    }
 
-        // 双击 tab 栏**空白处**最大化 / 还原。原版靠 `e.target.closest('[data-pane-tab],button')`
-        // 排除 tab 与按钮;gpui 侧改由那些子元素自己 `stop_propagation`(见各处注释)
-        // —— 效果相同,而且不需要在这里维护一张「哪些子元素算控件」的名单。
-        let pid_dblclick = pid.clone();
-        let anchor_dblclick = active_id.clone();
-        bar = bar.on_click(cx.listener(move |this, event: &ClickEvent, _window, cx| {
-            if click_count(event) < 2 {
-                return;
-            }
-            let (pid, anchor) = (pid_dblclick.clone(), anchor_dblclick.clone());
-            this.store
-                .update(cx, |store, cx| store.toggle_maximized_leaf(&pid, &anchor, cx));
-        }));
-
+    /// ── tab 栏的落点层 ────────────────────────────────────────
+    ///
+    /// 为什么要在可滚动的 tab 栏**外面**再包一层:
+    /// ① 插入指示线是绝对定位的,放进滚动容器里会跟着内容偏移,而 x 又是由
+    ///    屏幕坐标现算的(已含滚动量)—— 两下叠加就双算了;包一层非滚动的
+    ///    父级,`指示线 x = tab 屏幕左缘 − tab 栏屏幕左缘` 直接可用。
+    /// ② `on_drag_move` 的 `event.bounds` 就是挂监听那个元素的矩形,挂在这层
+    ///    等于白拿「tab 栏在屏幕上的位置」,不必再为它单开一片量尺 canvas。
+    fn render_leaf_drop_layer(
+        &mut self,
+        bar: impl IntoElement,
+        project_id: &str,
+        leaf_id: &str,
+        dragging: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
         // ── tab 栏的落点层 ────────────────────────────────────────
         //
         // 为什么要在可滚动的 tab 栏**外面**再包一层:
@@ -2196,19 +2174,19 @@ impl TerminalArea {
         //    父级,`指示线 x = tab 屏幕左缘 − tab 栏屏幕左缘` 直接可用。
         // ② `on_drag_move` 的 `event.bounds` 就是挂监听那个元素的矩形,挂在这层
         //    等于白拿「tab 栏在屏幕上的位置」,不必再为它单开一片量尺 canvas。
-        let leaf_for_bar = leaf.clone();
-        let leaf_for_drop = leaf.clone();
-        let pid_tab_drop = pid.clone();
+        let leaf_for_bar = leaf_id.to_string();
+        let leaf_for_drop = leaf_id.to_string();
+        let pid_tab_drop = project_id.to_string();
         let tab_indicator = self
             .tab_drop
             .as_ref()
-            .filter(|(id, _, _)| dragging && id == &leaf)
+            .filter(|(id, _, _)| dragging && id.as_str() == leaf_id)
             .map(|(_, _, x)| *x);
         // ⚠️ 必须是**纵向** flex:`bar` 自己带 `flex_none`,放进默认的横向 flex 里
         // 就变成「宽度按内容撑」,右侧控件簇的 `ml_auto` 会跟着缩到 tab 后面去。
         // 纵向下 `flex_none` 只钉高度(26),宽度照旧横向铺满 —— 与它原先直接
         // 挂在叶子那个 `flex_col` 容器里时的表现一字不差。
-        let bar_layer = div()
+        div()
             .relative()
             .flex()
             .flex_col()
@@ -2255,14 +2233,141 @@ impl TerminalArea {
                             spread_radius: px(0.0),
                         },
                     ])
-            }));
+            }))
+    }
+
+    /// 远程断线覆盖层:**保留 pane**,点一下在同一 pane 重连。
+    fn render_leaf_reconnect_overlay(
+        &mut self,
+        project_id: &str,
+        pane_id: &str,
+        leaf_id: &str,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let (pid, pane_id) = (project_id.to_string(), pane_id.to_string());
+        div()
+            .id(gpui::SharedString::from(format!("reconnect-{leaf_id}")))
+            .absolute()
+            .inset_0()
+            // 遮罩自己吃点击:底下终端的聚焦监听不该抢走这一下
+            .occlude()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(px(12.0))
+            // 原版 `bg-black/55 backdrop-blur-[1px]`;gpui 没有
+            // backdrop-filter,只留半透明黑
+            .bg(gpui::rgba(0x0000008c))
+            .child(
+                div()
+                    .text_size(ui::font_px(12.0))
+                    .text_color(ui::text_secondary())
+                    .child(t("paneGroup", "remoteDisconnected")),
+            )
+            .child(
+                ui::ghost_button(
+                    gpui::SharedString::from(format!("reconnect-btn-{leaf_id}")),
+                    t("paneGroup", "reconnect"),
+                )
+                .on_click(cx.listener(
+                    move |this: &mut TerminalArea, _event, window, cx| {
+                        let (pid, pane_id) = (pid.clone(), pane_id.clone());
+                        this.store.update(cx, |store, cx| {
+                            // 一步含:kill 旧 PTY / 清标记与退出登记 /
+                            // 起新 PTY / 回写 pane(见 store 那边的注释)
+                            store.reset_pane_for_reconnect(&pid, &pane_id, cx);
+                            store.focus_pane(&pid, &pane_id, window, cx);
+                        });
+                    },
+                )),
+            )
+    }
+
+    fn render_leaf(
+        &mut self,
+        node: &SplitNode,
+        project_id: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let SplitNode::Leaf {
+            id: leaf_id,
+            panes,
+            active_pane_id,
+        } = node
+        else {
+            return div().into_any_element();
+        };
+
+        let active = panes
+            .iter()
+            .find(|p| &p.id == active_pane_id)
+            .or_else(|| panes.first());
+        let Some(active) = active else {
+            return div().into_any_element();
+        };
+
+        // ── 检测叶内切 tab,起一条方向性 push 过渡(见文件头注释)────
+        let tab_swap = self.note_leaf_tab_swap(leaf_id, panes, &active.id, cx);
+
+        // RevealBack 的空洞:实体此刻在飞行层上,这格只画底色(见 render 里的置位)
+        let suppressed = self.suppress_entity_pane.as_deref() == Some(active.id.as_str());
+        let store = self.store.read(cx);
+        let terminal = if suppressed {
+            None
+        } else {
+            active.pty_id.and_then(|id| store.terminal(id)).cloned()
+        };
+        // 出场层的旧终端实体(旧 pane 还没起 PTY 时出场层只好省略)
+        let exit_terminal = tab_swap.as_ref().and_then(|(_, _, old)| {
+            store
+                .project_state(project_id)
+                .and_then(|s| s.pane(old))
+                .and_then(|p| p.pty_id)
+                .and_then(|id| store.terminal(id))
+                .cloned()
+        });
+        // 远程 pane 的断线覆盖层(`PaneGroup.tsx:329-333` 的 `showReconnect`):
+        // 判据是「项目是 SSH 远程项目 **且** 这条 PTY 已登记退出」。
+        // ⚠️ **本地 pane 不进这条路** —— 本地退出仍走既有的 error 状态 + 右下角
+        // 「shell 已退出」角标(原版 `remote &&` 那一半就是这个闸)。
+        // 断链(连接被删)照样算远程项目,遮罩照出:重连会再失败一次并把明确的
+        // 断链错误画进 pane,比静默什么都不发生强。
+        let show_reconnect = store.is_remote_project(project_id)
+            && active
+                .pty_id
+                .map(|id| store.is_pty_exited(id))
+                .unwrap_or(false);
+
+        let active_id = active.id.clone();
+        let pid = project_id.to_string();
+        let leaf = leaf_id.clone();
+        // 拖拽相关的三份视图状态一律与它与门(见字段注释)
+        let dragging = cx.has_active_drag();
+
+        // tab 栏 = 本体 + 右侧控件簇,外面再包一层落点层(理由见那个方法)
+        let mut bar = self.render_leaf_tab_bar(panes, active, project_id, leaf_id, dragging, cx);
+        bar = bar.child(self.render_leaf_controls(panes, active, project_id, leaf_id, cx));
+        // 双击 tab 栏**空白处**最大化 / 还原。原版靠 `e.target.closest('[data-pane-tab],button')`
+        // 排除 tab 与按钮;gpui 侧改由那些子元素自己 `stop_propagation`(见各处注释)
+        // —— 效果相同,而且不需要在这里维护一张「哪些子元素算控件」的名单。
+        let pid_dblclick = pid.clone();
+        let anchor_dblclick = active_id.clone();
+        bar = bar.on_click(cx.listener(move |this, event: &ClickEvent, _window, cx| {
+            if click_count(event) < 2 {
+                return;
+            }
+            let (pid, anchor) = (pid_dblclick.clone(), anchor_dblclick.clone());
+            this.store
+                .update(cx, |store, cx| store.toggle_maximized_leaf(&pid, &anchor, cx));
+        }));
+        let bar_layer = self.render_leaf_drop_layer(bar, project_id, leaf_id, dragging, cx);
 
         let pid_focus = pid.clone();
         let active_for_focus = active_id.clone();
         let pid_drop = pid.clone();
         let drop_pane_id = active_id.clone();
-        let pid_reconnect = pid.clone();
-        let pane_reconnect = active_id.clone();
         // 拖拽中断(松手在窗外)后 gpui 会清 active_drag 并重画,与它与门就不必
         // 到处补清理 —— 与 `project_list.rs` 里那份高亮同一套判据。
         let file_drop_over =
@@ -2293,6 +2398,10 @@ impl TerminalArea {
         // 焦点表达靠激活 tab 的 accent 顶线 + 光标实心/空心两处;此前的
         // group_focused accent 描边是 GPUI 侧自加的,真机上整圈橙线喧宾夺主
         // (用户报障),按原版口径删除。
+        // 远程断线覆盖层(判据见上面的 `show_reconnect`)
+        let reconnect = show_reconnect
+            .then(|| self.render_leaf_reconnect_overlay(project_id, &active_id, leaf_id, cx));
+
         div()
             .size_full()
             .flex()
@@ -2404,90 +2513,12 @@ impl TerminalArea {
                         .absolute()
                         .size_full(),
                     )
-                    .map(|el| match terminal {
-                        // 叶内切 tab 的方向性 push(见文件头注释):新 pane 按
-                        // 方向推入、旧 pane 同向推出;两层都是全尺寸 absolute,
-                        // 只动 left,PTY 不收 resize。没有在场记录时零包装。
-                        // 只包终端主体,tab 栏不参与(它没换内容,动了反而怪)
-                        Some(entity) => match tab_swap.as_ref() {
-                            Some((seq, dir, _old)) => {
-                                let (seq, dir) = (*seq, *dir);
-                                el.child(
-                                    div()
-                                        .size_full()
-                                        .relative()
-                                        .overflow_hidden()
-                                        .children(exit_terminal.clone().map(|old_entity| {
-                                            div()
-                                                .absolute()
-                                                .top_0()
-                                                .w_full()
-                                                .h_full()
-                                                .child(old_entity)
-                                                .with_animation(
-                                                    gpui::SharedString::from(format!(
-                                                        "tab-exit-{seq}"
-                                                    )),
-                                                    Animation::new(
-                                                        std::time::Duration::from_millis(
-                                                            TAB_SWAP_MS,
-                                                        ),
-                                                    )
-                                                    .with_easing(ui::cubic_bezier(
-                                                        0.16, 1.0, 0.3, 1.0,
-                                                    )),
-                                                    move |el, delta| {
-                                                        el.left(gpui::relative(push_exit_x(
-                                                            dir, delta,
-                                                        )))
-                                                    },
-                                                )
-                                        }))
-                                        .child(
-                                            div()
-                                                .absolute()
-                                                .top_0()
-                                                .w_full()
-                                                .h_full()
-                                                .child(entity)
-                                                .with_animation(
-                                                    gpui::SharedString::from(format!(
-                                                        "tab-enter-{seq}"
-                                                    )),
-                                                    Animation::new(
-                                                        std::time::Duration::from_millis(
-                                                            TAB_SWAP_MS,
-                                                        ),
-                                                    )
-                                                    .with_easing(ui::cubic_bezier(
-                                                        0.16, 1.0, 0.3, 1.0,
-                                                    )),
-                                                    move |el, delta| {
-                                                        el.left(gpui::relative(push_enter_x(
-                                                            dir, delta,
-                                                        )))
-                                                    },
-                                                ),
-                                        ),
-                                )
-                            }
-                            None => el.child(entity),
-                        },
-                        // 空洞态(RevealBack 在飞)只画底色,不出「正在启动」——
-                        // 那行字会在飞行层落位前闪一下
-                        None => el.child(
-                            div().size_full().bg(ui::bg_terminal()).when(
-                                !suppressed,
-                                |el| {
-                                    el.flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .text_color(ui::text_muted())
-                                        .child(t("paneGroup", "starting"))
-                                },
-                            ),
-                        ),
-                    })
+                    .child(leaf_terminal_layer(
+                        terminal,
+                        exit_terminal,
+                        tab_swap.as_ref(),
+                        suppressed,
+                    ))
                     // 「释放以插入路径」的虚线框。与 `cx.has_active_drag()` 与门:
                     // 拖拽被中断时 gpui 会清 active_drag 并重画,残留状态自动失效。
                     .when(file_drop_over, |el| el.child(drop_hint()))
@@ -2496,48 +2527,7 @@ impl TerminalArea {
                     // 见 `note_pane_drag_over`)—— 原版三轮评审的最终口径
                     .children(body_zone.map(zone_overlay))
                     // 远程断线覆盖层:**保留 pane**,点一下在同一 pane 重连
-                    .when(show_reconnect, |el| {
-                        let (pid, pane_id) = (pid_reconnect.clone(), pane_reconnect.clone());
-                        el.child(
-                            div()
-                                .id(gpui::SharedString::from(format!("reconnect-{leaf}")))
-                                .absolute()
-                                .inset_0()
-                                // 遮罩自己吃点击:底下终端的聚焦监听不该抢走这一下
-                                .occlude()
-                                .flex()
-                                .flex_col()
-                                .items_center()
-                                .justify_center()
-                                .gap(px(12.0))
-                                // 原版 `bg-black/55 backdrop-blur-[1px]`;gpui 没有
-                                // backdrop-filter,只留半透明黑
-                                .bg(gpui::rgba(0x0000008c))
-                                .child(
-                                    div()
-                                        .text_size(ui::font_px(12.0))
-                                        .text_color(ui::text_secondary())
-                                        .child(t("paneGroup", "remoteDisconnected")),
-                                )
-                                .child(
-                                    ui::ghost_button(
-                                        gpui::SharedString::from(format!("reconnect-btn-{leaf}")),
-                                        t("paneGroup", "reconnect"),
-                                    )
-                                    .on_click(cx.listener(
-                                        move |this: &mut TerminalArea, _event, window, cx| {
-                                            let (pid, pane_id) = (pid.clone(), pane_id.clone());
-                                            this.store.update(cx, |store, cx| {
-                                                // 一步含:kill 旧 PTY / 清标记与退出登记 /
-                                                // 起新 PTY / 回写 pane(见 store 那边的注释)
-                                                store.reset_pane_for_reconnect(&pid, &pane_id, cx);
-                                                store.focus_pane(&pid, &pane_id, window, cx);
-                                            });
-                                        },
-                                    )),
-                                ),
-                        )
-                    }),
+                    .children(reconnect)
             )
             .into_any_element()
     }
@@ -2802,6 +2792,97 @@ impl TerminalArea {
         cx.notify();
     }
 }
+/// 叶内切 tab 的方向性 push 两层(见文件头注释):新 pane 按方向推入、旧 pane
+/// 同向推出;两层都是全尺寸 absolute,只动 `left`,PTY 不收 resize。没有在场
+/// 记录时零包装 —— 只包终端主体,tab 栏不参与(它没换内容,动了反而怪)。
+fn leaf_terminal_layer(
+    terminal: Option<Entity<crate::pane::TerminalPane>>,
+    exit_terminal: Option<Entity<crate::pane::TerminalPane>>,
+    tab_swap: Option<&(u64, f32, String)>,
+    suppressed: bool,
+) -> AnyElement {
+    match terminal {
+        Some(entity) => match tab_swap {
+            Some((seq, dir, _old)) => {
+                let (seq, dir) = (*seq, *dir);
+                div()
+                    .size_full()
+                    .relative()
+                    .overflow_hidden()
+                    .children(exit_terminal.clone().map(|old_entity| {
+                        div()
+                            .absolute()
+                            .top_0()
+                            .w_full()
+                            .h_full()
+                            .child(old_entity)
+                            .with_animation(
+                                gpui::SharedString::from(format!(
+                                    "tab-exit-{seq}"
+                                )),
+                                Animation::new(
+                                    std::time::Duration::from_millis(
+                                        TAB_SWAP_MS,
+                                    ),
+                                )
+                                .with_easing(ui::cubic_bezier(
+                                    0.16, 1.0, 0.3, 1.0,
+                                )),
+                                move |el, delta| {
+                                    el.left(gpui::relative(push_exit_x(
+                                        dir, delta,
+                                    )))
+                                },
+                            )
+                    }))
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .w_full()
+                            .h_full()
+                            .child(entity)
+                            .with_animation(
+                                gpui::SharedString::from(format!(
+                                    "tab-enter-{seq}"
+                                )),
+                                Animation::new(
+                                    std::time::Duration::from_millis(
+                                        TAB_SWAP_MS,
+                                    ),
+                                )
+                                .with_easing(ui::cubic_bezier(
+                                    0.16, 1.0, 0.3, 1.0,
+                                )),
+                                move |el, delta| {
+                                    el.left(gpui::relative(push_enter_x(
+                                        dir, delta,
+                                    )))
+                                },
+                            ),
+                    )
+                    .into_any_element()
+            }
+            None => entity.into_any_element(),
+        },
+        // 空洞态(RevealBack 在飞)只画底色,不出「正在启动」——
+        // 那行字会在飞行层落位前闪一下
+        None => {
+            div().size_full().bg(ui::bg_terminal()).when(
+                !suppressed,
+                |el| {
+                    el.flex()
+                        .items_center()
+                        .justify_center()
+                        .text_color(ui::text_muted())
+                        .child(t("paneGroup", "starting"))
+                },
+            )
+            .into_any_element()
+        }
+    }
+}
+
 
 /// 拖文件悬停时盖在终端上的虚线提示框(`TerminalInstance.tsx:430-442`)。
 fn drop_hint() -> AnyElement {

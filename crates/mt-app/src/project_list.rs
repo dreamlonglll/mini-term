@@ -214,6 +214,148 @@ fn done_tag(progress: f32) -> AnyElement {
         .into_any_element()
 }
 
+/// 行上的 AI 品牌堆叠:领位图标之后、名字之前,**只追加不覆盖**。
+/// 负边距抵掉行内 gap(6px),与领位图标只留 2px;图标之间同样 2px。
+fn ai_vendor_icons(vendors: &[Option<AiVendor>]) -> gpui::Div {
+    let mut stack = div()
+        .flex()
+        .items_center()
+        .flex_shrink_0()
+        .ml(px(-4.0))
+        .gap(px(2.0));
+    for vendor in vendors {
+        stack = stack.child(
+            BrandIcon::new(*vendor)
+                .size(px(AI_ICON_SIZE))
+                // 固定 text-secondary 上下文:单色品牌图标不随
+                // 选中行的 accent 变色(与 tab 上观感一致)
+                .color(ui::text_secondary()),
+        );
+    }
+    stack
+}
+
+/// worktree 徽章:`⎇ 分支名`(U+2387 是**文本**,不是图标)。
+fn worktree_badge_chip(id: &str, branch: String) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(SharedString::from(format!("worktree-{id}")))
+        .flex_shrink_0()
+        .max_w(px(WORKTREE_BADGE_MAX_W))
+        .truncate()
+        .px(px(3.0))
+        .rounded(px(3.0))
+        .text_size(ui::font_px(9.75))
+        .text_color(ui::text_muted())
+        .bg(ui::border_subtle())
+        .tooltip({
+            let branch = branch.clone();
+            move |window, cx| {
+                mt_ui::tooltip::Tooltip::new(tr!(
+                    "projectList",
+                    "worktreeBadgeTitle",
+                    branch = branch.clone()
+                ))
+                .build(window, cx)
+            }
+        })
+        .child(format!("⎇ {branch}"))
+}
+
+/// 远程徽章:连接名(断链时「断链」两字 + error 配色)。
+fn remote_badge_chip(id: &str, remote: RemoteBadge) -> gpui::Stateful<gpui::Div> {
+    let (fg, bg) = if remote.broken {
+        (ui::color_error(), ui::with_alpha(ui::color_error(), 0.15))
+    } else {
+        (ui::text_muted(), ui::border_subtle())
+    };
+    let tip: SharedString = if remote.broken {
+        t("projectList", "remoteBrokenTitle").into()
+    } else {
+        tr!(
+            "projectList",
+            "remoteBadgeTitle",
+            summary = remote.summary.clone()
+        )
+        .into()
+    };
+    div()
+        .id(SharedString::from(format!("remote-badge-{id}")))
+        .flex_shrink_0()
+        .max_w(px(REMOTE_BADGE_MAX_W))
+        .truncate()
+        .px(px(3.0))
+        .rounded(px(3.0))
+        .font_family("monospace")
+        .text_size(ui::font_px(9.75))
+        .text_color(fg)
+        .bg(bg)
+        .tooltip(move |window, cx| {
+            mt_ui::tooltip::Tooltip::new(tip.clone())
+                .build(window, cx)
+        })
+        .child(if remote.broken {
+            SharedString::from(t("projectList", "remoteBrokenBadge"))
+        } else {
+            SharedString::from(remote.name.clone())
+        })
+}
+
+/// 完成标 / 状态灯二选一,**idle 且没有完成标时两个都不画**(原版 `ProjectList.tsx:912`)。
+fn row_status_mark(
+    id: &str,
+    show_done_tag: bool,
+    done_tag_in: f32,
+    status: PaneStatus,
+) -> Option<AnyElement> {
+    if show_done_tag {
+        Some(done_tag(done_tag_in))
+    } else if status != PaneStatus::Idle {
+        // 状态灯的动画 id 拿项目 id 拼:跨帧稳定、逐行唯一
+        Some(
+            ui::status_dot(SharedString::from(format!("status-project-{id}")), status)
+                .into_any_element(),
+        )
+    } else {
+        None
+    }
+}
+
+/// 外部拖拽的三态提示框:盖住整栏。
+fn external_drop_hint(kind: Option<ExternalDropKind>) -> gpui::Div {
+    let (border, bg) = match kind {
+        // 还在后台判目录:先按"可以放"画,免得闪一下红框
+        None | Some(ExternalDropKind::Valid) => {
+            (ui::accent(), ui::with_alpha(ui::accent(), 0.1))
+        }
+        Some(ExternalDropKind::Forbidden) => {
+            (ui::color_error(), ui::with_alpha(ui::color_error(), 0.1))
+        }
+        Some(ExternalDropKind::Duplicate) => {
+            (ui::color_warning(), ui::with_alpha(ui::color_warning(), 0.1))
+        }
+    };
+    div()
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(6.0))
+        .border_2()
+        .border_dashed()
+        .border_color(border)
+        .bg(bg)
+        .child(
+            div()
+                .text_size(ui::font_px(11.0))
+                .text_color(border)
+                .child(t(
+                    "projectList",
+                    kind.unwrap_or(ExternalDropKind::Valid).hint_key(),
+                )),
+        )
+}
+
 /// 领位徽标最终显示哪种技术栈(`ProjectList.tsx:629-632`)。
 ///
 /// 原式:`kindOverride === 'none' ? null : kindOverride ?? detected ?? null`。
@@ -1715,224 +1857,12 @@ impl Render for ProjectList {
             let store = self.store.read(cx);
             project_tree::get_ordered_tree(store.config())
         };
-        // 行焦点句柄按当前行集合补齐并回收(`render_project`/`render_group` 拿的是
-        // `&self`,不能在那里现建)。句柄要**跨帧稳定**,不能每帧新建 ——
-        // 那样 Tab 过去的焦点每帧都会丢
-        {
-            let ids: HashSet<&str> = ordered
-                .iter()
-                .map(|item| match item {
-                    OrderedItem::Group { id, .. } | OrderedItem::Project { id, .. } => id.as_str(),
-                })
-                .collect();
-            self.row_focus.retain(|id, _| ids.contains(id.as_str()));
-            let missing: Vec<String> = ids
-                .into_iter()
-                .filter(|id| !self.row_focus.contains_key(*id))
-                .map(|id| id.to_string())
-                .collect();
-            for id in missing {
-                self.row_focus(&id, cx);
-            }
-        }
-        // 完成标的进场表:这一帧哪些行挂着标就留哪些(等价于 DOM 的挂载/卸载)。
-        // 进度在 `render_project` 里读,**请求下一帧只能在这儿**(那边没有 window)。
-        {
-            let store = self.store.read(cx);
-            let active_id = store.active_project_id.clone();
-            let showing: HashSet<String> = ordered
-                .iter()
-                .filter_map(|item| match item {
-                    OrderedItem::Project { id, .. } => {
-                        let needs = store
-                            .project_state(id)
-                            .map(|s| s.needs_attention)
-                            .unwrap_or(false);
-                        shows_done_tag(needs, active_id.as_deref() == Some(id.as_str()))
-                            .then(|| id.clone())
-                    }
-                    OrderedItem::Group { .. } => None,
-                })
-                .collect();
-            self.done_tags.retain(|id, _| showing.contains(id));
-            for id in showing {
-                self.done_tags
-                    .entry(id)
-                    .or_insert_with(|| mt_ui::motion::Transition::new(mt_ui::motion::TAG_FADE_IN));
-            }
-        }
-        if self.done_tags.values().any(|tr| tr.running()) {
-            window.request_animation_frame();
-        }
+        self.sync_row_focus(&ordered, cx);
+        self.sync_done_tags(&ordered, window, cx);
         let preview = self.render_preview(window, cx);
-        let store_ref = self.store.read(cx);
-        let active = store_ref.active_project_id.clone();
-        // 缺省开启,与 store 里那处取值同口径
-        let auto_resume = store_ref.config().ai_auto_resume.unwrap_or(true);
-        let tree_snapshot: Vec<ProjectTreeItem> = store_ref
-            .config()
-            .project_tree
-            .clone()
-            .unwrap_or_default();
-
-        let mut list = div()
-            .id("project-list-rows")
-            .flex()
-            .flex_col()
-            .flex_1()
-            .overflow_y_scroll()
-            // 列表一滚锚点就失效 —— 原版挂 window 的 scroll/wheel 直接关掉
-            .on_scroll_wheel(cx.listener(|this, _event: &ScrollWheelEvent, _window, cx| {
-                this.close_preview(cx);
-            }));
-        for item in ordered {
-            match item {
-                OrderedItem::Group {
-                    id,
-                    name,
-                    collapsed,
-                    count,
-                    depth,
-                    ..
-                } => {
-                    let row = GroupRow {
-                        id,
-                        name,
-                        collapsed,
-                        count,
-                        depth,
-                    };
-                    list = list.child(self.render_group(row, dragging.as_deref(), drag_active, cx));
-                }
-                OrderedItem::Project {
-                    id,
-                    depth,
-                    parent_group_id,
-                    is_child,
-                } => {
-                    let store = self.store.read(cx);
-                    let Some(p) = store.project(&id) else {
-                        continue;
-                    };
-                    let state = store.project_state(&id);
-                    // 行上的 AI 品牌堆叠:递归收布局树里「显示 AI 会话」的 pane,
-                    // 判定与 tab 上的品牌图标共用同一把尺子
-                    let ai_vendors = ai_vendor_stack(
-                        state
-                            .map(|s| s.all_panes())
-                            .unwrap_or_default()
-                            .into_iter()
-                            .filter(|pane| pane.shows_ai_session(auto_resume))
-                            .map(|pane| pane.ai_agent()),
-                    );
-                    // 探测缓存:`None` = 还没探完 / 已探但认不出,两种都走通用图标
-                    let detected_kind = store.dir_kind(&p.path).flatten();
-                    let remote = remote_badge(p, store.ssh_connections());
-                    let row = Row {
-                        id: p.id.clone(),
-                        name: p.name.clone(),
-                        path: p.path.clone(),
-                        status: state.map(|s| s.status).unwrap_or(PaneStatus::Idle),
-                        needs_attention: state.map(|s| s.needs_attention).unwrap_or(false),
-                        kind: resolve_project_kind(p.kind_override.as_deref(), detected_kind),
-                        detected_kind,
-                        description: p.description.clone(),
-                        kind_override: p.kind_override.clone(),
-                        depth,
-                        parent_group_id,
-                        is_child,
-                        ai_vendors,
-                        // 远程项目的路径是远端 POSIX 路径,本机 worktree 探测与它无关
-                        worktree_branch: if remote.is_some() {
-                            None
-                        } else {
-                            self.worktree_branches.get(&p.path).cloned()
-                        },
-                        remote,
-                    };
-                    let is_active = active.as_deref() == Some(row.id.as_str());
-                    list = list.child(self.render_project(
-                        row,
-                        is_active,
-                        dragging.as_deref(),
-                        drag_active,
-                        &tree_snapshot,
-                        cx,
-                    ));
-                }
-            }
-        }
-
-        // 底部按钮条(`ProjectList.tsx:1087-1113`):添加项目 / SSH / +。
-        // 中间那颗 `SSH` 走 `remote_project::open`(根层),BB-b 补齐。
-        let dashed_button = |id: &'static str, label: SharedString, wide: bool| {
-            div()
-                .id(id)
-                .when(wide, |el| el.flex_1())
-                .flex()
-                .items_center()
-                .justify_center()
-                .px(px(12.0))
-                .py(px(8.0))
-                .rounded(px(6.0))
-                .border_1()
-                .border_dashed()
-                .border_color(ui::border_default())
-                .cursor_pointer()
-                .text_size(ui::font_px(11.4))
-                .text_color(ui::text_muted())
-                .hover(|el| el.border_color(ui::accent()).text_color(ui::accent()))
-                .child(label)
-        };
-        let store_for_add = self.store.clone();
-        let footer = div()
-            .flex()
-            .flex_none()
-            .gap(px(6.0))
-            .p(px(8.0))
-            .child(
-                dashed_button(
-                    "add-project",
-                    t("projectList", "addProject").into(),
-                    true,
-                )
-                .on_click(move |_event, window, cx| {
-                    modal::open_add_project(store_for_add.clone(), window, cx);
-                }),
-            )
-            .child(
-                dashed_button("add-remote-project", "SSH".into(), false)
-                    .tooltip(|window, cx| {
-                        mt_ui::tooltip::Tooltip::new(t(
-                            "projectList",
-                            "addRemoteProject",
-                        ))
-                        .build(window, cx)
-                    })
-                    .on_click(cx.listener(|this, _event, window, cx| {
-                        crate::remote_project::open(this.store.clone(), None, window, cx);
-                    })),
-            )
-            .child(
-                dashed_button("new-group", "+".into(), false)
-                    .tooltip(|window, cx| {
-                        mt_ui::tooltip::Tooltip::new(t("projectList", "newGroup"))
-                            .build(window, cx)
-                    })
-                    .on_click(cx.listener(|this, _event, window, cx| {
-                        let store = this.store.clone();
-                        crate::prompt::show_prompt(
-                            t("projectList", "newGroup"),
-                            t("projectList", "newGroupPlaceholder"),
-                            "",
-                            move |value, _window, cx| {
-                                store.update(cx, |store, cx| store.create_group(&value, None, cx));
-                            },
-                            window,
-                            cx,
-                        );
-                    })),
-            );
+        let list = self.render_rows(ordered, dragging.as_deref(), drag_active, cx);
+        let footer = self.render_footer(cx);
+        let header = self.render_list_header(cx);
 
         div()
             .id("project-list")
@@ -1951,34 +1881,7 @@ impl Render for ProjectList {
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
                 this.on_external_drop(paths.paths().to_vec(), cx);
             }))
-            .child(
-                div()
-                    .id("project-list-header")
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .px(px(10.0))
-                    .py(px(6.0))
-                    .border_b_1()
-                    .border_color(ui::border_subtle())
-                    // 标题栏空白右键 = 新建分组(原版 `ProjectList.tsx:1069-1074`)
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                            cx.stop_propagation();
-                            let entries = new_group_menu(&this.store);
-                            menu::show(event.position, entries, window, cx);
-                        }),
-                    )
-                    // 原版头部只有 "PROJECTS" 文本 + 空白右键菜单,没有 `+` 按钮
-                    // (添加项目在底部按钮条)
-                    .child(
-                        div()
-                            .text_size(ui::font_px(11.0))
-                            .text_color(ui::text_muted())
-                            .child(t("panels", "projects")),
-                    ),
-            )
+            .child(header)
             .child(list)
             .child(footer)
             // 悬停缩略图。`deferred(priority 1)` 画在所有常规内容之上,
@@ -1986,42 +1889,7 @@ impl Render for ProjectList {
             .children(preview)
             // 三态提示框:盖住整栏,`pointer-events` 不用管 —— gpui 的 drop 分发
             // 按 hitbox 命中走,这层没有 `.id()` 也就没有 hitbox
-            .when_some(external, |el, kind| {
-                let (border, bg) = match kind {
-                    // 还在后台判目录:先按"可以放"画,免得闪一下红框
-                    None | Some(ExternalDropKind::Valid) => {
-                        (ui::accent(), ui::with_alpha(ui::accent(), 0.1))
-                    }
-                    Some(ExternalDropKind::Forbidden) => {
-                        (ui::color_error(), ui::with_alpha(ui::color_error(), 0.1))
-                    }
-                    Some(ExternalDropKind::Duplicate) => {
-                        (ui::color_warning(), ui::with_alpha(ui::color_warning(), 0.1))
-                    }
-                };
-                el.child(
-                    div()
-                        .absolute()
-                        .inset_0()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(px(6.0))
-                        .border_2()
-                        .border_dashed()
-                        .border_color(border)
-                        .bg(bg)
-                        .child(
-                            div()
-                                .text_size(ui::font_px(11.0))
-                                .text_color(border)
-                                .child(t(
-                                    "projectList",
-                                    kind.unwrap_or(ExternalDropKind::Valid).hint_key(),
-                                )),
-                        ),
-                )
-            })
+            .children(external.map(external_drop_hint))
     }
 }
 
@@ -2198,6 +2066,517 @@ impl ProjectList {
             .into_any_element()
     }
 
+    /// 行焦点句柄按当前行集合补齐并回收(`render_project` / `render_group` 拿的是
+    /// `&self`,不能在那里现建)。句柄要**跨帧稳定**,不能每帧新建 ——
+    /// 那样 Tab 过去的焦点每帧都会丢。
+    fn sync_row_focus(&mut self, ordered: &[OrderedItem], cx: &mut Context<Self>) {
+        let ids: HashSet<&str> = ordered
+            .iter()
+            .map(|item| match item {
+                OrderedItem::Group { id, .. } | OrderedItem::Project { id, .. } => id.as_str(),
+            })
+            .collect();
+        self.row_focus.retain(|id, _| ids.contains(id.as_str()));
+        let missing: Vec<String> = ids
+            .into_iter()
+            .filter(|id| !self.row_focus.contains_key(*id))
+            .map(|id| id.to_string())
+            .collect();
+        for id in missing {
+            self.row_focus(&id, cx);
+        }
+    }
+
+    /// 完成标的进场表:这一帧哪些行挂着标就留哪些(等价于 DOM 的挂载/卸载)。
+    /// 进度在 `render_project` 里读,**请求下一帧只能在这儿**(那边没有 window)。
+    fn sync_done_tags(
+        &mut self,
+        ordered: &[OrderedItem],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let store = self.store.read(cx);
+        let active_id = store.active_project_id.clone();
+        let showing: HashSet<String> = ordered
+            .iter()
+            .filter_map(|item| match item {
+                OrderedItem::Project { id, .. } => {
+                    let needs = store
+                        .project_state(id)
+                        .map(|s| s.needs_attention)
+                        .unwrap_or(false);
+                    shows_done_tag(needs, active_id.as_deref() == Some(id.as_str()))
+                        .then(|| id.clone())
+                }
+                OrderedItem::Group { .. } => None,
+            })
+            .collect();
+        self.done_tags.retain(|id, _| showing.contains(id));
+        for id in showing {
+            self.done_tags
+                .entry(id)
+                .or_insert_with(|| mt_ui::motion::Transition::new(mt_ui::motion::TAG_FADE_IN));
+        }
+        if self.done_tags.values().any(|tr| tr.running()) {
+            window.request_animation_frame();
+        }
+    }
+
+    /// 列表本体:`get_ordered_tree` 展平出来的分组行 / 项目行逐条铺开。
+    fn render_rows(
+        &self,
+        ordered: Vec<OrderedItem>,
+        dragging: Option<&str>,
+        drag_active: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let store_ref = self.store.read(cx);
+        let active = store_ref.active_project_id.clone();
+        // 缺省开启,与 store 里那处取值同口径
+        let auto_resume = store_ref.config().ai_auto_resume.unwrap_or(true);
+        let tree_snapshot: Vec<ProjectTreeItem> = store_ref
+            .config()
+            .project_tree
+            .clone()
+            .unwrap_or_default();
+        let mut list = div()
+            .id("project-list-rows")
+            .flex()
+            .flex_col()
+            .flex_1()
+            .overflow_y_scroll()
+            // 列表一滚锚点就失效 —— 原版挂 window 的 scroll/wheel 直接关掉
+            .on_scroll_wheel(cx.listener(|this, _event: &ScrollWheelEvent, _window, cx| {
+                this.close_preview(cx);
+            }));
+        for item in ordered {
+            match item {
+                OrderedItem::Group {
+                    id,
+                    name,
+                    collapsed,
+                    count,
+                    depth,
+                    ..
+                } => {
+                    let row = GroupRow {
+                        id,
+                        name,
+                        collapsed,
+                        count,
+                        depth,
+                    };
+                    list = list.child(self.render_group(row, dragging, drag_active, cx));
+                }
+                OrderedItem::Project {
+                    id,
+                    depth,
+                    parent_group_id,
+                    is_child,
+                } => {
+                    let store = self.store.read(cx);
+                    let Some(p) = store.project(&id) else {
+                        continue;
+                    };
+                    let state = store.project_state(&id);
+                    // 行上的 AI 品牌堆叠:递归收布局树里「显示 AI 会话」的 pane,
+                    // 判定与 tab 上的品牌图标共用同一把尺子
+                    let ai_vendors = ai_vendor_stack(
+                        state
+                            .map(|s| s.all_panes())
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|pane| pane.shows_ai_session(auto_resume))
+                            .map(|pane| pane.ai_agent()),
+                    );
+                    // 探测缓存:`None` = 还没探完 / 已探但认不出,两种都走通用图标
+                    let detected_kind = store.dir_kind(&p.path).flatten();
+                    let remote = remote_badge(p, store.ssh_connections());
+                    let row = Row {
+                        id: p.id.clone(),
+                        name: p.name.clone(),
+                        path: p.path.clone(),
+                        status: state.map(|s| s.status).unwrap_or(PaneStatus::Idle),
+                        needs_attention: state.map(|s| s.needs_attention).unwrap_or(false),
+                        kind: resolve_project_kind(p.kind_override.as_deref(), detected_kind),
+                        detected_kind,
+                        description: p.description.clone(),
+                        kind_override: p.kind_override.clone(),
+                        depth,
+                        parent_group_id,
+                        is_child,
+                        ai_vendors,
+                        // 远程项目的路径是远端 POSIX 路径,本机 worktree 探测与它无关
+                        worktree_branch: if remote.is_some() {
+                            None
+                        } else {
+                            self.worktree_branches.get(&p.path).cloned()
+                        },
+                        remote,
+                    };
+                    let is_active = active.as_deref() == Some(row.id.as_str());
+                    list = list.child(self.render_project(
+                        row,
+                        is_active,
+                        dragging,
+                        drag_active,
+                        &tree_snapshot,
+                        cx,
+                    ));
+                }
+            }
+        }
+
+        list
+    }
+
+    /// 栏头:只有 "PROJECTS" 文本 + 空白右键菜单(原版没有 `+` 按钮)。
+    fn render_list_header(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("project-list-header")
+            .flex()
+            .items_center()
+            .justify_between()
+            .px(px(10.0))
+            .py(px(6.0))
+            .border_b_1()
+            .border_color(ui::border_subtle())
+            // 标题栏空白右键 = 新建分组(原版 `ProjectList.tsx:1069-1074`)
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    let entries = new_group_menu(&this.store);
+                    menu::show(event.position, entries, window, cx);
+                }),
+            )
+            // 原版头部只有 "PROJECTS" 文本 + 空白右键菜单,没有 `+` 按钮
+            // (添加项目在底部按钮条)
+            .child(
+                div()
+                    .text_size(ui::font_px(11.0))
+                    .text_color(ui::text_muted())
+                    .child(t("panels", "projects")),
+            )
+    }
+
+    /// 底部按钮条。
+    fn render_footer(&self, cx: &mut Context<Self>) -> gpui::Div {
+        // 底部按钮条(`ProjectList.tsx:1087-1113`):添加项目 / SSH / +。
+        // 中间那颗 `SSH` 走 `remote_project::open`(根层),BB-b 补齐。
+        let dashed_button = |id: &'static str, label: SharedString, wide: bool| {
+            div()
+                .id(id)
+                .when(wide, |el| el.flex_1())
+                .flex()
+                .items_center()
+                .justify_center()
+                .px(px(12.0))
+                .py(px(8.0))
+                .rounded(px(6.0))
+                .border_1()
+                .border_dashed()
+                .border_color(ui::border_default())
+                .cursor_pointer()
+                .text_size(ui::font_px(11.4))
+                .text_color(ui::text_muted())
+                .hover(|el| el.border_color(ui::accent()).text_color(ui::accent()))
+                .child(label)
+        };
+        let store_for_add = self.store.clone();
+        div()
+            .flex()
+            .flex_none()
+            .gap(px(6.0))
+            .p(px(8.0))
+            .child(
+                dashed_button(
+                    "add-project",
+                    t("projectList", "addProject").into(),
+                    true,
+                )
+                .on_click(move |_event, window, cx| {
+                    modal::open_add_project(store_for_add.clone(), window, cx);
+                }),
+            )
+            .child(
+                dashed_button("add-remote-project", "SSH".into(), false)
+                    .tooltip(|window, cx| {
+                        mt_ui::tooltip::Tooltip::new(t(
+                            "projectList",
+                            "addRemoteProject",
+                        ))
+                        .build(window, cx)
+                    })
+                    .on_click(cx.listener(|this, _event, window, cx| {
+                        crate::remote_project::open(this.store.clone(), None, window, cx);
+                    })),
+            )
+            .child(
+                dashed_button("new-group", "+".into(), false)
+                    .tooltip(|window, cx| {
+                        mt_ui::tooltip::Tooltip::new(t("projectList", "newGroup"))
+                            .build(window, cx)
+                    })
+                    .on_click(cx.listener(|this, _event, window, cx| {
+                        let store = this.store.clone();
+                        crate::prompt::show_prompt(
+                            t("projectList", "newGroup"),
+                            t("projectList", "newGroupPlaceholder"),
+                            "",
+                            move |value, _window, cx| {
+                                store.update(cx, |store, cx| store.create_group(&value, None, cx));
+                            },
+                            window,
+                            cx,
+                        );
+                    })),
+            )
+    }
+
+    /// 项目行的名字位:编辑态换成内联输入框,否则是「名字 + 描述」。
+    fn project_row_label(
+        &self,
+        editing: Option<&Entity<InputState>>,
+        name: String,
+        description: Option<String>,
+    ) -> AnyElement {
+        match editing {
+            Some(input) => self.rename_input(input, 13.0),
+            None => {
+                div()
+                    .flex_1()
+                    .overflow_hidden()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    // 原版**没有**副行显示路径:路径只在 title / 预览卡头里出现
+                    .child(div().truncate().child(name))
+                    .when_some(description, |el, desc| {
+                        el.child(
+                            div()
+                                .truncate()
+                                .text_size(ui::font_px(9.75))
+                                .text_color(ui::text_muted())
+                                .child(desc),
+                        )
+                    })
+                .into_any_element()
+            }
+        }
+    }
+
+    /// 行尾的移除按钮:弹确认框(不可逆,布局与展开目录一起没)。
+    fn project_remove_button(
+        &self,
+        id: &str,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let id_remove = id.to_string();
+        div()
+            .id(SharedString::from(format!("project-remove-{id}")))
+            .w(px(16.0))
+            .h(px(16.0))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(3.0))
+            .text_size(ui::font_px(11.4))
+            .text_color(ui::text_muted())
+            .hover(|el| el.text_color(ui::color_error()).bg(ui::bg_overlay()))
+            .on_click(cx.listener(move |this, _event, window, cx| {
+                cx.stop_propagation();
+                let Some((name, path)) = this
+                    .store
+                    .read(cx)
+                    .project(&id_remove)
+                    .map(|p| (p.name.clone(), p.path.clone()))
+                else {
+                    return;
+                };
+                modal::open_confirm_remove_project(
+                    this.store.clone(),
+                    id_remove.clone(),
+                    name,
+                    path,
+                    window,
+                    cx,
+                );
+            }))
+            .child("✕")
+    }
+
+    /// 项目行的**交互挂载**:焦点 / 键盘 / 悬停 / 拖放 / 点击 / 右键菜单 + 行样式。
+    /// 行里的内容(图标、名字、徽章、状态灯……)由 [`Self::render_project`] 往里塞。
+    fn project_row_shell(
+        &self,
+        row: &Row,
+        is_active: bool,
+        dragging: Option<&str>,
+        tree: &[ProjectTreeItem],
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let id = row.id.clone();
+        let path = row.path.clone();
+        let kind = row.kind;
+        let is_child = row.is_child;
+        let indent = project_indent(row.depth, row.parent_group_id.is_some());
+        let is_source = dragging == Some(id.as_str());
+        let id_click = id.clone();
+        let id_move = id.clone();
+        let id_drop = id.clone();
+        let id_key = id.clone();
+        let id_focus = id.clone();
+        let id_hover = id.clone();
+        let name_drag = row.name.clone();
+        let row_for_menu = row.clone();
+        let tree_for_menu: Vec<ProjectTreeItem> = tree.to_vec();
+        let this = cx.entity();
+        let focus = self.row_focus.get(id.as_str()).cloned();
+        // 编辑中的那一行:行本身的点击/按键让给输入框(输入框本体在 `project_row_label`)
+        let is_editing = self
+            .editing
+            .as_ref()
+            .is_some_and(|e| !e.is_group && e.id == id);
+
+        div()
+            .id(SharedString::from(format!("project-{id}")))
+            .group(SharedString::from(format!("project-row-{id}")))
+            // 行级焦点 + tab 停靠点(原版每行 `tabIndex={0}`)。
+            // 整栏是一个 tab group,组内序号从 0 起,不与别处的 tab 序打架
+            .when_some(focus, |el, focus| el.track_focus(&focus).tab_index(0))
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
+                this.on_project_key(event, &id_key, window, cx);
+            }))
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .pl(px(indent))
+            .pr(px(10.0))
+            .py(px(6.0))
+            .rounded(px(3.0))
+            .cursor_pointer()
+            .text_size(ui::font_px(13.0))
+            .when(is_source, |el| el.opacity(0.4))
+            .when(is_active, |el| {
+                el.bg(ui::accent_subtle()).text_color(ui::accent())
+            })
+            .when(!is_active, |el| {
+                el.text_color(ui::text_secondary())
+                    .hover(|el| el.bg(ui::border_subtle()).text_color(ui::text_primary()))
+            })
+            // 绝对路径挂 tooltip。原版是 `title={aiVendors.length>0 ? undefined
+            // : project.path}` —— 有 AI 会话时路径改由缩略图卡头显示,
+            // 原生 tooltip 会盖住那张卡。这里同款条件挂
+            .when(row.ai_vendors.is_empty(), |el| {
+                el.tooltip({
+                    let path = path.clone();
+                    move |window, cx| {
+                        mt_ui::tooltip::Tooltip::new(path.clone())
+                            .build(window, cx)
+                    }
+                })
+            })
+            // 悬停记到 view state 上 —— 行尾 ✕ 的显隐与缩略图计时都要它。
+            // ⚠️ 离开分支必须先核对「离开的正是我们记着的那一行」:相邻
+            // 行的 enter/leave 到达顺序不保证,直接清会把刚进来的那一行
+            // 抹掉(鼠标沿列表纵扫时预览再也弹不出来)
+            .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
+                let mine = this.hovered.as_deref() == Some(id_hover.as_str());
+                if *hovered {
+                    if mine {
+                        return;
+                    }
+                    this.hovered = Some(id_hover.clone());
+                    this.schedule_preview(id_hover.clone(), cx);
+                } else {
+                    if !mine {
+                        return;
+                    }
+                    this.hovered = None;
+                    // 移出即关(原版 onMouseLeave 的 closePreview)
+                    this.close_preview(cx);
+                }
+                cx.notify();
+            }))
+            .on_drag(
+                DragProjectItem {
+                    id: id.clone(),
+                    is_group: false,
+                },
+                move |item, _offset, _window, cx| {
+                    let id = item.id.clone();
+                    this.update(cx, |this: &mut ProjectList, _cx| {
+                        this.dragging = Some(id);
+                    });
+                    dnd::preview(name_drag.clone(), PreviewIcon::Project(kind), cx)
+                },
+            )
+            // worktree 子项目**不作为落点**(位置是从父项目派生的),
+            // 但自身可以被拖走 = 脱离父项目 —— 所以只摘 drop 那半边
+            .when(!is_child, |el| {
+                let id_move = id_move.clone();
+                let id_drop = id_drop.clone();
+                el.on_drag_move(cx.listener(
+                    move |this, event: &DragMoveEvent<DragProjectItem>, _window, cx| {
+                        // 项目不是容器:allow_inside = false,只有 before/after
+                        this.on_row_drag_move(event, &id_move, false, cx);
+                    },
+                ))
+                .on_drop(cx.listener(move |this, item: &DragProjectItem, _window, cx| {
+                    this.on_row_drop(item, &id_drop, cx);
+                }))
+            })
+            // 按下即收缩略图(原版 onMouseDown 的第一句),顺带把行焦点
+            // 收过来 —— 浏览器点 `tabIndex=0` 的元素就会聚焦,原版的
+            // 「点完项目按 Delete 能删」正是靠这一条
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _event: &MouseDownEvent, window, cx| {
+                    this.close_preview(cx);
+                    if this.editing.is_none()
+                        && let Some(focus) = this.row_focus.get(id_focus.as_str())
+                    {
+                        window.focus(focus);
+                    }
+                }),
+            )
+            .on_click(cx.listener(move |this, _event, _window, cx| {
+                // 编辑态里点自己不切项目(交互全让给输入框)
+                if this.editing.is_some() {
+                    return;
+                }
+                this.store
+                    .update(cx, |store, cx| store.set_active_project(&id_click, cx));
+            }))
+            // Esc 放弃重命名(见分组行上的同一条注释)
+            .when(is_editing, |el| {
+                el.on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+                    if event.keystroke.key == "escape" {
+                        cx.stop_propagation();
+                        this.cancel_rename(cx);
+                    }
+                }))
+            })
+            // 右键菜单(`ProjectList.tsx` 的 onContextMenu),开菜单前先
+            // 收掉悬停缩略图(原版第一句就是 `closePreview()`)
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.close_preview(cx);
+                    let entries = project_menu(
+                        &cx.entity(),
+                        &this.store,
+                        &row_for_menu,
+                        &tree_for_menu,
+                    );
+                    menu::show(event.position, entries, window, cx);
+                }),
+            )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn render_project(
         &self,
@@ -2210,45 +2589,21 @@ impl ProjectList {
     ) -> AnyElement {
         let Row {
             ref id,
-            ref name,
-            ref path,
             status,
             needs_attention,
             kind,
-            depth,
-            ref parent_group_id,
             is_child,
             ..
         } = row;
-        let (id, name, path) = (id.clone(), name.clone(), path.clone());
-        let indent = project_indent(depth, parent_group_id.is_some());
-        let is_source = dragging == Some(id.as_str());
-        let id_click = id.clone();
-        let id_remove = id.clone();
-        let id_move = id.clone();
-        let id_drop = id.clone();
-        let id_line = id.clone();
-        let id_hover = id.clone();
-        let name_drag = name.clone();
+        let name = row.name.clone();
         let description = row.description.clone();
         let ai_vendors = row.ai_vendors.clone();
         let worktree_branch = row.worktree_branch.clone();
         let remote = row.remote.clone();
-        let row_for_menu = row.clone();
-        let tree_for_menu: Vec<ProjectTreeItem> = tree.to_vec();
-        let this = cx.entity();
-        let editing = self
-            .editing
-            .as_ref()
-            .filter(|e| !e.is_group && e.id == id)
-            .map(|e| e.input.clone());
         // 行尾的 ✕ 只在**这一行**被悬停时出现(原版 `hidden group-hover:inline`)。
         // 走 view state 而不是 `group_hover` + 透明度:透明的按钮仍然吃点击,
         // 而这个按钮的动作是「移除项目」,看不见还能点中是实打实的事故。
         let hovered = self.hovered.as_deref() == Some(id.as_str());
-        let focus = self.row_focus.get(id.as_str()).cloned();
-        let id_key = id.clone();
-        let id_focus = id.clone();
         // 完成提示:非激活项目里有 AI 任务完成时画 DONE 标,否则才轮到状态灯;
         // **idle 且没有完成标时两个都不画**(原版 `ProjectList.tsx:912`)
         let show_done_tag = shows_done_tag(needs_attention, is_active);
@@ -2258,6 +2613,45 @@ impl ProjectList {
             .get(id.as_str())
             .map(|tr| tr.progress())
             .unwrap_or(1.0);
+        let editing = self
+            .editing
+            .as_ref()
+            .filter(|e| !e.is_group && e.id == *id)
+            .map(|e| e.input.clone());
+
+        let row_el = self
+            .project_row_shell(&row, is_active, dragging, tree, cx)
+            // 行首那道 accent 竖条(原版 `w-0.5 h-4 rounded-full`)。
+            // ⚠️ 原版只在选中时才渲染这个 span,于是选中的一瞬整行内容右移
+            // 10px;这里**恒占位**、未选中时透明,视觉一致但不抖。
+            .child(
+                div()
+                    .w(px(2.0))
+                    .h(px(16.0))
+                    .flex_shrink_0()
+                    .rounded_full()
+                    .bg(if is_active {
+                        ui::accent()
+                    } else {
+                        ui::with_alpha(ui::accent(), 0.0)
+                    }),
+            )
+            // 领位是**项目身份图标**,每行都有、缩进才对得齐
+            // (SSH 远程 > 技术栈 > 通用,原版同序)
+            .child(project_icon(kind, remote.clone()))
+            // AI 品牌堆叠:领位图标之后、名字之前,**只追加不覆盖**。
+            // 负边距抵掉行内 gap(6px),与领位图标只留 2px;图标之间同样 2px
+            .children((!ai_vendors.is_empty()).then(|| ai_vendor_icons(&ai_vendors)))
+            .child(self.project_row_label(editing.as_ref(), name, description))
+            // worktree 徽章:`⎇ 分支名`(U+2387 是**文本**,不是图标)
+            .children(worktree_branch.map(|branch| worktree_badge_chip(&row.id, branch)))
+            // 远程徽章:连接名(断链时「断链」两字 + error 配色)。
+            // 位置照原版 —— worktree 徽章之后、完成标/状态灯之前
+            .children(remote.map(|remote| remote_badge_chip(&row.id, remote)))
+            // 完成标 / 状态灯二选一,**idle 时两个都不画**
+            .children(row_status_mark(&row.id, show_done_tag, done_tag_in, status))
+            // 移除:弹确认框(不可逆,布局与展开目录一起没)。只在行悬停时出现
+            .children(hovered.then(|| self.project_remove_button(&row.id, cx)));
 
         div()
             .relative()
@@ -2279,326 +2673,11 @@ impl ProjectList {
                     .size_full(),
                 )
             })
-            .child(
-                div()
-                    .id(SharedString::from(format!("project-{id}")))
-                    .group(SharedString::from(format!("project-row-{id}")))
-                    // 行级焦点 + tab 停靠点(原版每行 `tabIndex={0}`)。
-                    // 整栏是一个 tab group,组内序号从 0 起,不与别处的 tab 序打架
-                    .when_some(focus, |el, focus| el.track_focus(&focus).tab_index(0))
-                    .on_key_down(cx.listener(move |this, event: &KeyDownEvent, window, cx| {
-                        this.on_project_key(event, &id_key, window, cx);
-                    }))
-                    .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .pl(px(indent))
-                    .pr(px(10.0))
-                    .py(px(6.0))
-                    .rounded(px(3.0))
-                    .cursor_pointer()
-                    .text_size(ui::font_px(13.0))
-                    .when(is_source, |el| el.opacity(0.4))
-                    .when(is_active, |el| {
-                        el.bg(ui::accent_subtle()).text_color(ui::accent())
-                    })
-                    .when(!is_active, |el| {
-                        el.text_color(ui::text_secondary())
-                            .hover(|el| el.bg(ui::border_subtle()).text_color(ui::text_primary()))
-                    })
-                    // 绝对路径挂 tooltip。原版是 `title={aiVendors.length>0 ? undefined
-                    // : project.path}` —— 有 AI 会话时路径改由缩略图卡头显示,
-                    // 原生 tooltip 会盖住那张卡。这里同款条件挂
-                    .when(ai_vendors.is_empty(), |el| {
-                        el.tooltip({
-                            let path = path.clone();
-                            move |window, cx| {
-                                mt_ui::tooltip::Tooltip::new(path.clone())
-                                    .build(window, cx)
-                            }
-                        })
-                    })
-                    // 悬停记到 view state 上 —— 行尾 ✕ 的显隐与缩略图计时都要它。
-                    // ⚠️ 离开分支必须先核对「离开的正是我们记着的那一行」:相邻
-                    // 行的 enter/leave 到达顺序不保证,直接清会把刚进来的那一行
-                    // 抹掉(鼠标沿列表纵扫时预览再也弹不出来)
-                    .on_hover(cx.listener(move |this, hovered: &bool, _window, cx| {
-                        let mine = this.hovered.as_deref() == Some(id_hover.as_str());
-                        if *hovered {
-                            if mine {
-                                return;
-                            }
-                            this.hovered = Some(id_hover.clone());
-                            this.schedule_preview(id_hover.clone(), cx);
-                        } else {
-                            if !mine {
-                                return;
-                            }
-                            this.hovered = None;
-                            // 移出即关(原版 onMouseLeave 的 closePreview)
-                            this.close_preview(cx);
-                        }
-                        cx.notify();
-                    }))
-                    .on_drag(
-                        DragProjectItem {
-                            id: id.clone(),
-                            is_group: false,
-                        },
-                        move |item, _offset, _window, cx| {
-                            let id = item.id.clone();
-                            this.update(cx, |this: &mut ProjectList, _cx| {
-                                this.dragging = Some(id);
-                            });
-                            dnd::preview(name_drag.clone(), PreviewIcon::Project(kind), cx)
-                        },
-                    )
-                    // worktree 子项目**不作为落点**(位置是从父项目派生的),
-                    // 但自身可以被拖走 = 脱离父项目 —— 所以只摘 drop 那半边
-                    .when(!is_child, |el| {
-                        let id_move = id_move.clone();
-                        let id_drop = id_drop.clone();
-                        el.on_drag_move(cx.listener(
-                            move |this, event: &DragMoveEvent<DragProjectItem>, _window, cx| {
-                                // 项目不是容器:allow_inside = false,只有 before/after
-                                this.on_row_drag_move(event, &id_move, false, cx);
-                            },
-                        ))
-                        .on_drop(cx.listener(move |this, item: &DragProjectItem, _window, cx| {
-                            this.on_row_drop(item, &id_drop, cx);
-                        }))
-                    })
-                    // 按下即收缩略图(原版 onMouseDown 的第一句),顺带把行焦点
-                    // 收过来 —— 浏览器点 `tabIndex=0` 的元素就会聚焦,原版的
-                    // 「点完项目按 Delete 能删」正是靠这一条
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, _event: &MouseDownEvent, window, cx| {
-                            this.close_preview(cx);
-                            if this.editing.is_none()
-                                && let Some(focus) = this.row_focus.get(id_focus.as_str())
-                            {
-                                window.focus(focus);
-                            }
-                        }),
-                    )
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        // 编辑态里点自己不切项目(交互全让给输入框)
-                        if this.editing.is_some() {
-                            return;
-                        }
-                        this.store
-                            .update(cx, |store, cx| store.set_active_project(&id_click, cx));
-                    }))
-                    // Esc 放弃重命名(见分组行上的同一条注释)
-                    .when(editing.is_some(), |el| {
-                        el.on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
-                            if event.keystroke.key == "escape" {
-                                cx.stop_propagation();
-                                this.cancel_rename(cx);
-                            }
-                        }))
-                    })
-                    // 右键菜单(`ProjectList.tsx` 的 onContextMenu),开菜单前先
-                    // 收掉悬停缩略图(原版第一句就是 `closePreview()`)
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                            cx.stop_propagation();
-                            this.close_preview(cx);
-                            let entries = project_menu(
-                                &cx.entity(),
-                                &this.store,
-                                &row_for_menu,
-                                &tree_for_menu,
-                            );
-                            menu::show(event.position, entries, window, cx);
-                        }),
-                    )
-                    // 行首那道 accent 竖条(原版 `w-0.5 h-4 rounded-full`)。
-                    // ⚠️ 原版只在选中时才渲染这个 span,于是选中的一瞬整行内容右移
-                    // 10px;这里**恒占位**、未选中时透明,视觉一致但不抖。
-                    .child(
-                        div()
-                            .w(px(2.0))
-                            .h(px(16.0))
-                            .flex_shrink_0()
-                            .rounded_full()
-                            .bg(if is_active {
-                                ui::accent()
-                            } else {
-                                ui::with_alpha(ui::accent(), 0.0)
-                            }),
-                    )
-                    // 领位是**项目身份图标**,每行都有、缩进才对得齐
-                    // (SSH 远程 > 技术栈 > 通用,原版同序)
-                    .child(project_icon(kind, remote.clone()))
-                    // AI 品牌堆叠:领位图标之后、名字之前,**只追加不覆盖**。
-                    // 负边距抵掉行内 gap(6px),与领位图标只留 2px;图标之间同样 2px
-                    .when(!ai_vendors.is_empty(), |el| {
-                        let mut stack = div()
-                            .flex()
-                            .items_center()
-                            .flex_shrink_0()
-                            .ml(px(-4.0))
-                            .gap(px(2.0));
-                        for vendor in &ai_vendors {
-                            stack = stack.child(
-                                BrandIcon::new(*vendor)
-                                    .size(px(AI_ICON_SIZE))
-                                    // 固定 text-secondary 上下文:单色品牌图标不随
-                                    // 选中行的 accent 变色(与 tab 上观感一致)
-                                    .color(ui::text_secondary()),
-                            );
-                        }
-                        el.child(stack)
-                    })
-                    .map(|el| match &editing {
-                        Some(input) => el.child(self.rename_input(input, 13.0)),
-                        None => el.child(
-                            div()
-                                .flex_1()
-                                .overflow_hidden()
-                                .flex()
-                                .items_center()
-                                .gap(px(6.0))
-                                // 原版**没有**副行显示路径:路径只在 title / 预览卡头里出现
-                                .child(div().truncate().child(name))
-                                .when_some(description, |el, desc| {
-                                    el.child(
-                                        div()
-                                            .truncate()
-                                            .text_size(ui::font_px(9.75))
-                                            .text_color(ui::text_muted())
-                                            .child(desc),
-                                    )
-                                }),
-                        ),
-                    })
-                    // worktree 徽章:`⎇ 分支名`(U+2387 是**文本**,不是图标)
-                    .when_some(worktree_branch, |el, branch| {
-                        el.child(
-                            div()
-                                .id(SharedString::from(format!("worktree-{id}")))
-                                .flex_shrink_0()
-                                .max_w(px(WORKTREE_BADGE_MAX_W))
-                                .truncate()
-                                .px(px(3.0))
-                                .rounded(px(3.0))
-                                .text_size(ui::font_px(9.75))
-                                .text_color(ui::text_muted())
-                                .bg(ui::border_subtle())
-                                .tooltip({
-                                    let branch = branch.clone();
-                                    move |window, cx| {
-                                        mt_ui::tooltip::Tooltip::new(tr!(
-                                            "projectList",
-                                            "worktreeBadgeTitle",
-                                            branch = branch.clone()
-                                        ))
-                                        .build(window, cx)
-                                    }
-                                })
-                                .child(format!("⎇ {branch}")),
-                        )
-                    })
-                    // 远程徽章:连接名(断链时「断链」两字 + error 配色)。
-                    // 位置照原版 —— worktree 徽章之后、完成标/状态灯之前
-                    .when_some(remote, |el, remote| {
-                        let (fg, bg) = if remote.broken {
-                            (ui::color_error(), ui::with_alpha(ui::color_error(), 0.15))
-                        } else {
-                            (ui::text_muted(), ui::border_subtle())
-                        };
-                        let tip: SharedString = if remote.broken {
-                            t("projectList", "remoteBrokenTitle").into()
-                        } else {
-                            tr!(
-                                "projectList",
-                                "remoteBadgeTitle",
-                                summary = remote.summary.clone()
-                            )
-                            .into()
-                        };
-                        el.child(
-                            div()
-                                .id(SharedString::from(format!("remote-badge-{id}")))
-                                .flex_shrink_0()
-                                .max_w(px(REMOTE_BADGE_MAX_W))
-                                .truncate()
-                                .px(px(3.0))
-                                .rounded(px(3.0))
-                                .font_family("monospace")
-                                .text_size(ui::font_px(9.75))
-                                .text_color(fg)
-                                .bg(bg)
-                                .tooltip(move |window, cx| {
-                                    mt_ui::tooltip::Tooltip::new(tip.clone())
-                                        .build(window, cx)
-                                })
-                                .child(if remote.broken {
-                                    SharedString::from(t("projectList", "remoteBrokenBadge"))
-                                } else {
-                                    SharedString::from(remote.name.clone())
-                                }),
-                        )
-                    })
-                    // 完成标 / 状态灯二选一,**idle 时两个都不画**
-                    .map(|el| {
-                        if show_done_tag {
-                            el.child(done_tag(done_tag_in))
-                        } else if status != PaneStatus::Idle {
-                            // 状态灯的动画 id 拿项目 id 拼:跨帧稳定、逐行唯一
-                            el.child(ui::status_dot(
-                                SharedString::from(format!("status-project-{id}")),
-                                status,
-                            ))
-                        } else {
-                            el
-                        }
-                    })
-                    // 移除:弹确认框(不可逆,布局与展开目录一起没)。只在行悬停时出现
-                    .when(hovered, |el| {
-                        el.child(
-                            div()
-                                .id(SharedString::from(format!("project-remove-{id}")))
-                                .w(px(16.0))
-                                .h(px(16.0))
-                                .flex_shrink_0()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded(px(3.0))
-                                .text_size(ui::font_px(11.4))
-                                .text_color(ui::text_muted())
-                                .hover(|el| el.text_color(ui::color_error()).bg(ui::bg_overlay()))
-                                .on_click(cx.listener(move |this, _event, window, cx| {
-                                    cx.stop_propagation();
-                                    let Some((name, path)) = this
-                                        .store
-                                        .read(cx)
-                                        .project(&id_remove)
-                                        .map(|p| (p.name.clone(), p.path.clone()))
-                                    else {
-                                        return;
-                                    };
-                                    modal::open_confirm_remove_project(
-                                        this.store.clone(),
-                                        id_remove.clone(),
-                                        name,
-                                        path,
-                                        window,
-                                        cx,
-                                    );
-                                }))
-                                .child("✕"),
-                        )
-                    }),
-            )
+            .child(row_el)
             // 子项目不是落点,指示线自然也不该出现在它上下
             .when(!is_child, |el| {
-                el.children(self.drop_line(&id_line, DropPosition::Before, drag_active))
-                    .children(self.drop_line(&id_line, DropPosition::After, drag_active))
+                el.children(self.drop_line(&row.id, DropPosition::Before, drag_active))
+                    .children(self.drop_line(&row.id, DropPosition::After, drag_active))
             })
             .into_any_element()
     }
