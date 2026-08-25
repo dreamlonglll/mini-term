@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.0.9--beta-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.1.0-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -162,7 +162,7 @@ VS Code 风格的 **Changes 面板**（Staged / Changes / Untracked 分组，单
 | Git / 文件 | git2（libgit2）· notify + ignore |
 | 用量统计 | rusqlite 本地账本 · 自绘趋势图 |
 | 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`） |
-| 测试 | **1540 个 Rust 测试**（28 个测试目标） |
+| 测试 | **1541 个 Rust 测试**（28 个测试目标） |
 
 ---
 
@@ -172,9 +172,9 @@ VS Code 风格的 **Changes 面板**（Staged / Changes / Untracked 分组，单
 
 前往 [Releases](https://github.com/dreamlonglll/mini-term/releases) 下载，三平台产物：
 
-- **Windows x64（主要支持平台）** — `mini-term-gpui-*-windows-x64-setup.exe` 安装包（NSIS，用户级安装免管理员；装过旧版的默认原目录升级，且**先卸载旧版再装**而不是文件覆盖写）
-- **macOS arm64** — `mini-term-gpui-*-macos-arm64.dmg`
-- **Linux x64** — `mini-term-gpui-*-linux-amd64.deb` 或 `mini-term-gpui-*-linux-x64.tar.gz`
+- **Windows x64（主要支持平台）** — `Mini-Term_*_x64-setup.exe` 安装包（NSIS，用户级安装免管理员；装过旧版的默认原目录升级，且**先卸载旧版再装**而不是文件覆盖写）
+- **macOS arm64** — `Mini-Term_*_aarch64.dmg`
+- **Linux x64** — `Mini-Term_*_amd64.deb` 或 `Mini-Term_*_amd64.tar.gz`
 
 > **平台支持**
 > - **Windows** — 主要支持平台，保证可用性，日常开发与测试都在 Windows 上

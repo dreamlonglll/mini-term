@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.0.9--beta-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.1.0-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -162,7 +162,7 @@ The whole application is **native Rust** (the earlier Tauri + React build was re
 | Git / files | git2 (libgit2) · notify + ignore |
 | Usage stats | rusqlite local ledger · hand-drawn trend charts |
 | Mobile relay | axum + tokio WebSocket (`relay-server/`) · React + Vite PWA (`mobile/`) |
-| Tests | **1,540 Rust tests** (28 test targets) |
+| Tests | **1,541 Rust tests** (28 test targets) |
 
 ---
 
@@ -172,9 +172,9 @@ The whole application is **native Rust** (the earlier Tauri + React build was re
 
 Grab the latest build from [Releases](https://github.com/dreamlonglll/mini-term/releases) — three platforms:
 
-- **Windows x64 (primary platform)** — `mini-term-gpui-*-windows-x64-setup.exe` installer (NSIS, per-user install without admin rights; upgrades in the same directory, and **uninstalls the old build first** instead of overwriting files)
-- **macOS arm64** — `mini-term-gpui-*-macos-arm64.dmg`
-- **Linux x64** — `mini-term-gpui-*-linux-amd64.deb` or `mini-term-gpui-*-linux-x64.tar.gz`
+- **Windows x64 (primary platform)** — `Mini-Term_*_x64-setup.exe` installer (NSIS, per-user install without admin rights; upgrades in the same directory, and **uninstalls the old build first** instead of overwriting files)
+- **macOS arm64** — `Mini-Term_*_aarch64.dmg`
+- **Linux x64** — `Mini-Term_*_amd64.deb` or `Mini-Term_*_amd64.tar.gz`
 
 > **Platform support**
 > - **Windows** — the primary platform with guaranteed usability; all daily development and testing happens here

@@ -15,6 +15,9 @@ name: Build & Release
 #   该目录收集 —— 目录布局即最终包布局
 # - release 壳由 create-release 先建好(prerelease 按 tag 含 `-` 自动标),
 #   三平台只向其上传产物,避免并行抢建 release
+# - 资产名沿用旧正式版(Tauri v2 bundler)的形态:`Mini-Term_<版本>_<arch>…`,
+#   **不带 v 前缀、不带 gpui 字样**。渲染层从 WebView 换成 GPUI 是内部实现,
+#   用户是按文件名认包的(v1.0.x-beta 那一串 `mini-term-gpui-*` 是迁移期的临时名)
 # ⚠️ macOS / Linux 是「代码支持,可用性欠佳」档,构建线未经真机验证;
 #   fail-fast: false 保证它们失败不拖累 Windows 产物
 
@@ -129,7 +132,9 @@ jobs:
           New-Item -ItemType Directory -Force dist | Out-Null
           $src = (Resolve-Path 'target/release').Path
           $ico = (Resolve-Path 'crates/mt-app/resources/icon.ico').Path
-          $out = Join-Path (Resolve-Path 'dist').Path "mini-term-gpui-$tag-windows-x64-setup.exe"
+          # 资产名沿用旧正式版(Tauri v2 bundler)那一套:`Mini-Term_<版本>_<arch>…`,
+          # 不带 v 前缀、不带 gpui 字样 —— 用户按名字认包,渲染层换了不该改名
+          $out = Join-Path (Resolve-Path 'dist').Path "Mini-Term_${version}_x64-setup.exe"
           # makensis 定位:**三级兜底,每一级之后都重新解析路径**。
           #
           # 此前这里写死 'C:\Program Files (x86)\NSIS\makensis.exe' + choco 兜底,
@@ -216,7 +221,7 @@ jobs:
           </plist>
           PLIST
           hdiutil create -volname "Mini-Term" -srcfolder "$APP" -ov -format UDZO \
-            "dist/mini-term-gpui-${TAG}-macos-arm64.dmg"
+            "dist/Mini-Term_${VERSION}_aarch64.dmg"
           ls -la dist
 
       - name: Assemble deb + tar.gz (Linux)
@@ -233,7 +238,9 @@ jobs:
           for name in mini-term miniterm-hook mt-ssh-cli mt-ssh-mcp; do
             cp "target/release/$name" "$STAGE/"
           done
-          tar -C dist -czf "dist/mini-term-gpui-${TAG}-linux-x64.tar.gz" mini-term
+          # ⚠️ 打包目录仍叫 `mini-term`(解压出来就是可执行文件名),只有**资产名**
+          # 用 `Mini-Term_…` —— Linux 大小写敏感,上传的 glob 抓不到这个暂存目录
+          tar -C dist -czf "dist/Mini-Term_${VERSION}_amd64.tar.gz" mini-term
           # sidecar 按「与 exe 同目录」定位 → 全家落 /usr/lib/mini-term,
           # /usr/bin 放符号链接(Linux 的 current_exe 走 /proc/self/exe,天然解链接)
           PKG="dist/deb/mini-term_${DEB_VERSION}_amd64"
@@ -262,8 +269,10 @@ jobs:
           Description: Desktop terminal manager for the AI era
            Multi-project tabs, recursive split panes, AI process awareness.
           CONTROL
+          # deb 的文件名用 DEB_VERSION(`-` 已换成 `~`),与包内 Version 字段一致；
+          # 正式版两者本来就相同(1.1.0),预发布才看得出差别(1.1.0~beta)
           dpkg-deb --build --root-owner-group "$PKG" \
-            "dist/mini-term-gpui-${TAG}-linux-amd64.deb"
+            "dist/Mini-Term_${DEB_VERSION}_amd64.deb"
           ls -la dist
 
       - name: Upload bundles to release
@@ -271,7 +280,7 @@ jobs:
         with:
           prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
-            dist/mini-term-gpui-*-setup.exe
-            dist/mini-term-gpui-*.dmg
-            dist/mini-term-gpui-*.tar.gz
-            dist/mini-term-gpui-*.deb
+            dist/Mini-Term_*-setup.exe
+            dist/Mini-Term_*.dmg
+            dist/Mini-Term_*.tar.gz
+            dist/Mini-Term_*.deb

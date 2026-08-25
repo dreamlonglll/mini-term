@@ -193,7 +193,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 | Git / 文件 | git2（libgit2）· notify + ignore |
 | 用量统计 | rusqlite 本地账本 · 自绘趋势图 |
 | 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`） |
-| 测试 | **1528 个 Rust 测试**（27 个测试目标）+ 中转服务端协议边界测试 |
+| 测试 | **1541 个 Rust 测试**（28 个测试目标）+ 中转服务端协议边界测试 |
 
 ## 快速开始
 
@@ -201,9 +201,9 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 
 前往 [Releases](https://github.com/dreamlonglll/mini-term/releases) 下载，三平台产物：
 
-- **Windows x64（主要支持平台）** — `mini-term-gpui-*-windows-x64-setup.exe` 安装包（NSIS，用户级安装免管理员，装过旧版的默认原目录原地升级）
-- **macOS arm64** — `mini-term-gpui-*-macos-arm64.dmg`
-- **Linux x64** — `mini-term-gpui-*-linux-amd64.deb` 或 `mini-term-gpui-*-linux-x64.tar.gz`
+- **Windows x64（主要支持平台）** — `Mini-Term_*_x64-setup.exe` 安装包（NSIS，用户级安装免管理员，装过旧版的默认原目录原地升级）
+- **macOS arm64** — `Mini-Term_*_aarch64.dmg`
+- **Linux x64** — `Mini-Term_*_amd64.deb` 或 `Mini-Term_*_amd64.tar.gz`
 
 > **平台支持说明**
 > - **Windows** — 主要支持平台，保证可用性，日常开发与测试均在 Windows 上进行
@@ -333,7 +333,7 @@ Root（gpui-component 根，承载 Dialog / 通知层）
 提交代码前请运行：
 
 ```bash
-# 全工作区 Rust 测试（27 个测试目标、1528 例）
+# 全工作区 Rust 测试（28 个测试目标、1541 例）
 cargo test --workspace
 
 # Node 侧测试（仅 2 个文件：ConPTY 打包 / vendored-openssl 守卫）

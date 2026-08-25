@@ -193,7 +193,7 @@ The whole application is **native Rust** (the earlier Tauri + React build was re
 | Git / files | git2 (libgit2) · notify + ignore |
 | Usage stats | rusqlite local ledger · hand-drawn trend charts |
 | Mobile relay | axum + tokio WebSocket (`relay-server/`) · React + Vite PWA (`mobile/`) |
-| Tests | **1,528 Rust tests** (27 test targets) + relay-server protocol boundary tests |
+| Tests | **1,541 Rust tests** (28 test targets) + relay-server protocol boundary tests |
 
 ## Getting Started
 
@@ -201,9 +201,9 @@ The whole application is **native Rust** (the earlier Tauri + React build was re
 
 Head to [Releases](https://github.com/dreamlonglll/mini-term/releases) to download — three platforms:
 
-- **Windows x64 (primary supported platform)** — `mini-term-gpui-*-windows-x64-setup.exe` installer (NSIS, per-user install without admin rights; upgrades in place if an older version is installed)
-- **macOS arm64** — `mini-term-gpui-*-macos-arm64.dmg`
-- **Linux x64** — `mini-term-gpui-*-linux-amd64.deb` or `mini-term-gpui-*-linux-x64.tar.gz`
+- **Windows x64 (primary supported platform)** — `Mini-Term_*_x64-setup.exe` installer (NSIS, per-user install without admin rights; upgrades in place if an older version is installed)
+- **macOS arm64** — `Mini-Term_*_aarch64.dmg`
+- **Linux x64** — `Mini-Term_*_amd64.deb` or `Mini-Term_*_amd64.tar.gz`
 
 > **Platform support note**
 > - **Windows** — The primary supported platform with guaranteed usability; daily development and testing all happen on Windows.
@@ -333,7 +333,7 @@ Issues and PRs are welcome. External contributions are merged after functional v
 Before submitting, please run:
 
 ```bash
-# Workspace-wide Rust tests (27 test targets, 1,528 cases)
+# Workspace-wide Rust tests (28 test targets, 1,541 cases)
 cargo test --workspace
 
 # Node-side tests (just 2 files: ConPTY bundling / vendored-openssl guard)
