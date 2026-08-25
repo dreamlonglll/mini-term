@@ -28,7 +28,6 @@ tokio-tungstenite = { version = "0.27", features = ["rustls-tls-native-roots"] }
 # 运行时需 install ring provider。
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 futures-util = "0.3"
-sha2 = "0.11.0"
 # manager 内那批小状态表被 GPUI 主线程与 tokio 任务共同持有。std::sync::Mutex 一旦
 # 有任一持锁者 panic 就整把锁中毒,下一个 .lock().unwrap() 把主线程也带走;
 # parking_lot 无中毒概念(与 mt-app/mt-pty/mt-terminal 同款)。

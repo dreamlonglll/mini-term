@@ -20,7 +20,7 @@
 //! # 阻塞调用
 //!
 //! `get_changes_status` / `git_stage_all` / `git_unstage_all` / `git_discard_file`
-//! 是 git2 的同步 IO,`git_commit` 更是**无超时**的 git CLI —— 全部丢
+//! 是 git2 的同步 IO,`git_commit` 是带 60s 超时的 git CLI —— 全部丢
 //! `cx.background_executor()`(范式照 `file_tree.rs:138-156`)。
 
 use std::collections::HashSet;
@@ -413,8 +413,8 @@ impl GitChanges {
         let repo = std::path::PathBuf::from(&self.repo_path);
         let input = self.commit_input.clone();
         cx.spawn_in(window, async move |this, cx| {
-            // git_commit 走 git CLI 且**无超时**(git.rs:1191)——
-            // 主线程上跑一次 pre-commit hook 慢的仓库就是永久卡死
+            // git_commit 走 git CLI(60s 超时兜底 GPG/pre-commit hook 挂起)——
+            // 即便如此也不上主线程跑,hook 慢的仓库会把 UI 卡满整个超时窗口
             let result = cx
                 .background_executor()
                 .spawn(async move { mt_project::git::git_commit(&repo, &message) })

@@ -66,3 +66,17 @@ windows-sys = { version = "0.52", features = [
     "Win32_System_Threading",
 ] }
 
+# 发布构建。与根 Cargo.toml 同款三项，这里的体积收益更实在：
+# miniterm-hook **每次 hook 事件都要冷启动一次**，二进制小一圈就是每次事件都省一点
+# 加载与页面调入；三个 sidecar 还要随安装包平铺到 exe 同目录，体积直接进装机包。
+#
+# ⚠️ 同样**不加 `panic = "abort"`**：mt-ssh-cli 的 daemon 靠 unwind 把单个连接的
+# panic 收敛成一次失败响应，abort 会让一条坏连接带走整个常驻 daemon。
+[profile.release]
+# thin LTO：跨 crate 内联收益的大头，链接时间可控。
+lto = "thin"
+# 单个 codegen unit：让 LLVM 看到整个 crate 再优化（sidecar 构建本身很快，不心疼）。
+codegen-units = 1
+# 剥符号表：三个 sidecar 都进装机包，能小则小。
+strip = "symbols"
+

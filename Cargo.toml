@@ -65,6 +65,24 @@ chrono = "0.4"
 # 只要 QrCode 的位矩阵，渲染由 mt-app 自绘(静区 1 模块 / EC level M)。
 qrcode = { version = "0.14", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "io-util", "macros"] }
+# 跨线程 join_all / oneshot 等组合子(mt-app 的 PTY 唤醒信号、mt-ssh 的池 shutdown)。
+# gpui 自己就依赖 futures 0.3,提到工作区只是去重声明,不会多拉一棵依赖树。
+futures = "0.3"
+# 主题包 manifest 的 sha256 校验(mt-config)。
+sha2 = "0.11.0"
+# SQLite:config.db(mt-config)/ layout.db(mt-layout)/ usage.db(mt-usage) 三家共用。
+#
+# ⚠️ **版本必须三家一致**:同一棵依赖树里出现两个 rusqlite 会连带两份
+# libsqlite3-sys,构建直接失败 —— 提到工作区正是为了让这条约束由 Cargo 兜住,
+# 而不是靠三份注释互相提醒。
+#
+# features 只放三家的公约数 `bundled`;mt-config 另需的 `backup` 由它自己
+# `features = ["backup"]` 追加(features 可加不可减)。
+#
+# ⚠️ 这一行**不影响三个 sidecar 二进制**:它们只依赖 mt-core / mt-ssh
+# (见 sidecars/Cargo.toml),不依赖上面三个 crate。红线只有「绝不让 mt-core
+# 依赖任何带 rusqlite 的 crate」。
+rusqlite = { version = "0.40.1", features = ["bundled"] }
 
 # ---------------------------------------------------------------------------
 # 工作区内部
@@ -99,3 +117,19 @@ mt-usage = { path = "crates/mt-usage" }
 # dev 下依赖走 opt-level 1，自己的 crate 保持 0 以留调试信息。
 [profile.dev.package."*"]
 opt-level = 1
+
+# 发布构建。只调这三项,都是「体积/运行时换构建时间」的保守档位。
+#
+# ⚠️ **不要加 `panic = "abort"`**:进程内多处依赖 unwind 语义 —— PTY reader 线程、
+# hook server、后台执行器上的任务 panic 后由 join handle 收敛成错误,单个 pane 挂掉
+# 不该带走整个应用;abort 会把这些全变成进程级崩溃。
+[profile.release]
+# thin LTO:跨 crate 内联的收益拿到八成左右,链接时间与内存占用远低于 `fat`
+# (GPUI + wgpu/blade 那棵依赖树用 fat 在 CI 上很容易顶到内存上限)。
+lto = "thin"
+# 单个 codegen unit:让 LLVM 看到整个 crate 再优化。代价是丢掉 codegen 并行,
+# release 构建变慢 —— 但 release 只在发版/CI 跑,不吃开发迭代的时间。
+codegen-units = 1
+# 剥符号表:装机包小一圈,且发布产物不需要本地符号(崩溃分析靠日志与复现步骤)。
+# 用 `symbols` 而非 `debuginfo` —— 后者只去调试信息,符号表还留着。
+strip = "symbols"

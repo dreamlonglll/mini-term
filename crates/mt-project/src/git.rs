@@ -1094,6 +1094,21 @@ fn run_git_command(
     timeout: Duration,
     timeout_hint: &str,
 ) -> Result<String> {
+    let op = args.join(" ");
+    run_git_command_labeled(repo_path, args, &op, timeout, timeout_hint)
+}
+
+/// 同 `run_git_command`,但错误信息里的操作名由 `op_label` 指定而非拼 `args`。
+///
+/// 给 `git commit -m <message>` 这类**参数里带用户文本**的调用用:直接 join 会把
+/// 整条提交信息(可能几十行)灌进「启动失败 / 超时」的错误里。
+fn run_git_command_labeled(
+    repo_path: &Path,
+    args: &[&str],
+    op_label: &str,
+    timeout: Duration,
+    timeout_hint: &str,
+) -> Result<String> {
     if !repo_path.is_dir() {
         bail!("不是有效目录:{}", repo_path.display());
     }
@@ -1102,7 +1117,7 @@ fn run_git_command(
         bail!("不是 git 仓库(缺少 .git):{}", repo_path.display());
     }
 
-    let op = args.join(" ");
+    let op = op_label.to_string();
     let (tx, rx) = std::sync::mpsc::channel();
     let repo_path_owned = repo_path.to_path_buf();
     let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
@@ -1240,29 +1255,19 @@ pub fn git_unstage_all(repo_path: &Path) -> Result<()> {
 }
 
 /// 走 git CLI 而非 git2:提交要继承用户的 hooks / gpg 签名 / user.name 配置。
-/// **无超时**(与原实现一致,留档见 `project_security_audit`)。
+///
+/// **阻塞最多 60s**,必须在后台线程上调用。取值取 pull/push(30s)与 worktree add
+/// (120s)的中段:提交本身是本地操作、毫秒级,但会同步跑 pre-commit hook(格式化 /
+/// lint / 测试),30s 对大仓库的 hook 偏紧;真卡死的形态是 hook 死循环或 gpg 等口令
+/// 输入(stdin 已置 null,不会永久挂起但仍可能拖很久),给 60s 兜底足够。
 pub fn git_commit(repo_path: &Path, message: &str) -> Result<String> {
-    if !repo_path.is_dir() {
-        bail!("不是有效目录:{}", repo_path.display());
-    }
-    if !repo_path.join(".git").exists() {
-        bail!("不是 git 仓库(缺少 .git):{}", repo_path.display());
-    }
-
-    let mut cmd = std::process::Command::new("git");
-    cmd.args(["commit", "-m", message])
-        .current_dir(repo_path)
-        .stdin(std::process::Stdio::null());
-    hide_console_window(&mut cmd);
-    let output = cmd
-        .output()
-        .map_err(|e| anyhow!("启动 git commit 失败:{}", e))?;
-
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
-    } else {
-        bail!("{}", String::from_utf8_lossy(&output.stderr));
-    }
+    run_git_command_labeled(
+        repo_path,
+        &["commit", "-m", message],
+        "commit",
+        Duration::from_secs(60),
+        ",可能卡在 pre-commit hook 或 gpg 签名上",
+    )
 }
 
 pub fn git_discard_file(repo_path: &Path, files: &[String]) -> Result<()> {
@@ -1661,5 +1666,24 @@ mod tests {
             .to_string();
         assert!(err.contains("不是 git 仓库"), "实际错误: {err}");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// git_commit 改走 run_git_command 后,那两道目录/仓库前置校验必须还在
+    /// (不能因为换了执行路径就变成「先 spawn 再说」)。
+    #[test]
+    fn git_commit_keeps_repo_guards() {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("mini-term-git-commit-guard-{ts}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = git_commit(&dir, "msg").unwrap_err().to_string();
+        assert!(err.contains("不是 git 仓库"), "实际错误: {err}");
+        std::fs::remove_dir_all(&dir).ok();
+
+        let missing = std::env::temp_dir().join(format!("mini-term-git-commit-absent-{ts}"));
+        let err = git_commit(&missing, "msg").unwrap_err().to_string();
+        assert!(err.contains("不是有效目录"), "实际错误: {err}");
     }
 }

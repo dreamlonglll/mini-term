@@ -14,18 +14,13 @@ dirs.workspace = true
 # 本 crate 改为再导出/引用。方向选 mt-config → mt-core 的论证见
 # config.rs 中 `SshConnection` 的文档注释(反向会把 zip/sha2 拖进 sidecar 小二进制)。
 mt-core.workspace = true
-# 主题包导入:zip 解包 + manifest.json 的 sha256 校验。
-# 版本与 src-tauri/Cargo.toml 保持一致,避免同一功能在两套构建里行为漂开。
-sha2 = "0.11.0"
+# 主题包导入:zip 解包 + manifest.json 的 sha256 校验。版本收在工作区(与 mt-relay 共用)。
+sha2.workspace = true
 zip = "8.6.0"
 # `config.db`:AppConfig 的持久化归属方(见 src/db.rs 的模块注释)。
 #
-# 版本与 mt-usage / mt-layout 对齐 —— 同一棵依赖树里出现两个 rusqlite 会连带两份
-# libsqlite3-sys,构建直接失败。`backup` feature 供每启动一代的库备份:WAL 模式下
-# 直接 copy 主库文件会漏掉还没 checkpoint 的那部分。
-#
-# ⚠️ 这一行**不影响三个 sidecar 二进制**:它们只依赖 mt-core / mt-ssh
-# (见 sidecars/Cargo.toml),不依赖本 crate。真正的红线只有「绝不让 mt-core
-# 依赖任何带 rusqlite 的 crate」——那才会把 SQLite 静态塞进每次事件都冷启动的
-# hook 小程序里。
-rusqlite = { version = "0.40.1", features = ["bundled", "backup"] }
+# 版本(与 mt-usage / mt-layout 对齐的那条约束)在工作区统一声明,这里只**追加**
+# 本 crate 独需的 `backup` feature —— features 是可加的,工作区给的 `bundled` 仍在。
+# `backup` 供每启动一代的库备份:WAL 模式下直接 copy 主库文件会漏掉还没
+# checkpoint 的那部分。
+rusqlite = { workspace = true, features = ["backup"] }

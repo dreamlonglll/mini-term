@@ -63,8 +63,8 @@ anyhow.workspace = true
 # 活 pane 列表要在 GPUI 主线程与 mt-ai 的 500ms 轮询线程之间共享。
 parking_lot.workspace = true
 # PTY reader 线程 → 主线程的唤醒信号(gpui 的 AsyncApp 是 Rc,不能跨线程)。
-# gpui 自己也依赖 futures 0.3,不会多拉一棵依赖树。
-futures = "0.3"
+# gpui 自己也依赖 futures 0.3,不会多拉一棵依赖树。版本收在工作区(与 mt-ssh 共用)。
+futures.workspace = true
 # 会话列表的相对时间、用量面板的本地日历日窗口。
 chrono.workspace = true
 # 移动端配对二维码(工作区里已 default-features=false，只要位矩阵)。

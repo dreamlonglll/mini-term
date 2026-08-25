@@ -217,16 +217,226 @@ pub fn cap_output(s: &str, cap: usize) -> (String, bool) {
 // 审计日志
 // ---------------------------------------------------------------------------
 
+/// 脱敏掩码。凭据被替换成这三个字符。
+const MASK: &str = "***";
+
+/// 已知会用 `-p<密码>` **紧贴**写法的客户端(mysql 家族)。
+///
+/// 只在命令里出现它们时才认这种形态 —— 见 `redact_command` 的取舍说明。
+/// 按 basename 比对(去掉目录与 `.exe`),`sudo mysql -pX` / `/usr/bin/mysql -pX` /
+/// `docker exec db mysql -pX` 都能命中。
+const GLUED_PASSWORD_CLIENTS: &[&str] = &[
+    "mysql",
+    "mysqladmin",
+    "mysqldump",
+    "mysqlshow",
+    "mysqlimport",
+    "mariadb",
+    "mariadb-admin",
+    "mariadb-dump",
+    "mariadb-show",
+    "mariadb-import",
+];
+
+/// 审计日志脱敏:把命令行里**明确是凭据**的片段换成 `***`。
+///
+/// 审计日志记的是命令原文,`mysql -pSecret` / `curl -u user:pass` /
+/// `https://user:pass@host` 这类写法会把明文凭据落进磁盘上的
+/// `ssh-mcp-audit.log`(且该文件与 `config.json` 同目录、长期留存)。
+///
+/// 覆盖的四种形态:
+///
+/// | 形态 | 处理 |
+/// |------|------|
+/// | `-p<值>` 紧贴(mysql 风格) | → `-p***`,**且仅当命令里出现 mysql 家族客户端** |
+/// | `--password=<值>` / `--password <值>` | 值整段 → `***` |
+/// | `-u` / `--user` 的 `用户:密码` | 只掩冒号后半段 → `用户:***` |
+/// | URL 的 `scheme://用户:密码@主机` | 只掩密码段 → `scheme://用户:***@主机` |
+///
+/// **宁漏勿误伤**:审计日志的可用性优先,拿不准的形态一律不动 ——
+/// 独立的 `-p 3306`(端口)、`ssh://user@host`(无密码段)、`http://h:8080/x`
+/// (那个冒号是端口)全部原样保留;不认识的自定义凭据开关(`--token=` 等)也不动。
+///
+/// 紧贴 `-p` 之所以要挂 mysql 家族这道闸:`tar -pxvf` / `cp -pr` / `mkdir -pv` /
+/// `docker run -p8080:80` / `ssh -p2222` 都是同一种「`-p` 后紧贴非空」的形态,
+/// 无差别掩会把审计日志掩成废纸,那比漏掩一条 `sudo -u x mysql5 -pX` 更糟。
+///
+/// 纯函数,不碰 IO —— 便于单测穷举形态。
+pub fn redact_command(command: &str) -> String {
+    let segments = split_keep_whitespace(command);
+    let allow_glued_p = segments.iter().any(|s| is_glued_password_client(s));
+
+    // 上一个非空白 token 若是「独立开关」,当前 token 就是它的值。
+    enum Pending {
+        Password,
+        User,
+    }
+    let mut pending: Option<Pending> = None;
+    let mut out = String::with_capacity(command.len());
+
+    for seg in segments {
+        // 空白段原样回填(审计行要尽量贴近用户实际敲下的那行)
+        if seg
+            .as_bytes()
+            .first()
+            .map(|b| b.is_ascii_whitespace())
+            .unwrap_or(false)
+        {
+            out.push_str(seg);
+            continue;
+        }
+        match pending.take() {
+            Some(Pending::Password) => {
+                out.push_str(MASK);
+                continue;
+            }
+            Some(Pending::User) => {
+                // 无冒号说明只是个用户名,不是凭据 —— 原样保留
+                out.push_str(&mask_user_value(seg));
+                continue;
+            }
+            None => {}
+        }
+        if seg == "--password" {
+            pending = Some(Pending::Password);
+            out.push_str(seg);
+            continue;
+        }
+        if seg == "-u" || seg == "--user" {
+            pending = Some(Pending::User);
+            out.push_str(seg);
+            continue;
+        }
+        out.push_str(&redact_token(seg, allow_glued_p));
+    }
+    out
+}
+
+/// 把字符串切成「空白段 / 非空白段」交替的切片序列,拼回去与原文逐字节相同。
+///
+/// 不用 `split_whitespace`:那会把连续空格、制表压成一个,审计行就不是原文了。
+/// 按字节判空白是安全的 —— ASCII 空白绝不会出现在 UTF-8 多字节序列内部,
+/// 切点必然落在字符边界上。
+fn split_keep_whitespace(s: &str) -> Vec<&str> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let is_ws = bytes[i].is_ascii_whitespace();
+        let mut j = i + 1;
+        while j < bytes.len() && bytes[j].is_ascii_whitespace() == is_ws {
+            j += 1;
+        }
+        out.push(&s[i..j]);
+        i = j;
+    }
+    out
+}
+
+/// token 是否是 mysql 家族客户端(去目录、去 `.exe`、忽略大小写)。
+fn is_glued_password_client(token: &str) -> bool {
+    let base = token
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(token)
+        .to_ascii_lowercase();
+    let base = base.strip_suffix(".exe").unwrap_or(&base);
+    GLUED_PASSWORD_CLIENTS.contains(&base)
+}
+
+/// 单个 token 的脱敏:紧贴形态的开关 + URL userinfo。
+fn redact_token(token: &str, allow_glued_p: bool) -> String {
+    if let Some(value) = token.strip_prefix("--password=") {
+        if !value.is_empty() {
+            return format!("--password={MASK}");
+        }
+        return token.to_string();
+    }
+    if let Some(value) = token.strip_prefix("--user=") {
+        return format!("--user={}", mask_user_value(value));
+    }
+    if !token.starts_with("--") {
+        // `-uuser:pass`(curl 允许紧贴)。没有冒号就只是用户名,不动。
+        if let Some(value) = token.strip_prefix("-u") {
+            if value.contains(':') {
+                return format!("-u{}", mask_user_value(value));
+            }
+        }
+        // `-pSecret`(mysql 风格)。独立的 `-p` 不在此列 —— 它后面跟的通常是端口。
+        if allow_glued_p {
+            if let Some(value) = token.strip_prefix("-p") {
+                if !value.is_empty() {
+                    return format!("-p{MASK}");
+                }
+            }
+        }
+    }
+    redact_url_userinfo(token)
+}
+
+/// `-u` / `--user` 取到的值:整段是 URL 时(`redis-cli -u redis://:pw@h`)按 URL 规则走,
+/// 否则按 `用户:密码` 掩冒号后半段。
+///
+/// 少了这一岔,`-u redis://:pw@h` 会被当成 `用户=redis` 而把 `//:pw@h` 整段掩掉 ——
+/// 密码是没了,主机名也一起没了。
+fn mask_user_value(value: &str) -> String {
+    if value.contains("://") {
+        redact_url_userinfo(value)
+    } else {
+        mask_after_first_colon(value)
+    }
+}
+
+/// `用户:密码` → `用户:***`。没有冒号、或冒号后为空则原样返回。
+fn mask_after_first_colon(value: &str) -> String {
+    match value.split_once(':') {
+        Some((user, pass)) if !pass.is_empty() => format!("{user}:{MASK}"),
+        _ => value.to_string(),
+    }
+}
+
+/// 掩掉 token 里所有 URL 的 userinfo 密码段:`scheme://user:pass@host` →
+/// `scheme://user:***@host`。
+///
+/// 边界按 RFC 3986 取:authority 到第一个 `/` `?` `#` 为止,userinfo 到 authority
+/// 里**最后一个** `@` 为止,密码是 userinfo 里**第一个** `:` 之后的部分。
+/// 没有 `@` 的一律不动 —— `http://host:8080/p` 那个冒号是端口,不是密码。
+fn redact_url_userinfo(token: &str) -> String {
+    if !token.contains("://") {
+        return token.to_string();
+    }
+    let mut out = String::with_capacity(token.len());
+    let mut rest = token;
+    while let Some(idx) = rest.find("://") {
+        let (head, after) = rest.split_at(idx + 3);
+        out.push_str(head);
+        let auth_end = after.find(['/', '?', '#']).unwrap_or(after.len());
+        let authority = &after[..auth_end];
+        match authority.rfind('@') {
+            Some(at) => {
+                out.push_str(&mask_after_first_colon(&authority[..at]));
+                out.push('@');
+                out.push_str(&authority[at + 1..]);
+            }
+            None => out.push_str(authority),
+        }
+        rest = &after[auth_end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// 格式化一行审计日志。抽出便于单测。
 ///
 /// 形如:`2026-05-18T12:34:56Z\tconn=prod\texit=0\tcmd=ls -la`
-/// 命令里的换行替换成空格,保证一次执行就是一行。
+/// 命令先过 `redact_command` 脱敏(明文凭据不落盘),再把换行替换成空格,
+/// 保证一次执行就是一行。
 fn format_audit_line(timestamp: &str, conn_name: &str, command: &str, exit: Option<i32>) -> String {
     let exit_str = match exit {
         Some(code) => code.to_string(),
         None => "timeout".to_string(),
     };
-    let one_line_cmd = command.replace(['\n', '\r'], " ");
+    let one_line_cmd = redact_command(command).replace(['\n', '\r'], " ");
     format!("{timestamp}\tconn={conn_name}\texit={exit_str}\tcmd={one_line_cmd}\n")
 }
 
@@ -1132,6 +1342,172 @@ mod tests {
         // 命令里的换行被替成空格 —— 一次执行只占一行
         assert_eq!(line.matches('\n').count(), 1);
         assert!(line.ends_with('\n'));
+    }
+
+    #[test]
+    fn format_audit_line_redacts_credentials() {
+        // 安全验收:审计行里绝不出现明文密码
+        let line = format_audit_line(
+            "t",
+            "prod",
+            "mysql -h db -uroot -pS3cr3tPw -e 'select 1'",
+            Some(0),
+        );
+        assert!(!line.contains("S3cr3tPw"), "实际: {line}");
+        assert!(line.contains("-p***"), "实际: {line}");
+        // 非凭据部分照旧可读
+        assert!(line.contains("-h db"));
+        assert!(line.contains("select 1"));
+    }
+
+    // --- redact_command ---
+
+    #[test]
+    fn redact_glued_mysql_password() {
+        assert_eq!(redact_command("mysql -pSecret"), "mysql -p***");
+        assert_eq!(
+            redact_command("mysqldump -uroot -pP@ss db > d.sql"),
+            "mysqldump -uroot -p*** db > d.sql"
+        );
+        // 带路径 / .exe / sudo 前缀也认得出客户端
+        assert_eq!(
+            redact_command("sudo /usr/bin/mysql -pSecret"),
+            "sudo /usr/bin/mysql -p***"
+        );
+        assert_eq!(redact_command("mysql.exe -pSecret"), "mysql.exe -p***");
+        assert_eq!(
+            redact_command("docker exec db mariadb -pSecret"),
+            "docker exec db mariadb -p***"
+        );
+    }
+
+    #[test]
+    fn redact_leaves_standalone_dash_p_and_its_value_alone() {
+        // 反例:独立 `-p` 后面跟的是端口,不是密码
+        assert_eq!(redact_command("mysql -p 3306"), "mysql -p 3306");
+        assert_eq!(redact_command("psql -p 5432 -h db"), "psql -p 5432 -h db");
+        assert_eq!(redact_command("ps -p 1234"), "ps -p 1234");
+    }
+
+    #[test]
+    fn redact_leaves_non_credential_glued_dash_p_alone() {
+        // 反例:命令里没有 mysql 家族客户端时,紧贴 `-p` 一律不动 ——
+        // tar/cp/mkdir/docker/ssh 的 `-p` 都不是密码
+        assert_eq!(redact_command("tar -pxvf a.tar"), "tar -pxvf a.tar");
+        assert_eq!(redact_command("cp -pr a b"), "cp -pr a b");
+        assert_eq!(redact_command("mkdir -pv /a/b"), "mkdir -pv /a/b");
+        assert_eq!(
+            redact_command("docker run -p8080:80 nginx"),
+            "docker run -p8080:80 nginx"
+        );
+        assert_eq!(redact_command("ssh -p2222 h"), "ssh -p2222 h");
+    }
+
+    #[test]
+    fn redact_long_password_flag_both_shapes() {
+        assert_eq!(
+            redact_command("pg_dump --password=Secret db"),
+            "pg_dump --password=*** db"
+        );
+        assert_eq!(
+            redact_command("wget --password Secret http://h/f"),
+            "wget --password *** http://h/f"
+        );
+        // 值在下一段,中间隔多少空白都认
+        assert_eq!(
+            redact_command("wget --password   Secret"),
+            "wget --password   ***"
+        );
+        // 光秃秃的 `--password=`(没有值)不动
+        assert_eq!(redact_command("x --password="), "x --password=");
+    }
+
+    #[test]
+    fn redact_user_colon_password() {
+        assert_eq!(
+            redact_command("curl -u alice:hunter2 https://api/x"),
+            "curl -u alice:*** https://api/x"
+        );
+        assert_eq!(
+            redact_command("curl -ualice:hunter2 https://api/x"),
+            "curl -ualice:*** https://api/x"
+        );
+        assert_eq!(
+            redact_command("curl --user=alice:hunter2 https://api/x"),
+            "curl --user=alice:*** https://api/x"
+        );
+        assert_eq!(
+            redact_command("curl --user alice:hunter2 https://api/x"),
+            "curl --user alice:*** https://api/x"
+        );
+    }
+
+    #[test]
+    fn redact_leaves_user_without_colon_alone() {
+        // 反例:没有冒号就只是用户名,不是凭据
+        assert_eq!(redact_command("curl -u alice https://api"), "curl -u alice https://api");
+        assert_eq!(redact_command("sudo -u www-data ls"), "sudo -u www-data ls");
+        assert_eq!(redact_command("id -u"), "id -u");
+    }
+
+    #[test]
+    fn redact_url_userinfo_password() {
+        assert_eq!(
+            redact_command("curl https://alice:hunter2@api.example.com/v1?a=1"),
+            "curl https://alice:***@api.example.com/v1?a=1"
+        );
+        assert_eq!(
+            redact_command("git clone https://u:tok@github.com/o/r.git"),
+            "git clone https://u:***@github.com/o/r.git"
+        );
+        // 无用户名、只有密码的形态(redis / amqp 常见)
+        assert_eq!(
+            redact_command("redis-cli -u redis://:pw@127.0.0.1:6379"),
+            "redis-cli -u redis://:***@127.0.0.1:6379"
+        );
+    }
+
+    #[test]
+    fn redact_leaves_non_credential_urls_alone() {
+        // 反例:端口的冒号、无密码的 userinfo、scp 风格的 host:path 都不是凭据
+        assert_eq!(
+            redact_command("curl http://example.com:8080/a?b=1"),
+            "curl http://example.com:8080/a?b=1"
+        );
+        assert_eq!(
+            redact_command("ssh ssh://user@host:22/x"),
+            "ssh ssh://user@host:22/x"
+        );
+        assert_eq!(
+            redact_command("git clone git@github.com:owner/repo.git"),
+            "git clone git@github.com:owner/repo.git"
+        );
+    }
+
+    #[test]
+    fn redact_leaves_plain_commands_byte_identical() {
+        // 反例:没有凭据形态的命令必须逐字节原样返回(含连续空格与缩进)
+        for cmd in [
+            "ls -la",
+            "systemctl restart nginx",
+            "tail -n 100 /var/log/syslog | grep -i error",
+            "  echo   'a   b'  ",
+            "find / -name '*.log' -mtime +7 -delete",
+            "",
+        ] {
+            assert_eq!(redact_command(cmd), cmd, "不该改动: {cmd}");
+        }
+    }
+
+    #[test]
+    fn redact_preserves_newlines_and_multiple_hits() {
+        // 多段命令里出现多处凭据时全都掩掉,换行等空白原样保留
+        let src = "mysql -pA\ncurl -u u:B https://x:C@h/p";
+        let out = redact_command(src);
+        assert_eq!(out, "mysql -p***\ncurl -u u:*** https://x:***@h/p");
+        assert!(!out.contains("-pA"));
+        assert!(!out.contains(":B"));
+        assert!(!out.contains(":C@"));
     }
 
     // --- utc_timestamp ---

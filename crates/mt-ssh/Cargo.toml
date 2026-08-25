@@ -28,8 +28,13 @@ mt-core = { path = "../mt-core" }
 # (aws-lc-sys 的 jitterentropy / chacha20 等用 NASM 写优化路径),本仓库与 CI
 # 都没装 NASM;ring 是 pure Rust 不需要任何额外工具链。
 russh = { version = "0.61", default-features = false, features = ["ring"] }
-# 会话池 shutdown 时并发关闭多条 session 用 join_all。
-futures = "0.3"
+# 会话池 shutdown 时并发关闭多条 session 用 join_all。版本收在根工作区(与 mt-app 共用)。
+#
+# ℹ️ 这里的 `workspace = true` 在 `sidecars/` 那个独立工作区里也解析得动:本 crate
+# 是根工作区的成员(`members = ["crates/*"]`),cargo 把它当 path 依赖拉进来时会
+# 自行向上找到它自己的工作区根去取值。与上面 mt-core 那条**路径**写法不冲突 ——
+# 路径没法这么继承,版本可以。version / edition 仍保持显式(取值与工作区不同)。
+futures.workspace = true
 # known_hosts 文件读写时编解码 server pubkey 字节。
 base64 = "0.22"
 # --- 传统 PKCS#1 RSA 私钥支持 (task 06-06-ssh-mcp-pkcs1-rsa-key) ---
@@ -57,7 +62,9 @@ russh-sftp = "2.3.0"
 # time(interval/timeout)、fs + io-util(SFTP 传输用 tokio::fs 流式读写本地文件,task 06-09)。
 tokio = { version = "1", features = ["rt", "sync", "time", "fs", "io-util"] }
 # known_hosts 默认路径 `~/.ssh/known_hosts` 的 home 定位(本 crate 无 Tauri AppHandle)。
-dirs = "6"
+# 版本收在根工作区(继承的可行性见上面 futures 那条注释)。
+# ⚠️ mt-core 的 `dirs` 不要跟着改:它是三个 sidecar 的直接依赖,要保持自包含。
+dirs.workspace = true
 
 [dev-dependencies]
 # 单测里的 #[tokio::test] 需要 macros;SSH 公钥 fixture 用 32 字节常量直接构造,
