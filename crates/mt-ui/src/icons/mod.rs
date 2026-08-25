@@ -10,7 +10,8 @@
 //! ├── tech_art  ↑ 用的 51 种 ProjectKind 与官方 logo —— **生成物**,见 tools/gen_tech_icons.mjs
 //! ├── file      文件树图标的查表规则与 Element(fileIcon.ts / FileTree.tsx)
 //! ├── file_art  ↑ 用的 263 枚官方图形状表 —— **生成物**,见 tools/gen_file_icons.mjs
-//! └── status    四态状态灯 + spinner 旋转(StatusDot.tsx)
+//! ├── status    四态状态灯 + spinner 旋转(StatusDot.tsx)
+//! └── usage_glyphs  用量面板 KPI 六枚图标的形状表(KpiCards.tsx)
 //! ```
 //!
 //! # 为什么全是自绘
@@ -61,6 +62,7 @@ pub mod status;
 pub mod svg_path;
 pub mod tech;
 pub mod tech_art;
+pub mod usage_glyphs;
 pub mod vector;
 
 pub use brand::{ALL_VENDORS, AiVendor, BrandIcon};
@@ -69,6 +71,7 @@ pub use file_art::FileArt;
 pub use status::{ALL_STATUS_KINDS, SPIN_PERIOD, StatusDot, StatusKind};
 pub use tech::{ALL_TECH_CATEGORIES, TechCategory, TechIcon};
 pub use tech_art::{ALL_PROJECT_KINDS, ProjectKind};
+pub use usage_glyphs::ALL_USAGE_GLYPHS;
 pub use vector::{Geom, Ink, Pen, Shape, VectorIcon};
 
 /// 全部形状表。单测用它做「所有图标的点都在单位方框内」这类跨模块约束。
@@ -78,5 +81,6 @@ pub(crate) fn all_shape_tables() -> Vec<&'static [Shape]> {
     out.extend(tech::shape_tables());
     out.extend(file::shape_tables());
     out.extend(status::shape_tables());
+    out.extend(usage_glyphs::shape_tables());
     out
 }
