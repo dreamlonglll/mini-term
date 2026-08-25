@@ -50,6 +50,7 @@
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -357,6 +358,31 @@ enum MdSegment {
     Table(MdTable),
     /// 一整行的图片(徽章行可能并排多张)
     Images(Vec<MdImage>),
+}
+
+/// 预处理好的一块正文:`Text` 里的图片目标已改写成绝对 `file://`
+/// ([`rewrite_md_image_urls`]),块顶间距([`block_top_margin`])也已算出。
+///
+/// 与 [`MdSegment`] 分家是因为它要**跨帧活着** —— 见 [`FileViewer::md_cache`]。
+enum MdBlock {
+    Text(gpui::SharedString),
+    Table(MdTable),
+    Images(Vec<MdImage>),
+}
+
+/// markdown 预览的分块缓存。key 是「源码 + 所在目录」,两者都没变就复用。
+///
+/// 有它是因为**滚动一次就是整个视图重 render 一遍**(gpui 的滚轮处理改完
+/// offset 就 notify 当前 view),而 [`split_md_blocks`] 与
+/// [`rewrite_md_image_urls`] 都是全文逐字符扫描 —— 一份 40 KB 的文档每帧
+/// 重切一次纯属白烧。缓存的是**分块结果**,不是元素:元素每帧照建
+/// (gpui 的 retained 边界在 Element 那一层,不在这里)。
+struct MdCache {
+    source: String,
+    base_dir: PathBuf,
+    /// `(块顶间距, 块)`。`Rc` 让 [`FileViewer::render_markdown`] 拿完就撒手,
+    /// 不必攥着 `RefCell` 的借用穿过整段渲染
+    blocks: Rc<Vec<(f32, MdBlock)>>,
 }
 
 /// 把 markdown 源切成**块级**段:GFM 表格与整行图片各自独立成段,其余文本
@@ -1017,6 +1043,93 @@ fn display_width(s: &str) -> usize {
     s.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum()
 }
 
+/// 格子内容能不能不起 `TextView`、直接当纯文本画。
+///
+/// **表格自绘的代价全压在这一个判定上。** 每个格子一个 [`TextView::markdown`],
+/// 而 [`FileViewer::render_markdown`] 的滚动容器是非虚拟化的普通 div ——
+/// gpui 的滚轮处理改完 offset 就 `cx.notify(current_view)`
+/// (`gpui::elements::div` 里那条),于是**滚一格 = 整篇重建一遍,视口外的表格
+/// 也不例外**。实测一份 26 张表的需求文档是每帧 1425 个 TextView(每个还各带
+/// 一个 focus handle 进 dispatch tree),滚动直接卡死;同等体量、只有 1 张表的
+/// 文档 89 个,毫无问题 —— 差的不是文件大小,是格子数。
+///
+/// 判据**保守到底**:只要出现任何可能被 markdown 当标记的字符就判否,宁可多起
+/// 一个 TextView,也不能把行内 code / 加粗 / 链接画成源码。放行的格子渲染结果
+/// 与走 TextView **逐像素一致** —— 组件的普通文本 run 直接吃
+/// `window.text_style()`(`text/inline.rs:247-259`),字号颜色行高全靠继承,
+/// 与这里的纯文本元素同源;连「多个空格折叠成一个」那点差别也靠下面那条挡掉。
+fn is_plain_cell(s: &str) -> bool {
+    // markdown 折叠空白,纯文本不折 —— 有连续空白就交回 TextView,免得两类格子
+    // 排版有肉眼可见的差
+    if s.contains('\t') || s.contains("  ") {
+        return false;
+    }
+    // 行内标记:出现在任何位置都可能起作用
+    if s.bytes().any(|b| {
+        matches!(
+            b,
+            b'`' | b'*' | b'_' | b'[' | b']' | b'<' | b'>' | b'&' | b'~' | b'\\' | b'!' | b'|'
+        )
+    }) {
+        return false;
+    }
+    // GFM 的 autolink literal:裸 URL / www. / 邮箱会自动变链接
+    // (解析走 `ParseOptions::gfm()`,见 gpui-component `text/format/markdown.rs`)
+    if s.contains("://") || s.contains("www.") || s.contains('@') {
+        return false;
+    }
+    // 块级标记只在行首起作用,而格子内容没有换行、且在 [`split_cells`] 里已 trim,
+    // 只看开头一处。`-`/`+`/`#` 不管后面跟不跟空格一律判否 —— 差一个字符的判定
+    // 不值得赌(`---` 是分隔线,`- 项` 是列表)。`=` 反倒安全:setext 标题要有上一行,
+    // 单行 `===` 只会是段落,于是 `a=b` 这类格子照走快路
+    let Some(first) = s.as_bytes().first().copied() else {
+        return true;
+    };
+    if matches!(first, b'#' | b'-' | b'+') {
+        return false;
+    }
+    // `1. 项` / `1) 项` 有序列表。点号后必须是空白(或到头)才算 ——
+    // 否则 `1.5 倍` 这种会被误判
+    if first.is_ascii_digit() {
+        let rest = s.trim_start_matches(|c: char| c.is_ascii_digit());
+        if let Some(after) = rest.strip_prefix(['.', ')'])
+            && (after.is_empty() || after.starts_with(char::is_whitespace))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// 一个格子的内容元素:纯文字走快路,其余仍逐格按 markdown 渲染。
+fn render_md_cell(
+    seg_ix: usize,
+    row_ix: usize,
+    col_ix: usize,
+    cell: &str,
+    style: &TextViewStyle,
+    window: &mut Window,
+    cx: &mut App,
+) -> gpui::AnyElement {
+    if is_plain_cell(cell) {
+        // 外层刻意与 TextView 那条路同形(它的最外层也是 `div().size_full()`,
+        // 见 `text/text_view.rs` 的 `request_layout`)—— 两类格子混在同一张表里,
+        // 盒模型差一点就是一行高矮不齐
+        return div()
+            .size_full()
+            .child(gpui::SharedString::from(cell.to_string()))
+            .into_any_element();
+    }
+    TextView::markdown(
+        gpui::SharedString::from(format!("md-tbl-{seg_ix}-{row_ix}-{col_ix}")),
+        cell.to_string(),
+        window,
+        cx,
+    )
+    .style(style.clone())
+    .into_any_element()
+}
+
 /// 自绘一张表。样式逐条对照 `.md-preview table`(styles.css:889-910):
 /// 100% 宽、0.92em、collapse 边框(--border-default)、格子 8×12 padding、
 /// 表头 --bg-elevated + 600、偶数数据行 --bg-surface 斑马纹;格子**自动换行**
@@ -1051,18 +1164,11 @@ fn render_md_table(
                     })
                     .when(align == MdAlign::Center, |el| el.flex().justify_center())
                     .when(align == MdAlign::Right, |el| el.flex().justify_end())
-                    .child(
-                        // 格子内容仍按 markdown 渲染:行内 code 胶囊/加粗/链接不丢
-                        TextView::markdown(
-                            gpui::SharedString::from(format!(
-                                "md-tbl-{seg_ix}-{row_ix}-{col_ix}"
-                            )),
-                            cell.clone(),
-                            window,
-                            cx,
-                        )
-                        .style(style.clone()),
-                    )
+                    // 带标记的格子仍按 markdown 渲染(行内 code 胶囊/加粗/链接不丢),
+                    // 纯文字的走快路 —— 理由见 [`is_plain_cell`]
+                    .child(render_md_cell(
+                        seg_ix, row_ix, col_ix, cell, style, window, cx,
+                    ))
                     .into_any_element(),
             );
         }
@@ -1255,6 +1361,10 @@ pub struct FileViewer {
     preview_draft: Option<String>,
     /// 文件读进来时的行尾。写回时按它还原(见模块注释)。
     line_ending: LineEnding,
+    /// markdown 预览的分块缓存,见 [`MdCache`]。`RefCell` 是因为
+    /// [`Self::render_markdown`] 只拿得到 `&self`(gpui 的 `Render::render`
+    /// 之下全是不可变借用),而这份缓存要在渲染途中回填。
+    md_cache: RefCell<Option<MdCache>>,
 
     preview: bool,
     dirty: bool,
@@ -1311,6 +1421,7 @@ impl FileViewer {
             disk: String::new(),
             preview_draft: None,
             line_ending: LineEnding::Lf,
+            md_cache: RefCell::new(None),
             // 原版初值就是 true(Markdown / HTML 打开先看渲染稿)
             preview: true,
             dirty: false,
@@ -2062,10 +2173,49 @@ impl FileViewer {
     }
 
     /// 预览态要渲染的源码:切到预览那一刻的草稿快照,没有草稿就用磁盘现内容。
-    fn preview_source(&self) -> String {
-        self.preview_draft
-            .clone()
-            .unwrap_or_else(|| self.disk.clone())
+    ///
+    /// 借出去而不是 clone —— 这条每帧都走(滚动即重画),而正文动辄几十 KB。
+    fn preview_source(&self) -> &str {
+        self.preview_draft.as_deref().unwrap_or(&self.disk)
+    }
+
+    /// 正文分块(带缓存,见 [`MdCache`])。源码或所在目录变了才重切。
+    fn md_blocks(&self, source: &str, base_dir: &Path) -> Rc<Vec<(f32, MdBlock)>> {
+        // 先把命中与否算完再撒手,别让 borrow 活到 borrow_mut 那一行
+        let hit = self.md_cache.borrow().as_ref().and_then(|c| {
+            (c.source == source && c.base_dir == base_dir).then(|| c.blocks.clone())
+        });
+        if let Some(blocks) = hit {
+            return blocks;
+        }
+
+        let blocks: Vec<(f32, MdBlock)> = split_md_blocks(source)
+            .into_iter()
+            .enumerate()
+            .map(|(ix, seg)| {
+                let mt = block_top_margin(ix, &seg);
+                let block = match seg {
+                    // 交给 TextView 的段里还可能有**内联**图片(列表项 / 引用块 /
+                    // 表格格子),它们的本地路径得先转成 file:// 才画得出来
+                    // (见 rewrite_md_image_urls);块级图片行不走这里,
+                    // 拿的是拆好的原始 url
+                    MdSegment::Text(text) => {
+                        MdBlock::Text(rewrite_md_image_urls(&text, base_dir).into())
+                    }
+                    MdSegment::Table(table) => MdBlock::Table(table),
+                    MdSegment::Images(images) => MdBlock::Images(images),
+                };
+                (mt, block)
+            })
+            .collect();
+
+        let blocks = Rc::new(blocks);
+        *self.md_cache.borrow_mut() = Some(MdCache {
+            source: source.to_string(),
+            base_dir: base_dir.to_path_buf(),
+            blocks: blocks.clone(),
+        });
+        blocks
     }
 
     /// 富文本排版。markdown 与 html 两支预览共用一份 —— 两边走的是
@@ -2115,12 +2265,12 @@ impl FileViewer {
     /// 且与编辑器同一份 `highlight_theme`,两处颜色一致。
     fn render_markdown(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let base_dir = self.preview_base_dir();
-        let source = self.preview_source();
         let style = self.preview_text_style(cx);
         // 表格与图片拆出来自绘(组件表格单行截断、图片只认网络 URI,见
         // split_md_blocks 一节的说明),其余段落照走 TextView;段落 id 按段序编,
-        // 文档不变即稳定。
-        let segments = split_md_blocks(&source);
+        // 文档不变即稳定。分块结果跨帧缓存(见 MdCache)——「滚一格重画一遍」
+        // 这条路上,每帧重切 40 KB 正文是白烧。
+        let blocks = self.md_blocks(self.preview_source(), &base_dir);
         let avail_w = self.preview_avail_width(window);
         div()
             .id("file-viewer-md")
@@ -2133,39 +2283,34 @@ impl FileViewer {
             .line_height(gpui::relative(1.85))
             .child(
                 div().max_w(px(860.0)).mx_auto().w_full().children(
-                    segments
-                        .into_iter()
+                    blocks
+                        .iter()
                         .enumerate()
-                        .map(|(ix, seg)| {
+                        .map(|(ix, (mt, block))| {
                             // 块间距按原版纵向节奏由这里统一给(em 基准,随
                             // uiFontSize 缩放),TextView 内部的 paragraph_gap
                             // 在非虚拟化路径上是坏的(见 split_md_blocks 注释)
-                            let mt = block_top_margin(ix, &seg);
-                            let content = match seg {
-                                // 交给 TextView 的段里还可能有**内联**图片
-                                // (列表项 / 引用块 / 表格格子),它们的本地路径
-                                // 得先转成 file:// 才画得出来(见 rewrite_md_image_urls);
-                                // 块级图片行不走这里,拿的是拆好的原始 url
-                                MdSegment::Text(text) => TextView::markdown(
+                            let content = match block {
+                                MdBlock::Text(text) => TextView::markdown(
                                     gpui::SharedString::from(format!(
                                         "file-viewer-md-body-{ix}"
                                     )),
-                                    rewrite_md_image_urls(&text, &base_dir),
+                                    text.clone(),
                                     window,
                                     cx,
                                 )
                                 .style(style.clone())
                                 .selectable(true)
                                 .into_any_element(),
-                                MdSegment::Table(table) => {
-                                    render_md_table(ix, &table, &style, window, cx)
+                                MdBlock::Table(table) => {
+                                    render_md_table(ix, table, &style, window, cx)
                                 }
-                                MdSegment::Images(images) => {
-                                    self.render_md_images(ix, &images, avail_w, window, cx)
+                                MdBlock::Images(images) => {
+                                    self.render_md_images(ix, images, avail_w, window, cx)
                                 }
                             };
                             div()
-                                .when(mt > 0.0, |el| el.mt(ui::font_px(mt)))
+                                .when(*mt > 0.0, |el| el.mt(ui::font_px(*mt)))
                                 .child(content)
                                 .into_any_element()
                         })
@@ -2184,7 +2329,7 @@ impl FileViewer {
     /// 图片与其它本地资源靠 [`rewrite_html_urls`] 转 `file://`(原版是
     /// `convertFileSrc`),由 [`PreviewHttpClient`] 读盘。
     fn render_html(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let source = rewrite_html_urls(&self.preview_source(), &self.preview_base_dir());
+        let source = rewrite_html_urls(self.preview_source(), &self.preview_base_dir());
         let style = self.preview_text_style(cx);
         div()
             .id("file-viewer-html")
@@ -2479,6 +2624,64 @@ mod tests {
         };
         let w2 = column_weights(&t2);
         assert!((w2[0] - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn 表格格子_纯文字走快路_带标记的交回_textview() {
+        // 快路:一句纯文字(表格里的绝大多数)
+        assert!(is_plain_cell("已完成"));
+        assert!(is_plain_cell("用户登录模块"));
+        assert!(is_plain_cell(""), "空格子");
+        assert!(is_plain_cell("P0"));
+        // `-` 不在行首不是标记;`=` 单行永远成不了 setext 标题
+        assert!(is_plain_cell("2026-08-25"));
+        assert!(is_plain_cell("a=b"));
+        assert!(is_plain_cell("张三 李四"), "单个空格照走快路");
+
+        // 行内标记一律交回
+        assert!(!is_plain_cell("`a.rs`"));
+        assert!(!is_plain_cell("**必填**"));
+        assert!(!is_plain_cell("下划_线"));
+        assert!(!is_plain_cell("[文档](a.md)"));
+        assert!(!is_plain_cell("![图](a.png)"));
+        assert!(!is_plain_cell("~~废弃~~"));
+        assert!(!is_plain_cell("<br>"));
+        assert!(!is_plain_cell("a&amp;b"));
+        assert!(!is_plain_cell("a\\|b"), "转义符");
+
+        // GFM autolink literal:裸 URL / www. / 邮箱会自动成链接
+        assert!(!is_plain_cell("https://example.com"));
+        assert!(!is_plain_cell("www.example.com"));
+        assert!(!is_plain_cell("a@b.com"));
+
+        // 块级标记在行首才算,而格子已 trim,只看开头一处
+        assert!(!is_plain_cell("# 标题"));
+        assert!(!is_plain_cell("- 列表项"));
+        assert!(!is_plain_cell("+ 列表项"));
+        assert!(!is_plain_cell("---"), "分隔线");
+        assert!(!is_plain_cell("1. 第一步"));
+        assert!(!is_plain_cell("2) 第二步"));
+        assert!(is_plain_cell("1.5 倍"), "小数不是有序列表");
+        assert!(is_plain_cell("2026 年"), "光是数字开头不算");
+
+        // markdown 折叠空白,纯文本不折 —— 有连续空白就交回,免得排版有差
+        assert!(!is_plain_cell("a  b"));
+        assert!(!is_plain_cell("a\tb"));
+    }
+
+    #[test]
+    fn 表格格子_真实形状的表大头走快路() {
+        // 「文件 | 职责」这类文档表:只有第一列带反引号,其余都是纯文字
+        let src = "| 模块 | 负责人 | 状态 | 备注 |\n|---|---|---|---|\n\
+                   | `auth.rs` | 张三 | 已完成 | 见设计稿 |\n\
+                   | 支付 | 李四 | 进行中 | 依赖第三方 |";
+        let MdSegment::Table(t) = &split_md_blocks(src)[0] else {
+            panic!("应解析成表格")
+        };
+        let cells: Vec<&String> = t.header.iter().chain(t.rows.iter().flatten()).collect();
+        let fast = cells.iter().filter(|c| is_plain_cell(c)).count();
+        assert_eq!(cells.len(), 12);
+        assert_eq!(fast, 11, "只有 `auth.rs` 那一格该交回 TextView");
     }
 
     #[test]
