@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.0.8--beta-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.0.9--beta-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -133,7 +133,7 @@ A VS Code-style **Changes panel** (Staged / Changes / Untracked groups, per-file
 | **Global search** | `Ctrl+Shift+F` for filename or content search, substring or regex, streamed from the backend and cancellable anytime |
 | **Per-project env vars** | Injected into the PTY child process per project, with strict POSIX validation and a second defensive filter on the Rust side; passes through to WSL via WSLENV |
 | **Smart Ctrl+C/V** | Optional: copy when there's a selection, interrupt the program when there isn't; large Windows pastes are chunked so ConPTY doesn't drop lines |
-| **Icons everywhere** | File-type icons in the tree, AI brand icons and tech-stack icons on project rows (official brand SVG shapes, natively drawn) |
+| **Icons everywhere** | A dedicated icon per file name and per folder name in the tree (263 official Material Icon Theme icons), plus AI brand icons and 51 tech-stack badges on project rows (official devicon logos). Official SVG geometry and colors baked in as-is, natively drawn |
 | **Dwell-to-copy selection** | Hold the mouse still after drag-selecting and the selection is copied with a "Copied" tip; dwell time configurable (0 = off) |
 | **Project descriptions** | Right-click to add a gray one-liner next to the project name — tell a row of worktree sub-projects apart at a glance |
 | **Zero network requests at startup** | Native rendering, no web assets — startup makes no network request at all (the price table refreshes daily and falls back to its cache) |
@@ -162,7 +162,7 @@ The whole application is **native Rust** (the earlier Tauri + React build was re
 | Git / files | git2 (libgit2) · notify + ignore |
 | Usage stats | rusqlite local ledger · hand-drawn trend charts |
 | Mobile relay | axum + tokio WebSocket (`relay-server/`) · React + Vite PWA (`mobile/`) |
-| Tests | **1,514 Rust tests** (28 test targets) |
+| Tests | **1,540 Rust tests** (28 test targets) |
 
 ---
 
