@@ -33,7 +33,7 @@ use gpui_component::input::{Input, InputEvent, InputState};
 use mt_config::SshConnection;
 
 use crate::i18n::t;
-use crate::prompt::{close_guarded, kind, open_guarded};
+use crate::prompt::{autofocus, close_guarded, kind, open_guarded};
 use crate::ssh_conn::{SshGroupBucket, build_group_buckets};
 use crate::ssh_panel::{
     GroupKey, PANEL_W, bucket_header, bucket_key, conn_card, conn_text, panel_header,
@@ -97,6 +97,9 @@ pub fn open(
     let name = cx.new(|cx| {
         InputState::new(window, cx).placeholder(t("remoteProject", "namePlaceholder"))
     });
+    // 打开即可直接接着 `~` 往下敲路径。聚焦排在 `open_guarded` 之后,
+    // 判据见 `prompt::autofocus`
+    let path_for_focus = path.clone();
 
     let state = cx.new(|cx| {
         // 两个输入框里按回车 = 点「添加」(原版那两处 `onKeyDown`)。
@@ -153,6 +156,8 @@ pub fn open(
                 .child(body)
         },
     );
+
+    autofocus(&path_for_focus, window, cx);
 }
 
 // ─── 保存 ─────────────────────────────────────────────────────

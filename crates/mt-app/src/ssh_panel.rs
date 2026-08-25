@@ -40,7 +40,7 @@ use mt_config::SshConnection;
 
 use crate::i18n::{t, tr};
 use crate::menu::{self, MenuItem};
-use crate::prompt::{Confirm, kind, open_guarded};
+use crate::prompt::{Confirm, autofocus, kind, open_guarded};
 use crate::ssh_conn::{SshGroupBucket, build_group_buckets, connection_summary};
 use crate::store::AppStore;
 use crate::ui;
@@ -553,8 +553,11 @@ fn new_form(
         window,
         cx,
     );
-    // 打开即可直接改名,不必先点一下输入框(原版表单第一个框 `autoFocus`)
-    name.update(cx, |state, cx| state.focus(window, cx));
+    // 打开即可直接改名,不必先点一下输入框(原版表单第一个框 `autoFocus`)。
+    // 表单是在**已经开着的**本面板里长出来的、不经 `open_dialog`,所以焦点没有
+    // 被抢的问题;仍走 `autofocus` 是为了与其余输入弹窗同一条路(它多让一轮
+    // effect,输入框此刻尚未画出也不要紧)
+    autofocus(&name, window, cx);
     ConnForm {
         id: conn.map(|c| c.id.clone()).unwrap_or_default(),
         name,
@@ -699,7 +702,7 @@ fn dissolve_group(state: &Entity<SshPanel>, name: &str, cx: &mut App) {
 
 fn start_rename_group(state: &Entity<SshPanel>, name: &str, window: &mut Window, cx: &mut App) {
     let input = cx.new(|cx| InputState::new(window, cx).default_value(name.to_string()));
-    input.update(cx, |s, cx| s.focus(window, cx));
+    autofocus(&input, window, cx);
     let name = name.to_string();
     state.update(cx, |panel, cx| {
         // 回车 = 提交,失焦 = 提交(原版 onKeyDown Enter / onBlur 两条都提交)
@@ -718,7 +721,7 @@ fn start_rename_group(state: &Entity<SshPanel>, name: &str, window: &mut Window,
 fn start_create_group(state: &Entity<SshPanel>, window: &mut Window, cx: &mut App) {
     let input = cx
         .new(|cx| InputState::new(window, cx).placeholder(t("sshModal", "addGroupPlaceholder")));
-    input.update(cx, |s, cx| s.focus(window, cx));
+    autofocus(&input, window, cx);
     state.update(cx, |panel, cx| {
         let sub = cx.subscribe(&input, |this: &mut SshPanel, _i, event: &InputEvent, cx| {
             if matches!(event, InputEvent::PressEnter { .. } | InputEvent::Blur) {

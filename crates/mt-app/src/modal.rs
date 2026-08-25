@@ -31,7 +31,7 @@ use gpui_component::dialog::DialogButtonProps;
 use gpui_component::input::{Input, InputState, SelectAll};
 
 use crate::i18n::t;
-use crate::prompt::{kind, open_guarded};
+use crate::prompt::{autofocus, is_open, kind, open_guarded};
 use crate::store::AppStore;
 use crate::ui;
 
@@ -49,6 +49,11 @@ pub fn open_rename_pane(
     window: &mut Window,
     cx: &mut App,
 ) {
+    // 守卫要在**建输入框之前**判:被 `open_guarded` 拦下时弹窗压根没开,
+    // 底下那句 `autofocus` 就会把焦点送进虚空(判据见 `prompt::is_open`)
+    if is_open(kind::RENAME_PANE) {
+        return;
+    }
     // 原版这条走的是同一个 `showPrompt`(`paneActions.ts:310`,标题当默认值),
     // 于是也吃到那句 `if (defaultValue) input.select()`
     let select_all = Cell::new(!current.is_empty());
@@ -57,8 +62,9 @@ pub fn open_rename_pane(
             .placeholder(t("fileTree", "prompt.renameMessage"))
             .default_value(current)
     });
-    // 打开即可直接改名,不必先点一下输入框
-    input.update(cx, |state, cx| state.focus(window, cx));
+    // 打开即可直接改名,不必先点一下输入框。聚焦必须排在 `open_guarded`
+    // **之后**(弹窗一开就抢焦点),判据见 `prompt::autofocus`
+    let input_for_focus = input.clone();
 
     open_guarded(kind::RENAME_PANE, window, cx, move |dialog, window, cx| {
         // 有默认值就全选。手法与时机见 `prompt::show_prompt` 里那段注释
@@ -91,6 +97,8 @@ pub fn open_rename_pane(
                 true
             })
     });
+
+    autofocus(&input_for_focus, window, cx);
 }
 
 // ─── 移除项目确认 ─────────────────────────────────────────────
@@ -178,11 +186,16 @@ pub fn open_add_project_into(
     window: &mut Window,
     cx: &mut App,
 ) {
+    // 守卫要在**建输入框之前**判,理由同 `open_rename_pane`
+    if is_open(kind::ADD_PROJECT) {
+        return;
+    }
     // 原版加项目走的是系统目录选择框,没有手输框;这条占位串与下面的路径提示
     // 是 GPUI 侧独有的,`projectList.{pathPlaceholder,pathHint}` 由 M 批补进 TS 源头。
     let input =
         cx.new(|cx| InputState::new(window, cx).placeholder(t("projectList", "pathPlaceholder")));
-    input.update(cx, |state, cx| state.focus(window, cx));
+    // 聚焦排在 `open_guarded` 之后,见 `prompt::autofocus`
+    let input_for_focus = input.clone();
 
     open_guarded(kind::ADD_PROJECT, window, cx, move |dialog, _window, _cx| {
         let store = store.clone();
@@ -280,4 +293,6 @@ pub fn open_add_project_into(
                 true
             })
     });
+
+    autofocus(&input_for_focus, window, cx);
 }

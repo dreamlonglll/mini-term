@@ -42,7 +42,7 @@ use mt_project::search::{
 use crate::i18n::{t, tr};
 use crate::menu;
 use crate::overlay::kind;
-use crate::prompt::{close_guarded, open_guarded};
+use crate::prompt::{autofocus, close_guarded, open_guarded};
 use crate::store::AppStore;
 use crate::ui;
 
@@ -127,9 +127,8 @@ pub fn open(store: Entity<AppStore>, window: &mut Window, cx: &mut App) {
     });
 
     // Dialog 打开时会把焦点抢到自己面板上,聚焦输入框必须排在它后面
-    window.defer(cx, move |window, cx| {
-        input.update(cx, |state, cx| state.focus(window, cx));
-    });
+    // (判据全文见 `prompt::autofocus`)
+    autofocus(&input, window, cx);
 }
 
 impl SearchModal {

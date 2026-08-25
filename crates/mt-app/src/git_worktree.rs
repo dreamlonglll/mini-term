@@ -39,7 +39,7 @@ use mt_project::git::{BranchInfo, WorktreeInfo};
 
 use crate::i18n::{t, tr};
 use crate::menu::{self, MenuItem};
-use crate::prompt::{dialog_title, kind, open_guarded};
+use crate::prompt::{autofocus, dialog_title, kind, open_guarded};
 use crate::store::AppStore;
 use crate::ui;
 
@@ -964,11 +964,17 @@ fn render_create_section(
                 })
                 .when(!active, |el| el.text_color(ui::text_muted()))
                 .child(label)
-                .on_click(move |_: &ClickEvent, _window, cx| {
-                    state_for_mode.update(cx, |s, cx| {
+                .on_click(move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                    let input = state_for_mode.update(cx, |s, cx| {
                         s.mode = mode;
                         cx.notify();
+                        matches!(mode, Mode::New).then(|| s.new_branch.clone())
                     });
+                    // 切到「新建」就该能直接敲分支名,不必再点一下输入框
+                    // (「已有」那侧是下拉选择,没有可聚焦的输入框)
+                    if let Some(input) = input {
+                        autofocus(&input, window, cx);
+                    }
                 }),
         );
     }

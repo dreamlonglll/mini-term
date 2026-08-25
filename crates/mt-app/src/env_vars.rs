@@ -34,7 +34,7 @@ use gpui_component::input::{Input, InputState};
 use mt_config::ProjectEnvVar;
 
 use crate::i18n::{t, tr};
-use crate::prompt::{close_guarded, kind, open_guarded};
+use crate::prompt::{autofocus, close_guarded, kind, open_guarded};
 use crate::ssh_panel::panel_header;
 use crate::store::AppStore;
 use crate::ui;
@@ -199,10 +199,14 @@ pub fn open(store: Entity<AppStore>, project_id: &str, window: &mut Window, cx: 
         rows.push(new_row(next_rid, &var.key, &var.value, var.enabled, window, cx));
     }
     // 一条都没有时留一行空白占位(原版同款),否则弹窗开出来是空的
-    if rows.is_empty() {
+    let blank = rows.is_empty();
+    if blank {
         next_rid += 1;
         rows.push(new_row(next_rid, "", "", true, window, cx));
     }
+    // 空白占位那行是唯一「打开就等着输入」的情形,把光标交给它的键名框;
+    // 已有变量时不抢焦点 —— 光标停在第一条已填好的键名上会像是要改它
+    let focus_key = blank.then(|| rows[0].key.clone());
 
     let state = cx.new(|_cx| EnvVarsPanel {
         store,
@@ -228,6 +232,11 @@ pub fn open(store: Entity<AppStore>, project_id: &str, window: &mut Window, cx: 
                 .child(body)
         },
     );
+
+    // 聚焦必须排在 `open_guarded` 之后,判据见 `prompt::autofocus`
+    if let Some(key) = focus_key {
+        autofocus(&key, window, cx);
+    }
 }
 
 fn new_row(
@@ -441,11 +450,14 @@ fn render_body(state: &Entity<EnvVarsPanel>, cx: &mut App) -> AnyElement {
                     move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
                         let rid = state.read(cx).next_rid + 1;
                         let row = new_row(rid, "", "", true, window, cx);
+                        let key = row.key.clone();
                         state.update(cx, |panel, cx| {
                             panel.next_rid = rid;
                             panel.rows.push(row);
                             cx.notify();
                         });
+                        // 点了「添加一行」就该能直接打字,不必再点一下新行
+                        autofocus(&key, window, cx);
                     }
                 }),
         ),

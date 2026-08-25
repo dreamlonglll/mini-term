@@ -34,7 +34,7 @@ use crate::mobile_relay::{
     self, QR_CANVAS_PX, QR_QUIET_MODULES, QrMatrix, RelayBridge, command_warning,
     launcher_draft_valid, launcher_subtitle, upsert_launcher,
 };
-use crate::prompt::{Confirm, dialog_title, kind, open_guarded};
+use crate::prompt::{Confirm, autofocus, dialog_title, kind, open_guarded};
 use crate::store::AppStore;
 use crate::ui;
 
@@ -139,6 +139,10 @@ pub fn open(window: &mut Window, cx: &mut App) {
             .default_value(relay.desktop_key.clone())
     });
 
+    // 打开即可直接改中转地址(密钥框是 masked,不该抢焦点)。聚焦排在
+    // `open_guarded` 之后,判据见 `prompt::autofocus`
+    let url_for_focus = url.clone();
+
     let state = cx.new(|cx| {
         // 两个输入框里按回车 = 点「保存并连接」(原版 `onKeyDown` 那两处)。
         // `InputState` 在单行模式下无条件 emit `PressEnter`,订阅它比抢键位直白。
@@ -189,6 +193,8 @@ pub fn open(window: &mut Window, cx: &mut App) {
             .overlay_closable(false)
             .child(body)
     });
+
+    autofocus(&url_for_focus, window, cx);
 }
 
 // ─── 动作 ─────────────────────────────────────────────────────
@@ -588,6 +594,7 @@ fn render_launchers(
                             InputState::new(window, cx)
                                 .placeholder(t("mobileRelay", "launchers.commandPlaceholder"))
                         });
+                        let name_for_focus = name.clone();
                         state.update(cx, |panel, cx| {
                             panel.draft = Some(Draft {
                                 id: String::new(),
@@ -597,6 +604,8 @@ fn render_launchers(
                             });
                             cx.notify();
                         });
+                        // 点了「+ 添加」就该能直接敲名字,不必再点一下表单
+                        autofocus(&name_for_focus, window, cx);
                     }
                 }),
             ),
@@ -678,6 +687,7 @@ fn render_launcher_row(
                             .placeholder(t("mobileRelay", "launchers.commandPlaceholder"))
                             .default_value(command.clone())
                     });
+                    let name_for_focus = name_input.clone();
                     state.update(cx, |panel, cx| {
                         panel.draft = Some(Draft {
                             id: id.clone(),
@@ -687,6 +697,8 @@ fn render_launcher_row(
                         });
                         cx.notify();
                     });
+                    // 点了「编辑」就该能直接改名字
+                    autofocus(&name_for_focus, window, cx);
                 }
             }),
         )

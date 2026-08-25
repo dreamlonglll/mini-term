@@ -28,8 +28,8 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use gpui::{
-    App, AppContext, ClickEvent, Focusable as _, InteractiveElement, IntoElement, ParentElement,
-    SharedString, StatefulInteractiveElement, Styled, Window, div, px,
+    App, AppContext, ClickEvent, Entity, Focusable as _, InteractiveElement, IntoElement,
+    ParentElement, SharedString, StatefulInteractiveElement, Styled, Window, div, px,
 };
 use gpui_component::WindowExt as _;
 use gpui_component::dialog::{Dialog, DialogButtonProps};
@@ -125,10 +125,53 @@ pub fn dialog_title(kind: &'static str, title: impl Into<SharedString>) -> impl 
         )
 }
 
-/// 这种弹窗现在开着吗。给「开之前要先做点别的」的调用方提前判一次用
-/// (见 [`show_prompt`]:它得先建输入框实体并抢焦点,被守卫拦下就白抢了)。
-fn is_open(kind: &'static str) -> bool {
+/// 这种弹窗现在开着吗。给「开之前/开之后要先做点别的」的调用方提前判一次用:
+///
+/// - 开之前(见 [`show_prompt`]):建输入框实体这类活儿被守卫拦下就白干了;
+/// - 开之后(见 [`autofocus`]):[`open_guarded`] 拦下时**弹窗根本没开**,这时
+///   再聚焦等于把焦点送给一个永远不会被画出来的输入框 —— 键盘从此落进虚空,
+///   终端一个字也收不到。
+///
+/// 两头的活儿都靠调用点开头这一句提前 `return` 挡掉,所以它必须在**第一行**。
+pub fn is_open(kind: &'static str) -> bool {
     overlay::contains(overlay::key(kind))
+}
+
+// ─── 自动聚焦 ─────────────────────────────────────────────────
+
+/// 把焦点交给弹窗里的输入框。**必须排在 [`open_guarded`] 之后**调用。
+///
+/// # 为什么不能在开弹窗之前聚焦
+///
+/// `window.open_dialog` 内部有一句 `focus_handle.focus(window)`(gpui-component
+/// `root.rs`)——**弹窗一开就把焦点抢到自己的面板上**。而 `Window::focus` 只是
+/// 把 `window.focus` 改写成新的 id、后来者无条件覆盖前者,所以「先聚焦输入框、
+/// 再开弹窗」等于白聚焦:落地时焦点在 Dialog 面板上。
+///
+/// 这正是「弹出来整段是选中的、敲字却毫无反应,鼠标点一下才能打」的成因 ——
+/// 全选走的是 `focus.dispatch_action(&SelectAll, ..)`,它沿 dispatch tree 找
+/// handler、**不要求该节点持有焦点**,所以选区照样画得出来;键盘输入要的却是
+/// 真焦点,那时还挂在 Dialog 面板上,键落进的是弹窗而不是输入框。
+///
+/// # 为什么还要再 defer 一层
+///
+/// `open_dialog` 的抢焦点发生在 `Root::update` 里,与调用点同处一轮 effect;
+/// 排在它后面直接 focus 虽然通常也能赢,但 `window.defer` 让这一手稳稳落在
+/// **本轮 effect 全部跑完之后**,不必去推敲弹窗内部还会不会再动焦点。
+/// 输入框元素这时尚未画出并不要紧:`window.focus` 只记 id,下一帧
+/// `track_focus` 自会接上(`project_switcher` / `search_modal` 一直这么用)。
+///
+/// # 与 Dialog 键位的关系
+///
+/// 焦点落到输入框后,Esc / 回车照旧管用:单行 `InputState` 的 `escape` /
+/// `enter` 处理器都以 `cx.propagate()` 收尾(注释原话 "e.g.: In a dialog to
+/// confirm"),动作继续沿 dispatch tree 冒到外层 Dialog 的 `Cancel` / `Confirm`。
+/// 唯一会吞掉 Esc 的是 `clean_on_escape`,本仓一处没用。
+pub fn autofocus(input: &Entity<InputState>, window: &mut Window, cx: &mut App) {
+    let input = input.clone();
+    window.defer(cx, move |window, cx| {
+        input.update(cx, |state, cx| state.focus(window, cx));
+    });
 }
 
 // ─── prompt ───────────────────────────────────────────────────
@@ -147,8 +190,8 @@ pub fn show_prompt(
     window: &mut Window,
     cx: &mut App,
 ) {
-    // 守卫要在**建输入框之前**判:open_guarded 里那道判定拦下来的时候,
-    // 焦点已经被下面这个新输入框抢走了(而它永远不会被画出来)
+    // 守卫要在**建输入框之前**判:`open_guarded` 里那道判定拦下来的时候弹窗
+    // 压根没开,底下那句 `autofocus` 会把焦点送给一个永远不会被画出来的输入框
     if is_open(kind::PROMPT) {
         return;
     }
@@ -161,9 +204,10 @@ pub fn show_prompt(
             .placeholder(placeholder.into())
             .default_value(default_value)
     });
-    // 打开即可直接打字,不必先点一下输入框。
-    input.update(cx, |state, cx| state.focus(window, cx));
     let on_ok = Rc::new(on_ok);
+    // 打开即可直接打字,不必先点一下输入框。真正的聚焦排在 `open_guarded`
+    // **之后**(见 [`autofocus`]),这里只是先留一份引用
+    let input_for_focus = input.clone();
 
     open_guarded(kind::PROMPT, window, cx, move |dialog, window, cx| {
         // 「有默认值就全选」(重命名多半是整个换掉)。`InputState::select_all`
@@ -201,6 +245,8 @@ pub fn show_prompt(
                 true
             })
     });
+
+    autofocus(&input_for_focus, window, cx);
 }
 
 // ─── confirm ──────────────────────────────────────────────────

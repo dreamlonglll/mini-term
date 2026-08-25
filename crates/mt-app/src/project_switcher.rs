@@ -35,7 +35,7 @@ use mt_config::{AppConfig, ProjectTreeItem};
 
 use crate::i18n::t;
 use crate::overlay::kind;
-use crate::prompt::{close_guarded, open_guarded};
+use crate::prompt::{autofocus, close_guarded, open_guarded};
 use crate::store::AppStore;
 use crate::tree::PaneStatus;
 use crate::ui;
@@ -118,11 +118,9 @@ pub fn open(store: Entity<AppStore>, window: &mut Window, cx: &mut App) {
         }
     });
 
-    // Dialog 打开时会把焦点抢到自己的面板上(`open_dialog` 里那句
-    // `focus_handle.focus(window)`),所以聚焦输入框必须**排到它后面**。
-    window.defer(cx, move |window, cx| {
-        input.update(cx, |state, cx| state.focus(window, cx));
-    });
+    // Dialog 打开时会把焦点抢到自己的面板上,所以聚焦输入框必须**排到它后面**
+    // (判据全文见 `prompt::autofocus`)
+    autofocus(&input, window, cx);
 }
 
 impl ProjectSwitcher {
