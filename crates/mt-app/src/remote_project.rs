@@ -36,8 +36,8 @@ use crate::i18n::t;
 use crate::prompt::{autofocus, close_guarded, kind, open_guarded};
 use crate::ssh_conn::{SshGroupBucket, build_group_buckets};
 use crate::ssh_panel::{
-    GroupKey, PANEL_W, bucket_header, bucket_key, conn_card, conn_text, panel_header,
-    panel_total_h, resolve_active, sidebar_row, visible_buckets,
+    BucketCollapse, GroupKey, PANEL_W, conn_card, conn_text, panel_footer, panel_header,
+    panel_total_h, render_conn_buckets, resolve_active, sidebar_row, visible_buckets,
 };
 use crate::store::AppStore;
 use crate::ui;
@@ -67,6 +67,12 @@ pub struct AddRemotePanel {
 impl Render for AddRemotePanel {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
+    }
+}
+
+impl BucketCollapse for AddRemotePanel {
+    fn collapsed_set(&mut self) -> &mut HashSet<String> {
+        &mut self.collapsed
     }
 }
 
@@ -401,87 +407,62 @@ fn render_list(state: &Entity<AddRemotePanel>, frame: &Frame) -> AnyElement {
         .flex_col()
         .gap(px(12.0));
 
-    for bucket in visible_buckets(&frame.order, &frame.active) {
-        let key = bucket_key(&bucket);
-        let collapsed = frame.active == GroupKey::All && frame.collapsed.contains(&key);
-        let mut section = div().flex().flex_col().gap(px(6.0));
-        if frame.active == GroupKey::All && (bucket.group.is_some() || has_named) {
-            let label: SharedString = match &bucket.group {
-                Some(g) => g.clone().into(),
-                None => t("remoteProject", "ungrouped").into(),
-            };
-            section = section.child(
-                bucket_header(
-                    SharedString::from(format!("remote-bucket-{key}")),
-                    label,
-                    bucket.items.len(),
-                    collapsed,
+    // 骨架与另两个弹窗共用(见 [`crate::ssh_panel::render_conn_buckets`]);
+    // 本弹窗的行内容是单选圆点
+    list = list.children(render_conn_buckets(
+        state,
+        visible_buckets(&frame.order, &frame.active),
+        &frame.active,
+        &frame.collapsed,
+        has_named,
+        "remote-bucket-",
+        t("remoteProject", "ungrouped"),
+        |conn| {
+            let id = conn.id.clone();
+            let selected = frame.connection_id == id;
+            conn_card(SharedString::from(format!("remote-row-{id}")), selected)
+                .cursor_pointer()
+                // 单选钮:实心圆点表示选中(与 `ui::checkbox` 同尺寸)
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(14.0))
+                        .h(px(14.0))
+                        .rounded_full()
+                        .border_1()
+                        .border_color(if selected {
+                            ui::accent()
+                        } else {
+                            ui::border_strong()
+                        })
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .when(selected, |el| {
+                            el.child(
+                                div()
+                                    .w(px(7.0))
+                                    .h(px(7.0))
+                                    .rounded_full()
+                                    .bg(ui::accent()),
+                            )
+                        }),
                 )
+                .child(conn_text(conn, ""))
                 .on_click({
                     let state = state.clone();
-                    let key = key.clone();
+                    let id = id.clone();
                     move |_: &ClickEvent, _window: &mut Window, cx: &mut App| {
-                        let key = key.clone();
+                        let id = id.clone();
                         state.update(cx, |panel, cx| {
-                            if !panel.collapsed.remove(&key) {
-                                panel.collapsed.insert(key);
-                            }
+                            panel.connection_id = id;
                             cx.notify();
                         });
                     }
-                }),
-            );
-        }
-        if !collapsed {
-            for conn in &bucket.items {
-                let id = conn.id.clone();
-                let selected = frame.connection_id == id;
-                section = section.child(
-                    conn_card(SharedString::from(format!("remote-row-{id}")), selected)
-                        .cursor_pointer()
-                        // 单选钮:实心圆点表示选中(与 `ui::checkbox` 同尺寸)
-                        .child(
-                            div()
-                                .flex_none()
-                                .w(px(14.0))
-                                .h(px(14.0))
-                                .rounded_full()
-                                .border_1()
-                                .border_color(if selected {
-                                    ui::accent()
-                                } else {
-                                    ui::border_strong()
-                                })
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .when(selected, |el| {
-                                    el.child(
-                                        div()
-                                            .w(px(7.0))
-                                            .h(px(7.0))
-                                            .rounded_full()
-                                            .bg(ui::accent()),
-                                    )
-                                }),
-                        )
-                        .child(conn_text(conn, ""))
-                        .on_click({
-                            let state = state.clone();
-                            let id = id.clone();
-                            move |_: &ClickEvent, _window: &mut Window, cx: &mut App| {
-                                let id = id.clone();
-                                state.update(cx, |panel, cx| {
-                                    panel.connection_id = id;
-                                    cx.notify();
-                                });
-                            }
-                        }),
-                );
-            }
-        }
-        list = list.child(section);
-    }
+                })
+                .into_any_element()
+        },
+    ));
     list.into_any_element()
 }
 
@@ -537,21 +518,7 @@ fn render_form(state: &Entity<AddRemotePanel>, frame: &Frame, cx: &App) -> AnyEl
 fn render_footer(state: &Entity<AddRemotePanel>, frame: &Frame) -> AnyElement {
     let busy = frame.busy;
     let disabled = busy || frame.total == 0;
-    div()
-        .flex()
-        .items_center()
-        .gap(px(12.0))
-        .px(px(20.0))
-        .py(px(10.0))
-        .border_t_1()
-        .border_color(ui::border_subtle())
-        .child(
-            div()
-                .flex_1()
-                .text_size(ui::font_px(10.0))
-                .text_color(ui::text_muted())
-                .child(t("remoteProject", "footerHint")),
-        )
+    panel_footer(t("remoteProject", "footerHint"))
         .child(
             ui::ghost_button("remote-cancel", t("remoteProject", "cancel"))
                 .opacity(if busy { 0.4 } else { 1.0 })

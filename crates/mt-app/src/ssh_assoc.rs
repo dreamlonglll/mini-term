@@ -36,9 +36,8 @@ use crate::i18n::{t, tr};
 use crate::prompt::{close_guarded, kind, open_guarded, show_alert};
 use crate::ssh_conn::{SshGroupBucket, build_group_buckets, initial_checked};
 use crate::ssh_panel::{
-    GroupKey, PANEL_W, bucket_header, bucket_key, conn_card, conn_text, panel_header,
-    panel_total_h,
-    resolve_active, sidebar_row, visible_buckets,
+    BucketCollapse, GroupKey, PANEL_W, conn_card, conn_text, panel_footer, panel_header,
+    panel_total_h, render_conn_buckets, resolve_active, sidebar_row, visible_buckets,
 };
 use crate::store::{AppStore, SshAssocOutcome};
 use crate::ui;
@@ -62,6 +61,12 @@ pub struct SshAssocPanel {
 impl Render for SshAssocPanel {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
+    }
+}
+
+impl BucketCollapse for SshAssocPanel {
+    fn collapsed_set(&mut self) -> &mut HashSet<String> {
+        &mut self.collapsed
     }
 }
 
@@ -418,69 +423,43 @@ fn render_list(state: &Entity<SshAssocPanel>, frame: &Frame) -> AnyElement {
             ),
     );
 
-    let has_named = !frame.named.is_empty();
-    for bucket in buckets {
-        let key = bucket_key(&bucket);
-        let collapsed = frame.active == GroupKey::All && frame.collapsed.contains(&key);
-        let mut section = div().flex().flex_col().gap(px(6.0));
-        if frame.active == GroupKey::All && (bucket.group.is_some() || has_named) {
-            let label: SharedString = match &bucket.group {
-                Some(g) => g.clone().into(),
-                None => t("sshAssoc", "ungrouped").into(),
-            };
-            section = section.child(
-                bucket_header(
-                    SharedString::from(format!("ssh-assoc-bucket-{key}")),
-                    label,
-                    bucket.items.len(),
-                    collapsed,
-                )
+    // 骨架与另两个弹窗共用(见 [`crate::ssh_panel::render_conn_buckets`]);
+    // 本弹窗的行内容是勾选框 + 整行可点
+    list = list.children(render_conn_buckets(
+        state,
+        buckets,
+        &frame.active,
+        &frame.collapsed,
+        !frame.named.is_empty(),
+        "ssh-assoc-bucket-",
+        t("sshAssoc", "ungrouped"),
+        |conn| {
+            let id = conn.id.clone();
+            let on = frame.checked.contains(&id);
+            conn_card(SharedString::from(format!("ssh-assoc-row-{id}")), false)
+                .cursor_pointer()
+                .child(ui::checkbox(
+                    SharedString::from(format!("ssh-assoc-cb-{id}")),
+                    on,
+                ))
+                .child(conn_text(conn, ""))
+                // 整行可点(原版是 `<label>` 包着 checkbox)
                 .on_click({
                     let state = state.clone();
-                    let key = key.clone();
+                    let id = id.clone();
                     move |_: &ClickEvent, _window: &mut Window, cx: &mut App| {
-                        let key = key.clone();
+                        let id = id.clone();
                         state.update(cx, |panel, cx| {
-                            if !panel.collapsed.remove(&key) {
-                                panel.collapsed.insert(key);
+                            if !panel.checked.remove(&id) {
+                                panel.checked.insert(id);
                             }
                             cx.notify();
                         });
                     }
-                }),
-            );
-        }
-        if !collapsed {
-            for conn in &bucket.items {
-                let id = conn.id.clone();
-                let on = frame.checked.contains(&id);
-                section = section.child(
-                    conn_card(SharedString::from(format!("ssh-assoc-row-{id}")), false)
-                        .cursor_pointer()
-                        .child(ui::checkbox(
-                            SharedString::from(format!("ssh-assoc-cb-{id}")),
-                            on,
-                        ))
-                        .child(conn_text(conn, ""))
-                        // 整行可点(原版是 `<label>` 包着 checkbox)
-                        .on_click({
-                            let state = state.clone();
-                            let id = id.clone();
-                            move |_: &ClickEvent, _window: &mut Window, cx: &mut App| {
-                                let id = id.clone();
-                                state.update(cx, |panel, cx| {
-                                    if !panel.checked.remove(&id) {
-                                        panel.checked.insert(id);
-                                    }
-                                    cx.notify();
-                                });
-                            }
-                        }),
-                );
-            }
-        }
-        list = list.child(section);
-    }
+                })
+                .into_any_element()
+        },
+    ));
     list.into_any_element()
 }
 
@@ -507,54 +486,40 @@ fn set_many(
 
 fn render_footer(state: &Entity<SshAssocPanel>, frame: &Frame) -> AnyElement {
     let busy = frame.busy;
-    div()
-        .flex()
-        .items_center()
-        .gap(px(12.0))
-        .px(px(20.0))
-        .py(px(10.0))
-        .border_t_1()
-        .border_color(ui::border_subtle())
-        .child(
-            div()
-                .flex_1()
-                .text_size(ui::font_px(10.0))
-                .text_color(ui::text_muted())
-                .child(if frame.checked.is_empty() {
-                    t("sshAssoc", "footerHintEmpty")
-                } else {
-                    t("sshAssoc", "footerHintSelected")
-                }),
-        )
-        .child(
-            ui::ghost_button("ssh-assoc-cancel", t("sshAssoc", "cancel"))
-                .opacity(if busy { 0.4 } else { 1.0 })
-                .on_click({
-                    let state = state.clone();
-                    move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
-                        if state.read(cx).busy {
-                            return;
-                        }
-                        close(&state, window, cx);
-                    }
-                }),
-        )
-        .child(
-            ui::primary_button(
-                "ssh-assoc-save",
-                if busy {
-                    t("sshAssoc", "saving")
-                } else {
-                    t("sshAssoc", "save")
-                },
-            )
+    panel_footer(if frame.checked.is_empty() {
+        t("sshAssoc", "footerHintEmpty")
+    } else {
+        t("sshAssoc", "footerHintSelected")
+    })
+    .child(
+        ui::ghost_button("ssh-assoc-cancel", t("sshAssoc", "cancel"))
             .opacity(if busy { 0.4 } else { 1.0 })
             .on_click({
                 let state = state.clone();
-                move |_: &ClickEvent, window: &mut Window, cx: &mut App| save(&state, window, cx)
+                move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                    if state.read(cx).busy {
+                        return;
+                    }
+                    close(&state, window, cx);
+                }
             }),
+    )
+    .child(
+        ui::primary_button(
+            "ssh-assoc-save",
+            if busy {
+                t("sshAssoc", "saving")
+            } else {
+                t("sshAssoc", "save")
+            },
         )
-        .into_any_element()
+        .opacity(if busy { 0.4 } else { 1.0 })
+        .on_click({
+            let state = state.clone();
+            move |_: &ClickEvent, window: &mut Window, cx: &mut App| save(&state, window, cx)
+        }),
+    )
+    .into_any_element()
 }
 
 #[cfg(test)]

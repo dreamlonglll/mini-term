@@ -13,6 +13,11 @@
 //! 「左栏 + 右栏桶」是同构的,原版靠 `import { GroupSidebarRow } from './SshModal'`
 //! 共用,这里照办。
 //!
+//! 右栏那整套「分组折叠 + 逐条渲染」也在这儿([`render_conn_buckets`] +
+//! [`BucketCollapse`])—— 此前三个弹窗各抄一份,连折叠开关的闭包都一字不差;
+//! 行内容(单选圆点 / 勾选框 / 行内表单)由闭包注入,那才是三家真正的差别。
+//! 底栏外壳 [`panel_footer`] 同理,多加一个消费方 [`crate::env_vars`]。
+//!
 //! # 与原版的三处形态差异
 //!
 //! 1. **拖拽走 gpui 的 `on_drag`/`on_drop`**,不是原版那套 mousedown/mousemove
@@ -270,6 +275,30 @@ pub(crate) fn panel_header(
         .into_any_element()
 }
 
+/// 弹窗底栏外壳:左边一句灰色脚注,右边的按钮由调用方 `.child()` 追加。
+///
+/// [`crate::ssh_assoc`] / [`crate::remote_project`] / [`crate::env_vars`] 三个
+/// 弹窗的底栏容器与脚注一字不差;**按钮不并进来** —— 它们的 id、置灰口径
+/// (busy / 空列表 / 校验未过)与点击语义三家各不相同,硬凑只会把三份分支塞进
+/// 一个签名里。
+pub(crate) fn panel_footer(hint: impl Into<SharedString>) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(12.0))
+        .px(px(20.0))
+        .py(px(10.0))
+        .border_t_1()
+        .border_color(ui::border_subtle())
+        .child(
+            div()
+                .flex_1()
+                .text_size(ui::font_px(10.0))
+                .text_color(ui::text_muted())
+                .child(hint.into()),
+        )
+}
+
 /// 一条连接的卡片外壳(名称 + `user@host:port` 副行)。三个弹窗共用同一款卡,
 /// 差别只在左侧的勾选框/单选钮与右侧的操作按钮,由调用方追加。
 pub(crate) fn conn_card(
@@ -322,6 +351,74 @@ pub(crate) fn conn_text(conn: &SshConnection, suffix: &str) -> AnyElement {
                 ))),
         )
         .into_any_element()
+}
+
+/// 右栏折叠态住在各自面板结构的 `collapsed` 字段上 —— [`render_conn_buckets`]
+/// 要改的就是这一个字段,三家的其余状态互不相干,所以只抽这一口。
+pub(crate) trait BucketCollapse: 'static {
+    fn collapsed_set(&mut self) -> &mut HashSet<String>;
+}
+
+/// 右栏「分组折叠 + 逐条渲染」的骨架。三个弹窗此前逐字重复三份,差别只有两处:
+/// 元素 id 前缀与**行内容**(本面板的行/行内表单二选一、[`crate::ssh_assoc`]
+/// 的勾选框、[`crate::remote_project`] 的单选圆点),后者由 `row` 闭包注入。
+///
+/// - **只有「全部」视图画桶标题**:选中某个具名分组时右栏就是那一桶,再画一遍
+///   组名是废话;同理折叠只在「全部」视图下生效(`active == All` 才看 `collapsed`);
+/// - `has_named` = 现在有没有具名分组。全是未分组连接时连「未分组」这个标题都
+///   不画 —— 原版 `bucket.group || hasNamedGroup` 那条;
+/// - 返回**一桶一个** `AnyElement`,调用方 `.children(...)` 铺进列表容器 ——
+///   三家的容器 id / padding / 空态提示各不相同,那一层不并。
+pub(crate) fn render_conn_buckets<T: BucketCollapse>(
+    state: &Entity<T>,
+    buckets: Vec<SshGroupBucket>,
+    active: &GroupKey,
+    collapsed: &HashSet<String>,
+    has_named: bool,
+    id_prefix: &'static str,
+    ungrouped_label: &'static str,
+    mut row: impl FnMut(&SshConnection) -> AnyElement,
+) -> Vec<AnyElement> {
+    let mut sections = Vec::with_capacity(buckets.len());
+    for bucket in buckets {
+        let key = bucket_key(&bucket);
+        let is_collapsed = *active == GroupKey::All && collapsed.contains(&key);
+        let mut section = div().flex().flex_col().gap(px(6.0));
+        if *active == GroupKey::All && (bucket.group.is_some() || has_named) {
+            let label: SharedString = match &bucket.group {
+                Some(g) => g.clone().into(),
+                None => ungrouped_label.into(),
+            };
+            section = section.child(
+                bucket_header(
+                    SharedString::from(format!("{id_prefix}{key}")),
+                    label,
+                    bucket.items.len(),
+                    is_collapsed,
+                )
+                .on_click({
+                    let state = state.clone();
+                    let key = key.clone();
+                    move |_: &ClickEvent, _window: &mut Window, cx: &mut App| {
+                        let key = key.clone();
+                        state.update(cx, |panel, cx| {
+                            if !panel.collapsed_set().remove(&key) {
+                                panel.collapsed_set().insert(key);
+                            }
+                            cx.notify();
+                        });
+                    }
+                }),
+            );
+        }
+        if !is_collapsed {
+            for conn in &bucket.items {
+                section = section.child(row(conn));
+            }
+        }
+        sections.push(section.into_any_element());
+    }
+    sections
 }
 
 // ─── 表单纯逻辑 ───────────────────────────────────────────────
@@ -440,6 +537,12 @@ impl Render for SshPanel {
     /// 状态盒子。画面由 Dialog 的 builder 每帧重建(见 `modal.rs` 的说明)。
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
+    }
+}
+
+impl BucketCollapse for SshPanel {
+    fn collapsed_set(&mut self) -> &mut HashSet<String> {
+        &mut self.collapsed
     }
 }
 
@@ -1060,48 +1163,24 @@ fn render_list(state: &Entity<SshPanel>, frame: &Frame, cx: &mut App) -> AnyElem
         );
     }
 
-    for bucket in visible_buckets(&frame.order, &frame.active) {
-        let key = bucket_key(&bucket);
-        let collapsed = frame.active == GroupKey::All && frame.collapsed.contains(&key);
-        let mut section = div().flex().flex_col().gap(px(6.0));
-        if frame.active == GroupKey::All && (bucket.group.is_some() || has_named) {
-            let label: SharedString = match &bucket.group {
-                Some(g) => g.clone().into(),
-                None => t("sshModal", "ungrouped").into(),
-            };
-            section = section.child(
-                bucket_header(
-                    SharedString::from(format!("ssh-bucket-{key}")),
-                    label,
-                    bucket.items.len(),
-                    collapsed,
-                )
-                .on_click({
-                    let state = state.clone();
-                    let key = key.clone();
-                    move |_: &ClickEvent, _window, cx: &mut App| {
-                        let key = key.clone();
-                        state.update(cx, |panel, cx| {
-                            if !panel.collapsed.remove(&key) {
-                                panel.collapsed.insert(key);
-                            }
-                            cx.notify();
-                        });
-                    }
-                }),
-            );
-        }
-        if !collapsed {
-            for conn in &bucket.items {
-                if frame.editing_id.as_deref() == Some(conn.id.as_str()) {
-                    section = section.child(render_form(state, cx));
-                } else {
-                    section = section.child(render_row(state, conn, frame));
-                }
+    // 骨架与另两个弹窗共用(见 [`render_conn_buckets`]);本面板的行有两态 ——
+    // 正在编辑的那一条原地换成表单
+    list = list.children(render_conn_buckets(
+        state,
+        visible_buckets(&frame.order, &frame.active),
+        &frame.active,
+        &frame.collapsed,
+        has_named,
+        "ssh-bucket-",
+        t("sshModal", "ungrouped"),
+        |conn| {
+            if frame.editing_id.as_deref() == Some(conn.id.as_str()) {
+                render_form(state, cx)
+            } else {
+                render_row(state, conn, frame)
             }
-        }
-        list = list.child(section);
-    }
+        },
+    ));
 
     if frame.adding {
         list = list.child(render_form(state, cx));

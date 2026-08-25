@@ -108,6 +108,7 @@ mod toast;
 mod tray;
 mod tree;
 mod ui;
+mod update_check;
 mod usage_panel;
 
 use std::path::PathBuf;
@@ -377,7 +378,7 @@ struct Workspace {
     ///
     /// 与原版 `App.tsx:89` 的 `updateInfo` 同一份状态:只在进程内活着,不落盘,
     /// **也没有「忽略此版本」** —— 原版查完就一直亮着那颗按钮,直到升级为止。
-    update_release: Option<settings::ReleaseInfo>,
+    update_release: Option<crate::update_check::ReleaseInfo>,
     /// 系统托盘(状态灯 + 项目菜单)。**drop 即摘图标**,所以必须由 Workspace
     /// 持有而不是丢进全局:窗口没了托盘也就该没了。
     tray: Tray,
@@ -510,7 +511,7 @@ impl Workspace {
         let update_check = cx.spawn(async move |this, cx| {
             let found = cx
                 .background_executor()
-                .spawn(async { settings::newer_release(env!("CARGO_PKG_VERSION")) })
+                .spawn(async { crate::update_check::newer_release(env!("CARGO_PKG_VERSION")) })
                 .await;
             let Some(release) = found else { return };
             let _ = this.update(cx, |workspace: &mut Self, cx| {

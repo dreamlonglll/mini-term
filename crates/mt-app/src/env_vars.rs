@@ -35,7 +35,7 @@ use mt_config::ProjectEnvVar;
 
 use crate::i18n::{t, tr};
 use crate::prompt::{autofocus, close_guarded, kind, open_guarded};
-use crate::ssh_panel::panel_header;
+use crate::ssh_panel::{panel_footer, panel_header};
 use crate::store::AppStore;
 use crate::ui;
 
@@ -505,43 +505,29 @@ fn render_body(state: &Entity<EnvVarsPanel>, cx: &mut App) -> AnyElement {
 }
 
 fn render_footer(state: &Entity<EnvVarsPanel>, has_errors: bool) -> AnyElement {
-    div()
-        .flex()
-        .items_center()
-        .gap(px(12.0))
-        .px(px(20.0))
-        .py(px(10.0))
-        .border_t_1()
-        .border_color(ui::border_subtle())
-        .child(
-            div()
-                .flex_1()
-                .text_size(ui::font_px(10.0))
-                .text_color(ui::text_muted())
-                .child(if has_errors {
-                    t("envVars", "hasErrors")
-                } else {
-                    t("envVars", "footnote")
-                }),
-        )
-        .child(
-            ui::ghost_button("env-cancel", t("envVars", "cancel")).on_click(
+    panel_footer(if has_errors {
+        t("envVars", "hasErrors")
+    } else {
+        t("envVars", "footnote")
+    })
+    .child(
+        ui::ghost_button("env-cancel", t("envVars", "cancel")).on_click(
+            move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                close_guarded(kind::PROJECT_ENV_VARS, window, cx);
+            },
+        ),
+    )
+    .child(
+        ui::primary_button("env-save", t("envVars", "save"))
+            .opacity(if has_errors { 0.4 } else { 1.0 })
+            .on_click({
+                let state = state.clone();
                 move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
-                    close_guarded(kind::PROJECT_ENV_VARS, window, cx);
-                },
-            ),
-        )
-        .child(
-            ui::primary_button("env-save", t("envVars", "save"))
-                .opacity(if has_errors { 0.4 } else { 1.0 })
-                .on_click({
-                    let state = state.clone();
-                    move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
-                        save(&state, window, cx);
-                    }
-                }),
-        )
-        .into_any_element()
+                    save(&state, window, cx);
+                }
+            }),
+    )
+    .into_any_element()
 }
 
 #[cfg(test)]
