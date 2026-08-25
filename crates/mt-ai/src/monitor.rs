@@ -6,9 +6,13 @@
 
 use serde::Serialize;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+
+// 去重表被 hook HTTP 线程、500ms 轮询线程与 GPUI 主线程共同发射,
+// 与 tracker/hook_server 那批表同一条命脉:用 parking_lot 免掉锁中毒。
+use parking_lot::Mutex;
 
 use crate::hook_server::HookState;
 use crate::tracker::SessionTracker;
@@ -127,7 +131,7 @@ impl StatusEmitter {
         cause: Option<&str>,
         agent: Option<String>,
     ) {
-        let mut prev = self.prev.lock().unwrap();
+        let mut prev = self.prev.lock();
         if let Some((prev_status, prev_cause)) = prev.get(&pty_id) {
             if prev_status == status {
                 match cause {
@@ -157,14 +161,13 @@ impl StatusEmitter {
     pub(crate) fn last_cause(&self, pty_id: u32) -> Option<String> {
         self.prev
             .lock()
-            .unwrap()
             .get(&pty_id)
             .and_then(|(_, cause)| cause.clone())
     }
 
     /// 清掉已不存在的 pty 的去重记录
     pub fn retain(&self, alive: &[u32]) {
-        self.prev.lock().unwrap().retain(|id, _| alive.contains(id));
+        self.prev.lock().retain(|id, _| alive.contains(id));
     }
 }
 
@@ -695,7 +698,7 @@ mod tests {
         let seen: Arc<Mutex<Vec<(String, Option<String>)>>> = Arc::new(Mutex::new(Vec::new()));
         let sink_seen = seen.clone();
         let emitter = StatusEmitter::new(Arc::new(move |c: StatusChange| {
-            sink_seen.lock().unwrap().push((c.status, c.cause));
+            sink_seen.lock().push((c.status, c.cause));
         }));
 
         emitter.emit_if_changed(1, "ai-working", None, None);
@@ -706,7 +709,7 @@ mod tests {
         emitter.emit_if_changed(1, "ai-working", Some("PreToolUse"), None); // 同成因 → 吞
         emitter.emit_if_changed(1, "ai-idle", Some("Stop"), None);
 
-        let got = seen.lock().unwrap().clone();
+        let got = seen.lock().clone();
         assert_eq!(
             got,
             vec![

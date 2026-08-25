@@ -10,9 +10,15 @@ use crate::monitor::{SessionIdentity, StatusEmitter};
 use crate::tracker::SessionTracker;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+// hook HTTP 线程与 GPUI 主线程、500ms 轮询线程共享这几张表:std::sync::Mutex 一旦
+// 有持锁者 panic 就整把锁中毒,主线程下一次 lock 跟着 panic 整个进程就没了。
+// parking_lot 没有中毒概念(与 mt-app/mt-pty/mt-terminal 同款)。
+use parking_lot::Mutex;
 
 /// 默认监听端口
 const DEFAULT_PORT: u16 = 23456;
@@ -23,6 +29,9 @@ const ENDED_SESSIONS_CAP: usize = 8;
 /// 每个 PTY 跟踪的活跃会话数量上限（正常只有 1 个；嵌套非交互实例/事件乱序
 /// 时短暂多个，上限只是防御事件丢失导致的累积）
 const ACTIVE_SESSIONS_CAP: usize = 8;
+/// 单个 hook 请求 body 的字节上限。真实 payload 只有几百字节（三家 CLI 发的都是
+/// 一小段 JSON），1 MiB 已宽出三个数量级；超限直接 413，不进 JSON 解析。
+const MAX_HOOK_BODY_BYTES: usize = 1024 * 1024;
 /// Hook 事件的 JSON payload
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)] // 保留完整字段供未来 UI 细化使用
@@ -123,12 +132,12 @@ impl HookState {
     ///
     /// 一旦启用，完全信任 hook 状态，不再降级回进程轮询。
     pub fn is_hook_enabled(&self, pty_id: u32) -> bool {
-        self.hook_enabled.lock().unwrap().contains(&pty_id)
+        self.hook_enabled.lock().contains(&pty_id)
     }
 
     /// 获取指定 PTY 的 hook 状态
     pub fn get_status(&self, pty_id: u32) -> Option<String> {
-        self.last_hook_status.lock().unwrap().get(&pty_id).cloned()
+        self.last_hook_status.lock().get(&pty_id).cloned()
     }
 
     /// 距上一次 hook 事件（或上一次状态落盘）的时长；从未收到过事件返回 None。
@@ -137,14 +146,13 @@ impl HookState {
     pub(crate) fn status_age(&self, pty_id: u32) -> Option<Duration> {
         self.last_hook_time
             .lock()
-            .unwrap()
             .get(&pty_id)
             .map(|t| t.elapsed())
     }
 
     /// 当前会话身份;从未收到带 session_id 的事件时返回 None
     pub fn session_of(&self, pty_id: u32) -> Option<HookSessionId> {
-        self.last_session.lock().unwrap().get(&pty_id).cloned()
+        self.last_session.lock().get(&pty_id).cloned()
     }
 
     /// 记录 hook 上报的会话身份(每个事件都带,直接覆盖即可)。
@@ -152,7 +160,7 @@ impl HookState {
     /// agent 也参与比较:codex 的 SessionStart 不带 turn_id 会被 hook 二进制
     /// 误推断为 claude-code,靠后续带 turn_id 的事件在这里纠正并重新通知。
     fn record_session(&self, pty_id: u32, agent: Option<String>, session_id: String) -> bool {
-        let mut map = self.last_session.lock().unwrap();
+        let mut map = self.last_session.lock();
         let changed = map
             .get(&pty_id)
             .is_none_or(|prev| prev.session_id != session_id || prev.agent != agent);
@@ -162,35 +170,34 @@ impl HookState {
 
     /// 更新指定 PTY 的 hook 状态
     pub(crate) fn update(&self, pty_id: u32, status: String) {
-        self.hook_enabled.lock().unwrap().insert(pty_id);
+        self.hook_enabled.lock().insert(pty_id);
         self.last_hook_time
             .lock()
-            .unwrap()
             .insert(pty_id, Instant::now());
-        self.last_hook_status.lock().unwrap().insert(pty_id, status);
+        self.last_hook_status.lock().insert(pty_id, status);
     }
 
     /// 移除指定 PTY 的 hook 状态。不清墓碑：SessionEnd 打完墓碑后调用
     /// 本方法，墓碑要继续挡住旧会话的迟到事件。
     pub fn remove(&self, pty_id: u32) {
-        self.hook_enabled.lock().unwrap().remove(&pty_id);
-        self.last_hook_time.lock().unwrap().remove(&pty_id);
-        self.last_hook_status.lock().unwrap().remove(&pty_id);
-        self.last_session.lock().unwrap().remove(&pty_id);
+        self.hook_enabled.lock().remove(&pty_id);
+        self.last_hook_time.lock().remove(&pty_id);
+        self.last_hook_status.lock().remove(&pty_id);
+        self.last_session.lock().remove(&pty_id);
     }
 
     /// PTY 关闭时的彻底清理：hook 状态 + 墓碑 + 活跃会话集
     pub fn purge(&self, pty_id: u32) {
         self.remove(pty_id);
-        self.ended_sessions.lock().unwrap().remove(&pty_id);
-        self.active_sessions.lock().unwrap().remove(&pty_id);
+        self.ended_sessions.lock().remove(&pty_id);
+        self.active_sessions.lock().remove(&pty_id);
     }
 
     /// 记录会话为活跃。任意非 SessionEnd 事件都调（不只 SessionStart：
     /// hook server 中途启用时首个事件可能是 Stop/PreToolUse）。
     /// 有序去重；超容量挤掉最老的——正常情况集合里只有 1 个。
     fn note_session_active(&self, pty_id: u32, session_id: &str) {
-        let mut map = self.active_sessions.lock().unwrap();
+        let mut map = self.active_sessions.lock();
         let queue = map.entry(pty_id).or_default();
         if queue.iter().any(|s| s == session_id) {
             return;
@@ -206,7 +213,7 @@ impl HookState {
     /// 非空 → pane 上还有别的活跃会话（嵌套 `claude -p` / 退出后立刻重开的
     /// 乱序），只打墓碑不销毁。payload 无 session_id 时不移除，仅报告空否。
     fn end_session(&self, pty_id: u32, session_id: Option<&str>) -> bool {
-        let mut map = self.active_sessions.lock().unwrap();
+        let mut map = self.active_sessions.lock();
         let Some(queue) = map.get_mut(&pty_id) else {
             return true;
         };
@@ -222,7 +229,7 @@ impl HookState {
 
     /// 给已结束的会话 id 打墓碑
     pub fn mark_session_ended(&self, pty_id: u32, session_id: String) {
-        let mut map = self.ended_sessions.lock().unwrap();
+        let mut map = self.ended_sessions.lock();
         let queue = map.entry(pty_id).or_default();
         if queue.iter().any(|s| s == &session_id) {
             return;
@@ -237,7 +244,6 @@ impl HookState {
     pub fn is_session_ended(&self, pty_id: u32, session_id: &str) -> bool {
         self.ended_sessions
             .lock()
-            .unwrap()
             .get(&pty_id)
             .is_some_and(|q| q.iter().any(|s| s == session_id))
     }
@@ -245,29 +251,29 @@ impl HookState {
     /// 摘除墓碑:SessionStart 表明同 id 会话再次存活(退出后 claude -c / --resume
     /// 重开),不摘的话该会话的后续事件被永久忽略,身份也无法重新记录
     pub fn revive_session(&self, pty_id: u32, session_id: &str) {
-        if let Some(queue) = self.ended_sessions.lock().unwrap().get_mut(&pty_id) {
+        if let Some(queue) = self.ended_sessions.lock().get_mut(&pty_id) {
             queue.retain(|s| s != session_id);
         }
     }
 
     /// 获取当前服务器端口
     pub fn get_port(&self) -> u16 {
-        *self.port.lock().unwrap()
+        *self.port.lock()
     }
 
     /// 设置服务器端口
     fn set_port(&self, port: u16) {
-        *self.port.lock().unwrap() = port;
+        *self.port.lock() = port;
     }
 
     /// 保存 server 实例
     fn set_server(&self, server: Option<Arc<tiny_http::Server>>) {
-        *self.server.lock().unwrap() = server;
+        *self.server.lock() = server;
     }
 
     /// 检查 server 是否正在运行
     pub fn is_server_running(&self) -> bool {
-        self.server.lock().unwrap().is_some()
+        self.server.lock().is_some()
     }
 
     /// 与 server 启停串行化地执行回调。
@@ -278,7 +284,7 @@ impl HookState {
     /// true、`resolve_status` 仍认 hook 状态权威,而唯一能把它从 ai-working 拉回来
     /// 的收敛路径被挡在门外——黄灯从此永久卡死。
     pub fn with_server_lock<T>(&self, callback: impl FnOnce() -> T) -> T {
-        let _guard = self.server.lock().unwrap();
+        let _guard = self.server.lock();
         callback()
     }
 }
@@ -570,11 +576,37 @@ pub fn start_hook_server(
                 continue;
             }
 
-            // 读取 body
+            // 读取 body。端点监听在 127.0.0.1 且无鉴权(改鉴权要动 sidecar 协议),
+            // 同机任意进程都能 POST 过来,不封顶等于把内存交给对方:先看
+            // Content-Length 拦掉声明超限的,再用 take() 兜住谎报/分块传输的情形。
+            if request
+                .body_length()
+                .is_some_and(|n| n > MAX_HOOK_BODY_BYTES)
+            {
+                let response =
+                    tiny_http::Response::from_string("Payload Too Large").with_status_code(413);
+                let _ = request.respond(response);
+                continue;
+            }
             let mut body = String::new();
-            if request.as_reader().read_to_string(&mut body).is_err() {
+            // 多读一个字节:读满 MAX+1 说明真身超限,而不是刚好卡在上限
+            let read = request
+                .as_reader()
+                .take(MAX_HOOK_BODY_BYTES as u64 + 1)
+                .read_to_string(&mut body);
+            if read.is_err() {
                 let response =
                     tiny_http::Response::from_string("Bad Request").with_status_code(400);
+                let _ = request.respond(response);
+                continue;
+            }
+            if body.len() > MAX_HOOK_BODY_BYTES {
+                eprintln!(
+                    "[hook-server] body 超过 {} 字节上限，已拒绝",
+                    MAX_HOOK_BODY_BYTES
+                );
+                let response =
+                    tiny_http::Response::from_string("Payload Too Large").with_status_code(413);
                 let _ = request.respond(response);
                 continue;
             }
@@ -741,7 +773,7 @@ pub fn start_hook_server(
 /// 取出保存的 server 实例，调用 `unblock()` 中断阻塞循环，
 /// 清理端口文件并重置端口。
 pub fn stop_hook_server(hook_state: &HookState, data_dir: &Path) {
-    let server = hook_state.server.lock().unwrap().take();
+    let server = hook_state.server.lock().take();
     if let Some(s) = server {
         s.unblock();
         eprintln!("[hook-server] 服务器已停止");

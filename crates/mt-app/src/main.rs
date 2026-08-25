@@ -1791,10 +1791,39 @@ impl Render for Workspace {
     }
 }
 
+/// 全局 panic 兜底:在默认 hook 之前补一行带**线程名**的 stderr。
+///
+/// 倒下的多半不是主线程 —— PTY reader、hook HTTP、500ms 轮询、mt-relay 的 tokio
+/// 任务都在各自线程里跑,默认 hook 只打消息与位置,事后从用户贴来的日志里认不出
+/// 是哪条线路。原 hook 链式调用在后,backtrace 行为(RUST_BACKTRACE)一个字不改。
+///
+/// ⚠️ release 的 Windows GUI 子系统下 stderr 无处可去(见文件头 `windows_subsystem`
+/// 注释),这一行只在 dev 实例 / 控制台启动时看得见。
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        let name = thread.name().unwrap_or("<unnamed>");
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        eprintln!(
+            "[panic] thread={} at {}: {}",
+            name,
+            location,
+            info.payload_as_str().unwrap_or("<non-string payload>")
+        );
+        default_hook(info);
+    }));
+}
+
 fn main() {
     // 启动链路埋点的 T0。**必须是第一行** —— 往后每个 `startup_trace::mark`
     // 打的都是相对这一刻的偏移(装机版 `lib.rs::run()` 同位置)。
     startup_trace::init();
+    // 紧随其后装 panic 兜底:再往后的任何一行倒下都得留下可定位的一行日志。
+    install_panic_hook();
     Application::new().run(|cx: &mut App| {
         startup_trace::mark("setup enter");
         gpui_component::init(cx);

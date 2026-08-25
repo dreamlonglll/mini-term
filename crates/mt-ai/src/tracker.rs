@@ -5,8 +5,13 @@
 //! 最近输出时刻。PTY 只管字节进出,这些全是 AI 感知的私产,随迁移整块搬来。
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
+
+// 这批表被 GPUI 主线程(每次击键/每批 PTY 输出)、500ms 轮询线程与 hook HTTP 线程
+// 共同持有:std::sync::Mutex 只要有一个持锁者 panic 就整把锁中毒,其余线程下一次
+// lock 全部跟着 panic。parking_lot 没有中毒概念,与 mt-pty/mt-terminal 同款。
+use parking_lot::Mutex;
 
 use crate::detect::{
     line_ai_command_name, output_ai_command_name, AI_EXIT_COMMANDS,
@@ -236,18 +241,18 @@ impl SessionTracker {
     /// 用户敲 `exit` 后把 pane 开着不动,这些条目就一直留到手动关 pane 才被回收。
     /// 抽成一处后新增字段不会再漏掉其中一条路径。
     pub fn purge_pane(&self, pane_id: u32) {
-        self.ai_sessions.lock().unwrap().remove(&pane_id);
-        self.ai_started.lock().unwrap().remove(&pane_id);
-        self.input_states.lock().unwrap().remove(&pane_id);
-        self.last_ctrlc.lock().unwrap().remove(&pane_id);
-        self.last_enter.lock().unwrap().remove(&pane_id);
-        self.pending_submits.lock().unwrap().remove(&pane_id);
-        self.last_output.lock().unwrap().remove(&pane_id);
-        self.tui_redraw_cooldown_until.lock().unwrap().remove(&pane_id);
+        self.ai_sessions.lock().remove(&pane_id);
+        self.ai_started.lock().remove(&pane_id);
+        self.input_states.lock().remove(&pane_id);
+        self.last_ctrlc.lock().remove(&pane_id);
+        self.last_enter.lock().remove(&pane_id);
+        self.pending_submits.lock().remove(&pane_id);
+        self.last_output.lock().remove(&pane_id);
+        self.tui_redraw_cooldown_until.lock().remove(&pane_id);
     }
 
     pub fn has_recent_output(&self, pane_id: u32, within: Duration) -> bool {
-        let map = self.last_output.lock().unwrap();
+        let map = self.last_output.lock();
         map.get(&pane_id).is_some_and(|t| t.elapsed() < within)
     }
 
@@ -257,22 +262,21 @@ impl SessionTracker {
     pub fn note_output_for_test(&self, pane_id: u32) {
         self.last_output
             .lock()
-            .unwrap()
             .insert(pane_id, Instant::now());
     }
 
     pub fn is_ai_session(&self, pane_id: u32) -> bool {
-        self.ai_sessions.lock().unwrap().contains_key(&pane_id)
+        self.ai_sessions.lock().contains_key(&pane_id)
     }
 
     /// 会话内 AI 命令名("claude"/"codex"/…);不在 AI 会话中返回 None。
     pub fn ai_session_agent(&self, pane_id: u32) -> Option<String> {
-        self.ai_sessions.lock().unwrap().get(&pane_id).cloned()
+        self.ai_sessions.lock().get(&pane_id).cloned()
     }
 
     /// 本轮 AI 会话的启动时刻;不在 AI 会话中返回 None。
     pub fn ai_session_started_at(&self, pane_id: u32) -> Option<SystemTime> {
-        self.ai_started.lock().unwrap().get(&pane_id).copied()
+        self.ai_started.lock().get(&pane_id).copied()
     }
 
     /// hook 事件证明 AI 进程存活时把会话标记扶正：输入检测漏判启动
@@ -280,12 +284,11 @@ impl SessionTracker {
     /// 双击 Ctrl+C 只是打断并不退出）的自愈路径。已标记时幂等 no-op，
     /// 不重置 ai_started（对话镜像按它过滤旧记录，中途重置会错绑）。
     pub fn mark_ai_session(&self, pane_id: u32, agent: &str) {
-        let mut sessions = self.ai_sessions.lock().unwrap();
+        let mut sessions = self.ai_sessions.lock();
         if !sessions.contains_key(&pane_id) {
             sessions.insert(pane_id, agent.to_string());
             self.ai_started
                 .lock()
-                .unwrap()
                 .insert(pane_id, SystemTime::now());
         }
     }
@@ -297,16 +300,15 @@ impl SessionTracker {
     /// 否则退出瞬间 ConPTY 重绘把 scrollback 里的 "PS ..> claude" 再吐出来,
     /// 会被扫描误判成命令 echo 又把会话标回去。
     pub fn clear_ai_session(&self, pane_id: u32) {
-        self.ai_sessions.lock().unwrap().remove(&pane_id);
-        self.ai_started.lock().unwrap().remove(&pane_id);
-        self.last_ctrlc.lock().unwrap().remove(&pane_id);
-        self.last_enter.lock().unwrap().remove(&pane_id);
+        self.ai_sessions.lock().remove(&pane_id);
+        self.ai_started.lock().remove(&pane_id);
+        self.last_ctrlc.lock().remove(&pane_id);
+        self.last_enter.lock().remove(&pane_id);
     }
 
     pub fn drain_submits(&self, pane_id: u32) -> Vec<UserSubmit> {
         self.pending_submits
             .lock()
-            .unwrap()
             .remove(&pane_id)
             .unwrap_or_default()
     }
@@ -314,21 +316,20 @@ impl SessionTracker {
     /// 延长 TUI 重绘冷却窗口。采用 max 语义,不会缩短已有的更长冷却。
     /// resize 与 focus 共用同一冷却字段(效果一致:抑制 TUI 重绘刷新 last_output)。
     pub fn bump_cooldown(&self, pane_id: u32, duration: Duration) {
-        if let Ok(mut map) = self.tui_redraw_cooldown_until.lock() {
-            let new_until = Instant::now() + duration;
-            let final_until = match map.get(&pane_id).copied() {
-                Some(old) if old > new_until => old,
-                _ => new_until,
-            };
-            map.insert(pane_id, final_until);
-        }
+        let mut map = self.tui_redraw_cooldown_until.lock();
+        let new_until = Instant::now() + duration;
+        let final_until = match map.get(&pane_id).copied() {
+            Some(old) if old > new_until => old,
+            _ => new_until,
+        };
+        map.insert(pane_id, final_until);
     }
 
     pub fn is_in_cooldown(&self, pane_id: u32) -> bool {
         self.tui_redraw_cooldown_until
             .lock()
-            .ok()
-            .and_then(|m| m.get(&pane_id).copied())
+            .get(&pane_id)
+            .copied()
             .is_some_and(|until| Instant::now() < until)
     }
 
@@ -352,12 +353,11 @@ impl SessionTracker {
             let recently_entered = self
                 .last_enter
                 .lock()
-                .unwrap()
                 .get(&pane_id)
                 .map(|t| t.elapsed() < AI_ENTER_SCAN_WINDOW)
                 .unwrap_or(false);
             if recently_entered {
-                let mut sessions = self.ai_sessions.lock().unwrap();
+                let mut sessions = self.ai_sessions.lock();
                 if !sessions.contains_key(&pane_id) {
                     if let Some(agent) = output_ai_command_name(data) {
                         sessions.insert(pane_id, agent.to_string());
@@ -371,9 +371,7 @@ impl SessionTracker {
         // Alternate Screen Buffer,这些重绘数据不能被状态判定当作 AI 活跃信号,
         // 否则会触发 ai-working 状态闪烁和假完成通知。
         if !self.is_in_cooldown(pane_id) {
-            if let Ok(mut map) = self.last_output.lock() {
-                map.insert(pane_id, Instant::now());
-            }
+            self.last_output.lock().insert(pane_id, Instant::now());
         }
     }
 
@@ -392,7 +390,7 @@ impl SessionTracker {
         let mut enter_ai: Option<&'static str> = None;
         let mut exit_ai = false;
         {
-            let mut states = self.input_states.lock().unwrap();
+            let mut states = self.input_states.lock();
             let state = states.entry(pane_id).or_default();
             // 单独一个字节的裸 Esc 是**用户按了 Esc 键**,不是转义序列的开头
             // (判据与 [`crate::detect::is_interrupt_key`] 同一条:终端把方向键、
@@ -429,7 +427,7 @@ impl SessionTracker {
                         state.clear_line();
                         if in_ai {
                             // Ctrl+C: 单次取消当前任务，连续两次退出 AI 会话
-                            let mut last = self.last_ctrlc.lock().unwrap();
+                            let mut last = self.last_ctrlc.lock();
                             let now = Instant::now();
                             if let Some(prev) = last.get(&pane_id) {
                                 if now.duration_since(*prev) < DOUBLE_CTRLC_WINDOW {
@@ -464,7 +462,6 @@ impl SessionTracker {
                         if !trimmed.is_empty() || snapshot_agent.is_some() {
                             self.last_enter
                                 .lock()
-                                .unwrap()
                                 .insert(pane_id, Instant::now());
                         }
                         if self.is_ai_session(pane_id) {
@@ -486,7 +483,6 @@ impl SessionTracker {
                                     .unwrap_or(0);
                                 self.pending_submits
                                     .lock()
-                                    .unwrap()
                                     .entry(pane_id)
                                     .or_default()
                                     .push(UserSubmit {
@@ -530,11 +526,9 @@ impl SessionTracker {
         if let Some(agent) = enter_ai {
             self.ai_sessions
                 .lock()
-                .unwrap()
                 .insert(pane_id, agent.to_string());
             self.ai_started
                 .lock()
-                .unwrap()
                 .insert(pane_id, SystemTime::now());
         } else if exit_ai {
             self.clear_ai_session(pane_id);
@@ -650,12 +644,12 @@ mod tests {
         mgr.track_input(1, "claude\r");
         // 会话内提交 prompt 会记录 last_enter(打开输出扫描窗口)
         mgr.track_input(1, "fix the bug\r");
-        assert!(mgr.last_enter.lock().unwrap().contains_key(&1));
+        assert!(mgr.last_enter.lock().contains_key(&1));
         // 双击 Ctrl+C 退出后窗口必须关闭,防止退出重绘把会话标回去
         mgr.track_input(1, "\x03");
         mgr.track_input(1, "\x03");
         assert!(!mgr.is_ai_session(1));
-        assert!(!mgr.last_enter.lock().unwrap().contains_key(&1));
+        assert!(!mgr.last_enter.lock().contains_key(&1));
     }
 
     #[test]
@@ -961,7 +955,6 @@ mod tests {
         let mgr = SessionTracker::new();
         mgr.pending_submits
             .lock()
-            .unwrap()
             .entry(1)
             .or_default()
             .push(UserSubmit {
@@ -1147,7 +1140,7 @@ mod tests {
     fn empty_enter_with_ai_autosuggestion_snapshot_does_not_open_output_scan_window() {
         let mgr = SessionTracker::new();
         mgr.track_input_with_line_snapshot(1, "\r", Some("D:\\Git\\mini-term> claude"));
-        assert!(!mgr.last_enter.lock().unwrap().contains_key(&1));
+        assert!(!mgr.last_enter.lock().contains_key(&1));
     }
 
     #[test]
@@ -1155,7 +1148,7 @@ mod tests {
         let mgr = SessionTracker::new();
         mgr.track_input(1, "\x1b[B");
         mgr.track_input_with_line_snapshot(1, "\r", Some("D:\\Git\\mini-term>"));
-        assert!(!mgr.last_enter.lock().unwrap().contains_key(&1));
+        assert!(!mgr.last_enter.lock().contains_key(&1));
     }
 
     #[test]
@@ -1265,7 +1258,6 @@ mod tests {
         let long_until = mgr
             .tui_redraw_cooldown_until
             .lock()
-            .unwrap()
             .get(&1)
             .copied()
             .unwrap();
@@ -1274,7 +1266,6 @@ mod tests {
         let after_short = mgr
             .tui_redraw_cooldown_until
             .lock()
-            .unwrap()
             .get(&1)
             .copied()
             .unwrap();
@@ -1304,7 +1295,6 @@ mod tests {
         mgr.bump_cooldown(id, RESIZE_COOLDOWN);
         mgr.pending_submits
             .lock()
-            .unwrap()
             .entry(id)
             .or_default()
             .push(UserSubmit {
@@ -1315,18 +1305,18 @@ mod tests {
 
         mgr.purge_pane(id);
 
-        assert!(mgr.last_output.lock().unwrap().is_empty(), "last_output 未清");
-        assert!(mgr.ai_sessions.lock().unwrap().is_empty(), "ai_sessions 未清");
-        assert!(mgr.ai_started.lock().unwrap().is_empty(), "ai_started 未清");
-        assert!(mgr.input_states.lock().unwrap().is_empty(), "input_states 未清");
-        assert!(mgr.last_ctrlc.lock().unwrap().is_empty(), "last_ctrlc 未清");
-        assert!(mgr.last_enter.lock().unwrap().is_empty(), "last_enter 未清");
+        assert!(mgr.last_output.lock().is_empty(), "last_output 未清");
+        assert!(mgr.ai_sessions.lock().is_empty(), "ai_sessions 未清");
+        assert!(mgr.ai_started.lock().is_empty(), "ai_started 未清");
+        assert!(mgr.input_states.lock().is_empty(), "input_states 未清");
+        assert!(mgr.last_ctrlc.lock().is_empty(), "last_ctrlc 未清");
+        assert!(mgr.last_enter.lock().is_empty(), "last_enter 未清");
         assert!(
-            mgr.pending_submits.lock().unwrap().is_empty(),
+            mgr.pending_submits.lock().is_empty(),
             "pending_submits 未清"
         );
         assert!(
-            mgr.tui_redraw_cooldown_until.lock().unwrap().is_empty(),
+            mgr.tui_redraw_cooldown_until.lock().is_empty(),
             "tui_redraw_cooldown_until 未清"
         );
     }

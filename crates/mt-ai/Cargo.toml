@@ -23,3 +23,7 @@ tiny_http = "0.12"
 # Codex 的 ~/.codex/config.toml 要开 features.codex_hooks,改 TOML 得保留用户
 # 自己的注释与排版,故用 toml_edit 而非 toml。
 toml_edit = "0.22"
+# AI 感知的那批状态表横跨三条线程(GPUI 主线程 / 500ms 轮询 / hook HTTP)。
+# std::sync::Mutex 的锁中毒会把任一线程的 panic 传染成全进程崩溃,故统一
+# 换 parking_lot(mt-app/mt-pty/mt-terminal 已是同款)。
+parking_lot.workspace = true
