@@ -2325,28 +2325,55 @@ impl AppStore {
     /// 标题栏的项目切换胶囊与托盘菜单(T 批)共用这一份,唯一的差别是 done 判据
     /// 从哪来 —— 见 [`DoneScope`]。
     pub fn ai_projects(&self, scope: DoneScope) -> AiProjects {
-        let panes = self.pane_refs(None);
+        self.ai_projects_of(&self.pane_refs(None), scope)
+    }
+
+    /// [`Self::ai_projects`] 的「pane 快照已经在手上」版本。
+    ///
+    /// 拆出来只为一件事:标题栏那一帧要把**同一份**快照喂给两个聚合器
+    /// (见 [`Self::title_bar_snapshot`]),不该为此扫两遍全部 pane。
+    fn ai_projects_of(&self, panes: &[PaneRef<'_>], scope: DoneScope) -> AiProjects {
+        let projects = self.config.projects.as_slice();
         match scope {
             DoneScope::All => {
                 let order = self.done.order();
-                collect_ai_projects(panes, self.config.projects.as_slice(), |id| {
-                    order.contains_key(id)
-                })
+                collect_ai_projects(panes.iter().copied(), projects, |id| order.contains_key(id))
             }
-            DoneScope::Unread => collect_ai_projects(panes, self.config.projects.as_slice(), |id| {
-                self.done.is_unread(id)
-            }),
+            DoneScope::Unread => {
+                collect_ai_projects(panes.iter().copied(), projects, |id| self.done.is_unread(id))
+            }
         }
     }
 
-    /// 标题栏那颗全局状态灯(`TitleBar.tsx::computeLight`)。
+    /// 标题栏一帧要的两件事:那颗全局状态灯(`TitleBar.tsx::computeLight`)+
+    /// 项目切换胶囊的下拉列表。
     ///
-    /// ⚠️ 与边条徽标的 [`AppStore::global_ai_status`] **口径不同**:边条把 `error`
-    /// 压成 `idle`(一个 `exit 1` 的 shell 不该盖住真在跑的 AI),标题栏灯反过来
-    /// 把 `error` 列为最高一档,另外还多一个 `done` 档。两处不可互相复用。
-    pub fn title_bar_light(&self) -> TitleBarLight {
+    /// ⚠️ 状态灯与边条徽标的 [`AppStore::global_ai_status`] **口径不同**:边条把
+    /// `error` 压成 `idle`(一个 `exit 1` 的 shell 不该盖住真在跑的 AI),标题栏灯
+    /// 反过来把 `error` 列为最高一档,另外还多一个 `done` 档。两处不可互相复用。
+    ///
+    /// # 为什么合成一个方法
+    ///
+    /// 拆成两个 getter 就要各扫一遍 `pane_refs(None)`(全项目 flat_map + collect
+    /// 一个 Vec),而标题栏**每帧都要**:它挂了 `window_control_area`,套不了
+    /// view 级缓存(理由见 `main.rs::cached_panel` 与标题栏挂载点的注释),
+    /// 所以那两遍是真的每帧各来一次。
+    ///
+    /// 两条结果的 done 判据都取 [`DoneScope::All`](`aiDoneOrder`,不看窗口焦点),
+    /// 与标题栏那两处消费点原本的口径逐字一致 —— 托盘用的是
+    /// [`DoneScope::Unread`],**不能**并进来。
+    ///
+    /// # 为什么不做脏标记缓存
+    ///
+    /// 评估后判为不划算:两条结果的输入横跨 `project_states`(30 处 `&mut`
+    /// 触点)、`config.projects`(22 处)与 `done` 账本(11 处),没有任何一个
+    /// 收口函数覆盖得住全部失效点。漏一处的后果是**状态灯从此不更新**,
+    /// 比多扫一遍 pane 严重得多。合成一次遍历省下的,正好是能确定省下的那一半。
+    pub fn title_bar_snapshot(&self) -> (TitleBarLight, AiProjects) {
+        let panes = self.pane_refs(None);
         let order = self.done.order();
-        compute_title_bar_light(self.pane_refs(None), |id| order.contains_key(id))
+        let light = compute_title_bar_light(panes.iter().copied(), |id| order.contains_key(id));
+        (light, self.ai_projects_of(&panes, DoneScope::All))
     }
 
     pub fn is_pane_unread_done(&self, pane_id: &str) -> bool {
@@ -4514,6 +4541,40 @@ mod tests {
             compute_title_bar_light(vec![pane("p", "x", PaneStatus::AiWorking, false)], |_| true),
             TitleBarLight::Working
         );
+    }
+
+    /// [`AppStore::title_bar_snapshot`] 把状态灯与胶囊下拉合成了**一次**全 pane
+    /// 遍历。这条闸看住的就是那次合并没改结果:同一份 pane 快照喂给两个聚合器,
+    /// 必须与「各自扫一遍」逐字相同。
+    ///
+    /// (`PaneRef` 为此加了 `Copy` —— 加完之后编译器不会再拦「谁把 Vec 吃掉了」,
+    /// 所以得有一条用例替它站岗。)
+    #[test]
+    fn 一份_pane_快照喂两个聚合器与各扫一遍等价() {
+        let projects = vec![project("a", "A"), project("b", "B")];
+        let panes = vec![
+            pane("a", "w", PaneStatus::AiWorking, false),
+            pane("a", "d", PaneStatus::Idle, false),
+            pane("b", "x", PaneStatus::AiIdle, true),
+        ];
+        let done = |id: &str| id == "d";
+
+        // 合成一次遍历(`title_bar_snapshot` 的内层写法)
+        let light_merged = compute_title_bar_light(panes.iter().copied(), done);
+        let projects_merged = collect_ai_projects(panes.iter().copied(), &projects, done);
+        // 各扫一遍(合并之前那两次 `pane_refs(None)`)
+        let light_split = compute_title_bar_light(panes.clone(), done);
+        let projects_split = collect_ai_projects(panes.clone(), &projects, done);
+
+        assert_eq!(light_merged, light_split);
+        assert_eq!(projects_merged, projects_split);
+
+        // 顺带钉死这组数据的期望值 —— 两边一起错的话上面三条是测不出来的
+        assert_eq!(light_merged, TitleBarLight::Attention, "b 有待确认,压过 a 的处理中");
+        assert_eq!(projects_merged.attention, 1);
+        assert_eq!(projects_merged.working, 1);
+        assert_eq!(projects_merged.done, 1);
+        assert_eq!(projects_merged.entries.len(), 2);
     }
 
     /// 五档各自的 tooltip key 都指向 `app.titleBar.status.*`(拼错就是空 tooltip)。

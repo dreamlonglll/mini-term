@@ -227,6 +227,11 @@ impl DoneTracker {
 }
 
 /// 挑目标用的一条 pane 快照。
+///
+/// `Copy` 是给「一份 `Vec<PaneRef>` 喂给多个聚合器」用的(见
+/// [`AppStore::title_bar_snapshot`](crate::store::AppStore::title_bar_snapshot)):
+/// 字段全是 `&str` 与 Copy 标量,复制一条就是几个字长。
+#[derive(Clone, Copy)]
 pub struct PaneRef<'a> {
     pub project_id: &'a str,
     pub pane_id: &'a str,

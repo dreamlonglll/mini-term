@@ -955,6 +955,9 @@ pub struct ProjectList {
     worktree_branches: HashMap<String, String>,
     /// 上次探测用的路径清单(拼成一条),变了才重探。
     probe_key: String,
+    /// 上次喂给技术栈探测的**待探路径**清单(拼成一条),变了才再喂一次。
+    /// 见 [`Self::ensure_project_kinds`]。
+    kinds_key: String,
     /// 上次看到的窗口聚焦态。`false → true` 是原版 `onFocusChanged` 那条重探时机。
     was_focused: bool,
     /// 每行一个焦点句柄(原版每行 `tabIndex={0}`)。行拿到焦点之后
@@ -1004,6 +1007,7 @@ impl ProjectList {
             hovered: None,
             worktree_branches: HashMap::new(),
             probe_key: String::new(),
+            kinds_key: String::new(),
             was_focused: true,
             row_focus: HashMap::new(),
             preview: None,
@@ -1023,16 +1027,45 @@ impl ProjectList {
     ///
     /// **远程项目不探**:领位固定 SSH 图标,路径也不是本机能列的位置
     /// (GPUI 侧还没有远程项目,判据照写,mt-ssh 接上自动生效)。
-    /// 去重与「探过就不再探」都在 store 那边,这里每次全量喂即可。
+    /// 「探过就不再探」的判据在 store 那边(`dir_kinds`),这里只负责**不去白喂**
+    /// ——见下面那道与 [`Self::probe_worktrees`] 同款的去重闸。
     fn ensure_project_kinds(&mut self, cx: &mut Context<Self>) {
-        let paths: Vec<String> = self
-            .store
-            .read(cx)
-            .projects()
-            .iter()
-            .filter(|p| p.ssh_connection_id.is_none())
-            .map(|p| p.path.clone())
-            .collect();
+        // 去重闸,与 [`Self::probe_worktrees`] 同款:这个方法挂在 store 观察者上,
+        // 每次 notify 都会走一遍(AI 状态跳一下就有一次),此前每次都要把全部
+        // 项目路径克隆成一个 `Vec<String>` 再喂给一个只会全部命中缓存的去重表。
+        // 先只拼一条比较用的键,确定有新东西要探了才真去收集路径。
+        //
+        // ⚠️ **键只统计「还没探过」的路径**,不是全部路径。缓存被
+        // `remove_dir_kind` 失效(项目根的标记文件变动)之后,那条路径会重新
+        // 落进这个集合、键随之变化,重探照旧发生 —— 拿全量路径当键会把
+        // 「失效后由这条重跑补上」那条通路闸死。
+        let mut key = String::new();
+        {
+            let store = self.store.read(cx);
+            for p in store
+                .projects()
+                .iter()
+                .filter(|p| p.ssh_connection_id.is_none())
+            {
+                if store.dir_kind(&p.path).is_none() {
+                    key.push_str(&p.path);
+                    key.push('\n');
+                }
+            }
+        }
+        if key == self.kinds_key {
+            return;
+        }
+        self.kinds_key = key;
+        let paths: Vec<String> = {
+            let store = self.store.read(cx);
+            store
+                .projects()
+                .iter()
+                .filter(|p| p.ssh_connection_id.is_none() && store.dir_kind(&p.path).is_none())
+                .map(|p| p.path.clone())
+                .collect()
+        };
         if paths.is_empty() {
             return;
         }

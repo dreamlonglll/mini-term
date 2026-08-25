@@ -166,6 +166,12 @@ fn leaf_rect_in(
 
 pub struct TerminalArea {
     store: Entity<AppStore>,
+    /// 活动布局树的**跨帧快照**。`render` 要边读这棵树边改视图状态
+    /// (`render_node` 是 `&mut self` + `&mut Context`),所以树必须以拥有权的
+    /// 形态拿在手上、不能挂在 `store` 的借用上;而每帧深拷贝一棵树是纯浪费。
+    /// 折中:与 store 里那棵**逐字段比**,真变了才拷一次,平时只递一次
+    /// 引用计数。维护点只有 `render` 开头那一段。
+    layout_snapshot: Option<std::rc::Rc<SplitNode>>,
     /// 每个 split 节点一份分隔条状态(跨帧保留,否则每帧都重置回均分)。
     split_states: HashMap<String, Entity<ResizableState>>,
     /// 终端区自身的可用尺寸(canvas 量出来,用于把百分比换算成像素初值)。
@@ -672,6 +678,7 @@ impl TerminalArea {
         cx.observe(&store, |_, _, cx| cx.notify()).detach();
         Self {
             store,
+            layout_snapshot: None,
             split_states: HashMap::new(),
             area_size: FALLBACK_AREA,
             measured: false,
@@ -2890,12 +2897,62 @@ pub(crate) fn click_position(event: &ClickEvent, window: &Window) -> gpui::Point
     }
 }
 
+/// 把 `snapshot` 对齐到 store 里那棵活树,返回**这一帧是不是换了棵树**。
+///
+/// [`TerminalArea::layout_snapshot`] 存在的理由见那个字段的注释。这里是它唯一的
+/// 维护点,拆成自由函数是为了能不带 `Window` 单测 —— 失效判据错了的后果是
+/// 「画的是上一帧的分屏树」,那种 bug 在真机上极难认。
+///
+/// 判据是 `SplitNode` 的 `PartialEq`(逐字段走查,零分配,首个不同处即短路),
+/// **不是**指针相等:store 那边是就地改树(`tree.rs` 模块注释里那条「不重建」
+/// 的取舍),指针从头到尾都不会变。
+fn sync_layout_snapshot(
+    snapshot: &mut Option<std::rc::Rc<SplitNode>>,
+    live: Option<&SplitNode>,
+) -> bool {
+    match live {
+        Some(live) => {
+            let stale = snapshot.as_deref() != Some(live);
+            if stale {
+                *snapshot = Some(std::rc::Rc::new(live.clone()));
+            }
+            stale
+        }
+        // 没有活动布局(切到空项目 / 关光了终端)—— 快照跟着清掉,
+        // 「本来就是空的」不算换过
+        None => snapshot.take().is_some(),
+    }
+}
+
 impl Render for TerminalArea {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 活动布局的快照。**每帧一次整棵树深拷贝**是 render 的固定开销
+        // (每个 pane 五到七次堆分配 × 30fps),改成「与上一帧逐字段比,真变了
+        // 才拷一次」并把结果收进 `Rc`:比较是零分配的走查且首个不同处即短路,
+        // 拿到手的 `layout` 是一次引用计数,树本身不动。
+        //
+        // ⚠️ 为什么不干脆按引用用(消掉这一份拥有权):`store` 是
+        // `self.store.read(cx)` 借出来的,借的是 `*cx`;而下面 `render_node` /
+        // `render_maximized` / `render_marker_popover` 全都要 `&mut self` **加**
+        // `&mut Context<Self>`。只要 `layout` 还挂在 store 的借用上,那三处就一个
+        // 都调不了 —— 这不是语句顺序能绕开的,是「渲染要边读树边改视图状态」
+        // 这件事本身的形状。`Rc` 快照是同一目标的等价落点:热路径上不再有深拷贝。
+        let layout_changed = {
+            let store = self.store.read(cx);
+            sync_layout_snapshot(&mut self.layout_snapshot, store.active_layout())
+        };
         // 塌陷/关闭掉的节点的分隔条状态在这里回收 —— 不清的话每分一次屏就多留
         // 一个 Entity(极小但确实的泄漏,看板已记)。
-        let live_nodes = self.store.read(cx).live_node_ids();
-        self.split_states.retain(|id, _| live_nodes.contains(id));
+        //
+        // 只在布局快照真变了的那一帧收:节点塌陷只可能随布局变化发生,而
+        // `live_node_ids()` 要遍历**全部项目的全部树**再把每个 id `to_string`
+        // 收进 HashSet —— 那是每帧都付、几乎每帧都白付的一笔。切项目、切面板、
+        // 开关终端都会让快照变,所以最坏也只是别的项目里刚关掉的节点多留一帧
+        // (本来就是「泄漏兜底」而非正确性依赖)。
+        if layout_changed {
+            let live_nodes = self.store.read(cx).live_node_ids();
+            self.split_states.retain(|id, _| live_nodes.contains(id));
+        }
         // 拖拽结束后借这一帧清掉落点残留(**不 notify**,正在渲染)。
         // 高亮另外还与 `has_active_drag` 与门,见 `render_leaf`。
         if !cx.has_active_drag() {
@@ -2935,7 +2992,9 @@ impl Render for TerminalArea {
         };
         let project_id = project.id.clone();
         let project_name = project.name.clone();
-        let layout = store.active_layout().cloned();
+        // 上面那段已经把快照对齐到 `store.active_layout()` 了,这里只是取一份
+        // 引用计数 —— 与旧写法的 `.cloned()` 语义等价,少一整棵树的堆分配
+        let layout = self.layout_snapshot.clone();
 
         let Some(layout) = layout else {
             let pid = project_id.clone();
@@ -3517,6 +3576,45 @@ mod tests {
         // 和不是 100 的老数据(拖动写回时有浮点误差)照样归一
         let f = split_fractions(&[1.0, 1.0, 2.0], 3);
         assert_eq!(f, vec![0.25, 0.25, 0.5]);
+    }
+
+    /// 布局快照的失效判据(见 [`sync_layout_snapshot`])。
+    ///
+    /// 三条一起看住这道闸:① 内容一变必须换新快照(否则画的是上一帧的分屏树);
+    /// ② 内容没变不许换(换了就等于把「每帧深拷贝」原样搬了回来);
+    /// ③ 活树没了要清空,且「本来就是空的」不算换过 —— `split_states` 的回收
+    /// 挂在这个返回值上,恒真会把每帧一次的全项目遍历又请回来。
+    #[test]
+    fn 布局快照按内容失效() {
+        use crate::tree::PaneState;
+
+        let mut snapshot: Option<std::rc::Rc<SplitNode>> = None;
+        let mut live = SplitNode::leaf(PaneState::new("pwsh"));
+
+        // 第一次:从无到有
+        assert!(sync_layout_snapshot(&mut snapshot, Some(&live)));
+        assert_eq!(snapshot.as_deref(), Some(&live));
+
+        // 同一棵树再来一次:不换,也不重新拷
+        let kept = snapshot.clone().unwrap();
+        assert!(!sync_layout_snapshot(&mut snapshot, Some(&live)));
+        assert!(
+            std::rc::Rc::ptr_eq(&kept, snapshot.as_ref().unwrap()),
+            "内容没变却重拷了一棵树"
+        );
+
+        // 就地改一个字段(store 那边就是这么改的,指针不变)→ 必须换
+        if let SplitNode::Leaf { panes, .. } = &mut live {
+            panes[0].status = crate::tree::PaneStatus::AiWorking;
+        }
+        assert!(sync_layout_snapshot(&mut snapshot, Some(&live)));
+        assert_eq!(snapshot.as_deref(), Some(&live));
+
+        // 活树没了 → 清空并报「换过」(这一帧要顺带回收 split_states)
+        assert!(sync_layout_snapshot(&mut snapshot, None));
+        assert!(snapshot.is_none());
+        // 已经是空的了 → 不算换过
+        assert!(!sync_layout_snapshot(&mut snapshot, None));
     }
 
     /// 分屏进场滑入的端点严丝合缝:起点满偏移、终点精确归零,越界进度一律钳住

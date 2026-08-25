@@ -62,7 +62,7 @@ use mt_ui::rgb8;
 
 use crate::i18n::t;
 use crate::prompt::Confirm;
-use crate::store::{AiProjectEntry, AiProjectKind, AppStore, DoneScope, TitleBarLight};
+use crate::store::{AiProjectEntry, AiProjectKind, AppStore, TitleBarLight};
 use crate::ui;
 
 /// 标题栏高度。原版 `TITLE_BAR_HEIGHT = 32`(注释:对齐 Windows 原生 32px,
@@ -768,11 +768,15 @@ impl Render for TitleBar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let (light, entries, active_project, active_project_id) = {
             let store = self.store.read(cx);
+            // 状态灯与胶囊下拉**合成一次全 pane 遍历**(`title_bar_snapshot`)。
+            // 拆成两个 getter 会各扫一遍 `pane_refs(None)`,而标题栏挂了
+            // `window_control_area`、套不了 view 级缓存,那两遍是每帧都来的。
+            // done 判据仍是 `aiDoneOrder`(不看窗口焦点),与托盘的
+            // `unreadDonePaneIds` 口径**有意不同**。
+            let (light, projects) = store.title_bar_snapshot();
             (
-                store.title_bar_light(),
-                // done 判据用 `aiDoneOrder`(不看窗口焦点),与旁边的全局状态灯
-                // 同一套语义 —— 托盘那边用的是 `unreadDonePaneIds`
-                store.ai_projects(DoneScope::All).entries,
+                light,
+                projects.entries,
                 store.active_project().map(|p| p.name.clone()),
                 store.active_project_id.clone(),
             )

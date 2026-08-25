@@ -115,10 +115,10 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use gpui::{
-    AnimationExt as _, App, AppContext, Application, Bounds, Context, Entity, InteractiveElement,
-    IntoElement, ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled,
-    Size, Subscription, Task, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div,
-    point, prelude::FluentBuilder, px, size,
+    AnimationExt as _, AnyView, App, AppContext, Application, Bounds, Context, Entity,
+    InteractiveElement, IntoElement, ParentElement, Pixels, Render, SharedString,
+    StatefulInteractiveElement, StyleRefinement, Styled, Size, Subscription, Task, TitlebarOptions,
+    Window, WindowBounds, WindowOptions, actions, div, point, prelude::FluentBuilder, px, size,
 };
 // img 的 `object_fit` 是 StyledImage 的方法(毛玻璃背板那两处在用)
 use gpui::StyledImage as _;
@@ -1138,6 +1138,51 @@ impl Workspace {
     }
 }
 
+/// 给一个「数据全从 store 来、自己 observe 了 store」的稳定面板套上 gpui 的
+/// **view 级缓存**。
+///
+/// # 为什么非套不可
+///
+/// `gpui::AnyView` 的缓存**只对调过 `.cached(style)` 的 view 生效**
+/// (`gpui-0.2.2/src/view.rs:170-182`:`cached_style` 是 `None` 时 `request_layout`
+/// 无条件重跑 `render`;`prepaint` 走 :197 那条早退,压根到不了 :208-223 那段
+/// 按 `dirty_views` 复用的逻辑)。本仓此前一处都没调过 —— 于是终端每一拍
+/// (30fps,见 [`crate::redraw`])都拖着项目列表 / 文件树 / 面板竖条整套重跑 render。
+///
+/// 套上之后:`redraw` 里 notify 的是 `TerminalPane`,`mark_view_dirty` 只沿
+/// **它那条 view 路径**往上标脏(`window.rs:1304-1318`),这几个面板不在路径上,
+/// 整拍跳过 render/prepaint/paint 直接复用上一帧。
+///
+/// # 套之前必须逐个核实的三件事
+///
+/// 1. **render 读到的每一样东西都得能 notify 到这个 view**。缓存的失效条件只有
+///    四条:自身进 `dirty_views`、bounds 变、content_mask 变、text_style 变
+///    (外加 `Window::refresh()` 的全局绕过)。读了不 observe 的东西 = 画面冻结。
+///    几条常见交互态 gpui 自己接好了,不必额外担心:hover 变化会
+///    `cx.notify(current_view)`(`elements/div.rs:2068-2081`)、滚动同理
+///    (:2417-2450)、tooltip 与拖拽期间走 `window.refresh()`
+///    (:2616-2633 / `window.rs:3716-3727`)、`request_animation_frame`
+///    notify 的也是当前 view(`window.rs:1654`)——`mt_ui::motion` 那套补间
+///    因此照常跑。
+/// 2. **别套在 paint 期登记了 `reuse_paint` 不搬的东西的 view 上**。`PaintIndex`
+///    只覆盖 scene / mouse_listeners / input_handlers / cursor_styles /
+///    tab_stops(`window.rs:2293-2329`),**`window_control_hitboxes` 不在里面**
+///    且每帧 `Frame::clear` 清空 —— 用了 `.window_control_area(..)` 的 view
+///    (标题栏)一旦命中缓存就会丢掉拖拽区与最小化/最大化/关闭三键。
+/// 3. **祖先不能在动画里改 opacity**。opacity 是 paint 期烙进图元的
+///    (`window.rs:2896` 一线),`reuse_paint` 原样重放,命中缓存就把上一帧的
+///    透明度定死了。右侧抽屉那两块面板卡在这一条上。
+///
+/// # `style` 传什么
+///
+/// 命中缓存时 `request_layout` 返回的是一个**没有子节点**的占位节点,样式就是
+/// 这里传的这一份(`view.rs:171-176`)。`StyleRefinement::default()` 的 size 是
+/// `auto`,没有子节点即 0×0 —— 面板会整块塌掉。所以必须传一份与该面板
+/// **render 根节点等价**的尺寸样式。
+fn cached_panel<V: Render>(view: &Entity<V>, style: StyleRefinement) -> AnyView {
+    AnyView::from(view.clone()).cached(style)
+}
+
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 窗口尺寸变了就让两组分栏重新以持久化的绝对像素做种(见该函数注释)——
@@ -1227,12 +1272,22 @@ impl Render for Workspace {
                 resizable_panel()
                     .size(px(middle[0] as f32))
                     .size_range(px(100.0)..Pixels::MAX)
-                    .child(self.project_list.clone()),
+                    // 两块都套 view 级缓存(判据见 [`cached_panel`]):内容全从
+                    // store 来、各自 `cx.observe(&store)`,终端刷屏那一拍不该带着
+                    // 它们重跑 render。占位样式与两者 render 根节点的
+                    // `div().size_full()` 等价
+                    .child(cached_panel(
+                        &self.project_list,
+                        StyleRefinement::default().size_full(),
+                    )),
             )
             .child(
                 resizable_panel()
                     .size_range(px(120.0)..Pixels::MAX)
-                    .child(self.file_tree.clone()),
+                    .child(cached_panel(
+                        &self.file_tree,
+                        StyleRefinement::default().size_full(),
+                    )),
             )
             .on_resize(move |state, _window, cx| {
                 let sizes: Vec<f64> = state.read(cx).sizes().iter().map(|p| f32::from(*p) as f64).collect();
@@ -1261,10 +1316,21 @@ impl Render for Workspace {
                             div()
                                 .flex_1()
                                 .min_w(px(0.0))
+                                // ⚠️ 终端区**不套** [`cached_panel`]:它就是每一拍
+                                // 真在变的那块内容,套上等于每帧必然未命中,白付
+                                // 一次 cache_key 比较
                                 .child(self.terminal_area.clone()),
                         )
                         .when(terminals_visible, |el| {
-                            el.child(self.terminals_panel.clone())
+                            // 同样套缓存:竖条的数据源只有 store。占位样式照抄它
+                            // render 根节点的 `.w(WIDTH).h_full().flex_none()`
+                            el.child(cached_panel(
+                                &self.terminals_panel,
+                                StyleRefinement::default()
+                                    .w(px(terminals_panel::WIDTH))
+                                    .h_full()
+                                    .flex_none(),
+                            ))
                         }),
                 ),
             )
@@ -1492,6 +1558,12 @@ impl Render for Workspace {
         let drawer_layer = self.right_drawer.or(exiting).map(|panel| {
             let leaving = self.right_drawer.is_none();
             let width = drawer_width as f32;
+            // ⚠️ 抽屉里这两块**不套** [`cached_panel`],两条理由缺一不可:
+            // ① 它们身上压着两层 `with_animation`(整层滑入滑出 + 换面板的
+            //    `panelSwapIn` 改 opacity),而 opacity 是 paint 期烙进图元的、
+            //    `reuse_paint` 原样重放 —— 命中缓存就会把某一帧的透明度定死;
+            // ② 抽屉默认收着且开合不持久化,收起时这两个实体压根不进元素树,
+            //    稳态下本来就没有每帧开销可省。
             let content: gpui::AnyElement = match panel {
                 DrawerPanel::Sessions => self.session_panel.clone().into_any_element(),
                 DrawerPanel::Git => self.git_panel.clone().into_any_element(),
@@ -1756,6 +1828,11 @@ impl Render for Workspace {
                     }),
                 )
             })
+            // ⚠️ 标题栏**不套** [`cached_panel`]:它靠 `.window_control_area(..)`
+            // 在 paint 期登记拖拽区与三键的 hitbox,而 `window_control_hitboxes`
+            // 不在 `PaintIndex` 里、`reuse_paint` 不搬它,每帧还被 `Frame::clear`
+            // 清空 —— 命中一次缓存,那一帧的窗口拖拽与最小化/最大化/关闭就全没了。
+            // 它每帧那两遍全 pane 扫改走 `store.title_bar_snapshot()` 合成一次遍历。
             .child(self.title_bar.clone())
             .child(body)
             // 弹窗毛玻璃背板:垫在用量面板与 Dialog 层之下、其余一切之上

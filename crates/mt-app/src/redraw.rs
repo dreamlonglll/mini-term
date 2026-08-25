@@ -3,9 +3,11 @@
 //!
 //! # 为什么要有这一层
 //!
-//! GPUI 没有局部重绘:**一次 `cx.notify()` = 整窗重画**。CPU 侧还有 view 级缓存
-//! 兜着(`gpui::AnyView` 按 `dirty_views` 跳过没变的子树),GPU 侧没有 ——
-//! paint 出来的 scene 每帧都是全量的,终端 glyph + 文件树 + 会话面板一起重画。
+//! GPUI 没有局部重绘:**一次 `cx.notify()` = 整窗重画**。CPU 侧的 view 级缓存
+//! 只对**显式调过 `.cached(style)`** 的 view 生效(`gpui::AnyView` 才有
+//! `cached_style`;`Entity<V>` 直接当元素用是无条件重跑 `render` 的),挂载点与
+//! 逐面板的取舍见 `main.rs::cached_panel`;GPU 侧则压根没有 —— paint 出来的
+//! scene 每帧都是全量的,终端 glyph + 文件树 + 会话面板一起重画。
 //!
 //! 于是「PTY 一有输出就 notify」这条看着无害的路,在实测里是这样的
 //! (Windows / 74Hz 屏 / 7 个 pane 其中 3 个在跑 claude):
