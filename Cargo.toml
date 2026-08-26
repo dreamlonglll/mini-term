@@ -22,6 +22,7 @@ edition = "2024"
 # 与 src-tauri 保持同一底线(libsqlite3-sys 0.38 的 build.rs 用 cfg_select!)
 rust-version = "1.95"
 authors = ["mini-term"]
+license = "MIT"
 
 [workspace.dependencies]
 # ---------------------------------------------------------------------------

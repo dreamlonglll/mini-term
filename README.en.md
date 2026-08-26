@@ -19,6 +19,7 @@
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
   <img src="https://img.shields.io/badge/Rust-1.95%2B-dea584" alt="rust">
+  <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
 </p>
 
 <p align="center">
@@ -180,5 +181,9 @@ cargo build --release -p mt-app      # output: target/release/mini-term(.exe)
 - 📖 **[Full feature list](docs/features.md)** — every feature in detail, plus architecture overview and known limitations
 - 📱 **[Relay deployment guide](docs/deploy-relay.md)** — the self-hosted relay behind the mobile features
 - 🐛 **[Issues / PRs](https://github.com/dreamlonglll/mini-term/issues)** — external contributions are merged after functional verification and a security review
+
+## License
+
+Released under the [MIT License](LICENSE).
 
 Learn AI, join the L site — [LinuxDO](https://linux.do/)

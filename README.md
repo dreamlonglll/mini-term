@@ -19,6 +19,7 @@
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
   <img src="https://img.shields.io/badge/Rust-1.95%2B-dea584" alt="rust">
+  <img src="https://img.shields.io/badge/license-MIT-green" alt="license">
 </p>
 
 <p align="center">
@@ -182,5 +183,9 @@ cargo build --release -p mt-app      # 产物 target/release/mini-term(.exe)
 - 📖 **[完整功能清单](docs/features.zh-CN.md)** — 每一项功能的详细说明、架构概览与边界条件
 - 📱 **[中转服务部署文档](docs/deploy-relay.zh-CN.md)** — 手机远程功能所需的自托管中转
 - 🐛 **[提 Issue / PR](https://github.com/dreamlonglll/mini-term/issues)** — 外部贡献会经过功能验证和安全审查后合并
+
+## 许可证
+
+本项目基于 [MIT 协议](LICENSE) 开源。
 
 学 AI，上 L 站 — [LinuxDO](https://linux.do/)
