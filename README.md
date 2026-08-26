@@ -136,7 +136,7 @@ VS Code 风格的 **Changes 面板**（Staged / Changes / Untracked 分组，单
 | Git / 文件 | git2（libgit2）· notify + ignore |
 | 用量统计 | rusqlite 本地账本 · 自绘趋势图 |
 | 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`） |
-| 测试 | **1569 个 Rust 测试**（28 个测试目标） |
+| 测试 | **1574 个 Rust 测试**（28 个测试目标） |
 
 ---
 

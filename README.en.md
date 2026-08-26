@@ -134,7 +134,7 @@ The whole application is **native Rust**:
 | Git / files | git2 (libgit2) · notify + ignore |
 | Usage stats | rusqlite local ledger · hand-drawn trend charts |
 | Mobile relay | axum + tokio WebSocket (`relay-server/`) · React + Vite PWA (`mobile/`) |
-| Tests | **1,569 Rust tests** (28 test targets) |
+| Tests | **1,574 Rust tests** (28 test targets) |
 
 ---
 
