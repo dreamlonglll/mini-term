@@ -125,7 +125,6 @@ use gpui::{
 use gpui::StyledImage as _;
 use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel, v_resizable};
 use gpui_component::{Root, WindowExt as _};
-use mt_ui::icons::{StatusDot, StatusKind};
 use mt_ui::tooltip::Tooltip;
 
 use crate::ai::AiBridge;
@@ -368,6 +367,11 @@ struct Workspace {
     /// 抽屉左缘正在被拖。`Some` 期间宽度由本结构自持,松手才落盘。
     drawer_drag: Option<DrawerDrag>,
     usage_open: bool,
+    /// 左侧 Activity Bar 整组按钮共用的 VS Code 式悬停会话。
+    activity_bar_hover: activity_bar::HoverSession,
+    /// 新会话第一条标签的 500ms 计时。drop 句柄立即取消;状态机的 generation
+    /// 再挡住已经进入回调队列的旧任务。
+    activity_bar_hover_task: Option<Task<()>>,
     /// 弹窗毛玻璃背板的快照(见 [`frost`] 模块注释)。弹窗/用量面板从无到有的
     /// 第一帧抓一次,期间沿用,全关即弃 —— 开着时再抓会把弹窗自己抓进去。
     frost: Option<std::sync::Arc<gpui::RenderImage>>,
@@ -539,6 +543,8 @@ impl Workspace {
             drawer_exit: None,
             drawer_drag: None,
             usage_open: false,
+            activity_bar_hover: activity_bar::HoverSession::default(),
+            activity_bar_hover_task: None,
             frost: None,
             frost_task: None,
             update_release: None,
@@ -554,6 +560,76 @@ impl Workspace {
         // 布局里本来就可能有跑着的 AI 会话。
         workspace.sync_tray(cx);
         workspace
+    }
+
+    /// 一颗 Activity Bar 按钮的 enter / leave。热身前排一次 500ms 计时;
+    /// 热身后只改状态并立即重画。
+    fn on_activity_bar_item_hover(
+        &mut self,
+        key: &'static str,
+        hovered: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if hovered {
+            match self.activity_bar_hover.enter(key) {
+                activity_bar::HoverEnter::Unchanged => {}
+                activity_bar::HoverEnter::ShowNow => {
+                    self.activity_bar_hover_task = None;
+                    cx.notify();
+                }
+                activity_bar::HoverEnter::Delay(generation) => {
+                    // 覆盖句柄 = clearTimeout。generation 是旧回调已经排进队列时的
+                    // 第二道闸,两条都保留才不会补弹过期标签。
+                    self.activity_bar_hover_task = None;
+                    self.activity_bar_hover_task = Some(cx.spawn(async move |this, cx| {
+                        cx.background_executor()
+                            .timer(activity_bar::HOVER_SHOW_DELAY)
+                            .await;
+                        let _ = this.update(cx, |workspace: &mut Self, cx| {
+                            if workspace
+                                .activity_bar_hover
+                                .on_delay_elapsed(generation, key)
+                            {
+                                workspace.activity_bar_hover_task = None;
+                                cx.notify();
+                            }
+                        });
+                    }));
+                    cx.notify();
+                }
+            }
+        } else if self.activity_bar_hover.leave(key) {
+            self.activity_bar_hover_task = None;
+            cx.notify();
+        }
+    }
+
+    /// 给每颗 Activity Bar 按钮生成同款 hover 监听器。key 同时是按钮 id 与
+    /// [`activity_bar::HoverSession`] 的稳定身份,集中在这里避免十处闭包漂移。
+    fn activity_bar_item_hover_listener(
+        key: &'static str,
+        cx: &Context<Self>,
+    ) -> impl Fn(&bool, &mut Window, &mut App) + 'static {
+        cx.listener(move |this, hovered: &bool, _window, cx| {
+            this.on_activity_bar_item_hover(key, *hovered, cx);
+        })
+    }
+
+    /// 只有离开**整条** Activity Bar 才降温;经过按钮间空隙只由按钮 leave
+    /// 隐藏标签,保留 warmed 状态。
+    fn on_activity_bar_hover(
+        &mut self,
+        hovered: &bool,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if *hovered {
+            return;
+        }
+        self.activity_bar_hover_task = None;
+        if self.activity_bar_hover.reset() {
+            cx.notify();
+        }
     }
 
     /// 把 store 的当前状态压成一份托盘快照推下去(`store.ts::syncTrayStatus`)。
@@ -1224,6 +1300,15 @@ impl Render for Workspace {
             )
         };
 
+        // 条件按钮可能在鼠标仍停在原坐标时从元素树消失,这时 GPUI 不保证再补一发
+        // on_hover(false)。主动按当前可见性对账,避免它的旧计时把会话偷偷热身。
+        let conditional_hover_gone = (unread == 0
+            && self.activity_bar_hover.leave("jump-attention"))
+            || (self.update_release.is_none() && self.activity_bar_hover.leave("open-update"));
+        if conditional_hover_gone {
+            self.activity_bar_hover_task = None;
+        }
+
         // 弹窗毛玻璃背板:Dialog 族或用量面板**从无到有的第一帧**抓一次快照
         // (那一刻 DWM 的上一帧还没有弹窗),期间沿用,全关即弃 —— 开着时再抓
         // 会把弹窗自己抓进去。抓帧同步(PrintWindow 有窗口线程亲和性,也快),
@@ -1368,7 +1453,12 @@ impl Render for Workspace {
         // 原版 8 颗按钮至此全部就位(BB-b 补上最后一颗 SSH);末尾那颗
         // 「跳到已完成」是 GPUI 独有的。
         let toggle_strip = div()
-            .flex_none()
+            .id("activity-bar")
+            // 视觉层稍后排在 columns 之后画;body 里另留一块 44px 占位。
+            // 这样按钮右侧标签能盖住相邻内容,又仍低于后面的 drawer/toast/modal。
+            .absolute()
+            .left_0()
+            .top_0()
             .w(px(activity_bar::WIDTH))
             .h_full()
             .flex()
@@ -1379,6 +1469,7 @@ impl Render for Workspace {
             .bg(ui::bg_surface())
             .border_r_1()
             .border_color(ui::border_subtle())
+            .on_hover(cx.listener(Self::on_activity_bar_hover))
             .child(
                 activity_bar::strip_button(
                     "toggle-middle",
@@ -1389,6 +1480,8 @@ impl Render for Workspace {
                         t("app", "activityBar.expand")
                     },
                     middle_visible,
+                    self.activity_bar_hover.is_visible("toggle-middle"),
+                    Self::activity_bar_item_hover_listener("toggle-middle", cx),
                 )
                 // 全局 AI 状态徽标挂在这颗按钮上(中间栏承载项目列表)。
                 // 口径与原版一致:只反映 AI 状态,**error 不往上冒** ——
@@ -1410,6 +1503,8 @@ impl Render for Workspace {
                     activity_bar::SESSIONS,
                     t("app", "activityBar.sessions"),
                     self.right_drawer == Some(DrawerPanel::Sessions),
+                    self.activity_bar_hover.is_visible("toggle-sessions"),
+                    Self::activity_bar_item_hover_listener("toggle-sessions", cx),
                 )
                 .on_click(cx.listener(|this, _event, _window, cx| {
                     this.toggle_drawer(DrawerPanel::Sessions, cx)
@@ -1423,6 +1518,8 @@ impl Render for Workspace {
                     activity_bar::GIT,
                     t("app", "activityBar.git"),
                     self.right_drawer == Some(DrawerPanel::Git),
+                    self.activity_bar_hover.is_visible("toggle-git"),
+                    Self::activity_bar_item_hover_listener("toggle-git", cx),
                 )
                 .on_click(cx.listener(|this, _event, _window, cx| {
                     this.toggle_drawer(DrawerPanel::Git, cx)
@@ -1436,6 +1533,8 @@ impl Render for Workspace {
                     activity_bar::TERMINALS,
                     t("app", "activityBar.terminals"),
                     terminals_visible,
+                    self.activity_bar_hover.is_visible("toggle-terminals"),
+                    Self::activity_bar_item_hover_listener("toggle-terminals", cx),
                 )
                 .on_click(cx.listener(|this, _event, _window, cx| {
                     this.store
@@ -1449,6 +1548,8 @@ impl Render for Workspace {
                     activity_bar::STATS,
                     t("app", "activityBar.stats"),
                     self.usage_open,
+                    self.activity_bar_hover.is_visible("toggle-usage"),
+                    Self::activity_bar_item_hover_listener("toggle-usage", cx),
                 )
                 .on_click(cx.listener(|this, _event, window, cx| this.toggle_usage(window, cx))),
             )
@@ -1461,6 +1562,8 @@ impl Render for Workspace {
                     activity_bar::SETTINGS,
                     t("app", "activityBar.settings"),
                     false,
+                    self.activity_bar_hover.is_visible("open-settings"),
+                    Self::activity_bar_item_hover_listener("open-settings", cx),
                 )
                 .on_click(cx.listener(|this, _event, window, cx| {
                     settings::open_settings(this.store.clone(), None, window, cx);
@@ -1473,6 +1576,8 @@ impl Render for Workspace {
                     activity_bar::SSH,
                     t("app", "activityBar.ssh"),
                     false,
+                    self.activity_bar_hover.is_visible("open-ssh"),
+                    Self::activity_bar_item_hover_listener("open-ssh", cx),
                 )
                 .on_click(cx.listener(|_this, _event, window, cx| {
                     ssh_panel::open(window, cx);
@@ -1484,6 +1589,8 @@ impl Render for Workspace {
                     activity_bar::MOBILE,
                     t("app", "activityBar.mobile"),
                     false,
+                    self.activity_bar_hover.is_visible("open-mobile-relay"),
+                    Self::activity_bar_item_hover_listener("open-mobile-relay", cx),
                 )
                 .on_click(cx.listener(|_this, _event, window, cx| {
                     mobile_panel::open(window, cx);
@@ -1497,7 +1604,9 @@ impl Render for Workspace {
                 let url = release.url.clone();
                 activity_bar::update_button(
                     "open-update",
-                    tr!("app", "update.title", version = release.version.as_str()).into(),
+                    tr!("app", "update.title", version = release.version.as_str()),
+                    self.activity_bar_hover.is_visible("open-update"),
+                    Self::activity_bar_item_hover_listener("open-update", cx),
                 )
                 .on_click(move |_event, _window, cx: &mut gpui::App| {
                     cx.open_url(&url);
@@ -1507,29 +1616,15 @@ impl Render for Workspace {
             // 原版边栏没有这颗按钮,所以借状态灯的「实心圆 + 勾」当图形)
             .when(unread > 0, |el| {
                 el.child(
-                    div()
-                        .id("jump-attention")
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .w(px(32.0))
-                        .h(px(32.0))
-                        .flex_none()
-                        .rounded(px(4.0))
-                        .cursor_pointer()
-                        .hover(|el| el.bg(ui::border_subtle()))
-                        .tooltip(move |window, cx| {
-                            Tooltip::new(t("app", "titleBar.status.done")).build(window, cx)
-                        })
-                        .child(
-                            StatusDot::new("strip-unread-done", StatusKind::AiIdle)
-                                .size(px(14.0))
-                                .color(ui::color_success())
-                                .contrast(ui::bg_surface()),
-                        )
-                        .on_click(cx.listener(|this, _event, window, cx| {
-                            this.on_jump_attention(&JumpAttention, window, cx);
-                        })),
+                    activity_bar::done_button(
+                        "jump-attention",
+                        t("app", "titleBar.status.done"),
+                        self.activity_bar_hover.is_visible("jump-attention"),
+                        Self::activity_bar_item_hover_listener("jump-attention", cx),
+                    )
+                    .on_click(cx.listener(|this, _event, window, cx| {
+                        this.on_jump_attention(&JumpAttention, window, cx);
+                    })),
                 )
             });
 
@@ -1739,8 +1834,11 @@ impl Render for Workspace {
             .overflow_hidden()
             .relative()
             .flex()
-            .child(toggle_strip)
+            // Activity Bar 的 flex 占位仍是 44px;视觉条本体在 columns 后面以
+            // absolute sibling 画,让右伸的标签不被 columns 覆盖。
+            .child(div().flex_none().w(px(activity_bar::WIDTH)).h_full())
             .child(div().flex_1().h_full().child(columns_group))
+            .child(toggle_strip)
             .children(drawer_layer)
             // 自建 toast 层。挂在 `body`(它是 `relative`)里而不是根上 ——
             // 原版 `.toast-stack` 贴的是视口右下角(`fixed right:16 bottom:16`),

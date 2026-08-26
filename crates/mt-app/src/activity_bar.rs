@@ -20,13 +20,15 @@
 //! 「跳到已完成」。(Git 那颗由 V 批补上,与右抽屉的 sessions⇄git 段控件同一个开关;
 //! 移动端那颗由 U 批补上,位置照原版排在「设置」之前。)
 
+use std::time::Duration;
+
 use gpui::{
-    AnimationExt as _, AnyElement, Animation, Div, ElementId, Hsla, InteractiveElement, IntoElement,
-    ParentElement, SharedString, Stateful, StatefulInteractiveElement, Styled, div,
-    prelude::FluentBuilder as _, px,
+    Animation, AnimationExt as _, AnyElement, App, Div, ElementId, Hsla, InteractiveElement,
+    IntoElement, ParentElement, RenderOnce, SharedString, Stateful, StatefulInteractiveElement,
+    Styled, Window, div, prelude::FluentBuilder as _, px, rems,
 };
-use mt_ui::tooltip::Tooltip;
-use mt_ui::icons::{Geom, Ink, Shape, VectorIcon};
+use gpui_component::ActiveTheme as _;
+use mt_ui::icons::{Geom, Ink, Shape, StatusDot, StatusKind, VectorIcon};
 
 use crate::tree::PaneStatus;
 use crate::ui;
@@ -37,6 +39,143 @@ pub const WIDTH: f32 = 44.0;
 const BUTTON: f32 = 32.0;
 /// 图标尺寸。原版每个 svg 都是 `width="18" height="18"`。
 const ICON: f32 = 18.0;
+/// 一次新的边条悬停会话里,第一条文字提示要停多久才出现。
+///
+/// 这是**完整延迟**,不再叠加全局 [`mt_ui::tooltip::Tooltip`] 的额外 700ms。
+pub const HOVER_SHOW_DELAY: Duration = Duration::from_millis(500);
+/// 按钮在 44px 边条里左右各留 6px;提示从按钮右缘再跨过这 6px,
+/// 正好从边条右缘开始画。
+const LABEL_GAP: f32 = (WIDTH - BUTTON) / 2.0;
+/// 与全局 tooltip 同一档字号(0.75rem),只把定位与计时收归 Activity Bar。
+const LABEL_FONT_SIZE: f32 = 0.75;
+
+/// 进入一颗 Activity Bar 按钮之后,宿主该做什么。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HoverEnter {
+    /// 重复收到同一颗按钮的 enter,状态没有变化。
+    Unchanged,
+    /// 新会话的第一条提示要起表;值是本次计时的代号。
+    Delay(u64),
+    /// 本次会话已经热身,提示已在状态机里切到新按钮,直接重画即可。
+    ShowNow,
+}
+
+/// Activity Bar 整组按钮共用的悬停会话。
+///
+/// 这台状态机不碰时钟:宿主按 [`HoverEnter::Delay`] 起计时,到点后带
+/// `generation` 回来对账。Task drop 是第一道取消,代号是竞态下的第二道闸。
+#[derive(Debug, Default)]
+pub struct HoverSession {
+    hovered: Option<&'static str>,
+    visible: Option<&'static str>,
+    warmed: bool,
+    generation: u64,
+}
+
+impl HoverSession {
+    /// 进入一颗按钮。热身前返回计时代号,热身后当场切换可见标签。
+    pub fn enter(&mut self, key: &'static str) -> HoverEnter {
+        if self.hovered == Some(key) {
+            return HoverEnter::Unchanged;
+        }
+
+        self.generation = self.generation.wrapping_add(1);
+        self.hovered = Some(key);
+        if self.warmed {
+            self.visible = Some(key);
+            HoverEnter::ShowNow
+        } else {
+            self.visible = None;
+            HoverEnter::Delay(self.generation)
+        }
+    }
+
+    /// 离开一颗按钮。只有离开的仍是当前目标才清理 —— 相邻按钮的 enter/leave
+    /// 到达顺序不保证,旧按钮的迟到 leave 不能抹掉新按钮。
+    pub fn leave(&mut self, key: &'static str) -> bool {
+        if self.hovered != Some(key) {
+            return false;
+        }
+        self.generation = self.generation.wrapping_add(1);
+        self.hovered = None;
+        self.visible = None;
+        true
+    }
+
+    /// 第一段停留到点。仍悬着同一颗且代号没过期才真正显示并热身。
+    pub fn on_delay_elapsed(&mut self, generation: u64, key: &'static str) -> bool {
+        if self.warmed || self.generation != generation || self.hovered != Some(key) {
+            return false;
+        }
+        self.warmed = true;
+        self.visible = Some(key);
+        true
+    }
+
+    /// 离开整条边条:隐藏、降温并让所有在飞的旧计时失效。
+    pub fn reset(&mut self) -> bool {
+        let changed = self.hovered.is_some() || self.visible.is_some() || self.warmed;
+        self.generation = self.generation.wrapping_add(1);
+        self.hovered = None;
+        self.visible = None;
+        self.warmed = false;
+        changed
+    }
+
+    /// 当前是否该在这颗按钮右侧画文字。
+    pub fn is_visible(&self, key: &'static str) -> bool {
+        self.visible == Some(key)
+    }
+}
+
+/// Activity Bar 专用的文字表面。定位壳高 32px 并 `items_center`,所以文字高度
+/// 无论随主题字号怎么变,都始终相对按钮垂直居中。
+#[derive(IntoElement)]
+struct HoverLabel {
+    text: SharedString,
+}
+
+impl RenderOnce for HoverLabel {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        div()
+            .absolute()
+            .left(px(BUTTON + LABEL_GAP))
+            .top_0()
+            .h(px(BUTTON))
+            .flex()
+            .items_center()
+            .child(
+                div()
+                    .font_family(cx.theme().font_family.clone())
+                    .whitespace_nowrap()
+                    .bg(cx.theme().popover)
+                    .text_color(cx.theme().popover_foreground)
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .shadow_md()
+                    .rounded(px(6.0))
+                    .py(px(2.0))
+                    .px(px(8.0))
+                    .text_size(rems(LABEL_FONT_SIZE))
+                    .child(self.text),
+            )
+    }
+}
+
+/// 三种按钮共用的 hover 接线与标签表面,避免 update / unread 走出另一套手感。
+fn with_hover_label<F>(
+    button: Stateful<Div>,
+    tip: SharedString,
+    label_visible: bool,
+    on_hover: F,
+) -> Stateful<Div>
+where
+    F: Fn(&bool, &mut Window, &mut App) + 'static,
+{
+    button
+        .on_hover(on_hover)
+        .when(label_visible, move |el| el.child(HoverLabel { text: tip }))
+}
 
 /// 单位方框换算:原版 viewBox 是 `0 0 16 16`,除以 16 即可。
 const fn u(v: f32) -> f32 {
@@ -346,9 +485,17 @@ pub const UPDATE: &[Shape] = &[
 /// [`corner_dot`]。⚠️ 闪烁过 [`mt_ui::motion`] 的闸:`.animate-blink` **不在**
 /// 原版 reduce 段的豁免名单里,系统开着「减少动画」时装机版本来就不闪 ——
 /// 这里同样静止,见 [`update_dot_blinks`]。
-pub fn update_button(id: impl Into<ElementId>, tip: SharedString) -> Stateful<Div> {
-    div()
-        .id(id)
+pub fn update_button<F>(
+    key: &'static str,
+    tip: impl Into<SharedString>,
+    label_visible: bool,
+    on_hover: F,
+) -> Stateful<Div>
+where
+    F: Fn(&bool, &mut Window, &mut App) + 'static,
+{
+    let button = div()
+        .id(key)
         .relative()
         .flex()
         .items_center()
@@ -363,8 +510,9 @@ pub fn update_button(id: impl Into<ElementId>, tip: SharedString) -> Stateful<Di
         .child(VectorIcon::new(UPDATE, px(ICON)).ink(ui::accent()))
         // `absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-accent
         //  border border-[var(--bg-surface)] animate-blink`
-        .child(corner_dot("update-dot", ui::accent(), update_dot_blinks()))
-        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+        .child(corner_dot("update-dot", ui::accent(), update_dot_blinks()));
+
+    with_hover_label(button, tip.into(), label_visible, on_hover)
 }
 
 /// 一个边条按钮的外壳(不含 `on_click`,由调用方挂)。
@@ -373,19 +521,24 @@ pub fn update_button(id: impl Into<ElementId>, tip: SharedString) -> Stateful<Di
 /// 未激活 = 淡字、hover 转主文本色;激活时左侧还有一根 accent 竖条
 /// (原版 `ACCENT_BAR`,**始终占位**靠透明度切换的写法在 gpui 里没必要,
 /// 这里直接按需追加子元素)。
-pub fn strip_button(
-    id: impl Into<ElementId>,
+pub fn strip_button<F>(
+    key: &'static str,
     shapes: &'static [Shape],
-    tip: &'static str,
+    tip: impl Into<SharedString>,
     active: bool,
-) -> Stateful<Div> {
+    label_visible: bool,
+    on_hover: F,
+) -> Stateful<Div>
+where
+    F: Fn(&bool, &mut Window, &mut App) + 'static,
+{
     let color = if active {
         ui::text_primary()
     } else {
         ui::text_muted()
     };
-    div()
-        .id(id)
+    let button = div()
+        .id(key)
         .relative()
         .flex()
         .items_center()
@@ -409,8 +562,42 @@ pub fn strip_button(
                     .rounded(px(1.0))
                     .bg(ui::accent()),
             )
-        })
-        .tooltip(move |window, cx| Tooltip::new(tip).build(window, cx))
+        });
+
+    with_hover_label(button, tip.into(), label_visible, on_hover)
+}
+
+/// 未读完成入口。图形与行为仍是原来的成功状态点,只把 Activity Bar 三类按钮的
+/// 尺寸、hover 接线和右侧标签统一到同一个构造路径。
+pub fn done_button<F>(
+    key: &'static str,
+    tip: impl Into<SharedString>,
+    label_visible: bool,
+    on_hover: F,
+) -> Stateful<Div>
+where
+    F: Fn(&bool, &mut Window, &mut App) + 'static,
+{
+    let button = div()
+        .id(key)
+        .relative()
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(BUTTON))
+        .h(px(BUTTON))
+        .flex_none()
+        .rounded(px(4.0))
+        .cursor_pointer()
+        .hover(|el| el.bg(ui::border_subtle()))
+        .child(
+            StatusDot::new("strip-unread-done", StatusKind::AiIdle)
+                .size(px(14.0))
+                .color(ui::color_success())
+                .contrast(ui::bg_surface()),
+        );
+
+    with_hover_label(button, tip.into(), label_visible, on_hover)
 }
 
 /// 全局 AI 状态徽标(挂在「折叠中间栏」那颗按钮的右上角)。
@@ -510,6 +697,76 @@ pub fn divider() -> Div {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn 首条提示延迟显示并把会话热身() {
+        let mut session = HoverSession::default();
+        let HoverEnter::Delay(generation) = session.enter("one") else {
+            panic!("新会话第一颗按钮必须起表");
+        };
+        assert!(!session.is_visible("one"), "停够 500ms 前不能先画出来");
+        assert!(session.on_delay_elapsed(generation, "one"));
+        assert!(session.is_visible("one"));
+        assert!(session.warmed);
+    }
+
+    #[test]
+    fn 热身后跨空隙切按钮立即显示() {
+        let mut session = HoverSession::default();
+        let HoverEnter::Delay(generation) = session.enter("one") else {
+            panic!("第一颗应起表");
+        };
+        assert!(session.on_delay_elapsed(generation, "one"));
+
+        assert!(session.leave("one"), "进空隙时隐藏当前标签");
+        assert!(!session.is_visible("one"));
+        assert!(session.warmed, "空隙不等于离开整条边条");
+
+        assert_eq!(session.enter("two"), HoverEnter::ShowNow);
+        assert!(session.is_visible("two"));
+    }
+
+    #[test]
+    fn 离开整条边条后下次重新等待() {
+        let mut session = HoverSession::default();
+        let HoverEnter::Delay(generation) = session.enter("one") else {
+            panic!("第一颗应起表");
+        };
+        assert!(session.on_delay_elapsed(generation, "one"));
+        assert!(session.reset());
+        assert!(!session.warmed);
+        assert!(!session.is_visible("one"));
+        assert!(matches!(session.enter("two"), HoverEnter::Delay(_)));
+    }
+
+    #[test]
+    fn 旧计时与旧按钮的迟到离开都不能覆盖新目标() {
+        let mut session = HoverSession::default();
+        let HoverEnter::Delay(old_generation) = session.enter("one") else {
+            panic!("第一颗应起表");
+        };
+        let HoverEnter::Delay(new_generation) = session.enter("two") else {
+            panic!("热身前切换目标应为新目标重新起表");
+        };
+
+        assert!(!session.leave("one"), "旧按钮的 leave 不能清掉新按钮");
+        assert!(!session.on_delay_elapsed(old_generation, "one"));
+        assert!(!session.is_visible("one"));
+        assert!(session.on_delay_elapsed(new_generation, "two"));
+        assert!(session.is_visible("two"));
+
+        assert_eq!(session.enter("three"), HoverEnter::ShowNow);
+        assert!(!session.leave("two"), "热身后的旧 leave 同样不能清新标签");
+        assert!(session.is_visible("three"));
+    }
+
+    #[test]
+    fn 延迟与标签起点钉在边条几何上() {
+        assert_eq!(HOVER_SHOW_DELAY, Duration::from_millis(500));
+        // 按钮左侧留白 + 标签相对按钮的 left = 44px 边条右缘。
+        assert_eq!(LABEL_GAP + BUTTON + LABEL_GAP, WIDTH);
+        assert_eq!(BUTTON, 32.0, "定位壳高度跟按钮高度同源");
+    }
 
     /// 形状表的点必须全落在单位方框内 —— 越界会画到相邻按钮上。
     /// (mt-ui 对自己那批图标有同名约束,这里是本 crate 这四张表的同款体检。)
