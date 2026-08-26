@@ -1,0 +1,29 @@
+{
+  "id": "menu-tooltip",
+  "name": "menu-tooltip",
+  "title": "Improve top-left menu tooltip behavior",
+  "description": "Use VS Code-style Activity Bar labels with an initial pause and immediate switching between icons.",
+  "status": "completed",
+  "dev_type": null,
+  "scope": null,
+  "package": "mt-app",
+  "priority": "P2",
+  "creator": "leo",
+  "assignee": "leo",
+  "createdAt": "2026-08-26",
+  "completedAt": "2026-08-26",
+  "branch": null,
+  "base_branch": "main",
+  "worktree_path": null,
+  "commit": null,
+  "pr_url": null,
+  "subtasks": [],
+  "children": [],
+  "parent": null,
+  "relatedFiles": [
+    "crates/mt-app/src/activity_bar.rs",
+    "crates/mt-app/src/main.rs"
+  ],
+  "notes": "",
+  "meta": {}
+}
