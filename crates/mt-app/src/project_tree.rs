@@ -17,7 +17,7 @@
 //! 磁盘格式(`config.projectTree`)一个字都不改:这里只读写
 //! [`mt_config::ProjectTreeItem`],它的 `#[serde(untagged)]` 布局与装机版互读互写。
 
-use mt_config::{AppConfig, ProjectGroup, ProjectTreeItem};
+use mt_config::{AppConfig, ProjectConfig, ProjectGroup, ProjectTreeItem};
 
 /// 分组嵌套上限(含项目那一层)。与 `projectTree.ts:3` 同值。
 pub const MAX_DEPTH: usize = 3;
@@ -105,10 +105,17 @@ pub fn can_drop(tree: &[ProjectTreeItem], target_group_id: &str, dragged: &Proje
     target_depth + 1 + get_subtree_max_depth(dragged) <= MAX_DEPTH
 }
 
-/// 落到目标**旁边**(`before` / `after`)合法吗 —— 只有拖「组」才可能超深。
+/// 落到目标**旁边**(`before` / `after`)合法吗 —— 项目怎么放都行;拖「组」要挡
+/// 两件事:自环与超深。自环 = 目标行落在被拖分组自己的子树里(Inside 落点的
+/// [`can_drop`] 有同一道检查):放行的话 [`move_item_in_tree`] 摘下分组后目标
+/// 随子树一起消失,失败兜底救得回节点、救不回它「本该在哪」。
 pub fn can_drop_at(tree: &[ProjectTreeItem], target_id: &str, dragged: &ProjectTreeItem) -> bool {
     if !is_group(dragged) {
         return true;
+    }
+    let dragged_id = item_id(dragged);
+    if dragged_id == target_id || is_descendant(tree, dragged_id, target_id) {
+        return false;
     }
     let Some(parent_id) = find_parent_group_id(tree, target_id) else {
         return get_subtree_max_depth(dragged) <= MAX_DEPTH;
@@ -266,6 +273,51 @@ pub fn remove_group_and_promote_children(
         }
     }
     false
+}
+
+/// `AppStore::move_item` 的树侧全部语义:把节点(项目或分组)移到
+/// `target_group_id` 里的 `index` 位置。`None` 目标 = 根层;`index` 缺省 = 末尾。
+/// 返回值 = 这次有没有真的动过树(或 `projects`)。
+///
+/// 三条边界:
+/// - **自环先验**:目标组是被移动节点自己或其子孙时直接拒绝、原树不动。
+///   必须在摘之前判 —— 摘下分组后目标随子树一起消失,只剩失败兜底可走,
+///   而兜底只保得住节点、保不住位置。
+/// - **树里找不到**(对照 `store.ts:1296-1313`):worktree 子项目(按设计不在
+///   树里,位置由父项目派生)与树外孤儿项目([`get_ordered_tree`] 的收尾兜底
+///   把它顶在根层显示的那种)都以裸 id 入树 —— 前者语义是「脱离父项目」,
+///   后者是给已损坏的树一次自愈机会:孤儿看得见却移不动才是死路。
+///   `projects` 里也没有这个 id → 什么都不做。
+/// - **目标组找不到**(分组被并发删掉):退回根层末尾,且放回的必须是摘下来的
+///   **原节点** —— 按 id 合成 `ProjectId` 的话,摘下来的是分组时组名与组员
+///   就地蒸发,只留一个指向不存在项目的幽灵 id。
+pub fn move_item_in_tree(
+    tree: &mut Vec<ProjectTreeItem>,
+    projects: &mut [ProjectConfig],
+    item_id: &str,
+    target_group_id: Option<&str>,
+    index: Option<usize>,
+) -> bool {
+    if let Some(gid) = target_group_id
+        && (gid == item_id || is_descendant(tree, item_id, gid))
+    {
+        return false;
+    }
+    let removed = match remove_from_tree(tree, item_id) {
+        Some(item) => item,
+        None => {
+            let Some(project) = projects.iter_mut().find(|p| p.id == item_id) else {
+                return false;
+            };
+            project.parent_project_id = None;
+            ProjectTreeItem::ProjectId(item_id.to_string())
+        }
+    };
+    let backup = removed.clone();
+    if !insert_into_tree(tree, target_group_id, removed, index) {
+        insert_into_tree(tree, None, backup, None);
+    }
+    true
 }
 
 // ─── 渲染展平 ─────────────────────────────────────────────────
@@ -921,6 +973,63 @@ mod tests {
         let item = remove_from_tree(&mut tree, "g1").expect("g1 在");
         assert!(insert_into_tree(&mut tree, Some("g2"), item, None));
         assert_eq!(dump(&tree), "g2[g1[p1,p2]]");
+    }
+
+    /// `can_drop_at` 的自环:组不能落到**自己子树里任何一行**的旁边。
+    /// 这里放行过一次真实事故:摘下组后目标随子树消失,整组被兜底降格毁掉。
+    #[test]
+    fn 组不能落到自己子树成员旁边() {
+        let tree = vec![
+            group("g1", vec![proj("p1"), group("g2", vec![proj("p2")])]),
+            proj("外"),
+        ];
+        let dragged = tree[0].clone();
+        assert!(!can_drop_at(&tree, "p1", &dragged), "直接子项目旁");
+        assert!(!can_drop_at(&tree, "g2", &dragged), "子组旁");
+        assert!(!can_drop_at(&tree, "p2", &dragged), "孙辈旁");
+        assert!(!can_drop_at(&tree, "g1", &dragged), "自己旁边");
+        assert!(can_drop_at(&tree, "外", &dragged), "子树之外照常");
+    }
+
+    /// `move_item_in_tree` 的自环先验:目标是自己或子孙 → 拒绝且原树一动不动。
+    #[test]
+    fn 移动目标为自己或子孙时原树不动() {
+        let mut tree = vec![group("g1", vec![proj("p1"), group("g2", vec![])])];
+        let mut projects = vec![project_cfg("p1", None)];
+        assert!(!move_item_in_tree(&mut tree, &mut projects, "g1", Some("g1"), None));
+        assert!(!move_item_in_tree(&mut tree, &mut projects, "g1", Some("g2"), None));
+        assert_eq!(dump(&tree), "g1[p1,g2[]]");
+    }
+
+    /// 目标组被并发删掉:整棵**原样**退回根层末尾,组名与组员一个不丢。
+    #[test]
+    fn 目标组消失时分组原样退回根层() {
+        let mut tree = vec![group("g1", vec![proj("p1"), proj("p2")]), proj("外")];
+        let mut projects: Vec<ProjectConfig> = Vec::new();
+        assert!(move_item_in_tree(&mut tree, &mut projects, "g1", Some("查无此组"), None));
+        assert_eq!(dump(&tree), "外,g1[p1,p2]");
+    }
+
+    /// 树外孤儿项目(渲染兜底顶在根层显示的那种)也能移进组 —— 坏数据一次拖动自愈;
+    /// 项目表里也没有的 id(如毁组事故残留的幽灵 id)仍然什么都不做。
+    #[test]
+    fn 树外孤儿项目移动时收编入组() {
+        let mut tree = vec![group("g1", vec![])];
+        let mut projects = vec![project_cfg("孤儿", None)];
+        assert!(move_item_in_tree(&mut tree, &mut projects, "孤儿", Some("g1"), None));
+        assert_eq!(dump(&tree), "g1[孤儿]");
+        assert!(!move_item_in_tree(&mut tree, &mut projects, "查无此项", None, None));
+        assert_eq!(dump(&tree), "g1[孤儿]");
+    }
+
+    /// worktree 子项目移动 = 脱离父项目:清 `parentProjectId` 并以裸 id 入树。
+    #[test]
+    fn 子项目移动即脱离父项目() {
+        let mut tree = vec![proj("父"), group("g1", vec![])];
+        let mut projects = vec![project_cfg("父", None), project_cfg("子", Some("父"))];
+        assert!(move_item_in_tree(&mut tree, &mut projects, "子", Some("g1"), None));
+        assert_eq!(dump(&tree), "父,g1[子]");
+        assert_eq!(projects[1].parent_project_id, None);
     }
 
     // ─── 磁盘格式 ─────────────────────────────────────────────
