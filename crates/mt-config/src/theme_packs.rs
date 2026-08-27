@@ -649,6 +649,46 @@ mod tests {
         }
         assert!(count > 0, "theme/ 下一个成品皮肤都没有 —— 路径写错了?");
 
+        // 一键下载的 zip 与同名文件夹必须是**同一份东西**:网页上下 zip 的人
+        // 和 clone 仓库的人拿到的皮肤不能不一样。zip 是手工打的,改了文件夹忘了
+        // 重打包,两边就会静静地漂开。
+        let zip_root = unique_test_root("shipped-zips");
+        let zip_packs = ThemePacks::at(zip_root.join("themes"));
+        for entry in fs::read_dir(&shipped).unwrap().flatten() {
+            let path = entry.path();
+            let is_zip = path
+                .extension()
+                .map(|e| e.eq_ignore_ascii_case("zip"))
+                .unwrap_or(false);
+            if !is_zip {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let id = zip_packs
+                .import_zip(&path)
+                .unwrap_or_else(|e| panic!("{name} 导入失败: {e:#}"));
+
+            let from_zip = zip_packs.read(&id).unwrap();
+            let from_dir = packs
+                .read(&id)
+                .unwrap_or_else(|e| panic!("{name} 没有对应的同名文件夹({id}): {e:#}"));
+            assert_eq!(
+                from_zip.theme_json, from_dir.theme_json,
+                "{name} 与文件夹版的 theme.json 已漂开,重新打包"
+            );
+
+            // 背景图同样要逐字节对齐 —— theme.json 一致但图不同,装出来是两个皮肤
+            let def: serde_json::Value = serde_json::from_str(&from_zip.theme_json).unwrap();
+            if let Some(image) = def["image"].as_str().filter(|s| !s.trim().is_empty()) {
+                assert_eq!(
+                    fs::read(from_zip.dir.join(image)).unwrap(),
+                    fs::read(from_dir.dir.join(image)).unwrap(),
+                    "{name} 与文件夹版的 {image} 不是同一张图,重新打包"
+                );
+            }
+        }
+        let _ = fs::remove_dir_all(&zip_root);
+
         let _ = fs::remove_dir_all(&root);
     }
 }

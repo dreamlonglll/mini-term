@@ -1,69 +1,73 @@
-# 皮肤库（成品外置皮肤）
+# mini-term 皮肤库
 
-这里放**可以直接拿来用的成品皮肤**，下载即装，不用改一个字。
+这里是**成品皮肤**，下载即装，不用改一个字。
 
-> 想**自己做**一份皮肤 → 去 [`docs/theme-pack-example/`](../docs/theme-pack-example/)，那里是带完整字段说明的参考模板
-> （也就是设置页「生成示例」落下来的那一份）。本目录是成品，那边是模板，别搞混。
+> 你多半是从 **设置 → 外观 → 主题与语言 → 外置皮肤 → 「更多皮肤」** 跳过来的。挑一份下载，回应用里导入即可。
+> 想**自己做**一份皮肤，字段说明在 [`docs/theme-pack-example/`](../docs/theme-pack-example/)（那边是模板，这边是成品）。
 
-## 有哪些
+---
 
-| 皮肤 | 明暗 | 带背景图 | 预览 |
-|------|------|----------|------|
-| [`blue-hour/`](blue-hour/) — Blue Hour 蓝调时分 | dark | 是 | 深紫蓝底 + 冷蓝人像氛围图 + 余烬橙 accent |
+## Blue Hour 蓝调时分
+
+<img src="blue-hour/background.jpg" alt="Blue Hour 背景图" width="640">
+
+深紫蓝底 + 冷蓝人像氛围图 + 余烬橙 accent，暗色皮肤。终端与面板半透明压在氛围层上。
+
+**📦 [下载 blue-hour.zip](https://github.com/dreamlonglll/mini-term/raw/main/theme/blue-hour.zip)（211 KB）** · [看包内文件](blue-hour/)
+
+---
 
 ## 怎么装
 
-任选一种，装完在**设置 → 外观 → 主题与语言 → 外置皮肤**里点卡片应用。
+### 最快：下 zip → 「导入 zip」
 
-**① 从界面导入（推荐）**
+1. 点上面的 **下载 blue-hour.zip**（浏览器直接开始下载）；
+2. 回到 mini-term：设置 → 外观 → 主题与语言 → 外置皮肤 → **「导入 zip」**，选中刚下的文件；
+3. 列表里出现卡片，点一下就应用了。
 
-1. 把仓库里的皮肤文件夹（如 `blue-hour/`）下载到本地任意位置 ——
-   整仓 clone、GitHub 网页「Download ZIP」、或只下这一个目录都行；
-2. 设置 → 外观 → 外置皮肤 → **「添加皮肤」**，选中那个文件夹（里面得有 `theme.json`）。
+### 或者：拿到文件夹 → 「添加皮肤」
 
-**② 直接丢进皮肤目录**
+GitHub 网页没法单独下载一个子目录，所以走文件夹得先把仓库弄到本地 —— 整仓 **Download ZIP**，或者：
 
-把皮肤文件夹整个拷进皮肤目录，回界面点「刷新」即可。皮肤目录位置见「打开皮肤目录」按钮，Windows 上是：
+```bash
+git clone --depth 1 https://github.com/dreamlonglll/mini-term.git
+```
+
+然后 **「添加皮肤」** 选中 `theme/blue-hour/` 那个文件夹（里面得有 `theme.json`）。
+
+### 或者：直接丢进皮肤目录
+
+把皮肤文件夹整个拷进皮肤目录，回界面点「刷新」。目录位置见 **「打开皮肤目录」** 按钮，Windows 上是：
 
 ```
 %APPDATA%\com.mini-term.app\themes\
 ```
 
-**③ 打包成 zip 导入**
-
-把皮肤文件夹压成 zip（zip 根平铺或整包套一层目录都认），用「导入 zip」选它。
-
 > ⚠️ **皮肤 id = 文件夹名**，不是 `theme.json` 里的 `id` 字段 —— 两者不一致时一律以文件夹名为准。
 > 装之前给文件夹改名，等于改了这份皮肤的 id；已经装过同名皮肤的话会被顶掉。
 
-## 装完长什么样
+## 装完想调
 
-`blue-hour` 带背景图，所以激活后终端和面板会**半透明地压在氛围图上**
-（`effects.terminalOpacity` / `surfaceOpacity` 控制透明度，`backgroundDim` 控制图上的压暗层）。
-嫌太透或太暗，直接改皮肤目录里的 `theme.json` —— **保存即热重载**（目录监听 300ms 防抖），不用重启。
+`blue-hour` 带背景图，所以终端和面板会**半透明地压在氛围图上**。嫌太透或太暗，直接改皮肤目录里的 `theme.json` —— **保存即热重载**（目录监听 300ms 防抖），不用重启：
 
-想调构图（人物在视口里的位置）改 `art.focusX` / `focusY`，取值 0–1。
+| 想改什么 | 改哪个 |
+|---|---|
+| 终端透明度 | `effects.terminalOpacity`（0–1，越小越透） |
+| 侧栏 / 面板透明度 | `effects.surfaceOpacity` |
+| 背景图压暗程度 | `effects.backgroundDim`（越大越暗） |
+| 人物在视口里的位置 | `art.focusX` / `art.focusY`（0–1） |
+| 配色 | `colors` 十个语义色、`terminal` 的 ANSI 配色 |
 
-## 关于 `theme.css`
+字段的完整含义见 [`docs/theme-pack-example/README.md`](../docs/theme-pack-example/README.md)。
 
-**这里的皮肤都不带 `theme.css`，这是故意的。**
+---
 
-`theme.css` 与 `tokens` 是 Tauri + WebView 时代的机制，靠的是浏览器 CSS 引擎。
-GPUI 原生版没有 CSS 引擎，这两项**已无任何消费方** —— 写了不会报错，但一行也不会生效。
-现在真正生效的是 `theme.json` 里的 `colors` / `appearance` / `image` / `art` / `effects` / `terminal`。
+## 几件值得知道的事
 
-## 关于 `manifest.json`
+**包里没有 `theme.css`，这是故意的。** `theme.css` 与 `tokens` 是 Tauri + WebView 时代的机制，靠浏览器 CSS 引擎生效。GPUI 原生版没有 CSS 引擎，这两项**已无任何消费方** —— 写了不报错，但一行也不会生效。现在真正生效的是 `theme.json` 里的 `colors` / `appearance` / `image` / `art` / `effects` / `terminal`。
 
-有 `manifest.json` 时，导入会逐文件核对 `bytes` + `sha256`，防止包在下载/传输途中损坏。
-本目录的 manifest **只登记背景图**：`theme.json` 是文本文件，Git 在签出时可能按平台改写换行
-（`core.autocrlf`），字节数与哈希会跟着变，登记进去反而会让每个下载者都撞上「大小不符」。
-文本文件损坏本来也会在 JSON 解析阶段直接报错，不需要 manifest 兜底。
+**`manifest.json` 只登记背景图。** 有 manifest 时导入会逐文件核对 `bytes` + `sha256`，防包在下载途中损坏。这里只登记二进制的背景图：`theme.json` 是文本，Git 在签出时可能按平台改写换行（`core.autocrlf`），字节数与哈希会跟着变，登记进去反而会让下载者撞上「大小不符」；文本损坏本来也会在 JSON 解析阶段直接报错。
 
-## 背景图
+**zip 与文件夹是同一份东西。** 两者的 `theme.json` 与背景图逐字节对齐，有测试钉着，不会漂开 —— 走哪条路装都一样。
 
-`blue-hour/background.jpg` 是 2560×1440 / JPEG q85（231 KB），由 3840×2160 的 PNG 原图压制 ——
-背景要被 `backgroundDim: 0.4` 压暗、还要被面板盖掉大半，原图那 6.9 MB 进 Git 仓库不划算，
-观感上分辨不出差别。
-
-> 📌 **授权待标注**：这张背景图的来源与授权尚未注明。仓库以 MIT 发布，但 MIT 覆盖的是代码；
-> 随仓库分发的图片素材需要单独说明来源与许可。**在补上出处与授权之前，请勿把本目录当作可自由再分发的素材库。**
+**背景图。** `blue-hour/background.jpg` 是 2560×1440 / JPEG q85（231 KB），由 3840×2160 的 PNG 原图压制：背景要被 `backgroundDim` 压暗、还要被面板盖掉大半，原图那 6.9 MB 进 Git 不划算，观感上分辨不出差别。这张图随皮肤一起分发，**出处尚未注明** —— 仓库以 MIT 发布，但 MIT 覆盖的是代码，图片素材需要单独说明来源与许可。在补上之前，请勿把它当作可自由再分发的素材；如果你是版权方，欢迎开 issue 告知。
