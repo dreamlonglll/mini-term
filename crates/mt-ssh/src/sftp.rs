@@ -712,16 +712,16 @@ impl SftpHandle {
                 ),
             );
         }
-        if promote_error_message.is_some()
-            && let Err(error) = self.discard_file_staging(staging).await
-        {
-            push_warning(
-                &mut warning,
-                format!(
-                    "target contents were verified but staging cleanup failed at '{staging}': {}",
-                    error.message()
-                ),
-            );
+        if promote_error_message.is_some() {
+            if let Err(error) = self.discard_file_staging(staging).await {
+                push_warning(
+                    &mut warning,
+                    format!(
+                        "target contents were verified but staging cleanup failed at '{staging}': {}",
+                        error.message()
+                    ),
+                );
+            }
         }
         if let Err(error) = self.remove_file(&backup).await {
             push_warning(

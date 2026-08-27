@@ -1034,12 +1034,13 @@ fn find_next_url_attr(lower: &str, from: usize) -> Option<(usize, usize, &'stati
         while let Some(rel) = lower[at..].find(attr) {
             let name_start = at + rel;
             at = name_start + attr.len();
-            // 属性名前面必须是空白 —— 挡住 `data-src` / `xlink:href` 这类
-            if !lower[..name_start]
-                .chars()
-                .next_back()
-                .is_some_and(char::is_whitespace)
-            {
+            // HTML5 error recovery also accepts attributes after a stray `/`
+            // (`<img/src=x>`) or immediately after a quoted attribute
+            // (`alt="x"src=y`). Cover those parser forms while still rejecting
+            // compound names such as `data-src` and `xlink:href`.
+            if !lower[..name_start].chars().next_back().is_some_and(|ch| {
+                ch.is_whitespace() || matches!(ch, '/' | '"' | '\'')
+            }) {
                 continue;
             }
             // 后面得是 `\s*=\s*`，值可以带引号也可以不带
@@ -2001,6 +2002,12 @@ impl FileViewer {
                     state.set_cursor_position(Position::new(line - 1, 0), window, cx);
                 });
             }
+        } else {
+            // A remote file can change from editable text to binary/oversized
+            // between activations. Drop the old hidden editor so `draft()` and a
+            // later refresh cannot reuse stale text behind the fallback view.
+            self.editor = None;
+            self._editor_sub = None;
         }
         self.result = Some(res);
         // 原版编辑器每次都是带 `autoFocus` 重新挂载的(`preview` 态下才不抢焦点),
@@ -3745,6 +3752,8 @@ mod tests {
 
         let unquoted = sanitize_remote_html_urls(concat!(
             r#"<img src=file:///etc/passwd>"#,
+            r#"<img/src=file:///etc/group>"#,
+            r#"<img alt="x"src=file:///etc/hosts>"#,
             r#"<img src=https://example.com/image.png>"#,
             r#"<a href=../secret.txt>local</a>"#,
         ));
