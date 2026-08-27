@@ -35,7 +35,7 @@ use gpui_component::WindowExt as _;
 use gpui_component::dialog::{Dialog, DialogButtonProps};
 use gpui_component::input::{Input, InputState, SelectAll};
 
-use crate::i18n::t;
+use crate::i18n::{t, tr};
 use crate::overlay;
 use crate::ui;
 
@@ -51,19 +51,38 @@ pub fn open_guarded<F>(kind: &'static str, window: &mut Window, cx: &mut App, bu
 where
     F: Fn(Dialog, &mut Window, &mut App) -> Dialog + 'static,
 {
+    open_guarded_with_close(kind, window, cx, build, |_window, _cx| {});
+}
+
+fn open_guarded_with_close<F, C>(
+    kind: &'static str,
+    window: &mut Window,
+    cx: &mut App,
+    build: F,
+    on_close: C,
+) -> bool
+where
+    F: Fn(Dialog, &mut Window, &mut App) -> Dialog + 'static,
+    C: Fn(&mut Window, &mut App) + 'static,
+{
     if !overlay::push(overlay::key(kind)) {
-        return;
+        on_close(window, cx);
+        return false;
     }
+    let on_close = Rc::new(on_close);
     window.open_dialog(cx, move |dialog, window, cx| {
+        let on_close = on_close.clone();
         // on_close 与 close_button 都放在最后 —— 它们会覆盖 build 里设过的同名
         // 设置:on_close 漏了(摘不掉种类标记)就再也开不出同种类的弹窗;
         // close_button 见 [`dialog_title`] 的注释,画出来是**空白但仍可点**的一块。
         build(dialog, window, cx)
             .close_button(false)
-            .on_close(move |_: &ClickEvent, _window, _cx| {
+            .on_close(move |_: &ClickEvent, window, cx| {
                 overlay::pop(overlay::key(kind));
+                on_close(window, cx);
             })
     });
+    true
 }
 
 /// 主动关掉某种弹窗(Ctrl+Shift+F 第二次按下要能把搜索框关回去)。
@@ -341,6 +360,99 @@ pub fn show_alert(
     });
 }
 
+const FILE_CONFLICT_PREVIEW_LIMIT: usize = 5;
+
+fn file_conflict_preview(conflicts: &[String]) -> (Vec<String>, usize) {
+    let preview = conflicts
+        .iter()
+        .take(FILE_CONFLICT_PREVIEW_LIMIT)
+        .cloned()
+        .collect::<Vec<_>>();
+    let remaining = conflicts.len().saturating_sub(preview.len());
+    (preview, remaining)
+}
+
+/// 上传/下载遇到同名目标时的三选一弹窗。点击遮罩或 Esc 等同取消。
+pub fn show_file_conflict_choice(
+    conflicts: Vec<String>,
+    on_choice: impl Fn(crate::remote_ssh::FileConflictStrategy, &mut Window, &mut App) + 'static,
+    on_cancel: impl Fn(&mut Window, &mut App) + 'static,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let (preview, remaining) = file_conflict_preview(&conflicts);
+    let mut details = preview
+        .into_iter()
+        .map(|name| format!("• {name}"))
+        .collect::<Vec<_>>();
+    if remaining > 0 {
+        details.push(tr!("fileTree", "conflict.remaining", count = remaining));
+    }
+    let message = t("fileTree", "conflict.message");
+    let on_choice = Rc::new(on_choice);
+    open_guarded_with_close(
+        kind::FILE_CONFLICT,
+        window,
+        cx,
+        move |dialog, _window, _cx| {
+            let button = |id: &'static str,
+                          label: SharedString,
+                          strategy: crate::remote_ssh::FileConflictStrategy,
+                          primary: bool| {
+                let on_choice = on_choice.clone();
+                let el = if primary {
+                    ui::primary_button(id, label)
+                } else {
+                    ui::ghost_button(id, label)
+                };
+                el.on_click(move |_: &ClickEvent, window, cx| {
+                    close_guarded(kind::FILE_CONFLICT, window, cx);
+                    on_choice(strategy, window, cx);
+                })
+            };
+            dialog
+                .title(t("fileTree", "conflict.title"))
+                .w(px(420.0))
+                .overlay_closable(true)
+                .child(
+                    div()
+                        .pb(px(16.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(14.0))
+                        .child(body(message, &details))
+                        .child(
+                            div()
+                                .px(px(20.0))
+                                .flex()
+                                .items_center()
+                                .justify_end()
+                                .gap(px(8.0))
+                                .child(button(
+                                    "file-conflict-skip",
+                                    t("fileTree", "conflict.skip").into(),
+                                    crate::remote_ssh::FileConflictStrategy::Skip,
+                                    false,
+                                ))
+                                .child(button(
+                                    "file-conflict-keep-both",
+                                    t("fileTree", "conflict.keepBoth").into(),
+                                    crate::remote_ssh::FileConflictStrategy::KeepBoth,
+                                    false,
+                                ))
+                                .child(button(
+                                    "file-conflict-overwrite",
+                                    t("fileTree", "conflict.overwrite").into(),
+                                    crate::remote_ssh::FileConflictStrategy::Overwrite,
+                                    true,
+                                )),
+                        ),
+                )
+        },
+        on_cancel,
+    );
+}
+
 /// 正文 + 补充行。文案里的 `\n` 要真换行(确认框普遍用它排版),
 /// 而 gpui 的文本不认转义符,得自己拆成多个 child。
 fn body(message: &str, detail: &[String]) -> gpui::AnyElement {
@@ -371,4 +483,29 @@ fn body(message: &str, detail: &[String]) -> gpui::AnyElement {
         el = el.child(list);
     }
     el.into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_conflict_preview_lists_at_most_five_names() {
+        let conflicts = (1..=7)
+            .map(|index| format!("file-{index}.txt"))
+            .collect::<Vec<_>>();
+        let (preview, remaining) = file_conflict_preview(&conflicts);
+
+        assert_eq!(preview.as_slice(), &conflicts[..5]);
+        assert_eq!(remaining, 2);
+    }
+
+    #[test]
+    fn file_conflict_preview_keeps_short_lists_complete() {
+        let conflicts = vec!["a.txt".to_string(), "b.txt".to_string()];
+        let (preview, remaining) = file_conflict_preview(&conflicts);
+
+        assert_eq!(preview, conflicts);
+        assert_eq!(remaining, 0);
+    }
 }

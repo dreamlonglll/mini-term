@@ -36,6 +36,7 @@
 //! `isAiPty` 那道闸在旁路里,AI pane 刷屏带不起这边的刷新。
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -43,23 +44,44 @@ use std::time::{Duration, Instant};
 use futures::StreamExt;
 use futures::channel::mpsc;
 use gpui::{
-    AnyElement, App, ClipboardItem, Context, Entity, Hsla, InteractiveElement, IntoElement,
-    MouseButton, MouseDownEvent, ParentElement, Render, SharedString, StatefulInteractiveElement,
-    Styled, Task, Window, div, prelude::FluentBuilder, px,
+    AnyElement, App, ClipboardItem, Context, DragMoveEvent, Entity, ExternalPaths, Hsla,
+    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, PathPromptOptions,
+    Render, SharedString, StatefulInteractiveElement, Styled, Task, Window, div,
+    prelude::FluentBuilder, px,
 };
-use mt_ui::tooltip::Tooltip;
 use mt_project::fs::FileEntry;
 use mt_project::watch::FsWatcher;
 use mt_ui::icons::FileIcon;
 use mt_ui::icons::vector::{Geom, Ink, Shape, VectorIcon};
+use mt_ui::tooltip::Tooltip;
 
+use crate::file_ops::{
+    FileBackendIdentity, FileClipboardEntry, FileOperationContext, entry_target_directory,
+};
 use crate::fs_ops;
 use crate::git_watch;
 use crate::i18n::{t, tr};
 use crate::menu::{self, MenuEntry, MenuItem};
-use crate::prompt::{Confirm, show_alert, show_prompt};
+use crate::prompt::{Confirm, show_alert, show_file_conflict_choice, show_prompt};
 use crate::store::AppStore;
 use crate::ui;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExternalDropTarget {
+    hit_id: String,
+    target_dir: PathBuf,
+}
+
+fn connection_fingerprint(connection: &mt_config::SshConnection) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    connection.id.hash(&mut hasher);
+    connection.host.hash(&mut hasher);
+    connection.port.hash(&mut hasher);
+    connection.user.hash(&mut hasher);
+    connection.password.hash(&mut hasher);
+    connection.identity_file.hash(&mut hasher);
+    hasher.finish()
+}
 
 pub struct FileTree {
     store: Entity<AppStore>,
@@ -67,10 +89,34 @@ pub struct FileTree {
     entries: HashMap<PathBuf, Vec<FileEntry>>,
     /// 正在列的目录(防重复排队)。
     loading: HashSet<PathBuf>,
+    /// 每个目录当前有效的请求号；删除/切换时移除即可丢弃迟到结果。
+    dir_request_ids: HashMap<PathBuf, u64>,
+    next_dir_request_id: u64,
+    /// 文件操作或 watcher 命中正在加载的目录时，当前请求完成后必须再列一次。
+    /// bool 表示那次补列是否需要强制刷新远程根 `.gitignore`。
+    pending_reload: HashMap<PathBuf, bool>,
     watcher: Arc<FsWatcher>,
     watched: HashSet<PathBuf>,
     /// 当前挂着的项目;换项目时整表作废。
     current_project: Option<String>,
+    /// 项目 + 根路径 + 后端/连接配置的身份签名。连接配置原地修改时也会变化。
+    source_signature: Option<String>,
+    /// 每次 source signature 变化递增，后台结果回写前必须对号。
+    source_generation: u64,
+    /// 应用内文件复制剪贴板；显式绑定项目和后端，不与系统文本剪贴板混用。
+    file_clipboard: Option<FileClipboardEntry>,
+    /// 当前 FileTree 同时只允许一个 mutation/transfer。
+    operation_busy: bool,
+    operation_label: Option<String>,
+    /// 在途操作开始时的来源身份。切项目不会清空它；任务结束时只允许原操作
+    /// 释放全局闸，并仅在项目/根/后端仍一致时刷新视图。
+    active_operation_context: Option<FileOperationContext>,
+    active_operation_suppressed_path: Option<PathBuf>,
+    /// 正在被删除、重命名或批量改写的子树。操作结束前禁止 watcher / 展开态补列
+    /// 重新挂载它，避免大目录删除时 watcher 事件洪泛和半成品缓存回写。
+    suppressed_subtrees: HashSet<PathBuf>,
+    /// 外部文件拖放当前命中的远程目标目录。
+    external_drop_target: Option<ExternalDropTarget>,
     /// git 状态:相对项目根的 `/` 分隔路径 → 状态字母(M/A/D/R/?/C)。
     git_status: HashMap<String, String>,
     /// 排着的 git 状态刷新(去抖到点时刻);`None` = 没排。
@@ -93,6 +139,35 @@ pub struct FileTree {
 }
 
 impl FileTree {
+    fn note_external_drop_target(
+        &mut self,
+        hit_id: &str,
+        target: &Path,
+        event: &DragMoveEvent<ExternalPaths>,
+        cx: &mut Context<Self>,
+    ) {
+        if event.bounds.contains(&event.event.position) {
+            if self
+                .external_drop_target
+                .as_ref()
+                .is_none_or(|active| active.hit_id != hit_id || active.target_dir != target)
+            {
+                self.external_drop_target = Some(ExternalDropTarget {
+                    hit_id: hit_id.to_string(),
+                    target_dir: target.to_path_buf(),
+                });
+                cx.notify();
+            }
+        } else if self
+            .external_drop_target
+            .as_ref()
+            .is_some_and(|active| active.hit_id == hit_id)
+        {
+            self.external_drop_target = None;
+            cx.notify();
+        }
+    }
+
     pub fn new(store: Entity<AppStore>, cx: &mut Context<Self>) -> Self {
         cx.observe(&store, |this: &mut Self, _, cx| {
             this.sync_project(cx);
@@ -116,6 +191,9 @@ impl FileTree {
                 };
                 if this
                     .update(cx, |tree: &mut FileTree, cx| {
+                        if tree.path_is_suppressed(&path) {
+                            return;
+                        }
                         tree.invalidate(&dir, cx);
                         // 原版第二条:`fs-change` 且属于当前项目 → 500ms 去抖刷 git 状态。
                         // watcher 是按项目根注册的,能走到这儿的必然属于当前项目。
@@ -149,9 +227,21 @@ impl FileTree {
             store,
             entries: HashMap::new(),
             loading: HashSet::new(),
+            dir_request_ids: HashMap::new(),
+            next_dir_request_id: 0,
+            pending_reload: HashMap::new(),
             watcher,
             watched: HashSet::new(),
             current_project: None,
+            source_signature: None,
+            source_generation: 0,
+            file_clipboard: None,
+            operation_busy: false,
+            operation_label: None,
+            active_operation_context: None,
+            active_operation_suppressed_path: None,
+            suppressed_subtrees: HashSet::new(),
+            external_drop_target: None,
             git_status: HashMap::new(),
             git_refresh_at: None,
             chain_owner: HashMap::new(),
@@ -187,10 +277,15 @@ impl FileTree {
     /// 失败一律清空(原版 `.catch(() => setGitStatusMap(new Map()))`):
     /// 不是 git 仓库 / 仓库坏了的时候,留着上一个项目的状态字母比没有更糟。
     fn load_git_status(&mut self, cx: &mut Context<Self>) {
-        let Some(root) = self.project_root(cx) else {
+        let Some(context) = self.operation_context(cx) else {
             self.git_status.clear();
             return;
         };
+        if !matches!(&context.backend, FileBackendIdentity::Local) {
+            self.git_status.clear();
+            return;
+        }
+        let root = context.root.clone();
         cx.spawn(async move |this, cx| {
             let probe = root.clone();
             let result = cx
@@ -198,8 +293,9 @@ impl FileTree {
                 .spawn(async move { mt_project::git::get_git_status(&probe) })
                 .await;
             let _ = this.update(cx, |tree: &mut FileTree, cx| {
-                // 回来时项目可能已经换掉了 —— 只认还对得上号的那一次
-                if tree.project_root(cx).as_deref() != Some(root.as_path()) {
+                // 回来时项目、连接或 source generation 都可能已经变化；完整上下文
+                // 不相等就丢弃，避免同路径项目之间串入迟到的 git 状态。
+                if tree.operation_context(cx).as_ref() != Some(&context) {
                     return;
                 }
                 tree.git_status = result
@@ -218,24 +314,35 @@ impl FileTree {
 
     /// 活动项目变了:清空缓存与监听,重列根目录。
     fn sync_project(&mut self, cx: &mut Context<Self>) {
-        let (project_id, root, remote, broken) = {
+        let (project_id, root, remote, broken, signature) = {
             let store = self.store.read(cx);
             match store.active_project() {
                 Some(p) => {
                     let is_remote = store.is_remote_project(&p.id);
                     let conn = store.remote_connection_of(&p.id);
+                    let signature = match &conn {
+                        Some(conn) => format!(
+                            "{}|{}|ssh:{:016x}",
+                            p.id,
+                            p.path,
+                            connection_fingerprint(conn)
+                        ),
+                        None if is_remote => format!("{}|{}|ssh:broken", p.id, p.path),
+                        None => format!("{}|{}|local", p.id, p.path),
+                    };
                     (
                         Some(p.id.clone()),
                         Some(PathBuf::from(&p.path)),
                         conn.is_some(),
                         // 断链 = 是远程项目但连接查不到
                         is_remote && conn.is_none(),
+                        Some(signature),
                     )
                 }
-                None => (None, None, false, false),
+                None => (None, None, false, false, None),
             }
         };
-        if project_id == self.current_project {
+        if signature == self.source_signature {
             return;
         }
         for dir in std::mem::take(&mut self.watched) {
@@ -243,11 +350,27 @@ impl FileTree {
         }
         self.entries.clear();
         self.loading.clear();
+        self.dir_request_ids.clear();
+        self.pending_reload.clear();
         self.chain_owner.clear();
         self.git_status.clear();
         self.git_refresh_at = None;
         self.root_error = None;
         self.current_project = project_id;
+        self.source_signature = signature;
+        self.source_generation = self.source_generation.wrapping_add(1);
+        self.suppressed_subtrees.clear();
+        if self.operation_busy
+            && let (Some(active), Some(current), Some(path)) = (
+                self.active_operation_context.as_ref(),
+                self.operation_context(cx),
+                self.active_operation_suppressed_path.as_ref(),
+            )
+            && same_file_source(active, &current)
+        {
+            self.suppressed_subtrees.insert(path.clone());
+        }
+        self.external_drop_target = None;
         self.remote_broken = broken;
         self.git_status.clear();
         // 没有项目 / 远程项目都把旁路那一份关掉:远程不拉 git 状态,
@@ -291,12 +414,40 @@ impl FileTree {
             .map(|p| PathBuf::from(&p.path))
     }
 
+    fn operation_context(&self, cx: &App) -> Option<FileOperationContext> {
+        let store = self.store.read(cx);
+        let project = store.active_project()?;
+        let backend = if store.is_remote_project(&project.id) {
+            match store.remote_connection_of(&project.id) {
+                Some(connection) => FileBackendIdentity::Remote {
+                    connection_id: connection.id.clone(),
+                    connection_fingerprint: connection_fingerprint(&connection),
+                },
+                None => FileBackendIdentity::BrokenRemote,
+            }
+        } else {
+            FileBackendIdentity::Local
+        };
+        Some(FileOperationContext {
+            project_id: project.id.clone(),
+            root: PathBuf::from(&project.path),
+            backend,
+            generation: self.source_generation,
+        })
+    }
+
+    fn path_is_suppressed(&self, path: &Path) -> bool {
+        self.suppressed_subtrees
+            .iter()
+            .any(|suppressed| path.starts_with(suppressed))
+    }
+
     /// 列一个目录(后台线程)+ 挂监听。
     ///
     /// `refresh_ignore` **只对远程有效**:强制后端重读远程根 `.gitignore`
     /// (头部刷新按钮那一路,原版 `loadRootEntries(true)`)。
     fn load_dir(&mut self, root: PathBuf, dir: PathBuf, cx: &mut Context<Self>) {
-        self.load_dir_with(root, dir, false, cx);
+        self.load_dir_with(root, dir, false, false, cx);
     }
 
     fn load_dir_with(
@@ -304,26 +455,40 @@ impl FileTree {
         root: PathBuf,
         dir: PathBuf,
         refresh_ignore: bool,
+        queue_if_loading: bool,
         cx: &mut Context<Self>,
     ) {
+        if self.path_is_suppressed(&dir) {
+            return;
+        }
         if self.loading.contains(&dir) {
+            if queue_if_loading {
+                self.pending_reload
+                    .entry(dir)
+                    .and_modify(|pending| *pending |= refresh_ignore)
+                    .or_insert(refresh_ignore);
+            }
             return;
         }
         self.loading.insert(dir.clone());
+        self.next_dir_request_id = self.next_dir_request_id.wrapping_add(1);
+        let request_id = self.next_dir_request_id;
+        self.dir_request_ids.insert(dir.clone(), request_id);
 
         // 远程项目**不注册 watcher**:远端文件系统本机监听不到
         let remote = self.remote_conn(cx);
         if remote.is_none()
             && self.watched.insert(dir.clone())
-            && let Err(err) = self
-                .watcher
-                .watch(&dir, &root.to_string_lossy().to_string())
+            && let Err(err) = self.watcher.watch(&dir, root.to_string_lossy().as_ref())
         {
             eprintln!("[files] 监听 {} 失败: {err:#}", dir.display());
         }
 
         let task_dir = dir.clone();
         let task_root = root.clone();
+        let request_project = self.current_project.clone();
+        let request_signature = self.source_signature.clone();
+        let request_generation = self.source_generation;
         // 根目录那一趟额外承担三态占位(loading / 加载失败 / 刷新失败)
         let is_root = dir == root;
         cx.spawn(async move |this, cx| {
@@ -341,9 +506,7 @@ impl FileTree {
                     )
                     .map_err(|e| anyhow::anyhow!(e))?;
                     if remote.is_some() {
-                        return anyhow::Ok(
-                            entries.into_iter().map(|e| (e, Vec::new())).collect(),
-                        );
+                        return anyhow::Ok(entries.into_iter().map(|e| (e, Vec::new())).collect());
                     }
                     let chains = compact_dir_chains(entries, |d| {
                         mt_project::fs::list_directory(&task_root, d).unwrap_or_default()
@@ -352,7 +515,25 @@ impl FileTree {
                 })
                 .await;
             let _ = this.update(cx, |tree: &mut FileTree, cx| {
+                if tree.current_project != request_project
+                    || tree.source_signature != request_signature
+                    || tree.source_generation != request_generation
+                    || tree.dir_request_ids.get(&dir) != Some(&request_id)
+                {
+                    return;
+                }
                 tree.loading.remove(&dir);
+                tree.dir_request_ids.remove(&dir);
+                if let Some(pending_refresh_ignore) = tree.pending_reload.remove(&dir) {
+                    tree.load_dir_with(
+                        root.clone(),
+                        dir.clone(),
+                        pending_refresh_ignore,
+                        false,
+                        cx,
+                    );
+                    return;
+                }
                 if is_root {
                     tree.root_loading = false;
                 }
@@ -440,7 +621,7 @@ impl FileTree {
         let remote = self.is_remote(cx);
         // 手动刷新时强制重读远程根 `.gitignore`(原版 `loadRootEntries(true)`);
         // 本地那一路后端不认这个参数,传什么都一样
-        self.load_dir_with(root.clone(), root, remote, cx);
+        self.load_dir_with(root.clone(), root, remote, true, cx);
         if !remote {
             self.load_git_status(cx);
         }
@@ -472,7 +653,7 @@ impl FileTree {
         let Some(root) = self.project_root(cx) else {
             return;
         };
-        self.load_dir(root, target, cx);
+        self.load_dir_with(root, target, false, true, cx);
     }
 
     /// 技术栈缓存的失效(`useProjectKinds.ts:88-103` 的 `fs-change` 监听)。
@@ -579,6 +760,15 @@ impl FileTree {
     /// 留着的话双击会先开预览器再拉起编辑器(gpui 的双击是两个 click 事件,
     /// click_count 依次为 1、2),两个窗口一起冒出来。
     fn open_file(&self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_remote(cx) {
+            show_alert(
+                t("fileTree", "remote.previewUnsupportedTitle"),
+                t("fileTree", "remote.previewUnsupportedMessage"),
+                window,
+                cx,
+            );
+            return;
+        }
         let Some(root) = self.project_root(cx) else {
             return;
         };
@@ -611,9 +801,33 @@ impl FileTree {
     /// 「同一目录不重复排队」的闸门,两条路撞上也只列一次。
     fn reload_dir(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
         if let Some(root) = self.project_root(cx) {
-            self.load_dir(root, dir, cx);
+            self.load_dir_with(root, dir, false, true, cx);
         }
         cx.notify();
+    }
+
+    /// 删除前解除目标子树 watcher 并清掉缓存，避免大目录逐文件事件洪泛；远程树虽
+    /// 没 watcher，也共用缓存清理。失败后父目录重列会按展开状态逐层恢复。
+    fn detach_subtree(&mut self, target: &Path) {
+        let watched: Vec<PathBuf> = self
+            .watched
+            .iter()
+            .filter(|path| path.starts_with(target))
+            .cloned()
+            .collect();
+        for path in watched {
+            self.watched.remove(&path);
+            self.watcher.unwatch(&path);
+        }
+        self.entries.retain(|path, _| !path.starts_with(target));
+        self.loading.retain(|path| !path.starts_with(target));
+        self.dir_request_ids
+            .retain(|path, _| !path.starts_with(target));
+        self.pending_reload
+            .retain(|path, _| !path.starts_with(target));
+        self.chain_owner
+            .retain(|path, owner| !path.starts_with(target) && !owner.starts_with(target));
+        self.row_focus.retain(|path, _| !path.starts_with(target));
     }
 
     /// 把树按展开状态拍平成可渲染的行。
@@ -666,6 +880,10 @@ impl FileTree {
             }
         }
     }
+}
+
+fn same_file_source(left: &FileOperationContext, right: &FileOperationContext) -> bool {
+    left.project_id == right.project_id && left.root == right.root && left.backend == right.backend
 }
 
 /// 「展开着、却一份内容都没列过」的目录 —— 要补列的那些。
@@ -726,9 +944,15 @@ struct Row {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FileMenuAction {
     OpenWithDefault,
+    CopyEntry,
+    Paste,
+    Download,
+    UploadFiles,
+    UploadFolder,
     CopyRelativePath,
     CopyAbsolutePath,
     RevealInFolder,
+    OpenInTerminal,
     Rename,
     Delete,
     NewFile,
@@ -736,27 +960,36 @@ enum FileMenuAction {
     ViewDiff,
 }
 
-fn file_menu_actions(is_dir: bool, has_git_status: bool) -> Vec<Option<FileMenuAction>> {
+fn file_menu_actions(
+    is_dir: bool,
+    has_git_status: bool,
+    remote: bool,
+) -> Vec<Option<FileMenuAction>> {
     use FileMenuAction::*;
     let mut actions = Vec::new();
-    // 原版是 `items.unshift(openWithDefault)`,所以只有文件才有、且排在最前
-    if !is_dir {
+    if !remote && !is_dir {
         actions.push(Some(OpenWithDefault));
     }
-    actions.extend([
-        Some(CopyRelativePath),
-        Some(CopyAbsolutePath),
-        None,
-        Some(RevealInFolder),
-        None,
-        Some(Rename),
-        Some(Delete),
-    ]);
+    actions.push(Some(CopyEntry));
+    if is_dir {
+        actions.push(Some(Paste));
+    }
+    if remote {
+        actions.push(Some(Download));
+        if is_dir {
+            actions.extend([Some(UploadFiles), Some(UploadFolder)]);
+        }
+    }
+    actions.extend([None, Some(CopyRelativePath), Some(CopyAbsolutePath)]);
+    if !remote {
+        actions.push(Some(RevealInFolder));
+    }
+    actions.extend([Some(OpenInTerminal), None, Some(Rename), Some(Delete)]);
     if is_dir {
         actions.extend([None, Some(NewFile), Some(NewFolder)]);
     }
     // 目录没有单文件 diff 可看 —— 原版这条判定是 `entryGitStatus && !entry.isDir`
-    if !is_dir && has_git_status {
+    if !remote && !is_dir && has_git_status {
         actions.extend([None, Some(ViewDiff)]);
     }
     actions
@@ -861,42 +1094,716 @@ fn rollup_dir_label<'a>(status: &'a HashMap<String, String>, rel: &str) -> Optio
     best.map(|(label, _)| label)
 }
 
-/// 跑一件**阻塞**的文件操作:后台线程做事,回主线程刷目录 / 弹错误框。
-///
-/// `failure` 是 `fileTree.dialog.*` 里那对「标题 / 正文」key(正文带 `{error}`);
-/// `None` = 只往 stderr 打一行不弹框 —— 新建文件/文件夹走的就是这一支:字典里
-/// **没有** `createFailed*` 词条,而原版那两处 `invoke` 压根没接 catch(失败静默)。
-/// 补词条要走 TS 源头 + 重新生成,不在本批里做,已记入交付说明。
-fn spawn_fs_op(
-    tree: Entity<FileTree>,
-    refresh_dir: PathBuf,
-    expand: bool,
-    failure: Option<(&'static str, &'static str)>,
-    op: impl FnOnce() -> anyhow::Result<()> + Send + 'static,
+/// 跑一件阻塞文件操作。状态和结果都绑定开始时的项目/连接/generation；切换项目后
+/// 旧结果不会刷新新树。同一 FileTree 同时只接受一件 mutation/transfer。
+fn begin_tree_preflight(
+    tree: &Entity<FileTree>,
+    context: &FileOperationContext,
+    label: SharedString,
     window: &mut Window,
     cx: &mut App,
-) {
+) -> bool {
+    let start_state = tree.update(cx, |tree, cx| {
+        if tree.operation_context(cx).as_ref() != Some(context) {
+            return None;
+        }
+        if tree.operation_busy {
+            return Some(false);
+        }
+        tree.operation_busy = true;
+        tree.operation_label = Some(label.to_string());
+        tree.active_operation_context = Some(context.clone());
+        tree.active_operation_suppressed_path = None;
+        cx.notify();
+        Some(true)
+    });
+    match start_state {
+        Some(true) => true,
+        Some(false) => {
+            show_alert(
+                t("fileTree", "operation.busyTitle"),
+                t("fileTree", "operation.busyMessage"),
+                window,
+                cx,
+            );
+            false
+        }
+        None => false,
+    }
+}
+
+fn finish_tree_preflight(
+    tree: &Entity<FileTree>,
+    context: &FileOperationContext,
+    cx: &mut App,
+) -> Option<bool> {
+    tree.update(cx, |tree, cx| {
+        if tree.active_operation_context.as_ref() != Some(context) {
+            return None;
+        }
+        let context_matches = tree.operation_context(cx).as_ref() == Some(context);
+        tree.operation_busy = false;
+        tree.operation_label = None;
+        tree.active_operation_context = None;
+        tree.active_operation_suppressed_path = None;
+        cx.notify();
+        Some(context_matches)
+    })
+}
+
+fn retain_tree_preflight_for_choice(
+    tree: &Entity<FileTree>,
+    context: &FileOperationContext,
+    cx: &mut App,
+) -> bool {
+    tree.update(cx, |tree, cx| {
+        if tree.active_operation_context.as_ref() != Some(context) {
+            return false;
+        }
+        if tree.operation_context(cx).as_ref() != Some(context) {
+            tree.operation_busy = false;
+            tree.operation_label = None;
+            tree.active_operation_context = None;
+            tree.active_operation_suppressed_path = None;
+            cx.notify();
+            return false;
+        }
+        tree.operation_label = Some(t("fileTree", "conflict.title").to_string());
+        cx.notify();
+        true
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_tree_op(
+    tree: Entity<FileTree>,
+    context: FileOperationContext,
+    refresh_dir: Option<PathBuf>,
+    expand: bool,
+    detach_before: Option<PathBuf>,
+    label: SharedString,
+    op: impl FnOnce() -> Result<Option<String>, String> + Send + 'static,
+    window: &mut Window,
+    cx: &mut App,
+) -> bool {
+    let suppressed_path = detach_before.clone();
+    let start_state = tree.update(cx, |tree, cx| {
+        if tree.operation_context(cx).as_ref() != Some(&context) {
+            return None;
+        }
+        if tree.operation_busy {
+            return Some(false);
+        }
+        tree.operation_busy = true;
+        tree.operation_label = Some(label.to_string());
+        tree.active_operation_context = Some(context.clone());
+        tree.active_operation_suppressed_path = suppressed_path.clone();
+        cx.notify();
+        Some(true)
+    });
+    match start_state {
+        None => return false,
+        Some(false) => {
+            show_alert(
+                t("fileTree", "operation.busyTitle"),
+                t("fileTree", "operation.busyMessage"),
+                window,
+                cx,
+            );
+            return false;
+        }
+        Some(true) => {}
+    }
+    if let Some(path) = detach_before {
+        tree.update(cx, |tree, cx| {
+            if tree.operation_context(cx).as_ref() == Some(&context) {
+                tree.suppressed_subtrees.insert(path.clone());
+                tree.detach_subtree(&path);
+                cx.notify();
+            }
+        });
+    }
+    let failed_refresh_dir = refresh_dir.clone();
     let task = cx.background_executor().spawn(async move { op() });
     window
         .spawn(cx, async move |cx| {
             let result = task.await;
             let _ = cx.update(|window, cx| match result {
-                Ok(()) => {
-                    tree.update(cx, |tree, cx| {
-                        if expand {
-                            tree.ensure_expanded(refresh_dir, cx);
-                        } else {
-                            tree.reload_dir(refresh_dir, cx);
+                Ok(summary) => {
+                    let operation_owned = tree.update(cx, |tree, cx| {
+                        let current = tree.operation_context(cx);
+                        if tree.active_operation_context.as_ref() != Some(&context) {
+                            return false;
                         }
+                        let same_source = current
+                            .as_ref()
+                            .is_some_and(|current| same_file_source(current, &context));
+                        tree.operation_busy = false;
+                        tree.operation_label = None;
+                        tree.active_operation_context = None;
+                        tree.active_operation_suppressed_path = None;
+                        if let Some(path) = suppressed_path.as_ref() {
+                            if same_source {
+                                tree.detach_subtree(path);
+                            }
+                            if same_source
+                                && !expand
+                                && let Some(project_id) = tree.current_project.clone()
+                            {
+                                let key = path.to_string_lossy().to_string();
+                                tree.store.update(cx, |store, cx| {
+                                    store.set_dir_expanded(&project_id, &key, false, cx)
+                                });
+                            }
+                            tree.suppressed_subtrees.remove(path);
+                        }
+                        if same_source && let Some(refresh_dir) = refresh_dir {
+                            if expand {
+                                tree.ensure_expanded(refresh_dir, cx);
+                            } else {
+                                tree.reload_dir(refresh_dir, cx);
+                            }
+                        }
+                        cx.notify();
+                        true
                     });
+                    if operation_owned && let Some(summary) = summary {
+                        show_alert(
+                            t("fileTree", "operation.completeTitle"),
+                            summary,
+                            window,
+                            cx,
+                        );
+                    }
                 }
                 Err(err) => {
-                    eprintln!("[files] 操作失败: {err:#}");
-                    // 原版用 Tauri 的 message() 弹系统提示,这里统一走自己的 alert
-                    if let Some((title, message)) = failure {
+                    eprintln!("[files] 操作失败: {err}");
+                    let operation_owned = tree.update(cx, |tree, cx| {
+                        if tree.active_operation_context.as_ref() != Some(&context) {
+                            return false;
+                        }
+                        let same_source = tree
+                            .operation_context(cx)
+                            .as_ref()
+                            .is_some_and(|current| same_file_source(current, &context));
+                        tree.operation_busy = false;
+                        tree.operation_label = None;
+                        tree.active_operation_context = None;
+                        tree.active_operation_suppressed_path = None;
+                        if let Some(path) = suppressed_path.as_ref() {
+                            if same_source {
+                                tree.detach_subtree(path);
+                            }
+                            tree.suppressed_subtrees.remove(path);
+                        }
+                        if same_source && let Some(failed_refresh_dir) = failed_refresh_dir {
+                            tree.reload_dir(failed_refresh_dir, cx);
+                        }
+                        cx.notify();
+                        true
+                    });
+                    if operation_owned {
                         show_alert(
-                            t("fileTree", title),
-                            tr!("fileTree", message, error = format!("{err:#}")),
+                            t("fileTree", "operation.failedTitle"),
+                            tr!("fileTree", "operation.failedMessage", error = err),
+                            window,
+                            cx,
+                        );
+                    }
+                }
+            });
+        })
+        .detach();
+    true
+}
+
+fn operation_summary(summary: &crate::remote_ssh::FileOperationSummary) -> Option<String> {
+    let mut text = tr!(
+        "fileTree",
+        "operation.summary",
+        completed = summary.completed,
+        skipped = summary.skipped,
+        failed = summary.failed
+    );
+    if !summary.warnings.is_empty() {
+        text.push_str("\n\n");
+        text.push_str(&summary.warnings.join("\n"));
+    }
+    Some(text)
+}
+
+fn copy_to_file_clipboard(
+    tree: &Entity<FileTree>,
+    row: &Row,
+    expected_context: &FileOperationContext,
+    cx: &mut App,
+) {
+    tree.update(cx, |tree, cx| {
+        if tree.operation_context(cx).as_ref() != Some(expected_context) {
+            return;
+        }
+        tree.file_clipboard = Some(FileClipboardEntry {
+            project_id: expected_context.project_id.clone(),
+            root: expected_context.root.clone(),
+            backend: expected_context.backend.clone(),
+            generation: expected_context.generation,
+            source: row.path.clone(),
+            is_dir: row.is_dir,
+        });
+        cx.notify();
+    });
+}
+
+fn paste_file_clipboard(
+    tree: Entity<FileTree>,
+    expected_context: FileOperationContext,
+    target_dir: PathBuf,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let prepared = (tree.read(cx).operation_context(cx).as_ref() == Some(&expected_context))
+        .then(|| {
+            let clipboard = tree.read(cx).file_clipboard.clone()?;
+            clipboard
+                .can_paste_into(&expected_context)
+                .then_some((expected_context, clipboard))
+        })
+        .flatten();
+    let Some((context, clipboard)) = prepared else {
+        show_alert(
+            t("fileTree", "clipboard.unavailableTitle"),
+            t("fileTree", "clipboard.unavailableMessage"),
+            window,
+            cx,
+        );
+        return;
+    };
+    if clipboard.would_copy_into_itself(&target_dir) {
+        show_alert(
+            t("fileTree", "clipboard.recursiveTitle"),
+            t("fileTree", "clipboard.recursiveMessage"),
+            window,
+            cx,
+        );
+        return;
+    }
+    let source_name = clipboard.source.file_name().map(|name| name.to_os_string());
+    let Some(source_name) = source_name else {
+        return;
+    };
+
+    match &context.backend {
+        FileBackendIdentity::Local => {
+            let root = context.root.clone();
+            let source = clipboard.source.clone();
+            let destination = target_dir.join(source_name);
+            spawn_tree_op(
+                tree,
+                context,
+                Some(target_dir),
+                true,
+                None,
+                t("fileTree", "operation.copying").into(),
+                move || {
+                    mt_project::fs::copy_entry(
+                        &root,
+                        &source,
+                        &destination,
+                        mt_project::fs::CopyConflictPolicy::KeepBoth,
+                    )
+                    .map(|_| None)
+                    .map_err(|e| format!("{e:#}"))
+                },
+                window,
+                cx,
+            );
+        }
+        FileBackendIdentity::Remote { .. } => {
+            let Some(conn) = tree.read(cx).remote_conn(cx) else {
+                return;
+            };
+            let root = context.root.to_string_lossy().into_owned();
+            let source = clipboard.source.to_string_lossy().into_owned();
+            let target = target_dir.to_string_lossy().into_owned();
+            spawn_tree_op(
+                tree,
+                context,
+                Some(target_dir),
+                true,
+                None,
+                t("fileTree", "operation.copying").into(),
+                move || {
+                    crate::remote_ssh::copy_entry_keep_both(&conn, &root, &source, &target)
+                        .map(|(_, summary)| operation_summary(&summary))
+                },
+                window,
+                cx,
+            );
+        }
+        FileBackendIdentity::BrokenRemote => {}
+    }
+}
+
+fn open_entry_in_terminal(
+    tree: Entity<FileTree>,
+    store: Entity<AppStore>,
+    context: FileOperationContext,
+    path: PathBuf,
+    is_dir: bool,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if tree.read(cx).operation_context(cx).as_ref() != Some(&context) {
+        return;
+    }
+    let cwd_path = entry_target_directory(&path, is_dir, &context.root);
+    let cwd = (cwd_path != context.root).then(|| cwd_path.to_string_lossy().into_owned());
+    store.update(cx, |store, cx| {
+        if store.active_project_id.as_deref() != Some(context.project_id.as_str()) {
+            return;
+        }
+        store.new_terminal_with_cwd(&context.project_id, None, None, cwd, window, cx);
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_upload(
+    tree: Entity<FileTree>,
+    context: FileOperationContext,
+    conn: mt_config::SshConnection,
+    target_dir: PathBuf,
+    local_paths: Vec<PathBuf>,
+    strategy: crate::remote_ssh::FileConflictStrategy,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let root = context.root.to_string_lossy().into_owned();
+    let target = target_dir.to_string_lossy().into_owned();
+    let detach_before = target_dir.clone();
+    spawn_tree_op(
+        tree,
+        context,
+        Some(target_dir),
+        true,
+        Some(detach_before),
+        t("fileTree", "operation.uploading").into(),
+        move || {
+            crate::remote_ssh::upload_paths(&conn, &root, &target, &local_paths, strategy)
+                .map(|summary| operation_summary(&summary))
+        },
+        window,
+        cx,
+    );
+}
+
+fn start_upload(
+    tree: Entity<FileTree>,
+    context: FileOperationContext,
+    target_dir: PathBuf,
+    local_paths: Vec<PathBuf>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if local_paths.is_empty() {
+        return;
+    }
+    if tree.read(cx).operation_context(cx).as_ref() != Some(&context) {
+        return;
+    }
+    let FileBackendIdentity::Remote { .. } = &context.backend else {
+        return;
+    };
+    let Some(conn) = tree.read(cx).remote_conn(cx) else {
+        return;
+    };
+    if !begin_tree_preflight(
+        &tree,
+        &context,
+        t("fileTree", "operation.checkingConflicts").into(),
+        window,
+        cx,
+    ) {
+        return;
+    }
+    let root = context.root.to_string_lossy().into_owned();
+    let target = target_dir.to_string_lossy().into_owned();
+    let scan_paths = local_paths.clone();
+    let task = cx.background_executor().spawn(async move {
+        crate::remote_ssh::upload_conflicts(&conn, &root, &target, &scan_paths)
+            .map(|conflicts| (conn, conflicts))
+    });
+    window
+        .spawn(cx, async move |cx| {
+            let result = task.await;
+            let _ = cx.update(|window, cx| match result {
+                Ok((conn, conflicts)) if conflicts.is_empty() => {
+                    if finish_tree_preflight(&tree, &context, cx) != Some(true) {
+                        return;
+                    }
+                    run_upload(
+                        tree.clone(),
+                        context.clone(),
+                        conn,
+                        target_dir.clone(),
+                        local_paths.clone(),
+                        crate::remote_ssh::FileConflictStrategy::KeepBoth,
+                        window,
+                        cx,
+                    );
+                }
+                Ok((conn, conflicts)) => {
+                    if !retain_tree_preflight_for_choice(&tree, &context, cx) {
+                        return;
+                    }
+                    let choice_tree = tree.clone();
+                    let choice_context = context.clone();
+                    let cancel_tree = tree.clone();
+                    let cancel_context = context.clone();
+                    show_file_conflict_choice(
+                        conflicts,
+                        move |strategy, window, cx| {
+                            if finish_tree_preflight(&choice_tree, &choice_context, cx)
+                                != Some(true)
+                            {
+                                return;
+                            }
+                            run_upload(
+                                choice_tree.clone(),
+                                choice_context.clone(),
+                                conn.clone(),
+                                target_dir.clone(),
+                                local_paths.clone(),
+                                strategy,
+                                window,
+                                cx,
+                            );
+                        },
+                        move |_window, cx| {
+                            finish_tree_preflight(&cancel_tree, &cancel_context, cx);
+                        },
+                        window,
+                        cx,
+                    );
+                }
+                Err(error) => {
+                    if finish_tree_preflight(&tree, &context, cx).is_some() {
+                        show_alert(
+                            t("fileTree", "operation.failedTitle"),
+                            tr!("fileTree", "operation.failedMessage", error = error),
+                            window,
+                            cx,
+                        );
+                    }
+                }
+            });
+        })
+        .detach();
+}
+
+fn choose_upload_paths(
+    tree: Entity<FileTree>,
+    context: FileOperationContext,
+    target_dir: PathBuf,
+    directories: bool,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let prompt = cx.prompt_for_paths(PathPromptOptions {
+        files: !directories,
+        directories,
+        multiple: !directories,
+        prompt: Some(
+            t(
+                "fileTree",
+                if directories {
+                    "upload.chooseFolderTitle"
+                } else {
+                    "upload.chooseFilesTitle"
+                },
+            )
+            .into(),
+        ),
+    });
+    window
+        .spawn(cx, async move |cx| {
+            let selected = match prompt.await {
+                Ok(Ok(Some(paths))) => paths,
+                Ok(Ok(None)) => return,
+                Ok(Err(error)) => {
+                    let detail = error.to_string();
+                    let _ = cx.update(|window, cx| {
+                        if tree.read(cx).operation_context(cx).as_ref() != Some(&context) {
+                            return;
+                        }
+                        show_alert(t("fileTree", "operation.failedTitle"), detail, window, cx);
+                    });
+                    return;
+                }
+                Err(error) => {
+                    let detail = error.to_string();
+                    let _ = cx.update(|window, cx| {
+                        if tree.read(cx).operation_context(cx).as_ref() != Some(&context) {
+                            return;
+                        }
+                        show_alert(t("fileTree", "operation.failedTitle"), detail, window, cx);
+                    });
+                    return;
+                }
+            };
+            let _ = cx.update(|window, cx| {
+                if tree.read(cx).operation_context(cx).as_ref() != Some(&context) {
+                    return;
+                }
+                start_upload(tree, context, target_dir, selected, window, cx)
+            });
+        })
+        .detach();
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_download(
+    tree: Entity<FileTree>,
+    context: FileOperationContext,
+    conn: mt_config::SshConnection,
+    remote_paths: Vec<PathBuf>,
+    download_dir: PathBuf,
+    strategy: crate::remote_ssh::FileConflictStrategy,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let root = context.root.to_string_lossy().into_owned();
+    spawn_tree_op(
+        tree,
+        context,
+        None,
+        false,
+        None,
+        t("fileTree", "operation.downloading").into(),
+        move || {
+            crate::remote_ssh::download_entries(
+                &conn,
+                &root,
+                &remote_paths,
+                &download_dir,
+                strategy,
+            )
+            .map(|summary| {
+                let mut message = operation_summary(&summary).unwrap_or_default();
+                message.push_str("\n\n");
+                message.push_str(&tr!(
+                    "fileTree",
+                    "operation.downloadLocation",
+                    path = download_dir.display()
+                ));
+                Some(message)
+            })
+        },
+        window,
+        cx,
+    );
+}
+
+fn start_download(
+    tree: Entity<FileTree>,
+    context: FileOperationContext,
+    remote_paths: Vec<PathBuf>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if tree.read(cx).operation_context(cx).as_ref() != Some(&context) {
+        return;
+    }
+    let FileBackendIdentity::Remote { .. } = &context.backend else {
+        return;
+    };
+    let Some(conn) = tree.read(cx).remote_conn(cx) else {
+        return;
+    };
+    let store = tree.read(cx).store.clone();
+    let download_dir = match store.read(cx).config().resolved_download_dir() {
+        Ok(path) => path,
+        Err(error) => {
+            show_alert(
+                t("fileTree", "download.directoryErrorTitle"),
+                format!("{error:#}"),
+                window,
+                cx,
+            );
+            return;
+        }
+    };
+    if !begin_tree_preflight(
+        &tree,
+        &context,
+        t("fileTree", "operation.checkingConflicts").into(),
+        window,
+        cx,
+    ) {
+        return;
+    }
+    let scan_dir = download_dir.clone();
+    let scan_paths = remote_paths.clone();
+    let task = cx
+        .background_executor()
+        .spawn(async move { crate::remote_ssh::download_conflicts(&scan_dir, &scan_paths) });
+    window
+        .spawn(cx, async move |cx| {
+            let result = task.await;
+            let _ = cx.update(|window, cx| match result {
+                Ok(conflicts) if conflicts.is_empty() => {
+                    if finish_tree_preflight(&tree, &context, cx) != Some(true) {
+                        return;
+                    }
+                    run_download(
+                        tree,
+                        context,
+                        conn,
+                        remote_paths,
+                        download_dir,
+                        crate::remote_ssh::FileConflictStrategy::KeepBoth,
+                        window,
+                        cx,
+                    );
+                }
+                Ok(conflicts) => {
+                    if !retain_tree_preflight_for_choice(&tree, &context, cx) {
+                        return;
+                    }
+                    let choice_tree = tree.clone();
+                    let choice_context = context.clone();
+                    let cancel_tree = tree.clone();
+                    let cancel_context = context.clone();
+                    show_file_conflict_choice(
+                        conflicts,
+                        move |strategy, window, cx| {
+                            if finish_tree_preflight(&choice_tree, &choice_context, cx)
+                                != Some(true)
+                            {
+                                return;
+                            }
+                            run_download(
+                                choice_tree.clone(),
+                                choice_context.clone(),
+                                conn.clone(),
+                                remote_paths.clone(),
+                                download_dir.clone(),
+                                strategy,
+                                window,
+                                cx,
+                            );
+                        },
+                        move |_window, cx| {
+                            finish_tree_preflight(&cancel_tree, &cancel_context, cx);
+                        },
+                        window,
+                        cx,
+                    );
+                }
+                Err(error) => {
+                    if finish_tree_preflight(&tree, &context, cx).is_some() {
+                        show_alert(
+                            t("fileTree", "operation.failedTitle"),
+                            tr!("fileTree", "operation.failedMessage", error = error),
                             window,
                             cx,
                         );
@@ -912,10 +1819,14 @@ fn file_menu(
     tree: &Entity<FileTree>,
     store: &Entity<AppStore>,
     row: &Row,
-    root: PathBuf,
+    context: FileOperationContext,
+    connection: Option<mt_config::SshConnection>,
+    can_paste: bool,
 ) -> Vec<MenuEntry> {
+    let root = context.root.clone();
+    let remote = matches!(&context.backend, FileBackendIdentity::Remote { .. });
     let mut entries = Vec::new();
-    for action in file_menu_actions(row.is_dir, row.git.is_some()) {
+    for action in file_menu_actions(row.is_dir, row.git.is_some(), remote) {
         let Some(action) = action else {
             entries.push(menu::separator());
             continue;
@@ -924,8 +1835,18 @@ fn file_menu(
         let name = row.name.clone();
         let tree = tree.clone();
         let root = root.clone();
+        let context = context.clone();
+        let connection = connection.clone();
         // 父目录:重命名/删除之后要刷的是它;新建时刷的是目录自己
-        let parent = path.parent().map(Path::to_path_buf).unwrap_or_else(|| root.clone());
+        let parent = if remote {
+            crate::remote_ssh::parent_posix(&path.to_string_lossy())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| root.clone())
+        } else {
+            path.parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| root.clone())
+        };
 
         entries.push(match action {
             FileMenuAction::OpenWithDefault => {
@@ -933,25 +1854,87 @@ fn file_menu(
                     let path = path.clone();
                     cx.background_executor()
                         .spawn(async move {
-                            if let Err(err) = mt_project::editor::open_path_with_default_app(&path) {
+                            if let Err(err) = mt_project::editor::open_path_with_default_app(&path)
+                            {
                                 eprintln!("[files] 默认程序打开失败: {err:#}");
                             }
                         })
                         .detach();
                 })
             }
-            FileMenuAction::CopyRelativePath => {
-                let relative =
-                    fs_ops::relative_path(&path.to_string_lossy(), &root.to_string_lossy());
-                menu::item(t("fileTree", "menu.copyRelativePath"), move |_window, cx| {
-                    cx.write_to_clipboard(ClipboardItem::new_string(relative.clone()));
+            FileMenuAction::CopyEntry => {
+                let row = row.clone();
+                let context = context.clone();
+                menu::item(t("fileTree", "menu.copy"), move |_window, cx| {
+                    copy_to_file_clipboard(&tree, &row, &context, cx);
                 })
+            }
+            FileMenuAction::Paste => MenuItem::new(t("fileTree", "menu.paste"))
+                .disabled(!can_paste)
+                .on_click(move |window, cx| {
+                    paste_file_clipboard(tree.clone(), context.clone(), path.clone(), window, cx);
+                })
+                .into(),
+            FileMenuAction::Download => {
+                menu::item(t("fileTree", "menu.download"), move |window, cx| {
+                    start_download(
+                        tree.clone(),
+                        context.clone(),
+                        vec![path.clone()],
+                        window,
+                        cx,
+                    );
+                })
+            }
+            FileMenuAction::UploadFiles => {
+                menu::item(t("fileTree", "menu.uploadFiles"), move |window, cx| {
+                    choose_upload_paths(
+                        tree.clone(),
+                        context.clone(),
+                        path.clone(),
+                        false,
+                        window,
+                        cx,
+                    );
+                })
+            }
+            FileMenuAction::UploadFolder => {
+                menu::item(t("fileTree", "menu.uploadFolder"), move |window, cx| {
+                    choose_upload_paths(
+                        tree.clone(),
+                        context.clone(),
+                        path.clone(),
+                        true,
+                        window,
+                        cx,
+                    );
+                })
+            }
+            FileMenuAction::CopyRelativePath => {
+                let relative = if remote {
+                    crate::remote_ssh::posix_relative(
+                        &root.to_string_lossy(),
+                        &path.to_string_lossy(),
+                    )
+                    .unwrap_or_default()
+                } else {
+                    fs_ops::relative_path(&path.to_string_lossy(), &root.to_string_lossy())
+                };
+                menu::item(
+                    t("fileTree", "menu.copyRelativePath"),
+                    move |_window, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(relative.clone()));
+                    },
+                )
             }
             FileMenuAction::CopyAbsolutePath => {
                 let absolute = path.to_string_lossy().to_string();
-                menu::item(t("fileTree", "menu.copyAbsolutePath"), move |_window, cx| {
-                    cx.write_to_clipboard(ClipboardItem::new_string(absolute.clone()));
-                })
+                menu::item(
+                    t("fileTree", "menu.copyAbsolutePath"),
+                    move |_window, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(absolute.clone()));
+                    },
+                )
             }
             FileMenuAction::RevealInFolder => {
                 menu::item(t("fileTree", "menu.revealInFolder"), move |_window, cx| {
@@ -965,35 +1948,73 @@ fn file_menu(
                         .detach();
                 })
             }
-            FileMenuAction::Rename => menu::item(t("fileTree", "menu.rename"), move |window, cx| {
-                let (tree, root, path, parent) =
-                    (tree.clone(), root.clone(), path.clone(), parent.clone());
-                let old_name = name.clone();
-                show_prompt(
-                    t("fileTree", "prompt.renameTitle"),
-                    t("fileTree", "prompt.renameMessage"),
-                    old_name.clone(),
-                    move |value, window, cx| {
-                        let new_name = value.trim().to_string();
-                        // 空名 / 没改都当没点(原版同一条判断)
-                        if new_name.is_empty() || new_name == old_name {
-                            return;
-                        }
-                        let (root, path) = (root.clone(), path.clone());
-                        spawn_fs_op(
-                            tree.clone(),
-                            parent.clone(),
-                            false,
-                            Some(("dialog.renameFailedTitle", "dialog.renameFailedMessage")),
-                            move || mt_project::fs::rename_entry(&root, &path, &new_name).map(|_| ()),
-                            window,
-                            cx,
-                        );
-                    },
-                    window,
-                    cx,
-                );
-            }),
+            FileMenuAction::OpenInTerminal => {
+                let context = context.clone();
+                let store = store.clone();
+                let is_dir = row.is_dir;
+                menu::item(t("fileTree", "menu.openInTerminal"), move |window, cx| {
+                    open_entry_in_terminal(
+                        tree.clone(),
+                        store.clone(),
+                        context.clone(),
+                        path.clone(),
+                        is_dir,
+                        window,
+                        cx,
+                    );
+                })
+            }
+            FileMenuAction::Rename => {
+                let is_dir = row.is_dir;
+                menu::item(t("fileTree", "menu.rename"), move |window, cx| {
+                    let (tree, root, path, parent) =
+                        (tree.clone(), root.clone(), path.clone(), parent.clone());
+                    let detach_before = is_dir.then(|| path.clone());
+                    let old_name = name.clone();
+                    let context = context.clone();
+                    let connection = connection.clone();
+                    show_prompt(
+                        t("fileTree", "prompt.renameTitle"),
+                        t("fileTree", "prompt.renameMessage"),
+                        old_name.clone(),
+                        move |value, window, cx| {
+                            let new_name = value.trim().to_string();
+                            // 空名 / 没改都当没点(原版同一条判断)
+                            if new_name.is_empty() || new_name == old_name {
+                                return;
+                            }
+                            let (root, path) = (root.clone(), path.clone());
+                            let detach_before = detach_before.clone();
+                            let context = context.clone();
+                            let connection = connection.clone();
+                            spawn_tree_op(
+                                tree.clone(),
+                                context,
+                                Some(parent.clone()),
+                                false,
+                                detach_before,
+                                t("fileTree", "operation.renaming").into(),
+                                move || match connection {
+                                    Some(conn) => crate::remote_ssh::rename_entry(
+                                        &conn,
+                                        &root.to_string_lossy(),
+                                        &path.to_string_lossy(),
+                                        &new_name,
+                                    )
+                                    .map(|_| None),
+                                    None => mt_project::fs::rename_entry(&root, &path, &new_name)
+                                        .map(|_| None)
+                                        .map_err(|e| format!("{e:#}")),
+                                },
+                                window,
+                                cx,
+                            );
+                        },
+                        window,
+                        cx,
+                    );
+                })
+            }
             FileMenuAction::Delete => {
                 let is_dir = row.is_dir;
                 MenuItem::new(t("fileTree", "menu.delete"))
@@ -1001,6 +2022,8 @@ fn file_menu(
                     .on_click(move |window, cx| {
                         let (tree, root, path, parent) =
                             (tree.clone(), root.clone(), path.clone(), parent.clone());
+                        let context = context.clone();
+                        let connection = connection.clone();
                         let (title, message) = if is_dir {
                             (
                                 t("fileTree", "dialog.deleteFolderTitle"),
@@ -1018,15 +2041,28 @@ fn file_menu(
                             .open(
                                 move |window, cx| {
                                     let (root, path) = (root.clone(), path.clone());
-                                    spawn_fs_op(
+                                    let connection = connection.clone();
+                                    let operation_path = path.clone();
+                                    spawn_tree_op(
                                         tree.clone(),
-                                        parent.clone(),
+                                        context.clone(),
+                                        Some(parent.clone()),
                                         false,
-                                        Some((
-                                            "dialog.deleteFailedTitle",
-                                            "dialog.deleteFailedMessage",
-                                        )),
-                                        move || mt_project::fs::delete_entry(&root, &path),
+                                        Some(path.clone()),
+                                        t("fileTree", "operation.deleting").into(),
+                                        move || match connection {
+                                            Some(conn) => crate::remote_ssh::delete_entry(
+                                                &conn,
+                                                &root.to_string_lossy(),
+                                                &operation_path.to_string_lossy(),
+                                            )
+                                            .map(|_| None),
+                                            None => {
+                                                mt_project::fs::delete_entry(&root, &operation_path)
+                                                    .map(|_| None)
+                                                    .map_err(|e| format!("{e:#}"))
+                                            }
+                                        },
                                         window,
                                         cx,
                                     );
@@ -1038,13 +2074,33 @@ fn file_menu(
                     .into()
             }
             FileMenuAction::NewFile => {
+                let context = context.clone();
+                let connection = connection.clone();
                 menu::item(t("fileTree", "menu.newFile"), move |window, cx| {
-                    new_entry_prompt(tree.clone(), root.clone(), path.clone(), false, window, cx);
+                    new_entry_prompt(
+                        tree.clone(),
+                        context.clone(),
+                        connection.clone(),
+                        path.clone(),
+                        false,
+                        window,
+                        cx,
+                    );
                 })
             }
             FileMenuAction::NewFolder => {
+                let context = context.clone();
+                let connection = connection.clone();
                 menu::item(t("fileTree", "menu.newFolder"), move |window, cx| {
-                    new_entry_prompt(tree.clone(), root.clone(), path.clone(), true, window, cx);
+                    new_entry_prompt(
+                        tree.clone(),
+                        context.clone(),
+                        connection.clone(),
+                        path.clone(),
+                        true,
+                        window,
+                        cx,
+                    );
                 })
             }
             FileMenuAction::ViewDiff => {
@@ -1072,10 +2128,125 @@ fn file_menu(
     entries
 }
 
+fn background_menu(
+    tree: &Entity<FileTree>,
+    store: &Entity<AppStore>,
+    context: FileOperationContext,
+    connection: Option<mt_config::SshConnection>,
+    can_paste: bool,
+) -> Vec<MenuEntry> {
+    let root = context.root.clone();
+    let remote = matches!(&context.backend, FileBackendIdentity::Remote { .. });
+    let mut entries = vec![
+        MenuItem::new(t("fileTree", "menu.paste"))
+            .disabled(!can_paste)
+            .on_click({
+                let tree = tree.clone();
+                let root = root.clone();
+                let context = context.clone();
+                move |window, cx| {
+                    paste_file_clipboard(tree.clone(), context.clone(), root.clone(), window, cx);
+                }
+            })
+            .into(),
+    ];
+    if remote {
+        entries.extend([
+            menu::item(t("fileTree", "menu.uploadFiles"), {
+                let tree = tree.clone();
+                let root = root.clone();
+                let context = context.clone();
+                move |window, cx| {
+                    choose_upload_paths(
+                        tree.clone(),
+                        context.clone(),
+                        root.clone(),
+                        false,
+                        window,
+                        cx,
+                    )
+                }
+            }),
+            menu::item(t("fileTree", "menu.uploadFolder"), {
+                let tree = tree.clone();
+                let root = root.clone();
+                let context = context.clone();
+                move |window, cx| {
+                    choose_upload_paths(
+                        tree.clone(),
+                        context.clone(),
+                        root.clone(),
+                        true,
+                        window,
+                        cx,
+                    )
+                }
+            }),
+        ]);
+    }
+    entries.push(menu::separator());
+    entries.push(menu::item(t("fileTree", "menu.openInTerminal"), {
+        let tree = tree.clone();
+        let store = store.clone();
+        let context = context.clone();
+        let root = root.clone();
+        move |window, cx| {
+            open_entry_in_terminal(
+                tree.clone(),
+                store.clone(),
+                context.clone(),
+                root.clone(),
+                true,
+                window,
+                cx,
+            )
+        }
+    }));
+    entries.push(menu::separator());
+    entries.extend([
+        menu::item(t("fileTree", "menu.newFile"), {
+            let tree = tree.clone();
+            let context = context.clone();
+            let connection = connection.clone();
+            let root = root.clone();
+            move |window, cx| {
+                new_entry_prompt(
+                    tree.clone(),
+                    context.clone(),
+                    connection.clone(),
+                    root.clone(),
+                    false,
+                    window,
+                    cx,
+                )
+            }
+        }),
+        menu::item(t("fileTree", "menu.newFolder"), {
+            let tree = tree.clone();
+            let context = context.clone();
+            let connection = connection.clone();
+            let root = root.clone();
+            move |window, cx| {
+                new_entry_prompt(
+                    tree.clone(),
+                    context.clone(),
+                    connection.clone(),
+                    root.clone(),
+                    true,
+                    window,
+                    cx,
+                )
+            }
+        }),
+    ]);
+    entries
+}
+
 /// 「新建文件 / 新建文件夹」:问名字 → 建 → 展开父目录并重列。
 fn new_entry_prompt(
     tree: Entity<FileTree>,
-    root: PathBuf,
+    context: FileOperationContext,
+    connection: Option<mt_config::SshConnection>,
     dir: PathBuf,
     is_dir: bool,
     window: &mut Window,
@@ -1101,21 +2272,38 @@ fn new_entry_prompt(
             if name.is_empty() {
                 return;
             }
-            // 分隔符按目录路径里已有的那种拼(远程/WSL 路径是 POSIX 的)
-            let target = PathBuf::from(fs_ops::child_path(&dir.to_string_lossy(), &name));
-            let root = root.clone();
-            spawn_fs_op(
+            let root = context.root.clone();
+            let context = context.clone();
+            let connection = connection.clone();
+            let operation_dir = dir.clone();
+            spawn_tree_op(
                 tree.clone(),
-                dir.clone(),
-                // 建完把父目录展开,不然新建的东西看不见(原版 `if (!expanded) handleToggle()`)
+                context,
+                Some(dir.clone()),
                 true,
-                // 缺 `createFailed*` 词条,失败只打日志(见 spawn_fs_op 的说明)
                 None,
-                move || {
-                    if is_dir {
-                        mt_project::fs::create_directory(&root, &target)
-                    } else {
-                        mt_project::fs::create_file(&root, &target)
+                t("fileTree", "operation.creating").into(),
+                move || match connection {
+                    Some(conn) => crate::remote_ssh::create_entry(
+                        &conn,
+                        &root.to_string_lossy(),
+                        &operation_dir.to_string_lossy(),
+                        &name,
+                        is_dir,
+                    )
+                    .map(|_| None),
+                    None => {
+                        let target = PathBuf::from(fs_ops::child_path(
+                            &operation_dir.to_string_lossy(),
+                            &name,
+                        ));
+                        if is_dir {
+                            mt_project::fs::create_directory(&root, &target)
+                        } else {
+                            mt_project::fs::create_file(&root, &target)
+                        }
+                        .map(|_| None)
+                        .map_err(|e| format!("{e:#}"))
                     }
                 },
                 window,
@@ -1129,7 +2317,11 @@ fn new_entry_prompt(
 
 /// 快捷键提示里的修饰键名(与 `search_modal` 那份同规则)。
 fn mod_label() -> &'static str {
-    if cfg!(target_os = "macos") { "⌘" } else { "Ctrl" }
+    if cfg!(target_os = "macos") {
+        "⌘"
+    } else {
+        "Ctrl"
+    }
 }
 
 /// 头部那三个 26×26 的图标钮共用的外观(`FileTree.tsx:734`)。
@@ -1195,11 +2387,10 @@ const CARET_SHAPES: &[Shape] = &[Shape::line(
 
 impl Render for FileTree {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let project_name = self
-            .store
-            .read(cx)
-            .active_project()
-            .map(|p| p.name.clone());
+        if !cx.has_active_drag() {
+            self.external_drop_target = None;
+        }
+        let project_name = self.store.read(cx).active_project().map(|p| p.name.clone());
         let editors: Vec<String> = self
             .store
             .read(cx)
@@ -1249,26 +2440,28 @@ impl Render for FileTree {
                     .items_center()
                     .flex_none()
                     .gap(px(4.0))
-                    .child(
-                        // 搜索 = 全局 SearchModal(不是文件名过滤),与 Ctrl+Shift+F 同一个入口
-                        header_button("file-tree-search")
-                            .tooltip(|window, cx| {
-                                // `{mod}` 插值不能走 `tr!`(参数位是 `$name:ident`,
-                                // `mod` 是 Rust 关键字塞不进去)—— 与 search_modal 同一个坑
-                                Tooltip::new(mt_i18n::t_args(
-                                    "fileTree",
-                                    "header.searchTitle",
-                                    &[("mod", mod_label())],
-                                ))
-                                .build(window, cx)
-                            })
-                            .on_click(move |_event, window, cx| {
-                                crate::search_modal::open(store_for_search.clone(), window, cx);
-                            })
-                            .child(
-                                VectorIcon::new(SEARCH_SHAPES, px(13.0)).ink(ui::text_muted()),
-                            ),
-                    )
+                    .when(!is_remote, |el| {
+                        el.child(
+                            // 搜索 = 全局 SearchModal(不是文件名过滤),与 Ctrl+Shift+F 同一个入口
+                            header_button("file-tree-search")
+                                .tooltip(|window, cx| {
+                                    // `{mod}` 插值不能走 `tr!`(参数位是 `$name:ident`,
+                                    // `mod` 是 Rust 关键字塞不进去)—— 与 search_modal 同一个坑
+                                    Tooltip::new(mt_i18n::t_args(
+                                        "fileTree",
+                                        "header.searchTitle",
+                                        &[("mod", mod_label())],
+                                    ))
+                                    .build(window, cx)
+                                })
+                                .on_click(move |_event, window, cx| {
+                                    crate::search_modal::open(store_for_search.clone(), window, cx);
+                                })
+                                .child(
+                                    VectorIcon::new(SEARCH_SHAPES, px(13.0)).ink(ui::text_muted()),
+                                ),
+                        )
+                    })
                     .child(
                         header_button("file-tree-refresh")
                             // 远程项目多一句:刷新会重读远程根 `.gitignore`
@@ -1287,12 +2480,12 @@ impl Render for FileTree {
                             .on_click(cx.listener(|this, _event, _window, cx| {
                                 this.refresh_root(cx);
                             }))
-                            .child(
-                                VectorIcon::new(REFRESH_SHAPES, px(13.0)).ink(ui::text_muted()),
-                            ),
+                            .child(VectorIcon::new(REFRESH_SHAPES, px(13.0)).ink(ui::text_muted())),
                     )
-                    .when_some(default_editor.clone(), |el, current| {
-                        el.child(self.render_editor_picker(current, editors.clone(), cx))
+                    .when(!is_remote, |el| {
+                        el.when_some(default_editor.clone(), |el, current| {
+                            el.child(self.render_editor_picker(current, editors.clone(), cx))
+                        })
                     }),
             );
         }
@@ -1337,6 +2530,7 @@ impl Render for FileTree {
                 };
                 missing_expanded_dirs(&self.entries, &root, &is_expanded, &mut missing);
             }
+            missing.retain(|dir| !self.path_is_suppressed(dir));
             for dir in missing {
                 self.load_dir(root.clone(), dir, cx);
             }
@@ -1436,50 +2630,76 @@ impl Render for FileTree {
             .flex()
             .flex_col()
             .flex_1()
-            .overflow_y_scroll()
-            // 空白处右键 = 在项目根新建(原版 `handleRootContextMenu`)。
-            // 行自己会 stop_propagation,所以点在行上不会走到这儿。
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                    let Some(root) = this.project_root(cx) else {
-                        return;
-                    };
-                    let tree = cx.entity();
-                    let entries = vec![
-                        {
-                            let (tree, root) = (tree.clone(), root.clone());
-                            menu::item(t("fileTree", "menu.newFile"), move |window, cx| {
-                                new_entry_prompt(
-                                    tree.clone(),
-                                    root.clone(),
-                                    root.clone(),
-                                    false,
-                                    window,
-                                    cx,
-                                );
-                            })
-                        },
-                        {
-                            let (tree, root) = (tree.clone(), root.clone());
-                            menu::item(t("fileTree", "menu.newFolder"), move |window, cx| {
-                                new_entry_prompt(
-                                    tree.clone(),
-                                    root.clone(),
-                                    root.clone(),
-                                    true,
-                                    window,
-                                    cx,
-                                );
-                            })
-                        },
-                    ];
-                    menu::show(event.position, entries, window, cx);
-                }),
-            );
+            .overflow_y_scroll();
         for row in rows {
             list = list.child(self.render_row(row, cx));
         }
+        let background_target = root.clone();
+        let background_drop_id = "background".to_string();
+        let background_context = self.operation_context(cx);
+        let background_highlight = self
+            .external_drop_target
+            .as_ref()
+            .is_some_and(|active| active.hit_id == background_drop_id);
+        list = list.child(
+            div()
+                .id("file-tree-background")
+                .flex_1()
+                .min_h(px(24.0))
+                .when(background_highlight, |el| {
+                    el.bg(ui::with_alpha(ui::accent(), 0.12))
+                })
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        let Some(context) = this.operation_context(cx) else {
+                            return;
+                        };
+                        let can_paste = this
+                            .file_clipboard
+                            .as_ref()
+                            .is_some_and(|clipboard| clipboard.can_paste_into(&context));
+                        let store = this.store.clone();
+                        let entries = background_menu(
+                            &cx.entity(),
+                            &store,
+                            context,
+                            this.remote_conn(cx),
+                            can_paste,
+                        );
+                        menu::show(event.position, entries, window, cx);
+                    }),
+                )
+                .when(is_remote, |el| {
+                    let move_target = background_target.clone();
+                    let drop_target = background_target.clone();
+                    let move_id = background_drop_id.clone();
+                    let drop_context = background_context.clone();
+                    el.on_drag_move(cx.listener(
+                        move |this, event: &DragMoveEvent<ExternalPaths>, _window, cx| {
+                            this.note_external_drop_target(&move_id, &move_target, event, cx);
+                        },
+                    ))
+                    .on_drop(cx.listener(
+                        move |this, paths: &ExternalPaths, window, cx| {
+                            this.external_drop_target = None;
+                            cx.notify();
+                            let Some(context) = drop_context.clone() else {
+                                return;
+                            };
+                            start_upload(
+                                cx.entity(),
+                                context,
+                                drop_target.clone(),
+                                paths.paths().to_vec(),
+                                window,
+                                cx,
+                            );
+                        },
+                    ))
+                }),
+        );
 
         div()
             .size_full()
@@ -1497,6 +2717,17 @@ impl Render for FileTree {
                         .text_size(ui::font_px(9.75))
                         .text_color(ui::text_muted())
                         .child(t("fileTree", "empty.refreshFailed")),
+                )
+            })
+            .when_some(self.operation_label.clone(), |el, label| {
+                el.child(
+                    div()
+                        .px(px(8.0))
+                        .py(px(4.0))
+                        .truncate()
+                        .text_size(ui::font_px(10.5))
+                        .text_color(ui::accent())
+                        .child(label),
                 )
             })
             .child(list)
@@ -1652,14 +2883,36 @@ impl FileTree {
         let focus = self.row_focus.get(&row.path).cloned();
         let key_path = row.path.clone();
         let key_expanded = row.expanded;
+        let remote = self.is_remote(cx);
+        let row_context = self.operation_context(cx);
+        let key_context = row_context.clone();
+        let click_context = row_context.clone();
+        let drop_context = row_context.clone();
+        let upload_target = if row.is_dir {
+            row.path.clone()
+        } else {
+            crate::remote_ssh::parent_posix(&row.path.to_string_lossy())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| self.project_root(cx).unwrap_or_else(|| row.path.clone()))
+        };
+        let row_drop_id = format!("row:{}", row.path.display());
+        let drop_highlight = self
+            .external_drop_target
+            .as_ref()
+            .is_some_and(|active| active.hit_id == row_drop_id);
 
         div()
             .id(SharedString::from(format!("fs-{}", row.path.display())))
             // 行级焦点 + tab 停靠点(原版每行 `tabIndex={0}` + `role=treeitem`)
             .when_some(focus, |el, focus| el.track_focus(&focus).tab_index(0))
-            .on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, window, cx| {
-                this.on_row_key(event, &key_path, is_dir, key_expanded, window, cx);
-            }))
+            .on_key_down(
+                cx.listener(move |this, event: &gpui::KeyDownEvent, window, cx| {
+                    if this.operation_context(cx).as_ref() != key_context.as_ref() {
+                        return;
+                    }
+                    this.on_row_key(event, &key_path, is_dir, key_expanded, window, cx);
+                }),
+            )
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener({
@@ -1682,15 +2935,23 @@ impl FileTree {
             .text_size(ui::font_px(12.0))
             .text_color(color)
             .hover(|el| el.bg(ui::bg_overlay()))
-            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
-                if is_dir {
-                    this.toggle_dir(path.clone(), cx);
-                } else if event.click_count() <= 1 {
-                    // 单击开预览器;双击的第二个事件(click_count == 2)不再做别的,
-                    // 见 `open_file` 的注释
-                    this.open_file(path.clone(), window, cx);
-                }
-            }))
+            .when(drop_highlight, |el| {
+                el.bg(ui::with_alpha(ui::accent(), 0.18))
+            })
+            .on_click(
+                cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                    if this.operation_context(cx).as_ref() != click_context.as_ref() {
+                        return;
+                    }
+                    if is_dir {
+                        this.toggle_dir(path.clone(), cx);
+                    } else if event.click_count() <= 1 {
+                        // 单击开预览器;双击的第二个事件(click_count == 2)不再做别的,
+                        // 见 `open_file` 的注释
+                        this.open_file(path.clone(), window, cx);
+                    }
+                }),
+            )
             // 拖进终端 = 把路径当文本写进 PTY(不是上传文件)。目录同样可拖,
             // 与原版一致(`FileTree.tsx:326-328` 的 `initFileDrag(entry.path)`
             // 不区分文件/目录)。落点在 `terminal_area.rs` 的 pane 主体。
@@ -1712,17 +2973,60 @@ impl FileTree {
                     )
                 },
             )
+            .when(remote, |el| {
+                let move_target = upload_target.clone();
+                let drop_target = upload_target.clone();
+                let move_id = row_drop_id.clone();
+                let drop_context = drop_context.clone();
+                el.on_drag_move(cx.listener(
+                    move |this, event: &DragMoveEvent<ExternalPaths>, _window, cx| {
+                        this.note_external_drop_target(&move_id, &move_target, event, cx);
+                    },
+                ))
+                .on_drop(cx.listener(
+                    move |this, paths: &ExternalPaths, window, cx| {
+                        this.external_drop_target = None;
+                        cx.notify();
+                        let Some(context) = drop_context.clone() else {
+                            return;
+                        };
+                        start_upload(
+                            cx.entity(),
+                            context,
+                            drop_target.clone(),
+                            paths.paths().to_vec(),
+                            window,
+                            cx,
+                        );
+                    },
+                ))
+            })
             // 行的右键菜单。**必须 stop_propagation** —— 否则会连带触发列表容器
             // 那个「空白处右键 = 新建」的菜单(原版靠 `e.stopPropagation()` 同理)
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
                     cx.stop_propagation();
-                    let Some(root) = this.project_root(cx) else {
+                    let Some(context) = row_context.clone() else {
                         return;
                     };
+                    if this.operation_context(cx).as_ref() != Some(&context) {
+                        return;
+                    }
                     let store = this.store.clone();
-                    let entries = file_menu(&cx.entity(), &store, &row_for_menu, root);
+                    let connection = this.remote_conn(cx);
+                    let can_paste = this.file_clipboard.as_ref().is_some_and(|clipboard| {
+                        clipboard.can_paste_into(&context)
+                            && !clipboard.would_copy_into_itself(&row_for_menu.path)
+                    });
+                    let entries = file_menu(
+                        &cx.entity(),
+                        &store,
+                        &row_for_menu,
+                        context,
+                        connection,
+                        can_paste,
+                    );
                     menu::show(event.position, entries, window, cx);
                 }),
             )
@@ -1769,13 +3073,15 @@ mod tests {
     #[test]
     fn 文件菜单项序与原版一致() {
         assert_eq!(
-            file_menu_actions(false, true),
+            file_menu_actions(false, true, false),
             vec![
                 Some(OpenWithDefault),
+                Some(CopyEntry),
+                None,
                 Some(CopyRelativePath),
                 Some(CopyAbsolutePath),
-                None,
                 Some(RevealInFolder),
+                Some(OpenInTerminal),
                 None,
                 Some(Rename),
                 Some(Delete),
@@ -1785,13 +3091,15 @@ mod tests {
         );
         // 干净文件:一项不多(原版 `entryGitStatus && !entry.isDir`)
         assert_eq!(
-            file_menu_actions(false, false),
+            file_menu_actions(false, false, false),
             vec![
                 Some(OpenWithDefault),
+                Some(CopyEntry),
+                None,
                 Some(CopyRelativePath),
                 Some(CopyAbsolutePath),
-                None,
                 Some(RevealInFolder),
+                Some(OpenInTerminal),
                 None,
                 Some(Rename),
                 Some(Delete),
@@ -1803,12 +3111,15 @@ mod tests {
     #[test]
     fn 目录菜单项序与原版一致() {
         assert_eq!(
-            file_menu_actions(true, false),
+            file_menu_actions(true, false, false),
             vec![
+                Some(CopyEntry),
+                Some(Paste),
+                None,
                 Some(CopyRelativePath),
                 Some(CopyAbsolutePath),
-                None,
                 Some(RevealInFolder),
+                Some(OpenInTerminal),
                 None,
                 Some(Rename),
                 Some(Delete),
@@ -1824,11 +3135,11 @@ mod tests {
     /// 而「默认工具打开」只对文件出现。
     #[test]
     fn 目录与文件的差别只在两处() {
-        let file: Vec<_> = file_menu_actions(false, false)
+        let file: Vec<_> = file_menu_actions(false, false, false)
             .into_iter()
             .flatten()
             .collect();
-        let dir: Vec<_> = file_menu_actions(true, false)
+        let dir: Vec<_> = file_menu_actions(true, false, false)
             .into_iter()
             .flatten()
             .collect();
@@ -1837,12 +3148,50 @@ mod tests {
         assert!(dir.contains(&NewFile) && dir.contains(&NewFolder));
         assert!(!file.contains(&NewFile) && !file.contains(&NewFolder));
         // 有状态的目录同样不给 ViewDiff
-        let dirty_dir: Vec<_> = file_menu_actions(true, true)
+        let dirty_dir: Vec<_> = file_menu_actions(true, true, false)
             .into_iter()
             .flatten()
             .collect();
         assert!(!dirty_dir.contains(&ViewDiff));
         assert_eq!(dirty_dir, dir);
+    }
+
+    #[test]
+    fn 远程菜单不暴露本机动作并提供传输入口() {
+        assert_eq!(
+            file_menu_actions(false, true, true),
+            vec![
+                Some(CopyEntry),
+                Some(Download),
+                None,
+                Some(CopyRelativePath),
+                Some(CopyAbsolutePath),
+                Some(OpenInTerminal),
+                None,
+                Some(Rename),
+                Some(Delete),
+            ]
+        );
+        assert_eq!(
+            file_menu_actions(true, false, true),
+            vec![
+                Some(CopyEntry),
+                Some(Paste),
+                Some(Download),
+                Some(UploadFiles),
+                Some(UploadFolder),
+                None,
+                Some(CopyRelativePath),
+                Some(CopyAbsolutePath),
+                Some(OpenInTerminal),
+                None,
+                Some(Rename),
+                Some(Delete),
+                None,
+                Some(NewFile),
+                Some(NewFolder),
+            ]
+        );
     }
 
     // ─── git 状态着色 ─────────────────────────────────────────
@@ -1956,7 +3305,12 @@ mod tests {
             ),
             (
                 "/p/only-ignored",
-                vec![entry("node_modules", "/p/only-ignored/node_modules", true, true)],
+                vec![entry(
+                    "node_modules",
+                    "/p/only-ignored/node_modules",
+                    true,
+                    true,
+                )],
             ),
             // 被忽略的目录压根不该被列(命中就说明闸门漏了)
             ("/p/target", vec![entry("x", "/p/target/x", true, false)]),

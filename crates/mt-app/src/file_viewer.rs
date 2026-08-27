@@ -2751,7 +2751,7 @@ mod tests {
 
     #[test]
     fn 图片目标_相对路径按当前文件目录解析() {
-        let base = Path::new("D:\\Git\\mini-term");
+        let base = Path::new(env!("CARGO_MANIFEST_DIR"));
         // 相对路径 → 落到当前文件所在目录(原版 convertFileSrc(fileDir + '/' + src))
         assert_eq!(
             resolve_image_src("docs/a.png", base),
@@ -2762,16 +2762,26 @@ mod tests {
             resolve_image_src("my%20shots/a.png", base),
             MdImageSrc::Local(base.join("my shots/a.png"))
         );
-        // 绝对路径原样(Windows 盘符不能被当成 scheme)
+
+        // 宿主平台的绝对路径原样
+        let absolute = base.join("shots/a.png");
         assert_eq!(
-            resolve_image_src("D:/shots/a.png", base),
-            MdImageSrc::Local(PathBuf::from("D:/shots/a.png"))
+            resolve_image_src(&absolute.to_string_lossy(), base),
+            MdImageSrc::Local(absolute)
         );
-        // file:// 三斜杠
-        assert_eq!(
-            resolve_image_src("file:///D:/shots/a.png", base),
-            MdImageSrc::Local(PathBuf::from("D:/shots/a.png"))
-        );
+
+        #[cfg(windows)]
+        {
+            // Windows 盘符不能被当成 scheme；file:// 三斜杠会去掉盘符前的 `/`
+            assert_eq!(
+                resolve_image_src("D:/shots/a.png", base),
+                MdImageSrc::Local(PathBuf::from("D:/shots/a.png"))
+            );
+            assert_eq!(
+                resolve_image_src("file:///D:/shots/a.png", base),
+                MdImageSrc::Local(PathBuf::from("D:/shots/a.png"))
+            );
+        }
         // 远程与不认识的 scheme
         assert_eq!(
             resolve_image_src("https://x.dev/a.png", base),
@@ -2795,39 +2805,40 @@ mod tests {
 
     #[test]
     fn md_内联图片的本地路径改写成_file_url() {
-        let base = Path::new("D:\\Git\\mini-term\\docs");
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs");
         // 列表项里的内联图片(块级图片行走自绘,不经过这条)
-        let out = rewrite_md_image_urls("- ![图](shots/a.png) 说明", base);
-        assert!(
-            out.starts_with("- ![图](file:///D:/Git/mini-term/docs/shots/a.png)"),
-            "{out}"
-        );
+        let out = rewrite_md_image_urls("- ![图](shots/a.png) 说明", &base);
+        let image_url = to_file_url(&base.join("shots/a.png")).expect("测试基准路径应为绝对路径");
+        assert!(out.starts_with(&format!("- ![图]({image_url})")), "{out}");
         // title 保留
-        let out = rewrite_md_image_urls(r#"![图](a.png "标题")"#, base);
+        let out = rewrite_md_image_urls(r#"![图](a.png "标题")"#, &base);
         assert!(out.contains(r#""标题""#), "{out}");
         // 远程与 data: 原样
         let remote = "![x](https://x.dev/a.png)";
-        assert_eq!(rewrite_md_image_urls(remote, base), remote);
+        assert_eq!(rewrite_md_image_urls(remote, &base), remote);
         let data = "![x](data:image/png;base64,AAA)";
-        assert_eq!(rewrite_md_image_urls(data, base), data);
+        assert_eq!(rewrite_md_image_urls(data, &base), data);
         // 围栏代码块 / 行内 code 里的图片语法是代码,不许动
         let fenced = "```md\n![a](b.png)\n```";
-        assert_eq!(rewrite_md_image_urls(fenced, base), fenced);
+        assert_eq!(rewrite_md_image_urls(fenced, &base), fenced);
         let inline_code = "写法是 `![a](b.png)` 这样";
-        assert_eq!(rewrite_md_image_urls(inline_code, base), inline_code);
+        assert_eq!(rewrite_md_image_urls(inline_code, &base), inline_code);
     }
 
     #[test]
     fn html_的本地资源改写成_file_url() {
-        let base = Path::new("D:\\site");
-        let out = rewrite_html_urls(r#"<img src="img/a.png" alt="a">"#, base);
-        assert_eq!(out, r#"<img src="file:///D:/site/img/a.png" alt="a">"#);
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("site");
+        let image_url = to_file_url(&base.join("img/a.png")).expect("测试基准路径应为绝对路径");
+        let out = rewrite_html_urls(r#"<img src="img/a.png" alt="a">"#, &base);
+        assert_eq!(out, format!(r#"<img src="{image_url}" alt="a">"#));
         // 单引号 / 大写属性名 / 等号旁的空白都认
-        let out = rewrite_html_urls("<img SRC = 'a.png'>", base);
-        assert_eq!(out, "<img SRC = 'file:///D:/site/a.png'>");
+        let image_url = to_file_url(&base.join("a.png")).expect("测试基准路径应为绝对路径");
+        let out = rewrite_html_urls("<img SRC = 'a.png'>", &base);
+        assert_eq!(out, format!("<img SRC = '{image_url}'>"));
         // href / poster 同样处理
-        let out = rewrite_html_urls(r#"<video poster="p.jpg"></video>"#, base);
-        assert!(out.contains("file:///D:/site/p.jpg"), "{out}");
+        let poster_url = to_file_url(&base.join("p.jpg")).expect("测试基准路径应为绝对路径");
+        let out = rewrite_html_urls(r#"<video poster="p.jpg"></video>"#, &base);
+        assert!(out.contains(&poster_url), "{out}");
 
         // 排除清单(原版正则那一串)一律原样
         for keep in [
@@ -2839,11 +2850,11 @@ mod tests {
             r#"<a href="javascript:void(0)">js</a>"#,
             r#"<img src="file:///D:/site/a.png">"#,
         ] {
-            assert_eq!(rewrite_html_urls(keep, base), keep, "不该改:{keep}");
+            assert_eq!(rewrite_html_urls(keep, &base), keep, "不该改:{keep}");
         }
         // `data-src` 不是 src
         let keep = r#"<img data-src="a.png">"#;
-        assert_eq!(rewrite_html_urls(keep, base), keep);
+        assert_eq!(rewrite_html_urls(keep, &base), keep);
     }
 
     #[test]

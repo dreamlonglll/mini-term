@@ -695,7 +695,7 @@ impl AppStore {
 
         // SSH 远程分支:直接 spawn `ssh` 作 PTY 子进程(不经本地 shell,对齐 WSL
         // 启动器重写模式)。本地 cwd 用兜底目录 —— 远程目录由 ssh 的远端命令
-        // `cd '<path>' && exec $SHELL -l` 进入,项目的 `path` 是远程 POSIX 路径,
+        // `cd '<path>' 2>/dev/null; exec $SHELL -l` 进入,项目的 `path` 是远程 POSIX 路径,
         // 传给 portable-pty 只会让 ConPTY 静默退回 `$USERPROFILE`。
         //
         // AI 状态感知在这条路上走 PTY 输入/输出扫描的降级路径(输入检测作用于
@@ -705,7 +705,7 @@ impl AppStore {
         // 机器,注给本地 ssh 客户端毫无意义)。
         let remote = project.ssh_connection_id.as_deref().map(|conn_id| {
             crate::remote_ssh::find_connection(&self.config.ssh_connections, conn_id)
-                .and_then(|conn| crate::remote_ssh::prepare_remote_launch(&conn, &project.path))
+                .and_then(|conn| crate::remote_ssh::prepare_remote_launch(&conn, &cwd))
         });
         let (spec, extras) = match remote {
             None => (

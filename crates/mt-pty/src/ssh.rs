@@ -87,18 +87,21 @@ pub fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-/// 拼 ssh 的远端命令:`cd '<path>' && exec $SHELL -l`。
+/// 拼 ssh 的远端命令:`cd '<path>' 2>/dev/null; exec $SHELL -l`。
 /// `$SHELL` 保持字面量 —— 本地不经过 shell(portable-pty 直接 spawn ssh,
 /// 参数按 argv 传递),它由远程 sshd 用登录 shell 执行时才展开,
-/// 从而落在用户自己的默认 shell 上。
+/// 从而落在用户自己的默认 shell 上。路径失效时忽略 `cd` 错误并从登录目录启动。
 pub fn build_remote_login_command(remote_path: &str) -> String {
-    format!("cd {} && exec $SHELL -l", shell_single_quote(remote_path))
+    format!(
+        "cd {} 2>/dev/null; exec $SHELL -l",
+        shell_single_quote(remote_path)
+    )
 }
 
 /// 拼直接 spawn `ssh` 作 PTY 子进程的参数列表(不经本地 shell,
 /// 对齐 WSL 分支 spawn wsl.exe 的启动器重写模式)。
 ///
-/// 形如:`-t [-p <port>] [-i <identity>] user@host "cd '<path>' && exec $SHELL -l"`。
+/// 形如:`-t [-p <port>] [-i <identity>] user@host "cd '<path>' 2>/dev/null; exec $SHELL -l"`。
 /// **绝不能加 `-o BatchMode=yes`**:它会连带禁用密码认证,
 /// 而密码连接依赖 PTY autofill 灌密码([`SshAutofill`])。
 pub fn build_ssh_launcher_args(
@@ -251,7 +254,7 @@ mod tests {
     #[test]
     fn build_remote_login_command_quotes_path_and_keeps_shell_literal() {
         let cmd = build_remote_login_command("/home/u/my proj");
-        assert_eq!(cmd, "cd '/home/u/my proj' && exec $SHELL -l");
+        assert_eq!(cmd, "cd '/home/u/my proj' 2>/dev/null; exec $SHELL -l");
         // $SHELL 必须保持字面量,由远程登录 shell 展开
         assert!(cmd.contains("$SHELL"));
     }
@@ -264,7 +267,7 @@ mod tests {
             vec![
                 "-t".to_string(),
                 "root@h.example.com".to_string(),
-                "cd '/srv/app' && exec $SHELL -l".to_string(),
+                "cd '/srv/app' 2>/dev/null; exec $SHELL -l".to_string(),
             ]
         );
     }
@@ -293,7 +296,7 @@ mod tests {
                 "-i".to_string(),
                 r"C:\Temp\mini-term-ssh-keys\abc.key".to_string(),
                 "deploy@10.0.0.5".to_string(),
-                "cd '/home/deploy' && exec $SHELL -l".to_string(),
+                "cd '/home/deploy' 2>/dev/null; exec $SHELL -l".to_string(),
             ]
         );
     }
@@ -318,7 +321,7 @@ mod tests {
         let remote_cmd = args.last().unwrap();
         assert_eq!(
             remote_cmd,
-            r"cd '/tmp'\''; rm -rf /; echo '\''' && exec $SHELL -l"
+            r"cd '/tmp'\''; rm -rf /; echo '\''' 2>/dev/null; exec $SHELL -l"
         );
     }
 }

@@ -21,13 +21,14 @@
 //!
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mt_core::SshConnection;
+use russh::ChannelMsg;
 use russh::client::{self, Handle, Handler};
-use russh::keys::{load_secret_key, PrivateKeyWithHashAlg};
+use russh::keys::{PrivateKeyWithHashAlg, load_secret_key};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
@@ -74,6 +75,25 @@ struct PoolInner {
     sessions: HashMap<String, Arc<CachedSession>>,
 }
 
+/// 只有 map 里仍是 caller 看到的那个 `Arc` 时才移除。
+///
+/// 抽成泛型纯函数，让 acquire / evict 共用同一份 TOCTOU 规则，
+/// 也能用不含真 SSH handle 的 `Arc` fixture 做单测。
+fn remove_arc_if_same<T>(
+    entries: &mut HashMap<String, Arc<T>>,
+    id: &str,
+    expected: &Arc<T>,
+) -> Option<Arc<T>> {
+    if entries
+        .get(id)
+        .is_some_and(|current| Arc::ptr_eq(current, expected))
+    {
+        entries.remove(id)
+    } else {
+        None
+    }
+}
+
 /// 池里一项:russh handle + 时间戳 + 连接快照。
 pub struct CachedSession {
     /// 串行化同 session 上的 channel 操作。russh Handle 自身 Clone 廉价,但允许
@@ -85,6 +105,8 @@ pub struct CachedSession {
     last_used: AtomicU64,
     /// auth 连失败后的冷却截止 UNIX 毫秒,0 表示无 cooldown。
     unhealthy_until: AtomicU64,
+    /// 活跃 SFTP 句柄数。reaper/LRU 不得断开仍在跑长操作的 session。
+    active_sftp_leases: AtomicUsize,
 }
 
 impl CachedSession {
@@ -108,6 +130,20 @@ impl CachedSession {
     /// 更新 last_used 为 now。
     pub fn touch(&self) {
         self.last_used.store(now_millis(), Ordering::Relaxed);
+    }
+
+    pub fn acquire_sftp_lease(&self) {
+        self.active_sftp_leases.fetch_add(1, Ordering::AcqRel);
+        self.touch();
+    }
+
+    pub fn release_sftp_lease(&self) {
+        self.active_sftp_leases.fetch_sub(1, Ordering::AcqRel);
+        self.touch();
+    }
+
+    fn has_active_sftp_lease(&self) -> bool {
+        self.active_sftp_leases.load(Ordering::Acquire) != 0
     }
 
     /// 取 last_used 的 UNIX 毫秒(reaper 用)。
@@ -205,11 +241,14 @@ impl SshPool {
         // 而传输操作(`run_sftp_upload_on_session` / `run_sftp_download_on_session`)
         // 全程持有单会话锁 —— 若在池锁里等它,任何一条连接传大文件都会把**其它所有
         // 连接**的 acquire 一起堵死(全池 head-of-line 阻塞)。池锁只保护 map 本身。
-        let cached = {
-            let inner = self.inner.lock().await;
-            inner.sessions.get(&conn.id).cloned()
-        };
-        if let Some(s) = cached {
+        loop {
+            let cached = {
+                let inner = self.inner.lock().await;
+                inner.sessions.get(&conn.id).cloned()
+            };
+            let Some(session) = cached else {
+                break;
+            };
             // 复用前只检查 underlying handle 是否还活着。
             //
             // **不要在这里同时检查 is_unhealthy_now**:cooldown 的意图是「上一次失败
@@ -218,53 +257,108 @@ impl SshPool {
             // 在这里把 unhealthy session 当作 miss 跳过去走重建,acquire 会真的重连
             // 远端、并返回一个 unhealthy_until=0 的新 session,调用方永远看不到
             // cooldown,gatetime 语义彻底失效。
-            if !s.handle.lock().await.is_closed() {
-                s.touch();
-                return Ok(s);
+            if !session.handle.lock().await.is_closed() {
+                let still_cached = {
+                    let inner = self.inner.lock().await;
+                    inner
+                        .sessions
+                        .get(&conn.id)
+                        .is_some_and(|current| Arc::ptr_eq(current, &session))
+                };
+                if still_cached {
+                    session.touch();
+                    return Ok(session);
+                }
+                // 检查存活性期间这条 session 已被精确淘汰/替换，不得把
+                // 退役对象再交给 caller。
+                continue;
             }
             // 已死:重新取池锁把它剔掉(否则 build 失败时死条目会一直占着 max_sessions)。
             // **TOCTOU**:放锁的这段空档里别人可能已经重建过同 id 的 session,
             // 用 `Arc::ptr_eq` 确认 map 里还是当初那一条再删,别误删新的。
             let mut inner = self.inner.lock().await;
-            if inner
-                .sessions
-                .get(&conn.id)
-                .is_some_and(|cur| Arc::ptr_eq(cur, &s))
-            {
-                inner.sessions.remove(&conn.id);
-            }
+            let _ = remove_arc_if_same(&mut inner.sessions, &conn.id, &session);
         }
 
         // 不在池里、或缓存的 session 已死 —— 重建。
         let cached = self.build_session(conn).await?;
-        let arc = Arc::new(cached);
+        let candidate = Arc::new(cached);
 
-        let mut inner = self.inner.lock().await;
-        // 重建场景:把旧的(可能已死的)条目踢掉。
-        inner.sessions.remove(&conn.id);
-
-        // 池满则 LRU 淘汰一条。
-        if inner.sessions.len() >= self.config.max_sessions {
-            if let Some(victim_id) = pick_lru_victim(&inner.sessions) {
-                if let Some(victim) = inner.sessions.remove(&victim_id) {
-                    // 后台 disconnect,不阻塞 acquire。
-                    spawn_disconnect(victim, self.config.shutdown_per_session_timeout);
+        // connect/auth 不持池锁，因此同 id 的并发 miss 可能同时建好多条。
+        // 插入时重新选 winner：已有存活 session 就复用，只关闭本次未入池的 loser。
+        loop {
+            let winner = {
+                let mut inner = self.inner.lock().await;
+                if let Some(winner) = inner.sessions.get(&conn.id).cloned() {
+                    winner
+                } else {
+                    // 池满则 LRU 淘汰一条。只有没有外部强引用/活跃 lease 的
+                    // 条目会被 pick，因此移除后可安全后台 disconnect。
+                    if inner.sessions.len() >= self.config.max_sessions {
+                        if let Some(victim_id) = pick_lru_victim(&inner.sessions) {
+                            if let Some(victim) = inner.sessions.remove(&victim_id) {
+                                spawn_disconnect(victim, self.config.shutdown_per_session_timeout);
+                            }
+                        }
+                    }
+                    inner.sessions.insert(conn.id.clone(), candidate.clone());
+                    return Ok(candidate);
                 }
+            };
+
+            if !winner.handle.lock().await.is_closed() {
+                let still_winner = {
+                    let inner = self.inner.lock().await;
+                    inner
+                        .sessions
+                        .get(&conn.id)
+                        .is_some_and(|current| Arc::ptr_eq(current, &winner))
+                };
+                if still_winner {
+                    winner.touch();
+                    // candidate 从未入池，也没有其他引用；带上限关闭，不泄漏竞争 loser。
+                    spawn_disconnect(candidate, self.config.shutdown_per_session_timeout);
+                    return Ok(winner);
+                }
+                continue;
             }
+
+            // winner 已死。移除前再比对 Arc；如果已被第三个任务替换，
+            // 下轮检查新 winner，本次 candidate 仍然保留。
+            let mut inner = self.inner.lock().await;
+            let _ = remove_arc_if_same(&mut inner.sessions, &conn.id, &winner);
         }
-        inner.sessions.insert(conn.id.clone(), arc.clone());
-        Ok(arc)
     }
 
-    /// 把指定连接对应的 session 从池里踢出去并后台 disconnect。
+    /// 把指定连接对应的 session 从池里踢出去。
     ///
     /// 用途:`ssh_exec` 在拿到 session 后开 channel / exec 失败(transport-level
     /// 死链 race),需要先把这条死 session 移出池再重新 acquire 触发重连。
-    /// 不阻塞 caller —— 后台 spawn disconnect 带超时兜底。
+    /// 没有外部引用/lease 时后台 disconnect；否则只移出缓存，待使用者自然释放。
     pub async fn evict(&self, id: &str) {
         let mut inner = self.inner.lock().await;
-        if let Some(victim) = inner.sessions.remove(id) {
-            spawn_disconnect(victim, self.config.shutdown_per_session_timeout);
+        let victim = inner.sessions.remove(id);
+        drop(inner);
+        if let Some(victim) = victim {
+            retire_removed_session(victim, self.config.shutdown_per_session_timeout);
+        }
+    }
+
+    /// 仅当 `id` 仍指向 caller 遇到错误的那条 session 时才淘汰。
+    ///
+    /// 返回是否真正从池中移除。这个 API 用于 transport 失败后的精确重连：
+    /// 若同 id 已经由其它任务重建，不能把新 winner 误删。移除后如果仍有强引用
+    ///（至少包括 `expected`）或活跃 SFTP lease，不会强制 disconnect；它会在最后
+    /// 一个使用者释放时自然销毁。
+    pub async fn evict_if_same(&self, id: &str, expected: &Arc<CachedSession>) -> bool {
+        let mut inner = self.inner.lock().await;
+        let victim = remove_arc_if_same(&mut inner.sessions, id, expected);
+        drop(inner);
+        if let Some(victim) = victim {
+            retire_removed_session(victim, self.config.shutdown_per_session_timeout);
+            true
+        } else {
+            false
         }
     }
 
@@ -291,7 +385,9 @@ impl SshPool {
             async move {
                 let _ = tokio::time::timeout(t, async {
                     let h = s.handle.lock().await;
-                    let _ = h.disconnect(russh::Disconnect::ByApplication, "", "en").await;
+                    let _ = h
+                        .disconnect(russh::Disconnect::ByApplication, "", "en")
+                        .await;
                 })
                 .await;
             }
@@ -326,6 +422,7 @@ impl SshPool {
             opened_at: Instant::now(),
             last_used: AtomicU64::new(now_millis()),
             unhealthy_until: AtomicU64::new(0),
+            active_sftp_leases: AtomicUsize::new(0),
         })
     }
 }
@@ -384,6 +481,9 @@ fn spawn_reaper(
                 let triples: Vec<(String, u64, Duration)> = guard
                     .sessions
                     .iter()
+                    .filter(|(_, session)| {
+                        !session.has_active_sftp_lease() && Arc::strong_count(session) == 1
+                    })
                     .map(|(id, s)| (id.clone(), s.last_used_millis(), s.age_from(now_instant)))
                     .collect();
                 let victims = select_expired(&triples, now_ms, idle_timeout, max_lifetime);
@@ -433,8 +533,25 @@ fn select_expired(
 fn pick_lru_victim(sessions: &HashMap<String, Arc<CachedSession>>) -> Option<String> {
     sessions
         .iter()
+        .filter(|(_, session)| !session.has_active_sftp_lease() && Arc::strong_count(session) == 1)
         .min_by_key(|(_, s)| s.last_used.load(Ordering::Relaxed))
         .map(|(id, _)| id.clone())
+}
+
+/// 从池中移除后，只有本地退役逻辑持有唯一强引用且没有活跃
+/// SFTP lease 时，才能主动 disconnect。否则仅丢掉池引用，让在途使用者
+/// 自然释放，避免淘汰一条 session 却中断其它 channel。
+fn should_disconnect_removed_session(active_sftp_lease: bool, strong_count: usize) -> bool {
+    !active_sftp_lease && strong_count == 1
+}
+
+fn retire_removed_session(session: Arc<CachedSession>, timeout: Duration) {
+    if should_disconnect_removed_session(
+        session.has_active_sftp_lease(),
+        Arc::strong_count(&session),
+    ) {
+        spawn_disconnect(session, timeout);
+    }
 }
 
 /// 后台异步 disconnect 一条 session,带超时;失败静默(stderr 一行)。
@@ -442,13 +559,281 @@ fn spawn_disconnect(s: Arc<CachedSession>, timeout: Duration) {
     tokio::spawn(async move {
         let res = tokio::time::timeout(timeout, async {
             let h = s.handle.lock().await;
-            h.disconnect(russh::Disconnect::ByApplication, "", "en").await
+            h.disconnect(russh::Disconnect::ByApplication, "", "en")
+                .await
         })
         .await;
         if res.is_err() {
             eprintln!("[mt-ssh] session disconnect timed out, dropping");
         }
     });
+}
+
+// ============================================================================
+// 有界 SSH exec 原语
+// ============================================================================
+
+/// 一次 exec 在 SSH channel 协议中达到的最终状态。
+///
+/// `russh::Channel::exec()` 只把请求送入本地 session 事件队列；服务器是否
+/// 接受由后续 [`ChannelMsg::Success`] / [`ChannelMsg::Failure`] 表示。因此超时不能
+/// 用一个 bool 混成“没启动”：调用方可以用此状态决定是否能安全 fallback。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BoundedExecState {
+    /// 还没有发起 channel open（例如等 session 锁超时）。
+    #[default]
+    NotDispatched,
+    /// channel-open 请求已经可能入队，但 future 在返回 channel 前超时。
+    /// 本函数没有发 exec，但旧 session 存在孤儿 channel/传输状态不明。
+    ChannelOpenUnknown,
+    /// `exec()` 在向本地 session 队列入队时超时。Tokio mpsc send
+    /// 具有取消安全保证，此时请求没有入队，不是等服务器确认超时。
+    ExecEnqueueTimedOut,
+    /// exec 请求已成功入队，但未收到服务器 Success / Failure。
+    ExecReplyUnknown,
+    /// 服务器明确拒绝 exec，且没有观察到任何执行证据。
+    Rejected,
+    /// 服务器已确认，或已收到输出/退出状态等执行证据。
+    Started,
+}
+
+impl BoundedExecState {
+    /// 是否可以立即对同一目标启动业务 fallback。
+    pub fn safe_to_fallback(self) -> bool {
+        matches!(
+            self,
+            Self::NotDispatched | Self::ExecEnqueueTimedOut | Self::Rejected
+        )
+    }
+
+    /// 远端命令是否可能已经启动。注意 `ChannelOpenUnknown` 为 false，
+    /// 但该状态的旧 session 仍应先精确淘汰，再考虑新操作。
+    pub fn may_have_started(self) -> bool {
+        matches!(self, Self::ExecReplyUnknown | Self::Started)
+    }
+}
+
+/// 一次 SSH exec 的有界结果。stdout / stderr 各自最多保留调用方指定的字节数；
+/// 超出的数据仍会从 channel 排空，避免远端因发送窗口耗尽而卡住，只是不再留在内存中。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BoundedExecOutput {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub exit_code: Option<u32>,
+    pub state: BoundedExecState,
+    /// 向后兼容的保守 guard。只有 [`BoundedExecOutput::safe_to_fallback`]
+    /// 为 true 时才是 false；因此 `ChannelOpenUnknown` 也会返回 true，
+    /// 避免旧 caller 把“session 状态不明”误当成“安全 fallback”。
+    /// 新 caller 应匹配 `state`，不要从该字段反推精确协议阶段。
+    pub command_started: bool,
+    pub timed_out: bool,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+    /// channel close 在独立 grace 窗口内未能确认入队。命令本身的
+    /// `state` 仍然保留，但 caller 应先精确淘汰该 session 再执行后续操作。
+    pub channel_cleanup_uncertain: bool,
+}
+
+impl BoundedExecOutput {
+    /// 结合命令派发状态与 channel 清理结果判断能否立即 fallback。
+    pub fn safe_to_fallback(&self) -> bool {
+        self.state.safe_to_fallback() && !self.channel_cleanup_uncertain
+    }
+
+    /// 是否应使用 `evict_if_same` 退役本次操作所在的具体 session。
+    pub fn requires_session_retirement(&self) -> bool {
+        self.state == BoundedExecState::ChannelOpenUnknown || self.channel_cleanup_uncertain
+    }
+}
+
+fn append_bounded_output(output: &mut Vec<u8>, chunk: &[u8], cap: usize) -> bool {
+    let available = cap.saturating_sub(output.len());
+    let retained = available.min(chunk.len());
+    output.extend_from_slice(&chunk[..retained]);
+    retained < chunk.len()
+}
+
+fn exec_output(state: BoundedExecState, timed_out: bool) -> BoundedExecOutput {
+    BoundedExecOutput {
+        state,
+        command_started: !state.safe_to_fallback(),
+        timed_out,
+        ..BoundedExecOutput::default()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecStateEvent {
+    Accepted,
+    Rejected,
+    ExecutionEvidence,
+}
+
+fn transition_exec_state(current: BoundedExecState, event: ExecStateEvent) -> BoundedExecState {
+    match event {
+        ExecStateEvent::Accepted | ExecStateEvent::ExecutionEvidence => BoundedExecState::Started,
+        // 一旦已看到执行证据，迟到/异常的 Failure 不能把状态倒退成可重试。
+        ExecStateEvent::Rejected if current == BoundedExecState::Started => current,
+        ExecStateEvent::Rejected => BoundedExecState::Rejected,
+    }
+}
+
+fn set_exec_state(output: &mut BoundedExecOutput, state: BoundedExecState) {
+    output.state = state;
+    output.command_started = !output.safe_to_fallback();
+}
+
+fn mark_exec_cleanup_uncertain(output: &mut BoundedExecOutput) {
+    output.channel_cleanup_uncertain = true;
+    output.command_started = true;
+}
+
+const EXEC_CHANNEL_CLOSE_GRACE: Duration = Duration::from_millis(500);
+
+async fn await_exec_cleanup<F, T, E>(future: F) -> bool
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    matches!(
+        tokio::time::timeout(EXEC_CHANNEL_CLOSE_GRACE, future).await,
+        Ok(Ok(_))
+    )
+}
+
+/// 在已认证的共享 session 上执行一条远端命令，并收集有限输出、退出码和整体超时。
+///
+/// 该函数只负责单次 channel 协议，不负责连接 acquire / evict / retry。开 channel 或发送
+/// exec 请求失败返回 transport 错误；远端非零退出码仍是正常的 [`BoundedExecOutput`]，由
+/// 调用方按业务语义处理。超时后会在独立的短 grace 窗口内显式关闭
+/// channel，且 `timed_out = true`；整个 API 的硬上限是 `timeout + 500ms`。
+///
+/// session 锁只覆盖 `channel_open_session`。channel 建立后立即释放，长命令不会阻塞同一
+/// SSH 连接上的其它 channel；调用方持有的 `Arc<CachedSession>` 会阻止池 reaper/LRU 在
+/// 本操作期间淘汰 session。
+pub async fn run_bounded_exec_on_session(
+    session: &CachedSession,
+    remote_command: &str,
+    timeout: Duration,
+    output_cap_bytes: usize,
+) -> Result<BoundedExecOutput, String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    session.touch();
+
+    let handle_guard = match tokio::time::timeout_at(deadline, session.lock()).await {
+        Ok(guard) => guard,
+        Err(_) => {
+            return Ok(exec_output(BoundedExecState::NotDispatched, true));
+        }
+    };
+    let mut channel =
+        match tokio::time::timeout_at(deadline, handle_guard.channel_open_session()).await {
+            Ok(Ok(channel)) => channel,
+            Ok(Err(error)) => return Err(format!("channel_open_session failed: {error}")),
+            Err(_) => {
+                // `Handle::channel_open_session()` 先向 session 队列发 open，再等服务器
+                // confirmation。future 在中间被取消后没有 Channel 可 close，旧 session
+                // 可能留有孤儿 channel；不能谎报成安全 fallback。
+                session.touch();
+                return Ok(exec_output(BoundedExecState::ChannelOpenUnknown, true));
+            }
+        };
+    drop(handle_guard);
+
+    match tokio::time::timeout_at(deadline, channel.exec(true, remote_command)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            let cleanup_note = if await_exec_cleanup(channel.close()).await {
+                ""
+            } else {
+                "; channel cleanup uncertain; retire this exact session"
+            };
+            session.touch();
+            return Err(format!("channel exec failed: {error}{cleanup_note}"));
+        }
+        Err(_) => {
+            let cleanup_succeeded = await_exec_cleanup(channel.close()).await;
+            session.touch();
+            // russh 的 `exec()` 只负责向本地 session 事件队列入队，不等服务器
+            // 确认。Tokio 取消安全性保证请求没有入队；这是“本地入队超时”，
+            // 而不是“等服务器确认超时”。
+            let mut output = exec_output(BoundedExecState::ExecEnqueueTimedOut, true);
+            if !cleanup_succeeded {
+                mark_exec_cleanup_uncertain(&mut output);
+            }
+            return Ok(output);
+        }
+    }
+
+    // 成功入队不等于服务器已启动命令；等 Success / Failure 完成判定。
+    let mut output = exec_output(BoundedExecState::ExecReplyUnknown, false);
+    const SSH_EXTENDED_DATA_STDERR: u32 = 1;
+
+    loop {
+        let message = match tokio::time::timeout_at(deadline, channel.wait()).await {
+            Ok(message) => message,
+            Err(_) => {
+                let cleanup_succeeded = await_exec_cleanup(channel.close()).await;
+                output.timed_out = true;
+                output.exit_code = None;
+                if !cleanup_succeeded {
+                    mark_exec_cleanup_uncertain(&mut output);
+                }
+                session.touch();
+                return Ok(output);
+            }
+        };
+        let Some(message) = message else { break };
+        match message {
+            ChannelMsg::Success => {
+                let state = transition_exec_state(output.state, ExecStateEvent::Accepted);
+                set_exec_state(&mut output, state);
+            }
+            ChannelMsg::Failure => {
+                let state = transition_exec_state(output.state, ExecStateEvent::Rejected);
+                set_exec_state(&mut output, state);
+                if state == BoundedExecState::Rejected {
+                    // `want_reply = true` 的 exec 被服务器明确拒绝；没有观察到
+                    // 执行证据时可以安全 fallback，不必等到整体超时。
+                    if !await_exec_cleanup(channel.close()).await {
+                        mark_exec_cleanup_uncertain(&mut output);
+                    }
+                    session.touch();
+                    return Ok(output);
+                }
+            }
+            ChannelMsg::Data { data } => {
+                let state = transition_exec_state(output.state, ExecStateEvent::ExecutionEvidence);
+                set_exec_state(&mut output, state);
+                output.stdout_truncated |=
+                    append_bounded_output(&mut output.stdout, &data, output_cap_bytes);
+            }
+            ChannelMsg::ExtendedData { data, ext } => {
+                let state = transition_exec_state(output.state, ExecStateEvent::ExecutionEvidence);
+                set_exec_state(&mut output, state);
+                if ext == SSH_EXTENDED_DATA_STDERR {
+                    output.stderr_truncated |=
+                        append_bounded_output(&mut output.stderr, &data, output_cap_bytes);
+                }
+            }
+            ChannelMsg::ExitStatus { exit_status } => {
+                let state = transition_exec_state(output.state, ExecStateEvent::ExecutionEvidence);
+                set_exec_state(&mut output, state);
+                output.exit_code = Some(exit_status);
+            }
+            ChannelMsg::ExitSignal { .. } => {
+                let state = transition_exec_state(output.state, ExecStateEvent::ExecutionEvidence);
+                set_exec_state(&mut output, state);
+            }
+            _ => {}
+        }
+    }
+
+    // `wait()` 返回 None 已证明远端通道收流结束；此处 close 只是幂等的
+    // best-effort 收尾，本地 sender 已关闭时的 Err 不代表 session 状态不明。
+    let _ = await_exec_cleanup(channel.close()).await;
+    session.touch();
+    Ok(output)
 }
 
 // ============================================================================
@@ -536,12 +921,9 @@ pub async fn run_sftp_upload_on_session(
         .channel_open_session()
         .await
         .map_err(|e| SftpTransferError::Transport(format!("channel_open_session failed: {e}")))?;
-    channel
-        .request_subsystem(true, "sftp")
-        .await
-        .map_err(|e| {
-            SftpTransferError::Transport(format!("request_subsystem(sftp) failed: {e}"))
-        })?;
+    channel.request_subsystem(true, "sftp").await.map_err(|e| {
+        SftpTransferError::Transport(format!("request_subsystem(sftp) failed: {e}"))
+    })?;
     let sftp = SftpSession::new(channel.into_stream())
         .await
         .map_err(|e| SftpTransferError::Transport(format!("sftp handshake failed: {e}")))?;
@@ -575,9 +957,10 @@ pub async fn run_sftp_upload_on_session(
             })?;
             total += n as u64;
         }
-        remote.flush().await.map_err(|e| {
-            SftpTransferError::Sftp(format!("sftp flush '{tmp_path}' failed: {e}"))
-        })?;
+        remote
+            .flush()
+            .await
+            .map_err(|e| SftpTransferError::Sftp(format!("sftp flush '{tmp_path}' failed: {e}")))?;
         remote.shutdown().await.map_err(|e| {
             SftpTransferError::Sftp(format!("sftp close remote '{tmp_path}' failed: {e}"))
         })?;
@@ -653,12 +1036,9 @@ pub async fn run_sftp_download_on_session(
         .channel_open_session()
         .await
         .map_err(|e| SftpTransferError::Transport(format!("channel_open_session failed: {e}")))?;
-    channel
-        .request_subsystem(true, "sftp")
-        .await
-        .map_err(|e| {
-            SftpTransferError::Transport(format!("request_subsystem(sftp) failed: {e}"))
-        })?;
+    channel.request_subsystem(true, "sftp").await.map_err(|e| {
+        SftpTransferError::Transport(format!("request_subsystem(sftp) failed: {e}"))
+    })?;
     let sftp = SftpSession::new(channel.into_stream())
         .await
         .map_err(|e| SftpTransferError::Transport(format!("sftp handshake failed: {e}")))?;
@@ -709,16 +1089,18 @@ pub async fn run_sftp_download_on_session(
 
     // 成功:确保数据落盘后原子 rename 到目标。
     drop(local);
-    tokio::fs::rename(&tmp_path, local_path).await.map_err(|e| {
-        // rename 失败也要清掉临时文件,避免污染目录。
-        let tmp = tmp_path.clone();
-        tokio::spawn(async move {
-            let _ = tokio::fs::remove_file(&tmp).await;
-        });
-        SftpTransferError::Sftp(format!(
-            "failed to move downloaded file into place '{local_path}': {e}"
-        ))
-    })?;
+    tokio::fs::rename(&tmp_path, local_path)
+        .await
+        .map_err(|e| {
+            // rename 失败也要清掉临时文件,避免污染目录。
+            let tmp = tmp_path.clone();
+            tokio::spawn(async move {
+                let _ = tokio::fs::remove_file(&tmp).await;
+            });
+            SftpTransferError::Sftp(format!(
+                "failed to move downloaded file into place '{local_path}': {e}"
+            ))
+        })?;
 
     Ok(total)
 }
@@ -729,7 +1111,12 @@ pub async fn run_sftp_download_on_session(
 /// 两个 method —— 某些服务器禁用 password 而只接受 keyboard-interactive。
 async fn authenticate(handle: &mut Handle<MtClient>, conn: &SshConnection) -> Result<(), String> {
     // 1) publickey
-    if let Some(path) = conn.identity_file.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(path) = conn
+        .identity_file
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         let key = load_private_key_compat(path)?;
         // RSA 公钥签名的 hash 选择 —— 关键:`PrivateKeyWithHashAlg::new(key, None)` 对
         // RSA key 会落到 **legacy ssh-rsa(SHA-1)**,而现代 OpenSSH(>=8.8,如 Ubuntu
@@ -853,9 +1240,7 @@ fn try_parse_pkcs1_rsa(pem: &str) -> Result<Option<russh::keys::PrivateKey>, Str
         .find(END)
         .filter(|&e| e >= body_start)
         .ok_or_else(|| "PKCS#1 RSA PEM missing END marker".to_string())?;
-    let b64: String = pem[body_start..body_end]
-        .split_whitespace()
-        .collect();
+    let b64: String = pem[body_start..body_end].split_whitespace().collect();
     let der = {
         use base64_engine::Engine;
         base64_engine::engine::general_purpose::STANDARD
@@ -925,7 +1310,9 @@ impl Handler for MtClient {
                 Ok(false)
             }
             HostKeyMatch::Unknown => {
-                if let Err(e) = append_known_host(&self.known_hosts_path, &host_pattern, server_pubkey) {
+                if let Err(e) =
+                    append_known_host(&self.known_hosts_path, &host_pattern, server_pubkey)
+                {
                     eprintln!(
                         "[mt-ssh] failed to append to {}: {e}",
                         self.known_hosts_path.display()
@@ -993,7 +1380,10 @@ fn match_known_host(
             // hashed,跳过 —— 见函数 doc comment 说明。
             continue;
         }
-        if !hostspec.split(',').any(|h| h.eq_ignore_ascii_case(host_pattern)) {
+        if !hostspec
+            .split(',')
+            .any(|h| h.eq_ignore_ascii_case(host_pattern))
+        {
             continue;
         }
         let algo = match fields.next() {
@@ -1027,7 +1417,9 @@ fn match_known_host(
 /// 标准 base64 解码,接受常见的等号填充。无 padding 用例也容忍。
 fn base64_decode(s: &str) -> Option<Vec<u8>> {
     use base64_engine::Engine;
-    base64_engine::engine::general_purpose::STANDARD.decode(s.trim()).ok()
+    base64_engine::engine::general_purpose::STANDARD
+        .decode(s.trim())
+        .ok()
 }
 
 // 我们已经间接通过 russh 拉了 base64 —— 但直接 use 路径不稳。改成自己引入。
@@ -1081,6 +1473,116 @@ mod tests {
         assert_eq!(sftp_request_timeout_secs(Duration::from_millis(500)), 1);
     }
 
+    #[test]
+    fn append_bounded_output_caps_without_losing_prefix() {
+        let mut output = b"abc".to_vec();
+        assert!(append_bounded_output(&mut output, b"defgh", 6));
+        assert_eq!(output, b"abcdef");
+        assert!(append_bounded_output(&mut output, b"more", 6));
+        assert_eq!(output, b"abcdef");
+    }
+
+    #[test]
+    fn append_bounded_output_reports_exact_fit_as_not_truncated() {
+        let mut output = Vec::new();
+        assert!(!append_bounded_output(&mut output, b"abcd", 4));
+        assert_eq!(output, b"abcd");
+        assert!(!append_bounded_output(&mut output, b"", 4));
+    }
+
+    #[test]
+    fn append_bounded_output_zero_cap_discards_nonempty_chunks() {
+        let mut output = Vec::new();
+        assert!(append_bounded_output(&mut output, b"data", 0));
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn exec_state_exposes_safe_fallback_matrix() {
+        assert!(BoundedExecState::NotDispatched.safe_to_fallback());
+        assert!(BoundedExecState::ExecEnqueueTimedOut.safe_to_fallback());
+        assert!(BoundedExecState::Rejected.safe_to_fallback());
+        assert!(!BoundedExecState::ChannelOpenUnknown.safe_to_fallback());
+        assert!(!BoundedExecState::ExecReplyUnknown.safe_to_fallback());
+        assert!(!BoundedExecState::Started.safe_to_fallback());
+
+        assert!(!BoundedExecState::ChannelOpenUnknown.may_have_started());
+        assert!(!BoundedExecState::ExecEnqueueTimedOut.may_have_started());
+        assert!(BoundedExecState::ExecReplyUnknown.may_have_started());
+        assert!(BoundedExecState::Started.may_have_started());
+    }
+
+    #[test]
+    fn compatibility_command_started_guard_is_conservative() {
+        let output = exec_output(BoundedExecState::NotDispatched, true);
+        assert!(output.timed_out);
+        assert!(!output.command_started);
+        assert_eq!(output.state, BoundedExecState::NotDispatched);
+        assert_eq!(output.exit_code, None);
+
+        // channel-open 阶段还没发 exec，但旧 caller 只看 bool 时也不得
+        // 立即 fallback；精确含义由 state 表达。
+        let uncertain = exec_output(BoundedExecState::ChannelOpenUnknown, true);
+        assert!(uncertain.command_started);
+        assert!(!uncertain.state.may_have_started());
+
+        let mut rejected = exec_output(BoundedExecState::Rejected, false);
+        assert!(rejected.safe_to_fallback());
+        mark_exec_cleanup_uncertain(&mut rejected);
+        assert!(!rejected.safe_to_fallback());
+        assert!(rejected.requires_session_retirement());
+        assert!(rejected.command_started);
+    }
+
+    #[test]
+    fn failure_cannot_downgrade_observed_execution() {
+        assert_eq!(
+            transition_exec_state(BoundedExecState::ExecReplyUnknown, ExecStateEvent::Rejected,),
+            BoundedExecState::Rejected
+        );
+        assert_eq!(
+            transition_exec_state(BoundedExecState::Started, ExecStateEvent::Rejected),
+            BoundedExecState::Started
+        );
+        assert_eq!(
+            transition_exec_state(BoundedExecState::ExecReplyUnknown, ExecStateEvent::Accepted,),
+            BoundedExecState::Started
+        );
+        assert_eq!(
+            transition_exec_state(
+                BoundedExecState::ExecReplyUnknown,
+                ExecStateEvent::ExecutionEvidence,
+            ),
+            BoundedExecState::Started
+        );
+    }
+
+    #[test]
+    fn remove_arc_if_same_preserves_replacement_winner() {
+        let stale = Arc::new(1_u8);
+        let winner = Arc::new(2_u8);
+        let mut entries = HashMap::from([("connection".to_string(), winner.clone())]);
+
+        assert!(remove_arc_if_same(&mut entries, "connection", &stale).is_none());
+        assert!(Arc::ptr_eq(
+            entries.get("connection").expect("winner remains cached"),
+            &winner
+        ));
+
+        let removed = remove_arc_if_same(&mut entries, "connection", &winner)
+            .expect("matching winner is removed");
+        assert!(Arc::ptr_eq(&removed, &winner));
+        assert!(!entries.contains_key("connection"));
+    }
+
+    #[test]
+    fn removed_session_disconnect_requires_exclusive_ownership() {
+        assert!(should_disconnect_removed_session(false, 1));
+        assert!(!should_disconnect_removed_session(true, 1));
+        assert!(!should_disconnect_removed_session(false, 2));
+        assert!(!should_disconnect_removed_session(true, 2));
+    }
+
     /// 临时文件名:上传(远端路径)与下载(本地路径)共用同一后缀,
     /// 且**永远落在目标同目录**(同文件系统 → rename 是原子改名)。
     #[test]
@@ -1095,7 +1597,10 @@ mod tests {
             r"D:\dl\a.zip.mt-sftp-partial"
         );
         // 无扩展名 / 带空格的目标也只是加后缀。
-        assert_eq!(sftp_partial_path("/tmp/my file"), "/tmp/my file.mt-sftp-partial");
+        assert_eq!(
+            sftp_partial_path("/tmp/my file"),
+            "/tmp/my file.mt-sftp-partial"
+        );
     }
 
     #[test]
@@ -1122,7 +1627,10 @@ mod tests {
     fn match_known_host_ignores_blank_and_comment_lines() {
         let pub_key = test_pubkey_from_bytes(KEY_BYTES_A);
         let raw = "\n# comment line\n\n# another\n";
-        assert_eq!(match_known_host(raw, "h.example.com", &pub_key), HostKeyMatch::Unknown);
+        assert_eq!(
+            match_known_host(raw, "h.example.com", &pub_key),
+            HostKeyMatch::Unknown
+        );
     }
 
     /// pick_lru_victim 的算法纯函数等价物,用 u64 而非 Arc<CachedSession>,
@@ -1131,7 +1639,9 @@ mod tests {
     #[test]
     fn pick_lru_victim_algorithm_chooses_smallest_last_used() {
         fn pick<T>(map: &HashMap<String, T>, key: impl Fn(&T) -> u64) -> Option<String> {
-            map.iter().min_by_key(|(_, v)| key(v)).map(|(k, _)| k.clone())
+            map.iter()
+                .min_by_key(|(_, v)| key(v))
+                .map(|(k, _)| k.clone())
         }
         let mut m: HashMap<String, u64> = HashMap::new();
         m.insert("a".into(), 100);
@@ -1190,14 +1700,20 @@ mod tests {
             pubkey_b64(&pub_b)
         );
         // 文件里登记的是 pub_b,但服务器报上来的是 pub_a → mismatch
-        assert_eq!(match_known_host(&raw, "h.example.com", &pub_a), HostKeyMatch::Mismatch);
+        assert_eq!(
+            match_known_host(&raw, "h.example.com", &pub_a),
+            HostKeyMatch::Mismatch
+        );
     }
 
     #[test]
     fn match_known_host_skips_hashed_entries_and_treats_as_unknown() {
         let pub_key = test_pubkey_from_bytes(KEY_BYTES_A);
         let raw = "|1|abcsalt|abchash ssh-ed25519 AAAA\n";
-        assert_eq!(match_known_host(raw, "h.example.com", &pub_key), HostKeyMatch::Unknown);
+        assert_eq!(
+            match_known_host(raw, "h.example.com", &pub_key),
+            HostKeyMatch::Unknown
+        );
     }
 
     #[test]
@@ -1208,7 +1724,10 @@ mod tests {
             pubkey_algo(&pub_key),
             pubkey_b64(&pub_key)
         );
-        assert_eq!(match_known_host(&raw, "h.example.com", &pub_key), HostKeyMatch::Match);
+        assert_eq!(
+            match_known_host(&raw, "h.example.com", &pub_key),
+            HostKeyMatch::Match
+        );
     }
 
     #[test]
@@ -1216,7 +1735,10 @@ mod tests {
         // 同 host 但 algo 不同 → 不算 mismatch,允许同 host 多算法共存。
         let pub_key = test_pubkey_from_bytes(KEY_BYTES_A);
         let raw = "h.example.com ssh-rsa AAAAB3NzaC1yc2EFakeFakeFake\n";
-        assert_eq!(match_known_host(raw, "h.example.com", &pub_key), HostKeyMatch::Unknown);
+        assert_eq!(
+            match_known_host(raw, "h.example.com", &pub_key),
+            HostKeyMatch::Unknown
+        );
     }
 
     #[test]
@@ -1227,15 +1749,16 @@ mod tests {
             pubkey_algo(&pub_key),
             pubkey_b64(&pub_key)
         );
-        assert_eq!(match_known_host(&raw, "h.example.com", &pub_key), HostKeyMatch::Match);
+        assert_eq!(
+            match_known_host(&raw, "h.example.com", &pub_key),
+            HostKeyMatch::Match
+        );
     }
 
     #[test]
     fn append_known_host_creates_parent_dir_and_writes_entry() {
-        let dir = std::env::temp_dir().join(format!(
-            "mt-ssh-mcp-test-append-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("mt-ssh-mcp-test-append-{}", std::process::id()));
         let path = dir.join("nested").join("known_hosts");
         let _ = std::fs::remove_dir_all(&dir);
         let pub_key = test_pubkey_from_bytes(KEY_BYTES_A);
@@ -1255,7 +1778,12 @@ mod tests {
     /// `select_expired` 在空池上稳健返回空。
     #[test]
     fn select_expired_empty_input_returns_empty() {
-        let v = select_expired(&[], 1_000_000, Duration::from_secs(60), Duration::from_secs(3600));
+        let v = select_expired(
+            &[],
+            1_000_000,
+            Duration::from_secs(60),
+            Duration::from_secs(3600),
+        );
         assert!(v.is_empty());
     }
 
@@ -1268,7 +1796,12 @@ mod tests {
             ("a".to_string(), now_ms - 1_000, Duration::from_secs(5)),
             ("b".to_string(), now_ms - 500, Duration::from_secs(1)),
         ];
-        let v = select_expired(&triples, now_ms, Duration::from_secs(60), Duration::from_secs(3600));
+        let v = select_expired(
+            &triples,
+            now_ms,
+            Duration::from_secs(60),
+            Duration::from_secs(3600),
+        );
         assert!(v.is_empty(), "expected no victims, got {v:?}");
     }
 
@@ -1277,10 +1810,23 @@ mod tests {
     fn select_expired_picks_idle_expired() {
         let now_ms: u64 = 1_000_000_000;
         let triples = vec![
-            ("idle".to_string(), now_ms - 70_000, Duration::from_secs(120)), // 70s 没用 ≥ 60s
-            ("fresh".to_string(), now_ms - 1_000, Duration::from_secs(120)),
+            (
+                "idle".to_string(),
+                now_ms - 70_000,
+                Duration::from_secs(120),
+            ), // 70s 没用 ≥ 60s
+            (
+                "fresh".to_string(),
+                now_ms - 1_000,
+                Duration::from_secs(120),
+            ),
         ];
-        let v = select_expired(&triples, now_ms, Duration::from_secs(60), Duration::from_secs(3600));
+        let v = select_expired(
+            &triples,
+            now_ms,
+            Duration::from_secs(60),
+            Duration::from_secs(3600),
+        );
         assert_eq!(v, vec!["idle".to_string()]);
     }
 
@@ -1306,7 +1852,11 @@ mod tests {
     fn select_expired_handles_mixed_idle_and_lifetime() {
         let now_ms: u64 = 1_000_000_000;
         let triples = vec![
-            ("idle".to_string(), now_ms - 700_000, Duration::from_secs(10)),
+            (
+                "idle".to_string(),
+                now_ms - 700_000,
+                Duration::from_secs(10),
+            ),
             ("aged".to_string(), now_ms - 1, Duration::from_secs(7_201)),
             ("ok".to_string(), now_ms - 1_000, Duration::from_secs(60)),
         ];
@@ -1323,9 +1873,7 @@ mod tests {
     /// `now_ms < last_used`(系统时钟回拨)时 `saturating_sub` 不溢出,该条目按 idle=0 处理 → 不踢。
     #[test]
     fn select_expired_tolerates_clock_skew() {
-        let triples = vec![
-            ("future".to_string(), 1_000_000_000, Duration::from_secs(10)),
-        ];
+        let triples = vec![("future".to_string(), 1_000_000_000, Duration::from_secs(10))];
         // now < last_used —— saturating_sub 返 0,idle 判断不命中;lifetime 也未到。
         let v = select_expired(
             &triples,
@@ -1340,10 +1888,17 @@ mod tests {
     #[test]
     fn select_expired_idle_exact_boundary_is_expired() {
         let now_ms: u64 = 1_000_000_000;
-        let triples = vec![
-            ("on_edge".to_string(), now_ms - 60_000, Duration::from_secs(1)),
-        ];
-        let v = select_expired(&triples, now_ms, Duration::from_secs(60), Duration::from_secs(3600));
+        let triples = vec![(
+            "on_edge".to_string(),
+            now_ms - 60_000,
+            Duration::from_secs(1),
+        )];
+        let v = select_expired(
+            &triples,
+            now_ms,
+            Duration::from_secs(60),
+            Duration::from_secs(3600),
+        );
         assert_eq!(v, vec!["on_edge".to_string()]);
     }
 
@@ -1462,7 +2017,8 @@ ipMBLNlhlJHNKVmgnpLBSiUoO5fDWn1KcwvQouOC3U3hSMAPnT+7
     #[test]
     fn try_parse_pkcs1_rsa_returns_none_for_non_pkcs1_tag() {
         // OpenSSH 格式标签 —— 本函数不处理,返回 None 让上层回退到 russh 原生错误。
-        let openssh = "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----\n";
+        let openssh =
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----\n";
         assert!(matches!(try_parse_pkcs1_rsa(openssh), Ok(None)));
         // PKCS#8 标签同理。
         let pkcs8 = "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n";
@@ -1486,7 +2042,8 @@ ipMBLNlhlJHNKVmgnpLBSiUoO5fDWn1KcwvQouOC3U3hSMAPnT+7
     #[test]
     fn try_parse_pkcs1_rsa_errors_on_corrupt_base64() {
         // 命中 PKCS#1 标签但主体不是合法 base64/DER —— 返回 Err,不会 panic。
-        let bad = "-----BEGIN RSA PRIVATE KEY-----\n@@@not-base64@@@\n-----END RSA PRIVATE KEY-----\n";
+        let bad =
+            "-----BEGIN RSA PRIVATE KEY-----\n@@@not-base64@@@\n-----END RSA PRIVATE KEY-----\n";
         assert!(try_parse_pkcs1_rsa(bad).is_err());
     }
 }
