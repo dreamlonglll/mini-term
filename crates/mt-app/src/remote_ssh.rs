@@ -1977,10 +1977,7 @@ fn keep_both_local_path(desired: &Path) -> Result<PathBuf, String> {
     ))
 }
 
-fn collect_upload_conflicts(
-    existing: &HashSet<String>,
-    local_paths: &[PathBuf],
-) -> Vec<String> {
+fn collect_upload_conflicts(existing: &HashSet<String>, local_paths: &[PathBuf]) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut reported = HashSet::new();
     let mut conflicts = Vec::new();

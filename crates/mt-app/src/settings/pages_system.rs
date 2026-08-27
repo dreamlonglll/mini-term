@@ -57,11 +57,7 @@ impl SettingsView {
         ) = {
             let config = self.store.read(cx).config();
             let (path, validation_path, error) = match config.resolved_download_dir() {
-                Ok(path) => (
-                    path.to_string_lossy().into_owned(),
-                    Some(path),
-                    None,
-                ),
+                Ok(path) => (path.to_string_lossy().into_owned(), Some(path), None),
                 Err(err) => (
                     "—".into(),
                     None,
@@ -353,10 +349,10 @@ impl SettingsView {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let path = AppConfig::system_download_dir().map_err(|error| format!("{error:#}"))?;
-                    std::fs::create_dir_all(&path).map_err(|error| {
-                        format!("无法创建下载目录 {}: {error}", path.display())
-                    })?;
+                    let path =
+                        AppConfig::system_download_dir().map_err(|error| format!("{error:#}"))?;
+                    std::fs::create_dir_all(&path)
+                        .map_err(|error| format!("无法创建下载目录 {}: {error}", path.display()))?;
                     AppConfig::validate_download_dir(&path)
                         .map_err(|error| format!("{error:#}"))?;
                     Ok::<String, String>(path.to_string_lossy().into_owned())

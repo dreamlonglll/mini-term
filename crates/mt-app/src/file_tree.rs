@@ -1535,68 +1535,63 @@ fn start_upload(
     window
         .spawn(cx, async move |cx| {
             let result = task.await;
-            let _ = cx.update(|window, cx| {
-                match result {
-                    Ok((conn, conflicts)) if conflicts.is_empty() => {
-                        if finish_tree_preflight(&tree, &context, cx) != Some(true) {
-                            return;
-                        }
-                        run_upload(
-                            tree.clone(),
-                            context.clone(),
-                            conn,
-                            target_dir.clone(),
-                            local_paths.clone(),
-                            crate::remote_ssh::FileConflictStrategy::KeepBoth,
-                            window,
-                            cx,
-                        );
+            let _ = cx.update(|window, cx| match result {
+                Ok((conn, conflicts)) if conflicts.is_empty() => {
+                    if finish_tree_preflight(&tree, &context, cx) != Some(true) {
+                        return;
                     }
-                    Ok((conn, _)) => {
-                        if !retain_tree_preflight_for_choice(&tree, &context, cx) {
-                            return;
-                        }
-                        let choice_tree = tree.clone();
-                        let choice_context = context.clone();
-                        let cancel_tree = tree.clone();
-                        let cancel_context = context.clone();
-                        show_file_conflict_choice(
-                            move |strategy, window, cx| {
-                                if finish_tree_preflight(
-                                    &choice_tree,
-                                    &choice_context,
-                                    cx,
-                                ) != Some(true)
-                                {
-                                    return;
-                                }
-                                run_upload(
-                                    choice_tree.clone(),
-                                    choice_context.clone(),
-                                    conn.clone(),
-                                    target_dir.clone(),
-                                    local_paths.clone(),
-                                    strategy,
-                                    window,
-                                    cx,
-                                );
-                            },
-                            move |_window, cx| {
-                                finish_tree_preflight(&cancel_tree, &cancel_context, cx);
-                            },
-                            window,
-                            cx,
-                        );
+                    run_upload(
+                        tree.clone(),
+                        context.clone(),
+                        conn,
+                        target_dir.clone(),
+                        local_paths.clone(),
+                        crate::remote_ssh::FileConflictStrategy::KeepBoth,
+                        window,
+                        cx,
+                    );
+                }
+                Ok((conn, _)) => {
+                    if !retain_tree_preflight_for_choice(&tree, &context, cx) {
+                        return;
                     }
-                    Err(error) => {
-                        if finish_tree_preflight(&tree, &context, cx).is_some() {
-                            show_alert(
-                                t("fileTree", "operation.failedTitle"),
-                                tr!("fileTree", "operation.failedMessage", error = error),
+                    let choice_tree = tree.clone();
+                    let choice_context = context.clone();
+                    let cancel_tree = tree.clone();
+                    let cancel_context = context.clone();
+                    show_file_conflict_choice(
+                        move |strategy, window, cx| {
+                            if finish_tree_preflight(&choice_tree, &choice_context, cx)
+                                != Some(true)
+                            {
+                                return;
+                            }
+                            run_upload(
+                                choice_tree.clone(),
+                                choice_context.clone(),
+                                conn.clone(),
+                                target_dir.clone(),
+                                local_paths.clone(),
+                                strategy,
                                 window,
                                 cx,
                             );
-                        }
+                        },
+                        move |_window, cx| {
+                            finish_tree_preflight(&cancel_tree, &cancel_context, cx);
+                        },
+                        window,
+                        cx,
+                    );
+                }
+                Err(error) => {
+                    if finish_tree_preflight(&tree, &context, cx).is_some() {
+                        show_alert(
+                            t("fileTree", "operation.failedTitle"),
+                            tr!("fileTree", "operation.failedMessage", error = error),
+                            window,
+                            cx,
+                        );
                     }
                 }
             });

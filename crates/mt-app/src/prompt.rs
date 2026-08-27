@@ -75,12 +75,12 @@ where
         // on_close 与 close_button 都放在最后 —— 它们会覆盖 build 里设过的同名
         // 设置:on_close 漏了(摘不掉种类标记)就再也开不出同种类的弹窗;
         // close_button 见 [`dialog_title`] 的注释,画出来是**空白但仍可点**的一块。
-        build(dialog, window, cx).close_button(false).on_close(
-            move |_: &ClickEvent, window, cx| {
+        build(dialog, window, cx)
+            .close_button(false)
+            .on_close(move |_: &ClickEvent, window, cx| {
                 overlay::pop(overlay::key(kind));
                 on_close(window, cx);
-            },
-        )
+            })
     });
     true
 }
