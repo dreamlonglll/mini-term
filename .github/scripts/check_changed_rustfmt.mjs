@@ -95,24 +95,24 @@ try {
     const sourceRanges = changedRanges(sourceDiff.stdout);
     if (sourceRanges.length === 0) continue;
 
+    const original = fs.readFileSync(file, "utf8");
+    const formattedPath = path.join(tempDir, `${index}.rs`);
+    fs.writeFileSync(formattedPath, original);
     const formatted = run("rustfmt", [
       "--edition",
       "2024",
       "--config",
       "skip_children=true",
-      "--emit",
-      "stdout",
-      file,
+      formattedPath,
     ]);
     if (formatted.status !== 0) {
       process.stderr.write(formatted.stdout);
       process.stderr.write(formatted.stderr);
       process.exit(formatted.status ?? 1);
     }
-    if (formatted.stdout === fs.readFileSync(file, "utf8")) continue;
+    const formattedText = fs.readFileSync(formattedPath, "utf8");
+    if (formattedText === original) continue;
 
-    const formattedPath = path.join(tempDir, `${index}.rs`);
-    fs.writeFileSync(formattedPath, formatted.stdout);
     const diff = run("diff", [
       "-U0",
       "--label",
