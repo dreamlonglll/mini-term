@@ -420,7 +420,7 @@ pub fn show_file_conflict_choice(
                         .flex()
                         .flex_col()
                         .gap(px(14.0))
-                        .child(body(&message, &details))
+                        .child(body(message, &details))
                         .child(
                             div()
                                 .px(px(20.0))
