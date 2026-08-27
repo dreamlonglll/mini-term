@@ -2688,14 +2688,16 @@ impl Render for FileTree {
                             let Some(context) = drop_context.clone() else {
                                 return;
                             };
-                            start_upload(
-                                cx.entity(),
-                                context,
-                                drop_target.clone(),
-                                paths.paths().to_vec(),
-                                window,
-                                cx,
-                            );
+                            // listener 里 FileTree 正被 update,start_upload 一进门就
+                            // tree.read 会 double-lease panic;且此刻栈在 OLE Drop 的
+                            // COM 回调上,panic 不可展开、整个进程直接 abort。defer 到
+                            // 租约释放后再跑。
+                            let tree = cx.entity();
+                            let target = drop_target.clone();
+                            let paths = paths.paths().to_vec();
+                            window.defer(cx, move |window, cx| {
+                                start_upload(tree, context, target, paths, window, cx);
+                            });
                         },
                     ))
                 }),
@@ -2990,14 +2992,14 @@ impl FileTree {
                         let Some(context) = drop_context.clone() else {
                             return;
                         };
-                        start_upload(
-                            cx.entity(),
-                            context,
-                            drop_target.clone(),
-                            paths.paths().to_vec(),
-                            window,
-                            cx,
-                        );
+                        // 同背景落点:实体租约未释放前不能进 start_upload(double-lease
+                        // 会在 COM 拖放栈上 abort),defer 一拍。
+                        let tree = cx.entity();
+                        let target = drop_target.clone();
+                        let paths = paths.paths().to_vec();
+                        window.defer(cx, move |window, cx| {
+                            start_upload(tree, context, target, paths, window, cx);
+                        });
                     },
                 ))
             })
