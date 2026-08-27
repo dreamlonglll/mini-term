@@ -1,0 +1,12 @@
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"The feature spans FileTree UI, AppStore identity, local filesystem, SSH/SFTP, config persistence, settings, terminal launch, and i18n."}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Reuse existing SFTP sessions, GPUI ExternalPaths, terminal cwd, picker/dialog, settings, and atomic-write patterns instead of duplicating them."}
+{"file":".trellis/spec/mt-app/backend/index.md","reason":"Primary application-layer package for FileTree, file operation orchestration, dialogs, drag-and-drop, settings, remote picker, and terminal integration."}
+{"file":".trellis/spec/mt-project/backend/index.md","reason":"Owns local path containment, symlink-safe delete, recursive copy, and local filesystem tests."}
+{"file":".trellis/spec/mt-ssh/backend/index.md","reason":"Owns reusable SFTP mutation/streaming primitives, session/channel locking, timeout, and guarded exec."}
+{"file":".trellis/spec/mt-config/backend/index.md","reason":"Owns the optional downloadDir field, defaults, serde compatibility, and config DB round-trip."}
+{"file":".trellis/spec/mt-i18n/backend/index.md","reason":"Owns locale source updates and generated dictionary consistency."}
+{"file":".trellis/spec/mt-terminal/backend/index.md","reason":"Relevant to preserving local/remote cwd semantics when opening a folder in a terminal."}
+{"file":".trellis/tasks/08-27-remote-file-management/research/file-tree-delete-audit.md","reason":"Confirmed current local/remote split defects, context-menu targeting, stale request race, watcher behavior, and symlink delete risk."}
+{"file":".trellis/tasks/08-27-remote-file-management/research/remote-transfer-dnd-settings.md","reason":"Defines transfer primitives, approved conflict semantics, atomicity, GPUI external drop mechanics, and download directory configuration."}
+{"file":".trellis/tasks/08-27-remote-file-management/research/remote-picker-terminal.md","reason":"Defines the remote directory picker boundary and the existing SSH cwd override wiring defect."}
+{"file":".github/workflows/release.yml","reason":"Provides the proven cross-platform toolchain and Linux GPUI dependency setup to reuse in a separate non-release CI workflow; its tag-only release responsibility must remain unchanged."}

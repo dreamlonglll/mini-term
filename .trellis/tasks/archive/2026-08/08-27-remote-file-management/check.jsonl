@@ -1,0 +1,11 @@
+{"file":".trellis/spec/guides/cross-layer-thinking-guide.md","reason":"Review complete data flow, identity guards, error boundaries, config round-trip, and UI refresh ownership."}
+{"file":".trellis/spec/guides/code-reuse-thinking-guide.md","reason":"Check that shared path, transfer, conflict, DnD, settings, and picker patterns were reused rather than reimplemented inconsistently."}
+{"file":".trellis/spec/mt-app/backend/index.md","reason":"Review FileTree menus, async state, drag/drop, dialogs, settings, picker, and terminal integration."}
+{"file":".trellis/spec/mt-project/backend/index.md","reason":"Review local filesystem containment, symlink behavior, recursive operations, and large-delete tests."}
+{"file":".trellis/spec/mt-ssh/backend/index.md","reason":"Review SFTP request count, channel/session lock scope, timeout, atomic transfer, rollback, and exec fallback."}
+{"file":".trellis/spec/mt-config/backend/index.md","reason":"Review optional field compatibility and default/custom download directory persistence."}
+{"file":".trellis/spec/mt-i18n/backend/index.md","reason":"Review source/generated dictionary consistency and used-key registration."}
+{"file":".trellis/tasks/08-27-remote-file-management/research/file-tree-delete-audit.md","reason":"Verify every audited defect is either fixed, explicitly deferred, or covered by a regression test."}
+{"file":".trellis/tasks/08-27-remote-file-management/research/remote-transfer-dnd-settings.md","reason":"Verify conflict semantics, atomicity, DnD routing, transfer request budget, and download settings behavior."}
+{"file":".trellis/tasks/08-27-remote-file-management/research/remote-picker-terminal.md","reason":"Verify stale picker requests, manual/picker convergence, and remote terminal cwd override."}
+{"file":".github/workflows/release.yml","reason":"Compare the new CI environment with the established release build setup and verify release remains tag-only while ordinary branches and PRs gain a separate Rust quality gate."}
