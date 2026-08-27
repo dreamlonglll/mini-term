@@ -2808,12 +2808,8 @@ mod tests {
         let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs");
         // 列表项里的内联图片(块级图片行走自绘,不经过这条)
         let out = rewrite_md_image_urls("- ![图](shots/a.png) 说明", &base);
-        let image_url =
-            to_file_url(&base.join("shots/a.png")).expect("测试基准路径应为绝对路径");
-        assert!(
-            out.starts_with(&format!("- ![图]({image_url})")),
-            "{out}"
-        );
+        let image_url = to_file_url(&base.join("shots/a.png")).expect("测试基准路径应为绝对路径");
+        assert!(out.starts_with(&format!("- ![图]({image_url})")), "{out}");
         // title 保留
         let out = rewrite_md_image_urls(r#"![图](a.png "标题")"#, &base);
         assert!(out.contains(r#""标题""#), "{out}");
@@ -2832,18 +2828,15 @@ mod tests {
     #[test]
     fn html_的本地资源改写成_file_url() {
         let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("site");
-        let image_url =
-            to_file_url(&base.join("img/a.png")).expect("测试基准路径应为绝对路径");
+        let image_url = to_file_url(&base.join("img/a.png")).expect("测试基准路径应为绝对路径");
         let out = rewrite_html_urls(r#"<img src="img/a.png" alt="a">"#, &base);
         assert_eq!(out, format!(r#"<img src="{image_url}" alt="a">"#));
         // 单引号 / 大写属性名 / 等号旁的空白都认
-        let image_url =
-            to_file_url(&base.join("a.png")).expect("测试基准路径应为绝对路径");
+        let image_url = to_file_url(&base.join("a.png")).expect("测试基准路径应为绝对路径");
         let out = rewrite_html_urls("<img SRC = 'a.png'>", &base);
         assert_eq!(out, format!("<img SRC = '{image_url}'>"));
         // href / poster 同样处理
-        let poster_url =
-            to_file_url(&base.join("p.jpg")).expect("测试基准路径应为绝对路径");
+        let poster_url = to_file_url(&base.join("p.jpg")).expect("测试基准路径应为绝对路径");
         let out = rewrite_html_urls(r#"<video poster="p.jpg"></video>"#, &base);
         assert!(out.contains(&poster_url), "{out}");
 
