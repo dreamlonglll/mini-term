@@ -479,9 +479,7 @@ impl FileTree {
         let remote = self.remote_conn(cx);
         if remote.is_none()
             && self.watched.insert(dir.clone())
-            && let Err(err) = self
-                .watcher
-                .watch(&dir, root.to_string_lossy().as_ref())
+            && let Err(err) = self.watcher.watch(&dir, root.to_string_lossy().as_ref())
         {
             eprintln!("[files] 监听 {} 失败: {err:#}", dir.display());
         }

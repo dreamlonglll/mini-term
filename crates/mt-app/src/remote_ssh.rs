@@ -2936,9 +2936,7 @@ async fn collect_remote_codex_files(
                 };
                 file_entries.retain(|e| !e.is_dir && e.name.ends_with(".jsonl"));
                 // 同一天内按 mtime 倒序。
-                file_entries.sort_by_key(|entry| {
-                    std::cmp::Reverse(entry.mtime_secs.unwrap_or(0))
-                });
+                file_entries.sort_by_key(|entry| std::cmp::Reverse(entry.mtime_secs.unwrap_or(0)));
                 for f in file_entries {
                     out.push((join_posix(&ddir, &f.name), f.mtime_secs.unwrap_or(0)));
                     if out.len() >= limit {
