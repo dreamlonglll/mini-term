@@ -484,20 +484,22 @@ mod tests {
         let dir = temp_dir("roundtrip");
         let db = ConfigDb::open_at(&dir).unwrap();
 
-        let mut config = AppConfig::default();
-        config.ui_font_size = 15.0;
-        config.theme = "dark".into();
-        config.terminal_font_family = Some("Cascadia Mono".into());
-        config.download_dir = Some("/tmp/mini-term-downloads".into());
-        config.hook_enabled = true;
-        config.projects = vec![project("p1", "甲"), project("p2", "乙")];
-        config.ssh_connections = vec![conn("c1")];
-        config.default_shell = "PowerShell".into();
-        config.available_shells = vec![ShellConfig {
-            name: "PowerShell".into(),
-            command: "powershell.exe".into(),
-            args: None,
-        }];
+        let mut config = AppConfig {
+            ui_font_size: 15.0,
+            theme: "dark".into(),
+            terminal_font_family: Some("Cascadia Mono".into()),
+            download_dir: Some("/tmp/mini-term-downloads".into()),
+            hook_enabled: true,
+            projects: vec![project("p1", "甲"), project("p2", "乙")],
+            ssh_connections: vec![conn("c1")],
+            default_shell: "PowerShell".into(),
+            available_shells: vec![ShellConfig {
+                name: "PowerShell".into(),
+                command: "powershell.exe".into(),
+                args: None,
+            }],
+            ..Default::default()
+        };
 
         db.save(&config).unwrap();
         let back = db.load().unwrap().unwrap();
@@ -564,8 +566,10 @@ mod tests {
     fn 项目顺序按_ord_还原() {
         let dir = temp_dir("order");
         let db = ConfigDb::open_at(&dir).unwrap();
-        let mut config = AppConfig::default();
-        config.projects = vec![project("zzz", "第一"), project("aaa", "第二")];
+        let mut config = AppConfig {
+            projects: vec![project("zzz", "第一"), project("aaa", "第二")],
+            ..Default::default()
+        };
         db.save(&config).unwrap();
 
         let back = db.load().unwrap().unwrap();
@@ -587,9 +591,11 @@ mod tests {
     fn 删除的项目与连接不残留() {
         let dir = temp_dir("delete");
         let db = ConfigDb::open_at(&dir).unwrap();
-        let mut config = AppConfig::default();
-        config.projects = vec![project("p1", "甲"), project("p2", "乙")];
-        config.ssh_connections = vec![conn("c1"), conn("c2")];
+        let mut config = AppConfig {
+            projects: vec![project("p1", "甲"), project("p2", "乙")],
+            ssh_connections: vec![conn("c1"), conn("c2")],
+            ..Default::default()
+        };
         db.save(&config).unwrap();
 
         config.projects.retain(|p| p.id == "p1");
@@ -611,8 +617,10 @@ mod tests {
     fn 项目删光后仍不是空库() {
         let dir = temp_dir("all-deleted");
         let db = ConfigDb::open_at(&dir).unwrap();
-        let mut config = AppConfig::default();
-        config.projects = vec![project("p1", "甲")];
+        let mut config = AppConfig {
+            projects: vec![project("p1", "甲")],
+            ..Default::default()
+        };
         db.save(&config).unwrap();
 
         config.projects.clear();
@@ -628,9 +636,11 @@ mod tests {
         let dir = temp_dir("reopen");
         {
             let db = ConfigDb::open_at(&dir).unwrap();
-            let mut config = AppConfig::default();
-            config.projects = vec![project("p1", "甲")];
-            config.ui_font_size = 17.0;
+            let config = AppConfig {
+                projects: vec![project("p1", "甲")],
+                ui_font_size: 17.0,
+                ..Default::default()
+            };
             db.save(&config).unwrap();
         }
         let db = ConfigDb::open_at(&dir).unwrap();
@@ -645,9 +655,11 @@ mod tests {
     fn 布局字段不进配置库() {
         let dir = temp_dir("no-layout");
         let db = ConfigDb::open_at(&dir).unwrap();
-        let mut config = AppConfig::default();
-        config.layout_sizes = Some(vec![20.0, 80.0]);
-        config.right_drawer_width = Some(400.0);
+        let config = AppConfig {
+            layout_sizes: Some(vec![20.0, 80.0]),
+            right_drawer_width: Some(400.0),
+            ..Default::default()
+        };
         db.save(&config).unwrap();
 
         let keys: Vec<String> = {
@@ -669,8 +681,10 @@ mod tests {
         let bak = dir.join("config.db.bak");
         {
             let db = ConfigDb::open_at(&dir).unwrap();
-            let mut config = AppConfig::default();
-            config.projects = vec![project("p1", "甲")];
+            let config = AppConfig {
+                projects: vec![project("p1", "甲")],
+                ..Default::default()
+            };
             db.save(&config).unwrap();
             db.backup_to(&bak).unwrap();
         }

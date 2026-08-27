@@ -1328,22 +1328,23 @@ impl Render for Workspace {
         let dialog_open = window.has_active_dialog(cx);
         let frost_wanted = dialog_open || self.usage_open;
         if frost_wanted {
-            if self.frost.is_none() && self.frost_task.is_none() {
-                if let Some(raw) = frost::capture_raw(window) {
-                    self.frost_task = Some(cx.spawn(async move |this, cx| {
-                        let img = cx
-                            .background_executor()
-                            .spawn(async move { frost::finish(raw) })
-                            .await;
-                        let _ = this.update(cx, |this, cx| {
-                            this.frost_task = None;
-                            if let Some(img) = img {
-                                this.frost = Some(img);
-                                cx.notify();
-                            }
-                        });
-                    }));
-                }
+            if self.frost.is_none()
+                && self.frost_task.is_none()
+                && let Some(raw) = frost::capture_raw(window)
+            {
+                self.frost_task = Some(cx.spawn(async move |this, cx| {
+                    let img = cx
+                        .background_executor()
+                        .spawn(async move { frost::finish(raw) })
+                        .await;
+                    let _ = this.update(cx, |this, cx| {
+                        this.frost_task = None;
+                        if let Some(img) = img {
+                            this.frost = Some(img);
+                            cx.notify();
+                        }
+                    });
+                }));
             }
         } else if self.frost.is_some() || self.frost_task.is_some() {
             self.frost = None;

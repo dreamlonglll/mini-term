@@ -800,6 +800,7 @@ fn parse_codex_thread_names(content: &str) -> HashMap<String, String> {
 ///
 /// 忽略过滤 = 项目根 `.gitignore`(读一次、按 connId+projectRoot 缓存)
 /// + [`ALWAYS_IGNORE`] 固定黑名单(目录直接隐藏)。
+///
 /// `refresh_ignore=true` 强制重读 .gitignore(树顶手动刷新按钮用)。
 ///
 /// **阻塞**,丢 `background_executor`。
@@ -2244,20 +2245,20 @@ async fn upload_path_tree(
         }
         let mut cleanup_errors = Vec::new();
         for staging in staged_directories {
-            if let Ok(kind) = sftp.node_kind(&staging).await {
-                if let Err(error) = sftp.remove_tree(&staging, kind).await {
-                    cleanup_errors.push(format!("{staging}: {}", error.message()));
-                }
+            if let Ok(kind) = sftp.node_kind(&staging).await
+                && let Err(error) = sftp.remove_tree(&staging, kind).await
+            {
+                cleanup_errors.push(format!("{staging}: {}", error.message()));
             }
         }
-        if !cleanup_errors.is_empty() {
-            if let Err(original) = &result {
-                let original = original.clone();
-                result = Err(format!(
-                    "{original}; 清理远程暂存目录失败: {}",
-                    cleanup_errors.join("; ")
-                ));
-            }
+        if !cleanup_errors.is_empty()
+            && let Err(original) = &result
+        {
+            let original = original.clone();
+            result = Err(format!(
+                "{original}; 清理远程暂存目录失败: {}",
+                cleanup_errors.join("; ")
+            ));
         }
     }
     result
@@ -2558,20 +2559,20 @@ async fn download_remote_tree(
         }
         let mut cleanup_errors = Vec::new();
         for staging_container in staging_containers {
-            if std::fs::symlink_metadata(&staging_container).is_ok() {
-                if let Err(error) = remove_local_entry(&staging_container) {
-                    cleanup_errors.push(error);
-                }
+            if std::fs::symlink_metadata(&staging_container).is_ok()
+                && let Err(error) = remove_local_entry(&staging_container)
+            {
+                cleanup_errors.push(error);
             }
         }
-        if !cleanup_errors.is_empty() {
-            if let Err(original) = &result {
-                let original = original.clone();
-                result = Err(format!(
-                    "{original}; 清理本地下载暂存目录失败: {}",
-                    cleanup_errors.join("; ")
-                ));
-            }
+        if !cleanup_errors.is_empty()
+            && let Err(original) = &result
+        {
+            let original = original.clone();
+            result = Err(format!(
+                "{original}; 清理本地下载暂存目录失败: {}",
+                cleanup_errors.join("; ")
+            ));
         }
     }
     result
@@ -2870,7 +2871,7 @@ async fn scan_remote_claude(
             }
         }
     }
-    files.sort_by(|a, b| b.2.cmp(&a.2));
+    files.sort_by_key(|entry| std::cmp::Reverse(entry.2));
     files.truncate(REMOTE_CLAUDE_SCAN_LIMIT);
 
     let mut sessions = Vec::new();
@@ -2935,8 +2936,9 @@ async fn collect_remote_codex_files(
                 };
                 file_entries.retain(|e| !e.is_dir && e.name.ends_with(".jsonl"));
                 // 同一天内按 mtime 倒序。
-                file_entries
-                    .sort_by(|a, b| b.mtime_secs.unwrap_or(0).cmp(&a.mtime_secs.unwrap_or(0)));
+                file_entries.sort_by_key(|entry| {
+                    std::cmp::Reverse(entry.mtime_secs.unwrap_or(0))
+                });
                 for f in file_entries {
                     out.push((join_posix(&ddir, &f.name), f.mtime_secs.unwrap_or(0)));
                     if out.len() >= limit {
@@ -3686,7 +3688,7 @@ not json\n\
     #[test]
     fn accumulate_session_content_concatenates_until_exhausted() {
         // 三段:每段推进偏移,最后一段偏移不再前进(EOF)→ 拼接全部消息
-        let chunks = vec![
+        let chunks = [
             (vec![msg("a"), msg("b")], 10u64),
             (vec![msg("c")], 20u64),
             (vec![], 20u64),

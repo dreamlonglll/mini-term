@@ -314,7 +314,7 @@ mod tests {
     fn 查找条不挡全局快捷键() {
         let mut stack = Stack::default();
         stack.push(terminal_search(3));
-        assert!(stack.blocking() == false);
+        assert!(!stack.blocking());
         assert!(stack.allows(Yield::ToOverlay));
         // 但只要上面再压一个真弹窗,照样让路
         stack.push(key(kind::CONFIRM));

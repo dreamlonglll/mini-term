@@ -481,7 +481,7 @@ impl FileTree {
             && self.watched.insert(dir.clone())
             && let Err(err) = self
                 .watcher
-                .watch(&dir, &root.to_string_lossy().to_string())
+                .watch(&dir, root.to_string_lossy().as_ref())
         {
             eprintln!("[files] 监听 {} 失败: {err:#}", dir.display());
         }

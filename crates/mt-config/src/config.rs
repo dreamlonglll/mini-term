@@ -1465,40 +1465,42 @@ mod tests {
     /// 这一条钉的是决议本身,删字段那一版把整个测试一起删掉即可。
     #[test]
     fn 布局字段不再序列化() {
-        let mut config = AppConfig::default();
-        config.layout_sizes = Some(vec![20.0, 60.0, 20.0]);
-        config.middle_column_sizes = Some(vec![50.0, 50.0]);
-        config.middle_column_visible = false;
-        config.right_drawer_width = Some(400.0);
-        config.projects.push(ProjectConfig {
-            id: "p1".into(),
-            name: "proj".into(),
-            path: "/tmp".into(),
-            description: None,
-            saved_layout: Some(SavedProjectLayout {
-                tabs: vec![SavedTab {
-                    custom_title: None,
-                    split_layout: SavedSplitNode::Leaf {
-                        pane: None,
-                        panes: vec![SavedPane {
-                            shell_name: "cmd".into(),
-                            cwd: None,
-                            ai_session: None,
-                        }],
-                    },
-                }],
-                active_tab_index: 0,
-            }),
-            expanded_dirs: vec![],
-            ssh_mcp_enabled: false,
-            ssh_cli_token: None,
-            ssh_connection_ids: None,
-            env_vars: vec![],
-            wsl_sessions_distro: None,
-            ssh_connection_id: None,
-            parent_project_id: None,
-            kind_override: None,
-        });
+        let config = AppConfig {
+            layout_sizes: Some(vec![20.0, 60.0, 20.0]),
+            middle_column_sizes: Some(vec![50.0, 50.0]),
+            middle_column_visible: false,
+            right_drawer_width: Some(400.0),
+            projects: vec![ProjectConfig {
+                id: "p1".into(),
+                name: "proj".into(),
+                path: "/tmp".into(),
+                description: None,
+                saved_layout: Some(SavedProjectLayout {
+                    tabs: vec![SavedTab {
+                        custom_title: None,
+                        split_layout: SavedSplitNode::Leaf {
+                            pane: None,
+                            panes: vec![SavedPane {
+                                shell_name: "cmd".into(),
+                                cwd: None,
+                                ai_session: None,
+                            }],
+                        },
+                    }],
+                    active_tab_index: 0,
+                }),
+                expanded_dirs: vec![],
+                ssh_mcp_enabled: false,
+                ssh_cli_token: None,
+                ssh_connection_ids: None,
+                env_vars: vec![],
+                wsl_sessions_distro: None,
+                ssh_connection_id: None,
+                parent_project_id: None,
+                kind_override: None,
+            }],
+            ..Default::default()
+        };
 
         let json = serde_json::to_string(&config).unwrap();
         for key in [
@@ -2138,46 +2140,48 @@ mod tests {
         let store = ConfigStore::at(&path);
         let token = store.load().unwrap().token;
 
-        let mut config = AppConfig::default();
-        config.ssh_connections = vec![
-            SshConnection {
-                id: "c1".into(),
-                name: "prod".into(),
-                host: "h1".into(),
-                port: 22,
-                user: "root".into(),
-                password: Some("secret".into()),
-                identity_file: None,
-                group: None,
-            },
-            SshConnection {
-                id: "c2".into(),
-                name: "dev".into(),
-                host: "h2".into(),
-                port: 2222,
-                user: "deploy".into(),
-                password: None,
-                identity_file: None,
-                group: None,
-            },
-        ];
-        config.projects = vec![
-            ProjectConfig {
-                id: "p1".into(),
-                name: "甲".into(),
-                path: "D:/a".into(),
-                ssh_mcp_enabled: true,
-                ssh_cli_token: Some("tok-a".into()),
-                ssh_connection_ids: Some(vec!["c1".into()]),
-                ..project_stub()
-            },
-            ProjectConfig {
-                id: "p2".into(),
-                name: "乙".into(),
-                path: "D:/b".into(),
-                ..project_stub()
-            },
-        ];
+        let config = AppConfig {
+            ssh_connections: vec![
+                SshConnection {
+                    id: "c1".into(),
+                    name: "prod".into(),
+                    host: "h1".into(),
+                    port: 22,
+                    user: "root".into(),
+                    password: Some("secret".into()),
+                    identity_file: None,
+                    group: None,
+                },
+                SshConnection {
+                    id: "c2".into(),
+                    name: "dev".into(),
+                    host: "h2".into(),
+                    port: 2222,
+                    user: "deploy".into(),
+                    password: None,
+                    identity_file: None,
+                    group: None,
+                },
+            ],
+            projects: vec![
+                ProjectConfig {
+                    id: "p1".into(),
+                    name: "甲".into(),
+                    path: "D:/a".into(),
+                    ssh_mcp_enabled: true,
+                    ssh_cli_token: Some("tok-a".into()),
+                    ssh_connection_ids: Some(vec!["c1".into()]),
+                    ..project_stub()
+                },
+                ProjectConfig {
+                    id: "p2".into(),
+                    name: "乙".into(),
+                    path: "D:/b".into(),
+                    ..project_stub()
+                },
+            ],
+            ..Default::default()
+        };
         store.save(token, &config).unwrap();
 
         // 能力令牌 → 该项目的连接范围
