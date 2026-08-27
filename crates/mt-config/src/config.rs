@@ -2,7 +2,8 @@
 //!
 //! 与 Tauri 版的差别只有两处出入口:路径不再来自 `AppHandle`(见 [`crate::paths`]),
 //! 写盘令牌不再是 Tauri managed state 而是 [`ConfigStore`] 自己的字段。
-//! **序列化面一个字段都没动** —— 存量 `config.json` 必须原样读得进来。
+//! **存量字段的序列化形状不动**；新增字段必须带 serde 缺省 —— 存量
+//! `config.json` 必须原样读得进来。
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -155,6 +156,12 @@ pub struct AppConfig {
     /// 也可填远端绝对路径（`/tmp/mini-term`）或 `~/xxx`。含 `..` 的写法会被拒绝。
     #[serde(default = "default_remote_paste_dir")]
     pub remote_paste_dir: String,
+    /// 文件管理器下载到本机时的目标目录。
+    ///
+    /// `None` = 跟随系统下载目录（系统 API 不可用时回落到 `$HOME/Downloads`）；
+    /// `Some` = 用户在设置页显式选择的本地目录。增量字段必须允许旧配置缺省。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub download_dir: Option<String>,
     // NOTE: 曾有 projects_visible / sessions_visible / files_visible / git_visible
     // 四个面板显隐开关，界面上没有任何入口消费（已被 middle_column_visible 与右侧
     // 抽屉取代），随 UI 改版一并删除。旧 config.json 里残留的这些键会被 serde 忽略。
@@ -491,6 +498,83 @@ fn default_true() -> bool {
     true
 }
 
+static DOWNLOAD_DIR_PROBE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn resolve_download_dir_with(
+    configured: Option<&str>,
+    system_download_dir: Option<PathBuf>,
+    home_dir: Option<PathBuf>,
+) -> Result<PathBuf> {
+    if let Some(path) = configured {
+        let path = PathBuf::from(path);
+        return if path.is_absolute() {
+            Ok(path)
+        } else {
+            Err(anyhow!("下载目录必须是绝对路径：{}", path.display()))
+        };
+    }
+    system_download_dir
+        .or_else(|| home_dir.map(|home| home.join("Downloads")))
+        .ok_or_else(|| anyhow!("无法确定本机下载目录：系统下载目录和用户主目录均不可用"))
+}
+
+impl AppConfig {
+    /// 解析系统默认下载目录，不读取用户覆盖值。
+    pub fn system_download_dir() -> Result<PathBuf> {
+        resolve_download_dir_with(None, dirs::download_dir(), dirs::home_dir())
+    }
+
+    /// 返回当前配置实际生效的下载目录。
+    ///
+    /// 显式配置优先；未配置时动态解析系统目录，避免把某台机器的默认路径写进配置。
+    pub fn resolved_download_dir(&self) -> Result<PathBuf> {
+        resolve_download_dir_with(
+            self.download_dir.as_deref(),
+            dirs::download_dir(),
+            dirs::home_dir(),
+        )
+    }
+
+    /// 校验设置页选中的下载目录真实存在、是绝对目录且当前进程可创建并删除文件。
+    ///
+    /// 该方法会短暂创建一个空探针文件；调用方应放到后台线程执行。下载动作开始前仍应
+    /// 再调用一次，以覆盖设置后目录被删除或权限变化的情况。
+    pub fn validate_download_dir(path: &Path) -> Result<()> {
+        if !path.is_absolute() {
+            return Err(anyhow!("下载目录必须是绝对路径：{}", path.display()));
+        }
+
+        let metadata = fs::metadata(path)
+            .map_err(|err| anyhow!("无法访问下载目录 {}：{err}", path.display()))?;
+        if !metadata.is_dir() {
+            return Err(anyhow!("下载路径不是文件夹：{}", path.display()));
+        }
+
+        let sequence = DOWNLOAD_DIR_PROBE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let probe = path.join(format!(
+            ".mini-term-write-probe-{}-{timestamp}-{sequence}",
+            std::process::id(),
+        ));
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+            .map_err(|err| anyhow!("下载目录不可写 {}：{err}", path.display()))?;
+        drop(file);
+        fs::remove_file(&probe).map_err(|err| {
+            anyhow!(
+                "下载目录无法清理写入探针 {}：{err}",
+                probe.display()
+            )
+        })?;
+        Ok(())
+    }
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -524,6 +608,7 @@ impl Default for AppConfig {
             long_paste_line_threshold: default_long_paste_line_threshold(),
             long_paste_char_threshold: default_long_paste_char_threshold(),
             remote_paste_dir: default_remote_paste_dir(),
+            download_dir: None,
             middle_column_visible: true,
             right_drawer_width: None,
             last_active_project_id: None,
@@ -1096,6 +1181,76 @@ mod tests {
     }
 
     #[test]
+    fn download_dir_is_backward_compatible_and_round_trips() {
+        let legacy = r#"{
+            "projects": [],
+            "defaultShell": "cmd",
+            "availableShells": []
+        }"#;
+        let mut config: AppConfig = serde_json::from_str(legacy).unwrap();
+        assert!(config.download_dir.is_none());
+        assert!(
+            !serde_json::to_string(&config)
+                .unwrap()
+                .contains("downloadDir"),
+            "跟随系统默认时不应污染持久化配置"
+        );
+
+        config.download_dir = Some("/chosen/downloads".into());
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains(r#""downloadDir":"/chosen/downloads""#));
+        let parsed: AppConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.download_dir.as_deref(), Some("/chosen/downloads"));
+    }
+
+    #[test]
+    fn download_dir_resolution_prefers_override_then_system_then_home() {
+        let configured = std::env::temp_dir().join("chosen");
+        let configured_text = configured.to_string_lossy().into_owned();
+        let override_path = resolve_download_dir_with(
+            Some(&configured_text),
+            Some(PathBuf::from("system")),
+            Some(PathBuf::from("home")),
+        )
+        .unwrap();
+        assert_eq!(override_path, configured);
+
+        let system = resolve_download_dir_with(
+            None,
+            Some(PathBuf::from("system")),
+            Some(PathBuf::from("home")),
+        )
+        .unwrap();
+        assert_eq!(system, PathBuf::from("system"));
+
+        let fallback =
+            resolve_download_dir_with(None, None, Some(PathBuf::from("home"))).unwrap();
+        assert_eq!(fallback, PathBuf::from("home").join("Downloads"));
+        assert!(resolve_download_dir_with(None, None, None).is_err());
+
+        let config = AppConfig {
+            download_dir: Some("relative".into()),
+            ..AppConfig::default()
+        };
+        assert!(config.resolved_download_dir().is_err());
+    }
+
+    #[test]
+    fn download_dir_validation_rejects_invalid_targets_and_cleans_probe() {
+        let root = unique_test_root("download-dir-validation");
+        AppConfig::validate_download_dir(&root).unwrap();
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+
+        let file = root.join("not-a-directory");
+        fs::write(&file, b"x").unwrap();
+        assert!(AppConfig::validate_download_dir(&file).is_err());
+        assert!(AppConfig::validate_download_dir(&root.join("missing")).is_err());
+        assert!(AppConfig::validate_download_dir(Path::new("relative")).is_err());
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn font_family_round_trip() {
         let json = r#"{
             "projects": [],
@@ -1312,40 +1467,42 @@ mod tests {
     /// 这一条钉的是决议本身,删字段那一版把整个测试一起删掉即可。
     #[test]
     fn 布局字段不再序列化() {
-        let mut config = AppConfig::default();
-        config.layout_sizes = Some(vec![20.0, 60.0, 20.0]);
-        config.middle_column_sizes = Some(vec![50.0, 50.0]);
-        config.middle_column_visible = false;
-        config.right_drawer_width = Some(400.0);
-        config.projects.push(ProjectConfig {
-            id: "p1".into(),
-            name: "proj".into(),
-            path: "/tmp".into(),
-            description: None,
-            saved_layout: Some(SavedProjectLayout {
-                tabs: vec![SavedTab {
-                    custom_title: None,
-                    split_layout: SavedSplitNode::Leaf {
-                        pane: None,
-                        panes: vec![SavedPane {
-                            shell_name: "cmd".into(),
-                            cwd: None,
-                            ai_session: None,
-                        }],
-                    },
-                }],
-                active_tab_index: 0,
-            }),
-            expanded_dirs: vec![],
-            ssh_mcp_enabled: false,
-            ssh_cli_token: None,
-            ssh_connection_ids: None,
-            env_vars: vec![],
-            wsl_sessions_distro: None,
-            ssh_connection_id: None,
-            parent_project_id: None,
-            kind_override: None,
-        });
+        let config = AppConfig {
+            layout_sizes: Some(vec![20.0, 60.0, 20.0]),
+            middle_column_sizes: Some(vec![50.0, 50.0]),
+            middle_column_visible: false,
+            right_drawer_width: Some(400.0),
+            projects: vec![ProjectConfig {
+                id: "p1".into(),
+                name: "proj".into(),
+                path: "/tmp".into(),
+                description: None,
+                saved_layout: Some(SavedProjectLayout {
+                    tabs: vec![SavedTab {
+                        custom_title: None,
+                        split_layout: SavedSplitNode::Leaf {
+                            pane: None,
+                            panes: vec![SavedPane {
+                                shell_name: "cmd".into(),
+                                cwd: None,
+                                ai_session: None,
+                            }],
+                        },
+                    }],
+                    active_tab_index: 0,
+                }),
+                expanded_dirs: vec![],
+                ssh_mcp_enabled: false,
+                ssh_cli_token: None,
+                ssh_connection_ids: None,
+                env_vars: vec![],
+                wsl_sessions_distro: None,
+                ssh_connection_id: None,
+                parent_project_id: None,
+                kind_override: None,
+            }],
+            ..Default::default()
+        };
 
         let json = serde_json::to_string(&config).unwrap();
         for key in [
@@ -1978,46 +2135,48 @@ mod tests {
         let store = ConfigStore::at(&path);
         let token = store.load().unwrap().token;
 
-        let mut config = AppConfig::default();
-        config.ssh_connections = vec![
-            SshConnection {
-                id: "c1".into(),
-                name: "prod".into(),
-                host: "h1".into(),
-                port: 22,
-                user: "root".into(),
-                password: Some("secret".into()),
-                identity_file: None,
-                group: None,
-            },
-            SshConnection {
-                id: "c2".into(),
-                name: "dev".into(),
-                host: "h2".into(),
-                port: 2222,
-                user: "deploy".into(),
-                password: None,
-                identity_file: None,
-                group: None,
-            },
-        ];
-        config.projects = vec![
-            ProjectConfig {
-                id: "p1".into(),
-                name: "甲".into(),
-                path: "D:/a".into(),
-                ssh_mcp_enabled: true,
-                ssh_cli_token: Some("tok-a".into()),
-                ssh_connection_ids: Some(vec!["c1".into()]),
-                ..project_stub()
-            },
-            ProjectConfig {
-                id: "p2".into(),
-                name: "乙".into(),
-                path: "D:/b".into(),
-                ..project_stub()
-            },
-        ];
+        let config = AppConfig {
+            ssh_connections: vec![
+                SshConnection {
+                    id: "c1".into(),
+                    name: "prod".into(),
+                    host: "h1".into(),
+                    port: 22,
+                    user: "root".into(),
+                    password: Some("secret".into()),
+                    identity_file: None,
+                    group: None,
+                },
+                SshConnection {
+                    id: "c2".into(),
+                    name: "dev".into(),
+                    host: "h2".into(),
+                    port: 2222,
+                    user: "deploy".into(),
+                    password: None,
+                    identity_file: None,
+                    group: None,
+                },
+            ],
+            projects: vec![
+                ProjectConfig {
+                    id: "p1".into(),
+                    name: "甲".into(),
+                    path: "D:/a".into(),
+                    ssh_mcp_enabled: true,
+                    ssh_cli_token: Some("tok-a".into()),
+                    ssh_connection_ids: Some(vec!["c1".into()]),
+                    ..project_stub()
+                },
+                ProjectConfig {
+                    id: "p2".into(),
+                    name: "乙".into(),
+                    path: "D:/b".into(),
+                    ..project_stub()
+                },
+            ],
+            ..Default::default()
+        };
         store.save(token, &config).unwrap();
 
         // 能力令牌 → 该项目的连接范围

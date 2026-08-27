@@ -7,8 +7,11 @@
 //! 目录监听(`fs-change`)不在本模块,见 [`crate::watch`]。
 
 use std::cmp::Ordering;
+use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use ignore::gitignore::Gitignore;
@@ -181,6 +184,7 @@ pub const ALWAYS_IGNORE: &[&str] = &[
 /// - `\\?\UNC\wsl.localhost\Ubuntu\home` → `Some("\\\\wsl.localhost\\Ubuntu\\home")`
 /// - Volume GUID `\\?\Volume{...}` 等其他 verbatim 形式 → `None` (保留原样)
 /// - 非 verbatim 路径 → `None`
+#[cfg(any(windows, test))]
 fn try_strip_windows_verbatim(s: &str) -> Option<String> {
     let rest = s.strip_prefix(r"\\?\")?;
     // UNC verbatim: `\\?\UNC\<host>\<rest>` → `\\<host>\<rest>`
@@ -216,10 +220,10 @@ pub fn strip_verbatim_prefix(p: PathBuf) -> PathBuf {
 /// 校验 target 必须在 project_root 内,防止调用方(UI 里的重命名输入框、
 /// 拖放来的路径等)构造 `../../etc/passwd` 之类的路径逃逸出项目根目录。
 ///
-/// 用 `canonicalize` 同时解析符号链接和 `..`,要求 project_root 必须存在。
-/// `must_exist=true` 时 target 也必须存在(用于 list/read/rename 旧路径);
-/// `must_exist=false` 时仅 canonicalize 父目录后拼上 file_name,允许 target
-/// 本身不存在(用于 create_file/create_directory 这类创建场景)。
+/// project_root 与 target 的父目录会 `canonicalize`,从而解析父级符号链接和
+/// `..`;target 叶子本身**不 canonicalize**,避免删除/重命名时把符号链接替换成
+/// 它指向的真实路径。`must_exist=true` 用 `symlink_metadata` 检查叶子存在,所以
+/// 指向不存在目标的断链也属于一个可操作的既有条目。
 ///
 /// 返回校验后的绝对路径(Windows 上已剥 `\\?\` 前缀),后续 IO 直接用它,
 /// 避免重复访问磁盘。
@@ -236,11 +240,19 @@ pub(crate) fn verify_under_project_root(
         .map(strip_verbatim_prefix)
         .map_err(|e| anyhow!("项目根目录无效: {}: {}", project_root.display(), e))?;
 
-    let canon = if must_exist {
-        target
-            .canonicalize()
+    // project_root 自己可能是 symlink。调用方把根本身(包括 `root/.`)作为
+    // target 时必须返回 canonical root;普通叶子只 canonicalize 父目录。
+    // 判断 root alias 时先看 lstat:项目内“指回根”的叶子 symlink
+    // 仍应保留为链接。
+    let target_is_root = target == project_root
+        || fs::symlink_metadata(target)
+            .ok()
+            .filter(|meta| !meta.file_type().is_symlink())
+            .and_then(|_| target.canonicalize().ok())
             .map(strip_verbatim_prefix)
-            .map_err(|e| anyhow!("路径不可访问: {}: {}", target.display(), e))?
+            .is_some_and(|candidate| candidate == root);
+    let canon = if target_is_root {
+        root.clone()
     } else {
         let parent = target
             .parent()
@@ -262,7 +274,34 @@ pub(crate) fn verify_under_project_root(
             root.display()
         );
     }
+    if must_exist {
+        fs::symlink_metadata(&canon)
+            .map_err(|e| anyhow!("路径不可访问: {}: {}", target.display(), e))?;
+    }
     Ok(canon)
+}
+
+/// 内容读取/目录遍历需要跟随叶子 symlink 时使用:先以“不跟随叶子”的
+/// 口径确认链接条目本身在项目内,再 canonicalize 目标并二次确认最终路径
+/// 仍在项目根内。
+fn verify_followed_under_project_root(project_root: &Path, target: &Path) -> Result<PathBuf> {
+    let leaf = verify_under_project_root(project_root, target, true)?;
+    let root = project_root
+        .canonicalize()
+        .map(strip_verbatim_prefix)
+        .map_err(|e| anyhow!("项目根目录无效: {}: {}", project_root.display(), e))?;
+    let followed = leaf
+        .canonicalize()
+        .map(strip_verbatim_prefix)
+        .map_err(|e| anyhow!("路径不可访问: {}: {}", target.display(), e))?;
+    if !followed.starts_with(&root) {
+        bail!(
+            "路径不在项目根目录内: {} (root={})",
+            followed.display(),
+            root.display()
+        );
+    }
+    Ok(followed)
 }
 
 /// 过滤出有效的目录路径（用于拖拽添加项目时验证）
@@ -273,7 +312,7 @@ pub fn filter_directories(paths: Vec<PathBuf>) -> Vec<PathBuf> {
 /// 列举目录:隐藏 [`ALWAYS_IGNORE`],其余按 .gitignore 打 `ignored` 标记(不隐藏),
 /// 排序为「目录优先 → 未忽略优先 → 名称自然序」。
 pub fn list_directory(project_root: &Path, path: &Path) -> Result<Vec<FileEntry>> {
-    let dir = verify_under_project_root(project_root, path, true)?;
+    let dir = verify_followed_under_project_root(project_root, path)?;
     if !dir.is_dir() {
         bail!("Not a directory: {}", path.display());
     }
@@ -319,7 +358,7 @@ pub struct FileContentResult {
 pub const MAX_FILE_VIEW_SIZE: u64 = 1_048_576; // 1MB
 
 pub fn read_file_content(project_root: &Path, path: &Path) -> Result<FileContentResult> {
-    let p = verify_under_project_root(project_root, path, true)?;
+    let p = verify_followed_under_project_root(project_root, path)?;
     if !p.is_file() {
         bail!("不是文件: {}", path.display());
     }
@@ -352,7 +391,7 @@ pub fn write_file_content(project_root: &Path, path: &Path, content: &str) -> Re
     if content.len() as u64 > MAX_FILE_VIEW_SIZE {
         bail!("内容过大(>1MB),拒绝写入");
     }
-    let p = verify_under_project_root(project_root, path, true)?;
+    let p = verify_followed_under_project_root(project_root, path)?;
     if !p.is_file() {
         bail!("不是文件: {}", path.display());
     }
@@ -362,16 +401,19 @@ pub fn write_file_content(project_root: &Path, path: &Path, content: &str) -> Re
 
 pub fn create_file(project_root: &Path, path: &Path) -> Result<()> {
     let p = verify_under_project_root(project_root, path, false)?;
-    if p.exists() {
+    if path_entry_exists(&p)? {
         bail!("已存在: {}", path.display());
     }
-    fs::write(&p, "")?;
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&p)?;
     Ok(())
 }
 
 pub fn create_directory(project_root: &Path, path: &Path) -> Result<()> {
     let p = verify_under_project_root(project_root, path, false)?;
-    if p.exists() {
+    if path_entry_exists(&p)? {
         bail!("已存在: {}", path.display());
     }
     fs::create_dir(&p)?;
@@ -387,27 +429,564 @@ pub fn rename_entry(project_root: &Path, old_path: &Path, new_name: &str) -> Res
     let new_path = parent.join(new_name);
     // new_name 可能含 `../` 等,必须再校验一遍新路径仍在 project_root 内
     let new_canon = verify_under_project_root(project_root, &new_path, false)?;
-    if new_canon.exists() {
+    if path_entry_exists(&new_canon)? {
         bail!("目标已存在: {}", new_canon.display());
     }
     fs::rename(&old_canon, &new_canon)?;
     Ok(new_canon)
 }
 
+/// 本地复制遇到同名目标时的落盘策略。`Skip` 由批处理层在调用本函数前
+/// 处理;这一层只负责两种真正会写盘的行为。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CopyConflictPolicy {
+    KeepBoth,
+    Overwrite,
+}
+
+/// 为文件或目录生成第一个尚未占用的 VS Code 风格副本路径。
+///
+/// 文件只把后缀插入最后一个扩展名前:`a.tar.gz` → `a.tar copy.gz`;
+/// 目录名不解析扩展:`folder.v1` → `folder.v1 copy`。存在性检查使用
+/// `symlink_metadata`,所以断链同样占用名称,不会被新文件意外跟随覆盖。
+pub fn keep_both_path(path: &Path, is_dir: bool) -> Result<PathBuf> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("无法获取父目录: {}", path.display()))?;
+    let name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("缺少文件名: {}", path.display()))?;
+
+    for copy_number in 1u64.. {
+        let candidate = parent.join(keep_both_name(name, is_dir, copy_number));
+        if !path_entry_exists(&candidate)? {
+            return Ok(candidate);
+        }
+    }
+    unreachable!("u64 副本序号耗尽")
+}
+
+/// 在同一个本地项目内递归复制一个文件或目录,返回实际目标路径。
+///
+/// - `KeepBoth`:同名时生成 ` copy` / ` copy 2` 路径;
+/// - `Overwrite`:文件使用 temp + backup-swap,目录与目录递归合并且保留
+///   目标独有项;
+/// - 叶子或树内 symlink、socket、FIFO、device 一律报 unsupported,绝不跟随。
+///
+/// 目录合并按条目提交,不是整棵树事务:中途 IO 失败时,此前成功的条目会
+/// 保留,调用方应把错误作为“部分完成”展示,不能宣称整批回滚。
+pub fn copy_entry(
+    project_root: &Path,
+    source: &Path,
+    destination: &Path,
+    policy: CopyConflictPolicy,
+) -> Result<PathBuf> {
+    let root = project_root
+        .canonicalize()
+        .map(strip_verbatim_prefix)
+        .map_err(|e| anyhow!("项目根目录无效: {}: {}", project_root.display(), e))?;
+    let source = verify_under_project_root(project_root, source, true)?;
+    let source_meta = fs::symlink_metadata(&source)
+        .with_context(|| format!("读取源条目失败: {}", source.display()))?;
+    if source == root {
+        bail!("不能复制项目根目录");
+    }
+    if source_meta.file_type().is_symlink() {
+        bail!("不支持复制符号链接: {}", source.display());
+    }
+    if !source_meta.is_dir() && !source_meta.is_file() {
+        bail!("不支持复制特殊文件: {}", source.display());
+    }
+
+    let requested_target = verify_under_project_root(project_root, destination, false)?;
+    let requested_exists = path_entry_exists(&requested_target)?;
+    ensure_copyable_tree(&source, &source_meta)?;
+
+    if policy == CopyConflictPolicy::KeepBoth {
+        let mut target = if requested_exists {
+            keep_both_path(&requested_target, source_meta.is_dir())?
+        } else {
+            requested_target.clone()
+        };
+        loop {
+            validate_copy_target(&root, &source, source_meta.is_dir(), &target)?;
+            match copy_entry_to_new(&source, &source_meta, &target) {
+                Ok(()) => return Ok(target),
+                Err(e) if error_is_already_exists(&e) => {
+                    // 列目录/选名之后的竞态由排他创建裁决;被抢占就重新生成
+                    // 下一后缀,不能把并发者的条目静默覆盖掉。
+                    target = keep_both_path(&requested_target, source_meta.is_dir())?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    validate_copy_target(&root, &source, source_meta.is_dir(), &requested_target)?;
+    if path_entry_exists(&requested_target)? {
+        overwrite_entry(&source, &source_meta, &requested_target)?;
+    } else {
+        match copy_entry_to_new(&source, &source_meta, &requested_target) {
+            Ok(()) => {}
+            Err(e) if error_is_already_exists(&e) => {
+                // 预检后出现的新冲突仍遵循 Overwrite,而不是随机报
+                // AlreadyExists。
+                overwrite_entry(&source, &source_meta, &requested_target)?;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(requested_target)
+}
+
+fn validate_copy_target(
+    root: &Path,
+    source: &Path,
+    source_is_dir: bool,
+    target: &Path,
+) -> Result<()> {
+    if target == root {
+        bail!("不能覆盖项目根目录");
+    }
+    if source == target {
+        bail!("源路径与目标路径相同: {}", source.display());
+    }
+    if source_is_dir && (target.starts_with(source) || source.starts_with(target)) {
+        bail!(
+            "源目录与目标目录不能互相包含: {} → {}",
+            source.display(),
+            target.display()
+        );
+    }
+    Ok(())
+}
+
+fn error_is_already_exists(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_error| io_error.kind() == std::io::ErrorKind::AlreadyExists)
+    })
+}
+
+fn keep_both_name(name: &OsStr, is_dir: bool, copy_number: u64) -> OsString {
+    let suffix = if copy_number == 1 {
+        " copy".to_string()
+    } else {
+        format!(" copy {copy_number}")
+    };
+
+    if is_dir {
+        let mut result = OsString::from(name);
+        result.push(suffix);
+        return result;
+    }
+
+    let name_path = Path::new(name);
+    let stem = name_path.file_stem().unwrap_or(name);
+    let mut result = OsString::from(stem);
+    result.push(suffix);
+    if let Some(extension) = name_path.extension() {
+        result.push(".");
+        result.push(extension);
+    }
+    result
+}
+
+fn path_entry_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e).with_context(|| format!("检查路径失败: {}", path.display())),
+    }
+}
+
+fn ensure_copyable_tree(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+    let current = fs::symlink_metadata(path)
+        .with_context(|| format!("读取源条目失败: {}", path.display()))?;
+    ensure_entry_unchanged(path, metadata, &current)?;
+    let file_type = current.file_type();
+    if file_type.is_symlink() {
+        bail!("不支持复制符号链接: {}", path.display());
+    }
+    if file_type.is_file() {
+        return Ok(());
+    }
+    if !file_type.is_dir() {
+        bail!("不支持复制特殊文件: {}", path.display());
+    }
+
+    let entries =
+        fs::read_dir(path).with_context(|| format!("读取目录失败: {}", path.display()))?;
+    let after_open = fs::symlink_metadata(path)
+        .with_context(|| format!("重新读取源目录失败: {}", path.display()))?;
+    ensure_entry_unchanged(path, &current, &after_open)?;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("读取目录项失败: {}", path.display()))?;
+        let current_parent = fs::symlink_metadata(path)
+            .with_context(|| format!("重新读取源目录失败: {}", path.display()))?;
+        ensure_entry_unchanged(path, &after_open, &current_parent)?;
+        let child = entry.path();
+        let child_meta = fs::symlink_metadata(&child)
+            .with_context(|| format!("读取源条目失败: {}", child.display()))?;
+        ensure_copyable_tree(&child, &child_meta)?;
+    }
+    Ok(())
+}
+
+fn copy_entry_to_new(source: &Path, source_meta: &fs::Metadata, target: &Path) -> Result<()> {
+    if source_meta.file_type().is_symlink() {
+        bail!("不支持复制符号链接: {}", source.display());
+    }
+    if !source_meta.is_dir() && !source_meta.is_file() {
+        bail!("不支持复制特殊文件: {}", source.display());
+    }
+    // 新建/KeepBoth 必须以排他创建为最终仲裁。标准库没有跨平台的
+    // rename-no-replace;先检查再 rename 在 Unix 会覆盖竞态创建的目标。
+    // 因此直接以 create_new/create_dir 创建最终路径,失败时由下层清理半成品。
+    if source_meta.is_dir() {
+        copy_directory_to_new(source, source_meta, target)
+    } else {
+        copy_regular_file_to_new(source, source_meta, target)
+    }
+}
+
+fn copy_regular_file_to_new(
+    source: &Path,
+    source_meta: &fs::Metadata,
+    target: &Path,
+) -> Result<()> {
+    if !source_meta.is_file() || source_meta.file_type().is_symlink() {
+        bail!("源条目不是普通文件: {}", source.display());
+    }
+    let before_open = fs::symlink_metadata(source)
+        .with_context(|| format!("重新读取源文件失败: {}", source.display()))?;
+    ensure_entry_unchanged(source, source_meta, &before_open)?;
+    let mut input = fs::File::open(source)
+        .with_context(|| format!("打开源文件失败: {}", source.display()))?;
+    let opened_meta = input
+        .metadata()
+        .with_context(|| format!("读取已打开源文件失败: {}", source.display()))?;
+    ensure_entry_unchanged(source, &before_open, &opened_meta)?;
+    let after_open = fs::symlink_metadata(source)
+        .with_context(|| format!("重新读取源文件失败: {}", source.display()))?;
+    ensure_entry_unchanged(source, &opened_meta, &after_open)?;
+    // `create_new` 成功后才进入清理分支;若并发者抢先占用 target,绝不能把
+    // 对方创建的文件当成自己的半成品删掉。
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(target)
+        .with_context(|| format!("创建目标文件失败: {}", target.display()))?;
+    let result = (|| -> Result<()> {
+        std::io::copy(&mut input, &mut output)
+            .with_context(|| format!("复制文件失败: {}", source.display()))?;
+        output
+            .flush()
+            .with_context(|| format!("刷新目标文件失败: {}", target.display()))?;
+        let _ = output.sync_all();
+        fs::set_permissions(target, source_meta.permissions())
+            .with_context(|| format!("复制文件权限失败: {}", target.display()))?;
+        Ok(())
+    })();
+    drop(output);
+    if result.is_err() {
+        let _ = fs::remove_file(target);
+    }
+    result
+}
+
+fn copy_directory_to_new(
+    source: &Path,
+    source_meta: &fs::Metadata,
+    target: &Path,
+) -> Result<()> {
+    if !source_meta.is_dir() || source_meta.file_type().is_symlink() {
+        bail!("源条目不是普通目录: {}", source.display());
+    }
+    fs::create_dir(target)
+        .with_context(|| format!("创建目标目录失败: {}", target.display()))?;
+    let result = (|| -> Result<()> {
+        let before_open = fs::symlink_metadata(source)
+            .with_context(|| format!("重新读取源目录失败: {}", source.display()))?;
+        ensure_entry_unchanged(source, source_meta, &before_open)?;
+        let entries = fs::read_dir(source)
+            .with_context(|| format!("读取目录失败: {}", source.display()))?;
+        let after_open = fs::symlink_metadata(source)
+            .with_context(|| format!("重新读取源目录失败: {}", source.display()))?;
+        ensure_entry_unchanged(source, &before_open, &after_open)?;
+        for entry in entries {
+            let entry =
+                entry.with_context(|| format!("读取目录项失败: {}", source.display()))?;
+            let current_parent = fs::symlink_metadata(source)
+                .with_context(|| format!("重新读取源目录失败: {}", source.display()))?;
+            ensure_entry_unchanged(source, &after_open, &current_parent)?;
+            let child_source = entry.path();
+            let child_target = target.join(entry.file_name());
+            let child_meta = fs::symlink_metadata(&child_source)
+                .with_context(|| format!("读取源条目失败: {}", child_source.display()))?;
+            if child_meta.is_dir() {
+                copy_directory_to_new(&child_source, &child_meta, &child_target)?;
+            } else if child_meta.is_file() {
+                copy_regular_file_to_new(&child_source, &child_meta, &child_target)?;
+            } else if child_meta.file_type().is_symlink() {
+                bail!("不支持复制符号链接: {}", child_source.display());
+            } else {
+                bail!("不支持复制特殊文件: {}", child_source.display());
+            }
+        }
+        fs::set_permissions(target, source_meta.permissions())
+            .with_context(|| format!("复制目录权限失败: {}", target.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(target);
+    }
+    result
+}
+
+/// 防止预检与实际打开之间的普通路径被替换成 symlink/另一条目。Unix 额外
+/// 比较 `(dev, ino)`;其他平台至少比较不跟随链接得到的条目类型。它不能
+/// 替代 OS 级 openat/no-follow capability,但能关闭普通并发替换窗口并保证
+/// 检测到的 symlink 永远不会进入复制读取。
+fn ensure_entry_unchanged(
+    path: &Path,
+    expected: &fs::Metadata,
+    actual: &fs::Metadata,
+) -> Result<()> {
+    let expected_type = expected.file_type();
+    let actual_type = actual.file_type();
+    if expected_type.is_symlink()
+        || actual_type.is_symlink()
+        || expected_type.is_dir() != actual_type.is_dir()
+        || expected_type.is_file() != actual_type.is_file()
+    {
+        bail!("文件操作期间条目发生变化或变为符号链接: {}", path.display());
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if expected.dev() != actual.dev() || expected.ino() != actual.ino() {
+            bail!("文件操作期间条目被替换: {}", path.display());
+        }
+    }
+    Ok(())
+}
+
+fn overwrite_entry(source: &Path, source_meta: &fs::Metadata, target: &Path) -> Result<()> {
+    let target_meta = fs::symlink_metadata(target)
+        .with_context(|| format!("读取目标条目失败: {}", target.display()))?;
+    if source_meta.is_dir() && target_meta.is_dir() && !target_meta.file_type().is_symlink() {
+        return merge_directories(source, source_meta, target, &target_meta);
+    }
+
+    let (staging_container, staging) = stage_entry(source, source_meta, target)?;
+    replace_with_backup(&staging, &staging_container, target)
+}
+
+fn stage_entry(
+    source: &Path,
+    source_meta: &fs::Metadata,
+    target: &Path,
+) -> Result<(PathBuf, PathBuf)> {
+    let container = create_unique_operation_dir(target, "copy")?;
+    let staging = container.join("entry");
+    let result = if source_meta.is_dir() {
+        copy_directory_to_new(source, source_meta, &staging)
+    } else {
+        copy_regular_file_to_new(source, source_meta, &staging)
+    };
+    if let Err(e) = result {
+        let _ = remove_path_no_follow(&container);
+        return Err(e);
+    }
+    Ok((container, staging))
+}
+
+fn merge_directories(
+    source: &Path,
+    expected_source: &fs::Metadata,
+    target: &Path,
+    expected_target: &fs::Metadata,
+) -> Result<()> {
+    let source_before = fs::symlink_metadata(source)
+        .with_context(|| format!("重新读取源目录失败: {}", source.display()))?;
+    ensure_entry_unchanged(source, expected_source, &source_before)?;
+    let target_before = fs::symlink_metadata(target)
+        .with_context(|| format!("重新读取目标目录失败: {}", target.display()))?;
+    ensure_entry_unchanged(target, expected_target, &target_before)?;
+    let entries =
+        fs::read_dir(source).with_context(|| format!("读取目录失败: {}", source.display()))?;
+    let source_after = fs::symlink_metadata(source)
+        .with_context(|| format!("重新读取源目录失败: {}", source.display()))?;
+    ensure_entry_unchanged(source, &source_before, &source_after)?;
+
+    for entry in entries {
+        let entry = entry.with_context(|| format!("读取目录项失败: {}", source.display()))?;
+        let current_source = fs::symlink_metadata(source)
+            .with_context(|| format!("重新读取源目录失败: {}", source.display()))?;
+        ensure_entry_unchanged(source, &source_after, &current_source)?;
+        let current_target = fs::symlink_metadata(target)
+            .with_context(|| format!("重新读取目标目录失败: {}", target.display()))?;
+        ensure_entry_unchanged(target, &target_before, &current_target)?;
+        let child_source = entry.path();
+        let child_target = target.join(entry.file_name());
+        let source_meta = fs::symlink_metadata(&child_source)
+            .with_context(|| format!("读取源条目失败: {}", child_source.display()))?;
+
+        if !path_entry_exists(&child_target)? {
+            copy_entry_to_new(&child_source, &source_meta, &child_target)?;
+            continue;
+        }
+
+        let target_meta = fs::symlink_metadata(&child_target)
+            .with_context(|| format!("读取目标条目失败: {}", child_target.display()))?;
+        if source_meta.is_dir()
+            && target_meta.is_dir()
+            && !target_meta.file_type().is_symlink()
+        {
+            merge_directories(
+                &child_source,
+                &source_meta,
+                &child_target,
+                &target_meta,
+            )?;
+        } else {
+            overwrite_entry(&child_source, &source_meta, &child_target)?;
+        }
+    }
+    Ok(())
+}
+
+fn unique_operation_path(target: &Path, kind: &str) -> Result<PathBuf> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let parent = target
+        .parent()
+        .ok_or_else(|| anyhow!("无法获取父目录: {}", target.display()))?;
+    let name = target
+        .file_name()
+        .ok_or_else(|| anyhow!("缺少文件名: {}", target.display()))?;
+    loop {
+        let seq = COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+        let mut candidate_name = OsString::from(".");
+        candidate_name.push(name);
+        candidate_name.push(format!(".mt-{kind}-{}-{seq}", std::process::id()));
+        let candidate = parent.join(candidate_name);
+        if !path_entry_exists(&candidate)? {
+            return Ok(candidate);
+        }
+    }
+}
+
+fn replace_with_backup(
+    staging: &Path,
+    staging_container: &Path,
+    target: &Path,
+) -> Result<()> {
+    let backup_container = match create_unique_operation_dir(target, "backup") {
+        Ok(path) => path,
+        Err(e) => {
+            let _ = remove_path_no_follow(staging_container);
+            return Err(e);
+        }
+    };
+    // container 由 create_dir 排他创建,其内部名称只归本次操作所有,避免
+    // `rename(target, backup)` 覆盖并发者抢占的同级 backup 路径。
+    let backup = backup_container.join("entry");
+    if let Err(e) = fs::rename(target, &backup) {
+        let _ = remove_path_no_follow(staging_container);
+        let _ = fs::remove_dir(&backup_container);
+        return Err(e).with_context(|| format!("备份既有目标失败: {}", target.display()));
+    }
+
+    if let Err(promote_error) = fs::rename(staging, target) {
+        let rollback_result = fs::rename(&backup, target);
+        let _ = remove_path_no_follow(staging_container);
+        if let Err(rollback_error) = rollback_result {
+            bail!(
+                "提交覆盖结果失败且恢复备份失败: {}: {}; rollback: {}; backup: {}",
+                target.display(),
+                promote_error,
+                rollback_error,
+                backup.display()
+            );
+        }
+        let _ = fs::remove_dir(&backup_container);
+        return Err(promote_error)
+            .with_context(|| format!("提交覆盖结果失败: {}", target.display()));
+    }
+
+    let staging_cleanup = fs::remove_dir(staging_container).err();
+    remove_path_no_follow(&backup)
+        .with_context(|| format!("覆盖成功但清理备份失败: {}", backup.display()))?;
+    fs::remove_dir(&backup_container)
+        .with_context(|| format!("清理备份目录失败: {}", backup_container.display()))?;
+    if let Some(e) = staging_cleanup {
+        return Err(e)
+            .with_context(|| format!("清理暂存目录失败: {}", staging_container.display()));
+    }
+    Ok(())
+}
+
+fn create_unique_operation_dir(target: &Path, kind: &str) -> Result<PathBuf> {
+    loop {
+        let candidate = unique_operation_path(target, kind)?;
+        match fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("创建操作目录失败: {}", candidate.display()));
+            }
+        }
+    }
+}
+
+fn remove_path_no_follow(path: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("读取待删除条目失败: {}", path.display()));
+        }
+    };
+
+    if metadata.file_type().is_symlink() {
+        // Unix 的目录 symlink 用 remove_file;Windows 目录 symlink 通常要求
+        // remove_dir。先走不跟随的 remove_file,失败后仅对 symlink 回退 remove_dir。
+        return match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(file_error) => fs::remove_dir(path).map_err(|dir_error| {
+                anyhow!(
+                    "删除符号链接失败: {}: {}; remove_dir: {}",
+                    path.display(),
+                    file_error,
+                    dir_error
+                )
+            }),
+        };
+    }
+    if metadata.is_dir() {
+        fs::remove_dir_all(path)?;
+    } else {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
 pub fn delete_entry(project_root: &Path, path: &Path) -> Result<()> {
     let target = verify_under_project_root(project_root, path, true)?;
     // 多一道保险:绝不允许删除项目根目录本身
-    // 必须同样剥掉 `\\?\`,否则与 verify_under_project_root 返回的 target 形式不一致
+    // 必须同样剥掉 `\\?\`,否则与 verify_under_project_root 返回的
+    // target 形式不一致
     let root = project_root.canonicalize().map(strip_verbatim_prefix)?;
     if target == root {
         bail!("不能删除项目根目录");
     }
-    if target.is_dir() {
-        fs::remove_dir_all(&target)?;
-    } else {
-        fs::remove_file(&target)?;
-    }
-    Ok(())
+    remove_path_no_follow(&target)
 }
 
 #[cfg(test)]
@@ -636,6 +1215,340 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    /// 大目录删除仍委托给平台递归原语；FileTree 会在提交后台任务前解除 watcher。
+    /// 这里用 5,000 个文件守住递归完整性，实际 UI 非阻塞由调用链结构保证。
+    #[test]
+    fn delete_entry_handles_directory_with_many_files() {
+        let (root, _) = make_test_project();
+        let large = root.join("large");
+        for directory_index in 0..50 {
+            let directory = large.join(format!("d{directory_index}"));
+            fs::create_dir_all(&directory).unwrap();
+            for file_index in 0..100 {
+                fs::write(directory.join(format!("f{file_index}.txt")), []).unwrap();
+            }
+        }
+
+        delete_entry(&root, &large).unwrap();
+
+        assert!(fs::symlink_metadata(&large).is_err());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_entry_removes_leaf_symlinks_without_touching_targets() {
+        use std::os::unix::fs::symlink;
+
+        let (root, inside_file) = make_test_project();
+        let inside_dir = root.join("inside-dir");
+        fs::create_dir(&inside_dir).unwrap();
+        fs::write(inside_dir.join("keep.txt"), "inside").unwrap();
+
+        let outside = std::env::temp_dir().join(format!(
+            "mini-term-fs-symlink-targets-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(outside.join("dir")).unwrap();
+        let outside_file = outside.join("file.txt");
+        fs::write(&outside_file, "outside").unwrap();
+        fs::write(outside.join("dir").join("keep.txt"), "outside-dir").unwrap();
+
+        let links = [
+            (root.join("inside-file-link"), inside_file.clone()),
+            (root.join("inside-dir-link"), inside_dir.clone()),
+            (root.join("outside-file-link"), outside_file.clone()),
+            (root.join("outside-dir-link"), outside.join("dir")),
+        ];
+        for (link, target) in &links {
+            symlink(target, link).unwrap();
+            let verified = verify_under_project_root(&root, link, true).unwrap();
+            assert_eq!(
+                verified.as_path(),
+                link.as_path(),
+                "校验不得把叶子链接替换成目标"
+            );
+            delete_entry(&root, link).unwrap();
+            assert!(
+                fs::symlink_metadata(link).is_err(),
+                "链接自身应被删除: {}",
+                link.display()
+            );
+            assert!(target.exists(), "链接目标必须保留: {}", target.display());
+        }
+        assert_eq!(fs::read_to_string(&inside_file).unwrap(), "hi");
+        assert_eq!(
+            fs::read_to_string(inside_dir.join("keep.txt")).unwrap(),
+            "inside"
+        );
+        assert_eq!(fs::read_to_string(&outside_file).unwrap(), "outside");
+        assert_eq!(
+            fs::read_to_string(outside.join("dir").join("keep.txt")).unwrap(),
+            "outside-dir"
+        );
+
+        fs::remove_dir_all(&root).ok();
+        fs::remove_dir_all(&outside).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_entry_rejects_leaf_and_nested_symlinks_without_following() {
+        use std::os::unix::fs::symlink;
+
+        let (root, inside_file) = make_test_project();
+        let leaf_link = root.join("leaf-link");
+        symlink(&inside_file, &leaf_link).unwrap();
+        let leaf_target = root.join("leaf-copy");
+        let err = copy_entry(
+            &root,
+            &leaf_link,
+            &leaf_target,
+            CopyConflictPolicy::KeepBoth,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("符号链接"));
+        assert!(!leaf_target.exists());
+        assert_eq!(fs::read_to_string(&inside_file).unwrap(), "hi");
+
+        let source_dir = root.join("source-with-link");
+        fs::create_dir(&source_dir).unwrap();
+        fs::write(source_dir.join("regular.txt"), "regular").unwrap();
+        symlink(&inside_file, source_dir.join("nested-link")).unwrap();
+        let directory_target = root.join("directory-copy");
+        let err = copy_entry(
+            &root,
+            &source_dir,
+            &directory_target,
+            CopyConflictPolicy::KeepBoth,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("符号链接"));
+        assert!(
+            fs::symlink_metadata(&directory_target).is_err(),
+            "预检失败时不应创建部分目标"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn content_read_rejects_leaf_symlink_that_escapes_project() {
+        use std::os::unix::fs::symlink;
+
+        let (root, _) = make_test_project();
+        let outside = std::env::temp_dir().join(format!(
+            "mini-term-fs-read-link-target-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&outside, "secret").unwrap();
+        let link = root.join("outside-link");
+        symlink(&outside, &link).unwrap();
+
+        let err = read_file_content(&root, &link).unwrap_err().to_string();
+        assert!(err.contains("不在项目根目录内"));
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "secret");
+
+        fs::remove_dir_all(&root).ok();
+        fs::remove_file(&outside).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_symlink_counts_as_existing_and_can_be_deleted() {
+        use std::os::unix::fs::symlink;
+
+        let (root, _) = make_test_project();
+        let missing_target = root.join("missing-target");
+        let link = root.join("broken-link");
+        symlink(&missing_target, &link).unwrap();
+
+        let err = create_file(&root, &link).unwrap_err().to_string();
+        assert!(err.contains("已存在"));
+        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert!(!missing_target.exists());
+
+        delete_entry(&root, &link).unwrap();
+        assert!(fs::symlink_metadata(&link).is_err());
+        assert!(!missing_target.exists());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn keep_both_path_uses_copy_suffix_and_last_extension() {
+        let (root, _) = make_test_project();
+        let report = root.join("report.txt");
+        fs::write(&report, "one").unwrap();
+        fs::write(root.join("report copy.txt"), "two").unwrap();
+        assert_eq!(
+            keep_both_path(&report, false).unwrap(),
+            root.join("report copy 2.txt")
+        );
+
+        let archive = root.join("archive.tar.gz");
+        fs::write(&archive, "archive").unwrap();
+        assert_eq!(
+            keep_both_path(&archive, false).unwrap(),
+            root.join("archive.tar copy.gz")
+        );
+
+        let dot_file = root.join(".env");
+        fs::write(&dot_file, "env").unwrap();
+        assert_eq!(
+            keep_both_path(&dot_file, false).unwrap(),
+            root.join(".env copy")
+        );
+
+        let dotted_dir = root.join("folder.v1");
+        fs::create_dir(&dotted_dir).unwrap();
+        assert_eq!(
+            keep_both_path(&dotted_dir, true).unwrap(),
+            root.join("folder.v1 copy")
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn copy_entry_keep_both_recursively_copies_directory() {
+        let (root, _) = make_test_project();
+        let source = root.join("source");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::write(source.join("top.txt"), "top").unwrap();
+        fs::write(source.join("nested").join("deep.txt"), "deep").unwrap();
+
+        let actual = copy_entry(
+            &root,
+            &source,
+            &source,
+            CopyConflictPolicy::KeepBoth,
+        )
+        .unwrap();
+        assert_eq!(actual, root.join("source copy"));
+        assert_eq!(fs::read_to_string(actual.join("top.txt")).unwrap(), "top");
+        assert_eq!(
+            fs::read_to_string(actual.join("nested").join("deep.txt")).unwrap(),
+            "deep"
+        );
+        assert!(operation_artifacts(&root).is_empty());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn copy_entry_overwrites_file_via_backup_swap() {
+        let (root, _) = make_test_project();
+        let source = root.join("source.txt");
+        let target = root.join("target.txt");
+        fs::write(&source, "new-content").unwrap();
+        fs::write(&target, "old-content").unwrap();
+
+        let actual = copy_entry(
+            &root,
+            &source,
+            &target,
+            CopyConflictPolicy::Overwrite,
+        )
+        .unwrap();
+        assert_eq!(actual, target);
+        assert_eq!(fs::read_to_string(&source).unwrap(), "new-content");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new-content");
+        assert!(operation_artifacts(&root).is_empty());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn backup_swap_restores_original_when_promote_fails() {
+        let (root, _) = make_test_project();
+        let target = root.join("target.txt");
+        let staging_container = create_unique_operation_dir(&target, "copy").unwrap();
+        let missing_staging = staging_container.join("missing-entry");
+        fs::write(&target, "original").unwrap();
+
+        let err = replace_with_backup(&missing_staging, &staging_container, &target)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("提交覆盖结果失败"));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "original");
+        assert!(operation_artifacts(&root).is_empty());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn copy_entry_overwrite_merges_directories_and_preserves_target_only_items() {
+        let (root, _) = make_test_project();
+        let source = root.join("source");
+        let target = root.join("target");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::create_dir_all(target.join("nested")).unwrap();
+        fs::write(source.join("common.txt"), "source-common").unwrap();
+        fs::write(source.join("source-only.txt"), "source-only").unwrap();
+        fs::write(source.join("nested").join("common.txt"), "source-nested").unwrap();
+        fs::write(target.join("common.txt"), "target-common").unwrap();
+        fs::write(target.join("target-only.txt"), "target-only").unwrap();
+        fs::write(target.join("nested").join("common.txt"), "target-nested").unwrap();
+        fs::write(target.join("nested").join("target-only.txt"), "keep").unwrap();
+
+        copy_entry(
+            &root,
+            &source,
+            &target,
+            CopyConflictPolicy::Overwrite,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(target.join("common.txt")).unwrap(),
+            "source-common"
+        );
+        assert_eq!(
+            fs::read_to_string(target.join("source-only.txt")).unwrap(),
+            "source-only"
+        );
+        assert_eq!(
+            fs::read_to_string(target.join("target-only.txt")).unwrap(),
+            "target-only"
+        );
+        assert_eq!(
+            fs::read_to_string(target.join("nested").join("common.txt")).unwrap(),
+            "source-nested"
+        );
+        assert_eq!(
+            fs::read_to_string(target.join("nested").join("target-only.txt")).unwrap(),
+            "keep"
+        );
+        assert!(operation_artifacts(&root).is_empty());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn copy_entry_overwrite_replaces_conflicting_entry_type() {
+        let (root, _) = make_test_project();
+        let source = root.join("source.txt");
+        let target = root.join("target");
+        fs::write(&source, "replacement").unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("old.txt"), "old").unwrap();
+
+        copy_entry(
+            &root,
+            &source,
+            &target,
+            CopyConflictPolicy::Overwrite,
+        )
+        .unwrap();
+        assert!(target.is_file());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "replacement");
+        assert!(operation_artifacts(&root).is_empty());
+        fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn delete_entry_rejects_path_outside_project() {
         let (root, _) = make_test_project();
@@ -665,6 +1578,39 @@ mod tests {
         assert!(err.contains("不能删除项目根目录"));
         assert!(root.exists(), "项目根目录不应被删除");
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn delete_entry_rejects_project_root_dot_alias() {
+        let (root, _) = make_test_project();
+        let err = delete_entry(&root, &root.join(".")).unwrap_err().to_string();
+        assert!(err.contains("不能删除项目根目录"));
+        assert!(root.exists());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    fn operation_artifacts(dir: &Path) -> Vec<PathBuf> {
+        fn collect(dir: &Path, result: &mut Vec<PathBuf>) {
+            for entry in fs::read_dir(dir).unwrap().filter_map(|entry| entry.ok()) {
+                let path = entry.path();
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.contains(".mt-copy-") || name.contains(".mt-backup-") {
+                    result.push(path);
+                    continue;
+                }
+                if fs::symlink_metadata(&path)
+                    .ok()
+                    .is_some_and(|metadata| metadata.is_dir())
+                {
+                    collect(&path, result);
+                }
+            }
+        }
+
+        let mut result = Vec::new();
+        collect(dir, &mut result);
+        result
     }
 
     #[test]

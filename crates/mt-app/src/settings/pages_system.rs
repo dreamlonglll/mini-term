@@ -4,12 +4,14 @@
 //! about 页的版本比较与 GitHub 查询在 [`crate::update_check`],这里只有那颗
 //! 「检查更新」按钮的后台任务与结果渲染。
 
+use std::path::PathBuf;
+
 use gpui::{
     AnyElement, App, Context, InteractiveElement, IntoElement, ParentElement, PathPromptOptions,
     SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
 };
 use gpui_component::input::Input;
-use mt_config::EditorConfig;
+use mt_config::{AppConfig, EditorConfig};
 
 use crate::hotkeys;
 use crate::i18n::{t, tr};
@@ -23,14 +25,75 @@ use super::widgets::{
     toggle_row,
 };
 
+#[derive(Debug, PartialEq, Eq)]
+enum DownloadDirUpdate {
+    Keep,
+    Set(String),
+}
+
+/// 目录选择的纯状态归约：取消和无效结果都不得覆盖上一个有效配置。
+fn reduce_download_dir_selection(
+    selection: Option<Result<String, String>>,
+) -> (DownloadDirUpdate, Option<String>) {
+    match selection {
+        None => (DownloadDirUpdate::Keep, None),
+        Some(Ok(path)) => (DownloadDirUpdate::Set(path), None),
+        Some(Err(error)) => (DownloadDirUpdate::Keep, Some(error)),
+    }
+}
+
 impl SettingsView {
     // ── system 页 ──
 
     pub(super) fn render_system_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let config = self.store.read(cx).config();
-        let tray = config.tray_status_enabled.unwrap_or(true);
-        let click_focus = config.tray_click_focus.unwrap_or(true);
-        let auto_resume = config.ai_auto_resume.unwrap_or(true);
+        let (
+            tray,
+            click_focus,
+            auto_resume,
+            download_dir_custom,
+            download_dir_path,
+            download_dir_validation_path,
+            download_dir_resolve_error,
+        ) = {
+            let config = self.store.read(cx).config();
+            let (path, validation_path, error) = match config.resolved_download_dir() {
+                Ok(path) => (
+                    path.to_string_lossy().into_owned(),
+                    Some(path),
+                    None,
+                ),
+                Err(err) => (
+                    "—".into(),
+                    None,
+                    Some(format!(
+                        "{}: {err:#}",
+                        t("settings", "system.downloadDirectoryInvalid")
+                    )),
+                ),
+            };
+            (
+                config.tray_status_enabled.unwrap_or(true),
+                config.tray_click_focus.unwrap_or(true),
+                config.ai_auto_resume.unwrap_or(true),
+                config.download_dir.is_some(),
+                path,
+                validation_path,
+                error,
+            )
+        };
+        if let Some(path) = download_dir_validation_path {
+            let key = path.to_string_lossy().into_owned();
+            if !self.download_dir_busy
+                && self.download_dir_validation_key.as_deref() != Some(key.as_str())
+            {
+                self.start_download_dir_validation(path, key, cx);
+            }
+        }
+        let download_dir_error = self
+            .download_dir_error
+            .clone()
+            .or(download_dir_resolve_error);
+        let download_dir_busy = self.download_dir_busy;
 
         page_root()
             .child(
@@ -85,7 +148,246 @@ impl SettingsView {
                 },
                 cx,
             )))
+            .child(
+                section("system.downloadDirectoryGroup")
+                    .child(
+                        ui::setting_row(
+                            t("settings", "system.downloadDirectoryTitle"),
+                            Some(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(4.0))
+                                    .child(ui::desc_text(t(
+                                        "settings",
+                                        "system.downloadDirectoryDesc",
+                                    )))
+                                    .child(
+                                        div()
+                                            .pt(px(4.0))
+                                            .text_size(ui::font_px(11.0))
+                                            .text_color(ui::text_secondary())
+                                            .child(format!(
+                                                "{}: {download_dir_path}",
+                                                t(
+                                                    "settings",
+                                                    "system.downloadDirectoryCurrent"
+                                                )
+                                            )),
+                                    )
+                                    .into_any_element(),
+                            ),
+                            false,
+                            div()
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(
+                                    ui::primary_button(
+                                        "download-dir-choose",
+                                        if download_dir_busy {
+                                            t("settings", "system.downloadDirectoryChoosing")
+                                        } else {
+                                            t("settings", "system.downloadDirectoryChoose")
+                                        },
+                                    )
+                                    .when(download_dir_busy, |el| el.opacity(0.5))
+                                    .when(!download_dir_busy, |el| {
+                                        el.on_click(cx.listener(|this, _, _window, cx| {
+                                            this.browse_download_dir(cx)
+                                        }))
+                                    }),
+                                )
+                                .when(download_dir_custom, |el| {
+                                    el.child(
+                                        ui::ghost_button(
+                                            "download-dir-reset",
+                                            t("settings", "system.downloadDirectoryReset"),
+                                        )
+                                        .when(download_dir_busy, |el| el.opacity(0.5))
+                                        .when(!download_dir_busy, |el| {
+                                            el.on_click(cx.listener(|this, _, _window, cx| {
+                                                this.restore_default_download_dir(cx)
+                                            }))
+                                        }),
+                                    )
+                                }),
+                        ),
+                    )
+                    .when_some(download_dir_error, |el, err| {
+                        el.child(banner(err, ui::color_error()))
+                    }),
+            )
             .into_any_element()
+    }
+
+    fn start_download_dir_validation(
+        &mut self,
+        path: PathBuf,
+        key: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.download_dir_busy = true;
+        self.download_dir_error = None;
+        self.download_dir_validation_key = Some(key.clone());
+        self._download_dir_job = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    AppConfig::validate_download_dir(&path).map_err(|error| format!("{error:#}"))
+                })
+                .await;
+            let _ = this.update(cx, |this: &mut SettingsView, cx| {
+                let current_key = this
+                    .store
+                    .read(cx)
+                    .config()
+                    .resolved_download_dir()
+                    .ok()
+                    .map(|path| path.to_string_lossy().into_owned());
+                if current_key.as_deref() != Some(key.as_str()) {
+                    this.download_dir_busy = false;
+                    this.download_dir_validation_key = None;
+                    cx.notify();
+                    return;
+                }
+                this.download_dir_busy = false;
+                this.download_dir_error = result.err().map(|detail| {
+                    format!(
+                        "{}: {detail}",
+                        t("settings", "system.downloadDirectoryInvalid")
+                    )
+                });
+                cx.notify();
+            });
+        }));
+    }
+
+    fn browse_download_dir(&mut self, cx: &mut Context<Self>) {
+        if self.download_dir_busy {
+            return;
+        }
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some(t("settings", "system.downloadDirectoryDialogTitle").into()),
+        });
+        self.download_dir_busy = true;
+        self.download_dir_error = None;
+        cx.notify();
+
+        self._download_dir_job = Some(cx.spawn(async move |this, cx| {
+            let paths = match paths.await {
+                Ok(Ok(Some(paths))) => paths,
+                Ok(Ok(None)) => {
+                    let _ = this.update(cx, |this: &mut SettingsView, cx| {
+                        this.finish_download_dir_selection(None, cx);
+                    });
+                    return;
+                }
+                Ok(Err(err)) => {
+                    let detail = err.to_string();
+                    let _ = this.update(cx, |this: &mut SettingsView, cx| {
+                        this.finish_download_dir_selection(Some(Err(detail)), cx);
+                    });
+                    return;
+                }
+                Err(err) => {
+                    let detail = err.to_string();
+                    let _ = this.update(cx, |this: &mut SettingsView, cx| {
+                        this.finish_download_dir_selection(Some(Err(detail)), cx);
+                    });
+                    return;
+                }
+            };
+            let Some(path) = paths.into_iter().next() else {
+                let _ = this.update(cx, |this: &mut SettingsView, cx| {
+                    this.finish_download_dir_selection(None, cx);
+                });
+                return;
+            };
+
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let Some(text) = path.to_str().map(str::to_owned) else {
+                        return Err("selected path is not valid UTF-8".to_string());
+                    };
+                    AppConfig::validate_download_dir(&path)
+                        .map_err(|err| format!("{err:#}"))?;
+                    Ok(text)
+                })
+                .await;
+            let _ = this.update(cx, |this: &mut SettingsView, cx| {
+                this.finish_download_dir_selection(Some(result), cx);
+            });
+        }));
+    }
+
+    fn finish_download_dir_selection(
+        &mut self,
+        selection: Option<Result<String, String>>,
+        cx: &mut Context<Self>,
+    ) {
+        let (update, error) = reduce_download_dir_selection(selection);
+        self.download_dir_busy = false;
+        self.download_dir_error = error.map(|detail| {
+            format!(
+                "{}: {detail}",
+                t("settings", "system.downloadDirectoryInvalid")
+            )
+        });
+        if let DownloadDirUpdate::Set(path) = update {
+            self.download_dir_validation_key = Some(path.clone());
+            self.store.update(cx, |store, cx| {
+                store.patch_config(|config| config.download_dir = Some(path), cx)
+            });
+        }
+        cx.notify();
+    }
+
+    fn restore_default_download_dir(&mut self, cx: &mut Context<Self>) {
+        if self.download_dir_busy {
+            return;
+        }
+        self.download_dir_busy = true;
+        self.download_dir_error = None;
+        cx.notify();
+        self._download_dir_job = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let path = AppConfig::system_download_dir().map_err(|error| format!("{error:#}"))?;
+                    std::fs::create_dir_all(&path).map_err(|error| {
+                        format!("无法创建下载目录 {}: {error}", path.display())
+                    })?;
+                    AppConfig::validate_download_dir(&path)
+                        .map_err(|error| format!("{error:#}"))?;
+                    Ok::<String, String>(path.to_string_lossy().into_owned())
+                })
+                .await;
+            let _ = this.update(cx, |this: &mut SettingsView, cx| {
+                this.download_dir_busy = false;
+                match result {
+                    Ok(path) => {
+                        this.download_dir_error = None;
+                        this.download_dir_validation_key = Some(path);
+                        this.store.update(cx, |store, cx| {
+                            store.patch_config(|config| config.download_dir = None, cx)
+                        });
+                    }
+                    Err(detail) => {
+                        this.download_dir_error = Some(format!(
+                            "{}: {detail}",
+                            t("settings", "system.downloadDirectoryInvalid")
+                        ));
+                    }
+                }
+                cx.notify();
+            });
+        }));
     }
 
     // ── editor 页 ──
@@ -549,5 +851,29 @@ impl SettingsView {
             })
             .child(ui::hint(t("settings", "about.footer")))
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn download_dir_selection_only_updates_for_valid_choice() {
+        assert_eq!(
+            reduce_download_dir_selection(None),
+            (DownloadDirUpdate::Keep, None)
+        );
+        assert_eq!(
+            reduce_download_dir_selection(Some(Err("not writable".into()))),
+            (
+                DownloadDirUpdate::Keep,
+                Some("not writable".to_string())
+            )
+        );
+        assert_eq!(
+            reduce_download_dir_selection(Some(Ok("/downloads".into()))),
+            (DownloadDirUpdate::Set("/downloads".into()), None)
+        );
     }
 }

@@ -47,7 +47,8 @@
 //! [`find_connection`],它是纯函数、有单测。
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -59,12 +60,19 @@ use mt_ai::sessions::{
 };
 use mt_config::SshConnection;
 use mt_project::fs::{ALWAYS_IGNORE, FileEntry, TextGitignore, natural_cmp};
-use mt_ssh::{CachedSession, SftpHandle, SshPool};
+use mt_ssh::{
+    CachedSession, SftpHandle, SftpNodeKind, SshPool, run_bounded_exec_on_session,
+};
 
 /// SFTP 协议层每请求超时(readdir / stat / 单个 read 包)。
 /// 默认仅 10s 且逐请求计时(见 spec/backend/russh-sftp-file-transfer.md 坑 1),
 /// 这里放宽到 20s 覆盖慢链路;整体不设长窗口——只读操作单包粒度小。
 const SFTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const REMOTE_DELETE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const REMOTE_DELETE_EXEC_TIMEOUT: Duration = Duration::from_secs(70);
+const REMOTE_DELETE_SERVER_TIMEOUT_SECS: u64 = 60;
+const REMOTE_DELETE_OUTPUT_CAP: usize = 16 * 1024;
+static LOCAL_TRANSFER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// 建立(或复用)SSH session 的外层超时:TCP 连接 + 握手 + 认证。
 const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
 /// 粘贴上传的**单请求**超时(`run_sftp_upload_on_session` 把它转成
@@ -289,24 +297,24 @@ async fn acquire_session(
 /// transport 级失败(死链 race)evict + 重连再试一次,与 mt-ssh-mcp 的
 /// exec/transfer 编排同构。
 ///
-/// 需要 session 的场景只有上传(`run_sftp_upload_on_session` 自己另开 channel,
-/// 但要拿同一条已认证 session);只读场景用下面的 [`open_sftp`] 丢掉它即可。
+/// `SftpHandle` 自己持有活动 lease，长操作期间 reaper/LRU 不会断开它；额外返回
+/// session 只供仍需在同一认证连接上另开 channel 的旧调用点使用。
 async fn open_sftp_with_session(
     st: &RemoteSshState,
     conn: &SshConnection,
 ) -> Result<(Arc<CachedSession>, SftpHandle), String> {
     let pool = st.pool();
     let session = acquire_session(&pool, conn).await?;
-    match SftpHandle::open_on_session(&session, SFTP_REQUEST_TIMEOUT).await {
+    match SftpHandle::open_on_session(session.clone(), SFTP_REQUEST_TIMEOUT).await {
         Ok(h) => {
             session.touch();
             Ok((session, h))
         }
         Err(e) if e.is_transport() => {
             eprintln!("[remote-ssh] sftp open failed (transport), retrying once: {e}");
-            pool.evict(&conn.id).await;
+            pool.evict_if_same(&conn.id, &session).await;
             let session2 = acquire_session(&pool, conn).await?;
-            let h = SftpHandle::open_on_session(&session2, SFTP_REQUEST_TIMEOUT)
+            let h = SftpHandle::open_on_session(session2.clone(), SFTP_REQUEST_TIMEOUT)
                 .await
                 .map_err(|e| e.message().to_string())?;
             session2.touch();
@@ -316,7 +324,7 @@ async fn open_sftp_with_session(
     }
 }
 
-/// 开一个 SFTP 会话句柄(只读路径用,不需要 session 本身)。
+/// 开一个 SFTP 会话句柄；句柄内部持有 session lease。
 async fn open_sftp(st: &RemoteSshState, conn: &SshConnection) -> Result<SftpHandle, String> {
     Ok(open_sftp_with_session(st, conn).await?.1)
 }
@@ -414,6 +422,21 @@ pub fn join_posix(dir: &str, name: &str) -> String {
     }
 }
 
+/// POSIX 路径父目录；不使用宿主平台 `Path`，因此远端文件名里的反斜杠不会在
+/// Windows 客户端上被误当成分隔符。
+pub fn parent_posix(path: &str) -> Option<String> {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() || trimmed == "/" {
+        return None;
+    }
+    let index = trimmed.rfind('/')?;
+    Some(if index == 0 {
+        "/".into()
+    } else {
+        trimmed[..index].to_string()
+    })
+}
+
 /// 计算 `full` 相对 `root` 的 POSIX 相对路径。不在 root 下返回 None。
 /// **匹配 gitignore 必须用相对路径**:Windows 的 `Path` 语义对 POSIX 绝对路径
 /// 有歧义(`/a/b` 在 Windows 上不是绝对路径),相对路径两平台行为一致。
@@ -431,6 +454,186 @@ pub fn posix_relative(root: &str, full: &str) -> Option<String> {
         .strip_prefix(root_t)
         .and_then(|rest| rest.strip_prefix('/'))
         .map(str::to_string)
+}
+
+/// 上传/下载冲突的用户选择。一次批处理内对所有剩余冲突沿用同一策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileConflictStrategy {
+    Skip,
+    Overwrite,
+    KeepBoth,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FileOperationSummary {
+    pub completed: usize,
+    pub skipped: usize,
+    pub failed: usize,
+    pub bytes: u64,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteDirectoryEntry {
+    pub name: String,
+    pub path: String,
+    pub is_symlink: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteDirectoryListing {
+    pub canonical_path: String,
+    pub directories: Vec<RemoteDirectoryEntry>,
+}
+
+fn valid_remote_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
+}
+
+fn split_posix_leaf(path: &str) -> Result<(&str, &str), String> {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() || trimmed == "/" {
+        return Err("远程根目录不能作为文件条目操作".into());
+    }
+    let index = trimmed
+        .rfind('/')
+        .ok_or_else(|| format!("远程路径必须是绝对路径: {path}"))?;
+    let parent = if index == 0 { "/" } else { &trimmed[..index] };
+    let name = &trimmed[index + 1..];
+    if !valid_remote_name(name) {
+        return Err(format!("远程文件名无效: {name}"));
+    }
+    Ok((parent, name))
+}
+
+fn normalize_absolute_posix(path: &str) -> Result<String, String> {
+    if !path.starts_with('/') {
+        return Err(format!("远程路径必须是绝对路径: {path}"));
+    }
+    let mut segments = Vec::new();
+    for segment in path.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => return Err(format!("远程路径不能包含 `..`: {path}")),
+            value if value.contains('\0') => return Err("远程路径不能包含 NUL".into()),
+            value => segments.push(value),
+        }
+    }
+    if segments.is_empty() {
+        Ok("/".into())
+    } else {
+        Ok(format!("/{}", segments.join("/")))
+    }
+}
+
+async fn canonical_project_root(
+    sftp: &SftpHandle,
+    project_root: &str,
+) -> Result<String, String> {
+    let normalized = normalize_absolute_posix(project_root)?;
+    sftp.canonicalize(&normalized)
+        .await
+        .map_err(|e| format!("远程项目根不可访问: {}", e.message()))
+}
+
+async fn validate_remote_dir_under_root(
+    sftp: &SftpHandle,
+    project_root: &str,
+    dir: &str,
+) -> Result<String, String> {
+    let root = canonical_project_root(sftp, project_root).await?;
+    let normalized = normalize_absolute_posix(dir)?;
+    let canonical = sftp
+        .canonicalize(&normalized)
+        .await
+        .map_err(|e| format!("远程目录不可访问: {}", e.message()))?;
+    if posix_relative(&root, &canonical).is_none() {
+        return Err(format!("远程目录超出项目范围: {canonical}"));
+    }
+    let is_dir = sftp
+        .is_dir(&canonical)
+        .await
+        .map_err(|e| format!("远程目录不可访问: {}", e.message()))?;
+    if !is_dir {
+        return Err(format!("远程路径不是目录: {canonical}"));
+    }
+    Ok(canonical)
+}
+
+async fn validate_remote_leaf_under_root(
+    sftp: &SftpHandle,
+    project_root: &str,
+    path: &str,
+) -> Result<String, String> {
+    let root = canonical_project_root(sftp, project_root).await?;
+    validate_remote_leaf_against_root(sftp, &root, path).await
+}
+
+async fn validate_remote_leaf_against_root(
+    sftp: &SftpHandle,
+    canonical_root: &str,
+    path: &str,
+) -> Result<String, String> {
+    let normalized = normalize_absolute_posix(path)?;
+    if normalized == canonical_root {
+        return Err("不能操作远程项目根目录".into());
+    }
+    let (parent, name) = split_posix_leaf(&normalized)?;
+    let canonical_parent = sftp
+        .canonicalize(parent)
+        .await
+        .map_err(|e| format!("远程父目录不可访问: {}", e.message()))?;
+    if posix_relative(canonical_root, &canonical_parent).is_none() {
+        return Err(format!("远程路径超出项目范围: {normalized}"));
+    }
+    Ok(join_posix(&canonical_parent, name))
+}
+
+/// VS Code 风格的同名副本名。目录与文件共用，文件保留最后一个扩展名。
+pub fn keep_both_name(name: &str, ordinal: usize) -> String {
+    let suffix = if ordinal <= 1 {
+        " copy".to_string()
+    } else {
+        format!(" copy {ordinal}")
+    };
+    if name.starts_with('.') && !name[1..].contains('.') {
+        return format!("{name}{suffix}");
+    }
+    match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && !ext.is_empty() => {
+            format!("{stem}{suffix}.{ext}")
+        }
+        _ => format!("{name}{suffix}"),
+    }
+}
+
+async fn keep_both_remote_path(
+    sftp: &SftpHandle,
+    desired: &str,
+) -> Result<String, String> {
+    let (parent, name) = split_posix_leaf(desired)?;
+    let existing: HashSet<String> = sftp
+        .read_dir(parent)
+        .await
+        .map_err(|e| format!("读取远程目录失败: {}", e.message()))?
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect();
+    if !existing.contains(name) {
+        return Ok(desired.to_string());
+    }
+    for ordinal in 1..=10_000 {
+        let candidate = keep_both_name(name, ordinal);
+        if !existing.contains(&candidate) {
+            return Ok(join_posix(parent, &candidate));
+        }
+    }
+    Err(format!("无法为远程条目生成可用副本名: {desired}"))
 }
 
 /// 把 `~` / `~/xxx` 展开为远程绝对路径(home 来自 SFTP canonicalize(".")).
@@ -605,6 +808,7 @@ fn parse_codex_thread_names(content: &str) -> HashMap<String, String> {
 ///
 /// 忽略过滤 = 项目根 `.gitignore`(读一次、按 connId+projectRoot 缓存)
 /// + [`ALWAYS_IGNORE`] 固定黑名单(目录直接隐藏)。
+///
 /// `refresh_ignore=true` 强制重读 .gitignore(树顶手动刷新按钮用)。
 ///
 /// **阻塞**,丢 `background_executor`。
@@ -648,6 +852,11 @@ pub fn list_directory(
             let mut out: Vec<FileEntry> = entries
                 .into_iter()
                 .filter_map(|e| {
+                    // FileTree 目前用宿主 `PathBuf` 承载远程路径；反斜杠在 Windows
+                    // 会被解释成分隔符，因此无法无损、安全地操作这类远程名称。
+                    if !valid_remote_name(&e.name) {
+                        return None;
+                    }
                     // ALWAYS_IGNORE 目录完全隐藏(与本地树一致)
                     if e.is_dir && ALWAYS_IGNORE.contains(&e.name.as_str()) {
                         return None;
@@ -688,8 +897,8 @@ pub fn list_directory(
 /// 断链时是 `None`)就能共用同一段加载代码 —— 分流判据只有这一处,不会出现
 /// 「树顶刷新走了本地、展开子目录走了远程」这类半截状态。
 ///
-/// **断链**(项目其实是远程项目但连接已被删)会传进 `None`,于是去读本地的
-/// 同名路径并失败报错 —— 与原版一致(`FileTree.tsx` 那边同样只看得到 undefined)。
+/// 断链项目由 FileTree 在进入此分流函数前拦住，绝不会把远程 POSIX 路径当成本机
+/// 路径读取。
 ///
 /// **阻塞**,丢 `background_executor`。
 pub fn list_directory_for(
@@ -744,6 +953,1750 @@ pub fn validate_dir(conn: &SshConnection, path: &str) -> Result<String, String> 
                 return Err(format!("远程路径不是目录: {canonical}"));
             }
             Ok(canonical)
+        }
+        .await;
+        sftp.close().await;
+        result
+    })
+}
+
+/// 为“新建远程项目”提供的轻量目录浏览；不应用项目 `.gitignore` 或固定隐藏目录。
+/// **阻塞**,调用方必须放到 background executor。
+pub fn browse_directory(
+    conn: &SshConnection,
+    requested_path: &str,
+) -> Result<RemoteDirectoryListing, String> {
+    let st = state();
+    st.block_on(async move {
+        let sftp = open_sftp(st, conn).await?;
+        let result = async {
+            let trimmed = requested_path.trim();
+            let expanded = if trimmed.is_empty() || trimmed == "~" || trimmed.starts_with("~/") {
+                let home = remote_home(st, &sftp, &conn.id).await?;
+                expand_tilde(trimmed, &home)
+            } else {
+                trimmed.to_string()
+            };
+            let canonical = sftp
+                .canonicalize(&expanded)
+                .await
+                .map_err(|e| format!("远程路径无效: {}", e.message()))?;
+            if !sftp
+                .is_dir(&canonical)
+                .await
+                .map_err(|e| format!("远程路径不可访问: {}", e.message()))?
+            {
+                return Err(format!("远程路径不是目录: {canonical}"));
+            }
+            let entries = sftp
+                .read_dir(&canonical)
+                .await
+                .map_err(|e| format!("读取远程目录失败: {}", e.message()))?;
+            let mut directories = Vec::new();
+            for entry in entries {
+                if !valid_sftp_child_name(&entry.name) {
+                    continue;
+                }
+                let path = join_posix(&canonical, &entry.name);
+                let browsable = entry.is_dir
+                    || (entry.is_symlink && sftp.is_dir(&path).await.unwrap_or(false));
+                if !browsable {
+                    continue;
+                }
+                directories.push(RemoteDirectoryEntry {
+                    path,
+                    name: entry.name,
+                    is_symlink: entry.is_symlink,
+                });
+            }
+            directories.sort_by(|a, b| natural_cmp(&a.name, &b.name));
+            Ok(RemoteDirectoryListing {
+                canonical_path: canonical,
+                directories,
+            })
+        }
+        .await;
+        sftp.close().await;
+        result
+    })
+}
+
+/// 在远程项目目录中新建文件或文件夹。
+pub fn create_entry(
+    conn: &SshConnection,
+    project_root: &str,
+    parent_dir: &str,
+    name: &str,
+    is_dir: bool,
+) -> Result<String, String> {
+    if !valid_remote_name(name) {
+        return Err(format!("文件名无效: {name}"));
+    }
+    let st = state();
+    st.block_on(async move {
+        let sftp = open_sftp(st, conn).await?;
+        let result = async {
+            let parent = validate_remote_dir_under_root(&sftp, project_root, parent_dir).await?;
+            let target = join_posix(&parent, name);
+            if is_dir {
+                sftp.create_dir(&target)
+                    .await
+                    .map_err(|e| format!("创建远程文件夹失败: {}", e.message()))?;
+            } else {
+                sftp.create_file(&target)
+                    .await
+                    .map_err(|e| format!("创建远程文件失败: {}", e.message()))?;
+            }
+            Ok(target)
+        }
+        .await;
+        sftp.close().await;
+        result
+    })
+}
+
+/// 重命名远程条目；新名称只允许单个 POSIX basename。
+pub fn rename_entry(
+    conn: &SshConnection,
+    project_root: &str,
+    path: &str,
+    new_name: &str,
+) -> Result<String, String> {
+    if !valid_remote_name(new_name) {
+        return Err(format!("文件名无效: {new_name}"));
+    }
+    let st = state();
+    st.block_on(async move {
+        let sftp = open_sftp(st, conn).await?;
+        let result = async {
+            let source = validate_remote_leaf_under_root(&sftp, project_root, path).await?;
+            let (parent, _) = split_posix_leaf(&source)?;
+            let target = join_posix(parent, new_name);
+            sftp.rename(&source, &target)
+                .await
+                .map_err(|e| format!("重命名远程条目失败: {}", e.message()))?;
+            Ok(target)
+        }
+        .await;
+        sftp.close().await;
+        result
+    })
+}
+
+async fn remove_remote_tree(
+    sftp: &SftpHandle,
+    target: String,
+    target_kind: SftpNodeKind,
+) -> Result<usize, String> {
+    sftp
+        .remove_tree(&target, target_kind)
+        .await
+        .map_err(|e| format!("删除远程条目失败: {}", e.message()))
+}
+
+fn valid_sftp_child_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\0')
+}
+
+fn split_sftp_leaf(path: &str) -> Result<(&str, &str), String> {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() || trimmed == "/" {
+        return Err("远程根目录不能作为文件条目操作".into());
+    }
+    let index = trimmed
+        .rfind('/')
+        .ok_or_else(|| format!("远程路径必须是绝对路径: {path}"))?;
+    let parent = if index == 0 { "/" } else { &trimmed[..index] };
+    let name = &trimmed[index + 1..];
+    if !valid_sftp_child_name(name) {
+        return Err(format!("服务器返回了无效目录项名: {name:?}"));
+    }
+    Ok((parent, name))
+}
+
+async fn remote_kind_if_present(
+    sftp: &SftpHandle,
+    path: &str,
+) -> Result<Option<SftpNodeKind>, String> {
+    split_sftp_leaf(path)?;
+    sftp.try_node_kind(path)
+        .await
+        .map_err(|e| format!("读取远程条目类型失败: {}", e.message()))
+}
+
+async fn validate_remote_delete_leaf_against_root(
+    sftp: &SftpHandle,
+    canonical_root: &str,
+    path: &str,
+) -> Result<String, String> {
+    let normalized = normalize_absolute_posix(path)?;
+    if normalized == canonical_root {
+        return Err("不能操作远程项目根目录".into());
+    }
+    let (parent, name) = split_sftp_leaf(&normalized)?;
+    let canonical_parent = sftp
+        .canonicalize(parent)
+        .await
+        .map_err(|e| format!("远程父目录不可访问: {}", e.message()))?;
+    if canonical_parent != parent {
+        return Err(format!(
+            "远程父目录在删除期间被符号链接替换或重定向: {parent}"
+        ));
+    }
+    if posix_relative(canonical_root, &canonical_parent).is_none() {
+        return Err(format!("远程路径超出项目范围: {normalized}"));
+    }
+    Ok(join_posix(&canonical_parent, name))
+}
+
+async fn validate_remote_delete_directory_identity(
+    sftp: &SftpHandle,
+    canonical_root: &str,
+    path: &str,
+) -> Result<String, String> {
+    let validated =
+        validate_remote_delete_leaf_against_root(sftp, canonical_root, path).await?;
+    let canonical = sftp
+        .canonicalize(&validated)
+        .await
+        .map_err(|e| format!("远程目录不可访问: {}", e.message()))?;
+    if canonical != validated || posix_relative(canonical_root, &canonical).is_none() {
+        return Err(format!("远程目录在删除期间被替换或移出项目范围: {validated}"));
+    }
+    if remote_kind_if_present(sftp, &validated).await? != Some(SftpNodeKind::Directory) {
+        return Err(format!("远程目录在删除期间发生变化: {validated}"));
+    }
+    Ok(validated)
+}
+
+fn shell_quote_posix(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn remote_delete_command(
+    target: &str,
+    proof_path: &str,
+    proof_nonce: &str,
+) -> Result<String, String> {
+    let (parent, name) = split_sftp_leaf(target)?;
+    let (proof_parent, proof_name) = split_sftp_leaf(proof_path)?;
+    if proof_parent != parent {
+        return Err("远程删除验证标记必须与目标位于同一目录".into());
+    }
+    let relative = format!("./{name}");
+    let proof_relative = format!("./{proof_name}");
+    Ok(format!(
+        "cd -P {} 2>/dev/null && [ \"$(pwd -P)\" = {} ] && \
+         [ -d {} ] && [ ! -L {} ] && [ -f {} ] && [ ! -L {} ] && \
+         [ \"$(cat -- {})\" = {} ] && rm -f -- {} && \
+         exec timeout {} rm -rf -- {}",
+        shell_quote_posix(parent),
+        shell_quote_posix(parent),
+        shell_quote_posix(&relative),
+        shell_quote_posix(&relative),
+        shell_quote_posix(&proof_relative),
+        shell_quote_posix(&proof_relative),
+        shell_quote_posix(&proof_relative),
+        shell_quote_posix(proof_nonce),
+        shell_quote_posix(&proof_relative),
+        REMOTE_DELETE_SERVER_TIMEOUT_SECS,
+        shell_quote_posix(&relative),
+    ))
+}
+
+async fn create_remote_delete_proof(
+    sftp: &SftpHandle,
+    target: &str,
+) -> Result<(String, String), String> {
+    for _ in 0..16 {
+        let proof_path = sftp.temporary_sibling_path(target, "delete-proof");
+        let sequence = LOCAL_TRANSFER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let nonce = format!("mt-delete-proof-{}-{timestamp}-{sequence}", std::process::id());
+        match sftp.write_new_file(&proof_path, nonce.as_bytes()).await {
+            Ok(()) => return Ok((proof_path, nonce)),
+            Err(error) => match sftp.try_node_kind(&proof_path).await {
+                Ok(Some(_)) => continue,
+                Ok(None) | Err(_) => {
+                    return Err(format!("创建远程删除验证标记失败: {}", error.message()));
+                }
+            },
+        }
+    }
+    Err("无法分配唯一的远程删除验证标记".into())
+}
+
+async fn cleanup_remote_delete_proof(sftp: &SftpHandle, proof_path: &str) -> Result<(), String> {
+    match sftp
+        .try_node_kind(proof_path)
+        .await
+        .map_err(|error| format!("检查远程删除验证标记失败: {}", error.message()))?
+    {
+        None => Ok(()),
+        Some(SftpNodeKind::Directory) => Err(format!(
+            "远程删除验证标记被替换为目录，已拒绝清理: {proof_path}"
+        )),
+        Some(_) => sftp
+            .remove_file(proof_path)
+            .await
+            .map_err(|error| format!("清理远程删除验证标记失败: {}", error.message())),
+    }
+}
+
+fn remote_exec_failure_detail(output: &mt_ssh::BoundedExecOutput) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = stderr.trim();
+    let mut detail = if output.timed_out {
+        "服务端删除命令超时，远端状态仍需确认".to_string()
+    } else {
+        match output.exit_code {
+            Some(code) => format!("服务端删除命令退出码: {code}"),
+            None => "服务端删除命令未返回退出码".to_string(),
+        }
+    };
+    if !stderr.is_empty() {
+        detail.push_str("; stderr: ");
+        detail.push_str(stderr);
+    }
+    detail
+}
+
+async fn remove_remote_tree_safely(
+    sftp: &SftpHandle,
+    canonical_root: &str,
+    target: &str,
+) -> Result<usize, String> {
+    enum RemoveWork {
+        Visit(String),
+        RemoveDirectory(String),
+    }
+
+    let mut stack = vec![RemoveWork::Visit(target.to_string())];
+    let mut removed = 0usize;
+    while let Some(work) = stack.pop() {
+        match work {
+            RemoveWork::Visit(path) => {
+                let path =
+                    validate_remote_delete_leaf_against_root(sftp, canonical_root, &path).await?;
+                let Some(kind) = remote_kind_if_present(sftp, &path).await? else {
+                    continue;
+                };
+                if kind == SftpNodeKind::Directory {
+                    let path = validate_remote_delete_directory_identity(
+                        sftp,
+                        canonical_root,
+                        &path,
+                    )
+                    .await?;
+                    let entries = sftp
+                        .read_dir(&path)
+                        .await
+                        .map_err(|e| format!("读取远程目录失败: {}", e.message()))?;
+                    stack.push(RemoveWork::RemoveDirectory(path.clone()));
+                    for entry in entries.into_iter().rev() {
+                        if !valid_sftp_child_name(&entry.name) {
+                            return Err(format!(
+                                "服务器返回了无效目录项名: {:?}",
+                                entry.name
+                            ));
+                        }
+                        stack.push(RemoveWork::Visit(join_posix(&path, &entry.name)));
+                    }
+                } else {
+                    sftp.remove_file(&path)
+                        .await
+                        .map_err(|e| format!("删除远程条目失败: {}", e.message()))?;
+                    removed += 1;
+                }
+            }
+            RemoveWork::RemoveDirectory(path) => {
+                let path =
+                    validate_remote_delete_leaf_against_root(sftp, canonical_root, &path).await?;
+                let Some(kind) = remote_kind_if_present(sftp, &path).await? else {
+                    continue;
+                };
+                if kind == SftpNodeKind::Directory {
+                    validate_remote_delete_directory_identity(sftp, canonical_root, &path).await?;
+                    sftp.remove_dir(&path)
+                        .await
+                        .map_err(|e| format!("删除远程目录失败: {}", e.message()))?;
+                } else {
+                    sftp.remove_file(&path)
+                        .await
+                        .map_err(|e| format!("删除远程条目失败: {}", e.message()))?;
+                }
+                removed += 1;
+            }
+        }
+    }
+    Ok(removed)
+}
+
+async fn restore_isolated_remote_entry(
+    sftp: &SftpHandle,
+    isolation: &str,
+    target: &str,
+) -> Result<(), String> {
+    if remote_kind_if_present(sftp, isolation).await?.is_none() {
+        return Ok(());
+    }
+    if remote_kind_if_present(sftp, target).await?.is_some() {
+        return Err(format!(
+            "原路径已被重新创建，未覆盖；剩余条目保留在: {isolation}"
+        ));
+    }
+    sftp.rename(isolation, target)
+        .await
+        .map_err(|error| {
+            format!(
+                "恢复远程条目失败: {}; 剩余条目保留在: {isolation}",
+                error.message()
+            )
+        })
+}
+
+async fn remove_remote_leaf_via_isolation(
+    sftp: &SftpHandle,
+    canonical_root: &str,
+    target: &str,
+) -> Result<usize, String> {
+    let target = validate_remote_delete_leaf_against_root(sftp, canonical_root, target).await?;
+    let isolation = loop {
+        let candidate = sftp.temporary_sibling_path(&target, "delete-isolation");
+        if remote_kind_if_present(sftp, &candidate).await?.is_none() {
+            break candidate;
+        }
+    };
+    sftp.rename(&target, &isolation)
+        .await
+        .map_err(|error| format!("隔离远程待删除条目失败: {}", error.message()))?;
+
+    let isolated = validate_remote_delete_leaf_against_root(sftp, canonical_root, &isolation)
+        .await?;
+    match remote_kind_if_present(sftp, &isolated).await? {
+        Some(SftpNodeKind::Directory) => {
+            let restore = restore_isolated_remote_entry(sftp, &isolated, &target).await;
+            match restore {
+                Ok(()) => Err("远程条目在删除期间变成了目录，已恢复原路径".into()),
+                Err(restore_error) => Err(format!(
+                    "远程条目在删除期间变成了目录；{restore_error}"
+                )),
+            }
+        }
+        Some(_) => {
+            if let Err(error) = sftp.remove_file(&isolated).await {
+                let restore = restore_isolated_remote_entry(sftp, &isolated, &target).await;
+                return match restore {
+                    Ok(()) => Err(format!("删除远程条目失败: {}", error.message())),
+                    Err(restore_error) => Err(format!(
+                        "删除远程条目失败: {}; {restore_error}",
+                        error.message()
+                    )),
+                };
+            }
+            Ok(1)
+        }
+        None => Ok(1),
+    }
+}
+
+async fn remove_remote_directory_via_isolation(
+    sftp: &SftpHandle,
+    canonical_root: &str,
+    target: &str,
+) -> Result<usize, String> {
+    let target = validate_remote_delete_directory_identity(sftp, canonical_root, target).await?;
+    let isolation = loop {
+        let candidate = sftp.temporary_sibling_path(&target, "delete-isolation");
+        if remote_kind_if_present(sftp, &candidate).await?.is_none() {
+            break candidate;
+        }
+    };
+    sftp.rename(&target, &isolation)
+        .await
+        .map_err(|error| format!("隔离远程待删除目录失败: {}", error.message()))?;
+
+    if let Err(error) =
+        validate_remote_delete_directory_identity(sftp, canonical_root, &isolation).await
+    {
+        let restore = restore_isolated_remote_entry(sftp, &isolation, &target).await;
+        return match restore {
+            Ok(()) => Err(format!("隔离后的远程目录校验失败: {error}")),
+            Err(restore_error) => Err(format!(
+                "隔离后的远程目录校验失败: {error}; {restore_error}"
+            )),
+        };
+    }
+
+    match remove_remote_tree_safely(sftp, canonical_root, &isolation).await {
+        Ok(removed) => Ok(removed),
+        Err(error) => {
+            let restore = restore_isolated_remote_entry(sftp, &isolation, &target).await;
+            match restore {
+                Ok(()) => Err(error),
+                Err(restore_error) => Err(format!("{error}; {restore_error}")),
+            }
+        }
+    }
+}
+
+async fn remove_remote_directory_via_fresh_session(
+    st: &RemoteSshState,
+    conn: &SshConnection,
+    project_root: &str,
+    target: &str,
+) -> Result<usize, String> {
+    let fresh_sftp = open_sftp(st, conn).await?;
+    let result = async {
+        let canonical_root = canonical_project_root(&fresh_sftp, project_root).await?;
+        remove_remote_directory_via_isolation(&fresh_sftp, &canonical_root, target).await
+    }
+    .await;
+    fresh_sftp.close().await;
+    result
+}
+
+async fn delete_remote_directory(
+    st: &RemoteSshState,
+    conn: &SshConnection,
+    project_root: &str,
+    session: &Arc<CachedSession>,
+    sftp: &SftpHandle,
+    canonical_root: &str,
+    target: &str,
+) -> Result<usize, String> {
+    // 只绑定并验证删除根目录。服务端 `rm` 自己完成递归；若先用 SFTP 扫描整棵树，
+    // 大目录仍会因网络传输和目录往返退化为线性预处理，抵消快速路径的意义。
+    let target = validate_remote_delete_directory_identity(sftp, canonical_root, target).await?;
+    let capability = run_bounded_exec_on_session(
+        session,
+        "command -v timeout >/dev/null 2>&1 && command -v rm >/dev/null 2>&1 && \
+         command -v cat >/dev/null 2>&1",
+        REMOTE_DELETE_PROBE_TIMEOUT,
+        1024,
+    )
+    .await;
+    match capability {
+        Ok(output)
+            if !output.requires_session_retirement()
+                && !output.timed_out
+                && output.exit_code == Some(0) => {}
+        Ok(output) if output.requires_session_retirement() => {
+            st.pool().evict_if_same(&conn.id, session).await;
+            return remove_remote_directory_via_fresh_session(
+                st,
+                conn,
+                project_root,
+                &target,
+            )
+            .await;
+        }
+        Ok(_) => {
+            return remove_remote_directory_via_isolation(sftp, canonical_root, &target).await;
+        }
+        Err(_) => {
+            st.pool().evict_if_same(&conn.id, session).await;
+            return remove_remote_directory_via_fresh_session(
+                st,
+                conn,
+                project_root,
+                &target,
+            )
+            .await;
+        }
+    }
+
+    let (proof_path, proof_nonce) = match create_remote_delete_proof(sftp, &target).await {
+        Ok(proof) => proof,
+        Err(_) => {
+            return remove_remote_directory_via_isolation(sftp, canonical_root, &target).await;
+        }
+    };
+    let command = remote_delete_command(&target, &proof_path, &proof_nonce)?;
+    let execution = run_bounded_exec_on_session(
+        session,
+        &command,
+        REMOTE_DELETE_EXEC_TIMEOUT,
+        REMOTE_DELETE_OUTPUT_CAP,
+    )
+    .await;
+    match &execution {
+        Ok(output) if output.requires_session_retirement() => {
+            st.pool().evict_if_same(&conn.id, session).await;
+        }
+        Err(_) => {
+            st.pool().evict_if_same(&conn.id, session).await;
+        }
+        _ => {}
+    }
+    let proof_cleanup = cleanup_remote_delete_proof(sftp, &proof_path).await;
+    let post_target =
+        validate_remote_delete_leaf_against_root(sftp, canonical_root, &target).await?;
+    if remote_kind_if_present(sftp, &post_target).await?.is_none() {
+        if let Err(cleanup_error) = proof_cleanup {
+            return Err(format!("远程目录已删除，但{cleanup_error}"));
+        }
+        // 调用方只关心成功与否；快速路径不为统计条目重新扫描整棵树。
+        return Ok(1);
+    }
+
+    match execution {
+        Ok(output) if output.safe_to_fallback() => {
+            proof_cleanup?;
+            remove_remote_directory_via_isolation(sftp, canonical_root, &target).await
+        }
+        Ok(output)
+            if output.requires_session_retirement() && !output.state.may_have_started() =>
+        {
+            proof_cleanup?;
+            remove_remote_directory_via_fresh_session(st, conn, project_root, &target).await
+        }
+        Ok(output) => {
+            let cleanup = proof_cleanup
+                .err()
+                .map(|error| format!("；{error}"))
+                .unwrap_or_default();
+            Err(format!(
+                "{}；为避免与仍可能运行的服务端删除并发，未启动 SFTP 回退{cleanup}",
+                remote_exec_failure_detail(&output)
+            ))
+        }
+        Err(error) => {
+            proof_cleanup?;
+            remove_remote_directory_via_fresh_session(st, conn, project_root, &target)
+                .await
+                .map_err(|fallback_error| {
+                    format!("服务端删除通道失败: {error}; SFTP 回退也失败: {fallback_error}")
+                })
+        }
+    }
+}
+
+async fn discard_remote_staged_entry(sftp: &SftpHandle, staging: &str) -> Result<(), String> {
+    let kind = sftp
+        .node_kind(staging)
+        .await
+        .map_err(|e| format!("远程暂存条目不可访问: {}", e.message()))?;
+    remove_remote_tree(sftp, staging.to_string(), kind)
+        .await
+        .map(|_| ())
+}
+
+async fn commit_new_remote_staged_directory(
+    sftp: &SftpHandle,
+    staging: &str,
+    target: &str,
+) -> Result<(), String> {
+    if let Err(error) = sftp.rename(staging, target).await {
+        let cleanup = discard_remote_staged_entry(sftp, staging).await;
+        return match cleanup {
+            Ok(()) => Err(format!("提交远程目录失败: {}", error.message())),
+            Err(cleanup_error) => Err(format!(
+                "提交远程目录失败: {}; 清理暂存目录也失败: {cleanup_error}",
+                error.message()
+            )),
+        };
+    }
+    Ok(())
+}
+
+/// 删除远程文件、符号链接或目录。普通目录先校验删除根并用 SFTP nonce 证明 shell
+/// 与 SFTP 看见同一父目录，再优先使用带 `timeout` 的服务端 `rm`；能力不可用时先
+/// 原子改名到随机隔离路径，再用一个复用 SFTP handle 后序删除。叶子 symlink 只删除
+/// 链接自身，路径式 fallback 的每一步仍会重新校验 canonical parent。
+pub fn delete_entry(
+    conn: &SshConnection,
+    project_root: &str,
+    path: &str,
+) -> Result<usize, String> {
+    let st = state();
+    st.block_on(async move {
+        let (session, sftp) = open_sftp_with_session(st, conn).await?;
+        let result = async {
+            let canonical_root = canonical_project_root(&sftp, project_root).await?;
+            let target =
+                validate_remote_leaf_against_root(&sftp, &canonical_root, path).await?;
+            let kind = remote_kind_if_present(&sftp, &target)
+                .await?
+                .ok_or_else(|| format!("远程条目不存在: {target}"))?;
+            if kind == SftpNodeKind::Directory {
+                delete_remote_directory(
+                    st,
+                    conn,
+                    project_root,
+                    &session,
+                    &sftp,
+                    &canonical_root,
+                    &target,
+                )
+                .await
+            } else {
+                remove_remote_leaf_via_isolation(&sftp, &canonical_root, &target).await
+            }
+        }
+        .await;
+        sftp.close().await;
+        result
+    })
+}
+
+/// 在同一远程项目中复制文件或目录；同名时自动生成副本名。
+pub fn copy_entry_keep_both(
+    conn: &SshConnection,
+    project_root: &str,
+    source_path: &str,
+    target_dir: &str,
+) -> Result<(String, FileOperationSummary), String> {
+    let st = state();
+    st.block_on(async move {
+        let sftp = open_sftp(st, conn).await?;
+        let result = async {
+            let source = validate_remote_leaf_under_root(&sftp, project_root, source_path).await?;
+            let target_dir =
+                validate_remote_dir_under_root(&sftp, project_root, target_dir).await?;
+            let (_, source_name) = split_posix_leaf(&source)?;
+            let desired = join_posix(&target_dir, source_name);
+            let target = keep_both_remote_path(&sftp, &desired).await?;
+            let source_kind = sftp
+                .node_kind(&source)
+                .await
+                .map_err(|e| format!("远程源条目不可访问: {}", e.message()))?;
+            if source_kind == SftpNodeKind::Directory
+                && posix_relative(&source, &target).is_some()
+            {
+                return Err("不能把远程目录复制到自身或其子目录".into());
+            }
+            let mut summary = FileOperationSummary::default();
+            match source_kind {
+                SftpNodeKind::Symlink | SftpNodeKind::Other => {
+                    return Err("暂不复制远程符号链接或特殊文件".into());
+                }
+                SftpNodeKind::File => {
+                    summary.bytes = sftp
+                        .copy_file(&source, &target, false)
+                        .await
+                        .map_err(|e| format!("复制远程文件失败: {}", e.message()))?;
+                    summary.completed = 1;
+                }
+                SftpNodeKind::Directory => {
+                    let staging = sftp.temporary_sibling_path(&target, "copy-directory");
+                    sftp.create_dir(&staging)
+                        .await
+                        .map_err(|e| format!("创建远程副本目录失败: {}", e.message()))?;
+                    let copy_result: Result<(), String> = async {
+                        let mut stack = vec![(source, staging.clone())];
+                        while let Some((source_dir, target_dir)) = stack.pop() {
+                            let entries = sftp.read_dir(&source_dir).await.map_err(|e| {
+                                format!("读取远程源目录失败: {}", e.message())
+                            })?;
+                            for entry in entries {
+                                if !valid_remote_name(&entry.name) {
+                                    return Err(format!(
+                                        "服务器返回了无效条目名: {:?}",
+                                        entry.name
+                                    ));
+                                }
+                                let source_child = join_posix(&source_dir, &entry.name);
+                                let target_child = join_posix(&target_dir, &entry.name);
+                                if entry.is_symlink {
+                                    summary.skipped += 1;
+                                    summary
+                                        .warnings
+                                        .push(format!("已跳过符号链接: {source_child}"));
+                                } else if entry.is_dir {
+                                    sftp.create_dir(&target_child).await.map_err(|e| {
+                                        format!(
+                                            "创建远程副本目录失败: {}",
+                                            e.message()
+                                        )
+                                    })?;
+                                    summary.completed += 1;
+                                    stack.push((source_child, target_child));
+                                } else if entry.is_file {
+                                    summary.bytes += sftp
+                                        .copy_file(&source_child, &target_child, false)
+                                        .await
+                                        .map_err(|e| {
+                                            format!("复制远程文件失败: {}", e.message())
+                                        })?;
+                                    summary.completed += 1;
+                                } else {
+                                    summary.skipped += 1;
+                                    summary
+                                        .warnings
+                                        .push(format!("已跳过特殊文件: {source_child}"));
+                                }
+                            }
+                        }
+                        Ok(())
+                    }
+                    .await;
+                    if let Err(error) = copy_result {
+                        let cleanup = discard_remote_staged_entry(&sftp, &staging).await;
+                        return match cleanup {
+                            Ok(()) => Err(error),
+                            Err(cleanup_error) => {
+                                Err(format!("{error}; 清理远程暂存目录失败: {cleanup_error}"))
+                            }
+                        };
+                    }
+                    commit_new_remote_staged_directory(&sftp, &staging, &target).await?;
+                    summary.completed += 1;
+                }
+            }
+            Ok((target, summary))
+        }
+        .await;
+        sftp.close().await;
+        result
+    })
+}
+
+type RemoteDirectoryCache = HashMap<String, HashMap<String, SftpNodeKind>>;
+
+async fn remote_kind_cached(
+    sftp: &SftpHandle,
+    path: &str,
+    cache: &mut RemoteDirectoryCache,
+) -> Result<Option<SftpNodeKind>, String> {
+    let (parent, name) = split_posix_leaf(path)?;
+    if !cache.contains_key(parent) {
+        let entries = sftp
+            .read_dir(parent)
+            .await
+            .map_err(|e| format!("读取远程目录失败: {}", e.message()))?
+            .into_iter()
+            .map(|entry| {
+                let kind = if entry.is_symlink {
+                    SftpNodeKind::Symlink
+                } else if entry.is_dir {
+                    SftpNodeKind::Directory
+                } else if entry.is_file {
+                    SftpNodeKind::File
+                } else {
+                    SftpNodeKind::Other
+                };
+                (entry.name, kind)
+            })
+            .collect();
+        cache.insert(parent.to_string(), entries);
+    }
+    Ok(cache
+        .get(parent)
+        .and_then(|entries| entries.get(name))
+        .copied())
+}
+
+fn set_remote_kind_cached(
+    cache: &mut RemoteDirectoryCache,
+    path: &str,
+    kind: SftpNodeKind,
+) -> Result<(), String> {
+    let (parent, name) = split_posix_leaf(path)?;
+    if let Some(entries) = cache.get_mut(parent) {
+        entries.insert(name.to_string(), kind);
+    }
+    Ok(())
+}
+
+fn remove_remote_kind_cached(
+    cache: &mut RemoteDirectoryCache,
+    path: &str,
+) -> Result<(), String> {
+    let (parent, name) = split_posix_leaf(path)?;
+    if let Some(entries) = cache.get_mut(parent) {
+        entries.remove(name);
+    }
+    Ok(())
+}
+
+fn invalidate_remote_cache_subtree(cache: &mut RemoteDirectoryCache, path: &str) {
+    let prefix = format!("{}/", path.trim_end_matches('/'));
+    cache.retain(|dir, _| dir != path && !dir.starts_with(&prefix));
+}
+
+fn invalidate_remote_parent_cache(cache: &mut RemoteDirectoryCache, path: &str) {
+    if let Ok((parent, _)) = split_posix_leaf(path) {
+        cache.remove(parent);
+    }
+}
+
+async fn keep_both_remote_path_cached(
+    sftp: &SftpHandle,
+    desired: &str,
+    cache: &mut RemoteDirectoryCache,
+) -> Result<String, String> {
+    let (parent, name) = split_posix_leaf(desired)?;
+    let _ = remote_kind_cached(sftp, desired, cache).await?;
+    let existing = cache
+        .get(parent)
+        .ok_or_else(|| format!("远程目录缓存缺失: {parent}"))?;
+    for ordinal in 1..=10_000 {
+        let candidate = keep_both_name(name, ordinal);
+        if !existing.contains_key(&candidate) {
+            return Ok(join_posix(parent, &candidate));
+        }
+    }
+    Err(format!("无法为远程条目生成可用副本名: {desired}"))
+}
+
+fn local_kind(path: &Path) -> Result<SftpNodeKind, String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("无法读取本地条目 {}: {e}", path.display()))?;
+    let ty = metadata.file_type();
+    Ok(if ty.is_symlink() {
+        SftpNodeKind::Symlink
+    } else if ty.is_dir() {
+        SftpNodeKind::Directory
+    } else if ty.is_file() {
+        SftpNodeKind::File
+    } else {
+        SftpNodeKind::Other
+    })
+}
+
+fn remove_local_entry(path: &Path) -> Result<(), String> {
+    match local_kind(path)? {
+        SftpNodeKind::Directory => std::fs::remove_dir_all(path)
+            .map_err(|e| format!("删除本地目录 {} 失败: {e}", path.display())),
+        _ => std::fs::remove_file(path)
+            .map_err(|e| format!("删除本地文件 {} 失败: {e}", path.display())),
+    }
+}
+
+fn create_local_operation_container(target: &Path, role: &str) -> Result<PathBuf, String> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| format!("无法获取本地目标父目录: {}", target.display()))?;
+    let name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("entry");
+    for _ in 0..10_000 {
+        let sequence = LOCAL_TRANSFER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!(
+            ".{name}.mt-{role}-{}-{sequence}",
+            std::process::id()
+        ));
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(format!(
+                    "创建本地操作目录 {} 失败: {error}",
+                    candidate.display()
+                ));
+            }
+        }
+    }
+    Err(format!("无法为本地目标分配暂存目录: {}", target.display()))
+}
+
+fn create_local_staging_directory(target: &Path) -> Result<(PathBuf, PathBuf), String> {
+    let container = create_local_operation_container(target, "download")?;
+    let staging = container.join("entry");
+    if let Err(error) = std::fs::create_dir(&staging) {
+        let _ = std::fs::remove_dir(&container);
+        return Err(format!("创建本地暂存目录 {} 失败: {error}", staging.display()));
+    }
+    Ok((container, staging))
+}
+
+fn commit_new_local_staged_directory(
+    staging: &Path,
+    staging_container: &Path,
+    target: &Path,
+) -> Result<(), String> {
+    match std::fs::symlink_metadata(target) {
+        Ok(_) => {
+            let _ = remove_local_entry(staging_container);
+            return Err(format!(
+                "提交本地下载目录时目标已存在: {}",
+                target.display()
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            let _ = remove_local_entry(staging_container);
+            return Err(format!(
+                "提交前检查本地目标 {} 失败: {error}",
+                target.display()
+            ));
+        }
+    }
+    if let Err(error) = std::fs::rename(staging, target) {
+        let cleanup = remove_local_entry(staging_container);
+        return match cleanup {
+            Ok(()) => Err(format!("提交本地下载目录 {} 失败: {error}", target.display())),
+            Err(cleanup_error) => Err(format!(
+                "提交本地下载目录 {} 失败: {error}; 清理暂存目录也失败: {cleanup_error}",
+                target.display()
+            )),
+        };
+    }
+    std::fs::remove_dir(staging_container).map_err(|error| {
+        format!(
+            "清理本地下载暂存目录 {} 失败: {error}",
+            staging_container.display()
+        )
+    })
+}
+
+fn replace_local_staged_entry(
+    staging: &Path,
+    staging_container: &Path,
+    target: &Path,
+) -> Result<(), String> {
+    let backup_container = create_local_operation_container(target, "backup")?;
+    let backup = backup_container.join("entry");
+    if let Err(error) = std::fs::rename(target, &backup) {
+        let _ = remove_local_entry(staging_container);
+        let _ = std::fs::remove_dir(&backup_container);
+        return Err(format!("备份本地目标 {} 失败: {error}", target.display()));
+    }
+    if let Err(promote_error) = std::fs::rename(staging, target) {
+        let rollback = std::fs::rename(&backup, target);
+        let _ = remove_local_entry(staging_container);
+        let _ = std::fs::remove_dir(&backup_container);
+        return match rollback {
+            Ok(()) => Err(format!("提交本地下载 {} 失败: {promote_error}", target.display())),
+            Err(rollback_error) => Err(format!(
+                "提交本地下载失败且恢复失败: {promote_error}; rollback: {rollback_error}; backup: {}",
+                backup.display()
+            )),
+        };
+    }
+    std::fs::remove_dir(staging_container).map_err(|error| {
+        format!("清理本地下载暂存目录 {} 失败: {error}", staging_container.display())
+    })?;
+    remove_local_entry(&backup)
+        .map_err(|error| format!("下载完成但清理备份 {} 失败: {error}", backup.display()))?;
+    std::fs::remove_dir(&backup_container).map_err(|error| {
+        format!("清理本地备份目录 {} 失败: {error}", backup_container.display())
+    })?;
+    Ok(())
+}
+
+fn keep_both_local_path(desired: &Path) -> Result<PathBuf, String> {
+    if std::fs::symlink_metadata(desired).is_err() {
+        return Ok(desired.to_path_buf());
+    }
+    let name = desired
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("本地目标名称不是有效 UTF-8: {}", desired.display()))?;
+    for ordinal in 1..=10_000 {
+        let candidate = desired.with_file_name(keep_both_name(name, ordinal));
+        if std::fs::symlink_metadata(&candidate).is_err() {
+            return Ok(candidate);
+        }
+    }
+    Err(format!("无法为本地条目生成可用副本名: {}", desired.display()))
+}
+
+fn collect_upload_conflicts(
+    existing: &HashSet<String>,
+    local_paths: &[PathBuf],
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut reported = HashSet::new();
+    let mut conflicts = Vec::new();
+    for path in local_paths {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let repeated_in_batch = !seen.insert(name.to_string());
+        if (existing.contains(name) || repeated_in_batch) && reported.insert(name.to_string()) {
+            conflicts.push(name.to_string());
+        }
+    }
+    conflicts
+}
+
+/// 上传前扫描顶层冲突；返回发生冲突的本地条目名称。
+pub fn upload_conflicts(
+    conn: &SshConnection,
+    project_root: &str,
+    target_dir: &str,
+    local_paths: &[PathBuf],
+) -> Result<Vec<String>, String> {
+    let st = state();
+    st.block_on(async move {
+        let sftp = open_sftp(st, conn).await?;
+        let result = async {
+            let target_dir =
+                validate_remote_dir_under_root(&sftp, project_root, target_dir).await?;
+            let existing: HashSet<String> = sftp
+                .read_dir(&target_dir)
+                .await
+                .map_err(|e| format!("读取远程目录失败: {}", e.message()))?
+                .into_iter()
+                .map(|entry| entry.name)
+                .collect();
+            Ok(collect_upload_conflicts(&existing, local_paths))
+        }
+        .await;
+        sftp.close().await;
+        result
+    })
+}
+
+async fn upload_path_tree(
+    sftp: &SftpHandle,
+    local_root: PathBuf,
+    remote_root: String,
+    strategy: FileConflictStrategy,
+    summary: &mut FileOperationSummary,
+    remote_cache: &mut RemoteDirectoryCache,
+) -> Result<(), String> {
+    enum UploadWork {
+        Visit {
+            local: PathBuf,
+            desired_remote: String,
+            inside_staging: bool,
+            staging_replaces_existing: bool,
+        },
+        CommitDirectory {
+            staging: String,
+            target: String,
+            replace_existing: bool,
+            summary_before: FileOperationSummary,
+        },
+    }
+
+    let mut stack = vec![UploadWork::Visit {
+        local: local_root,
+        desired_remote: remote_root,
+        inside_staging: false,
+        staging_replaces_existing: false,
+    }];
+    let mut staged_directories = HashSet::new();
+    let mut result: Result<(), String> = async {
+        while let Some(work) = stack.pop() {
+            let (local, desired_remote, inside_staging, staging_replaces_existing) = match work {
+                UploadWork::Visit {
+                    local,
+                    desired_remote,
+                    inside_staging,
+                    staging_replaces_existing,
+                } => (
+                    local,
+                    desired_remote,
+                    inside_staging,
+                    staging_replaces_existing,
+                ),
+                UploadWork::CommitDirectory {
+                    staging,
+                    target,
+                    replace_existing,
+                    summary_before,
+                } => {
+                    let commit_result = if replace_existing {
+                        sftp.replace_staged_entry(&staging, &target)
+                            .await
+                            .map_err(|e| format!("替换远程目录失败: {}", e.message()))
+                    } else {
+                        commit_new_remote_staged_directory(sftp, &staging, &target).await
+                    };
+                    if let Err(error) = commit_result {
+                        let rollback_summary = stack
+                            .iter()
+                            .find_map(|work| match work {
+                                UploadWork::CommitDirectory { summary_before, .. } => {
+                                    Some(summary_before.clone())
+                                }
+                                UploadWork::Visit { .. } => None,
+                            })
+                            .unwrap_or(summary_before);
+                        *summary = rollback_summary;
+                        invalidate_remote_parent_cache(remote_cache, &target);
+                        invalidate_remote_parent_cache(remote_cache, &staging);
+                        invalidate_remote_cache_subtree(remote_cache, &target);
+                        invalidate_remote_cache_subtree(remote_cache, &staging);
+                        return Err(error);
+                    }
+                    staged_directories.remove(&staging);
+                    invalidate_remote_cache_subtree(remote_cache, &target);
+                    invalidate_remote_cache_subtree(remote_cache, &staging);
+                    remove_remote_kind_cached(remote_cache, &staging)?;
+                    set_remote_kind_cached(remote_cache, &target, SftpNodeKind::Directory)?;
+                    summary.completed += 1;
+                    continue;
+                }
+            };
+            let kind = match local_kind(&local) {
+                Ok(kind) => kind,
+                Err(error) if inside_staging => {
+                    return Err(format!("远程暂存目录未完整构建: {error}"));
+                }
+                Err(error) => {
+                    summary.failed += 1;
+                    summary.warnings.push(error);
+                    continue;
+                }
+            };
+            if matches!(kind, SftpNodeKind::Symlink | SftpNodeKind::Other) {
+                let warning = format!("已跳过本地符号链接或特殊文件: {}", local.display());
+                if staging_replaces_existing {
+                    return Err(format!("远程暂存目录未完整构建: {warning}"));
+                }
+                summary.skipped += 1;
+                summary.warnings.push(warning);
+                continue;
+            }
+
+            let existing = remote_kind_cached(sftp, &desired_remote, remote_cache).await?;
+            if inside_staging && existing.is_some() {
+                return Err(format!(
+                    "远程暂存目录被意外修改，拒绝提交: {desired_remote}"
+                ));
+            }
+            let (remote, existing) = match (existing, strategy) {
+                (Some(_), FileConflictStrategy::Skip) => {
+                    summary.skipped += 1;
+                    continue;
+                }
+                (Some(_), FileConflictStrategy::KeepBoth) => (
+                    keep_both_remote_path_cached(sftp, &desired_remote, remote_cache).await?,
+                    None,
+                ),
+                (existing, _) => (desired_remote, existing),
+            };
+
+            match kind {
+                SftpNodeKind::Directory => {
+                    let mut completes_immediately = true;
+                    let (
+                        child_remote_base,
+                        child_inside_staging,
+                        child_staging_replaces_existing,
+                    ) = match existing {
+                        None if inside_staging => {
+                            sftp.create_dir(&remote)
+                                .await
+                                .map_err(|e| format!("创建远程目录失败: {}", e.message()))?;
+                            set_remote_kind_cached(
+                                remote_cache,
+                                &remote,
+                                SftpNodeKind::Directory,
+                            )?;
+                            remote_cache.insert(remote.clone(), HashMap::new());
+                            (remote.clone(), true, staging_replaces_existing)
+                        }
+                        Some(SftpNodeKind::Directory)
+                            if strategy == FileConflictStrategy::Overwrite =>
+                        {
+                            (
+                                remote.clone(),
+                                inside_staging,
+                                staging_replaces_existing,
+                            )
+                        }
+                        existing => {
+                            let replace_existing = existing.is_some();
+                            let staging = sftp.temporary_sibling_path(&remote, "directory");
+                            sftp.create_dir(&staging).await.map_err(|e| {
+                                format!("创建远程暂存目录失败: {}", e.message())
+                            })?;
+                            staged_directories.insert(staging.clone());
+                            set_remote_kind_cached(
+                                remote_cache,
+                                &staging,
+                                SftpNodeKind::Directory,
+                            )?;
+                            remote_cache.insert(staging.clone(), HashMap::new());
+                            stack.push(UploadWork::CommitDirectory {
+                                staging: staging.clone(),
+                                target: remote.clone(),
+                                replace_existing,
+                                summary_before: summary.clone(),
+                            });
+                            completes_immediately = false;
+                            (
+                                staging,
+                                true,
+                                staging_replaces_existing || replace_existing,
+                            )
+                        }
+                    };
+                    if completes_immediately {
+                        summary.completed += 1;
+                    }
+                    let entries = std::fs::read_dir(&local)
+                        .map_err(|e| format!("读取本地目录 {} 失败: {e}", local.display()))?;
+                    let mut children = Vec::new();
+                    for entry in entries {
+                        let entry = entry.map_err(|e| {
+                            format!("读取本地目录项 {} 失败: {e}", local.display())
+                        })?;
+                        let name = entry.file_name();
+                        let Some(name) = name.to_str() else {
+                            let warning = format!(
+                                "已跳过名称不是有效 UTF-8 的本地条目: {}",
+                                entry.path().display()
+                            );
+                            if child_staging_replaces_existing {
+                                return Err(format!(
+                                    "远程暂存目录未完整构建: {warning}"
+                                ));
+                            }
+                            summary.skipped += 1;
+                            summary.warnings.push(warning);
+                            continue;
+                        };
+                        if !valid_remote_name(name) {
+                            let warning = format!("已跳过远程不支持的名称: {name}");
+                            if child_staging_replaces_existing {
+                                return Err(format!(
+                                    "远程暂存目录未完整构建: {warning}"
+                                ));
+                            }
+                            summary.skipped += 1;
+                            summary.warnings.push(warning);
+                            continue;
+                        }
+                        children.push(UploadWork::Visit {
+                            local: entry.path(),
+                            desired_remote: join_posix(&child_remote_base, name),
+                            inside_staging: child_inside_staging,
+                            staging_replaces_existing: child_staging_replaces_existing,
+                        });
+                    }
+                    children.reverse();
+                    stack.extend(children);
+                }
+                SftpNodeKind::File => {
+                    let overwrite =
+                        existing.is_some() && strategy == FileConflictStrategy::Overwrite;
+                    summary.bytes += sftp
+                        .upload_file(&local, &remote, overwrite)
+                        .await
+                        .map_err(|e| format!("上传文件失败: {}", e.message()))?;
+                    invalidate_remote_cache_subtree(remote_cache, &remote);
+                    set_remote_kind_cached(remote_cache, &remote, SftpNodeKind::File)?;
+                    summary.completed += 1;
+                }
+                SftpNodeKind::Symlink | SftpNodeKind::Other => unreachable!(),
+            }
+        }
+        Ok(())
+    }
+    .await;
+
+    if result.is_err() {
+        if let Some(summary_before) = stack.iter().find_map(|work| match work {
+            UploadWork::CommitDirectory { summary_before, .. } => Some(summary_before.clone()),
+            UploadWork::Visit { .. } => None,
+        }) {
+            *summary = summary_before;
+        }
+        let mut cleanup_errors = Vec::new();
+        for staging in staged_directories {
+            if let Ok(kind) = sftp.node_kind(&staging).await
+                && let Err(error) = sftp.remove_tree(&staging, kind).await
+            {
+                cleanup_errors.push(format!("{staging}: {}", error.message()));
+            }
+        }
+        if !cleanup_errors.is_empty()
+            && let Err(original) = &result
+        {
+            let original = original.clone();
+            result = Err(format!(
+                "{original}; 清理远程暂存目录失败: {}",
+                cleanup_errors.join("; ")
+            ));
+        }
+    }
+    result
+}
+
+/// 上传一批本地文件/文件夹到远程目录。目录 Overwrite 为递归合并并保留目标独有项。
+pub fn upload_paths(
+    conn: &SshConnection,
+    project_root: &str,
+    target_dir: &str,
+    local_paths: &[PathBuf],
+    strategy: FileConflictStrategy,
+) -> Result<FileOperationSummary, String> {
+    let st = state();
+    st.block_on(async move {
+        let sftp = open_sftp(st, conn).await?;
+        let result = async {
+            let target_dir =
+                validate_remote_dir_under_root(&sftp, project_root, target_dir).await?;
+            let mut summary = FileOperationSummary::default();
+            let mut remote_cache = RemoteDirectoryCache::new();
+            for local in local_paths {
+                let Some(name) = local.file_name().and_then(|name| name.to_str()) else {
+                    summary.skipped += 1;
+                    summary.warnings.push(format!(
+                        "已跳过名称不是有效 UTF-8 的本地条目: {}",
+                        local.display()
+                    ));
+                    continue;
+                };
+                if !valid_remote_name(name) {
+                    summary.skipped += 1;
+                    summary
+                        .warnings
+                        .push(format!("已跳过远程不支持的名称: {name}"));
+                    continue;
+                }
+                if let Err(error) = upload_path_tree(
+                    &sftp,
+                    local.clone(),
+                    join_posix(&target_dir, name),
+                    strategy,
+                    &mut summary,
+                    &mut remote_cache,
+                )
+                .await
+                {
+                    remote_cache.clear();
+                    summary.failed += 1;
+                    summary.warnings.push(error);
+                }
+            }
+            Ok(summary)
+        }
+        .await;
+        sftp.close().await;
+        result
+    })
+}
+
+/// 下载前检查顶层目标是否已存在。
+pub fn download_conflicts(download_dir: &Path, remote_paths: &[PathBuf]) -> Vec<String> {
+    remote_paths
+        .iter()
+        .filter_map(|path| path.file_name())
+        .filter_map(|name| {
+            let target = download_dir.join(name);
+            std::fs::symlink_metadata(target)
+                .is_ok()
+                .then(|| name.to_string_lossy().into_owned())
+        })
+        .collect()
+}
+
+async fn download_remote_tree(
+    sftp: &SftpHandle,
+    remote_root: String,
+    local_root: PathBuf,
+    strategy: FileConflictStrategy,
+    summary: &mut FileOperationSummary,
+) -> Result<(), String> {
+    enum DownloadWork {
+        Visit {
+            remote: String,
+            desired_local: PathBuf,
+            known_kind: Option<SftpNodeKind>,
+            inside_staging: bool,
+            staging_replaces_existing: bool,
+        },
+        CommitDirectory {
+            staging: PathBuf,
+            staging_container: PathBuf,
+            target: PathBuf,
+            replace_existing: bool,
+            summary_before: FileOperationSummary,
+        },
+    }
+
+    let mut stack = vec![DownloadWork::Visit {
+        remote: remote_root,
+        desired_local: local_root,
+        known_kind: None,
+        inside_staging: false,
+        staging_replaces_existing: false,
+    }];
+    let mut staging_containers = HashSet::new();
+    let mut result: Result<(), String> = async {
+        while let Some(work) = stack.pop() {
+            let (
+                remote,
+                desired_local,
+                known_kind,
+                inside_staging,
+                staging_replaces_existing,
+            ) = match work {
+                DownloadWork::Visit {
+                    remote,
+                    desired_local,
+                    known_kind,
+                    inside_staging,
+                    staging_replaces_existing,
+                } => (
+                    remote,
+                    desired_local,
+                    known_kind,
+                    inside_staging,
+                    staging_replaces_existing,
+                ),
+                DownloadWork::CommitDirectory {
+                    staging,
+                    staging_container,
+                    target,
+                    replace_existing,
+                    summary_before,
+                } => {
+                    let commit_result = if replace_existing {
+                        replace_local_staged_entry(&staging, &staging_container, &target)
+                    } else {
+                        commit_new_local_staged_directory(
+                            &staging,
+                            &staging_container,
+                            &target,
+                        )
+                    };
+                    if let Err(error) = commit_result {
+                        let rollback_summary = stack
+                            .iter()
+                            .find_map(|work| match work {
+                                DownloadWork::CommitDirectory { summary_before, .. } => {
+                                    Some(summary_before.clone())
+                                }
+                                DownloadWork::Visit { .. } => None,
+                            })
+                            .unwrap_or(summary_before);
+                        *summary = rollback_summary;
+                        return Err(error);
+                    }
+                    staging_containers.remove(&staging_container);
+                    summary.completed += 1;
+                    continue;
+                }
+            };
+            let kind = match known_kind {
+                Some(kind) => kind,
+                None => sftp
+                    .node_kind(&remote)
+                    .await
+                    .map_err(|e| format!("远程条目不可访问: {}", e.message()))?,
+            };
+            if matches!(kind, SftpNodeKind::Symlink | SftpNodeKind::Other) {
+                if staging_replaces_existing {
+                    return Err(format!(
+                        "本地下载暂存目录未完整构建: 远程条目不可传输: {remote}"
+                    ));
+                }
+                summary.skipped += 1;
+                summary
+                    .warnings
+                    .push(format!("已跳过远程符号链接或特殊文件: {remote}"));
+                continue;
+            }
+
+            let existing = std::fs::symlink_metadata(&desired_local).ok().map(|metadata| {
+                let ty = metadata.file_type();
+                if ty.is_symlink() {
+                    SftpNodeKind::Symlink
+                } else if ty.is_dir() {
+                    SftpNodeKind::Directory
+                } else if ty.is_file() {
+                    SftpNodeKind::File
+                } else {
+                    SftpNodeKind::Other
+                }
+            });
+            if inside_staging && existing.is_some() {
+                return Err(format!(
+                    "本地下载暂存目录被意外修改，拒绝提交: {}",
+                    desired_local.display()
+                ));
+            }
+            let (local, existing) = match (existing, strategy) {
+                (Some(_), FileConflictStrategy::Skip) => {
+                    summary.skipped += 1;
+                    continue;
+                }
+                (Some(_), FileConflictStrategy::KeepBoth) => {
+                    (keep_both_local_path(&desired_local)?, None)
+                }
+                (existing, _) => (desired_local, existing),
+            };
+
+            match kind {
+                SftpNodeKind::Directory => {
+                    let mut completes_immediately = true;
+                    let (
+                        child_local_base,
+                        child_inside_staging,
+                        child_staging_replaces_existing,
+                    ) = match existing {
+                        None if inside_staging => {
+                            std::fs::create_dir(&local).map_err(|e| {
+                                format!("创建本地下载目录 {} 失败: {e}", local.display())
+                            })?;
+                            (local.clone(), true, staging_replaces_existing)
+                        }
+                        Some(SftpNodeKind::Directory)
+                            if strategy == FileConflictStrategy::Overwrite =>
+                        {
+                            (
+                                local.clone(),
+                                inside_staging,
+                                staging_replaces_existing,
+                            )
+                        }
+                        existing => {
+                            let replace_existing = existing.is_some();
+                            let (staging_container, staging) =
+                                create_local_staging_directory(&local)?;
+                            staging_containers.insert(staging_container.clone());
+                            stack.push(DownloadWork::CommitDirectory {
+                                staging: staging.clone(),
+                                staging_container,
+                                target: local.clone(),
+                                replace_existing,
+                                summary_before: summary.clone(),
+                            });
+                            completes_immediately = false;
+                            (
+                                staging,
+                                true,
+                                staging_replaces_existing || replace_existing,
+                            )
+                        }
+                    };
+                    if completes_immediately {
+                        summary.completed += 1;
+                    }
+                    let entries = sftp
+                        .read_dir(&remote)
+                        .await
+                        .map_err(|e| format!("读取远程目录失败: {}", e.message()))?;
+                    for entry in entries.into_iter().rev() {
+                        if !valid_remote_name(&entry.name) {
+                            if child_staging_replaces_existing {
+                                return Err(format!(
+                                    "本地下载暂存目录未完整构建: 服务器返回了无效条目名: {:?}",
+                                    entry.name
+                                ));
+                            }
+                            summary.skipped += 1;
+                            summary.warnings.push(format!(
+                                "服务器返回了无效条目名: {:?}",
+                                entry.name
+                            ));
+                            continue;
+                        }
+                        let kind = if entry.is_symlink {
+                            SftpNodeKind::Symlink
+                        } else if entry.is_dir {
+                            SftpNodeKind::Directory
+                        } else if entry.is_file {
+                            SftpNodeKind::File
+                        } else {
+                            SftpNodeKind::Other
+                        };
+                        stack.push(DownloadWork::Visit {
+                            remote: join_posix(&remote, &entry.name),
+                            desired_local: child_local_base.join(&entry.name),
+                            known_kind: Some(kind),
+                            inside_staging: child_inside_staging,
+                            staging_replaces_existing: child_staging_replaces_existing,
+                        });
+                    }
+                }
+                SftpNodeKind::File => {
+                    let overwrite =
+                        existing.is_some() && strategy == FileConflictStrategy::Overwrite;
+                    summary.bytes += sftp
+                        .download_file(&remote, &local, overwrite)
+                        .await
+                        .map_err(|e| format!("下载远程文件失败: {}", e.message()))?;
+                    summary.completed += 1;
+                }
+                SftpNodeKind::Symlink | SftpNodeKind::Other => unreachable!(),
+            }
+        }
+        Ok(())
+    }
+    .await;
+
+    if result.is_err() {
+        if let Some(summary_before) = stack.iter().find_map(|work| match work {
+            DownloadWork::CommitDirectory { summary_before, .. } => Some(summary_before.clone()),
+            DownloadWork::Visit { .. } => None,
+        }) {
+            *summary = summary_before;
+        }
+        let mut cleanup_errors = Vec::new();
+        for staging_container in staging_containers {
+            if std::fs::symlink_metadata(&staging_container).is_ok()
+                && let Err(error) = remove_local_entry(&staging_container)
+            {
+                cleanup_errors.push(error);
+            }
+        }
+        if !cleanup_errors.is_empty()
+            && let Err(original) = &result
+        {
+            let original = original.clone();
+            result = Err(format!(
+                "{original}; 清理本地下载暂存目录失败: {}",
+                cleanup_errors.join("; ")
+            ));
+        }
+    }
+    result
+}
+
+/// 下载一个或多个远程条目到本地目录。
+pub fn download_entries(
+    conn: &SshConnection,
+    project_root: &str,
+    remote_paths: &[PathBuf],
+    download_dir: &Path,
+    strategy: FileConflictStrategy,
+) -> Result<FileOperationSummary, String> {
+    if !download_dir.is_absolute() {
+        return Err(format!(
+            "下载目录必须是绝对路径: {}",
+            download_dir.display()
+        ));
+    }
+    std::fs::create_dir_all(download_dir)
+        .map_err(|e| format!("无法创建下载目录 {}: {e}", download_dir.display()))?;
+    mt_config::AppConfig::validate_download_dir(download_dir)
+        .map_err(|e| format!("下载目录不可用: {e:#}"))?;
+    let st = state();
+    st.block_on(async move {
+        let sftp = open_sftp(st, conn).await?;
+        let result = async {
+            let mut summary = FileOperationSummary::default();
+            for remote_path in remote_paths {
+                let remote = validate_remote_leaf_under_root(
+                    &sftp,
+                    project_root,
+                    &remote_path.to_string_lossy(),
+                )
+                .await?;
+                let (_, name) = split_posix_leaf(&remote)?;
+                let name = name.to_string();
+                if let Err(error) = download_remote_tree(
+                    &sftp,
+                    remote,
+                    download_dir.join(&name),
+                    strategy,
+                    &mut summary,
+                )
+                .await
+                {
+                    summary.failed += 1;
+                    summary.warnings.push(error);
+                }
+            }
+            Ok(summary)
         }
         .await;
         sftp.close().await;
@@ -995,7 +2948,7 @@ async fn scan_remote_claude(
             }
         }
     }
-    files.sort_by(|a, b| b.2.cmp(&a.2));
+    files.sort_by_key(|entry| std::cmp::Reverse(entry.2));
     files.truncate(REMOTE_CLAUDE_SCAN_LIMIT);
 
     let mut sessions = Vec::new();
@@ -1060,8 +3013,9 @@ async fn collect_remote_codex_files(
                 };
                 file_entries.retain(|e| !e.is_dir && e.name.ends_with(".jsonl"));
                 // 同一天内按 mtime 倒序。
-                file_entries
-                    .sort_by(|a, b| b.mtime_secs.unwrap_or(0).cmp(&a.mtime_secs.unwrap_or(0)));
+                file_entries.sort_by_key(|entry| {
+                    std::cmp::Reverse(entry.mtime_secs.unwrap_or(0))
+                });
                 for f in file_entries {
                     out.push((join_posix(&ddir, &f.name), f.mtime_secs.unwrap_or(0)));
                     if out.len() >= limit {
@@ -1423,6 +3377,59 @@ mod tests {
         assert!(posix_relative("/home/u/proj", "/other/place").is_none());
     }
 
+    #[test]
+    fn parent_posix_handles_root_and_trailing_slashes() {
+        assert_eq!(parent_posix("/home/u/project"), Some("/home/u".into()));
+        assert_eq!(parent_posix("/home/u/project/"), Some("/home/u".into()));
+        assert_eq!(parent_posix("/home"), Some("/".into()));
+        assert_eq!(parent_posix("/"), None);
+        assert_eq!(parent_posix(""), None);
+    }
+
+    #[test]
+    fn keep_both_names_preserve_extensions_and_dotfiles() {
+        assert_eq!(keep_both_name("notes.txt", 1), "notes copy.txt");
+        assert_eq!(keep_both_name("notes.txt", 2), "notes copy 2.txt");
+        assert_eq!(keep_both_name("archive.tar.gz", 1), "archive.tar copy.gz");
+        assert_eq!(keep_both_name("folder", 1), "folder copy");
+        assert_eq!(keep_both_name(".env", 1), ".env copy");
+    }
+
+    #[test]
+    fn remote_path_validation_rejects_escape_and_host_separator_names() {
+        assert_eq!(normalize_absolute_posix("/work/src/./main").unwrap(), "/work/src/main");
+        assert!(normalize_absolute_posix("/work/../etc").is_err());
+        assert!(!valid_remote_name("a/b"));
+        assert!(!valid_remote_name("a\\b"));
+        assert!(!valid_remote_name(".."));
+    }
+
+    #[test]
+    fn delete_child_validation_allows_remote_backslashes_but_rejects_separators() {
+        assert!(valid_sftp_child_name("a\\b"));
+        assert!(!valid_sftp_child_name("a/b"));
+        assert!(!valid_sftp_child_name("."));
+        assert!(!valid_sftp_child_name(".."));
+        assert!(!valid_sftp_child_name("a\0b"));
+    }
+
+    #[test]
+    fn delete_shell_command_quotes_parent_and_leaf() {
+        assert_eq!(shell_quote_posix("a'b"), "'a'\\''b'");
+        let command = remote_delete_command(
+            "/srv/project/a'b",
+            "/srv/project/.proof'file",
+            "nonce'value",
+        )
+        .unwrap();
+        assert!(command.contains("cd -P '/srv/project'"));
+        assert!(command.contains("[ ! -L './a'\\''b' ]"));
+        assert!(command.contains("[ \"$(cat -- './.proof'\\''file')\" = 'nonce'\\''value' ]"));
+        assert!(command.contains("rm -f -- './.proof'\\''file'"));
+        assert!(command.contains("rm -rf -- './a'\\''b'"));
+        assert!(!command.contains("rm -rf -- '/srv/project"));
+    }
+
     // --- ~ 展开 ---
 
     #[test]
@@ -1726,6 +3733,23 @@ not json\n\
     }
 
     #[test]
+    fn upload_conflicts_include_existing_and_duplicate_batch_names_once() {
+        let existing = HashSet::from(["existing.txt".to_string()]);
+        let paths = vec![
+            PathBuf::from("first/existing.txt"),
+            PathBuf::from("first/new.txt"),
+            PathBuf::from("second/new.txt"),
+            PathBuf::from("third/new.txt"),
+            PathBuf::from("second/existing.txt"),
+        ];
+
+        assert_eq!(
+            collect_upload_conflicts(&existing, &paths),
+            vec!["existing.txt".to_string(), "new.txt".to_string()]
+        );
+    }
+
+    #[test]
     fn session_id_guard_rejects_traversal_before_touching_network() {
         // 非法 id 必须在开 SFTP 之前就被挡下(否则 `../` 会拼进远端路径)。
         // 这条不触网:守卫在函数第一行。
@@ -1752,7 +3776,7 @@ not json\n\
     #[test]
     fn accumulate_session_content_concatenates_until_exhausted() {
         // 三段:每段推进偏移,最后一段偏移不再前进(EOF)→ 拼接全部消息
-        let chunks = vec![
+        let chunks = [
             (vec![msg("a"), msg("b")], 10u64),
             (vec![msg("c")], 20u64),
             (vec![], 20u64),

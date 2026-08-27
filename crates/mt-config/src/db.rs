@@ -61,8 +61,9 @@ use crate::config::AppConfig;
 ///
 /// ⚠️ 与 `usage.db` 相反、与 `layout.db` 相同:**版本不匹配绝不删表重建**。
 /// 账本是 JSONL 的派生缓存,重建只是多跑一次 backfill;配置是第一手数据,
-/// 重建即用户资产蒸发。加字段走 kv 表的天然向前兼容 —— 不认识的 key 原样留着,
-/// 装回新版还在。
+/// 重建即用户资产蒸发。普通 settings 键仍按当前强类型 schema 清理；需要跨旧版
+/// 保存周期保留的新字段必须单独放进 meta(见 `downloadDir`),避免旧程序整份保存时
+/// 把自己不认识的键删掉。
 const SCHEMA_VERSION: i64 = 1;
 
 const SCHEMA: &str = "
@@ -91,10 +92,14 @@ CREATE TABLE IF NOT EXISTS ssh_connections (
 /// 把删掉的项目全复活。
 const META_INITIALIZED: &str = "initialized";
 const META_SCHEMA_VERSION: &str = "schema_version";
+/// `downloadDir` 特意存进旧版本不会清理的 meta，而不是 settings。
+/// 这样用户短暂降级并保存其它设置后，再升级回来仍能恢复下载目录覆盖值。
+const META_DOWNLOAD_DIR: &str = "setting.downloadDir";
 
 /// 摘出去单独入表的两个键(其余进 settings)。
 const KEY_PROJECTS: &str = "projects";
 const KEY_SSH_CONNECTIONS: &str = "sshConnections";
+const KEY_DOWNLOAD_DIR: &str = "downloadDir";
 
 /// `config.db` 的读写口。
 pub(crate) struct ConfigDb {
@@ -235,6 +240,18 @@ impl ConfigDb {
             KEY_SSH_CONNECTIONS.to_string(),
             Value::Array(read_ordered(&conn, "ssh_connections")?),
         );
+        if let Some(raw) = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![META_DOWNLOAD_DIR],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+        {
+            let value = serde_json::from_str(&raw)
+                .context("配置项 downloadDir 的兼容值解析失败")?;
+            map.insert(KEY_DOWNLOAD_DIR.to_string(), value);
+        }
 
         let config: AppConfig = serde_json::from_value(Value::Object(map))
             .context("配置库内容不符合当前 schema")?;
@@ -248,7 +265,11 @@ impl ConfigDb {
     /// 「拿一份完整配置写下去」,不必为每种改动各开一个入口;而磁盘上只有真正
     /// 变了的行被触碰。
     pub fn save(&self, config: &AppConfig) -> Result<()> {
-        let (settings, projects, connections) = split_config(config)?;
+        let (mut settings, projects, connections) = split_config(config)?;
+        let download_dir = settings
+            .iter()
+            .position(|(key, _)| key == KEY_DOWNLOAD_DIR)
+            .map(|index| settings.swap_remove(index).1);
 
         let mut conn = self.conn.lock().map_err(|_| anyhow!("配置库锁中毒"))?;
         let tx = conn.transaction()?;
@@ -273,6 +294,18 @@ impl ConfigDb {
         }
         write_ordered(&tx, "projects", &projects)?;
         write_ordered(&tx, "ssh_connections", &connections)?;
+        match download_dir {
+            Some(value) => {
+                tx.execute(
+                    "INSERT INTO meta(key, value) VALUES(?1, ?2)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    params![META_DOWNLOAD_DIR, value],
+                )?;
+            }
+            None => {
+                tx.execute("DELETE FROM meta WHERE key = ?1", params![META_DOWNLOAD_DIR])?;
+            }
+        }
         tx.execute(
             "INSERT INTO meta(key, value) VALUES(?1, '1')
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -449,19 +482,22 @@ mod tests {
         let dir = temp_dir("roundtrip");
         let db = ConfigDb::open_at(&dir).unwrap();
 
-        let mut config = AppConfig::default();
-        config.ui_font_size = 15.0;
-        config.theme = "dark".into();
-        config.terminal_font_family = Some("Cascadia Mono".into());
-        config.hook_enabled = true;
-        config.projects = vec![project("p1", "甲"), project("p2", "乙")];
-        config.ssh_connections = vec![conn("c1")];
-        config.default_shell = "PowerShell".into();
-        config.available_shells = vec![ShellConfig {
-            name: "PowerShell".into(),
-            command: "powershell.exe".into(),
-            args: None,
-        }];
+        let mut config = AppConfig {
+            ui_font_size: 15.0,
+            theme: "dark".into(),
+            terminal_font_family: Some("Cascadia Mono".into()),
+            download_dir: Some("/tmp/mini-term-downloads".into()),
+            hook_enabled: true,
+            projects: vec![project("p1", "甲"), project("p2", "乙")],
+            ssh_connections: vec![conn("c1")],
+            default_shell: "PowerShell".into(),
+            available_shells: vec![ShellConfig {
+                name: "PowerShell".into(),
+                command: "powershell.exe".into(),
+                args: None,
+            }],
+            ..Default::default()
+        };
 
         db.save(&config).unwrap();
         let back = db.load().unwrap().unwrap();
@@ -469,6 +505,10 @@ mod tests {
         assert_eq!(back.ui_font_size, 15.0);
         assert_eq!(back.theme, "dark");
         assert_eq!(back.terminal_font_family.as_deref(), Some("Cascadia Mono"));
+        assert_eq!(
+            back.download_dir.as_deref(),
+            Some("/tmp/mini-term-downloads")
+        );
         assert!(back.hook_enabled);
         assert_eq!(back.default_shell, "PowerShell");
         assert_eq!(back.available_shells.len(), 1);
@@ -479,6 +519,43 @@ mod tests {
         assert_eq!(back.ssh_connections[0].password.as_deref(), Some("secret"));
         assert!(!db.is_empty());
 
+        // downloadDir 放在旧版本不会清理的 meta；settings 中不留同名键。
+        {
+            let conn = db.conn.lock().unwrap();
+            let settings_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM settings WHERE key = ?1",
+                    params![KEY_DOWNLOAD_DIR],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let compatible_value: String = conn
+                .query_row(
+                    "SELECT value FROM meta WHERE key = ?1",
+                    params![META_DOWNLOAD_DIR],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(settings_count, 0);
+            assert_eq!(compatible_value, "\"/tmp/mini-term-downloads\"");
+        }
+
+        // 恢复系统默认会移除 meta 中的兼容值。
+        config.download_dir = None;
+        db.save(&config).unwrap();
+        assert!(db.load().unwrap().unwrap().download_dir.is_none());
+        let compatible_count: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM meta WHERE key = ?1",
+                params![META_DOWNLOAD_DIR],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(compatible_count, 0);
+
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -487,8 +564,10 @@ mod tests {
     fn 项目顺序按_ord_还原() {
         let dir = temp_dir("order");
         let db = ConfigDb::open_at(&dir).unwrap();
-        let mut config = AppConfig::default();
-        config.projects = vec![project("zzz", "第一"), project("aaa", "第二")];
+        let mut config = AppConfig {
+            projects: vec![project("zzz", "第一"), project("aaa", "第二")],
+            ..Default::default()
+        };
         db.save(&config).unwrap();
 
         let back = db.load().unwrap().unwrap();
@@ -510,9 +589,11 @@ mod tests {
     fn 删除的项目与连接不残留() {
         let dir = temp_dir("delete");
         let db = ConfigDb::open_at(&dir).unwrap();
-        let mut config = AppConfig::default();
-        config.projects = vec![project("p1", "甲"), project("p2", "乙")];
-        config.ssh_connections = vec![conn("c1"), conn("c2")];
+        let mut config = AppConfig {
+            projects: vec![project("p1", "甲"), project("p2", "乙")],
+            ssh_connections: vec![conn("c1"), conn("c2")],
+            ..Default::default()
+        };
         db.save(&config).unwrap();
 
         config.projects.retain(|p| p.id == "p1");
@@ -534,8 +615,10 @@ mod tests {
     fn 项目删光后仍不是空库() {
         let dir = temp_dir("all-deleted");
         let db = ConfigDb::open_at(&dir).unwrap();
-        let mut config = AppConfig::default();
-        config.projects = vec![project("p1", "甲")];
+        let mut config = AppConfig {
+            projects: vec![project("p1", "甲")],
+            ..Default::default()
+        };
         db.save(&config).unwrap();
 
         config.projects.clear();
@@ -551,9 +634,11 @@ mod tests {
         let dir = temp_dir("reopen");
         {
             let db = ConfigDb::open_at(&dir).unwrap();
-            let mut config = AppConfig::default();
-            config.projects = vec![project("p1", "甲")];
-            config.ui_font_size = 17.0;
+            let config = AppConfig {
+                projects: vec![project("p1", "甲")],
+                ui_font_size: 17.0,
+                ..Default::default()
+            };
             db.save(&config).unwrap();
         }
         let db = ConfigDb::open_at(&dir).unwrap();
@@ -568,9 +653,11 @@ mod tests {
     fn 布局字段不进配置库() {
         let dir = temp_dir("no-layout");
         let db = ConfigDb::open_at(&dir).unwrap();
-        let mut config = AppConfig::default();
-        config.layout_sizes = Some(vec![20.0, 80.0]);
-        config.right_drawer_width = Some(400.0);
+        let config = AppConfig {
+            layout_sizes: Some(vec![20.0, 80.0]),
+            right_drawer_width: Some(400.0),
+            ..Default::default()
+        };
         db.save(&config).unwrap();
 
         let keys: Vec<String> = {
@@ -592,8 +679,10 @@ mod tests {
         let bak = dir.join("config.db.bak");
         {
             let db = ConfigDb::open_at(&dir).unwrap();
-            let mut config = AppConfig::default();
-            config.projects = vec![project("p1", "甲")];
+            let config = AppConfig {
+                projects: vec![project("p1", "甲")],
+                ..Default::default()
+            };
             db.save(&config).unwrap();
             db.backup_to(&bak).unwrap();
         }
