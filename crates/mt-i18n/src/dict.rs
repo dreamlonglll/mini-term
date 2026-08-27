@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 32;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 823;
+pub const ZH_ENTRY_COUNT: usize = 824;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 823;
+pub const EN_ENTRY_COUNT: usize = 824;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -877,6 +877,7 @@ static REMOTE_PROJECT_ZH: &[(&str, &str)] = &[
     ("browse", "浏览…"),
     ("cancel", "取消"),
     ("connectionLabel", "SSH 连接"),
+    ("errorCloseOverlayBeforeSave", "请先关闭上层弹窗，然后重新添加项目"),
     ("errorNoConnection", "请先选择一个 SSH 连接"),
     ("footerHint", "保存前会通过 SFTP 验证目录存在"),
     ("nameLabel", "项目名称"),
@@ -904,6 +905,7 @@ static REMOTE_PROJECT_EN: &[(&str, &str)] = &[
     ("browse", "Browse…"),
     ("cancel", "Cancel"),
     ("connectionLabel", "SSH Connection"),
+    ("errorCloseOverlayBeforeSave", "Close the dialog above, then add the project again"),
     ("errorNoConnection", "Select an SSH connection first"),
     ("footerHint", "The directory is verified over SFTP before saving"),
     ("nameLabel", "Project name"),

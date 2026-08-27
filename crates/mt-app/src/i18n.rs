@@ -459,6 +459,7 @@ const USED_KEYS: &[&str] = &[
     "remoteProject.allConnections",
     "remoteProject.browse",
     "remoteProject.cancel",
+    "remoteProject.errorCloseOverlayBeforeSave",
     "remoteProject.errorNoConnection",
     "remoteProject.footerHint",
     "remoteProject.nameLabel",

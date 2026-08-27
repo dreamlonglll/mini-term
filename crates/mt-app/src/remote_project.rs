@@ -240,6 +240,20 @@ fn save(state: &Entity<AddRemotePanel>, window: &mut Window, cx: &mut App) {
 
             match result {
                 Ok(canonical) => {
+                    // 校验期间允许其它种类的覆盖物叠到上面。只有当前添加项目弹窗
+                    // 已回到栈顶时才真正写配置，否则 `close_guarded` 无法关闭它，
+                    // 用户稍后再次点击会重复创建同一项目。
+                    if !crate::overlay::is_top(crate::overlay::key(
+                        kind::ADD_REMOTE_PROJECT,
+                    )) {
+                        state_for_task.update(cx, |panel, cx| {
+                            panel.busy = false;
+                            panel.error =
+                                t("remoteProject", "errorCloseOverlayBeforeSave").to_string();
+                            cx.notify();
+                        });
+                        return;
+                    }
                     state_for_task.update(cx, |panel, cx| {
                         let id = panel.store.update(cx, |store, cx| {
                             let id = store.add_remote_project(
@@ -270,7 +284,8 @@ fn save(state: &Entity<AddRemotePanel>, window: &mut Window, cx: &mut App) {
                         panel.busy = false;
                         cx.notify();
                     });
-                    close_guarded(kind::ADD_REMOTE_PROJECT, window, cx);
+                    let closed = close_guarded(kind::ADD_REMOTE_PROJECT, window, cx);
+                    debug_assert!(closed, "添加远程项目写入前已确认弹窗位于栈顶");
                 }
                 Err(err) => {
                     // 校验失败**不关窗**:用户刚打的路径还在框里,改一改就能再试

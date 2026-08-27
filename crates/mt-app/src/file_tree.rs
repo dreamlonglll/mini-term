@@ -108,6 +108,10 @@ pub struct FileTree {
     /// 当前 FileTree 同时只允许一个 mutation/transfer。
     operation_busy: bool,
     operation_label: Option<String>,
+    /// 在途操作开始时的来源身份。切项目不会清空它；任务结束时只允许原操作
+    /// 释放全局闸，并仅在项目/根/后端仍一致时刷新视图。
+    active_operation_context: Option<FileOperationContext>,
+    active_operation_suppressed_path: Option<PathBuf>,
     /// 正在被删除、重命名或批量改写的子树。操作结束前禁止 watcher / 展开态补列
     /// 重新挂载它，避免大目录删除时 watcher 事件洪泛和半成品缓存回写。
     suppressed_subtrees: HashSet<PathBuf>,
@@ -234,6 +238,8 @@ impl FileTree {
             file_clipboard: None,
             operation_busy: false,
             operation_label: None,
+            active_operation_context: None,
+            active_operation_suppressed_path: None,
             suppressed_subtrees: HashSet::new(),
             external_drop_target: None,
             git_status: HashMap::new(),
@@ -353,9 +359,17 @@ impl FileTree {
         self.current_project = project_id;
         self.source_signature = signature;
         self.source_generation = self.source_generation.wrapping_add(1);
-        self.operation_busy = false;
-        self.operation_label = None;
         self.suppressed_subtrees.clear();
+        if self.operation_busy
+            && let (Some(active), Some(current), Some(path)) = (
+                self.active_operation_context.as_ref(),
+                self.operation_context(cx),
+                self.active_operation_suppressed_path.as_ref(),
+            )
+            && same_file_source(active, &current)
+        {
+            self.suppressed_subtrees.insert(path.clone());
+        }
         self.external_drop_target = None;
         self.remote_broken = broken;
         self.git_status.clear();
@@ -872,6 +886,12 @@ impl FileTree {
     }
 }
 
+fn same_file_source(left: &FileOperationContext, right: &FileOperationContext) -> bool {
+    left.project_id == right.project_id
+        && left.root == right.root
+        && left.backend == right.backend
+}
+
 /// 「展开着、却一份内容都没列过」的目录 —— 要补列的那些。
 ///
 /// 展开状态存在 [`AppStore`] 里并**落盘**(`ProjectConfig::expanded_dirs`),
@@ -1107,6 +1127,8 @@ fn begin_tree_preflight(
         }
         tree.operation_busy = true;
         tree.operation_label = Some(label.to_string());
+        tree.active_operation_context = Some(context.clone());
+        tree.active_operation_suppressed_path = None;
         cx.notify();
         Some(true)
     });
@@ -1131,16 +1153,20 @@ fn finish_tree_preflight(
     cx: &mut App,
 ) -> bool {
     tree.update(cx, |tree, cx| {
-        if tree.operation_context(cx).as_ref() != Some(context) {
+        if tree.active_operation_context.as_ref() != Some(context) {
             return false;
         }
+        let context_matches = tree.operation_context(cx).as_ref() == Some(context);
         tree.operation_busy = false;
         tree.operation_label = None;
+        tree.active_operation_context = None;
+        tree.active_operation_suppressed_path = None;
         cx.notify();
-        true
+        context_matches
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_tree_op(
     tree: Entity<FileTree>,
     context: FileOperationContext,
@@ -1162,6 +1188,8 @@ fn spawn_tree_op(
         }
         tree.operation_busy = true;
         tree.operation_label = Some(label.to_string());
+        tree.active_operation_context = Some(context.clone());
+        tree.active_operation_suppressed_path = suppressed_path.clone();
         cx.notify();
         Some(true)
     });
@@ -1196,14 +1224,22 @@ fn spawn_tree_op(
                 Ok(summary) => {
                     let context_matches = tree.update(cx, |tree, cx| {
                         let current = tree.operation_context(cx);
-                        if current.as_ref() != Some(&context) {
+                        if tree.active_operation_context.as_ref() != Some(&context) {
                             return false;
                         }
+                        let same_source = current
+                            .as_ref()
+                            .is_some_and(|current| same_file_source(current, &context));
                         tree.operation_busy = false;
                         tree.operation_label = None;
+                        tree.active_operation_context = None;
+                        tree.active_operation_suppressed_path = None;
                         if let Some(path) = suppressed_path.as_ref() {
-                            tree.detach_subtree(path);
-                            if !expand
+                            if same_source {
+                                tree.detach_subtree(path);
+                            }
+                            if same_source
+                                && !expand
                                 && let Some(project_id) = tree.current_project.clone()
                             {
                                 let key = path.to_string_lossy().to_string();
@@ -1213,14 +1249,14 @@ fn spawn_tree_op(
                             }
                             tree.suppressed_subtrees.remove(path);
                         }
-                        if let Some(refresh_dir) = refresh_dir {
+                        if same_source && let Some(refresh_dir) = refresh_dir {
                             if expand {
                                 tree.ensure_expanded(refresh_dir, cx);
                             } else {
                                 tree.reload_dir(refresh_dir, cx);
                             }
                         }
-                        true
+                        same_source
                     });
                     if context_matches && let Some(summary) = summary {
                         show_alert(
@@ -1234,21 +1270,28 @@ fn spawn_tree_op(
                 Err(err) => {
                     eprintln!("[files] 操作失败: {err}");
                     let context_matches = tree.update(cx, |tree, cx| {
-                        if tree.operation_context(cx).as_ref() == Some(&context) {
-                            tree.operation_busy = false;
-                            tree.operation_label = None;
-                            if let Some(path) = suppressed_path.as_ref() {
-                                tree.detach_subtree(path);
-                                tree.suppressed_subtrees.remove(path);
-                            }
-                            if let Some(failed_refresh_dir) = failed_refresh_dir {
-                                tree.reload_dir(failed_refresh_dir, cx);
-                            }
-                            cx.notify();
-                            true
-                        } else {
-                            false
+                        if tree.active_operation_context.as_ref() != Some(&context) {
+                            return false;
                         }
+                        let same_source = tree
+                            .operation_context(cx)
+                            .as_ref()
+                            .is_some_and(|current| same_file_source(current, &context));
+                        tree.operation_busy = false;
+                        tree.operation_label = None;
+                        tree.active_operation_context = None;
+                        tree.active_operation_suppressed_path = None;
+                        if let Some(path) = suppressed_path.as_ref() {
+                            if same_source {
+                                tree.detach_subtree(path);
+                            }
+                            tree.suppressed_subtrees.remove(path);
+                        }
+                        if same_source && let Some(failed_refresh_dir) = failed_refresh_dir {
+                            tree.reload_dir(failed_refresh_dir, cx);
+                        }
+                        cx.notify();
+                        same_source
                     });
                     if context_matches {
                         show_alert(
@@ -1417,6 +1460,7 @@ fn open_entry_in_terminal(
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_upload(
     tree: Entity<FileTree>,
     context: FileOperationContext,
@@ -1600,6 +1644,7 @@ fn choose_upload_paths(
         .detach();
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_download(
     tree: Entity<FileTree>,
     context: FileOperationContext,

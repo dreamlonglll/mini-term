@@ -132,10 +132,9 @@ fn render_body(state: &Entity<PickerState>, cx: &mut App) -> AnyElement {
             state.has_valid_current,
             state.loading,
             state.error.clone(),
-            state.on_select.clone(),
         )
     };
-    let (current, requested, directories, has_valid_current, loading, error, on_select) = snapshot;
+    let (current, requested, directories, has_valid_current, loading, error) = snapshot;
 
     let nav_button = |id: &'static str, label: &'static str, target: String| {
         let state = state.clone();
@@ -209,7 +208,6 @@ fn render_body(state: &Entity<PickerState>, cx: &mut App) -> AnyElement {
         }
     }
 
-    let choose_path = current.clone();
     div()
         .px(px(18.0))
         .pb(px(16.0))
@@ -284,12 +282,26 @@ fn render_body(state: &Entity<PickerState>, cx: &mut App) -> AnyElement {
                         t("remoteProject", "picker.chooseCurrent"),
                     )
                     .when(loading || !has_valid_current, |el| el.opacity(0.4))
-                    .on_click(move |_: &ClickEvent, window, cx| {
-                        if loading || !has_valid_current {
-                            return;
+                    .on_click({
+                        let state = state.clone();
+                        move |_: &ClickEvent, window, cx| {
+                            let (loading, has_valid_current, choose_path, on_select) = {
+                                let state = state.read(cx);
+                                (
+                                    state.loading,
+                                    state.has_valid_current,
+                                    state.current_path.clone(),
+                                    state.on_select.clone(),
+                                )
+                            };
+                            if loading || !has_valid_current {
+                                return;
+                            }
+                            if !close_guarded(kind::REMOTE_DIRECTORY_PICKER, window, cx) {
+                                return;
+                            }
+                            on_select(choose_path, window, cx);
                         }
-                        close_guarded(kind::REMOTE_DIRECTORY_PICKER, window, cx);
-                        on_select(choose_path.clone(), window, cx);
                     }),
                 ),
         )

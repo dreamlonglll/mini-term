@@ -987,19 +987,27 @@ pub fn browse_directory(
             {
                 return Err(format!("远程路径不是目录: {canonical}"));
             }
-            let mut directories: Vec<RemoteDirectoryEntry> = sftp
+            let entries = sftp
                 .read_dir(&canonical)
                 .await
-                .map_err(|e| format!("读取远程目录失败: {}", e.message()))?
-                .into_iter()
-                .filter(|entry| entry.is_dir || entry.is_symlink)
-                .filter(|entry| valid_sftp_child_name(&entry.name))
-                .map(|entry| RemoteDirectoryEntry {
-                    path: join_posix(&canonical, &entry.name),
+                .map_err(|e| format!("读取远程目录失败: {}", e.message()))?;
+            let mut directories = Vec::new();
+            for entry in entries {
+                if !valid_sftp_child_name(&entry.name) {
+                    continue;
+                }
+                let path = join_posix(&canonical, &entry.name);
+                let browsable = entry.is_dir
+                    || (entry.is_symlink && sftp.is_dir(&path).await.unwrap_or(false));
+                if !browsable {
+                    continue;
+                }
+                directories.push(RemoteDirectoryEntry {
+                    path,
                     name: entry.name,
                     is_symlink: entry.is_symlink,
-                })
-                .collect();
+                });
+            }
             directories.sort_by(|a, b| natural_cmp(&a.name, &b.name));
             Ok(RemoteDirectoryListing {
                 canonical_path: canonical,

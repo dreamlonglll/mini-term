@@ -15,6 +15,7 @@ export const remoteProject = {
     save: "添加",
     validating: "验证中…",
     errorNoConnection: "请先选择一个 SSH 连接",
+    errorCloseOverlayBeforeSave: "请先关闭上层弹窗，然后重新添加项目",
     browse: "浏览…",
     picker: {
       title: "选择远程文件夹",
@@ -43,6 +44,7 @@ export const remoteProject = {
     save: "Add",
     validating: "Validating…",
     errorNoConnection: "Select an SSH connection first",
+    errorCloseOverlayBeforeSave: "Close the dialog above, then add the project again",
     browse: "Browse…",
     picker: {
       title: "Choose Remote Folder",
