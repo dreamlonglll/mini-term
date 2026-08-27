@@ -1018,7 +1018,9 @@ fn sanitize_remote_markdown_inline_links(source: &str) -> String {
                 rest = tail;
                 continue;
             }
-            if ch == '<' && let Some(end) = rest[1..].find('>') {
+            if ch == '<'
+                && let Some(end) = rest[1..].find('>')
+            {
                 let value = &rest[1..end + 1];
                 if scheme_len(value).is_some() && !remote_markdown_url_allowed(value) {
                     out.push_str("link");

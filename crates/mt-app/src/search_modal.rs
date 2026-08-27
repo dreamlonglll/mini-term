@@ -108,9 +108,9 @@ pub fn open(store: Entity<AppStore>, window: &mut Window, cx: &mut App) {
     }
     let local_project = {
         let store = store.read(cx);
-        store.active_project().is_some_and(|project| {
-            !store.is_remote_project(&project.id)
-        })
+        store
+            .active_project()
+            .is_some_and(|project| !store.is_remote_project(&project.id))
     };
     if !local_project {
         return;

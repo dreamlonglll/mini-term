@@ -505,9 +505,7 @@ impl Render for WorkbenchArea {
                     let store = self.store.clone();
                     let project_id = project_id.clone();
                     window.defer(cx, move |window, cx| {
-                        if !area
-                            .read(cx)
-                            .is_terminal_page_for_project(&project_id, cx)
+                        if !area.read(cx).is_terminal_page_for_project(&project_id, cx)
                             || window.has_active_dialog(cx)
                             || !crate::overlay::allows(crate::overlay::Yield::ToOverlay)
                         {
