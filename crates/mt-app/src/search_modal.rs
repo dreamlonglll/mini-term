@@ -248,12 +248,7 @@ impl SearchModal {
     }
 
     /// 点一条结果：统一打开工作区文件页并收起搜索浮层。
-    fn open_result(
-        &self,
-        item: &SearchResultItem,
-        window: &mut Window,
-        cx: &mut App,
-    ) {
+    fn open_result(&self, item: &SearchResultItem, window: &mut Window, cx: &mut App) {
         let Some(root) = self.project_root(cx) else {
             return;
         };
@@ -544,12 +539,14 @@ impl SearchModal {
             .py(px(4.0))
             .cursor_pointer()
             .hover(|el| el.bg(ui::border_subtle()))
-            .on_click(cx.listener(move |this, _event: &gpui::ClickEvent, window, cx| {
-                let Some(item) = this.results.get(index).cloned() else {
-                    return;
-                };
-                this.open_result(&item, window, cx);
-            }))
+            .on_click(
+                cx.listener(move |this, _event: &gpui::ClickEvent, window, cx| {
+                    let Some(item) = this.results.get(index).cloned() else {
+                        return;
+                    };
+                    this.open_result(&item, window, cx);
+                }),
+            )
             .on_mouse_down(
                 gpui::MouseButton::Right,
                 cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
@@ -586,12 +583,14 @@ impl SearchModal {
             .py(px(6.0))
             .cursor_pointer()
             .hover(|el| el.bg(ui::border_subtle()))
-            .on_click(cx.listener(move |this, _event: &gpui::ClickEvent, window, cx| {
-                let Some(item) = this.results.get(index).cloned() else {
-                    return;
-                };
-                this.open_result(&item, window, cx);
-            }))
+            .on_click(
+                cx.listener(move |this, _event: &gpui::ClickEvent, window, cx| {
+                    let Some(item) = this.results.get(index).cloned() else {
+                        return;
+                    };
+                    this.open_result(&item, window, cx);
+                }),
+            )
             .on_mouse_down(
                 gpui::MouseButton::Right,
                 cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {

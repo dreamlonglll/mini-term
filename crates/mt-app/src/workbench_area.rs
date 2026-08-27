@@ -41,9 +41,10 @@ pub struct DocumentKey {
 impl DocumentKey {
     fn from_source(source: &DocumentSource) -> Self {
         let (backend, normalized_path) = match source {
-            DocumentSource::Local { path, .. } => {
-                (DocumentBackendKey::Local, normalize_local_document_path(path))
-            }
+            DocumentSource::Local { path, .. } => (
+                DocumentBackendKey::Local,
+                normalize_local_document_path(path),
+            ),
             DocumentSource::Remote {
                 connection, path, ..
             } => (
@@ -146,7 +147,8 @@ pub fn install(area: Entity<WorkbenchArea>, cx: &mut App) {
 }
 
 fn global(cx: &App) -> Option<Entity<WorkbenchArea>> {
-    cx.try_global::<GlobalWorkbench>().map(|global| global.0.clone())
+    cx.try_global::<GlobalWorkbench>()
+        .map(|global| global.0.clone())
 }
 
 /// 按当前项目快照打开文件。远程项目会同时快照连接身份，断链时明确报错。
@@ -264,9 +266,8 @@ impl WorkbenchArea {
                 .retain(|project_id, _| project_ids.contains(project_id));
             for project in this.projects.values() {
                 for tab in &project.tabs {
-                    tab.document.update(cx, |document, cx| {
-                        document.validate_remote_source(cx)
-                    });
+                    tab.document
+                        .update(cx, |document, cx| document.validate_remote_source(cx));
                 }
             }
             cx.notify();
@@ -314,9 +315,7 @@ impl WorkbenchArea {
         }
 
         let title = source.file_name();
-        let document = cx.new(|cx| {
-            FileViewer::new_document(source, highlight_line, window, cx)
-        });
+        let document = cx.new(|cx| FileViewer::new_document(source, highlight_line, window, cx));
         cx.observe(&document, |_this, _document, cx| cx.notify())
             .detach();
         project.tabs.push(DocumentTab {
@@ -393,15 +392,11 @@ impl WorkbenchArea {
         else {
             return;
         };
-        let Some(document) = self
-            .projects
-            .get(&project_id)
-            .and_then(|project| {
-                project
-                    .index_of(&key)
-                    .map(|index| project.tabs[index].document.clone())
-            })
-        else {
+        let Some(document) = self.projects.get(&project_id).and_then(|project| {
+            project
+                .index_of(&key)
+                .map(|index| project.tabs[index].document.clone())
+        }) else {
             return;
         };
         document.update(cx, |document, cx| document.open_search(window, cx));
@@ -425,21 +420,24 @@ impl WorkbenchArea {
         }
 
         let this = cx.entity();
-        Confirm::new(t("fileViewer", "unsavedTitle"), t("fileViewer", "unsavedMessage"))
-            .open(
-                move |window, cx| {
-                    let this = this.clone();
-                    let project_id = project_id.clone();
-                    let key = key.clone();
-                    window.defer(cx, move |window, cx| {
-                        this.update(cx, |area, cx| {
-                            area.close_document(&project_id, &key, window, cx)
-                        });
+        Confirm::new(
+            t("fileViewer", "unsavedTitle"),
+            t("fileViewer", "unsavedMessage"),
+        )
+        .open(
+            move |window, cx| {
+                let this = this.clone();
+                let project_id = project_id.clone();
+                let key = key.clone();
+                window.defer(cx, move |window, cx| {
+                    this.update(cx, |area, cx| {
+                        area.close_document(&project_id, &key, window, cx)
                     });
-                },
-                window,
-                cx,
-            );
+                });
+            },
+            window,
+            cx,
+        );
     }
 
     fn close_document(
@@ -462,9 +460,7 @@ impl WorkbenchArea {
         }
         match project.active.clone() {
             WorkbenchPage::Terminal => self.activate_terminal(window, cx),
-            WorkbenchPage::Document(next) => {
-                self.activate_document(project_id, &next, window, cx)
-            }
+            WorkbenchPage::Document(next) => self.activate_document(project_id, &next, window, cx),
         }
         cx.notify();
     }
@@ -472,7 +468,11 @@ impl WorkbenchArea {
     fn active_snapshot(
         &self,
         cx: &App,
-    ) -> Option<(String, WorkbenchPage, Vec<(DocumentKey, String, Entity<FileViewer>)>)> {
+    ) -> Option<(
+        String,
+        WorkbenchPage,
+        Vec<(DocumentKey, String, Entity<FileViewer>)>,
+    )> {
         let project_id = self.store.read(cx).active_project_id.clone()?;
         let project = self.projects.get(&project_id);
         let active = project
@@ -568,12 +568,15 @@ impl Render for WorkbenchArea {
                     .when(!terminal_active, |el| {
                         el.text_color(ui::text_muted())
                             .border_t_2()
-                            .border_color(gpui::Hsla { a: 0.0, ..ui::accent() })
+                            .border_color(gpui::Hsla {
+                                a: 0.0,
+                                ..ui::accent()
+                            })
                     })
                     .child(t("terminalArea", "terminal"))
-                    .on_click(cx.listener(|this, _event, window, cx| {
-                        this.activate_terminal(window, cx)
-                    })),
+                    .on_click(
+                        cx.listener(|this, _event, window, cx| this.activate_terminal(window, cx)),
+                    ),
             );
 
         for (key, title, document) in &tabs {
@@ -607,10 +610,19 @@ impl Render for WorkbenchArea {
                     .when(!selected, |el| {
                         el.text_color(ui::text_muted())
                             .border_t_2()
-                            .border_color(gpui::Hsla { a: 0.0, ..ui::accent() })
+                            .border_color(gpui::Hsla {
+                                a: 0.0,
+                                ..ui::accent()
+                            })
                     })
                     .child(FileIcon::new(title, false, false).size(px(14.0)))
-                    .child(div().min_w(px(0.0)).flex_1().truncate().child(title.clone()))
+                    .child(
+                        div()
+                            .min_w(px(0.0))
+                            .flex_1()
+                            .truncate()
+                            .child(title.clone()),
+                    )
                     .when(dirty, |el| {
                         el.child(
                             div()
@@ -638,9 +650,7 @@ impl Render for WorkbenchArea {
                             .justify_center()
                             .rounded(px(3.0))
                             .text_color(ui::text_muted())
-                            .hover(|el| {
-                                el.bg(ui::border_subtle()).text_color(ui::text_primary())
-                            })
+                            .hover(|el| el.bg(ui::border_subtle()).text_color(ui::text_primary()))
                             .child("×")
                             .on_click(cx.listener(move |this, _event, window, cx| {
                                 cx.stop_propagation();

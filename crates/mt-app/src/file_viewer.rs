@@ -1521,9 +1521,7 @@ pub fn open(
         project_root,
         path,
     };
-    let view = cx.new(|cx| {
-        FileViewer::new(source, highlight_line, ViewerHost::Modal, window, cx)
-    });
+    let view = cx.new(|cx| FileViewer::new(source, highlight_line, ViewerHost::Modal, window, cx));
     CURRENT.with(|c| *c.borrow_mut() = Some(view.downgrade()));
 
     open_guarded(kind::FILE_VIEWER, window, cx, {
@@ -1799,9 +1797,7 @@ impl FileViewer {
                     let probe = (project_root, path.clone());
                     let outcome = cx
                         .background_executor()
-                        .spawn(async move {
-                            mt_project::fs::read_file_content(&probe.0, &probe.1)
-                        })
+                        .spawn(async move { mt_project::fs::read_file_content(&probe.0, &probe.1) })
                         .await;
                     let _ = this.update_in(cx, |view: &mut FileViewer, window, cx| {
                         if view.current_path != path || view.load_generation != generation {
@@ -1861,7 +1857,12 @@ impl FileViewer {
     ///
     /// 「编辑基线与内容一起落位」是原版注释里点名的一条(`FileViewerModal.tsx:224`)——
     /// 分两步会出现「内容已换、基线还是旧文件」的窗口,那一瞬间的脏态是错的。
-    fn apply_content(&mut self, res: FileContentResult, window: &mut Window, cx: &mut Context<Self>) {
+    fn apply_content(
+        &mut self,
+        res: FileContentResult,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.remote_baseline = None;
         self.remote_conflict = None;
         self.apply_file_content(res, window, cx);
@@ -1906,11 +1907,7 @@ impl FileViewer {
             let outcome = cx
                 .background_executor()
                 .spawn(async move {
-                    crate::remote_ssh::read_file_content(
-                        &connection,
-                        &project_root,
-                        &remote_path,
-                    )
+                    crate::remote_ssh::read_file_content(&connection, &project_root, &remote_path)
                 })
                 .await;
             let _ = this.update_in(cx, |view: &mut FileViewer, window, cx| {
@@ -2053,7 +2050,9 @@ impl FileViewer {
             let store = crate::store::AppStore::global(cx);
             let store = store.read(cx);
             (
-                store.project(project_id).map(|project| project.path.clone()),
+                store
+                    .project(project_id)
+                    .map(|project| project.path.clone()),
                 store.remote_connection_of(project_id),
             )
         };
@@ -2335,9 +2334,7 @@ impl FileViewer {
         match self.host {
             // Modal host itself is an active dialog. The overlay stack tells us
             // whether a nested confirm/menu has since moved above it.
-            ViewerHost::Modal => {
-                crate::overlay::is_top(crate::overlay::key(kind::FILE_VIEWER))
-            }
+            ViewerHost::Modal => crate::overlay::is_top(crate::overlay::key(kind::FILE_VIEWER)),
             ViewerHost::Workbench => {
                 crate::workbench_area::is_document_active(&self.source, cx)
                     && !window.has_active_dialog(cx)
@@ -2439,8 +2436,7 @@ impl FileViewer {
         let name = self.file_name();
         let path = self.path_str();
         let is_html = !self.source.is_remote() && is_html_file(&path);
-        let can_edit = !self.remote_source_invalid
-            && can_edit(self.is_img(), self.result.as_ref());
+        let can_edit = !self.remote_source_invalid && can_edit(self.is_img(), self.result.as_ref());
         let dirty = self.dirty;
         let saving = self.saving;
 
@@ -2655,11 +2651,7 @@ impl FileViewer {
                         .text_size(ui::font_px(12.0))
                         .text_color(ui::color_warning())
                         .truncate()
-                        .child(format!(
-                            "{}: {}",
-                            t("fileViewer", "saveWarning"),
-                            warning
-                        )),
+                        .child(format!("{}: {}", t("fileViewer", "saveWarning"), warning)),
                 )
             })
             .when(
@@ -2684,14 +2676,12 @@ impl FileViewer {
                                     .cursor_pointer()
                                     .hover(|el| el.text_color(ui::text_primary()))
                                     .child(t("fileViewer", "reloadDiscard"))
-                                    .on_click(cx.listener(
-                                        |this, _: &ClickEvent, window, cx| {
-                                            let Some(current) = this.remote_conflict.take() else {
-                                                return;
-                                            };
-                                            this.apply_remote_content(current, window, cx);
-                                        },
-                                    )),
+                                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                        let Some(current) = this.remote_conflict.take() else {
+                                            return;
+                                        };
+                                        this.apply_remote_content(current, window, cx);
+                                    })),
                             )
                             .child(
                                 div()
@@ -2699,11 +2689,9 @@ impl FileViewer {
                                     .cursor_pointer()
                                     .hover(|el| el.text_color(ui::text_primary()))
                                     .child(t("fileViewer", "forceSave"))
-                                    .on_click(cx.listener(
-                                        |this, _: &ClickEvent, _window, cx| {
-                                            this.save_with_mode(true, cx);
-                                        },
-                                    )),
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                                        this.save_with_mode(true, cx);
+                                    })),
                             ),
                     )
                 },
@@ -2732,11 +2720,9 @@ impl FileViewer {
                                 .when(self.saving, |el| el.opacity(0.5))
                                 .child(t("fileViewer", "reloadDiscard"))
                                 .when(!self.saving, |el| {
-                                    el.on_click(cx.listener(
-                                        |this, _: &ClickEvent, window, cx| {
-                                            this.reload(window, cx);
-                                        },
-                                    ))
+                                    el.on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                        this.reload(window, cx);
+                                    }))
                                 }),
                         ),
                 )
@@ -2770,16 +2756,12 @@ impl FileViewer {
                     ),
                 )
             })
-            .when(remote, |el| {
-                el.child(t("fileViewer", "remoteDownloadHint"))
-            })
+            .when(remote, |el| el.child(t("fileViewer", "remoteDownloadHint")))
             .when(remote && !self.remote_source_invalid, |el| {
                 el.child(
-                    ui::primary_button(id, t("fileTree", "menu.download")).on_click(
-                        cx.listener(|this, _: &ClickEvent, window, cx| {
-                            this.download_remote_file(window, cx)
-                        }),
-                    ),
+                    ui::primary_button(id, t("fileTree", "menu.download")).on_click(cx.listener(
+                        |this, _: &ClickEvent, window, cx| this.download_remote_file(window, cx),
+                    )),
                 )
             })
     }
@@ -2996,9 +2978,7 @@ impl FileViewer {
     ) -> Rc<Vec<(f32, MdBlock)>> {
         // 先把命中与否算完再撒手,别让 borrow 活到 borrow_mut 那一行
         let hit = self.md_cache.borrow().as_ref().and_then(|c| {
-            (c.source == source
-                && c.base_dir == base_dir
-                && c.local_resources == local_resources)
+            (c.source == source && c.base_dir == base_dir && c.local_resources == local_resources)
                 .then(|| c.blocks.clone())
         });
         if let Some(blocks) = hit {
@@ -3102,11 +3082,7 @@ impl FileViewer {
         // split_md_blocks 一节的说明),其余段落照走 TextView;段落 id 按段序编,
         // 文档不变即稳定。分块结果跨帧缓存(见 MdCache)——「滚一格重画一遍」
         // 这条路上,每帧重切 40 KB 正文是白烧。
-        let blocks = self.md_blocks(
-            self.preview_source(),
-            &base_dir,
-            !self.source.is_remote(),
-        );
+        let blocks = self.md_blocks(self.preview_source(), &base_dir, !self.source.is_remote());
         let avail_w = self.preview_avail_width(window);
         div()
             .id("file-viewer-md")
@@ -3739,7 +3715,10 @@ mod tests {
             "[remote]: https://example.com/image.png\n",
         ));
         assert!(!references.contains("file:///"), "{references}");
-        assert!(references.contains("[local]: <about:blank>"), "{references}");
+        assert!(
+            references.contains("[local]: <about:blank>"),
+            "{references}"
+        );
         assert!(
             references.contains("[remote]: https://example.com/image.png"),
             "{references}"
@@ -3759,7 +3738,10 @@ mod tests {
         );
         assert!(sanitized.contains(r#"src="about:blank""#), "{sanitized}");
         assert!(sanitized.contains(r#"href="#""#), "{sanitized}");
-        assert!(sanitized.contains("https://example.com/docs"), "{sanitized}");
+        assert!(
+            sanitized.contains("https://example.com/docs"),
+            "{sanitized}"
+        );
 
         let unquoted = sanitize_remote_html_urls(concat!(
             r#"<img src=file:///etc/passwd>"#,

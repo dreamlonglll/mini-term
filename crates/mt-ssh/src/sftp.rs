@@ -110,8 +110,7 @@ fn can_restore_verified_backup(
     target_state: &Result<Option<SftpNodeKind>, SftpTransferError>,
     backup_state: &Result<Option<SftpNodeKind>, SftpTransferError>,
 ) -> bool {
-    matches!(target_state, Ok(None))
-        && matches!(backup_state, Ok(Some(SftpNodeKind::File)))
+    matches!(target_state, Ok(None)) && matches!(backup_state, Ok(Some(SftpNodeKind::File)))
 }
 
 /// 打开在某条 session 上的 SFTP 会话句柄。可跨多次操作复用;用完调 [`Self::close`]
@@ -373,11 +372,14 @@ impl SftpHandle {
     ) -> Result<(), SftpTransferError> {
         let mut attributes = russh_sftp::protocol::FileAttributes::empty();
         attributes.permissions = Some(permissions);
-        self.sftp.set_metadata(path, attributes).await.map_err(|error| {
-            SftpTransferError::Sftp(format!(
-                "sftp preserve permissions on '{path}' failed: {error}"
-            ))
-        })
+        self.sftp
+            .set_metadata(path, attributes)
+            .await
+            .map_err(|error| {
+                SftpTransferError::Sftp(format!(
+                    "sftp preserve permissions on '{path}' failed: {error}"
+                ))
+            })
     }
 
     /// 逐级创建远程目录(`mkdir -p` 语义)。`path` 必须是 POSIX 绝对路径。
@@ -562,7 +564,8 @@ impl SftpHandle {
         staging: &str,
         target: &str,
     ) -> Result<(), SftpTransferError> {
-        self.replace_staged_entry_with_expected_kind(staging, target, None).await
+        self.replace_staged_entry_with_expected_kind(staging, target, None)
+            .await
     }
 
     async fn replace_staged_regular_file(
@@ -608,10 +611,9 @@ impl SftpHandle {
         let isolated = match self.read_file_bounded(&backup, max_bytes).await {
             Ok(current) => current,
             Err(error) => {
-                return Err(
-                    self.rollback_staged_regular_file(&backup, target, staging, error)
-                        .await,
-                );
+                return Err(self
+                    .rollback_staged_regular_file(&backup, target, staging, error)
+                    .await);
             }
         };
         let changed = matches!(&isolated, SftpBoundedFileRead::TooLarge)
@@ -637,27 +639,24 @@ impl SftpHandle {
         let permissions = match self.regular_file_permissions(&backup).await {
             Ok(permissions) => permissions,
             Err(error) => {
-                return Err(
-                    self.rollback_staged_regular_file(&backup, target, staging, error)
-                        .await,
-                );
+                return Err(self
+                    .rollback_staged_regular_file(&backup, target, staging, error)
+                    .await);
             }
         };
         if let Err(error) = self.set_file_permissions(staging, permissions).await {
-            return Err(
-                self.rollback_staged_regular_file(&backup, target, staging, error)
-                    .await,
-            );
+            return Err(self
+                .rollback_staged_regular_file(&backup, target, staging, error)
+                .await);
         }
         if let Err(error) = self
             .node_kind(staging)
             .await
             .and_then(|kind| ensure_regular_file(kind, staging))
         {
-            return Err(
-                self.rollback_staged_regular_file(&backup, target, staging, error)
-                    .await,
-            );
+            return Err(self
+                .rollback_staged_regular_file(&backup, target, staging, error)
+                .await);
         }
 
         let promote_error = self.rename(staging, target).await.err();
@@ -684,9 +683,7 @@ impl SftpHandle {
                     let rollback_result = self.rename(&backup, target).await;
                     let original = promote_error.unwrap_or(error);
                     return match rollback_result {
-                        Ok(()) => {
-                            Err(self.with_staging_cleanup_error(original, staging).await)
-                        }
+                        Ok(()) => Err(self.with_staging_cleanup_error(original, staging).await),
                         Err(rollback_error) => Err(SftpTransferError::Sftp(format!(
                             "{}; promotion state could not be read and rollback request failed: {}; target/backup/staging final state is uncertain; recovery paths are backup='{}', staging='{}'",
                             original.message(),
@@ -767,10 +764,9 @@ impl SftpHandle {
     ) -> Result<(), SftpTransferError> {
         let backup = unique_sibling_path(target, "backup");
         if let Err(err) = self.rename(target, &backup).await {
-            return Err(
-                self.with_replacement_staging_cleanup_error(err, staging, expected_backup_kind)
-                    .await,
-            );
+            return Err(self
+                .with_replacement_staging_cleanup_error(err, staging, expected_backup_kind)
+                .await);
         }
 
         if let Some(expected_kind) = expected_backup_kind {
@@ -796,14 +792,9 @@ impl SftpHandle {
                         backup
                     )),
                 };
-                return Err(
-                    self.with_replacement_staging_cleanup_error(
-                        error,
-                        staging,
-                        expected_backup_kind,
-                    )
-                    .await,
-                );
+                return Err(self
+                    .with_replacement_staging_cleanup_error(error, staging, expected_backup_kind)
+                    .await);
             }
         }
 
@@ -818,10 +809,9 @@ impl SftpHandle {
                     backup
                 )),
             };
-            return Err(
-                self.with_replacement_staging_cleanup_error(error, staging, expected_backup_kind)
-                    .await,
-            );
+            return Err(self
+                .with_replacement_staging_cleanup_error(error, staging, expected_backup_kind)
+                .await);
         }
         let kind = self.node_kind(&backup).await.map_err(|error| {
             SftpTransferError::Sftp(format!(
@@ -896,9 +886,7 @@ impl SftpHandle {
         let write_result: Result<(), SftpTransferError> = async {
             for chunk in contents.chunks(SFTP_READ_CHUNK_BYTES) {
                 remote.write_all(chunk).await.map_err(|error| {
-                    SftpTransferError::Sftp(format!(
-                        "sftp write '{staging}' failed: {error}"
-                    ))
+                    SftpTransferError::Sftp(format!("sftp write '{staging}' failed: {error}"))
                 })?;
             }
             remote.flush().await.map_err(|error| {
@@ -927,13 +915,15 @@ impl SftpHandle {
         let changed = matches!(&current, SftpBoundedFileRead::TooLarge)
             || expected_current.is_some_and(|expected| !current.matches_bytes(expected));
         if changed {
-            self.discard_file_staging(&staging).await.map_err(|cleanup_error| {
-                SftpTransferError::Sftp(format!(
-                    "remote file changed before promotion; staging cleanup failed at \
+            self.discard_file_staging(&staging)
+                .await
+                .map_err(|cleanup_error| {
+                    SftpTransferError::Sftp(format!(
+                        "remote file changed before promotion; staging cleanup failed at \
                      '{staging}': {}",
-                    cleanup_error.message()
-                ))
-            })?;
+                        cleanup_error.message()
+                    ))
+                })?;
             return Ok(SftpFileReplaceResult::ExternalChange(current));
         }
         if let Err(error) = self
@@ -944,14 +934,8 @@ impl SftpHandle {
             return Err(self.with_staging_cleanup_error(error, &staging).await);
         }
 
-        self.replace_staged_regular_file(
-            &staging,
-            target,
-            contents,
-            max_bytes,
-            expected_current,
-        )
-        .await
+        self.replace_staged_regular_file(&staging, target, contents, max_bytes, expected_current)
+            .await
     }
 
     async fn with_replacement_staging_cleanup_error(
@@ -1464,10 +1448,7 @@ mod tests {
             Some(SftpNodeKind::Other)
         );
         assert_eq!(
-            ambiguous_editor_recovery_kind(
-                Some(SftpNodeKind::File),
-                Some(SftpNodeKind::File)
-            ),
+            ambiguous_editor_recovery_kind(Some(SftpNodeKind::File), Some(SftpNodeKind::File)),
             None
         );
         assert_eq!(ambiguous_editor_recovery_kind(None, None), None);

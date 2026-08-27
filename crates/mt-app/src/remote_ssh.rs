@@ -569,7 +569,9 @@ pub enum RemoteFileSaveResult {
         baseline: RemoteFileBaseline,
         warning: Option<String>,
     },
-    ExternalChange { current: RemoteFileReadResult },
+    ExternalChange {
+        current: RemoteFileReadResult,
+    },
 }
 
 fn valid_remote_name(name: &str) -> bool {
@@ -931,12 +933,9 @@ pub fn save_file_content(
                 }
                 let root_after_staging =
                     canonical_remote_document_root(&sftp, project_root).await?;
-                let path_after_staging = validate_remote_document_file_against_root(
-                    &sftp,
-                    &root_after_staging,
-                    path,
-                )
-                .await?;
+                let path_after_staging =
+                    validate_remote_document_file_against_root(&sftp, &root_after_staging, path)
+                        .await?;
                 validate_remote_file_baseline_path(
                     expected,
                     &root_after_staging,
@@ -3753,7 +3752,10 @@ mod tests {
         assert_eq!(text.content.content, "# title\n");
         assert!(!text.content.is_binary);
         assert!(!text.content.too_large);
-        assert_eq!(text.baseline.as_ref().map(|value| value.byte_len()), Some(8));
+        assert_eq!(
+            text.baseline.as_ref().map(|value| value.byte_len()),
+            Some(8)
+        );
 
         let binary = build_remote_file_read_result(
             &connection,
@@ -3823,16 +3825,10 @@ mod tests {
 
         let mut changed_connection = connection.clone();
         changed_connection.host = "new-host".into();
+        assert!(validate_remote_file_baseline_connection(&changed_connection, &baseline).is_err());
         assert!(
-            validate_remote_file_baseline_connection(&changed_connection, &baseline).is_err()
-        );
-        assert!(
-            validate_remote_file_baseline_path(
-                &baseline,
-                "/srv/other",
-                "/srv/other/src/main.rs"
-            )
-            .is_err()
+            validate_remote_file_baseline_path(&baseline, "/srv/other", "/srv/other/src/main.rs")
+                .is_err()
         );
         assert!(
             validate_remote_file_baseline_path(

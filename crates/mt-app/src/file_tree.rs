@@ -43,9 +43,9 @@ use std::time::{Duration, Instant};
 use futures::StreamExt;
 use futures::channel::mpsc;
 use gpui::{
-    AnyElement, App, ClipboardItem, Context, DragMoveEvent, Entity, ExternalPaths,
-    Global, Hsla, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
-    PathPromptOptions, Render, SharedString, StatefulInteractiveElement, Styled, Task, Window, div,
+    AnyElement, App, ClipboardItem, Context, DragMoveEvent, Entity, ExternalPaths, Global, Hsla,
+    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, PathPromptOptions,
+    Render, SharedString, StatefulInteractiveElement, Styled, Task, Window, div,
     prelude::FluentBuilder, px,
 };
 use mt_project::fs::FileEntry;
@@ -458,9 +458,7 @@ impl FileTree {
             match store.remote_connection_of(&project.id) {
                 Some(connection) => FileBackendIdentity::Remote {
                     connection_id: connection.id.clone(),
-                    connection_fingerprint: crate::remote_ssh::connection_fingerprint(
-                        &connection,
-                    ),
+                    connection_fingerprint: crate::remote_ssh::connection_fingerprint(&connection),
                 },
                 None => FileBackendIdentity::BrokenRemote,
             }
@@ -799,13 +797,7 @@ impl FileTree {
     /// 留着的话双击会先开预览器再拉起编辑器(gpui 的双击是两个 click 事件,
     /// click_count 依次为 1、2),两个窗口一起冒出来。
     fn open_file(&self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        crate::workbench_area::open_active_file(
-            self.store.clone(),
-            path,
-            None,
-            window,
-            cx,
-        );
+        crate::workbench_area::open_active_file(self.store.clone(), path, None, window, cx);
     }
 
     /// 展开某个目录并(重)列它。新建文件/文件夹之后要用:原版是
@@ -2380,9 +2372,8 @@ fn header_action_capabilities(
             FileBackendIdentity::Local | FileBackendIdentity::Remote { .. }
         )
     });
-    let show_upload = context.is_some_and(|context| {
-        matches!(&context.backend, FileBackendIdentity::Remote { .. })
-    });
+    let show_upload = context
+        .is_some_and(|context| matches!(&context.backend, FileBackendIdentity::Remote { .. }));
     let mutations_enabled = connected && !operation_busy;
     let paste_enabled = mutations_enabled
         && context.is_some_and(|context| {
@@ -2708,8 +2699,7 @@ impl Render for FileTree {
                                 header_capabilities.mutations_enabled,
                             )
                             .tooltip(|window, cx| {
-                                Tooltip::new(t("fileTree", "menu.uploadFolder"))
-                                    .build(window, cx)
+                                Tooltip::new(t("fileTree", "menu.uploadFolder")).build(window, cx)
                             })
                             .when(header_capabilities.mutations_enabled, |el| {
                                 el.on_click(cx.listener(|this, _event, window, cx| {
@@ -2743,38 +2733,35 @@ impl Render for FileTree {
                         )
                     })
                     .child(
-                        header_action_button(
-                            "file-tree-paste",
-                            header_capabilities.paste_enabled,
-                        )
-                        .tooltip(|window, cx| {
-                            Tooltip::new(t("fileTree", "menu.paste")).build(window, cx)
-                        })
-                        .when(header_capabilities.paste_enabled, |el| {
-                            el.on_click(cx.listener(|this, _event, window, cx| {
-                                let Some(context) = this.operation_context(cx) else {
-                                    return;
-                                };
-                                if this.operation_busy
-                                    || !this
-                                        .file_clipboard
-                                        .as_ref()
-                                        .is_some_and(|clip| clip.can_paste_into(&context))
-                                {
-                                    return;
-                                }
-                                let root = context.root.clone();
-                                // paste_file_clipboard 进门会 tree.read；当前 listener
-                                // 仍持有 FileTree 的 update 租约，直接调用会触发 GPUI
-                                // double-lease panic。延后一拍，并由业务入口再次校验
-                                // context/clipboard，避免项目切换时使用旧快照。
-                                let tree = cx.entity();
-                                window.defer(cx, move |window, cx| {
-                                    paste_file_clipboard(tree, context, root, window, cx);
-                                });
-                            }))
-                        })
-                        .child(VectorIcon::new(PASTE_SHAPES, px(13.0)).ink(ui::text_muted())),
+                        header_action_button("file-tree-paste", header_capabilities.paste_enabled)
+                            .tooltip(|window, cx| {
+                                Tooltip::new(t("fileTree", "menu.paste")).build(window, cx)
+                            })
+                            .when(header_capabilities.paste_enabled, |el| {
+                                el.on_click(cx.listener(|this, _event, window, cx| {
+                                    let Some(context) = this.operation_context(cx) else {
+                                        return;
+                                    };
+                                    if this.operation_busy
+                                        || !this
+                                            .file_clipboard
+                                            .as_ref()
+                                            .is_some_and(|clip| clip.can_paste_into(&context))
+                                    {
+                                        return;
+                                    }
+                                    let root = context.root.clone();
+                                    // paste_file_clipboard 进门会 tree.read；当前 listener
+                                    // 仍持有 FileTree 的 update 租约，直接调用会触发 GPUI
+                                    // double-lease panic。延后一拍，并由业务入口再次校验
+                                    // context/clipboard，避免项目切换时使用旧快照。
+                                    let tree = cx.entity();
+                                    window.defer(cx, move |window, cx| {
+                                        paste_file_clipboard(tree, context, root, window, cx);
+                                    });
+                                }))
+                            })
+                            .child(VectorIcon::new(PASTE_SHAPES, px(13.0)).ink(ui::text_muted())),
                     )
                     .child(
                         header_action_button(
@@ -2790,10 +2777,7 @@ impl Render for FileTree {
                                     return;
                                 };
                                 if this.operation_busy
-                                    || matches!(
-                                        &context.backend,
-                                        FileBackendIdentity::BrokenRemote
-                                    )
+                                    || matches!(&context.backend, FileBackendIdentity::BrokenRemote)
                                 {
                                     return;
                                 }
@@ -2830,10 +2814,7 @@ impl Render for FileTree {
                                     return;
                                 };
                                 if this.operation_busy
-                                    || matches!(
-                                        &context.backend,
-                                        FileBackendIdentity::BrokenRemote
-                                    )
+                                    || matches!(&context.backend, FileBackendIdentity::BrokenRemote)
                                 {
                                     return;
                                 }
