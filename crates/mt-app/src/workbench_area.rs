@@ -89,6 +89,9 @@ struct DocumentTab {
     document: Entity<FileViewer>,
 }
 
+type RenderDocumentTab = (DocumentKey, String, Entity<FileViewer>);
+type ActiveWorkbenchSnapshot = (String, WorkbenchPage, Vec<RenderDocumentTab>);
+
 struct ProjectDocuments {
     tabs: Vec<DocumentTab>,
     active: WorkbenchPage,
@@ -204,12 +207,17 @@ pub fn open_active_file(
     });
 }
 
-/// 文件页内部的 Ctrl/Cmd+W 入口。
-pub fn close_active_document(window: &mut Window, cx: &mut App) {
+/// 文件页内部的 Ctrl/Cmd+W 入口。延迟执行前先快照来源身份，避免用户在
+/// `window.defer` 落地前切换页签后误关新的活动页。
+pub fn close_document_source(source: DocumentSource, window: &mut Window, cx: &mut App) {
     let Some(area) = global(cx) else {
         return;
     };
-    area.update(cx, |area, cx| area.request_close_active(window, cx));
+    let project_id = source.project_id().to_string();
+    let key = DocumentKey::from_source(&source);
+    area.update(cx, |area, cx| {
+        area.request_close_document(project_id, key, window, cx)
+    });
 }
 
 /// Unified entry for existing navigation surfaces that explicitly jump to a
@@ -287,8 +295,15 @@ impl WorkbenchArea {
         let Some(project_id) = self.store.read(cx).active_project_id.clone() else {
             return true;
         };
+        self.is_terminal_page_for_project(&project_id, cx)
+    }
+
+    fn is_terminal_page_for_project(&self, project_id: &str, cx: &App) -> bool {
+        if self.store.read(cx).active_project_id.as_deref() != Some(project_id) {
+            return false;
+        }
         self.projects
-            .get(&project_id)
+            .get(project_id)
             .is_none_or(|project| project.active == WorkbenchPage::Terminal)
     }
 
@@ -326,7 +341,7 @@ impl WorkbenchArea {
         });
         project.active = WorkbenchPage::Document(key);
         window.defer(cx, move |window, cx| {
-            document.update(cx, |document, cx| document.focus_content(window, cx));
+            document.update(cx, |document, cx| document.on_activated(window, cx));
         });
         cx.notify();
     }
@@ -366,20 +381,6 @@ impl WorkbenchArea {
             });
         });
         cx.notify();
-    }
-
-    fn request_close_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(project_id) = self.store.read(cx).active_project_id.clone() else {
-            return;
-        };
-        let Some(WorkbenchPage::Document(key)) = self
-            .projects
-            .get(&project_id)
-            .map(|project| project.active.clone())
-        else {
-            return;
-        };
-        self.request_close_document(project_id, key, window, cx);
     }
 
     pub fn search_active_document(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -466,14 +467,7 @@ impl WorkbenchArea {
         cx.notify();
     }
 
-    fn active_snapshot(
-        &self,
-        cx: &App,
-    ) -> Option<(
-        String,
-        WorkbenchPage,
-        Vec<(DocumentKey, String, Entity<FileViewer>)>,
-    )> {
+    fn active_snapshot(&self, cx: &App) -> Option<ActiveWorkbenchSnapshot> {
         let project_id = self.store.read(cx).active_project_id.clone()?;
         let project = self.projects.get(&project_id);
         let active = project
@@ -507,9 +501,18 @@ impl Render for WorkbenchArea {
             self.last_rendered_page = Some(active.clone());
             match &active {
                 WorkbenchPage::Terminal => {
+                    let area = cx.entity();
                     let store = self.store.clone();
                     let project_id = project_id.clone();
                     window.defer(cx, move |window, cx| {
+                        if !area
+                            .read(cx)
+                            .is_terminal_page_for_project(&project_id, cx)
+                            || window.has_active_dialog(cx)
+                            || !crate::overlay::allows(crate::overlay::Yield::ToOverlay)
+                        {
+                            return;
+                        }
                         let pane_id = store.read(cx).active_pane_id(&project_id);
                         if let Some(pane_id) = pane_id {
                             store.update(cx, |store, cx| {

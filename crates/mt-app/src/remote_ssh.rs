@@ -535,6 +535,7 @@ impl std::fmt::Debug for RemoteFileBaseline {
 
 impl RemoteFileBaseline {
     /// Number of raw remote bytes represented by this baseline.
+    #[cfg(test)]
     pub fn byte_len(&self) -> usize {
         self.bytes.len()
     }

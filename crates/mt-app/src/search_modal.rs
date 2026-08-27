@@ -59,6 +59,10 @@ enum Status {
 
 pub struct SearchModal {
     store: Entity<AppStore>,
+    /// Identity of the local project that produced the currently displayed
+    /// results. A late result must never be reinterpreted against a newly
+    /// active project (especially an SSH project with the same textual path).
+    search_project: Option<(String, PathBuf)>,
     query: Entity<InputState>,
     mode: SearchMode,
     use_regex: bool,
@@ -102,6 +106,15 @@ pub fn open(store: Entity<AppStore>, window: &mut Window, cx: &mut App) {
     if overlay_open() {
         return;
     }
+    let local_project = {
+        let store = store.read(cx);
+        store.active_project().is_some_and(|project| {
+            !store.is_remote_project(&project.id)
+        })
+    };
+    if !local_project {
+        return;
+    }
     let view = cx.new(|cx| SearchModal::new(store, window, cx));
     let input = view.read(cx).query.clone();
 
@@ -141,8 +154,15 @@ impl SearchModal {
                 this.run(cx);
             }
         });
+        let project_sub = cx.observe(&store, |this: &mut Self, _, cx| {
+            if this.search_project.is_some() && this.current_search_root(cx).is_none() {
+                this.reset(cx);
+                cx.notify();
+            }
+        });
         Self {
             store,
+            search_project: None,
             query,
             mode: SearchMode::FileName,
             use_regex: false,
@@ -151,15 +171,26 @@ impl SearchModal {
             total_count: 0,
             handle: None,
             _pump: None,
-            _subs: vec![sub],
+            _subs: vec![sub, project_sub],
         }
     }
 
-    fn project_root(&self, cx: &App) -> Option<PathBuf> {
-        self.store
-            .read(cx)
-            .active_project()
-            .map(|p| PathBuf::from(&p.path))
+    fn project_snapshot(&self, cx: &App) -> Option<(String, PathBuf)> {
+        let store = self.store.read(cx);
+        let project = store.active_project()?;
+        if store.is_remote_project(&project.id) {
+            return None;
+        }
+        Some((project.id.clone(), PathBuf::from(&project.path)))
+    }
+
+    fn current_search_root(&self, cx: &App) -> Option<PathBuf> {
+        let expected = self.search_project.as_ref()?;
+        if self.project_snapshot(cx).as_ref() == Some(expected) {
+            Some(expected.1.clone())
+        } else {
+            None
+        }
     }
 
     /// 换搜索模式:取消在跑的那次、清空结果(原版那个 `useEffect([mode])`)。
@@ -184,18 +215,20 @@ impl SearchModal {
         self.results.clear();
         self.total_count = 0;
         self.status = Status::Idle;
+        self.search_project = None;
     }
 
     /// 发起一次搜索(Enter / 点「搜索」)。
     fn run(&mut self, cx: &mut Context<Self>) {
         let query = self.query.read(cx).value().trim().to_string();
-        let Some(root) = self.project_root(cx) else {
+        let Some((project_id, root)) = self.project_snapshot(cx) else {
             return;
         };
         if query.is_empty() {
             return;
         }
         self.reset(cx);
+        self.search_project = Some((project_id, root.clone()));
 
         let (tx, mut rx) = mpsc::unbounded::<SearchEvent>();
         let request = SearchRequest {
@@ -249,7 +282,7 @@ impl SearchModal {
 
     /// 点一条结果：统一打开工作区文件页并收起搜索浮层。
     fn open_result(&self, item: &SearchResultItem, window: &mut Window, cx: &mut App) {
-        let Some(root) = self.project_root(cx) else {
+        let Some(root) = self.current_search_root(cx) else {
             return;
         };
         let path = root.join(&item.file_path);
@@ -271,7 +304,7 @@ impl SearchModal {
     /// 与原版 `projectRoot.includes('\\') ? '\\' : '/'` 同口径 —— `Path::join`
     /// 在 Windows 上永远给 `\`,复制出来的串就与装机版不一致了。
     fn absolute_text(&self, item: &SearchResultItem, cx: &App) -> Option<String> {
-        let root = self.store.read(cx).active_project()?.path.clone();
+        let root = self.current_search_root(cx)?.to_string_lossy().into_owned();
         let sep = if root.contains('\\') { '\\' } else { '/' };
         Some(format!("{root}{sep}{}", item.file_path.display()))
     }
@@ -444,7 +477,7 @@ impl SearchModal {
     fn render_query_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let can_search = !self.query.read(cx).value().trim().is_empty()
             && self.status != Status::Searching
-            && self.store.read(cx).active_project().is_some();
+            && self.project_snapshot(cx).is_some();
         let regex_on = self.use_regex;
 
         div()

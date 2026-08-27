@@ -848,10 +848,10 @@ fn rewrite_md_image_urls(source: &str, base_dir: &Path) -> String {
     out
 }
 
-/// Remote rich-text is untrusted input from another machine. Do not let inline
-/// Markdown images hand `file://` (or an implicit local path) to the process-wide
-/// preview HTTP client. Explicit HTTP(S) images remain available, as required by
-/// the remote Markdown contract; SSH-relative assets are deliberately deferred.
+/// Remote rich-text is untrusted input from another machine. Do not let images
+/// hand `file://` (or an implicit local path) to the process-wide preview HTTP
+/// client, and do not let ordinary links pass local paths to `cx.open_url`.
+/// Explicit HTTP(S) resources remain available; SSH-relative assets are deferred.
 fn sanitize_remote_markdown_images(source: &str) -> String {
     let mut out = String::with_capacity(source.len());
     let mut in_fence = false;
@@ -871,16 +871,20 @@ fn sanitize_remote_markdown_images(source: &str) -> String {
         }
 
         let mut rest = line;
-        let mut in_code = false;
         while let Some(ch) = rest.chars().next() {
             if ch == '`' {
-                in_code = !in_code;
-                out.push('`');
-                rest = &rest[1..];
+                if let Some(consumed) = markdown_code_span_len(rest) {
+                    out.push_str(&rest[..consumed]);
+                    rest = &rest[consumed..];
+                } else {
+                    // An unmatched backtick is ordinary text in CommonMark;
+                    // it must not suppress sanitization for the rest of the line.
+                    out.push('`');
+                    rest = &rest[1..];
+                }
                 continue;
             }
-            if !in_code
-                && rest.starts_with("![")
+            if rest.starts_with("![")
                 && let Some((image, tail)) = parse_bang_image(rest)
             {
                 let url = image.url.trim().to_ascii_lowercase();
@@ -903,7 +907,132 @@ fn sanitize_remote_markdown_images(source: &str) -> String {
             rest = &rest[ch.len_utf8()..];
         }
     }
-    sanitize_remote_markdown_reference_urls(&out)
+    sanitize_remote_markdown_reference_urls(&sanitize_remote_markdown_inline_links(&out))
+}
+
+/// Length in bytes of a complete CommonMark-style backtick code span at the
+/// start of `source`. Closing delimiters must contain exactly the same number
+/// of backticks; an unmatched opener returns `None` and is treated as text by
+/// the sanitizers.
+fn markdown_code_span_len(source: &str) -> Option<usize> {
+    let bytes = source.as_bytes();
+    if bytes.first() != Some(&b'`') {
+        return None;
+    }
+    let opening = bytes.iter().take_while(|byte| **byte == b'`').count();
+    let mut at = opening;
+    while at < bytes.len() {
+        if bytes[at] != b'`' {
+            at += 1;
+            continue;
+        }
+        let start = at;
+        while at < bytes.len() && bytes[at] == b'`' {
+            at += 1;
+        }
+        if at - start == opening {
+            return Some(at);
+        }
+    }
+    None
+}
+
+fn remote_markdown_url_allowed(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("mailto:")
+        || lower.starts_with("tel:")
+        || lower.starts_with('#')
+}
+
+fn sanitized_remote_markdown_link_label(label: &str) -> String {
+    let trimmed = label.trim();
+    if let Some((image, tail)) = parse_bang_image(trimmed)
+        && tail.trim().is_empty()
+    {
+        let lower = image.url.trim().to_ascii_lowercase();
+        if lower.starts_with("http://") || lower.starts_with("https://") {
+            return trimmed.to_string();
+        }
+    }
+    if !trimmed.is_empty()
+        && trimmed
+            .chars()
+            .all(|ch| ch.is_alphanumeric() || ch.is_whitespace() || matches!(ch, '_' | '-'))
+    {
+        trimmed.to_string()
+    } else {
+        "link".into()
+    }
+}
+
+/// Markdown links use the same rich-text click path as local documents, which
+/// ultimately calls `cx.open_url`. Remote content must not hand that path a
+/// local `file://` URI, a relative path, or another arbitrary scheme. Preserve
+/// the visible label while replacing disallowed inline destinations and URI
+/// autolinks with plain text. Fenced and inline code stay byte-for-byte
+/// unchanged.
+fn sanitize_remote_markdown_inline_links(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut in_fence = false;
+    for (ix, line) in source.split('\n').enumerate() {
+        if ix > 0 {
+            out.push('\n');
+        }
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            out.push_str(line);
+            continue;
+        }
+        if in_fence || line.starts_with("    ") || line.starts_with('\t') {
+            out.push_str(line);
+            continue;
+        }
+
+        let mut rest = line;
+        while let Some(ch) = rest.chars().next() {
+            if ch == '`' {
+                if let Some(consumed) = markdown_code_span_len(rest) {
+                    out.push_str(&rest[..consumed]);
+                    rest = &rest[consumed..];
+                } else {
+                    out.push('`');
+                    rest = &rest[1..];
+                }
+                continue;
+            }
+            if rest.starts_with('[')
+                && let Some((label, after_label)) = take_balanced(&rest[1..], '[', ']')
+                && let Some(after_open) = after_label.strip_prefix('(')
+                && let Some((destination, tail)) = take_balanced(after_open, '(', ')')
+            {
+                let (url, _title) = split_dest(destination);
+                if remote_markdown_url_allowed(&url) {
+                    let consumed = rest.len() - tail.len();
+                    out.push_str(&rest[..consumed]);
+                } else {
+                    out.push_str(&sanitized_remote_markdown_link_label(label));
+                }
+                rest = tail;
+                continue;
+            }
+            if ch == '<' && let Some(end) = rest[1..].find('>') {
+                let value = &rest[1..end + 1];
+                if scheme_len(value).is_some() && !remote_markdown_url_allowed(value) {
+                    out.push_str("link");
+                } else {
+                    out.push_str(&rest[..end + 2]);
+                }
+                rest = &rest[end + 2..];
+                continue;
+            }
+            out.push(ch);
+            rest = &rest[ch.len_utf8()..];
+        }
+    }
+    out
 }
 
 /// Reference-style images resolve their URL from a separate `[label]: target`
@@ -1777,7 +1906,7 @@ impl FileViewer {
         let generation = self.load_generation;
         self.remote_conflict = None;
         self.remote_baseline = None;
-        if self.renders_local_image() {
+        if self.is_img() {
             self.loading = false;
             self.result = None;
             self.editor = None;
@@ -2082,6 +2211,7 @@ impl FileViewer {
     pub fn on_activated(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.validate_remote_source(cx);
         if self.source.is_remote()
+            && !self.is_img()
             && !self.remote_source_invalid
             && !self.loading
             && !self.remote_refreshing
@@ -2316,8 +2446,9 @@ impl FileViewer {
         if self.host == ViewerHost::Workbench {
             // Workbench 的关闭检查会回读当前 FileViewer 的 dirty 状态。当前按键
             // listener 仍持有本实体的 update 租约，直接回调会 double-lease。
-            window.defer(cx, |window, cx| {
-                crate::workbench_area::close_active_document(window, cx);
+            let source = self.source.clone();
+            window.defer(cx, move |window, cx| {
+                crate::workbench_area::close_document_source(source, window, cx);
             });
             return;
         }
@@ -2379,8 +2510,14 @@ impl FileViewer {
         editor.update(cx, |state, cx| state.focus(window, cx));
         let focus = editor.read(cx).focus_handle(cx);
         if was_preview {
+            let source = self.source.clone();
             window.on_next_frame(move |window, cx| {
-                focus.dispatch_action(&Search, window, cx);
+                if crate::workbench_area::is_document_active(&source, cx)
+                    && !window.has_active_dialog(cx)
+                    && crate::overlay::allows(crate::overlay::Yield::ToOverlay)
+                {
+                    focus.dispatch_action(&Search, window, cx);
+                }
             });
         } else {
             focus.dispatch_action(&Search, window, cx);
@@ -3701,6 +3838,13 @@ mod tests {
 
     #[test]
     fn 远程富文本只允许显式网络资源() {
+        let double_tick = "``[code](file:///tmp/double)``";
+        assert_eq!(
+            markdown_code_span_len(&format!("{double_tick} tail")),
+            Some(double_tick.len())
+        );
+        assert_eq!(markdown_code_span_len("```unmatched``"), None);
+
         let markdown = concat!(
             "- ![secret](file:///home/user/secret.png)\n",
             "![tracker](http://127.0.0.1:8080/a.png)\n",
@@ -3732,6 +3876,30 @@ mod tests {
             references.contains("[remote]: https://example.com/image.png"),
             "{references}"
         );
+
+        let links = sanitize_remote_markdown_images(concat!(
+            "[local](file:///etc/passwd)\n",
+            "[relative](../secret.txt)\n",
+            "[web](https://example.com/docs)\n",
+            "[<file:///etc/shadow>](file:///tmp/outer)\n",
+            "<file:///etc/group>\n",
+            "`[code](file:///tmp/code)`\n",
+            "``[code](file:///tmp/double)``\n",
+            "` unmatched [unsafe](file:///tmp/unmatched)\n",
+            "```md\n[code](file:///tmp/fenced)\n```",
+        ));
+        assert!(!links.contains("file:///etc/passwd"), "{links}");
+        assert!(!links.contains("../secret.txt"), "{links}");
+        assert!(!links.contains("file:///etc/group"), "{links}");
+        assert!(!links.contains("file:///etc/shadow"), "{links}");
+        assert!(!links.contains("file:///tmp/outer"), "{links}");
+        assert!(!links.contains("file:///tmp/unmatched"), "{links}");
+        assert!(links.contains("local\nrelative\n"), "{links}");
+        assert!(links.contains("[web](https://example.com/docs)"), "{links}");
+        assert!(links.contains("`[code](file:///tmp/code)`"), "{links}");
+        assert!(links.contains("``[code](file:///tmp/double)``"), "{links}");
+        assert!(links.contains("` unmatched unsafe"), "{links}");
+        assert!(links.contains("[code](file:///tmp/fenced)"), "{links}");
 
         let html = concat!(
             r#"<img src="file:///home/user/secret.png">"#,
