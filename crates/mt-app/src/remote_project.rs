@@ -100,9 +100,8 @@ pub fn open(
             .placeholder(t("remoteProject", "pathPlaceholder"))
             .default_value("~")
     });
-    let name = cx.new(|cx| {
-        InputState::new(window, cx).placeholder(t("remoteProject", "namePlaceholder"))
-    });
+    let name =
+        cx.new(|cx| InputState::new(window, cx).placeholder(t("remoteProject", "namePlaceholder")));
     // 打开即可直接接着 `~` 往下敲路径。聚焦排在 `open_guarded` 之后,
     // 判据见 `prompt::autofocus`
     let path_for_focus = path.clone();
@@ -110,13 +109,15 @@ pub fn open(
     let state = cx.new(|cx| {
         // 两个输入框里按回车 = 点「添加」(原版那两处 `onKeyDown`)。
         // `InputState` 单行模式下无条件 emit `PressEnter`,订阅它比抢键位直白。
-        let on_enter =
-            |this: &mut AddRemotePanel, _e, event: &InputEvent, cx: &mut Context<AddRemotePanel>| {
-                if !this.busy && matches!(event, InputEvent::PressEnter { .. }) {
-                    this.enter_pressed = true;
-                    cx.notify();
-                }
-            };
+        let on_enter = |this: &mut AddRemotePanel,
+                        _e,
+                        event: &InputEvent,
+                        cx: &mut Context<AddRemotePanel>| {
+            if !this.busy && matches!(event, InputEvent::PressEnter { .. }) {
+                this.enter_pressed = true;
+                cx.notify();
+            }
+        };
         let subs = vec![cx.subscribe(&path, on_enter), cx.subscribe(&name, on_enter)];
         AddRemotePanel {
             store,
@@ -243,9 +244,7 @@ fn save(state: &Entity<AddRemotePanel>, window: &mut Window, cx: &mut App) {
                     // 校验期间允许其它种类的覆盖物叠到上面。只有当前添加项目弹窗
                     // 已回到栈顶时才真正写配置，否则 `close_guarded` 无法关闭它，
                     // 用户稍后再次点击会重复创建同一项目。
-                    if !crate::overlay::is_top(crate::overlay::key(
-                        kind::ADD_REMOTE_PROJECT,
-                    )) {
+                    if !crate::overlay::is_top(crate::overlay::key(kind::ADD_REMOTE_PROJECT)) {
                         state_for_task.update(cx, |panel, cx| {
                             panel.busy = false;
                             panel.error =
@@ -337,16 +336,12 @@ fn read_frame(state: &Entity<AddRemotePanel>, cx: &App) -> Frame {
 
 fn render_body(state: &Entity<AddRemotePanel>, total: gpui::Pixels, cx: &mut App) -> AnyElement {
     let frame = read_frame(state, cx);
-    let mut root = div()
-        .h(total)
-        .flex()
-        .flex_col()
-        .child(panel_header(
-            kind::ADD_REMOTE_PROJECT,
-            t("remoteProject", "title"),
-            Some(t("remoteProject", "subtitle").to_string()),
-            !frame.busy,
-        ));
+    let mut root = div().h(total).flex().flex_col().child(panel_header(
+        kind::ADD_REMOTE_PROJECT,
+        t("remoteProject", "title"),
+        Some(t("remoteProject", "subtitle").to_string()),
+        !frame.busy,
+    ));
 
     if frame.total == 0 {
         // 一条连接都没有:整个选择区与表单都不画,只给一句引导
@@ -484,13 +479,7 @@ fn render_list(state: &Entity<AddRemotePanel>, frame: &Frame) -> AnyElement {
                         .items_center()
                         .justify_center()
                         .when(selected, |el| {
-                            el.child(
-                                div()
-                                    .w(px(7.0))
-                                    .h(px(7.0))
-                                    .rounded_full()
-                                    .bg(ui::accent()),
-                            )
+                            el.child(div().w(px(7.0)).h(px(7.0)).rounded_full().bg(ui::accent()))
                         }),
                 )
                 .child(conn_text(conn, ""))
@@ -563,59 +552,56 @@ fn render_form(state: &Entity<AddRemotePanel>, frame: &Frame, cx: &App) -> AnyEl
                         .child(Input::new(&path).disabled(frame.busy)),
                 )
                 .child(
-                    ui::ghost_button(
-                        "remote-project-browse",
-                        t("remoteProject", "browse"),
-                    )
-                    .opacity(if frame.busy { 0.4 } else { 1.0 })
-                    .on_click({
-                        let state = state.clone();
-                        move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
-                            let (busy, connection, initial, input) = {
-                                let panel = state.read(cx);
-                                let connection = panel
-                                    .store
-                                    .read(cx)
-                                    .ssh_connections()
-                                    .iter()
-                                    .find(|connection| connection.id == panel.connection_id)
-                                    .cloned();
-                                (
-                                    panel.busy,
-                                    connection,
-                                    panel.path.read(cx).value().to_string(),
-                                    panel.path.clone(),
-                                )
-                            };
-                            if busy {
-                                return;
-                            }
-                            let Some(connection) = connection else {
-                                state.update(cx, |panel, cx| {
-                                    panel.error =
-                                        t("remoteProject", "errorNoConnection").to_string();
-                                    cx.notify();
-                                });
-                                return;
-                            };
-                            let panel_state = state.clone();
-                            crate::remote_directory_picker::open(
-                                connection,
-                                initial,
-                                move |selected, window, cx| {
-                                    input.update(cx, |input, cx| {
-                                        input.set_value(selected, window, cx)
-                                    });
-                                    panel_state.update(cx, |panel, cx| {
-                                        panel.error.clear();
+                    ui::ghost_button("remote-project-browse", t("remoteProject", "browse"))
+                        .opacity(if frame.busy { 0.4 } else { 1.0 })
+                        .on_click({
+                            let state = state.clone();
+                            move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                                let (busy, connection, initial, input) = {
+                                    let panel = state.read(cx);
+                                    let connection = panel
+                                        .store
+                                        .read(cx)
+                                        .ssh_connections()
+                                        .iter()
+                                        .find(|connection| connection.id == panel.connection_id)
+                                        .cloned();
+                                    (
+                                        panel.busy,
+                                        connection,
+                                        panel.path.read(cx).value().to_string(),
+                                        panel.path.clone(),
+                                    )
+                                };
+                                if busy {
+                                    return;
+                                }
+                                let Some(connection) = connection else {
+                                    state.update(cx, |panel, cx| {
+                                        panel.error =
+                                            t("remoteProject", "errorNoConnection").to_string();
                                         cx.notify();
                                     });
-                                },
-                                window,
-                                cx,
-                            );
-                        }
-                    }),
+                                    return;
+                                };
+                                let panel_state = state.clone();
+                                crate::remote_directory_picker::open(
+                                    connection,
+                                    initial,
+                                    move |selected, window, cx| {
+                                        input.update(cx, |input, cx| {
+                                            input.set_value(selected, window, cx)
+                                        });
+                                        panel_state.update(cx, |panel, cx| {
+                                            panel.error.clear();
+                                            cx.notify();
+                                        });
+                                    },
+                                    window,
+                                    cx,
+                                );
+                            }
+                        }),
                 )
                 .into_any_element(),
         ))

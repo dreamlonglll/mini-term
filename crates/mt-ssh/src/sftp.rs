@@ -102,11 +102,10 @@ impl SftpHandle {
 
     /// 列目录。过滤 `.` / `..`;symlink 不解引用(`is_dir` 只反映条目自身类型)。
     pub async fn read_dir(&self, path: &str) -> Result<Vec<SftpDirEntry>, SftpTransferError> {
-        let rd = self
-            .sftp
-            .read_dir(path)
-            .await
-            .map_err(|e| SftpTransferError::Sftp(format!("sftp readdir '{path}' failed: {e}")))?;
+        let rd =
+            self.sftp.read_dir(path).await.map_err(|e| {
+                SftpTransferError::Sftp(format!("sftp readdir '{path}' failed: {e}"))
+            })?;
         Ok(rd
             .filter(|entry| {
                 let n = entry.file_name();
@@ -225,9 +224,10 @@ impl SftpHandle {
         let mut buf = vec![0u8; SFTP_READ_CHUNK_BYTES];
         while out.len() < max_bytes {
             let want = (max_bytes - out.len()).min(SFTP_READ_CHUNK_BYTES);
-            let n = file.read(&mut buf[..want]).await.map_err(|e| {
-                SftpTransferError::Sftp(format!("sftp read '{path}' failed: {e}"))
-            })?;
+            let n = file
+                .read(&mut buf[..want])
+                .await
+                .map_err(|e| SftpTransferError::Sftp(format!("sftp read '{path}' failed: {e}")))?;
             if n == 0 {
                 break; // EOF
             }
@@ -401,10 +401,9 @@ impl SftpHandle {
 
     /// 同一远程文件系统内改名。目标已存在时由服务器返回冲突错误。
     pub async fn rename(&self, from: &str, to: &str) -> Result<(), SftpTransferError> {
-        self.sftp
-            .rename(from, to)
-            .await
-            .map_err(|e| SftpTransferError::Sftp(format!("sftp rename '{from}' -> '{to}' failed: {e}")))
+        self.sftp.rename(from, to).await.map_err(|e| {
+            SftpTransferError::Sftp(format!("sftp rename '{from}' -> '{to}' failed: {e}"))
+        })
     }
 
     /// 生成同级、进程内唯一的隐藏暂存路径。调用方必须用排他创建裁决极小概率碰撞。
@@ -505,9 +504,7 @@ impl SftpHandle {
                 OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::EXCLUDE,
             )
             .await
-            .map_err(|e| {
-                SftpTransferError::Sftp(format!("sftp create '{staging}' failed: {e}"))
-            })?;
+            .map_err(|e| SftpTransferError::Sftp(format!("sftp create '{staging}' failed: {e}")))?;
 
         let mut total = 0u64;
         let mut buf = vec![0u8; SFTP_READ_CHUNK_BYTES];
@@ -557,11 +554,9 @@ impl SftpHandle {
     ) -> Result<u64, SftpTransferError> {
         use russh_sftp::protocol::OpenFlags;
 
-        let mut source = self
-            .sftp
-            .open(source_path)
-            .await
-            .map_err(|e| SftpTransferError::Sftp(format!("sftp open '{source_path}' failed: {e}")))?;
+        let mut source = self.sftp.open(source_path).await.map_err(|e| {
+            SftpTransferError::Sftp(format!("sftp open '{source_path}' failed: {e}"))
+        })?;
         let staging = if overwrite {
             unique_sibling_path(target_path, "partial")
         } else {
@@ -574,9 +569,7 @@ impl SftpHandle {
                 OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::EXCLUDE,
             )
             .await
-            .map_err(|e| {
-                SftpTransferError::Sftp(format!("sftp create '{staging}' failed: {e}"))
-            })?;
+            .map_err(|e| SftpTransferError::Sftp(format!("sftp create '{staging}' failed: {e}")))?;
 
         let mut total = 0u64;
         let mut buf = vec![0u8; SFTP_READ_CHUNK_BYTES];
@@ -621,11 +614,9 @@ impl SftpHandle {
         local_path: &Path,
         overwrite: bool,
     ) -> Result<u64, SftpTransferError> {
-        let mut remote = self
-            .sftp
-            .open(remote_path)
-            .await
-            .map_err(|e| SftpTransferError::Sftp(format!("sftp open '{remote_path}' failed: {e}")))?;
+        let mut remote = self.sftp.open(remote_path).await.map_err(|e| {
+            SftpTransferError::Sftp(format!("sftp open '{remote_path}' failed: {e}"))
+        })?;
         let staging = if overwrite {
             unique_local_sibling(local_path, "partial")
         } else {
@@ -766,7 +757,10 @@ fn unique_local_sibling(target: &Path, role: &str) -> std::path::PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
-    let name = target.file_name().and_then(|name| name.to_str()).unwrap_or("item");
+    let name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("item");
     target.with_file_name(format!(
         ".{name}.mt-{role}-{}-{timestamp}-{seq}",
         std::process::id(),

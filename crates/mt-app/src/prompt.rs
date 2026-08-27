@@ -386,11 +386,7 @@ pub fn show_file_conflict_choice(
         .map(|name| format!("• {name}"))
         .collect::<Vec<_>>();
     if remaining > 0 {
-        details.push(tr!(
-            "fileTree",
-            "conflict.remaining",
-            count = remaining
-        ));
+        details.push(tr!("fileTree", "conflict.remaining", count = remaining));
     }
     let message = t("fileTree", "conflict.message");
     let on_choice = Rc::new(on_choice);

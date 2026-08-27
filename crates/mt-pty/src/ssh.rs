@@ -254,10 +254,7 @@ mod tests {
     #[test]
     fn build_remote_login_command_quotes_path_and_keeps_shell_literal() {
         let cmd = build_remote_login_command("/home/u/my proj");
-        assert_eq!(
-            cmd,
-            "cd '/home/u/my proj' 2>/dev/null; exec $SHELL -l"
-        );
+        assert_eq!(cmd, "cd '/home/u/my proj' 2>/dev/null; exec $SHELL -l");
         // $SHELL 必须保持字面量,由远程登录 shell 展开
         assert!(cmd.contains("$SHELL"));
     }

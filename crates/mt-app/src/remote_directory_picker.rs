@@ -111,10 +111,7 @@ pub fn open(
                     kind::REMOTE_DIRECTORY_PICKER,
                     t("remoteProject", "picker.title"),
                 ))
-                .w(ui::clamp_dialog_width(
-                    px(560.0),
-                    window.viewport_size(),
-                ))
+                .w(ui::clamp_dialog_width(px(560.0), window.viewport_size()))
                 .overlay_closable(false)
                 .child(render_body(&dialog_state, cx))
         },
@@ -247,17 +244,14 @@ fn render_body(state: &Entity<PickerState>, cx: &mut App) -> AnyElement {
                     .text_color(ui::color_error())
                     .child(error)
                     .child(
-                        ui::ghost_button(
-                            "remote-picker-retry",
-                            t("remoteProject", "picker.retry"),
-                        )
-                        .on_click(move |_: &ClickEvent, _window, cx| {
-                            if state.read(cx).loading {
-                                return;
-                            }
-                            let path = retry_path.clone();
-                            state.update(cx, |state, cx| state.load(path, cx));
-                        }),
+                        ui::ghost_button("remote-picker-retry", t("remoteProject", "picker.retry"))
+                            .on_click(move |_: &ClickEvent, _window, cx| {
+                                if state.read(cx).loading {
+                                    return;
+                                }
+                                let path = retry_path.clone();
+                                state.update(cx, |state, cx| state.load(path, cx));
+                            }),
                     ),
             )
         })
@@ -268,13 +262,10 @@ fn render_body(state: &Entity<PickerState>, cx: &mut App) -> AnyElement {
                 .justify_end()
                 .gap(px(8.0))
                 .child(
-                    ui::ghost_button(
-                        "remote-picker-cancel",
-                        t("remoteProject", "cancel"),
-                    )
-                    .on_click(|_: &ClickEvent, window, cx| {
-                        close_guarded(kind::REMOTE_DIRECTORY_PICKER, window, cx);
-                    }),
+                    ui::ghost_button("remote-picker-cancel", t("remoteProject", "cancel"))
+                        .on_click(|_: &ClickEvent, window, cx| {
+                            close_guarded(kind::REMOTE_DIRECTORY_PICKER, window, cx);
+                        }),
                 )
                 .child(
                     ui::primary_button(

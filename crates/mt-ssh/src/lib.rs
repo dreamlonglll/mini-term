@@ -20,7 +20,6 @@ pub use russh;
 
 pub use pool::{
     BoundedExecOutput, BoundedExecState, CachedSession, MtClient, PoolConfig, SftpTransferError,
-    SshPool,
-    run_bounded_exec_on_session, run_sftp_download_on_session, run_sftp_upload_on_session,
+    SshPool, run_bounded_exec_on_session, run_sftp_download_on_session, run_sftp_upload_on_session,
 };
 pub use sftp::{SftpDirEntry, SftpHandle, SftpNodeKind};
