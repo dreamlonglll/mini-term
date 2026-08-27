@@ -110,8 +110,6 @@ jobs:
         shell: bash
         run: |
           base="${{ steps.diff-base.outputs.sha }}"
-          git diff --name-only --diff-filter=ACMR -z "$base" HEAD -- '*.rs' \
-            > /tmp/clippy-changed-files
           set +e
           cargo clippy --no-deps \
             -p mt-project -p mt-ssh -p mt-config -p mt-app \
@@ -123,7 +121,7 @@ jobs:
             exit "$clippy_status"
           fi
           node .github/scripts/check_changed_clippy.mjs \
-            /tmp/clippy-changed-files /tmp/clippy-messages.jsonl
+            "$base" /tmp/clippy-messages.jsonl
 
       - name: Cargo test
         run: cargo test --workspace
