@@ -3870,10 +3870,7 @@ mod tests {
             "[remote]: https://example.com/image.png\n",
         ));
         assert!(!references.contains("file:///"), "{references}");
-        assert!(
-            references.contains("[local]: about:blank"),
-            "{references}"
-        );
+        assert!(references.contains("[local]: about:blank"), "{references}");
         assert!(
             references.contains("[remote]: https://example.com/image.png"),
             "{references}"
