@@ -30,4 +30,3 @@
 - Current SSH branch computes cwd override but passes `project.path` to `prepare_remote_launch` (`store/panes.rs:684-709`).
 - Fix it to use the resolved cwd; pane persistence and SSH reconnect already preserve `PaneState.cwd` (`tree.rs:96-105`, `persist.rs:34-108`, `store/ssh.rs:392-400`).
 - Remote path parent calculation must use POSIX string helpers rather than host `Path::parent`.
-

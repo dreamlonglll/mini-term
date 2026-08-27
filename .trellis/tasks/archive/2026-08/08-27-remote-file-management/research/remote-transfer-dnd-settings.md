@@ -55,4 +55,3 @@
 - Resolve with `dirs::download_dir()`, then `home/Downloads`; if neither is available, show a visible settings error.
 - System settings should display the effective path and offer Choose / Restore Default.
 - Download must revalidate/create the directory at operation time because it can be removed after configuration.
-

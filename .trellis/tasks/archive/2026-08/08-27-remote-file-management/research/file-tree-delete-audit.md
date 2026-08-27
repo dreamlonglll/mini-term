@@ -40,4 +40,3 @@
 - Remote file click still invokes the local viewer (`file_tree.rs:581-585`).
 - Remote header still exposes local search/editor actions (`file_tree.rs:1220-1296`).
 - Historical React implementation hid these local-only actions; the GPUI migration added only remote list loading.
-
