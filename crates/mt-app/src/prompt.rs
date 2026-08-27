@@ -58,11 +58,11 @@ where
         // on_close 与 close_button 都放在最后 —— 它们会覆盖 build 里设过的同名
         // 设置:on_close 漏了(摘不掉种类标记)就再也开不出同种类的弹窗;
         // close_button 见 [`dialog_title`] 的注释,画出来是**空白但仍可点**的一块。
-        build(dialog, window, cx)
-            .close_button(false)
-            .on_close(move |_: &ClickEvent, _window, _cx| {
+        build(dialog, window, cx).close_button(false).on_close(
+            move |_: &ClickEvent, _window, _cx| {
                 overlay::pop(overlay::key(kind));
-            })
+            },
+        )
     });
 }
 
@@ -348,67 +348,72 @@ pub fn show_file_conflict_choice(
     cx: &mut App,
 ) {
     let on_choice = Rc::new(on_choice);
-    open_guarded(kind::FILE_CONFLICT, window, cx, move |dialog, _window, _cx| {
-        let button = |id: &'static str,
-                      label: SharedString,
-                      strategy: crate::remote_ssh::FileConflictStrategy,
-                      primary: bool| {
-            let on_choice = on_choice.clone();
-            let el = if primary {
-                ui::primary_button(id, label)
-            } else {
-                ui::ghost_button(id, label)
+    open_guarded(
+        kind::FILE_CONFLICT,
+        window,
+        cx,
+        move |dialog, _window, _cx| {
+            let button = |id: &'static str,
+                          label: SharedString,
+                          strategy: crate::remote_ssh::FileConflictStrategy,
+                          primary: bool| {
+                let on_choice = on_choice.clone();
+                let el = if primary {
+                    ui::primary_button(id, label)
+                } else {
+                    ui::ghost_button(id, label)
+                };
+                el.on_click(move |_: &ClickEvent, window, cx| {
+                    close_guarded(kind::FILE_CONFLICT, window, cx);
+                    on_choice(strategy, window, cx);
+                })
             };
-            el.on_click(move |_: &ClickEvent, window, cx| {
-                close_guarded(kind::FILE_CONFLICT, window, cx);
-                on_choice(strategy, window, cx);
-            })
-        };
 
-        dialog
-            .title(t("fileTree", "conflict.title"))
-            .w(px(420.0))
-            .overlay_closable(true)
-            .child(
-                div()
-                    .px(px(20.0))
-                    .pb(px(16.0))
-                    .flex()
-                    .flex_col()
-                    .gap(px(14.0))
-                    .child(
-                        div()
-                            .text_size(ui::font_px(13.0))
-                            .text_color(ui::text_primary())
-                            .child(t("fileTree", "conflict.message")),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_end()
-                            .gap(px(8.0))
-                            .child(button(
-                                "file-conflict-skip",
-                                t("fileTree", "conflict.skip").into(),
-                                crate::remote_ssh::FileConflictStrategy::Skip,
-                                false,
-                            ))
-                            .child(button(
-                                "file-conflict-keep-both",
-                                t("fileTree", "conflict.keepBoth").into(),
-                                crate::remote_ssh::FileConflictStrategy::KeepBoth,
-                                false,
-                            ))
-                            .child(button(
-                                "file-conflict-overwrite",
-                                t("fileTree", "conflict.overwrite").into(),
-                                crate::remote_ssh::FileConflictStrategy::Overwrite,
-                                true,
-                            )),
-                    ),
-            )
-    });
+            dialog
+                .title(t("fileTree", "conflict.title"))
+                .w(px(420.0))
+                .overlay_closable(true)
+                .child(
+                    div()
+                        .px(px(20.0))
+                        .pb(px(16.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(14.0))
+                        .child(
+                            div()
+                                .text_size(ui::font_px(13.0))
+                                .text_color(ui::text_primary())
+                                .child(t("fileTree", "conflict.message")),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_end()
+                                .gap(px(8.0))
+                                .child(button(
+                                    "file-conflict-skip",
+                                    t("fileTree", "conflict.skip").into(),
+                                    crate::remote_ssh::FileConflictStrategy::Skip,
+                                    false,
+                                ))
+                                .child(button(
+                                    "file-conflict-keep-both",
+                                    t("fileTree", "conflict.keepBoth").into(),
+                                    crate::remote_ssh::FileConflictStrategy::KeepBoth,
+                                    false,
+                                ))
+                                .child(button(
+                                    "file-conflict-overwrite",
+                                    t("fileTree", "conflict.overwrite").into(),
+                                    crate::remote_ssh::FileConflictStrategy::Overwrite,
+                                    true,
+                                )),
+                        ),
+                )
+        },
+    );
 }
 
 /// 正文 + 补充行。文案里的 `\n` 要真换行(确认框普遍用它排版),

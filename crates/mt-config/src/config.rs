@@ -565,12 +565,8 @@ impl AppConfig {
             .open(&probe)
             .map_err(|err| anyhow!("下载目录不可写 {}：{err}", path.display()))?;
         drop(file);
-        fs::remove_file(&probe).map_err(|err| {
-            anyhow!(
-                "下载目录无法清理写入探针 {}：{err}",
-                probe.display()
-            )
-        })?;
+        fs::remove_file(&probe)
+            .map_err(|err| anyhow!("下载目录无法清理写入探针 {}：{err}", probe.display()))?;
         Ok(())
     }
 }
@@ -1223,8 +1219,7 @@ mod tests {
         .unwrap();
         assert_eq!(system, PathBuf::from("system"));
 
-        let fallback =
-            resolve_download_dir_with(None, None, Some(PathBuf::from("home"))).unwrap();
+        let fallback = resolve_download_dir_with(None, None, Some(PathBuf::from("home"))).unwrap();
         assert_eq!(fallback, PathBuf::from("home").join("Downloads"));
         assert!(resolve_download_dir_with(None, None, None).is_err());
 
@@ -1353,7 +1348,10 @@ mod tests {
         assert!(config.usage_custom_from.is_none());
         assert!(config.usage_custom_to.is_none());
         let json = serde_json::to_string(&config).unwrap();
-        assert!(!json.contains("usage"), "没设过就不该往磁盘上写这些键: {json}");
+        assert!(
+            !json.contains("usage"),
+            "没设过就不该往磁盘上写这些键: {json}"
+        );
 
         let with_prefs = r#"{
             "projects": [],
@@ -2070,8 +2068,15 @@ mod tests {
             .map(String::as_str)
             .collect();
         keys.sort_unstable();
-        assert_eq!(keys, ["projects", "sshConnections"], "投影只该有这两个键: {json}");
-        assert!(!json.contains("defaultShell"), "设置不该出现在投影里: {json}");
+        assert_eq!(
+            keys,
+            ["projects", "sshConnections"],
+            "投影只该有这两个键: {json}"
+        );
+        assert!(
+            !json.contains("defaultShell"),
+            "设置不该出现在投影里: {json}"
+        );
         assert!(!json.contains("uiFontSize"));
 
         fs::remove_dir_all(&root).ok();

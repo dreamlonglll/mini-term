@@ -222,9 +222,8 @@ impl ConfigDb {
         let mut map = Map::new();
         {
             let mut stmt = conn.prepare("SELECT key, value FROM settings")?;
-            let rows = stmt.query_map([], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })?;
+            let rows =
+                stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
             for row in rows {
                 let (key, raw) = row?;
                 let value: Value = serde_json::from_str(&raw)
@@ -248,13 +247,13 @@ impl ConfigDb {
             )
             .optional()?
         {
-            let value = serde_json::from_str(&raw)
-                .context("配置项 downloadDir 的兼容值解析失败")?;
+            let value =
+                serde_json::from_str(&raw).context("配置项 downloadDir 的兼容值解析失败")?;
             map.insert(KEY_DOWNLOAD_DIR.to_string(), value);
         }
 
-        let config: AppConfig = serde_json::from_value(Value::Object(map))
-            .context("配置库内容不符合当前 schema")?;
+        let config: AppConfig =
+            serde_json::from_value(Value::Object(map)).context("配置库内容不符合当前 schema")?;
         Ok(Some(config))
     }
 
@@ -303,7 +302,10 @@ impl ConfigDb {
                 )?;
             }
             None => {
-                tx.execute("DELETE FROM meta WHERE key = ?1", params![META_DOWNLOAD_DIR])?;
+                tx.execute(
+                    "DELETE FROM meta WHERE key = ?1",
+                    params![META_DOWNLOAD_DIR],
+                )?;
             }
         }
         tx.execute(

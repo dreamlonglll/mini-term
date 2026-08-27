@@ -14,11 +14,11 @@ use crate::tree::{
     AiSessionRef, DropZone, PaneState, PaneStatus, ProjectPanel, SplitDirection, SplitNode,
 };
 
+use super::AppStore;
 use super::pure::{
     next_maximized, resolve_auto_resume_command, resolve_resume_cwd, resolve_scrollback,
     terminal_style_from,
 };
-use super::AppStore;
 
 impl AppStore {
     // === 终端 ===
@@ -255,7 +255,9 @@ impl AppStore {
         let Some(layout) = state.active_layout() else {
             return;
         };
-        let anchor_leaf = layout.leaf_of_pane(anchor_pane_id).map(|l| l.id().to_string());
+        let anchor_leaf = layout
+            .leaf_of_pane(anchor_pane_id)
+            .map(|l| l.id().to_string());
         let current_leaf = state
             .maximized_pane_id
             .as_deref()

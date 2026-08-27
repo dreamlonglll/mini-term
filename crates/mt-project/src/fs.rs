@@ -661,8 +661,8 @@ fn copy_regular_file_to_new(
     let before_open = fs::symlink_metadata(source)
         .with_context(|| format!("重新读取源文件失败: {}", source.display()))?;
     ensure_entry_unchanged(source, source_meta, &before_open)?;
-    let mut input = fs::File::open(source)
-        .with_context(|| format!("打开源文件失败: {}", source.display()))?;
+    let mut input =
+        fs::File::open(source).with_context(|| format!("打开源文件失败: {}", source.display()))?;
     let opened_meta = input
         .metadata()
         .with_context(|| format!("读取已打开源文件失败: {}", source.display()))?;
@@ -695,28 +695,22 @@ fn copy_regular_file_to_new(
     result
 }
 
-fn copy_directory_to_new(
-    source: &Path,
-    source_meta: &fs::Metadata,
-    target: &Path,
-) -> Result<()> {
+fn copy_directory_to_new(source: &Path, source_meta: &fs::Metadata, target: &Path) -> Result<()> {
     if !source_meta.is_dir() || source_meta.file_type().is_symlink() {
         bail!("源条目不是普通目录: {}", source.display());
     }
-    fs::create_dir(target)
-        .with_context(|| format!("创建目标目录失败: {}", target.display()))?;
+    fs::create_dir(target).with_context(|| format!("创建目标目录失败: {}", target.display()))?;
     let result = (|| -> Result<()> {
         let before_open = fs::symlink_metadata(source)
             .with_context(|| format!("重新读取源目录失败: {}", source.display()))?;
         ensure_entry_unchanged(source, source_meta, &before_open)?;
-        let entries = fs::read_dir(source)
-            .with_context(|| format!("读取目录失败: {}", source.display()))?;
+        let entries =
+            fs::read_dir(source).with_context(|| format!("读取目录失败: {}", source.display()))?;
         let after_open = fs::symlink_metadata(source)
             .with_context(|| format!("重新读取源目录失败: {}", source.display()))?;
         ensure_entry_unchanged(source, &before_open, &after_open)?;
         for entry in entries {
-            let entry =
-                entry.with_context(|| format!("读取目录项失败: {}", source.display()))?;
+            let entry = entry.with_context(|| format!("读取目录项失败: {}", source.display()))?;
             let current_parent = fs::symlink_metadata(source)
                 .with_context(|| format!("重新读取源目录失败: {}", source.display()))?;
             ensure_entry_unchanged(source, &after_open, &current_parent)?;
@@ -841,16 +835,8 @@ fn merge_directories(
 
         let target_meta = fs::symlink_metadata(&child_target)
             .with_context(|| format!("读取目标条目失败: {}", child_target.display()))?;
-        if source_meta.is_dir()
-            && target_meta.is_dir()
-            && !target_meta.file_type().is_symlink()
-        {
-            merge_directories(
-                &child_source,
-                &source_meta,
-                &child_target,
-                &target_meta,
-            )?;
+        if source_meta.is_dir() && target_meta.is_dir() && !target_meta.file_type().is_symlink() {
+            merge_directories(&child_source, &source_meta, &child_target, &target_meta)?;
         } else {
             overwrite_entry(&child_source, &source_meta, &child_target)?;
         }
@@ -879,11 +865,7 @@ fn unique_operation_path(target: &Path, kind: &str) -> Result<PathBuf> {
     }
 }
 
-fn replace_with_backup(
-    staging: &Path,
-    staging_container: &Path,
-    target: &Path,
-) -> Result<()> {
+fn replace_with_backup(staging: &Path, staging_container: &Path, target: &Path) -> Result<()> {
     let backup_container = match create_unique_operation_dir(target, "backup") {
         Ok(path) => path,
         Err(e) => {
@@ -948,8 +930,7 @@ fn remove_path_no_follow(path: &Path) -> Result<()> {
         Ok(metadata) => metadata,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => {
-            return Err(e)
-                .with_context(|| format!("读取待删除条目失败: {}", path.display()));
+            return Err(e).with_context(|| format!("读取待删除条目失败: {}", path.display()));
         }
     };
 
@@ -1373,7 +1354,12 @@ mod tests {
 
         let err = create_file(&root, &link).unwrap_err().to_string();
         assert!(err.contains("已存在"));
-        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert!(!missing_target.exists());
 
         delete_entry(&root, &link).unwrap();
@@ -1424,13 +1410,7 @@ mod tests {
         fs::write(source.join("top.txt"), "top").unwrap();
         fs::write(source.join("nested").join("deep.txt"), "deep").unwrap();
 
-        let actual = copy_entry(
-            &root,
-            &source,
-            &source,
-            CopyConflictPolicy::KeepBoth,
-        )
-        .unwrap();
+        let actual = copy_entry(&root, &source, &source, CopyConflictPolicy::KeepBoth).unwrap();
         assert_eq!(actual, root.join("source copy"));
         assert_eq!(fs::read_to_string(actual.join("top.txt")).unwrap(), "top");
         assert_eq!(
@@ -1449,13 +1429,7 @@ mod tests {
         fs::write(&source, "new-content").unwrap();
         fs::write(&target, "old-content").unwrap();
 
-        let actual = copy_entry(
-            &root,
-            &source,
-            &target,
-            CopyConflictPolicy::Overwrite,
-        )
-        .unwrap();
+        let actual = copy_entry(&root, &source, &target, CopyConflictPolicy::Overwrite).unwrap();
         assert_eq!(actual, target);
         assert_eq!(fs::read_to_string(&source).unwrap(), "new-content");
         assert_eq!(fs::read_to_string(&target).unwrap(), "new-content");
@@ -1495,13 +1469,7 @@ mod tests {
         fs::write(target.join("nested").join("common.txt"), "target-nested").unwrap();
         fs::write(target.join("nested").join("target-only.txt"), "keep").unwrap();
 
-        copy_entry(
-            &root,
-            &source,
-            &target,
-            CopyConflictPolicy::Overwrite,
-        )
-        .unwrap();
+        copy_entry(&root, &source, &target, CopyConflictPolicy::Overwrite).unwrap();
         assert_eq!(
             fs::read_to_string(target.join("common.txt")).unwrap(),
             "source-common"
@@ -1535,13 +1503,7 @@ mod tests {
         fs::create_dir(&target).unwrap();
         fs::write(target.join("old.txt"), "old").unwrap();
 
-        copy_entry(
-            &root,
-            &source,
-            &target,
-            CopyConflictPolicy::Overwrite,
-        )
-        .unwrap();
+        copy_entry(&root, &source, &target, CopyConflictPolicy::Overwrite).unwrap();
         assert!(target.is_file());
         assert_eq!(fs::read_to_string(&target).unwrap(), "replacement");
         assert!(operation_artifacts(&root).is_empty());
@@ -1582,7 +1544,9 @@ mod tests {
     #[test]
     fn delete_entry_rejects_project_root_dot_alias() {
         let (root, _) = make_test_project();
-        let err = delete_entry(&root, &root.join(".")).unwrap_err().to_string();
+        let err = delete_entry(&root, &root.join("."))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("不能删除项目根目录"));
         assert!(root.exists());
         fs::remove_dir_all(&root).ok();

@@ -17,43 +17,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  rustfmt-artifact:
-    name: Rustfmt artifact
-    runs-on: ubuntu-22.04
-    timeout-minutes: 10
-
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-
-      # Formatting is produced on the GitHub runner so the development machine
-      # never runs a Rust tool. The artifact is applied in the next commit, then
-      # this temporary job is removed.
-      - name: Format changed Rust files
-        shell: bash
-        env:
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        run: |
-          base="$(git merge-base HEAD "origin/$DEFAULT_BRANCH")"
-          mapfile -d '' files < <(git diff --name-only --diff-filter=ACMR -z "$base" HEAD -- '*.rs')
-          rustfmt --edition 2024 "${files[@]}"
-          printf '%s\0' "${files[@]}" \
-            | tar --null --files-from=- -czf rustfmt-output.tar.gz
-
-      - name: Upload formatted sources
-        uses: actions/upload-artifact@v4
-        with:
-          name: rustfmt-${{ github.sha }}
-          path: rustfmt-output.tar.gz
-          if-no-files-found: error
-          retention-days: 1
-
   rust:
     name: Rust workspace
     runs-on: ubuntu-22.04

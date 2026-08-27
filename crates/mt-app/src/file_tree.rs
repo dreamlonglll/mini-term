@@ -45,20 +45,20 @@ use futures::StreamExt;
 use futures::channel::mpsc;
 use gpui::{
     AnyElement, App, ClipboardItem, Context, DragMoveEvent, Entity, ExternalPaths, Hsla,
-    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
-    PathPromptOptions, Render, SharedString, StatefulInteractiveElement, Styled, Task, Window, div,
+    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, PathPromptOptions,
+    Render, SharedString, StatefulInteractiveElement, Styled, Task, Window, div,
     prelude::FluentBuilder, px,
 };
-use mt_ui::tooltip::Tooltip;
 use mt_project::fs::FileEntry;
 use mt_project::watch::FsWatcher;
 use mt_ui::icons::FileIcon;
 use mt_ui::icons::vector::{Geom, Ink, Shape, VectorIcon};
+use mt_ui::tooltip::Tooltip;
 
-use crate::fs_ops;
 use crate::file_ops::{
     FileBackendIdentity, FileClipboardEntry, FileOperationContext, entry_target_directory,
 };
+use crate::fs_ops;
 use crate::git_watch;
 use crate::i18n::{t, tr};
 use crate::menu::{self, MenuEntry, MenuItem};
@@ -508,9 +508,7 @@ impl FileTree {
                     )
                     .map_err(|e| anyhow::anyhow!(e))?;
                     if remote.is_some() {
-                        return anyhow::Ok(
-                            entries.into_iter().map(|e| (e, Vec::new())).collect(),
-                        );
+                        return anyhow::Ok(entries.into_iter().map(|e| (e, Vec::new())).collect());
                     }
                     let chains = compact_dir_chains(entries, |d| {
                         mt_project::fs::list_directory(&task_root, d).unwrap_or_default()
@@ -887,9 +885,7 @@ impl FileTree {
 }
 
 fn same_file_source(left: &FileOperationContext, right: &FileOperationContext) -> bool {
-    left.project_id == right.project_id
-        && left.root == right.root
-        && left.backend == right.backend
+    left.project_id == right.project_id && left.root == right.root && left.backend == right.backend
 }
 
 /// 「展开着、却一份内容都没列过」的目录 —— 要补列的那些。
@@ -986,20 +982,11 @@ fn file_menu_actions(
             actions.extend([Some(UploadFiles), Some(UploadFolder)]);
         }
     }
-    actions.extend([
-        None,
-        Some(CopyRelativePath),
-        Some(CopyAbsolutePath),
-    ]);
+    actions.extend([None, Some(CopyRelativePath), Some(CopyAbsolutePath)]);
     if !remote {
         actions.push(Some(RevealInFolder));
     }
-    actions.extend([
-        Some(OpenInTerminal),
-        None,
-        Some(Rename),
-        Some(Delete),
-    ]);
+    actions.extend([Some(OpenInTerminal), None, Some(Rename), Some(Delete)]);
     if is_dir {
         actions.extend([None, Some(NewFile), Some(NewFolder)]);
     }
@@ -1378,10 +1365,7 @@ fn paste_file_clipboard(
         );
         return;
     }
-    let source_name = clipboard
-        .source
-        .file_name()
-        .map(|name| name.to_os_string());
+    let source_name = clipboard.source.file_name().map(|name| name.to_os_string());
     let Some(source_name) = source_name else {
         return;
     };
@@ -1609,12 +1593,7 @@ fn choose_upload_paths(
                         if tree.read(cx).operation_context(cx).as_ref() != Some(&context) {
                             return;
                         }
-                        show_alert(
-                            t("fileTree", "operation.failedTitle"),
-                            detail,
-                            window,
-                            cx,
-                        );
+                        show_alert(t("fileTree", "operation.failedTitle"), detail, window, cx);
                     });
                     return;
                 }
@@ -1624,12 +1603,7 @@ fn choose_upload_paths(
                         if tree.read(cx).operation_context(cx).as_ref() != Some(&context) {
                             return;
                         }
-                        show_alert(
-                            t("fileTree", "operation.failedTitle"),
-                            detail,
-                            window,
-                            cx,
-                        );
+                        show_alert(t("fileTree", "operation.failedTitle"), detail, window, cx);
                     });
                     return;
                 }
@@ -1811,7 +1785,8 @@ fn file_menu(
                     let path = path.clone();
                     cx.background_executor()
                         .spawn(async move {
-                            if let Err(err) = mt_project::editor::open_path_with_default_app(&path) {
+                            if let Err(err) = mt_project::editor::open_path_with_default_app(&path)
+                            {
                                 eprintln!("[files] 默认程序打开失败: {err:#}");
                             }
                         })
@@ -1825,20 +1800,12 @@ fn file_menu(
                     copy_to_file_clipboard(&tree, &row, &context, cx);
                 })
             }
-            FileMenuAction::Paste => {
-                MenuItem::new(t("fileTree", "menu.paste"))
-                    .disabled(!can_paste)
-                    .on_click(move |window, cx| {
-                        paste_file_clipboard(
-                            tree.clone(),
-                            context.clone(),
-                            path.clone(),
-                            window,
-                            cx,
-                        );
-                    })
-                    .into()
-            }
+            FileMenuAction::Paste => MenuItem::new(t("fileTree", "menu.paste"))
+                .disabled(!can_paste)
+                .on_click(move |window, cx| {
+                    paste_file_clipboard(tree.clone(), context.clone(), path.clone(), window, cx);
+                })
+                .into(),
             FileMenuAction::Download => {
                 menu::item(t("fileTree", "menu.download"), move |window, cx| {
                     start_download(
@@ -1884,15 +1851,21 @@ fn file_menu(
                 } else {
                     fs_ops::relative_path(&path.to_string_lossy(), &root.to_string_lossy())
                 };
-                menu::item(t("fileTree", "menu.copyRelativePath"), move |_window, cx| {
-                    cx.write_to_clipboard(ClipboardItem::new_string(relative.clone()));
-                })
+                menu::item(
+                    t("fileTree", "menu.copyRelativePath"),
+                    move |_window, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(relative.clone()));
+                    },
+                )
             }
             FileMenuAction::CopyAbsolutePath => {
                 let absolute = path.to_string_lossy().to_string();
-                menu::item(t("fileTree", "menu.copyAbsolutePath"), move |_window, cx| {
-                    cx.write_to_clipboard(ClipboardItem::new_string(absolute.clone()));
-                })
+                menu::item(
+                    t("fileTree", "menu.copyAbsolutePath"),
+                    move |_window, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(absolute.clone()));
+                    },
+                )
             }
             FileMenuAction::RevealInFolder => {
                 menu::item(t("fileTree", "menu.revealInFolder"), move |_window, cx| {
@@ -2103,13 +2076,7 @@ fn background_menu(
                 let root = root.clone();
                 let context = context.clone();
                 move |window, cx| {
-                    paste_file_clipboard(
-                        tree.clone(),
-                        context.clone(),
-                        root.clone(),
-                        window,
-                        cx,
-                    );
+                    paste_file_clipboard(tree.clone(), context.clone(), root.clone(), window, cx);
                 }
             })
             .into(),
@@ -2255,10 +2222,8 @@ fn new_entry_prompt(
                     )
                     .map(|_| None),
                     None => {
-                        let target = PathBuf::from(fs_ops::child_path(
-                            &dir.to_string_lossy(),
-                            &name,
-                        ));
+                        let target =
+                            PathBuf::from(fs_ops::child_path(&dir.to_string_lossy(), &name));
                         if is_dir {
                             mt_project::fs::create_directory(&root, &target)
                         } else {
@@ -2279,7 +2244,11 @@ fn new_entry_prompt(
 
 /// 快捷键提示里的修饰键名(与 `search_modal` 那份同规则)。
 fn mod_label() -> &'static str {
-    if cfg!(target_os = "macos") { "⌘" } else { "Ctrl" }
+    if cfg!(target_os = "macos") {
+        "⌘"
+    } else {
+        "Ctrl"
+    }
 }
 
 /// 头部那三个 26×26 的图标钮共用的外观(`FileTree.tsx:734`)。
@@ -2348,11 +2317,7 @@ impl Render for FileTree {
         if !cx.has_active_drag() {
             self.external_drop_target = None;
         }
-        let project_name = self
-            .store
-            .read(cx)
-            .active_project()
-            .map(|p| p.name.clone());
+        let project_name = self.store.read(cx).active_project().map(|p| p.name.clone());
         let editors: Vec<String> = self
             .store
             .read(cx)
@@ -2402,26 +2367,28 @@ impl Render for FileTree {
                     .items_center()
                     .flex_none()
                     .gap(px(4.0))
-                    .when(!is_remote, |el| el.child(
-                        // 搜索 = 全局 SearchModal(不是文件名过滤),与 Ctrl+Shift+F 同一个入口
-                        header_button("file-tree-search")
-                            .tooltip(|window, cx| {
-                                // `{mod}` 插值不能走 `tr!`(参数位是 `$name:ident`,
-                                // `mod` 是 Rust 关键字塞不进去)—— 与 search_modal 同一个坑
-                                Tooltip::new(mt_i18n::t_args(
-                                    "fileTree",
-                                    "header.searchTitle",
-                                    &[("mod", mod_label())],
-                                ))
-                                .build(window, cx)
-                            })
-                            .on_click(move |_event, window, cx| {
-                                crate::search_modal::open(store_for_search.clone(), window, cx);
-                            })
-                            .child(
-                                VectorIcon::new(SEARCH_SHAPES, px(13.0)).ink(ui::text_muted()),
-                            ),
-                    ))
+                    .when(!is_remote, |el| {
+                        el.child(
+                            // 搜索 = 全局 SearchModal(不是文件名过滤),与 Ctrl+Shift+F 同一个入口
+                            header_button("file-tree-search")
+                                .tooltip(|window, cx| {
+                                    // `{mod}` 插值不能走 `tr!`(参数位是 `$name:ident`,
+                                    // `mod` 是 Rust 关键字塞不进去)—— 与 search_modal 同一个坑
+                                    Tooltip::new(mt_i18n::t_args(
+                                        "fileTree",
+                                        "header.searchTitle",
+                                        &[("mod", mod_label())],
+                                    ))
+                                    .build(window, cx)
+                                })
+                                .on_click(move |_event, window, cx| {
+                                    crate::search_modal::open(store_for_search.clone(), window, cx);
+                                })
+                                .child(
+                                    VectorIcon::new(SEARCH_SHAPES, px(13.0)).ink(ui::text_muted()),
+                                ),
+                        )
+                    })
                     .child(
                         header_button("file-tree-refresh")
                             // 远程项目多一句:刷新会重读远程根 `.gitignore`
@@ -2440,9 +2407,7 @@ impl Render for FileTree {
                             .on_click(cx.listener(|this, _event, _window, cx| {
                                 this.refresh_root(cx);
                             }))
-                            .child(
-                                VectorIcon::new(REFRESH_SHAPES, px(13.0)).ink(ui::text_muted()),
-                            ),
+                            .child(VectorIcon::new(REFRESH_SHAPES, px(13.0)).ink(ui::text_muted())),
                     )
                     .when(!is_remote, |el| {
                         el.when_some(default_editor.clone(), |el, current| {
@@ -2867,12 +2832,14 @@ impl FileTree {
             .id(SharedString::from(format!("fs-{}", row.path.display())))
             // 行级焦点 + tab 停靠点(原版每行 `tabIndex={0}` + `role=treeitem`)
             .when_some(focus, |el, focus| el.track_focus(&focus).tab_index(0))
-            .on_key_down(cx.listener(move |this, event: &gpui::KeyDownEvent, window, cx| {
-                if this.operation_context(cx).as_ref() != key_context.as_ref() {
-                    return;
-                }
-                this.on_row_key(event, &key_path, is_dir, key_expanded, window, cx);
-            }))
+            .on_key_down(
+                cx.listener(move |this, event: &gpui::KeyDownEvent, window, cx| {
+                    if this.operation_context(cx).as_ref() != key_context.as_ref() {
+                        return;
+                    }
+                    this.on_row_key(event, &key_path, is_dir, key_expanded, window, cx);
+                }),
+            )
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener({
@@ -2895,19 +2862,23 @@ impl FileTree {
             .text_size(ui::font_px(12.0))
             .text_color(color)
             .hover(|el| el.bg(ui::bg_overlay()))
-            .when(drop_highlight, |el| el.bg(ui::with_alpha(ui::accent(), 0.18)))
-            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
-                if this.operation_context(cx).as_ref() != click_context.as_ref() {
-                    return;
-                }
-                if is_dir {
-                    this.toggle_dir(path.clone(), cx);
-                } else if event.click_count() <= 1 {
-                    // 单击开预览器;双击的第二个事件(click_count == 2)不再做别的,
-                    // 见 `open_file` 的注释
-                    this.open_file(path.clone(), window, cx);
-                }
-            }))
+            .when(drop_highlight, |el| {
+                el.bg(ui::with_alpha(ui::accent(), 0.18))
+            })
+            .on_click(
+                cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                    if this.operation_context(cx).as_ref() != click_context.as_ref() {
+                        return;
+                    }
+                    if is_dir {
+                        this.toggle_dir(path.clone(), cx);
+                    } else if event.click_count() <= 1 {
+                        // 单击开预览器;双击的第二个事件(click_count == 2)不再做别的,
+                        // 见 `open_file` 的注释
+                        this.open_file(path.clone(), window, cx);
+                    }
+                }),
+            )
             // 拖进终端 = 把路径当文本写进 PTY(不是上传文件)。目录同样可拖,
             // 与原版一致(`FileTree.tsx:326-328` 的 `initFileDrag(entry.path)`
             // 不区分文件/目录)。落点在 `terminal_area.rs` 的 pane 主体。
@@ -3261,7 +3232,12 @@ mod tests {
             ),
             (
                 "/p/only-ignored",
-                vec![entry("node_modules", "/p/only-ignored/node_modules", true, true)],
+                vec![entry(
+                    "node_modules",
+                    "/p/only-ignored/node_modules",
+                    true,
+                    true,
+                )],
             ),
             // 被忽略的目录压根不该被列(命中就说明闸门漏了)
             ("/p/target", vec![entry("x", "/p/target/x", true, false)]),

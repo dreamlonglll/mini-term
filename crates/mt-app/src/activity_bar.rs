@@ -664,11 +664,7 @@ const DOT_INSET: f32 = -1.0;
 /// 缩,不补的话圆点会朝右上角缩过去(单测钉的就是这条中心不动)。
 fn blink_dot_frame(phase: f32) -> (f32, f32, f32) {
     let side = DOT_SIZE - DOT_SIZE * 0.25 * phase;
-    (
-        side,
-        DOT_INSET + (DOT_SIZE - side) / 2.0,
-        1.0 - 0.8 * phase,
-    )
+    (side, DOT_INSET + (DOT_SIZE - side) / 2.0, 1.0 - 0.8 * phase)
 }
 
 /// `alertBlink` 的周期(原版 `animation: alertBlink 0.8s ease-in-out infinite`)。

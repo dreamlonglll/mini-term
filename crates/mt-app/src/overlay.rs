@@ -291,7 +291,10 @@ mod tests {
 
         stack.push(key(kind::SETTINGS));
         assert!(!stack.allows(Yield::ToOverlay), "弹窗开着必须让路");
-        assert!(stack.allows(Yield::Never), "openSettings / globalSearch 不让路");
+        assert!(
+            stack.allows(Yield::Never),
+            "openSettings / globalSearch 不让路"
+        );
 
         stack.pop(key(kind::SETTINGS));
         assert!(stack.allows(Yield::ToOverlay), "关掉之后恢复");

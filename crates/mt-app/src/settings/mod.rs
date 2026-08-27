@@ -628,7 +628,10 @@ impl SettingsView {
         let texts = [
             (this.txt_remote_paste_dir.clone(), TextField::RemotePasteDir),
             (this.txt_ui_font.clone(), TextField::UiFontFamily),
-            (this.txt_terminal_font.clone(), TextField::TerminalFontFamily),
+            (
+                this.txt_terminal_font.clone(),
+                TextField::TerminalFontFamily,
+            ),
         ];
         for (entity, field) in texts {
             this._subs.push(cx.subscribe_in(
@@ -676,7 +679,9 @@ impl SettingsView {
             NumField::CharThreshold => {
                 store.patch_config(|c| c.long_paste_char_threshold = next as u32, cx)
             }
-            NumField::TrayMax => store.patch_config(|c| c.tray_max_projects = Some(next as u32), cx),
+            NumField::TrayMax => {
+                store.patch_config(|c| c.tray_max_projects = Some(next as u32), cx)
+            }
         });
     }
 
@@ -1005,7 +1010,11 @@ mod tests {
         let none = vec![reg("claude", 0, 16), reg("codex", 0, 8), reg("grok", 0, 6)];
         assert_eq!(
             default_selected_agents(&none),
-            vec!["claude".to_string(), "codex".to_string(), "grok".to_string()]
+            vec![
+                "claude".to_string(),
+                "codex".to_string(),
+                "grok".to_string()
+            ]
         );
 
         // 旧事件集(registered < total)也算「装过」
