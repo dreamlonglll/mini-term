@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 32;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 824;
+pub const ZH_ENTRY_COUNT: usize = 825;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 824;
+pub const EN_ENTRY_COUNT: usize = 825;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -234,6 +234,7 @@ static FILE_TREE_ZH: &[(&str, &str)] = &[
     ("conflict.keepBoth", "生成副本"),
     ("conflict.message", "请选择本次批量操作中所有剩余同名冲突的处理方式。覆盖文件夹会递归合并，并保留目标独有内容。"),
     ("conflict.overwrite", "覆盖"),
+    ("conflict.remaining", "另有 {count} 项"),
     ("conflict.skip", "跳过"),
     ("conflict.title", "发现同名文件"),
     ("dialog.deleteCancel", "取消"),
@@ -311,6 +312,7 @@ static FILE_TREE_EN: &[(&str, &str)] = &[
     ("conflict.keepBoth", "Keep Both"),
     ("conflict.message", "Choose how to handle all remaining conflicts in this batch. Overwriting a folder merges it recursively and keeps destination-only content."),
     ("conflict.overwrite", "Overwrite"),
+    ("conflict.remaining", "{count} more items"),
     ("conflict.skip", "Skip"),
     ("conflict.title", "Name Conflicts Found"),
     ("dialog.deleteCancel", "Cancel"),

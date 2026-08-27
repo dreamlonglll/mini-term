@@ -215,6 +215,7 @@ const USED_KEYS: &[&str] = &[
     "fileTree.conflict.keepBoth",
     "fileTree.conflict.message",
     "fileTree.conflict.overwrite",
+    "fileTree.conflict.remaining",
     "fileTree.conflict.skip",
     "fileTree.conflict.title",
     "fileTree.dialog.deleteCancel",

@@ -35,7 +35,7 @@ use gpui_component::WindowExt as _;
 use gpui_component::dialog::{Dialog, DialogButtonProps};
 use gpui_component::input::{Input, InputState, SelectAll};
 
-use crate::i18n::t;
+use crate::i18n::{t, tr};
 use crate::overlay;
 use crate::ui;
 
@@ -360,13 +360,39 @@ pub fn show_alert(
     });
 }
 
+const FILE_CONFLICT_PREVIEW_LIMIT: usize = 5;
+
+fn file_conflict_preview(conflicts: &[String]) -> (Vec<String>, usize) {
+    let preview = conflicts
+        .iter()
+        .take(FILE_CONFLICT_PREVIEW_LIMIT)
+        .cloned()
+        .collect::<Vec<_>>();
+    let remaining = conflicts.len().saturating_sub(preview.len());
+    (preview, remaining)
+}
+
 /// 上传/下载遇到同名目标时的三选一弹窗。点击遮罩或 Esc 等同取消。
 pub fn show_file_conflict_choice(
+    conflicts: Vec<String>,
     on_choice: impl Fn(crate::remote_ssh::FileConflictStrategy, &mut Window, &mut App) + 'static,
     on_cancel: impl Fn(&mut Window, &mut App) + 'static,
     window: &mut Window,
     cx: &mut App,
 ) {
+    let (preview, remaining) = file_conflict_preview(&conflicts);
+    let mut details = preview
+        .into_iter()
+        .map(|name| format!("• {name}"))
+        .collect::<Vec<_>>();
+    if remaining > 0 {
+        details.push(tr!(
+            "fileTree",
+            "conflict.remaining",
+            count = remaining
+        ));
+    }
+    let message = t("fileTree", "conflict.message");
     let on_choice = Rc::new(on_choice);
     open_guarded_with_close(
         kind::FILE_CONFLICT,
@@ -394,19 +420,14 @@ pub fn show_file_conflict_choice(
                 .overlay_closable(true)
                 .child(
                     div()
-                        .px(px(20.0))
                         .pb(px(16.0))
                         .flex()
                         .flex_col()
                         .gap(px(14.0))
+                        .child(body(&message, &details))
                         .child(
                             div()
-                                .text_size(ui::font_px(13.0))
-                                .text_color(ui::text_primary())
-                                .child(t("fileTree", "conflict.message")),
-                        )
-                        .child(
-                            div()
+                                .px(px(20.0))
                                 .flex()
                                 .items_center()
                                 .justify_end()
@@ -466,4 +487,29 @@ fn body(message: &str, detail: &[String]) -> gpui::AnyElement {
         el = el.child(list);
     }
     el.into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_conflict_preview_lists_at_most_five_names() {
+        let conflicts = (1..=7)
+            .map(|index| format!("file-{index}.txt"))
+            .collect::<Vec<_>>();
+        let (preview, remaining) = file_conflict_preview(&conflicts);
+
+        assert_eq!(preview.as_slice(), &conflicts[..5]);
+        assert_eq!(remaining, 2);
+    }
+
+    #[test]
+    fn file_conflict_preview_keeps_short_lists_complete() {
+        let conflicts = vec!["a.txt".to_string(), "b.txt".to_string()];
+        let (preview, remaining) = file_conflict_preview(&conflicts);
+
+        assert_eq!(preview, conflicts);
+        assert_eq!(remaining, 0);
+    }
 }

@@ -65,6 +65,7 @@ export const fileTree = {
       message: "请选择本次批量操作中所有剩余同名冲突的处理方式。覆盖文件夹会递归合并，并保留目标独有内容。",
       skip: "跳过",
       overwrite: "覆盖",
+      remaining: "另有 {count} 项",
       keepBoth: "生成副本",
     },
     operation: {
@@ -163,6 +164,7 @@ export const fileTree = {
       message: "Choose how to handle all remaining conflicts in this batch. Overwriting a folder merges it recursively and keeps destination-only content.",
       skip: "Skip",
       overwrite: "Overwrite",
+      remaining: "{count} more items",
       keepBoth: "Keep Both",
     },
     operation: {

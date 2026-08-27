@@ -1570,7 +1570,7 @@ fn start_upload(
                             cx,
                         );
                     }
-                    Ok((conn, _)) => {
+                    Ok((conn, conflicts)) => {
                         if !retain_tree_preflight_for_choice(&tree, &context, cx) {
                             return;
                         }
@@ -1579,6 +1579,7 @@ fn start_upload(
                         let cancel_tree = tree.clone();
                         let cancel_context = context.clone();
                         show_file_conflict_choice(
+                            conflicts,
                             move |strategy, window, cx| {
                                 if finish_tree_preflight(
                                     &choice_tree,
@@ -1780,54 +1781,71 @@ fn start_download(
         .spawn(async move { crate::remote_ssh::download_conflicts(&scan_dir, &scan_paths) });
     window
         .spawn(cx, async move |cx| {
-            let conflicts = task.await;
+            let result = task.await;
             let _ = cx.update(|window, cx| {
-                if conflicts.is_empty() {
-                    if finish_tree_preflight(&tree, &context, cx) != Some(true) {
-                        return;
+                match result {
+                    Ok(conflicts) if conflicts.is_empty() => {
+                        if finish_tree_preflight(&tree, &context, cx) != Some(true) {
+                            return;
+                        }
+                        run_download(
+                            tree,
+                            context,
+                            conn,
+                            remote_paths,
+                            download_dir,
+                            crate::remote_ssh::FileConflictStrategy::KeepBoth,
+                            window,
+                            cx,
+                        );
                     }
-                    run_download(
-                        tree,
-                        context,
-                        conn,
-                        remote_paths,
-                        download_dir,
-                        crate::remote_ssh::FileConflictStrategy::KeepBoth,
-                        window,
-                        cx,
-                    );
-                } else {
-                    if !retain_tree_preflight_for_choice(&tree, &context, cx) {
-                        return;
+                    Ok(conflicts) => {
+                        if !retain_tree_preflight_for_choice(&tree, &context, cx) {
+                            return;
+                        }
+                        let choice_tree = tree.clone();
+                        let choice_context = context.clone();
+                        let cancel_tree = tree.clone();
+                        let cancel_context = context.clone();
+                        show_file_conflict_choice(
+                            conflicts,
+                            move |strategy, window, cx| {
+                                if finish_tree_preflight(
+                                    &choice_tree,
+                                    &choice_context,
+                                    cx,
+                                ) != Some(true)
+                                {
+                                    return;
+                                }
+                                run_download(
+                                    choice_tree.clone(),
+                                    choice_context.clone(),
+                                    conn.clone(),
+                                    remote_paths.clone(),
+                                    download_dir.clone(),
+                                    strategy,
+                                    window,
+                                    cx,
+                                );
+                            },
+                            move |_window, cx| {
+                                finish_tree_preflight(&cancel_tree, &cancel_context, cx);
+                            },
+                            window,
+                            cx,
+                        );
                     }
-                    let choice_tree = tree.clone();
-                    let choice_context = context.clone();
-                    let cancel_tree = tree.clone();
-                    let cancel_context = context.clone();
-                    show_file_conflict_choice(
-                        move |strategy, window, cx| {
-                            if finish_tree_preflight(&choice_tree, &choice_context, cx)
-                                != Some(true)
-                            {
-                                return;
-                            }
-                            run_download(
-                                choice_tree.clone(),
-                                choice_context.clone(),
-                                conn.clone(),
-                                remote_paths.clone(),
-                                download_dir.clone(),
-                                strategy,
+                    Err(error) => {
+                        if finish_tree_preflight(&tree, &context, cx).is_some() {
+                            show_alert(
+                                t("fileTree", "operation.failedTitle"),
+                                tr!("fileTree", "operation.failedMessage", error = error),
                                 window,
                                 cx,
                             );
-                        },
-                        move |_window, cx| {
-                            finish_tree_preflight(&cancel_tree, &cancel_context, cx);
-                        },
-                        window,
-                        cx,
-                    );
+                        }
+                    }
                 }
             });
         })

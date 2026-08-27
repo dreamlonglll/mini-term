@@ -492,6 +492,7 @@ fn valid_remote_name(name: &str) -> bool {
         && name != ".."
         && !name.contains('/')
         && !name.contains('\\')
+        && !name.contains(':')
         && !name.contains('\0')
 }
 
@@ -2373,27 +2374,65 @@ pub fn upload_paths(
     })
 }
 
+fn ensure_local_download_target(download_root: &Path, target: &Path) -> Result<(), String> {
+    if !download_root.is_absolute() {
+        return Err(format!(
+            "下载根目录必须是绝对路径: {}",
+            download_root.display()
+        ));
+    }
+    if !target.starts_with(download_root) {
+        return Err(format!(
+            "本地下载目标逃出下载目录: {} (root: {})",
+            target.display(),
+            download_root.display()
+        ));
+    }
+    Ok(())
+}
+
+fn checked_local_download_child(
+    download_root: &Path,
+    parent: &Path,
+    name: &str,
+) -> Result<PathBuf, String> {
+    if !valid_remote_name(name) {
+        return Err(format!("远程文件名不能安全落到本机: {name:?}"));
+    }
+    ensure_local_download_target(download_root, parent)?;
+    let target = parent.join(name);
+    ensure_local_download_target(download_root, &target)?;
+    Ok(target)
+}
+
 /// 下载前检查顶层目标是否已存在。
-pub fn download_conflicts(download_dir: &Path, remote_paths: &[PathBuf]) -> Vec<String> {
-    remote_paths
-        .iter()
-        .filter_map(|path| path.file_name())
-        .filter_map(|name| {
-            let target = download_dir.join(name);
-            std::fs::symlink_metadata(target)
-                .is_ok()
-                .then(|| name.to_string_lossy().into_owned())
-        })
-        .collect()
+pub fn download_conflicts(
+    download_dir: &Path,
+    remote_paths: &[PathBuf],
+) -> Result<Vec<String>, String> {
+    let mut conflicts = Vec::new();
+    for path in remote_paths {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| format!("远程下载目标名称无效: {}", path.display()))?;
+        let target = checked_local_download_child(download_dir, download_dir, name)?;
+        if std::fs::symlink_metadata(target).is_ok() {
+            conflicts.push(name.to_string());
+        }
+    }
+    Ok(conflicts)
 }
 
 async fn download_remote_tree(
     sftp: &SftpHandle,
     remote_root: String,
+    download_root: &Path,
     local_root: PathBuf,
     strategy: FileConflictStrategy,
     summary: &mut FileOperationSummary,
 ) -> Result<(), String> {
+    ensure_local_download_target(download_root, &local_root)?;
     enum DownloadWork {
         Visit {
             remote: String,
@@ -2448,6 +2487,9 @@ async fn download_remote_tree(
                     replace_existing,
                     summary_before,
                 } => {
+                    ensure_local_download_target(download_root, &staging)?;
+                    ensure_local_download_target(download_root, &staging_container)?;
+                    ensure_local_download_target(download_root, &target)?;
                     let commit_result = if replace_existing {
                         replace_local_staged_entry(&staging, &staging_container, &target)
                     } else {
@@ -2475,6 +2517,7 @@ async fn download_remote_tree(
                     continue;
                 }
             };
+            ensure_local_download_target(download_root, &desired_local)?;
             let kind = match known_kind {
                 Some(kind) => kind,
                 None => sftp
@@ -2523,6 +2566,7 @@ async fn download_remote_tree(
                 }
                 (existing, _) => (desired_local, existing),
             };
+            ensure_local_download_target(download_root, &local)?;
 
             match kind {
                 SftpNodeKind::Directory => {
@@ -2551,6 +2595,8 @@ async fn download_remote_tree(
                             let replace_existing = existing.is_some();
                             let (staging_container, staging) =
                                 create_local_staging_directory(&local)?;
+                            ensure_local_download_target(download_root, &staging_container)?;
+                            ensure_local_download_target(download_root, &staging)?;
                             staging_containers.insert(staging_container.clone());
                             stack.push(DownloadWork::CommitDirectory {
                                 staging: staging.clone(),
@@ -2600,7 +2646,11 @@ async fn download_remote_tree(
                         };
                         stack.push(DownloadWork::Visit {
                             remote: join_posix(&remote, &entry.name),
-                            desired_local: child_local_base.join(&entry.name),
+                            desired_local: checked_local_download_child(
+                                download_root,
+                                &child_local_base,
+                                &entry.name,
+                            )?,
                             known_kind: Some(kind),
                             inside_staging: child_inside_staging,
                             staging_replaces_existing: child_staging_replaces_existing,
@@ -2669,6 +2719,8 @@ pub fn download_entries(
         .map_err(|e| format!("无法创建下载目录 {}: {e}", download_dir.display()))?;
     mt_config::AppConfig::validate_download_dir(download_dir)
         .map_err(|e| format!("下载目录不可用: {e:#}"))?;
+    let download_root = std::fs::canonicalize(download_dir)
+        .map_err(|e| format!("无法解析下载目录 {}: {e}", download_dir.display()))?;
     let st = state();
     st.block_on(async move {
         let sftp = open_sftp(st, conn).await?;
@@ -2682,11 +2734,13 @@ pub fn download_entries(
                 )
                 .await?;
                 let (_, name) = split_posix_leaf(&remote)?;
-                let name = name.to_string();
+                let local_root =
+                    checked_local_download_child(&download_root, &download_root, name)?;
                 if let Err(error) = download_remote_tree(
                     &sftp,
                     remote,
-                    download_dir.join(&name),
+                    &download_root,
+                    local_root,
                     strategy,
                     &mut summary,
                 )
@@ -3401,7 +3455,35 @@ mod tests {
         assert!(normalize_absolute_posix("/work/../etc").is_err());
         assert!(!valid_remote_name("a/b"));
         assert!(!valid_remote_name("a\\b"));
+        assert!(!valid_remote_name("C:evil.exe"));
+        assert!(!valid_remote_name("file:stream"));
         assert!(!valid_remote_name(".."));
+    }
+
+    #[test]
+    fn local_download_targets_stay_inside_root() {
+        let root = if cfg!(windows) {
+            PathBuf::from(r"C:\downloads")
+        } else {
+            PathBuf::from("/downloads")
+        };
+        let outside = if cfg!(windows) {
+            PathBuf::from(r"D:\outside")
+        } else {
+            PathBuf::from("/outside")
+        };
+
+        assert_eq!(
+            checked_local_download_child(&root, &root, "safe.txt").unwrap(),
+            root.join("safe.txt")
+        );
+        assert!(checked_local_download_child(&root, &root, "C:evil.exe").is_err());
+        assert!(checked_local_download_child(&root, &root, "a\\b").is_err());
+        assert!(checked_local_download_child(&root, &outside, "safe.txt").is_err());
+        assert!(ensure_local_download_target(&root, &outside).is_err());
+        assert!(
+            download_conflicts(&root, &[PathBuf::from("/remote/C:evil.exe")]).is_err()
+        );
     }
 
     #[test]
