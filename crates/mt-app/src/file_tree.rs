@@ -1168,7 +1168,7 @@ fn retain_tree_preflight_for_choice(
             cx.notify();
             return false;
         }
-        tree.operation_label = Some(t("fileTree", "conflict.title"));
+        tree.operation_label = Some(t("fileTree", "conflict.title").to_string());
         cx.notify();
         true
     })
