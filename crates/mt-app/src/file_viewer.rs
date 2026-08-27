@@ -1038,9 +1038,11 @@ fn find_next_url_attr(lower: &str, from: usize) -> Option<(usize, usize, &'stati
             // (`<img/src=x>`) or immediately after a quoted attribute
             // (`alt="x"src=y`). Cover those parser forms while still rejecting
             // compound names such as `data-src` and `xlink:href`.
-            if !lower[..name_start].chars().next_back().is_some_and(|ch| {
-                ch.is_whitespace() || matches!(ch, '/' | '"' | '\'')
-            }) {
+            if !lower[..name_start]
+                .chars()
+                .next_back()
+                .is_some_and(|ch| ch.is_whitespace() || matches!(ch, '/' | '"' | '\''))
+            {
                 continue;
             }
             // 后面得是 `\s*=\s*`，值可以带引号也可以不带
