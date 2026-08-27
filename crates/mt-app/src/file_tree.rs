@@ -2117,6 +2117,7 @@ fn background_menu(
     }
     entries.push(menu::separator());
     entries.push(menu::item(t("fileTree", "menu.openInTerminal"), {
+        let tree = tree.clone();
         let store = store.clone();
         let context = context.clone();
         let root = root.clone();
@@ -2205,6 +2206,7 @@ fn new_entry_prompt(
             let root = context.root.clone();
             let context = context.clone();
             let connection = connection.clone();
+            let operation_dir = dir.clone();
             spawn_tree_op(
                 tree.clone(),
                 context,
@@ -2216,14 +2218,16 @@ fn new_entry_prompt(
                     Some(conn) => crate::remote_ssh::create_entry(
                         &conn,
                         &root.to_string_lossy(),
-                        &dir.to_string_lossy(),
+                        &operation_dir.to_string_lossy(),
                         &name,
                         is_dir,
                     )
                     .map(|_| None),
                     None => {
-                        let target =
-                            PathBuf::from(fs_ops::child_path(&dir.to_string_lossy(), &name));
+                        let target = PathBuf::from(fs_ops::child_path(
+                            &operation_dir.to_string_lossy(),
+                            &name,
+                        ));
                         if is_dir {
                             mt_project::fs::create_directory(&root, &target)
                         } else {

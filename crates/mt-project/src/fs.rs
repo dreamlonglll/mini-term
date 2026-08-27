@@ -184,6 +184,7 @@ pub const ALWAYS_IGNORE: &[&str] = &[
 /// - `\\?\UNC\wsl.localhost\Ubuntu\home` → `Some("\\\\wsl.localhost\\Ubuntu\\home")`
 /// - Volume GUID `\\?\Volume{...}` 等其他 verbatim 形式 → `None` (保留原样)
 /// - 非 verbatim 路径 → `None`
+#[cfg(any(windows, test))]
 fn try_strip_windows_verbatim(s: &str) -> Option<String> {
     let rest = s.strip_prefix(r"\\?\")?;
     // UNC verbatim: `\\?\UNC\<host>\<rest>` → `\\<host>\<rest>`
