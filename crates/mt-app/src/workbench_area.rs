@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 
 use gpui::{
     App, AppContext, Context, Entity, Global, InteractiveElement, IntoElement, ParentElement,
-    Render, SharedString, StatefulInteractiveElement, Styled, Window, div, px,
+    Render, SharedString, StatefulInteractiveElement, Styled, Window, div,
+    prelude::FluentBuilder, px,
 };
 use mt_ui::icons::FileIcon;
 use mt_ui::tooltip::Tooltip;
@@ -626,6 +627,10 @@ impl Render for WorkbenchArea {
                     .when(dirty, |el| {
                         el.child(
                             div()
+                                .id(SharedString::from(format!(
+                                    "workbench-tab-dirty-{:016x}",
+                                    stable_hash(key)
+                                )))
                                 .w(px(6.0))
                                 .h(px(6.0))
                                 .flex_none()

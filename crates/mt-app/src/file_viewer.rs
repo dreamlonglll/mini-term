@@ -3746,7 +3746,7 @@ mod tests {
             "{sanitized}"
         );
         assert!(sanitized.contains(r#"src="about:blank""#), "{sanitized}");
-        assert!(sanitized.contains(r#"href="#""#), "{sanitized}");
+        assert!(sanitized.contains(r##"href="#""##), "{sanitized}");
         assert!(
             sanitized.contains("https://example.com/docs"),
             "{sanitized}"

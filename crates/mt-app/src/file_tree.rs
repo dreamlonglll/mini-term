@@ -2578,6 +2578,7 @@ impl Render for FileTree {
 
         let is_remote = self.is_remote(cx);
         let mut header = div()
+            .id("file-tree-header")
             .flex()
             .items_center()
             .justify_between()
