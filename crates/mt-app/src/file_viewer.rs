@@ -1704,7 +1704,7 @@ impl FileViewer {
             |window, cx| {
                 // 确认框自己还压在栈顶,`close_guarded` 这时会拒绝动手
                 // (它只关栈顶那一个)—— 排到本轮之后再关
-                window.defer(cx, |window, cx| close(window, cx));
+                window.defer(cx, close);
             },
             window,
             cx,
@@ -2232,7 +2232,7 @@ impl FileViewer {
             // 这里的字号能赢(node.rs:384-386)
             let text = code_block.text.get_or_insert_default();
             text.font_size = Some(ui::font_px(11.9).into());
-            text.line_height = Some(gpui::relative(1.6).into());
+            text.line_height = Some(gpui::relative(1.6));
         }
         TextViewStyle {
             highlight_theme: cx.theme().highlight_theme.clone(),
@@ -2431,7 +2431,7 @@ impl FileViewer {
                             "Segoe UI Emoji".into(),
                         ]));
                         ts.font_size = Some(px(13.0).into());
-                        ts.line_height = Some(gpui::relative(1.6).into());
+                        ts.line_height = Some(gpui::relative(1.6));
                         wrap.child(Input::new(editor).h_full().appearance(false).bordered(false))
                             .into_any_element()
                     }
