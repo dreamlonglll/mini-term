@@ -1,8 +1,8 @@
 //! 配置持久化与主题包。**不依赖 gpui,也不依赖 tauri**。
 //!
 //! 从 `src-tauri/src/config.rs`(1298 行)与 `src-tauri/src/theme_packs.rs`(429 行)
-//! 移入。序列化面(`config.json` 的字段与 camelCase 名)一个字都没改 —— 装机版写下的
-//! 配置,新壳必须原样读得进来。
+//! 移入。既有字段与 camelCase 名保持兼容；新增偏好使用可选字段，旧版配置仍可
+//! 原样读入。
 //!
 //! # 三个入口
 //!

@@ -102,6 +102,10 @@ pub mod kind {
     /// 「添加远程项目」弹窗。三个入口(项目列表底部 SSH 钮 / 分组右键 /
     /// 首启引导第二颗按钮)共用这一种类,防的正是「两处入口各开一个」。
     pub const ADD_REMOTE_PROJECT: &str = "add-remote-project";
+    /// 文件上传/下载发现同名目标后的三选一冲突策略弹窗。
+    pub const FILE_CONFLICT: &str = "file-conflict";
+    /// 添加远程项目时叠在表单上方的远程目录浏览器。
+    pub const REMOTE_DIRECTORY_PICKER: &str = "remote-directory-picker";
     /// 项目环境变量弹窗。
     pub const PROJECT_ENV_VARS: &str = "project-env-vars";
     /// 日期选择浮层(用量面板的自定义起止)。种类唯一 —— 起、止两个输入框各点一次

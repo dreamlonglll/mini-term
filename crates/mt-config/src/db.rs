@@ -453,6 +453,7 @@ mod tests {
         config.ui_font_size = 15.0;
         config.theme = "dark".into();
         config.terminal_font_family = Some("Cascadia Mono".into());
+        config.download_dir = Some("/tmp/mini-term-downloads".into());
         config.hook_enabled = true;
         config.projects = vec![project("p1", "甲"), project("p2", "乙")];
         config.ssh_connections = vec![conn("c1")];
@@ -469,6 +470,10 @@ mod tests {
         assert_eq!(back.ui_font_size, 15.0);
         assert_eq!(back.theme, "dark");
         assert_eq!(back.terminal_font_family.as_deref(), Some("Cascadia Mono"));
+        assert_eq!(
+            back.download_dir.as_deref(),
+            Some("/tmp/mini-term-downloads")
+        );
         assert!(back.hook_enabled);
         assert_eq!(back.default_shell, "PowerShell");
         assert_eq!(back.available_shells.len(), 1);
@@ -478,6 +483,11 @@ mod tests {
         assert_eq!(back.ssh_connections.len(), 1);
         assert_eq!(back.ssh_connections[0].password.as_deref(), Some("secret"));
         assert!(!db.is_empty());
+
+        // 恢复系统默认会让 optional key 消失；库里的旧值也必须被 stale-key 清理。
+        config.download_dir = None;
+        db.save(&config).unwrap();
+        assert!(db.load().unwrap().unwrap().download_dir.is_none());
 
         fs::remove_dir_all(&dir).ok();
     }

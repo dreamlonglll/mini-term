@@ -69,8 +69,11 @@ use mt_i18n::{
 /// 那一栏只有「无」能点、blueprint / fluent2 长期置灰），随之删掉
 /// `settings.appearance.{skin,skinNone,skinBlueprint,skinDesc,skinUnavailable}`。
 /// 皮肤只剩默认（主题段）与外置（`settings.themes.*`）两档。
+///
+/// 771 → 823：远程文件管理补齐复制/粘贴、上传/下载、冲突选择、操作状态，
+/// 新增远程目录选择器、递归粘贴保护，并在系统设置加入下载目录偏好。
 const EXPECTED_NAMESPACES: usize = 32;
-const EXPECTED_ENTRIES_PER_LANG: usize = 771;
+const EXPECTED_ENTRIES_PER_LANG: usize = 823;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

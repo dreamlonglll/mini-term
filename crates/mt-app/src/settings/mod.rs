@@ -367,6 +367,10 @@ pub struct SettingsView {
     /// 选到非 `.wav` 时的提示(`notify.rs` 只认 wav,其余静默回落系统提示音)。
     sound_warning: bool,
 
+    // ── system 页:本地下载目录 ──
+    download_dir_busy: bool,
+    download_dir_error: Option<String>,
+
     // ── about 页 ──
     checking: bool,
     latest: Option<ReleaseInfo>,
@@ -374,6 +378,8 @@ pub struct SettingsView {
 
     /// 后台任务(hook 动作 / 皮肤导入 / 检查更新)。换一次就丢掉上一次。
     _job: Option<Task<()>>,
+    /// 下载目录选择与校验独立持有，避免覆盖其它设置页正在运行的任务。
+    _download_dir_job: Option<Task<()>>,
     _subs: Vec<Subscription>,
 }
 
@@ -588,10 +594,13 @@ impl SettingsView {
             show_snippet: false,
             snippet_tab: "claude",
             sound_warning: false,
+            download_dir_busy: false,
+            download_dir_error: None,
             checking: false,
             latest: None,
             update_error: None,
             _job: None,
+            _download_dir_job: None,
             _subs: Vec::new(),
         };
 

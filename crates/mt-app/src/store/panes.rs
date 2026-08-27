@@ -705,7 +705,7 @@ impl AppStore {
         // 机器,注给本地 ssh 客户端毫无意义)。
         let remote = project.ssh_connection_id.as_deref().map(|conn_id| {
             crate::remote_ssh::find_connection(&self.config.ssh_connections, conn_id)
-                .and_then(|conn| crate::remote_ssh::prepare_remote_launch(&conn, &project.path))
+                .and_then(|conn| crate::remote_ssh::prepare_remote_launch(&conn, &cwd))
         });
         let (spec, extras) = match remote {
             None => (

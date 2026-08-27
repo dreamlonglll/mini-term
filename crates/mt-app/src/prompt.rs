@@ -341,6 +341,76 @@ pub fn show_alert(
     });
 }
 
+/// 上传/下载遇到同名目标时的三选一弹窗。点击遮罩或 Esc 等同取消，不调用回调。
+pub fn show_file_conflict_choice(
+    on_choice: impl Fn(crate::remote_ssh::FileConflictStrategy, &mut Window, &mut App) + 'static,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let on_choice = Rc::new(on_choice);
+    open_guarded(kind::FILE_CONFLICT, window, cx, move |dialog, _window, _cx| {
+        let button = |id: &'static str,
+                      label: SharedString,
+                      strategy: crate::remote_ssh::FileConflictStrategy,
+                      primary: bool| {
+            let on_choice = on_choice.clone();
+            let el = if primary {
+                ui::primary_button(id, label)
+            } else {
+                ui::ghost_button(id, label)
+            };
+            el.on_click(move |_: &ClickEvent, window, cx| {
+                close_guarded(kind::FILE_CONFLICT, window, cx);
+                on_choice(strategy, window, cx);
+            })
+        };
+
+        dialog
+            .title(t("fileTree", "conflict.title"))
+            .w(px(420.0))
+            .overlay_closable(true)
+            .child(
+                div()
+                    .px(px(20.0))
+                    .pb(px(16.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(14.0))
+                    .child(
+                        div()
+                            .text_size(ui::font_px(13.0))
+                            .text_color(ui::text_primary())
+                            .child(t("fileTree", "conflict.message")),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_end()
+                            .gap(px(8.0))
+                            .child(button(
+                                "file-conflict-skip",
+                                t("fileTree", "conflict.skip").into(),
+                                crate::remote_ssh::FileConflictStrategy::Skip,
+                                false,
+                            ))
+                            .child(button(
+                                "file-conflict-keep-both",
+                                t("fileTree", "conflict.keepBoth").into(),
+                                crate::remote_ssh::FileConflictStrategy::KeepBoth,
+                                false,
+                            ))
+                            .child(button(
+                                "file-conflict-overwrite",
+                                t("fileTree", "conflict.overwrite").into(),
+                                crate::remote_ssh::FileConflictStrategy::Overwrite,
+                                true,
+                            )),
+                    ),
+            )
+    });
+}
+
 /// 正文 + 补充行。文案里的 `\n` 要真换行(确认框普遍用它排版),
 /// 而 gpui 的文本不认转义符,得自己拆成多个 child。
 fn body(message: &str, detail: &[String]) -> gpui::AnyElement {
