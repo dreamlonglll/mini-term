@@ -595,4 +595,54 @@ mod tests {
 
         let _ = fs::remove_dir_all(&root);
     }
+
+    /// 仓库 `theme/` 下的成品皮肤是**给用户下载的分发物**,坏了却没有任何运行时
+    /// 信号 —— 解析不了的包在列表里是静默跳过的,用户只会看到「装了没反应」。
+    /// 这里把每一份都真的导入一遍:`import_dir` 内部要跑 manifest 的
+    /// bytes + sha256 核对,导入成功即证明包既没缺件、也没在提交/签出途中损坏。
+    ///
+    /// ⚠️ manifest 只登记二进制资源。文本文件会被 Git 按 `core.autocrlf` 改写
+    /// 换行,字节数与哈希随平台漂,登记进去等于让每个下载者都撞「大小不符」。
+    #[test]
+    fn 仓库分发的成品皮肤能被导入且不缺件() {
+        let shipped = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../theme");
+        let root = unique_test_root("shipped-packs");
+        let packs = ThemePacks::at(root.join("themes"));
+
+        let mut count = 0;
+        for entry in fs::read_dir(&shipped).unwrap().flatten() {
+            let src = entry.path();
+            if !src.is_dir() {
+                continue; // theme/README.md 这类说明文件不是皮肤
+            }
+            let dir_name = entry.file_name().to_string_lossy().into_owned();
+            let id = packs
+                .import_dir(&src)
+                .unwrap_or_else(|e| panic!("{dir_name} 导入失败: {e:#}"));
+            assert_eq!(id, dir_name, "皮肤身份就是目录名");
+
+            // 声明了背景图就必须真的跟着进包:导入只拷**顶层文件**,
+            // 图搁子目录里会被静默丢下,装完只剩一张纯色皮
+            let data = packs.read(&id).unwrap();
+            let def: serde_json::Value = serde_json::from_str(&data.theme_json)
+                .unwrap_or_else(|e| panic!("{dir_name}/theme.json 不是合法 JSON: {e}"));
+            if let Some(image) = def["image"].as_str().filter(|s| !s.trim().is_empty()) {
+                assert!(
+                    data.dir.join(image).is_file(),
+                    "{dir_name} 声明了背景图 {image},包里却没有"
+                );
+            }
+            // 目录名与 json 的 `id` 不一致是踩过的坑(见上一条测试):自家分发的
+            // 包不许再留这个雷,否则文档里写的 id 和实际装出来的对不上
+            assert_eq!(
+                def["id"].as_str(),
+                Some(dir_name.as_str()),
+                "{dir_name}/theme.json 的 id 应与目录名一致"
+            );
+            count += 1;
+        }
+        assert!(count > 0, "theme/ 下一个成品皮肤都没有 —— 路径写错了?");
+
+        let _ = fs::remove_dir_all(&root);
+    }
 }

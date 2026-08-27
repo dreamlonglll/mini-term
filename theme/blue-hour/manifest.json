@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "id": "blue-hour",
+  "files": [
+    { "path": "background.jpg", "bytes": 236223, "sha256": "69bae1f096eac3d2e83c54c0dd0b8f0a4f3502b803cbbc5a9c010111010cfcd1" }
+  ]
+}

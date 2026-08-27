@@ -968,6 +968,37 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir.parent().unwrap().parent().unwrap());
     }
 
+    /// 仓库 `theme/` 下分发的成品皮肤要经得起**语义**校验。mt-config 那侧只管
+    /// 文件层（能不能导入、manifest 对不对）；色值合不合法、`image` 是不是包内
+    /// 文件名、背景图最终能不能真解析成氛围层，只有走完这条路才知道。
+    #[test]
+    fn 仓库分发的成品皮肤能解析出氛围层() {
+        let shipped = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../theme");
+        let mut count = 0;
+        for entry in std::fs::read_dir(&shipped).unwrap().flatten() {
+            let dir = entry.path();
+            if !dir.is_dir() {
+                continue; // theme/README.md 这类说明文件不是皮肤
+            }
+            let id = entry.file_name().to_string_lossy().into_owned();
+            let json = std::fs::read_to_string(dir.join("theme.json"))
+                .unwrap_or_else(|e| panic!("{id}/theme.json 读不到: {e}"));
+            let def =
+                parse_theme_pack(&id, &json).unwrap_or_else(|e| panic!("{id} 校验不过: {e:#}"));
+
+            let applied = resolve_theme_pack(&def, Some(&dir));
+            assert_eq!(applied.theme_id, id, "身份取目录名");
+            if def.image.is_some() {
+                // 图在盘上才有氛围层。拿不到就是 resolve 按「无背景图」降级了 ——
+                // 而这类皮肤的 effects 是照着有图配的，降级后终端只剩一片纯色底
+                assert!(applied.background.is_some(), "{id} 的背景图没解析出来");
+                assert!(applied.surface_opacity < 1.0, "{id} 带图却没开面板透明");
+            }
+            count += 1;
+        }
+        assert!(count > 0, "theme/ 下一个成品皮肤都没有 —— 路径写错了？");
+    }
+
     /// `Option<SharedString>` 取 `&str`（`as_deref` 给的是 `&ArcCow<str>`，比不了）
     fn slot(value: &Option<gpui::SharedString>) -> Option<&str> {
         value.as_ref().map(|s| s.as_ref())
