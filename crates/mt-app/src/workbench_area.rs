@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 
 use gpui::{
     App, AppContext, Context, Entity, Global, InteractiveElement, IntoElement, ParentElement,
-    Render, SharedString, StatefulInteractiveElement, Styled, Window, div,
-    prelude::FluentBuilder, px,
+    Render, SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder,
+    px,
 };
 use mt_ui::icons::FileIcon;
 use mt_ui::tooltip::Tooltip;
