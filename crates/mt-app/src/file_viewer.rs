@@ -3871,7 +3871,7 @@ mod tests {
         ));
         assert!(!references.contains("file:///"), "{references}");
         assert!(
-            references.contains("[local]: <about:blank>"),
+            references.contains("[local]: about:blank"),
             "{references}"
         );
         assert!(
