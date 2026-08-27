@@ -12,6 +12,7 @@ use gpui::{
     Render, SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder,
     px,
 };
+use gpui_component::WindowExt as _;
 use mt_ui::icons::FileIcon;
 use mt_ui::tooltip::Tooltip;
 
