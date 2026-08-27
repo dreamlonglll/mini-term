@@ -143,6 +143,12 @@ impl ThemePacks {
     ///
     /// 目录已存在时**报错而非覆盖**：用户多半已经在那份上改过东西，静默覆盖等于
     /// 删掉他的皮肤；要重来就先删掉或改名，语义清楚。
+    ///
+    /// ⚠️ **设置页已无入口**：原「生成示例」按钮改成了跳转仓库皮肤库的外链
+    /// （`pages_appearance.rs` 的 `THEME_GALLERY_URL`），本函数眼下没有 UI 调用方。
+    /// 保留它是为了那份编译期对账 —— [`EXAMPLE_THEME_JSON`] 等三个 `include_str!`
+    /// 钉着 `docs/theme-pack-example/`，`embedded_example_pack_matches_frontend_contract`
+    /// 会在坏模板进仓库前就失败。连函数一起删掉，那份字段文档就没人看着了。
     pub fn create_example(&self) -> Result<String> {
         let dir = self.ensure_root()?.join(EXAMPLE_THEME_ID);
         if dir.exists() {

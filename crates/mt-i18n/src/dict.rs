@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 32;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 773;
+pub const ZH_ENTRY_COUNT: usize = 771;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 773;
+pub const EN_ENTRY_COUNT: usize = 771;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -1132,12 +1132,10 @@ static SETTINGS_ZH: &[(&str, &str)] = &[
     ("terminal.scrollbackDesc", "每个终端保留的历史行数。这是内存占用的大头：约每行每 100 列 1.2 KB，且每个终端各算一份。改小立即生效并释放内存"),
     ("themes.addPack", "添加皮肤"),
     ("themes.applyFailed", "皮肤应用失败：{detail}"),
-    ("themes.createExample", "生成示例"),
-    ("themes.createExampleHint", "在皮肤目录生成一份可直接改的示例皮肤（theme.json + theme.css + 字段说明 README）"),
+    ("themes.browseGallery", "更多皮肤"),
     ("themes.customSection", "外置皮肤"),
     ("themes.deleteConfirm", "删除皮肤「{name}」？其文件将从皮肤目录移除"),
-    ("themes.empty", "还没有外置皮肤。点「生成示例」拿一份可直接改的模板，或点「添加皮肤」导入 Dream Skin 格式的皮肤文件夹（含 theme.json）"),
-    ("themes.exampleCreated", "示例皮肤已生成：themes/{id} —— 点「打开皮肤目录」照着改，保存即热重载"),
+    ("themes.empty", "还没有外置皮肤。点「更多皮肤」去 GitHub 皮肤库挑一份下载，或点「添加皮肤」导入 Dream Skin 格式的皮肤文件夹（含 theme.json）"),
     ("themes.importDialogTitle", "选择皮肤包文件夹（含 theme.json）"),
     ("themes.importZip", "导入 zip"),
     ("themes.importZipDialogTitle", "选择皮肤包 zip 文件"),
@@ -1322,12 +1320,10 @@ static SETTINGS_EN: &[(&str, &str)] = &[
     ("terminal.scrollbackDesc", "History lines kept per terminal. This dominates memory use: roughly 1.2 KB per line per 100 columns, counted separately for every terminal. Lowering it takes effect immediately and frees memory"),
     ("themes.addPack", "Add skin"),
     ("themes.applyFailed", "Failed to apply skin: {detail}"),
-    ("themes.createExample", "Example"),
-    ("themes.createExampleHint", "Write a ready-to-edit example skin into the skins folder (theme.json + theme.css + a field reference README)"),
+    ("themes.browseGallery", "More skins"),
     ("themes.customSection", "External skins"),
     ("themes.deleteConfirm", "Delete skin \"{name}\"? Its files will be removed from the skins folder"),
-    ("themes.empty", "No external skins yet. Click \"Example\" for a ready-to-edit template, or \"Add skin\" to import a Dream Skin format folder (with theme.json)"),
-    ("themes.exampleCreated", "Example skin created: themes/{id} — open the skins folder and edit it, saving hot-reloads it"),
+    ("themes.empty", "No external skins yet. Click \"More skins\" to pick one up from the GitHub gallery, or \"Add skin\" to import a Dream Skin format folder (with theme.json)"),
     ("themes.importDialogTitle", "Select a skin pack folder (with theme.json)"),
     ("themes.importZip", "Import zip"),
     ("themes.importZipDialogTitle", "Select a skin pack zip file"),

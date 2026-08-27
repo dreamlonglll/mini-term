@@ -1,11 +1,13 @@
 //! 设置面板的 appearance(语言 / 主题 / 外置皮肤)与 font(字号 / 字族 / 连字)两页。
 //!
 //! 外置皮肤那一段是本文件的大头:卡片数据([`ThemeCard`])、导入(目录 / zip)、
-//! 生成示例、删除确认都在这儿。三条写盘路径统一走 `run_theme_job` 丢后台。
+//! 删除确认都在这儿。两条写盘路径统一走 `run_theme_job` 丢后台;「更多皮肤」
+//! 不写盘,它只是把浏览器指向仓库的皮肤库([`THEME_GALLERY_URL`])。
 
 use gpui::{
-    AnyElement, Context, Hsla, InteractiveElement, IntoElement, ParentElement, PathPromptOptions,
-    SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
+    AnyElement, App, Context, Hsla, InteractiveElement, IntoElement, ParentElement,
+    PathPromptOptions, SharedString, StatefulInteractiveElement, Styled, Window, div,
+    prelude::FluentBuilder, px,
 };
 use mt_ui::theme_bridge::{ThemePackListing, ThemeSlot, resolve_theme_pack};
 
@@ -17,6 +19,15 @@ use super::{SettingsView, choice_value};
 use super::widgets::{
     banner, choice_group, font_family_input, mini_bar, page_root, section, toggle_row,
 };
+
+/// 「更多皮肤」按钮的去处:仓库里的成品皮肤库(`theme/`)。
+///
+/// 那批皮肤**不随安装包分发**(三平台打包都只装二进制),所以界面这里给的是
+/// 一条外链而不是一次本地生成 —— 用户在浏览器里挑,下载后走「添加皮肤」导入。
+///
+/// 指向 `main` 而非某个 tag:皮肤库是会持续添新的分发目录,钉在发版 tag 上
+/// 会让老版本用户永远停在当时那几份。
+const THEME_GALLERY_URL: &str = "https://github.com/dreamlonglll/mini-term/tree/main/theme";
 
 // ─── 外置皮肤卡片的数据 ───────────────────────────────────────
 
@@ -198,14 +209,8 @@ impl SettingsView {
                 ),
             )
             .child(
-                ui::ghost_button("theme-example", t("settings", "themes.createExample")).on_click(
-                    cx.listener(|this, _, _window, cx| {
-                        this.run_theme_job(
-                            |packs| packs.create_example().map_err(|e| format!("{e:#}")),
-                            Some(|id| tr!("settings", "themes.exampleCreated", id = id)),
-                            cx,
-                        );
-                    }),
+                ui::ghost_button("theme-gallery", t("settings", "themes.browseGallery")).on_click(
+                    |_, _window, cx: &mut App| cx.open_url(THEME_GALLERY_URL),
                 ),
             )
             .child(
@@ -567,7 +572,7 @@ impl SettingsView {
         cx.notify();
     }
 
-    /// 导入皮肤(目录 / zip)与生成示例:三条都要写盘,统一丢后台。
+    /// 导入皮肤(目录 / zip):两条都要写盘,统一丢后台。
     fn run_theme_job(
         &mut self,
         job: impl FnOnce(mt_config::ThemePacks) -> Result<String, String> + Send + 'static,
