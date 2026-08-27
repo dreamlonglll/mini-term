@@ -123,6 +123,7 @@ pub(crate) fn jump_to_session(
             store.set_active_project(&project_id, cx);
             store.activate_pane(&project_id, &pane_id, window, cx);
         });
+        crate::workbench_area::activate_terminal_page(window, cx);
         return Task::ready(());
     }
 
@@ -192,6 +193,7 @@ pub(crate) fn jump_to_session(
                 );
                 store.focus_pane(&project_id, &pane_id, window, cx);
             });
+            crate::workbench_area::activate_terminal_page(window, cx);
         });
     })
 }
@@ -689,6 +691,7 @@ impl SessionPanel {
             store.write_to_pane(&project_id, &pane_id, &format!("{command}\r"), cx);
             store.focus_pane(&project_id, &pane_id, window, cx);
         });
+        crate::workbench_area::activate_terminal_page(window, cx);
     }
 
     /// 会话行的右键菜单(`SessionList.tsx:378-401`,顺序照抄):

@@ -968,13 +968,17 @@ impl GitPanel {
                 } else {
                     (Some(repo_path.clone()), Some(title.clone()))
                 };
-                store.update(cx, |store, cx| {
+                let opened = store.update(cx, |store, cx| {
                     let pane =
                         store.new_terminal_with_cwd(&project_id, None, None, cwd, window, cx);
-                    if let (Some(pane), Some(title)) = (pane, title) {
-                        store.rename_pane(&project_id, &pane, &title, cx);
+                    if let (Some(pane), Some(title)) = (pane.as_ref(), title) {
+                        store.rename_pane(&project_id, pane, &title, cx);
                     }
+                    pane.is_some()
                 });
+                if opened {
+                    crate::workbench_area::activate_terminal_page(window, cx);
+                }
             }),
             menu::separator(),
             menu::item(

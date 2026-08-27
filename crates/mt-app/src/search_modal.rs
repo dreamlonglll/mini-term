@@ -247,16 +247,10 @@ impl SearchModal {
         }
     }
 
-    /// 点一条结果。**单击开预览器、双击调外部编辑器**,逐条对照
-    /// `SearchModal.tsx:203-222`。
-    ///
-    /// 双击时两条都会跑:DOM 里 dblclick 之前必然先来一发 click(原版同时挂了
-    /// `onClick` 与 `onDoubleClick`,预览器确实会先弹出来),gpui 这边同样是
-    /// 两个 click 事件、`click_count` 依次 1 和 2 —— 行为对齐,不必去抖。
+    /// 点一条结果：统一打开工作区文件页并收起搜索浮层。
     fn open_result(
         &self,
         item: &SearchResultItem,
-        click_count: usize,
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -264,21 +258,16 @@ impl SearchModal {
             return;
         };
         let path = root.join(&item.file_path);
-        match result_action(click_count) {
-            ResultAction::Preview => crate::file_viewer::open(
-                root,
-                path,
-                // 内容搜索给命中行,文件名搜索没有行号
-                item.line_number,
-                window,
-                cx,
-            ),
-            ResultAction::ExternalEditor => {
-                // 分两句写:第一句借完 `cx`(读配置)就还,第二句才拿可变借用去丢后台
-                let editor = crate::fs_ops::configured_editor(self.store.read(cx).config());
-                crate::fs_ops::open_path_with(editor, path, cx);
-            }
-        }
+        // 文件页位于主内容区，先收起搜索浮层，用户会立刻看到激活后的页签。
+        close_guarded(kind::GLOBAL_SEARCH, window, cx);
+        crate::workbench_area::open_active_file(
+            self.store.clone(),
+            path,
+            // 内容搜索给命中行,文件名搜索没有行号
+            item.line_number,
+            window,
+            cx,
+        );
     }
 
     /// 结果的绝对路径文本(右键「复制文件地址」用)。
@@ -294,25 +283,6 @@ impl SearchModal {
 }
 
 // ─── 纯逻辑(可测) ────────────────────────────────────────────
-
-/// 点一条结果该做什么。
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum ResultAction {
-    /// 单击:开[文件预览器](crate::file_viewer),带上命中行号。
-    Preview,
-    /// 双击:用配置里的外部编辑器打开(`SearchModal.tsx:213-222`)。
-    ExternalEditor,
-}
-
-/// `click_count` → 动作。抽成纯函数是为了把「AA 批把单击从外部编辑器
-/// 换成预览器」这条切换钉在单测里。
-pub fn result_action(click_count: usize) -> ResultAction {
-    if click_count >= 2 {
-        ResultAction::ExternalEditor
-    } else {
-        ResultAction::Preview
-    }
-}
 
 /// 往结果集里追加一批,总数封顶在 `cap`。
 ///
@@ -574,11 +544,11 @@ impl SearchModal {
             .py(px(4.0))
             .cursor_pointer()
             .hover(|el| el.bg(ui::border_subtle()))
-            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+            .on_click(cx.listener(move |this, _event: &gpui::ClickEvent, window, cx| {
                 let Some(item) = this.results.get(index).cloned() else {
                     return;
                 };
-                this.open_result(&item, event.click_count(), window, cx);
+                this.open_result(&item, window, cx);
             }))
             .on_mouse_down(
                 gpui::MouseButton::Right,
@@ -616,11 +586,11 @@ impl SearchModal {
             .py(px(6.0))
             .cursor_pointer()
             .hover(|el| el.bg(ui::border_subtle()))
-            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+            .on_click(cx.listener(move |this, _event: &gpui::ClickEvent, window, cx| {
                 let Some(item) = this.results.get(index).cloned() else {
                     return;
                 };
-                this.open_result(&item, event.click_count(), window, cx);
+                this.open_result(&item, window, cx);
             }))
             .on_mouse_down(
                 gpui::MouseButton::Right,
@@ -760,18 +730,6 @@ mod tests {
             line_content: Some(format!("line {line}")),
             match_ranges: vec![(0, 4)],
         }
-    }
-
-    /// AA 批的回接:**单击开预览器**(此前是外部编辑器),双击才是编辑器。
-    #[test]
-    fn 单击开预览器双击才调外部编辑器() {
-        // gpui 的双击是两个 click 事件,click_count 依次 1、2 —— 与原版
-        // DOM 的 click + dblclick 同构:预览器先弹,编辑器随后拉起
-        assert_eq!(result_action(1), ResultAction::Preview);
-        assert_eq!(result_action(2), ResultAction::ExternalEditor);
-        assert_eq!(result_action(3), ResultAction::ExternalEditor, "三连击照旧");
-        // 0 是理论上不会出现的取值,别让它落进「拉外部程序」那一支
-        assert_eq!(result_action(0), ResultAction::Preview);
     }
 
     /// 满了就整批丢弃(不是丢最旧的),没满只取装得下的前几条。

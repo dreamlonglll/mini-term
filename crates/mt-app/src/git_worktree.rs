@@ -774,7 +774,7 @@ fn render_worktree_row(
                 };
                 let title = format!("⎇ {}", branch.clone().unwrap_or_else(|| name.clone()));
                 let path = path.clone();
-                store.update(cx, |store, cx| {
+                let opened = store.update(cx, |store, cx| {
                     let pane = store.new_terminal_with_cwd(
                         &project_id,
                         None,
@@ -783,11 +783,15 @@ fn render_worktree_row(
                         window,
                         cx,
                     );
-                    if let Some(pane) = pane {
-                        store.rename_pane(&project_id, &pane, &title, cx);
+                    if let Some(pane) = pane.as_ref() {
+                        store.rename_pane(&project_id, pane, &title, cx);
                     }
+                    pane.is_some()
                 });
                 crate::prompt::close_guarded(kind::GIT_WORKTREE, window, cx);
+                if opened {
+                    crate::workbench_area::activate_terminal_page(window, cx);
+                }
             }),
         );
 

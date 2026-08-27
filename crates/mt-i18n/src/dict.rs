@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 32;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 825;
+pub const ZH_ENTRY_COUNT: usize = 831;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 825;
+pub const EN_ENTRY_COUNT: usize = 831;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -297,8 +297,6 @@ static FILE_TREE_ZH: &[(&str, &str)] = &[
     ("prompt.renameMessage", "请输入新名称"),
     ("prompt.renameTitle", "重命名"),
     ("remote.broken", "SSH 连接已被删除，无法加载远程文件树"),
-    ("remote.previewUnsupportedMessage", "远程文件不会交给本机程序打开。请先下载文件后查看。"),
-    ("remote.previewUnsupportedTitle", "暂不支持远程预览"),
     ("remote.refreshTitle", "刷新（重新读取远程根 .gitignore）"),
     ("upload.chooseFilesTitle", "选择要上传的文件"),
     ("upload.chooseFolderTitle", "选择要上传的文件夹"),
@@ -375,8 +373,6 @@ static FILE_TREE_EN: &[(&str, &str)] = &[
     ("prompt.renameMessage", "Enter a new name"),
     ("prompt.renameTitle", "Rename"),
     ("remote.broken", "The SSH connection was deleted; cannot load the remote file tree"),
-    ("remote.previewUnsupportedMessage", "Remote paths are not passed to local applications. Download the file before opening it."),
-    ("remote.previewUnsupportedTitle", "Remote Preview Not Supported"),
     ("remote.refreshTitle", "Refresh (re-reads the remote root .gitignore)"),
     ("upload.chooseFilesTitle", "Choose Files to Upload"),
     ("upload.chooseFolderTitle", "Choose a Folder to Upload"),
@@ -387,14 +383,21 @@ static FILE_VIEWER_ZH: &[(&str, &str)] = &[
     ("back", "返回"),
     ("binaryNotSupported", "二进制文件，不支持预览"),
     ("externallyChanged", "文件已被外部修改"),
+    ("forceSave", "仍然覆盖"),
     ("htmlPreviewNote", "简版渲染：不跑 CSS 与脚本，需要真实效果请用浏览器打开"),
     ("loading", "加载中..."),
     ("openInBrowser", "用浏览器打开"),
     ("openWithDefaultApp", "使用默认工具打开"),
     ("preview", "预览"),
     ("reloadDiscard", "重新加载（丢弃修改）"),
+    ("remoteConnectionChanged", "SSH 连接配置已变化，此页签已失效；请关闭后重新打开文件。"),
+    ("remoteDownloadHint", "此类远程文件暂不支持内置预览，可下载后查看。"),
+    ("remoteExternallyChanged", "远程文件已被其他程序修改"),
+    ("remoteReadOnly", "远程文件当前不可编辑"),
+    ("remoteRelativeImage", "远程 Markdown 仅加载 HTTP(S) 绝对图片"),
     ("save", "保存"),
     ("saveFailed", "保存失败"),
+    ("saveWarning", "已保存，但需要注意"),
     ("saving", "保存中…"),
     ("source", "源码"),
     ("tooLarge", "文件过大（>1MB），不支持预览"),
@@ -407,14 +410,21 @@ static FILE_VIEWER_EN: &[(&str, &str)] = &[
     ("back", "Back"),
     ("binaryNotSupported", "Binary file, preview not supported"),
     ("externallyChanged", "File was modified externally"),
+    ("forceSave", "Overwrite Anyway"),
     ("htmlPreviewNote", "Simplified rendering: no CSS or scripts — open in a browser for the real thing"),
     ("loading", "Loading..."),
     ("openInBrowser", "Open in browser"),
     ("openWithDefaultApp", "Open with default app"),
     ("preview", "Preview"),
     ("reloadDiscard", "Reload (discard changes)"),
+    ("remoteConnectionChanged", "The SSH connection changed. Close this tab and reopen the file."),
+    ("remoteDownloadHint", "This remote file cannot be previewed here yet. Download it to view it."),
+    ("remoteExternallyChanged", "The remote file was modified by another program"),
+    ("remoteReadOnly", "This remote file is currently read-only"),
+    ("remoteRelativeImage", "Remote Markdown only loads absolute HTTP(S) images"),
     ("save", "Save"),
     ("saveFailed", "Save failed"),
+    ("saveWarning", "Saved with a warning"),
     ("saving", "Saving…"),
     ("source", "Source"),
     ("tooLarge", "File too large (>1MB), preview not supported"),
@@ -1605,6 +1615,7 @@ static TERMINAL_AREA_ZH: &[(&str, &str)] = &[
     ("panelN", "面板 {n}"),
     ("remoteConnectFailedTitle", "远程连接失败"),
     ("renamePanel", "重命名面板"),
+    ("terminal", "终端"),
 ];
 #[rustfmt::skip]
 static TERMINAL_AREA_EN: &[(&str, &str)] = &[
@@ -1616,6 +1627,7 @@ static TERMINAL_AREA_EN: &[(&str, &str)] = &[
     ("panelN", "Panel {n}"),
     ("remoteConnectFailedTitle", "Remote Connection Failed"),
     ("renamePanel", "Rename panel"),
+    ("terminal", "Terminal"),
 ];
 
 #[rustfmt::skip]

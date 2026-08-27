@@ -303,12 +303,16 @@ impl ToastLayer {
             // 原版只 `setActiveProject`;GPUI 侧一并跳到那个项目的待办 pane
             // (`main.rs` 旧 `deliver_alert` 已经是这个行为,不退回去)
             let pane = store.read(cx).next_attention_target(Some(&project_id));
+            let jumps_to_pane = pane.is_some();
             store.update(cx, |store, cx| {
                 store.set_active_project(&project_id, cx);
                 if let Some((pid, pane_id)) = pane {
                     store.activate_pane(&pid, &pane_id, window, cx);
                 }
             });
+            if jumps_to_pane {
+                crate::workbench_area::activate_terminal_page(window, cx);
+            }
         });
     }
 }

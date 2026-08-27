@@ -68,7 +68,8 @@ use gpui::http_client::{
     AsyncBody, HttpClient, Request, Response, StatusCode, Url, http::HeaderValue,
 };
 use gpui_component::ActiveTheme as _;
-use gpui_component::input::{Input, InputEvent, InputState, Position};
+use gpui_component::WindowExt as _;
+use gpui_component::input::{Input, InputEvent, InputState, Position, Search};
 use gpui_component::text::{TextView, TextViewStyle};
 use mt_ui::tooltip::Tooltip;
 use mt_project::fs::FileContentResult;
@@ -79,6 +80,58 @@ use crate::i18n::t;
 use crate::overlay::kind;
 use crate::prompt::{Confirm, close_guarded, open_guarded};
 use crate::ui;
+
+/// 文档的读写来源。远程来源持有打开时的连接快照；保存前还会与 `AppStore`
+/// 中的当前连接身份复核，避免连接配置原地变化后旧页签写到错误主机。
+#[derive(Clone)]
+pub enum DocumentSource {
+    Local {
+        project_id: String,
+        project_root: PathBuf,
+        path: PathBuf,
+    },
+    Remote {
+        project_id: String,
+        connection: mt_config::SshConnection,
+        project_root: String,
+        path: PathBuf,
+    },
+}
+
+impl DocumentSource {
+    pub fn project_id(&self) -> &str {
+        match self {
+            Self::Local { project_id, .. } | Self::Remote { project_id, .. } => project_id,
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        match self {
+            Self::Local { path, .. } | Self::Remote { path, .. } => path,
+        }
+    }
+
+    pub fn file_name(&self) -> String {
+        file_name_of(&self.path().to_string_lossy()).to_string()
+    }
+
+    fn project_root_path(&self) -> PathBuf {
+        match self {
+            Self::Local { project_root, .. } => project_root.clone(),
+            Self::Remote { project_root, .. } => PathBuf::from(project_root),
+        }
+    }
+
+    fn is_remote(&self) -> bool {
+        matches!(self, Self::Remote { .. })
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ViewerHost {
+    Modal,
+    Workbench,
+}
 
 // ─── 纯逻辑(可测) ────────────────────────────────────────────
 
@@ -380,6 +433,7 @@ enum MdBlock {
 struct MdCache {
     source: String,
     base_dir: PathBuf,
+    local_resources: bool,
     /// `(块顶间距, 块)`。`Rc` 让 [`FileViewer::render_markdown`] 拿完就撒手,
     /// 不必攥着 `RefCell` 的借用穿过整段渲染
     blocks: Rc<Vec<(f32, MdBlock)>>,
@@ -794,6 +848,124 @@ fn rewrite_md_image_urls(source: &str, base_dir: &Path) -> String {
     out
 }
 
+/// Remote rich-text is untrusted input from another machine. Do not let inline
+/// Markdown images hand `file://` (or an implicit local path) to the process-wide
+/// preview HTTP client. Explicit HTTP(S) images remain available, as required by
+/// the remote Markdown contract; SSH-relative assets are deliberately deferred.
+fn sanitize_remote_markdown_images(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut in_fence = false;
+    for (ix, line) in source.split('\n').enumerate() {
+        if ix > 0 {
+            out.push('\n');
+        }
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            out.push_str(line);
+            continue;
+        }
+        if in_fence || line.starts_with("    ") || line.starts_with('\t') {
+            out.push_str(line);
+            continue;
+        }
+
+        let mut rest = line;
+        let mut in_code = false;
+        while let Some(ch) = rest.chars().next() {
+            if ch == '`' {
+                in_code = !in_code;
+                out.push('`');
+                rest = &rest[1..];
+                continue;
+            }
+            if !in_code
+                && rest.starts_with("![")
+                && let Some((image, tail)) = parse_bang_image(rest)
+            {
+                let url = image.url.trim().to_ascii_lowercase();
+                if url.starts_with("http://") || url.starts_with("https://") {
+                    let consumed = rest.len() - tail.len();
+                    out.push_str(&rest[..consumed]);
+                } else {
+                    out.push('[');
+                    out.push_str(if image.alt.is_empty() {
+                        "image"
+                    } else {
+                        &image.alt
+                    });
+                    out.push(']');
+                }
+                rest = tail;
+                continue;
+            }
+            out.push(ch);
+            rest = &rest[ch.len_utf8()..];
+        }
+    }
+    sanitize_remote_markdown_reference_urls(&out)
+}
+
+/// Reference-style images resolve their URL from a separate `[label]: target`
+/// definition, so the inline `![alt](target)` scanner above never sees it.
+/// Sanitize every non-code reference definition to the same HTTP(S)-only policy;
+/// relative reference links are not part of the first remote-preview contract.
+fn sanitize_remote_markdown_reference_urls(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut in_fence = false;
+    for (ix, line) in source.split('\n').enumerate() {
+        if ix > 0 {
+            out.push('\n');
+        }
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            out.push_str(line);
+            continue;
+        }
+        let indent = line.len() - trimmed.len();
+        if in_fence || line.starts_with('\t') || indent > 3 || !trimmed.starts_with('[') {
+            out.push_str(line);
+            continue;
+        }
+        let Some((_label, after_label)) = take_balanced(&trimmed[1..], '[', ']') else {
+            out.push_str(line);
+            continue;
+        };
+        let Some(after_colon) = after_label.strip_prefix(':') else {
+            out.push_str(line);
+            continue;
+        };
+        let destination = after_colon.trim_start();
+        let destination_start = line.len() - destination.len();
+        let (url, destination_len, bracketed) = if let Some(rest) = destination.strip_prefix('<') {
+            let Some(end) = rest.find('>') else {
+                out.push_str(line);
+                continue;
+            };
+            (&rest[..end], end + 2, true)
+        } else {
+            let len = destination
+                .find(char::is_whitespace)
+                .unwrap_or(destination.len());
+            (&destination[..len], len, false)
+        };
+        let url = url.trim().to_ascii_lowercase();
+        if url.starts_with("http://") || url.starts_with("https://") {
+            out.push_str(line);
+            continue;
+        }
+        out.push_str(&line[..destination_start]);
+        if bracketed {
+            out.push_str("<about:blank>");
+        } else {
+            out.push_str("about:blank");
+        }
+        out.push_str(&line[destination_start + destination_len..]);
+    }
+    out
+}
+
 /// 一行里的图片目标逐个改写(行内 code 跳过)。
 fn rewrite_md_line_into(line: &str, base_dir: &Path, out: &mut String) {
     let mut rest = line;
@@ -842,11 +1014,7 @@ fn rewrite_html_urls(source: &str, base_dir: &Path) -> String {
     let lower = source.to_ascii_lowercase();
     let mut out = String::with_capacity(source.len());
     let mut pos = 0usize;
-    while let Some((value_start, quote)) = find_next_url_attr(&lower, pos) {
-        let Some(rel) = lower[value_start..].find(quote) else {
-            break;
-        };
-        let value_end = value_start + rel;
+    while let Some((value_start, value_end, _attr)) = find_next_url_attr(&lower, pos) {
         out.push_str(&source[pos..value_start]);
         out.push_str(&rewrite_html_value(&source[value_start..value_end], base_dir));
         pos = value_end;
@@ -855,10 +1023,12 @@ fn rewrite_html_urls(source: &str, base_dir: &Path) -> String {
     out
 }
 
-/// 找下一个 `src=` / `href=` / `poster=` 的**值起点**与它的引号。
-fn find_next_url_attr(lower: &str, from: usize) -> Option<(usize, char)> {
+/// 找下一个 `src=` / `href=` / `poster=` 的值区间。HTML 允许属性值不加引号，
+/// 所以这里同时覆盖 `src="x"`、`src='x'` 与 `src=x`；远程内容的安全过滤
+/// 不能只认前两种，否则 html5ever 仍会把第三种解析成可加载资源。
+fn find_next_url_attr(lower: &str, from: usize) -> Option<(usize, usize, &'static str)> {
     const ATTRS: [&str; 3] = ["src", "href", "poster"];
-    let mut best: Option<(usize, usize, char)> = None;
+    let mut best: Option<(usize, usize, usize, &'static str)> = None;
     for attr in ATTRS {
         let mut at = from;
         while let Some(rel) = lower[at..].find(attr) {
@@ -872,26 +1042,77 @@ fn find_next_url_attr(lower: &str, from: usize) -> Option<(usize, char)> {
             {
                 continue;
             }
-            // 后面得是 `\s*=\s*` 加引号
+            // 后面得是 `\s*=\s*`，值可以带引号也可以不带
             let after_name = &lower[at..];
             let trimmed = after_name.trim_start();
             let Some(after_eq) = trimmed.strip_prefix('=') else {
                 continue;
             };
             let value = after_eq.trim_start();
-            let Some(quote) = value.chars().next().filter(|c| *c == '"' || *c == '\'') else {
-                continue;
-            };
             // `after_name` 与 `value` 的长度差,正好是「空白 + `=` + 空白」那一截
-            let quote_at = at + (after_name.len() - value.len());
-            let candidate = (name_start, quote_at + 1, quote);
-            if best.is_none_or(|(best_start, _, _)| candidate.0 < best_start) {
+            let value_at = at + (after_name.len() - value.len());
+            let (value_start, value_end) = match value.chars().next() {
+                Some(quote @ ('"' | '\'')) => {
+                    let value_start = value_at + quote.len_utf8();
+                    let Some(rel) = lower[value_start..].find(quote) else {
+                        // A stray `href="` in ordinary text must not stop the
+                        // scanner before a later, valid `<img src=...>`.
+                        at = value_start;
+                        continue;
+                    };
+                    (value_start, value_start + rel)
+                }
+                Some(_) => {
+                    let rel = value
+                        .find(|ch: char| ch.is_whitespace() || ch == '>')
+                        .unwrap_or(value.len());
+                    (value_at, value_at + rel)
+                }
+                None => (value_at, value_at),
+            };
+            let candidate = (name_start, value_start, value_end, attr);
+            if best.is_none_or(|(best_start, _, _, _)| candidate.0 < best_start) {
                 best = Some(candidate);
             }
             break;
         }
     }
-    best.map(|(_, value_start, quote)| (value_start, quote))
+    best.map(|(_, value_start, value_end, attr)| (value_start, value_end, attr))
+}
+
+/// Remote HTML may load explicit HTTP(S) resources and expose explicit
+/// web/mail/tel/fragment links. Local file URLs, relative paths and script-like
+/// schemes must never reach the process-wide preview HTTP client.
+fn sanitize_remote_html_urls(source: &str) -> String {
+    let lower = source.to_ascii_lowercase();
+    let mut out = String::with_capacity(source.len());
+    let mut pos = 0usize;
+    while let Some((value_start, value_end, attr)) = find_next_url_attr(&lower, pos) {
+        let value = source[value_start..value_end].trim();
+        let value_lower = value.to_ascii_lowercase();
+        let is_web = ["http:", "https:"]
+            .iter()
+            .any(|prefix| value_lower.starts_with(prefix));
+        let replacement = match attr {
+            "href"
+                if value.starts_with('#')
+                    || is_web
+                    || ["mailto:", "tel:"]
+                        .iter()
+                        .any(|prefix| value_lower.starts_with(prefix)) =>
+            {
+                &source[value_start..value_end]
+            }
+            "src" | "poster" if is_web => &source[value_start..value_end],
+            "href" => "#",
+            _ => "about:blank",
+        };
+        out.push_str(&source[pos..value_start]);
+        out.push_str(replacement);
+        pos = value_end;
+    }
+    out.push_str(&source[pos..]);
+    out
 }
 
 /// 一个属性值:本地目标转 `file://`,其余原样(排除清单同原版正则)。
@@ -1295,7 +1516,14 @@ pub fn open(
         return;
     }
 
-    let view = cx.new(|cx| FileViewer::new(project_root, path, highlight_line, window, cx));
+    let source = DocumentSource::Local {
+        project_id: format!("modal:{}", project_root.to_string_lossy()),
+        project_root,
+        path,
+    };
+    let view = cx.new(|cx| {
+        FileViewer::new(source, highlight_line, ViewerHost::Modal, window, cx)
+    });
     CURRENT.with(|c| *c.borrow_mut() = Some(view.downgrade()));
 
     open_guarded(kind::FILE_VIEWER, window, cx, {
@@ -1338,6 +1566,8 @@ fn close(window: &mut Window, cx: &mut App) {
 // ─── 视图 ─────────────────────────────────────────────────────
 
 pub struct FileViewer {
+    source: DocumentSource,
+    host: ViewerHost,
     project_root: PathBuf,
     /// 外部传进来的那一个。`highlight_line` 只在 `current == origin` 时生效
     /// (`FileViewerModal.tsx:486`:跳走之后行号就失效了)。
@@ -1346,6 +1576,7 @@ pub struct FileViewer {
     highlight_line: Option<u32>,
 
     loading: bool,
+    remote_refreshing: bool,
     error: Option<String>,
     result: Option<FileContentResult>,
     /// 编辑器实体。**换文件 / 显式重载才重建** —— `set_value` 会清撤销栈,
@@ -1370,8 +1601,17 @@ pub struct FileViewer {
     dirty: bool,
     saving: bool,
     save_error: Option<String>,
+    save_warning: Option<String>,
     ext_changed: bool,
     last_save_at: Option<Instant>,
+
+    /// 远程可编辑文件的加载/上次保存基线。二进制、超限和失败分支为 `None`。
+    remote_baseline: Option<crate::remote_ssh::RemoteFileBaseline>,
+    /// 保存前发现远端已变化。保留后端返回的新内容，让“重新加载”无需第二次网络请求。
+    remote_conflict: Option<crate::remote_ssh::RemoteFileReadResult>,
+    /// 当前配置中的 SSH 连接身份已与打开页签时不同；此页签只允许查看，不允许保存。
+    remote_source_invalid: bool,
+    load_generation: u64,
 
     watcher: Arc<FsWatcher>,
     watched: Option<PathBuf>,
@@ -1382,10 +1622,19 @@ pub struct FileViewer {
 }
 
 impl FileViewer {
-    fn new(
-        project_root: PathBuf,
-        path: PathBuf,
+    pub fn new_document(
+        source: DocumentSource,
         highlight_line: Option<u32>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new(source, highlight_line, ViewerHost::Workbench, window, cx)
+    }
+
+    fn new(
+        source: DocumentSource,
+        highlight_line: Option<u32>,
+        host: ViewerHost,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -1408,12 +1657,17 @@ impl FileViewer {
             }
         });
 
+        let project_root = source.project_root_path();
+        let path = source.path().to_path_buf();
         let mut this = Self {
+            source,
+            host,
             project_root,
             origin_path: path.clone(),
             current_path: path,
             highlight_line,
             loading: false,
+            remote_refreshing: false,
             error: None,
             result: None,
             editor: None,
@@ -1422,13 +1676,19 @@ impl FileViewer {
             preview_draft: None,
             line_ending: LineEnding::Lf,
             md_cache: RefCell::new(None),
-            // 原版初值就是 true(Markdown / HTML 打开先看渲染稿)
-            preview: true,
+            // 文件树打开 Markdown / HTML 时默认看渲染稿；内容搜索带行号时切到
+            // 源码，否则命中光标虽然已经定位，用户看到的仍是无法对应行号的预览。
+            preview: highlight_line.is_none(),
             dirty: false,
             saving: false,
             save_error: None,
+            save_warning: None,
             ext_changed: false,
             last_save_at: None,
+            remote_baseline: None,
+            remote_conflict: None,
+            remote_source_invalid: false,
+            load_generation: 0,
             watcher,
             watched: None,
             focus: cx.focus_handle(),
@@ -1449,11 +1709,20 @@ impl FileViewer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.saving {
+            return;
+        }
+        self.source = DocumentSource::Local {
+            project_id: format!("modal:{}", project_root.to_string_lossy()),
+            project_root: project_root.clone(),
+            path: path.clone(),
+        };
         self.project_root = project_root;
         self.origin_path = path.clone();
         self.current_path = path;
         self.highlight_line = highlight_line;
         self.preview = true;
+        self.remote_source_invalid = false;
         self.reload(window, cx);
         self.focus_content(window, cx);
     }
@@ -1462,13 +1731,21 @@ impl FileViewer {
         self.current_path.to_string_lossy().to_string()
     }
 
-    fn file_name(&self) -> String {
+    pub fn file_name(&self) -> String {
         let p = self.path_str();
         file_name_of(&p).to_string()
     }
 
     fn is_img(&self) -> bool {
         is_image_file(&self.path_str())
+    }
+
+    fn renders_local_image(&self) -> bool {
+        !self.source.is_remote() && self.is_img()
+    }
+
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
     }
 
     /// 「预览 / 源码」段控件的显示条件:`(isMd || isHtml) && canEdit`
@@ -1481,15 +1758,25 @@ impl FileViewer {
     fn has_preview_toggle(&self) -> bool {
         let path = self.path_str();
         (is_markdown_file(&path) || is_html_file(&path))
-            && can_edit(self.is_img(), self.result.as_ref())
+            && can_edit(self.renders_local_image(), self.result.as_ref())
     }
 
     // ── 读盘 ──────────────────────────────────────────────
 
     /// 读当前文件并重建编辑器。图片分支不读盘(原版 `if (!open || isImg) return`)。
     fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // 保存任务已经拿到旧基线并可能正在落盘。此时重建编辑器会让迟到的保存
+        // 完成跨代修改状态，也会允许用户在旧写入尚未结束时启动第二次保存。
+        if self.saving {
+            return;
+        }
+        self.remote_refreshing = false;
         self.rewatch();
-        if self.is_img() {
+        self.load_generation = self.load_generation.wrapping_add(1);
+        let generation = self.load_generation;
+        self.remote_conflict = None;
+        self.remote_baseline = None;
+        if self.renders_local_image() {
             self.loading = false;
             self.result = None;
             self.editor = None;
@@ -1504,31 +1791,70 @@ impl FileViewer {
         self._editor_sub = None;
         cx.notify();
 
-        let root = self.project_root.clone();
         let path = self.current_path.clone();
-        cx.spawn_in(window, async move |this, cx| {
-            // 读盘是阻塞的,**不能在主线程上跑**
-            let probe = (root.clone(), path.clone());
-            let outcome = cx
-                .background_executor()
-                .spawn(async move { mt_project::fs::read_file_content(&probe.0, &probe.1) })
-                .await;
-            let _ = this.update_in(cx, |view: &mut FileViewer, window, cx| {
-                // 回来时可能已经换了文件 —— 只认还对得上号的那一次
-                if view.current_path != path {
-                    return;
-                }
-                view.loading = false;
-                match outcome {
-                    Ok(res) => view.apply_content(res, window, cx),
-                    Err(err) => {
-                        view.error = Some(format!("{err:#}"));
-                        cx.notify();
-                    }
-                }
-            });
-        })
-        .detach();
+        match self.source.clone() {
+            DocumentSource::Local { project_root, .. } => {
+                cx.spawn_in(window, async move |this, cx| {
+                    // 读盘是阻塞的,**不能在主线程上跑**
+                    let probe = (project_root, path.clone());
+                    let outcome = cx
+                        .background_executor()
+                        .spawn(async move {
+                            mt_project::fs::read_file_content(&probe.0, &probe.1)
+                        })
+                        .await;
+                    let _ = this.update_in(cx, |view: &mut FileViewer, window, cx| {
+                        if view.current_path != path || view.load_generation != generation {
+                            return;
+                        }
+                        view.loading = false;
+                        match outcome {
+                            Ok(res) => view.apply_content(res, window, cx),
+                            Err(err) => {
+                                view.error = Some(format!("{err:#}"));
+                                cx.notify();
+                            }
+                        }
+                    });
+                })
+                .detach();
+            }
+            DocumentSource::Remote {
+                connection,
+                project_root,
+                ..
+            } => {
+                let remote_path = path.to_string_lossy().into_owned();
+                cx.spawn_in(window, async move |this, cx| {
+                    let outcome = cx
+                        .background_executor()
+                        .spawn(async move {
+                            crate::remote_ssh::read_file_content(
+                                &connection,
+                                &project_root,
+                                &remote_path,
+                            )
+                        })
+                        .await;
+                    let _ = this.update_in(cx, |view: &mut FileViewer, window, cx| {
+                        if view.current_path != path || view.load_generation != generation {
+                            return;
+                        }
+                        view.loading = false;
+                        match outcome {
+                            Ok(content) => {
+                                view.apply_remote_content(content, window, cx);
+                            }
+                            Err(err) => {
+                                view.error = Some(err);
+                                cx.notify();
+                            }
+                        }
+                    });
+                })
+                .detach();
+            }
+        }
     }
 
     /// 内容到位:落基线 + 建编辑器。
@@ -1536,6 +1862,106 @@ impl FileViewer {
     /// 「编辑基线与内容一起落位」是原版注释里点名的一条(`FileViewerModal.tsx:224`)——
     /// 分两步会出现「内容已换、基线还是旧文件」的窗口,那一瞬间的脏态是错的。
     fn apply_content(&mut self, res: FileContentResult, window: &mut Window, cx: &mut Context<Self>) {
+        self.remote_baseline = None;
+        self.remote_conflict = None;
+        self.apply_file_content(res, window, cx);
+    }
+
+    fn apply_remote_content(
+        &mut self,
+        content: crate::remote_ssh::RemoteFileReadResult,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.validate_remote_source(cx);
+        if self.remote_source_invalid {
+            return;
+        }
+        self.remote_baseline = content.baseline;
+        self.remote_conflict = None;
+        self.apply_file_content(content.content, window, cx);
+    }
+
+    /// Re-activation refresh for a clean remote tab. Keep the existing editor
+    /// entity (and therefore cursor/undo history) when the remote bytes are
+    /// unchanged; only rebuild when the server actually returned new content.
+    fn refresh_remote(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let DocumentSource::Remote {
+            connection,
+            project_root,
+            ..
+        } = self.source.clone()
+        else {
+            return;
+        };
+        self.load_generation = self.load_generation.wrapping_add(1);
+        let generation = self.load_generation;
+        let path = self.current_path.clone();
+        let remote_path = path.to_string_lossy().into_owned();
+        self.remote_refreshing = true;
+        self.error = None;
+        cx.notify();
+
+        cx.spawn_in(window, async move |this, cx| {
+            let outcome = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::remote_ssh::read_file_content(
+                        &connection,
+                        &project_root,
+                        &remote_path,
+                    )
+                })
+                .await;
+            let _ = this.update_in(cx, |view: &mut FileViewer, window, cx| {
+                if view.current_path != path || view.load_generation != generation {
+                    return;
+                }
+                view.remote_refreshing = false;
+                view.validate_remote_source(cx);
+                if view.remote_source_invalid {
+                    return;
+                }
+                match outcome {
+                    Ok(content) => {
+                        let editable = view.editor.is_some()
+                            && !content.content.is_binary
+                            && !content.content.too_large;
+                        let unchanged = editable
+                            && LineEnding::detect(&content.content.content) == view.line_ending
+                            && normalize_to_lf(&content.content.content) == view.saved;
+                        if unchanged {
+                            view.remote_baseline = content.baseline;
+                            view.remote_conflict = None;
+                            view.error = None;
+                        } else if view.dirty {
+                            // The user started typing while the refresh was in
+                            // flight. Preserve the draft and surface the same
+                            // explicit reload/overwrite decision used by save.
+                            view.remote_conflict = Some(content);
+                        } else {
+                            view.apply_remote_content(content, window, cx);
+                        }
+                    }
+                    Err(error) => {
+                        view.error = Some(error);
+                        if view.can_take_async_focus(window, cx) {
+                            view.focus.focus(window);
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn apply_file_content(
+        &mut self,
+        res: FileContentResult,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.line_ending = LineEnding::detect(&res.content);
         let text = normalize_to_lf(&res.content);
         self.saved = text.clone();
@@ -1544,8 +1970,9 @@ impl FileViewer {
         self.ext_changed = false;
         self.preview_draft = None;
         self.save_error = None;
+        self.save_warning = None;
 
-        if can_edit(false, Some(&res)) {
+        if can_edit(self.is_img(), Some(&res)) {
             let name = self.file_name();
             let lang = language_for(&name);
             let wrap = should_wrap(&name);
@@ -1580,9 +2007,90 @@ impl FileViewer {
         }
         self.result = Some(res);
         // 原版编辑器每次都是带 `autoFocus` 重新挂载的(`preview` 态下才不抢焦点),
-        // 这里在内容落位之后统一把焦点摆回该在的地方
-        self.focus_content(window, cx);
+        // 这里在内容落位之后统一把焦点摆回该在的地方。工作区允许多个并发加载
+        // 的文档，后台页签的迟到结果不得抢走当前页的键盘焦点。
+        if self.can_take_async_focus(window, cx) {
+            self.focus_content(window, cx);
+        }
         cx.notify();
+    }
+
+    /// 已经打开的搜索结果再次被点到时，只移动光标，不重建文档或撤销栈。
+    pub fn reveal_line(
+        &mut self,
+        highlight_line: Option<u32>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.highlight_line = highlight_line;
+        if highlight_line.is_some() && self.has_preview_toggle() && self.preview {
+            self.preview = false;
+            cx.notify();
+        }
+        let Some(editor) = self.editor.as_ref() else {
+            return;
+        };
+        let text = editor.read(cx).value().to_string();
+        if let Some(line) = highlight_target(highlight_line, true, &text) {
+            editor.update(cx, |state, cx| {
+                state.set_cursor_position(Position::new(line - 1, 0), window, cx);
+            });
+        }
+    }
+
+    /// 检查远程页签的连接快照是否仍对应当前项目配置。
+    pub fn validate_remote_source(&mut self, cx: &mut Context<Self>) {
+        let DocumentSource::Remote {
+            project_id,
+            connection,
+            project_root,
+            ..
+        } = &self.source
+        else {
+            return;
+        };
+        let (current_root, current) = {
+            let store = crate::store::AppStore::global(cx);
+            let store = store.read(cx);
+            (
+                store.project(project_id).map(|project| project.path.clone()),
+                store.remote_connection_of(project_id),
+            )
+        };
+        let invalid = current_root.as_deref() != Some(project_root.as_str())
+            || current.as_ref().is_none_or(|current| {
+                current.id != connection.id
+                    || crate::remote_ssh::connection_fingerprint(current)
+                        != crate::remote_ssh::connection_fingerprint(connection)
+            });
+        if self.remote_source_invalid != invalid {
+            self.remote_source_invalid = invalid;
+            cx.notify();
+        }
+    }
+
+    /// 页签重新激活时，干净的远程文档后台重读一次；内容未变时保留编辑器实体，
+    /// 脏草稿只做连接身份检查，外部变化继续由保存前基线比较兜底。
+    pub fn on_activated(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.validate_remote_source(cx);
+        if self.source.is_remote()
+            && !self.remote_source_invalid
+            && !self.loading
+            && !self.remote_refreshing
+            && !self.saving
+            && !self.dirty
+        {
+            // Project switches reach this path from WorkbenchArea's deferred focus
+            // hand-off. Keep focus on the newly visible document while the remote
+            // refresh is in flight; otherwise the hidden editor from the previous
+            // project can continue receiving keystrokes until SFTP completes.
+            if self.can_take_async_focus(window, cx) {
+                self.focus_content(window, cx);
+            }
+            self.refresh_remote(window, cx);
+        } else if self.can_take_async_focus(window, cx) {
+            self.focus_content(window, cx);
+        }
     }
 
     /// 当前草稿(编辑器全文,`\n` 行尾)。没有编辑器时就是磁盘内容。
@@ -1598,6 +2106,12 @@ impl FileViewer {
     /// 换文件时把监听挪到新文件的**父目录**上(notify 是目录级监听)。
     /// `FsWatcher` 内部有引用计数,与文件树同时监听同一目录是安全的。
     fn rewatch(&mut self) {
+        if self.source.is_remote() {
+            if let Some(old) = self.watched.take() {
+                self.watcher.unwatch(&old);
+            }
+            return;
+        }
         let dir = self.current_path.parent().map(|p| p.to_path_buf());
         if self.watched == dir {
             return;
@@ -1615,7 +2129,7 @@ impl FileViewer {
 
     /// 逐条对照 `FileViewerModal.tsx:275-283`。
     fn on_fs_change(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
-        if self.is_img() || self.result.is_none() {
+        if self.source.is_remote() || self.is_img() || self.result.is_none() {
             return;
         }
         if !same_path(&path.to_string_lossy(), &self.path_str()) {
@@ -1628,8 +2142,8 @@ impl FileViewer {
         {
             return;
         }
-        if self.draft(cx) != self.saved {
-            // 脏:挂提示条让用户自己决定
+        if self.draft(cx) != self.saved || self.saving {
+            // 脏或正在保存:先挂提示条，不能在旧写入尚未收口时重建编辑器。
             self.ext_changed = true;
             cx.notify();
         } else {
@@ -1643,48 +2157,143 @@ impl FileViewer {
     /// `FileViewerModal.tsx:251-272`。干净或在保存中时**静默返回** ——
     /// Ctrl+S 是肌肉记忆,不该弹任何东西。
     fn save(&mut self, cx: &mut Context<Self>) {
+        self.save_with_mode(false, cx);
+    }
+
+    fn save_with_mode(&mut self, force: bool, cx: &mut Context<Self>) {
         let text = self.draft(cx);
         if self.saving || text == self.saved {
             return;
         }
+        if self.remote_refreshing {
+            // Saving performs its own fresh baseline validation. Invalidate the
+            // older activation refresh so its late result cannot replace a draft
+            // or conflict state owned by this save.
+            self.load_generation = self.load_generation.wrapping_add(1);
+            self.remote_refreshing = false;
+        }
+        self.validate_remote_source(cx);
+        if self.remote_source_invalid {
+            return;
+        }
         self.saving = true;
         self.save_error = None;
+        self.save_warning = None;
+        self.remote_conflict = None;
         cx.notify();
 
-        let root = self.project_root.clone();
         let path = self.current_path.clone();
+        let generation = self.load_generation;
         // 写回磁盘前把行尾还原(见模块注释)
         let on_disk = restore_line_ending(&text, self.line_ending);
-        cx.spawn(async move |this, cx| {
-            let probe = (root, path.clone(), on_disk);
-            let outcome = cx
-                .background_executor()
-                .spawn(async move {
-                    mt_project::fs::write_file_content(&probe.0, &probe.1, &probe.2)
+        match self.source.clone() {
+            DocumentSource::Local { project_root, .. } => {
+                cx.spawn(async move |this, cx| {
+                    let probe = (project_root, path.clone(), on_disk);
+                    let outcome = cx
+                        .background_executor()
+                        .spawn(async move {
+                            mt_project::fs::write_file_content(&probe.0, &probe.1, &probe.2)
+                        })
+                        .await;
+                    let _ = this.update(cx, |view: &mut FileViewer, cx| {
+                        if view.current_path != path || view.load_generation != generation {
+                            return;
+                        }
+                        view.saving = false;
+                        match outcome {
+                            Ok(()) => view.finish_save(text.clone(), None, None, cx),
+                            Err(err) => view.save_error = Some(format!("{err:#}")),
+                        }
+                        cx.notify();
+                    });
                 })
-                .await;
-            let _ = this.update(cx, |view: &mut FileViewer, cx| {
-                view.saving = false;
-                if view.current_path != path {
+                .detach();
+            }
+            DocumentSource::Remote {
+                project_id,
+                project_root,
+                ..
+            } => {
+                let Some(baseline) = self.remote_baseline.clone() else {
+                    self.saving = false;
+                    self.save_error = Some(t("fileViewer", "remoteReadOnly").to_string());
+                    cx.notify();
                     return;
-                }
-                match outcome {
-                    Ok(()) => {
-                        view.saved = text.clone();
-                        view.disk = text.clone();
-                        view.last_save_at = Some(Instant::now());
-                        // 保存期间用户可能又敲了字:按**最新**草稿重新比对,
-                        // 而不是直接置 false(原版 `setDirty(draftRef.current !== text)`)
-                        view.dirty = view.draft(cx) != text;
-                        view.ext_changed = false;
-                    }
-                    // 失败挂顶部红条,不弹窗
-                    Err(err) => view.save_error = Some(format!("{err:#}")),
-                }
-                cx.notify();
-            });
-        })
-        .detach();
+                };
+                let connection = {
+                    let store_entity = crate::store::AppStore::global(cx);
+                    let store = store_entity.read(cx);
+                    store.remote_connection_of(&project_id)
+                };
+                let Some(connection) = connection else {
+                    self.saving = false;
+                    self.remote_source_invalid = true;
+                    cx.notify();
+                    return;
+                };
+                let remote_path = path.to_string_lossy().into_owned();
+                cx.spawn(async move |this, cx| {
+                    let outcome = cx
+                        .background_executor()
+                        .spawn(async move {
+                            crate::remote_ssh::save_file_content(
+                                &connection,
+                                &project_root,
+                                &remote_path,
+                                &on_disk,
+                                &baseline,
+                                force,
+                            )
+                        })
+                        .await;
+                    let _ = this.update(cx, |view: &mut FileViewer, cx| {
+                        if view.current_path != path || view.load_generation != generation {
+                            return;
+                        }
+                        view.saving = false;
+                        view.validate_remote_source(cx);
+                        if view.remote_source_invalid {
+                            return;
+                        }
+                        match outcome {
+                            Ok(crate::remote_ssh::RemoteFileSaveResult::Saved {
+                                baseline,
+                                warning,
+                            }) => {
+                                view.finish_save(text.clone(), Some(baseline), warning, cx);
+                            }
+                            Ok(crate::remote_ssh::RemoteFileSaveResult::ExternalChange {
+                                current,
+                            }) => {
+                                view.remote_conflict = Some(current);
+                            }
+                            Err(err) => view.save_error = Some(err),
+                        }
+                        cx.notify();
+                    });
+                })
+                .detach();
+            }
+        }
+    }
+
+    fn finish_save(
+        &mut self,
+        text: String,
+        remote_baseline: Option<crate::remote_ssh::RemoteFileBaseline>,
+        warning: Option<String>,
+        cx: &App,
+    ) {
+        self.saved = text.clone();
+        self.disk = text.clone();
+        self.last_save_at = Some(Instant::now());
+        self.remote_baseline = remote_baseline.or_else(|| self.remote_baseline.clone());
+        self.remote_conflict = None;
+        self.save_warning = warning;
+        // 保存期间用户可能又敲了字:按**最新**草稿重新比对。
+        self.dirty = self.draft(cx) != text;
+        self.ext_changed = false;
     }
 
     // ── 关闭 ──────────────────────────────────────────────
@@ -1696,6 +2305,14 @@ impl FileViewer {
     /// `on_action_escape` 不 `cx.propagate()`(`input/search.rs:305-307`),
     /// 焦点在面板上时 Esc 被它吃掉,根本走不到这里。
     fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.host == ViewerHost::Workbench {
+            // Workbench 的关闭检查会回读当前 FileViewer 的 dirty 状态。当前按键
+            // listener 仍持有本实体的 update 租约，直接回调会 double-lease。
+            window.defer(cx, |window, cx| {
+                crate::workbench_area::close_active_document(window, cx);
+            });
+            return;
+        }
         if self.draft(cx) == self.saved {
             close(window, cx);
             return;
@@ -1714,7 +2331,22 @@ impl FileViewer {
     /// 打开 / 换文件后把焦点放到该放的地方:能编辑就进编辑器,
     /// 否则留在容器上(Ctrl+S / Esc 挂在容器的 `on_key_down` 上,
     /// 焦点不在这条链上就收不到键)。
-    fn focus_content(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn can_take_async_focus(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        match self.host {
+            // Modal host itself is an active dialog. The overlay stack tells us
+            // whether a nested confirm/menu has since moved above it.
+            ViewerHost::Modal => {
+                crate::overlay::is_top(crate::overlay::key(kind::FILE_VIEWER))
+            }
+            ViewerHost::Workbench => {
+                crate::workbench_area::is_document_active(&self.source, cx)
+                    && !window.has_active_dialog(cx)
+                    && crate::overlay::allows(crate::overlay::Yield::ToOverlay)
+            }
+        }
+    }
+
+    pub fn focus_content(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match &self.editor {
             Some(editor) if !(self.has_preview_toggle() && self.preview) => {
                 editor.update(cx, |state, cx| state.focus(window, cx));
@@ -1723,10 +2355,39 @@ impl FileViewer {
         }
     }
 
+    /// Route the workspace Ctrl/Cmd+F action into this document. Preview pages
+    /// first reveal source, then dispatch the editor's native search action once
+    /// the Input node exists in the next rendered dispatch tree.
+    pub fn open_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.loading || self.error.is_some() || !can_edit(self.is_img(), self.result.as_ref()) {
+            return;
+        }
+        let Some(editor) = self.editor.as_ref() else {
+            return;
+        };
+        let was_preview = self.has_preview_toggle() && self.preview;
+        if was_preview {
+            self.preview = false;
+            cx.notify();
+        }
+        editor.update(cx, |state, cx| state.focus(window, cx));
+        let focus = editor.read(cx).focus_handle(cx);
+        if was_preview {
+            window.on_next_frame(move |window, cx| {
+                focus.dispatch_action(&Search, window, cx);
+            });
+        } else {
+            focus.dispatch_action(&Search, window, cx);
+        }
+    }
+
     /// 「用浏览器打开」。走**协议**关联而不是文件关联 —— `.html` 的默认程序常被
     /// 设成编辑器(用户实测 notepad--),那样点一下只是再开一个编辑器,拿不到
     /// 这个按钮真正想要的东西(见 `mt_project::editor::open_path_in_browser`)。
     fn open_in_browser(&self, cx: &mut App) {
+        if self.source.is_remote() {
+            return;
+        }
         let path = self.current_path.clone();
         cx.background_executor()
             .spawn(async move {
@@ -1738,6 +2399,9 @@ impl FileViewer {
     }
 
     fn open_with_default_app(&self, cx: &mut App) {
+        if self.source.is_remote() {
+            return;
+        }
         let path = self.current_path.clone();
         cx.background_executor()
             .spawn(async move {
@@ -1748,13 +2412,35 @@ impl FileViewer {
             .detach();
     }
 
+    fn download_remote_file(&self, window: &mut Window, cx: &mut App) {
+        let DocumentSource::Remote {
+            project_id,
+            connection,
+            project_root,
+            ..
+        } = &self.source
+        else {
+            return;
+        };
+        crate::file_tree::download_remote_file(
+            project_id,
+            project_root,
+            &connection.id,
+            crate::remote_ssh::connection_fingerprint(connection),
+            self.current_path.clone(),
+            window,
+            cx,
+        );
+    }
+
     // ── 渲染 ──────────────────────────────────────────────
 
     fn render_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let name = self.file_name();
         let path = self.path_str();
-        let is_html = is_html_file(&path);
-        let can_edit = can_edit(self.is_img(), self.result.as_ref());
+        let is_html = !self.source.is_remote() && is_html_file(&path);
+        let can_edit = !self.remote_source_invalid
+            && can_edit(self.is_img(), self.result.as_ref());
         let dirty = self.dirty;
         let saving = self.saving;
 
@@ -1865,19 +2551,21 @@ impl FileViewer {
                     .when(self.has_preview_toggle(), |el| {
                         el.child(self.render_preview_toggle(cx))
                     })
-                    .child(
-                        div()
-                            .id("file-viewer-close")
-                            .px(px(4.0))
-                            .text_size(ui::font_px(16.0))
-                            .text_color(ui::text_muted())
-                            .cursor_pointer()
-                            .hover(|el| el.text_color(ui::text_primary()))
-                            .child("✕")
-                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                this.request_close(window, cx)
-                            })),
-                    ),
+                    .when(self.host == ViewerHost::Modal, |el| {
+                        el.child(
+                            div()
+                                .id("file-viewer-close")
+                                .px(px(4.0))
+                                .text_size(ui::font_px(16.0))
+                                .text_color(ui::text_muted())
+                                .cursor_pointer()
+                                .hover(|el| el.text_color(ui::text_primary()))
+                                .child("✕")
+                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                    this.request_close(window, cx)
+                                })),
+                        )
+                    }),
             )
     }
 
@@ -1923,12 +2611,25 @@ impl FileViewer {
             )
     }
 
-    /// 顶部两条提示条:保存失败(红)、外部修改(黄)。
+    /// 顶部状态条：保存错误、本地/远程外部修改和连接身份失效。
     fn render_banners(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex()
             .flex_col()
             .flex_none()
+            .when(self.remote_source_invalid, |el| {
+                el.child(
+                    div()
+                        .px(px(16.0))
+                        .py(px(6.0))
+                        .border_b_1()
+                        .border_color(ui::border_subtle())
+                        .bg(ui::with_alpha(ui::color_warning(), 0.15))
+                        .text_size(ui::font_px(12.0))
+                        .text_color(ui::color_warning())
+                        .child(t("fileViewer", "remoteConnectionChanged")),
+                )
+            })
             .when_some(self.save_error.clone(), |el, err| {
                 el.child(
                     div()
@@ -1943,6 +2644,70 @@ impl FileViewer {
                         .child(format!("{}: {}", t("fileViewer", "saveFailed"), err)),
                 )
             })
+            .when_some(self.save_warning.clone(), |el, warning| {
+                el.child(
+                    div()
+                        .px(px(16.0))
+                        .py(px(6.0))
+                        .border_b_1()
+                        .border_color(ui::border_subtle())
+                        .bg(ui::with_alpha(ui::color_warning(), 0.15))
+                        .text_size(ui::font_px(12.0))
+                        .text_color(ui::color_warning())
+                        .truncate()
+                        .child(format!(
+                            "{}: {}",
+                            t("fileViewer", "saveWarning"),
+                            warning
+                        )),
+                )
+            })
+            .when(
+                self.remote_conflict.is_some() && !self.remote_source_invalid,
+                |el| {
+                    el.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(12.0))
+                            .px(px(16.0))
+                            .py(px(6.0))
+                            .border_b_1()
+                            .border_color(ui::border_subtle())
+                            .bg(ui::accent_subtle())
+                            .text_size(ui::font_px(12.0))
+                            .text_color(ui::color_warning())
+                            .child(t("fileViewer", "remoteExternallyChanged"))
+                            .child(
+                                div()
+                                    .id("file-viewer-remote-reload")
+                                    .cursor_pointer()
+                                    .hover(|el| el.text_color(ui::text_primary()))
+                                    .child(t("fileViewer", "reloadDiscard"))
+                                    .on_click(cx.listener(
+                                        |this, _: &ClickEvent, window, cx| {
+                                            let Some(current) = this.remote_conflict.take() else {
+                                                return;
+                                            };
+                                            this.apply_remote_content(current, window, cx);
+                                        },
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .id("file-viewer-remote-force-save")
+                                    .cursor_pointer()
+                                    .hover(|el| el.text_color(ui::text_primary()))
+                                    .child(t("fileViewer", "forceSave"))
+                                    .on_click(cx.listener(
+                                        |this, _: &ClickEvent, _window, cx| {
+                                            this.save_with_mode(true, cx);
+                                        },
+                                    )),
+                            ),
+                    )
+                },
+            )
             .when(self.ext_changed, |el| {
                 el.child(
                     div()
@@ -1960,20 +2725,32 @@ impl FileViewer {
                         .child(
                             div()
                                 .id("file-viewer-reload")
-                                .cursor_pointer()
-                                .hover(|el| el.text_color(ui::text_primary()))
+                                .when(!self.saving, |el| {
+                                    el.cursor_pointer()
+                                        .hover(|el| el.text_color(ui::text_primary()))
+                                })
+                                .when(self.saving, |el| el.opacity(0.5))
                                 .child(t("fileViewer", "reloadDiscard"))
-                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                    this.ext_changed = false;
-                                    this.reload(window, cx);
-                                })),
+                                .when(!self.saving, |el| {
+                                    el.on_click(cx.listener(
+                                        |this, _: &ClickEvent, window, cx| {
+                                            this.reload(window, cx);
+                                        },
+                                    ))
+                                }),
                         ),
                 )
             })
     }
 
     /// 居中一行字 + 一个「使用默认工具打开」按钮(二进制 / 过大 / 图片解不出来)。
-    fn render_fallback(&self, id: &'static str, message: String, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_fallback(
+        &self,
+        id: &'static str,
+        message: String,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let remote = self.source.is_remote();
         div()
             .size_full()
             .flex()
@@ -1984,11 +2761,27 @@ impl FileViewer {
             .text_size(ui::font_px(13.0))
             .text_color(ui::text_muted())
             .child(message)
-            .child(
-                ui::primary_button(id, t("fileViewer", "openWithDefaultApp")).on_click(
-                    cx.listener(|this, _: &ClickEvent, _window, cx| this.open_with_default_app(cx)),
-                ),
-            )
+            .when(!remote, |el| {
+                el.child(
+                    ui::primary_button(id, t("fileViewer", "openWithDefaultApp")).on_click(
+                        cx.listener(|this, _: &ClickEvent, _window, cx| {
+                            this.open_with_default_app(cx)
+                        }),
+                    ),
+                )
+            })
+            .when(remote, |el| {
+                el.child(t("fileViewer", "remoteDownloadHint"))
+            })
+            .when(remote && !self.remote_source_invalid, |el| {
+                el.child(
+                    ui::primary_button(id, t("fileTree", "menu.download")).on_click(
+                        cx.listener(|this, _: &ClickEvent, window, cx| {
+                            this.download_remote_file(window, cx)
+                        }),
+                    ),
+                )
+            })
     }
 
     fn render_center(&self, text: String, color: gpui::Hsla) -> impl IntoElement {
@@ -2068,15 +2861,30 @@ impl FileViewer {
             } else {
                 image.alt.clone()
             });
-            let el = match resolve_image_src(&image.url, &base_dir) {
-                MdImageSrc::Local(path) => {
-                    self.render_md_local_image(id, label, &path, each_w, window, cx)
+            let source = resolve_image_src(&image.url, &base_dir);
+            let el = if self.source.is_remote() {
+                match source {
+                    MdImageSrc::Remote(url) => {
+                        self.render_md_remote_image(id, label, &url, each_w, window, cx)
+                    }
+                    MdImageSrc::Local(_) | MdImageSrc::Unsupported => md_image_placeholder(
+                        id,
+                        label,
+                        Some(t("fileViewer", "remoteRelativeImage").to_string()),
+                        None,
+                    ),
                 }
-                MdImageSrc::Remote(url) => {
-                    self.render_md_remote_image(id, label, &url, each_w, window, cx)
-                }
-                MdImageSrc::Unsupported => {
-                    md_image_placeholder(id, label, Some(image.url.clone()), None)
+            } else {
+                match source {
+                    MdImageSrc::Local(path) => {
+                        self.render_md_local_image(id, label, &path, each_w, window, cx)
+                    }
+                    MdImageSrc::Remote(url) => {
+                        self.render_md_remote_image(id, label, &url, each_w, window, cx)
+                    }
+                    MdImageSrc::Unsupported => {
+                        md_image_placeholder(id, label, Some(image.url.clone()), None)
+                    }
                 }
             };
             // 外层链接(`[![alt](img)](link)`):点图开外链。只认 http(s) ——
@@ -2180,10 +2988,18 @@ impl FileViewer {
     }
 
     /// 正文分块(带缓存,见 [`MdCache`])。源码或所在目录变了才重切。
-    fn md_blocks(&self, source: &str, base_dir: &Path) -> Rc<Vec<(f32, MdBlock)>> {
+    fn md_blocks(
+        &self,
+        source: &str,
+        base_dir: &Path,
+        local_resources: bool,
+    ) -> Rc<Vec<(f32, MdBlock)>> {
         // 先把命中与否算完再撒手,别让 borrow 活到 borrow_mut 那一行
         let hit = self.md_cache.borrow().as_ref().and_then(|c| {
-            (c.source == source && c.base_dir == base_dir).then(|| c.blocks.clone())
+            (c.source == source
+                && c.base_dir == base_dir
+                && c.local_resources == local_resources)
+                .then(|| c.blocks.clone())
         });
         if let Some(blocks) = hit {
             return blocks;
@@ -2199,10 +3015,25 @@ impl FileViewer {
                     // 表格格子),它们的本地路径得先转成 file:// 才画得出来
                     // (见 rewrite_md_image_urls);块级图片行不走这里,
                     // 拿的是拆好的原始 url
-                    MdSegment::Text(text) => {
-                        MdBlock::Text(rewrite_md_image_urls(&text, base_dir).into())
+                    MdSegment::Text(text) => MdBlock::Text(if local_resources {
+                        rewrite_md_image_urls(&text, base_dir).into()
+                    } else {
+                        sanitize_remote_html_urls(&sanitize_remote_markdown_images(&text)).into()
+                    }),
+                    MdSegment::Table(mut table) => {
+                        for cell in table
+                            .header
+                            .iter_mut()
+                            .chain(table.rows.iter_mut().flatten())
+                        {
+                            *cell = if local_resources {
+                                rewrite_md_image_urls(cell, base_dir)
+                            } else {
+                                sanitize_remote_html_urls(&sanitize_remote_markdown_images(cell))
+                            };
+                        }
+                        MdBlock::Table(table)
                     }
-                    MdSegment::Table(table) => MdBlock::Table(table),
                     MdSegment::Images(images) => MdBlock::Images(images),
                 };
                 (mt, block)
@@ -2213,6 +3044,7 @@ impl FileViewer {
         *self.md_cache.borrow_mut() = Some(MdCache {
             source: source.to_string(),
             base_dir: base_dir.to_path_buf(),
+            local_resources,
             blocks: blocks.clone(),
         });
         blocks
@@ -2255,7 +3087,7 @@ impl FileViewer {
     /// 正文可用宽度:弹窗宽是 viewport*0.9(见 [`open`]),减掉两侧 24px padding,
     /// 再夹到正文的 860px 上限。图片自绘要按它定尺寸。
     fn preview_avail_width(&self, window: &Window) -> f32 {
-        (f32::from(window.viewport_size().width) * 0.9 - 48.0).clamp(80.0, 860.0)
+        (f32::from(window.viewport_size().width) - 48.0).clamp(80.0, 860.0)
     }
 
     /// Markdown 预览。样式对照 `src/styles.css:813-943` 的 `.md-preview`:
@@ -2270,7 +3102,11 @@ impl FileViewer {
         // split_md_blocks 一节的说明),其余段落照走 TextView;段落 id 按段序编,
         // 文档不变即稳定。分块结果跨帧缓存(见 MdCache)——「滚一格重画一遍」
         // 这条路上,每帧重切 40 KB 正文是白烧。
-        let blocks = self.md_blocks(self.preview_source(), &base_dir);
+        let blocks = self.md_blocks(
+            self.preview_source(),
+            &base_dir,
+            !self.source.is_remote(),
+        );
         let avail_w = self.preview_avail_width(window);
         div()
             .id("file-viewer-md")
@@ -2329,7 +3165,11 @@ impl FileViewer {
     /// 图片与其它本地资源靠 [`rewrite_html_urls`] 转 `file://`(原版是
     /// `convertFileSrc`),由 [`PreviewHttpClient`] 读盘。
     fn render_html(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let source = rewrite_html_urls(self.preview_source(), &self.preview_base_dir());
+        let source = if self.source.is_remote() {
+            sanitize_remote_html_urls(self.preview_source())
+        } else {
+            rewrite_html_urls(self.preview_source(), &self.preview_base_dir())
+        };
         let style = self.preview_text_style(cx);
         div()
             .id("file-viewer-html")
@@ -2375,6 +3215,13 @@ impl FileViewer {
             self.error.is_some(),
             self.result.as_ref(),
         ) {
+            Branch::Image if self.source.is_remote() => self
+                .render_fallback(
+                    "file-viewer-remote-image",
+                    t("fileViewer", "binaryNotSupported").to_string(),
+                    cx,
+                )
+                .into_any_element(),
             Branch::Image => self.render_image(window, cx),
             Branch::Loading => self
                 .render_center(t("fileViewer", "loading").to_string(), ui::text_muted())
@@ -2465,7 +3312,17 @@ impl Render for FileViewer {
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 let ks = &event.keystroke;
                 let mods = &ks.modifiers;
-                if ks.key == "escape" && !mods.modified() {
+                if this.host == ViewerHost::Modal && ks.key == "escape" && !mods.modified() {
+                    cx.stop_propagation();
+                    this.request_close(window, cx);
+                    return;
+                }
+                if this.host == ViewerHost::Workbench
+                    && ks.key == "w"
+                    && mods.secondary()
+                    && !mods.shift
+                    && !mods.alt
+                {
                     cx.stop_propagation();
                     this.request_close(window, cx);
                     return;
@@ -2855,6 +3712,72 @@ mod tests {
         // `data-src` 不是 src
         let keep = r#"<img data-src="a.png">"#;
         assert_eq!(rewrite_html_urls(keep, &base), keep);
+    }
+
+    #[test]
+    fn 远程富文本只允许显式网络资源() {
+        let markdown = concat!(
+            "- ![secret](file:///home/user/secret.png)\n",
+            "![tracker](http://127.0.0.1:8080/a.png)\n",
+            "`![code](file:///tmp/code.png)`\n",
+            "```md\n![fenced](file:///tmp/fenced.png)\n```",
+        );
+        let sanitized = sanitize_remote_markdown_images(markdown);
+        assert!(sanitized.contains("- [secret]"), "{sanitized}");
+        assert!(
+            sanitized.contains("![tracker](http://127.0.0.1:8080/a.png)"),
+            "{sanitized}"
+        );
+        assert!(!sanitized.contains("file:///home/user/secret.png"));
+        assert!(sanitized.contains("`![code](file:///tmp/code.png)`"));
+        assert!(sanitized.contains("![fenced](file:///tmp/fenced.png)"));
+
+        let references = sanitize_remote_markdown_images(concat!(
+            "![secret][local]\n",
+            "[local]: <file:///home/user/secret.png> \"title\"\n",
+            "![web][remote]\n",
+            "[remote]: https://example.com/image.png\n",
+        ));
+        assert!(!references.contains("file:///"), "{references}");
+        assert!(references.contains("[local]: <about:blank>"), "{references}");
+        assert!(
+            references.contains("[remote]: https://example.com/image.png"),
+            "{references}"
+        );
+
+        let html = concat!(
+            r#"<img src="file:///home/user/secret.png">"#,
+            r#"<img src="http://127.0.0.1:8080/a.png">"#,
+            r#"<a href="file:///etc/passwd">local</a>"#,
+            r#"<a href="https://example.com/docs">web</a>"#,
+        );
+        let sanitized = sanitize_remote_html_urls(html);
+        assert!(!sanitized.contains("file:///"), "{sanitized}");
+        assert!(
+            sanitized.contains(r#"src="http://127.0.0.1:8080/a.png""#),
+            "{sanitized}"
+        );
+        assert!(sanitized.contains(r#"src="about:blank""#), "{sanitized}");
+        assert!(sanitized.contains(r#"href="#""#), "{sanitized}");
+        assert!(sanitized.contains("https://example.com/docs"), "{sanitized}");
+
+        let unquoted = sanitize_remote_html_urls(concat!(
+            r#"<img src=file:///etc/passwd>"#,
+            r#"<img src=https://example.com/image.png>"#,
+            r#"<a href=../secret.txt>local</a>"#,
+        ));
+        assert!(!unquoted.contains("file:///"), "{unquoted}");
+        assert!(
+            unquoted.contains("src=https://example.com/image.png"),
+            "{unquoted}"
+        );
+        assert!(unquoted.contains("src=about:blank"), "{unquoted}");
+        assert!(unquoted.contains("href=#"), "{unquoted}");
+
+        let stray_text = sanitize_remote_html_urls(
+            "plain href=\" without a closing quote\n<img src=file:///etc/shadow>",
+        );
+        assert!(!stray_text.contains("file:///"), "{stray_text}");
     }
 
     #[test]

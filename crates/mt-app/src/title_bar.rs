@@ -378,6 +378,7 @@ fn focus_attention_target(
         store.set_active_project(&project_id, cx);
         store.activate_pane(&project_id, &pane_id, window, cx);
     });
+    crate::workbench_area::activate_terminal_page(window, cx);
     true
 }
 
