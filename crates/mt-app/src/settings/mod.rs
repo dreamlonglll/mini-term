@@ -370,6 +370,7 @@ pub struct SettingsView {
     // ── system 页:本地下载目录 ──
     download_dir_busy: bool,
     download_dir_error: Option<String>,
+    download_dir_validation_key: Option<String>,
 
     // ── about 页 ──
     checking: bool,
@@ -596,6 +597,7 @@ impl SettingsView {
             sound_warning: false,
             download_dir_busy: false,
             download_dir_error: None,
+            download_dir_validation_key: None,
             checking: false,
             latest: None,
             update_error: None,

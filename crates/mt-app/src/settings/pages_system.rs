@@ -4,6 +4,8 @@
 //! about 页的版本比较与 GitHub 查询在 [`crate::update_check`],这里只有那颗
 //! 「检查更新」按钮的后台任务与结果渲染。
 
+use std::path::PathBuf;
+
 use gpui::{
     AnyElement, App, Context, InteractiveElement, IntoElement, ParentElement, PathPromptOptions,
     SharedString, StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px,
@@ -50,13 +52,19 @@ impl SettingsView {
             auto_resume,
             download_dir_custom,
             download_dir_path,
+            download_dir_validation_path,
             download_dir_resolve_error,
         ) = {
             let config = self.store.read(cx).config();
-            let (path, error) = match config.resolved_download_dir() {
-                Ok(path) => (path.to_string_lossy().into_owned(), None),
+            let (path, validation_path, error) = match config.resolved_download_dir() {
+                Ok(path) => (
+                    path.to_string_lossy().into_owned(),
+                    Some(path),
+                    None,
+                ),
                 Err(err) => (
                     "—".into(),
+                    None,
                     Some(format!(
                         "{}: {err:#}",
                         t("settings", "system.downloadDirectoryInvalid")
@@ -69,9 +77,18 @@ impl SettingsView {
                 config.ai_auto_resume.unwrap_or(true),
                 config.download_dir.is_some(),
                 path,
+                validation_path,
                 error,
             )
         };
+        if let Some(path) = download_dir_validation_path {
+            let key = path.to_string_lossy().into_owned();
+            if !self.download_dir_busy
+                && self.download_dir_validation_key.as_deref() != Some(key.as_str())
+            {
+                self.start_download_dir_validation(path, key, cx);
+            }
+        }
         let download_dir_error = self
             .download_dir_error
             .clone()
@@ -200,6 +217,48 @@ impl SettingsView {
             .into_any_element()
     }
 
+    fn start_download_dir_validation(
+        &mut self,
+        path: PathBuf,
+        key: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.download_dir_busy = true;
+        self.download_dir_error = None;
+        self.download_dir_validation_key = Some(key.clone());
+        self._download_dir_job = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    AppConfig::validate_download_dir(&path).map_err(|error| format!("{error:#}"))
+                })
+                .await;
+            let _ = this.update(cx, |this: &mut SettingsView, cx| {
+                let current_key = this
+                    .store
+                    .read(cx)
+                    .config()
+                    .resolved_download_dir()
+                    .ok()
+                    .map(|path| path.to_string_lossy().into_owned());
+                if current_key.as_deref() != Some(key.as_str()) {
+                    this.download_dir_busy = false;
+                    this.download_dir_validation_key = None;
+                    cx.notify();
+                    return;
+                }
+                this.download_dir_busy = false;
+                this.download_dir_error = result.err().map(|detail| {
+                    format!(
+                        "{}: {detail}",
+                        t("settings", "system.downloadDirectoryInvalid")
+                    )
+                });
+                cx.notify();
+            });
+        }));
+    }
+
     fn browse_download_dir(&mut self, cx: &mut Context<Self>) {
         if self.download_dir_busy {
             return;
@@ -275,6 +334,7 @@ impl SettingsView {
             )
         });
         if let DownloadDirUpdate::Set(path) = update {
+            self.download_dir_validation_key = Some(path.clone());
             self.store.update(cx, |store, cx| {
                 store.patch_config(|config| config.download_dir = Some(path), cx)
             });
@@ -286,19 +346,42 @@ impl SettingsView {
         if self.download_dir_busy {
             return;
         }
-        if let Err(error) = AppConfig::system_download_dir() {
-            self.download_dir_error = Some(format!(
-                "{}: {error:#}",
-                t("settings", "system.downloadDirectoryInvalid")
-            ));
-            cx.notify();
-            return;
-        }
+        self.download_dir_busy = true;
         self.download_dir_error = None;
-        self.store.update(cx, |store, cx| {
-            store.patch_config(|config| config.download_dir = None, cx)
-        });
         cx.notify();
+        self._download_dir_job = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let path = AppConfig::system_download_dir().map_err(|error| format!("{error:#}"))?;
+                    std::fs::create_dir_all(&path).map_err(|error| {
+                        format!("无法创建下载目录 {}: {error}", path.display())
+                    })?;
+                    AppConfig::validate_download_dir(&path)
+                        .map_err(|error| format!("{error:#}"))?;
+                    Ok::<String, String>(path.to_string_lossy().into_owned())
+                })
+                .await;
+            let _ = this.update(cx, |this: &mut SettingsView, cx| {
+                this.download_dir_busy = false;
+                match result {
+                    Ok(path) => {
+                        this.download_dir_error = None;
+                        this.download_dir_validation_key = Some(path);
+                        this.store.update(cx, |store, cx| {
+                            store.patch_config(|config| config.download_dir = None, cx)
+                        });
+                    }
+                    Err(detail) => {
+                        this.download_dir_error = Some(format!(
+                            "{}: {detail}",
+                            t("settings", "system.downloadDirectoryInvalid")
+                        ));
+                    }
+                }
+                cx.notify();
+            });
+        }));
     }
 
     // ── editor 页 ──

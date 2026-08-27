@@ -51,19 +51,38 @@ pub fn open_guarded<F>(kind: &'static str, window: &mut Window, cx: &mut App, bu
 where
     F: Fn(Dialog, &mut Window, &mut App) -> Dialog + 'static,
 {
+    open_guarded_with_close(kind, window, cx, build, |_window, _cx| {});
+}
+
+fn open_guarded_with_close<F, C>(
+    kind: &'static str,
+    window: &mut Window,
+    cx: &mut App,
+    build: F,
+    on_close: C,
+) -> bool
+where
+    F: Fn(Dialog, &mut Window, &mut App) -> Dialog + 'static,
+    C: Fn(&mut Window, &mut App) + 'static,
+{
     if !overlay::push(overlay::key(kind)) {
-        return;
+        on_close(window, cx);
+        return false;
     }
+    let on_close = Rc::new(on_close);
     window.open_dialog(cx, move |dialog, window, cx| {
+        let on_close = on_close.clone();
         // on_close 与 close_button 都放在最后 —— 它们会覆盖 build 里设过的同名
         // 设置:on_close 漏了(摘不掉种类标记)就再也开不出同种类的弹窗;
         // close_button 见 [`dialog_title`] 的注释,画出来是**空白但仍可点**的一块。
         build(dialog, window, cx).close_button(false).on_close(
-            move |_: &ClickEvent, _window, _cx| {
+            move |_: &ClickEvent, window, cx| {
                 overlay::pop(overlay::key(kind));
+                on_close(window, cx);
             },
         )
     });
+    true
 }
 
 /// 主动关掉某种弹窗(Ctrl+Shift+F 第二次按下要能把搜索框关回去)。
@@ -341,14 +360,15 @@ pub fn show_alert(
     });
 }
 
-/// 上传/下载遇到同名目标时的三选一弹窗。点击遮罩或 Esc 等同取消，不调用回调。
+/// 上传/下载遇到同名目标时的三选一弹窗。点击遮罩或 Esc 等同取消。
 pub fn show_file_conflict_choice(
     on_choice: impl Fn(crate::remote_ssh::FileConflictStrategy, &mut Window, &mut App) + 'static,
+    on_cancel: impl Fn(&mut Window, &mut App) + 'static,
     window: &mut Window,
     cx: &mut App,
 ) {
     let on_choice = Rc::new(on_choice);
-    open_guarded(
+    open_guarded_with_close(
         kind::FILE_CONFLICT,
         window,
         cx,
@@ -413,6 +433,7 @@ pub fn show_file_conflict_choice(
                         ),
                 )
         },
+        on_cancel,
     );
 }
 

@@ -1977,6 +1977,25 @@ fn keep_both_local_path(desired: &Path) -> Result<PathBuf, String> {
     ))
 }
 
+fn collect_upload_conflicts(
+    existing: &HashSet<String>,
+    local_paths: &[PathBuf],
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut reported = HashSet::new();
+    let mut conflicts = Vec::new();
+    for path in local_paths {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let repeated_in_batch = !seen.insert(name.to_string());
+        if (existing.contains(name) || repeated_in_batch) && reported.insert(name.to_string()) {
+            conflicts.push(name.to_string());
+        }
+    }
+    conflicts
+}
+
 /// 上传前扫描顶层冲突；返回发生冲突的本地条目名称。
 pub fn upload_conflicts(
     conn: &SshConnection,
@@ -1997,12 +2016,7 @@ pub fn upload_conflicts(
                 .into_iter()
                 .map(|entry| entry.name)
                 .collect();
-            Ok(local_paths
-                .iter()
-                .filter_map(|path| path.file_name().and_then(|name| name.to_str()))
-                .filter(|name| existing.contains(*name))
-                .map(str::to_string)
-                .collect())
+            Ok(collect_upload_conflicts(&existing, local_paths))
         }
         .await;
         sftp.close().await;
@@ -3657,6 +3671,23 @@ not json\n\
         let st = RemoteSshState::new();
         st.shutdown_pool_blocking();
         assert!(lock(&st.runtime).is_none(), "不该为了关池现建运行时");
+    }
+
+    #[test]
+    fn upload_conflicts_include_existing_and_duplicate_batch_names_once() {
+        let existing = HashSet::from(["existing.txt".to_string()]);
+        let paths = vec![
+            PathBuf::from("first/existing.txt"),
+            PathBuf::from("first/new.txt"),
+            PathBuf::from("second/new.txt"),
+            PathBuf::from("third/new.txt"),
+            PathBuf::from("second/existing.txt"),
+        ];
+
+        assert_eq!(
+            collect_upload_conflicts(&existing, &paths),
+            vec!["existing.txt".to_string(), "new.txt".to_string()]
+        );
     }
 
     #[test]

@@ -1136,10 +1136,10 @@ fn finish_tree_preflight(
     tree: &Entity<FileTree>,
     context: &FileOperationContext,
     cx: &mut App,
-) -> bool {
+) -> Option<bool> {
     tree.update(cx, |tree, cx| {
         if tree.active_operation_context.as_ref() != Some(context) {
-            return false;
+            return None;
         }
         let context_matches = tree.operation_context(cx).as_ref() == Some(context);
         tree.operation_busy = false;
@@ -1147,7 +1147,30 @@ fn finish_tree_preflight(
         tree.active_operation_context = None;
         tree.active_operation_suppressed_path = None;
         cx.notify();
-        context_matches
+        Some(context_matches)
+    })
+}
+
+fn retain_tree_preflight_for_choice(
+    tree: &Entity<FileTree>,
+    context: &FileOperationContext,
+    cx: &mut App,
+) -> bool {
+    tree.update(cx, |tree, cx| {
+        if tree.active_operation_context.as_ref() != Some(context) {
+            return false;
+        }
+        if tree.operation_context(cx).as_ref() != Some(context) {
+            tree.operation_busy = false;
+            tree.operation_label = None;
+            tree.active_operation_context = None;
+            tree.active_operation_suppressed_path = None;
+            cx.notify();
+            return false;
+        }
+        tree.operation_label = Some(t("fileTree", "conflict.title"));
+        cx.notify();
+        true
     })
 }
 
@@ -1207,7 +1230,7 @@ fn spawn_tree_op(
             let result = task.await;
             let _ = cx.update(|window, cx| match result {
                 Ok(summary) => {
-                    let context_matches = tree.update(cx, |tree, cx| {
+                    let operation_owned = tree.update(cx, |tree, cx| {
                         let current = tree.operation_context(cx);
                         if tree.active_operation_context.as_ref() != Some(&context) {
                             return false;
@@ -1241,9 +1264,10 @@ fn spawn_tree_op(
                                 tree.reload_dir(refresh_dir, cx);
                             }
                         }
-                        same_source
+                        cx.notify();
+                        true
                     });
-                    if context_matches && let Some(summary) = summary {
+                    if operation_owned && let Some(summary) = summary {
                         show_alert(
                             t("fileTree", "operation.completeTitle"),
                             summary,
@@ -1254,7 +1278,7 @@ fn spawn_tree_op(
                 }
                 Err(err) => {
                     eprintln!("[files] 操作失败: {err}");
-                    let context_matches = tree.update(cx, |tree, cx| {
+                    let operation_owned = tree.update(cx, |tree, cx| {
                         if tree.active_operation_context.as_ref() != Some(&context) {
                             return false;
                         }
@@ -1276,9 +1300,9 @@ fn spawn_tree_op(
                             tree.reload_dir(failed_refresh_dir, cx);
                         }
                         cx.notify();
-                        same_source
+                        true
                     });
-                    if context_matches {
+                    if operation_owned {
                         show_alert(
                             t("fileTree", "operation.failedTitle"),
                             tr!("fileTree", "operation.failedMessage", error = err),
@@ -1512,26 +1536,43 @@ fn start_upload(
         .spawn(cx, async move |cx| {
             let result = task.await;
             let _ = cx.update(|window, cx| {
-                if !finish_tree_preflight(&tree, &context, cx) {
-                    return;
-                }
                 match result {
-                    Ok((conn, conflicts)) if conflicts.is_empty() => run_upload(
-                        tree.clone(),
-                        context.clone(),
-                        conn,
-                        target_dir.clone(),
-                        local_paths.clone(),
-                        crate::remote_ssh::FileConflictStrategy::KeepBoth,
-                        window,
-                        cx,
-                    ),
+                    Ok((conn, conflicts)) if conflicts.is_empty() => {
+                        if finish_tree_preflight(&tree, &context, cx) != Some(true) {
+                            return;
+                        }
+                        run_upload(
+                            tree.clone(),
+                            context.clone(),
+                            conn,
+                            target_dir.clone(),
+                            local_paths.clone(),
+                            crate::remote_ssh::FileConflictStrategy::KeepBoth,
+                            window,
+                            cx,
+                        );
+                    }
                     Ok((conn, _)) => {
+                        if !retain_tree_preflight_for_choice(&tree, &context, cx) {
+                            return;
+                        }
+                        let choice_tree = tree.clone();
+                        let choice_context = context.clone();
+                        let cancel_tree = tree.clone();
+                        let cancel_context = context.clone();
                         show_file_conflict_choice(
                             move |strategy, window, cx| {
+                                if finish_tree_preflight(
+                                    &choice_tree,
+                                    &choice_context,
+                                    cx,
+                                ) != Some(true)
+                                {
+                                    return;
+                                }
                                 run_upload(
-                                    tree.clone(),
-                                    context.clone(),
+                                    choice_tree.clone(),
+                                    choice_context.clone(),
                                     conn.clone(),
                                     target_dir.clone(),
                                     local_paths.clone(),
@@ -1540,16 +1581,23 @@ fn start_upload(
                                     cx,
                                 );
                             },
+                            move |_window, cx| {
+                                finish_tree_preflight(&cancel_tree, &cancel_context, cx);
+                            },
                             window,
                             cx,
                         );
                     }
-                    Err(error) => show_alert(
-                        t("fileTree", "operation.failedTitle"),
-                        tr!("fileTree", "operation.failedMessage", error = error),
-                        window,
-                        cx,
-                    ),
+                    Err(error) => {
+                        if finish_tree_preflight(&tree, &context, cx).is_some() {
+                            show_alert(
+                                t("fileTree", "operation.failedTitle"),
+                                tr!("fileTree", "operation.failedMessage", error = error),
+                                window,
+                                cx,
+                            );
+                        }
+                    }
                 }
             });
         })
@@ -1706,10 +1754,10 @@ fn start_download(
         .spawn(cx, async move |cx| {
             let conflicts = task.await;
             let _ = cx.update(|window, cx| {
-                if !finish_tree_preflight(&tree, &context, cx) {
-                    return;
-                }
                 if conflicts.is_empty() {
+                    if finish_tree_preflight(&tree, &context, cx) != Some(true) {
+                        return;
+                    }
                     run_download(
                         tree,
                         context,
@@ -1721,11 +1769,23 @@ fn start_download(
                         cx,
                     );
                 } else {
+                    if !retain_tree_preflight_for_choice(&tree, &context, cx) {
+                        return;
+                    }
+                    let choice_tree = tree.clone();
+                    let choice_context = context.clone();
+                    let cancel_tree = tree.clone();
+                    let cancel_context = context.clone();
                     show_file_conflict_choice(
                         move |strategy, window, cx| {
+                            if finish_tree_preflight(&choice_tree, &choice_context, cx)
+                                != Some(true)
+                            {
+                                return;
+                            }
                             run_download(
-                                tree.clone(),
-                                context.clone(),
+                                choice_tree.clone(),
+                                choice_context.clone(),
                                 conn.clone(),
                                 remote_paths.clone(),
                                 download_dir.clone(),
@@ -1733,6 +1793,9 @@ fn start_download(
                                 window,
                                 cx,
                             );
+                        },
+                        move |_window, cx| {
+                            finish_tree_preflight(&cancel_tree, &cancel_context, cx);
                         },
                         window,
                         cx,
