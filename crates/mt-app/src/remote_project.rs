@@ -228,8 +228,8 @@ fn save(state: &Entity<AddRemotePanel>, window: &mut Window, cx: &mut App) {
             };
             let snapshot_matches = busy
                 && current_conn == conn_id
-                && current_path.read(cx).value().to_string() == submitted_path
-                && current_name.read(cx).value().to_string() == submitted_name
+                && current_path.read(cx).value() == submitted_path
+                && current_name.read(cx).value() == submitted_name
                 && current_group == submitted_group;
             if !snapshot_matches {
                 state_for_task.update(cx, |panel, cx| {
