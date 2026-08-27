@@ -28,6 +28,11 @@
 //!    没有等价物,而菜单是本壳通用的下拉形态(与设置面板同款)。手输新组名照旧。
 //! 3. **私钥「…」按钮调 `cx.prompt_for_paths`**(原版 `@tauri-apps/plugin-dialog`)。
 //!
+//! # 本面板独有:点连接名复制名字
+//!
+//! [`copyable_name`] —— 只长在本面板的行上。另两个弹窗共用 [`conn_text`],
+//! 它们的**整行**点击是勾选 / 单选,名字上再接一个点击语义就打架了。
+//!
 //! # 防叠开
 //!
 //! [`crate::overlay::kind::SSH_PANEL`]。删除连接的确认框是**另一种类**
@@ -327,18 +332,34 @@ pub(crate) fn conn_card(
 
 /// 卡片里那两行字(名称 + 摘要)。`suffix` 接在摘要后面(「· 已存密码」)。
 pub(crate) fn conn_text(conn: &SshConnection, suffix: &str) -> AnyElement {
+    conn_text_with_name(
+        name_line()
+            .child(SharedString::from(conn.name.clone()))
+            .into_any_element(),
+        conn,
+        suffix,
+    )
+}
+
+/// 名称那一行的字号/颜色/截断 —— [`conn_text`] 与本面板的可复制名称同一款,
+/// 抽出来是为了「点得动的名字」与「纯文本名字」看上去一模一样。
+fn name_line() -> gpui::Div {
+    div()
+        .truncate()
+        .text_size(ui::font_px(13.0))
+        .text_color(ui::text_primary())
+}
+
+/// 名称行由调用方给的版本。本面板要把名字做成「点一下就复制」
+/// (见 [`copyable_name`]),另两个弹窗不能这么干 —— 它们**整行**点击另有语义
+/// (勾选 / 单选),名字上再接一个点击就成了「点哪儿结果不一样」。
+fn conn_text_with_name(name: AnyElement, conn: &SshConnection, suffix: &str) -> AnyElement {
     div()
         .flex_1()
         .min_w(px(0.0))
         .flex()
         .flex_col()
-        .child(
-            div()
-                .truncate()
-                .text_size(ui::font_px(13.0))
-                .text_color(ui::text_primary())
-                .child(SharedString::from(conn.name.clone())),
-        )
+        .child(name)
         .child(
             div()
                 .truncate()
@@ -529,6 +550,11 @@ pub struct SshPanel {
     dragging: Option<String>,
     /// 鼠标正悬在哪个落点上(`None` = 未分组桶那一行)。
     drag_over: Option<GroupKey>,
+    /// 刚复制过名字的那条连接 id —— 该行亮一枚「已复制」回执。`None` = 不亮。
+    copied: Option<String>,
+    /// 回执自撤任务的句柄。存着是为了「连着复制两条」时上一个计时器被丢弃 ——
+    /// 否则第一条的计时器到点会把第二条刚亮起的回执提前抹掉(照 `pane.rs` 那颗气泡)。
+    _copied_timer: Option<gpui::Task<()>>,
     /// 改名 / 新建两个输入框的「回车提交 / 失焦提交」订阅。
     _subs: Vec<Subscription>,
 }
@@ -607,6 +633,8 @@ pub fn open(window: &mut Window, cx: &mut App) {
         creating: None,
         dragging: None,
         drag_over: None,
+        copied: None,
+        _copied_timer: None,
         _subs: Vec::new(),
     });
 
@@ -838,6 +866,40 @@ fn start_create_group(state: &Entity<SshPanel>, window: &mut Window, cx: &mut Ap
     });
 }
 
+/// 「已复制」回执亮多久。与终端那颗选区气泡同一档(`pane.rs` 的 1s),
+/// 长到看得见、短到不挡下一次操作。
+const COPIED_TIP: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// 点击连接名要送进剪贴板的那一串:**连接名原文**。
+///
+/// 刻意不是 `user@host:port`(那一串就画在名字底下,想要它的人直接选文本更快),
+/// 也不 trim —— 名字是 [`build_connection`] 存进去时就 trim 过的,这里再裁一遍
+/// 只会掩盖存量配置里手改出来的怪名字。用途是把名字贴进 AI 对话 / `mini-term-ssh`
+/// 那类**按名字引用连接**的地方,一个字都不能差。
+pub(crate) fn copy_payload(conn: &SshConnection) -> String {
+    conn.name.clone()
+}
+
+/// 复制连接名 + 亮一秒回执。
+///
+/// 回执画在行内而不是弹 toast:本面板是模态,toast 会落在遮罩之下 / 盖住列表,
+/// 而「点了哪一行」的反馈本来就该长在那一行上。
+fn copy_name(state: &Entity<SshPanel>, conn: &SshConnection, cx: &mut App) {
+    cx.write_to_clipboard(gpui::ClipboardItem::new_string(copy_payload(conn)));
+    let id = conn.id.clone();
+    state.update(cx, |panel, cx| {
+        panel.copied = Some(id);
+        cx.notify();
+        panel._copied_timer = Some(cx.spawn(async move |panel, cx| {
+            cx.background_executor().timer(COPIED_TIP).await;
+            let _ = panel.update(cx, |panel: &mut SshPanel, cx| {
+                panel.copied = None;
+                cx.notify();
+            });
+        }));
+    });
+}
+
 fn move_to_group(state: &Entity<SshPanel>, conn_id: &str, group: Option<&str>, cx: &mut App) {
     let (conn_id, group) = (conn_id.to_string(), group.map(str::to_string));
     state.update(cx, |panel, cx| {
@@ -867,6 +929,7 @@ struct Frame {
     creating: bool,
     dragging: Option<String>,
     drag_over: Option<GroupKey>,
+    copied: Option<String>,
 }
 
 fn read_frame(state: &Entity<SshPanel>, cx: &App) -> Frame {
@@ -896,6 +959,7 @@ fn read_frame(state: &Entity<SshPanel>, cx: &App) -> Frame {
         creating: panel.creating.is_some(),
         dragging: panel.dragging.clone(),
         drag_over: panel.drag_over.clone(),
+        copied: panel.copied.clone(),
     }
 }
 
@@ -1224,7 +1288,8 @@ fn render_list(state: &Entity<SshPanel>, frame: &Frame, cx: &mut App) -> AnyElem
             .text_size(ui::font_px(11.0))
             .text_color(ui::text_muted())
             .child(t("sshModal", "footerHint"))
-            .child(t("sshModal", "groupOpsHint")),
+            .child(t("sshModal", "groupOpsHint"))
+            .child(t("sshModal", "copyNameHint")),
     )
     .into_any_element()
 }
@@ -1237,6 +1302,7 @@ fn render_row(state: &Entity<SshPanel>, conn: &SshConnection, frame: &Frame) -> 
         String::new()
     };
     let is_source = frame.dragging.as_deref() == Some(id.as_str());
+    let just_copied = frame.copied.as_deref() == Some(id.as_str());
     let conn_for_edit = conn.clone();
     let conn_for_del = conn.clone();
     let drag_label = conn.name.clone();
@@ -1252,7 +1318,11 @@ fn render_row(state: &Entity<SshPanel>, conn: &SshConnection, frame: &Frame) -> 
                 cx.new(|_| ConnDragPreview(drag_label.clone()))
             }
         })
-        .child(conn_text(conn, &suffix))
+        .child(conn_text_with_name(
+            copyable_name(state, conn, just_copied),
+            conn,
+            &suffix,
+        ))
         .child(
             div()
                 .flex()
@@ -1283,6 +1353,53 @@ fn render_row(state: &Entity<SshPanel>, conn: &SshConnection, frame: &Frame) -> 
                     }),
                 ),
         )
+        .into_any_element()
+}
+
+/// 连接名做成「点一下复制名字」的按钮 + 复制后那一秒的行内回执。
+///
+/// # 三处细节
+///
+/// 1. **不是整卡可点** —— 卡片本身是拖拽源(拖进左栏分组),整卡再接点击会让
+///    「想拖却手抖点了一下」变成一次莫名其妙的复制;点击面缩到名字那几个字上,
+///    与拖拽的手势区分得开(拖拽要位移,点击不要);
+/// 2. **名字外面套一层 flex 而不是直接给名字挂 hover** —— 回执是名字**右边**
+///    的一枚小签,名字自己得留着 `min_w(0) + truncate`,长名字才会在回执出现时
+///    缩短而不是把卡片撑破;
+/// 3. `cursor_pointer` 卡片上本来就有(拖拽),这里靠 hover 变 accent 色告诉用户
+///    「这几个字与旁边不一样」。
+fn copyable_name(state: &Entity<SshPanel>, conn: &SshConnection, just_copied: bool) -> AnyElement {
+    let id = conn.id.clone();
+    let conn = conn.clone();
+    div()
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .min_w(px(0.0))
+        .child(
+            name_line()
+                .id(SharedString::from(format!("ssh-name-{id}")))
+                .min_w(px(0.0))
+                .cursor_pointer()
+                .when(just_copied, |el| el.text_color(ui::accent()))
+                .hover(|el| el.text_color(ui::accent()))
+                .child(SharedString::from(conn.name.clone()))
+                .on_click({
+                    let state = state.clone();
+                    move |_: &ClickEvent, _window: &mut Window, cx: &mut App| {
+                        copy_name(&state, &conn, cx);
+                    }
+                }),
+        )
+        .when(just_copied, |el| {
+            el.child(
+                div().flex_none().child(
+                    mt_ui::CopiedTip::new(t("sshModal", "copied"))
+                        .colors(ui::bg_overlay(), ui::text_primary())
+                        .font_size(ui::font_px(10.0)),
+                ),
+            )
+        })
         .into_any_element()
 }
 
@@ -1566,6 +1683,24 @@ mod tests {
         assert_eq!(empty.password, None);
         assert_eq!(empty.group, None);
         assert_eq!(empty.port, 22);
+    }
+
+    /// 点名字复制出去的是**连接名原文**,不是底下那行 `user@host:port` 摘要,
+    /// 也不做任何裁剪 —— 它要拿去当「按名字引用连接」的字面量,差一个字就对不上。
+    #[test]
+    fn 复制载荷是连接名原文() {
+        let conn = SshConnection {
+            id: "c1".into(),
+            name: "生产 服务器".into(),
+            host: "10.0.0.5".into(),
+            port: 2222,
+            user: "root".into(),
+            password: None,
+            identity_file: None,
+            group: None,
+        };
+        assert_eq!(copy_payload(&conn), "生产 服务器");
+        assert_ne!(copy_payload(&conn), connection_summary(&conn));
     }
 
     /// 折叠键:未分组桶用空串。

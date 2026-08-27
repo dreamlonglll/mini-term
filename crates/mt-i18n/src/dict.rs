@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 32;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 771;
+pub const ZH_ENTRY_COUNT: usize = 773;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 771;
+pub const EN_ENTRY_COUNT: usize = 773;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -1394,6 +1394,8 @@ static SSH_MODAL_ZH: &[(&str, &str)] = &[
     ("addGroupPlaceholder", "分组名"),
     ("allConnections", "全部连接"),
     ("cancel", "取消"),
+    ("copied", "已复制"),
+    ("copyNameHint", "点击连接名即可复制该名称"),
     ("delete", "删除"),
     ("deleteConfirmMessage", "确定要删除连接「{name}」({summary}) 吗？\n此操作不可撤销，已保存的密码与私钥路径会一并丢失，已关联该连接的项目也将不再能访问它。"),
     ("deleteConfirmTitle", "删除 SSH 连接"),
@@ -1431,6 +1433,8 @@ static SSH_MODAL_EN: &[(&str, &str)] = &[
     ("addGroupPlaceholder", "Group name"),
     ("allConnections", "All Connections"),
     ("cancel", "Cancel"),
+    ("copied", "Copied"),
+    ("copyNameHint", "Click a connection name to copy it"),
     ("delete", "Delete"),
     ("deleteConfirmMessage", "Delete connection \"{name}\" ({summary})?\nThis cannot be undone: the saved password and private key path go with it, and projects linked to this connection will lose access to it."),
     ("deleteConfirmTitle", "Delete SSH Connection"),

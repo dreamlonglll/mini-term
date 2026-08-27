@@ -20,6 +20,7 @@ export const sshModal = {
     cancel: "取消",
     save: "保存",
     passwordSaved: " · 已存密码",
+    copied: "已复制",
     edit: "编辑",
     delete: "删除",
     deleteConfirmTitle: "删除 SSH 连接",
@@ -34,6 +35,7 @@ export const sshModal = {
     addConnection: "+ 添加连接",
     footerHint: "在终端中右键「SSH 连接」即可快速选择并连接",
     groupOpsHint: "右键左侧列表可新增分组，右键分组可重命名或解散；拖动连接到分组上可调整归属",
+    copyNameHint: "点击连接名即可复制该名称",
   },
   en: {
     title: "SSH Connections",
@@ -56,6 +58,7 @@ export const sshModal = {
     cancel: "Cancel",
     save: "Save",
     passwordSaved: " · Password saved",
+    copied: "Copied",
     edit: "Edit",
     delete: "Delete",
     deleteConfirmTitle: "Delete SSH Connection",
@@ -70,5 +73,6 @@ export const sshModal = {
     addConnection: "+ Add Connection",
     footerHint: "Right-click \"SSH Connections\" in the terminal to quickly select and connect",
     groupOpsHint: "Right-click the left list to add a group, right-click a group to rename or dissolve it; drag a connection onto a group to move it",
+    copyNameHint: "Click a connection name to copy it",
   },
 } as const;

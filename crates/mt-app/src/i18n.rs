@@ -674,6 +674,8 @@ const USED_KEYS: &[&str] = &[
     "sshModal.addGroupPlaceholder",
     "sshModal.allConnections",
     "sshModal.cancel",
+    "sshModal.copied",
+    "sshModal.copyNameHint",
     "sshModal.delete",
     "sshModal.deleteConfirmMessage",
     "sshModal.deleteConfirmTitle",
