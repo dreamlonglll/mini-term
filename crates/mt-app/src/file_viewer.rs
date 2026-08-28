@@ -3616,9 +3616,8 @@ mod tests {
     #[test]
     fn 图片段落_认得五种常见写法() {
         // 单张
-        let [MdSegment::Images(imgs)] =
-            split_md_blocks("![主界面](docs/screenshots/main.png)").as_slice()
-        else {
+        let segments = split_md_blocks("![主界面](docs/screenshots/main.png)");
+        let [MdSegment::Images(imgs)] = segments.as_slice() else {
             panic!("单张图片应由 AST 拆出来自绘")
         };
         assert_eq!(imgs.len(), 1);
@@ -3627,33 +3626,33 @@ mod tests {
         assert!(imgs[0].link.is_none());
 
         // 带 title
-        let [MdSegment::Images(imgs)] = split_md_blocks(r#"![图](a.png "标题")"#).as_slice()
-        else {
+        let segments = split_md_blocks(r#"![图](a.png "标题")"#);
+        let [MdSegment::Images(imgs)] = segments.as_slice() else {
             panic!("带标题图片应由 AST 拆出来自绘")
         };
         assert_eq!(imgs[0].url, "a.png");
         assert_eq!(imgs[0].title.as_deref(), Some("标题"));
 
         // 链接包裹(徽章)
-        let [MdSegment::Images(imgs)] =
-            split_md_blocks("[![CI](https://img.shields.io/x.svg)](https://ci.example)").as_slice()
-        else {
+        let segments =
+            split_md_blocks("[![CI](https://img.shields.io/x.svg)](https://ci.example)");
+        let [MdSegment::Images(imgs)] = segments.as_slice() else {
             panic!("链接包裹图片应由 AST 拆出来自绘")
         };
         assert_eq!(imgs[0].url, "https://img.shields.io/x.svg");
         assert_eq!(imgs[0].link.as_deref(), Some("https://ci.example"));
 
         // 一行并排两张
-        let [MdSegment::Images(imgs)] = split_md_blocks("![a](1.png) ![b](2.png)").as_slice()
-        else {
+        let segments = split_md_blocks("![a](1.png) ![b](2.png)");
+        let [MdSegment::Images(imgs)] = segments.as_slice() else {
             panic!("并排图片应由 AST 拆出来自绘")
         };
         assert_eq!(imgs.len(), 2);
         assert_eq!(imgs[1].url, "2.png");
 
         // 尖括号写法(路径里有空格)
-        let [MdSegment::Images(imgs)] = split_md_blocks("![x](<my shots/a b.png>)").as_slice()
-        else {
+        let segments = split_md_blocks("![x](<my shots/a b.png>)");
+        let [MdSegment::Images(imgs)] = segments.as_slice() else {
             panic!("尖括号目标图片应由 AST 拆出来自绘")
         };
         assert_eq!(imgs[0].url, "my shots/a b.png");
