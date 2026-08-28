@@ -541,7 +541,7 @@ fn parse_table_block(source: &str) -> Option<MdTable> {
 
 fn markdown_image_from_node(node: &MarkdownNode) -> Option<MdImage> {
     match node {
-        MarkdownNode::Image(image) => Some(MdImage {
+        MarkdownNode::Image(image) if !image.url.trim().is_empty() => Some(MdImage {
             url: image.url.clone(),
             alt: image.alt.clone(),
             title: image.title.clone(),
@@ -551,6 +551,9 @@ fn markdown_image_from_node(node: &MarkdownNode) -> Option<MdImage> {
             let MarkdownNode::Image(image) = &link.children[0] else {
                 return None;
             };
+            if image.url.trim().is_empty() {
+                return None;
+            }
             Some(MdImage {
                 url: image.url.clone(),
                 alt: image.alt.clone(),
@@ -3840,11 +3843,15 @@ mod tests {
             "[remote]: https://example.com/image.png\n",
         ));
         assert!(!references.contains("file:///"), "{references}");
-        assert!(!references.contains("[local]:"), "{references}");
         assert!(
             references.contains("[remote]: https://example.com/image.png"),
             "{references}"
         );
+        let references_ast = markdown::to_mdast(&references, &ParseOptions::gfm())
+            .expect("sanitized references must remain parseable");
+        let mut unsafe_reference_nodes = Vec::new();
+        collect_remote_markdown_replacements(&references_ast, &mut unsafe_reference_nodes);
+        assert!(unsafe_reference_nodes.is_empty(), "{references}");
 
         let links = sanitize_remote_markdown(concat!(
             "[local](file:///etc/passwd)\n",
