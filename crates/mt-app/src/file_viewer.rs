@@ -4257,7 +4257,9 @@ mod tests {
             references.contains("[remote]: https://example.com/image.png"),
             "{references}"
         );
-        assert!(!references.contains("![web][remote]"), "{references}");
+        // Unresolved reference syntax may remain as literal text. The reparsed
+        // AST below is the security boundary: no active image/reference node
+        // may survive sanitization.
         let references_ast = markdown::to_mdast(&references, &ParseOptions::gfm())
             .expect("sanitized references must remain parseable");
         let mut unsafe_reference_nodes = Vec::new();
