@@ -1263,9 +1263,7 @@ fn skip_raw_text_element(lower: &str, mut cursor: usize, tag: &str) -> usize {
         let close_start = cursor + relative;
         let name_end = close_start + needle.len();
         let boundary = lower.as_bytes().get(name_end).copied();
-        if boundary.is_none_or(|byte| {
-            byte.is_ascii_whitespace() || matches!(byte, b'/' | b'>')
-        }) {
+        if boundary.is_none_or(|byte| byte.is_ascii_whitespace() || matches!(byte, b'/' | b'>')) {
             return skip_html_end_tag(lower, name_end);
         }
         cursor = name_end;
@@ -1426,10 +1424,7 @@ fn html_url_attributes(
         } else {
             cursor.max(open + 1)
         };
-        if fail_closed_after_foreign_content
-            && !self_closing
-            && matches!(tag, "svg" | "math")
-        {
+        if fail_closed_after_foreign_content && !self_closing && matches!(tag, "svg" | "math") {
             saw_foreign_content = true;
         }
     }
@@ -3099,9 +3094,10 @@ impl FileViewer {
                         if markdown_image_can_load(
                             true,
                             self.approved_remote_images.contains(&url),
-                        ) => {
-                            self.render_md_remote_image(id, label, &url, each_w, window, cx)
-                        }
+                        ) =>
+                    {
+                        self.render_md_remote_image(id, label, &url, each_w, window, cx)
+                    }
                     MdImageSrc::Remote(url) => {
                         let consent_id = gpui::SharedString::from(format!(
                             "file-viewer-md-img-consent-{seg_ix}-{ix}"
@@ -3117,8 +3113,7 @@ impl FileViewer {
                             .cursor_pointer()
                             .on_click(cx.listener(move |this, _event, _window, cx| {
                                 cx.stop_propagation();
-                                this.approved_remote_images
-                                    .insert(approved_url.clone());
+                                this.approved_remote_images.insert(approved_url.clone());
                                 cx.notify();
                             }))
                             .child(md_image_placeholder(
@@ -4396,10 +4391,7 @@ mod tests {
 
             let markdown = sanitize_remote_markdown(source);
             assert!(markdown.contains(r#"src="about:blank""#), "{markdown}");
-            assert!(
-                !markdown.contains("src=\"https://evil.test"),
-                "{markdown}"
-            );
+            assert!(!markdown.contains("src=\"https://evil.test"), "{markdown}");
         }
 
         let raw_text = concat!(
@@ -4442,27 +4434,20 @@ mod tests {
             "{sanitized}"
         );
         assert!(
-            sanitized.contains(
-                "```html\n<a href=\"file:///tmp/example\">example</a>\n```"
-            ),
+            sanitized.contains("```html\n<a href=\"file:///tmp/example\">example</a>\n```"),
             "{sanitized}"
         );
         assert!(
-            sanitized.contains(
-                "&lt;img src=\"https://example.com/pre-example.png\"&gt;"
-            ),
+            sanitized.contains("&lt;img src=\"https://example.com/pre-example.png\"&gt;"),
             "{sanitized}"
         );
         assert!(
-            sanitized.contains(
-                "<!-- <img src=\"https://example.com/comment-example.png\"> -->"
-            ),
+            sanitized.contains("<!-- <img src=\"https://example.com/comment-example.png\"> -->"),
             "{sanitized}"
         );
         assert!(
-            sanitized.contains(
-                "const demo = '<img src=\"https://example.com/script-example.png\">'"
-            ),
+            sanitized
+                .contains("const demo = '<img src=\"https://example.com/script-example.png\">'"),
             "{sanitized}"
         );
         assert!(
@@ -4523,9 +4508,7 @@ mod tests {
             "{sanitized}"
         );
         assert!(
-            sanitized.contains(
-                "```html\n<img src=\"https://example.com/code-fenced.png\">\n```"
-            ),
+            sanitized.contains("```html\n<img src=\"https://example.com/code-fenced.png\">\n```"),
             "{sanitized}"
         );
         assert!(
@@ -4536,11 +4519,7 @@ mod tests {
         let ast = markdown::to_mdast(&sanitized, &ParseOptions::gfm())
             .expect("sanitized session markdown must remain parseable");
         let mut unsafe_nodes = Vec::new();
-        collect_untrusted_markdown_replacements(
-            &ast,
-            &mut unsafe_nodes,
-            SESSION_MARKDOWN_POLICY,
-        );
+        collect_untrusted_markdown_replacements(&ast, &mut unsafe_nodes, SESSION_MARKDOWN_POLICY);
         assert!(unsafe_nodes.is_empty(), "{sanitized}");
     }
 

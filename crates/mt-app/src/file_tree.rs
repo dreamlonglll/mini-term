@@ -3503,7 +3503,10 @@ mod tests {
             8,
         ));
 
-        for backend in [FileBackendIdentity::Local, FileBackendIdentity::BrokenRemote] {
+        for backend in [
+            FileBackendIdentity::Local,
+            FileBackendIdentity::BrokenRemote,
+        ] {
             let context = FileOperationContext {
                 backend,
                 ..context.clone()
