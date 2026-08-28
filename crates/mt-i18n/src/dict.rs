@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 32;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 836;
+pub const ZH_ENTRY_COUNT: usize = 839;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 836;
+pub const EN_ENTRY_COUNT: usize = 839;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -258,6 +258,7 @@ static FILE_TREE_ZH: &[(&str, &str)] = &[
     ("dialog.openEditorFailedTitle", "打开编辑器失败"),
     ("dialog.renameFailedMessage", "重命名失败：{error}"),
     ("dialog.renameFailedTitle", "重命名失败"),
+    ("download.contextChanged", "下载上下文已变化，请重新打开或刷新文件后再试。"),
     ("download.directoryErrorTitle", "下载目录不可用"),
     ("empty.loadFailed", "文件列表加载失败"),
     ("empty.loading", "加载中..."),
@@ -334,6 +335,7 @@ static FILE_TREE_EN: &[(&str, &str)] = &[
     ("dialog.openEditorFailedTitle", "Failed to Open Editor"),
     ("dialog.renameFailedMessage", "Rename failed: {error}"),
     ("dialog.renameFailedTitle", "Rename Failed"),
+    ("download.contextChanged", "The download context changed. Reopen or refresh the file and try again."),
     ("download.directoryErrorTitle", "Download Directory Unavailable"),
     ("empty.loadFailed", "Failed to load file list"),
     ("empty.loading", "Loading..."),
@@ -402,8 +404,9 @@ static FILE_VIEWER_ZH: &[(&str, &str)] = &[
     ("remoteConnectionChanged", "SSH 连接配置已变化，此页签已失效；请关闭后重新打开文件。"),
     ("remoteDownloadHint", "此类远程文件暂不支持内置预览，可下载后查看。"),
     ("remoteExternallyChanged", "远程文件已被其他程序修改"),
+    ("remoteImageClickToLoad", "点击加载远程图片"),
     ("remoteReadOnly", "远程文件当前不可编辑"),
-    ("remoteRelativeImage", "远程 Markdown 仅加载 HTTP(S) 绝对图片"),
+    ("remoteRelativeImage", "远程 Markdown 仅支持按需加载 HTTP(S) 绝对图片"),
     ("save", "保存"),
     ("saveFailed", "保存失败"),
     ("saveWarning", "已保存，但需要注意"),
@@ -430,8 +433,9 @@ static FILE_VIEWER_EN: &[(&str, &str)] = &[
     ("remoteConnectionChanged", "The SSH connection changed. Close this tab and reopen the file."),
     ("remoteDownloadHint", "This remote file cannot be previewed here yet. Download it to view it."),
     ("remoteExternallyChanged", "The remote file was modified by another program"),
+    ("remoteImageClickToLoad", "Click to load remote image"),
     ("remoteReadOnly", "This remote file is currently read-only"),
-    ("remoteRelativeImage", "Remote Markdown only loads absolute HTTP(S) images"),
+    ("remoteRelativeImage", "Remote Markdown can only load absolute HTTP(S) images on demand"),
     ("save", "Save"),
     ("saveFailed", "Save failed"),
     ("saveWarning", "Saved with a warning"),
@@ -961,6 +965,7 @@ static SEARCH_ZH: &[(&str, &str)] = &[
     ("placeholderContent", "搜索文件内容..."),
     ("placeholderFilename", "搜索文件名..."),
     ("regexTitle", "正则表达式"),
+    ("remoteUnsupported", "远程项目暂不支持全局搜索。"),
     ("searchButton", "搜索"),
     ("searching", "搜索中..."),
     ("searchingFound", "搜索中... 已找到 {count} 条"),
@@ -979,6 +984,7 @@ static SEARCH_EN: &[(&str, &str)] = &[
     ("placeholderContent", "Search file contents..."),
     ("placeholderFilename", "Search filenames..."),
     ("regexTitle", "Regular Expression"),
+    ("remoteUnsupported", "Global search is not available for remote projects yet."),
     ("searchButton", "Search"),
     ("searching", "Searching..."),
     ("searchingFound", "Searching... {count} found"),

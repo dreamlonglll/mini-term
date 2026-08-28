@@ -1005,6 +1005,22 @@ mod tests {
         assert_ne!(dump(ICON_MAXIMIZE), dump(ICON_RESTORE));
     }
 
+    #[test]
+    fn 关窗风险只预览前五项并汇总剩余数量() {
+        let items = [
+            "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+        ]
+        .map(str::to_string)
+        .to_vec();
+        let preview = close_risk_preview(&items);
+        for name in &items[..CLOSE_RISK_PREVIEW_LIMIT] {
+            assert!(preview.contains(name), "{preview}");
+        }
+        assert!(!preview.contains("foxtrot"), "{preview}");
+        assert_eq!(preview.lines().count(), CLOSE_RISK_PREVIEW_LIMIT + 1);
+        assert!(preview.contains('3'), "剩余数量未显示:{preview}");
+    }
+
     /// 三键的 tooltip key 都在字典里(拼错的后果是空 tooltip,真机上很难发现)。
     #[test]
     fn 窗口控制键文案_key_齐全() {

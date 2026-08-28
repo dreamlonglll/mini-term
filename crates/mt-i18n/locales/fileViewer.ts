@@ -24,7 +24,8 @@ export const fileViewer = {
     remoteConnectionChanged: "SSH 连接配置已变化，此页签已失效；请关闭后重新打开文件。",
     remoteReadOnly: "远程文件当前不可编辑",
     remoteDownloadHint: "此类远程文件暂不支持内置预览，可下载后查看。",
-    remoteRelativeImage: "远程 Markdown 仅加载 HTTP(S) 绝对图片",
+    remoteImageClickToLoad: "点击加载远程图片",
+    remoteRelativeImage: "远程 Markdown 仅支持按需加载 HTTP(S) 绝对图片",
   },
   en: {
     preview: "Preview",
@@ -51,6 +52,7 @@ export const fileViewer = {
     remoteConnectionChanged: "The SSH connection changed. Close this tab and reopen the file.",
     remoteReadOnly: "This remote file is currently read-only",
     remoteDownloadHint: "This remote file cannot be previewed here yet. Download it to view it.",
-    remoteRelativeImage: "Remote Markdown only loads absolute HTTP(S) images",
+    remoteImageClickToLoad: "Click to load remote image",
+    remoteRelativeImage: "Remote Markdown can only load absolute HTTP(S) images on demand",
   },
 } as const;

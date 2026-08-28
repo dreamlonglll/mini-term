@@ -80,7 +80,41 @@ pub fn install(tree: Entity<FileTree>, cx: &mut App) {
     cx.set_global(GlobalFileTree(tree));
 }
 
-/// 从当前可见文件页下载一个远程文件。项目或连接上下文已经变化时静默拒绝，
+fn show_download_context_changed(project_id: &str, cx: &mut App) {
+    let project_name = AppStore::global(cx)
+        .read(cx)
+        .project(project_id)
+        .map(|project| project.name.clone())
+        .unwrap_or_else(|| project_id.to_string());
+    crate::toast::push_message(
+        crate::notify::ToastKind::PasteError,
+        project_id.to_string(),
+        project_name,
+        t("fileTree", "download.contextChanged").to_string(),
+        cx,
+    );
+}
+
+fn remote_download_context_matches(
+    context: &FileOperationContext,
+    project_id: &str,
+    project_root: &str,
+    connection_id: &str,
+    connection_fingerprint: u64,
+) -> bool {
+    context.project_id == project_id
+        && context.root.as_path() == Path::new(project_root)
+        && matches!(
+            &context.backend,
+            FileBackendIdentity::Remote {
+                connection_id: current_id,
+                connection_fingerprint: current_fingerprint,
+            } if current_id == connection_id
+                && *current_fingerprint == connection_fingerprint
+        )
+}
+
+/// 从当前可见文件页下载一个远程文件。项目或连接上下文已经变化时拒绝并提示，
 /// 避免旧页签借当前文件树的连接把同名路径下载自另一台主机。
 pub fn download_remote_file(
     project_id: &str,
@@ -95,6 +129,7 @@ pub fn download_remote_file(
         .try_global::<GlobalFileTree>()
         .map(|global| global.0.clone())
     else {
+        show_download_context_changed(project_id, cx);
         return;
     };
     let context = {
@@ -102,19 +137,17 @@ pub fn download_remote_file(
         tree.operation_context(cx)
     };
     let Some(context) = context else {
+        show_download_context_changed(project_id, cx);
         return;
     };
-    if context.project_id != project_id
-        || context.root.as_path() != Path::new(project_root)
-        || !matches!(
-            &context.backend,
-            FileBackendIdentity::Remote {
-                connection_id: current_id,
-                connection_fingerprint: current_fingerprint,
-            } if current_id == connection_id
-                && *current_fingerprint == connection_fingerprint
-        )
-    {
+    if !remote_download_context_matches(
+        &context,
+        project_id,
+        project_root,
+        connection_id,
+        connection_fingerprint,
+    ) {
+        show_download_context_changed(project_id, cx);
         return;
     }
     start_download(tree, context, vec![path], window, cx);
@@ -3422,6 +3455,68 @@ impl FileTree {
 mod tests {
     use super::FileMenuAction::*;
     use super::*;
+
+    #[test]
+    fn 远程下载上下文要求项目根目录和连接身份完全一致() {
+        let context = FileOperationContext {
+            project_id: "project-a".into(),
+            root: PathBuf::from("/workspace"),
+            backend: FileBackendIdentity::Remote {
+                connection_id: "ssh-a".into(),
+                connection_fingerprint: 7,
+            },
+            generation: 3,
+        };
+        assert!(remote_download_context_matches(
+            &context,
+            "project-a",
+            "/workspace",
+            "ssh-a",
+            7,
+        ));
+        assert!(!remote_download_context_matches(
+            &context,
+            "project-b",
+            "/workspace",
+            "ssh-a",
+            7,
+        ));
+        assert!(!remote_download_context_matches(
+            &context,
+            "project-a",
+            "/other",
+            "ssh-a",
+            7,
+        ));
+        assert!(!remote_download_context_matches(
+            &context,
+            "project-a",
+            "/workspace",
+            "ssh-b",
+            7,
+        ));
+        assert!(!remote_download_context_matches(
+            &context,
+            "project-a",
+            "/workspace",
+            "ssh-a",
+            8,
+        ));
+
+        for backend in [FileBackendIdentity::Local, FileBackendIdentity::BrokenRemote] {
+            let context = FileOperationContext {
+                backend,
+                ..context.clone()
+            };
+            assert!(!remote_download_context_matches(
+                &context,
+                "project-a",
+                "/workspace",
+                "ssh-a",
+                7,
+            ));
+        }
+    }
 
     /// 文件的菜单:「使用默认工具打开」在最前(原版 unshift),没有「新建」两项。
     ///

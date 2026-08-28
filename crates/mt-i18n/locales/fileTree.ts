@@ -93,6 +93,7 @@ export const fileTree = {
       chooseFolderTitle: "选择要上传的文件夹",
     },
     download: {
+      contextChanged: "下载上下文已变化，请重新打开或刷新文件后再试。",
       directoryErrorTitle: "下载目录不可用",
     },
   },
@@ -190,6 +191,7 @@ export const fileTree = {
       chooseFolderTitle: "Choose a Folder to Upload",
     },
     download: {
+      contextChanged: "The download context changed. Reopen or refresh the file and try again.",
       directoryErrorTitle: "Download Directory Unavailable",
     },
   },

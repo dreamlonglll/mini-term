@@ -38,6 +38,7 @@
 //!    说明 + 工具栏常驻「用浏览器打开」——走样的排版有解释、真效果有出口,
 //!    比对着一屏源码有用。相对资源不再是问题,见 [`rewrite_html_urls`]。
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -428,9 +429,9 @@ fn split_md_blocks(source: &str) -> Vec<MdSegment> {
     let Ok(ast) = markdown::to_mdast(source, &ParseOptions::gfm()) else {
         return markdown_text_only(source);
     };
-    // 引用与脚注定义可能被其它段落跨块消费；一旦出现就保守地整篇交回
-    // TextView，避免为了表格/图片自绘破坏整篇文档的解析作用域。
-    if markdown_contains_definition(&ast) {
+    // 引用、脚注与嵌套定义可能跨分段消费；遇到这些就整篇交回 TextView。
+    // 仅有未被引用的顶层普通定义时可以安全分块，它本身不产生可见内容。
+    if markdown_requires_shared_definition_scope(&ast) {
         return markdown_text_only(source);
     }
     let Some(children) = ast.children() else {
@@ -454,6 +455,11 @@ fn split_md_blocks(source: &str) -> Vec<MdSegment> {
     let mut segs = Vec::new();
     let mut pending_text: Option<(usize, usize)> = None;
     for (node, start, end) in nodes {
+        // 未被引用的顶层定义不产生可见内容。既然上面的共享作用域检查已经确认
+        // 没有引用消费者，就直接跳过，避免为它建立一个空 TextView 和块间距。
+        if matches!(node, MarkdownNode::Definition(_)) {
+            continue;
+        }
         let raw = &source[start..end];
         let custom = match node {
             MarkdownNode::Table(_) => {
@@ -493,13 +499,28 @@ fn split_md_blocks(source: &str) -> Vec<MdSegment> {
     segs
 }
 
-fn markdown_contains_definition(node: &MarkdownNode) -> bool {
+fn markdown_requires_shared_definition_scope(node: &MarkdownNode) -> bool {
+    let Some(children) = node.children() else {
+        return false;
+    };
+    children.iter().any(|child| match child {
+        MarkdownNode::Definition(_) => false,
+        _ => markdown_contains_reference_or_definition(child),
+    })
+}
+
+fn markdown_contains_reference_or_definition(node: &MarkdownNode) -> bool {
     matches!(
         node,
-        MarkdownNode::Definition(_) | MarkdownNode::FootnoteDefinition(_)
-    ) || node
-        .children()
-        .is_some_and(|children| children.iter().any(markdown_contains_definition))
+        MarkdownNode::Definition(_)
+            | MarkdownNode::FootnoteDefinition(_)
+            | MarkdownNode::ImageReference(_)
+            | MarkdownNode::LinkReference(_)
+    ) || node.children().is_some_and(|children| {
+        children
+            .iter()
+            .any(markdown_contains_reference_or_definition)
+    })
 }
 
 fn markdown_text_only(source: &str) -> Vec<MdSegment> {
@@ -928,11 +949,21 @@ struct MarkdownReplacement {
     value: String,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum MarkdownImagePolicy {
-    HttpOnly,
-    Disabled,
+#[derive(Clone, Copy)]
+struct MarkdownSanitizePolicy {
+    allow_html_external_links: bool,
+    allow_html_external_resources: bool,
 }
+
+const REMOTE_MARKDOWN_POLICY: MarkdownSanitizePolicy = MarkdownSanitizePolicy {
+    allow_html_external_links: true,
+    allow_html_external_resources: false,
+};
+
+const SESSION_MARKDOWN_POLICY: MarkdownSanitizePolicy = MarkdownSanitizePolicy {
+    allow_html_external_links: false,
+    allow_html_external_resources: false,
+};
 
 fn markdown_plain_text(node: &MarkdownNode) -> String {
     match node {
@@ -951,16 +982,11 @@ fn markdown_plain_text(node: &MarkdownNode) -> String {
 }
 
 fn markdown_safe_plain_label(value: &str, fallback: &str) -> String {
-    let trimmed = value.trim();
-    if trimmed.is_empty()
-        || !trimmed
-            .chars()
-            .all(|ch| ch.is_alphanumeric() || ch.is_whitespace() || matches!(ch, '_' | '-'))
-    {
+    if value.trim().is_empty() {
         return fallback.into();
     }
-    let mut escaped = String::with_capacity(trimmed.len());
-    for ch in trimmed.chars() {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
         if ch.is_ascii_punctuation() {
             escaped.push('\\');
         }
@@ -981,7 +1007,7 @@ fn markdown_replacement(node: &MarkdownNode, value: String) -> Option<MarkdownRe
 fn collect_untrusted_markdown_replacements(
     node: &MarkdownNode,
     replacements: &mut Vec<MarkdownReplacement>,
-    image_policy: MarkdownImagePolicy,
+    policy: MarkdownSanitizePolicy,
 ) {
     match node {
         MarkdownNode::Link(link) if !remote_markdown_url_allowed(&link.url) => {
@@ -992,18 +1018,13 @@ fn collect_untrusted_markdown_replacements(
             return;
         }
         MarkdownNode::Image(image) => {
-            let lower = image.url.trim().to_ascii_lowercase();
-            if image_policy == MarkdownImagePolicy::Disabled
-                || (!lower.starts_with("http://") && !lower.starts_with("https://"))
-            {
-                let alt = markdown_safe_plain_label(&image.alt, "image");
-                if let Some(replacement) = markdown_replacement(node, alt) {
-                    replacements.push(replacement);
-                }
+            let alt = markdown_safe_plain_label(&image.alt, "image");
+            if let Some(replacement) = markdown_replacement(node, alt) {
+                replacements.push(replacement);
             }
             return;
         }
-        MarkdownNode::ImageReference(image) if image_policy == MarkdownImagePolicy::Disabled => {
+        MarkdownNode::ImageReference(image) => {
             let alt = markdown_safe_plain_label(&image.alt, "image");
             if let Some(replacement) = markdown_replacement(node, alt) {
                 replacements.push(replacement);
@@ -1016,12 +1037,25 @@ fn collect_untrusted_markdown_replacements(
             }
             return;
         }
+        MarkdownNode::Html(html) => {
+            let sanitized = sanitize_untrusted_html_urls(
+                &html.value,
+                policy.allow_html_external_links,
+                policy.allow_html_external_resources,
+            );
+            if sanitized != html.value
+                && let Some(replacement) = markdown_replacement(node, sanitized)
+            {
+                replacements.push(replacement);
+            }
+            return;
+        }
         _ => {}
     }
 
     if let Some(children) = node.children() {
         for child in children {
-            collect_untrusted_markdown_replacements(child, replacements, image_policy);
+            collect_untrusted_markdown_replacements(child, replacements, policy);
         }
     }
 }
@@ -1031,7 +1065,7 @@ fn collect_remote_markdown_replacements(
     node: &MarkdownNode,
     replacements: &mut Vec<MarkdownReplacement>,
 ) {
-    collect_untrusted_markdown_replacements(node, replacements, MarkdownImagePolicy::HttpOnly);
+    collect_untrusted_markdown_replacements(node, replacements, REMOTE_MARKDOWN_POLICY);
 }
 
 fn markdown_as_indented_code(source: &str) -> String {
@@ -1042,12 +1076,12 @@ fn markdown_as_indented_code(source: &str) -> String {
         .join("\n")
 }
 
-fn sanitize_markdown_with_policy(source: &str, image_policy: MarkdownImagePolicy) -> String {
+fn sanitize_markdown_with_policy(source: &str, policy: MarkdownSanitizePolicy) -> String {
     let Ok(ast) = markdown::to_mdast(source, &ParseOptions::gfm()) else {
         return markdown_as_indented_code(source);
     };
     let mut replacements = Vec::new();
-    collect_untrusted_markdown_replacements(&ast, &mut replacements, image_policy);
+    collect_untrusted_markdown_replacements(&ast, &mut replacements, policy);
     replacements.sort_unstable_by_key(|replacement| std::cmp::Reverse(replacement.start));
 
     let mut sanitized = source.to_string();
@@ -1067,10 +1101,11 @@ fn sanitize_markdown_with_policy(source: &str, image_policy: MarkdownImagePolicy
 
 /// Remote rich-text is untrusted input from another machine. Parse with the
 /// same GFM AST used by `TextView::markdown`, then replace disallowed links,
-/// images, and reference definitions by source byte range. AST positions cover
-/// multiline destinations and keep fenced/indented/inline code out of scope.
+/// images, reference definitions, and real raw-HTML nodes by source byte range.
+/// AST positions cover multiline destinations and keep fenced/indented/inline
+/// code out of scope.
 fn sanitize_remote_markdown(source: &str) -> String {
-    sanitize_markdown_with_policy(source, MarkdownImagePolicy::HttpOnly)
+    sanitize_markdown_with_policy(source, REMOTE_MARKDOWN_POLICY)
 }
 
 /// AI session logs are untrusted rich text and share the process-wide preview
@@ -1078,8 +1113,7 @@ fn sanitize_remote_markdown(source: &str) -> String {
 /// image into plain alt text so opening a history entry cannot read local files
 /// or issue background network requests.
 pub fn sanitize_session_markdown(source: &str) -> String {
-    let markdown = sanitize_markdown_with_policy(source, MarkdownImagePolicy::Disabled);
-    sanitize_untrusted_html_urls(&markdown, false)
+    sanitize_markdown_with_policy(source, SESSION_MARKDOWN_POLICY)
 }
 
 /// 把 HTML 源里 `src` / `href` / `poster` 的**本地**目标改写成 `file:///…`。
@@ -1093,117 +1127,366 @@ fn rewrite_html_urls(source: &str, base_dir: &Path) -> String {
     let lower = source.to_ascii_lowercase();
     let mut out = String::with_capacity(source.len());
     let mut pos = 0usize;
-    while let Some((value_start, value_end, _attr)) = find_next_url_attr(&lower, pos) {
-        out.push_str(&source[pos..value_start]);
-        out.push_str(&rewrite_html_value(&source[value_start..value_end], base_dir));
-        pos = value_end;
+    for attr in html_url_attributes(&lower, false) {
+        out.push_str(&source[pos..attr.value_start]);
+        out.push_str(&rewrite_html_value(
+            &source[attr.value_start..attr.value_end],
+            base_dir,
+        ));
+        pos = attr.value_end;
     }
     out.push_str(&source[pos..]);
     out
 }
 
-/// 找下一个 `src=` / `href=` / `poster=` 的值区间。HTML 允许属性值不加引号，
-/// 所以这里同时覆盖 `src="x"`、`src='x'` 与 `src=x`；远程内容的安全过滤
-/// 不能只认前两种，否则 html5ever 仍会把第三种解析成可加载资源。
-fn find_next_url_attr(lower: &str, from: usize) -> Option<(usize, usize, &'static str)> {
-    const ATTRS: [&str; 3] = ["src", "href", "poster"];
-    let mut best: Option<(usize, usize, usize, &'static str)> = None;
-    for attr in ATTRS {
-        let mut at = from;
-        while let Some(rel) = lower[at..].find(attr) {
-            let name_start = at + rel;
-            at = name_start + attr.len();
-            // HTML5 error recovery also accepts attributes after a stray `/`
-            // (`<img/src=x>`) or immediately after a quoted attribute
-            // (`alt="x"src=y`). Cover those parser forms while still rejecting
-            // compound names such as `data-src` and `xlink:href`.
-            if !lower[..name_start]
-                .chars()
-                .next_back()
-                .is_some_and(|ch| ch.is_whitespace() || matches!(ch, '/' | '"' | '\''))
-            {
-                continue;
-            }
-            // 后面得是 `\s*=\s*`，值可以带引号也可以不带
-            let after_name = &lower[at..];
-            let trimmed = after_name.trim_start();
-            let Some(after_eq) = trimmed.strip_prefix('=') else {
-                continue;
-            };
-            let value = after_eq.trim_start();
-            // `after_name` 与 `value` 的长度差,正好是「空白 + `=` + 空白」那一截
-            let value_at = at + (after_name.len() - value.len());
-            let (value_start, value_end) = match value.chars().next() {
-                Some(quote @ ('"' | '\'')) => {
-                    let value_start = value_at + quote.len_utf8();
-                    let Some(rel) = lower[value_start..].find(quote) else {
-                        // A stray `href="` in ordinary text must not stop the
-                        // scanner before a later, valid `<img src=...>`.
-                        at = value_start;
-                        continue;
-                    };
-                    (value_start, value_start + rel)
-                }
-                Some(_) => {
-                    let rel = value
-                        .find(|ch: char| ch.is_whitespace() || ch == '>')
-                        .unwrap_or(value.len());
-                    (value_at, value_at + rel)
-                }
-                None => (value_at, value_at),
-            };
-            let candidate = (name_start, value_start, value_end, attr);
-            if best.is_none_or(|(best_start, _, _, _)| candidate.0 < best_start) {
-                best = Some(candidate);
-            }
+#[derive(Clone, Copy)]
+struct HtmlUrlAttribute {
+    value_start: usize,
+    value_end: usize,
+    name: &'static str,
+}
+
+fn skip_html_tag(lower: &str, cursor: usize) -> usize {
+    let bytes = lower.as_bytes();
+    bytes[cursor..]
+        .iter()
+        .position(|byte| *byte == b'>')
+        .map(|relative| cursor + relative + 1)
+        .unwrap_or(bytes.len())
+}
+
+fn skip_html_end_tag(lower: &str, mut cursor: usize) -> usize {
+    let bytes = lower.as_bytes();
+    while cursor < bytes.len() {
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if cursor >= bytes.len() {
             break;
         }
+        if bytes[cursor] == b'>' {
+            return cursor + 1;
+        }
+        if bytes[cursor] == b'/' {
+            cursor += 1;
+            continue;
+        }
+
+        let name_start = cursor;
+        while cursor < bytes.len()
+            && !bytes[cursor].is_ascii_whitespace()
+            && !matches!(bytes[cursor], b'=' | b'/' | b'>' | b'"' | b'\'' | b'<')
+        {
+            cursor += 1;
+        }
+        if cursor == name_start {
+            // 关闭标签里的孤立引号只是解析错误，不会让后面的 `>` 失去结束作用。
+            cursor += 1;
+            continue;
+        }
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        if bytes.get(cursor) != Some(&b'=') {
+            continue;
+        }
+        cursor += 1;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        match bytes.get(cursor).copied() {
+            Some(quote @ (b'"' | b'\'')) => {
+                cursor += 1;
+                while cursor < bytes.len() && bytes[cursor] != quote {
+                    cursor += 1;
+                }
+                if cursor < bytes.len() {
+                    cursor += 1;
+                }
+            }
+            Some(_) => {
+                while cursor < bytes.len()
+                    && !bytes[cursor].is_ascii_whitespace()
+                    && bytes[cursor] != b'>'
+                {
+                    cursor += 1;
+                }
+            }
+            None => break,
+        }
     }
-    best.map(|(_, value_start, value_end, attr)| (value_start, value_end, attr))
+    bytes.len()
+}
+
+fn skip_html_comment(lower: &str, mut cursor: usize) -> usize {
+    let bytes = lower.as_bytes();
+    // HTML5 的 abrupt-closing empty comment：`<!-->` / `<!--->`。
+    if bytes.get(cursor) == Some(&b'>') {
+        return cursor + 1;
+    }
+    if bytes[cursor..].starts_with(b"->") {
+        return cursor + 2;
+    }
+    while cursor < bytes.len() {
+        if bytes[cursor..].starts_with(b"-->") {
+            return cursor + 3;
+        }
+        if bytes[cursor..].starts_with(b"--!>") {
+            return cursor + 4;
+        }
+        cursor += 1;
+    }
+    bytes.len()
+}
+
+fn is_raw_text_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "script"
+            | "style"
+            | "textarea"
+            | "title"
+            | "xmp"
+            | "iframe"
+            | "noembed"
+            | "noframes"
+            | "plaintext"
+    )
+}
+
+fn skip_raw_text_element(lower: &str, mut cursor: usize, tag: &str) -> usize {
+    if tag == "plaintext" {
+        return lower.len();
+    }
+    let needle = format!("</{tag}");
+    while let Some(relative) = lower[cursor..].find(&needle) {
+        let close_start = cursor + relative;
+        let name_end = close_start + needle.len();
+        let boundary = lower.as_bytes().get(name_end).copied();
+        if boundary.is_none_or(|byte| {
+            byte.is_ascii_whitespace() || matches!(byte, b'/' | b'>')
+        }) {
+            return skip_html_end_tag(lower, name_end);
+        }
+        cursor = name_end;
+    }
+    lower.len()
+}
+
+/// 收集真实开始标签里的 `src=` / `href=` / `poster=` 值区间。HTML 允许属性值
+/// 不加引号，也会恢复 `<img/src=x>` 与 `alt="x"src=y` 这类错误写法；同时必须
+/// 跳过普通文本、注释和 HTML namespace 的 raw-text 内容，避免把示例代码当成
+/// 属性；svg/math foreign content 则保守继续扫描，防止 namespace 恢复产生
+/// 活动图片。
+fn html_url_attributes(
+    lower: &str,
+    fail_closed_after_foreign_content: bool,
+) -> Vec<HtmlUrlAttribute> {
+    let bytes = lower.as_bytes();
+    let mut attrs = Vec::new();
+    let mut pos = 0usize;
+    // foreign-content 的 tree-builder 恢复规则无法只靠词法标签栈精确复刻。
+    // 不可信清洗启用 fail-closed 时，一旦见过非自闭合 svg/math，后续都不再
+    // 跳过 raw-text，宁可多清洗也不能漏活动图片；可信本地改写不启用这条
+    // 策略。
+    let mut saw_foreign_content = false;
+
+    while pos < bytes.len() {
+        let Some(relative) = lower[pos..].find('<') else {
+            break;
+        };
+        let open = pos + relative;
+        let mut cursor = open + 1;
+        if lower[cursor..].starts_with("!--") {
+            pos = skip_html_comment(lower, cursor + 3);
+            continue;
+        }
+        let Some(first) = bytes.get(cursor).copied() else {
+            break;
+        };
+        if first == b'/' {
+            let mut name_cursor = cursor + 1;
+            while name_cursor < bytes.len()
+                && !bytes[name_cursor].is_ascii_whitespace()
+                && !matches!(bytes[name_cursor], b'/' | b'>')
+            {
+                name_cursor += 1;
+            }
+            pos = skip_html_end_tag(lower, name_cursor);
+            continue;
+        }
+        if matches!(first, b'!' | b'?') {
+            pos = skip_html_tag(lower, cursor + 1);
+            continue;
+        }
+        if !first.is_ascii_alphabetic() {
+            pos = cursor;
+            continue;
+        }
+
+        let tag_start = cursor;
+        while cursor < bytes.len()
+            && !bytes[cursor].is_ascii_whitespace()
+            && !matches!(bytes[cursor], b'/' | b'>')
+        {
+            cursor += 1;
+        }
+        let tag = &lower[tag_start..cursor];
+        let mut self_closing = false;
+
+        while cursor < bytes.len() {
+            while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            if cursor >= bytes.len() {
+                break;
+            }
+            if bytes[cursor] == b'>' {
+                cursor += 1;
+                break;
+            }
+            if bytes[cursor] == b'/' {
+                if bytes.get(cursor + 1) == Some(&b'>') {
+                    self_closing = true;
+                    cursor += 2;
+                    break;
+                }
+                // html5ever 接受 `<img/src=x>`；单独的 `/` 当属性分隔符跳过。
+                cursor += 1;
+                continue;
+            }
+
+            let name_start = cursor;
+            while cursor < bytes.len()
+                && !bytes[cursor].is_ascii_whitespace()
+                && !matches!(bytes[cursor], b'=' | b'/' | b'>' | b'"' | b'\'' | b'<')
+            {
+                cursor += 1;
+            }
+            if cursor == name_start {
+                cursor += 1;
+                continue;
+            }
+            let name = match &lower[name_start..cursor] {
+                "src" => Some("src"),
+                "href" => Some("href"),
+                "poster" => Some("poster"),
+                _ => None,
+            };
+
+            while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            if bytes.get(cursor) != Some(&b'=') {
+                continue;
+            }
+            cursor += 1;
+            while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+
+            let (value_start, value_end) = match bytes.get(cursor).copied() {
+                Some(quote @ (b'"' | b'\'')) => {
+                    cursor += 1;
+                    let value_start = cursor;
+                    while cursor < bytes.len() && bytes[cursor] != quote {
+                        cursor += 1;
+                    }
+                    let value_end = cursor;
+                    if cursor < bytes.len() {
+                        cursor += 1;
+                    }
+                    (value_start, value_end)
+                }
+                Some(_) => {
+                    let value_start = cursor;
+                    while cursor < bytes.len()
+                        && !bytes[cursor].is_ascii_whitespace()
+                        && bytes[cursor] != b'>'
+                    {
+                        cursor += 1;
+                    }
+                    (value_start, cursor)
+                }
+                None => (cursor, cursor),
+            };
+            if let Some(name) = name {
+                attrs.push(HtmlUrlAttribute {
+                    value_start,
+                    value_end,
+                    name,
+                });
+            }
+        }
+
+        pos = if (!fail_closed_after_foreign_content || !saw_foreign_content)
+            && is_raw_text_tag(tag)
+        {
+            skip_raw_text_element(lower, cursor, tag)
+        } else {
+            cursor.max(open + 1)
+        };
+        if fail_closed_after_foreign_content
+            && !self_closing
+            && matches!(tag, "svg" | "math")
+        {
+            saw_foreign_content = true;
+        }
+    }
+
+    attrs
 }
 
 /// Sanitize rich-text HTML attributes before they reach the process-wide preview
-/// HTTP client. Remote file previews may keep explicit web resources and links;
-/// session history disables all external HTML resources and relies on Markdown
-/// links for deliberate navigation instead.
-fn sanitize_untrusted_html_urls(source: &str, allow_external: bool) -> String {
+/// HTTP client. Explicit links and automatically loaded resources are separate
+/// capabilities: callers may keep deliberate web navigation while still
+/// blocking every `src` / `poster` request.
+fn sanitize_untrusted_html_urls(
+    source: &str,
+    allow_external_links: bool,
+    allow_external_resources: bool,
+) -> String {
     let lower = source.to_ascii_lowercase();
     let mut out = String::with_capacity(source.len());
     let mut pos = 0usize;
-    while let Some((value_start, value_end, attr)) = find_next_url_attr(&lower, pos) {
-        let value = source[value_start..value_end].trim();
+    for attr in html_url_attributes(&lower, true) {
+        let value = source[attr.value_start..attr.value_end].trim();
         let value_lower = value.to_ascii_lowercase();
         let is_web = ["http:", "https:"]
             .iter()
             .any(|prefix| value_lower.starts_with(prefix));
-        let replacement = match attr {
-            "href" if value.starts_with('#') => &source[value_start..value_end],
+        let replacement = match attr.name {
+            "href" if allow_external_links && value.starts_with('#') => {
+                &source[attr.value_start..attr.value_end]
+            }
             "href"
-                if allow_external
+                if allow_external_links
                     && (is_web
                         || ["mailto:", "tel:"]
                             .iter()
                             .any(|prefix| value_lower.starts_with(prefix))) =>
             {
-                &source[value_start..value_end]
+                &source[attr.value_start..attr.value_end]
             }
-            "src" | "poster" if allow_external && is_web => &source[value_start..value_end],
+            "src" | "poster" if allow_external_resources && is_web => {
+                &source[attr.value_start..attr.value_end]
+            }
             "href" => "#",
             _ => "about:blank",
         };
-        out.push_str(&source[pos..value_start]);
+        out.push_str(&source[pos..attr.value_start]);
         out.push_str(replacement);
-        pos = value_end;
+        pos = attr.value_end;
     }
     out.push_str(&source[pos..]);
     out
 }
 
-/// Remote HTML may load explicit HTTP(S) resources and expose explicit
-/// web/mail/tel/fragment links. Local file URLs, relative paths and script-like
-/// schemes must never reach the process-wide preview HTTP client.
+/// Remote HTML keeps explicit web/mail/tel/fragment links, but never loads an
+/// external resource automatically. Local paths and script-like schemes are
+/// blocked as well.
 fn sanitize_remote_html_urls(source: &str) -> String {
-    sanitize_untrusted_html_urls(source, true)
+    sanitize_untrusted_html_urls(source, true, false)
 }
 
 /// 一个属性值:本地目标转 `file://`,其余原样(排除清单同原版正则)。
@@ -1521,6 +1804,8 @@ fn is_svg_target(url: &str) -> bool {
         .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("svg"))
 }
 
+const MARKDOWN_CONTENT_MAX_WIDTH: f32 = 860.0;
+
 /// 图片该占多宽(逻辑像素):原尺寸与可用宽取小 —— 小图保持原大(原版
 /// `max-width:100%` 也不放大),大图压到可用宽。
 ///
@@ -1530,6 +1815,17 @@ fn is_svg_target(url: &str) -> bool {
 fn image_display_width(data: &gpui::RenderImage, is_svg: bool, avail_w: f32) -> f32 {
     let scale = if is_svg { 2.0 } else { 1.0 };
     (data.size(0).width.0 as f32 / scale).clamp(1.0, avail_w.max(1.0))
+}
+
+fn image_aspect_ratio(data: &gpui::RenderImage) -> f32 {
+    let size = data.size(0);
+    let width = size.width.0.max(1) as f32;
+    let height = size.height.0.max(1) as f32;
+    width / height
+}
+
+fn markdown_image_can_load(is_remote_document: bool, approved: bool) -> bool {
+    !is_remote_document || approved
 }
 
 /// 图片画不出来时的占位:一枚描边小卡片,写 alt(没有就写文件名)。
@@ -1545,6 +1841,8 @@ fn md_image_placeholder(
 ) -> gpui::AnyElement {
     div()
         .id(id)
+        .max_w_full()
+        .min_w_0()
         .flex()
         .items_center()
         .px(px(10.0))
@@ -1555,14 +1853,17 @@ fn md_image_placeholder(
         .bg(ui::bg_elevated())
         .text_size(ui::font_px(12.0))
         .text_color(ui::text_muted())
-        .child(label)
+        .child(div().min_w_0().truncate().child(label))
         .when_some(hint, |el, hint| {
             el.tooltip(move |window, cx| Tooltip::new(hint.clone()).build(window, cx))
         })
         .when_some(open, |el, url| {
             el.cursor_pointer()
                 .hover(|el| el.text_color(ui::text_primary()))
-                .on_click(move |_: &ClickEvent, _window, cx| cx.open_url(&url))
+                .on_click(move |_: &ClickEvent, _window, cx| {
+                    cx.stop_propagation();
+                    cx.open_url(&url);
+                })
         })
         .into_any_element()
 }
@@ -1596,6 +1897,9 @@ pub struct FileViewer {
     /// [`Self::render_markdown`] 只拿得到 `&self`(gpui 的 `Render::render`
     /// 之下全是不可变借用),而这份缓存要在渲染途中回填。
     md_cache: RefCell<Option<MdCache>>,
+    /// 远程 Markdown 图片按文档、按 URL 记录用户明确批准。未命中时只能画
+    /// 占位，绝不能把 URI 交给进程级图片加载器。
+    approved_remote_images: HashSet<String>,
 
     preview: bool,
     dirty: bool,
@@ -1673,6 +1977,7 @@ impl FileViewer {
             preview_draft: None,
             line_ending: LineEnding::Lf,
             md_cache: RefCell::new(None),
+            approved_remote_images: HashSet::new(),
             // 文件树打开 Markdown / HTML 时默认看渲染稿；内容搜索带行号时切到
             // 源码，否则命中光标虽然已经定位，用户看到的仍是无法对应行号的预览。
             preview: highlight_line.is_none(),
@@ -2762,13 +3067,11 @@ impl FileViewer {
     /// 在预览里什么都不出 —— 原版是 `convertFileSrc(fileDir + '/' + src)`。
     /// 这里按当前文件所在目录解析成 `Resource::Path` 自己画。
     ///
-    /// 远程图片(徽章、外链截图)走 `Resource::Uri`,字节由 [`PreviewHttpClient`]
-    /// 拉回来 —— gpui 默认的 `NullHttpClient`(`gpui/app.rs:2343`)压根发不出请求。
+    /// 远程图片先画不触网的占位；用户明确点击后才把 `Resource::Uri` 交给
+    /// [`PreviewHttpClient`]。本地 Markdown 维持原来的自动加载行为。
     ///
-    /// 宽度自己算而不是甩给 `max_w`:gpui 的 `img` 在宽高都是 `Auto` 时把两轴
-    /// 一起填成图片原尺寸(`elements/img.rs:337-363`),此后 `max_w` 只压得住宽、
-    /// 高度还是原值,大图会被 `object_fit` 缩成一小条飘在大片留白里。**给定宽度
-    /// 之后**高度那一支才会按比例算。
+    /// 860px 只用于算设计宽；真实布局由带原图宽高比的外层框负责。父栏变窄时
+    /// `max_w_full` 会压缩框宽，`aspect_ratio` 同步重算高度，不再依赖整窗 viewport。
     fn render_md_images(
         &self,
         seg_ix: usize,
@@ -2783,16 +3086,48 @@ impl FileViewer {
         let mut els = Vec::with_capacity(images.len());
         for (ix, image) in images.iter().enumerate() {
             let id = gpui::SharedString::from(format!("file-viewer-md-img-{seg_ix}-{ix}"));
-            let label = gpui::SharedString::from(if image.alt.is_empty() {
+            let label_text = if image.alt.is_empty() {
                 file_name_of(&image.url).to_string()
             } else {
                 image.alt.clone()
-            });
+            };
+            let label = gpui::SharedString::from(label_text.clone());
             let source = resolve_image_src(&image.url, &base_dir);
             let el = if self.source.is_remote() {
                 match source {
+                    MdImageSrc::Remote(url)
+                        if markdown_image_can_load(
+                            true,
+                            self.approved_remote_images.contains(&url),
+                        ) => {
+                            self.render_md_remote_image(id, label, &url, each_w, window, cx)
+                        }
                     MdImageSrc::Remote(url) => {
-                        self.render_md_remote_image(id, label, &url, each_w, window, cx)
+                        let consent_id = gpui::SharedString::from(format!(
+                            "file-viewer-md-img-consent-{seg_ix}-{ix}"
+                        ));
+                        let approved_url = url.clone();
+                        let prompt = t("fileViewer", "remoteImageClickToLoad");
+                        let placeholder_label =
+                            gpui::SharedString::from(format!("{label_text} · {prompt}"));
+                        div()
+                            .id(consent_id)
+                            .max_w_full()
+                            .min_w_0()
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                cx.stop_propagation();
+                                this.approved_remote_images
+                                    .insert(approved_url.clone());
+                                cx.notify();
+                            }))
+                            .child(md_image_placeholder(
+                                id,
+                                placeholder_label,
+                                Some(format!("{prompt}\n{url}")),
+                                None,
+                            ))
+                            .into_any_element()
                     }
                     MdImageSrc::Local(_) | MdImageSrc::Unsupported => md_image_placeholder(
                         id,
@@ -2826,6 +3161,8 @@ impl FileViewer {
                         .id(gpui::SharedString::from(format!(
                             "file-viewer-md-img-link-{seg_ix}-{ix}"
                         )))
+                        .max_w_full()
+                        .min_w_0()
                         .cursor_pointer()
                         .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
                         .on_click(move |_: &ClickEvent, _window, cx| cx.open_url(&url))
@@ -2837,6 +3174,9 @@ impl FileViewer {
             els.push(el);
         }
         div()
+            .w_full()
+            .max_w_full()
+            .min_w_0()
             .flex()
             .flex_wrap()
             .items_center()
@@ -2860,11 +3200,28 @@ impl FileViewer {
         match window.use_asset::<ImageAssetLoader>(&resource, cx) {
             // 还在读 / 读不出来(文件不在、格式解不了)都给占位,不留白
             None | Some(Err(_)) => md_image_placeholder(id, label, Some(hint), None),
-            Some(Ok(data)) => img(path.to_path_buf())
-                .id(id)
-                .object_fit(gpui::ObjectFit::Contain)
-                .w(px(image_display_width(&data, is_svg_target(&hint), avail_w)))
-                .into_any_element(),
+            Some(Ok(data)) => {
+                // ImgState 会按 element id 跨帧保存 GIF/WebP 的 frame_index。资源换代
+                // 后必须换 id，否则旧动画帧下标可能越过新图片的 frame_count。
+                let image_id = gpui::SharedString::from(format!("{id}-{}", data.id.0));
+                let mut frame = div();
+                frame.style().aspect_ratio = Some(image_aspect_ratio(&data));
+                frame
+                    .w(px(image_display_width(
+                        &data,
+                        is_svg_target(&hint),
+                        avail_w,
+                    )))
+                    .max_w_full()
+                    .min_w_0()
+                    .child(
+                        img(data.clone())
+                            .id(image_id)
+                            .size_full()
+                            .object_fit(gpui::ObjectFit::Contain),
+                    )
+                    .into_any_element()
+            }
         }
     }
 
@@ -2891,11 +3248,24 @@ impl FileViewer {
                 Some(url.to_string()),
                 Some(url.to_string()),
             ),
-            Some(Ok(data)) => img(uri)
-                .id(id)
-                .object_fit(gpui::ObjectFit::Contain)
-                .w(px(image_display_width(&data, is_svg_target(url), avail_w)))
-                .into_any_element(),
+            Some(Ok(data)) => {
+                // 同一槽位换成另一份 RenderImage 时重置动画状态；同一资源跨帧的
+                // ImageId 保持稳定，因此 GIF/WebP 仍能连续播放。
+                let image_id = gpui::SharedString::from(format!("{id}-{}", data.id.0));
+                let mut frame = div();
+                frame.style().aspect_ratio = Some(image_aspect_ratio(&data));
+                frame
+                    .w(px(image_display_width(&data, is_svg_target(url), avail_w)))
+                    .max_w_full()
+                    .min_w_0()
+                    .child(
+                        img(data.clone())
+                            .id(image_id)
+                            .size_full()
+                            .object_fit(gpui::ObjectFit::Contain),
+                    )
+                    .into_any_element()
+            }
         }
     }
 
@@ -2943,7 +3313,7 @@ impl FileViewer {
                     MdSegment::Text(text) => MdBlock::Text(if local_resources {
                         rewrite_md_image_urls(&text, base_dir).into()
                     } else {
-                        sanitize_remote_html_urls(&sanitize_remote_markdown(&text)).into()
+                        sanitize_remote_markdown(&text).into()
                     }),
                     MdSegment::Table(mut table) => {
                         for cell in table
@@ -2954,7 +3324,7 @@ impl FileViewer {
                             *cell = if local_resources {
                                 rewrite_md_image_urls(cell, base_dir)
                             } else {
-                                sanitize_remote_html_urls(&sanitize_remote_markdown(cell))
+                                sanitize_remote_markdown(cell)
                             };
                         }
                         MdBlock::Table(table)
@@ -3009,12 +3379,6 @@ impl FileViewer {
         })
     }
 
-    /// 正文可用宽度:工作区文件页减掉两侧 24px padding,再夹到正文的 860px
-    /// 上限。图片自绘要按它定尺寸。
-    fn preview_avail_width(&self, window: &Window) -> f32 {
-        (f32::from(window.viewport_size().width) - 48.0).clamp(80.0, 860.0)
-    }
-
     /// Markdown 预览。样式对照 `src/styles.css:813-943` 的 `.md-preview`:
     /// 容器 `p-6 max-w-[860px] mx-auto`、段间距 1 rem、正文 1.08rem/1.7。
     ///
@@ -3028,7 +3392,6 @@ impl FileViewer {
         // 文档不变即稳定。分块结果跨帧缓存(见 MdCache)——「滚一格重画一遍」
         // 这条路上,每帧重切 40 KB 正文是白烧。
         let blocks = self.md_blocks(self.preview_source(), &base_dir, !self.source.is_remote());
-        let avail_w = self.preview_avail_width(window);
         div()
             .id("file-viewer-md")
             .size_full()
@@ -3039,40 +3402,52 @@ impl FileViewer {
             // 放宽到 1.85 —— 表格格子行高同源跟随
             .line_height(gpui::relative(1.85))
             .child(
-                div().max_w(px(860.0)).mx_auto().w_full().children(
-                    blocks
-                        .iter()
-                        .enumerate()
-                        .map(|(ix, (mt, block))| {
-                            // 块间距按原版纵向节奏由这里统一给(em 基准,随
-                            // uiFontSize 缩放),TextView 内部的 paragraph_gap
-                            // 在非虚拟化路径上是坏的(见 split_md_blocks 注释)
-                            let content = match block {
-                                MdBlock::Text(text) => TextView::markdown(
-                                    gpui::SharedString::from(format!(
-                                        "file-viewer-md-body-{ix}"
-                                    )),
-                                    text.clone(),
-                                    window,
-                                    cx,
-                                )
-                                .style(style.clone())
-                                .selectable(true)
-                                .into_any_element(),
-                                MdBlock::Table(table) => {
-                                    render_md_table(ix, table, &style, window, cx)
-                                }
-                                MdBlock::Images(images) => {
-                                    self.render_md_images(ix, images, avail_w, window, cx)
-                                }
-                            };
-                            div()
-                                .when(*mt > 0.0, |el| el.mt(ui::font_px(*mt)))
-                                .child(content)
-                                .into_any_element()
-                        })
-                        .collect::<Vec<_>>(),
-                ),
+                div()
+                    .w_full()
+                    .max_w(px(MARKDOWN_CONTENT_MAX_WIDTH))
+                    .min_w_0()
+                    .mx_auto()
+                    .children(
+                        blocks
+                            .iter()
+                            .enumerate()
+                            .map(|(ix, (mt, block))| {
+                                // 块间距按原版纵向节奏由这里统一给(em 基准,随
+                                // uiFontSize 缩放),TextView 内部的 paragraph_gap
+                                // 在非虚拟化路径上是坏的(见 split_md_blocks 注释)
+                                let content = match block {
+                                    MdBlock::Text(text) => TextView::markdown(
+                                        gpui::SharedString::from(format!(
+                                            "file-viewer-md-body-{ix}"
+                                        )),
+                                        text.clone(),
+                                        window,
+                                        cx,
+                                    )
+                                    .style(style.clone())
+                                    .selectable(true)
+                                    .into_any_element(),
+                                    MdBlock::Table(table) => {
+                                        render_md_table(ix, table, &style, window, cx)
+                                    }
+                                    MdBlock::Images(images) => self.render_md_images(
+                                        ix,
+                                        images,
+                                        MARKDOWN_CONTENT_MAX_WIDTH,
+                                        window,
+                                        cx,
+                                    ),
+                                };
+                                div()
+                                    .w_full()
+                                    .max_w_full()
+                                    .min_w_0()
+                                    .when(*mt > 0.0, |el| el.mt(ui::font_px(*mt)))
+                                    .child(content)
+                                    .into_any_element()
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
             )
             .into_any_element()
     }
@@ -3101,9 +3476,10 @@ impl FileViewer {
             .line_height(gpui::relative(1.85))
             .child(
                 div()
-                    .max_w(px(860.0))
-                    .mx_auto()
                     .w_full()
+                    .max_w(px(MARKDOWN_CONTENT_MAX_WIDTH))
+                    .min_w_0()
+                    .mx_auto()
                     .flex()
                     .flex_col()
                     .gap(px(12.0))
@@ -3704,6 +4080,41 @@ mod tests {
         let segs = split_md_blocks("```md\n![a](1.png)\n```");
         assert_eq!(segs.len(), 1, "{segs:?}");
         assert!(matches!(&segs[0], MdSegment::Text(_)));
+
+        let with_definition = split_md_blocks(concat!(
+            "![direct](https://example.com/direct.png)\n\n",
+            "[docs]: https://example.com/docs\n\n",
+            "正文\n",
+        ));
+        assert!(
+            matches!(
+                &with_definition[0],
+                MdSegment::Images(images) if images[0].url.ends_with("direct.png")
+            ),
+            "普通定义不得让直链图片失去自绘占位:{with_definition:?}"
+        );
+        assert_eq!(
+            with_definition.len(),
+            2,
+            "未引用定义不应产生空 TextView 块:{with_definition:?}"
+        );
+        assert!(matches!(&with_definition[1], MdSegment::Text(text) if text == "正文"));
+
+        let reference = split_md_blocks(concat!(
+            "![badge][image]\n\n",
+            "[image]: https://example.com/badge.svg\n",
+        ));
+        assert!(
+            matches!(reference.as_slice(), [MdSegment::Text(_)]),
+            "引用图片保留整篇定义作用域并在远程 TextView 路径安全降级:{reference:?}"
+        );
+    }
+
+    #[test]
+    fn 远程图片必须先获批准_本地图片保持自动加载() {
+        assert!(!markdown_image_can_load(true, false));
+        assert!(markdown_image_can_load(true, true));
+        assert!(markdown_image_can_load(false, false));
     }
 
     #[test]
@@ -3816,10 +4227,16 @@ mod tests {
         // `data-src` 不是 src
         let keep = r#"<img data-src="a.png">"#;
         assert_eq!(rewrite_html_urls(keep, &base), keep);
+
+        // 远程清洗器在见过 svg/math 后会保守扫描后续 raw-text，防 HTML5
+        // namespace 恢复漏掉活动图片；可信本地 HTML 不得复用这条 fail-closed
+        // 策略，否则 textarea 里的示例文本会被误改成 file:// URL。
+        let keep = r#"<svg></svg><textarea><img src="literal.png"></textarea>"#;
+        assert_eq!(rewrite_html_urls(keep, &base), keep);
     }
 
     #[test]
-    fn 远程富文本只允许显式网络资源() {
+    fn 远程富文本禁用自动资源但保留显式网络链接() {
         let markdown = concat!(
             "- ![secret](file:///home/user/secret.png)\n",
             "![tracker](http://127.0.0.1:8080/a.png)\n",
@@ -3828,10 +4245,8 @@ mod tests {
         );
         let sanitized = sanitize_remote_markdown(markdown);
         assert!(sanitized.contains("- secret"), "{sanitized}");
-        assert!(
-            sanitized.contains("![tracker](http://127.0.0.1:8080/a.png)"),
-            "{sanitized}"
-        );
+        assert!(sanitized.contains("tracker"), "{sanitized}");
+        assert!(!sanitized.contains("![tracker]"), "{sanitized}");
         assert!(!sanitized.contains("file:///home/user/secret.png"));
         assert!(sanitized.contains("`![code](file:///tmp/code.png)`"));
         assert!(sanitized.contains("![fenced](file:///tmp/fenced.png)"));
@@ -3847,6 +4262,7 @@ mod tests {
             references.contains("[remote]: https://example.com/image.png"),
             "{references}"
         );
+        assert!(!references.contains("![web][remote]"), "{references}");
         let references_ast = markdown::to_mdast(&references, &ParseOptions::gfm())
             .expect("sanitized references must remain parseable");
         let mut unsafe_reference_nodes = Vec::new();
@@ -3933,19 +4349,17 @@ mod tests {
             r#"<img src="http://127.0.0.1:8080/a.png">"#,
             r#"<a href="file:///etc/passwd">local</a>"#,
             r#"<a href="https://example.com/docs">web</a>"#,
+            r##"<a href="#section">anchor</a>"##,
         );
         let sanitized = sanitize_remote_html_urls(html);
         assert!(!sanitized.contains("file:///"), "{sanitized}");
-        assert!(
-            sanitized.contains(r#"src="http://127.0.0.1:8080/a.png""#),
-            "{sanitized}"
-        );
-        assert!(sanitized.contains(r#"src="about:blank""#), "{sanitized}");
+        assert_eq!(sanitized.matches(r#"src="about:blank""#).count(), 2);
         assert!(sanitized.contains(r##"href="#""##), "{sanitized}");
         assert!(
             sanitized.contains("https://example.com/docs"),
             "{sanitized}"
         );
+        assert!(sanitized.contains(r##"href="#section""##), "{sanitized}");
 
         let unquoted = sanitize_remote_html_urls(concat!(
             r#"<img src=file:///etc/passwd>"#,
@@ -3955,10 +4369,7 @@ mod tests {
             r#"<a href=../secret.txt>local</a>"#,
         ));
         assert!(!unquoted.contains("file:///"), "{unquoted}");
-        assert!(
-            unquoted.contains("src=https://example.com/image.png"),
-            "{unquoted}"
-        );
+        assert!(!unquoted.contains("src=https://example.com/image.png"));
         assert!(unquoted.contains("src=about:blank"), "{unquoted}");
         assert!(unquoted.contains("href=#"), "{unquoted}");
 
@@ -3966,6 +4377,124 @@ mod tests {
             "plain href=\" without a closing quote\n<img src=file:///etc/shadow>",
         );
         assert!(!stray_text.contains("file:///"), "{stray_text}");
+
+        for source in [
+            r#"<!-- normal --><img src="https://evil.test/normal.png">"#,
+            r#"<!--x--!><img src="https://evil.test/bang.png">"#,
+            r#"<!--><img src="https://evil.test/abrupt.png">"#,
+            r#"<!--><img src="https://evil.test/abrupt-with-tail.png">-->"#,
+            r#"<!---><img src="https://evil.test/short.png">"#,
+            r#"</div "><img src="https://evil.test/end-tag.png">"#,
+            r#"<script>x</script "><img src="https://evil.test/raw-end-tag.png">"#,
+            r#"<svg><script><img src="https://evil.test/foreign.png"></script></svg>"#,
+            r#"<svg><p><math></svg><script><img src="https://evil.test/foreign-recovery-a.png"></script>"#,
+            r#"<svg></math><p><math></svg><script><img src="https://evil.test/foreign-recovery-b.png"></script>"#,
+        ] {
+            let html = sanitize_remote_html_urls(source);
+            assert!(html.contains(r#"src="about:blank""#), "{html}");
+            assert!(!html.contains("src=\"https://evil.test"), "{html}");
+
+            let markdown = sanitize_remote_markdown(source);
+            assert!(markdown.contains(r#"src="about:blank""#), "{markdown}");
+            assert!(
+                !markdown.contains("src=\"https://evil.test"),
+                "{markdown}"
+            );
+        }
+
+        let raw_text = concat!(
+            r#"<textarea /><img src="https://example.com/text-example.png"></textarea>"#,
+            r#"<img src="https://evil.test/after-textarea.png">"#,
+        );
+        for sanitized in [
+            sanitize_remote_html_urls(raw_text),
+            sanitize_remote_markdown(raw_text),
+        ] {
+            assert!(
+                sanitized.contains("https://example.com/text-example.png"),
+                "{sanitized}"
+            );
+            assert!(sanitized.contains(r#"src="about:blank""#), "{sanitized}");
+            assert!(
+                !sanitized.contains("https://evil.test/after-textarea.png"),
+                "{sanitized}"
+            );
+        }
+    }
+
+    #[test]
+    fn markdown_html_只清洗真实_ast_节点() {
+        let source = concat!(
+            "`<img src=\"https://example.com/inline.png\">`\n\n",
+            "```html\n<a href=\"file:///tmp/example\">example</a>\n```\n\n",
+            "<pre>\n&lt;img src=\"https://example.com/pre-example.png\"&gt;\n</pre>\n\n",
+            "<!-- <img src=\"https://example.com/comment-example.png\"> -->\n\n",
+            "<script>const demo = '<img src=\"https://example.com/script-example.png\">';</script>\n\n",
+            r#"<img src="https://example.com/active.png">"#,
+            "\n",
+            r#"<a href="file:///etc/passwd">local</a>"#,
+            "\n",
+            r#"<a href="https://example.com/docs">web</a>"#,
+        );
+        let sanitized = sanitize_remote_markdown(source);
+        assert!(
+            sanitized.contains("`<img src=\"https://example.com/inline.png\">`"),
+            "{sanitized}"
+        );
+        assert!(
+            sanitized.contains(
+                "```html\n<a href=\"file:///tmp/example\">example</a>\n```"
+            ),
+            "{sanitized}"
+        );
+        assert!(
+            sanitized.contains(
+                "&lt;img src=\"https://example.com/pre-example.png\"&gt;"
+            ),
+            "{sanitized}"
+        );
+        assert!(
+            sanitized.contains(
+                "<!-- <img src=\"https://example.com/comment-example.png\"> -->"
+            ),
+            "{sanitized}"
+        );
+        assert!(
+            sanitized.contains(
+                "const demo = '<img src=\"https://example.com/script-example.png\">'"
+            ),
+            "{sanitized}"
+        );
+        assert!(
+            sanitized.contains(r#"<img src="about:blank">"#),
+            "{sanitized}"
+        );
+        assert!(
+            sanitized.contains(r##"<a href="#">local</a>"##),
+            "{sanitized}"
+        );
+        assert!(
+            sanitized.contains(r#"<a href="https://example.com/docs">web</a>"#),
+            "{sanitized}"
+        );
+    }
+
+    #[test]
+    fn 不安全目标降级时保留带标点的标签() {
+        let sanitized = sanitize_remote_markdown(concat!(
+            "[main.rs](src/main.rs)\n",
+            "![截图(1).png](./a.png)\n",
+        ));
+        assert!(sanitized.contains(r"main\.rs"), "{sanitized}");
+        assert!(sanitized.contains(r"截图\(1\)\.png"), "{sanitized}");
+        assert!(!sanitized.contains("link"), "{sanitized}");
+        assert!(!sanitized.contains("image"), "{sanitized}");
+
+        let ast = markdown::to_mdast(&sanitized, &ParseOptions::gfm())
+            .expect("sanitized labels must remain parseable");
+        let mut unsafe_nodes = Vec::new();
+        collect_remote_markdown_replacements(&ast, &mut unsafe_nodes);
+        assert!(unsafe_nodes.is_empty(), "{sanitized}");
     }
 
     #[test]
@@ -3976,13 +4505,29 @@ mod tests {
             "![reference][image]\n",
             "[image]: https://example.com/reference.png\n",
             "[docs](https://example.com/docs)\n",
-            r#"<img src="https://example.com/html.png"><img src="file:///etc/group"><a href="https://example.com/html">html</a>"#,
+            "`<img src=\"https://example.com/code-inline.png\">`\n",
+            "```html\n<img src=\"https://example.com/code-fenced.png\">\n```\n",
+            r##"<img src="https://example.com/html.png"><img src="file:///etc/group"><a href="https://example.com/html">html</a><a href="#section">anchor</a>"##,
         );
         let sanitized = sanitize_session_markdown(source);
         assert!(!sanitized.contains("file:///"), "{sanitized}");
-        assert!(!sanitized.contains("src=\"https://"), "{sanitized}");
+        assert!(
+            !sanitized.contains("src=\"https://example.com/html.png"),
+            "{sanitized}"
+        );
         assert!(sanitized.contains("src=\"about:blank\""), "{sanitized}");
         assert!(sanitized.contains("href=\"#\""), "{sanitized}");
+        assert!(!sanitized.contains("#section"), "{sanitized}");
+        assert!(
+            sanitized.contains("`<img src=\"https://example.com/code-inline.png\">`"),
+            "{sanitized}"
+        );
+        assert!(
+            sanitized.contains(
+                "```html\n<img src=\"https://example.com/code-fenced.png\">\n```"
+            ),
+            "{sanitized}"
+        );
         assert!(
             sanitized.contains("[docs](https://example.com/docs)"),
             "{sanitized}"
@@ -3994,7 +4539,7 @@ mod tests {
         collect_untrusted_markdown_replacements(
             &ast,
             &mut unsafe_nodes,
-            MarkdownImagePolicy::Disabled,
+            SESSION_MARKDOWN_POLICY,
         );
         assert!(unsafe_nodes.is_empty(), "{sanitized}");
     }
