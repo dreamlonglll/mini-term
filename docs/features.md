@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.0.8--beta-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.1.5-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -75,6 +75,7 @@ Mini-Term solves all of the above with one lightweight desktop app.
 ### File Search
 
 - **Global search** — Triggered by `Ctrl+Shift+F` (macOS `⌘+Shift+F`) or the file-tree toolbar button, supporting both filename and file-content search modes.
+- **Path matching** — In filename mode, a query containing `/` (a Windows backslash works too) is matched against the project-relative path, e.g. `pages/task/my` hits `src/pages/task/my/my.vue`, with the highlight on the path; queries without a separator still match the bare filename only.
 - **Regex matching** — Toggle between substring / regex modes, with matched keywords highlighted in the results.
 - **Streaming results** — The backend walks the file tree with the `ignore` crate and pushes results in batches every 50 entries or 100ms, cancellable at any time.
 - **Content grouping** — Content-search mode groups matched line numbers by file; clicking a result previews and jumps straight to the matched line.
@@ -193,7 +194,7 @@ The whole application is **native Rust** (the earlier Tauri + React build was re
 | Git / files | git2 (libgit2) · notify + ignore |
 | Usage stats | rusqlite local ledger · hand-drawn trend charts |
 | Mobile relay | axum + tokio WebSocket (`relay-server/`) · React + Vite PWA (`mobile/`) |
-| Tests | **1,541 Rust tests** (28 test targets) + relay-server protocol boundary tests |
+| Tests | **1,629 Rust tests** (28 test targets) + relay-server protocol boundary tests |
 
 ## Getting Started
 
@@ -333,7 +334,7 @@ Issues and PRs are welcome. External contributions are merged after functional v
 Before submitting, please run:
 
 ```bash
-# Workspace-wide Rust tests (28 test targets, 1,541 cases)
+# Workspace-wide Rust tests (28 test targets, 1,629 cases)
 cargo test --workspace
 
 # Node-side tests (just 2 files: ConPTY bundling / vendored-openssl guard)
