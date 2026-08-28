@@ -120,8 +120,7 @@ fn can_accept_verified_promotion(
     staging_state: &Result<Option<SftpNodeKind>, SftpTransferError>,
     backup_state: &Result<Option<SftpNodeKind>, SftpTransferError>,
 ) -> bool {
-    matches!(staging_state, Ok(None))
-        && matches!(backup_state, Ok(Some(SftpNodeKind::File)))
+    matches!(staging_state, Ok(None)) && matches!(backup_state, Ok(Some(SftpNodeKind::File)))
 }
 
 /// 打开在某条 session 上的 SFTP 会话句柄。可跨多次操作复用;用完调 [`Self::close`]
@@ -1493,7 +1492,10 @@ mod tests {
         let no_backup = Ok(None);
         assert!(!can_accept_verified_promotion(&missing, &no_backup));
         let staging_probe_failed = Err(SftpTransferError::Transport("timeout".into()));
-        assert!(!can_accept_verified_promotion(&staging_probe_failed, &backup));
+        assert!(!can_accept_verified_promotion(
+            &staging_probe_failed,
+            &backup
+        ));
     }
 
     #[test]

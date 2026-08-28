@@ -165,13 +165,12 @@ fn project_documents_are_dirty(project: &ProjectDocuments, cx: &App) -> bool {
 
 /// 项目移除、worktree 清理等生命周期操作的统一防丢失闸。
 pub fn project_has_dirty_documents(project_id: &str, cx: &App) -> bool {
-    global(cx)
-        .is_some_and(|area| {
-            area.read(cx)
-                .projects
-                .get(project_id)
-                .is_some_and(|project| project_documents_are_dirty(project, cx))
-        })
+    global(cx).is_some_and(|area| {
+        area.read(cx)
+            .projects
+            .get(project_id)
+            .is_some_and(|project| project_documents_are_dirty(project, cx))
+    })
 }
 
 /// 关窗确认使用的未保存文档列表。项目名与页签名一起展示，避免不同项目中的

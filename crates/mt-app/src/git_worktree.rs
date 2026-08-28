@@ -1530,12 +1530,9 @@ fn open_remove_confirm(
                         return false;
                     }
                     let project_id = linked.as_ref().map(|(id, _)| id.clone());
-                    if project_id
-                        .as_deref()
-                        .is_some_and(|id| {
-                            crate::workbench_area::project_has_dirty_documents(id, cx)
-                        })
-                    {
+                    if project_id.as_deref().is_some_and(|id| {
+                        crate::workbench_area::project_has_dirty_documents(id, cx)
+                    }) {
                         show_alert(
                             t("fileViewer", "unsavedTitle"),
                             t("fileViewer", "projectRemovalBlocked"),

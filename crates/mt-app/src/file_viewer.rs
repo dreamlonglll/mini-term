@@ -532,7 +532,11 @@ fn parse_table_block(source: &str) -> Option<MdTable> {
         cells.resize(header.len(), String::new());
         rows.push(cells);
     }
-    Some(MdTable { header, aligns, rows })
+    Some(MdTable {
+        header,
+        aligns,
+        rows,
+    })
 }
 
 fn markdown_image_from_node(node: &MarkdownNode) -> Option<MdImage> {
@@ -728,8 +732,8 @@ impl HttpClient for PreviewHttpClient {
 fn fetch_local_preview_bytes(path: &Path) -> anyhow::Result<Vec<u8>> {
     use std::io::Read as _;
 
-    let canonical = std::fs::canonicalize(path)
-        .with_context(|| format!("读不到 {}", path.display()))?;
+    let canonical =
+        std::fs::canonicalize(path).with_context(|| format!("读不到 {}", path.display()))?;
     let metadata = std::fs::symlink_metadata(&canonical)
         .with_context(|| format!("无法检查 {}", canonical.display()))?;
     anyhow::ensure!(
@@ -1003,9 +1007,7 @@ fn collect_untrusted_markdown_replacements(
             }
             return;
         }
-        MarkdownNode::Definition(definition)
-            if !remote_markdown_url_allowed(&definition.url) =>
-        {
+        MarkdownNode::Definition(definition) if !remote_markdown_url_allowed(&definition.url) => {
             if let Some(replacement) = markdown_replacement(node, String::new()) {
                 replacements.push(replacement);
             }
@@ -1026,11 +1028,7 @@ fn collect_remote_markdown_replacements(
     node: &MarkdownNode,
     replacements: &mut Vec<MarkdownReplacement>,
 ) {
-    collect_untrusted_markdown_replacements(
-        node,
-        replacements,
-        MarkdownImagePolicy::HttpOnly,
-    );
+    collect_untrusted_markdown_replacements(node, replacements, MarkdownImagePolicy::HttpOnly);
 }
 
 fn markdown_as_indented_code(source: &str) -> String {
@@ -1186,9 +1184,7 @@ fn sanitize_untrusted_html_urls(source: &str, allow_external: bool) -> String {
             {
                 &source[value_start..value_end]
             }
-            "src" | "poster" if allow_external && is_web => {
-                &source[value_start..value_end]
-            }
+            "src" | "poster" if allow_external && is_web => &source[value_start..value_end],
             "href" => "#",
             _ => "about:blank",
         };
@@ -3234,11 +3230,7 @@ impl Render for FileViewer {
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 let ks = &event.keystroke;
                 let mods = &ks.modifiers;
-                if ks.key == "w"
-                    && mods.secondary()
-                    && !mods.shift
-                    && !mods.alt
-                {
+                if ks.key == "w" && mods.secondary() && !mods.shift && !mods.alt {
                     cx.stop_propagation();
                     this.request_close(window, cx);
                     return;
@@ -3340,7 +3332,8 @@ mod tests {
         );
         let segs = split_md_blocks(src);
         assert!(
-            segs.iter().all(|segment| matches!(segment, MdSegment::Text(_))),
+            segs.iter()
+                .all(|segment| matches!(segment, MdSegment::Text(_))),
             "围栏内不得拆出图片或表格:{segs:?}"
         );
     }
@@ -3354,7 +3347,8 @@ mod tests {
         );
         let segs = split_md_blocks(src);
         assert!(
-            segs.iter().all(|segment| matches!(segment, MdSegment::Text(_))),
+            segs.iter()
+                .all(|segment| matches!(segment, MdSegment::Text(_))),
             "跨行行内代码不得拆出图片资源:{segs:?}"
         );
     }
@@ -3379,7 +3373,8 @@ mod tests {
         ] {
             let segs = split_md_blocks(src);
             assert!(
-                segs.iter().all(|segment| matches!(segment, MdSegment::Text(_))),
+                segs.iter()
+                    .all(|segment| matches!(segment, MdSegment::Text(_))),
                 "列表容器里的代码不得拆出资源块:{segs:?}"
             );
         }
@@ -3397,7 +3392,8 @@ mod tests {
         );
         let segs = split_md_blocks(src);
         assert!(
-            segs.iter().all(|segment| matches!(segment, MdSegment::Text(_))),
+            segs.iter()
+                .all(|segment| matches!(segment, MdSegment::Text(_))),
             "raw HTML 容器里的文本不得拆出资源块:{segs:?}"
         );
     }
@@ -3455,7 +3451,8 @@ mod tests {
         );
         let segs = split_md_blocks(src);
         assert!(
-            segs.iter().all(|segment| matches!(segment, MdSegment::Text(_))),
+            segs.iter()
+                .all(|segment| matches!(segment, MdSegment::Text(_))),
             "缩进代码不得拆成表格或图片:{segs:?}"
         );
     }
@@ -3619,8 +3616,8 @@ mod tests {
     #[test]
     fn 图片段落_认得五种常见写法() {
         // 单张
-        let [MdSegment::Images(imgs)] = split_md_blocks("![主界面](docs/screenshots/main.png)")
-            .as_slice()
+        let [MdSegment::Images(imgs)] =
+            split_md_blocks("![主界面](docs/screenshots/main.png)").as_slice()
         else {
             panic!("单张图片应由 AST 拆出来自绘")
         };
@@ -3783,10 +3780,7 @@ mod tests {
         let inline_code = "写法是 `![a](b.png)` 这样";
         assert_eq!(rewrite_md_image_urls(inline_code, &base), inline_code);
         // 解析器没有确认成 Image 的宽松/残缺写法不得被改写成有效资源。
-        for invalid in [
-            "![x](shots/a.png trailing)",
-            "![x](shots/a.png \"unclosed)",
-        ] {
+        for invalid in ["![x](shots/a.png trailing)", "![x](shots/a.png \"unclosed)"] {
             assert_eq!(rewrite_md_image_urls(invalid, &base), invalid);
         }
     }
@@ -3891,7 +3885,10 @@ mod tests {
             "![&#91;image&#93;&#40;file:///tmp/a.png&#41;](file:///image)\n",
             "[&#91;ref&#93;]: file:///definition\n",
         ));
-        assert!(!decoded_label_injection.contains("file:///"), "{decoded_label_injection}");
+        assert!(
+            !decoded_label_injection.contains("file:///"),
+            "{decoded_label_injection}"
+        );
         let ast = markdown::to_mdast(&decoded_label_injection, &ParseOptions::gfm())
             .expect("sanitized markdown must remain parseable");
         let mut unsafe_nodes = Vec::new();
@@ -3907,9 +3904,15 @@ mod tests {
             "```\n",
             "[outside](file:///tmp/outside)\n",
         ));
-        assert!(!fence_edges.contains("file:///tmp/after-indent"), "{fence_edges}");
+        assert!(
+            !fence_edges.contains("file:///tmp/after-indent"),
+            "{fence_edges}"
+        );
         assert!(fence_edges.contains("file:///tmp/inside"), "{fence_edges}");
-        assert!(!fence_edges.contains("file:///tmp/outside"), "{fence_edges}");
+        assert!(
+            !fence_edges.contains("file:///tmp/outside"),
+            "{fence_edges}"
+        );
 
         let html = concat!(
             r#"<img src="file:///home/user/secret.png">"#,
@@ -3993,7 +3996,10 @@ mod tests {
             fetch_local_preview_bytes(&small).unwrap().as_slice(),
             b"small-image"
         );
-        assert!(fetch_local_preview_bytes(&dir).is_err(), "目录不得作为预览资源读取");
+        assert!(
+            fetch_local_preview_bytes(&dir).is_err(),
+            "目录不得作为预览资源读取"
+        );
 
         let oversized = dir.join("oversized.png");
         let file = std::fs::File::create(&oversized).unwrap();
