@@ -372,6 +372,17 @@ fn placeholder_key(mode: SearchMode) -> &'static str {
 
 /// 一段高亮文本(关键词命中处黄底黄字),对应原版 `HighlightText`。
 fn highlighted(text: &str, ranges: &[(usize, usize)], size: f32) -> impl IntoElement {
+    highlighted_on(text, ranges, size, ui::text_primary())
+}
+
+/// 同 [`highlighted`],但未命中片段用指定颜色——按路径搜时高亮落在弱化色的路径行上,
+/// 未命中部分得保持弱化色而不是被抬成主文字色。
+fn highlighted_on(
+    text: &str,
+    ranges: &[(usize, usize)],
+    size: f32,
+    base: gpui::Hsla,
+) -> impl IntoElement {
     let mut row = div().flex().items_center().overflow_hidden();
     for (chunk, hit) in ui::highlight_runs(text, ranges) {
         row = row.child(
@@ -384,7 +395,7 @@ fn highlighted(text: &str, ranges: &[(usize, usize)], size: f32) -> impl IntoEle
                         .bg(ui::with_alpha(ui::color_warning(), 0.3))
                         .text_color(ui::color_warning())
                 })
-                .when(!hit, |el| el.text_color(ui::text_primary()))
+                .when(!hit, |el| el.text_color(base))
                 .child(SharedString::from(chunk)),
         );
     }
@@ -605,7 +616,13 @@ impl SearchModal {
         let item = &self.results[index];
         let name = item.file_name.clone();
         let path = item.file_path.display().to_string();
-        let ranges = item.match_ranges.clone();
+        // 按路径搜(查询串带 `/`)时命中区间落在路径上,高亮跟着落到路径那一行;
+        // 文件名那一行照常显示但不高亮
+        let (ranges, path_ranges) = if item.match_in_path {
+            (Vec::new(), item.match_ranges.clone())
+        } else {
+            (item.match_ranges.clone(), Vec::new())
+        };
 
         div()
             .id(SharedString::from(format!("search-file-{index}")))
@@ -633,13 +650,16 @@ impl SearchModal {
                 }),
             )
             .child(highlighted(&name, &ranges, 12.0))
-            .child(
+            .child(if path_ranges.is_empty() {
                 div()
                     .truncate()
                     .text_size(ui::font_px(10.0))
                     .text_color(ui::text_muted())
-                    .child(path),
-            )
+                    .child(path)
+                    .into_any_element()
+            } else {
+                highlighted_on(&path, &path_ranges, 10.0, ui::text_muted()).into_any_element()
+            })
     }
 }
 
@@ -759,6 +779,7 @@ mod tests {
             line_number: Some(line),
             line_content: Some(format!("line {line}")),
             match_ranges: vec![(0, 4)],
+            match_in_path: false,
         }
     }
 

@@ -39,6 +39,11 @@ pub struct SearchResultItem {
     pub line_content: Option<String>,
     /// 命中区间,按 **char** 计(不是字节),上层直接拿去切片高亮。
     pub match_ranges: Vec<(usize, usize)>,
+    /// 文件名模式下 `match_ranges` 落在哪一段:`true` 落在 `file_path`(按路径搜时),
+    /// `false` 落在 `file_name`。内容模式恒为 `false`(区间落在 `line_content`)。
+    /// 路径口径见 [`path_for_match`]——分隔符换成 `/` 不改变 char 数,上层拿
+    /// `file_path.display()` 原样高亮即可。
+    pub match_in_path: bool,
 }
 
 /// 搜索过程中回调给上层的事件。
@@ -254,6 +259,30 @@ impl<F: Fn(SearchEvent)> ResultBatcher<F> {
 
 // ── Search functions ──
 
+/// 文件名模式的查询串里带路径分隔符,就说明用户要按路径找(issue #57:输入
+/// `pages/task/my/my` 期望命中 `src/pages/task/my/my.vue`,而 `/` 不可能出现在
+/// 文件名里,只匹配文件名永远是 0 结果)。
+///
+/// `/` 在任何模式下都算;`\` 只在非正则模式下算——正则里它是转义符(`\.vue`)。
+/// 不带分隔符仍只匹配裸文件名:搜 `my` 时不该把 `my/` 目录下所有文件都冲出来。
+fn wants_path_match(query: &str, use_regex: bool) -> bool {
+    query.contains('/') || (!use_regex && query.contains('\\'))
+}
+
+/// 按路径搜时的被搜文本:相对项目根的路径,分隔符统一成 `/`。Windows 上 walker 给的是
+/// `\`,用户照 issue 里的习惯敲 `/`;两者都是单个 char,换掉不影响区间下标。
+fn path_for_match(rel_path: &Path) -> String {
+    rel_path.to_string_lossy().replace('\\', "/")
+}
+
+/// 非正则路径查询的归一化:`\` 换成 `/`、去掉开头的 `/` 或 `./`(相对路径没有这两种
+/// 前缀,留着必然搜不到),再小写。
+fn normalize_path_query(query: &str) -> String {
+    let q = query.replace('\\', "/");
+    let q = q.strip_prefix("./").unwrap_or(&q);
+    q.trim_start_matches('/').to_lowercase()
+}
+
 fn search_filenames<F: Fn(SearchEvent)>(
     root: &Path,
     query: &str,
@@ -266,7 +295,12 @@ fn search_filenames<F: Fn(SearchEvent)>(
     } else {
         None
     };
-    let query_lower = query.to_lowercase();
+    let match_in_path = wants_path_match(query, use_regex);
+    let query_lower = if match_in_path {
+        normalize_path_query(query)
+    } else {
+        query.to_lowercase()
+    };
 
     for entry in build_walker(root) {
         if cancel.is_cancelled() {
@@ -280,25 +314,31 @@ fn search_filenames<F: Fn(SearchEvent)>(
             continue;
         }
         let file_name = entry.file_name().to_string_lossy().to_string();
+        let rel_path = entry
+            .path()
+            .strip_prefix(root)
+            .unwrap_or(entry.path())
+            .to_path_buf();
 
-        let char_ranges = if let Some(ref re) = re {
-            byte_ranges_to_char_ranges(&file_name, find_regex_matches(&file_name, re))
+        let haystack = if match_in_path {
+            path_for_match(&rel_path)
         } else {
-            find_substring_char_ranges(&file_name, &query_lower)
+            file_name.clone()
+        };
+        let char_ranges = if let Some(ref re) = re {
+            byte_ranges_to_char_ranges(&haystack, find_regex_matches(&haystack, re))
+        } else {
+            find_substring_char_ranges(&haystack, &query_lower)
         };
 
         if !char_ranges.is_empty() {
-            let rel_path = entry
-                .path()
-                .strip_prefix(root)
-                .unwrap_or(entry.path())
-                .to_path_buf();
             batcher.push(SearchResultItem {
                 file_path: rel_path,
                 file_name,
                 line_number: None,
                 line_content: None,
                 match_ranges: char_ranges,
+                match_in_path,
             });
         }
     }
@@ -363,6 +403,7 @@ fn search_contents<F: Fn(SearchEvent)>(
                     line_number: Some((line_idx + 1) as u32),
                     line_content: Some(line.to_string()),
                     match_ranges: char_ranges,
+                    match_in_path: false,
                 });
             }
         }
@@ -568,13 +609,22 @@ mod tests {
     }
 
     fn collect(root: &Path, query: &str, mode: SearchMode) -> (Vec<SearchResultItem>, u32, bool) {
+        collect_with(root, query, mode, false)
+    }
+
+    fn collect_with(
+        root: &Path,
+        query: &str,
+        mode: SearchMode,
+        use_regex: bool,
+    ) -> (Vec<SearchResultItem>, u32, bool) {
         let (tx, rx) = channel();
         run_search(
             SearchRequest {
                 project_root: root.to_path_buf(),
                 query: query.to_string(),
                 mode,
-                use_regex: false,
+                use_regex,
             },
             SearchHandle::new(),
             move |ev| {
@@ -607,7 +657,90 @@ mod tests {
         assert_eq!(total, 1, "node_modules 下的同名文件不应被搜到");
         assert_eq!(items[0].file_name, "alpha.txt");
         assert_eq!(items[0].file_path, PathBuf::from("alpha.txt"));
+        assert!(!items[0].match_in_path);
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// issue #57 的现场:`src/pages/task/my/my.vue`,外加同目录另一个文件与
+    /// 浅层同名文件,用来区分「按路径」与「按文件名」两种口径。
+    fn make_nested_project(tag: &str) -> PathBuf {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mini-term-search-{tag}-{ts}"));
+        let deep = root.join("src").join("pages").join("task").join("my");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("my.vue"), "<template/>\n").unwrap();
+        std::fs::write(deep.parent().unwrap().join("other.vue"), "<template/>\n").unwrap();
+        std::fs::write(root.join("src").join("my.vue"), "<template/>\n").unwrap();
+        root
+    }
+
+    #[test]
+    fn filename_search_matches_path_when_query_has_separator() {
+        let root = make_nested_project("path");
+        let (items, total, _) = collect(&root, "pages/task/my/my", SearchMode::FileName);
+        assert_eq!(total, 1);
+        assert!(items[0].match_in_path);
+        assert_eq!(items[0].file_name, "my.vue");
+        assert_eq!(
+            items[0].file_path,
+            PathBuf::from("src/pages/task/my/my.vue")
+        );
+        // 区间落在路径上:"src/" 占 4 个 char,命中的是其后 16 个 char
+        assert_eq!(items[0].match_ranges, vec![(4, 20)]);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn filename_search_without_separator_stays_on_file_name() {
+        let root = make_nested_project("name-only");
+        let (items, total, _) = collect(&root, "my", SearchMode::FileName);
+        // 两个 my.vue 命中;目录名 my 不算——other.vue 不该因为躺在 my/ 旁边被冲出来
+        assert_eq!(total, 2);
+        assert!(items.iter().all(|i| !i.match_in_path));
+        assert!(items.iter().all(|i| i.file_name == "my.vue"));
+        assert!(items.iter().all(|i| i.match_ranges == vec![(0, 2)]));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn filename_search_normalizes_backslash_and_leading_prefix() {
+        let root = make_nested_project("normalize");
+        // Windows 习惯的反斜杠
+        let (items, total, _) = collect(&root, "pages\\task\\my\\", SearchMode::FileName);
+        assert_eq!(total, 1);
+        assert!(items[0].match_in_path);
+        // 开头的 ./ 与 / 都去掉:相对路径没有这种前缀
+        let (_, total, _) = collect(&root, "./src/my", SearchMode::FileName);
+        assert_eq!(total, 1);
+        let (_, total, _) = collect(&root, "/src/pages", SearchMode::FileName);
+        assert_eq!(total, 2);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn filename_search_regex_with_separator_matches_path() {
+        let root = make_nested_project("regex-path");
+        let (items, total, _) =
+            collect_with(&root, r"task/.*\.vue$", SearchMode::FileName, true);
+        assert_eq!(total, 2);
+        assert!(items.iter().all(|i| i.match_in_path));
+        // 不带 / 的正则仍只看文件名:\ 是转义符,不算路径分隔符
+        let (items, total, _) = collect_with(&root, r"^my\.vue$", SearchMode::FileName, true);
+        assert_eq!(total, 2);
+        assert!(items.iter().all(|i| !i.match_in_path));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn wants_path_match_rules() {
+        assert!(wants_path_match("pages/task", false));
+        assert!(wants_path_match("pages/task", true));
+        assert!(wants_path_match("pages\\task", false));
+        assert!(!wants_path_match(r"my\.vue", true));
+        assert!(!wants_path_match("my", false));
     }
 
     #[test]
