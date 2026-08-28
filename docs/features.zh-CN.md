@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.0.8--beta-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.1.5-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -75,6 +75,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 ### 文件搜索
 
 - **全局搜索** — `Ctrl+Shift+F`（macOS `⌘+Shift+F`）快捷键或文件树工具栏按钮唤起，支持文件名搜索和文件内容搜索两种模式
+- **路径匹配** — 文件名模式下查询串含 `/`（Windows 反斜杠亦可）时改为对相对项目根的路径匹配，如 `pages/task/my` 命中 `src/pages/task/my/my.vue`，高亮落在路径上；不含分隔符仍只匹配文件名
 - **正则匹配** — 可切换子串 / 正则模式，结果关键词高亮显示
 - **流式推送** — 后端使用 ignore crate 遍历文件树，每 50 条或 100ms 批量推送结果，支持随时取消
 - **内容分组** — 内容搜索模式按文件分组展示匹配行号，点击结果直接预览并定位到匹配行
@@ -193,7 +194,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 | Git / 文件 | git2（libgit2）· notify + ignore |
 | 用量统计 | rusqlite 本地账本 · 自绘趋势图 |
 | 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`） |
-| 测试 | **1541 个 Rust 测试**（28 个测试目标）+ 中转服务端协议边界测试 |
+| 测试 | **1629 个 Rust 测试**（28 个测试目标）+ 中转服务端协议边界测试 |
 
 ## 快速开始
 
@@ -333,7 +334,7 @@ Root（gpui-component 根，承载 Dialog / 通知层）
 提交代码前请运行：
 
 ```bash
-# 全工作区 Rust 测试（28 个测试目标、1541 例）
+# 全工作区 Rust 测试（28 个测试目标、1629 例）
 cargo test --workspace
 
 # Node 侧测试（仅 2 个文件：ConPTY 打包 / vendored-openssl 守卫）
