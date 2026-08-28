@@ -126,6 +126,8 @@ windows = { version = "0.61", features = [
     "Win32_System_LibraryLoader",
     # Shell_NotifyIconW / NOTIFYICONDATAW —— 系统托盘图标的唯一入口。
     "Win32_UI_Shell",
+    # 搜索结果单/双击判定:GetDoubleClickTime 读取系统双击间隔。
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
     # PrintWindow 住在打印/XPS 模块里(弹窗毛玻璃快照,见 frost.rs)。
     "Win32_Storage_Xps",

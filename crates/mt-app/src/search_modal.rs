@@ -57,7 +57,7 @@ const MAX_RESULTS: usize = 1000;
 /// so the second mouse-up is delivered before the overlay closes.
 #[cfg(windows)]
 fn result_preview_close_delay() -> Duration {
-    use windows::Win32::UI::WindowsAndMessaging::GetDoubleClickTime;
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
 
     // SAFETY: `GetDoubleClickTime` reads process-independent system settings and
     // has no pointer or lifetime preconditions.
