@@ -3891,7 +3891,16 @@ mod tests {
             "[&#91;ref&#93;]: file:///definition\n",
         ));
         assert!(
-            !decoded_label_injection.contains("file:///"),
+            !decoded_label_injection.contains("file:///outer"),
+            "{decoded_label_injection}"
+        );
+        assert!(
+            !decoded_label_injection.contains("file:///image"),
+            "{decoded_label_injection}"
+        );
+        // 定义不能中断前面的段落；这一行从首次解析起就是普通文本，不会生成链接。
+        assert!(
+            decoded_label_injection.contains("[&#91;ref&#93;]: file:///definition"),
             "{decoded_label_injection}"
         );
         let ast = markdown::to_mdast(&decoded_label_injection, &ParseOptions::gfm())
