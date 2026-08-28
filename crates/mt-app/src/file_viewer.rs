@@ -3634,8 +3634,7 @@ mod tests {
         assert_eq!(imgs[0].title.as_deref(), Some("标题"));
 
         // 链接包裹(徽章)
-        let segments =
-            split_md_blocks("[![CI](https://img.shields.io/x.svg)](https://ci.example)");
+        let segments = split_md_blocks("[![CI](https://img.shields.io/x.svg)](https://ci.example)");
         let [MdSegment::Images(imgs)] = segments.as_slice() else {
             panic!("链接包裹图片应由 AST 拆出来自绘")
         };
