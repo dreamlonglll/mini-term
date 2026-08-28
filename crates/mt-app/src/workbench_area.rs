@@ -66,16 +66,16 @@ impl DocumentKey {
 }
 
 fn normalize_local_document_path(path: &Path) -> String {
-    let normalized = path.to_string_lossy().replace('\\', "/");
+    let normalized = path.to_string_lossy().into_owned();
     if cfg!(windows) {
-        normalized.to_lowercase()
+        normalized.replace('\\', "/").to_lowercase()
     } else {
         normalized
     }
 }
 
 fn normalize_remote_document_path(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
+    path.to_string_lossy().into_owned()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -154,6 +154,48 @@ pub fn install(area: Entity<WorkbenchArea>, cx: &mut App) {
 fn global(cx: &App) -> Option<Entity<WorkbenchArea>> {
     cx.try_global::<GlobalWorkbench>()
         .map(|global| global.0.clone())
+}
+
+fn project_documents_are_dirty(project: &ProjectDocuments, cx: &App) -> bool {
+    project
+        .tabs
+        .iter()
+        .any(|tab| tab.document.read(cx).is_dirty())
+}
+
+/// 项目移除、worktree 清理等生命周期操作的统一防丢失闸。
+pub fn project_has_dirty_documents(project_id: &str, cx: &App) -> bool {
+    global(cx)
+        .is_some_and(|area| {
+            area.read(cx)
+                .projects
+                .get(project_id)
+                .is_some_and(|project| project_documents_are_dirty(project, cx))
+        })
+}
+
+/// 关窗确认使用的未保存文档列表。项目名与页签名一起展示，避免不同项目中的
+/// 同名文件让用户无法判断哪些草稿会被丢弃。
+pub fn dirty_document_names(cx: &App) -> Vec<String> {
+    let Some(area) = global(cx) else {
+        return Vec::new();
+    };
+    let area = area.read(cx);
+    let store = area.store.read(cx);
+    let mut names = Vec::new();
+    for (project_id, documents) in &area.projects {
+        let project_name = store
+            .project(project_id)
+            .map(|project| project.name.as_str())
+            .unwrap_or(project_id);
+        for tab in &documents.tabs {
+            if tab.document.read(cx).is_dirty() {
+                names.push(format!("{project_name}: {}", tab.title));
+            }
+        }
+    }
+    names.sort();
+    names
 }
 
 /// 按当前项目快照打开文件。远程项目会同时快照连接身份，断链时明确报错。
@@ -272,8 +314,11 @@ impl WorkbenchArea {
                 .iter()
                 .map(|project| project.id.clone())
                 .collect::<std::collections::HashSet<_>>();
-            this.projects
-                .retain(|project_id, _| project_ids.contains(project_id));
+            // 正常移除入口会在 AppStore 层拒绝丢弃脏页签；这里再留一道兜底，
+            // 防止配置被其它路径直接改写时观察者静默销毁内存草稿。
+            this.projects.retain(|project_id, project| {
+                project_ids.contains(project_id) || project_documents_are_dirty(project, cx)
+            });
             for project in this.projects.values() {
                 for tab in &project.tabs {
                     tab.document
@@ -730,10 +775,20 @@ mod tests {
         assert_ne!(a, b);
     }
 
+    #[cfg(windows)]
     #[test]
     fn normalized_paths_deduplicate_separator_variants_on_windows() {
         let normalized = normalize_local_document_path(Path::new("C:\\Work\\src\\main.rs"));
         assert!(!normalized.contains('\\'));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn local_posix_paths_preserve_backslash_file_names() {
+        assert_ne!(
+            normalize_local_document_path(Path::new("/work/a\\b.rs")),
+            normalize_local_document_path(Path::new("/work/a/b.rs"))
+        );
     }
 
     #[test]
@@ -741,6 +796,10 @@ mod tests {
         assert_ne!(
             normalize_remote_document_path(Path::new("/work/A.rs")),
             normalize_remote_document_path(Path::new("/work/a.rs"))
+        );
+        assert_ne!(
+            normalize_remote_document_path(Path::new("/work/a\\b.rs")),
+            normalize_remote_document_path(Path::new("/work/a/b.rs"))
         );
     }
 

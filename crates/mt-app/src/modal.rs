@@ -31,7 +31,7 @@ use gpui_component::dialog::DialogButtonProps;
 use gpui_component::input::{Input, InputState, SelectAll};
 
 use crate::i18n::t;
-use crate::prompt::{autofocus, is_open, kind, open_guarded};
+use crate::prompt::{autofocus, is_open, kind, open_guarded, show_alert};
 use crate::store::AppStore;
 use crate::ui;
 
@@ -158,7 +158,18 @@ pub fn open_confirm_remove_project(
                             .child(project_path.clone()),
                     ),
             )
-            .on_ok(move |_: &ClickEvent, _window, cx| {
+            .on_ok(move |_: &ClickEvent, window, cx| {
+                if crate::workbench_area::project_has_dirty_documents(&project_id, cx) {
+                    window.defer(cx, |window, cx| {
+                        show_alert(
+                            t("fileViewer", "unsavedTitle"),
+                            t("fileViewer", "projectRemovalBlocked"),
+                            window,
+                            cx,
+                        );
+                    });
+                    return true;
+                }
                 store.update(cx, |store, cx| store.remove_project(&project_id, cx));
                 true
             })

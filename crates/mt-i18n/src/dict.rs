@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 32;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 831;
+pub const ZH_ENTRY_COUNT: usize = 836;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 831;
+pub const EN_ENTRY_COUNT: usize = 836;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -28,8 +28,12 @@ static APP_ZH: &[(&str, &str)] = &[
     ("activityBar.ssh", "SSH 连接"),
     ("activityBar.stats", "使用统计"),
     ("activityBar.terminals", "终端面板"),
+    ("closeConfirm.messageWithDocuments", "还有 {count} 个文件包含未保存的修改，关闭后这些修改会丢失：\n\n{names}\n\n确定退出吗？"),
+    ("closeConfirm.messageWithDocumentsAndSessions", "还有 {document_count} 个文件包含未保存的修改，关闭后这些修改会丢失：\n\n{document_names}\n\n还有 {session_count} 个 AI 会话将被终止：\n\n{session_names}\n\n确定退出吗？"),
     ("closeConfirm.messageWithSessions", "还有 {count} 个 AI 会话，关闭后它们会被终止：\n\n{names}\n\n确定退出吗？"),
+    ("closeConfirm.remaining", "另有 {count} 项"),
     ("closeConfirm.titleAi", "有 AI 会话正在运行"),
+    ("closeConfirm.titleUnsaved", "有文件尚未保存"),
     ("configLoadFailed", "配置加载失败，为防止覆盖已有配置，本次运行禁止保存。请重启应用重试。\n\n错误：{detail}"),
     ("emptyState", "请先在中间栏添加项目"),
     ("firstRun.addLocal", "添加本地项目"),
@@ -73,8 +77,12 @@ static APP_EN: &[(&str, &str)] = &[
     ("activityBar.ssh", "SSH connections"),
     ("activityBar.stats", "Statistics"),
     ("activityBar.terminals", "Terminal panels"),
+    ("closeConfirm.messageWithDocuments", "{count} file(s) have unsaved changes that will be discarded:\n\n{names}\n\nQuit anyway?"),
+    ("closeConfirm.messageWithDocumentsAndSessions", "{document_count} file(s) have unsaved changes that will be discarded:\n\n{document_names}\n\n{session_count} AI session(s) will also be terminated:\n\n{session_names}\n\nQuit anyway?"),
     ("closeConfirm.messageWithSessions", "{count} AI session(s) are still running and will be terminated:\n\n{names}\n\nQuit anyway?"),
+    ("closeConfirm.remaining", "{count} more items"),
     ("closeConfirm.titleAi", "AI sessions still running"),
+    ("closeConfirm.titleUnsaved", "Unsaved files"),
     ("configLoadFailed", "Failed to load config. Saving is disabled for this run to protect your existing config. Please restart the app.\n\nError: {detail}"),
     ("emptyState", "Add a project in the middle panel first"),
     ("firstRun.addLocal", "Add local project"),
@@ -389,6 +397,7 @@ static FILE_VIEWER_ZH: &[(&str, &str)] = &[
     ("openInBrowser", "用浏览器打开"),
     ("openWithDefaultApp", "使用默认工具打开"),
     ("preview", "预览"),
+    ("projectRemovalBlocked", "该项目仍有未保存的文件，请先保存或关闭这些页签后再移除项目。"),
     ("reloadDiscard", "重新加载（丢弃修改）"),
     ("remoteConnectionChanged", "SSH 连接配置已变化，此页签已失效；请关闭后重新打开文件。"),
     ("remoteDownloadHint", "此类远程文件暂不支持内置预览，可下载后查看。"),
@@ -416,6 +425,7 @@ static FILE_VIEWER_EN: &[(&str, &str)] = &[
     ("openInBrowser", "Open in browser"),
     ("openWithDefaultApp", "Open with default app"),
     ("preview", "Preview"),
+    ("projectRemovalBlocked", "This project still has unsaved files. Save or close those tabs before removing the project."),
     ("reloadDiscard", "Reload (discard changes)"),
     ("remoteConnectionChanged", "The SSH connection changed. Close this tab and reopen the file."),
     ("remoteDownloadHint", "This remote file cannot be previewed here yet. Download it to view it."),

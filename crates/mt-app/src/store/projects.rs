@@ -292,6 +292,9 @@ impl AppStore {
 
     /// 移除项目:先回收它所有 pane 的 PTY,再从配置里摘掉。
     pub fn remove_project(&mut self, id: &str, cx: &mut Context<Self>) {
+        if crate::workbench_area::project_has_dirty_documents(id, cx) {
+            return;
+        }
         let pty_ids: Vec<u32> = self
             .project_states
             .get(id)

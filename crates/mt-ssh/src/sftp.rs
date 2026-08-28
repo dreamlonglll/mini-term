@@ -113,6 +113,17 @@ fn can_restore_verified_backup(
     matches!(target_state, Ok(None)) && matches!(backup_state, Ok(Some(SftpNodeKind::File)))
 }
 
+/// A failed promotion reply is accepted only when the staging name disappeared
+/// and the verified regular-file backup still exists. Matching target bytes
+/// alone are insufficient because another writer can create identical content.
+fn can_accept_verified_promotion(
+    staging_state: &Result<Option<SftpNodeKind>, SftpTransferError>,
+    backup_state: &Result<Option<SftpNodeKind>, SftpTransferError>,
+) -> bool {
+    matches!(staging_state, Ok(None))
+        && matches!(backup_state, Ok(Some(SftpNodeKind::File)))
+}
+
 /// 打开在某条 session 上的 SFTP 会话句柄。可跨多次操作复用;用完调 [`Self::close`]
 /// (或直接 drop,底层 channel 随之关闭,close 只是显式礼貌收尾)。
 pub struct SftpHandle {
@@ -564,8 +575,43 @@ impl SftpHandle {
         staging: &str,
         target: &str,
     ) -> Result<(), SftpTransferError> {
-        self.replace_staged_entry_with_expected_kind(staging, target, None)
-            .await
+        let backup = unique_sibling_path(target, "backup");
+        if let Err(err) = self.rename(target, &backup).await {
+            if let Ok(kind) = self.node_kind(staging).await {
+                let _ = self.remove_tree(staging, kind).await;
+            }
+            return Err(err);
+        }
+        if let Err(promote_error) = self.rename(staging, target).await {
+            let rollback = self.rename(&backup, target).await;
+            if let Ok(kind) = self.node_kind(staging).await {
+                let _ = self.remove_tree(staging, kind).await;
+            }
+            return match rollback {
+                Ok(()) => Err(promote_error),
+                Err(rollback_error) => Err(SftpTransferError::Sftp(format!(
+                    "promotion failed: {}; rollback failed: {}; backup remains at '{}'",
+                    promote_error.message(),
+                    rollback_error.message(),
+                    backup
+                ))),
+            };
+        }
+        let kind = self.node_kind(&backup).await.map_err(|error| {
+            SftpTransferError::Sftp(format!(
+                "replacement succeeded but backup could not be inspected at '{}': {}",
+                backup,
+                error.message()
+            ))
+        })?;
+        self.remove_tree(&backup, kind).await.map_err(|error| {
+            SftpTransferError::Sftp(format!(
+                "replacement succeeded but backup cleanup failed at '{}': {}",
+                backup,
+                error.message()
+            ))
+        })?;
+        Ok(())
     }
 
     async fn replace_staged_regular_file(
@@ -576,11 +622,19 @@ impl SftpHandle {
         max_bytes: usize,
         expected_current: Option<&[u8]>,
     ) -> Result<SftpFileReplaceResult, SftpTransferError> {
-        let backup = editor_backup_path(target)?;
-        if let Some(kind) = self.try_node_kind(&backup).await? {
-            return Err(SftpTransferError::Sftp(format!(
+        let backup = match editor_backup_path(target) {
+            Ok(backup) => backup,
+            Err(error) => return Err(self.with_staging_cleanup_error(error, staging).await),
+        };
+        let backup_kind = match self.try_node_kind(&backup).await {
+            Ok(kind) => kind,
+            Err(error) => return Err(self.with_staging_cleanup_error(error, staging).await),
+        };
+        if let Some(kind) = backup_kind {
+            let error = SftpTransferError::Sftp(format!(
                 "remote editor backup already exists with type {kind:?}: '{backup}'; refusing to overwrite recovery data"
-            )));
+            ));
+            return Err(self.with_staging_cleanup_error(error, staging).await);
         }
 
         let mut state_warning = None;
@@ -664,7 +718,32 @@ impl SftpHandle {
             .as_ref()
             .map(|error| error.message().to_string());
         match self.read_file_bounded(target, max_bytes).await {
-            Ok(current) if current.matches_bytes(contents) => {}
+            Ok(current) if current.matches_bytes(contents) => {
+                let actual_permissions = self
+                    .regular_file_permissions(target)
+                    .await
+                    .map_err(|error| {
+                        SftpTransferError::Sftp(format!(
+                            "remote editor promotion contents were verified but permissions could not be checked: {}; backup remains at '{backup}', staging path='{staging}'",
+                            error.message()
+                        ))
+                    })?;
+                if actual_permissions != permissions {
+                    return Err(SftpTransferError::Sftp(format!(
+                        "remote editor promotion installed unexpected permissions: expected {permissions:o}, found {actual_permissions:o}; backup remains at '{backup}', staging path='{staging}'"
+                    )));
+                }
+                if let Some(error) = promote_error.as_ref() {
+                    let staging_state = self.try_node_kind(staging).await;
+                    let backup_state = self.try_node_kind(&backup).await;
+                    if !can_accept_verified_promotion(&staging_state, &backup_state) {
+                        return Err(SftpTransferError::Sftp(format!(
+                            "remote editor promotion reply failed and completion could not be verified after '{}': staging={staging_state:?}, backup={backup_state:?}; target contents were matched but recovery data was preserved at backup='{backup}', staging='{staging}'",
+                            error.message()
+                        )));
+                    }
+                }
+            }
             Ok(current) => {
                 let observed = match current {
                     SftpBoundedFileRead::Complete(bytes) => {
@@ -712,17 +791,6 @@ impl SftpHandle {
                 ),
             );
         }
-        if promote_error_message.is_some() {
-            if let Err(error) = self.discard_file_staging(staging).await {
-                push_warning(
-                    &mut warning,
-                    format!(
-                        "target contents were verified but staging cleanup failed at '{staging}': {}",
-                        error.message()
-                    ),
-                );
-            }
-        }
         if let Err(error) = self.remove_file(&backup).await {
             push_warning(
                 &mut warning,
@@ -756,96 +824,11 @@ impl SftpHandle {
         }
     }
 
-    async fn replace_staged_entry_with_expected_kind(
-        &self,
-        staging: &str,
-        target: &str,
-        expected_backup_kind: Option<SftpNodeKind>,
-    ) -> Result<(), SftpTransferError> {
-        let backup = unique_sibling_path(target, "backup");
-        if let Err(err) = self.rename(target, &backup).await {
-            return Err(self
-                .with_replacement_staging_cleanup_error(err, staging, expected_backup_kind)
-                .await);
-        }
-
-        if let Some(expected_kind) = expected_backup_kind {
-            let validation_error = match self.node_kind(&backup).await {
-                Ok(actual_kind) if actual_kind == expected_kind => None,
-                Ok(actual_kind) => Some(SftpTransferError::Sftp(format!(
-                    "replacement target changed type before promotion: expected \
-                     {expected_kind:?}, found {actual_kind:?} at '{backup}'"
-                ))),
-                Err(error) => Some(SftpTransferError::Sftp(format!(
-                    "replacement target backup could not be inspected at '{}': {}",
-                    backup,
-                    error.message()
-                ))),
-            };
-            if let Some(validation_error) = validation_error {
-                let error = match self.rename(&backup, target).await {
-                    Ok(()) => validation_error,
-                    Err(rollback_error) => SftpTransferError::Sftp(format!(
-                        "{}; rollback failed: {}; backup remains at '{}'",
-                        validation_error.message(),
-                        rollback_error.message(),
-                        backup
-                    )),
-                };
-                return Err(self
-                    .with_replacement_staging_cleanup_error(error, staging, expected_backup_kind)
-                    .await);
-            }
-        }
-
-        if let Err(promote_error) = self.rename(staging, target).await {
-            let rollback = self.rename(&backup, target).await;
-            let error = match rollback {
-                Ok(()) => promote_error,
-                Err(rollback_error) => SftpTransferError::Sftp(format!(
-                    "promotion failed: {}; rollback failed: {}; backup remains at '{}'",
-                    promote_error.message(),
-                    rollback_error.message(),
-                    backup
-                )),
-            };
-            return Err(self
-                .with_replacement_staging_cleanup_error(error, staging, expected_backup_kind)
-                .await);
-        }
-        let kind = self.node_kind(&backup).await.map_err(|error| {
-            SftpTransferError::Sftp(format!(
-                "replacement succeeded but backup could not be inspected at '{}': {}",
-                backup,
-                error.message()
-            ))
-        })?;
-        if expected_backup_kind.is_some_and(|expected| expected != kind) {
-            return Err(SftpTransferError::Sftp(format!(
-                "replacement succeeded but backup changed type at '{backup}'; backup remains"
-            )));
-        }
-        let cleanup = if expected_backup_kind.is_some() {
-            self.remove_file(&backup).await
-        } else {
-            self.remove_tree(&backup, kind).await.map(|_| ())
-        };
-        cleanup.map_err(|error| {
-            SftpTransferError::Sftp(format!(
-                "replacement succeeded but backup cleanup failed at '{}': {}",
-                backup,
-                error.message()
-            ))
-        })?;
-        Ok(())
-    }
-
     /// Replace an existing regular remote file with bounded in-memory data.
     ///
     /// Contents are written to an exclusive, same-directory staging file and
-    /// closed before [`Self::replace_staged_entry`] performs the existing
-    /// backup-swap/rollback sequence. The target type is checked both before
-    /// staging and immediately before promotion. A failed staging write keeps
+    /// closed before the editor-specific backup-swap/rollback sequence. The target type is
+    /// checked both before staging and immediately before promotion. A failed staging write keeps
     /// the original error and appends any cleanup failure instead of silently
     /// discarding it. The target is read again after staging so the size/type
     /// limit still applies to force-save; when `expected_current` is present,
@@ -871,7 +854,7 @@ impl SftpHandle {
         attributes.permissions = Some(permissions);
 
         let staging = unique_sibling_path(target, "partial");
-        let mut remote = self
+        let mut remote = match self
             .sftp
             .open_with_flags_and_attributes(
                 &staging,
@@ -879,9 +862,15 @@ impl SftpHandle {
                 attributes,
             )
             .await
-            .map_err(|error| {
-                SftpTransferError::Sftp(format!("sftp create '{staging}' failed: {error}"))
-            })?;
+        {
+            Ok(remote) => remote,
+            Err(error) => {
+                let original =
+                    SftpTransferError::Sftp(format!("sftp create '{staging}' failed: {error}"));
+                let staging_state = self.try_node_kind(&staging).await;
+                return Err(staging_create_error(original, &staging, staging_state));
+            }
+        };
 
         let write_result: Result<(), SftpTransferError> = async {
             for chunk in contents.chunks(SFTP_READ_CHUNK_BYTES) {
@@ -936,32 +925,6 @@ impl SftpHandle {
 
         self.replace_staged_regular_file(&staging, target, contents, max_bytes, expected_current)
             .await
-    }
-
-    async fn with_replacement_staging_cleanup_error(
-        &self,
-        original: SftpTransferError,
-        staging: &str,
-        expected_backup_kind: Option<SftpNodeKind>,
-    ) -> SftpTransferError {
-        if expected_backup_kind.is_some() {
-            self.with_staging_cleanup_error(original, staging).await
-        } else {
-            self.with_entry_cleanup_error(original, staging).await
-        }
-    }
-
-    async fn with_entry_cleanup_error(
-        &self,
-        original: SftpTransferError,
-        staging: &str,
-    ) -> SftpTransferError {
-        let cleanup = match self.try_node_kind(staging).await {
-            Ok(None) => Ok(()),
-            Ok(Some(kind)) => self.remove_tree(staging, kind).await.map(|_| ()),
-            Err(error) => Err(error),
-        };
-        append_cleanup_error(original, cleanup, staging)
     }
 
     async fn with_staging_cleanup_error(
@@ -1274,6 +1237,26 @@ fn append_cleanup_error(
     }
 }
 
+fn staging_create_error(
+    original: SftpTransferError,
+    staging: &str,
+    staging_state: Result<Option<SftpNodeKind>, SftpTransferError>,
+) -> SftpTransferError {
+    match staging_state {
+        Ok(None) => original,
+        Ok(Some(kind)) => SftpTransferError::Sftp(format!(
+            "{}; the create reply failed but staging now exists as {kind:?} at '{staging}'; ownership is uncertain, so the path was preserved for manual recovery",
+            original.message()
+        )),
+        Err(probe_error) => SftpTransferError::Sftp(format!(
+            "{}; staging final state is uncertain at '{}': {}",
+            original.message(),
+            staging,
+            probe_error.message()
+        )),
+    }
+}
+
 fn split_parent_name(path: &str) -> Result<(&str, &str), SftpTransferError> {
     let trimmed = path.trim_end_matches('/');
     if trimmed.is_empty() || trimmed == "/" {
@@ -1497,5 +1480,41 @@ mod tests {
         assert!(!can_restore_verified_backup(&missing, &backup_error));
         let replaced = Ok(Some(SftpNodeKind::File));
         assert!(!can_restore_verified_backup(&replaced, &backup));
+    }
+
+    #[test]
+    fn lost_promotion_requires_missing_staging_and_regular_backup() {
+        let missing = Ok(None);
+        let backup = Ok(Some(SftpNodeKind::File));
+        assert!(can_accept_verified_promotion(&missing, &backup));
+
+        let staging_remains = Ok(Some(SftpNodeKind::File));
+        assert!(!can_accept_verified_promotion(&staging_remains, &backup));
+        let no_backup = Ok(None);
+        assert!(!can_accept_verified_promotion(&missing, &no_backup));
+        let staging_probe_failed = Err(SftpTransferError::Transport("timeout".into()));
+        assert!(!can_accept_verified_promotion(&staging_probe_failed, &backup));
+    }
+
+    #[test]
+    fn staging_create_failure_reports_observed_or_uncertain_state() {
+        let path = "/srv/project/.notes.md.mt-partial";
+        let existing = staging_create_error(
+            SftpTransferError::Sftp("create timed out".into()),
+            path,
+            Ok(Some(SftpNodeKind::File)),
+        );
+        assert!(existing.message().contains("create timed out"));
+        assert!(existing.message().contains("ownership is uncertain"));
+        assert!(existing.message().contains(path));
+
+        let uncertain = staging_create_error(
+            SftpTransferError::Sftp("create timed out".into()),
+            path,
+            Err(SftpTransferError::Transport("lstat timed out".into())),
+        );
+        assert!(uncertain.message().contains("create timed out"));
+        assert!(uncertain.message().contains("lstat timed out"));
+        assert!(uncertain.message().contains(path));
     }
 }

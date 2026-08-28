@@ -1028,12 +1028,17 @@ impl Workspace {
     /// 按键、没有「退回按键」的通路。取舍是:PTY 还没起来的空 pane 上按 Ctrl+F
     /// 什么也不发生 —— 那个 pane 本来也没有终端能收这个字节。
     fn on_terminal_search(&mut self, _: &TerminalSearch, window: &mut Window, cx: &mut Context<Self>) {
-        if yields_to_overlay(window, cx) {
-            return;
-        }
         if !self.terminal_page_active(cx) {
+            // 文档编辑器本身也是 `Input`,不能套用终端页的 typing guard,否则编辑器
+            // 获得焦点后 Ctrl+F 会被提前吞掉；真正的弹窗仍然必须优先处理快捷键。
+            if !overlay::allows(overlay::Yield::ToOverlay) {
+                return;
+            }
             self.workbench_area
                 .update(cx, |area, cx| area.search_active_document(window, cx));
+            return;
+        }
+        if yields_to_overlay(window, cx) {
             return;
         }
         let Some((project_id, pane_id)) = self.target_pane(cx) else {
