@@ -435,7 +435,7 @@ fn split_md_blocks(source: &str) -> Vec<MdSegment> {
     }
     let Some(children) = ast.children() else {
         return markdown_text_only(source);
-    }
+    };
 
     let mut nodes = Vec::with_capacity(children.len());
     let mut previous_end = 0usize;
