@@ -267,17 +267,56 @@ pub struct BranchInfo {
     pub commit_hash: String,
 }
 
+/// 仓库发现允许越过**项目根**往上爬的层数(项目是 monorepo 子目录时仓库在项目根之上)。
 const MAX_DISCOVER_PARENTS: usize = 5;
 
-fn discover_repo_limited(start: &Path) -> Option<Repository> {
-    let mut ceiling = start.to_path_buf();
-    for _ in 0..MAX_DISCOVER_PARENTS {
-        match ceiling.parent() {
-            Some(p) if p != ceiling => ceiling = p.to_path_buf(),
+/// 为 `project_path` 下的文件 `abs_file` 找它所属的仓库。
+///
+/// 起点是文件所在目录、向上搜;搜索上界锚在 **项目根再往上 [`MAX_DISCOVER_PARENTS`] 级**。
+/// 两个坑都踩过,别改回去:
+///
+/// 1. **上界不能按文件算。** 旧实现拿文件往上数 5 级当 ceiling,文件嵌得越深、ceiling 就
+///    越可能落在仓库根**以内**——`src/pages/task/my/my.vue` 往上 5 级正好是仓库根,diff
+///    直接报「找不到仓库」(issue #58);凡是仓库根以下 ≥4 层目录的文件全中招。锚在项目根
+///    上,能不能找到就与文件深度无关了。
+/// 2. **libgit2 的 ceiling 是排他的**:走到 ceiling 目录本身即停、不检查它(`repository.c`
+///    的 `path.ptr[ceiling_offset] == 0` 即 break)。要让「往上 N 级」都被查到,ceiling 得取
+///    第 N+1 级。
+///
+/// 起点从文件所在目录出发而不是直接开项目根,是为了让嵌套子仓库里的文件找到离它最近的
+/// 那个仓库(文件树的「查看变更」标签就是按最近仓库算的)。目录已随文件一起被删掉时回退
+/// 到最近一个还存在的祖先——libgit2 会对起点做 realpath,不存在直接报错。
+fn discover_repo_for(project_path: &Path, abs_file: &Path) -> Option<Repository> {
+    let start = abs_file
+        .ancestors()
+        .skip(1)
+        .find(|p| p.is_dir())
+        .unwrap_or(project_path);
+    open_repo_within(start, project_path)
+}
+
+/// 项目根所属的仓库:从项目根本身向上找,上界同样是项目根再往上 [`MAX_DISCOVER_PARENTS`] 级。
+fn discover_repo_limited(project_path: &Path) -> Option<Repository> {
+    open_repo_within(project_path, project_path)
+}
+
+/// 从 `start` 向上找仓库,最多找到 `anchor` 往上 [`MAX_DISCOVER_PARENTS`] 级为止
+/// (libgit2 的 ceiling 排他,故取第 N+1 级)。
+fn open_repo_within(start: &Path, anchor: &Path) -> Option<Repository> {
+    let ceiling = nth_parent(anchor, MAX_DISCOVER_PARENTS + 1);
+    Repository::open_ext(start, RepositoryOpenFlags::empty(), &[&ceiling]).ok()
+}
+
+/// `path` 往上 `n` 级的祖先;不够 `n` 级就停在根(或相对路径的顶层)。
+fn nth_parent(path: &Path, n: usize) -> PathBuf {
+    let mut cur = path;
+    for _ in 0..n {
+        match cur.parent() {
+            Some(p) if !p.as_os_str().is_empty() => cur = p,
             _ => break,
         }
     }
-    Repository::open_ext(start, RepositoryOpenFlags::empty(), &[&ceiling]).ok()
+    cur.to_path_buf()
 }
 
 #[derive(Clone)]
@@ -1014,11 +1053,12 @@ pub fn get_git_diff(
 ) -> Result<GitDiffResult> {
     let abs_file = project_path.join(file_path);
 
-    let repo = discover_repo_limited(&abs_file).ok_or_else(|| {
+    let repo = discover_repo_for(project_path, &abs_file).ok_or_else(|| {
         anyhow!(
-            "no git repository found within {} parents of {}",
+            "no git repository found for {} (searched up to {} parents above {})",
+            abs_file.display(),
             MAX_DISCOVER_PARENTS,
-            abs_file.display()
+            project_path.display()
         )
     })?;
     let workdir = repo
@@ -1685,5 +1725,115 @@ mod tests {
         let missing = std::env::temp_dir().join(format!("mini-term-git-commit-absent-{ts}"));
         let err = git_commit(&missing, "msg").unwrap_err().to_string();
         assert!(err.contains("不是有效目录"), "实际错误: {err}");
+    }
+
+    /// 用 git2 搭一个只有一次提交、只含 `rel` 一个文件的仓库,返回仓库根。
+    ///
+    /// 非 Windows 上对根做 canonicalize:libgit2 会对路径做 realpath,macOS 的
+    /// `/var` → `/private/var` 会让「文件相对 workdir 的路径」算歪。Windows 不做——
+    /// canonicalize 会带上 `\\?\` 前缀,而临时目录本来也没有符号链接。
+    fn init_repo_with_file(tag: &str, rel: &str, content: &str) -> PathBuf {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("mini-term-git-{tag}-{ts}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = if cfg!(windows) {
+            root
+        } else {
+            std::fs::canonicalize(&root).unwrap()
+        };
+        let repo = Repository::init(&root).unwrap();
+        let abs = root.join(rel);
+        std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
+        std::fs::write(&abs, content).unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new(rel)).unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("mini-term", "test@example.com").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+            .unwrap();
+        root
+    }
+
+    fn diff_lines(result: &GitDiffResult) -> Vec<(String, String)> {
+        result
+            .hunks
+            .iter()
+            .flat_map(|h| h.lines.iter())
+            .map(|l| (l.kind.clone(), l.content.clone()))
+            .collect()
+    }
+
+    fn old_to_new() -> Vec<(String, String)> {
+        vec![
+            ("delete".to_string(), "old".to_string()),
+            ("add".to_string(), "new".to_string()),
+        ]
+    }
+
+    /// issue #58:仓库根以下 ≥4 层目录的文件,旧实现按文件往上数 5 级当 ceiling 会停在
+    /// 仓库根以内(而 libgit2 的 ceiling 排他),diff 直接报「找不到仓库」。
+    /// 能不能找到仓库必须与文件深度无关。
+    #[test]
+    fn diff_finds_repo_for_deeply_nested_file() {
+        let rel = "src/pages/task/my/my.vue";
+        let root = init_repo_with_file("deep", rel, "old\n");
+        std::fs::write(root.join(rel), "new\n").unwrap();
+        let result = get_git_diff(&root, rel, Some(false)).unwrap();
+        assert_eq!(diff_lines(&result), old_to_new());
+        std::fs::remove_dir_all(&root).ok();
+
+        // 比 MAX_DISCOVER_PARENTS 深得多也一样
+        let rel = "a/b/c/d/e/f/g/h/i/j.txt";
+        let root = init_repo_with_file("deeper", rel, "old\n");
+        std::fs::write(root.join(rel), "new\n").unwrap();
+        let result = get_git_diff(&root, rel, Some(false)).unwrap();
+        assert_eq!(diff_lines(&result), old_to_new());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 项目是 monorepo 的子目录(仓库在项目根之上):文件树的「查看变更」传的是项目根,
+    /// 仍要能找到上面的仓库,且文件相对 workdir 的路径算对(HEAD 内容取得到)。
+    #[test]
+    fn diff_finds_repo_above_project_root() {
+        let rel_in_repo = "packages/app/src/pages/task/my/my.vue";
+        let root = init_repo_with_file("monorepo", rel_in_repo, "old\n");
+        std::fs::write(root.join(rel_in_repo), "new\n").unwrap();
+        let project = root.join("packages").join("app");
+        let result = get_git_diff(&project, "src/pages/task/my/my.vue", Some(false)).unwrap();
+        assert_eq!(diff_lines(&result), old_to_new());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 文件连同所在目录一起被删、删除已暂存:起点目录不存在时得回退到还存在的祖先,
+    /// 否则 libgit2 对起点做 realpath 就报错了。
+    #[test]
+    fn diff_of_staged_deletion_survives_missing_directory() {
+        let rel = "src/pages/task/my/my.vue";
+        let root = init_repo_with_file("deleted", rel, "old\n");
+        std::fs::remove_dir_all(root.join("src")).unwrap();
+        {
+            let repo = Repository::open(&root).unwrap();
+            let mut index = repo.index().unwrap();
+            index.remove_path(Path::new(rel)).unwrap();
+            index.write().unwrap();
+        }
+        let result = get_git_diff(&root, rel, Some(true)).unwrap();
+        assert_eq!(
+            diff_lines(&result),
+            vec![("delete".to_string(), "old".to_string())]
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn nth_parent_stops_at_root() {
+        let p = Path::new("/a/b/c");
+        assert_eq!(nth_parent(p, 1), PathBuf::from("/a/b"));
+        assert_eq!(nth_parent(p, 3), PathBuf::from("/"));
+        assert_eq!(nth_parent(p, 10), PathBuf::from("/"));
     }
 }
