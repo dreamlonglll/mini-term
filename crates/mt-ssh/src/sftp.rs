@@ -394,10 +394,7 @@ impl SftpHandle {
     /// target proves an existing regular backup is stale cleanup residue from a
     /// committed save; remove it and verify absence before creating staging.
     /// Missing/uncertain targets and unexpected backup types remain fail-closed.
-    async fn prepare_file_replacement_state(
-        &self,
-        target: &str,
-    ) -> Result<(), SftpTransferError> {
+    async fn prepare_file_replacement_state(&self, target: &str) -> Result<(), SftpTransferError> {
         let backup = editor_backup_path(target)?;
         let target_kind = self.try_node_kind(target).await?;
         let backup_kind = self.try_node_kind(&backup).await?;
@@ -1506,10 +1503,7 @@ mod tests {
     #[test]
     fn committed_target_classifies_regular_backup_as_stale_cleanup_residue() {
         assert_eq!(
-            stale_editor_backup_kind(
-                Some(SftpNodeKind::File),
-                Some(SftpNodeKind::File)
-            ),
+            stale_editor_backup_kind(Some(SftpNodeKind::File), Some(SftpNodeKind::File)),
             Some(SftpNodeKind::File)
         );
         assert_eq!(
@@ -1518,10 +1512,7 @@ mod tests {
             "missing targets must preserve ambiguous recovery data"
         );
         assert_eq!(
-            stale_editor_backup_kind(
-                Some(SftpNodeKind::Directory),
-                Some(SftpNodeKind::File)
-            ),
+            stale_editor_backup_kind(Some(SftpNodeKind::Directory), Some(SftpNodeKind::File)),
             None,
             "invalid targets must not authorize backup deletion"
         );
@@ -1530,10 +1521,7 @@ mod tests {
             None
         );
         assert_eq!(
-            stale_editor_backup_kind(
-                Some(SftpNodeKind::File),
-                Some(SftpNodeKind::Directory)
-            ),
+            stale_editor_backup_kind(Some(SftpNodeKind::File), Some(SftpNodeKind::Directory)),
             Some(SftpNodeKind::Directory),
             "the caller must see and refuse an unexpected backup type"
         );

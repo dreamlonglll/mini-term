@@ -3705,17 +3705,15 @@ mod tests {
 
     fn contains_raw_markdown_html(node: &MarkdownNode) -> bool {
         matches!(node, MarkdownNode::Html(_))
-            || node.children().is_some_and(|children| {
-                children.iter().any(contains_raw_markdown_html)
-            })
+            || node
+                .children()
+                .is_some_and(|children| children.iter().any(contains_raw_markdown_html))
     }
 
     fn contains_network_loading_markdown_construct(node: &MarkdownNode) -> bool {
         matches!(
             node,
-            MarkdownNode::Html(_)
-                | MarkdownNode::Image(_)
-                | MarkdownNode::ImageReference(_)
+            MarkdownNode::Html(_) | MarkdownNode::Image(_) | MarkdownNode::ImageReference(_)
         ) || node.children().is_some_and(|children| {
             children
                 .iter()
@@ -3731,9 +3729,9 @@ mod tests {
                 | MarkdownNode::LinkReference(_)
                 | MarkdownNode::Image(_)
                 | MarkdownNode::ImageReference(_)
-        ) || node.children().is_some_and(|children| {
-            children.iter().any(contains_active_markdown_construct)
-        })
+        ) || node
+            .children()
+            .is_some_and(|children| children.iter().any(contains_active_markdown_construct))
     }
 
     fn visible_backslash_escaped_source(value: &str) -> String {

@@ -295,11 +295,7 @@ pub fn is_document_active(source: &DocumentSource, cx: &App) -> bool {
 /// that happened to be active before the close. The active project and page
 /// are resolved at handoff time, and `FileViewer::on_activated` performs the
 /// final identity/overlay checks again in the deferred callback.
-pub fn reactivate_active_document(
-    expected_project_id: &str,
-    window: &mut Window,
-    cx: &mut App,
-) {
+pub fn reactivate_active_document(expected_project_id: &str, window: &mut Window, cx: &mut App) {
     let Some(area) = global(cx) else {
         return;
     };
