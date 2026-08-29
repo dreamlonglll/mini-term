@@ -349,6 +349,17 @@ fn remote_refresh_failure_presentation(
     }
 }
 
+fn refresh_warning_after_remote_save(
+    current: Option<String>,
+    save_succeeded: bool,
+) -> Option<String> {
+    if save_succeeded {
+        None
+    } else {
+        current
+    }
+}
+
 /// 自己落盘的回声窗口:保存后 2s 内的 `fs-change` 不算「外部修改」
 /// (`FileViewerModal.tsx:280`)。
 ///
@@ -971,6 +982,8 @@ struct MarkdownReplacement {
     value: String,
 }
 
+const MAX_UNTRUSTED_MARKDOWN_SANITIZE_PASSES: usize = 4;
+
 fn markdown_plain_text(node: &MarkdownNode) -> String {
     match node {
         MarkdownNode::Image(image) => image.alt.clone(),
@@ -1092,12 +1105,10 @@ fn markdown_as_indented_code(source: &str) -> String {
         .join("\n")
 }
 
-fn sanitize_untrusted_markdown(source: &str) -> String {
-    let Ok(ast) = markdown::to_mdast(source, &ParseOptions::gfm()) else {
-        return markdown_as_indented_code(source);
-    };
-    let mut replacements = Vec::new();
-    collect_untrusted_markdown_replacements(&ast, &mut replacements);
+fn apply_markdown_replacements(
+    source: &str,
+    mut replacements: Vec<MarkdownReplacement>,
+) -> String {
     replacements.sort_unstable_by_key(|replacement| std::cmp::Reverse(replacement.start));
 
     let mut sanitized = source.to_string();
@@ -1113,6 +1124,37 @@ fn sanitize_untrusted_markdown(source: &str) -> String {
         next_start = replacement.start;
     }
     sanitized
+}
+
+/// Keep reparsing transformed Markdown until the renderer's own GFM grammar
+/// sees no disallowed nodes. Escaping an HTML block can change the following
+/// indented block into active Markdown, so a single AST generation is not a
+/// sufficient security boundary.
+fn sanitize_untrusted_markdown_with_pass_limit(source: &str, pass_limit: usize) -> String {
+    let mut sanitized = source.to_string();
+    for _ in 0..pass_limit {
+        let Ok(ast) = markdown::to_mdast(&sanitized, &ParseOptions::gfm()) else {
+            return markdown_as_indented_code(source);
+        };
+        let mut replacements = Vec::new();
+        collect_untrusted_markdown_replacements(&ast, &mut replacements);
+        if replacements.is_empty() {
+            return sanitized;
+        }
+        sanitized = apply_markdown_replacements(&sanitized, replacements);
+    }
+
+    // A transformed document is safe to render only after reparsing proves it
+    // has no active replacements. If the bounded loop cannot establish that
+    // fixed point, keep the original source visible as inert code.
+    markdown_as_indented_code(source)
+}
+
+fn sanitize_untrusted_markdown(source: &str) -> String {
+    sanitize_untrusted_markdown_with_pass_limit(
+        source,
+        MAX_UNTRUSTED_MARKDOWN_SANITIZE_PASSES,
+    )
 }
 
 /// Remote rich-text is untrusted input from another machine. Parse with the
@@ -1452,6 +1494,7 @@ fn html_url_attributes(
 /// Historical lexical sanitizer retained for focused regression tests. It is
 /// not a security boundary: untrusted Markdown raw HTML is made inert by AST
 /// replacement, and standalone remote HTML never enters the rich renderer.
+#[cfg(test)]
 fn sanitize_untrusted_html_urls(
     source: &str,
     allow_external_links: bool,
@@ -1494,7 +1537,7 @@ fn sanitize_untrusted_html_urls(
 }
 
 /// Legacy test helper for the former remote-HTML preview path.
-#[allow(dead_code)]
+#[cfg(test)]
 fn sanitize_remote_html_urls(source: &str) -> String {
     sanitize_untrusted_html_urls(source, true, false)
 }
@@ -2577,6 +2620,14 @@ impl FileViewer {
                         if view.remote_source_invalid {
                             return;
                         }
+                        let save_succeeded = matches!(
+                            &outcome,
+                            Ok(crate::remote_ssh::RemoteFileSaveResult::Saved { .. })
+                        );
+                        view.refresh_warning = refresh_warning_after_remote_save(
+                            view.refresh_warning.take(),
+                            save_succeeded,
+                        );
                         match outcome {
                             Ok(crate::remote_ssh::RemoteFileSaveResult::Saved {
                                 baseline,
@@ -3795,6 +3846,19 @@ mod tests {
     }
 
     #[test]
+    fn 远程保存只有成功才清除刷新警告() {
+        let warning = Some("refresh failed".to_string());
+        assert_eq!(
+            refresh_warning_after_remote_save(warning.clone(), false),
+            warning
+        );
+        assert_eq!(
+            refresh_warning_after_remote_save(Some("refresh failed".to_string()), true),
+            None
+        );
+    }
+
+    #[test]
     fn 表格分段_基本两列表() {
         let src = "前文\n\n| 文件 | 职责 |\n|---|---|\n| `a.rs` | 说明 A |\n| b.rs | 说明 B |\n\n后文";
         let segs = split_md_blocks(src);
@@ -4622,6 +4686,78 @@ mod tests {
                 assert!(unsafe_nodes.is_empty(), "{sanitized}");
             }
         }
+    }
+
+    #[test]
+    fn html_block_type_1到5后的缩进活动载荷会清洗到不动点() {
+        let html_blocks = [
+            "<pre></pre>",
+            "<style></style>",
+            "<!-- comment -->",
+            "<?php ?>",
+            "<!DOCTYPE html>",
+            "<![CDATA[value]]>",
+        ];
+        let indented_payloads = [
+            "![network](https://attacker.example/image.png)",
+            "[local](file:///etc/passwd)",
+            "![local](file:///etc/passwd)",
+            r#"<img src="https://attacker.example/raw.png">"#,
+            r#"<a href="file:///etc/passwd">open</a>"#,
+        ];
+
+        for html_block in html_blocks {
+            for payload in indented_payloads {
+                let source = format!("{html_block}\n    {payload}\n");
+                for sanitized in [
+                    sanitize_remote_markdown(&source),
+                    sanitize_session_markdown(&source),
+                ] {
+                    assert_ne!(
+                        sanitized,
+                        markdown_as_indented_code(&source),
+                        "正常审核载荷应在轮次上限内收敛:{source}"
+                    );
+                    let ast = markdown::to_mdast(&sanitized, &ParseOptions::gfm())
+                        .expect("fixed-point Markdown must remain parseable");
+                    let mut replacements = Vec::new();
+                    collect_untrusted_markdown_replacements(&ast, &mut replacements);
+                    assert!(replacements.is_empty(), "{source}\n---\n{sanitized}");
+                    assert!(
+                        !contains_active_markdown_construct(&ast),
+                        "{source}\n---\n{sanitized}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn markdown清洗超出轮次时整篇降级为可见代码块() {
+        let source = concat!(
+            "<!-- comment -->\n",
+            "    ![network](https://attacker.example/image.png)\n",
+        );
+        let sanitized = sanitize_untrusted_markdown_with_pass_limit(source, 1);
+        assert_eq!(sanitized, markdown_as_indented_code(source));
+
+        let ast = markdown::to_mdast(&sanitized, &ParseOptions::gfm())
+            .expect("fallback Markdown must remain parseable");
+        let mut replacements = Vec::new();
+        collect_untrusted_markdown_replacements(&ast, &mut replacements);
+        assert!(replacements.is_empty(), "{sanitized}");
+        assert!(!contains_active_markdown_construct(&ast), "{sanitized}");
+    }
+
+    #[test]
+    fn 已安全markdown在首轮不动点保持原文() {
+        let source = concat!(
+            "# 标题\n\n",
+            "正文 [docs](https://example.com/docs)\n\n",
+            "`<img src=\"https://example.com/code.png\">`\n",
+        );
+        assert_eq!(sanitize_remote_markdown(source), source);
+        assert_eq!(sanitize_session_markdown(source), source);
     }
 
     #[test]
