@@ -32,11 +32,12 @@
 //!    `cx.open_url(&link.url)`(`text/node.rs:622`、`text/inline.rs:359`),没有回调口。
 //!    于是原版三条链接处置(外链弹确认框 / 文档内锚点滚动 / 本地文件在页内跳转)
 //!    都做不到,**页内跳转历史栈(`←` 返回)随之整条不做**。记档。
-//! 2. **HTML 是简版渲染,不是浏览器**:GPUI 侧没有 iframe 等价物,`TextView::html`
+//! 2. **本地 HTML 是简版渲染,不是浏览器**:GPUI 侧没有 iframe 等价物,`TextView::html`
 //!    与 markdown 那支是同一个富文本渲染器(无 CSS / 无 JS)。此处曾按规格 B.6.3
 //!    的建议「只留源码编辑器」,**已翻案**(用户要求):现在给预览态,但配一条
 //!    说明 + 工具栏常驻「用浏览器打开」——走样的排版有解释、真效果有出口,
-//!    比对着一屏源码有用。相对资源不再是问题,见 [`rewrite_html_urls`]。
+//!    比对着一屏源码有用。相对资源不再是问题,见 [`rewrite_html_urls`]。远程
+//!    HTML 属于不可信输入，只走源码编辑器，不进入富文本 HTML 渲染器。
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -325,6 +326,27 @@ pub fn branch_of(is_img: bool, loading: bool, has_error: bool, result: Option<&F
 /// `canEdit = !!result && !isBinary && !tooLarge && !isImg`(`FileViewerModal.tsx:244`)。
 pub fn can_edit(is_img: bool, result: Option<&FileContentResult>) -> bool {
     !is_img && matches!(result, Some(r) if !r.is_binary && !r.too_large)
+}
+
+fn supports_rich_preview(is_remote: bool, path: &str) -> bool {
+    is_markdown_file(path) || (!is_remote && is_html_file(path))
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RemoteRefreshFailurePresentation {
+    Fatal,
+    Warning,
+}
+
+fn remote_refresh_failure_presentation(
+    has_loaded_result: bool,
+    has_editor: bool,
+) -> RemoteRefreshFailurePresentation {
+    if has_loaded_result || has_editor {
+        RemoteRefreshFailurePresentation::Warning
+    } else {
+        RemoteRefreshFailurePresentation::Fatal
+    }
 }
 
 /// 自己落盘的回声窗口:保存后 2s 内的 `fs-change` 不算「外部修改」
@@ -949,22 +971,6 @@ struct MarkdownReplacement {
     value: String,
 }
 
-#[derive(Clone, Copy)]
-struct MarkdownSanitizePolicy {
-    allow_html_external_links: bool,
-    allow_html_external_resources: bool,
-}
-
-const REMOTE_MARKDOWN_POLICY: MarkdownSanitizePolicy = MarkdownSanitizePolicy {
-    allow_html_external_links: true,
-    allow_html_external_resources: false,
-};
-
-const SESSION_MARKDOWN_POLICY: MarkdownSanitizePolicy = MarkdownSanitizePolicy {
-    allow_html_external_links: false,
-    allow_html_external_resources: false,
-};
-
 fn markdown_plain_text(node: &MarkdownNode) -> String {
     match node {
         MarkdownNode::Image(image) => image.alt.clone(),
@@ -1004,10 +1010,25 @@ fn markdown_replacement(node: &MarkdownNode, value: String) -> Option<MarkdownRe
     })
 }
 
+/// Turn an untrusted raw-HTML AST node into visible Markdown text. Escape every
+/// ASCII punctuation character so a second GFM parse cannot recreate either an
+/// `mdast::Html` node or Markdown links/images hidden inside an attribute value.
+/// Backslash escapes render as the original punctuation, preserving readable
+/// source without giving the replacement any active Markdown syntax.
+fn inert_markdown_html_source(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_punctuation() {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
 fn collect_untrusted_markdown_replacements(
     node: &MarkdownNode,
     replacements: &mut Vec<MarkdownReplacement>,
-    policy: MarkdownSanitizePolicy,
 ) {
     match node {
         MarkdownNode::Link(link) if !remote_markdown_url_allowed(&link.url) => {
@@ -1038,13 +1059,8 @@ fn collect_untrusted_markdown_replacements(
             return;
         }
         MarkdownNode::Html(html) => {
-            let sanitized = sanitize_untrusted_html_urls(
-                &html.value,
-                policy.allow_html_external_links,
-                policy.allow_html_external_resources,
-            );
-            if sanitized != html.value
-                && let Some(replacement) = markdown_replacement(node, sanitized)
+            if let Some(replacement) =
+                markdown_replacement(node, inert_markdown_html_source(&html.value))
             {
                 replacements.push(replacement);
             }
@@ -1055,7 +1071,7 @@ fn collect_untrusted_markdown_replacements(
 
     if let Some(children) = node.children() {
         for child in children {
-            collect_untrusted_markdown_replacements(child, replacements, policy);
+            collect_untrusted_markdown_replacements(child, replacements);
         }
     }
 }
@@ -1065,7 +1081,7 @@ fn collect_remote_markdown_replacements(
     node: &MarkdownNode,
     replacements: &mut Vec<MarkdownReplacement>,
 ) {
-    collect_untrusted_markdown_replacements(node, replacements, REMOTE_MARKDOWN_POLICY);
+    collect_untrusted_markdown_replacements(node, replacements);
 }
 
 fn markdown_as_indented_code(source: &str) -> String {
@@ -1076,12 +1092,12 @@ fn markdown_as_indented_code(source: &str) -> String {
         .join("\n")
 }
 
-fn sanitize_markdown_with_policy(source: &str, policy: MarkdownSanitizePolicy) -> String {
+fn sanitize_untrusted_markdown(source: &str) -> String {
     let Ok(ast) = markdown::to_mdast(source, &ParseOptions::gfm()) else {
         return markdown_as_indented_code(source);
     };
     let mut replacements = Vec::new();
-    collect_untrusted_markdown_replacements(&ast, &mut replacements, policy);
+    collect_untrusted_markdown_replacements(&ast, &mut replacements);
     replacements.sort_unstable_by_key(|replacement| std::cmp::Reverse(replacement.start));
 
     let mut sanitized = source.to_string();
@@ -1101,19 +1117,20 @@ fn sanitize_markdown_with_policy(source: &str, policy: MarkdownSanitizePolicy) -
 
 /// Remote rich-text is untrusted input from another machine. Parse with the
 /// same GFM AST used by `TextView::markdown`, then replace disallowed links,
-/// images, reference definitions, and real raw-HTML nodes by source byte range.
-/// AST positions cover multiline destinations and keep fenced/indented/inline
-/// code out of scope.
+/// images, and reference definitions by source byte range. Every real raw-HTML
+/// node becomes visible inert source; AST positions keep fenced/indented/inline
+/// code byte-for-byte out of scope.
 fn sanitize_remote_markdown(source: &str) -> String {
-    sanitize_markdown_with_policy(source, REMOTE_MARKDOWN_POLICY)
+    sanitize_untrusted_markdown(source)
 }
 
 /// AI session logs are untrusted rich text and share the process-wide preview
-/// HTTP client. Preserve Markdown formatting and explicit links, but turn every
-/// image into plain alt text so opening a history entry cannot read local files
-/// or issue background network requests.
+/// HTTP client. Preserve Markdown formatting and explicit Markdown links, turn
+/// every image into plain alt text, and make raw HTML visible but inert so
+/// opening a history entry cannot read local files or issue background network
+/// requests.
 pub fn sanitize_session_markdown(source: &str) -> String {
-    sanitize_markdown_with_policy(source, SESSION_MARKDOWN_POLICY)
+    sanitize_untrusted_markdown(source)
 }
 
 /// 把 HTML 源里 `src` / `href` / `poster` 的**本地**目标改写成 `file:///…`。
@@ -1432,10 +1449,9 @@ fn html_url_attributes(
     attrs
 }
 
-/// Sanitize rich-text HTML attributes before they reach the process-wide preview
-/// HTTP client. Explicit links and automatically loaded resources are separate
-/// capabilities: callers may keep deliberate web navigation while still
-/// blocking every `src` / `poster` request.
+/// Historical lexical sanitizer retained for focused regression tests. It is
+/// not a security boundary: untrusted Markdown raw HTML is made inert by AST
+/// replacement, and standalone remote HTML never enters the rich renderer.
 fn sanitize_untrusted_html_urls(
     source: &str,
     allow_external_links: bool,
@@ -1477,9 +1493,8 @@ fn sanitize_untrusted_html_urls(
     out
 }
 
-/// Remote HTML keeps explicit web/mail/tel/fragment links, but never loads an
-/// external resource automatically. Local paths and script-like schemes are
-/// blocked as well.
+/// Legacy test helper for the former remote-HTML preview path.
+#[allow(dead_code)]
 fn sanitize_remote_html_urls(source: &str) -> String {
     sanitize_untrusted_html_urls(source, true, false)
 }
@@ -1874,6 +1889,10 @@ pub struct FileViewer {
     loading: bool,
     remote_refreshing: bool,
     error: Option<String>,
+    /// A re-activation refresh failed after usable content was already loaded.
+    /// Keep it separate from `error`: the latter selects the full-page fatal
+    /// branch, while this warning must leave the editor/draft visible.
+    refresh_warning: Option<String>,
     result: Option<FileContentResult>,
     /// 编辑器实体。**换文件 / 显式重载才重建** —— `set_value` 会清撤销栈,
     /// 「预览 ↔ 源码」来回切只是不画它,草稿与撤销栈都留着
@@ -1965,6 +1984,7 @@ impl FileViewer {
             loading: false,
             remote_refreshing: false,
             error: None,
+            refresh_warning: None,
             result: None,
             editor: None,
             saved: String::new(),
@@ -2017,16 +2037,16 @@ impl FileViewer {
         self.dirty
     }
 
-    /// 「预览 / 源码」段控件的显示条件:`(isMd || isHtml) && canEdit`
-    /// (`FileViewerModal.tsx:355`,与原版同口径)。
+    /// 「预览 / 源码」段控件的显示条件:Markdown 始终允许，本地 HTML 允许，
+    /// 远程 HTML 只走源码；最后都必须满足 `canEdit`。
     ///
-    /// HTML 那一半曾经被摘掉(模块注释偏差 2 的旧结论:没有 iframe 等价物,
+    /// 本地 HTML 那一半曾经被摘掉(模块注释偏差 2 的旧结论:没有 iframe 等价物,
     /// 富文本渲染器画出来的东西「比不提供更误导人」)。现在**改为提供** ——
     /// 见 [`Self::render_html`]:简版渲染 + 顶上一条说明 + 工具栏常驻
     /// 「用浏览器打开」,把真效果的出口摆明,比只给一屏源码有用。
     fn has_preview_toggle(&self) -> bool {
         let path = self.path_str();
-        (is_markdown_file(&path) || is_html_file(&path))
+        supports_rich_preview(self.source.is_remote(), &path)
             && can_edit(self.renders_local_image(), self.result.as_ref())
     }
 
@@ -2040,6 +2060,7 @@ impl FileViewer {
             return;
         }
         self.remote_refreshing = false;
+        self.refresh_warning = None;
         self.rewatch();
         self.load_generation = self.load_generation.wrapping_add(1);
         let generation = self.load_generation;
@@ -2175,6 +2196,7 @@ impl FileViewer {
         let path = self.current_path.clone();
         let remote_path = path.to_string_lossy().into_owned();
         self.remote_refreshing = true;
+        self.refresh_warning = None;
         self.error = None;
         cx.notify();
 
@@ -2196,6 +2218,7 @@ impl FileViewer {
                 }
                 match outcome {
                     Ok(content) => {
+                        view.refresh_warning = None;
                         let editable = view.editor.is_some()
                             && !content.content.is_binary
                             && !content.content.too_large;
@@ -2212,13 +2235,30 @@ impl FileViewer {
                             // explicit reload/overwrite decision used by save.
                             view.remote_conflict = Some(content);
                         } else {
+                            let save_warning = view.save_warning.clone();
                             view.apply_remote_content(content, window, cx);
+                            // A successful refresh resolves only the refresh
+                            // warning. A prior committed-save cleanup warning
+                            // remains actionable until the next save/reload.
+                            view.save_warning = save_warning;
                         }
                     }
                     Err(error) => {
-                        view.error = Some(error);
-                        if view.can_take_async_focus(window, cx) {
-                            view.focus.focus(window);
+                        match remote_refresh_failure_presentation(
+                            view.result.is_some(),
+                            view.editor.is_some(),
+                        ) {
+                            RemoteRefreshFailurePresentation::Warning => {
+                                view.refresh_warning = Some(error);
+                                view.error = None;
+                            }
+                            RemoteRefreshFailurePresentation::Fatal => {
+                                view.refresh_warning = None;
+                                view.error = Some(error);
+                                if view.can_take_async_focus(window, cx) {
+                                    view.focus.focus(window);
+                                }
+                            }
                         }
                     }
                 }
@@ -2243,6 +2283,7 @@ impl FileViewer {
         self.preview_draft = None;
         self.save_error = None;
         self.save_warning = None;
+        self.refresh_warning = None;
 
         if can_edit(self.is_img(), Some(&res)) {
             let name = self.file_name();
@@ -2899,6 +2940,24 @@ impl FileViewer {
                         .child(format!("{}: {}", t("fileViewer", "saveWarning"), warning)),
                 )
             })
+            .when_some(self.refresh_warning.clone(), |el, warning| {
+                el.child(
+                    div()
+                        .px(px(16.0))
+                        .py(px(6.0))
+                        .border_b_1()
+                        .border_color(ui::border_subtle())
+                        .bg(ui::with_alpha(ui::color_warning(), 0.15))
+                        .text_size(ui::font_px(12.0))
+                        .text_color(ui::color_warning())
+                        .truncate()
+                        .child(format!(
+                            "{}: {}",
+                            t("fileViewer", "refreshWarning"),
+                            warning
+                        )),
+                )
+            })
             .when(
                 self.remote_conflict.is_some() && !self.remote_source_invalid,
                 |el| {
@@ -3447,7 +3506,7 @@ impl FileViewer {
             .into_any_element()
     }
 
-    /// HTML 预览。**富文本简版渲染,不是浏览器** —— GPUI 侧没有 iframe 等价物,
+    /// Trusted local HTML preview. **富文本简版渲染,不是浏览器** —— GPUI 侧没有 iframe 等价物,
     /// `TextView::html` 与 markdown 那支是同一个渲染器:标题 / 段落 / 列表 /
     /// 表格 / 图片 / 链接认得,CSS 与脚本一概不跑,带样式的页面会走样。
     ///
@@ -3456,11 +3515,8 @@ impl FileViewer {
     /// 图片与其它本地资源靠 [`rewrite_html_urls`] 转 `file://`(原版是
     /// `convertFileSrc`),由 [`PreviewHttpClient`] 读盘。
     fn render_html(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let source = if self.source.is_remote() {
-            sanitize_remote_html_urls(self.preview_source())
-        } else {
-            rewrite_html_urls(self.preview_source(), &self.preview_base_dir())
-        };
+        debug_assert!(!self.source.is_remote());
+        let source = rewrite_html_urls(self.preview_source(), &self.preview_base_dir());
         let style = self.preview_text_style(cx);
         div()
             .id("file-viewer-html")
@@ -3647,6 +3703,52 @@ mod tests {
         }
     }
 
+    fn contains_raw_markdown_html(node: &MarkdownNode) -> bool {
+        matches!(node, MarkdownNode::Html(_))
+            || node.children().is_some_and(|children| {
+                children.iter().any(contains_raw_markdown_html)
+            })
+    }
+
+    fn contains_network_loading_markdown_construct(node: &MarkdownNode) -> bool {
+        matches!(
+            node,
+            MarkdownNode::Html(_)
+                | MarkdownNode::Image(_)
+                | MarkdownNode::ImageReference(_)
+        ) || node.children().is_some_and(|children| {
+            children
+                .iter()
+                .any(contains_network_loading_markdown_construct)
+        })
+    }
+
+    fn contains_active_markdown_construct(node: &MarkdownNode) -> bool {
+        matches!(
+            node,
+            MarkdownNode::Html(_)
+                | MarkdownNode::Link(_)
+                | MarkdownNode::LinkReference(_)
+                | MarkdownNode::Image(_)
+                | MarkdownNode::ImageReference(_)
+        ) || node.children().is_some_and(|children| {
+            children.iter().any(contains_active_markdown_construct)
+        })
+    }
+
+    fn visible_backslash_escaped_source(value: &str) -> String {
+        let mut chars = value.chars().peekable();
+        let mut visible = String::with_capacity(value.len());
+        while let Some(ch) = chars.next() {
+            if ch == '\\' && chars.peek().is_some_and(|next| next.is_ascii_punctuation()) {
+                visible.push(chars.next().expect("peeked punctuation must remain"));
+            } else {
+                visible.push(ch);
+            }
+        }
+        visible
+    }
+
     #[test]
     fn 文件类型三条判定与原版正则同口径() {
         assert!(is_markdown_file("D:\\a\\README.md"));
@@ -3668,6 +3770,30 @@ mod tests {
 
         // 没有扩展名一律不是
         assert!(!is_markdown_file("Makefile") && !is_image_file("Makefile"));
+    }
+
+    #[test]
+    fn 远程_html_只走源码而本地_html_保留预览() {
+        assert!(supports_rich_preview(false, "index.html"));
+        assert!(!supports_rich_preview(true, "index.html"));
+        assert!(supports_rich_preview(false, "README.md"));
+        assert!(supports_rich_preview(true, "README.md"));
+    }
+
+    #[test]
+    fn 远程刷新失败仅在没有已加载内容时进入致命错误页() {
+        assert_eq!(
+            remote_refresh_failure_presentation(false, false),
+            RemoteRefreshFailurePresentation::Fatal
+        );
+        assert_eq!(
+            remote_refresh_failure_presentation(true, false),
+            RemoteRefreshFailurePresentation::Warning
+        );
+        assert_eq!(
+            remote_refresh_failure_presentation(false, true),
+            RemoteRefreshFailurePresentation::Warning
+        );
     }
 
     #[test]
@@ -4392,35 +4518,49 @@ mod tests {
             assert!(!html.contains("src=\"https://evil.test"), "{html}");
 
             let markdown = sanitize_remote_markdown(source);
-            assert!(markdown.contains(r#"src="about:blank""#), "{markdown}");
-            assert!(!markdown.contains("src=\"https://evil.test"), "{markdown}");
+            let ast = markdown::to_mdast(&markdown, &ParseOptions::gfm())
+                .expect("sanitized Markdown must remain parseable");
+            assert!(!contains_raw_markdown_html(&ast), "{markdown}");
+            assert!(
+                !contains_network_loading_markdown_construct(&ast),
+                "{markdown}"
+            );
+            assert_eq!(visible_backslash_escaped_source(&markdown), source);
         }
 
         let raw_text = concat!(
             r#"<textarea /><img src="https://example.com/text-example.png"></textarea>"#,
             r#"<img src="https://evil.test/after-textarea.png">"#,
         );
-        for sanitized in [
-            sanitize_remote_html_urls(raw_text),
-            sanitize_remote_markdown(raw_text),
-        ] {
-            assert!(
-                sanitized.contains("https://example.com/text-example.png"),
-                "{sanitized}"
-            );
-            assert!(sanitized.contains(r#"src="about:blank""#), "{sanitized}");
-            assert!(
-                !sanitized.contains("https://evil.test/after-textarea.png"),
-                "{sanitized}"
-            );
-        }
+        let scanned = sanitize_remote_html_urls(raw_text);
+        assert!(
+            scanned.contains("https://example.com/text-example.png"),
+            "{scanned}"
+        );
+        assert!(scanned.contains(r#"src="about:blank""#), "{scanned}");
+        assert!(
+            !scanned.contains("https://evil.test/after-textarea.png"),
+            "{scanned}"
+        );
+
+        let markdown = sanitize_remote_markdown(raw_text);
+        assert_eq!(visible_backslash_escaped_source(&markdown), raw_text);
+        let ast = markdown::to_mdast(&markdown, &ParseOptions::gfm())
+            .expect("sanitized Markdown must remain parseable");
+        assert!(!contains_raw_markdown_html(&ast), "{markdown}");
+        assert!(
+            !contains_network_loading_markdown_construct(&ast),
+            "{markdown}"
+        );
     }
 
     #[test]
-    fn markdown_html_只清洗真实_ast_节点() {
+    fn markdown_html_只降级真实_ast_节点并保留代码原文() {
         let source = concat!(
             "`<img src=\"https://example.com/inline.png\">`\n\n",
+            "`<Widget src=\"file:///tmp/widget\" />`\n\n",
             "```html\n<a href=\"file:///tmp/example\">example</a>\n```\n\n",
+            "```jsx\n<Component href=\"file:///tmp/component\" />\n```\n\n",
             "<pre>\n&lt;img src=\"https://example.com/pre-example.png\"&gt;\n</pre>\n\n",
             "<!-- <img src=\"https://example.com/comment-example.png\"> -->\n\n",
             "<script>const demo = '<img src=\"https://example.com/script-example.png\">';</script>\n\n",
@@ -4436,34 +4576,54 @@ mod tests {
             "{sanitized}"
         );
         assert!(
+            sanitized.contains("`<Widget src=\"file:///tmp/widget\" />`"),
+            "{sanitized}"
+        );
+        assert!(
             sanitized.contains("```html\n<a href=\"file:///tmp/example\">example</a>\n```"),
             "{sanitized}"
         );
         assert!(
-            sanitized.contains("&lt;img src=\"https://example.com/pre-example.png\"&gt;"),
+            sanitized.contains("```jsx\n<Component href=\"file:///tmp/component\" />\n```"),
             "{sanitized}"
         );
+        assert_eq!(visible_backslash_escaped_source(&sanitized), source);
+
+        let ast = markdown::to_mdast(&sanitized, &ParseOptions::gfm())
+            .expect("sanitized Markdown must remain parseable");
+        assert!(!contains_raw_markdown_html(&ast), "{sanitized}");
         assert!(
-            sanitized.contains("<!-- <img src=\"https://example.com/comment-example.png\"> -->"),
+            !contains_network_loading_markdown_construct(&ast),
             "{sanitized}"
         );
-        assert!(
-            sanitized
-                .contains("const demo = '<img src=\"https://example.com/script-example.png\">'"),
-            "{sanitized}"
-        );
-        assert!(
-            sanitized.contains(r#"<img src="about:blank">"#),
-            "{sanitized}"
-        );
-        assert!(
-            sanitized.contains(r##"<a href="#">local</a>"##),
-            "{sanitized}"
-        );
-        assert!(
-            sanitized.contains(r#"<a href="https://example.com/docs">web</a>"#),
-            "{sanitized}"
-        );
+    }
+
+    #[test]
+    fn 审核载荷在远程与会话_markdown中都不能形成活动_html() {
+        for payload in [
+            r#"<div><select><title></select><img src="https://attacker.example/beacon.png"></title></div>"#,
+            r#"<select><plaintext></select><img src="https://attacker.example/b2.png"><a href="file:///C:/Windows/notepad.exe">open</a>"#,
+            r#"<template><col><title></template><img src="https://attacker.example/b3.png"></title>"#,
+            r#"<div data-example="![beacon](https://attacker.example/b4.png)"></div>"#,
+        ] {
+            for sanitized in [
+                sanitize_remote_markdown(payload),
+                sanitize_session_markdown(payload),
+            ] {
+                assert_eq!(visible_backslash_escaped_source(&sanitized), payload);
+                let ast = markdown::to_mdast(&sanitized, &ParseOptions::gfm())
+                    .expect("sanitized Markdown must remain parseable");
+                assert!(!contains_raw_markdown_html(&ast), "{sanitized}");
+                assert!(
+                    !contains_network_loading_markdown_construct(&ast),
+                    "{sanitized}"
+                );
+                assert!(!contains_active_markdown_construct(&ast), "{sanitized}");
+                let mut unsafe_nodes = Vec::new();
+                collect_untrusted_markdown_replacements(&ast, &mut unsafe_nodes);
+                assert!(unsafe_nodes.is_empty(), "{sanitized}");
+            }
+        }
     }
 
     #[test]
@@ -4497,14 +4657,13 @@ mod tests {
             r##"<img src="https://example.com/html.png"><img src="file:///etc/group"><a href="https://example.com/html">html</a><a href="#section">anchor</a>"##,
         );
         let sanitized = sanitize_session_markdown(source);
-        assert!(!sanitized.contains("file:///"), "{sanitized}");
+        let visible = visible_backslash_escaped_source(&sanitized);
         assert!(
-            !sanitized.contains("src=\"https://example.com/html.png"),
-            "{sanitized}"
+            visible.contains(
+                r##"<img src="https://example.com/html.png"><img src="file:///etc/group"><a href="https://example.com/html">html</a><a href="#section">anchor</a>"##,
+            ),
+            "raw HTML 源码应保持可见:{sanitized}"
         );
-        assert!(sanitized.contains("src=\"about:blank\""), "{sanitized}");
-        assert!(sanitized.contains("href=\"#\""), "{sanitized}");
-        assert!(!sanitized.contains("#section"), "{sanitized}");
         assert!(
             sanitized.contains("`<img src=\"https://example.com/code-inline.png\">`"),
             "{sanitized}"
@@ -4520,8 +4679,9 @@ mod tests {
 
         let ast = markdown::to_mdast(&sanitized, &ParseOptions::gfm())
             .expect("sanitized session markdown must remain parseable");
+        assert!(!contains_raw_markdown_html(&ast), "{sanitized}");
         let mut unsafe_nodes = Vec::new();
-        collect_untrusted_markdown_replacements(&ast, &mut unsafe_nodes, SESSION_MARKDOWN_POLICY);
+        collect_untrusted_markdown_replacements(&ast, &mut unsafe_nodes);
         assert!(unsafe_nodes.is_empty(), "{sanitized}");
     }
 

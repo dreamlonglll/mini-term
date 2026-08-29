@@ -123,6 +123,45 @@ fn can_accept_verified_promotion(
     matches!(staging_state, Ok(None)) && matches!(backup_state, Ok(Some(SftpNodeKind::File)))
 }
 
+fn stale_editor_backup_kind(
+    target_kind: Option<SftpNodeKind>,
+    backup_kind: Option<SftpNodeKind>,
+) -> Option<SftpNodeKind> {
+    match (target_kind, backup_kind) {
+        (Some(SftpNodeKind::File), Some(kind)) => Some(kind),
+        _ => None,
+    }
+}
+
+fn verify_stale_editor_backup_cleanup(
+    backup: &str,
+    remove_error: Option<SftpTransferError>,
+    backup_state: Result<Option<SftpNodeKind>, SftpTransferError>,
+) -> Result<(), SftpTransferError> {
+    match backup_state {
+        Ok(None) => Ok(()),
+        Ok(Some(kind)) => {
+            let remove_detail = remove_error
+                .as_ref()
+                .map(|error| format!("; remove failed: {}", error.message()))
+                .unwrap_or_default();
+            Err(SftpTransferError::Sftp(format!(
+                "stale remote editor backup cleanup did not remove '{backup}' (remaining type {kind:?}){remove_detail}"
+            )))
+        }
+        Err(probe_error) => {
+            let remove_detail = remove_error
+                .as_ref()
+                .map(|error| format!("remove failed: {}; ", error.message()))
+                .unwrap_or_default();
+            Err(SftpTransferError::Sftp(format!(
+                "stale remote editor backup cleanup state is uncertain at '{backup}': {remove_detail}verification failed: {}",
+                probe_error.message()
+            )))
+        }
+    }
+}
+
 /// 打开在某条 session 上的 SFTP 会话句柄。可跨多次操作复用;用完调 [`Self::close`]
 /// (或直接 drop,底层 channel 随之关闭,close 只是显式礼貌收尾)。
 pub struct SftpHandle {
@@ -330,10 +369,8 @@ impl SftpHandle {
     }
 
     /// Refuse an ambiguous deterministic editor backup instead of restoring it
-    /// automatically. `target missing + backup present` can mean either an
-    /// interrupted isolation or an old backup left after a committed save whose
-    /// cleanup failed and whose target was later intentionally deleted. SFTP has
-    /// no transaction marker that can distinguish those histories safely.
+    /// automatically. Read-side validation uses this non-mutating guard;
+    /// replacement performs stale-backup cleanup separately before staging.
     ///
     /// The caller must already have canonicalized and root-checked the parent.
     /// Recovery data is deliberately kept in place for explicit/manual action.
@@ -351,6 +388,36 @@ impl SftpHandle {
         } else {
             Ok(())
         }
+    }
+
+    /// Prepare the deterministic backup name for a new replacement. A regular
+    /// target proves an existing regular backup is stale cleanup residue from a
+    /// committed save; remove it and verify absence before creating staging.
+    /// Missing/uncertain targets and unexpected backup types remain fail-closed.
+    async fn prepare_file_replacement_state(
+        &self,
+        target: &str,
+    ) -> Result<(), SftpTransferError> {
+        let backup = editor_backup_path(target)?;
+        let target_kind = self.try_node_kind(target).await?;
+        let backup_kind = self.try_node_kind(&backup).await?;
+        if let Some(kind) = ambiguous_editor_recovery_kind(target_kind, backup_kind) {
+            return Err(SftpTransferError::Sftp(format!(
+                "remote editor recovery state is ambiguous: target '{target}' is missing and recovery data ({kind:?}) remains at '{backup}'; automatic restore was refused"
+            )));
+        }
+        let Some(stale_kind) = stale_editor_backup_kind(target_kind, backup_kind) else {
+            return Ok(());
+        };
+        if stale_kind != SftpNodeKind::File {
+            return Err(SftpTransferError::Sftp(format!(
+                "remote editor backup has unexpected type {stale_kind:?} at '{backup}'; refusing to remove recovery data"
+            )));
+        }
+
+        let remove_error = self.remove_file(&backup).await.err();
+        let backup_state = self.try_node_kind(&backup).await;
+        verify_stale_editor_backup_cleanup(&backup, remove_error, backup_state)
     }
 
     async fn regular_file_permissions(&self, path: &str) -> Result<u32, SftpTransferError> {
@@ -846,7 +913,7 @@ impl SftpHandle {
                 "remote file contents exceed the {max_bytes}-byte limit"
             )));
         }
-        self.guard_file_replacement_state(target).await?;
+        self.prepare_file_replacement_state(target).await?;
         ensure_regular_file(self.node_kind(target).await?, target)?;
         let permissions = self.regular_file_permissions(target).await?;
         let mut attributes = FileAttributes::empty();
@@ -1434,6 +1501,78 @@ mod tests {
             None
         );
         assert_eq!(ambiguous_editor_recovery_kind(None, None), None);
+    }
+
+    #[test]
+    fn committed_target_classifies_regular_backup_as_stale_cleanup_residue() {
+        assert_eq!(
+            stale_editor_backup_kind(
+                Some(SftpNodeKind::File),
+                Some(SftpNodeKind::File)
+            ),
+            Some(SftpNodeKind::File)
+        );
+        assert_eq!(
+            stale_editor_backup_kind(None, Some(SftpNodeKind::File)),
+            None,
+            "missing targets must preserve ambiguous recovery data"
+        );
+        assert_eq!(
+            stale_editor_backup_kind(
+                Some(SftpNodeKind::Directory),
+                Some(SftpNodeKind::File)
+            ),
+            None,
+            "invalid targets must not authorize backup deletion"
+        );
+        assert_eq!(
+            stale_editor_backup_kind(Some(SftpNodeKind::File), None),
+            None
+        );
+        assert_eq!(
+            stale_editor_backup_kind(
+                Some(SftpNodeKind::File),
+                Some(SftpNodeKind::Directory)
+            ),
+            Some(SftpNodeKind::Directory),
+            "the caller must see and refuse an unexpected backup type"
+        );
+    }
+
+    #[test]
+    fn stale_backup_cleanup_requires_verified_absence() {
+        let path = "/srv/project/.notes.md.mt-editor-backup";
+        assert!(
+            verify_stale_editor_backup_cleanup(path, None, Ok(None)).is_ok(),
+            "verified absence permits the next save"
+        );
+        assert!(
+            verify_stale_editor_backup_cleanup(
+                path,
+                Some(SftpTransferError::Transport("lost reply".into())),
+                Ok(None),
+            )
+            .is_ok(),
+            "a lost remove reply is harmless once absence is verified"
+        );
+
+        let remains = verify_stale_editor_backup_cleanup(
+            path,
+            Some(SftpTransferError::Sftp("permission denied".into())),
+            Ok(Some(SftpNodeKind::File)),
+        )
+        .unwrap_err();
+        assert!(remains.message().contains("permission denied"));
+        assert!(remains.message().contains("remaining type File"));
+
+        let uncertain = verify_stale_editor_backup_cleanup(
+            path,
+            None,
+            Err(SftpTransferError::Transport("lstat timeout".into())),
+        )
+        .unwrap_err();
+        assert!(uncertain.message().contains("state is uncertain"));
+        assert!(uncertain.message().contains("lstat timeout"));
     }
 
     #[test]

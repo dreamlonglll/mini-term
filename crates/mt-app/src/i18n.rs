@@ -299,6 +299,7 @@ const USED_KEYS: &[&str] = &[
     "fileViewer.remoteImageClickToLoad",
     "fileViewer.remoteReadOnly",
     "fileViewer.remoteRelativeImage",
+    "fileViewer.refreshWarning",
     "fileViewer.save",
     "fileViewer.saveFailed",
     "fileViewer.saveWarning",

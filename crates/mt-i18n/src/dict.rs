@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 32;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 839;
+pub const ZH_ENTRY_COUNT: usize = 840;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 839;
+pub const EN_ENTRY_COUNT: usize = 840;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -400,6 +400,7 @@ static FILE_VIEWER_ZH: &[(&str, &str)] = &[
     ("openWithDefaultApp", "使用默认工具打开"),
     ("preview", "预览"),
     ("projectRemovalBlocked", "该项目仍有未保存的文件，请先保存或关闭这些页签后再移除项目。"),
+    ("refreshWarning", "远程刷新失败，已保留当前内容"),
     ("reloadDiscard", "重新加载（丢弃修改）"),
     ("remoteConnectionChanged", "SSH 连接配置已变化，此页签已失效；请关闭后重新打开文件。"),
     ("remoteDownloadHint", "此类远程文件暂不支持内置预览，可下载后查看。"),
@@ -429,6 +430,7 @@ static FILE_VIEWER_EN: &[(&str, &str)] = &[
     ("openWithDefaultApp", "Open with default app"),
     ("preview", "Preview"),
     ("projectRemovalBlocked", "This project still has unsaved files. Save or close those tabs before removing the project."),
+    ("refreshWarning", "Remote refresh failed; current content was kept"),
     ("reloadDiscard", "Reload (discard changes)"),
     ("remoteConnectionChanged", "The SSH connection changed. Close this tab and reopen the file."),
     ("remoteDownloadHint", "This remote file cannot be previewed here yet. Download it to view it."),

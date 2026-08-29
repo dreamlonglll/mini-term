@@ -289,13 +289,23 @@ impl SearchModal {
                 .timer(result_preview_close_delay())
                 .await;
             let _ = this.update_in(cx, |this: &mut SearchModal, window, cx| {
-                if this.close_generation != generation
-                    || this.search_project.as_ref() != Some(&expected_project)
-                    || this.project_snapshot(cx).as_ref() != Some(&expected_project)
-                {
+                let active_project = this.project_snapshot(cx);
+                if !preview_close_context_matches(
+                    this.close_generation,
+                    generation,
+                    this.search_project.as_ref(),
+                    active_project.as_ref(),
+                    &expected_project,
+                ) {
                     return;
                 }
-                close_guarded(kind::GLOBAL_SEARCH, window, cx);
+                if close_guarded(kind::GLOBAL_SEARCH, window, cx) {
+                    crate::workbench_area::reactivate_active_document(
+                        &expected_project.0,
+                        window,
+                        cx,
+                    );
+                }
             });
         }));
     }
@@ -427,6 +437,18 @@ pub fn result_action(click_count: usize) -> ResultAction {
     } else {
         ResultAction::Preview
     }
+}
+
+fn preview_close_context_matches(
+    current_generation: u64,
+    expected_generation: u64,
+    search_project: Option<&(String, PathBuf)>,
+    active_project: Option<&(String, PathBuf)>,
+    expected_project: &(String, PathBuf),
+) -> bool {
+    current_generation == expected_generation
+        && search_project == Some(expected_project)
+        && active_project == Some(expected_project)
 }
 
 /// 往结果集里追加一批,总数封顶在 `cap`。
@@ -908,6 +930,41 @@ mod tests {
         assert_eq!(result_action(1), ResultAction::Preview);
         assert_eq!(result_action(2), ResultAction::ExternalEditor);
         assert_eq!(result_action(3), ResultAction::ExternalEditor);
+    }
+
+    #[test]
+    fn 延迟关闭只在同一代搜索与同一活动项目中交还焦点() {
+        let expected = ("project-a".to_string(), PathBuf::from("/project-a"));
+        assert!(preview_close_context_matches(
+            7,
+            7,
+            Some(&expected),
+            Some(&expected),
+            &expected,
+        ));
+
+        let other = ("project-b".to_string(), PathBuf::from("/project-b"));
+        assert!(!preview_close_context_matches(
+            8,
+            7,
+            Some(&expected),
+            Some(&expected),
+            &expected,
+        ));
+        assert!(!preview_close_context_matches(
+            7,
+            7,
+            Some(&expected),
+            Some(&other),
+            &expected,
+        ));
+        assert!(!preview_close_context_matches(
+            7,
+            7,
+            Some(&other),
+            Some(&expected),
+            &expected,
+        ));
     }
 
     /// 满了就整批丢弃(不是丢最旧的),没满只取装得下的前几条。

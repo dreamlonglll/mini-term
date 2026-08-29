@@ -291,6 +291,23 @@ pub fn is_document_active(source: &DocumentSource, cx: &App) -> bool {
             .is_some_and(|project| project.active == WorkbenchPage::Document(key))
 }
 
+/// Restore focus after a modal overlay closes without capturing the document
+/// that happened to be active before the close. The active project and page
+/// are resolved at handoff time, and `FileViewer::on_activated` performs the
+/// final identity/overlay checks again in the deferred callback.
+pub fn reactivate_active_document(
+    expected_project_id: &str,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(area) = global(cx) else {
+        return;
+    };
+    area.update(cx, |area, cx| {
+        area.reactivate_active_document(expected_project_id, window, cx)
+    });
+}
+
 /// 文件页签宿主。
 pub struct WorkbenchArea {
     store: Entity<AppStore>,
@@ -426,6 +443,25 @@ impl WorkbenchArea {
             });
         });
         cx.notify();
+    }
+
+    fn reactivate_active_document(
+        &mut self,
+        expected_project_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.store.read(cx).active_project_id.as_deref() != Some(expected_project_id) {
+            return;
+        }
+        let Some(WorkbenchPage::Document(key)) = self
+            .projects
+            .get(expected_project_id)
+            .map(|project| project.active.clone())
+        else {
+            return;
+        };
+        self.activate_document(expected_project_id, &key, window, cx);
     }
 
     pub fn search_active_document(&mut self, window: &mut Window, cx: &mut Context<Self>) {
