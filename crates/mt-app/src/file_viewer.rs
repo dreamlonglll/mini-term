@@ -353,11 +353,7 @@ fn refresh_warning_after_remote_save(
     current: Option<String>,
     save_succeeded: bool,
 ) -> Option<String> {
-    if save_succeeded {
-        None
-    } else {
-        current
-    }
+    if save_succeeded { None } else { current }
 }
 
 /// 自己落盘的回声窗口:保存后 2s 内的 `fs-change` 不算「外部修改」
@@ -1105,10 +1101,7 @@ fn markdown_as_indented_code(source: &str) -> String {
         .join("\n")
 }
 
-fn apply_markdown_replacements(
-    source: &str,
-    mut replacements: Vec<MarkdownReplacement>,
-) -> String {
+fn apply_markdown_replacements(source: &str, mut replacements: Vec<MarkdownReplacement>) -> String {
     replacements.sort_unstable_by_key(|replacement| std::cmp::Reverse(replacement.start));
 
     let mut sanitized = source.to_string();
@@ -1151,10 +1144,7 @@ fn sanitize_untrusted_markdown_with_pass_limit(source: &str, pass_limit: usize) 
 }
 
 fn sanitize_untrusted_markdown(source: &str) -> String {
-    sanitize_untrusted_markdown_with_pass_limit(
-        source,
-        MAX_UNTRUSTED_MARKDOWN_SANITIZE_PASSES,
-    )
+    sanitize_untrusted_markdown_with_pass_limit(source, MAX_UNTRUSTED_MARKDOWN_SANITIZE_PASSES)
 }
 
 /// Remote rich-text is untrusted input from another machine. Parse with the
