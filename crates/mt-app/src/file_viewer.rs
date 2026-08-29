@@ -1192,6 +1192,7 @@ fn rewrite_html_urls(source: &str, base_dir: &Path) -> String {
 struct HtmlUrlAttribute {
     value_start: usize,
     value_end: usize,
+    #[cfg(test)]
     name: &'static str,
 }
 
@@ -1461,6 +1462,7 @@ fn html_url_attributes(
                 attrs.push(HtmlUrlAttribute {
                     value_start,
                     value_end,
+                    #[cfg(test)]
                     name,
                 });
             }
