@@ -1458,12 +1458,12 @@ fn html_url_attributes(
                 }
                 None => (cursor, cursor),
             };
-            if let Some(name) = name {
+            if let Some(_name) = name {
                 attrs.push(HtmlUrlAttribute {
                     value_start,
                     value_end,
                     #[cfg(test)]
-                    name,
+                    name: _name,
                 });
             }
         }
