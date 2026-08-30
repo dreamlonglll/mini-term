@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.1.5-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.1.6-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -82,7 +82,7 @@ Mini-Term 就是为这件事做的：项目列表上的状态灯实时跳动，A
 ### 🌐 远程目录当本地项目用，WSL 也一样
 
 - **SSH 远程项目** — 服务器上的目录直接添加成项目：文件树经 SFTP 懒加载，终端 `ssh -t` 直连并自动落到项目目录，断线后覆盖层一键重连，远程机器上的 Claude / Codex 历史会话也能读出正文。远程缓存键掺入连接 id，两台服务器上的同名路径不会串数据
-- **远程文件管理** — 远程文件树支持复制 / 粘贴 / 上传 / 下载，从资源管理器拖文件进来就是上传；同名冲突可跳过、覆盖或生成副本，弹窗列出具体文件名。下载默认进系统下载目录、可在设置中自选；添加远程项目时可用远程目录选择器直接浏览挑目录，右键还能在终端打开远程目录
+- **远程文件管理** — 远程文件树支持复制 / 粘贴 / 上传 / 下载，从资源管理器拖文件进来就是上传，文件栏顶部还有上传文件 / 文件夹、粘贴、新建文件 / 文件夹的快捷按钮；同名冲突可跳过、覆盖或生成副本，弹窗列出具体文件名。下载默认进系统下载目录、可在设置中自选；添加远程项目时可用远程目录选择器直接浏览挑目录，右键还能在终端打开远程目录
 - **WSL 支持** — `\\wsl$\<distro>\<path>` 直接当项目根，自动改用 `wsl.exe --cd` 启动，`pwd` 真的落在 WSL 里而不是 `C:\Windows`；Windows 下还能直接读 WSL 发行版内的 Claude / Codex 会话历史
 
 ### 🪟 多项目 · 递归分屏 · 会话历史
@@ -110,8 +110,8 @@ VS Code 风格的 **Changes 面板**（Staged / Changes / Untracked 分组，单
 | **图片粘贴** | 剪贴板里有截图自动检测，存成临时 PNG 并粘路径，兼容 PinPix 等非标准格式 |
 | **远程自动落地** | 上面两种粘贴在 SSH 远程项目里会经 SFTP 传到远端再粘**远端**路径；WSL 项目自动把 `C:\...` 换算成 `/mnt/c/...` |
 | **文件拖拽** | 从文件树或资源管理器拖文件到终端，插入带引号的绝对路径，精准落到目标分屏 |
-| **内置文件编辑器** | 文件树点开即改：tree-sitter 语法高亮（30+ 语言），查找替换，`Ctrl+S` 原子落盘，外部改动自动感知 |
-| **文档预览** | Markdown / HTML 预览里的图片真的会显示——相对路径按文件所在目录解析，网络图直接拉回来（10s 超时 + 32MB 上限，其余协议一律拒）。HTML 另有一个「用浏览器打开」，走 https 协议关联而不是 `.html` 的文件关联 |
+| **文件工作区** | 文件树点开的本地 / 远程文件在主区页签里查看、编辑、保存，与终端并列切换：tree-sitter 语法高亮（30+ 语言），查找替换，`Ctrl+S` 原子落盘，外部改动自动感知；远程文件经 SFTP 读写，保存前比对基线，冲突时可重载或强制覆盖，也能直接下载 |
+| **文档预览** | Markdown / HTML 预览里的图片真的会显示——相对路径按文件所在目录解析，网络图直接拉回来（10s 超时 + 32MB 上限，其余协议一律拒）。远程文件的 Markdown 先清洗再渲染：原始 HTML 按源码显示、外链图片点击才加载、`file://` 之类的链接降级为纯文本；远程 HTML 只提供源码查看。HTML 另有一个「用浏览器打开」，走 https 协议关联而不是 `.html` 的文件关联 |
 | **全局搜索** | `Ctrl+Shift+F` 唤起，文件名 / 内容双模式（文件名含 `/` 即按路径匹配），子串或正则，后端流式推送随时可取消 |
 | **项目级环境变量** | 按项目注入 PTY 子进程，严格 POSIX 校验，Rust 端二次防御，WSL 下经 WSLENV 透传 |
 | **智能 Ctrl+C/V** | 可选开启：有选区时复制、无选区时中断程序；Windows 大段粘贴自动分块防 ConPTY 丢行 |
@@ -138,7 +138,7 @@ VS Code 风格的 **Changes 面板**（Staged / Changes / Untracked 分组，单
 | Git / 文件 | git2（libgit2）· notify + ignore |
 | 用量统计 | rusqlite 本地账本 · 自绘趋势图 |
 | 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`） |
-| 测试 | **1629 个 Rust 测试**（28 个测试目标） |
+| 测试 | **1665 个 Rust 测试**（28 个测试目标） |
 
 ---
 

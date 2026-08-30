@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.1.5-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.1.6-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -80,7 +80,7 @@ Right-click a project → "Link SSH", tick the connections, and it's enabled for
 ### 🌐 Remote directories as local projects — and WSL too
 
 - **SSH remote projects** — add a directory on a server as a project directly: the file tree lazy-loads over SFTP, the terminal connects via `ssh -t` and lands straight in the project directory, a one-click overlay reconnects after a drop, and the remote machine's Claude / Codex history is readable with full content. Remote cache keys mix in the connection id, so identical paths on two servers never cross-contaminate
-- **Remote file management** — the remote file tree supports copy / paste / upload / download, and dragging files in from Explorer uploads them; name conflicts can be skipped, overwritten, or kept as copies, with the affected names listed in the dialog. Downloads land in the system Downloads folder by default (configurable in Settings); a remote directory picker lets you browse for the path when adding a remote project, and a context-menu action opens a remote directory in the terminal
+- **Remote file management** — the remote file tree supports copy / paste / upload / download, dragging files in from Explorer uploads them, and the file panel header has shortcut buttons for uploading files / folders, pasting, and creating files / folders; name conflicts can be skipped, overwritten, or kept as copies, with the affected names listed in the dialog. Downloads land in the system Downloads folder by default (configurable in Settings); a remote directory picker lets you browse for the path when adding a remote project, and a context-menu action opens a remote directory in the terminal
 - **WSL support** — `\\wsl$\<distro>\<path>` works as a project root, launching switches to `wsl.exe --cd` automatically so `pwd` really lands inside WSL instead of `C:\Windows`; Windows can also read Claude / Codex session history from inside WSL distros directly
 
 ### 🪟 Multi-project · recursive splits · session history
@@ -108,8 +108,8 @@ A VS Code-style **Changes panel** (Staged / Changes / Untracked groups, per-file
 | **Image paste** | Screenshots in the clipboard are detected, saved as a temp PNG, and pasted as a path; handles non-standard formats like PinPix |
 | **Remote-aware landing** | Both of the above remap in remote terminals: SSH projects upload over SFTP and paste the **remote** path; WSL projects rewrite `C:\...` into `/mnt/c/...` |
 | **File drag & drop** | Drag from the file tree or Explorer onto the terminal to insert a quoted absolute path, landing in the exact split pane |
-| **Built-in file editor** | Click any file in the tree to edit in place: tree-sitter syntax highlighting (30+ languages), find & replace, atomic `Ctrl+S` saves, external-change detection |
-| **Document preview** | Images actually render in the Markdown / HTML preview: relative paths resolve against the file's own directory, and remote images are fetched for real (10s timeout, 32MB cap, every other scheme refused). HTML previews also get an "Open in browser" button that resolves through the https protocol handler rather than the `.html` file association |
+| **File workbench** | Local and remote files opened from the tree live in main-area tabs alongside the terminal, where you view, edit, and save them: tree-sitter syntax highlighting (30+ languages), find & replace, atomic `Ctrl+S` saves, external-change detection; remote files are read and written over SFTP, every save is checked against the loaded baseline, conflicts offer reload or force-overwrite, and any remote file can be downloaded |
+| **Document preview** | Images actually render in the Markdown / HTML preview: relative paths resolve against the file's own directory, and remote images are fetched for real (10s timeout, 32MB cap, every other scheme refused). Markdown from remote files is sanitized before rendering: raw HTML shows as source, external images load only on click, and `file://`-style links degrade to plain text; remote HTML is source-view only. HTML previews also get an "Open in browser" button that resolves through the https protocol handler rather than the `.html` file association |
 | **Global search** | `Ctrl+Shift+F` for filename or content search (a `/` in the query matches against the path), substring or regex, streamed from the backend and cancellable anytime |
 | **Per-project env vars** | Injected into the PTY child process per project, with strict POSIX validation and a second defensive filter on the Rust side; passes through to WSL via WSLENV |
 | **Smart Ctrl+C/V** | Optional: copy when there's a selection, interrupt the program when there isn't; large Windows pastes are chunked so ConPTY doesn't drop lines |
@@ -136,7 +136,7 @@ The whole application is **native Rust**:
 | Git / files | git2 (libgit2) · notify + ignore |
 | Usage stats | rusqlite local ledger · hand-drawn trend charts |
 | Mobile relay | axum + tokio WebSocket (`relay-server/`) · React + Vite PWA (`mobile/`) |
-| Tests | **1,629 Rust tests** (28 test targets) |
+| Tests | **1,665 Rust tests** (28 test targets) |
 
 ---
 
