@@ -289,13 +289,24 @@ pub(crate) enum SmartAction {
 /// 逐条照抄原版 `attachCustomKeyEventHandler` 的第三段:
 /// `mod = ctrlKey || metaKey`,且**不带 Shift / Alt**;`KeyC` 有选区才接管
 /// (没选区 `return true` = 透传 SIGINT,这是这个功能的全部意义),`KeyV` 一律接管。
+///
+/// # macOS 上 ⌘ 不受 `enabled` 管
+///
+/// 这个开关存在的理由是 Windows / Linux 上 ^C 必须发 SIGINT、^V 是 literal-next,
+/// 拿它们当复制粘贴要用户自己权衡。**macOS 没有这个冲突** —— ⌘ 根本不是终端修饰键,
+/// 中断走的是物理 Control+C,两个键位互不相干。Terminal.app / iTerm2 / Ghostty /
+/// WezTerm 一律 ⌘C / ⌘V 无条件生效,这里对齐。
+///
+/// 只放行 `platform`,不动 `control`:Windows 上 `platform` 是 Win 键(Win+V 是系统
+/// 剪贴板历史),那边维持原样由开关管。
 pub(crate) fn smart_key_action(
     enabled: bool,
     mods: &gpui::Modifiers,
     key: &str,
     has_selection: bool,
 ) -> SmartAction {
-    if !enabled || !(mods.control || mods.platform) || mods.shift || mods.alt {
+    let mac_cmd = cfg!(target_os = "macos") && mods.platform;
+    if (!enabled && !mac_cmd) || !(mods.control || mods.platform) || mods.shift || mods.alt {
         return SmartAction::PassThrough;
     }
     match key {
@@ -619,8 +630,20 @@ impl TerminalView {
             return;
         }
 
-        // 应用层快捷键:Ctrl+Shift+C / Ctrl+Shift+V。
-        if mods.control && mods.shift {
+        // 应用层快捷键:Ctrl+Shift+C / Ctrl+Shift+V(macOS 上是 ⌘⇧C / ⌘⇧V)。
+        //
+        // ⚠️ 必须一并认 `platform`:macOS 把 ⌘ 报在 `platform` 位而不是 `control`,
+        // 只判 `control` 的话这个分支在 mac 上永远进不去 —— 而设置页恰恰把这条
+        // 显示成 ⌘⇧V(`hotkeys.rs::combo_label` 在 mac 上渲染 ⌘),显示与实际对不上。
+        // 判据与 [`smart_key_action`] 保持同一口径(那边本来就是 `control || platform`)。
+        //
+        // **副作用如实记:Windows 上 Win+Shift+C / Win+Shift+V 也会被这里接管**
+        // —— gpui 的 Windows 后端把 Win 键报在 `platform` 位(`events.rs`),上游评审
+        // 真机实测到了(PR #59)。刻意不用 `cfg!(target_os = "macos")` 闸住:
+        // ① `smart_key_action` 那条路**本来**就把 `platform` 与 `control` 同权,
+        //    这里闸住反而让两条路的判据分叉;② Win+Shift+V 没有系统绑定,多一条
+        //    粘贴入口无害。要严格守住「Windows 逐字不变」就在这里加 cfg 闸门。
+        if (mods.control || mods.platform) && mods.shift {
             match keystroke.key.as_str() {
                 "c" => {
                     self.copy_selection(cx);
@@ -917,6 +940,33 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(smart_key_action(true, &cmd, "v", false), SmartAction::Paste);
+    }
+
+    /// macOS 上 ⌘C / ⌘V **不受开关管**:那个开关是为 Windows / Linux 的 ^C/^V 冲突
+    /// 设的,而 mac 上 ⌘ 根本不是终端修饰键、中断走物理 Control+C,没有冲突可权衡。
+    /// 曾经开关默认关着 + Ctrl+Shift 分支漏判 `platform`,导致 mac 上 ⌘V 与 ⌘⇧V
+    /// **双双失效**、只剩右键菜单能粘贴。这条钉住不要退回去。
+    ///
+    /// `control` 那一路不放行:Windows 的 `platform` 是 Win 键(Win+V 是系统剪贴板
+    /// 历史),行为仍由开关决定 —— 所以断言按平台分叉。
+    #[test]
+    fn mac_的_cmd_不受智能开关管() {
+        let cmd = Modifiers {
+            platform: true,
+            ..Default::default()
+        };
+        let expected = if cfg!(target_os = "macos") {
+            SmartAction::Paste
+        } else {
+            SmartAction::PassThrough
+        };
+        assert_eq!(smart_key_action(false, &cmd, "v", false), expected);
+
+        // 关着的 Ctrl 三家一致:照发 SIGINT / 走老路
+        assert_eq!(
+            smart_key_action(false, &ctrl(), "v", false),
+            SmartAction::PassThrough
+        );
     }
 
     /// 带 Shift / Alt 的组合不归智能键位管:Ctrl+Shift+C/V 是另一条**始终生效**

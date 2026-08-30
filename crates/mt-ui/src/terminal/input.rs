@@ -74,12 +74,10 @@ pub fn keystroke_to_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u
         return None;
     }
 
-    // 方向键 / Home / End 在 DECCKM(APP_CURSOR)下换 SS3 前缀。
+    // 方向键 / Home / End 在 DECCKM(APP_CURSOR)下换 SS3 前缀。编码收口在
+    // [`cursor_key_bytes`],这里只是把 `app_cursor` 绑进去。
     let app_cursor = mode.contains(TermMode::APP_CURSOR);
-    let cursor_seq = |final_byte: char| -> Vec<u8> {
-        let prefix = if app_cursor { "\x1bO" } else { "\x1b[" };
-        format!("{prefix}{final_byte}").into_bytes()
-    };
+    let cursor_seq = |final_byte: char| -> Vec<u8> { cursor_key_bytes(final_byte, app_cursor) };
     // 带修饰键的方向键走 CSI 1;<mod><final>。
     let modifier_param = modifier_param(m.shift, m.alt, m.control);
     let cursor_seq_mod = |final_byte: char| -> Vec<u8> {
@@ -212,6 +210,38 @@ fn control_code(key: &str) -> Option<Vec<u8>> {
     Some(vec![byte])
 }
 
+/// 一个方向键。见 [`arrow_bytes`]。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Arrow {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+/// 光标键序列的编码:CSI `ESC [ <final>`,DECCKM(`APP_CURSOR`)下换 SS3
+/// `ESC O <final>`。方向键与 Home / End 共用这一条规则。
+///
+/// **全仓只有这一处知道 SS3 那件事**。此前它散在三个地方各写一份
+/// (`keystroke_to_bytes` 的 `cursor_seq` 闭包、[`arrow_bytes`]、
+/// [`super::mouse::alt_screen_scroll_bytes`] 的四个硬编码字面量),
+/// 谁改了 DECCKM 的判据都不会波及另外两处 —— 收口到这里。
+pub fn cursor_key_bytes(final_byte: char, app_cursor: bool) -> Vec<u8> {
+    let prefix = if app_cursor { "\x1bO" } else { "\x1b[" };
+    format!("{prefix}{final_byte}").into_bytes()
+}
+
+/// 一个**无修饰**方向键的字节序列。编码规则见 [`cursor_key_bytes`]。
+pub fn arrow_bytes(dir: Arrow, app_cursor: bool) -> Vec<u8> {
+    let final_byte = match dir {
+        Arrow::Up => 'A',
+        Arrow::Down => 'B',
+        Arrow::Right => 'C',
+        Arrow::Left => 'D',
+    };
+    cursor_key_bytes(final_byte, app_cursor)
+}
+
 /// 粘贴文本 → PTY 字节。开了 bracketed paste 就包上 `ESC[200~ … ESC[201~`。
 ///
 /// 无论哪种模式都要先把 `\r\n` / `\n` 归一成 `\r`:PTY 那头把 `\n` 当作
@@ -255,6 +285,41 @@ mod tests {
             keystroke_to_bytes(&k, TermMode::APP_CURSOR).unwrap(),
             b"\x1bOA".to_vec()
         );
+    }
+
+    /// 方向键的编码只有 [`cursor_key_bytes`] 一处知道 SS3 那件事,三个调用方必须
+    /// 逐字节一致。此前它散成三份(这里的 `cursor_seq` 闭包、[`arrow_bytes`]、
+    /// `mouse::alt_screen_scroll_bytes` 的硬编码字面量),改一处波及不到另两处 ——
+    /// 上游评审(PR #59)指出过。这条把三条路交叉钉死,DECCKM 两态都比。
+    #[test]
+    fn 三处方向键编码逐字节一致() {
+        for (app_cursor, mode) in [(false, TermMode::empty()), (true, TermMode::APP_CURSOR)] {
+            for (name, dir, expect_tail) in [
+                ("up", Arrow::Up, 'A'),
+                ("down", Arrow::Down, 'B'),
+                ("right", Arrow::Right, 'C'),
+                ("left", Arrow::Left, 'D'),
+            ] {
+                let want = cursor_key_bytes(expect_tail, app_cursor);
+                assert_eq!(arrow_bytes(dir, app_cursor), want, "arrow_bytes {name}");
+                assert_eq!(
+                    keystroke_to_bytes(&key(name, Modifiers::default()), mode).unwrap(),
+                    want,
+                    "keystroke_to_bytes {name} (app_cursor={app_cursor})"
+                );
+            }
+            // 滚轮那条路只用上下两个方向
+            assert_eq!(
+                crate::terminal::mouse::alt_screen_scroll_bytes(1, app_cursor),
+                cursor_key_bytes('A', app_cursor),
+                "alt_screen 上滚 (app_cursor={app_cursor})"
+            );
+            assert_eq!(
+                crate::terminal::mouse::alt_screen_scroll_bytes(-1, app_cursor),
+                cursor_key_bytes('B', app_cursor),
+                "alt_screen 下滚 (app_cursor={app_cursor})"
+            );
+        }
     }
 
     #[test]

@@ -121,22 +121,54 @@ pub struct TerminalStyle {
     pub ligatures: bool,
 }
 
+/// 默认等宽字族栈(主字体 + 回退),按平台选。
+///
+/// **主字体必须随平台走**:`font_fallbacks` 只在主字体缺**字形**时才往下找,
+/// 主字体族本身不存在时 gpui 不会顺着回退表试,而是直接落到平台 UI 字体 ——
+/// 那是比例字体,[`super::TerminalElement`] 的逐列对齐当场失效(症状是每个字形
+/// 钉在列格左沿、窄字母后面拖一片空白)。原先三平台共用 Windows 那一套,
+/// macOS / Linux 上五个名字全落空,没手填字族就是开箱即坏。
+///
+/// 取值一律挑该平台**开箱即有**的:Windows 11 的 Cascadia Mono、macOS 自带的
+/// Menlo(SF Mono 没被登记成 CoreText family,点名点不到)、主流发行版随
+/// fontconfig 一起装的 DejaVu Sans Mono。
+fn default_font_stack() -> (&'static str, &'static [&'static str]) {
+    if cfg!(target_os = "macos") {
+        ("Menlo", &["Monaco", "PingFang SC", "Apple Color Emoji"])
+    } else if cfg!(target_os = "linux") {
+        (
+            "DejaVu Sans Mono",
+            &[
+                "Noto Sans Mono",
+                "Liberation Mono",
+                "Noto Sans CJK SC",
+                "Noto Color Emoji",
+            ],
+        )
+    } else {
+        (
+            "Cascadia Mono",
+            &[
+                "Consolas",
+                "JetBrains Mono",
+                "Microsoft YaHei",
+                "Segoe UI Emoji",
+            ],
+        )
+    }
+}
+
 impl Default for TerminalStyle {
     fn default() -> Self {
+        let (family, fallbacks) = default_font_stack();
         Self {
-            // Windows 11 自带;Cascadia Mono 缺席时由 gpui 的 fallback 栈兜底。
-            font_family: "Cascadia Mono".into(),
-            font_fallbacks: vec![
-                "Consolas".into(),
-                "JetBrains Mono".into(),
-                "Microsoft YaHei".into(),
-                "Segoe UI Emoji".into(),
-            ],
+            font_family: family.into(),
+            font_fallbacks: fallbacks.iter().map(|f| SharedString::from(*f)).collect(),
             font_size: px(14.0),
             line_height: 1.3,
-            // 默认关:默认字族 Cascadia **Mono** 本来就是去连字版,开了也没东西可连,
-            // 徒增一次总宽校验。要连字的用户得先把字族换成 Cascadia Code 这类带
-            // `calt` 表的字体 —— 设置页那行提示说的就是这件事。
+            // 默认关:三家的默认字族都是去连字版,开了也没东西可连,徒增一次总宽
+            // 校验。要连字的用户得先把字族换成 Cascadia Code 这类带 `calt` 表的
+            // 字体 —— 设置页那行提示说的就是这件事。
             ligatures: false,
         }
     }
@@ -200,7 +232,7 @@ mod tests {
     #[test]
     fn 连字开关只切_calt() {
         let mut style = TerminalStyle::default();
-        assert!(!style.ligatures, "默认关:默认字族 Cascadia Mono 是去连字版");
+        assert!(!style.ligatures, "默认关:三家默认字族都是去连字版");
         assert_eq!(style.font().features.is_calt_enabled(), Some(false));
 
         style.ligatures = true;
@@ -234,6 +266,30 @@ mod tests {
 
         // 同一份样式连问两次必须一模一样(命中缓存那条路)
         assert_eq!(style.font(), style.font());
+    }
+
+    /// 默认字族栈必须是**本平台**开箱即有的等宽字体。
+    ///
+    /// 曾经三平台共用 Windows 那一套(Cascadia Mono + Consolas / JetBrains Mono /
+    /// Microsoft YaHei / Segoe UI Emoji),macOS 与 Linux 上五个名字一个都点不到。
+    /// 主字体族点不到时 gpui 不会顺着回退表试,而是直接回落平台 UI 字体,于是
+    /// 终端拿比例字体去做逐列对齐 —— 没手填字族的 mac 用户开箱就撞上。
+    /// 这条钉住三家各自的主字体与 emoji 回退,别再退回单一平台。
+    #[test]
+    fn 默认字族栈按平台选() {
+        let style = TerminalStyle::default();
+        let (family, emoji) = if cfg!(target_os = "macos") {
+            ("Menlo", "Apple Color Emoji")
+        } else if cfg!(target_os = "linux") {
+            ("DejaVu Sans Mono", "Noto Color Emoji")
+        } else {
+            ("Cascadia Mono", "Segoe UI Emoji")
+        };
+        assert_eq!(style.font_family.as_ref(), family);
+        assert!(
+            style.font_fallbacks.iter().any(|f| f.as_ref() == emoji),
+            "缺本平台 emoji 回退 {emoji}"
+        );
     }
 }
 

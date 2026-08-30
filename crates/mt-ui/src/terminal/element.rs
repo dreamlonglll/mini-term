@@ -83,6 +83,7 @@ use mt_terminal::{TermSize, TerminalEmulator};
 
 use super::colors;
 use super::damage::{CellSignature, DamageStats, FrameKey, MAX_ZEROWIDTH_CHARS, RowCache, row_signature};
+use super::input::{Arrow, arrow_bytes};
 use super::mouse::{
     GridPos, MouseAction, MouseBtn, MouseMods, WheelDir, alt_screen_scroll_bytes,
     mouse_report_bytes, mouse_reporting_active, prefers_local_handling,
@@ -863,6 +864,31 @@ impl TerminalElement {
                     return;
                 }
                 let display_offset = emulator.with_term(|t| t.grid().display_offset());
+
+                // ⌥+单击:把光标挪到点中的格子。判定与合成见 [`cursor_move_bytes`]。
+                //
+                // **修饰键不能省**:裸左键是拖选区的起手式,两者抢同一个手势。
+                // Terminal.app 同样挂在 ⌥+click 上,这里照它。
+                //
+                // 只在**没滚动回看**时生效:滚上去之后视口行号与光标所在的 grid 行
+                // 不是一回事,差值算出来会把光标带到莫名其妙的地方。
+                if event.modifiers.alt
+                    && event.click_count == 1
+                    && display_offset == 0
+                    && let Some(on_input) = on_input.as_ref()
+                {
+                    let (cur_line, cur_col) = emulator.with_term(|t| {
+                        let p = t.grid().cursor.point;
+                        (p.line.0, p.column.0 as i32)
+                    });
+                    let payload =
+                        cursor_move_bytes(cur_line, cur_col, row as i32, col as i32, mode);
+                    if !payload.is_empty() {
+                        on_input(&payload, window, cx);
+                    }
+                    return;
+                }
+
                 let ty = match event.click_count {
                     1 => SelectionType::Simple,
                     2 => SelectionType::Semantic,
@@ -1801,6 +1827,56 @@ fn width_fits_columns(shaped: Pixels, cell_width: Pixels, cols: usize) -> bool {
     (f(shaped) - f(cell_width) * cols as f32).abs() <= LIGATURE_WIDTH_SLACK
 }
 
+/// 「⌥+点击定位光标」一次最多合成多少个方向键。
+///
+/// 手滑点到几千列开外时别把 PTY 灌爆:超了就整个不动,比走一半停下强
+/// (走一半的结果既不是用户要的位置,又没法撤销)。
+const MAX_CURSOR_MOVE_STEPS: usize = 512;
+
+/// 「⌥+点击定位光标」要发的方向键序列。
+///
+/// 这是个**启发式**:光标最终落在哪由前台程序的行编辑器说了算(readline /
+/// PSReadLine / Ink 各有各的规则),模拟器能做的只是按列差把方向键发过去。任何终端
+/// 里的这个功能都是这么实现的 —— shell 与 TUI 自己都不认鼠标定位。
+///
+/// # 只走同一行
+///
+/// **跨行一律不动**。竖向位移在行编辑器里往往不是「移动光标」而是**召回历史**:
+/// pwsh(PSReadLine)里点上一行,一个 Up 就把当前输入整行换成了历史条目 —— 用户
+/// 想挪个光标,结果正在编辑的内容没了。Terminal.app 的 ⌥+click 有这个坑,这里不抄。
+/// 多行编辑器里的跨行定位留给以后配开关(上游评审实测出的这条,见 PR #59)。
+///
+/// # 对 Ink 类 TUI 不保证
+///
+/// Claude CLI / Codex 这类 Ink 应用把**硬件光标停在输入行末尾**(可见光标块之后),
+/// 而这里的起点取的是 grid 光标 —— 两者对不上,落点会偏。上游评审实测:输入
+/// `abc def` 去点 `d`,字符落到了空格前。只有可见光标恰在行末时才近似可用。
+/// 这不是本实现的缺陷(Terminal.app 在 Claude Code 里同样如此),但别指望它。
+/// shell 提示符(bash / zsh / pwsh)下则是逐格准确的。
+fn cursor_move_bytes(
+    from_line: i32,
+    from_col: i32,
+    to_line: i32,
+    to_col: i32,
+    mode: TermMode,
+) -> Vec<u8> {
+    if from_line != to_line {
+        return Vec::new();
+    }
+    let dx = to_col - from_col;
+    let steps = dx.unsigned_abs() as usize;
+    if steps == 0 || steps > MAX_CURSOR_MOVE_STEPS {
+        return Vec::new();
+    }
+    let dir = if dx > 0 { Arrow::Right } else { Arrow::Left };
+    let seq = arrow_bytes(dir, mode.contains(TermMode::APP_CURSOR));
+    let mut out = Vec::with_capacity(seq.len() * steps);
+    for _ in 0..steps {
+        out.extend_from_slice(&seq);
+    }
+    out
+}
+
 /// 把一行解析好的格子变成可绘制产物。**几何全部相对行首**。
 #[allow(clippy::too_many_arguments)]
 fn build_row(
@@ -2202,6 +2278,53 @@ fn paint_hollow_rect(window: &mut Window, bounds: Bounds<Pixels>, color: Hsla) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ⌥+点击定位光标:同一行按列差发左右键,零位移不发。
+    #[test]
+    fn 点击定位光标合成方向键() {
+        let m = TermMode::empty();
+        // 同行右移 3 格
+        assert_eq!(
+            cursor_move_bytes(0, 2, 0, 5, m),
+            b"\x1b[C\x1b[C\x1b[C".to_vec()
+        );
+        // 同行左移 2 格
+        assert_eq!(cursor_move_bytes(0, 5, 0, 3, m), b"\x1b[D\x1b[D".to_vec());
+        // 点在光标本身:什么都不发,别让一次点击白白喂 PTY 一个空包
+        assert!(cursor_move_bytes(3, 7, 3, 7, m).is_empty());
+    }
+
+    /// **跨行一律不动**。竖向位移在行编辑器里往往是召回历史而不是移动光标 ——
+    /// pwsh 里点上一行,一个 Up 就把正在编辑的整行换成历史条目(上游评审实测)。
+    /// 这条钉住「宁可不动也不能毁掉用户正在输入的内容」。
+    #[test]
+    fn 点击定位光标跨行不动() {
+        let m = TermMode::empty();
+        assert!(cursor_move_bytes(1, 4, 2, 5, m).is_empty(), "往下跨行");
+        assert!(cursor_move_bytes(2, 4, 1, 3, m).is_empty(), "往上跨行");
+        // 跨行且同列同样不动
+        assert!(cursor_move_bytes(1, 4, 5, 4, m).is_empty(), "跨行同列");
+    }
+
+    /// DECCKM(`APP_CURSOR`)下方向键换 SS3 前缀 —— 与 `keystroke_to_bytes` 同一口径,
+    /// 两处若分叉,vim 这类开了应用光标键的程序会收到它不认的序列。
+    #[test]
+    fn 点击定位光标跟随应用光标键模式() {
+        assert_eq!(
+            cursor_move_bytes(0, 0, 0, 2, TermMode::APP_CURSOR),
+            b"\x1bOC\x1bOC".to_vec()
+        );
+    }
+
+    /// 点到几千列开外时整个不动:走一半的结果既不是用户要的位置,又没法撤销。
+    #[test]
+    fn 点击定位光标超出步数上限即放弃() {
+        let far = MAX_CURSOR_MOVE_STEPS as i32 + 1;
+        assert!(cursor_move_bytes(0, 0, 0, far, TermMode::empty()).is_empty());
+        // 上限本身要放行
+        let at_limit = cursor_move_bytes(0, 0, 0, MAX_CURSOR_MOVE_STEPS as i32, TermMode::empty());
+        assert_eq!(at_limit.len(), MAX_CURSOR_MOVE_STEPS * 3);
+    }
 
     /// 闪烁行的 grid 绝对行号 → 屏幕行:`row = line + display_offset`。
     /// 视口顶在最新内容时(offset = 0),正数行号就是屏幕行本身。

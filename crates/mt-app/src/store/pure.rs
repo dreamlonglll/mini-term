@@ -317,7 +317,11 @@ const GENERIC_FAMILIES: [&str; 5] = ["monospace", "sans-serif", "serif", "system
 /// 原版把它接在**用户自选字体**后面,这里同样。
 const CJK_FALLBACK_FONTS: [&str; 3] = ["Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC"];
 /// emoji 回退。`TerminalStyle::default()` 里本来就有,自定义字族时别弄丢。
-const EMOJI_FALLBACK: &str = "Segoe UI Emoji";
+///
+/// 与 [`CJK_FALLBACK_FONTS`] 同样**三家并列**:回退表里点不到的名字会被跳过,
+/// 列全比按平台切省事,也让同一串字族配置在三个平台上表现一致。此前只有
+/// `Segoe UI Emoji` 一个,macOS / Linux 上必然落空,终端里的 emoji 无字体可用。
+const EMOJI_FALLBACK_FONTS: [&str; 3] = ["Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji"];
 
 /// `config.terminalFontSize` + `terminalFontFamily` → [`TerminalStyle`]。
 ///
@@ -342,7 +346,7 @@ pub fn terminal_style_from(size: f64, family: Option<&str>, ligatures: bool) -> 
         return style;
     }
     style.font_family = families.remove(0).into();
-    for extra in CJK_FALLBACK_FONTS.iter().chain([&EMOJI_FALLBACK]) {
+    for extra in CJK_FALLBACK_FONTS.iter().chain(EMOJI_FALLBACK_FONTS.iter()) {
         if !families.iter().any(|f| f == extra) {
             families.push((*extra).to_string());
         }
@@ -979,7 +983,13 @@ mod tests {
         for cjk in CJK_FALLBACK_FONTS {
             assert!(fallbacks.iter().any(|f| f == cjk), "缺 CJK 回退 {cjk}");
         }
-        assert!(fallbacks.iter().any(|f| f == EMOJI_FALLBACK));
+        // 三家的 emoji 字体都要在:同一串配置换个平台照样画得出 emoji
+        for emoji in EMOJI_FALLBACK_FONTS {
+            assert!(
+                fallbacks.iter().any(|f| f == emoji),
+                "缺 emoji 回退 {emoji}"
+            );
+        }
     }
 
     /// 字族为空 / 只有通用族名时整段回落默认样式(只改字号)。

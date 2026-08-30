@@ -45,6 +45,8 @@
 
 use alacritty_terminal::term::TermMode;
 
+use super::input::{Arrow, arrow_bytes};
+
 /// 鼠标按键。`Other` 是 4 号以上的侧键（bit 7 那一族）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MouseBtn {
@@ -233,16 +235,14 @@ fn push_utf8(out: &mut Vec<u8>, value: u32) {
 /// alt screen 下滚轮的等价按键序列（没有回看缓冲，滚轮当上下方向键使）。
 ///
 /// 这是 xterm 的老约定，`less` / `vim` / `man` 全都靠它。`app_cursor` 是 DECCKM。
+/// 序列本身走 [`super::input::arrow_bytes`] —— 此前这里硬编码着四个字面量，
+/// 与 `keystroke_to_bytes` 各写一份，改 DECCKM 判据时波及不到对方。
 pub fn alt_screen_scroll_bytes(lines: i32, app_cursor: bool) -> Vec<u8> {
-    let seq: &[u8] = match (lines > 0, app_cursor) {
-        (true, false) => b"\x1b[A",
-        (true, true) => b"\x1bOA",
-        (false, false) => b"\x1b[B",
-        (false, true) => b"\x1bOB",
-    };
+    let dir = if lines > 0 { Arrow::Up } else { Arrow::Down };
+    let seq = arrow_bytes(dir, app_cursor);
     let mut out = Vec::with_capacity(seq.len() * lines.unsigned_abs() as usize);
     for _ in 0..lines.unsigned_abs() {
-        out.extend_from_slice(seq);
+        out.extend_from_slice(&seq);
     }
     out
 }
