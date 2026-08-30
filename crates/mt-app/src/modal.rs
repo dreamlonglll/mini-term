@@ -31,7 +31,7 @@ use gpui_component::dialog::DialogButtonProps;
 use gpui_component::input::{Input, InputState, SelectAll};
 
 use crate::i18n::t;
-use crate::prompt::{autofocus, is_open, kind, open_guarded};
+use crate::prompt::{autofocus, is_open, kind, open_guarded, show_alert};
 use crate::store::AppStore;
 use crate::ui;
 
@@ -120,48 +120,59 @@ pub fn open_confirm_remove_project(
         window,
         cx,
         move |dialog, _window, _cx| {
-        let store = store.clone();
-        let project_id = project_id.clone();
-        dialog
-            .title(t("projectList", "removeConfirm.title"))
-            // 原版 `ProjectList.tsx` 的删除确认是 `w-[320px]`
-            .w(px(320.0))
-            .confirm()
-            .button_props(
-                DialogButtonProps::default()
-                    .ok_text(t("projectList", "removeConfirm.confirm"))
-                    .cancel_text(t("projectList", "removeConfirm.cancel")),
-            )
-            .child(
-                div()
-                    .px(px(20.0))
-                    .flex()
-                    .flex_col()
-                    .gap(px(6.0))
-                    // 正文与原版一样是「前缀 + 项目名 + 后缀」三段拼(后缀那半句
-                    // 已经把"只从列表移除、不删文件"说清楚了,不必另起一行)
-                    .child(
-                        div()
-                            .text_size(ui::font_px(13.0))
-                            .text_color(ui::text_primary())
-                            .child(format!(
-                                "{}{}{}",
-                                t("projectList", "removeConfirm.messagePrefix"),
-                                project_name,
-                                t("projectList", "removeConfirm.messageSuffix"),
-                            )),
-                    )
-                    .child(
-                        div()
-                            .text_size(ui::font_px(11.0))
-                            .text_color(ui::text_muted())
-                            .child(project_path.clone()),
-                    ),
-            )
-            .on_ok(move |_: &ClickEvent, _window, cx| {
-                store.update(cx, |store, cx| store.remove_project(&project_id, cx));
-                true
-            })
+            let store = store.clone();
+            let project_id = project_id.clone();
+            dialog
+                .title(t("projectList", "removeConfirm.title"))
+                // 原版 `ProjectList.tsx` 的删除确认是 `w-[320px]`
+                .w(px(320.0))
+                .confirm()
+                .button_props(
+                    DialogButtonProps::default()
+                        .ok_text(t("projectList", "removeConfirm.confirm"))
+                        .cancel_text(t("projectList", "removeConfirm.cancel")),
+                )
+                .child(
+                    div()
+                        .px(px(20.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.0))
+                        // 正文与原版一样是「前缀 + 项目名 + 后缀」三段拼(后缀那半句
+                        // 已经把"只从列表移除、不删文件"说清楚了,不必另起一行)
+                        .child(
+                            div()
+                                .text_size(ui::font_px(13.0))
+                                .text_color(ui::text_primary())
+                                .child(format!(
+                                    "{}{}{}",
+                                    t("projectList", "removeConfirm.messagePrefix"),
+                                    project_name,
+                                    t("projectList", "removeConfirm.messageSuffix"),
+                                )),
+                        )
+                        .child(
+                            div()
+                                .text_size(ui::font_px(11.0))
+                                .text_color(ui::text_muted())
+                                .child(project_path.clone()),
+                        ),
+                )
+                .on_ok(move |_: &ClickEvent, window, cx| {
+                    if crate::workbench_area::project_has_dirty_documents(&project_id, cx) {
+                        window.defer(cx, |window, cx| {
+                            show_alert(
+                                t("fileViewer", "unsavedTitle"),
+                                t("fileViewer", "projectRemovalBlocked"),
+                                window,
+                                cx,
+                            );
+                        });
+                        return true;
+                    }
+                    store.update(cx, |store, cx| store.remove_project(&project_id, cx));
+                    true
+                })
         },
     );
 }

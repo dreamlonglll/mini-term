@@ -39,7 +39,7 @@ use mt_project::git::{BranchInfo, WorktreeInfo};
 
 use crate::i18n::{t, tr};
 use crate::menu::{self, MenuItem};
-use crate::prompt::{autofocus, dialog_title, kind, open_guarded};
+use crate::prompt::{autofocus, dialog_title, kind, open_guarded, show_alert};
 use crate::store::AppStore;
 use crate::ui;
 
@@ -774,7 +774,7 @@ fn render_worktree_row(
                 };
                 let title = format!("⎇ {}", branch.clone().unwrap_or_else(|| name.clone()));
                 let path = path.clone();
-                store.update(cx, |store, cx| {
+                let opened = store.update(cx, |store, cx| {
                     let pane = store.new_terminal_with_cwd(
                         &project_id,
                         None,
@@ -783,11 +783,15 @@ fn render_worktree_row(
                         window,
                         cx,
                     );
-                    if let Some(pane) = pane {
-                        store.rename_pane(&project_id, &pane, &title, cx);
+                    if let Some(pane) = pane.as_ref() {
+                        store.rename_pane(&project_id, pane, &title, cx);
                     }
+                    pane.is_some()
                 });
                 crate::prompt::close_guarded(kind::GIT_WORKTREE, window, cx);
+                if opened {
+                    crate::workbench_area::activate_terminal_page(window, cx);
+                }
             }),
         );
 
@@ -1408,6 +1412,18 @@ fn open_remove_confirm(
         .iter()
         .find(|p| p.ssh_connection_id.is_none() && normalize_path(&p.path) == normalize_path(&wt.path))
         .map(|p| (p.id.clone(), p.name.clone()));
+    if linked_project
+        .as_ref()
+        .is_some_and(|(id, _)| crate::workbench_area::project_has_dirty_documents(id, cx))
+    {
+        show_alert(
+            t("fileViewer", "unsavedTitle"),
+            t("fileViewer", "projectRemovalBlocked"),
+            window,
+            cx,
+        );
+        return;
+    }
 
     // force 勾选与错误文本要活过重绘,放实体
     let form = cx.new(|_| RemoveForm {
@@ -1513,6 +1529,18 @@ fn open_remove_confirm(
                     if form_for_ok.read(cx).removing {
                         return false;
                     }
+                    let project_id = linked.as_ref().map(|(id, _)| id.clone());
+                    if project_id.as_deref().is_some_and(|id| {
+                        crate::workbench_area::project_has_dirty_documents(id, cx)
+                    }) {
+                        show_alert(
+                            t("fileViewer", "unsavedTitle"),
+                            t("fileViewer", "projectRemovalBlocked"),
+                            window,
+                            cx,
+                        );
+                        return false;
+                    }
                     form_for_ok.update(cx, |f, cx| {
                         f.removing = true;
                         cx.notify();
@@ -1521,7 +1549,7 @@ fn open_remove_confirm(
                         &state,
                         &group,
                         &wt,
-                        linked.as_ref().map(|(id, _)| id.clone()),
+                        project_id,
                         form_for_ok.read(cx).force,
                         window,
                         cx,
@@ -1554,6 +1582,18 @@ fn remove_worktree(
     window: &mut Window,
     cx: &mut App,
 ) {
+    if project_id
+        .as_deref()
+        .is_some_and(|id| crate::workbench_area::project_has_dirty_documents(id, cx))
+    {
+        show_alert(
+            t("fileViewer", "unsavedTitle"),
+            t("fileViewer", "projectRemovalBlocked"),
+            window,
+            cx,
+        );
+        return;
+    }
     let store = state.read(cx).store.clone();
     // ① 先关该目录下的终端 —— Windows 上 shell 占着目录会让 remove 失败
     if let Some(id) = &project_id {

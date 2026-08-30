@@ -959,23 +959,30 @@ impl GitPanel {
         let repo_for_worktree = repo_path.clone();
 
         vec![
-            menu::item(t("gitHistoryContent", "openInTerminal"), move |window, cx| {
-                let Some(project_id) = project_id.clone() else {
-                    return;
-                };
-                let (cwd, title) = if same_as_root {
-                    (None, None)
-                } else {
-                    (Some(repo_path.clone()), Some(title.clone()))
-                };
-                store.update(cx, |store, cx| {
-                    let pane =
-                        store.new_terminal_with_cwd(&project_id, None, None, cwd, window, cx);
-                    if let (Some(pane), Some(title)) = (pane, title) {
-                        store.rename_pane(&project_id, &pane, &title, cx);
+            menu::item(
+                t("gitHistoryContent", "openInTerminal"),
+                move |window, cx| {
+                    let Some(project_id) = project_id.clone() else {
+                        return;
+                    };
+                    let (cwd, title) = if same_as_root {
+                        (None, None)
+                    } else {
+                        (Some(repo_path.clone()), Some(title.clone()))
+                    };
+                    let opened = store.update(cx, |store, cx| {
+                        let pane =
+                            store.new_terminal_with_cwd(&project_id, None, None, cwd, window, cx);
+                        if let (Some(pane), Some(title)) = (pane.as_ref(), title) {
+                            store.rename_pane(&project_id, pane, &title, cx);
+                        }
+                        pane.is_some()
+                    });
+                    if opened {
+                        crate::workbench_area::activate_terminal_page(window, cx);
                     }
-                });
-            }),
+                },
+            ),
             menu::separator(),
             menu::item(
                 t("gitHistoryContent", "manageWorktrees"),

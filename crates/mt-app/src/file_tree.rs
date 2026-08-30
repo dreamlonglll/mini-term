@@ -36,7 +36,6 @@
 //! `isAiPty` 那道闸在旁路里,AI pane 刷屏带不起这边的刷新。
 
 use std::collections::{HashMap, HashSet};
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -44,7 +43,7 @@ use std::time::{Duration, Instant};
 use futures::StreamExt;
 use futures::channel::mpsc;
 use gpui::{
-    AnyElement, App, ClipboardItem, Context, DragMoveEvent, Entity, ExternalPaths, Hsla,
+    AnyElement, App, ClipboardItem, Context, DragMoveEvent, Entity, ExternalPaths, Global, Hsla,
     InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, PathPromptOptions,
     Render, SharedString, StatefulInteractiveElement, Styled, Task, Window, div,
     prelude::FluentBuilder, px,
@@ -72,15 +71,86 @@ struct ExternalDropTarget {
     target_dir: PathBuf,
 }
 
-fn connection_fingerprint(connection: &mt_config::SshConnection) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    connection.id.hash(&mut hasher);
-    connection.host.hash(&mut hasher);
-    connection.port.hash(&mut hasher);
-    connection.user.hash(&mut hasher);
-    connection.password.hash(&mut hasher);
-    connection.identity_file.hash(&mut hasher);
-    hasher.finish()
+struct GlobalFileTree(Entity<FileTree>);
+impl Global for GlobalFileTree {}
+
+/// 安装文件管理器的统一操作入口。文件页中的远程二进制/超限提示通过它复用
+/// 现有下载冲突检查、下载目录设置和 busy ownership，不另建一套下载流程。
+pub fn install(tree: Entity<FileTree>, cx: &mut App) {
+    cx.set_global(GlobalFileTree(tree));
+}
+
+fn show_download_context_changed(project_id: &str, cx: &mut App) {
+    let project_name = AppStore::global(cx)
+        .read(cx)
+        .project(project_id)
+        .map(|project| project.name.clone())
+        .unwrap_or_else(|| project_id.to_string());
+    crate::toast::push_message(
+        crate::notify::ToastKind::PasteError,
+        project_id.to_string(),
+        project_name,
+        t("fileTree", "download.contextChanged").to_string(),
+        cx,
+    );
+}
+
+fn remote_download_context_matches(
+    context: &FileOperationContext,
+    project_id: &str,
+    project_root: &str,
+    connection_id: &str,
+    connection_fingerprint: u64,
+) -> bool {
+    context.project_id == project_id
+        && context.root.as_path() == Path::new(project_root)
+        && matches!(
+            &context.backend,
+            FileBackendIdentity::Remote {
+                connection_id: current_id,
+                connection_fingerprint: current_fingerprint,
+            } if current_id == connection_id
+                && *current_fingerprint == connection_fingerprint
+        )
+}
+
+/// 从当前可见文件页下载一个远程文件。项目或连接上下文已经变化时拒绝并提示，
+/// 避免旧页签借当前文件树的连接把同名路径下载自另一台主机。
+pub fn download_remote_file(
+    project_id: &str,
+    project_root: &str,
+    connection_id: &str,
+    connection_fingerprint: u64,
+    path: PathBuf,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(tree) = cx
+        .try_global::<GlobalFileTree>()
+        .map(|global| global.0.clone())
+    else {
+        show_download_context_changed(project_id, cx);
+        return;
+    };
+    let context = {
+        let tree = tree.read(cx);
+        tree.operation_context(cx)
+    };
+    let Some(context) = context else {
+        show_download_context_changed(project_id, cx);
+        return;
+    };
+    if !remote_download_context_matches(
+        &context,
+        project_id,
+        project_root,
+        connection_id,
+        connection_fingerprint,
+    ) {
+        show_download_context_changed(project_id, cx);
+        return;
+    }
+    start_download(tree, context, vec![path], window, cx);
 }
 
 pub struct FileTree {
@@ -325,7 +395,7 @@ impl FileTree {
                             "{}|{}|ssh:{:016x}",
                             p.id,
                             p.path,
-                            connection_fingerprint(conn)
+                            crate::remote_ssh::connection_fingerprint(conn)
                         ),
                         None if is_remote => format!("{}|{}|ssh:broken", p.id, p.path),
                         None => format!("{}|{}|local", p.id, p.path),
@@ -421,7 +491,7 @@ impl FileTree {
             match store.remote_connection_of(&project.id) {
                 Some(connection) => FileBackendIdentity::Remote {
                     connection_id: connection.id.clone(),
-                    connection_fingerprint: connection_fingerprint(&connection),
+                    connection_fingerprint: crate::remote_ssh::connection_fingerprint(&connection),
                 },
                 None => FileBackendIdentity::BrokenRemote,
             }
@@ -760,19 +830,7 @@ impl FileTree {
     /// 留着的话双击会先开预览器再拉起编辑器(gpui 的双击是两个 click 事件,
     /// click_count 依次为 1、2),两个窗口一起冒出来。
     fn open_file(&self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        if self.is_remote(cx) {
-            show_alert(
-                t("fileTree", "remote.previewUnsupportedTitle"),
-                t("fileTree", "remote.previewUnsupportedMessage"),
-                window,
-                cx,
-            );
-            return;
-        }
-        let Some(root) = self.project_root(cx) else {
-            return;
-        };
-        crate::file_viewer::open(root, path, None, window, cx);
+        crate::workbench_area::open_active_file(self.store.clone(), path, None, window, cx);
     }
 
     /// 展开某个目录并(重)列它。新建文件/文件夹之后要用:原版是
@@ -1458,12 +1516,17 @@ fn open_entry_in_terminal(
     }
     let cwd_path = entry_target_directory(&path, is_dir, &context.root);
     let cwd = (cwd_path != context.root).then(|| cwd_path.to_string_lossy().into_owned());
-    store.update(cx, |store, cx| {
+    let opened = store.update(cx, |store, cx| {
         if store.active_project_id.as_deref() != Some(context.project_id.as_str()) {
-            return;
+            return false;
         }
-        store.new_terminal_with_cwd(&context.project_id, None, None, cwd, window, cx);
+        store
+            .new_terminal_with_cwd(&context.project_id, None, None, cwd, window, cx)
+            .is_some()
     });
+    if opened {
+        crate::workbench_area::activate_terminal_page(window, cx);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2324,19 +2387,59 @@ fn mod_label() -> &'static str {
     }
 }
 
-/// 头部那三个 26×26 的图标钮共用的外观(`FileTree.tsx:734`)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HeaderActionCapabilities {
+    show_upload: bool,
+    mutations_enabled: bool,
+    paste_enabled: bool,
+}
+
+fn header_action_capabilities(
+    context: Option<&FileOperationContext>,
+    operation_busy: bool,
+    clipboard: Option<&FileClipboardEntry>,
+) -> HeaderActionCapabilities {
+    let connected = context.is_some_and(|context| {
+        matches!(
+            &context.backend,
+            FileBackendIdentity::Local | FileBackendIdentity::Remote { .. }
+        )
+    });
+    let show_upload = context
+        .is_some_and(|context| matches!(&context.backend, FileBackendIdentity::Remote { .. }));
+    let mutations_enabled = connected && !operation_busy;
+    let paste_enabled = mutations_enabled
+        && context.is_some_and(|context| {
+            clipboard.is_some_and(|clipboard| clipboard.can_paste_into(context))
+        });
+    HeaderActionCapabilities {
+        show_upload,
+        mutations_enabled,
+        paste_enabled,
+    }
+}
+
+/// 头部 26×26 图标钮共用的外观(`FileTree.tsx:734`)。
 fn header_button(id: &'static str) -> gpui::Stateful<gpui::Div> {
+    header_action_button(id, true)
+}
+
+fn header_action_button(id: &'static str, enabled: bool) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .w(px(26.0))
         .h(px(26.0))
+        .flex_none()
         .flex()
         .items_center()
         .justify_center()
         .rounded(px(3.0))
-        .cursor_pointer()
         .text_color(ui::text_muted())
-        .hover(|el| el.text_color(ui::text_primary()).bg(ui::border_subtle()))
+        .when(enabled, |el| {
+            el.cursor_pointer()
+                .hover(|el| el.text_color(ui::text_primary()).bg(ui::border_subtle()))
+        })
+        .when(!enabled, |el| el.opacity(0.38))
 }
 
 /// 放大镜。原版是 `viewBox="0 0 16 16"` 的 `circle(7,7,r=4.2)` + `M10.2 10.2L14 14`
@@ -2378,6 +2481,99 @@ const REFRESH_SHAPES: &[Shape] = &[
     ),
 ];
 
+const FILE_SHAPES: &[Shape] = &[Shape::line(
+    Ink::Current,
+    0.075,
+    Geom::Polyline(&[
+        (0.22, 0.08),
+        (0.62, 0.08),
+        (0.82, 0.28),
+        (0.82, 0.92),
+        (0.22, 0.92),
+        (0.22, 0.08),
+        (0.62, 0.08),
+        (0.62, 0.28),
+        (0.82, 0.28),
+    ]),
+)];
+
+const FOLDER_SHAPES: &[Shape] = &[Shape::line(
+    Ink::Current,
+    0.075,
+    Geom::Polyline(&[
+        (0.08, 0.24),
+        (0.38, 0.24),
+        (0.48, 0.36),
+        (0.92, 0.36),
+        (0.92, 0.86),
+        (0.08, 0.86),
+        (0.08, 0.24),
+    ]),
+)];
+
+const UPLOAD_MARK_SHAPES: &[Shape] = &[
+    Shape::line(
+        Ink::Current,
+        0.095,
+        Geom::Polyline(&[(0.5, 0.76), (0.5, 0.42)]),
+    ),
+    Shape::line(
+        Ink::Current,
+        0.095,
+        Geom::Polyline(&[(0.34, 0.56), (0.5, 0.40), (0.66, 0.56)]),
+    ),
+];
+
+const PLUS_MARK_SHAPES: &[Shape] = &[
+    Shape::line(
+        Ink::Current,
+        0.095,
+        Geom::Polyline(&[(0.66, 0.68), (0.92, 0.68)]),
+    ),
+    Shape::line(
+        Ink::Current,
+        0.095,
+        Geom::Polyline(&[(0.79, 0.55), (0.79, 0.81)]),
+    ),
+];
+
+const PASTE_SHAPES: &[Shape] = &[
+    Shape::line(
+        Ink::Current,
+        0.075,
+        Geom::Polyline(&[
+            (0.28, 0.22),
+            (0.18, 0.22),
+            (0.18, 0.92),
+            (0.78, 0.92),
+            (0.78, 0.82),
+        ]),
+    ),
+    Shape::line(
+        Ink::Current,
+        0.075,
+        Geom::Polyline(&[
+            (0.38, 0.12),
+            (0.70, 0.12),
+            (0.70, 0.30),
+            (0.38, 0.30),
+            (0.38, 0.12),
+        ]),
+    ),
+    Shape::line(
+        Ink::Current,
+        0.075,
+        Geom::Polyline(&[
+            (0.34, 0.30),
+            (0.30, 0.30),
+            (0.30, 0.78),
+            (0.86, 0.78),
+            (0.86, 0.30),
+            (0.74, 0.30),
+        ]),
+    ),
+];
+
 /// 编辑器选择器的下拉箭头(原版 8×8 的 `M1.5 3L4 5.5L6.5 3`)。
 const CARET_SHAPES: &[Shape] = &[Shape::line(
     Ink::Current,
@@ -2407,14 +2603,23 @@ impl Render for FileTree {
             .clone()
             .filter(|name| editors.iter().any(|e| e == name))
             .or_else(|| editors.first().cloned());
+        let header_capabilities = header_action_capabilities(
+            self.operation_context(cx).as_ref(),
+            self.operation_busy,
+            self.file_clipboard.as_ref(),
+        );
 
         let is_remote = self.is_remote(cx);
         let mut header = div()
+            .id("file-tree-header")
             .flex()
             .items_center()
             .justify_between()
             .gap(px(8.0))
             .flex_none()
+            // 180px 窄栏装不下远程侧 6 个固定 26px 图标。保持按钮尺寸并允许
+            // 整条头部横向滚动，所有动作仍可达；宽栏内容未溢出时行为不变。
+            .overflow_x_scroll()
             .px(px(10.0))
             .py(px(6.0))
             .border_b_1()
@@ -2422,6 +2627,7 @@ impl Render for FileTree {
             .child(
                 div()
                     .flex_1()
+                    .min_w(px(60.0))
                     .truncate()
                     .text_size(ui::font_px(11.0))
                     .text_color(ui::text_muted())
@@ -2481,6 +2687,189 @@ impl Render for FileTree {
                                 this.refresh_root(cx);
                             }))
                             .child(VectorIcon::new(REFRESH_SHAPES, px(13.0)).ink(ui::text_muted())),
+                    )
+                    .when(header_capabilities.show_upload, |el| {
+                        el.child(
+                            header_action_button(
+                                "file-tree-upload-file",
+                                header_capabilities.mutations_enabled,
+                            )
+                            .tooltip(|window, cx| {
+                                Tooltip::new(t("fileTree", "menu.uploadFiles")).build(window, cx)
+                            })
+                            .when(header_capabilities.mutations_enabled, |el| {
+                                el.on_click(cx.listener(|this, _event, window, cx| {
+                                    let Some(context) = this.operation_context(cx) else {
+                                        return;
+                                    };
+                                    if this.operation_busy
+                                        || !matches!(
+                                            &context.backend,
+                                            FileBackendIdentity::Remote { .. }
+                                        )
+                                    {
+                                        return;
+                                    }
+                                    let root = context.root.clone();
+                                    choose_upload_paths(
+                                        cx.entity(),
+                                        context,
+                                        root,
+                                        false,
+                                        window,
+                                        cx,
+                                    );
+                                }))
+                            })
+                            .child(
+                                VectorIcon::new(FILE_SHAPES, px(13.0))
+                                    .overlay(UPLOAD_MARK_SHAPES)
+                                    .ink(ui::text_muted()),
+                            ),
+                        )
+                        .child(
+                            header_action_button(
+                                "file-tree-upload-folder",
+                                header_capabilities.mutations_enabled,
+                            )
+                            .tooltip(|window, cx| {
+                                Tooltip::new(t("fileTree", "menu.uploadFolder")).build(window, cx)
+                            })
+                            .when(header_capabilities.mutations_enabled, |el| {
+                                el.on_click(cx.listener(|this, _event, window, cx| {
+                                    let Some(context) = this.operation_context(cx) else {
+                                        return;
+                                    };
+                                    if this.operation_busy
+                                        || !matches!(
+                                            &context.backend,
+                                            FileBackendIdentity::Remote { .. }
+                                        )
+                                    {
+                                        return;
+                                    }
+                                    let root = context.root.clone();
+                                    choose_upload_paths(
+                                        cx.entity(),
+                                        context,
+                                        root,
+                                        true,
+                                        window,
+                                        cx,
+                                    );
+                                }))
+                            })
+                            .child(
+                                VectorIcon::new(FOLDER_SHAPES, px(13.0))
+                                    .overlay(UPLOAD_MARK_SHAPES)
+                                    .ink(ui::text_muted()),
+                            ),
+                        )
+                    })
+                    .child(
+                        header_action_button("file-tree-paste", header_capabilities.paste_enabled)
+                            .tooltip(|window, cx| {
+                                Tooltip::new(t("fileTree", "menu.paste")).build(window, cx)
+                            })
+                            .when(header_capabilities.paste_enabled, |el| {
+                                el.on_click(cx.listener(|this, _event, window, cx| {
+                                    let Some(context) = this.operation_context(cx) else {
+                                        return;
+                                    };
+                                    if this.operation_busy
+                                        || !this
+                                            .file_clipboard
+                                            .as_ref()
+                                            .is_some_and(|clip| clip.can_paste_into(&context))
+                                    {
+                                        return;
+                                    }
+                                    let root = context.root.clone();
+                                    // paste_file_clipboard 进门会 tree.read；当前 listener
+                                    // 仍持有 FileTree 的 update 租约，直接调用会触发 GPUI
+                                    // double-lease panic。延后一拍，并由业务入口再次校验
+                                    // context/clipboard，避免项目切换时使用旧快照。
+                                    let tree = cx.entity();
+                                    window.defer(cx, move |window, cx| {
+                                        paste_file_clipboard(tree, context, root, window, cx);
+                                    });
+                                }))
+                            })
+                            .child(VectorIcon::new(PASTE_SHAPES, px(13.0)).ink(ui::text_muted())),
+                    )
+                    .child(
+                        header_action_button(
+                            "file-tree-new-file",
+                            header_capabilities.mutations_enabled,
+                        )
+                        .tooltip(|window, cx| {
+                            Tooltip::new(t("fileTree", "menu.newFile")).build(window, cx)
+                        })
+                        .when(header_capabilities.mutations_enabled, |el| {
+                            el.on_click(cx.listener(|this, _event, window, cx| {
+                                let Some(context) = this.operation_context(cx) else {
+                                    return;
+                                };
+                                if this.operation_busy
+                                    || matches!(&context.backend, FileBackendIdentity::BrokenRemote)
+                                {
+                                    return;
+                                }
+                                let root = context.root.clone();
+                                let connection = this.remote_conn(cx);
+                                new_entry_prompt(
+                                    cx.entity(),
+                                    context,
+                                    connection,
+                                    root,
+                                    false,
+                                    window,
+                                    cx,
+                                );
+                            }))
+                        })
+                        .child(
+                            VectorIcon::new(FILE_SHAPES, px(13.0))
+                                .overlay(PLUS_MARK_SHAPES)
+                                .ink(ui::text_muted()),
+                        ),
+                    )
+                    .child(
+                        header_action_button(
+                            "file-tree-new-folder",
+                            header_capabilities.mutations_enabled,
+                        )
+                        .tooltip(|window, cx| {
+                            Tooltip::new(t("fileTree", "menu.newFolder")).build(window, cx)
+                        })
+                        .when(header_capabilities.mutations_enabled, |el| {
+                            el.on_click(cx.listener(|this, _event, window, cx| {
+                                let Some(context) = this.operation_context(cx) else {
+                                    return;
+                                };
+                                if this.operation_busy
+                                    || matches!(&context.backend, FileBackendIdentity::BrokenRemote)
+                                {
+                                    return;
+                                }
+                                let root = context.root.clone();
+                                let connection = this.remote_conn(cx);
+                                new_entry_prompt(
+                                    cx.entity(),
+                                    context,
+                                    connection,
+                                    root,
+                                    true,
+                                    window,
+                                    cx,
+                                );
+                            }))
+                        })
+                        .child(
+                            VectorIcon::new(FOLDER_SHAPES, px(13.0))
+                                .overlay(PLUS_MARK_SHAPES)
+                                .ink(ui::text_muted()),
+                        ),
                     )
                     .when(!is_remote, |el| {
                         el.when_some(default_editor.clone(), |el, current| {
@@ -3067,6 +3456,71 @@ mod tests {
     use super::FileMenuAction::*;
     use super::*;
 
+    #[test]
+    fn 远程下载上下文要求项目根目录和连接身份完全一致() {
+        let context = FileOperationContext {
+            project_id: "project-a".into(),
+            root: PathBuf::from("/workspace"),
+            backend: FileBackendIdentity::Remote {
+                connection_id: "ssh-a".into(),
+                connection_fingerprint: 7,
+            },
+            generation: 3,
+        };
+        assert!(remote_download_context_matches(
+            &context,
+            "project-a",
+            "/workspace",
+            "ssh-a",
+            7,
+        ));
+        assert!(!remote_download_context_matches(
+            &context,
+            "project-b",
+            "/workspace",
+            "ssh-a",
+            7,
+        ));
+        assert!(!remote_download_context_matches(
+            &context,
+            "project-a",
+            "/other",
+            "ssh-a",
+            7,
+        ));
+        assert!(!remote_download_context_matches(
+            &context,
+            "project-a",
+            "/workspace",
+            "ssh-b",
+            7,
+        ));
+        assert!(!remote_download_context_matches(
+            &context,
+            "project-a",
+            "/workspace",
+            "ssh-a",
+            8,
+        ));
+
+        for backend in [
+            FileBackendIdentity::Local,
+            FileBackendIdentity::BrokenRemote,
+        ] {
+            let context = FileOperationContext {
+                backend,
+                ..context.clone()
+            };
+            assert!(!remote_download_context_matches(
+                &context,
+                "project-a",
+                "/workspace",
+                "ssh-a",
+                7,
+            ));
+        }
+    }
+
     /// 文件的菜单:「使用默认工具打开」在最前(原版 unshift),没有「新建」两项。
     ///
     /// ⚠️ Y 批把「查看变更」接了上去(V 批的 `open_file_diff` 已就绪),
@@ -3461,5 +3915,59 @@ mod tests {
         }
         // 认不出的字母不参与汇总(优先级 0)
         assert_eq!(git_priority("X"), 0);
+    }
+
+    #[test]
+    fn 文件树头部动作按后端和忙碌状态收口() {
+        let local = FileOperationContext {
+            project_id: "p".into(),
+            root: PathBuf::from("/work"),
+            backend: FileBackendIdentity::Local,
+            generation: 1,
+        };
+        let clip = FileClipboardEntry {
+            project_id: "p".into(),
+            root: PathBuf::from("/work"),
+            backend: FileBackendIdentity::Local,
+            generation: 1,
+            source: PathBuf::from("/work/a.txt"),
+            is_dir: false,
+        };
+        assert_eq!(
+            header_action_capabilities(Some(&local), false, Some(&clip)),
+            HeaderActionCapabilities {
+                show_upload: false,
+                mutations_enabled: true,
+                paste_enabled: true,
+            }
+        );
+        assert_eq!(
+            header_action_capabilities(Some(&local), true, Some(&clip)),
+            HeaderActionCapabilities {
+                show_upload: false,
+                mutations_enabled: false,
+                paste_enabled: false,
+            }
+        );
+
+        let mut remote = local.clone();
+        remote.backend = FileBackendIdentity::Remote {
+            connection_id: "ssh".into(),
+            connection_fingerprint: 7,
+        };
+        let remote_caps = header_action_capabilities(Some(&remote), false, None);
+        assert!(remote_caps.show_upload && remote_caps.mutations_enabled);
+        assert!(!remote_caps.paste_enabled);
+
+        let mut broken = remote;
+        broken.backend = FileBackendIdentity::BrokenRemote;
+        assert_eq!(
+            header_action_capabilities(Some(&broken), false, None),
+            HeaderActionCapabilities {
+                show_upload: false,
+                mutations_enabled: false,
+                paste_enabled: false,
+            }
+        );
     }
 }

@@ -83,13 +83,6 @@ pub mod kind {
     /// worktree 删除确认。**与 [`GIT_WORKTREE`] 不同种类**,所以能叠在它之上
     /// (原版就是嵌套弹窗,`GitWorktreeModal.tsx:779` 的「Esc 归栈顶,不会误关外层」)。
     pub const GIT_WORKTREE_REMOVE: &str = "git-worktree-remove";
-    /// 文件预览器(`FileViewerModal`:文件树单击文件 / 全局搜索单击结果)。
-    ///
-    /// **原版是两处各挂一份**(`FileTree.tsx:838` 与 `SearchModal.tsx:356`),
-    /// 靠 `viewFilePath` 状态各管各的;GPUI 侧做成单例 —— 两个入口调同一个
-    /// [`crate::file_viewer::open`],防叠开 / Esc / 快捷键让路一次到位。
-    /// 「已经开着时再点另一条搜索结果」不是叠开,是换文件(见 `file_viewer::open`)。
-    pub const FILE_VIEWER: &str = "file-viewer";
     /// 「移动端」面板(中转地址 / 配对二维码 / AI 启动器)。原版没有防叠开,
     /// 是 audit 记的缺口;重置配对的确认框是**另一种类**,照样能叠在它之上。
     pub const MOBILE_RELAY: &str = "mobile-relay";

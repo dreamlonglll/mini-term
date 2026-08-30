@@ -51,6 +51,117 @@ pub enum SftpNodeKind {
     Other,
 }
 
+/// A bounded full-file read. [`TooLarge`](Self::TooLarge) means the reader
+/// observed at least `max_bytes + 1` bytes without retaining the rest of the
+/// remote file in memory.
+#[derive(Clone, PartialEq, Eq)]
+pub enum SftpBoundedFileRead {
+    Complete(Vec<u8>),
+    TooLarge,
+}
+
+impl std::fmt::Debug for SftpBoundedFileRead {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Complete(bytes) => formatter
+                .debug_struct("Complete")
+                .field("byte_len", &bytes.len())
+                .finish(),
+            Self::TooLarge => formatter.write_str("TooLarge"),
+        }
+    }
+}
+
+impl SftpBoundedFileRead {
+    /// Whether this complete bounded read is byte-for-byte equal to a saved
+    /// baseline. Oversized files can never match an editable baseline.
+    pub fn matches_bytes(&self, expected: &[u8]) -> bool {
+        matches!(self, Self::Complete(bytes) if bytes.as_slice() == expected)
+    }
+}
+
+/// Outcome of a staged in-memory file replacement. A normal optimistic save
+/// can discover a late external change after staging but before promotion.
+#[derive(Clone, PartialEq, Eq)]
+pub enum SftpFileReplaceResult {
+    Replaced { cleanup_warning: Option<String> },
+    ExternalChange(SftpBoundedFileRead),
+}
+
+impl std::fmt::Debug for SftpFileReplaceResult {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Replaced { cleanup_warning } => formatter
+                .debug_struct("Replaced")
+                .field("has_cleanup_warning", &cleanup_warning.is_some())
+                .finish(),
+            Self::ExternalChange(current) => formatter
+                .debug_tuple("ExternalChange")
+                .field(current)
+                .finish(),
+        }
+    }
+}
+
+/// A failed promotion probe permits rollback only when both follow-up lstats
+/// produced an unambiguous state. Transport errors are not evidence that the
+/// target is absent: promotion may already have succeeded on the server.
+fn can_restore_verified_backup(
+    target_state: &Result<Option<SftpNodeKind>, SftpTransferError>,
+    backup_state: &Result<Option<SftpNodeKind>, SftpTransferError>,
+) -> bool {
+    matches!(target_state, Ok(None)) && matches!(backup_state, Ok(Some(SftpNodeKind::File)))
+}
+
+/// A failed promotion reply is accepted only when the staging name disappeared
+/// and the verified regular-file backup still exists. Matching target bytes
+/// alone are insufficient because another writer can create identical content.
+fn can_accept_verified_promotion(
+    staging_state: &Result<Option<SftpNodeKind>, SftpTransferError>,
+    backup_state: &Result<Option<SftpNodeKind>, SftpTransferError>,
+) -> bool {
+    matches!(staging_state, Ok(None)) && matches!(backup_state, Ok(Some(SftpNodeKind::File)))
+}
+
+fn stale_editor_backup_kind(
+    target_kind: Option<SftpNodeKind>,
+    backup_kind: Option<SftpNodeKind>,
+) -> Option<SftpNodeKind> {
+    match (target_kind, backup_kind) {
+        (Some(SftpNodeKind::File), Some(kind)) => Some(kind),
+        _ => None,
+    }
+}
+
+fn verify_stale_editor_backup_cleanup(
+    backup: &str,
+    remove_error: Option<SftpTransferError>,
+    backup_state: Result<Option<SftpNodeKind>, SftpTransferError>,
+) -> Result<(), SftpTransferError> {
+    match backup_state {
+        Ok(None) => Ok(()),
+        Ok(Some(kind)) => {
+            let remove_detail = remove_error
+                .as_ref()
+                .map(|error| format!("; remove failed: {}", error.message()))
+                .unwrap_or_default();
+            Err(SftpTransferError::Sftp(format!(
+                "stale remote editor backup cleanup did not remove '{backup}' (remaining type {kind:?}){remove_detail}"
+            )))
+        }
+        Err(probe_error) => {
+            let remove_detail = remove_error
+                .as_ref()
+                .map(|error| format!("remove failed: {}; ", error.message()))
+                .unwrap_or_default();
+            Err(SftpTransferError::Sftp(format!(
+                "stale remote editor backup cleanup state is uncertain at '{backup}': {remove_detail}verification failed: {}",
+                probe_error.message()
+            )))
+        }
+    }
+}
+
 /// 打开在某条 session 上的 SFTP 会话句柄。可跨多次操作复用;用完调 [`Self::close`]
 /// (或直接 drop,底层 channel 随之关闭,close 只是显式礼貌收尾)。
 pub struct SftpHandle {
@@ -234,6 +345,115 @@ impl SftpHandle {
             out.extend_from_slice(&buf[..n]);
         }
         Ok(out)
+    }
+
+    /// Read a complete regular file up to `max_bytes`, using one additional
+    /// byte to distinguish an exact-limit file from an oversized one.
+    ///
+    /// The leaf is checked with `lstat` before and after the read so a symlink
+    /// or special entry is never accepted as an editor document. Project-root
+    /// containment remains the caller's responsibility because this crate
+    /// intentionally has no project model.
+    pub async fn read_file_bounded(
+        &self,
+        path: &str,
+        max_bytes: usize,
+    ) -> Result<SftpBoundedFileRead, SftpTransferError> {
+        ensure_regular_file(self.node_kind(path).await?, path)?;
+        let probe_bytes = max_bytes.checked_add(1).ok_or_else(|| {
+            SftpTransferError::Sftp("bounded SFTP read limit is too large".into())
+        })?;
+        let bytes = self.read_from_offset(path, 0, probe_bytes).await?;
+        ensure_regular_file(self.node_kind(path).await?, path)?;
+        Ok(classify_bounded_file_bytes(bytes, max_bytes))
+    }
+
+    /// Refuse an ambiguous deterministic editor backup instead of restoring it
+    /// automatically. Read-side validation uses this non-mutating guard;
+    /// replacement performs stale-backup cleanup separately before staging.
+    ///
+    /// The caller must already have canonicalized and root-checked the parent.
+    /// Recovery data is deliberately kept in place for explicit/manual action.
+    pub async fn guard_file_replacement_state(
+        &self,
+        target: &str,
+    ) -> Result<(), SftpTransferError> {
+        let backup = editor_backup_path(target)?;
+        let target_kind = self.try_node_kind(target).await?;
+        let backup_kind = self.try_node_kind(&backup).await?;
+        if let Some(kind) = ambiguous_editor_recovery_kind(target_kind, backup_kind) {
+            Err(SftpTransferError::Sftp(format!(
+                "remote editor recovery state is ambiguous: target '{target}' is missing and recovery data ({kind:?}) remains at '{backup}'; automatic restore was refused"
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Prepare the deterministic backup name for a new replacement. A regular
+    /// target proves an existing regular backup is stale cleanup residue from a
+    /// committed save; remove it and verify absence before creating staging.
+    /// Missing/uncertain targets and unexpected backup types remain fail-closed.
+    async fn prepare_file_replacement_state(&self, target: &str) -> Result<(), SftpTransferError> {
+        let backup = editor_backup_path(target)?;
+        let target_kind = self.try_node_kind(target).await?;
+        let backup_kind = self.try_node_kind(&backup).await?;
+        if let Some(kind) = ambiguous_editor_recovery_kind(target_kind, backup_kind) {
+            return Err(SftpTransferError::Sftp(format!(
+                "remote editor recovery state is ambiguous: target '{target}' is missing and recovery data ({kind:?}) remains at '{backup}'; automatic restore was refused"
+            )));
+        }
+        let Some(stale_kind) = stale_editor_backup_kind(target_kind, backup_kind) else {
+            return Ok(());
+        };
+        if stale_kind != SftpNodeKind::File {
+            return Err(SftpTransferError::Sftp(format!(
+                "remote editor backup has unexpected type {stale_kind:?} at '{backup}'; refusing to remove recovery data"
+            )));
+        }
+
+        let remove_error = self.remove_file(&backup).await.err();
+        let backup_state = self.try_node_kind(&backup).await;
+        verify_stale_editor_backup_cleanup(&backup, remove_error, backup_state)
+    }
+
+    async fn regular_file_permissions(&self, path: &str) -> Result<u32, SftpTransferError> {
+        let metadata = self.sftp.symlink_metadata(path).await.map_err(|error| {
+            SftpTransferError::Sftp(format!("sftp lstat '{path}' failed: {error}"))
+        })?;
+        let file_type = metadata.file_type();
+        let kind = if file_type.is_symlink() {
+            SftpNodeKind::Symlink
+        } else if file_type.is_dir() {
+            SftpNodeKind::Directory
+        } else if file_type.is_file() {
+            SftpNodeKind::File
+        } else {
+            SftpNodeKind::Other
+        };
+        ensure_regular_file(kind, path)?;
+        metadata.permissions.ok_or_else(|| {
+            SftpTransferError::Sftp(format!(
+                "remote server omitted permissions for editor target '{path}'"
+            ))
+        })
+    }
+
+    async fn set_file_permissions(
+        &self,
+        path: &str,
+        permissions: u32,
+    ) -> Result<(), SftpTransferError> {
+        let mut attributes = russh_sftp::protocol::FileAttributes::empty();
+        attributes.permissions = Some(permissions);
+        self.sftp
+            .set_metadata(path, attributes)
+            .await
+            .map_err(|error| {
+                SftpTransferError::Sftp(format!(
+                    "sftp preserve permissions on '{path}' failed: {error}"
+                ))
+            })
     }
 
     /// 逐级创建远程目录(`mkdir -p` 语义)。`path` 必须是 POSIX 绝对路径。
@@ -455,6 +675,339 @@ impl SftpHandle {
             ))
         })?;
         Ok(())
+    }
+
+    async fn replace_staged_regular_file(
+        &self,
+        staging: &str,
+        target: &str,
+        contents: &[u8],
+        max_bytes: usize,
+        expected_current: Option<&[u8]>,
+    ) -> Result<SftpFileReplaceResult, SftpTransferError> {
+        let backup = match editor_backup_path(target) {
+            Ok(backup) => backup,
+            Err(error) => return Err(self.with_staging_cleanup_error(error, staging).await),
+        };
+        let backup_kind = match self.try_node_kind(&backup).await {
+            Ok(kind) => kind,
+            Err(error) => return Err(self.with_staging_cleanup_error(error, staging).await),
+        };
+        if let Some(kind) = backup_kind {
+            let error = SftpTransferError::Sftp(format!(
+                "remote editor backup already exists with type {kind:?}: '{backup}'; refusing to overwrite recovery data"
+            ));
+            return Err(self.with_staging_cleanup_error(error, staging).await);
+        }
+
+        let mut state_warning = None;
+        if let Some(error) = self.rename(target, &backup).await.err() {
+            let target_kind = self.try_node_kind(target).await;
+            let backup_kind = self.try_node_kind(&backup).await;
+            match (target_kind, backup_kind) {
+                (Ok(None), Ok(Some(SftpNodeKind::File))) => {
+                    // The request timed out or lost its reply after the server
+                    // completed the rename. Continue from the observed state.
+                    state_warning = Some(format!(
+                        "isolation reply was lost but the backup state was verified: {}",
+                        error.message()
+                    ));
+                }
+                (Ok(Some(SftpNodeKind::File)), Ok(None)) => {
+                    return Err(self.with_staging_cleanup_error(error, staging).await);
+                }
+                (target_state, backup_state) => {
+                    return Err(SftpTransferError::Sftp(format!(
+                        "remote editor isolation state is uncertain after '{}': target={target_state:?}, backup={backup_state:?}; recovery data kept at '{backup}', staging kept at '{staging}'",
+                        error.message()
+                    )));
+                }
+            }
+        }
+
+        let isolated = match self.read_file_bounded(&backup, max_bytes).await {
+            Ok(current) => current,
+            Err(error) => {
+                return Err(self
+                    .rollback_staged_regular_file(&backup, target, staging, error)
+                    .await);
+            }
+        };
+        let changed = matches!(&isolated, SftpBoundedFileRead::TooLarge)
+            || expected_current.is_some_and(|expected| !isolated.matches_bytes(expected));
+        if changed {
+            if let Err(rollback_error) = self.rename(&backup, target).await {
+                return Err(SftpTransferError::Sftp(format!(
+                    "remote file changed after isolation; rollback request failed: {}; target/backup/staging final state is uncertain; recovery paths are backup='{}', staging='{}'",
+                    rollback_error.message(),
+                    backup,
+                    staging
+                )));
+            }
+            self.discard_file_staging(staging).await.map_err(|cleanup_error| {
+                SftpTransferError::Sftp(format!(
+                    "remote file changed after isolation; staging cleanup failed at '{staging}': {}",
+                    cleanup_error.message()
+                ))
+            })?;
+            return Ok(SftpFileReplaceResult::ExternalChange(isolated));
+        }
+
+        let permissions = match self.regular_file_permissions(&backup).await {
+            Ok(permissions) => permissions,
+            Err(error) => {
+                return Err(self
+                    .rollback_staged_regular_file(&backup, target, staging, error)
+                    .await);
+            }
+        };
+        if let Err(error) = self.set_file_permissions(staging, permissions).await {
+            return Err(self
+                .rollback_staged_regular_file(&backup, target, staging, error)
+                .await);
+        }
+        if let Err(error) = self
+            .node_kind(staging)
+            .await
+            .and_then(|kind| ensure_regular_file(kind, staging))
+        {
+            return Err(self
+                .rollback_staged_regular_file(&backup, target, staging, error)
+                .await);
+        }
+
+        let promote_error = self.rename(staging, target).await.err();
+        let promote_error_message = promote_error
+            .as_ref()
+            .map(|error| error.message().to_string());
+        match self.read_file_bounded(target, max_bytes).await {
+            Ok(current) if current.matches_bytes(contents) => {
+                let actual_permissions = self
+                    .regular_file_permissions(target)
+                    .await
+                    .map_err(|error| {
+                        SftpTransferError::Sftp(format!(
+                            "remote editor promotion contents were verified but permissions could not be checked: {}; backup remains at '{backup}', staging path='{staging}'",
+                            error.message()
+                        ))
+                    })?;
+                if actual_permissions != permissions {
+                    return Err(SftpTransferError::Sftp(format!(
+                        "remote editor promotion installed unexpected permissions: expected {permissions:o}, found {actual_permissions:o}; backup remains at '{backup}', staging path='{staging}'"
+                    )));
+                }
+                if let Some(error) = promote_error.as_ref() {
+                    let staging_state = self.try_node_kind(staging).await;
+                    let backup_state = self.try_node_kind(&backup).await;
+                    if !can_accept_verified_promotion(&staging_state, &backup_state) {
+                        return Err(SftpTransferError::Sftp(format!(
+                            "remote editor promotion reply failed and completion could not be verified after '{}': staging={staging_state:?}, backup={backup_state:?}; target contents were matched but recovery data was preserved at backup='{backup}', staging='{staging}'",
+                            error.message()
+                        )));
+                    }
+                }
+            }
+            Ok(current) => {
+                let observed = match current {
+                    SftpBoundedFileRead::Complete(bytes) => {
+                        format!("{} bytes", bytes.len())
+                    }
+                    SftpBoundedFileRead::TooLarge => "more than the editor limit".into(),
+                };
+                return Err(SftpTransferError::Sftp(format!(
+                    "remote editor promotion did not install the staged contents; target now has {observed}; backup remains at '{backup}', staging state is unchanged or unknown"
+                )));
+            }
+            Err(error) => {
+                let target_state = self.try_node_kind(target).await;
+                let backup_state = self.try_node_kind(&backup).await;
+                if can_restore_verified_backup(&target_state, &backup_state) {
+                    let rollback_result = self.rename(&backup, target).await;
+                    let original = promote_error.unwrap_or(error);
+                    return match rollback_result {
+                        Ok(()) => Err(self.with_staging_cleanup_error(original, staging).await),
+                        Err(rollback_error) => Err(SftpTransferError::Sftp(format!(
+                            "{}; promotion state could not be read and rollback request failed: {}; target/backup/staging final state is uncertain; recovery paths are backup='{}', staging='{}'",
+                            original.message(),
+                            rollback_error.message(),
+                            backup,
+                            staging
+                        ))),
+                    };
+                }
+                return Err(SftpTransferError::Sftp(format!(
+                    "remote editor promotion state is uncertain after '{}': target={target_state:?}, backup={backup_state:?}; recovery backup path='{}', staging path='{}' (final presence unknown)",
+                    error.message(),
+                    backup,
+                    staging
+                )));
+            }
+        }
+
+        let mut warning = state_warning;
+        if let Some(error) = promote_error_message.as_deref() {
+            push_warning(
+                &mut warning,
+                format!(
+                    "promotion reply was lost but the target contents were verified: {}",
+                    error
+                ),
+            );
+        }
+        if let Err(error) = self.remove_file(&backup).await {
+            push_warning(
+                &mut warning,
+                format!(
+                    "replacement succeeded but recovery backup cleanup failed at '{backup}': {}",
+                    error.message()
+                ),
+            );
+        }
+        Ok(SftpFileReplaceResult::Replaced {
+            cleanup_warning: warning,
+        })
+    }
+
+    async fn rollback_staged_regular_file(
+        &self,
+        backup: &str,
+        target: &str,
+        staging: &str,
+        reason: SftpTransferError,
+    ) -> SftpTransferError {
+        match self.rename(backup, target).await {
+            Ok(()) => self.with_staging_cleanup_error(reason, staging).await,
+            Err(rollback_error) => SftpTransferError::Sftp(format!(
+                "{}; rollback request failed: {}; target/backup/staging final state is uncertain; recovery paths are backup='{}', staging='{}'",
+                reason.message(),
+                rollback_error.message(),
+                backup,
+                staging
+            )),
+        }
+    }
+
+    /// Replace an existing regular remote file with bounded in-memory data.
+    ///
+    /// Contents are written to an exclusive, same-directory staging file and
+    /// closed before the editor-specific backup-swap/rollback sequence. The target type is
+    /// checked both before staging and immediately before promotion. A failed staging write keeps
+    /// the original error and appends any cleanup failure instead of silently
+    /// discarding it. The target is read again after staging so the size/type
+    /// limit still applies to force-save; when `expected_current` is present,
+    /// byte changes are also returned without promoting the staged content.
+    pub async fn replace_file_contents(
+        &self,
+        target: &str,
+        contents: &[u8],
+        max_bytes: usize,
+        expected_current: Option<&[u8]>,
+    ) -> Result<SftpFileReplaceResult, SftpTransferError> {
+        use russh_sftp::protocol::{FileAttributes, OpenFlags};
+
+        if contents.len() > max_bytes {
+            return Err(SftpTransferError::Sftp(format!(
+                "remote file contents exceed the {max_bytes}-byte limit"
+            )));
+        }
+        self.prepare_file_replacement_state(target).await?;
+        ensure_regular_file(self.node_kind(target).await?, target)?;
+        let permissions = self.regular_file_permissions(target).await?;
+        let mut attributes = FileAttributes::empty();
+        attributes.permissions = Some(permissions);
+
+        let staging = unique_sibling_path(target, "partial");
+        let mut remote = match self
+            .sftp
+            .open_with_flags_and_attributes(
+                &staging,
+                OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::EXCLUDE,
+                attributes,
+            )
+            .await
+        {
+            Ok(remote) => remote,
+            Err(error) => {
+                let original =
+                    SftpTransferError::Sftp(format!("sftp create '{staging}' failed: {error}"));
+                let staging_state = self.try_node_kind(&staging).await;
+                return Err(staging_create_error(original, &staging, staging_state));
+            }
+        };
+
+        let write_result: Result<(), SftpTransferError> = async {
+            for chunk in contents.chunks(SFTP_READ_CHUNK_BYTES) {
+                remote.write_all(chunk).await.map_err(|error| {
+                    SftpTransferError::Sftp(format!("sftp write '{staging}' failed: {error}"))
+                })?;
+            }
+            remote.flush().await.map_err(|error| {
+                SftpTransferError::Sftp(format!("sftp flush '{staging}' failed: {error}"))
+            })?;
+            remote.shutdown().await.map_err(|error| {
+                SftpTransferError::Sftp(format!("sftp close '{staging}' failed: {error}"))
+            })?;
+            Ok(())
+        }
+        .await;
+        drop(remote);
+
+        if let Err(error) = write_result {
+            return Err(self.with_staging_cleanup_error(error, &staging).await);
+        }
+        // Always re-read after staging, including force-save. Force may skip the
+        // byte-equality comparison, but it must not skip the maximum target size
+        // check or the regular-file checks performed by read_file_bounded.
+        let current = match self.read_file_bounded(target, max_bytes).await {
+            Ok(current) => current,
+            Err(error) => {
+                return Err(self.with_staging_cleanup_error(error, &staging).await);
+            }
+        };
+        let changed = matches!(&current, SftpBoundedFileRead::TooLarge)
+            || expected_current.is_some_and(|expected| !current.matches_bytes(expected));
+        if changed {
+            self.discard_file_staging(&staging)
+                .await
+                .map_err(|cleanup_error| {
+                    SftpTransferError::Sftp(format!(
+                        "remote file changed before promotion; staging cleanup failed at \
+                     '{staging}': {}",
+                        cleanup_error.message()
+                    ))
+                })?;
+            return Ok(SftpFileReplaceResult::ExternalChange(current));
+        }
+        if let Err(error) = self
+            .node_kind(target)
+            .await
+            .and_then(|kind| ensure_regular_file(kind, target))
+        {
+            return Err(self.with_staging_cleanup_error(error, &staging).await);
+        }
+
+        self.replace_staged_regular_file(&staging, target, contents, max_bytes, expected_current)
+            .await
+    }
+
+    async fn with_staging_cleanup_error(
+        &self,
+        original: SftpTransferError,
+        staging: &str,
+    ) -> SftpTransferError {
+        let cleanup = self.discard_file_staging(staging).await;
+        append_cleanup_error(original, cleanup, staging)
+    }
+
+    async fn discard_file_staging(&self, staging: &str) -> Result<(), SftpTransferError> {
+        match self.try_node_kind(staging).await {
+            Ok(None) => Ok(()),
+            Ok(Some(SftpNodeKind::Directory)) => Err(SftpTransferError::Sftp(format!(
+                "refusing to recursively remove unexpected staging directory '{staging}'"
+            ))),
+            Ok(Some(_)) => self.remove_file(staging).await,
+            Err(error) => Err(error),
+        }
     }
 
     /// 把本地文件流式写到远端。新目标直接用 EXCLUDE 排他创建，避免提交阶段
@@ -708,6 +1261,65 @@ impl SftpHandle {
     }
 }
 
+fn ensure_regular_file(kind: SftpNodeKind, path: &str) -> Result<(), SftpTransferError> {
+    match kind {
+        SftpNodeKind::File => Ok(()),
+        SftpNodeKind::Directory => Err(SftpTransferError::Sftp(format!(
+            "remote editor target is a directory: '{path}'"
+        ))),
+        SftpNodeKind::Symlink => Err(SftpTransferError::Sftp(format!(
+            "remote editor target is a symbolic link: '{path}'"
+        ))),
+        SftpNodeKind::Other => Err(SftpTransferError::Sftp(format!(
+            "remote editor target is not a regular file: '{path}'"
+        ))),
+    }
+}
+
+fn classify_bounded_file_bytes(bytes: Vec<u8>, max_bytes: usize) -> SftpBoundedFileRead {
+    if bytes.len() > max_bytes {
+        SftpBoundedFileRead::TooLarge
+    } else {
+        SftpBoundedFileRead::Complete(bytes)
+    }
+}
+
+fn append_cleanup_error(
+    original: SftpTransferError,
+    cleanup: Result<(), SftpTransferError>,
+    staging: &str,
+) -> SftpTransferError {
+    match cleanup {
+        Ok(()) => original,
+        Err(cleanup_error) => SftpTransferError::Sftp(format!(
+            "{}; staging cleanup failed at '{}': {}",
+            original.message(),
+            staging,
+            cleanup_error.message()
+        )),
+    }
+}
+
+fn staging_create_error(
+    original: SftpTransferError,
+    staging: &str,
+    staging_state: Result<Option<SftpNodeKind>, SftpTransferError>,
+) -> SftpTransferError {
+    match staging_state {
+        Ok(None) => original,
+        Ok(Some(kind)) => SftpTransferError::Sftp(format!(
+            "{}; the create reply failed but staging now exists as {kind:?} at '{staging}'; ownership is uncertain, so the path was preserved for manual recovery",
+            original.message()
+        )),
+        Err(probe_error) => SftpTransferError::Sftp(format!(
+            "{}; staging final state is uncertain at '{}': {}",
+            original.message(),
+            staging,
+            probe_error.message()
+        )),
+    }
+}
+
 fn split_parent_name(path: &str) -> Result<(&str, &str), SftpTransferError> {
     let trimmed = path.trim_end_matches('/');
     if trimmed.is_empty() || trimmed == "/" {
@@ -749,6 +1361,33 @@ fn unique_sibling_path(target: &str, role: &str) -> String {
             std::process::id()
         )
     }
+}
+
+fn editor_backup_path(target: &str) -> Result<String, SftpTransferError> {
+    let (parent, name) = split_parent_name(target)?;
+    if parent == "/" {
+        Ok(format!("/.{name}.mt-editor-backup"))
+    } else {
+        Ok(format!("{parent}/.{name}.mt-editor-backup"))
+    }
+}
+
+fn ambiguous_editor_recovery_kind(
+    target_kind: Option<SftpNodeKind>,
+    backup_kind: Option<SftpNodeKind>,
+) -> Option<SftpNodeKind> {
+    if target_kind.is_none() {
+        backup_kind
+    } else {
+        None
+    }
+}
+
+fn push_warning(warning: &mut Option<String>, message: String) {
+    *warning = Some(match warning.take() {
+        Some(existing) => format!("{existing}; {message}"),
+        None => message,
+    });
 }
 
 fn unique_local_sibling(target: &Path, role: &str) -> std::path::PathBuf {
@@ -798,4 +1437,213 @@ fn ensure_same_local_file(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn editor_file_kind_guard_rejects_non_regular_entries() {
+        assert!(ensure_regular_file(SftpNodeKind::File, "/p/a.txt").is_ok());
+        for kind in [
+            SftpNodeKind::Directory,
+            SftpNodeKind::Symlink,
+            SftpNodeKind::Other,
+        ] {
+            let error = ensure_regular_file(kind, "/p/a.txt").unwrap_err();
+            assert!(error.message().contains("/p/a.txt"));
+        }
+    }
+
+    #[test]
+    fn bounded_file_read_classifies_the_exact_limit_and_one_extra_byte() {
+        let exact = classify_bounded_file_bytes(vec![0; 4], 4);
+        assert_eq!(exact, SftpBoundedFileRead::Complete(vec![0; 4]));
+        assert!(exact.matches_bytes(&[0; 4]));
+        assert_eq!(
+            classify_bounded_file_bytes(vec![0; 5], 4),
+            SftpBoundedFileRead::TooLarge
+        );
+        assert!(!SftpBoundedFileRead::TooLarge.matches_bytes(&[0; 4]));
+    }
+
+    #[test]
+    fn remote_editor_debug_output_does_not_expose_file_bytes_or_cleanup_errors() {
+        let read = SftpBoundedFileRead::Complete(b"remote-secret".to_vec());
+        let read_debug = format!("{read:?}");
+        assert!(read_debug.contains("byte_len"));
+        assert!(!read_debug.contains("remote-secret"));
+
+        let replaced = SftpFileReplaceResult::Replaced {
+            cleanup_warning: Some("/private/path: permission denied".into()),
+        };
+        let replace_debug = format!("{replaced:?}");
+        assert!(replace_debug.contains("has_cleanup_warning"));
+        assert!(!replace_debug.contains("/private/path"));
+    }
+
+    #[test]
+    fn automatic_editor_recovery_refuses_only_missing_targets_with_backup_data() {
+        assert_eq!(
+            ambiguous_editor_recovery_kind(None, Some(SftpNodeKind::File)),
+            Some(SftpNodeKind::File)
+        );
+        assert_eq!(
+            ambiguous_editor_recovery_kind(None, Some(SftpNodeKind::Other)),
+            Some(SftpNodeKind::Other)
+        );
+        assert_eq!(
+            ambiguous_editor_recovery_kind(Some(SftpNodeKind::File), Some(SftpNodeKind::File)),
+            None
+        );
+        assert_eq!(ambiguous_editor_recovery_kind(None, None), None);
+    }
+
+    #[test]
+    fn committed_target_classifies_regular_backup_as_stale_cleanup_residue() {
+        assert_eq!(
+            stale_editor_backup_kind(Some(SftpNodeKind::File), Some(SftpNodeKind::File)),
+            Some(SftpNodeKind::File)
+        );
+        assert_eq!(
+            stale_editor_backup_kind(None, Some(SftpNodeKind::File)),
+            None,
+            "missing targets must preserve ambiguous recovery data"
+        );
+        assert_eq!(
+            stale_editor_backup_kind(Some(SftpNodeKind::Directory), Some(SftpNodeKind::File)),
+            None,
+            "invalid targets must not authorize backup deletion"
+        );
+        assert_eq!(
+            stale_editor_backup_kind(Some(SftpNodeKind::File), None),
+            None
+        );
+        assert_eq!(
+            stale_editor_backup_kind(Some(SftpNodeKind::File), Some(SftpNodeKind::Directory)),
+            Some(SftpNodeKind::Directory),
+            "the caller must see and refuse an unexpected backup type"
+        );
+    }
+
+    #[test]
+    fn stale_backup_cleanup_requires_verified_absence() {
+        let path = "/srv/project/.notes.md.mt-editor-backup";
+        assert!(
+            verify_stale_editor_backup_cleanup(path, None, Ok(None)).is_ok(),
+            "verified absence permits the next save"
+        );
+        assert!(
+            verify_stale_editor_backup_cleanup(
+                path,
+                Some(SftpTransferError::Transport("lost reply".into())),
+                Ok(None),
+            )
+            .is_ok(),
+            "a lost remove reply is harmless once absence is verified"
+        );
+
+        let remains = verify_stale_editor_backup_cleanup(
+            path,
+            Some(SftpTransferError::Sftp("permission denied".into())),
+            Ok(Some(SftpNodeKind::File)),
+        )
+        .unwrap_err();
+        assert!(remains.message().contains("permission denied"));
+        assert!(remains.message().contains("remaining type File"));
+
+        let uncertain = verify_stale_editor_backup_cleanup(
+            path,
+            None,
+            Err(SftpTransferError::Transport("lstat timeout".into())),
+        )
+        .unwrap_err();
+        assert!(uncertain.message().contains("state is uncertain"));
+        assert!(uncertain.message().contains("lstat timeout"));
+    }
+
+    #[test]
+    fn editor_staging_paths_are_hidden_unique_siblings() {
+        let first = unique_sibling_path("/srv/project/src/main.rs", "partial");
+        let second = unique_sibling_path("/srv/project/src/main.rs", "partial");
+        assert!(first.starts_with("/srv/project/src/.main.rs.mt-partial-"));
+        assert!(second.starts_with("/srv/project/src/.main.rs.mt-partial-"));
+        assert_ne!(first, second);
+
+        let root_child = unique_sibling_path("/notes.md", "backup");
+        assert!(root_child.starts_with("/.notes.md.mt-backup-"));
+
+        assert_eq!(
+            editor_backup_path("/srv/project/src/main.rs").unwrap(),
+            "/srv/project/src/.main.rs.mt-editor-backup"
+        );
+        assert_eq!(
+            editor_backup_path("/notes.md").unwrap(),
+            "/.notes.md.mt-editor-backup"
+        );
+    }
+
+    #[test]
+    fn staging_cleanup_errors_preserve_the_original_failure() {
+        let original = SftpTransferError::Sftp("write failed".into());
+        let cleanup = SftpTransferError::Sftp("permission denied".into());
+        let combined = append_cleanup_error(original, Err(cleanup), "/p/.a.partial");
+        assert!(combined.message().contains("write failed"));
+        assert!(combined.message().contains("permission denied"));
+        assert!(combined.message().contains("/p/.a.partial"));
+    }
+
+    #[test]
+    fn promotion_probe_errors_never_authorize_rollback() {
+        let missing = Ok(None);
+        let backup = Ok(Some(SftpNodeKind::File));
+        assert!(can_restore_verified_backup(&missing, &backup));
+
+        let target_error = Err(SftpTransferError::Transport("timeout".into()));
+        assert!(!can_restore_verified_backup(&target_error, &backup));
+        let backup_error = Err(SftpTransferError::Sftp("lstat failed".into()));
+        assert!(!can_restore_verified_backup(&missing, &backup_error));
+        let replaced = Ok(Some(SftpNodeKind::File));
+        assert!(!can_restore_verified_backup(&replaced, &backup));
+    }
+
+    #[test]
+    fn lost_promotion_requires_missing_staging_and_regular_backup() {
+        let missing = Ok(None);
+        let backup = Ok(Some(SftpNodeKind::File));
+        assert!(can_accept_verified_promotion(&missing, &backup));
+
+        let staging_remains = Ok(Some(SftpNodeKind::File));
+        assert!(!can_accept_verified_promotion(&staging_remains, &backup));
+        let no_backup = Ok(None);
+        assert!(!can_accept_verified_promotion(&missing, &no_backup));
+        let staging_probe_failed = Err(SftpTransferError::Transport("timeout".into()));
+        assert!(!can_accept_verified_promotion(
+            &staging_probe_failed,
+            &backup
+        ));
+    }
+
+    #[test]
+    fn staging_create_failure_reports_observed_or_uncertain_state() {
+        let path = "/srv/project/.notes.md.mt-partial";
+        let existing = staging_create_error(
+            SftpTransferError::Sftp("create timed out".into()),
+            path,
+            Ok(Some(SftpNodeKind::File)),
+        );
+        assert!(existing.message().contains("create timed out"));
+        assert!(existing.message().contains("ownership is uncertain"));
+        assert!(existing.message().contains(path));
+
+        let uncertain = staging_create_error(
+            SftpTransferError::Sftp("create timed out".into()),
+            path,
+            Err(SftpTransferError::Transport("lstat timed out".into())),
+        );
+        assert!(uncertain.message().contains("create timed out"));
+        assert!(uncertain.message().contains("lstat timed out"));
+        assert!(uncertain.message().contains(path));
+    }
 }

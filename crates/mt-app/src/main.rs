@@ -112,6 +112,7 @@ mod tree;
 mod ui;
 mod update_check;
 mod usage_panel;
+mod workbench_area;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -141,6 +142,7 @@ use crate::title_bar::TitleBar;
 use crate::tray::{Tray, TrayEvent};
 use crate::tree::SplitDirection;
 use crate::usage_panel::UsagePanel;
+use crate::workbench_area::WorkbenchArea;
 
 actions!(
     mini_term,
@@ -347,6 +349,8 @@ struct Workspace {
     project_list: Entity<ProjectList>,
     file_tree: Entity<FileTree>,
     terminal_area: Entity<TerminalArea>,
+    /// 常驻终端页与运行时文件页签的宿主。文件页不进入终端布局持久化。
+    workbench_area: Entity<WorkbenchArea>,
     /// 终端区右缘的「项目级终端面板」切换竖条。显隐住在 store
     /// (`terminals_panel_visible`,落 layout.db),收起时整个不进元素树。
     terminals_panel: Entity<terminals_panel::TerminalsPanel>,
@@ -421,7 +425,11 @@ impl Workspace {
         let title_bar = cx.new(|cx| TitleBar::new(store.clone(), cx));
         let project_list = cx.new(|cx| ProjectList::new(store.clone(), cx));
         let file_tree = cx.new(|cx| FileTree::new(store.clone(), cx));
+        file_tree::install(file_tree.clone(), cx);
         let terminal_area = cx.new(|cx| TerminalArea::new(store.clone(), cx));
+        let workbench_area =
+            cx.new(|cx| WorkbenchArea::new(store.clone(), terminal_area.clone(), cx));
+        workbench_area::install(workbench_area.clone(), cx);
         let terminals_panel =
             cx.new(|cx| terminals_panel::TerminalsPanel::new(store.clone(), cx));
         let session_panel = cx.new(|cx| SessionPanel::new(store.clone(), cx));
@@ -534,6 +542,7 @@ impl Workspace {
             project_list,
             file_tree,
             terminal_area,
+            workbench_area,
             terminals_panel,
             session_panel,
             git_panel,
@@ -697,6 +706,8 @@ impl Workspace {
             store.set_active_project(&project_id, cx);
             store.activate_pane(&project_id, &pane_id, window, cx);
         });
+        self.workbench_area
+            .update(cx, |area, cx| area.activate_terminal(window, cx));
         true
     }
 
@@ -731,8 +742,12 @@ impl Workspace {
         Some((project_id, pane_id))
     }
 
+    fn terminal_page_active(&self, cx: &App) -> bool {
+        self.workbench_area.read(cx).is_terminal_active(cx)
+    }
+
     fn on_new_terminal(&mut self, _: &NewTerminal, window: &mut Window, cx: &mut Context<Self>) {
-        if yields_to_overlay(window, cx) {
+        if yields_to_overlay(window, cx) || !self.terminal_page_active(cx) {
             return;
         }
         let Some(project_id) = self.store.read(cx).active_project_id.clone() else {
@@ -750,7 +765,7 @@ impl Workspace {
     /// 走 [`pane_actions::close_leaf_of_pane`] 而不是直接调 store:关闭前要盘点
     /// 组里活着的 AI 会话并确认(三条关闭路径共用同一个入口)。
     fn on_close_pane(&mut self, _: &ClosePane, window: &mut Window, cx: &mut Context<Self>) {
-        if yields_to_overlay(window, cx) {
+        if yields_to_overlay(window, cx) || !self.terminal_page_active(cx) {
             return;
         }
         let Some((project_id, pane_id)) = self.target_pane(cx) else {
@@ -760,14 +775,14 @@ impl Workspace {
     }
 
     fn on_next_pane(&mut self, _: &NextPane, window: &mut Window, cx: &mut Context<Self>) {
-        if yields_to_overlay(window, cx) {
+        if yields_to_overlay(window, cx) || !self.terminal_page_active(cx) {
             return;
         }
         self.cycle_pane(1, window, cx);
     }
 
     fn on_prev_pane(&mut self, _: &PrevPane, window: &mut Window, cx: &mut Context<Self>) {
-        if yields_to_overlay(window, cx) {
+        if yields_to_overlay(window, cx) || !self.terminal_page_active(cx) {
             return;
         }
         self.cycle_pane(-1, window, cx);
@@ -783,7 +798,7 @@ impl Workspace {
     }
 
     fn on_select_pane(&mut self, action: &SelectPane, window: &mut Window, cx: &mut Context<Self>) {
-        if yields_to_overlay(window, cx) {
+        if yields_to_overlay(window, cx) || !self.terminal_page_active(cx) {
             return;
         }
         let Some((project_id, pane_id)) = self.target_pane(cx) else {
@@ -796,14 +811,14 @@ impl Workspace {
     }
 
     fn on_split_right(&mut self, _: &SplitRight, window: &mut Window, cx: &mut Context<Self>) {
-        if yields_to_overlay(window, cx) {
+        if yields_to_overlay(window, cx) || !self.terminal_page_active(cx) {
             return;
         }
         self.split(SplitDirection::Horizontal, window, cx);
     }
 
     fn on_split_down(&mut self, _: &SplitDown, window: &mut Window, cx: &mut Context<Self>) {
-        if yields_to_overlay(window, cx) {
+        if yields_to_overlay(window, cx) || !self.terminal_page_active(cx) {
             return;
         }
         self.split(SplitDirection::Vertical, window, cx);
@@ -846,6 +861,9 @@ impl Workspace {
             .project_list
             .update(cx, |list, cx| list.rename_focused_row(window, cx))
         {
+            return;
+        }
+        if !self.terminal_page_active(cx) {
             return;
         }
         let Some((project_id, pane_id)) = self.target_pane(cx) else {
@@ -996,20 +1014,30 @@ impl Workspace {
     fn focus_adjacent(&mut self, dir: Direction, window: &mut Window, cx: &mut Context<Self>) {
         // 这四条只从快捷键进来,守卫放这一处就够(Alt+方向键在文本输入框里
         // 还是「按词移动」,让路给弹窗是必须的)
-        if yields_to_overlay(window, cx) {
+        if yields_to_overlay(window, cx) || !self.terminal_page_active(cx) {
             return;
         }
         self.terminal_area
             .update(cx, |area, cx| area.focus_adjacent(dir, window, cx));
     }
 
-    /// Ctrl+F:在**当前焦点 pane** 上开查找条。
+    /// Ctrl+F:文件页交给当前文档；终端页在**当前焦点 pane** 上开查找条。
     ///
     /// 与原版有一处差:原版在「当前 pane 还没有 ptyId」时**不拦**这次按键
     /// (让 Ctrl+F 原样落进终端,发 `\x06`),而 gpui 的 action 一旦绑上就必然吞掉
     /// 按键、没有「退回按键」的通路。取舍是:PTY 还没起来的空 pane 上按 Ctrl+F
     /// 什么也不发生 —— 那个 pane 本来也没有终端能收这个字节。
     fn on_terminal_search(&mut self, _: &TerminalSearch, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.terminal_page_active(cx) {
+            // 文档编辑器本身也是 `Input`,不能套用终端页的 typing guard,否则编辑器
+            // 获得焦点后 Ctrl+F 会被提前吞掉；真正的弹窗仍然必须优先处理快捷键。
+            if !overlay::allows(overlay::Yield::ToOverlay) {
+                return;
+            }
+            self.workbench_area
+                .update(cx, |area, cx| area.search_active_document(window, cx));
+            return;
+        }
         if yields_to_overlay(window, cx) {
             return;
         }
@@ -1047,7 +1075,7 @@ impl Workspace {
     /// 两道闸。方向键在输入框里有明确语义,在设置对话框里按 Ctrl+Shift+↑ 去跳终端
     /// 是意外行为 —— 这里让它与其余全局动作同口径。
     fn on_marker_prev(&mut self, _: &MarkerPrev, window: &mut Window, cx: &mut Context<Self>) {
-        if yields_to_overlay(window, cx) {
+        if yields_to_overlay(window, cx) || !self.terminal_page_active(cx) {
             return;
         }
         self.store.update(cx, |store, cx| store.step_marker(-1, cx));
@@ -1056,7 +1084,7 @@ impl Workspace {
     /// Ctrl+Shift+↓:跳到下一个 AI 任务标记。首次按跳**最早一条**。
     /// 让路口径见 [`Self::on_marker_prev`]。
     fn on_marker_next(&mut self, _: &MarkerNext, window: &mut Window, cx: &mut Context<Self>) {
-        if yields_to_overlay(window, cx) {
+        if yields_to_overlay(window, cx) || !self.terminal_page_active(cx) {
             return;
         }
         self.store.update(cx, |store, cx| store.step_marker(1, cx));
@@ -1301,6 +1329,7 @@ impl Render for Workspace {
                 store.background_art().cloned(),
             )
         };
+        let terminal_page_active = self.workbench_area.read(cx).is_terminal_active(cx);
 
         // 条件按钮可能在鼠标仍停在原坐标时从元素树消失,这时 GPUI 不保证再补一发
         // on_hover(false)。主动按当前可见性对账,避免它的旧计时把会话偷偷热身。
@@ -1407,9 +1436,9 @@ impl Render for Workspace {
                                 // ⚠️ 终端区**不套** [`cached_panel`]:它就是每一拍
                                 // 真在变的那块内容,套上等于每帧必然未命中,白付
                                 // 一次 cache_key 比较
-                                .child(self.terminal_area.clone()),
+                                .child(self.workbench_area.clone()),
                         )
-                        .when(terminals_visible, |el| {
+                        .when(terminals_visible && terminal_page_active, |el| {
                             // 同样套缓存:竖条的数据源只有 store。占位样式照抄它
                             // render 根节点的 `.w(WIDTH).h_full().flex_none()`
                             el.child(cached_panel(
@@ -1534,13 +1563,19 @@ impl Render for Workspace {
                     "toggle-terminals",
                     activity_bar::TERMINALS,
                     t("app", "activityBar.terminals"),
-                    terminals_visible,
+                    terminals_visible && terminal_page_active,
                     self.activity_bar_hover.is_visible("toggle-terminals"),
                     Self::activity_bar_item_hover_listener("toggle-terminals", cx),
                 )
-                .on_click(cx.listener(|this, _event, _window, cx| {
-                    this.store
-                        .update(cx, |store, cx| store.toggle_terminals_panel(cx));
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    let terminal_was_active = this.terminal_page_active(cx);
+                    this.workbench_area
+                        .update(cx, |area, cx| area.activate_terminal(window, cx));
+                    this.store.update(cx, |store, cx| {
+                        if terminal_was_active || !store.terminals_panel_visible() {
+                            store.toggle_terminals_panel(cx);
+                        }
+                    });
                 })),
             )
             .child(activity_bar::divider())

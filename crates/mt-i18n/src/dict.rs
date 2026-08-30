@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 32;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 825;
+pub const ZH_ENTRY_COUNT: usize = 840;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 825;
+pub const EN_ENTRY_COUNT: usize = 840;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -28,8 +28,12 @@ static APP_ZH: &[(&str, &str)] = &[
     ("activityBar.ssh", "SSH 连接"),
     ("activityBar.stats", "使用统计"),
     ("activityBar.terminals", "终端面板"),
+    ("closeConfirm.messageWithDocuments", "还有 {count} 个文件包含未保存的修改，关闭后这些修改会丢失：\n\n{names}\n\n确定退出吗？"),
+    ("closeConfirm.messageWithDocumentsAndSessions", "还有 {document_count} 个文件包含未保存的修改，关闭后这些修改会丢失：\n\n{document_names}\n\n还有 {session_count} 个 AI 会话将被终止：\n\n{session_names}\n\n确定退出吗？"),
     ("closeConfirm.messageWithSessions", "还有 {count} 个 AI 会话，关闭后它们会被终止：\n\n{names}\n\n确定退出吗？"),
+    ("closeConfirm.remaining", "另有 {count} 项"),
     ("closeConfirm.titleAi", "有 AI 会话正在运行"),
+    ("closeConfirm.titleUnsaved", "有文件尚未保存"),
     ("configLoadFailed", "配置加载失败，为防止覆盖已有配置，本次运行禁止保存。请重启应用重试。\n\n错误：{detail}"),
     ("emptyState", "请先在中间栏添加项目"),
     ("firstRun.addLocal", "添加本地项目"),
@@ -73,8 +77,12 @@ static APP_EN: &[(&str, &str)] = &[
     ("activityBar.ssh", "SSH connections"),
     ("activityBar.stats", "Statistics"),
     ("activityBar.terminals", "Terminal panels"),
+    ("closeConfirm.messageWithDocuments", "{count} file(s) have unsaved changes that will be discarded:\n\n{names}\n\nQuit anyway?"),
+    ("closeConfirm.messageWithDocumentsAndSessions", "{document_count} file(s) have unsaved changes that will be discarded:\n\n{document_names}\n\n{session_count} AI session(s) will also be terminated:\n\n{session_names}\n\nQuit anyway?"),
     ("closeConfirm.messageWithSessions", "{count} AI session(s) are still running and will be terminated:\n\n{names}\n\nQuit anyway?"),
+    ("closeConfirm.remaining", "{count} more items"),
     ("closeConfirm.titleAi", "AI sessions still running"),
+    ("closeConfirm.titleUnsaved", "Unsaved files"),
     ("configLoadFailed", "Failed to load config. Saving is disabled for this run to protect your existing config. Please restart the app.\n\nError: {detail}"),
     ("emptyState", "Add a project in the middle panel first"),
     ("firstRun.addLocal", "Add local project"),
@@ -250,6 +258,7 @@ static FILE_TREE_ZH: &[(&str, &str)] = &[
     ("dialog.openEditorFailedTitle", "打开编辑器失败"),
     ("dialog.renameFailedMessage", "重命名失败：{error}"),
     ("dialog.renameFailedTitle", "重命名失败"),
+    ("download.contextChanged", "下载上下文已变化，请重新打开或刷新文件后再试。"),
     ("download.directoryErrorTitle", "下载目录不可用"),
     ("empty.loadFailed", "文件列表加载失败"),
     ("empty.loading", "加载中..."),
@@ -297,8 +306,6 @@ static FILE_TREE_ZH: &[(&str, &str)] = &[
     ("prompt.renameMessage", "请输入新名称"),
     ("prompt.renameTitle", "重命名"),
     ("remote.broken", "SSH 连接已被删除，无法加载远程文件树"),
-    ("remote.previewUnsupportedMessage", "远程文件不会交给本机程序打开。请先下载文件后查看。"),
-    ("remote.previewUnsupportedTitle", "暂不支持远程预览"),
     ("remote.refreshTitle", "刷新（重新读取远程根 .gitignore）"),
     ("upload.chooseFilesTitle", "选择要上传的文件"),
     ("upload.chooseFolderTitle", "选择要上传的文件夹"),
@@ -328,6 +335,7 @@ static FILE_TREE_EN: &[(&str, &str)] = &[
     ("dialog.openEditorFailedTitle", "Failed to Open Editor"),
     ("dialog.renameFailedMessage", "Rename failed: {error}"),
     ("dialog.renameFailedTitle", "Rename Failed"),
+    ("download.contextChanged", "The download context changed. Reopen or refresh the file and try again."),
     ("download.directoryErrorTitle", "Download Directory Unavailable"),
     ("empty.loadFailed", "Failed to load file list"),
     ("empty.loading", "Loading..."),
@@ -375,8 +383,6 @@ static FILE_TREE_EN: &[(&str, &str)] = &[
     ("prompt.renameMessage", "Enter a new name"),
     ("prompt.renameTitle", "Rename"),
     ("remote.broken", "The SSH connection was deleted; cannot load the remote file tree"),
-    ("remote.previewUnsupportedMessage", "Remote paths are not passed to local applications. Download the file before opening it."),
-    ("remote.previewUnsupportedTitle", "Remote Preview Not Supported"),
     ("remote.refreshTitle", "Refresh (re-reads the remote root .gitignore)"),
     ("upload.chooseFilesTitle", "Choose Files to Upload"),
     ("upload.chooseFolderTitle", "Choose a Folder to Upload"),
@@ -387,14 +393,24 @@ static FILE_VIEWER_ZH: &[(&str, &str)] = &[
     ("back", "返回"),
     ("binaryNotSupported", "二进制文件，不支持预览"),
     ("externallyChanged", "文件已被外部修改"),
+    ("forceSave", "仍然覆盖"),
     ("htmlPreviewNote", "简版渲染：不跑 CSS 与脚本，需要真实效果请用浏览器打开"),
     ("loading", "加载中..."),
     ("openInBrowser", "用浏览器打开"),
     ("openWithDefaultApp", "使用默认工具打开"),
     ("preview", "预览"),
+    ("projectRemovalBlocked", "该项目仍有未保存的文件，请先保存或关闭这些页签后再移除项目。"),
+    ("refreshWarning", "远程刷新失败，已保留当前内容"),
     ("reloadDiscard", "重新加载（丢弃修改）"),
+    ("remoteConnectionChanged", "SSH 连接配置已变化，此页签已失效；请关闭后重新打开文件。"),
+    ("remoteDownloadHint", "此类远程文件暂不支持内置预览，可下载后查看。"),
+    ("remoteExternallyChanged", "远程文件已被其他程序修改"),
+    ("remoteImageClickToLoad", "点击加载远程图片"),
+    ("remoteReadOnly", "远程文件当前不可编辑"),
+    ("remoteRelativeImage", "远程 Markdown 仅支持按需加载 HTTP(S) 绝对图片"),
     ("save", "保存"),
     ("saveFailed", "保存失败"),
+    ("saveWarning", "已保存，但需要注意"),
     ("saving", "保存中…"),
     ("source", "源码"),
     ("tooLarge", "文件过大（>1MB），不支持预览"),
@@ -407,14 +423,24 @@ static FILE_VIEWER_EN: &[(&str, &str)] = &[
     ("back", "Back"),
     ("binaryNotSupported", "Binary file, preview not supported"),
     ("externallyChanged", "File was modified externally"),
+    ("forceSave", "Overwrite Anyway"),
     ("htmlPreviewNote", "Simplified rendering: no CSS or scripts — open in a browser for the real thing"),
     ("loading", "Loading..."),
     ("openInBrowser", "Open in browser"),
     ("openWithDefaultApp", "Open with default app"),
     ("preview", "Preview"),
+    ("projectRemovalBlocked", "This project still has unsaved files. Save or close those tabs before removing the project."),
+    ("refreshWarning", "Remote refresh failed; current content was kept"),
     ("reloadDiscard", "Reload (discard changes)"),
+    ("remoteConnectionChanged", "The SSH connection changed. Close this tab and reopen the file."),
+    ("remoteDownloadHint", "This remote file cannot be previewed here yet. Download it to view it."),
+    ("remoteExternallyChanged", "The remote file was modified by another program"),
+    ("remoteImageClickToLoad", "Click to load remote image"),
+    ("remoteReadOnly", "This remote file is currently read-only"),
+    ("remoteRelativeImage", "Remote Markdown can only load absolute HTTP(S) images on demand"),
     ("save", "Save"),
     ("saveFailed", "Save failed"),
+    ("saveWarning", "Saved with a warning"),
     ("saving", "Saving…"),
     ("source", "Source"),
     ("tooLarge", "File too large (>1MB), preview not supported"),
@@ -941,6 +967,7 @@ static SEARCH_ZH: &[(&str, &str)] = &[
     ("placeholderContent", "搜索文件内容..."),
     ("placeholderFilename", "搜索文件名（含 / 则按路径匹配）..."),
     ("regexTitle", "正则表达式"),
+    ("remoteUnsupported", "远程项目暂不支持全局搜索。"),
     ("searchButton", "搜索"),
     ("searching", "搜索中..."),
     ("searchingFound", "搜索中... 已找到 {count} 条"),
@@ -959,6 +986,7 @@ static SEARCH_EN: &[(&str, &str)] = &[
     ("placeholderContent", "Search file contents..."),
     ("placeholderFilename", "Search filenames (include / to match paths)..."),
     ("regexTitle", "Regular Expression"),
+    ("remoteUnsupported", "Global search is not available for remote projects yet."),
     ("searchButton", "Search"),
     ("searching", "Searching..."),
     ("searchingFound", "Searching... {count} found"),
@@ -1605,6 +1633,7 @@ static TERMINAL_AREA_ZH: &[(&str, &str)] = &[
     ("panelN", "面板 {n}"),
     ("remoteConnectFailedTitle", "远程连接失败"),
     ("renamePanel", "重命名面板"),
+    ("terminal", "终端"),
 ];
 #[rustfmt::skip]
 static TERMINAL_AREA_EN: &[(&str, &str)] = &[
@@ -1616,6 +1645,7 @@ static TERMINAL_AREA_EN: &[(&str, &str)] = &[
     ("panelN", "Panel {n}"),
     ("remoteConnectFailedTitle", "Remote Connection Failed"),
     ("renamePanel", "Rename panel"),
+    ("terminal", "Terminal"),
 ];
 
 #[rustfmt::skip]

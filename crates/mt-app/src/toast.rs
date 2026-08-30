@@ -112,6 +112,16 @@ impl ToastQueue {
             .any(|n| n.project_id == project_id && n.kind == kind)
     }
 
+    /// 同项目、同类且正文完全相同的提示是否仍在队列中。后台 reconcile 可能
+    /// 连续命中同一阻止条件，用这条精确判定去重，不影响其它粘贴/上传错误。
+    fn has_live_message(&self, project_id: &str, kind: ToastKind, message: &str) -> bool {
+        self.items.iter().any(|item| {
+            item.project_id == project_id
+                && item.kind == kind
+                && item.message.as_deref() == Some(message)
+        })
+    }
+
     /// 移除一条。返回是否真的移掉了(定时器到点时队列里可能已经没它了)。
     pub fn dismiss(&mut self, id: u64) -> bool {
         let before = self.items.len();
@@ -190,7 +200,7 @@ pub fn push_alert(kind: ToastKind, project_id: String, project_name: String, cx:
     );
 }
 
-/// 推一条自带正文的 toast(WSL 提示 / 移动端会话 / 粘贴失败)。**不去重**。
+/// 推一条自带正文的 toast(信息提示 / 移动端会话 / 粘贴失败)。**不去重**。
 pub fn push_message(
     kind: ToastKind,
     project_id: String,
@@ -209,6 +219,38 @@ pub fn push_message(
         false,
         cx,
     );
+}
+
+/// 推一条幂等的自定义提示。只压掉仍存活的“同项目 + 同 kind + 同正文”，用于
+/// 可重复触发的后台 reconcile；不同错误正文仍可并存。
+pub fn push_message_deduped(
+    kind: ToastKind,
+    project_id: String,
+    project_name: String,
+    message: String,
+    cx: &mut App,
+) {
+    let item = ToastItem {
+        id: 0,
+        project_id,
+        project_name,
+        kind,
+        message: Some(message),
+    };
+    layer(cx).update(cx, |layer, cx| {
+        let message = item.message.as_deref().unwrap_or_default();
+        if layer
+            .queue
+            .has_live_message(&item.project_id, item.kind, message)
+        {
+            return;
+        }
+        let Some(id) = layer.queue.push(item, false) else {
+            return;
+        };
+        layer.arm(id, cx);
+        cx.notify();
+    });
 }
 
 /// WSL 启动器重写的一次性告知(`App.tsx:367-379`)。
@@ -303,12 +345,16 @@ impl ToastLayer {
             // 原版只 `setActiveProject`;GPUI 侧一并跳到那个项目的待办 pane
             // (`main.rs` 旧 `deliver_alert` 已经是这个行为,不退回去)
             let pane = store.read(cx).next_attention_target(Some(&project_id));
+            let jumps_to_pane = pane.is_some();
             store.update(cx, |store, cx| {
                 store.set_active_project(&project_id, cx);
                 if let Some((pid, pane_id)) = pane {
                     store.activate_pane(&pid, &pane_id, window, cx);
                 }
             });
+            if jumps_to_pane {
+                crate::workbench_area::activate_terminal_page(window, cx);
+            }
         });
     }
 }
@@ -560,6 +606,18 @@ mod tests {
         assert!(q.push(item("p1", ToastKind::PasteError), false).is_some());
         assert!(q.push(item("p1", ToastKind::PasteError), false).is_some());
         assert_eq!(q.len(), 2);
+    }
+
+    #[test]
+    fn 后台提示只按相同正文精确去重() {
+        let mut q = ToastQueue::default();
+        let mut blocked = item("p1", ToastKind::PasteError);
+        blocked.message = Some("有未保存文档".into());
+        q.push(blocked, false).unwrap();
+
+        assert!(q.has_live_message("p1", ToastKind::PasteError, "有未保存文档"));
+        assert!(!q.has_live_message("p1", ToastKind::PasteError, "上传失败"));
+        assert!(!q.has_live_message("p2", ToastKind::PasteError, "有未保存文档"));
     }
 
     /// 超出 5 条只是**不画**,不丢 —— 前面的消失后自动补位。

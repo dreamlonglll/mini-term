@@ -85,7 +85,7 @@ pub enum ToastKind {
     Completion,
     /// AI 停下来等你批权限 / 填表单 / 这轮因 API 错误结束。
     Attention,
-    /// WSL 项目改用 `wsl.exe` 启动的一次性告知(`App.tsx:367-379`)。
+    /// 信息提示：WSL 启动器替换、远程项目暂不支持搜索等非错误状态。
     WslInfo,
     /// 移动端发起了一个新会话(`mobileStartSession.ts`)。
     MobileSession,
@@ -106,8 +106,9 @@ impl ToastKind {
 
     /// 点这条 toast 要不要顺带切到那个项目。
     ///
-    /// `wsl-info` 的 projectId 是占位串(压根不是项目)、`paste-error` 的项目就在
-    /// 眼前 —— 两者点击**仅关闭**(`ToastContainer.tsx:35-38`)。
+    /// `wsl-info` 只陈述当前状态、`paste-error` 的项目就在眼前 —— 两者点击
+    /// **仅关闭**(`ToastContainer.tsx:35-38`)。WSL 启动提示仍使用占位项目 id，
+    /// 其它信息提示可以携带真实项目 id，但同样不跳转。
     pub fn jumps_to_project(self) -> bool {
         matches!(
             self,

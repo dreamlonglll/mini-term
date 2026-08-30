@@ -96,6 +96,10 @@ fn remove_arc_if_same<T>(
 
 /// 池里一项:russh handle + 时间戳 + 连接快照。
 pub struct CachedSession {
+    /// 建立该 session 时真正参与认证/寻址的连接身份。池的 map key 仍是稳定的
+    /// connection id，但复用前必须逐字段核对这一份，避免用户原地修改 host、
+    /// port、user 或凭据后短暂命中旧服务器 session。
+    connection_identity: CachedConnectionIdentity,
     /// 串行化同 session 上的 channel 操作。russh Handle 自身 Clone 廉价,但允许
     /// 并发开 channel 会让审计日志顺序与"标记 unhealthy"的语义复杂化。
     handle: Mutex<Handle<MtClient>>,
@@ -109,7 +113,43 @@ pub struct CachedSession {
     active_sftp_leases: AtomicUsize,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct CachedConnectionIdentity {
+    id: String,
+    host: String,
+    port: u16,
+    user: String,
+    password: Option<String>,
+    identity_file: Option<String>,
+}
+
+impl CachedConnectionIdentity {
+    fn from_connection(connection: &SshConnection) -> Self {
+        Self {
+            id: connection.id.clone(),
+            host: connection.host.clone(),
+            port: connection.port,
+            user: connection.user.clone(),
+            password: connection.password.clone(),
+            identity_file: connection.identity_file.clone(),
+        }
+    }
+
+    fn matches(&self, connection: &SshConnection) -> bool {
+        self.id == connection.id
+            && self.host == connection.host
+            && self.port == connection.port
+            && self.user == connection.user
+            && self.password == connection.password
+            && self.identity_file == connection.identity_file
+    }
+}
+
 impl CachedSession {
+    fn matches_connection(&self, connection: &SshConnection) -> bool {
+        self.connection_identity.matches(connection)
+    }
+
     /// 现在是否处于 gatetime cooldown 内。
     pub fn is_unhealthy_now(&self) -> bool {
         let until = self.unhealthy_until.load(Ordering::Relaxed);
@@ -249,6 +289,19 @@ impl SshPool {
             let Some(session) = cached else {
                 break;
             };
+            if !session.matches_connection(conn) {
+                // `invalidate_connection` 是 fire-and-forget；配置保存后紧接着发起的
+                // 请求可能先于异步 evict 到达这里。复用边界本身必须再次核对完整
+                // 身份，不能让 map 的纯 id key 把新配置导向旧服务器。
+                let victim = {
+                    let mut inner = self.inner.lock().await;
+                    remove_arc_if_same(&mut inner.sessions, &conn.id, &session)
+                };
+                if let Some(victim) = victim {
+                    retire_removed_session(victim, self.config.shutdown_per_session_timeout);
+                }
+                continue;
+            }
             // 复用前只检查 underlying handle 是否还活着。
             //
             // **不要在这里同时检查 is_unhealthy_now**:cooldown 的意图是「上一次失败
@@ -305,6 +358,17 @@ impl SshPool {
                     return Ok(candidate);
                 }
             };
+
+            if !winner.matches_connection(conn) {
+                let victim = {
+                    let mut inner = self.inner.lock().await;
+                    remove_arc_if_same(&mut inner.sessions, &conn.id, &winner)
+                };
+                if let Some(victim) = victim {
+                    retire_removed_session(victim, self.config.shutdown_per_session_timeout);
+                }
+                continue;
+            }
 
             if !winner.handle.lock().await.is_closed() {
                 let still_winner = {
@@ -418,6 +482,7 @@ impl SshPool {
         authenticate(&mut handle, conn).await?;
 
         Ok(CachedSession {
+            connection_identity: CachedConnectionIdentity::from_connection(conn),
             handle: Mutex::new(handle),
             opened_at: Instant::now(),
             last_used: AtomicU64::new(now_millis()),
@@ -1461,6 +1526,58 @@ fn append_known_host(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn connection(id: &str) -> SshConnection {
+        SshConnection {
+            id: id.into(),
+            name: "server".into(),
+            host: "example.com".into(),
+            port: 22,
+            user: "deploy".into(),
+            password: Some("secret".into()),
+            identity_file: None,
+            group: None,
+        }
+    }
+
+    #[test]
+    fn cached_connection_identity_tracks_endpoint_and_credentials_only() {
+        let base = connection("ssh");
+        let identity = CachedConnectionIdentity::from_connection(&base);
+        assert!(identity.matches(&base));
+
+        for changed in [
+            SshConnection {
+                host: "other.example.com".into(),
+                ..base.clone()
+            },
+            SshConnection {
+                port: 2222,
+                ..base.clone()
+            },
+            SshConnection {
+                user: "root".into(),
+                ..base.clone()
+            },
+            SshConnection {
+                password: Some("other".into()),
+                ..base.clone()
+            },
+            SshConnection {
+                identity_file: Some("/keys/id_ed25519".into()),
+                ..base.clone()
+            },
+        ] {
+            assert!(!identity.matches(&changed));
+        }
+
+        let display_only = SshConnection {
+            name: "renamed".into(),
+            group: Some("production".into()),
+            ..base
+        };
+        assert!(identity.matches(&display_only));
+    }
 
     #[test]
     fn sftp_request_timeout_tracks_transfer_window() {

@@ -15,6 +15,7 @@ export const search = {
     foundFiles: "找到 {count} 个文件",
     foundMatches: "找到 {count} 处匹配",
     shortcutHint: "{mod}+Shift+F 打开搜索",
+    remoteUnsupported: "远程项目暂不支持全局搜索。",
   },
   en: {
     copyFilePath: "Copy File Path",
@@ -32,5 +33,6 @@ export const search = {
     foundFiles: "{count} files found",
     foundMatches: "{count} matches found",
     shortcutHint: "{mod}+Shift+F to open search",
+    remoteUnsupported: "Global search is not available for remote projects yet.",
   },
 } as const;

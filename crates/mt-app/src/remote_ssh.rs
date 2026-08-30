@@ -46,7 +46,9 @@
 //! [`SshConnection`] 再传进来** —— 断链(连接已删)判定前移到
 //! [`find_connection`],它是纯函数、有单测。
 
+use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -59,13 +61,19 @@ use mt_ai::sessions::{
     normalize_unix_path, session_cache, session_id_path_safe,
 };
 use mt_config::SshConnection;
-use mt_project::fs::{ALWAYS_IGNORE, FileEntry, TextGitignore, natural_cmp};
+use mt_project::fs::{
+    ALWAYS_IGNORE, FileContentResult, FileEntry, MAX_FILE_VIEW_SIZE, TextGitignore, natural_cmp,
+};
+use mt_ssh::sftp::{SftpBoundedFileRead, SftpFileReplaceResult};
 use mt_ssh::{CachedSession, SftpHandle, SftpNodeKind, SshPool, run_bounded_exec_on_session};
 
 /// SFTP 协议层每请求超时(readdir / stat / 单个 read 包)。
 /// 默认仅 10s 且逐请求计时(见 spec/backend/russh-sftp-file-transfer.md 坑 1),
 /// 这里放宽到 20s 覆盖慢链路;整体不设长窗口——只读操作单包粒度小。
 const SFTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const REMOTE_DOCUMENT_MAX_BYTES: usize = MAX_FILE_VIEW_SIZE as usize;
+const REMOTE_DOCUMENT_TOO_LARGE_SAVE_ERROR: &str =
+    "远程文件已超过 1MB，请重新下载或使用外部工具处理";
 const REMOTE_DELETE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_DELETE_EXEC_TIMEOUT: Duration = Duration::from_secs(70);
 const REMOTE_DELETE_SERVER_TIMEOUT_SECS: u64 = 60;
@@ -188,10 +196,10 @@ impl RemoteSshState {
     /// 池里那条 session + 两张按连接缓存(`home_cache` / `gitignore_cache`)+
     /// 会话路径映射。
     ///
-    /// 为什么必须有:池键是纯 `connection.id`,`CachedSession` 不存 host/user/port,
-    /// acquire 也不比对配置。用户把 host 改成另一台服务器却保留同一个 id 时,
-    /// 旧服务器的 session 会一直被复用到 reaper 回收(idle 10min / lifetime 2h),
-    /// 期间文件树、粘贴上传、会话扫描全打在**旧机器**上。
+    /// 为什么仍需主动失效:池的 map key 是稳定的 `connection.id`；虽然
+    /// `CachedSession` 会保存并在每次 acquire 时核对完整 endpoint/credential
+    /// 身份，主动淘汰仍能及时释放旧 session，并同步清掉 home/gitignore/path
+    /// 这些同样按 connection id 建键的派生缓存。
     ///
     /// **边界**:只作废本进程的池。三个 sidecar 是独立进程、各自另一份池,
     /// 它们每次请求重读 `config.json` 拿连接信息,自己的 session 仍可能是旧的 ——
@@ -275,6 +283,24 @@ pub fn find_connection(
         .find(|c| c.id == connection_id)
         .cloned()
         .ok_or_else(|| format!("SSH 连接不存在或已被删除 (id={connection_id})"))
+}
+
+/// Runtime identity for a saved SSH connection. A document baseline includes
+/// this value so changing host, user, port, password, or identity file cannot
+/// silently redirect an already-open editor tab to another server.
+pub fn connection_fingerprint(connection: &SshConnection) -> u64 {
+    // Runtime-only identity: the process-random keyed hasher prevents a
+    // password-derived fingerprint from becoming a stable offline oracle if it
+    // ever appears in diagnostics. Callers only compare values in this process.
+    static HASHER: OnceLock<RandomState> = OnceLock::new();
+    let mut hasher = HASHER.get_or_init(RandomState::new).build_hasher();
+    connection.id.hash(&mut hasher);
+    connection.host.hash(&mut hasher);
+    connection.port.hash(&mut hasher);
+    connection.user.hash(&mut hasher);
+    connection.password.hash(&mut hasher);
+    connection.identity_file.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// 从池里拿一条可用 session(带外层超时 + gatetime cooldown 检查)。
@@ -484,6 +510,71 @@ pub struct RemoteDirectoryListing {
     pub directories: Vec<RemoteDirectoryEntry>,
 }
 
+/// Opaque optimistic-concurrency token returned only for editable UTF-8 files.
+/// Callers retain it with the draft and must send it back to
+/// [`save_file_content`]. Raw bytes stay private so UI code cannot fabricate a
+/// baseline for a binary or oversized file.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RemoteFileBaseline {
+    connection_id: String,
+    connection_fingerprint: u64,
+    canonical_root: String,
+    canonical_path: String,
+    bytes: Arc<[u8]>,
+}
+
+impl std::fmt::Debug for RemoteFileBaseline {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RemoteFileBaseline")
+            .field("connection_id", &self.connection_id)
+            .field("byte_len", &self.bytes.len())
+            .finish()
+    }
+}
+
+impl RemoteFileBaseline {
+    /// Number of raw remote bytes represented by this baseline.
+    #[cfg(test)]
+    pub fn byte_len(&self) -> usize {
+        self.bytes.len()
+    }
+}
+
+/// Result of a bounded remote document read. `baseline` is present only when
+/// `content` is editable UTF-8 text.
+#[derive(Clone)]
+pub struct RemoteFileReadResult {
+    pub content: FileContentResult,
+    pub baseline: Option<RemoteFileBaseline>,
+}
+
+impl std::fmt::Debug for RemoteFileReadResult {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RemoteFileReadResult")
+            .field("content_len", &self.content.content.len())
+            .field("is_binary", &self.content.is_binary)
+            .field("too_large", &self.content.too_large)
+            .field("has_baseline", &self.baseline.is_some())
+            .finish()
+    }
+}
+
+/// A normal save either commits and returns the next baseline or reports the
+/// current remote value without modifying it. The caller may reload `current`
+/// or explicitly retry [`save_file_content`] with `force = true`.
+#[derive(Debug, Clone)]
+pub enum RemoteFileSaveResult {
+    Saved {
+        baseline: RemoteFileBaseline,
+        warning: Option<String>,
+    },
+    ExternalChange {
+        current: RemoteFileReadResult,
+    },
+}
+
 fn valid_remote_name(name: &str) -> bool {
     !name.is_empty()
         && name != "."
@@ -588,6 +679,292 @@ async fn validate_remote_leaf_against_root(
         return Err(format!("远程路径超出项目范围: {normalized}"));
     }
     Ok(join_posix(&canonical_parent, name))
+}
+
+async fn canonical_remote_document_root(
+    sftp: &SftpHandle,
+    project_root: &str,
+) -> Result<String, String> {
+    let canonical_root = canonical_project_root(sftp, project_root).await?;
+    match sftp
+        .node_kind(&canonical_root)
+        .await
+        .map_err(|error| format!("远程项目根不可访问: {}", error.message()))?
+    {
+        SftpNodeKind::Directory => Ok(canonical_root),
+        _ => Err(format!("远程项目根不是目录: {canonical_root}")),
+    }
+}
+
+async fn validate_remote_document_file_against_root(
+    sftp: &SftpHandle,
+    canonical_root: &str,
+    path: &str,
+) -> Result<String, String> {
+    let target = validate_remote_leaf_against_root(sftp, canonical_root, path).await?;
+    sftp.guard_file_replacement_state(&target)
+        .await
+        .map_err(|error| format!("远程文件存在未决的保存恢复状态: {}", error.message()))?;
+    match sftp
+        .node_kind(&target)
+        .await
+        .map_err(|error| format!("远程文件不可访问: {}", error.message()))?
+    {
+        SftpNodeKind::File => Ok(target),
+        SftpNodeKind::Directory => Err(format!("远程路径不是文件: {target}")),
+        SftpNodeKind::Symlink => Err(format!("远程文件不能是符号链接: {target}")),
+        SftpNodeKind::Other => Err(format!("远程路径不是普通文件: {target}")),
+    }
+}
+
+fn build_remote_file_read_result(
+    conn: &SshConnection,
+    canonical_root: String,
+    canonical_path: String,
+    read: SftpBoundedFileRead,
+) -> RemoteFileReadResult {
+    let fingerprint = connection_fingerprint(conn);
+    match read {
+        SftpBoundedFileRead::TooLarge => RemoteFileReadResult {
+            content: FileContentResult {
+                content: String::new(),
+                is_binary: false,
+                too_large: true,
+            },
+            baseline: None,
+        },
+        SftpBoundedFileRead::Complete(bytes) => {
+            let decoded = std::str::from_utf8(&bytes).map(str::to_owned);
+            match decoded {
+                Ok(content) => {
+                    let baseline = RemoteFileBaseline {
+                        connection_id: conn.id.clone(),
+                        connection_fingerprint: fingerprint,
+                        canonical_root: canonical_root.clone(),
+                        canonical_path: canonical_path.clone(),
+                        bytes: Arc::from(bytes),
+                    };
+                    RemoteFileReadResult {
+                        content: FileContentResult {
+                            content,
+                            is_binary: false,
+                            too_large: false,
+                        },
+                        baseline: Some(baseline),
+                    }
+                }
+                Err(_) => RemoteFileReadResult {
+                    content: FileContentResult {
+                        content: String::new(),
+                        is_binary: true,
+                        too_large: false,
+                    },
+                    baseline: None,
+                },
+            }
+        }
+    }
+}
+
+fn validate_remote_file_baseline_connection(
+    conn: &SshConnection,
+    baseline: &RemoteFileBaseline,
+) -> Result<(), String> {
+    if conn.id != baseline.connection_id {
+        return Err("远程文件所属 SSH 连接已变化，请重新打开文件".into());
+    }
+    if connection_fingerprint(conn) != baseline.connection_fingerprint {
+        return Err("SSH 连接配置已变化，请重新打开远程文件后再保存".into());
+    }
+    Ok(())
+}
+
+fn validate_remote_file_baseline_path(
+    baseline: &RemoteFileBaseline,
+    canonical_root: &str,
+    canonical_path: &str,
+) -> Result<(), String> {
+    if canonical_root != baseline.canonical_root {
+        return Err("远程项目根已变化，请重新打开文件".into());
+    }
+    if canonical_path != baseline.canonical_path {
+        return Err("远程文件路径身份已变化，请重新打开文件".into());
+    }
+    Ok(())
+}
+
+fn should_block_remote_save(
+    current: &SftpBoundedFileRead,
+    expected: &RemoteFileBaseline,
+    force: bool,
+) -> bool {
+    match current {
+        // “仍然覆盖”只跳过内容相等比较，不得跳过目标文件大小上限。
+        SftpBoundedFileRead::TooLarge => true,
+        SftpBoundedFileRead::Complete(_) if force => false,
+        SftpBoundedFileRead::Complete(_) => !current.matches_bytes(expected.bytes.as_ref()),
+    }
+}
+
+async fn read_remote_file_with_sftp(
+    conn: &SshConnection,
+    sftp: &SftpHandle,
+    project_root: &str,
+    path: &str,
+) -> Result<RemoteFileReadResult, String> {
+    let canonical_root = canonical_remote_document_root(sftp, project_root).await?;
+    let canonical_path =
+        validate_remote_document_file_against_root(sftp, &canonical_root, path).await?;
+    let read = sftp
+        .read_file_bounded(&canonical_path, REMOTE_DOCUMENT_MAX_BYTES)
+        .await
+        .map_err(|error| format!("读取远程文件失败: {}", error.message()))?;
+
+    let root_after_read = canonical_remote_document_root(sftp, project_root).await?;
+    let path_after_read =
+        validate_remote_document_file_against_root(sftp, &root_after_read, path).await?;
+    if root_after_read != canonical_root || path_after_read != canonical_path {
+        return Err("远程文件路径在读取期间发生变化，请重试".into());
+    }
+
+    Ok(build_remote_file_read_result(
+        conn,
+        canonical_root,
+        canonical_path,
+        read,
+    ))
+}
+
+/// Read one remote editor document with the same 1 MiB text/binary/oversize
+/// contract as `mt_project::fs::read_file_content`.
+///
+/// This is a synchronous service boundary and must run on GPUI's background
+/// executor. It opens/reuses the pooled SSH session, canonicalizes the project
+/// root and parent, rejects symlink/special leaves, and reads at most 1 MiB + 1
+/// byte.
+pub fn read_file_content(
+    conn: &SshConnection,
+    project_root: &str,
+    path: &str,
+) -> Result<RemoteFileReadResult, String> {
+    let st = state();
+    st.block_on(async {
+        let sftp = open_sftp(st, conn).await?;
+        read_remote_file_with_sftp(conn, &sftp, project_root, path).await
+    })
+}
+
+/// Safely save one previously loaded remote UTF-8 document.
+///
+/// A normal save (`force = false`) re-reads the bounded remote contents and
+/// returns [`RemoteFileSaveResult::ExternalChange`] instead of writing when the
+/// byte baseline changed. `force = true` skips only that byte comparison; it
+/// still repeats connection, canonical-root, canonical-leaf, regular-file, and
+/// size validation before a same-directory staged backup-swap.
+pub fn save_file_content(
+    conn: &SshConnection,
+    project_root: &str,
+    path: &str,
+    content: &str,
+    expected: &RemoteFileBaseline,
+    force: bool,
+) -> Result<RemoteFileSaveResult, String> {
+    if content.len() > REMOTE_DOCUMENT_MAX_BYTES {
+        return Err("内容过大(>1MB)，拒绝写入远程文件".into());
+    }
+    if expected.bytes.len() > REMOTE_DOCUMENT_MAX_BYTES {
+        return Err("远程文件基线无效，请重新打开文件".into());
+    }
+    validate_remote_file_baseline_connection(conn, expected)?;
+
+    let st = state();
+    st.block_on(async {
+        let sftp = open_sftp(st, conn).await?;
+        let canonical_root = canonical_remote_document_root(&sftp, project_root).await?;
+        let canonical_path =
+            validate_remote_document_file_against_root(&sftp, &canonical_root, path).await?;
+        validate_remote_file_baseline_path(expected, &canonical_root, &canonical_path)?;
+
+        let current = sftp
+            .read_file_bounded(&canonical_path, REMOTE_DOCUMENT_MAX_BYTES)
+            .await
+            .map_err(|error| format!("保存前读取远程文件失败: {}", error.message()))?;
+
+        let root_after_read = canonical_remote_document_root(&sftp, project_root).await?;
+        let path_after_read =
+            validate_remote_document_file_against_root(&sftp, &root_after_read, path).await?;
+        validate_remote_file_baseline_path(expected, &root_after_read, &path_after_read)?;
+
+        if force && matches!(&current, SftpBoundedFileRead::TooLarge) {
+            return Err(REMOTE_DOCUMENT_TOO_LARGE_SAVE_ERROR.into());
+        }
+        if should_block_remote_save(&current, expected, force) {
+            return Ok(RemoteFileSaveResult::ExternalChange {
+                current: build_remote_file_read_result(
+                    conn,
+                    root_after_read,
+                    path_after_read,
+                    current,
+                ),
+            });
+        }
+
+        // The optimistic content comparison above is not a transaction. Repeat
+        // identity/type validation immediately before constructing and
+        // promoting the staging file so a changed parent or leaf never inherits
+        // the earlier check.
+        let commit_root = canonical_remote_document_root(&sftp, project_root).await?;
+        let commit_path =
+            validate_remote_document_file_against_root(&sftp, &commit_root, path).await?;
+        validate_remote_file_baseline_path(expected, &commit_root, &commit_path)?;
+        let expected_at_commit = (!force).then_some(expected.bytes.as_ref());
+        let replace_result = sftp
+            .replace_file_contents(
+                &commit_path,
+                content.as_bytes(),
+                REMOTE_DOCUMENT_MAX_BYTES,
+                expected_at_commit,
+            )
+            .await
+            .map_err(|error| format!("保存远程文件失败: {}", error.message()))?;
+        let cleanup_warning = match replace_result {
+            SftpFileReplaceResult::ExternalChange(current) => {
+                if force && matches!(&current, SftpBoundedFileRead::TooLarge) {
+                    return Err(REMOTE_DOCUMENT_TOO_LARGE_SAVE_ERROR.into());
+                }
+                let root_after_staging =
+                    canonical_remote_document_root(&sftp, project_root).await?;
+                let path_after_staging =
+                    validate_remote_document_file_against_root(&sftp, &root_after_staging, path)
+                        .await?;
+                validate_remote_file_baseline_path(
+                    expected,
+                    &root_after_staging,
+                    &path_after_staging,
+                )?;
+                return Ok(RemoteFileSaveResult::ExternalChange {
+                    current: build_remote_file_read_result(
+                        conn,
+                        root_after_staging,
+                        path_after_staging,
+                        current,
+                    ),
+                });
+            }
+            SftpFileReplaceResult::Replaced { cleanup_warning } => cleanup_warning,
+        };
+
+        Ok(RemoteFileSaveResult::Saved {
+            baseline: RemoteFileBaseline {
+                connection_id: conn.id.clone(),
+                connection_fingerprint: connection_fingerprint(conn),
+                canonical_root: commit_root,
+                canonical_path: commit_path,
+                bytes: Arc::from(content.as_bytes()),
+            },
+            warning: cleanup_warning,
+        })
+    })
 }
 
 /// VS Code 风格的同名副本名。目录与文件共用，文件保留最后一个扩展名。
@@ -3308,6 +3685,16 @@ mod tests {
         }
     }
 
+    fn remote_baseline(conn: &SshConnection, bytes: &[u8]) -> RemoteFileBaseline {
+        RemoteFileBaseline {
+            connection_id: conn.id.clone(),
+            connection_fingerprint: connection_fingerprint(conn),
+            canonical_root: "/srv/project".into(),
+            canonical_path: "/srv/project/src/main.rs".into(),
+            bytes: Arc::from(bytes),
+        }
+    }
+
     // --- 断链查找 ---
 
     #[test]
@@ -3323,6 +3710,135 @@ mod tests {
         assert!(err.contains("SSH 连接不存在或已被删除"));
         // 空表同样是断链而不是 panic
         assert!(find_connection(&[], "x").is_err());
+    }
+
+    #[test]
+    fn remote_document_connection_fingerprint_tracks_endpoint_and_credentials() {
+        let base = conn("a");
+        let fingerprint = connection_fingerprint(&base);
+
+        let mut changed = base.clone();
+        changed.host = "other-host".into();
+        assert_ne!(connection_fingerprint(&changed), fingerprint);
+        changed = base.clone();
+        changed.port = 2222;
+        assert_ne!(connection_fingerprint(&changed), fingerprint);
+        changed = base.clone();
+        changed.user = "other-user".into();
+        assert_ne!(connection_fingerprint(&changed), fingerprint);
+        changed = base.clone();
+        changed.password = Some("new-password".into());
+        assert_ne!(connection_fingerprint(&changed), fingerprint);
+        changed = base.clone();
+        changed.identity_file = Some("/keys/new".into());
+        assert_ne!(connection_fingerprint(&changed), fingerprint);
+
+        // Display-only edits must not invalidate an otherwise identical remote
+        // filesystem identity.
+        changed = base.clone();
+        changed.name = "renamed".into();
+        changed.group = Some("other group".into());
+        assert_eq!(connection_fingerprint(&changed), fingerprint);
+    }
+
+    #[test]
+    fn remote_document_read_classifies_text_binary_and_oversize() {
+        let connection = conn("a");
+        let text = build_remote_file_read_result(
+            &connection,
+            "/srv/project".into(),
+            "/srv/project/notes.md".into(),
+            SftpBoundedFileRead::Complete(b"# title\n".to_vec()),
+        );
+        assert_eq!(text.content.content, "# title\n");
+        assert!(!text.content.is_binary);
+        assert!(!text.content.too_large);
+        assert_eq!(
+            text.baseline.as_ref().map(|value| value.byte_len()),
+            Some(8)
+        );
+
+        let binary = build_remote_file_read_result(
+            &connection,
+            "/srv/project".into(),
+            "/srv/project/image.bin".into(),
+            SftpBoundedFileRead::Complete(vec![0xff, 0xfe]),
+        );
+        assert!(binary.content.is_binary);
+        assert!(!binary.content.too_large);
+        assert!(binary.baseline.is_none());
+
+        let oversize = build_remote_file_read_result(
+            &connection,
+            "/srv/project".into(),
+            "/srv/project/large.txt".into(),
+            SftpBoundedFileRead::TooLarge,
+        );
+        assert!(oversize.content.too_large);
+        assert!(!oversize.content.is_binary);
+        assert!(oversize.baseline.is_none());
+    }
+
+    #[test]
+    fn remote_document_save_conflict_requires_explicit_force() {
+        let connection = conn("a");
+        let baseline = remote_baseline(&connection, b"original");
+        assert!(!should_block_remote_save(
+            &SftpBoundedFileRead::Complete(b"original".to_vec()),
+            &baseline,
+            false
+        ));
+        assert!(should_block_remote_save(
+            &SftpBoundedFileRead::Complete(b"changed".to_vec()),
+            &baseline,
+            false
+        ));
+        assert!(should_block_remote_save(
+            &SftpBoundedFileRead::TooLarge,
+            &baseline,
+            false
+        ));
+        assert!(!should_block_remote_save(
+            &SftpBoundedFileRead::Complete(b"changed".to_vec()),
+            &baseline,
+            true
+        ));
+        assert!(should_block_remote_save(
+            &SftpBoundedFileRead::TooLarge,
+            &baseline,
+            true
+        ));
+    }
+
+    #[test]
+    fn remote_document_baseline_rejects_connection_and_path_changes() {
+        let connection = conn("a");
+        let baseline = remote_baseline(&connection, b"original");
+        assert!(validate_remote_file_baseline_connection(&connection, &baseline).is_ok());
+        assert!(
+            validate_remote_file_baseline_path(
+                &baseline,
+                "/srv/project",
+                "/srv/project/src/main.rs"
+            )
+            .is_ok()
+        );
+
+        let mut changed_connection = connection.clone();
+        changed_connection.host = "new-host".into();
+        assert!(validate_remote_file_baseline_connection(&changed_connection, &baseline).is_err());
+        assert!(
+            validate_remote_file_baseline_path(&baseline, "/srv/other", "/srv/other/src/main.rs")
+                .is_err()
+        );
+        assert!(
+            validate_remote_file_baseline_path(
+                &baseline,
+                "/srv/project",
+                "/srv/project/src/other.rs"
+            )
+            .is_err()
+        );
     }
 
     // --- POSIX 路径拼接 / 相对化 ---

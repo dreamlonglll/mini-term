@@ -25,11 +25,12 @@
 //!    ripgrep 级别的重活,边打字边搜会把磁盘打满)。这里照此,不加去抖。
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use futures::StreamExt;
 use futures::channel::mpsc;
 use gpui::{
-    App, AppContext, ClipboardItem, Context, Entity, InteractiveElement, IntoElement,
+    App, AppContext, ClipboardItem, Context, Entity, Global, InteractiveElement, IntoElement,
     ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Task,
     Window, div, prelude::FluentBuilder, px,
 };
@@ -41,6 +42,7 @@ use mt_project::search::{
 
 use crate::i18n::{t, tr};
 use crate::menu;
+use crate::notify::ToastKind;
 use crate::overlay::kind;
 use crate::prompt::{autofocus, close_guarded, open_guarded};
 use crate::store::AppStore;
@@ -49,6 +51,30 @@ use crate::ui;
 /// 结果上限。与原版 `SearchModal.tsx` 里那两个字面量 1000 同一个数
 /// (超出后只显示前 1000 条并挂一条提示)。
 const MAX_RESULTS: usize = 1000;
+
+/// Keep the row alive for the same interval GPUI uses to form `click_count=2`.
+/// Windows exposes a user-configurable threshold; add a small scheduling margin
+/// so the second mouse-up is delivered before the overlay closes.
+#[cfg(windows)]
+fn result_preview_close_delay() -> Duration {
+    use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
+
+    // SAFETY: `GetDoubleClickTime` reads process-independent system settings and
+    // has no pointer or lifetime preconditions.
+    let configured_ms = unsafe { GetDoubleClickTime() };
+    let system_delay = Duration::from_millis(u64::from(configured_ms));
+    system_delay.saturating_add(Duration::from_millis(50))
+}
+
+/// GPUI's Linux backends use 400 ms. The 500 ms fallback also matches the
+/// existing interaction on platforms where GPUI does not expose the interval.
+#[cfg(not(windows))]
+fn result_preview_close_delay() -> Duration {
+    Duration::from_millis(500)
+}
+
+struct GlobalSearchModal(Entity<SearchModal>);
+impl Global for GlobalSearchModal {}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Status {
@@ -59,6 +85,10 @@ enum Status {
 
 pub struct SearchModal {
     store: Entity<AppStore>,
+    /// Identity of the local project that produced the currently displayed
+    /// results. A late result must never be reinterpreted against a newly
+    /// active project (especially an SSH project with the same textual path).
+    search_project: Option<(String, PathBuf)>,
     query: Entity<InputState>,
     mode: SearchMode,
     use_regex: bool,
@@ -69,12 +99,15 @@ pub struct SearchModal {
     handle: Option<SearchHandle>,
     /// 结果泵。换一次搜索就整个替换 —— 旧任务被丢弃,旧 worker 的结果自然到不了。
     _pump: Option<Task<()>>,
+    /// 单击结果后短暂保留浮层，让同一行的第二击仍能到达。替换或丢弃句柄即取消。
+    _close_task: Option<Task<()>>,
+    close_generation: u64,
     _subs: Vec<Subscription>,
 }
 
 impl Drop for SearchModal {
     fn drop(&mut self) {
-        // 关窗即取消(原版 `useEffect` 里 `open` 转 false 时那句 cancel_search)
+        // 实体在应用生命周期内常驻；这里只处理应用退出/实体真正销毁。
         if let Some(handle) = self.handle.take() {
             handle.cancel();
         }
@@ -102,7 +135,37 @@ pub fn open(store: Entity<AppStore>, window: &mut Window, cx: &mut App) {
     if overlay_open() {
         return;
     }
-    let view = cx.new(|cx| SearchModal::new(store, window, cx));
+    let project = {
+        let store = store.read(cx);
+        store.active_project().map(|project| {
+            (
+                project.id.clone(),
+                project.name.clone(),
+                store.is_remote_project(&project.id),
+            )
+        })
+    };
+    let Some((project_id, project_name, is_remote)) = project else {
+        return;
+    };
+    if is_remote {
+        crate::toast::push_message(
+            ToastKind::WslInfo,
+            project_id,
+            project_name,
+            t("search", "remoteUnsupported").to_string(),
+            cx,
+        );
+        return;
+    }
+    let view = if let Some(global) = cx.try_global::<GlobalSearchModal>() {
+        global.0.clone()
+    } else {
+        let view = cx.new(|cx| SearchModal::new(store, window, cx));
+        cx.set_global(GlobalSearchModal(view.clone()));
+        view
+    };
+    view.update(cx, |view, _cx| view.cancel_pending_close());
     let input = view.read(cx).query.clone();
 
     open_guarded(kind::GLOBAL_SEARCH, window, cx, {
@@ -141,8 +204,15 @@ impl SearchModal {
                 this.run(cx);
             }
         });
+        let project_sub = cx.observe(&store, |this: &mut Self, _, cx| {
+            if this.search_project.is_some() && this.current_search_root(cx).is_none() {
+                this.reset(cx);
+                cx.notify();
+            }
+        });
         Self {
             store,
+            search_project: None,
             query,
             mode: SearchMode::FileName,
             use_regex: false,
@@ -151,15 +221,28 @@ impl SearchModal {
             total_count: 0,
             handle: None,
             _pump: None,
-            _subs: vec![sub],
+            _close_task: None,
+            close_generation: 0,
+            _subs: vec![sub, project_sub],
         }
     }
 
-    fn project_root(&self, cx: &App) -> Option<PathBuf> {
-        self.store
-            .read(cx)
-            .active_project()
-            .map(|p| PathBuf::from(&p.path))
+    fn project_snapshot(&self, cx: &App) -> Option<(String, PathBuf)> {
+        let store = self.store.read(cx);
+        let project = store.active_project()?;
+        if store.is_remote_project(&project.id) {
+            return None;
+        }
+        Some((project.id.clone(), PathBuf::from(&project.path)))
+    }
+
+    fn current_search_root(&self, cx: &App) -> Option<PathBuf> {
+        let expected = self.search_project.as_ref()?;
+        if self.project_snapshot(cx).as_ref() == Some(expected) {
+            Some(expected.1.clone())
+        } else {
+            None
+        }
     }
 
     /// 换搜索模式:取消在跑的那次、清空结果(原版那个 `useEffect([mode])`)。
@@ -177,6 +260,7 @@ impl SearchModal {
 
     /// 停掉当前搜索并清空结果。
     fn reset(&mut self, _cx: &mut Context<Self>) {
+        self.cancel_pending_close();
         if let Some(handle) = self.handle.take() {
             handle.cancel();
         }
@@ -184,18 +268,59 @@ impl SearchModal {
         self.results.clear();
         self.total_count = 0;
         self.status = Status::Idle;
+        self.search_project = None;
+    }
+
+    fn cancel_pending_close(&mut self) {
+        self.close_generation = self.close_generation.wrapping_add(1);
+        self._close_task = None;
+    }
+
+    fn schedule_overlay_close(
+        &mut self,
+        expected_project: (String, PathBuf),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.cancel_pending_close();
+        let generation = self.close_generation;
+        self._close_task = Some(cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor()
+                .timer(result_preview_close_delay())
+                .await;
+            let _ = this.update_in(cx, |this: &mut SearchModal, window, cx| {
+                let active_project = this.project_snapshot(cx);
+                if !preview_close_context_matches(
+                    this.close_generation,
+                    generation,
+                    this.search_project.as_ref(),
+                    active_project.as_ref(),
+                    &expected_project,
+                ) {
+                    return;
+                }
+                if close_guarded(kind::GLOBAL_SEARCH, window, cx) {
+                    crate::workbench_area::reactivate_active_document(
+                        &expected_project.0,
+                        window,
+                        cx,
+                    );
+                }
+            });
+        }));
     }
 
     /// 发起一次搜索(Enter / 点「搜索」)。
     fn run(&mut self, cx: &mut Context<Self>) {
         let query = self.query.read(cx).value().trim().to_string();
-        let Some(root) = self.project_root(cx) else {
+        let Some((project_id, root)) = self.project_snapshot(cx) else {
             return;
         };
         if query.is_empty() {
             return;
         }
         self.reset(cx);
+        self.search_project = Some((project_id, root.clone()));
 
         let (tx, mut rx) = mpsc::unbounded::<SearchEvent>();
         let request = SearchRequest {
@@ -247,36 +372,38 @@ impl SearchModal {
         }
     }
 
-    /// 点一条结果。**单击开预览器、双击调外部编辑器**,逐条对照
-    /// `SearchModal.tsx:203-222`。
-    ///
-    /// 双击时两条都会跑:DOM 里 dblclick 之前必然先来一发 click(原版同时挂了
-    /// `onClick` 与 `onDoubleClick`,预览器确实会先弹出来),gpui 这边同样是
-    /// 两个 click 事件、`click_count` 依次 1 和 2 —— 行为对齐,不必去抖。
+    /// 点一条结果：单击先在工作区打开并延迟收起，双击取消延迟并交给外部编辑器。
     fn open_result(
-        &self,
+        &mut self,
         item: &SearchResultItem,
         click_count: usize,
         window: &mut Window,
-        cx: &mut App,
+        cx: &mut Context<Self>,
     ) {
-        let Some(root) = self.project_root(cx) else {
+        let Some(root) = self.current_search_root(cx) else {
+            return;
+        };
+        let Some(expected_project) = self.search_project.clone() else {
             return;
         };
         let path = root.join(&item.file_path);
         match result_action(click_count) {
-            ResultAction::Preview => crate::file_viewer::open(
-                root,
-                path,
-                // 内容搜索给命中行,文件名搜索没有行号
-                item.line_number,
-                window,
-                cx,
-            ),
+            ResultAction::Preview => {
+                crate::workbench_area::open_active_file(
+                    self.store.clone(),
+                    path,
+                    // 内容搜索给命中行,文件名搜索没有行号
+                    item.line_number,
+                    window,
+                    cx,
+                );
+                self.schedule_overlay_close(expected_project, window, cx);
+            }
             ResultAction::ExternalEditor => {
-                // 分两句写:第一句借完 `cx`(读配置)就还,第二句才拿可变借用去丢后台
+                self.cancel_pending_close();
                 let editor = crate::fs_ops::configured_editor(self.store.read(cx).config());
                 crate::fs_ops::open_path_with(editor, path, cx);
+                close_guarded(kind::GLOBAL_SEARCH, window, cx);
             }
         }
     }
@@ -287,7 +414,7 @@ impl SearchModal {
     /// 与原版 `projectRoot.includes('\\') ? '\\' : '/'` 同口径 —— `Path::join`
     /// 在 Windows 上永远给 `\`,复制出来的串就与装机版不一致了。
     fn absolute_text(&self, item: &SearchResultItem, cx: &App) -> Option<String> {
-        let root = self.store.read(cx).active_project()?.path.clone();
+        let root = self.current_search_root(cx)?.to_string_lossy().into_owned();
         let sep = if root.contains('\\') { '\\' } else { '/' };
         Some(format!("{root}{sep}{}", item.file_path.display()))
     }
@@ -295,23 +422,33 @@ impl SearchModal {
 
 // ─── 纯逻辑(可测) ────────────────────────────────────────────
 
-/// 点一条结果该做什么。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ResultAction {
-    /// 单击:开[文件预览器](crate::file_viewer),带上命中行号。
+    /// 单击：在内置文件工作区打开。
     Preview,
-    /// 双击:用配置里的外部编辑器打开(`SearchModal.tsx:213-222`)。
+    /// 双击及以上：交给配置的外部编辑器。
     ExternalEditor,
 }
 
-/// `click_count` → 动作。抽成纯函数是为了把「AA 批把单击从外部编辑器
-/// 换成预览器」这条切换钉在单测里。
+/// 把 GPUI 的连续点击次数映射为搜索结果动作。
 pub fn result_action(click_count: usize) -> ResultAction {
     if click_count >= 2 {
         ResultAction::ExternalEditor
     } else {
         ResultAction::Preview
     }
+}
+
+fn preview_close_context_matches(
+    current_generation: u64,
+    expected_generation: u64,
+    search_project: Option<&(String, PathBuf)>,
+    active_project: Option<&(String, PathBuf)>,
+    expected_project: &(String, PathBuf),
+) -> bool {
+    current_generation == expected_generation
+        && search_project == Some(expected_project)
+        && active_project == Some(expected_project)
 }
 
 /// 往结果集里追加一批,总数封顶在 `cap`。
@@ -490,7 +627,7 @@ impl SearchModal {
     fn render_query_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let can_search = !self.query.read(cx).value().trim().is_empty()
             && self.status != Status::Searching
-            && self.store.read(cx).active_project().is_some();
+            && self.project_snapshot(cx).is_some();
         let regex_on = self.use_regex;
 
         div()
@@ -585,12 +722,14 @@ impl SearchModal {
             .py(px(4.0))
             .cursor_pointer()
             .hover(|el| el.bg(ui::border_subtle()))
-            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
-                let Some(item) = this.results.get(index).cloned() else {
-                    return;
-                };
-                this.open_result(&item, event.click_count(), window, cx);
-            }))
+            .on_click(
+                cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                    let Some(item) = this.results.get(index).cloned() else {
+                        return;
+                    };
+                    this.open_result(&item, event.click_count(), window, cx);
+                }),
+            )
             .on_mouse_down(
                 gpui::MouseButton::Right,
                 cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
@@ -633,12 +772,14 @@ impl SearchModal {
             .py(px(6.0))
             .cursor_pointer()
             .hover(|el| el.bg(ui::border_subtle()))
-            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
-                let Some(item) = this.results.get(index).cloned() else {
-                    return;
-                };
-                this.open_result(&item, event.click_count(), window, cx);
-            }))
+            .on_click(
+                cx.listener(move |this, event: &gpui::ClickEvent, window, cx| {
+                    let Some(item) = this.results.get(index).cloned() else {
+                        return;
+                    };
+                    this.open_result(&item, event.click_count(), window, cx);
+                }),
+            )
             .on_mouse_down(
                 gpui::MouseButton::Right,
                 cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
@@ -783,16 +924,47 @@ mod tests {
         }
     }
 
-    /// AA 批的回接:**单击开预览器**(此前是外部编辑器),双击才是编辑器。
     #[test]
-    fn 单击开预览器双击才调外部编辑器() {
-        // gpui 的双击是两个 click 事件,click_count 依次 1、2 —— 与原版
-        // DOM 的 click + dblclick 同构:预览器先弹,编辑器随后拉起
+    fn 单击预览双击及以上打开外部编辑器() {
+        assert_eq!(result_action(0), ResultAction::Preview);
         assert_eq!(result_action(1), ResultAction::Preview);
         assert_eq!(result_action(2), ResultAction::ExternalEditor);
-        assert_eq!(result_action(3), ResultAction::ExternalEditor, "三连击照旧");
-        // 0 是理论上不会出现的取值,别让它落进「拉外部程序」那一支
-        assert_eq!(result_action(0), ResultAction::Preview);
+        assert_eq!(result_action(3), ResultAction::ExternalEditor);
+    }
+
+    #[test]
+    fn 延迟关闭只在同一代搜索与同一活动项目中交还焦点() {
+        let expected = ("project-a".to_string(), PathBuf::from("/project-a"));
+        assert!(preview_close_context_matches(
+            7,
+            7,
+            Some(&expected),
+            Some(&expected),
+            &expected,
+        ));
+
+        let other = ("project-b".to_string(), PathBuf::from("/project-b"));
+        assert!(!preview_close_context_matches(
+            8,
+            7,
+            Some(&expected),
+            Some(&expected),
+            &expected,
+        ));
+        assert!(!preview_close_context_matches(
+            7,
+            7,
+            Some(&expected),
+            Some(&other),
+            &expected,
+        ));
+        assert!(!preview_close_context_matches(
+            7,
+            7,
+            Some(&other),
+            Some(&expected),
+            &expected,
+        ));
     }
 
     /// 满了就整批丢弃(不是丢最旧的),没满只取装得下的前几条。

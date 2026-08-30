@@ -36,7 +36,11 @@ export const app = {
     },
     closeConfirm: {
       titleAi: "有 AI 会话正在运行",
+      titleUnsaved: "有文件尚未保存",
+      messageWithDocuments: "还有 {count} 个文件包含未保存的修改，关闭后这些修改会丢失：\n\n{names}\n\n确定退出吗？",
+      messageWithDocumentsAndSessions: "还有 {document_count} 个文件包含未保存的修改，关闭后这些修改会丢失：\n\n{document_names}\n\n还有 {session_count} 个 AI 会话将被终止：\n\n{session_names}\n\n确定退出吗？",
       messageWithSessions: "还有 {count} 个 AI 会话，关闭后它们会被终止：\n\n{names}\n\n确定退出吗？",
+      remaining: "另有 {count} 项",
     },
     configLoadFailed: "配置加载失败，为防止覆盖已有配置，本次运行禁止保存。请重启应用重试。\n\n错误：{detail}",
     trayAttention: "{count} 个待确认",
@@ -96,7 +100,11 @@ export const app = {
     },
     closeConfirm: {
       titleAi: "AI sessions still running",
+      titleUnsaved: "Unsaved files",
+      messageWithDocuments: "{count} file(s) have unsaved changes that will be discarded:\n\n{names}\n\nQuit anyway?",
+      messageWithDocumentsAndSessions: "{document_count} file(s) have unsaved changes that will be discarded:\n\n{document_names}\n\n{session_count} AI session(s) will also be terminated:\n\n{session_names}\n\nQuit anyway?",
       messageWithSessions: "{count} AI session(s) are still running and will be terminated:\n\n{names}\n\nQuit anyway?",
+      remaining: "{count} more items",
     },
     configLoadFailed: "Failed to load config. Saving is disabled for this run to protect your existing config. Please restart the app.\n\nError: {detail}",
     trayAttention: "{count} awaiting confirmation",

@@ -21,6 +21,10 @@ gpui.workspace = true
 # **写在这里而不是根 `Cargo.toml`**:workspace 依赖允许成员 crate 在
 # `workspace = true` 之上追加 feature(feature 是可加的),于是根文件保持不动。
 gpui-component = { workspace = true, features = ["tree-sitter-languages"] }
+# 远程 Markdown 与 gpui-component 使用同一份 GFM AST 解析器做 URL 清洗，
+# 避免行级扫描漏掉跨行资源目标或误判代码围栏。该 crate 已由
+# gpui-component 锁定在依赖树中，不会新增第三方包。
+markdown = "1.0"
 mt-ui.workspace = true
 mt-terminal.workspace = true
 mt-pty.workspace = true
@@ -122,6 +126,8 @@ windows = { version = "0.61", features = [
     "Win32_System_LibraryLoader",
     # Shell_NotifyIconW / NOTIFYICONDATAW —— 系统托盘图标的唯一入口。
     "Win32_UI_Shell",
+    # 搜索结果单/双击判定:GetDoubleClickTime 读取系统双击间隔。
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
     # PrintWindow 住在打印/XPS 模块里(弹窗毛玻璃快照,见 frost.rs)。
     "Win32_Storage_Xps",

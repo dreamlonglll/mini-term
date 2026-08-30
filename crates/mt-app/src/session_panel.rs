@@ -123,6 +123,7 @@ pub(crate) fn jump_to_session(
             store.set_active_project(&project_id, cx);
             store.activate_pane(&project_id, &pane_id, window, cx);
         });
+        crate::workbench_area::activate_terminal_page(window, cx);
         return Task::ready(());
     }
 
@@ -192,6 +193,7 @@ pub(crate) fn jump_to_session(
                 );
                 store.focus_pane(&project_id, &pane_id, window, cx);
             });
+            crate::workbench_area::activate_terminal_page(window, cx);
         });
     })
 }
@@ -306,6 +308,8 @@ struct Preview {
     loading: bool,
     error: Option<String>,
     messages: Vec<AiSessionMessage>,
+    /// 与 `messages` 同下标的安全渲染副本；复制动作仍使用原始正文。
+    rendered_messages: Vec<String>,
     /// 已铺出去的条数(见 [`PREVIEW_PAGE_SIZE`])。
     shown: usize,
     /// 可复制的 resume 命令(拼不出来则为 None)。
@@ -689,6 +693,7 @@ impl SessionPanel {
             store.write_to_pane(&project_id, &pane_id, &format!("{command}\r"), cx);
             store.focus_pane(&project_id, &pane_id, window, cx);
         });
+        crate::workbench_area::activate_terminal_page(window, cx);
     }
 
     /// 会话行的右键菜单(`SessionList.tsx:378-401`,顺序照抄):
@@ -755,6 +760,7 @@ impl SessionPanel {
             loading: true,
             error: None,
             messages: Vec::new(),
+            rendered_messages: Vec::new(),
             shown: PREVIEW_PAGE_SIZE,
             command: build_resume_command(&session.session_type, &session.id),
         });
@@ -775,7 +781,7 @@ impl SessionPanel {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    match remote {
+                    let result = match remote {
                         // 循环续读到文件末尾:单次 SFTP 读封顶 8 MB,只读一段的话
                         // 大会话后半截会被静默丢掉(前进保证与总量护栏在 all 里)
                         Some(conn) => crate::remote_ssh::ai_session_content_all(
@@ -790,7 +796,16 @@ impl SessionPanel {
                             project_path,
                             distro,
                         ),
-                    }
+                    };
+                    result.map(|messages| {
+                        let rendered_messages = messages
+                            .iter()
+                            .map(|message| {
+                                crate::file_viewer::sanitize_session_markdown(&message.content)
+                            })
+                            .collect::<Vec<_>>();
+                        (messages, rendered_messages)
+                    })
                 })
                 .await;
             let _ = this.update(cx, |this: &mut Self, cx| {
@@ -799,7 +814,10 @@ impl SessionPanel {
                 };
                 preview.loading = false;
                 match result {
-                    Ok(messages) => preview.messages = messages,
+                    Ok((messages, rendered_messages)) => {
+                        preview.messages = messages;
+                        preview.rendered_messages = rendered_messages;
+                    }
                     Err(err) => preview.error = Some(err),
                 }
                 cx.notify();
@@ -874,16 +892,11 @@ impl SessionPanel {
 
         // 逐条引用着画,不整页 clone:终端一跑起来整窗每帧重绘(GPUI 的
         // notify 是整窗口口径),一页几十条正文每帧复制一遍就是白烧内存带宽
-        for (ix, msg) in self
-            .preview
-            .iter()
-            .flat_map(|p| p.messages.iter())
-            .take(shown)
-            .enumerate()
-        {
+        for (ix, msg) in preview.messages.iter().take(shown).enumerate() {
             let is_user = msg.role == "user";
             let time = format_message_time(&msg.timestamp);
             let content = msg.content.clone();
+            let rendered_content = preview.rendered_messages[ix].clone();
             body = body.child(
                 div()
                     .flex()
@@ -928,7 +941,7 @@ impl SessionPanel {
                                 TextView::markdown(
                                     // id 带会话 id:换会话看时不复用上一份的解析缓存
                                     SharedString::from(format!("session-msg-{session_key}-{ix}")),
-                                    msg.content.clone(),
+                                    rendered_content,
                                     window,
                                     cx,
                                 )
@@ -1514,6 +1527,7 @@ mod tests {
                 msg("user", "问题", "2026-08-24T00:30:05+08:00"),
                 msg("assistant", "回答", ""),
             ],
+            rendered_messages: vec!["问题".into(), "回答".into()],
             shown: PREVIEW_PAGE_SIZE,
             command: None,
         };
@@ -1541,6 +1555,10 @@ mod tests {
             title: "t".into(),
             loading: false,
             error: None,
+            rendered_messages: messages
+                .iter()
+                .map(|message| message.content.clone())
+                .collect(),
             messages,
             shown: PREVIEW_PAGE_SIZE,
             command: None,
