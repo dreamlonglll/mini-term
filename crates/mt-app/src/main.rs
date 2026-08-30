@@ -1787,94 +1787,98 @@ impl Render for Workspace {
         // 原版 `w-[80vw] max-h-[85vh]` + 外壳默认 `pt-[10vh]`(`Modal.tsx:162`):
         // 左右各留 10vw,顶 10vh、底 5vh(10vh + 85vh = 95vh)
         let usage_viewport = window.viewport_size();
-        let usage_layer = self.usage_panel.clone().filter(|_| self.usage_open).map(|panel| {
-            // 原版用量统计是 Modal(`UsageStatsModal.tsx:397`,fixed inset-0,
-            // **盖住标题栏**),遮罩统一 `bg-black/50 backdrop-blur-sm`
-            // (`Modal.tsx:171`)。毛玻璃由**根层那张共用快照**承担(与 Dialog
-            // 族同一层,见 render 尾部)—— 挂根层而不是 body:body 版本盖不到
-            // 标题栏、内嵌玻璃还会被拉伸错位,与设置弹窗观感不一致(用户实测)。
-            // 遮罩上**按下**即关(mousedown 语义 —— 面板里按下、拖出去松手
-            // 不误关);面板自己 stop_propagation 挡掉冒泡(`Modal.tsx:180` 同款)。
-            div()
-                .absolute()
-                .inset_0()
-                .occlude()
-                .bg(gpui::hsla(0.0, 0.0, 0.0, 0.5))
-                .on_mouse_down(
-                    gpui::MouseButton::Left,
-                    cx.listener(|this, _event, window, cx| {
-                        if this.usage_open {
-                            this.toggle_usage(window, cx);
-                        }
-                    }),
-                )
-                .child(
-                    div()
-                        .absolute()
-                        .top(usage_viewport.height * 0.10)
-                        .left(usage_viewport.width * 0.10)
-                        .right(usage_viewport.width * 0.10)
-                        .bottom(usage_viewport.height * 0.05)
-                        .occlude()
-                        // 面板内按下不冒泡到遮罩(原版 `Modal.tsx:180` 的
-                        // stopPropagation 同款),否则点面板空白处也会关窗
-                        .on_mouse_down(gpui::MouseButton::Left, |_event, _window, cx| {
-                            cx.stop_propagation();
-                        })
-                        // 面板体自己的底色。**别省这一行** —— 少了它面板就是全透明的,
-                        // 背后只剩那层 black/50,终端文字照样一个个看得清。
-                        //
-                        // Windows 上看不出来:根层那张毛玻璃快照垫在面板之下,透出来的是
-                        // 模糊+压暗的画面,勉强能读。但快照走 `PrintWindow` 是 Windows 专有
-                        // (见 `frost` 模块),**非 Windows 上 `frost` 恒为 `None`**,退化成
-                        // 纯 black/50 —— 隔着一层黑纱看锐利的终端正文,读不了。
-                        //
-                        // 用 `bg_overlay` 而不是 `bg_surface` / `bg_elevated`:后两者在外置
-                        // 主题包下会乘 `surface_opacity`(有背景图时要透出图),而浮层叠在任意
-                        // 内容之上,半透明是拿可读性换观感 —— 判据见 `ui::Palette::from_pack`
-                        // 里那一行注释。设置弹窗与 pane 预览 / 分支家族 / 日期选择器四处浮层
-                        // 用的都是它,这里是唯一漏掉的一个。
-                        .bg(ui::bg_overlay())
-                        .rounded(px(6.0))
-                        .border_1()
-                        .border_color(ui::border_default())
-                        .overflow_hidden()
-                        .flex()
-                        .flex_col()
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .px(px(12.0))
-                                .py(px(6.0))
-                                .bg(ui::bg_elevated())
-                                .child(
-                                    div()
-                                        .text_size(crate::ui::font_px(12.0))
-                                        .text_color(ui::text_primary())
-                                        .child(t("usageStats", "title")),
-                                )
-                                .child(
-                                    div()
-                                        .id("usage-close")
-                                        .px(px(6.0))
-                                        .text_color(ui::text_muted())
-                                        .cursor_pointer()
-                                        .hover(|el| el.text_color(ui::color_error()))
-                                        // 走 toggle 而不是直接改标志位 —— 可见性要透给
-                                        // 面板,否则关掉之后自动刷新定时器还在每 5s 跑
-                                        .on_click(cx.listener(|this, _event, window, cx| {
-                                            if this.usage_open {
-                                                this.toggle_usage(window, cx);
-                                            }
-                                        }))
-                                        .child("×"),
-                                ),
-                        )
-                        .child(div().flex_1().overflow_hidden().child(panel)),
-                )
-        });
+        let usage_layer = self
+            .usage_panel
+            .clone()
+            .filter(|_| self.usage_open)
+            .map(|panel| {
+                // 原版用量统计是 Modal(`UsageStatsModal.tsx:397`,fixed inset-0,
+                // **盖住标题栏**),遮罩统一 `bg-black/50 backdrop-blur-sm`
+                // (`Modal.tsx:171`)。毛玻璃由**根层那张共用快照**承担(与 Dialog
+                // 族同一层,见 render 尾部)—— 挂根层而不是 body:body 版本盖不到
+                // 标题栏、内嵌玻璃还会被拉伸错位,与设置弹窗观感不一致(用户实测)。
+                // 遮罩上**按下**即关(mousedown 语义 —— 面板里按下、拖出去松手
+                // 不误关);面板自己 stop_propagation 挡掉冒泡(`Modal.tsx:180` 同款)。
+                div()
+                    .absolute()
+                    .inset_0()
+                    .occlude()
+                    .bg(gpui::hsla(0.0, 0.0, 0.0, 0.5))
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(|this, _event, window, cx| {
+                            if this.usage_open {
+                                this.toggle_usage(window, cx);
+                            }
+                        }),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .top(usage_viewport.height * 0.10)
+                            .left(usage_viewport.width * 0.10)
+                            .right(usage_viewport.width * 0.10)
+                            .bottom(usage_viewport.height * 0.05)
+                            .occlude()
+                            // 面板内按下不冒泡到遮罩(原版 `Modal.tsx:180` 的
+                            // stopPropagation 同款),否则点面板空白处也会关窗
+                            .on_mouse_down(gpui::MouseButton::Left, |_event, _window, cx| {
+                                cx.stop_propagation();
+                            })
+                            // 面板体自己的底色。**别省这一行** —— 少了它面板就是全透明的,
+                            // 背后只剩那层 black/50,终端文字照样一个个看得清。
+                            //
+                            // Windows 上看不出来:根层那张毛玻璃快照垫在面板之下,透出来的是
+                            // 模糊+压暗的画面,勉强能读。但快照走 `PrintWindow` 是 Windows 专有
+                            // (见 `frost` 模块),**非 Windows 上 `frost` 恒为 `None`**,退化成
+                            // 纯 black/50 —— 隔着一层黑纱看锐利的终端正文,读不了。
+                            //
+                            // 用 `bg_overlay` 而不是 `bg_surface` / `bg_elevated`:后两者在外置
+                            // 主题包下会乘 `surface_opacity`(有背景图时要透出图),而浮层叠在任意
+                            // 内容之上,半透明是拿可读性换观感 —— 判据见 `ui::Palette::from_pack`
+                            // 里那一行注释。设置弹窗与 pane 预览 / 分支家族 / 日期选择器四处浮层
+                            // 用的都是它,这里是唯一漏掉的一个。
+                            .bg(ui::bg_overlay())
+                            .rounded(px(6.0))
+                            .border_1()
+                            .border_color(ui::border_default())
+                            .overflow_hidden()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .px(px(12.0))
+                                    .py(px(6.0))
+                                    .bg(ui::bg_elevated())
+                                    .child(
+                                        div()
+                                            .text_size(crate::ui::font_px(12.0))
+                                            .text_color(ui::text_primary())
+                                            .child(t("usageStats", "title")),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("usage-close")
+                                            .px(px(6.0))
+                                            .text_color(ui::text_muted())
+                                            .cursor_pointer()
+                                            .hover(|el| el.text_color(ui::color_error()))
+                                            // 走 toggle 而不是直接改标志位 —— 可见性要透给
+                                            // 面板,否则关掉之后自动刷新定时器还在每 5s 跑
+                                            .on_click(cx.listener(|this, _event, window, cx| {
+                                                if this.usage_open {
+                                                    this.toggle_usage(window, cx);
+                                                }
+                                            }))
+                                            .child("×"),
+                                    ),
+                            )
+                            .child(div().flex_1().overflow_hidden().child(panel)),
+                    )
+            });
 
         // 三栏 + 悬浮抽屉的那一层。标题栏之下的**全部**内容都在这里 ——
         // 原版同款(`App.tsx:478` 的 `flex-1 overflow-hidden flex`),抽屉的
