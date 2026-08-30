@@ -635,7 +635,14 @@ impl TerminalView {
         // ⚠️ 必须一并认 `platform`:macOS 把 ⌘ 报在 `platform` 位而不是 `control`,
         // 只判 `control` 的话这个分支在 mac 上永远进不去 —— 而设置页恰恰把这条
         // 显示成 ⌘⇧V(`hotkeys.rs::combo_label` 在 mac 上渲染 ⌘),显示与实际对不上。
-        // 判据与 [`smart_key_action`] 保持同一口径。
+        // 判据与 [`smart_key_action`] 保持同一口径(那边本来就是 `control || platform`)。
+        //
+        // **副作用如实记:Windows 上 Win+Shift+C / Win+Shift+V 也会被这里接管**
+        // —— gpui 的 Windows 后端把 Win 键报在 `platform` 位(`events.rs`),上游评审
+        // 真机实测到了(PR #59)。刻意不用 `cfg!(target_os = "macos")` 闸住:
+        // ① `smart_key_action` 那条路**本来**就把 `platform` 与 `control` 同权,
+        //    这里闸住反而让两条路的判据分叉;② Win+Shift+V 没有系统绑定,多一条
+        //    粘贴入口无害。要严格守住「Windows 逐字不变」就在这里加 cfg 闸门。
         if (mods.control || mods.platform) && mods.shift {
             match keystroke.key.as_str() {
                 "c" => {

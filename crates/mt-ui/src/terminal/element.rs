@@ -1835,11 +1835,24 @@ const MAX_CURSOR_MOVE_STEPS: usize = 512;
 
 /// 「⌥+点击定位光标」要发的方向键序列。
 ///
-/// 这是个**启发式**:光标最终落在哪由前台程序的行编辑器说了算(readline 与 Ink
-/// 各有各的钳位规则),模拟器能做的只是按行列差把方向键发过去。任何终端里的这个
-/// 功能都是这么实现的 —— shell 和 Ink 类 TUI 自己都不认鼠标定位。
+/// 这是个**启发式**:光标最终落在哪由前台程序的行编辑器说了算(readline /
+/// PSReadLine / Ink 各有各的规则),模拟器能做的只是按列差把方向键发过去。任何终端
+/// 里的这个功能都是这么实现的 —— shell 与 TUI 自己都不认鼠标定位。
 ///
-/// **先竖后横**:行编辑器上下移动时往往把列钳到该行末尾,先竖再横才收得回来。
+/// # 只走同一行
+///
+/// **跨行一律不动**。竖向位移在行编辑器里往往不是「移动光标」而是**召回历史**:
+/// pwsh(PSReadLine)里点上一行,一个 Up 就把当前输入整行换成了历史条目 —— 用户
+/// 想挪个光标,结果正在编辑的内容没了。Terminal.app 的 ⌥+click 有这个坑,这里不抄。
+/// 多行编辑器里的跨行定位留给以后配开关(上游评审实测出的这条,见 PR #59)。
+///
+/// # 对 Ink 类 TUI 不保证
+///
+/// Claude CLI / Codex 这类 Ink 应用把**硬件光标停在输入行末尾**(可见光标块之后),
+/// 而这里的起点取的是 grid 光标 —— 两者对不上,落点会偏。上游评审实测:输入
+/// `abc def` 去点 `d`,字符落到了空格前。只有可见光标恰在行末时才近似可用。
+/// 这不是本实现的缺陷(Terminal.app 在 Claude Code 里同样如此),但别指望它。
+/// shell 提示符(bash / zsh / pwsh)下则是逐格准确的。
 fn cursor_move_bytes(
     from_line: i32,
     from_col: i32,
@@ -1847,20 +1860,19 @@ fn cursor_move_bytes(
     to_col: i32,
     mode: TermMode,
 ) -> Vec<u8> {
-    let dy = to_line - from_line;
+    if from_line != to_line {
+        return Vec::new();
+    }
     let dx = to_col - from_col;
-    let steps = dy.unsigned_abs() as usize + dx.unsigned_abs() as usize;
+    let steps = dx.unsigned_abs() as usize;
     if steps == 0 || steps > MAX_CURSOR_MOVE_STEPS {
         return Vec::new();
     }
-    let mut out = Vec::new();
-    let vertical = if dy > 0 { Arrow::Down } else { Arrow::Up };
-    for _ in 0..dy.abs() {
-        out.extend_from_slice(&arrow_bytes(vertical, mode));
-    }
-    let horizontal = if dx > 0 { Arrow::Right } else { Arrow::Left };
-    for _ in 0..dx.abs() {
-        out.extend_from_slice(&arrow_bytes(horizontal, mode));
+    let dir = if dx > 0 { Arrow::Right } else { Arrow::Left };
+    let seq = arrow_bytes(dir, mode.contains(TermMode::APP_CURSOR));
+    let mut out = Vec::with_capacity(seq.len() * steps);
+    for _ in 0..steps {
+        out.extend_from_slice(&seq);
     }
     out
 }
@@ -2267,7 +2279,7 @@ fn paint_hollow_rect(window: &mut Window, bounds: Bounds<Pixels>, color: Hsla) {
 mod tests {
     use super::*;
 
-    /// ⌥+点击定位光标:同一行只发左右键,先竖后横,零位移不发。
+    /// ⌥+点击定位光标:同一行按列差发左右键,零位移不发。
     #[test]
     fn 点击定位光标合成方向键() {
         let m = TermMode::empty();
@@ -2280,9 +2292,18 @@ mod tests {
         assert_eq!(cursor_move_bytes(0, 5, 0, 3, m), b"\x1b[D\x1b[D".to_vec());
         // 点在光标本身:什么都不发,别让一次点击白白喂 PTY 一个空包
         assert!(cursor_move_bytes(3, 7, 3, 7, m).is_empty());
-        // 先竖后横 —— 行编辑器上下移动会把列钳到行尾,先竖再横才收得回来
-        assert_eq!(cursor_move_bytes(1, 4, 2, 5, m), b"\x1b[B\x1b[C".to_vec());
-        assert_eq!(cursor_move_bytes(2, 4, 1, 3, m), b"\x1b[A\x1b[D".to_vec());
+    }
+
+    /// **跨行一律不动**。竖向位移在行编辑器里往往是召回历史而不是移动光标 ——
+    /// pwsh 里点上一行,一个 Up 就把正在编辑的整行换成历史条目(上游评审实测)。
+    /// 这条钉住「宁可不动也不能毁掉用户正在输入的内容」。
+    #[test]
+    fn 点击定位光标跨行不动() {
+        let m = TermMode::empty();
+        assert!(cursor_move_bytes(1, 4, 2, 5, m).is_empty(), "往下跨行");
+        assert!(cursor_move_bytes(2, 4, 1, 3, m).is_empty(), "往上跨行");
+        // 跨行且同列同样不动
+        assert!(cursor_move_bytes(1, 4, 5, 4, m).is_empty(), "跨行同列");
     }
 
     /// DECCKM(`APP_CURSOR`)下方向键换 SS3 前缀 —— 与 `keystroke_to_bytes` 同一口径,
