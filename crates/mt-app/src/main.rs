@@ -1821,6 +1821,20 @@ impl Render for Workspace {
                         .on_mouse_down(gpui::MouseButton::Left, |_event, _window, cx| {
                             cx.stop_propagation();
                         })
+                        // 面板体自己的底色。**别省这一行** —— 少了它面板就是全透明的,
+                        // 背后只剩那层 black/50,终端文字照样一个个看得清。
+                        //
+                        // Windows 上看不出来:根层那张毛玻璃快照垫在面板之下,透出来的是
+                        // 模糊+压暗的画面,勉强能读。但快照走 `PrintWindow` 是 Windows 专有
+                        // (见 `frost` 模块),**非 Windows 上 `frost` 恒为 `None`**,退化成
+                        // 纯 black/50 —— 隔着一层黑纱看锐利的终端正文,读不了。
+                        //
+                        // 用 `bg_overlay` 而不是 `bg_surface` / `bg_elevated`:后两者在外置
+                        // 主题包下会乘 `surface_opacity`(有背景图时要透出图),而浮层叠在任意
+                        // 内容之上,半透明是拿可读性换观感 —— 判据见 `ui::Palette::from_pack`
+                        // 里那一行注释。设置弹窗与 pane 预览 / 分支家族 / 日期选择器四处浮层
+                        // 用的都是它,这里是唯一漏掉的一个。
+                        .bg(ui::bg_overlay())
                         .rounded(px(6.0))
                         .border_1()
                         .border_color(ui::border_default())
