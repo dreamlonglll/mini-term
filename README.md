@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.1.6-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.1.7-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -116,6 +116,7 @@ VS Code 风格的 **Changes 面板**（Staged / Changes / Untracked 分组，单
 | **项目级环境变量** | 按项目注入 PTY 子进程，严格 POSIX 校验，Rust 端二次防御，WSL 下经 WSLENV 透传 |
 | **智能 Ctrl+C/V** | 可选开启：有选区时复制、无选区时中断程序；Windows 大段粘贴自动分块防 ConPTY 丢行 |
 | **拖选停留自动复制** | 拖选后按住鼠标静止超过设定时长自动复制选区并弹「已复制」气泡，时长可调（0 = 关闭） |
+| **Alt+单击定位光标** | 按住 Alt（macOS ⌥）单击命令行任意位置，光标直接挪过去——同一行内按列差合成方向键；跨行一律不动，免得触发行编辑器的历史召回。shell 提示符下逐格准确，Claude CLI 这类 Ink TUI 不保证 |
 | **启动零网络请求** | 原生渲染无 Web 资源，启动不发任何网络请求（价格表按天拉取，拉不到用缓存） |
 | **刷屏不卡界面** | PTY 字节在后台线程直喂 VT 状态机、UI 按帧取格子渲染——单进程零 IPC，没有中间缓冲可堆积，`cat` 大文件也拖不垮界面 |
 | **外置主题包** | 兼容 Dream Skin 格式的皮肤：文件夹或 zip 导入、manifest 的 sha256 校验、改文件即热重载；皮肤可自带背景图，终端随之透明化压在氛围层上。外链一律走同一道闸（禁 `@import`，指向包外的引用全拒）。点「更多皮肤」直达仓库 [`theme/`](theme/) 皮肤库，挑一份下载后导入即用；想自己做一份，字段说明在 [`docs/theme-pack-example/`](docs/theme-pack-example/) |
@@ -138,7 +139,7 @@ VS Code 风格的 **Changes 面板**（Staged / Changes / Untracked 分组，单
 | Git / 文件 | git2（libgit2）· notify + ignore |
 | 用量统计 | rusqlite 本地账本 · 自绘趋势图 |
 | 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`） |
-| 测试 | **1665 个 Rust 测试**（28 个测试目标） |
+| 测试 | **1672 个 Rust 测试**（28 个测试目标） |
 
 ---
 

@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.1.6-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.1.7-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -114,6 +114,7 @@ A VS Code-style **Changes panel** (Staged / Changes / Untracked groups, per-file
 | **Per-project env vars** | Injected into the PTY child process per project, with strict POSIX validation and a second defensive filter on the Rust side; passes through to WSL via WSLENV |
 | **Smart Ctrl+C/V** | Optional: copy when there's a selection, interrupt the program when there isn't; large Windows pastes are chunked so ConPTY doesn't drop lines |
 | **Dwell-to-copy selection** | Hold the mouse still after drag-selecting and the selection is copied with a "Copied" tip; dwell time configurable (0 = off) |
+| **Alt+click to place the cursor** | Hold Alt (⌥ on macOS) and click anywhere on the command line to move the cursor there — arrow keys are synthesized from the column delta, same line only; cross-line clicks are ignored so the line editor's history recall never fires. Cell-accurate at shell prompts; Ink-style TUIs such as Claude CLI are best-effort |
 | **Zero network requests at startup** | Native rendering, no web assets — startup makes no network request at all (the price table refreshes daily and falls back to its cache) |
 | **Flood-proof UI** | PTY bytes feed the VT state machine on a background thread while the UI samples the grid per frame — single process, zero IPC, no intermediate buffer to pile up, so `cat`-ing a huge file can't drag the interface down |
 | **External theme packs** | Dream Skin-compatible skins: import from a folder or a zip, sha256-verified against the manifest, hot-reloaded when you edit a file. A pack can ship its own background image, in which case the terminal goes translucent over that ambient layer. External references all pass the same gate (no `@import`; anything pointing outside the pack is rejected). Hit "More skins" to jump straight to the [`theme/`](theme/) gallery in this repo — pick one, download it, import it; to roll your own, the field reference lives in [`docs/theme-pack-example/`](docs/theme-pack-example/) |
@@ -136,7 +137,7 @@ The whole application is **native Rust**:
 | Git / files | git2 (libgit2) · notify + ignore |
 | Usage stats | rusqlite local ledger · hand-drawn trend charts |
 | Mobile relay | axum + tokio WebSocket (`relay-server/`) · React + Vite PWA (`mobile/`) |
-| Tests | **1,665 Rust tests** (28 test targets) |
+| Tests | **1,672 Rust tests** (28 test targets) |
 
 ---
 
