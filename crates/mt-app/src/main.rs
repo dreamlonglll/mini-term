@@ -2140,6 +2140,26 @@ fn main() {
         })
         .detach();
 
+        // macOS 的 NSApplication **不随最后一个窗口关闭而退出**(Windows / Linux 的
+        // gpui 会结束事件循环),于是关窗后进程还活着、Dock 里还挂着图标,而点它没有
+        // 任何反应:本仓没注册 `on_reopen`,`menu.rs` 又是右键菜单不是菜单栏,没有
+        // 任何入口能把窗口叫回来 —— 应用变成一个点不开也退不掉的僵尸。
+        //
+        // 收敛成「关窗即退出」而不是重开窗口:`Workspace::new` 吃掉的 `ai_events` 是
+        // 一次性的 `UnboundedReceiver`,重建窗口得先把 AI 事件泵与 Workspace 的生命
+        // 周期解耦;而 `title_bar::finish_close` 的注释(「那条管进程退出,这条管窗口
+        // 关闭」)与关窗确认框的措辞(「关掉会丢失这些 AI 会话」)本来就是
+        // 「关窗 = 关应用」的语义。
+        //
+        // 只在 macOS 挂:另外两家 gpui 自己就会退,多这一道只会在主力平台上引入变数。
+        #[cfg(target_os = "macos")]
+        cx.on_window_closed(|cx| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
+
         // 上次退出时的窗口大小/位置/最大化态(存在 layout.db)。没存过 / 存的框
         // 已经不在任何一块屏幕上 → 回落默认居中 1280×800。
         let window_bounds = restore_window_bounds(store.read(cx).window_geometry(), cx);

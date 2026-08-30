@@ -212,6 +212,35 @@ fn control_code(key: &str) -> Option<Vec<u8>> {
     Some(vec![byte])
 }
 
+/// 一个方向键。见 [`arrow_bytes`]。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Arrow {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+/// 一个**无修饰**方向键的字节序列(DECCKM / `APP_CURSOR` 下换 SS3 前缀)。
+///
+/// 「⌥+点击定位光标」按行列差值连发方向键,那条路手上没有 `Keystroke` 可喂给
+/// [`keystroke_to_bytes`],于是把里面那一小段编码抽出来共用 —— 两处各写一份,
+/// 迟早在 DECCKM 这种细节上分叉。
+pub fn arrow_bytes(dir: Arrow, mode: TermMode) -> Vec<u8> {
+    let prefix = if mode.contains(TermMode::APP_CURSOR) {
+        "\x1bO"
+    } else {
+        "\x1b["
+    };
+    let final_byte = match dir {
+        Arrow::Up => 'A',
+        Arrow::Down => 'B',
+        Arrow::Right => 'C',
+        Arrow::Left => 'D',
+    };
+    format!("{prefix}{final_byte}").into_bytes()
+}
+
 /// 粘贴文本 → PTY 字节。开了 bracketed paste 就包上 `ESC[200~ … ESC[201~`。
 ///
 /// 无论哪种模式都要先把 `\r\n` / `\n` 归一成 `\r`:PTY 那头把 `\n` 当作
