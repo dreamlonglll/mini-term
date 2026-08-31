@@ -261,27 +261,43 @@ impl TerminalsPanel {
                 let Some(pid) = this.store.read(cx).active_project_id.clone() else {
                     return;
                 };
-                let shells = this.store.read(cx).config().available_shells.clone();
-                if shells.len() <= 1 {
+                let (shells, launchers) = {
+                    let store = this.store.read(cx);
+                    (
+                        store.config().available_shells.clone(),
+                        store.mobile_relay().launchers,
+                    )
+                };
+                if !pane_actions::should_show_new_terminal_menu(shells.len(), launchers.len()) {
                     this.store.update(cx, |store, cx| {
                         store.new_panel(&pid, None, window, cx);
                     });
                     return;
                 }
-                let entries: Vec<menu::MenuEntry> = shells
-                    .into_iter()
-                    .map(|shell| {
+                let entries = pane_actions::new_terminal_menu_entries(
+                    shells,
+                    launchers,
+                    {
                         let store = this.store.clone();
                         let pid = pid.clone();
-                        let name = shell.name.clone();
-                        menu::item(name, move |window, cx| {
-                            let (pid, shell) = (pid.clone(), shell.clone());
+                        move |shell, window, cx| {
+                            let pid = pid.clone();
                             store.update(cx, |store, cx| {
                                 store.new_panel(&pid, Some(shell), window, cx);
                             });
-                        })
-                    })
-                    .collect();
+                        }
+                    },
+                    {
+                        let store = this.store.clone();
+                        let pid = pid.clone();
+                        move |launcher, window, cx| {
+                            let pid = pid.clone();
+                            store.update(cx, |store, cx| {
+                                store.new_panel_from_launcher(&pid, &launcher, window, cx);
+                            });
+                        }
+                    },
+                );
                 menu::show(click_position(event, window), entries, window, cx);
             }))
     }

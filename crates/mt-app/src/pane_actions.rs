@@ -22,8 +22,10 @@
 //! 灰色补充行里(原版没有这一段,但「哪几个终端会被杀」是关整组时最想知道的)。
 
 use gpui::{App, Entity, Window};
+use mt_config::{AiLauncher, ShellConfig};
 
 use crate::i18n::{t, tr};
+use crate::menu;
 use crate::prompt::Confirm;
 use crate::session_branch::{BranchMenuSegment, branch_menu_segment};
 use crate::store::{AppStore, resolve_fork_cwd};
@@ -32,6 +34,67 @@ use crate::tree::{PaneState, PaneStatus, SplitDirection, SplitNode};
 /// 这个状态算「AI 会话还活着」吗。
 pub fn is_ai_alive(status: PaneStatus) -> bool {
     matches!(status, PaneStatus::AiWorking | PaneStatus::AiIdle)
+}
+
+// === 新建终端菜单 ===
+
+/// 「新建终端」菜单该不该弹出来。
+///
+/// 原判据是 `shells.len() <= 1` —— 只有一个 shell 时直接开,别让单 shell 用户
+/// 每次多点一下(见 `terminal_area::render_leaf_tab_bar` 那处注释)。接入 AI
+/// 启动器后可选项变成两段,判据必须**连启动器一起算**,否则精简过 shell 列表的
+/// 用户永远看不到启动器段。
+pub fn should_show_new_terminal_menu(shell_count: usize, launcher_count: usize) -> bool {
+    shell_count + launcher_count > 1
+}
+
+/// 「新建终端」菜单的条目:shell 段 +(有启动器时)AI 启动器段 +「管理启动器…」。
+///
+/// # 为什么收成一个入口
+///
+/// 新建终端有三条路:tab 栏的 `+`、空态的「+ 新建终端」按钮、终端面板的 `+`。
+/// 三处此前是同一份代码复制三遍,菜单内容一致纯靠人工对齐;加了启动器段之后
+/// 三份各改一遍必然漂移(与本模块开头「关终端必须收成一个入口」同一个理由)。
+///
+/// 落点差异由两个回调表达:前两处开 tab(带/不带锚点),第三处开面板。
+pub fn new_terminal_menu_entries(
+    shells: Vec<ShellConfig>,
+    launchers: Vec<AiLauncher>,
+    on_shell: impl Fn(ShellConfig, &mut Window, &mut App) + Clone + 'static,
+    on_launcher: impl Fn(AiLauncher, &mut Window, &mut App) + Clone + 'static,
+) -> Vec<menu::MenuEntry> {
+    let mut entries: Vec<menu::MenuEntry> = shells
+        .into_iter()
+        .map(|shell| {
+            let on_shell = on_shell.clone();
+            let name = shell.name.clone();
+            menu::item(name, move |window, cx| on_shell(shell.clone(), window, cx))
+        })
+        .collect();
+
+    // 启动器一条都没有时不出这一段(含标题与分隔线)——空标题比没有更难看
+    if !launchers.is_empty() {
+        entries.push(menu::separator());
+        entries.push(menu::MenuEntry::Header(
+            t("terminalArea", "aiLaunchers").into(),
+        ));
+        for launcher in launchers {
+            let on_launcher = on_launcher.clone();
+            let name = launcher.name.clone();
+            entries.push(menu::item(name, move |window, cx| {
+                on_launcher(launcher.clone(), window, cx)
+            }));
+        }
+    }
+
+    // 启动器配置住在「移动端」面板里(它同时是移动端发起会话的名单),
+    // 桌面端用户找不到那个入口 —— 这一条是唯一的指路牌,故**总是**出现。
+    entries.push(menu::separator());
+    entries.push(menu::item(
+        t("terminalArea", "manageLaunchers"),
+        |window, cx| crate::mobile_panel::open(window, cx),
+    ));
+    entries
 }
 
 /// 盘点一组 pane 里活着的 AI 会话,返回它们的显示名(顺序同 tab 顺序)。
@@ -325,6 +388,21 @@ fn confirm_close_group(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 「只有一个可选项就别弹菜单」那道闸:接入 AI 启动器后必须**连启动器一起算**。
+    /// 只按 shell 数判的话,精简过 shell 列表的用户永远看不到启动器段
+    /// —— 而那正是这次要给他们的入口。
+    #[test]
+    fn single_option_gate_counts_launchers_too() {
+        // 一个 shell、零启动器:只有一条路,直接开(原行为)
+        assert!(!should_show_new_terminal_menu(1, 0));
+        // 一个 shell、一条启动器:有得选了,必须弹
+        assert!(should_show_new_terminal_menu(1, 1));
+        // 多 shell 照旧弹
+        assert!(should_show_new_terminal_menu(2, 0));
+        // 一条 shell 都没有(配置损坏)也不弹:调用方那条分支会回落默认 shell
+        assert!(!should_show_new_terminal_menu(0, 0));
+    }
 
     fn pane(label: &str, status: PaneStatus) -> PaneState {
         let mut p = PaneState::new(label);

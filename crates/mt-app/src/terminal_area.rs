@@ -1910,29 +1910,49 @@ impl TerminalArea {
                 .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                     // 与 tab 同理:别让这一下冒到 tab 栏的「双击空白处最大化」上
                     cx.stop_propagation();
-                    let shells = this.store.read(cx).config().available_shells.clone();
-                    if shells.len() <= 1 {
+                    let (shells, launchers) = {
+                        let store = this.store.read(cx);
+                        (
+                            store.config().available_shells.clone(),
+                            store.mobile_relay().launchers,
+                        )
+                    };
+                    if !pane_actions::should_show_new_terminal_menu(shells.len(), launchers.len()) {
                         this.store.update(cx, |store, cx| {
                             store.new_terminal(&pid_new, None, Some(anchor_new.clone()), window, cx);
                         });
                         return;
                     }
-                    // 无勾选标记、无分隔线,就是一列 shell 名
-                    let entries: Vec<menu::MenuEntry> = shells
-                        .into_iter()
-                        .map(|shell| {
+                    let entries = pane_actions::new_terminal_menu_entries(
+                        shells,
+                        launchers,
+                        {
                             let store = this.store.clone();
                             let (pid, anchor) = (pid_new.clone(), anchor_new.clone());
-                            let name = shell.name.clone();
-                            menu::item(name, move |window, cx| {
-                                let (pid, anchor, shell) =
-                                    (pid.clone(), anchor.clone(), shell.clone());
+                            move |shell, window, cx| {
+                                let (pid, anchor) = (pid.clone(), anchor.clone());
                                 store.update(cx, |store, cx| {
                                     store.new_terminal(&pid, Some(shell), Some(anchor), window, cx);
                                 });
-                            })
-                        })
-                        .collect();
+                            }
+                        },
+                        {
+                            let store = this.store.clone();
+                            let (pid, anchor) = (pid_new.clone(), anchor_new.clone());
+                            move |launcher, window, cx| {
+                                let (pid, anchor) = (pid.clone(), anchor.clone());
+                                store.update(cx, |store, cx| {
+                                    store.new_terminal_from_launcher(
+                                        &pid,
+                                        &launcher,
+                                        Some(anchor),
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            }
+                        },
+                    );
                     menu::show(click_position(event, window), entries, window, cx);
                 }))
                 .child("+"),
@@ -3111,27 +3131,48 @@ impl Render for TerminalArea {
                         // 唯一差别是 anchor:空态没有「当前 pane」可挨着放,传 None
                         // (原版那边也是 `newTerminal(projectId)` 不带 targetPaneId)。
                         .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                            let shells = this.store.read(cx).config().available_shells.clone();
-                            if shells.len() <= 1 {
+                            let (shells, launchers) = {
+                                let store = this.store.read(cx);
+                                (
+                                    store.config().available_shells.clone(),
+                                    store.mobile_relay().launchers,
+                                )
+                            };
+                            if !pane_actions::should_show_new_terminal_menu(
+                                shells.len(),
+                                launchers.len(),
+                            ) {
                                 this.store.update(cx, |store, cx| {
                                     store.new_terminal(&pid, None, None, window, cx);
                                 });
                                 return;
                             }
-                            let entries: Vec<menu::MenuEntry> = shells
-                                .into_iter()
-                                .map(|shell| {
+                            let entries = pane_actions::new_terminal_menu_entries(
+                                shells,
+                                launchers,
+                                {
                                     let store = this.store.clone();
                                     let pid = pid.clone();
-                                    let name = shell.name.clone();
-                                    menu::item(name, move |window, cx| {
-                                        let (pid, shell) = (pid.clone(), shell.clone());
+                                    move |shell, window, cx| {
+                                        let pid = pid.clone();
                                         store.update(cx, |store, cx| {
                                             store.new_terminal(&pid, Some(shell), None, window, cx);
                                         });
-                                    })
-                                })
-                                .collect();
+                                    }
+                                },
+                                {
+                                    let store = this.store.clone();
+                                    let pid = pid.clone();
+                                    move |launcher, window, cx| {
+                                        let pid = pid.clone();
+                                        store.update(cx, |store, cx| {
+                                            store.new_terminal_from_launcher(
+                                                &pid, &launcher, None, window, cx,
+                                            );
+                                        });
+                                    }
+                                },
+                            );
                             menu::show(click_position(event, window), entries, window, cx);
                         }))
                         .child(format!("+ {}", t("terminalArea", "newTerminal"))),

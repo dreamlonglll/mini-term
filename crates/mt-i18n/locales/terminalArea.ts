@@ -9,6 +9,8 @@ export const terminalArea = {
     newPanel: "新建终端面板",
     renamePanel: "重命名面板",
     closePanel: "关闭面板",
+    aiLaunchers: "AI 启动器",
+    manageLaunchers: "管理启动器…",
   },
   en: {
     terminal: "Terminal",
@@ -20,5 +22,7 @@ export const terminalArea = {
     newPanel: "New terminal panel",
     renamePanel: "Rename panel",
     closePanel: "Close panel",
+    aiLaunchers: "AI Launchers",
+    manageLaunchers: "Manage launchers…",
   },
 } as const;

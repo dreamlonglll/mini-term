@@ -5,7 +5,7 @@
 //! `// === 双击最大化 ===`),段注释随代码走,逻辑一行未改。
 
 use gpui::{AppContext, Context, Window};
-use mt_config::{ProjectConfig, ShellConfig};
+use mt_config::{AiLauncher, ProjectConfig, ShellConfig};
 use mt_pty::PtySpawn;
 use mt_ui::{DwellConfig, TerminalStyle};
 
@@ -36,6 +36,73 @@ impl AppStore {
         cx: &mut Context<Self>,
     ) -> Option<String> {
         self.new_terminal_with_cwd(project_id, shell, anchor_pane_id, None, window, cx)
+    }
+
+    /// 新建一个终端 tab 并按 AI 启动器把 agent 拉起来。
+    ///
+    /// 启动器是 `{名称, shell(可选), 命令}` 的具名条目(见 [`mt_config::AiLauncher`]),
+    /// 桌面端与移动端**共用同一份配置**;这里是桌面端那条触发路径。
+    ///
+    /// 与移动端发起会话(`mobile_relay::MobileRelayBridge::try_start_session`)的区别
+    /// 只在落点与善后:那边刻意用 `append_pane_background` 不抢焦点、要回执、要弹
+    /// 审计 toast;桌面端是人自己点的,照常走 [`new_terminal`] 把焦点带过去,
+    /// 不回执也不弹 toast。**改这里时记得看一眼那边**,两条路径共用启动器语义。
+    ///
+    /// [`new_terminal`]: Self::new_terminal
+    pub fn new_terminal_from_launcher(
+        &mut self,
+        project_id: &str,
+        launcher: &AiLauncher,
+        anchor_pane_id: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
+        // 绑定的 shell 被删掉时退回默认 —— 总比不开好,用户在桌面看得到实情
+        // (判据与移动端那条同一个 `resolve_shell`)
+        let shell = self.resolve_shell(launcher.shell.as_deref())?;
+        let pane_id = self.new_terminal(project_id, Some(shell), anchor_pane_id, window, cx)?;
+        self.rename_pane(project_id, &pane_id, &launcher.name, cx);
+        self.write_launcher_command(project_id, &pane_id, &launcher.command, cx);
+        Some(pane_id)
+    }
+
+    /// 新建一个终端**面板**并按 AI 启动器把 agent 拉起来。
+    /// 与 [`new_terminal_from_launcher`] 同,只是落点是新面板而非当前面板的 tab 栏。
+    ///
+    /// [`new_terminal_from_launcher`]: Self::new_terminal_from_launcher
+    pub fn new_panel_from_launcher(
+        &mut self,
+        project_id: &str,
+        launcher: &AiLauncher,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let shell = self.resolve_shell(launcher.shell.as_deref())?;
+        let pane_id = self.new_panel(project_id, Some(shell), window, cx)?;
+        self.rename_pane(project_id, &pane_id, &launcher.name, cx);
+        self.write_launcher_command(project_id, &pane_id, &launcher.command, cx);
+        Some(pane_id)
+    }
+
+    /// 把启动器命令连同回车写进 pane。
+    ///
+    /// ⚠️ 必须走 [`write_to_pane`] 而不是裸 PTY 写:AI 会话身份靠**输入检测**建立,
+    /// 只有「往 shell 里敲进启动命令并回车」这条路能让 pane 进入 AI 会话状态。
+    /// 把 AI CLI 当成 PTY 根程序 spawn(`shell -c "claude"`)会绕开检测,拿不到
+    /// 状态徽章与对话镜像 —— 这是 ADR 0002 定下的纪律,别改。
+    ///
+    /// PTY 内核缓冲 stdin,shell 就绪前写入不丢(与移动端发起会话同一时序)。
+    /// 写不进去时**保留 pane**:用户回头能看到它卡在哪。
+    ///
+    /// [`write_to_pane`]: Self::write_to_pane
+    fn write_launcher_command(
+        &mut self,
+        project_id: &str,
+        pane_id: &str,
+        command: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.write_to_pane(project_id, pane_id, &format!("{command}\r"), cx);
     }
 
     /// 新建终端并指定启动目录。

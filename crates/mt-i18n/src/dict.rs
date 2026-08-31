@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 32;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 840;
+pub const ZH_ENTRY_COUNT: usize = 842;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 840;
+pub const EN_ENTRY_COUNT: usize = 842;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -1625,9 +1625,11 @@ static TERMINAL_EN: &[(&str, &str)] = &[
 
 #[rustfmt::skip]
 static TERMINAL_AREA_ZH: &[(&str, &str)] = &[
+    ("aiLaunchers", "AI 启动器"),
     ("closePanel", "关闭面板"),
     ("emptyHint", "也可以按"),
     ("emptyTitle", "「{project}」还没有打开终端"),
+    ("manageLaunchers", "管理启动器…"),
     ("newPanel", "新建终端面板"),
     ("newTerminal", "新建终端"),
     ("panelN", "面板 {n}"),
@@ -1637,9 +1639,11 @@ static TERMINAL_AREA_ZH: &[(&str, &str)] = &[
 ];
 #[rustfmt::skip]
 static TERMINAL_AREA_EN: &[(&str, &str)] = &[
+    ("aiLaunchers", "AI Launchers"),
     ("closePanel", "Close panel"),
     ("emptyHint", "or press"),
     ("emptyTitle", "No terminal open in \"{project}\""),
+    ("manageLaunchers", "Manage launchers…"),
     ("newPanel", "New terminal panel"),
     ("newTerminal", "New Terminal"),
     ("panelN", "Panel {n}"),
