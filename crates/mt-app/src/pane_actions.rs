@@ -78,8 +78,17 @@ pub fn new_terminal_menu_data(
 ///
 /// 原判据是 `shells.len() <= 1` —— 只有一个 shell 时直接开,别让单 shell 用户
 /// 每次多点一下(见 `terminal_area::render_leaf_tab_bar` 那处注释)。接入 AI
-/// 启动器后可选项变成两段,判据必须**连启动器一起算**,否则精简过 shell 列表的
-/// 用户永远看不到启动器段。
+/// 启动器后可选项变成两段,判据必须**连启动器一起算**,否则单 shell 用户永远
+/// 看不到启动器段。
+///
+/// ⚠️ **影响面比字面大**:启动器的读口径(`AppStore::mobile_relay`)在配置整块
+/// 缺失时回落 `Default`,含预置的 Claude / Codex 两条,`launcher_count` 因此
+/// 恒 ≥ 2 —— 除非用户把启动器删光。也就是说**所有**单 shell 用户点「+」从此
+/// 都会弹菜单,而不只是自己精简过 shell 列表的那批。这是有意为之:本次的目的
+/// 就是把启动器这个入口曝光出来,多的那一次点击换来的是「一键开 AI 会话」。
+///
+/// 例外是远程项目 —— [`new_terminal_menu_data`] 对它返回空启动器,
+/// 于是单 shell + 远程项目仍然是点一下直接开。
 pub fn should_show_new_terminal_menu(shell_count: usize, launcher_count: usize) -> bool {
     shell_count + launcher_count > 1
 }
@@ -426,14 +435,17 @@ mod tests {
     use super::*;
 
     /// 「只有一个可选项就别弹菜单」那道闸:接入 AI 启动器后必须**连启动器一起算**。
-    /// 只按 shell 数判的话,精简过 shell 列表的用户永远看不到启动器段
-    /// —— 而那正是这次要给他们的入口。
+    /// 只按 shell 数判的话,单 shell 用户永远看不到启动器段 —— 而那正是这次要给
+    /// 他们的入口。因为启动器读口径缺省含预置两条,实际效果是所有单 shell 用户
+    /// 点「+」都会弹菜单(远程项目除外,那边启动器为空)。
     #[test]
     fn single_option_gate_counts_launchers_too() {
-        // 一个 shell、零启动器:只有一条路,直接开(原行为)
+        // 一个 shell、零启动器:只有一条路,直接开(原行为;也是远程项目的情形)
         assert!(!should_show_new_terminal_menu(1, 0));
         // 一个 shell、一条启动器:有得选了,必须弹
         assert!(should_show_new_terminal_menu(1, 1));
+        // 预置两条启动器是缺省状态 —— 单 shell 用户实际落在这一档
+        assert!(should_show_new_terminal_menu(1, 2));
         // 多 shell 照旧弹
         assert!(should_show_new_terminal_menu(2, 0));
         // 一条 shell 都没有(配置损坏)也不弹:调用方那条分支会回落默认 shell
