@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.1.7-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.2.0-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -90,6 +90,7 @@ Mini-Term 就是为这件事做的：项目列表上的状态灯实时跳动，A
 - **左侧项目列表**管理多个工作区，支持最多 3 级嵌套分组、拖拽排序、从资源管理器拖文件夹直接添加
 - **横竖任意嵌套的递归分屏**，拖拽调比例；标签 / 分屏 / 窗口大小位置全部持久化，重启原样恢复
 - **项目级终端面板**——终端区右缘的图标竖条给同一项目开多个**独立终端工作面**，各自持有整套分屏与标签互不影响（跑 AI 的一面、跑前后端的一面，点图标整面切换）；按钮带 AI 进度呼吸灯与终端数角标，双击改名，全部随重启还原
+- **新建终端即启 agent**——三处「新建终端」入口(标签栏 +、空态按钮、终端面板)的菜单里除了各类 shell,还列着 AI 启动器(预置 Claude / Codex,可自行增删):选中即开出新终端并自动敲入启动命令,AI 状态感知随之建立;与移动端「发起新会话」共用同一份启动器配置(SSH 远程项目不出此段——连接初期的口令交互会把预写命令吃掉)
 - **换场动画**——切标签 / 切面板按方向推入推出，最大化从终端所在格子展开到整幅、还原反向收回；不喜欢动画的，设置里一个开关整体关掉
 - **pane 拖拽重排与最大化**——tab 拖到别的分组并入，拖到终端区四边分出新屏，落点实时高亮预览；双击 tab 栏空白处把当前分组临时铺满，终端内容全程不丢
 - **AI 任务标记**——会话里每次按 Enter 自动打点，`Ctrl+Shift+↑/↓` 在历史提交之间跳转
@@ -139,7 +140,7 @@ VS Code 风格的 **Changes 面板**（Staged / Changes / Untracked 分组，单
 | Git / 文件 | git2（libgit2）· notify + ignore |
 | 用量统计 | rusqlite 本地账本 · 自绘趋势图 |
 | 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`） |
-| 测试 | **1672 个 Rust 测试**（28 个测试目标） |
+| 测试 | **1677 个 Rust 测试**（28 个测试目标） |
 
 ---
 

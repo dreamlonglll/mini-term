@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.1.7-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.2.0-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -88,6 +88,7 @@ Right-click a project → "Link SSH", tick the connections, and it's enabled for
 - A **project sidebar** for multiple workspaces, with up to 3 levels of nested groups, drag-to-reorder, and drag-a-folder-from-Explorer to add
 - **Arbitrarily nested horizontal / vertical splits**, drag to adjust ratios; tabs, splits, and window geometry all persist and restore on restart
 - **Project-level terminal panels** — an icon strip on the terminal area's right edge gives one project multiple **independent terminal workspaces**, each holding its own splits and tabs (one face for the AI session, another split for frontend + backend; click an icon to switch the whole face); buttons carry an AI progress light and a terminal-count badge, double-click to rename, everything restores on restart
+- **New terminal, agent included** — all three "new terminal" entry points (tab-bar +, empty-state button, terminal panel) list your AI launchers alongside the shells (Claude / Codex preset, fully editable): pick one and a new pane opens with the launch command typed in, AI status detection attached; launchers share one config with the mobile "start a new session" flow (hidden on SSH remote projects — the early password prompts would eat the pre-typed command)
 - **Transition animations** — directional pushes when switching tabs / panels, maximize expands from the pane's own cell and restore reverses it back; a single switch in Settings turns them all off
 - **Drag panes to rearrange & maximize** — drag a tab into another group to merge, or onto a terminal-area edge to split off a new pane, with a live drop preview; double-click the tab bar's empty area to temporarily fill the terminal area, and content survives throughout
 - **AI task markers** — every Enter inside a session drops a marker; `Ctrl+Shift+↑/↓` jumps between past submissions
@@ -137,7 +138,7 @@ The whole application is **native Rust**:
 | Git / files | git2 (libgit2) · notify + ignore |
 | Usage stats | rusqlite local ledger · hand-drawn trend charts |
 | Mobile relay | axum + tokio WebSocket (`relay-server/`) · React + Vite PWA (`mobile/`) |
-| Tests | **1,672 Rust tests** (28 test targets) |
+| Tests | **1,677 Rust tests** (28 test targets) |
 
 ---
 
