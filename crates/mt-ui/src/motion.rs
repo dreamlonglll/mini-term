@@ -243,7 +243,9 @@ pub fn pulse_phase(period: Duration, window: &Window, cx: &mut App) -> f32 {
             loop {
                 cx.background_executor().timer(PULSE_TICK).await;
                 // App 没了(退出中)就把 running 收干净再走
-                let Ok(stop) = cx.update(pulse_tick) else { break };
+                let Ok(stop) = cx.update(pulse_tick) else {
+                    break;
+                };
                 if stop {
                     return;
                 }
@@ -759,7 +761,10 @@ mod tests {
         // 整圈归零,而不是停在 1.0
         assert_eq!(phase_of(Duration::from_millis(900), p), 0.0);
         assert!((phase_of(Duration::from_millis(2250), p) - 0.5).abs() < 1e-4);
-        assert!(phase_of(Duration::from_secs(86400), p) < 1.0, "跑一天也不许越界");
+        assert!(
+            phase_of(Duration::from_secs(86400), p) < 1.0,
+            "跑一天也不许越界"
+        );
         // 零周期防护:不许除零
         assert_eq!(phase_of(Duration::from_secs(1), Duration::ZERO), 0.0);
     }

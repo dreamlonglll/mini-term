@@ -43,8 +43,8 @@ use futures::channel::mpsc;
 use gpui::{
     AnyElement, App, AppContext as _, Context, Div, Entity, InteractiveElement, IntoElement,
     MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Render, RenderOnce, SharedString,
-    Stateful, StatefulInteractiveElement, Styled, Task, Window, div, point,
-    prelude::FluentBuilder, px, relative,
+    Stateful, StatefulInteractiveElement, Styled, Task, Window, div, point, prelude::FluentBuilder,
+    px, relative,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 use mt_ui::tooltip::Tooltip;
@@ -1134,9 +1134,7 @@ fn state_hint(
         .flex_col()
         .items_center()
         .gap(px(12.0))
-        .when(spinning, |el| {
-            el.child(ui::spinner(px(20.0), ui::accent()))
-        })
+        .when(spinning, |el| el.child(ui::spinner(px(20.0), ui::accent())))
         .child(
             div()
                 .text_size(ui::font_px(13.0))
