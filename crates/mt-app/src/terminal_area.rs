@@ -1910,16 +1910,17 @@ impl TerminalArea {
                 .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                     // 与 tab 同理:别让这一下冒到 tab 栏的「双击空白处最大化」上
                     cx.stop_propagation();
-                    let (shells, launchers) = {
-                        let store = this.store.read(cx);
-                        (
-                            store.config().available_shells.clone(),
-                            store.mobile_relay().launchers,
-                        )
-                    };
+                    let (shells, launchers) =
+                        pane_actions::new_terminal_menu_data(this.store.read(cx), &pid_new);
                     if !pane_actions::should_show_new_terminal_menu(shells.len(), launchers.len()) {
                         this.store.update(cx, |store, cx| {
-                            store.new_terminal(&pid_new, None, Some(anchor_new.clone()), window, cx);
+                            store.new_terminal(
+                                &pid_new,
+                                None,
+                                Some(anchor_new.clone()),
+                                window,
+                                cx,
+                            );
                         });
                         return;
                     }
@@ -3131,13 +3132,8 @@ impl Render for TerminalArea {
                         // 唯一差别是 anchor:空态没有「当前 pane」可挨着放,传 None
                         // (原版那边也是 `newTerminal(projectId)` 不带 targetPaneId)。
                         .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                            let (shells, launchers) = {
-                                let store = this.store.read(cx);
-                                (
-                                    store.config().available_shells.clone(),
-                                    store.mobile_relay().launchers,
-                                )
-                            };
+                            let (shells, launchers) =
+                                pane_actions::new_terminal_menu_data(this.store.read(cx), &pid);
                             if !pane_actions::should_show_new_terminal_menu(
                                 shells.len(),
                                 launchers.len(),

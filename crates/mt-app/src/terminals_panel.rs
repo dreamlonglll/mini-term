@@ -261,13 +261,8 @@ impl TerminalsPanel {
                 let Some(pid) = this.store.read(cx).active_project_id.clone() else {
                     return;
                 };
-                let (shells, launchers) = {
-                    let store = this.store.read(cx);
-                    (
-                        store.config().available_shells.clone(),
-                        store.mobile_relay().launchers,
-                    )
-                };
+                let (shells, launchers) =
+                    pane_actions::new_terminal_menu_data(this.store.read(cx), &pid);
                 if !pane_actions::should_show_new_terminal_menu(shells.len(), launchers.len()) {
                     this.store.update(cx, |store, cx| {
                         store.new_panel(&pid, None, window, cx);

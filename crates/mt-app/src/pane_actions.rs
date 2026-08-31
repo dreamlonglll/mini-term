@@ -38,6 +38,42 @@ pub fn is_ai_alive(status: PaneStatus) -> bool {
 
 // === 新建终端菜单 ===
 
+/// 这个项目能不能在「新建终端」菜单里出 AI 启动器段。
+///
+/// 远程项目**一律不出**:SSH 项目的 PTY 是 ssh 启动器,启动初期可能停在口令或
+/// host key 确认交互上,**预写的命令会被当口令消费** —— 命令丢失之外,登录本身
+/// 还可能因此失败一次;存了密码的连接则会与 PTY 的密码 autofill 状态机抢同一次
+/// 输入。判据与 `AppStore::hydrate_project` 的自动续接守卫同源(`store/panes.rs`,
+/// 那里对远程项目跳过 resume 预写),也与移动端 `mt_relay::can_start_session`
+/// 把远程项目挡在发起会话之外的口径一致。
+///
+/// WSL 项目**不挡**:本地 PTY 直接起 `wsl.exe`,没有口令交互那一段。移动端连
+/// WSL 根项目一起挡是对话镜像盲发的问题,与桌面端这条路径无关。
+pub fn project_allows_launchers(ssh_connection_id: Option<&str>) -> bool {
+    ssh_connection_id.is_none()
+}
+
+/// 「新建终端」菜单的数据源:shell 列表 + 该项目**可用**的启动器。
+///
+/// 与 [`new_terminal_menu_entries`] 一样收成一处 —— 三处入口各判一次远程守卫
+/// 迟早漏掉一处,而漏掉的那处正好是会把用户 ssh 口令吃掉的那条路。
+/// 项目不存在时按「不给启动器」处置(保守侧)。
+pub fn new_terminal_menu_data(
+    store: &AppStore,
+    project_id: &str,
+) -> (Vec<ShellConfig>, Vec<AiLauncher>) {
+    let shells = store.config().available_shells.clone();
+    let allows = store
+        .project(project_id)
+        .is_some_and(|p| project_allows_launchers(p.ssh_connection_id.as_deref()));
+    let launchers = if allows {
+        store.mobile_relay().launchers
+    } else {
+        Vec::new()
+    };
+    (shells, launchers)
+}
+
 /// 「新建终端」菜单该不该弹出来。
 ///
 /// 原判据是 `shells.len() <= 1` —— 只有一个 shell 时直接开,别让单 shell 用户
@@ -402,6 +438,15 @@ mod tests {
         assert!(should_show_new_terminal_menu(2, 0));
         // 一条 shell 都没有(配置损坏)也不弹:调用方那条分支会回落默认 shell
         assert!(!should_show_new_terminal_menu(0, 0));
+    }
+
+    /// 远程项目不出启动器段:ssh 启动初期停在口令/host key 交互上时,
+    /// 预写的 `{命令}\r` 会被当口令消费 —— 判据与 `hydrate_project` 的自动续接
+    /// 守卫同源。WSL 不挡(本地直接起 wsl.exe,没有那段交互)。
+    #[test]
+    fn launcher_section_hidden_for_remote_projects_only() {
+        assert!(project_allows_launchers(None));
+        assert!(!project_allows_launchers(Some("conn-1")));
     }
 
     fn pane(label: &str, status: PaneStatus) -> PaneState {
