@@ -119,6 +119,10 @@ impl GitHistoryContent {
         self.graph = git_graph::compute(&[]);
         self.has_more = false;
         self.request += 1;
+        // ⚠️ loading 必须复位:令牌已 +1,在途响应注定被丢弃,而丢弃分支
+        // 不会走到 `loading = false` —— 不复位的话这次 load_page 被 loading
+        // 闸挡掉,历史区就永远停在旧仓库的内容上再也不刷
+        self.loading = false;
         self.load_page(true, cx);
     }
 

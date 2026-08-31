@@ -450,18 +450,6 @@ impl GitChanges {
         );
     }
 
-    fn toggle_view_mode(&mut self, cx: &mut Context<Self>) {
-        self.store.update(cx, |store, cx| {
-            let next = if store.git_changes_view_mode() == "tree" {
-                "list"
-            } else {
-                "tree"
-            };
-            store.set_git_changes_view_mode(next, cx);
-        });
-        cx.notify();
-    }
-
     fn on_commit_action(
         &mut self,
         _: &GitCommitMessage,
@@ -495,45 +483,15 @@ impl Render for GitChanges {
         let untracked = self.group_indices(Area::Untracked);
         let empty = self.changes.is_empty();
 
-        // ① 工具栏
-        let toolbar = div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .px(px(12.0))
-            .py(px(6.0))
-            .flex_none()
-            .child(
-                div()
-                    .id("git-changes-refresh")
-                    .text_size(ui::font_px(13.0))
-                    .text_color(ui::text_muted())
-                    .cursor_pointer()
-                    .hover(|el| el.text_color(ui::text_primary()))
-                    .child("↻")
-                    .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| this.load(cx))),
-            )
-            .child(
-                div()
-                    .id("git-changes-view-mode")
-                    .text_size(ui::font_px(12.0))
-                    .text_color(ui::text_muted())
-                    .cursor_pointer()
-                    .hover(|el| el.text_color(ui::text_primary()))
-                    // list 时显示 ⊞(点它切树),tree 时显示 ≡(点它切列表)
-                    .child(if tree_mode { "≡" } else { "⊞" })
-                    .on_click(
-                        cx.listener(|this, _: &ClickEvent, _window, cx| this.toggle_view_mode(cx)),
-                    ),
-            );
-
-        // ② 文件列表
+        // ① 文件列表(原先上方还有一条 刷新/视图切换 工具栏:刷新并入仓库栏的
+        // ↻,视图切换上移到「更改」标题栏右侧,整条撤掉)
         let mut list = div()
             .id("git-changes-list")
             .flex_1()
             .min_h(px(0.0))
             .overflow_y_scroll()
-            .px(px(4.0));
+            .px(px(4.0))
+            .pt(px(4.0));
 
         if self.loading && empty {
             list = list.child(placeholder_text(t("gitChanges", "loading")));
@@ -569,7 +527,7 @@ impl Render for GitChanges {
             }
         }
 
-        // ③ 提交区
+        // ② 提交区
         let can_commit = staged_count > 0 && !self.committing;
         let commit_label = if self.committing {
             t("gitChanges", "committing").to_string()
@@ -616,7 +574,6 @@ impl Render for GitChanges {
             // `"GitChanges > Input"` —— 与项目切换器的方向键同一套路)
             .key_context("GitChanges")
             .on_action(cx.listener(Self::on_commit_action))
-            .child(toolbar)
             .child(list)
             .child(commit_area)
     }

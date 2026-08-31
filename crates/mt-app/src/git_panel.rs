@@ -5,7 +5,7 @@
 //!    ├ 仓库下拉触发器(▾ + 名称 + ⎇)   右键 = 「在终端中打开」/「Worktree 管理」
 //!    ├ 分支徽章 + 分支下拉(displayBranch 存在时)
 //!    ├ 刷新 ↻ / pull ↓ / push ↑
-//! ② SectionHeader「更改」  h30
+//! ② SectionHeader「更改」  h30   右侧挂 视图切换 ⊞/≡
 //! ③ GitChanges           .git-section-body
 //! ④ 中缝拖拽手柄(两块都展开时)
 //! ⑤ SectionHeader「提交历史」h30(带上边框)
@@ -530,6 +530,7 @@ impl Render for GitPanel {
                 t("panels", "changes"),
                 section.changes_open,
                 false,
+                Some(self.render_view_mode_toggle(cx)),
                 cx.listener(|this, _: &ClickEvent, _window, cx| {
                     SECTION_UI.with(|s| {
                         let mut s = s.borrow_mut();
@@ -560,6 +561,7 @@ impl Render for GitPanel {
                 t("panels", "history"),
                 section.history_open,
                 true,
+                None,
                 cx.listener(|this, _: &ClickEvent, _window, cx| {
                     SECTION_UI.with(|s| {
                         let mut s = s.borrow_mut();
@@ -620,11 +622,14 @@ impl Render for GitPanel {
 }
 
 /// SectionHeader(`GitHistory.tsx:69-100`)。`bordered` 只有下方「提交历史」用。
+/// `trailing` 是右侧的动作位(「更改」的视图切换按钮住这);它自己的 on_click
+/// 要 stop_propagation,否则会连带触发 header 的折叠。
 fn section_header(
     id: &'static str,
     label: &'static str,
     open: bool,
     bordered: bool,
+    trailing: Option<AnyElement>,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
     div()
@@ -652,6 +657,9 @@ fn section_header(
                 .child(if open { "▾" } else { "▸" }),
         )
         .child(div().text_size(ui::font_px(13.0)).child(label))
+        .when_some(trailing, |el, trailing| {
+            el.child(div().flex_1()).child(trailing)
+        })
         .on_click(on_click)
         .into_any_element()
 }
@@ -808,6 +816,9 @@ impl GitPanel {
                 .child("↻")
                 .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
                     this.refresh_repo_meta(cx);
+                    // 「更改」列表也要跟着重取 —— push_repo_down 的 set_repo
+                    // 对同仓库路径会短路,不显式 load 它就纹丝不动
+                    this.changes.update(cx, |c, cx| c.load(cx));
                     this.history.update(cx, |h, cx| h.reload(cx));
                 })),
         );
@@ -857,6 +868,42 @@ impl GitPanel {
             })
             .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
                 this.run_sync(pull, cx)
+            }))
+            .into_any_element()
+    }
+
+    /// 「更改」标题栏右侧的视图切换(树/列表)。原先住在 GitChanges 的工具栏里,
+    /// 工具栏撤掉后上移到这。
+    fn render_view_mode_toggle(&self, cx: &mut Context<Self>) -> AnyElement {
+        let tree_mode = self.store.read(cx).git_changes_view_mode() == "tree";
+        div()
+            .id("git-changes-view-mode")
+            .w(px(20.0))
+            .h(px(20.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .flex_none()
+            .rounded(px(3.0))
+            .text_size(ui::font_px(12.0))
+            .text_color(ui::text_muted())
+            .hover(|el| el.text_color(ui::text_primary()))
+            // list 时显示 ⊞(点它切树),tree 时显示 ≡(点它切列表)
+            .child(if tree_mode { "≡" } else { "⊞" })
+            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+                // 按钮在 header 里,不拦住冒泡会连带把整块折叠
+                cx.stop_propagation();
+                this.store.update(cx, |store, cx| {
+                    let next = if store.git_changes_view_mode() == "tree" {
+                        "list"
+                    } else {
+                        "tree"
+                    };
+                    store.set_git_changes_view_mode(next, cx);
+                });
+                // GitChanges 不 observe store,列表要重排得显式踢它一脚
+                this.changes.update(cx, |_, cx| cx.notify());
+                cx.notify();
             }))
             .into_any_element()
     }
