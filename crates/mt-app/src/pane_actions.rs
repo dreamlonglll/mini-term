@@ -92,7 +92,7 @@ pub fn new_terminal_menu_entries(
     entries.push(menu::separator());
     entries.push(menu::item(
         t("terminalArea", "manageLaunchers"),
-        |window, cx| crate::mobile_panel::open(window, cx),
+        crate::mobile_panel::open,
     ));
     entries
 }
