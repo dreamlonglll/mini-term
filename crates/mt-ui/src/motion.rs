@@ -72,11 +72,12 @@
 //! self.bars.sweep();   // 本帧没读到的条目丢掉(等价于 DOM 里那行没了)
 //! ```
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use gpui::Window;
+use gpui::{AnyWindowHandle, App, EntityId, Window};
 
 // ─── 闸 ──────────────────────────────────────────────────────
 
@@ -111,6 +112,203 @@ pub fn spin_period(base: Duration) -> Duration {
     } else {
         base
     }
+}
+
+// ─── 永续动画低频泵 ──────────────────────────────────────────
+//
+// spinner 旋转/状态点闪烁这类**永不停**的动画,原先走
+// `gpui::with_animation(Animation::new(..).repeat())` —— `AnimationElement`
+// 只要没播完就每帧 `request_animation_frame()`,而 `.repeat()` 意味着永不完:
+// 一颗 8px 的点足以把整窗按满帧率连续重绘,**前后台通吃**,`mt-app::redraw`
+// 的 30fps/后台 5fps 节拍完全被架空。实测(2026-08-31 GPU 悬崖诊断)在显存
+// 吃紧、整窗纹理被驱动挤进共享内存的机器上,这条帧率就是「挂着 AI 时 GPU
+// 80~99%」的直接来源。
+//
+// 换成两半:
+// - **相位**从进程级墙钟推导([`pulse_phase`]),不做逐元素状态 —— 终端有
+//   输出时动画搭 PTY 重绘的便车,平滑度与从前无差,额外代价为零;
+// - **保底节拍**由一条共享低频泵兜住「终端静默时动画也得走」:前台
+//   [`PULSE_TICK`] 一拍,后台每 [`PULSE_INACTIVE_EVERY`] 拍才刷一次(同时把
+//   动画周期放慢 [`PULSE_INACTIVE_SLOWDOWN`] 倍,免得 500ms 的拍距在 0.8~1s
+//   的周期上踩出「看着没动」的走样)。窗口一个刷新周期内没有任何动画再来
+//   登记就从泵上摘除,泵空转即停 —— 与 `mt-app::redraw::Pump` 同款
+//   「空跑一拍就收摊」,不留常驻定时器。
+//
+// 泵触发用的是 **`cx.notify(挂动画的 view)`** 而不是 `window.refresh()`:
+// refresh 会置 `refreshing` 位、绕过所有 view 级缓存做全量 CPU 重渲染
+// (实测同尺寸下单帧 CPU 是 notify 路的 ~4.6 倍);notify 只弄脏登记过的
+// view,其余面板照走缓存 —— 与上游 `request_animation_frame` 的
+// 「notify 当前 view」同一语义,只是节拍从每帧换成了低频定时。
+
+/// 前台保底节拍:100ms(10fps)。AI 思考中无输出时 spinner 靠它步进。
+const PULSE_TICK: Duration = Duration::from_millis(100);
+
+/// 后台每几拍刷一次(5 × 100ms = 500ms)。后台窗口上的 spinner 只是「还活着」
+/// 的信号,2fps 足够传达,代价是前台满帧档的 1/30。
+const PULSE_INACTIVE_EVERY: u64 = 5;
+
+/// 后台把动画周期放慢的倍数。500ms 拍距若踩在 0.9s 周期上,相邻两帧相位差
+/// 过半圈,旋转会走样成来回抖;放慢到 3.6s 后每拍走约 1/7 圈,方向清晰。
+const PULSE_INACTIVE_SLOWDOWN: u32 = 4;
+
+thread_local! {
+    /// 相位的时间原点。进程级 —— 所有窗口所有动画共用一条钟,
+    /// 同状态的多颗灯天然同相(原版 CSS animation 各自挂载反而会错相)。
+    static PULSE_EPOCH: Instant = Instant::now();
+
+    static PULSE: RefCell<PulsePump> = RefCell::new(PulsePump::default());
+}
+
+/// 保底泵本体。状态全在主线程,`thread_local` 零通知 —— 与全局闸同款朴素做法。
+#[derive(Default)]
+struct PulsePump {
+    /// 泵在跑吗。同一时刻只该有一条。
+    running: bool,
+    /// 第几拍。后台窗口按 [`PULSE_INACTIVE_EVERY`] 的整数拍刷新。
+    tick: u64,
+    windows: Vec<PulseWindow>,
+}
+
+struct PulseWindow {
+    handle: AnyWindowHandle,
+    /// 自上次泵触发以来,窗口里登记过动画的 view(= [`pulse_phase`] 的调用方)。
+    /// 触发即取走;一轮下来还是空的,说明动画都卸载了,该摘除这个窗口。
+    views: Vec<EntityId>,
+}
+
+/// 一拍里对单个窗口的处置。纯判定,单测钉它。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PulseAction {
+    /// 到拍且上轮有登记:notify 登记过的 view,开始新一轮观察。
+    Refresh,
+    /// 后台窗口还没到它的拍:什么都不做,登记记录保留。
+    Wait,
+    /// 到拍但上轮没人登记:动画已从树上消失,把窗口从泵上摘掉。
+    Drop,
+}
+
+fn pulse_action(window_active: bool, inactive_due: bool, painted: bool) -> PulseAction {
+    if !(window_active || inactive_due) {
+        return PulseAction::Wait;
+    }
+    if painted {
+        PulseAction::Refresh
+    } else {
+        PulseAction::Drop
+    }
+}
+
+/// 当前墙钟在 `period` 周期里的相位(0..1)。
+fn phase_of(elapsed: Duration, period: Duration) -> f32 {
+    let period_ms = period.as_millis().max(1) as u64;
+    (elapsed.as_millis() as u64 % period_ms) as f32 / period_ms as f32
+}
+
+/// 取一个永续动画这一帧的相位(0..1 一圈),并把窗口挂上保底泵。
+///
+/// **render 里替代 `with_animation(Animation::new(period).repeat())` 用**:
+/// 拿返回值直接喂 `VectorIcon::rotation` / 闪烁曲线。窗口在后台时周期自动
+/// 放慢 [`PULSE_INACTIVE_SLOWDOWN`] 倍。
+///
+/// 减弱动效的口径由调用方把住(旋转过 [`spin_period`]、闪烁过 [`blinks`]),
+/// 本函数不做判断 —— 谁都不挂树,泵自然就停。
+pub fn pulse_phase(period: Duration, window: &Window, cx: &mut App) -> f32 {
+    let period = if window.is_window_active() {
+        period
+    } else {
+        period * PULSE_INACTIVE_SLOWDOWN
+    };
+    let handle = window.window_handle();
+    let view = window.current_view();
+    let start_pump = PULSE.with(|pump| {
+        let mut pump = pump.borrow_mut();
+        let id = handle.window_id();
+        let entry = match pump.windows.iter_mut().find(|w| w.handle.window_id() == id) {
+            Some(w) => w,
+            None => {
+                pump.windows.push(PulseWindow {
+                    handle,
+                    views: Vec::new(),
+                });
+                pump.windows.last_mut().expect("刚 push 进去的")
+            }
+        };
+        if !entry.views.contains(&view) {
+            entry.views.push(view);
+        }
+        !std::mem::replace(&mut pump.running, true)
+    });
+    if start_pump {
+        cx.spawn(async move |cx| {
+            loop {
+                cx.background_executor().timer(PULSE_TICK).await;
+                // App 没了(退出中)就把 running 收干净再走
+                let Ok(stop) = cx.update(pulse_tick) else { break };
+                if stop {
+                    return;
+                }
+            }
+            PULSE.with(|pump| pump.borrow_mut().running = false);
+        })
+        .detach();
+    }
+    phase_of(PULSE_EPOCH.with(|e| e.elapsed()), period)
+}
+
+/// 泵的一拍:按处置口径刷新/摘除各窗口。返回**是否该停泵**(停时已自收
+/// `running`)。
+fn pulse_tick(cx: &mut App) -> bool {
+    let (tick, entries) = PULSE.with(|pump| {
+        let mut pump = pump.borrow_mut();
+        pump.tick = pump.tick.wrapping_add(1);
+        let entries: Vec<(AnyWindowHandle, bool)> = pump
+            .windows
+            .iter()
+            .map(|w| (w.handle, !w.views.is_empty()))
+            .collect();
+        (pump.tick, entries)
+    });
+    let inactive_due = tick % PULSE_INACTIVE_EVERY == 0;
+
+    for (handle, painted) in entries {
+        // 窗口已关按 Drop 处理 —— 弱引用失效是正常生命周期
+        let action = handle
+            .update(cx, |_, window, _| {
+                pulse_action(window.is_window_active(), inactive_due, painted)
+            })
+            .unwrap_or(PulseAction::Drop);
+        let views = PULSE.with(|pump| {
+            let mut pump = pump.borrow_mut();
+            let id = handle.window_id();
+            match action {
+                PulseAction::Refresh => pump
+                    .windows
+                    .iter_mut()
+                    .find(|w| w.handle.window_id() == id)
+                    .map(|w| std::mem::take(&mut w.views))
+                    .unwrap_or_default(),
+                PulseAction::Wait => Vec::new(),
+                PulseAction::Drop => {
+                    pump.windows.retain(|w| w.handle.window_id() != id);
+                    Vec::new()
+                }
+            }
+        });
+        // notify 已释放的 view 是无害 no-op(观察者表里查无此人)
+        for view in views {
+            cx.notify(view);
+        }
+    }
+
+    PULSE.with(|pump| {
+        let mut pump = pump.borrow_mut();
+        if pump.windows.is_empty() {
+            pump.running = false;
+            true
+        } else {
+            false
+        }
+    })
 }
 
 // ─── 缓动 ────────────────────────────────────────────────────
@@ -551,6 +749,42 @@ mod tests {
             assert_eq!(spin_period(base), REDUCED_SPIN_PERIOD);
             assert!(!spin_period(base).is_zero());
         });
+    }
+
+    #[test]
+    fn 相位按周期取模且不越界() {
+        let p = Duration::from_millis(900);
+        assert_eq!(phase_of(Duration::ZERO, p), 0.0);
+        assert!((phase_of(Duration::from_millis(450), p) - 0.5).abs() < 1e-4);
+        // 整圈归零,而不是停在 1.0
+        assert_eq!(phase_of(Duration::from_millis(900), p), 0.0);
+        assert!((phase_of(Duration::from_millis(2250), p) - 0.5).abs() < 1e-4);
+        assert!(phase_of(Duration::from_secs(86400), p) < 1.0, "跑一天也不许越界");
+        // 零周期防护:不许除零
+        assert_eq!(phase_of(Duration::from_secs(1), Duration::ZERO), 0.0);
+    }
+
+    #[test]
+    fn 保底泵一拍的处置口径() {
+        // 前台:每拍都到,登记过就刷、没登记就摘
+        assert_eq!(pulse_action(true, false, true), PulseAction::Refresh);
+        assert_eq!(pulse_action(true, false, false), PulseAction::Drop);
+        // 后台没到拍:一律等,**不许**因 painted=false 提前摘 ——
+        // 它的观察窗口以「刷新」为界,还没刷过下一次就没资格下结论
+        assert_eq!(pulse_action(false, false, true), PulseAction::Wait);
+        assert_eq!(pulse_action(false, false, false), PulseAction::Wait);
+        // 后台到拍:与前台同口径
+        assert_eq!(pulse_action(false, true, true), PulseAction::Refresh);
+        assert_eq!(pulse_action(false, true, false), PulseAction::Drop);
+    }
+
+    #[test]
+    fn 后台放慢倍数要压住走样() {
+        // 500ms 拍距 × 放慢后的最短常见周期(0.8s×4 = 3.2s):每拍相位差
+        // 需明显小于半圈,旋转方向才不至于读反
+        let tick_ms = (PULSE_TICK.as_millis() as u64 * PULSE_INACTIVE_EVERY) as f32;
+        let slowest_ms = 800.0 * PULSE_INACTIVE_SLOWDOWN as f32;
+        assert!(tick_ms / slowest_ms < 0.25, "后台每拍相位差应小于 1/4 圈");
     }
 
     #[test]

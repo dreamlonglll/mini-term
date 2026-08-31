@@ -444,10 +444,7 @@ impl Render for ProjectSwitcher {
                         )
                     })
                     .when(row.status != PaneStatus::Idle, |el| {
-                        el.child(div().flex_none().child(ui::status_dot(
-                            SharedString::from(format!("switcher-dot-{}", row.id)),
-                            row.status,
-                        )))
+                        el.child(div().flex_none().child(ui::status_dot(row.status)))
                     }),
             );
         }

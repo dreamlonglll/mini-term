@@ -375,10 +375,7 @@ impl BranchFamilyPanel {
                 )
             })
             .when_some(live, |el, (_, _, status)| {
-                el.child(ui::status_dot(
-                    SharedString::from(format!("branch-family-live-{}", session.id)),
-                    status,
-                ))
+                el.child(ui::status_dot(status))
             })
             .child(
                 div()

@@ -1519,10 +1519,7 @@ impl Render for Workspace {
                 // 某个 shell `exit 1` 不该让整条边栏亮红点、盖住真在跑的 AI。
                 // 徽标本体(含 ai-working 档的闪烁)在 `activity_bar::status_badge`。
                 .when(global_status != crate::tree::PaneStatus::Idle, |el| {
-                    el.child(activity_bar::status_badge(
-                        "activity-bar-ai-badge",
-                        global_status,
-                    ))
+                    el.child(activity_bar::status_badge(global_status))
                 })
                 .on_click(cx.listener(|this, _event, _window, cx| {
                     this.store.update(cx, |store, cx| store.toggle_middle_column(cx));

@@ -41,10 +41,10 @@ use std::time::{Duration, Instant};
 use futures::StreamExt;
 use futures::channel::mpsc;
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, App, AppContext as _, Context, Div, Entity,
-    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement, Pixels, Point,
-    Render, SharedString, Stateful, StatefulInteractiveElement, Styled, Task, Window, bounce, div,
-    ease_in_out, point, prelude::FluentBuilder, px, relative,
+    AnyElement, App, AppContext as _, Context, Div, Entity, InteractiveElement, IntoElement,
+    MouseButton, MouseDownEvent, ParentElement, Pixels, Point, Render, RenderOnce, SharedString,
+    Stateful, StatefulInteractiveElement, Styled, Task, Window, div, point,
+    prelude::FluentBuilder, px, relative,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 use mt_ui::tooltip::Tooltip;
@@ -1084,28 +1084,41 @@ fn x_axis_labels(buckets: &[DailyStat], plot_width: f32) -> Div {
 
 /// 骨架块:`rounded-md` + `--border-subtle` + 2s 脉冲(`opacity 1 → .5 → 1`)。
 ///
+/// 脉冲相位来自 `mt_ui::motion::pulse_phase` 的低频泵 —— **不用**
+/// `with_animation(..repeat())`,那条路每帧请求重绘,骨架屏一挂就是整窗满帧。
+///
 /// ⚠️ 脉冲过减弱动效的闸:原版这是 Tailwind 的 `.animate-pulse`,reduce 段的
 /// 通配规则把它**停在第一帧**(它不在豁免名单里 —— 那段注释还专门点了
 /// `animate-pulse` 的名)。停下来就是一块静止的浅色占位,信息量不减。
-fn skeleton_block(id: &'static str, h: f32) -> AnyElement {
-    let block = div()
-        .h(px(h))
-        .flex_1()
-        .rounded(px(6.0))
-        .bg(ui::border_subtle());
-    if !mt_ui::motion::blinks() {
-        return block.into_any_element();
-    }
-    block
-        .with_animation(
-            id,
-            Animation::new(Duration::from_secs(2))
-                .repeat()
-                .with_easing(bounce(ease_in_out)),
-            |el, delta| el.opacity(1.0 - delta * 0.5),
-        )
-        .into_any_element()
+fn skeleton_block(h: f32) -> AnyElement {
+    SkeletonBlock { h }.into_any_element()
 }
+
+#[derive(IntoElement)]
+struct SkeletonBlock {
+    h: f32,
+}
+
+impl RenderOnce for SkeletonBlock {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let block = div()
+            .h(px(self.h))
+            .flex_1()
+            .rounded(px(6.0))
+            .bg(ui::border_subtle());
+        if !mt_ui::motion::blinks() {
+            return block;
+        }
+        // 0..1 进度折成 1 → 0.5 → 1 的呼吸(原版 `bounce(ease_in_out)` 的近似,
+        // 折返曲线复用 title_bar::blink_phase 的 smoothstep 三角波)
+        let phase =
+            crate::title_bar::blink_phase(mt_ui::motion::pulse_phase(SKELETON_PERIOD, window, cx));
+        block.opacity(1.0 - phase * 0.5)
+    }
+}
+
+/// 骨架脉冲周期(原版 Tailwind `animate-pulse` 是 2s)。
+const SKELETON_PERIOD: Duration = Duration::from_secs(2);
 
 /// 状态提示件(`UsageStatsModal.tsx:503-536`):可选 spinner + 主文案 +
 /// detail(截断) + 可选动作按钮。
@@ -1122,7 +1135,7 @@ fn state_hint(
         .items_center()
         .gap(px(12.0))
         .when(spinning, |el| {
-            el.child(ui::spinner("usage-state-spinner", px(20.0), ui::accent()))
+            el.child(ui::spinner(px(20.0), ui::accent()))
         })
         .child(
             div()
@@ -1289,24 +1302,24 @@ fn render_skeleton() -> Div {
             div()
                 .flex()
                 .gap(px(12.0))
-                .child(skeleton_block("sk-kpi-0", 66.0))
-                .child(skeleton_block("sk-kpi-1", 66.0))
-                .child(skeleton_block("sk-kpi-2", 66.0))
-                .child(skeleton_block("sk-kpi-3", 66.0)),
+                .child(skeleton_block(66.0))
+                .child(skeleton_block(66.0))
+                .child(skeleton_block(66.0))
+                .child(skeleton_block(66.0)),
         )
         .child(
             div()
                 .flex()
-                .child(div().w(px(320.0)).child(skeleton_block("sk-tokens", 16.0))),
+                .child(div().w(px(320.0)).child(skeleton_block(16.0))),
         )
-        .child(skeleton_block("sk-chart", 280.0))
+        .child(skeleton_block(280.0))
         .child(
             div()
                 .flex()
                 .gap(px(16.0))
-                .child(skeleton_block("sk-card-0", 200.0))
-                .child(skeleton_block("sk-card-1", 200.0))
-                .child(skeleton_block("sk-card-2", 200.0)),
+                .child(skeleton_block(200.0))
+                .child(skeleton_block(200.0))
+                .child(skeleton_block(200.0)),
         )
 }
 

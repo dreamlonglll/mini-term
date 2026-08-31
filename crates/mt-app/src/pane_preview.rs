@@ -268,10 +268,7 @@ fn mini_pane(info: &MiniPaneInfo, style: &TerminalStyle, area: Size<Pixels>) -> 
         // 原版是 `color-mix(bg-overlay 80%)` + `backdrop-blur(6px)`;
         // gpui 没有 backdrop-filter,退成同色 80% 不透明度的实底
         .bg(ui::with_alpha(ui::bg_overlay(), 0.8))
-        .child(ui::status_dot(
-            gpui::SharedString::from(format!("mini-status-{}", info.pane_id)),
-            info.status,
-        ));
+        .child(ui::status_dot(info.status));
     if info.shows_ai {
         label_bar = label_bar.child(
             BrandIcon::new(info.vendor)
@@ -288,10 +285,7 @@ fn mini_pane(info: &MiniPaneInfo, style: &TerminalStyle, area: Size<Pixels>) -> 
             .gap(px(4.0))
             .text_color(ui::text_muted());
         if let Some(status) = info.hidden_top {
-            tail = tail.child(ui::status_dot(
-                gpui::SharedString::from(format!("mini-hidden-{}", info.pane_id)),
-                status,
-            ));
+            tail = tail.child(ui::status_dot(status));
         }
         label_bar = label_bar.child(tail.child(format!("+{}", info.hidden_count)));
     }

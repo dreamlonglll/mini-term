@@ -23,9 +23,9 @@
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, App, Div, ElementId, Hsla, InteractiveElement,
-    IntoElement, ParentElement, RenderOnce, SharedString, Stateful, StatefulInteractiveElement,
-    Styled, Window, div, prelude::FluentBuilder as _, px, rems,
+    AnyElement, App, Div, Hsla, InteractiveElement, IntoElement, ParentElement, RenderOnce,
+    SharedString, Stateful, StatefulInteractiveElement, Styled, Window, div,
+    prelude::FluentBuilder as _, px, rems,
 };
 use gpui_component::ActiveTheme as _;
 use mt_ui::icons::{Geom, Ink, Shape, StatusDot, StatusKind, VectorIcon};
@@ -510,7 +510,10 @@ where
         .child(VectorIcon::new(UPDATE, px(ICON)).ink(ui::accent()))
         // `absolute -top-0.5 -right-0.5 w-2 h-2 rounded-full bg-accent
         //  border border-[var(--bg-surface)] animate-blink`
-        .child(corner_dot("update-dot", ui::accent(), update_dot_blinks()));
+        .child(CornerDot {
+            color: ui::accent(),
+            blinking: update_dot_blinks(),
+        });
 
     with_hover_label(button, tip.into(), label_visible, on_hover)
 }
@@ -591,7 +594,7 @@ where
         .cursor_pointer()
         .hover(|el| el.bg(ui::border_subtle()))
         .child(
-            StatusDot::new("strip-unread-done", StatusKind::AiIdle)
+            StatusDot::new(StatusKind::AiIdle)
                 .size(px(14.0))
                 .color(ui::color_success())
                 .contrast(ui::bg_surface()),
@@ -612,43 +615,50 @@ where
 ///
 /// ⚠️ 闪烁过 [`crate::motion`] 的闸:原版 reduce 段的通配规则把 `.animate-blink`
 /// 停在第一帧(它**不在**豁免名单里),用户机器上装机版就是不闪的。
-pub fn status_badge(id: impl Into<ElementId>, status: PaneStatus) -> AnyElement {
-    corner_dot(id, ui::status_color(status), badge_blinks(status))
+pub fn status_badge(status: PaneStatus) -> AnyElement {
+    CornerDot {
+        color: ui::status_color(status),
+        blinking: badge_blinks(status),
+    }
+    .into_any_element()
 }
 
 /// 按钮右上角那颗 8px 圆点。全局 AI 徽标([`status_badge`])与「有新版本」按钮
 /// ([`update_button`])共用同一颗,差别只有配色与闪不闪。
 ///
-/// `blinking` = 挂 `alertBlink`;停的那一档**整个不挂 `with_animation`** ——
-/// 它会持续请求帧,静态档必须让它从元素树上消失。
-fn corner_dot(id: impl Into<ElementId>, color: Hsla, blinking: bool) -> AnyElement {
-    let dot = div()
-        .absolute()
-        .top(px(DOT_INSET))
-        .right(px(DOT_INSET))
-        .w(px(DOT_SIZE))
-        .h(px(DOT_SIZE))
-        .rounded_full()
-        .border_1()
-        .border_color(ui::bg_surface())
-        .bg(color);
+/// 闪烁相位来自 `mt_ui::motion::pulse_phase` 的低频泵 —— **不用**
+/// `with_animation(..repeat())`,那条路每帧请求重绘,一颗 8px 的点就能把
+/// 整窗钉在满帧率上。静态档连泵都不挂。
+#[derive(IntoElement)]
+struct CornerDot {
+    color: Hsla,
+    blinking: bool,
+}
 
-    if !blinking {
-        return dot.into_any_element();
+impl RenderOnce for CornerDot {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let dot = div()
+            .absolute()
+            .top(px(DOT_INSET))
+            .right(px(DOT_INSET))
+            .w(px(DOT_SIZE))
+            .h(px(DOT_SIZE))
+            .rounded_full()
+            .border_1()
+            .border_color(ui::bg_surface())
+            .bg(self.color);
+
+        if !self.blinking {
+            return dot;
+        }
+        let delta = mt_ui::motion::pulse_phase(BLINK_PERIOD, window, cx);
+        let (side, inset, opacity) = blink_dot_frame(crate::title_bar::blink_phase(delta));
+        dot.w(px(side))
+            .h(px(side))
+            .top(px(inset))
+            .right(px(inset))
+            .opacity(opacity)
     }
-    dot.with_animation(
-        id.into(),
-        Animation::new(BLINK_PERIOD).repeat(),
-        |el, delta| {
-            let (side, inset, opacity) = blink_dot_frame(crate::title_bar::blink_phase(delta));
-            el.w(px(side))
-                .h(px(side))
-                .top(px(inset))
-                .right(px(inset))
-                .opacity(opacity)
-        },
-    )
-    .into_any_element()
 }
 
 /// 原版 `w-2 h-2`。

@@ -1255,20 +1255,13 @@ impl Render for SessionPanel {
                                     .flex()
                                     .items_center()
                                     .gap(px(6.0))
-                                    // 在跑状态点。id 拿会话 id 拼 —— `with_animation`
-                                    // 用它当元素状态 key,**逐处唯一且跨帧稳定**
+                                    // 在跑状态点
                                     .when_some(live.as_ref(), |el, (_, status)| {
                                         el.child(
-                                            StatusDot::new(
-                                                SharedString::from(format!(
-                                                    "session-live-{}",
-                                                    session.id
-                                                )),
-                                                status_kind(*status),
-                                            )
-                                            .size(px(11.0))
-                                            .color(ui::status_color(*status))
-                                            .contrast(ui::bg_surface()),
+                                            StatusDot::new(status_kind(*status))
+                                                .size(px(11.0))
+                                                .color(ui::status_color(*status))
+                                                .contrast(ui::bg_surface()),
                                         )
                                     })
                                     .child(
@@ -1340,8 +1333,8 @@ impl Render for SessionPanel {
                                     .text_color(ui::text_muted())
                                     .child(t("panels", "sessions")),
                             )
-                            // WSL 加载中的转圈。⚠️ `with_animation` 持续请求帧 ——
-                            // `wsl_loading` 落回 false 时整个元素**从树上消失**
+                            // WSL 加载中的转圈。`wsl_loading` 落回 false 时整个
+                            // 元素从树上消失,保底泵随之自停
                             .when(wsl_loading, |el| {
                                 el.child(
                                     div()
@@ -1352,11 +1345,7 @@ impl Render for SessionPanel {
                                             Tooltip::new(t("sessionList", "wslLoading"))
                                                 .build(window, cx)
                                         })
-                                        .child(ui::spinner(
-                                            "session-wsl-spin",
-                                            px(12.0),
-                                            ui::text_muted(),
-                                        )),
+                                        .child(ui::spinner(px(12.0), ui::text_muted())),
                                 )
                             })
                             // 远程来源加载中的转圈(原版 `loading && sshConnectionId`)
@@ -1370,11 +1359,7 @@ impl Render for SessionPanel {
                                             Tooltip::new(t("sessionList", "remoteLoading"))
                                                 .build(window, cx)
                                         })
-                                        .child(ui::spinner(
-                                            "session-remote-spin",
-                                            px(12.0),
-                                            ui::text_muted(),
-                                        )),
+                                        .child(ui::spinner(px(12.0), ui::text_muted())),
                                 )
                             }),
                     )

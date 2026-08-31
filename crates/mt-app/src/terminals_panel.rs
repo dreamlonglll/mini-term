@@ -167,10 +167,7 @@ impl TerminalsPanel {
             // AI 进度呼吸灯(与项目级那颗同一套徽标,`ai-working` 档闪烁;
             // 档位口径见 [`panel_light_status`],idle 不挂)
             .when(status != PaneStatus::Idle, |el| {
-                el.child(activity_bar::status_badge(
-                    SharedString::from(format!("term-panel-badge-{panel_id}")),
-                    status,
-                ))
+                el.child(activity_bar::status_badge(status))
             })
             // 终端数角标(右下角):这个面板里一共几个终端(含后台 tab)
             .child(

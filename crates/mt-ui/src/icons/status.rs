@@ -17,8 +17,10 @@
 //! + `M8 2a6 6 0 0 1 6 6` / `M5.6 5.6l4.8 4.8 M10.4 5.6l-4.8 4.8`。
 //!
 //! **ai-working 那段弧必须真的转**:画着一段弧却纹丝不动,看上去就是个卡死的
-//! 加载指示器 —— 原版为此专门加了 `animate-status-spin`,这里用
-//! [`gpui::Animation`] 的 `repeat()` 驱动 [`VectorIcon::rotation`] 做到同一件事。
+//! 加载指示器 —— 原版为此专门加了 `animate-status-spin`,这里由
+//! [`crate::motion::pulse_phase`] 的墙钟相位驱动 [`VectorIcon::rotation`]。
+//! **刻意不用** `with_animation(..repeat())`:那条路每帧请求重绘,一颗灯就能把
+//! 整窗钉在满帧率上、前后台通吃(见 `motion` 模块「永续动画低频泵」一节)。
 //!
 //! # 减弱动效
 //!
@@ -46,22 +48,17 @@
 //!         PaneStatus::AiWorking => StatusKind::AiWorking,
 //!         PaneStatus::Error => StatusKind::Error,
 //!     };
-//!     StatusDot::new(("status", status.priority() as usize), kind)
+//!     StatusDot::new(kind)
 //!         .size(px(11.0))
 //!         .color(status_color(status))   // 保留 ui.rs 自己那张色表
 //!         .contrast(bg_elevated())       // 勾/叉画在实心圆上,用面板底色
 //! }
 //! ```
 //!
-//! ⚠️ **`id` 必须逐处唯一且稳定**:`with_animation` 拿它当元素状态的 key,
-//! 同一帧里两个状态灯用同一个 id 会共享动画进度(看着像同步闪),而 id 随帧变化
-//! 则每帧从头开始转(看着像卡住)。项目列表用 `("status", project_id)`,
-//! pane tab 用 `("status", pty_id)` 这类稳定标识。
+//! 旋转不带逐元素状态(相位来自进程级墙钟),所以**不需要 id**;同状态的
+//! 多颗灯天然同相 —— 原版 CSS animation 各自挂载反而会错相,这里顺手更整齐。
 
-use gpui::{
-    Animation, AnimationExt as _, App, ElementId, Hsla, IntoElement, Pixels, RenderOnce, Window,
-    px,
-};
+use gpui::{App, Hsla, IntoElement, Pixels, RenderOnce, Window, px};
 use std::time::Duration;
 
 use super::vector::{Geom, Ink, Shape, VectorIcon};
@@ -224,7 +221,6 @@ pub const SPIN_PERIOD: Duration = Duration::from_millis(900);
 /// 状态灯。
 #[derive(IntoElement)]
 pub struct StatusDot {
-    id: ElementId,
     status: StatusKind,
     size: Pixels,
     color: Option<Hsla>,
@@ -233,12 +229,9 @@ pub struct StatusDot {
 }
 
 impl StatusDot {
-    /// `id` 见模块注释的告警:必须逐处唯一且跨帧稳定。
-    ///
     /// 默认 10px —— 与原版 `size='sm'` 的 10px 一致(`'md'` 是 13px)。
-    pub fn new(id: impl Into<ElementId>, status: StatusKind) -> Self {
+    pub fn new(status: StatusKind) -> Self {
         Self {
-            id: id.into(),
             status,
             size: px(10.0),
             color: None,
@@ -274,22 +267,20 @@ impl StatusDot {
 }
 
 impl RenderOnce for StatusDot {
-    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let mut icon = VectorIcon::new(self.status.shapes(), self.size)
             .ink(self.color.unwrap_or_else(|| self.status.default_color()));
         if let Some(c) = self.contrast {
             icon = icon.contrast(c);
         }
         if self.status.spins() && self.animated {
+            // 相位来自低频泵的墙钟([`crate::motion::pulse_phase`],0..1 一圈,
+            // `VectorIcon::rotation` 的单位也是「圈」)—— 不用 `with_animation(
+            // ..repeat())`:那条路每帧请求重绘,一颗灯就能把整窗钉在满帧率上
             let period = crate::motion::spin_period(SPIN_PERIOD);
-            icon.with_animation(self.id, Animation::new(period).repeat(), |icon, delta| {
-                // delta 就是 0..1 的一圈,VectorIcon::rotation 的单位也是「圈」
-                icon.rotation(delta)
-            })
-            .into_any_element()
-        } else {
-            icon.into_any_element()
+            icon = icon.rotation(crate::motion::pulse_phase(period, window, cx));
         }
+        icon
     }
 }
 

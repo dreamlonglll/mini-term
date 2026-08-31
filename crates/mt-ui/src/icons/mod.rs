@@ -48,7 +48,7 @@
 //!     .gap(px(6.0))
 //!     // 项目行:技术栈徽标 + 聚合状态灯
 //!     .child(TechIcon::new(ProjectKind::Rust))
-//!     .child(StatusDot::new(("status", "proj-1"), StatusKind::AiWorking))
+//!     .child(StatusDot::new(StatusKind::AiWorking))
 //!     // 会话行:厂商图标
 //!     .child(BrandIcon::new(AiVendor::for_session("claude", Some("glm-4.6"))))
 //!     // 文件树行

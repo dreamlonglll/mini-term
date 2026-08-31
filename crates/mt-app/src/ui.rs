@@ -24,8 +24,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, App, Div, ElementId, Hsla, InteractiveElement,
-    IntoElement, MouseButton, MouseMoveEvent, ParentElement, Pixels, SharedString, Stateful,
+    AnyElement, App, Div, ElementId, Hsla, InteractiveElement, IntoElement, MouseButton,
+    MouseMoveEvent, ParentElement, Pixels, RenderOnce, SharedString, Stateful,
     StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder, px, white,
 };
 use mt_ui::icons::vector::{Geom, Ink, Shape, VectorIcon};
@@ -1013,23 +1013,32 @@ const SPINNER_ARC: &[Shape] = &[Shape::line(
 /// 加载中的转圈。**自绘** —— gpui-component 的 `Spinner` 默认图标是
 /// `IconName::Loader`,而 0.5.1 不带 svg 资产,转的是个空框(见 `menu` 模块注释)。
 ///
-/// 周期 1s 匀速(Tailwind `animate-spin` 的默认值)。
-///
-/// ⚠️ `with_animation` **持续请求帧**:加载态结束时必须让整个元素
-/// **从树上消失**,不能留着靠 `opacity(0)` 藏起来。
+/// 周期 1s 匀速(Tailwind `animate-spin` 的默认值),相位来自
+/// `mt_ui::motion::pulse_phase` 的低频泵 —— **不用** `with_animation(..repeat())`,
+/// 那条路每帧请求重绘,一个 20px 的圈就能把整窗钉在满帧率上。
 ///
 /// 减弱动效下**不停,只放慢到 2.4s**(`mt_ui::motion::spin_period`)——
 /// 原版 `styles.css:404-413` 专门为「进行中」指示器开了这条豁免:
 /// 停住的 spinner 不是安静,是看着像卡死。
-pub fn spinner(id: impl Into<ElementId>, size: Pixels, color: Hsla) -> impl IntoElement {
-    VectorIcon::new(SPINNER_ARC, size)
-        .ink(color)
-        .with_animation(
-            id.into(),
-            Animation::new(mt_ui::motion::spin_period(std::time::Duration::from_secs(1))).repeat(),
-            // delta 就是 0..1 的一圈,`VectorIcon::rotation` 的单位也是「圈」
-            |icon, delta| icon.rotation(delta),
-        )
+pub fn spinner(size: Pixels, color: Hsla) -> impl IntoElement {
+    Spinner { size, color }
+}
+
+#[derive(IntoElement)]
+struct Spinner {
+    size: Pixels,
+    color: Hsla,
+}
+
+impl RenderOnce for Spinner {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let period = mt_ui::motion::spin_period(std::time::Duration::from_secs(1));
+        // 相位 0..1 一圈,`VectorIcon::rotation` 的单位也是「圈」
+        let phase = mt_ui::motion::pulse_phase(period, window, cx);
+        VectorIcon::new(SPINNER_ARC, self.size)
+            .ink(self.color)
+            .rotation(phase)
+    }
 }
 
 /// 状态灯的颜色(对齐 `src/components/StatusDot.tsx` 的 `STATUS_COLORS`)。
@@ -1049,13 +1058,9 @@ pub fn status_color(status: PaneStatus) -> Hsla {
 /// 这里只做两件事:`PaneStatus → StatusKind` 的转换,以及把壳的配色表喂进去
 /// (勾/叉是**挖空**语义,`contrast` 必须给面板底色,换主题包时跟着变)。
 ///
-/// # ⚠️ `id` 必须逐处唯一且跨帧稳定
-///
-/// `with_animation` 拿它当元素状态的 key:同一帧里两个状态灯共用 id 会共享动画
-/// 进度(看着像同步闪),id 随帧变化则每帧从头转(看着像卡住)。所以调用方一律
-/// 拿 **pane id / 项目 id** 拼,**不许**用循环下标(删掉中间一个 pane 后,后面所有
-/// 状态灯的动画进度会集体跳一格)。
-pub fn status_dot(id: impl Into<ElementId>, status: PaneStatus) -> impl IntoElement {
+/// 旋转相位来自进程级墙钟(`mt_ui::motion::pulse_phase`),没有逐元素状态,
+/// 所以不需要 id;同状态的多颗灯天然同相。
+pub fn status_dot(status: PaneStatus) -> impl IntoElement {
     // PaneStatus 住在 mt-app(tree.rs),mt-ui 不能反向依赖,所以在这里转一次
     let kind = match status {
         PaneStatus::Idle => StatusKind::Idle,
@@ -1063,7 +1068,7 @@ pub fn status_dot(id: impl Into<ElementId>, status: PaneStatus) -> impl IntoElem
         PaneStatus::AiWorking => StatusKind::AiWorking,
         PaneStatus::Error => StatusKind::Error,
     };
-    StatusDot::new(id, kind)
+    StatusDot::new(kind)
         .size(px(11.0))
         .color(status_color(status))
         .contrast(bg_elevated())

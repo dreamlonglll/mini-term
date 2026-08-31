@@ -51,10 +51,10 @@
 //! 可抄的两点(`.window_control_area` 只在 Windows 挂、Drag 区用一个元素声明)已照抄。
 
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, App, Context, Div, ElementId, Entity,
-    FocusHandle, Hsla, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
-    Render, SharedString, Stateful, StatefulInteractiveElement, Styled, Window, WindowControlArea,
-    anchored, deferred, div, point, prelude::FluentBuilder, px, relative,
+    AnyElement, App, Context, Div, ElementId, Entity, FocusHandle, Hsla, InteractiveElement,
+    IntoElement, MouseButton, MouseDownEvent, ParentElement, Render, SharedString, Stateful,
+    StatefulInteractiveElement, Styled, Window, WindowControlArea, anchored, deferred, div, point,
+    prelude::FluentBuilder, px, relative,
 };
 use mt_ui::tooltip::Tooltip;
 use mt_ui::icons::{Geom, Ink, Shape, VectorIcon};
@@ -232,7 +232,7 @@ pub fn kind_color(kind: AiProjectKind) -> Hsla {
 ///
 /// 对应 `styles.css` 的 `@keyframes alertBlink`
 /// (`0%,100% {opacity:1; scale(1)}` / `50% {opacity:0.2; scale(0.75)}`)——
-/// gpui 的 `Animation` 只给一条 0..1 的进度,中点折返得自己算。
+/// 输入是 0..1 的线性进度(来自 `mt_ui::motion::pulse_phase`),中点折返得自己算。
 pub fn blink_phase(delta: f32) -> f32 {
     let triangle = 1.0 - (delta * 2.0 - 1.0).abs();
     // smoothstep,等价于 CSS 的 ease-in-out
@@ -751,7 +751,12 @@ impl TitleBar {
     }
 
     /// 全局状态灯。点一下跳到「下一件该我做的事」(不限项目)。
-    fn status_light(&self, light: TitleBarLight, cx: &mut Context<Self>) -> AnyElement {
+    fn status_light(
+        &self,
+        light: TitleBarLight,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let color = light_color(light);
         let alpha = if light == TitleBarLight::Idle { 0.45 } else { 1.0 };
         // 原版 `group-hover:scale-125`(8px → 10px)
@@ -763,22 +768,22 @@ impl TitleBar {
             .h(px(size))
             .rounded_full()
             .bg(ui::with_alpha(color, alpha));
-        // `working` 档闪烁(`animate-blink`)。⚠️ `with_animation` 持续请求帧 ——
-        // 所以只在这一档挂,别的档位必须让它整个从树上消失。
+        // `working` 档闪烁(`animate-blink`),相位来自低频泵
+        // (`mt_ui::motion::pulse_phase`)—— 静态档连泵都不挂。
         // ⚠️ 还要过减弱动效的闸(`mt_ui::motion`):原版的通配规则把
         // `.animate-blink` 停在第一帧 —— 它**不在** reduce 的豁免名单里,
         // 装机版在用户机器上就是不闪的。
         let dot: AnyElement = if light == TitleBarLight::Working && mt_ui::motion::blinks() {
-            dot.with_animation(
-                "titlebar-light-blink",
-                Animation::new(std::time::Duration::from_millis(800)).repeat(),
-                move |el, delta| {
-                    let phase = blink_phase(delta);
-                    let side = px(size - (size * 0.25) * phase);
-                    el.w(side).h(side).opacity(1.0 - 0.8 * phase)
-                },
-            )
-            .into_any_element()
+            let phase = blink_phase(mt_ui::motion::pulse_phase(
+                std::time::Duration::from_millis(800),
+                window,
+                cx,
+            ));
+            let side = px(size - (size * 0.25) * phase);
+            dot.w(side)
+                .h(side)
+                .opacity(1.0 - 0.8 * phase)
+                .into_any_element()
         } else {
             dot.into_any_element()
         };
@@ -901,7 +906,7 @@ impl Render for TitleBar {
                         cx,
                     ))
             }))
-            .child(self.status_light(light, cx))
+            .child(self.status_light(light, window, cx))
             // 中段留白 —— 主要的拖拽区
             .child(
                 div()

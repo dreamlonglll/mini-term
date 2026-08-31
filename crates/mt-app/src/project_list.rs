@@ -301,20 +301,11 @@ fn remote_badge_chip(id: &str, remote: RemoteBadge) -> gpui::Stateful<gpui::Div>
 }
 
 /// 完成标 / 状态灯二选一,**idle 且没有完成标时两个都不画**(原版 `ProjectList.tsx:912`)。
-fn row_status_mark(
-    id: &str,
-    show_done_tag: bool,
-    done_tag_in: f32,
-    status: PaneStatus,
-) -> Option<AnyElement> {
+fn row_status_mark(show_done_tag: bool, done_tag_in: f32, status: PaneStatus) -> Option<AnyElement> {
     if show_done_tag {
         Some(done_tag(done_tag_in))
     } else if status != PaneStatus::Idle {
-        // 状态灯的动画 id 拿项目 id 拼:跨帧稳定、逐行唯一
-        Some(
-            ui::status_dot(SharedString::from(format!("status-project-{id}")), status)
-                .into_any_element(),
-        )
+        Some(ui::status_dot(status).into_any_element())
     } else {
         None
     }
@@ -2649,7 +2640,7 @@ impl ProjectList {
             // 位置照原版 —— worktree 徽章之后、完成标/状态灯之前
             .children(remote.map(|remote| remote_badge_chip(&row.id, remote)))
             // 完成标 / 状态灯二选一,**idle 时两个都不画**
-            .children(row_status_mark(&row.id, show_done_tag, done_tag_in, status))
+            .children(row_status_mark(show_done_tag, done_tag_in, status))
             // 移除:弹确认框(不可逆,布局与展开目录一起没)。只在行悬停时出现
             .children(hovered.then(|| self.project_remove_button(&row.id, cx)));
 
