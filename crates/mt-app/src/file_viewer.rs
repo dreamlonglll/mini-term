@@ -51,7 +51,7 @@ use futures::channel::mpsc;
 use futures::future::BoxFuture;
 use gpui::{
     App, AppContext, ClickEvent, Context, Entity, FocusHandle, Focusable, ImageAssetLoader,
-    InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Render, Resource,
+    InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Render, Resource, ScrollHandle,
     StatefulInteractiveElement, Styled, StyledImage as _, Subscription, Task, Window, div, img,
     prelude::FluentBuilder as _, px,
 };
@@ -61,6 +61,7 @@ use gpui::http_client::{
 use gpui_component::ActiveTheme as _;
 use gpui_component::WindowExt as _;
 use gpui_component::input::{Input, InputEvent, InputState, Position, Search};
+use gpui_component::scroll::Scrollbar;
 use gpui_component::text::{TextView, TextViewStyle};
 use markdown::{ParseOptions, mdast::Node as MarkdownNode};
 use mt_project::fs::FileContentResult;
@@ -1949,6 +1950,12 @@ pub struct FileViewer {
     /// 远程 Markdown 图片按文档、按 URL 记录用户明确批准。未命中时只能画
     /// 占位，绝不能把 URI 交给进程级图片加载器。
     approved_remote_images: HashSet<String>,
+    /// 预览态(markdown / html)的滚动位置。**必须住在实体上**:裸
+    /// `overflow_y_scroll()` 的偏移存在按帧回收的 element state 里,切去终端页
+    /// 的那几帧预览不渲染、状态被回收,切回来就跳回顶部。一份文件只会走
+    /// md / html 其中一支,共用一个句柄;「预览 ↔ 源码」来回切也靠它保住进度
+    /// (源码态的滚动住在 `InputState` 实体里,组件自己管)。
+    preview_scroll: ScrollHandle,
 
     preview: bool,
     dirty: bool,
@@ -2028,6 +2035,7 @@ impl FileViewer {
             line_ending: LineEnding::Lf,
             md_cache: RefCell::new(None),
             approved_remote_images: HashSet::new(),
+            preview_scroll: ScrollHandle::new(),
             // 文件树打开 Markdown / HTML 时默认看渲染稿；内容搜索带行号时切到
             // 源码，否则命中光标虽然已经定位，用户看到的仍是无法对应行号的预览。
             preview: highlight_line.is_none(),
@@ -3476,6 +3484,34 @@ impl FileViewer {
         })
     }
 
+    /// 预览滚动壳:内容器挂上 [`Self::preview_scroll`](进度跨卸载存活),
+    /// 再叠一层滚动条(显隐跟主题的 `scrollbar_show`,默认滚动时现身、闲置淡出,
+    /// 与终端滚动条同口径)。
+    ///
+    /// 滚动条要自己套一层 `absolute` + 四边贴 0 的壳,理由与 `menu.rs` 那处相同:
+    /// `Scrollbar` 元素自身是 absolute 却不带 inset,直接塞进流式布局会被 taffy
+    /// 按静态位置摆到内容下方去。壳上没有监听器,不挡内容的点击与选择。
+    fn preview_scroll_shell(
+        &self,
+        bar_id: &'static str,
+        content: gpui::Stateful<gpui::Div>,
+    ) -> gpui::AnyElement {
+        div()
+            .size_full()
+            .relative()
+            .child(content.track_scroll(&self.preview_scroll))
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .child(Scrollbar::vertical(&self.preview_scroll).id(bar_id)),
+            )
+            .into_any_element()
+    }
+
     /// Markdown 预览。样式对照 `src/styles.css:813-943` 的 `.md-preview`:
     /// 容器 `p-6 max-w-[860px] mx-auto`、段间距 1 rem、正文 1.08rem/1.7。
     ///
@@ -3489,7 +3525,7 @@ impl FileViewer {
         // 文档不变即稳定。分块结果跨帧缓存(见 MdCache)——「滚一格重画一遍」
         // 这条路上,每帧重切 40 KB 正文是白烧。
         let blocks = self.md_blocks(self.preview_source(), &base_dir, !self.source.is_remote());
-        div()
+        let content = div()
             .id("file-viewer-md")
             .size_full()
             .overflow_y_scroll()
@@ -3545,8 +3581,8 @@ impl FileViewer {
                             })
                             .collect::<Vec<_>>(),
                     ),
-            )
-            .into_any_element()
+            );
+        self.preview_scroll_shell("file-viewer-md-scrollbar", content)
     }
 
     /// Trusted local HTML preview. **富文本简版渲染,不是浏览器** —— GPUI 侧没有 iframe 等价物,
@@ -3561,7 +3597,7 @@ impl FileViewer {
         debug_assert!(!self.source.is_remote());
         let source = rewrite_html_urls(self.preview_source(), &self.preview_base_dir());
         let style = self.preview_text_style(cx);
-        div()
+        let content = div()
             .id("file-viewer-html")
             .size_full()
             .overflow_y_scroll()
@@ -3595,8 +3631,8 @@ impl FileViewer {
                             .style(style)
                             .selectable(true),
                     ),
-            )
-            .into_any_element()
+            );
+        self.preview_scroll_shell("file-viewer-html-scrollbar", content)
     }
 
     fn render_content(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
