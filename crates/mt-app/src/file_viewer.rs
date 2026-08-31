@@ -3696,6 +3696,11 @@ impl Render for FileViewer {
             .flex()
             .flex_col()
             .overflow_hidden()
+            // 着色统一由容器层承担**一层**(与终端区同口径,见 terminal_area 的
+            // 「不刷底色」注释):工具栏/横幅/内容区都坐在这一层上,背景图皮肤下
+            // bg_document 半透明,整页透出氛围图;内容区不再自己刷 bg_base,
+            // 免得两层叠乘把图盖死
+            .bg(ui::bg_document())
             // Ctrl/Cmd+S 与 Ctrl/Cmd+W。挂在容器上而不是绑 action:
             // 绑成全局 action 要动 `main.rs` 的 bindings 表,而这两个键**只在文件页里**
             // 有意义;`on_key_down` 沿焦点链冒泡上来,焦点在编辑器里照样收得到
@@ -3720,7 +3725,6 @@ impl Render for FileViewer {
                     .flex_1()
                     .min_h(px(0.0))
                     .overflow_hidden()
-                    .bg(ui::bg_base())
                     .child(self.render_content(window, cx)),
             )
     }

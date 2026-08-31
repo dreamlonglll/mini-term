@@ -681,7 +681,9 @@ impl Render for WorkbenchArea {
                     .cursor_pointer()
                     .text_size(ui::font_px(12.0))
                     .when(selected, |el| {
-                        el.bg(ui::bg_base())
+                        // 与文档页容器同色:背景图皮肤下随内容区一起半透明,
+                        // 不透明的 bg_base 会在半透明页签条上凸成一块实色
+                        el.bg(ui::bg_document())
                             .text_color(ui::text_primary())
                             .border_t_2()
                             .border_color(ui::accent())

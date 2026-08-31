@@ -39,6 +39,11 @@ use crate::tree::PaneStatus;
 #[derive(Clone, Debug, PartialEq)]
 pub struct Palette {
     pub bg_base: Hsla,
+    /// 主区文档页(文件编辑器)的容器层底色:与 `bg_base` 同色,但吃
+    /// `surface_opacity` —— 背景图皮肤下随面板一起透出氛围图。
+    /// 原版无此变量(FileViewerModal 是弹窗,按「浮层不透明」走);文件页改成
+    /// 主区页签后与终端区同层级,着色得走面板那条半透明路。
+    pub bg_document: Hsla,
     pub bg_surface: Hsla,
     pub bg_elevated: Hsla,
     pub bg_overlay: Hsla,
@@ -90,6 +95,7 @@ impl Palette {
     pub fn dark() -> Self {
         Self {
             bg_base: rgb8(0x08, 0x07, 0x06),
+            bg_document: rgb8(0x08, 0x07, 0x06),
             bg_surface: rgb8(0x12, 0x11, 0x10),
             bg_elevated: rgb8(0x1c, 0x1a, 0x18),
             bg_overlay: rgb8(0x25, 0x23, 0x20),
@@ -144,6 +150,7 @@ impl Palette {
     pub fn light() -> Self {
         Self {
             bg_base: rgb8(0xff, 0xff, 0xff),
+            bg_document: rgb8(0xff, 0xff, 0xff),
             bg_surface: rgb8(0xf5, 0xf5, 0xf5),
             bg_elevated: rgb8(0xeb, 0xeb, 0xeb),
             bg_overlay: rgb8(0xe0, 0xe0, 0xe0),
@@ -233,6 +240,7 @@ impl Palette {
         Self {
             bg_base: background,
             // 面板半透明才透得出背景图;无背景图时 surface_opacity = 1.0
+            bg_document: alpha(background, so),
             bg_surface: alpha(panel, so),
             bg_elevated: alpha(panel_alt, so),
             // 浮层始终不透明:弹窗叠在任意内容上,半透明是拿可读性换观感
@@ -387,6 +395,10 @@ fn token(pick: impl Fn(&Palette) -> Hsla) -> Hsla {
 /// `--bg-base`
 pub fn bg_base() -> Hsla {
     token(|p| p.bg_base)
+}
+/// 文档页容器底色:带 `surface_opacity` 的 `bg_base`(见 [`Palette::bg_document`])。
+pub fn bg_document() -> Hsla {
+    token(|p| p.bg_document)
 }
 /// `--bg-surface`
 pub fn bg_surface() -> Hsla {

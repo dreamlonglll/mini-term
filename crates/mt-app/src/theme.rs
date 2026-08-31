@@ -295,7 +295,12 @@ fn install_highlight_theme(palette: &Palette, appearance: Appearance, cx: &mut A
             Appearance::Light => ThemeMode::Light,
         },
         style: HighlightThemeStyle {
-            editor_background: Some(palette.bg_base),
+            // 行号栏那条整高 quad 用它(gpui-component input/element.rs 的
+            // 「Paint line numbers」段)。跟 bg_document 走:背景图皮肤下文件页
+            // 整页半透明,行号栏刷不透明 bg_base 会留一条实色竖带。代价是长行
+            // 横向滚进行号栏下方时遮不严(28% 透底),与「终端文字直接坐在
+            // 氛围图上」同档,可接受
+            editor_background: Some(palette.bg_document),
             editor_foreground: Some(palette.text_primary),
             // 活动行:accent 的极淡一档(原版 `.cm-activeLine` 用 --accent-subtle)
             editor_active_line: Some(palette.accent_subtle),
