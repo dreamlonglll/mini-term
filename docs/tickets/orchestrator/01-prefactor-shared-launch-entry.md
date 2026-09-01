@@ -6,8 +6,8 @@
 
 **Blocked by:** None — can start immediately.
 
-**Status:** ready-for-agent
+**Status:** done（feff984，随合并 98749f9 入 main）
 
-- [ ] 移动端发起会话链路行为零变化，既有测试全绿
-- [ ] 共享入口不绑死中转体系的类型，编排控制面后续可直接调用
-- [ ] cargo test --workspace 全绿
+- [x] 移动端发起会话链路行为零变化，既有测试全绿
+- [x] 共享入口不绑死中转体系的类型，编排控制面后续可直接调用（`AppStore::launch_ai_session` + `LaunchRequest`，`store/launch.rs`）
+- [x] cargo test --workspace 全绿（合并后 28 目标复验）

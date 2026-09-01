@@ -23,8 +23,9 @@ MT_APP_DATA_DIR="$LOCALAPPDATA/mini-term-gpui-dev" cargo run -p mt-app
 # 全工作区测试（27 个目标 1500+ 例）
 cargo test --workspace
 
-# 中转服务端协议边界测试 / sidecar 工作区
+# 中转服务端协议边界测试 / sidecar 工作区(--workspace 才跑得到 agent-control 等成员 crate)
 cd relay-server && cargo test
+cargo test --manifest-path sidecars/Cargo.toml --workspace
 cargo build --manifest-path sidecars/Cargo.toml
 
 # 移动端 PWA

@@ -8,12 +8,14 @@
 
 **Blocked by:** None — can start immediately.
 
-**Status:** ready-for-agent
+**Status:** done（6ad5a31/12995d2/ab3c07e，随合并 ab73962 入 main）
 
-- [ ] 启动器编辑 UI 有「允许编排」开关；配置存 config.db，**不碰 config.json 投影**（不涉 `ConfigSshView` 对账）
-- [ ] 勾选启动器起的 pane 内 CLI 可用；普通 pane / 无令牌 / 坏令牌一律被拒（fail-closed）
-- [ ] `list-projects` 可达范围 = 本项目 + 同分组；未分组仅本项目；改分组即时生效
-- [ ] 主缝测试：控制端点经注入假宿主覆盖鉴权与范围裁决（先例：hook server 既有 HTTP 级测试 + `NoopRelayHost` 模式）
-- [ ] 辅缝脚手架：主仓测试直调 sidecar CLI 的解析器读真 handler 产出（先例：「投影能被 sidecar 的解析器读懂」跨工作区对账）
-- [ ] 新文案进 i18n 字典源头并重跑生成器
-- [ ] cargo test --workspace 全绿
+- [x] 启动器编辑 UI 有「允许编排」开关；配置存 config.db，**不碰 config.json 投影**（不涉 `ConfigSshView` 对账）
+- [x] 勾选启动器起的 pane 内 CLI 可用；普通 pane / 无令牌 / 坏令牌一律被拒（fail-closed）——CLI↔真 hook server 的整条 HTTP 往返未真机走过，留工单 09 验收
+- [x] `list-projects` 可达范围 = 本项目 + 同分组；未分组仅本项目；改分组即时生效
+- [x] 主缝测试：`mt-ai::control` 17 例（真 tiny_http + 假宿主）
+- [x] 辅缝脚手架：`orchestrator_wire.rs` 4 例（跨工作区引 `sidecars/agent-control`）
+- [x] 新文案进 i18n 字典源头并重跑生成器
+- [x] cargo test --workspace 全绿（合并后复验）
+
+**合并期决议**（主会话解冲突时定）：spawn 链 `extra_env` 与 `OrchestratorGrant` 两参并存，令牌先进 base env 再合 extra_env；`LaunchRequest` 增 `grant` 字段。移动端引用「允许编排」启动器暂**不授予**（spec 故事 22 的放行需协议带 flag，留后续工单裁决）。
