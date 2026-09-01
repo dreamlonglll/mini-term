@@ -26,6 +26,8 @@
 //! mt-agent-cli list-projects                           # 我能在哪些项目里起(本项目 + 同分组)
 //! mt-agent-cli start-session --launcher <ID> [--project <ID>]   # 起一个受编排会话
 //! mt-agent-cli list-panes                              # 我起过的受编排会话及其状态
+//! mt-agent-cli send --pane <ID> --text <TEXT>          # 给某个受编排会话派活
+//! mt-agent-cli send --pane <ID> --stdin                # 同上,正文从 stdin 读(多行)
 //! ```
 //!
 //! 成功：JSON 到 stdout，退出码 0。失败：JSON 到 stderr，退出码见 [`CliError::exit_code`]。
@@ -37,7 +39,8 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use mt_agent_control::{
     ControlFailure, ControlRequest, IdentityError, identity_from_env, parse_launchers, parse_panes,
-    parse_projects, parse_started_pane, CONNECT_TIMEOUT, CONTROL_PREFIX, READ_TIMEOUT,
+    parse_projects, parse_send_receipt, parse_started_pane, CONNECT_TIMEOUT, CONTROL_PREFIX,
+    READ_TIMEOUT,
 };
 
 /// 退出码说明。**给编排者（LLM）读的**，所以 `--help` 里就得写清 `desktopBusy`
@@ -51,7 +54,16 @@ Exit codes:
      an orchestrated session the moment it lands, before it answers. Run `list-panes`
      to check whether it is already there instead of retrying blindly.
   4  the desktop rejected the request (bad launcher/project, session limit, ...);
-     change the request or wait for one of your sessions to finish";
+     change the request or wait for one of your sessions to finish
+
+send notes:
+  A prompt is delivered immediately, never queued, and is equivalent to typing it in
+  that session and pressing Enter once. Multi-line prompts go in as a single
+  bracketed-paste block so newlines inside them do not submit early - but the receipt
+  reports bracketedPaste: false when the target terminal was not in paste mode (its
+  agent has probably exited), which means the lines went in one by one. An empty
+  prompt is refused: a bare Enter would answer a pending prompt on the user's behalf,
+  and an orchestrator must never do that - ask the user to handle it instead.";
 
 #[derive(Parser)]
 #[command(
@@ -82,6 +94,22 @@ enum Command {
     },
     /// List the orchestrated sessions this orchestrator started, with their status.
     ListPanes,
+    /// Send a prompt to one of your orchestrated sessions, as if typed and entered there.
+    ///
+    /// Multi-line text is delivered as one bracketed-paste block, so newlines inside it
+    /// do not submit early; a single Enter is appended at the end.
+    #[command(group = clap::ArgGroup::new("body").required(true).args(["text", "stdin"]))]
+    Send {
+        /// Pane id of the orchestrated session, as reported by `start-session` / `list-panes`.
+        #[arg(long, value_name = "ID")]
+        pane: u32,
+        /// The prompt to send. Use --stdin instead for anything with newlines or quotes.
+        #[arg(long, value_name = "TEXT")]
+        text: Option<String>,
+        /// Read the prompt from stdin (the whole stream). Preferred for multi-line prompts.
+        #[arg(long)]
+        stdin: bool,
+    },
 }
 
 impl Command {
@@ -92,19 +120,45 @@ impl Command {
             Self::ListProjects => "list-projects",
             Self::StartSession { .. } => "start-session",
             Self::ListPanes => "list-panes",
+            Self::Send { .. } => "send",
         }
     }
 
     /// 这条命令的请求体。**只带 id** —— 启动器的命令文本从不经过 CLI
     /// （ADR 0002：命令只能来自桌面端配置）。
-    fn request(&self, identity: &mt_agent_control::Identity) -> ControlRequest {
-        match self {
+    ///
+    /// `send` 的正文是唯一的例外：那是编排者自己写的 prompt，本来就得经这里
+    /// 传过去。它**只出现在请求体里** —— 不打印、不进错误消息。
+    fn request(&self, identity: &mt_agent_control::Identity) -> Result<ControlRequest, CliError> {
+        Ok(match self {
             Self::StartSession { launcher, project } => {
                 ControlRequest::start_session(identity, launcher, project.as_deref())
             }
+            Self::Send { pane, text, stdin } => {
+                let body = read_body(text.as_deref(), *stdin)?;
+                ControlRequest::send(identity, *pane, &body)
+            }
             _ => ControlRequest::from(identity),
-        }
+        })
     }
+}
+
+/// `send` 的正文：`--text` 直给，或 `--stdin` 整条读进来。
+///
+/// clap 的 `ArgGroup` 已经保证两者恰好给一个，所以这里没有「都没给」的分支 ——
+/// 无参数时**绝不**去读 stdin：这个二进制常在没有管道的 pane 里被跑到，
+/// 那样会挂住等一个永远不来的 EOF。
+fn read_body(text: Option<&str>, stdin: bool) -> Result<String, CliError> {
+    if let Some(text) = text {
+        return Ok(text.to_string());
+    }
+    debug_assert!(stdin, "clap 的 ArgGroup 保证两者恰好给一个");
+    let mut body = String::new();
+    std::io::stdin()
+        .read_to_string(&mut body)
+        // ⚠️ 报错里只说读失败，**不带出已经读到的那部分正文**
+        .map_err(|e| CliError::DesktopUnreachable(format!("cannot read prompt from stdin: {e}")))?;
+    Ok(body)
 }
 
 fn main() {
@@ -125,7 +179,7 @@ fn run(command: &Command) -> Result<String, CliError> {
     let port = discover_port().ok_or(CliError::DesktopUnreachable(
         "cannot locate the mini-term hook server port (is mini-term running?)".to_string(),
     ))?;
-    let body = serde_json::to_string(&command.request(&identity))
+    let body = serde_json::to_string(&command.request(&identity)?)
         .map_err(|e| CliError::DesktopUnreachable(format!("cannot encode request: {e}")))?;
     let (status, response) = post(port, command.endpoint(), &body)?;
 
@@ -145,6 +199,10 @@ fn run(command: &Command) -> Result<String, CliError> {
         Command::ListPanes => {
             let panes = parse_panes(status, &response).map_err(CliError::Rejected)?;
             to_json(&serde_json::json!({ "panes": panes }))
+        }
+        Command::Send { .. } => {
+            let sent = parse_send_receipt(status, &response).map_err(CliError::Rejected)?;
+            to_json(&serde_json::json!({ "sent": sent }))
         }
     }
 }
@@ -237,6 +295,10 @@ fn split_response(raw: &str) -> Option<(u16, String)> {
 
 // ─── 错误语义 ─────────────────────────────────────────────────
 
+/// ⚠️ `Debug` 是给测试用的。**三个变体一个都不许装 `send` 的正文** ——
+/// 那是用户项目里的内容，`Debug` 会经 panic 消息 / `unwrap` 落到 stderr。
+/// 读 stdin 失败那一档只带 io 错误本身，不带已经读到的半截。
+#[derive(Debug)]
 enum CliError {
     /// 这个 pane 压根没有编排能力（或注入链路坏了）。
     Identity(IdentityError),
@@ -349,6 +411,15 @@ mod tests {
             "start-session"
         );
         assert_eq!(Command::ListPanes.endpoint(), "list-panes");
+        assert_eq!(
+            Command::Send {
+                pane: 1,
+                text: Some("x".into()),
+                stdin: false
+            }
+            .endpoint(),
+            "send"
+        );
         assert_eq!(CONTROL_PREFIX, "/control/");
     }
 
@@ -359,7 +430,7 @@ mod tests {
             token: "t".into(),
             pane_id: 5,
         };
-        let json = |c: &Command| serde_json::to_string(&c.request(&id)).unwrap();
+        let json = |c: &Command| serde_json::to_string(&c.request(&id).unwrap()).unwrap();
 
         assert_eq!(json(&Command::ListPanes), r#"{"token":"t","paneId":5}"#);
         assert_eq!(
@@ -412,6 +483,77 @@ mod tests {
         assert!(
             !EXIT_CODE_HELP.contains("musician"),
             "用户可见文案一律用 orchestrated session（术语表）"
+        );
+    }
+
+    /// `send` 那三条只有编排者会踩的坑都得写在 `--help` 里：不排队、多行整块、
+    /// 以及**空正文为什么被拒**（那是 ADR 0003 的「不代答」，不是参数校验）。
+    #[test]
+    fn 帮助文案讲清楚了_send_的语义() {
+        assert!(EXIT_CODE_HELP.contains("bracketed-paste"), "多行怎么送的");
+        assert!(EXIT_CODE_HELP.contains("never queued"), "立即写穿不排队");
+        assert!(
+            EXIT_CODE_HELP.contains("bracketedPaste: false"),
+            "回执里那一位为假意味着什么，得写清"
+        );
+        assert!(
+            EXIT_CODE_HELP.contains("on the user's behalf"),
+            "空正文被拒的理由是「不代答」，不是参数不对"
+        );
+    }
+
+    /// `--text` 与 `--stdin` **恰好给一个**：都不给会去读一个不存在的管道，
+    /// 都给了则不知道听谁的。这条由 clap 的 `ArgGroup` 挡，这里钉住那个声明
+    /// （`debug_assert` 顺带验证整棵命令树的定义没写坏）。
+    #[test]
+    fn 正文来源必须恰好给一个() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+
+        let parse = |args: &[&str]| Cli::try_parse_from(args).map(|_| ());
+        assert!(parse(&["mt-agent-cli", "send", "--pane", "1", "--text", "x"]).is_ok());
+        assert!(parse(&["mt-agent-cli", "send", "--pane", "1", "--stdin"]).is_ok());
+        assert!(
+            parse(&["mt-agent-cli", "send", "--pane", "1"]).is_err(),
+            "两个都不给必须报错，不许悄悄去读 stdin"
+        );
+        assert!(
+            parse(&["mt-agent-cli", "send", "--pane", "1", "--stdin", "--text", "x"]).is_err(),
+            "两个都给了不知道听谁的"
+        );
+        assert!(
+            parse(&["mt-agent-cli", "send", "--text", "x"]).is_err(),
+            "--pane 是必给的"
+        );
+    }
+
+    /// `--text` 直给时不碰 stdin。
+    ///
+    /// 这个二进制常在**没有管道**的 pane 里被跑到，那时候去读 stdin 会挂住等
+    /// 一个永远不来的 EOF —— 编排者看到的会是「命令卡死」。
+    #[test]
+    fn 有_text_就不读_stdin() {
+        assert_eq!(read_body(Some("干活"), false).unwrap(), "干活");
+        // 多行原样带过去（换行归一是桌面侧的事）
+        assert_eq!(read_body(Some("a\nb"), false).unwrap(), "a\nb");
+    }
+
+    /// `send` 的请求体带目标编号与正文，别的命令一如既往。
+    #[test]
+    fn 写穿请求体带目标与正文() {
+        let id = mt_agent_control::Identity {
+            token: "t".into(),
+            pane_id: 5,
+        };
+        let cmd = Command::Send {
+            pane: 101,
+            text: Some("跑一下测试".into()),
+            stdin: false,
+        };
+        let json = serde_json::to_string(&cmd.request(&id).unwrap()).unwrap();
+        assert_eq!(
+            json,
+            r#"{"token":"t","paneId":5,"targetPaneId":101,"text":"跑一下测试"}"#
         );
     }
 

@@ -109,7 +109,13 @@ pub const TOKEN_ENV: &str = "MINITERM_ORCHESTRATOR_TOKEN";
 /// 编排者自身 pane 身份的环境变量名。
 pub const PANE_ENV: &str = "MINITERM_ORCHESTRATOR_PANE";
 
-/// 单个控制请求 body 的字节上限（现有命令的 body 只有一百来字节）。
+/// 单个控制请求 body 的字节上限。
+///
+/// 除 `send` 之外的命令 body 只有一百来字节；`send` 那条会带上编排者写的整段
+/// prompt，是唯一一条可能顶到上限的命令。**64 KiB 判为够用**：那已经是一万多个
+/// 英文词的一段指令，远超「派一次活」的合理体量，而编排者要塞的大块上下文
+/// 本来就该以文件路径的形式交过去（乐手自己能读文件），不该逐字灌进 PTY。
+/// 顶到上限时得到的是明确的 `payloadTooLarge`，不是截断。
 const MAX_CONTROL_BODY_BYTES: usize = 64 * 1024;
 
 // ─── 注入接口 ─────────────────────────────────────────────────
@@ -360,15 +366,129 @@ impl PaneLiveness {
     }
 }
 
+// ─── 写穿：一段要交给乐手的输入（工单 05）────────────────────────
+
+/// 一段**装配好的**、要当成「本人在那个 pane 上粘贴并回车」写进去的输入。
+///
+/// # 为什么装配在控制面这一侧
+///
+/// 装配是纯字符串运算，桌面侧只剩「把这串字节交给既有写穿入口」这一件事 ——
+/// 于是[主缝测试](self)拿假宿主就能把**真正写进 PTY 的那串字节**逐字断言，
+/// 不必起 gpui。桌面侧唯一还要做的判断是下面那个 `bracketed_paste`。
+///
+/// # 为什么带两份而不是一份
+///
+/// 包不包 `ESC[200~ … ESC[201~` 取决于**目标终端此刻开没开 DECSET 2004**
+/// （`TermMode::BRACKETED_PASTE`），而那是 VT 状态机的事实，只有桌面侧读得到；
+/// 本 crate 不依赖 `mt-terminal`/`gpui`，也不该为了猜它去建一条状态镜像。
+///
+/// 于是两份都在这里备好，桌面侧照着终端的真实模式挑一份 —— 与用户按 Ctrl+V
+/// 时 `mt_ui::terminal::input::paste_to_bytes` 做的判断**是同一个判断**。
+/// 不无条件包裹的理由：乐手的 agent 退出之后那个 pane 会退回裸 shell
+/// （`cmd.exe` / PowerShell 都不认 bracketed paste），那时候硬包一层
+/// 就是往用户的终端里灌一串肉眼可见的乱码。
+///
+/// # 装配口径（与 `paste_to_bytes` 对齐，由 `mt-app` 的对账测试钉住）
+///
+/// - **换行一律归一成 `\r`**：PTY 那头把 `\n` 当作「换行但不回车」，多行会出阶梯；
+/// - **正文里的结束标记 `ESC[201~` 剔掉**：否则 prompt 自己就能把粘贴块提前
+///   截断，后半截变成真键入 —— 那正是本命令要防的事；
+/// - **末尾的换行删掉、另补一个 `\r`**，且那个 `\r` 在**包裹之外**：包在里头
+///   只是往编辑框里插一个换行，送不出去。
+#[derive(Clone, PartialEq, Eq)]
+pub struct PaneInput {
+    /// 目标开着 bracketed paste 时写这份。
+    bracketed: String,
+    /// 没开时写这份（= 归一后的正文 + 回车，与裸粘贴同形）。
+    plain: String,
+}
+
+impl PaneInput {
+    /// 装配一段输入。正文空（或只有空白）时返回 `None`。
+    ///
+    /// 空正文被拒**不只是入参校验**：那等于替用户按一下回车，而「停在等审批 /
+    /// 向人提问时编排者不代答」是 ADR 0003 的铁律。裸回车是最顺手的代答姿势，
+    /// 在这里就堵掉。
+    ///
+    /// 对外可见只为一件事：`mt-app` 那条[跨 crate 对账测试](自身模块注释的
+    /// 「装配口径」)要拿它与 `mt_ui::paste_to_bytes` 比一次 —— 那是同时看得见
+    /// 两侧的唯一地方。**装配本身仍然只在 [`ControlPlane::send`] 里被调用**。
+    pub fn assemble(text: &str) -> Option<Self> {
+        let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
+        let body = normalized.replace("\x1b[201~", "");
+        // 结尾的换行删掉：LLM 拿 heredoc 拼 prompt 时末尾几乎总带一个换行，
+        // 原样留着就是替它多按一次回车 —— 在等确认的 TUI 里那一下会被当成「确认」。
+        let body = body.trim_end_matches('\r');
+        if body.trim().is_empty() {
+            return None;
+        }
+        Some(Self {
+            bracketed: format!("\x1b[200~{body}\x1b[201~\r"),
+            plain: format!("{body}\r"),
+        })
+    }
+
+    /// 目标终端开着 bracketed paste 时该写的那串。
+    pub fn bracketed(&self) -> &str {
+        &self.bracketed
+    }
+
+    /// 没开时该写的那串。
+    pub fn plain(&self) -> &str {
+        &self.plain
+    }
+
+    /// 按目标终端的真实模式挑一份。桌面侧唯一要做的判断。
+    pub fn bytes(&self, bracketed_paste: bool) -> &str {
+        if bracketed_paste {
+            self.bracketed()
+        } else {
+            self.plain()
+        }
+    }
+}
+
+impl std::fmt::Debug for PaneInput {
+    /// **正文一个字都不打**（ADR 0002 的防线延伸到编排者发的 prompt：那是用户
+    /// 项目里的内容，不许经由日志 / panic 消息 / 错误上报漏出去）。只给长度。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PaneInput")
+            .field("bytes", &self.plain.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// 一次写穿落地之后桌面侧回来的东西。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Delivered {
+    /// 写的是哪一份（= 目标终端此刻开没开 bracketed paste）。
+    ///
+    /// **如实回答**，并且原样透给编排者：为假时它那段多行 prompt 是被逐行送进去
+    /// 的，很可能已经被中途的换行提前发出去了 —— 这是它需要知道的事实，
+    /// 不是可以粉饰的实现细节。
+    pub bracketed_paste: bool,
+}
+
+/// 写穿失败的原因。**闭集** —— 桌面侧只负责判定，映射成对外错误码是本模块的事。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendFailure {
+    /// 从裁决到落地之间那个 pane 没了（用户刚好把它关掉）。
+    PaneGone,
+    /// 找得到那个终端，但字节没交出去。
+    WriteFailed,
+    /// 桌面主线程没在时限内答复（泵没接线 / 主线程忙死）。
+    DesktopBusy,
+}
+
 /// 控制面要桌面端**做事**的入口。
 ///
 /// 与 [`OrchestratorHost`] 的分工：那条是查（纯读镜像，随手可答），这条是做
-/// （要回主线程建 pane）。刻意分成两个 trait 而不是并成一个，是因为两者的
-/// 线程契约完全不同 —— 下面这条注意事项对 `Host` 不成立。
+/// （要回主线程建 pane / 写 PTY）。刻意分成两个 trait 而不是并成一个，是因为
+/// 两者的线程契约完全不同 —— 下面这条注意事项对 `Host` 不成立。
 ///
-/// ⚠️ **两个方法都在 HTTP 线程上被调用，且调用方（本模块）不持任何锁**。
-/// [`Self::start_session`] 允许阻塞（实现方回主线程 + 同步等回执 + 自己兜超时，
-/// 超时就答 [`StartFailure::DesktopBusy`]，别永久挂住）；
+/// ⚠️ **三个方法都在 HTTP 线程上被调用，且调用方（本模块）不持任何锁**。
+/// [`Self::start_session`] 与 [`Self::send_input`] 允许阻塞（实现方回主线程 +
+/// 同步等回执 + 自己兜超时，超时就答 `DesktopBusy`，别永久挂住）；
 /// [`Self::pane_liveness`] 必须**很快**（名额判定一次要问好几个 pane），
 /// 实现方应当从后台线程读得到的状态里现答，别为它跳主线程。
 pub trait OrchestratorActions: Send + Sync + 'static {
@@ -379,19 +499,37 @@ pub trait OrchestratorActions: Send + Sync + 'static {
     /// 到点没答复就返回 [`StartFailure::DesktopBusy`]，别把 HTTP 线程永久挂着。
     fn start_session(&self, spec: StartSessionSpec) -> Result<StartedSession, StartFailure>;
 
+    /// 把一段输入写穿进某个乐手，**立即写、不排队**（ADR 0003 / 工单 05）。
+    ///
+    /// 语义必须与移动端指令**完全一致**：等价本人在桌面上对那个终端粘贴这段
+    /// 内容并回车 —— 输入跟踪 / AI marker / SSH autofill 解除一个都不能少。
+    /// 实现方**必须走既有的写穿入口**（`AppStore::write_to_pane`），别另开一条
+    /// 裸 PTY 写：那几样语义全挂在那条链路上。
+    ///
+    /// 目标已经由 [`ControlPlane::resolve_target`] 裁决过（是调用者自己起的乐手、
+    /// 且 pane 还活着），实现方不必再判可见范围；但从裁决到落地之间 pane 可能
+    /// 刚好被关掉，那一档答 [`SendFailure::PaneGone`]。
+    ///
+    /// 写哪一份由实现方按目标终端的真实 bracketed paste 模式挑（[`PaneInput::bytes`]），
+    /// 并在回执里[如实说明挑了哪份](Delivered::bracketed_paste)。
+    fn send_input(&self, pane_id: u32, input: PaneInput) -> Result<Delivered, SendFailure>;
+
     /// 这个 pane 现在什么样（活着吗、在不在 AI 会话里）。
     fn pane_liveness(&self, pane_id: u32) -> PaneLiveness;
 }
 
 /// 什么都做不了的动作实现。
 ///
-/// 只给测试和「尚未接线」用：起会话恒答 [`StartFailure::DesktopBusy`]
+/// 只给测试和「尚未接线」用：起会话与写穿恒答 `DesktopBusy`
 /// （fail-closed —— 没接线绝不能被当成「随便起」的理由），死活恒答「已经不在了」。
 pub struct NoopOrchestratorActions;
 
 impl OrchestratorActions for NoopOrchestratorActions {
     fn start_session(&self, _spec: StartSessionSpec) -> Result<StartedSession, StartFailure> {
         Err(StartFailure::DesktopBusy)
+    }
+    fn send_input(&self, _pane_id: u32, _input: PaneInput) -> Result<Delivered, SendFailure> {
+        Err(SendFailure::DesktopBusy)
     }
     fn pane_liveness(&self, _pane_id: u32) -> PaneLiveness {
         PaneLiveness::gone()
@@ -505,14 +643,16 @@ enum Command {
     ListProjects,
     StartSession,
     ListPanes,
+    Send,
 }
 
 impl Command {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::ListLaunchers,
         Self::ListProjects,
         Self::StartSession,
         Self::ListPanes,
+        Self::Send,
     ];
 
     /// 路由里那一段（与 sidecar CLI 的 `Command::endpoint` 一字不差）。
@@ -522,6 +662,7 @@ impl Command {
             Self::ListProjects => "list-projects",
             Self::StartSession => "start-session",
             Self::ListPanes => "list-panes",
+            Self::Send => "send",
         }
     }
 
@@ -537,8 +678,10 @@ impl Command {
     fn blocks_on_desktop(self) -> bool {
         match self {
             Self::ListLaunchers | Self::ListProjects | Self::ListPanes => false,
-            // 工单 05~07 的 send / wait / read 落地时，`wait` 也属于这一档
-            Self::StartSession => true,
+            // 工单 06~07 的 wait / read 落地时，`wait` 也属于这一档。
+            // `send` 要回主线程走 `AppStore::write_to_pane`（写 PTY 是 gpui 实体
+            // 上的活），漏登记这一条就会把 hook 上报那条队一起卡住。
+            Self::StartSession | Self::Send => true,
         }
     }
 }
@@ -933,10 +1076,9 @@ impl ControlPlane {
     ///   已离场位保证它还是够不着（MVP 不做收养）。
     /// - 是自己的乐手、但 pane 已经关了 → [`ControlError::PaneGone`]。这条**可以**
     ///   说：那是它自己起的东西，告诉它「关了」比「不存在」有用得多。
-    // 本票只落地并测试这个函数，命令留给 05/06/07（`target_pane_id` 的解析器
-    // 同款先就位）。收成 `pub(crate)` 是因为它没有跨 crate 消费者，也不该有 ——
-    // 可见范围铁律是本模块的裁决。
-    #[allow(dead_code)]
+    // 收成 `pub(crate)` 是因为它没有跨 crate 消费者，也不该有 ——
+    // 可见范围铁律是本模块的裁决。工单 05 的 `send` 是它的第一个真消费者，
+    // 06/07 的 wait / read 照用同一条。
     pub(crate) fn resolve_target(
         &self,
         grant: &Grant,
@@ -1010,6 +1152,7 @@ impl ControlPlane {
                 ok_outcome(&ControlData::Projects { projects })
             }
             Command::StartSession => self.start_session(&grant, &request),
+            Command::Send => self.send(&grant, &request),
             Command::ListPanes => {
                 let actions = self.actions();
                 let panes = self
@@ -1100,6 +1243,40 @@ impl ControlPlane {
             pane: pane_view(&started.session, &liveness),
         })
     }
+
+    /// `send`：把一段 prompt 写穿进自己的某个乐手。
+    ///
+    /// **立即写、不排队**（ADR 0003）：写不进去就明确报错，不缓存也不重试 ——
+    /// 缓存重试会让「我发了」与「它收到了」这两件事分家，而编排者接下来要靠
+    /// `wait` / `read` 判断乐手在干什么。
+    ///
+    /// 裁决顺序照旧「越便宜越靠前」：先把请求体本身看完（不惊动记账与桌面），
+    /// 再过可见范围铁律，最后才动 PTY。
+    fn send(&self, grant: &Grant, request: &ControlRequest) -> ControlOutcome {
+        let Some(target_pane_id) = request.target_pane_id else {
+            return ControlError::BadRequest.into_outcome();
+        };
+        // 空正文即拒（见 [`PaneInput::assemble`]：裸回车是最顺手的代答姿势）。
+        let Some(input) = PaneInput::assemble(request.text.as_deref().unwrap_or_default()) else {
+            return ControlError::EmptyInput.into_outcome();
+        };
+        // 可见范围铁律走**共用**的那一条，别在这儿另写一遍。
+        let session = match self.resolve_target(grant, target_pane_id) {
+            Ok(s) => s,
+            Err(e) => return e.into_outcome(),
+        };
+        match self.actions().send_input(session.pane_id, input) {
+            Ok(delivered) => ok_outcome(&ControlData::Sent {
+                sent: SentView {
+                    pane_id: session.pane_id,
+                    bracketed_paste: delivered.bracketed_paste,
+                },
+            }),
+            Err(SendFailure::PaneGone) => ControlError::PaneGone.into_outcome(),
+            Err(SendFailure::WriteFailed) => ControlError::SendFailed.into_outcome(),
+            Err(SendFailure::DesktopBusy) => ControlError::DesktopBusy.into_outcome(),
+        }
+    }
 }
 
 /// trim 之后还剩东西的那一档；空串与全空白一律当没给。
@@ -1158,10 +1335,16 @@ struct ControlRequest {
     /// `start-session`：落在哪个项目；不给就是编排者自己那个。
     #[serde(default)]
     project_id: Option<String>,
-    /// 以某个乐手为目标的命令（工单 05~07）用它。
+    /// 以某个乐手为目标的命令（`send`，工单 06~07 的 wait / read 同款）用它。
     #[serde(default)]
-    #[allow(dead_code)] // 解析器先就位：线上形状两侧同时定稿，省得 05 再动一次 CLI
     target_pane_id: Option<u32>,
+    /// `send`：要写穿进去的正文。
+    ///
+    /// ⚠️ **这是用户项目里的内容**（编排者拿自己的上下文拼出来的 prompt）——
+    /// 与启动器的命令文本同一档待遇：不许进日志、不许进错误消息、不许出现在
+    /// 任何回执里（ADR 0002 的防线延伸）。
+    #[serde(default)]
+    text: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1173,6 +1356,8 @@ enum ControlData {
     Pane { pane: PaneView },
     /// `list-panes`：自己名下的全部乐手（含已经关掉的）。
     Panes { panes: Vec<PaneView> },
+    /// `send` 的回执。
+    Sent { sent: SentView },
 }
 
 #[derive(Debug, Serialize)]
@@ -1210,6 +1395,26 @@ struct PaneView {
     /// pane 还在桌面上吗。编排者退场不杀乐手，反过来乐手被用户关掉时这里就是
     /// `false` —— 记账留着，好让编排者看得见「我起的那个已经没了」。
     alive: bool,
+}
+
+/// `send` 的回执。
+///
+/// **刻意不复用 [`PaneView`]**：写穿之后那一瞬的 `status` 一定还是写之前的样子
+/// （agent 还没来得及反应），把它摆在回执里会诱导编排者把「刚发完还是 ai-idle」
+/// 读成「它干完了」。要看状态请走工单 06 的 `wait`。
+///
+/// ⚠️ 正文一个字都不回显 —— 那是用户项目里的内容（见 `ControlRequest::text`）。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SentView {
+    /// 写进了哪个乐手。
+    pane_id: u32,
+    /// 是不是当成一整块粘贴送进去的。
+    ///
+    /// 为 `false` 时目标终端此刻没开 bracketed paste（多半是那个 agent 已经退了、
+    /// pane 退回裸 shell），多行正文是逐行进去的 —— 中途的换行很可能已经把它
+    /// 提前发出去了。**如实告诉编排者**，让它自己决定要不要重来。
+    bracketed_paste: bool,
 }
 
 fn pane_view(session: &OrchestratedSession, liveness: &PaneLiveness) -> PaneView {
@@ -1265,6 +1470,15 @@ pub(crate) enum ControlError {
     PaneNotFound,
     /// 是自己起的乐手，但那个 pane 已经被关掉了。
     PaneGone,
+    // ── 工单 05 ──
+    /// `send` 给了空正文（或只有空白）。
+    ///
+    /// 单独一个码而不是并进 [`Self::BadRequest`]：它不是「请求拼错了」，
+    /// 而是一条**裁决** —— 裸回车就是替用户按确认，ADR 0003 的「attention 不代答」
+    /// 在这里堵住最顺手的那条代答姿势。给它自己的码，编排者才读得懂为什么被拒。
+    EmptyInput,
+    /// 找得到那个乐手，但正文没交到它的 PTY 手上。
+    SendFailed,
 }
 
 impl ControlError {
@@ -1285,19 +1499,21 @@ impl ControlError {
             Self::SelfTarget => "selfTarget",
             Self::PaneNotFound => "paneNotFound",
             Self::PaneGone => "paneGone",
+            Self::EmptyInput => "emptyInput",
+            Self::SendFailed => "sendFailed",
         }
     }
 
     fn status(self) -> u16 {
         match self {
             Self::MissingToken | Self::InvalidToken => 401,
-            Self::BadRequest => 400,
+            Self::BadRequest | Self::EmptyInput => 400,
             Self::UnknownCommand | Self::LauncherNotFound | Self::PaneNotFound => 404,
             Self::ProjectUnavailable | Self::RemoteProjectUnsupported => 409,
             Self::PayloadTooLarge => 413,
             Self::ProjectUnreachable | Self::SelfTarget => 403,
             Self::SessionLimitReached => 429,
-            Self::StartFailed => 500,
+            Self::StartFailed | Self::SendFailed => 500,
             Self::DesktopBusy => 503,
             Self::PaneGone => 410,
         }
@@ -1332,6 +1548,12 @@ impl ControlError {
             Self::SelfTarget => "an orchestrator cannot drive its own pane",
             Self::PaneNotFound => "no such orchestrated session",
             Self::PaneGone => "that orchestrated session's pane has been closed",
+            // 「不代答」那条铁律的用户可见面：说清为什么，别让它以为是拼错了。
+            Self::EmptyInput => {
+                "send needs a non-empty prompt; a bare Enter would be answering on the user's \
+                 behalf, which an orchestrator must not do"
+            }
+            Self::SendFailed => "the desktop could not deliver that input to the session",
         }
     }
 
@@ -1500,6 +1722,17 @@ mod tests {
         orchestrator_pane_id: u32,
     }
 
+    /// 一次 `send_input` 收到的东西：写给谁、装配成了什么样。
+    ///
+    /// **两份都抄下来**：装配是控制面的产出，真桌面挑哪一份只是一次布尔判断 ——
+    /// 把两份都钉住，等于把「写进 PTY 的那串字节」整个钉住。
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct SendCall {
+        pane_id: u32,
+        bracketed: String,
+        plain: String,
+    }
+
     /// 桌面动作的假实现：**记下收到的 spec**（裁决对不对，看它收到了什么），
     /// 按需要伪造失败，并把「起出来的乐手」登记成一个可以随手改死活的现场。
     #[derive(Default)]
@@ -1514,6 +1747,13 @@ mod tests {
         liveness: Mutex<HashMap<u32, PaneLiveness>>,
         /// 起会话时先睡这么久（测「阻塞命令不占 HTTP 线程」用）。
         delay: Mutex<Option<std::time::Duration>>,
+        /// 每次 `send_input` 收到的东西，按顺序。
+        sends: Mutex<Vec<SendCall>>,
+        /// 非 `None` 时 `send_input` 一律这么失败。
+        send_fail: Mutex<Option<SendFailure>>,
+        /// 目标终端开着 bracketed paste 吗。
+        /// `None` = 常态（乐手都是 AI TUI，一律开着）。
+        bracketed_paste: Mutex<Option<bool>>,
     }
 
     impl FakeActions {
@@ -1569,6 +1809,25 @@ mod tests {
             // 与真桌面同一条契约：先记账（`landed`），再谈回执。编排者的 tab
             // 标题由桌面侧查出来带进来，这里给一个固定的假名。
             Ok(spec.landed(pane_id, "大脑"))
+        }
+
+        /// 与真桌面同形：记下收到的装配结果，按目标终端的真实模式挑一份，
+        /// 并**如实**回报挑了哪份。
+        fn send_input(&self, pane_id: u32, input: PaneInput) -> Result<Delivered, SendFailure> {
+            if let Some(d) = *self.delay.lock() {
+                std::thread::sleep(d);
+            }
+            self.sends.lock().push(SendCall {
+                pane_id,
+                bracketed: input.bracketed().to_string(),
+                plain: input.plain().to_string(),
+            });
+            if let Some(err) = *self.send_fail.lock() {
+                return Err(err);
+            }
+            Ok(Delivered {
+                bracketed_paste: self.bracketed_paste.lock().unwrap_or(true),
+            })
         }
 
         fn pane_liveness(&self, pane_id: u32) -> PaneLiveness {
@@ -1669,6 +1928,22 @@ mod tests {
         (status, json(&body))
     }
 
+    /// `send` 一段正文。正文经 serde 转义 —— prompt 里带引号 / 反斜杠 / 换行
+    /// 是常态，手拼 JSON 字面量在这条命令上必错。
+    fn send(port: u16, token: &str, target: u32, text: &str) -> (u16, serde_json::Value) {
+        let text = serde_json::to_string(text).unwrap();
+        let payload = payload_of(token, &format!(r#""targetPaneId":{target},"text":{text}"#));
+        let (status, body) = post(port, "/control/send", &payload);
+        (status, json(&body))
+    }
+
+    /// 起一个乐手并把编号交出来（`send` 那一组测试的开场白）。
+    fn start_musician(port: u16, token: &str) -> u32 {
+        let (status, v) = start(port, token, r#""launcherId":"claude""#);
+        assert_eq!(status, 200, "{v}");
+        v["data"]["pane"]["paneId"].as_u64().unwrap() as u32
+    }
+
     // ─── 鉴权 fail-closed ─────────────────────────────────────
 
     /// 普通 pane 里跑 CLI：没有令牌 → 明确被拒（演示口径的另一半）。
@@ -1687,7 +1962,11 @@ mod tests {
     #[test]
     fn 坏令牌与伪造令牌一律被拒() {
         let (_plane, _host, _actions, port, token) = granted();
-        let forged = format!("{}0", &token[..token.len() - 1]); // 改最后一位
+        // 改最后一位。**必须真的改掉** —— 原来固定换成 '0',令牌本来就以 '0'
+        // 结尾时(十六进制,1/16 的概率)「伪造」的那枚与真令牌一模一样,
+        // 这条测试就会随机变红。
+        let last = token.chars().last().unwrap();
+        let forged = format!("{}{}", &token[..token.len() - 1], if last == '0' { '1' } else { '0' });
         for bad in ["", "not-a-token", forged.as_str()] {
             let payload = format!(r#"{{"token":"{bad}","paneId":7}}"#);
             let (status, body) = post(port, "/control/list-launchers", &payload);
@@ -2312,6 +2591,11 @@ mod tests {
                 drop(started); // 回执没送到
                 Err(StartFailure::DesktopBusy)
             }
+            fn send_input(&self, _pane_id: u32, _input: PaneInput) -> Result<Delivered, SendFailure> {
+                Ok(Delivered {
+                    bracketed_paste: true,
+                })
+            }
             fn pane_liveness(&self, pane_id: u32) -> PaneLiveness {
                 PaneLiveness {
                     alive: pane_id == 202,
@@ -2686,6 +2970,270 @@ mod tests {
         );
     }
 
+    // ─── send：写穿与 bracketed paste 装配（工单 05）────────────
+
+    /// 单行 prompt：装配成一整块粘贴 + **包裹之外**的一个回车。
+    ///
+    /// **单行也包 bracketed paste**，理由有三：① 一种形状一条路，「只有多行才包」
+    /// 会长出第二条只在少数情形下走到的分支；② 粘贴块里的正文对 TUI 而言是纯
+    /// 文本，单行 prompt 里出现的 `\t`、`\x1b` 之类同样被当字面量而不是热键；
+    /// ③ `mt_ai::tracker` 认得这对标记，整块 + 一个回车恰好被记成**一次**提交，
+    /// AI 会话身份与 marker 因此与用户亲手粘贴完全同形。
+    #[test]
+    fn 单行_prompt_装配成一块粘贴并跟一个回车() {
+        let (_plane, _host, actions, port, token) = granted();
+        let musician = start_musician(port, &token);
+
+        let (status, v) = send(port, &token, musician, "跑一下测试");
+        assert_eq!(status, 200, "{v}");
+        assert_eq!(v["data"]["sent"]["paneId"], musician);
+        assert_eq!(v["data"]["sent"]["bracketedPaste"], true);
+
+        let calls = actions.sends.lock().clone();
+        assert_eq!(calls.len(), 1, "立即写穿一次，不排队也不重发");
+        assert_eq!(calls[0].pane_id, musician);
+        assert_eq!(calls[0].bracketed, "\x1b[200~跑一下测试\x1b[201~\r");
+        assert_eq!(calls[0].plain, "跑一下测试\r");
+    }
+
+    /// 多行 prompt（含代码块）：整体一块送达，中途的换行**一个都不许**变成提交。
+    ///
+    /// 换行一律归一成 `\r`（PTY 那头把 `\n` 当「换行但不回车」，多行会出阶梯）——
+    /// 与 `mt_ui::terminal::input::paste_to_bytes` 同一口径。
+    #[test]
+    fn 多行_prompt_整块送达且回车在包裹之外() {
+        let (_plane, _host, actions, port, token) = granted();
+        let musician = start_musician(port, &token);
+
+        // 混着 LF 与 CRLF —— 编排者拼 prompt 时两种都可能出现
+        let prompt = "修一下这个：\n```rust\r\nfn main() {}\n```";
+        let (status, v) = send(port, &token, musician, prompt);
+        assert_eq!(status, 200, "{v}");
+
+        let calls = actions.sends.lock().clone();
+        assert_eq!(
+            calls[0].bracketed,
+            "\x1b[200~修一下这个：\r```rust\rfn main() {}\r```\x1b[201~\r"
+        );
+        assert_eq!(calls[0].plain, "修一下这个：\r```rust\rfn main() {}\r```\r");
+        // 裸 `\n` 一个都不许进 PTY
+        assert!(!calls[0].bracketed.contains('\n'), "换行没归一成 \\r");
+        // 回车在**结束标记之后**：包在里头只是往编辑框插一个换行，送不出去
+        assert!(calls[0].bracketed.ends_with("\x1b[201~\r"));
+    }
+
+    /// 正文末尾的换行删掉再补一个回车 —— 否则就是替编排者多按一次。
+    ///
+    /// LLM 拿 heredoc / 三引号拼 prompt 时结尾几乎总带一个换行，原样留着那一下
+    /// 在等确认的 TUI 里会被当成「确认」。
+    #[test]
+    fn 正文末尾的换行不会变成多按一次回车() {
+        let (_plane, _host, actions, port, token) = granted();
+        let musician = start_musician(port, &token);
+
+        assert_eq!(send(port, &token, musician, "干活\n\n").0, 200);
+        let calls = actions.sends.lock().clone();
+        assert_eq!(calls[0].bracketed, "\x1b[200~干活\x1b[201~\r");
+        assert_eq!(calls[0].plain, "干活\r");
+    }
+
+    /// 正文里的结束标记要剔掉：留着的话 prompt 自己就能把粘贴块提前截断，
+    /// 后半截变成真键入 —— 那正是本命令要防的事（`paste_to_bytes` 同款防线）。
+    #[test]
+    fn 正文里的结束标记被剔掉() {
+        let (_plane, _host, actions, port, token) = granted();
+        let musician = start_musician(port, &token);
+
+        assert_eq!(send(port, &token, musician, "前半\x1b[201~后半").0, 200);
+        let calls = actions.sends.lock().clone();
+        assert_eq!(calls[0].bracketed, "\x1b[200~前半后半\x1b[201~\r");
+        assert_eq!(
+            calls[0].bracketed.matches("\x1b[201~").count(),
+            1,
+            "结束标记只许有装配加上的那一个"
+        );
+    }
+
+    /// 目标终端没开 bracketed paste（agent 退了、pane 退回裸 shell）时**如实说**：
+    /// 那段多行是逐行进去的，编排者需要知道。
+    #[test]
+    fn 目标没开粘贴模式时如实告知() {
+        let (_plane, _host, actions, port, token) = granted();
+        let musician = start_musician(port, &token);
+        *actions.bracketed_paste.lock() = Some(false);
+
+        let (status, v) = send(port, &token, musician, "第一行\n第二行");
+        assert_eq!(status, 200, "{v}");
+        assert_eq!(
+            v["data"]["sent"]["bracketedPaste"], false,
+            "不许粉饰成整块送达"
+        );
+        // 装配照旧两份都备着，桌面侧挑的是裸的那一份
+        let calls = actions.sends.lock().clone();
+        assert_eq!(calls[0].plain, "第一行\r第二行\r");
+    }
+
+    /// [`PaneInput::bytes`] 就是桌面侧那一次布尔判断。
+    #[test]
+    fn 按目标模式挑一份() {
+        let input = PaneInput::assemble("一行").unwrap();
+        assert_eq!(input.bytes(true), input.bracketed());
+        assert_eq!(input.bytes(false), input.plain());
+        assert_eq!(input.bytes(true), "\x1b[200~一行\x1b[201~\r");
+        assert_eq!(input.bytes(false), "一行\r");
+        // 正文一个字都不许出现在 Debug 里（它会进日志 / panic 消息）
+        assert!(!format!("{input:?}").contains("一行"));
+    }
+
+    /// **可见范围铁律**：向非自启 pane 写穿一律「不存在」语义，且不惊动桌面端。
+    #[test]
+    fn 向非自启_pane_写穿被拒() {
+        let (plane, _host, actions, port, token) = granted();
+        let mine = start_musician(port, &token);
+
+        // 另一个编排者的乐手
+        let other = plane.grant(9, "p-self");
+        let payload = format!(r#"{{"token":"{other}","paneId":9,"launcherId":"claude"}}"#);
+        let (_s, body) = post(port, "/control/start-session", &payload);
+        let theirs = json(&body)["data"]["pane"]["paneId"].as_u64().unwrap() as u32;
+
+        actions.sends.lock().clear();
+        // 别人的乐手 / 别人的编排者 pane / 编造的编号 —— 同一个「不存在」
+        for target in [theirs, 9, 4242] {
+            let (status, v) = send(port, &token, target, "干活");
+            assert_eq!(status, 404, "target={target}: {v}");
+            assert_eq!(v["error"]["code"], "paneNotFound", "target={target}");
+        }
+        // 自指禁令有自己的码（自己的身份本来就钉在环境里，能自我纠正）
+        let (status, v) = send(port, &token, 7, "干活");
+        assert_eq!(status, 403, "{v}");
+        assert_eq!(v["error"]["code"], "selfTarget");
+
+        assert!(
+            actions.sends.lock().is_empty(),
+            "被拒的写穿一个字节都不许落到桌面端"
+        );
+        // 自己的乐手照旧写得进去（上面几条不是把整条路封死了）
+        assert_eq!(send(port, &token, mine, "干活").0, 200);
+    }
+
+    /// 自己的乐手但 pane 已经关了：这条**可以**说清楚。
+    #[test]
+    fn 写穿已关的乐手得到_pane_gone() {
+        let (_plane, _host, actions, port, token) = granted();
+        let musician = start_musician(port, &token);
+        actions.close(musician);
+
+        let (status, v) = send(port, &token, musician, "干活");
+        assert_eq!(status, 410, "{v}");
+        assert_eq!(v["error"]["code"], "paneGone");
+        assert!(actions.sends.lock().is_empty());
+    }
+
+    /// 空正文被拒 —— 裸回车就是替用户按确认，而「attention 不代答」是 ADR 0003
+    /// 的铁律。给它专门的码，编排者才读得懂为什么被拒。
+    #[test]
+    fn 空正文被拒且不惊动桌面端() {
+        let (_plane, _host, actions, port, token) = granted();
+        let musician = start_musician(port, &token);
+        actions.sends.lock().clear();
+
+        for text in ["", "   ", "\n\n", "\r\n", " \t "] {
+            let (status, v) = send(port, &token, musician, text);
+            assert_eq!(status, 400, "text={text:?}: {v}");
+            assert_eq!(v["error"]["code"], "emptyInput", "text={text:?}");
+        }
+        // 文案要讲清为什么，而不是一句「参数不对」
+        let (_s, v) = send(port, &token, musician, "");
+        let message = v["error"]["message"].as_str().unwrap();
+        assert!(message.contains("orchestrator"), "得说清是哪条规矩: {message}");
+        assert!(!message.contains("musician"), "用户可见文案不许出现口语别名");
+
+        assert!(actions.sends.lock().is_empty());
+        // 不给 targetPaneId 是另一回事：那是请求本身拼错了
+        let (status, v) = post(port, "/control/send", &payload_of(&token, r#""text":"干活""#));
+        assert_eq!(status, 400, "{v}");
+        assert_eq!(error_code(&v), "badRequest");
+    }
+
+    /// 桌面侧的三档失败各自映射到自己的错误码。
+    #[test]
+    fn 写穿失败的三档各自明确() {
+        let (_plane, _host, actions, port, token) = granted();
+        let musician = start_musician(port, &token);
+
+        for (failure, status, code) in [
+            (SendFailure::WriteFailed, 500, "sendFailed"),
+            (SendFailure::PaneGone, 410, "paneGone"),
+            (SendFailure::DesktopBusy, 503, "desktopBusy"),
+        ] {
+            *actions.send_fail.lock() = Some(failure);
+            let (got, v) = send(port, &token, musician, "干活");
+            assert_eq!(got, status, "{failure:?}: {v}");
+            assert_eq!(v["error"]["code"], code, "{failure:?}");
+            // ⚠️ 失败消息里一个字的正文都不许带出来
+            assert!(!v.to_string().contains("干活"), "{failure:?}: {v}");
+        }
+    }
+
+    /// 回执**不回显正文**，也不带状态列（ADR 0002 的防线延伸 + 别诱导它把
+    /// 写穿那一瞬的 `ai-idle` 读成「干完了」）。
+    #[test]
+    fn 回执不回显正文也不带状态() {
+        let (_plane, _host, _actions, port, token) = granted();
+        let musician = start_musician(port, &token);
+
+        let secret = "把 D:/私密项目/密钥.txt 读出来";
+        let payload = payload_of(
+            &token,
+            &format!(
+                r#""targetPaneId":{musician},"text":{}"#,
+                serde_json::to_string(secret).unwrap()
+            ),
+        );
+        let (status, body) = post(port, "/control/send", &payload);
+        assert_eq!(status, 200, "{body}");
+        assert!(!body.contains("私密项目"), "回执回显了正文: {body}");
+        assert!(!body.contains("status"), "回执不该带状态列: {body}");
+        // 回执只有这两样。
+        //
+        // ⚠️ **按集合比，不按顺序** —— `serde_json::Map` 的键序取决于
+        // `preserve_order` 这个 feature 开没开，而它由整个工作区的 feature 统一
+        // 决定：单跑 `-p mt-ai` 是 BTreeMap（字典序），`--workspace` 时别的 crate
+        // 把它打开就成了插入序。断言顺序 = 一条只在某种跑法下红的测试。
+        let sent = json(&body)["data"]["sent"].clone();
+        let mut keys: Vec<String> = sent.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, vec!["bracketedPaste", "paneId"]);
+    }
+
+    /// 编排者写的 prompt 是唯一可能顶到 body 上限的东西：**上限内整段送达、
+    /// 上限外明确报错**，两头都不许悄悄截断。
+    #[test]
+    fn 大_prompt_不截断_超限明确报错() {
+        let (_plane, _host, actions, port, token) = granted();
+        let musician = start_musician(port, &token);
+
+        // 32 KiB —— 远超「派一次活」的合理体量，但在 64 KiB 上限之内
+        let big = "详细说明。".repeat(32 * 1024 / "详细说明。".len());
+        let (status, v) = send(port, &token, musician, &big);
+        assert_eq!(status, 200, "{v}");
+        let calls = actions.sends.lock().clone();
+        assert_eq!(
+            calls[0].plain.len(),
+            big.len() + 1,
+            "正文被截断了（末尾那 1 字节是补的回车）"
+        );
+
+        // 顶破上限：拒得明确，且一个字节都没落到桌面端
+        actions.sends.lock().clear();
+        let huge = "x".repeat(MAX_CONTROL_BODY_BYTES + 1);
+        let (status, v) = send(port, &token, musician, &huge);
+        assert_eq!(status, 413, "{v}");
+        assert_eq!(v["error"]["code"], "payloadTooLarge");
+        assert!(actions.sends.lock().is_empty(), "超限的正文不许写出去半截");
+    }
+
     // ─── 记账修剪 ─────────────────────────────────────────────
 
     /// 直接往记账表里塞一条（绕开 HTTP 与并发上限，专测修剪口径）。
@@ -2804,23 +3352,32 @@ mod tests {
         let names: Vec<&str> = Command::ALL.iter().map(|c| c.name()).collect();
         assert_eq!(
             names,
-            vec!["list-launchers", "list-projects", "start-session", "list-panes"]
+            vec![
+                "list-launchers",
+                "list-projects",
+                "start-session",
+                "list-panes",
+                "send"
+            ]
         );
         // 认不出的一律 None（带查询串 / 多层路径的别去猜）
-        for bad in ["", "start-session?x=1", "start-session/extra", "wait"] {
+        for bad in ["", "send?x=1", "send/extra", "wait"] {
             assert_eq!(Command::parse(bad), None, "{bad}");
         }
     }
 
-    /// 阻塞属性登记在命令表上：只有起乐手要回主线程，其余就地答完。
+    /// 阻塞属性登记在命令表上：要回主线程的那些登记齐了，其余就地答完。
+    ///
+    /// `send` 要回主线程走 `AppStore::write_to_pane`（写 PTY 是 gpui 实体上的活），
+    /// 漏登记就会把 hook 上报那条队一起卡住 —— 正是这张表要防的事。
     #[test]
-    fn 只有起乐手会阻塞主线程() {
+    fn 要回主线程的命令都登记在阻塞表里() {
         let blocking: Vec<&str> = Command::ALL
             .iter()
             .filter(|c| c.blocks_on_desktop())
             .map(|c| c.name())
             .collect();
-        assert_eq!(blocking, vec!["start-session"]);
+        assert_eq!(blocking, vec!["start-session", "send"]);
     }
 
     // ─── 阻塞命令不占 HTTP 线程 ───────────────────────────────

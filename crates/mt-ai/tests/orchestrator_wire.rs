@@ -12,11 +12,13 @@
 use std::sync::Arc;
 
 use mt_ai::control::{
-    AiSessionState, ControlLauncher, ControlPlane, ControlProject, OrchestratorActions,
-    OrchestratorHost, PaneLiveness, StartFailure, StartSessionSpec, StartedSession,
+    AiSessionState, ControlLauncher, ControlPlane, ControlProject, Delivered, OrchestratorActions,
+    OrchestratorHost, PaneInput, PaneLiveness, SendFailure, StartFailure, StartSessionSpec,
+    StartedSession,
 };
 use mt_agent_control::{
-    ControlRequest, Identity, parse_launchers, parse_panes, parse_projects, parse_started_pane,
+    ControlRequest, Identity, parse_launchers, parse_panes, parse_projects, parse_send_receipt,
+    parse_started_pane,
 };
 
 /// 桌面能力的假宿主(与 mt-app 那份真实现同形)。
@@ -79,6 +81,16 @@ impl OrchestratorActions for Actions {
         assert_eq!(spec.orchestrator_pane_id(), 7);
         // 记账先落地、再谈回执 —— `landed` 是造出 `StartedSession` 的唯一路径
         Ok(spec.landed(101, "大脑"))
+    }
+
+    /// 与 mt-app 那份真实现同形:按目标终端的真实模式挑一份,如实回报挑了哪份。
+    /// 这里的乐手是个正常的 AI TUI(开着 bracketed paste)。
+    fn send_input(&self, _pane_id: u32, input: PaneInput) -> Result<Delivered, SendFailure> {
+        // 桌面侧唯一要做的判断就是这一次挑选
+        assert!(input.bytes(true).starts_with("\u{1b}[200~"));
+        Ok(Delivered {
+            bracketed_paste: true,
+        })
     }
 
     fn pane_liveness(&self, _pane_id: u32) -> PaneLiveness {
@@ -194,6 +206,67 @@ fn 乐手名单能被_sidecar_解析器读懂() {
     assert_eq!(panes[0].launcher_name, "Claude");
 }
 
+/// `send` 的回执:请求方向(CLI 构造带 targetPaneId + text 的体)与响应方向
+/// (handler 的写穿回执)各走一遍真代码。
+#[test]
+fn 写穿回执能被_sidecar_解析器读懂() {
+    let (plane, identity, _body) = granted();
+    // 先起一个乐手 —— 可见范围铁律要求目标必须是自己起的
+    let start =
+        serde_json::to_string(&ControlRequest::start_session(&identity, "claude", None)).unwrap();
+    assert_eq!(plane.handle("start-session", &start).status, 200);
+
+    // 多行正文(含代码块)走一遍真的线上形状:CLI 侧的请求体构造 → 桌面 handler
+    let prompt = "修一下这个:\n```rust\nfn main() {}\n```";
+    let body = serde_json::to_string(&ControlRequest::send(&identity, 101, prompt)).unwrap();
+    let outcome = plane.handle("send", &body);
+    assert_eq!(outcome.status, 200, "{}", outcome.body);
+
+    let sent = parse_send_receipt(outcome.status, &outcome.body)
+        .expect("sidecar 的解析器必须读得懂桌面 handler 的产出");
+    assert_eq!(sent.pane_id, 101);
+    assert!(sent.bracketed_paste, "整块粘贴这一位要透到 CLI 侧");
+    // 正文一个字都不许回显(ADR 0002 的防线延伸到编排者写的 prompt)
+    assert!(
+        !outcome.body.contains("fn main"),
+        "回执回显了正文: {}",
+        outcome.body
+    );
+}
+
+/// 工单 05 新增的两个错误码两侧一致。
+#[test]
+fn 写穿的错误码两侧一致() {
+    let (plane, identity, _body) = granted();
+    let start =
+        serde_json::to_string(&ControlRequest::start_session(&identity, "claude", None)).unwrap();
+    assert_eq!(plane.handle("start-session", &start).status, 200);
+
+    // 空正文:裸回车就是替用户按确认(ADR 0003 的「不代答」)
+    let body = serde_json::to_string(&ControlRequest::send(&identity, 101, "  \n ")).unwrap();
+    let err = parse_send_receipt(200, &plane.handle("send", &body).body).unwrap_err();
+    assert_eq!(err.code, "emptyInput");
+    assert!(!err.is_denied(), "不是鉴权问题");
+    assert!(!err.is_desktop_unavailable(), "也不是够不着");
+    assert!(
+        !err.message.contains("musician"),
+        "用户可见文案一律用 orchestrated session(术语表)"
+    );
+
+    // 不是自己起的乐手 —— 统一的「不存在」语义
+    let body = serde_json::to_string(&ControlRequest::send(&identity, 4242, "干活")).unwrap();
+    let outcome = plane.handle("send", &body);
+    let err = parse_send_receipt(outcome.status, &outcome.body).unwrap_err();
+    assert_eq!(err.code, "paneNotFound");
+    assert_eq!(err.status, 404);
+
+    // 自指禁令
+    let body = serde_json::to_string(&ControlRequest::send(&identity, 7, "干活")).unwrap();
+    let outcome = plane.handle("send", &body);
+    let err = parse_send_receipt(outcome.status, &outcome.body).unwrap_err();
+    assert_eq!(err.code, "selfTarget");
+}
+
 /// 工单 03 新增的错误码两侧一致 —— CLI 按 code 分档退出码,漂移了就只剩
 /// 「反正失败了」。
 #[test]
@@ -260,9 +333,11 @@ fn 被拒响应的错误码两侧一致() {
     assert_eq!(err.code, "invalidToken");
     assert!(err.is_denied());
 
-    // 未知命令(CLI 比桌面端新时的样子:CLI 发了一条这边还不认识的命令)
+    // 未知命令(CLI 比桌面端新时的样子:CLI 发了一条这边还不认识的命令)。
+    // ⚠️ 这里的命令名必须是**永远不会被实现**的那种:原来写的是 `send`,
+    // 工单 05 把它做出来之后这条测试就成了「send 居然是未知命令」。
     let (plane, _id, body) = granted();
-    let outcome = plane.handle("send", &body);
+    let outcome = plane.handle("no-such-command", &body);
     let err = parse_launchers(outcome.status, &outcome.body).unwrap_err();
     assert_eq!(err.code, "unknownCommand");
     assert!(!err.is_denied(), "命令不认识不是鉴权问题");
