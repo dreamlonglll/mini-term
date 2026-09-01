@@ -14,9 +14,10 @@ use crate::tree::{
     AiSessionRef, DropZone, PaneState, PaneStatus, ProjectPanel, SplitDirection, SplitNode,
 };
 
+use super::launch::{LaunchPlacement, LaunchRequest};
 use super::pure::{
-    next_maximized, resolve_auto_resume_command, resolve_resume_cwd, resolve_scrollback,
-    terminal_style_from,
+    merge_internal_env, next_maximized, resolve_auto_resume_command, resolve_resume_cwd,
+    resolve_scrollback, terminal_style_from,
 };
 use super::AppStore;
 
@@ -43,12 +44,13 @@ impl AppStore {
     /// 启动器是 `{名称, shell(可选), 命令}` 的具名条目(见 [`mt_config::AiLauncher`]),
     /// 桌面端与移动端**共用同一份配置**;这里是桌面端那条触发路径。
     ///
-    /// 与移动端发起会话(`mobile_relay::MobileRelayBridge::try_start_session`)的区别
-    /// 只在落点与善后:那边刻意用 `append_pane_background` 不抢焦点、要回执、要弹
-    /// 审计 toast;桌面端是人自己点的,照常走 [`new_terminal`] 把焦点带过去,
-    /// 不回执也不弹 toast。**改这里时记得看一眼那边**,两条路径共用启动器语义。
+    /// 落地动作(校验 → 建 pane → 写启动命令)住在共享入口
+    /// [`launch_ai_session`],桌面端与移动端/编排者共用同一条;这里只挑落点
+    /// ([`LaunchPlacement::Tab`]:锚点叶子的 tab 栏 + 抢焦点)、不注入内部
+    /// 环境变量、不要诞生提示,并把失败收敛回 `None`(三个界面调用点都不看
+    /// 返回值,写不进命令时 pane 照样留着)。
     ///
-    /// [`new_terminal`]: Self::new_terminal
+    /// [`launch_ai_session`]: Self::launch_ai_session
     pub fn new_terminal_from_launcher(
         &mut self,
         project_id: &str,
@@ -57,13 +59,23 @@ impl AppStore {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<String> {
-        // 绑定的 shell 被删掉时退回默认 —— 总比不开好,用户在桌面看得到实情
-        // (判据与移动端那条同一个 `resolve_shell`)
-        let shell = self.resolve_shell(launcher.shell.as_deref())?;
-        let pane_id = self.new_terminal(project_id, Some(shell), anchor_pane_id, window, cx)?;
-        self.rename_pane(project_id, &pane_id, &launcher.name, cx);
-        self.write_launcher_command(project_id, &pane_id, &launcher.command, cx);
-        Some(pane_id)
+        self.launch_ai_session(
+            LaunchRequest {
+                project_id,
+                launcher_name: &launcher.name,
+                // 绑定的 shell 被删掉时退回默认 —— 总比不开好,用户在桌面看得到
+                // 实情(共享入口里那一个 `resolve_shell`,与移动端同一条)
+                shell_name: launcher.shell.as_deref(),
+                command: &launcher.command,
+                placement: LaunchPlacement::Tab { anchor_pane_id },
+                env: Vec::new(),
+                notice: None,
+            },
+            window,
+            cx,
+        )
+        .ok()
+        .map(|outcome| outcome.pane_id)
     }
 
     /// 新建一个终端**面板**并按 AI 启动器把 agent 拉起来。
@@ -77,32 +89,21 @@ impl AppStore {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<String> {
-        let shell = self.resolve_shell(launcher.shell.as_deref())?;
-        let pane_id = self.new_panel(project_id, Some(shell), window, cx)?;
-        self.rename_pane(project_id, &pane_id, &launcher.name, cx);
-        self.write_launcher_command(project_id, &pane_id, &launcher.command, cx);
-        Some(pane_id)
-    }
-
-    /// 把启动器命令连同回车写进 pane。
-    ///
-    /// ⚠️ 必须走 [`write_to_pane`] 而不是裸 PTY 写:AI 会话身份靠**输入检测**建立,
-    /// 只有「往 shell 里敲进启动命令并回车」这条路能让 pane 进入 AI 会话状态。
-    /// 把 AI CLI 当成 PTY 根程序 spawn(`shell -c "claude"`)会绕开检测,拿不到
-    /// 状态徽章与对话镜像 —— 这是 ADR 0002 定下的纪律,别改。
-    ///
-    /// PTY 内核缓冲 stdin,shell 就绪前写入不丢(与移动端发起会话同一时序)。
-    /// 写不进去时**保留 pane**:用户回头能看到它卡在哪。
-    ///
-    /// [`write_to_pane`]: Self::write_to_pane
-    fn write_launcher_command(
-        &mut self,
-        project_id: &str,
-        pane_id: &str,
-        command: &str,
-        cx: &mut Context<Self>,
-    ) {
-        self.write_to_pane(project_id, pane_id, &format!("{command}\r"), cx);
+        self.launch_ai_session(
+            LaunchRequest {
+                project_id,
+                launcher_name: &launcher.name,
+                shell_name: launcher.shell.as_deref(),
+                command: &launcher.command,
+                placement: LaunchPlacement::Panel,
+                env: Vec::new(),
+                notice: None,
+            },
+            window,
+            cx,
+        )
+        .ok()
+        .map(|outcome| outcome.pane_id)
     }
 
     /// 新建终端并指定启动目录。
@@ -121,9 +122,29 @@ impl AppStore {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<String> {
+        self.new_terminal_with_env(project_id, shell, anchor_pane_id, cwd, &[], window, cx)
+    }
+
+    /// [`new_terminal_with_cwd`] 再加一份**应用内部**环境变量。
+    ///
+    /// 单独一个入口只为把 `extra_env` 递到 [`spawn_pane`] —— 界面上那几个
+    /// 「新建终端」调用点一律走上面那个无 env 的门面,签名一字不变。
+    ///
+    /// [`new_terminal_with_cwd`]: Self::new_terminal_with_cwd
+    /// [`spawn_pane`]: Self::spawn_pane
+    pub(super) fn new_terminal_with_env(
+        &mut self,
+        project_id: &str,
+        shell: Option<ShellConfig>,
+        anchor_pane_id: Option<String>,
+        cwd: Option<String>,
+        extra_env: &[(String, String)],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
         let project = self.project(project_id)?.clone();
         let shell = shell.or_else(|| self.resolve_shell(None))?;
-        let pane = self.spawn_pane(&project, &shell, cwd, window, cx)?;
+        let pane = self.spawn_pane(&project, &shell, cwd, extra_env, window, cx)?;
         let pane_id = pane.id.clone();
 
         let anchor = anchor_pane_id.or_else(|| self.focused_pane_id.clone());
@@ -192,7 +213,8 @@ impl AppStore {
             .map(|p| p.shell_name.clone());
         let shell = self.resolve_shell(shell_name.as_deref())?;
 
-        let pane = self.spawn_pane(&project, &shell, source_cwd, window, cx)?;
+        // 分屏是「照着源 pane 再开一个」,不带任何调用方注入的内部变量
+        let pane = self.spawn_pane(&project, &shell, source_cwd, &[], window, cx)?;
         let new_pane_id = pane.id.clone();
         let new_leaf = SplitNode::leaf(pane);
 
@@ -674,7 +696,7 @@ impl AppStore {
             // pane 自己的 cwd 优先,会话 cwd 兜底
             let start_cwd = item.cwd.clone().or_else(|| resume_cwd.clone());
 
-            let pty_id = self.start_pty(&project, &shell, start_cwd.as_deref(), cx);
+            let pty_id = self.start_pty(&project, &shell, start_cwd.as_deref(), &[], cx);
             if let Some(state) = self.project_states.get_mut(project_id)
                 && let Some(pane) = state.pane_mut(&item.pane_id)
             {
@@ -717,16 +739,21 @@ impl AppStore {
     }
 
     /// 起 PTY 并拼出 `PaneState`。
+    ///
+    /// `extra_env` 是**应用内部**环境变量(`MINITERM_` 保留前缀),并进
+    /// [`mt_pty::PtySpawn::env`];普通新建/分屏一律传 `&[]`,只有
+    /// [「按启动器起会话」共享入口](Self::launch_ai_session)会往里塞东西。
     // 拆分前是私有方法;调用点在 `store::layout`(挂后台 pane / 新建面板),升到 `pub(super)`。
     pub(super) fn spawn_pane(
         &mut self,
         project: &ProjectConfig,
         shell: &ShellConfig,
         cwd_override: Option<String>,
+        extra_env: &[(String, String)],
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<PaneState> {
-        let pty_id = self.start_pty(project, shell, cwd_override.as_deref(), cx);
+        let pty_id = self.start_pty(project, shell, cwd_override.as_deref(), extra_env, cx);
         let mut pane = PaneState::new(shell.name.clone());
         pane.pty_id = Some(pty_id);
         pane.cwd = cwd_override;
@@ -743,6 +770,7 @@ impl AppStore {
         project: &ProjectConfig,
         shell: &ShellConfig,
         cwd_override: Option<&str>,
+        extra_env: &[(String, String)],
         cx: &mut Context<Self>,
     ) -> u32 {
         let pty_id = self.next_pty_id;
@@ -759,6 +787,9 @@ impl AppStore {
         if hook_port > 0 {
             env.push(("MINITERM_HOOK_PORT".to_string(), hook_port.to_string()));
         }
+        // 调用方要求注入的内部变量(编排令牌之类)并进同一条通道;上面两条
+        // 顶不掉,判据与顺序见 `merge_internal_env`。既有调用点全传 `&[]`。
+        let env = merge_internal_env(env, extra_env);
 
         // SSH 远程分支:直接 spawn `ssh` 作 PTY 子进程(不经本地 shell,对齐 WSL
         // 启动器重写模式)。本地 cwd 用兜底目录 —— 远程目录由 ssh 的远端命令

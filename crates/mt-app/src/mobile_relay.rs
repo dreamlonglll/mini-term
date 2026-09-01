@@ -56,7 +56,7 @@ use parking_lot::Mutex;
 
 use crate::ai::AiBridge;
 use crate::i18n::tr;
-use crate::store::AppStore;
+use crate::store::{AppStore, LaunchError, LaunchNotice, LaunchPlacement, LaunchRequest};
 use crate::tree::PaneStatus;
 
 /// 结构同步的去抖(原版 `mobileSessionSync.ts:101` 的 150ms)。
@@ -120,6 +120,18 @@ fn to_relay_project(p: &ProjectConfig) -> RelayProject {
     RelayProject {
         path: p.path.clone(),
         ssh_connection_id: p.ssh_connection_id.clone(),
+    }
+}
+
+/// 共享入口的失败原因 → 中转协议的回执原因。
+///
+/// [`AppStore::launch_ai_session`] 刻意不认识中转协议的类型(它还要给编排控制面
+/// 用,那边有自己的错误集),映射落在这一层。回执是闭集枚举、不带自由文本 ——
+/// 失败消息一律不带命令原文(ADR 0002)。
+fn start_session_fail_reason(err: LaunchError) -> StartSessionFailReason {
+    match err {
+        LaunchError::ProjectNotFound => StartSessionFailReason::ProjectNotFound,
+        LaunchError::SpawnFailed => StartSessionFailReason::SpawnFailed,
     }
 }
 
@@ -633,86 +645,54 @@ impl RelayBridge {
     /// `Result` 的每一条 `?` 早退都由调用方兜住回执 —— 这正是把它拆成内层函数
     /// 的原因(原版 5 处失败分支 + 1 处成功**全都**手动调了 `reportResult`,
     /// GPUI 侧用 `?` 极容易漏)。
+    ///
+    /// 步 1~9 那一整套落地动作已经搬进[共享入口](AppStore::launch_ai_session)
+    /// (桌面端新终端菜单与编排控制面共用同一条);这里只剩三件移动端自己的事:
+    /// 挑 `Background` 落点(不抢焦点不切项目)、给出诞生提示的文案、
+    /// 把结局折成中转协议的回执。
     fn try_start_session(
         &mut self,
         payload: &StartSessionPayload,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<String, StartSessionFailReason> {
-        // 1. 项目还在吗。mt-relay 侧已经校验过一遍,但从校验到执行之间用户
-        //    可能刚好把项目移除了,所以 ProjectNotFound 这一档必须保留
-        let shell = {
-            let store = self.store.read(cx);
-            if store.project(&payload.project_id).is_none() {
-                return Err(StartSessionFailReason::ProjectNotFound);
-            }
-            // 2. shell:启动器绑定的 → default_shell → 列表首项。
-            //    绑定的 shell 被删掉时退回默认 —— 总比不开好,用户在桌面能看到实情。
-            // 3. 一个 shell 都没配:开不出终端,也没有能写进布局的 shellName
-            store
-                .resolve_shell(payload.shell_name.as_deref())
-                .ok_or(StartSessionFailReason::SpawnFailed)?
-        };
-
-        // 4~7. 建 PTY + 建 pane + 挂进最左侧叶子末尾(不激活、不抢焦点、不切项目)。
-        //      customTitle 用启动器名:回到电脑前一眼看出这个标签是什么。
-        let pane_id = self
+        let outcome = self
             .store
             .update(cx, |store, cx| {
-                store.append_pane_background(
-                    &payload.project_id,
-                    shell,
-                    Some(payload.launcher_name.clone()),
+                store.launch_ai_session(
+                    LaunchRequest {
+                        project_id: &payload.project_id,
+                        launcher_name: &payload.launcher_name,
+                        shell_name: payload.shell_name.as_deref(),
+                        command: &payload.command,
+                        // 挂进最左侧叶子末尾:不激活、不抢焦点、不切项目
+                        placement: LaunchPlacement::Background,
+                        // 移动端发起不注入任何内部变量(编排令牌是编排者那条路的事)
+                        env: Vec::new(),
+                        // 桌面端 toast:凭证被盗时这是唯一的审计迹象,所以即便
+                        // 不切过去也要弹。走自建 toast 层的 `mobile-session` 档
+                        // (info 图标 + 点击切项目,原版 `mobileStartSession.ts:122-127`)
+                        notice: Some(LaunchNotice {
+                            kind: crate::notify::ToastKind::MobileSession,
+                            message: tr!(
+                                "app",
+                                "mobileStartSession",
+                                launcher = payload.launcher_name.clone()
+                            ),
+                        }),
+                    },
                     window,
                     cx,
                 )
             })
-            .ok_or(StartSessionFailReason::SpawnFailed)?;
+            .map_err(start_session_fail_reason)?;
 
-        // 8. 写启动命令 + 回车。AI 会话身份靠输入检测建立,只有「往 shell 里敲进
-        //    启动命令并回车」这条路能让 pane 进入 AI 会话状态。
-        //    写不进去时**保留 pane**:用户回桌面能看到它卡在哪。
-        //
-        //    ⚠️ `TerminalPane::write` 没有 PTY 时是**静默丢弃**的(返回值只说明
-        //    「找到了那个终端实体」),所以还要单独问一句 PTY 起来了没 ——
-        //    否则 shell 路径失效时手机会拿到成功回执然后干等 15s 超时。
-        let data = format!("{}\r", payload.command);
-        let (written, alive) = self.store.update(cx, |store, cx| {
-            let written = store.write_to_pane(&payload.project_id, &pane_id, &data, cx);
-            let alive = store
-                .project_state(&payload.project_id)
-                .and_then(|s| s.pane(&pane_id))
-                .and_then(|p| p.pty_id)
-                .is_some_and(|pty_id| store.pane_pty_alive(pty_id, cx));
-            (written, alive)
-        });
-        if !written || !alive {
+        // pane 建成了但命令没交到活着的 PTY 手上 —— 对手机而言这就是失败
+        // (pane 本身**保留不杀**,用户回桌面能看到它卡在哪)。
+        if !outcome.command_delivered() {
             return Err(StartSessionFailReason::SpawnFailed);
         }
-
-        // 9. 桌面端 toast。凭证被盗时这是唯一的审计迹象,所以即便不切过去也要弹。
-        //    走自建 toast 层的 `mobile-session` 档:info 图标 + 点击切项目
-        //    (原版 `mobileStartSession.ts:122-127` 就是这一档)。**不去重** ——
-        //    连开两个会话该看到两条,原版这条也是裸 `pushNotification`。
-        //    项目名由标题行展示,正文只补启动器名。
-        let project_name = self
-            .store
-            .read(cx)
-            .project(&payload.project_id)
-            .map(|p| p.name.clone())
-            .unwrap_or_default();
-        crate::toast::push_message(
-            crate::notify::ToastKind::MobileSession,
-            payload.project_id.clone(),
-            project_name,
-            tr!(
-                "app",
-                "mobileStartSession",
-                launcher = payload.launcher_name.clone()
-            ),
-            cx,
-        );
-        Ok(pane_id)
+        Ok(outcome.pane_id)
     }
 
     fn apply_signal(&mut self, signal: RelaySignal, window: &mut Window, cx: &mut Context<Self>) {
@@ -939,6 +919,23 @@ mod tests {
             &facet2.path,
             facet2.ssh_connection_id.as_deref()
         ));
+    }
+
+    // ── 共享入口的失败原因 → 中转回执 ───────────────────────
+
+    /// 两档失败各自映射到自己的回执原因,**不许并成一档**:
+    /// 手机侧对 `projectNotFound`(刷新项目列表)与 `spawnFailed`(去桌面看
+    /// 那个 pane 卡在哪)的处置不同。
+    #[test]
+    fn 共享入口的失败原因逐档映射成回执() {
+        assert_eq!(
+            start_session_fail_reason(LaunchError::ProjectNotFound),
+            StartSessionFailReason::ProjectNotFound
+        );
+        assert_eq!(
+            start_session_fail_reason(LaunchError::SpawnFailed),
+            StartSessionFailReason::SpawnFailed
+        );
     }
 
     // ── relayHttpBase 四种前缀 ──────────────────────────────
