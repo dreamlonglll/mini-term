@@ -106,20 +106,10 @@ impl MirrorParser {
 
     fn parse_line(&mut self, line: &str, out: &mut Vec<MirrorMessage>) {
         match self.agent {
-            // Claude 一行可产出多条(说明文字 + 提问卡片 / 作答标记 + 用户输入)
+            // Claude/Codex 一行可产出多条(说明文字 + 提问卡片 / 作答标记 + 用户输入)
             MirrorAgent::Claude => self.parse_claude_line(line, out),
-            MirrorAgent::Codex => {
-                if let Some(raw) = ai_sessions::codex_message_from_line(line) {
-                    let msg = self.next_text_message(raw);
-                    out.push(msg);
-                }
-            }
-            MirrorAgent::Grok => {
-                if let Some(raw) = self.grok.as_mut().and_then(|g| g.feed_line(line)) {
-                    let msg = self.next_text_message(raw);
-                    out.push(msg);
-                }
-            }
+            MirrorAgent::Codex => self.parse_codex_line(line, out),
+            MirrorAgent::Grok => self.parse_grok_line(line, out),
         }
     }
 
@@ -145,43 +135,8 @@ impl MirrorParser {
     /// Claude 行的完整解析:普通文本之外还产出提问卡片(assistant 行的
     /// AskUserQuestion tool_use)与已作答标记(user 行的 tool_result 对账)。
     fn parse_claude_line(&mut self, line: &str, out: &mut Vec<MirrorMessage>) {
-        // 作答对账:tool_result 命中挂起提问 → 产出标记并只移除**该**提问。
-        // 不能一刀切清空——提问可能与别的工具调用并行(同一条 assistant 消息里
-        // AskUserQuestion + Bash),别家工具的回执行不代表提问已了结
         if let Some(answer) = ai_sessions::claude_question_answer_from_line(line) {
-            let (resolved, still): (Vec<_>, Vec<_>) = self
-                .pending
-                .drain(..)
-                .partition(|p| answer.tool_use_ids.contains(&p.question.tool_use_id));
-            self.pending = still;
-            for pending in resolved {
-                // is_error = Esc 打断/报错的回执,不是用户的选择:labels 留空,
-                // 移动端据此显示中性的「已处理」而不是「已作答」
-                let labels: Vec<String> = if answer.is_error {
-                    Vec::new()
-                } else {
-                    pending
-                        .question
-                        .items
-                        .iter()
-                        .filter_map(|item| answer.answers.get(&item.question).cloned())
-                        .collect()
-                };
-                let msg = MirrorMessage {
-                    seq: self.next_seq,
-                    // 作答是用户动作;移动端点选过的由 relabel_mobile_sources 改标
-                    source: "desktop".into(),
-                    // content 只是旧链路的纯文本兜底;结构化选中项在 labels
-                    content: labels.join(", "),
-                    timestamp: answer.timestamp.clone(),
-                    kind: Some("questionAnswered".into()),
-                    ref_seq: Some(pending.seq),
-                    labels,
-                    ..Default::default()
-                };
-                self.next_seq += 1;
-                out.push(msg);
-            }
+            self.resolve_answer(&answer, out);
         }
 
         if let Some(raw) = ai_sessions::claude_message_from_line(line) {
@@ -196,42 +151,165 @@ impl MirrorParser {
         }
 
         if let Some(question) = ai_sessions::claude_question_from_line(line) {
-            let questions: Vec<MirrorQuestionItem> = question
-                .items
-                .iter()
-                .map(|item| MirrorQuestionItem {
-                    question: item.question.clone(),
-                    header: item.header.clone(),
-                    options: item
-                        .options
-                        .iter()
-                        .map(|o| MirrorQuestionOption {
-                            label: o.label.clone(),
-                            description: o.description.clone(),
-                        })
-                        .collect(),
-                    multi_select: item.multi_select,
-                })
-                .collect();
+            self.push_question(question, out);
+        }
+    }
+
+    /// Codex 行的完整解析:与 Claude 同构——提问是 `function_call`
+    /// (name=request_user_input),回执是 `function_call_output` 按 call_id 对账。
+    fn parse_codex_line(&mut self, line: &str, out: &mut Vec<MirrorMessage>) {
+        if let Some(answer) = ai_sessions::codex_question_answer_from_line(line) {
+            self.resolve_answer(&answer, out);
+        }
+
+        if let Some(raw) = ai_sessions::codex_message_from_line(line) {
+            // Codex 把系统注入(`# AGENTS.md`/`<turn_aborted>` 等)写成普通 user
+            // 消息行,不进镜像(判据与 codex_user_title_from_line 同源);但仍算
+            // 「用户动作」——TUI 已了结,挂起提问照清
+            let is_user_text = raw.role == "user";
+            if !(is_user_text && is_codex_injected_text(&raw.content)) {
+                let msg = self.next_text_message(raw);
+                out.push(msg);
+            }
+            if is_user_text {
+                self.pending.clear();
+            }
+        }
+
+        if let Some(question) = ai_sessions::codex_question_from_line(line) {
+            self.push_question(question, out);
+        }
+    }
+
+    /// Grok 行的完整解析:分片攒消息之外,提问是 tool_call 行
+    /// (title=ask_user_question),回执是 tool_call_update 终态行按 call_id 对账。
+    fn parse_grok_line(&mut self, line: &str, out: &mut Vec<MirrorMessage>) {
+        if let Some(answer) = ai_sessions::grok_question_answer_from_line(line) {
+            self.resolve_answer(&answer, out);
+        }
+
+        if let Some(raw) = self.grok.as_mut().and_then(|g| g.feed_line(line)) {
+            // 分片解析器在边界行才吐出上一条消息:user 消息成形 = TUI 已了结,
+            // 挂起照清(与 Claude/Codex 的用户文本清挂起同语义,晚一行到账)
+            let is_user_text = raw.role == "user";
+            let msg = self.next_text_message(raw);
+            out.push(msg);
+            if is_user_text {
+                self.pending.clear();
+            }
+        }
+
+        if let Some(question) = ai_sessions::grok_question_from_line(line) {
+            self.push_question(question, out);
+        }
+    }
+
+    /// 作答对账:回执命中挂起提问 → 产出标记并只移除**该**提问。
+    /// 不能一刀切清空——提问可能与别的工具调用并行(同一条 assistant 消息里
+    /// AskUserQuestion + Bash),别家工具的回执行不代表提问已了结
+    fn resolve_answer(&mut self, answer: &ai_sessions::AiQuestionAnswer, out: &mut Vec<MirrorMessage>) {
+        let (resolved, still): (Vec<_>, Vec<_>) = self
+            .pending
+            .drain(..)
+            .partition(|p| answer.tool_use_ids.contains(&p.question.tool_use_id));
+        self.pending = still;
+        for pending in resolved {
+            // is_error = Esc 打断/报错的回执,不是用户的选择:labels 留空,
+            // 移动端据此显示中性的「已处理」而不是「已作答」
+            let labels: Vec<String> = if answer.is_error {
+                Vec::new()
+            } else {
+                pending
+                    .question
+                    .items
+                    .iter()
+                    .flat_map(|item| {
+                        // Claude 的 answers 按题文对账;Codex 按题目 id
+                        answer
+                            .answers
+                            .get(&item.question)
+                            .or_else(|| answer.answers.get(&item.id))
+                            .cloned()
+                            .unwrap_or_default()
+                    })
+                    .collect()
+            };
             let msg = MirrorMessage {
                 seq: self.next_seq,
-                source: "assistant".into(),
-                // 纯文本兜底:旧移动端/被旧中转丢掉结构化字段时仍可读
-                content: question_fallback_text(&question),
-                timestamp: question.timestamp.clone(),
-                kind: Some("question".into()),
-                questions,
-                question_id: Some(question.tool_use_id.clone()),
+                // 作答是用户动作;移动端点选过的由 relabel_mobile_sources 改标
+                source: "desktop".into(),
+                // content 只是旧链路的纯文本兜底;结构化选中项在 labels
+                content: labels.join(", "),
+                timestamp: answer.timestamp.clone(),
+                kind: Some("questionAnswered".into()),
+                ref_seq: Some(pending.seq),
+                labels,
                 ..Default::default()
             };
-            self.pending.push(PendingQuestion {
-                seq: msg.seq,
-                question,
-                answered_items: 0,
-            });
             self.next_seq += 1;
             out.push(msg);
         }
+    }
+
+    /// 产出提问卡片并登记挂起。
+    ///
+    /// TUI 会在选项末尾自动追加一个会话记录里没有的兜底项(Claude 是「Other」
+    /// 自由输入,Codex 是「None of the above」),这里补进卡片与挂起,让移动端
+    /// 也点得到它——追加在尾部,已有选项的下标映射不受影响。Claude 选中 Other
+    /// 后 TUI 进入文本输入态,移动端用下方指令输入框接着打字即可。
+    /// Grok 的 TUI 不追加(实测模型会自己写一个「其他」选项)。
+    fn push_question(&mut self, mut question: ai_sessions::AiQuestion, out: &mut Vec<MirrorMessage>) {
+        let extra_label = match self.agent {
+            MirrorAgent::Claude => Some("Other"),
+            MirrorAgent::Codex => Some("None of the above"),
+            MirrorAgent::Grok => None,
+        };
+        if let Some(label) = extra_label {
+            for item in &mut question.items {
+                // 多选题 v1 只展示不可点选,不补
+                if !item.multi_select {
+                    item.options.push(ai_sessions::AiQuestionOption {
+                        label: label.to_string(),
+                        description: String::new(),
+                    });
+                }
+            }
+        }
+        let questions: Vec<MirrorQuestionItem> = question
+            .items
+            .iter()
+            .map(|item| MirrorQuestionItem {
+                question: item.question.clone(),
+                header: item.header.clone(),
+                options: item
+                    .options
+                    .iter()
+                    .map(|o| MirrorQuestionOption {
+                        label: o.label.clone(),
+                        description: o.description.clone(),
+                    })
+                    .collect(),
+                multi_select: item.multi_select,
+            })
+            .collect();
+        let msg = MirrorMessage {
+            seq: self.next_seq,
+            source: "assistant".into(),
+            // 纯文本兜底:旧移动端/被旧中转丢掉结构化字段时仍可读
+            content: question_fallback_text(&question),
+            timestamp: question.timestamp.clone(),
+            kind: Some("question".into()),
+            questions,
+            question_id: Some(question.tool_use_id.clone()),
+            ..Default::default()
+        };
+        self.pending.push(PendingQuestion {
+            seq: msg.seq,
+            question,
+            answered_items: 0,
+        });
+        self.next_seq += 1;
+        out.push(msg);
     }
 
     /// 移动端点选作答:校验 seq **与提问身份(tool_use id)**指向的提问仍挂起、
@@ -273,6 +351,13 @@ impl MirrorParser {
             pending.answered_items += 1;
         }
     }
+}
+
+/// Codex 会话记录里的系统注入 user 行(`<user_instructions>`/`<turn_aborted>`/
+/// `# AGENTS.md` 等),判据与 `codex_user_title_from_line` 的跳过规则同源。
+fn is_codex_injected_text(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    trimmed.starts_with('<') || trimmed.starts_with("# AGENTS.md")
 }
 
 /// 提问卡片的纯文本兜底:`[header] 题目` + 编号选项,语言中立。
@@ -659,12 +744,14 @@ mod tests {
         assert_eq!(card.kind.as_deref(), Some("question"));
         assert_eq!(card.question_id.as_deref(), Some("toolu_q1"));
         assert_eq!(card.questions.len(), 1);
-        assert_eq!(card.questions[0].options.len(), 3);
+        // 3 个结构化选项 + 追加的「Other」兜底项(TUI 有、记录里没有)
+        assert_eq!(card.questions[0].options.len(), 4);
+        assert_eq!(card.questions[0].options[3].label, "Other");
         assert!(!card.questions[0].multi_select);
         // 兜底文本:标签 + 题目 + 编号选项(有描述的带描述)
         assert_eq!(
             card.content,
-            "[方案] 选哪个?\n1. 方案A — 稳\n2. 方案B — 快\n3. 方案C"
+            "[方案] 选哪个?\n1. 方案A — 稳\n2. 方案B — 快\n3. 方案C\n4. Other"
         );
 
         // 点选第 2 项(下标 1):↓×1 + 回车;写入成功后推进进度
@@ -745,6 +832,180 @@ mod tests {
         assert!(parser.answer_keys(1, "toolu_q1", 0, 0).is_none());
     }
 
+    /// Codex 提问行(request_user_input 的 function_call,arguments 是 JSON 字符串)。
+    fn codex_question_line() -> String {
+        r#"{"timestamp":"t1","type":"response_item","payload":{"type":"function_call","name":"request_user_input","arguments":"{\"questions\":[{\"header\":\"测试选择\",\"id\":\"test_choice\",\"question\":\"测哪个?\",\"options\":[{\"label\":\"方案A\",\"description\":\"稳\"},{\"label\":\"方案B\",\"description\":\"\"}]}]}","call_id":"call_q1"}}"#.to_string()
+    }
+
+    fn codex_user_line(text: &str) -> String {
+        format!(
+            r#"{{"type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":{}}}]}}}}"#,
+            serde_json::to_string(text).unwrap()
+        )
+    }
+
+    /// Codex 提问出卡 + 点选作答按键与 Claude 同一套(↓×n + 回车)。
+    #[test]
+    fn parser_codex_question_card_and_answer_keys() {
+        let mut parser = MirrorParser::new(MirrorAgent::Codex);
+        let msgs = parser.feed(format!("{}\n", codex_question_line()).as_bytes());
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        let card = &msgs[0];
+        assert_eq!(card.kind.as_deref(), Some("question"));
+        assert_eq!(card.question_id.as_deref(), Some("call_q1"));
+        assert_eq!(card.questions.len(), 1);
+        // 2 个结构化选项 + 追加的「None of the above」兜底项
+        assert_eq!(card.questions[0].options.len(), 3);
+        assert_eq!(card.questions[0].options[2].label, "None of the above");
+        assert!(!card.questions[0].multi_select);
+
+        let keys = parser
+            .answer_keys(0, "call_q1", 0, 1)
+            .expect("提问应挂起可作答");
+        assert_eq!(keys.keys, "\x1b[B\r");
+        assert_eq!(keys.label, "方案B");
+        // 兜底项也可点选:↓×2 + 回车
+        let none = parser.answer_keys(0, "call_q1", 0, 2).unwrap();
+        assert_eq!(none.keys, "\x1b[B\x1b[B\r");
+        assert_eq!(none.label, "None of the above");
+    }
+
+    /// Esc 打断的回执("aborted by user …")不是用户的选择:标记 labels 留空。
+    #[test]
+    fn parser_codex_abort_marks_handled() {
+        let mut parser = MirrorParser::new(MirrorAgent::Codex);
+        parser.feed(format!("{}\n", codex_question_line()).as_bytes());
+        let abort = r#"{"timestamp":"t2","type":"response_item","payload":{"type":"function_call_output","call_id":"call_q1","output":"aborted by user after 32.9s"}}"#;
+        let msgs = parser.feed(format!("{abort}\n").as_bytes());
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert_eq!(msgs[0].kind.as_deref(), Some("questionAnswered"));
+        assert_eq!(msgs[0].ref_seq, Some(0));
+        assert!(msgs[0].labels.is_empty(), "打断不该伪装成有选中项");
+        assert!(parser.answer_keys(0, "call_q1", 0, 0).is_none());
+    }
+
+    /// 模式门禁回执(Default 模式下工具不可用):卡片立即失效,不可再点选。
+    #[test]
+    fn parser_codex_mode_gate_marks_handled() {
+        let mut parser = MirrorParser::new(MirrorAgent::Codex);
+        parser.feed(format!("{}\n", codex_question_line()).as_bytes());
+        let gate = r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"call_q1","output":"request_user_input is unavailable in Default mode"}}"#;
+        let msgs = parser.feed(format!("{gate}\n").as_bytes());
+        assert_eq!(msgs.len(), 1);
+        assert!(msgs[0].labels.is_empty());
+        assert!(parser.answer_keys(0, "call_q1", 0, 0).is_none());
+    }
+
+    /// 别家工具(exec 等)的回执不清挂起,与 Claude 侧同语义。
+    #[test]
+    fn parser_codex_keeps_pending_on_unrelated_output() {
+        let mut parser = MirrorParser::new(MirrorAgent::Codex);
+        parser.feed(format!("{}\n", codex_question_line()).as_bytes());
+        let unrelated = r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"call_other","output":"ls done"}}"#;
+        let msgs = parser.feed(format!("{unrelated}\n").as_bytes());
+        assert!(msgs.is_empty(), "{msgs:?}");
+        assert!(parser.answer_keys(0, "call_q1", 0, 0).is_some());
+    }
+
+    /// 系统注入的 user 行(# AGENTS.md / <turn_aborted>)不进镜像,
+    /// 但仍算用户动作——挂起提问照清;真实用户文本正常产出。
+    #[test]
+    fn parser_codex_filters_injected_noise() {
+        let mut parser = MirrorParser::new(MirrorAgent::Codex);
+        let noise = format!(
+            "{}\n{}\n",
+            codex_user_line("# AGENTS.md instructions for D:\\Git\\mini-term\n\n<INSTRUCTIONS>…"),
+            codex_user_line("<turn_aborted>\nThe user interrupted…\n</turn_aborted>")
+        );
+        assert!(parser.feed(noise.as_bytes()).is_empty(), "注入噪声不进镜像");
+
+        // 被滤掉的噪声不消耗 seq:卡片取 seq 0
+        parser.feed(format!("{}\n", codex_question_line()).as_bytes());
+        assert!(parser.answer_keys(0, "call_q1", 0, 0).is_some());
+        let msgs = parser.feed(
+            format!(
+                "{}\n",
+                codex_user_line("<turn_aborted>\n打断标记\n</turn_aborted>")
+            )
+            .as_bytes(),
+        );
+        assert!(msgs.is_empty(), "{msgs:?}");
+        assert!(
+            parser.answer_keys(0, "call_q1", 0, 0).is_none(),
+            "注入的打断标记也该清挂起"
+        );
+
+        let real = parser.feed(format!("{}\n", codex_user_line("真实输入")).as_bytes());
+        assert_eq!(real.len(), 1);
+        assert_eq!(real[0].content, "真实输入");
+    }
+
+    /// Grok 提问行(tool_call 首行,title 即工具名;形状取自真机 updates.jsonl)。
+    fn grok_question_line() -> String {
+        r#"{"timestamp":1788249699,"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"call-g1","title":"ask_user_question","rawInput":{"questions":[{"question":"接下来做什么？","options":[{"label":"继续镜像工作","description":"继续处理改动"},{"label":"其他","description":"请说明"}]}]}}}}"#.to_string()
+    }
+
+    /// Grok 提问出卡(不追加兜底项)+ 点选作答按键同一套;
+    /// completed 回执从 UserAnswered.message 扫出选中项做高亮对账。
+    #[test]
+    fn parser_grok_question_card_and_answered_labels() {
+        let mut parser = MirrorParser::new(MirrorAgent::Grok);
+        let msgs = parser.feed(format!("{}\n", grok_question_line()).as_bytes());
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        let card = &msgs[0];
+        assert_eq!(card.kind.as_deref(), Some("question"));
+        assert_eq!(card.question_id.as_deref(), Some("call-g1"));
+        // grok 的 TUI 不追加兜底项:选项数与记录一致
+        assert_eq!(card.questions[0].options.len(), 2);
+
+        let keys = parser.answer_keys(0, "call-g1", 0, 0).unwrap();
+        assert_eq!(keys.keys, "\r");
+
+        let answered = r#"{"timestamp":1788249746,"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"call-g1","status":"completed","rawOutput":{"type":"AskUserQuestion","UserAnswered":{"message":"User has answered your questions: \"接下来做什么？\"=\"继续镜像工作\". You can now continue."}}}}}"#;
+        let marks = parser.feed(format!("{answered}\n").as_bytes());
+        assert_eq!(marks.len(), 1, "{marks:?}");
+        assert_eq!(marks[0].kind.as_deref(), Some("questionAnswered"));
+        assert_eq!(marks[0].ref_seq, Some(0));
+        assert_eq!(marks[0].labels, vec!["继续镜像工作".to_string()]);
+        assert!(parser.answer_keys(0, "call-g1", 0, 0).is_none());
+    }
+
+    /// Grok 的富化行(tool_call_update 重发 rawInput)不重复出卡;
+    /// 无 UserAnswered 的 completed 回执按打断处理(labels 留空)。
+    #[test]
+    fn parser_grok_no_duplicate_card_and_declined_marks_handled() {
+        let mut parser = MirrorParser::new(MirrorAgent::Grok);
+        parser.feed(format!("{}\n", grok_question_line()).as_bytes());
+        let enriched = r#"{"timestamp":1788249733,"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"call-g1","kind":"other","rawInput":{"variant":"AskUserQuestion","questions":[{"question":"接下来做什么？","options":[{"label":"继续镜像工作"}]}]}}}}"#;
+        assert!(
+            parser.feed(format!("{enriched}\n").as_bytes()).is_empty(),
+            "富化行不重复出卡"
+        );
+
+        let declined = r#"{"timestamp":1788249750,"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"call-g1","status":"completed","rawOutput":{"type":"AskUserQuestion"}}}}"#;
+        let marks = parser.feed(format!("{declined}\n").as_bytes());
+        assert_eq!(marks.len(), 1);
+        assert!(marks[0].labels.is_empty(), "拒答/打断不该伪装成有选中项");
+        assert!(parser.answer_keys(0, "call-g1", 0, 0).is_none());
+    }
+
+    /// Grok 用户消息(分片攒出)成形即清挂起;正文消息照常产出。
+    #[test]
+    fn parser_grok_user_message_clears_pending() {
+        let mut parser = MirrorParser::new(MirrorAgent::Grok);
+        parser.feed(format!("{}\n", grok_question_line()).as_bytes());
+        assert!(parser.answer_keys(0, "call-g1", 0, 0).is_some());
+        let chunk = r#"{"timestamp":1788249800,"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"算了,先看代码"}}}}"#;
+        let boundary = r#"{"timestamp":1788249801,"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"ok"}}}}"#;
+        let msgs = parser.feed(format!("{chunk}\n{boundary}\n").as_bytes());
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert_eq!(msgs[0].content, "算了,先看代码");
+        assert!(
+            parser.answer_keys(0, "call-g1", 0, 0).is_none(),
+            "用户消息成形即清挂起"
+        );
+    }
+
     /// 作答校验的负路径:错 seq / 身份不符 / 越界选项 / 乱序题号 / 多选题一律拒绝。
     #[test]
     fn answer_keys_rejects_invalid_requests() {
@@ -759,7 +1020,9 @@ mod tests {
             parser.answer_keys(1, "toolu_stale", 0, 0).is_none(),
             "提问身份不符(换绑后 seq 碰撞的防线)"
         );
-        assert!(parser.answer_keys(1, "toolu_q1", 0, 3).is_none(), "选项越界");
+        // 下标 3 是追加的「Other」兜底项,合法;4 才越界
+        assert!(parser.answer_keys(1, "toolu_q1", 0, 3).is_some(), "Other 兜底项可点选");
+        assert!(parser.answer_keys(1, "toolu_q1", 0, 4).is_none(), "选项越界");
         assert!(parser.answer_keys(1, "toolu_q1", 1, 0).is_none(), "题号越界/乱序");
 
         // 多选题只展示不可点选

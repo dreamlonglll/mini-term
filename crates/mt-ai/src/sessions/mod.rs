@@ -14,12 +14,13 @@ mod grok;
 mod lineage;
 
 pub use codex::{
-    CodexSessionMeta, codex_message_from_line, codex_meta_from_line, codex_user_title_from_line,
+    CodexSessionMeta, codex_message_from_line, codex_meta_from_line,
+    codex_question_answer_from_line, codex_question_from_line, codex_user_title_from_line,
     collect_codex_session_paths, load_codex_thread_names,
 };
 pub use grok::{
     GrokUpdateParser, decode_grok_cwd_dir, find_grok_cwd_dirs, find_grok_session_dir,
-    grok_updates_path,
+    grok_question_answer_from_line, grok_question_from_line, grok_updates_path,
 };
 pub use lineage::{
     BookkeptLineageEdge, LineageEdge, branch_title_from_texts, claude_branch_title_from_lines,
@@ -636,6 +637,9 @@ pub struct AiQuestionOption {
 pub struct AiQuestionItem {
     pub question: String,
     pub header: String,
+    /// 题目标识:Codex 的 request_user_input 每题带 `id`(作答回执可能按它对账),
+    /// Claude 的 AskUserQuestion 没有,留空
+    pub id: String,
     pub options: Vec<AiQuestionOption>,
     pub multi_select: bool,
 }
@@ -658,7 +662,9 @@ pub struct AiQuestion {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AiQuestionAnswer {
     pub tool_use_ids: Vec<String>,
-    pub answers: HashMap<String, String>,
+    /// 题目(题文或题目 id)→ 选中 label 列表。Claude 的 toolUseResult.answers
+    /// 值是单个字符串;Codex 的 output 值是 `{"answers":[label,…]}` 数组
+    pub answers: HashMap<String, Vec<String>>,
     /// 任一 tool_result 块带 `is_error: true`——Esc 打断/工具报错的回执,
     /// 不是用户作出的选择,调用方据此区分「已作答」与「已打断」
     pub is_error: bool,
@@ -670,6 +676,29 @@ fn line_timestamp(obj: &serde_json::Value) -> String {
         .and_then(|t| t.as_str())
         .unwrap_or("")
         .to_string()
+}
+
+/// 把作答映射里的一个值归一化为 label 列表,吃三种形态:
+/// 字符串(Claude)、字符串数组、`{"answers":[…]}` 对象(Codex)。空列表 → None。
+pub(super) fn answer_labels(value: &serde_json::Value) -> Option<Vec<String>> {
+    let labels: Vec<String> = match value {
+        serde_json::Value::String(s) => vec![s.clone()],
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+        serde_json::Value::Object(_) => value
+            .get("answers")
+            .and_then(|a| a.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    if labels.is_empty() { None } else { Some(labels) }
 }
 
 /// 解析 Claude JSONL 的一行为 agent 提问。非 assistant 行 / 无 AskUserQuestion
@@ -717,6 +746,7 @@ pub fn claude_question_from_line(line: &str) -> Option<AiQuestion> {
                     .and_then(|v| v.as_str())
                     .unwrap_or_default()
                     .to_string(),
+                id: String::new(),
                 options,
                 multi_select: q
                     .get("multiSelect")
@@ -764,8 +794,8 @@ pub fn claude_question_answer_from_line(line: &str) -> Option<AiQuestionAnswer> 
         .and_then(|v| v.as_object())
     {
         for (question, label) in map {
-            if let Some(label) = label.as_str() {
-                answers.insert(question.clone(), label.to_string());
+            if let Some(labels) = answer_labels(label) {
+                answers.insert(question.clone(), labels);
             }
         }
     }
@@ -1042,7 +1072,10 @@ mod tests {
         let line = r#"{"type":"user","timestamp":"2026-09-01T03:31:00.000Z","message":{"role":"user","content":[{"type":"tool_result","content":"answered","tool_use_id":"toolu_test01"}]},"toolUseResult":{"answers":{"要支持点选作答吗?":"支持"}}}"#;
         let a = claude_question_answer_from_line(line).expect("应解析出作答");
         assert_eq!(a.tool_use_ids, vec!["toolu_test01".to_string()]);
-        assert_eq!(a.answers.get("要支持点选作答吗?").map(String::as_str), Some("支持"));
+        assert_eq!(
+            a.answers.get("要支持点选作答吗?"),
+            Some(&vec!["支持".to_string()])
+        );
         assert_eq!(a.timestamp, "2026-09-01T03:31:00.000Z");
     }
 
