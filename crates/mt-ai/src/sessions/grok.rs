@@ -303,13 +303,16 @@ impl GrokUpdateParser {
 
 // ─── Agent 提问(grok ask_user_question)────────────────────────
 //
-// 提问是 `session/update` 的 `tool_call` 行(title=ask_user_question),题目与
-// 选项在 `rawInput.questions`,结构与 Claude 的 AskUserQuestion 入参同构;
+// 提问在 updates.jsonl 里出现两次:`tool_call` 首行(title=ask_user_question)
+// 与富化行(`tool_call_update`,rawInput.variant=AskUserQuestion,无 status),
+// 题目与选项都在 `rawInput.questions`,结构与 Claude 的 AskUserQuestion 入参
+// 同构。⚠️ **富化行是提问了结那一刻才补写的**(时间戳 ≈ 作答/打断时刻,
+// 实测挂起 101s 期间磁盘上只有首行)——出卡必须认首行,否则卡片永远晚到;
+// 富化行也认(首行万一缺 rawInput 时的兜底,实测两者题目选项逐字一致),
+// 重复出卡由镜像层按挂起中的 call_id 去重。
 // 回执是同 toolCallId 的 `tool_call_update` 终态行:status=completed 且
 // `rawOutput.type=AskUserQuestion`,选中项**嵌在 UserAnswered.message 文本里**
 // (`User has answered your questions: "题文"="label". …`),按引号对扫出。
-// 提问后还有一条携带完整 rawInput 的 tool_call_update 富化行——只认
-// `tool_call` 首行出卡,富化行不再匹配,避免重复出卡。
 
 /// 行 → (params.update, unix 时间戳)。非 session/update 轨(xAI 扩展轨)返回 None。
 fn grok_acp_update(line: &str) -> Option<(serde_json::Value, u64)> {
@@ -322,19 +325,27 @@ fn grok_acp_update(line: &str) -> Option<(serde_json::Value, u64)> {
     Some((params.get("update")?.clone(), ts))
 }
 
-/// 解析 grok updates.jsonl 的一行为 agent 提问。非 tool_call 首行 /
-/// 非 ask_user_question / 题目或选项为空 → None。
+/// 解析 grok updates.jsonl 的一行为 agent 提问(首行与富化行都认,见模块注释)。
+/// 非 ask_user_question / 带 status 的进度终态行 / 题目或选项为空 → None。
 pub fn grok_question_from_line(line: &str) -> Option<AiQuestion> {
     let (update, ts) = grok_acp_update(line)?;
-    if update.get("sessionUpdate").and_then(|t| t.as_str()) != Some("tool_call") {
+    if update.get("status").is_some() {
         return None;
     }
-    let is_ask = update.get("title").and_then(|t| t.as_str()) == Some("ask_user_question")
-        || update.pointer("/rawInput/variant").and_then(|v| v.as_str()) == Some("AskUserQuestion")
-        || update
-            .pointer("/_meta/x.ai~1tool/name")
-            .and_then(|v| v.as_str())
-            == Some("ask_user_question");
+    let is_ask = match update.get("sessionUpdate").and_then(|t| t.as_str()) {
+        Some("tool_call") => {
+            update.get("title").and_then(|t| t.as_str()) == Some("ask_user_question")
+        }
+        Some("tool_call_update") => {
+            update.pointer("/rawInput/variant").and_then(|v| v.as_str())
+                == Some("AskUserQuestion")
+                || update
+                    .pointer("/_meta/x.ai~1tool/name")
+                    .and_then(|v| v.as_str())
+                    == Some("ask_user_question")
+        }
+        _ => false,
+    };
     if !is_ask {
         return None;
     }
@@ -544,11 +555,12 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
-    /// 形状取自真机 updates.jsonl(2026-09-01):tool_call 首行,title 即工具名
+    /// 形状取自真机 updates.jsonl(2026-09-01):首行(挂起期间磁盘上只有它)
+    /// 与富化行(了结时补写)都要认,重复由镜像层按挂起 call_id 去重。
     #[test]
-    fn grok_question_from_line_parses_ask_user_question() {
-        let line = r#"{"timestamp":1788249699,"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"call-10d759af-x-2","title":"ask_user_question","rawInput":{"questions":[{"question":"你希望我接下来帮你做什么？","options":[{"label":"继续镜像工作","description":"继续处理改动"},{"label":"其他","description":"请说明"}]}]}}}}"#;
-        let q = grok_question_from_line(line).unwrap();
+    fn grok_question_from_line_parses_both_shapes() {
+        let first = r#"{"timestamp":1788249699,"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"call-10d759af-x-2","title":"ask_user_question","rawInput":{"questions":[{"question":"你希望我接下来帮你做什么？","options":[{"label":"继续镜像工作","description":"继续处理改动"},{"label":"其他","description":"请说明"}]}]}}}}"#;
+        let q = grok_question_from_line(first).unwrap();
         assert_eq!(q.tool_use_id, "call-10d759af-x-2");
         assert_eq!(q.items.len(), 1);
         assert_eq!(q.items[0].question, "你希望我接下来帮你做什么？");
@@ -556,9 +568,14 @@ mod tests {
         assert!(!q.items[0].multi_select);
         assert_eq!(q.timestamp, "2026-09-01T08:01:39Z");
 
-        // 富化行(tool_call_update 带同样 rawInput)不出卡,避免重复
-        let enriched = r#"{"timestamp":1788249733,"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"call-10d759af-x-2","kind":"other","rawInput":{"variant":"AskUserQuestion","questions":[{"question":"Q","options":[{"label":"A"}]}]}}}}"#;
-        assert!(grok_question_from_line(enriched).is_none());
+        let enriched = r#"{"timestamp":1788249733,"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"call-10d759af-x-2","kind":"other","title":"Ask: 你希望我接下来帮你做什么？","rawInput":{"variant":"AskUserQuestion","questions":[{"question":"你希望我接下来帮你做什么？","options":[{"label":"继续镜像工作","description":"继续处理改动"},{"label":"其他","description":"请说明"}],"multiSelect":null}]},"_meta":{"x.ai/tool":{"name":"ask_user_question","kind":"ask_user"}}}}}"#;
+        let q2 = grok_question_from_line(enriched).unwrap();
+        assert_eq!(q2.tool_use_id, "call-10d759af-x-2");
+        assert_eq!(q2.items[0].options.len(), 2);
+
+        // 终态行(带 status)不出卡
+        let terminal = r#"{"timestamp":2,"method":"session/update","params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"c","status":"completed","rawInput":{"variant":"AskUserQuestion","questions":[{"question":"Q","options":[{"label":"A"}]}]}}}}"#;
+        assert!(grok_question_from_line(terminal).is_none());
         // 别的工具调用不出卡
         let other = r#"{"timestamp":1,"method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"c","title":"grep","rawInput":{"pattern":"x"}}}}"#;
         assert!(grok_question_from_line(other).is_none());

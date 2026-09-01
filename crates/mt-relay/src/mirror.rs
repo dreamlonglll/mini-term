@@ -200,7 +200,14 @@ impl MirrorParser {
         }
 
         if let Some(question) = ai_sessions::grok_question_from_line(line) {
-            self.push_question(question, out);
+            // 富化行可能重发同一提问:已挂起即跳过,不重复出卡
+            if !self
+                .pending
+                .iter()
+                .any(|p| p.question.tool_use_id == question.tool_use_id)
+            {
+                self.push_question(question, out);
+            }
         }
     }
 
@@ -253,26 +260,24 @@ impl MirrorParser {
 
     /// 产出提问卡片并登记挂起。
     ///
-    /// TUI 会在选项末尾自动追加一个会话记录里没有的兜底项(Claude 是「Other」
-    /// 自由输入,Codex 是「None of the above」),这里补进卡片与挂起,让移动端
-    /// 也点得到它——追加在尾部,已有选项的下标映射不受影响。Claude 选中 Other
-    /// 后 TUI 进入文本输入态,移动端用下方指令输入框接着打字即可。
-    /// Grok 的 TUI 不追加(实测模型会自己写一个「其他」选项)。
+    /// 三家 TUI 都会在选项末尾自动追加一个会话记录里没有的兜底项
+    /// (Claude「Other」/Codex「None of the above」/Grok「z. Type your answer here」),
+    /// 这里补进卡片与挂起,让移动端也点得到它——追加在尾部,已有选项的下标映射
+    /// 不受影响。选中后 TUI 进入文本输入态(Codex 直接提交),移动端用下方
+    /// 指令输入框接着打字即可。
     fn push_question(&mut self, mut question: ai_sessions::AiQuestion, out: &mut Vec<MirrorMessage>) {
         let extra_label = match self.agent {
-            MirrorAgent::Claude => Some("Other"),
-            MirrorAgent::Codex => Some("None of the above"),
-            MirrorAgent::Grok => None,
+            MirrorAgent::Claude => "Other",
+            MirrorAgent::Codex => "None of the above",
+            MirrorAgent::Grok => "Type your answer here",
         };
-        if let Some(label) = extra_label {
-            for item in &mut question.items {
-                // 多选题 v1 只展示不可点选,不补
-                if !item.multi_select {
-                    item.options.push(ai_sessions::AiQuestionOption {
-                        label: label.to_string(),
-                        description: String::new(),
-                    });
-                }
+        for item in &mut question.items {
+            // 多选题 v1 只展示不可点选,不补
+            if !item.multi_select {
+                item.options.push(ai_sessions::AiQuestionOption {
+                    label: extra_label.to_string(),
+                    description: String::new(),
+                });
             }
         }
         let questions: Vec<MirrorQuestionItem> = question
@@ -337,8 +342,18 @@ impl MirrorParser {
             return None;
         }
         let option = item.options.get(option_index as usize)?;
-        let mut keys = "\x1b[B".repeat(option_index as usize);
-        keys.push('\r');
+        // grok 的自由输入项(TUI 里的 z 项)不在方向键导航序列里:↓×N 会停在
+        // 最后一个编号项、回车把它交出去(踩过)。热键 z 直达输入态,后续
+        // 文本由用户经指令输入框补上。该项永远是我们追加在尾部的那一个
+        let is_grok_free_input = matches!(self.agent, MirrorAgent::Grok)
+            && option_index as usize == item.options.len() - 1;
+        let keys = if is_grok_free_input {
+            "z".to_string()
+        } else {
+            let mut keys = "\x1b[B".repeat(option_index as usize);
+            keys.push('\r');
+            keys
+        };
         Some(AnswerKeys {
             keys,
             label: option.label.clone(),
@@ -940,12 +955,13 @@ mod tests {
         assert_eq!(real[0].content, "真实输入");
     }
 
-    /// Grok 提问行(tool_call 首行,title 即工具名;形状取自真机 updates.jsonl)。
+    /// Grok 提问富化行(tool_call_update + variant 判别;形状取自真机 updates.jsonl)。
+    /// ⚠️ tool_call 首行是流式草稿,内容可能与 TUI 渲染的整个不同,不作出卡依据。
     fn grok_question_line() -> String {
-        r#"{"timestamp":1788249699,"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"call-g1","title":"ask_user_question","rawInput":{"questions":[{"question":"接下来做什么？","options":[{"label":"继续镜像工作","description":"继续处理改动"},{"label":"其他","description":"请说明"}]}]}}}}"#.to_string()
+        r#"{"timestamp":1788249733,"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"call-g1","kind":"other","title":"Ask: 接下来做什么？","rawInput":{"variant":"AskUserQuestion","questions":[{"question":"接下来做什么？","options":[{"label":"继续镜像工作","description":"继续处理改动"},{"label":"其他","description":"请说明"}],"multiSelect":null}]}}}}"#.to_string()
     }
 
-    /// Grok 提问出卡(不追加兜底项)+ 点选作答按键同一套;
+    /// Grok 提问出卡 + 点选作答:结构化选项走 ↓×n+回车,自由输入兜底项走热键 z;
     /// completed 回执从 UserAnswered.message 扫出选中项做高亮对账。
     #[test]
     fn parser_grok_question_card_and_answered_labels() {
@@ -955,11 +971,16 @@ mod tests {
         let card = &msgs[0];
         assert_eq!(card.kind.as_deref(), Some("question"));
         assert_eq!(card.question_id.as_deref(), Some("call-g1"));
-        // grok 的 TUI 不追加兜底项:选项数与记录一致
-        assert_eq!(card.questions[0].options.len(), 2);
+        // 2 个结构化选项 + 追加的「z. Type your answer here」自由输入兜底项
+        assert_eq!(card.questions[0].options.len(), 3);
+        assert_eq!(card.questions[0].options[2].label, "Type your answer here");
 
         let keys = parser.answer_keys(0, "call-g1", 0, 0).unwrap();
         assert_eq!(keys.keys, "\r");
+        // 自由输入项不吃方向键(↓×N 会停在最后一个编号项误交):注入热键 z
+        let free = parser.answer_keys(0, "call-g1", 0, 2).unwrap();
+        assert_eq!(free.keys, "z");
+        assert_eq!(free.label, "Type your answer here");
 
         let answered = r#"{"timestamp":1788249746,"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"call-g1","status":"completed","rawOutput":{"type":"AskUserQuestion","UserAnswered":{"message":"User has answered your questions: \"接下来做什么？\"=\"继续镜像工作\". You can now continue."}}}}}"#;
         let marks = parser.feed(format!("{answered}\n").as_bytes());
@@ -970,15 +991,20 @@ mod tests {
         assert!(parser.answer_keys(0, "call-g1", 0, 0).is_none());
     }
 
-    /// Grok 的富化行(tool_call_update 重发 rawInput)不重复出卡;
+    /// 首行即出卡(富化行要等提问了结才落盘,等它卡片永远晚到);
+    /// 富化行到来时同 call_id 已挂起,不重复出卡;
     /// 无 UserAnswered 的 completed 回执按打断处理(labels 留空)。
     #[test]
     fn parser_grok_no_duplicate_card_and_declined_marks_handled() {
         let mut parser = MirrorParser::new(MirrorAgent::Grok);
-        parser.feed(format!("{}\n", grok_question_line()).as_bytes());
-        let enriched = r#"{"timestamp":1788249733,"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"call-g1","kind":"other","rawInput":{"variant":"AskUserQuestion","questions":[{"question":"接下来做什么？","options":[{"label":"继续镜像工作"}]}]}}}}"#;
+        let first = r#"{"timestamp":1788249699,"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"call-g1","title":"ask_user_question","rawInput":{"questions":[{"question":"接下来做什么？","options":[{"label":"继续镜像工作","description":"继续处理改动"},{"label":"其他","description":"请说明"}]}]}}}}"#;
+        let msgs = parser.feed(format!("{first}\n").as_bytes());
+        assert_eq!(msgs.len(), 1, "首行即出卡: {msgs:?}");
+        assert_eq!(msgs[0].kind.as_deref(), Some("question"));
         assert!(
-            parser.feed(format!("{enriched}\n").as_bytes()).is_empty(),
+            parser
+                .feed(format!("{}\n", grok_question_line()).as_bytes())
+                .is_empty(),
             "富化行不重复出卡"
         );
 
