@@ -28,6 +28,7 @@
 //!  ├─ prefs.rs    面板视图 / 用量 / 主题 / 各类配置 / 感知 / 语言 / 重命名 / 中转
 //!  ├─ ssh.rs      SSH 连接表、远程项目、「关联 SSH」、断线重连
 //!  ├─ layout.rs   项目级终端面板、三栏与抽屉、文件树展开、布局与配置落盘
+//!  ├─ launch.rs   「按启动器起会话」共享入口(桌面菜单 / 移动端 / 编排者共用)
 //!  └─ pure.rs     无 `self` 的纯函数与它们的类型,连同全部单测
 //! ```
 //!
@@ -54,6 +55,7 @@ use crate::tree::{PaneState, PaneStatus, ProjectPanel, SplitNode};
 
 mod ai;
 mod config_writer;
+mod launch;
 mod layout;
 mod panes;
 mod prefs;
@@ -66,6 +68,15 @@ use config_writer::ConfigWriter;
 // 纯函数与它们的类型原本就住在 store.rs 顶层;拆进 `pure` 后原样再导出,
 // `crate::store::Xxx` 这条对外路径一字不变(全仓其它文件零改动的前提)。
 pub use pure::*;
+
+// 「按启动器起会话」共享入口的请求/结果类型 —— 桌面端、移动端中转、编排控制面
+// 共用,对外路径统一成 `crate::store::Xxx`。
+pub use launch::{LaunchError, LaunchNotice, LaunchPlacement, LaunchRequest};
+// `LaunchOutcome` 是 `launch_ai_session` 的返回类型,现有调用点全靠类型推断拿到
+// 它,名字还没在任何 `use` 里出现过。这条再导出留着,编排控制面(工单 03)按名字
+// 接的时候不必再改 `store` 的对外面。
+#[allow(unused_imports)]
+pub use launch::LaunchOutcome;
 
 /// 单个项目的运行时状态(对应 `types.ts` 的 `ProjectState`)。
 pub struct ProjectState {

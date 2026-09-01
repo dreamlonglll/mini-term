@@ -397,7 +397,8 @@ impl AppStore {
             (pane.shell_name.clone(), pane.cwd.clone())
         };
         let shell = self.resolve_shell(Some(&shell_name))?;
-        let new_pty = self.start_pty(&project, &shell, cwd.as_deref(), cx);
+        // 重连是「原地换一根 PTY」,不带任何调用方注入的内部变量
+        let new_pty = self.start_pty(&project, &shell, cwd.as_deref(), &[], cx);
 
         let state = self.project_states.get_mut(project_id)?;
         let pane = state.pane_mut(pane_id)?;

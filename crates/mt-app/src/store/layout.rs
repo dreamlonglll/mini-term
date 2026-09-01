@@ -18,7 +18,7 @@ use super::pure::collect_node_ids;
 use super::AppStore;
 
 impl AppStore {
-    /// 移动端发起会话时挂 pane:追加到布局树**最左侧叶子**的 tab 栏末尾,
+    /// 远程发起会话时挂 pane:追加到布局树**最左侧叶子**的 tab 栏末尾,
     /// **不激活、不抢焦点、不切项目**(远程操作不抢桌面现场,
     /// `src/utils/mobileStartSession.ts:100-110`)。
     ///
@@ -29,16 +29,22 @@ impl AppStore {
     /// 原版步 6「先建终端实例再写命令」在这里**自动满足**:`spawn_pane` 建 PTY 的
     /// 同时就把 `TerminalPane` 插进 `self.terminals`,不存在旧版那个
     /// 「pty-output 到了但实例还没建、AI 起来那一整段输出丢在地上」的窗口期。
-    pub fn append_pane_background(
+    ///
+    /// 调用点只有[「按启动器起会话」共享入口](Self::launch_ai_session)的
+    /// [`LaunchPlacement::Background`] 那一档(移动端 / 编排者)。
+    ///
+    /// [`LaunchPlacement::Background`]: super::LaunchPlacement::Background
+    pub(super) fn append_pane_background(
         &mut self,
         project_id: &str,
         shell: ShellConfig,
         custom_title: Option<String>,
+        extra_env: &[(String, String)],
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<String> {
         let project = self.project(project_id)?.clone();
-        let mut pane = self.spawn_pane(&project, &shell, None, window, cx)?;
+        let mut pane = self.spawn_pane(&project, &shell, None, extra_env, window, cx)?;
         pane.custom_title = custom_title;
         let pane_id = pane.id.clone();
         let pty_id = pane.pty_id;
@@ -140,9 +146,26 @@ impl AppStore {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<String> {
+        self.new_panel_with_env(project_id, shell, &[], window, cx)
+    }
+
+    /// [`new_panel`] 再加一份**应用内部**环境变量。
+    ///
+    /// 单独一个入口只为把 `extra_env` 递到 `spawn_pane` —— 界面上那两个
+    /// 「新建面板」调用点一律走上面那个无 env 的门面,签名一字不变。
+    ///
+    /// [`new_panel`]: Self::new_panel
+    pub(super) fn new_panel_with_env(
+        &mut self,
+        project_id: &str,
+        shell: Option<ShellConfig>,
+        extra_env: &[(String, String)],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
         let project = self.project(project_id)?.clone();
         let shell = shell.or_else(|| self.resolve_shell(None))?;
-        let pane = self.spawn_pane(&project, &shell, None, window, cx)?;
+        let pane = self.spawn_pane(&project, &shell, None, extra_env, window, cx)?;
         let pane_id = pane.id.clone();
 
         let state = self.project_states.get_mut(project_id)?;
