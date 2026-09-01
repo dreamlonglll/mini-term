@@ -145,32 +145,38 @@ impl MirrorParser {
     /// Claude 行的完整解析:普通文本之外还产出提问卡片(assistant 行的
     /// AskUserQuestion tool_use)与已作答标记(user 行的 tool_result 对账)。
     fn parse_claude_line(&mut self, line: &str, out: &mut Vec<MirrorMessage>) {
-        // 作答对账必须在清挂起之前:同一 user 行可能同时带 tool_result 与文本
-        let answer = ai_sessions::claude_question_answer_from_line(line);
-        if let Some(answer) = &answer {
-            for pending in &self.pending {
-                if !answer.tool_use_ids.contains(&pending.question.tool_use_id) {
-                    continue;
-                }
-                let labels: Vec<&str> = pending
-                    .question
-                    .items
-                    .iter()
-                    .filter_map(|item| answer.answers.get(&item.question).map(String::as_str))
-                    .collect();
+        // 作答对账:tool_result 命中挂起提问 → 产出标记并只移除**该**提问。
+        // 不能一刀切清空——提问可能与别的工具调用并行(同一条 assistant 消息里
+        // AskUserQuestion + Bash),别家工具的回执行不代表提问已了结
+        if let Some(answer) = ai_sessions::claude_question_answer_from_line(line) {
+            let (resolved, still): (Vec<_>, Vec<_>) = self
+                .pending
+                .drain(..)
+                .partition(|p| answer.tool_use_ids.contains(&p.question.tool_use_id));
+            self.pending = still;
+            for pending in resolved {
+                // is_error = Esc 打断/报错的回执,不是用户的选择:labels 留空,
+                // 移动端据此显示中性的「已处理」而不是「已作答」
+                let labels: Vec<String> = if answer.is_error {
+                    Vec::new()
+                } else {
+                    pending
+                        .question
+                        .items
+                        .iter()
+                        .filter_map(|item| answer.answers.get(&item.question).cloned())
+                        .collect()
+                };
                 let msg = MirrorMessage {
                     seq: self.next_seq,
                     // 作答是用户动作;移动端点选过的由 relabel_mobile_sources 改标
                     source: "desktop".into(),
-                    // 旧记录缺 answers 映射时给不出选中项,只能确认"已作答"
-                    content: if labels.is_empty() {
-                        "✓".to_string()
-                    } else {
-                        labels.join(", ")
-                    },
+                    // content 只是旧链路的纯文本兜底;结构化选中项在 labels
+                    content: labels.join(", "),
                     timestamp: answer.timestamp.clone(),
                     kind: Some("questionAnswered".into()),
                     ref_seq: Some(pending.seq),
+                    labels,
                     ..Default::default()
                 };
                 self.next_seq += 1;
@@ -178,16 +184,15 @@ impl MirrorParser {
             }
         }
 
-        let text = ai_sessions::claude_message_from_line(line);
-        let saw_user_line = answer.is_some() || text.as_ref().is_some_and(|t| t.role == "user");
-        if let Some(raw) = text {
+        if let Some(raw) = ai_sessions::claude_message_from_line(line) {
+            // 真实用户文本(键入/打断标记)= 提问 TUI 必已了结:打断可能不落
+            // tool_result,靠这里把挂起清掉,卡片按钮随之失效
+            let is_user_text = raw.role == "user";
             let msg = self.next_text_message(raw);
             out.push(msg);
-        }
-        // 任何 user 行都意味着提问 TUI 已了结(作答或 Esc/Ctrl+C 打断):
-        // 打断路径没有 tool_result,靠这里把挂起提问清掉,卡片按钮随之失效
-        if saw_user_line {
-            self.pending.clear();
+            if is_user_text {
+                self.pending.clear();
+            }
         }
 
         if let Some(question) = ai_sessions::claude_question_from_line(line) {
@@ -216,6 +221,7 @@ impl MirrorParser {
                 timestamp: question.timestamp.clone(),
                 kind: Some("question".into()),
                 questions,
+                question_id: Some(question.tool_use_id.clone()),
                 ..Default::default()
             };
             self.pending.push(PendingQuestion {
@@ -228,12 +234,23 @@ impl MirrorParser {
         }
     }
 
-    /// 移动端点选作答:校验 seq 指向的提问仍挂起、按题序作答、选项下标合法且
-    /// 非多选题,通过则返回注入 PTY 的按键序列。不推进进度——PTY 写入成功后
-    /// 由调用方回调 [`Self::mark_answered`],写失败不脏化进度。
+    /// 移动端点选作答:校验 seq **与提问身份(tool_use id)**指向的提问仍挂起、
+    /// 按题序作答、选项下标合法且非多选题,通过则返回注入 PTY 的按键序列。
+    /// 身份对账挡住换绑后的 seq 碰撞——新会话恰好在同 seq 也有挂起提问时,
+    /// 旧卡片的作答不能记到新提问头上。不推进进度——PTY 写入成功后由调用方
+    /// 回调 [`Self::mark_answered`],写失败不脏化进度。
     /// 校验不过返回 None——提问已作答/被打断/镜像已换绑,调用方回执 QuestionNotPending。
-    pub fn answer_keys(&self, seq: u64, question_index: u32, option_index: u32) -> Option<AnswerKeys> {
-        let pending = self.pending.iter().find(|p| p.seq == seq)?;
+    pub fn answer_keys(
+        &self,
+        seq: u64,
+        question_id: &str,
+        question_index: u32,
+        option_index: u32,
+    ) -> Option<AnswerKeys> {
+        let pending = self
+            .pending
+            .iter()
+            .find(|p| p.seq == seq && p.question.tool_use_id == question_id)?;
         if question_index as usize != pending.answered_items {
             return None;
         }
@@ -640,6 +657,7 @@ mod tests {
         assert_eq!(card.seq, 1);
         assert_eq!(card.source, "assistant");
         assert_eq!(card.kind.as_deref(), Some("question"));
+        assert_eq!(card.question_id.as_deref(), Some("toolu_q1"));
         assert_eq!(card.questions.len(), 1);
         assert_eq!(card.questions[0].options.len(), 3);
         assert!(!card.questions[0].multi_select);
@@ -650,18 +668,20 @@ mod tests {
         );
 
         // 点选第 2 项(下标 1):↓×1 + 回车;写入成功后推进进度
-        let keys = parser.answer_keys(1, 0, 1).expect("提问应挂起可作答");
+        let keys = parser
+            .answer_keys(1, "toolu_q1", 0, 1)
+            .expect("提问应挂起可作答");
         assert_eq!(keys.keys, "\x1b[B\r");
         assert_eq!(keys.label, "方案B");
         // 未 mark_answered 前重复校验仍通过(写失败可重试)
-        assert!(parser.answer_keys(1, 0, 1).is_some());
+        assert!(parser.answer_keys(1, "toolu_q1", 0, 1).is_some());
         parser.mark_answered(1);
         // 单题作答完毕:题序推进后不再接受
-        assert!(parser.answer_keys(1, 0, 0).is_none());
+        assert!(parser.answer_keys(1, "toolu_q1", 0, 0).is_none());
     }
 
-    /// tool_result 回流:产出已作答标记(指回卡片 seq,content 为选中项),
-    /// 挂起随之清除。
+    /// tool_result 回流:产出已作答标记(指回卡片 seq,选中项在结构化 labels,
+    /// content 只是兜底文本),挂起随之清除。
     #[test]
     fn parser_marks_question_answered_on_tool_result() {
         let mut parser = MirrorParser::new(MirrorAgent::Claude);
@@ -671,35 +691,76 @@ mod tests {
         let marker = &msgs[0];
         assert_eq!(marker.kind.as_deref(), Some("questionAnswered"));
         assert_eq!(marker.ref_seq, Some(1));
+        assert_eq!(marker.labels, vec!["方案B".to_string()]);
         assert_eq!(marker.content, "方案B");
         assert_eq!(marker.source, "desktop");
-        assert!(parser.answer_keys(1, 0, 0).is_none(), "已作答不可再点选");
+        assert!(
+            parser.answer_keys(1, "toolu_q1", 0, 0).is_none(),
+            "已作答不可再点选"
+        );
     }
 
-    /// Esc/Ctrl+C 打断没有 tool_result:任何后续 user 文本都应清掉挂起提问,
+    /// 与提问并行的**别家工具**回执行不代表提问已了结:不能清挂起,
+    /// 否则桌面还在等作答、移动端却只能收 QuestionNotPending。
+    #[test]
+    fn parser_keeps_pending_on_unrelated_tool_result() {
+        let mut parser = MirrorParser::new(MirrorAgent::Claude);
+        parser.feed(format!("{}\n", question_line()).as_bytes());
+        let unrelated = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"file list...","tool_use_id":"toolu_other"}]}}"#;
+        let msgs = parser.feed(format!("{unrelated}\n").as_bytes());
+        assert!(msgs.is_empty(), "别家回执不产出消息也不发标记: {msgs:?}");
+        assert!(
+            parser.answer_keys(1, "toolu_q1", 0, 0).is_some(),
+            "提问应仍挂起可作答"
+        );
+    }
+
+    /// Esc 打断落下的 is_error 回执不是用户的选择:标记 labels 留空
+    /// (移动端显示中性「已处理」),挂起清除。
+    #[test]
+    fn parser_marks_interrupted_question_as_handled() {
+        let mut parser = MirrorParser::new(MirrorAgent::Claude);
+        parser.feed(format!("{}\n", question_line()).as_bytes());
+        let interrupted = r#"{"type":"user","timestamp":"2026-09-01T03:33:00Z","message":{"role":"user","content":[{"type":"tool_result","content":"The user doesn't want to proceed","is_error":true,"tool_use_id":"toolu_q1"}]}}"#;
+        let msgs = parser.feed(format!("{interrupted}\n").as_bytes());
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].kind.as_deref(), Some("questionAnswered"));
+        assert!(msgs[0].labels.is_empty(), "打断不该伪装成有选中项");
+        assert_eq!(msgs[0].content, "");
+        assert!(parser.answer_keys(1, "toolu_q1", 0, 0).is_none());
+    }
+
+    /// 打断也可能只落一条 user 文本(无 tool_result):真实用户文本一律清挂起,
     /// 否则卡片按钮会对着一个已消失的 TUI 注入按键。
     #[test]
     fn parser_clears_pending_on_user_interrupt() {
         let mut parser = MirrorParser::new(MirrorAgent::Claude);
         parser.feed(format!("{}\n", question_line()).as_bytes());
-        assert!(parser.answer_keys(1, 0, 0).is_some());
+        assert!(parser.answer_keys(1, "toolu_q1", 0, 0).is_some());
         let msgs = parser.feed(
             format!("{}\n", claude_line("user", "算了,先不选", "2026-09-01T03:32:00Z")).as_bytes(),
         );
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].kind, None, "打断不产出已作答标记");
-        assert!(parser.answer_keys(1, 0, 0).is_none());
+        assert!(parser.answer_keys(1, "toolu_q1", 0, 0).is_none());
     }
 
-    /// 作答校验的负路径:错 seq / 越界选项 / 乱序题号 / 多选题一律拒绝。
+    /// 作答校验的负路径:错 seq / 身份不符 / 越界选项 / 乱序题号 / 多选题一律拒绝。
     #[test]
     fn answer_keys_rejects_invalid_requests() {
         let mut parser = MirrorParser::new(MirrorAgent::Claude);
         parser.feed(format!("{}\n", question_line()).as_bytes());
-        assert!(parser.answer_keys(0, 0, 0).is_none(), "seq 0 是文字消息不是提问");
-        assert!(parser.answer_keys(99, 0, 0).is_none(), "不存在的 seq");
-        assert!(parser.answer_keys(1, 0, 3).is_none(), "选项越界");
-        assert!(parser.answer_keys(1, 1, 0).is_none(), "题号越界/乱序");
+        assert!(
+            parser.answer_keys(0, "toolu_q1", 0, 0).is_none(),
+            "seq 0 是文字消息不是提问"
+        );
+        assert!(parser.answer_keys(99, "toolu_q1", 0, 0).is_none(), "不存在的 seq");
+        assert!(
+            parser.answer_keys(1, "toolu_stale", 0, 0).is_none(),
+            "提问身份不符(换绑后 seq 碰撞的防线)"
+        );
+        assert!(parser.answer_keys(1, "toolu_q1", 0, 3).is_none(), "选项越界");
+        assert!(parser.answer_keys(1, "toolu_q1", 1, 0).is_none(), "题号越界/乱序");
 
         // 多选题只展示不可点选
         let mut parser = MirrorParser::new(MirrorAgent::Claude);
@@ -707,7 +768,7 @@ mod tests {
         let msgs = parser.feed(format!("{multi}\n").as_bytes());
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].kind.as_deref(), Some("question"));
-        assert!(parser.answer_keys(0, 0, 0).is_none(), "多选题不可点选");
+        assert!(parser.answer_keys(0, "toolu_m", 0, 0).is_none(), "多选题不可点选");
     }
 
     #[test]

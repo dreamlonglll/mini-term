@@ -659,6 +659,9 @@ pub struct AiQuestion {
 pub struct AiQuestionAnswer {
     pub tool_use_ids: Vec<String>,
     pub answers: HashMap<String, String>,
+    /// 任一 tool_result 块带 `is_error: true`——Esc 打断/工具报错的回执,
+    /// 不是用户作出的选择,调用方据此区分「已作答」与「已打断」
+    pub is_error: bool,
     pub timestamp: String,
 }
 
@@ -740,15 +743,21 @@ pub fn claude_question_answer_from_line(line: &str) -> Option<AiQuestionAnswer> 
         return None;
     }
     let content = obj.pointer("/message/content")?.as_array()?;
-    let tool_use_ids: Vec<String> = content
+    let results: Vec<&serde_json::Value> = content
         .iter()
         .filter(|item| item.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+        .collect();
+    let tool_use_ids: Vec<String> = results
+        .iter()
         .filter_map(|item| item.get("tool_use_id").and_then(|i| i.as_str()))
         .map(String::from)
         .collect();
     if tool_use_ids.is_empty() {
         return None;
     }
+    let is_error = results
+        .iter()
+        .any(|item| item.get("is_error").and_then(|v| v.as_bool()) == Some(true));
     let mut answers = HashMap::new();
     if let Some(map) = obj
         .pointer("/toolUseResult/answers")
@@ -763,6 +772,7 @@ pub fn claude_question_answer_from_line(line: &str) -> Option<AiQuestionAnswer> 
     Some(AiQuestionAnswer {
         tool_use_ids,
         answers,
+        is_error,
         timestamp: line_timestamp(&obj),
     })
 }

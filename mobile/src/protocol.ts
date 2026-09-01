@@ -63,15 +63,17 @@ export interface MobileStartAiSession {
 }
 
 /**
- * 点选作答 agent 的提问:按镜像消息 seq 定位提问卡片,按题序+选项下标选择。
- * 桌面端校验该提问仍挂起后向 PTY 注入按键;回执复用 commandReceipt,
- * 提问已不挂起时 reason = questionNotPending。
+ * 点选作答 agent 的提问:按镜像消息 seq + 提问身份(questionId)定位提问卡片,
+ * 按题序+选项下标选择。桌面端校验该提问仍挂起后向 PTY 注入按键;回执复用
+ * commandReceipt,提问已不挂起时 reason = questionNotPending。
  */
 export interface MobileAnswerQuestion {
   type: 'answerQuestion';
   paneId: string;
   commandId: string;
   seq: number;
+  /** 提问卡片的 questionId:seq 在镜像换绑后会重排,靠它对账 */
+  questionId: string;
   questionIndex: number;
   optionIndex: number;
 }
@@ -190,13 +192,17 @@ export interface MirrorMessage {
   content: string;
   timestamp: string;
   /**
-   * 消息种类:缺省 = 普通文本;"question" = agent 提问卡片(questions 随行);
-   * "questionAnswered" = 已作答标记(refSeq 指向提问消息,content 为选中项)。
-   * 旧桌面端不发、旧中转会把这三个字段吃掉——缺省一律按普通文本渲染 content。
+   * 消息种类:缺省 = 普通文本;"question" = agent 提问卡片(questions/questionId
+   * 随行);"questionAnswered" = 已作答标记(refSeq 指向提问消息,labels 为逐题
+   * 选中项,为空 = 打断/旧版记录给不出选中项;content 只是纯文本兜底)。
+   * 旧桌面端不发、旧中转会把这些字段吃掉——缺省一律按普通文本渲染 content。
    */
   kind?: string;
   questions?: MirrorQuestionItem[];
+  /** kind=question 时该次提问的稳定身份,作答请求带回它对账 */
+  questionId?: string;
   refSeq?: number;
+  labels?: string[];
 }
 
 export interface MobileMirrorSnapshot {

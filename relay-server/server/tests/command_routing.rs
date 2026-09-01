@@ -179,6 +179,7 @@ async fn answer_question_routes_and_rejects_when_offline() {
             pane_id: "pane-1".into(),
             command_id: "ans-1".into(),
             seq: 5,
+            question_id: "toolu_q1".into(),
             question_index: 0,
             option_index: 1,
         },
@@ -190,6 +191,7 @@ async fn answer_question_routes_and_rejects_when_offline() {
             pane_id: "pane-1".into(),
             command_id: "ans-1".into(),
             seq: 5,
+            question_id: "toolu_q1".into(),
             question_index: 0,
             option_index: 1,
         })
@@ -210,6 +212,7 @@ async fn answer_question_routes_and_rejects_when_offline() {
             pane_id: "pane-1".into(),
             command_id: "ans-2".into(),
             seq: 5,
+            question_id: "toolu_q1".into(),
             question_index: 0,
             option_index: 1,
         },

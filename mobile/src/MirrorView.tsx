@@ -70,31 +70,34 @@ function MessageRow({ msg }: { msg: MirrorMessage }) {
  *
  * - `active` = 该提问仍是最新消息且未见作答标记;其后出现任何消息都视为已在
  *   桌面端处理(作答或打断),按钮失效只留展示;
- * - `answeredContent` 来自 questionAnswered 标记的 content(选中项文本),
- *   用于高亮当初选了哪一项;"✓" 表示旧记录给不出选中项;
+ * - `marker` = 回流的 questionAnswered 标记,选中项取其结构化 labels
+ *   (labels 为空 = 打断/旧版记录给不出选中项,显示中性「已处理」);
+ * - 逐题推进:只放行本地作答进度指向的下一道题(与桌面端校验同一口径),
+ *   回执 ok 即推进,不等标记回流——堵住 1s 轮询间隙里按钮复活可再点的毛刺;
  * - 多选题 v1 只展示不可点选(注入按键无法可靠表达多选);
  * - 结构化题目被旧链路丢掉时退化为纯文本兜底(content)。
  */
 function QuestionCard({
   msg,
   active,
-  answeredContent,
+  marker,
 }: {
   msg: MirrorMessage;
   active: boolean;
-  answeredContent: string | null;
+  marker: MirrorMessage | null;
 }) {
   const t = useT();
   const mirror = useRelayStore((s) => s.mirror);
   const desktopOnline = useRelayStore((s) => s.desktopOnline);
   const sending = mirror?.pendingCommandId != null;
-  const answered = answeredContent != null;
-  const chosen =
-    answeredContent && answeredContent !== '✓' ? answeredContent.split(', ') : [];
+  const progress = mirror?.answeredProgress[msg.seq] ?? 0;
+  const answered = marker != null;
+  const chosen = marker?.labels ?? [];
   const canAnswer =
     active && !answered && !!mirror && !mirror.closed && desktopOnline !== false;
   const time = formatTime(msg.timestamp);
   const items = msg.questions ?? [];
+  const questionId = msg.questionId ?? '';
   return (
     <div className="mirror-msg from-assistant">
       <div className="mirror-msg-source">
@@ -114,8 +117,14 @@ function QuestionCard({
                   <button
                     key={oi}
                     className={`question-option${chosen.includes(opt.label) ? ' chosen' : ''}`}
-                    disabled={!canAnswer || sending || item.multiSelect === true}
-                    onClick={() => answerQuestion(msg.seq, qi, oi)}
+                    disabled={
+                      !canAnswer ||
+                      sending ||
+                      item.multiSelect === true ||
+                      !questionId ||
+                      qi !== progress
+                    }
+                    onClick={() => answerQuestion(msg.seq, questionId, qi, oi)}
                   >
                     <span className="question-option-label">{opt.label}</span>
                     {opt.description && (
@@ -132,8 +141,9 @@ function QuestionCard({
         )}
         {answered ? (
           <div className="question-state answered">
-            {t('mirror.question.answered')}
-            {chosen.length > 0 ? `: ${chosen.join(', ')}` : ''}
+            {chosen.length > 0
+              ? `${t('mirror.question.answered')}: ${chosen.join(', ')}`
+              : t('mirror.question.handled')}
           </div>
         ) : !active ? (
           <div className="question-state stale">{t('mirror.question.expired')}</div>
@@ -232,6 +242,14 @@ export function MirrorView() {
   const messageCount = mirror?.messages.length ?? 0;
   const lastSeq = messageCount > 0 ? mirror!.messages[messageCount - 1].seq : -1;
 
+  // 作答标记按 refSeq 建索引:渲染期逐卡片 find 是 O(n²),长对话可感
+  const answeredMarkers = new Map<number, MirrorMessage>();
+  for (const m of mirror?.messages ?? []) {
+    if (m.kind === 'questionAnswered' && m.refSeq !== undefined) {
+      answeredMarkers.set(m.refSeq, m);
+    }
+  }
+
   // 新消息到达时,若此前贴着底部则自动滚到底(阅读历史时不打扰)
   useEffect(() => {
     const el = scrollRef.current;
@@ -319,15 +337,13 @@ export function MirrorView() {
           mirror.messages.map((m) => {
             if (m.kind === 'question') {
               // 作答状态由后续的 questionAnswered 标记回推;标记本身不单独成行
-              const marker = mirror.messages.find(
-                (x) => x.kind === 'questionAnswered' && x.refSeq === m.seq,
-              );
+              const marker = answeredMarkers.get(m.seq) ?? null;
               return (
                 <QuestionCard
                   key={m.seq}
                   msg={m}
                   active={m.seq === lastSeq && !marker}
-                  answeredContent={marker ? marker.content : null}
+                  marker={marker}
                 />
               );
             }

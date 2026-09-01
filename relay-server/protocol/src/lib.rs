@@ -119,9 +119,17 @@ pub struct MirrorMessage {
     /// kind = "question" 时的结构化题目(一次提问可含多题,TUI 逐题推进)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub questions: Vec<MirrorQuestionItem>,
+    /// kind = "question" 时该次提问的稳定身份(tool_use id)。作答请求带回它对账:
+    /// seq 在镜像换绑后会从 0 重排,单靠 seq 可能把旧卡片的作答记到新提问头上
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question_id: Option<String>,
     /// kind = "questionAnswered" 时指向被作答的提问消息 seq
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ref_seq: Option<u64>,
+    /// kind = "questionAnswered" 时逐题的选中项 label(结构化,label 含逗号也不歧义)。
+    /// 为空 = 打断/旧版记录给不出选中项,移动端显示中性的「已处理」
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
 }
 
 /// agent 提问的一道题。
@@ -255,6 +263,8 @@ pub enum RelayToDesktop {
         command_id: String,
         /// 提问卡片消息的镜像 seq
         seq: u64,
+        /// 提问的稳定身份(卡片消息的 question_id):seq 换绑后会重排,靠它对账
+        question_id: String,
         /// 题序(一次提问可含多题,只接受按顺序作答下一题)
         question_index: u32,
         /// 选项下标(0 起)
@@ -296,13 +306,15 @@ pub enum MobileToRelay {
         command_id: String,
         text: String,
     },
-    /// 点选作答 agent 的提问:按镜像消息 seq 定位提问卡片,按题序+选项下标选择。
-    /// 桌面端向 PTY 注入 ↓×option_index + 回车完成选择;回执复用 CommandReceipt,
-    /// 提问已不挂起时失败原因为 QuestionNotPending。command_id 由移动端生成。
+    /// 点选作答 agent 的提问:按镜像消息 seq + 提问身份(question_id)定位提问卡片,
+    /// 按题序+选项下标选择。桌面端向 PTY 注入 ↓×option_index + 回车完成选择;
+    /// 回执复用 CommandReceipt,提问已不挂起时失败原因为 QuestionNotPending。
+    /// command_id 由移动端生成。
     AnswerQuestion {
         pane_id: String,
         command_id: String,
         seq: u64,
+        question_id: String,
         question_index: u32,
         option_index: u32,
     },
@@ -820,6 +832,7 @@ mod tests {
             pane_id: "pane-1".into(),
             command_id: "cmd-9".into(),
             seq: 7,
+            question_id: "toolu_q1".into(),
             question_index: 0,
             option_index: 2,
         };
@@ -827,6 +840,7 @@ mod tests {
         assert!(
             json.contains(r#""type":"answerQuestion""#)
                 && json.contains(r#""seq":7"#)
+                && json.contains(r#""questionId":"toolu_q1""#)
                 && json.contains(r#""questionIndex":0"#)
                 && json.contains(r#""optionIndex":2"#),
             "{json}"
@@ -837,6 +851,7 @@ mod tests {
             pane_id: "pane-1".into(),
             command_id: "cmd-9".into(),
             seq: 7,
+            question_id: "toolu_q1".into(),
             question_index: 0,
             option_index: 2,
         };
@@ -868,14 +883,18 @@ mod tests {
                 }],
                 multi_select: false,
             }],
+            question_id: Some("toolu_q1".into()),
             ref_seq: None,
+            labels: Vec::new(),
         };
         let json = serde_json::to_string(&card).unwrap();
         assert!(
             json.contains(r#""kind":"question""#)
                 && json.contains(r#""multiSelect":false"#)
                 && json.contains(r#""questions":["#)
-                && !json.contains("refSeq"),
+                && json.contains(r#""questionId":"toolu_q1""#)
+                && !json.contains("refSeq")
+                && !json.contains("labels"),
             "{json}"
         );
         assert_eq!(serde_json::from_str::<MirrorMessage>(&json).unwrap(), card);
@@ -898,7 +917,9 @@ mod tests {
         let msg: MirrorMessage = serde_json::from_str(legacy).unwrap();
         assert_eq!(msg.kind, None);
         assert!(msg.questions.is_empty());
+        assert_eq!(msg.question_id, None);
         assert_eq!(msg.ref_seq, None);
+        assert!(msg.labels.is_empty());
     }
 
     /// pane 黄灯字段:false 不上 wire(省流量),旧载荷缺字段按 false 解析。

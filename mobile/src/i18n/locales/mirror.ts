@@ -14,6 +14,7 @@ export const mirror = {
     },
     question: {
       answered: "已作答",
+      handled: "已处理",
       expired: "该提问已在桌面端处理",
       multiSelectHint: "多选题请回桌面终端作答",
     },
@@ -44,6 +45,7 @@ export const mirror = {
     },
     question: {
       answered: "Answered",
+      handled: "Handled",
       expired: "This question was handled on the desktop",
       multiSelectHint: "Multi-select questions must be answered in the desktop terminal",
     },
