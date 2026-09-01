@@ -4069,8 +4069,11 @@ mod tests {
                 "wait"
             ]
         );
-        // 认不出的一律 None（带查询串 / 多层路径的别去猜）
-        for bad in ["", "send?x=1", "send/extra", "wait/", "read"] {
+        // 认不出的一律 None（带查询串 / 多层路径的别去猜）。
+        // ⚠️ 占位名必须是**永远不会被实现**的那种：工单 05 的留档记着这条教训
+        // （它当年拿 `send` 当占位，05 一落地那条测试就成了「send 居然是未知命令」）。
+        // 工单 07 的 `read` 同理，别写进来。
+        for bad in ["", "send?x=1", "send/extra", "wait/", "no-such-command"] {
             assert_eq!(Command::parse(bad), None, "{bad}");
         }
     }
