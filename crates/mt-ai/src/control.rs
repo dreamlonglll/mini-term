@@ -71,19 +71,31 @@
 //! 构造路径），而 `landed` 做的第一件事就是把记账写进 `registry.sessions`。
 //! 「拿到回执 = 记账已落地」因此是**类型层面**成立的，不靠调用方自觉。
 //!
-//! # 为什么阻塞命令要另起线程
+//! # 为什么有些命令要另起线程
 //!
 //! `start-session` 得回桌面主线程去建 pane，而 hook 那个 HTTP 服务是**单线程
 //! 循环**（`hook_server.rs` 的 `for request in server.incoming_requests()`）——
 //! 就地阻塞等回执会把排在后面的 hook 上报一起卡住，而 AI 状态感知是本仓的权威
 //! 通道，不能为编排让路。于是 [`try_handle_control`] 对这类命令：先在 HTTP 线程
 //! 上把鉴权做掉（挡住「任意进程都能让我们起线程」），再把已鉴权的活丢给一条
-//! 独立线程跑完并响应。
+//! 独立线程跑完并响应。判据是 [`Command::needs_own_thread`]。
+//!
+//! # 长轮询：`wait` 一次也不打扰主线程（工单 06）
+//!
+//! [`ControlPlane::wait`] 要等的是**一个 AI 回合**（几分钟是常态），而上面那条
+//! 泵的时限 [`ACTION_TIMEOUT`] 是 3 秒、为「建一个 pane」定的 —— 两者差两个
+//! 数量级，硬套过去只会得到一串 `desktopBusy`。于是 `wait` 走另一条路：就在
+//! 那条一次性线程上反复问 [`OrchestratorActions::pane_liveness`]（那个方法的
+//! 契约本来就是「很快、不跳主线程」，读的都是后台线程够得到的只读状态），
+//! gpui 主线程一次都不惊动。
+//!
+//! 它照样进 `needs_own_thread` 那张表 —— 那张表说的是「别在 HTTP 那条循环里
+//! 就地做」，而 `wait` 要占的正是几分钟。
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -102,6 +114,41 @@ pub const CONTROL_PREFIX: &str = "/control/";
 /// 给的明确答复。**跨工作区的那条不等式由 `tests/orchestrator_wire.rs` 拿两侧
 /// 真常量钉住**。
 pub const ACTION_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// [`ControlPlane::wait`] 长轮询的**服务端上界**（工单 06）。
+///
+/// 编排者给的超时只是个愿望：一条 `wait` 请求占着一条一次性线程，让它按调用方
+/// 报的数字无限期挂下去，就是把「hook 服务旁边偶尔多起一条线程」变成一条慢性
+/// 泄漏。5 分钟这个数两头夹出来：
+///
+/// - 下界是**一个 AI 回合正常要多久** —— Claude / Codex 跑一轮改代码几分钟是
+///   常态，上界短于它就等于逼编排者不停重投，每次重投都是一次进程启动；
+/// - 上界是**出了岔子最多白占一条线程多久** —— 5 分钟之后总要给它一个回执，
+///   让它自己决定继续等还是先去干别的。
+///
+/// 超过上界的请求**不报错**，按上界算（`wait` 的超时是正常回执，不是错误码）。
+/// CLI 侧那份同名常量由 `tests/orchestrator_wire.rs` 拿两侧真常量钉住 ——
+/// 它得按这个数放大自己的读超时，否则长轮询会变成 CLI 先断线。
+pub const WAIT_MAX: Duration = Duration::from_secs(300);
+
+/// 编排者没说等多久时的默认耐心。
+///
+/// 60 秒是照着**编排者自己那一侧的工具调用超时**定的：`wait` 是一次同步阻塞的
+/// CLI 调用，而跑它的那个 agent 通常给一次 shell 调用两分钟。默认值必须稳稳落
+/// 在那之内，否则「不给 `--timeout` 直接用」这条默认路径就是「命令被自己的宿主
+/// kill 掉」。要等更久的编排者显式给 `--timeout`，并自己把宿主那侧的超时一起放大。
+pub const WAIT_DEFAULT: Duration = Duration::from_secs(60);
+
+/// 长轮询的节拍。
+///
+/// 比 monitor 那条 500ms 轮询快一档，但**不是**为了抢在它前面：hook 事件是在
+/// HTTP 线程上**同步**落进 `last_hook_status` 与去重表的（见 [`crate::hook_server`]），
+/// 状态变化本来就不用等轮询那一拍。250ms 只是把「回合边界 → 编排者拿到回执」
+/// 的延迟压到半秒以内，代价是每秒四次几把互斥锁的读 —— 对这条低频命令可忽略。
+///
+/// **不做成可注入**：主缝测试靠请求里那个 `timeoutMs` 把整轮压到几百毫秒，
+/// 用不着为它另开一个只有测试会拨的旋钮。
+const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// 编排令牌的环境变量名（应用内部协议，`MINITERM_` 保留前缀保证用户/项目级
 /// 环境变量覆盖不掉）。
@@ -342,11 +389,30 @@ pub struct PaneLiveness {
     /// pane 还在桌面上吗（PTY 层面；用户关掉那个 tab 即 `false`）。
     pub alive: bool,
     /// AI 状态：`idle` / `ai-idle` / `ai-working`（与桌面徽章同一口径）。
-    /// **只用于展示**（`list-panes` 的状态列），名额判定读的是下面那个。
+    /// **展示 + `wait` 的终态判定**（`list-panes` 的状态列读它），
+    /// 名额判定读的是下面那个。
     pub status: String,
     /// 名额判定的那一问，见 [`AiSessionState`]。宿主侧据实回答，
     /// 别为了让它「好看」去改 AI 状态机本身。
     pub ai_session: AiSessionState,
+    /// 上一次发给 UI 的**状态成因**：hook 事件名原文（`Stop` / `PermissionRequest`
+    /// / `Interrupt` / `Stall` …，见 [`crate::monitor::StatusChange::cause`]）。
+    ///
+    /// 工单 06 的 `wait` 有两档终态全靠它，一个字的新判定都不必加：
+    ///
+    /// - **「停在等审批 / 向人提问」的判据是成因，不是状态字符串**：Claude 的
+    ///   `PermissionRequest` 落在 `ai-idle`，而 Codex 的落在 `ai-working`
+    ///   （`hook_server::map_event_to_status` 对它有专门一条：批准后直接执行工具，
+    ///   状态得留在工作中）。只看状态的话，一个正等着 Codex 审批的乐手会被当成
+    ///   「还在跑」一直等到超时 —— 而 attention 恰恰是最该立刻告诉人的那一档。
+    ///   判据本身用现成的 [`crate::hook_server::is_attention_cause`]。
+    /// - **`ai-idle` 那一档要把成因原样交给编排者**：`Stop` 是真干完了，
+    ///   `Interrupt` 是用户按了 Esc，`Stall` 是停摆兜底收敛的 —— 这三件事编排者
+    ///   得分得开，否则它会把一次被打断的活当成做完了。
+    ///
+    /// `None` = 无 hook 的降级路径（那条路上 monitor 一律以无成因发射），或这个
+    /// pane 还没发过任何状态。
+    pub cause: Option<String>,
 }
 
 impl PaneLiveness {
@@ -356,6 +422,7 @@ impl PaneLiveness {
             alive: false,
             status: "idle".to_string(),
             ai_session: AiSessionState::Ended,
+            cause: None,
         }
     }
 
@@ -364,7 +431,75 @@ impl PaneLiveness {
     pub fn occupies_slot(&self) -> bool {
         self.alive && self.ai_session != AiSessionState::Ended
     }
+
+    /// 收敛成 [`WaitState`] 了吗。`None` = 还在跑 / 说不上来，`wait` 接着等。
+    ///
+    /// **判定顺序有讲究：先看成因，再看状态。** attention 与状态不是一一对应的
+    /// （见 [`Self::cause`] 的第一条）；反过来先看状态，Codex 的审批等待会被
+    /// `ai-working` 那一档吞掉。
+    ///
+    /// 三档之外一律不收敛，尤其是 [`AiSessionState::Unknown`]（无 hook、输入检测
+    /// 也没认出来的自定义启动器）：那一档**说不上来**里头还有没有 agent 在跑，
+    /// 谎报成 `idle`（已退出）或 `ai-idle`（干完了）都是编排者据以做决定的假事实。
+    /// 它会一路等到上界，拿一个 `pending` + `status: "idle"` 的诚实回执 ——
+    /// 那两样合起来就是「这个乐手我看不透」的唯一签名。
+    fn settled(&self) -> Option<WaitState> {
+        if !self.alive {
+            // pane 都没了：那是 `paneGone`，不是终态（由调用方答）
+            return None;
+        }
+        if self
+            .cause
+            .as_deref()
+            .is_some_and(crate::hook_server::is_attention_cause)
+        {
+            return Some(WaitState::Attention);
+        }
+        match self.status.as_str() {
+            "ai-idle" => Some(WaitState::AiIdle),
+            // 「已退出」只认**明确**结束的那一档（见 [`AiSessionState`]）
+            "idle" if self.ai_session == AiSessionState::Ended => Some(WaitState::Idle),
+            _ => None,
+        }
+    }
 }
+
+/// `wait` 认得的三类终态（第四类「pane 不存在」是错误码，见
+/// [`ControlPlane::resolve_target`]）。
+///
+/// **一条判定逻辑都不新增**：三档全从既有事实读出来 —— hook 权威状态机
+/// （`monitor::resolve_status`）、它落盘之后的两条兜底结论（`note_user_interrupt`
+/// 的用户打断、`stall_settle_target` 的 10s 双静默收敛），以及 attention 的现成
+/// 判据 [`crate::hook_server::is_attention_cause`]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitState {
+    /// 干完了。**成因照带** —— 只有 `Stop` 是真做完。
+    AiIdle,
+    /// 停在等审批或向人提问。**编排者不代答**（ADR 0003 的铁律）：它拿着成因去
+    /// 自己的对话里播报，由人去那个乐手 pane 处理。零新增 UI —— 既有黄灯徽章
+    /// 本来就亮着。
+    Attention,
+    /// agent 已经退出，pane 退回裸 shell（`alive` 仍为真）。
+    Idle,
+}
+
+impl WaitState {
+    /// 线上那个字符串。**与 `status` 同一套词汇**（`ai-idle` / `idle`）——
+    /// 编排者不必再认第二种拼法，看到什么就是徽章上的那个意思；
+    /// `attention` 是这套词汇里多出来的一档。
+    fn name(self) -> &'static str {
+        match self {
+            Self::AiIdle => "ai-idle",
+            Self::Attention => "attention",
+            Self::Idle => "idle",
+        }
+    }
+}
+
+/// 到上界还没收敛时那个 `outcome`。
+///
+/// **不是错误**：见 [`ControlPlane::wait`] 的「超时不是错误」。
+const WAIT_PENDING: &str = "pending";
 
 // ─── 写穿：一段要交给乐手的输入（工单 05）────────────────────────
 
@@ -635,7 +770,7 @@ pub const MAX_SESSIONS_PER_ORCHESTRATOR: usize = 50;
 /// hook 那条队 —— 而 hook 是 AI 状态感知的权威通道，正是这条设计要防的事。
 ///
 /// 现在漏一处编译不过：加一个变体，[`Self::ALL`]（定长数组）、[`Self::name`]、
-/// [`Self::blocks_on_desktop`]（两处穷尽 `match`，都没有 `_` 兜底）与
+/// [`Self::needs_own_thread`]（两处穷尽 `match`，都没有 `_` 兜底）与
 /// [`ControlPlane::handle`] 的分发一起报错。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Command {
@@ -644,15 +779,17 @@ enum Command {
     StartSession,
     ListPanes,
     Send,
+    Wait,
 }
 
 impl Command {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::ListLaunchers,
         Self::ListProjects,
         Self::StartSession,
         Self::ListPanes,
         Self::Send,
+        Self::Wait,
     ];
 
     /// 路由里那一段（与 sidecar CLI 的 `Command::endpoint` 一字不差）。
@@ -663,6 +800,7 @@ impl Command {
             Self::StartSession => "start-session",
             Self::ListPanes => "list-panes",
             Self::Send => "send",
+            Self::Wait => "wait",
         }
     }
 
@@ -671,17 +809,28 @@ impl Command {
         Self::ALL.into_iter().find(|c| c.name() == name)
     }
 
-    /// 这条命令会不会阻塞在桌面主线程上。
+    /// 这条命令**能不能就地在 HTTP 那条循环上跑完**。
     ///
-    /// [`try_handle_control`] 据此决定要不要另起一条线程 —— hook 那个 HTTP 循环
-    /// 是单线程的，起乐手要等主线程建 pane，就地阻塞会把 hook 上报一起卡住。
-    fn blocks_on_desktop(self) -> bool {
+    /// 工单 03~05 里它叫 `blocks_on_desktop`，工单 06 改成了现在这个名字：那时候
+    /// 进表的理由只有一种（要回 gpui 主线程等回执），名字与判据恰好同义；`wait`
+    /// 打破了这个巧合 —— 它**一次也不碰主线程**，却要在这条线程上睡几分钟。
+    /// [`try_handle_control`] 关心的从来只是结论，于是名字改成说结论的那一个。
+    ///
+    /// 两种进表的理由：
+    ///
+    /// - **要回桌面主线程等回执**（`start-session` / `send`）：那一等按
+    ///   [`ACTION_TIMEOUT`] 算，最长 3 秒；
+    /// - **要长轮询**（`wait`）：主线程一次不惊动，但会在这条线程上睡到
+    ///   [`WAIT_MAX`]（默认 [`WAIT_DEFAULT`]）—— 比前一种久两个数量级。
+    ///
+    /// 两种都绝不能就地做：hook 那个 HTTP 服务是**单线程循环**
+    /// （`hook_server.rs` 的 `for request in server.incoming_requests()`），占着它
+    /// 就是把 AI 状态感知那条权威通道一起卡住 —— 而 `wait` 卡的还不是三秒，
+    /// 是几分钟。工单 07 的 `read` 要回主线程读终端画面，同样进这一档。
+    fn needs_own_thread(self) -> bool {
         match self {
             Self::ListLaunchers | Self::ListProjects | Self::ListPanes => false,
-            // 工单 06~07 的 wait / read 落地时，`wait` 也属于这一档。
-            // `send` 要回主线程走 `AppStore::write_to_pane`（写 PTY 是 gpui 实体
-            // 上的活），漏登记这一条就会把 hook 上报那条队一起卡住。
-            Self::StartSession | Self::Send => true,
+            Self::StartSession | Self::Send | Self::Wait => true,
         }
     }
 }
@@ -1153,6 +1302,7 @@ impl ControlPlane {
             }
             Command::StartSession => self.start_session(&grant, &request),
             Command::Send => self.send(&grant, &request),
+            Command::Wait => self.wait(&grant, &request),
             Command::ListPanes => {
                 let actions = self.actions();
                 let panes = self
@@ -1277,6 +1427,110 @@ impl ControlPlane {
             Err(SendFailure::DesktopBusy) => ControlError::DesktopBusy.into_outcome(),
         }
     }
+
+    /// `wait`：长轮询等一个乐手收敛成终态（工单 06）。
+    ///
+    /// # 它不走桌面主线程那条泵
+    ///
+    /// 那条泵的时限是 [`ACTION_TIMEOUT`]（3 秒，为「建一个 pane」定的），而这条
+    /// 命令要等的是**一个 AI 回合** —— 几分钟是常态，差两个数量级。于是 `wait`
+    /// 一次也不打扰 gpui 主线程：它就在 [`try_handle_control`] 起的那条一次性
+    /// 线程上反复问 [`OrchestratorActions::pane_liveness`]（那个方法的契约本来
+    /// 就是「很快、不跳主线程」，读的都是 `Arc<Mutex<..>>` 后面的只读状态）。
+    ///
+    /// **轮询期间一把锁都不持**：[`Self::resolve_target`] 出锁之后才问死活，
+    /// 循环里手上只剩一个 `Arc<dyn OrchestratorActions>`（[`Self::actions`] 早就
+    /// 把 `actions` 那把锁放了）。持着 `registry` 睡几分钟会把整个控制面挂住 ——
+    /// 连 `revoke_pane` 都进不来。
+    ///
+    /// # 判定完全复用既有状态机
+    ///
+    /// 三档终态由 [`PaneLiveness::settled`] 从既有事实读出来，本函数一个判定都不
+    /// 新增：hook 权威状态机、它落盘之后的两条兜底（用户打断 / 停摆收敛）、
+    /// 以及 attention 的现成判据。成因**原文照带**给编排者。
+    ///
+    /// # 超时不是错误
+    ///
+    /// 等到耐心用尽还没收敛，答的是 **200 + `outcome: "pending"`**，不是 HTTP
+    /// 错误码 ——「它还没干完」是一条正常的观测结果，编排者据此决定继续等还是先
+    /// 去干别的。做成错误码就得给它一个 CLI 退出码档位，而那三档说的都是
+    /// 「你的请求不对 / 我们出了问题」，两样都不是。
+    ///
+    /// # attention 到此为止
+    ///
+    /// 收到 attention 就立刻返回，**本函数不做任何代答动作**（ADR 0003 的铁律）：
+    /// 它把成因交给编排者，由编排者在自己的对话里请用户去那个 pane 处理。
+    /// 零新增 UI —— 那个 pane 的黄灯徽章本来就亮着。
+    ///
+    /// ⚠️ **一条已知的窄口子**：`send` 之后**立刻** `wait`，那一瞬的状态可能还是
+    /// 上一回合的 `ai-idle` + `Stop`（agent 还没来得及发 `UserPromptSubmit`），
+    /// 于是拿到一个假的「干完了」。回执里 `waitedMs` 接近 0 是它唯一的签名。
+    /// 刻意**不**在这里加一条「先等它动起来」的启发式：那正是「不新增判定逻辑」
+    /// 要挡的东西，而且回合极短时那条启发式自己也会误判。留档见工单 06。
+    fn wait(&self, grant: &Grant, request: &ControlRequest) -> ControlOutcome {
+        let Some(target_pane_id) = request.target_pane_id else {
+            return ControlError::BadRequest.into_outcome();
+        };
+        let patience = wait_patience(request.timeout_ms);
+        // 可见范围铁律走**共用**的那一条（自指 / 不是你起的 / 已经关了）。
+        // 只在开头判一次：轮询期间编排者的令牌若被撤销，跑 CLI 的那个 pane 本身
+        // 也已经没了，这一趟回执答给谁都无所谓。
+        let session = match self.resolve_target(grant, target_pane_id) {
+            Ok(s) => s,
+            Err(e) => return e.into_outcome(),
+        };
+        let actions = self.actions();
+        let started = Instant::now();
+        loop {
+            let liveness = actions.pane_liveness(session.pane_id);
+            if !liveness.alive {
+                // 等着等着被用户关掉了。与 `resolve_target` 开头那一档同一个码：
+                // 「你起的那个已经关了」比一个憋到上界的 `pending` 有用得多。
+                return ControlError::PaneGone.into_outcome();
+            }
+            let elapsed = started.elapsed();
+            if let Some(state) = liveness.settled() {
+                return wait_outcome(session.pane_id, state.name(), &liveness, elapsed);
+            }
+            let Some(remaining) = patience.checked_sub(elapsed).filter(|r| !r.is_zero()) else {
+                return wait_outcome(session.pane_id, WAIT_PENDING, &liveness, elapsed);
+            };
+            // 剩得比一拍还少就只睡那么多：编排者给的超时是个承诺，别超出去。
+            // （`timeoutMs: 0` 因此是合法的「只看一眼就回来」。）
+            std::thread::sleep(WAIT_POLL_INTERVAL.min(remaining));
+        }
+    }
+}
+
+/// 编排者要的耐心 → 实际等多久。不给就是 [`WAIT_DEFAULT`]，超上界按 [`WAIT_MAX`] 算。
+///
+/// **钳而不拒**：上界是我们这侧的实现约束，编排者无从知道；为一个能安全钳回来的
+/// 数字报错只是多一趟往返。回执里的 `waitedMs` 会如实说明实际等了多久，
+/// 它自己看得出来被钳过。
+fn wait_patience(timeout_ms: Option<u64>) -> Duration {
+    match timeout_ms {
+        Some(ms) => Duration::from_millis(ms).min(WAIT_MAX),
+        None => WAIT_DEFAULT,
+    }
+}
+
+/// 装一条 `wait` 回执。三档终态与 `pending` 共用一种形状 —— 编排者读 `outcome`
+/// 分支，别的字段照旧在那儿。
+fn wait_outcome(
+    pane_id: u32,
+    outcome: &'static str,
+    liveness: &PaneLiveness,
+    waited: Duration,
+) -> ControlOutcome {
+    ok_outcome(&ControlData::Waited {
+        waited: WaitView {
+            pane_id,
+            outcome,
+            status: liveness.status.clone(),
+            cause: liveness.cause.clone(),
+            waited_ms: waited.as_millis() as u64,
+        },
+    })
 }
 
 /// trim 之后还剩东西的那一档；空串与全空白一律当没给。
@@ -1335,9 +1589,15 @@ struct ControlRequest {
     /// `start-session`：落在哪个项目；不给就是编排者自己那个。
     #[serde(default)]
     project_id: Option<String>,
-    /// 以某个乐手为目标的命令（`send`，工单 06~07 的 wait / read 同款）用它。
+    /// 以某个乐手为目标的命令（`send` / `wait`，工单 07 的 read 同款）用它。
     #[serde(default)]
     target_pane_id: Option<u32>,
+    /// `wait`：最多等多久（毫秒）。
+    ///
+    /// 不给就是 [`WAIT_DEFAULT`]；超过 [`WAIT_MAX`] 按上界算（**钳而不拒**，
+    /// 见 [`wait_patience`]）。`0` 是合法值，语义是「只看一眼就回来」。
+    #[serde(default)]
+    timeout_ms: Option<u64>,
     /// `send`：要写穿进去的正文。
     ///
     /// ⚠️ **这是用户项目里的内容**（编排者拿自己的上下文拼出来的 prompt）——
@@ -1358,6 +1618,8 @@ enum ControlData {
     Panes { panes: Vec<PaneView> },
     /// `send` 的回执。
     Sent { sent: SentView },
+    /// `wait` 的回执。
+    Waited { waited: WaitView },
 }
 
 #[derive(Debug, Serialize)]
@@ -1415,6 +1677,46 @@ struct SentView {
     /// pane 退回裸 shell），多行正文是逐行进去的 —— 中途的换行很可能已经把它
     /// 提前发出去了。**如实告诉编排者**，让它自己决定要不要重来。
     bracketed_paste: bool,
+}
+
+/// `wait` 的回执。
+///
+/// **刻意不复用 [`PaneView`]**：那一份是「这个乐手是什么」（项目 / 启动器 /
+/// 死活），而这一份是「这一次等待的结论」。把项目名启动器名再抄一遍只会让编排者
+/// 在两种形状之间反复对齐；要那些走 `list-panes`。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WaitView {
+    /// 等的是哪个乐手。
+    pane_id: u32,
+    /// 结论：`ai-idle`（干完了）/ `attention`（等你处理）/ `idle`（agent 已退出），
+    /// 或 `pending`（到耐心用尽还没收敛 —— **正常回执，不是错误**）。
+    ///
+    /// 前三个与 `status` **同一套词汇**，编排者不必认第二种拼法。
+    outcome: &'static str,
+    /// 收工那一刻的 AI 状态原文，与 `list-panes` 的状态列同一口径。
+    ///
+    /// 与 `outcome` **不重复**，两处场合非它不可：
+    ///
+    /// - `attention` 时它说明那个 pane 停在 `ai-idle`（Claude 的审批等待）还是
+    ///   `ai-working`（Codex 的 —— 批准后直接执行工具，状态留在工作中）；
+    /// - `pending` 时它是唯一能区分「真在跑」（`ai-working`）与「这个乐手看不透」
+    ///   （`idle`：没 hook、输入检测也没认出来的自定义启动器）的东西。
+    status: String,
+    /// 成因原文（hook 事件名）。**照带不翻译** —— `Stop` 是真做完，`Interrupt`
+    /// 是用户按了 Esc，`Stall` 是停摆兜底收敛的，`PermissionRequest` /
+    /// `Elicitation` / `StopFailure` 是三种「等你处理」。
+    ///
+    /// 没有就整个字段不出线：无 hook 的降级路径上一律没有成因（那条路上只有
+    /// 输出活跃度，没有事件）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cause: Option<String>,
+    /// 实际等了多久（毫秒）。
+    ///
+    /// 编排者据此认出两件事：自己给的超时被[钳到上界](wait_patience)了，
+    /// 以及「几乎没等就答了 `ai-idle`」那一档 —— 那多半是上一回合的残留
+    /// （见 [`ControlPlane::wait`] 结尾那条已知窄口子）。
+    waited_ms: u64,
 }
 
 fn pane_view(session: &OrchestratedSession, liveness: &PaneLiveness) -> PaneView {
@@ -1632,7 +1934,7 @@ pub(crate) fn try_handle_control(
     //
     // 认不出的命令名（带查询串 / 多层路径的也在内）当然不阻塞，落到下面那条路
     // 由 `handle` 统一答「未知命令」。
-    if Command::parse(command).is_some_and(Command::blocks_on_desktop) {
+    if Command::parse(command).is_some_and(Command::needs_own_thread) {
         if let Err(err) = plane.authorize_body(&body) {
             respond(request, err.into_outcome());
             return None;
@@ -1758,17 +2060,39 @@ mod tests {
 
     impl FakeActions {
         fn set(&self, pane_id: u32, alive: bool, status: &str, ai_session: AiSessionState) {
+            self.set_with_cause(pane_id, alive, status, ai_session, None);
+        }
+        /// 带成因的那一档（`wait` 的 attention / ai-idle 两档全靠它）。
+        fn set_with_cause(
+            &self,
+            pane_id: u32,
+            alive: bool,
+            status: &str,
+            ai_session: AiSessionState,
+            cause: Option<&str>,
+        ) {
             self.liveness.lock().insert(
                 pane_id,
                 PaneLiveness {
                     alive,
                     status: status.into(),
                     ai_session,
+                    cause: cause.map(str::to_string),
                 },
             );
         }
         fn live(&self, pane_id: u32, status: &str) {
             self.set(pane_id, true, status, AiSessionState::Active);
+        }
+        /// 一个回合干完了：hook 的 `Stop` 落地（**这才是真做完**）。
+        fn finished(&self, pane_id: u32, cause: &str) {
+            self.set_with_cause(pane_id, true, "ai-idle", AiSessionState::Active, Some(cause));
+        }
+        /// 停在等审批 / 向人提问：状态由调用方给 —— Claude 落 `ai-idle`，
+        /// Codex 的 `PermissionRequest` 落 `ai-working`（真实差异，见
+        /// `hook_server::map_event_to_status`）。
+        fn attention(&self, pane_id: u32, status: &str, cause: &str) {
+            self.set_with_cause(pane_id, true, status, AiSessionState::Active, Some(cause));
         }
         /// 乐手 pane 被用户关掉。
         fn close(&self, pane_id: u32) {
@@ -2601,6 +2925,7 @@ mod tests {
                     alive: pane_id == 202,
                     status: "ai-idle".into(),
                     ai_session: AiSessionState::Active,
+                    cause: None,
                 }
             }
         }
@@ -3234,6 +3559,389 @@ mod tests {
         assert!(actions.sends.lock().is_empty(), "超限的正文不许写出去半截");
     }
 
+    // ─── wait：四类终态与超时（工单 06）────────────────────────
+
+    /// `wait` 一次。`timeout_ms` 直接给毫秒 —— 主缝测试靠它把长轮询压到几百毫秒，
+    /// 不必为节拍另开一个只有测试会拨的旋钮。
+    fn wait(port: u16, token: &str, target: u32, timeout_ms: u64) -> (u16, serde_json::Value) {
+        let payload = payload_of(
+            token,
+            &format!(r#""targetPaneId":{target},"timeoutMs":{timeout_ms}"#),
+        );
+        let (status, body) = post(port, "/control/wait", &payload);
+        (status, json(&body))
+    }
+
+    /// 终态一：**干完了**。成因原文照带 —— 只有 `Stop` 是真做完。
+    #[test]
+    fn wait_干完了返回_ai_idle_并带成因() {
+        let (_plane, _host, actions, port, token) = granted();
+        let musician = start_musician(port, &token);
+        actions.finished(musician, "Stop");
+
+        let (status, v) = wait(port, &token, musician, 2_000);
+        assert_eq!(status, 200, "{v}");
+        let w = &v["data"]["waited"];
+        assert_eq!(w["outcome"], "ai-idle");
+        assert_eq!(w["status"], "ai-idle", "状态原文与徽章同一口径");
+        assert_eq!(w["cause"], "Stop");
+        assert_eq!(w["paneId"], musician);
+        // 已经收敛了就立刻答，不必等满耐心
+        assert!(w["waitedMs"].as_u64().unwrap() < 1_000, "{w}");
+    }
+
+    /// `ai-idle` 的三种成因**必须分得开**：`Stop` 是干完了，`Interrupt` 是用户
+    /// 按了 Esc（两条兜底之一），`Stall` 是停摆兜底收敛的。编排者拿它们做的决定
+    /// 完全不同 —— 把「被打断」当成「做完了」就是把半截活报成交付。
+    #[test]
+    fn wait_把打断与停摆的成因原样交出去() {
+        let (_plane, _host, actions, port, token) = granted();
+        let musician = start_musician(port, &token);
+
+        for cause in ["Stop", "Interrupt", "Stall"] {
+            actions.finished(musician, cause);
+            let (status, v) = wait(port, &token, musician, 2_000);
+            assert_eq!(status, 200, "{v}");
+            assert_eq!(v["data"]["waited"]["outcome"], "ai-idle", "cause={cause}");
+            assert_eq!(
+                v["data"]["waited"]["cause"], cause,
+                "成因必须原文照带，不许归一成「完成」"
+            );
+        }
+    }
+
+    /// 终态二：**停在等审批 / 向人提问**，原因原文照带。
+    ///
+    /// ⚠️ 两家的状态不一样，而判据是**成因**不是状态：Claude 的
+    /// `PermissionRequest` 落在 `ai-idle`，Codex 的落在 `ai-working`
+    /// （批准后直接执行工具，`hook_server::map_event_to_status` 对它有专门一条）。
+    /// 只看状态的话，正等着 Codex 审批的乐手会被当成「还在跑」一直等到超时 ——
+    /// 而 attention 恰恰是最该立刻告诉人的那一档。
+    #[test]
+    fn wait_停在_attention_立刻返回并带原因() {
+        let (_plane, _host, actions, port, token) = granted();
+        let musician = start_musician(port, &token);
+
+        for (status_text, cause) in [
+            ("ai-idle", "PermissionRequest"),   // Claude
+            ("ai-working", "PermissionRequest"), // Codex：批准后直接执行工具
+            ("ai-idle", "Elicitation"),
+            ("ai-idle", "StopFailure"), // 回合因 API 错误结束，要人回来看
+        ] {
+            actions.attention(musician, status_text, cause);
+            let (http, v) = wait(port, &token, musician, 2_000);
+            assert_eq!(http, 200, "{v}");
+            let w = &v["data"]["waited"];
+            assert_eq!(
+                w["outcome"], "attention",
+                "status={status_text} cause={cause}: attention 的判据是成因不是状态"
+            );
+            assert_eq!(w["cause"], cause, "原因原文要交到编排者手上");
+            assert_eq!(w["status"], status_text, "状态照实说，两家形态不同");
+            assert!(w["waitedMs"].as_u64().unwrap() < 1_000, "别让人干等着: {w}");
+        }
+    }
+
+    /// 终态三：**agent 已退出**（pane 还在，退回裸 shell）。
+    ///
+    /// 与 `ai-idle` 是两回事：前者 pane 还在 AI 会话里，后者已经没有 agent 了 ——
+    /// 编排者要据此决定是接着派活还是重起一个。判据借
+    /// [`AiSessionState::Ended`]，不是拿状态字符串裸比。
+    #[test]
+    fn wait_agent_退出返回_idle() {
+        let (_plane, _host, actions, port, token) = granted();
+        let musician = start_musician(port, &token);
+        actions.agent_exited(musician);
+
+        let (status, v) = wait(port, &token, musician, 2_000);
+        assert_eq!(status, 200, "{v}");
+        let w = &v["data"]["waited"];
+        assert_eq!(w["outcome"], "idle");
+        assert_eq!(w["status"], "idle");
+        assert!(w["cause"].is_null(), "退出这一档没有成因: {w}");
+    }
+
+    /// 终态四：**pane 不存在**（可见范围铁律）。三条语义各一例，一条都不泄露
+    /// 桌面上还有什么别的 pane。
+    #[test]
+    fn wait_向非自启_pane_被拒() {
+        let (_plane, _host, _actions, port, token) = granted();
+        let musician = start_musician(port, &token);
+        let _ = musician;
+
+        // 别人的乐手 / 用户亲手开的会话 / 编造的编号 —— 统一「不存在」
+        let (status, v) = wait(port, &token, 4242, 2_000);
+        assert_eq!(status, 404);
+        assert_eq!(v["error"]["code"], "paneNotFound");
+        // 自指禁令
+        let (status, v) = wait(port, &token, 7, 2_000);
+        assert_eq!(status, 403);
+        assert_eq!(v["error"]["code"], "selfTarget");
+    }
+
+    /// 是自己起的、但那个 pane 已经关了 → `paneGone`（**可以**说，那是它自己
+    /// 起的东西）。开头那一次裁决就挡下来，不进轮询。
+    #[test]
+    fn wait_乐手_pane_已关时明确报已关() {
+        let (_plane, _host, actions, port, token) = granted();
+        let musician = start_musician(port, &token);
+        actions.close(musician);
+
+        let (status, v) = wait(port, &token, musician, 2_000);
+        assert_eq!(status, 410);
+        assert_eq!(v["error"]["code"], "paneGone");
+    }
+
+    /// 等着等着被用户关掉：同样答 `paneGone`，而不是憋到上界给一个 `pending`。
+    /// 「你起的那个已经关了」是一个确定的结论，编排者该立刻知道。
+    #[test]
+    fn wait_期间被关掉答已关而不是超时() {
+        let (_plane, _host, actions, port, token) = granted();
+        let musician = start_musician(port, &token);
+        actions.live(musician, "ai-working"); // 还在跑，wait 会进轮询
+
+        let closer = {
+            let actions = actions.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(60));
+                actions.close(musician);
+            })
+        };
+        let (status, v) = wait(port, &token, musician, 5_000);
+        closer.join().unwrap();
+        assert_eq!(status, 410, "{v}");
+        assert_eq!(v["error"]["code"], "paneGone");
+    }
+
+    /// **超时不是错误**：等到耐心用尽仍在跑 → 200 + `pending`，让编排者自己决定
+    /// 继续等还是先去干别的。做成错误码就得给它一个「你或我们出了问题」的退出码档位。
+    #[test]
+    fn wait_超时是正常回执而不是错误() {
+        let (_plane, _host, actions, port, token) = granted();
+        let musician = start_musician(port, &token);
+        actions.live(musician, "ai-working");
+
+        let (status, v) = wait(port, &token, musician, 300);
+        assert_eq!(status, 200, "超时不许变成 HTTP 错误: {v}");
+        let w = &v["data"]["waited"];
+        assert_eq!(w["outcome"], "pending");
+        assert_eq!(w["status"], "ai-working", "还在跑这件事要说清");
+        assert_eq!(v["ok"], true);
+        assert!(
+            w["waitedMs"].as_u64().unwrap() >= 300,
+            "该等满的耐心不许提前收工: {w}"
+        );
+    }
+
+    /// **状态迁移经假宿主驱动**：轮询期间乐手从 ai-working 干完 → wait 拿到终态。
+    /// 这条证的是长轮询真的在轮询，而不是只看了开头那一眼。
+    #[test]
+    fn wait_轮询到状态迁移后收敛() {
+        let (_plane, _host, actions, port, token) = granted();
+        let musician = start_musician(port, &token);
+        actions.live(musician, "ai-working");
+
+        let flip = {
+            let actions = actions.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(60));
+                actions.finished(musician, "Stop");
+            })
+        };
+        let (status, v) = wait(port, &token, musician, 5_000);
+        flip.join().unwrap();
+        assert_eq!(status, 200, "{v}");
+        let w = &v["data"]["waited"];
+        assert_eq!(w["outcome"], "ai-idle");
+        assert_eq!(w["cause"], "Stop");
+        assert!(
+            w["waitedMs"].as_u64().unwrap() >= 60,
+            "它得是等出来的，不是开头那一眼: {w}"
+        );
+    }
+
+    /// 人工处理之后的下一次 `wait` 拿到恢复后的终态（工单验收项第 4 条的进程内
+    /// 那一半；真机走查留工单 09）。attention 期间编排者**什么都不做** ——
+    /// 这里也就没有任何代答动作可测：`send` 的调用记录必须是空的。
+    #[test]
+    fn wait_人工处理后下一次拿到恢复后的终态() {
+        let (_plane, _host, actions, port, token) = granted();
+        let musician = start_musician(port, &token);
+
+        actions.attention(musician, "ai-idle", "PermissionRequest");
+        let (_s, v) = wait(port, &token, musician, 2_000);
+        assert_eq!(v["data"]["waited"]["outcome"], "attention");
+
+        // 用户去那个 pane 批准了 → 下一个 hook 事件把状态推回工作中
+        actions.live(musician, "ai-working");
+        let (_s, v) = wait(port, &token, musician, 300);
+        assert_eq!(v["data"]["waited"]["outcome"], "pending", "批完还在跑");
+
+        // 干完
+        actions.finished(musician, "Stop");
+        let (_s, v) = wait(port, &token, musician, 2_000);
+        assert_eq!(v["data"]["waited"]["outcome"], "ai-idle");
+        assert_eq!(v["data"]["waited"]["cause"], "Stop");
+
+        assert!(
+            actions.sends.lock().is_empty(),
+            "attention 时编排者不代答（ADR 0003）：wait 一个字节都不许替它写"
+        );
+    }
+
+    /// **fail-closed**：说不上来的那一档（无 hook、输入检测也没认出来的自定义
+    /// 启动器）绝不谎报成终态。它等到上界，答 `pending` + `status: "idle"` ——
+    /// 那两样合起来是「这个乐手我看不透」的唯一签名。
+    ///
+    /// 谎报成 `idle`（已退出）会让编排者去重起一个还在跑的活；谎报成 `ai-idle`
+    /// （干完了）会让它把没开始的活当成交付。两个都比多等一会儿坏得多。
+    #[test]
+    fn wait_说不上来时不谎报终态() {
+        let (_plane, _host, actions, port, token) = granted();
+        let musician = start_musician(port, &token);
+        actions.unknown(musician);
+
+        let (status, v) = wait(port, &token, musician, 300);
+        assert_eq!(status, 200, "{v}");
+        let w = &v["data"]["waited"];
+        assert_eq!(
+            w["outcome"], "pending",
+            "「答不上来」不许被当成干完了或已退出: {w}"
+        );
+        assert_eq!(w["status"], "idle", "pending + idle = 这个乐手看不透");
+    }
+
+    /// 超时上界：编排者报一个天文数字也只等到 [`WAIT_MAX`]（**钳而不拒**）。
+    /// 这条不真等 5 分钟 —— 只钉纯函数那一层的钳位口径。
+    #[test]
+    fn wait_耐心有服务端上界() {
+        assert_eq!(wait_patience(None), WAIT_DEFAULT, "不给就是默认值");
+        assert_eq!(
+            wait_patience(Some(u64::MAX)),
+            WAIT_MAX,
+            "报多大都只等到上界，且不报错"
+        );
+        assert_eq!(wait_patience(Some(1_500)), Duration::from_millis(1_500));
+        assert_eq!(
+            wait_patience(Some(0)),
+            Duration::ZERO,
+            "0 是合法值：只看一眼就回来"
+        );
+        assert!(WAIT_DEFAULT < WAIT_MAX, "默认值得落在上界之内");
+        assert!(
+            WAIT_POLL_INTERVAL < WAIT_DEFAULT,
+            "一拍都比默认耐心长的话就成了「只看一眼」"
+        );
+    }
+
+    /// `timeoutMs: 0` = 只看一眼就回来（不睡）。给编排者一条「非阻塞查一下状态」
+    /// 的路，省得为它另加一条命令。
+    #[test]
+    fn wait_零超时只看一眼() {
+        let (_plane, _host, actions, port, token) = granted();
+        let musician = start_musician(port, &token);
+        actions.live(musician, "ai-working");
+
+        let started = std::time::Instant::now();
+        let (status, v) = wait(port, &token, musician, 0);
+        assert_eq!(status, 200, "{v}");
+        assert_eq!(v["data"]["waited"]["outcome"], "pending");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "0 超时不许睡一拍"
+        );
+    }
+
+    /// 没给目标编号 → `badRequest`（与 `send` 同一条）。
+    #[test]
+    fn wait_缺目标编号被拒() {
+        let (_plane, _host, _actions, port, token) = granted();
+        let payload = payload_of(&token, r#""timeoutMs":100"#);
+        let (status, body) = post(port, "/control/wait", &payload);
+        assert_eq!(status, 400);
+        assert_eq!(error_code(&body), "badRequest");
+    }
+
+    /// 长轮询期间 hook 那条路必须照常通 —— `wait` 一等就是几分钟，
+    /// 就地跑会把 AI 状态感知那条**权威通道**卡到天荒地老。
+    ///
+    /// （`start-session` 那条同款测试用的是 600ms 的慢动作；这条更狠：
+    /// wait 是真的在睡，睡的正是我们让它睡的那 1.5 秒。）
+    #[test]
+    fn 长轮询期间_hook_那条路不被卡住() {
+        let (_plane, _host, actions, port, token) = granted();
+        let musician = start_musician(port, &token);
+        actions.live(musician, "ai-working"); // 永远不收敛，一定等满
+
+        let waiter = {
+            let token = token.clone();
+            std::thread::spawn(move || wait(port, &token, musician, 1_500))
+        };
+        // 让 wait 先把请求发出去
+        std::thread::sleep(Duration::from_millis(120));
+        let started = std::time::Instant::now();
+        let (status, _body) = post(port, "/hook", r#"{"ptyId":1,"event":"Stop"}"#);
+        let hook_took = started.elapsed();
+        // serve() 里非控制路由一律 404（真 hook 循环在别处），要的是「立刻答」
+        assert_eq!(status, 404);
+        assert!(
+            hook_took < Duration::from_millis(500),
+            "长轮询把 hook 那条队卡住了: {hook_took:?}"
+        );
+
+        let (status, v) = waiter.join().unwrap();
+        assert_eq!(status, 200, "{v}");
+        assert_eq!(v["data"]["waited"]["outcome"], "pending");
+    }
+
+    /// 纯判定那一层：三档终态 + 两档不收敛，不起 HTTP。
+    #[test]
+    fn 终态判定只认既有事实() {
+        let liveness = |status: &str, ai: AiSessionState, cause: Option<&str>| PaneLiveness {
+            alive: true,
+            status: status.into(),
+            ai_session: ai,
+            cause: cause.map(str::to_string),
+        };
+
+        // 干完了（无 hook 的降级路径上没有成因，照样是 ai-idle）
+        assert_eq!(
+            liveness("ai-idle", AiSessionState::Active, Some("Stop")).settled(),
+            Some(WaitState::AiIdle)
+        );
+        assert_eq!(
+            liveness("ai-idle", AiSessionState::Unknown, None).settled(),
+            Some(WaitState::AiIdle),
+            "无 hook 的乐手也能报干完了，只是没有成因"
+        );
+        // attention 先于状态：Codex 那一档状态是 ai-working
+        assert_eq!(
+            liveness("ai-working", AiSessionState::Active, Some("PermissionRequest")).settled(),
+            Some(WaitState::Attention)
+        );
+        // 已退出只认明确结束的那一档
+        assert_eq!(
+            liveness("idle", AiSessionState::Ended, None).settled(),
+            Some(WaitState::Idle)
+        );
+        assert_eq!(
+            liveness("idle", AiSessionState::Unknown, None).settled(),
+            None,
+            "说不上来的那一档不许被当成已退出"
+        );
+        // 还在跑
+        assert_eq!(
+            liveness("ai-working", AiSessionState::Active, Some("PreToolUse")).settled(),
+            None
+        );
+        // pane 都没了不是终态（由调用方答 paneGone）
+        assert_eq!(PaneLiveness::gone().settled(), None);
+        // 线上那三个名字与 status 同一套词汇
+        assert_eq!(WaitState::AiIdle.name(), "ai-idle");
+        assert_eq!(WaitState::Idle.name(), "idle");
+        assert_eq!(WaitState::Attention.name(), "attention");
+    }
+
     // ─── 记账修剪 ─────────────────────────────────────────────
 
     /// 直接往记账表里塞一条（绕开 HTTP 与并发上限，专测修剪口径）。
@@ -3340,8 +4048,8 @@ mod tests {
 
     // ─── 命令表 ───────────────────────────────────────────────
 
-    /// 命令名与「会不会阻塞主线程」只有一份表。加一个变体时 `ALL` / `name` /
-    /// `blocks_on_desktop` / `handle` 的分发会一起编译不过 —— 这条测试补的是
+    /// 命令名与「能不能就地跑完」只有一份表。加一个变体时 `ALL` / `name` /
+    /// `needs_own_thread` / `handle` 的分发会一起编译不过 —— 这条测试补的是
     /// 「表里那几条自己对得上」。
     #[test]
     fn 每条命令都解析得回自己() {
@@ -3357,27 +4065,30 @@ mod tests {
                 "list-projects",
                 "start-session",
                 "list-panes",
-                "send"
+                "send",
+                "wait"
             ]
         );
         // 认不出的一律 None（带查询串 / 多层路径的别去猜）
-        for bad in ["", "send?x=1", "send/extra", "wait"] {
+        for bad in ["", "send?x=1", "send/extra", "wait/", "read"] {
             assert_eq!(Command::parse(bad), None, "{bad}");
         }
     }
 
-    /// 阻塞属性登记在命令表上：要回主线程的那些登记齐了，其余就地答完。
+    /// 「别在 HTTP 那条循环里就地做」的那些命令都登记齐了，其余就地答完。
     ///
-    /// `send` 要回主线程走 `AppStore::write_to_pane`（写 PTY 是 gpui 实体上的活），
-    /// 漏登记就会把 hook 上报那条队一起卡住 —— 正是这张表要防的事。
+    /// 两种进表的理由（见 [`Command::needs_own_thread`]）：`start-session` / `send`
+    /// 要回 gpui 主线程等回执；`wait` 主线程一次不碰，但要在这条线程上睡到几分钟。
+    /// 漏登记任意一条都会把 hook 上报那条队一起卡住 —— 正是这张表要防的事，
+    /// 而 `wait` 卡的不是三秒，是几分钟。
     #[test]
-    fn 要回主线程的命令都登记在阻塞表里() {
-        let blocking: Vec<&str> = Command::ALL
+    fn 不能就地跑完的命令都登记在表里() {
+        let threaded: Vec<&str> = Command::ALL
             .iter()
-            .filter(|c| c.blocks_on_desktop())
+            .filter(|c| c.needs_own_thread())
             .map(|c| c.name())
             .collect();
-        assert_eq!(blocking, vec!["start-session", "send"]);
+        assert_eq!(threaded, vec!["start-session", "send", "wait"]);
     }
 
     // ─── 阻塞命令不占 HTTP 线程 ───────────────────────────────

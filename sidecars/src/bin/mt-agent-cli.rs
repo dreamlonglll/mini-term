@@ -28,19 +28,24 @@
 //! mt-agent-cli list-panes                              # 我起过的受编排会话及其状态
 //! mt-agent-cli send --pane <ID> --text <TEXT>          # 给某个受编排会话派活
 //! mt-agent-cli send --pane <ID> --stdin                # 同上,正文从 stdin 读(多行)
+//! mt-agent-cli wait --pane <ID> [--timeout <SECONDS>]  # 等它干完/等人/退出(长轮询)
 //! ```
 //!
 //! 成功：JSON 到 stdout，退出码 0。失败：JSON 到 stderr，退出码见 [`CliError::exit_code`]。
+//!
+//! ⚠️ `wait` 是**唯一会阻塞好几分钟**的命令，它的读超时按请求的耐心放大
+//! （[`mt_agent_control::wait_read_timeout`]）；其余命令一律用常规的 5 秒。
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use mt_agent_control::{
     ControlFailure, ControlRequest, IdentityError, identity_from_env, parse_launchers, parse_panes,
-    parse_projects, parse_send_receipt, parse_started_pane, CONNECT_TIMEOUT, CONTROL_PREFIX,
-    READ_TIMEOUT,
+    parse_projects, parse_send_receipt, parse_started_pane, parse_wait_outcome, wait_read_timeout,
+    CONNECT_TIMEOUT, CONTROL_PREFIX, READ_TIMEOUT, WAIT_DEFAULT,
 };
 
 /// 退出码说明。**给编排者（LLM）读的**，所以 `--help` 里就得写清 `desktopBusy`
@@ -63,7 +68,30 @@ send notes:
   reports bracketedPaste: false when the target terminal was not in paste mode (its
   agent has probably exited), which means the lines went in one by one. An empty
   prompt is refused: a bare Enter would answer a pending prompt on the user's behalf,
-  and an orchestrator must never do that - ask the user to handle it instead.";
+  and an orchestrator must never do that - ask the user to handle it instead.
+
+wait notes:
+  wait blocks until the session settles, then prints one of four outcomes - ALWAYS
+  read `outcome`, the exit code is 0 for all of them:
+    ai-idle    the turn finished. Read `cause` to learn HOW: only Stop means the work
+               really completed; Interrupt means the user pressed Esc, and Stall means
+               the session went silent and was settled by a fallback. Neither of those
+               two is a delivered result.
+    attention  it is waiting for approval or asking a question; `cause` says which
+               (PermissionRequest / Elicitation / StopFailure).
+               DO NOT answer for the user and DO NOT send that session anything.
+               Tell the user in your own conversation and let them handle it there;
+               its status badge is already yellow. Then wait again.
+    idle       the agent inside that session has exited; the pane is back to a shell.
+    pending    it did not settle before the timeout. This is NOT an error. status
+               ai-working means it is genuinely busy - wait again. status idle means
+               that session is opaque to us (no hooks, and its command is not a
+               recognized AI command), so wait will never settle on it: use read or
+               ask the user.
+  --timeout defaults to 60s and is capped at 300s server-side; the command blocks for
+  that long, so keep it under your own tool-call timeout. Calling wait immediately
+  after send can return the PREVIOUS turn's ai-idle (the agent has not reacted yet) -
+  a waitedMs near 0 is the tell; wait again to confirm.";
 
 #[derive(Parser)]
 #[command(
@@ -110,6 +138,20 @@ enum Command {
         #[arg(long)]
         stdin: bool,
     },
+    /// Wait until one of your orchestrated sessions settles: finished, waiting for a
+    /// human, or exited.
+    ///
+    /// Blocks (long poll). Always read `outcome` from the JSON - every outcome, the
+    /// timeout included, exits 0. On `attention` the session is waiting for the USER:
+    /// report it and let them handle it; never answer on their behalf.
+    Wait {
+        /// Pane id of the orchestrated session, as reported by `start-session` / `list-panes`.
+        #[arg(long, value_name = "ID")]
+        pane: u32,
+        /// How long to wait, in seconds (default 60, capped at 300 server-side).
+        #[arg(long, value_name = "SECONDS")]
+        timeout: Option<u64>,
+    },
 }
 
 impl Command {
@@ -121,6 +163,24 @@ impl Command {
             Self::StartSession { .. } => "start-session",
             Self::ListPanes => "list-panes",
             Self::Send { .. } => "send",
+            Self::Wait { .. } => "wait",
+        }
+    }
+
+    /// 这条命令要给读响应留多久。
+    ///
+    /// 除 `wait` 之外都是一趟请求答一趟，[`READ_TIMEOUT`]（5 秒）足够；
+    /// **`wait` 会在服务端睡到几分钟**，照 5 秒读的话长轮询每次都变成 CLI 先
+    /// 断线 —— 编排者拿到的会是「够不着」，而不是它等的那个终态。
+    ///
+    /// 放大的口径住在 `mt_agent_control`（[`wait_read_timeout`]），因为它得与
+    /// 服务端那个上界对得上，而那条不等式跨着工作区边界、由主仓的对账测试钉住。
+    fn read_timeout(&self) -> Duration {
+        match self {
+            Self::Wait { timeout, .. } => {
+                wait_read_timeout(timeout.map_or(WAIT_DEFAULT, Duration::from_secs))
+            }
+            _ => READ_TIMEOUT,
         }
     }
 
@@ -137,6 +197,10 @@ impl Command {
             Self::Send { pane, text, stdin } => {
                 let body = read_body(text.as_deref(), *stdin)?;
                 ControlRequest::send(identity, *pane, &body)
+            }
+            // 不给 `--timeout` 就整个字段不出线：默认耐心只住在桌面侧那个常量上
+            Self::Wait { pane, timeout } => {
+                ControlRequest::wait(identity, *pane, timeout.map(Duration::from_secs))
             }
             _ => ControlRequest::from(identity),
         })
@@ -181,7 +245,7 @@ fn run(command: &Command) -> Result<String, CliError> {
     ))?;
     let body = serde_json::to_string(&command.request(&identity)?)
         .map_err(|e| CliError::DesktopUnreachable(format!("cannot encode request: {e}")))?;
-    let (status, response) = post(port, command.endpoint(), &body)?;
+    let (status, response) = post(port, command.endpoint(), &body, command.read_timeout())?;
 
     match command {
         Command::ListLaunchers => {
@@ -203,6 +267,12 @@ fn run(command: &Command) -> Result<String, CliError> {
         Command::Send { .. } => {
             let sent = parse_send_receipt(status, &response).map_err(CliError::Rejected)?;
             to_json(&serde_json::json!({ "sent": sent }))
+        }
+        // **超时也走成功这一路**：`pending` 是一条正常的观测结果，不是错误
+        // （做成错误就得给它一个「你或我们出了问题」的退出码档位，两样都不是）。
+        Command::Wait { .. } => {
+            let waited = parse_wait_outcome(status, &response).map_err(CliError::Rejected)?;
+            to_json(&serde_json::json!({ "waited": waited }))
         }
     }
 }
@@ -244,7 +314,16 @@ fn port_file_path() -> Option<PathBuf> {
 
 /// 裸 HTTP POST，返回 (状态码, body)。不引 HTTP 客户端依赖（与 miniterm-hook 同款），
 /// 区别是这条**要读响应**。
-fn post(port: u16, endpoint: &str, body: &str) -> Result<(u16, String), CliError> {
+///
+/// `read_timeout` 按命令来（[`Command::read_timeout`]）：`wait` 要等的是一个 AI
+/// 回合，别的都是一趟请求答一趟。**写超时不跟着放大** —— 请求体早就发完了，
+/// 长轮询等的是响应；写这一侧慢到 5 秒本来就是出事了。
+fn post(
+    port: u16,
+    endpoint: &str,
+    body: &str,
+    read_timeout: Duration,
+) -> Result<(u16, String), CliError> {
     let addr = format!("127.0.0.1:{port}")
         .parse()
         .map_err(|e| CliError::DesktopUnreachable(format!("bad address: {e}")))?;
@@ -252,7 +331,7 @@ fn post(port: u16, endpoint: &str, body: &str) -> Result<(u16, String), CliError
         CliError::DesktopUnreachable(format!("cannot reach mini-term on 127.0.0.1:{port}: {e}"))
     })?;
     stream
-        .set_read_timeout(Some(READ_TIMEOUT))
+        .set_read_timeout(Some(read_timeout))
         .and_then(|()| stream.set_write_timeout(Some(READ_TIMEOUT)))
         .map_err(|e| CliError::DesktopUnreachable(format!("socket setup failed: {e}")))?;
 
@@ -420,7 +499,128 @@ mod tests {
             .endpoint(),
             "send"
         );
+        assert_eq!(
+            Command::Wait {
+                pane: 1,
+                timeout: None
+            }
+            .endpoint(),
+            "wait"
+        );
         assert_eq!(CONTROL_PREFIX, "/control/");
+    }
+
+    /// **只有 `wait` 放大读超时**，其余命令一律常规 5 秒。
+    ///
+    /// 反过来（`wait` 也用 5 秒）时长轮询每次都是 CLI 先断线，编排者拿到的会是
+    /// 「够不着」而不是它等的那个终态 —— 这条命令因此整个不可用。
+    #[test]
+    fn 只有等待放大读超时() {
+        assert_eq!(Command::ListPanes.read_timeout(), READ_TIMEOUT);
+        assert_eq!(
+            Command::Send {
+                pane: 1,
+                text: Some("x".into()),
+                stdin: false
+            }
+            .read_timeout(),
+            READ_TIMEOUT
+        );
+
+        // 不给 --timeout：按服务端的默认耐心放大
+        let default = Command::Wait {
+            pane: 1,
+            timeout: None,
+        }
+        .read_timeout();
+        assert!(default > WAIT_DEFAULT, "默认那一档也得留富余: {default:?}");
+
+        // 给了就按给的放大，且**必须大于**服务端会占用的那段时间
+        let asked = Duration::from_secs(120);
+        let t = Command::Wait {
+            pane: 1,
+            timeout: Some(120),
+        }
+        .read_timeout();
+        assert!(t > asked, "{t:?}");
+
+        // 报一个天文数字：两侧都钳到上界，读超时也跟着落在上界那一档
+        let max = mt_agent_control::WAIT_MAX;
+        let huge = Command::Wait {
+            pane: 1,
+            timeout: Some(u64::MAX),
+        }
+        .read_timeout();
+        assert_eq!(huge, wait_read_timeout(max));
+        assert!(huge > max);
+    }
+
+    /// `wait` 的请求体只带目标与耐心；不给 `--timeout` 就整个字段不出线
+    /// （默认耐心只住在桌面侧那个常量上，CLI 不抄一份）。
+    #[test]
+    fn 等待请求体带目标与耐心() {
+        let id = mt_agent_control::Identity {
+            token: "t".into(),
+            pane_id: 5,
+        };
+        let json = |c: &Command| serde_json::to_string(&c.request(&id).unwrap()).unwrap();
+
+        assert_eq!(
+            json(&Command::Wait {
+                pane: 101,
+                timeout: None
+            }),
+            r#"{"token":"t","paneId":5,"targetPaneId":101}"#
+        );
+        assert_eq!(
+            json(&Command::Wait {
+                pane: 101,
+                timeout: Some(30)
+            }),
+            r#"{"token":"t","paneId":5,"targetPaneId":101,"timeoutMs":30000}"#
+        );
+    }
+
+    /// `--pane` 是必给的；`--timeout` 可选且必须是数字。
+    #[test]
+    fn 等待的参数形状() {
+        let parse = |args: &[&str]| Cli::try_parse_from(args).map(|_| ());
+        assert!(parse(&["mt-agent-cli", "wait", "--pane", "1"]).is_ok());
+        assert!(parse(&["mt-agent-cli", "wait", "--pane", "1", "--timeout", "30"]).is_ok());
+        assert!(parse(&["mt-agent-cli", "wait"]).is_err(), "--pane 必给");
+        assert!(parse(&["mt-agent-cli", "wait", "--pane", "1", "--timeout", "x"]).is_err());
+    }
+
+    /// `wait` 的四类结论、以及**每一类都退出码 0** 这件事，必须写在 `--help` 里
+    /// —— 编排者看不到就会拿退出码当结论，而那样它永远读不出 attention。
+    ///
+    /// attention 那一条还得写清「不代答」（ADR 0003 的铁律）：这是整条编排链路
+    /// 上最容易被 LLM 自作主张跨过去的一道闸。
+    #[test]
+    fn 帮助文案讲清楚了_wait_的四类结论() {
+        for outcome in ["ai-idle", "attention", "idle", "pending"] {
+            assert!(EXIT_CODE_HELP.contains(outcome), "没写 {outcome} 那一档");
+        }
+        assert!(
+            EXIT_CODE_HELP.contains("DO NOT answer for the user"),
+            "attention 不代答是 ADR 0003 的铁律，必须写死在帮助里"
+        );
+        assert!(
+            EXIT_CODE_HELP.contains("exit code is 0 for all of them"),
+            "得告诉它读 outcome 而不是读退出码"
+        );
+        assert!(
+            EXIT_CODE_HELP.contains("only Stop"),
+            "ai-idle 的三种成因得分得开，别把被打断当成做完了"
+        );
+        assert!(
+            EXIT_CODE_HELP.contains("is NOT an error"),
+            "超时不是错误，得说清"
+        );
+        assert!(
+            !EXIT_CODE_HELP.contains("musician"),
+            "用户可见文案一律用 orchestrated session（术语表）"
+        );
     }
 
     /// 每条命令带上自己那几个字段，不带别人的。

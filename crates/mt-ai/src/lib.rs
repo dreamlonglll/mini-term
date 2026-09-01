@@ -66,7 +66,7 @@ pub use control::{
     NoopOrchestratorActions, NoopOrchestratorHost, OrchestratedSession, OrchestratorActions,
     OrchestratorHost, PaneInput, PaneLiveness, SendFailure, SessionOrigin, StartFailure,
     StartSessionSpec, StartedSession, ACTION_TIMEOUT, DEFAULT_SESSION_CAP,
-    MAX_SESSIONS_PER_ORCHESTRATOR,
+    MAX_SESSIONS_PER_ORCHESTRATOR, WAIT_DEFAULT, WAIT_MAX,
 };
 pub use detect::{interactive_ai_command_name, is_interactive_ai_command, AI_COMMANDS};
 pub use hook_server::{is_attention_cause, HookState, HookStatusInfo};

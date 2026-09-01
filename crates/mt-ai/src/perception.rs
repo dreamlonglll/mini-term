@@ -133,6 +133,21 @@ impl AiPerception {
         monitor::resolve_status(&self.hooks, &self.tracker, pane_id)
     }
 
+    /// 当前状态的**成因**(不发射,只读):上一次发给 UI 的那个 hook 事件名
+    /// (`Stop` / `PermissionRequest` / `Interrupt` / `Stall` …)。
+    ///
+    /// 成因只住在发射器的去重表里(`StatusChange::cause` 的来源),`HookState`
+    /// 不存它 —— 它是「上一次状态变化是因为什么」,不是状态本身。
+    ///
+    /// 编排控制面的 `wait` 靠它分出两档终态(attention 的判据是成因而非状态,
+    /// 见 `mt_ai::control::PaneLiveness::cause`);托盘黄灯与停摆兜底读的
+    /// 也是同一份事实,**不另养一份会漂移的副本**。
+    ///
+    /// `None` = 无 hook 的降级路径(monitor 一律以无成因发射),或还没发过状态。
+    pub fn cause_of(&self, pane_id: u32) -> Option<String> {
+        self.emitter.last_cause(pane_id)
+    }
+
     /// 启动 hook HTTP 服务器。`data_dir` 是端口文件的落地目录。
     pub fn start_hook_server(&self, data_dir: PathBuf) -> Result<(), String> {
         hook_server::start_hook_server(

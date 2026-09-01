@@ -296,7 +296,13 @@ impl OrchestratorActions for ActionsImpl {
     /// - `alive` 走 [`AiBridge`] 的活 pane 名册(建 PTY 时登记、pane 关闭时注销,
     ///   与 500ms 轮询同一份);
     /// - `status` 走 `AiPerception`(hook 状态与旁路检测都在 `Arc<Mutex<..>>` 后面);
+    /// - `cause` 走同一份感知的发射器去重表(工单 06 的 `wait` 靠它分 attention);
     /// - 「在不在 AI 会话里」见 [`ai_session_state`] —— 那一问有**答不上来**的时候。
+    ///
+    /// ⚠️ 工单 06 起这个方法还兼任 `wait` 的**长轮询取样点**(每 250ms 一次,
+    /// 一次只对一个 pane)。四样全是互斥锁后面的裸读,量级没变;
+    /// 但它「必须很快、绝不跳主线程」这条契约从此更硬 —— 违反它就是让编排者的
+    /// 每一次等待都去排 gpui 主线程的队。
     fn pane_liveness(&self, pane_id: u32) -> PaneLiveness {
         let status = self.ai.perception().status_of(pane_id);
         let ai_session = ai_session_state(&self.ai, pane_id, &status);
@@ -304,6 +310,9 @@ impl OrchestratorActions for ActionsImpl {
             alive: self.ai.is_pane_live(pane_id),
             status,
             ai_session,
+            // **只读、原文照带**:成因是既有 AI 状态机的产出(hook 事件名 /
+            // 两条兜底落盘时带的 `Interrupt`、`Stall`),编排层一个字都不改写。
+            cause: self.ai.perception().cause_of(pane_id),
         }
     }
 }

@@ -30,6 +30,35 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// 常量比一次，而它够不到 bin 里的私有常量。放在这里，那条断言才不是假保险。
 pub const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
+// ─── 长轮询（`wait`，工单 06）──────────────────────────────────
+
+/// `wait` 长轮询的服务端上界（与 `mt_ai::control::WAIT_MAX` 必须一致）。
+///
+/// CLI 这一侧要它只为一件事：**按它放大自己的读超时**。上面那个 5 秒是为
+/// 「一趟请求答一趟」定的，而 `wait` 会在服务端睡到几分钟 —— 照 5 秒读的话
+/// 长轮询每次都变成 CLI 先断线，编排者拿到的会是「够不着」而不是终态。
+///
+/// 两侧各有一份常量、隔着工作区边界，由主仓 `tests/orchestrator_wire.rs`
+/// 拿真常量钉住（与 `READ_TIMEOUT` ↔ `ACTION_TIMEOUT` 那条同一种保险）。
+pub const WAIT_MAX: Duration = Duration::from_secs(300);
+
+/// 不给 `--timeout` 时服务端的默认耐心（与 `mt_ai::control::WAIT_DEFAULT` 一致）。
+///
+/// CLI 得知道它，否则默认用法下读超时会按 5 秒算 —— 而服务端要等 60 秒。
+pub const WAIT_DEFAULT: Duration = Duration::from_secs(60);
+
+/// `wait` 这一趟该把读超时设成多少。
+///
+/// = 服务端最多会占用的那段时间 + 一份常规富余（[`READ_TIMEOUT`]，留给 HTTP 往返
+/// 与最后那一次取样）。**必须严格大于服务端那一侧**，否则长轮询的正常回执
+/// （包括 `pending`）永远拿不到。
+///
+/// `requested` 先自己钳一次上界：服务端也会钳（那是权威的一道），
+/// 两边钳出同一个数，CLI 的读超时才与它真的等到的时间对得上。
+pub fn wait_read_timeout(requested: Duration) -> Duration {
+    requested.min(WAIT_MAX) + READ_TIMEOUT
+}
+
 /// 编排令牌的环境变量名（与 `mt_ai::control::TOKEN_ENV` 必须一致）。
 pub const TOKEN_ENV: &str = "MINITERM_ORCHESTRATOR_TOKEN";
 /// 编排者自身 pane 身份的环境变量名（与 `mt_ai::control::PANE_ENV` 必须一致）。
@@ -102,9 +131,13 @@ pub struct ControlRequest {
     /// `start-session`：落在哪个项目；不给就是编排者自己那个。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
-    /// 以某个乐手为目标的命令（`send`，工单 06~07 的 wait / read 同款）用它。
+    /// 以某个乐手为目标的命令（`send` / `wait`，工单 07 的 read 同款）用它。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_pane_id: Option<u32>,
+    /// `wait`：最多等多久（毫秒）。不给就是服务端的 [`WAIT_DEFAULT`]；
+    /// 超过 [`WAIT_MAX`] 由服务端钳回上界（钳而不拒）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
     /// `send`：要写穿进去的正文（编排者写的 prompt）。
     ///
     /// **只在这条命令的请求体里出现一次，别的地方一个字都不留** —— 它是用户
@@ -123,6 +156,7 @@ impl From<&Identity> for ControlRequest {
             project_id: None,
             target_pane_id: None,
             text: None,
+            timeout_ms: None,
         }
     }
 }
@@ -142,6 +176,18 @@ impl ControlRequest {
         Self {
             target_pane_id: Some(target_pane_id),
             text: Some(text.to_string()),
+            ..Self::from(id)
+        }
+    }
+
+    /// `wait` 的请求体：等哪个乐手、最多等多久。
+    ///
+    /// `timeout` 不给就整个字段不出线 —— 服务端据此落在它自己的
+    /// [`WAIT_DEFAULT`]，默认值因此只有一处（在桌面侧那个常量上）。
+    pub fn wait(id: &Identity, target_pane_id: u32, timeout: Option<Duration>) -> Self {
+        Self {
+            target_pane_id: Some(target_pane_id),
+            timeout_ms: timeout.map(|d| d.min(WAIT_MAX).as_millis() as u64),
             ..Self::from(id)
         }
     }
@@ -214,6 +260,59 @@ pub struct SendReceipt {
     /// 同一个 fail-closed 取向）。
     #[serde(default)]
     pub bracketed_paste: bool,
+}
+
+/// `wait` 的结论（工单 06）。
+///
+/// 四类终态里的三类走这个结构（第四类「pane 不存在」是错误码 `paneNotFound`），
+/// 外加一个 `pending`：**到耐心用尽还没收敛不是错误**，是一条正常的观测结果，
+/// 编排者据此决定继续等还是先去干别的。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WaitOutcome {
+    /// 等的是哪个受编排会话。
+    pub pane_id: u32,
+    /// 结论，四选一：
+    ///
+    /// - `ai-idle` —— 干完了。看 `cause` 才知道是**怎么**完的（只有 `Stop` 是
+    ///   真做完；`Interrupt` 是用户按了 Esc，`Stall` 是停摆兜底收敛的）。
+    /// - `attention` —— 停在等审批或向人提问，`cause` 是原因原文。
+    ///   **编排者不代答**：在自己的对话里请用户去那个会话处理。
+    /// - `idle` —— 里头的 agent 已经退出，会话退回裸 shell。
+    /// - `pending` —— 到时限还没收敛。看 `status`：`ai-working` 是真在跑，
+    ///   `idle` 是「这个会话看不透」（没有 hook、也没被识别成已知 AI 命令）。
+    ///
+    /// **缺省空串**：认不出这个字段的旧桌面端在场时，宁可让编排者拿到一个显然
+    /// 不合法的结论去查，也别默认成某一档终态（fail-closed 的取向，与
+    /// `Project::can_start_sessions` 同源）。
+    #[serde(default)]
+    pub outcome: String,
+    /// 收工那一刻的 AI 状态：`idle` / `ai-idle` / `ai-working`，与
+    /// `list-panes` 的状态列同一口径。
+    #[serde(default)]
+    pub status: String,
+    /// 成因原文（hook 事件名）。无 hook 的会话没有成因。
+    #[serde(default)]
+    pub cause: Option<String>,
+    /// 实际等了多久（毫秒）。给的超时被钳到上界时看得出来。
+    #[serde(default)]
+    pub waited_ms: u64,
+}
+
+impl WaitOutcome {
+    /// 停在等审批 / 向人提问了吗 —— 编排者该**停手播报**的那一档。
+    pub fn needs_human(&self) -> bool {
+        self.outcome == "attention"
+    }
+
+    /// 收敛成终态了吗（`false` = `pending`，还得接着等或去干别的）。
+    ///
+    /// 认的是那三个具体的名字而不是「不等于 pending」：认不出的 `outcome`
+    /// （旧/新桌面端、字段缺失）一律**不算**收敛 —— 少判一次终态只是多等一轮，
+    /// 误判成终态是把没做完的活报成交付。
+    pub fn is_settled(&self) -> bool {
+        matches!(self.outcome.as_str(), "ai-idle" | "attention" | "idle")
+    }
 }
 
 /// 被拒 / 出错的响应。`code` 是闭集（桌面侧 `ControlError::code`），
@@ -335,6 +434,17 @@ pub fn parse_send_receipt(status: u16, body: &str) -> Result<SendReceipt, Contro
         .ok_or_else(|| ControlFailure::malformed(status, "missing `sent`"))?;
     serde_json::from_value(sent)
         .map_err(|e| ControlFailure::malformed(status, &format!("bad `sent`: {e}")))
+}
+
+/// 解析 `wait` 的结论。
+pub fn parse_wait_outcome(status: u16, body: &str) -> Result<WaitOutcome, ControlFailure> {
+    let data = envelope(status, body)?;
+    let waited = data
+        .get("waited")
+        .cloned()
+        .ok_or_else(|| ControlFailure::malformed(status, "missing `waited`"))?;
+    serde_json::from_value(waited)
+        .map_err(|e| ControlFailure::malformed(status, &format!("bad `waited`: {e}")))
 }
 
 #[cfg(test)]
@@ -636,6 +746,145 @@ mod tests {
         ] {
             assert!(!f(code).is_denied(), "{code} 不是鉴权失败");
             assert!(!f(code).is_desktop_unavailable(), "{code} 不是够不着");
+        }
+    }
+
+    // ─── 工单 06：wait ────────────────────────────────────────
+
+    /// `wait` 的请求体：只带目标编号与耐心，别人的字段一个不出线；
+    /// 不给超时就整个字段不出线（默认值只住在桌面侧那个常量上）。
+    #[test]
+    fn 等待请求体只带目标与耐心() {
+        let id = Identity {
+            token: "t".into(),
+            pane_id: 3,
+        };
+        let json = serde_json::to_string(&ControlRequest::wait(&id, 101, None)).unwrap();
+        assert_eq!(json, r#"{"token":"t","paneId":3,"targetPaneId":101}"#);
+
+        let json = serde_json::to_string(&ControlRequest::wait(
+            &id,
+            101,
+            Some(Duration::from_secs(30)),
+        ))
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"token":"t","paneId":3,"targetPaneId":101,"timeoutMs":30000}"#
+        );
+        // 正文那个字段一个字都不该跟着 wait 出线
+        assert!(!json.contains("text"));
+    }
+
+    /// 超上界的耐心两侧钳成同一个数：CLI 得按它算读超时，算错就会先断线。
+    #[test]
+    fn 超上界的耐心被钳回上界() {
+        let id = Identity {
+            token: "t".into(),
+            pane_id: 3,
+        };
+        let req = ControlRequest::wait(&id, 101, Some(Duration::from_secs(9_999)));
+        assert_eq!(req.timeout_ms, Some(WAIT_MAX.as_millis() as u64));
+    }
+
+    /// `wait` 的读超时必须**大于**服务端可能占用的那段时间，否则长轮询的正常
+    /// 回执永远拿不到 —— 编排者看到的会是「够不着」而不是终态。
+    #[test]
+    fn 等待的读超时留出富余() {
+        assert!(wait_read_timeout(WAIT_MAX) > WAIT_MAX);
+        assert!(wait_read_timeout(WAIT_DEFAULT) > WAIT_DEFAULT);
+        // 报多大都按上界算（服务端也只等到上界）
+        assert_eq!(
+            wait_read_timeout(Duration::from_secs(9_999)),
+            wait_read_timeout(WAIT_MAX)
+        );
+        // 短耐心不许因此把常规读超时缩掉
+        assert!(wait_read_timeout(Duration::ZERO) >= READ_TIMEOUT);
+        assert!(WAIT_DEFAULT < WAIT_MAX);
+    }
+
+    #[test]
+    fn 解析等待结论() {
+        let body = r#"{"ok":true,"data":{"waited":{"paneId":101,"outcome":"ai-idle",
+            "status":"ai-idle","cause":"Stop","waitedMs":4210}}}"#;
+        let w = parse_wait_outcome(200, body).unwrap();
+        assert_eq!(w.pane_id, 101);
+        assert_eq!(w.outcome, "ai-idle");
+        assert_eq!(w.cause.as_deref(), Some("Stop"));
+        assert_eq!(w.waited_ms, 4210);
+        assert!(w.is_settled());
+        assert!(!w.needs_human());
+    }
+
+    /// attention 那一档：原因原文要到得了编排者手上，且 `needs_human` 认得出。
+    /// Codex 的审批等待状态是 `ai-working` —— 判据是成因不是状态。
+    #[test]
+    fn 解析等待结论的_attention_档() {
+        let body = r#"{"ok":true,"data":{"waited":{"paneId":101,"outcome":"attention",
+            "status":"ai-working","cause":"PermissionRequest","waitedMs":900}}}"#;
+        let w = parse_wait_outcome(200, body).unwrap();
+        assert!(w.needs_human(), "编排者据此停手播报，不代答");
+        assert!(w.is_settled());
+        assert_eq!(w.cause.as_deref(), Some("PermissionRequest"));
+        assert_eq!(w.status, "ai-working", "Codex 的审批等待停在工作中");
+    }
+
+    /// **超时是成功响应**：`pending` 不是错误，只是还没收敛。
+    /// 没有成因时 `cause` 整个字段不出线，解析成 `None`。
+    #[test]
+    fn 超时的等待结论也是成功响应() {
+        let body = r#"{"ok":true,"data":{"waited":{"paneId":101,"outcome":"pending",
+            "status":"ai-working","waitedMs":60000}}}"#;
+        let w = parse_wait_outcome(200, body).unwrap();
+        assert_eq!(w.outcome, "pending");
+        assert!(!w.is_settled(), "pending 不算收敛");
+        assert!(!w.needs_human());
+        assert_eq!(w.cause, None, "无 hook 的会话没有成因");
+    }
+
+    /// 认不出的 `outcome`（桌面端比 CLI 新 / 字段缺失）**不算收敛** ——
+    /// 少判一次只是多等一轮，误判成终态是把没做完的活报成交付。
+    #[test]
+    fn 认不出的结论不算收敛() {
+        let body = r#"{"ok":true,"data":{"waited":{"paneId":101,"status":"idle"}}}"#;
+        let w = parse_wait_outcome(200, body).unwrap();
+        assert_eq!(w.outcome, "");
+        assert!(!w.is_settled());
+        assert!(!w.needs_human());
+
+        let body = r#"{"ok":true,"data":{"waited":{"paneId":101,"outcome":"somethingNew",
+            "status":"ai-idle"}}}"#;
+        assert!(!parse_wait_outcome(200, body).unwrap().is_settled());
+    }
+
+    /// 认不出的响应照旧算失败，不许退化成「反正没等到」。
+    #[test]
+    fn 等待的坏响应也算失败() {
+        for (status, body) in [(200, "not json"), (200, r#"{"ok":true,"data":{}}"#)] {
+            assert_eq!(
+                parse_wait_outcome(status, body).unwrap_err().code,
+                "malformedResponse",
+                "body={body}"
+            );
+        }
+    }
+
+    /// `wait` 复用既有错误码，**没有自己的新码**：四类终态里那一类
+    /// 「pane 不存在」就是 `paneNotFound`（与 `send` 同一条可见范围铁律）。
+    #[test]
+    fn 等待复用既有错误码() {
+        for (status, code) in [
+            (404, "paneNotFound"),
+            (403, "selfTarget"),
+            (410, "paneGone"),
+        ] {
+            let body = format!(
+                r#"{{"ok":false,"error":{{"code":"{code}","message":"m"}}}}"#
+            );
+            let err = parse_wait_outcome(status, &body).unwrap_err();
+            assert_eq!(err.code, code);
+            assert!(!err.is_denied(), "{code} 不是鉴权失败");
+            assert!(!err.is_desktop_unavailable(), "{code} 不是够不着");
         }
     }
 

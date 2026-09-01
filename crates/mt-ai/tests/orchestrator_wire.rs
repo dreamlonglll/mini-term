@@ -18,7 +18,7 @@ use mt_ai::control::{
 };
 use mt_agent_control::{
     ControlRequest, Identity, parse_launchers, parse_panes, parse_projects, parse_send_receipt,
-    parse_started_pane,
+    parse_started_pane, parse_wait_outcome,
 };
 
 /// 桌面能力的假宿主(与 mt-app 那份真实现同形)。
@@ -93,11 +93,14 @@ impl OrchestratorActions for Actions {
         })
     }
 
+    /// 与 mt-app 那份真实现同形：四样全是只读现查。这里的乐手刚干完一个回合
+    /// （`Stop` 是唯一「真做完」的成因），`wait` 因此一问就收敛。
     fn pane_liveness(&self, _pane_id: u32) -> PaneLiveness {
         PaneLiveness {
             alive: true,
             status: "ai-idle".into(),
             ai_session: AiSessionState::Active,
+            cause: Some("Stop".into()),
         }
     }
 }
@@ -389,6 +392,148 @@ fn desktop_busy_的语义两侧一致() {
     assert!(
         !err.message.contains("musician"),
         "用户可见文案一律用 orchestrated session(术语表)"
+    );
+}
+
+// ─── 工单 06:wait ────────────────────────────────────────────
+
+/// `wait` 的结论:请求方向(CLI 构造带 targetPaneId + timeoutMs 的体)与响应方向
+/// (handler 的等待回执)各走一遍真代码。
+///
+/// 这里的假宿主刚干完一个回合(`ai-idle` + `Stop`),所以一问就收敛 ——
+/// 长轮询本身在主缝测(`control.rs`),这条只对账**形状**。
+#[test]
+fn 等待结论能被_sidecar_解析器读懂() {
+    let (plane, identity, _body) = granted();
+    let start =
+        serde_json::to_string(&ControlRequest::start_session(&identity, "claude", None)).unwrap();
+    assert_eq!(plane.handle("start-session", &start).status, 200);
+
+    let body = serde_json::to_string(&ControlRequest::wait(
+        &identity,
+        101,
+        Some(std::time::Duration::from_secs(2)),
+    ))
+    .unwrap();
+    let outcome = plane.handle("wait", &body);
+    assert_eq!(outcome.status, 200, "{}", outcome.body);
+
+    let waited = parse_wait_outcome(outcome.status, &outcome.body)
+        .expect("sidecar 的解析器必须读得懂桌面 handler 的产出");
+    assert_eq!(waited.pane_id, 101);
+    assert_eq!(waited.outcome, "ai-idle");
+    assert_eq!(waited.status, "ai-idle");
+    // 成因**原文**要到得了 CLI 侧:只有 `Stop` 是真做完
+    assert_eq!(waited.cause.as_deref(), Some("Stop"));
+    assert!(waited.is_settled());
+    assert!(!waited.needs_human());
+}
+
+/// attention 那一档的形状对账:原因原文透到 CLI 侧,`needs_human` 认得出。
+///
+/// 用一个单独的假宿主,因为它要停在「等人处理」而不是「干完了」——
+/// 而这正是编排者**唯一必须停手**的那一档(ADR 0003:不代答)。
+#[test]
+fn 等人处理那一档能被_sidecar_解析器读懂() {
+    /// Codex 的审批等待:状态停在 `ai-working`(批准后直接执行工具),
+    /// 判据是**成因**不是状态 —— 只看状态会一直等到超时。
+    struct Waiting;
+
+    impl OrchestratorActions for Waiting {
+        fn start_session(&self, spec: StartSessionSpec) -> Result<StartedSession, StartFailure> {
+            Ok(spec.landed(101, "大脑"))
+        }
+        fn send_input(&self, _pane_id: u32, _input: PaneInput) -> Result<Delivered, SendFailure> {
+            unreachable!("attention 时编排者不代答,一个字节都不该写出去")
+        }
+        fn pane_liveness(&self, _pane_id: u32) -> PaneLiveness {
+            PaneLiveness {
+                alive: true,
+                status: "ai-working".into(),
+                ai_session: AiSessionState::Active,
+                cause: Some("PermissionRequest".into()),
+            }
+        }
+    }
+
+    let plane = ControlPlane::new();
+    plane.set_host(Arc::new(Host));
+    plane.set_actions(Arc::new(Waiting));
+    let token = plane.grant(7, "p-self");
+    let identity = Identity { token, pane_id: 7 };
+    let start =
+        serde_json::to_string(&ControlRequest::start_session(&identity, "claude", None)).unwrap();
+    assert_eq!(plane.handle("start-session", &start).status, 200);
+
+    let body = serde_json::to_string(&ControlRequest::wait(&identity, 101, None)).unwrap();
+    let outcome = plane.handle("wait", &body);
+    assert_eq!(outcome.status, 200, "{}", outcome.body);
+
+    let waited = parse_wait_outcome(outcome.status, &outcome.body).unwrap();
+    assert_eq!(waited.outcome, "attention");
+    assert_eq!(waited.cause.as_deref(), Some("PermissionRequest"));
+    assert_eq!(waited.status, "ai-working", "Codex 那一档停在工作中");
+    assert!(waited.needs_human(), "CLI 侧据此停手播报");
+}
+
+/// `wait` **没有自己的新错误码**:「pane 不存在」那一类终态复用可见范围铁律
+/// 那三条(与 `send` 一模一样),两侧对得上。
+#[test]
+fn 等待复用可见范围的错误码() {
+    let (plane, identity, _body) = granted();
+    let start =
+        serde_json::to_string(&ControlRequest::start_session(&identity, "claude", None)).unwrap();
+    assert_eq!(plane.handle("start-session", &start).status, 200);
+
+    // 不是自己起的乐手 —— 统一的「不存在」语义
+    let body = serde_json::to_string(&ControlRequest::wait(&identity, 4242, None)).unwrap();
+    let outcome = plane.handle("wait", &body);
+    let err = parse_wait_outcome(outcome.status, &outcome.body).unwrap_err();
+    assert_eq!(err.code, "paneNotFound");
+    assert_eq!(err.status, 404);
+    assert!(!err.is_denied() && !err.is_desktop_unavailable());
+    assert!(
+        !err.message.contains("musician"),
+        "用户可见文案一律用 orchestrated session(术语表)"
+    );
+
+    // 自指禁令
+    let body = serde_json::to_string(&ControlRequest::wait(&identity, 7, None)).unwrap();
+    let outcome = plane.handle("wait", &body);
+    let err = parse_wait_outcome(outcome.status, &outcome.body).unwrap_err();
+    assert_eq!(err.code, "selfTarget");
+}
+
+/// 长轮询的**上界与默认耐心**两侧必须是同一个数,而 CLI 的读超时必须留出富余。
+///
+/// 这条跨着工作区边界:CLI 按自己那份常量算读超时,服务端按自己那份钳耐心 ——
+/// 两份漂了,长轮询就变成「CLI 先断线」,编排者拿到的是「够不着」而不是终态。
+/// 与 `ACTION_TIMEOUT` ↔ `READ_TIMEOUT` 那条是同一种保险,只有在这里能拿真值比。
+#[test]
+fn 长轮询的上界两侧一致且读超时留富余() {
+    assert_eq!(
+        mt_ai::control::WAIT_MAX,
+        mt_agent_control::WAIT_MAX,
+        "上界漂了:CLI 会按错的数算读超时"
+    );
+    assert_eq!(
+        mt_ai::control::WAIT_DEFAULT,
+        mt_agent_control::WAIT_DEFAULT,
+        "默认耐心漂了:不给 --timeout 时 CLI 会先断线"
+    );
+    // 读超时必须**严格大于**服务端会占用的那段时间
+    assert!(
+        mt_agent_control::wait_read_timeout(mt_ai::control::WAIT_MAX) > mt_ai::control::WAIT_MAX,
+        "等满上界的那一趟拿不到回执"
+    );
+    assert!(
+        mt_agent_control::wait_read_timeout(mt_ai::control::WAIT_DEFAULT)
+            > mt_ai::control::WAIT_DEFAULT
+    );
+    // 长轮询的耐心与「等主线程」那条时限不是一回事,别哪天被合成一个常量
+    assert!(
+        mt_ai::control::ACTION_TIMEOUT < mt_ai::control::WAIT_DEFAULT,
+        "等一个 AI 回合与建一个 pane 差两个数量级,不该共用一个数"
     );
 }
 

@@ -158,7 +158,11 @@ impl StatusEmitter {
 
     /// 上次发给 UI 的成因。停摆兜底用它避让「正等用户批准」的 pane：
     /// 那类 pane 的黄灯要一直亮到用户处理，兜底若插一脚会把 attention 抹掉。
-    pub(crate) fn last_cause(&self, pty_id: u32) -> Option<String> {
+    ///
+    /// （工单 06 起也是编排控制面 `wait` 的成因来源 —— 经
+    /// `AiPerception::cause_of` 读，故从 `pub(crate)` 放开成 `pub`。
+    /// **它是只读的**：`wait` 一个字都不写回状态机。）
+    pub fn last_cause(&self, pty_id: u32) -> Option<String> {
         self.prev
             .lock()
             .get(&pty_id)
