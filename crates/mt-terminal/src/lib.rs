@@ -313,8 +313,7 @@ impl TerminalEmulator {
     /// 口径与 [`Self::visible_lines`] 一致(跳过宽字符 spacer、裁行尾空格),
     /// 这样定锚与校验两侧不会因为取法不同而假性失配。
     pub fn line_text(&self, abs_line: i32) -> Option<String> {
-        use alacritty_terminal::index::{Column, Line};
-        use alacritty_terminal::term::cell::Flags;
+        use alacritty_terminal::index::Line;
 
         let term = self.term.lock();
         let history = term.history_size() as i32;
@@ -322,9 +321,67 @@ impl TerminalEmulator {
         if line < -history || line >= term.screen_lines() as i32 {
             return None;
         }
-        let row = &term.grid()[Line(line)];
+        Some(Self::row_text(&term.grid()[Line(line)], term.columns()))
+    }
+
+    /// 画面**尾部** `max_lines` 行纯文本,**一次持锁取齐**。
+    ///
+    /// 「尾部」= 从最后一个非空行往回数,所以光标下方那一片空屏不会把有内容的
+    /// 行挤出去(agent 的 TUI 通常只占屏幕上半截)。不足 `max_lines` 行就有多少
+    /// 给多少;整屏全空给空 `Vec`。
+    ///
+    /// # 与 [`Self::line_text`] 的分工
+    ///
+    /// 那条是**按绝对行号点名**取一行(AI 任务标记校验锚点用),这条是**按尾部
+    /// 取一段**。行内口径完全一样(跳宽字符 spacer、裁行尾空格、颜色与属性一律
+    /// 剥掉),共用同一个 [`Self::row_text`]。分成两个方法而不是让调用方循环调
+    /// `line_text`,是因为循环会**逐行各锁一次**:reader 线程在中间推进状态机,
+    /// 取回来的那几行就不是同一帧的画面了。
+    ///
+    /// 回看缓冲(scrollback)算在内 —— `max_lines` 大于可视区行数时继续往历史里
+    /// 取。备用屏(alt screen)下 `history_size()` 恒 0,于是自然只给备用屏那一屏,
+    /// 那正是此刻用户看见的东西。
+    pub fn tail_lines(&self, max_lines: usize) -> Vec<String> {
+        use alacritty_terminal::index::Line;
+
+        if max_lines == 0 {
+            return Vec::new();
+        }
+        let term = self.term.lock();
+        let columns = term.columns();
+        let history = term.history_size() as i32;
+        let last = term.screen_lines() as i32 - 1;
+        // 先把尾部的空行跳掉:光标下方那一片是空屏,不该占掉配额。
+        let mut end = last;
+        while end >= -history {
+            if !Self::row_text(&term.grid()[Line(end)], columns).is_empty() {
+                break;
+            }
+            end -= 1;
+        }
+        let mut rows: Vec<String> = Vec::new();
+        let mut line = end;
+        while line >= -history && rows.len() < max_lines {
+            rows.push(Self::row_text(&term.grid()[Line(line)], columns));
+            line -= 1;
+        }
+        rows.reverse();
+        rows
+    }
+
+    /// 一行 grid 的纯文本:跳过宽字符 spacer、裁掉行尾空格。
+    ///
+    /// [`Self::line_text`] 与 [`Self::tail_lines`] 的共同口径 —— 两处各写一遍就是
+    /// 两种取法,定锚与校验会因此假性失配。
+    fn row_text(
+        row: &alacritty_terminal::grid::Row<alacritty_terminal::term::cell::Cell>,
+        columns: usize,
+    ) -> String {
+        use alacritty_terminal::index::Column;
+        use alacritty_terminal::term::cell::Flags;
+
         let mut s = String::new();
-        for col in 0..term.columns() {
+        for col in 0..columns {
             let cell = &row[Column(col)];
             if cell
                 .flags
@@ -337,7 +394,7 @@ impl TerminalEmulator {
         while s.ends_with(' ') {
             s.pop();
         }
-        Some(s)
+        s
     }
 
     /// 可视区逐行的 `(列号, 字符)`。宽字符只出现一次,列号是它**起始**的那一列;
@@ -406,6 +463,94 @@ mod tests {
         e.set_scrollback(40);
         assert_eq!(e.scrollback(), 40);
         assert_eq!(e.history_lines(), 3);
+    }
+
+    // ─── 尾部 N 行(编排者的 read-screen)────────────────────────
+
+    /// 尾部**从最后一个非空行往回数**,光标下方那一片空屏不占配额。
+    #[test]
+    fn 尾部行跳过屏幕下方的空白() {
+        let e = TerminalEmulator::new(TermSize::new(40, 10));
+        e.advance(b"one\r\ntwo\r\nthree\r\n"); // 光标落在第 3 行,下面 6 行全空
+        assert_eq!(e.tail_lines(50), vec!["one", "two", "three"]);
+        // 不足 N 行就有多少给多少,顺序是**旧的在前**(与人眼看屏幕一致)
+        assert_eq!(e.tail_lines(2), vec!["two", "three"]);
+        assert_eq!(e.tail_lines(1), vec!["three"]);
+        assert!(e.tail_lines(0).is_empty(), "要 0 行就给 0 行");
+    }
+
+    /// 整屏全空给空 `Vec` —— 那不是失败,是「这个终端上什么都没有」。
+    #[test]
+    fn 空屏给空的一段() {
+        let e = TerminalEmulator::new(TermSize::new(40, 10));
+        assert!(e.tail_lines(50).is_empty());
+    }
+
+    /// 要得比可视区多时**继续往回看缓冲里取**。
+    #[test]
+    fn 尾部行取得到回看缓冲() {
+        let e = TerminalEmulator::with_scrollback(TermSize::new(40, 4), 100);
+        feed_lines(&e, 20); // line0..line19,可视区只装得下 4 行
+        assert!(e.history_lines() > 4, "先攒出一段历史");
+
+        // 只要可视区那几行
+        let visible = e.tail_lines(3);
+        assert_eq!(visible, vec!["line17", "line18", "line19"]);
+        // 要 10 行就从历史里补上
+        let deep = e.tail_lines(10);
+        assert_eq!(deep.len(), 10);
+        assert_eq!(deep.first().unwrap(), "line10");
+        assert_eq!(deep.last().unwrap(), "line19");
+        // 要得比存着的还多:有多少给多少,不报错也不补空行
+        assert_eq!(e.tail_lines(9999).len(), 20);
+    }
+
+    /// 行内口径与 [`TerminalEmulator::line_text`] 完全一致(两者共用 `row_text`):
+    /// 行尾空格裁掉、颜色与属性一律剥掉、宽字符只出现一次。
+    #[test]
+    fn 尾部行与按行号取同一个口径() {
+        let e = TerminalEmulator::new(TermSize::new(40, 6));
+        // 带颜色 + 行尾一堆空格 + 中英混排
+        e.advance("\x1b[31m红色\x1b[0m abc   \r\n你好world\r\n".as_bytes());
+
+        let tail = e.tail_lines(10);
+        assert_eq!(tail, vec!["红色 abc", "你好world"], "颜色要剥掉、行尾空格要裁");
+        // 与按绝对行号取的那条逐字相同
+        for (i, row) in tail.iter().enumerate() {
+            assert_eq!(e.line_text(i as i32).as_ref(), Some(row), "第 {i} 行口径不一致");
+        }
+    }
+
+    /// 备用屏(alt screen,agent 的 TUI 常驻的那一档):`history_size` 恒 0,
+    /// 于是尾部就是备用屏那一屏 —— 正是此刻用户看见的东西。
+    #[test]
+    fn 备用屏只给备用屏那一屏() {
+        let e = TerminalEmulator::with_scrollback(TermSize::new(40, 5), 100);
+        feed_lines(&e, 20); // 主屏攒一堆历史
+        e.advance(b"\x1b[?1049h"); // 切备用屏
+        e.advance(b"approve? (y/n)\r\n");
+
+        let tail = e.tail_lines(50);
+        assert!(
+            tail.iter().all(|l| !l.starts_with("line")),
+            "备用屏不该翻出主屏的历史: {tail:?}"
+        );
+        assert!(tail.len() <= 5, "至多一屏(5 行),实际 {}", tail.len());
+        assert_eq!(tail.last().unwrap(), "approve? (y/n)");
+
+        e.advance(b"\x1b[?1049l"); // 切回主屏,历史还在
+        assert_eq!(e.tail_lines(2), vec!["line18", "line19"]);
+    }
+
+    /// **只裁尾部空行,当中与开头的空行留着**。
+    ///
+    /// 空行是画面的一部分(TUI 靠它分块),抹掉就不是「那一屏的样子」了;
+    /// 尾部那一片则是光标下方的空屏,纯噪音,不该占掉编排者要的配额。
+    #[test]
+    fn 只裁尾部空行中间的留着() {
+        let e = TerminalEmulator::new(TermSize::new(40, 10));
+        e.advance(b"\r\n\r\ntop\r\n\r\nbottom\r\n\r\n\r\n");
+        assert_eq!(e.tail_lines(50), vec!["", "", "top", "", "bottom"]);
     }
 
     /// 没武装时什么都不追踪 —— `advance` 走整批快路径。

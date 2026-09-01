@@ -74,6 +74,11 @@ impl AiBridge {
             .control()
             .set_host(Arc::new(crate::orchestrator::HostImpl::new(
                 orchestrator_mirror.clone(),
+                // 会话身份那两张表(hook 上报 / 输入检测)按值给过去 ——
+                // 内部都是 `Arc<Mutex<..>>`,克隆即共享同一份;给整个 `AiBridge`
+                // 会绕成一圈放不掉的 Arc(见 `HostImpl::new` 的注释)。
+                perception.hooks().clone(),
+                perception.tracker().clone(),
             )));
 
         let bridge = Self {

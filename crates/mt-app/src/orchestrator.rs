@@ -70,8 +70,8 @@ use futures::channel::mpsc::{self, UnboundedSender};
 use gpui::{App, Entity, Task, Window};
 use mt_ai::{
     AiSessionState, ControlLauncher, ControlProject, Delivered, OrchestratorActions,
-    OrchestratorHost, PaneInput, PaneLiveness, SendFailure, StartFailure, StartSessionSpec,
-    StartedSession, ACTION_TIMEOUT,
+    OrchestratorHost, PaneInput, PaneLiveness, ScreenFailure, SendFailure, StartFailure,
+    StartSessionSpec, StartedSession, ACTION_TIMEOUT,
 };
 use mt_config::{AiLauncher, AppConfig, ProjectTreeItem};
 use parking_lot::Mutex;
@@ -165,11 +165,31 @@ impl OrchestratorMirror {
 /// 注入给 `mt-ai` 的宿主实现。
 pub struct HostImpl {
     mirror: SharedMirror,
+    /// hook 上报的会话身份表(`pty → agent + session_id`)。
+    hooks: mt_ai::HookState,
+    /// 输入检测认出来的 agent 名 —— 没有 hook 的那些乐手唯一的 agent 来源。
+    tracker: mt_ai::SessionTracker,
 }
 
 impl HostImpl {
-    pub fn new(mirror: SharedMirror) -> Self {
-        Self { mirror }
+    /// 拿的是 `HookState` / `SessionTracker` 这两份**具体**的表,不是整个
+    /// [`AiBridge`]:
+    ///
+    /// - 两者内部都是 `Arc<Mutex<..>>`,克隆即共享同一份,后台线程随手可读;
+    /// - 更要紧的是**不成环** —— `AiBridge` 里装着 `AiPerception`,而
+    ///   `AiPerception` 里装着这个宿主要被塞进去的那个 `ControlPlane`。
+    ///   拿整个桥就是 `ControlPlane → HostImpl → AiBridge → ControlPlane` 一圈
+    ///   `Arc` 引用,谁也放不掉。这两张表都不认识 `ControlPlane`。
+    pub fn new(
+        mirror: SharedMirror,
+        hooks: mt_ai::HookState,
+        tracker: mt_ai::SessionTracker,
+    ) -> Self {
+        Self {
+            mirror,
+            hooks,
+            tracker,
+        }
     }
 }
 
@@ -181,6 +201,50 @@ impl OrchestratorHost for HostImpl {
     fn projects(&self) -> Vec<ControlProject> {
         self.mirror.lock().projects.clone()
     }
+
+    /// 会话身份**照实报**,一个字都不加工(工单 07)。
+    ///
+    /// 两个来源各管一头,与对话镜像(`mt_relay::mirror` 的绑定两层)同一个分工:
+    ///
+    /// - `session_id` **只**来自 hook(`HookState::session_of`)—— 它是绑定的
+    ///   唯一权威。没有就是没有,这边不许拿别的东西凑一个出来:控制面据此答
+    ///   `sessionUnidentified`,而**启发式绑定是踩过坑的**(会把同项目里别的
+    ///   agent 的对话贴到这个 pane 上)。
+    /// - `agent` 先问 hook,没有再退回输入检测(`SessionTracker::ai_session_agent`)。
+    ///   退这一步是必须的:opencode / pi 压根不发 hook,没有它就答不出
+    ///   「这个 agent 没有会话记录,改用 read-screen」那句话。
+    ///
+    /// 两张表都在 `Arc<Mutex<..>>` 后面,**不跳主线程**(与 `pane_liveness` 同款)。
+    ///
+    /// 取值与合并分开:合并那一半是 [`merge_pane_session`],纯函数、可单测 ——
+    /// hook 那张表没有公开的写入口(`record_session` 是私有的,只有真 hook 事件
+    /// 进得去),不拆开的话「hook 优先」这条就一条测试都写不出来。
+    fn pane_session(&self, pane_id: u32) -> Option<mt_ai::PaneSession> {
+        let hook = self
+            .hooks
+            .session_of(pane_id)
+            .map(|s| (s.session_id, s.agent));
+        merge_pane_session(hook, self.tracker.ai_session_agent(pane_id))
+    }
+}
+
+/// 把两个来源合成一份会话身份。`hook` = `(session_id, agent)`。
+///
+/// 三条:`session_id` **只**认 hook;`agent` hook 优先、退回输入检测;
+/// 两样都没有就答 `None`(答一个空壳与答「不知道」等价,`None` 更诚实)。
+fn merge_pane_session(
+    hook: Option<(String, Option<String>)>,
+    detected: Option<String>,
+) -> Option<mt_ai::PaneSession> {
+    let (session_id, hook_agent) = match hook {
+        Some((id, agent)) => (Some(id), agent),
+        None => (None, None),
+    };
+    let agent = hook_agent.or(detected);
+    if session_id.is_none() && agent.is_none() {
+        return None;
+    }
+    Some(mt_ai::PaneSession { session_id, agent })
 }
 
 // ─── 动作:起乐手 / 查死活 ────────────────────────────────────
@@ -224,6 +288,20 @@ enum OrchestratorSignal {
         reply: std::sync::mpsc::SyncSender<Result<Delivered, SendFailure>>,
         deadline: Deadline,
     },
+    /// 读某个乐手的终端画面尾部若干行(工单 07)。
+    ///
+    /// **为什么也走主线程**:终端本体(`Arc<Mutex<Term>>`)后台线程读得动,
+    /// 但 `pty_id → 终端` 那张表(`AppStore::terminals`)装的是 gpui 实体。
+    /// 在旁边另建一份镜像表就是给 pane 生命周期再加一个必须同步注销的地方 ——
+    /// 漏一次注销就永久攥着一份一万行的回看缓冲。读一屏是几十微秒的主线程
+    /// 占用,与建 pane 不是一个量级,走泵便宜得多。
+    ReadScreen {
+        pane_id: u32,
+        /// 要几行(控制面已经钳进 `1..=MAX_SCREEN_LINES`)。
+        lines: usize,
+        reply: std::sync::mpsc::SyncSender<Result<Vec<String>, ScreenFailure>>,
+        deadline: Deadline,
+    },
 }
 
 impl OrchestratorSignal {
@@ -234,7 +312,9 @@ impl OrchestratorSignal {
     /// 无人认领的 pane。
     fn deadline(&self) -> Deadline {
         match self {
-            Self::StartSession { deadline, .. } | Self::SendInput { deadline, .. } => *deadline,
+            Self::StartSession { deadline, .. }
+            | Self::SendInput { deadline, .. }
+            | Self::ReadScreen { deadline, .. } => *deadline,
         }
     }
 }
@@ -288,6 +368,28 @@ impl OrchestratorActions for ActionsImpl {
         answer
             .recv_timeout(ACTION_TIMEOUT)
             .unwrap_or(Err(SendFailure::DesktopBusy))
+    }
+
+    /// 读画面同样回主线程(那张 `pty_id → 终端` 表是 gpui 实体的表),
+    /// 于是与另外两条**同一条路**:同一个泵、同一个时限、同一种超时结论。
+    fn read_screen(&self, pane_id: u32, lines: usize) -> Result<Vec<String>, ScreenFailure> {
+        let (reply, answer) = std::sync::mpsc::sync_channel(1);
+        let deadline = Deadline::after(ACTION_TIMEOUT);
+        if self
+            .tx
+            .unbounded_send(OrchestratorSignal::ReadScreen {
+                pane_id,
+                lines,
+                reply,
+                deadline,
+            })
+            .is_err()
+        {
+            return Err(ScreenFailure::DesktopBusy);
+        }
+        answer
+            .recv_timeout(ACTION_TIMEOUT)
+            .unwrap_or(Err(ScreenFailure::DesktopBusy))
     }
 
     /// 死活**不跳主线程** —— 名额判定一次要问好几个 pane,而这几样东西后台线程
@@ -383,6 +485,19 @@ pub fn install(store: Entity<AppStore>, window: &mut Window, cx: &mut App) -> Ta
                     };
                     // 回执丢了这条**没有**起会话那种「桌面上多了个东西」的后果:
                     // 字节要么进了 PTY 要么没进,不留任何要记账的实体。
+                    let _ = reply.send(result);
+                }
+                OrchestratorSignal::ReadScreen {
+                    pane_id,
+                    lines,
+                    reply,
+                    ..
+                } => {
+                    let Ok(result) = cx.update(|_window, cx| read_screen(&store, pane_id, lines, cx))
+                    else {
+                        return;
+                    };
+                    // 纯读,回执丢了什么后果都没有。
                     let _ = reply.send(result);
                 }
             }
@@ -498,6 +613,26 @@ fn send_input(
         return Err(SendFailure::WriteFailed);
     }
     Ok(Delivered { bracketed_paste })
+}
+
+/// 主线程上真正把那个乐手的画面读出来。
+///
+/// 只有一句话的活:按 PTY 编号找到终端,让它一次持锁交出尾部若干行纯文本
+/// (`mt_terminal::TerminalEmulator::tail_lines`,取行/裁空白/剥颜色都在那里)。
+///
+/// 找不到那个终端 = 控制面裁决之后、走到这儿之前用户刚好把它关了 ——
+/// 与写穿那条的同名档位同一个含义,如实答 [`ScreenFailure::PaneGone`],
+/// **不许**退化成「一屏空的」:那会让编排者以为乐手什么都没输出。
+fn read_screen(
+    store: &Entity<AppStore>,
+    pane_id: u32,
+    lines: usize,
+    cx: &App,
+) -> Result<Vec<String>, ScreenFailure> {
+    store
+        .read(cx)
+        .pane_screen_tail(pane_id, lines, cx)
+        .ok_or(ScreenFailure::PaneGone)
 }
 
 /// 「受编排会话」那份落地请求的**唯一**构造处。
@@ -991,6 +1126,46 @@ mod tests {
             mt_ai::DEFAULT_SESSION_CAP <= SESSION_CAP_MAX as usize,
             "默认值得落在设置项填得出来的范围里"
         );
+    }
+
+    // ─── 会话身份的合并口径(工单 07)────────────────────────────
+
+    /// `session_id` **只**来自 hook,`agent` hook 优先、退回输入检测。
+    #[test]
+    fn 会话身份以_hook_为权威输入检测只补_agent() {
+        // 两样都有:hook 的 agent 说了算(它比输入检测精确 ——
+        // 输入检测只看得到命令名,hook 报的是 agent 自己的名字)
+        let merged = merge_pane_session(
+            Some(("s-1".into(), Some("claude-code".into()))),
+            Some("claude".into()),
+        )
+        .unwrap();
+        assert_eq!(merged.session_id.as_deref(), Some("s-1"));
+        assert_eq!(merged.agent.as_deref(), Some("claude-code"));
+
+        // hook 报了 session_id 但没报 agent:退回输入检测认出来的那个
+        let merged =
+            merge_pane_session(Some(("s-2".into(), None)), Some("codex".into())).unwrap();
+        assert_eq!(merged.session_id.as_deref(), Some("s-2"));
+        assert_eq!(merged.agent.as_deref(), Some("codex"));
+    }
+
+    /// **没有 hook 就没有 session_id** —— 输入检测认得出 agent 也不许凑一个出来。
+    ///
+    /// 这是 opencode / pi 那一档:控制面靠 `agent` 答出「这家没有会话记录,
+    /// 改用 read-screen」,靠 `session_id` 为空答出「无从绑定」。
+    /// 凑一个 id 出来就是启发式绑定的入口 —— 对话镜像在这上面踩过串台的坑。
+    #[test]
+    fn 没有_hook_时不许凑出会话_id() {
+        let merged = merge_pane_session(None, Some("opencode".into())).unwrap();
+        assert_eq!(merged.session_id, None, "绑定只认 hook,不许猜");
+        assert_eq!(merged.agent.as_deref(), Some("opencode"));
+    }
+
+    /// 两样都没有 = 这个 pane 上根本没认出 AI 会话,答「不知道」。
+    #[test]
+    fn 两个来源都没有时答不知道() {
+        assert_eq!(merge_pane_session(None, None), None);
     }
 
     /// 设置项说明里那个取值范围是**手写进文案**的,改了 [`SESSION_CAP_MAX`]
