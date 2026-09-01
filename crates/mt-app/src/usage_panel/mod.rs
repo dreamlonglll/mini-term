@@ -2032,9 +2032,16 @@ impl UsagePanel {
                     // **之上**,别顺手 `with_alpha` 加浓 —— 那个函数是**赋值**
                     // 不是乘,给 0.5 会直接变成半透明白把曲线洗掉
                     .hover(|el| el.bg(ui::border_subtle()))
+                    // 图表 hover 详情是「扫过去看数」的交互,不是「停下来问这
+                    // 是什么键」——默认那 1200ms 会让人以为图表没反应,横向扫
+                    // 过多个桶时每格还要重新等满。免掉额外停留(见
+                    // `mt_ui::tooltip` 的二段延迟说明),回落到 gpui 的 500ms;
+                    // 全仓其余 tooltip 不受影响
                     .tooltip(move |window, cx| {
                         let tip = tip.clone();
-                        Tooltip::element(move |_window, _cx| tip.render()).build(window, cx)
+                        Tooltip::element(move |_window, _cx| tip.render())
+                            .instant()
+                            .build(window, cx)
                     }),
             );
         }
