@@ -397,8 +397,17 @@ impl AppStore {
             (pane.shell_name.clone(), pane.cwd.clone())
         };
         let shell = self.resolve_shell(Some(&shell_name))?;
-        // 重连是「原地换一根 PTY」,不带任何调用方注入的内部变量
-        let new_pty = self.start_pty(&project, &shell, cwd.as_deref(), &[], cx);
+        // 重连是「原地换一根 PTY」:不带调用方注入的内部变量,也**不重新发编排
+        // 令牌**——旧 PTY 关闭时令牌已随 pane 撤销(`AiBridge::remove_pane`),
+        // 远程 pane 本来也拿不到 hook 精确状态,编排链路不在这条路上。
+        let new_pty = self.start_pty(
+            &project,
+            &shell,
+            cwd.as_deref(),
+            &[],
+            crate::orchestrator::OrchestratorGrant::None,
+            cx,
+        );
 
         let state = self.project_states.get_mut(project_id)?;
         let pane = state.pane_mut(pane_id)?;

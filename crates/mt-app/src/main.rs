@@ -76,6 +76,7 @@ mod mobile_relay;
 mod modal;
 mod motion;
 mod notify;
+mod orchestrator;
 mod overlay;
 mod pane;
 mod pane_actions;

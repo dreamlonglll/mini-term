@@ -43,7 +43,15 @@
 //!   [`AiPerception::observe_input`] / [`AiPerception::observe_output`]。
 //!   本 crate 不依赖 mt-pty,也不依赖 gpui。
 //! - 原先经 Tauri 解析的路径(`app_data_dir` 下的端口文件)改为显式参数传入。
+//!
+//! # 编排控制面([`control`])
+//!
+//! hook 那个本地 HTTP 服务上另挂了一组 `/control/` 端点,给「编排者」用
+//! (ADR 0003)。它与 AI 感知**没有**逻辑耦合,只是共用监听与端口发现;
+//! `/hook` 路由与 payload 形状一个字没动。鉴权 fail-closed、桌面能力经注入
+//! trait 提供,详见该模块的注释。
 
+pub mod control;
 pub mod detect;
 pub mod hook_registry;
 pub mod hook_server;
@@ -53,6 +61,9 @@ pub mod sessions;
 pub mod tracker;
 mod util;
 
+pub use control::{
+    ControlLauncher, ControlPlane, ControlProject, NoopOrchestratorHost, OrchestratorHost,
+};
 pub use detect::{interactive_ai_command_name, is_interactive_ai_command, AI_COMMANDS};
 pub use hook_server::{is_attention_cause, HookState, HookStatusInfo};
 pub use monitor::{SessionIdentity, StatusChange, StatusEmitter, StatusSink};

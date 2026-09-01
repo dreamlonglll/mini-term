@@ -22,7 +22,7 @@
 use gpui::{
     App, AppContext, Bounds, ClickEvent, Context, Entity, InteractiveElement, IntoElement,
     ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled, Subscription,
-    Window, canvas, div, fill, point, px, size,
+    Window, canvas, div, fill, point, prelude::FluentBuilder, px, size,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
 use mt_config::AiLauncher;
@@ -57,6 +57,9 @@ struct Draft {
     command: Entity<InputState>,
     /// 绑定的 shell 名;`None` = 使用默认 shell。
     shell: Option<String>,
+    /// 「允许编排」:用这条启动器起的会话能驱动别的 AI 会话(ADR 0003)。
+    /// 新增草稿一律从 false 起 —— 编排能力只能是用户显式勾出来的。
+    orchestration: bool,
 }
 
 pub struct MobilePanel {
@@ -269,8 +272,20 @@ struct Frame {
     qr_requested: bool,
     launchers: Vec<AiLauncher>,
     /// 草稿的轻量切面(输入框实体是 `Clone` 的句柄)。
-    draft: Option<(String, Entity<InputState>, Entity<InputState>, Option<String>)>,
+    draft: Option<DraftFacet>,
     shells: Vec<String>,
+}
+
+/// 草稿在一帧里用到的只读切面。
+///
+/// 没有 `id`:保存那一刻是从 `panel.draft` 现读的(表单里的输入框实体也在那边),
+/// 这份切面只服务渲染。
+#[derive(Clone)]
+struct DraftFacet {
+    name: Entity<InputState>,
+    command: Entity<InputState>,
+    shell: Option<String>,
+    orchestration: bool,
 }
 
 fn read_frame(state: &Entity<MobilePanel>, cx: &App) -> Frame {
@@ -287,13 +302,11 @@ fn read_frame(state: &Entity<MobilePanel>, cx: &App) -> Frame {
         qr: panel.qr.clone(),
         qr_requested: panel.qr_requested,
         launchers: relay.launchers,
-        draft: panel.draft.as_ref().map(|d| {
-            (
-                d.id.clone(),
-                d.name.clone(),
-                d.command.clone(),
-                d.shell.clone(),
-            )
+        draft: panel.draft.as_ref().map(|d| DraftFacet {
+            name: d.name.clone(),
+            command: d.command.clone(),
+            shell: d.shell.clone(),
+            orchestration: d.orchestration,
         }),
         shells: store
             .config()
@@ -601,6 +614,8 @@ fn render_launchers(
                                 name,
                                 command,
                                 shell: None,
+                                // 新启动器默认**不**带编排能力(fail-closed)
+                                orchestration: false,
                             });
                             cx.notify();
                         });
@@ -623,6 +638,7 @@ fn render_launcher_row(
     let name = launcher.name.clone();
     let command = launcher.command.clone();
     let shell = launcher.shell.clone();
+    let orchestration = launcher.orchestration;
     let subtitle = launcher_subtitle(shell.as_deref(), &command);
     // 从命令文本推断品牌(识别不出回退 Bot)
     let vendor = AiVendor::infer(None, Some(&command));
@@ -652,10 +668,30 @@ fn render_launcher_row(
                 .flex_col()
                 .child(
                     div()
-                        .truncate()
-                        .text_size(ui::font_px(13.0))
-                        .text_color(ui::text_primary())
-                        .child(SharedString::from(name.clone())),
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(ui::font_px(13.0))
+                                .text_color(ui::text_primary())
+                                .child(SharedString::from(name.clone())),
+                        )
+                        // 授了编排能力的条目在列表里一眼看得出来 —— 这是个
+                        // 权限位,不该只在编辑表单里才可见
+                        .when(orchestration, |el| {
+                            el.child(
+                                div()
+                                    .flex_none()
+                                    .px(px(6.0))
+                                    .rounded(px(3.0))
+                                    .bg(ui::accent_muted())
+                                    .text_size(ui::font_px(10.0))
+                                    .text_color(ui::accent())
+                                    .child(t("mobileRelay", "launchers.orchestrationBadge")),
+                            )
+                        }),
                 )
                 .child(
                     div()
@@ -694,6 +730,7 @@ fn render_launcher_row(
                             name: name_input,
                             command: command_input,
                             shell: shell.clone(),
+                            orchestration,
                         });
                         cx.notify();
                     });
@@ -718,13 +755,16 @@ fn render_launcher_row(
 /// 草稿表单:名称 / shell 选择 / 命令 / 警告 / 保存 / 取消。
 fn render_draft_form(
     state: &Entity<MobilePanel>,
-    draft: &(String, Entity<InputState>, Entity<InputState>, Option<String>),
+    draft: &DraftFacet,
     frame: &Frame,
     cx: &mut App,
 ) -> impl IntoElement {
-    let (_draft_id, name_input, command_input, shell) = draft;
-    let (name_input, command_input, shell) =
-        (name_input.clone(), command_input.clone(), shell.clone());
+    let (name_input, command_input, shell) = (
+        draft.name.clone(),
+        draft.command.clone(),
+        draft.shell.clone(),
+    );
+    let orchestration = draft.orchestration;
     let name_value = name_input.read(cx).value().to_string();
     let command_value = command_input.read(cx).value().to_string();
     let shell_label = shell
@@ -808,6 +848,50 @@ fn render_draft_form(
         );
     }
 
+    // 「允许编排」开关(ADR 0003 的信任根:编排能力**只能**从这里授予)。
+    // 与命令警告同为表单的收尾段,但它是**授权**不是提示,所以带一行说明。
+    form = form.child(
+        div()
+            .id("launcher-orchestration")
+            .flex()
+            .items_start()
+            .gap(px(8.0))
+            .cursor_pointer()
+            .child(
+                div()
+                    .mt(px(2.0))
+                    .child(ui::checkbox("launcher-orchestration-box", orchestration)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .text_size(ui::font_px(13.0))
+                            .text_color(ui::text_primary())
+                            .child(t("mobileRelay", "launchers.orchestration")),
+                    )
+                    .child(
+                        div()
+                            .text_size(ui::font_px(11.0))
+                            .text_color(ui::text_muted())
+                            .child(t("mobileRelay", "launchers.orchestrationHint")),
+                    ),
+            )
+            .on_click({
+                let state = state.clone();
+                move |_: &ClickEvent, _window, cx| {
+                    state.update(cx, |panel, cx| {
+                        if let Some(draft) = panel.draft.as_mut() {
+                            draft.orchestration = !draft.orchestration;
+                        }
+                        cx.notify();
+                    });
+                }
+            }),
+    );
+
     form.child(
         div()
             .flex()
@@ -818,7 +902,7 @@ fn render_draft_form(
                     .on_click({
                         let state = state.clone();
                         move |_: &ClickEvent, _window, cx| {
-                            let (name, command, shell, id) = {
+                            let (name, command, shell, id, orchestration) = {
                                 let panel = state.read(cx);
                                 let Some(draft) = panel.draft.as_ref() else {
                                     return;
@@ -828,13 +912,20 @@ fn render_draft_form(
                                     draft.command.read(cx).value().to_string(),
                                     draft.shell.clone(),
                                     draft.id.clone(),
+                                    draft.orchestration,
                                 )
                             };
                             if !launcher_draft_valid(&name, &command) {
                                 return;
                             }
-                            let next =
-                                upsert_launcher(&all, &id, &name, shell.as_deref(), &command);
+                            let next = upsert_launcher(
+                                &all,
+                                &id,
+                                &name,
+                                shell.as_deref(),
+                                &command,
+                                orchestration,
+                            );
                             // 先收表单再落盘(原版同序)
                             state.update(cx, |panel, cx| {
                                 panel.draft = None;

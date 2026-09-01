@@ -32,6 +32,9 @@ export const mobileRelay = {
       commandPlaceholder: "启动命令（如 claude）",
       defaultShell: "使用默认 shell",
       commandWarning: "这条命令不会被识别为 AI 会话：手机上会一直等不到会话出现。命令仍会照常保存。",
+      orchestration: "允许编排",
+      orchestrationHint: "用这条启动器起的会话可以启动并驱动其他 AI 会话（范围限本项目与同分组项目）。只在你确实要开编排者时勾选。",
+      orchestrationBadge: "编排",
     },
     modal: {
       title: "移动端",
@@ -82,6 +85,9 @@ export const mobileRelay = {
       commandPlaceholder: "Launch command (e.g. claude)",
       defaultShell: "Use default shell",
       commandWarning: "This command won't be recognised as an AI session — your phone will wait forever for the session to appear. It will still be saved.",
+      orchestration: "Allow orchestration",
+      orchestrationHint: "Sessions started from this launcher may start and drive other AI sessions (within this project and projects in the same group). Only tick this when you really want an orchestrator.",
+      orchestrationBadge: "Orchestrator",
     },
     modal: {
       title: "Mobile",

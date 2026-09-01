@@ -194,7 +194,7 @@ jobs:
           VERSION="${TAG#v}"
           APP="dist/Mini-Term.app"
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-          for name in mini-term miniterm-hook mt-ssh-cli mt-ssh-mcp; do
+          for name in mini-term miniterm-hook mt-ssh-cli mt-ssh-mcp mt-agent-cli; do
             cp "target/release/$name" "$APP/Contents/MacOS/"
           done
           mkdir -p icon.iconset
@@ -235,7 +235,7 @@ jobs:
           DEB_VERSION="${VERSION//-/\~}"
           STAGE="dist/mini-term"
           mkdir -p "$STAGE"
-          for name in mini-term miniterm-hook mt-ssh-cli mt-ssh-mcp; do
+          for name in mini-term miniterm-hook mt-ssh-cli mt-ssh-mcp mt-agent-cli; do
             cp "target/release/$name" "$STAGE/"
           done
           # ⚠️ 打包目录仍叫 `mini-term`(解压出来就是可执行文件名),只有**资产名**
@@ -246,7 +246,7 @@ jobs:
           PKG="dist/deb/mini-term_${DEB_VERSION}_amd64"
           mkdir -p "$PKG/DEBIAN" "$PKG/usr/bin" "$PKG/usr/lib/mini-term" \
             "$PKG/usr/share/applications" "$PKG/usr/share/icons/hicolor/512x512/apps"
-          for name in mini-term miniterm-hook mt-ssh-cli mt-ssh-mcp; do
+          for name in mini-term miniterm-hook mt-ssh-cli mt-ssh-mcp mt-agent-cli; do
             cp "target/release/$name" "$PKG/usr/lib/mini-term/"
           done
           ln -s ../lib/mini-term/mini-term "$PKG/usr/bin/mini-term"

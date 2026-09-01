@@ -13,6 +13,7 @@
 //! |------|------|--------|--------|
 //! | 落点与焦点 | [`LaunchPlacement`] | `Tab` / `Panel`,抢焦点 | `Background`,不抢焦点不切项目 |
 //! | 内部环境变量 | [`LaunchRequest::env`] | 空 | 空 |
+//! | 编排授予 | [`LaunchRequest::grant`] | 按启动器「允许编排」开关 | `None`(ADR 0003:编排能力只从桌面端那道开关来) |
 //! | 诞生一次性提示 | [`LaunchRequest::notice`] | 无(人自己点的) | 有(凭证被盗时唯一的审计迹象) |
 //! | 回执 | 返回的 [`LaunchOutcome`] | 丢弃 | 映射成中转协议的回执 |
 //!
@@ -33,13 +34,17 @@
 //!
 //! [`LaunchRequest::env`] 走的是 [`mt_pty::PtySpawn::env`] —— 应用注入**内部
 //! 协议变量**的既有通道(`MINITERM_` 是保留前缀,项目级 env 那条 `user_env`
-//! 会被它挡掉)。现在两个调用点都传空;它是给编排者的令牌注入(工单 02/03)
-//! 预留的,`MINITERM_PTY_ID` / `MINITERM_HOOK_PORT` 顶不掉,判据见
-//! `store::pure` 的 `merge_internal_env`。
+//! 会被它挡掉)。现在两个调用点都传空,留作通用注入缝;`MINITERM_PTY_ID` /
+//! `MINITERM_HOOK_PORT` 顶不掉,判据见 `store::pure` 的 `merge_internal_env`。
+//!
+//! 编排**令牌**不走这条缝而走 [`LaunchRequest::grant`]:令牌要与 pane 身份
+//! (pty_id)绑定登记,而 pty_id 到 `store::panes::start_pty` 里才诞生 ——
+//! 授予与注入只能在那儿落地,这里只把「要不要授予」递下去。
 
 use gpui::{Context, Window};
 
 use crate::notify::ToastKind;
+use crate::orchestrator::OrchestratorGrant;
 
 use super::AppStore;
 
@@ -82,8 +87,12 @@ pub struct LaunchRequest<'a> {
     pub command: &'a str,
     pub placement: LaunchPlacement,
     /// 额外注入 PTY 的**应用内部**环境变量(`MINITERM_` 保留前缀)。
-    /// 现有两个调用点都传空,见模块注释「环境变量这条缝」。
+    /// 现有调用点都传空,见模块注释「环境变量这条缝」。
     pub env: Vec<(String, String)>,
+    /// 编排授予(ADR 0003 的信任根)。桌面端按启动器「允许编排」开关传,
+    /// 移动端一律 [`OrchestratorGrant::None`];令牌与身份注入在
+    /// `store::panes::start_pty` 落地,见模块注释。
+    pub grant: OrchestratorGrant,
     pub notice: Option<LaunchNotice>,
 }
 
@@ -143,6 +152,7 @@ impl AppStore {
             command,
             placement,
             env,
+            grant,
             notice,
         } = req;
 
@@ -162,7 +172,16 @@ impl AppStore {
         let pane_id = match placement {
             LaunchPlacement::Tab { anchor_pane_id } => {
                 let pane_id = self
-                    .new_terminal_with_env(project_id, Some(shell), anchor_pane_id, None, &env, window, cx)
+                    .new_terminal_with_env(
+                        project_id,
+                        Some(shell),
+                        anchor_pane_id,
+                        None,
+                        &env,
+                        grant,
+                        window,
+                        cx,
+                    )
                     .ok_or(LaunchError::SpawnFailed)?;
                 // 标题走 `rename_pane`(会 trim)—— 拆分前桌面端那两条就是它,
                 // 与 `Background` 那档的 `custom_title`(建 pane 时原样带上)
@@ -172,7 +191,7 @@ impl AppStore {
             }
             LaunchPlacement::Panel => {
                 let pane_id = self
-                    .new_panel_with_env(project_id, Some(shell), &env, window, cx)
+                    .new_panel_with_env(project_id, Some(shell), &env, grant, window, cx)
                     .ok_or(LaunchError::SpawnFailed)?;
                 self.rename_pane(project_id, &pane_id, launcher_name, cx);
                 pane_id
@@ -183,6 +202,7 @@ impl AppStore {
                     shell,
                     Some(launcher_name.to_string()),
                     &env,
+                    grant,
                     window,
                     cx,
                 )

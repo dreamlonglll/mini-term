@@ -11,6 +11,7 @@ use std::time::Duration;
 use gpui::{Context, Window};
 use mt_config::ShellConfig;
 
+use crate::orchestrator::OrchestratorGrant;
 use crate::persist;
 use crate::tree::{ProjectPanel, SplitNode};
 
@@ -40,11 +41,12 @@ impl AppStore {
         shell: ShellConfig,
         custom_title: Option<String>,
         extra_env: &[(String, String)],
+        grant: OrchestratorGrant,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<String> {
         let project = self.project(project_id)?.clone();
-        let mut pane = self.spawn_pane(&project, &shell, None, extra_env, window, cx)?;
+        let mut pane = self.spawn_pane(&project, &shell, None, extra_env, grant, window, cx)?;
         pane.custom_title = custom_title;
         let pane_id = pane.id.clone();
         let pty_id = pane.pty_id;
@@ -146,13 +148,15 @@ impl AppStore {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<String> {
-        self.new_panel_with_env(project_id, shell, &[], window, cx)
+        self.new_panel_with_env(project_id, shell, &[], OrchestratorGrant::None, window, cx)
     }
 
-    /// [`new_panel`] 再加一份**应用内部**环境变量。
+    /// [`new_panel`] 再加**应用内部**环境变量与编排授予。
     ///
-    /// 单独一个入口只为把 `extra_env` 递到 `spawn_pane` —— 界面上那两个
-    /// 「新建面板」调用点一律走上面那个无 env 的门面,签名一字不变。
+    /// 单独一个入口只为把 `extra_env` / `grant` 递到 `spawn_pane` —— 界面上那两个
+    /// 「新建面板」调用点一律走上面那个无注入的门面,签名一字不变;只有
+    /// [「按启动器起会话」共享入口](Self::launch_ai_session)会传
+    /// [`OrchestratorGrant::Grant`]。
     ///
     /// [`new_panel`]: Self::new_panel
     pub(super) fn new_panel_with_env(
@@ -160,12 +164,13 @@ impl AppStore {
         project_id: &str,
         shell: Option<ShellConfig>,
         extra_env: &[(String, String)],
+        grant: OrchestratorGrant,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<String> {
         let project = self.project(project_id)?.clone();
         let shell = shell.or_else(|| self.resolve_shell(None))?;
-        let pane = self.spawn_pane(&project, &shell, None, extra_env, window, cx)?;
+        let pane = self.spawn_pane(&project, &shell, None, extra_env, grant, window, cx)?;
         let pane_id = pane.id.clone();
 
         let state = self.project_states.get_mut(project_id)?;
@@ -526,6 +531,10 @@ impl AppStore {
     /// 一行 upsert、库也没开 `synchronous=FULL`,搬去后台换不来什么。
     pub fn save_config_now(&mut self) {
         self.flush_layout_now();
+        // 编排控制面的镜像跟着配置走。放在**最前面**、早于下面那两处提前返回:
+        // 「改分组即时生效」是这条链路的验收标准之一,而镜像陈不陈旧与配置能不能
+        // 落盘(只读模式 / 令牌过期)是两码事。
+        self.ai.refresh_orchestrator_mirror(&self.config);
         if self.token == 0 {
             return; // 配置没加载成功过,不许写盘覆盖磁盘
         }

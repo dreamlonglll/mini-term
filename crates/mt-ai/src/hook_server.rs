@@ -6,6 +6,7 @@
 //! **端口 / 协议 / 路由一个字都不能改**:三家 CLI 里已注册在用户机器上的 hook
 //! 命令按当前形态 POST 过来,改了等于让存量用户的 AI 感知集体失灵。
 
+use crate::control::ControlPlane;
 use crate::monitor::{SessionIdentity, StatusEmitter};
 use crate::tracker::SessionTracker;
 use serde::{Deserialize, Serialize};
@@ -515,6 +516,7 @@ pub fn start_hook_server(
     hook_state: HookState,
     emitter: StatusEmitter,
     tracker: SessionTracker,
+    control: ControlPlane,
     data_dir: PathBuf,
 ) -> Result<(), String> {
     // 如果已经在运行，不重复启动
@@ -561,7 +563,12 @@ pub fn start_hook_server(
 
     std::thread::spawn(move || {
         // 处理请求
-        for mut request in server.incoming_requests() {
+        for request in server.incoming_requests() {
+            // 编排控制面(`/control/*`)先过一道:不是它的请求原样交还,
+            // hook 那条路(路由 / payload / 「先回 200 再处理」的时序)一个字不动。
+            let Some(mut request) = crate::control::try_handle_control(request, &control) else {
+                continue;
+            };
             if request.method() != &tiny_http::Method::Post {
                 let response =
                     tiny_http::Response::from_string("Method Not Allowed").with_status_code(405);
@@ -788,6 +795,7 @@ pub fn set_hook_server_enabled(
     hook_state: &HookState,
     emitter: &StatusEmitter,
     tracker: &SessionTracker,
+    control: &ControlPlane,
     data_dir: &Path,
     enabled: bool,
 ) -> Result<(), String> {
@@ -797,6 +805,7 @@ pub fn set_hook_server_enabled(
                 hook_state.clone(),
                 emitter.clone(),
                 tracker.clone(),
+                control.clone(),
                 data_dir.to_path_buf(),
             )?;
         }

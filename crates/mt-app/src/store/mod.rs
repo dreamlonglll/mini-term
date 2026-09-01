@@ -570,6 +570,11 @@ impl AppStore {
         // 跑完**(`main.rs` 那个在函数体里补的最后一次 `save_config_now()` 于是
         // 已经入队),**再**统一 await 收上来的 future。所以本观察者虽然注册得更
         // 早,轮到它的 future 被 poll 时看到的已是最终队列。
+        // 编排控制面的镜像开机灌一次(此后每次配置落盘跟着刷,
+        // 见 `store::layout::save_config_now`)。没有这一次,第一个编排者
+        // 在用户改任何配置之前问到的都是空名单。
+        ai.refresh_orchestrator_mirror(&config);
+
         let config_writer = ConfigWriter::spawn(config_store.clone());
         let drain = config_writer.drain_handle();
         // 显式走 `App::on_app_quit` 而不是 `Context::on_app_quit`:排干不需要

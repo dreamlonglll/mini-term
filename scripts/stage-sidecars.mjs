@@ -1,6 +1,7 @@
-// 构建 mini-term 的 sidecar 二进制（miniterm-hook、mt-ssh-mcp、mt-ssh-cli）并就位。
+// 构建 mini-term 的 sidecar 二进制（miniterm-hook、mt-ssh-mcp、mt-ssh-cli、
+// mt-agent-cli）并就位。
 //
-// 三个 sidecar 在独立工作区 sidecars/（版本号自成语义，不并入根 workspace），
+// 这些 sidecar 在独立工作区 sidecars/（版本号自成语义，不并入根 workspace），
 // 运行时由主程序按 current_exe().parent() 同目录裸名定位 —— 本脚本把产物
 // 拷进主程序所在的 target/<profile>/，dev 与 release 同一套就位模型；
 // Windows 下再把便携 ConPTY 一并就位到同目录的 portable-conpty/。
@@ -16,7 +17,9 @@ import { copyFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { stagePortableConpty, WINDOWS_X64_TARGET } from './stage-conpty.mjs';
 
-const SIDECARS = ['miniterm-hook', 'mt-ssh-mcp', 'mt-ssh-cli'];
+// mt-agent-cli 是编排者的控制 CLI（ADR 0003）：编排者 pane 里的 agent 靠它
+// 调主程序的控制端点。与另外三个同一套「与 exe 同目录裸名定位」的模型。
+const SIDECARS = ['miniterm-hook', 'mt-ssh-mcp', 'mt-ssh-cli', 'mt-agent-cli'];
 const MANIFEST = join('sidecars', 'Cargo.toml');
 
 const args = process.argv.slice(2);

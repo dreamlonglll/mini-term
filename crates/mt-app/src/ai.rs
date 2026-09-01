@@ -48,6 +48,9 @@ pub struct AiBridge {
     perception: AiPerception,
     /// monitor 线程每 500ms 读一次。`mt-ai` 不认识 PTY,列表只能由这里提供。
     live_panes: Arc<Mutex<Vec<u32>>>,
+    /// 编排控制面的桌面状态镜像(主线程刷、控制 HTTP 线程读)。
+    /// 住在这里是因为控制面本身长在 `AiPerception` 上(与 hook 共用监听)。
+    orchestrator_mirror: crate::orchestrator::SharedMirror,
     data_dir: PathBuf,
 }
 
@@ -61,9 +64,22 @@ impl AiBridge {
         let data_dir = crate::app_data_dir();
 
         let live_panes: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+        // 编排控制面的宿主一开机就注入:令牌只在用户勾了「允许编排」的启动器起
+        // pane 时才发,注不注入宿主与授不授权无关 —— 而没注入宿主的控制面会把
+        // 一切都答成空,排查起来像「配置没生效」。
+        let orchestrator_mirror: crate::orchestrator::SharedMirror = Arc::new(Mutex::new(
+            crate::orchestrator::OrchestratorMirror::default(),
+        ));
+        perception
+            .control()
+            .set_host(Arc::new(crate::orchestrator::HostImpl::new(
+                orchestrator_mirror.clone(),
+            )));
+
         let bridge = Self {
             perception,
             live_panes,
+            orchestrator_mirror,
             data_dir,
         };
 
@@ -89,6 +105,24 @@ impl AiBridge {
     /// hook server 端口;0 = 没起来。注入给子进程的 `MINITERM_HOOK_PORT`。
     pub fn hook_port(&self) -> u16 {
         self.perception.hooks().get_port()
+    }
+
+    /// 授予某个 pane 编排能力,返回要注入进它 PTY 的令牌。
+    ///
+    /// **唯一调用点**是「按勾了『允许编排』的启动器起会话」那条路
+    /// (`store::panes`),别在别处发令牌 —— 授予入口只有一个,是 ADR 0003 的
+    /// 信任根。
+    pub fn grant_orchestration(&self, pane_id: u32, project_id: &str) -> String {
+        self.perception.control().grant(pane_id, project_id)
+    }
+
+    /// 把当前配置刷进编排控制面的镜像。
+    ///
+    /// 控制面在 hook 那条 HTTP 线程上跑,碰不得 gpui 实体,只能读这份镜像;
+    /// 而「改分组即时生效」要求它别陈旧 —— 调用点在配置落盘那一处
+    /// (`store::layout::save_config_now`)与启动接线处,配置一变就跟。
+    pub fn refresh_orchestrator_mirror(&self, config: &mt_config::AppConfig) {
+        self.orchestrator_mirror.lock().replace(config);
     }
 
     /// 运行时开关 hook server(设置页「Hook 事件」的落点,原 `toggle_hook_server`)。
