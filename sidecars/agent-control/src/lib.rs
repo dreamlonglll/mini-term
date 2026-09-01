@@ -12,7 +12,23 @@
 //!
 //! 依赖表只有 serde 两件套 —— 主仓把它引进测试图，不该顺带背一棵大依赖树。
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
+
+/// 连接超时。控制端点是本机进程，慢到这个份上一定是出事了。
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// 读响应的超时。
+///
+/// ⚠️ 必须**大于**桌面侧等主线程的那个时限（`mt_ai::control::ACTION_TIMEOUT`
+/// 3 秒），否则起会话稍慢一点就变成 CLI 先断线 —— 编排者拿到的会是「够不着」，
+/// 而不是桌面端给的那个明确答复。
+///
+/// 住在这个 crate 而不是 `mt-agent-cli` 的 bin 里，是因为那条不等式跨着**工作区
+/// 边界**：主仓 `mt-ai` 的对账测试（`tests/orchestrator_wire.rs`）要拿两侧的真
+/// 常量比一次，而它够不到 bin 里的私有常量。放在这里，那条断言才不是假保险。
+pub const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 编排令牌的环境变量名（与 `mt_ai::control::TOKEN_ENV` 必须一致）。
 pub const TOKEN_ENV: &str = "MINITERM_ORCHESTRATOR_TOKEN";
@@ -181,8 +197,12 @@ impl ControlFailure {
 
     /// 桌面端在，但没答上来（主线程忙死 / 动作泵没接线）。
     ///
-    /// 与「连都连不上」是同一类处境 —— 编排者该做的都是**过会儿再试**，
-    /// 而不是改自己的请求，所以 CLI 把它归进「够不着」那一档退出码。
+    /// 与「连都连不上」归进同一档退出码：两种处境下编排者都**改自己的请求也没用**。
+    ///
+    /// ⚠️ 但 `desktopBusy` **不等于「没起成」**：桌面端一旦把乐手起出来就先落记账、
+    /// 再谈回执（`mt_ai::control` 的记账契约），所以没答上来的只是这一趟往返。
+    /// 正确的下一步是先 `list-panes` 看一眼那个会话在不在，**别无脑重试** ——
+    /// 重试很可能是在起第二个。
     pub fn is_desktop_unavailable(&self) -> bool {
         self.code == "desktopBusy"
     }

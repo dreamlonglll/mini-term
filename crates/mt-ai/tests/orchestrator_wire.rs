@@ -12,8 +12,8 @@
 use std::sync::Arc;
 
 use mt_ai::control::{
-    ControlLauncher, ControlPlane, ControlProject, OrchestratorActions, OrchestratorHost,
-    PaneLiveness, StartFailure, StartSessionSpec, StartedSession,
+    AiSessionState, ControlLauncher, ControlPlane, ControlProject, OrchestratorActions,
+    OrchestratorHost, PaneLiveness, StartFailure, StartSessionSpec, StartedSession,
 };
 use mt_agent_control::{
     ControlRequest, Identity, parse_launchers, parse_panes, parse_projects, parse_started_pane,
@@ -76,14 +76,16 @@ struct Actions;
 impl OrchestratorActions for Actions {
     fn start_session(&self, spec: StartSessionSpec) -> Result<StartedSession, StartFailure> {
         // pane 编号在真桌面上是 PTY 编号;这里给个稳定值好断言
-        assert_eq!(spec.orchestrator_pane_id, 7);
-        Ok(StartedSession { pane_id: 101 })
+        assert_eq!(spec.orchestrator_pane_id(), 7);
+        // 记账先落地、再谈回执 —— `landed` 是造出 `StartedSession` 的唯一路径
+        Ok(spec.landed(101))
     }
 
     fn pane_liveness(&self, _pane_id: u32) -> PaneLiveness {
         PaneLiveness {
             alive: true,
             status: "ai-idle".into(),
+            ai_session: AiSessionState::Active,
         }
     }
 }
@@ -264,6 +266,55 @@ fn 被拒响应的错误码两侧一致() {
     let err = parse_launchers(outcome.status, &outcome.body).unwrap_err();
     assert_eq!(err.code, "unknownCommand");
     assert!(!err.is_denied(), "命令不认识不是鉴权问题");
+}
+
+/// 桌面侧等主线程的时限必须**短于** CLI 那侧的读超时,否则起会话稍慢一点就变成
+/// CLI 先断线 —— 编排者拿到的会是「够不着」,而不是桌面端给的那个明确答复。
+///
+/// 这条不等式跨着工作区边界,两侧各有一份常量,**只有在这里能拿真值比一次**。
+/// (它此前长在 `mt-app` 里,拿的是一个字面量 `Duration::from_secs(5)`——
+/// 改了 CLI 那侧的真常量它不会红,是假保险。)
+#[test]
+fn 桌面动作超时短于_cli_读超时() {
+    assert!(
+        mt_ai::control::ACTION_TIMEOUT < mt_agent_control::READ_TIMEOUT,
+        "留给 HTTP 往返的富余没了: 桌面 {:?} vs CLI {:?}",
+        mt_ai::control::ACTION_TIMEOUT,
+        mt_agent_control::READ_TIMEOUT
+    );
+    assert!(
+        mt_ai::control::ACTION_TIMEOUT >= std::time::Duration::from_secs(1),
+        "太短会把「主线程正忙」误判成「卡死」"
+    );
+}
+
+/// `desktopBusy` 的**新语义**:它不是「没起成」,而是「没答上来,那个会话可能
+/// 已经起来了」。CLI 侧据此把它归进「改请求也没用」那一档退出码,而消息本身
+/// 要指向 `list-panes` —— 无脑重试正是这条错误码最容易诱发的错误动作。
+#[test]
+fn desktop_busy_的语义两侧一致() {
+    let plane = ControlPlane::new();
+    // 不注入动作实现 = 泵没接线,起会话恒答 DesktopBusy(fail-closed)
+    plane.set_host(Arc::new(Host));
+    let token = plane.grant(7, "p-self");
+    let identity = Identity { token, pane_id: 7 };
+    let body =
+        serde_json::to_string(&ControlRequest::start_session(&identity, "claude", None)).unwrap();
+
+    let outcome = plane.handle("start-session", &body);
+    let err = parse_started_pane(outcome.status, &outcome.body).unwrap_err();
+    assert_eq!(err.code, "desktopBusy");
+    assert_eq!(err.status, 503);
+    assert!(err.is_desktop_unavailable(), "CLI 归进「够不着」那一档退出码");
+    assert!(
+        err.message.contains("list-panes"),
+        "得告诉编排者先查一眼再决定,而不是重试: {}",
+        err.message
+    );
+    assert!(
+        !err.message.contains("musician"),
+        "用户可见文案一律用 orchestrated session(术语表)"
+    );
 }
 
 /// 环境变量名两侧必须一字不差 —— 主程序按这个名字注入,CLI 按这个名字读。

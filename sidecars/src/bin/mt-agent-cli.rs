@@ -33,26 +33,31 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::PathBuf;
-use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use mt_agent_control::{
     ControlFailure, ControlRequest, IdentityError, identity_from_env, parse_launchers, parse_panes,
-    parse_projects, parse_started_pane, CONTROL_PREFIX,
+    parse_projects, parse_started_pane, CONNECT_TIMEOUT, CONTROL_PREFIX, READ_TIMEOUT,
 };
 
-/// 连接与读取超时。控制端点是本机进程，慢到这个份上一定是出事了。
-///
-/// ⚠️ 读超时必须**大于**桌面侧等主线程的那个时限（`orchestrator::ACTION_TIMEOUT`
-/// 3 秒），否则起会话稍慢一点就变成 CLI 先断线 —— 编排者拿到的会是「够不着」
-/// 而不是桌面端给的那个明确答复。
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
-const READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// 退出码说明。**给编排者（LLM）读的**，所以 `--help` 里就得写清 `desktopBusy`
+/// 那一条不是「重试就好」—— 那正是它最容易做错的判断。
+const EXIT_CODE_HELP: &str = "\
+Exit codes:
+  0  success (JSON on stdout)
+  2  this pane has no orchestrator capability, or the request was rejected as unauthorized
+  3  the desktop could not be reached, or did not answer in time (desktopBusy).
+     NOTE: desktopBusy does NOT mean the session failed to start - the desktop records
+     an orchestrated session the moment it lands, before it answers. Run `list-panes`
+     to check whether it is already there instead of retrying blindly.
+  4  the desktop rejected the request (bad launcher/project, session limit, ...);
+     change the request or wait for one of your sessions to finish";
 
 #[derive(Parser)]
 #[command(
     name = "mt-agent-cli",
     about = "mini-term orchestrator control CLI (requires an orchestration-enabled pane)",
+    after_help = EXIT_CODE_HELP,
     version
 )]
 struct Cli {
@@ -243,11 +248,14 @@ enum CliError {
 
 impl CliError {
     /// 退出码是给编排者（LLM）看的第一手信号，语义分三档：
-    /// 2 = 你没有这个能力；3 = 桌面端够不着；4 = 请求被拒。
+    /// 2 = 你没有这个能力；3 = 桌面端够不着 / 没答上来；4 = 请求被拒。
     ///
     /// 「够不着」那一档刻意把 `desktopBusy`（桌面端在，但主线程没在时限内答复）
-    /// 也算进去：编排者对这两种处境该做的都是**过会儿再试**，而 4 那一档是
-    /// 「改你的请求或等名额」。
+    /// 也算进去：这两种处境下**改请求都没用**，而 4 那一档是「改你的请求或等名额」。
+    ///
+    /// ⚠️ 但 3 不等于「重试就好」：`desktopBusy` 时那个受编排会话很可能已经起来了
+    /// （桌面端先记账再答复），该做的是 `list-panes` 查一眼。这一条写进了
+    /// [`EXIT_CODE_HELP`]，`--help` 里编排者看得到。
     fn exit_code(&self) -> i32 {
         match self {
             Self::Identity(_) => 2,
@@ -393,5 +401,25 @@ mod tests {
             .exit_code(),
             4
         );
+    }
+
+    /// `--help` 里必须写清 `desktopBusy` 不等于「没起成」—— 编排者看不到这句就会
+    /// 无脑重试，而重试很可能是在起第二个受编排会话。
+    #[test]
+    fn 帮助文案讲清楚了_desktop_busy_该怎么办() {
+        assert!(EXIT_CODE_HELP.contains("desktopBusy"));
+        assert!(EXIT_CODE_HELP.contains("list-panes"), "得告诉它先查一眼");
+        assert!(
+            !EXIT_CODE_HELP.contains("musician"),
+            "用户可见文案一律用 orchestrated session（术语表）"
+        );
+    }
+
+    /// CLI 的读超时必须留出富余给桌面侧等主线程的那 3 秒。真常量对真常量的
+    /// 那条断言在主仓 `crates/mt-ai/tests/orchestrator_wire.rs`（跨工作区，
+    /// 那边够得到 `mt_ai::control::ACTION_TIMEOUT`）。
+    #[test]
+    fn 读超时大于连接超时() {
+        assert!(READ_TIMEOUT > CONNECT_TIMEOUT);
     }
 }

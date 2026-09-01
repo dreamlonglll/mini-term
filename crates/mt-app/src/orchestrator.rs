@@ -33,20 +33,35 @@
 //! - 用 `std::sync::mpsc::sync_channel(1)` 而不是 futures 的 oneshot:HTTP 线程
 //!   是一条裸线程,没有执行器可以 `block_on`。
 //! - **必须有超时**([`ACTION_TIMEOUT`]):泵没接线(纯单测 / 窗口已关)或主线程
-//!   卡死时,不许把 HTTP 线程永久挂在那儿。超时答 `DesktopBusy`,CLI 据此给
-//!   「过会儿再试」那一档退出码。
+//!   卡死时,不许把 HTTP 线程永久挂在那儿。超时答 `DesktopBusy` —— 注意那**不是**
+//!   「没起成」,见下。
+//!
+//! # 超时之后:先记账,再谈回执
+//!
+//! 发起侧到点就走,泵这边却可能正把 pane 建到一半。两条防线各管一头:
+//!
+//! - **建之前先看时限**:信号里带一个 `deadline`(发起侧算好的绝对时刻),
+//!   泵取到已经过期的信号就**直接丢弃、不建 pane** —— 队列积压时这是最省的止损,
+//!   而且没人在等那个回执了。
+//! - **建成之后先记账**:pane 真起来了就一定要落进控制面的记账
+//!   (`StartSessionSpec::landed`,唯一的 [`StartedSession`] 构造路径),回执送不送
+//!   得到与它无关。否则桌面上会长出一个不进 `list-panes`、不占名额、
+//!   目标解析答「不存在」的幽灵乐手。
+//!
+//! 两条之间仍有一线窗口(判完时限、建 pane 期间发起侧刚好到点),那一档由「先记账」
+//! 兜住:会话在,记账也在,编排者 `list-panes` 看得见。
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use futures::channel::mpsc::{self, UnboundedSender};
 use gpui::{App, Entity, Task, Window};
 use mt_ai::{
-    ControlLauncher, ControlProject, OrchestratorActions, OrchestratorHost, PaneLiveness,
-    StartFailure, StartSessionSpec, StartedSession,
+    AiSessionState, ControlLauncher, ControlProject, OrchestratorActions, OrchestratorHost,
+    PaneLiveness, StartFailure, StartSessionSpec, StartedSession, ACTION_TIMEOUT,
 };
-use mt_config::{AppConfig, ProjectTreeItem};
+use mt_config::{AiLauncher, AppConfig, ProjectTreeItem};
 use parking_lot::Mutex;
 
 use crate::ai::AiBridge;
@@ -88,17 +103,6 @@ impl OrchestratorGrant {
 /// 是**互斥**的两条路:授予只从「用户在桌面上勾了开关、并亲手/按配置起了那个
 /// pane」来,编排者起的会话一律不走那条路,哪怕目标启动器自己勾了开关。
 pub const ORCHESTRATED_GRANT: OrchestratorGrant = OrchestratorGrant::None;
-
-/// 控制面等桌面主线程的时限。
-///
-/// 定 3 秒的理由是两头夹出来的:下界是「建一个 pane 正常要多久」——本机 spawn
-/// 一个 PTY 通常几十毫秒,3 秒是它的一个数量级以上;上界是 CLI 那侧的读超时
-/// (`mt-agent-cli` 的 `READ_TIMEOUT` 5 秒),必须留出富余,否则起会话稍慢一点
-/// 就变成 CLI 先断线,编排者拿到的会是「够不着」而不是这边给的明确答复。
-///
-/// 真到点还没答复,说明主线程已经卡住了 —— 那时 UI 本来也动不了,老实回一个
-/// `DesktopBusy` 让编排者过会儿再试,比把 HTTP 线程无限挂着强。
-pub const ACTION_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// 主线程按配置刷新、控制面 HTTP 线程只读的那一份桌面状态切面。
 #[derive(Default)]
@@ -144,17 +148,39 @@ impl OrchestratorHost for HostImpl {
 
 // ─── 动作:起乐手 / 查死活 ────────────────────────────────────
 
+/// 发起侧不再等待的那个时刻。
+///
+/// 用**绝对时刻**而不是「还剩多久」:信号在队列里排的那段时间也要算进去。
+/// gpui 主线程上照样可以读 [`Instant`]。
+#[derive(Debug, Clone, Copy)]
+struct Deadline(Instant);
+
+impl Deadline {
+    /// 从此刻起再等 `patience`。
+    fn after(patience: Duration) -> Self {
+        Self(Instant::now() + patience)
+    }
+
+    /// 已经没人等这个回执了吗。
+    fn passed(self) -> bool {
+        Instant::now() >= self.0
+    }
+}
+
 /// 控制面递给主线程的活。**唯一**的跨线程口。
 enum OrchestratorSignal {
     StartSession {
         spec: StartSessionSpec,
         /// 回执通道。容量 1:主线程放完就走,不等对面取。
         reply: std::sync::mpsc::SyncSender<Result<StartedSession, StartFailure>>,
+        /// 发起侧到这个时刻就不等了(= 它发信号那一刻 + [`ACTION_TIMEOUT`])。
+        /// 泵在**动手之前**看一眼,过期了就整条丢掉,连 pane 都不建。
+        deadline: Deadline,
     },
 }
 
 /// 注入给 `mt-ai` 的动作实现。
-pub struct ActionsImpl {
+struct ActionsImpl {
     ai: AiBridge,
     tx: UnboundedSender<OrchestratorSignal>,
 }
@@ -163,9 +189,15 @@ impl OrchestratorActions for ActionsImpl {
     /// 把活丢给主线程,**同步等**一个答复(见模块注释)。
     fn start_session(&self, spec: StartSessionSpec) -> Result<StartedSession, StartFailure> {
         let (reply, answer) = std::sync::mpsc::sync_channel(1);
+        // 时限由**发起侧**算:等的人是它,泵那边只照着这个时刻判要不要动手。
+        let deadline = Deadline::after(ACTION_TIMEOUT);
         if self
             .tx
-            .unbounded_send(OrchestratorSignal::StartSession { spec, reply })
+            .unbounded_send(OrchestratorSignal::StartSession {
+                spec,
+                reply,
+                deadline,
+            })
             .is_err()
         {
             // 泵没了(窗口关了 / 还没接线):不许把「没人接」当成起成了
@@ -176,20 +208,49 @@ impl OrchestratorActions for ActionsImpl {
             .unwrap_or(Err(StartFailure::DesktopBusy))
     }
 
-    /// 死活**不跳主线程** —— 名额判定一次要问好几个 pane,而这两样东西后台线程
+    /// 死活**不跳主线程** —— 名额判定一次要问好几个 pane,而这几样东西后台线程
     /// 本来就读得到:
     ///
     /// - `alive` 走 [`AiBridge`] 的活 pane 名册(建 PTY 时登记、pane 关闭时注销,
     ///   与 500ms 轮询同一份);
-    /// - `status` 走 `AiPerception`(hook 状态与旁路检测都在 `Arc<Mutex<..>>` 后面)。
-    ///
-    /// 两者一起构成「还占不占名额」:pane 关了 → `alive` 假;agent 自己退出 →
-    /// hook 的 SessionEnd 把状态落到 `idle`。**两条释放路径都不靠事件送达**。
+    /// - `status` 走 `AiPerception`(hook 状态与旁路检测都在 `Arc<Mutex<..>>` 后面);
+    /// - 「在不在 AI 会话里」见 [`ai_session_state`] —— 那一问有**答不上来**的时候。
     fn pane_liveness(&self, pane_id: u32) -> PaneLiveness {
+        let status = self.ai.perception().status_of(pane_id);
+        let ai_session = ai_session_state(&self.ai, pane_id, &status);
         PaneLiveness {
             alive: self.ai.is_pane_live(pane_id),
-            status: self.ai.perception().status_of(pane_id),
+            status,
+            ai_session,
         }
+    }
+}
+
+/// 「这个 pane 还在 AI 会话里吗」的宿主侧判据,**fail-closed 三态**。
+///
+/// 判据只读现有的两样事实,一个字都不动 AI 状态机本身
+/// (`monitor::resolve_status` 那条链是本仓的权威通道,不给编排让路):
+///
+/// - 状态不是裸 `idle` → [`AiSessionState::Active`]。hook 说 `ai-*` 也好,
+///   输入检测认出来了也好,都是「在」的正面证据。
+/// - 状态是 `idle`,但这个 pane 上 **hook 已启用** → [`AiSessionState::Ended`]。
+///   hook 一旦启用即为权威,`idle` 就是 SessionEnd 落地了(或停摆兜底判了已退出)
+///   —— 这一档才真正把名额还回来。
+/// - 其余 → [`AiSessionState::Unknown`],**按占着名额算**。这一档长这样:
+///   自定义启动器的命令不在 `mt_ai::AI_COMMANDS` 里(ADR 0003 明说任何启动器都能
+///   当乐手)、又没有 hook,于是 `resolve_status` 恒答 `idle`。按「不占」算的话
+///   硬上限就是摆设,可以无限起;按「占」算最坏是少起一个,编排者会收到明确的
+///   `sessionLimitReached`,它自己排队 —— 两害相权取轻。
+///
+/// ⚠️ 代价记在工单 03 的留档里:无 hook 的 agent(opencode/pi 之流)自行退出后
+/// 名额不会释放,得等用户把那个 pane 关掉。修它要动降级状态机,不在本轮范围。
+fn ai_session_state(ai: &AiBridge, pane_id: u32, status: &str) -> AiSessionState {
+    if status != "idle" {
+        AiSessionState::Active
+    } else if ai.perception().hooks().is_hook_enabled(pane_id) {
+        AiSessionState::Ended
+    } else {
+        AiSessionState::Unknown
     }
 }
 
@@ -210,12 +271,24 @@ pub fn install(store: Entity<AppStore>, window: &mut Window, cx: &mut App) -> Ta
 
     window.spawn(cx, async move |cx| {
         while let Some(signal) = rx.next().await {
-            let OrchestratorSignal::StartSession { spec, reply } = signal;
+            // 不可反驳的解构:将来加第二种信号时这里编译不过,免得新信号
+            // 悄悄绕过下面那道时限闸。
+            let OrchestratorSignal::StartSession {
+                spec,
+                reply,
+                deadline,
+            } = signal;
+            // **动手之前先看时限**:发起侧早走了就整条丢掉,连 pane 都不建 ——
+            // 起出来也没人认领(见模块注释)。队列积压时这是最省的止损。
+            if deadline.passed() {
+                continue;
+            }
             // 窗口没了就别再答复:发起方会在 `ACTION_TIMEOUT` 上收敛成 DesktopBusy
             let Ok(result) = cx.update(|window, cx| start_session(&store, spec, window, cx)) else {
                 return;
             };
-            // 对面可能已经等超时走了(`SyncSender` 于是报错),不是问题
+            // 对面可能已经等超时走了(`SyncSender` 于是报错),不是问题 ——
+            // 记账在 `spec.landed()` 里已经落地,回执丢了也不会长出幽灵乐手。
             let _ = reply.send(result);
         }
     })
@@ -239,39 +312,22 @@ fn start_session(
         .mobile_relay()
         .launchers
         .iter()
-        .find(|l| l.id == spec.launcher_id)
+        .find(|l| l.id == spec.launcher_id())
         .cloned();
     // 控制面刚查过名单,到这儿还能没了只有一种可能:用户正巧把它删了。
     let Some(launcher) = launcher else {
         return Err(StartFailure::SpawnFailed);
     };
 
+    let message = tr!(
+        "app",
+        "orchestratorStartSession",
+        launcher = launcher.name.clone()
+    );
     let outcome = store
         .update(cx, |store, cx| {
             store.launch_ai_session(
-                LaunchRequest {
-                    project_id: &spec.project_id,
-                    launcher_name: &launcher.name,
-                    shell_name: launcher.shell.as_deref(),
-                    command: &launcher.command,
-                    // 挂进活动面板最左侧叶子:不激活、不抢焦点、不切项目
-                    placement: LaunchPlacement::Background,
-                    // **禁套娃**:受编排会话一律不授予编排能力,哪怕这个启动器
-                    // 自己勾了「允许编排」—— 那个开关是「谁能当编排者」的授予位,
-                    // 只对用户在桌面上亲手起的那条路生效。
-                    grant: ORCHESTRATED_GRANT,
-                    // 诞生一次性提示:与移动端发起同一档 toast(info 图标 + 点击
-                    // 切项目),只是文案说明出身。凭证被盗时这是唯一的审计迹象,
-                    // 所以即便不切过去也要弹。
-                    notice: Some(LaunchNotice {
-                        kind: crate::notify::ToastKind::MobileSession,
-                        message: tr!(
-                            "app",
-                            "orchestratorStartSession",
-                            launcher = launcher.name.clone()
-                        ),
-                    }),
-                },
+                orchestrated_launch_request(spec.project_id(), &launcher, message),
                 window,
                 cx,
             )
@@ -283,20 +339,54 @@ fn start_session(
 
     // pane 建成了但启动命令没交到一根活着的 PTY 手上 —— 对编排者而言这就是失败
     // (pane 本身**保留不杀**,用户回头能看到它卡在哪)。与移动端回执同一判据。
+    //
+    // **这一档刻意不登记记账**:那儿只是一个裸终端,没有 AI 在跑;登记了它会以
+    // 「AI 会话状态不可知」永久占着一个名额(见 `ai_session_state`),比不登记更坏。
     if !outcome.command_delivered() {
         return Err(StartFailure::SpawnFailed);
     }
     // 对外的 pane 身份一律是 **PTY 编号**:编排者自己的身份也是它
     // (`MINITERM_ORCHESTRATOR_PANE`),自指禁令因此是一次裸比较。
-    let pty_id = store
-        .read(cx)
-        .project_state(&spec.project_id)
-        .and_then(|state| state.pane(&outcome.pane_id))
-        .and_then(|pane| pane.pty_id);
-    match pty_id {
-        Some(pane_id) => Ok(StartedSession { pane_id }),
-        // 命令都写进去了却查不到 PTY 编号:布局在这几行之间被动过,当失败处理
-        None => Err(StartFailure::SpawnFailed),
+    //
+    // 编号随 `LaunchOutcome` 一起回来,不回头再查一次布局树:`command_delivered()`
+    // 为真已经蕴含它在场(两者出自同一次查找),那条「命令写进去了却查不到编号」
+    // 的窄口子因此不存在 —— 它正是幽灵乐手的另一个入口。
+    let Some(pane_id) = outcome.pty_id else {
+        return Err(StartFailure::SpawnFailed);
+    };
+    // **先记账,再谈回执**:`landed` 把这条乐手写进控制面的范围记账,并且是
+    // `StartedSession` 唯一的构造路径。发起侧就算已经超时走人,桌面上这个真实
+    // 存在的受编排会话照样进 `list-panes`、照样占名额、照样能被点名。
+    Ok(spec.landed(pane_id))
+}
+
+/// 「受编排会话」那份落地请求的**唯一**构造处。
+///
+/// 抽成不碰 `window` / `cx` 的纯函数,是为了让[禁套娃的实际防线](ORCHESTRATED_GRANT)
+/// 有个能被单测指着说话的调用点 —— 「类型上没有那个位」只保证了控制面到桌面这一段,
+/// 真正决定发不发令牌的是下面 `grant:` 那一行。
+fn orchestrated_launch_request<'a>(
+    project_id: &'a str,
+    launcher: &'a AiLauncher,
+    message: String,
+) -> LaunchRequest<'a> {
+    LaunchRequest {
+        project_id,
+        launcher_name: &launcher.name,
+        shell_name: launcher.shell.as_deref(),
+        command: &launcher.command,
+        // 挂进活动面板最左侧叶子:不激活、不抢焦点、不切项目
+        placement: LaunchPlacement::Background,
+        // **禁套娃**:受编排会话一律不授予编排能力,哪怕这个启动器自己勾了
+        // 「允许编排」—— 那个开关是「谁能当编排者」的授予位,只对用户在桌面上
+        // 亲手起的那条路生效(`OrchestratorGrant::from_launcher`)。
+        grant: ORCHESTRATED_GRANT,
+        // 诞生一次性提示:与移动端发起同一档 toast(info 图标 + 点击切项目),
+        // 只是文案说明出身。凭证被盗时这是唯一的审计迹象,所以即便不切过去也要弹。
+        notice: Some(LaunchNotice {
+            kind: crate::notify::ToastKind::MobileSession,
+            message,
+        }),
     }
 }
 
@@ -400,7 +490,7 @@ fn resolve_group(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mt_config::{AiLauncher, MobileRelayConfig, ProjectGroup};
+    use mt_config::{MobileRelayConfig, ProjectGroup};
 
     fn project(id: &str) -> mt_config::ProjectConfig {
         mt_config::ProjectConfig {
@@ -580,18 +670,9 @@ mod tests {
     /// **禁套娃**:受编排会话拿到的授予恒为「不发」,与启动器开关那条路互斥。
     #[test]
     fn 受编排会话一律不授予编排能力() {
-        assert_eq!(ORCHESTRATED_GRANT, OrchestratorGrant::None);
-        assert!(!ORCHESTRATED_GRANT.is_granted());
-
         // 哪怕目标启动器自己勾了「允许编排」:那个开关只对「用户在桌面上亲手
-        // 起的那条路」生效(`from_launcher`),编排者起会话走的是上面那个常量。
-        let orchestrating = AiLauncher {
-            id: "l".into(),
-            name: "Claude".into(),
-            shell: None,
-            command: "claude".into(),
-            orchestration: true,
-        };
+        // 起的那条路」生效(`from_launcher`),编排者起会话走的是那个常量。
+        let orchestrating = orchestrating_launcher();
         assert!(OrchestratorGrant::from_launcher(&orchestrating).is_granted());
         assert!(
             !ORCHESTRATED_GRANT.is_granted(),
@@ -599,19 +680,56 @@ mod tests {
         );
     }
 
-    /// 等主线程的时限必须**短于** CLI 那侧的读超时(`mt-agent-cli` 的
-    /// `READ_TIMEOUT` 5 秒),否则起会话稍慢一点就变成 CLI 先断线 ——
-    /// 编排者拿到的会是「够不着」,而不是桌面端给的明确答复。
+    fn orchestrating_launcher() -> AiLauncher {
+        AiLauncher {
+            id: "l".into(),
+            name: "Claude".into(),
+            shell: Some("wsl".into()),
+            // 命令文本只在桌面端进程内流转,这里顺带钉一下它不外泄
+            command: "claude --dangerously".into(),
+            orchestration: true,
+        }
+    }
+
+    /// **禁套娃的实际防线钉在调用点上**,而不是钉在「那个常量等于 None」这句
+    /// 套套逻辑上:真正决定发不发令牌的是落地请求里 `grant:` 那一行,
+    /// 把它改成 `from_launcher(&launcher)` 这条测试就红。
     #[test]
-    fn 动作超时短于_cli_读超时() {
+    fn 受编排会话的落地请求恒不授予编排能力() {
+        let launcher = orchestrating_launcher();
+        let req = orchestrated_launch_request("p-self", &launcher, "起了一个".into());
+
+        assert_eq!(
+            req.grant,
+            OrchestratorGrant::None,
+            "启动器勾了「允许编排」也不许把令牌传给乐手"
+        );
+        assert!(!req.grant.is_granted());
+        // 出生礼仪(ADR 0002):不抢焦点、不切项目,且必弹一次诞生提示
+        assert_eq!(req.placement, LaunchPlacement::Background);
+        assert!(req.notice.is_some(), "凭证被盗时这是唯一的审计迹象");
+        // 命令与 shell 照配置取,项目照裁决结果落
+        assert_eq!(req.project_id, "p-self");
+        assert_eq!(req.command, "claude --dangerously");
+        assert_eq!(req.shell_name, Some("wsl"));
+        assert_eq!(req.launcher_name, "Claude");
+    }
+
+    /// 发起侧已经不等了的信号,泵**动手之前**就该丢掉 —— 建出来的乐手没人认领。
+    #[test]
+    fn 时限过了就不该再动手() {
         assert!(
-            ACTION_TIMEOUT < Duration::from_secs(5),
-            "留给 HTTP 往返的富余没了: {ACTION_TIMEOUT:?}"
+            Deadline(Instant::now() - Duration::from_millis(1)).passed(),
+            "过了时限必须认得出来"
         );
         assert!(
-            ACTION_TIMEOUT >= Duration::from_secs(1),
-            "太短会把「主线程正忙」误判成「卡死」"
+            !Deadline::after(ACTION_TIMEOUT).passed(),
+            "刚发出的信号不许被误丢"
         );
+        // 时限是**绝对时刻**:在队列里排的时间也算,不是「拿到手才开始数」
+        let d = Deadline::after(Duration::from_millis(30));
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(d.passed());
     }
 
     /// 授予与否只看启动器上的开关,不看名字、命令或别的任何东西。

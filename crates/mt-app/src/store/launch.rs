@@ -115,6 +115,13 @@ pub struct LaunchOutcome {
     /// `write_to_pane` 没有 PTY 时是**静默丢弃**的 —— 少了这一问,shell 路径
     /// 失效时调用方会拿到成功回执然后干等超时。
     pub pty_alive: bool,
+    /// 新 pane 的 **PTY 编号**;没起到 PTY 时是 `None`。
+    ///
+    /// 顺手带回来而不是让调用方回头再查一次布局树:`pty_alive` 本来就是从这次
+    /// 查找算出来的,再查一次不但白花,还多出一个「查得到 vs 查不到」的窄口子
+    /// —— 编排控制面拿它当乐手身份,查空就成了「pane 已经在跑 AI 却没人记账」
+    /// 的幽灵。[`Self::command_delivered`] 为真即蕴含它在场。
+    pub pty_id: Option<u32>,
 }
 
 impl LaunchOutcome {
@@ -211,15 +218,16 @@ impl AppStore {
         //    PTY 内核缓冲 stdin,shell 就绪前写入不丢。写不进去时**保留 pane**:
         //    用户回头能看到它卡在哪。
         let command_written = self.write_to_pane(project_id, &pane_id, &format!("{command}\r"), cx);
-        let pty_alive = self
+        let pty_id = self
             .project_state(project_id)
             .and_then(|s| s.pane(&pane_id))
-            .and_then(|p| p.pty_id)
-            .is_some_and(|pty_id| self.pane_pty_alive(pty_id, cx));
+            .and_then(|p| p.pty_id);
+        let pty_alive = pty_id.is_some_and(|pty_id| self.pane_pty_alive(pty_id, cx));
         let outcome = LaunchOutcome {
             pane_id,
             command_written,
             pty_alive,
+            pty_id,
         };
 
         // 6. 诞生一次性提示。走自建 toast 层,**不去重** —— 连开两个会话该看到
@@ -253,6 +261,8 @@ mod tests {
             pane_id: "pane-1".into(),
             command_written: written,
             pty_alive: alive,
+            // `pty_alive` 为真即蕴含 PTY 编号在场(两者出自同一次查找)
+            pty_id: alive.then_some(7),
         }
     }
 
@@ -267,5 +277,14 @@ mod tests {
         assert!(!outcome(false, true).command_delivered());
         assert!(!outcome(true, false).command_delivered());
         assert!(!outcome(false, false).command_delivered());
+    }
+
+    /// 命令送达 ⇒ PTY 编号在场。编排控制面拿它当乐手身份登记记账,
+    /// 这条蕴含关系一破就是「pane 在跑 AI 却没人记账」的幽灵乐手。
+    #[test]
+    fn 命令送达蕴含_pty_编号在场() {
+        let ok = outcome(true, true);
+        assert!(ok.command_delivered());
+        assert!(ok.pty_id.is_some());
     }
 }

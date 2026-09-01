@@ -45,6 +45,18 @@
 //! 名额与死活一律**现查**（[`OrchestratorActions::pane_liveness`]），不靠事件
 //! 驱动记账：漏收一次「乐手退出」的事件不该永久占住一个名额。
 //!
+//! # 记账契约：乐手一落地就记账，**再谈回执送不送得到**
+//!
+//! 起乐手是一次跨线程往返（HTTP 线程 → 桌面主线程 → 回来），发起侧兜着
+//! [`ACTION_TIMEOUT`]。要是「先答复、答复到了才记账」，超时那一瞬就会长出一个
+//! **幽灵乐手**：桌面上真有一个受编排会话在跑，却不进 `list-panes`、不占名额、
+//! 被 [`ControlPlane::resolve_target`] 答成「不存在」—— 一次违反 ADR 0003 三条。
+//!
+//! 于是契约反过来：[`StartSessionSpec`] 本身就是一张**落地登记凭据**，动作实现
+//! 只能靠 [`StartSessionSpec::landed`] 造出 [`StartedSession`]（那个类型没有别的
+//! 构造路径），而 `landed` 做的第一件事就是把记账写进 `registry.sessions`。
+//! 「拿到回执 = 记账已落地」因此是**类型层面**成立的，不靠调用方自觉。
+//!
 //! # 为什么阻塞命令要另起线程
 //!
 //! `start-session` 得回桌面主线程去建 pane，而 hook 那个 HTTP 服务是**单线程
@@ -54,9 +66,10 @@
 //! 上把鉴权做掉（挡住「任意进程都能让我们起线程」），再把已鉴权的活丢给一条
 //! 独立线程跑完并响应。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -64,6 +77,17 @@ use uuid::Uuid;
 
 /// 控制端点的路由前缀。
 pub const CONTROL_PREFIX: &str = "/control/";
+
+/// [`OrchestratorActions::start_session`] 必须在多久之内答复。
+///
+/// 住在**这里**而不是桌面侧，是因为它是一条三方约束：本模块（等回执）、桌面端
+/// （兜超时）、以及 sidecar CLI 的读超时（`mt_agent_control::READ_TIMEOUT`）。
+/// 定 3 秒的理由两头夹出来：下界是「建一个 pane 正常要多久」——本机 spawn 一根
+/// PTY 通常几十毫秒，3 秒是它的一个数量级以上；上界是 CLI 的读超时必须留出富余，
+/// 否则起会话稍慢一点就变成 CLI 先断线，编排者拿到的会是「够不着」而不是这边
+/// 给的明确答复。**跨工作区的那条不等式由 `tests/orchestrator_wire.rs` 拿两侧
+/// 真常量钉住**。
+pub const ACTION_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// 编排令牌的环境变量名（应用内部协议，`MINITERM_` 保留前缀保证用户/项目级
 /// 环境变量覆盖不掉）。
@@ -148,33 +172,106 @@ impl OrchestratorHost for NoopOrchestratorHost {
 
 // ─── 动作注入（起乐手 / 查死活）─────────────────────────────────
 
-/// 一次「起乐手」的落地请求。
+/// 一次「起乐手」的落地请求，**同时是一张落地登记凭据**。
 ///
 /// **没有命令文本，也没有「要不要授予编排能力」这个位** —— 类型上就没有第二种
 /// 可能：
 ///
-/// - 命令由桌面侧按 `launcher_id` 从配置里取（ADR 0002 的唯一防线是「命令只能
-///   来自桌面端配置」，编排者连看都看不到）；
+/// - 命令由桌面侧按 [`Self::launcher_id`] 从配置里取（ADR 0002 的唯一防线是
+///   「命令只能来自桌面端配置」，编排者连看都看不到）；
 /// - 受编排会话**一律不授予**编排能力（ADR 0003 的禁套娃），哪怕目标启动器自己
 ///   勾了「允许编排」。
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// 字段全私有、只读不改：这几样东西同时是**记账那一份事实**（见
+/// [`Self::landed`]），拆成「请求一份、记账一份」就是两份走散的机会。
 pub struct StartSessionSpec {
+    /// 记账草稿：除 pane 身份之外都已经知道了（控制面查宿主时顺手拿到的）。
+    draft: SessionDraft,
+    /// 登记的去处。带在请求里而不是让动作实现自己去找控制面 —— 记账是**控制面
+    /// 的**事实，动作实现只负责说一句「它落地了，编号是这个」。
+    plane: ControlPlane,
+}
+
+/// 记账草稿：一条 [`OrchestratedSession`] 差 pane 身份的那一部分。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionDraft {
+    orchestrator_pane_id: u32,
+    project_id: String,
+    project_name: String,
+    launcher_id: String,
+    launcher_name: String,
+}
+
+impl SessionDraft {
+    fn landed(self, pane_id: u32) -> OrchestratedSession {
+        OrchestratedSession {
+            pane_id,
+            orchestrator_pane_id: self.orchestrator_pane_id,
+            project_id: self.project_id,
+            project_name: self.project_name,
+            launcher_id: self.launcher_id,
+            launcher_name: self.launcher_name,
+        }
+    }
+}
+
+impl std::fmt::Debug for StartSessionSpec {
+    /// 不打 [`ControlPlane`]（里头是几张表和一把锁，打出来只有噪音）。
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StartSessionSpec")
+            .field("draft", &self.draft)
+            .finish_non_exhaustive()
+    }
+}
+
+impl StartSessionSpec {
     /// 具名启动器的 id（控制面已确认它在名单里）。
-    pub launcher_id: String,
+    pub fn launcher_id(&self) -> &str {
+        &self.draft.launcher_id
+    }
+
     /// 落地项目（控制面已确认它可达、且不是 SSH 远程项目）。
-    pub project_id: String,
+    pub fn project_id(&self) -> &str {
+        &self.draft.project_id
+    }
+
     /// 谁起的。桌面侧的诞生提示要说明出身（ADR 0002 的一次性提示）。
-    pub orchestrator_pane_id: u32,
+    pub fn orchestrator_pane_id(&self) -> u32 {
+        self.draft.orchestrator_pane_id
+    }
+
+    /// **乐手落地了**：先把记账写进控制面，再把回执交回去。
+    ///
+    /// 这是造出 [`StartedSession`] 的**唯一**路径（那个类型没有公开构造式），
+    /// 所以「桌面上多了一个受编排会话」与「控制面记着它」在类型层面就是同一件事
+    /// —— 回执后来送没送到（发起侧可能已经在 [`ACTION_TIMEOUT`] 上放弃了）
+    /// 与记账无关。幽灵乐手那条竞态因此不存在。
+    ///
+    /// `pane_id` 是乐手的 **PTY 编号**：编排者自己的身份也是它
+    /// （`MINITERM_ORCHESTRATOR_PANE`），自指禁令因此是一次裸比较，不必翻译。
+    ///
+    /// ⚠️ 命令**没有**交到活着的 PTY 手上时别调它：那儿只是一个裸终端，不是受
+    /// 编排会话；登记了反而会让它以「AI 会话状态不可知」永久占着一个名额。
+    pub fn landed(self, pane_id: u32) -> StartedSession {
+        let session = self.draft.landed(pane_id);
+        self.plane.register_landed(session.clone());
+        StartedSession { session }
+    }
 }
 
 /// 乐手起成之后桌面侧回来的东西。
+///
+/// **只能由 [`StartSessionSpec::landed`] 造出来** —— 拿得到它就说明记账已经落地。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StartedSession {
+    session: OrchestratedSession,
+}
+
+impl StartedSession {
     /// 乐手的 pane 身份（= PTY 编号，与鉴权用的 `paneId` 同一个命名空间）。
-    ///
-    /// 对外只认这一个编号：编排者自己的身份也是它（`MINITERM_ORCHESTRATOR_PANE`），
-    /// 自指禁令因此是一次裸比较，不必翻译。
-    pub pane_id: u32,
+    pub fn pane_id(&self) -> u32 {
+        self.session.pane_id
+    }
 }
 
 /// 起乐手失败的原因。**闭集** —— 桌面侧只负责判定，映射成对外错误码是本模块的事。
@@ -188,36 +285,56 @@ pub enum StartFailure {
     DesktopBusy,
 }
 
+/// 「这个 pane 还在 AI 会话里吗」—— **三态**。
+///
+/// 两态（拿状态字符串与 `"idle"` 裸比）在无 hook 的降级路径上两头都不成立：
+///
+/// - 命令不在 `crate::detect::AI_COMMANDS` 里的自定义启动器（ADR 0003：**任何**
+///   启动器都能当乐手）没有 hook 时恒答 `"idle"`，判成「不占名额」就是硬上限
+///   形同虚设 —— 可以无限起；
+/// - 反过来，输入检测认得的 agent 自行退出时也未必收得到信号。
+///
+/// 于是把「答不上来」显式做成一档，并且**按占名额算**（fail-closed：宁可少起
+/// 一个让编排者收到明确的 `sessionLimitReached`，也不让上限变成摆设）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AiSessionState {
+    /// 明确在 AI 会话里：hook 权威说 `ai-*`，或输入检测认出了它。
+    Active,
+    /// 明确不在了：hook 已在这个 pane 上启用，而它说 `idle`（SessionEnd 是权威
+    /// 的退出信号）；或者 pane 压根已经关了。**这一档才释放名额。**
+    Ended,
+    /// **答不上来**：这个 pane 没有 hook，输入检测也没把它认成 AI 会话。
+    /// 「从没跑起来」与「跑过又退了」在这条路上不可区分，只能保守占着名额。
+    Unknown,
+}
+
 /// 一个 pane 此刻的样子。名额判定与 `list-panes` 的状态列都读它。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaneLiveness {
     /// pane 还在桌面上吗（PTY 层面；用户关掉那个 tab 即 `false`）。
     pub alive: bool,
     /// AI 状态：`idle` / `ai-idle` / `ai-working`（与桌面徽章同一口径）。
+    /// **只用于展示**（`list-panes` 的状态列），名额判定读的是下面那个。
     pub status: String,
+    /// 名额判定的那一问，见 [`AiSessionState`]。宿主侧据实回答，
+    /// 别为了让它「好看」去改 AI 状态机本身。
+    pub ai_session: AiSessionState,
 }
 
 impl PaneLiveness {
-    /// 已经不在了（pane 关了）的那一档。
+    /// 已经不在了（pane 关了）的那一档。pane 都没了，AI 会话自然是明确结束。
     pub fn gone() -> Self {
         Self {
             alive: false,
             status: "idle".to_string(),
+            ai_session: AiSessionState::Ended,
         }
     }
 
-    /// 还在 AI 会话里吗（状态不是裸 `idle`）。
-    ///
-    /// agent 自己 `exit` 之后 hook 的 SessionEnd 会把状态落到 `idle`，
-    /// pane 被关掉时 `AiPerception::pane_closed` 会把状态清空 —— 也是 `idle`。
-    /// 两种「释放名额」的方式在这里收敛成同一条判据。
-    pub fn in_ai_session(&self) -> bool {
-        self.status != "idle"
-    }
-
-    /// 占不占一个名额：**活着且还在 AI 会话里**（ADR 0003：上限只计活着的 AI 会话）。
+    /// 占不占一个名额：**活着，且不是明确已经结束**（ADR 0003：上限只计活着的
+    /// AI 会话；「不可知」按占用算，见 [`AiSessionState`]）。
     pub fn occupies_slot(&self) -> bool {
-        self.alive && self.in_ai_session()
+        self.alive && self.ai_session != AiSessionState::Ended
     }
 }
 
@@ -234,6 +351,10 @@ impl PaneLiveness {
 /// 实现方应当从后台线程读得到的状态里现答，别为它跳主线程。
 pub trait OrchestratorActions: Send + Sync + 'static {
     /// 起一个受编排会话。
+    ///
+    /// 成功的唯一造法是 [`StartSessionSpec::landed`]（记账在它里头先落地，
+    /// 见模块注释的「记账契约」）。实现方还应当自己兜住 [`ACTION_TIMEOUT`]：
+    /// 到点没答复就返回 [`StartFailure::DesktopBusy`]，别把 HTTP 线程永久挂着。
     fn start_session(&self, spec: StartSessionSpec) -> Result<StartedSession, StartFailure>;
 
     /// 这个 pane 现在什么样（活着吗、在不在 AI 会话里）。
@@ -290,6 +411,71 @@ pub struct Grant {
 /// [`ControlPlane::set_session_cap`]，裁决那一行一个字都不用动。
 pub const DEFAULT_SESSION_CAP: usize = 5;
 
+/// 一个编排者名下最多留多少条记账。
+///
+/// 记账只增不减是有意的（「你起的那个已经关了」比「不存在」有用），但一个长命
+/// 编排者起关几百个乐手时那张表就只涨不消 —— 除了列表变长，真代价是
+/// [`ControlPlane::live_session_count`] 每次数名额都要对**历史全部**乐手各问一次
+/// 死活。于是给它一个上限，超出时**只丢已经关掉的、从最旧的丢起**：
+/// 活着的一条都不能丢（丢了就成幽灵乐手），丢不动就让它超着。
+///
+/// 50 是「远大于并发上限（默认 5）、又不至于让数名额变贵」的一个数：编排者能
+/// 回看的历史足够长，而现查死活最多问 50 次。
+const MAX_SESSIONS_PER_ORCHESTRATOR: usize = 50;
+
+/// 控制命令的闭集。
+///
+/// **命令名与「会不会阻塞主线程」这两件事只有这一份表**。此前它们各写一处
+/// （`handle` 的 `match` 与一个 `matches!`），新命令漏登记阻塞属性就会静默卡住
+/// hook 那条队 —— 而 hook 是 AI 状态感知的权威通道，正是这条设计要防的事。
+///
+/// 现在漏一处编译不过：加一个变体，[`Self::ALL`]（定长数组）、[`Self::name`]、
+/// [`Self::blocks_on_desktop`]（两处穷尽 `match`，都没有 `_` 兜底）与
+/// [`ControlPlane::handle`] 的分发一起报错。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Command {
+    ListLaunchers,
+    ListProjects,
+    StartSession,
+    ListPanes,
+}
+
+impl Command {
+    const ALL: [Self; 4] = [
+        Self::ListLaunchers,
+        Self::ListProjects,
+        Self::StartSession,
+        Self::ListPanes,
+    ];
+
+    /// 路由里那一段（与 sidecar CLI 的 `Command::endpoint` 一字不差）。
+    fn name(self) -> &'static str {
+        match self {
+            Self::ListLaunchers => "list-launchers",
+            Self::ListProjects => "list-projects",
+            Self::StartSession => "start-session",
+            Self::ListPanes => "list-panes",
+        }
+    }
+
+    /// 命令名里带查询串 / 多层路径的一律认不出来，别去猜。
+    fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.name() == name)
+    }
+
+    /// 这条命令会不会阻塞在桌面主线程上。
+    ///
+    /// [`try_handle_control`] 据此决定要不要另起一条线程 —— hook 那个 HTTP 循环
+    /// 是单线程的，起乐手要等主线程建 pane，就地阻塞会把 hook 上报一起卡住。
+    fn blocks_on_desktop(self) -> bool {
+        match self {
+            Self::ListLaunchers | Self::ListProjects | Self::ListPanes => false,
+            // 工单 05~07 的 send / wait / read 落地时，`wait` 也属于这一档
+            Self::StartSession => true,
+        }
+    }
+}
+
 /// 控制面本体。内部全是 `Arc`，`Clone` 即同一份。
 #[derive(Clone, Default)]
 pub struct ControlPlane {
@@ -333,6 +519,43 @@ struct TokenRegistry {
     /// 乐手 pane → 它的出身。**可见范围铁律的事实底座**：不在这张表里的 pane，
     /// 对编排者而言就是不存在。
     sessions: HashMap<u32, OrchestratedSession>,
+    /// 已经关掉的乐手 pane（`revoke_pane` 走到乐手自己那一次时记下）。
+    ///
+    /// **只给修剪用**（见 [`MAX_SESSIONS_PER_ORCHESTRATOR`]）：对外那个 `alive`
+    /// 一律现查 [`OrchestratorActions::pane_liveness`]，一个字都不读这里 ——
+    /// 事件驱动的死活记账漏一次就是永久占住名额，那条路本模块不走。
+    closed: HashSet<u32>,
+}
+
+impl TokenRegistry {
+    /// 记账超出上限时，**只丢已经关掉的、从最旧的丢起**。
+    ///
+    /// PTY 编号单调递增，所以按 pane_id 升序就是起的先后序。活着的一条都不丢：
+    /// 丢掉一条活着的记账 = 桌面上多一个谁也够不到的幽灵乐手。
+    fn trim(&mut self, orchestrator_pane_id: u32) {
+        let mut mine: Vec<u32> = self
+            .sessions
+            .values()
+            .filter(|s| s.orchestrator_pane_id == orchestrator_pane_id)
+            .map(|s| s.pane_id)
+            .collect();
+        let Some(mut over) = mine.len().checked_sub(MAX_SESSIONS_PER_ORCHESTRATOR) else {
+            return;
+        };
+        if over == 0 {
+            return;
+        }
+        mine.sort_unstable();
+        for id in mine {
+            if over == 0 {
+                break;
+            }
+            if self.closed.remove(&id) {
+                self.sessions.remove(&id);
+                over -= 1;
+            }
+        }
+    }
 }
 
 impl ControlPlane {
@@ -386,27 +609,46 @@ impl ControlPlane {
     /// pane 都调），那次 `retain` 什么也不匹配：**乐手的记账刻意留着**，
     /// 好让 `list-panes` 与目标解析答得出「你起的那个已经关了」，而不是
     /// 一句无从下手的「不存在」。名额不受影响 —— 它是现查存活的。
+    /// 那一次只在 `closed` 里记一笔，供[记账修剪](MAX_SESSIONS_PER_ORCHESTRATOR)
+    /// 挑「可以丢的那些」。
     pub fn revoke_pane(&self, pane_id: u32) {
-        let mut registry = self.inner.registry.lock();
+        let mut guard = self.inner.registry.lock();
+        // 先 deref 出来:`MutexGuard` 上的字段访问会整体借走 guard,
+        // `sessions` 与 `closed` 那两笔改动就没法同时成立。
+        let registry = &mut *guard;
         if let Some(token) = registry.tokens.remove(&pane_id) {
             registry.grants.remove(&token);
         }
-        registry
-            .sessions
-            .retain(|_, s| s.orchestrator_pane_id != pane_id);
+        // 乐手那一路：记账留着，只标记「关了」
+        if registry.sessions.contains_key(&pane_id) {
+            registry.closed.insert(pane_id);
+        }
+        // 编排者那一路：名下记账整体作废，`closed` 里的残留一并清掉
+        let closed = &mut registry.closed;
+        registry.sessions.retain(|_, s| {
+            if s.orchestrator_pane_id == pane_id {
+                closed.remove(&s.pane_id);
+                return false;
+            }
+            true
+        });
+    }
+
+    /// 记下「这个乐手落地了」。**唯一的写入点**，由 [`StartSessionSpec::landed`]
+    /// 在动作实现拿到 pane 身份的那一刻调 —— 早于任何回执（见模块注释）。
+    fn register_landed(&self, session: OrchestratedSession) {
+        let mut registry = self.inner.registry.lock();
+        let orchestrator = session.orchestrator_pane_id;
+        // PTY 编号单调递增，编号复用理论上不会发生；真撞上也别让新乐手继承
+        // 前一条的「已关」标记。
+        registry.closed.remove(&session.pane_id);
+        registry.sessions.insert(session.pane_id, session);
+        registry.trim(orchestrator);
     }
 
     /// 该 pane 当前是否持有编排能力（UI 标识与工单 03 的裁决用）。
     pub fn is_orchestrator(&self, pane_id: u32) -> bool {
         self.inner.registry.lock().tokens.contains_key(&pane_id)
-    }
-
-    /// 这条命令会不会阻塞在桌面主线程上。
-    ///
-    /// [`try_handle_control`] 据此决定要不要另起一条线程 —— hook 那个 HTTP 循环
-    /// 是单线程的，起乐手要等主线程建 pane，就地阻塞会把 hook 上报一起卡住。
-    fn blocks_on_desktop(command: &str) -> bool {
-        matches!(command, "start-session")
     }
 
     /// 只做「解析 + 鉴权」的那一半。
@@ -475,17 +717,29 @@ impl ControlPlane {
         list
     }
 
+    /// 某个编排者名下乐手的 **pane 编号**，升序。
+    ///
+    /// 数名额只要 id，`sessions_of` 那条会把每条记账的六个 `String` 都克隆一遍
+    /// （历史全部乐手 × 每次 `start-session`），白花。
+    fn session_ids_of(&self, orchestrator_pane_id: u32) -> Vec<u32> {
+        let registry = self.inner.registry.lock();
+        let mut ids: Vec<u32> = registry
+            .sessions
+            .values()
+            .filter(|s| s.orchestrator_pane_id == orchestrator_pane_id)
+            .map(|s| s.pane_id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
     /// 当前占着名额的乐手数：**每次请求现查存活**，不靠事件驱动记账。
     ///
-    /// ⚠️ 先在 [`Self::sessions_of`] 里把 id 拷出来（那把锁到此已经放掉），
+    /// ⚠️ 先在 [`Self::session_ids_of`] 里把 id 拷出来（那把锁到此已经放掉），
     /// 再逐个问 [`OrchestratorActions::pane_liveness`] —— 持 `registry` 锁去调
     /// 注入进来的外部代码，就是把上层的锁序绑进本模块的锁序。
     fn live_session_count(&self, orchestrator_pane_id: u32) -> usize {
-        let ids: Vec<u32> = self
-            .sessions_of(orchestrator_pane_id)
-            .into_iter()
-            .map(|s| s.pane_id)
-            .collect();
+        let ids = self.session_ids_of(orchestrator_pane_id);
         let actions = self.actions();
         ids.into_iter()
             .filter(|id| actions.pane_liveness(*id).occupies_slot())
@@ -504,7 +758,11 @@ impl ControlPlane {
     ///   不归你」—— 区分开来就是一台探测桌面上有哪些 pane 的扫描器。
     /// - 是自己的乐手、但 pane 已经关了 → [`ControlError::PaneGone`]。这条**可以**
     ///   说：那是它自己起的东西，告诉它「关了」比「不存在」有用得多。
-    pub fn resolve_target(
+    // 本票只落地并测试这个函数，命令留给 05/06/07（`target_pane_id` 的解析器
+    // 同款先就位）。收成 `pub(crate)` 是因为它没有跨 crate 消费者，也不该有 ——
+    // 可见范围铁律是本模块的裁决。
+    #[allow(dead_code)]
+    pub(crate) fn resolve_target(
         &self,
         grant: &Grant,
         target_pane_id: u32,
@@ -538,8 +796,11 @@ impl ControlPlane {
             Ok(g) => g,
             Err(e) => return e.into_outcome(),
         };
+        let Some(command) = Command::parse(command) else {
+            return ControlError::UnknownCommand.into_outcome();
+        };
         match command {
-            "list-launchers" => {
+            Command::ListLaunchers => {
                 let launchers = self
                     .host_launchers()
                     .into_iter()
@@ -550,7 +811,7 @@ impl ControlPlane {
                     .collect();
                 ok_outcome(&ControlData::Launchers { launchers })
             }
-            "list-projects" => {
+            Command::ListProjects => {
                 let all = self.host_projects();
                 let reachable = reachable_projects(&all, &grant.project_id);
                 if reachable.is_empty() {
@@ -573,8 +834,8 @@ impl ControlPlane {
                     .collect();
                 ok_outcome(&ControlData::Projects { projects })
             }
-            "start-session" => self.start_session(&grant, &request),
-            "list-panes" => {
+            Command::StartSession => self.start_session(&grant, &request),
+            Command::ListPanes => {
                 let actions = self.actions();
                 let panes = self
                     .sessions_of(grant.pane_id)
@@ -586,7 +847,6 @@ impl ControlPlane {
                     .collect();
                 ok_outcome(&ControlData::Panes { panes })
             }
-            _ => ControlError::UnknownCommand.into_outcome(),
         }
     }
 
@@ -637,10 +897,19 @@ impl ControlPlane {
 
         // 裁决四（禁套娃）在类型上：[`StartSessionSpec`] 里没有「要不要授予」
         // 这个位，桌面侧那条路只有一种可能。
+        //
+        // 这份 spec 同时是**落地登记凭据**：展示用的项目名/启动器名在这里就一并
+        // 带上（宿主刚查过，手上就有），桌面侧原样回填即可 —— 记账因此在乐手
+        // 落地那一刻就完整，不必等回执回到这条线程（见模块注释的「记账契约」）。
         let spec = StartSessionSpec {
-            launcher_id: launcher.id.clone(),
-            project_id: project.id.clone(),
-            orchestrator_pane_id: grant.pane_id,
+            draft: SessionDraft {
+                orchestrator_pane_id: grant.pane_id,
+                project_id: project.id.clone(),
+                project_name: project.name.clone(),
+                launcher_id: launcher.id,
+                launcher_name: launcher.name,
+            },
+            plane: self.clone(),
         };
         let started = match self.actions().start_session(spec) {
             Ok(s) => s,
@@ -649,23 +918,11 @@ impl ControlPlane {
             Err(StartFailure::DesktopBusy) => return ControlError::DesktopBusy.into_outcome(),
         };
 
-        let session = OrchestratedSession {
-            pane_id: started.pane_id,
-            orchestrator_pane_id: grant.pane_id,
-            project_id: project.id.clone(),
-            project_name: project.name.clone(),
-            launcher_id: launcher.id,
-            launcher_name: launcher.name,
-        };
-        self.inner
-            .registry
-            .lock()
-            .sessions
-            .insert(session.pane_id, session.clone());
+        // 记账已经在 `landed` 里落地了，这里不再插一次（只有一个写入点）。
         // 回执与 `list-panes` 里那一条**同形**：编排者只需要认识一种 pane 视图。
-        let liveness = self.actions().pane_liveness(session.pane_id);
+        let liveness = self.actions().pane_liveness(started.session.pane_id);
         ok_outcome(&ControlData::Pane {
-            pane: pane_view(&session, &liveness),
+            pane: pane_view(&started.session, &liveness),
         })
     }
 }
@@ -713,7 +970,7 @@ pub fn reachable_projects(all: &[ControlProject], own_project_id: &str) -> Vec<C
 /// `launcherId` / `projectId`，工单 05~07 的 send / wait / read 看 `targetPaneId`。
 /// 一个结构体装全部而不是每条命令一个类型，是为了让鉴权能在**分发之前**做掉
 /// （未知命令也不该成为免鉴权的口子）。
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ControlRequest {
     #[serde(default)]
@@ -802,9 +1059,12 @@ pub struct ControlOutcome {
 /// 错误是**闭集**：CLI 按 code 分支，文案只给人看。
 ///
 /// ⚠️ 消息一律是**给编排者读的英文短句**，且**一个字都不许带出启动器的命令文本
-/// 或项目里的什么内容**（ADR 0002 的防线）。
+/// 或项目里的什么内容**（ADR 0002 的防线）。另外 [`Self::into_outcome`] 是手工
+/// 拼的 JSON 字面量 —— 消息里别写引号和反斜杠。
+///
+/// 对外只出 [`Self::code`] 那个字符串（sidecar 侧按它分档），类型本身不出 crate。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ControlError {
+pub(crate) enum ControlError {
     MissingToken,
     InvalidToken,
     BadRequest,
@@ -822,7 +1082,7 @@ pub enum ControlError {
     SessionLimitReached,
     /// 桌面端起不来那个会话（终端没建成 / 命令没交到活着的 PTY 手上）。
     StartFailed,
-    /// 桌面主线程没在时限内答复。
+    /// 桌面主线程没在时限内答复。**不等于「没起成」** —— 见 [`Self::message`]。
     DesktopBusy,
     /// 自指禁令：编排者不能驱动自己那个 pane。
     SelfTarget,
@@ -887,7 +1147,13 @@ impl ControlError {
                 "orchestrated session limit reached; wait for one of yours to finish"
             }
             Self::StartFailed => "the desktop could not start that session",
-            Self::DesktopBusy => "the desktop did not answer in time",
+            // ⚠️ 这条**不是**「没起成」：记账在乐手落地那一刻就已经写进控制面
+            // （见模块注释的「记账契约」），没答上来的只是这一趟回执。于是正确的
+            // 下一步是先 list-panes 看一眼，而不是无脑重试再起一个。
+            Self::DesktopBusy => {
+                "the desktop did not answer in time; the session may have started anyway - \
+                 run list-panes before retrying"
+            }
             Self::SelfTarget => "an orchestrator cannot drive its own pane",
             Self::PaneNotFound => "no such orchestrated session",
             Self::PaneGone => "that orchestrated session's pane has been closed",
@@ -966,7 +1232,10 @@ pub(crate) fn try_handle_control(
     //
     // 每条请求一个线程而不是线程池：控制命令是编排者手动调 CLI 触发的低频动作，
     // 一个池子的复杂度换不来什么；而带令牌的请求方本来就是我们自己起的进程。
-    if ControlPlane::blocks_on_desktop(command) {
+    //
+    // 认不出的命令名（带查询串 / 多层路径的也在内）当然不阻塞，落到下面那条路
+    // 由 `handle` 统一答「未知命令」。
+    if Command::parse(command).is_some_and(Command::blocks_on_desktop) {
         if let Err(err) = plane.authorize_body(&body) {
             respond(request, err.into_outcome());
             return None;
@@ -979,7 +1248,6 @@ pub(crate) fn try_handle_control(
         });
         return None;
     }
-    // 命令名里带查询串 / 多层路径的一律落进「未知命令」，别去猜
     let outcome = plane.handle(command, &body);
     respond(request, outcome);
     None
@@ -1048,6 +1316,15 @@ mod tests {
 
     // ─── 假动作实现 ───────────────────────────────────────────
 
+    /// 一次 `start_session` 收到的东西（spec 本身是一次性的落地凭据、不可克隆，
+    /// 所以只把要断言的那几样抄出来）。
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct SpecFacts {
+        launcher_id: String,
+        project_id: String,
+        orchestrator_pane_id: u32,
+    }
+
     /// 桌面动作的假实现：**记下收到的 spec**（裁决对不对，看它收到了什么），
     /// 按需要伪造失败，并把「起出来的乐手」登记成一个可以随手改死活的现场。
     #[derive(Default)]
@@ -1056,8 +1333,8 @@ mod tests {
         next_pane: Mutex<u32>,
         /// 非 `None` 时 `start_session` 一律这么失败。
         fail: Mutex<Option<StartFailure>>,
-        /// 每次 `start_session` 收到的 spec，按顺序。
-        calls: Mutex<Vec<StartSessionSpec>>,
+        /// 每次 `start_session` 收到的 spec 摘要，按顺序。
+        calls: Mutex<Vec<SpecFacts>>,
         /// pane → 死活。没登记过的一律「已经不在了」。
         liveness: Mutex<HashMap<u32, PaneLiveness>>,
         /// 起会话时先睡这么久（测「阻塞命令不占 HTTP 线程」用）。
@@ -1065,22 +1342,32 @@ mod tests {
     }
 
     impl FakeActions {
-        fn live(&self, pane_id: u32, status: &str) {
+        fn set(&self, pane_id: u32, alive: bool, status: &str, ai_session: AiSessionState) {
             self.liveness.lock().insert(
                 pane_id,
                 PaneLiveness {
-                    alive: true,
+                    alive,
                     status: status.into(),
+                    ai_session,
                 },
             );
+        }
+        fn live(&self, pane_id: u32, status: &str) {
+            self.set(pane_id, true, status, AiSessionState::Active);
         }
         /// 乐手 pane 被用户关掉。
         fn close(&self, pane_id: u32) {
             self.liveness.lock().insert(pane_id, PaneLiveness::gone());
         }
         /// agent 自己退出了，但 pane 还在（还能回去看它留下的东西）。
+        /// **hook 已启用**的那条路：`idle` 是权威的退出信号。
         fn agent_exited(&self, pane_id: u32) {
-            self.live(pane_id, "idle");
+            self.set(pane_id, true, "idle", AiSessionState::Ended);
+        }
+        /// 降级路径：这个 pane 没 hook、输入检测也没认出它是 AI 会话 ——
+        /// 桌面侧**答不上来**「它还在不在跑」。
+        fn unknown(&self, pane_id: u32) {
+            self.set(pane_id, true, "idle", AiSessionState::Unknown);
         }
     }
 
@@ -1089,7 +1376,11 @@ mod tests {
             if let Some(d) = *self.delay.lock() {
                 std::thread::sleep(d);
             }
-            self.calls.lock().push(spec);
+            self.calls.lock().push(SpecFacts {
+                launcher_id: spec.launcher_id().to_string(),
+                project_id: spec.project_id().to_string(),
+                orchestrator_pane_id: spec.orchestrator_pane_id(),
+            });
             if let Some(err) = *self.fail.lock() {
                 return Err(err);
             }
@@ -1100,7 +1391,8 @@ mod tests {
             };
             // 刚起的乐手：命令已经敲进去了，输入检测那一刻就把它认成 AI 会话
             self.live(pane_id, "ai-idle");
-            Ok(StartedSession { pane_id })
+            // 与真桌面同一条契约：先记账（`landed`），再谈回执
+            Ok(spec.landed(pane_id))
         }
 
         fn pane_liveness(&self, pane_id: u32) -> PaneLiveness {
@@ -1641,6 +1933,33 @@ mod tests {
         assert!(extra > 100);
     }
 
+    /// **「不可知」按占名额算**（fail-closed）。
+    ///
+    /// 无 hook + 命令不在 `AI_COMMANDS` 里的自定义启动器（ADR 0003：任何启动器
+    /// 都能当乐手）恒答 `idle`，若按「不在 AI 会话里 = 不占名额」判，硬上限就是
+    /// 摆设 —— 可以无限起。宁可少起一个。
+    #[test]
+    fn 说不上来的乐手照样占着名额() {
+        let (plane, _host, actions, port, token) = granted();
+        plane.set_session_cap(2);
+
+        let first = start(port, &token, r#""launcherId":"claude""#).1["data"]["pane"]["paneId"]
+            .as_u64()
+            .unwrap() as u32;
+        assert_eq!(start(port, &token, r#""launcherId":"claude""#).0, 200);
+        assert_eq!(start(port, &token, r#""launcherId":"claude""#).0, 429, "满了");
+
+        // 这个 pane 没有 hook、输入检测也没认出它 —— 桌面侧答不上来
+        actions.unknown(first);
+        let (status, v) = start(port, &token, r#""launcherId":"claude""#);
+        assert_eq!(status, 429, "「说不上来」不许释放名额,否则上限形同虚设: {v}");
+        assert_eq!(v["error"]["code"], "sessionLimitReached");
+
+        // 只有**明确结束**才还名额：hook 权威说 idle（SessionEnd 落地了）
+        actions.agent_exited(first);
+        assert_eq!(start(port, &token, r#""launcherId":"claude""#).0, 200);
+    }
+
     /// 上限是**可注入**的（工单 08 的设置项落点），判断处不必改一个字。
     #[test]
     fn 上限可注入() {
@@ -1747,6 +2066,67 @@ mod tests {
             json(&body)["data"]["panes"].as_array().unwrap().is_empty(),
             "失败的尝试不该留下记账: {body}"
         );
+    }
+
+    /// **幽灵乐手那条竞态的钉子**：记账在 [`StartSessionSpec::landed`] 里落地，
+    /// 回执之后再也不写第二次 —— 于是发起侧超时走人、回执丢在半路，也不会在桌面上
+    /// 留下一个「不进 `list-panes`、不占名额、点名答不存在」的真实会话。
+    #[test]
+    fn 回执丢了记账照样在() {
+        /// 起成之后把回执丢掉、只答「桌面忙」的动作实现 —— 与真现场
+        /// 「主线程建成了 pane，但 HTTP 线程已经在 ACTION_TIMEOUT 上放弃」同构。
+        struct DropsReply;
+
+        impl OrchestratorActions for DropsReply {
+            fn start_session(&self, spec: StartSessionSpec) -> Result<StartedSession, StartFailure> {
+                let started = spec.landed(202);
+                drop(started); // 回执没送到
+                Err(StartFailure::DesktopBusy)
+            }
+            fn pane_liveness(&self, pane_id: u32) -> PaneLiveness {
+                PaneLiveness {
+                    alive: pane_id == 202,
+                    status: "ai-idle".into(),
+                    ai_session: AiSessionState::Active,
+                }
+            }
+        }
+
+        let host = Arc::new(FakeHost::default());
+        *host.launchers.lock() = vec![launcher("claude", "Claude")];
+        *host.projects.lock() = vec![project("p-self", None)];
+        let plane = ControlPlane::new();
+        plane.set_host(Arc::new(host));
+        plane.set_actions(Arc::new(DropsReply));
+        let token = plane.grant(7, "p-self");
+        let port = serve(plane.clone());
+
+        // 编排者这一趟拿到的是「桌面没答上来」
+        let (status, v) = start(port, &token, r#""launcherId":"claude""#);
+        assert_eq!(status, 503, "{v}");
+        assert_eq!(v["error"]["code"], "desktopBusy");
+        // 而那条消息要指向 list-panes，不许诱导它无脑重试
+        let message = v["error"]["message"].as_str().unwrap();
+        assert!(message.contains("list-panes"), "文案得指路: {message}");
+
+        // …但桌面上那个真实存在的乐手照样看得见
+        let (_s, body) = post(port, "/control/list-panes", &payload_of(&token, ""));
+        let panes = json(&body)["data"]["panes"].clone();
+        assert_eq!(panes.as_array().unwrap().len(), 1, "别把它变成幽灵: {body}");
+        assert_eq!(panes[0]["paneId"], 202);
+        assert_eq!(panes[0]["alive"], true);
+
+        // …照样占着名额（ADR 0003：上限只计活着的 AI 会话，它就是一个）
+        plane.set_session_cap(1);
+        let (status, v) = start(port, &token, r#""launcherId":"claude""#);
+        assert_eq!(status, 429, "幽灵乐手不占名额就是在鼓励重试再起一个: {v}");
+
+        // …照样点得动（可见范围铁律：它是自己起的，不该答「不存在」）
+        let me = Grant {
+            pane_id: 7,
+            project_id: "p-self".into(),
+        };
+        assert_eq!(plane.resolve_target(&me, 202).unwrap().pane_id, 202);
     }
 
     /// 动作没接线时**一律拒绝**起会话（fail-closed，别把「没配置」当放行理由）。
@@ -1865,6 +2245,117 @@ mod tests {
             project_id: "p-self".into(),
         };
         assert_eq!(plane.resolve_target(&me, musician), Err(ControlError::PaneGone));
+    }
+
+    // ─── 记账修剪 ─────────────────────────────────────────────
+
+    /// 直接往记账表里塞一条（绕开 HTTP 与并发上限，专测修剪口径）。
+    fn record(plane: &ControlPlane, orchestrator: u32, pane_id: u32) {
+        plane.register_landed(OrchestratedSession {
+            pane_id,
+            orchestrator_pane_id: orchestrator,
+            project_id: "p-self".into(),
+            project_name: "项目".into(),
+            launcher_id: "claude".into(),
+            launcher_name: "Claude".into(),
+        });
+    }
+
+    /// 超出上限时**只丢已经关掉的、从最旧的丢起**。
+    #[test]
+    fn 记账超上限时先丢最旧的已关条目() {
+        let plane = ControlPlane::new();
+        // 先塞满上限：前 10 条随后被用户关掉
+        for i in 0..MAX_SESSIONS_PER_ORCHESTRATOR as u32 {
+            record(&plane, 7, 100 + i);
+        }
+        for i in 0..10u32 {
+            plane.revoke_pane(100 + i); // 乐手 pane 关闭走的就是这条
+        }
+        assert_eq!(
+            plane.session_ids_of(7).len(),
+            MAX_SESSIONS_PER_ORCHESTRATOR,
+            "还没超，一条都不该丢"
+        );
+
+        // 再起三个：把最旧的三条已关记账挤掉
+        for i in 0..3u32 {
+            record(&plane, 7, 200 + i);
+        }
+        let ids = plane.session_ids_of(7);
+        assert_eq!(ids.len(), MAX_SESSIONS_PER_ORCHESTRATOR);
+        assert!(!ids.contains(&100), "最旧的已关条目该先走");
+        assert!(!ids.contains(&102));
+        assert!(ids.contains(&103), "只丢超出的那几条，别多丢");
+        assert!(ids.contains(&200) && ids.contains(&202));
+    }
+
+    /// **活着的一条都不能丢** —— 丢掉一条活着的记账就是造一个幽灵乐手，
+    /// 比表长一点坏得多。丢不动就让它超着。
+    #[test]
+    fn 修剪不许丢活着的记账() {
+        let plane = ControlPlane::new();
+        let over = MAX_SESSIONS_PER_ORCHESTRATOR as u32 + 20;
+        for i in 0..over {
+            record(&plane, 7, 100 + i);
+        }
+        assert_eq!(
+            plane.session_ids_of(7).len(),
+            over as usize,
+            "一条都没关，超着也不许丢"
+        );
+
+        // 关掉 5 条，下一次登记才丢得动 5 条
+        for i in 0..5u32 {
+            plane.revoke_pane(100 + i);
+        }
+        record(&plane, 7, 900);
+        assert_eq!(plane.session_ids_of(7).len(), over as usize + 1 - 5);
+    }
+
+    /// 修剪按编排者各算各的：别人的记账不该被我起会话挤掉。
+    #[test]
+    fn 修剪只动自己名下的记账() {
+        let plane = ControlPlane::new();
+        record(&plane, 9, 50);
+        plane.revoke_pane(50);
+        for i in 0..(MAX_SESSIONS_PER_ORCHESTRATOR as u32 + 5) {
+            record(&plane, 7, 100 + i);
+        }
+        assert_eq!(plane.session_ids_of(9), vec![50], "别人的记账一条不动");
+    }
+
+    // ─── 命令表 ───────────────────────────────────────────────
+
+    /// 命令名与「会不会阻塞主线程」只有一份表。加一个变体时 `ALL` / `name` /
+    /// `blocks_on_desktop` / `handle` 的分发会一起编译不过 —— 这条测试补的是
+    /// 「表里那几条自己对得上」。
+    #[test]
+    fn 每条命令都解析得回自己() {
+        for cmd in Command::ALL {
+            assert_eq!(Command::parse(cmd.name()), Some(cmd), "{cmd:?}");
+        }
+        // 名字与 sidecar CLI 的 `Command::endpoint` 一字不差
+        let names: Vec<&str> = Command::ALL.iter().map(|c| c.name()).collect();
+        assert_eq!(
+            names,
+            vec!["list-launchers", "list-projects", "start-session", "list-panes"]
+        );
+        // 认不出的一律 None（带查询串 / 多层路径的别去猜）
+        for bad in ["", "start-session?x=1", "start-session/extra", "wait"] {
+            assert_eq!(Command::parse(bad), None, "{bad}");
+        }
+    }
+
+    /// 阻塞属性登记在命令表上：只有起乐手要回主线程，其余就地答完。
+    #[test]
+    fn 只有起乐手会阻塞主线程() {
+        let blocking: Vec<&str> = Command::ALL
+            .iter()
+            .filter(|c| c.blocks_on_desktop())
+            .map(|c| c.name())
+            .collect();
+        assert_eq!(blocking, vec!["start-session"]);
     }
 
     // ─── 阻塞命令不占 HTTP 线程 ───────────────────────────────
