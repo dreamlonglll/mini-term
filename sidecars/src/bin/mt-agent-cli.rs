@@ -56,7 +56,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// List the AI launchers this orchestrator may start musicians with.
+    /// List the AI launchers this orchestrator may start orchestrated sessions with.
     ListLaunchers,
     /// List the projects reachable from here (own project + same group).
     ListProjects,

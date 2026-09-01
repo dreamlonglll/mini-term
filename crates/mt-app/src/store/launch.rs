@@ -12,7 +12,6 @@
 //! | 差异 | 参数 | 桌面端 | 移动端 |
 //! |------|------|--------|--------|
 //! | 落点与焦点 | [`LaunchPlacement`] | `Tab` / `Panel`,抢焦点 | `Background`,不抢焦点不切项目 |
-//! | 内部环境变量 | [`LaunchRequest::env`] | 空 | 空 |
 //! | 编排授予 | [`LaunchRequest::grant`] | 按启动器「允许编排」开关 | `None`(ADR 0003:编排能力只从桌面端那道开关来) |
 //! | 诞生一次性提示 | [`LaunchRequest::notice`] | 无(人自己点的) | 有(凭证被盗时唯一的审计迹象) |
 //! | 回执 | 返回的 [`LaunchOutcome`] | 丢弃 | 映射成中转协议的回执 |
@@ -30,16 +29,14 @@
 //! - **不代替调用方回执**。移动端那条「外层统一回执、内层随便 `?` 早退」的结构
 //!   (坑 5)留在 `mobile_relay` 自己手里。
 //!
-//! # 环境变量这条缝
+//! # 编排令牌为什么走 `grant` 而不是环境变量参数
 //!
-//! [`LaunchRequest::env`] 走的是 [`mt_pty::PtySpawn::env`] —— 应用注入**内部
-//! 协议变量**的既有通道(`MINITERM_` 是保留前缀,项目级 env 那条 `user_env`
-//! 会被它挡掉)。现在两个调用点都传空,留作通用注入缝;`MINITERM_PTY_ID` /
-//! `MINITERM_HOOK_PORT` 顶不掉,判据见 `store::pure` 的 `merge_internal_env`。
-//!
-//! 编排**令牌**不走这条缝而走 [`LaunchRequest::grant`]:令牌要与 pane 身份
-//! (pty_id)绑定登记,而 pty_id 到 `store::panes::start_pty` 里才诞生 ——
-//! 授予与注入只能在那儿落地,这里只把「要不要授予」递下去。
+//! 令牌要与 pane 身份(pty_id)绑定登记,而 pty_id 到 `store::panes::start_pty`
+//! 里才诞生 —— 授予与注入只能在那儿落地,这里只把「要不要授予」
+//! ([`LaunchRequest::grant`])递下去。曾经预留过一条通用的
+//! `Vec<(String, String)>` 注入缝,因为所有调用点都传空、令牌又走不了它
+//! (评审判为 Speculative Generality)而删除;真出现新的内部变量需求时,
+//! 在 `start_pty` 的 base env 里加,`MINITERM_` 保留前缀的防覆盖纪律不变。
 
 use gpui::{Context, Window};
 
@@ -86,9 +83,6 @@ pub struct LaunchRequest<'a> {
     /// 要敲进 shell 的启动命令(**不含**回车,由入口补)。
     pub command: &'a str,
     pub placement: LaunchPlacement,
-    /// 额外注入 PTY 的**应用内部**环境变量(`MINITERM_` 保留前缀)。
-    /// 现有调用点都传空,见模块注释「环境变量这条缝」。
-    pub env: Vec<(String, String)>,
     /// 编排授予(ADR 0003 的信任根)。桌面端按启动器「允许编排」开关传,
     /// 移动端一律 [`OrchestratorGrant::None`];令牌与身份注入在
     /// `store::panes::start_pty` 落地,见模块注释。
@@ -151,7 +145,6 @@ impl AppStore {
             shell_name,
             command,
             placement,
-            env,
             grant,
             notice,
         } = req;
@@ -172,12 +165,11 @@ impl AppStore {
         let pane_id = match placement {
             LaunchPlacement::Tab { anchor_pane_id } => {
                 let pane_id = self
-                    .new_terminal_with_env(
+                    .new_terminal_with_grant(
                         project_id,
                         Some(shell),
                         anchor_pane_id,
                         None,
-                        &env,
                         grant,
                         window,
                         cx,
@@ -191,7 +183,7 @@ impl AppStore {
             }
             LaunchPlacement::Panel => {
                 let pane_id = self
-                    .new_panel_with_env(project_id, Some(shell), &env, grant, window, cx)
+                    .new_panel_with_grant(project_id, Some(shell), grant, window, cx)
                     .ok_or(LaunchError::SpawnFailed)?;
                 self.rename_pane(project_id, &pane_id, launcher_name, cx);
                 pane_id
@@ -201,7 +193,6 @@ impl AppStore {
                     project_id,
                     shell,
                     Some(launcher_name.to_string()),
-                    &env,
                     grant,
                     window,
                     cx,

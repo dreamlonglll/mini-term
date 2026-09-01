@@ -496,33 +496,6 @@ pub(super) fn remove_from_tree(tree: &mut Vec<mt_config::ProjectTreeItem>, proje
     });
 }
 
-// ─── 「按启动器起会话」共享入口的纯逻辑 ──────────────────────────
-
-/// 把调用方要求注入的**应用内部环境变量**并进 PTY 的内部变量表。
-///
-/// `base` 是 [`AppStore::start_pty`] 自己建的那一份(`MINITERM_PTY_ID` /
-/// `MINITERM_HOOK_PORT`)—— 它们是 hook 子进程关联回具体 pane 的唯一凭据,
-/// **不许被顶掉**:同名键一律丢弃调用方那一份,已有顺序也不动。调用方自己
-/// 重复的键取先出现的那个(与「先到先得」同一口径)。
-///
-/// ⚠️ 这条通道是 [`mt_pty::PtySpawn::env`],与项目级环境变量走的
-/// `PtyOptions::user_env` 是**两条路**:后者会被 `MINITERM_` 前缀过滤挡掉,
-/// 前者不过滤 —— 它本来就是应用注入内部协议变量的地方,`MINITERM_` 是保留前缀。
-///
-/// [`AppStore::start_pty`]: super::AppStore::start_pty
-pub(super) fn merge_internal_env(
-    mut base: Vec<(String, String)>,
-    extra: &[(String, String)],
-) -> Vec<(String, String)> {
-    for (key, value) in extra {
-        if base.iter().any(|(existing, _)| existing == key) {
-            continue;
-        }
-        base.push((key.clone(), value.clone()));
-    }
-    base
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1205,52 +1178,4 @@ mod tests {
         assert_eq!(next_maximized(None, None), None);
     }
 
-    // ── 「按启动器起会话」注入的内部环境变量 ──────────────────
-
-    fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
-    }
-
-    #[test]
-    fn 注入的内部变量追加在既有内部变量之后() {
-        let base = env(&[("MINITERM_PTY_ID", "7"), ("MINITERM_HOOK_PORT", "5511")]);
-        let merged = merge_internal_env(base.clone(), &env(&[("MINITERM_AGENT_TOKEN", "tok")]));
-        assert_eq!(
-            merged,
-            env(&[
-                ("MINITERM_PTY_ID", "7"),
-                ("MINITERM_HOOK_PORT", "5511"),
-                ("MINITERM_AGENT_TOKEN", "tok"),
-            ])
-        );
-        // 两个既有调用点都传空 —— 那一档必须与拆分前一字不差
-        assert_eq!(merge_internal_env(base.clone(), &[]), base);
-    }
-
-    #[test]
-    fn 注入的内部变量顶不掉_pty_id() {
-        // hook 子进程靠 `MINITERM_PTY_ID` 关联回 pane;调用方顶掉它 = 状态判定
-        // 认错 pane,这条闸不能只靠调用方自律
-        let base = env(&[("MINITERM_PTY_ID", "7")]);
-        let merged = merge_internal_env(
-            base,
-            &env(&[("MINITERM_PTY_ID", "999"), ("MINITERM_HOOK_PORT", "1")]),
-        );
-        assert_eq!(
-            merged,
-            env(&[("MINITERM_PTY_ID", "7"), ("MINITERM_HOOK_PORT", "1")])
-        );
-    }
-
-    #[test]
-    fn 注入表内部重复取先出现的那个() {
-        let merged = merge_internal_env(
-            Vec::new(),
-            &env(&[("MINITERM_A", "1"), ("MINITERM_A", "2"), ("MINITERM_B", "3")]),
-        );
-        assert_eq!(merged, env(&[("MINITERM_A", "1"), ("MINITERM_B", "3")]));
-    }
 }

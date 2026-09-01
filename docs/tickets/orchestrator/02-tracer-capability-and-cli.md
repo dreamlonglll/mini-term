@@ -18,4 +18,8 @@
 - [x] 新文案进 i18n 字典源头并重跑生成器
 - [x] cargo test --workspace 全绿（合并后复验）
 
-**合并期决议**（主会话解冲突时定）：spawn 链 `extra_env` 与 `OrchestratorGrant` 两参并存，令牌先进 base env 再合 extra_env；`LaunchRequest` 增 `grant` 字段。移动端引用「允许编排」启动器暂**不授予**（spec 故事 22 的放行需协议带 flag，留后续工单裁决）。
+**合并期决议**（主会话解冲突时定）：`LaunchRequest` 增 `grant` 字段，spawn 链穿 `OrchestratorGrant`。移动端引用「允许编排」启动器暂**不授予**（spec 故事 22 的放行需协议带 flag，留后续工单裁决）。
+
+**两轴评审后的整改**（同波落地）：① 工单 01 预留的 `extra_env` 通用注入缝判为 Speculative Generality 删除（令牌走不了它——需要 spawn 时才诞生的 pty_id），`merge_internal_env` 及其 3 例测试一并删除，`_with_env` 系列归名 `_with_grant`；② `ControlPlane` 的 grants/tokens 两把锁并成一把（grant/revoke 加锁顺序相反是 AB-BA 雷）；③ SSH 远程项目不授予令牌（原会在本地 ssh 客户端进程上登记一枚永远用不上的活令牌）；④ CLI 帮助文案 musicians → orchestrated sessions。
+
+**评审留档（未整改）**：`mt-agent-cli` 与 `miniterm-hook` 的端口发现同形异构（宜共享进 mt-core，但动 hook 属行为变更，另行立项）；`upsert_launcher` 尾参裸 bool；「改分组即时生效」实为配置落盘刷镜像（`save_config_soon` 有 500ms 防抖，最坏滞后半秒，实用可接受）。

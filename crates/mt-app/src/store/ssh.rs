@@ -404,7 +404,6 @@ impl AppStore {
             &project,
             &shell,
             cwd.as_deref(),
-            &[],
             crate::orchestrator::OrchestratorGrant::None,
             cx,
         );

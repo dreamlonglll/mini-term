@@ -669,10 +669,9 @@ impl RelayBridge {
                         command: &payload.command,
                         // 挂进最左侧叶子末尾:不激活、不抢焦点、不切项目
                         placement: LaunchPlacement::Background,
-                        // 移动端发起不注入任何内部变量,也不授予编排能力:
-                        // 编排能力只从桌面端启动器那道开关来(ADR 0003;
-                        // 移动端引用「允许编排」启动器的放行留待后续工单裁决)
-                        env: Vec::new(),
+                        // 移动端发起不授予编排能力:编排能力只从桌面端启动器
+                        // 那道开关来(ADR 0003;移动端引用「允许编排」启动器的
+                        // 放行留待后续工单裁决)
                         grant: crate::orchestrator::OrchestratorGrant::None,
                         // 桌面端 toast:凭证被盗时这是唯一的审计迹象,所以即便
                         // 不切过去也要弹。走自建 toast 层的 `mobile-session` 档

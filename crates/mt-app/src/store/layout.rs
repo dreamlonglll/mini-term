@@ -40,13 +40,12 @@ impl AppStore {
         project_id: &str,
         shell: ShellConfig,
         custom_title: Option<String>,
-        extra_env: &[(String, String)],
         grant: OrchestratorGrant,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<String> {
         let project = self.project(project_id)?.clone();
-        let mut pane = self.spawn_pane(&project, &shell, None, extra_env, grant, window, cx)?;
+        let mut pane = self.spawn_pane(&project, &shell, None, grant, window, cx)?;
         pane.custom_title = custom_title;
         let pane_id = pane.id.clone();
         let pty_id = pane.pty_id;
@@ -148,29 +147,28 @@ impl AppStore {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<String> {
-        self.new_panel_with_env(project_id, shell, &[], OrchestratorGrant::None, window, cx)
+        self.new_panel_with_grant(project_id, shell, OrchestratorGrant::None, window, cx)
     }
 
-    /// [`new_panel`] 再加**应用内部**环境变量与编排授予。
+    /// [`new_panel`] 的带授予版。
     ///
-    /// 单独一个入口只为把 `extra_env` / `grant` 递到 `spawn_pane` —— 界面上那两个
-    /// 「新建面板」调用点一律走上面那个无注入的门面,签名一字不变;只有
+    /// 单独一个入口只为把 `grant` 递到 `spawn_pane` —— 界面上那两个
+    /// 「新建面板」调用点一律走上面那个无授予的门面,签名一字不变;只有
     /// [「按启动器起会话」共享入口](Self::launch_ai_session)会传
     /// [`OrchestratorGrant::Grant`]。
     ///
     /// [`new_panel`]: Self::new_panel
-    pub(super) fn new_panel_with_env(
+    pub(super) fn new_panel_with_grant(
         &mut self,
         project_id: &str,
         shell: Option<ShellConfig>,
-        extra_env: &[(String, String)],
         grant: OrchestratorGrant,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<String> {
         let project = self.project(project_id)?.clone();
         let shell = shell.or_else(|| self.resolve_shell(None))?;
-        let pane = self.spawn_pane(&project, &shell, None, extra_env, grant, window, cx)?;
+        let pane = self.spawn_pane(&project, &shell, None, grant, window, cx)?;
         let pane_id = pane.id.clone();
 
         let state = self.project_states.get_mut(project_id)?;

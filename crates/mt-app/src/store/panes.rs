@@ -17,7 +17,7 @@ use crate::tree::{
 
 use super::launch::{LaunchPlacement, LaunchRequest};
 use super::pure::{
-    merge_internal_env, next_maximized, resolve_auto_resume_command, resolve_resume_cwd,
+    next_maximized, resolve_auto_resume_command, resolve_resume_cwd,
     resolve_scrollback, terminal_style_from,
 };
 use super::AppStore;
@@ -69,7 +69,6 @@ impl AppStore {
                 shell_name: launcher.shell.as_deref(),
                 command: &launcher.command,
                 placement: LaunchPlacement::Tab { anchor_pane_id },
-                env: Vec::new(),
                 // 勾了「允许编排」就连编排令牌一起注入(与 `new_panel_from_launcher`
                 // 同一条口径,只是落点是当前面板的 tab 栏)。
                 grant: OrchestratorGrant::from_launcher(launcher),
@@ -100,7 +99,6 @@ impl AppStore {
                 shell_name: launcher.shell.as_deref(),
                 command: &launcher.command,
                 placement: LaunchPlacement::Panel,
-                env: Vec::new(),
                 // 编排能力的**唯一**授予入口:勾了「允许编排」的启动器,起 pane 时
                 // 连同令牌一起注进 PTY 环境(ADR 0003 的信任根)。开关没勾就什么都不发,
                 // pane 里的 agent 调控制 CLI 会被明确拒绝(fail-closed)。
@@ -130,41 +128,39 @@ impl AppStore {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<String> {
-        self.new_terminal_with_env(
+        self.new_terminal_with_grant(
             project_id,
             shell,
             anchor_pane_id,
             cwd,
-            &[],
             OrchestratorGrant::None,
             window,
             cx,
         )
     }
 
-    /// [`new_terminal_with_cwd`] 再加**应用内部**环境变量与编排授予。
+    /// [`new_terminal_with_cwd`] 的带授予版。
     ///
-    /// 单独一个入口只为把 `extra_env` / `grant` 递到 [`spawn_pane`] —— 界面上那几个
-    /// 「新建终端」调用点一律走上面那个无注入的门面,签名一字不变;只有
+    /// 单独一个入口只为把 `grant` 递到 [`spawn_pane`] —— 界面上那几个
+    /// 「新建终端」调用点一律走上面那个无授予的门面,签名一字不变;只有
     /// [「按启动器起会话」共享入口](Self::launch_ai_session)会传
     /// [`OrchestratorGrant::Grant`],别的入口一律 `None`。
     ///
     /// [`new_terminal_with_cwd`]: Self::new_terminal_with_cwd
     /// [`spawn_pane`]: Self::spawn_pane
-    pub(super) fn new_terminal_with_env(
+    pub(super) fn new_terminal_with_grant(
         &mut self,
         project_id: &str,
         shell: Option<ShellConfig>,
         anchor_pane_id: Option<String>,
         cwd: Option<String>,
-        extra_env: &[(String, String)],
         grant: OrchestratorGrant,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<String> {
         let project = self.project(project_id)?.clone();
         let shell = shell.or_else(|| self.resolve_shell(None))?;
-        let pane = self.spawn_pane(&project, &shell, cwd, extra_env, grant, window, cx)?;
+        let pane = self.spawn_pane(&project, &shell, cwd, grant, window, cx)?;
         let pane_id = pane.id.clone();
 
         let anchor = anchor_pane_id.or_else(|| self.focused_pane_id.clone());
@@ -233,13 +229,12 @@ impl AppStore {
             .map(|p| p.shell_name.clone());
         let shell = self.resolve_shell(shell_name.as_deref())?;
 
-        // 分屏是「照着源 pane 再开一个」:不带调用方注入的内部变量,编排能力
-        // 也不随分屏继承(它只从启动器那道开关来)
+        // 分屏是「照着源 pane 再开一个」:编排能力不随分屏继承
+        // (它只从启动器那道开关来)
         let pane = self.spawn_pane(
             &project,
             &shell,
             source_cwd,
-            &[],
             OrchestratorGrant::None,
             window,
             cx,
@@ -725,13 +720,12 @@ impl AppStore {
             // pane 自己的 cwd 优先,会话 cwd 兜底
             let start_cwd = item.cwd.clone().or_else(|| resume_cwd.clone());
 
-            // 启动恢复的 pane 一律不带注入变量、不发编排令牌:重启即新身份,
-            // 编排能力要用户重新用「允许编排」的启动器起一个(ADR 0003「MVP 不做收养」)。
+            // 启动恢复的 pane 一律不发编排令牌:重启即新身份,编排能力要用户
+            // 重新用「允许编排」的启动器起一个(ADR 0003「MVP 不做收养」)。
             let pty_id = self.start_pty(
                 &project,
                 &shell,
                 start_cwd.as_deref(),
-                &[],
                 OrchestratorGrant::None,
                 cx,
             );
@@ -778,23 +772,20 @@ impl AppStore {
 
     /// 起 PTY 并拼出 `PaneState`。
     ///
-    /// `extra_env` 是**应用内部**环境变量(`MINITERM_` 保留前缀),并进
-    /// [`mt_pty::PtySpawn::env`];`grant` 是编排授予(ADR 0003 的信任根,勾了
-    /// 「允许编排」的启动器那条路才是 `Grant`)。普通新建/分屏一律传
-    /// `&[]` + `None`,只有[「按启动器起会话」共享入口](Self::launch_ai_session)
-    /// 会往里塞东西。
+    /// `grant` 是编排授予(ADR 0003 的信任根,勾了「允许编排」的启动器那条路
+    /// 才是 `Grant`)。普通新建/分屏一律传 `None`,只有
+    /// [「按启动器起会话」共享入口](Self::launch_ai_session)会传 `Grant`。
     // 拆分前是私有方法;调用点在 `store::layout`(挂后台 pane / 新建面板),升到 `pub(super)`。
     pub(super) fn spawn_pane(
         &mut self,
         project: &ProjectConfig,
         shell: &ShellConfig,
         cwd_override: Option<String>,
-        extra_env: &[(String, String)],
         grant: OrchestratorGrant,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<PaneState> {
-        let pty_id = self.start_pty(project, shell, cwd_override.as_deref(), extra_env, grant, cx);
+        let pty_id = self.start_pty(project, shell, cwd_override.as_deref(), grant, cx);
         let mut pane = PaneState::new(shell.name.clone());
         pane.pty_id = Some(pty_id);
         pane.cwd = cwd_override;
@@ -811,7 +802,6 @@ impl AppStore {
         project: &ProjectConfig,
         shell: &ShellConfig,
         cwd_override: Option<&str>,
-        extra_env: &[(String, String)],
         grant: OrchestratorGrant,
         cx: &mut Context<Self>,
     ) -> u32 {
@@ -831,16 +821,16 @@ impl AppStore {
         }
         // 编排令牌 + 自身 pane 身份(ADR 0003)。走 `PtySpawn.env` 这条**应用内部
         // 变量**通道:项目级 env 走的是 `user_env`,会被 `MINITERM_` 保留前缀
-        // 挡一道,用户手改配置也覆盖不掉这两个。先进 base 再合 `extra_env`,
-        // 借 `merge_internal_env` 的「base 已有键顶不掉」把这两条一并护住。
-        if grant.is_granted() {
+        // 挡一道,用户手改配置也覆盖不掉这两个。
+        //
+        // SSH 远程项目**不授予**:这条 env 只会注进本地 ssh 客户端进程,远端
+        // agent 根本拿不到,登记出来的是一枚永远无人使用的活令牌(评审发现);
+        // 远程项目能不能进编排版图是发起侧的裁决,不在这儿。
+        if grant.is_granted() && project.ssh_connection_id.is_none() {
             let token = self.ai.grant_orchestration(pty_id, &project.id);
             env.push((mt_ai::control::TOKEN_ENV.to_string(), token));
             env.push((mt_ai::control::PANE_ENV.to_string(), pty_id.to_string()));
         }
-        // 调用方要求注入的内部变量并进同一条通道;上面几条顶不掉,
-        // 判据与顺序见 `merge_internal_env`。既有调用点全传 `&[]`。
-        let env = merge_internal_env(env, extra_env);
 
         // SSH 远程分支:直接 spawn `ssh` 作 PTY 子进程(不经本地 shell,对齐 WSL
         // 启动器重写模式)。本地 cwd 用兜底目录 —— 远程目录由 ssh 的远端命令

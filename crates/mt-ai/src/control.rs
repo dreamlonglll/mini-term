@@ -123,10 +123,18 @@ pub struct ControlPlane {
 #[derive(Default)]
 struct Inner {
     host: Mutex<Option<Arc<dyn OrchestratorHost>>>,
+    /// 令牌登记。`grants` 与 `tokens` 是同一份事实的两个索引,必须在**同一把锁**
+    /// 下变更 —— 拆成两把锁时 `grant`(先 grants 后 tokens)与 `revoke_pane`
+    /// (先 tokens 后 grants)的加锁顺序相反,是典型的 AB-BA 死锁雷。
+    registry: Mutex<TokenRegistry>,
+}
+
+#[derive(Default)]
+struct TokenRegistry {
     /// token → 授予。
-    grants: Mutex<HashMap<String, Grant>>,
+    grants: HashMap<String, Grant>,
     /// pane → token（pane 关闭时按 pane 撤销，重复授予时顶掉旧的）。
-    tokens: Mutex<HashMap<u32, String>>,
+    tokens: HashMap<u32, String>,
 }
 
 impl ControlPlane {
@@ -142,12 +150,11 @@ impl ControlPlane {
     /// 授予一枚编排令牌：随机生成、每 pane 一枚，同一 pane 重复授予顶掉旧的。
     pub fn grant(&self, pane_id: u32, project_id: &str) -> String {
         let token = new_token();
-        let mut grants = self.inner.grants.lock();
-        let mut tokens = self.inner.tokens.lock();
-        if let Some(old) = tokens.insert(pane_id, token.clone()) {
-            grants.remove(&old);
+        let mut registry = self.inner.registry.lock();
+        if let Some(old) = registry.tokens.insert(pane_id, token.clone()) {
+            registry.grants.remove(&old);
         }
-        grants.insert(
+        registry.grants.insert(
             token.clone(),
             Grant {
                 pane_id,
@@ -159,15 +166,15 @@ impl ControlPlane {
 
     /// pane 关闭 / 重开 PTY：撤销它手上的令牌。
     pub fn revoke_pane(&self, pane_id: u32) {
-        let mut tokens = self.inner.tokens.lock();
-        if let Some(token) = tokens.remove(&pane_id) {
-            self.inner.grants.lock().remove(&token);
+        let mut registry = self.inner.registry.lock();
+        if let Some(token) = registry.tokens.remove(&pane_id) {
+            registry.grants.remove(&token);
         }
     }
 
     /// 该 pane 当前是否持有编排能力（UI 标识与工单 03 的裁决用）。
     pub fn is_orchestrator(&self, pane_id: u32) -> bool {
-        self.inner.tokens.lock().contains_key(&pane_id)
+        self.inner.registry.lock().tokens.contains_key(&pane_id)
     }
 
     /// 校验令牌 + 自称身份。任何一环对不上都是 401，不降级。
@@ -175,8 +182,8 @@ impl ControlPlane {
         if token.is_empty() {
             return Err(ControlError::MissingToken);
         }
-        let grants = self.inner.grants.lock();
-        let Some(grant) = grants.get(token) else {
+        let registry = self.inner.registry.lock();
+        let Some(grant) = registry.grants.get(token) else {
             return Err(ControlError::InvalidToken);
         };
         if grant.pane_id != pane_id {
