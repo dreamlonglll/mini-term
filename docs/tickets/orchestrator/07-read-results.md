@@ -6,7 +6,7 @@
 
 **Blocked by:** 03（先有乐手可读）
 
-**Status:** done（待填）
+**Status:** done（e74613f）
 
 - [x] 三大家乐手的回答能以结构化增量读出（新增量只含上次之后的内容）
 - [x] 无记录 agent 调 read-transcript 得到明确错误；read-screen 对其可用
