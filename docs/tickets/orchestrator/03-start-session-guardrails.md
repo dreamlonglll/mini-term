@@ -6,7 +6,7 @@
 
 **Blocked by:** 01（共享入口）、02（控制面骨架与令牌）
 
-**Status:** done（本工单实施提交）
+**Status:** done（b0ad0a6）
 
 - [x] 编排者可在本项目与同分组项目启动乐手并拿到回执；乐手 pane 正常进入 AI 会话
 - [x] 出生不抢焦点不切项目，一次性提示照旧（`LaunchPlacement::Background` + 新文案 `orchestratorStartSession`）
