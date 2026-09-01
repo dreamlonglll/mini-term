@@ -510,6 +510,7 @@ pub fn upsert_launcher(
     name: &str,
     shell: Option<&str>,
     command: &str,
+    orchestration: bool,
 ) -> Vec<AiLauncher> {
     let entry = AiLauncher {
         id: if id.is_empty() {
@@ -523,6 +524,7 @@ pub fn upsert_launcher(
             .filter(|s| !s.is_empty())
             .map(str::to_string),
         command: command.trim().to_string(),
+        orchestration,
     };
     if id.is_empty() {
         let mut next = list.to_vec();
@@ -1031,12 +1033,25 @@ mod tests {
 
     #[test]
     fn 保存草稿时空_shell_不写字段() {
-        let next = upsert_launcher(&[], "", "  Claude  ", Some("   "), " claude ");
+        let next = upsert_launcher(&[], "", "  Claude  ", Some("   "), " claude ", false);
         assert_eq!(next.len(), 1);
         assert_eq!(next[0].name, "Claude");
         assert_eq!(next[0].command, "claude");
         assert!(next[0].shell.is_none(), "空 shell 不该写成空串");
         assert!(!next[0].id.is_empty());
+        assert!(!next[0].orchestration, "没勾就是没授予");
+    }
+
+    /// 「允许编排」跟着草稿走:勾上要存下来,取消勾选要能收回去。
+    /// 它是权限位,漂移一次就是白送或白丢一份编排能力。
+    #[test]
+    fn 编排开关随草稿存取() {
+        let granted = upsert_launcher(&[], "", "编排者", None, "claude", true);
+        assert!(granted[0].orchestration);
+
+        let revoked = upsert_launcher(&granted, &granted[0].id, "编排者", None, "claude", false);
+        assert_eq!(revoked.len(), 1);
+        assert!(!revoked[0].orchestration, "取消勾选必须收回能力");
     }
 
     #[test]
@@ -1047,22 +1062,31 @@ mod tests {
                 name: "Claude".into(),
                 shell: None,
                 command: "claude".into(),
+                orchestration: false,
             },
             AiLauncher {
                 id: "codex".into(),
                 name: "Codex".into(),
                 shell: None,
                 command: "codex".into(),
+                orchestration: false,
             },
         ];
-        let edited = upsert_launcher(&list, "codex", "Codex 新", Some("pwsh"), "codex resume");
+        let edited = upsert_launcher(
+            &list,
+            "codex",
+            "Codex 新",
+            Some("pwsh"),
+            "codex resume",
+            false,
+        );
         assert_eq!(edited.len(), 2);
         assert_eq!(edited[0].id, "claude");
         assert_eq!(edited[1].id, "codex");
         assert_eq!(edited[1].name, "Codex 新");
         assert_eq!(edited[1].shell.as_deref(), Some("pwsh"));
 
-        let added = upsert_launcher(&list, "", "Grok", None, "grok");
+        let added = upsert_launcher(&list, "", "Grok", None, "grok", false);
         assert_eq!(added.len(), 3);
         assert_eq!(added[2].name, "Grok");
         // 预置条目的 id 是 "claude" / "codex",新 id 不能与之撞车

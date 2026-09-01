@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 32;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 842;
+pub const ZH_ENTRY_COUNT: usize = 845;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 842;
+pub const EN_ENTRY_COUNT: usize = 845;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -563,6 +563,9 @@ static MOBILE_RELAY_ZH: &[(&str, &str)] = &[
     ("launchers.empty", "启动器已清空，手机将无法发起新会话。"),
     ("launchers.intro", "决定手机能起哪些 agent。命令与 shell 只保存在桌面端，手机只看得到名称。"),
     ("launchers.namePlaceholder", "名称（如 Claude）"),
+    ("launchers.orchestration", "允许编排"),
+    ("launchers.orchestrationBadge", "编排"),
+    ("launchers.orchestrationHint", "用这条启动器起的会话可以启动并驱动其他 AI 会话（范围限本项目与同分组项目）。只在你确实要开编排者时勾选。"),
     ("launchers.save", "保存"),
     ("launchers.title", "AI 启动器"),
     ("modal.generateQr", "生成配对二维码"),
@@ -607,6 +610,9 @@ static MOBILE_RELAY_EN: &[(&str, &str)] = &[
     ("launchers.empty", "No launchers left — your phone cannot start new sessions."),
     ("launchers.intro", "Decides which agents your phone can start. Commands and shells stay on the desktop; the phone only ever sees the name."),
     ("launchers.namePlaceholder", "Name (e.g. Claude)"),
+    ("launchers.orchestration", "Allow orchestration"),
+    ("launchers.orchestrationBadge", "Orchestrator"),
+    ("launchers.orchestrationHint", "Sessions started from this launcher may start and drive other AI sessions (within this project and projects in the same group). Only tick this when you really want an orchestrator."),
     ("launchers.save", "Save"),
     ("launchers.title", "AI launchers"),
     ("modal.generateQr", "Generate pairing QR code"),

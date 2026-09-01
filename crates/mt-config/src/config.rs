@@ -303,6 +303,17 @@ pub struct AiLauncher {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell: Option<String>,
     pub command: String,
+    /// 「允许编排」:用这条启动器起的 pane 拿得到编排令牌(ADR 0003 的信任根)。
+    ///
+    /// **默认 false**,且是**唯一**的授予入口 —— 编排能力必须由用户在桌面端
+    /// 显式勾选,存量配置与旧版写回的配置一律不带该字段、一律解析为 false
+    /// (fail-closed)。
+    ///
+    /// ⚠️ 这个字段**不进移动端协议**:移动端只看得到启动器的 `{id, name}`
+    /// (`mt_relay::MobileLauncher`),`mt_relay::AiLauncher` 那份镜像类型也
+    /// 刻意不带它 —— 编排是桌面本地的能力,与手机无关。
+    #[serde(default)]
+    pub orchestration: bool,
 }
 
 /// 预置启动器:零配置直接可用。
@@ -313,12 +324,14 @@ fn default_launchers() -> Vec<AiLauncher> {
             name: "Claude".into(),
             shell: None,
             command: "claude".into(),
+            orchestration: false,
         },
         AiLauncher {
             id: "codex".into(),
             name: "Codex".into(),
             shell: None,
             command: "codex".into(),
+            orchestration: false,
         },
     ]
 }
@@ -1912,12 +1925,14 @@ mod tests {
                 name: "Claude (WSL)".into(),
                 shell: Some("wsl-bash".into()),
                 command: "claude".into(),
+                orchestration: false,
             },
             AiLauncher {
                 id: "l2".into(),
                 name: "Codex".into(),
                 shell: None,
                 command: "codex --model gpt-5".into(),
+                orchestration: false,
             },
         ];
         let json = serde_json::to_string(&launchers).unwrap();
@@ -1929,6 +1944,37 @@ mod tests {
         );
         let parsed: Vec<AiLauncher> = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, launchers);
+    }
+
+    /// 「允许编排」是编排能力的**唯一**授予入口,默认必须是关的:
+    /// 存量配置里没有这个字段,解析成 true 等于给所有人白送编排令牌。
+    #[test]
+    fn launcher_orchestration_defaults_off_and_round_trips() {
+        // 存量配置(无该字段)→ false
+        let legacy: AiLauncher =
+            serde_json::from_str(r#"{"id":"l1","name":"Claude","command":"claude"}"#).unwrap();
+        assert!(
+            !legacy.orchestration,
+            "缺字段必须 fail-closed 解析成「不允许编排」"
+        );
+
+        // 预置启动器也一律不带编排能力
+        assert!(default_launchers().iter().all(|l| !l.orchestration));
+
+        // 勾上之后往返保真(camelCase 键名与其余字段同口径)
+        let granted = AiLauncher {
+            id: "l2".into(),
+            name: "编排者".into(),
+            shell: None,
+            command: "claude".into(),
+            orchestration: true,
+        };
+        let json = serde_json::to_string(&granted).unwrap();
+        assert!(json.contains(r#""orchestration":true"#), "{json}");
+        assert_eq!(
+            serde_json::from_str::<AiLauncher>(&json).unwrap(),
+            granted
+        );
     }
 
     #[test]
