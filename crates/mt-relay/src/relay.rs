@@ -59,12 +59,17 @@ pub struct SyncPane {
     /// 该 pane 当前的 PTY id(移动端指令写穿目标);终端未创建时缺省
     #[serde(default)]
     pub pty_id: Option<u32>,
+    /// 桌面端黄灯(agent 提问待答/等待授权批准),原样透传给移动端
+    #[serde(default)]
+    pub needs_attention: bool,
 }
 
-/// 一个被订阅 pane 的镜像状态:取消句柄 + 已解析消息(分页取数用)。
+/// 一个被订阅 pane 的镜像状态:取消句柄 + 已解析消息(分页取数用)
+/// + 解析器本体(移动端点选作答要跨任务查它的挂起提问,故共享持有)。
 struct MirrorSub {
     cancel_tx: watch::Sender<bool>,
     messages: Arc<Mutex<Vec<MirrorMessage>>>,
+    parser: Arc<Mutex<Option<MirrorParser>>>,
 }
 
 /// 异步任务(连接循环 + 镜像轮询)的落脚处。
@@ -290,6 +295,7 @@ impl MobileRelayManager {
                         pane_id: x.pane_id,
                         title: x.title,
                         status: x.status,
+                        needs_attention: x.needs_attention,
                     })
                     .collect(),
             })
@@ -469,16 +475,18 @@ impl MobileRelayManager {
 
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let messages = Arc::new(Mutex::new(Vec::new()));
+        let parser = Arc::new(Mutex::new(None));
         self.mirror_subs.lock().insert(
             pane_id.clone(),
             MirrorSub {
                 cancel_tx,
                 messages: messages.clone(),
+                parser: parser.clone(),
             },
         );
         let manager = Arc::clone(self);
         self.spawn(async move {
-            mirror_task(manager, pane_id, project_path, messages, cancel_rx).await;
+            mirror_task(manager, pane_id, project_path, messages, parser, cancel_rx).await;
         });
     }
 }
@@ -681,6 +689,14 @@ fn handle_relay_message(manager: &Arc<MobileRelayManager>, text: &str) {
             command_id,
             text,
         }) => handle_mobile_command(manager, pane_id, command_id, text),
+        // 移动端点选作答 agent 提问:校验挂起后注入按键,回执复用 CommandReceipt
+        Ok(RelayToDesktop::AnswerQuestion {
+            pane_id,
+            command_id,
+            seq,
+            question_index,
+            option_index,
+        }) => handle_answer_question(manager, pane_id, command_id, seq, question_index, option_index),
         // 移动端重命名会话:pane 标题归上层布局状态所有,本 crate 只做长度收敛后转交
         Ok(RelayToDesktop::RenamePane { pane_id, title }) => {
             manager.events.rename_pane(RenamePanePayload {
@@ -837,6 +853,69 @@ fn handle_mobile_command(
     }
 }
 
+/// 移动端点选作答:向镜像解析器核对该提问仍挂起(seq/题序/选项下标全合法且
+/// 非多选题),通过则把 ↓×n+回车 一次写入 PTY——等价用户在桌面终端用方向键
+/// 选中该项并回车。挂起校验是唯一防线:提问已被桌面作答/打断时按键会落进
+/// 普通输入框,必须拒绝而不是盲注。
+fn handle_answer_question(
+    manager: &Arc<MobileRelayManager>,
+    pane_id: String,
+    command_id: String,
+    seq: u64,
+    question_index: u32,
+    option_index: u32,
+) {
+    use mt_relay_protocol::CommandFailReason;
+
+    // 校验→写入→推进进度须在同一次解析器持锁内完成,否则两次点按会撞进度;
+    // write_pty 只是投递 channel(乐观 Ok),持锁跨它没有阻塞与重入风险
+    let result = {
+        let subs = manager.mirror_subs.lock();
+        let sub = subs.get(&pane_id);
+        let mut slot = sub.map(|s| s.parser.lock());
+        let parser = slot.as_mut().and_then(|s| s.as_mut());
+        match parser {
+            None => Err(CommandFailReason::QuestionNotPending),
+            Some(parser) => match parser.answer_keys(seq, question_index, option_index) {
+                None => Err(CommandFailReason::QuestionNotPending),
+                Some(answer) => match manager.pane_ptys.lock().get(&pane_id).copied() {
+                    None => Err(CommandFailReason::PaneNotFound),
+                    Some(pty_id) => manager
+                        .host
+                        .write_pty(pty_id, answer.keys)
+                        .map(|()| {
+                            parser.mark_answered(seq);
+                            answer.label
+                        })
+                        .map_err(|_| CommandFailReason::WriteFailed),
+                },
+            },
+        }
+    };
+
+    match result {
+        Ok(label) => {
+            // 登记选中项文本:作答回流的 questionAnswered 标记 content 即该 label,
+            // relabel_mobile_sources 逐字匹配后把来源改标 "mobile"
+            manager.record_mobile_cmd(&pane_id, &label);
+            let _ = manager.send(DesktopToRelay::CommandReceipt {
+                pane_id,
+                command_id,
+                ok: true,
+                reason: None,
+            });
+        }
+        Err(reason) => {
+            let _ = manager.send(DesktopToRelay::CommandReceipt {
+                pane_id,
+                command_id,
+                ok: false,
+                reason: Some(reason),
+            });
+        }
+    }
+}
+
 /// 镜像轮询任务:解析 pane 应镜像的最新会话文件,增量读取新行推送;
 /// 出现更新的会话文件时重新绑定并重发快照。
 async fn mirror_task(
@@ -844,9 +923,12 @@ async fn mirror_task(
     pane_id: String,
     project_path: String,
     messages: Arc<Mutex<Vec<MirrorMessage>>>,
+    parser: Arc<Mutex<Option<MirrorParser>>>,
     mut cancel_rx: watch::Receiver<bool>,
 ) {
-    let mut bound: Option<(PathBuf, MirrorParser, u64)> = None;
+    // 解析器住在 MirrorSub 的共享槽里(点选作答要跨任务查挂起提问),
+    // 本任务只在此记绑定路径与读取偏移;锁只在 feed 的瞬间持有,不跨 IO
+    let mut bound: Option<(PathBuf, u64)> = None;
     let mut sent_initial = false;
 
     loop {
@@ -886,14 +968,17 @@ async fn mirror_task(
                 }
             }
             Some((path, agent)) => {
-                let rebind = bound.as_ref().is_none_or(|(p, _, _)| *p != path);
+                let rebind = bound.as_ref().is_none_or(|(p, _)| *p != path);
                 if rebind {
                     // 首次绑定或换绑到更新的会话文件:全量解析 + 重发快照
-                    let mut parser = MirrorParser::new(agent);
                     if let Some((bytes, offset)) = mirror::read_from_offset(&path, 0) {
-                        let msgs = parser.feed(&bytes);
+                        let msgs = {
+                            let mut slot = parser.lock();
+                            let p = slot.insert(MirrorParser::new(agent));
+                            p.feed(&bytes)
+                        };
                         *messages.lock() = msgs;
-                        bound = Some((path, parser, offset));
+                        bound = Some((path, offset));
                         sent_initial = true;
                         let (page, has_more) = {
                             let m = messages.lock();
@@ -905,12 +990,18 @@ async fn mirror_task(
                             has_more,
                         });
                     }
-                } else if let Some((bpath, parser, offset)) = bound.as_mut() {
+                } else if let Some((bpath, offset)) = bound.as_mut() {
                     match mirror::read_from_offset(bpath, *offset) {
                         Some((bytes, new_offset)) => {
                             *offset = new_offset;
                             if !bytes.is_empty() {
-                                let mut new_msgs = parser.feed(&bytes);
+                                let mut new_msgs = {
+                                    let mut slot = parser.lock();
+                                    match slot.as_mut() {
+                                        Some(p) => p.feed(&bytes),
+                                        None => Vec::new(),
+                                    }
+                                };
                                 if !new_msgs.is_empty() {
                                     // 移动端指令回流:匹配的 user 消息改标 "mobile"
                                     manager.relabel_mobile_sources(&pane_id, &mut new_msgs);
@@ -1062,6 +1153,7 @@ mod tests {
                     pane_id: (*pane_id).into(),
                     title: "claude".into(),
                     status: (*status).into(),
+                    needs_attention: false,
                 })
                 .collect(),
             can_start_session: true,
@@ -1277,18 +1369,21 @@ mod tests {
                 source: "desktop".into(),
                 content: "unrelated input".into(),
                 timestamp: String::new(),
+                ..Default::default()
             },
             MirrorMessage {
                 seq: 1,
                 source: "desktop".into(),
                 content: "npm test".into(),
                 timestamp: String::new(),
+                ..Default::default()
             },
             MirrorMessage {
                 seq: 2,
                 source: "assistant".into(),
                 content: "npm test".into(),
                 timestamp: String::new(),
+                ..Default::default()
             },
         ];
         manager.relabel_mobile_sources("pane-1", &mut msgs);
@@ -1303,6 +1398,7 @@ mod tests {
             source: "desktop".into(),
             content: "npm test".into(),
             timestamp: String::new(),
+            ..Default::default()
         }];
         manager.relabel_mobile_sources("pane-1", &mut again);
         assert_eq!(again[0].source, "desktop");
@@ -1314,6 +1410,7 @@ mod tests {
             source: "desktop".into(),
             content: "ls".into(),
             timestamp: String::new(),
+            ..Default::default()
         }];
         manager.relabel_mobile_sources("pane-1", &mut other);
         assert_eq!(other[0].source, "desktop");

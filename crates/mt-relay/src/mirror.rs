@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use mt_ai::sessions as ai_sessions;
-use mt_relay_protocol::MirrorMessage;
+use mt_relay_protocol::{MirrorMessage, MirrorQuestionItem, MirrorQuestionOption};
 
 /// 该 agent 是否有本模块能解析的会话记录(Claude / Codex / Grok 三家)。
 ///
@@ -41,6 +41,25 @@ pub enum MirrorAgent {
     Grok,
 }
 
+/// 挂起中的 agent 提问:卡片已下发、尚未见到作答或打断。
+/// 仅 Claude 有此形态(AskUserQuestion);Codex/Grok 的审批走 hook 黄灯,不落记录。
+struct PendingQuestion {
+    /// 提问卡片消息的镜像 seq(移动端作答以此定位)
+    seq: u64,
+    question: ai_sessions::AiQuestion,
+    /// 已点选作答的题数:TUI 逐题推进,只接受按顺序作答下一题
+    answered_items: usize,
+}
+
+/// [`MirrorParser::answer_keys`] 的产物:注入 PTY 的按键序列 + 选中项文本。
+pub struct AnswerKeys {
+    /// ↓×option_index + 回车(TUI 高亮从首项起,方向键对单选题普适;
+    /// 数字键在各家 TUI 语义不一,不用)
+    pub keys: String,
+    /// 选中选项的 label(登记为移动端指令原文,镜像回流改标来源用)
+    pub label: String,
+}
+
 /// 增量解析器:按字节块喂入,只消费完整行(以 `\n` 结尾),半行留待下一块拼接。
 /// seq 在一次绑定内从 0 连续递增——`history_slice` 的下标分页依赖此不变量。
 pub struct MirrorParser {
@@ -50,6 +69,8 @@ pub struct MirrorParser {
     /// grok 专用:消息被拆成任意多个 chunk 行,要攒到边界才成一条。
     /// 其余两家一行即一条,该状态机不参与。
     grok: Option<ai_sessions::GrokUpdateParser>,
+    /// 挂起中的提问(Claude 专用)。换绑即随解析器整体重建,天然清空。
+    pending: Vec<PendingQuestion>,
 }
 
 impl MirrorParser {
@@ -59,6 +80,7 @@ impl MirrorParser {
             next_seq: 0,
             partial: Vec::new(),
             grok: (agent == MirrorAgent::Grok).then(ai_sessions::GrokUpdateParser::new),
+            pending: Vec::new(),
         }
     }
 
@@ -77,21 +99,33 @@ impl MirrorParser {
             if line.is_empty() {
                 continue;
             }
-            if let Some(m) = self.parse_line(line) {
-                out.push(m);
-            }
+            self.parse_line(line, &mut out);
         }
         out
     }
 
-    fn parse_line(&mut self, line: &str) -> Option<MirrorMessage> {
-        let raw = match self.agent {
-            MirrorAgent::Claude => ai_sessions::claude_message_from_line(line)?,
-            MirrorAgent::Codex => ai_sessions::codex_message_from_line(line)?,
-            MirrorAgent::Grok => self.grok.as_mut()?.feed_line(line)?,
-        };
-        // 来源标注:user = 桌面输入,assistant = AI 回复;与最近移动端指令匹配的
-        // user 消息由 relay::MobileRelayManager::relabel_mobile_sources 改标为 "mobile"
+    fn parse_line(&mut self, line: &str, out: &mut Vec<MirrorMessage>) {
+        match self.agent {
+            // Claude 一行可产出多条(说明文字 + 提问卡片 / 作答标记 + 用户输入)
+            MirrorAgent::Claude => self.parse_claude_line(line, out),
+            MirrorAgent::Codex => {
+                if let Some(raw) = ai_sessions::codex_message_from_line(line) {
+                    let msg = self.next_text_message(raw);
+                    out.push(msg);
+                }
+            }
+            MirrorAgent::Grok => {
+                if let Some(raw) = self.grok.as_mut().and_then(|g| g.feed_line(line)) {
+                    let msg = self.next_text_message(raw);
+                    out.push(msg);
+                }
+            }
+        }
+    }
+
+    /// 来源标注:user = 桌面输入,assistant = AI 回复;与最近移动端指令匹配的
+    /// user 消息由 relay::MobileRelayManager::relabel_mobile_sources 改标为 "mobile"
+    fn next_text_message(&mut self, raw: ai_sessions::AiSessionMessage) -> MirrorMessage {
         let source = if raw.role == "user" {
             "desktop"
         } else {
@@ -102,10 +136,150 @@ impl MirrorParser {
             source: source.into(),
             content: raw.content,
             timestamp: raw.timestamp,
+            ..Default::default()
         };
         self.next_seq += 1;
-        Some(msg)
+        msg
     }
+
+    /// Claude 行的完整解析:普通文本之外还产出提问卡片(assistant 行的
+    /// AskUserQuestion tool_use)与已作答标记(user 行的 tool_result 对账)。
+    fn parse_claude_line(&mut self, line: &str, out: &mut Vec<MirrorMessage>) {
+        // 作答对账必须在清挂起之前:同一 user 行可能同时带 tool_result 与文本
+        let answer = ai_sessions::claude_question_answer_from_line(line);
+        if let Some(answer) = &answer {
+            for pending in &self.pending {
+                if !answer.tool_use_ids.contains(&pending.question.tool_use_id) {
+                    continue;
+                }
+                let labels: Vec<&str> = pending
+                    .question
+                    .items
+                    .iter()
+                    .filter_map(|item| answer.answers.get(&item.question).map(String::as_str))
+                    .collect();
+                let msg = MirrorMessage {
+                    seq: self.next_seq,
+                    // 作答是用户动作;移动端点选过的由 relabel_mobile_sources 改标
+                    source: "desktop".into(),
+                    // 旧记录缺 answers 映射时给不出选中项,只能确认"已作答"
+                    content: if labels.is_empty() {
+                        "✓".to_string()
+                    } else {
+                        labels.join(", ")
+                    },
+                    timestamp: answer.timestamp.clone(),
+                    kind: Some("questionAnswered".into()),
+                    ref_seq: Some(pending.seq),
+                    ..Default::default()
+                };
+                self.next_seq += 1;
+                out.push(msg);
+            }
+        }
+
+        let text = ai_sessions::claude_message_from_line(line);
+        let saw_user_line = answer.is_some() || text.as_ref().is_some_and(|t| t.role == "user");
+        if let Some(raw) = text {
+            let msg = self.next_text_message(raw);
+            out.push(msg);
+        }
+        // 任何 user 行都意味着提问 TUI 已了结(作答或 Esc/Ctrl+C 打断):
+        // 打断路径没有 tool_result,靠这里把挂起提问清掉,卡片按钮随之失效
+        if saw_user_line {
+            self.pending.clear();
+        }
+
+        if let Some(question) = ai_sessions::claude_question_from_line(line) {
+            let questions: Vec<MirrorQuestionItem> = question
+                .items
+                .iter()
+                .map(|item| MirrorQuestionItem {
+                    question: item.question.clone(),
+                    header: item.header.clone(),
+                    options: item
+                        .options
+                        .iter()
+                        .map(|o| MirrorQuestionOption {
+                            label: o.label.clone(),
+                            description: o.description.clone(),
+                        })
+                        .collect(),
+                    multi_select: item.multi_select,
+                })
+                .collect();
+            let msg = MirrorMessage {
+                seq: self.next_seq,
+                source: "assistant".into(),
+                // 纯文本兜底:旧移动端/被旧中转丢掉结构化字段时仍可读
+                content: question_fallback_text(&question),
+                timestamp: question.timestamp.clone(),
+                kind: Some("question".into()),
+                questions,
+                ..Default::default()
+            };
+            self.pending.push(PendingQuestion {
+                seq: msg.seq,
+                question,
+                answered_items: 0,
+            });
+            self.next_seq += 1;
+            out.push(msg);
+        }
+    }
+
+    /// 移动端点选作答:校验 seq 指向的提问仍挂起、按题序作答、选项下标合法且
+    /// 非多选题,通过则返回注入 PTY 的按键序列。不推进进度——PTY 写入成功后
+    /// 由调用方回调 [`Self::mark_answered`],写失败不脏化进度。
+    /// 校验不过返回 None——提问已作答/被打断/镜像已换绑,调用方回执 QuestionNotPending。
+    pub fn answer_keys(&self, seq: u64, question_index: u32, option_index: u32) -> Option<AnswerKeys> {
+        let pending = self.pending.iter().find(|p| p.seq == seq)?;
+        if question_index as usize != pending.answered_items {
+            return None;
+        }
+        let item = pending.question.items.get(question_index as usize)?;
+        if item.multi_select {
+            return None;
+        }
+        let option = item.options.get(option_index as usize)?;
+        let mut keys = "\x1b[B".repeat(option_index as usize);
+        keys.push('\r');
+        Some(AnswerKeys {
+            keys,
+            label: option.label.clone(),
+        })
+    }
+
+    /// 点选作答的按键已成功写入 PTY:推进该提问的作答进度(逐题推进)。
+    pub fn mark_answered(&mut self, seq: u64) {
+        if let Some(pending) = self.pending.iter_mut().find(|p| p.seq == seq) {
+            pending.answered_items += 1;
+        }
+    }
+}
+
+/// 提问卡片的纯文本兜底:`[header] 题目` + 编号选项,语言中立。
+fn question_fallback_text(q: &ai_sessions::AiQuestion) -> String {
+    let mut s = String::new();
+    for item in &q.items {
+        if !s.is_empty() {
+            s.push_str("\n\n");
+        }
+        if !item.header.is_empty() {
+            s.push('[');
+            s.push_str(&item.header);
+            s.push_str("] ");
+        }
+        s.push_str(&item.question);
+        for (i, opt) in item.options.iter().enumerate() {
+            s.push_str(&format!("\n{}. {}", i + 1, opt.label));
+            if !opt.description.is_empty() {
+                s.push_str(" — ");
+                s.push_str(&opt.description);
+            }
+        }
+    }
+    s
 }
 
 /// 分页取数:`before_seq = None` 取最近 `limit` 条(打开对话的首屏),
@@ -441,6 +615,101 @@ mod tests {
         assert_eq!(msgs[1].seq, 1);
     }
 
+    // ── agent 提问(AskUserQuestion)镜像 ──
+
+    /// assistant 行:说明文字 + 两题里取一题的 AskUserQuestion。
+    fn question_line() -> String {
+        r#"{"type":"assistant","timestamp":"2026-09-01T03:30:00Z","message":{"role":"assistant","content":[{"type":"text","text":"先确认方案。"},{"type":"tool_use","id":"toolu_q1","name":"AskUserQuestion","input":{"questions":[{"question":"选哪个?","header":"方案","options":[{"label":"方案A","description":"稳"},{"label":"方案B","description":"快"},{"label":"方案C","description":""}],"multiSelect":false}]}}]}}"#.to_string()
+    }
+
+    /// 作答行:tool_result + 顶层 answers 映射。
+    fn answer_line() -> String {
+        r#"{"type":"user","timestamp":"2026-09-01T03:31:00Z","message":{"role":"user","content":[{"type":"tool_result","content":"answered","tool_use_id":"toolu_q1"}]},"toolUseResult":{"answers":{"选哪个?":"方案B"}}}"#.to_string()
+    }
+
+    /// 同一 assistant 行产出说明文字 + 提问卡片两条;卡片带结构化题目与
+    /// 纯文本兜底,且随即可点选作答。
+    #[test]
+    fn parser_emits_question_card_beside_text() {
+        let mut parser = MirrorParser::new(MirrorAgent::Claude);
+        let msgs = parser.feed(format!("{}\n", question_line()).as_bytes());
+        assert_eq!(msgs.len(), 2, "{msgs:?}");
+        assert_eq!(msgs[0].content, "先确认方案。");
+        assert_eq!(msgs[0].kind, None);
+        let card = &msgs[1];
+        assert_eq!(card.seq, 1);
+        assert_eq!(card.source, "assistant");
+        assert_eq!(card.kind.as_deref(), Some("question"));
+        assert_eq!(card.questions.len(), 1);
+        assert_eq!(card.questions[0].options.len(), 3);
+        assert!(!card.questions[0].multi_select);
+        // 兜底文本:标签 + 题目 + 编号选项(有描述的带描述)
+        assert_eq!(
+            card.content,
+            "[方案] 选哪个?\n1. 方案A — 稳\n2. 方案B — 快\n3. 方案C"
+        );
+
+        // 点选第 2 项(下标 1):↓×1 + 回车;写入成功后推进进度
+        let keys = parser.answer_keys(1, 0, 1).expect("提问应挂起可作答");
+        assert_eq!(keys.keys, "\x1b[B\r");
+        assert_eq!(keys.label, "方案B");
+        // 未 mark_answered 前重复校验仍通过(写失败可重试)
+        assert!(parser.answer_keys(1, 0, 1).is_some());
+        parser.mark_answered(1);
+        // 单题作答完毕:题序推进后不再接受
+        assert!(parser.answer_keys(1, 0, 0).is_none());
+    }
+
+    /// tool_result 回流:产出已作答标记(指回卡片 seq,content 为选中项),
+    /// 挂起随之清除。
+    #[test]
+    fn parser_marks_question_answered_on_tool_result() {
+        let mut parser = MirrorParser::new(MirrorAgent::Claude);
+        parser.feed(format!("{}\n", question_line()).as_bytes());
+        let msgs = parser.feed(format!("{}\n", answer_line()).as_bytes());
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        let marker = &msgs[0];
+        assert_eq!(marker.kind.as_deref(), Some("questionAnswered"));
+        assert_eq!(marker.ref_seq, Some(1));
+        assert_eq!(marker.content, "方案B");
+        assert_eq!(marker.source, "desktop");
+        assert!(parser.answer_keys(1, 0, 0).is_none(), "已作答不可再点选");
+    }
+
+    /// Esc/Ctrl+C 打断没有 tool_result:任何后续 user 文本都应清掉挂起提问,
+    /// 否则卡片按钮会对着一个已消失的 TUI 注入按键。
+    #[test]
+    fn parser_clears_pending_on_user_interrupt() {
+        let mut parser = MirrorParser::new(MirrorAgent::Claude);
+        parser.feed(format!("{}\n", question_line()).as_bytes());
+        assert!(parser.answer_keys(1, 0, 0).is_some());
+        let msgs = parser.feed(
+            format!("{}\n", claude_line("user", "算了,先不选", "2026-09-01T03:32:00Z")).as_bytes(),
+        );
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].kind, None, "打断不产出已作答标记");
+        assert!(parser.answer_keys(1, 0, 0).is_none());
+    }
+
+    /// 作答校验的负路径:错 seq / 越界选项 / 乱序题号 / 多选题一律拒绝。
+    #[test]
+    fn answer_keys_rejects_invalid_requests() {
+        let mut parser = MirrorParser::new(MirrorAgent::Claude);
+        parser.feed(format!("{}\n", question_line()).as_bytes());
+        assert!(parser.answer_keys(0, 0, 0).is_none(), "seq 0 是文字消息不是提问");
+        assert!(parser.answer_keys(99, 0, 0).is_none(), "不存在的 seq");
+        assert!(parser.answer_keys(1, 0, 3).is_none(), "选项越界");
+        assert!(parser.answer_keys(1, 1, 0).is_none(), "题号越界/乱序");
+
+        // 多选题只展示不可点选
+        let mut parser = MirrorParser::new(MirrorAgent::Claude);
+        let multi = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_m","name":"AskUserQuestion","input":{"questions":[{"question":"启用哪些?","header":"","options":[{"label":"甲","description":""},{"label":"乙","description":""}],"multiSelect":true}]}}]}}"#;
+        let msgs = parser.feed(format!("{multi}\n").as_bytes());
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].kind.as_deref(), Some("question"));
+        assert!(parser.answer_keys(0, 0, 0).is_none(), "多选题不可点选");
+    }
+
     #[test]
     fn parser_handles_partial_line_across_chunks() {
         let mut parser = MirrorParser::new(MirrorAgent::Claude);
@@ -488,6 +757,7 @@ mod tests {
                 source: "desktop".into(),
                 content: format!("m{i}"),
                 timestamp: String::new(),
+                ..Default::default()
             })
             .collect()
     }

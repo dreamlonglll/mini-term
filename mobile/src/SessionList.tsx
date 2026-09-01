@@ -25,14 +25,20 @@ function statusKey(status: string): string {
 function PaneRow({ pane }: { pane: MobilePane }) {
   const t = useT();
   const [renaming, setRenaming] = useState(false);
+  // 黄灯(提问待答/等待授权)展示优先于常规状态:用户此刻该做的事比 AI 在不在跑重要
+  const attention = pane.needsAttention === true;
   return (
     <>
       {/* 行是容器不是按钮:进镜像与改名是两个热区,按钮不能相互嵌套 */}
       <div className="pane-row">
         <button className="pane-open" onClick={() => openMirror(pane.paneId, pane.title)}>
-          <span className={`status-dot ${STATUS_CLASS[pane.status] ?? 'dot-error'}`} />
+          <span
+            className={`status-dot ${attention ? 'dot-attention' : (STATUS_CLASS[pane.status] ?? 'dot-error')}`}
+          />
           <span className="pane-title">{pane.title}</span>
-          <span className="pane-status">{t(statusKey(pane.status))}</span>
+          <span className={`pane-status${attention ? ' pane-status-attention' : ''}`}>
+            {t(attention ? 'sessions.status.attention' : statusKey(pane.status))}
+          </span>
           <span className="pane-chevron">›</span>
         </button>
         <button

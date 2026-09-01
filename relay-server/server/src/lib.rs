@@ -675,6 +675,35 @@ fn handle_mobile_message(state: &RelayState, msg: MobileToRelay) {
                 None
             }
         }
+        // 点选作答 agent 提问:与移动端指令同款——桌面端离线即拒,回执同通道
+        MobileToRelay::AnswerQuestion {
+            pane_id,
+            command_id,
+            seq,
+            question_index,
+            option_index,
+        } => {
+            if inner.desktop.is_some() {
+                Some(RelayToDesktop::AnswerQuestion {
+                    pane_id,
+                    command_id,
+                    seq,
+                    question_index,
+                    option_index,
+                })
+            } else {
+                eprintln!("[relay] answer question rejected: desktop offline");
+                if let Some(mobile) = inner.mobile.as_ref() {
+                    let _ = mobile.tx.send(to_text(&RelayToMobile::CommandReceipt {
+                        pane_id,
+                        command_id,
+                        ok: false,
+                        reason: Some(CommandFailReason::DesktopOffline),
+                    }));
+                }
+                None
+            }
+        }
         // 重命名会话:桌面端离线就丢弃。无回执通道——改没改成看结构增量回不回新
         // title,离线时手机侧本来就看得到「桌面端离线」横幅
         MobileToRelay::RenamePane { pane_id, title } => inner

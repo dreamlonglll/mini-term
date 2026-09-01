@@ -617,6 +617,156 @@ pub fn claude_message_from_line(line: &str) -> Option<AiSessionMessage> {
     })
 }
 
+// ─── Agent 提问(Claude AskUserQuestion)────────────────────────
+//
+// 提问在会话记录里是 assistant 行的 `tool_use` 块(name=AskUserQuestion),
+// 题目与选项在 input.questions;作答是后续 user 行的 `tool_result` 块,
+// 选中项的结构化映射在该行顶层 `toolUseResult.answers`(question → label)。
+// 这组解析供 mt-relay 对话镜像把提问下发到移动端;桌面 AI 历史面板不用它。
+
+/// agent 提问的一个选项。
+#[derive(Debug, Clone, PartialEq)]
+pub struct AiQuestionOption {
+    pub label: String,
+    pub description: String,
+}
+
+/// agent 提问的一道题(一次 AskUserQuestion 调用可含多题,TUI 逐题推进)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct AiQuestionItem {
+    pub question: String,
+    pub header: String,
+    pub options: Vec<AiQuestionOption>,
+    pub multi_select: bool,
+}
+
+/// 从 assistant 行解析出的一次 agent 提问。
+#[derive(Debug, Clone, PartialEq)]
+pub struct AiQuestion {
+    /// tool_use id:与后续 user 行的 tool_result 对账作答
+    pub tool_use_id: String,
+    pub items: Vec<AiQuestionItem>,
+    pub timestamp: String,
+}
+
+/// 从 user 行解析出的工具结果归属:哪些 tool_use 已有回执,以及
+/// AskUserQuestion 作答的 (题文 → 选中 label) 映射。
+///
+/// 行内不含工具名,单看本行分不出是不是提问的作答——由调用方拿挂起的
+/// 提问 id 对账;`answers` 只在该行确为 AskUserQuestion 回执时非空
+/// (旧版记录缺 `toolUseResult.answers` 时也为空,此时只能确认"已作答")。
+#[derive(Debug, Clone, PartialEq)]
+pub struct AiQuestionAnswer {
+    pub tool_use_ids: Vec<String>,
+    pub answers: HashMap<String, String>,
+    pub timestamp: String,
+}
+
+fn line_timestamp(obj: &serde_json::Value) -> String {
+    obj.get("timestamp")
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// 解析 Claude JSONL 的一行为 agent 提问。非 assistant 行 / 无 AskUserQuestion
+/// tool_use 块 / 题目或选项为空 → None。与 `claude_message_from_line` 互补:
+/// 同一行可能同时产出说明文字(text 块)与提问(tool_use 块),两者各自独立解析。
+pub fn claude_question_from_line(line: &str) -> Option<AiQuestion> {
+    let obj: serde_json::Value = serde_json::from_str(line).ok()?;
+    if obj.get("type").and_then(|t| t.as_str()) != Some("assistant") {
+        return None;
+    }
+    let content = obj.pointer("/message/content")?.as_array()?;
+    let tool_use = content.iter().find(|item| {
+        item.get("type").and_then(|t| t.as_str()) == Some("tool_use")
+            && item.get("name").and_then(|n| n.as_str()) == Some("AskUserQuestion")
+    })?;
+    let tool_use_id = tool_use.get("id").and_then(|i| i.as_str())?.to_string();
+    let items: Vec<AiQuestionItem> = tool_use
+        .pointer("/input/questions")?
+        .as_array()?
+        .iter()
+        .filter_map(|q| {
+            let question = q.get("question").and_then(|v| v.as_str())?.to_string();
+            let options: Vec<AiQuestionOption> = q
+                .get("options")?
+                .as_array()?
+                .iter()
+                .filter_map(|o| {
+                    Some(AiQuestionOption {
+                        label: o.get("label").and_then(|v| v.as_str())?.to_string(),
+                        description: o
+                            .get("description")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                    })
+                })
+                .collect();
+            if options.is_empty() {
+                return None;
+            }
+            Some(AiQuestionItem {
+                question,
+                header: q
+                    .get("header")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                options,
+                multi_select: q
+                    .get("multiSelect")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+            })
+        })
+        .collect();
+    if items.is_empty() {
+        return None;
+    }
+    Some(AiQuestion {
+        tool_use_id,
+        items,
+        timestamp: line_timestamp(&obj),
+    })
+}
+
+/// 解析 Claude JSONL 的一行为工具回执归属(user 行的 tool_result)。
+/// 无 tool_result 块 → None。
+pub fn claude_question_answer_from_line(line: &str) -> Option<AiQuestionAnswer> {
+    let obj: serde_json::Value = serde_json::from_str(line).ok()?;
+    if obj.get("type").and_then(|t| t.as_str()) != Some("user") {
+        return None;
+    }
+    let content = obj.pointer("/message/content")?.as_array()?;
+    let tool_use_ids: Vec<String> = content
+        .iter()
+        .filter(|item| item.get("type").and_then(|t| t.as_str()) == Some("tool_result"))
+        .filter_map(|item| item.get("tool_use_id").and_then(|i| i.as_str()))
+        .map(String::from)
+        .collect();
+    if tool_use_ids.is_empty() {
+        return None;
+    }
+    let mut answers = HashMap::new();
+    if let Some(map) = obj
+        .pointer("/toolUseResult/answers")
+        .and_then(|v| v.as_object())
+    {
+        for (question, label) in map {
+            if let Some(label) = label.as_str() {
+                answers.insert(question.clone(), label.to_string());
+            }
+        }
+    }
+    Some(AiQuestionAnswer {
+        tool_use_ids,
+        answers,
+        timestamp: line_timestamp(&obj),
+    })
+}
+
 /// 从单个 Claude JSONL 会话文件读取全部消息
 fn read_claude_messages_from_file(path: &Path) -> Result<Vec<AiSessionMessage>, String> {
     let file = fs::File::open(path).map_err(|e| format!("无法打开文件: {}", e))?;
@@ -835,6 +985,67 @@ mod tests {
                 "{agent} 不应被认为有会话记录"
             );
         }
+    }
+
+    // ---- agent 提问(AskUserQuestion)解析 ----
+
+    /// 形状取自真实会话记录:assistant 行同时带 text 块与 AskUserQuestion tool_use。
+    fn ask_user_question_line() -> String {
+        r#"{"type":"assistant","timestamp":"2026-09-01T03:30:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"先确认一下方案。"},{"type":"tool_use","id":"toolu_test01","name":"AskUserQuestion","input":{"questions":[{"question":"要支持点选作答吗?","header":"作答方式","options":[{"label":"支持","description":"卡片带按钮"},{"label":"只展示","description":""}],"multiSelect":false}]}}]}}"#.to_string()
+    }
+
+    #[test]
+    fn claude_question_from_line_parses_items_and_options() {
+        let q = claude_question_from_line(&ask_user_question_line()).expect("应解析出提问");
+        assert_eq!(q.tool_use_id, "toolu_test01");
+        assert_eq!(q.timestamp, "2026-09-01T03:30:00.000Z");
+        assert_eq!(q.items.len(), 1);
+        let item = &q.items[0];
+        assert_eq!(item.question, "要支持点选作答吗?");
+        assert_eq!(item.header, "作答方式");
+        assert!(!item.multi_select);
+        assert_eq!(item.options.len(), 2);
+        assert_eq!(item.options[0].label, "支持");
+        assert_eq!(item.options[0].description, "卡片带按钮");
+        assert_eq!(item.options[1].description, "");
+    }
+
+    /// user 行 / 无 tool_use 的 assistant 行 / 别的工具调用都不是提问。
+    #[test]
+    fn claude_question_from_line_rejects_non_question_lines() {
+        for line in [
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"hi"}]}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"回答"}]}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}"#,
+            "not json",
+        ] {
+            assert!(claude_question_from_line(line).is_none(), "{line} 不该产出提问");
+        }
+        // 选项为空的题目整体作废:没有可选项就没有卡片可点
+        let empty_options = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"AskUserQuestion","input":{"questions":[{"question":"q","header":"h","options":[]}]}}]}}"#;
+        assert!(claude_question_from_line(empty_options).is_none());
+    }
+
+    /// 作答行:tool_result 归属 id + 顶层 toolUseResult.answers 的结构化映射。
+    #[test]
+    fn claude_question_answer_from_line_extracts_ids_and_answers() {
+        let line = r#"{"type":"user","timestamp":"2026-09-01T03:31:00.000Z","message":{"role":"user","content":[{"type":"tool_result","content":"answered","tool_use_id":"toolu_test01"}]},"toolUseResult":{"answers":{"要支持点选作答吗?":"支持"}}}"#;
+        let a = claude_question_answer_from_line(line).expect("应解析出作答");
+        assert_eq!(a.tool_use_ids, vec!["toolu_test01".to_string()]);
+        assert_eq!(a.answers.get("要支持点选作答吗?").map(String::as_str), Some("支持"));
+        assert_eq!(a.timestamp, "2026-09-01T03:31:00.000Z");
+    }
+
+    /// 旧版记录缺 toolUseResult.answers:仍能确认"已作答",映射为空。
+    #[test]
+    fn claude_question_answer_without_answers_map_still_reports_ids() {
+        let line = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"ok","tool_use_id":"toolu_x"}]}}"#;
+        let a = claude_question_answer_from_line(line).expect("应解析出作答");
+        assert_eq!(a.tool_use_ids, vec!["toolu_x".to_string()]);
+        assert!(a.answers.is_empty());
+        // 纯文本 user 行没有 tool_result → None
+        let plain = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"继续"}]}}"#;
+        assert!(claude_question_answer_from_line(plain).is_none());
     }
 
     // ---- 会话文件排序 ----

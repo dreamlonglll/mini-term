@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import {
+  answerQuestion,
   clearCommandReceipt,
   closeMirror,
   loadOlderMirror,
@@ -59,6 +60,84 @@ function MessageRow({ msg }: { msg: MirrorMessage }) {
         ) : (
           <pre className="plain-input">{msg.content}</pre>
         )}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * agent 提问卡片:题目 + 选项按钮,点按即作答(桌面端向终端注入按键完成选择)。
+ *
+ * - `active` = 该提问仍是最新消息且未见作答标记;其后出现任何消息都视为已在
+ *   桌面端处理(作答或打断),按钮失效只留展示;
+ * - `answeredContent` 来自 questionAnswered 标记的 content(选中项文本),
+ *   用于高亮当初选了哪一项;"✓" 表示旧记录给不出选中项;
+ * - 多选题 v1 只展示不可点选(注入按键无法可靠表达多选);
+ * - 结构化题目被旧链路丢掉时退化为纯文本兜底(content)。
+ */
+function QuestionCard({
+  msg,
+  active,
+  answeredContent,
+}: {
+  msg: MirrorMessage;
+  active: boolean;
+  answeredContent: string | null;
+}) {
+  const t = useT();
+  const mirror = useRelayStore((s) => s.mirror);
+  const desktopOnline = useRelayStore((s) => s.desktopOnline);
+  const sending = mirror?.pendingCommandId != null;
+  const answered = answeredContent != null;
+  const chosen =
+    answeredContent && answeredContent !== '✓' ? answeredContent.split(', ') : [];
+  const canAnswer =
+    active && !answered && !!mirror && !mirror.closed && desktopOnline !== false;
+  const time = formatTime(msg.timestamp);
+  const items = msg.questions ?? [];
+  return (
+    <div className="mirror-msg from-assistant">
+      <div className="mirror-msg-source">
+        <span>{t('mirror.source.question')}</span>
+        {time && <time className="mirror-msg-time">{time}</time>}
+      </div>
+      <div className={`question-card${canAnswer ? '' : ' inactive'}`}>
+        {items.length === 0 ? (
+          <pre className="plain-input">{msg.content}</pre>
+        ) : (
+          items.map((item, qi) => (
+            <div key={qi} className="question-item">
+              {item.header && <div className="question-header">{item.header}</div>}
+              <div className="question-text">{item.question}</div>
+              <div className="question-options">
+                {item.options.map((opt, oi) => (
+                  <button
+                    key={oi}
+                    className={`question-option${chosen.includes(opt.label) ? ' chosen' : ''}`}
+                    disabled={!canAnswer || sending || item.multiSelect === true}
+                    onClick={() => answerQuestion(msg.seq, qi, oi)}
+                  >
+                    <span className="question-option-label">{opt.label}</span>
+                    {opt.description && (
+                      <span className="question-option-desc">{opt.description}</span>
+                    )}
+                  </button>
+                ))}
+              </div>
+              {item.multiSelect === true && (
+                <div className="question-hint">{t('mirror.question.multiSelectHint')}</div>
+              )}
+            </div>
+          ))
+        )}
+        {answered ? (
+          <div className="question-state answered">
+            {t('mirror.question.answered')}
+            {chosen.length > 0 ? `: ${chosen.join(', ')}` : ''}
+          </div>
+        ) : !active ? (
+          <div className="question-state stale">{t('mirror.question.expired')}</div>
+        ) : null}
       </div>
     </div>
   );
@@ -237,7 +316,24 @@ export function MirrorView() {
         ) : mirror.messages.length === 0 ? (
           <div className="mirror-empty">{t('mirror.empty')}</div>
         ) : (
-          mirror.messages.map((m) => <MessageRow key={m.seq} msg={m} />)
+          mirror.messages.map((m) => {
+            if (m.kind === 'question') {
+              // 作答状态由后续的 questionAnswered 标记回推;标记本身不单独成行
+              const marker = mirror.messages.find(
+                (x) => x.kind === 'questionAnswered' && x.refSeq === m.seq,
+              );
+              return (
+                <QuestionCard
+                  key={m.seq}
+                  msg={m}
+                  active={m.seq === lastSeq && !marker}
+                  answeredContent={marker ? marker.content : null}
+                />
+              );
+            }
+            if (m.kind === 'questionAnswered') return null;
+            return <MessageRow key={m.seq} msg={m} />;
+          })
         )}
       </div>
 

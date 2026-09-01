@@ -385,6 +385,31 @@ export function sendMobileCommand(text: string): boolean {
   return true;
 }
 
+/**
+ * 点选作答 agent 的提问。返回 false = 当前不可作答。
+ * 与手输指令共用 pendingCommandId 单槽与回执展示——两者本就互斥
+ * (提问挂起时 agent 在等作答,不会同时有别的在途指令)。
+ */
+export function answerQuestion(seq: number, questionIndex: number, optionIndex: number): boolean {
+  const { mirror, desktopOnline, phase } = useRelayStore.getState();
+  if (!mirror || mirror.closed) return false;
+  if (phase !== 'connected' || desktopOnline === false) return false;
+  if (mirror.pendingCommandId != null) return false;
+  const commandId = crypto.randomUUID();
+  useRelayStore.setState({
+    mirror: { ...mirror, pendingCommandId: commandId, receipt: null },
+  });
+  sendToRelay({
+    type: 'answerQuestion',
+    paneId: mirror.paneId,
+    commandId,
+    seq,
+    questionIndex,
+    optionIndex,
+  });
+  return true;
+}
+
 /** 清除回执提示(UI 展示几秒后调用)。 */
 export function clearCommandReceipt() {
   const { mirror } = useRelayStore.getState();

@@ -173,6 +173,7 @@ async fn relay_process_leaves_no_files_behind() {
                 source: "assistant".into(),
                 content: "SECRET-CONVERSATION-BODY-must-not-touch-disk".into(),
                 timestamp: String::new(),
+                ..Default::default()
             }],
         },
     )
