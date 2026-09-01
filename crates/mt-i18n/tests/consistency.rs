@@ -84,8 +84,9 @@ use mt_i18n::{
 /// 840 → 842：新建终端菜单接入 AI 启动器段（分组标题 + 「管理启动器…」入口）。
 /// 842 → 845：AI 启动器加「允许编排」开关（标题 + 说明 + 列表徽标），
 /// 编排能力的唯一授予入口（ADR 0003）。
+/// 845 → 846：编排者起会话的诞生一次性提示（与移动端那条同档，只是说明出身）。
 const EXPECTED_NAMESPACES: usize = 32;
-const EXPECTED_ENTRIES_PER_LANG: usize = 845;
+const EXPECTED_ENTRIES_PER_LANG: usize = 846;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

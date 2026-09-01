@@ -399,6 +399,9 @@ struct Workspace {
     /// 移动端中转桥(泵 + store 观察者 + 去抖同步靠它的生命周期保活,
     /// 与 [`Self::_ai_pump`] 同一种分工)。见 [`mobile_relay`]。
     _relay: Entity<mobile_relay::RelayBridge>,
+    /// 编排控制面的动作泵(HTTP 线程 → 主线程建 pane)。**丢了句柄泵就没了**,
+    /// 之后编排者的起会话请求会一路超时成 `desktopBusy`。见 [`orchestrator`]。
+    _orchestrator_pump: Task<()>,
     _tray_pump: Task<()>,
     _activation: Subscription,
     /// 窗口大小/位置的观察者 —— 拖动缩放期间每帧回调,由 store 那边的防抖收口。
@@ -487,6 +490,11 @@ impl Workspace {
         // 是因为泵要 `spawn_in` 拿窗口 —— 移动端发起会话得建 pane、弹 toast。
         let relay = mobile_relay::install(store.clone(), window, cx);
 
+        // 编排控制面的动作泵。与中转那条同一个理由要 `window`:起乐手得建 pane、
+        // 弹诞生提示。差别是回执**同步**(CLI 在等),超时兜在发起侧,见
+        // `orchestrator::ACTION_TIMEOUT`。
+        let orchestrator_pump = orchestrator::install(store.clone(), window, cx);
+
         // 系统托盘:图标住在另一条线程上(自己的隐藏窗口 + 消息循环),
         // 交互经 channel 回到这里 —— 与 AI 状态泵同一套路数。
         let (tray, mut tray_events) = Tray::start(window);
@@ -564,6 +572,7 @@ impl Workspace {
             _update_check: update_check,
             _ai_pump: ai_pump,
             _relay: relay,
+            _orchestrator_pump: orchestrator_pump,
             _tray_pump: tray_pump,
             _activation: activation,
             _window_bounds: window_bounds,

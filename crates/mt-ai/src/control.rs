@@ -25,14 +25,37 @@
 //!
 //! # 桌面能力经注入 trait 提供
 //!
-//! 本 crate 不依赖 `mt-config` / `gpui`，项目表与启动器名单由宿主注入
-//! （[`OrchestratorHost`]，与 `mt_relay::host::RelayHost` 同一个模式，
-//! [`NoopOrchestratorHost`] 是给测试与「尚未接线」用的空实现）。
+//! 本 crate 不依赖 `mt-config` / `gpui`，分成**查**与**做**两条注入缝：
+//!
+//! - [`OrchestratorHost`] —— 项目表与启动器名单（与 `mt_relay::host::RelayHost`
+//!   同一个模式，[`NoopOrchestratorHost`] 是给测试与「尚未接线」用的空实现）；
+//! - [`OrchestratorActions`] —— 起乐手、查乐手死活（照 `RelayEvents` 那条「出向
+//!   动作」的路数，但**回执是同步的**：CLI 在等一个答复，见下）。
 //!
 //! **每次请求现查**：分组关系改了要即时生效，所以 handler 每次都问一遍宿主，
 //! 不在授予令牌那一刻把可达项目算死。
+//!
+//! # 范围记账：谁 spawn 了谁（工单 03）
+//!
+//! 「可见与可驱动范围仅限编排者自己启动的会话」（ADR 0003）这条铁律的事实底座
+//! 是记账表 `TokenRegistry::sessions` —— 不在表里的 pane，对编排者而言就是不
+//! 存在。它与令牌**同锁**：编排者 pane 一撤销令牌，名下记账一并作废（乐手照常
+//! 活着 —— 不陪葬；编排者 pane 重开是新身份，MVP 不做收养）。
+//!
+//! 名额与死活一律**现查**（[`OrchestratorActions::pane_liveness`]），不靠事件
+//! 驱动记账：漏收一次「乐手退出」的事件不该永久占住一个名额。
+//!
+//! # 为什么阻塞命令要另起线程
+//!
+//! `start-session` 得回桌面主线程去建 pane，而 hook 那个 HTTP 服务是**单线程
+//! 循环**（`hook_server.rs` 的 `for request in server.incoming_requests()`）——
+//! 就地阻塞等回执会把排在后面的 hook 上报一起卡住，而 AI 状态感知是本仓的权威
+//! 通道，不能为编排让路。于是 [`try_handle_control`] 对这类命令：先在 HTTP 线程
+//! 上把鉴权做掉（挡住「任意进程都能让我们起线程」），再把已鉴权的活丢给一条
+//! 独立线程跑完并响应。
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -74,6 +97,26 @@ pub struct ControlProject {
     pub name: String,
     pub path: String,
     pub group_id: Option<String>,
+    /// 引用的 SSH 连接 id；本地项目为 `None`。
+    ///
+    /// **照实投影**（与 `mt_relay::host::RelayProject` 同一个字段、同一份配置
+    /// 事实），不在宿主那侧先折成一个 `remote: bool` —— 两处投影同一件事，
+    /// 形状一致才好对账，而「远程项目算不算可用宿主」是本模块的裁决，
+    /// 不该提前在配置层判掉。
+    ///
+    /// 裁决本身在 [`Self::is_remote`]：SSH 远程项目**不能当乐手宿主** ——
+    /// 编排令牌只会注进本地 ssh 客户端进程，远端 agent 根本拿不到（工单 02 的
+    /// 评审结论，`store::panes::start_pty` 那侧也照此不发令牌）。共享入口
+    /// `AppStore::launch_ai_session` 刻意**不判**这一条（那是发起侧策略），
+    /// 所以它必须落在这里。
+    pub ssh_connection_id: Option<String>,
+}
+
+impl ControlProject {
+    /// 是 SSH 远程项目吗（= 不能当乐手宿主）。
+    pub fn is_remote(&self) -> bool {
+        self.ssh_connection_id.is_some()
+    }
 }
 
 /// 控制面向桌面端要东西的入口（`RelayHost` 的同款注入 trait）。
@@ -103,6 +146,133 @@ impl OrchestratorHost for NoopOrchestratorHost {
     }
 }
 
+// ─── 动作注入（起乐手 / 查死活）─────────────────────────────────
+
+/// 一次「起乐手」的落地请求。
+///
+/// **没有命令文本，也没有「要不要授予编排能力」这个位** —— 类型上就没有第二种
+/// 可能：
+///
+/// - 命令由桌面侧按 `launcher_id` 从配置里取（ADR 0002 的唯一防线是「命令只能
+///   来自桌面端配置」，编排者连看都看不到）；
+/// - 受编排会话**一律不授予**编排能力（ADR 0003 的禁套娃），哪怕目标启动器自己
+///   勾了「允许编排」。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartSessionSpec {
+    /// 具名启动器的 id（控制面已确认它在名单里）。
+    pub launcher_id: String,
+    /// 落地项目（控制面已确认它可达、且不是 SSH 远程项目）。
+    pub project_id: String,
+    /// 谁起的。桌面侧的诞生提示要说明出身（ADR 0002 的一次性提示）。
+    pub orchestrator_pane_id: u32,
+}
+
+/// 乐手起成之后桌面侧回来的东西。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartedSession {
+    /// 乐手的 pane 身份（= PTY 编号，与鉴权用的 `paneId` 同一个命名空间）。
+    ///
+    /// 对外只认这一个编号：编排者自己的身份也是它（`MINITERM_ORCHESTRATOR_PANE`），
+    /// 自指禁令因此是一次裸比较，不必翻译。
+    pub pane_id: u32,
+}
+
+/// 起乐手失败的原因。**闭集** —— 桌面侧只负责判定，映射成对外错误码是本模块的事。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartFailure {
+    /// 从裁决到落地之间项目没了（用户刚好把它移除）。
+    ProjectGone,
+    /// 终端没建成，或启动命令没交到一根活着的 PTY 手上。
+    SpawnFailed,
+    /// 桌面主线程没在时限内答复（泵没接线 / 主线程忙死）。
+    DesktopBusy,
+}
+
+/// 一个 pane 此刻的样子。名额判定与 `list-panes` 的状态列都读它。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneLiveness {
+    /// pane 还在桌面上吗（PTY 层面；用户关掉那个 tab 即 `false`）。
+    pub alive: bool,
+    /// AI 状态：`idle` / `ai-idle` / `ai-working`（与桌面徽章同一口径）。
+    pub status: String,
+}
+
+impl PaneLiveness {
+    /// 已经不在了（pane 关了）的那一档。
+    pub fn gone() -> Self {
+        Self {
+            alive: false,
+            status: "idle".to_string(),
+        }
+    }
+
+    /// 还在 AI 会话里吗（状态不是裸 `idle`）。
+    ///
+    /// agent 自己 `exit` 之后 hook 的 SessionEnd 会把状态落到 `idle`，
+    /// pane 被关掉时 `AiPerception::pane_closed` 会把状态清空 —— 也是 `idle`。
+    /// 两种「释放名额」的方式在这里收敛成同一条判据。
+    pub fn in_ai_session(&self) -> bool {
+        self.status != "idle"
+    }
+
+    /// 占不占一个名额：**活着且还在 AI 会话里**（ADR 0003：上限只计活着的 AI 会话）。
+    pub fn occupies_slot(&self) -> bool {
+        self.alive && self.in_ai_session()
+    }
+}
+
+/// 控制面要桌面端**做事**的入口。
+///
+/// 与 [`OrchestratorHost`] 的分工：那条是查（纯读镜像，随手可答），这条是做
+/// （要回主线程建 pane）。刻意分成两个 trait 而不是并成一个，是因为两者的
+/// 线程契约完全不同 —— 下面这条注意事项对 `Host` 不成立。
+///
+/// ⚠️ **两个方法都在 HTTP 线程上被调用，且调用方（本模块）不持任何锁**。
+/// [`Self::start_session`] 允许阻塞（实现方回主线程 + 同步等回执 + 自己兜超时，
+/// 超时就答 [`StartFailure::DesktopBusy`]，别永久挂住）；
+/// [`Self::pane_liveness`] 必须**很快**（名额判定一次要问好几个 pane），
+/// 实现方应当从后台线程读得到的状态里现答，别为它跳主线程。
+pub trait OrchestratorActions: Send + Sync + 'static {
+    /// 起一个受编排会话。
+    fn start_session(&self, spec: StartSessionSpec) -> Result<StartedSession, StartFailure>;
+
+    /// 这个 pane 现在什么样（活着吗、在不在 AI 会话里）。
+    fn pane_liveness(&self, pane_id: u32) -> PaneLiveness;
+}
+
+/// 什么都做不了的动作实现。
+///
+/// 只给测试和「尚未接线」用：起会话恒答 [`StartFailure::DesktopBusy`]
+/// （fail-closed —— 没接线绝不能被当成「随便起」的理由），死活恒答「已经不在了」。
+pub struct NoopOrchestratorActions;
+
+impl OrchestratorActions for NoopOrchestratorActions {
+    fn start_session(&self, _spec: StartSessionSpec) -> Result<StartedSession, StartFailure> {
+        Err(StartFailure::DesktopBusy)
+    }
+    fn pane_liveness(&self, _pane_id: u32) -> PaneLiveness {
+        PaneLiveness::gone()
+    }
+}
+
+/// 一条范围记账：一个乐手的出身。
+///
+/// 「谁 spawn 了谁」由控制服务持有（ADR 0003）—— 桌面侧的 pane 上**不打**这个
+/// 标记，因为「受编排会话出身不构成状态」：编排者退场了乐手照常活着，只是没人
+/// 再够得到它。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrchestratedSession {
+    /// 乐手的 pane 身份（= PTY 编号）。
+    pub pane_id: u32,
+    /// 起它的编排者 pane。可见范围的判据就是这一条。
+    pub orchestrator_pane_id: u32,
+    pub project_id: String,
+    pub project_name: String,
+    pub launcher_id: String,
+    /// 启动器展示名。**不是命令文本** —— 那东西一个字都不出控制面。
+    pub launcher_name: String,
+}
+
 // ─── 令牌与授予 ───────────────────────────────────────────────
 
 /// 一枚已登记的编排能力。
@@ -114,19 +284,44 @@ pub struct Grant {
     pub project_id: String,
 }
 
+/// 同时存活的受编排会话上限（ADR 0003 的默认值）。
+///
+/// **不写死在判断处**：工单 08 要把它变成设置项，届时只需在装配处调一次
+/// [`ControlPlane::set_session_cap`]，裁决那一行一个字都不用动。
+pub const DEFAULT_SESSION_CAP: usize = 5;
+
 /// 控制面本体。内部全是 `Arc`，`Clone` 即同一份。
 #[derive(Clone, Default)]
 pub struct ControlPlane {
     inner: Arc<Inner>,
 }
 
-#[derive(Default)]
 struct Inner {
     host: Mutex<Option<Arc<dyn OrchestratorHost>>>,
-    /// 令牌登记。`grants` 与 `tokens` 是同一份事实的两个索引,必须在**同一把锁**
+    actions: Mutex<Option<Arc<dyn OrchestratorActions>>>,
+    /// 令牌登记 + 范围记账。三张表是同一份事实的几个索引,必须在**同一把锁**
     /// 下变更 —— 拆成两把锁时 `grant`(先 grants 后 tokens)与 `revoke_pane`
     /// (先 tokens 后 grants)的加锁顺序相反,是典型的 AB-BA 死锁雷。
+    ///
+    /// ⚠️ 加新状态时守住两条:① 与令牌相关的一切都进这把锁,别开第二把;
+    /// ② **持这把锁时绝不调注入进来的 trait**([`OrchestratorHost`] /
+    /// [`OrchestratorActions`] 的实现是上层代码,自带别的锁)—— 先在锁内把
+    /// 需要的东西拷出来,出锁再问。
     registry: Mutex<TokenRegistry>,
+    /// 并发上限。用原子量而不是再加一把锁:多一把锁就多一组与 `registry`
+    /// 交叉持有的可能。
+    session_cap: AtomicUsize,
+}
+
+impl Default for Inner {
+    fn default() -> Self {
+        Self {
+            host: Mutex::new(None),
+            actions: Mutex::new(None),
+            registry: Mutex::new(TokenRegistry::default()),
+            session_cap: AtomicUsize::new(DEFAULT_SESSION_CAP),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -135,6 +330,9 @@ struct TokenRegistry {
     grants: HashMap<String, Grant>,
     /// pane → token（pane 关闭时按 pane 撤销，重复授予时顶掉旧的）。
     tokens: HashMap<u32, String>,
+    /// 乐手 pane → 它的出身。**可见范围铁律的事实底座**：不在这张表里的 pane，
+    /// 对编排者而言就是不存在。
+    sessions: HashMap<u32, OrchestratedSession>,
 }
 
 impl ControlPlane {
@@ -145,6 +343,20 @@ impl ControlPlane {
     /// 注入桌面能力。未注入时等价于 [`NoopOrchestratorHost`]。
     pub fn set_host(&self, host: Arc<dyn OrchestratorHost>) {
         *self.inner.host.lock() = Some(host);
+    }
+
+    /// 注入桌面动作。未注入时等价于 [`NoopOrchestratorActions`]（起会话恒失败）。
+    pub fn set_actions(&self, actions: Arc<dyn OrchestratorActions>) {
+        *self.inner.actions.lock() = Some(actions);
+    }
+
+    /// 改并发上限（工单 08 的设置项落点）。`0` = 不许起任何乐手。
+    pub fn set_session_cap(&self, cap: usize) {
+        self.inner.session_cap.store(cap, Ordering::Relaxed);
+    }
+
+    pub fn session_cap(&self) -> usize {
+        self.inner.session_cap.load(Ordering::Relaxed)
     }
 
     /// 授予一枚编排令牌：随机生成、每 pane 一枚，同一 pane 重复授予顶掉旧的。
@@ -164,17 +376,48 @@ impl ControlPlane {
         token
     }
 
-    /// pane 关闭 / 重开 PTY：撤销它手上的令牌。
+    /// pane 关闭 / 重开 PTY：撤销它手上的令牌，并作废它名下的范围记账。
+    ///
+    /// **不杀乐手**（ADR 0003：乐手 pane 里可能躺着改到一半的代码，大脑崩了不该
+    /// 烧现场）；只是从此没人够得到它们了 —— 编排者 pane 重开是新身份，
+    /// MVP 不做收养。
+    ///
+    /// 乐手自己的 pane 关闭时也会走到这里（`AiPerception::pane_closed` 对每个
+    /// pane 都调），那次 `retain` 什么也不匹配：**乐手的记账刻意留着**，
+    /// 好让 `list-panes` 与目标解析答得出「你起的那个已经关了」，而不是
+    /// 一句无从下手的「不存在」。名额不受影响 —— 它是现查存活的。
     pub fn revoke_pane(&self, pane_id: u32) {
         let mut registry = self.inner.registry.lock();
         if let Some(token) = registry.tokens.remove(&pane_id) {
             registry.grants.remove(&token);
         }
+        registry
+            .sessions
+            .retain(|_, s| s.orchestrator_pane_id != pane_id);
     }
 
     /// 该 pane 当前是否持有编排能力（UI 标识与工单 03 的裁决用）。
     pub fn is_orchestrator(&self, pane_id: u32) -> bool {
         self.inner.registry.lock().tokens.contains_key(&pane_id)
+    }
+
+    /// 这条命令会不会阻塞在桌面主线程上。
+    ///
+    /// [`try_handle_control`] 据此决定要不要另起一条线程 —— hook 那个 HTTP 循环
+    /// 是单线程的，起乐手要等主线程建 pane，就地阻塞会把 hook 上报一起卡住。
+    fn blocks_on_desktop(command: &str) -> bool {
+        matches!(command, "start-session")
+    }
+
+    /// 只做「解析 + 鉴权」的那一半。
+    ///
+    /// 给 [`try_handle_control`] 在**把活丢进新线程之前**先过一道用的：不然同机
+    /// 任意进程都能靠一串无令牌请求让我们不停起线程。鉴权很便宜（一次哈希查找），
+    /// 在 HTTP 线程上做掉不影响 hook。
+    fn authorize_body(&self, body: &str) -> Result<Grant, ControlError> {
+        let request: ControlRequest =
+            serde_json::from_str(body).map_err(|_| ControlError::BadRequest)?;
+        self.authorize(&request.token, request.pane_id)
     }
 
     /// 校验令牌 + 自称身份。任何一环对不上都是 401，不降级。
@@ -205,6 +448,84 @@ impl ControlPlane {
             Some(h) => h.projects(),
             None => Vec::new(),
         }
+    }
+
+    /// 取动作实现。**取出来就放锁** —— 后面那些调用可能阻塞好几秒
+    /// （`start-session` 要等主线程），持着锁等于把整个控制面挂住。
+    fn actions(&self) -> Arc<dyn OrchestratorActions> {
+        match self.inner.actions.lock().as_ref() {
+            Some(a) => a.clone(),
+            None => Arc::new(NoopOrchestratorActions),
+        }
+    }
+
+    // ─── 范围记账 ─────────────────────────────────────────────
+
+    /// 某个编排者名下的乐手，**按 pane 编号升序**（= 起的先后序，PTY 编号单调
+    /// 递增）。顺序稳定是给编排者看的：反复 `list-panes` 顺序跳来跳去很难读。
+    fn sessions_of(&self, orchestrator_pane_id: u32) -> Vec<OrchestratedSession> {
+        let registry = self.inner.registry.lock();
+        let mut list: Vec<OrchestratedSession> = registry
+            .sessions
+            .values()
+            .filter(|s| s.orchestrator_pane_id == orchestrator_pane_id)
+            .cloned()
+            .collect();
+        list.sort_by_key(|s| s.pane_id);
+        list
+    }
+
+    /// 当前占着名额的乐手数：**每次请求现查存活**，不靠事件驱动记账。
+    ///
+    /// ⚠️ 先在 [`Self::sessions_of`] 里把 id 拷出来（那把锁到此已经放掉），
+    /// 再逐个问 [`OrchestratorActions::pane_liveness`] —— 持 `registry` 锁去调
+    /// 注入进来的外部代码，就是把上层的锁序绑进本模块的锁序。
+    fn live_session_count(&self, orchestrator_pane_id: u32) -> usize {
+        let ids: Vec<u32> = self
+            .sessions_of(orchestrator_pane_id)
+            .into_iter()
+            .map(|s| s.pane_id)
+            .collect();
+        let actions = self.actions();
+        ids.into_iter()
+            .filter(|id| actions.pane_liveness(*id).occupies_slot())
+            .count()
+    }
+
+    /// 解析「编排者点名的那个乐手」。**05/06/07 的 send / wait / read 共用这一条**
+    /// —— 可见范围铁律只该有一处实现，三条命令各写一遍就是三个走散的机会。
+    ///
+    /// 三种结论各自明确，且**一条都不泄露**：
+    ///
+    /// - 目标是编排者自己 → [`ControlError::SelfTarget`]（自指禁令，ADR 0003）。
+    ///   自己的身份本来就钉在它的环境变量里，给专门的码是让它能自我纠正。
+    /// - 目标不在自己的记账里（别人的乐手 / 用户亲手开的会话 / 编造的编号）
+    ///   → 一律 [`ControlError::PaneNotFound`]。**不区分**「不存在」与「存在但
+    ///   不归你」—— 区分开来就是一台探测桌面上有哪些 pane 的扫描器。
+    /// - 是自己的乐手、但 pane 已经关了 → [`ControlError::PaneGone`]。这条**可以**
+    ///   说：那是它自己起的东西，告诉它「关了」比「不存在」有用得多。
+    pub fn resolve_target(
+        &self,
+        grant: &Grant,
+        target_pane_id: u32,
+    ) -> Result<OrchestratedSession, ControlError> {
+        if target_pane_id == grant.pane_id {
+            return Err(ControlError::SelfTarget);
+        }
+        let session = {
+            let registry = self.inner.registry.lock();
+            registry
+                .sessions
+                .get(&target_pane_id)
+                .filter(|s| s.orchestrator_pane_id == grant.pane_id)
+                .cloned()
+        };
+        let session = session.ok_or(ControlError::PaneNotFound)?;
+        // 锁已经放掉了才问死活（见 `live_session_count` 的同款注意事项）
+        if !self.actions().pane_liveness(target_pane_id).alive {
+            return Err(ControlError::PaneGone);
+        }
+        Ok(session)
     }
 
     /// 处理一条控制请求。`command` 是 `/control/` 之后那一段。
@@ -241,6 +562,10 @@ impl ControlPlane {
                     .into_iter()
                     .map(|p| ProjectView {
                         current: p.id == grant.project_id,
+                        // 远程项目照列（编排者在那儿有别的活可干，工单 05 之后
+                        // 还能读它的画面），但**先告诉它起不了乐手** —— 与其让它
+                        // 试一次再吃 `remoteProjectUnsupported`，不如列表里就写清。
+                        can_start_sessions: !p.is_remote(),
                         id: p.id,
                         name: p.name,
                         path: p.path,
@@ -248,9 +573,106 @@ impl ControlPlane {
                     .collect();
                 ok_outcome(&ControlData::Projects { projects })
             }
+            "start-session" => self.start_session(&grant, &request),
+            "list-panes" => {
+                let actions = self.actions();
+                let panes = self
+                    .sessions_of(grant.pane_id)
+                    .into_iter()
+                    .map(|s| {
+                        let liveness = actions.pane_liveness(s.pane_id);
+                        pane_view(&s, &liveness)
+                    })
+                    .collect();
+                ok_outcome(&ControlData::Panes { panes })
+            }
             _ => ControlError::UnknownCommand.into_outcome(),
         }
     }
+
+    /// `start-session`：四条裁决按「越便宜越靠前」排，全过了才去动桌面。
+    fn start_session(&self, grant: &Grant, request: &ControlRequest) -> ControlOutcome {
+        let Some(launcher_id) = nonempty(request.launcher_id.as_deref()) else {
+            return ControlError::BadRequest.into_outcome();
+        };
+        // 启动器**现查**：与可达项目同一个口径，用户刚加的那条要立刻能用。
+        // 全量名单（任何启动器都能当乐手，ADR 0003）—— 目标启动器自己勾没勾
+        // 「允许编排」在这里**不看**：那是「谁能当编排者」的授予位，
+        // 而乐手一律不授予（禁套娃）。
+        let Some(launcher) = self
+            .host_launchers()
+            .into_iter()
+            .find(|l| l.id == launcher_id)
+        else {
+            return ControlError::LauncherNotFound.into_outcome();
+        };
+
+        // 裁决一：范围。缺省落在编排者自己那个项目。
+        let all = self.host_projects();
+        let reachable = reachable_projects(&all, &grant.project_id);
+        if reachable.is_empty() {
+            return ControlError::ProjectUnavailable.into_outcome();
+        }
+        let target_id = nonempty(request.project_id.as_deref()).unwrap_or(&grant.project_id);
+        let Some(project) = reachable.iter().find(|p| p.id == target_id) else {
+            // 组外项目与压根不存在的项目**同一个错误**：「那个项目存在但不在你
+            // 组里」本身就是不该泄露的信息（可见范围铁律的项目版）。
+            return ControlError::ProjectUnreachable.into_outcome();
+        };
+        // 裁决二：SSH 远程项目当不了乐手宿主（令牌注不到远端去，见 `ControlProject`）。
+        if project.is_remote() {
+            return ControlError::RemoteProjectUnsupported.into_outcome();
+        }
+
+        // 裁决三：名额。**不静默排队** —— 明确报错，让编排者自己调度
+        // （ADR 0003）。判据是现查存活，退出的乐手立刻把名额还回来。
+        //
+        // 已知窗口：同一个编排者并发发两条 start-session 时，两条都可能在各自
+        // 数完之后才落地，于是短暂超出上限一个。不为它加锁 —— 唯一的收紧办法是
+        // 持锁跨过 `actions.start_session()`（一条会阻塞好几秒的外部调用），
+        // 代价远大于收益；而编排者是串行调 CLI 的单进程，实际到不了这个窗口。
+        if self.live_session_count(grant.pane_id) >= self.session_cap() {
+            return ControlError::SessionLimitReached.into_outcome();
+        }
+
+        // 裁决四（禁套娃）在类型上：[`StartSessionSpec`] 里没有「要不要授予」
+        // 这个位，桌面侧那条路只有一种可能。
+        let spec = StartSessionSpec {
+            launcher_id: launcher.id.clone(),
+            project_id: project.id.clone(),
+            orchestrator_pane_id: grant.pane_id,
+        };
+        let started = match self.actions().start_session(spec) {
+            Ok(s) => s,
+            Err(StartFailure::ProjectGone) => return ControlError::ProjectUnreachable.into_outcome(),
+            Err(StartFailure::SpawnFailed) => return ControlError::StartFailed.into_outcome(),
+            Err(StartFailure::DesktopBusy) => return ControlError::DesktopBusy.into_outcome(),
+        };
+
+        let session = OrchestratedSession {
+            pane_id: started.pane_id,
+            orchestrator_pane_id: grant.pane_id,
+            project_id: project.id.clone(),
+            project_name: project.name.clone(),
+            launcher_id: launcher.id,
+            launcher_name: launcher.name,
+        };
+        self.inner
+            .registry
+            .lock()
+            .sessions
+            .insert(session.pane_id, session.clone());
+        // 回执与 `list-panes` 里那一条**同形**：编排者只需要认识一种 pane 视图。
+        let liveness = self.actions().pane_liveness(session.pane_id);
+        ok_outcome(&ControlData::Pane {
+            pane: pane_view(&session, &liveness),
+        })
+    }
+}
+
+/// trim 之后还剩东西的那一档；空串与全空白一律当没给。
+fn nonempty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|s| !s.is_empty())
 }
 
 /// 随机令牌：两个 v4 UUID 拼成 256 bit 的十六进制串。
@@ -286,13 +708,28 @@ pub fn reachable_projects(all: &[ControlProject], own_project_id: &str) -> Vec<C
 // ─── 线上形状 ─────────────────────────────────────────────────
 
 /// 控制请求的 body。
-#[derive(Debug, Deserialize)]
+///
+/// 命令各取所需：`list-*` 只用前两个字段，`start-session` 另看
+/// `launcherId` / `projectId`，工单 05~07 的 send / wait / read 看 `targetPaneId`。
+/// 一个结构体装全部而不是每条命令一个类型，是为了让鉴权能在**分发之前**做掉
+/// （未知命令也不该成为免鉴权的口子）。
+#[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ControlRequest {
     #[serde(default)]
     token: String,
     /// 调用方自称的 pane 身份（来自 `MINITERM_ORCHESTRATOR_PANE`）。
     pane_id: u32,
+    /// `start-session`：用哪个具名启动器。
+    #[serde(default)]
+    launcher_id: Option<String>,
+    /// `start-session`：落在哪个项目；不给就是编排者自己那个。
+    #[serde(default)]
+    project_id: Option<String>,
+    /// 以某个乐手为目标的命令（工单 05~07）用它。
+    #[serde(default)]
+    #[allow(dead_code)] // 解析器先就位：线上形状两侧同时定稿，省得 05 再动一次 CLI
+    target_pane_id: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -300,6 +737,10 @@ struct ControlRequest {
 enum ControlData {
     Launchers { launchers: Vec<LauncherView> },
     Projects { projects: Vec<ProjectView> },
+    /// `start-session` 的回执：刚起成的那一个。
+    Pane { pane: PaneView },
+    /// `list-panes`：自己名下的全部乐手（含已经关掉的）。
+    Panes { panes: Vec<PaneView> },
 }
 
 #[derive(Debug, Serialize)]
@@ -317,6 +758,38 @@ struct ProjectView {
     path: String,
     /// 编排者自己所在的那条。
     current: bool,
+    /// 能不能在这里起乐手。SSH 远程项目是 `false`（令牌注不到远端去）。
+    can_start_sessions: bool,
+}
+
+/// 一个乐手在编排者眼里的样子。`start-session` 的回执与 `list-panes` 的每一条
+/// 都是它 —— 编排者只需要认识一种 pane 视图。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PaneView {
+    /// 乐手的 pane 身份（= PTY 编号）。后续命令按它点名。
+    pane_id: u32,
+    project_id: String,
+    project_name: String,
+    launcher_id: String,
+    launcher_name: String,
+    /// AI 状态：`idle` / `ai-idle` / `ai-working`（与桌面徽章同一口径）。
+    status: String,
+    /// pane 还在桌面上吗。编排者退场不杀乐手，反过来乐手被用户关掉时这里就是
+    /// `false` —— 记账留着，好让编排者看得见「我起的那个已经没了」。
+    alive: bool,
+}
+
+fn pane_view(session: &OrchestratedSession, liveness: &PaneLiveness) -> PaneView {
+    PaneView {
+        pane_id: session.pane_id,
+        project_id: session.project_id.clone(),
+        project_name: session.project_name.clone(),
+        launcher_id: session.launcher_id.clone(),
+        launcher_name: session.launcher_name.clone(),
+        status: liveness.status.clone(),
+        alive: liveness.alive,
+    }
 }
 
 /// 一条控制请求的结论：HTTP 状态码 + JSON body。
@@ -327,14 +800,36 @@ pub struct ControlOutcome {
 }
 
 /// 错误是**闭集**：CLI 按 code 分支，文案只给人看。
+///
+/// ⚠️ 消息一律是**给编排者读的英文短句**，且**一个字都不许带出启动器的命令文本
+/// 或项目里的什么内容**（ADR 0002 的防线）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ControlError {
+pub enum ControlError {
     MissingToken,
     InvalidToken,
     BadRequest,
     UnknownCommand,
     ProjectUnavailable,
     PayloadTooLarge,
+    // ── 工单 03 ──
+    /// 启动器 id 不在名单里。
+    LauncherNotFound,
+    /// 目标项目不在可达范围内（组外 / 不存在，**刻意不区分**）。
+    ProjectUnreachable,
+    /// SSH 远程项目当不了乐手宿主。
+    RemoteProjectUnsupported,
+    /// 已达并发上限。编排者自己排队，不静默等待。
+    SessionLimitReached,
+    /// 桌面端起不来那个会话（终端没建成 / 命令没交到活着的 PTY 手上）。
+    StartFailed,
+    /// 桌面主线程没在时限内答复。
+    DesktopBusy,
+    /// 自指禁令：编排者不能驱动自己那个 pane。
+    SelfTarget,
+    /// 目标不是自己起的乐手（含压根不存在）—— 统一的「不存在」语义。
+    PaneNotFound,
+    /// 是自己起的乐手，但那个 pane 已经被关掉了。
+    PaneGone,
 }
 
 impl ControlError {
@@ -346,6 +841,15 @@ impl ControlError {
             Self::UnknownCommand => "unknownCommand",
             Self::ProjectUnavailable => "projectUnavailable",
             Self::PayloadTooLarge => "payloadTooLarge",
+            Self::LauncherNotFound => "launcherNotFound",
+            Self::ProjectUnreachable => "projectUnreachable",
+            Self::RemoteProjectUnsupported => "remoteProjectUnsupported",
+            Self::SessionLimitReached => "sessionLimitReached",
+            Self::StartFailed => "startFailed",
+            Self::DesktopBusy => "desktopBusy",
+            Self::SelfTarget => "selfTarget",
+            Self::PaneNotFound => "paneNotFound",
+            Self::PaneGone => "paneGone",
         }
     }
 
@@ -353,9 +857,14 @@ impl ControlError {
         match self {
             Self::MissingToken | Self::InvalidToken => 401,
             Self::BadRequest => 400,
-            Self::UnknownCommand => 404,
-            Self::ProjectUnavailable => 409,
+            Self::UnknownCommand | Self::LauncherNotFound | Self::PaneNotFound => 404,
+            Self::ProjectUnavailable | Self::RemoteProjectUnsupported => 409,
             Self::PayloadTooLarge => 413,
+            Self::ProjectUnreachable | Self::SelfTarget => 403,
+            Self::SessionLimitReached => 429,
+            Self::StartFailed => 500,
+            Self::DesktopBusy => 503,
+            Self::PaneGone => 410,
         }
     }
 
@@ -367,10 +876,25 @@ impl ControlError {
             Self::UnknownCommand => "unknown control command",
             Self::ProjectUnavailable => "orchestrator project is no longer available",
             Self::PayloadTooLarge => "control request body too large",
+            Self::LauncherNotFound => "no such AI launcher",
+            Self::ProjectUnreachable => {
+                "project is not reachable from here (own project and same group only)"
+            }
+            Self::RemoteProjectUnsupported => {
+                "SSH remote projects cannot host orchestrated sessions"
+            }
+            Self::SessionLimitReached => {
+                "orchestrated session limit reached; wait for one of yours to finish"
+            }
+            Self::StartFailed => "the desktop could not start that session",
+            Self::DesktopBusy => "the desktop did not answer in time",
+            Self::SelfTarget => "an orchestrator cannot drive its own pane",
+            Self::PaneNotFound => "no such orchestrated session",
+            Self::PaneGone => "that orchestrated session's pane has been closed",
         }
     }
 
-    fn into_outcome(self) -> ControlOutcome {
+    pub(crate) fn into_outcome(self) -> ControlOutcome {
         ControlOutcome {
             status: self.status(),
             body: format!(
@@ -436,6 +960,25 @@ pub(crate) fn try_handle_control(
         respond(request, ControlError::PayloadTooLarge.into_outcome());
         return None;
     }
+    // 会阻塞在桌面主线程上的命令：**不能占着这条 HTTP 线程等** —— 它同时也是
+    // hook 上报的那条队（见模块注释）。鉴权先在本线程做掉挡住无令牌请求，
+    // 已鉴权的活丢给一条一次性线程跑完再响应。
+    //
+    // 每条请求一个线程而不是线程池：控制命令是编排者手动调 CLI 触发的低频动作，
+    // 一个池子的复杂度换不来什么；而带令牌的请求方本来就是我们自己起的进程。
+    if ControlPlane::blocks_on_desktop(command) {
+        if let Err(err) = plane.authorize_body(&body) {
+            respond(request, err.into_outcome());
+            return None;
+        }
+        let plane = plane.clone();
+        let command = command.to_string();
+        std::thread::spawn(move || {
+            let outcome = plane.handle(&command, &body);
+            respond(request, outcome);
+        });
+        return None;
+    }
     // 命令名里带查询串 / 多层路径的一律落进「未知命令」，别去猜
     let outcome = plane.handle(command, &body);
     respond(request, outcome);
@@ -491,6 +1034,81 @@ mod tests {
             name: format!("项目{id}"),
             path: format!("D:\\repos\\{id}"),
             group_id: group.map(str::to_string),
+            ssh_connection_id: None,
+        }
+    }
+
+    /// 同一条项目，但是 SSH 远程的。
+    fn remote_project(id: &str, group: Option<&str>) -> ControlProject {
+        ControlProject {
+            ssh_connection_id: Some("conn-1".into()),
+            ..project(id, group)
+        }
+    }
+
+    // ─── 假动作实现 ───────────────────────────────────────────
+
+    /// 桌面动作的假实现：**记下收到的 spec**（裁决对不对，看它收到了什么），
+    /// 按需要伪造失败，并把「起出来的乐手」登记成一个可以随手改死活的现场。
+    #[derive(Default)]
+    struct FakeActions {
+        /// 下一个乐手的 pane 编号（真桌面上是 PTY 编号，同样单调递增）。
+        next_pane: Mutex<u32>,
+        /// 非 `None` 时 `start_session` 一律这么失败。
+        fail: Mutex<Option<StartFailure>>,
+        /// 每次 `start_session` 收到的 spec，按顺序。
+        calls: Mutex<Vec<StartSessionSpec>>,
+        /// pane → 死活。没登记过的一律「已经不在了」。
+        liveness: Mutex<HashMap<u32, PaneLiveness>>,
+        /// 起会话时先睡这么久（测「阻塞命令不占 HTTP 线程」用）。
+        delay: Mutex<Option<std::time::Duration>>,
+    }
+
+    impl FakeActions {
+        fn live(&self, pane_id: u32, status: &str) {
+            self.liveness.lock().insert(
+                pane_id,
+                PaneLiveness {
+                    alive: true,
+                    status: status.into(),
+                },
+            );
+        }
+        /// 乐手 pane 被用户关掉。
+        fn close(&self, pane_id: u32) {
+            self.liveness.lock().insert(pane_id, PaneLiveness::gone());
+        }
+        /// agent 自己退出了，但 pane 还在（还能回去看它留下的东西）。
+        fn agent_exited(&self, pane_id: u32) {
+            self.live(pane_id, "idle");
+        }
+    }
+
+    impl OrchestratorActions for Arc<FakeActions> {
+        fn start_session(&self, spec: StartSessionSpec) -> Result<StartedSession, StartFailure> {
+            if let Some(d) = *self.delay.lock() {
+                std::thread::sleep(d);
+            }
+            self.calls.lock().push(spec);
+            if let Some(err) = *self.fail.lock() {
+                return Err(err);
+            }
+            let pane_id = {
+                let mut next = self.next_pane.lock();
+                *next += 1;
+                100 + *next
+            };
+            // 刚起的乐手：命令已经敲进去了，输入检测那一刻就把它认成 AI 会话
+            self.live(pane_id, "ai-idle");
+            Ok(StartedSession { pane_id })
+        }
+
+        fn pane_liveness(&self, pane_id: u32) -> PaneLiveness {
+            self.liveness
+                .lock()
+                .get(&pane_id)
+                .cloned()
+                .unwrap_or_else(PaneLiveness::gone)
         }
     }
 
@@ -553,16 +1171,34 @@ mod tests {
         json(body)["error"]["code"].as_str().unwrap().to_string()
     }
 
-    /// 一套「已授予编排能力的编排者 pane」的现场。
-    fn granted() -> (ControlPlane, Arc<FakeHost>, u16, String) {
+    /// 一套「已授予编排能力的编排者 pane」的现场。编排者是 pane 7，在 `p-self`。
+    fn granted() -> (ControlPlane, Arc<FakeHost>, Arc<FakeActions>, u16, String) {
         let host = Arc::new(FakeHost::default());
         *host.launchers.lock() = vec![launcher("claude", "Claude"), launcher("codex", "Codex")];
         *host.projects.lock() = vec![project("p-self", None)];
+        let actions = Arc::new(FakeActions::default());
         let plane = ControlPlane::new();
         plane.set_host(Arc::new(host.clone()));
+        plane.set_actions(Arc::new(actions.clone()));
         let token = plane.grant(7, "p-self");
         let port = serve(plane.clone());
-        (plane, host, port, token)
+        (plane, host, actions, port, token)
+    }
+
+    /// 编排者 pane 7 的请求体。`extra` 是这条命令自己那几个字段的 JSON 片段
+    /// （空串就是只带鉴权那两项）。
+    fn payload_of(token: &str, extra: &str) -> String {
+        if extra.is_empty() {
+            format!(r#"{{"token":"{token}","paneId":7}}"#)
+        } else {
+            format!(r#"{{"token":"{token}","paneId":7,{extra}}}"#)
+        }
+    }
+
+    /// 起一个乐手，返回它的 pane 编号。
+    fn start(port: u16, token: &str, extra: &str) -> (u16, serde_json::Value) {
+        let (status, body) = post(port, "/control/start-session", &payload_of(token, extra));
+        (status, json(&body))
     }
 
     // ─── 鉴权 fail-closed ─────────────────────────────────────
@@ -570,7 +1206,7 @@ mod tests {
     /// 普通 pane 里跑 CLI：没有令牌 → 明确被拒（演示口径的另一半）。
     #[test]
     fn 无令牌一律被拒() {
-        let (_plane, _host, port, _token) = granted();
+        let (_plane, _host, _actions, port, _token) = granted();
         for cmd in ["list-launchers", "list-projects"] {
             let (status, body) = post(port, &format!("/control/{cmd}"), r#"{"paneId":7}"#);
             assert_eq!(status, 401, "{cmd}");
@@ -582,7 +1218,7 @@ mod tests {
     /// 伪造 / 猜的令牌一律被拒，且**不泄露**任何数据。
     #[test]
     fn 坏令牌与伪造令牌一律被拒() {
-        let (_plane, _host, port, token) = granted();
+        let (_plane, _host, _actions, port, token) = granted();
         let forged = format!("{}0", &token[..token.len() - 1]); // 改最后一位
         for bad in ["", "not-a-token", forged.as_str()] {
             let payload = format!(r#"{{"token":"{bad}","paneId":7}}"#);
@@ -595,7 +1231,7 @@ mod tests {
     /// 令牌被抄到别的 pane 去用：自称身份与令牌登记的 pane 对不上 → 拒。
     #[test]
     fn 身份与令牌对不上被拒() {
-        let (_plane, _host, port, token) = granted();
+        let (_plane, _host, _actions, port, token) = granted();
         let payload = format!(r#"{{"token":"{token}","paneId":8}}"#);
         let (status, body) = post(port, "/control/list-launchers", &payload);
         assert_eq!(status, 401);
@@ -605,7 +1241,7 @@ mod tests {
     /// pane 关掉之后令牌立刻作废（重开的 pane 是新身份，够不到前世的能力）。
     #[test]
     fn 撤销后令牌立即失效() {
-        let (plane, _host, port, token) = granted();
+        let (plane, _host, _actions, port, token) = granted();
         let payload = format!(r#"{{"token":"{token}","paneId":7}}"#);
         assert_eq!(post(port, "/control/list-launchers", &payload).0, 200);
 
@@ -618,7 +1254,7 @@ mod tests {
     /// 同一 pane 再次授予会顶掉旧令牌（PTY 重开、SSH 重连）。
     #[test]
     fn 重复授予顶掉旧令牌() {
-        let (plane, _host, port, old) = granted();
+        let (plane, _host, _actions, port, old) = granted();
         let new = plane.grant(7, "p-self");
         assert_ne!(old, new);
 
@@ -644,7 +1280,7 @@ mod tests {
     /// 勾了「允许编排」的启动器起的 pane：令牌可用，拿得到启动器名单。
     #[test]
     fn 编排者_pane_能列出启动器() {
-        let (_plane, _host, port, token) = granted();
+        let (_plane, _host, _actions, port, token) = granted();
         let payload = format!(r#"{{"token":"{token}","paneId":7}}"#);
         let (status, body) = post(port, "/control/list-launchers", &payload);
         assert_eq!(status, 200);
@@ -664,7 +1300,7 @@ mod tests {
     /// 未分组项目：只有本项目。
     #[test]
     fn 未分组项目只能看到自己() {
-        let (_plane, host, port, token) = granted();
+        let (_plane, host, _actions, port, token) = granted();
         *host.projects.lock() = vec![
             project("p-self", None),
             project("p-other", None),
@@ -683,7 +1319,7 @@ mod tests {
     /// 同分组项目可达，组外项目一概不可见。
     #[test]
     fn 同分组项目可达而组外不可见() {
-        let (_plane, host, port, token) = granted();
+        let (_plane, host, _actions, port, token) = granted();
         *host.projects.lock() = vec![
             project("p-self", Some("g1")),
             project("p-sibling", Some("g1")),
@@ -707,7 +1343,7 @@ mod tests {
     /// 可达范围是每次请求现查的，不是授予那一刻算死的。
     #[test]
     fn 改分组即时生效() {
-        let (_plane, host, port, token) = granted();
+        let (_plane, host, _actions, port, token) = granted();
         *host.projects.lock() = vec![project("p-self", None), project("p-friend", Some("g1"))];
         let payload = format!(r#"{{"token":"{token}","paneId":7}}"#);
 
@@ -735,7 +1371,7 @@ mod tests {
     /// 编排者所在的项目被删掉：给明确错误，而不是一个空列表。
     #[test]
     fn 项目没了给明确错误() {
-        let (_plane, host, port, token) = granted();
+        let (_plane, host, _actions, port, token) = granted();
         *host.projects.lock() = vec![project("p-other", None)];
         let payload = format!(r#"{{"token":"{token}","paneId":7}}"#);
         let (status, body) = post(port, "/control/list-projects", &payload);
@@ -768,7 +1404,7 @@ mod tests {
 
     #[test]
     fn 未知命令与坏_json_有各自的语义() {
-        let (_plane, _host, port, token) = granted();
+        let (_plane, _host, _actions, port, token) = granted();
         let payload = format!(r#"{{"token":"{token}","paneId":7}}"#);
 
         let (status, body) = post(port, "/control/list-everything", &payload);
@@ -787,7 +1423,7 @@ mod tests {
 
     #[test]
     fn 非_post_与超大_body_被拒() {
-        let (_plane, _host, port, token) = granted();
+        let (_plane, _host, _actions, port, token) = granted();
         let (status, _body) = request_raw(port, "GET", "/control/list-launchers", None);
         assert_eq!(status, 400);
 
@@ -803,7 +1439,7 @@ mod tests {
     /// 控制路由不许吃掉 hook 那条路（`/hook` 一个字都不能动）。
     #[test]
     fn 非控制路由原样交还() {
-        let (_plane, _host, port, _token) = granted();
+        let (_plane, _host, _actions, port, _token) = granted();
         let (status, _body) = post(port, "/hook", "{}");
         assert_eq!(status, 404, "本测试服务只接控制路由,交还的请求应走到 404");
     }
@@ -842,5 +1478,434 @@ mod tests {
         assert!(plane.is_orchestrator(3));
         plane.revoke_pane(3);
         assert!(!plane.is_orchestrator(3));
+    }
+
+    // ─── start-session：起乐手 ────────────────────────────────
+
+    /// 本项目起乐手：拿到回执，桌面侧收到的是「按 id 引用的启动器 + 落地项目」。
+    #[test]
+    fn 能在本项目起乐手并拿到回执() {
+        let (_plane, _host, actions, port, token) = granted();
+        let (status, v) = start(port, &token, r#""launcherId":"codex""#);
+        assert_eq!(status, 200, "{v}");
+        assert_eq!(v["ok"], true);
+        let pane = &v["data"]["pane"];
+        assert_eq!(pane["paneId"], 101);
+        assert_eq!(pane["projectId"], "p-self", "不给 projectId 就落在本项目");
+        assert_eq!(pane["launcherId"], "codex");
+        assert_eq!(pane["launcherName"], "Codex");
+        assert_eq!(pane["status"], "ai-idle");
+        assert_eq!(pane["alive"], true);
+
+        let calls = actions.calls.lock().clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].launcher_id, "codex");
+        assert_eq!(calls[0].project_id, "p-self");
+        assert_eq!(calls[0].orchestrator_pane_id, 7, "出身要带上，诞生提示要用");
+    }
+
+    /// 同分组的另一个项目也可以起（ADR 0003 的跨项目范围）。
+    #[test]
+    fn 能在同分组项目起乐手() {
+        let (_plane, host, actions, port, token) = granted();
+        *host.projects.lock() = vec![project("p-self", Some("g1")), project("p-api", Some("g1"))];
+
+        let (status, v) = start(port, &token, r#""launcherId":"claude","projectId":"p-api""#);
+        assert_eq!(status, 200, "{v}");
+        assert_eq!(v["data"]["pane"]["projectId"], "p-api");
+        assert_eq!(actions.calls.lock()[0].project_id, "p-api");
+    }
+
+    /// 组外项目与压根不存在的项目**同一个错误** —— 区分开来就是一台项目扫描器。
+    #[test]
+    fn 组外项目与不存在的项目同一个错误() {
+        let (_plane, host, actions, port, token) = granted();
+        *host.projects.lock() = vec![
+            project("p-self", Some("g1")),
+            project("p-outsider", Some("g2")),
+        ];
+
+        for target in ["p-outsider", "p-never-existed"] {
+            let extra = format!(r#""launcherId":"claude","projectId":"{target}""#);
+            let (status, v) = start(port, &token, &extra);
+            assert_eq!(status, 403, "{target}: {v}");
+            assert_eq!(v["error"]["code"], "projectUnreachable", "{target}");
+            let body = v.to_string();
+            assert!(!body.contains("项目p-outsider"), "组外项目名泄露: {body}");
+        }
+        assert!(actions.calls.lock().is_empty(), "被拒的请求不许惊动桌面端");
+    }
+
+    /// 启动器不存在有自己的错误码（与「项目不可达」分得开）。
+    #[test]
+    fn 启动器不存在给专门的错误() {
+        let (_plane, _host, actions, port, token) = granted();
+        let (status, v) = start(port, &token, r#""launcherId":"grok""#);
+        assert_eq!(status, 404, "{v}");
+        assert_eq!(v["error"]["code"], "launcherNotFound");
+        assert!(actions.calls.lock().is_empty());
+
+        // 连 launcherId 都没给：这是请求本身不对，不是「找不到」
+        let (status, v) = start(port, &token, "");
+        assert_eq!(status, 400, "{v}");
+        assert_eq!(v["error"]["code"], "badRequest");
+    }
+
+    /// SSH 远程项目当不了乐手宿主：令牌只会注进本地 ssh 客户端进程。
+    #[test]
+    fn 远程项目不能当乐手宿主() {
+        let (_plane, host, actions, port, token) = granted();
+        *host.projects.lock() = vec![
+            project("p-self", Some("g1")),
+            remote_project("p-remote", Some("g1")),
+        ];
+
+        let (status, v) = start(port, &token, r#""launcherId":"claude","projectId":"p-remote""#);
+        assert_eq!(status, 409, "{v}");
+        assert_eq!(v["error"]["code"], "remoteProjectUnsupported");
+        assert!(actions.calls.lock().is_empty(), "别让桌面端白起一个 pane");
+
+        // 可达列表里照列，但先写明起不了 —— 省得编排者试一次才知道
+        let (_s, body) = post(port, "/control/list-projects", &payload_of(&token, ""));
+        let list = json(&body)["data"]["projects"].clone();
+        let list = list.as_array().unwrap();
+        assert_eq!(list[0]["id"], "p-self");
+        assert_eq!(list[0]["canStartSessions"], true);
+        assert_eq!(list[1]["id"], "p-remote");
+        assert_eq!(list[1]["canStartSessions"], false);
+    }
+
+    /// 起会话的响应与 spec 里一个字都不带命令文本（ADR 0002 的防线）。
+    #[test]
+    fn 回执与落地请求都不带命令文本() {
+        let (_plane, host, actions, port, token) = granted();
+        *host.launchers.lock() = vec![launcher("l1", "Claude")];
+        let (_status, v) = start(port, &token, r#""launcherId":"l1""#);
+        let body = v.to_string();
+        assert!(!body.contains("command"), "命令字段不该出现: {body}");
+        assert!(!body.contains("shell"), "shell 字段不该出现: {body}");
+        // 落地请求的类型上就只有 id —— 命令由桌面侧自己按 id 去配置里取
+        let spec = actions.calls.lock()[0].clone();
+        assert_eq!(spec.launcher_id, "l1");
+    }
+
+    /// **禁套娃**：起出来的乐手不持有编排令牌，它自己跑 CLI 一律被拒。
+    #[test]
+    fn 乐手不持有编排令牌() {
+        let (plane, _host, _actions, port, token) = granted();
+        let (_status, v) = start(port, &token, r#""launcherId":"claude""#);
+        let musician = v["data"]["pane"]["paneId"].as_u64().unwrap() as u32;
+
+        assert!(
+            !plane.is_orchestrator(musician),
+            "受编排会话一律不授予编排能力"
+        );
+        // 乐手 pane 里跑 CLI：它连令牌都没有，第一道闸就挡住了
+        let payload = format!(r#"{{"token":"{token}","paneId":{musician}}}"#);
+        let (status, body) = post(port, "/control/list-launchers", &payload);
+        assert_eq!(status, 401, "抄编排者的令牌也不行");
+        assert_eq!(error_code(&body), "invalidToken");
+    }
+
+    // ─── 并发上限 ─────────────────────────────────────────────
+
+    /// 第 6 个存活乐手被明确拒绝（**不静默排队**）；退出一个就还回一个名额。
+    #[test]
+    fn 第六个乐手被拒而退出即释放名额() {
+        let (plane, _host, actions, port, token) = granted();
+        assert_eq!(plane.session_cap(), DEFAULT_SESSION_CAP);
+
+        let mut panes = Vec::new();
+        for i in 0..DEFAULT_SESSION_CAP {
+            let (status, v) = start(port, &token, r#""launcherId":"claude""#);
+            assert_eq!(status, 200, "第 {} 个应当起得来: {v}", i + 1);
+            panes.push(v["data"]["pane"]["paneId"].as_u64().unwrap() as u32);
+        }
+
+        let (status, v) = start(port, &token, r#""launcherId":"claude""#);
+        assert_eq!(status, 429, "{v}");
+        assert_eq!(v["error"]["code"], "sessionLimitReached");
+
+        // ① agent 自己退出（pane 还在，能回去看它留下的东西）→ 名额还回来
+        actions.agent_exited(panes[0]);
+        let (status, v) = start(port, &token, r#""launcherId":"claude""#);
+        assert_eq!(status, 200, "AI 会话退出即释放名额: {v}");
+        let extra = v["data"]["pane"]["paneId"].as_u64().unwrap() as u32;
+
+        // 又满了
+        assert_eq!(start(port, &token, r#""launcherId":"claude""#).0, 429);
+
+        // ② 乐手 pane 被用户关掉 → 同样还回来
+        actions.close(panes[1]);
+        assert_eq!(start(port, &token, r#""launcherId":"claude""#).0, 200);
+        assert!(extra > 100);
+    }
+
+    /// 上限是**可注入**的（工单 08 的设置项落点），判断处不必改一个字。
+    #[test]
+    fn 上限可注入() {
+        let (plane, _host, _actions, port, token) = granted();
+        plane.set_session_cap(1);
+        assert_eq!(start(port, &token, r#""launcherId":"claude""#).0, 200);
+        assert_eq!(start(port, &token, r#""launcherId":"claude""#).0, 429);
+
+        // 0 = 不许起任何乐手（设置项拉到底的语义）
+        plane.set_session_cap(0);
+        let plane2 = ControlPlane::new();
+        plane2.set_session_cap(0);
+        assert_eq!(plane2.session_cap(), 0);
+    }
+
+    /// 名额只计**自己**的乐手：别人起满了不该拖累我。
+    #[test]
+    fn 名额按编排者各算各的() {
+        let (plane, _host, _actions, port, token) = granted();
+        plane.set_session_cap(1);
+        assert_eq!(start(port, &token, r#""launcherId":"claude""#).0, 200);
+        assert_eq!(start(port, &token, r#""launcherId":"claude""#).0, 429);
+
+        // 另一个编排者（pane 9）名额是空的
+        let other = plane.grant(9, "p-self");
+        let payload = format!(r#"{{"token":"{other}","paneId":9,"launcherId":"claude"}}"#);
+        let (status, body) = post(port, "/control/start-session", &payload);
+        assert_eq!(status, 200, "{body}");
+    }
+
+    // ─── list-panes：可见范围 ─────────────────────────────────
+
+    /// 只看得见自己起的，且顺序稳定（按 pane 编号 = 起的先后）。
+    #[test]
+    fn list_panes_只列自己的乐手() {
+        let (plane, _host, actions, port, token) = granted();
+        let mine: Vec<u32> = (0..2)
+            .map(|_| {
+                start(port, &token, r#""launcherId":"codex""#).1["data"]["pane"]["paneId"]
+                    .as_u64()
+                    .unwrap() as u32
+            })
+            .collect();
+
+        // 另一个编排者也起了一个
+        let other = plane.grant(9, "p-self");
+        let payload = format!(r#"{{"token":"{other}","paneId":9,"launcherId":"claude"}}"#);
+        let (_s, body) = post(port, "/control/start-session", &payload);
+        let theirs = json(&body)["data"]["pane"]["paneId"].as_u64().unwrap() as u32;
+
+        let (status, body) = post(port, "/control/list-panes", &payload_of(&token, ""));
+        assert_eq!(status, 200);
+        let ids: Vec<u32> = json(&body)["data"]["panes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["paneId"].as_u64().unwrap() as u32)
+            .collect();
+        assert_eq!(ids, mine, "别人的乐手一条都不该露面");
+        assert!(!ids.contains(&theirs));
+
+        // 状态是现查的：agent 干起活来，列表立刻跟上
+        actions.live(mine[0], "ai-working");
+        let (_s, body) = post(port, "/control/list-panes", &payload_of(&token, ""));
+        let panes = json(&body)["data"]["panes"].clone();
+        assert_eq!(panes[0]["status"], "ai-working");
+        assert_eq!(panes[1]["status"], "ai-idle");
+    }
+
+    /// 乐手被关掉之后**照列**，只是 `alive` 变假 —— 编排者要看得见「我起的那个
+    /// 已经没了」，而不是它凭空消失。
+    #[test]
+    fn 关掉的乐手照列但标为不在() {
+        let (_plane, _host, actions, port, token) = granted();
+        let (_s, v) = start(port, &token, r#""launcherId":"claude""#);
+        let pane = v["data"]["pane"]["paneId"].as_u64().unwrap() as u32;
+
+        actions.close(pane);
+        let (_s, body) = post(port, "/control/list-panes", &payload_of(&token, ""));
+        let panes = json(&body)["data"]["panes"].clone();
+        assert_eq!(panes.as_array().unwrap().len(), 1);
+        assert_eq!(panes[0]["alive"], false);
+        assert_eq!(panes[0]["status"], "idle");
+    }
+
+    /// 起会话失败**不留记账**：没起成的东西不该占着名额也不该出现在列表里。
+    #[test]
+    fn 起失败不留记账() {
+        let (_plane, _host, actions, port, token) = granted();
+        for (failure, status, code) in [
+            (StartFailure::SpawnFailed, 500, "startFailed"),
+            (StartFailure::DesktopBusy, 503, "desktopBusy"),
+            (StartFailure::ProjectGone, 403, "projectUnreachable"),
+        ] {
+            *actions.fail.lock() = Some(failure);
+            let (got, v) = start(port, &token, r#""launcherId":"claude""#);
+            assert_eq!(got, status, "{failure:?}: {v}");
+            assert_eq!(v["error"]["code"], code, "{failure:?}");
+        }
+        *actions.fail.lock() = None;
+
+        let (_s, body) = post(port, "/control/list-panes", &payload_of(&token, ""));
+        assert!(
+            json(&body)["data"]["panes"].as_array().unwrap().is_empty(),
+            "失败的尝试不该留下记账: {body}"
+        );
+    }
+
+    /// 动作没接线时**一律拒绝**起会话（fail-closed，别把「没配置」当放行理由）。
+    #[test]
+    fn 未接线的动作实现拒绝起会话() {
+        let host = Arc::new(FakeHost::default());
+        *host.launchers.lock() = vec![launcher("claude", "Claude")];
+        *host.projects.lock() = vec![project("p-self", None)];
+        let plane = ControlPlane::new();
+        plane.set_host(Arc::new(host));
+        let token = plane.grant(7, "p-self");
+        let port = serve(plane);
+
+        let (status, v) = start(port, &token, r#""launcherId":"claude""#);
+        assert_eq!(status, 503, "{v}");
+        assert_eq!(v["error"]["code"], "desktopBusy");
+    }
+
+    // ─── 目标解析：可见范围铁律 ───────────────────────────────
+
+    /// 三条语义各自明确：自指 / 他人（含不存在）/ 已关。
+    ///
+    /// 这个函数是 **05/06/07 的 send / wait / read 共用的那一条**，所以直接钉它，
+    /// 不等命令落地。
+    #[test]
+    fn 目标解析的三条语义() {
+        let (plane, _host, actions, port, token) = granted();
+        let (_s, v) = start(port, &token, r#""launcherId":"claude""#);
+        let mine = v["data"]["pane"]["paneId"].as_u64().unwrap() as u32;
+
+        // 另一个编排者的乐手
+        let other_token = plane.grant(9, "p-self");
+        let payload = format!(r#"{{"token":"{other_token}","paneId":9,"launcherId":"claude"}}"#);
+        let (_s, body) = post(port, "/control/start-session", &payload);
+        let theirs = json(&body)["data"]["pane"]["paneId"].as_u64().unwrap() as u32;
+
+        let me = Grant {
+            pane_id: 7,
+            project_id: "p-self".into(),
+        };
+
+        // 自己的乐手：解析得到，带着出身信息
+        let hit = plane.resolve_target(&me, mine).expect("自己起的该找得到");
+        assert_eq!(hit.pane_id, mine);
+        assert_eq!(hit.orchestrator_pane_id, 7);
+        assert_eq!(hit.launcher_name, "Claude");
+
+        // 自指禁令
+        assert_eq!(plane.resolve_target(&me, 7), Err(ControlError::SelfTarget));
+
+        // 别人的乐手、用户亲手开的会话、编造的编号 —— **同一个**「不存在」
+        for target in [theirs, 9, 4242] {
+            assert_eq!(
+                plane.resolve_target(&me, target),
+                Err(ControlError::PaneNotFound),
+                "target={target} 必须与「不存在」不可区分"
+            );
+        }
+
+        // 自己的乐手但 pane 已经关了：这条可以说
+        actions.close(mine);
+        assert_eq!(plane.resolve_target(&me, mine), Err(ControlError::PaneGone));
+
+        // agent 退出但 pane 还在 ≠ 已关：还能回去读它留下的东西（工单 07）
+        actions.agent_exited(mine);
+        assert!(plane.resolve_target(&me, mine).is_ok());
+    }
+
+    /// 编排者 pane 一撤销令牌，名下记账就作废（**不杀乐手**）——
+    /// pane 重开是新身份，够不到前世起的会话。
+    #[test]
+    fn 编排者撤销后记账作废但乐手照活() {
+        let (plane, _host, actions, port, token) = granted();
+        let (_s, v) = start(port, &token, r#""launcherId":"claude""#);
+        let musician = v["data"]["pane"]["paneId"].as_u64().unwrap() as u32;
+
+        plane.revoke_pane(7);
+        assert!(
+            actions.pane_liveness(musician).alive,
+            "编排者退场不许连坐乐手"
+        );
+
+        // 同一个 pane 重开 PTY = 新身份，列表是空的
+        let reborn = plane.grant(7, "p-self");
+        let (status, body) = post(port, "/control/list-panes", &payload_of(&reborn, ""));
+        assert_eq!(status, 200);
+        assert!(
+            json(&body)["data"]["panes"].as_array().unwrap().is_empty(),
+            "MVP 不做收养: {body}"
+        );
+
+        let me = Grant {
+            pane_id: 7,
+            project_id: "p-self".into(),
+        };
+        assert_eq!(
+            plane.resolve_target(&me, musician),
+            Err(ControlError::PaneNotFound),
+            "前世的乐手对新身份而言就是不存在"
+        );
+    }
+
+    /// 乐手自己的 pane 关闭时也会走 `revoke_pane`（那是每个 pane 都调的路径），
+    /// 那一次**不许**把它从记账里抹掉 —— 抹掉了「已关」就退化成「不存在」。
+    #[test]
+    fn 乐手关闭不抹掉自己的记账() {
+        let (plane, _host, actions, port, token) = granted();
+        let (_s, v) = start(port, &token, r#""launcherId":"claude""#);
+        let musician = v["data"]["pane"]["paneId"].as_u64().unwrap() as u32;
+
+        actions.close(musician);
+        plane.revoke_pane(musician);
+
+        let me = Grant {
+            pane_id: 7,
+            project_id: "p-self".into(),
+        };
+        assert_eq!(plane.resolve_target(&me, musician), Err(ControlError::PaneGone));
+    }
+
+    // ─── 阻塞命令不占 HTTP 线程 ───────────────────────────────
+
+    /// `start-session` 要等桌面主线程，而 hook 上报与它排在**同一条 HTTP 队**上。
+    /// 起会话期间 hook 那条路必须照常通 —— AI 状态感知不给编排让路。
+    #[test]
+    fn 起会话期间_hook_那条路不被卡住() {
+        let (_plane, _host, actions, port, token) = granted();
+        *actions.delay.lock() = Some(Duration::from_millis(600));
+
+        let start_token = token.clone();
+        let slow = std::thread::spawn(move || start(port, &start_token, r#""launcherId":"claude""#));
+        // 让慢请求先进到 handler 里
+        std::thread::sleep(Duration::from_millis(120));
+
+        let began = std::time::Instant::now();
+        let (status, _body) = post(port, "/hook", "{}");
+        let waited = began.elapsed();
+        assert_eq!(status, 404, "本测试服务只接控制路由，hook 请求走到 404");
+        assert!(
+            waited < Duration::from_millis(400),
+            "hook 上报被起会话卡了 {waited:?} —— 阻塞命令必须另起线程"
+        );
+
+        let (status, v) = slow.join().unwrap();
+        assert_eq!(status, 200, "{v}");
+    }
+
+    /// 另起线程的那条路**不能**变成免鉴权的口子：无令牌请求在 HTTP 线程上就被挡。
+    #[test]
+    fn 阻塞命令的鉴权一样_fail_closed() {
+        let (_plane, _host, actions, port, _token) = granted();
+        for payload in [
+            r#"{"paneId":7,"launcherId":"claude"}"#.to_string(),
+            r#"{"token":"forged","paneId":7,"launcherId":"claude"}"#.to_string(),
+            "not json".to_string(),
+        ] {
+            let (status, body) = post(port, "/control/start-session", &payload);
+            assert!(status == 401 || status == 400, "payload={payload}: {body}");
+        }
+        assert!(actions.calls.lock().is_empty(), "被拒的请求不许惊动桌面端");
     }
 }

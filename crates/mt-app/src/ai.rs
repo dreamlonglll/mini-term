@@ -148,6 +148,15 @@ impl AiBridge {
         }
     }
 
+    /// 这个 pane 还活着吗。
+    ///
+    /// 读的就是 500ms 轮询那份活 pane 名册([`Self::add_pane`] 登记、
+    /// [`Self::remove_pane`] 注销),所以**后台线程随手可问** —— 编排控制面
+    /// 判「乐手还占不占名额」要在 HTTP 线程上一次问好几个 pane,跳主线程太贵。
+    pub fn is_pane_live(&self, pane_id: u32) -> bool {
+        self.live_panes.lock().contains(&pane_id)
+    }
+
     /// 注销 pane:轮询列表与 `mt-ai` 内部的旁路状态一起清干净。
     pub fn remove_pane(&self, pane_id: u32) {
         self.live_panes.lock().retain(|id| *id != pane_id);

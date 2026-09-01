@@ -72,11 +72,23 @@ pub fn identity_from_env() -> Result<Identity, IdentityError> {
 }
 
 /// 控制请求的 body（与桌面侧 `ControlRequest` 对齐）。
+///
+/// 命令各取所需，用不上的字段**整个不出线**（`skip_serializing_if`）——
+/// `list-*` 那两条命令的请求体因此与工单 02 时一字不差。
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ControlRequest {
     pub token: String,
     pub pane_id: u32,
+    /// `start-session`：用哪个具名启动器（**只有 id** —— 命令文本从不经过这里）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub launcher_id: Option<String>,
+    /// `start-session`：落在哪个项目；不给就是编排者自己那个。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    /// 以某个乐手为目标的命令（工单 05~07）用它。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_pane_id: Option<u32>,
 }
 
 impl From<&Identity> for ControlRequest {
@@ -84,6 +96,20 @@ impl From<&Identity> for ControlRequest {
         Self {
             token: id.token.clone(),
             pane_id: id.pane_id,
+            launcher_id: None,
+            project_id: None,
+            target_pane_id: None,
+        }
+    }
+}
+
+impl ControlRequest {
+    /// `start-session` 的请求体。
+    pub fn start_session(id: &Identity, launcher_id: &str, project_id: Option<&str>) -> Self {
+        Self {
+            launcher_id: Some(launcher_id.to_string()),
+            project_id: project_id.map(str::to_string),
+            ..Self::from(id)
         }
     }
 }
@@ -108,6 +134,34 @@ pub struct Project {
     /// 编排者自己所在的那条。
     #[serde(default)]
     pub current: bool,
+    /// 能不能在这里起乐手（SSH 远程项目起不了）。
+    ///
+    /// **缺省 `false`**：认不出这个字段的旧桌面端在场时，宁可让编排者以为
+    /// 都起不了、去试一次吃个明确错误，也别反过来（fail-closed 的取向）。
+    #[serde(default)]
+    pub can_start_sessions: bool,
+}
+
+/// 一个受编排会话（乐手）在编排者眼里的样子。
+///
+/// `start-session` 的回执与 `list-panes` 的每一条都是它 —— 两条命令共用一个类型，
+/// 编排者只需要认识一种 pane 视图。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrchestratedPane {
+    /// 乐手的 pane 身份（= PTY 编号）。后续命令按它点名。
+    pub pane_id: u32,
+    pub project_id: String,
+    pub project_name: String,
+    pub launcher_id: String,
+    /// 启动器展示名。**不是命令文本** —— 那东西一个字都不出桌面端。
+    pub launcher_name: String,
+    /// AI 状态：`idle` / `ai-idle` / `ai-working`。
+    pub status: String,
+    /// pane 还在桌面上吗。编排者退场不杀乐手；反过来乐手被用户关掉时这里是
+    /// `false`，记账仍在（好让编排者看得见「我起的那个已经没了」）。
+    #[serde(default)]
+    pub alive: bool,
 }
 
 /// 被拒 / 出错的响应。`code` 是闭集（桌面侧 `ControlError::code`），
@@ -123,6 +177,14 @@ impl ControlFailure {
     /// 「这个 pane 没有编排能力」这一类（鉴权失败），CLI 据此给专门的退出码。
     pub fn is_denied(&self) -> bool {
         matches!(self.code.as_str(), "missingToken" | "invalidToken")
+    }
+
+    /// 桌面端在，但没答上来（主线程忙死 / 动作泵没接线）。
+    ///
+    /// 与「连都连不上」是同一类处境 —— 编排者该做的都是**过会儿再试**，
+    /// 而不是改自己的请求，所以 CLI 把它归进「够不着」那一档退出码。
+    pub fn is_desktop_unavailable(&self) -> bool {
+        self.code == "desktopBusy"
     }
 
     fn malformed(status: u16, why: &str) -> Self {
@@ -184,6 +246,28 @@ pub fn parse_projects(status: u16, body: &str) -> Result<Vec<Project>, ControlFa
         .ok_or_else(|| ControlFailure::malformed(status, "missing `projects`"))?;
     serde_json::from_value(list)
         .map_err(|e| ControlFailure::malformed(status, &format!("bad `projects`: {e}")))
+}
+
+/// 解析 `start-session` 的回执（单个乐手）。
+pub fn parse_started_pane(status: u16, body: &str) -> Result<OrchestratedPane, ControlFailure> {
+    let data = envelope(status, body)?;
+    let pane = data
+        .get("pane")
+        .cloned()
+        .ok_or_else(|| ControlFailure::malformed(status, "missing `pane`"))?;
+    serde_json::from_value(pane)
+        .map_err(|e| ControlFailure::malformed(status, &format!("bad `pane`: {e}")))
+}
+
+/// 解析 `list-panes` 的响应（自己名下的全部乐手）。
+pub fn parse_panes(status: u16, body: &str) -> Result<Vec<OrchestratedPane>, ControlFailure> {
+    let data = envelope(status, body)?;
+    let list = data
+        .get("panes")
+        .cloned()
+        .ok_or_else(|| ControlFailure::malformed(status, "missing `panes`"))?;
+    serde_json::from_value(list)
+        .map_err(|e| ControlFailure::malformed(status, &format!("bad `panes`: {e}")))
 }
 
 #[cfg(test)]
@@ -303,5 +387,124 @@ mod tests {
         let body = r#"{"ok":true,"data":{"projects":[
             {"id":"p1","name":"n","path":"p","current":true,"futureField":42}],"extra":1}}"#;
         assert_eq!(parse_projects(200, body).unwrap().len(), 1);
+    }
+
+    // ─── 工单 03 的两条命令 ───────────────────────────────────
+
+    /// `start-session` 的请求体：**只带 id**，没给的字段整个不出线。
+    #[test]
+    fn 起会话请求体只带_id() {
+        let id = Identity {
+            token: "t".into(),
+            pane_id: 3,
+        };
+        let json = serde_json::to_string(&ControlRequest::start_session(&id, "codex", None)).unwrap();
+        assert_eq!(json, r#"{"token":"t","paneId":3,"launcherId":"codex"}"#);
+
+        let json =
+            serde_json::to_string(&ControlRequest::start_session(&id, "codex", Some("p-api")))
+                .unwrap();
+        assert_eq!(
+            json,
+            r#"{"token":"t","paneId":3,"launcherId":"codex","projectId":"p-api"}"#
+        );
+        // 命令文本没有出线的通道 —— 类型上就没有那个字段
+        assert!(!json.contains("command"));
+    }
+
+    /// `list-*` 的请求体不受工单 03 的字段扩展影响（工单 02 那版一字不差）。
+    #[test]
+    fn 列表命令的请求体未被新字段污染() {
+        let id = Identity {
+            token: "t".into(),
+            pane_id: 3,
+        };
+        let json = serde_json::to_string(&ControlRequest::from(&id)).unwrap();
+        assert_eq!(json, r#"{"token":"t","paneId":3}"#);
+    }
+
+    #[test]
+    fn 解析起会话回执() {
+        let body = r#"{"ok":true,"data":{"pane":{"paneId":101,"projectId":"p1",
+            "projectName":"前端","launcherId":"codex","launcherName":"Codex",
+            "status":"ai-idle","alive":true}}}"#;
+        let pane = parse_started_pane(200, body).unwrap();
+        assert_eq!(pane.pane_id, 101);
+        assert_eq!(pane.launcher_name, "Codex");
+        assert_eq!(pane.status, "ai-idle");
+        assert!(pane.alive);
+    }
+
+    #[test]
+    fn 解析乐手名单() {
+        let body = r#"{"ok":true,"data":{"panes":[
+            {"paneId":101,"projectId":"p1","projectName":"前端","launcherId":"codex",
+             "launcherName":"Codex","status":"ai-working","alive":true},
+            {"paneId":102,"projectId":"p1","projectName":"前端","launcherId":"claude",
+             "launcherName":"Claude","status":"idle","alive":false}]}}"#;
+        let panes = parse_panes(200, body).unwrap();
+        assert_eq!(panes.len(), 2);
+        assert!(panes[0].alive);
+        assert!(!panes[1].alive, "关掉的乐手照列，只是 alive 为假");
+    }
+
+    /// 空名单是**合法**的成功响应（还没起过乐手），不许被当成解析失败。
+    #[test]
+    fn 空乐手名单是成功() {
+        let body = r#"{"ok":true,"data":{"panes":[]}}"#;
+        assert!(parse_panes(200, body).unwrap().is_empty());
+    }
+
+    /// 认不出的响应照旧算失败，两条新解析器一视同仁。
+    #[test]
+    fn 新命令的坏响应也算失败() {
+        for (status, body) in [(200, "not json"), (200, r#"{"ok":true,"data":{}}"#)] {
+            assert_eq!(
+                parse_panes(status, body).unwrap_err().code,
+                "malformedResponse"
+            );
+            assert_eq!(
+                parse_started_pane(status, body).unwrap_err().code,
+                "malformedResponse"
+            );
+        }
+    }
+
+    /// 工单 03 新增的错误码要落在正确的退出码档位上。
+    #[test]
+    fn 新错误码的分档() {
+        let f = |code: &str| ControlFailure {
+            status: 400,
+            code: code.into(),
+            message: String::new(),
+        };
+        // 桌面端没答上来 = 「够不着」那一档（过会儿再试，别改请求）
+        assert!(f("desktopBusy").is_desktop_unavailable());
+        assert!(!f("desktopBusy").is_denied());
+        // 其余都是「请求被拒」：编排者该改自己的请求或等名额
+        for code in [
+            "launcherNotFound",
+            "projectUnreachable",
+            "remoteProjectUnsupported",
+            "sessionLimitReached",
+            "startFailed",
+            "selfTarget",
+            "paneNotFound",
+            "paneGone",
+        ] {
+            assert!(!f(code).is_denied(), "{code} 不是鉴权失败");
+            assert!(!f(code).is_desktop_unavailable(), "{code} 不是够不着");
+        }
+    }
+
+    /// 远程项目的 `canStartSessions` 要透到 CLI 侧（编排者据此不去白试一次）。
+    #[test]
+    fn 可达项目带上能否起会话() {
+        let body = r#"{"ok":true,"data":{"projects":[
+            {"id":"p1","name":"本地","path":"D:\\a","current":true,"canStartSessions":true},
+            {"id":"p2","name":"远程","path":"/srv/api","current":false,"canStartSessions":false}]}}"#;
+        let list = parse_projects(200, body).unwrap();
+        assert!(list[0].can_start_sessions);
+        assert!(!list[1].can_start_sessions, "远程项目起不了乐手");
     }
 }

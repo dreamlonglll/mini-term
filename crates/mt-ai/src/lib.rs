@@ -62,7 +62,9 @@ pub mod tracker;
 mod util;
 
 pub use control::{
-    ControlLauncher, ControlPlane, ControlProject, NoopOrchestratorHost, OrchestratorHost,
+    ControlLauncher, ControlPlane, ControlProject, NoopOrchestratorActions, NoopOrchestratorHost,
+    OrchestratedSession, OrchestratorActions, OrchestratorHost, PaneLiveness, StartFailure,
+    StartSessionSpec, StartedSession, DEFAULT_SESSION_CAP,
 };
 pub use detect::{interactive_ai_command_name, is_interactive_ai_command, AI_COMMANDS};
 pub use hook_server::{is_attention_cause, HookState, HookStatusInfo};

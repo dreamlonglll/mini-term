@@ -22,11 +22,13 @@
 //! # 用法
 //!
 //! ```text
-//! mt-agent-cli list-launchers     # 我能用哪些 AI 启动器起乐手
-//! mt-agent-cli list-projects      # 我能在哪些项目里起(本项目 + 同分组)
+//! mt-agent-cli list-launchers                          # 我能用哪些 AI 启动器起乐手
+//! mt-agent-cli list-projects                           # 我能在哪些项目里起(本项目 + 同分组)
+//! mt-agent-cli start-session --launcher <ID> [--project <ID>]   # 起一个受编排会话
+//! mt-agent-cli list-panes                              # 我起过的受编排会话及其状态
 //! ```
 //!
-//! 成功：JSON 到 stdout，退出码 0。失败：JSON 到 stderr，退出码见 [`exit_code`]。
+//! 成功：JSON 到 stdout，退出码 0。失败：JSON 到 stderr，退出码见 [`CliError::exit_code`]。
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -35,11 +37,15 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use mt_agent_control::{
-    ControlFailure, ControlRequest, IdentityError, identity_from_env, parse_launchers,
-    parse_projects, CONTROL_PREFIX,
+    ControlFailure, ControlRequest, IdentityError, identity_from_env, parse_launchers, parse_panes,
+    parse_projects, parse_started_pane, CONTROL_PREFIX,
 };
 
 /// 连接与读取超时。控制端点是本机进程，慢到这个份上一定是出事了。
+///
+/// ⚠️ 读超时必须**大于**桌面侧等主线程的那个时限（`orchestrator::ACTION_TIMEOUT`
+/// 3 秒），否则起会话稍慢一点就变成 CLI 先断线 —— 编排者拿到的会是「够不着」
+/// 而不是桌面端给的那个明确答复。
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -60,6 +66,17 @@ enum Command {
     ListLaunchers,
     /// List the projects reachable from here (own project + same group).
     ListProjects,
+    /// Start an orchestrated session with the given launcher.
+    StartSession {
+        /// Launcher id, as reported by `list-launchers`.
+        #[arg(long, value_name = "ID")]
+        launcher: String,
+        /// Project id, as reported by `list-projects`; defaults to this pane's own project.
+        #[arg(long, value_name = "ID")]
+        project: Option<String>,
+    },
+    /// List the orchestrated sessions this orchestrator started, with their status.
+    ListPanes,
 }
 
 impl Command {
@@ -68,6 +85,19 @@ impl Command {
         match self {
             Self::ListLaunchers => "list-launchers",
             Self::ListProjects => "list-projects",
+            Self::StartSession { .. } => "start-session",
+            Self::ListPanes => "list-panes",
+        }
+    }
+
+    /// 这条命令的请求体。**只带 id** —— 启动器的命令文本从不经过 CLI
+    /// （ADR 0002：命令只能来自桌面端配置）。
+    fn request(&self, identity: &mt_agent_control::Identity) -> ControlRequest {
+        match self {
+            Self::StartSession { launcher, project } => {
+                ControlRequest::start_session(identity, launcher, project.as_deref())
+            }
+            _ => ControlRequest::from(identity),
         }
     }
 }
@@ -90,7 +120,7 @@ fn run(command: &Command) -> Result<String, CliError> {
     let port = discover_port().ok_or(CliError::DesktopUnreachable(
         "cannot locate the mini-term hook server port (is mini-term running?)".to_string(),
     ))?;
-    let body = serde_json::to_string(&ControlRequest::from(&identity))
+    let body = serde_json::to_string(&command.request(&identity))
         .map_err(|e| CliError::DesktopUnreachable(format!("cannot encode request: {e}")))?;
     let (status, response) = post(port, command.endpoint(), &body)?;
 
@@ -102,6 +132,14 @@ fn run(command: &Command) -> Result<String, CliError> {
         Command::ListProjects => {
             let projects = parse_projects(status, &response).map_err(CliError::Rejected)?;
             to_json(&serde_json::json!({ "projects": projects }))
+        }
+        Command::StartSession { .. } => {
+            let pane = parse_started_pane(status, &response).map_err(CliError::Rejected)?;
+            to_json(&serde_json::json!({ "pane": pane }))
+        }
+        Command::ListPanes => {
+            let panes = parse_panes(status, &response).map_err(CliError::Rejected)?;
+            to_json(&serde_json::json!({ "panes": panes }))
         }
     }
 }
@@ -206,11 +244,16 @@ enum CliError {
 impl CliError {
     /// 退出码是给编排者（LLM）看的第一手信号，语义分三档：
     /// 2 = 你没有这个能力；3 = 桌面端够不着；4 = 请求被拒。
+    ///
+    /// 「够不着」那一档刻意把 `desktopBusy`（桌面端在，但主线程没在时限内答复）
+    /// 也算进去：编排者对这两种处境该做的都是**过会儿再试**，而 4 那一档是
+    /// 「改你的请求或等名额」。
     fn exit_code(&self) -> i32 {
         match self {
             Self::Identity(_) => 2,
             Self::DesktopUnreachable(_) => 3,
             Self::Rejected(f) if f.is_denied() => 2,
+            Self::Rejected(f) if f.is_desktop_unavailable() => 3,
             Self::Rejected(_) => 4,
         }
     }
@@ -289,6 +332,66 @@ mod tests {
     fn 端点名固定() {
         assert_eq!(Command::ListLaunchers.endpoint(), "list-launchers");
         assert_eq!(Command::ListProjects.endpoint(), "list-projects");
+        assert_eq!(
+            Command::StartSession {
+                launcher: "x".into(),
+                project: None
+            }
+            .endpoint(),
+            "start-session"
+        );
+        assert_eq!(Command::ListPanes.endpoint(), "list-panes");
         assert_eq!(CONTROL_PREFIX, "/control/");
+    }
+
+    /// 每条命令带上自己那几个字段，不带别人的。
+    #[test]
+    fn 请求体按命令各取所需() {
+        let id = mt_agent_control::Identity {
+            token: "t".into(),
+            pane_id: 5,
+        };
+        let json = |c: &Command| serde_json::to_string(&c.request(&id)).unwrap();
+
+        assert_eq!(json(&Command::ListPanes), r#"{"token":"t","paneId":5}"#);
+        assert_eq!(
+            json(&Command::StartSession {
+                launcher: "codex".into(),
+                project: Some("p-api".into())
+            }),
+            r#"{"token":"t","paneId":5,"launcherId":"codex","projectId":"p-api"}"#
+        );
+        // 不给 --project 就整个字段不出线（桌面侧据此落在编排者自己的项目）
+        assert_eq!(
+            json(&Command::StartSession {
+                launcher: "codex".into(),
+                project: None
+            }),
+            r#"{"token":"t","paneId":5,"launcherId":"codex"}"#
+        );
+    }
+
+    /// 桌面端没答上来 = 「过会儿再试」那一档，与「连不上」同码。
+    #[test]
+    fn 桌面端忙不过来与够不着同档() {
+        assert_eq!(
+            CliError::Rejected(ControlFailure {
+                status: 503,
+                code: "desktopBusy".into(),
+                message: "m".into()
+            })
+            .exit_code(),
+            3
+        );
+        // 名额满了是「改你的请求 / 等一等」，不是够不着
+        assert_eq!(
+            CliError::Rejected(ControlFailure {
+                status: 429,
+                code: "sessionLimitReached".into(),
+                message: "m".into()
+            })
+            .exit_code(),
+            4
+        );
     }
 }

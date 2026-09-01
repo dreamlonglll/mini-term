@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 32;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 845;
+pub const ZH_ENTRY_COUNT: usize = 846;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 845;
+pub const EN_ENTRY_COUNT: usize = 846;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -43,6 +43,7 @@ static APP_ZH: &[(&str, &str)] = &[
     ("firstRun.title", "还没有项目"),
     ("menu.settings", "设置"),
     ("mobileStartSession", "移动端新建了会话（{launcher}）"),
+    ("orchestratorStartSession", "编排者新建了会话（{launcher}）"),
     ("titleBar.close", "关闭"),
     ("titleBar.maximize", "最大化"),
     ("titleBar.minimize", "最小化"),
@@ -92,6 +93,7 @@ static APP_EN: &[(&str, &str)] = &[
     ("firstRun.title", "No projects yet"),
     ("menu.settings", "Settings"),
     ("mobileStartSession", "Mobile started a session ({launcher})"),
+    ("orchestratorStartSession", "An orchestrator started a session ({launcher})"),
     ("titleBar.close", "Close"),
     ("titleBar.maximize", "Maximize"),
     ("titleBar.minimize", "Minimize"),
