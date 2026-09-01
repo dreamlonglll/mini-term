@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 32;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 846;
+pub const ZH_ENTRY_COUNT: usize = 850;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 846;
+pub const EN_ENTRY_COUNT: usize = 850;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -1098,12 +1098,16 @@ static SETTINGS_ZH: &[(&str, &str)] = &[
     ("aiHook.enableHookDesc", "开启后监听本地端口接收 AI 事件，Windows 上首次开启可能触发防火墙授权"),
     ("aiHook.footer", "注册后所选 CLI 会在事件发生时通知 Mini-Term · 三家的配置文件互不相干，可单独装/卸 · 未注册时自动使用进程轮询检测"),
     ("aiHook.noTargetSelected", "至少勾选一个注入目标"),
+    ("aiHook.orchestrationFooter", "编排能力逐条开在 AI 启动器上（「移动端」面板里的「允许编排」）· 控制通道就走上面这个 Hook 服务器，它没启动时编排命令一律连不上 · 超出上限的启动请求会收到明确错误，由编排者自己排队"),
+    ("aiHook.orchestrationTitle", "编排"),
     ("aiHook.register", "注册所选 Hook"),
     ("aiHook.registering", "注册中..."),
     ("aiHook.serverDesc", "通过 Claude Code / Codex / Grok 的 hook 系统获取精确的 AI 状态，替代进程轮询"),
     ("aiHook.serverLabel", "Hook 服务器"),
     ("aiHook.serverRunning", "运行中 (端口 {port})"),
     ("aiHook.serverStopped", "未启动"),
+    ("aiHook.sessionCapDesc", "一个编排者同时最多能有几个受编排会话在跑（0~20）。0 = 暂停新的受编排会话；调低不会关掉已经在跑的，只影响之后的启动请求"),
+    ("aiHook.sessionCapTitle", "受编排会话并发上限"),
     ("aiHook.showSnippet", "查看配置片段（手动粘贴）"),
     ("aiHook.stateAbsent", "未注册"),
     ("aiHook.stateReady", "已注册 {n} 个事件"),
@@ -1295,12 +1299,16 @@ static SETTINGS_EN: &[(&str, &str)] = &[
     ("aiHook.enableHookDesc", "When enabled, listens on a local port for AI events. On Windows the first launch may prompt for firewall access"),
     ("aiHook.footer", "Once registered, the selected CLIs notify Mini-Term when events occur · The three config files are independent, so each can be installed or removed on its own · Falls back to process polling when not registered"),
     ("aiHook.noTargetSelected", "Select at least one injection target"),
+    ("aiHook.orchestrationFooter", "Orchestration is granted per AI launcher (the Allow orchestration switch in the Mobile panel) · The control channel rides the hook server above, so orchestration commands cannot connect while it is stopped · Start requests beyond the limit get an explicit error, leaving the orchestrator to queue them itself"),
+    ("aiHook.orchestrationTitle", "Orchestration"),
     ("aiHook.register", "Register selected hooks"),
     ("aiHook.registering", "Registering..."),
     ("aiHook.serverDesc", "Get precise AI status via the Claude Code / Codex / Grok hook system, replacing process polling"),
     ("aiHook.serverLabel", "Hook server"),
     ("aiHook.serverRunning", "Running (port {port})"),
     ("aiHook.serverStopped", "Not running"),
+    ("aiHook.sessionCapDesc", "How many orchestrated sessions one orchestrator may keep running at the same time (0-20). 0 pauses new orchestrated sessions; lowering it never closes sessions already running, it only applies to later start requests"),
+    ("aiHook.sessionCapTitle", "Concurrent orchestrated sessions"),
     ("aiHook.showSnippet", "View config snippet (manual paste)"),
     ("aiHook.stateAbsent", "Not registered"),
     ("aiHook.stateReady", "{n} events registered"),

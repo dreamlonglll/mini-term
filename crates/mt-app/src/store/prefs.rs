@@ -262,6 +262,26 @@ impl AppStore {
         cx.notify();
     }
 
+    /// 受编排会话并发上限(ADR 0003 / 工单 08)。
+    ///
+    /// **改完立刻推给控制面**,不搭 [`Self::save_config_soon`] 那班 500ms 防抖的
+    /// 车:验收口径是「用户改完立刻在编排者里试」,而裁决读的是控制面里那个
+    /// 原子量、不是磁盘。落盘照旧防抖(这是个数字输入框,失焦/回车才提交一次,
+    /// 不存在拖动时每帧写盘的问题)。
+    ///
+    /// 调低**不动已存活的乐手**:上限只在 `start-session` 那一行被读一次
+    /// (钉子见 `mt_ai::control` 的 `调低上限不动已存活的乐手`)。
+    pub fn set_orchestrator_session_cap(&mut self, cap: u32, cx: &mut Context<Self>) {
+        if self.config.orchestrator_session_cap == Some(cap) {
+            return;
+        }
+        self.config.orchestrator_session_cap = Some(cap);
+        self.ai
+            .set_orchestrator_session_cap(crate::orchestrator::resolve_session_cap(Some(cap)));
+        self.save_config_soon(cx);
+        cx.notify();
+    }
+
     /// 把当前的终端字号/字族下发给**全部**已开终端。
     fn apply_terminal_style(&mut self, cx: &mut Context<Self>) {
         let style = self.terminal_style();

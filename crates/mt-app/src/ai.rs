@@ -116,13 +116,28 @@ impl AiBridge {
         self.perception.control().grant(pane_id, project_id)
     }
 
-    /// 把当前配置刷进编排控制面的镜像。
+    /// 把当前配置刷进编排控制面:镜像 + 并发上限。
     ///
     /// 控制面在 hook 那条 HTTP 线程上跑,碰不得 gpui 实体,只能读这份镜像;
     /// 而「改分组即时生效」要求它别陈旧 —— 调用点在配置落盘那一处
     /// (`store::layout::save_config_now`)与启动接线处,配置一变就跟。
+    ///
+    /// 上限也在这里推一次:它是**配置的一部分**,启动时得从盘上那份接上,
+    /// 配置若哪天由别的路径整体换掉(重读 / 迁移)也得跟着走。改设置项那一下
+    /// 另走 [`Self::set_orchestrator_session_cap`] —— 那条不等 500ms 防抖。
     pub fn refresh_orchestrator_mirror(&self, config: &mt_config::AppConfig) {
         self.orchestrator_mirror.lock().replace(config);
+        self.set_orchestrator_session_cap(crate::orchestrator::resolve_session_cap(
+            config.orchestrator_session_cap,
+        ));
+    }
+
+    /// 把受编排会话并发上限推给控制面(工单 08 的设置项落点)。
+    ///
+    /// 控制面里那是个原子量,写完立刻对**后续**的 `start-session` 裁决生效,
+    /// 已存活的乐手一个不动(裁决只在起会话那一行读它)。
+    pub fn set_orchestrator_session_cap(&self, cap: usize) {
+        self.perception.control().set_session_cap(cap);
     }
 
     /// 运行时开关 hook server(设置页「Hook 事件」的落点,原 `toggle_hook_server`)。

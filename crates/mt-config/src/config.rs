@@ -198,6 +198,14 @@ pub struct AppConfig {
     /// 持久化，重新打开开关后下次启动照样能续上。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai_auto_resume: Option<bool>,
+    /// 一个编排者同时能有几个受编排会话活着（ADR 0003 的硬上限，设置可调）。
+    ///
+    /// `None` = 用默认值。**默认值不写在这里**：它是编排控制面的常量
+    /// （`mt_ai::DEFAULT_SESSION_CAP`），而 `mt-config` 不认识 `mt-ai`；界面层
+    /// 拿到 `None` 时按那个常量兜底（与 `tray_max_projects` 同一个套路）。
+    /// 存量配置里没有这个键，反序列化即 `None` —— 语义正是「跟默认走」。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestrator_session_cap: Option<u32>,
     #[serde(default)]
     pub ssh_connections: Vec<SshConnection>,
     /// 显式创建的 SSH 分组名（允许空分组存在）。连接上的 group 字段仍是归属的
@@ -629,6 +637,7 @@ impl Default for AppConfig {
             tray_click_focus: None,
             terminal_animations: None,
             ai_auto_resume: None,
+            orchestrator_session_cap: None,
             ssh_connections: vec![],
             ssh_groups: vec![],
             mobile_relay: None,
@@ -1974,6 +1983,49 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<AiLauncher>(&json).unwrap(),
             granted
+        );
+    }
+
+    /// 受编排会话并发上限:存量配置缺这个键 → `None`(= 跟默认走),
+    /// 用户设过之后往返保真且键名是 camelCase。
+    ///
+    /// 缺字段这一档是**存量用户的迁移路径**:老 `config.db` 里根本没有这个
+    /// settings 键,解析失败会把整份配置(连带项目列表)一起拖垮。
+    #[test]
+    fn orchestrator_session_cap_defaults_none_and_round_trips() {
+        let legacy = AppConfig::default();
+        assert_eq!(
+            legacy.orchestrator_session_cap, None,
+            "缺字段必须解析成 None —— 那是「跟默认走」,不是 0"
+        );
+        // None 时不落键,配置文件保持干净
+        let json = serde_json::to_string(&legacy).unwrap();
+        assert!(
+            !json.contains("orchestratorSessionCap"),
+            "没设过就不该落这个键: {json}"
+        );
+
+        let mut tuned = AppConfig::default();
+        tuned.orchestrator_session_cap = Some(3);
+        let json = serde_json::to_string(&tuned).unwrap();
+        assert!(json.contains(r#""orchestratorSessionCap":3"#), "{json}");
+        assert_eq!(
+            serde_json::from_str::<AppConfig>(&json)
+                .unwrap()
+                .orchestrator_session_cap,
+            Some(3)
+        );
+
+        // 0 是合法值(「暂停一切新的受编排会话」),不许被当成「没设过」吞掉
+        let mut paused = AppConfig::default();
+        paused.orchestrator_session_cap = Some(0);
+        let json = serde_json::to_string(&paused).unwrap();
+        assert_eq!(
+            serde_json::from_str::<AppConfig>(&json)
+                .unwrap()
+                .orchestrator_session_cap,
+            Some(0),
+            "0 与 None 是两个意思,序列化不许把它们抹平"
         );
     }
 

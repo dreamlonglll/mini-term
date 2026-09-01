@@ -407,8 +407,10 @@ pub struct Grant {
 
 /// 同时存活的受编排会话上限（ADR 0003 的默认值）。
 ///
-/// **不写死在判断处**：工单 08 要把它变成设置项，届时只需在装配处调一次
-/// [`ControlPlane::set_session_cap`]，裁决那一行一个字都不用动。
+/// **不写死在判断处**：工单 08 把它变成了设置项，装配处（桌面侧的
+/// `AiBridge::refresh_orchestrator_mirror`）按配置调一次
+/// [`ControlPlane::set_session_cap`]，裁决那一行一个字都没动。用户没设过时
+/// 配置里是 `None`，界面层拿这个常量兜底 —— 默认值只有这一处。
 pub const DEFAULT_SESSION_CAP: usize = 5;
 
 /// 一个编排者名下最多留多少条记账。
@@ -421,7 +423,13 @@ pub const DEFAULT_SESSION_CAP: usize = 5;
 ///
 /// 50 是「远大于并发上限（默认 5）、又不至于让数名额变贵」的一个数：编排者能
 /// 回看的历史足够长，而现查死活最多问 50 次。
-const MAX_SESSIONS_PER_ORCHESTRATOR: usize = 50;
+///
+/// **公开出去是给设置项的上界当锚**：并发上限一旦让用户填得比这张表还长，
+/// 记账就装不下全部**活着**的乐手（修剪只丢已关的、丢不动就超着），
+/// 「活着的一条都不能丢」这条不变式会被逼到墙角。工单 08 的
+/// `mt_app::orchestrator::SESSION_CAP_MAX` 由一条测试拿这个真常量钉住，
+/// 不是抄一个字面量。
+pub const MAX_SESSIONS_PER_ORCHESTRATOR: usize = 50;
 
 /// 控制命令的闭集。
 ///
@@ -1973,6 +1981,59 @@ mod tests {
         let plane2 = ControlPlane::new();
         plane2.set_session_cap(0);
         assert_eq!(plane2.session_cap(), 0);
+    }
+
+    /// **调低上限不许杀已存活的乐手**（工单 08 的验收项，也是一根防退化的钉子）。
+    ///
+    /// 上限只在 `start-session` 那一行被读一次，所以「调低不杀」是当前实现的
+    /// 天然结论 —— 正因为是天然的，才更容易被后来人一条「超限就回收」的
+    /// 顺手逻辑破掉。乐手 pane 里可能躺着改到一半的代码（ADR 0003 否决
+    /// 「编排者退出时自动关闭其受编排会话」用的是同一条理由）。
+    #[test]
+    fn 调低上限不动已存活的乐手() {
+        let (plane, _host, actions, port, token) = granted();
+        let mut panes = Vec::new();
+        for _ in 0..3 {
+            let (status, v) = start(port, &token, r#""launcherId":"claude""#);
+            assert_eq!(status, 200);
+            panes.push(v["data"]["pane"]["paneId"].as_u64().unwrap() as u32);
+        }
+
+        // 用户把上限从 5 拉到 1 —— 已经在跑的三个一个都不许动
+        plane.set_session_cap(1);
+
+        let (status, body) = post(port, "/control/list-panes", &payload_of(&token, ""));
+        assert_eq!(status, 200);
+        let listed = json(&body)["data"]["panes"].clone();
+        let listed = listed.as_array().unwrap();
+        assert_eq!(listed.len(), 3, "调低上限不该让谁从名册上消失: {body}");
+        for pane in listed {
+            assert_eq!(pane["alive"], true, "已存活的乐手不许被回收: {pane}");
+        }
+        // 桌面侧的死活现场也一个字没改（控制面压根没有「关 pane」这个能力，
+        // 真要加「超限就回收」得先给 `OrchestratorActions` 开一道口子）
+        for pane in &panes {
+            assert!(
+                actions.liveness.lock()[pane].alive,
+                "pane {pane} 被谁关掉了"
+            );
+        }
+
+        // 只影响**后续**裁决：现在超着限，新的一律拒
+        let (status, v) = start(port, &token, r#""launcherId":"claude""#);
+        assert_eq!(status, 429, "{v}");
+        assert_eq!(v["error"]["code"], "sessionLimitReached");
+
+        // 名额得等真的降到新上限**之下**才长出来：关掉两个还剩一个，仍然满
+        actions.close(panes[0]);
+        actions.close(panes[1]);
+        assert_eq!(
+            start(port, &token, r#""launcherId":"claude""#).0,
+            429,
+            "还剩一个活着,上限 1 就是满的"
+        );
+        actions.close(panes[2]);
+        assert_eq!(start(port, &token, r#""launcherId":"claude""#).0, 200);
     }
 
     /// 名额只计**自己**的乐手：别人起满了不该拖累我。

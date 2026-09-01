@@ -15,7 +15,9 @@ use crate::i18n::{t, tr};
 use crate::ui;
 
 use super::{SettingsView, default_selected_agents};
-use super::widgets::{banner, page_root, section, snippet_file_name, snippet_lines, toggle_row};
+use super::widgets::{
+    banner, number_row, page_root, section, snippet_file_name, snippet_lines, toggle_row,
+};
 
 impl SettingsView {
     // ── ai-notification 页 ──
@@ -538,6 +540,33 @@ impl SettingsView {
                 )
             })
             .child(body)
+            // ── 编排(ADR 0003 / 工单 08)──
+            //
+            // 落在 hook 页而不是另开一页:控制端点(`/control/*`)就长在上面那个
+            // hook 服务器的监听上(`hook_server.rs` 的 `try_handle_control`),
+            // 服务器没开时编排 CLI 一个命令都递不进来 —— 把这条依赖摆在同一页上
+            // 比让用户去两个地方找它诚实。
+            //
+            // **不随服务器开关置灰**:这是一条持久化配置,关着服务器也该改得动
+            // (改完下次开起来就是新上限),依赖关系由页脚那句话说清。
+            .child(
+                div()
+                    .mt(px(16.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .child(ui::settings_section_title(t(
+                        "settings",
+                        "aiHook.orchestrationTitle",
+                    )))
+                    .child(number_row(
+                        "aiHook.sessionCapTitle",
+                        "aiHook.sessionCapDesc",
+                        &self.num_orchestrator_cap,
+                        false,
+                    ))
+                    .child(ui::hint(t("settings", "aiHook.orchestrationFooter"))),
+            )
             .into_any_element()
     }
 

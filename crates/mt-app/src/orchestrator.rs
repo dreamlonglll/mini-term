@@ -104,6 +104,31 @@ impl OrchestratorGrant {
 /// pane」来,编排者起的会话一律不走那条路,哪怕目标启动器自己勾了开关。
 pub const ORCHESTRATED_GRANT: OrchestratorGrant = OrchestratorGrant::None;
 
+// ─── 并发上限:配置里的那个数 → 控制面要的上限 ────────────────
+
+/// 设置项能填到的最大值。
+///
+/// 上界不是防手滑,是**防把机器拖垮**:一个受编排会话 = 一条 PTY + 一个几百 MB
+/// 的 agent 进程 + 它自己拉起的子进程,20 个已经远超一台开发机能同时供养的量。
+/// 另有一条硬约束:它必须 ≤ [`mt_ai::MAX_SESSIONS_PER_ORCHESTRATOR`](记账表长度
+/// 上限)—— 记账装不下全部**活着**的乐手时,「活着的一条都不能丢」那条不变式就
+/// 被逼到墙角了。那条不等式由本模块的测试拿两侧真常量钉住。
+pub const SESSION_CAP_MAX: u32 = 20;
+
+/// 配置里那个 `Option<u32>` → 控制面要的 `usize`。
+///
+/// 三件事收在这一处(界面初值、提交后推给控制面、启动接线各调一次,口径必须同一份):
+///
+/// - `None` = **用户没设过**,兜底到 [`mt_ai::DEFAULT_SESSION_CAP`]。默认值只有
+///   那一个常量,`mt-config` 不认识 `mt-ai`,所以兜底只能落在这一层;
+/// - 越界的值钳回 `0..=SESSION_CAP_MAX`。config.db 是本程序自己写的,理论上填不进
+///   越界值,但配置也可能是从旧 `config.json` 迁进来的 —— 钳一下比信它便宜;
+/// - `0` 是**合法值**,语义是「暂停一切新的受编排会话」(见
+///   [`mt_ai::ControlPlane::set_session_cap`]),不许被当成「没设过」吞掉。
+pub fn resolve_session_cap(saved: Option<u32>) -> usize {
+    saved.unwrap_or(mt_ai::DEFAULT_SESSION_CAP as u32).min(SESSION_CAP_MAX) as usize
+}
+
 /// 主线程按配置刷新、控制面 HTTP 线程只读的那一份桌面状态切面。
 #[derive(Default)]
 pub struct OrchestratorMirror {
@@ -760,5 +785,74 @@ mod tests {
 
         mirror.replace(&AppConfig::default());
         assert!(mirror.projects.is_empty(), "整体替换,不许留旧项目");
+    }
+
+    // ─── 并发上限(工单 08) ───────────────────────────────────
+
+    /// 没设过 → 默认值;设过 → 照用;0 是合法值不是「没设过」。
+    #[test]
+    fn 上限没设过时用默认值() {
+        assert_eq!(resolve_session_cap(None), mt_ai::DEFAULT_SESSION_CAP);
+        assert_eq!(resolve_session_cap(Some(3)), 3);
+        assert_eq!(
+            resolve_session_cap(Some(0)),
+            0,
+            "0 = 暂停一切新的受编排会话,不许被兜底成默认值"
+        );
+        // 存量配置的迁移路径:缺这个键就是 None
+        assert_eq!(
+            resolve_session_cap(AppConfig::default().orchestrator_session_cap),
+            mt_ai::DEFAULT_SESSION_CAP
+        );
+    }
+
+    /// 越界的值钳回上界(配置可能是从旧 config.json 迁进来的,别信它)。
+    #[test]
+    fn 上限越界被钳回上界() {
+        assert_eq!(
+            resolve_session_cap(Some(u32::MAX)),
+            SESSION_CAP_MAX as usize
+        );
+        assert_eq!(
+            resolve_session_cap(Some(SESSION_CAP_MAX)),
+            SESSION_CAP_MAX as usize
+        );
+    }
+
+    /// 上界必须留在记账表长度之内 —— 拿**两侧真常量**比，不是抄字面量。
+    ///
+    /// 反过来(上限 > 记账上限)时记账装不下全部活着的乐手,而修剪只丢已经关掉的、
+    /// 「活着的一条都不能丢」,那条不变式会被逼到墙角。
+    #[test]
+    fn 上限的上界不超过记账表长度() {
+        assert!(
+            SESSION_CAP_MAX as usize <= mt_ai::MAX_SESSIONS_PER_ORCHESTRATOR,
+            "并发上限的上界 {} 超过了每编排者记账上限 {}",
+            SESSION_CAP_MAX,
+            mt_ai::MAX_SESSIONS_PER_ORCHESTRATOR
+        );
+        assert!(
+            mt_ai::DEFAULT_SESSION_CAP <= SESSION_CAP_MAX as usize,
+            "默认值得落在设置项填得出来的范围里"
+        );
+    }
+
+    /// 设置项说明里那个取值范围是**手写进文案**的,改了 [`SESSION_CAP_MAX`]
+    /// 却忘了改文案时在这儿红一次(双语各查一遍)。
+    #[test]
+    fn 上限文案与取值范围对得上() {
+        let max = SESSION_CAP_MAX.to_string();
+        for locale in [mt_i18n::Locale::Zh, mt_i18n::Locale::En] {
+            let desc = mt_i18n::t_in(locale, "settings", "aiHook.sessionCapDesc");
+            assert!(
+                desc.contains(&max),
+                "{locale:?} 的说明里没提到上界 {max}: {desc}"
+            );
+            // 术语纪律:用户可见面一律「受编排会话 / orchestrated session」
+            assert!(
+                !desc.contains("乐手") && !desc.to_lowercase().contains("musician"),
+                "{locale:?} 的用户可见文案不许出现口语别名: {desc}"
+            );
+        }
     }
 }

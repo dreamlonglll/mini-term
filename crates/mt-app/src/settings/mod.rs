@@ -193,6 +193,8 @@ pub enum NumField {
     CharThreshold,
     /// 托盘菜单最多显示的项目数
     TrayMax,
+    /// 受编排会话并发上限(ADR 0003 / 工单 08)
+    OrchestratorCap,
 }
 
 impl NumField {
@@ -204,6 +206,10 @@ impl NumField {
             Self::LineThreshold => (0.0, 100_000.0),
             Self::CharThreshold => (0.0, 10_000_000.0),
             Self::TrayMax => (1.0, 20.0),
+            // 下界**是 0 而不是 1**:0 的语义是「暂停一切新的受编排会话」
+            // (`ControlPlane::set_session_cap` 的文档口径),是个有用的总闸 ——
+            // 逐条去启动器上取消勾选才叫麻烦。上界的论证见 `SESSION_CAP_MAX`。
+            Self::OrchestratorCap => (0.0, crate::orchestrator::SESSION_CAP_MAX as f64),
         }
     }
 }
@@ -339,6 +345,7 @@ pub struct SettingsView {
     num_line_threshold: Entity<InputState>,
     num_char_threshold: Entity<InputState>,
     num_tray_max: Entity<InputState>,
+    num_orchestrator_cap: Entity<InputState>,
 
     // ── 文本行(草稿态)──
     txt_remote_paste_dir: Entity<InputState>,
@@ -539,6 +546,12 @@ impl SettingsView {
             NumField::TrayMax,
             config.tray_max_projects.unwrap_or(5) as f64,
         );
+        let num_orchestrator_cap = num(
+            cx,
+            window,
+            NumField::OrchestratorCap,
+            crate::orchestrator::resolve_session_cap(config.orchestrator_session_cap) as f64,
+        );
 
         let txt_remote_paste_dir = cx.new(|cx| {
             InputState::new(window, cx)
@@ -579,6 +592,7 @@ impl SettingsView {
             num_line_threshold,
             num_char_threshold,
             num_tray_max,
+            num_orchestrator_cap,
             txt_remote_paste_dir,
             txt_ui_font,
             txt_terminal_font,
@@ -615,6 +629,10 @@ impl SettingsView {
             (this.num_line_threshold.clone(), NumField::LineThreshold),
             (this.num_char_threshold.clone(), NumField::CharThreshold),
             (this.num_tray_max.clone(), NumField::TrayMax),
+            (
+                this.num_orchestrator_cap.clone(),
+                NumField::OrchestratorCap,
+            ),
         ];
         for (entity, field) in numeric {
             this._subs.push(cx.subscribe_in(
@@ -679,6 +697,8 @@ impl SettingsView {
                 store.patch_config(|c| c.long_paste_char_threshold = next as u32, cx)
             }
             NumField::TrayMax => store.patch_config(|c| c.tray_max_projects = Some(next as u32), cx),
+            // 有额外副作用(推给控制面),所以走自己的 setter 而不是 patch_config
+            NumField::OrchestratorCap => store.set_orchestrator_session_cap(next as u32, cx),
         });
     }
 
@@ -690,6 +710,9 @@ impl SettingsView {
             NumField::LineThreshold => config.long_paste_line_threshold as f64,
             NumField::CharThreshold => config.long_paste_char_threshold as f64,
             NumField::TrayMax => config.tray_max_projects.unwrap_or(5) as f64,
+            NumField::OrchestratorCap => {
+                crate::orchestrator::resolve_session_cap(config.orchestrator_session_cap) as f64
+            }
         }
     }
 
@@ -958,6 +981,29 @@ mod tests {
             Some(MAX_SCROLLBACK as f64)
         );
         assert_eq!(normalize_number(NumField::Scrollback, "nan"), None);
+    }
+
+    /// 受编排会话并发上限:**下界是 0 而不是 1**(0 = 暂停一切新的受编排会话),
+    /// 上界钳到 [`crate::orchestrator::SESSION_CAP_MAX`],负数/非数字回落已保存值。
+    #[test]
+    fn 受编排会话上限归一() {
+        let max = crate::orchestrator::SESSION_CAP_MAX as f64;
+        assert_eq!(
+            normalize_number(NumField::OrchestratorCap, "0"),
+            Some(0.0),
+            "0 是合法值:总闸,不许当非法输入回落"
+        );
+        assert_eq!(normalize_number(NumField::OrchestratorCap, "5"), Some(5.0));
+        assert_eq!(
+            normalize_number(NumField::OrchestratorCap, "999"),
+            Some(max)
+        );
+        assert_eq!(normalize_number(NumField::OrchestratorCap, "-1"), None);
+        assert_eq!(normalize_number(NumField::OrchestratorCap, "abc"), None);
+        assert_eq!(normalize_number(NumField::OrchestratorCap, ""), None);
+        // 整数项:小数截尾,回显不带小数点
+        assert_eq!(normalize_number(NumField::OrchestratorCap, "2.9"), Some(2.0));
+        assert_eq!(number_text(NumField::OrchestratorCap, 5.0), "5");
     }
 
     /// 数字回显:整数不带小数点,浮点保留必要的小数。

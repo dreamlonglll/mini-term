@@ -139,6 +139,10 @@ export const settings = {
       collapseSnippet: "收起配置片段",
       showSnippet: "查看配置片段（手动粘贴）",
       footer: "注册后所选 CLI 会在事件发生时通知 Mini-Term · 三家的配置文件互不相干，可单独装/卸 · 未注册时自动使用进程轮询检测",
+      orchestrationTitle: "编排",
+      sessionCapTitle: "受编排会话并发上限",
+      sessionCapDesc: "一个编排者同时最多能有几个受编排会话在跑（0~20）。0 = 暂停新的受编排会话；调低不会关掉已经在跑的，只影响之后的启动请求",
+      orchestrationFooter: "编排能力逐条开在 AI 启动器上（「移动端」面板里的「允许编排」）· 控制通道就走上面这个 Hook 服务器，它没启动时编排命令一律连不上 · 超出上限的启动请求会收到明确错误，由编排者自己排队",
     },
     aiNotification: {
       method: "通知方式",
@@ -369,6 +373,10 @@ export const settings = {
       collapseSnippet: "Collapse config snippet",
       showSnippet: "View config snippet (manual paste)",
       footer: "Once registered, the selected CLIs notify Mini-Term when events occur · The three config files are independent, so each can be installed or removed on its own · Falls back to process polling when not registered",
+      orchestrationTitle: "Orchestration",
+      sessionCapTitle: "Concurrent orchestrated sessions",
+      sessionCapDesc: "How many orchestrated sessions one orchestrator may keep running at the same time (0-20). 0 pauses new orchestrated sessions; lowering it never closes sessions already running, it only applies to later start requests",
+      orchestrationFooter: "Orchestration is granted per AI launcher (the Allow orchestration switch in the Mobile panel) · The control channel rides the hook server above, so orchestration commands cannot connect while it is stopped · Start requests beyond the limit get an explicit error, leaving the orchestrator to queue them itself",
     },
     aiNotification: {
       method: "Notification method",
