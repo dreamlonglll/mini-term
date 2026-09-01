@@ -187,6 +187,11 @@ impl ProjectState {
             .find_map(|p| p.layout.pane_mut(pane_id))
     }
 
+    /// 按 PTY 编号找(跨全部面板)。
+    pub fn pane_by_pty(&self, pty_id: u32) -> Option<&PaneState> {
+        self.layouts().find_map(|l| l.pane_by_pty(pty_id))
+    }
+
     pub fn pane_by_pty_mut(&mut self, pty_id: u32) -> Option<&mut PaneState> {
         self.panels
             .iter_mut()

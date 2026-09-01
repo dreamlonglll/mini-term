@@ -116,6 +116,20 @@ impl AiBridge {
         self.perception.control().grant(pane_id, project_id)
     }
 
+    /// 受编排会话的出身快照(pty 编号 → 谁起的 / 那个人还在不在)。
+    ///
+    /// tab 上那枚「受编排」标识读它。**别每帧调** —— 记账在控制面那把锁后面,
+    /// 而那把锁 hook / 控制 HTTP 线程也在用;渲染侧按
+    /// [`Self::session_origins_version`] 缓存,号没变就不必取。
+    pub fn session_origins(&self) -> std::collections::HashMap<u32, mt_ai::SessionOrigin> {
+        self.perception.control().origins()
+    }
+
+    /// 出身记账的版本号。**先读它、再取快照**(顺序理由见 `mt_ai` 那侧的注释)。
+    pub fn session_origins_version(&self) -> u64 {
+        self.perception.control().origins_version()
+    }
+
     /// 把当前配置刷进编排控制面的镜像。
     ///
     /// 控制面在 hook 那条 HTTP 线程上跑,碰不得 gpui 实体,只能读这份镜像;

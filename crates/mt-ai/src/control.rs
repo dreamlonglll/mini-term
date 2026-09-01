@@ -39,11 +39,25 @@
 //!
 //! 「可见与可驱动范围仅限编排者自己启动的会话」（ADR 0003）这条铁律的事实底座
 //! 是记账表 `TokenRegistry::sessions` —— 不在表里的 pane，对编排者而言就是不
-//! 存在。它与令牌**同锁**：编排者 pane 一撤销令牌，名下记账一并作废（乐手照常
-//! 活着 —— 不陪葬；编排者 pane 重开是新身份，MVP 不做收养）。
+//! 存在。它与令牌**同锁**：编排者 pane 一撤销令牌，名下记账一并**降级**（乐手
+//! 照常活着 —— 不陪葬；编排者 pane 重开是新身份，MVP 不做收养）。
 //!
 //! 名额与死活一律**现查**（[`OrchestratorActions::pane_liveness`]），不靠事件
 //! 驱动记账：漏收一次「乐手退出」的事件不该永久占住一个名额。
+//!
+//! # 「编排者已离场」：出身留着，可达性收走（工单 04）
+//!
+//! 记账同时是**桌面 tab 上那枚出身标识**的事实来源（[`ControlPlane::origins`]）。
+//! 于是编排者退场时不能把名下记账整体删掉 —— 删了「编排者已离场」就无从显示。
+//! 改成留下记账、置一个 [`OrchestratedSession::orchestrator_departed`] 位：
+//!
+//! - **可达性立刻收走**：`belongs_to` 一律答否，`list-panes` / `resolve_target` /
+//!   名额三处同时失效。原编排者的令牌已经撤了，本来就没人认证得成它；那个位是
+//!   为「同一编号上又拿到一次授予」准备的 —— 前世的乐手不许被今生认领。
+//! - **展示保留**：`origins` 照出这一条，桌面把标识降级成「编排者已离场」。
+//! - **回收有主**：已离场记账只可能对着**还活着的**乐手 pane（已关的那些在退场
+//!   那一刻就回收了），等乐手自己关掉时那次 `revoke_pane` 一并清掉。
+//!   于是它不是一条只涨不消的表。
 //!
 //! # 记账契约：乐手一落地就记账，**再谈回执送不送得到**
 //!
@@ -67,7 +81,7 @@
 //! 独立线程跑完并响应。
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -203,10 +217,13 @@ struct SessionDraft {
 }
 
 impl SessionDraft {
-    fn landed(self, pane_id: u32) -> OrchestratedSession {
+    fn landed(self, pane_id: u32, orchestrator_label: &str) -> OrchestratedSession {
         OrchestratedSession {
             pane_id,
             orchestrator_pane_id: self.orchestrator_pane_id,
+            orchestrator_label: orchestrator_label.to_string(),
+            // 刚落地的乐手，编排者当然还在（它正等着这一趟回执）。
+            orchestrator_departed: false,
             project_id: self.project_id,
             project_name: self.project_name,
             launcher_id: self.launcher_id,
@@ -252,8 +269,13 @@ impl StartSessionSpec {
     ///
     /// ⚠️ 命令**没有**交到活着的 PTY 手上时别调它：那儿只是一个裸终端，不是受
     /// 编排会话；登记了反而会让它以「AI 会话状态不可知」永久占着一个名额。
-    pub fn landed(self, pane_id: u32) -> StartedSession {
-        let session = self.draft.landed(pane_id);
+    ///
+    /// `orchestrator_label` 是编排者 pane 此刻的 tab 标题，由桌面侧查出来交进来
+    /// —— 控制面自己认不出（它不认识布局树），而这一份得**抄下来**：编排者离场
+    /// 之后那个 pane 就没了，「编排者已离场（某某）」这句话只能靠落地时的快照。
+    /// 查不到就传空串。
+    pub fn landed(self, pane_id: u32, orchestrator_label: &str) -> StartedSession {
+        let session = self.draft.landed(pane_id, orchestrator_label);
         self.plane.register_landed(session.clone());
         StartedSession { session }
     }
@@ -380,18 +402,55 @@ impl OrchestratorActions for NoopOrchestratorActions {
 ///
 /// 「谁 spawn 了谁」由控制服务持有（ADR 0003）—— 桌面侧的 pane 上**不打**这个
 /// 标记，因为「受编排会话出身不构成状态」：编排者退场了乐手照常活着，只是没人
-/// 再够得到它。
+/// 再够得到它。桌面 tab 上那枚出身标识也读这张表（[`ControlPlane::origins`]），
+/// 不在 pane 上另存一份。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrchestratedSession {
     /// 乐手的 pane 身份（= PTY 编号）。
     pub pane_id: u32,
-    /// 起它的编排者 pane。可见范围的判据就是这一条。
+    /// 起它的编排者 pane。可见范围的判据就是这一条**加上**下面那个已离场位。
     pub orchestrator_pane_id: u32,
+    /// 编排者的展示名（桌面侧在乐手落地那一刻抄下来的 tab 标题）。
+    ///
+    /// **抄一份而不是回头现查**：编排者离场之后那个 pane 就没了，现查只会查到
+    /// 空 —— 而「编排者已离场」这句话恰恰要在那时候说出编排者是谁。空串 = 落地
+    /// 时就没认出来（正常路径下不该发生），展示侧自己兜一个「未知编排者」。
+    pub orchestrator_label: String,
+    /// 编排者已经离场了吗（pane 关闭 / 令牌撤销 / 在同一编号上重新授予）。
+    ///
+    /// 出身**保留、标识降级**（工单 04）：乐手照常活着，tab 上那枚标识从
+    /// 「由某某启动」变成「编排者已离场」。一旦置位就再也不会翻回来 ——
+    /// MVP 不做收养，编排者 pane 重开是新身份，够不到前世起的会话。
+    pub orchestrator_departed: bool,
     pub project_id: String,
     pub project_name: String,
     pub launcher_id: String,
     /// 启动器展示名。**不是命令文本** —— 那东西一个字都不出控制面。
     pub launcher_name: String,
+}
+
+impl OrchestratedSession {
+    /// 这条记账归不归**此刻这个**编排者。
+    ///
+    /// 两问缺一不可：pane 编号对得上，**且编排者没离场过**。只比编号的话，
+    /// 一个离场之后又在同一编号上拿到授予的编排者会把前世的乐手认领回去
+    /// —— ADR 0003 明说 MVP 不做收养。PTY 编号单调递增，正常路径上碰不到这一档，
+    /// 但「同一 pane 重复授予」（`ControlPlane::grant`）那条路做得到。
+    fn belongs_to(&self, orchestrator_pane_id: u32) -> bool {
+        self.orchestrator_pane_id == orchestrator_pane_id && !self.orchestrator_departed
+    }
+}
+
+/// 一个 pane 的「受编排」出身，给桌面 tab 上那枚标识用。
+///
+/// **不是 [`OrchestratedSession`] 的克隆**：tab 每帧都画，展示只需要两样东西
+/// （谁起的、那个人还在不在），项目/启动器那几样是给编排者看的，不进渲染路径。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionOrigin {
+    /// 起它的编排者的展示名；空串 = 落地时没认出来。
+    pub orchestrator_label: String,
+    /// `true` → 标识降级成「编排者已离场」。
+    pub orchestrator_departed: bool,
 }
 
 // ─── 令牌与授予 ───────────────────────────────────────────────
@@ -497,6 +556,9 @@ struct Inner {
     /// 并发上限。用原子量而不是再加一把锁:多一把锁就多一组与 `registry`
     /// 交叉持有的可能。
     session_cap: AtomicUsize,
+    /// 记账版本号，见 [`ControlPlane::origins_version`]。同样是原子量、同样的
+    /// 理由 —— 渲染路径每帧都读它，绝不能让它多长一把锁出来。
+    origins_version: AtomicU64,
 }
 
 impl Default for Inner {
@@ -506,6 +568,7 @@ impl Default for Inner {
             actions: Mutex::new(None),
             registry: Mutex::new(TokenRegistry::default()),
             session_cap: AtomicUsize::new(DEFAULT_SESSION_CAP),
+            origins_version: AtomicU64::new(0),
         }
     }
 }
@@ -528,15 +591,45 @@ struct TokenRegistry {
 }
 
 impl TokenRegistry {
+    /// 编排者退场：名下**活着的**乐手记账标记成「已离场」，已经关掉的就地回收。
+    ///
+    /// 为什么留着活的：tab 上那枚出身标识要降级成「编排者已离场」（工单 04），
+    /// 记账一抹这句话就无从说起 —— 而 ADR 0003 明说编排者退出不连坐乐手。
+    ///
+    /// 为什么已关的要丢：那条记账既没有 tab 可标（pane 都没了），也没有编排者
+    /// 读得到（下面那个 [`OrchestratedSession::belongs_to`] 一律答否），留着就是
+    /// 一条**永不回收**的泄漏 —— 修剪只在 [`Self::trim`] 也就是登记新乐手那一刻
+    /// 跑，而已离场的编排者再也不会登记新乐手了。
+    ///
+    /// 剩下的那些「已离场 + 乐手还活着」的记账由谁回收：乐手自己关掉时那次
+    /// `revoke_pane`（见 [`ControlPlane::revoke_pane`]）。于是已离场记账的条数
+    /// 恒不超过桌面上还活着的受编排 pane 数，不是一条只涨不消的表。
+    fn depart(&mut self, orchestrator_pane_id: u32) {
+        let closed = &mut self.closed;
+        self.sessions.retain(|_, s| {
+            if !s.belongs_to(orchestrator_pane_id) {
+                return true;
+            }
+            if closed.remove(&s.pane_id) {
+                return false;
+            }
+            s.orchestrator_departed = true;
+            true
+        });
+    }
+
     /// 记账超出上限时，**只丢已经关掉的、从最旧的丢起**。
     ///
     /// PTY 编号单调递增，所以按 pane_id 升序就是起的先后序。活着的一条都不丢：
     /// 丢掉一条活着的记账 = 桌面上多一个谁也够不到的幽灵乐手。
+    ///
+    /// 只数**当前身份**名下的（`belongs_to`）：已离场编排者留下的那些记账既不
+    /// 占名额也进不了 `list-panes`，凭什么把新身份的额度吃掉。
     fn trim(&mut self, orchestrator_pane_id: u32) {
         let mut mine: Vec<u32> = self
             .sessions
             .values()
-            .filter(|s| s.orchestrator_pane_id == orchestrator_pane_id)
+            .filter(|s| s.belongs_to(orchestrator_pane_id))
             .map(|s| s.pane_id)
             .collect();
         let Some(mut over) = mine.len().checked_sub(MAX_SESSIONS_PER_ORCHESTRATOR) else {
@@ -583,67 +676,132 @@ impl ControlPlane {
     }
 
     /// 授予一枚编排令牌：随机生成、每 pane 一枚，同一 pane 重复授予顶掉旧的。
+    ///
+    /// **重复授予 = 新身份**：同一个 pane 编号上再来一次（PTY 重开 / SSH 重连）
+    /// 时，前一次授予名下的乐手一律转「已离场」—— 与 [`Self::revoke_pane`] 同一句
+    /// 话，MVP 不做收养。少了这一步，前世的乐手会被今生认领回去。
     pub fn grant(&self, pane_id: u32, project_id: &str) -> String {
         let token = new_token();
-        let mut registry = self.inner.registry.lock();
-        if let Some(old) = registry.tokens.insert(pane_id, token.clone()) {
-            registry.grants.remove(&old);
+        {
+            let mut guard = self.inner.registry.lock();
+            let registry = &mut *guard;
+            if let Some(old) = registry.tokens.insert(pane_id, token.clone()) {
+                registry.grants.remove(&old);
+            }
+            registry.depart(pane_id);
+            registry.grants.insert(
+                token.clone(),
+                Grant {
+                    pane_id,
+                    project_id: project_id.to_string(),
+                },
+            );
         }
-        registry.grants.insert(
-            token.clone(),
-            Grant {
-                pane_id,
-                project_id: project_id.to_string(),
-            },
-        );
+        self.bump_origins();
         token
     }
 
-    /// pane 关闭 / 重开 PTY：撤销它手上的令牌，并作废它名下的范围记账。
+    /// pane 关闭 / 重开 PTY：撤销它手上的令牌，并把它名下的范围记账**降级**。
     ///
     /// **不杀乐手**（ADR 0003：乐手 pane 里可能躺着改到一半的代码，大脑崩了不该
     /// 烧现场）；只是从此没人够得到它们了 —— 编排者 pane 重开是新身份，
     /// MVP 不做收养。
     ///
-    /// 乐手自己的 pane 关闭时也会走到这里（`AiPerception::pane_closed` 对每个
-    /// pane 都调），那次 `retain` 什么也不匹配：**乐手的记账刻意留着**，
-    /// 好让 `list-panes` 与目标解析答得出「你起的那个已经关了」，而不是
-    /// 一句无从下手的「不存在」。名额不受影响 —— 它是现查存活的。
-    /// 那一次只在 `closed` 里记一笔，供[记账修剪](MAX_SESSIONS_PER_ORCHESTRATOR)
-    /// 挑「可以丢的那些」。
+    /// 两路各走各的：
+    ///
+    /// - **编排者那一路**（[`TokenRegistry::depart`]）：名下活着的乐手记账**留着**，
+    ///   只标一个「已离场」位 —— 桌面 tab 上那枚出身标识据此从「由某某启动」
+    ///   降级成「编排者已离场」（工单 04）。已经关掉的那些就地回收。
+    ///   工单 03 那一版是整体删除，出身信息随之消失，标识就无从显示了。
+    /// - **乐手那一路**：记账同样留着，只在 `closed` 里记一笔，好让 `list-panes`
+    ///   与目标解析答得出「你起的那个已经关了」，而不是一句无从下手的「不存在」；
+    ///   那一笔同时是[记账修剪](MAX_SESSIONS_PER_ORCHESTRATOR)挑「可以丢的那些」
+    ///   的依据。**例外**：它的编排者已经离场了 —— 那条记账从此既没有 tab 可标
+    ///   也没有编排者读得到，就地回收，免得成一条永不过期的泄漏。
+    ///
+    /// 名额一律不受影响 —— 它是现查存活的。
     pub fn revoke_pane(&self, pane_id: u32) {
-        let mut guard = self.inner.registry.lock();
-        // 先 deref 出来:`MutexGuard` 上的字段访问会整体借走 guard,
-        // `sessions` 与 `closed` 那两笔改动就没法同时成立。
-        let registry = &mut *guard;
-        if let Some(token) = registry.tokens.remove(&pane_id) {
-            registry.grants.remove(&token);
-        }
-        // 乐手那一路：记账留着，只标记「关了」
-        if registry.sessions.contains_key(&pane_id) {
-            registry.closed.insert(pane_id);
-        }
-        // 编排者那一路：名下记账整体作废，`closed` 里的残留一并清掉
-        let closed = &mut registry.closed;
-        registry.sessions.retain(|_, s| {
-            if s.orchestrator_pane_id == pane_id {
-                closed.remove(&s.pane_id);
-                return false;
+        {
+            let mut guard = self.inner.registry.lock();
+            // 先 deref 出来:`MutexGuard` 上的字段访问会整体借走 guard,
+            // `sessions` 与 `closed` 那两笔改动就没法同时成立。
+            let registry = &mut *guard;
+            if let Some(token) = registry.tokens.remove(&pane_id) {
+                registry.grants.remove(&token);
             }
-            true
-        });
+            // 乐手那一路
+            match registry.sessions.get(&pane_id) {
+                Some(s) if s.orchestrator_departed => {
+                    registry.sessions.remove(&pane_id);
+                    registry.closed.remove(&pane_id);
+                }
+                Some(_) => {
+                    registry.closed.insert(pane_id);
+                }
+                None => {}
+            }
+            // 编排者那一路
+            registry.depart(pane_id);
+        }
+        self.bump_origins();
     }
 
     /// 记下「这个乐手落地了」。**唯一的写入点**，由 [`StartSessionSpec::landed`]
     /// 在动作实现拿到 pane 身份的那一刻调 —— 早于任何回执（见模块注释）。
     fn register_landed(&self, session: OrchestratedSession) {
-        let mut registry = self.inner.registry.lock();
-        let orchestrator = session.orchestrator_pane_id;
-        // PTY 编号单调递增，编号复用理论上不会发生；真撞上也别让新乐手继承
-        // 前一条的「已关」标记。
-        registry.closed.remove(&session.pane_id);
-        registry.sessions.insert(session.pane_id, session);
-        registry.trim(orchestrator);
+        {
+            let mut registry = self.inner.registry.lock();
+            let orchestrator = session.orchestrator_pane_id;
+            // PTY 编号单调递增，编号复用理论上不会发生；真撞上也别让新乐手继承
+            // 前一条的「已关」标记。
+            registry.closed.remove(&session.pane_id);
+            registry.sessions.insert(session.pane_id, session);
+            registry.trim(orchestrator);
+        }
+        self.bump_origins();
+    }
+
+    // ─── 出身快照（桌面 tab 上那枚标识）───────────────────────
+
+    /// 记账版本号：`sessions` 每变一次就 +1。
+    ///
+    /// **给渲染路径用**：tab 每帧都画，而记账住在 `registry` 那把锁后面
+    /// （hook / 控制 HTTP 线程也在用它）。渲染侧照 `layout_snapshot` 的老规矩
+    /// 缓存一份 [`Self::origins`]，号没变就只花一次原子读。
+    ///
+    /// ⚠️ 用法有顺序要求：**先读号、再取快照**。反过来（先取快照再读号）会把
+    /// 一份旧快照配上新号存住，之后再也刷不掉。按正序则最坏是多刷一次。
+    pub fn origins_version(&self) -> u64 {
+        self.inner.origins_version.load(Ordering::Acquire)
+    }
+
+    /// 全部受编排会话的出身：pane 编号 → [`SessionOrigin`]。
+    ///
+    /// **含已离场编排者名下的**（那正是要显示「编排者已离场」的那些），
+    /// 也含已经关掉的乐手（tab 都没了，查不到就是不画，无害）。
+    /// 按 [`Self::origins_version`] 缓存着用，别每帧调。
+    pub fn origins(&self) -> HashMap<u32, SessionOrigin> {
+        self.inner
+            .registry
+            .lock()
+            .sessions
+            .values()
+            .map(|s| {
+                (
+                    s.pane_id,
+                    SessionOrigin {
+                        orchestrator_label: s.orchestrator_label.clone(),
+                        orchestrator_departed: s.orchestrator_departed,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// 记账变了。**必须在放掉 `registry` 锁之后调** —— 见 [`Self::origins_version`]
+    /// 的顺序要求。
+    fn bump_origins(&self) {
+        self.inner.origins_version.fetch_add(1, Ordering::Release);
     }
 
     /// 该 pane 当前是否持有编排能力（UI 标识与工单 03 的裁决用）。
@@ -705,12 +863,15 @@ impl ControlPlane {
 
     /// 某个编排者名下的乐手，**按 pane 编号升序**（= 起的先后序，PTY 编号单调
     /// 递增）。顺序稳定是给编排者看的：反复 `list-panes` 顺序跳来跳去很难读。
+    ///
+    /// 已离场那一批不在其中（[`OrchestratedSession::belongs_to`]）：那是前世的
+    /// 身份留下的记账，只用来在 tab 上画「编排者已离场」。
     fn sessions_of(&self, orchestrator_pane_id: u32) -> Vec<OrchestratedSession> {
         let registry = self.inner.registry.lock();
         let mut list: Vec<OrchestratedSession> = registry
             .sessions
             .values()
-            .filter(|s| s.orchestrator_pane_id == orchestrator_pane_id)
+            .filter(|s| s.belongs_to(orchestrator_pane_id))
             .cloned()
             .collect();
         list.sort_by_key(|s| s.pane_id);
@@ -721,12 +882,15 @@ impl ControlPlane {
     ///
     /// 数名额只要 id，`sessions_of` 那条会把每条记账的六个 `String` 都克隆一遍
     /// （历史全部乐手 × 每次 `start-session`），白花。
+    ///
+    /// 同样跳过已离场那一批：**已离场编排者留下的记账不占任何人的名额**
+    /// （它们既进不了 `list-panes`，也不该让新身份少起一个）。
     fn session_ids_of(&self, orchestrator_pane_id: u32) -> Vec<u32> {
         let registry = self.inner.registry.lock();
         let mut ids: Vec<u32> = registry
             .sessions
             .values()
-            .filter(|s| s.orchestrator_pane_id == orchestrator_pane_id)
+            .filter(|s| s.belongs_to(orchestrator_pane_id))
             .map(|s| s.pane_id)
             .collect();
         ids.sort_unstable();
@@ -753,9 +917,12 @@ impl ControlPlane {
     ///
     /// - 目标是编排者自己 → [`ControlError::SelfTarget`]（自指禁令，ADR 0003）。
     ///   自己的身份本来就钉在它的环境变量里，给专门的码是让它能自我纠正。
-    /// - 目标不在自己的记账里（别人的乐手 / 用户亲手开的会话 / 编造的编号）
-    ///   → 一律 [`ControlError::PaneNotFound`]。**不区分**「不存在」与「存在但
-    ///   不归你」—— 区分开来就是一台探测桌面上有哪些 pane 的扫描器。
+    /// - 目标不在自己的记账里（别人的乐手 / 用户亲手开的会话 / 编造的编号 /
+    ///   **前世那个身份起的乐手**）→ 一律 [`ControlError::PaneNotFound`]。
+    ///   **不区分**「不存在」与「存在但不归你」—— 区分开来就是一台探测桌面上有
+    ///   哪些 pane 的扫描器。已离场那一档由 [`OrchestratedSession::belongs_to`]
+    ///   挡掉：那个编排者的令牌早撤了，谁也认证不成它；万一同一编号又拿到授予，
+    ///   已离场位保证它还是够不着（MVP 不做收养）。
     /// - 是自己的乐手、但 pane 已经关了 → [`ControlError::PaneGone`]。这条**可以**
     ///   说：那是它自己起的东西，告诉它「关了」比「不存在」有用得多。
     // 本票只落地并测试这个函数，命令留给 05/06/07（`target_pane_id` 的解析器
@@ -775,7 +942,7 @@ impl ControlPlane {
             registry
                 .sessions
                 .get(&target_pane_id)
-                .filter(|s| s.orchestrator_pane_id == grant.pane_id)
+                .filter(|s| s.belongs_to(grant.pane_id))
                 .cloned()
         };
         let session = session.ok_or(ControlError::PaneNotFound)?;
@@ -1391,8 +1558,9 @@ mod tests {
             };
             // 刚起的乐手：命令已经敲进去了，输入检测那一刻就把它认成 AI 会话
             self.live(pane_id, "ai-idle");
-            // 与真桌面同一条契约：先记账（`landed`），再谈回执
-            Ok(spec.landed(pane_id))
+            // 与真桌面同一条契约：先记账（`landed`），再谈回执。编排者的 tab
+            // 标题由桌面侧查出来带进来，这里给一个固定的假名。
+            Ok(spec.landed(pane_id, "大脑"))
         }
 
         fn pane_liveness(&self, pane_id: u32) -> PaneLiveness {
@@ -2079,7 +2247,7 @@ mod tests {
 
         impl OrchestratorActions for DropsReply {
             fn start_session(&self, spec: StartSessionSpec) -> Result<StartedSession, StartFailure> {
-                let started = spec.landed(202);
+                let started = spec.landed(202, "大脑");
                 drop(started); // 回执没送到
                 Err(StartFailure::DesktopBusy)
             }
@@ -2195,10 +2363,10 @@ mod tests {
         assert!(plane.resolve_target(&me, mine).is_ok());
     }
 
-    /// 编排者 pane 一撤销令牌，名下记账就作废（**不杀乐手**）——
+    /// 编排者 pane 一撤销令牌，名下记账就**够不到**了（**不杀乐手**）——
     /// pane 重开是新身份，够不到前世起的会话。
     #[test]
-    fn 编排者撤销后记账作废但乐手照活() {
+    fn 编排者撤销后记账够不到但乐手照活() {
         let (plane, _host, actions, port, token) = granted();
         let (_s, v) = start(port, &token, r#""launcherId":"claude""#);
         let musician = v["data"]["pane"]["paneId"].as_u64().unwrap() as u32;
@@ -2247,6 +2415,216 @@ mod tests {
         assert_eq!(plane.resolve_target(&me, musician), Err(ControlError::PaneGone));
     }
 
+    // ─── 「编排者已离场」（工单 04）─────────────────────────────
+
+    /// 出身**留着、标识降级**：编排者退场后 `origins` 里那一条还在，
+    /// 只是 `orchestrator_departed` 置了位 —— tab 上那枚标识据此换文案。
+    ///
+    /// 这是工单 04 的核心：工单 03 那一版在这里把记账整体删了，出身信息随之
+    /// 消失，「编排者已离场」就无从显示。
+    #[test]
+    fn 编排者离场后出身留着并标记已离场() {
+        let (plane, _host, actions, port, token) = granted();
+        let (_s, v) = start(port, &token, r#""launcherId":"claude""#);
+        let musician = v["data"]["pane"]["paneId"].as_u64().unwrap() as u32;
+
+        let before = plane.origins();
+        let origin = before.get(&musician).expect("刚起的乐手就该有出身");
+        assert_eq!(origin.orchestrator_label, "大脑", "编排者是谁得记下来");
+        assert!(!origin.orchestrator_departed);
+
+        plane.revoke_pane(7);
+
+        assert!(
+            actions.pane_liveness(musician).alive,
+            "编排者退场不许连坐乐手"
+        );
+        let after = plane.origins();
+        let origin = after.get(&musician).expect("出身不许随编排者一起消失");
+        assert!(origin.orchestrator_departed, "标识该降级成「编排者已离场」");
+        assert_eq!(
+            origin.orchestrator_label, "大脑",
+            "离场之后更要说得出是谁 —— 那个 pane 已经没了，现查查不到"
+        );
+    }
+
+    /// **已离场编排者的前世乐手不许被任何人驱动**。
+    ///
+    /// 三条路各堵一次：原编排者的令牌已撤（认证不成）、同一编号上重新授予的
+    /// 新身份（MVP 不做收养）、别的编排者（可见范围铁律）。
+    #[test]
+    fn 已离场编排者的乐手谁也够不到() {
+        let (plane, _host, _actions, port, token) = granted();
+        let (_s, v) = start(port, &token, r#""launcherId":"claude""#);
+        let musician = v["data"]["pane"]["paneId"].as_u64().unwrap() as u32;
+
+        plane.revoke_pane(7);
+
+        // ① 原令牌当场失效 —— 没人能再以 pane 7 的身份说话
+        let (status, _body) = post(port, "/control/list-panes", &payload_of(&token, ""));
+        assert_eq!(status, 401, "撤销后原令牌必须立刻不认");
+
+        // ② 同一编号上重新授予 = 新身份，前世的乐手对它就是「不存在」
+        let reborn = plane.grant(7, "p-self");
+        let (status, body) = post(port, "/control/list-panes", &payload_of(&reborn, ""));
+        assert_eq!(status, 200);
+        assert!(
+            json(&body)["data"]["panes"].as_array().unwrap().is_empty(),
+            "MVP 不做收养: {body}"
+        );
+        let me = Grant {
+            pane_id: 7,
+            project_id: "p-self".into(),
+        };
+        assert_eq!(
+            plane.resolve_target(&me, musician),
+            Err(ControlError::PaneNotFound)
+        );
+
+        // ③ 别的编排者一样够不到
+        let other = Grant {
+            pane_id: 9,
+            project_id: "p-self".into(),
+        };
+        assert_eq!(
+            plane.resolve_target(&other, musician),
+            Err(ControlError::PaneNotFound)
+        );
+
+        // 而它本人照常活着 —— 用户随时可以亲手接管
+        assert!(plane.origins().contains_key(&musician));
+    }
+
+    /// **已离场的记账不占任何人的名额**：重开的编排者拿到的是满额，
+    /// 别的编排者也不受牵连。
+    #[test]
+    fn 已离场的记账不占名额() {
+        let (plane, _host, _actions, port, token) = granted();
+        for i in 0..DEFAULT_SESSION_CAP {
+            let (status, v) = start(port, &token, r#""launcherId":"claude""#);
+            assert_eq!(status, 200, "第 {i} 个该起得来: {v}");
+        }
+        let (status, _v) = start(port, &token, r#""launcherId":"claude""#);
+        assert_eq!(status, 429, "第 6 个撞上限");
+
+        plane.revoke_pane(7);
+        let reborn = plane.grant(7, "p-self");
+        assert_eq!(
+            plane.live_session_count(7),
+            0,
+            "前世的乐手不该吃掉新身份的额度"
+        );
+        for i in 0..DEFAULT_SESSION_CAP {
+            let (status, v) = start(port, &reborn, r#""launcherId":"claude""#);
+            assert_eq!(status, 200, "新身份的第 {i} 个: {v}");
+        }
+    }
+
+    /// 已离场记账的**回收口径**：等它那个乐手 pane 自己关掉。
+    ///
+    /// 那一刻它既没有 tab 可标（pane 没了）也没有编排者读得到，留着就是一条
+    /// 永不过期的泄漏 —— 修剪只在登记新乐手时跑，而已离场的编排者不会再登记。
+    #[test]
+    fn 已离场编排者的乐手关掉后记账就地回收() {
+        let (plane, _host, actions, port, token) = granted();
+        let (_s, v) = start(port, &token, r#""launcherId":"claude""#);
+        let musician = v["data"]["pane"]["paneId"].as_u64().unwrap() as u32;
+
+        plane.revoke_pane(7);
+        assert!(plane.origins().contains_key(&musician), "乐手还活着，标识还要画");
+
+        actions.close(musician);
+        plane.revoke_pane(musician); // 乐手 pane 关闭走的就是这条
+        assert!(
+            !plane.origins().contains_key(&musician),
+            "编排者已离场 + 乐手也关了 = 这条记账再没人用得着"
+        );
+    }
+
+    /// 反过来的顺序：乐手先关、编排者后走 —— 那条已关记账在退场那一刻回收。
+    #[test]
+    fn 编排者离场时已关的乐手记账当场回收() {
+        let (plane, _host, actions, port, token) = granted();
+        let (_s, v) = start(port, &token, r#""launcherId":"claude""#);
+        let closed_one = v["data"]["pane"]["paneId"].as_u64().unwrap() as u32;
+        let (_s, v) = start(port, &token, r#""launcherId":"claude""#);
+        let live_one = v["data"]["pane"]["paneId"].as_u64().unwrap() as u32;
+
+        actions.close(closed_one);
+        plane.revoke_pane(closed_one);
+        plane.revoke_pane(7);
+
+        let origins = plane.origins();
+        assert!(!origins.contains_key(&closed_one), "已关的那条就地回收");
+        assert!(
+            origins[&live_one].orchestrator_departed,
+            "还活着的那条留下来标「编排者已离场」"
+        );
+    }
+
+    /// 同一 pane 编号上**重复授予**也是新身份（PTY 重开 / SSH 重连那条路）：
+    /// 前世的乐手一律转已离场，不许被认领回去。
+    #[test]
+    fn 重复授予即新身份前世乐手转已离场() {
+        let (plane, _host, _actions, port, token) = granted();
+        let (_s, v) = start(port, &token, r#""launcherId":"claude""#);
+        let musician = v["data"]["pane"]["paneId"].as_u64().unwrap() as u32;
+
+        // 没走 revoke，直接再授予一次
+        let reborn = plane.grant(7, "p-self");
+        assert!(
+            plane.origins()[&musician].orchestrator_departed,
+            "重复授予 = 新身份，前世的乐手该转已离场"
+        );
+        let (status, body) = post(port, "/control/list-panes", &payload_of(&reborn, ""));
+        assert_eq!(status, 200);
+        assert!(
+            json(&body)["data"]["panes"].as_array().unwrap().is_empty(),
+            "{body}"
+        );
+    }
+
+    /// 出身快照的版本号：记账每变一次就该动一下 —— 渲染侧靠它决定要不要重取。
+    #[test]
+    fn 出身版本号跟着记账变() {
+        let (plane, _host, actions, port, token) = granted();
+        let v0 = plane.origins_version();
+        let (_s, v) = start(port, &token, r#""launcherId":"claude""#);
+        let musician = v["data"]["pane"]["paneId"].as_u64().unwrap() as u32;
+        let v1 = plane.origins_version();
+        assert!(v1 > v0, "登记乐手要动号");
+
+        plane.revoke_pane(7);
+        let v2 = plane.origins_version();
+        assert!(v2 > v1, "编排者离场要动号 —— 标识得跟着降级");
+
+        actions.close(musician);
+        plane.revoke_pane(musician);
+        assert!(plane.origins_version() > v2, "回收也要动号");
+
+        // 纯读不动号:否则渲染侧每帧都要重取一次
+        let before = plane.origins_version();
+        let _ = plane.origins();
+        assert_eq!(plane.origins_version(), before);
+    }
+
+    /// 出身快照**只带展示要用的两样**，编排者那边的东西一个字不带过来。
+    #[test]
+    fn 出身快照不带项目与启动器细节() {
+        let (plane, _host, _actions, port, token) = granted();
+        let (_s, v) = start(port, &token, r#""launcherId":"claude""#);
+        let musician = v["data"]["pane"]["paneId"].as_u64().unwrap() as u32;
+
+        let origin = plane.origins().remove(&musician).unwrap();
+        assert_eq!(
+            origin,
+            SessionOrigin {
+                orchestrator_label: "大脑".into(),
+                orchestrator_departed: false,
+            }
+        );
+    }
+
     // ─── 记账修剪 ─────────────────────────────────────────────
 
     /// 直接往记账表里塞一条（绕开 HTTP 与并发上限，专测修剪口径）。
@@ -2254,6 +2632,8 @@ mod tests {
         plane.register_landed(OrchestratedSession {
             pane_id,
             orchestrator_pane_id: orchestrator,
+            orchestrator_label: "大脑".into(),
+            orchestrator_departed: false,
             project_id: "p-self".into(),
             project_name: "项目".into(),
             launcher_id: "claude".into(),
@@ -2323,6 +2703,30 @@ mod tests {
             record(&plane, 7, 100 + i);
         }
         assert_eq!(plane.session_ids_of(9), vec![50], "别人的记账一条不动");
+    }
+
+    /// 修剪只数**当前身份**名下的：前世留下的那些已离场记账既不占名额、
+    /// 也不该把新身份的 50 条额度吃掉。
+    #[test]
+    fn 修剪不数已离场的记账() {
+        let plane = ControlPlane::new();
+        for i in 0..MAX_SESSIONS_PER_ORCHESTRATOR as u32 {
+            record(&plane, 7, 100 + i);
+        }
+        // 编排者离场:这 50 条全转已离场(乐手都还活着,一条都不该丢)
+        plane.revoke_pane(7);
+        assert_eq!(plane.origins().len(), MAX_SESSIONS_PER_ORCHESTRATOR);
+        assert!(plane.session_ids_of(7).is_empty(), "新身份名下一条都没有");
+
+        // 新身份从零起算,50 条额度是它自己的
+        for i in 0..MAX_SESSIONS_PER_ORCHESTRATOR as u32 {
+            record(&plane, 7, 300 + i);
+        }
+        assert_eq!(
+            plane.session_ids_of(7).len(),
+            MAX_SESSIONS_PER_ORCHESTRATOR,
+            "前世那 50 条不许挤掉今生的"
+        );
     }
 
     // ─── 命令表 ───────────────────────────────────────────────
