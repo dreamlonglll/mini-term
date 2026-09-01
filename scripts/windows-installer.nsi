@@ -104,6 +104,10 @@ LangString MSG_UNINST_FAIL ${LANG_SIMPCHINESE} "旧版本没有卸载干净(卸�
   Pop $0
   nsExec::Exec 'taskkill /F /IM mt-ssh-mcp.exe'
   Pop $0
+  ; mt-agent-cli 是短命进程(编排者调一次跑一次),但升级时它恰好在跑就会锁住
+  ; 文件 —— 与 miniterm-hook 同一个理由,一并放倒。
+  nsExec::Exec 'taskkill /F /IM mt-agent-cli.exe'
+  Pop $0
 !macroend
 
 ; 跑旧版自己的卸载器。带 `_?=` 是关键:没有它,NSIS 卸载器会先把自己复制到
@@ -175,6 +179,7 @@ Section "Install"
   File "${SOURCE_DIR}\miniterm-hook.exe"
   File "${SOURCE_DIR}\mt-ssh-cli.exe"
   File "${SOURCE_DIR}\mt-ssh-mcp.exe"
+  File "${SOURCE_DIR}\mt-agent-cli.exe"
   SetOutPath "$INSTDIR\portable-conpty"
   File /r "${SOURCE_DIR}\portable-conpty\*"
   SetOutPath "$INSTDIR"
@@ -203,6 +208,7 @@ Section "Uninstall"
   Delete "$INSTDIR\miniterm-hook.exe"
   Delete "$INSTDIR\mt-ssh-cli.exe"
   Delete "$INSTDIR\mt-ssh-mcp.exe"
+  Delete "$INSTDIR\mt-agent-cli.exe"
   RMDir /r "$INSTDIR\portable-conpty"
   Delete "$INSTDIR\uninstall.exe"
   ; 只删空目录:用户自选目录里若有别的东西,不动。

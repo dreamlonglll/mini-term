@@ -14,7 +14,14 @@ edition = "2021"
 # **主仓**的根 Cargo.toml，那份 exclude 的相对路径对不上，于是报
 # 「current package believes it's in a workspace when it's not」而拒绝构建。
 # 有了这一行，无论 checkout 在哪都自成 workspace root。
+#
+# `members` 里那个 `agent-control` 是编排控制面的线上形状 + 响应解析器
+# （serde 两件套之外无依赖）。它单独成 crate 而不是塞进本包的 lib，是因为
+# **主仓的 mt-ai 要把它当 dev-dependency 引过去做跨工作区对账**
+# （「桌面 handler 的产出能被 sidecar 的解析器读懂」），而本包的 lib 挂着
+# russh / rmcp / tokio 那一串，拉进主仓的测试图里就是白等编译。
 [workspace]
+members = ["agent-control"]
 
 # lib target：ssh_service 业务编排共享层，mt-ssh-mcp 与 mt-ssh-cli 两个 bin
 # 都只做传输层、业务转调 lib（ssh-cli-skill spec §3）。
@@ -34,8 +41,17 @@ path = "src/bin/mt-ssh-mcp.rs"
 name = "mt-ssh-cli"
 path = "src/bin/mt-ssh-cli.rs"
 
+# 编排者的控制 CLI（ADR 0003 / 工单 02）。与另外三个一样随
+# scripts/stage-sidecars.mjs 就位到主程序 exe 同目录。
+[[bin]]
+name = "mt-agent-cli"
+path = "src/bin/mt-agent-cli.rs"
+
 [dependencies]
 mt-core = { path = "../crates/mt-core" }
+# 编排控制面的线上形状 + 响应解析器（mt-agent-cli 用）。单独成 crate 的理由见
+# 上面 `[workspace] members` 那段：主仓的 mt-ai 要跨工作区把它引去做对账。
+mt-agent-control = { path = "agent-control" }
 # SSH 持久会话池 + SFTP 传输原语(russh 0.61 + ring 后端、ssh-key/rsa 精确锁、
 # russh-sftp)。task 07-05-ssh-remote-projects PR1 抽到共享 crate mt-ssh,
 # 主程序与 sidecar 共用;russh 类型(如 ChannelMsg)经 `mt_ssh::russh` 再导出取用,

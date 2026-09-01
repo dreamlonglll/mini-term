@@ -4230,12 +4230,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "mt-agent-control"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "mt-ai"
 version = "1.2.2"
 dependencies = [
  "anyhow",
  "chrono",
  "dirs 6.0.0",
+ "mt-agent-control",
  "mt-core",
  "parking_lot",
  "regex",
@@ -4243,6 +4252,7 @@ dependencies = [
  "serde_json",
  "tiny_http",
  "toml_edit 0.22.27",
+ "uuid",
 ]
 
 [[package]]

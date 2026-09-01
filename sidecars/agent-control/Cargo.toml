@@ -1,0 +1,18 @@
+[package]
+name = "mt-agent-control"
+# 版本随 sidecars 工作区自成语义(不跟随主程序发版),见 ../Cargo.toml 的说明。
+version = "0.1.0"
+description = "mini-term orchestrator control-plane wire types and response parser (shared by mt-agent-cli and the desktop-side seam test)"
+edition = "2021"
+
+# ⚠️ 这里**不写** `[workspace]` —— 本 crate 是 `sidecars/` 那个工作区的成员
+# (由其 `members` 显式列出)。主仓根 Cargo.toml 的 `exclude = ["sidecars"]`
+# 把整棵子树排除在主工作区之外,主仓侧只以 path 依赖的形式引用它
+# (`mt-relay` 依赖 `relay-server/protocol` 是同一种跨工作区用法)。
+
+[dependencies]
+# 依赖表**只许有 serde/serde_json**:主仓的 mt-ai 把本 crate 当 dev-dependency
+# 引进来做「桌面 handler 的产出能被 sidecar 的解析器读懂」的对账,
+# 拉一棵大依赖树就等于给 `cargo test -p mt-ai` 加一份编译负担。
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
