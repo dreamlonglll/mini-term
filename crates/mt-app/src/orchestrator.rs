@@ -339,6 +339,13 @@ fn start_session(
         .iter()
         .find(|l| l.id == spec.launcher_id())
         .cloned();
+    // 编排者自己那个 pane 的 tab 标题:记账要抄一份,好在编排者离场之后还说得出
+    // 「是谁起的」(工单 04)。**必须在这儿查** —— 控制面不认识布局树,而离场之后
+    // 那个 pane 就没了,现查只会查到空。查不到就传空串,展示侧兜「未知编排者」。
+    let orchestrator_label = store
+        .read(cx)
+        .pane_label_by_pty(spec.orchestrator_pane_id())
+        .unwrap_or_default();
     // 控制面刚查过名单,到这儿还能没了只有一种可能:用户正巧把它删了。
     let Some(launcher) = launcher else {
         return Err(StartFailure::SpawnFailed);
@@ -382,7 +389,7 @@ fn start_session(
     // **先记账,再谈回执**:`landed` 把这条乐手写进控制面的范围记账,并且是
     // `StartedSession` 唯一的构造路径。发起侧就算已经超时走人,桌面上这个真实
     // 存在的受编排会话照样进 `list-panes`、照样占名额、照样能被点名。
-    Ok(spec.landed(pane_id))
+    Ok(spec.landed(pane_id, &orchestrator_label))
 }
 
 /// 「受编排会话」那份落地请求的**唯一**构造处。

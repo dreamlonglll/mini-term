@@ -31,6 +31,9 @@ export const paneGroup = {
     maximizePane: "最大化此区域（双击标签栏空白处）",
     restorePane: "还原分屏布局",
     collapsedHint: "点击铺满此区域",
+    orchestratedBy: "受编排会话 · 由「{orchestrator}」启动",
+    orchestratorDeparted: "受编排会话 · 编排者「{orchestrator}」已离场",
+    orchestratorAnonymous: "未知编排者",
   },
   en: {
     closeAiTitle: "Close AI Session",
@@ -64,5 +67,8 @@ export const paneGroup = {
     maximizePane: "Maximize this pane (double-click empty tab bar area)",
     restorePane: "Restore split layout",
     collapsedHint: "Click to maximize this pane",
+    orchestratedBy: "Orchestrated session · started by {orchestrator}",
+    orchestratorDeparted: "Orchestrated session · orchestrator {orchestrator} has left",
+    orchestratorAnonymous: "an unknown orchestrator",
   },
 } as const;

@@ -196,6 +196,19 @@ impl AppStore {
         pane.shell_name.clone()
     }
 
+    /// 按 **PTY 编号**跨项目找 pane 的显示名(与 tab 上看到的那个同一口径)。
+    ///
+    /// 跨项目是必须的:编排者可以在同分组的**别的**项目里起受编排会话
+    /// (ADR 0003 的可达范围),记「谁起的」时要拿的是编排者那一边的名字。
+    /// 找不到 → `None`(pane 已经关了 / 编号是编造的)。
+    pub fn pane_label_by_pty(&self, pty_id: u32) -> Option<String> {
+        self.project_states.iter().find_map(|(project_id, state)| {
+            state
+                .pane_by_pty(pty_id)
+                .map(|pane| self.pane_display_label(project_id, pane))
+        })
+    }
+
     /// 添加一个 SSH 远程项目并返回它的 id(`AddRemoteProjectModal.tsx::handleSave`
     /// 的落盘那一半 —— 远程路径的 `~` 展开与目录校验由调用方先跑
     /// [`crate::remote_ssh::validate_dir`],这里只接**已 canonicalize 的绝对路径**)。

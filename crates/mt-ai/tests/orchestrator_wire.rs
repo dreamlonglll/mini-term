@@ -78,7 +78,7 @@ impl OrchestratorActions for Actions {
         // pane 编号在真桌面上是 PTY 编号;这里给个稳定值好断言
         assert_eq!(spec.orchestrator_pane_id(), 7);
         // 记账先落地、再谈回执 —— `landed` 是造出 `StartedSession` 的唯一路径
-        Ok(spec.landed(101))
+        Ok(spec.landed(101, "大脑"))
     }
 
     fn pane_liveness(&self, _pane_id: u32) -> PaneLiveness {

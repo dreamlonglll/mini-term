@@ -38,6 +38,7 @@ use gpui::{
     Window, anchored, canvas, deferred, div, point, prelude::FluentBuilder, px,
 };
 use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel, v_resizable};
+use mt_ai::SessionOrigin;
 use mt_ui::tooltip::Tooltip;
 use mt_ui::icons::{AiVendor, BrandIcon, Geom, Ink, Shape, VectorIcon};
 
@@ -172,6 +173,14 @@ pub struct TerminalArea {
     /// 折中:与 store 里那棵**逐字段比**,真变了才拷一次,平时只递一次
     /// 引用计数。维护点只有 `render` 开头那一段。
     layout_snapshot: Option<std::rc::Rc<SplitNode>>,
+    /// 受编排会话的出身快照(pty 编号 → 谁起的 / 那个人还在不在),tab 上那枚
+    /// 「受编排」标识读它。**与 [`Self::layout_snapshot`] 同一条思路**:事实住在
+    /// 编排控制面的那把锁后面(hook / 控制 HTTP 线程也在用它),而 tab 每帧都画
+    /// —— 于是按版本号缓存,号没变的帧只花一次原子读。维护点只有
+    /// [`Self::sync_session_origins`]。
+    session_origins: HashMap<u32, SessionOrigin>,
+    /// 上一次取快照时的版本号。`None` = 还没取过。
+    session_origins_version: Option<u64>,
     /// 每个 split 节点一份分隔条状态(跨帧保留,否则每帧都重置回均分)。
     split_states: HashMap<String, Entity<ResizableState>>,
     /// 终端区自身的可用尺寸(canvas 量出来,用于把百分比换算成像素初值)。
@@ -470,8 +479,95 @@ const ICON_RESTORE: &[Shape] = &[
     ),
 ];
 
+/// 「受编排」出身标识(工单 04)。一条从上游拐下来的支线 + 箭头 ——
+/// 「这个会话是别人起的」。刻意不用文字:tab 最窄 110px,中文三个字挤掉标题,
+/// 英文 "Orchestrated" 更不用想;身份细节交给标识自己那条 tooltip。
+const ICON_ORCHESTRATED: &[Shape] = &[
+    Shape::line(
+        Ink::Current,
+        CTRL_STROKE,
+        Geom::Polyline(&[(cu(4.5), cu(2.5)), (cu(4.5), cu(10.5)), (cu(12.0), cu(10.5))]),
+    ),
+    Shape::line(
+        Ink::Current,
+        CTRL_STROKE,
+        Geom::Polyline(&[(cu(9.5), cu(8.0)), (cu(12.0), cu(10.5)), (cu(9.5), cu(13.0))]),
+    ),
+];
+
 /// 图标在 22×22 方钮里的边长(原版 SVG 是 13×13)。
 const CTRL_ICON: f32 = 13.0;
+
+/// 「受编排」标识的边长。与同排的 AI 品牌图标一样大 —— 它们是同一档信息
+/// (这个 tab 是什么),不该有一个抢戏。
+const ORIGIN_ICON: f32 = 12.0;
+
+/// 折叠条上一颗 tab 的展示数据。
+///
+/// 摘成 owned 是因为下面每个 tab 都要往 `move` 闭包里搬,借着 store 走不了;
+/// 具名结构体而不是六元组 —— 五元组时还读得过去,加上出身那一项就该给字段起
+/// 名字了。
+struct CollapsedTab {
+    pane_id: String,
+    label: String,
+    status: PaneStatus,
+    vendor: Option<AiVendor>,
+    unread: bool,
+    /// 受编排出身;`None` = 用户/移动端自己起的普通 pane。
+    origin: Option<SessionOrigin>,
+}
+
+/// tab 上那枚出身标识的 tooltip 文案。
+fn origin_tooltip(origin: &SessionOrigin) -> String {
+    origin_tooltip_in(mt_i18n::locale(), origin)
+}
+
+/// [`origin_tooltip`] 的指定语言版本。
+///
+/// 抽成不读全局语言的纯函数是为了能不起窗口单测三件事:编排者还在时说得出
+/// 是谁、离场之后换成「已离场」那一句、以及**两种语言都不许漏出「乐手 /
+/// musician」这个内部别名**(`CONTEXT.md` 的术语纪律:用户可见面一律写
+/// 「受编排会话 / orchestrated session」)。全局语言是进程级可变状态,
+/// 拿它写断言会与同进程里别的测试打架。
+fn origin_tooltip_in(locale: mt_i18n::Locale, origin: &SessionOrigin) -> String {
+    let who = if origin.orchestrator_label.trim().is_empty() {
+        // 落地那一刻没查到编排者 pane(正常路径下不该发生)。拼半截话比
+        // 说一句「未知编排者」难懂得多。
+        mt_i18n::t_in(locale, "paneGroup", "orchestratorAnonymous").to_string()
+    } else {
+        origin.orchestrator_label.clone()
+    };
+    let key = if origin.orchestrator_departed {
+        "orchestratorDeparted"
+    } else {
+        "orchestratedBy"
+    };
+    mt_i18n::t_args_in(locale, "paneGroup", key, &[("orchestrator", &who)])
+}
+
+/// tab 上那枚出身标识本体。
+///
+/// - **tooltip 挂在标识自己身上,不挂整条 tab**:挂整条的话鼠标停在 tab 任意
+///   处都会弹,与隐藏 tab 的悬停缩略图两个浮层打架(同款理由见折叠条那处注释)。
+/// - **离场即褪色**:在场是 info 蓝(与「远程发起」那档提示同色系),
+///   离场转 muted 灰 —— 不必 hover 也看得出标识降过级。
+fn origin_badge(pane_id: &str, origin: &SessionOrigin) -> impl IntoElement {
+    let tip = origin_tooltip(origin);
+    let ink = if origin.orchestrator_departed {
+        ui::text_muted()
+    } else {
+        ui::color_info()
+    };
+    div()
+        .id(gpui::SharedString::from(format!("tab-origin-{pane_id}")))
+        .flex()
+        .items_center()
+        // 离场那一档再压一档存在感:颜色已经换成 muted,透明度把它推到「还在,
+        // 但不再是活跃事实」那个层次
+        .when(origin.orchestrator_departed, |el| el.opacity(0.7))
+        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+        .child(VectorIcon::new(ICON_ORCHESTRATED, px(ORIGIN_ICON)).ink(ink))
+}
 
 /// tab 栏插入指示线的宽度。原版最初是 2px 细线,评审实测「肉眼难辨」后
 /// 换成 **3px 圆头 + accent 双层光晕**(`0 0 6px` + `0 0 2px`),这里一步到位
@@ -679,6 +775,8 @@ impl TerminalArea {
         Self {
             store,
             layout_snapshot: None,
+            session_origins: HashMap::new(),
+            session_origins_version: None,
             split_states: HashMap::new(),
             area_size: FALLBACK_AREA,
             measured: false,
@@ -1321,10 +1419,13 @@ impl TerminalArea {
         let auto_resume = store.config().ai_auto_resume.unwrap_or(true);
         let pid = project_id.to_string();
         let leaf = leaf_id.clone();
+        // 「受编排」出身与展开态同一份快照,取法也一样(见 render_leaf_tab_bar)
+        let origins = self.session_origins_of(panes);
         // 显示数据先摘成 owned:下面每个 tab 都要往 move 闭包里搬,借着 store 走不了
-        let tabs: Vec<(String, String, PaneStatus, Option<AiVendor>, bool)> = panes
+        let tabs: Vec<CollapsedTab> = panes
             .iter()
-            .map(|pane| {
+            .enumerate()
+            .map(|(idx, pane)| {
                 // 品牌图标的取值口径与展开态 tab 逐字一致(见 render_leaf 的 vendors)
                 let vendor = pane
                     .shows_ai_session(auto_resume)
@@ -1334,22 +1435,23 @@ impl TerminalArea {
                         AiVendor::from_session_type(agent)
                             .or_else(|| AiVendor::infer(Some(agent), None))
                     });
-                (
-                    pane.id.clone(),
-                    store.pane_display_label(&pid, pane),
-                    pane.status,
+                CollapsedTab {
+                    pane_id: pane.id.clone(),
+                    label: store.pane_display_label(&pid, pane),
+                    status: pane.status,
                     vendor,
-                    store.is_pane_unread_done(&pane.id),
-                )
+                    unread: store.is_pane_unread_done(&pane.id),
+                    origin: origins.get(idx).cloned().flatten(),
+                }
             })
             .collect();
 
         // 焦点句柄与展开态共用 `tab_focus` 那张表(它按整棵树保留,见 render 里的
         // retain):折叠 ↔ 展开来回切时 Tab 焦点不丢
-        for (pane_id, ..) in &tabs {
-            if !self.tab_focus.contains_key(pane_id) {
+        for tab in &tabs {
+            if !self.tab_focus.contains_key(&tab.pane_id) {
                 let handle = cx.focus_handle();
-                self.tab_focus.insert(pane_id.clone(), handle);
+                self.tab_focus.insert(tab.pane_id.clone(), handle);
             }
         }
 
@@ -1376,8 +1478,17 @@ impl TerminalArea {
             }));
 
         let this_area = cx.entity();
-        for (pane_id, label, status, vendor, unread) in tabs {
+        for CollapsedTab {
+            pane_id,
+            label,
+            status,
+            vendor,
+            unread,
+            origin,
+        } in tabs
+        {
             let is_active = pane_id == active_id;
+            let pane_origin = pane_id.clone();
             let focus = self.tab_focus.get(&pane_id).cloned();
             let (pid_click, pane_click) = (pid.clone(), pane_id.clone());
             let (pid_key, pane_key) = (pid.clone(), pane_id.clone());
@@ -1467,6 +1578,10 @@ impl TerminalArea {
                         ))
                     })
                     .child(div().child(label))
+                    // 「受编排」出身标识,与展开态同一枚(工单 04)
+                    .when_some(origin, |el, origin| {
+                        el.child(origin_badge(&pane_origin, &origin))
+                    })
                     .when(unread, |el| {
                         el.child(
                             div()
@@ -1595,6 +1710,36 @@ impl TerminalArea {
             .map(|s| (s.seq, s.dir, s.old_pane_id.clone()))
     }
 
+    /// 把受编排出身的快照对齐到控制面。**每帧调一次**,`render` 开头那一处是
+    /// 它唯一的维护点。
+    ///
+    /// 顺序是**先读版本号、再取快照**:反过来会把一份旧快照配上新号存住,
+    /// 之后永远刷不掉。按正序最坏是紧挨着变更的那一帧多刷一次。
+    fn sync_session_origins(&mut self, cx: &App) {
+        let ai = self.store.read(cx).ai();
+        let version = ai.session_origins_version();
+        if self.session_origins_version == Some(version) {
+            return;
+        }
+        self.session_origins = ai.session_origins();
+        self.session_origins_version = Some(version);
+    }
+
+    /// 这一批 pane 各自的受编排出身(没有出身的是 `None`)。
+    ///
+    /// 与 `unread` / `vendors` 一样**按 tab 栏预取一次**,不在每颗 tab 的构造里
+    /// 各查各的。
+    fn session_origins_of(&self, panes: &[PaneState]) -> Vec<Option<SessionOrigin>> {
+        panes
+            .iter()
+            .map(|p| {
+                p.pty_id
+                    .and_then(|id| self.session_origins.get(&id))
+                    .cloned()
+            })
+            .collect()
+    }
+
     /// 一个叶子的 tab 栏本体:每个 pane 一颗 tab(含拖起 / 合并 / 重排的拖拽
     /// 挂载)+ 末尾那颗新建终端的 `+`。右侧控件簇与落点层分别在
     /// [`Self::render_leaf_controls`] 与 [`Self::render_leaf_drop_layer`]。
@@ -1610,6 +1755,9 @@ impl TerminalArea {
         // 借的是 `*cx` 不是 `self`,所以下面补焦点句柄那段照样能改 self
         let store = self.store.read(cx);
         let unread: Vec<bool> = panes.iter().map(|p| store.is_pane_unread_done(&p.id)).collect();
+        // 「受编排」出身标识(工单 04)。**出身不构成状态** —— 除了这枚标识,
+        // 乐手 tab 与普通 tab 一个字都不差(关闭 / 重命名 / 分屏 / 拖拽全照旧)。
+        let origins = self.session_origins_of(panes);
         // tab 上的 AI 品牌图标:显示条件与 agent 取值都照抄原版(见 PaneState 上
         // 的两个方法);`aiAutoResume` 缺省开启,与 store 里那处取值同口径
         let auto_resume = store.config().ai_auto_resume.unwrap_or(true);
@@ -1665,6 +1813,7 @@ impl TerminalArea {
             let pid_click = project_id.to_string();
             let pane_id_close = pane.id.clone();
             let pane_id_menu = pane.id.clone();
+            let pane_id_origin = pane.id.clone();
             let pid_close = project_id.to_string();
             let pid_rename = project_id.to_string();
             let pid_menu = project_id.to_string();
@@ -1676,6 +1825,7 @@ impl TerminalArea {
             let label_text = label.clone();
             let has_unread = unread.get(idx).copied().unwrap_or(false);
             let vendor = vendors.get(idx).copied().flatten();
+            let origin = origins.get(idx).cloned().flatten();
             let this_area = cx.entity();
             let pid_drag = project_id.to_string();
             // 与 `has_active_drag` 与门:拖拽被中断(松手在窗外)时 gpui 会清
@@ -1848,6 +1998,11 @@ impl TerminalArea {
                         )
                     })
                     .child(div().child(label_text.clone()))
+                    // 「受编排」出身标识:标题右侧,与未读标同一档小挂件。
+                    // 编排者离场后它**不消失**,只降级(见 `origin_badge`)。
+                    .when_some(origin.clone(), |el, origin| {
+                        el.child(origin_badge(&pane_id_origin, &origin))
+                    })
                     // 未读完成标(窗口没聚焦时完成的任务)
                     .when(has_unread, |el| {
                         el.child(
@@ -3037,6 +3192,8 @@ impl Render for TerminalArea {
             let store = self.store.read(cx);
             sync_layout_snapshot(&mut self.layout_snapshot, store.active_layout())
         };
+        // 受编排出身的快照同理:号没变的帧只花一次原子读(见字段注释)。
+        self.sync_session_origins(cx);
         // 塌陷/关闭掉的节点的分隔条状态在这里回收 —— 不清的话每分一次屏就多留
         // 一个 Entity(极小但确实的泄漏,看板已记)。
         //
@@ -4021,6 +4178,68 @@ mod tests {
         assert!(!marker_popover_alive(&layout, &second_id, 99));
         // pane 压根不在布局里
         assert!(!marker_popover_alive(&layout, "pane-nonexistent", 7));
+    }
+
+    // ─── 受编排出身标识(工单 04)────────────────────────────────
+
+    fn origin(label: &str, departed: bool) -> SessionOrigin {
+        SessionOrigin {
+            orchestrator_label: label.to_string(),
+            orchestrator_departed: departed,
+        }
+    }
+
+    /// 编排者还在:说得出是谁。
+    #[test]
+    fn 出身文案说得出编排者是谁() {
+        let tip = origin_tooltip_in(mt_i18n::Locale::Zh, &origin("Claude 编排者", false));
+        assert!(tip.contains("Claude 编排者"), "{tip}");
+        assert!(!tip.contains("离场"), "还没走呢: {tip}");
+    }
+
+    /// 编排者走了:同一枚标识**换文案**(不是消失,也不是变成另一种状态)。
+    #[test]
+    fn 编排者离场后文案换成已离场() {
+        let zh = mt_i18n::Locale::Zh;
+        let tip = origin_tooltip_in(zh, &origin("Claude 编排者", true));
+        assert!(tip.contains("已离场"), "{tip}");
+        assert!(tip.contains("Claude 编排者"), "离场了也要说得出是谁: {tip}");
+        assert_ne!(tip, origin_tooltip_in(zh, &origin("Claude 编排者", false)));
+
+        let en = origin_tooltip_in(mt_i18n::Locale::En, &origin("Claude", true));
+        assert!(en.contains("has left"), "{en}");
+    }
+
+    /// 落地时没认出编排者(pane 刚好查不到)也不能画出一句半截话。
+    #[test]
+    fn 认不出编排者时有兜底称呼() {
+        for departed in [false, true] {
+            let tip = origin_tooltip_in(mt_i18n::Locale::Zh, &origin("   ", departed));
+            assert!(tip.contains("未知编排者"), "{tip}");
+            // 空白名字不许原样拼进去,拼出来是「由「   」启动」
+            assert!(!tip.contains("「   」"), "{tip}");
+        }
+    }
+
+    /// **术语纪律**(`CONTEXT.md`):用户可见文案一律「受编排会话 /
+    /// orchestrated session」,「乐手 / musician」只许留在注释与测试名里。
+    #[test]
+    fn 出身文案不许出现内部别名() {
+        for departed in [false, true] {
+            for label in ["Claude", ""] {
+                let o = origin(label, departed);
+                let zh = origin_tooltip_in(mt_i18n::Locale::Zh, &o);
+                assert!(!zh.contains("乐手"), "{zh}");
+                assert!(zh.contains("受编排会话"), "得点明这是什么: {zh}");
+
+                let en = origin_tooltip_in(mt_i18n::Locale::En, &o);
+                assert!(!en.to_lowercase().contains("musician"), "{en}");
+                assert!(
+                    en.to_lowercase().contains("orchestrated session"),
+                    "得点明这是什么: {en}"
+                );
+            }
+        }
     }
 
     /// 换算一圈回来不变形:百分比 → 像素 → 百分比。

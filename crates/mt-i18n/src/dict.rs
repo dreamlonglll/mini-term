@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 32;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 850;
+pub const ZH_ENTRY_COUNT: usize = 853;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 850;
+pub const EN_ENTRY_COUNT: usize = 853;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -660,6 +660,9 @@ static PANE_GROUP_ZH: &[(&str, &str)] = &[
     ("forkSession", "分支会话到新分屏"),
     ("markerTooltip", "AI 任务标记 ({mod}+Shift+↑/↓ 跳转)"),
     ("maximizePane", "最大化此区域（双击标签栏空白处）"),
+    ("orchestratedBy", "受编排会话 · 由「{orchestrator}」启动"),
+    ("orchestratorAnonymous", "未知编排者"),
+    ("orchestratorDeparted", "受编排会话 · 编排者「{orchestrator}」已离场"),
     ("reconnect", "点击重连"),
     ("remoteDisconnected", "连接已断开"),
     ("rename", "重命名"),
@@ -692,6 +695,9 @@ static PANE_GROUP_EN: &[(&str, &str)] = &[
     ("forkSession", "Fork session to new split"),
     ("markerTooltip", "AI task markers ({mod}+Shift+↑/↓ to jump)"),
     ("maximizePane", "Maximize this pane (double-click empty tab bar area)"),
+    ("orchestratedBy", "Orchestrated session · started by {orchestrator}"),
+    ("orchestratorAnonymous", "an unknown orchestrator"),
+    ("orchestratorDeparted", "Orchestrated session · orchestrator {orchestrator} has left"),
     ("reconnect", "Click to reconnect"),
     ("remoteDisconnected", "Connection lost"),
     ("rename", "Rename"),
