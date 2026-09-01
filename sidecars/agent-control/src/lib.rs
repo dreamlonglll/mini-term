@@ -132,6 +132,8 @@ pub struct ControlRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
     /// 以某个乐手为目标的命令（`send` / `wait`，工单 07 的 read 同款）用它。
+    /// 以某个乐手为目标的命令（`send` / `read-transcript` / `read-screen`，
+    /// 工单 06 的 wait 同款）用它。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_pane_id: Option<u32>,
     /// `wait`：最多等多久（毫秒）。不给就是服务端的 [`WAIT_DEFAULT`]；
@@ -145,9 +147,18 @@ pub struct ControlRequest {
     /// 不进回执（回执只回 pane 编号与「有没有当成一块粘贴」）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// `read-transcript`：从第几条读起（= 上次回执里的 `nextCursor`）。
+    /// 不给就是从头。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<u64>,
+    /// `read-screen`：要画面尾部多少行。不给由桌面侧用默认值。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lines: Option<u32>,
 }
 
 impl From<&Identity> for ControlRequest {
+    /// ⚠️ 这里**刻意逐个字段写 `None`**，不用 `..Default::default()`：
+    /// 加一个字段忘了在这里补一行就编译不过，那正是我们要的护栏。
     fn from(id: &Identity) -> Self {
         Self {
             token: id.token.clone(),
@@ -157,6 +168,8 @@ impl From<&Identity> for ControlRequest {
             target_pane_id: None,
             text: None,
             timeout_ms: None,
+            cursor: None,
+            lines: None,
         }
     }
 }
@@ -188,6 +201,24 @@ impl ControlRequest {
         Self {
             target_pane_id: Some(target_pane_id),
             timeout_ms: timeout.map(|d| d.min(WAIT_MAX).as_millis() as u64),
+            ..Self::from(id)
+        }
+    }
+
+    /// `read-transcript` 的请求体：读哪个乐手、从第几条起。
+    pub fn read_transcript(id: &Identity, target_pane_id: u32, cursor: Option<u64>) -> Self {
+        Self {
+            target_pane_id: Some(target_pane_id),
+            cursor,
+            ..Self::from(id)
+        }
+    }
+
+    /// `read-screen` 的请求体：读哪个乐手的画面、要尾部多少行。
+    pub fn read_screen(id: &Identity, target_pane_id: u32, lines: Option<u32>) -> Self {
+        Self {
+            target_pane_id: Some(target_pane_id),
+            lines,
             ..Self::from(id)
         }
     }
@@ -313,6 +344,70 @@ impl WaitOutcome {
     pub fn is_settled(&self) -> bool {
         matches!(self.outcome.as_str(), "ai-idle" | "attention" | "idle")
     }
+}
+
+/// `read-transcript` 的回执：一段结构化会话记录增量（工单 07）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Transcript {
+    pub pane_id: u32,
+    /// 记录家族：`claude` / `codex` / `grok`。
+    #[serde(default)]
+    pub agent: String,
+    /// 这一段属于哪条会话。
+    ///
+    /// **游标只在同一个 `session_id` 内有意义** —— 乐手 `/clear` 或退出重开
+    /// 之后 seq 从 0 重新数。它一变就把游标归零重取。
+    #[serde(default)]
+    pub session_id: String,
+    /// 本次实际从第几条起（请求的游标越界时会被钳回来）。
+    #[serde(default)]
+    pub cursor: u64,
+    /// 下次该传的游标。没有新内容时它等于 `cursor`。
+    #[serde(default)]
+    pub next_cursor: u64,
+    /// 这条会话此刻一共有多少条消息。
+    #[serde(default)]
+    pub total: u64,
+    /// 还有没读完的（被回执的字节上界挡住）—— 按 `next_cursor` 接着取。
+    ///
+    /// **缺省 `false`**：认不出这个字段的旧桌面端在场时，宁可让编排者以为读完了
+    /// 也别让它无限循环取下去（与 `SendReceipt::bracketed_paste` 同一个取向）。
+    #[serde(default)]
+    pub has_more: bool,
+    #[serde(default)]
+    pub messages: Vec<TranscriptMessage>,
+}
+
+/// transcript 里的一条消息。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptMessage {
+    /// 这条会话里的序号（0 起、连续、只增）。
+    pub seq: u64,
+    /// `user` / `assistant`。
+    pub role: String,
+    pub content: String,
+    /// 记录里的时间戳，各家格式不同，原样透传。
+    #[serde(default)]
+    pub timestamp: String,
+    /// 这条的正文被字节上界截断了 —— 后半截**再也取不回来**（只在一条消息
+    /// 自己就超过上界时发生；不给出去的话游标永远走不过它）。
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+/// `read-screen` 的回执：终端画面尾部若干行纯文本（工单 07）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Screen {
+    pub pane_id: u32,
+    /// 画面尾部若干行，**旧的在前**。颜色与属性已剥掉，行尾空格已裁。
+    #[serde(default)]
+    pub lines: Vec<String>,
+    /// 字节上界砍掉了开头几行。
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 /// 被拒 / 出错的响应。`code` 是闭集（桌面侧 `ControlError::code`），
@@ -445,6 +540,28 @@ pub fn parse_wait_outcome(status: u16, body: &str) -> Result<WaitOutcome, Contro
         .ok_or_else(|| ControlFailure::malformed(status, "missing `waited`"))?;
     serde_json::from_value(waited)
         .map_err(|e| ControlFailure::malformed(status, &format!("bad `waited`: {e}")))
+}
+
+/// 解析 `read-transcript` 的回执。
+pub fn parse_transcript(status: u16, body: &str) -> Result<Transcript, ControlFailure> {
+    let data = envelope(status, body)?;
+    let transcript = data
+        .get("transcript")
+        .cloned()
+        .ok_or_else(|| ControlFailure::malformed(status, "missing `transcript`"))?;
+    serde_json::from_value(transcript)
+        .map_err(|e| ControlFailure::malformed(status, &format!("bad `transcript`: {e}")))
+}
+
+/// 解析 `read-screen` 的回执。
+pub fn parse_screen(status: u16, body: &str) -> Result<Screen, ControlFailure> {
+    let data = envelope(status, body)?;
+    let screen = data
+        .get("screen")
+        .cloned()
+        .ok_or_else(|| ControlFailure::malformed(status, "missing `screen`"))?;
+    serde_json::from_value(screen)
+        .map_err(|e| ControlFailure::malformed(status, &format!("bad `screen`: {e}")))
 }
 
 #[cfg(test)]
@@ -897,5 +1014,143 @@ mod tests {
         let list = parse_projects(200, body).unwrap();
         assert!(list[0].can_start_sessions);
         assert!(!list[1].can_start_sessions, "远程项目起不了乐手");
+    }
+
+    // ─── 工单 07：read-transcript / read-screen ────────────────
+
+    fn id7() -> Identity {
+        Identity {
+            token: "t".into(),
+            pane_id: 3,
+        }
+    }
+
+    /// 读命令的请求体只带自己那几个字段，别人的一个不出线。
+    #[test]
+    fn 读请求体各取所需() {
+        // 不带游标 = 从头读
+        let json = serde_json::to_string(&ControlRequest::read_transcript(&id7(), 101, None)).unwrap();
+        assert_eq!(json, r#"{"token":"t","paneId":3,"targetPaneId":101}"#);
+
+        let json =
+            serde_json::to_string(&ControlRequest::read_transcript(&id7(), 101, Some(12))).unwrap();
+        assert_eq!(
+            json,
+            r#"{"token":"t","paneId":3,"targetPaneId":101,"cursor":12}"#
+        );
+
+        // 不给行数 = 让桌面侧用默认值（CLI 这一侧不复制那个默认值，
+        // 复制了就成两处口径）
+        let json = serde_json::to_string(&ControlRequest::read_screen(&id7(), 101, None)).unwrap();
+        assert_eq!(json, r#"{"token":"t","paneId":3,"targetPaneId":101}"#);
+
+        let json =
+            serde_json::to_string(&ControlRequest::read_screen(&id7(), 101, Some(20))).unwrap();
+        assert_eq!(
+            json,
+            r#"{"token":"t","paneId":3,"targetPaneId":101,"lines":20}"#
+        );
+
+        // 读命令一个字的正文都不带（`text` 是 send 专属）
+        for req in [
+            ControlRequest::read_transcript(&id7(), 101, Some(1)),
+            ControlRequest::read_screen(&id7(), 101, Some(1)),
+        ] {
+            let json = serde_json::to_string(&req).unwrap();
+            assert!(!json.contains("text"), "{json}");
+            assert!(!json.contains("launcherId"), "{json}");
+        }
+    }
+
+    #[test]
+    fn 解析_transcript_回执() {
+        let body = r#"{"ok":true,"data":{"transcript":{
+            "paneId":101,"agent":"claude","sessionId":"s-1","cursor":2,"nextCursor":4,
+            "total":9,"hasMore":true,"messages":[
+              {"seq":2,"role":"user","content":"修一下","timestamp":"t1","truncated":false},
+              {"seq":3,"role":"assistant","content":"修好了","timestamp":"t2","truncated":false}]}}}"#;
+        let t = parse_transcript(200, body).unwrap();
+        assert_eq!(t.pane_id, 101);
+        assert_eq!(t.agent, "claude");
+        assert_eq!(t.session_id, "s-1");
+        assert_eq!((t.cursor, t.next_cursor, t.total), (2, 4, 9));
+        assert!(t.has_more);
+        assert_eq!(t.messages.len(), 2);
+        assert_eq!(t.messages[0].seq, 2);
+        assert_eq!(t.messages[1].content, "修好了");
+        assert!(!t.messages[1].truncated);
+    }
+
+    /// 空一段（没有新内容）是合法成功，不是失败。
+    #[test]
+    fn 空的_transcript_增量也是合法成功() {
+        let body = r#"{"ok":true,"data":{"transcript":{
+            "paneId":101,"agent":"codex","sessionId":"s","cursor":4,"nextCursor":4,
+            "total":4,"hasMore":false,"messages":[]}}}"#;
+        let t = parse_transcript(200, body).unwrap();
+        assert!(t.messages.is_empty());
+        assert_eq!(t.cursor, t.next_cursor, "游标原地不动");
+        assert!(!t.has_more);
+    }
+
+    /// 旧桌面端缺字段时保守缺省：`hasMore` 当 false（宁可以为读完了，
+    /// 也别让编排者照着一个不存在的「还有更多」无限循环取）。
+    #[test]
+    fn transcript_缺字段时保守缺省() {
+        let body = r#"{"ok":true,"data":{"transcript":{"paneId":101}}}"#;
+        let t = parse_transcript(200, body).unwrap();
+        assert!(!t.has_more);
+        assert!(t.messages.is_empty());
+        assert_eq!(t.total, 0);
+        assert!(t.session_id.is_empty());
+    }
+
+    #[test]
+    fn 解析_screen_回执() {
+        let body = r#"{"ok":true,"data":{"screen":{
+            "paneId":101,"lines":["$ codex","> approve? (y/n)"],"truncated":false}}}"#;
+        let s = parse_screen(200, body).unwrap();
+        assert_eq!(s.pane_id, 101);
+        assert_eq!(s.lines, vec!["$ codex", "> approve? (y/n)"]);
+        assert!(!s.truncated);
+
+        // 空屏也是合法答案（那个乐手此刻什么都没显示）
+        let body = r#"{"ok":true,"data":{"screen":{"paneId":101}}}"#;
+        let s = parse_screen(200, body).unwrap();
+        assert!(s.lines.is_empty());
+        assert!(!s.truncated);
+    }
+
+    /// 认不出的响应照旧算失败，不许退化成「反正读到了」。
+    #[test]
+    fn 读命令的坏响应也算失败() {
+        for (status, body) in [(200, "not json"), (200, r#"{"ok":true,"data":{}}"#)] {
+            assert_eq!(
+                parse_transcript(status, body).unwrap_err().code,
+                "malformedResponse",
+                "transcript body={body}"
+            );
+            assert_eq!(
+                parse_screen(status, body).unwrap_err().code,
+                "malformedResponse",
+                "screen body={body}"
+            );
+        }
+    }
+
+    /// 工单 07 的两个错误码落在「改你的请求」那一档 —— **既不是**没能力，
+    /// **也不是**够不着（够不着那一档的含义是「重试可能就好了」，而
+    /// `transcriptUnsupported` 永远不会好转，得换 `read-screen`）。
+    #[test]
+    fn 读命令错误码的分档() {
+        let f = |code: &str| ControlFailure {
+            status: 409,
+            code: code.into(),
+            message: String::new(),
+        };
+        for code in ["transcriptUnsupported", "sessionUnidentified"] {
+            assert!(!f(code).is_denied(), "{code} 不是鉴权失败");
+            assert!(!f(code).is_desktop_unavailable(), "{code} 不是够不着");
+        }
     }
 }

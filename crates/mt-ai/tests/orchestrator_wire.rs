@@ -13,12 +13,12 @@ use std::sync::Arc;
 
 use mt_ai::control::{
     AiSessionState, ControlLauncher, ControlPlane, ControlProject, Delivered, OrchestratorActions,
-    OrchestratorHost, PaneInput, PaneLiveness, SendFailure, StartFailure, StartSessionSpec,
-    StartedSession,
+    OrchestratorHost, PaneInput, PaneLiveness, PaneSession, ScreenFailure, SendFailure,
+    StartFailure, StartSessionSpec, StartedSession, TranscriptSource,
 };
 use mt_agent_control::{
-    ControlRequest, Identity, parse_launchers, parse_panes, parse_projects, parse_send_receipt,
-    parse_started_pane, parse_wait_outcome,
+    ControlRequest, Identity, parse_launchers, parse_panes, parse_projects, parse_screen,
+    parse_send_receipt, parse_started_pane, parse_transcript, parse_wait_outcome,
 };
 
 /// 桌面能力的假宿主(与 mt-app 那份真实现同形)。
@@ -70,6 +70,48 @@ impl OrchestratorHost for Host {
             },
         ]
     }
+
+    /// 乐手 101 是个 hook 上报过身份的 Claude 会话;102 是只有输入检测认得出的
+    /// opencode(没有会话记录那一档)。与 mt-app 那份真实现同形:照实报,不加工。
+    fn pane_session(&self, pane_id: u32) -> Option<PaneSession> {
+        match pane_id {
+            101 => Some(PaneSession {
+                session_id: Some("s-1".into()),
+                agent: Some("claude-code".into()),
+            }),
+            102 => Some(PaneSession {
+                session_id: None,
+                agent: Some("opencode".into()),
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// 假会话记录(**不碰用户真实的 `~/.claude`**)。
+struct Transcripts;
+
+impl TranscriptSource for Transcripts {
+    fn read(
+        &self,
+        agent: &str,
+        session_id: &str,
+        _project_path: &str,
+    ) -> Option<Vec<mt_ai::AiSessionMessage>> {
+        if (agent, session_id) != ("claude", "s-1") {
+            return None;
+        }
+        Some(
+            [("user", "跑一下测试"), ("assistant", "跑完了")]
+                .iter()
+                .map(|(role, content)| mt_ai::AiSessionMessage {
+                    role: (*role).into(),
+                    content: (*content).into(),
+                    timestamp: "2026-09-01T00:00:00Z".into(),
+                })
+                .collect(),
+        )
+    }
 }
 
 /// 桌面动作的假实现(与 mt-app 那份真实现同形:起会话回主线程、死活现查)。
@@ -93,6 +135,17 @@ impl OrchestratorActions for Actions {
         })
     }
 
+    /// 与 mt-app 那份真实现同形:钳位在控制面做完了,这里照办即可。
+    fn read_screen(&self, _pane_id: u32, lines: usize) -> Result<Vec<String>, ScreenFailure> {
+        let rows = vec![
+            "$ claude".to_string(),
+            "> 跑一下测试".to_string(),
+            "Allow Bash(cargo test)? (y/n)".to_string(),
+        ];
+        let skip = rows.len().saturating_sub(lines);
+        Ok(rows.into_iter().skip(skip).collect())
+    }
+
     /// 与 mt-app 那份真实现同形：四样全是只读现查。这里的乐手刚干完一个回合
     /// （`Stop` 是唯一「真做完」的成因），`wait` 因此一问就收敛。
     fn pane_liveness(&self, _pane_id: u32) -> PaneLiveness {
@@ -110,6 +163,8 @@ fn granted() -> (ControlPlane, Identity, String) {
     let plane = ControlPlane::new();
     plane.set_host(Arc::new(Host));
     plane.set_actions(Arc::new(Actions));
+    // 会话记录顶成假的:默认实现会去翻用户真实的 `~/.claude` / `~/.codex`
+    plane.set_transcripts(Arc::new(Transcripts));
     let token = plane.grant(7, "p-self");
     // 请求体由 **CLI 那一侧**构造(它是 sidecar 里的同一段代码),
     // 桌面 handler 必须原样认得 —— 请求方向的对账。
@@ -308,6 +363,185 @@ fn 新增错误码两侧一致() {
     assert!(!err.is_denied(), "名额满了不是鉴权问题");
 }
 
+/// `read-transcript` 的增量回执两侧对得上:请求方向(CLI 构造带 `cursor` 的体)
+/// 与响应方向(handler 的 transcript)各走一遍真代码。
+#[test]
+fn 会话记录增量能被_sidecar_解析器读懂() {
+    let (plane, identity, _body) = granted();
+    // 先起一个乐手 —— 可见范围铁律要求目标必须是自己起的(落在 101)
+    let start =
+        serde_json::to_string(&ControlRequest::start_session(&identity, "claude", None)).unwrap();
+    assert_eq!(plane.handle("start-session", &start).status, 200);
+
+    // 从头读
+    let body = serde_json::to_string(&ControlRequest::read_transcript(&identity, 101, None)).unwrap();
+    let outcome = plane.handle("read-transcript", &body);
+    assert_eq!(outcome.status, 200, "{}", outcome.body);
+    let t = parse_transcript(outcome.status, &outcome.body)
+        .expect("sidecar 的解析器必须读得懂桌面 handler 的产出");
+    assert_eq!(t.pane_id, 101);
+    assert_eq!(t.agent, "claude", "hook 上报的 claude-code 要收敛成家族名");
+    assert_eq!(t.session_id, "s-1");
+    assert_eq!((t.cursor, t.next_cursor, t.total), (0, 2, 2));
+    assert!(!t.has_more);
+    assert_eq!(t.messages.len(), 2);
+    assert_eq!(t.messages[0].seq, 0);
+    assert_eq!(t.messages[0].role, "user");
+    assert_eq!(t.messages[1].content, "跑完了");
+    assert!(!t.messages[1].truncated);
+
+    // 带游标读:**只给之后的**(这里是「之后什么都没有」)
+    let body =
+        serde_json::to_string(&ControlRequest::read_transcript(&identity, 101, Some(2))).unwrap();
+    let outcome = plane.handle("read-transcript", &body);
+    let t = parse_transcript(outcome.status, &outcome.body).unwrap();
+    assert!(t.messages.is_empty());
+    assert_eq!(t.cursor, t.next_cursor, "没有新内容时游标原地不动");
+}
+
+/// `read-screen` 的回执两侧对得上,且**行数参数真的透到桌面侧**。
+#[test]
+fn 终端画面能被_sidecar_解析器读懂() {
+    let (plane, identity, _body) = granted();
+    let start =
+        serde_json::to_string(&ControlRequest::start_session(&identity, "claude", None)).unwrap();
+    assert_eq!(plane.handle("start-session", &start).status, 200);
+
+    let body = serde_json::to_string(&ControlRequest::read_screen(&identity, 101, None)).unwrap();
+    let outcome = plane.handle("read-screen", &body);
+    assert_eq!(outcome.status, 200, "{}", outcome.body);
+    let s = parse_screen(outcome.status, &outcome.body)
+        .expect("sidecar 的解析器必须读得懂桌面 handler 的产出");
+    assert_eq!(s.pane_id, 101);
+    assert_eq!(
+        s.lines,
+        vec!["$ claude", "> 跑一下测试", "Allow Bash(cargo test)? (y/n)"]
+    );
+    assert!(!s.truncated);
+
+    // 指定行数:尾部那一行(审批提示原文 —— read-screen 的头号用途)
+    let body =
+        serde_json::to_string(&ControlRequest::read_screen(&identity, 101, Some(1))).unwrap();
+    let outcome = plane.handle("read-screen", &body);
+    let s = parse_screen(outcome.status, &outcome.body).unwrap();
+    assert_eq!(s.lines, vec!["Allow Bash(cargo test)? (y/n)"]);
+}
+
+/// 工单 07 新增的两个错误码两侧一致,且**能力分层的下一步写在消息里**。
+#[test]
+fn 读命令的错误码两侧一致() {
+    let (plane, identity, _body) = granted();
+    let start =
+        serde_json::to_string(&ControlRequest::start_session(&identity, "claude", None)).unwrap();
+    assert_eq!(plane.handle("start-session", &start).status, 200);
+
+    let read = |target: u32| {
+        let body =
+            serde_json::to_string(&ControlRequest::read_transcript(&identity, target, None))
+                .unwrap();
+        plane.handle("read-transcript", &body)
+    };
+
+    // 不是自己起的乐手 —— 统一的「不存在」语义(102 是 Host 认得的另一个 pane,
+    // 但它不在这个编排者的记账里)
+    let outcome = read(4242);
+    let err = parse_transcript(outcome.status, &outcome.body).unwrap_err();
+    assert_eq!(err.code, "paneNotFound");
+    assert_eq!(err.status, 404);
+    let outcome = read(102);
+    let err = parse_transcript(outcome.status, &outcome.body).unwrap_err();
+    assert_eq!(
+        err.code, "paneNotFound",
+        "别人的 pane 必须与「不存在」不可区分"
+    );
+
+    // 自指禁令
+    let outcome = read(7);
+    let err = parse_transcript(outcome.status, &outcome.body).unwrap_err();
+    assert_eq!(err.code, "selfTarget");
+
+    // 两个新码都落在「改你的请求」那一档
+    for code in ["transcriptUnsupported", "sessionUnidentified"] {
+        let f = mt_agent_control::ControlFailure {
+            status: 409,
+            code: code.into(),
+            message: String::new(),
+        };
+        assert!(!f.is_denied(), "{code} 不是鉴权失败");
+        assert!(!f.is_desktop_unavailable(), "{code} 不是够不着");
+    }
+}
+
+/// **能力分层走到线上**:无会话记录的 agent 起的乐手,`read-transcript` 明确报错
+/// (且消息里写着改用 `read-screen`),`read-screen` 照常可用。
+///
+/// 这里另起一个 plane,让 `Host::pane_session` 认得的那个 opencode pane(102)
+/// 真的成为这个编排者名下的乐手。
+#[test]
+fn 无记录_agent_的能力分层走到线上() {
+    /// 起出来的乐手就是 102 —— `Host::pane_session` 把它报成 opencode。
+    struct OpencodeActions;
+
+    impl OrchestratorActions for OpencodeActions {
+        fn start_session(&self, spec: StartSessionSpec) -> Result<StartedSession, StartFailure> {
+            Ok(spec.landed(102, "大脑"))
+        }
+        fn send_input(&self, _pane_id: u32, _input: PaneInput) -> Result<Delivered, SendFailure> {
+            Ok(Delivered {
+                bracketed_paste: false,
+            })
+        }
+        fn read_screen(&self, _pane_id: u32, _lines: usize) -> Result<Vec<String>, ScreenFailure> {
+            Ok(vec!["opencode > 在跑".to_string()])
+        }
+        fn pane_liveness(&self, _pane_id: u32) -> PaneLiveness {
+            PaneLiveness {
+                alive: true,
+                status: "ai-idle".into(),
+                ai_session: AiSessionState::Active,
+                // 无记录 agent 也有成因(工单 06 加的字段)——它照样收敛得出终态,
+                // 只是 read-transcript 那一层够不着。
+                cause: Some("Stop".into()),
+            }
+        }
+    }
+
+    let plane = ControlPlane::new();
+    plane.set_host(Arc::new(Host));
+    plane.set_actions(Arc::new(OpencodeActions));
+    plane.set_transcripts(Arc::new(Transcripts));
+    let identity = Identity {
+        token: plane.grant(7, "p-self"),
+        pane_id: 7,
+    };
+    let start =
+        serde_json::to_string(&ControlRequest::start_session(&identity, "claude", None)).unwrap();
+    assert_eq!(plane.handle("start-session", &start).status, 200);
+
+    // transcript：明确报错，并告诉编排者改用哪条命令
+    let body = serde_json::to_string(&ControlRequest::read_transcript(&identity, 102, None)).unwrap();
+    let outcome = plane.handle("read-transcript", &body);
+    let err = parse_transcript(outcome.status, &outcome.body).unwrap_err();
+    assert_eq!(err.code, "transcriptUnsupported");
+    assert_eq!(err.status, 409);
+    assert!(
+        err.message.contains("read-screen"),
+        "得写清下一步: {}",
+        err.message
+    );
+    assert!(
+        !err.message.contains("musician"),
+        "用户可见文案一律 orchestrated session(术语表)"
+    );
+
+    // read-screen：对它照常可用 —— 那就是它的兜底
+    let body = serde_json::to_string(&ControlRequest::read_screen(&identity, 102, None)).unwrap();
+    let outcome = plane.handle("read-screen", &body);
+    assert_eq!(outcome.status, 200, "{}", outcome.body);
+    let s = parse_screen(outcome.status, &outcome.body).unwrap();
+    assert_eq!(s.lines, vec!["opencode > 在跑"]);
+}
+
 /// 被拒响应也要对得上:CLI 靠 `code` 分档退出码,漂移了就只剩「反正失败了」。
 #[test]
 fn 被拒响应的错误码两侧一致() {
@@ -445,6 +679,11 @@ fn 等人处理那一档能被_sidecar_解析器读懂() {
         }
         fn send_input(&self, _pane_id: u32, _input: PaneInput) -> Result<Delivered, SendFailure> {
             unreachable!("attention 时编排者不代答,一个字节都不该写出去")
+        }
+        /// 等审批那一档**恰恰要读得到画面**:ADR 0003 要求编排者把审批提示
+        /// 原文播报给用户,而无记录 agent 只有这一条路(工单 07 加的方法)。
+        fn read_screen(&self, _pane_id: u32, _lines: usize) -> Result<Vec<String>, ScreenFailure> {
+            Ok(vec!["Allow Bash(cargo test)? (y/n)".to_string()])
         }
         fn pane_liveness(&self, _pane_id: u32) -> PaneLiveness {
             PaneLiveness {

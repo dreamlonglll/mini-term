@@ -165,6 +165,31 @@ pub const PANE_ENV: &str = "MINITERM_ORCHESTRATOR_PANE";
 /// 顶到上限时得到的是明确的 `payloadTooLarge`，不是截断。
 const MAX_CONTROL_BODY_BYTES: usize = 64 * 1024;
 
+/// 一次读回执里正文的字节上界（`read-transcript` 与 `read-screen` 共用）。
+///
+/// **请求那道闸管不住这一头**：[`MAX_CONTROL_BODY_BYTES`] 只看进来的 body，而读
+/// 命令的产出由乐手写了多少决定 —— 一次回合的 transcript 增量可以是几 MB，一屏
+/// 500 行也能有十几万字节。不给上界就是让编排者一条命令把自己的上下文撑爆。
+///
+/// 32 KiB ≈ 一万个汉字，够装下一次回合的完整回答，又只占编排者上下文的一小块。
+/// 顶到上界时 `read-transcript` **不截断内容、只少给几条**并在回执里说明还有更多
+/// （编排者接着取即可，游标就是为此存在）；`read-screen` 那条没有游标，于是
+/// **从头上截**、保住尾部（要的就是最新那几行），并在回执里如实说明截过。
+const MAX_READ_BYTES: usize = 32 * 1024;
+
+/// `read-screen` 不指定行数时取多少行。
+///
+/// 一屏 TUI 通常 30~50 行，50 行足够看清一次审批提示的全文与它上面的上下文，
+/// 又不至于每次都把整屏空白搬过来。
+pub const DEFAULT_SCREEN_LINES: usize = 50;
+
+/// `read-screen` 一次最多取多少行。
+///
+/// 回看缓冲默认 10000 行，不设上界的话编排者一条命令就能把整条滚屏搬出来
+/// （字节上界会把它砍掉大半，但那时已经白读了一遍 grid 并白拷了一份）。
+/// 500 行是「翻十屏」的量级，超出的部分该用 `read-transcript` 去读结构化记录。
+pub const MAX_SCREEN_LINES: usize = 500;
+
 // ─── 注入接口 ─────────────────────────────────────────────────
 
 /// 启动器在控制面里的切面。
@@ -210,9 +235,28 @@ impl ControlProject {
     }
 }
 
+/// 一个 pane 此刻的 AI 会话身份。[`OrchestratorHost::pane_session`] 的产出。
+///
+/// **两个字段各有各的权威性，别混着用**：
+///
+/// - [`Self::session_id`] 只可能来自 **hook 上报**（`HookState::session_of`）。
+///   `None` = hook 没启用或还没来第一条事件 —— 那就是「不知道该绑哪个会话」，
+///   **不许拿它去猜**（见 [`ControlPlane::read_transcript`] 的绑定纪律）。
+/// - [`Self::agent`] 是 hook 上报优先、退回输入检测认出来的那个名字。它**只用来
+///   判「这一家有没有可解析的会话记录」**（[`crate::sessions::agent_has_session_log`]），
+///   不参与定位文件。之所以要退回输入检测：opencode / pi 压根不发 hook，
+///   没有这条退路就答不出「这个 agent 换 read-screen」那句话。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PaneSession {
+    /// hook 上报的会话 id。`None` = 无从绑定。
+    pub session_id: Option<String>,
+    /// agent 名（`claude-code` / `claude` / `codex` / `opencode` …）。
+    pub agent: Option<String>,
+}
+
 /// 控制面向桌面端要东西的入口（`RelayHost` 的同款注入 trait）。
 ///
-/// **两个方法都在 HTTP 线程上被调用**，实现方自己负责跨线程取值
+/// **三个方法都在 HTTP 线程上被调用**，实现方自己负责跨线程取值
 /// （`mt-app` 那边是主线程刷新、HTTP 线程只读的一份镜像）。
 pub trait OrchestratorHost: Send + Sync + 'static {
     /// 当前配置里的 AI 启动器名单（全量：任何启动器都能当乐手，见 ADR 0003）。
@@ -220,6 +264,16 @@ pub trait OrchestratorHost: Send + Sync + 'static {
 
     /// 当前项目表（含分组归属）。**每次请求现查** —— 改分组要即时生效。
     fn projects(&self) -> Vec<ControlProject>;
+
+    /// 某个 pane 此刻的 AI 会话身份（`read-transcript` 的绑定依据）。
+    ///
+    /// 与另外两个一样是**纯查**：`mt-app` 那边读的是 `HookState` 与
+    /// `SessionTracker`，两者都在 `Arc<Mutex<..>>` 后面，后台线程随手可答，
+    /// 不跳主线程。
+    ///
+    /// 做成**必须实现**而不给默认实现：默认答 `None` 的话，接线时漏掉这一条会
+    /// 表现成「read-transcript 永远说没有会话身份」，看起来像 hook 坏了。
+    fn pane_session(&self, pane_id: u32) -> Option<PaneSession>;
 }
 
 /// 什么都不做的宿主实现。
@@ -234,6 +288,9 @@ impl OrchestratorHost for NoopOrchestratorHost {
     }
     fn projects(&self) -> Vec<ControlProject> {
         Vec::new()
+    }
+    fn pane_session(&self, _pane_id: u32) -> Option<PaneSession> {
+        None
     }
 }
 
@@ -615,17 +672,31 @@ pub enum SendFailure {
     DesktopBusy,
 }
 
+/// 读画面失败的原因。**闭集**。
+///
+/// 只有两档：找不到那个终端（从裁决到落地之间用户刚好把它关了），以及主线程没
+/// 在时限内答复。**没有「读到一半失败」那一档** —— 读 grid 是一次持锁拷贝，
+/// 要么拿到那一屏，要么那个终端已经不在了。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScreenFailure {
+    /// 从裁决到落地之间那个 pane 没了。
+    PaneGone,
+    /// 桌面主线程没在时限内答复（泵没接线 / 主线程忙死）。
+    DesktopBusy,
+}
+
 /// 控制面要桌面端**做事**的入口。
 ///
 /// 与 [`OrchestratorHost`] 的分工：那条是查（纯读镜像，随手可答），这条是做
-/// （要回主线程建 pane / 写 PTY）。刻意分成两个 trait 而不是并成一个，是因为
-/// 两者的线程契约完全不同 —— 下面这条注意事项对 `Host` 不成立。
+/// （要回主线程建 pane / 写 PTY / 读 gpui 实体手上的终端）。刻意分成两个 trait
+/// 而不是并成一个，是因为两者的线程契约完全不同 —— 下面这条注意事项对 `Host`
+/// 不成立。
 ///
-/// ⚠️ **三个方法都在 HTTP 线程上被调用，且调用方（本模块）不持任何锁**。
-/// [`Self::start_session`] 与 [`Self::send_input`] 允许阻塞（实现方回主线程 +
-/// 同步等回执 + 自己兜超时，超时就答 `DesktopBusy`，别永久挂住）；
-/// [`Self::pane_liveness`] 必须**很快**（名额判定一次要问好几个 pane），
-/// 实现方应当从后台线程读得到的状态里现答，别为它跳主线程。
+/// ⚠️ **四个方法都在 HTTP 线程上被调用，且调用方（本模块）不持任何锁**。
+/// [`Self::start_session`] / [`Self::send_input`] / [`Self::read_screen`] 允许阻塞
+/// （实现方回主线程 + 同步等回执 + 自己兜超时，超时就答 `DesktopBusy`，
+/// 别永久挂住）；[`Self::pane_liveness`] 必须**很快**（名额判定一次要问好几个
+/// pane），实现方应当从后台线程读得到的状态里现答，别为它跳主线程。
 pub trait OrchestratorActions: Send + Sync + 'static {
     /// 起一个受编排会话。
     ///
@@ -649,6 +720,23 @@ pub trait OrchestratorActions: Send + Sync + 'static {
     /// 并在回执里[如实说明挑了哪份](Delivered::bracketed_paste)。
     fn send_input(&self, pane_id: u32, input: PaneInput) -> Result<Delivered, SendFailure>;
 
+    /// 读某个乐手终端画面的**尾部 `lines` 行纯文本**（工单 07）。
+    ///
+    /// - `lines` 已经由控制面钳在 `1..=`[`MAX_SCREEN_LINES`]，实现方照办即可；
+    /// - **纯文本**：颜色、粗细、光标位置一律剥掉，行尾空格裁掉，一行一个
+    ///   `String`（`mt_terminal::TerminalEmulator::tail_lines` 就是这个口径）；
+    /// - 尾部**从最后一个非空行往回数** —— 光标下方那一片空屏不该占掉配额；
+    /// - 不足 `lines` 行就有多少给多少，整屏全空给空 `Vec`（那不是失败）。
+    ///
+    /// 目标同样已经过 [`ControlPlane::resolve_target`]，实现方不必再判可见范围。
+    ///
+    /// ⚠️ **要回主线程**：`pty_id → 终端` 那张表（`AppStore::terminals`）是
+    /// gpui 实体的表，只有主线程读得到。终端本体（`Arc<Mutex<Term>>`）倒是后台
+    /// 线程读得动，但为它在旁边另建一份 `pty_id → 终端` 的镜像就是给 pane 生命
+    /// 周期再加一个必须同步注销的地方 —— 漏一次注销就永久攥着一份一万行的回看
+    /// 缓冲。宁可走泵：读一屏是几十微秒的主线程占用，与建 pane 不是一个量级。
+    fn read_screen(&self, pane_id: u32, lines: usize) -> Result<Vec<String>, ScreenFailure>;
+
     /// 这个 pane 现在什么样（活着吗、在不在 AI 会话里）。
     fn pane_liveness(&self, pane_id: u32) -> PaneLiveness;
 }
@@ -666,8 +754,94 @@ impl OrchestratorActions for NoopOrchestratorActions {
     fn send_input(&self, _pane_id: u32, _input: PaneInput) -> Result<Delivered, SendFailure> {
         Err(SendFailure::DesktopBusy)
     }
+    fn read_screen(&self, _pane_id: u32, _lines: usize) -> Result<Vec<String>, ScreenFailure> {
+        Err(ScreenFailure::DesktopBusy)
+    }
     fn pane_liveness(&self, _pane_id: u32) -> PaneLiveness {
         PaneLiveness::gone()
+    }
+}
+
+// ─── 会话记录那条缝 ───────────────────────────────────────────
+
+/// 按会话身份取一整条会话记录的消息序列。
+///
+/// # 为什么这是一条缝
+///
+/// 实现只有一个（[`SessionLogTranscripts`]，也是**默认值** —— 生产路径不注入
+/// 任何东西就是它），抽出来纯粹是为了**测试造得出假会话记录**：三家的定位逻辑
+/// 各自扎在用户 home 底下（`~/.claude/projects` / `~/.codex/sessions` /
+/// `~/.grok/sessions`），而那几个目录的解析是本仓的既有资产，本票是它的消费者、
+/// 不是改造者 —— 既不许给它加一个「根目录可覆写」的参数，也绝不能让测试去读
+/// 用户真实的会话记录。
+///
+/// 与 [`OrchestratorHost`] / [`OrchestratorActions`] 那两条注入缝的区别：那两条
+/// 未注入时是 `Noop`（fail-closed，因为它们要动桌面），这一条未注入时是**真的
+/// 去磁盘上找** —— 读记录不需要桌面端参与，`mt-ai` 自己就是会话记录格式的归属方。
+pub trait TranscriptSource: Send + Sync + 'static {
+    /// 取 `session_id` 这一条会话**从头到此刻**的全部消息，按落盘顺序。
+    ///
+    /// `agent` 是已经收敛过的家族名（`claude` / `codex` / `grok`，见
+    /// [`transcript_family`]），`project_path` 是乐手所在项目的路径。
+    ///
+    /// `None` = 这条会话的记录还读不到（首条消息前尚未落盘，或文件定位失败）。
+    /// **与「会话里一条消息都没有」刻意不区分** —— 对编排者而言两者都是「现在
+    /// 没什么可读的，待会再来」，而对话镜像（`mt_relay::mirror`）在同一处也是
+    /// 给一份空镜像。
+    fn read(
+        &self,
+        agent: &str,
+        session_id: &str,
+        project_path: &str,
+    ) -> Option<Vec<crate::sessions::AiSessionMessage>>;
+}
+
+/// 默认实现：真的去磁盘上找。
+///
+/// 一行都不重新实现解析 —— 整个转交 [`crate::sessions::get_ai_session_content`]，
+/// 那是 AI 历史面板与对话镜像读的同一份代码（路径穿越校验也在它里头）。
+/// `wsl_distro` 传 `None`：受编排会话一律起在本机项目里
+/// （SSH 远程项目在 `start-session` 那一步就被 `remoteProjectUnsupported` 挡掉），
+/// WSL 那条留给工单之外。
+pub struct SessionLogTranscripts;
+
+impl TranscriptSource for SessionLogTranscripts {
+    fn read(
+        &self,
+        agent: &str,
+        session_id: &str,
+        project_path: &str,
+    ) -> Option<Vec<crate::sessions::AiSessionMessage>> {
+        crate::sessions::get_ai_session_content(
+            agent.to_string(),
+            session_id.to_string(),
+            project_path.to_string(),
+            None,
+        )
+        .ok()
+    }
+}
+
+/// agent 名 → 会话记录的家族名。认不出来的一律 `None`。
+///
+/// 口径与 `mt_relay::mirror::resolve_session_file_by_id` **完全一致**（`contains`
+/// 而非全等：hook 上报的是 `claude-code`，输入检测给的是 `claude`；判定顺序也
+/// 一样，codex / grok 先判，其余落 claude）。两处走散就意味着同一个 pane 在镜像
+/// 里绑到一个会话、在这里绑到另一个。
+///
+/// `agent` 为空（hook 上报里 agent 字段缺席）时**按 claude 算** —— 与镜像那条
+/// `else` 分支同一个兜底。这不是启发式：我们仍然只认那个确切的 session_id，
+/// 猜错家族的后果只是文件找不到、答一份空 transcript，绝不会绑到别人的会话上。
+fn transcript_family(agent: &str) -> Option<&'static str> {
+    let agent = agent.to_ascii_lowercase();
+    if agent.contains("codex") {
+        Some("codex")
+    } else if agent.contains("grok") {
+        Some("grok")
+    } else if agent.is_empty() || agent.contains("claude") {
+        Some("claude")
+    } else {
+        None
     }
 }
 
@@ -780,16 +954,20 @@ enum Command {
     ListPanes,
     Send,
     Wait,
+    ReadTranscript,
+    ReadScreen,
 }
 
 impl Command {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 8] = [
         Self::ListLaunchers,
         Self::ListProjects,
         Self::StartSession,
         Self::ListPanes,
         Self::Send,
         Self::Wait,
+        Self::ReadTranscript,
+        Self::ReadScreen,
     ];
 
     /// 路由里那一段（与 sidecar CLI 的 `Command::endpoint` 一字不差）。
@@ -801,6 +979,8 @@ impl Command {
             Self::ListPanes => "list-panes",
             Self::Send => "send",
             Self::Wait => "wait",
+            Self::ReadTranscript => "read-transcript",
+            Self::ReadScreen => "read-screen",
         }
     }
 
@@ -811,26 +991,30 @@ impl Command {
 
     /// 这条命令**能不能就地在 HTTP 那条循环上跑完**。
     ///
-    /// 工单 03~05 里它叫 `blocks_on_desktop`，工单 06 改成了现在这个名字：那时候
-    /// 进表的理由只有一种（要回 gpui 主线程等回执），名字与判据恰好同义；`wait`
-    /// 打破了这个巧合 —— 它**一次也不碰主线程**，却要在这条线程上睡几分钟。
-    /// [`try_handle_control`] 关心的从来只是结论，于是名字改成说结论的那一个。
+    /// [`try_handle_control`] 据此决定要不要另起一条线程 —— hook 那个 HTTP 服务是
+    /// **单线程循环**（`hook_server.rs` 的 `for request in server.incoming_requests()`），
+    /// 占着它就是把 AI 状态感知那条权威通道一起卡住，而它不给编排让路。
     ///
-    /// 两种进表的理由：
+    /// 工单 03~05 里这个方法叫 `blocks_on_desktop`：那时候进表的理由只有一种
+    /// （要回 gpui 主线程等回执），名字与判据恰好同义。工单 06 与 07 各自打破了
+    /// 那个巧合 —— 于是改成说**结论**的这个名字。现在进表的理由有三种：
     ///
-    /// - **要回桌面主线程等回执**（`start-session` / `send`）：那一等按
-    ///   [`ACTION_TIMEOUT`] 算，最长 3 秒；
-    /// - **要长轮询**（`wait`）：主线程一次不惊动，但会在这条线程上睡到
-    ///   [`WAIT_MAX`]（默认 [`WAIT_DEFAULT`]）—— 比前一种久两个数量级。
-    ///
-    /// 两种都绝不能就地做：hook 那个 HTTP 服务是**单线程循环**
-    /// （`hook_server.rs` 的 `for request in server.incoming_requests()`），占着它
-    /// 就是把 AI 状态感知那条权威通道一起卡住 —— 而 `wait` 卡的还不是三秒，
-    /// 是几分钟。工单 07 的 `read` 要回主线程读终端画面，同样进这一档。
+    /// 1. **要回桌面主线程等回执**（`start-session` 建 pane、`send` 写 PTY、
+    ///    `read-screen` 读 gpui 实体手上的终端）：那一等按 [`ACTION_TIMEOUT`] 算，
+    ///    最长 3 秒；
+    /// 2. **要长轮询**（`wait`）：主线程一次不惊动，却要在这条线程上睡到
+    ///    [`WAIT_MAX`]（默认 [`WAIT_DEFAULT`]）—— 比第一种久两个数量级；
+    /// 3. **要做慢 IO**（`read-transcript`）：把整条会话记录读进来解析一遍。跑了
+    ///    几小时的会话，那个 JSONL 可以是几十 MB —— 就地读就是让 hook 上报排在
+    ///    一次全文件解析后面。它不碰主线程，但一样不能占着这条队。
     fn needs_own_thread(self) -> bool {
         match self {
             Self::ListLaunchers | Self::ListProjects | Self::ListPanes => false,
-            Self::StartSession | Self::Send | Self::Wait => true,
+            Self::StartSession
+            | Self::Send
+            | Self::Wait
+            | Self::ReadTranscript
+            | Self::ReadScreen => true,
         }
     }
 }
@@ -844,6 +1028,9 @@ pub struct ControlPlane {
 struct Inner {
     host: Mutex<Option<Arc<dyn OrchestratorHost>>>,
     actions: Mutex<Option<Arc<dyn OrchestratorActions>>>,
+    /// 会话记录的来源。**不是 `Option`** —— 缺省就是真实现
+    /// （[`SessionLogTranscripts`]），生产路径一行都不必接线，只有测试会换掉它。
+    transcripts: Mutex<Arc<dyn TranscriptSource>>,
     /// 令牌登记 + 范围记账。三张表是同一份事实的几个索引,必须在**同一把锁**
     /// 下变更 —— 拆成两把锁时 `grant`(先 grants 后 tokens)与 `revoke_pane`
     /// (先 tokens 后 grants)的加锁顺序相反,是典型的 AB-BA 死锁雷。
@@ -866,6 +1053,7 @@ impl Default for Inner {
         Self {
             host: Mutex::new(None),
             actions: Mutex::new(None),
+            transcripts: Mutex::new(Arc::new(SessionLogTranscripts)),
             registry: Mutex::new(TokenRegistry::default()),
             session_cap: AtomicUsize::new(DEFAULT_SESSION_CAP),
             origins_version: AtomicU64::new(0),
@@ -964,6 +1152,14 @@ impl ControlPlane {
     /// 注入桌面动作。未注入时等价于 [`NoopOrchestratorActions`]（起会话恒失败）。
     pub fn set_actions(&self, actions: Arc<dyn OrchestratorActions>) {
         *self.inner.actions.lock() = Some(actions);
+    }
+
+    /// 换掉会话记录的来源。
+    ///
+    /// **生产路径不调它** —— 缺省的 [`SessionLogTranscripts`] 就是真实现。
+    /// 存在的唯一理由是让主缝/辅缝测试造得出假会话记录，见 [`TranscriptSource`]。
+    pub fn set_transcripts(&self, transcripts: Arc<dyn TranscriptSource>) {
+        *self.inner.transcripts.lock() = transcripts;
     }
 
     /// 改并发上限（工单 08 的设置项落点）。`0` = 不许起任何乐手。
@@ -1150,6 +1346,15 @@ impl ControlPlane {
         }
     }
 
+    fn host_pane_session(&self, pane_id: u32) -> Option<PaneSession> {
+        self.inner.host.lock().as_ref()?.pane_session(pane_id)
+    }
+
+    /// 取会话记录来源。**取出来就放锁** —— 后面那一下是读整个文件。
+    fn transcripts(&self) -> Arc<dyn TranscriptSource> {
+        self.inner.transcripts.lock().clone()
+    }
+
     /// 取动作实现。**取出来就放锁** —— 后面那些调用可能阻塞好几秒
     /// （`start-session` 要等主线程），持着锁等于把整个控制面挂住。
     fn actions(&self) -> Arc<dyn OrchestratorActions> {
@@ -1303,6 +1508,8 @@ impl ControlPlane {
             Command::StartSession => self.start_session(&grant, &request),
             Command::Send => self.send(&grant, &request),
             Command::Wait => self.wait(&grant, &request),
+            Command::ReadTranscript => self.read_transcript(&grant, &request),
+            Command::ReadScreen => self.read_screen(&grant, &request),
             Command::ListPanes => {
                 let actions = self.actions();
                 let panes = self
@@ -1500,6 +1707,128 @@ impl ControlPlane {
             std::thread::sleep(WAIT_POLL_INTERVAL.min(remaining));
         }
     }
+
+    /// `read-transcript`：按增量读乐手的**结构化会话记录**（工单 07）。
+    ///
+    /// # 绑定只认 hook 上报的会话身份，**禁止启发式**
+    ///
+    /// 这是与对话镜像同一条铁律（`mt_relay::mirror` 的模块注释与 CLAUDE.md 各写
+    /// 了一遍）：找不到身份就明确报错，**绝不**回退到「这个项目里最新的那个会话
+    /// 文件」。那条退路踩过坑 —— 同一个项目里另一个 agent 的对话会被贴到这个
+    /// pane 上，编排者读到的是**别人的**会话。宁可让它去 `read-screen`。
+    ///
+    /// # 能力分层（ADR 0003）
+    ///
+    /// 只有 Claude / Codex / Grok 有可解析的记录。opencode / pi 之流拿得到状态
+    /// 徽章、拿得到 `send`，但没有 transcript —— 那一档给专门的
+    /// [`ControlError::TranscriptUnsupported`]，消息里直接写「改用 read-screen」，
+    /// 编排者不必自己猜下一步。
+    ///
+    /// # 增量：游标就是 seq，与镜像同一套语义
+    ///
+    /// `seq` 是这条会话记录里消息的**序号**（0 起、连续、只增），与
+    /// `mt_relay::mirror::MirrorParser` 给镜像消息编的那个 seq 是同一套东西 ——
+    /// 不另发明第二种游标。编排者把上次拿到的 `nextCursor` 原样传回来，
+    /// 这边只回它之后的部分。
+    ///
+    /// 服务端**不存**任何游标：seq 是「从头解析这一条会话记录」这件事的确定性
+    /// 产物（记录文件只追加不改写），每次现算即可。代价是每次请求都要把整条记录
+    /// 读一遍（所以这条命令登记在 [`Command::needs_own_thread`] 里）；收益是
+    /// 控制面不必为每个编排者×每个乐手维护一份会不会走散的解析器状态。
+    ///
+    /// ⚠️ **游标只在一个 `sessionId` 内有意义**：乐手 `/clear` 或退出重开之后
+    /// 是另一条会话、seq 从 0 重新数。回执里带着 `sessionId` 就是为了让编排者
+    /// 认得出这一跳，它一变就该把游标归零。
+    fn read_transcript(&self, grant: &Grant, request: &ControlRequest) -> ControlOutcome {
+        let Some(target_pane_id) = request.target_pane_id else {
+            return ControlError::BadRequest.into_outcome();
+        };
+        // 可见范围铁律走**共用**的那一条，别在这儿另写一遍。
+        let session = match self.resolve_target(grant, target_pane_id) {
+            Ok(s) => s,
+            Err(e) => return e.into_outcome(),
+        };
+        let identity = self.host_pane_session(session.pane_id).unwrap_or_default();
+        // 裁决一：能力分层。认得出是哪一家、但那一家没有记录 → 明确改道。
+        // （agent 名缺席时落 claude，见 [`transcript_family`]。）
+        let Some(family) = transcript_family(identity.agent.as_deref().unwrap_or_default()) else {
+            return ControlError::TranscriptUnsupported.into_outcome();
+        };
+        // 裁决二：绑定。没有 hook 上报的会话身份就到此为止 —— **不猜**。
+        let Some(session_id) = nonempty(identity.session_id.as_deref()) else {
+            return ControlError::SessionUnidentified.into_outcome();
+        };
+        // 定位用的项目路径取自记账里那个项目（乐手就是在它里头起的）。
+        // 与镜像同一个口径：它也是拿 pane 所属项目的路径去找会话桶，不看 pane
+        // 自己的 cwd —— 那个 cwd 只在 hook 推送的事件里有，查不到。
+        let project_path = self
+            .host_projects()
+            .into_iter()
+            .find(|p| p.id == session.project_id)
+            .map(|p| p.path)
+            .unwrap_or_default();
+
+        // ⚠️ 读文件是慢活，**已经出锁**（`resolve_target` 与 `host_*` 都已经
+        // 各自取完放掉了 registry 锁）。
+        let messages = self
+            .transcripts()
+            .read(family, session_id, &project_path)
+            .unwrap_or_default();
+        let total = messages.len() as u64;
+        // 游标越界（编排者传了个大于总数的数 / 换绑后记录变短）一律钳回 —— 报错
+        // 帮不上忙，钳回去它下一次就对了。
+        let cursor = request.cursor.unwrap_or(0).min(total);
+        let out = slice_transcript(&messages, cursor);
+        let next_cursor = cursor + out.len() as u64;
+        ok_outcome(&ControlData::Transcript {
+            transcript: TranscriptView {
+                pane_id: session.pane_id,
+                agent: family.to_string(),
+                session_id: session_id.to_string(),
+                cursor,
+                next_cursor,
+                total,
+                has_more: next_cursor < total,
+                messages: out,
+            },
+        })
+    }
+
+    /// `read-screen`：直读乐手终端画面尾部若干行纯文本（工单 07）。
+    ///
+    /// **对所有乐手可用** —— 这是没有会话记录那一档的兜底，也是看清审批提示原文
+    /// （黄灯那一档，ADR 0003 的「attention 不代答」要求编排者把原文播报给用户）
+    /// 的唯一途径。于是这里**不做任何 agent 家族判断**：能过
+    /// [`Self::resolve_target`] 就能读。
+    fn read_screen(&self, grant: &Grant, request: &ControlRequest) -> ControlOutcome {
+        let Some(target_pane_id) = request.target_pane_id else {
+            return ControlError::BadRequest.into_outcome();
+        };
+        // 行数**钳**不**拒**：`0` 与超大值都是编排者随手写出来的，为它们各造一个
+        // 错误码只会多一次往返。默认值与上界见那两个常量。
+        let lines = request
+            .lines
+            .map(|n| (n as usize).clamp(1, MAX_SCREEN_LINES))
+            .unwrap_or(DEFAULT_SCREEN_LINES);
+        let session = match self.resolve_target(grant, target_pane_id) {
+            Ok(s) => s,
+            Err(e) => return e.into_outcome(),
+        };
+        match self.actions().read_screen(session.pane_id, lines) {
+            Ok(rows) => {
+                let (rows, truncated) = cap_screen_bytes(rows);
+                ok_outcome(&ControlData::Screen {
+                    screen: ScreenView {
+                        pane_id: session.pane_id,
+                        lines: rows,
+                        truncated,
+                    },
+                })
+            }
+            Err(ScreenFailure::PaneGone) => ControlError::PaneGone.into_outcome(),
+            Err(ScreenFailure::DesktopBusy) => ControlError::DesktopBusy.into_outcome(),
+        }
+    }
 }
 
 /// 编排者要的耐心 → 实际等多久。不给就是 [`WAIT_DEFAULT`]，超上界按 [`WAIT_MAX`] 算。
@@ -1531,6 +1860,84 @@ fn wait_outcome(
             waited_ms: waited.as_millis() as u64,
         },
     })
+}
+
+/// 从 `cursor` 起裁一段 transcript，受 [`MAX_READ_BYTES`] 约束。
+///
+/// **不满就整条不给**：宁可少给一条、让编排者下次再取，也不把一条消息劈成两半
+/// —— 半条 agent 回答对读的人没有价值，而游标语义是「第几条」，劈开就没法表达
+/// 「我读到某条的一半」。
+///
+/// **例外是第一条**：它自己就顶穿预算时必须给出去（截断 + 标记），否则
+/// `nextCursor` 永远等于 `cursor`，编排者会卡在这条消息上无限重试 —— 一条
+/// 内容超大的消息就能把整条会话记录后面的部分永久挡住。
+fn slice_transcript(
+    messages: &[crate::sessions::AiSessionMessage],
+    cursor: u64,
+) -> Vec<TranscriptMessageView> {
+    let mut out: Vec<TranscriptMessageView> = Vec::new();
+    let mut budget = MAX_READ_BYTES;
+    for (offset, msg) in messages.iter().skip(cursor as usize).enumerate() {
+        let seq = cursor + offset as u64;
+        if msg.content.len() <= budget {
+            budget -= msg.content.len();
+            out.push(TranscriptMessageView {
+                seq,
+                role: msg.role.clone(),
+                content: msg.content.clone(),
+                timestamp: msg.timestamp.clone(),
+                truncated: false,
+            });
+            continue;
+        }
+        if out.is_empty() {
+            out.push(TranscriptMessageView {
+                seq,
+                role: msg.role.clone(),
+                content: truncate_on_char_boundary(&msg.content, MAX_READ_BYTES),
+                timestamp: msg.timestamp.clone(),
+                truncated: true,
+            });
+        }
+        break;
+    }
+    out
+}
+
+/// 按**字节**截断，落在字符边界上。
+///
+/// 不按字符数截：预算是字节预算（回执要装进 HTTP 响应），而一个汉字三字节 ——
+/// 按字符数算会让中文回答的实际体量翻三倍。
+fn truncate_on_char_boundary(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
+}
+
+/// 给一屏文本套上字节上界，**从头上砍、保住尾部**。
+///
+/// 与 transcript 那条相反的取舍：那条有游标，砍掉的部分下次取得回来；这条没有
+/// （画面是此刻的样子，没有「上一页」可言），而编排者要看的永远是最新那几行
+/// —— 于是丢最旧的。返回的布尔如实说明砍过。
+fn cap_screen_bytes(rows: Vec<String>) -> (Vec<String>, bool) {
+    // 每行按「内容 + 一个换行」计：编排者拿到的就是一段带换行的文本。
+    let mut total: usize = rows.iter().map(|r| r.len() + 1).sum();
+    if total <= MAX_READ_BYTES {
+        return (rows, false);
+    }
+    let mut kept: std::collections::VecDeque<String> = rows.into();
+    while total > MAX_READ_BYTES {
+        let Some(dropped) = kept.pop_front() else {
+            break;
+        };
+        total -= dropped.len() + 1;
+    }
+    (kept.into(), true)
 }
 
 /// trim 之后还剩东西的那一档；空串与全空白一律当没给。
@@ -1605,6 +2012,14 @@ struct ControlRequest {
     /// 任何回执里（ADR 0002 的防线延伸）。
     #[serde(default)]
     text: Option<String>,
+    /// `read-transcript`：从第几条读起（= 上次回执里的 `nextCursor`）。
+    /// 不给就是从头。越界一律钳回总数，不报错。
+    #[serde(default)]
+    cursor: Option<u64>,
+    /// `read-screen`：要画面尾部多少行。不给用 [`DEFAULT_SCREEN_LINES`]，
+    /// 给了钳进 `1..=`[`MAX_SCREEN_LINES`]。
+    #[serde(default)]
+    lines: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1620,6 +2035,10 @@ enum ControlData {
     Sent { sent: SentView },
     /// `wait` 的回执。
     Waited { waited: WaitView },
+    /// `read-transcript`：一段结构化会话记录增量。
+    Transcript { transcript: TranscriptView },
+    /// `read-screen`：终端画面尾部若干行纯文本。
+    Screen { screen: ScreenView },
 }
 
 #[derive(Debug, Serialize)]
@@ -1719,6 +2138,63 @@ struct WaitView {
     waited_ms: u64,
 }
 
+/// `read-transcript` 的回执。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TranscriptView {
+    /// 读的是哪个乐手。
+    pane_id: u32,
+    /// 记录家族：`claude` / `codex` / `grok`。
+    agent: String,
+    /// 这一段属于哪条会话。
+    ///
+    /// **游标只在同一个 `sessionId` 内有意义** —— 乐手 `/clear` 或退出重开之后
+    /// seq 从 0 重新数。编排者按这个字段认换绑，一变就把游标归零。
+    session_id: String,
+    /// 本次实际从第几条起（= 请求的 `cursor` 钳进 `0..=total` 之后的值）。
+    cursor: u64,
+    /// 下次该传的游标。**没有新内容时它等于 `cursor`**。
+    next_cursor: u64,
+    /// 这条会话此刻一共有多少条消息。
+    total: u64,
+    /// 还有没读完的（被本次回执的字节上界挡住了）—— 接着按 `nextCursor` 取。
+    has_more: bool,
+    messages: Vec<TranscriptMessageView>,
+}
+
+/// transcript 里的一条消息。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TranscriptMessageView {
+    /// 这条会话里的序号（0 起、连续、只增；与对话镜像的 seq 同一套语义）。
+    seq: u64,
+    /// `user` / `assistant`（与 `mt_ai::sessions` 的解析口径一致）。
+    role: String,
+    content: String,
+    /// 记录里的时间戳，原样透传（各家格式不同，不在这里归一）。
+    timestamp: String,
+    /// 这条的正文被字节上界截断了。
+    ///
+    /// 只可能发生在**一条消息自己就超过上界**的时候（那时必须给出去，否则游标
+    /// 永远走不过它）。为真意味着这一条的后半截**再也取不回来** —— 要全文请去
+    /// 看那个 pane 或它的会话记录文件。
+    truncated: bool,
+}
+
+/// `read-screen` 的回执。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ScreenView {
+    pane_id: u32,
+    /// 画面尾部若干行纯文本，**旧的在前**（与人眼看屏幕的顺序一致）。
+    /// 颜色与属性一律剥掉，行尾空格裁掉。
+    lines: Vec<String>,
+    /// 字节上界砍掉了开头几行。**不包括**「请求的行数比屏幕上的内容少」那一档
+    /// —— 那一档编排者自己看得出来（拿到的行数正好等于它要的），加大 `lines`
+    /// 再取一次即可。
+    truncated: bool,
+}
+
 fn pane_view(session: &OrchestratedSession, liveness: &PaneLiveness) -> PaneView {
     PaneView {
         pane_id: session.pane_id,
@@ -1781,6 +2257,18 @@ pub(crate) enum ControlError {
     EmptyInput,
     /// 找得到那个乐手，但正文没交到它的 PTY 手上。
     SendFailed,
+    // ── 工单 07 ──
+    /// 这个乐手跑的 agent **没有可解析的会话记录**（opencode / pi 之流）。
+    ///
+    /// 能力分层（ADR 0003）的用户可见面。与下面那条分开成两个码，是因为编排者
+    /// 该做的事不同：这一条**永远不会好转**，换 `read-screen`；那一条只是还没
+    /// 上报，等一下可能就有了。
+    TranscriptUnsupported,
+    /// 这个乐手上还没有 hook 上报过会话身份，**无从绑定**。
+    ///
+    /// 绝不退回「项目里最新的那个会话文件」—— 那会把同项目里别人的对话贴过来
+    /// （对话镜像踩过的坑，CLAUDE.md 有记）。
+    SessionUnidentified,
 }
 
 impl ControlError {
@@ -1803,6 +2291,8 @@ impl ControlError {
             Self::PaneGone => "paneGone",
             Self::EmptyInput => "emptyInput",
             Self::SendFailed => "sendFailed",
+            Self::TranscriptUnsupported => "transcriptUnsupported",
+            Self::SessionUnidentified => "sessionUnidentified",
         }
     }
 
@@ -1811,7 +2301,10 @@ impl ControlError {
             Self::MissingToken | Self::InvalidToken => 401,
             Self::BadRequest | Self::EmptyInput => 400,
             Self::UnknownCommand | Self::LauncherNotFound | Self::PaneNotFound => 404,
-            Self::ProjectUnavailable | Self::RemoteProjectUnsupported => 409,
+            Self::ProjectUnavailable
+            | Self::RemoteProjectUnsupported
+            | Self::TranscriptUnsupported
+            | Self::SessionUnidentified => 409,
             Self::PayloadTooLarge => 413,
             Self::ProjectUnreachable | Self::SelfTarget => 403,
             Self::SessionLimitReached => 429,
@@ -1856,6 +2349,14 @@ impl ControlError {
                  behalf, which an orchestrator must not do"
             }
             Self::SendFailed => "the desktop could not deliver that input to the session",
+            // 能力分层的用户可见面：直接把下一步写出来，别让编排者猜。
+            Self::TranscriptUnsupported => {
+                "that agent keeps no readable transcript; use read-screen to see its terminal instead"
+            }
+            Self::SessionUnidentified => {
+                "no AI session has been reported for that orchestrated session yet; \
+                 use read-screen, or try again once it has started answering"
+            }
         }
     }
 
@@ -1925,9 +2426,9 @@ pub(crate) fn try_handle_control(
         respond(request, ControlError::PayloadTooLarge.into_outcome());
         return None;
     }
-    // 会阻塞在桌面主线程上的命令：**不能占着这条 HTTP 线程等** —— 它同时也是
-    // hook 上报的那条队（见模块注释）。鉴权先在本线程做掉挡住无令牌请求，
-    // 已鉴权的活丢给一条一次性线程跑完再响应。
+    // 占着这条 HTTP 线程干活的命令（等主线程 / 读整个会话记录文件）：**不能就地
+    // 干** —— 它同时也是 hook 上报的那条队（见模块注释）。鉴权先在本线程做掉
+    // 挡住无令牌请求，已鉴权的活丢给一条一次性线程跑完再响应。
     //
     // 每条请求一个线程而不是线程池：控制命令是编排者手动调 CLI 触发的低频动作，
     // 一个池子的复杂度换不来什么；而带令牌的请求方本来就是我们自己起的进程。
@@ -1958,7 +2459,21 @@ fn respond(request: tiny_http::Request, outcome: ControlOutcome) {
         .with_header(
             tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
                 .expect("static header"),
-        );
+        )
+        // ⚠️ **一律用 Content-Length，绝不 chunked**。
+        //
+        // tiny_http 默认在 body ≥ 32 KiB 时自动切成 `Transfer-Encoding: chunked`
+        // （`chunked_threshold` 的默认值），而对面那个 sidecar CLI 是**手写的
+        // HTTP 客户端**：它按 `\r\n\r\n` 切一次头体，剩下的整块当 JSON 解析
+        // （`mt_agent_control` 不带任何 HTTP 客户端依赖，那是它的设计取舍）。
+        // 一旦分块，body 里就混进十六进制的块长度行，CLI 只会答
+        // `malformedResponse` —— 而工单 07 的两条读命令**正是**第一批产得出
+        // 32 KiB 以上回执的命令（`list-*` / `send` 的回执都只有几百字节）。
+        //
+        // 把阈值顶到最大即「有多长写多长的 Content-Length」。我们的回执体量本来
+        // 就自带上界（[`MAX_READ_BYTES`]），不需要流式分块省内存。
+        // 这条由 `大回执不许走分块传输` 钉住。
+        .with_chunked_threshold(usize::MAX);
     let _ = request.respond(response);
 }
 
@@ -1977,6 +2492,32 @@ mod tests {
     struct FakeHost {
         launchers: Mutex<Vec<ControlLauncher>>,
         projects: Mutex<Vec<ControlProject>>,
+        /// pane → hook 上报的会话身份。没登记过 = 还没上报（`read-transcript`
+        /// 的「无从绑定」那一档）。
+        sessions: Mutex<HashMap<u32, PaneSession>>,
+    }
+
+    impl FakeHost {
+        /// hook 上报过身份的乐手（Claude/Codex/Grok 那一档）。
+        fn identify(&self, pane_id: u32, agent: &str, session_id: &str) {
+            self.sessions.lock().insert(
+                pane_id,
+                PaneSession {
+                    session_id: Some(session_id.into()),
+                    agent: Some(agent.into()),
+                },
+            );
+        }
+        /// 只有输入检测认出了 agent、没有 hook 身份（opencode / pi 那一档）。
+        fn detected_only(&self, pane_id: u32, agent: &str) {
+            self.sessions.lock().insert(
+                pane_id,
+                PaneSession {
+                    session_id: None,
+                    agent: Some(agent.into()),
+                },
+            );
+        }
     }
 
     impl OrchestratorHost for Arc<FakeHost> {
@@ -1985,6 +2526,54 @@ mod tests {
         }
         fn projects(&self) -> Vec<ControlProject> {
             self.projects.lock().clone()
+        }
+        fn pane_session(&self, pane_id: u32) -> Option<PaneSession> {
+            self.sessions.lock().get(&pane_id).cloned()
+        }
+    }
+
+    /// 假会话记录：按 `(家族, session_id)` 登记几条消息。
+    ///
+    /// **绝不碰用户真实的 `~/.claude` / `~/.codex` / `~/.grok`** —— 那是本票
+    /// 抽出 [`TranscriptSource`] 这条缝的全部理由。
+    #[derive(Default)]
+    struct FakeTranscripts {
+        logs: Mutex<HashMap<(String, String), Vec<crate::sessions::AiSessionMessage>>>,
+        /// 每次 `read` 收到的 `(家族, session_id, 项目路径)`，按顺序。
+        calls: Mutex<Vec<(String, String, String)>>,
+    }
+
+    impl FakeTranscripts {
+        fn put(&self, agent: &str, session_id: &str, msgs: &[(&str, &str)]) {
+            self.logs.lock().insert(
+                (agent.into(), session_id.into()),
+                msgs.iter()
+                    .map(|(role, content)| crate::sessions::AiSessionMessage {
+                        role: (*role).into(),
+                        content: (*content).into(),
+                        timestamp: "2026-09-01T00:00:00Z".into(),
+                    })
+                    .collect(),
+            );
+        }
+    }
+
+    impl TranscriptSource for Arc<FakeTranscripts> {
+        fn read(
+            &self,
+            agent: &str,
+            session_id: &str,
+            project_path: &str,
+        ) -> Option<Vec<crate::sessions::AiSessionMessage>> {
+            self.calls.lock().push((
+                agent.into(),
+                session_id.into(),
+                project_path.into(),
+            ));
+            self.logs
+                .lock()
+                .get(&(agent.into(), session_id.into()))
+                .cloned()
         }
     }
 
@@ -2056,6 +2645,13 @@ mod tests {
         /// 目标终端开着 bracketed paste 吗。
         /// `None` = 常态（乐手都是 AI TUI，一律开着）。
         bracketed_paste: Mutex<Option<bool>>,
+        /// pane → 那个终端画面上此刻的行（**从旧到新**，已经是纯文本）。
+        screens: Mutex<HashMap<u32, Vec<String>>>,
+        /// 每次 `read_screen` 收到的 `(pane_id, 行数)`，按顺序 ——
+        /// 钳位是控制面的裁决，桌面侧收到的那个数就是判据。
+        screen_calls: Mutex<Vec<(u32, usize)>>,
+        /// 非 `None` 时 `read_screen` 一律这么失败。
+        screen_fail: Mutex<Option<ScreenFailure>>,
     }
 
     impl FakeActions {
@@ -2108,6 +2704,12 @@ mod tests {
         fn unknown(&self, pane_id: u32) {
             self.set(pane_id, true, "idle", AiSessionState::Unknown);
         }
+        /// 摆一屏画面（从旧到新）。
+        fn screen(&self, pane_id: u32, rows: &[&str]) {
+            self.screens
+                .lock()
+                .insert(pane_id, rows.iter().map(|s| (*s).to_string()).collect());
+        }
     }
 
     impl OrchestratorActions for Arc<FakeActions> {
@@ -2152,6 +2754,21 @@ mod tests {
             Ok(Delivered {
                 bracketed_paste: self.bracketed_paste.lock().unwrap_or(true),
             })
+        }
+
+        /// 与真桌面同形：只给尾部 `lines` 行（钳位已经由控制面做完），
+        /// 并把收到的行数抄下来 —— 那个数就是钳位裁决的判据。
+        fn read_screen(&self, pane_id: u32, lines: usize) -> Result<Vec<String>, ScreenFailure> {
+            if let Some(d) = *self.delay.lock() {
+                std::thread::sleep(d);
+            }
+            self.screen_calls.lock().push((pane_id, lines));
+            if let Some(err) = *self.screen_fail.lock() {
+                return Err(err);
+            }
+            let rows = self.screens.lock().get(&pane_id).cloned().unwrap_or_default();
+            let skip = rows.len().saturating_sub(lines);
+            Ok(rows.into_iter().skip(skip).collect())
         }
 
         fn pane_liveness(&self, pane_id: u32) -> PaneLiveness {
@@ -2266,6 +2883,74 @@ mod tests {
         let (status, v) = start(port, token, r#""launcherId":"claude""#);
         assert_eq!(status, 200, "{v}");
         v["data"]["pane"]["paneId"].as_u64().unwrap() as u32
+    }
+
+    /// 「已经起了一个乐手」的现场 —— 读结果那一组测试的开场白。
+    ///
+    /// 比 [`granted`] 多一样：一份[假会话记录](FakeTranscripts)顶掉真磁盘。
+    /// 返回 `(host, actions, transcripts, port, token, 乐手 pane 编号)`。
+    fn reading() -> (
+        Arc<FakeHost>,
+        Arc<FakeActions>,
+        Arc<FakeTranscripts>,
+        u16,
+        String,
+        u32,
+    ) {
+        let host = Arc::new(FakeHost::default());
+        *host.launchers.lock() = vec![launcher("claude", "Claude")];
+        *host.projects.lock() = vec![project("p-self", None)];
+        let actions = Arc::new(FakeActions::default());
+        let transcripts = Arc::new(FakeTranscripts::default());
+        let plane = ControlPlane::new();
+        plane.set_host(Arc::new(host.clone()));
+        plane.set_actions(Arc::new(actions.clone()));
+        plane.set_transcripts(Arc::new(transcripts.clone()));
+        let token = plane.grant(7, "p-self");
+        let port = serve(plane.clone());
+        let musician = start_musician(port, &token);
+        (host, actions, transcripts, port, token, musician)
+    }
+
+    /// `read-transcript` 一次。`cursor` 为 `None` 就是从头。
+    fn transcript(
+        port: u16,
+        token: &str,
+        target: u32,
+        cursor: Option<u64>,
+    ) -> (u16, serde_json::Value) {
+        let extra = match cursor {
+            Some(c) => format!(r#""targetPaneId":{target},"cursor":{c}"#),
+            None => format!(r#""targetPaneId":{target}"#),
+        };
+        let (status, body) = post(port, "/control/read-transcript", &payload_of(token, &extra));
+        (status, json(&body))
+    }
+
+    /// `read-screen` 一次。`lines` 为 `None` 就是用默认行数。
+    fn screen(port: u16, token: &str, target: u32, lines: Option<u32>) -> (u16, serde_json::Value) {
+        let extra = match lines {
+            Some(n) => format!(r#""targetPaneId":{target},"lines":{n}"#),
+            None => format!(r#""targetPaneId":{target}"#),
+        };
+        let (status, body) = post(port, "/control/read-screen", &payload_of(token, &extra));
+        (status, json(&body))
+    }
+
+    /// 回执里那几条消息的 `(seq, role, content)`。
+    fn msgs(v: &serde_json::Value) -> Vec<(u64, String, String)> {
+        v["data"]["transcript"]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| {
+                (
+                    m["seq"].as_u64().unwrap(),
+                    m["role"].as_str().unwrap().to_string(),
+                    m["content"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
     }
 
     // ─── 鉴权 fail-closed ─────────────────────────────────────
@@ -2919,6 +3604,13 @@ mod tests {
                 Ok(Delivered {
                     bracketed_paste: true,
                 })
+            }
+            fn read_screen(
+                &self,
+                _pane_id: u32,
+                _lines: usize,
+            ) -> Result<Vec<String>, ScreenFailure> {
+                Ok(Vec::new())
             }
             fn pane_liveness(&self, pane_id: u32) -> PaneLiveness {
                 PaneLiveness {
@@ -4048,9 +4740,9 @@ mod tests {
 
     // ─── 命令表 ───────────────────────────────────────────────
 
-    /// 命令名与「能不能就地跑完」只有一份表。加一个变体时 `ALL` / `name` /
-    /// `needs_own_thread` / `handle` 的分发会一起编译不过 —— 这条测试补的是
-    /// 「表里那几条自己对得上」。
+    /// 命令名与「能不能就地在 HTTP 线程上答完」只有一份表。加一个变体时 `ALL` /
+    /// `name` / `needs_own_thread` / `handle` 的分发会一起编译不过 —— 这条测试补
+    /// 的是「表里那几条自己对得上」。
     #[test]
     fn 每条命令都解析得回自己() {
         for cmd in Command::ALL {
@@ -4066,32 +4758,45 @@ mod tests {
                 "start-session",
                 "list-panes",
                 "send",
-                "wait"
+                "wait",
+                "read-transcript",
+                "read-screen",
             ]
         );
         // 认不出的一律 None（带查询串 / 多层路径的别去猜）。
         // ⚠️ 占位名必须是**永远不会被实现**的那种：工单 05 的留档记着这条教训
         // （它当年拿 `send` 当占位，05 一落地那条测试就成了「send 居然是未知命令」）。
-        // 工单 07 的 `read` 同理，别写进来。
+        // `read` 也不行 —— 07 的两条命令虽叫 `read-transcript`/`read-screen`，
+        // 但这种「像某条命令的前缀」的占位迟早再踩一次。
         for bad in ["", "send?x=1", "send/extra", "wait/", "no-such-command"] {
             assert_eq!(Command::parse(bad), None, "{bad}");
         }
     }
 
-    /// 「别在 HTTP 那条循环里就地做」的那些命令都登记齐了，其余就地答完。
+    /// 占着 HTTP 线程干活的命令都登记在表上，其余就地答完。
     ///
-    /// 两种进表的理由（见 [`Command::needs_own_thread`]）：`start-session` / `send`
-    /// 要回 gpui 主线程等回执；`wait` 主线程一次不碰，但要在这条线程上睡到几分钟。
-    /// 漏登记任意一条都会把 hook 上报那条队一起卡住 —— 正是这张表要防的事，
-    /// 而 `wait` 卡的不是三秒，是几分钟。
+    /// 三种「占着」都要登记（见 [`Command::needs_own_thread`]）：要回主线程的
+    /// （`start-session` 建 pane、`send` 写 PTY、`read-screen` 读 gpui 实体手上的
+    /// 终端）、要长轮询的（`wait` 主线程一次不碰，却要睡到几分钟）、要做慢 IO 的
+    /// （`read-transcript` 读整条会话记录）。漏登记任何一条都会把 hook 上报那条队
+    /// 一起卡住 —— 正是这张表要防的事，而 `wait` 卡的不是三秒，是几分钟。
     #[test]
-    fn 不能就地跑完的命令都登记在表里() {
-        let threaded: Vec<&str> = Command::ALL
+    fn 占着_http_线程的命令都登记在表里() {
+        let own_thread: Vec<&str> = Command::ALL
             .iter()
             .filter(|c| c.needs_own_thread())
             .map(|c| c.name())
             .collect();
-        assert_eq!(threaded, vec!["start-session", "send", "wait"]);
+        assert_eq!(
+            own_thread,
+            vec![
+                "start-session",
+                "send",
+                "wait",
+                "read-transcript",
+                "read-screen"
+            ]
+        );
     }
 
     // ─── 阻塞命令不占 HTTP 线程 ───────────────────────────────
@@ -4134,5 +4839,581 @@ mod tests {
             assert!(status == 401 || status == 400, "payload={payload}: {body}");
         }
         assert!(actions.calls.lock().is_empty(), "被拒的请求不许惊动桌面端");
+    }
+
+    // ─── 读结果：read-transcript（工单 07）───────────────────────
+
+    /// 三家的回答都能以结构化增量读出：**首次全量、之后只给新增**。
+    ///
+    /// hook 上报的 agent 名各家形态不同（`claude-code` / `codex` / `grok`），
+    /// 收敛成家族名这件事由 [`transcript_family`] 做，这里连着一起钉。
+    #[test]
+    fn 三家的会话记录都能按增量读出() {
+        for (agent, family) in [
+            ("claude-code", "claude"),
+            ("codex", "codex"),
+            ("grok", "grok"),
+        ] {
+            let (host, _actions, transcripts, port, token, m) = reading();
+            host.identify(m, agent, "s-1");
+            transcripts.put(
+                family,
+                "s-1",
+                &[("user", "跑一下测试"), ("assistant", "跑完了，两个红")],
+            );
+
+            // 首次：从头拿全量
+            let (status, v) = transcript(port, &token, m, None);
+            assert_eq!(status, 200, "{agent}: {v}");
+            let t = &v["data"]["transcript"];
+            assert_eq!(t["agent"], family, "agent 名要收敛成家族名");
+            assert_eq!(t["sessionId"], "s-1");
+            assert_eq!(t["paneId"].as_u64().unwrap() as u32, m);
+            assert_eq!(t["cursor"], 0);
+            assert_eq!(t["total"], 2);
+            assert_eq!(t["nextCursor"], 2);
+            assert_eq!(t["hasMore"], false);
+            assert_eq!(
+                msgs(&v),
+                vec![
+                    (0, "user".into(), "跑一下测试".into()),
+                    (1, "assistant".into(), "跑完了，两个红".into()),
+                ],
+                "{agent}"
+            );
+
+            // 乐手又答了一轮
+            transcripts.put(
+                family,
+                "s-1",
+                &[
+                    ("user", "跑一下测试"),
+                    ("assistant", "跑完了，两个红"),
+                    ("user", "修一下"),
+                    ("assistant", "修好了"),
+                ],
+            );
+            // 增量：**只含上次之后的内容**
+            let (status, v) = transcript(port, &token, m, Some(2));
+            assert_eq!(status, 200, "{agent}: {v}");
+            assert_eq!(
+                msgs(&v),
+                vec![
+                    (2, "user".into(), "修一下".into()),
+                    (3, "assistant".into(), "修好了".into()),
+                ],
+                "{agent}: 增量里混进了已经读过的内容"
+            );
+            assert_eq!(v["data"]["transcript"]["nextCursor"], 4);
+
+            // 没有新内容时：空一段，游标原地不动（不是错误）
+            let (status, v) = transcript(port, &token, m, Some(4));
+            assert_eq!(status, 200, "{agent}: {v}");
+            assert!(msgs(&v).is_empty());
+            assert_eq!(v["data"]["transcript"]["cursor"], 4);
+            assert_eq!(v["data"]["transcript"]["nextCursor"], 4);
+            assert_eq!(v["data"]["transcript"]["hasMore"], false);
+        }
+    }
+
+    /// 定位用的三样东西如实传给记录来源：家族名、hook 上报的那个 session_id、
+    /// **乐手所在项目的路径**（不是编排者的、不是猜的）。
+    #[test]
+    fn 记录定位按会话身份与项目路径() {
+        let (host, _actions, transcripts, port, token, m) = reading();
+        host.identify(m, "claude-code", "s-42");
+        transcripts.put("claude", "s-42", &[("assistant", "在")]);
+
+        let (status, _v) = transcript(port, &token, m, None);
+        assert_eq!(status, 200);
+        assert_eq!(
+            *transcripts.calls.lock(),
+            vec![(
+                "claude".to_string(),
+                "s-42".to_string(),
+                "D:\\repos\\p-self".to_string()
+            )]
+        );
+    }
+
+    /// **能力分层**：没有可解析会话记录的 agent 调 `read-transcript` 得到明确
+    /// 错误，且错误消息里直接写着改用 `read-screen`。
+    #[test]
+    fn 无记录的_agent_读_transcript_被明确拒绝() {
+        for agent in ["opencode", "pi"] {
+            let (host, _actions, transcripts, port, token, m) = reading();
+            host.detected_only(m, agent);
+
+            let (status, body) = post(
+                port,
+                "/control/read-transcript",
+                &payload_of(&token, &format!(r#""targetPaneId":{m}"#)),
+            );
+            assert_eq!(status, 409, "{agent}: {body}");
+            assert_eq!(error_code(&body), "transcriptUnsupported", "{agent}");
+            let message = json(&body)["error"]["message"].as_str().unwrap().to_string();
+            assert!(
+                message.contains("read-screen"),
+                "{agent}: 得告诉编排者换哪条命令: {message}"
+            );
+            // 术语纪律：用户可见文案不许出现口语别名
+            assert!(!message.contains("musician"), "{agent}: {message}");
+            // **一次都没去翻过磁盘** —— 判据在 agent 名上，不在文件在不在
+            assert!(transcripts.calls.lock().is_empty(), "{agent}");
+        }
+    }
+
+    /// 无记录 agent 的 `read-screen` **照常可用** —— 那是它们的兜底。
+    #[test]
+    fn 无记录的_agent_照样读得到画面() {
+        let (host, actions, _transcripts, port, token, m) = reading();
+        host.detected_only(m, "opencode");
+        actions.screen(m, &["$ opencode", "> 在跑"]);
+
+        let (status, v) = screen(port, &token, m, None);
+        assert_eq!(status, 200, "{v}");
+        assert_eq!(
+            v["data"]["screen"]["lines"],
+            serde_json::json!(["$ opencode", "> 在跑"])
+        );
+    }
+
+    /// **禁止启发式绑定**：没有 hook 上报的会话身份就明确报错，
+    /// 绝不去翻「项目里最新的那个会话文件」（对话镜像踩过的串台坑）。
+    #[test]
+    fn 没有会话身份时明确报错且一个文件都不翻() {
+        // 两种「没有身份」：压根没上报过，与上报了 agent 但没有 session_id
+        for setup in [0u8, 1] {
+            let (host, _actions, transcripts, port, token, m) = reading();
+            if setup == 1 {
+                host.detected_only(m, "claude");
+            }
+            // 项目里明明躺着一条 claude 会话记录 —— 但那不是这个 pane 的
+            transcripts.put("claude", "别人的会话", &[("assistant", "别人的对话")]);
+
+            let (status, body) = post(
+                port,
+                "/control/read-transcript",
+                &payload_of(&token, &format!(r#""targetPaneId":{m}"#)),
+            );
+            assert_eq!(status, 409, "setup={setup}: {body}");
+            assert_eq!(error_code(&body), "sessionUnidentified", "setup={setup}");
+            assert!(
+                transcripts.calls.lock().is_empty(),
+                "setup={setup}: 一次都不许去找会话文件 —— 找了就有绑错的机会"
+            );
+            assert!(
+                !body.contains("别人的对话"),
+                "setup={setup}: 串台了: {body}"
+            );
+        }
+    }
+
+    /// 会话记录还没落盘（乐手刚起来、第一条消息还没写）：**空 transcript，不是错误**。
+    ///
+    /// 与对话镜像同一个取舍 —— 那边给的也是一份空镜像。编排者据此接着等即可。
+    #[test]
+    fn 记录还没落盘时给空的一段而不是报错() {
+        let (host, _actions, _transcripts, port, token, m) = reading();
+        host.identify(m, "claude-code", "s-new");
+
+        let (status, v) = transcript(port, &token, m, None);
+        assert_eq!(status, 200, "{v}");
+        let t = &v["data"]["transcript"];
+        assert_eq!(t["total"], 0);
+        assert_eq!(t["nextCursor"], 0);
+        assert_eq!(t["hasMore"], false);
+        assert!(msgs(&v).is_empty());
+    }
+
+    /// 乐手换了会话（`/clear` / 退出重开）：回执里的 `sessionId` 跟着变，
+    /// seq 从 0 重新数 —— 编排者认得出这一跳，该把游标归零。
+    #[test]
+    fn 换会话后游标归零由_session_id_认出来() {
+        let (host, _actions, transcripts, port, token, m) = reading();
+        host.identify(m, "claude-code", "s-1");
+        transcripts.put("claude", "s-1", &[("user", "一"), ("assistant", "二")]);
+        let (_s, v) = transcript(port, &token, m, None);
+        assert_eq!(v["data"]["transcript"]["sessionId"], "s-1");
+        assert_eq!(v["data"]["transcript"]["nextCursor"], 2);
+
+        // 换会话：新会话只有一条，旧游标 2 越界
+        host.identify(m, "claude-code", "s-2");
+        transcripts.put("claude", "s-2", &[("user", "重新开始")]);
+        let (status, v) = transcript(port, &token, m, Some(2));
+        assert_eq!(status, 200, "{v}");
+        let t = &v["data"]["transcript"];
+        assert_eq!(t["sessionId"], "s-2", "换绑要看得出来");
+        // 越界游标钳回总数，不报错 —— 编排者看 sessionId 变了自己归零重取
+        assert_eq!(t["cursor"], 1);
+        assert_eq!(t["total"], 1);
+        assert!(msgs(&v).is_empty());
+
+        let (_s, v) = transcript(port, &token, m, Some(0));
+        assert_eq!(msgs(&v), vec![(0, "user".into(), "重新开始".into())]);
+    }
+
+    /// 回执有字节上界：一次给不完就**少给几条 + 标 `hasMore`**，
+    /// 编排者按 `nextCursor` 接着取，一条都不丢。
+    #[test]
+    fn 超过字节上界时分几次取完() {
+        let (host, _actions, transcripts, port, token, m) = reading();
+        host.identify(m, "claude-code", "s-big");
+        // 每条 10 KiB × 8 条 = 80 KiB，远超 32 KiB 的回执上界
+        let chunk = "x".repeat(10 * 1024);
+        let msgs_in: Vec<(&str, &str)> = (0..8).map(|_| ("assistant", chunk.as_str())).collect();
+        transcripts.put("claude", "s-big", &msgs_in);
+
+        let mut cursor = 0u64;
+        let mut rounds = 0;
+        let mut seen = Vec::new();
+        loop {
+            let (status, v) = transcript(port, &token, m, Some(cursor));
+            assert_eq!(status, 200, "{v}");
+            let t = &v["data"]["transcript"];
+            let next = t["nextCursor"].as_u64().unwrap();
+            for (seq, _role, content) in msgs(&v) {
+                assert_eq!(content.len(), chunk.len(), "整条给，不许劈成两半");
+                seen.push(seq);
+            }
+            rounds += 1;
+            assert!(rounds < 10, "取不完");
+            if !t["hasMore"].as_bool().unwrap() {
+                assert_eq!(next, 8);
+                break;
+            }
+            assert!(next > cursor, "游标必须往前走，否则编排者死循环");
+            cursor = next;
+        }
+        assert!(rounds >= 2, "80 KiB 该分好几次给");
+        assert_eq!(seen, (0..8).collect::<Vec<u64>>(), "一条都不许丢或重复");
+    }
+
+    /// **一条消息自己就顶穿上界**：必须给出去（截断 + 标记），否则游标永远走不过
+    /// 它 —— 编排者会卡在这条上无限重试，后面的内容永久读不到。
+    #[test]
+    fn 单条超大消息被截断但游标照样前进() {
+        let (host, _actions, transcripts, port, token, m) = reading();
+        host.identify(m, "claude-code", "s-huge");
+        let huge = "字".repeat(40 * 1024); // 3 字节一个汉字，远超上界
+        transcripts.put("claude", "s-huge", &[("assistant", &huge), ("user", "好")]);
+
+        let (status, v) = transcript(port, &token, m, None);
+        assert_eq!(status, 200, "{v}");
+        let one = &v["data"]["transcript"]["messages"][0];
+        assert_eq!(one["seq"], 0);
+        assert_eq!(one["truncated"], true, "截过就得如实说");
+        let content = one["content"].as_str().unwrap();
+        assert!(content.len() <= MAX_READ_BYTES, "截断后仍超界");
+        assert!(
+            content.chars().all(|c| c == '字'),
+            "截在了字符中间，UTF-8 都不合法了"
+        );
+        assert_eq!(v["data"]["transcript"]["nextCursor"], 1, "游标必须前进");
+        assert_eq!(v["data"]["transcript"]["hasMore"], true);
+
+        // 接着取拿得到后面那条
+        let (_s, v) = transcript(port, &token, m, Some(1));
+        assert_eq!(msgs(&v), vec![(1, "user".into(), "好".into())]);
+    }
+
+    // ─── 读结果：read-screen（工单 07）──────────────────────────
+
+    /// 尾部 N 行、默认行数、行数上界：钳位是控制面的裁决，
+    /// **桌面侧收到的那个数**就是判据。
+    #[test]
+    fn 画面行数有默认值与上界() {
+        let (_host, actions, _transcripts, port, token, m) = reading();
+        actions.screen(m, &["一", "二", "三", "四"]);
+
+        // 不给行数 → 默认值
+        let (status, v) = screen(port, &token, m, None);
+        assert_eq!(status, 200, "{v}");
+        assert_eq!(actions.screen_calls.lock().last().unwrap().1, DEFAULT_SCREEN_LINES);
+
+        // 给了就按给的（尾部两行，旧的在前）
+        let (_s, v) = screen(port, &token, m, Some(2));
+        assert_eq!(v["data"]["screen"]["lines"], serde_json::json!(["三", "四"]));
+        assert_eq!(actions.screen_calls.lock().last().unwrap().1, 2);
+
+        // 超界钳回上界，`0` 钳到 1 —— 都不报错，少一次往返
+        for (asked, expect) in [(u32::MAX, MAX_SCREEN_LINES), (99999, MAX_SCREEN_LINES), (0, 1)] {
+            let (status, v) = screen(port, &token, m, Some(asked));
+            assert_eq!(status, 200, "asked={asked}: {v}");
+            assert_eq!(
+                actions.screen_calls.lock().last().unwrap().1,
+                expect,
+                "asked={asked}"
+            );
+        }
+    }
+
+    /// 一屏太大时**从头上砍、保住尾部**（要看的永远是最新那几行），并如实说明。
+    #[test]
+    fn 画面超过字节上界时砍掉最旧的几行() {
+        let (_host, actions, _transcripts, port, token, m) = reading();
+        // 200 行 × 1 KiB = 200 KiB，远超 32 KiB
+        let wide = "w".repeat(1024);
+        let mut rows: Vec<String> = (0..200).map(|_| wide.clone()).collect();
+        rows.push("最后一行".into());
+        let refs: Vec<&str> = rows.iter().map(|s| s.as_str()).collect();
+        actions.screen(m, &refs);
+
+        let (status, v) = screen(port, &token, m, Some(MAX_SCREEN_LINES as u32));
+        assert_eq!(status, 200, "{v}");
+        let s = &v["data"]["screen"];
+        assert_eq!(s["truncated"], true, "砍过就得如实说");
+        let lines = s["lines"].as_array().unwrap();
+        assert!(lines.len() < 201, "没砍");
+        assert_eq!(
+            lines.last().unwrap().as_str().unwrap(),
+            "最后一行",
+            "砍的必须是头上那几行"
+        );
+        let bytes: usize = lines.iter().map(|l| l.as_str().unwrap().len() + 1).sum();
+        assert!(bytes <= MAX_READ_BYTES, "砍完还超界: {bytes}");
+    }
+
+    /// 装得下就不标截断；空屏是合法答案，不是失败。
+    #[test]
+    fn 画面装得下时不标截断_空屏也是合法答案() {
+        let (_host, actions, _transcripts, port, token, m) = reading();
+        actions.screen(m, &["> ", "等你回话"]);
+        let (_s, v) = screen(port, &token, m, None);
+        assert_eq!(v["data"]["screen"]["truncated"], false);
+        assert_eq!(v["data"]["screen"]["paneId"].as_u64().unwrap() as u32, m);
+
+        // 从没登记过画面 = 整屏全空
+        actions.screen(m, &[]);
+        let (status, v) = screen(port, &token, m, None);
+        assert_eq!(status, 200, "{v}");
+        assert!(v["data"]["screen"]["lines"].as_array().unwrap().is_empty());
+        assert_eq!(v["data"]["screen"]["truncated"], false);
+    }
+
+    /// 读画面的两档失败各自明确。
+    #[test]
+    fn 读画面失败的两档各自明确() {
+        for (fail, code, status) in [
+            (ScreenFailure::PaneGone, "paneGone", 410),
+            (ScreenFailure::DesktopBusy, "desktopBusy", 503),
+        ] {
+            let (_host, actions, _transcripts, port, token, m) = reading();
+            *actions.screen_fail.lock() = Some(fail);
+            let (got, body) = post(
+                port,
+                "/control/read-screen",
+                &payload_of(&token, &format!(r#""targetPaneId":{m}"#)),
+            );
+            assert_eq!(got, status, "{fail:?}: {body}");
+            assert_eq!(error_code(&body), code, "{fail:?}");
+        }
+    }
+
+    // ─── 读结果：范围裁决（两条命令共用 resolve_target）─────────
+
+    /// **两条读命令都过可见范围铁律**：别人的乐手 / 编造的编号一律「不存在」，
+    /// 自指被拒，已关的乐手答「已关」—— 且一律不惊动桌面端与磁盘。
+    #[test]
+    fn 两条读命令都过可见范围铁律() {
+        for endpoint in ["read-transcript", "read-screen"] {
+            let (host, actions, transcripts, port, token, m) = reading();
+            host.identify(m, "claude-code", "s-1");
+            transcripts.put("claude", "s-1", &[("assistant", "在")]);
+
+            let call = |target: u32| {
+                post(
+                    port,
+                    &format!("/control/{endpoint}"),
+                    &payload_of(&token, &format!(r#""targetPaneId":{target}"#)),
+                )
+            };
+
+            // 别人的乐手 / 用户亲手开的会话 / 编造的编号 —— **同一个**「不存在」
+            for target in [4242, 9] {
+                let (status, body) = call(target);
+                assert_eq!(status, 404, "{endpoint}/{target}: {body}");
+                assert_eq!(error_code(&body), "paneNotFound", "{endpoint}/{target}");
+            }
+            // 自指禁令
+            let (status, body) = call(7);
+            assert_eq!(status, 403, "{endpoint}: {body}");
+            assert_eq!(error_code(&body), "selfTarget", "{endpoint}");
+
+            assert!(
+                actions.screen_calls.lock().is_empty(),
+                "{endpoint}: 被拒的读不许惊动桌面端"
+            );
+            assert!(
+                transcripts.calls.lock().is_empty(),
+                "{endpoint}: 被拒的读不许去翻磁盘"
+            );
+
+            // 自己的乐手但 pane 已经关了：这条可以说
+            actions.close(m);
+            let (status, body) = call(m);
+            assert_eq!(status, 410, "{endpoint}: {body}");
+            assert_eq!(error_code(&body), "paneGone", "{endpoint}");
+        }
+    }
+
+    /// **agent 退出但 pane 还在**时两条读命令照常可用 —— 那正是「回头看它留下了
+    /// 什么」的时刻（`resolve_target` 只判 pane 死活，不判 AI 会话状态）。
+    #[test]
+    fn agent_退出后仍读得到它留下的东西() {
+        let (host, actions, transcripts, port, token, m) = reading();
+        host.identify(m, "claude-code", "s-1");
+        transcripts.put("claude", "s-1", &[("assistant", "干完了")]);
+        actions.screen(m, &["done."]);
+        actions.agent_exited(m);
+
+        let (status, v) = transcript(port, &token, m, None);
+        assert_eq!(status, 200, "{v}");
+        assert_eq!(msgs(&v), vec![(0, "assistant".into(), "干完了".into())]);
+
+        let (status, v) = screen(port, &token, m, None);
+        assert_eq!(status, 200, "{v}");
+        assert_eq!(v["data"]["screen"]["lines"], serde_json::json!(["done."]));
+    }
+
+    /// 缺 `targetPaneId` 的读请求是坏请求（不许当成「读我自己」）。
+    #[test]
+    fn 读命令缺目标是坏请求() {
+        let (_host, _actions, _transcripts, port, token, _m) = reading();
+        for endpoint in ["read-transcript", "read-screen"] {
+            let (status, body) = post(
+                port,
+                &format!("/control/{endpoint}"),
+                &payload_of(&token, ""),
+            );
+            assert_eq!(status, 400, "{endpoint}: {body}");
+            assert_eq!(error_code(&body), "badRequest", "{endpoint}");
+        }
+    }
+
+    /// 读命令与写穿一样 fail-closed：无令牌 / 伪造令牌一律被拒，
+    /// 且不惊动桌面端与磁盘（它们走的是「另起线程」那条路，鉴权在 HTTP 线程上做）。
+    #[test]
+    fn 读命令的鉴权一样_fail_closed() {
+        let (_host, actions, transcripts, port, _token, m) = reading();
+        for endpoint in ["read-transcript", "read-screen"] {
+            for payload in [
+                format!(r#"{{"paneId":7,"targetPaneId":{m}}}"#),
+                format!(r#"{{"token":"forged","paneId":7,"targetPaneId":{m}}}"#),
+                "not json".to_string(),
+            ] {
+                let (status, body) = post(port, &format!("/control/{endpoint}"), &payload);
+                assert!(
+                    status == 401 || status == 400,
+                    "{endpoint} payload={payload}: {body}"
+                );
+            }
+        }
+        assert!(actions.screen_calls.lock().is_empty());
+        assert!(transcripts.calls.lock().is_empty());
+    }
+
+    /// 读会话记录期间 hook 那条路不被卡住 —— 慢 IO 与「回主线程」同一档待遇。
+    #[test]
+    fn 读画面期间_hook_那条路不被卡住() {
+        let (_host, actions, _transcripts, port, token, m) = reading();
+        *actions.delay.lock() = Some(Duration::from_millis(600));
+
+        let slow_token = token.clone();
+        let slow = std::thread::spawn(move || screen(port, &slow_token, m, None));
+        std::thread::sleep(Duration::from_millis(120));
+
+        let began = std::time::Instant::now();
+        let (status, _body) = post(port, "/hook", "{}");
+        let waited = began.elapsed();
+        assert_eq!(status, 404, "本测试服务只接控制路由");
+        assert!(
+            waited < Duration::from_millis(400),
+            "hook 上报被读画面卡了 {waited:?} —— 这类命令必须另起线程"
+        );
+        let (status, v) = slow.join().unwrap();
+        assert_eq!(status, 200, "{v}");
+    }
+
+    // ─── 读结果：纯函数口径 ────────────────────────────────────
+
+    /// agent 名 → 家族名的收敛口径，与 `mt_relay::mirror::resolve_session_file_by_id`
+    /// 一字不差（`contains` 而非全等；codex/grok 先判；其余落 claude）。
+    #[test]
+    fn agent_名收敛成家族名的口径() {
+        for (agent, expect) in [
+            ("claude", Some("claude")),
+            ("claude-code", Some("claude")),
+            ("Claude-Code", Some("claude")),
+            ("codex", Some("codex")),
+            ("codex-cli", Some("codex")),
+            ("grok", Some("grok")),
+            // agent 名缺席时按 claude 兜底（与镜像那条 else 分支同源）——
+            // 仍然只认那个确切的 session_id，猜错家族只会找不到文件，
+            // **绝不会绑到别人的会话上**
+            ("", Some("claude")),
+            ("opencode", None),
+            ("pi", None),
+        ] {
+            assert_eq!(transcript_family(agent), expect, "{agent}");
+        }
+        // 与「有没有会话记录」那条既有判据对得上：认得出家族 ⇔ 有记录
+        for agent in ["claude", "claude-code", "codex", "grok", "opencode", "pi"] {
+            assert_eq!(
+                transcript_family(agent).is_some(),
+                crate::sessions::agent_has_session_log(agent),
+                "{agent}: 两条判据走散了"
+            );
+        }
+    }
+
+    /// **大回执不许走分块传输**。
+    ///
+    /// tiny_http 默认在 body ≥ 32 KiB 时自动切 `Transfer-Encoding: chunked`，
+    /// 而 sidecar CLI 是手写的 HTTP 客户端、只认 Content-Length —— 分块之后它
+    /// 拿到的 body 里混着十六进制块长度行，只会答 `malformedResponse`。
+    /// 读命令是第一批产得出这么大回执的命令，于是这条钉在这儿。
+    ///
+    /// 顺带钉住「回执一定是完整的合法 UTF-8 JSON」：多字节正文被块边界劈开时
+    /// 连 `read_to_string` 都过不去（本票就是这么发现这个坑的）。
+    #[test]
+    fn 大回执不许走分块传输() {
+        let (host, _actions, transcripts, port, token, m) = reading();
+        host.identify(m, "claude-code", "s-big");
+        // 汉字正文：一旦分块，块边界会把三字节序列劈开
+        let huge = "字".repeat(40 * 1024);
+        transcripts.put("claude", "s-big", &[("assistant", &huge)]);
+
+        let (status, raw) = post(
+            port,
+            "/control/read-transcript",
+            &payload_of(&token, &format!(r#""targetPaneId":{m}"#)),
+        );
+        assert_eq!(status, 200);
+        assert!(
+            raw.len() > 32 * 1024,
+            "这条测试要的就是超过 32 KiB 的回执，实际 {}",
+            raw.len()
+        );
+        // body 从第一个字符起就是 JSON —— 分块的话这里是一行十六进制块长度
+        assert!(raw.starts_with('{'), "回执被分块了: {:?}", &raw[..40.min(raw.len())]);
+        let v = json(&raw);
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["data"]["transcript"]["messages"][0]["truncated"], true);
+    }
+
+    /// 按字节截断落在字符边界上（预算是字节预算，一个汉字三字节）。
+    #[test]
+    fn 截断落在字符边界上() {
+        assert_eq!(truncate_on_char_boundary("abc", 10), "abc");
+        assert_eq!(truncate_on_char_boundary("abcdef", 3), "abc");
+        // 「字」三字节：上界 4 只装得下一个
+        assert_eq!(truncate_on_char_boundary("字字", 4), "字");
+        assert_eq!(truncate_on_char_boundary("字字", 3), "字");
+        assert_eq!(truncate_on_char_boundary("字字", 2), "");
+        // 截出来的一定还是合法 UTF-8（`String` 类型本身保证），且不超界
+        for n in 0..12 {
+            assert!(truncate_on_char_boundary("字a字b", n).len() <= n.max(0));
+        }
     }
 }

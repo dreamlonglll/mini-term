@@ -630,6 +630,27 @@ impl AppStore {
         })
     }
 
+    /// 某个 PTY 的终端画面**尾部 `lines` 行纯文本**（编排者的 `read-screen`）。
+    ///
+    /// `None` = 没有这个终端（PTY 已经不在了）—— 与 [`Self::pane_bracketed_paste`]
+    /// 的「认不出就答保守值」不同，这一条必须区分得开：读不到画面是要如实告诉
+    /// 编排者的失败，不是「一屏空的」。
+    ///
+    /// 取行、裁空白、剥颜色全在 `mt_terminal::TerminalEmulator::tail_lines` 里
+    /// **一次持锁**做完 —— 逐行各锁一次的话，reader 线程会在中间推进状态机，
+    /// 取回来的几行就不是同一帧的画面了。
+    ///
+    /// 与 `pane_bracketed_paste` 同样取 `&App`：调用方要在一个共享借用里连问两句。
+    pub fn pane_screen_tail(
+        &self,
+        pty_id: u32,
+        lines: usize,
+        cx: &gpui::App,
+    ) -> Option<Vec<String>> {
+        let entity = self.terminals.get(&pty_id)?;
+        Some(entity.read(cx).emulator().tail_lines(lines))
+    }
+
     /// 分屏分隔条拖动后的比例回写。
     pub fn set_split_sizes(
         &mut self,

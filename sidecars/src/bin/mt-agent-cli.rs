@@ -29,6 +29,8 @@
 //! mt-agent-cli send --pane <ID> --text <TEXT>          # 给某个受编排会话派活
 //! mt-agent-cli send --pane <ID> --stdin                # 同上,正文从 stdin 读(多行)
 //! mt-agent-cli wait --pane <ID> [--timeout <SECONDS>]  # 等它干完/等人/退出(长轮询)
+//! mt-agent-cli read-transcript --pane <ID> [--cursor N] # 读它的对话记录(增量)
+//! mt-agent-cli read-screen --pane <ID> [--lines N]      # 读它终端画面的尾部若干行
 //! ```
 //!
 //! 成功：JSON 到 stdout，退出码 0。失败：JSON 到 stderr，退出码见 [`CliError::exit_code`]。
@@ -44,8 +46,9 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 use mt_agent_control::{
     ControlFailure, ControlRequest, IdentityError, identity_from_env, parse_launchers, parse_panes,
-    parse_projects, parse_send_receipt, parse_started_pane, parse_wait_outcome, wait_read_timeout,
-    CONNECT_TIMEOUT, CONTROL_PREFIX, READ_TIMEOUT, WAIT_DEFAULT,
+    parse_projects, parse_screen, parse_send_receipt, parse_started_pane, parse_transcript,
+    parse_wait_outcome, wait_read_timeout, CONNECT_TIMEOUT, CONTROL_PREFIX, READ_TIMEOUT,
+    WAIT_DEFAULT,
 };
 
 /// 退出码说明。**给编排者（LLM）读的**，所以 `--help` 里就得写清 `desktopBusy`
@@ -91,7 +94,23 @@ wait notes:
   --timeout defaults to 60s and is capped at 300s server-side; the command blocks for
   that long, so keep it under your own tool-call timeout. Calling wait immediately
   after send can return the PREVIOUS turn's ai-idle (the agent has not reacted yet) -
-  a waitedMs near 0 is the tell; wait again to confirm.";
+  a waitedMs near 0 is the tell; wait again to confirm.
+
+read notes:
+  read-transcript reads the session's structured record and is available only for
+  Claude, Codex and Grok; anything else (opencode, pi, custom launchers) is refused
+  with transcriptUnsupported - use read-screen for those. It is incremental: pass the
+  nextCursor from the previous receipt and you get only what came after it. A cursor
+  is only meaningful within one sessionId - when that field changes the session was
+  restarted and seq numbering began again from 0, so reset the cursor to 0.
+  hasMore: true means the receipt hit its size cap; call again with nextCursor.
+  sessionUnidentified means no AI session has been reported for that pane yet - the
+  binding is never guessed, so wait or use read-screen.
+
+  read-screen works for every orchestrated session and returns the tail of the
+  terminal as plain text (colors stripped), oldest line first. It is the way to read
+  a pending approval prompt verbatim - report it to the user and let them answer it;
+  answering on their behalf is never an orchestrator's call.";
 
 #[derive(Parser)]
 #[command(
@@ -152,6 +171,32 @@ enum Command {
         #[arg(long, value_name = "SECONDS")]
         timeout: Option<u64>,
     },
+    /// Read one of your orchestrated sessions' transcript, incrementally.
+    ///
+    /// Only Claude / Codex / Grok keep a readable transcript; for anything else this
+    /// fails with transcriptUnsupported - use read-screen instead.
+    ReadTranscript {
+        /// Pane id of the orchestrated session, as reported by `start-session` / `list-panes`.
+        #[arg(long, value_name = "ID")]
+        pane: u32,
+        /// Start from this message (the `nextCursor` of your previous read); defaults to 0.
+        ///
+        /// Only meaningful within one sessionId - reset it to 0 when that changes.
+        #[arg(long, value_name = "SEQ")]
+        cursor: Option<u64>,
+    },
+    /// Read the tail of one of your orchestrated sessions' terminal, as plain text.
+    ///
+    /// Works for every orchestrated session - the fallback for agents without a
+    /// transcript, and the way to read a pending approval prompt verbatim.
+    ReadScreen {
+        /// Pane id of the orchestrated session, as reported by `start-session` / `list-panes`.
+        #[arg(long, value_name = "ID")]
+        pane: u32,
+        /// How many trailing lines to read; the desktop picks a default and caps it.
+        #[arg(long, value_name = "N")]
+        lines: Option<u32>,
+    },
 }
 
 impl Command {
@@ -164,6 +209,8 @@ impl Command {
             Self::ListPanes => "list-panes",
             Self::Send { .. } => "send",
             Self::Wait { .. } => "wait",
+            Self::ReadTranscript { .. } => "read-transcript",
+            Self::ReadScreen { .. } => "read-screen",
         }
     }
 
@@ -201,6 +248,15 @@ impl Command {
             // 不给 `--timeout` 就整个字段不出线：默认耐心只住在桌面侧那个常量上
             Self::Wait { pane, timeout } => {
                 ControlRequest::wait(identity, *pane, timeout.map(Duration::from_secs))
+            }
+
+            Self::ReadTranscript { pane, cursor } => {
+                ControlRequest::read_transcript(identity, *pane, *cursor)
+            }
+            // `lines` 不给就**不出线** —— 默认行数只有桌面侧那一个常量，
+            // 在这儿复制一份就是两处口径。
+            Self::ReadScreen { pane, lines } => {
+                ControlRequest::read_screen(identity, *pane, *lines)
             }
             _ => ControlRequest::from(identity),
         })
@@ -273,6 +329,15 @@ fn run(command: &Command) -> Result<String, CliError> {
         Command::Wait { .. } => {
             let waited = parse_wait_outcome(status, &response).map_err(CliError::Rejected)?;
             to_json(&serde_json::json!({ "waited": waited }))
+        }
+
+        Command::ReadTranscript { .. } => {
+            let transcript = parse_transcript(status, &response).map_err(CliError::Rejected)?;
+            to_json(&serde_json::json!({ "transcript": transcript }))
+        }
+        Command::ReadScreen { .. } => {
+            let screen = parse_screen(status, &response).map_err(CliError::Rejected)?;
+            to_json(&serde_json::json!({ "screen": screen }))
         }
     }
 }
@@ -507,6 +572,22 @@ mod tests {
             .endpoint(),
             "wait"
         );
+        assert_eq!(
+            Command::ReadTranscript {
+                pane: 1,
+                cursor: None
+            }
+            .endpoint(),
+            "read-transcript"
+        );
+        assert_eq!(
+            Command::ReadScreen {
+                pane: 1,
+                lines: None
+            }
+            .endpoint(),
+            "read-screen"
+        );
         assert_eq!(CONTROL_PREFIX, "/control/");
     }
 
@@ -648,6 +729,95 @@ mod tests {
             }),
             r#"{"token":"t","paneId":5,"launcherId":"codex"}"#
         );
+        // 读命令：可选参数不给就整个不出线（默认值只有桌面侧那一份）
+        assert_eq!(
+            json(&Command::ReadTranscript {
+                pane: 101,
+                cursor: Some(7)
+            }),
+            r#"{"token":"t","paneId":5,"targetPaneId":101,"cursor":7}"#
+        );
+        assert_eq!(
+            json(&Command::ReadTranscript {
+                pane: 101,
+                cursor: None
+            }),
+            r#"{"token":"t","paneId":5,"targetPaneId":101}"#
+        );
+        assert_eq!(
+            json(&Command::ReadScreen {
+                pane: 101,
+                lines: Some(30)
+            }),
+            r#"{"token":"t","paneId":5,"targetPaneId":101,"lines":30}"#
+        );
+        assert_eq!(
+            json(&Command::ReadScreen {
+                pane: 101,
+                lines: None
+            }),
+            r#"{"token":"t","paneId":5,"targetPaneId":101}"#
+        );
+    }
+
+    /// `read-*` 那几条只有编排者会踩的坑都得写在 `--help` 里。
+    ///
+    /// 逐句钉住：能力分层要给出**改用哪条命令**、游标只在一个会话内有效、
+    /// `hasMore` 该怎么处理，以及审批提示**不许代答**（ADR 0003 的铁律，
+    /// `read-screen` 正是它最可能被误用的地方）。
+    #[test]
+    fn 帮助文案讲清楚了读命令的语义() {
+        assert!(
+            EXIT_CODE_HELP.contains("transcriptUnsupported"),
+            "无记录 agent 那一档得点名"
+        );
+        assert!(
+            EXIT_CODE_HELP.contains("use read-screen for those"),
+            "得直接告诉编排者改用哪条命令"
+        );
+        assert!(
+            EXIT_CODE_HELP.contains("only meaningful within one sessionId"),
+            "游标的有效范围得写清，否则换会话后它会读到错位的内容"
+        );
+        assert!(
+            EXIT_CODE_HELP.contains("call again with nextCursor"),
+            "hasMore 该怎么处理"
+        );
+        assert!(
+            EXIT_CODE_HELP.contains("never guessed"),
+            "绑定不猜这条得写出来，别让它以为是 bug 去绕过"
+        );
+        assert!(
+            EXIT_CODE_HELP.contains("let them answer it"),
+            "审批不代答（ADR 0003）"
+        );
+        // 术语纪律：用户可见文案一律 orchestrated session
+        assert!(!EXIT_CODE_HELP.to_lowercase().contains("musician"));
+    }
+
+    /// 读命令的参数：`--pane` 必给，可选参数各自可省。
+    #[test]
+    fn 读命令的参数解析() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
+
+        let parse = |args: &[&str]| Cli::try_parse_from(args).map(|_| ());
+        assert!(parse(&["mt-agent-cli", "read-transcript", "--pane", "1"]).is_ok());
+        assert!(
+            parse(&["mt-agent-cli", "read-transcript", "--pane", "1", "--cursor", "9"]).is_ok()
+        );
+        assert!(parse(&["mt-agent-cli", "read-screen", "--pane", "1"]).is_ok());
+        assert!(parse(&["mt-agent-cli", "read-screen", "--pane", "1", "--lines", "20"]).is_ok());
+        assert!(
+            parse(&["mt-agent-cli", "read-transcript"]).is_err(),
+            "--pane 是必给的"
+        );
+        assert!(
+            parse(&["mt-agent-cli", "read-screen"]).is_err(),
+            "--pane 是必给的"
+        );
+        // 读命令不该有 --text（那是 send 专属）
+        assert!(parse(&["mt-agent-cli", "read-screen", "--pane", "1", "--text", "x"]).is_err());
     }
 
     /// 桌面端没答上来 = 「过会儿再试」那一档，与「连不上」同码。
