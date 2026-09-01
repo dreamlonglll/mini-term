@@ -23,7 +23,20 @@ tiny_http = "0.12"
 # Codex 的 ~/.codex/config.toml 要开 features.codex_hooks,改 TOML 得保留用户
 # 自己的注释与排版,故用 toml_edit 而非 toml。
 toml_edit = "0.22"
+# 编排令牌的随机源(control.rs):v4 UUID 走 getrandom = 操作系统 CSPRNG。
+# 本 crate 原本没有随机数依赖,而 uuid 已在工作区里(mt-relay / mt-app 都用),
+# 不多拉一棵树。
+uuid.workspace = true
 # AI 感知的那批状态表横跨三条线程(GPUI 主线程 / 500ms 轮询 / hook HTTP)。
 # std::sync::Mutex 的锁中毒会把任一线程的 panic 传染成全进程崩溃,故统一
 # 换 parking_lot(mt-app/mt-pty/mt-terminal 已是同款)。
 parking_lot.workspace = true
+
+[dev-dependencies]
+# 跨工作区对账:编排控制面的**桌面侧 handler 产出**要能被 sidecar CLI 自己的
+# 解析器读懂(`tests/orchestrator_wire.rs`)。两侧隔着工作区边界、各有一份类型,
+# 只靠字段名对齐 —— 与 `mt-config` 的「投影能被 sidecar 的解析器读懂」同一种缝。
+#
+# 引的是 `sidecars/agent-control`(serde 两件套之外无依赖)而不是 sidecars 根包:
+# 后者挂着 russh / rmcp / tokio 一串,拉进 `cargo test -p mt-ai` 就是白等编译。
+mt-agent-control = { path = "../../sidecars/agent-control" }

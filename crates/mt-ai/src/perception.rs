@@ -17,6 +17,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::control::ControlPlane;
 use crate::detect::is_interrupt_key;
 use crate::hook_server::{self, HookState};
 use crate::monitor::{self, StatusEmitter, StatusSink};
@@ -28,6 +29,10 @@ pub struct AiPerception {
     tracker: SessionTracker,
     hooks: HookState,
     emitter: StatusEmitter,
+    /// 编排控制面。与 AI 感知没有逻辑耦合,住在这里只因为它与 hook 共用那个
+    /// 本地 HTTP 服务 —— 装配层顺手把它一并传进 `start_hook_server`,
+    /// 上层不必为编排再记一个句柄。
+    control: ControlPlane,
 }
 
 impl AiPerception {
@@ -37,6 +42,7 @@ impl AiPerception {
             tracker: SessionTracker::new(),
             hooks: HookState::new(),
             emitter: StatusEmitter::new(sink),
+            control: ControlPlane::new(),
         }
     }
 
@@ -46,6 +52,11 @@ impl AiPerception {
 
     pub fn hooks(&self) -> &HookState {
         &self.hooks
+    }
+
+    /// 编排控制面(令牌授予/撤销、宿主注入)。
+    pub fn control(&self) -> &ControlPlane {
+        &self.control
     }
 
     pub fn emitter(&self) -> &StatusEmitter {
@@ -108,10 +119,13 @@ impl AiPerception {
         self.tracker.drain_submits(pane_id)
     }
 
-    /// pane 关闭:清掉它在本 crate 里的一切痕迹(旁路状态 + hook 状态 + 墓碑)。
+    /// pane 关闭:清掉它在本 crate 里的一切痕迹(旁路状态 + hook 状态 + 墓碑 +
+    /// 编排令牌)。**令牌必须跟着 pane 一起没** —— pane 重开是新身份,
+    /// 够不到前世的编排能力(ADR 0003:MVP 不做收养)。
     pub fn pane_closed(&self, pane_id: u32) {
         self.tracker.purge_pane(pane_id);
         self.hooks.purge(pane_id);
+        self.control.revoke_pane(pane_id);
     }
 
     /// 当前状态(不发射,只读)。
@@ -125,6 +139,7 @@ impl AiPerception {
             self.hooks.clone(),
             self.emitter.clone(),
             self.tracker.clone(),
+            self.control.clone(),
             data_dir,
         )
     }
@@ -139,6 +154,7 @@ impl AiPerception {
             &self.hooks,
             &self.emitter,
             &self.tracker,
+            &self.control,
             data_dir,
             enabled,
         )

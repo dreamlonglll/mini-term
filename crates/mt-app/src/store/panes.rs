@@ -9,6 +9,7 @@ use mt_config::{AiLauncher, ProjectConfig, ShellConfig};
 use mt_pty::PtySpawn;
 use mt_ui::{DwellConfig, TerminalStyle};
 
+use crate::orchestrator::OrchestratorGrant;
 use crate::pane::{PaneEvent, TerminalPane};
 use crate::tree::{
     AiSessionRef, DropZone, PaneState, PaneStatus, ProjectPanel, SplitDirection, SplitNode,
@@ -60,7 +61,17 @@ impl AppStore {
         // 绑定的 shell 被删掉时退回默认 —— 总比不开好,用户在桌面看得到实情
         // (判据与移动端那条同一个 `resolve_shell`)
         let shell = self.resolve_shell(launcher.shell.as_deref())?;
-        let pane_id = self.new_terminal(project_id, Some(shell), anchor_pane_id, window, cx)?;
+        // 勾了「允许编排」就连编排令牌一起注入(与 `new_panel_from_launcher`
+        // 同一条口径,只是落点是当前面板的 tab 栏)。
+        let pane_id = self.new_terminal_with_grant(
+            project_id,
+            Some(shell),
+            anchor_pane_id,
+            None,
+            OrchestratorGrant::from_launcher(launcher),
+            window,
+            cx,
+        )?;
         self.rename_pane(project_id, &pane_id, &launcher.name, cx);
         self.write_launcher_command(project_id, &pane_id, &launcher.command, cx);
         Some(pane_id)
@@ -78,7 +89,11 @@ impl AppStore {
         cx: &mut Context<Self>,
     ) -> Option<String> {
         let shell = self.resolve_shell(launcher.shell.as_deref())?;
-        let pane_id = self.new_panel(project_id, Some(shell), window, cx)?;
+        // 编排能力的**唯一**授予入口:勾了「允许编排」的启动器,起 pane 时
+        // 连同令牌一起注进 PTY 环境(ADR 0003 的信任根)。开关没勾就什么都不发,
+        // pane 里的 agent 调控制 CLI 会被明确拒绝(fail-closed)。
+        let grant = OrchestratorGrant::from_launcher(launcher);
+        let pane_id = self.new_panel_with_grant(project_id, Some(shell), grant, window, cx)?;
         self.rename_pane(project_id, &pane_id, &launcher.name, cx);
         self.write_launcher_command(project_id, &pane_id, &launcher.command, cx);
         Some(pane_id)
@@ -121,9 +136,34 @@ impl AppStore {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<String> {
+        self.new_terminal_with_grant(
+            project_id,
+            shell,
+            anchor_pane_id,
+            cwd,
+            OrchestratorGrant::None,
+            window,
+            cx,
+        )
+    }
+
+    /// [`new_terminal_with_cwd`] 的带授予版。只有「按启动器起会话」那条路会传
+    /// [`OrchestratorGrant::Grant`],别的入口一律 `None`。
+    ///
+    /// [`new_terminal_with_cwd`]: Self::new_terminal_with_cwd
+    pub fn new_terminal_with_grant(
+        &mut self,
+        project_id: &str,
+        shell: Option<ShellConfig>,
+        anchor_pane_id: Option<String>,
+        cwd: Option<String>,
+        grant: OrchestratorGrant,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
         let project = self.project(project_id)?.clone();
         let shell = shell.or_else(|| self.resolve_shell(None))?;
-        let pane = self.spawn_pane(&project, &shell, cwd, window, cx)?;
+        let pane = self.spawn_pane(&project, &shell, cwd, grant, window, cx)?;
         let pane_id = pane.id.clone();
 
         let anchor = anchor_pane_id.or_else(|| self.focused_pane_id.clone());
@@ -192,7 +232,15 @@ impl AppStore {
             .map(|p| p.shell_name.clone());
         let shell = self.resolve_shell(shell_name.as_deref())?;
 
-        let pane = self.spawn_pane(&project, &shell, source_cwd, window, cx)?;
+        // 分屏出来的是普通 pane:编排能力不随分屏继承(它只从启动器那道开关来)
+        let pane = self.spawn_pane(
+            &project,
+            &shell,
+            source_cwd,
+            OrchestratorGrant::None,
+            window,
+            cx,
+        )?;
         let new_pane_id = pane.id.clone();
         let new_leaf = SplitNode::leaf(pane);
 
@@ -674,7 +722,15 @@ impl AppStore {
             // pane 自己的 cwd 优先,会话 cwd 兜底
             let start_cwd = item.cwd.clone().or_else(|| resume_cwd.clone());
 
-            let pty_id = self.start_pty(&project, &shell, start_cwd.as_deref(), cx);
+            // 启动恢复的 pane 一律不发编排令牌:重启即新身份,编排能力要用户
+            // 重新用「允许编排」的启动器起一个(ADR 0003 的「MVP 不做收养」)。
+            let pty_id = self.start_pty(
+                &project,
+                &shell,
+                start_cwd.as_deref(),
+                OrchestratorGrant::None,
+                cx,
+            );
             if let Some(state) = self.project_states.get_mut(project_id)
                 && let Some(pane) = state.pane_mut(&item.pane_id)
             {
@@ -723,10 +779,11 @@ impl AppStore {
         project: &ProjectConfig,
         shell: &ShellConfig,
         cwd_override: Option<String>,
+        grant: OrchestratorGrant,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<PaneState> {
-        let pty_id = self.start_pty(project, shell, cwd_override.as_deref(), cx);
+        let pty_id = self.start_pty(project, shell, cwd_override.as_deref(), grant, cx);
         let mut pane = PaneState::new(shell.name.clone());
         pane.pty_id = Some(pty_id);
         pane.cwd = cwd_override;
@@ -743,6 +800,7 @@ impl AppStore {
         project: &ProjectConfig,
         shell: &ShellConfig,
         cwd_override: Option<&str>,
+        grant: OrchestratorGrant,
         cx: &mut Context<Self>,
     ) -> u32 {
         let pty_id = self.next_pty_id;
@@ -758,6 +816,14 @@ impl AppStore {
         let hook_port = self.ai.hook_port();
         if hook_port > 0 {
             env.push(("MINITERM_HOOK_PORT".to_string(), hook_port.to_string()));
+        }
+        // 编排令牌 + 自身 pane 身份(ADR 0003)。走 `PtySpawn.env` 这条**应用内部
+        // 变量**通道:项目级 env 走的是 `user_env`,会被 `MINITERM_` 保留前缀
+        // 挡一道,用户手改配置也覆盖不掉这两个。
+        if grant.is_granted() {
+            let token = self.ai.grant_orchestration(pty_id, &project.id);
+            env.push((mt_ai::control::TOKEN_ENV.to_string(), token));
+            env.push((mt_ai::control::PANE_ENV.to_string(), pty_id.to_string()));
         }
 
         // SSH 远程分支:直接 spawn `ssh` 作 PTY 子进程(不经本地 shell,对齐 WSL
