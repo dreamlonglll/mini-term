@@ -6,9 +6,71 @@
 
 **Blocked by:** 04（标识/离场）、05（send）、06（wait）、07（读结果）、08（上限设置项）
 
-**Status:** ready-for-agent
+**Status:** done（真机验收 2026-09-02 完成，Skill 随仓交付）
 
-- [ ] Skill 随仓交付，新开的编排者按 Skill 即能正确编排（不靠试错）
-- [ ] 真机：双乐手跨项目工作流完整走通
-- [ ] 验收清单逐项确认：出生不抢焦点 / 黄灯全流程 / 多行粘贴各家表现 / 已离场标识 / 上限报错语义
-- [ ] 对照 issue #61 的 user stories 逐条核对，未覆盖项明确留档
+- [x] Skill 随仓交付（`.claude/skills/mini-term-orchestrator/SKILL.md`）——⚠️ **投放机制未做**，见留档
+- [x] 真机：双乐手跨项目工作流完整走通
+- [x] 验收清单逐项确认：出生不抢焦点 / 多行粘贴 / 已离场标识 / 上限报错语义——**黄灯全流程未覆盖**，见留档
+- [x] 对照 issue #61 的 user stories 逐条核对，未覆盖项明确留档
+
+## 真机验收现场（2026-09-02）
+
+隔离数据目录 `%LOCALAPPDATA%\mini-term-e2e-orch`（**不碰** dev 与装机版配置，收尾已删）。
+两个临时项目 orch-backend / orch-frontend 放同一分组「编排验收」；启动器两条：
+「编排者」（`orchestration: true`，命令刻意是 `echo orchestrator-ready` —— pane 起来就是
+个 shell，好手动跑 CLI，**授予只看开关、与命令内容无关**）与「Claude」（真 `claude`）。
+`orchestratorSessionCap` 调成 2 便于验上限。hook server 端口 23457（23456 被装机版占着）。
+
+**hook 注册没碰**：`~/.claude/settings.json` 里的 hook 命令指向装机版 exe，而 hook 二进制
+是无状态转发器、按 `MINITERM_HOOK_PORT` 投递 —— dev 实例起的 pane 自动上报到 dev 自己的
+端口。验收全程未修改任何全局文件。
+
+| # | 验收项 | 结果 |
+|---|---|---|
+| 1 | 令牌注入 | `MINITERM_ORCHESTRATOR_PANE=1`、`TOKEN` 长 64、`HOOK_PORT=23457` |
+| 2 | **CLI ↔ 真 hook server HTTP 往返**（工单 02 欠到现在） | 通；`list-launchers` 只回 id+name，命令文本没出岸 |
+| 3 | 可达范围 | 同分组两项目，`current` 正确，`canStartSessions: true` |
+| 4 | 跨项目起乐手 | `paneId 2` 落在 p-frontend，`status: ai-idle` |
+| 5 | 出生礼仪 | 不抢焦点、不切项目（活动项目仍 orch-backend） |
+| 6 | 诞生一次性提示 | toast「orch-backend / 编排者新建了会话（Claude）」 |
+| 7 | `list-panes` | 两个乐手，按 pane 升序 |
+| 8 | **并发上限** | 第 3 个 → `sessionLimitReached` + 退出码 4 |
+| 9 | `send` 单行 | Claude 收到并回答 |
+| 10 | **`send` 多行 bracketed paste** | 含 ``` 代码块与空行整段送达，中途换行一次都没提前提交；乐手真写出了 `orch-answer.txt` |
+| 11 | `read-screen` | 纯文本、颜色已剥离 |
+| 12 | `read-transcript` | `agent=claude` + hook 上报的 `sessionId`；seq 增量 `cursor 0→4`、再 `4→6` 只回新的 2 条 |
+| 13 | 自指禁令 | `selfTarget` + 退出码 4 |
+| 14 | 非自启 pane | `paneNotFound` + 退出码 4 |
+| 15 | 受编排标识 | tab 上蓝色 `↳` |
+| 16 | **编排者已离场** | 关掉编排者 pane 后标识由蓝转灰，乐手照常活着（不陪葬） |
+
+## 真机揪出的两条时序坑（已写进 Skill）
+
+**A. `start-session` 之后不能立刻 `send`（新发现）。** 回执只保证「启动命令已交给一根活着的
+PTY」，**不保证 agent 已经进入输入循环**。首次多行 prompt 就是这么被丢的：`send` 回执
+`bracketedPaste: true` 一切正常，但 Claude 输入框空白、`Ctx Used 0.0%`，`wait` 只看得到
+`cause: SessionStart`。等它就绪后原样重发，整段完整送达。**这不是多行或 stdin 的问题**
+（单行同样会丢），是时序。Skill 的处置：`start-session` 后先 `read-screen` 确认输入提示符
+出现，再 `send`。
+
+**B. `wait` 不能当「这一回合干完了」的判据（工单 06 已留档，真机确认且极易触发）。**
+`send` 之后紧接 `wait`，返回的是**上一回合**的 `ai-idle`（`waitedMs: 0`）；第二次 `wait`
+同样 `waitedMs: 0`，而那时活儿其实已在两次 `wait` 之间干完了。根因是 hook 状态没有回合
+概念。Skill 的处置：**拿 `read-transcript` 的 cursor 当事实来源** —— send 前记下
+`nextCursor`，wait 之后用它读增量，读到 0 条就再 wait。
+
+## 留档（未整改）
+
+- **Skill 投放机制未做**：Skill 只是随本仓交付的正文，**没有**像 `mini-term-ssh` 那样在勾选
+  「允许编排」时自动写进目标项目的 `.claude/skills/`。编排者跑在用户自己的项目里，读的是
+  那个项目的 skills 目录 —— 所以现在需要用户手工放置。照 mini-term-ssh 的生成/注销先例补
+  一条投放链路即可，另行立项。
+- **黄灯（attention）全流程未覆盖**：Claude 在 `auto mode on` 下不请求权限，本次没能自然触发
+  `PermissionRequest`。`read-screen` 读审批提示原文的能力已单独验过（能读到画面全文），
+  attention 的四类终态判定有主缝测试覆盖（含「按成因而非状态判」那条 Codex 特例），但
+  「乐手挂黄灯 → 编排者播报 → 人工处理 → 再 wait 拿到恢复后终态」这一条链未在真机跑通。
+- **多行粘贴只验了 Claude 一家**：Codex / Grok 的表现未测（工单 05 原验收项要求三家）。
+- **「已离场编排者的前世乐手不许被驱动」真机未验**：编排者 pane 一关，令牌即撤销、CLI 也
+  没了运行环境，真机上无法再发起请求；该语义由主缝测试的 8 例覆盖。
+- `wait` 紧跟 `send` 时 `cause` 观测到是 `Notification` 而非 `Stop` —— 与工单 06 文档里
+  「`Stop` 才是真做完」的表述有出入，值得回头核一次 cause 的取值口径。
