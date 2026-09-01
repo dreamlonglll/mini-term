@@ -102,9 +102,16 @@ pub struct ControlRequest {
     /// `start-session`：落在哪个项目；不给就是编排者自己那个。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
-    /// 以某个乐手为目标的命令（工单 05~07）用它。
+    /// 以某个乐手为目标的命令（`send`，工单 06~07 的 wait / read 同款）用它。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_pane_id: Option<u32>,
+    /// `send`：要写穿进去的正文（编排者写的 prompt）。
+    ///
+    /// **只在这条命令的请求体里出现一次，别的地方一个字都不留** —— 它是用户
+    /// 项目里的内容，与启动器的命令文本同一档待遇：不进日志、不进错误消息、
+    /// 不进回执（回执只回 pane 编号与「有没有当成一块粘贴」）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
 }
 
 impl From<&Identity> for ControlRequest {
@@ -115,6 +122,7 @@ impl From<&Identity> for ControlRequest {
             launcher_id: None,
             project_id: None,
             target_pane_id: None,
+            text: None,
         }
     }
 }
@@ -125,6 +133,15 @@ impl ControlRequest {
         Self {
             launcher_id: Some(launcher_id.to_string()),
             project_id: project_id.map(str::to_string),
+            ..Self::from(id)
+        }
+    }
+
+    /// `send` 的请求体：往哪个乐手写、写什么。
+    pub fn send(id: &Identity, target_pane_id: u32, text: &str) -> Self {
+        Self {
+            target_pane_id: Some(target_pane_id),
+            text: Some(text.to_string()),
             ..Self::from(id)
         }
     }
@@ -178,6 +195,25 @@ pub struct OrchestratedPane {
     /// `false`，记账仍在（好让编排者看得见「我起的那个已经没了」）。
     #[serde(default)]
     pub alive: bool,
+}
+
+/// `send` 的回执。
+///
+/// **不带任何正文回显**，也不带状态列：写穿之后那一瞬的状态一定还是写之前的
+/// 样子（agent 还没来得及反应），摆出来只会诱导编排者把它读成「干完了」。
+/// 要看状态走 `wait`（工单 06）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SendReceipt {
+    /// 写进了哪个受编排会话。
+    pub pane_id: u32,
+    /// 是不是当成一整块粘贴送进去的（bracketed paste）。
+    ///
+    /// **缺省 `false`**：认不出这个字段的旧桌面端在场时，宁可让编排者以为
+    /// 多行没走成整块、去核对一眼，也别反过来（与 `Project::can_start_sessions`
+    /// 同一个 fail-closed 取向）。
+    #[serde(default)]
+    pub bracketed_paste: bool,
 }
 
 /// 被拒 / 出错的响应。`code` 是闭集（桌面侧 `ControlError::code`），
@@ -288,6 +324,17 @@ pub fn parse_panes(status: u16, body: &str) -> Result<Vec<OrchestratedPane>, Con
         .ok_or_else(|| ControlFailure::malformed(status, "missing `panes`"))?;
     serde_json::from_value(list)
         .map_err(|e| ControlFailure::malformed(status, &format!("bad `panes`: {e}")))
+}
+
+/// 解析 `send` 的回执。
+pub fn parse_send_receipt(status: u16, body: &str) -> Result<SendReceipt, ControlFailure> {
+    let data = envelope(status, body)?;
+    let sent = data
+        .get("sent")
+        .cloned()
+        .ok_or_else(|| ControlFailure::malformed(status, "missing `sent`"))?;
+    serde_json::from_value(sent)
+        .map_err(|e| ControlFailure::malformed(status, &format!("bad `sent`: {e}")))
 }
 
 #[cfg(test)]
@@ -487,6 +534,81 @@ mod tests {
                 parse_started_pane(status, body).unwrap_err().code,
                 "malformedResponse"
             );
+        }
+    }
+
+    // ─── 工单 05：send ────────────────────────────────────────
+
+    /// `send` 的请求体：只带目标编号与正文，别人的字段一个不出线。
+    #[test]
+    fn 写穿请求体只带目标与正文() {
+        let id = Identity {
+            token: "t".into(),
+            pane_id: 3,
+        };
+        let json = serde_json::to_string(&ControlRequest::send(&id, 101, "干活")).unwrap();
+        assert_eq!(
+            json,
+            r#"{"token":"t","paneId":3,"targetPaneId":101,"text":"干活"}"#
+        );
+        // 启动器那两个字段不该跟着出线
+        assert!(!json.contains("launcherId"));
+        assert!(!json.contains("projectId"));
+    }
+
+    /// 多行正文经 JSON 转义出线 —— 换行归一是**桌面侧**的事，
+    /// CLI 这一侧原样送过去，不许在这儿先改一遍（改两遍就是两种口径）。
+    #[test]
+    fn 多行正文原样出线由桌面侧归一() {
+        let id = Identity {
+            token: "t".into(),
+            pane_id: 3,
+        };
+        let req = ControlRequest::send(&id, 101, "第一行\n第二行");
+        assert_eq!(req.text.as_deref(), Some("第一行\n第二行"));
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains(r#""text":"第一行\n第二行""#), "{json}");
+    }
+
+    #[test]
+    fn 解析写穿回执() {
+        let body = r#"{"ok":true,"data":{"sent":{"paneId":101,"bracketedPaste":true}}}"#;
+        let sent = parse_send_receipt(200, body).unwrap();
+        assert_eq!(sent.pane_id, 101);
+        assert!(sent.bracketed_paste);
+    }
+
+    /// 旧桌面端不认得 `bracketedPaste` 时缺省 `false`：宁可让编排者以为多行
+    /// 没走成整块、去核对一眼，也别反过来（fail-closed 取向）。
+    #[test]
+    fn 回执缺字段时保守当成没整块粘贴() {
+        let body = r#"{"ok":true,"data":{"sent":{"paneId":101}}}"#;
+        assert!(!parse_send_receipt(200, body).unwrap().bracketed_paste);
+    }
+
+    /// 认不出的响应照旧算失败，不许退化成「反正发出去了」。
+    #[test]
+    fn 写穿的坏响应也算失败() {
+        for (status, body) in [(200, "not json"), (200, r#"{"ok":true,"data":{}}"#)] {
+            assert_eq!(
+                parse_send_receipt(status, body).unwrap_err().code,
+                "malformedResponse",
+                "body={body}"
+            );
+        }
+    }
+
+    /// 工单 05 的两个错误码落在「改你的请求」那一档（既不是没能力，也不是够不着）。
+    #[test]
+    fn 写穿错误码的分档() {
+        let f = |code: &str| ControlFailure {
+            status: 400,
+            code: code.into(),
+            message: String::new(),
+        };
+        for code in ["emptyInput", "sendFailed"] {
+            assert!(!f(code).is_denied(), "{code} 不是鉴权失败");
+            assert!(!f(code).is_desktop_unavailable(), "{code} 不是够不着");
         }
     }
 

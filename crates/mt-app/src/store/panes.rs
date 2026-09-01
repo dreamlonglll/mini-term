@@ -607,6 +607,29 @@ impl AppStore {
         true
     }
 
+    /// 这个 PTY 的终端此刻开着 bracketed paste 吗（DECSET 2004）。
+    ///
+    /// 程序化写穿要决定「包不包 `ESC[200~ … ESC[201~`」时问它 —— 与用户按
+    /// Ctrl+V 时 `mt_ui::terminal::input::paste_to_bytes` 读的**是同一个模式位**
+    /// （都出自 VT 状态机，不另存一份镜像）。
+    ///
+    /// 找不到那个终端时答 `false`：包一层只有在对面认得它时才有意义，
+    /// 认不出的时候少包一层最多是逐行送进去，多包一层是往用户屏幕上灌乱码。
+    ///
+    /// 取 `&App` 而不是 `&Context<Self>`，是为了让调用方能在同一个共享借用里
+    /// 先 `store.read(cx)` 再问这一句（`Entity::read` 的返回值会把那次借用
+    /// 一直持到语句结束）。
+    pub fn pane_bracketed_paste(&self, pty_id: u32, cx: &gpui::App) -> bool {
+        use mt_terminal::alacritty_terminal::term::TermMode;
+        self.terminals.get(&pty_id).is_some_and(|entity| {
+            entity
+                .read(cx)
+                .emulator()
+                .mode()
+                .contains(TermMode::BRACKETED_PASTE)
+        })
+    }
+
     /// 分屏分隔条拖动后的比例回写。
     pub fn set_split_sizes(
         &mut self,

@@ -50,6 +50,17 @@
 //!
 //! 两条之间仍有一线窗口(判完时限、建 pane 期间发起侧刚好到点),那一档由「先记账」
 //! 兜住:会话在,记账也在,编排者 `list-panes` 看得见。
+//!
+//! # 写穿走同一条泵(工单 05)
+//!
+//! `send` 也是主线程的活(写 PTY 要经 gpui 实体上的 [`AppStore::write_to_pane`]),
+//! 于是它与起会话共用这一条泵、这一个时限、这一种超时结论。两者只有一处不同:
+//! 起会话超时后**桌面上可能真多了一个会话**(所以有那套记账契约),写穿超时后
+//! 什么实体都不会留下 —— 字节要么进了 PTY 要么没进。
+//!
+//! 装配(bracketed paste 包裹、换行归一)在**控制面那一侧**做好([`PaneInput`]),
+//! 这里只挑一份:目标终端开着 bracketed paste 就写包裹版,没开就写裸版 ——
+//! 与用户按 Ctrl+V 时 `mt_ui::terminal::input::paste_to_bytes` 读的是同一个模式位。
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -58,8 +69,9 @@ use futures::StreamExt;
 use futures::channel::mpsc::{self, UnboundedSender};
 use gpui::{App, Entity, Task, Window};
 use mt_ai::{
-    AiSessionState, ControlLauncher, ControlProject, OrchestratorActions, OrchestratorHost,
-    PaneLiveness, StartFailure, StartSessionSpec, StartedSession, ACTION_TIMEOUT,
+    AiSessionState, ControlLauncher, ControlProject, Delivered, OrchestratorActions,
+    OrchestratorHost, PaneInput, PaneLiveness, SendFailure, StartFailure, StartSessionSpec,
+    StartedSession, ACTION_TIMEOUT,
 };
 use mt_config::{AiLauncher, AppConfig, ProjectTreeItem};
 use parking_lot::Mutex;
@@ -177,6 +189,29 @@ enum OrchestratorSignal {
         /// 泵在**动手之前**看一眼,过期了就整条丢掉,连 pane 都不建。
         deadline: Deadline,
     },
+    /// 把一段输入写穿进某个乐手(工单 05)。写 PTY 要经 gpui 实体上的
+    /// [`AppStore::write_to_pane`],所以同样是主线程的活。
+    SendInput {
+        /// 乐手的 PTY 编号(控制面已按可见范围铁律裁决过)。
+        pane_id: u32,
+        /// 已经装配好的两份字节,挑哪份看目标终端的真实粘贴模式。
+        input: PaneInput,
+        reply: std::sync::mpsc::SyncSender<Result<Delivered, SendFailure>>,
+        deadline: Deadline,
+    },
+}
+
+impl OrchestratorSignal {
+    /// 发起侧的耐心到点没有。
+    ///
+    /// **穷尽 match、没有 `_` 兜底**:加一种新信号时这里编译不过,免得它悄悄绕过
+    /// 泵开头那道时限闸 —— 绕过去就是「没人等的活照做」,起会话那条还会长出
+    /// 无人认领的 pane。
+    fn deadline(&self) -> Deadline {
+        match self {
+            Self::StartSession { deadline, .. } | Self::SendInput { deadline, .. } => *deadline,
+        }
+    }
 }
 
 /// 注入给 `mt-ai` 的动作实现。
@@ -206,6 +241,28 @@ impl OrchestratorActions for ActionsImpl {
         answer
             .recv_timeout(ACTION_TIMEOUT)
             .unwrap_or(Err(StartFailure::DesktopBusy))
+    }
+
+    /// 写穿同样要回主线程(`AppStore::write_to_pane` 挂在 gpui 实体上),
+    /// 于是与起会话**同一条路**:同一个泵、同一个时限、同一种超时结论。
+    fn send_input(&self, pane_id: u32, input: PaneInput) -> Result<Delivered, SendFailure> {
+        let (reply, answer) = std::sync::mpsc::sync_channel(1);
+        let deadline = Deadline::after(ACTION_TIMEOUT);
+        if self
+            .tx
+            .unbounded_send(OrchestratorSignal::SendInput {
+                pane_id,
+                input,
+                reply,
+                deadline,
+            })
+            .is_err()
+        {
+            return Err(SendFailure::DesktopBusy);
+        }
+        answer
+            .recv_timeout(ACTION_TIMEOUT)
+            .unwrap_or(Err(SendFailure::DesktopBusy))
     }
 
     /// 死活**不跳主线程** —— 名额判定一次要问好几个 pane,而这几样东西后台线程
@@ -271,25 +328,39 @@ pub fn install(store: Entity<AppStore>, window: &mut Window, cx: &mut App) -> Ta
 
     window.spawn(cx, async move |cx| {
         while let Some(signal) = rx.next().await {
-            // 不可反驳的解构:将来加第二种信号时这里编译不过,免得新信号
-            // 悄悄绕过下面那道时限闸。
-            let OrchestratorSignal::StartSession {
-                spec,
-                reply,
-                deadline,
-            } = signal;
             // **动手之前先看时限**:发起侧早走了就整条丢掉,连 pane 都不建 ——
             // 起出来也没人认领(见模块注释)。队列积压时这是最省的止损。
-            if deadline.passed() {
+            // 判据对每一种信号都成立,所以在分发**之前**问(见
+            // [`OrchestratorSignal::deadline`] 那条穷尽 match)。
+            if signal.deadline().passed() {
                 continue;
             }
-            // 窗口没了就别再答复:发起方会在 `ACTION_TIMEOUT` 上收敛成 DesktopBusy
-            let Ok(result) = cx.update(|window, cx| start_session(&store, spec, window, cx)) else {
-                return;
-            };
-            // 对面可能已经等超时走了(`SyncSender` 于是报错),不是问题 ——
-            // 记账在 `spec.landed()` 里已经落地,回执丢了也不会长出幽灵乐手。
-            let _ = reply.send(result);
+            match signal {
+                OrchestratorSignal::StartSession { spec, reply, .. } => {
+                    // 窗口没了就别再答复:发起方会在 `ACTION_TIMEOUT` 上收敛成 DesktopBusy
+                    let Ok(result) = cx.update(|window, cx| start_session(&store, spec, window, cx))
+                    else {
+                        return;
+                    };
+                    // 对面可能已经等超时走了(`SyncSender` 于是报错),不是问题 ——
+                    // 记账在 `spec.landed()` 里已经落地,回执丢了也不会长出幽灵乐手。
+                    let _ = reply.send(result);
+                }
+                OrchestratorSignal::SendInput {
+                    pane_id,
+                    input,
+                    reply,
+                    ..
+                } => {
+                    let Ok(result) = cx.update(|_window, cx| send_input(&store, pane_id, input, cx))
+                    else {
+                        return;
+                    };
+                    // 回执丢了这条**没有**起会话那种「桌面上多了个东西」的后果:
+                    // 字节要么进了 PTY 要么没进,不留任何要记账的实体。
+                    let _ = reply.send(result);
+                }
+            }
         }
     })
 }
@@ -358,6 +429,43 @@ fn start_session(
     // `StartedSession` 唯一的构造路径。发起侧就算已经超时走人,桌面上这个真实
     // 存在的受编排会话照样进 `list-panes`、照样占名额、照样能被点名。
     Ok(spec.landed(pane_id))
+}
+
+/// 主线程上真正把那段输入写进乐手。
+///
+/// **整条走既有的写穿入口**[`AppStore::write_to_pane`] —— 与用户自己在那个终端
+/// 上粘贴并回车是同一段代码，输入跟踪 / AI marker / attention 黄灯清除 /
+/// SSH autofill 解除全挂在它下游（`TerminalPane::write` → `PtySession::write`），
+/// 绕过去就全丢了（`store::launch` 第 5 步那条纪律的同一条红线）。移动端指令
+/// 走的也是这一条 —— 工单要的「语义与移动端完全一致」就是**同一个函数**，
+/// 不是另一个长得像的。
+///
+/// 只做两件本地判断：把 PTY 编号翻回「项目 + pane」（写穿入口按那个点名），
+/// 以及问一句目标终端此刻开没开 bracketed paste。
+fn send_input(
+    store: &Entity<AppStore>,
+    pane_id: u32,
+    input: PaneInput,
+    cx: &mut App,
+) -> Result<Delivered, SendFailure> {
+    // 一个共享借用里连问两句:`Entity::read` 的返回值会把借用持到语句结束,
+    // 拿 `&mut App` 直接连着 read 两次借用检查过不去。
+    let app: &App = cx;
+    let Some((project_id, pane)) = store.read(app).pane_of_pty(pane_id) else {
+        // 控制面裁决时它还活着,到这儿没了 = 用户刚好把它关掉。
+        return Err(SendFailure::PaneGone);
+    };
+    let bracketed_paste = store.read(app).pane_bracketed_paste(pane_id, app);
+
+    let written = store.update(cx, |store, cx| {
+        store.write_to_pane(&project_id, &pane, input.bytes(bracketed_paste), cx)
+    });
+    if !written {
+        // `write_to_pane` 只在「找不到那个终端实体」时答 false —— 与上面那一档
+        // 同因异形(布局树里还有这个 pane,但它的 PTY 已经不在了)。
+        return Err(SendFailure::WriteFailed);
+    }
+    Ok(Delivered { bracketed_paste })
 }
 
 /// 「受编排会话」那份落地请求的**唯一**构造处。
@@ -713,6 +821,47 @@ mod tests {
         assert_eq!(req.command, "claude --dangerously");
         assert_eq!(req.shell_name, Some("wsl"));
         assert_eq!(req.launcher_name, "Claude");
+    }
+
+    // ─── 写穿装配的跨 crate 对账(工单 05)────────────────────────
+
+    /// **编排者的写穿与用户按 Ctrl+V 装配出同一串字节**。
+    ///
+    /// 装配有两份实现,隔着 crate 边界:粘贴那条在 `mt_ui::paste_to_bytes`
+    /// (它吃 `TermMode`,而 `mt-ai` 不依赖 `mt-terminal`/`gpui`,搬不过去),
+    /// 写穿那条在 `mt_ai::PaneInput`(装配在控制面才让主缝测试断言得到)。
+    /// **`mt-app` 是唯一同时看得见两侧的地方**,于是这条对账住在这里 ——
+    /// 少了它,哪天有人只改一侧的换行口径,编排者发的多行 prompt 会与用户
+    /// 亲手粘的表现不一样,而两边的单测各自照绿。
+    ///
+    /// 唯一的差别是**末尾那个回车**:粘贴不按回车(用户自己按),写穿要按。
+    #[test]
+    fn 写穿装配与用户粘贴同口径() {
+        use mt_terminal::alacritty_terminal::term::TermMode;
+        use mt_ui::paste_to_bytes;
+
+        for text in [
+            "单行",
+            "第一行\n第二行",
+            "混着\r\n两种\n换行",
+            "带代码块:\n```rust\nfn main() {}\n```",
+        ] {
+            let input = PaneInput::assemble(text).expect("非空正文");
+
+            let pasted = paste_to_bytes(text, TermMode::BRACKETED_PASTE);
+            assert_eq!(
+                input.bracketed(),
+                format!("{}\r", String::from_utf8(pasted).unwrap()),
+                "text={text:?}: 包裹版与用户粘贴的字节不一致"
+            );
+
+            let pasted = paste_to_bytes(text, TermMode::empty());
+            assert_eq!(
+                input.plain(),
+                format!("{}\r", String::from_utf8(pasted).unwrap()),
+                "text={text:?}: 裸版与用户粘贴的字节不一致"
+            );
+        }
     }
 
     /// 发起侧已经不等了的信号,泵**动手之前**就该丢掉 —— 建出来的乐手没人认领。
