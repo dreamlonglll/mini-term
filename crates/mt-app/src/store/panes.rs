@@ -874,6 +874,20 @@ impl AppStore {
             let token = self.ai.grant_orchestration(pty_id, &project.id);
             env.push((mt_ai::control::TOKEN_ENV.to_string(), token));
             env.push((mt_ai::control::PANE_ENV.to_string(), pty_id.to_string()));
+            // 令牌的另一半:编排礼仪 Skill 投进这个项目(`orchestrator_skill`)。
+            // **同步**、且在启动命令敲进 shell 之前 —— agent 只在启动时读 skills
+            // 目录。失败不拦着起 pane(令牌照发,CLI 照样能用),但要让用户知道
+            // 编排者可能不会用 CLI;收回在 `dispose_terminal`。
+            if let Err(err) = crate::orchestrator_skill::deploy(&project.path) {
+                eprintln!("[orchestrator_skill] 投放失败: {err}");
+                crate::toast::push_message(
+                    crate::notify::ToastKind::PasteError,
+                    project.id.clone(),
+                    project.name.clone(),
+                    crate::i18n::tr!("app", "orchestratorSkillDeployFailed", error = err),
+                    cx,
+                );
+            }
         }
 
         // SSH 远程分支:直接 spawn `ssh` 作 PTY 子进程(不经本地 shell,对齐 WSL

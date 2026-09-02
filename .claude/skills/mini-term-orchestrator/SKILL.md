@@ -18,10 +18,20 @@ echo $MINITERM_ORCHESTRATOR_TOKEN  # bash
 
 Empty means this pane has no capability. Say so; do not try to work around it.
 
+<!-- cli-location:start -->
+<!--
+  Maintainers: mini-term embeds this file (include_str!) and writes a rendered copy
+  into <project>/.claude/skills/ and <project>/.codex/skills/ whenever an
+  orchestrator pane starts in that project. Only the block between the
+  cli-location markers is replaced (with the real mt-agent-cli path and the
+  per-shell invocation forms); keep both markers. See
+  crates/mt-app/src/orchestrator_skill.rs.
+-->
 The CLI lives next to the mini-term executable, e.g.
 `"E:\Program Files\Mini-Term\mt-agent-cli.exe"` (quote it — the path has spaces).
 Run `mt-agent-cli --help` once; the exit codes and per-command notes there are
 authoritative. Every command prints JSON on success.
+<!-- cli-location:end -->
 
 ## Commands
 

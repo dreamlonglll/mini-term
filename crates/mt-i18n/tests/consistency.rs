@@ -88,8 +88,9 @@ use mt_i18n::{
 /// 846 → 853：Hook 页新增「编排」一节——受编排会话并发上限的节标题、行标题、
 /// 说明与页脚（工单 08 的设置项，4 条）；受编排会话 tab 上的出身标识——由谁启动 /
 /// 编排者已离场 / 认不出时那个兜底称呼（工单 04，3 条）。
+/// 853 → 854：编排礼仪 Skill 投放失败的 toast（起编排者 pane 时写不进项目目录）。
 const EXPECTED_NAMESPACES: usize = 32;
-const EXPECTED_ENTRIES_PER_LANG: usize = 853;
+const EXPECTED_ENTRIES_PER_LANG: usize = 854;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。
