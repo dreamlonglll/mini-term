@@ -37,10 +37,6 @@
 //! 拍重发；`Closed` 之后该 pane 的一切事实一律忽略。**没有任何一条判定会在同一
 //! 份事实上反复得出同一个结论。**
 
-// 本票（工单 11）交付时这个模块没有任何调用方——它是 12 的引擎，接线在 12。
-// 12 落地后这行连同本注释一起删掉。
-#![allow(dead_code)]
-
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 

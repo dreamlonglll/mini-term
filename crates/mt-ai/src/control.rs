@@ -190,6 +190,29 @@ pub const DEFAULT_SCREEN_LINES: usize = 50;
 /// 500 行是「翻十屏」的量级，超出的部分该用 `read-transcript` 去读结构化记录。
 pub const MAX_SCREEN_LINES: usize = 500;
 
+/// 汇报投递泵的自唤醒节拍（工单 12）。
+///
+/// 泵平时睡在一条唤醒通道上（[`ControlPlane::observe_status`] 一产生汇报、或者
+/// 编排者自己的状态一变就戳它），这个数只是**兜底重试的间隔**：投递闸没开
+/// （编排者正忙 / 停在黄灯）时那一批要留在收件箱里等下一拍，而「编排者闲下来了」
+/// 未必总伴随一次状态变化（无 hook 的降级路径上就没有事件）。
+///
+/// 1 秒两头夹出来：下界是「一次空转要多便宜」——没有积压时它只是一次哈希表读，
+/// 每秒一次可以忽略；上界是「编排者干完一轮到收到汇报最多晚多久」，超过一秒
+/// 就开始像卡顿了。**不做成可注入**：主缝测试直接调
+/// [`ControlPlane::pump_reports`]，不睡等线程。
+const PUMP_INTERVAL: Duration = Duration::from_secs(1);
+
+/// 每段汇报的固定前缀。
+///
+/// 写进编排者终端的那段文字得让它一眼认出「这不是用户说的话」。刻意**不进字典**
+/// ——它是一个标识而不是文案，翻译它只会让编排者在两种语言里认两种标记。
+///
+/// ⚠️ 它同时是一道安全护栏：整段文字以它开头，于是
+/// [`crate::detect::interactive_ai_command_name`]（只看行首第一个词）绝不会把
+/// 汇报正文里出现的 `claude` / `codex` 当成「用户敲了一条 AI 命令」。
+const REPORT_PREFIX: &str = "[mini-term]";
+
 // ─── 注入接口 ─────────────────────────────────────────────────
 
 /// 启动器在控制面里的切面。
@@ -887,6 +910,30 @@ fn transcript_family(agent: &str) -> Option<&'static str> {
     }
 }
 
+/// 「这个受编排会话的会话记录该去哪读」的裁决结果。
+///
+/// 三档与 `read-transcript` 的三条出路一一对应，是**同一段裁决**的产物
+/// （见 [`ControlPlane::transcript_binding`]）：命令那一侧把后两档答成错误码，
+/// 汇报渲染那一侧把后两档换成画面尾部。摊开写两遍就是两个走散的机会 ——
+/// 而走散的方式很具体：忘了「session_id 只认 hook、绝不启发式」。
+enum TranscriptBinding {
+    Ready(TranscriptTarget),
+    /// 这一家没有可解析的会话记录（opencode / pi 之流）。
+    Unsupported,
+    /// 还没有 hook 上报过会话身份，**无从绑定**（不猜）。
+    Unidentified,
+}
+
+/// 绑定成立时定位一条会话记录要的三样东西。
+struct TranscriptTarget {
+    /// 收敛过的家族名（`claude` / `codex` / `grok`）。
+    family: &'static str,
+    /// hook 上报的会话 id —— 绑定的唯一权威。
+    session_id: String,
+    /// 受编排会话所在项目的路径（记账里那个项目，不看 pane 自己的 cwd）。
+    project_path: String,
+}
+
 /// 一条范围记账：一个乐手的出身。
 ///
 /// 「谁 spawn 了谁」由控制服务持有（ADR 0003）—— 桌面侧的 pane 上**不打**这个
@@ -1014,11 +1061,6 @@ pub struct Task {
     /// 意味着立刻开跑、或者写进了一个已经退回裸 shell 的 pane。三档的处置各不相同，
     /// 由编排者自己判断（`--help` 里写着）。
     pub target_status_at_write: String,
-    /// 这条任务的编号已经随某条汇报交给编排者了吗（工单 12 的投递泵回填）。
-    ///
-    /// 汇报要带上「此前写入且尚未汇报过的任务编号」，取一次即收敛 —— 与
-    /// `monitor` 那条「降级结论必须落盘、不许每轮重算」同一条铁律。
-    pub reported: bool,
 }
 
 /// 控制命令的闭集。
@@ -1124,6 +1166,19 @@ struct Inner {
     /// [`OrchestratorActions`] 的实现是上层代码,自带别的锁)—— 先在锁内把
     /// 需要的东西拷出来,出锁再问。
     registry: Mutex<TokenRegistry>,
+    /// 汇报账本（工单 11 的纯状态机）。**自成一把锁，且与 `registry` 那把从不
+    /// 同时持有** —— 两者的调用序在两个方向上都出现过（`register_landed` 是
+    /// 先 registry 后 ledger，投递泵是先 ledger 后 registry），同时持就是
+    /// AB-BA。做法与 `registry` 那条注释第二点一样：先在锁内把要的东西拷出来，
+    /// 出锁再谈下一步。
+    ///
+    /// ⚠️ **渲染与写穿一律在锁外**（读会话记录文件 / 跳 gpui 主线程），
+    /// 与 `wait` 那条「取事实、放锁、再动手」同一条纪律。
+    ledger: Mutex<crate::reports::ReportLedger>,
+    /// 投递泵的唤醒口。`None` = 泵还没起（[`ControlPlane::set_actions`] 之前，
+    /// 也就是「桌面还没接线」）。用 `sync_channel(1)`：多次唤醒自动并成一次，
+    /// 泵不会因为一批汇报里有十条就空转十趟。
+    pump: Mutex<Option<std::sync::mpsc::SyncSender<()>>>,
     /// 并发上限。用原子量而不是再加一把锁:多一把锁就多一组与 `registry`
     /// 交叉持有的可能。
     session_cap: AtomicUsize,
@@ -1142,6 +1197,8 @@ impl Default for Inner {
             actions: Mutex::new(None),
             transcripts: Mutex::new(Arc::new(SessionLogTranscripts)),
             registry: Mutex::new(TokenRegistry::default()),
+            ledger: Mutex::new(crate::reports::ReportLedger::new()),
+            pump: Mutex::new(None),
             session_cap: AtomicUsize::new(DEFAULT_SESSION_CAP),
             // 缺省开着 —— 配置里 `None` 的语义就是「跟默认走」。
             report_footer: AtomicBool::new(true),
@@ -1234,35 +1291,11 @@ impl TokenRegistry {
             target_pane_id,
             written_at: Instant::now(),
             target_status_at_write: status.to_string(),
-            reported: false,
         });
         while ledger.tasks.len() > MAX_TASKS_PER_ORCHESTRATOR {
             ledger.tasks.pop_front();
         }
         id
-    }
-
-    /// 某个乐手身上「尚未汇报」的任务，按派活先后。`consume` 为真时就地标记成
-    /// 已汇报（取一次即收敛）。
-    fn unreported_of_hand(&mut self, target_pane_id: u32, consume: bool) -> Vec<String> {
-        let mut out: Vec<(u64, String)> = Vec::new();
-        for ledger in self.tasks.values_mut() {
-            for task in ledger.tasks.iter_mut() {
-                if task.target_pane_id != target_pane_id || task.reported {
-                    continue;
-                }
-                // 编号里那个序号就是派活顺序（同一编排者内单调递增）；跨编排者
-                // 派给同一个乐手是不可能的（可见范围铁律：乐手只属于起它的那个），
-                // 所以按它排就是全局的先后序。
-                let seq = task.id[1..].parse().unwrap_or(0);
-                out.push((seq, task.id.clone()));
-                if consume {
-                    task.reported = true;
-                }
-            }
-        }
-        out.sort_unstable();
-        out.into_iter().map(|(_, id)| id).collect()
     }
 
     /// 记账超出上限时，**只丢已经关掉的、从最旧的丢起**。
@@ -1309,8 +1342,13 @@ impl ControlPlane {
     }
 
     /// 注入桌面动作。未注入时等价于 [`NoopOrchestratorActions`]（起会话恒失败）。
+    ///
+    /// **顺带把汇报投递泵起起来**（工单 12）：泵要做的两件事——查编排者的投递闸、
+    /// 把汇报写穿进它的终端——全都要经这条缝，没接线之前起了也只会空转。
+    /// 泵与 hook 服务同寿，重复调只起一条。
     pub fn set_actions(&self, actions: Arc<dyn OrchestratorActions>) {
         *self.inner.actions.lock() = Some(actions);
+        self.start_report_pump();
     }
 
     /// 换掉会话记录的来源。
@@ -1344,47 +1382,43 @@ impl ControlPlane {
 
     // ─── 任务账本（工单 10）───────────────────────────────────
 
-    /// 记一条派活并拿到它的编号。
+    /// 记一条派活并拿到它的编号，**同时把这件事告诉汇报账本**。
     ///
     /// **正常路径由 [`Self::send`] 在写穿成功之后自己调**（写失败不消耗编号：
-    /// 没写进去就没有这次派活）。开成 `pub` 是给工单 11 / 12 的账本与它们的
-    /// 测试用 —— 它们要能在没有真桌面的情况下造出「派过活」这个事实。
+    /// 没写进去就没有这次派活）。开成 `pub` 是给测试用 —— 它们要能在没有真桌面
+    /// 的情况下造出「派过活」这个事实。
+    ///
+    /// # 「尚未汇报的任务编号」只有一个真源
+    ///
+    /// 工单 10 曾在 [`Task`] 上另做过一个 `reported` 位（外加两个查询方法），
+    /// 与 [`crate::reports::ReportLedger`] 自己那份「尚未汇报」清单是同一件事的
+    /// 两份事实 —— 而两份事实迟早会走散。工单 12 收成一份：**账本那份说了算**，
+    /// 这里的任务表退回纯事实查询（派了几条、什么时候派的、写入那一刻对面什么
+    /// 状态），一个字都不参与汇报判定。
     pub fn note_task_written(
         &self,
         orchestrator_pane_id: u32,
         target_pane_id: u32,
         target_status_at_write: &str,
     ) -> String {
-        self.inner.registry.lock().note_task(
+        let id = self.inner.registry.lock().note_task(
             orchestrator_pane_id,
             target_pane_id,
             target_status_at_write,
-        )
-    }
-
-    /// 某个乐手身上**尚未汇报**的任务编号，按派活先后。只看不取。
-    pub fn unreported_task_ids(&self, target_pane_id: u32) -> Vec<String> {
-        self.inner
-            .registry
-            .lock()
-            .unreported_of_hand(target_pane_id, false)
-    }
-
-    /// 同上，但**取一次即收敛**：返回的这些就地标记成已汇报，下次不再出现。
-    ///
-    /// 工单 12 渲染「回合已结束 / 已退出 / 已关闭」那三种汇报时调它一次，把
-    /// 编号清单带进汇报正文。重复投递会让编排者以为同一批活被派了两遍。
-    pub fn take_unreported_task_ids(&self, target_pane_id: u32) -> Vec<String> {
-        self.inner
-            .registry
-            .lock()
-            .unreported_of_hand(target_pane_id, true)
+        );
+        // 出锁再喂账本：两把锁从不同时持有（本模块的锁序纪律，见 `Inner::ledger`）。
+        self.inner.ledger.lock().note_task_written(
+            target_pane_id,
+            &id,
+            target_status_at_write,
+            Instant::now(),
+        );
+        id
     }
 
     /// 某个编排者名下的任务，按派活先后（最多 [`MAX_TASKS_PER_ORCHESTRATOR`] 条）。
     ///
-    /// 给工单 11/12 与测试查事实用：写入时刻（未被接收的超时判定）与写入那一刻
-    /// 目标的状态都在里头。
+    /// 纯事实查询：写入时刻与写入那一刻目标的状态都在里头。
     pub fn tasks_of(&self, orchestrator_pane_id: u32) -> Vec<Task> {
         self.inner
             .registry
@@ -1417,6 +1451,9 @@ impl ControlPlane {
                 },
             );
         }
+        // 前世的收件箱与它名下受编排会话的追踪一并作废（`depart` 的账本版）。
+        // **出锁再动账本**：两把锁从不同时持有。
+        self.inner.ledger.lock().drop_inbox(pane_id);
         self.bump_origins();
         token
     }
@@ -1463,21 +1500,42 @@ impl ControlPlane {
             // 编排者那一路
             registry.depart(pane_id);
         }
+        // 账本那一路（**出锁之后**，两把锁从不同时持有）。两句都无条件调：
+        // 这个 pane 只可能是其中一种身份，另一句对不相干的编号是空操作。
+        //
+        // ⚠️ **顺序纪律**：受编排会话那条「已关闭」汇报由桌面侧在 `dispose_terminal`
+        // 里更早一步的 [`Self::observe_pane_closed`] 产出，这里只负责收摊 ——
+        // 反过来的话汇报会因为追踪已被忘掉而永远发不出去（工单 11 留档第 3 条）。
+        {
+            let mut ledger = self.inner.ledger.lock();
+            // 编排者走了：收件箱作废，名下受编排会话的追踪一并忘掉
+            ledger.drop_inbox(pane_id);
+            // 受编排会话自己走了：忘掉这一条追踪（记账表里那条留着标「已关」，
+            // 但账本不必再为一个再也不会有事实进来的 pane 留一份状态）
+            ledger.forget_session(pane_id);
+        }
         self.bump_origins();
     }
 
     /// 记下「这个乐手落地了」。**唯一的写入点**，由 [`StartSessionSpec::landed`]
     /// 在动作实现拿到 pane 身份的那一刻调 —— 早于任何回执（见模块注释）。
     fn register_landed(&self, session: OrchestratedSession) {
+        let pane_id = session.pane_id;
+        let orchestrator = session.orchestrator_pane_id;
         {
             let mut registry = self.inner.registry.lock();
-            let orchestrator = session.orchestrator_pane_id;
             // PTY 编号单调递增，编号复用理论上不会发生；真撞上也别让新乐手继承
             // 前一条的「已关」标记。
             registry.closed.remove(&session.pane_id);
             registry.sessions.insert(session.pane_id, session);
             registry.trim(orchestrator);
         }
+        // 汇报账本跟着记账表走：不在它表里的 pane，状态变化一律被忽略
+        // （**出锁之后**，两把锁从不同时持有）。
+        self.inner
+            .ledger
+            .lock()
+            .register_session(pane_id, orchestrator);
         self.bump_origins();
     }
 
@@ -2007,31 +2065,24 @@ impl ControlPlane {
             Ok(s) => s,
             Err(e) => return e.into_outcome(),
         };
-        let identity = self.host_pane_session(session.pane_id).unwrap_or_default();
-        // 裁决一：能力分层。认得出是哪一家、但那一家没有记录 → 明确改道。
-        // （agent 名缺席时落 claude，见 [`transcript_family`]。）
-        let Some(family) = transcript_family(identity.agent.as_deref().unwrap_or_default()) else {
-            return ControlError::TranscriptUnsupported.into_outcome();
+        // 家族裁决 + 绑定 + 项目路径**走共用的那一条**（汇报渲染也用它，
+        // 见 [`Self::transcript_binding`]）。
+        let binding = match self.transcript_binding(&session) {
+            TranscriptBinding::Ready(b) => b,
+            TranscriptBinding::Unsupported => {
+                return ControlError::TranscriptUnsupported.into_outcome();
+            }
+            TranscriptBinding::Unidentified => {
+                return ControlError::SessionUnidentified.into_outcome();
+            }
         };
-        // 裁决二：绑定。没有 hook 上报的会话身份就到此为止 —— **不猜**。
-        let Some(session_id) = nonempty(identity.session_id.as_deref()) else {
-            return ControlError::SessionUnidentified.into_outcome();
-        };
-        // 定位用的项目路径取自记账里那个项目（乐手就是在它里头起的）。
-        // 与镜像同一个口径：它也是拿 pane 所属项目的路径去找会话桶，不看 pane
-        // 自己的 cwd —— 那个 cwd 只在 hook 推送的事件里有，查不到。
-        let project_path = self
-            .host_projects()
-            .into_iter()
-            .find(|p| p.id == session.project_id)
-            .map(|p| p.path)
-            .unwrap_or_default();
+        let (family, session_id) = (binding.family, binding.session_id.as_str());
 
         // ⚠️ 读文件是慢活，**已经出锁**（`resolve_target` 与 `host_*` 都已经
         // 各自取完放掉了 registry 锁）。
         let messages = self
             .transcripts()
-            .read(family, session_id, &project_path)
+            .read(family, session_id, &binding.project_path)
             .unwrap_or_default();
         let total = messages.len() as u64;
         // 游标越界（编排者传了个大于总数的数 / 换绑后记录变短）一律钳回 —— 报错
@@ -2088,6 +2139,546 @@ impl ControlPlane {
             Err(ScreenFailure::DesktopBusy) => ControlError::DesktopBusy.into_outcome(),
         }
     }
+
+    // ─── 汇报投递（工单 12 / ADR 0004）────────────────────────────
+
+    /// 「这条会话记录该去哪读」——`read-transcript` 与汇报渲染**共用这一条**。
+    ///
+    /// 三条裁决一个字都没变，只是从命令里搬了出来：家族收敛（[`transcript_family`]）、
+    /// **session id 只认 hook**（找不到就到此为止，绝不退回「项目里最新的那个会话
+    /// 文件」——对话镜像在那上面踩过串台的坑）、项目路径取记账里那个项目。
+    fn transcript_binding(&self, session: &OrchestratedSession) -> TranscriptBinding {
+        let identity = self.host_pane_session(session.pane_id).unwrap_or_default();
+        // 裁决一：能力分层。认得出是哪一家、但那一家没有记录 → 明确改道。
+        // （agent 名缺席时落 claude，见 [`transcript_family`]。）
+        let Some(family) = transcript_family(identity.agent.as_deref().unwrap_or_default()) else {
+            return TranscriptBinding::Unsupported;
+        };
+        // 裁决二：绑定。没有 hook 上报的会话身份就到此为止 —— **不猜**。
+        let Some(session_id) = nonempty(identity.session_id.as_deref()) else {
+            return TranscriptBinding::Unidentified;
+        };
+        // 定位用的项目路径取自记账里那个项目（受编排会话就是在它里头起的）。
+        // 与镜像同一个口径：它也是拿 pane 所属项目的路径去找会话桶，不看 pane
+        // 自己的 cwd —— 那个 cwd 只在 hook 推送的事件里有，查不到。
+        let project_path = self
+            .host_projects()
+            .into_iter()
+            .find(|p| p.id == session.project_id)
+            .map(|p| p.path)
+            .unwrap_or_default();
+        TranscriptBinding::Ready(TranscriptTarget {
+            family,
+            session_id: session_id.to_string(),
+            project_path,
+        })
+    }
+
+    /// 吃一次 pane 的状态变化。**桌面侧只有一个接线点**
+    /// （`mt_app::store::ai` 的 `AiEvent::Status`），三种可能全在这一句里分掉：
+    ///
+    /// - 是自己名下的受编排会话 → 喂账本，可能就此产出一条汇报；
+    /// - 是**编排者自己** → 账本不认它（未注册的 pane 一律忽略，那条过滤在
+    ///   `reports` 里），但它刚刚可能闲下来了 —— 收件箱有积压就戳一下投递泵；
+    /// - 两者都不是（用户亲手开的会话 / 裸 shell）→ 什么都不做。
+    ///
+    /// **不收时钟参数**：桌面侧没有可拨的时钟，`now` 就是此刻；要拨时间的测试
+    /// 直接调 [`Self::pump_reports`]。
+    pub fn observe_status(&self, pane_id: u32, status: &str, cause: Option<&str>) {
+        let produced = self
+            .inner
+            .ledger
+            .lock()
+            .observe_status(pane_id, status, cause, Instant::now());
+        if produced {
+            self.wake_pump();
+            return;
+        }
+        // 出锁之后才问记账表（`registry` 与 `ledger` 从不同时持有）
+        if self.is_orchestrator(pane_id) && self.inner.ledger.lock().has_pending(pane_id) {
+            self.wake_pump();
+        }
+    }
+
+    /// 吃一次「pane 被关掉了」（桌面侧 `dispose_terminal`）。
+    ///
+    /// ⚠️ **必须早于 [`Self::revoke_pane`]**：那一步会把这个 pane 的追踪忘掉，
+    /// 之后再调就出不来「已关闭」那条汇报了（工单 11 留档第 3 条的顺序要求）。
+    pub fn observe_pane_closed(&self, pane_id: u32) {
+        let produced = self
+            .inner
+            .ledger
+            .lock()
+            .observe_pane_closed(pane_id, Instant::now());
+        if produced {
+            self.wake_pump();
+        }
+    }
+
+    /// 投递泵的**一拍**：把到点的「未被接收」报出来，再跑一遍投递。
+    ///
+    /// 后台线程每 [`PUMP_INTERVAL`] 调一次，主缝测试直接调它（不睡等线程）。
+    pub fn pump_reports(&self, now: Instant) {
+        // 返回值（本拍有没有新汇报）在这儿用不上 —— 下面那句本来就要扫一遍。
+        let _ = self.inner.ledger.lock().tick(now);
+        self.deliver_pending();
+    }
+
+    /// 跑一遍投递：每个有积压的编排者查一次[闸](can_deliver)，过了就把收件箱
+    /// 取空、渲染成一段文字、经既有的写穿缝送进它的终端。
+    ///
+    /// # 一把锁都不持着做 I/O
+    ///
+    /// 与 [`Self::wait`] 同款纪律：账本那把锁只在「问谁有积压」「取批次」「回写
+    /// 游标」三处各持一瞬，渲染（读会话记录文件、跳 gpui 主线程读画面）与写穿
+    /// 全在锁外。
+    ///
+    /// # 失败的三种处置
+    ///
+    /// - 编排者 pane 已经没了 / 写穿答 [`SendFailure::PaneGone`] → 这批**丢掉**，
+    ///   连收件箱一起（ADR 0004：暂存随编排者 pane 关闭作废）；
+    /// - [`SendFailure::DesktopBusy`] / [`SendFailure::WriteFailed`] → 放回队首，
+    ///   下一拍再试。**游标不回写** —— 没送到就等于没汇报过，下次把同一段增量
+    ///   重渲一遍（这正是游标要等到写穿成功之后才落的理由）。
+    pub fn deliver_pending(&self) {
+        let pending = self.inner.ledger.lock().pending_orchestrators();
+        if pending.is_empty() {
+            return;
+        }
+        let actions = self.actions();
+        for orchestrator in pending {
+            let liveness = actions.pane_liveness(orchestrator);
+            if !liveness.alive {
+                self.inner.ledger.lock().drop_inbox(orchestrator);
+                continue;
+            }
+            // 闸没开：**原样留在收件箱里**（编排者忙 / 停在黄灯 / 退回裸 shell），
+            // 下一拍再问。攒着比投错了强 —— 往一个正等人拍板的提示里写字就是代答。
+            if !can_deliver(&liveness) {
+                continue;
+            }
+            let Some(batch) = self.inner.ledger.lock().take_batch(orchestrator) else {
+                continue;
+            };
+            let rendered = self.render_batch(&batch);
+            // 批头永远非空，装配不出东西只可能是字典被清空了 —— 那也别把这批塞
+            // 回去无限重试（下一条汇报照常来）。
+            let Some(input) = PaneInput::assemble(&rendered.text) else {
+                continue;
+            };
+            match actions.send_input(orchestrator, input) {
+                Ok(_) => {
+                    let mut ledger = self.inner.ledger.lock();
+                    for (pane_id, cursor) in rendered.cursors {
+                        ledger.set_reported_cursor(pane_id, cursor);
+                    }
+                }
+                Err(SendFailure::PaneGone) => {
+                    self.inner.ledger.lock().drop_inbox(orchestrator);
+                }
+                Err(SendFailure::WriteFailed) | Err(SendFailure::DesktopBusy) => {
+                    self.inner.ledger.lock().requeue_batch(orchestrator, batch);
+                }
+            }
+        }
+    }
+
+    /// 把一批汇报渲染成要写进编排者终端的那段文字。
+    ///
+    /// 形状：一个批头（有丢弃就多一行说明），然后每条汇报一段——一行抬头
+    /// （`[mini-term] 受编排会话 #12 · 启动器 Claude · 项目 X · 回合结束 ·
+    /// 成因 Stop · 本回合用时 2m13s · 涉及任务 t3, t4`）加一段正文。
+    ///
+    /// **整批共用一份字节预算**（[`MAX_READ_BYTES`]，与 `read-transcript` 一次
+    /// 回执同一档）：超了就地截断并注明，编排者随时能自己 `read-transcript` 补读。
+    fn render_batch(&self, batch: &crate::reports::ReportBatch) -> RenderedBatch {
+        use crate::reports::ReportKind;
+
+        let count = batch.reports.len().to_string();
+        let mut text = String::new();
+        push_line(
+            &mut text,
+            &format!(
+                "{REPORT_PREFIX} {}",
+                mt_i18n::t_args("orchestrator", "batchHeader", &[("count", &count)])
+            ),
+        );
+        if batch.dropped > 0 {
+            let dropped = batch.dropped.to_string();
+            push_line(
+                &mut text,
+                &mt_i18n::t_args("orchestrator", "batchDropped", &[("dropped", &dropped)]),
+            );
+        }
+
+        // 渲染期间的游标：同一批里同一个 pane 可能有两条终结性汇报（编排者忙了
+        // 两个回合），第二条得从第一条的末尾接着数 —— 账本里那份要等写穿成功
+        // 才回写，光读它的话同一段增量会被贴两遍。
+        let mut cursors: HashMap<u32, usize> = {
+            let ledger = self.inner.ledger.lock();
+            batch
+                .reports
+                .iter()
+                .map(|r| (r.session_pane_id, ledger.reported_cursor(r.session_pane_id)))
+                .collect()
+        };
+        // 记账快照一次拿全（启动器名 / 项目名），渲染期间不再碰 registry 那把锁。
+        let records: HashMap<u32, OrchestratedSession> = {
+            let registry = self.inner.registry.lock();
+            batch
+                .reports
+                .iter()
+                .filter_map(|r| {
+                    registry
+                        .sessions
+                        .get(&r.session_pane_id)
+                        .map(|s| (r.session_pane_id, s.clone()))
+                })
+                .collect()
+        };
+
+        let mut budget = MAX_READ_BYTES;
+        for report in &batch.reports {
+            let pane_id = report.session_pane_id;
+            let record = records.get(&pane_id);
+            text.push('\n');
+            push_line(
+                &mut text,
+                &format!("{REPORT_PREFIX} {}", headline(report, record)),
+            );
+            let from = cursors.get(&pane_id).copied().unwrap_or(0);
+            match &report.kind {
+                ReportKind::TurnEnded { .. } | ReportKind::Exited { .. } => {
+                    match self.transcript_delta(record, from) {
+                        Some((Some(body), next)) => {
+                            cursors.insert(pane_id, next);
+                            push_body(&mut text, &mut budget, &body);
+                        }
+                        // 记录读得到但这一段没有新消息：真机上会话记录文件可能
+                        // 晚于 `Stop` hook 落盘，只回一句「还没有」等于让编排者拿
+                        // 一条空汇报 —— 补一份画面尾部，它至少看得到对面停在哪。
+                        // 游标原地不动（本来就没有可推进的），下一条汇报接着数。
+                        Some((None, next)) => {
+                            cursors.insert(pane_id, next);
+                            push_line(&mut text, mt_i18n::t("orchestrator", "transcriptEmpty"));
+                            self.push_screen_tail(&mut text, &mut budget, pane_id);
+                        }
+                        // 没有可解析记录 / 还没有 hook 身份的那两档换画面尾部
+                        None => self.push_screen_tail(&mut text, &mut budget, pane_id),
+                    }
+                }
+                ReportKind::Closed => {
+                    // pane 都没了：会话身份随它一起被清掉（`AiPerception::pane_closed`
+                    // 先 purge hook 再撤令牌），增量多半读不到，画面更是无从读起
+                    // —— 那一档只给抬头，不做一次注定 `PaneGone` 的主线程往返。
+                    if let Some((body, next)) = self.transcript_delta(record, from) {
+                        cursors.insert(pane_id, next);
+                        if let Some(body) = body {
+                            push_body(&mut text, &mut budget, &body);
+                        }
+                    }
+                }
+                ReportKind::AwaitingHuman { .. } => {
+                    // ADR 0003 的铁律：编排者不代答，它要做的是把原文转告用户。
+                    push_line(&mut text, mt_i18n::t("orchestrator", "awaitingHumanNote"));
+                    self.push_screen_tail(&mut text, &mut budget, pane_id);
+                }
+                ReportKind::NotAccepted { .. } => {
+                    // 只带编号与下一步，不猜它为什么没接（那一档看不出来）。
+                    push_line(&mut text, mt_i18n::t("orchestrator", "notAcceptedNote"));
+                }
+            }
+        }
+        RenderedBatch {
+            text,
+            cursors: cursors.into_iter().collect(),
+        }
+    }
+
+    /// 从 `from` 起的会话记录增量，连同**渲染完之后的新游标**。
+    ///
+    /// 外层 `None` = 这个受编排会话没有可解析的记录，或还没有 hook 上报的会话身份
+    /// （调用方据此换画面尾部）；内层 `None` = 记录读得到，但从 `from` 起没有新消息
+    /// （调用方补画面尾部，游标照旧回写）。游标是「第几条消息」，与工单 11 的账本
+    /// 同一口径。
+    fn transcript_delta(
+        &self,
+        record: Option<&OrchestratedSession>,
+        from: usize,
+    ) -> Option<(Option<String>, usize)> {
+        let TranscriptBinding::Ready(target) = self.transcript_binding(record?) else {
+            return None;
+        };
+        // ⚠️ 读文件是慢活，此处**不持任何锁**（`records` 快照早就出锁了）。
+        let messages = self
+            .transcripts()
+            .read(target.family, &target.session_id, &target.project_path)
+            .unwrap_or_default();
+        let total = messages.len();
+        // 记录换绑（`/clear` / 退出重开）之后会变短，游标一律钳回，不报错。
+        let from = from.min(total);
+        let delta = &messages[from..];
+        if delta.is_empty() {
+            return Some((None, total));
+        }
+        let mut body = mt_i18n::t_args(
+            "orchestrator",
+            "transcriptHeader",
+            &[("from", &from.to_string()), ("count", &delta.len().to_string())],
+        );
+        for msg in delta {
+            body.push('\n');
+            // 角色标是**字面量**（`[user]` / `[assistant]`），不进字典：编排者
+            // 认的是这两个标记本身，翻译它只会让它在两种语言里认两套。
+            body.push_str(&format!(
+                "[{}] {}",
+                sanitize_report(&msg.role, false),
+                sanitize_report(&msg.content, true)
+            ));
+        }
+        Some((Some(body), total))
+    }
+
+    /// 画面尾部若干行原文。读不到就如实说读不到 —— **不许**退化成一段空白，
+    /// 那会让编排者以为对面什么都没输出。
+    fn push_screen_tail(&self, out: &mut String, budget: &mut usize, pane_id: u32) {
+        match self.actions().read_screen(pane_id, DEFAULT_SCREEN_LINES) {
+            Ok(rows) if !rows.is_empty() => {
+                let mut body = mt_i18n::t("orchestrator", "screenHeader").to_string();
+                for row in rows {
+                    body.push('\n');
+                    body.push_str(&sanitize_report(&row, false));
+                }
+                push_body(out, budget, &body);
+            }
+            _ => push_line(out, mt_i18n::t("orchestrator", "screenUnavailable")),
+        }
+    }
+
+    /// 起投递泵。重复调只起一条（`set_actions` 在测试里会被调很多次）。
+    ///
+    /// **只拿 `Weak`**：泵不该把控制面钉在内存里 —— 主程序里它与 hook 服务同寿，
+    /// 而测试里一个 plane 一落地就该让这条线程自己走掉。唤醒通道的发送端住在
+    /// [`Inner`] 里，Inner 一没，`recv_timeout` 立刻答 `Disconnected`。
+    fn start_report_pump(&self) {
+        // **单元测试里不起这条线程**：主缝测试按拍显式调 [`Self::pump_reports`]，
+        // 后台再有一个投递方就是两个人抢同一个收件箱 —— 谁先 `take_batch` 谁
+        // 就把对方的断言变成掷骰子。被测的是 `pump_reports` / `deliver_pending`
+        // 本身（它们照跑），不是下面这条 while 循环。
+        if cfg!(test) {
+            return;
+        }
+        let mut slot = self.inner.pump.lock();
+        if slot.is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel::<()>(1);
+        *slot = Some(tx);
+        drop(slot);
+        let weak = Arc::downgrade(&self.inner);
+        std::thread::spawn(move || {
+            loop {
+                match rx.recv_timeout(PUMP_INTERVAL) {
+                    // 被戳醒 / 自唤醒到点：都跑一拍
+                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    // 控制面没了：收工
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                }
+                let Some(inner) = weak.upgrade() else {
+                    return;
+                };
+                // upgrade 出来的这份 `Arc` 只活到本拍结束 —— 别让泵在两拍之间
+                // 攥着控制面。
+                ControlPlane { inner }.pump_reports(Instant::now());
+            }
+        });
+    }
+
+    /// 戳一下泵。泵没起（桌面还没接线）时什么都不做。
+    fn wake_pump(&self) {
+        if let Some(tx) = self.inner.pump.lock().as_ref() {
+            // 满了说明上一次唤醒还没被消费 —— 那一拍会把新到的一并带走，
+            // 十条汇报不该换来十趟空转。
+            let _ = tx.try_send(());
+        }
+    }
+}
+
+/// 渲染好的一批汇报。
+struct RenderedBatch {
+    /// 要写进编排者终端的整段文字。
+    text: String,
+    /// 渲染期间用掉的会话记录游标（pane → 新游标）。**送到了才回写**，
+    /// 见 [`ControlPlane::deliver_pending`] 的失败处置。
+    cursors: Vec<(u32, usize)>,
+}
+
+/// 投递闸：现在能不能把汇报写进这个编排者的终端（ADR 0004 的三条边界）。
+///
+/// - `alive`：pane 都没了就没有收件人；
+/// - `ai-idle`：它正忙（`ai-working`）时写进去等于插队，退回裸 shell（`idle`）
+///   时写进去会落进 shell 变成一条命令；
+/// - **非 attention**：停在等审批 / 等人回答时写任何东西都是替用户代答
+///   （ADR 0003 的铁律）。判据是[成因不是状态](PaneLiveness::awaiting_human)
+///   —— Codex 的 `PermissionRequest` 停在 `ai-working`。
+///
+/// 抽成纯函数是为了让这三条能被单独钉住：它是整条汇报链路上唯一一处
+/// 「什么时候不许写」的裁决。
+fn can_deliver(liveness: &PaneLiveness) -> bool {
+    liveness.alive && liveness.status == "ai-idle" && !liveness.awaiting_human()
+}
+
+/// 一条汇报的抬头：几个字段用 `·` 串起来，缺的就不出现。
+fn headline(report: &crate::reports::Report, record: Option<&OrchestratedSession>) -> String {
+    use crate::reports::ReportKind;
+
+    let mut parts: Vec<String> = vec![mt_i18n::t_args(
+        "orchestrator",
+        "sessionField",
+        &[("pane", &report.session_pane_id.to_string())],
+    )];
+    if let Some(record) = record {
+        if !record.launcher_name.is_empty() {
+            parts.push(mt_i18n::t_args(
+                "orchestrator",
+                "launcherField",
+                &[("launcher", &sanitize_report(&record.launcher_name, false))],
+            ));
+        }
+        if !record.project_name.is_empty() {
+            parts.push(mt_i18n::t_args(
+                "orchestrator",
+                "projectField",
+                &[("project", &sanitize_report(&record.project_name, false))],
+            ));
+        }
+    }
+    let (what, cause, duration) = match &report.kind {
+        ReportKind::TurnEnded {
+            cause,
+            started_at,
+            ended_at,
+        } => (
+            mt_i18n::t("orchestrator", "turnEnded").to_string(),
+            cause.clone(),
+            Some(format_duration(ended_at.saturating_duration_since(*started_at))),
+        ),
+        ReportKind::AwaitingHuman { cause } => (
+            mt_i18n::t("orchestrator", "awaitingHuman").to_string(),
+            Some(cause.clone()),
+            None,
+        ),
+        ReportKind::Exited { cause } => (
+            mt_i18n::t("orchestrator", "exited").to_string(),
+            cause.clone(),
+            None,
+        ),
+        ReportKind::Closed => (mt_i18n::t("orchestrator", "closed").to_string(), None, None),
+        ReportKind::NotAccepted { task_id } => (
+            mt_i18n::t_args("orchestrator", "notAccepted", &[("task", task_id)]),
+            None,
+            None,
+        ),
+    };
+    parts.push(what);
+    if let Some(cause) = cause {
+        // 成因**原文照带**（`Stop` / `Interrupt` / `Stall` / `PermissionRequest`…）
+        // —— 编排者得分得开「真做完」与「被打断」。
+        parts.push(mt_i18n::t_args(
+            "orchestrator",
+            "causeField",
+            &[("cause", &sanitize_report(&cause, false))],
+        ));
+    }
+    if let Some(duration) = duration {
+        parts.push(mt_i18n::t_args(
+            "orchestrator",
+            "durationField",
+            &[("duration", &duration)],
+        ));
+    }
+    if !report.task_ids.is_empty() {
+        parts.push(mt_i18n::t_args(
+            "orchestrator",
+            "tasksField",
+            &[("tasks", &report.task_ids.join(", "))],
+        ));
+    }
+    parts.join(" · ")
+}
+
+/// 回合耗时的短写法。**不进字典**：`2m13s` 在两种语言里都读得懂，而为它造两套
+/// 「分/秒」文案只会多两个键。
+fn format_duration(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m{}s", secs / 60, secs % 60)
+    } else {
+        format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+fn push_line(out: &mut String, line: &str) {
+    out.push_str(line);
+    out.push('\n');
+}
+
+/// 把一段正文按**整批共用**的剩余预算放进去；放不下就截断并注明。
+///
+/// 与 `read-transcript` 的取舍不同：那条有游标，少给一条下次取得回来；这里是
+/// 推过去的，编排者不会为一条汇报重放游标 —— 于是宁可给半段也别整段不给，
+/// 并明说截过（它随时能自己 `read-transcript` 补读）。
+fn push_body(out: &mut String, budget: &mut usize, body: &str) {
+    if body.is_empty() {
+        return;
+    }
+    if body.len() <= *budget {
+        *budget -= body.len();
+        push_line(out, body);
+        return;
+    }
+    let kept = truncate_on_char_boundary(body, *budget);
+    *budget = 0;
+    if !kept.is_empty() {
+        push_line(out, &kept);
+    }
+    push_line(out, mt_i18n::t("orchestrator", "bodyTruncated"));
+}
+
+/// 先剥转义序列，再剥掉一切 C0 控制字符与 DEL。`keep_newlines` 为假时换行也
+/// 压成空格（抬头那一行不许被撑成两行）。
+///
+/// # 这不是美化，是一道红线
+///
+/// 渲染出来的文字会被当成**一次粘贴**写进编排者的 PTY。会话记录与终端画面里
+/// 都可能带着 `ESC` / `Ctrl+C` 这类字节，原样送进去就不再是「一段话」：
+/// 裸 `ESC[201~` 能把 bracketed paste 提前截断（后半截变成真键入）、裸 `ESC`
+/// 与 `\x03` 是打断键（[`crate::detect::is_interrupt_key`]）。剥在这里，
+/// 而不是指望装配那一侧 —— 那一侧只认得结束标记这一种。
+///
+/// 转义序列走 [`crate::detect::strip_ansi_codes`]（本仓剥 ANSI 的那一份），
+/// 剩下的裸控制字符再逐个筛掉：只剥序列的话 `\x03` 这种单字节留得下来，
+/// 只筛字符的话 `ESC[31m` 会留下一串 `[31m` 的字面量噪音。
+fn sanitize_report(text: &str, keep_newlines: bool) -> String {
+    crate::detect::strip_ansi_codes(text)
+        .replace("\r\n", "\n")
+        .chars()
+        .map(|c| match c {
+            '\n' | '\r' => {
+                if keep_newlines {
+                    Some('\n')
+                } else {
+                    Some(' ')
+                }
+            }
+            '\t' => Some(' '),
+            c if (c as u32) < 0x20 || c == '\u{7f}' => None,
+            c => Some(c),
+        })
+        .flatten()
+        .collect()
 }
 
 /// 编排者要的耐心 → 实际等多久。不给就是 [`WAIT_DEFAULT`]，超上界按 [`WAIT_MAX`] 算。
@@ -4707,8 +5298,12 @@ mod tests {
         assert_eq!(task_id(send(port, &token2, m2, "干活")), "t1");
     }
 
-    /// 乐手被关掉时它的任务**照留**（工单 12 要拿它们做「已关闭」那条汇报的
-    /// 任务清单），编排者离场才一并清掉。
+    /// 乐手被关掉时它的任务**照留**（那条「已关闭」汇报还要引编号），编排者
+    /// 离场才一并清掉。
+    ///
+    /// ⚠️ 「尚未汇报」那份清单**不在这张表上** —— 工单 12 把它收成了汇报账本
+    /// 一处真源（`reports::ReportLedger`）。这里的任务表只答事实：派了几条、
+    /// 派给谁、写入那一刻对面什么状态。
     #[test]
     fn 乐手关掉任务照留_编排者离场才清() {
         let (plane, _host, actions, port, token) = granted();
@@ -4718,39 +5313,13 @@ mod tests {
         actions.close(m);
         plane.revoke_pane(m);
         assert_eq!(
-            plane.unreported_task_ids(m),
-            vec!["t1".to_string()],
-            "乐手关了，它身上那条活还得能被「已关闭」那条汇报引到"
+            plane.tasks_of(7).len(),
+            1,
+            "乐手关了，它身上那条活还得查得到"
         );
 
         plane.revoke_pane(7);
         assert!(plane.tasks_of(7).is_empty(), "编排者离场，整本账丢掉");
-        assert!(plane.unreported_task_ids(m).is_empty());
-    }
-
-    /// 「尚未汇报」的清单按乐手取，**取一次即收敛**（与 monitor 那条「结论落盘、
-    /// 不许每轮重算」同一条铁律：重复投递会让编排者以为同一批活派了两遍）。
-    #[test]
-    fn 尚未汇报的任务按乐手取且取一次即收敛() {
-        let (plane, _host, _actions, port, token) = granted();
-        let a = start_musician(port, &token);
-        let b = start_musician(port, &token);
-        assert_eq!(task_id(send(port, &token, a, "干活")), "t1");
-        assert_eq!(task_id(send(port, &token, b, "干活")), "t2");
-        assert_eq!(task_id(send(port, &token, a, "再干一件")), "t3");
-
-        assert_eq!(plane.unreported_task_ids(a), vec!["t1", "t3"]);
-        assert_eq!(plane.unreported_task_ids(b), vec!["t2"]);
-        // 只看不取：再问一遍还在
-        assert_eq!(plane.unreported_task_ids(a), vec!["t1", "t3"]);
-
-        assert_eq!(plane.take_unreported_task_ids(a), vec!["t1", "t3"]);
-        assert!(plane.unreported_task_ids(a).is_empty(), "取一次即收敛");
-        assert_eq!(plane.unreported_task_ids(b), vec!["t2"], "别的乐手不受影响");
-
-        // 收敛之后新派的活照样进清单
-        assert_eq!(task_id(send(port, &token, a, "第三件")), "t4");
-        assert_eq!(plane.unreported_task_ids(a), vec!["t4"]);
     }
 
     /// 任务账本有上限，超出时**从最旧的丢起**，号码不回收。
@@ -6082,6 +6651,535 @@ mod tests {
         // 截出来的一定还是合法 UTF-8（`String` 类型本身保证），且不超界
         for n in 0..12 {
             assert!(truncate_on_char_boundary("字a字b", n).len() <= n.max(0));
+        }
+    }
+
+    // ─── 汇报投递（工单 12 / ADR 0004）────────────────────────────
+
+    /// 「编排者 pane 7 正闲着 + 一个起好的受编排会话 + 一份假会话记录」的现场。
+    ///
+    /// 与 [`reading`] 只差一样：**编排者自己的死活也摆好了** —— 投递闸要问它，
+    /// 不摆的话 [`FakeActions`] 会答「这个 pane 已经不在了」，一条都投不出去。
+    ///
+    /// 返回 `(plane, host, actions, transcripts, port, token, 受编排会话 pane)`。
+    fn reporting() -> (
+        ControlPlane,
+        Arc<FakeHost>,
+        Arc<FakeActions>,
+        Arc<FakeTranscripts>,
+        u16,
+        String,
+        u32,
+    ) {
+        let host = Arc::new(FakeHost::default());
+        *host.launchers.lock() = vec![launcher("claude", "Claude")];
+        *host.projects.lock() = vec![project("p-self", None)];
+        let actions = Arc::new(FakeActions::default());
+        let transcripts = Arc::new(FakeTranscripts::default());
+        let plane = ControlPlane::new();
+        plane.set_host(Arc::new(host.clone()));
+        plane.set_actions(Arc::new(actions.clone()));
+        plane.set_transcripts(Arc::new(transcripts.clone()));
+        let token = plane.grant(7, "p-self");
+        let port = serve(plane.clone());
+        let musician = start_musician(port, &token);
+        // 编排者刚说完自己那一轮，正闲着 —— 闸开着
+        actions.finished(7, "Stop");
+        (plane, host, actions, transcripts, port, token, musician)
+    }
+
+    /// 走完一个回合：进入工作 → `Stop` 收工。
+    fn one_turn(plane: &ControlPlane, pane_id: u32) {
+        plane.observe_status(pane_id, "ai-working", Some("UserPromptSubmit"));
+        plane.observe_status(pane_id, "ai-idle", Some("Stop"));
+    }
+
+    /// 投递泵写进编排者 pane 7 的那些正文，按顺序（`plain` 那一份 = 归一后的
+    /// 正文 + 回车；派给受编排会话的那些写入不在其中）。
+    fn deliveries(actions: &FakeActions) -> Vec<String> {
+        actions
+            .sends
+            .lock()
+            .iter()
+            .filter(|c| c.pane_id == 7)
+            .map(|c| c.plain.clone())
+            .collect()
+    }
+
+    /// 最后一次投递的正文。一次都没投过就 `None`。
+    fn last_delivery(actions: &FakeActions) -> Option<String> {
+        deliveries(actions).pop()
+    }
+
+    fn zh_or_en(key: &'static str) -> &'static str {
+        mt_i18n::t("orchestrator", key)
+    }
+
+    /// **主缝**：受编排会话跑完一个回合 → 编排者闲着 → 那段文字进了它的终端，
+    /// 里头有会话记录增量、成因原文与任务编号。
+    #[test]
+    fn 回合结束的汇报写进编排者的终端() {
+        let (plane, host, actions, transcripts, port, token, m) = reporting();
+        host.identify(m, "claude-code", "s-1");
+        transcripts.put(
+            "claude",
+            "s-1",
+            &[("user", "把测试跑一遍"), ("assistant", "跑完了，3 个失败")],
+        );
+        assert_eq!(task_id(send(port, &token, m, "把测试跑一遍")), "t1");
+        one_turn(&plane, m);
+
+        plane.deliver_pending();
+        let text = last_delivery(&actions).expect("汇报该写进编排者的 pane");
+
+        assert!(text.starts_with(REPORT_PREFIX), "每段以固定前缀打头: {text}");
+        assert!(text.contains(&format!("#{m}")), "得说清是哪个受编排会话: {text}");
+        assert!(text.contains("Claude"), "启动器展示名: {text}");
+        assert!(text.contains("项目p-self") || text.contains("p-self"), "项目名: {text}");
+        assert!(text.contains(zh_or_en("turnEnded")), "{text}");
+        assert!(text.contains("Stop"), "成因原文照带: {text}");
+        assert!(text.contains("t1"), "任务编号随汇报走: {text}");
+        assert!(text.contains("[user] 把测试跑一遍"), "{text}");
+        assert!(text.contains("[assistant] 跑完了，3 个失败"), "{text}");
+        // ⚠️ 派活的正文一个字都不回显（ADR 0002 的防线）—— 这里出现「把测试跑
+        // 一遍」是因为它在**会话记录**里，那是受编排会话自己写下的东西。
+        // 投递完游标就落了：同一段增量不会再贴第二遍
+        plane.deliver_pending();
+        assert_eq!(deliveries(&actions).len(), 1, "取一次即收敛");
+    }
+
+    /// 编排者正忙（`ai-working`）时只攒不投；它闲下来之后**一次**把积压的两条
+    /// 一起送到，且同一段增量只贴一遍。
+    #[test]
+    fn 编排者忙时暂存闲下来一次投() {
+        let (plane, host, actions, transcripts, _port, _token, m) = reporting();
+        host.identify(m, "claude-code", "s-1");
+        actions.live(7, "ai-working");
+
+        transcripts.put("claude", "s-1", &[("assistant", "第一轮完")]);
+        one_turn(&plane, m);
+        plane.deliver_pending();
+        assert!(last_delivery(&actions).is_none(), "编排者忙着，不许插队");
+
+        transcripts.put(
+            "claude",
+            "s-1",
+            &[("assistant", "第一轮完"), ("assistant", "第二轮完")],
+        );
+        one_turn(&plane, m);
+        plane.deliver_pending();
+        assert!(last_delivery(&actions).is_none());
+
+        actions.finished(7, "Stop");
+        plane.deliver_pending();
+        let text = last_delivery(&actions).expect("闲下来就该投");
+        assert_eq!(deliveries(&actions).len(), 1, "两条汇报并成一次写入");
+        assert_eq!(
+            text.matches(zh_or_en("turnEnded")).count(),
+            2,
+            "两条各有各的抬头: {text}"
+        );
+        assert_eq!(
+            text.matches("第一轮完").count(),
+            1,
+            "同一段增量不许贴两遍: {text}"
+        );
+        assert!(text.contains("第二轮完"), "{text}");
+    }
+
+    /// 编排者停在黄灯时不投 —— 写进去就是替用户代答（ADR 0003 的铁律）。
+    ///
+    /// 两家的黄灯落在不同状态上：Claude 的 `PermissionRequest` 停在 `ai-idle`，
+    /// Codex 的停在 `ai-working`。**只看状态就会漏掉前者**，所以两档都试一遍。
+    #[test]
+    fn 编排者黄灯时暂存() {
+        for (status, cause) in [
+            ("ai-idle", "PermissionRequest"),
+            ("ai-working", "PermissionRequest"),
+            ("ai-idle", "Elicitation"),
+        ] {
+            let (plane, _host, actions, _t, _port, _token, m) = reporting();
+            actions.attention(7, status, cause);
+            one_turn(&plane, m);
+            plane.deliver_pending();
+            assert!(
+                last_delivery(&actions).is_none(),
+                "编排者停在 {status}/{cause} 时不许投"
+            );
+            // 攒着而已，没丢：它处理完之后照投
+            actions.finished(7, "Stop");
+            plane.deliver_pending();
+            assert!(last_delivery(&actions).is_some(), "黄灯是暂存不是丢弃");
+        }
+    }
+
+    /// 编排者退回裸 shell（`idle`）时不投 —— 那一段会落进 shell 变成一条命令。
+    #[test]
+    fn 编排者退回裸_shell_时暂存() {
+        let (plane, _host, actions, _t, _port, _token, m) = reporting();
+        actions.agent_exited(7);
+        one_turn(&plane, m);
+        plane.deliver_pending();
+        assert!(last_delivery(&actions).is_none());
+
+        // 它在同一个 pane 里把 agent 重开了：闸再次放行
+        actions.finished(7, "Stop");
+        plane.deliver_pending();
+        assert!(
+            last_delivery(&actions).is_some(),
+            "编排者的身份是 pane，agent 重开令牌与收件箱都还在"
+        );
+    }
+
+    /// 编排者的 pane 没了：**暂存作废**（ADR 0004），而且不会在编号被复用之后
+    /// 补投出来。
+    #[test]
+    fn 编排者_pane_没了收件箱丢弃() {
+        let (plane, _host, actions, _t, _port, _token, m) = reporting();
+        one_turn(&plane, m);
+        actions.close(7);
+        plane.deliver_pending();
+        assert!(last_delivery(&actions).is_none());
+
+        actions.finished(7, "Stop");
+        plane.deliver_pending();
+        assert!(last_delivery(&actions).is_none(), "丢了就是丢了，不补投");
+        // 名下受编排会话的追踪一并没了：它后续的回合也不再攒
+        one_turn(&plane, m);
+        plane.deliver_pending();
+        assert!(last_delivery(&actions).is_none());
+    }
+
+    /// 受编排会话停在黄灯：汇报带**画面尾部原文**（编排者要逐字转告用户）。
+    #[test]
+    fn 受编排会话黄灯的汇报带画面原文() {
+        let (plane, _host, actions, _t, _port, _token, m) = reporting();
+        actions.screen(m, &["> Allow running rm -rf /tmp/x ?", "  1. Yes  2. No"]);
+        plane.observe_status(m, "ai-working", Some("PermissionRequest"));
+
+        plane.deliver_pending();
+        let text = last_delivery(&actions).expect("黄灯要立刻告诉编排者");
+        assert!(text.contains(zh_or_en("awaitingHuman")), "{text}");
+        assert!(text.contains("PermissionRequest"), "{text}");
+        assert!(text.contains(zh_or_en("awaitingHumanNote")), "{text}");
+        assert!(text.contains("Allow running rm -rf /tmp/x ?"), "{text}");
+        assert!(text.contains("1. Yes  2. No"), "{text}");
+    }
+
+    /// 没有可解析会话记录的 agent（opencode / pi 那一档）改用画面尾部。
+    #[test]
+    fn 无记录_agent_的汇报换画面尾部() {
+        let (plane, host, actions, _t, _port, _token, m) = reporting();
+        host.detected_only(m, "opencode");
+        actions.screen(m, &["opencode: 改完了，跑过 cargo test"]);
+        one_turn(&plane, m);
+
+        plane.deliver_pending();
+        let text = last_delivery(&actions).expect("能力分层不该让它收不到汇报");
+        assert!(text.contains(zh_or_en("screenHeader")), "{text}");
+        assert!(text.contains("opencode: 改完了，跑过 cargo test"), "{text}");
+    }
+
+    /// 记录读得到但这一段没有新消息（真机上会话记录可能晚于 `Stop` hook 落盘）：
+    /// 说一句「还没有」并补画面尾部，**不许**只给抬头；游标不倒退，下一条接着数。
+    #[test]
+    fn 增量为空的汇报补画面尾部() {
+        let (plane, host, actions, transcripts, _port, _token, m) = reporting();
+        host.identify(m, "claude-code", "s-1");
+        transcripts.put("claude", "s-1", &[]);
+        actions.screen(m, &["⏺ 跑完了，3 个失败", "> "]);
+        one_turn(&plane, m);
+
+        plane.deliver_pending();
+        let text = last_delivery(&actions).expect("增量为空也该有一条汇报");
+        assert!(text.contains(zh_or_en("transcriptEmpty")), "{text}");
+        assert!(text.contains(zh_or_en("screenHeader")), "{text}");
+        assert!(text.contains("⏺ 跑完了，3 个失败"), "{text}");
+
+        // 记录随后落盘：下一回合的增量从第 0 条起，一条都不丢
+        transcripts.put(
+            "claude",
+            "s-1",
+            &[("user", "把测试跑一遍"), ("assistant", "跑完了，3 个失败")],
+        );
+        one_turn(&plane, m);
+        plane.deliver_pending();
+        let text = last_delivery(&actions).unwrap();
+        assert!(text.contains("[assistant] 跑完了，3 个失败"), "{text}");
+        assert_eq!(deliveries(&actions).len(), 2);
+    }
+
+    /// 还没有 hook 上报会话身份的那一档同样换画面尾部（**不猜**是哪条会话）。
+    #[test]
+    fn 没有会话身份的汇报换画面尾部() {
+        let (plane, _host, actions, transcripts, _port, _token, m) = reporting();
+        actions.screen(m, &["还没上报身份，但屏幕上有东西"]);
+        one_turn(&plane, m);
+
+        plane.deliver_pending();
+        let text = last_delivery(&actions).unwrap();
+        assert!(text.contains("还没上报身份，但屏幕上有东西"), "{text}");
+        assert!(
+            transcripts.calls.lock().is_empty(),
+            "没有会话身份就一次记录都不该去读 —— 启发式绑定是踩过坑的"
+        );
+    }
+
+    /// 派活之后 15 秒还没见它动起来 → 一条「可能没被接收」，带任务编号与下一步。
+    #[test]
+    fn 派活未被接收端到端() {
+        let (plane, _host, actions, _t, port, token, m) = reporting();
+        assert_eq!(task_id(send(port, &token, m, "干活")), "t1");
+
+        // 还没到点：一个字都不出
+        plane.pump_reports(Instant::now());
+        assert!(last_delivery(&actions).is_none());
+
+        plane.pump_reports(Instant::now() + Duration::from_secs(20));
+        let text = last_delivery(&actions).expect("到点该报");
+        assert!(text.contains("t1"), "{text}");
+        assert!(text.contains(zh_or_en("notAcceptedNote")), "{text}");
+
+        // 报完即收敛：不会每拍重发
+        plane.pump_reports(Instant::now() + Duration::from_secs(40));
+        assert_eq!(deliveries(&actions).len(), 1);
+    }
+
+    /// 桌面忙 / 写失败：这一批**放回去下一拍再试**，增量不会被那次失败吃掉。
+    #[test]
+    fn 桌面忙时放回下一拍再投() {
+        let (plane, host, actions, transcripts, _port, _token, m) = reporting();
+        host.identify(m, "claude-code", "s-1");
+        transcripts.put("claude", "s-1", &[("assistant", "干完了")]);
+        one_turn(&plane, m);
+
+        *actions.send_fail.lock() = Some(SendFailure::DesktopBusy);
+        plane.deliver_pending();
+        assert_eq!(deliveries(&actions).len(), 1, "试过一次");
+
+        *actions.send_fail.lock() = None;
+        plane.deliver_pending();
+        let sent = deliveries(&actions);
+        assert_eq!(sent.len(), 2, "下一拍再试一次");
+        assert!(
+            sent[1].contains("干完了"),
+            "游标只在写穿成功之后才落，失败那次不许把增量吃掉: {}",
+            sent[1]
+        );
+
+        plane.deliver_pending();
+        assert_eq!(deliveries(&actions).len(), 2, "送到了就不再重发");
+    }
+
+    /// 编排者的 pane 在投递半路被关掉：这批丢掉，不放回。
+    #[test]
+    fn 写穿答_pane_gone_时收件箱丢掉() {
+        let (plane, _host, actions, _t, _port, _token, m) = reporting();
+        one_turn(&plane, m);
+        *actions.send_fail.lock() = Some(SendFailure::PaneGone);
+        plane.deliver_pending();
+        assert_eq!(deliveries(&actions).len(), 1);
+
+        *actions.send_fail.lock() = None;
+        plane.deliver_pending();
+        assert_eq!(deliveries(&actions).len(), 1, "没了收件人就别再攒着");
+    }
+
+    /// 受编排会话的 pane 被关掉：一条「已关闭」汇报，带走它身上尚未汇报的编号。
+    #[test]
+    fn 关闭受编排会话出一条汇报并带走任务编号() {
+        let (plane, _host, actions, _t, port, token, m) = reporting();
+        assert_eq!(task_id(send(port, &token, m, "干活")), "t1");
+        plane.observe_pane_closed(m);
+
+        plane.deliver_pending();
+        let text = last_delivery(&actions).expect("关掉了也要说一声");
+        assert!(text.contains(zh_or_en("closed")), "{text}");
+        assert!(text.contains("t1"), "{text}");
+        assert!(
+            !actions.screen_calls.lock().iter().any(|(p, _)| *p == m),
+            "pane 都没了，别为它白跑一次读画面"
+        );
+    }
+
+    /// **编排者自己的回合不该给自己发汇报** —— 它的状态变化也走同一条事件流。
+    #[test]
+    fn 编排者自己的回合不产生汇报() {
+        let (plane, _host, actions, _t, _port, _token, _m) = reporting();
+        plane.observe_status(7, "ai-working", Some("UserPromptSubmit"));
+        plane.observe_status(7, "ai-idle", Some("Stop"));
+        plane.deliver_pending();
+        assert!(last_delivery(&actions).is_none());
+    }
+
+    /// 投递用的是 [`PaneInput::assemble`]：**不追加**派活那条格式尾部。
+    #[test]
+    fn 投递的输入不带派活的格式尾部() {
+        let (plane, _host, actions, _t, _port, _token, m) = reporting();
+        one_turn(&plane, m);
+        plane.deliver_pending();
+
+        let call = actions
+            .sends
+            .lock()
+            .iter()
+            .rev()
+            .find(|c| c.pane_id == 7)
+            .cloned()
+            .expect("投过一次");
+        let footer = mt_i18n::t("orchestrator", "reportFooter");
+        assert!(
+            !call.plain.contains(footer),
+            "汇报不是派活，别把「做完后请按这个格式收尾」也塞给编排者"
+        );
+        // 装配口径与派活那条一致：整块粘贴，回车在结束标记之外
+        assert!(call.bracketed.starts_with("\x1b[200~[mini-term]"));
+        assert!(call.bracketed.ends_with("\x1b[201~\r"));
+    }
+
+    /// **写进编排者的那段字不许被当成按键**：没有裸 ESC / Ctrl+C，认不出 AI 命令。
+    ///
+    /// 会话记录与终端画面里什么都可能有 —— 颜色序列、`\x03`、甚至一个粘贴结束
+    /// 标记。原样送进去的话，轻则乱码，重则把 bracketed paste 提前截断（后半截
+    /// 变成真键入）或直接打断编排者自己那一轮。
+    #[test]
+    fn 汇报文字不含裸控制字节也不像_ai_命令() {
+        let (plane, host, actions, transcripts, _port, _token, m) = reporting();
+        host.identify(m, "claude-code", "s-1");
+        transcripts.put(
+            "claude",
+            "s-1",
+            &[(
+                "assistant",
+                "我跑了 \x1b[31mclaude --resume\x1b[0m\n中途 \x03 了一下\x1b[201~然后重来",
+            )],
+        );
+        actions.screen(m, &["PS D:\\repo> \x1b[32mcodex\x1b[0m"]);
+        one_turn(&plane, m);
+        plane.deliver_pending();
+
+        let call = actions
+            .sends
+            .lock()
+            .iter()
+            .rev()
+            .find(|c| c.pane_id == 7)
+            .cloned()
+            .expect("投过一次");
+        assert!(!call.plain.contains('\x1b'), "渲染结果里不许有裸 ESC");
+        assert!(!call.plain.contains('\x03'), "渲染结果里不许有 Ctrl+C");
+        assert!(!call.plain.contains('\n'), "换行一律归一成 \\r");
+        // 包裹版里的 ESC 只有装配自己加的那两处（开始标记 + 结束标记）
+        assert_eq!(call.bracketed.matches('\x1b').count(), 2);
+        assert_eq!(call.bracketed.matches("\x1b[201~").count(), 1);
+        // 颜色序列被剥干净了，剩下的是可读文本
+        assert!(call.plain.contains("claude --resume"), "{}", call.plain);
+        // 整段以 `[mini-term]` 打头 → 行首第一个词不是 AI 命令
+        assert!(crate::detect::interactive_ai_command_name(&call.plain).is_none());
+        assert!(!crate::detect::is_interrupt_key(&call.bracketed));
+        assert!(!crate::detect::is_interrupt_key(&call.plain));
+    }
+
+    /// 整批的正文有字节上界：超了就地截断并注明（编排者随时能自己补读）。
+    #[test]
+    fn 汇报正文有字节上界() {
+        let (plane, host, actions, transcripts, _port, _token, m) = reporting();
+        host.identify(m, "claude-code", "s-1");
+        let huge = "字".repeat(40 * 1024);
+        transcripts.put("claude", "s-1", &[("assistant", &huge)]);
+        one_turn(&plane, m);
+        plane.deliver_pending();
+
+        let text = last_delivery(&actions).unwrap();
+        assert!(
+            text.len() < MAX_READ_BYTES + 4096,
+            "整批体量失控: {} 字节",
+            text.len()
+        );
+        assert!(text.contains(zh_or_en("bodyTruncated")), "截了就要说");
+    }
+
+    /// 投递闸：三条边界各钉一次。**黄灯的判据是成因不是状态** —— Codex 的
+    /// `PermissionRequest` 停在 `ai-working`，Claude 的停在 `ai-idle`。
+    #[test]
+    fn 投递闸只在编排者真闲着时放行() {
+        let idle = PaneLiveness {
+            alive: true,
+            status: "ai-idle".into(),
+            ai_session: AiSessionState::Active,
+            cause: Some("Stop".into()),
+        };
+        assert!(can_deliver(&idle));
+        // 无 hook 的降级路径没有成因，不该因此被拦
+        assert!(can_deliver(&PaneLiveness {
+            cause: None,
+            ..idle.clone()
+        }));
+
+        assert!(!can_deliver(&PaneLiveness {
+            alive: false,
+            ..idle.clone()
+        }));
+        assert!(!can_deliver(&PaneLiveness {
+            status: "ai-working".into(),
+            ..idle.clone()
+        }));
+        assert!(!can_deliver(&PaneLiveness {
+            status: "idle".into(),
+            ..idle.clone()
+        }));
+        for cause in ["PermissionRequest", "Elicitation", "StopFailure"] {
+            assert!(
+                !can_deliver(&PaneLiveness {
+                    cause: Some(cause.into()),
+                    ..idle.clone()
+                }),
+                "{cause} 是等人处理，写进去就是代答"
+            );
+            assert!(
+                !can_deliver(&PaneLiveness {
+                    status: "ai-working".into(),
+                    cause: Some(cause.into()),
+                    ..idle.clone()
+                }),
+                "{cause} 停在 ai-working 那一档同样不许投"
+            );
+        }
+    }
+
+    /// 回合耗时的短写法（两种语言都读得懂，所以不进字典）。
+    #[test]
+    fn 回合耗时的短写法() {
+        assert_eq!(format_duration(Duration::from_secs(0)), "0s");
+        assert_eq!(format_duration(Duration::from_secs(59)), "59s");
+        assert_eq!(format_duration(Duration::from_secs(60)), "1m0s");
+        assert_eq!(format_duration(Duration::from_secs(133)), "2m13s");
+        assert_eq!(format_duration(Duration::from_secs(3600)), "1h0m");
+        assert_eq!(format_duration(Duration::from_secs(7860)), "2h11m");
+    }
+
+    /// 汇报文案是**写进另一个 AI 会话终端**的，双语都得在、不许带口语别名、
+    /// 不许自带 ESC（那会把粘贴块提前截断）。
+    #[test]
+    fn 汇报文案双语齐备且不带别名() {
+        for locale in [mt_i18n::Locale::Zh, mt_i18n::Locale::En] {
+            for key in mt_i18n::namespace("orchestrator")
+                .expect("orchestrator 命名空间")
+                .entries(locale)
+                .iter()
+                .map(|(k, _)| *k)
+            {
+                let text = mt_i18n::lookup(locale, "orchestrator", key).unwrap_or_default();
+                assert!(!text.trim().is_empty(), "{locale:?} 的 {key} 是空的");
+                assert!(
+                    !text.contains("乐手") && !text.to_lowercase().contains("musician"),
+                    "{locale:?} 的 {key} 不许出现口语别名: {text}"
+                );
+                assert!(
+                    !text.contains('\u{1b}') && !text.contains('\n') && !text.contains('\r'),
+                    "{locale:?} 的 {key} 里不许有控制字符: {text}"
+                );
+            }
         }
     }
 }

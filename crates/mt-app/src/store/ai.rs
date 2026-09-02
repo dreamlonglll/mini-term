@@ -201,6 +201,11 @@ impl AppStore {
     /// 回收一个终端:kill 子进程 + 清 AI 感知痕迹 + 摘掉视图与订阅。
     // 拆分前是私有方法;调用点散在 `projects` / `panes` / `ssh` / `layout`,升到 `pub(super)`。
     pub(super) fn dispose_terminal(&mut self, pty_id: u32, cx: &mut Context<Self>) {
+        // 受编排会话被关掉要出一条「已关闭」汇报(ADR 0004),**必须赶在撤销令牌
+        // 之前**:下面 `shutdown` → `AiBridge::remove_pane` → `revoke_pane` 会把
+        // 这个 pane 在汇报账本里的追踪一并忘掉,那之后就再也出不来了
+        // (工单 11 留档第 3 条的顺序要求)。
+        self.ai.perception().control().observe_pane_closed(pty_id);
         // 编排者 pane 走了要顺手收回它投进项目的编排礼仪 Skill。「是不是编排者」
         // 得在下面 `shutdown` 撤销令牌**之前**问,之后就问不出来了。
         let orchestrator_home = self.orchestrator_home_of(pty_id);
@@ -329,6 +334,15 @@ impl AppStore {
     ) -> Option<PendingAlert> {
         match event {
             AiEvent::Status(change) => {
+                // 汇报账本先吃这一条(ADR 0004):「回合结束 / 停下等人 / 已退出」
+                // 三种汇报的唯一事实来源,也是「编排者刚闲下来」时投递泵的唤醒点。
+                // **必须在最前面** —— 下面那句 `from_str?` 会在认不出的状态上
+                // 提前返回,挂在它后面就等于漏掉一整档事实。
+                self.ai.perception().control().observe_status(
+                    change.pty_id,
+                    &change.status,
+                    change.cause.as_deref(),
+                );
                 let status = PaneStatus::from_str(&change.status)?;
                 // Git 面板的 pty-output 嗅探要跳过 AI pane 的输出。判据与
                 // `App.tsx:284` 的 `markAiPty(ptyId, status === 'ai-working' ||

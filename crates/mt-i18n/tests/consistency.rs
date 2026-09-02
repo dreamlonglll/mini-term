@@ -95,8 +95,11 @@ use mt_i18n::{
 /// 852 → 855（命名空间 32 → 33）：工单 10 的派活改造——新命名空间
 /// `orchestrator` 只放**会被写进别人终端**的那类文案（首条 `reportFooter`，
 /// 派活时追加的汇报格式要求），设置页「编排」一节加这条尾部的开关标题与说明。
+/// 855 → 875：工单 12 的汇报投递——`orchestrator` ns 补齐一整段汇报文案
+/// （批头 2 条、抬头字段 6 条、五种汇报各自那句话 7 条、正文 5 条），
+/// 它们随汇报一起被写穿进编排者的终端，读者同样是另一个 LLM。
 const EXPECTED_NAMESPACES: usize = 33;
-const EXPECTED_ENTRIES_PER_LANG: usize = 855;
+const EXPECTED_ENTRIES_PER_LANG: usize = 875;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

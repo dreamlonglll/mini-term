@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 33;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 855;
+pub const ZH_ENTRY_COUNT: usize = 875;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 855;
+pub const EN_ENTRY_COUNT: usize = 875;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -620,11 +620,51 @@ static MOBILE_RELAY_EN: &[(&str, &str)] = &[
 
 #[rustfmt::skip]
 static ORCHESTRATOR_ZH: &[(&str, &str)] = &[
+    ("awaitingHuman", "停下等人处理"),
+    ("awaitingHumanNote", "你不能替人回答。把下面的画面原文转述给用户，请人到那个终端处理完，再继续派活。"),
+    ("batchDropped", "另有 {dropped} 条汇报因积压被丢弃，需要完整经过请自己用 read-transcript 补读。"),
+    ("batchHeader", "以下是 mini-term 桌面端自动送达的受编排会话汇报，共 {count} 条。用户没有说话——是你派出去的受编排会话有了新进展。请据此决定下一步；需要人处理的事直接告诉用户。"),
+    ("bodyTruncated", "（内容过长，这里截断了；完整内容用 read-transcript 或 read-screen 自己取）"),
+    ("causeField", "成因 {cause}"),
+    ("closed", "终端已被关闭，这个受编排会话不会再有后续"),
+    ("durationField", "本回合用时 {duration}"),
+    ("exited", "里头的 AI 已退出，终端退回普通 shell"),
+    ("launcherField", "启动器 {launcher}"),
+    ("notAccepted", "任务 {task} 可能没被接收"),
+    ("notAcceptedNote", "写入后 15 秒仍没看到它开始处理。用 read-screen 核对那个终端此刻的样子，必要时重发。"),
+    ("projectField", "项目 {project}"),
     ("reportFooter", "【来自编排者的固定要求】做完后请按这个格式收尾：结果 / 改动的文件 / 做过的验证 / 未完成或存疑的事。遇到拿不准的问题，用文字写出来并结束本回合等答复，不要使用交互式提问工具。"),
+    ("screenHeader", "终端画面尾部原文："),
+    ("screenUnavailable", "（读不到这个终端此刻的画面）"),
+    ("sessionField", "受编排会话 #{pane}"),
+    ("tasksField", "涉及任务 {tasks}"),
+    ("transcriptEmpty", "（这一段还没有新的会话记录，需要的话稍后用 read-transcript 补读）"),
+    ("transcriptHeader", "会话记录增量（第 {from} 条起，共 {count} 条）："),
+    ("turnEnded", "回合结束"),
 ];
 #[rustfmt::skip]
 static ORCHESTRATOR_EN: &[(&str, &str)] = &[
+    ("awaitingHuman", "stopped, waiting for a human"),
+    ("awaitingHumanNote", "You must not answer on the user's behalf. Relay the terminal text below to the user, let a human deal with it in that terminal, and only then send more work."),
+    ("batchDropped", "{dropped} further report(s) were dropped because they piled up; use read-transcript if you need the full story."),
+    ("batchHeader", "The following are automatic reports from the mini-term desktop about your orchestrated sessions ({count} in total). The user did not say this - one of the sessions you dispatched has made progress. Decide the next step from it; anything a human must handle, tell the user."),
+    ("bodyTruncated", "(too long, truncated here; fetch the rest yourself with read-transcript or read-screen)"),
+    ("causeField", "cause {cause}"),
+    ("closed", "that terminal has been closed; this orchestrated session will produce nothing more"),
+    ("durationField", "turn took {duration}"),
+    ("exited", "the AI inside it exited; the terminal is back to a plain shell"),
+    ("launcherField", "launcher {launcher}"),
+    ("notAccepted", "task {task} may not have been picked up"),
+    ("notAcceptedNote", "15 seconds after the write it still had not started working on it. Use read-screen to check what that terminal looks like now, and resend if needed."),
+    ("projectField", "project {project}"),
     ("reportFooter", "[Standing instruction from your orchestrator] When you are done, close with this format: result / files changed / checks you ran / anything unfinished or uncertain. If something is unclear, write it out as plain text and end the turn to wait for an answer - do not use an interactive question tool."),
+    ("screenHeader", "Tail of the terminal screen:"),
+    ("screenUnavailable", "(cannot read that terminal's screen right now)"),
+    ("sessionField", "orchestrated session #{pane}"),
+    ("tasksField", "tasks involved: {tasks}"),
+    ("transcriptEmpty", "(no new transcript entries for this stretch yet - use read-transcript later if you need them)"),
+    ("transcriptHeader", "New transcript entries (from #{from}, {count} in total):"),
+    ("turnEnded", "turn ended"),
 ];
 
 #[rustfmt::skip]
