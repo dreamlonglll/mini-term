@@ -17,6 +17,15 @@ dirs.workspace = true
 # `src-tauri/` 下,反向依赖会把整套 Tauri 依赖拖进来)。mt-core 移入 `crates/`
 # 后副本已删,统一走它。mt-core 是叶子(serde/serde_json/dirs),不带包袱。
 mt-core.workspace = true
+# 编排者派活时追加的那段汇报格式要求(ADR 0004 / 工单 10)是**会被写进另一个
+# AI 会话终端的用户可见文案**,得随界面语言走 —— 硬编码在 Rust 里就只剩一种
+# 语言,而这一句是要对面那个 LLM 照着执行的指令,语言不对它就照着回错格式。
+#
+# 引它不给本 crate 添包袱:mt-i18n 是**零第三方依赖的叶子**(字典是编译期
+# 静态表,唯一且可选的依赖 serde 本 crate 早就在用),并且明令**绝不引 gpui**
+# —— 后端 crate 取文案不该被拖进 GPU 栈。语言由 mt-app 在启动与切语言时
+# `set_locale` 定,本 crate 只 `t()` 读那个全局,不自己传 locale。
+mt-i18n.workspace = true
 # hook 上报接收端。三家 CLI 里已注册的 hook 命令 POST 到 127.0.0.1:23456/hook,
 # 端口/协议/路由都是用户机器上的既成事实,不能改(版本照抄 src-tauri/Cargo.toml)。
 tiny_http = "0.12"

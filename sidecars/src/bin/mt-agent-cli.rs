@@ -72,6 +72,22 @@ send notes:
   agent has probably exited), which means the lines went in one by one. An empty
   prompt is refused: a bare Enter would answer a pending prompt on the user's behalf,
   and an orchestrator must never do that - ask the user to handle it instead.
+  targetAwaitingHuman is a RULE, not a failure: the target session is stopped on an
+  approval prompt or an interactive question, so writing anything into it would answer
+  for the user. Nothing was written and nothing is queued. Tell the user, wait for that
+  session to settle, then send again - do not retry in a loop.
+  taskId identifies this one delivery. The desktop reports back to you on its own when
+  that session finishes a turn, stops for a human, or exits, and the report carries the
+  taskIds it covers - that is how you match a result to the work you handed out. A task
+  is NOT promised to map to exactly one turn.
+  targetStatus is the target's state at the moment of the write, not a result:
+  ai-working means it was busy and the prompt went into that agent's own input queue;
+  ai-idle means it should start on it right away; idle means the agent there has exited
+  and the text went into a bare shell (read it together with bracketedPaste).
+  Unless the user turned it off, a short standing instruction about how to report back
+  is appended to every prompt you send (inside the same paste, before the Enter), so
+  the answer comes back in a predictable shape. Write your prompt as if it were not
+  there; do not repeat those instructions yourself.
 
 wait notes:
   wait blocks until the session settles, then prints one of four outcomes - ALWAYS
@@ -870,6 +886,43 @@ mod tests {
             EXIT_CODE_HELP.contains("on the user's behalf"),
             "空正文被拒的理由是「不代答」，不是参数不对"
         );
+    }
+
+    /// 工单 10 给 `send` 添了三件编排者必须知道的事，一件都不许漏在 `--help` 外：
+    /// 黄灯被拒是**规矩**不是错误、`taskId` 是干什么用的、以及桌面端会往它的
+    /// prompt 尾巴上追加一段东西（不知道这条它会自己再写一遍格式要求）。
+    #[test]
+    fn 帮助文案讲清楚了工单十的三件事() {
+        // ① 黄灯被拒：是裁决，不是「重试就好」
+        assert!(EXIT_CODE_HELP.contains("targetAwaitingHuman"));
+        assert!(
+            EXIT_CODE_HELP.contains("is a RULE, not a failure"),
+            "得说清这不是故障"
+        );
+        assert!(
+            EXIT_CODE_HELP.contains("do not retry in a loop"),
+            "得堵住「重试就好」那条反应"
+        );
+        // ② taskId：汇报靠它对上派出去的活，且不与回合一一对应
+        assert!(EXIT_CODE_HELP.contains("taskId"));
+        assert!(
+            EXIT_CODE_HELP.contains("NOT promised to map to exactly one turn"),
+            "别让它以为一条 prompt 对一个回合"
+        );
+        // ③ 尾部会被追加：它自己别再写一遍
+        assert!(
+            EXIT_CODE_HELP.contains("appended to every prompt"),
+            "得告诉它尾部是桌面端加的"
+        );
+        assert!(
+            EXIT_CODE_HELP.contains("do not repeat those instructions"),
+            "不然它会自己再写一遍格式要求"
+        );
+        // ④ targetStatus 三档的含义（三个词一个都不能少）
+        assert!(EXIT_CODE_HELP.contains("targetStatus is the target's state"));
+        for status in ["ai-working means", "ai-idle means", "idle means"] {
+            assert!(EXIT_CODE_HELP.contains(status), "缺 {status} 那一档");
+        }
     }
 
     /// `--text` 与 `--stdin` **恰好给一个**：都不给会去读一个不存在的管道，

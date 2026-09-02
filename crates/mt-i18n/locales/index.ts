@@ -33,6 +33,7 @@ import { externalLink } from './externalLink';
 import { updateChecker } from './updateChecker';
 import { remoteProject } from './remoteProject';
 import { mobileRelay } from './mobileRelay';
+import { orchestrator } from './orchestrator';
 import { panels } from './panels';
 import { terminalSearch } from './terminalSearch';
 import { projectSwitcher } from './projectSwitcher';
@@ -70,6 +71,7 @@ export const dicts: { zh: Dict; en: Dict } = {
     updateChecker: updateChecker.zh,
     remoteProject: remoteProject.zh,
     mobileRelay: mobileRelay.zh,
+    orchestrator: orchestrator.zh,
     panels: panels.zh,
     terminalSearch: terminalSearch.zh,
     projectSwitcher: projectSwitcher.zh,
@@ -104,6 +106,7 @@ export const dicts: { zh: Dict; en: Dict } = {
     updateChecker: updateChecker.en,
     remoteProject: remoteProject.en,
     mobileRelay: mobileRelay.en,
+    orchestrator: orchestrator.en,
     panels: panels.en,
     terminalSearch: terminalSearch.en,
     projectSwitcher: projectSwitcher.en,

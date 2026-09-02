@@ -284,11 +284,84 @@ fn 写穿回执能被_sidecar_解析器读懂() {
         .expect("sidecar 的解析器必须读得懂桌面 handler 的产出");
     assert_eq!(sent.pane_id, 101);
     assert!(sent.bracketed_paste, "整块粘贴这一位要透到 CLI 侧");
+    // 工单 10 新增的两样也要透过去 —— 汇报靠 taskId 与派出去的活对上,
+    // 而 targetStatus 是编排者判断「立刻开跑还是排进了输入缓冲」的唯一依据
+    assert_eq!(sent.task_id, "t1", "任务编号要透到 CLI 侧");
+    assert_eq!(
+        sent.target_status, "ai-idle",
+        "写入那一刻的状态原文要透到 CLI 侧"
+    );
     // 正文一个字都不许回显(ADR 0002 的防线延伸到编排者写的 prompt)
     assert!(
         !outcome.body.contains("fn main"),
         "回执回显了正文: {}",
         outcome.body
+    );
+
+    // 再派一次:编号单调递增(编排者靠它区分先后)
+    let body = serde_json::to_string(&ControlRequest::send(&identity, 101, "再来一件")).unwrap();
+    let outcome = plane.handle("send", &body);
+    let sent = parse_send_receipt(outcome.status, &outcome.body).unwrap();
+    assert_eq!(sent.task_id, "t2");
+}
+
+/// 工单 10 的黄灯拦截走到线上:目标停在等人处理时 `send` 被拒,新错误码两侧一致。
+///
+/// 另起一个 plane —— 默认那份 `Actions` 的死活是钉死的 `Stop`(那是「干完了」),
+/// 而这条要的是**成因属 attention**。用 Codex 那一档(`PermissionRequest` 停在
+/// `ai-working`):只看状态的实现会放过它,这条测试就是那道护栏。
+#[test]
+fn 黄灯拦截的错误码两侧一致() {
+    struct AwaitingActions;
+
+    impl OrchestratorActions for AwaitingActions {
+        fn start_session(&self, spec: StartSessionSpec) -> Result<StartedSession, StartFailure> {
+            Ok(spec.landed(101, "大脑"))
+        }
+        fn send_input(&self, _pane_id: u32, _input: PaneInput) -> Result<Delivered, SendFailure> {
+            panic!("停在等人处理时一个字节都不许落到桌面端");
+        }
+        fn read_screen(&self, _pane_id: u32, _lines: usize) -> Result<Vec<String>, ScreenFailure> {
+            Ok(vec!["Allow Bash(cargo test)? (y/n)".to_string()])
+        }
+        fn pane_liveness(&self, _pane_id: u32) -> PaneLiveness {
+            PaneLiveness {
+                alive: true,
+                // ⚠️ Codex 的审批等待停在 **ai-working**,判据只能是成因
+                status: "ai-working".into(),
+                ai_session: AiSessionState::Active,
+                cause: Some("PermissionRequest".into()),
+            }
+        }
+    }
+
+    let plane = ControlPlane::new();
+    plane.set_host(Arc::new(Host));
+    plane.set_actions(Arc::new(AwaitingActions));
+    let identity = Identity {
+        token: plane.grant(7, "p-self"),
+        pane_id: 7,
+    };
+    let start =
+        serde_json::to_string(&ControlRequest::start_session(&identity, "claude", None)).unwrap();
+    assert_eq!(plane.handle("start-session", &start).status, 200);
+
+    let body = serde_json::to_string(&ControlRequest::send(&identity, 101, "接着干")).unwrap();
+    let outcome = plane.handle("send", &body);
+    let err = parse_send_receipt(outcome.status, &outcome.body).unwrap_err();
+    assert_eq!(err.code, "targetAwaitingHuman");
+    assert_eq!(err.status, 409);
+    // CLI 的退出码分档:既不是「没能力」也不是「够不着」,而是「改你的请求」那一档
+    assert!(!err.is_denied(), "不是鉴权问题");
+    assert!(!err.is_desktop_unavailable(), "也不是够不着");
+    assert!(
+        err.message.contains("waiting for a human"),
+        "得说清为什么被拒: {}",
+        err.message
+    );
+    assert!(
+        !err.message.contains("musician"),
+        "用户可见文案一律 orchestrated session(术语表)"
     );
 }
 

@@ -4246,6 +4246,7 @@ dependencies = [
  "dirs 6.0.0",
  "mt-agent-control",
  "mt-core",
+ "mt-i18n",
  "parking_lot",
  "regex",
  "serde",

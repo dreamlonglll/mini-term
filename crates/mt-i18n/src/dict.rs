@@ -10,11 +10,11 @@
 use crate::Namespace;
 
 /// 命名空间总数（生成器对账用，测试断言防漂移）
-pub const NAMESPACE_COUNT: usize = 32;
+pub const NAMESPACE_COUNT: usize = 33;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 852;
+pub const ZH_ENTRY_COUNT: usize = 855;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 852;
+pub const EN_ENTRY_COUNT: usize = 855;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -619,6 +619,15 @@ static MOBILE_RELAY_EN: &[(&str, &str)] = &[
 ];
 
 #[rustfmt::skip]
+static ORCHESTRATOR_ZH: &[(&str, &str)] = &[
+    ("reportFooter", "【来自编排者的固定要求】做完后请按这个格式收尾：结果 / 改动的文件 / 做过的验证 / 未完成或存疑的事。遇到拿不准的问题，用文字写出来并结束本回合等答复，不要使用交互式提问工具。"),
+];
+#[rustfmt::skip]
+static ORCHESTRATOR_EN: &[(&str, &str)] = &[
+    ("reportFooter", "[Standing instruction from your orchestrator] When you are done, close with this format: result / files changed / checks you ran / anything unfinished or uncertain. If something is unclear, write it out as plain text and end the turn to wait for an answer - do not use an interactive question tool."),
+];
+
+#[rustfmt::skip]
 static PANE_GROUP_ZH: &[(&str, &str)] = &[
     ("branchPopover.current", "← 当前"),
     ("branchPopover.empty", "该会话没有分支记录"),
@@ -1084,6 +1093,8 @@ static SETTINGS_ZH: &[(&str, &str)] = &[
     ("aiHook.orchestrationTitle", "编排"),
     ("aiHook.register", "注册所选 Hook"),
     ("aiHook.registering", "注册中..."),
+    ("aiHook.reportFooterDesc", "编排者每次派活时，在 prompt 末尾追加一段固定要求：做完按「结果 / 改动的文件 / 做过的验证 / 未完成或存疑的事」收尾，拿不准的问题用文字提出并结束回合等答复，不要弹交互式提问。关掉后一个字都不追加"),
+    ("aiHook.reportFooterTitle", "派活时追加汇报格式要求"),
     ("aiHook.serverDesc", "通过 Claude Code / Codex / Grok 的 hook 系统获取精确的 AI 状态，替代进程轮询"),
     ("aiHook.serverLabel", "Hook 服务器"),
     ("aiHook.serverRunning", "运行中 (端口 {port})"),
@@ -1296,6 +1307,8 @@ static SETTINGS_EN: &[(&str, &str)] = &[
     ("aiHook.orchestrationTitle", "Orchestration"),
     ("aiHook.register", "Register selected hooks"),
     ("aiHook.registering", "Registering..."),
+    ("aiHook.reportFooterDesc", "Adds a fixed instruction to the end of every prompt an orchestrator sends: close with result / files changed / checks you ran / anything unfinished, and raise anything unclear as plain text at the end of the turn instead of an interactive question. Turn this off and nothing is appended"),
+    ("aiHook.reportFooterTitle", "Append a reporting format to every prompt"),
     ("aiHook.serverDesc", "Get precise AI status via the Claude Code / Codex / Grok hook system, replacing process polling"),
     ("aiHook.serverLabel", "Hook server"),
     ("aiHook.serverRunning", "Running (port {port})"),
@@ -2005,6 +2018,11 @@ pub static NAMESPACES: &[Namespace] = &[
         name: "mobileRelay",
         zh: MOBILE_RELAY_ZH,
         en: MOBILE_RELAY_EN,
+    },
+    Namespace {
+        name: "orchestrator",
+        zh: ORCHESTRATOR_ZH,
+        en: ORCHESTRATOR_EN,
     },
     Namespace {
         name: "paneGroup",

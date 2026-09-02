@@ -141,6 +141,16 @@ pub fn resolve_session_cap(saved: Option<u32>) -> usize {
     saved.unwrap_or(mt_ai::DEFAULT_SESSION_CAP as u32).min(SESSION_CAP_MAX) as usize
 }
 
+/// 配置里那个 `Option<bool>` → 派活时追不追加汇报格式尾部(工单 10)。
+///
+/// 与上面那条同一个套路、同样三个调用点(界面初值 / 提交后推给控制面 / 启动接线),
+/// 区别只是默认值这次两侧都是「开着」:配置里的 `None` 语义是「用户没设过」,
+/// [`mt_ai::ControlPlane`] 那个原子量的初值也是 `true` —— 两处都写着 true,
+/// 但只有这一处是**用户配置的兜底口径**,控制面那处是「没接线时的行为」。
+pub fn resolve_report_footer(saved: Option<bool>) -> bool {
+    saved.unwrap_or(true)
+}
+
 /// 主线程按配置刷新、控制面 HTTP 线程只读的那一份桌面状态切面。
 #[derive(Default)]
 pub struct OrchestratorMirror {
@@ -1193,6 +1203,57 @@ mod tests {
                 !desc.contains("乐手") && !desc.to_lowercase().contains("musician"),
                 "{locale:?} 的用户可见文案不许出现口语别名: {desc}"
             );
+        }
+    }
+
+    // ─── 汇报格式尾部(工单 10)───────────────────────────────
+
+    /// 没设过 = **开着**(存量配置里根本没这个键),设过就照用。
+    #[test]
+    fn 汇报格式尾部没设过时开着() {
+        assert!(resolve_report_footer(None), "None = 跟默认走 = 开着");
+        assert!(resolve_report_footer(Some(true)));
+        assert!(!resolve_report_footer(Some(false)));
+        // 存量配置的迁移路径:缺这个键就是 None
+        assert!(resolve_report_footer(
+            AppConfig::default().orchestrator_report_footer
+        ));
+        // 控制面那个原子量的初值必须与这里的兜底一致 —— 两处若走散,
+        // 「没接线时的行为」与「用户没设过时的行为」会是两回事
+        assert_eq!(
+            mt_ai::ControlPlane::new().report_footer_enabled(),
+            resolve_report_footer(None),
+            "控制面的缺省与配置兜底必须同一档"
+        );
+    }
+
+    /// 尾部那段文案是**写进另一个 AI 会话终端**的,双语都得在,且不许出现
+    /// 口语别名(它的读者是另一个 LLM,术语混用会被照抄进对话)。
+    #[test]
+    fn 汇报格式尾部文案双语都在且不带别名() {
+        for locale in [mt_i18n::Locale::Zh, mt_i18n::Locale::En] {
+            let footer = mt_i18n::t_in(locale, "orchestrator", "reportFooter");
+            assert!(!footer.trim().is_empty(), "{locale:?} 的尾部文案是空的");
+            assert!(
+                !footer.contains("乐手") && !footer.to_lowercase().contains("musician"),
+                "{locale:?} 的尾部文案不许出现口语别名: {footer}"
+            );
+            // 尾部会被包进 bracketed paste:自带结束标记就能把粘贴块提前截断
+            assert!(
+                !footer.contains('\u{1b}'),
+                "{locale:?} 的尾部文案里不许有 ESC 序列: {footer}"
+            );
+        }
+        // 设置项的开关文案也得在(双语)
+        for locale in [mt_i18n::Locale::Zh, mt_i18n::Locale::En] {
+            for key in ["aiHook.reportFooterTitle", "aiHook.reportFooterDesc"] {
+                let text = mt_i18n::t_in(locale, "settings", key);
+                assert!(!text.trim().is_empty(), "{locale:?} 的 {key} 是空的");
+                assert!(
+                    !text.contains("乐手") && !text.to_lowercase().contains("musician"),
+                    "{locale:?} 的 {key} 不许出现口语别名: {text}"
+                );
+            }
         }
     }
 }

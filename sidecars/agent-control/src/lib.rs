@@ -276,14 +276,24 @@ pub struct OrchestratedPane {
 
 /// `send` 的回执。
 ///
-/// **不带任何正文回显**，也不带状态列：写穿之后那一瞬的状态一定还是写之前的
-/// 样子（agent 还没来得及反应），摆出来只会诱导编排者把它读成「干完了」。
-/// 要看状态走 `wait`（工单 06）。
+/// **不带任何正文回显**：那是用户项目里的内容，与启动器的命令文本同一档待遇。
+/// 也不带「这次派活的结果」—— 写穿之后那一瞬什么都还没发生，要看结果走 `wait`
+/// （工单 06）或等汇报（ADR 0004）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SendReceipt {
     /// 写进了哪个受编排会话。
     pub pane_id: u32,
+    /// 这次派活的任务编号（`t1` / `t2`…，工单 10）。
+    ///
+    /// 汇报会带着它回来，编排者据此把「桌面端送来的这条结果」与「我派出去的
+    /// 那件活」对上。每个编排者各自从 `t1` 数起。
+    ///
+    /// **缺省空串**：认不出这个字段的旧桌面端在场时给的就是空串 —— 编排者拿它
+    /// 去核对会一眼看出对不上，**别猜**（补一个编号出来只会让它把别人的汇报
+    /// 认成自己的）。
+    #[serde(default)]
+    pub task_id: String,
     /// 是不是当成一整块粘贴送进去的（bracketed paste）。
     ///
     /// **缺省 `false`**：认不出这个字段的旧桌面端在场时，宁可让编排者以为
@@ -291,6 +301,17 @@ pub struct SendReceipt {
     /// 同一个 fail-closed 取向）。
     #[serde(default)]
     pub bracketed_paste: bool,
+    /// 写入那一刻目标的 AI 状态原文（工单 10）。**是事实，不是结果**：
+    ///
+    /// - `ai-working` —— 对面正忙，这段 prompt 进了它自己的输入缓冲，要等它
+    ///   手上这一轮结束（Claude / Codex 会排队，Grok 未验）；
+    /// - `ai-idle` —— 对面闲着，应当立刻开跑；
+    /// - `idle` —— 里头的 agent 已经退了，这段字进的是**裸 shell**
+    ///   （配合 `bracketed_paste: false` 一起读）。
+    ///
+    /// **缺省空串**（旧桌面端在场时），同样别猜。
+    #[serde(default)]
+    pub target_status: String,
 }
 
 /// `wait` 的结论（工单 06）。
@@ -799,18 +820,25 @@ mod tests {
 
     #[test]
     fn 解析写穿回执() {
-        let body = r#"{"ok":true,"data":{"sent":{"paneId":101,"bracketedPaste":true}}}"#;
+        let body = r#"{"ok":true,"data":{"sent":{"paneId":101,"taskId":"t7","bracketedPaste":true,"targetStatus":"ai-working"}}}"#;
         let sent = parse_send_receipt(200, body).unwrap();
         assert_eq!(sent.pane_id, 101);
+        assert_eq!(sent.task_id, "t7");
         assert!(sent.bracketed_paste);
+        assert_eq!(sent.target_status, "ai-working");
     }
 
-    /// 旧桌面端不认得 `bracketedPaste` 时缺省 `false`：宁可让编排者以为多行
-    /// 没走成整块、去核对一眼，也别反过来（fail-closed 取向）。
+    /// 旧桌面端不认得工单 10 那两个字段时：`bracketedPaste` 缺省 `false`
+    /// （宁可让编排者以为多行没走成整块、去核对一眼，也别反过来），
+    /// `taskId` / `targetStatus` 缺省**空串** —— 编排者拿空串去核对会一眼看出
+    /// 对不上，比补一个编号出来强（补出来它会把别人的汇报认成自己的）。
     #[test]
     fn 回执缺字段时保守当成没整块粘贴() {
         let body = r#"{"ok":true,"data":{"sent":{"paneId":101}}}"#;
-        assert!(!parse_send_receipt(200, body).unwrap().bracketed_paste);
+        let sent = parse_send_receipt(200, body).unwrap();
+        assert!(!sent.bracketed_paste);
+        assert!(sent.task_id.is_empty(), "别猜任务编号");
+        assert!(sent.target_status.is_empty(), "别猜目标状态");
     }
 
     /// 认不出的响应照旧算失败，不许退化成「反正发出去了」。
@@ -833,7 +861,10 @@ mod tests {
             code: code.into(),
             message: String::new(),
         };
-        for code in ["emptyInput", "sendFailed"] {
+        // `targetAwaitingHuman`（工单 10 的黄灯拦截）同档:它是一条**裁决**,
+        // 编排者该做的是转告用户、等那个会话被处理完再重发 —— 不是重试,
+        // 也不是「桌面端出问题了」。
+        for code in ["emptyInput", "sendFailed", "targetAwaitingHuman"] {
             assert!(!f(code).is_denied(), "{code} 不是鉴权失败");
             assert!(!f(code).is_desktop_unavailable(), "{code} 不是够不着");
         }

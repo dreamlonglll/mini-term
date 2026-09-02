@@ -92,8 +92,11 @@ use mt_i18n::{
 /// 854 → 852：AI 启动器的增删改从移动端面板迁到设置 → Shell：`mobileRelay.launchers.*`
 /// 15 条删除，`settings.launchers.*` 新增 11 条（编辑 / 删除 / 保存 / 取消复用
 /// `settings.common.*`），移动端面板留一句指路与「打开设置」入口 2 条。
-const EXPECTED_NAMESPACES: usize = 32;
-const EXPECTED_ENTRIES_PER_LANG: usize = 852;
+/// 852 → 855（命名空间 32 → 33）：工单 10 的派活改造——新命名空间
+/// `orchestrator` 只放**会被写进别人终端**的那类文案（首条 `reportFooter`，
+/// 派活时追加的汇报格式要求），设置页「编排」一节加这条尾部的开关标题与说明。
+const EXPECTED_NAMESPACES: usize = 33;
+const EXPECTED_ENTRIES_PER_LANG: usize = 855;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。
@@ -110,6 +113,7 @@ const TS_NAMESPACES: &[&str] = &[
     "gitHistoryContent",
     "markerList",
     "mobileRelay",
+    "orchestrator",
     "paneGroup",
     "panels",
     "projectList",

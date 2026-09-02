@@ -141,13 +141,16 @@ impl AiBridge {
     /// 而「改分组即时生效」要求它别陈旧 —— 调用点在配置落盘那一处
     /// (`store::layout::save_config_now`)与启动接线处,配置一变就跟。
     ///
-    /// 上限也在这里推一次:它是**配置的一部分**,启动时得从盘上那份接上,
-    /// 配置若哪天由别的路径整体换掉(重读 / 迁移)也得跟着走。改设置项那一下
-    /// 另走 [`Self::set_orchestrator_session_cap`] —— 那条不等 500ms 防抖。
+    /// 上限与汇报格式尾部这两个设置项也在这里推一次:它们是**配置的一部分**,
+    /// 启动时得从盘上那份接上,配置若哪天由别的路径整体换掉(重读 / 迁移)也得
+    /// 跟着走。改设置项那一下另走各自的 setter —— 那两条不等 500ms 防抖。
     pub fn refresh_orchestrator_mirror(&self, config: &mt_config::AppConfig) {
         self.orchestrator_mirror.lock().replace(config);
         self.set_orchestrator_session_cap(crate::orchestrator::resolve_session_cap(
             config.orchestrator_session_cap,
+        ));
+        self.set_orchestrator_report_footer(crate::orchestrator::resolve_report_footer(
+            config.orchestrator_report_footer,
         ));
     }
 
@@ -157,6 +160,14 @@ impl AiBridge {
     /// 已存活的乐手一个不动(裁决只在起会话那一行读它)。
     pub fn set_orchestrator_session_cap(&self, cap: usize) {
         self.perception.control().set_session_cap(cap);
+    }
+
+    /// 派活时追不追加那段汇报格式要求(工单 10 的设置项落点)。
+    ///
+    /// 与上限同款:控制面里那是个原子量,写完立刻对**下一次** `send` 生效;
+    /// 已经写出去的 prompt 当然追不回来。
+    pub fn set_orchestrator_report_footer(&self, enabled: bool) {
+        self.perception.control().set_report_footer(enabled);
     }
 
     /// 运行时开关 hook server(设置页「Hook 事件」的落点,原 `toggle_hook_server`)。

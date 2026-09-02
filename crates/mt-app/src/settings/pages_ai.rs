@@ -294,6 +294,9 @@ impl SettingsView {
 
     pub(super) fn render_hook_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let enabled = self.store.read(cx).config().hook_enabled;
+        let report_footer = crate::orchestrator::resolve_report_footer(
+            self.store.read(cx).config().orchestrator_report_footer,
+        );
         let agents = self.agents();
         let busy = self.hook_busy;
 
@@ -564,6 +567,22 @@ impl SettingsView {
                         "aiHook.sessionCapDesc",
                         &self.num_orchestrator_cap,
                         false,
+                    ))
+                    // 派活时追加的汇报格式要求(ADR 0004 / 工单 10)。
+                    // 与上面那个上限并排:两条都是「编排者派活时的行为」,
+                    // 也都不随 hook 服务器开关置灰(持久化配置,关着也该改得动)。
+                    .child(toggle_row(
+                        "orchestrator-report-footer",
+                        "aiHook.reportFooterTitle",
+                        "aiHook.reportFooterDesc",
+                        report_footer,
+                        false,
+                        |this, next, _window, cx| {
+                            this.store.update(cx, |store, cx| {
+                                store.set_orchestrator_report_footer(next, cx)
+                            });
+                        },
+                        cx,
                     ))
                     .child(ui::hint(t("settings", "aiHook.orchestrationFooter"))),
             )

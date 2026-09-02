@@ -282,6 +282,22 @@ impl AppStore {
         cx.notify();
     }
 
+    /// 派活时追不追加那段汇报格式要求(ADR 0004 / 工单 10)。
+    ///
+    /// 与上限同一个理由走专用 setter:验收口径是「用户改完立刻在编排者里试」,
+    /// 而装配读的是控制面里那个原子量、不是磁盘 —— 挂在防抖落盘上就要多等半秒。
+    ///
+    /// 关掉**不影响已经写出去的 prompt**(那些字早进 PTY 了),只影响下一次 `send`。
+    pub fn set_orchestrator_report_footer(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if self.config.orchestrator_report_footer == Some(enabled) {
+            return;
+        }
+        self.config.orchestrator_report_footer = Some(enabled);
+        self.ai.set_orchestrator_report_footer(enabled);
+        self.save_config_soon(cx);
+        cx.notify();
+    }
+
     /// 把当前的终端字号/字族下发给**全部**已开终端。
     fn apply_terminal_style(&mut self, cx: &mut Context<Self>) {
         let style = self.terminal_style();

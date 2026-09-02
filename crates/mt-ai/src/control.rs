@@ -92,9 +92,9 @@
 //! 它照样进 `needs_own_thread` 那张表 —— 那张表说的是「别在 HTTP 那条循环里
 //! 就地做」，而 `wait` 要占的正是几分钟。
 
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -489,6 +489,21 @@ impl PaneLiveness {
         self.alive && self.ai_session != AiSessionState::Ended
     }
 
+    /// 停在**等人处理**吗（等审批 / 交互式向人提问）。
+    ///
+    /// **判据是成因不是状态**（见 [`Self::cause`] 的第一条）：Codex 的
+    /// `PermissionRequest` 停在 `ai-working`，只看状态会放过它。
+    ///
+    /// 一句话三个消费者，都是 ADR 0003「不代答」那条铁律的落点：
+    /// [`Self::settled`]（`wait` 的 attention 终态）、[`ControlPlane::send`]
+    /// （黄灯时拒绝派活，工单 10）、以及汇报的投递闸（工单 12）。摊开写三遍
+    /// 就是三个走散的机会 —— 尤其是「别忘了它可能停在 `ai-working`」这一点。
+    pub fn awaiting_human(&self) -> bool {
+        self.cause
+            .as_deref()
+            .is_some_and(crate::hook_server::is_attention_cause)
+    }
+
     /// 收敛成 [`WaitState`] 了吗。`None` = 还在跑 / 说不上来，`wait` 接着等。
     ///
     /// **判定顺序有讲究：先看成因，再看状态。** attention 与状态不是一一对应的
@@ -505,11 +520,7 @@ impl PaneLiveness {
             // pane 都没了：那是 `paneGone`，不是终态（由调用方答）
             return None;
         }
-        if self
-            .cause
-            .as_deref()
-            .is_some_and(crate::hook_server::is_attention_cause)
-        {
+        if self.awaiting_human() {
             return Some(WaitState::Attention);
         }
         match self.status.as_str() {
@@ -606,18 +617,49 @@ impl PaneInput {
     /// 「装配口径」)要拿它与 `mt_ui::paste_to_bytes` 比一次 —— 那是同时看得见
     /// 两侧的唯一地方。**装配本身仍然只在 [`ControlPlane::send`] 里被调用**。
     pub fn assemble(text: &str) -> Option<Self> {
-        let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
-        let body = normalized.replace("\x1b[201~", "");
+        Self::assemble_with_footer(text, None)
+    }
+
+    /// 装配一段输入，并在正文后追加一段**固定尾部**（ADR 0004 的汇报格式要求，
+    /// 工单 10）。`footer` 为 `None`（设置里关掉了）时与 [`Self::assemble`] 一字不差。
+    ///
+    /// # 三条口径
+    ///
+    /// - **空正文的判定只看正文**：先按正文判一次空，再谈尾部。反过来的话
+    ///   「空 prompt + 尾部」就不空了，[`ControlError::EmptyInput`] 那条裁决
+    ///   （裸回车即代答）会被自己加的字绕过去；
+    /// - **尾部在包裹之内、回车之外**：它是 prompt 的一部分，要跟正文一起进
+    ///   那个输入框，而不是单独送出去的第二条消息；
+    /// - **正文与尾部之间空一行**：`\r\r`。挨着写的话尾部会被读成正文最后一句
+    ///   的续写，而它是一条与任务无关的元指令。
+    ///
+    /// 尾部本身照样过一遍归一（换行 → `\r`、剔掉 `ESC[201~`）—— 它来自字典，
+    /// 眼下是一行，但没有理由让这条不变量取决于文案怎么写。
+    pub fn assemble_with_footer(text: &str, footer: Option<&str>) -> Option<Self> {
+        let body = Self::normalize(text);
         // 结尾的换行删掉：LLM 拿 heredoc 拼 prompt 时末尾几乎总带一个换行，
         // 原样留着就是替它多按一次回车 —— 在等确认的 TUI 里那一下会被当成「确认」。
         let body = body.trim_end_matches('\r');
         if body.trim().is_empty() {
             return None;
         }
+        let full = match footer.map(Self::normalize) {
+            // 尾部全是空白（文案被清空了？）时当没有 —— 别在 prompt 后面挂两个
+            // 空行了事。
+            Some(f) if !f.trim().is_empty() => format!("{body}\r\r{}", f.trim_end_matches('\r')),
+            _ => body.to_string(),
+        };
         Some(Self {
-            bracketed: format!("\x1b[200~{body}\x1b[201~\r"),
-            plain: format!("{body}\r"),
+            bracketed: format!("\x1b[200~{full}\x1b[201~\r"),
+            plain: format!("{full}\r"),
         })
+    }
+
+    /// 换行归一成 `\r`、剔掉结束标记。正文与尾部走的是同一遍。
+    fn normalize(text: &str) -> String {
+        text.replace("\r\n", "\r")
+            .replace('\n', "\r")
+            .replace("\x1b[201~", "")
     }
 
     /// 目标终端开着 bracketed paste 时该写的那串。
@@ -937,6 +979,48 @@ pub const DEFAULT_SESSION_CAP: usize = 5;
 /// 不是抄一个字面量。
 pub const MAX_SESSIONS_PER_ORCHESTRATOR: usize = 50;
 
+/// 一个编排者名下最多留多少条**任务**记账（工单 10）。
+///
+/// 任务是派活回执的身份（`CONTEXT.md` 的「任务」词条）：`send` 成功一次就多一条，
+/// 而派活的频次比起会话高一两个数量级 —— 一个长命编排者跑一下午能派出好几百条。
+/// 于是给它一个上限，超出时从最旧的丢起。
+///
+/// **丢掉的只是「回头还能不能查到这条任务」，丢不掉任何活着的东西**（与
+/// [`MAX_SESSIONS_PER_ORCHESTRATOR`] 那条修剪的分量不同：那边丢一条活着的记账
+/// 就是造一个幽灵会话）。200 是「远大于一次编排会话里会被回头引用的条数、
+/// 又不至于让按乐手扫一遍变贵」的一个数。
+pub const MAX_TASKS_PER_ORCHESTRATOR: usize = 200;
+
+/// 一次派活的身份（ADR 0004 / `CONTEXT.md` 的「任务」词条）。
+///
+/// **不存正文**：编排者写的 prompt 是用户项目里的内容，与启动器的命令文本同一档
+/// 待遇（ADR 0002 的防线）—— 回执里不回显，账本里也不留。任务只是一个编号加上
+/// 「什么时候写进去的、写进去那一刻对面是什么状态」。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Task {
+    /// `t1` / `t2` … **每编排者各自单调递增**，编排者重新授予（PTY 重开）后从
+    /// `t1` 重数 —— 那是一个新身份，它读不到前世的任何东西。
+    pub id: String,
+    /// 谁派的。
+    pub orchestrator_pane_id: u32,
+    /// 派给谁。
+    pub target_pane_id: u32,
+    /// 写进 PTY 的那一刻。**给「未被接收」超时判定用**（工单 11 的 `ACK_TIMEOUT`）。
+    pub written_at: Instant,
+    /// 写入那一刻目标的 AI 状态原文（`pane_liveness().status`）。
+    ///
+    /// **只是事实，不折成「是不是在排队」的布尔**：`ai-working` 意味着 prompt 进了
+    /// agent 自己的输入缓冲（Claude / Codex 会排队，Grok 未验），`ai-idle` / `idle`
+    /// 意味着立刻开跑、或者写进了一个已经退回裸 shell 的 pane。三档的处置各不相同，
+    /// 由编排者自己判断（`--help` 里写着）。
+    pub target_status_at_write: String,
+    /// 这条任务的编号已经随某条汇报交给编排者了吗（工单 12 的投递泵回填）。
+    ///
+    /// 汇报要带上「此前写入且尚未汇报过的任务编号」，取一次即收敛 —— 与
+    /// `monitor` 那条「降级结论必须落盘、不许每轮重算」同一条铁律。
+    pub reported: bool,
+}
+
 /// 控制命令的闭集。
 ///
 /// **命令名与「会不会阻塞主线程」这两件事只有这一份表**。此前它们各写一处
@@ -1043,6 +1127,9 @@ struct Inner {
     /// 并发上限。用原子量而不是再加一把锁:多一把锁就多一组与 `registry`
     /// 交叉持有的可能。
     session_cap: AtomicUsize,
+    /// 派活时要不要追加汇报格式尾部（工单 10 的设置项）。同样是原子量、
+    /// 同样的理由，也同样是「设置一改立刻对**下一次** `send` 生效」。
+    report_footer: AtomicBool,
     /// 记账版本号，见 [`ControlPlane::origins_version`]。同样是原子量、同样的
     /// 理由 —— 渲染路径每帧都读它，绝不能让它多长一把锁出来。
     origins_version: AtomicU64,
@@ -1056,6 +1143,8 @@ impl Default for Inner {
             transcripts: Mutex::new(Arc::new(SessionLogTranscripts)),
             registry: Mutex::new(TokenRegistry::default()),
             session_cap: AtomicUsize::new(DEFAULT_SESSION_CAP),
+            // 缺省开着 —— 配置里 `None` 的语义就是「跟默认走」。
+            report_footer: AtomicBool::new(true),
             origins_version: AtomicU64::new(0),
         }
     }
@@ -1076,6 +1165,22 @@ struct TokenRegistry {
     /// 一律现查 [`OrchestratorActions::pane_liveness`]，一个字都不读这里 ——
     /// 事件驱动的死活记账漏一次就是永久占住名额，那条路本模块不走。
     closed: HashSet<u32>,
+    /// 编排者 pane → 它派出去的任务（工单 10）。
+    ///
+    /// **住在这把锁里、不另开一把**：它的生命周期与令牌完全绑死（编排者撤销令牌
+    /// 时名下任务一并清掉），拆出去就多一组与 `grants` / `sessions` 交叉持有的
+    /// 可能 —— 这把锁的注释第一条写的就是这件事。
+    tasks: HashMap<u32, OrchestratorTasks>,
+}
+
+/// 一个编排者的任务账本：一个递增的号码机 + 最近 [`MAX_TASKS_PER_ORCHESTRATOR`] 条。
+#[derive(Default)]
+struct OrchestratorTasks {
+    /// 下一个任务编号（`t{next_seq}`）。**只增不减** —— 修剪丢掉最旧的几条时
+    /// 号码不回收，否则同一次授予里会出现两条同号任务。
+    next_seq: u64,
+    /// 派活顺序（旧的在前）。
+    tasks: VecDeque<Task>,
 }
 
 impl TokenRegistry {
@@ -1104,6 +1209,60 @@ impl TokenRegistry {
             s.orchestrator_departed = true;
             true
         });
+        // 任务账本**整本丢掉**，与乐手记账那条「留着标已离场」相反。
+        //
+        // 任务的唯一读者是这个编排者（汇报要引它的编号），它一走那些编号再也
+        // 没人读得懂；留着既没有 tab 可标，也是一条永不回收的泄漏。号码机一并
+        // 归零，于是重新授予之后从 `t1` 重数 —— 那是**新身份**，MVP 不做收养，
+        // 让它看见「t37」只会让它以为自己派过 36 次活。
+        self.tasks.remove(&orchestrator_pane_id);
+    }
+
+    /// 记一条派活。返回新任务的编号。
+    fn note_task(
+        &mut self,
+        orchestrator_pane_id: u32,
+        target_pane_id: u32,
+        status: &str,
+    ) -> String {
+        let ledger = self.tasks.entry(orchestrator_pane_id).or_default();
+        ledger.next_seq += 1;
+        let id = format!("t{}", ledger.next_seq);
+        ledger.tasks.push_back(Task {
+            id: id.clone(),
+            orchestrator_pane_id,
+            target_pane_id,
+            written_at: Instant::now(),
+            target_status_at_write: status.to_string(),
+            reported: false,
+        });
+        while ledger.tasks.len() > MAX_TASKS_PER_ORCHESTRATOR {
+            ledger.tasks.pop_front();
+        }
+        id
+    }
+
+    /// 某个乐手身上「尚未汇报」的任务，按派活先后。`consume` 为真时就地标记成
+    /// 已汇报（取一次即收敛）。
+    fn unreported_of_hand(&mut self, target_pane_id: u32, consume: bool) -> Vec<String> {
+        let mut out: Vec<(u64, String)> = Vec::new();
+        for ledger in self.tasks.values_mut() {
+            for task in ledger.tasks.iter_mut() {
+                if task.target_pane_id != target_pane_id || task.reported {
+                    continue;
+                }
+                // 编号里那个序号就是派活顺序（同一编排者内单调递增）；跨编排者
+                // 派给同一个乐手是不可能的（可见范围铁律：乐手只属于起它的那个），
+                // 所以按它排就是全局的先后序。
+                let seq = task.id[1..].parse().unwrap_or(0);
+                out.push((seq, task.id.clone()));
+                if consume {
+                    task.reported = true;
+                }
+            }
+        }
+        out.sort_unstable();
+        out.into_iter().map(|(_, id)| id).collect()
     }
 
     /// 记账超出上限时，**只丢已经关掉的、从最旧的丢起**。
@@ -1169,6 +1328,71 @@ impl ControlPlane {
 
     pub fn session_cap(&self) -> usize {
         self.inner.session_cap.load(Ordering::Relaxed)
+    }
+
+    /// 派活时要不要追加汇报格式尾部（工单 10 的设置项落点）。
+    ///
+    /// 关掉之后**一个字都不追加**：`send` 写进去的就是编排者给的那段正文，
+    /// 与工单 05 那一版逐字节相同。
+    pub fn set_report_footer(&self, enabled: bool) {
+        self.inner.report_footer.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn report_footer_enabled(&self) -> bool {
+        self.inner.report_footer.load(Ordering::Relaxed)
+    }
+
+    // ─── 任务账本（工单 10）───────────────────────────────────
+
+    /// 记一条派活并拿到它的编号。
+    ///
+    /// **正常路径由 [`Self::send`] 在写穿成功之后自己调**（写失败不消耗编号：
+    /// 没写进去就没有这次派活）。开成 `pub` 是给工单 11 / 12 的账本与它们的
+    /// 测试用 —— 它们要能在没有真桌面的情况下造出「派过活」这个事实。
+    pub fn note_task_written(
+        &self,
+        orchestrator_pane_id: u32,
+        target_pane_id: u32,
+        target_status_at_write: &str,
+    ) -> String {
+        self.inner.registry.lock().note_task(
+            orchestrator_pane_id,
+            target_pane_id,
+            target_status_at_write,
+        )
+    }
+
+    /// 某个乐手身上**尚未汇报**的任务编号，按派活先后。只看不取。
+    pub fn unreported_task_ids(&self, target_pane_id: u32) -> Vec<String> {
+        self.inner
+            .registry
+            .lock()
+            .unreported_of_hand(target_pane_id, false)
+    }
+
+    /// 同上，但**取一次即收敛**：返回的这些就地标记成已汇报，下次不再出现。
+    ///
+    /// 工单 12 渲染「回合已结束 / 已退出 / 已关闭」那三种汇报时调它一次，把
+    /// 编号清单带进汇报正文。重复投递会让编排者以为同一批活被派了两遍。
+    pub fn take_unreported_task_ids(&self, target_pane_id: u32) -> Vec<String> {
+        self.inner
+            .registry
+            .lock()
+            .unreported_of_hand(target_pane_id, true)
+    }
+
+    /// 某个编排者名下的任务，按派活先后（最多 [`MAX_TASKS_PER_ORCHESTRATOR`] 条）。
+    ///
+    /// 给工单 11/12 与测试查事实用：写入时刻（未被接收的超时判定）与写入那一刻
+    /// 目标的状态都在里头。
+    pub fn tasks_of(&self, orchestrator_pane_id: u32) -> Vec<Task> {
+        self.inner
+            .registry
+            .lock()
+            .tasks
+            .get(&orchestrator_pane_id)
+            .map(|l| l.tasks.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// 授予一枚编排令牌：随机生成、每 pane 一枚，同一 pane 重复授予顶掉旧的。
@@ -1608,13 +1832,30 @@ impl ControlPlane {
     /// `wait` / `read` 判断乐手在干什么。
     ///
     /// 裁决顺序照旧「越便宜越靠前」：先把请求体本身看完（不惊动记账与桌面），
-    /// 再过可见范围铁律，最后才动 PTY。
+    /// 再过可见范围铁律，然后是黄灯闸，最后才动 PTY。
+    ///
+    /// # 黄灯闸（工单 10）
+    ///
+    /// 目标停在**等人处理**时拒绝写入：那时候往它的 PTY 里写任何东西都是替用户
+    /// 回答一个正等着人拍板的提示（ADR 0003 的「不代答」铁律，与 [`
+    /// ControlError::EmptyInput`] 堵的是同一件事的两种姿势）。判据是[成因不是
+    /// 状态](PaneLiveness::awaiting_human)。
+    ///
+    /// **拒绝不是排队**：被拒的正文一个字都不缓存、不重投 —— ADR 0004 定的是
+    /// 「派活即写入，桌面端不排队」，黄灯是唯一的例外，而例外的处置是把决定权
+    /// 交回编排者（它该做的是转告用户，等那个会话被人处理完再重发）。
     fn send(&self, grant: &Grant, request: &ControlRequest) -> ControlOutcome {
         let Some(target_pane_id) = request.target_pane_id else {
             return ControlError::BadRequest.into_outcome();
         };
-        // 空正文即拒（见 [`PaneInput::assemble`]：裸回车是最顺手的代答姿势）。
-        let Some(input) = PaneInput::assemble(request.text.as_deref().unwrap_or_default()) else {
+        // 空正文即拒（见 [`PaneInput::assemble_with_footer`]：裸回车是最顺手的
+        // 代答姿势）。尾部**不参与**空正文判定 —— 判定只看编排者给的那段。
+        let footer = self
+            .report_footer_enabled()
+            .then(|| mt_i18n::t("orchestrator", "reportFooter"));
+        let Some(input) =
+            PaneInput::assemble_with_footer(request.text.as_deref().unwrap_or_default(), footer)
+        else {
             return ControlError::EmptyInput.into_outcome();
         };
         // 可见范围铁律走**共用**的那一条，别在这儿另写一遍。
@@ -1622,13 +1863,31 @@ impl ControlPlane {
             Ok(s) => s,
             Err(e) => return e.into_outcome(),
         };
+        // **现查一次，两处都用它**：黄灯闸读 `cause`，回执里的 `targetStatus`
+        // 读 `status`。问两次的话闸看到的与回执报的可能不是同一瞬间的事实。
+        let liveness = self.actions().pane_liveness(session.pane_id);
+        if !liveness.alive {
+            // `resolve_target` 到这里之间被用户关掉了 —— 与它开头那一档同码。
+            return ControlError::PaneGone.into_outcome();
+        }
+        if liveness.awaiting_human() {
+            return ControlError::TargetAwaitingHuman.into_outcome();
+        }
         match self.actions().send_input(session.pane_id, input) {
-            Ok(delivered) => ok_outcome(&ControlData::Sent {
-                sent: SentView {
-                    pane_id: session.pane_id,
-                    bracketed_paste: delivered.bracketed_paste,
-                },
-            }),
+            Ok(delivered) => {
+                // 任务只在**写穿成功之后**才登记：没写进去就没有这次派活，
+                // 让一次失败的 send 吃掉一个编号只会让编号里出现看不见的洞。
+                let task_id =
+                    self.note_task_written(grant.pane_id, session.pane_id, &liveness.status);
+                ok_outcome(&ControlData::Sent {
+                    sent: SentView {
+                        pane_id: session.pane_id,
+                        task_id,
+                        bracketed_paste: delivered.bracketed_paste,
+                        target_status: liveness.status,
+                    },
+                })
+            }
             Err(SendFailure::PaneGone) => ControlError::PaneGone.into_outcome(),
             Err(SendFailure::WriteFailed) => ControlError::SendFailed.into_outcome(),
             Err(SendFailure::DesktopBusy) => ControlError::DesktopBusy.into_outcome(),
@@ -2080,9 +2339,8 @@ struct PaneView {
 
 /// `send` 的回执。
 ///
-/// **刻意不复用 [`PaneView`]**：写穿之后那一瞬的 `status` 一定还是写之前的样子
-/// （agent 还没来得及反应），把它摆在回执里会诱导编排者把「刚发完还是 ai-idle」
-/// 读成「它干完了」。要看状态请走工单 06 的 `wait`。
+/// **刻意不复用 [`PaneView`]**：那一份是「这个乐手是什么」（项目 / 启动器 /
+/// 死活），这一份是「这一次派活是怎么落地的」。
 ///
 /// ⚠️ 正文一个字都不回显 —— 那是用户项目里的内容（见 `ControlRequest::text`）。
 #[derive(Debug, Serialize)]
@@ -2090,12 +2348,35 @@ struct PaneView {
 struct SentView {
     /// 写进了哪个乐手。
     pane_id: u32,
+    /// 这次派活的任务编号（`t1` / `t2`…，见 [`Task`]）。
+    ///
+    /// 汇报会带着它回来（ADR 0004），编排者据此把「桌面端送来的这条结果」与
+    /// 「我派出去的那件活」对上。**每编排者各自数**，重新授予后从 `t1` 重数。
+    task_id: String,
     /// 是不是当成一整块粘贴送进去的。
     ///
     /// 为 `false` 时目标终端此刻没开 bracketed paste（多半是那个 agent 已经退了、
     /// pane 退回裸 shell），多行正文是逐行进去的 —— 中途的换行很可能已经把它
     /// 提前发出去了。**如实告诉编排者**，让它自己决定要不要重来。
     bracketed_paste: bool,
+    /// 写入那一刻目标的 AI 状态原文（`idle` / `ai-idle` / `ai-working`）。
+    ///
+    /// # 工单 05 说过「回执不带状态」，这里为什么带了
+    ///
+    /// 那一条防的是**把写后状态当成结果**：写穿之后那一瞬的状态一定还是写之前
+    /// 的样子，摆出来会诱导编排者把「刚发完还是 ai-idle」读成「它干完了」。
+    /// 这个字段的语义恰恰相反 —— 它明说自己是**写入那一刻**的事实，回答的是
+    /// 「这段 prompt 是被立刻处理，还是排进了对面的输入缓冲」：
+    ///
+    /// - `ai-working`：对面正忙，prompt 进了 agent 自己的输入队列（Claude /
+    ///   Codex 会排队，Grok 未验），要等它手上这一轮结束；
+    /// - `ai-idle`：对面闲着，应当立刻开跑；
+    /// - `idle`：里头的 agent 已经退了，这段字进的是**裸 shell**（配合
+    ///   `bracketedPaste: false` 一起读）。
+    ///
+    /// 名字里带 `target` 也是这个用意：它是**目标写入前**的状态，不是这次派活
+    /// 的结果。要看结果仍然只有工单 06 的 `wait` 与 ADR 0004 的汇报两条路。
+    target_status: String,
 }
 
 /// `wait` 的回执。
@@ -2257,6 +2538,13 @@ pub(crate) enum ControlError {
     EmptyInput,
     /// 找得到那个乐手，但正文没交到它的 PTY 手上。
     SendFailed,
+    // ── 工单 10 ──
+    /// 目标停在**等人处理**（等审批 / 交互式向人提问），`send` 被拒。
+    ///
+    /// 与 [`Self::EmptyInput`] 是同一条铁律的两种姿势：那条堵的是裸回车，
+    /// 这条堵的是「往正等着人拍板的提示里写任何东西」。**是一条裁决，不是错误**
+    /// —— 编排者该做的是在自己的对话里转告用户，等那个会话被处理完再重发。
+    TargetAwaitingHuman,
     // ── 工单 07 ──
     /// 这个乐手跑的 agent **没有可解析的会话记录**（opencode / pi 之流）。
     ///
@@ -2291,6 +2579,7 @@ impl ControlError {
             Self::PaneGone => "paneGone",
             Self::EmptyInput => "emptyInput",
             Self::SendFailed => "sendFailed",
+            Self::TargetAwaitingHuman => "targetAwaitingHuman",
             Self::TranscriptUnsupported => "transcriptUnsupported",
             Self::SessionUnidentified => "sessionUnidentified",
         }
@@ -2303,6 +2592,7 @@ impl ControlError {
             Self::UnknownCommand | Self::LauncherNotFound | Self::PaneNotFound => 404,
             Self::ProjectUnavailable
             | Self::RemoteProjectUnsupported
+            | Self::TargetAwaitingHuman
             | Self::TranscriptUnsupported
             | Self::SessionUnidentified => 409,
             Self::PayloadTooLarge => 413,
@@ -2349,6 +2639,13 @@ impl ControlError {
                  behalf, which an orchestrator must not do"
             }
             Self::SendFailed => "the desktop could not deliver that input to the session",
+            // 与 `EmptyInput` 同一个口气：说清这是哪条规矩，并把下一步写出来。
+            // ⚠️ `into_outcome` 是手拼的 JSON 字面量，消息里别写引号和反斜杠。
+            Self::TargetAwaitingHuman => {
+                "that orchestrated session is waiting for a human (approval or an interactive \
+                 question); sending it anything would answer on the user's behalf. Tell the user \
+                 and wait for that session to settle, then send again"
+            }
             // 能力分层的用户可见面：直接把下一步写出来，别让编排者猜。
             Self::TranscriptUnsupported => {
                 "that agent keeps no readable transcript; use read-screen to see its terminal instead"
@@ -3998,7 +4295,10 @@ mod tests {
     /// AI 会话身份与 marker 因此与用户亲手粘贴完全同形。
     #[test]
     fn 单行_prompt_装配成一块粘贴并跟一个回车() {
-        let (_plane, _host, actions, port, token) = granted();
+        let (plane, _host, actions, port, token) = granted();
+        // 本组钉的是**正文**装配口径，把工单 10 的尾部关掉免得混在字节里；
+        // 尾部自己那一组（`派活默认追加汇报格式尾部` 起）钉它的位置与开关。
+        plane.set_report_footer(false);
         let musician = start_musician(port, &token);
 
         let (status, v) = send(port, &token, musician, "跑一下测试");
@@ -4019,7 +4319,8 @@ mod tests {
     /// 与 `mt_ui::terminal::input::paste_to_bytes` 同一口径。
     #[test]
     fn 多行_prompt_整块送达且回车在包裹之外() {
-        let (_plane, _host, actions, port, token) = granted();
+        let (plane, _host, actions, port, token) = granted();
+        plane.set_report_footer(false); // 见上一条：本组只钉正文
         let musician = start_musician(port, &token);
 
         // 混着 LF 与 CRLF —— 编排者拼 prompt 时两种都可能出现
@@ -4045,7 +4346,8 @@ mod tests {
     /// 在等确认的 TUI 里会被当成「确认」。
     #[test]
     fn 正文末尾的换行不会变成多按一次回车() {
-        let (_plane, _host, actions, port, token) = granted();
+        let (plane, _host, actions, port, token) = granted();
+        plane.set_report_footer(false); // 见上：本组只钉正文
         let musician = start_musician(port, &token);
 
         assert_eq!(send(port, &token, musician, "干活\n\n").0, 200);
@@ -4058,7 +4360,8 @@ mod tests {
     /// 后半截变成真键入 —— 那正是本命令要防的事（`paste_to_bytes` 同款防线）。
     #[test]
     fn 正文里的结束标记被剔掉() {
-        let (_plane, _host, actions, port, token) = granted();
+        let (plane, _host, actions, port, token) = granted();
+        plane.set_report_footer(false); // 见上：本组只钉正文
         let musician = start_musician(port, &token);
 
         assert_eq!(send(port, &token, musician, "前半\x1b[201~后半").0, 200);
@@ -4075,7 +4378,8 @@ mod tests {
     /// 那段多行是逐行进去的，编排者需要知道。
     #[test]
     fn 目标没开粘贴模式时如实告知() {
-        let (_plane, _host, actions, port, token) = granted();
+        let (plane, _host, actions, port, token) = granted();
+        plane.set_report_footer(false); // 见上：本组只钉正文
         let musician = start_musician(port, &token);
         *actions.bracketed_paste.lock() = Some(false);
 
@@ -4193,10 +4497,14 @@ mod tests {
         }
     }
 
-    /// 回执**不回显正文**，也不带状态列（ADR 0002 的防线延伸 + 别诱导它把
-    /// 写穿那一瞬的 `ai-idle` 读成「干完了」）。
+    /// 回执**不回显正文**（ADR 0002 的防线延伸），且形状恰好是这四样。
+    ///
+    /// 工单 05 那一版还断言「不带状态列」，工单 10 把它换成了带语义的
+    /// `targetStatus`（**写入那一刻**的事实，不是这次派活的结果）—— 理由写在
+    /// [`SentView::target_status`] 上。这里改断言它在场，并且**不叫 `status`**：
+    /// 名字里那个 `target` 前缀正是「别把它读成结果」的那道提醒。
     #[test]
-    fn 回执不回显正文也不带状态() {
+    fn 回执不回显正文只给四样() {
         let (_plane, _host, _actions, port, token) = granted();
         let musician = start_musician(port, &token);
 
@@ -4211,8 +4519,7 @@ mod tests {
         let (status, body) = post(port, "/control/send", &payload);
         assert_eq!(status, 200, "{body}");
         assert!(!body.contains("私密项目"), "回执回显了正文: {body}");
-        assert!(!body.contains("status"), "回执不该带状态列: {body}");
-        // 回执只有这两样。
+        // 回执只有这四样。
         //
         // ⚠️ **按集合比，不按顺序** —— `serde_json::Map` 的键序取决于
         // `preserve_order` 这个 feature 开没开，而它由整个工作区的 feature 统一
@@ -4221,14 +4528,23 @@ mod tests {
         let sent = json(&body)["data"]["sent"].clone();
         let mut keys: Vec<String> = sent.as_object().unwrap().keys().cloned().collect();
         keys.sort();
-        assert_eq!(keys, vec!["bracketedPaste", "paneId"]);
+        assert_eq!(
+            keys,
+            vec!["bracketedPaste", "paneId", "targetStatus", "taskId"]
+        );
+        assert!(
+            !sent.as_object().unwrap().contains_key("status"),
+            "状态得叫 targetStatus —— 裸 status 会被读成「这次派活的结果」: {body}"
+        );
     }
 
     /// 编排者写的 prompt 是唯一可能顶到 body 上限的东西：**上限内整段送达、
     /// 上限外明确报错**，两头都不许悄悄截断。
     #[test]
     fn 大_prompt_不截断_超限明确报错() {
-        let (_plane, _host, actions, port, token) = granted();
+        let (plane, _host, actions, port, token) = granted();
+        // 「一个字节都没少」这条断言按正文长度算，尾部关掉才比得干净
+        plane.set_report_footer(false);
         let musician = start_musician(port, &token);
 
         // 32 KiB —— 远超「派一次活」的合理体量，但在 64 KiB 上限之内
@@ -4249,6 +4565,358 @@ mod tests {
         assert_eq!(status, 413, "{v}");
         assert_eq!(v["error"]["code"], "payloadTooLarge");
         assert!(actions.sends.lock().is_empty(), "超限的正文不许写出去半截");
+    }
+
+    // ─── send：黄灯拦截 / 任务身份 / 汇报格式尾部（工单 10）──────
+
+    /// 从 `send` 的回执里取任务编号（顺带断言这一趟是成功的）。
+    fn task_id(res: (u16, serde_json::Value)) -> String {
+        let (status, v) = res;
+        assert_eq!(status, 200, "{v}");
+        v["data"]["sent"]["taskId"]
+            .as_str()
+            .expect("成功回执必须带任务编号")
+            .to_string()
+    }
+
+    /// **黄灯拦截**：目标停在等人处理时 `send` 被拒，且一个字节都不落到桌面端。
+    ///
+    /// 判据是**成因不是状态** —— Codex 的 `PermissionRequest` 停在 `ai-working`
+    /// （`hook_server::map_event_to_status` 有专门一条），只看状态的话那一档
+    /// 会被放过去，而它恰恰是最该拦住的：用户正盯着一个审批提示，此时写进去
+    /// 的任何一段字都是替他按下了确认。
+    #[test]
+    fn 目标停在等人处理时派活被拒() {
+        let (_plane, _host, actions, port, token) = granted();
+        let musician = start_musician(port, &token);
+
+        for (status, cause) in [
+            ("ai-idle", "PermissionRequest"),    // Claude 的审批等待
+            ("ai-working", "PermissionRequest"), // Codex 的（状态留在工作中）
+            ("ai-idle", "Elicitation"),
+            ("ai-working", "StopFailure"),
+        ] {
+            actions.attention(musician, status, cause);
+            actions.sends.lock().clear();
+            let (got, v) = send(port, &token, musician, "接着干");
+            assert_eq!(got, 409, "{status}/{cause}: {v}");
+            assert_eq!(
+                v["error"]["code"], "targetAwaitingHuman",
+                "{status}/{cause}: {v}"
+            );
+            assert!(
+                actions.sends.lock().is_empty(),
+                "{status}/{cause}: 被拒的写穿一个字节都不许落到桌面端"
+            );
+        }
+
+        // 文案要说清这是哪条规矩、以及下一步该干什么（与 `emptyInput` 同口气）
+        let (_s, v) = send(port, &token, musician, "接着干");
+        let message = v["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("waiting for a human"),
+            "得说清为什么被拒: {message}"
+        );
+        assert!(
+            message.contains("Tell the user"),
+            "得把下一步写出来: {message}"
+        );
+        assert!(
+            !message.to_lowercase().contains("musician"),
+            "用户可见文案不许出现口语别名: {message}"
+        );
+
+        // 人处理完之后照旧派得进去 —— 这是一道闸，不是把整条路封死
+        actions.live(musician, "ai-working");
+        assert_eq!(task_id(send(port, &token, musician, "接着干")), "t1");
+    }
+
+    /// 黄灯 + pane 已经关掉：答的是 `paneGone` 而不是黄灯。
+    ///
+    /// 顺序有讲究：「那个 pane 没了」是编排者更该先知道的事实，等它去处理一个
+    /// 已经不存在的黄灯毫无意义。
+    #[test]
+    fn 已关的乐手即使挂着黄灯也答_pane_gone() {
+        let (_plane, _host, actions, port, token) = granted();
+        let musician = start_musician(port, &token);
+        actions.attention(musician, "ai-idle", "PermissionRequest");
+        actions.close(musician);
+
+        let (status, v) = send(port, &token, musician, "接着干");
+        assert_eq!(status, 410, "{v}");
+        assert_eq!(v["error"]["code"], "paneGone");
+        assert!(actions.sends.lock().is_empty());
+    }
+
+    /// 任务编号：`t1` 起、**每编排者各自**单调递增，账本里不留正文。
+    #[test]
+    fn 任务编号每编排者单调递增() {
+        let (plane, _host, _actions, port, token) = granted();
+        let a = start_musician(port, &token);
+        let b = start_musician(port, &token);
+
+        assert_eq!(task_id(send(port, &token, a, "干活")), "t1");
+        assert_eq!(task_id(send(port, &token, b, "干活")), "t2");
+        assert_eq!(task_id(send(port, &token, a, "再干一件")), "t3");
+
+        let tasks = plane.tasks_of(7);
+        assert_eq!(tasks.len(), 3);
+        assert_eq!(
+            tasks.iter().map(|t| t.target_pane_id).collect::<Vec<_>>(),
+            vec![a, b, a],
+            "账本按派活先后排，且记着派给了谁"
+        );
+        assert!(tasks.iter().all(|t| t.orchestrator_pane_id == 7));
+        // ⚠️ 账本里**没有正文**（ADR 0002 的防线延伸到编排者写的 prompt）
+        assert!(
+            !format!("{tasks:?}").contains("干活"),
+            "任务账本不许留正文: {tasks:?}"
+        );
+
+        // 另一个编排者各数各的
+        let other = plane.grant(9, "p-self");
+        let payload = format!(r#"{{"token":"{other}","paneId":9,"launcherId":"claude"}}"#);
+        let (_s, body) = post(port, "/control/start-session", &payload);
+        let theirs = json(&body)["data"]["pane"]["paneId"].as_u64().unwrap() as u32;
+        let text = serde_json::to_string("干活").unwrap();
+        let payload =
+            format!(r#"{{"token":"{other}","paneId":9,"targetPaneId":{theirs},"text":{text}}}"#);
+        let (status, body) = post(port, "/control/send", &payload);
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(
+            json(&body)["data"]["sent"]["taskId"],
+            "t1",
+            "编号不是全局的"
+        );
+    }
+
+    /// 编排者重新授予（PTY 重开 = 新身份）之后任务从 `t1` 重数，前世的账一并清掉。
+    ///
+    /// 让新身份看见 `t37` 只会让它以为自己派过 36 次活 —— 与「前世的乐手不被
+    /// 今生认领」（MVP 不做收养）是同一条处置。
+    #[test]
+    fn 重新授予后任务编号重数() {
+        let (plane, _host, _actions, port, token) = granted();
+        let m = start_musician(port, &token);
+        assert_eq!(task_id(send(port, &token, m, "干活")), "t1");
+        assert_eq!(plane.tasks_of(7).len(), 1);
+
+        let token2 = plane.grant(7, "p-self");
+        assert!(plane.tasks_of(7).is_empty(), "前世的任务不许留给今生");
+        let m2 = start_musician(port, &token2);
+        assert_eq!(task_id(send(port, &token2, m2, "干活")), "t1");
+    }
+
+    /// 乐手被关掉时它的任务**照留**（工单 12 要拿它们做「已关闭」那条汇报的
+    /// 任务清单），编排者离场才一并清掉。
+    #[test]
+    fn 乐手关掉任务照留_编排者离场才清() {
+        let (plane, _host, actions, port, token) = granted();
+        let m = start_musician(port, &token);
+        assert_eq!(task_id(send(port, &token, m, "干活")), "t1");
+
+        actions.close(m);
+        plane.revoke_pane(m);
+        assert_eq!(
+            plane.unreported_task_ids(m),
+            vec!["t1".to_string()],
+            "乐手关了，它身上那条活还得能被「已关闭」那条汇报引到"
+        );
+
+        plane.revoke_pane(7);
+        assert!(plane.tasks_of(7).is_empty(), "编排者离场，整本账丢掉");
+        assert!(plane.unreported_task_ids(m).is_empty());
+    }
+
+    /// 「尚未汇报」的清单按乐手取，**取一次即收敛**（与 monitor 那条「结论落盘、
+    /// 不许每轮重算」同一条铁律：重复投递会让编排者以为同一批活派了两遍）。
+    #[test]
+    fn 尚未汇报的任务按乐手取且取一次即收敛() {
+        let (plane, _host, _actions, port, token) = granted();
+        let a = start_musician(port, &token);
+        let b = start_musician(port, &token);
+        assert_eq!(task_id(send(port, &token, a, "干活")), "t1");
+        assert_eq!(task_id(send(port, &token, b, "干活")), "t2");
+        assert_eq!(task_id(send(port, &token, a, "再干一件")), "t3");
+
+        assert_eq!(plane.unreported_task_ids(a), vec!["t1", "t3"]);
+        assert_eq!(plane.unreported_task_ids(b), vec!["t2"]);
+        // 只看不取：再问一遍还在
+        assert_eq!(plane.unreported_task_ids(a), vec!["t1", "t3"]);
+
+        assert_eq!(plane.take_unreported_task_ids(a), vec!["t1", "t3"]);
+        assert!(plane.unreported_task_ids(a).is_empty(), "取一次即收敛");
+        assert_eq!(plane.unreported_task_ids(b), vec!["t2"], "别的乐手不受影响");
+
+        // 收敛之后新派的活照样进清单
+        assert_eq!(task_id(send(port, &token, a, "第三件")), "t4");
+        assert_eq!(plane.unreported_task_ids(a), vec!["t4"]);
+    }
+
+    /// 任务账本有上限，超出时**从最旧的丢起**，号码不回收。
+    ///
+    /// 不走 HTTP：这里要的是 200 条以上的规模，而账本本身与鉴权、桌面端都无关。
+    #[test]
+    fn 任务账本超上限丢最旧的() {
+        let plane = ControlPlane::new();
+        for _ in 0..MAX_TASKS_PER_ORCHESTRATOR + 5 {
+            plane.note_task_written(7, 101, "ai-idle");
+        }
+        let tasks = plane.tasks_of(7);
+        assert_eq!(tasks.len(), MAX_TASKS_PER_ORCHESTRATOR);
+        assert_eq!(tasks[0].id, "t6", "丢的是最旧的那几条");
+        assert_eq!(
+            tasks.last().unwrap().id,
+            format!("t{}", MAX_TASKS_PER_ORCHESTRATOR + 5),
+            "号码不回收 —— 回收会让同一次授予里出现两条同号任务"
+        );
+    }
+
+    /// 写穿失败**不消耗任务编号**：没写进去就没有这次派活，编号里不许留洞。
+    #[test]
+    fn 写穿失败不消耗任务编号() {
+        let (plane, _host, actions, port, token) = granted();
+        let m = start_musician(port, &token);
+
+        *actions.send_fail.lock() = Some(SendFailure::WriteFailed);
+        let (status, v) = send(port, &token, m, "干活");
+        assert_eq!(status, 500, "{v}");
+        assert!(v["data"]["sent"]["taskId"].is_null(), "失败回执不带编号");
+        assert!(plane.tasks_of(7).is_empty());
+
+        *actions.send_fail.lock() = None;
+        assert_eq!(task_id(send(port, &token, m, "干活")), "t1");
+    }
+
+    /// `targetStatus` 是**写入那一刻**的状态原文，三档各自照实回报。
+    ///
+    /// 它不折成「是不是在排队」的布尔：三档的处置各不相同（见
+    /// [`SentView::target_status`]），由编排者自己判断。
+    #[test]
+    fn 回执带写入那一刻的目标状态() {
+        let (plane, _host, actions, port, token) = granted();
+        let m = start_musician(port, &token);
+
+        for status in ["ai-idle", "ai-working"] {
+            actions.live(m, status);
+            let (got, v) = send(port, &token, m, "干活");
+            assert_eq!(got, 200, "{v}");
+            assert_eq!(v["data"]["sent"]["targetStatus"], status, "{v}");
+        }
+        // agent 已经退了、pane 退回裸 shell 的那一档也照实说
+        actions.agent_exited(m);
+        let (got, v) = send(port, &token, m, "干活");
+        assert_eq!(got, 200, "{v}");
+        assert_eq!(v["data"]["sent"]["targetStatus"], "idle", "{v}");
+
+        // 账本里记的是同一个事实（工单 11 的「未被接收」判定读它）
+        let statuses: Vec<String> = plane
+            .tasks_of(7)
+            .into_iter()
+            .map(|t| t.target_status_at_write)
+            .collect();
+        assert_eq!(statuses, vec!["ai-idle", "ai-working", "idle"]);
+    }
+
+    /// **默认追加**汇报格式尾部：正文之后空一行，尾部在**包裹之内、回车之外**。
+    #[test]
+    fn 派活默认追加汇报格式尾部() {
+        let (plane, _host, actions, port, token) = granted();
+        assert!(
+            plane.report_footer_enabled(),
+            "缺省开着 —— 配置里那个 None 就是这一档"
+        );
+        let musician = start_musician(port, &token);
+        assert_eq!(send(port, &token, musician, "跑一下测试").0, 200);
+
+        // 文案本体不在这里断言（它住在字典里，改一个字不该红一条测试）——
+        // 钉的是它**在不在、在哪儿**。
+        let footer = mt_i18n::t("orchestrator", "reportFooter");
+        let calls = actions.sends.lock().clone();
+        assert_eq!(
+            calls[0].bracketed,
+            format!("\x1b[200~跑一下测试\r\r{footer}\x1b[201~\r")
+        );
+        assert_eq!(calls[0].plain, format!("跑一下测试\r\r{footer}\r"));
+        // 回车仍在结束标记之后（包在里头只是往编辑框插一个换行，送不出去）
+        assert!(calls[0].bracketed.ends_with("\x1b[201~\r"));
+        // 裸 `\n` 一个都不许进 PTY（那头把它当「换行但不回车」）
+        assert!(!calls[0].bracketed.contains('\n'));
+        // 结束标记还是只有装配加上的那一个
+        assert_eq!(calls[0].bracketed.matches("\x1b[201~").count(), 1);
+    }
+
+    /// 关掉之后**一个字都不追加** —— 与工单 05 那一版逐字节相同。
+    #[test]
+    fn 关掉尾部后一个字都不追加() {
+        let (plane, _host, actions, port, token) = granted();
+        plane.set_report_footer(false);
+        let musician = start_musician(port, &token);
+        assert_eq!(send(port, &token, musician, "跑一下测试").0, 200);
+
+        let bare = PaneInput::assemble("跑一下测试").unwrap();
+        let calls = actions.sends.lock().clone();
+        assert_eq!(calls[0].bracketed, bare.bracketed());
+        assert_eq!(calls[0].plain, bare.plain());
+
+        // 开关是**立刻生效**的（原子量，不等落盘防抖）
+        plane.set_report_footer(true);
+        actions.sends.lock().clear();
+        assert_eq!(send(port, &token, musician, "跑一下测试").0, 200);
+        assert!(
+            actions.sends.lock()[0]
+                .plain
+                .contains(mt_i18n::t("orchestrator", "reportFooter"))
+        );
+    }
+
+    /// 尾部**不参与**空正文判定：空 prompt 加上尾部照样被拒。
+    ///
+    /// 反过来的话「裸回车即代答」那条裁决就被我们自己加的字绕过去了 ——
+    /// 编排者发一个空 `send`，对面收到的会是一段格式要求外加一个回车。
+    #[test]
+    fn 尾部不许把空正文救活() {
+        let (plane, _host, actions, port, token) = granted();
+        assert!(plane.report_footer_enabled());
+        let musician = start_musician(port, &token);
+        actions.sends.lock().clear();
+
+        for text in ["", "   ", "\n\n", " \t "] {
+            let (status, v) = send(port, &token, musician, text);
+            assert_eq!(status, 400, "text={text:?}: {v}");
+            assert_eq!(v["error"]["code"], "emptyInput", "text={text:?}");
+        }
+        assert!(actions.sends.lock().is_empty());
+    }
+
+    /// [`PaneInput::assemble_with_footer`] 的口径，不经 HTTP。
+    #[test]
+    fn 尾部装配的口径() {
+        // 正文与尾部之间空一行（挨着写会被读成正文最后一句的续写）
+        let input = PaneInput::assemble_with_footer("正文", Some("尾部")).unwrap();
+        assert_eq!(input.plain(), "正文\r\r尾部\r");
+        assert_eq!(input.bracketed(), "\x1b[200~正文\r\r尾部\x1b[201~\r");
+
+        // 尾部照样过一遍归一：换行 → `\r`，结束标记剔掉
+        let input = PaneInput::assemble_with_footer("正文", Some("上\n下\x1b[201~")).unwrap();
+        assert_eq!(input.plain(), "正文\r\r上\r下\r");
+
+        // 没有尾部时与 `assemble` 一字不差
+        assert_eq!(
+            PaneInput::assemble_with_footer("正文", None),
+            PaneInput::assemble("正文")
+        );
+        // 尾部全是空白时当没有 —— 别在 prompt 后面挂两个空行了事
+        assert_eq!(
+            PaneInput::assemble_with_footer("正文", Some("   ")),
+            PaneInput::assemble("正文")
+        );
+        // 空正文 + 尾部仍然是 None
+        assert!(PaneInput::assemble_with_footer("  \n ", Some("尾部")).is_none());
+
+        // 正文一个字都不许出现在 Debug 里（它会进日志 / panic 消息）
+        let input = PaneInput::assemble_with_footer("密钥", Some("尾部")).unwrap();
+        assert!(!format!("{input:?}").contains("密钥"));
     }
 
     // ─── wait：四类终态与超时（工单 06）────────────────────────

@@ -155,6 +155,8 @@ export const settings = {
       orchestrationTitle: "编排",
       sessionCapTitle: "受编排会话并发上限",
       sessionCapDesc: "一个编排者同时最多能有几个受编排会话在跑（0~20）。0 = 暂停新的受编排会话；调低不会关掉已经在跑的，只影响之后的启动请求",
+      reportFooterTitle: "派活时追加汇报格式要求",
+      reportFooterDesc: "编排者每次派活时，在 prompt 末尾追加一段固定要求：做完按「结果 / 改动的文件 / 做过的验证 / 未完成或存疑的事」收尾，拿不准的问题用文字提出并结束回合等答复，不要弹交互式提问。关掉后一个字都不追加",
       orchestrationFooter: "编排能力逐条开在 AI 启动器上（「移动端」面板里的「允许编排」）· 控制通道就走上面这个 Hook 服务器，它没启动时编排命令一律连不上 · 超出上限的启动请求会收到明确错误，由编排者自己排队",
     },
     aiNotification: {
@@ -402,6 +404,8 @@ export const settings = {
       orchestrationTitle: "Orchestration",
       sessionCapTitle: "Concurrent orchestrated sessions",
       sessionCapDesc: "How many orchestrated sessions one orchestrator may keep running at the same time (0-20). 0 pauses new orchestrated sessions; lowering it never closes sessions already running, it only applies to later start requests",
+      reportFooterTitle: "Append a reporting format to every prompt",
+      reportFooterDesc: "Adds a fixed instruction to the end of every prompt an orchestrator sends: close with result / files changed / checks you ran / anything unfinished, and raise anything unclear as plain text at the end of the turn instead of an interactive question. Turn this off and nothing is appended",
       orchestrationFooter: "Orchestration is granted per AI launcher (the Allow orchestration switch in the Mobile panel) · The control channel rides the hook server above, so orchestration commands cannot connect while it is stopped · Start requests beyond the limit get an explicit error, leaving the orchestrator to queue them itself",
     },
     aiNotification: {

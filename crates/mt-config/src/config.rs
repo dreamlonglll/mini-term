@@ -206,6 +206,13 @@ pub struct AppConfig {
     /// 存量配置里没有这个键，反序列化即 `None` —— 语义正是「跟默认走」。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestrator_session_cap: Option<u32>,
+    /// 编排者派活时，要不要在 prompt 尾部追加那段固定的汇报格式要求
+    /// （ADR 0004 / 工单 10）。`None` = 开着（默认行为）。
+    ///
+    /// 文案本体不在配置里：它是 `mt-i18n` 的 `orchestrator.reportFooter`，
+    /// 随界面语言走。这里只有一个「追不追加」的开关，关掉之后一个字都不追加。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestrator_report_footer: Option<bool>,
     #[serde(default)]
     pub ssh_connections: Vec<SshConnection>,
     /// 显式创建的 SSH 分组名（允许空分组存在）。连接上的 group 字段仍是归属的
@@ -638,6 +645,7 @@ impl Default for AppConfig {
             terminal_animations: None,
             ai_auto_resume: None,
             orchestrator_session_cap: None,
+            orchestrator_report_footer: None,
             ssh_connections: vec![],
             ssh_groups: vec![],
             mobile_relay: None,
@@ -2026,6 +2034,55 @@ mod tests {
                 .orchestrator_session_cap,
             Some(0),
             "0 与 None 是两个意思,序列化不许把它们抹平"
+        );
+    }
+
+    /// 派活时追加的汇报格式要求开关(工单 10):存量配置缺这个键 → `None`
+    /// (= 跟默认走,也就是**开着**),用户设过之后往返保真。
+    ///
+    /// 与上面那条上限同一个套路,连坑也同一个:漏掉 `serde(default)` 会让老
+    /// `config.db` 整份解析失败,连带项目列表一起丢。
+    #[test]
+    fn orchestrator_report_footer_defaults_none_and_round_trips() {
+        let legacy = AppConfig::default();
+        assert_eq!(
+            legacy.orchestrator_report_footer, None,
+            "缺字段必须解析成 None —— 那是「跟默认走」(开着),不是 false"
+        );
+        let json = serde_json::to_string(&legacy).unwrap();
+        assert!(
+            !json.contains("orchestratorReportFooter"),
+            "没设过就不该落这个键: {json}"
+        );
+
+        // 关掉这一档是**用户的显式选择**,必须落键 —— 不然重启又变回开着
+        let off = AppConfig {
+            orchestrator_report_footer: Some(false),
+            ..AppConfig::default()
+        };
+        let json = serde_json::to_string(&off).unwrap();
+        assert!(
+            json.contains(r#""orchestratorReportFooter":false"#),
+            "{json}"
+        );
+        assert_eq!(
+            serde_json::from_str::<AppConfig>(&json)
+                .unwrap()
+                .orchestrator_report_footer,
+            Some(false),
+            "false 与 None 是两个意思,序列化不许把它们抹平"
+        );
+
+        let on = AppConfig {
+            orchestrator_report_footer: Some(true),
+            ..AppConfig::default()
+        };
+        let json = serde_json::to_string(&on).unwrap();
+        assert_eq!(
+            serde_json::from_str::<AppConfig>(&json)
+                .unwrap()
+                .orchestrator_report_footer,
+            Some(true)
         );
     }
 

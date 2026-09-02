@@ -552,6 +552,8 @@ const USED_KEYS: &[&str] = &[
     "settings.aiHook.orchestrationTitle",
     "settings.aiHook.register",
     "settings.aiHook.registering",
+    "settings.aiHook.reportFooterDesc",
+    "settings.aiHook.reportFooterTitle",
     "settings.aiHook.serverDesc",
     "settings.aiHook.serverLabel",
     "settings.aiHook.serverRunning",
