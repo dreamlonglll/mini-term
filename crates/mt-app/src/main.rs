@@ -2079,6 +2079,13 @@ fn main() {
         cx.background_executor()
             .spawn(async { mt_core::cleanup_ssh_temp_keys() })
             .detach();
+        // Codex 的 feature 键改名(codex_hooks -> hooks)后,存量用户那份 config.toml
+        // 只有重点一次「注册」才会被改写 —— 而面板判「已注册」只看 hooks.json,
+        // 界面上没有任何线索提示他去点。故启动时按注册现状自愈一次(键已经是新名字
+        // 就不落盘)。同样丢后台:它要读写用户主目录下的文件。
+        cx.background_executor()
+            .spawn(async { mt_ai::hook_registry::sync_codex_hooks_feature_if_registered() })
+            .detach();
         // 真正的主题在 store 装好之后按 config 装配(`apply_theme_from_config`):
         // 亮/暗/auto + 外置主题包 + 终端配色一次算全。这里先钉一个暗色兜底,
         // 免得从 init 到装配之间有一帧走 gpui-component 的默认亮色。

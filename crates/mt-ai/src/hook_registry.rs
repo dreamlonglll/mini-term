@@ -441,7 +441,11 @@ fn enable_codex_hooks_feature(content: &str) -> Result<String, String> {
 }
 
 /// 确保 Codex config.toml 中启用了当前 hooks feature flag。
-fn ensure_codex_hooks_feature() -> Result<(), String> {
+///
+/// 返回是否真的落盘：键已经是现行名字时原样返回，一个字节都不写。启动期自愈
+/// （`sync_codex_hooks_feature_if_registered`）走的就是这条路，不能每次启动都
+/// 重写一遍用户的 config.toml。
+fn ensure_codex_hooks_feature() -> Result<bool, String> {
     let config_path = codex_config_path().ok_or_else(|| "无法获取 home 目录".to_string())?;
 
     if let Some(parent) = config_path.parent() {
@@ -455,11 +459,31 @@ fn ensure_codex_hooks_feature() -> Result<(), String> {
         String::new()
     };
     let updated = enable_codex_hooks_feature(&content)?;
+    if updated == content {
+        return Ok(false);
+    }
 
     crate::util::atomic_write(&config_path, updated.as_bytes())
         .map_err(|e| format!("写入 config.toml 失败: {}", e))?;
 
-    Ok(())
+    Ok(true)
+}
+
+/// 已注册用户的启动期自愈：把 config.toml 里的 feature 键迁到当前名字。
+///
+/// config.toml 只有点「注册」时才写，而面板判「已注册」只看 hooks.json——存量
+/// 用户升级 mini-term 后面板照旧显示已注册，config.toml 里却还留着废弃的
+/// `codex_hooks`，每次开 codex 都吃一条弃用告警（issue #72），且界面上没有任何
+/// 线索提示他该去重点一次注册。故只要 hooks.json 里有我们的条目就迁一次。
+pub fn sync_codex_hooks_feature_if_registered() {
+    if registered_codex_events().is_empty() {
+        return;
+    }
+    match ensure_codex_hooks_feature() {
+        Ok(true) => eprintln!("[hook-registry] codex config.toml 已迁至 features.hooks"),
+        Ok(false) => {}
+        Err(e) => eprintln!("[hook-registry] codex feature 迁移失败: {}", e),
+    }
 }
 
 /// 注册 Codex hooks 到 ~/.codex/hooks.json
@@ -1273,12 +1297,22 @@ mod tests {
         assert!(updated.contains("# 用户注释"));
     }
 
+    /// 键已经是现行名字时必须原样返回——`ensure_codex_hooks_feature` 拿这个
+    /// 相等判断决定写不写盘，启动期自愈全靠它才不会每次启动重写用户配置。
+    #[test]
+    fn codex_feature_config_is_noop_when_already_current() {
+        let current = "# 用户注释\n[features]\nhooks = true\nweb_search = true\n";
+        assert_eq!(
+            enable_codex_hooks_feature(current).expect("现行配置应可解析"),
+            current
+        );
+    }
+
     #[test]
     fn codex_feature_config_accepts_inline_features_table() {
-        let updated = enable_codex_hooks_feature(
-            "features = { codex_hooks = true, web_search = true }\n",
-        )
-        .expect("应迁移内联 features 表");
+        let updated =
+            enable_codex_hooks_feature("features = { codex_hooks = true, web_search = true }\n")
+                .expect("应迁移内联 features 表");
         let doc = updated
             .parse::<toml_edit::DocumentMut>()
             .expect("迁移结果应是合法 TOML");
