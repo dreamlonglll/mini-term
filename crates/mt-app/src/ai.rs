@@ -70,6 +70,11 @@ impl AiBridge {
         let orchestrator_mirror: crate::orchestrator::SharedMirror = Arc::new(Mutex::new(
             crate::orchestrator::OrchestratorMirror::default(),
         ));
+        // 汇报文件的兜底落点(ADR 0004 / 工单 14):编排者所在项目的路径查不到时,
+        // 汇报退到 `{data_dir}/orchestrator-reports/`。`mt-ai` 自己定位不出这个
+        // 目录 —— 它是 `mt_config` 的口径(含 `MT_APP_DATA_DIR` 覆盖),抄一份就是
+        // 两处走散。
+        perception.control().set_data_dir(data_dir.clone());
         perception
             .control()
             .set_host(Arc::new(crate::orchestrator::HostImpl::new(

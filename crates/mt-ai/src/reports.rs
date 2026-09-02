@@ -1,21 +1,35 @@
-//! 汇报账本（ADR 0004）：把受编排会话的状态事实折成「汇报」，按编排者攒收件箱。
+//! 汇报账本（ADR 0004）：把受编排会话的状态事实折成「汇报」，按编排者攒两道队。
 //!
 //! # 为什么它是一块**纯**状态机
 //!
-//! 投递那一侧（工单 12）做的事全是有副作用的：查编排者的投递闸、读 transcript、
-//! 跳主线程写字节、按秒级节拍重试。要是把「什么时候该出一条汇报」也塞进去，这
-//! 段判定就只能在一条后台线程 + 真实时钟上验证——而它恰恰是最该逐条钉死的一块：
-//! 一次误报等于编排者拿着假事实继续派活，一次漏报等于它永远等不到回音。
+//! 落盘那一侧（工单 14）做的事全是有副作用的：读 transcript、跳主线程读画面、
+//! 往项目目录里写文件、按秒级节拍重来。要是把「什么时候该出一条汇报」也塞进去，
+//! 这段判定就只能在一条后台线程 + 真实时钟上验证——而它恰恰是最该逐条钉死的
+//! 一块：一次误报等于编排者拿着假事实继续派活，一次漏报等于它永远等不到回音。
 //!
 //! 于是这里 **不认识 [`crate::control::ControlPlane`]、不起线程、不做 I/O、一次
 //! `Instant::now()` 都不调**——时间一律由调用方传进来，15 秒的未接收超时在测试里
-//! 拨一行就过去了。整张票交付时没有任何调用方，全部价值在本文件末尾的单测里。
+//! 拨一行就过去了。它连汇报文件长什么样、落在哪都不知道：路径是调用方渲染完
+//! 之后**存回来**的一个字符串（[`ReadyReport::file`]）。
 //!
 //! # 三种事实进，五种汇报出
 //!
 //! 进来的事实只有三样：受编排会话的**状态变化**（`status` + `cause`，与
 //! [`crate::monitor::StatusChange`] 同一口径）、**pane 关闭**、**派活写入**。
-//! 出去的是 [`ReportKind`] 那五档，按编排者攒进各自的收件箱等 12 来取。
+//! 出去的是 [`ReportKind`] 那五档。
+//!
+//! # 两道队：待落盘 → 待取走（工单 14）
+//!
+//! 汇报的生产在桌面主线程上（`observe_*`），而渲染要读会话记录文件、写盘要
+//! 碰磁盘——两件事不能在同一条线程上做完。于是每个编排者名下有**两道队**：
+//!
+//! 1. [`Self::push`] 把新汇报放进 **staged**（已产出、还没落成文件）；
+//! 2. 常驻线程 [`Self::take_staged`] 取空、渲染、写文件，再
+//!    [`Self::deposit`] 一条带文件路径的 [`ReadyReport`] 进 **inbox**；
+//! 3. 编排者的 `wait` 从 inbox [`Self::take_batch`]（取一次即收敛）。
+//!
+//! 两道队共用一个 [`INBOX_CAP`] 与一个 `dropped` 计数：编排者关心的只有
+//! 「我永远看不到的有几条」，它是攒在哪一段丢的无关紧要。
 //!
 //! # 判定口径全部沿用既有状态机，一条新启发式都不加
 //!
@@ -52,14 +66,14 @@ use crate::hook_server::is_attention_cause;
 /// 阻塞在自己那一轮的末尾等汇报，超过半分钟就该给它一个明确的说法。
 const ACK_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// 单个编排者收件箱里最多攒几条汇报。
+/// 单个编排者的每道队里最多攒几条汇报（待落盘的与待取走的各自算）。
 ///
-/// 溢出丢**最旧**的并累加 `dropped`，取批次时把丢弃条数一并交出去（12 在渲染的
-/// 批头里注明「丢了几条」）。丢新的不行：最新那几条才是编排者最需要的现状。
+/// 溢出丢**最旧**的并累加 `dropped`，取批次时把丢弃条数一并交出去（`wait` 的
+/// 回执里带着它）。丢新的不行：最新那几条才是编排者最需要的现状。
 ///
-/// 50 条的量级：编排者忙着跑自己那一轮（`ai-working`）时汇报只攒不投，而一个
+/// 50 条的量级：编排者可以很久不 `wait`（ADR 0004 允许它先去干别的），而一个
 /// 编排者名下的受编排会话数本就有硬上限（`MAX_SESSIONS_PER_ORCHESTRATOR`），
-/// 每个乐手一轮最多贡献几条，50 条足够覆盖「编排者忙了一整轮」这段窗口。
+/// 每个受编排会话一轮最多贡献几条，50 条足够覆盖「它埋头干了一整轮」这段窗口。
 const INBOX_CAP: usize = 50;
 
 /// 单个受编排会话「尚未随汇报带走」的任务编号上限。
@@ -86,7 +100,7 @@ fn is_ai_status(status: &str) -> bool {
 ///
 /// 五档穷尽 CONTEXT.md「汇报」词条列的种类：回合已结束 / 停下等人处理 / 已退出 /
 /// 已被关闭 / 任务未被接收。**这里不渲染一个字**——正文（transcript 增量、画面
-/// 尾部、文案）全是工单 12 的事，本模块只负责「什么时候、就哪件事」。
+/// 尾部、文案）全是渲染那一侧（工单 14）的事，本模块只负责「什么时候、就哪件事」。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReportKind {
     /// 一个回合结束了。`cause` 是成因原文（`Stop` / `Interrupt` / `Stall` …，
@@ -110,6 +124,35 @@ pub enum ReportKind {
     NotAccepted { task_id: String },
 }
 
+impl ReportKind {
+    /// 对外那个短名：**同时是汇报文件名的后半段与 `wait` 回执里的 `kind`**
+    /// （`0007-turn-ended.md`）。
+    ///
+    /// 刻意是 ASCII 小写连字符、**不进字典**：编排者要拿它做分支判断，翻译它
+    /// 就等于让它在两种显示语言下认两套名字。文件正文里的说明句照旧走 i18n。
+    pub fn slug(&self) -> &'static str {
+        match self {
+            Self::TurnEnded { .. } => "turn-ended",
+            Self::AwaitingHuman { .. } => "awaiting-human",
+            Self::Exited { .. } => "exited",
+            Self::Closed => "closed",
+            Self::NotAccepted { .. } => "not-accepted",
+        }
+    }
+
+    /// 成因原文（hook 事件名），没有就是 `None`。
+    ///
+    /// [`Self::Closed`] 没有成因可言（pane 都不在了）；[`Self::NotAccepted`]
+    /// 也没有——它是本地超时判出来的，不对应任何事件。
+    pub fn cause(&self) -> Option<&str> {
+        match self {
+            Self::TurnEnded { cause, .. } | Self::Exited { cause } => cause.as_deref(),
+            Self::AwaitingHuman { cause } => Some(cause),
+            Self::Closed | Self::NotAccepted { .. } => None,
+        }
+    }
+}
+
 /// 一条汇报。
 ///
 /// `task_ids` 是「此前写入且尚未汇报过」的任务编号清单——只有终结性的三档
@@ -128,13 +171,35 @@ pub struct Report {
     pub at: Instant,
 }
 
+/// 一条**已经落成文件**、等编排者用 `wait` 来取的汇报（工单 14）。
+///
+/// 与 [`Report`] 的分工：那一份是状态机的产出（「什么时候、就哪件事」），
+/// 这一份是它渲染落盘之后的样子——多了文件路径与一个人读得懂的时刻，
+/// 少了收件人（它已经躺在那个编排者的收件箱里了）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadyReport {
+    /// 主角：受编排会话的 pane 身份。
+    pub session_pane_id: u32,
+    pub kind: ReportKind,
+    /// 这条汇报覆盖的任务编号。
+    ///
+    /// 与 [`Report::task_ids`] 不完全相同：[`ReportKind::NotAccepted`] 那一档
+    /// 由渲染侧把 kind 里那个编号填进来（账本不带走它——回合还没完）。
+    pub task_ids: Vec<String>,
+    /// 汇报文件的**绝对路径**，原样交给编排者的 Read 工具（Windows 反斜杠照旧）。
+    pub file: String,
+    /// 落盘时刻，RFC3339 本地时间。**不是** [`Report::at`] 那个 `Instant`——
+    /// 账本不认识挂钟，这个字符串由渲染侧现取（两者相差一拍以内）。
+    pub at: String,
+}
+
 /// 一次取空的结果。
 ///
-/// `dropped` 是**上一次取空之后**因收件箱溢出丢掉的条数，取走即归零——12 在批头
-/// 里说明「另有 N 条汇报因积压被丢弃」，编排者据此知道自己看到的不是全部。
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `dropped` 是**上一次取空之后**因两道队溢出（或写文件失败）而永远看不到的
+/// 条数，取走即归零——`wait` 的回执里带着它，编排者据此知道自己看到的不是全部。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReportBatch {
-    pub reports: Vec<Report>,
+    pub reports: Vec<ReadyReport>,
     pub dropped: usize,
 }
 
@@ -161,7 +226,7 @@ struct SessionTrack {
     pending_task_ids: VecDeque<String>,
     /// 写入之后还没见对方开始处理的派活。
     awaiting_ack: Vec<PendingAck>,
-    /// 已汇报到 transcript 的第几条消息（12 渲染完增量后回写）。
+    /// 已汇报到 transcript 的第几条消息（14 渲染完增量后回写）。
     reported_cursor: usize,
 }
 
@@ -184,24 +249,34 @@ impl SessionTrack {
     }
 }
 
-/// 一个编排者的收件箱。
+/// 一个编排者的两道队 + 那个「你永远看不到几条」的计数。
 #[derive(Debug, Default)]
 struct Inbox {
-    reports: VecDeque<Report>,
+    /// 已产出、还没渲染落盘的（常驻线程每拍取空）。
+    staged: VecDeque<Report>,
+    /// 已落成文件、还没被 `wait` 取走的。
+    ready: VecDeque<ReadyReport>,
     dropped: usize,
+}
+
+impl Inbox {
+    fn is_empty(&self) -> bool {
+        self.staged.is_empty() && self.ready.is_empty() && self.dropped == 0
+    }
 }
 
 /// 汇报账本本体。
 ///
-/// 12 把它锁在 `ControlPlane` 里，喂三种事实、按节拍取批次。所有方法都是 `&mut
-/// self` 的同步调用，**没有内部可变性、没有后台线程**——并发编排全在调用方。
+/// 14 把它锁在 `ControlPlane` 里，喂三种事实、按节拍取待落盘的那一队、
+/// 把落好盘的存回来。所有方法都是 `&mut self` 的同步调用，**没有内部可变性、
+/// 没有后台线程**——并发编排全在调用方。
 #[derive(Debug, Default)]
 pub struct ReportLedger {
     /// 受编排会话 pane → 追踪状态。**不在这张表里的 pane 一律忽略**：编排者
-    /// 自己的状态变化也会打进 `observe_status`（12 那边一条事件流喂过来），
+    /// 自己的状态变化也会打进 `observe_status`（14 那边一条事件流喂过来），
     /// 必须在这里被过滤掉，否则编排者自己的回合会给自己发汇报。
     sessions: HashMap<u32, SessionTrack>,
-    /// 编排者 pane → 收件箱。惰性建立，取空即销毁。
+    /// 编排者 pane → 它的两道队。惰性建立，两队皆空且没有待报的丢弃数时销毁。
     inboxes: HashMap<u32, Inbox>,
 }
 
@@ -210,12 +285,12 @@ impl ReportLedger {
         Self::default()
     }
 
-    // ─── 记账表同步（12 从 `TokenRegistry::sessions` 镜像过来）───────────
+    // ─── 记账表同步（14 从 `TokenRegistry::sessions` 镜像过来）───────────
 
     /// 登记一个受编排会话属于哪个编排者。
     ///
     /// **幂等**：已在表里的 pane 原样保留（PTY 编号单调递增、不复用，重复登记只
-    /// 会是 12 那边的同步抖动；清掉进行中的回合与待汇报任务反而是丢事实）。
+    /// 会是 14 那边的同步抖动；清掉进行中的回合与待汇报任务反而是丢事实）。
     pub fn register_session(&mut self, session_pane_id: u32, orchestrator_pane_id: u32) {
         self.sessions
             .entry(session_pane_id)
@@ -230,8 +305,8 @@ impl ReportLedger {
 
     // ─── 事实进 ────────────────────────────────────────────────────
 
-    /// 吃一次受编排会话的状态变化。返回**本次是否产生了新汇报**（12 据此决定
-    /// 要不要唤醒投递泵，省一次回头查收件箱的锁）。
+    /// 吃一次受编排会话的状态变化。返回**本次是否产生了新汇报**（14 据此决定
+    /// 要不要唤醒那条常驻线程，省一次回头查队列的锁）。
     ///
     /// `status` / `cause` 与 [`crate::monitor::StatusChange`] 同字段同口径。
     pub fn observe_status(
@@ -304,7 +379,7 @@ impl ReportLedger {
                 // 从没进过 AI 会话的 pane 也不报。
                 if track.last_status.as_deref().is_some_and(is_ai_status) {
                     // 进行中的回合随之作废，**不另出 TurnEnded**：退出那条汇报把
-                    // 回合期间的东西一并带走（12 用 `reported_cursor` 取增量）。
+                    // 回合期间的东西一并带走（14 用 `reported_cursor` 取增量）。
                     track.turn_started_at = None;
                     track.awaiting_ack.clear();
                     let task_ids = track.take_task_ids();
@@ -415,70 +490,109 @@ impl ReportLedger {
         produced_any
     }
 
-    // ─── 收件箱出 ──────────────────────────────────────────────────
+    // ─── 待落盘那一队（常驻线程用）──────────────────────────────────
 
-    /// 这个编排者有积压吗。
-    pub fn has_pending(&self, orchestrator_pane_id: u32) -> bool {
-        self.inboxes
-            .get(&orchestrator_pane_id)
-            .is_some_and(|inbox| !inbox.reports.is_empty())
-    }
-
-    /// 此刻有积压的全部编排者（顺序不保证）。投递泵每拍照着它扫一遍。
+    /// 此刻有待落盘汇报的全部编排者（顺序不保证）。常驻线程每拍照着它扫一遍。
     pub fn pending_orchestrators(&self) -> Vec<u32> {
         self.inboxes
             .iter()
-            .filter(|(_, inbox)| !inbox.reports.is_empty())
+            .filter(|(_, inbox)| !inbox.staged.is_empty())
             .map(|(&id, _)| id)
             .collect()
     }
 
-    /// 一次取空。没有积压时答 `None`。
+    /// 取空「待落盘」那一队。渲染与写盘一律在**放锁之后**做（调用方的纪律）。
+    pub fn take_staged(&mut self, orchestrator_pane_id: u32) -> Vec<Report> {
+        let Some(inbox) = self.inboxes.get_mut(&orchestrator_pane_id) else {
+            return Vec::new();
+        };
+        let staged: Vec<Report> = inbox.staged.drain(..).collect();
+        self.prune(orchestrator_pane_id);
+        staged
+    }
+
+    /// 存回一条**已经落成文件**的汇报，等编排者来取。
+    pub fn deposit(&mut self, orchestrator_pane_id: u32, report: ReadyReport) {
+        let inbox = self.inboxes.entry(orchestrator_pane_id).or_default();
+        if inbox.ready.len() >= INBOX_CAP {
+            inbox.ready.pop_front();
+            inbox.dropped += 1;
+        }
+        inbox.ready.push_back(report);
+    }
+
+    /// 记 `n` 条「编排者永远看不到了」（写文件失败那一档）。
+    ///
+    /// 静默丢弃是不行的：`dropped` 是编排者判断「我看到的是不是全部」的唯一
+    /// 依据，而写盘失败恰恰是最该让它知道的一种丢法。
+    pub fn note_dropped(&mut self, orchestrator_pane_id: u32, n: usize) {
+        if n == 0 {
+            return;
+        }
+        self.inboxes.entry(orchestrator_pane_id).or_default().dropped += n;
+    }
+
+    // ─── 待取走那一队（`wait` 用）───────────────────────────────────
+
+    /// 一次取空。没有待取走的汇报时答 `None`（此时 `dropped` 原地留着，
+    /// 等下一条汇报到了一并交出去——空手回一个「丢了 3 条」帮不上忙）。
     pub fn take_batch(&mut self, orchestrator_pane_id: u32) -> Option<ReportBatch> {
+        self.take_matching(orchestrator_pane_id, |_| true)
+    }
+
+    /// 只取某一个受编排会话的那些（`wait --pane N`）。顺序保持不变，
+    /// 别人的那些留在队里等它自己来取。
+    pub fn take_batch_from(
+        &mut self,
+        orchestrator_pane_id: u32,
+        session_pane_id: u32,
+    ) -> Option<ReportBatch> {
+        self.take_matching(orchestrator_pane_id, |r| r.session_pane_id == session_pane_id)
+    }
+
+    fn take_matching(
+        &mut self,
+        orchestrator_pane_id: u32,
+        keep: impl Fn(&ReadyReport) -> bool,
+    ) -> Option<ReportBatch> {
         let inbox = self.inboxes.get_mut(&orchestrator_pane_id)?;
-        if inbox.reports.is_empty() {
+        let mut reports = Vec::new();
+        let mut left = VecDeque::new();
+        for report in inbox.ready.drain(..) {
+            if keep(&report) {
+                reports.push(report);
+            } else {
+                left.push_back(report);
+            }
+        }
+        inbox.ready = left;
+        if reports.is_empty() {
             return None;
         }
-        let reports: Vec<Report> = inbox.reports.drain(..).collect();
+        // `dropped` 是**整个编排者**的计数，不按受编排会话分——它说的是
+        // 「有几条你永远看不到了」，而丢的时候那条汇报连主角是谁都没留下。
         let dropped = std::mem::take(&mut inbox.dropped);
-        self.inboxes.remove(&orchestrator_pane_id);
+        self.prune(orchestrator_pane_id);
         Some(ReportBatch { reports, dropped })
     }
 
-    /// 把取走的一批**放回队首**（12 的投递遇上 `desktopBusy` / 写失败时下一拍再试）。
-    ///
-    /// 放回的这批比期间新到的更旧，所以进队首；连带 `dropped` 一起还回去，
-    /// 免得「投递失败」把「有几条被丢过」这件事洗掉。放回后仍受 [`INBOX_CAP`]
-    /// 约束——溢出照旧丢最旧的，也就是放回的这批里最靠前的那几条。
-    pub fn requeue_batch(&mut self, orchestrator_pane_id: u32, batch: ReportBatch) {
-        if batch.reports.is_empty() && batch.dropped == 0 {
-            return;
-        }
-        let inbox = self.inboxes.entry(orchestrator_pane_id).or_default();
-        inbox.dropped += batch.dropped;
-        for report in batch.reports.into_iter().rev() {
-            inbox.reports.push_front(report);
-        }
-        while inbox.reports.len() > INBOX_CAP {
-            inbox.reports.pop_front();
-            inbox.dropped += 1;
-        }
-    }
-
-    /// 丢掉一个编排者的收件箱（它 pane 关了 / 令牌撤销 / 离场）。
+    /// 丢掉一个编排者的两道队（它 pane 关了 / 令牌撤销 / 离场）。
     ///
     /// **连同它名下受编排会话的追踪一起忘掉**——ADR 0004 的「编排者关闭后暂存的
     /// 汇报随之作废」不只是清一次队列：那些乐手还活着（不陪葬，ADR 0003），它们
     /// 后续的每一次 Stop 都还会打进 `observe_status`，收件人却已经没了。留着追踪
     /// 就是留一条只涨不消的队列。忘掉之后它们变回「未注册的 pane」，一切事实一律
-    /// 忽略；万一编排者在同一编号上重新拿到授予，12 会照记账表重新 `register`。
+    /// 忽略；万一编排者在同一编号上重新拿到授予，14 会照记账表重新 `register`。
+    ///
+    /// ⚠️ 已经落盘的那些**文件**不归这里管：删目录是控制面的事
+    /// （`ControlPlane::revoke_pane` / `grant`），账本连路径长什么样都不知道。
     pub fn drop_inbox(&mut self, orchestrator_pane_id: u32) {
         self.inboxes.remove(&orchestrator_pane_id);
         self.sessions
             .retain(|_, track| track.orchestrator_pane_id != orchestrator_pane_id);
     }
 
-    // ─── transcript 汇报游标（12 渲染完增量后回写）─────────────────────
+    // ─── transcript 汇报游标（14 渲染完增量后回写）─────────────────────
 
     /// 已经汇报到 transcript 的第几条消息。未登记的 pane 答 `0`
     /// （「什么都还没报过」，与新登记的乐手同一个起点）。
@@ -506,17 +620,29 @@ impl ReportLedger {
         at: Instant,
     ) {
         let inbox = self.inboxes.entry(orchestrator_pane_id).or_default();
-        if inbox.reports.len() >= INBOX_CAP {
-            inbox.reports.pop_front();
+        if inbox.staged.len() >= INBOX_CAP {
+            inbox.staged.pop_front();
             inbox.dropped += 1;
         }
-        inbox.reports.push_back(Report {
+        inbox.staged.push_back(Report {
             orchestrator_pane_id,
             session_pane_id,
             kind,
             task_ids,
             at,
         });
+    }
+
+    /// 两道队都空了、也没有待报的丢弃数就把这个编排者的槽销毁（惰性建立的
+    /// 镜像动作）。**`dropped` 不为零时不许销毁** —— 那是一条还没交出去的事实。
+    fn prune(&mut self, orchestrator_pane_id: u32) {
+        if self
+            .inboxes
+            .get(&orchestrator_pane_id)
+            .is_some_and(Inbox::is_empty)
+        {
+            self.inboxes.remove(&orchestrator_pane_id);
+        }
     }
 }
 
@@ -534,13 +660,32 @@ mod tests {
         (l, Instant::now())
     }
 
-    /// 取空并断言只有一条，返回那一条。
+    /// 取空「待落盘」那一队并断言只有一条，返回那一条。
+    ///
+    /// 状态机的产出就在这一队里——它离「编排者看得到」还差渲染与写盘那一步，
+    /// 而那一步是控制面的事（本模块不做 I/O）。
     fn only(l: &mut ReportLedger, orchestrator: u32) -> Report {
-        let batch = l
-            .take_batch(orchestrator)
-            .expect("收件箱里应当有汇报");
-        assert_eq!(batch.reports.len(), 1, "期望恰好一条: {:?}", batch.reports);
-        batch.reports.into_iter().next().unwrap()
+        let staged = l.take_staged(orchestrator);
+        assert_eq!(staged.len(), 1, "期望恰好一条: {staged:?}");
+        staged.into_iter().next().unwrap()
+    }
+
+    /// 造一条「已经落盘」的汇报（本模块不认识文件，路径随便给一个）。
+    fn ready(session_pane_id: u32, kind: ReportKind) -> ReadyReport {
+        ReadyReport {
+            session_pane_id,
+            kind,
+            task_ids: Vec::new(),
+            file: format!("D:\\p\\.mini-term\\reports\\{ORCH}\\0001-x.md"),
+            at: "2026-09-02T10:00:00+08:00".into(),
+        }
+    }
+
+    /// 模拟控制面那条常驻线程：把待落盘的那一队渲染落盘，存回待取走那一队。
+    fn materialize(l: &mut ReportLedger, orchestrator: u32) {
+        for r in l.take_staged(orchestrator) {
+            l.deposit(orchestrator, ready(r.session_pane_id, r.kind));
+        }
     }
 
     fn secs(base: Instant, n: u64) -> Instant {
@@ -583,8 +728,8 @@ mod tests {
         // 再来一次 SessionStart 之类的 ai-idle 也一样
         assert!(!l.observe_status(HAND, AI_IDLE, Some("SessionStart"), secs(t0, 80)));
 
-        let batch = l.take_batch(ORCH).unwrap();
-        assert_eq!(batch.reports.len(), 1, "只该有那一条回合结束");
+        let staged = l.take_staged(ORCH);
+        assert_eq!(staged.len(), 1, "只该有那一条回合结束");
     }
 
     /// 回合中途的 ai-working 事件不重置起点（否则回合耗时会缩成最后一段工具调用）。
@@ -607,7 +752,7 @@ mod tests {
     fn 没开始过的回合不会结束() {
         let (mut l, t0) = ledger();
         assert!(!l.observe_status(HAND, AI_IDLE, Some("SessionStart"), t0));
-        assert!(l.take_batch(ORCH).is_none());
+        assert!(l.take_staged(ORCH).is_empty());
     }
 
     // ─── attention 规则 ────────────────────────────────────────────
@@ -645,16 +790,16 @@ mod tests {
         l.observe_status(HAND, AI_WORKING, Some("PostToolUse"), secs(t0, 8));
         l.observe_status(HAND, AI_IDLE, Some("Stop"), secs(t0, 20));
 
-        let batch = l.take_batch(ORCH).unwrap();
-        assert_eq!(batch.reports.len(), 2);
+        let staged = l.take_staged(ORCH);
+        assert_eq!(staged.len(), 2);
         assert_eq!(
-            batch.reports[0].kind,
+            staged[0].kind,
             ReportKind::AwaitingHuman {
                 cause: "PermissionRequest".into()
             }
         );
         assert_eq!(
-            batch.reports[1].kind,
+            staged[1].kind,
             ReportKind::TurnEnded {
                 cause: Some("Stop".into()),
                 started_at: t0, // 起点没被 attention 冲掉
@@ -672,10 +817,9 @@ mod tests {
         l.observe_status(HAND, AI_WORKING, Some("PermissionDenied"), secs(t0, 2));
         l.observe_status(HAND, AI_IDLE, Some("PermissionRequest"), secs(t0, 5));
 
-        let batch = l.take_batch(ORCH).unwrap();
-        assert_eq!(batch.reports.len(), 2);
-        assert!(batch
-            .reports
+        let staged = l.take_staged(ORCH);
+        assert_eq!(staged.len(), 2);
+        assert!(staged
             .iter()
             .all(|r| matches!(r.kind, ReportKind::AwaitingHuman { .. })));
     }
@@ -731,13 +875,12 @@ mod tests {
         let (mut l, t0) = ledger();
         // 从没进过 ai-* 就直接 idle：不是「退出」
         assert!(!l.observe_status(HAND, IDLE, Some("SessionEnd"), t0));
-        assert!(l.take_batch(ORCH).is_none());
+        assert!(l.take_staged(ORCH).is_empty());
 
         l.observe_status(HAND, AI_IDLE, Some("SessionStart"), secs(t0, 1));
         assert!(l.observe_status(HAND, IDLE, Some("SessionEnd"), secs(t0, 2)));
         assert!(!l.observe_status(HAND, IDLE, None, secs(t0, 3)), "重复 idle 不再报");
-        let batch = l.take_batch(ORCH).unwrap();
-        assert_eq!(batch.reports.len(), 1);
+        assert_eq!(l.take_staged(ORCH).len(), 1);
     }
 
     /// 退出之后同一 pane 里重开 agent（`claude -c`）照常追踪下一个回合。
@@ -746,7 +889,7 @@ mod tests {
         let (mut l, t0) = ledger();
         l.observe_status(HAND, AI_WORKING, Some("UserPromptSubmit"), t0);
         l.observe_status(HAND, IDLE, Some("SessionEnd"), secs(t0, 5));
-        l.take_batch(ORCH);
+        l.take_staged(ORCH);
 
         l.observe_status(HAND, AI_WORKING, Some("UserPromptSubmit"), secs(t0, 60));
         l.observe_status(HAND, AI_IDLE, Some("Stop"), secs(t0, 90));
@@ -771,7 +914,7 @@ mod tests {
         assert!(!l.observe_pane_closed(HAND, secs(t0, 6)));
         l.note_task_written(HAND, "t9", IDLE, secs(t0, 7));
         assert!(!l.tick(secs(t0, 999)));
-        assert!(l.take_batch(ORCH).is_none(), "关闭之后不该再有任何汇报");
+        assert!(l.take_staged(ORCH).is_empty(), "关闭之后不该再有任何汇报");
     }
 
     // ─── 未被接收规则 ──────────────────────────────────────────────
@@ -793,7 +936,7 @@ mod tests {
         );
         // 触发一次即收敛：不会每拍重发
         assert!(!l.tick(secs(t0, 60)));
-        assert!(l.take_batch(ORCH).is_none());
+        assert!(l.take_staged(ORCH).is_empty());
     }
 
     /// 之后第一次转到 ai-working 即清掉等待，**不出汇报**。
@@ -803,7 +946,7 @@ mod tests {
         l.note_task_written(HAND, "t1", AI_IDLE, t0);
         assert!(!l.observe_status(HAND, AI_WORKING, Some("UserPromptSubmit"), secs(t0, 2)));
         assert!(!l.tick(secs(t0, 60)), "等待已被清掉，不该再报");
-        assert!(l.take_batch(ORCH).is_none());
+        assert!(l.take_staged(ORCH).is_empty());
     }
 
     /// 目标写入时已是 ai-working 的**不登记**——那一档看不出来，不猜。
@@ -812,7 +955,7 @@ mod tests {
         let (mut l, t0) = ledger();
         l.note_task_written(HAND, "t1", AI_WORKING, t0);
         assert!(!l.tick(secs(t0, 600)));
-        assert!(l.take_batch(ORCH).is_none());
+        assert!(l.take_staged(ORCH).is_empty());
     }
 
     /// 写进裸 shell（idle）的派活同样要盯——它多半根本没进 agent。
@@ -909,24 +1052,59 @@ mod tests {
         assert_eq!(ids[0], "t5", "溢出丢的是最旧的");
     }
 
-    // ─── 收件箱 ────────────────────────────────────────────────────
+    // ─── 两道队 ────────────────────────────────────────────────────
 
+    /// 待落盘那一队溢出：丢最旧的并累加丢弃计数（常驻线程死了 / 磁盘卡住那一档）。
     #[test]
-    fn 收件箱溢出丢最旧并累加丢弃计数() {
+    fn 待落盘那一队溢出丢最旧并累加丢弃计数() {
         let (mut l, t0) = ledger();
         // 每一轮「进入工作 → Stop」出一条回合结束
         for i in 0..(INBOX_CAP + 3) as u64 {
             l.observe_status(HAND, AI_WORKING, Some("UserPromptSubmit"), secs(t0, i * 10));
             l.observe_status(HAND, AI_IDLE, Some("Stop"), secs(t0, i * 10 + 5));
         }
-        let batch = l.take_batch(ORCH).unwrap();
-        assert_eq!(batch.reports.len(), INBOX_CAP);
-        assert_eq!(batch.dropped, 3);
+        let batch = l.take_staged(ORCH);
+        assert_eq!(batch.len(), INBOX_CAP);
         // 留下的是最新的那批：第一条的结束时刻对应第 3 轮
-        match batch.reports[0].kind {
+        match batch[0].kind {
             ReportKind::TurnEnded { ended_at, .. } => assert_eq!(ended_at, secs(t0, 35)),
             ref other => panic!("期望回合结束: {other:?}"),
         }
+        // 丢弃计数要熬到有汇报可交时才随批次出去
+        l.deposit(ORCH, ready(HAND, ReportKind::Closed));
+        assert_eq!(l.take_batch(ORCH).unwrap().dropped, 3);
+    }
+
+    /// 待取走那一队溢出：同一套口径（丢最旧、计数照加）。
+    #[test]
+    fn 待取走那一队溢出丢最旧并累加丢弃计数() {
+        let mut l = ReportLedger::new();
+        for i in 0..(INBOX_CAP + 2) as u32 {
+            l.deposit(
+                ORCH,
+                ReadyReport {
+                    file: format!("f{i}.md"),
+                    ..ready(HAND, ReportKind::Closed)
+                },
+            );
+        }
+        let batch = l.take_batch(ORCH).unwrap();
+        assert_eq!(batch.reports.len(), INBOX_CAP);
+        assert_eq!(batch.dropped, 2);
+        assert_eq!(batch.reports[0].file, "f2.md", "溢出丢的是最旧的");
+    }
+
+    /// 写文件失败那一档也进丢弃计数——静默丢一条汇报，编排者就永远不知道自己
+    /// 看到的不是全部。
+    #[test]
+    fn 落盘失败计进丢弃数() {
+        let mut l = ReportLedger::new();
+        l.note_dropped(ORCH, 2);
+        assert!(l.take_batch(ORCH).is_none(), "光有丢弃数不算有汇报");
+        l.deposit(ORCH, ready(HAND, ReportKind::Closed));
+        let batch = l.take_batch(ORCH).unwrap();
+        assert_eq!(batch.dropped, 2);
+        assert_eq!(batch.reports.len(), 1);
     }
 
     #[test]
@@ -934,43 +1112,53 @@ mod tests {
         let (mut l, t0) = ledger();
         l.observe_status(HAND, AI_WORKING, None, t0);
         l.observe_status(HAND, AI_IDLE, Some("Stop"), secs(t0, 1));
-        assert!(l.has_pending(ORCH));
-        assert_eq!(l.pending_orchestrators(), vec![ORCH]);
+        assert_eq!(l.pending_orchestrators(), vec![ORCH], "有待落盘的");
+        assert!(l.take_batch(ORCH).is_none(), "还没落盘就还没得取");
+
+        materialize(&mut l, ORCH);
+        assert!(l.pending_orchestrators().is_empty(), "落完盘就不在待落盘队里了");
 
         let batch = l.take_batch(ORCH).unwrap();
+        assert_eq!(batch.reports.len(), 1);
         assert_eq!(batch.dropped, 0);
-        assert!(!l.has_pending(ORCH));
-        assert!(l.pending_orchestrators().is_empty());
-        assert!(l.take_batch(ORCH).is_none(), "空收件箱答 None");
+        assert!(l.take_batch(ORCH).is_none(), "取一次即收敛");
     }
 
+    /// 按受编排会话过滤地取（`wait --pane N`）：别人的那些留在队里，
+    /// 而 `dropped` 是整个编排者的计数，跟着第一次成功的取走一并交出去。
     #[test]
-    fn 放回批次回到队首并恢复丢弃计数() {
-        let (mut l, t0) = ledger();
-        l.observe_status(HAND, AI_WORKING, None, t0);
-        l.observe_status(HAND, AI_IDLE, Some("Stop"), secs(t0, 1));
-        let batch = l.take_batch(ORCH).unwrap();
-
-        // 投递失败 → 期间又来了一条新汇报 → 把旧的放回队首
-        l.observe_pane_closed(HAND, secs(t0, 2));
-        l.requeue_batch(
+    fn 按受编排会话过滤地取() {
+        let mut l = ReportLedger::new();
+        l.deposit(ORCH, ready(20, ReportKind::Closed));
+        l.deposit(
             ORCH,
-            ReportBatch {
-                reports: batch.reports.clone(),
-                dropped: 2,
-            },
+            ready(
+                21,
+                ReportKind::Exited {
+                    cause: Some("SessionEnd".into()),
+                },
+            ),
         );
-        let again = l.take_batch(ORCH).unwrap();
-        assert_eq!(again.dropped, 2, "丢弃计数不能被投递失败洗掉");
-        assert_eq!(again.reports.len(), 2);
-        assert_eq!(again.reports[0], batch.reports[0], "放回的那批仍在最前");
-        assert_eq!(again.reports[1].kind, ReportKind::Closed);
+        l.deposit(ORCH, ready(20, ReportKind::AwaitingHuman { cause: "x".into() }));
+        l.note_dropped(ORCH, 1);
+
+        let batch = l.take_batch_from(ORCH, 20).unwrap();
+        assert_eq!(batch.reports.len(), 2, "只取 20 号的，顺序照旧");
+        assert!(batch.reports.iter().all(|r| r.session_pane_id == 20));
+        assert_eq!(batch.dropped, 1);
+        assert!(l.take_batch_from(ORCH, 20).is_none(), "取一次即收敛");
+
+        // 21 号那条还在
+        let batch = l.take_batch_from(ORCH, 21).unwrap();
+        assert_eq!(batch.reports.len(), 1);
+        assert_eq!(batch.dropped, 0, "丢弃计数已经交出去过了");
+        assert!(l.take_staged(ORCH).is_empty());
     }
 
     // ─── 隔离：未注册 / 已关闭 / 收件箱已丢弃 ───────────────────────
 
     /// 未注册的 pane 一律忽略——**编排者自己的状态变化也会打进来**
-    /// （12 那边一条事件流喂过来），不过滤掉它就会给自己发汇报。
+    /// （14 那边一条事件流喂过来），不过滤掉它就会给自己发汇报。
     #[test]
     fn 未注册的_pane_的事实一律忽略() {
         let mut l = ReportLedger::new();
@@ -981,27 +1169,30 @@ mod tests {
         assert!(!l.observe_pane_closed(ORCH, secs(t0, 2)));
         l.note_task_written(999, "t1", AI_IDLE, t0);
         assert!(!l.tick(secs(t0, 600)));
-        assert!(l.take_batch(ORCH).is_none());
+        assert!(l.take_staged(ORCH).is_empty());
         assert!(l.pending_orchestrators().is_empty());
     }
 
-    /// 编排者收件箱被丢弃后不再累积（连同它名下乐手的追踪一起忘掉）。
+    /// 编排者的两道队被丢弃后不再累积（连同它名下乐手的追踪一起忘掉）。
+    /// **两道队都得清干净** —— 已经落盘等着取的那些同样作废。
     #[test]
     fn 收件箱被丢弃后不再累积() {
         let (mut l, t0) = ledger();
         l.observe_status(HAND, AI_WORKING, None, t0);
         l.observe_status(HAND, AI_IDLE, Some("Stop"), secs(t0, 1));
-        assert!(l.has_pending(ORCH));
+        assert_eq!(l.pending_orchestrators(), vec![ORCH]);
+        l.deposit(ORCH, ready(HAND, ReportKind::Closed));
 
         l.drop_inbox(ORCH);
-        assert!(!l.has_pending(ORCH));
-        assert!(l.take_batch(ORCH).is_none());
+        assert!(l.pending_orchestrators().is_empty());
+        assert!(l.take_batch(ORCH).is_none(), "落好盘的那些一并作废");
+        assert!(l.take_staged(ORCH).is_empty());
 
         // 乐手还活着，但它后续的一切事实都没有收件人了
         assert!(!l.observe_status(HAND, AI_WORKING, None, secs(t0, 10)));
         assert!(!l.observe_status(HAND, AI_IDLE, Some("Stop"), secs(t0, 20)));
         assert!(!l.observe_pane_closed(HAND, secs(t0, 30)));
-        assert!(l.take_batch(ORCH).is_none());
+        assert!(l.take_staged(ORCH).is_empty());
     }
 
     /// 记账被回收（`forget_session`）之后同样不再累积，且不产生汇报。
@@ -1011,7 +1202,7 @@ mod tests {
         l.forget_session(HAND);
         assert!(!l.observe_status(HAND, AI_WORKING, None, t0));
         assert!(!l.observe_status(HAND, AI_IDLE, Some("Stop"), secs(t0, 1)));
-        assert!(l.take_batch(ORCH).is_none());
+        assert!(l.take_staged(ORCH).is_empty());
     }
 
     /// 重复登记是幂等的：不清掉进行中的回合与待汇报任务。
@@ -1020,7 +1211,7 @@ mod tests {
         let (mut l, t0) = ledger();
         l.note_task_written(HAND, "t1", AI_WORKING, t0);
         l.observe_status(HAND, AI_WORKING, Some("UserPromptSubmit"), secs(t0, 1));
-        l.register_session(HAND, ORCH); // 12 那边的同步抖动
+        l.register_session(HAND, ORCH); // 14 那边的同步抖动
         l.observe_status(HAND, AI_IDLE, Some("Stop"), secs(t0, 9));
 
         let report = only(&mut l, ORCH);
@@ -1053,7 +1244,7 @@ mod tests {
 
         // 关掉 20 号不影响 21 号
         l.observe_pane_closed(20, secs(t0, 6));
-        l.take_batch(ORCH);
+        l.take_staged(ORCH);
         l.observe_status(21, AI_IDLE, Some("Stop"), secs(t0, 9));
         let report = only(&mut l, ORCH);
         assert_eq!(report.session_pane_id, 21);
@@ -1076,7 +1267,7 @@ mod tests {
         pending.sort_unstable();
         assert_eq!(pending, vec![10, 11]);
         assert_eq!(only(&mut l, 10).session_pane_id, 20);
-        assert!(l.has_pending(11), "取空 10 号不该动 11 号");
+        assert_eq!(l.pending_orchestrators(), vec![11], "取空 10 号不该动 11 号");
 
         // 丢掉 10 号的收件箱也不牵连 11 号
         l.drop_inbox(10);
@@ -1124,16 +1315,16 @@ mod tests {
         l.observe_status(HAND, AI_WORKING, Some("PostToolUse"), secs(t0, 30));
         l.observe_status(HAND, AI_IDLE, Some("Stop"), secs(t0, 45));
 
-        let batch = l.take_batch(ORCH).unwrap();
-        assert_eq!(batch.reports.len(), 2);
+        let staged = l.take_staged(ORCH);
+        assert_eq!(staged.len(), 2);
         assert_eq!(
-            batch.reports[0].kind,
+            staged[0].kind,
             ReportKind::AwaitingHuman {
                 cause: "PermissionRequest".into()
             }
         );
         assert_eq!(
-            batch.reports[1].kind,
+            staged[1].kind,
             ReportKind::TurnEnded {
                 cause: Some("Stop".into()),
                 started_at: t0,

@@ -6,7 +6,7 @@
 
 **Blocked by:** 12
 
-**Status:** in progress（真机验收待做；文档部分随工单 14 再改一遍——推送改成落文件 + `wait` 取件，2026-09-02 真机验收刚起步就被用户叫停）
+**Status:** in progress（**真机验收仍是欠账**；CLI 帮助与 SKILL.md 那两项已随工单 14 整段重写——推送改成落文件 + `wait` 取件，2026-09-02 真机验收刚起步就被用户叫停。新形态的验收清单见 `14-reports-to-files-and-wait.md` 留档第 8 条）
 
 - [x] `mt-agent-cli --help` 增加 "reports" 一节：汇报长什么样（`[mini-term]` 前缀、种类、任务编号）、什么时候到（编排者空闲时；忙时攒着合并）、收到 `AwaitingHuman` 该怎么做（转告用户、不代答、不 send）、收到 `NotAccepted` 该怎么做（read-screen 核对再重发）；send notes 与工单 10 对齐；wait notes 开头加一句「通常不需要——汇报会自己来」
 - [x] SKILL.md 改写：删掉「两个时序坑」里记游标那套舞步（未被接收由汇报覆盖，start-session 后先 read-screen 确认提示符那条**保留**）；「A normal run」改成派活 → 继续干别的 / 回答用户 → 汇报到了再处理；规则里加「文字提问可答、黄灯归人」「汇报是自述，关键结果自己验证」；`cli-location` 两个标记必须原样保留（`orchestrator_skill.rs` 的渲染测试钉着）
@@ -95,3 +95,8 @@ Skill 存在的理由，改写不该动它们。`cli-location` 两个标记一�
    Skill 何时被 agent 加载，改动很小但不是零风险，真机上顺带看一眼还能不能被正常触发。
 5. **仓里没有 `.codex/skills/mini-term-orchestrator/SKILL.md`**：Codex 版是投放时按同一源头
    现渲染的（只差 `allowed-tools` 一行），没有第二份副本要同步。
+6. **CLI 帮助与 SKILL.md 已被工单 14 整段重写**（2026-09-02）：推送模型换成「汇报落文件 +
+   `wait` 取件」，`reports` 一节、wait notes、Skill 的样例与五个小标题（改成
+   `turn-ended` / `awaiting-human` / … 这几个稳定 slug）全部随之改过，本票留档第 2、3、4
+   条描述的都是旧文本。上面第 1 条（真机验收整节未做）**仍然是欠账**，且要按新形态重走
+   ——清单见 `14-reports-to-files-and-wait.md` 的留档第 9 条。

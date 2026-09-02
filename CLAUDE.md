@@ -129,9 +129,11 @@ hook 上报（`mt-ai::hook_server`）一旦启用即为权威，退出以 Sessio
 
 **铁律**：两条兜底都把结论**落盘**进 hook 状态，触发一次即收敛、不再摆动——无记忆兜底（假完成每 20~50s 重复播报）是踩过的坑，别回去。
 
-### 编排者汇报推送（ADR 0004）
+### 编排者汇报：落文件 + `wait` 取件（ADR 0004）
 
-受编排会话每个回合结束 / 停下等人 / 退出 / 被关 / 派活未被接收时，桌面端机械生成一条**汇报**，由 `mt-ai::control` 的投递泵写穿进编排者的终端——等价于用户在那个 pane 里对它说了一句话，于是编排者不必 `wait`、不必轮询。**投递闸**只在编排者 `ai-idle` 且成因不属 attention 时放行：它忙时暂存、回合结束后把积压的合成一条投；它自己停在黄灯时不投（写入等于替用户代答，ADR 0003 的铁律）；它退回裸 shell 时也不投（粘贴会落进 shell）。汇报正文是**受编排会话的自述**（该回合的会话记录增量，无可解析记录的 agent 换画面尾部），里头没有工具调用与命令输出——「说完了」不等于「做对了」，编排者该验证的仍得自己跑。实现在 `mt-ai::reports`（纯状态机，不碰线程与 I/O）+ `mt-ai::control`（闸 / 渲染 / 投递线程），决策与被否决的备选见 `docs/adr/0004-orchestrated-session-reports.md`；编排者那一侧的礼仪在 `.claude/skills/mini-term-orchestrator/SKILL.md`（唯一源头，投放机制见 `mt-app::orchestrator_skill`）。
+受编排会话每个回合结束 / 停下等人 / 退出 / 被关 / 派活未被接收时，桌面端机械生成一条**汇报**：正文渲染成 Markdown 写进 `<编排者所在项目>/.mini-term/reports/<编排者 pane>/<NNNN>-<kind>.md`（kind 五档 `turn-ended` / `awaiting-human` / `exited` / `closed` / `not-accepted`；项目路径取不到时退到数据目录），**编排者的终端里一个字都不写**。`wait [--pane N]` 是取件：阻塞到名下有未取走的汇报即返回「哪个会话、什么事、文件在哪」并取走（取一次即收敛），正文由编排者自己用 Read 工具读；超时答 `pending`，那是正常回执不是错误。汇报文件的抬头是**稳定的 ASCII 键值行**（`kind: turn-ended` —— 编排者要拿它分支，故不进字典），只有正文走 i18n。正文是**受编排会话的自述**（该回合的会话记录增量，无可解析记录的 agent 换画面尾部），里头没有工具调用与命令输出——「说完了」不等于「做对了」。汇报目录随编排者 pane 关闭 / 重新授予整个删掉，`.gitignore` 由 Skill 投放那条链路顺带加一条。
+
+⚠️ 首版（工单 12）是把整段汇报**写穿进编排者的终端**，2026-09-02 真机一看即被否（像用户在输入，且上下文随派活次数线性膨胀），工单 14 推翻重做——账本、渲染与桌面接线全保留，只换末端。实现在 `mt-ai::reports`（纯状态机，不碰线程与 I/O；两道队：待落盘 → 待取走）+ `mt-ai::control`（渲染 / 落盘线程 / `wait`），决策与被否决的备选见 `docs/adr/0004-orchestrated-session-reports.md`；编排者那一侧的礼仪在 `.claude/skills/mini-term-orchestrator/SKILL.md`（唯一源头，投放机制见 `mt-app::orchestrator_skill`）。
 
 ### 移动端中转体系（`relay-server/` + `mobile/` + `mt-relay`）
 

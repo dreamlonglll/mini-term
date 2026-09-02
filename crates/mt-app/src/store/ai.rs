@@ -335,7 +335,7 @@ impl AppStore {
         match event {
             AiEvent::Status(change) => {
                 // 汇报账本先吃这一条(ADR 0004):「回合结束 / 停下等人 / 已退出」
-                // 三种汇报的唯一事实来源,也是「编排者刚闲下来」时投递泵的唤醒点。
+                // 三种汇报的唯一事实来源,也是汇报落盘线程的唤醒点。
                 // **必须在最前面** —— 下面那句 `from_str?` 会在认不出的状态上
                 // 提前返回,挂在它后面就等于漏掉一整档事实。
                 self.ai.perception().control().observe_status(

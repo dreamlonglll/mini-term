@@ -193,13 +193,14 @@ impl ControlRequest {
         }
     }
 
-    /// `wait` 的请求体：等哪个乐手、最多等多久。
+    /// `wait` 的请求体：等谁的汇报、最多等多久。
     ///
-    /// `timeout` 不给就整个字段不出线 —— 服务端据此落在它自己的
-    /// [`WAIT_DEFAULT`]，默认值因此只有一处（在桌面侧那个常量上）。
-    pub fn wait(id: &Identity, target_pane_id: u32, timeout: Option<Duration>) -> Self {
+    /// `target_pane_id` **可选**（工单 14）：不给就整个字段不出线，服务端据此
+    /// 理解成「名下任一受编排会话的下一条汇报」。`timeout` 同理不给就落在服务端
+    /// 自己的 [`WAIT_DEFAULT`]，默认值因此只有一处（在桌面侧那个常量上）。
+    pub fn wait(id: &Identity, target_pane_id: Option<u32>, timeout: Option<Duration>) -> Self {
         Self {
-            target_pane_id: Some(target_pane_id),
+            target_pane_id,
             timeout_ms: timeout.map(|d| d.min(WAIT_MAX).as_millis() as u64),
             ..Self::from(id)
         }
@@ -314,56 +315,84 @@ pub struct SendReceipt {
     pub target_status: String,
 }
 
-/// `wait` 的结论（工单 06）。
+/// `wait` 的结论（工单 06，形状由工单 14 换掉）。
 ///
-/// 四类终态里的三类走这个结构（第四类「pane 不存在」是错误码 `paneNotFound`），
-/// 外加一个 `pending`：**到耐心用尽还没收敛不是错误**，是一条正常的观测结果，
-/// 编排者据此决定继续等还是先去干别的。
+/// 它等的是**汇报**而不是状态：拿到一批就答 `reports`，到耐心用尽还没有就答
+/// `pending` ——**那不是错误**，是一条正常的观测结果，编排者据此决定继续等还是
+/// 先去干别的。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WaitOutcome {
-    /// 等的是哪个受编排会话。
-    pub pane_id: u32,
-    /// 结论，四选一：
-    ///
-    /// - `ai-idle` —— 干完了。看 `cause` 才知道是**怎么**完的（只有 `Stop` 是
-    ///   真做完；`Interrupt` 是用户按了 Esc，`Stall` 是停摆兜底收敛的）。
-    /// - `attention` —— 停在等审批或向人提问，`cause` 是原因原文。
-    ///   **编排者不代答**：在自己的对话里请用户去那个会话处理。
-    /// - `idle` —— 里头的 agent 已经退出，会话退回裸 shell。
-    /// - `pending` —— 到时限还没收敛。看 `status`：`ai-working` 是真在跑，
-    ///   `idle` 是「这个会话看不透」（没有 hook、也没被识别成已知 AI 命令）。
+    /// `reports`（取到了，见下面那个数组）或 `pending`（时限内没有新汇报）。
     ///
     /// **缺省空串**：认不出这个字段的旧桌面端在场时，宁可让编排者拿到一个显然
-    /// 不合法的结论去查，也别默认成某一档终态（fail-closed 的取向，与
+    /// 不合法的结论去查，也别默认成「取到了」（fail-closed 的取向，与
     /// `Project::can_start_sessions` 同源）。
     #[serde(default)]
     pub outcome: String,
-    /// 收工那一刻的 AI 状态：`idle` / `ai-idle` / `ai-working`，与
-    /// `list-panes` 的状态列同一口径。
+    /// 这一趟取走的汇报，**旧的在前**。取一次即收敛：同一条不会再交出来第二次。
+    ///
+    /// 正文一个字都不在这里 —— 它躺在每条的 `file` 里，用自己的 Read 工具按需读。
     #[serde(default)]
-    pub status: String,
-    /// 成因原文（hook 事件名）。无 hook 的会话没有成因。
+    pub reports: Vec<ReportNote>,
+    /// **上一次取走之后**因积压溢出或写盘失败而永远看不到的条数。
+    ///
+    /// 不为零意味着「你看到的不是全部」，缺的那几条无从补读（汇报是事件，不是
+    /// 快照）；真要补就自己 `read-transcript` 那个会话。
     #[serde(default)]
-    pub cause: Option<String>,
+    pub dropped: usize,
+    /// `pending` 且点了名（`--pane`）时，那个会话此刻的 AI 状态：
+    /// `ai-working` 是真在跑，`idle` 是「这个会话看不透」（没有 hook、也没被
+    /// 识别成已知 AI 命令 —— 它永远不会有 `turn-ended` 汇报）。
+    #[serde(default)]
+    pub status: Option<String>,
     /// 实际等了多久（毫秒）。给的超时被钳到上界时看得出来。
     #[serde(default)]
     pub waited_ms: u64,
 }
 
+/// `wait` 回执里的一条汇报：**哪个会话、什么事、文件在哪**。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportNote {
+    /// 哪个受编排会话的事。
+    pub pane_id: u32,
+    /// 五档之一：`turn-ended` / `awaiting-human` / `exited` / `closed` /
+    /// `not-accepted`。**稳定的 ASCII，不随桌面显示语言变**。
+    #[serde(default)]
+    pub kind: String,
+    /// 成因原文（hook 事件名）：只有 `Stop` 是真做完，`Interrupt` 是有人按了
+    /// Esc，`Stall` 是停摆兜底收敛的；`PermissionRequest` / `Elicitation` /
+    /// `StopFailure` 是三种「等人处理」。`closed` / `not-accepted` 没有成因。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<String>,
+    /// 这条汇报覆盖的任务编号（`send` 的回执里那个 `task_id`）。
+    #[serde(default)]
+    pub task_ids: Vec<String>,
+    /// 汇报文件的**绝对路径**（Windows 反斜杠原样）。直接喂给 Read 工具。
+    #[serde(default)]
+    pub file: String,
+    /// 落盘时刻，RFC3339 本地时间。
+    #[serde(default)]
+    pub at: String,
+}
+
 impl WaitOutcome {
-    /// 停在等审批 / 向人提问了吗 —— 编排者该**停手播报**的那一档。
+    /// 这一批里有没有「停在等人处理」——编排者该**停手播报**的那一档。
+    ///
+    /// 判据是**每一条的 kind**，不是这一趟的 `outcome`：一次取件可能同时带回
+    /// 一条回合结束与一条黄灯，漏看后者就是让人一直等在那个终端前。
     pub fn needs_human(&self) -> bool {
-        self.outcome == "attention"
+        self.reports.iter().any(|r| r.kind == "awaiting-human")
     }
 
-    /// 收敛成终态了吗（`false` = `pending`，还得接着等或去干别的）。
+    /// 这一趟取到东西了吗（`false` = `pending`，还得接着等或去干别的）。
     ///
-    /// 认的是那三个具体的名字而不是「不等于 pending」：认不出的 `outcome`
-    /// （旧/新桌面端、字段缺失）一律**不算**收敛 —— 少判一次终态只是多等一轮，
-    /// 误判成终态是把没做完的活报成交付。
+    /// 认的是那个具体的名字**加上**数组真的非空：认不出的 `outcome`
+    /// （旧/新桌面端、字段缺失）一律不算 —— 少判一次只是多等一轮，
+    /// 误判成「有结果了」是让编排者去读一个不存在的文件。
     pub fn is_settled(&self) -> bool {
-        matches!(self.outcome.as_str(), "ai-idle" | "attention" | "idle")
+        self.outcome == "reports" && !self.reports.is_empty()
     }
 }
 
@@ -897,22 +926,26 @@ mod tests {
         }
     }
 
-    // ─── 工单 06：wait ────────────────────────────────────────
+    // ─── 工单 06 / 14：wait ───────────────────────────────────
 
     /// `wait` 的请求体：只带目标编号与耐心，别人的字段一个不出线；
-    /// 不给超时就整个字段不出线（默认值只住在桌面侧那个常量上）。
+    /// 两个都不给就整个字段不出线（默认值只住在桌面侧那个常量上，
+    /// 而不点名 = 名下任一受编排会话）。
     #[test]
     fn 等待请求体只带目标与耐心() {
         let id = Identity {
             token: "t".into(),
             pane_id: 3,
         };
-        let json = serde_json::to_string(&ControlRequest::wait(&id, 101, None)).unwrap();
+        let json = serde_json::to_string(&ControlRequest::wait(&id, None, None)).unwrap();
+        assert_eq!(json, r#"{"token":"t","paneId":3}"#, "不点名就不出线");
+
+        let json = serde_json::to_string(&ControlRequest::wait(&id, Some(101), None)).unwrap();
         assert_eq!(json, r#"{"token":"t","paneId":3,"targetPaneId":101}"#);
 
         let json = serde_json::to_string(&ControlRequest::wait(
             &id,
-            101,
+            Some(101),
             Some(Duration::from_secs(30)),
         ))
         .unwrap();
@@ -931,12 +964,12 @@ mod tests {
             token: "t".into(),
             pane_id: 3,
         };
-        let req = ControlRequest::wait(&id, 101, Some(Duration::from_secs(9_999)));
+        let req = ControlRequest::wait(&id, Some(101), Some(Duration::from_secs(9_999)));
         assert_eq!(req.timeout_ms, Some(WAIT_MAX.as_millis() as u64));
     }
 
     /// `wait` 的读超时必须**大于**服务端可能占用的那段时间，否则长轮询的正常
-    /// 回执永远拿不到 —— 编排者看到的会是「够不着」而不是终态。
+    /// 回执永远拿不到 —— 编排者看到的会是「够不着」而不是那批汇报。
     #[test]
     fn 等待的读超时留出富余() {
         assert!(wait_read_timeout(WAIT_MAX) > WAIT_MAX);
@@ -951,57 +984,84 @@ mod tests {
         assert!(WAIT_DEFAULT < WAIT_MAX);
     }
 
+    /// 取到一批汇报：每条的**文件路径**要原样到得了编排者手上（它拿这个去 Read），
+    /// 成因原文照带，`dropped` 照带。
     #[test]
-    fn 解析等待结论() {
-        let body = r#"{"ok":true,"data":{"waited":{"paneId":101,"outcome":"ai-idle",
-            "status":"ai-idle","cause":"Stop","waitedMs":4210}}}"#;
+    fn 解析取到的汇报() {
+        let body = r#"{"ok":true,"data":{"waited":{"outcome":"reports","reports":[
+            {"paneId":101,"kind":"turn-ended","cause":"Stop","taskIds":["t1","t2"],
+             "file":"D:\\repos\\api\\.mini-term\\reports\\7\\0003-turn-ended.md",
+             "at":"2026-09-02T14:03:21+08:00"}],
+            "dropped":0,"waitedMs":4210}}}"#;
         let w = parse_wait_outcome(200, body).unwrap();
-        assert_eq!(w.pane_id, 101);
-        assert_eq!(w.outcome, "ai-idle");
-        assert_eq!(w.cause.as_deref(), Some("Stop"));
+        assert_eq!(w.outcome, "reports");
         assert_eq!(w.waited_ms, 4210);
+        assert_eq!(w.dropped, 0);
         assert!(w.is_settled());
         assert!(!w.needs_human());
+        assert_eq!(w.reports.len(), 1);
+        let r = &w.reports[0];
+        assert_eq!(r.pane_id, 101);
+        assert_eq!(r.kind, "turn-ended");
+        assert_eq!(r.cause.as_deref(), Some("Stop"));
+        assert_eq!(r.task_ids, vec!["t1".to_string(), "t2".to_string()]);
+        assert_eq!(
+            r.file,
+            r"D:\repos\api\.mini-term\reports\7\0003-turn-ended.md",
+            "Windows 反斜杠原样 —— 编排者直接把它喂给 Read"
+        );
+        assert_eq!(r.at, "2026-09-02T14:03:21+08:00");
     }
 
-    /// attention 那一档：原因原文要到得了编排者手上，且 `needs_human` 认得出。
-    /// Codex 的审批等待状态是 `ai-working` —— 判据是成因不是状态。
+    /// 黄灯那一档：判据是**每条的 kind**，不是这一趟的 `outcome` ——
+    /// 一次取件可能同时带回一条回合结束与一条黄灯，漏看后者就是让人干等。
     #[test]
-    fn 解析等待结论的_attention_档() {
-        let body = r#"{"ok":true,"data":{"waited":{"paneId":101,"outcome":"attention",
-            "status":"ai-working","cause":"PermissionRequest","waitedMs":900}}}"#;
+    fn 一批里混着黄灯也认得出() {
+        let body = r#"{"ok":true,"data":{"waited":{"outcome":"reports","reports":[
+            {"paneId":101,"kind":"turn-ended","cause":"Stop","taskIds":[],"file":"a.md","at":"x"},
+            {"paneId":102,"kind":"awaiting-human","cause":"PermissionRequest",
+             "taskIds":[],"file":"b.md","at":"y"}],"dropped":2,"waitedMs":900}}}"#;
         let w = parse_wait_outcome(200, body).unwrap();
         assert!(w.needs_human(), "编排者据此停手播报，不代答");
         assert!(w.is_settled());
-        assert_eq!(w.cause.as_deref(), Some("PermissionRequest"));
-        assert_eq!(w.status, "ai-working", "Codex 的审批等待停在工作中");
+        assert_eq!(w.dropped, 2, "丢了几条要如实带到");
+        assert_eq!(w.reports[1].cause.as_deref(), Some("PermissionRequest"));
     }
 
-    /// **超时是成功响应**：`pending` 不是错误，只是还没收敛。
-    /// 没有成因时 `cause` 整个字段不出线，解析成 `None`。
+    /// **超时是成功响应**：`pending` 不是错误，只是这段时间里没有新汇报。
+    /// 点了名时带上那个会话此刻的状态（`idle` = 这个会话我们看不透）。
     #[test]
     fn 超时的等待结论也是成功响应() {
-        let body = r#"{"ok":true,"data":{"waited":{"paneId":101,"outcome":"pending",
-            "status":"ai-working","waitedMs":60000}}}"#;
+        let body = r#"{"ok":true,"data":{"waited":{"outcome":"pending","reports":[],
+            "dropped":0,"status":"ai-working","waitedMs":60000}}}"#;
         let w = parse_wait_outcome(200, body).unwrap();
         assert_eq!(w.outcome, "pending");
-        assert!(!w.is_settled(), "pending 不算收敛");
+        assert!(!w.is_settled(), "pending 不算取到");
         assert!(!w.needs_human());
-        assert_eq!(w.cause, None, "无 hook 的会话没有成因");
+        assert_eq!(w.status.as_deref(), Some("ai-working"));
+
+        // 没点名那一趟整个字段不出线
+        let body = r#"{"ok":true,"data":{"waited":{"outcome":"pending","reports":[],
+            "dropped":0,"waitedMs":1}}}"#;
+        assert_eq!(parse_wait_outcome(200, body).unwrap().status, None);
     }
 
-    /// 认不出的 `outcome`（桌面端比 CLI 新 / 字段缺失）**不算收敛** ——
-    /// 少判一次只是多等一轮，误判成终态是把没做完的活报成交付。
+    /// 认不出的 `outcome`（桌面端比 CLI 新 / 字段缺失）**不算取到** ——
+    /// 少判一次只是多等一轮，误判成「有结果了」是让它去读一个不存在的文件。
     #[test]
-    fn 认不出的结论不算收敛() {
-        let body = r#"{"ok":true,"data":{"waited":{"paneId":101,"status":"idle"}}}"#;
+    fn 认不出的结论不算取到() {
+        let body = r#"{"ok":true,"data":{"waited":{"waitedMs":1}}}"#;
         let w = parse_wait_outcome(200, body).unwrap();
         assert_eq!(w.outcome, "");
         assert!(!w.is_settled());
         assert!(!w.needs_human());
 
-        let body = r#"{"ok":true,"data":{"waited":{"paneId":101,"outcome":"somethingNew",
-            "status":"ai-idle"}}}"#;
+        let body = r#"{"ok":true,"data":{"waited":{"outcome":"somethingNew","reports":[
+            {"paneId":1,"kind":"turn-ended","file":"a.md"}]}}}"#;
+        assert!(!parse_wait_outcome(200, body).unwrap().is_settled());
+
+        // 说取到了却给了空数组：同样不算
+        let body = r#"{"ok":true,"data":{"waited":{"outcome":"reports","reports":[]}}}"#;
         assert!(!parse_wait_outcome(200, body).unwrap().is_settled());
     }
 

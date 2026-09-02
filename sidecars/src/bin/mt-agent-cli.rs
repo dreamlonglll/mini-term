@@ -28,7 +28,7 @@
 //! mt-agent-cli list-panes                              # 我起过的受编排会话及其状态
 //! mt-agent-cli send --pane <ID> --text <TEXT>          # 给某个受编排会话派活
 //! mt-agent-cli send --pane <ID> --stdin                # 同上,正文从 stdin 读(多行)
-//! mt-agent-cli wait --pane <ID> [--timeout <SECONDS>]  # 等它干完/等人/退出(长轮询)
+//! mt-agent-cli wait [--pane <ID>] [--timeout <SECONDS>] # 取汇报:等到有新汇报就交给你(长轮询)
 //! mt-agent-cli read-transcript --pane <ID> [--cursor N] # 读它的对话记录(增量)
 //! mt-agent-cli read-screen --pane <ID> [--lines N]      # 读它终端画面的尾部若干行
 //! ```
@@ -65,42 +65,57 @@ Exit codes:
      change the request or wait for one of your sessions to finish
 
 reports:
-  You do not have to poll. The desktop watches every session you started and pushes a
-  report into your own terminal - it arrives exactly as if the user had typed it to
-  you - whenever one of them ends a turn, stops for a human, exits, is closed, or
-  looks like it never picked up a prompt you sent. Every line of a report starts with
-  [mini-term]. That marker means the DESKTOP is talking to you, not the user: act on
-  it, do not answer it as if a person had said it. Reports are written in mini-term's
-  display language, so the wording may not be English; the [mini-term] prefix and the
-  header fields are the same either way.
-  A report is delivered only while you are idle and not stopped on a prompt of your
-  own; while you are busy they pile up and are delivered merged into one message once
-  your turn ends. So a session can have finished minutes before you hear about it.
-  Each report header carries the session's pane id, its launcher and project, what
-  happened, the cause verbatim, and the taskIds it covers - that is how you match a
-  result to the work you handed out. The five things it can say:
-    turn ended    read `cause`: only Stop means the turn ended by itself. Interrupt
+  Nothing about an orchestrated session is ever typed into your terminal. When one of
+  the sessions you started ends a turn, stops for a human, exits, is closed, or looks
+  like it never picked up a prompt you sent, the desktop writes a REPORT FILE and
+  queues a note for you. `wait` collects those notes and hands each one to you exactly
+  once; the body stays on disk and you read it with your own Read tool, if and when
+  you want it. Nothing is lost while you are busy - reports keep until you collect.
+  One note out of the `reports` array looks like this:
+    {\"paneId\":2,\"kind\":\"turn-ended\",\"cause\":\"Stop\",\"taskIds\":[\"t1\"],
+     \"file\":\"<absolute path to the report file>\",\"at\":\"2026-09-02T14:03:21+08:00\"}
+  and the file it points at is plain `key: value` lines, a blank line, then the body:
+    session: 2
+    launcher: Claude
+    project: api
+    kind: turn-ended
+    cause: Stop
+    turn: 4m02s
+    tasks: t1
+    at: 2026-09-02T14:03:21+08:00
+
+    New transcript entries (from #0, 2 in total):
+    [user] run the test suite
+    [assistant] done, 3 failing
+  The header keys and the five `kind` values are always these ASCII names; the prose
+  below the blank line follows mini-term's display language, so it may not be English.
+  `tasks` (and `taskIds` in the note) are the taskIds from your `send`s that this
+  report covers - that is how you match a result to the work you handed out. The five
+  kinds and what you do about each:
+    turn-ended    read `cause`: only Stop means the turn ended by itself. Interrupt
                   means a human pressed Esc there, Stall means it went silent and was
                   settled by a fallback - neither of those delivered anything. The
-                  transcript excerpt under the header is that session's OWN account:
+                  transcript excerpt in the file is that session's OWN account:
                   no tool calls, no command output, no exit codes. \"It says it fixed
                   the tests\" is not \"the tests pass\" - verify what matters yourself.
                   A question asked in plain prose reaches you this way, and answering
                   it with `send` is your job.
-    waiting for a human
+    awaiting-human
                   it is stopped on an approval prompt or an interactive question. The
-                  report already quotes that screen verbatim; relay the text to the
+                  file already quotes that screen verbatim; relay the text to the
                   user and let them handle it in that pane. Do NOT send that session
                   anything and do not start polling it - the next report tells you
                   when it moved on. Its status badge is already yellow.
     exited        the agent inside quit and that pane is a bare shell now.
     closed        the pane is gone; nothing more will ever come from it.
                   For both: start a new session if the work still needs doing.
-    not picked up 15s after your write that session still had not started working on
+    not-accepted  15s after your write that session still had not started working on
                   it. Nothing failed and nothing is queued: use read-screen to see
                   what is actually on that pane (still booting? a bare shell? an
                   approval prompt?), then send the same prompt again if it is simply
                   not there.
+  Report files live under <project>/.mini-term/reports/, are already gitignored, and
+  the whole directory is deleted when your pane closes. Read them, do not edit them.
 
 send notes:
   A prompt is delivered immediately, never queued, and is equivalent to typing it in
@@ -114,9 +129,9 @@ send notes:
   approval prompt or an interactive question, so writing anything into it would answer
   for the user. Nothing was written and nothing is queued. Use read-screen on that pane
   to read the prompt verbatim, relay it to the user so a human can handle it there,
-  then get on with something else - the report that arrives when that session settles
+  then get on with something else - the report you pick up when that session settles
   is your signal to send again; do not retry in a loop.
-  taskId identifies this one delivery. The desktop reports back to you on its own when
+  taskId identifies this one delivery. The desktop writes a report of its own when
   that session finishes a turn, stops for a human, or exits (see `reports` above), and
   the report carries the taskIds it covers - that is how you match a result to the work
   you handed out. A task is NOT promised to map to exactly one turn.
@@ -130,33 +145,30 @@ send notes:
   there; do not repeat those instructions yourself.
 
 wait notes:
-  You usually do not need this. Results are pushed to you as reports (see `reports`
-  above); blocking here only keeps you from doing anything else, and it can never tell
-  you that the turn YOU dispatched is the one that finished. Reach for wait only when
-  you have nothing else to do and want to block on one specific session.
-  wait blocks until the session settles, then prints one of four outcomes - ALWAYS
-  read `outcome`, the exit code is 0 for all of them:
-    ai-idle    the turn finished. Read `cause` to learn HOW: only Stop means the work
-               really completed; Interrupt means the user pressed Esc, and Stall means
-               the session went silent and was settled by a fallback. Neither of those
-               two is a delivered result.
-    attention  it is waiting for approval or asking a question; `cause` says which
-               (PermissionRequest / Elicitation / StopFailure).
-               DO NOT answer for the user and DO NOT send that session anything.
-               Use read-screen to read that prompt verbatim, quote it in your own
-               conversation and let the user handle it in that pane; its status badge
-               is already yellow. Then leave it alone - the report that arrives when
-               it settles is your signal to send again.
-    idle       the agent inside that session has exited; the pane is back to a shell.
-    pending    it did not settle before the timeout. This is NOT an error. status
-               ai-working means it is genuinely busy - wait again. status idle means
-               that session is opaque to us (no hooks, and its command is not a
-               recognized AI command), so wait will never settle on it: use read or
-               ask the user.
+  wait is how you pick up reports (see `reports` above). It blocks until at least one
+  is waiting, prints the notes, and TAKES them - each report is handed to you exactly
+  once, so act on what you got instead of calling wait again to re-read it.
+  ALWAYS read `outcome`, the exit code is 0 for both of them:
+    reports   the `reports` array holds what you just took. Read each `file` with your
+              own Read tool. If any note says kind: awaiting-human, that one is for a
+              human - relay it, do not answer it.
+    pending   no report came in before the timeout. This is NOT an error. Call wait
+              again, or go do something else and collect later. With --pane the
+              receipt also carries that pane's `status`: ai-working means it is
+              genuinely busy, idle means that session is opaque to us (no hooks, and
+              its command is not a recognized AI command) so it will never produce a
+              turn-ended report - use read-screen or ask the user.
+  dropped greater than 0 means that many reports were lost to overflow or a failed
+  write. They are gone for good - a report is an event, not a snapshot; use
+  read-transcript if you need that history.
+  --pane is OPTIONAL: without it you get whichever of your sessions reported first
+  (the normal way to supervise several at once); with it you take only that session's
+  reports and leave everyone else's queued for later.
   --timeout defaults to 60s and is capped at 300s server-side; the command blocks for
-  that long, so keep it under your own tool-call timeout. Calling wait immediately
-  after send can return the PREVIOUS turn's ai-idle (the agent has not reacted yet) -
-  a waitedMs near 0 is the tell; wait again to confirm.
+  that long, so keep it under your own tool-call timeout.
+  Do not poll a session's status to decide whether the work you handed out is done:
+  status has no notion of \"which turn\", so a session can look ai-idle before it has
+  even started on your prompt. The report is the fact.
 
 read notes:
   read-transcript reads the session's structured record and is available only for
@@ -219,18 +231,18 @@ enum Command {
         #[arg(long)]
         stdin: bool,
     },
-    /// Wait until one of your orchestrated sessions settles: finished, waiting for a
-    /// human, or exited.
+    /// Collect reports about your orchestrated sessions: blocks until at least one is
+    /// waiting, then hands them over (each report exactly once).
     ///
-    /// You usually do not need this: results are pushed to you as reports on their own
-    /// (see the `reports` section of --help). Blocks (long poll). Always read `outcome`
-    /// from the JSON - every outcome, the timeout included, exits 0. On `attention` the
-    /// session is waiting for the USER: report it and let them handle it; never answer
-    /// on their behalf.
+    /// See the `reports` section of --help for what a report is and where its body
+    /// lives. Always read `outcome` from the JSON - both `reports` and `pending` exit
+    /// 0. A note with kind: awaiting-human is for the USER: relay it and let them
+    /// handle it in that pane; never answer on their behalf.
     Wait {
-        /// Pane id of the orchestrated session, as reported by `start-session` / `list-panes`.
+        /// Only take reports about this orchestrated session; omit to take whichever
+        /// of your sessions reported first.
         #[arg(long, value_name = "ID")]
-        pane: u32,
+        pane: Option<u32>,
         /// How long to wait, in seconds (default 60, capped at 300 server-side).
         #[arg(long, value_name = "SECONDS")]
         timeout: Option<u64>,
@@ -309,7 +321,8 @@ impl Command {
                 let body = read_body(text.as_deref(), *stdin)?;
                 ControlRequest::send(identity, *pane, &body)
             }
-            // 不给 `--timeout` 就整个字段不出线：默认耐心只住在桌面侧那个常量上
+            // 两个可选参数不给就整个字段不出线：默认耐心只住在桌面侧那个常量上，
+            // 不点名则由桌面侧理解成「名下任一受编排会话」。
             Self::Wait { pane, timeout } => {
                 ControlRequest::wait(identity, *pane, timeout.map(Duration::from_secs))
             }
@@ -388,8 +401,9 @@ fn run(command: &Command) -> Result<String, CliError> {
             let sent = parse_send_receipt(status, &response).map_err(CliError::Rejected)?;
             to_json(&serde_json::json!({ "sent": sent }))
         }
-        // **超时也走成功这一路**：`pending` 是一条正常的观测结果，不是错误
-        // （做成错误就得给它一个「你或我们出了问题」的退出码档位，两样都不是）。
+        // **`pending` 也走成功这一路**：「这段时间里没有新汇报」是一条正常的观测
+        // 结果，不是错误（做成错误就得给它一个「你或我们出了问题」的退出码档位，
+        // 两样都不是）。
         Command::Wait { .. } => {
             let waited = parse_wait_outcome(status, &response).map_err(CliError::Rejected)?;
             to_json(&serde_json::json!({ "waited": waited }))
@@ -630,7 +644,7 @@ mod tests {
         );
         assert_eq!(
             Command::Wait {
-                pane: 1,
+                pane: Some(1),
                 timeout: None
             }
             .endpoint(),
@@ -674,7 +688,7 @@ mod tests {
 
         // 不给 --timeout：按服务端的默认耐心放大
         let default = Command::Wait {
-            pane: 1,
+            pane: Some(1),
             timeout: None,
         }
         .read_timeout();
@@ -683,7 +697,7 @@ mod tests {
         // 给了就按给的放大，且**必须大于**服务端会占用的那段时间
         let asked = Duration::from_secs(120);
         let t = Command::Wait {
-            pane: 1,
+            pane: Some(1),
             timeout: Some(120),
         }
         .read_timeout();
@@ -692,7 +706,7 @@ mod tests {
         // 报一个天文数字：两侧都钳到上界，读超时也跟着落在上界那一档
         let max = mt_agent_control::WAIT_MAX;
         let huge = Command::Wait {
-            pane: 1,
+            pane: None,
             timeout: Some(u64::MAX),
         }
         .read_timeout();
@@ -700,8 +714,9 @@ mod tests {
         assert!(huge > max);
     }
 
-    /// `wait` 的请求体只带目标与耐心；不给 `--timeout` 就整个字段不出线
-    /// （默认耐心只住在桌面侧那个常量上，CLI 不抄一份）。
+    /// `wait` 的请求体只带目标与耐心，两个都可选；不给就整个字段不出线
+    /// （默认耐心只住在桌面侧那个常量上，CLI 不抄一份；不点名 = 名下任一
+    /// 受编排会话，那也只有桌面侧懂）。
     #[test]
     fn 等待请求体带目标与耐心() {
         let id = mt_agent_control::Identity {
@@ -712,55 +727,66 @@ mod tests {
 
         assert_eq!(
             json(&Command::Wait {
-                pane: 101,
+                pane: None,
+                timeout: None
+            }),
+            r#"{"token":"t","paneId":5}"#,
+            "不点名就不出线"
+        );
+        assert_eq!(
+            json(&Command::Wait {
+                pane: Some(101),
                 timeout: None
             }),
             r#"{"token":"t","paneId":5,"targetPaneId":101}"#
         );
         assert_eq!(
             json(&Command::Wait {
-                pane: 101,
+                pane: Some(101),
                 timeout: Some(30)
             }),
             r#"{"token":"t","paneId":5,"targetPaneId":101,"timeoutMs":30000}"#
         );
     }
 
-    /// `--pane` 是必给的；`--timeout` 可选且必须是数字。
+    /// `--pane` 与 `--timeout` **都可选**（工单 14：不点名就是等名下任一
+    /// 受编排会话的下一条汇报）；给了就必须是数字。
     #[test]
     fn 等待的参数形状() {
         let parse = |args: &[&str]| Cli::try_parse_from(args).map(|_| ());
+        assert!(parse(&["mt-agent-cli", "wait"]).is_ok(), "--pane 可以不给");
+        assert!(parse(&["mt-agent-cli", "wait", "--timeout", "300"]).is_ok());
         assert!(parse(&["mt-agent-cli", "wait", "--pane", "1"]).is_ok());
         assert!(parse(&["mt-agent-cli", "wait", "--pane", "1", "--timeout", "30"]).is_ok());
-        assert!(parse(&["mt-agent-cli", "wait"]).is_err(), "--pane 必给");
+        assert!(parse(&["mt-agent-cli", "wait", "--pane", "x"]).is_err());
         assert!(parse(&["mt-agent-cli", "wait", "--pane", "1", "--timeout", "x"]).is_err());
     }
 
-    /// `wait` 的四类结论、以及**每一类都退出码 0** 这件事，必须写在 `--help` 里
-    /// —— 编排者看不到就会拿退出码当结论，而那样它永远读不出 attention。
+    /// `wait` 的两类结论、以及**两类都退出码 0** 这件事，必须写在 `--help` 里
+    /// —— 编排者看不到就会拿退出码当结论，而那样 `pending` 会被它当成故障。
     ///
-    /// attention 那一条还得写清「不代答」（ADR 0003 的铁律）：这是整条编排链路
+    /// 黄灯那一条还得写清「不代答」（ADR 0003 的铁律）：这是整条编排链路
     /// 上最容易被 LLM 自作主张跨过去的一道闸。
     #[test]
-    fn 帮助文案讲清楚了_wait_的四类结论() {
-        for outcome in ["ai-idle", "attention", "idle", "pending"] {
+    fn 帮助文案讲清楚了_wait_的两类结论() {
+        for outcome in ["reports", "pending"] {
             assert!(EXIT_CODE_HELP.contains(outcome), "没写 {outcome} 那一档");
         }
         assert!(
-            EXIT_CODE_HELP.contains("DO NOT answer for the user"),
-            "attention 不代答是 ADR 0003 的铁律，必须写死在帮助里"
+            EXIT_CODE_HELP.contains("relay it, do not answer it"),
+            "取到黄灯汇报时不代答是 ADR 0003 的铁律，必须写死在帮助里"
         );
         assert!(
-            EXIT_CODE_HELP.contains("exit code is 0 for all of them"),
+            EXIT_CODE_HELP.contains("exit code is 0 for both of them"),
             "得告诉它读 outcome 而不是读退出码"
         );
         assert!(
             EXIT_CODE_HELP.contains("only Stop"),
-            "ai-idle 的三种成因得分得开，别把被打断当成做完了"
+            "turn-ended 的三种成因得分得开，别把被打断当成做完了"
         );
         assert!(
             EXIT_CODE_HELP.contains("is NOT an error"),
-            "超时不是错误，得说清"
+            "pending 不是错误，得说清"
         );
         assert!(
             !EXIT_CODE_HELP.contains("musician"),
@@ -973,36 +999,48 @@ mod tests {
         }
     }
 
-    /// 工单 13：`--help` 得把**推送模型**讲清楚，否则编排者还会按拉模型去轮询。
+    /// 工单 14：`--help` 得把**取件模型**讲清楚，否则编排者要么去轮询状态，
+    /// 要么等着汇报自己出现在对话里（12 那一版的模型）。
     ///
-    /// 逐句钉住的都是「不写它就会做错」的那几条：汇报会自己来（不必轮询）、
-    /// `[mini-term]` 打头的不是用户在说话、编排者忙时汇报攒着合并送、
-    /// 回合结束那条是**自述**（不许当成事实）、黄灯归人、未被接收该怎么办。
+    /// 逐句钉住的都是「不写它就会做错」的那几条：汇报落成文件、`wait` 是取件且
+    /// 取一次即收敛、文件长什么样、五种 kind 各自怎么处置、回合结束那条是
+    /// **自述**（不许当成事实）、黄灯归人、未被接收该怎么办。
     #[test]
-    fn 帮助文案讲清楚了汇报是推给编排者的() {
+    fn 帮助文案讲清楚了汇报落文件由_wait_取件() {
         assert!(EXIT_CODE_HELP.contains("reports:"), "得有 reports 那一节");
         assert!(
-            EXIT_CODE_HELP.contains("You do not have to poll"),
-            "推送模型的第一句：不必轮询"
+            EXIT_CODE_HELP.contains("is ever typed into your terminal"),
+            "终端里一个字都不写，这条不说它会一直等着汇报自己冒出来"
         );
-        // 认出汇报的那个标记，以及「这不是用户在说话」
-        assert!(EXIT_CODE_HELP.contains("[mini-term]"));
         assert!(
-            EXIT_CODE_HELP.contains("not the user"),
-            "得说清 [mini-term] 开头的是桌面端而不是用户"
+            EXIT_CODE_HELP.contains("REPORT FILE"),
+            "汇报落成文件这件事得点名"
         );
-        // 什么时候到：空闲才投，忙时攒着合并
         assert!(
-            EXIT_CODE_HELP.contains("delivered merged into one message"),
-            "忙时攒着合并送达得写清，否则它会以为汇报丢了"
+            EXIT_CODE_HELP.contains("hands each one to you exactly"),
+            "取一次即收敛：不写它会以为可以反复 wait 重读同一条"
         );
-        // 五种汇报一种都不能少
+        assert!(
+            EXIT_CODE_HELP.contains("your own Read tool"),
+            "正文要它自己读文件"
+        );
+        assert!(
+            EXIT_CODE_HELP.contains("Nothing is lost while you are busy"),
+            "不 wait 的时候汇报不会丢，不写它会不敢去干别的"
+        );
+        // 文件的形状：键值抬头 + 空行 + 正文，且抬头的键不随显示语言变
+        assert!(EXIT_CODE_HELP.contains("kind: turn-ended"));
+        assert!(
+            EXIT_CODE_HELP.contains("always these ASCII names"),
+            "键与 kind 不翻译这条得写清，否则它会去匹配中文"
+        );
+        // 五种汇报一种都不能少（用的是**文件里那五个 slug**，不是内部名）
         for kind in [
-            "turn ended",
-            "waiting for a human",
+            "turn-ended",
+            "awaiting-human",
             "exited",
             "closed",
-            "not picked up",
+            "not-accepted",
         ] {
             assert!(EXIT_CODE_HELP.contains(kind), "缺 {kind} 那一档");
         }
@@ -1034,27 +1072,36 @@ mod tests {
             EXIT_CODE_HELP.contains("send the same prompt again"),
             "未被接收该怎么办：核对后重发"
         );
+        // 文件住在哪、谁清理
+        assert!(
+            EXIT_CODE_HELP.contains(".mini-term/reports/"),
+            "得说清文件住在项目里的哪儿"
+        );
         // 术语纪律
         assert!(!EXIT_CODE_HELP.to_lowercase().contains("musician"));
     }
 
-    /// `wait` 降级成备用手段：开头那句「通常不需要」不写，编排者仍会派活即等。
+    /// `wait` 的那几条只有编排者会踩的坑：`--pane` 可选、`dropped` 意味着丢了、
+    /// 以及**别拿状态当回合完成的判据**（工单 06 留档那条事实降级后的落点）。
     #[test]
-    fn 帮助文案把等待降成了备用手段() {
+    fn 帮助文案讲清楚了取件的几条边界() {
         assert!(
-            EXIT_CODE_HELP.contains("You usually do not need this"),
-            "wait notes 开头得先说通常不需要"
+            EXIT_CODE_HELP.contains("--pane is OPTIONAL"),
+            "不点名等任一会话是最常用的姿势，得写出来"
         );
         assert!(
-            EXIT_CODE_HELP.contains("Results are pushed to you as reports"),
-            "得指向汇报那一节"
+            EXIT_CODE_HELP.contains("dropped greater than 0"),
+            "丢了几条得让它知道自己看到的不是全部"
         );
-        // 黄灯那一档补上「怎么拿到原文」（工单 10 留档第一条）
         assert!(
-            EXIT_CODE_HELP.contains("Use read-screen to read that prompt verbatim"),
-            "attention 那档得告诉它用 read-screen 读原文"
+            EXIT_CODE_HELP.contains("Do not poll a session's status"),
+            "别拿状态当回合完成的判据（工单 06 那条已知窄口子的落点）"
         );
-        // send 被黄灯拒时同样要读原文转告
+        assert!(
+            EXIT_CODE_HELP.contains("opaque to us"),
+            "看不透的 agent 永远等不到汇报，pending + status 是唯一签名"
+        );
+        // send 被黄灯拒时要读原文转告（工单 10 留档第一条）
         assert!(
             EXIT_CODE_HELP.contains("Use read-screen on that pane"),
             "targetAwaitingHuman 那档得告诉它用 read-screen 读原文"

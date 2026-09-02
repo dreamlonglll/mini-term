@@ -98,8 +98,13 @@ use mt_i18n::{
 /// 855 → 875：工单 12 的汇报投递——`orchestrator` ns 补齐一整段汇报文案
 /// （批头 2 条、抬头字段 6 条、五种汇报各自那句话 7 条、正文 5 条），
 /// 它们随汇报一起被写穿进编排者的终端，读者同样是另一个 LLM。
+/// 875 → 862：工单 14 把汇报从「写穿编排者终端」改成「落成文件 + `wait` 取件」——
+/// 批头那 2 条随「一批合成一段」的形态消失；抬头 6 条与五种汇报各自那句话里的
+/// 5 条（`turnEnded` / `awaitingHuman` / `exited` / `closed` / `notAccepted`）
+/// 被**稳定的 ASCII 键值行**取代（`kind: turn-ended`，编排者要拿它分支，
+/// 翻译它就等于让它认两套名字）。汇报文件的**正文**照旧走字典，一条没少。
 const EXPECTED_NAMESPACES: usize = 33;
-const EXPECTED_ENTRIES_PER_LANG: usize = 875;
+const EXPECTED_ENTRIES_PER_LANG: usize = 862;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

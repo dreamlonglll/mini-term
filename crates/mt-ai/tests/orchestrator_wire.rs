@@ -702,23 +702,90 @@ fn desktop_busy_的语义两侧一致() {
     );
 }
 
-// ─── 工单 06:wait ────────────────────────────────────────────
+// ─── 工单 06 / 14:wait ────────────────────────────────────────
 
-/// `wait` 的结论:请求方向(CLI 构造带 targetPaneId + timeoutMs 的体)与响应方向
-/// (handler 的等待回执)各走一遍真代码。
-///
-/// 这里的假宿主刚干完一个回合(`ai-idle` + `Stop`),所以一问就收敛 ——
-/// 长轮询本身在主缝测(`control.rs`),这条只对账**形状**。
-#[test]
-fn 等待结论能被_sidecar_解析器读懂() {
-    let (plane, identity, _body) = granted();
+/// 汇报要真的落成文件,所以这一组得有一个**真实存在**的项目目录。
+/// `p-self` 的路径改成一个临时目录,其余照抄 [`Host`]。
+struct ReportHost(String);
+
+impl OrchestratorHost for ReportHost {
+    fn launchers(&self) -> Vec<ControlLauncher> {
+        Host.launchers()
+    }
+    fn projects(&self) -> Vec<ControlProject> {
+        Host.projects()
+            .into_iter()
+            .map(|mut p| {
+                if p.id == "p-self" {
+                    p.path = self.0.clone();
+                }
+                p
+            })
+            .collect()
+    }
+    fn pane_session(&self, pane_id: u32) -> Option<PaneSession> {
+        Host.pane_session(pane_id)
+    }
+}
+
+/// 一个只属于本次测试的临时项目根,`Drop` 时整个删掉。
+struct TempProject(std::path::PathBuf);
+
+impl TempProject {
+    fn new(label: &str) -> Self {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("mt-wire-reports-{label}-{ts}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        Self(dir)
+    }
+    fn path(&self) -> String {
+        self.0.to_string_lossy().to_string()
+    }
+}
+
+impl Drop for TempProject {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// 起一个「编排者 pane 7 + 一个落地的受编排会话 101」的现场,项目落在临时目录。
+fn granted_in(root: &TempProject, actions: Arc<dyn OrchestratorActions>) -> (ControlPlane, Identity) {
+    let plane = ControlPlane::new();
+    plane.set_host(Arc::new(ReportHost(root.path())));
+    plane.set_actions(actions);
+    // 会话记录顶成假的:默认实现会去翻用户真实的 `~/.claude` / `~/.codex`
+    plane.set_transcripts(Arc::new(Transcripts));
+    let token = plane.grant(7, "p-self");
+    let identity = Identity { token, pane_id: 7 };
     let start =
         serde_json::to_string(&ControlRequest::start_session(&identity, "claude", None)).unwrap();
     assert_eq!(plane.handle("start-session", &start).status, 200);
+    (plane, identity)
+}
+
+/// `wait` 的取件回执:请求方向(CLI 构造带 targetPaneId + timeoutMs 的体)与
+/// 响应方向(handler 交出来的那一批汇报)各走一遍真代码。
+///
+/// 这里的受编排会话刚跑完一个回合,汇报已经落成文件,所以一问就有 ——
+/// 长轮询本身在主缝测(`control.rs`),这条只对账**形状**,外加一条硬事实:
+/// 回执里那个 `file` 真的指得到一个能读的文件。
+#[test]
+fn 取到的汇报能被_sidecar_解析器读懂() {
+    let root = TempProject::new("turn-ended");
+    let (plane, identity) = granted_in(&root, Arc::new(Actions));
+
+    // 走完一个回合并落盘
+    plane.observe_status(101, "ai-working", Some("UserPromptSubmit"));
+    plane.observe_status(101, "ai-idle", Some("Stop"));
+    plane.materialize_pending();
 
     let body = serde_json::to_string(&ControlRequest::wait(
         &identity,
-        101,
+        Some(101),
         Some(std::time::Duration::from_secs(2)),
     ))
     .unwrap();
@@ -727,18 +794,43 @@ fn 等待结论能被_sidecar_解析器读懂() {
 
     let waited = parse_wait_outcome(outcome.status, &outcome.body)
         .expect("sidecar 的解析器必须读得懂桌面 handler 的产出");
-    assert_eq!(waited.pane_id, 101);
-    assert_eq!(waited.outcome, "ai-idle");
-    assert_eq!(waited.status, "ai-idle");
-    // 成因**原文**要到得了 CLI 侧:只有 `Stop` 是真做完
-    assert_eq!(waited.cause.as_deref(), Some("Stop"));
+    assert_eq!(waited.outcome, "reports");
+    assert_eq!(waited.dropped, 0);
     assert!(waited.is_settled());
     assert!(!waited.needs_human());
+    assert_eq!(waited.reports.len(), 1);
+    let r = &waited.reports[0];
+    assert_eq!(r.pane_id, 101);
+    assert_eq!(r.kind, "turn-ended");
+    // 成因**原文**要到得了 CLI 侧:只有 `Stop` 是真做完
+    assert_eq!(r.cause.as_deref(), Some("Stop"));
+    assert!(!r.at.is_empty());
+
+    // 回执里那个路径是**绝对路径**,而且真的指得到一份读得开的汇报
+    let file = std::path::Path::new(&r.file);
+    assert!(file.is_absolute(), "{}", r.file);
+    let text = std::fs::read_to_string(file).expect("汇报文件得真的在那儿");
+    assert!(text.contains("kind: turn-ended"), "{text}");
+    assert!(text.contains("cause: Stop"), "{text}");
+    assert!(text.contains("跑完了"), "正文是会话记录增量: {text}");
+
+    // 取一次即收敛
+    let body = serde_json::to_string(&ControlRequest::wait(
+        &identity,
+        Some(101),
+        Some(std::time::Duration::ZERO),
+    ))
+    .unwrap();
+    let outcome = plane.handle("wait", &body);
+    let waited = parse_wait_outcome(outcome.status, &outcome.body).unwrap();
+    assert_eq!(waited.outcome, "pending");
+    assert!(waited.reports.is_empty());
 }
 
-/// attention 那一档的形状对账:原因原文透到 CLI 侧,`needs_human` 认得出。
+/// 黄灯那一档的形状对账:`kind: awaiting-human` 透到 CLI 侧,`needs_human` 认得出,
+/// 而且**审批提示的原文**进了汇报文件(ADR 0003 要求编排者把它播报给用户)。
 ///
-/// 用一个单独的假宿主,因为它要停在「等人处理」而不是「干完了」——
+/// 用一个单独的假动作实现,因为它要停在「等人处理」而不是「干完了」——
 /// 而这正是编排者**唯一必须停手**的那一档(ADR 0003:不代答)。
 #[test]
 fn 等人处理那一档能被_sidecar_解析器读懂() {
@@ -768,28 +860,28 @@ fn 等人处理那一档能被_sidecar_解析器读懂() {
         }
     }
 
-    let plane = ControlPlane::new();
-    plane.set_host(Arc::new(Host));
-    plane.set_actions(Arc::new(Waiting));
-    let token = plane.grant(7, "p-self");
-    let identity = Identity { token, pane_id: 7 };
-    let start =
-        serde_json::to_string(&ControlRequest::start_session(&identity, "claude", None)).unwrap();
-    assert_eq!(plane.handle("start-session", &start).status, 200);
+    let root = TempProject::new("attention");
+    let (plane, identity) = granted_in(&root, Arc::new(Waiting));
+    plane.observe_status(101, "ai-working", Some("PermissionRequest"));
+    plane.materialize_pending();
 
-    let body = serde_json::to_string(&ControlRequest::wait(&identity, 101, None)).unwrap();
+    let body = serde_json::to_string(&ControlRequest::wait(&identity, None, None)).unwrap();
     let outcome = plane.handle("wait", &body);
     assert_eq!(outcome.status, 200, "{}", outcome.body);
 
     let waited = parse_wait_outcome(outcome.status, &outcome.body).unwrap();
-    assert_eq!(waited.outcome, "attention");
-    assert_eq!(waited.cause.as_deref(), Some("PermissionRequest"));
-    assert_eq!(waited.status, "ai-working", "Codex 那一档停在工作中");
     assert!(waited.needs_human(), "CLI 侧据此停手播报");
+    assert_eq!(waited.reports[0].kind, "awaiting-human");
+    assert_eq!(waited.reports[0].cause.as_deref(), Some("PermissionRequest"));
+    let text = std::fs::read_to_string(&waited.reports[0].file).unwrap();
+    assert!(
+        text.contains("Allow Bash(cargo test)? (y/n)"),
+        "审批提示的原文得进汇报文件: {text}"
+    );
 }
 
-/// `wait` **没有自己的新错误码**:「pane 不存在」那一类终态复用可见范围铁律
-/// 那三条(与 `send` 一模一样),两侧对得上。
+/// `wait` **没有自己的新错误码**:点了名而那个 pane 不归你(或就是你自己)时,
+/// 复用可见范围铁律那两条(与 `send` 一模一样),两侧对得上。
 #[test]
 fn 等待复用可见范围的错误码() {
     let (plane, identity, _body) = granted();
@@ -798,7 +890,7 @@ fn 等待复用可见范围的错误码() {
     assert_eq!(plane.handle("start-session", &start).status, 200);
 
     // 不是自己起的乐手 —— 统一的「不存在」语义
-    let body = serde_json::to_string(&ControlRequest::wait(&identity, 4242, None)).unwrap();
+    let body = serde_json::to_string(&ControlRequest::wait(&identity, Some(4242), None)).unwrap();
     let outcome = plane.handle("wait", &body);
     let err = parse_wait_outcome(outcome.status, &outcome.body).unwrap_err();
     assert_eq!(err.code, "paneNotFound");
@@ -810,10 +902,24 @@ fn 等待复用可见范围的错误码() {
     );
 
     // 自指禁令
-    let body = serde_json::to_string(&ControlRequest::wait(&identity, 7, None)).unwrap();
+    let body = serde_json::to_string(&ControlRequest::wait(&identity, Some(7), None)).unwrap();
     let outcome = plane.handle("wait", &body);
     let err = parse_wait_outcome(outcome.status, &outcome.body).unwrap_err();
     assert_eq!(err.code, "selfTarget");
+
+    // 不点名是合法的(工单 14):名下没有汇报就是一条正常的 `pending`
+    let body = serde_json::to_string(&ControlRequest::wait(
+        &identity,
+        None,
+        Some(std::time::Duration::ZERO),
+    ))
+    .unwrap();
+    let outcome = plane.handle("wait", &body);
+    assert_eq!(outcome.status, 200, "{}", outcome.body);
+    let waited = parse_wait_outcome(outcome.status, &outcome.body).unwrap();
+    assert_eq!(waited.outcome, "pending");
+    assert!(waited.reports.is_empty());
+    assert!(!waited.is_settled());
 }
 
 /// 长轮询的**上界与默认耐心**两侧必须是同一个数,而 CLI 的读超时必须留出富余。

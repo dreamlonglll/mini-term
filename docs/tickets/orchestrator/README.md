@@ -1,6 +1,6 @@
 # 编排者（Orchestrator MVP）工单
 
-规格（PRD）在 issue [#61](https://github.com/dreamlonglll/mini-term/issues/61)，边界决策在 `docs/adr/0003-ai-session-orchestration.md`（第一期：拉模型）与 `docs/adr/0004-orchestrated-session-reports.md`（第二期：汇报推送），领域词条见 `CONTEXT.md`（编排者 / 受编排会话 / 任务 / 回合 / 汇报）。编排者那一侧的礼仪只有一份源头：`.claude/skills/mini-term-orchestrator/SKILL.md`（`mt-app::orchestrator_skill` 用 `include_str!` 编进主程序按项目投放），与 `mt-agent-cli --help` 两处一起构成编排者读到的全部指引。
+规格（PRD）在 issue [#61](https://github.com/dreamlonglll/mini-term/issues/61)，边界决策在 `docs/adr/0003-ai-session-orchestration.md`（第一期：拉模型）与 `docs/adr/0004-orchestrated-session-reports.md`（第二期：汇报落文件，`wait` 取件），领域词条见 `CONTEXT.md`（编排者 / 受编排会话 / 任务 / 回合 / 汇报）。编排者那一侧的礼仪只有一份源头：`.claude/skills/mini-term-orchestrator/SKILL.md`（`mt-app::orchestrator_skill` 用 `include_str!` 编进主程序按项目投放），与 `mt-agent-cli --help` 两处一起构成编排者读到的全部指引。
 
 每张工单是一发 tracer bullet：纵切所有层、可独立演示。按 frontier 开工——阻塞项全部完成的票即可动工，每张票用一个新会话实施。
 
@@ -33,19 +33,22 @@
 | 08 | 乐手并发上限设置项 | 03 |
 | 09 | 编排礼仪 Skill + 端到端真机验收（收口） | 04–08 |
 
-## 第二期：汇报推送（ADR 0004）
+## 第二期：汇报（ADR 0004）
 
-拉模型换成推：受编排会话每个回合结束、停下等人、退出、派活未被接收，桌面端生成「汇报」写穿进编排者终端。决策在 `docs/adr/0004-orchestrated-session-reports.md`，术语见 `CONTEXT.md`（任务 / 回合 / 汇报）。
+受编排会话每个回合结束、停下等人、退出、被关、派活未被接收，桌面端就生成一条「汇报」。**正文落成编排者项目目录下的一个 Markdown 文件，终端里一个字都不写**；`wait` 改成取件——阻塞到名下有新汇报就交出「哪个会话、什么事、文件在哪」，正文由编排者自己用 Read 工具读。决策在 `docs/adr/0004-orchestrated-session-reports.md`，术语见 `CONTEXT.md`（任务 / 回合 / 汇报）。
+
+12 那一版是把整段汇报**写穿进编排者的终端**，真机一看就被否（像用户在输入，且上下文线性膨胀），14 推翻重做——账本、渲染、`transcript_binding`、桌面接线全部保留，只把末端从「写编排者的 PTY」换成「写文件 + 入队」。
 
 ```
 10 派活改造（黄灯拦截 + 任务身份 + 格式尾部）──┐
-                                                ├─→ 12 投递泵 + 接线 ─→ 13 CLI/Skill/真机验收（收口）
+                                                ├─→ 12 投递泵 + 接线 ─→ 13 CLI/Skill/真机验收 ─→ 14 落文件 + wait 取件（现行形态）
 11 回合追踪与汇报账本（纯状态机）──────────────┘
 ```
 
 - **10、11** 互不阻塞，并行开工（同一 worktree，文件不交叉：11 只新增 `reports.rs`）
 - **12** 汇合点
 - **13** 收口
+- **14** 推翻 12 的投递方式；13 的 CLI 帮助与 Skill 随之再改一遍
 
 | 票 | 标题 | Blocked by |
 |----|------|-----------|
