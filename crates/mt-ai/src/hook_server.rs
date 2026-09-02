@@ -1334,7 +1334,10 @@ mod tests {
         // 提问工具映射成 Elicitation:等作答期间点黄灯,作答后熄灭
         assert_eq!(map_event("Elicitation", Some("omp"), None), Some("ai-idle"));
         assert!(is_attention_cause(event_cause("Elicitation", None, None)));
-        assert_eq!(map_event("ElicitationResult", Some("omp"), None), Some("ai-working"));
+        assert_eq!(
+            map_event("ElicitationResult", Some("omp"), None),
+            Some("ai-working")
+        );
         // 自动重试的 Notification 靠文案里的 retrying 判为「仍在工作」
         assert_eq!(
             map_event(
@@ -1345,7 +1348,10 @@ mod tests {
             Some("ai-working")
         );
         // omp 的 PermissionRequest 走 Claude 语义(ai-idle + 黄灯),不是 Codex 那条特例
-        assert_eq!(map_event("PermissionRequest", Some("omp"), None), Some("ai-idle"));
+        assert_eq!(
+            map_event("PermissionRequest", Some("omp"), None),
+            Some("ai-idle")
+        );
     }
 
     // ---- Grok Build 特有语义 ----

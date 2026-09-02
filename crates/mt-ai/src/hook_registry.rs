@@ -979,7 +979,10 @@ fn register_omp_hooks() -> Result<String, String> {
             OMP_HOOK_EVENTS.len()
         )
     } else {
-        format!("oh-my-pi: 扩展已是最新 (共 {} 个事件)", OMP_HOOK_EVENTS.len())
+        format!(
+            "oh-my-pi: 扩展已是最新 (共 {} 个事件)",
+            OMP_HOOK_EVENTS.len()
+        )
     })
 }
 
@@ -1540,7 +1543,8 @@ mod tests {
         let foreign = "export default function (pi) { pi.on(\"session_start\", () => {}); }";
         assert!(omp_events_in_source(foreign).is_empty());
         // 老版本模板（带标识但事件不全）识别成「旧版本 N/M」
-        let stale = format!("// {HOOK_MARKER}\npi.on(\"session_start\", f); pi.on(\"agent_end\", g);");
+        let stale =
+            format!("// {HOOK_MARKER}\npi.on(\"session_start\", f); pi.on(\"agent_end\", g);");
         let got = omp_events_in_source(&stale);
         assert_eq!(got.len(), 2);
         assert!(got.contains("session_start") && got.contains("agent_end"));

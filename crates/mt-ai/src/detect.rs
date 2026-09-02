@@ -148,11 +148,31 @@ mod tests {
     /// 一次性提问与版本查询不算;basename 全等,`compose` / `ompx` 都不会误伤。
     #[test]
     fn omp_is_recognized_only_when_interactive() {
-        for cmd in ["omp", "omp.cmd", "omp --resume 1f9d2a6b", "omp --continue", "omp --fork abc"] {
-            assert_eq!(interactive_ai_command_name(cmd), Some("omp"), "{cmd} 应识别为 omp");
+        for cmd in [
+            "omp",
+            "omp.cmd",
+            "omp --resume 1f9d2a6b",
+            "omp --continue",
+            "omp --fork abc",
+        ] {
+            assert_eq!(
+                interactive_ai_command_name(cmd),
+                Some("omp"),
+                "{cmd} 应识别为 omp"
+            );
         }
-        for cmd in ["omp -p 'fix it'", "omp --version", "omp -h", "docker compose up", "ompx"] {
-            assert_eq!(interactive_ai_command_name(cmd), None, "{cmd} 不该进入 AI 会话");
+        for cmd in [
+            "omp -p 'fix it'",
+            "omp --version",
+            "omp -h",
+            "docker compose up",
+            "ompx",
+        ] {
+            assert_eq!(
+                interactive_ai_command_name(cmd),
+                None,
+                "{cmd} 不该进入 AI 会话"
+            );
         }
         // 行快照里带 prompt 也认得出
         assert_eq!(line_ai_command_name("PS D:\\repo> omp"), Some("omp"));

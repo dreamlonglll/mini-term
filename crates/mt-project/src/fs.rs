@@ -1229,7 +1229,10 @@ mod tests {
         let target = root.join("sub");
         fs::create_dir(&target).unwrap();
         let moved = move_entry(&root, &file, &target).expect("move 失败");
-        assert_eq!(moved, strip_verbatim_prefix(target.canonicalize().unwrap()).join("inside.txt"));
+        assert_eq!(
+            moved,
+            strip_verbatim_prefix(target.canonicalize().unwrap()).join("inside.txt")
+        );
         assert!(moved.exists());
         assert!(!file.exists(), "源文件应被移走");
         assert_eq!(fs::read(&moved).unwrap(), b"hi");
@@ -1258,7 +1261,10 @@ mod tests {
         let dir = root.join("pkg");
         fs::create_dir_all(dir.join("deep")).unwrap();
         assert!(move_entry(&root, &dir, &dir).is_err(), "移进自身");
-        assert!(move_entry(&root, &dir, &dir.join("deep")).is_err(), "移进子孙");
+        assert!(
+            move_entry(&root, &dir, &dir.join("deep")).is_err(),
+            "移进子孙"
+        );
         assert!(dir.join("deep").exists(), "拒绝后原树一字未动");
         fs::remove_dir_all(&root).ok();
     }
@@ -1286,7 +1292,10 @@ mod tests {
     fn move_entry_rejects_target_outside_project() {
         let (root, file) = make_test_project();
         let outside = std::env::temp_dir();
-        assert!(move_entry(&root, &file, &outside).is_err(), "目标在项目根之外");
+        assert!(
+            move_entry(&root, &file, &outside).is_err(),
+            "目标在项目根之外"
+        );
         assert!(file.exists());
         fs::remove_dir_all(&root).ok();
     }

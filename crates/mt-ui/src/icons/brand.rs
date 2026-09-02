@@ -679,12 +679,28 @@ mod tests {
             let (pts, closed) = shape.geom.points();
             assert!(closed, "圆角矩形应闭合");
             for (x, y) in pts {
-                assert!((0.0..=1.0).contains(&x) && (0.0..=1.0).contains(&y), "({x},{y}) 出框");
+                assert!(
+                    (0.0..=1.0).contains(&x) && (0.0..=1.0).contains(&y),
+                    "({x},{y}) 出框"
+                );
             }
         }
         let (leg, plug) = (&OMP[2].geom, &OMP[3].geom);
-        let (Geom::Rect { x: lx, y: ly, w: lw, h: lh, .. }, Geom::Rect { x: px, y: py, w: pw, .. }) =
-            (*leg, *plug)
+        let (
+            Geom::Rect {
+                x: lx,
+                y: ly,
+                w: lw,
+                h: lh,
+                ..
+            },
+            Geom::Rect {
+                x: px,
+                y: py,
+                w: pw,
+                ..
+            },
+        ) = (*leg, *plug)
         else {
             panic!("右腿与插头都该是矩形");
         };

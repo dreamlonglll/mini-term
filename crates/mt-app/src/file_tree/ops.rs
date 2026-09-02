@@ -883,7 +883,10 @@ pub(super) fn confirm_move(
         )
         .unwrap_or_else(|| target_dir.to_string_lossy().into_owned())
     } else {
-        fs_ops::relative_path(&target_dir.to_string_lossy(), &context.root.to_string_lossy())
+        fs_ops::relative_path(
+            &target_dir.to_string_lossy(),
+            &context.root.to_string_lossy(),
+        )
     };
     Confirm::new(
         t("fileTree", "dialog.moveTitle"),

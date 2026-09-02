@@ -41,8 +41,8 @@ use std::path::{Path, PathBuf};
 
 use gpui::{
     AnyElement, AppContext, Bounds, Context, Entity, InteractiveElement, IntoElement,
-    ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled, Task,
-    Window, anchored, canvas, div, prelude::FluentBuilder, px, relative,
+    ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled, Task, Window,
+    anchored, canvas, div, prelude::FluentBuilder, px, relative,
 };
 use mt_config::SshConnection;
 use mt_project::fs::FileEntry;
@@ -328,7 +328,12 @@ impl MoveToPanel {
         .into_any_element()
     }
 
-    fn render_dir_row(&self, index: usize, entry: &FileEntry, cx: &mut Context<Self>) -> AnyElement {
+    fn render_dir_row(
+        &self,
+        index: usize,
+        entry: &FileEntry,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let enabled = self.source.accepts_target(&entry.path);
         let is_open = self.open_child == Some(index);
         let target = entry.path.clone();
@@ -396,7 +401,10 @@ impl Render for MoveToPanel {
         let this = cx.entity();
 
         let mut list = div()
-            .id(SharedString::from(format!("move-to-list-{}", self.dir.display())))
+            .id(SharedString::from(format!(
+                "move-to-list-{}",
+                self.dir.display()
+            )))
             .flex()
             .flex_col()
             .max_h(px(MAX_LIST_HEIGHT))
@@ -463,11 +471,7 @@ impl Render for MoveToPanel {
                         .absolute()
                         .left(relative(1.0))
                         .top(top - px(4.0))
-                        .child(
-                            anchored()
-                                .snap_to_window_with_margin(px(4.0))
-                                .child(panel),
-                        ),
+                        .child(anchored().snap_to_window_with_margin(px(4.0)).child(panel)),
                 )
             })
     }
@@ -518,8 +522,14 @@ mod tests {
         assert!(!dir.accepts_target(Path::new(r"D:\p")), "已在该目录");
         assert!(!dir.accepts_target(Path::new(r"D:\p\src")), "自身");
         assert!(!dir.accepts_target(Path::new(r"D:\p\src\core")), "子孙");
-        assert!(!dir.accepts_target(Path::new(r"D:\p\src\core\x")), "更深的子孙");
-        assert!(dir.accepts_target(Path::new(r"D:\p\src-old")), "同名前缀的兄弟");
+        assert!(
+            !dir.accepts_target(Path::new(r"D:\p\src\core\x")),
+            "更深的子孙"
+        );
+        assert!(
+            dir.accepts_target(Path::new(r"D:\p\src-old")),
+            "同名前缀的兄弟"
+        );
         assert!(dir.accepts_target(Path::new(r"D:\p\docs")));
     }
 
@@ -529,10 +539,19 @@ mod tests {
     fn 远程按_posix_判() {
         let dir = remote("/home/u/proj/src", true);
         assert!(!dir.accepts_target(Path::new("/home/u/proj")), "已在该目录");
-        assert!(!dir.accepts_target(Path::new("/home/u/proj/")), "尾斜杠等价");
+        assert!(
+            !dir.accepts_target(Path::new("/home/u/proj/")),
+            "尾斜杠等价"
+        );
         assert!(!dir.accepts_target(Path::new("/home/u/proj/src")), "自身");
-        assert!(!dir.accepts_target(Path::new("/home/u/proj/src/core")), "子孙");
-        assert!(dir.accepts_target(Path::new("/home/u/proj/src2")), "同名前缀的兄弟");
+        assert!(
+            !dir.accepts_target(Path::new("/home/u/proj/src/core")),
+            "子孙"
+        );
+        assert!(
+            dir.accepts_target(Path::new("/home/u/proj/src2")),
+            "同名前缀的兄弟"
+        );
         assert!(dir.accepts_target(Path::new("/home/u/proj/docs")));
 
         let file = remote("/home/u/proj/src/a.rs", false);
