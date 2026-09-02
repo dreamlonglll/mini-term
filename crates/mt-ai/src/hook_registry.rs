@@ -419,34 +419,44 @@ fn build_codex_hook_entry(hook_path: &str, event: &str) -> Value {
     }])
 }
 
-/// 确保 Codex config.toml 中启用了 hooks feature flag
+/// 将 Codex config.toml 更新为当前 hooks feature，并迁移旧版键。
+///
+/// 抽成纯函数，避免测试改写开发者真实的 `~/.codex/config.toml`。
+fn enable_codex_hooks_feature(content: &str) -> Result<String, String> {
+    let mut doc: toml_edit::DocumentMut = content
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| format!("解析 config.toml 失败: {}", e))?;
+
+    if doc.get("features").is_none() {
+        doc["features"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    let features = doc["features"]
+        .as_table_like_mut()
+        .ok_or_else(|| "config.toml 的 features 字段不是表".to_string())?;
+
+    // Codex CLI 0.152.1 起改用 `hooks`；移除旧键，避免新版本报告未知 feature。
+    features.remove("codex_hooks");
+    features.insert("hooks", toml_edit::value(true));
+    Ok(doc.to_string())
+}
+
+/// 确保 Codex config.toml 中启用了当前 hooks feature flag。
 fn ensure_codex_hooks_feature() -> Result<(), String> {
     let config_path = codex_config_path().ok_or_else(|| "无法获取 home 目录".to_string())?;
 
-    // 确保 .codex 目录存在
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("创建 .codex 目录失败: {}", e))?;
     }
 
-    // 读取或创建 config.toml
     let content = if config_path.exists() {
         std::fs::read_to_string(&config_path)
             .map_err(|e| format!("读取 config.toml 失败: {}", e))?
     } else {
         String::new()
     };
+    let updated = enable_codex_hooks_feature(&content)?;
 
-    let mut doc: toml_edit::DocumentMut = content
-        .parse::<toml_edit::DocumentMut>()
-        .map_err(|e| format!("解析 config.toml 失败: {}", e))?;
-
-    // 确保 [features] 段落存在并设置 codex_hooks = true
-    if doc.get("features").is_none() {
-        doc["features"] = toml_edit::Item::Table(toml_edit::Table::new());
-    }
-    doc["features"]["codex_hooks"] = toml_edit::value(true);
-
-    crate::util::atomic_write(&config_path, doc.to_string().as_bytes())
+    crate::util::atomic_write(&config_path, updated.as_bytes())
         .map_err(|e| format!("写入 config.toml 失败: {}", e))?;
 
     Ok(())
@@ -1017,7 +1027,7 @@ pub fn get_hook_config_snippet() -> Result<Value, String> {
                 {
                     "file": "~/.codex/config.toml",
                     "note": "追加以下内容",
-                    "content": "[features]\ncodex_hooks = true"
+                    "content": "[features]\nhooks = true"
                 }
             ]
         }
@@ -1228,5 +1238,53 @@ mod tests {
             .expect("SessionEnd hook 应包含命令");
         assert!(command.contains("miniterm-hook"));
         assert!(command.ends_with(" SessionEnd"));
+    }
+
+    /// Codex CLI 0.152.1 起 feature 名改为 `hooks`。手动片段与一键注册必须
+    /// 使用同一现行键；继续展示旧键会让用户照抄后无法启动 hooks。
+    #[test]
+    fn codex_manual_config_uses_current_hooks_feature() {
+        let snippet = get_hook_config_snippet().expect("应生成 hook 配置片段");
+        let content = snippet["codex"]["files"][1]["content"]
+            .as_str()
+            .expect("Codex config.toml 片段应为字符串");
+
+        assert!(content.contains("hooks = true"));
+        assert!(
+            !content.contains("codex_hooks"),
+            "Codex CLI 已不再识别 codex_hooks feature"
+        );
+    }
+
+    #[test]
+    fn codex_feature_config_migrates_legacy_key_and_preserves_user_content() {
+        let updated = enable_codex_hooks_feature(
+            "# 用户注释\nmodel = \"gpt-5\"\n\n[features]\ncodex_hooks = true\nweb_search = true\n",
+        )
+        .expect("应迁移 Codex feature");
+        let doc = updated
+            .parse::<toml_edit::DocumentMut>()
+            .expect("迁移结果应是合法 TOML");
+
+        assert_eq!(doc["features"]["hooks"].as_bool(), Some(true));
+        assert!(doc["features"].get("codex_hooks").is_none());
+        assert_eq!(doc["features"]["web_search"].as_bool(), Some(true));
+        assert_eq!(doc["model"].as_str(), Some("gpt-5"));
+        assert!(updated.contains("# 用户注释"));
+    }
+
+    #[test]
+    fn codex_feature_config_accepts_inline_features_table() {
+        let updated = enable_codex_hooks_feature(
+            "features = { codex_hooks = true, web_search = true }\n",
+        )
+        .expect("应迁移内联 features 表");
+        let doc = updated
+            .parse::<toml_edit::DocumentMut>()
+            .expect("迁移结果应是合法 TOML");
+
+        assert_eq!(doc["features"]["hooks"].as_bool(), Some(true));
+        assert!(doc["features"].get("codex_hooks").is_none());
+        assert_eq!(doc["features"]["web_search"].as_bool(), Some(true));
     }
 }
