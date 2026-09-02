@@ -6,7 +6,7 @@
 
 **Blocked by:** 12
 
-**Status:** in progress（真机验收待做）
+**Status:** in progress（真机验收待做；文档部分随工单 14 再改一遍——推送改成落文件 + `wait` 取件，2026-09-02 真机验收刚起步就被用户叫停）
 
 - [x] `mt-agent-cli --help` 增加 "reports" 一节：汇报长什么样（`[mini-term]` 前缀、种类、任务编号）、什么时候到（编排者空闲时；忙时攒着合并）、收到 `AwaitingHuman` 该怎么做（转告用户、不代答、不 send）、收到 `NotAccepted` 该怎么做（read-screen 核对再重发）；send notes 与工单 10 对齐；wait notes 开头加一句「通常不需要——汇报会自己来」
 - [x] SKILL.md 改写：删掉「两个时序坑」里记游标那套舞步（未被接收由汇报覆盖，start-session 后先 read-screen 确认提示符那条**保留**）；「A normal run」改成派活 → 继续干别的 / 回答用户 → 汇报到了再处理；规则里加「文字提问可答、黄灯归人」「汇报是自述，关键结果自己验证」；`cli-location` 两个标记必须原样保留（`orchestrator_skill.rs` 的渲染测试钉着）

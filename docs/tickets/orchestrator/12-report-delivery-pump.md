@@ -6,7 +6,7 @@
 
 **Blocked by:** 10（任务账本）、11（汇报账本）
 
-**Status:** done
+**Status:** done → **投递方式被工单 14 推翻**（2026-09-02 用户真机否了「写穿编排者终端」：像用户在输入且上下文膨胀）。账本、渲染、接线保留，投递泵/投递闸/写穿编排者删除，改为落文件 + `wait` 取件，见 14。
 
 - [x] `ControlPlane` 新增 `pub fn observe_status(pty_id, status, cause)` 与 `pub fn observe_pane_closed(pty_id)`：按记账表把「这个 pty 是谁的乐手」翻出来喂给 11 的账本；pty 是编排者自己时只用来**唤醒投递**（它可能刚变空闲）；两者都不是就忽略。记账增删（`register_landed` / `revoke_pane` / 离场）同步到账本的 `register_hand` / `forget_hand`；编排者撤销令牌时 `drop_inbox`
 - [x] 投递闸 `can_deliver(&PaneLiveness) -> bool`（纯函数、有单测）：`alive && status == "ai-idle" && !is_attention_cause(cause)`。`ai-working` 暂存、黄灯暂存、`idle`（裸 shell）暂存、pane 没了丢弃
