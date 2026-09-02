@@ -2079,12 +2079,24 @@ fn main() {
         cx.background_executor()
             .spawn(async { mt_core::cleanup_ssh_temp_keys() })
             .detach();
-        // Codex 的 feature 键改名(codex_hooks -> hooks)后,存量用户那份 config.toml
-        // 只有重点一次「注册」才会被改写 —— 而面板判「已注册」只看 hooks.json,
-        // 界面上没有任何线索提示他去点。故启动时按注册现状自愈一次(键已经是新名字
-        // 就不落盘)。同样丢后台:它要读写用户主目录下的文件。
+        // 已注册用户的启动期自愈,三家各一条。装机版 `lib.rs::setup` 里原本也是
+        // 一个后台线程按序跑这几条,GPUI 迁移时 hook_registry 逐字搬进了 mt-ai、
+        // 这行调用漏搬,claude/grok 两条自 2026-08-20(b52a654 删 src-tauri)起
+        // 一直没执行过 —— 补回来:
+        // - claude: 补齐新版本新增的 hook 事件(事件集没长过就直接 return,不写盘)
+        // - grok:   兼职把 `{grok_home}/hooks/` 里的 hook 二进制副本刷成当前版本
+        //           (mini-term 升级后旧副本会滞留),故不设「没变化」短路
+        // - codex:  把 config.toml 的 feature 键迁到现行名字(codex_hooks -> hooks),
+        //           面板判「已注册」只看 hooks.json,界面上没有线索提示用户重点
+        //           一次注册;键已是新名字就不落盘
+        // 三条都只在**已注册过**时才动手 —— 没开过这功能的用户一律不碰他的配置。
+        // 都要读写用户主目录下的文件,故丢后台不挡启动。
         cx.background_executor()
-            .spawn(async { mt_ai::hook_registry::sync_codex_hooks_feature_if_registered() })
+            .spawn(async {
+                mt_ai::hook_registry::sync_claude_hooks_if_registered();
+                mt_ai::hook_registry::sync_grok_hooks_if_registered();
+                mt_ai::hook_registry::sync_codex_hooks_feature_if_registered();
+            })
             .detach();
         // 真正的主题在 store 装好之后按 config 装配(`apply_theme_from_config`):
         // 亮/暗/auto + 外置主题包 + 终端配色一次算全。这里先钉一个暗色兜底,
