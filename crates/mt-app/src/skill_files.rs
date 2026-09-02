@@ -79,7 +79,8 @@ pub(crate) fn prune_empty_skill_dirs(skill_md: &Path) {
 /// 计算追加条目后的 `.gitignore` 全文;若无需追加返回 `None`。抽出便于单测。
 ///
 /// `header` 是追加段前那行注释,`entries` 是要保证在场的条目(逐行 trim 后
-/// 比对,已有的不重复)。
+/// 比对,已有的不重复)。**跟着文件已有的换行风格走**:CRLF 的文件就追加 CRLF
+/// 行 —— 混进 LF 会让 git 把整个文件判成「行尾全改」(2026-09-02 在本仓踩到)。
 pub(crate) fn compute_gitignore_append(
     existing: &str,
     header: &str,
@@ -95,16 +96,17 @@ pub(crate) fn compute_gitignore_append(
         return None;
     }
 
+    let newline = if existing.contains("\r\n") { "\r\n" } else { "\n" };
     let mut out = existing.to_string();
     // 确保与已有内容之间有换行分隔
     if !out.is_empty() && !out.ends_with('\n') {
-        out.push('\n');
+        out.push_str(newline);
     }
     out.push_str(header);
-    out.push('\n');
+    out.push_str(newline);
     for entry in missing {
         out.push_str(entry);
-        out.push('\n');
+        out.push_str(newline);
     }
     Some(out)
 }
@@ -284,6 +286,28 @@ mod tests {
         assert_eq!(content.matches(".codex/skills/x/").count(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// CRLF 的 `.gitignore` 追加 CRLF 行,不许混进 LF(git 会把整个文件判成行尾全改)。
+    #[test]
+    fn gitignore_append_follows_crlf_style() {
+        let result = compute_gitignore_append("dist\r\nnode_modules\r\n", HEADER, ENTRIES).unwrap();
+        assert_eq!(
+            result,
+            "dist\r\nnode_modules\r\n# test skill\r\n.claude/skills/x/\r\n.codex/skills/x/\r\n"
+        );
+        // 末尾没换行的 CRLF 文件:补的分隔也是 CRLF
+        let result = compute_gitignore_append("dist\r\nnode_modules", HEADER, ENTRIES).unwrap();
+        assert!(result.starts_with("dist\r\nnode_modules\r\n# test skill\r\n"), "got:\n{result:?}");
+        // 已经在场的条目照样认得出(`lines()` 会剥掉 \r)
+        assert!(
+            compute_gitignore_append(
+                "# test skill\r\n.claude/skills/x/\r\n.codex/skills/x/\r\n",
+                HEADER,
+                ENTRIES
+            )
+            .is_none()
+        );
     }
 
     // ─── validate_project_dir ───

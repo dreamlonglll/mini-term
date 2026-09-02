@@ -223,16 +223,29 @@ pub fn deploy(project_dir: &str) -> Result<(), String> {
     let dir = validate_project_dir(project_dir)?;
     let binary_path = agent_cli_binary_path()?;
 
-    if write_skill_files(&dir, &binary_path)? == 0 {
+    let written = write_skill_files(&dir, &binary_path)?;
+    if written == 0 {
         return Ok(());
     }
     if let Err(e) = trust_project_in_codex(&dir) {
         eprintln!("[orchestrator_skill] 写 Codex 项目信任失败(不影响投放): {e}");
     }
-    if let Err(e) = append_gitignore_entries(&dir, GITIGNORE_HEADER, GITIGNORE_ENTRIES) {
+    if let Err(e) = ignore_generated_files(&dir, written) {
         eprintln!("[orchestrator_skill] 追加 .gitignore 失败(不影响投放): {e}");
     }
     Ok(())
+}
+
+/// 把生成物目录追加进 `.gitignore` —— **两份都是自己写的才碰**。
+///
+/// 有一份是别人的(用户手放的、或本仓被 git 跟踪的源文件)说明这个项目在自己管
+/// 这些文件,再把它的目录写进 `.gitignore` 是帮倒忙:在 mini-term 仓里开编排者
+/// 就会把源文件所在目录 ignore 掉(2026-09-02 踩到)。
+fn ignore_generated_files(project_dir: &Path, written: usize) -> Result<(), String> {
+    if written < skill_paths(project_dir, SKILL_DIR_NAME).len() {
+        return Ok(());
+    }
+    append_gitignore_entries(project_dir, GITIGNORE_HEADER, GITIGNORE_ENTRIES)
 }
 
 /// 从 `project_dir` 收回本模块投放的 Skill。**阻塞**,丢 `background_executor`。
@@ -389,14 +402,32 @@ mod tests {
         std::fs::write(&claude, SKILL_SOURCE).unwrap();
 
         // Claude 那份是别人的 → 跳过;Codex 那份没有 → 照写
-        assert_eq!(write_skill_files(&dir, WIN_BIN).unwrap(), 1);
+        let written = write_skill_files(&dir, WIN_BIN).unwrap();
+        assert_eq!(written, 1);
         assert_eq!(std::fs::read_to_string(&claude).unwrap(), SKILL_SOURCE);
         assert!(codex_path(&dir).exists());
+        // 有一份是别人的:`.gitignore` 一个字都不动(源文件目录不许被 ignore 掉)
+        ignore_generated_files(&dir, written).unwrap();
+        assert!(!dir.join(".gitignore").exists(), "别人的目录不许写进 .gitignore");
 
         // 收回同样只动自己写的那份
         remove_skill_files(&dir).unwrap();
         assert!(claude.exists(), "别人的文件不许删");
         assert!(!codex_path(&dir).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 两份都是自己写的,`.gitignore` 才追加两个生成物目录。
+    #[test]
+    fn 两份都自己写时才追加_gitignore() {
+        let dir = unique_test_dir("gitignore");
+        let written = write_skill_files(&dir, WIN_BIN).unwrap();
+        assert_eq!(written, 2);
+        ignore_generated_files(&dir, written).unwrap();
+        let content = std::fs::read_to_string(dir.join(".gitignore")).unwrap();
+        for entry in GITIGNORE_ENTRIES {
+            assert!(content.contains(entry), "缺 {entry}:\n{content}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
