@@ -505,32 +505,35 @@ mod tests {
         }
     }
 
+    // 本地用例一律写正斜杠:Windows 上 `Path` 两种分隔符都认,Linux 上反斜杠只是
+    // 普通字符(`D:\p\src\a.rs` 的 `parent()` 会是空),CI 的 ubuntu 跑过这里会红。
+
     /// 文件:除了「已在这个目录里」哪儿都能去 —— 包括同名目录的兄弟、更深的层。
     #[test]
     fn 文件只拒绝原目录() {
-        let file = local(r"D:\p\src\a.rs", false);
-        assert!(!file.accepts_target(Path::new(r"D:\p\src")), "已在该目录");
-        assert!(file.accepts_target(Path::new(r"D:\p")));
-        assert!(file.accepts_target(Path::new(r"D:\p\src\deep")));
-        assert!(file.accepts_target(Path::new(r"D:\p\docs")));
+        let file = local("D:/p/src/a.rs", false);
+        assert!(!file.accepts_target(Path::new("D:/p/src")), "已在该目录");
+        assert!(file.accepts_target(Path::new("D:/p")));
+        assert!(file.accepts_target(Path::new("D:/p/src/deep")));
+        assert!(file.accepts_target(Path::new("D:/p/docs")));
     }
 
     /// 目录:原目录、自身、自身的子孙都不接;同名前缀的兄弟(`src-old`)不算子孙。
     #[test]
     fn 目录拒绝自身与子孙() {
-        let dir = local(r"D:\p\src", true);
-        assert!(!dir.accepts_target(Path::new(r"D:\p")), "已在该目录");
-        assert!(!dir.accepts_target(Path::new(r"D:\p\src")), "自身");
-        assert!(!dir.accepts_target(Path::new(r"D:\p\src\core")), "子孙");
+        let dir = local("D:/p/src", true);
+        assert!(!dir.accepts_target(Path::new("D:/p")), "已在该目录");
+        assert!(!dir.accepts_target(Path::new("D:/p/src")), "自身");
+        assert!(!dir.accepts_target(Path::new("D:/p/src/core")), "子孙");
         assert!(
-            !dir.accepts_target(Path::new(r"D:\p\src\core\x")),
+            !dir.accepts_target(Path::new("D:/p/src/core/x")),
             "更深的子孙"
         );
         assert!(
-            dir.accepts_target(Path::new(r"D:\p\src-old")),
+            dir.accepts_target(Path::new("D:/p/src-old")),
             "同名前缀的兄弟"
         );
-        assert!(dir.accepts_target(Path::new(r"D:\p\docs")));
+        assert!(dir.accepts_target(Path::new("D:/p/docs")));
     }
 
     /// 远程路径按 POSIX 字符串判,尾 `/` 不算差异;Windows 客户端上也不许把
