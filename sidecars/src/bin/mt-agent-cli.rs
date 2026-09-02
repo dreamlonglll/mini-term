@@ -64,6 +64,44 @@ Exit codes:
   4  the desktop rejected the request (bad launcher/project, session limit, ...);
      change the request or wait for one of your sessions to finish
 
+reports:
+  You do not have to poll. The desktop watches every session you started and pushes a
+  report into your own terminal - it arrives exactly as if the user had typed it to
+  you - whenever one of them ends a turn, stops for a human, exits, is closed, or
+  looks like it never picked up a prompt you sent. Every line of a report starts with
+  [mini-term]. That marker means the DESKTOP is talking to you, not the user: act on
+  it, do not answer it as if a person had said it. Reports are written in mini-term's
+  display language, so the wording may not be English; the [mini-term] prefix and the
+  header fields are the same either way.
+  A report is delivered only while you are idle and not stopped on a prompt of your
+  own; while you are busy they pile up and are delivered merged into one message once
+  your turn ends. So a session can have finished minutes before you hear about it.
+  Each report header carries the session's pane id, its launcher and project, what
+  happened, the cause verbatim, and the taskIds it covers - that is how you match a
+  result to the work you handed out. The five things it can say:
+    turn ended    read `cause`: only Stop means the turn ended by itself. Interrupt
+                  means a human pressed Esc there, Stall means it went silent and was
+                  settled by a fallback - neither of those delivered anything. The
+                  transcript excerpt under the header is that session's OWN account:
+                  no tool calls, no command output, no exit codes. \"It says it fixed
+                  the tests\" is not \"the tests pass\" - verify what matters yourself.
+                  A question asked in plain prose reaches you this way, and answering
+                  it with `send` is your job.
+    waiting for a human
+                  it is stopped on an approval prompt or an interactive question. The
+                  report already quotes that screen verbatim; relay the text to the
+                  user and let them handle it in that pane. Do NOT send that session
+                  anything and do not start polling it - the next report tells you
+                  when it moved on. Its status badge is already yellow.
+    exited        the agent inside quit and that pane is a bare shell now.
+    closed        the pane is gone; nothing more will ever come from it.
+                  For both: start a new session if the work still needs doing.
+    not picked up 15s after your write that session still had not started working on
+                  it. Nothing failed and nothing is queued: use read-screen to see
+                  what is actually on that pane (still booting? a bare shell? an
+                  approval prompt?), then send the same prompt again if it is simply
+                  not there.
+
 send notes:
   A prompt is delivered immediately, never queued, and is equivalent to typing it in
   that session and pressing Enter once. Multi-line prompts go in as a single
@@ -74,12 +112,14 @@ send notes:
   and an orchestrator must never do that - ask the user to handle it instead.
   targetAwaitingHuman is a RULE, not a failure: the target session is stopped on an
   approval prompt or an interactive question, so writing anything into it would answer
-  for the user. Nothing was written and nothing is queued. Tell the user, wait for that
-  session to settle, then send again - do not retry in a loop.
+  for the user. Nothing was written and nothing is queued. Use read-screen on that pane
+  to read the prompt verbatim, relay it to the user so a human can handle it there,
+  then get on with something else - the report that arrives when that session settles
+  is your signal to send again; do not retry in a loop.
   taskId identifies this one delivery. The desktop reports back to you on its own when
-  that session finishes a turn, stops for a human, or exits, and the report carries the
-  taskIds it covers - that is how you match a result to the work you handed out. A task
-  is NOT promised to map to exactly one turn.
+  that session finishes a turn, stops for a human, or exits (see `reports` above), and
+  the report carries the taskIds it covers - that is how you match a result to the work
+  you handed out. A task is NOT promised to map to exactly one turn.
   targetStatus is the target's state at the moment of the write, not a result:
   ai-working means it was busy and the prompt went into that agent's own input queue;
   ai-idle means it should start on it right away; idle means the agent there has exited
@@ -90,6 +130,10 @@ send notes:
   there; do not repeat those instructions yourself.
 
 wait notes:
+  You usually do not need this. Results are pushed to you as reports (see `reports`
+  above); blocking here only keeps you from doing anything else, and it can never tell
+  you that the turn YOU dispatched is the one that finished. Reach for wait only when
+  you have nothing else to do and want to block on one specific session.
   wait blocks until the session settles, then prints one of four outcomes - ALWAYS
   read `outcome`, the exit code is 0 for all of them:
     ai-idle    the turn finished. Read `cause` to learn HOW: only Stop means the work
@@ -99,8 +143,10 @@ wait notes:
     attention  it is waiting for approval or asking a question; `cause` says which
                (PermissionRequest / Elicitation / StopFailure).
                DO NOT answer for the user and DO NOT send that session anything.
-               Tell the user in your own conversation and let them handle it there;
-               its status badge is already yellow. Then wait again.
+               Use read-screen to read that prompt verbatim, quote it in your own
+               conversation and let the user handle it in that pane; its status badge
+               is already yellow. Then leave it alone - the report that arrives when
+               it settles is your signal to send again.
     idle       the agent inside that session has exited; the pane is back to a shell.
     pending    it did not settle before the timeout. This is NOT an error. status
                ai-working means it is genuinely busy - wait again. status idle means
@@ -176,9 +222,11 @@ enum Command {
     /// Wait until one of your orchestrated sessions settles: finished, waiting for a
     /// human, or exited.
     ///
-    /// Blocks (long poll). Always read `outcome` from the JSON - every outcome, the
-    /// timeout included, exits 0. On `attention` the session is waiting for the USER:
-    /// report it and let them handle it; never answer on their behalf.
+    /// You usually do not need this: results are pushed to you as reports on their own
+    /// (see the `reports` section of --help). Blocks (long poll). Always read `outcome`
+    /// from the JSON - every outcome, the timeout included, exits 0. On `attention` the
+    /// session is waiting for the USER: report it and let them handle it; never answer
+    /// on their behalf.
     Wait {
         /// Pane id of the orchestrated session, as reported by `start-session` / `list-panes`.
         #[arg(long, value_name = "ID")]
@@ -923,6 +971,94 @@ mod tests {
         for status in ["ai-working means", "ai-idle means", "idle means"] {
             assert!(EXIT_CODE_HELP.contains(status), "缺 {status} 那一档");
         }
+    }
+
+    /// 工单 13：`--help` 得把**推送模型**讲清楚，否则编排者还会按拉模型去轮询。
+    ///
+    /// 逐句钉住的都是「不写它就会做错」的那几条：汇报会自己来（不必轮询）、
+    /// `[mini-term]` 打头的不是用户在说话、编排者忙时汇报攒着合并送、
+    /// 回合结束那条是**自述**（不许当成事实）、黄灯归人、未被接收该怎么办。
+    #[test]
+    fn 帮助文案讲清楚了汇报是推给编排者的() {
+        assert!(EXIT_CODE_HELP.contains("reports:"), "得有 reports 那一节");
+        assert!(
+            EXIT_CODE_HELP.contains("You do not have to poll"),
+            "推送模型的第一句：不必轮询"
+        );
+        // 认出汇报的那个标记，以及「这不是用户在说话」
+        assert!(EXIT_CODE_HELP.contains("[mini-term]"));
+        assert!(
+            EXIT_CODE_HELP.contains("not the user"),
+            "得说清 [mini-term] 开头的是桌面端而不是用户"
+        );
+        // 什么时候到：空闲才投，忙时攒着合并
+        assert!(
+            EXIT_CODE_HELP.contains("delivered merged into one message"),
+            "忙时攒着合并送达得写清，否则它会以为汇报丢了"
+        );
+        // 五种汇报一种都不能少
+        for kind in [
+            "turn ended",
+            "waiting for a human",
+            "exited",
+            "closed",
+            "not picked up",
+        ] {
+            assert!(EXIT_CODE_HELP.contains(kind), "缺 {kind} 那一档");
+        }
+        // 回合结束：汇报是自述，关键结果自己验证
+        assert!(
+            EXIT_CODE_HELP.contains("that session's OWN account"),
+            "汇报是自述这条不写，它会把「说完了」当成「做对了」"
+        );
+        assert!(
+            EXIT_CODE_HELP.contains("verify what matters yourself"),
+            "得让它自己去验证"
+        );
+        // 文字提问可答（与黄灯归人是同一条边界的两侧）
+        assert!(
+            EXIT_CODE_HELP.contains("with `send` is your job"),
+            "文字提问是编排者该答的"
+        );
+        // 黄灯：转告用户、不代答、不轮询
+        assert!(
+            EXIT_CODE_HELP.contains("let them handle it in that pane"),
+            "黄灯那条得写清转告用户、由人处理"
+        );
+        assert!(
+            EXIT_CODE_HELP.contains("Do NOT send that session"),
+            "黄灯不代答（ADR 0003 的铁律）"
+        );
+        // 未被接收：先 read-screen 核对再重发
+        assert!(
+            EXIT_CODE_HELP.contains("send the same prompt again"),
+            "未被接收该怎么办：核对后重发"
+        );
+        // 术语纪律
+        assert!(!EXIT_CODE_HELP.to_lowercase().contains("musician"));
+    }
+
+    /// `wait` 降级成备用手段：开头那句「通常不需要」不写，编排者仍会派活即等。
+    #[test]
+    fn 帮助文案把等待降成了备用手段() {
+        assert!(
+            EXIT_CODE_HELP.contains("You usually do not need this"),
+            "wait notes 开头得先说通常不需要"
+        );
+        assert!(
+            EXIT_CODE_HELP.contains("Results are pushed to you as reports"),
+            "得指向汇报那一节"
+        );
+        // 黄灯那一档补上「怎么拿到原文」（工单 10 留档第一条）
+        assert!(
+            EXIT_CODE_HELP.contains("Use read-screen to read that prompt verbatim"),
+            "attention 那档得告诉它用 read-screen 读原文"
+        );
+        // send 被黄灯拒时同样要读原文转告
+        assert!(
+            EXIT_CODE_HELP.contains("Use read-screen on that pane"),
+            "targetAwaitingHuman 那档得告诉它用 read-screen 读原文"
+        );
     }
 
     /// `--text` 与 `--stdin` **恰好给一个**：都不给会去读一个不存在的管道，

@@ -1,6 +1,6 @@
 # 编排者（Orchestrator MVP）工单
 
-规格（PRD）在 issue [#61](https://github.com/dreamlonglll/mini-term/issues/61)，边界决策在 `docs/adr/0003-ai-session-orchestration.md`，领域词条见 `CONTEXT.md`（编排者 / 受编排会话）。
+规格（PRD）在 issue [#61](https://github.com/dreamlonglll/mini-term/issues/61)，边界决策在 `docs/adr/0003-ai-session-orchestration.md`（第一期：拉模型）与 `docs/adr/0004-orchestrated-session-reports.md`（第二期：汇报推送），领域词条见 `CONTEXT.md`（编排者 / 受编排会话 / 任务 / 回合 / 汇报）。编排者那一侧的礼仪只有一份源头：`.claude/skills/mini-term-orchestrator/SKILL.md`（`mt-app::orchestrator_skill` 用 `include_str!` 编进主程序按项目投放），与 `mt-agent-cli --help` 两处一起构成编排者读到的全部指引。
 
 每张工单是一发 tracer bullet：纵切所有层、可独立演示。按 frontier 开工——阻塞项全部完成的票即可动工，每张票用一个新会话实施。
 

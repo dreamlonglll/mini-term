@@ -302,7 +302,9 @@ mod tests {
         // 正文其余部分原样保留(抽几句礼仪铁律钉一下)
         assert!(md.contains("Never answer for a human"));
         assert!(md.contains("Do not `send` immediately after `start-session`"));
-        assert!(md.contains("`wait` alone cannot tell you a turn finished"));
+        // 推送模型(ADR 0004):汇报自己来,以及认出汇报的那个标记
+        assert!(md.contains("Results are pushed to you"));
+        assert!(md.contains("[mini-term]"));
     }
 
     #[test]

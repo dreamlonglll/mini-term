@@ -129,6 +129,10 @@ hook 上报（`mt-ai::hook_server`）一旦启用即为权威，退出以 Sessio
 
 **铁律**：两条兜底都把结论**落盘**进 hook 状态，触发一次即收敛、不再摆动——无记忆兜底（假完成每 20~50s 重复播报）是踩过的坑，别回去。
 
+### 编排者汇报推送（ADR 0004）
+
+受编排会话每个回合结束 / 停下等人 / 退出 / 被关 / 派活未被接收时，桌面端机械生成一条**汇报**，由 `mt-ai::control` 的投递泵写穿进编排者的终端——等价于用户在那个 pane 里对它说了一句话，于是编排者不必 `wait`、不必轮询。**投递闸**只在编排者 `ai-idle` 且成因不属 attention 时放行：它忙时暂存、回合结束后把积压的合成一条投；它自己停在黄灯时不投（写入等于替用户代答，ADR 0003 的铁律）；它退回裸 shell 时也不投（粘贴会落进 shell）。汇报正文是**受编排会话的自述**（该回合的会话记录增量，无可解析记录的 agent 换画面尾部），里头没有工具调用与命令输出——「说完了」不等于「做对了」，编排者该验证的仍得自己跑。实现在 `mt-ai::reports`（纯状态机，不碰线程与 I/O）+ `mt-ai::control`（闸 / 渲染 / 投递线程），决策与被否决的备选见 `docs/adr/0004-orchestrated-session-reports.md`；编排者那一侧的礼仪在 `.claude/skills/mini-term-orchestrator/SKILL.md`（唯一源头，投放机制见 `mt-app::orchestrator_skill`）。
+
 ### 移动端中转体系（`relay-server/` + `mobile/` + `mt-relay`）
 
 - `relay-server/protocol`：桌面端与中转共享的协议消息 crate（JSON over WebSocket，serde camelCase，版本号握手校验，当前 v2）；PWA 侧 TypeScript 类型在 `mobile/src/protocol.ts` 手写镜像，两侧字段必须同步维护
