@@ -1,8 +1,10 @@
 //! 「移动端」面板(对照 `src/components/MobileRelayModal.tsx` 249 行 +
-//! `AiLauncherSection.tsx` 212 行 + `RelayStatusBadge.tsx` 37 行)。
+//! `RelayStatusBadge.tsx` 37 行)。
 //!
-//! 一站式:中转地址 / 桌面端密钥 → 连接状态 → 配对二维码 → 重置配对,
-//! 中间嵌一段 AI 启动器的增删改。
+//! 一站式:中转地址 / 桌面端密钥 → 连接状态 → 配对二维码 → 重置配对。
+//! AI 启动器的增删改(原 `AiLauncherSection.tsx`)2026-09-02 迁到了设置 → Shell
+//! (`settings::pages_launchers`),这里只留一句指路与「打开设置」入口 ——
+//! 启动器同时是「新建终端」菜单的内容,放在 shell 列表旁边才找得到。
 //!
 //! # 两处与原版的形态差异
 //!
@@ -22,19 +24,13 @@
 use gpui::{
     App, AppContext, Bounds, ClickEvent, Context, Entity, InteractiveElement, IntoElement,
     ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled, Subscription,
-    Window, canvas, div, fill, point, prelude::FluentBuilder, px, size,
+    Window, canvas, div, fill, point, px, size,
 };
 use gpui_component::input::{Input, InputEvent, InputState};
-use mt_config::AiLauncher;
-use mt_ui::icons::{AiVendor, BrandIcon};
 
 use crate::i18n::{t, tr};
-use crate::menu;
-use crate::mobile_relay::{
-    self, QR_CANVAS_PX, QR_QUIET_MODULES, QrMatrix, RelayBridge, command_warning,
-    launcher_draft_valid, launcher_subtitle, upsert_launcher,
-};
-use crate::prompt::{Confirm, autofocus, dialog_title, kind, open_guarded};
+use crate::mobile_relay::{self, QR_CANVAS_PX, QR_QUIET_MODULES, QrMatrix, RelayBridge};
+use crate::prompt::{Confirm, autofocus, close_guarded, dialog_title, kind, open_guarded};
 use crate::store::AppStore;
 use crate::ui;
 
@@ -50,18 +46,6 @@ const BODY_MAX_H: f32 = 540.0;
 /// 面板整体才落在 76vh 内。
 const CHROME_H: f32 = 83.0;
 
-/// 编辑中的启动器草稿。`id` 为空串 = 新增(与原版 `DraftState` 一致)。
-struct Draft {
-    id: String,
-    name: Entity<InputState>,
-    command: Entity<InputState>,
-    /// 绑定的 shell 名;`None` = 使用默认 shell。
-    shell: Option<String>,
-    /// 「允许编排」:用这条启动器起的会话能驱动别的 AI 会话(ADR 0003)。
-    /// 新增草稿一律从 false 起 —— 编排能力只能是用户显式勾出来的。
-    orchestration: bool,
-}
-
 pub struct MobilePanel {
     store: Entity<AppStore>,
     bridge: Entity<RelayBridge>,
@@ -72,7 +56,6 @@ pub struct MobilePanel {
     qr: Option<(QrMatrix, String)>,
     /// 已经点过「生成」但码还没回来(渲染 `modal.qrWaiting`)。
     qr_requested: bool,
-    draft: Option<Draft>,
     /// 地址 / 密钥两个输入框的回车订阅。
     _subs: Vec<Subscription>,
 }
@@ -165,7 +148,6 @@ pub fn open(window: &mut Window, cx: &mut App) {
             key,
             qr: None,
             qr_requested: false,
-            draft: None,
             _subs: subs,
         }
     });
@@ -250,12 +232,6 @@ fn reset_pairing(state: &Entity<MobilePanel>, window: &mut Window, cx: &mut App)
     );
 }
 
-/// 落盘启动器名单 + 让中转重发全量快照。
-fn save_launchers(state: &Entity<MobilePanel>, launchers: Vec<AiLauncher>, cx: &mut App) {
-    let bridge = state.read(cx).bridge.clone();
-    bridge.update(cx, |bridge, cx| bridge.save_launchers(launchers, cx));
-}
-
 // ─── 渲染 ─────────────────────────────────────────────────────
 
 /// 面板一帧要用到的全部只读数据。
@@ -270,22 +246,6 @@ struct Frame {
     url_value: String,
     qr: Option<(QrMatrix, String)>,
     qr_requested: bool,
-    launchers: Vec<AiLauncher>,
-    /// 草稿的轻量切面(输入框实体是 `Clone` 的句柄)。
-    draft: Option<DraftFacet>,
-    shells: Vec<String>,
-}
-
-/// 草稿在一帧里用到的只读切面。
-///
-/// 没有 `id`:保存那一刻是从 `panel.draft` 现读的(表单里的输入框实体也在那边),
-/// 这份切面只服务渲染。
-#[derive(Clone)]
-struct DraftFacet {
-    name: Entity<InputState>,
-    command: Entity<InputState>,
-    shell: Option<String>,
-    orchestration: bool,
 }
 
 fn read_frame(state: &Entity<MobilePanel>, cx: &App) -> Frame {
@@ -301,19 +261,6 @@ fn read_frame(state: &Entity<MobilePanel>, cx: &App) -> Frame {
         url_value: panel.url.read(cx).value().to_string(),
         qr: panel.qr.clone(),
         qr_requested: panel.qr_requested,
-        launchers: relay.launchers,
-        draft: panel.draft.as_ref().map(|d| DraftFacet {
-            name: d.name.clone(),
-            command: d.command.clone(),
-            shell: d.shell.clone(),
-            orchestration: d.orchestration,
-        }),
-        shells: store
-            .config()
-            .available_shells
-            .iter()
-            .map(|s| s.name.clone())
-            .collect(),
     }
 }
 
@@ -356,8 +303,8 @@ fn render_body(
         )
         // 2~8. 地址 / 密钥 / 两颗按钮
         .child(render_endpoint_section(state, &url_value, &relay_url, cx))
-        // 9. AI 启动器(与是否连上中转无关,始终可编辑)
-        .child(render_launchers(state, &frame, cx))
+        // 9. AI 启动器已迁入设置 → Shell,这里只留指路牌 + 入口
+        .child(render_launchers_pointer())
         // 10. 连接状态行
         .child(
             row_card()
@@ -548,414 +495,38 @@ fn render_endpoint_section(
         )
 }
 
-/// AI 启动器段(`AiLauncherSection.tsx`)。
-fn render_launchers(
-    state: &Entity<MobilePanel>,
-    frame: &Frame,
-    cx: &mut App,
-) -> impl IntoElement {
-    let launchers = frame.launchers.clone();
-    let editing = frame.draft.is_some();
-
-    let mut section = div()
-        .flex()
-        .flex_col()
-        .child(field_label(t("mobileRelay", "launchers.title")))
-        .child(
-            div()
-                .mb(px(8.0))
-                .text_size(ui::font_px(11.0))
-                .text_color(ui::text_muted())
-                .child(t("mobileRelay", "launchers.intro")),
-        );
-
-    // 空名单警告(**红字**:手机将无法发起新会话)
-    if launchers.is_empty() && !editing {
-        section = section.child(
-            div()
-                .mb(px(8.0))
-                .text_size(ui::font_px(11.0))
-                .text_color(ui::color_error())
-                .child(t("mobileRelay", "launchers.empty")),
-        );
-    }
-
-    let mut list = div().flex().flex_col().gap(px(6.0));
-    for launcher in &launchers {
-        list = list.child(render_launcher_row(state, launcher, &launchers));
-    }
-    section = section.child(list);
-
-    // 编辑中的行**仍然显示**,草稿表单渲染在列表下方(与 `modal.rs` 的终端配置
-    // 「编辑中的行让位给表单」不同形,别照搬那边)
-    match frame.draft.as_ref() {
-        Some(draft) => section.child(render_draft_form(state, draft, frame, cx)),
-        None => section.child(
-            div().mt(px(8.0)).child(
-                ui::ghost_button(
-                    "launcher-add",
-                    format!("+ {}", t("mobileRelay", "launchers.add")),
-                )
-                .on_click({
-                    let state = state.clone();
-                    move |_: &ClickEvent, window, cx| {
-                        let name = cx.new(|cx| {
-                            InputState::new(window, cx)
-                                .placeholder(t("mobileRelay", "launchers.namePlaceholder"))
-                        });
-                        let command = cx.new(|cx| {
-                            InputState::new(window, cx)
-                                .placeholder(t("mobileRelay", "launchers.commandPlaceholder"))
-                        });
-                        let name_for_focus = name.clone();
-                        state.update(cx, |panel, cx| {
-                            panel.draft = Some(Draft {
-                                id: String::new(),
-                                name,
-                                command,
-                                shell: None,
-                                // 新启动器默认**不**带编排能力(fail-closed)
-                                orchestration: false,
-                            });
-                            cx.notify();
-                        });
-                        // 点了「+ 添加」就该能直接敲名字,不必再点一下表单
-                        autofocus(&name_for_focus, window, cx);
-                    }
-                }),
-            ),
-        ),
-    }
-}
-
-/// 一条启动器:品牌图标 + 名称 + 副行 + 编辑 / 删除。
-fn render_launcher_row(
-    state: &Entity<MobilePanel>,
-    launcher: &AiLauncher,
-    all: &[AiLauncher],
-) -> impl IntoElement {
-    let id = launcher.id.clone();
-    let name = launcher.name.clone();
-    let command = launcher.command.clone();
-    let shell = launcher.shell.clone();
-    let orchestration = launcher.orchestration;
-    let subtitle = launcher_subtitle(shell.as_deref(), &command);
-    // 从命令文本推断品牌(识别不出回退 Bot)
-    let vendor = AiVendor::infer(None, Some(&command));
-    let rest: Vec<AiLauncher> = all.iter().filter(|l| l.id != id).cloned().collect();
-
-    div()
-        .flex()
-        .items_center()
-        .gap(px(8.0))
-        .px(px(12.0))
-        .py(px(8.0))
-        .rounded(px(4.0))
-        .bg(ui::bg_base())
-        .border_1()
-        .border_color(ui::border_subtle())
-        .child(
-            div()
-                .flex_none()
-                .text_color(ui::text_secondary())
-                .child(BrandIcon::new(vendor).size(px(16.0))),
-        )
+/// AI 启动器的指路牌:增删改在设置 → Shell(`settings::pages_launchers`)。
+///
+/// 「打开设置」先收掉本面板再开设置:设置面板是 60vw 宽的大弹窗,叠在这个
+/// 440px 的面板上面、关掉后再露出一个陈旧的移动端面板,不如干脆换过去。
+/// 开设置排到 `defer`:与 `close_dialog` 同一帧里再 `open_dialog`,覆盖物栈
+/// 的登记顺序会乱(`open_guarded` / `close_guarded` 各自只认栈顶)。
+fn render_launchers_pointer() -> impl IntoElement {
+    row_card()
         .child(
             div()
                 .flex_1()
                 .min_w(px(0.0))
-                .flex()
-                .flex_col()
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(6.0))
-                        .child(
-                            div()
-                                .truncate()
-                                .text_size(ui::font_px(13.0))
-                                .text_color(ui::text_primary())
-                                .child(SharedString::from(name.clone())),
-                        )
-                        // 授了编排能力的条目在列表里一眼看得出来 —— 这是个
-                        // 权限位,不该只在编辑表单里才可见
-                        .when(orchestration, |el| {
-                            el.child(
-                                div()
-                                    .flex_none()
-                                    .px(px(6.0))
-                                    .rounded(px(3.0))
-                                    .bg(ui::accent_muted())
-                                    .text_size(ui::font_px(10.0))
-                                    .text_color(ui::accent())
-                                    .child(t("mobileRelay", "launchers.orchestrationBadge")),
-                            )
-                        }),
-                )
-                .child(
-                    div()
-                        .truncate()
-                        .text_size(ui::font_px(11.0))
-                        .text_color(ui::text_muted())
-                        .child(SharedString::from(subtitle)),
-                ),
-        )
-        .child(
-            ui::ghost_button(
-                SharedString::from(format!("launcher-edit-{id}")),
-                t("mobileRelay", "launchers.edit"),
-            )
-            .on_click({
-                let state = state.clone();
-                let id = id.clone();
-                let name = name.clone();
-                let command = command.clone();
-                let shell = shell.clone();
-                move |_: &ClickEvent, window, cx| {
-                    let name_input = cx.new(|cx| {
-                        InputState::new(window, cx)
-                            .placeholder(t("mobileRelay", "launchers.namePlaceholder"))
-                            .default_value(name.clone())
-                    });
-                    let command_input = cx.new(|cx| {
-                        InputState::new(window, cx)
-                            .placeholder(t("mobileRelay", "launchers.commandPlaceholder"))
-                            .default_value(command.clone())
-                    });
-                    let name_for_focus = name_input.clone();
-                    state.update(cx, |panel, cx| {
-                        panel.draft = Some(Draft {
-                            id: id.clone(),
-                            name: name_input,
-                            command: command_input,
-                            shell: shell.clone(),
-                            orchestration,
-                        });
-                        cx.notify();
-                    });
-                    // 点了「编辑」就该能直接改名字
-                    autofocus(&name_for_focus, window, cx);
-                }
-            }),
-        )
-        .child(
-            ui::danger_button(
-                SharedString::from(format!("launcher-del-{id}")),
-                t("mobileRelay", "launchers.delete"),
-            )
-            // **无二次确认**(原版就是直接删)
-            .on_click({
-                let state = state.clone();
-                move |_: &ClickEvent, _window, cx| save_launchers(&state, rest.clone(), cx)
-            }),
-        )
-}
-
-/// 草稿表单:名称 / shell 选择 / 命令 / 警告 / 保存 / 取消。
-fn render_draft_form(
-    state: &Entity<MobilePanel>,
-    draft: &DraftFacet,
-    frame: &Frame,
-    cx: &mut App,
-) -> impl IntoElement {
-    let (name_input, command_input, shell) = (
-        draft.name.clone(),
-        draft.command.clone(),
-        draft.shell.clone(),
-    );
-    let orchestration = draft.orchestration;
-    let name_value = name_input.read(cx).value().to_string();
-    let command_value = command_input.read(cx).value().to_string();
-    let shell_label = shell
-        .clone()
-        .map(SharedString::from)
-        .unwrap_or_else(|| t("mobileRelay", "launchers.defaultShell").into());
-    // 同步纯函数,原版那套 `cancelled` 防竞态整个不需要
-    let warn = command_warning(&command_value);
-    let can_save = launcher_draft_valid(&name_value, &command_value);
-    let shells = frame.shells.clone();
-    let all = frame.launchers.clone();
-
-    let mut form = div()
-        .mt(px(8.0))
-        .p(px(12.0))
-        .rounded(px(4.0))
-        .bg(ui::bg_base())
-        .border_1()
-        .border_color(ui::border_default())
-        .flex()
-        .flex_col()
-        .gap(px(8.0))
-        .child(Input::new(&name_input))
-        // shell 选择:自建菜单的 picker 按钮(第一项「使用默认 shell」)
-        .child(
-            div()
-                .id("launcher-shell-picker")
-                .flex()
-                .items_center()
-                .justify_between()
-                .px(px(12.0))
-                .py(px(6.0))
-                .rounded(px(4.0))
-                .bg(ui::bg_surface())
-                .border_1()
-                .border_color(ui::border_default())
-                .cursor_pointer()
-                .hover(|el| el.border_color(ui::accent()))
-                .text_size(ui::font_px(13.0))
-                .text_color(ui::text_primary())
-                .child(shell_label)
-                .child(div().text_color(ui::text_muted()).child("▾"))
-                .on_click({
-                    let state = state.clone();
-                    let current = shell.clone();
-                    move |event: &ClickEvent, window, cx| {
-                        let mut entries = Vec::new();
-                        let mark = |on: bool| if on { "✓ " } else { "   " };
-                        entries.push(menu::item(
-                            format!(
-                                "{}{}",
-                                mark(current.is_none()),
-                                t("mobileRelay", "launchers.defaultShell")
-                            ),
-                            {
-                                let state = state.clone();
-                                move |_window, cx| set_draft_shell(&state, None, cx)
-                            },
-                        ));
-                        for name in &shells {
-                            let selected = current.as_deref() == Some(name.as_str());
-                            entries.push(menu::item(format!("{}{name}", mark(selected)), {
-                                let state = state.clone();
-                                let name = name.clone();
-                                move |_window, cx| set_draft_shell(&state, Some(name.clone()), cx)
-                            }));
-                        }
-                        menu::show(event.position(), entries, window, cx);
-                    }
-                }),
-        )
-        .child(Input::new(&command_input));
-
-    if warn {
-        // **黄字不是红字** —— 它不阻塞保存
-        form = form.child(
-            div()
                 .text_size(ui::font_px(11.0))
-                .text_color(ui::color_ai_working())
-                .child(t("mobileRelay", "launchers.commandWarning")),
-        );
-    }
-
-    // 「允许编排」开关(ADR 0003 的信任根:编排能力**只能**从这里授予)。
-    // 与命令警告同为表单的收尾段,但它是**授权**不是提示,所以带一行说明。
-    form = form.child(
-        div()
-            .id("launcher-orchestration")
-            .flex()
-            .items_start()
-            .gap(px(8.0))
-            .cursor_pointer()
-            .child(
-                div()
-                    .mt(px(2.0))
-                    .child(ui::checkbox("launcher-orchestration-box", orchestration)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .text_size(ui::font_px(13.0))
-                            .text_color(ui::text_primary())
-                            .child(t("mobileRelay", "launchers.orchestration")),
-                    )
-                    .child(
-                        div()
-                            .text_size(ui::font_px(11.0))
-                            .text_color(ui::text_muted())
-                            .child(t("mobileRelay", "launchers.orchestrationHint")),
-                    ),
-            )
-            .on_click({
-                let state = state.clone();
-                move |_: &ClickEvent, _window, cx| {
-                    state.update(cx, |panel, cx| {
-                        if let Some(draft) = panel.draft.as_mut() {
-                            draft.orchestration = !draft.orchestration;
-                        }
-                        cx.notify();
+                .text_color(ui::text_muted())
+                .child(t("mobileRelay", "launchersMoved")),
+        )
+        .child(
+            ui::ghost_button("relay-open-settings", t("mobileRelay", "openSettings")).on_click(
+                |_: &ClickEvent, window, cx| {
+                    close_guarded(kind::MOBILE_RELAY, window, cx);
+                    window.defer(cx, |window, cx| {
+                        let store = AppStore::global(cx);
+                        crate::settings::open_settings(
+                            store,
+                            Some(crate::settings::SettingsPage::Terminal),
+                            window,
+                            cx,
+                        );
                     });
-                }
-            }),
-    );
-
-    form.child(
-        div()
-            .flex()
-            .gap(px(8.0))
-            .child(
-                accent_button("launcher-save", t("mobileRelay", "launchers.save"))
-                    .opacity(if can_save { 1.0 } else { 0.4 })
-                    .on_click({
-                        let state = state.clone();
-                        move |_: &ClickEvent, _window, cx| {
-                            let (name, command, shell, id, orchestration) = {
-                                let panel = state.read(cx);
-                                let Some(draft) = panel.draft.as_ref() else {
-                                    return;
-                                };
-                                (
-                                    draft.name.read(cx).value().to_string(),
-                                    draft.command.read(cx).value().to_string(),
-                                    draft.shell.clone(),
-                                    draft.id.clone(),
-                                    draft.orchestration,
-                                )
-                            };
-                            if !launcher_draft_valid(&name, &command) {
-                                return;
-                            }
-                            let next = upsert_launcher(
-                                &all,
-                                &id,
-                                &name,
-                                shell.as_deref(),
-                                &command,
-                                orchestration,
-                            );
-                            // 先收表单再落盘(原版同序)
-                            state.update(cx, |panel, cx| {
-                                panel.draft = None;
-                                cx.notify();
-                            });
-                            save_launchers(&state, next, cx);
-                        }
-                    }),
-            )
-            .child(
-                ui::ghost_button("launcher-cancel", t("mobileRelay", "launchers.cancel")).on_click({
-                    let state = state.clone();
-                    move |_: &ClickEvent, _window, cx| {
-                        state.update(cx, |panel, cx| {
-                            panel.draft = None;
-                            cx.notify();
-                        });
-                    }
-                }),
+                },
             ),
-    )
-}
-
-fn set_draft_shell(state: &Entity<MobilePanel>, shell: Option<String>, cx: &mut App) {
-    state.update(cx, |panel, cx| {
-        if let Some(draft) = panel.draft.as_mut() {
-            draft.shell = shell;
-        }
-        cx.notify();
-    });
+        )
 }
 
 /// 连接状态徽章(`RelayStatusBadge.tsx`):彩色圆点 + 文案。

@@ -16,6 +16,19 @@ export const settings = {
     editorRow: {
       execPathPlaceholder: "可执行文件路径",
     },
+    launchers: {
+      title: "AI 启动器",
+      intro: "「新建终端」菜单里的 AI 启动器，也是手机能起哪些 agent 的名单。命令与 shell 只保存在桌面端，手机只看得到名称。",
+      empty: "还没有启动器：「新建终端」菜单里不会出现 AI 启动器段，手机也无法发起新会话。",
+      add: "+ 添加启动器",
+      namePlaceholder: "名称（如 Claude）",
+      commandPlaceholder: "启动命令（如 claude）",
+      defaultShell: "使用默认 shell",
+      commandWarning: "这条命令不会被识别为 AI 会话：没有状态徽章与对话镜像，手机上会一直等不到会话出现。命令仍会照常保存。",
+      orchestration: "允许编排",
+      orchestrationHint: "用这条启动器起的会话可以启动并驱动其他 AI 会话（范围限本项目与同分组项目），编排礼仪 Skill 会随会话写进项目目录。只在你确实要开编排者时勾选。",
+      orchestrationBadge: "编排",
+    },
     terminal: {
       availableTerminals: "可用终端（●= 默认）",
       newNamePlaceholder: "名称（如 pwsh）",
@@ -249,6 +262,19 @@ export const settings = {
     },
     editorRow: {
       execPathPlaceholder: "Executable path",
+    },
+    launchers: {
+      title: "AI launchers",
+      intro: "The AI launchers offered in the New Terminal menu — and the list of agents your phone can start. Commands and shells stay on the desktop; the phone only ever sees the name.",
+      empty: "No launchers yet: the New Terminal menu has no AI launcher section and your phone cannot start new sessions.",
+      add: "+ Add launcher",
+      namePlaceholder: "Name (e.g. Claude)",
+      commandPlaceholder: "Launch command (e.g. claude)",
+      defaultShell: "Use default shell",
+      commandWarning: "This command won't be recognised as an AI session — no status badge or transcript mirror, and your phone will wait forever for the session to appear. It will still be saved.",
+      orchestration: "Allow orchestration",
+      orchestrationHint: "Sessions started from this launcher may start and drive other AI sessions (within this project and projects in the same group); the orchestrator skill is written into the project alongside the session. Only tick this when you really want an orchestrator.",
+      orchestrationBadge: "Orchestrator",
     },
     terminal: {
       availableTerminals: "Available terminals (● = default)",

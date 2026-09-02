@@ -132,13 +132,18 @@ pub fn new_terminal_menu_entries(
         }
     }
 
-    // 启动器配置住在「移动端」面板里(它同时是移动端发起会话的名单),
-    // 桌面端用户找不到那个入口 —— 这一条是唯一的指路牌,故**总是**出现。
+    // 启动器配置在设置 → Shell(`settings::pages_launchers`,与 shell 列表并排;
+    // 它同时是移动端发起会话的名单)。这一条是从菜单直达那一节的指路牌,故**总是**出现。
     entries.push(menu::separator());
-    entries.push(menu::item(
-        t("terminalArea", "manageLaunchers"),
-        crate::mobile_panel::open,
-    ));
+    entries.push(menu::item(t("terminalArea", "manageLaunchers"), |window, cx| {
+        let store = AppStore::global(cx);
+        crate::settings::open_settings(
+            store,
+            Some(crate::settings::SettingsPage::Terminal),
+            window,
+            cx,
+        );
+    }));
     entries
 }
 

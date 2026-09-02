@@ -1,7 +1,7 @@
-//! 设置面板的 terminal(Shell 列表 + 行为)与 clipboard(复制粘贴)两页。
+//! 设置面板的 terminal(Shell 列表 + AI 启动器 + 行为)与 clipboard(复制粘贴)两页。
 //!
 //! 两页共用「即时生效 + 即时落盘」的口径,数字行仍是草稿态 —— 归一与提交在
-//! [`super`] 的 `commit_number`,这里只画。
+//! [`super`] 的 `commit_number`,这里只画。AI 启动器那一节在 `pages_launchers`。
 
 use gpui::{
     AnyElement, Context, IntoElement, ParentElement, SharedString, StatefulInteractiveElement,
@@ -139,6 +139,8 @@ impl SettingsView {
                     )
                     .child(ui::hint(t("settings", "terminal.defaultHint"))),
             )
+            // AI 启动器紧挨 shell 列表:一条启动器 = 一个 shell + 一条命令
+            .child(self.render_launchers_section(cx))
             .child(
                 section("terminal.behavior")
                     .child(number_row(

@@ -49,7 +49,8 @@
 //!
 //! | 文件 | 内容 |
 //! |------|------|
-//! | `pages_terminal` | terminal(Shell 列表)/ clipboard |
+//! | `pages_terminal` | terminal(Shell 列表 + 行为)/ clipboard |
+//! | `pages_launchers` | terminal 页里的「AI 启动器」一节(自移动端面板迁入) |
 //! | `pages_appearance` | appearance(语言 / 主题 / 外置皮肤)/ font |
 //! | `pages_ai` | ai-notification / ai-hook |
 //! | `pages_system` | system / editor / shortcuts / about |
@@ -74,6 +75,7 @@ use crate::update_check::ReleaseInfo;
 
 mod pages_ai;
 mod pages_appearance;
+mod pages_launchers;
 mod pages_system;
 mod pages_terminal;
 mod widgets;
@@ -334,6 +336,15 @@ pub struct SettingsView {
     shell_args: Entity<InputState>,
     shell_error: Option<&'static str>,
 
+    // ── terminal 页:AI 启动器列表(`pages_launchers`)──
+    launcher_editing: Editing,
+    launcher_name: Entity<InputState>,
+    launcher_command: Entity<InputState>,
+    /// 草稿绑定的 shell 名;`None` = 使用默认 shell。
+    launcher_shell: Option<String>,
+    /// 草稿的「允许编排」位(ADR 0003)。
+    launcher_orchestration: bool,
+
     // ── editor 页:编辑器列表 ──
     editor_editing: Editing,
     editor_name: Entity<InputState>,
@@ -580,6 +591,11 @@ impl SettingsView {
             shell_command: ph(cx, window, t("settings", "terminal.newCommandPlaceholder")),
             shell_args: ph(cx, window, t("settings", "terminal.newArgsPlaceholder")),
             shell_error: None,
+            launcher_editing: None,
+            launcher_name: ph(cx, window, t("settings", "launchers.namePlaceholder")),
+            launcher_command: ph(cx, window, t("settings", "launchers.commandPlaceholder")),
+            launcher_shell: None,
+            launcher_orchestration: false,
             editor_editing: None,
             editor_name: ph(cx, window, t("settings", "editor.newEditorNamePlaceholder")),
             editor_command: ph(

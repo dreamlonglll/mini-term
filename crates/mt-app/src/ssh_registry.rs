@@ -31,11 +31,12 @@ use serde_json::Value;
 
 // 与 `orchestrator_skill` 共用的落盘底座(路径 / 引号 / .gitignore / Codex 信任)。
 use crate::skill_files::{
-    append_gitignore_entries as append_gitignore_entries_for,
-    compute_gitignore_append as compute_gitignore_append_for, prune_empty_skill_dirs,
+    append_gitignore_entries as append_gitignore_entries_for, prune_empty_skill_dirs,
     quote_posix_single, quote_powershell_single, skill_paths as skill_paths_for,
     trust_project_in_codex, validate_project_dir,
 };
+#[cfg(test)]
+use crate::skill_files::compute_gitignore_append as compute_gitignore_append_for;
 
 /// skill 目录名 —— 同时充当幂等 marker(与旧 MCP server 名一致,便于对应)。
 const SKILL_DIR_NAME: &str = "mini-term-ssh";
@@ -201,7 +202,10 @@ const GITIGNORE_ENTRIES: &[&str] = &[
 /// 追加段前那行注释。**一字不改**:装机版写出来的 `.gitignore` 就是这一行。
 const GITIGNORE_HEADER: &str = "# mini-term SSH skill（本机相关生成物，勿提交）";
 
-/// 计算追加条目后的 `.gitignore` 全文;若无需追加返回 `None`。抽出便于单测。
+/// 计算追加条目后的 `.gitignore` 全文;若无需追加返回 `None`。
+/// 只给单测用(生产路径直接走 `append_gitignore_entries`),钉的是 SSH 那组
+/// 常量与共用底座的搭配。
+#[cfg(test)]
 fn compute_gitignore_append(existing: &str) -> Option<String> {
     compute_gitignore_append_for(existing, GITIGNORE_HEADER, GITIGNORE_ENTRIES)
 }
