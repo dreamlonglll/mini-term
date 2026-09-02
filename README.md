@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.2.2-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.2.3-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -65,6 +65,7 @@ Mini-Term 就是为这件事做的：项目列表上的状态灯实时跳动，A
 - 看**按项目分组的活跃 AI 会话列表**，状态灯与桌面端实时同步
 - 点进任一会话**实时看对话镜像**，Markdown 渲染，往上滚分页加载更早的消息
 - 在底部输入框**直接发指令**，等价于你本人在桌面键盘上敲下并回车，带即时回执
+- **agent 提问直接在手机上点选作答**——Claude / Codex / Grok 的提问以卡片出现在镜像里，点选项即替你在桌面 TUI 里选中回车；等你处理（提问待答、等待授权）的会话在列表里亮琥珀点
 - **从手机发起一个全新会话**：选项目 → 选 AI 启动器，桌面端后台把 agent 拉起来
 
 > **前提**：中转要跑在**你自己的**服务器上（1C1G 足够，Docker 一条命令起，另需一个解析到它的域名做 TLS）。这是刻意的设计——没有任何第三方服务掺在中间。见[部署文档](docs/deploy-relay.zh-CN.md)。
@@ -111,6 +112,7 @@ VS Code 风格的 **Changes 面板**（Staged / Changes / Untracked 分组，单
 | **图片粘贴** | 剪贴板里有截图自动检测，存成临时 PNG 并粘路径，兼容 PinPix 等非标准格式 |
 | **远程自动落地** | 上面两种粘贴在 SSH 远程项目里会经 SFTP 传到远端再粘**远端**路径；WSL 项目自动把 `C:\...` 换算成 `/mnt/c/...` |
 | **文件拖拽** | 从文件树或资源管理器拖文件到终端，插入带引号的绝对路径，精准落到目标分屏 |
+| **文件树内移动** | 文件树里拖拽或右键「移动到 ▸」把文件 / 目录挪到别的目录，本地与远程一样；松手先确认，Esc 随时取消正在进行的拖拽 |
 | **文件工作区** | 文件树点开的本地 / 远程文件在主区页签里查看、编辑、保存，与终端并列切换：tree-sitter 语法高亮（30+ 语言），查找替换，`Ctrl+S` 原子落盘，外部改动自动感知；远程文件经 SFTP 读写，保存前比对基线，冲突时可重载或强制覆盖，也能直接下载 |
 | **文档预览** | Markdown / HTML 预览里的图片真的会显示——相对路径按文件所在目录解析，网络图直接拉回来（10s 超时 + 32MB 上限，其余协议一律拒）。远程文件的 Markdown 先清洗再渲染：原始 HTML 按源码显示、外链图片点击才加载、`file://` 之类的链接降级为纯文本；远程 HTML 只提供源码查看。HTML 另有一个「用浏览器打开」，走 https 协议关联而不是 `.html` 的文件关联 |
 | **全局搜索** | `Ctrl+Shift+F` 唤起，文件名 / 内容双模式（文件名含 `/` 即按路径匹配），子串或正则，后端流式推送随时可取消 |
@@ -140,7 +142,7 @@ VS Code 风格的 **Changes 面板**（Staged / Changes / Untracked 分组，单
 | Git / 文件 | git2（libgit2）· notify + ignore |
 | 用量统计 | rusqlite 本地账本 · 自绘趋势图 |
 | 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`） |
-| 测试 | **1677 个 Rust 测试**（28 个测试目标） |
+| 测试 | **1724 个 Rust 测试**（27 个测试目标） |
 
 ---
 

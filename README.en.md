@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.2.2-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.2.3-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -63,6 +63,7 @@ Fill in your relay address in the top-bar "Mobile" panel → save & connect → 
 - See **active AI sessions grouped by project**, with status lights synced live with the desktop
 - Tap into any session for a **live conversation mirror** — Markdown-rendered replies, scroll up to page in older messages
 - **Send commands** from the input box at the bottom — equivalent to typing it on the desktop keyboard and pressing Enter, with an immediate receipt
+- **Answer the agent's questions right on your phone** — Claude / Codex / Grok questions show up as cards in the mirror; tapping an option selects and confirms it in the desktop TUI on your behalf, and sessions waiting on you (a pending question, a permission prompt) glow amber in the list
 - **Start a brand-new session from your phone**: pick a project → pick an AI launcher, and the desktop brings the agent up in a background tab
 
 > **Prerequisite**: the relay runs on **your own** server (1 vCPU / 1 GB is plenty, one Docker command to start, plus a domain pointed at it for TLS). That's deliberate — there is no third-party service in the middle. See the [deployment guide](docs/deploy-relay.md).
@@ -109,6 +110,7 @@ A VS Code-style **Changes panel** (Staged / Changes / Untracked groups, per-file
 | **Image paste** | Screenshots in the clipboard are detected, saved as a temp PNG, and pasted as a path; handles non-standard formats like PinPix |
 | **Remote-aware landing** | Both of the above remap in remote terminals: SSH projects upload over SFTP and paste the **remote** path; WSL projects rewrite `C:\...` into `/mnt/c/...` |
 | **File drag & drop** | Drag from the file tree or Explorer onto the terminal to insert a quoted absolute path, landing in the exact split pane |
+| **Move within the file tree** | Drag, or right-click "Move to ▸", to move files / directories into another directory — local and remote alike; a confirmation appears on drop, and Esc cancels an in-progress drag at any time |
 | **File workbench** | Local and remote files opened from the tree live in main-area tabs alongside the terminal, where you view, edit, and save them: tree-sitter syntax highlighting (30+ languages), find & replace, atomic `Ctrl+S` saves, external-change detection; remote files are read and written over SFTP, every save is checked against the loaded baseline, conflicts offer reload or force-overwrite, and any remote file can be downloaded |
 | **Document preview** | Images actually render in the Markdown / HTML preview: relative paths resolve against the file's own directory, and remote images are fetched for real (10s timeout, 32MB cap, every other scheme refused). Markdown from remote files is sanitized before rendering: raw HTML shows as source, external images load only on click, and `file://`-style links degrade to plain text; remote HTML is source-view only. HTML previews also get an "Open in browser" button that resolves through the https protocol handler rather than the `.html` file association |
 | **Global search** | `Ctrl+Shift+F` for filename or content search (a `/` in the query matches against the path), substring or regex, streamed from the backend and cancellable anytime |
@@ -138,7 +140,7 @@ The whole application is **native Rust**:
 | Git / files | git2 (libgit2) · notify + ignore |
 | Usage stats | rusqlite local ledger · hand-drawn trend charts |
 | Mobile relay | axum + tokio WebSocket (`relay-server/`) · React + Vite PWA (`mobile/`) |
-| Tests | **1,677 Rust tests** (28 test targets) |
+| Tests | **1,724 Rust tests** (27 test targets) |
 
 ---
 
