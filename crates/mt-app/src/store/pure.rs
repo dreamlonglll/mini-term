@@ -396,7 +396,9 @@ pub(super) fn resolve_resume_cwd(session: &AiSessionRef) -> Option<String> {
     if let Some(cwd) = session.cwd.as_deref() {
         return Path::new(cwd).is_dir().then(|| cwd.to_string());
     }
-    if session.agent.as_deref() == Some("codex") {
+    // codex 不按目录分桶;omp 按目录分桶但没有记录解析可反查 —— 两者都不去
+    // `~/.claude/projects` 里翻(那里只会有 claude 的桶)
+    if matches!(session.agent.as_deref(), Some("codex") | Some("omp")) {
         return None;
     }
     mt_ai::sessions::lookup_ai_session_cwd(session.session_id.clone())

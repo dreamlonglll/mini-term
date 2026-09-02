@@ -1008,8 +1008,10 @@ mod tests {
             "claude",
             "codex",
             "grok",
+            "omp",
             "claude --dangerously-skip-permissions",
             "grok --resume",
+            "omp --continue",
         ] {
             assert!(!command_warning(ok), "{ok} 应该被识别");
         }

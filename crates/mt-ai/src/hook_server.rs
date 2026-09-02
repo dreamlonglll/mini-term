@@ -1,10 +1,11 @@
 //! Hook HTTP 服务器模块
 //!
-//! 在后台线程监听 `127.0.0.1` 的 HTTP 请求，接收 Claude Code / Codex / Grok 的
-//! hook 事件上报，并通过注入的 [`StatusEmitter`] 通知上层。
+//! 在后台线程监听 `127.0.0.1` 的 HTTP 请求，接收 Claude Code / Codex / Grok /
+//! oh-my-pi 的 hook 事件上报，并通过注入的 [`StatusEmitter`] 通知上层。
 //!
-//! **端口 / 协议 / 路由一个字都不能改**:三家 CLI 里已注册在用户机器上的 hook
-//! 命令按当前形态 POST 过来,改了等于让存量用户的 AI 感知集体失灵。
+//! **端口 / 协议 / 路由一个字都不能改**:各家 CLI 里已注册在用户机器上的 hook
+//! 命令（与 omp 的进程内扩展）按当前形态 POST 过来,改了等于让存量用户的 AI 感知
+//! 集体失灵。
 
 use crate::monitor::{SessionIdentity, StatusEmitter};
 use crate::tracker::SessionTracker;
@@ -40,7 +41,7 @@ pub struct HookPayload {
     pub pty_id: Option<u32>,
     /// 事件名（如 UserPromptSubmit, PreToolUse 等）
     pub event: Option<String>,
-    /// 来源 agent（claude-code / codex）
+    /// 来源 agent（claude-code / codex / grok / omp）
     pub agent: Option<String>,
     /// 会话 ID
     pub session_id: Option<String>,
@@ -393,6 +394,18 @@ fn event_cause<'a>(event: &'a str, notification_type: Option<&str>, message: Opt
     }
 }
 
+/// 该 `Stop` 是否是用户打断后的回合收尾（omp 上报 `reason: "aborted"`）。
+///
+/// omp 在 Esc/Ctrl+C 打断后仍会发 `agent_end`，扩展据 `stopReason == "aborted"`
+/// 标成这样一发。它要把状态收到 ai-idle（回合确实结束了），但 cause 不能是 `Stop`
+/// ——UI 的 isAiCompletion 会认成「任务完成」，每次打断都白响一声。cause 改成
+/// `Interrupt`，与输入检测那条打断路径（`note_user_interrupt`）同名：两条路先后
+/// 到达时 `emit_if_changed` 按「状态与 cause 都没变」去重，只发一次。
+/// Claude/Codex 的 Stop 不带 reason，grok 的 reason 集里也没有 aborted，恒为假。
+fn is_user_abort_stop(event: &str, reason: Option<&str>) -> bool {
+    event == "Stop" && reason == Some("aborted")
+}
+
 /// 该 cause 是否表示「有事等你处理」——托盘黄灯的依据，同时也是
 /// `StatusEmitter::emit_if_changed` 的去重豁免名单：黄灯的清除发生在 UI 侧
 /// （用户对该 pane 键入即视为已在处理），去重表感知不到，若按「状态与 cause
@@ -732,11 +745,15 @@ pub fn start_hook_server(
                         // 归一化后的事件名:Stop/PermissionRequest/Notification 都落
                         // ai-idle,但只有 Stop 是「任务做完了」,UI 据此决定播报与
                         // 托盘黄绿灯（见 utils/aiCompletion.ts 与 store 的 attention 判定）
-                        let cause = event_cause(
-                            event,
-                            payload.notification_type.as_deref(),
-                            payload.message.as_deref(),
-                        );
+                        let cause = if is_user_abort_stop(event, payload.reason.as_deref()) {
+                            "Interrupt"
+                        } else {
+                            event_cause(
+                                event,
+                                payload.notification_type.as_deref(),
+                                payload.message.as_deref(),
+                            )
+                        };
                         emitter.emit_if_changed(pty_id, status, Some(cause), payload.agent.clone());
 
                         eprintln!(
@@ -1278,6 +1295,57 @@ mod tests {
         assert_eq!(event_cause("Elicitation", None, None), "Elicitation");
         assert_eq!(event_cause("Stop", None, None), "Stop");
         assert_eq!(event_cause("UserPromptSubmit", None, None), "UserPromptSubmit");
+    }
+
+    // ---- oh-my-pi(omp)特有语义 ----
+
+    /// omp 打断后的回合收尾(`Stop` + `reason: aborted`):状态收到 ai-idle,但 cause
+    /// 是 `Interrupt` 不是 `Stop` —— 否则每次 Esc 打断都播一次「完成」。
+    /// 与输入检测那条打断路径同名,两条路先后到达时按去重只发一次。
+    #[test]
+    fn omp_aborted_stop_is_an_interrupt_not_a_completion() {
+        assert!(is_user_abort_stop("Stop", Some("aborted")));
+        assert_eq!(
+            map_event_to_status("Stop", Some("omp"), None, None, Some("aborted")),
+            Some("ai-idle"),
+            "回合确实结束了,状态要收到 ai-idle"
+        );
+        assert!(!is_attention_cause("Interrupt"), "打断不点黄灯");
+        // 不是别家的 Stop:无 reason / grok 的收尾 reason / SessionEnd 都不算
+        assert!(!is_user_abort_stop("Stop", None));
+        assert!(!is_user_abort_stop("Stop", Some("end_turn")));
+        assert!(!is_user_abort_stop("SessionEnd", Some("aborted")));
+        assert!(!is_user_abort_stop("StopFailure", Some("aborted")));
+    }
+
+    /// omp 扩展会上报的每个事件名都必须有状态映射(`SessionEnd` 走独立分支),
+    /// 漏一个就是一段状态空洞。表由 hook_registry 维护,与扩展模板逐条对账。
+    #[test]
+    fn omp_reported_event_set_is_fully_mapped() {
+        for event in crate::hook_registry::OMP_REPORTED_EVENTS {
+            if *event == "SessionEnd" {
+                continue;
+            }
+            assert!(
+                map_event(event, Some("omp"), None).is_some(),
+                "{event} 无状态映射"
+            );
+        }
+        // 提问工具映射成 Elicitation:等作答期间点黄灯,作答后熄灭
+        assert_eq!(map_event("Elicitation", Some("omp"), None), Some("ai-idle"));
+        assert!(is_attention_cause(event_cause("Elicitation", None, None)));
+        assert_eq!(map_event("ElicitationResult", Some("omp"), None), Some("ai-working"));
+        // 自动重试的 Notification 靠文案里的 retrying 判为「仍在工作」
+        assert_eq!(
+            map_event(
+                "Notification",
+                Some("omp"),
+                Some("API error, retrying (attempt 1/3): 529 overloaded")
+            ),
+            Some("ai-working")
+        );
+        // omp 的 PermissionRequest 走 Claude 语义(ai-idle + 黄灯),不是 Codex 那条特例
+        assert_eq!(map_event("PermissionRequest", Some("omp"), None), Some("ai-idle"));
     }
 
     // ---- Grok Build 特有语义 ----

@@ -206,6 +206,7 @@ impl SettingsView {
                 "claude" => Some(HookAgent::Claude),
                 "codex" => Some(HookAgent::Codex),
                 "grok" => Some(HookAgent::Grok),
+                "omp" => Some(HookAgent::Omp),
                 _ => None,
             })
             .collect();
@@ -541,7 +542,7 @@ impl SettingsView {
             .into_any_element()
     }
 
-    /// 配置片段面板(三个 tab,标签是字面量不走 i18n)。
+    /// 配置片段面板(四个 tab,标签是字面量不走 i18n)。
     fn render_snippet(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let data = self.snippet.as_ref()?;
         let mut tabs = div()
@@ -552,6 +553,7 @@ impl SettingsView {
             ("claude", "Claude Code"),
             ("codex", "Codex"),
             ("grok", "Grok"),
+            ("omp", "oh-my-pi"),
         ] {
             let active = self.snippet_tab == key;
             tabs = tabs.child(

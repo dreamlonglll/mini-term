@@ -2112,13 +2112,15 @@ fn main() {
         // - codex:  把 config.toml 的 feature 键迁到现行名字(codex_hooks -> hooks),
         //           面板判「已注册」只看 hooks.json,界面上没有线索提示用户重点
         //           一次注册;键已是新名字就不落盘
-        // 三条都只在**已注册过**时才动手 —— 没开过这功能的用户一律不碰他的配置。
+        // - omp:扩展文件与当前模板不同就整份重写(模板随版本演进)
+        // 四条都只在**已注册过**时才动手 —— 没开过这功能的用户一律不碰他的配置。
         // 都要读写用户主目录下的文件,故丢后台不挡启动。
         cx.background_executor()
             .spawn(async {
                 mt_ai::hook_registry::sync_claude_hooks_if_registered();
                 mt_ai::hook_registry::sync_grok_hooks_if_registered();
                 mt_ai::hook_registry::sync_codex_hooks_feature_if_registered();
+                mt_ai::hook_registry::sync_omp_hooks_if_registered();
             })
             .detach();
         // 真正的主题在 store 装好之后按 config 装配(`apply_theme_from_config`):

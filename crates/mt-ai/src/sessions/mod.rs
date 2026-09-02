@@ -98,8 +98,9 @@ fn home_dir() -> Option<PathBuf> {
 
 /// 该 agent 是否有本 crate 能解析的会话记录(Claude / Codex / Grok 三家)。
 ///
-/// 输入检测能认出的 agent 比这宽(pi / opencode 也在 `detect::AI_COMMANDS` 里),
-/// 它们**没有**可解析的记录文件。调用方(对话镜像)必须据此跳过启发式绑定:
+/// 输入检测能认出的 agent 比这宽(pi / opencode / omp 也在 `detect::AI_COMMANDS` 里),
+/// 它们**没有**可解析的记录文件(omp 虽有 hook 接入,`~/.omp/agent/sessions/` 的
+/// 记录格式尚未接进来)。调用方(对话镜像)必须据此跳过启发式绑定:
 /// 「按项目找最新的 claude/codex/grok 记录」对一个 pi pane 调用,会把同项目里别家
 /// 的对话贴到这个 pane 上(串台)。宁可空镜像。
 ///
@@ -1012,14 +1013,14 @@ mod tests {
 
     // ---- 可解析会话记录的白名单 ----
 
-    /// 只有 Claude/Codex/Grok 有可解析的记录;pi/opencode 必须落在白名单外,
+    /// 只有 Claude/Codex/Grok 有可解析的记录;pi/opencode/omp 必须落在白名单外,
     /// 否则镜像会退启发式绑到同项目别家的会话文件(串台)。
     #[test]
     fn only_claude_codex_and_grok_have_session_logs() {
         for agent in ["claude", "claude-code", "codex", "Codex", "grok", "Grok"] {
             assert!(agent_has_session_log(agent), "{agent} 应有会话记录");
         }
-        for agent in ["pi", "opencode", "", "gemini"] {
+        for agent in ["pi", "opencode", "omp", "", "gemini"] {
             assert!(
                 !agent_has_session_log(agent),
                 "{agent} 不应被认为有会话记录"

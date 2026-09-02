@@ -48,7 +48,7 @@ That is what Mini-Term is for. Status lights in the project list update live; th
 
 ### 🔔 Know the moment your AI is done
 
-Not by guessing at process names — Mini-Term plugs directly into the **official Claude Code / Codex / Grok Build Hook APIs**. Events are reported in real time, which is both more accurate and faster than polling (process polling is kept as a fallback). Hooks are registered / unregistered **per CLI** in Settings, so using only one of them never writes config into the other two, and whatever is written merges with rather than overwrites your existing hook config.
+Not by guessing at process names — Mini-Term plugs directly into the **official Claude Code / Codex / Grok Build / oh-my-pi Hook APIs** (oh-my-pi through its in-process extension mechanism). Events are reported in real time, which is both more accurate and faster than polling (process polling is kept as a fallback). Hooks are registered / unregistered **per CLI** in Settings, so using only one of them never writes config into the others, and whatever is written merges with rather than overwrites your existing hook config.
 
 Status aggregates layer by layer from pane → tab → project. The moment a task flips to finished, three things fire, each independently toggleable:
 

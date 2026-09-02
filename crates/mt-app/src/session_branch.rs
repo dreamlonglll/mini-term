@@ -90,8 +90,16 @@ const GROK_CAPS: AgentBranchCaps = AgentBranchCaps {
     resume_template: "grok --resume {id}",
 };
 
+const OMP_CAPS: AgentBranchCaps = AgentBranchCaps {
+    // omp 有 `--fork <id>`,但分支树要靠会话记录解析画节点,而 omp 的记录格式
+    // 尚未接进来 —— 此时开放 fork 只会得到一棵只有自记账边、没有节点的空树。
+    // 与 grok 一样只留 resume 位(启动续接走它);等记录解析补上再开 fork。
+    fork_template: None,
+    resume_template: "omp --resume {id}",
+};
+
 /// agent 标识 → 能力表。归一化口径与 [`crate::session_panel::build_resume_command`]
-/// 一致:codex / grok 显式分流,**其余一律按 Claude**(hook 上报的标识是
+/// 一致:codex / grok / omp 显式分流,**其余一律按 Claude**(hook 上报的标识是
 /// `claude-code` 而不是 `claude`;`AiSessionRef` 的约定即「agent 缺省按 Claude」)。
 ///
 /// **opencode / pi 显式排除**:它们没有可解析的会话记录(`agent_has_session_log`),
@@ -101,6 +109,7 @@ pub fn branch_caps_for_agent(agent: Option<&str>) -> Option<AgentBranchCaps> {
     match a.as_str() {
         "codex" => Some(CODEX_CAPS),
         "grok" => Some(GROK_CAPS),
+        "omp" => Some(OMP_CAPS),
         "opencode" | "pi" => None,
         _ => Some(CLAUDE_CAPS),
     }
@@ -499,9 +508,17 @@ mod tests {
             grok.resume_command(id).as_deref(),
             Some(format!("grok --resume {id}").as_str())
         );
+
+        // omp:有 --fork 但没有记录解析,分支树画不出节点,只留 resume 位
+        let omp = branch_caps_for_agent(Some("omp")).unwrap();
+        assert!(!omp.can_fork(), "omp 的记录解析未接入,不开 fork");
+        assert_eq!(
+            omp.resume_command(id).as_deref(),
+            Some(format!("omp --resume {id}").as_str())
+        );
     }
 
-    /// 归一化:codex / grok 显式分流,opencode / pi 整表缺席,其余一律按 Claude。
+    /// 归一化:codex / grok / omp 显式分流,opencode / pi 整表缺席,其余一律按 Claude。
     /// hook 上报的是 `claude-code` 而不是 `claude` —— 这条落在「其余」里。
     #[test]
     fn 能力位表按_agent_归一化() {
@@ -515,6 +532,7 @@ mod tests {
         assert_eq!(branch_caps_for_agent(None), Some(CLAUDE_CAPS), "缺省按 Claude");
         assert_eq!(branch_caps_for_agent(Some("CoDeX")), Some(CODEX_CAPS));
         assert_eq!(branch_caps_for_agent(Some("Grok")), Some(GROK_CAPS));
+        assert_eq!(branch_caps_for_agent(Some("OMP")), Some(OMP_CAPS));
         // 没有可解析会话记录的两家:连置灰提示都不出
         assert_eq!(branch_caps_for_agent(Some("opencode")), None);
         assert_eq!(branch_caps_for_agent(Some("pi")), None);
