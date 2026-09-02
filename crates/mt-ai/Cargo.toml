@@ -20,8 +20,8 @@ mt-core.workspace = true
 # hook 上报接收端。三家 CLI 里已注册的 hook 命令 POST 到 127.0.0.1:23456/hook,
 # 端口/协议/路由都是用户机器上的既成事实,不能改(版本照抄 src-tauri/Cargo.toml)。
 tiny_http = "0.12"
-# Codex 的 ~/.codex/config.toml 要开 features.codex_hooks,改 TOML 得保留用户
-# 自己的注释与排版,故用 toml_edit 而非 toml。
+# Codex 的 ~/.codex/config.toml 要开 features.hooks(旧名 codex_hooks 已弃用),
+# 迁移时必须保留用户自己的注释与排版,故用 toml_edit 而非 toml。
 toml_edit = "0.22"
 # AI 感知的那批状态表横跨三条线程(GPUI 主线程 / 500ms 轮询 / hook HTTP)。
 # std::sync::Mutex 的锁中毒会把任一线程的 panic 传染成全进程崩溃,故统一
