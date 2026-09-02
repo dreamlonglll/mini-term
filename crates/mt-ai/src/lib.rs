@@ -57,6 +57,7 @@ pub mod hook_registry;
 pub mod hook_server;
 pub mod monitor;
 pub mod perception;
+mod reports;
 pub mod sessions;
 pub mod tracker;
 mod util;
