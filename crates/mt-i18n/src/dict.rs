@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 32;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 842;
+pub const ZH_ENTRY_COUNT: usize = 850;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 842;
+pub const EN_ENTRY_COUNT: usize = 850;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -253,6 +253,9 @@ static FILE_TREE_ZH: &[(&str, &str)] = &[
     ("dialog.deleteFileTitle", "删除文件"),
     ("dialog.deleteFolderTitle", "删除文件夹"),
     ("dialog.deleteOk", "删除"),
+    ("dialog.moveConfirm", "确定要把 \"{name}\" 移动到 \"{target}\" 吗？"),
+    ("dialog.moveOk", "移动"),
+    ("dialog.moveTitle", "移动"),
     ("dialog.noEditorMessage", "请先在『设置 → 系统设置 → 外部编辑器』中添加编辑器。"),
     ("dialog.noEditorTitle", "未配置外部编辑器"),
     ("dialog.openEditorFailedTitle", "打开编辑器失败"),
@@ -275,6 +278,7 @@ static FILE_TREE_ZH: &[(&str, &str)] = &[
     ("menu.copyRelativePath", "复制相对路径"),
     ("menu.delete", "删除"),
     ("menu.download", "下载"),
+    ("menu.moveTo", "移动到"),
     ("menu.newFile", "新建文件"),
     ("menu.newFolder", "新建文件夹"),
     ("menu.openInTerminal", "在终端中打开"),
@@ -285,6 +289,9 @@ static FILE_TREE_ZH: &[(&str, &str)] = &[
     ("menu.uploadFiles", "上传文件…"),
     ("menu.uploadFolder", "上传文件夹…"),
     ("menu.viewDiff", "查看变更"),
+    ("moveTo.empty", "没有子文件夹"),
+    ("moveTo.here", "移动到此处"),
+    ("moveTo.root", "项目根目录"),
     ("operation.busyMessage", "请等待当前文件操作完成后再试。"),
     ("operation.busyTitle", "文件操作进行中"),
     ("operation.checkingConflicts", "正在检查同名冲突…"),
@@ -296,6 +303,7 @@ static FILE_TREE_ZH: &[(&str, &str)] = &[
     ("operation.downloading", "正在下载…"),
     ("operation.failedMessage", "文件操作失败：{error}"),
     ("operation.failedTitle", "文件操作失败"),
+    ("operation.moving", "正在移动…"),
     ("operation.renaming", "正在重命名…"),
     ("operation.summary", "完成 {completed} 项，跳过 {skipped} 项，失败 {failed} 项。"),
     ("operation.uploading", "正在上传…"),
@@ -330,6 +338,9 @@ static FILE_TREE_EN: &[(&str, &str)] = &[
     ("dialog.deleteFileTitle", "Delete File"),
     ("dialog.deleteFolderTitle", "Delete Folder"),
     ("dialog.deleteOk", "Delete"),
+    ("dialog.moveConfirm", "Move \"{name}\" to \"{target}\"?"),
+    ("dialog.moveOk", "Move"),
+    ("dialog.moveTitle", "Move"),
     ("dialog.noEditorMessage", "Add an editor under Settings → System → External Editors first."),
     ("dialog.noEditorTitle", "No External Editor Configured"),
     ("dialog.openEditorFailedTitle", "Failed to Open Editor"),
@@ -352,6 +363,7 @@ static FILE_TREE_EN: &[(&str, &str)] = &[
     ("menu.copyRelativePath", "Copy Relative Path"),
     ("menu.delete", "Delete"),
     ("menu.download", "Download"),
+    ("menu.moveTo", "Move to"),
     ("menu.newFile", "New File"),
     ("menu.newFolder", "New Folder"),
     ("menu.openInTerminal", "Open in Terminal"),
@@ -362,6 +374,9 @@ static FILE_TREE_EN: &[(&str, &str)] = &[
     ("menu.uploadFiles", "Upload Files…"),
     ("menu.uploadFolder", "Upload Folder…"),
     ("menu.viewDiff", "View Changes"),
+    ("moveTo.empty", "No subfolders"),
+    ("moveTo.here", "Move Here"),
+    ("moveTo.root", "Project Root"),
     ("operation.busyMessage", "Wait for the current file operation to finish and try again."),
     ("operation.busyTitle", "File Operation in Progress"),
     ("operation.checkingConflicts", "Checking for name conflicts…"),
@@ -373,6 +388,7 @@ static FILE_TREE_EN: &[(&str, &str)] = &[
     ("operation.downloading", "Downloading…"),
     ("operation.failedMessage", "File operation failed: {error}"),
     ("operation.failedTitle", "File Operation Failed"),
+    ("operation.moving", "Moving…"),
     ("operation.renaming", "Renaming…"),
     ("operation.summary", "Completed {completed}, skipped {skipped}, failed {failed}."),
     ("operation.uploading", "Uploading…"),

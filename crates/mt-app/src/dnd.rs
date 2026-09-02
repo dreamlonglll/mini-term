@@ -21,6 +21,7 @@
 //! | 项目列表内排序 / 入组 | [`DragProjectItem`] | `project_list.rs` 的行 | 同左 |
 //! | 资源管理器 → 加项目 | [`gpui::ExternalPaths`] | 系统 | 项目列表容器 |
 //! | 文件树 / 资源管理器 → 终端 | [`DragFilePath`] / `ExternalPaths` | 文件树行 / 系统 | pane 主体 |
+//! | 文件树内移动文件/目录 | [`DragFilePath`] | 文件树行 | 目录行 / 文件行(落其父目录)/ 空白处(项目根) |
 //! | 终端 tab 移动 / 合并 / 重排 | [`DragPane`] | tab | 另一组的 tab 栏 / 终端区 |
 //!
 //! # 三条 gpui 硬约束(写代码前必须知道)
@@ -44,7 +45,10 @@
 //! - **Esc 取消**:gpui 没有内建取消,但 [`gpui::App::stop_active_drag`] 是公开的,
 //!   配上 `capture_key_down`(捕获相沿根→焦点节点下行,先于终端自己的 `on_key_down`)
 //!   就等价于原版 `paneDragState` 里那句 `window.addEventListener('keydown', …, true)`。
-//!   落点在 `terminal_area.rs` 的终端区根容器上,X 批「Esc 取消未做」的记档就此结清。
+//!   挂在 **Workspace 根**(`main.rs`)上、对四条链路一视同仁:此前挂在终端区根容器
+//!   上只对 pane 拖拽有效 —— 从文件树起拖时焦点在文件树行上,终端区不在派发路径上。
+//!   资源管理器拖进来的 `ExternalPaths` 不走这条:OLE 拖拽期间 Esc 由拖源处理,
+//!   gpui 收到 `FileDropEvent::Exited` 时自己清 active_drag。
 //! - **grabbing 光标**:Windows 上**拿不到**。`CursorStyle::ClosedHand` 在
 //!   gpui 0.2.2 的 `platform/windows/util.rs::load_cursor` 里落进 `_ => IDC_ARROW`,
 //!   强行设过去反而从「手形」退化成「箭头」。而 gpui 拖拽期间本来就会把**拖源元素**
@@ -74,9 +78,16 @@ pub struct DragProjectItem {
     pub is_group: bool,
 }
 
-/// 文件树 → 终端的载荷。原版是模块级单例 `_payload`,这里是 gpui 的 drag value。
+/// 文件树行的拖拽载荷。原版是模块级单例 `_payload`(只有路径),这里是 gpui 的
+/// drag value;**两个落点共用**:终端 pane 主体只看 `path`(写成引号包裹的文本),
+/// 文件树自己的行/空白处拿它做**移动**,判「目录不能进自身」要 `is_dir`、
+/// 确认框要显示 `name`(压缩链行的显示名是 `src/main/java`,不是路径尾段)。
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DragFilePath(pub PathBuf);
+pub struct DragFilePath {
+    pub path: PathBuf,
+    pub name: String,
+    pub is_dir: bool,
+}
 
 /// 终端 tab(pane)拖拽的载荷,对应原版 `paneDragState.ts` 的 `PaneDragPayload`。
 ///

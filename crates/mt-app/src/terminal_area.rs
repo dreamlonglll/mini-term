@@ -2493,7 +2493,7 @@ impl TerminalArea {
                               item: &crate::dnd::DragFilePath,
                               window,
                               cx| {
-                            let text = crate::dnd::quote_path(&item.0);
+                            let text = crate::dnd::quote_path(&item.path);
                             this.insert_path_into_pane(&pid, &pane_id, &text, window, cx);
                         }
                     }))
@@ -3472,27 +3472,11 @@ impl Render for TerminalArea {
             .bg(ui::bg_terminal())
             .flex()
             .relative()
-            // Esc 中途取消 pane 拖拽(X 批「Esc 取消未做」的结清)。
-            //
-            // **必须是捕获相**:按键沿「根 → 焦点节点」下行时先经过这里,而焦点
-            // 在终端上、`TerminalView` 会把 Esc 翻成 `\x1b` 写进 PTY 并
-            // `stop_propagation` —— 冒泡相挂在这里根本收不到。原版那句
-            // `window.addEventListener('keydown', onKeyDown, true)` 是同一个道理
-            // (`paneDragState.ts` 里点名了这个坑)。
-            //
-            // 只在**真有 pane 拖拽在飞**时吞掉这次 Esc:没拖拽时照常放行,
-            // 终端里按 Esc 的行为一个字节都不变。
-            .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
-                if event.keystroke.key != "escape" || this.pane_drag.is_none() {
-                    return;
-                }
-                this.pane_drag = None;
-                this.pane_drop = None;
-                this.tab_drop = None;
-                cx.stop_active_drag(window);
-                cx.stop_propagation();
-                cx.notify();
-            }))
+            // Esc 中途取消拖拽**不在这里拦**:此前挂在这个根容器上的 `capture_key_down`
+            // 只对 pane 拖拽有效(焦点在终端上时它才在派发路径上),从文件树起拖时
+            // 焦点在文件树行上、这一层收不到。现已合并到 Workspace 根(`main.rs`),
+            // 对所有内部拖拽一视同仁;本视图的 `pane_drag` / `pane_drop` / `tab_drop`
+            // 残留由 `render` 开头那句 `has_active_drag` 对账清掉。
             .child(
                 canvas(
                     move |bounds: Bounds<Pixels>, _window, cx| {

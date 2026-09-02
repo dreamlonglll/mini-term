@@ -82,8 +82,10 @@ use mt_i18n::{
 /// 失效三条可见反馈。
 /// 839 → 840：远程文档刷新失败但保留已加载内容时补非阻断警告。
 /// 840 → 842：新建终端菜单接入 AI 启动器段（分组标题 + 「管理启动器…」入口）。
+/// 842 → 850：文件树补移动：右键「移动到 ▸」多级面板 3 条、拖拽落点确认框 3 条、
+/// 菜单项与操作状态各 1 条。
 const EXPECTED_NAMESPACES: usize = 32;
-const EXPECTED_ENTRIES_PER_LANG: usize = 842;
+const EXPECTED_ENTRIES_PER_LANG: usize = 850;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

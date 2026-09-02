@@ -1935,6 +1935,29 @@ impl Render for Workspace {
                 )
             })
             .key_context("Workspace")
+            // Esc 中途取消**任何**内部拖拽(pane 拖拽 / 文件树行拖向终端或树内移动 /
+            // 项目列表排序)。原版 `fileDragState.ts` / `paneDragState.ts` 各挂一句
+            // `window.addEventListener('keydown', …, true)`,这里合成一处。
+            //
+            // **必须挂在根、且是捕获相**:按键沿「根 → 焦点节点」下行,焦点在终端上时
+            // `TerminalView` 会把 Esc 翻成 `\x1b` 写进 PTY 并 `stop_propagation`,
+            // 冒泡相收不到;而从文件树起拖时焦点在**文件树行**上(按下即聚焦),
+            // 终端区那一层压根不在派发路径上 —— 挂终端区根容器只对 pane 拖拽有效
+            // (此前正是那样,记档在 `dnd` 模块注释)。
+            //
+            // 只在**真有拖拽在飞**时吞掉这次 Esc,没拖拽时照常放行,终端里按 Esc
+            // 的行为一个字节都不变。各视图的落点残留(高亮/档位)不在这儿清:它们
+            // 都与 `cx.has_active_drag()` 与门、并在自己的 render 里对账,
+            // `stop_active_drag` 自带一次 `window.refresh()` 就够了。资源管理器拖进来的
+            // `ExternalPaths` 不经这里:OLE 拖拽期间 Esc 由拖源(Explorer)处理,
+            // gpui 收到 `FileDropEvent::Exited` 时自己清 active_drag。
+            .capture_key_down(|event: &gpui::KeyDownEvent, window, cx| {
+                if event.keystroke.key != "escape" || !cx.has_active_drag() {
+                    return;
+                }
+                cx.stop_active_drag(window);
+                cx.stop_propagation();
+            })
             .on_action(cx.listener(Self::on_new_terminal))
             .on_action(cx.listener(Self::on_close_pane))
             .on_action(cx.listener(Self::on_split_right))

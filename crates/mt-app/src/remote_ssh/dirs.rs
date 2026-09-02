@@ -372,6 +372,58 @@ pub fn rename_entry(
     })
 }
 
+/// 移动远程条目到另一个目录(保留原名),返回新路径。
+///
+/// 与本地 [`mt_project::fs::move_entry`] 同一套闸:源与目标目录都要在项目根内、
+/// 目录不能移进自身或其子孙、目标已存在**不覆盖**。用 SFTP `rename` 一步到位
+/// (同一文件系统内是原子的;跨挂载点会失败,错误原样上抛 —— 远程「复制 + 删除」
+/// 那一套不在这里做,用户可以走复制/粘贴)。
+pub fn move_entry(
+    conn: &SshConnection,
+    project_root: &str,
+    path: &str,
+    target_dir: &str,
+) -> Result<String, String> {
+    let st = state();
+    st.block_on(async move {
+        let sftp = open_sftp(st, conn).await?;
+        let result = async {
+            let source = validate_remote_leaf_under_root(&sftp, project_root, path).await?;
+            let target_dir =
+                validate_remote_dir_under_root(&sftp, project_root, target_dir).await?;
+            let (_, name) = split_posix_leaf(&source)?;
+            let target = join_posix(&target_dir, name);
+            if target == source {
+                return Err(format!("已在该目录中: {source}"));
+            }
+            let source_kind = sftp
+                .node_kind(&source)
+                .await
+                .map_err(|e| format!("远程源条目不可访问: {}", e.message()))?;
+            if source_kind == mt_ssh::SftpNodeKind::Directory
+                && posix_relative(&source, &target_dir).is_some()
+            {
+                return Err("不能把远程目录移动到自身或其子目录".into());
+            }
+            if sftp
+                .try_node_kind(&target)
+                .await
+                .map_err(|e| format!("读取远程目标失败: {}", e.message()))?
+                .is_some()
+            {
+                return Err(format!("目标已存在: {target}"));
+            }
+            sftp.rename(&source, &target)
+                .await
+                .map_err(|e| format!("移动远程条目失败: {}", e.message()))?;
+            Ok(target)
+        }
+        .await;
+        sftp.close().await;
+        result
+    })
+}
+
 /// 连接自检:只探到远程 `$HOME` 为止,返回它。
 ///
 /// 原版没有独立的「测试连接」command(SshModal 只做 CRUD),这里把

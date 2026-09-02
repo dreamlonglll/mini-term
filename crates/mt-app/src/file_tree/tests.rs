@@ -86,6 +86,7 @@ fn 文件菜单项序与原版一致() {
             Some(OpenInTerminal),
             None,
             Some(Rename),
+            Some(MoveTo),
             Some(Delete),
             None,
             Some(ViewDiff),
@@ -104,6 +105,7 @@ fn 文件菜单项序与原版一致() {
             Some(OpenInTerminal),
             None,
             Some(Rename),
+            Some(MoveTo),
             Some(Delete),
         ]
     );
@@ -124,6 +126,7 @@ fn 目录菜单项序与原版一致() {
             Some(OpenInTerminal),
             None,
             Some(Rename),
+            Some(MoveTo),
             Some(Delete),
             None,
             Some(NewFile),
@@ -171,6 +174,7 @@ fn 远程菜单不暴露本机动作并提供传输入口() {
             Some(OpenInTerminal),
             None,
             Some(Rename),
+            Some(MoveTo),
             Some(Delete),
         ]
     );
@@ -188,6 +192,7 @@ fn 远程菜单不暴露本机动作并提供传输入口() {
             Some(OpenInTerminal),
             None,
             Some(Rename),
+            Some(MoveTo),
             Some(Delete),
             None,
             Some(NewFile),
