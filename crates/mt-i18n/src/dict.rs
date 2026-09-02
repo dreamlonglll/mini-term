@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 32;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 853;
+pub const ZH_ENTRY_COUNT: usize = 854;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 853;
+pub const EN_ENTRY_COUNT: usize = 854;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -43,6 +43,7 @@ static APP_ZH: &[(&str, &str)] = &[
     ("firstRun.title", "还没有项目"),
     ("menu.settings", "设置"),
     ("mobileStartSession", "移动端新建了会话（{launcher}）"),
+    ("orchestratorSkillDeployFailed", "编排 Skill（mini-term-orchestrator）写入项目目录失败，编排者可能不会用控制 CLI：{error}"),
     ("orchestratorStartSession", "编排者新建了会话（{launcher}）"),
     ("titleBar.close", "关闭"),
     ("titleBar.maximize", "最大化"),
@@ -93,6 +94,7 @@ static APP_EN: &[(&str, &str)] = &[
     ("firstRun.title", "No projects yet"),
     ("menu.settings", "Settings"),
     ("mobileStartSession", "Mobile started a session ({launcher})"),
+    ("orchestratorSkillDeployFailed", "Could not write the orchestrator skill (mini-term-orchestrator) into the project; the orchestrator may not know how to use the control CLI: {error}"),
     ("orchestratorStartSession", "An orchestrator started a session ({launcher})"),
     ("titleBar.close", "Close"),
     ("titleBar.maximize", "Maximize"),

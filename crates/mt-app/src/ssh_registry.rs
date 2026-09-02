@@ -29,6 +29,14 @@ use std::path::{Path, PathBuf};
 use mt_core::atomic_write;
 use serde_json::Value;
 
+// 与 `orchestrator_skill` 共用的落盘底座(路径 / 引号 / .gitignore / Codex 信任)。
+use crate::skill_files::{
+    append_gitignore_entries as append_gitignore_entries_for,
+    compute_gitignore_append as compute_gitignore_append_for, prune_empty_skill_dirs,
+    quote_posix_single, quote_powershell_single, skill_paths as skill_paths_for,
+    trust_project_in_codex, validate_project_dir,
+};
+
 /// skill 目录名 —— 同时充当幂等 marker(与旧 MCP server 名一致,便于对应)。
 const SKILL_DIR_NAME: &str = "mini-term-ssh";
 
@@ -56,28 +64,7 @@ fn ssh_cli_binary_path() -> Result<String, String> {
     Ok(dir.join(bin_name).to_string_lossy().to_string())
 }
 
-/// 校验并规整项目目录路径。要求传入的是一个已存在的目录。
-fn validate_project_dir(project_dir: &str) -> Result<PathBuf, String> {
-    let trimmed = project_dir.trim();
-    if trimmed.is_empty() {
-        return Err("项目目录路径为空".to_string());
-    }
-    let path = PathBuf::from(trimmed);
-    if !path.is_dir() {
-        return Err(format!("项目目录不存在或不是文件夹: {}", trimmed));
-    }
-    Ok(path)
-}
-
 // ─── SKILL.md 模板 ───
-
-fn quote_posix_single(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\"'\"'"))
-}
-
-fn quote_powershell_single(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "''"))
-}
 
 /// 渲染 SKILL.md 内容。`with_allowed_tools` 区分 Claude 版(true,skill 激活
 /// 期间免审批)与 Codex 版(false,规避未知 frontmatter 字段的容忍度风险)。
@@ -165,26 +152,9 @@ Do NOT base64-echo file contents through exec — use upload/download.
     )
 }
 
-/// 两份 SKILL.md 的落盘路径。
+/// 两份 SKILL.md 的落盘路径(Claude 版含 allowed-tools)。
 fn skill_paths(project_dir: &Path) -> [(PathBuf, bool); 2] {
-    [
-        (
-            project_dir
-                .join(".claude")
-                .join("skills")
-                .join(SKILL_DIR_NAME)
-                .join("SKILL.md"),
-            true, // Claude 版含 allowed-tools
-        ),
-        (
-            project_dir
-                .join(".codex")
-                .join("skills")
-                .join(SKILL_DIR_NAME)
-                .join("SKILL.md"),
-            false,
-        ),
-    ]
+    skill_paths_for(project_dir, SKILL_DIR_NAME)
 }
 
 /// 整文件覆盖写入两份 SKILL.md(mini-term 独占生成物,无需合并语义)。
@@ -215,15 +185,7 @@ fn remove_skill_files(project_dir: &Path) -> Result<(), String> {
                 .map_err(|e| format!("删除 {} 失败: {}", path.display(), e))?;
         }
         // mini-term-ssh/ → skills/ → .claude|.codex/,逐级尝试删空目录。
-        let mut dir = path.parent();
-        for _ in 0..3 {
-            let Some(d) = dir else { break };
-            // 只在目录存在且为空时成功;失败(非空/不存在)即停止向上。
-            if std::fs::remove_dir(d).is_err() {
-                break;
-            }
-            dir = d.parent();
-        }
+        prune_empty_skill_dirs(&path);
     }
     Ok(())
 }
@@ -236,48 +198,17 @@ const GITIGNORE_ENTRIES: &[&str] = &[
     ".codex/skills/mini-term-ssh/",
 ];
 
+/// 追加段前那行注释。**一字不改**:装机版写出来的 `.gitignore` 就是这一行。
+const GITIGNORE_HEADER: &str = "# mini-term SSH skill（本机相关生成物，勿提交）";
+
 /// 计算追加条目后的 `.gitignore` 全文;若无需追加返回 `None`。抽出便于单测。
 fn compute_gitignore_append(existing: &str) -> Option<String> {
-    let present: std::collections::HashSet<&str> = existing.lines().map(|l| l.trim()).collect();
-    let missing: Vec<&str> = GITIGNORE_ENTRIES
-        .iter()
-        .copied()
-        .filter(|e| !present.contains(*e))
-        .collect();
-    if missing.is_empty() {
-        return None;
-    }
-
-    let mut out = existing.to_string();
-    // 确保与已有内容之间有换行分隔
-    if !out.is_empty() && !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out.push_str("# mini-term SSH skill（本机相关生成物，勿提交）\n");
-    for entry in missing {
-        out.push_str(entry);
-        out.push('\n');
-    }
-    Some(out)
+    compute_gitignore_append_for(existing, GITIGNORE_HEADER, GITIGNORE_ENTRIES)
 }
 
 /// 幂等地把两个 skill 目录追加进 `<project>/.gitignore`。
 fn append_gitignore_entries(project_dir: &Path) -> Result<(), String> {
-    let gitignore_path = project_dir.join(".gitignore");
-    let existing = if gitignore_path.exists() {
-        std::fs::read_to_string(&gitignore_path)
-            .map_err(|e| format!("读取 .gitignore 失败: {}", e))?
-    } else {
-        String::new()
-    };
-
-    let Some(appended) = compute_gitignore_append(&existing) else {
-        return Ok(());
-    };
-
-    atomic_write(&gitignore_path, appended.as_bytes())
-        .map_err(|e| format!("写入 .gitignore 失败: {}", e))?;
-    Ok(())
+    append_gitignore_entries_for(project_dir, GITIGNORE_HEADER, GITIGNORE_ENTRIES)
 }
 
 // ---------------------------------------------------------------------------
@@ -291,11 +222,6 @@ fn append_gitignore_entries(project_dir: &Path) -> Result<(), String> {
 // 清理原则与写入时代一致:只动本 server 用 marker 写入的条目,用户/团队的
 // 其它 server 与配置字段毫发无损;但**不**移除 Codex 的项目信任(无法可靠
 // 区分是否本功能所加,且信任无害),也不动 `.gitignore`。
-
-/// 获取 Codex 全局配置文件路径: `~/.codex/config.toml`
-fn codex_global_config_path() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".codex").join("config.toml"))
-}
 
 /// 获取 Claude Code 全局配置文件路径: `~/.claude/settings.json`
 fn claude_settings_path() -> Option<PathBuf> {
@@ -378,50 +304,6 @@ fn strip_codex_mcp_server(doc: &mut toml_edit::DocumentMut) {
             doc.remove("mcp_servers");
         }
     }
-}
-
-/// 在 Codex 全局 `~/.codex/config.toml` 里把项目标为 `trust_level = "trusted"`。
-///
-/// Codex 要求项目目录被信任后,其 `<project>/.codex/` 内容才生效;未信任则
-/// 项目级配置(含 skills)可能被静默忽略,启用时继续写入。
-///
-/// 幂等:若该项目路径已有 `[projects."..."]` 条目,保留其它字段、只确保
-/// `trust_level` 为 `"trusted"`。停用时**不**移除此信任(无法可靠判断是否
-/// 本功能所加,且信任本身无害)。
-fn trust_project_in_codex(project_dir: &Path) -> Result<(), String> {
-    let config_path = codex_global_config_path().ok_or_else(|| "无法获取 home 目录".to_string())?;
-    if let Some(parent) = config_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("创建 .codex 目录失败: {}", e))?;
-    }
-
-    let content = if config_path.exists() {
-        std::fs::read_to_string(&config_path)
-            .map_err(|e| format!("读取 Codex config.toml 失败: {}", e))?
-    } else {
-        String::new()
-    };
-
-    let mut doc: toml_edit::DocumentMut = content
-        .parse::<toml_edit::DocumentMut>()
-        .map_err(|e| format!("解析 Codex config.toml 失败: {}", e))?;
-
-    // Codex 用项目绝对路径作为 [projects."<path>"] 的 key。
-    let key = project_dir.to_string_lossy().to_string();
-    apply_codex_project_trust(&mut doc, &key);
-
-    atomic_write(&config_path, doc.to_string().as_bytes())
-        .map_err(|e| format!("写入 Codex config.toml 失败: {}", e))?;
-    Ok(())
-}
-
-/// 在 `toml_edit` 文档里确保 `[projects."<key>"] trust_level = "trusted"`。抽出便于单测。
-fn apply_codex_project_trust(doc: &mut toml_edit::DocumentMut, project_key: &str) {
-    if doc.get("projects").is_none() {
-        let mut t = toml_edit::Table::new();
-        t.set_implicit(true);
-        doc["projects"] = toml_edit::Item::Table(t);
-    }
-    doc["projects"][project_key]["trust_level"] = toml_edit::value("trusted");
 }
 
 /// 在 Claude `~/.claude/settings.json` 的 `enabledMcpjsonServers` 数组里
@@ -814,21 +696,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ─── validate_project_dir ───
-
-    #[test]
-    fn validate_project_dir_rejects_empty_and_missing() {
-        assert!(validate_project_dir("").is_err());
-        assert!(validate_project_dir("   ").is_err());
-        assert!(validate_project_dir("/definitely/not/a/real/dir/xyz123").is_err());
-    }
-
-    #[test]
-    fn validate_project_dir_accepts_existing_dir() {
-        let tmp = std::env::temp_dir();
-        assert!(validate_project_dir(&tmp.to_string_lossy()).is_ok());
-    }
-
     #[test]
     fn project_token_reuses_existing_or_generates_uuid() {
         assert_eq!(
@@ -978,54 +845,6 @@ mod tests {
         assert_eq!(
             reparsed["mcp_servers"]["context7"]["command"].as_str(),
             Some("npx")
-        );
-    }
-
-    // ─── Codex 项目信任 ───
-
-    #[test]
-    fn codex_project_trust_written_correctly() {
-        let mut doc: toml_edit::DocumentMut = "".parse().unwrap();
-        apply_codex_project_trust(&mut doc, r"D:\Git\proj");
-        let reparsed: toml_edit::DocumentMut = doc.to_string().parse().unwrap();
-        assert_eq!(
-            reparsed["projects"][r"D:\Git\proj"]["trust_level"].as_str(),
-            Some("trusted")
-        );
-    }
-
-    #[test]
-    fn codex_project_trust_preserves_other_projects() {
-        let initial = "[projects.\"/home/u/other\"]\ntrust_level = \"trusted\"\n";
-        let mut doc: toml_edit::DocumentMut = initial.parse().unwrap();
-        apply_codex_project_trust(&mut doc, "/home/u/new");
-        let reparsed: toml_edit::DocumentMut = doc.to_string().parse().unwrap();
-        // 旧项目信任保留
-        assert_eq!(
-            reparsed["projects"]["/home/u/other"]["trust_level"].as_str(),
-            Some("trusted")
-        );
-        // 新项目信任加入
-        assert_eq!(
-            reparsed["projects"]["/home/u/new"]["trust_level"].as_str(),
-            Some("trusted")
-        );
-    }
-
-    #[test]
-    fn codex_project_trust_preserves_sibling_fields() {
-        // 已有项目条目带其它字段时,只动 trust_level,其它字段保留
-        let initial = "[projects.\"/home/u/proj\"]\ntrust_level = \"unknown\"\nsome_field = 42\n";
-        let mut doc: toml_edit::DocumentMut = initial.parse().unwrap();
-        apply_codex_project_trust(&mut doc, "/home/u/proj");
-        let reparsed: toml_edit::DocumentMut = doc.to_string().parse().unwrap();
-        assert_eq!(
-            reparsed["projects"]["/home/u/proj"]["trust_level"].as_str(),
-            Some("trusted")
-        );
-        assert_eq!(
-            reparsed["projects"]["/home/u/proj"]["some_field"].as_integer(),
-            Some(42)
         );
     }
 

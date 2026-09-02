@@ -201,6 +201,9 @@ impl AppStore {
     /// 回收一个终端:kill 子进程 + 清 AI 感知痕迹 + 摘掉视图与订阅。
     // 拆分前是私有方法;调用点散在 `projects` / `panes` / `ssh` / `layout`,升到 `pub(super)`。
     pub(super) fn dispose_terminal(&mut self, pty_id: u32, cx: &mut Context<Self>) {
+        // 编排者 pane 走了要顺手收回它投进项目的编排礼仪 Skill。「是不是编排者」
+        // 得在下面 `shutdown` 撤销令牌**之前**问,之后就问不出来了。
+        let orchestrator_home = self.orchestrator_home_of(pty_id);
         // 对应 `terminalCache.ts:546` 的 `aiPtyIds.delete(ptyId)` ——
         // 不摘的话新 PTY 复用同一个编号时会被误当成 AI pane(嗅探静默失效)
         crate::git_watch::forget_pane(pty_id);
@@ -221,6 +224,56 @@ impl AppStore {
             });
         }
         self.pane_subs.remove(&pty_id);
+        if let Some(project_id) = orchestrator_home {
+            self.withdraw_orchestrator_skill_if_last(&project_id, pty_id, cx);
+        }
+    }
+
+    /// 这个 PTY 此刻是编排者 pane 时,它所在项目的 id;不是就 `None`。
+    ///
+    /// 布局树里查项目要在 pane 被摘掉之前(`close_pane` 先 dispose 再 remove,
+    /// `remove_project` 先 dispose 再删 state,两条路都满足)。
+    fn orchestrator_home_of(&self, pty_id: u32) -> Option<String> {
+        if !self.ai.perception().control().is_orchestrator(pty_id) {
+            return None;
+        }
+        self.pane_of_pty(pty_id).map(|(project_id, _)| project_id)
+    }
+
+    /// 编排者 pane 关掉后:该项目里再没有别的编排者活着,就把投进去的编排礼仪
+    /// Skill 收回(`orchestrator_skill::withdraw`,后台跑,没人等它)。
+    ///
+    /// `closing` 是刚关掉的那个 —— 它的令牌已在 `shutdown` 里撤销,但万一那条路
+    /// 没走到(终端实体早已不在),这里也不许把它算成「还活着的编排者」。
+    fn withdraw_orchestrator_skill_if_last(
+        &self,
+        project_id: &str,
+        closing: u32,
+        cx: &mut Context<Self>,
+    ) {
+        let control = self.ai.perception().control();
+        let still_hosting = self
+            .project_states
+            .get(project_id)
+            .map(|s| {
+                s.pty_ids()
+                    .into_iter()
+                    .any(|id| id != closing && control.is_orchestrator(id))
+            })
+            .unwrap_or(false);
+        if still_hosting {
+            return;
+        }
+        let Some(path) = self.project(project_id).map(|p| p.path.clone()) else {
+            return;
+        };
+        cx.background_executor()
+            .spawn(async move {
+                if let Err(err) = crate::orchestrator_skill::withdraw(&path) {
+                    eprintln!("[orchestrator_skill] 收回失败: {err}");
+                }
+            })
+            .detach();
     }
 
     // 拆分前是私有方法;调用点在 `store::panes::split_pane_with_cwd`,升到 `pub(super)`。
