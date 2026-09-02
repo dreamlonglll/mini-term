@@ -221,6 +221,8 @@ pub struct PaneFacet {
     pub title: String,
     pub status: PaneStatus,
     pub pty_id: Option<u32>,
+    /// 桌面端黄灯(`PaneState.attention`:提问待答/等待授权),透传给移动端
+    pub attention: bool,
 }
 
 /// 组装好的一条 pane。**自带 `PartialEq`**:内容去重直接比结构,
@@ -232,6 +234,8 @@ pub struct SnapPane {
     pub title: String,
     pub status: String,
     pub pty_id: Option<u32>,
+    /// 进 `PartialEq` 才能让黄灯变化触发内容去重后的重发
+    pub needs_attention: bool,
 }
 
 /// 组装好的一条项目。
@@ -262,6 +266,7 @@ impl From<SnapProject> for SyncProject {
                     title: x.title,
                     status: x.status,
                     pty_id: x.pty_id,
+                    needs_attention: x.needs_attention,
                 })
                 .collect(),
         }
@@ -365,6 +370,7 @@ pub fn build_snapshot(
                 title: pane.title.clone(),
                 status: pane.status.as_str().to_string(),
                 pty_id: pane.pty_id,
+                needs_attention: pane.attention,
             });
         }
         out.push(SnapProject {
@@ -782,6 +788,7 @@ impl RelayBridge {
                                 title: pane.label().to_string(),
                                 status: pane.status,
                                 pty_id: pane.pty_id,
+                                attention: pane.attention,
                             })
                             .collect()
                     })
@@ -903,6 +910,7 @@ mod tests {
             title: format!("t-{id}"),
             status,
             pty_id: pty,
+            attention: false,
         }
     }
 
@@ -1164,6 +1172,35 @@ mod tests {
         assert_eq!(snapshot[0].panes[1].pty_id, None);
         assert_eq!(snapshot[0].group_path, ["组"]);
         assert_eq!(ai_pane_ids, HashSet::from(["p1".to_string(), "p2".to_string()]));
+    }
+
+    /// 黄灯(attention)必须进快照并参与 `PartialEq`:不透传手机看不到
+    /// 「等你处理」;不参与相等比较则黄灯变化会被 `last_sent` 内容去重吞掉。
+    #[test]
+    fn attention_进快照且变化触发不相等() {
+        let projects = vec![ProjectFacet {
+            id: "a".into(),
+            name: "A".into(),
+            path: "D:/A".into(),
+            ssh_connection_id: None,
+            group_path: vec![],
+        }];
+        let calm = pane("p1", PaneStatus::AiWorking, Some(1));
+        let hot = PaneFacet {
+            attention: true,
+            ..calm.clone()
+        };
+
+        let mut ids = HashSet::new();
+        let mut panes = HashMap::new();
+        panes.insert("a".to_string(), vec![calm]);
+        let before = build_snapshot(&projects, &panes, &mut ids);
+        assert!(!before[0].panes[0].needs_attention);
+
+        panes.insert("a".to_string(), vec![hot]);
+        let after = build_snapshot(&projects, &panes, &mut ids);
+        assert!(after[0].panes[0].needs_attention);
+        assert_ne!(before, after, "黄灯变化必须打破内容去重");
     }
 
     /// 坑 10:`ai_pane_ids` 是跨调用状态。AI 会话崩成 error 之后 pane 必须**还在**

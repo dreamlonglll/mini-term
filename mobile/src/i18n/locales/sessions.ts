@@ -12,6 +12,7 @@ export const sessions = {
       aiWorking: "工作中",
       aiIdle: "空闲",
       error: "错误",
+      attention: "等你处理",
     },
     rename: {
       action: "重命名会话",
@@ -35,6 +36,7 @@ export const sessions = {
       aiWorking: "Working",
       aiIdle: "Idle",
       error: "Error",
+      attention: "Needs your input",
     },
     rename: {
       action: "Rename session",

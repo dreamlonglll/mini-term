@@ -166,6 +166,69 @@ async fn command_routes_to_desktop_and_receipt_returns() {
     );
 }
 
+/// 点选作答与移动端指令同一路由纪律:在线原样转发,离线路由层即拒。
+#[tokio::test]
+async fn answer_question_routes_and_rejects_when_offline() {
+    let addr = spawn_relay().await;
+    let mut desktop = desktop_handshake(addr).await;
+    let mut mobile = paired_mobile(addr, &mut desktop).await;
+
+    send_json(
+        &mut mobile,
+        &MobileToRelay::AnswerQuestion {
+            pane_id: "pane-1".into(),
+            command_id: "ans-1".into(),
+            seq: 5,
+            question_id: "toolu_q1".into(),
+            question_index: 0,
+            option_index: 1,
+        },
+    )
+    .await;
+    assert_eq!(
+        recv_json::<RelayToDesktop>(&mut desktop).await,
+        Some(RelayToDesktop::AnswerQuestion {
+            pane_id: "pane-1".into(),
+            command_id: "ans-1".into(),
+            seq: 5,
+            question_id: "toolu_q1".into(),
+            question_index: 0,
+            option_index: 1,
+        })
+    );
+
+    // 桌面端下线后作答即拒,回执走同一 CommandReceipt 通道
+    desktop.close(None).await.unwrap();
+    drop(desktop);
+    assert_eq!(
+        recv_json::<RelayToMobile>(&mut mobile).await,
+        Some(RelayToMobile::Presence {
+            desktop_online: false
+        })
+    );
+    send_json(
+        &mut mobile,
+        &MobileToRelay::AnswerQuestion {
+            pane_id: "pane-1".into(),
+            command_id: "ans-2".into(),
+            seq: 5,
+            question_id: "toolu_q1".into(),
+            question_index: 0,
+            option_index: 1,
+        },
+    )
+    .await;
+    assert_eq!(
+        recv_json::<RelayToMobile>(&mut mobile).await,
+        Some(RelayToMobile::CommandReceipt {
+            pane_id: "pane-1".into(),
+            command_id: "ans-2".into(),
+            ok: false,
+            reason: Some(CommandFailReason::DesktopOffline),
+        })
+    );
+}
+
 #[tokio::test]
 async fn desktop_offline_rejects_command_immediately() {
     let addr = spawn_relay().await;

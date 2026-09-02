@@ -11,11 +11,15 @@
 //! 而不是编码项目路径去比目录名 —— 后者要逐字复刻 grok 所用 urlencoding
 //! crate 的转义集(以及未来的任何调整),前者对两种编码形态一并成立。
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
-use super::{AiSession, AiSessionMessage, MAX_SESSIONS_PER_SOURCE, normalize_path};
+use super::{
+    AiQuestion, AiQuestionAnswer, AiQuestionItem, AiQuestionOption, AiSession, AiSessionMessage,
+    MAX_SESSIONS_PER_SOURCE, normalize_path,
+};
 
 /// grok 会话根目录:`{$GROK_HOME | ~/.grok}/sessions`
 fn grok_sessions_dir() -> Option<PathBuf> {
@@ -297,6 +301,175 @@ impl GrokUpdateParser {
     }
 }
 
+// ─── Agent 提问(grok ask_user_question)────────────────────────
+//
+// 提问在 updates.jsonl 里出现两次:`tool_call` 首行(title=ask_user_question)
+// 与富化行(`tool_call_update`,rawInput.variant=AskUserQuestion,无 status),
+// 题目与选项都在 `rawInput.questions`,结构与 Claude 的 AskUserQuestion 入参
+// 同构。⚠️ **富化行是提问了结那一刻才补写的**(时间戳 ≈ 作答/打断时刻,
+// 实测挂起 101s 期间磁盘上只有首行)——出卡必须认首行,否则卡片永远晚到;
+// 富化行也认(首行万一缺 rawInput 时的兜底,实测两者题目选项逐字一致),
+// 重复出卡由镜像层按挂起中的 call_id 去重。
+// 回执是同 toolCallId 的 `tool_call_update` 终态行:status=completed 且
+// `rawOutput.type=AskUserQuestion`,选中项**嵌在 UserAnswered.message 文本里**
+// (`User has answered your questions: "题文"="label". …`),按引号对扫出。
+
+/// 行 → (params.update, unix 时间戳)。非 session/update 轨(xAI 扩展轨)返回 None。
+fn grok_acp_update(line: &str) -> Option<(serde_json::Value, u64)> {
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    if v.get("method").and_then(|m| m.as_str()) == Some("_x.ai/session/update") {
+        return None;
+    }
+    let ts = v.get("timestamp").and_then(|t| t.as_u64()).unwrap_or(0);
+    let params = v.get("params").unwrap_or(&v);
+    Some((params.get("update")?.clone(), ts))
+}
+
+/// 解析 grok updates.jsonl 的一行为 agent 提问(首行与富化行都认,见模块注释)。
+/// 非 ask_user_question / 带 status 的进度终态行 / 题目或选项为空 → None。
+pub fn grok_question_from_line(line: &str) -> Option<AiQuestion> {
+    let (update, ts) = grok_acp_update(line)?;
+    if update.get("status").is_some() {
+        return None;
+    }
+    let is_ask = match update.get("sessionUpdate").and_then(|t| t.as_str()) {
+        Some("tool_call") => {
+            update.get("title").and_then(|t| t.as_str()) == Some("ask_user_question")
+        }
+        Some("tool_call_update") => {
+            update.pointer("/rawInput/variant").and_then(|v| v.as_str())
+                == Some("AskUserQuestion")
+                || update
+                    .pointer("/_meta/x.ai~1tool/name")
+                    .and_then(|v| v.as_str())
+                    == Some("ask_user_question")
+        }
+        _ => false,
+    };
+    if !is_ask {
+        return None;
+    }
+    let call_id = update.get("toolCallId").and_then(|i| i.as_str())?.to_string();
+    let items: Vec<AiQuestionItem> = update
+        .pointer("/rawInput/questions")?
+        .as_array()?
+        .iter()
+        .filter_map(|q| {
+            let question = q.get("question").and_then(|v| v.as_str())?.to_string();
+            let options: Vec<AiQuestionOption> = q
+                .get("options")?
+                .as_array()?
+                .iter()
+                .filter_map(|o| {
+                    Some(AiQuestionOption {
+                        label: o.get("label").and_then(|v| v.as_str())?.to_string(),
+                        description: o
+                            .get("description")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                    })
+                })
+                .collect();
+            if options.is_empty() {
+                return None;
+            }
+            Some(AiQuestionItem {
+                question,
+                header: q
+                    .get("header")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                id: q
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                options,
+                multi_select: q
+                    .get("multiSelect")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+            })
+        })
+        .collect();
+    if items.is_empty() {
+        return None;
+    }
+    Some(AiQuestion {
+        tool_use_id: call_id,
+        items,
+        timestamp: unix_to_iso(ts),
+    })
+}
+
+/// 从 `UserAnswered.message` 文本里扫出 `"题文"="label"` 对。
+/// label 含引号会截断——接受该局限(题文/label 都出自结构化选项,常规文本)。
+fn answered_pairs(message: &str) -> HashMap<String, Vec<String>> {
+    let mut out: HashMap<String, Vec<String>> = HashMap::new();
+    let chars: Vec<char> = message.chars().collect();
+    let read_quoted = |start: usize| -> Option<(String, usize)> {
+        if chars.get(start) != Some(&'"') {
+            return None;
+        }
+        let mut s = String::new();
+        let mut i = start + 1;
+        while i < chars.len() {
+            if chars[i] == '"' {
+                return Some((s, i + 1));
+            }
+            s.push(chars[i]);
+            i += 1;
+        }
+        None
+    };
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '"' {
+            if let Some((q, after_q)) = read_quoted(i) {
+                if chars.get(after_q) == Some(&'=') {
+                    if let Some((a, after_a)) = read_quoted(after_q + 1) {
+                        out.entry(q).or_default().push(a);
+                        i = after_a;
+                        continue;
+                    }
+                }
+                i = after_q;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// 解析 grok updates.jsonl 的一行为提问回执(tool_call_update 终态行)。
+/// 行内不含工具身份之外的判据,由调用方拿挂起提问的 call_id 对账。
+/// status=completed 且带 UserAnswered → 作答(labels 从 message 扫出);
+/// 其余终态(failed/canceled)或 completed 而无 UserAnswered → is_error。
+pub fn grok_question_answer_from_line(line: &str) -> Option<AiQuestionAnswer> {
+    let (update, ts) = grok_acp_update(line)?;
+    if update.get("sessionUpdate").and_then(|t| t.as_str()) != Some("tool_call_update") {
+        return None;
+    }
+    let status = update.get("status").and_then(|s| s.as_str())?;
+    if !matches!(status, "completed" | "failed" | "canceled" | "cancelled") {
+        return None;
+    }
+    let call_id = update.get("toolCallId").and_then(|i| i.as_str())?.to_string();
+    let answered_msg = update
+        .pointer("/rawOutput/UserAnswered/message")
+        .and_then(|m| m.as_str());
+    let answers = answered_msg.map(answered_pairs).unwrap_or_default();
+    Some(AiQuestionAnswer {
+        tool_use_ids: vec![call_id],
+        is_error: status != "completed" || answered_msg.is_none(),
+        answers,
+        timestamp: unix_to_iso(ts),
+    })
+}
+
 fn read_grok_messages_from_file(path: &Path) -> Result<Vec<AiSessionMessage>, String> {
     let file = fs::File::open(path).map_err(|e| format!("无法打开文件: {}", e))?;
     let reader = BufReader::new(file);
@@ -380,6 +553,52 @@ mod tests {
             Some(r"D:\Git\very-long-path")
         );
         fs::remove_dir_all(&root).ok();
+    }
+
+    /// 形状取自真机 updates.jsonl(2026-09-01):首行(挂起期间磁盘上只有它)
+    /// 与富化行(了结时补写)都要认,重复由镜像层按挂起 call_id 去重。
+    #[test]
+    fn grok_question_from_line_parses_both_shapes() {
+        let first = r#"{"timestamp":1788249699,"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"call-10d759af-x-2","title":"ask_user_question","rawInput":{"questions":[{"question":"你希望我接下来帮你做什么？","options":[{"label":"继续镜像工作","description":"继续处理改动"},{"label":"其他","description":"请说明"}]}]}}}}"#;
+        let q = grok_question_from_line(first).unwrap();
+        assert_eq!(q.tool_use_id, "call-10d759af-x-2");
+        assert_eq!(q.items.len(), 1);
+        assert_eq!(q.items[0].question, "你希望我接下来帮你做什么？");
+        assert_eq!(q.items[0].options.len(), 2);
+        assert!(!q.items[0].multi_select);
+        assert_eq!(q.timestamp, "2026-09-01T08:01:39Z");
+
+        let enriched = r#"{"timestamp":1788249733,"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"call-10d759af-x-2","kind":"other","title":"Ask: 你希望我接下来帮你做什么？","rawInput":{"variant":"AskUserQuestion","questions":[{"question":"你希望我接下来帮你做什么？","options":[{"label":"继续镜像工作","description":"继续处理改动"},{"label":"其他","description":"请说明"}],"multiSelect":null}]},"_meta":{"x.ai/tool":{"name":"ask_user_question","kind":"ask_user"}}}}}"#;
+        let q2 = grok_question_from_line(enriched).unwrap();
+        assert_eq!(q2.tool_use_id, "call-10d759af-x-2");
+        assert_eq!(q2.items[0].options.len(), 2);
+
+        // 终态行(带 status)不出卡
+        let terminal = r#"{"timestamp":2,"method":"session/update","params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"c","status":"completed","rawInput":{"variant":"AskUserQuestion","questions":[{"question":"Q","options":[{"label":"A"}]}]}}}}"#;
+        assert!(grok_question_from_line(terminal).is_none());
+        // 别的工具调用不出卡
+        let other = r#"{"timestamp":1,"method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"c","title":"grep","rawInput":{"pattern":"x"}}}}"#;
+        assert!(grok_question_from_line(other).is_none());
+    }
+
+    /// 回执:completed + UserAnswered.message 里的 "题文"="label" 对扫出选中项
+    #[test]
+    fn grok_question_answer_from_line_extracts_labels() {
+        let line = r#"{"timestamp":1788249746,"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"call-10d759af-x-2","status":"completed","rawOutput":{"type":"AskUserQuestion","UserAnswered":{"message":"User has answered your questions: \"你希望我接下来帮你做什么？\"=\"继续镜像工作\". You can now continue with the user's answers in mind."}}}}}"#;
+        let a = grok_question_answer_from_line(line).unwrap();
+        assert_eq!(a.tool_use_ids, vec!["call-10d759af-x-2".to_string()]);
+        assert!(!a.is_error);
+        assert_eq!(
+            a.answers.get("你希望我接下来帮你做什么？"),
+            Some(&vec!["继续镜像工作".to_string()])
+        );
+
+        // completed 但无 UserAnswered(拒答/打断的收尾)→ is_error
+        let declined = r#"{"timestamp":2,"method":"session/update","params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"c2","status":"completed","rawOutput":{"type":"AskUserQuestion"}}}}"#;
+        assert!(grok_question_answer_from_line(declined).unwrap().is_error);
+        // 进度更新(无 status)不产出回执
+        let progress = r#"{"timestamp":3,"method":"session/update","params":{"update":{"sessionUpdate":"tool_call_update","toolCallId":"c3","kind":"other"}}}"#;
+        assert!(grok_question_answer_from_line(progress).is_none());
     }
 
     fn grok_chunk(tag: &str, text: &str, ts: u64) -> String {

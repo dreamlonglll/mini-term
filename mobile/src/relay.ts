@@ -57,6 +57,14 @@ export interface MirrorState {
   closed: boolean;
   /** 等待回执中的指令 id;null = 没有在途指令 */
   pendingCommandId: string | null;
+  /** 在途的点选作答(commandId 与 pendingCommandId 同值,额外记住卡片 seq) */
+  pendingAnswer: { commandId: string; seq: number } | null;
+  /**
+   * 各提问卡片已成功注入的作答数(卡片 seq → 已答题数)。回执 ok 即推进:
+   * 已作答标记要等下一轮镜像轮询才回流,这 ~1s 里按钮不该复活可再点。
+   * 这是提交防抖不是乐观渲染——选中项的展示仍以回流的标记为准。
+   */
+  answeredProgress: Record<number, number>;
   /** 最近一次指令回执(短暂展示后由 UI 清除) */
   receipt: { ok: boolean; reason?: CommandFailReason } | null;
 }
@@ -286,10 +294,18 @@ function connect(auth: { pairingCode?: string; credential?: string }) {
         const { mirror } = useRelayStore.getState();
         if (!mirror || mirror.paneId !== msg.paneId) break;
         if (mirror.pendingCommandId !== null && mirror.pendingCommandId !== msg.commandId) break;
+        // 点选作答成功:本地推进该卡片的作答进度(见 answeredProgress 注释)
+        const answeredProgress = { ...mirror.answeredProgress };
+        if (msg.ok && mirror.pendingAnswer?.commandId === msg.commandId) {
+          const seq = mirror.pendingAnswer.seq;
+          answeredProgress[seq] = (answeredProgress[seq] ?? 0) + 1;
+        }
         useRelayStore.setState({
           mirror: {
             ...mirror,
             pendingCommandId: null,
+            pendingAnswer: null,
+            answeredProgress,
             receipt: { ok: msg.ok, reason: msg.reason },
           },
         });
@@ -350,6 +366,8 @@ export function openMirror(paneId: string, title: string) {
       loadingOlder: false,
       closed: false,
       pendingCommandId: null,
+      pendingAnswer: null,
+      answeredProgress: {},
       receipt: null,
     },
   });
@@ -371,17 +389,58 @@ export function renamePane(paneId: string, title: string): boolean {
   return true;
 }
 
+/** 镜像页动作的公共前置:有镜像且未关闭、已连接、桌面端在线。不满足返回 null。 */
+function mirrorReady(): MirrorState | null {
+  const { mirror, desktopOnline, phase } = useRelayStore.getState();
+  if (!mirror || mirror.closed) return null;
+  if (phase !== 'connected' || desktopOnline === false) return null;
+  return mirror;
+}
+
 /** 发送移动端指令(写穿,不排队)。返回 false = 当前不可发送。 */
 export function sendMobileCommand(text: string): boolean {
-  const { mirror, desktopOnline, phase } = useRelayStore.getState();
+  const mirror = mirrorReady();
   const trimmed = text.trim();
-  if (!mirror || mirror.closed || !trimmed) return false;
-  if (phase !== 'connected' || desktopOnline === false) return false;
+  if (!mirror || !trimmed) return false;
   const commandId = crypto.randomUUID();
   useRelayStore.setState({
     mirror: { ...mirror, pendingCommandId: commandId, receipt: null },
   });
   sendToRelay({ type: 'mobileCommand', paneId: mirror.paneId, commandId, text: trimmed });
+  return true;
+}
+
+/**
+ * 点选作答 agent 的提问。返回 false = 当前不可作答。
+ * 与手输指令共用 pendingCommandId 单槽与回执展示——两者本就互斥
+ * (提问挂起时 agent 在等作答,不会同时有别的在途指令)。
+ */
+export function answerQuestion(
+  seq: number,
+  questionId: string,
+  questionIndex: number,
+  optionIndex: number,
+): boolean {
+  const mirror = mirrorReady();
+  if (!mirror || mirror.pendingCommandId != null) return false;
+  const commandId = crypto.randomUUID();
+  useRelayStore.setState({
+    mirror: {
+      ...mirror,
+      pendingCommandId: commandId,
+      pendingAnswer: { commandId, seq },
+      receipt: null,
+    },
+  });
+  sendToRelay({
+    type: 'answerQuestion',
+    paneId: mirror.paneId,
+    commandId,
+    seq,
+    questionId,
+    questionIndex,
+    optionIndex,
+  });
   return true;
 }
 

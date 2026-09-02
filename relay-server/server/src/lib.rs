@@ -663,15 +663,30 @@ fn handle_mobile_message(state: &RelayState, msg: MobileToRelay) {
                     text,
                 })
             } else {
-                eprintln!("[relay] mobile command rejected: desktop offline");
-                if let Some(mobile) = inner.mobile.as_ref() {
-                    let _ = mobile.tx.send(to_text(&RelayToMobile::CommandReceipt {
-                        pane_id,
-                        command_id,
-                        ok: false,
-                        reason: Some(CommandFailReason::DesktopOffline),
-                    }));
-                }
+                reject_command_offline(&inner, "mobile command", pane_id, command_id);
+                None
+            }
+        }
+        // 点选作答 agent 提问:与移动端指令同款——桌面端离线即拒,回执同通道
+        MobileToRelay::AnswerQuestion {
+            pane_id,
+            command_id,
+            seq,
+            question_id,
+            question_index,
+            option_index,
+        } => {
+            if inner.desktop.is_some() {
+                Some(RelayToDesktop::AnswerQuestion {
+                    pane_id,
+                    command_id,
+                    seq,
+                    question_id,
+                    question_index,
+                    option_index,
+                })
+            } else {
+                reject_command_offline(&inner, "answer question", pane_id, command_id);
                 None
             }
         }
@@ -709,6 +724,20 @@ fn handle_mobile_message(state: &RelayState, msg: MobileToRelay) {
     };
     if let (Some(msg), Some(desktop)) = (forward, inner.desktop.as_ref()) {
         let _ = desktop.tx.send(to_text(&msg));
+    }
+}
+
+/// 桌面端离线时的路由层拒绝:直接给移动端回失败的指令回执(不做存储转发)。
+/// 移动端指令与点选作答共用——两者的回执都是 CommandReceipt。
+fn reject_command_offline(inner: &Inner, what: &str, pane_id: String, command_id: String) {
+    eprintln!("[relay] {what} rejected: desktop offline");
+    if let Some(mobile) = inner.mobile.as_ref() {
+        let _ = mobile.tx.send(to_text(&RelayToMobile::CommandReceipt {
+            pane_id,
+            command_id,
+            ok: false,
+            reason: Some(CommandFailReason::DesktopOffline),
+        }));
     }
 }
 

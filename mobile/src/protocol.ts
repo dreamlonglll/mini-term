@@ -62,12 +62,29 @@ export interface MobileStartAiSession {
   launcherId: string;
 }
 
+/**
+ * 点选作答 agent 的提问:按镜像消息 seq + 提问身份(questionId)定位提问卡片,
+ * 按题序+选项下标选择。桌面端校验该提问仍挂起后向 PTY 注入按键;回执复用
+ * commandReceipt,提问已不挂起时 reason = questionNotPending。
+ */
+export interface MobileAnswerQuestion {
+  type: 'answerQuestion';
+  paneId: string;
+  commandId: string;
+  seq: number;
+  /** 提问卡片的 questionId:seq 在镜像换绑后会重排,靠它对账 */
+  questionId: string;
+  questionIndex: number;
+  optionIndex: number;
+}
+
 export type MobileToRelay =
   | MobileHello
   | MobileSubscribePane
   | MobileUnsubscribePane
   | MobileRequestMirrorHistory
   | MobileCommandMsg
+  | MobileAnswerQuestion
   | MobileRenamePane
   | MobileStartAiSession;
 
@@ -103,6 +120,11 @@ export interface MobilePane {
   title: string;
   /** 与桌面端 PaneStatus 一致:"ai-working" | "ai-idle" | "error" */
   status: string;
+  /**
+   * 有事等用户处理(agent 提问待答/等待授权批准),桌面端黄灯的投影;
+   * 与 status 正交。旧桌面端不发、旧中转会把它吃掉——缺省按 false 处理。
+   */
+  needsAttention?: boolean;
 }
 
 export interface MobileProject {
@@ -146,6 +168,22 @@ export interface MobileSessionsDelta {
 
 // ── 对话镜像 ──
 
+/** agent 提问的一个选项 */
+export interface MirrorQuestionOption {
+  label: string;
+  description?: string;
+}
+
+/** agent 提问的一道题(一次提问可含多题,TUI 逐题推进) */
+export interface MirrorQuestionItem {
+  question: string;
+  /** 短标签(如「作答方式」),可为空 */
+  header?: string;
+  options: MirrorQuestionOption[];
+  /** 多选题:v1 只展示不可点选 */
+  multiSelect?: boolean;
+}
+
 /** 镜像中的一条消息。seq 在一次绑定内从 0 连续递增,分页以此为锚 */
 export interface MirrorMessage {
   seq: number;
@@ -153,6 +191,18 @@ export interface MirrorMessage {
   source: string;
   content: string;
   timestamp: string;
+  /**
+   * 消息种类:缺省 = 普通文本;"question" = agent 提问卡片(questions/questionId
+   * 随行);"questionAnswered" = 已作答标记(refSeq 指向提问消息,labels 为逐题
+   * 选中项,为空 = 打断/旧版记录给不出选中项;content 只是纯文本兜底)。
+   * 旧桌面端不发、旧中转会把这些字段吃掉——缺省一律按普通文本渲染 content。
+   */
+  kind?: string;
+  questions?: MirrorQuestionItem[];
+  /** kind=question 时该次提问的稳定身份,作答请求带回它对账 */
+  questionId?: string;
+  refSeq?: number;
+  labels?: string[];
 }
 
 export interface MobileMirrorSnapshot {
@@ -181,7 +231,11 @@ export interface MobilePaneClosed {
   paneId: string;
 }
 
-export type CommandFailReason = 'desktopOffline' | 'paneNotFound' | 'writeFailed';
+export type CommandFailReason =
+  | 'desktopOffline'
+  | 'paneNotFound'
+  | 'writeFailed'
+  | 'questionNotPending';
 
 /** 指令回执:ok = 已写入桌面终端(AI 真正接收以镜像回流为准) */
 export interface MobileCommandReceipt {

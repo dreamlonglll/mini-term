@@ -19,6 +19,11 @@ pub struct MobilePane {
     pub title: String,
     /// 与桌面端 PaneStatus 字符串一致:"ai-working" | "ai-idle" | "error"
     pub status: String,
+    /// 有事等用户处理(agent 提问待答/等待授权批准),即桌面端黄灯的投影。
+    /// 与 status 正交:等待批准时 status 仍可为 ai-working。
+    /// 加字段向后兼容:旧桌面端不发 → 缺省 false,移动端不显示徽章。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub needs_attention: bool,
 }
 
 /// 移动端可见的项目条目。
@@ -63,6 +68,9 @@ pub enum CommandFailReason {
     PaneNotFound,
     /// PTY 写入失败
     WriteFailed,
+    /// 点选作答被拒:该提问已不在挂起状态(已作答/被打断/镜像已换绑),
+    /// 或题序、选项下标不合法(含多选题——v1 不支持点选)
+    QuestionNotPending,
 }
 
 /// 移动端发起新 AI 会话失败的原因。
@@ -94,7 +102,7 @@ pub enum DesktopRejectReason {
 }
 
 /// 对话镜像中的一条消息。seq 在一次镜像绑定内从 0 连续递增,分页取数以此为锚。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MirrorMessage {
     pub seq: u64,
@@ -103,6 +111,48 @@ pub struct MirrorMessage {
     pub content: String,
     /// 会话记录中的 ISO 8601 时间戳,缺失时为空串
     pub timestamp: String,
+    /// 消息种类:缺省 = 普通文本;"question" = agent 提问卡片(questions 随行);
+    /// "questionAnswered" = 提问已作答标记(ref_seq 指向提问消息,content 为选中项)。
+    /// 三个字段都是向后兼容的可选扩展:旧桌面端不发,旧移动端只渲染 content 兜底文本。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// kind = "question" 时的结构化题目(一次提问可含多题,TUI 逐题推进)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub questions: Vec<MirrorQuestionItem>,
+    /// kind = "question" 时该次提问的稳定身份(tool_use id)。作答请求带回它对账:
+    /// seq 在镜像换绑后会从 0 重排,单靠 seq 可能把旧卡片的作答记到新提问头上
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question_id: Option<String>,
+    /// kind = "questionAnswered" 时指向被作答的提问消息 seq
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_seq: Option<u64>,
+    /// kind = "questionAnswered" 时逐题的选中项 label(结构化,label 含逗号也不歧义)。
+    /// 为空 = 打断/旧版记录给不出选中项,移动端显示中性的「已处理」
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<String>,
+}
+
+/// agent 提问的一道题。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MirrorQuestionItem {
+    pub question: String,
+    /// 短标签(如「作答方式」),可为空
+    #[serde(default)]
+    pub header: String,
+    pub options: Vec<MirrorQuestionOption>,
+    /// 多选题:v1 移动端只展示不可点选(点选作答仅支持单选题)
+    #[serde(default)]
+    pub multi_select: bool,
+}
+
+/// agent 提问的一个选项。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MirrorQuestionOption {
+    pub label: String,
+    #[serde(default)]
+    pub description: String,
 }
 
 /// 桌面端 → 中转
@@ -206,6 +256,20 @@ pub enum RelayToDesktop {
         command_id: String,
         text: String,
     },
+    /// 移动端点选作答 agent 提问(转发自移动端):桌面端校验该提问仍挂起后
+    /// 向 PTY 注入按键完成选择,回执复用 CommandReceipt。
+    AnswerQuestion {
+        pane_id: String,
+        command_id: String,
+        /// 提问卡片消息的镜像 seq
+        seq: u64,
+        /// 提问的稳定身份(卡片消息的 question_id):seq 换绑后会重排,靠它对账
+        question_id: String,
+        /// 题序(一次提问可含多题,只接受按顺序作答下一题)
+        question_index: u32,
+        /// 选项下标(0 起)
+        option_index: u32,
+    },
     /// 移动端重命名会话(转发自移动端):改的是目标 pane 的自定义标题。
     RenamePane { pane_id: String, title: String },
     /// 移动端发起新 AI 会话(原样转发自移动端):按 `launcher_id` 引用桌面端配置的
@@ -241,6 +305,18 @@ pub enum MobileToRelay {
         pane_id: String,
         command_id: String,
         text: String,
+    },
+    /// 点选作答 agent 的提问:按镜像消息 seq + 提问身份(question_id)定位提问卡片,
+    /// 按题序+选项下标选择。桌面端向 PTY 注入 ↓×option_index + 回车完成选择;
+    /// 回执复用 CommandReceipt,提问已不挂起时失败原因为 QuestionNotPending。
+    /// command_id 由移动端生成。
+    AnswerQuestion {
+        pane_id: String,
+        command_id: String,
+        seq: u64,
+        question_id: String,
+        question_index: u32,
+        option_index: u32,
     },
     /// 重命名会话:改目标 pane 的自定义标题(桌面端 tab 栏同步显示)。
     ///
@@ -495,6 +571,7 @@ mod tests {
                 pane_id: "pane-1".into(),
                 title: "claude".into(),
                 status: "ai-working".into(),
+                needs_attention: false,
             }],
             can_start_session: true,
             group_path: vec!["工作".into(), "后端".into()],
@@ -653,6 +730,7 @@ mod tests {
                 source: "desktop".into(),
                 content: "hello".into(),
                 timestamp: "2026-07-24T12:00:00Z".into(),
+                ..Default::default()
             }],
             has_more: true,
         };
@@ -745,5 +823,127 @@ mod tests {
         let json = serde_json::to_string(&fail).unwrap();
         assert!(json.contains(r#""reason":"desktopOffline""#), "{json}");
         assert_eq!(serde_json::from_str::<RelayToMobile>(&json).unwrap(), fail);
+    }
+
+    /// 点选作答:移动端与桌面端两个方向的变体都要 camelCase 对齐并可往返。
+    #[test]
+    fn answer_question_round_trip() {
+        let mobile = MobileToRelay::AnswerQuestion {
+            pane_id: "pane-1".into(),
+            command_id: "cmd-9".into(),
+            seq: 7,
+            question_id: "toolu_q1".into(),
+            question_index: 0,
+            option_index: 2,
+        };
+        let json = serde_json::to_string(&mobile).unwrap();
+        assert!(
+            json.contains(r#""type":"answerQuestion""#)
+                && json.contains(r#""seq":7"#)
+                && json.contains(r#""questionId":"toolu_q1""#)
+                && json.contains(r#""questionIndex":0"#)
+                && json.contains(r#""optionIndex":2"#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<MobileToRelay>(&json).unwrap(), mobile);
+
+        let desktop = RelayToDesktop::AnswerQuestion {
+            pane_id: "pane-1".into(),
+            command_id: "cmd-9".into(),
+            seq: 7,
+            question_id: "toolu_q1".into(),
+            question_index: 0,
+            option_index: 2,
+        };
+        let json = serde_json::to_string(&desktop).unwrap();
+        assert_eq!(serde_json::from_str::<RelayToDesktop>(&json).unwrap(), desktop);
+
+        // 新失败原因可往返
+        let reason: CommandFailReason =
+            serde_json::from_str(r#""questionNotPending""#).unwrap();
+        assert_eq!(reason, CommandFailReason::QuestionNotPending);
+    }
+
+    /// 镜像消息的提问扩展:新字段 camelCase 往返;普通文本消息不携带新字段;
+    /// 旧桌面端发来的无新字段 JSON 必须照常解析(向后兼容红线)。
+    #[test]
+    fn mirror_message_question_fields_round_trip_and_stay_optional() {
+        let card = MirrorMessage {
+            seq: 3,
+            source: "assistant".into(),
+            content: "[方案] 选哪个?".into(),
+            timestamp: "2026-09-01T03:30:00Z".into(),
+            kind: Some("question".into()),
+            questions: vec![MirrorQuestionItem {
+                question: "选哪个?".into(),
+                header: "方案".into(),
+                options: vec![MirrorQuestionOption {
+                    label: "方案A".into(),
+                    description: "稳".into(),
+                }],
+                multi_select: false,
+            }],
+            question_id: Some("toolu_q1".into()),
+            ref_seq: None,
+            labels: Vec::new(),
+        };
+        let json = serde_json::to_string(&card).unwrap();
+        assert!(
+            json.contains(r#""kind":"question""#)
+                && json.contains(r#""multiSelect":false"#)
+                && json.contains(r#""questions":["#)
+                && json.contains(r#""questionId":"toolu_q1""#)
+                && !json.contains("refSeq")
+                && !json.contains("labels"),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<MirrorMessage>(&json).unwrap(), card);
+
+        let plain = MirrorMessage {
+            seq: 0,
+            source: "desktop".into(),
+            content: "hi".into(),
+            timestamp: String::new(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&plain).unwrap();
+        assert!(
+            !json.contains("kind") && !json.contains("questions") && !json.contains("refSeq"),
+            "普通消息不应携带提问字段: {json}"
+        );
+
+        // 旧桌面端的载荷(没有新字段)
+        let legacy = r#"{"seq":1,"source":"assistant","content":"done","timestamp":""}"#;
+        let msg: MirrorMessage = serde_json::from_str(legacy).unwrap();
+        assert_eq!(msg.kind, None);
+        assert!(msg.questions.is_empty());
+        assert_eq!(msg.question_id, None);
+        assert_eq!(msg.ref_seq, None);
+        assert!(msg.labels.is_empty());
+    }
+
+    /// pane 黄灯字段:false 不上 wire(省流量),旧载荷缺字段按 false 解析。
+    #[test]
+    fn mobile_pane_needs_attention_is_backward_compatible() {
+        let calm = MobilePane {
+            pane_id: "p1".into(),
+            title: "claude".into(),
+            status: "ai-working".into(),
+            needs_attention: false,
+        };
+        let json = serde_json::to_string(&calm).unwrap();
+        assert!(!json.contains("needsAttention"), "{json}");
+
+        let hot = MobilePane {
+            needs_attention: true,
+            ..calm.clone()
+        };
+        let json = serde_json::to_string(&hot).unwrap();
+        assert!(json.contains(r#""needsAttention":true"#), "{json}");
+        assert_eq!(serde_json::from_str::<MobilePane>(&json).unwrap(), hot);
+
+        let legacy = r#"{"paneId":"p1","title":"claude","status":"ai-idle"}"#;
+        let pane: MobilePane = serde_json::from_str(legacy).unwrap();
+        assert!(!pane.needs_attention);
     }
 }

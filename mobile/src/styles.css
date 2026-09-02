@@ -10,6 +10,7 @@
   --accent: #4a9eff;
   --color-success: #4caf78;
   --color-error: #e05c5c;
+  --color-attention: #e0a93c;
 }
 
 * {
@@ -270,6 +271,16 @@ body {
   background: var(--color-error);
 }
 
+/* 黄灯:提问待答/等待授权,展示优先于常规状态 */
+.dot-attention {
+  background: var(--color-attention);
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+.pane-status-attention {
+  color: var(--color-attention);
+}
+
 /* ── 对话镜像 ── */
 
 .mirror-view {
@@ -484,6 +495,99 @@ body {
   font: inherit;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+/* ── agent 提问卡片 ── */
+
+.question-card {
+  border-radius: 12px;
+  padding: 10px 12px;
+  font-size: 14px;
+  line-height: 1.55;
+  min-width: 0;
+  background: var(--bg-surface);
+  border: 1px solid rgba(224, 169, 60, 0.45);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.question-card.inactive {
+  border-color: var(--border-subtle);
+}
+
+.question-item {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.question-header {
+  font-size: 11px;
+  color: var(--color-attention);
+}
+
+.question-card.inactive .question-header {
+  color: var(--text-muted);
+}
+
+.question-text {
+  overflow-wrap: break-word;
+}
+
+.question-options {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.question-option {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  text-align: left;
+  border-radius: 9px;
+  padding: 8px 10px;
+  background: rgba(224, 169, 60, 0.1);
+  border: 1px solid rgba(224, 169, 60, 0.35);
+  color: var(--text-primary);
+  font: inherit;
+  cursor: pointer;
+}
+
+.question-option:disabled {
+  cursor: default;
+  background: transparent;
+  border-color: var(--border-subtle);
+  color: var(--text-secondary);
+}
+
+/* 已作答的选中项:置灰后仍要看得出当初点的是哪个 */
+.question-option.chosen,
+.question-option.chosen:disabled {
+  background: rgba(74, 158, 255, 0.16);
+  border-color: rgba(74, 158, 255, 0.4);
+  color: var(--text-primary);
+}
+
+.question-option-label {
+  font-size: 14px;
+}
+
+.question-option-desc {
+  font-size: 12px;
+  color: var(--text-muted);
+  overflow-wrap: break-word;
+}
+
+.question-hint,
+.question-state {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.question-state.answered {
+  color: var(--color-success);
 }
 
 /* Markdown 基础排版(AI 回复) */

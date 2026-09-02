@@ -126,6 +126,7 @@ fn msg(seq: u64, content: &str) -> MirrorMessage {
         source: "assistant".into(),
         content: content.into(),
         timestamp: String::new(),
+        ..Default::default()
     }
 }
 

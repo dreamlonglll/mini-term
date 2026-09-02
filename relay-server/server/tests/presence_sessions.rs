@@ -146,6 +146,7 @@ fn sample_projects() -> Vec<MobileProject> {
                 pane_id: "pane-1".into(),
                 title: "claude".into(),
                 status: "ai-working".into(),
+                needs_attention: false,
             }],
             can_start_session: true,
             // 带分组的项目:中转是「反序列化→再序列化」转发的,这里同时守着 groupPath 不被吃掉

@@ -14,8 +14,8 @@ use std::sync::{Arc, OnceLock};
 
 use futures_util::{SinkExt, StreamExt};
 use mt_relay_protocol::{
-    DesktopRejectReason, DesktopToRelay, MirrorMessage, MobileLauncher, MobilePane, MobileProject,
-    RelayToDesktop, StartSessionFailReason, PROTOCOL_VERSION,
+    CommandFailReason, DesktopRejectReason, DesktopToRelay, MirrorMessage, MobileLauncher,
+    MobilePane, MobileProject, RelayToDesktop, StartSessionFailReason, PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
@@ -59,12 +59,26 @@ pub struct SyncPane {
     /// 该 pane 当前的 PTY id(移动端指令写穿目标);终端未创建时缺省
     #[serde(default)]
     pub pty_id: Option<u32>,
+    /// 桌面端黄灯(agent 提问待答/等待授权批准),原样透传给移动端
+    #[serde(default)]
+    pub needs_attention: bool,
 }
 
-/// 一个被订阅 pane 的镜像状态:取消句柄 + 已解析消息(分页取数用)。
+/// 一个镜像绑定的运行态:解析器 + 绑定文件与读取偏移。
+/// 三者必须同锁——增量泵的「读文件→喂解析→挪偏移」要原子,拆开就会把同一段
+/// 字节喂两次(消息重复、seq 漂移)。
+struct MirrorRuntime {
+    parser: MirrorParser,
+    path: PathBuf,
+    offset: u64,
+}
+
+/// 一个被订阅 pane 的镜像状态:取消句柄 + 已解析消息(分页取数用)
+/// + 绑定运行态(共享持有:1s 轮询之外,移动端点选作答也要先泵一次再校验)。
 struct MirrorSub {
     cancel_tx: watch::Sender<bool>,
     messages: Arc<Mutex<Vec<MirrorMessage>>>,
+    runtime: Arc<Mutex<Option<MirrorRuntime>>>,
 }
 
 /// 异步任务(连接循环 + 镜像轮询)的落脚处。
@@ -290,6 +304,7 @@ impl MobileRelayManager {
                         pane_id: x.pane_id,
                         title: x.title,
                         status: x.status,
+                        needs_attention: x.needs_attention,
                     })
                     .collect(),
             })
@@ -386,10 +401,74 @@ impl MobileRelayManager {
             if msg.source != "desktop" {
                 continue;
             }
+            // 作答标记按结构化 labels 对账——多题标记的 content 是合并文本,
+            // 与逐条登记的单个 label 对不上。全部选中项都出自本端登记才改标
+            if msg.kind.as_deref() == Some("questionAnswered") {
+                if !msg.labels.is_empty()
+                    && msg.labels.iter().all(|l| list.iter().any(|c| c == l))
+                {
+                    msg.source = "mobile".into();
+                    for label in &msg.labels {
+                        if let Some(pos) = list.iter().position(|c| c == label) {
+                            list.remove(pos);
+                        }
+                    }
+                }
+                continue;
+            }
             if let Some(pos) = list.iter().position(|cmd| cmd == msg.content.trim()) {
                 msg.source = "mobile".into();
                 list.remove(pos);
             }
+        }
+    }
+
+    /// 回发一条指令/作答回执(成功时 reason 为 None)。
+    fn send_command_receipt(
+        &self,
+        pane_id: String,
+        command_id: String,
+        result: Result<(), CommandFailReason>,
+    ) {
+        let _ = self.send(DesktopToRelay::CommandReceipt {
+            pane_id,
+            command_id,
+            ok: result.is_ok(),
+            reason: result.err(),
+        });
+    }
+
+    /// 增量泵一次镜像:读绑定文件的新字节喂解析器,新消息改标来源、并入缓存并
+    /// 推送 MirrorAppend。全程持 runtime 锁——泵有两个调用方(1s 轮询与点选
+    /// 作答),「读文件→喂解析→挪偏移」必须原子,否则同一段字节会被喂两次。
+    /// 文件被截断/重写时清空 runtime,下一轮轮询重新绑定。
+    fn pump_mirror(
+        &self,
+        pane_id: &str,
+        messages: &Mutex<Vec<MirrorMessage>>,
+        runtime: &Mutex<Option<MirrorRuntime>>,
+    ) {
+        let mut slot = runtime.lock();
+        let Some(rt) = slot.as_mut() else { return };
+        match mirror::read_from_offset(&rt.path, rt.offset) {
+            Some((bytes, new_offset)) => {
+                rt.offset = new_offset;
+                if bytes.is_empty() {
+                    return;
+                }
+                let mut new_msgs = rt.parser.feed(&bytes);
+                if new_msgs.is_empty() {
+                    return;
+                }
+                // 移动端指令/作答回流:匹配的消息改标 "mobile"
+                self.relabel_mobile_sources(pane_id, &mut new_msgs);
+                messages.lock().extend(new_msgs.clone());
+                let _ = self.send(DesktopToRelay::MirrorAppend {
+                    pane_id: pane_id.into(),
+                    messages: new_msgs,
+                });
+            }
+            None => *slot = None,
         }
     }
 
@@ -469,16 +548,18 @@ impl MobileRelayManager {
 
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let messages = Arc::new(Mutex::new(Vec::new()));
+        let runtime = Arc::new(Mutex::new(None));
         self.mirror_subs.lock().insert(
             pane_id.clone(),
             MirrorSub {
                 cancel_tx,
                 messages: messages.clone(),
+                runtime: runtime.clone(),
             },
         );
         let manager = Arc::clone(self);
         self.spawn(async move {
-            mirror_task(manager, pane_id, project_path, messages, cancel_rx).await;
+            mirror_task(manager, pane_id, project_path, messages, runtime, cancel_rx).await;
         });
     }
 }
@@ -681,6 +762,23 @@ fn handle_relay_message(manager: &Arc<MobileRelayManager>, text: &str) {
             command_id,
             text,
         }) => handle_mobile_command(manager, pane_id, command_id, text),
+        // 移动端点选作答 agent 提问:校验挂起后注入按键,回执复用 CommandReceipt
+        Ok(RelayToDesktop::AnswerQuestion {
+            pane_id,
+            command_id,
+            seq,
+            question_id,
+            question_index,
+            option_index,
+        }) => handle_answer_question(
+            manager,
+            pane_id,
+            command_id,
+            seq,
+            question_id,
+            question_index,
+            option_index,
+        ),
         // 移动端重命名会话:pane 标题归上层布局状态所有,本 crate 只做长度收敛后转交
         Ok(RelayToDesktop::RenamePane { pane_id, title }) => {
             manager.events.rename_pane(RenamePanePayload {
@@ -800,8 +898,6 @@ fn handle_mobile_command(
     command_id: String,
     text: String,
 ) {
-    use mt_relay_protocol::CommandFailReason;
-
     let pty_id = manager.pane_ptys.lock().get(&pane_id).copied();
     let result = match pty_id {
         None => Err(CommandFailReason::PaneNotFound),
@@ -815,26 +911,83 @@ fn handle_mobile_command(
                 .map_err(|_| CommandFailReason::WriteFailed)
         }
     };
-
-    match result {
-        Ok(()) => {
-            manager.record_mobile_cmd(&pane_id, &text);
-            let _ = manager.send(DesktopToRelay::CommandReceipt {
-                pane_id,
-                command_id,
-                ok: true,
-                reason: None,
-            });
-        }
-        Err(reason) => {
-            let _ = manager.send(DesktopToRelay::CommandReceipt {
-                pane_id,
-                command_id,
-                ok: false,
-                reason: Some(reason),
-            });
-        }
+    if result.is_ok() {
+        manager.record_mobile_cmd(&pane_id, &text);
     }
+    manager.send_command_receipt(pane_id, command_id, result);
+}
+
+/// 移动端点选作答:回执复用 CommandReceipt,成功时登记选中项供回流改标来源。
+fn handle_answer_question(
+    manager: &Arc<MobileRelayManager>,
+    pane_id: String,
+    command_id: String,
+    seq: u64,
+    question_id: String,
+    question_index: u32,
+    option_index: u32,
+) {
+    let result = try_answer_question(
+        manager,
+        &pane_id,
+        seq,
+        &question_id,
+        question_index,
+        option_index,
+    );
+    if let Ok(label) = &result {
+        // 登记选中项:作答回流的 questionAnswered 标记按 labels 对账改标 "mobile"
+        manager.record_mobile_cmd(&pane_id, label);
+    }
+    manager.send_command_receipt(pane_id, command_id, result.map(|_| ()));
+}
+
+/// 点选作答的校验与注入,Ok 携带选中项 label。
+///
+/// 先增量泵一次镜像——桌面刚作答/打断而轮询还没读到时,靠泵把这 1s 窗口压到
+/// 毫秒级,否则挂起校验会放行一次盲注(按键落进普通输入框)。校验→写入→推进
+/// 进度在同一次 runtime 持锁内完成,防两次点按撞进度;write_pty 只是投递
+/// channel(乐观 Ok),持锁跨它没有阻塞与重入风险。
+/// 仍防不住的残余:桌面只把高亮移走没作答、多题在桌面先答了一题(都不落
+/// 会话记录),这类错位注入无法从记录侧感知。
+fn try_answer_question(
+    manager: &Arc<MobileRelayManager>,
+    pane_id: &str,
+    seq: u64,
+    question_id: &str,
+    question_index: u32,
+    option_index: u32,
+) -> Result<String, CommandFailReason> {
+    // 克隆出共享句柄立即放开订阅表锁:泵要做文件 IO,不该顶着 subs 锁做
+    let handles = manager
+        .mirror_subs
+        .lock()
+        .get(pane_id)
+        .map(|sub| (sub.messages.clone(), sub.runtime.clone()));
+    let Some((messages, runtime)) = handles else {
+        return Err(CommandFailReason::QuestionNotPending);
+    };
+    manager.pump_mirror(pane_id, &messages, &runtime);
+
+    let mut slot = runtime.lock();
+    let Some(rt) = slot.as_mut() else {
+        return Err(CommandFailReason::QuestionNotPending);
+    };
+    let Some(answer) = rt
+        .parser
+        .answer_keys(seq, question_id, question_index, option_index)
+    else {
+        return Err(CommandFailReason::QuestionNotPending);
+    };
+    let Some(pty_id) = manager.pane_ptys.lock().get(pane_id).copied() else {
+        return Err(CommandFailReason::PaneNotFound);
+    };
+    manager
+        .host
+        .write_pty(pty_id, answer.keys)
+        .map_err(|_| CommandFailReason::WriteFailed)?;
+    rt.parser.mark_answered(seq);
+    Ok(answer.label)
 }
 
 /// 镜像轮询任务:解析 pane 应镜像的最新会话文件,增量读取新行推送;
@@ -844,9 +997,9 @@ async fn mirror_task(
     pane_id: String,
     project_path: String,
     messages: Arc<Mutex<Vec<MirrorMessage>>>,
+    runtime: Arc<Mutex<Option<MirrorRuntime>>>,
     mut cancel_rx: watch::Receiver<bool>,
 ) {
-    let mut bound: Option<(PathBuf, MirrorParser, u64)> = None;
     let mut sent_initial = false;
 
     loop {
@@ -886,45 +1039,34 @@ async fn mirror_task(
                 }
             }
             Some((path, agent)) => {
-                let rebind = bound.as_ref().is_none_or(|(p, _, _)| *p != path);
+                let rebind = runtime.lock().as_ref().is_none_or(|rt| rt.path != path);
                 if rebind {
-                    // 首次绑定或换绑到更新的会话文件:全量解析 + 重发快照
-                    let mut parser = MirrorParser::new(agent);
+                    // 首次绑定或换绑到更新的会话文件:全量解析 + 重发快照。
+                    // 全量读在锁外(文件可能不小);换入运行态与替换消息缓存在
+                    // 同一次持锁内完成,防点选作答的泵在中间插进来喂错解析器
                     if let Some((bytes, offset)) = mirror::read_from_offset(&path, 0) {
-                        let msgs = parser.feed(&bytes);
-                        *messages.lock() = msgs;
-                        bound = Some((path, parser, offset));
-                        sent_initial = true;
                         let (page, has_more) = {
-                            let m = messages.lock();
+                            let mut slot = runtime.lock();
+                            let rt = slot.insert(MirrorRuntime {
+                                parser: MirrorParser::new(agent),
+                                path,
+                                offset,
+                            });
+                            let msgs = rt.parser.feed(&bytes);
+                            let mut m = messages.lock();
+                            *m = msgs;
                             history_slice(&m, None, MIRROR_PAGE_SIZE)
                         };
+                        sent_initial = true;
                         let _ = manager.send(DesktopToRelay::MirrorSnapshot {
                             pane_id: pane_id.clone(),
                             messages: page,
                             has_more,
                         });
                     }
-                } else if let Some((bpath, parser, offset)) = bound.as_mut() {
-                    match mirror::read_from_offset(bpath, *offset) {
-                        Some((bytes, new_offset)) => {
-                            *offset = new_offset;
-                            if !bytes.is_empty() {
-                                let mut new_msgs = parser.feed(&bytes);
-                                if !new_msgs.is_empty() {
-                                    // 移动端指令回流:匹配的 user 消息改标 "mobile"
-                                    manager.relabel_mobile_sources(&pane_id, &mut new_msgs);
-                                    messages.lock().extend(new_msgs.clone());
-                                    let _ = manager.send(DesktopToRelay::MirrorAppend {
-                                        pane_id: pane_id.clone(),
-                                        messages: new_msgs,
-                                    });
-                                }
-                            }
-                        }
-                        // 文件被截断/重写:下一轮重新绑定
-                        None => bound = None,
-                    }
+                } else {
+                    // 增量与「文件被截断→清运行态待重绑」都在泵里
+                    manager.pump_mirror(&pane_id, &messages, &runtime);
                 }
             }
         }
@@ -1062,6 +1204,7 @@ mod tests {
                     pane_id: (*pane_id).into(),
                     title: "claude".into(),
                     status: (*status).into(),
+                    needs_attention: false,
                 })
                 .collect(),
             can_start_session: true,
@@ -1277,18 +1420,21 @@ mod tests {
                 source: "desktop".into(),
                 content: "unrelated input".into(),
                 timestamp: String::new(),
+                ..Default::default()
             },
             MirrorMessage {
                 seq: 1,
                 source: "desktop".into(),
                 content: "npm test".into(),
                 timestamp: String::new(),
+                ..Default::default()
             },
             MirrorMessage {
                 seq: 2,
                 source: "assistant".into(),
                 content: "npm test".into(),
                 timestamp: String::new(),
+                ..Default::default()
             },
         ];
         manager.relabel_mobile_sources("pane-1", &mut msgs);
@@ -1303,6 +1449,7 @@ mod tests {
             source: "desktop".into(),
             content: "npm test".into(),
             timestamp: String::new(),
+            ..Default::default()
         }];
         manager.relabel_mobile_sources("pane-1", &mut again);
         assert_eq!(again[0].source, "desktop");
@@ -1314,9 +1461,48 @@ mod tests {
             source: "desktop".into(),
             content: "ls".into(),
             timestamp: String::new(),
+            ..Default::default()
         }];
         manager.relabel_mobile_sources("pane-1", &mut other);
         assert_eq!(other[0].source, "desktop");
+    }
+
+    /// 点选作答的回流标记按结构化 labels 对账改标——content 是多题合并文本,
+    /// 与逐条登记的单个 label 对不上,不能走普通指令那条逐字匹配。
+    #[test]
+    fn relabel_marks_answer_markers_by_labels() {
+        let manager = test_manager();
+        manager.record_mobile_cmd("pane-1", "方案B");
+
+        let marker = |seq: u64, labels: &[&str]| MirrorMessage {
+            seq,
+            source: "desktop".into(),
+            content: labels.join(", "),
+            timestamp: String::new(),
+            kind: Some("questionAnswered".into()),
+            ref_seq: Some(0),
+            labels: labels.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+
+        // 有未登记的 label(桌面替答了一题)→ 不改标,登记条目也不消费
+        let mut mixed = vec![marker(2, &["方案B", "桌面答的"])];
+        manager.relabel_mobile_sources("pane-1", &mut mixed);
+        assert_eq!(mixed[0].source, "desktop");
+
+        // 全部选中项都出自本端登记 → 改标并消费,再来一遍不再命中
+        let mut mine = vec![marker(3, &["方案B"])];
+        manager.relabel_mobile_sources("pane-1", &mut mine);
+        assert_eq!(mine[0].source, "mobile");
+        let mut again = vec![marker(4, &["方案B"])];
+        manager.relabel_mobile_sources("pane-1", &mut again);
+        assert_eq!(again[0].source, "desktop");
+
+        // 打断标记(labels 为空)不参与对账
+        let mut interrupted = vec![marker(5, &[])];
+        manager.record_mobile_cmd("pane-1", "whatever");
+        manager.relabel_mobile_sources("pane-1", &mut interrupted);
+        assert_eq!(interrupted[0].source, "desktop");
     }
 
     #[test]

@@ -7,8 +7,9 @@ use std::path::{Path, PathBuf};
 
 use super::lineage::latest_model_from_file_tail;
 use super::{
-    AiSession, AiSessionMessage, MAX_CODEX_SESSION_FILES_TO_SCAN, MAX_SESSIONS_PER_SOURCE,
-    PathStyle, extract_text_content, home_dir, sort_newest_session_paths, wsl_candidate_homes,
+    AiQuestion, AiQuestionAnswer, AiQuestionItem, AiQuestionOption, AiSession, AiSessionMessage,
+    MAX_CODEX_SESSION_FILES_TO_SCAN, MAX_SESSIONS_PER_SOURCE, PathStyle, extract_text_content,
+    home_dir, line_timestamp, sort_newest_session_paths, wsl_candidate_homes,
 };
 
 /// 扫描指定 home 下的 Codex 会话。`wsl_distro` 为来源标识,一并写进结果。
@@ -324,6 +325,121 @@ pub fn codex_message_from_line(line: &str) -> Option<AiSessionMessage> {
     })
 }
 
+// ─── Agent 提问(Codex request_user_input)────────────────────────
+//
+// 提问在 rollout 里是 `response_item` 行的 `function_call`(name=request_user_input),
+// 题目与选项在 `arguments`(JSON **字符串**,需二次解析);回执是后续
+// `function_call_output` 行,按 `call_id` 对账。实测两种非作答回执:
+// Esc 打断("aborted by user after …s")与模式门禁("request_user_input is
+// unavailable in Default mode" —— 该工具仅协作模式可用)。TUI 会在选项末尾
+// 自行追加「None of the above」,rollout 里没有,注入下标不受影响(追加在尾部)。
+
+/// 解析 Codex JSONL 的一行为 agent 提问。非 response_item / 非
+/// request_user_input 的 function_call / 题目或选项为空 → None。
+pub fn codex_question_from_line(line: &str) -> Option<AiQuestion> {
+    let obj: serde_json::Value = serde_json::from_str(line).ok()?;
+    if obj.get("type").and_then(|t| t.as_str()) != Some("response_item") {
+        return None;
+    }
+    let payload = obj.get("payload")?;
+    if payload.get("type").and_then(|t| t.as_str()) != Some("function_call")
+        || payload.get("name").and_then(|n| n.as_str()) != Some("request_user_input")
+    {
+        return None;
+    }
+    let call_id = payload.get("call_id").and_then(|i| i.as_str())?.to_string();
+    let args: serde_json::Value =
+        serde_json::from_str(payload.get("arguments").and_then(|a| a.as_str())?).ok()?;
+    let items: Vec<AiQuestionItem> = args
+        .get("questions")?
+        .as_array()?
+        .iter()
+        .filter_map(|q| {
+            let question = q.get("question").and_then(|v| v.as_str())?.to_string();
+            let options: Vec<AiQuestionOption> = q
+                .get("options")?
+                .as_array()?
+                .iter()
+                .filter_map(|o| {
+                    Some(AiQuestionOption {
+                        label: o.get("label").and_then(|v| v.as_str())?.to_string(),
+                        description: o
+                            .get("description")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                    })
+                })
+                .collect();
+            if options.is_empty() {
+                return None;
+            }
+            Some(AiQuestionItem {
+                question,
+                header: q
+                    .get("header")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                id: q
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                options,
+                // request_user_input 无多选形态,TUI 是单选 + tab 附注
+                multi_select: false,
+            })
+        })
+        .collect();
+    if items.is_empty() {
+        return None;
+    }
+    Some(AiQuestion {
+        tool_use_id: call_id,
+        items,
+        timestamp: line_timestamp(&obj),
+    })
+}
+
+/// 解析 Codex JSONL 的一行为工具回执归属(function_call_output)。
+/// 行内不含工具名,单看本行分不出是不是提问的回执——由调用方拿挂起提问的
+/// call_id 对账(与 Claude 侧同约定)。`answers` 尽力从 output 的 JSON 里提取
+/// (成功作答的 output 形态未实测,取不到时为空,移动端只标「已作答」不高亮)。
+pub fn codex_question_answer_from_line(line: &str) -> Option<AiQuestionAnswer> {
+    let obj: serde_json::Value = serde_json::from_str(line).ok()?;
+    if obj.get("type").and_then(|t| t.as_str()) != Some("response_item") {
+        return None;
+    }
+    let payload = obj.get("payload")?;
+    if payload.get("type").and_then(|t| t.as_str()) != Some("function_call_output") {
+        return None;
+    }
+    let call_id = payload.get("call_id").and_then(|i| i.as_str())?.to_string();
+    let output = payload.get("output").and_then(|o| o.as_str()).unwrap_or("");
+    // 打断与模式门禁都不是用户作出的选择,对齐 Claude 侧 is_error 的语义
+    let is_error = output.starts_with("aborted by user") || output.contains("is unavailable in");
+    let mut answers = HashMap::new();
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(output) {
+        // 实测形态(2026-09-01):{"answers":{"<题目id>":{"answers":["<label>"]}}};
+        // 键按题目 id 对账,值的三种形态归一化交给 answer_labels
+        let map = v.get("answers").and_then(|a| a.as_object()).or_else(|| v.as_object());
+        if let Some(map) = map {
+            for (key, value) in map {
+                if let Some(labels) = super::answer_labels(value) {
+                    answers.insert(key.clone(), labels);
+                }
+            }
+        }
+    }
+    Some(AiQuestionAnswer {
+        tool_use_ids: vec![call_id],
+        answers,
+        is_error,
+        timestamp: line_timestamp(&obj),
+    })
+}
+
 /// 从单个 Codex JSONL 会话文件读取全部消息
 fn read_codex_messages_from_file(path: &Path) -> Result<Vec<AiSessionMessage>, String> {
     let file = fs::File::open(path).map_err(|e| format!("无法打开文件: {}", e))?;
@@ -395,6 +511,55 @@ mod tests {
 
         assert!(codex_meta_from_line(r#"{"type":"response_item"}"#).is_none());
         assert!(codex_meta_from_line("").is_none());
+    }
+
+    #[test]
+    fn codex_question_from_line_parses_request_user_input() {
+        // 形状取自真机 rollout(2026-09-01):arguments 是 JSON 字符串
+        let line = r#"{"timestamp":"2026-09-01T07:34:13.756Z","type":"response_item","payload":{"type":"function_call","id":"fc_1","name":"request_user_input","arguments":"{\"questions\":[{\"header\":\"测试选择\",\"id\":\"test_choice\",\"question\":\"你想测试哪一种交互？\",\"options\":[{\"label\":\"单选题（推荐）\",\"description\":\"测试从多个选项中选择一个答案。\"},{\"label\":\"功能偏好\",\"description\":\"测试在不同方案之间表达偏好。\"}]}]}","call_id":"call_1Nvzc3hSsPv3EZtFJzFVsvyz"}}"#;
+        let q = codex_question_from_line(line).unwrap();
+        assert_eq!(q.tool_use_id, "call_1Nvzc3hSsPv3EZtFJzFVsvyz");
+        assert_eq!(q.items.len(), 1);
+        assert_eq!(q.items[0].question, "你想测试哪一种交互？");
+        assert_eq!(q.items[0].header, "测试选择");
+        assert_eq!(q.items[0].id, "test_choice");
+        assert_eq!(q.items[0].options.len(), 2);
+        assert_eq!(q.items[0].options[0].label, "单选题（推荐）");
+        assert!(!q.items[0].multi_select);
+        assert_eq!(q.timestamp, "2026-09-01T07:34:13.756Z");
+
+        // 别的工具调用不产出提问
+        let exec = r#"{"type":"response_item","payload":{"type":"function_call","name":"exec","arguments":"{}","call_id":"c2"}}"#;
+        assert!(codex_question_from_line(exec).is_none());
+        // arguments 解析失败 → None
+        let bad = r#"{"type":"response_item","payload":{"type":"function_call","name":"request_user_input","arguments":"not json","call_id":"c3"}}"#;
+        assert!(codex_question_from_line(bad).is_none());
+    }
+
+    #[test]
+    fn codex_question_answer_from_line_flags_abort_and_gate() {
+        // Esc 打断(真机样本)→ is_error
+        let abort = r#"{"timestamp":"2026-09-01T07:34:50.317Z","type":"response_item","payload":{"type":"function_call_output","id":"fco_1","call_id":"call_1","output":"aborted by user after 32.9s"}}"#;
+        let a = codex_question_answer_from_line(abort).unwrap();
+        assert_eq!(a.tool_use_ids, vec!["call_1".to_string()]);
+        assert!(a.is_error);
+        assert!(a.answers.is_empty());
+
+        // 模式门禁(真机样本)→ is_error
+        let gate = r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"call_2","output":"request_user_input is unavailable in Default mode"}}"#;
+        assert!(codex_question_answer_from_line(gate).unwrap().is_error);
+
+        // 成功作答(真机样本 2026-09-01):值是 {"answers":[label]} 嵌套数组,键为题目 id
+        let answered = r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"call_3","output":"{\"answers\":{\"test_choice\":{\"answers\":[\"选项 A（推荐）\"]}}}"}}"#;
+        let ok = codex_question_answer_from_line(answered).unwrap();
+        assert!(!ok.is_error);
+        assert_eq!(
+            ok.answers.get("test_choice"),
+            Some(&vec!["选项 A（推荐）".to_string()])
+        );
+
+        // 非 function_call_output 行 → None
+        assert!(codex_question_answer_from_line(r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[]}}"#).is_none());
     }
 
     #[test]
