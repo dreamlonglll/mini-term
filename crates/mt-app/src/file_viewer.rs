@@ -26,6 +26,14 @@
 //! 写回时按探测结果还原。语义与原版一致(整份文件用同一种行尾),
 //! 唯一差别见 [`LineEnding::detect`] 的注释(混合行尾文件会被收敛成多数那一种)。
 //!
+//! # Tab:同一手法的第二件套
+//!
+//! GPUI 的整形器把 `\t` 画成零宽,Tab 缩进的文件(Go / Makefile)在编辑器里整篇顶格
+//! (issue #74)。读入时把 Tab 按制表位展成空格、写回时还原,规则与取舍全在
+//! [`crate::tab_expansion`] 的模块注释;本模块只在三处接线:[`FileViewer::apply_file_content`]
+//! 展开、[`FileViewer::save_with_mode`] 还原、[`FileViewer::finish_save`] 重算映射。
+//! 顺序是**先归一行尾再展开 Tab**,写回时反过来。
+//!
 //! # 与原版的偏差(逐条,详见各处注释)
 //!
 //! 1. **Markdown 里的链接点击拦不住**:gpui-component 的富文本渲染器把链接写死成
@@ -60,7 +68,7 @@ use gpui::http_client::{
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::WindowExt as _;
-use gpui_component::input::{Input, InputEvent, InputState, Position, Search};
+use gpui_component::input::{Input, InputEvent, InputState, Position, Search, TabSize};
 use gpui_component::scroll::Scrollbar;
 use gpui_component::text::{TextView, TextViewStyle};
 use markdown::{ParseOptions, mdast::Node as MarkdownNode};
@@ -70,6 +78,7 @@ use mt_ui::icons::FileIcon;
 use mt_ui::tooltip::Tooltip;
 
 use crate::i18n::t;
+use crate::tab_expansion::{TAB_WIDTH, TabExpansion};
 use crate::ui;
 
 /// 文档的读写来源。远程来源持有打开时的连接快照；保存前还会与 `AppStore`
@@ -1934,15 +1943,18 @@ pub struct FileViewer {
     /// 「预览 ↔ 源码」来回切只是不画它,草稿与撤销栈都留着
     /// (原版 `className={preview ? 'hidden' : 'h-full'}`,只隐藏不卸载)。
     editor: Option<Entity<InputState>>,
-    /// 磁盘上最后一次已知内容(已归一成 `\n`)。载入 / 保存成功时更新。
+    /// 磁盘上最后一次已知内容的**编辑器投影**(已归一成 `\n`、Tab 已展开)。
+    /// 载入 / 保存成功时更新。
     saved: String,
     /// 磁盘现内容的投影(Markdown 预览渲染用它,不用 `result.content` ——
-    /// 后者是「打开时」的内容,保存后就旧了)。
+    /// 后者是「打开时」的内容,保存后就旧了)。与 [`Self::saved`] 同一口径。
     disk: String,
     /// 切到预览那一刻的草稿快照;`None` = 干净,预览直接用 [`Self::disk`]。
     preview_draft: Option<String>,
     /// 文件读进来时的行尾。写回时按它还原(见模块注释)。
     line_ending: LineEnding,
+    /// 文件读进来时的 Tab 展开记录。写回时按它还原(见模块注释「Tab」一节)。
+    tabs: TabExpansion,
     /// markdown 预览的分块缓存,见 [`MdCache`]。`RefCell` 是因为
     /// [`Self::render_markdown`] 只拿得到 `&self`(gpui 的 `Render::render`
     /// 之下全是不可变借用),而这份缓存要在渲染途中回填。
@@ -2033,6 +2045,7 @@ impl FileViewer {
             disk: String::new(),
             preview_draft: None,
             line_ending: LineEnding::Lf,
+            tabs: TabExpansion::default(),
             md_cache: RefCell::new(None),
             approved_remote_images: HashSet::new(),
             preview_scroll: ScrollHandle::new(),
@@ -2318,7 +2331,9 @@ impl FileViewer {
         cx: &mut Context<Self>,
     ) {
         self.line_ending = LineEnding::detect(&res.content);
-        let text = normalize_to_lf(&res.content);
+        // 先归一行尾再展开 Tab(见模块注释「Tab」一节)
+        let (text, tabs) = TabExpansion::expand(&normalize_to_lf(&res.content), TAB_WIDTH);
+        self.tabs = tabs;
         self.saved = text.clone();
         self.disk = text.clone();
         self.dirty = false;
@@ -2332,12 +2347,23 @@ impl FileViewer {
             let name = self.file_name();
             let lang = language_for(&name);
             let wrap = should_wrap(&name);
+            let tab_indented = self.tabs.indents_with_tabs();
             let editor = cx.new(|cx| {
-                InputState::new(window, cx)
+                let state = InputState::new(window, cx)
                     .code_editor(lang)
                     .line_number(true)
                     .soft_wrap(wrap)
-                    .default_value(text.clone())
+                    .default_value(text.clone());
+                // Tab 缩进的文件:Tab 键一次缩 `TAB_WIDTH` 个空格,写回时正好折成一个 `\t`
+                // (组件默认 2 个,折不回去会留下半档空格);其余文件维持组件默认
+                if tab_indented {
+                    state.tab_size(TabSize {
+                        tab_size: TAB_WIDTH,
+                        hard_tabs: false,
+                    })
+                } else {
+                    state
+                }
             });
             // 每次编辑都要重算脏态(原版 `onDocChange` → `setDirty(doc !== savedRef)`)
             let sub = cx.subscribe(&editor, |this: &mut FileViewer, editor, event, cx| {
@@ -2457,7 +2483,7 @@ impl FileViewer {
         }
     }
 
-    /// 当前草稿(编辑器全文,`\n` 行尾)。没有编辑器时就是磁盘内容。
+    /// 当前草稿(编辑器全文,`\n` 行尾、Tab 已展开)。没有编辑器时就是磁盘内容的投影。
     fn draft(&self, cx: &App) -> String {
         match &self.editor {
             Some(editor) => editor.read(cx).value().to_string(),
@@ -2548,8 +2574,8 @@ impl FileViewer {
 
         let path = self.current_path.clone();
         let generation = self.load_generation;
-        // 写回磁盘前把行尾还原(见模块注释)
-        let on_disk = restore_line_ending(&text, self.line_ending);
+        // 写回磁盘前先还原 Tab、再还原行尾(与读入时相反的顺序,见模块注释)
+        let on_disk = restore_line_ending(&self.tabs.restore(&text), self.line_ending);
         match self.source.clone() {
             DocumentSource::Local { project_root, .. } => {
                 cx.spawn(async move |this, cx| {
@@ -2657,6 +2683,10 @@ impl FileViewer {
         warning: Option<String>,
         cx: &App,
     ) {
+        // 写回的是 `tabs.restore(text)`,此后「没动过的行」以它为准:用写回文本重算
+        // 一遍映射。`expand(restore(v)) == v` 是 `tab_expansion` 的不变式,编辑器内容
+        // 不用重建,`saved` 直接取 `text`
+        self.tabs = TabExpansion::expand(&self.tabs.restore(&text), TAB_WIDTH).1;
         self.saved = text.clone();
         self.disk = text.clone();
         self.last_save_at = Some(Instant::now());

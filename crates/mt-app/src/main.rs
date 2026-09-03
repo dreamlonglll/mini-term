@@ -102,6 +102,7 @@ mod ssh_panel;
 mod ssh_registry;
 mod startup_trace;
 mod store;
+mod tab_expansion;
 mod terminal_area;
 mod terminals_panel;
 mod theme;
