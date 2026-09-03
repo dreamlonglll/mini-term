@@ -1291,10 +1291,15 @@ fn connect_ssh(pty_id: u32, conn: SshConnection, window: &mut Window, cx: &mut A
     let Some(terminal) = AppStore::global(cx).read(cx).terminal(pty_id).cloned() else {
         return;
     };
-    if let Some(password) = conn.password.clone().filter(|p| !p.is_empty()) {
-        // `disarm_on_input = false`:与原版 `arm_ssh_autofill` command 同参
-        // (那条路是用户手动敲 `ssh`,首次输入不该把 autofill 解掉)
-        terminal.read(cx).arm_ssh_autofill(password, false);
+    // 已存密码是 `mt-secret` 信封,交给 autofill 前在这里解开;解不开就提示并不填
+    // (终端里照常出现密码提示,用户手输即可)。
+    if let Some(stored) = conn.password.as_deref().filter(|p| !p.is_empty()) {
+        match crate::secrets::reveal_password(stored) {
+            // `disarm_on_input = false`:与原版 `arm_ssh_autofill` command 同参
+            // (那条路是用户手动敲 `ssh`,首次输入不该把 autofill 解掉)
+            Ok(password) => terminal.read(cx).arm_ssh_autofill(password, false),
+            Err(err) => crate::secrets::toast_password_error(err, cx),
+        }
     }
     let identity = conn
         .identity_file

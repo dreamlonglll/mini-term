@@ -328,6 +328,19 @@ impl ConfigDb {
             .with_context(|| format!("备份配置库到 {} 失败", path.display()))?;
         Ok(())
     }
+
+    /// 密码封存迁移后的清扫。SQLite 更新一行**不会抹掉页内旧 cell 的字节**,明文
+    /// 密码会作为页内碎片残留;WAL 旧帧里同样躺着明文页。`VACUUM` 按逻辑内容把库
+    /// 整个重写,`wal_checkpoint(TRUNCATE)` 把 WAL 截成零。只在真的封存过东西时调
+    /// (稳态几十 KB 的库,跑一次是毫秒级),平时不跑。
+    pub fn scrub_after_secret_rewrite(&self) -> Result<()> {
+        let conn = self.conn.lock().map_err(|_| anyhow!("配置库锁中毒"))?;
+        conn.execute_batch("VACUUM").context("VACUUM 配置库失败")?;
+        // checkpoint 是有返回行的语句(busy / log / checkpointed),走 query_row。
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+            .context("截断配置库 WAL 失败")?;
+        Ok(())
+    }
 }
 
 /// 把一份 `AppConfig` 拆成 (settings 键值对, projects 行, sshConnections 行)。

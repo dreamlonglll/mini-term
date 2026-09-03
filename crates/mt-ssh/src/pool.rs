@@ -1209,7 +1209,14 @@ async fn authenticate(handle: &mut Handle<MtClient>, conn: &SshConnection) -> Re
     }
 
     // 2) password (含 keyboard-interactive fallback)
-    if let Some(pw) = conn.password.as_deref().filter(|p| !p.is_empty()) {
+    //
+    // 配置里的 password 是 `mt-secret` 的信封(或升级窗口期的遗留明文),**在这里**
+    // 解开 —— 主程序与三个 sidecar 共用这个池,解封点唯一就不会有谁忘了。
+    // 解不开(密钥换了 / 密文被改)直接报错,绝不把密文当密码送出去;错误文本不含密码。
+    if let Some(stored) = conn.password.as_deref().filter(|p| !p.is_empty()) {
+        let pw =
+            mt_secret::reveal_global(stored).map_err(|e| format!("password unavailable: {e}"))?;
+        let pw = pw.as_str();
         let auth = handle
             .authenticate_password(&conn.user, pw)
             .await

@@ -107,6 +107,10 @@ mt-layout = { path = "crates/mt-layout" }
 mt-project = { path = "crates/mt-project" }
 mt-pty = { path = "crates/mt-pty" }
 mt-relay = { path = "crates/mt-relay" }
+# 已存 SSH 密码的封存层(AES-256-GCM 信封 + `credential.key` 主密钥,Windows 走 DPAPI)。
+# 位置在 mt-core 之上、mt-config / mt-ssh / mt-app 之下;经 mt-ssh 进入三个 sidecar,
+# 所以它自己的依赖表也只许有 ring / base64 / serde / zeroize 这一级(见其 Cargo.toml)。
+mt-secret = { path = "crates/mt-secret" }
 # 共享 SSH 通信层(russh 持久会话池 + SFTP 原语),收尾-1 批自 `src-tauri/mt-ssh`
 # 移入;BB 批(SSH 全套 UI)接线用。
 mt-ssh = { path = "crates/mt-ssh" }

@@ -4266,6 +4266,7 @@ dependencies = [
  "mt-project",
  "mt-pty",
  "mt-relay",
+ "mt-secret",
  "mt-ssh",
  "mt-terminal",
  "mt-ui",
@@ -4290,6 +4291,7 @@ dependencies = [
  "anyhow",
  "dirs 6.0.0",
  "mt-core",
+ "mt-secret",
  "rusqlite",
  "serde",
  "serde_json",
@@ -4379,6 +4381,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "mt-secret"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "mt-core",
+ "ring",
+ "serde",
+ "serde_json",
+ "windows-sys 0.52.0",
+ "zeroize",
+]
+
+[[package]]
 name = "mt-ssh"
 version = "0.6.5"
 dependencies = [
@@ -4386,6 +4401,7 @@ dependencies = [
  "dirs 6.0.0",
  "futures",
  "mt-core",
+ "mt-secret",
  "rsa",
  "russh",
  "russh-sftp",
