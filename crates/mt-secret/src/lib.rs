@@ -54,9 +54,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
-use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
-use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, NONCE_LEN};
+use base64::engine::general_purpose::STANDARD as B64;
+use ring::aead::{AES_256_GCM, Aad, LessSafeKey, NONCE_LEN, Nonce, UnboundKey};
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
@@ -179,15 +179,14 @@ fn decode_key_file(raw: &[u8]) -> Result<Zeroizing<[u8; KEY_LEN]>, SecretError> 
             #[cfg(not(windows))]
             {
                 return Err(SecretError::KeyUnreadable(
-                    "这份密钥由 Windows DPAPI 包裹,只能在生成它的 Windows 用户账户下解开"
-                        .into(),
+                    "这份密钥由 Windows DPAPI 包裹,只能在生成它的 Windows 用户账户下解开".into(),
                 ));
             }
         }
         other => {
             return Err(SecretError::KeyUnreadable(format!(
                 "密钥保护方式 {other} 不受支持"
-            )))
+            )));
         }
     };
     if key_bytes.len() != KEY_LEN {
@@ -259,9 +258,7 @@ impl Vault {
         SystemRandom::new()
             .fill(&mut *key)
             .map_err(|_| SecretError::Rng)?;
-        Ok(Self {
-            key: Arc::new(key),
-        })
+        Ok(Self { key: Arc::new(key) })
     }
 
     /// 打开 `{data_dir}/credential.key`。**不存在不创建**(sidecar 走这条)。
@@ -270,13 +267,13 @@ impl Vault {
         let raw = match fs::read(&path) {
             Ok(raw) => raw,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                return Err(SecretError::KeyMissing(path))
+                return Err(SecretError::KeyMissing(path));
             }
             Err(e) => {
                 return Err(SecretError::KeyUnreadable(format!(
                     "{}: {e}",
                     path.display()
-                )))
+                )));
             }
         };
         Ok(Self {
@@ -357,7 +354,8 @@ impl Vault {
             return Err(SecretError::Undecryptable);
         }
         let (nonce, ciphertext) = bytes.split_at(NONCE_LEN);
-        let nonce = Nonce::try_assume_unique_for_key(nonce).map_err(|_| SecretError::Undecryptable)?;
+        let nonce =
+            Nonce::try_assume_unique_for_key(nonce).map_err(|_| SecretError::Undecryptable)?;
         let key = self.aead_key()?;
         let mut buf = Zeroizing::new(ciphertext.to_vec());
         let plain = key
@@ -507,9 +505,17 @@ mod tests {
         let sealed = first.seal("hunter2").unwrap();
 
         let second = Vault::open(&dir).unwrap();
-        assert_eq!(second.reveal(&sealed).unwrap(), "hunter2", "重开拿到的是同一把钥匙");
+        assert_eq!(
+            second.reveal(&sealed).unwrap(),
+            "hunter2",
+            "重开拿到的是同一把钥匙"
+        );
         let third = Vault::open_or_create(&dir).unwrap();
-        assert_eq!(third.reveal(&sealed).unwrap(), "hunter2", "已存在时绝不覆盖");
+        assert_eq!(
+            third.reveal(&sealed).unwrap(),
+            "hunter2",
+            "已存在时绝不覆盖"
+        );
 
         // 文件里不能直接躺着裸密钥的 base64(Windows 是 DPAPI blob;Unix 靠 0600,
         // 这条只在 Windows 断言)
@@ -519,13 +525,20 @@ mod tests {
         #[cfg(windows)]
         {
             assert_eq!(parsed.scheme, "dpapi");
-            assert!(!raw.contains(&B64.encode(&**first.key)), "裸密钥不能出现在文件里");
+            assert!(
+                !raw.contains(&B64.encode(&**first.key)),
+                "裸密钥不能出现在文件里"
+            );
         }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(parsed.scheme, "plain");
-            let mode = fs::metadata(key_file_path(&dir)).unwrap().permissions().mode() & 0o777;
+            let mode = fs::metadata(key_file_path(&dir))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
             assert_eq!(mode, 0o600, "Unix 密钥文件必须 0600");
         }
         fs::remove_dir_all(&dir).ok();
@@ -544,7 +557,10 @@ mod tests {
             Vault::open_or_create(&dir),
             Err(SecretError::KeyUnreadable(_))
         ));
-        assert_eq!(fs::read_to_string(key_file_path(&dir)).unwrap(), "{ not json");
+        assert_eq!(
+            fs::read_to_string(key_file_path(&dir)).unwrap(),
+            "{ not json"
+        );
 
         fs::write(
             key_file_path(&dir),

@@ -1478,20 +1478,29 @@ fn copyable_name(state: &Entity<SshPanel>, conn: &SshConnection, just_copied: bo
 
 /// 新增 / 编辑表单(原版 `SshConnectionForm`:accent 虚线框里一叠带标签的字段)。
 fn render_form(state: &Entity<SshPanel>, cx: &mut App) -> AnyElement {
-    let Some((name, host, port, user, password, reveal_password, password_unreadable, identity, group)) =
-        state.read(cx).form.as_ref().map(|f| {
-            (
-                f.name.clone(),
-                f.host.clone(),
-                f.port.clone(),
-                f.user.clone(),
-                f.password.clone(),
-                f.reveal_password,
-                f.password_unreadable,
-                f.identity.clone(),
-                f.group.clone(),
-            )
-        })
+    let Some((
+        name,
+        host,
+        port,
+        user,
+        password,
+        reveal_password,
+        password_unreadable,
+        identity,
+        group,
+    )) = state.read(cx).form.as_ref().map(|f| {
+        (
+            f.name.clone(),
+            f.host.clone(),
+            f.port.clone(),
+            f.user.clone(),
+            f.password.clone(),
+            f.reveal_password,
+            f.password_unreadable,
+            f.identity.clone(),
+            f.group.clone(),
+        )
+    })
     else {
         return div().into_any_element();
     };

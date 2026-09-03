@@ -335,8 +335,7 @@ impl ConfigDb {
     /// (稳态几十 KB 的库,跑一次是毫秒级),平时不跑。
     pub fn scrub_after_secret_rewrite(&self) -> Result<()> {
         let conn = self.conn.lock().map_err(|_| anyhow!("配置库锁中毒"))?;
-        conn.execute_batch("VACUUM")
-            .context("VACUUM 配置库失败")?;
+        conn.execute_batch("VACUUM").context("VACUUM 配置库失败")?;
         // checkpoint 是有返回行的语句(busy / log / checkpointed),走 query_row。
         conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
             .context("截断配置库 WAL 失败")?;

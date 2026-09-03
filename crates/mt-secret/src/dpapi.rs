@@ -9,9 +9,9 @@
 
 use std::ptr;
 
-use windows_sys::Win32::Foundation::{LocalFree, HLOCAL};
+use windows_sys::Win32::Foundation::{HLOCAL, LocalFree};
 use windows_sys::Win32::Security::Cryptography::{
-    CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
+    CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
 };
 
 const ENTROPY: &[u8] = b"mini-term credential key v1";

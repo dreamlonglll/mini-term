@@ -1181,9 +1181,9 @@ impl ConfigStore {
                 .and_then(|()| db.scrub_after_secret_rewrite())
             {
                 Ok(()) => eprintln!("[config] 已把 {sealed} 条 SSH 密码封存进 config.db"),
-                Err(err) => eprintln!(
-                    "[config] 密码封存后回写库失败(内存中已是密文,下次保存再写): {err:#}"
-                ),
+                Err(err) => {
+                    eprintln!("[config] 密码封存后回写库失败(内存中已是密文,下次保存再写): {err:#}")
+                }
             }
         }
         self.seal_legacy_archive(&vault);
@@ -2378,7 +2378,10 @@ mod tests {
         let stored = scoped[0].password.as_deref().expect("凭据要完整");
         assert!(mt_secret::is_sealed(stored), "投影里只能是信封: {stored}");
         assert_eq!(
-            mt_secret::Vault::open(&root).unwrap().reveal(stored).unwrap(),
+            mt_secret::Vault::open(&root)
+                .unwrap()
+                .reveal(stored)
+                .unwrap(),
             "secret",
             "sidecar 只读打开同目录的密钥文件就能解"
         );
@@ -2466,7 +2469,10 @@ mod tests {
         }
         // WAL 要么已截成空,要么不存在
         if let Ok(wal) = fs::read(root.join("config.db-wal")) {
-            assert!(!contains_bytes(&wal, PLAIN.as_bytes()), "WAL 旧帧里不该有明文");
+            assert!(
+                !contains_bytes(&wal, PLAIN.as_bytes()),
+                "WAL 旧帧里不该有明文"
+            );
         }
         // 存档其余内容原样,只有密码字段换了
         let archived: serde_json::Value =
