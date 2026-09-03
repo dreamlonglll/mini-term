@@ -509,9 +509,9 @@ mod tests {
             Some(format!("grok --resume {id}").as_str())
         );
 
-        // omp:有 --fork 但没有记录解析,分支树画不出节点,只留 resume 位
+        // omp 已接移动镜像的记录解析，但会话谱系尚未扫描，分支树仍不开 fork。
         let omp = branch_caps_for_agent(Some("omp")).unwrap();
-        assert!(!omp.can_fork(), "omp 的记录解析未接入,不开 fork");
+        assert!(!omp.can_fork(), "omp 尚未接入会话谱系扫描，不开 fork");
         assert_eq!(
             omp.resume_command(id).as_deref(),
             Some(format!("omp --resume {id}").as_str())

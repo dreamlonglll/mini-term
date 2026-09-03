@@ -1,9 +1,8 @@
-//! 三家 AI CLI 的会话记录读取与谱系扫描(原 `src-tauri/src/ai_sessions.rs`)。
+//! AI CLI 会话记录读取与谱系扫描（原 `src-tauri/src/ai_sessions.rs`）。
 //!
-//! **只有 Claude / Codex / Grok 有可解析的会话记录**([`agent_has_session_log`])。
-//! opencode / pi 这类只靠输入检测识别的 agent 拿得到状态徽章与移动端指令,但没有
-//! 对话镜像、AI 历史面板与用量统计 —— 镜像必须据此跳过启发式绑定,否则会绑到同
-//! 项目其它 agent 的最新会话文件,把别人的对话贴到该 pane 上。
+//! Claude / Codex / Grok 支持历史面板等完整读取；OMP 目前接入移动镜像所需的
+//! 本机会话定位、消息与 ask 问答解析。opencode / pi 只有状态与移动端指令，镜像必须
+//! 跳过启发式绑定，否则会把同项目其它 agent 的最新记录贴到该 pane。
 //!
 //! 原本的 `#[tauri::command]` 全部去掉,函数签名不变;跨模块共享的
 //! `pub(crate)` 项一律放宽成 `pub` —— 原来的消费者(remote_ssh / usage_stats /
@@ -11,6 +10,7 @@
 
 mod codex;
 mod grok;
+mod omp;
 mod lineage;
 
 pub use codex::{
@@ -21,6 +21,11 @@ pub use codex::{
 pub use grok::{
     GrokUpdateParser, decode_grok_cwd_dir, find_grok_cwd_dirs, find_grok_session_dir,
     grok_question_answer_from_line, grok_question_from_line, grok_updates_path,
+};
+pub use omp::{
+    OmpSessionMeta, find_omp_session_file, newest_omp_session_file,
+    omp_message_from_line, omp_question_answer_from_line, omp_question_from_line,
+    omp_session_meta_from_line,
 };
 pub use lineage::{
     BookkeptLineageEdge, LineageEdge, branch_title_from_texts, claude_branch_title_from_lines,
@@ -96,21 +101,21 @@ fn home_dir() -> Option<PathBuf> {
     dirs::home_dir()
 }
 
-/// 该 agent 是否有本 crate 能解析的会话记录(Claude / Codex / Grok 三家)。
+/// 该 agent 是否有对话镜像能解析的本机会话记录（Claude / Codex / Grok / OMP）。
 ///
-/// 输入检测能认出的 agent 比这宽(pi / opencode / omp 也在 `detect::AI_COMMANDS` 里),
-/// 它们**没有**可解析的记录文件(omp 虽有 hook 接入,`~/.omp/agent/sessions/` 的
-/// 记录格式尚未接进来)。调用方(对话镜像)必须据此跳过启发式绑定:
-/// 「按项目找最新的 claude/codex/grok 记录」对一个 pi pane 调用,会把同项目里别家
-/// 的对话贴到这个 pane 上(串台)。宁可空镜像。
+/// 输入检测能认出的 agent 比这宽（pi / opencode 也在 `detect::AI_COMMANDS` 里）。
+/// 未支持的 agent 必须跳过启发式绑定，否则会把同项目里别家的最新会话贴到该 pane。
 ///
-/// 用 `contains` 而非全等:hook 上报的 agent 是 `claude-code`,输入检测是 `claude`。
+/// 用 `contains` 而非全等：hook 上报的 agent 是 `claude-code`，输入检测是 `claude`。
 ///
 /// (原本长在 `mobile_mirror.rs` 里;记录形态的判定属于本 crate,镜像迁到
 /// mt-relay 后从这里引。)
 pub fn agent_has_session_log(agent: &str) -> bool {
     let agent = agent.to_ascii_lowercase();
-    agent.contains("claude") || agent.contains("codex") || agent.contains("grok")
+    agent.contains("claude")
+        || agent.contains("codex")
+        || agent.contains("grok")
+        || agent == "omp"
 }
 
 /// 从 Claude 会话 jsonl 文本中提取首个非空 `cwd` 字段。
@@ -643,6 +648,8 @@ pub struct AiQuestionItem {
     pub id: String,
     pub options: Vec<AiQuestionOption>,
     pub multi_select: bool,
+    /// TUI 初始高亮项。OMP 的 ask 支持 recommended；其余 agent 从首项开始。
+    pub recommended_index: Option<usize>,
 }
 
 /// 从 assistant 行解析出的一次 agent 提问。
@@ -753,6 +760,7 @@ pub fn claude_question_from_line(line: &str) -> Option<AiQuestion> {
                     .get("multiSelect")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false),
+                recommended_index: None,
             })
         })
         .collect();
@@ -1013,14 +1021,23 @@ mod tests {
 
     // ---- 可解析会话记录的白名单 ----
 
-    /// 只有 Claude/Codex/Grok 有可解析的记录;pi/opencode/omp 必须落在白名单外,
-    /// 否则镜像会退启发式绑到同项目别家的会话文件(串台)。
+    /// Claude/Codex/Grok/OMP 有可解析的记录；其余 agent 必须落在白名单外，
+    /// 否则镜像会退启发式绑到同项目别家的会话文件（串台）。
     #[test]
-    fn only_claude_codex_and_grok_have_session_logs() {
-        for agent in ["claude", "claude-code", "codex", "Codex", "grok", "Grok"] {
+    fn supported_agents_have_session_logs() {
+        for agent in [
+            "claude",
+            "claude-code",
+            "codex",
+            "Codex",
+            "grok",
+            "Grok",
+            "omp",
+            "OMP",
+        ] {
             assert!(agent_has_session_log(agent), "{agent} 应有会话记录");
         }
-        for agent in ["pi", "opencode", "omp", "", "gemini"] {
+        for agent in ["pi", "opencode", "", "gemini"] {
             assert!(
                 !agent_has_session_log(agent),
                 "{agent} 不应被认为有会话记录"

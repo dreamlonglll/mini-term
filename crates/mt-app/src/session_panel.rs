@@ -95,8 +95,7 @@ pub fn build_resume_command(agent: &str, session_id: &str) -> Option<String> {
     Some(match agent {
         "codex" => format!("codex resume {session_id}"),
         "grok" => format!("grok --resume {session_id}"),
-        // omp 的会话 id 来自 hook 上报(没有会话记录解析,列表里不会出现),
-        // 只服务于启动续接;`--resume` 按 id 前缀或路径找当前目录桶里的会话
+        // omp 的会话 id 来自 hook 上报；`--resume` 按 id 前缀或路径查当前目录桶
         "omp" => format!("omp --resume {session_id}"),
         _ => format!("claude --resume {session_id}"),
     })

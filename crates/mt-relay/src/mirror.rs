@@ -1,16 +1,10 @@
-//! 对话镜像:会话记录(JSONL)的增量解析 → 镜像消息序列。
+//! 对话镜像：会话记录（JSONL）的增量解析 → 镜像消息序列。
 //!
-//! 数据源是 Claude/Codex 会话记录文件,不是终端原始输出(docs/adr/0001)。
-//! 移动端按 pane 订阅;桌面端把 pane 绑定到其项目目录下**最新**的会话文件,
-//! 轮询增量解析新行并推送。用轮询而非复用 mt-project 的 notify 监听是有意取舍:
-//! 镜像除了"文件长大"还要发现"更新的会话文件出现"(换绑),对单文件挂 notify
-//! 覆盖不了后者;1s 轮询两种情况一并处理,订阅通常只有一个,代价可忽略。
-//!
-//! 绑定策略分两层:hook 上报过会话身份(pty→session_id)时精确绑定该会话的
-//! 文件,同项目多个 AI pane 各绑各的会话;未启用 hook 时退回"项目最新文件 +
-//! AI 启动时刻下限"启发式(此路径保留 v1 限制:多 pane 共同镜像最新会话)。
-//! 两层都保证:本轮会话未落盘时(首条消息前)给空镜像,不错绑别的会话。
-//! v1 限制:仅本机(Windows 宿主)来源的会话记录。
+//! 数据源是 Claude/Codex/Grok/OMP 会话记录文件，不是终端原始输出。
+//! 移动端按 pane 订阅；桌面端优先按 hook 上报的 session id 精确绑定，
+//! 无 hook 时退回“项目最新文件 + AI 启动时刻下限”的启发式绑定。
+//! 两层都保证本轮会话未落盘时返回空镜像，不绑定同项目的其他会话。
+//! v1 限制：仅本机来源的会话记录。
 
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
@@ -39,10 +33,11 @@ pub enum MirrorAgent {
     Claude,
     Codex,
     Grok,
+    Omp,
 }
 
-/// 挂起中的 agent 提问:卡片已下发、尚未见到作答或打断。
-/// 仅 Claude 有此形态(AskUserQuestion);Codex/Grok 的审批走 hook 黄灯,不落记录。
+/// 挂起中的 agent 提问：卡片已下发、尚未见到作答或打断。
+/// Claude/Codex/Grok/OMP 四家共用同一套挂起与作答对账。
 struct PendingQuestion {
     /// 提问卡片消息的镜像 seq(移动端作答以此定位)
     seq: u64,
@@ -106,10 +101,11 @@ impl MirrorParser {
 
     fn parse_line(&mut self, line: &str, out: &mut Vec<MirrorMessage>) {
         match self.agent {
-            // Claude/Codex 一行可产出多条(说明文字 + 提问卡片 / 作答标记 + 用户输入)
+            // Claude/Codex/OMP 一行可产出多条（说明文字 + 提问卡片 / 作答标记）。
             MirrorAgent::Claude => self.parse_claude_line(line, out),
             MirrorAgent::Codex => self.parse_codex_line(line, out),
             MirrorAgent::Grok => self.parse_grok_line(line, out),
+            MirrorAgent::Omp => self.parse_omp_line(line, out),
         }
     }
 
@@ -210,6 +206,26 @@ impl MirrorParser {
             }
         }
     }
+    /// OMP 行：普通 user/assistant 文本 + assistant 的 ask toolCall +
+    /// toolResult(toolName=ask) 作答回执。
+    fn parse_omp_line(&mut self, line: &str, out: &mut Vec<MirrorMessage>) {
+        if let Some(answer) = ai_sessions::omp_question_answer_from_line(line) {
+            self.resolve_answer(&answer, out);
+        }
+
+        if let Some(raw) = ai_sessions::omp_message_from_line(line) {
+            let is_user_text = raw.role == "user";
+            out.push(self.next_text_message(raw));
+            if is_user_text {
+                self.pending.clear();
+            }
+        }
+
+        if let Some(question) = ai_sessions::omp_question_from_line(line) {
+            self.push_question(question, out);
+        }
+    }
+
 
     /// 作答对账:回执命中挂起提问 → 产出标记并只移除**该**提问。
     /// 不能一刀切清空——提问可能与别的工具调用并行(同一条 assistant 消息里
@@ -270,6 +286,7 @@ impl MirrorParser {
             MirrorAgent::Claude => "Other",
             MirrorAgent::Codex => "None of the above",
             MirrorAgent::Grok => "Type your answer here",
+            MirrorAgent::Omp => "Other (type your own)",
         };
         for item in &mut question.items {
             // 多选题 v1 只展示不可点选,不补
@@ -342,15 +359,24 @@ impl MirrorParser {
             return None;
         }
         let option = item.options.get(option_index as usize)?;
-        // grok 的自由输入项(TUI 里的 z 项)不在方向键导航序列里:↓×N 会停在
-        // 最后一个编号项、回车把它交出去(踩过)。热键 z 直达输入态,后续
-        // 文本由用户经指令输入框补上。该项永远是我们追加在尾部的那一个
+        // Grok 自由输入项不在方向键导航序列里，热键 z 直达输入态。
         let is_grok_free_input = matches!(self.agent, MirrorAgent::Grok)
             && option_index as usize == item.options.len() - 1;
         let keys = if is_grok_free_input {
             "z".to_string()
         } else {
-            let mut keys = "\x1b[B".repeat(option_index as usize);
+            // OMP ask 的 recommended 是初始高亮；其余 agent 从首项开始。
+            let initial = if matches!(self.agent, MirrorAgent::Omp) {
+                item.recommended_index.unwrap_or(0).min(item.options.len() - 1)
+            } else {
+                0
+            };
+            let target = option_index as usize;
+            let mut keys = if target >= initial {
+                "\x1b[B".repeat(target - initial)
+            } else {
+                "\x1b[A".repeat(initial - target)
+            };
             keys.push('\r');
             keys
         };
@@ -532,6 +558,10 @@ pub fn resolve_session_file(
             fresh_since(newest_grok_file(project_path), min_mtime),
             MirrorAgent::Grok,
         ),
+        (
+            fresh_since(ai_sessions::newest_omp_session_file(project_path), min_mtime),
+            MirrorAgent::Omp,
+        ),
     ];
     let mut best: Option<(PathBuf, SystemTime, MirrorAgent)> = None;
     for (candidate, agent) in candidates {
@@ -603,9 +633,13 @@ pub fn resolve_session_file_by_id(
     } else if agent_lower.contains("grok") {
         let dir = ai_sessions::find_grok_session_dir(project_path, session_id)?;
         ai_sessions::grok_updates_path(&dir).map(|p| (p, MirrorAgent::Grok))
-    } else {
+    } else if agent_lower == "omp" {
+        ai_sessions::find_omp_session_file(project_path, session_id).map(|p| (p, MirrorAgent::Omp))
+    } else if agent_lower.contains("claude") || agent_lower.is_empty() {
         let dirs = ai_sessions::find_claude_project_dirs(project_path);
         claude_session_file_in(&dirs, session_id).map(|p| (p, MirrorAgent::Claude))
+    } else {
+        None
     }
 }
 
@@ -1099,6 +1133,38 @@ mod tests {
         assert_eq!(msgs[1].source, "assistant");
         assert_eq!(msgs[1].content, "world");
     }
+    #[test]
+    fn parser_omp_messages_question_and_answer() {
+        let mut parser = MirrorParser::new(MirrorAgent::Omp);
+        let data = concat!(
+            r#"{"type":"message","timestamp":"t0","message":{"role":"user","content":[{"type":"text","text":"help me"}]}}"#,
+            "\n",
+            r#"{"type":"message","timestamp":"t1","message":{"role":"assistant","content":[{"type":"text","text":"choose first"},{"type":"toolCall","id":"ask-1","name":"ask","arguments":{"questions":[{"id":"q1","question":"Which?","header":"Plan","options":[{"label":"A","description":"safe"},{"label":"B","description":"fast"}],"multi":false,"recommended":1}]}}]}}"#,
+            "\n",
+        );
+        let msgs = parser.feed(data.as_bytes());
+        assert_eq!(msgs.len(), 3, "{msgs:?}");
+        assert_eq!(msgs[0].source, "desktop");
+        assert_eq!(msgs[1].content, "choose first");
+        assert_eq!(msgs[2].kind.as_deref(), Some("question"));
+        assert_eq!(msgs[2].question_id.as_deref(), Some("ask-1"));
+
+        // recommended=1，选 B 直接回车；选 A 先向上一次。
+        assert_eq!(parser.answer_keys(2, "ask-1", 0, 1).unwrap().keys, "\r");
+        assert_eq!(parser.answer_keys(2, "ask-1", 0, 0).unwrap().keys, "\x1b[A\r");
+        assert_eq!(
+            parser.answer_keys(2, "ask-1", 0, 2).unwrap().label,
+            "Other (type your own)"
+        );
+
+        let answered = r#"{"type":"message","timestamp":"t2","message":{"role":"toolResult","toolCallId":"ask-1","toolName":"ask","details":{"question":"Which?","selectedOptions":["B"],"multi":false}}}"#;
+        let marks = parser.feed(format!("{answered}\n").as_bytes());
+        assert_eq!(marks.len(), 1);
+        assert_eq!(marks[0].kind.as_deref(), Some("questionAnswered"));
+        assert_eq!(marks[0].ref_seq, Some(2));
+        assert_eq!(marks[0].labels, ["B"]);
+    }
+
 
     fn make_messages(n: u64) -> Vec<MirrorMessage> {
         (0..n)
