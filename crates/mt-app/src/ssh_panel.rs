@@ -533,6 +533,8 @@ struct ConnForm {
     port: Entity<InputState>,
     user: Entity<InputState>,
     password: Entity<InputState>,
+    /// 密码框是否正以明文显示(右侧「显示 / 隐藏」按钮)。每次开表单都从掩码起。
+    reveal_password: bool,
     identity: Entity<InputState>,
     group: Entity<InputState>,
 }
@@ -724,6 +726,7 @@ fn new_form(
             window,
             cx,
         ),
+        reveal_password: false,
         identity: text_field(
             t("sshModal", "identityPlaceholder"),
             conn.and_then(|c| c.identity_file.clone()).unwrap_or_default(),
@@ -756,6 +759,29 @@ fn text_field(
             .placeholder(placeholder.into())
             .default_value(value)
     })
+}
+
+/// 「显示 / 隐藏」密码:翻转表单的明文态,并同步给输入框的 `masked`。
+///
+/// **不用 gpui-component 自带的 `Input::mask_toggle`**:① 它画 `IconName::Eye`,
+/// 0.5.1 不带 svg 资产、本仓也没注册 `AssetSource`,渲染出来是空白且编译期无感
+/// (见 `menu` 模块注释);② 它是「按住才显示、松手即掩」,与常见表单的点击切换
+/// 语义不同 —— 编辑已存密码时用户要的是能看清整串再改,按住看不方便。
+fn toggle_password_reveal(
+    state: &Entity<SshPanel>,
+    password: &Entity<InputState>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let reveal = state.update(cx, |panel, cx| {
+        let form = panel.form.as_mut()?;
+        form.reveal_password = !form.reveal_password;
+        cx.notify();
+        Some(form.reveal_password)
+    });
+    if let Some(reveal) = reveal {
+        password.update(cx, |input, cx| input.set_masked(!reveal, window, cx));
+    }
 }
 
 fn save_form(state: &Entity<SshPanel>, cx: &mut App) {
@@ -1405,7 +1431,7 @@ fn copyable_name(state: &Entity<SshPanel>, conn: &SshConnection, just_copied: bo
 
 /// 新增 / 编辑表单(原版 `SshConnectionForm`:accent 虚线框里一叠带标签的字段)。
 fn render_form(state: &Entity<SshPanel>, cx: &mut App) -> AnyElement {
-    let Some((name, host, port, user, password, identity, group)) =
+    let Some((name, host, port, user, password, reveal_password, identity, group)) =
         state.read(cx).form.as_ref().map(|f| {
             (
                 f.name.clone(),
@@ -1413,6 +1439,7 @@ fn render_form(state: &Entity<SshPanel>, cx: &mut App) -> AnyElement {
                 f.port.clone(),
                 f.user.clone(),
                 f.password.clone(),
+                f.reveal_password,
                 f.identity.clone(),
                 f.group.clone(),
             )
@@ -1463,7 +1490,27 @@ fn render_form(state: &Entity<SshPanel>, cx: &mut App) -> AnyElement {
         .child(field(
             t("sshModal", "passwordLabel"),
             Some(t("sshModal", "passwordHint")),
-            Input::new(&password),
+            div()
+                .flex()
+                .gap(px(8.0))
+                .child(div().flex_1().child(Input::new(&password)))
+                .child(
+                    ui::ghost_button(
+                        "ssh-password-toggle",
+                        if reveal_password {
+                            t("sshModal", "hidePassword")
+                        } else {
+                            t("sshModal", "showPassword")
+                        },
+                    )
+                    .on_click({
+                        let state = state.clone();
+                        let password = password.clone();
+                        move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                            toggle_password_reveal(&state, &password, window, cx);
+                        }
+                    }),
+                ),
         ))
         .child(field(
             t("sshModal", "identityLabel"),

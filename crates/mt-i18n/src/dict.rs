@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 32;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 850;
+pub const ZH_ENTRY_COUNT: usize = 852;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 850;
+pub const EN_ENTRY_COUNT: usize = 852;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -1555,6 +1555,7 @@ static SSH_MODAL_ZH: &[(&str, &str)] = &[
     ("groupLabel", "分组"),
     ("groupOpsHint", "右键左侧列表可新增分组，右键分组可重命名或解散；拖动连接到分组上可调整归属"),
     ("groupPlaceholder", "如 内网 / 客户A"),
+    ("hidePassword", "隐藏"),
     ("hostLabel", "主机 *"),
     ("hostPlaceholder", "example.com 或 10.0.0.5"),
     ("identityHint", "可选，对应 ssh -i"),
@@ -1569,6 +1570,7 @@ static SSH_MODAL_ZH: &[(&str, &str)] = &[
     ("renameGroup", "重命名分组"),
     ("save", "保存"),
     ("selectKeyFile", "选择私钥文件"),
+    ("showPassword", "显示"),
     ("title", "SSH 连接"),
     ("ungrouped", "未分组"),
     ("userLabel", "用户名 *"),
@@ -1594,6 +1596,7 @@ static SSH_MODAL_EN: &[(&str, &str)] = &[
     ("groupLabel", "Group"),
     ("groupOpsHint", "Right-click the left list to add a group, right-click a group to rename or dissolve it; drag a connection onto a group to move it"),
     ("groupPlaceholder", "e.g. Intranet / Client A"),
+    ("hidePassword", "Hide"),
     ("hostLabel", "Host *"),
     ("hostPlaceholder", "example.com or 10.0.0.5"),
     ("identityHint", "Optional, maps to ssh -i"),
@@ -1608,6 +1611,7 @@ static SSH_MODAL_EN: &[(&str, &str)] = &[
     ("renameGroup", "Rename group"),
     ("save", "Save"),
     ("selectKeyFile", "Select private key file"),
+    ("showPassword", "Show"),
     ("title", "SSH Connections"),
     ("ungrouped", "Ungrouped"),
     ("userLabel", "Username *"),
