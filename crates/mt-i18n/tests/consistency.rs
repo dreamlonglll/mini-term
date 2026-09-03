@@ -85,8 +85,9 @@ use mt_i18n::{
 /// 842 → 850：文件树补移动：右键「移动到 ▸」多级面板 3 条、拖拽落点确认框 3 条、
 /// 菜单项与操作状态各 1 条。
 /// 850 → 852：SSH 连接表单密码框补「显示 / 隐藏」切换按钮。
+/// 852 → 854：SSH 密码加密保存：解密失败 / 加密失败两条提示。
 const EXPECTED_NAMESPACES: usize = 32;
-const EXPECTED_ENTRIES_PER_LANG: usize = 852;
+const EXPECTED_ENTRIES_PER_LANG: usize = 854;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

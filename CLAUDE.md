@@ -65,7 +65,8 @@ bun run tools/omp-ext-check.ts
 | `mt-layout` | 界面布局持久化(`layout.db`,rusqlite):三栏比例 / 每项目分屏树 / 窗口几何。分屏树整棵存 JSON 不拆关系表,理由见模块注释 |
 | `mt-i18n` | 双语文案层。**字典源头是 `locales/*.ts`**（TS 对象字面量，随 Tauri 版下线迁入），`src/dict.rs` 由 `tools/gen_from_ts.mjs` 生成——**禁止手改 dict.rs**，改文案改 locales 后重跑生成器，`tests/consistency.rs` 的对账常量随之更新 |
 | `mt-relay` | 移动端中转桌面侧：出站 WSS 长连、配对、项目快照/增量、对话镜像（`mirror.rs`）、移动端指令写穿 |
-| `mt-ssh` | 共享 SSH 通信层（russh 持久会话池 + SFTP 原语），主程序与 sidecar 共用 |
+| `mt-ssh` | 共享 SSH 通信层（russh 持久会话池 + SFTP 原语），主程序与 sidecar 共用；密码信封在 `pool::authenticate` 解开 |
+| `mt-secret` | SSH 密码封存：AES-256-GCM 信封 + `credential.key` 主密钥（Windows DPAPI / Unix 0600）。在 mt-core 之上，经 mt-ssh 进入 sidecar，依赖表只许 ring/base64/serde/zeroize |
 | `mt-usage` | 用量统计：会话轮次解析 / SQLite 账本 / 聚合 / 计价 |
 | `mt-core` | 叶子共享库（WSL UNC 解析 / SSH 提示扫描 / 原子写等）。⚠️ 依赖方向铁律：只依赖 serde/serde_json/dirs，绝不反向依赖上层 crate——它同时被三个 sidecar 与 mt-ssh 链接 |
 
@@ -83,8 +84,9 @@ reader 线程读 PTY 字节直接喂 `mt-terminal` 的 VT 状态机，UI 按帧�
 |------|------|--------|
 | `config.db` | **配置本体**（项目、SSH 连接、全部设置） | 只有主程序（`mt-config::db`） |
 | `config.json` | **给 sidecar 读的 SSH 投影**，派生物 | 主程序写，三个 sidecar 二进制读 |
-| `config.json.pre-sqlite` | 存量用户迁移前的完整旧配置存档，不删不改 | 只在回退/排查时用 |
+| `config.json.pre-sqlite` | 存量用户迁移前的完整旧配置存档，除密码字段封存外不删不改 | 只在回退/排查时用 |
 | `config.db.bak` | 每次成功加载后留的一代库备份 | 库损坏时自动顶上 |
+| `credential.key` | SSH 密码信封的主密钥（Windows 内容经 DPAPI 包裹；Unix 0600） | 主程序生成，sidecar 只读（见下节） |
 | `layout.db` | 界面布局（见下节） | 只有主程序（`mt-layout`） |
 | `usage.db` | 用量账本（可从 JSONL 再生） | `mt-usage` |
 | `hook-server.json` | hook 端口文件 | 主程序写，sidecar 读 |
@@ -98,6 +100,18 @@ reader 线程读 PTY 字节直接喂 `mt-terminal` 的 VT 状态机，UI 按帧�
 - `sidecars/src/ssh_service.rs` 那道「拒绝传输 mini-term 自己的 config.json」的安全护栏按的就是这个路径；审计日志与 IPC socket 目录也拿它的所在目录当锚点
 
 ⚠️ **改投影形状时必须同步 `mt_core::config_reader::ConfigSshView`**——两边隔着 crate 边界、没有共享类型，只靠字段名对齐。护栏是 `mt-config` 里的 `投影能被_sidecar_的解析器读懂`，它直接调 sidecar 那份解析器。
+
+### SSH 密码封存（`mt-secret`）
+
+`SshConnection.password` 在库、投影、`.bak`、`.pre-sqlite` 存档四处**一律是信封串** `enc:v1:<base64(nonce‖密文‖tag)>`（AES-256-GCM），明文只活在「表单 → `AppStore::upsert_ssh_connection`」那一小段与认证那一刻。主密钥 32 字节随机，存 `{active_data_dir}/credential.key`：Windows 内容经 DPAPI（当前用户范围、禁弹窗）包裹，macOS/Linux 靠 0600。
+
+- **封存点唯一**：`AppStore::upsert_ssh_connection`（`mt-app::secrets::stored_password`，密码没改就沿用旧信封——信封每次 nonce 不同，换了会让 `ssh_session_identity_changed` 误判身份变了、白白作废池里的 session）。`ConfigStore::save` 另有兜底封存挡「谁忘了封」
+- **解封点三处**：编辑表单回填、终端自动填充（`pane::connect_ssh` / `remote_ssh::prepare_remote_launch`）、`mt-ssh::pool::authenticate`——最后一处是主程序与三个 sidecar 共用的，所以 sidecar 不需要任何自己的解封代码
+- **迁移**：`ConfigStore::load` 把存量明文一次性封存并回写库，随后 `VACUUM` + `wal_checkpoint(TRUNCATE)`（SQLite 更新一行不会抹掉页内旧 cell 字节，WAL 旧帧里也躺着明文页），再做这一代 `.bak`；`.pre-sqlite` 存档只改密码字段
+- **密钥只由主程序生成**（`Vault::open_or_create`），sidecar 走 `mt_secret::global()` 懒加载：在 `mt_core::config_json_path()` 同目录**只读**打开，**刻意不认 `MT_APP_DATA_DIR`**——sidecar 读的投影本来就不认它，密钥跟着走就会拿 dev 实例的钥匙开装机版的信封。主程序在 `ConfigStore::load` 里 `mt_secret::install` 自己那把（先到先得），dev 隔离目录因此各有各的钥匙
+- **降级口径**：`reveal` 对不带 `enc:` 前缀的值原样放行（升级窗口期 sidecar 先读到旧明文投影也能连）；解不开返回 `Undecryptable`，UI 提示「请重新填写密码」，会话池报 `password unavailable`，**绝不把密文当密码送去认证**。凭据库开不起来时加载不失败，密码保持原样并在日志里喊
+- **威胁模型（诚实版）**：防的是配置文件被拷走/同步/被别的账户读到；**不防**同一账户下的本机进程（主程序自己就能无提示解密），与浏览器存密码同一档
+- `mt-secret` 的依赖表只许有 ring / base64 / serde / zeroize（都是 sidecar 依赖树里已有的），它经 `mt-ssh` 进入三个 sidecar；`mt-core` 的叶子铁律不动，`SshConnection` 序列化形状一字未变
 
 ### 布局持久化（`layout.db`，非 `config.json`）
 

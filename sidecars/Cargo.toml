@@ -1,6 +1,7 @@
 [package]
 name = "mt-sidecars"
-version = "0.4.8"
+# 0.4.9:会话池改在认证那一刻解开 mt-secret 密码信封(旧 daemon 会把信封当密码送出去)。
+version = "0.4.9"
 description = "mini-term sidecar binaries: miniterm-hook (AI hook), mt-ssh-mcp (SSH MCP server) and mt-ssh-cli (SSH CLI + daemon)"
 edition = "2021"
 

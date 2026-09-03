@@ -92,6 +92,7 @@ mod remote_directory_picker;
 mod remote_project;
 mod remote_ssh;
 mod search_modal;
+mod secrets;
 mod session_branch;
 mod session_panel;
 mod settings;

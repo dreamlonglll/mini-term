@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 32;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 852;
+pub const ZH_ENTRY_COUNT: usize = 854;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 852;
+pub const EN_ENTRY_COUNT: usize = 854;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -1563,9 +1563,11 @@ static SSH_MODAL_ZH: &[(&str, &str)] = &[
     ("identityPlaceholder", "私钥文件路径"),
     ("nameLabel", "名称 *"),
     ("namePlaceholder", "如 生产服务器"),
-    ("passwordHint", "留空则连接时在终端手动输入；填写则明文保存在 config.json，连接时自动填充"),
+    ("passwordHint", "留空则连接时在终端手动输入；填写则加密保存在本机数据目录（密钥受当前系统用户保护），连接时自动填充"),
     ("passwordLabel", "密码"),
     ("passwordSaved", " · 已存密码"),
+    ("passwordSealFailed", "密码加密失败，本次未保存密码：{error}"),
+    ("passwordUnreadable", "已存密码无法解密（密钥文件可能已更换或丢失），请重新填写密码"),
     ("portLabel", "端口"),
     ("renameGroup", "重命名分组"),
     ("save", "保存"),
@@ -1604,9 +1606,11 @@ static SSH_MODAL_EN: &[(&str, &str)] = &[
     ("identityPlaceholder", "Path to private key file"),
     ("nameLabel", "Name *"),
     ("namePlaceholder", "e.g. Production Server"),
-    ("passwordHint", "Leave empty to enter manually in the terminal; otherwise stored in plaintext in config.json and auto-filled on connect"),
+    ("passwordHint", "Leave empty to enter manually in the terminal; otherwise stored encrypted in the local data directory (key protected by the current OS user) and auto-filled on connect"),
     ("passwordLabel", "Password"),
     ("passwordSaved", " · Password saved"),
+    ("passwordSealFailed", "Password encryption failed; the password was not saved: {error}"),
+    ("passwordUnreadable", "The saved password could not be decrypted (the key file may have been replaced or lost). Please enter it again."),
     ("portLabel", "Port"),
     ("renameGroup", "Rename group"),
     ("save", "Save"),
