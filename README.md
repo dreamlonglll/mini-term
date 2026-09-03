@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.2.3-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.2.4-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -113,7 +113,7 @@ VS Code 风格的 **Changes 面板**（Staged / Changes / Untracked 分组，单
 | **远程自动落地** | 上面两种粘贴在 SSH 远程项目里会经 SFTP 传到远端再粘**远端**路径；WSL 项目自动把 `C:\...` 换算成 `/mnt/c/...` |
 | **文件拖拽** | 从文件树或资源管理器拖文件到终端，插入带引号的绝对路径，精准落到目标分屏 |
 | **文件树内移动** | 文件树里拖拽或右键「移动到 ▸」把文件 / 目录挪到别的目录，本地与远程一样；松手先确认，Esc 随时取消正在进行的拖拽 |
-| **文件工作区** | 文件树点开的本地 / 远程文件在主区页签里查看、编辑、保存，与终端并列切换：tree-sitter 语法高亮（30+ 语言），查找替换，`Ctrl+S` 原子落盘，外部改动自动感知；远程文件经 SFTP 读写，保存前比对基线，冲突时可重载或强制覆盖，也能直接下载 |
+| **文件工作区** | 文件树点开的本地 / 远程文件在主区页签里查看、编辑、保存，与终端并列切换：tree-sitter 语法高亮（30+ 语言），查找替换，`Ctrl+S` 原子落盘，外部改动自动感知；Tab 缩进按制表位展开显示（Go 这类文件不再整篇顶格），保存时逐行还原原始字节；远程文件经 SFTP 读写，保存前比对基线，冲突时可重载或强制覆盖，也能直接下载 |
 | **文档预览** | Markdown / HTML 预览里的图片真的会显示——相对路径按文件所在目录解析，网络图直接拉回来（10s 超时 + 32MB 上限，其余协议一律拒）。远程文件的 Markdown 先清洗再渲染：原始 HTML 按源码显示、外链图片点击才加载、`file://` 之类的链接降级为纯文本；远程 HTML 只提供源码查看。HTML 另有一个「用浏览器打开」，走 https 协议关联而不是 `.html` 的文件关联 |
 | **全局搜索** | `Ctrl+Shift+F` 唤起，文件名 / 内容双模式（文件名含 `/` 即按路径匹配），子串或正则，后端流式推送随时可取消 |
 | **项目级环境变量** | 按项目注入 PTY 子进程，严格 POSIX 校验，Rust 端二次防御，WSL 下经 WSLENV 透传 |
