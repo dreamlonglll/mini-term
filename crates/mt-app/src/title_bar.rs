@@ -751,7 +751,6 @@ impl TitleBar {
         .with_priority(1)
         .into_any_element()
     }
-
 }
 
 impl Render for TitleBar {

@@ -704,8 +704,8 @@ impl GitPanel {
         let is_worktree = info.is_some_and(|r| r.is_worktree);
         // 选中的那个也只画叶子名,回头再看仍然认不出是哪个 `api` —— 名字前面
         // 补一段弱化的父级路径(与下拉里第二行同一个判据),完整路径挂 tooltip
-        let detail = info
-            .and_then(|r| repo_detail(&r.path.to_string_lossy(), self.project_path.as_deref()));
+        let detail =
+            info.and_then(|r| repo_detail(&r.path.to_string_lossy(), self.project_path.as_deref()));
         let repo_path_tip: SharedString = self.selected_repo.clone().into();
         let display_branch = self
             .view_branch
