@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.2.5-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.2.6-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -99,7 +99,7 @@ Mini-Term 就是为这件事做的：项目列表上的状态灯实时跳动，A
 
 ### 🌿 Git 集成 + Worktree 批量管理
 
-VS Code 风格的 **Changes 面板**（Staged / Changes / Untracked 分组，单文件或全量 stage / discard，`Ctrl+Enter` 提交），并排 / 内联双视图 Diff（长行横向滚动、两栏纵向同步、`@@` hunk 分隔与「上一处 / 下一处改动」跳转，配对上的删 / 增行再做词级高亮），游标分页的提交历史，以及**手绘 SVG 分支拓扑图**。Git 面板为上下两个可折叠区块——更改在上、提交历史在下，同屏可见、中缝拖拽调比例；顶部仓库栏下拉切换仓库，分支徽章一键切换历史查看分支（不 checkout），刷新 / Pull / Push 也收在栏上。
+VS Code 风格的 **Changes 面板**（Staged / Changes / Untracked 分组，单文件或全量 stage / discard，`Ctrl+Enter` 提交），并排 / 内联双视图 Diff（长行横向滚动、两栏纵向同步、`@@` hunk 分隔与「上一处 / 下一处改动」跳转，配对上的删 / 增行再做词级高亮），游标分页的提交历史，以及**手绘 SVG 分支拓扑图**。Git 面板为上下两个可折叠区块——更改在上、提交历史在下，同屏可见、中缝拖拽调比例；顶部仓库栏下拉切换仓库（monorepo 里一串同名 `api` 会各自带上父级路径区分），分支徽章一键切换历史查看分支（不 checkout），刷新 / Pull / Push 也收在栏上。
 
 **Worktree 管理**对多 Agent 并行开发特别有用：项目根目录本身不是仓库时会**向下扫描子仓库**并按主工作区归并，组头可勾选多选 / 全选，**一次为每个勾选的仓库各建一个 worktree**。建好的 worktree 可以一键「设为项目」挂到主项目下面，或者直接开个终端进去。**AI agent 在终端里把 worktree 删掉之后**，回到窗口时列表会自动把目录已消失的子项目连同终端资源一起收掉，不留失效条目。
 
@@ -143,7 +143,7 @@ VS Code 风格的 **Changes 面板**（Staged / Changes / Untracked 分组，单
 | Git / 文件 | git2（libgit2）· notify + ignore |
 | 用量统计 | rusqlite 本地账本 · 自绘趋势图 |
 | 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`） |
-| 测试 | **1754 个 Rust 测试**（29 个测试目标） |
+| 测试 | **1757 个 Rust 测试**（29 个测试目标） |
 
 ---
 
