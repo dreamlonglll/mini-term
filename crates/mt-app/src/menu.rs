@@ -138,6 +138,12 @@ pub enum MenuEntry {
 /// 一个可点的菜单项。
 pub struct MenuItem {
     label: SharedString,
+    /// 标题下面那行弱化的补充说明(路径/出处一类),**只展示不参与匹配**。
+    ///
+    /// 原版没有这一行 —— 它是给「光看标题分不出是哪一个」的列表补出处用的:
+    /// Git 面板的仓库下拉里,仓库名取的是目录叶子名,monorepo 里
+    /// `services/api`、`legacy/api` 会排出好几个一模一样的「api」。
+    detail: Option<SharedString>,
     /// 右侧那串弱化的快捷键提示,**只展示不参与匹配**(与原版同)。
     shortcut: Option<SharedString>,
     danger: bool,
@@ -154,6 +160,7 @@ impl MenuItem {
     pub fn new(label: impl Into<SharedString>) -> Self {
         Self {
             label: label.into(),
+            detail: None,
             shortcut: None,
             danger: false,
             disabled: false,
@@ -170,6 +177,15 @@ impl MenuItem {
 
     pub fn shortcut(mut self, label: impl Into<SharedString>) -> Self {
         self.shortcut = Some(label.into());
+        self
+    }
+
+    /// 标题底下再挂一行弱化的补充说明(见 [`detail`](Self::detail) 字段注释)。
+    ///
+    /// 行高会因此变成两行 —— 只给「标题本身不足以认人」的列表用,别拿它当
+    /// 通用的说明位铺满整个菜单。
+    pub fn detail(mut self, text: impl Into<SharedString>) -> Self {
+        self.detail = Some(text.into());
         self
     }
 
@@ -999,7 +1015,22 @@ impl ContextMenu {
                     cx.notify();
                 }
             }))
-            .child(div().child(item.label.clone()));
+            // 有副标题时左侧变成两行一列;快捷键仍按整块垂直居中(`items_center`)
+            .child(match item.detail.clone() {
+                Some(detail) => div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(1.0))
+                    .min_w(px(0.0))
+                    .child(div().child(item.label.clone()))
+                    .child(
+                        div()
+                            .text_size(ui::font_px(11.0))
+                            .text_color(ui::text_muted())
+                            .child(detail),
+                    ),
+                None => div().child(item.label.clone()),
+            });
 
         if let Some(shortcut) = item.shortcut.clone() {
             row = row.child(

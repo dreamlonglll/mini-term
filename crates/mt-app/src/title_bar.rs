@@ -2,10 +2,15 @@
 //!
 //! ```text
 //! ┌─ 32px ─────────────────────────────────────────────────────────────────┐
-//! │ [mac 交通灯占位] logo Mini-Term v0.13.1 │ ●项目名 ▾  ● │  拖拽  │ ─ □ ✕ │
-//! │ └──────── Drag ────────┘                 胶囊   灯   └Drag┘  └Min/Max/Close┘
+//! │ [mac 交通灯占位] logo Mini-Term v0.13.1 │ ●项目名 ▾ │    拖拽   │ ─ □ ✕ │
+//! │ └──────── Drag ────────┘                 胶囊      └─Drag─┘  └Min/Max/Close┘
 //! └────────────────────────────────────────────────────────────────────────┘
 //! ```
+//!
+//! 胶囊右边原本还有一颗**全局 AI 状态灯**(所有项目取最紧急的一档,点它跳到
+//! 「下一件该我做的事」)。2026-09-04 按用户要求撤掉 —— 胶囊自己左侧那颗点已经
+//! 表达了当前项目的档位,并排两颗色点反而要人分辨谁是谁。跳转能力没丢:托盘图标
+//! 左键做的是同一件事,胶囊下拉里逐项也各自跳自己那个项目。
 //!
 //! # 拖拽与三键:全部走 gpui 原生的 [`WindowControlArea`]
 //!
@@ -453,8 +458,6 @@ pub struct TitleBar {
     /// 还原焦点会把光标从新终端上抢走。
     prev_focus: Option<FocusHandle>,
     hovered_control: Option<Control>,
-    /// 全局状态灯被悬停(原版 `group-hover:scale-125`)。
-    light_hovered: bool,
 }
 
 impl TitleBar {
@@ -466,7 +469,6 @@ impl TitleBar {
             focus: cx.focus_handle(),
             prev_focus: None,
             hovered_control: None,
-            light_hovered: false,
         }
     }
 
@@ -750,83 +752,23 @@ impl TitleBar {
         .into_any_element()
     }
 
-    /// 全局状态灯。点一下跳到「下一件该我做的事」(不限项目)。
-    fn status_light(
-        &self,
-        light: TitleBarLight,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let color = light_color(light);
-        let alpha = if light == TitleBarLight::Idle { 0.45 } else { 1.0 };
-        // 原版 `group-hover:scale-125`(8px → 10px)
-        let size = if self.light_hovered { 10.0 } else { 8.0 };
-        let tip = light.i18n_key();
-
-        let dot = div()
-            .w(px(size))
-            .h(px(size))
-            .rounded_full()
-            .bg(ui::with_alpha(color, alpha));
-        // `working` 档闪烁(`animate-blink`),相位来自低频泵
-        // (`mt_ui::motion::pulse_phase`)—— 静态档连泵都不挂。
-        // ⚠️ 还要过减弱动效的闸(`mt_ui::motion`):原版的通配规则把
-        // `.animate-blink` 停在第一帧 —— 它**不在** reduce 的豁免名单里,
-        // 装机版在用户机器上就是不闪的。
-        let dot: AnyElement = if light == TitleBarLight::Working && mt_ui::motion::blinks() {
-            let phase = blink_phase(mt_ui::motion::pulse_phase(
-                std::time::Duration::from_millis(800),
-                window,
-                cx,
-            ));
-            let side = px(size - (size * 0.25) * phase);
-            dot.w(side)
-                .h(side)
-                .opacity(1.0 - 0.8 * phase)
-                .into_any_element()
-        } else {
-            dot.into_any_element()
-        };
-
-        div()
-            .id("titlebar-light")
-            .h_full()
-            // 原版是品牌容器 `gap-1.5` + 按钮自己的 `px-1.5`
-            .ml(px(6.0))
-            .px(px(6.0))
-            .flex()
-            .flex_none()
-            .items_center()
-            .justify_center()
-            .cursor_pointer()
-            .on_hover(cx.listener(|this: &mut Self, hovered: &bool, _window, cx| {
-                if this.light_hovered != *hovered {
-                    this.light_hovered = *hovered;
-                    cx.notify();
-                }
-            }))
-            .tooltip(move |window, cx| Tooltip::new(t("app", tip)).build(window, cx))
-            .on_click(cx.listener(|this, _event, window, cx| {
-                let store = this.store.clone();
-                focus_attention_target(&store, None, window, cx);
-            }))
-            .child(dot)
-            .into_any_element()
-    }
 }
 
 impl Render for TitleBar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (light, entries, active_project, active_project_id) = {
+        let (entries, active_project, active_project_id) = {
             let store = self.store.read(cx);
-            // 状态灯与胶囊下拉**合成一次全 pane 遍历**(`title_bar_snapshot`)。
-            // 拆成两个 getter 会各扫一遍 `pane_refs(None)`,而标题栏挂了
+            // 胶囊下拉要的是**一次全 pane 遍历**(`title_bar_snapshot`)。拆成两个
+            // getter 会各扫一遍 `pane_refs(None)`,而标题栏挂了
             // `window_control_area`、套不了 view 级缓存,那两遍是每帧都来的。
             // done 判据仍是 `aiDoneOrder`(不看窗口焦点),与托盘的
             // `unreadDonePaneIds` 口径**有意不同**。
-            let (light, projects) = store.title_bar_snapshot();
+            //
+            // 元组第一位是全局状态灯的档位:灯撤掉了(见模块注释),但它与逐项档位
+            // 本来就是同一趟遍历里顺手归并出来的,留着不多一次扫描,也省得动
+            // `title_bar_snapshot` 的签名与它那几条单测。
+            let (_light, projects) = store.title_bar_snapshot();
             (
-                light,
                 projects.entries,
                 store.active_project().map(|p| p.name.clone()),
                 store.active_project_id.clone(),
@@ -906,7 +848,6 @@ impl Render for TitleBar {
                         cx,
                     ))
             }))
-            .child(self.status_light(light, window, cx))
             // 中段留白 —— 主要的拖拽区
             .child(
                 div()
