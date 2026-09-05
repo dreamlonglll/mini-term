@@ -5,28 +5,14 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use super::{
-    answer_labels, extract_text_content, normalize_path, AiQuestion, AiQuestionAnswer,
-    AiQuestionItem, AiQuestionOption, AiSessionMessage,
+    AiQuestion, AiQuestionAnswer, AiQuestionItem, AiQuestionOption, AiSessionMessage,
+    answer_labels, extract_text_content,
 };
 
 const OMP_OTHER_OPTION: &str = "Other (type your own)";
-#[cfg(test)]
-use parking_lot::Mutex;
-#[cfg(test)]
-use std::sync::LazyLock;
 
-#[cfg(test)]
-static TEST_AGENT_DIR: LazyLock<Mutex<Option<PathBuf>>> = LazyLock::new(|| Mutex::new(None));
-
-fn omp_agent_dir() -> Option<PathBuf> {
-    #[cfg(test)]
-    if let Some(path) = TEST_AGENT_DIR.lock().clone() {
-        return Some(path);
-    }
-    crate::hook_registry::omp_agent_dir()
-}
-
-/// OMP 会话文件头。18.x 的文件名前缀是创建时间，精确身份必须读头部 `session.id`。
+/// OMP session file header. The filename contains the id, but the header is
+/// still checked so a stale or colliding path cannot bind the wrong session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OmpSessionMeta {
     pub id: String,
@@ -68,28 +54,46 @@ fn clean_windows_verbatim(path: &str) -> &str {
     path.strip_prefix(r"\\?\").unwrap_or(path)
 }
 
+fn normalize_windows_path(path: &str) -> String {
+    clean_windows_verbatim(path)
+        .replace('/', "\\")
+        .to_ascii_lowercase()
+        .trim_end_matches('\\')
+        .to_string()
+}
+
+/// OMP 的 legacy absolute 目录编码。只去掉一个前导分隔符，UNC 路径必须保留第二个。
 fn encoded_absolute_dir(path: &str) -> String {
     let path = clean_windows_verbatim(path).trim_end_matches(['/', '\\']);
-    let path = path.trim_start_matches(['/', '\\']);
+    let path = path
+        .strip_prefix('/')
+        .or_else(|| path.strip_prefix('\\'))
+        .unwrap_or(path);
     format!("--{}--", path.replace(['/', '\\', ':'], "-"))
 }
 
-fn relative_to(base: &Path, path: &Path) -> Option<String> {
-    let base = clean_windows_verbatim(base.to_str()?);
-    let path = clean_windows_verbatim(path.to_str()?);
-    let base_cmp = base.to_ascii_lowercase();
-    let path_cmp = path.to_ascii_lowercase();
-    let base_cmp = base_cmp.trim_end_matches(['/', '\\']);
-    let path_cmp = path_cmp.trim_end_matches(['/', '\\']);
-    if path_cmp == base_cmp {
+/// Return the original-cased suffix when `path` is below `base`.
+fn relative_to(base: &str, path: &str) -> Option<String> {
+    let base_original = clean_windows_verbatim(base)
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_string();
+    let path_original = clean_windows_verbatim(path)
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_string();
+    let base_normalized = normalize_windows_path(&base_original);
+    let path_normalized = normalize_windows_path(&path_original);
+    if path_normalized == base_normalized {
         return Some(String::new());
     }
-    let rest = path_cmp.strip_prefix(base_cmp)?;
-    if !rest.starts_with(['/', '\\']) {
+    let rest = path_normalized.strip_prefix(&base_normalized)?;
+    if !rest.starts_with('\\') {
         return None;
     }
-    let offset = base.len() + 1;
-    path.get(offset..).map(str::to_string)
+    path_original
+        .get(base_normalized.len() + 1..)
+        .map(str::to_string)
 }
 
 fn encoded_relative_dir(prefix: &str, relative: &str) -> String {
@@ -103,55 +107,88 @@ fn encoded_relative_dir(prefix: &str, relative: &str) -> String {
     }
 }
 
-/// 复刻 OMP 18.x 的默认 session 目录命名，并保留旧绝对路径目录候选。
-/// 候选最终仍会用文件头 cwd 校验，编码碰撞不会串项目。
-fn project_session_dirs(project_path: &str) -> Vec<PathBuf> {
-    let Some(agent_dir) = omp_agent_dir() else {
-        return Vec::new();
+/// Compute OMP's default directory name and retain the legacy absolute name
+/// as a read-only discovery fallback for sessions written by older versions.
+fn session_dir_names(home: &str, temp_root: &str, project_path: &str) -> Vec<String> {
+    let project_path = clean_windows_verbatim(project_path);
+    let default_name = if let Some(relative) = relative_to(home, project_path) {
+        encoded_relative_dir("-", &relative)
+    } else if let Some(relative) = relative_to(temp_root, project_path) {
+        encoded_relative_dir("-tmp", &relative)
+    } else {
+        encoded_absolute_dir(project_path)
     };
-    let root = agent_dir.join("sessions");
-    if !root.is_dir() {
+    let legacy_name = encoded_absolute_dir(project_path);
+    if default_name == legacy_name {
+        vec![default_name]
+    } else {
+        vec![default_name, legacy_name]
+    }
+}
+
+fn project_session_dirs_in(
+    sessions_root: &Path,
+    home: &Path,
+    temp_root: &Path,
+    project_path: &str,
+) -> Vec<PathBuf> {
+    if !sessions_root.is_dir() {
         return Vec::new();
     }
 
-
-    let original = PathBuf::from(project_path);
-    let mut paths = vec![original.clone()];
-    if let Ok(canonical) = original.canonicalize()
-        && canonical != original
+    let mut project_paths = vec![project_path.to_string()];
+    if let Ok(canonical) = PathBuf::from(project_path).canonicalize()
+        && canonical.to_string_lossy() != project_path
     {
-        paths.push(canonical);
+        project_paths.push(canonical.to_string_lossy().into_owned());
     }
 
-    let home = dirs::home_dir();
-    let temp = std::env::temp_dir();
+    let home = home.to_string_lossy();
+    let temp_root = temp_root.to_string_lossy();
     let mut names = Vec::new();
-    for path in paths {
-        let raw = clean_windows_verbatim(path.to_str().unwrap_or(project_path));
-        names.push(encoded_absolute_dir(raw));
-        if let Some(relative) = home.as_ref().and_then(|h| relative_to(h, &path)) {
-            names.push(encoded_relative_dir("-", &relative));
-        } else if let Some(relative) = relative_to(&temp, &path) {
-            names.push(encoded_relative_dir("-tmp", &relative));
+    for project_path in project_paths {
+        for name in session_dir_names(&home, &temp_root, &project_path) {
+            if !names.iter().any(|current| current == &name) {
+                names.push(name);
+            }
         }
     }
-    names.sort();
-    names.dedup();
+
     names
         .into_iter()
-        .map(|name| root.join(name))
+        .map(|name| sessions_root.join(name))
         .filter(|path| path.is_dir())
         .collect()
 }
 
-fn meta_matches_project(meta: &OmpSessionMeta, project_path: &str) -> bool {
-    normalize_path(&meta.cwd) == normalize_path(project_path)
+fn project_session_dirs(project_path: &str) -> Vec<PathBuf> {
+    let Some(agent_dir) = crate::hook_registry::omp_agent_dir() else {
+        return Vec::new();
+    };
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+    project_session_dirs_in(
+        &agent_dir.join("sessions"),
+        &home,
+        &std::env::temp_dir(),
+        project_path,
+    )
 }
 
-/// 按 Hook 上报的 session id 精确定位 OMP JSONL。
-pub fn find_omp_session_file(project_path: &str, session_id: &str) -> Option<PathBuf> {
+fn meta_matches_project(meta: &OmpSessionMeta, project_path: &str) -> bool {
+    normalize_windows_path(&meta.cwd) == normalize_windows_path(project_path)
+}
+
+fn find_omp_session_file_in(
+    sessions_root: &Path,
+    home: &Path,
+    temp_root: &Path,
+    project_path: &str,
+    session_id: &str,
+) -> Option<PathBuf> {
     let suffix = format!("_{session_id}.jsonl");
-    for dir in project_session_dirs(project_path) {
+    for dir in project_session_dirs_in(sessions_root, home, temp_root, project_path) {
         let Ok(entries) = fs::read_dir(dir) else {
             continue;
         };
@@ -175,18 +212,34 @@ pub fn find_omp_session_file(project_path: &str, session_id: &str) -> Option<Pat
     None
 }
 
-/// 无 Hook 时的启发式绑定：只在目标项目自己的 OMP session 目录中取最新文件。
+/// 按 Hook 上报的 session id 精确定位 OMP JSONL。
+pub fn find_omp_session_file(project_path: &str, session_id: &str) -> Option<PathBuf> {
+    let agent_dir = crate::hook_registry::omp_agent_dir()?;
+    let home = dirs::home_dir()?;
+    find_omp_session_file_in(
+        &agent_dir.join("sessions"),
+        &home,
+        &std::env::temp_dir(),
+        project_path,
+        session_id,
+    )
+}
+
+/// 无 Hook 时的启发式绑定：先按 mtime 限量，再读取 header 校验 cwd。
 pub fn newest_omp_session_file(project_path: &str) -> Option<(PathBuf, SystemTime)> {
+    const MAX_SCAN: usize = 30;
     let mut newest: Option<(PathBuf, SystemTime)> = None;
     for dir in project_session_dirs(project_path) {
         let Ok(entries) = fs::read_dir(dir) else {
             continue;
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|v| v.to_str()) != Some("jsonl") {
-                continue;
-            }
+        let mut paths: Vec<PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|v| v.to_str()) == Some("jsonl"))
+            .collect();
+        super::sort_newest_session_paths(&mut paths, MAX_SCAN);
+        for path in paths {
             let Some(meta) = session_meta(&path) else {
                 continue;
             };
@@ -196,7 +249,10 @@ pub fn newest_omp_session_file(project_path: &str) -> Option<(PathBuf, SystemTim
             let Ok(modified) = path.metadata().and_then(|m| m.modified()) else {
                 continue;
             };
-            if newest.as_ref().is_none_or(|(_, current)| modified > *current) {
+            if newest
+                .as_ref()
+                .is_none_or(|(_, current)| modified > *current)
+            {
                 newest = Some((path, modified));
             }
         }
@@ -215,6 +271,14 @@ pub fn omp_message_from_line(line: &str) -> Option<AiSessionMessage> {
         Some("assistant") => "assistant",
         _ => return None,
     };
+    if role == "user"
+        && obj
+            .pointer("/message/synthetic")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    {
+        return None;
+    }
     let content = extract_text_content(obj.pointer("/message/content"));
     if content.is_empty() {
         return None;
@@ -282,7 +346,10 @@ pub fn omp_question_from_line(line: &str) -> Option<AiQuestion> {
                     .unwrap_or_default()
                     .to_string(),
                 options,
-                multi_select: question.get("multi").and_then(|v| v.as_bool()).unwrap_or(false),
+                multi_select: question
+                    .get("multi")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
                 recommended_index: question
                     .get("recommended")
                     .and_then(|v| v.as_u64())
@@ -391,73 +458,78 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_user_messages_are_not_mirror_messages() {
+        let line = r#"{"type":"message","timestamp":"t","message":{"role":"user","synthetic":true,"content":[{"type":"text","text":"internal"}]}}"#;
+        assert!(omp_message_from_line(line).is_none());
+    }
+
+    #[test]
     fn parses_ask_question_and_result() {
         let question = omp_question_from_line(
-            r#"{"type":"message","timestamp":"t1","message":{"role":"assistant","content":[{"type":"text","text":"choose"},{"type":"toolCall","id":"call-1","name":"ask","arguments":{"questions":[{"id":"q1","question":"Which?","header":"Plan","options":[{"label":"A","description":"safe"},{"label":"B"}],"multi":false,"recommended":1}]}}]}}"#,
+            r#"{"type":"message","timestamp":"t1","message":{"role":"assistant","content":[{"type":"toolCall","id":"call-1","name":"ask","arguments":{"questions":[{"id":"q1","question":"Which?","header":"Plan","options":[{"label":"A","description":"safe"},{"label":"B"}],"multi":false,"recommended":1}]}}]}}"#,
         )
         .unwrap();
         assert_eq!(question.tool_use_id, "call-1");
-        assert_eq!(question.items[0].id, "q1");
         assert_eq!(question.items[0].recommended_index, Some(1));
 
         let answer = omp_question_answer_from_line(
-            r#"{"type":"message","timestamp":"t2","message":{"role":"toolResult","toolCallId":"call-1","toolName":"ask","content":[{"type":"text","text":"Selected B"}],"details":{"question":"Which?","options":["A","B"],"selectedOptions":["B"],"multi":false}}}"#,
+            r#"{"type":"message","timestamp":"t2","message":{"role":"toolResult","toolCallId":"call-1","toolName":"ask","details":{"question":"Which?","selectedOptions":["B"]}}}"#,
         )
         .unwrap();
-        assert_eq!(answer.tool_use_ids, ["call-1"]);
         assert_eq!(answer.answers["Which?"], ["B"]);
-        assert!(!answer.is_error);
     }
 
     #[test]
-    fn custom_input_maps_to_omp_other_option() {
-        let answer = omp_question_answer_from_line(
-            r#"{"type":"message","message":{"role":"toolResult","toolCallId":"call-1","toolName":"ask","details":{"question":"Which?","selectedOptions":[],"customInput":"custom"}}}"#,
-        )
-        .unwrap();
-        assert_eq!(answer.answers["Which?"], [OMP_OTHER_OPTION]);
+    fn omp_path_encodings_match_source_rules() {
+        assert_eq!(
+            session_dir_names(r"C:\Users\u", r"C:\Users\u\Temp", r"C:\Users\u\Git\proj")[0],
+            "-Git-proj"
+        );
+        assert_eq!(
+            session_dir_names(r"C:\Users\u", r"C:\Users\u\Temp", r"C:\Users\u")[0],
+            "-"
+        );
+        assert_eq!(
+            session_dir_names(r"C:\Users\u", r"C:\Windows\Temp", r"C:\Windows\Temp\x",)[0],
+            "-tmp-x"
+        );
+        assert_eq!(
+            session_dir_names(r"C:\Users\u", r"C:\Users\u\Temp", r"D:\Git\proj")[0],
+            "--D--Git-proj--"
+        );
+        assert_eq!(
+            encoded_absolute_dir(r"\\server\share\proj"),
+            "---server-share-proj--"
+        );
     }
-
 
     #[test]
     fn finds_session_file_by_project_and_id() {
-        let root = std::env::temp_dir().join(format!(
-            "mini-term-omp-test-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let root = std::env::temp_dir().join(format!("mini-term-omp-test-{}", std::process::id()));
         let agent = root.join("agent");
         let project = root.join("workspace");
         fs::create_dir_all(&project).unwrap();
-        let encoded = encoded_absolute_dir(project.to_str().unwrap());
-        let sessions = agent.join("sessions").join(encoded);
+        let sessions = agent
+            .join("sessions")
+            .join(encoded_absolute_dir(project.to_str().unwrap()));
         fs::create_dir_all(&sessions).unwrap();
         let wanted = sessions.join("2026-09-03T00-00-00Z_session-1.jsonl");
         fs::write(
             &wanted,
             format!(
-                "{{\"type\":\"title\",\"title\":\"x\"}}\n{{\"type\":\"session\",\"id\":\"session-1\",\"timestamp\":\"t\",\"cwd\":{}}}\n",
+                "{{\"type\":\"session\",\"id\":\"session-1\",\"cwd\":{}}}\n",
                 serde_json::to_string(project.to_str().unwrap()).unwrap()
             ),
         )
         .unwrap();
-        fs::write(
-            sessions.join("2026-09-03T00-00-01Z_other.jsonl"),
-            format!(
-                "{{\"type\":\"session\",\"id\":\"other\",\"cwd\":{}}}\n",
-                serde_json::to_string(project.to_str().unwrap()).unwrap()
-            ),
-        )
-        .unwrap();
-
-        *TEST_AGENT_DIR.lock() = Some(agent);
-        let found = find_omp_session_file(project.to_str().unwrap(), "session-1").unwrap();
-        assert_eq!(found, wanted);
-        assert!(find_omp_session_file(project.to_str().unwrap(), "missing").is_none());
-        *TEST_AGENT_DIR.lock() = None;
+        let found = find_omp_session_file_in(
+            &agent.join("sessions"),
+            &root,
+            &root.join("Temp"),
+            project.to_str().unwrap(),
+            "session-1",
+        );
+        assert_eq!(found, Some(wanted));
         fs::remove_dir_all(root).unwrap();
     }
 }

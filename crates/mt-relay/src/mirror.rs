@@ -1,10 +1,16 @@
-//! 对话镜像：会话记录（JSONL）的增量解析 → 镜像消息序列。
+//! 对话镜像:会话记录(JSONL)的增量解析 → 镜像消息序列。
 //!
-//! 数据源是 Claude/Codex/Grok/OMP 会话记录文件，不是终端原始输出。
-//! 移动端按 pane 订阅；桌面端优先按 hook 上报的 session id 精确绑定，
-//! 无 hook 时退回“项目最新文件 + AI 启动时刻下限”的启发式绑定。
-//! 两层都保证本轮会话未落盘时返回空镜像，不绑定同项目的其他会话。
-//! v1 限制：仅本机来源的会话记录。
+//! 数据源是 Claude/Codex/Grok/OMP 会话记录文件,不是终端原始输出(docs/adr/0001)。
+//! 移动端按 pane 订阅;桌面端把 pane 绑定到其项目目录下**最新**的会话文件,
+//! 轮询增量解析新行并推送。用轮询而非复用 mt-project 的 notify 监听是有意取舍:
+//! 镜像除了"文件长大"还要发现"更新的会话文件出现"(换绑),对单文件挂 notify
+//! 覆盖不了后者;1s 轮询两种情况一并处理,订阅通常只有一个,代价可忽略。
+//!
+//! 绑定策略分两层:hook 上报过会话身份(pty→session_id)时精确绑定该会话的
+//! 文件,同项目多个 AI pane 各绑各的会话;未启用 hook 时退回"项目最新文件 +
+//! AI 启动时刻下限"启发式(此路径保留 v1 限制:多 pane 共同镜像最新会话)。
+//! 两层都保证:本轮会话未落盘时(首条消息前)给空镜像,不错绑别的会话。
+//! v1 限制:仅本机(Windows 宿主)来源的会话记录。
 
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
@@ -14,13 +20,13 @@ use std::time::SystemTime;
 use mt_ai::sessions as ai_sessions;
 use mt_relay_protocol::{MirrorMessage, MirrorQuestionItem, MirrorQuestionOption};
 
-/// 该 agent 是否有本模块能解析的会话记录(Claude / Codex / Grok 三家)。
+/// 该 agent 是否有本模块能解析的会话记录(Claude / Codex / Grok / OMP 四家)。
 ///
 /// 判定与其测试随 `ai_sessions.rs` 一起迁进了 mt-ai(那边是会话记录格式的归属方),
 /// 这里 re-export 保留原调用点名字。**红线**:输入检测能认出的 agent 比这宽
 /// (pi / opencode 也在 `AI_COMMANDS` 里),它们**没有**可解析的记录文件,调用方
 /// 必须据此跳过启发式绑定 —— `resolve_session_file` 只按项目找"最新的
-/// claude/codex/grok 记录",对一个 pi pane 调它会把同项目里别家的对话贴到这个
+/// claude/codex/grok/omp 记录",对一个 pi pane 调它会把同项目里别家的对话贴到这个
 /// pane 上(串台)。宁可空镜像。
 pub use mt_ai::sessions::agent_has_session_log;
 
@@ -36,7 +42,7 @@ pub enum MirrorAgent {
     Omp,
 }
 
-/// 挂起中的 agent 提问：卡片已下发、尚未见到作答或打断。
+/// 挂起中的 agent 提问:卡片已下发、尚未见到作答或打断。
 /// Claude/Codex/Grok/OMP 四家共用同一套挂起与作答对账。
 struct PendingQuestion {
     /// 提问卡片消息的镜像 seq(移动端作答以此定位)
@@ -276,8 +282,8 @@ impl MirrorParser {
 
     /// 产出提问卡片并登记挂起。
     ///
-    /// 三家 TUI 都会在选项末尾自动追加一个会话记录里没有的兜底项
-    /// (Claude「Other」/Codex「None of the above」/Grok「z. Type your answer here」),
+    /// 四家 TUI 都会在选项末尾自动追加一个会话记录里没有的兜底项
+    /// (Claude「Other」/Codex「None of the above」/Grok「z. Type your answer here」/OMP「Other (type your own)」),
     /// 这里补进卡片与挂起,让移动端也点得到它——追加在尾部,已有选项的下标映射
     /// 不受影响。选中后 TUI 进入文本输入态(Codex 直接提交),移动端用下方
     /// 指令输入框接着打字即可。
@@ -289,6 +295,10 @@ impl MirrorParser {
             MirrorAgent::Omp => "Other (type your own)",
         };
         for item in &mut question.items {
+            // OMP 在追加 Other 前按真实选项范围钳位 recommended。
+            if let Some(index) = item.recommended_index.as_mut() {
+                *index = (*index).min(item.options.len().saturating_sub(1));
+            }
             // 多选题 v1 只展示不可点选,不补
             if !item.multi_select {
                 item.options.push(ai_sessions::AiQuestionOption {
@@ -359,19 +369,22 @@ impl MirrorParser {
             return None;
         }
         let option = item.options.get(option_index as usize)?;
-        // Grok 自由输入项不在方向键导航序列里，热键 z 直达输入态。
+        // grok 的自由输入项(TUI 里的 z 项)不在方向键导航序列里:↓×N 会停在
+        // 最后一个编号项、回车把它交出去(踩过)。热键 z 直达输入态,后续
+        // 文本由用户经指令输入框补上。该项永远是我们追加在尾部的那一个
         let is_grok_free_input = matches!(self.agent, MirrorAgent::Grok)
             && option_index as usize == item.options.len() - 1;
-        let keys = if is_grok_free_input {
+        let is_omp_other = matches!(self.agent, MirrorAgent::Omp)
+            && option.label == "Other (type your own)";
+        let initial = if matches!(self.agent, MirrorAgent::Omp) {
+            item.recommended_index.unwrap_or(0)
+        } else {
+            0
+        };
+        let target = option_index as usize;
+        let mut keys = if is_grok_free_input {
             "z".to_string()
         } else {
-            // OMP ask 的 recommended 是初始高亮；其余 agent 从首项开始。
-            let initial = if matches!(self.agent, MirrorAgent::Omp) {
-                item.recommended_index.unwrap_or(0).min(item.options.len() - 1)
-            } else {
-                0
-            };
-            let target = option_index as usize;
             let mut keys = if target >= initial {
                 "\x1b[B".repeat(target - initial)
             } else {
@@ -380,6 +393,15 @@ impl MirrorParser {
             keys.push('\r');
             keys
         };
+        // OMP 多题最后一题普通选项后进入 Submit 页,需要第二个 CR。
+        // Other 会打开输入态,不能提交第二个 CR。
+        if matches!(self.agent, MirrorAgent::Omp)
+            && question_index + 1 == pending.question.items.len() as u32
+            && pending.question.items.len() > 1
+            && !is_omp_other
+        {
+            keys.push('\r');
+        }
         Some(AnswerKeys {
             keys,
             label: option.label.clone(),
@@ -1163,6 +1185,41 @@ mod tests {
         assert_eq!(marks[0].kind.as_deref(), Some("questionAnswered"));
         assert_eq!(marks[0].ref_seq, Some(2));
         assert_eq!(marks[0].labels, ["B"]);
+    }
+
+    #[test]
+    fn parser_omp_ignores_synthetic_user_without_clearing_question() {
+        let mut parser = MirrorParser::new(MirrorAgent::Omp);
+        let ask = r#"{"type":"message","timestamp":"t1","message":{"role":"assistant","content":[{"type":"toolCall","id":"ask-synthetic","name":"ask","arguments":{"questions":[{"id":"q1","question":"Which?","options":[{"label":"A"}]}]}}]}}"#;
+        parser.feed(format!("{ask}\n").as_bytes());
+        let synthetic = r#"{"type":"message","timestamp":"t2","message":{"role":"user","synthetic":true,"content":[{"type":"text","text":"internal"}]}}"#;
+        assert!(parser.feed(format!("{synthetic}\n").as_bytes()).is_empty());
+        assert!(parser.answer_keys(0, "ask-synthetic", 0, 0).is_some());
+    }
+
+    #[test]
+    fn parser_omp_clamps_recommended_before_other() {
+        let mut parser = MirrorParser::new(MirrorAgent::Omp);
+        let ask = r#"{"type":"message","timestamp":"t1","message":{"role":"assistant","content":[{"type":"toolCall","id":"ask-clamp","name":"ask","arguments":{"questions":[{"id":"q1","question":"Which?","options":[{"label":"A"},{"label":"B"}],"recommended":99}]}}]}}"#;
+        parser.feed(format!("{ask}\n").as_bytes());
+        assert_eq!(parser.answer_keys(0, "ask-clamp", 0, 1).unwrap().keys, "\r");
+        assert_eq!(
+            parser.answer_keys(0, "ask-clamp", 0, 2).unwrap().keys,
+            "\x1b[B\r"
+        );
+    }
+
+    #[test]
+    fn parser_omp_multi_question_submits_last_choice_but_not_other() {
+        let mut parser = MirrorParser::new(MirrorAgent::Omp);
+        let ask = r#"{"type":"message","timestamp":"t1","message":{"role":"assistant","content":[{"type":"toolCall","id":"ask-multi","name":"ask","arguments":{"questions":[{"id":"q1","question":"First?","options":[{"label":"A"}]},{"id":"q2","question":"Second?","options":[{"label":"B"}]}]}}]}}"#;
+        parser.feed(format!("{ask}\n").as_bytes());
+        parser.mark_answered(0);
+        assert_eq!(parser.answer_keys(0, "ask-multi", 1, 0).unwrap().keys, "\r\r");
+        assert_eq!(
+            parser.answer_keys(0, "ask-multi", 1, 1).unwrap().keys,
+            "\x1b[B\r"
+        );
     }
 
 

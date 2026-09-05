@@ -28,9 +28,9 @@
 //!   (只注册了 Claude 的用户必须放行);② 注册进 `~/.grok/hooks/` 的必须是
 //!   **不含空格的裸文件名**。
 //! - **Claude / Codex / Grok / OMP 有移动镜像可解析的会话记录**
-//!   ([`sessions::agent_has_session_log`])。opencode / pi 必须在镜像绑定时跳过，
+//!   ([`sessions::agent_has_session_log`])。opencode / pi 必须在镜像绑定时跳过,
 //!   否则会绑到同项目其它 agent 的最新会话文件。
-//! - **oh-my-pi(omp)的 hook 不走 sidecar**:它的扩展点是进程内加载的 TS 模块,
+//! - **oh-my-pi(omp) 的 hook 不走 sidecar**:它的扩展点是进程内加载的 TS 模块,
 //!   [`hook_registry`] 把自带的扩展整份写进 `~/.omp/agent/extensions/`,扩展在 omp
 //!   进程内 `fetch` 本地 hook 服务器,事件名翻译成与 Claude 同名的 PascalCase。
 //! - **hook 接收端原样保留**:端口(23456 起,冲突递增 5 次)、路由(`POST /hook`)、
