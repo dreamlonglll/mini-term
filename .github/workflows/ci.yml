@@ -1,10 +1,15 @@
 name: CI
 
+# 什么时候跑:
+# - 推 `v*` tag(发版):与 release.yml 并行,对账范围是上一个 `v*` tag 到本 tag 的
+#   全部变更(见下方 diff-base 的 tag 分支)。日常往分支 push **不跑** —— 本仓单人
+#   直推 main 为主,每次 push 都跑一遍两平台的全量 check + test 不值。
+# - pull_request:分支保护 `main-ci-gate` 要求 `Rust workspace` 这个 check 过了才能
+#   合(外部 PR 走这条),砍掉它 PR 会永远卡在 "waiting for status"。
+# - workflow_dispatch:想在某个分支上手动跑一次时用。
 on:
   push:
-    branches-ignore:
-      - 'dependabot/**'
-    tags-ignore:
+    tags:
       - 'v*'
   pull_request:
   workflow_dispatch:
@@ -35,10 +40,21 @@ jobs:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PUSH_BEFORE_SHA: ${{ github.event.before }}
           REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           if [ "$EVENT_NAME" = "pull_request" ]; then
             base="$PR_BASE_SHA"
+          elif [ "$REF_TYPE" = "tag" ]; then
+            # 发版 tag:变更行检查覆盖上一个 v* tag 之后的全部提交。tag push 的
+            # `before` 是全零,而 merge-base(HEAD, main) 就是 HEAD 自己,两条都给不出
+            # 有意义的范围。第一个 tag 没有前任就从根提交算。
+            prev="$(git describe --tags --abbrev=0 --match 'v*' HEAD^ 2>/dev/null || true)"
+            if [ -n "$prev" ]; then
+              base="$(git rev-parse "$prev^{commit}")"
+            else
+              base="$(git rev-list --max-parents=0 HEAD)"
+            fi
           elif [ "$REF_NAME" != "$DEFAULT_BRANCH" ]; then
             base="$(git merge-base HEAD "origin/$DEFAULT_BRANCH")"
           elif [ "$EVENT_NAME" = "push" ] && \
