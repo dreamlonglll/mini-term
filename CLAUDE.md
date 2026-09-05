@@ -90,6 +90,7 @@ reader 线程读 PTY 字节直接喂 `mt-terminal` 的 VT 状态机，UI 按帧�
 | `layout.db` | 界面布局（见下节） | 只有主程序（`mt-layout`） |
 | `usage.db` | 用量账本（可从 JSONL 再生） | `mt-usage` |
 | `hook-server.json` | hook 端口文件 | 主程序写，sidecar 读 |
+| `mini-term.log` | 装机版的 stderr/stdout（全部 `eprintln!`、panic、启动埋点）。只在进程没有控制台时接管，启动时超 2 MB 轮转成 `.log.1`；`MT_LOG_FILE=1` 可在控制台下强制落文件 | 主程序（`mt-app::logfile`） |
 
 ### config.json 为什么还在（且必须还在）
 

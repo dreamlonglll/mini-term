@@ -128,3 +128,37 @@ jobs:
 
       - name: Whitespace check
         run: git diff --check "${{ steps.diff-base.outputs.sha }}" HEAD
+
+  # 主力平台的编译门。clipboard / tray / frost / notify / dpapi / conpty / logfile
+  # 这些 cfg(windows) 模块在 ubuntu 作业里根本不进编译,此前只有发版时才第一次
+  # 编到它们。这里只做 check + 几个不拖 gpui 的 crate 的测试,不重复 rustfmt /
+  # clippy / i18n 对账(那些与平台无关,上面的作业已经管了)。
+  windows:
+    name: Windows check
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          workspaces: |
+            . -> target
+            sidecars -> sidecars/target
+
+      - name: Cargo check
+        run: cargo check --workspace --all-targets
+
+      - name: Sidecar check
+        run: cargo check --manifest-path sidecars/Cargo.toml --all-targets
+
+      # 真机才验得到的路径:ConPTY 起真进程、DPAPI 包裹主密钥、WSL UNC 解析。
+      # 这几个 crate 都不依赖 gpui,测试二进制几分钟内能编出来。
+      - name: Cargo test (Windows-specific crates)
+        run: cargo test -p mt-pty -p mt-secret -p mt-core -p mt-terminal

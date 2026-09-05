@@ -1,6 +1,7 @@
 // release 构建在 Windows 上走 GUI 子系统:console 子系统的 exe 从快捷方式/Explorer 启动
 // 会被 Windows 新开一个控制台窗口滚启动日志(装机版即此形态)。debug 不挂,保留 console
-// 让 cargo run 的日志照常附着当前终端;代价是 release 版 println!/eprintln! 全部静默丢弃。
+// 让 cargo run 的日志照常附着当前终端。GUI 子系统下 println!/eprintln! 本会被 std 静默
+// 丢弃,`logfile::install`(main 第一行)把它们接到 `{数据目录}/mini-term.log`。
 #![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 
 //! mini-term 的 GPUI 应用壳。
@@ -69,6 +70,7 @@ mod git_watch;
 mod git_worktree;
 mod hotkeys;
 mod i18n;
+mod logfile;
 mod markers;
 mod menu;
 mod mobile_panel;
@@ -504,8 +506,9 @@ impl Workspace {
             }
         });
 
-        // 恢复出来的布局已经把 PTY 补齐了,键盘焦点也该落到当前 pane 上 ——
-        // 否则用户得先点一下终端才能打字。
+        // 把焦点记到当前 pane 上。此刻 PTY 还没补(启动补 PTY 排在首帧之后,见
+        // `main` 末尾),`focus_pane` 只能先记下 `focused_pane_id`;终端实体建出来后
+        // 由那一段再调一次 `focus_pane` 把键盘焦点真正落上去。
         let initial = {
             let s = store.read(cx);
             s.active_project_id.clone().zip(
@@ -2050,8 +2053,8 @@ impl Render for Workspace {
 /// 任务都在各自线程里跑,默认 hook 只打消息与位置,事后从用户贴来的日志里认不出
 /// 是哪条线路。原 hook 链式调用在后,backtrace 行为(RUST_BACKTRACE)一个字不改。
 ///
-/// ⚠️ release 的 Windows GUI 子系统下 stderr 无处可去(见文件头 `windows_subsystem`
-/// 注释),这一行只在 dev 实例 / 控制台启动时看得见。
+/// release 的 Windows GUI 子系统下 stderr 由 [`logfile::install`] 接到
+/// `mini-term.log`(`main` 第一行,早于本钩子安装),装机版的 panic 于是也留档。
 fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -2072,8 +2075,13 @@ fn install_panic_hook() {
 }
 
 fn main() {
-    // 启动链路埋点的 T0。**必须是第一行** —— 往后每个 `startup_trace::mark`
-    // 打的都是相对这一刻的偏移(装机版 `lib.rs::run()` 同位置)。
+    // 装机版没有控制台,stderr 先接到 `mini-term.log`(见 `logfile` 模块注释)。
+    // 必须排在埋点之前:`startup_trace::init` 自己就要打第一条 `run() enter`。
+    // 有控制台时它是空操作,dev 实例的日志照旧附着当前终端。
+    logfile::install();
+    // 启动链路埋点的 T0。**紧随日志接管之后** —— 往后每个 `startup_trace::mark`
+    // 打的都是相对这一刻的偏移(装机版 `lib.rs::run()` 同位置);上面那一步只是
+    // 打开一个文件,毫秒级,不影响埋点的可比性。
     startup_trace::init();
     // 紧随其后装 panic 兜底:再往后的任何一行倒下都得留下可定位的一行日志。
     install_panic_hook();
@@ -2088,8 +2096,8 @@ fn main() {
         // 右键菜单层的状态是全局的(项目列表 / 文件树 / tab / 终端四处都要弹),
         // 必须早于任何视图建出来 —— 视图的右键回调里直接取它。
         menu::init(cx);
-        // toast 层同理,而且要更早一档:启动补 PTY(`hydrate_project`)就可能推
-        // 一条 WSL 提示,那发生在窗口打开**之前**。
+        // toast 层同理:任何视图建出来之前就位。启动补 PTY(`hydrate_project`)
+        // 可能推一条 WSL 提示 —— 它现在排在首帧之后,但 toast 层早就位一档不亏。
         toast::init(cx);
         // 粘贴转存的临时文件清理(24h),启动时跑一次。丢后台线程:它要 stat
         // 整个目录,不该占住首帧(装机版是在 Rust 侧 setup 里同步跑的)。
@@ -2182,11 +2190,11 @@ fn main() {
         // 窗口还没开,`window` 传 None —— Theme::change 只是少一次 refresh。
         store.update(cx, |store, cx| store.apply_theme_from_config(None, cx));
 
-        // 启动即把当前项目的终端补起来(布局是从 config.json 恢复的,PTY 当然没了)
+        // 当前项目的终端要补起来(布局是从 layout.db 恢复的,PTY 当然没了),但
+        // **不在这里补** —— 每个 pane 的 openpty + 进程 spawn 都在主线程串行走,
+        // 恢复六七个 pane 就是几百毫秒,放在开窗之前等于让首帧陪着等。挪到首帧
+        // 呈现之后(见下方 `open_window` 之后那段),窗口先出来,终端随后贴上。
         let active = store.read(cx).active_project_id.clone();
-        if let Some(project_id) = active {
-            store.update(cx, |store, cx| store.hydrate_project(&project_id, cx));
-        }
         startup_trace::mark("setup: config applied (layout restored)");
 
         // 退出前把配置刷下去(不等 500ms 防抖),顺手收掉 hook server 的端口文件
@@ -2224,6 +2232,7 @@ fn main() {
         // 上次退出时的窗口大小/位置/最大化态(存在 layout.db)。没存过 / 存的框
         // 已经不在任何一块屏幕上 → 回落默认居中 1280×800。
         let window_bounds = restore_window_bounds(store.read(cx).window_geometry(), cx);
+        let store_for_window = store.clone();
         let window = cx.open_window(
             WindowOptions {
                 window_bounds: Some(window_bounds),
@@ -2257,18 +2266,53 @@ fn main() {
                 window.on_window_should_close(cx, title_bar::allow_close);
                 // 窗口的第一层必须是 gpui_component::Root:Dialog / 通知 / Input
                 // 的焦点登记都挂在它身上(Root::update 取不到就直接 panic)。
-                let workspace = cx.new(|cx| Workspace::new(store, ai_events, window, cx));
+                let workspace =
+                    cx.new(|cx| Workspace::new(store_for_window, ai_events, window, cx));
                 cx.new(|cx| Root::new(workspace, window, cx))
             },
         );
-        if let Err(err) = window {
-            eprintln!("打开窗口失败: {err:#}");
-            return;
-        }
+        let window = match window {
+            Ok(window) => window,
+            Err(err) => {
+                eprintln!("打开窗口失败: {err:#}");
+                return;
+            }
+        };
         cx.activate(true);
         // 装机版最后一个节点是前端的 `show() call (main UI first frame done)`;
         // GPUI 侧窗口一建出来元素树就已经构造完(`Workspace::new` 是同步的),
         // 差的只有 GPU 那一帧,于是收在这里。
         startup_trace::mark("setup exit (window opened)");
+
+        // 启动补 PTY,排在**首帧呈现之后**。
+        //
+        // gpui 的 `on_request_frame` 每帧的顺序是「先跑 `on_next_frame` 回调,再
+        // draw + present」;`open_window` 在 Windows 上虽已同步 draw 过一次,却要等
+        // 事件循环里第一个 request_frame 才 present。所以只挂一层回调会在首帧
+        // present **之前**执行,等于没挪;套两层才落在第一帧呈现之后、第二帧开画
+        // 之前。外层顺手 `refresh()` 保证第二帧一定会来(Windows 有 vsync 线程
+        // 常驻驱动,另外两家不一定)。
+        //
+        // 代价是 PTY 晚一个 vsync 起步(十几毫秒),换来的是窗口不再陪 spawn 干等。
+        if let Some(project_id) = active {
+            let store = store.clone();
+            let _ = window.update(cx, |_, window, _| {
+                window.on_next_frame(move |window, _| {
+                    window.refresh();
+                    window.on_next_frame(move |window, cx| {
+                        store.update(cx, |store, cx| {
+                            store.hydrate_project(&project_id, cx);
+                            // `Workspace::new` 那一下只记住了 focused_pane_id,当时
+                            // 还没有 PTY 实体可聚焦;真正的键盘焦点在这里落到终端上,
+                            // 否则用户得先点一下才能打字。
+                            if let Some(pane_id) = store.active_pane_id(&project_id) {
+                                store.focus_pane(&project_id, &pane_id, window, cx);
+                            }
+                        });
+                        startup_trace::mark("hydrate: PTYs spawned (after first frame)");
+                    });
+                });
+            });
+        }
     });
 }

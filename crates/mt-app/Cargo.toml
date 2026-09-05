@@ -109,6 +109,9 @@ gpui = { workspace = true, features = ["x11", "wayland"] }
 # 版本跟随 gpui 已经在用的那个,不给依赖树引入第二份 windows crate。
 windows = { version = "0.61", features = [
     "Win32_Foundation",
+    # 装机版日志落盘(logfile.rs):GetStdHandle 判「有没有 stderr」,
+    # SetStdHandle 把 stderr / stdout 换成 mini-term.log 的句柄。
+    "Win32_System_Console",
     # 首启探测界面语言:GetUserDefaultLocaleName。Windows 上 LANG/LC_ALL 这些
     # 环境变量通常不存在,只能问系统(见 i18n::system_locale)。
     "Win32_Globalization",
