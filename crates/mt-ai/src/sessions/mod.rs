@@ -10,8 +10,8 @@
 
 mod codex;
 mod grok;
-mod omp;
 mod lineage;
+mod omp;
 
 pub use codex::{
     CodexSessionMeta, codex_message_from_line, codex_meta_from_line,
@@ -22,15 +22,14 @@ pub use grok::{
     GrokUpdateParser, decode_grok_cwd_dir, find_grok_cwd_dirs, find_grok_session_dir,
     grok_question_answer_from_line, grok_question_from_line, grok_updates_path,
 };
-pub use omp::{
-    OmpSessionMeta, find_omp_session_file, newest_omp_session_file,
-    omp_message_from_line, omp_question_answer_from_line, omp_question_from_line,
-    omp_session_meta_from_line,
-};
 pub use lineage::{
     BookkeptLineageEdge, LineageEdge, branch_title_from_texts, claude_branch_title_from_lines,
     claude_fork_edge_from_lines, codex_fork_edge_from_meta_line, latest_model_from_lines,
     scan_session_lineage,
+};
+pub use omp::{
+    OmpSessionMeta, find_omp_session_file, newest_omp_session_file, omp_message_from_line,
+    omp_question_answer_from_line, omp_question_from_line, omp_session_meta_from_line,
 };
 
 use codex::{
@@ -112,10 +111,7 @@ fn home_dir() -> Option<PathBuf> {
 /// mt-relay 后从这里引。)
 pub fn agent_has_session_log(agent: &str) -> bool {
     let agent = agent.to_ascii_lowercase();
-    agent.contains("claude")
-        || agent.contains("codex")
-        || agent.contains("grok")
-        || agent == "omp"
+    agent.contains("claude") || agent.contains("codex") || agent.contains("grok") || agent == "omp"
 }
 
 /// 从 Claude 会话 jsonl 文本中提取首个非空 `cwd` 字段。
@@ -706,7 +702,11 @@ pub(super) fn answer_labels(value: &serde_json::Value) -> Option<Vec<String>> {
             .unwrap_or_default(),
         _ => Vec::new(),
     };
-    if labels.is_empty() { None } else { Some(labels) }
+    if labels.is_empty() {
+        None
+    } else {
+        Some(labels)
+    }
 }
 
 /// 解析 Claude JSONL 的一行为 agent 提问。非 assistant 行 / 无 AskUserQuestion
@@ -1077,7 +1077,10 @@ mod tests {
             r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}"#,
             "not json",
         ] {
-            assert!(claude_question_from_line(line).is_none(), "{line} 不该产出提问");
+            assert!(
+                claude_question_from_line(line).is_none(),
+                "{line} 不该产出提问"
+            );
         }
         // 选项为空的题目整体作废:没有可选项就没有卡片可点
         let empty_options = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"AskUserQuestion","input":{"questions":[{"question":"q","header":"h","options":[]}]}}]}}"#;

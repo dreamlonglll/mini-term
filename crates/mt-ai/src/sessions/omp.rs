@@ -11,8 +11,8 @@ use super::{
 
 const OMP_OTHER_OPTION: &str = "Other (type your own)";
 
-/// OMP session file header. The filename contains the id, but the header is
-/// still checked so a stale or colliding path cannot bind the wrong session.
+/// OMP 会话文件头。文件名含 session id,仍需校验头部以防旧路径或碰撞绑定错误会话。
+///
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OmpSessionMeta {
     pub id: String,
@@ -55,14 +55,10 @@ fn clean_windows_verbatim(path: &str) -> &str {
 }
 
 fn normalize_windows_path(path: &str) -> String {
-    clean_windows_verbatim(path)
-        .replace('/', "\\")
-        .to_ascii_lowercase()
-        .trim_end_matches('\\')
-        .to_string()
+    super::normalize_path(clean_windows_verbatim(path))
 }
 
-/// OMP 的 legacy absolute 目录编码。只去掉一个前导分隔符，UNC 路径必须保留第二个。
+/// OMP 的 legacy absolute 目录编码。只去掉一个前导分隔符,UNC 路径必须保留第二个。
 fn encoded_absolute_dir(path: &str) -> String {
     let path = clean_windows_verbatim(path).trim_end_matches(['/', '\\']);
     let path = path
@@ -72,7 +68,7 @@ fn encoded_absolute_dir(path: &str) -> String {
     format!("--{}--", path.replace(['/', '\\', ':'], "-"))
 }
 
-/// Return the original-cased suffix when `path` is below `base`.
+/// 返回 path 相对于 base 的原始大小写后缀。
 fn relative_to(base: &str, path: &str) -> Option<String> {
     let base_original = clean_windows_verbatim(base)
         .replace('/', "\\")
@@ -107,8 +103,7 @@ fn encoded_relative_dir(prefix: &str, relative: &str) -> String {
     }
 }
 
-/// Compute OMP's default directory name and retain the legacy absolute name
-/// as a read-only discovery fallback for sessions written by older versions.
+/// 计算 OMP 默认目录名,同时保留 legacy absolute 名称作为只读发现兜底。
 fn session_dir_names(home: &str, temp_root: &str, project_path: &str) -> Vec<String> {
     let project_path = clean_windows_verbatim(project_path);
     let default_name = if let Some(relative) = relative_to(home, project_path) {
@@ -255,6 +250,8 @@ pub fn newest_omp_session_file(project_path: &str) -> Option<(PathBuf, SystemTim
             {
                 newest = Some((path, modified));
             }
+            // paths 已按 mtime 降序,同一目录中首个 cwd 命中就是最新文件。
+            break;
         }
     }
     newest
@@ -470,13 +467,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(question.tool_use_id, "call-1");
+        assert_eq!(question.items[0].id, "q1");
         assert_eq!(question.items[0].recommended_index, Some(1));
 
         let answer = omp_question_answer_from_line(
-            r#"{"type":"message","timestamp":"t2","message":{"role":"toolResult","toolCallId":"call-1","toolName":"ask","details":{"question":"Which?","selectedOptions":["B"]}}}"#,
+            r#"{"type":"message","timestamp":"t2","message":{"role":"toolResult","toolCallId":"call-1","toolName":"ask","details":{"results":[{"id":"q1","selectedOptions":["B"]}]}}}"#,
         )
         .unwrap();
-        assert_eq!(answer.answers["Which?"], ["B"]);
+        assert_eq!(answer.tool_use_ids, ["call-1"]);
+        assert_eq!(answer.answers["q1"], ["B"]);
+        assert!(!answer.is_error);
+    }
+
+    #[test]
+    fn custom_input_maps_to_omp_other_option() {
+        let details = serde_json::json!({
+            "selectedOptions": ["A"],
+            "customInput": "use a custom answer"
+        });
+        assert_eq!(
+            labels_with_custom(&details),
+            vec!["A".to_string(), OMP_OTHER_OPTION.to_string()]
+        );
+        assert!(labels_with_custom(&serde_json::json!({"customInput": ""})).is_empty());
     }
 
     #[test]
@@ -514,10 +527,19 @@ mod tests {
             .join(encoded_absolute_dir(project.to_str().unwrap()));
         fs::create_dir_all(&sessions).unwrap();
         let wanted = sessions.join("2026-09-03T00-00-00Z_session-1.jsonl");
+        let other = sessions.join("other.jsonl");
         fs::write(
             &wanted,
             format!(
                 "{{\"type\":\"session\",\"id\":\"session-1\",\"cwd\":{}}}\n",
+                serde_json::to_string(project.to_str().unwrap()).unwrap()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &other,
+            format!(
+                "{{\"type\":\"session\",\"id\":\"session-other\",\"cwd\":{}}}\n",
                 serde_json::to_string(project.to_str().unwrap()).unwrap()
             ),
         )
@@ -530,6 +552,16 @@ mod tests {
             "session-1",
         );
         assert_eq!(found, Some(wanted));
+        assert!(
+            find_omp_session_file_in(
+                &agent.join("sessions"),
+                &root,
+                &root.join("Temp"),
+                project.to_str().unwrap(),
+                "missing",
+            )
+            .is_none()
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }

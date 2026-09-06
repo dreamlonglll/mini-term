@@ -232,11 +232,14 @@ impl MirrorParser {
         }
     }
 
-
     /// 作答对账:回执命中挂起提问 → 产出标记并只移除**该**提问。
     /// 不能一刀切清空——提问可能与别的工具调用并行(同一条 assistant 消息里
     /// AskUserQuestion + Bash),别家工具的回执行不代表提问已了结
-    fn resolve_answer(&mut self, answer: &ai_sessions::AiQuestionAnswer, out: &mut Vec<MirrorMessage>) {
+    fn resolve_answer(
+        &mut self,
+        answer: &ai_sessions::AiQuestionAnswer,
+        out: &mut Vec<MirrorMessage>,
+    ) {
         let (resolved, still): (Vec<_>, Vec<_>) = self
             .pending
             .drain(..)
@@ -287,7 +290,11 @@ impl MirrorParser {
     /// 这里补进卡片与挂起,让移动端也点得到它——追加在尾部,已有选项的下标映射
     /// 不受影响。选中后 TUI 进入文本输入态(Codex 直接提交),移动端用下方
     /// 指令输入框接着打字即可。
-    fn push_question(&mut self, mut question: ai_sessions::AiQuestion, out: &mut Vec<MirrorMessage>) {
+    fn push_question(
+        &mut self,
+        mut question: ai_sessions::AiQuestion,
+        out: &mut Vec<MirrorMessage>,
+    ) {
         let extra_label = match self.agent {
             MirrorAgent::Claude => "Other",
             MirrorAgent::Codex => "None of the above",
@@ -375,7 +382,7 @@ impl MirrorParser {
         let is_grok_free_input = matches!(self.agent, MirrorAgent::Grok)
             && option_index as usize == item.options.len() - 1;
         let is_omp_other = matches!(self.agent, MirrorAgent::Omp)
-            && option.label == "Other (type your own)";
+            && option_index as usize == item.options.len() - 1;
         let initial = if matches!(self.agent, MirrorAgent::Omp) {
             item.recommended_index.unwrap_or(0)
         } else {
@@ -402,6 +409,9 @@ impl MirrorParser {
         {
             keys.push('\r');
         }
+        // 已知限制：最后一题选 Other 后，OMP 会切到 Submit 页；手机端自定义文本
+        // 发完后无法通过底部输入框发送裸回车（sendMobileCommand 会 trim 空文本），
+        // 因此用户需要回到桌面再按一次 Enter 完成提交。
         Some(AnswerKeys {
             keys,
             label: option.label.clone(),
@@ -581,7 +591,10 @@ pub fn resolve_session_file(
             MirrorAgent::Grok,
         ),
         (
-            fresh_since(ai_sessions::newest_omp_session_file(project_path), min_mtime),
+            fresh_since(
+                ai_sessions::newest_omp_session_file(project_path),
+                min_mtime,
+            ),
             MirrorAgent::Omp,
         ),
     ];
@@ -896,7 +909,11 @@ mod tests {
         parser.feed(format!("{}\n", question_line()).as_bytes());
         assert!(parser.answer_keys(1, "toolu_q1", 0, 0).is_some());
         let msgs = parser.feed(
-            format!("{}\n", claude_line("user", "算了,先不选", "2026-09-01T03:32:00Z")).as_bytes(),
+            format!(
+                "{}\n",
+                claude_line("user", "算了,先不选", "2026-09-01T03:32:00Z")
+            )
+            .as_bytes(),
         );
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].kind, None, "打断不产出已作答标记");
@@ -1097,15 +1114,27 @@ mod tests {
             parser.answer_keys(0, "toolu_q1", 0, 0).is_none(),
             "seq 0 是文字消息不是提问"
         );
-        assert!(parser.answer_keys(99, "toolu_q1", 0, 0).is_none(), "不存在的 seq");
+        assert!(
+            parser.answer_keys(99, "toolu_q1", 0, 0).is_none(),
+            "不存在的 seq"
+        );
         assert!(
             parser.answer_keys(1, "toolu_stale", 0, 0).is_none(),
             "提问身份不符(换绑后 seq 碰撞的防线)"
         );
         // 下标 3 是追加的「Other」兜底项,合法;4 才越界
-        assert!(parser.answer_keys(1, "toolu_q1", 0, 3).is_some(), "Other 兜底项可点选");
-        assert!(parser.answer_keys(1, "toolu_q1", 0, 4).is_none(), "选项越界");
-        assert!(parser.answer_keys(1, "toolu_q1", 1, 0).is_none(), "题号越界/乱序");
+        assert!(
+            parser.answer_keys(1, "toolu_q1", 0, 3).is_some(),
+            "Other 兜底项可点选"
+        );
+        assert!(
+            parser.answer_keys(1, "toolu_q1", 0, 4).is_none(),
+            "选项越界"
+        );
+        assert!(
+            parser.answer_keys(1, "toolu_q1", 1, 0).is_none(),
+            "题号越界/乱序"
+        );
 
         // 多选题只展示不可点选
         let mut parser = MirrorParser::new(MirrorAgent::Claude);
@@ -1113,7 +1142,10 @@ mod tests {
         let msgs = parser.feed(format!("{multi}\n").as_bytes());
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].kind.as_deref(), Some("question"));
-        assert!(parser.answer_keys(0, "toolu_m", 0, 0).is_none(), "多选题不可点选");
+        assert!(
+            parser.answer_keys(0, "toolu_m", 0, 0).is_none(),
+            "多选题不可点选"
+        );
     }
 
     #[test]
@@ -1169,11 +1201,13 @@ mod tests {
         assert_eq!(msgs[0].source, "desktop");
         assert_eq!(msgs[1].content, "choose first");
         assert_eq!(msgs[2].kind.as_deref(), Some("question"));
-        assert_eq!(msgs[2].question_id.as_deref(), Some("ask-1"));
+        assert_eq!(parser.answer_keys(2, "ask-1", 0, 1).unwrap().keys, "\r");
 
         // recommended=1，选 B 直接回车；选 A 先向上一次。
-        assert_eq!(parser.answer_keys(2, "ask-1", 0, 1).unwrap().keys, "\r");
-        assert_eq!(parser.answer_keys(2, "ask-1", 0, 0).unwrap().keys, "\x1b[A\r");
+        assert_eq!(
+            parser.answer_keys(2, "ask-1", 0, 0).unwrap().keys,
+            "\x1b[A\r"
+        );
         assert_eq!(
             parser.answer_keys(2, "ask-1", 0, 2).unwrap().label,
             "Other (type your own)"
@@ -1215,13 +1249,15 @@ mod tests {
         let ask = r#"{"type":"message","timestamp":"t1","message":{"role":"assistant","content":[{"type":"toolCall","id":"ask-multi","name":"ask","arguments":{"questions":[{"id":"q1","question":"First?","options":[{"label":"A"}]},{"id":"q2","question":"Second?","options":[{"label":"B"}]}]}}]}}"#;
         parser.feed(format!("{ask}\n").as_bytes());
         parser.mark_answered(0);
-        assert_eq!(parser.answer_keys(0, "ask-multi", 1, 0).unwrap().keys, "\r\r");
+        assert_eq!(
+            parser.answer_keys(0, "ask-multi", 1, 0).unwrap().keys,
+            "\r\r"
+        );
         assert_eq!(
             parser.answer_keys(0, "ask-multi", 1, 1).unwrap().keys,
             "\x1b[B\r"
         );
     }
-
 
     fn make_messages(n: u64) -> Vec<MirrorMessage> {
         (0..n)
@@ -1318,8 +1354,11 @@ mod tests {
         let root = temp_dir("codex");
         let day = root.join("2026").join("07").join("25");
         fs::create_dir_all(&day).unwrap();
-        let meta =
-            |id: &str| format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":\"D:\\\\proj\"}}}}\n");
+        let meta = |id: &str| {
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":\"D:\\\\proj\"}}}}\n"
+            )
+        };
         fs::write(day.join("rollout-1.jsonl"), meta("sid-first")).unwrap();
         fs::write(day.join("rollout-2.jsonl"), meta("sid-second")).unwrap();
 

@@ -56,9 +56,9 @@ pub mod sessions;
 pub mod tracker;
 mod util;
 
-pub use detect::{interactive_ai_command_name, is_interactive_ai_command, AI_COMMANDS};
-pub use hook_server::{is_attention_cause, HookState, HookStatusInfo};
+pub use detect::{AI_COMMANDS, interactive_ai_command_name, is_interactive_ai_command};
+pub use hook_server::{HookState, HookStatusInfo, is_attention_cause};
 pub use monitor::{SessionIdentity, StatusChange, StatusEmitter, StatusSink};
 pub use perception::AiPerception;
-pub use sessions::{agent_has_session_log, AiSession, AiSessionMessage, LineageEdge};
+pub use sessions::{AiSession, AiSessionMessage, LineageEdge, agent_has_session_log};
 pub use tracker::{SessionTracker, UserSubmit};
