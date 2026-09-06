@@ -206,7 +206,8 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 前往 [Releases](https://github.com/dreamlonglll/mini-term/releases) 下载，三平台产物：
 
 - **Windows x64（主要支持平台）** — `Mini-Term_*_x64-setup.exe` 安装包（NSIS，用户级安装免管理员，装过旧版的默认原目录原地升级）
-- **macOS arm64** — `Mini-Term_*_aarch64.dmg`
+- **macOS arm64（Apple Silicon）** — `Mini-Term_*_aarch64.dmg`
+- **macOS x64（Intel）** — `Mini-Term_*_x64.dmg`
 - **Linux x64** — `Mini-Term_*_amd64.deb` 或 `Mini-Term_*_amd64.tar.gz`
 
 > **平台支持说明**

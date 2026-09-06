@@ -7,8 +7,11 @@ name: Build & Release
 #   老用户原地升级:装过就先弹框告知、再跑旧版卸载器,不是文件覆盖写;
 #   包内平铺 exe + 三个 sidecar + portable-conpty/,
 #   运行时全部按「与 exe 同目录」定位)
-# - macOS arm64:.app bundle 打成 dmg(无签名,首次打开需 `xattr -cr` 放行,
-#   bundle id 沿用旧 Tauri 版的 com.mini-term.app)
+# - macOS arm64 + x64:.app bundle 打成 dmg(无签名,首次打开需 `xattr -cr` 放行,
+#   bundle id 沿用旧 Tauri 版的 com.mini-term.app)。Intel 包(issue #77)在
+#   GitHub 免费的 `macos-15-intel` runner 上原生编译,不交叉编译;该镜像是 Actions
+#   最后一代 x86_64 macOS,官方承诺可用到 2027-08,之后要么在 arm64 runner 上带
+#   `--target x86_64-apple-darwin` 交叉编,要么 lipo 合成 universal 包
 # - Linux x64:deb + tar.gz(deb 版本号把 `-` 换成 `~`,预发布序才正确 ——
 #   1.0.0~beta < 1.0.0;rpm 不做了,旧流水线里它本来就进不了预发布版本号)
 # - sidecar 由 stage-sidecars.mjs 就位到 target/release/,组装步骤直接从
@@ -20,14 +23,37 @@ name: Build & Release
 #   用户是按文件名认包的(v1.0.x-beta 那一串 `mini-term-gpui-*` 是迁移期的临时名)
 # ⚠️ macOS / Linux 是「代码支持,可用性欠佳」档,构建线未经真机验证;
 #   fail-fast: false 保证它们失败不拖累 Windows 产物
+# - 手动触发(workflow_dispatch)= 给**已发布**的版本补建产物:不新建 release、
+#   不生成 changelog,从 inputs.tag 那个 tag 的代码构建 inputs.platforms 选中的
+#   平台,上传到该 tag 已有的 release。首个用例是 v1.2.6 补 Intel mac 包。
+#   ⚠️ 选了已有产物的平台会把用户下载过的同名文件覆盖掉,默认只补 macos-x64;
+#   workflow 文件取自触发时选的分支,代码取自 inputs.tag,两者刻意分离
 
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '已存在的 release tag(如 v1.2.6),产物从该 tag 的代码构建'
+        required: true
+        type: string
+      platforms:
+        description: '要补建的平台 key,逗号分隔:windows / macos-arm64 / macos-x64 / linux'
+        required: true
+        default: 'macos-x64'
+        type: string
+
+env:
+  # push 事件是被推的 tag;手动补建是 inputs.tag(push 时 inputs 为空,靠 || 兜底)。
+  # 各步骤一律用它,不直接碰 github.ref_name —— 手动触发时那是分支名
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   create-release:
+    # 手动补建时 release 已经在了,跳过;build-gpui 的 if 里把 skipped 视同成功
+    if: github.event_name == 'push'
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -40,7 +66,7 @@ jobs:
         id: changelog
         shell: bash
         run: |
-          CURRENT_TAG="${{ github.ref_name }}"
+          CURRENT_TAG="$RELEASE_TAG"
           PREV_TAG=$(git tag --sort=-v:refname | grep '^v' | sed -n '2p')
           if [ -z "$PREV_TAG" ]; then
             RANGE="$CURRENT_TAG"
@@ -62,29 +88,46 @@ jobs:
         id: create
         uses: softprops/action-gh-release@v2
         with:
-          name: Mini-Term ${{ github.ref_name }}
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: Mini-Term ${{ env.RELEASE_TAG }}
           body: ${{ steps.changelog.outputs.body }}
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
+
+  # 算出 build-gpui 的矩阵:push 全量四条;手动补建只留 inputs.platforms 点名的。
+  # 平台表与过滤规则在 .github/scripts/release_matrix.mjs(job 级 if 拿不到
+  # matrix 上下文,过滤只能在这里做完再 fromJSON 喂进 strategy.matrix)
+  plan:
+    runs-on: ubuntu-22.04
+    outputs:
+      include: ${{ steps.plan.outputs.include }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: plan
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PLATFORMS: ${{ inputs.platforms }}
+        run: node .github/scripts/release_matrix.mjs
 
   build-gpui:
-    needs: create-release
+    needs: [create-release, plan]
+    # 手动补建时 create-release 是 skipped,默认隐含的 success() 会把本作业一起
+    # 跳掉;显式写状态函数(!cancelled())才能覆盖那个默认,再自己放行 skipped
+    if: needs.plan.result == 'success' && !cancelled() && (needs.create-release.result == 'success' || needs.create-release.result == 'skipped')
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - platform: windows-latest
-            target: x86_64-pc-windows-msvc
-          - platform: macos-latest
-            target: aarch64-apple-darwin
-          - platform: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
+        include: ${{ fromJSON(needs.plan.outputs.include) }}
 
     runs-on: ${{ matrix.platform }}
     permissions:
       contents: write
 
     steps:
+      # 按 tag 检出而不是默认的触发 sha:手动补建时触发 sha 是分支 HEAD,
+      # 产物必须与该版本其它平台的包出自同一份代码
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       # gpui Linux 后端(x11/wayland,见 mt-app 的 target 依赖段)的构建依赖:
       # font-kit 要 fontconfig/freetype,xkb/wayland 头文件给 windowing 层。
@@ -125,7 +168,7 @@ jobs:
         if: matrix.platform == 'windows-latest'
         shell: pwsh
         run: |
-          $tag = "${{ github.ref_name }}"
+          $tag = $env:RELEASE_TAG
           $version = $tag.TrimStart('v')
           # VIProductVersion 只收纯数字四段:剥掉预发布/构建元数据再补第四段
           $versionNum = ($version -split '[-+]')[0] + '.0'
@@ -187,10 +230,10 @@ jobs:
           Get-ChildItem dist
 
       - name: Assemble .app bundle + dmg (macOS)
-        if: matrix.platform == 'macos-latest'
+        if: runner.os == 'macOS'
         shell: bash
         run: |
-          TAG="${{ github.ref_name }}"
+          TAG="$RELEASE_TAG"
           VERSION="${TAG#v}"
           APP="dist/Mini-Term.app"
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -220,15 +263,16 @@ jobs:
           </dict>
           </plist>
           PLIST
+          # 架构段来自矩阵的 arch(aarch64 / x64),两个 mac 包只差这一个词
           hdiutil create -volname "Mini-Term" -srcfolder "$APP" -ov -format UDZO \
-            "dist/Mini-Term_${VERSION}_aarch64.dmg"
+            "dist/Mini-Term_${VERSION}_${{ matrix.arch }}.dmg"
           ls -la dist
 
       - name: Assemble deb + tar.gz (Linux)
         if: matrix.platform == 'ubuntu-22.04'
         shell: bash
         run: |
-          TAG="${{ github.ref_name }}"
+          TAG="$RELEASE_TAG"
           VERSION="${TAG#v}"
           # ⚠️ 替换串必须转义:bash 对 ${var//pat/rep} 的 rep 做 tilde 展开,
           # 裸 ~ 会变成 $HOME,版本号成 1.0.0/home/runnerbeta(首个 tag 踩过)
@@ -275,10 +319,14 @@ jobs:
             "dist/Mini-Term_${DEB_VERSION}_amd64.deb"
           ls -la dist
 
+      # tag_name 必须显式给:手动补建时默认的 github.ref_name 是分支名,
+      # 不给就会平白建出一个叫 "main" 的 release。对已存在的 release 这个
+      # action 是更新语义,只上传文件、不覆盖 notes
       - name: Upload bundles to release
         uses: softprops/action-gh-release@v2
         with:
-          prerelease: ${{ contains(github.ref_name, '-') }}
+          tag_name: ${{ env.RELEASE_TAG }}
+          prerelease: ${{ contains(env.RELEASE_TAG, '-') }}
           files: |
             dist/Mini-Term_*-setup.exe
             dist/Mini-Term_*.dmg

@@ -154,7 +154,8 @@ VS Code 风格的 **Changes 面板**（Staged / Changes / Untracked 分组，单
 前往 [Releases](https://github.com/dreamlonglll/mini-term/releases) 下载，三平台产物：
 
 - **Windows x64（主要支持平台）** — `Mini-Term_*_x64-setup.exe` 安装包（NSIS，用户级安装免管理员；装过旧版的默认原目录升级，且**先卸载旧版再装**而不是文件覆盖写）
-- **macOS arm64** — `Mini-Term_*_aarch64.dmg`
+- **macOS arm64（Apple Silicon）** — `Mini-Term_*_aarch64.dmg`
+- **macOS x64（Intel）** — `Mini-Term_*_x64.dmg`
 - **Linux x64** — `Mini-Term_*_amd64.deb` 或 `Mini-Term_*_amd64.tar.gz`
 
 > **平台支持**

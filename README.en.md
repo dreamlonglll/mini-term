@@ -152,7 +152,8 @@ The whole application is **native Rust**:
 Grab the latest build from [Releases](https://github.com/dreamlonglll/mini-term/releases) — three platforms:
 
 - **Windows x64 (primary platform)** — `Mini-Term_*_x64-setup.exe` installer (NSIS, per-user install without admin rights; upgrades in the same directory, and **uninstalls the old build first** instead of overwriting files)
-- **macOS arm64** — `Mini-Term_*_aarch64.dmg`
+- **macOS arm64 (Apple Silicon)** — `Mini-Term_*_aarch64.dmg`
+- **macOS x64 (Intel)** — `Mini-Term_*_x64.dmg`
 - **Linux x64** — `Mini-Term_*_amd64.deb` or `Mini-Term_*_amd64.tar.gz`
 
 > **Platform support**
