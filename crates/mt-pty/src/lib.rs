@@ -14,6 +14,21 @@
 //! 观察器挂上去就能拿到每一次写入的原始字节,本 crate 不解释它们,**也不知道
 //! 有 AI 这回事**。
 //!
+//! # 线程模型
+//!
+//! 一个会话三条线程,调用方线程(GPUI 主线程)**从不碰管道**:
+//!
+//! ```text
+//! reader 线程   PTY 输出 → on_output(喂 VT 状态机);命中 SSH 密码提示时直接回写密码
+//! writer 线程   write() 入队的字节 → 分块写进 PTY(见 write_chunked)
+//! 退出 watcher  轮询子进程,退出后回调一次
+//! ```
+//!
+//! [`PtySession::write`] 只做观察器通知 + 入队即返回。写入放到独立线程是因为
+//! 管道写在两种情况下会阻塞:Windows 上多行长文本要逐行喂并让 ConPTY 消化
+//! (`write_chunked` 每行 sleep 1ms,两千行就是两秒),以及子进程停止消费输入
+//! (输入缓冲一满 conhost 就不再读管道)。这两种阻塞放在主线程上就是整窗冻结。
+//!
 //! # 明确**不要**移过来的东西
 //!
 //! 以下代码在 GPUI 架构下没有存在意义,移植时直接删掉,不要试图保留:
@@ -67,9 +82,10 @@
 
 use std::io::{Read, Write};
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, anyhow};
 use parking_lot::Mutex;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
@@ -123,7 +139,14 @@ pub struct PtySession {
     /// 正常生命周期内始终是 `Some`。
     master: Option<Box<dyn MasterPty + Send>>,
     child: Arc<Mutex<BoxedChild>>,
-    writer: Arc<Mutex<BoxedWriter>>,
+    /// 通往 writer 线程的队列。无界:队列的意义就是让 [`Self::write`] 永不阻塞,
+    /// 设上限就把管道的背压又引回了调用方线程;在途字节量由用户一次粘贴的体积
+    /// 决定,不会无限长。
+    ///
+    /// PTY 的写端本身不在这个结构体上:它只被 writer 线程(用户输入队列)与
+    /// reader 线程(SSH 密码自动填充的回写)各持一个 `Arc` —— **调用方线程不碰
+    /// 管道**,见模块注释「线程模型」。
+    write_tx: mpsc::Sender<Vec<u8>>,
     /// 写入路径的旁路观察器(见 [`PtySession::set_input_observer`])。
     input_observer: Arc<Mutex<Option<InputObserver>>>,
     /// SSH 密码自动填充状态,与 reader 线程共享。
@@ -305,21 +328,26 @@ impl PtySession {
 
         let autofill_for_reader = Arc::clone(&autofill);
         let writer_for_reader = Arc::clone(&writer);
-        std::thread::spawn(move || {
-            let mut buf = [0u8; READ_CHUNK];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        let chunk = &buf[..n];
-                        // SSH 密码自动填充先于交付:命中提示就直接回写密码,
-                        // 不经 `write` —— 那是用户输入通道,不该被自动填充污染。
-                        pump_autofill(&autofill_for_reader, &writer_for_reader, chunk);
-                        on_output(chunk);
+        std::thread::Builder::new()
+            .name("mt-pty-reader".into())
+            .spawn(move || {
+                let mut buf = [0u8; READ_CHUNK];
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            let chunk = &buf[..n];
+                            // SSH 密码自动填充先于交付:命中提示就直接回写密码,
+                            // 不经 `write` —— 那是用户输入通道,不该被自动填充污染。
+                            pump_autofill(&autofill_for_reader, &writer_for_reader, chunk);
+                            on_output(chunk);
+                        }
                     }
                 }
-            }
-        });
+            })
+            .context("起 PTY reader 线程失败")?;
+
+        let write_tx = spawn_writer(writer)?;
 
         let closing = Arc::new(std::sync::atomic::AtomicBool::new(false));
         if let Some(on_exit) = on_exit {
@@ -329,7 +357,7 @@ impl PtySession {
         Ok(Self {
             master: Some(pair.master),
             child,
-            writer,
+            write_tx,
             input_observer: Arc::new(Mutex::new(None)),
             autofill,
             last_size: Mutex::new((cols, rows)),
@@ -393,9 +421,16 @@ impl PtySession {
 
     /// 往 PTY 写字节(用户键入、粘贴、拖入的文件路径都走这里)。
     ///
-    /// 顺序:通知输入观察器 → 解除 SSH 自动填充(焦点事件除外)→ 分块写入。
-    /// 观察器排在写入**之前**:上层拿这一路做的判定(例如为焦点事件开一个
+    /// 顺序:通知输入观察器 → 解除 SSH 自动填充(焦点事件除外)→ 交给 writer
+    /// 线程。观察器排在入队**之前**:上层拿这一路做的判定(例如为焦点事件开一个
     /// 重绘冷却窗口)必须在子进程响应抵达 reader 之前就建立起来。
+    ///
+    /// **不等管道**:字节入队即返回,写入与分块延迟都在 writer 线程上发生
+    /// (见模块注释「线程模型」)。多次 `write` 的顺序由队列保证。
+    ///
+    /// 返回 `Err` 只有一种情况:writer 线程已因先前的写入失败退出(管道已断,
+    /// 通常是子进程没了)。当次写入本身的失败不在这里报 —— 它发生在别的线程上,
+    /// 由 writer 线程打一行日志后收摊。
     pub fn write(&self, bytes: &[u8]) -> Result<()> {
         if let Some(observer) = self.input_observer.lock().as_mut() {
             observer(bytes);
@@ -405,8 +440,9 @@ impl PtySession {
         if bytes != FOCUS_IN_SEQ && bytes != FOCUS_OUT_SEQ {
             self.disarm_ssh_autofill_on_user_input();
         }
-        let mut writer = self.writer.lock();
-        write_chunked(&mut **writer, bytes)
+        self.write_tx
+            .send(bytes.to_vec())
+            .map_err(|_| anyhow!("PTY 已关闭(写线程已退出)"))
     }
 
     /// 调整 PTY 尺寸。尺寸与上次相同时直接返回(见 [`resize_if_changed`](Self::resize_if_changed))。
@@ -468,9 +504,33 @@ impl Drop for PtySession {
     }
 }
 
+/// writer 线程:按 [`PtySession::write`] 入队的顺序把字节写进 PTY。
+///
+/// 一次写失败即退出 —— 管道断了之后不会自己好,继续消费队列只是把用户的输入
+/// 悄悄扔掉;线程一退,`Sender` 那头的下一次 `write` 就拿到 `Err`,上层看得见。
+/// 会话被 [`Drop`] 时 `write_tx` 随之丢弃,队列耗尽后线程自然结束。
+fn spawn_writer(writer: Arc<Mutex<BoxedWriter>>) -> Result<mpsc::Sender<Vec<u8>>> {
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    std::thread::Builder::new()
+        .name("mt-pty-writer".into())
+        .spawn(move || {
+            for chunk in rx {
+                if let Err(err) = write_chunked(&mut **writer.lock(), &chunk) {
+                    eprintln!("[mt-pty] 写 PTY 失败,写线程退出: {err:#}");
+                    break;
+                }
+            }
+        })
+        .context("起 PTY writer 线程失败")?;
+    Ok(tx)
+}
+
 /// Windows ConPTY 无法一次处理大量输入数据(粘贴长文本时只剩最后一行)。
 /// 将数据按行拆分,每行写入后加短暂延迟,给 ConPTY 时间消化。
 /// 短数据(普通键盘输入)直接写入不受影响。
+///
+/// 只在 writer 线程上调用(与 reader 线程的密码回写共用 `writer` 锁,
+/// 分块期间那边会等一等,无碍)。
 fn write_chunked(writer: &mut dyn Write, bytes: &[u8]) -> Result<()> {
     const CHUNK_THRESHOLD: usize = 128;
     const INTER_LINE_DELAY: Duration = Duration::from_millis(1);
@@ -692,6 +752,34 @@ mod tests {
         session.clear_input_observer();
         session.write(b"more\r").expect("write 失败");
         assert_eq!(&*seen.lock(), b"hello\r");
+    }
+
+    #[test]
+    fn write_returns_without_waiting_for_the_pipe() {
+        // 长多行粘贴在 Windows 上要逐行 sleep 1ms(见 write_chunked):两千行至少
+        // 两秒。`write` 必须当场返回 —— 它跑在 GPUI 主线程上,等管道就是整窗冻结。
+        // 用交互式 shell:`cmd /c echo` 那种会立刻退出,管道一断写线程就收摊了。
+        let spec = PtySpawn {
+            program: if cfg!(windows) { "cmd.exe" } else { "/bin/sh" }.to_string(),
+            args: Vec::new(),
+            cwd: None,
+            env: Vec::new(),
+            rows: INITIAL_PTY_ROWS,
+            cols: INITIAL_PTY_COLS,
+        };
+        let session = PtySession::spawn(spec, |_| {}).expect("spawn 失败");
+        let payload: String = (0..2000)
+            .map(|i| format!("rem line {i} {}\n", "x".repeat(150)))
+            .collect();
+
+        let started = Instant::now();
+        session.write(payload.as_bytes()).expect("write 失败");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "write 应当入队即返回,实际耗时 {elapsed:?}"
+        );
+        drop(session);
     }
 
     #[test]

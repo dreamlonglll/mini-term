@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.2.4-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.2.6-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -81,6 +81,7 @@ Right-click a project → "Link SSH", tick the connections, and it's enabled for
 ### 🌐 Remote directories as local projects — and WSL too
 
 - **SSH remote projects** — add a directory on a server as a project directly: the file tree lazy-loads over SFTP, the terminal connects via `ssh -t` and lands straight in the project directory, a one-click overlay reconnects after a drop, and the remote machine's Claude / Codex history is readable with full content. Remote cache keys mix in the connection id, so identical paths on two servers never cross-contaminate
+- **Encrypted password storage** — saved SSH passwords are sealed with AES-256-GCM before hitting disk, with the master key protected per-user via Windows DPAPI (file permissions on macOS / Linux); plaintext left by older versions is sealed and scrubbed automatically on the first launch after upgrading. The password field also gets a show / hide toggle
 - **Remote file management** — the remote file tree supports copy / paste / upload / download, dragging files in from Explorer uploads them, and the file panel header has shortcut buttons for uploading files / folders, pasting, and creating files / folders; name conflicts can be skipped, overwritten, or kept as copies, with the affected names listed in the dialog. Downloads land in the system Downloads folder by default (configurable in Settings); a remote directory picker lets you browse for the path when adding a remote project, and a context-menu action opens a remote directory in the terminal
 - **WSL support** — `\\wsl$\<distro>\<path>` works as a project root, launching switches to `wsl.exe --cd` automatically so `pwd` really lands inside WSL instead of `C:\Windows`; Windows can also read Claude / Codex session history from inside WSL distros directly
 
@@ -96,7 +97,7 @@ Right-click a project → "Link SSH", tick the connections, and it's enabled for
 
 ### 🌿 Git integration + batch worktree management
 
-A VS Code-style **Changes panel** (Staged / Changes / Untracked groups, per-file or bulk stage / discard, `Ctrl+Enter` to commit), side-by-side and inline diff views (horizontal scrolling for long lines, vertically synced columns, `@@` hunk separators and prev / next-change jumps, plus word-level highlighting on paired delete / add lines), cursor-paginated commit history, and a **hand-drawn SVG branch topology graph**. The Git panel stacks two collapsible sections — Changes on top, commit history below — visible at the same time with a draggable divider; a repo bar at the top switches repos, the branch badge switches which branch's history is shown (no checkout), and refresh / Pull / Push live on the same bar.
+A VS Code-style **Changes panel** (Staged / Changes / Untracked groups, per-file or bulk stage / discard, `Ctrl+Enter` to commit), side-by-side and inline diff views (horizontal scrolling for long lines, vertically synced columns, `@@` hunk separators and prev / next-change jumps, plus word-level highlighting on paired delete / add lines), cursor-paginated commit history, and a **hand-drawn SVG branch topology graph**. The Git panel stacks two collapsible sections — Changes on top, commit history below — visible at the same time with a draggable divider; a repo bar at the top switches repos (a run of identically named `api` repos in a monorepo each carry their parent path to tell them apart), the branch badge switches which branch's history is shown (no checkout), and refresh / Pull / Push live on the same bar.
 
 **Worktree management** is especially handy for running several agents in parallel: when the project root isn't a repo itself, it **scans downward for sub-repos** and groups them by main worktree, with checkable group headers so you can **create one worktree per checked repo in a single action**. Any worktree can be turned into a project in one click — mounted under its parent — or just opened in a terminal. **When an AI agent deletes a worktree from the terminal**, the list reconciles itself the moment the window regains focus: sub-projects whose directory is gone are removed along with their terminal resources, leaving no stale entries.
 
@@ -140,7 +141,7 @@ The whole application is **native Rust**:
 | Git / files | git2 (libgit2) · notify + ignore |
 | Usage stats | rusqlite local ledger · hand-drawn trend charts |
 | Mobile relay | axum + tokio WebSocket (`relay-server/`) · React + Vite PWA (`mobile/`) |
-| Tests | **1,724 Rust tests** (27 test targets) |
+| Tests | **1,757 Rust tests** (29 test targets) |
 
 ---
 
@@ -151,7 +152,8 @@ The whole application is **native Rust**:
 Grab the latest build from [Releases](https://github.com/dreamlonglll/mini-term/releases) — three platforms:
 
 - **Windows x64 (primary platform)** — `Mini-Term_*_x64-setup.exe` installer (NSIS, per-user install without admin rights; upgrades in the same directory, and **uninstalls the old build first** instead of overwriting files)
-- **macOS arm64** — `Mini-Term_*_aarch64.dmg`
+- **macOS arm64 (Apple Silicon)** — `Mini-Term_*_aarch64.dmg`
+- **macOS x64 (Intel)** — `Mini-Term_*_x64.dmg`
 - **Linux x64** — `Mini-Term_*_amd64.deb` or `Mini-Term_*_amd64.tar.gz`
 
 > **Platform support**

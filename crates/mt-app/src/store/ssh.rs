@@ -43,8 +43,31 @@ impl AppStore {
     /// 复用到 reaper 回收(idle 10min / lifetime 2h)。判据见
     /// [`crate::ssh_conn::ssh_session_identity_changed`]。
     /// (只作废本进程的池;三个 sidecar 各自独立进程独立池,不在这条链路上。)
-    pub fn upsert_ssh_connection(&mut self, conn: SshConnection, cx: &mut Context<Self>) {
+    ///
+    /// **密码在这里封存**:表单交来的是明文,落进 `config` 之前换成 `mt-secret` 信封
+    /// (没改的沿用旧信封,判据见 [`crate::secrets::stored_password`])。封存失败就
+    /// **不存密码**(其余字段照存)并把原因交给调用方提示 —— 宁可让用户再填一次,
+    /// 也不把明文写进库。
+    pub fn upsert_ssh_connection(
+        &mut self,
+        conn: SshConnection,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let mut conn = conn;
         let id = conn.id.clone();
+        let mut seal_error = None;
+        if let Some(plain) = conn.password.take().filter(|p| !p.is_empty()) {
+            let existing = self
+                .config
+                .ssh_connections
+                .iter()
+                .find(|c| c.id == id)
+                .and_then(|c| c.password.as_deref());
+            match crate::secrets::stored_password(&plain, existing) {
+                Ok(stored) => conn.password = Some(stored),
+                Err(err) => seal_error = Some(err),
+            }
+        }
         let mut identity_changed = false;
         match self
             .config
@@ -63,6 +86,10 @@ impl AppStore {
         }
         self.save_config_now();
         cx.notify();
+        match seal_error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 
     /// 删除一条连接(二次确认由调用方做 —— 原版同款)。

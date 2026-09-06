@@ -193,6 +193,12 @@ pub enum TitleBarLight {
 
 impl TitleBarLight {
     /// tooltip / aria-label 的 key(`app.titleBar.status.{light}`)。
+    ///
+    /// ⚠️ 2026-09-04 标题栏那颗灯按用户要求撤掉(见 [`crate::title_bar`] 模块注释),
+    /// 于是这条**暂时没有生产调用方** —— 档位类型、归并算法与这张文案表都留着:
+    /// 它们仍由 [`compute_title_bar_light`] 那几条单测把着,哪天要把灯挂回来
+    /// (或换个位置画)不必从头再推一遍优先级。
+    #[allow(dead_code)]
     pub fn i18n_key(self) -> &'static str {
         match self {
             Self::Error => "titleBar.status.error",

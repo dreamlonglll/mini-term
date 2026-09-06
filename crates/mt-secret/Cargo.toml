@@ -1,0 +1,32 @@
+[package]
+name = "mt-secret"
+# ⚠️ version / edition 与 mt-core / mt-ssh 同理保持**显式**值:本 crate 经 mt-ssh 被
+# `sidecars/` 那个独立工作区跨工作区 path 依赖,`workspace.package` 继承在那边取不到值。
+version = "0.1.0"
+description = "mini-term credential vault: AES-256-GCM envelopes for saved SSH passwords; master key wrapped by DPAPI (Windows) or kept in a 0600 key file (Unix)"
+edition = "2021"
+
+[lib]
+name = "mt_secret"
+
+[dependencies]
+# 只为 `config_json_path()`:sidecar 侧的懒加载要在**它读的那份 config.json 旁边**找密钥。
+mt-core = { path = "../mt-core" }
+# AEAD + 系统随机数。选 ring 而不是 aes-gcm:russh 在两个工作区里都已经带着 ring
+# (`features = ["ring"]`),而 aes-gcm 在根工作区是 0.11.0、在 sidecars 是 0.11.0-rc.3,
+# 再声明一次会在 sidecar 依赖树里出现第二份。
+ring = "0.17"
+# 信封串与密钥文件的 base64。两个工作区都已是 0.22。
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 主密钥与解出的明文离开作用域即清零。
+zeroize = "1"
+
+# DPAPI(CryptProtectData / CryptUnprotectData)。版本对齐 sidecars 已有的 0.52,
+# 不给小二进制多拉一份 windows-sys。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+] }

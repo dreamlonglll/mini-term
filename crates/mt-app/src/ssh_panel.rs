@@ -533,6 +533,12 @@ struct ConnForm {
     port: Entity<InputState>,
     user: Entity<InputState>,
     password: Entity<InputState>,
+    /// 密码框是否正以明文显示(右侧「显示 / 隐藏」按钮)。每次开表单都从掩码起。
+    reveal_password: bool,
+    /// 已存信封解不开(密钥换了 / 密文被改):密码框回填为空,并在框下**就地**标红
+    /// 说明;用户一开始输入新密码提示即隐去。**不走 toast** —— toast 层画在弹窗
+    /// 遮罩之下,面板开着时根本看不见(真机验过),关掉面板它又早已过期。
+    password_unreadable: bool,
     identity: Entity<InputState>,
     group: Entity<InputState>,
 }
@@ -557,6 +563,9 @@ pub struct SshPanel {
     _copied_timer: Option<gpui::Task<()>>,
     /// 改名 / 新建两个输入框的「回车提交 / 失焦提交」订阅。
     _subs: Vec<Subscription>,
+    /// 面板内的一行提示(目前只有「密码加密失败,本次未保存密码」)。画在右栏顶部,
+    /// 下一次开表单 / 保存成功时清掉。不走 toast 的理由见 [`ConnForm::password_unreadable`]。
+    notice: Option<SharedString>,
 }
 
 impl Render for SshPanel {
@@ -636,6 +645,7 @@ pub fn open(window: &mut Window, cx: &mut App) {
         copied: None,
         _copied_timer: None,
         _subs: Vec::new(),
+        notice: None,
     });
 
     open_guarded(kind::SSH_PANEL, window, cx, move |dialog, window, cx| {
@@ -659,6 +669,7 @@ fn start_add(state: &Entity<SshPanel>, group: Option<String>, window: &mut Windo
     let form = new_form(None, group.unwrap_or_default(), window, cx);
     state.update(cx, |panel, cx| {
         panel.form = Some(form);
+        panel.notice = None;
         cx.notify();
     });
 }
@@ -667,6 +678,7 @@ fn start_edit(state: &Entity<SshPanel>, conn: &SshConnection, window: &mut Windo
     let form = new_form(Some(conn), String::new(), window, cx);
     state.update(cx, |panel, cx| {
         panel.form = Some(form);
+        panel.notice = None;
         cx.notify();
     });
 }
@@ -689,6 +701,25 @@ fn new_form(
     // 被抢的问题;仍走 `autofocus` 是为了与其余输入弹窗同一条路(它多让一轮
     // effect,输入框此刻尚未画出也不要紧)
     autofocus(&name, window, cx);
+    // 已存密码是 `mt-secret` 信封,回填前解开;解不开就回填空并在框下标红说明 ——
+    // 用户此时直接保存会把密码清掉,那正是「密钥丢了,请重新填写」该有的结果。
+    // 日志不含密码。
+    let mut password_unreadable = false;
+    let password_value = conn
+        .and_then(|c| c.password.as_deref())
+        .filter(|p| !p.is_empty())
+        .map(|stored| match crate::secrets::reveal_password(stored) {
+            Ok(plain) => plain,
+            Err(err) => {
+                eprintln!(
+                    "[ssh-panel] 连接 {} 的已存密码无法解密,表单回填为空: {err}",
+                    conn.map(|c| c.id.as_str()).unwrap_or_default()
+                );
+                password_unreadable = true;
+                String::new()
+            }
+        })
+        .unwrap_or_default();
     ConnForm {
         id: conn.map(|c| c.id.clone()).unwrap_or_default(),
         name,
@@ -717,13 +748,9 @@ fn new_form(
             cx,
         ),
         // 原版是 `type="password"`;gpui-component 的对应物是 `masked`
-        password: text_field(
-            "",
-            conn.and_then(|c| c.password.clone()).unwrap_or_default(),
-            true,
-            window,
-            cx,
-        ),
+        password: text_field("", password_value, true, window, cx),
+        reveal_password: false,
+        password_unreadable,
         identity: text_field(
             t("sshModal", "identityPlaceholder"),
             conn.and_then(|c| c.identity_file.clone()).unwrap_or_default(),
@@ -758,6 +785,29 @@ fn text_field(
     })
 }
 
+/// 「显示 / 隐藏」密码:翻转表单的明文态,并同步给输入框的 `masked`。
+///
+/// **不用 gpui-component 自带的 `Input::mask_toggle`**:① 它画 `IconName::Eye`,
+/// 0.5.1 不带 svg 资产、本仓也没注册 `AssetSource`,渲染出来是空白且编译期无感
+/// (见 `menu` 模块注释);② 它是「按住才显示、松手即掩」,与常见表单的点击切换
+/// 语义不同 —— 编辑已存密码时用户要的是能看清整串再改,按住看不方便。
+fn toggle_password_reveal(
+    state: &Entity<SshPanel>,
+    password: &Entity<InputState>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let reveal = state.update(cx, |panel, cx| {
+        let form = panel.form.as_mut()?;
+        form.reveal_password = !form.reveal_password;
+        cx.notify();
+        Some(form.reveal_password)
+    });
+    if let Some(reveal) = reveal {
+        password.update(cx, |input, cx| input.set_masked(!reveal, window, cx));
+    }
+}
+
 fn save_form(state: &Entity<SshPanel>, cx: &mut App) {
     let Some(conn) = state.read(cx).form.as_ref().map(|f| {
         build_connection(
@@ -782,9 +832,15 @@ fn save_form(state: &Entity<SshPanel>, cx: &mut App) {
     }
     state.update(cx, |panel, cx| {
         panel.form = None;
-        panel
+        // 明文只活到这一步:store 落库前把它封成信封。封存失败时连接照存、密码不存,
+        // 在面板顶部提示用户再填一次(见 `AppStore::upsert_ssh_connection`;不走
+        // toast 的理由见 [`ConnForm::password_unreadable`])。
+        let saved = panel
             .store
             .update(cx, |store, cx| store.upsert_ssh_connection(conn, cx));
+        panel.notice = saved
+            .err()
+            .map(|err| SharedString::from(tr!("sshModal", "passwordSealFailed", error = err)));
         cx.notify();
     });
 }
@@ -930,6 +986,7 @@ struct Frame {
     dragging: Option<String>,
     drag_over: Option<GroupKey>,
     copied: Option<String>,
+    notice: Option<SharedString>,
 }
 
 fn read_frame(state: &Entity<SshPanel>, cx: &App) -> Frame {
@@ -960,6 +1017,7 @@ fn read_frame(state: &Entity<SshPanel>, cx: &App) -> Frame {
         dragging: panel.dragging.clone(),
         drag_over: panel.drag_over.clone(),
         copied: panel.copied.clone(),
+        notice: panel.notice.clone(),
     }
 }
 
@@ -1215,6 +1273,21 @@ fn render_list(state: &Entity<SshPanel>, frame: &Frame, cx: &mut App) -> AnyElem
         .flex_col()
         .gap(px(12.0));
 
+    // 面板级提示(密码封存失败):红框一行,钉在右栏顶部直到下一次开表单 / 保存成功
+    if let Some(notice) = &frame.notice {
+        list = list.child(
+            div()
+                .px(px(10.0))
+                .py(px(6.0))
+                .rounded(px(6.0))
+                .border_1()
+                .border_color(ui::color_error())
+                .text_size(ui::font_px(11.0))
+                .text_color(ui::color_error())
+                .child(notice.clone()),
+        );
+    }
+
     if frame.connections.is_empty() && !frame.adding {
         list = list.child(
             div()
@@ -1405,21 +1478,35 @@ fn copyable_name(state: &Entity<SshPanel>, conn: &SshConnection, just_copied: bo
 
 /// 新增 / 编辑表单(原版 `SshConnectionForm`:accent 虚线框里一叠带标签的字段)。
 fn render_form(state: &Entity<SshPanel>, cx: &mut App) -> AnyElement {
-    let Some((name, host, port, user, password, identity, group)) =
-        state.read(cx).form.as_ref().map(|f| {
-            (
-                f.name.clone(),
-                f.host.clone(),
-                f.port.clone(),
-                f.user.clone(),
-                f.password.clone(),
-                f.identity.clone(),
-                f.group.clone(),
-            )
-        })
+    let Some((
+        name,
+        host,
+        port,
+        user,
+        password,
+        reveal_password,
+        password_unreadable,
+        identity,
+        group,
+    )) = state.read(cx).form.as_ref().map(|f| {
+        (
+            f.name.clone(),
+            f.host.clone(),
+            f.port.clone(),
+            f.user.clone(),
+            f.password.clone(),
+            f.reveal_password,
+            f.password_unreadable,
+            f.identity.clone(),
+            f.group.clone(),
+        )
+    })
     else {
         return div().into_any_element();
     };
+    // 「解不开」的红字只在用户还没重新填之前显示;一开始输入就换回常规灰字提示
+    // (弹窗每帧重建,这里读输入框的值是活的)
+    let show_unreadable = password_unreadable && password.read(cx).value().is_empty();
     let can_save = form_valid(
         &name.read(cx).value().to_string(),
         &host.read(cx).value().to_string(),
@@ -1462,8 +1549,46 @@ fn render_form(state: &Entity<SshPanel>, cx: &mut App) -> AnyElement {
         .child(field(t("sshModal", "userLabel"), None, Input::new(&user)))
         .child(field(
             t("sshModal", "passwordLabel"),
-            Some(t("sshModal", "passwordHint")),
-            Input::new(&password),
+            if show_unreadable {
+                None
+            } else {
+                Some(t("sshModal", "passwordHint"))
+            },
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(4.0))
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(8.0))
+                        .child(div().flex_1().child(Input::new(&password)))
+                        .child(
+                            ui::ghost_button(
+                                "ssh-password-toggle",
+                                if reveal_password {
+                                    t("sshModal", "hidePassword")
+                                } else {
+                                    t("sshModal", "showPassword")
+                                },
+                            )
+                            .on_click({
+                                let state = state.clone();
+                                let password = password.clone();
+                                move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                                    toggle_password_reveal(&state, &password, window, cx);
+                                }
+                            }),
+                        ),
+                )
+                .when(show_unreadable, |el| {
+                    el.child(
+                        div()
+                            .text_size(ui::font_px(10.0))
+                            .text_color(ui::color_error())
+                            .child(t("sshModal", "passwordUnreadable")),
+                    )
+                }),
         ))
         .child(field(
             t("sshModal", "identityLabel"),

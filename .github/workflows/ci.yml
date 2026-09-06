@@ -1,10 +1,15 @@
 name: CI
 
+# 什么时候跑:
+# - 推 `v*` tag(发版):与 release.yml 并行,对账范围是上一个 `v*` tag 到本 tag 的
+#   全部变更(见下方 diff-base 的 tag 分支)。日常往分支 push **不跑** —— 本仓单人
+#   直推 main 为主,每次 push 都跑一遍两平台的全量 check + test 不值。
+# - pull_request:分支保护 `main-ci-gate` 要求 `Rust workspace` 这个 check 过了才能
+#   合(外部 PR 走这条),砍掉它 PR 会永远卡在 "waiting for status"。
+# - workflow_dispatch:想在某个分支上手动跑一次时用。
 on:
   push:
-    branches-ignore:
-      - 'dependabot/**'
-    tags-ignore:
+    tags:
       - 'v*'
   pull_request:
   workflow_dispatch:
@@ -35,10 +40,21 @@ jobs:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PUSH_BEFORE_SHA: ${{ github.event.before }}
           REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           if [ "$EVENT_NAME" = "pull_request" ]; then
             base="$PR_BASE_SHA"
+          elif [ "$REF_TYPE" = "tag" ]; then
+            # 发版 tag:变更行检查覆盖上一个 v* tag 之后的全部提交。tag push 的
+            # `before` 是全零,而 merge-base(HEAD, main) 就是 HEAD 自己,两条都给不出
+            # 有意义的范围。第一个 tag 没有前任就从根提交算。
+            prev="$(git describe --tags --abbrev=0 --match 'v*' HEAD^ 2>/dev/null || true)"
+            if [ -n "$prev" ]; then
+              base="$(git rev-parse "$prev^{commit}")"
+            else
+              base="$(git rev-list --max-parents=0 HEAD)"
+            fi
           elif [ "$REF_NAME" != "$DEFAULT_BRANCH" ]; then
             base="$(git merge-base HEAD "origin/$DEFAULT_BRANCH")"
           elif [ "$EVENT_NAME" = "push" ] && \
@@ -128,3 +144,37 @@ jobs:
 
       - name: Whitespace check
         run: git diff --check "${{ steps.diff-base.outputs.sha }}" HEAD
+
+  # 主力平台的编译门。clipboard / tray / frost / notify / dpapi / conpty / logfile
+  # 这些 cfg(windows) 模块在 ubuntu 作业里根本不进编译,此前只有发版时才第一次
+  # 编到它们。这里只做 check + 几个不拖 gpui 的 crate 的测试,不重复 rustfmt /
+  # clippy / i18n 对账(那些与平台无关,上面的作业已经管了)。
+  windows:
+    name: Windows check
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          workspaces: |
+            . -> target
+            sidecars -> sidecars/target
+
+      - name: Cargo check
+        run: cargo check --workspace --all-targets
+
+      - name: Sidecar check
+        run: cargo check --manifest-path sidecars/Cargo.toml --all-targets
+
+      # 真机才验得到的路径:ConPTY 起真进程、DPAPI 包裹主密钥、WSL UNC 解析。
+      # 这几个 crate 都不依赖 gpui,测试二进制几分钟内能编出来。
+      - name: Cargo test (Windows-specific crates)
+        run: cargo test -p mt-pty -p mt-secret -p mt-core -p mt-terminal

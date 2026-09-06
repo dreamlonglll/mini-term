@@ -426,6 +426,11 @@ fn discover_repo_paths(project_path: &Path) -> Vec<RepoPathEntry> {
         }
     }
     scan(project_path, 1, &mut entries);
+    // `read_dir` 给的是文件系统顺序 —— Windows 的 NTFS 恰好按名字,但 ext4 是
+    // 哈希序,同一个目录两次枚举都可能不一样,仓库下拉里的条目会莫名换位置。
+    // 按路径排一遍:顺序确定,且同名仓库(monorepo 里的一堆 `api`)按父目录
+    // 挨在一起,配上 UI 那行父级路径正好一眼对比。
+    entries.sort_by_key(|e| e.path.to_string_lossy().to_lowercase());
     entries
 }
 
