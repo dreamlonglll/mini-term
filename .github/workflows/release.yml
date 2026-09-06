@@ -264,8 +264,28 @@ jobs:
           </plist>
           PLIST
           # 架构段来自矩阵的 arch(aarch64 / x64),两个 mac 包只差这一个词
-          hdiutil create -volname "Mini-Term" -srcfolder "$APP" -ov -format UDZO \
-            "dist/Mini-Term_${VERSION}_${{ matrix.arch }}.dmg"
+          DMG="dist/Mini-Term_${VERSION}_${{ matrix.arch }}.dmg"
+          # hdiutil 在 Actions 的 macOS runner 上会随机报「create failed - No space
+          # left on device / could not access /Volumes/Mini-Term/...」:满的不是
+          # runner 磁盘(df 给你看),是 -srcfolder 自动估算出来的临时卷偏小
+          # (actions/runner-images#4288)。对策:显式 -size 给足余量(UDZO 最终
+          # 体积只看内容,空余压缩后不占),失败再卸掉残留的临时卷、尺寸翻倍重试。
+          # v1.2.4 / v1.2.6 / v1.2.6 的 Intel 补建三次都撞上,此前靠人工 rerun
+          # 整个作业,白等半小时编译
+          df -h .
+          SIZE_MB=$(( $(du -sm "$APP" | cut -f1) * 2 + 64 ))
+          for attempt in 1 2 3 4 5; do
+            if hdiutil create -volname "Mini-Term" -srcfolder "$APP" -ov -format UDZO \
+                 -size "${SIZE_MB}m" "$DMG"; then
+              break
+            fi
+            echo "::warning::hdiutil 第 $attempt 次失败(size=${SIZE_MB}m)"
+            [ "$attempt" -lt 5 ] || { echo "::error::hdiutil 连续 5 次失败"; exit 1; }
+            hdiutil detach /Volumes/Mini-Term -force >/dev/null 2>&1 || true
+            rm -f "$DMG"
+            SIZE_MB=$(( SIZE_MB * 2 ))
+            sleep 15
+          done
           ls -la dist
 
       - name: Assemble deb + tar.gz (Linux)
