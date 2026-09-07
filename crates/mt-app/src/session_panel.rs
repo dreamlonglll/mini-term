@@ -46,15 +46,15 @@
 //! —— 点同一种节点必须有同一种行为。
 
 use gpui::{
-    AnyElement, App, Context, Entity, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Task,
-    Window, div, prelude::FluentBuilder, px,
+    AnyElement, App, Context, Entity, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Task, Window, div,
+    prelude::FluentBuilder, px,
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::text::{TextView, TextViewStyle};
-use mt_ui::tooltip::Tooltip;
 use mt_ai::sessions::{AiSession, AiSessionMessage, LineageEdge};
 use mt_ui::icons::{AiVendor, BrandIcon, StatusDot, StatusKind};
+use mt_ui::tooltip::Tooltip;
 
 use crate::i18n::{t, tr};
 use crate::menu;
@@ -95,8 +95,7 @@ pub fn build_resume_command(agent: &str, session_id: &str) -> Option<String> {
     Some(match agent {
         "codex" => format!("codex resume {session_id}"),
         "grok" => format!("grok --resume {session_id}"),
-        // omp 的会话 id 来自 hook 上报(没有会话记录解析,列表里不会出现),
-        // 只服务于启动续接;`--resume` 按 id 前缀或路径找当前目录桶里的会话
+        // omp 的会话 id 来自 hook 上报；`--resume` 按 id 前缀或路径查当前目录桶
         "omp" => format!("omp --resume {session_id}"),
         _ => format!("claude --resume {session_id}"),
     })
@@ -329,7 +328,11 @@ impl Preview {
         self.messages
             .iter()
             .map(|m| {
-                let role = if m.role == "user" { "User" } else { "Assistant" };
+                let role = if m.role == "user" {
+                    "User"
+                } else {
+                    "Assistant"
+                };
                 match format_message_time(&m.timestamp) {
                     Some(time) => format!("{role} · {time}\n{}", m.content),
                     None => format!("{role}\n{}", m.content),
@@ -471,9 +474,9 @@ impl SessionPanel {
                 .map(|p| (p.path.clone(), p.wsl_sessions_distro.clone()));
             // **唯一的来源分流开关**(见模块注释):三条并发请求与远程那一条
             // 不会同时发出
-            let source = store.active_project().map(|p| {
-                crate::ssh_conn::session_source(p, store.ssh_connections())
-            });
+            let source = store
+                .active_project()
+                .map(|p| crate::ssh_conn::session_source(p, store.ssh_connections()));
             (project, source)
         };
         // 自记账边:mini-term 自己发起的 fork 当场记下的 child→parent。
@@ -543,12 +546,12 @@ impl SessionPanel {
                 self._tasks.push(cx.spawn(async move |this, cx| {
                     // [后台] SFTP 往返,秒级;`ai_sessions` 永不返 Err
                     // (失败静默降级为空表,与原版同)
-                    let result = cx
-                        .background_executor()
-                        .spawn(async move {
-                            crate::remote_ssh::ai_sessions(&conn, &remote_path, force)
-                        })
-                        .await;
+                    let result =
+                        cx.background_executor()
+                            .spawn(async move {
+                                crate::remote_ssh::ai_sessions(&conn, &remote_path, force)
+                            })
+                            .await;
                     let _ = this.update(cx, |this: &mut Self, cx| {
                         if this.request_id != req {
                             return;
@@ -679,7 +682,13 @@ impl SessionPanel {
     }
 
     /// 在当前活动 pane 里恢复会话。没有终端时退化成「开一个新的再恢复」。
-    fn resume(&mut self, command: String, new_tab: bool, window: &mut Window, cx: &mut Context<Self>) {
+    fn resume(
+        &mut self,
+        command: String,
+        new_tab: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(project_id) = self.store.read(cx).active_project_id.clone() else {
             return;
         };
@@ -993,10 +1002,12 @@ impl SessionPanel {
                             "session-preview-back",
                             format!("‹ {}", t("fileViewer", "back")),
                         )
-                        .on_click(cx.listener(|this: &mut Self, _, _window, cx| {
-                            this.preview = None;
-                            cx.notify();
-                        })),
+                        .on_click(cx.listener(
+                            |this: &mut Self, _, _window, cx| {
+                                this.preview = None;
+                                cx.notify();
+                            },
+                        )),
                     )
                     .child(
                         div()
@@ -1010,8 +1021,12 @@ impl SessionPanel {
                         el.child(
                             ui::ghost_button("session-copy-all", t("sessionViewer", "copyAll"))
                                 .tooltip(move |window, cx| {
-                                    Tooltip::new(tr!("sessionViewer", "messageCount", count = total))
-                                        .build(window, cx)
+                                    Tooltip::new(tr!(
+                                        "sessionViewer",
+                                        "messageCount",
+                                        count = total
+                                    ))
+                                    .build(window, cx)
                                 })
                                 .on_click(cx.listener(|this: &mut Self, _, _window, cx| {
                                     let Some(preview) = this.preview.as_ref() else {
@@ -1165,8 +1180,7 @@ impl Render for SessionPanel {
                 AiVendor::for_session(&session.session_type, session.model.as_deref())
             } else {
                 // 平铺的缺省是 claude(原版 `TYPE_VENDOR[...] ?? 'claude'`)
-                AiVendor::from_session_type(&session.session_type)
-                    .or(Some(AiVendor::Claude))
+                AiVendor::from_session_type(&session.session_type).or(Some(AiVendor::Claude))
             };
             let wsl_badge = session.wsl_distro.clone();
             let live = live_of.get(i).cloned().flatten();
@@ -1176,9 +1190,12 @@ impl Render for SessionPanel {
             // tooltip:树模式区分 live / 非 live,平铺恒是会话标题
             let tip: SharedString = if tree {
                 match &live_project {
-                    Some(name) => {
-                        tr!("sessionList", "branchTree.runningIn", project = name.clone()).into()
-                    }
+                    Some(name) => tr!(
+                        "sessionList",
+                        "branchTree.runningIn",
+                        project = name.clone()
+                    )
+                    .into(),
                     None => format!(
                         "{display_title}\n{}",
                         t("sessionList", "branchTree.clickToResume")

@@ -337,8 +337,7 @@ pub fn grok_question_from_line(line: &str) -> Option<AiQuestion> {
             update.get("title").and_then(|t| t.as_str()) == Some("ask_user_question")
         }
         Some("tool_call_update") => {
-            update.pointer("/rawInput/variant").and_then(|v| v.as_str())
-                == Some("AskUserQuestion")
+            update.pointer("/rawInput/variant").and_then(|v| v.as_str()) == Some("AskUserQuestion")
                 || update
                     .pointer("/_meta/x.ai~1tool/name")
                     .and_then(|v| v.as_str())
@@ -349,7 +348,10 @@ pub fn grok_question_from_line(line: &str) -> Option<AiQuestion> {
     if !is_ask {
         return None;
     }
-    let call_id = update.get("toolCallId").and_then(|i| i.as_str())?.to_string();
+    let call_id = update
+        .get("toolCallId")
+        .and_then(|i| i.as_str())?
+        .to_string();
     let items: Vec<AiQuestionItem> = update
         .pointer("/rawInput/questions")?
         .as_array()?
@@ -391,6 +393,7 @@ pub fn grok_question_from_line(line: &str) -> Option<AiQuestion> {
                     .get("multiSelect")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false),
+                recommended_index: None,
             })
         })
         .collect();
@@ -457,7 +460,10 @@ pub fn grok_question_answer_from_line(line: &str) -> Option<AiQuestionAnswer> {
     if !matches!(status, "completed" | "failed" | "canceled" | "cancelled") {
         return None;
     }
-    let call_id = update.get("toolCallId").and_then(|i| i.as_str())?.to_string();
+    let call_id = update
+        .get("toolCallId")
+        .and_then(|i| i.as_str())?
+        .to_string();
     let answered_msg = update
         .pointer("/rawOutput/UserAnswered/message")
         .and_then(|m| m.as_str());

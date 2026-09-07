@@ -389,6 +389,7 @@ pub fn codex_question_from_line(line: &str) -> Option<AiQuestion> {
                 options,
                 // request_user_input 无多选形态,TUI 是单选 + tab 附注
                 multi_select: false,
+                recommended_index: None,
             })
         })
         .collect();
@@ -423,7 +424,10 @@ pub fn codex_question_answer_from_line(line: &str) -> Option<AiQuestionAnswer> {
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(output) {
         // 实测形态(2026-09-01):{"answers":{"<题目id>":{"answers":["<label>"]}}};
         // 键按题目 id 对账,值的三种形态归一化交给 answer_labels
-        let map = v.get("answers").and_then(|a| a.as_object()).or_else(|| v.as_object());
+        let map = v
+            .get("answers")
+            .and_then(|a| a.as_object())
+            .or_else(|| v.as_object());
         if let Some(map) = map {
             for (key, value) in map {
                 if let Some(labels) = super::answer_labels(value) {

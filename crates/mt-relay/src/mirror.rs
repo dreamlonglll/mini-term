@@ -1,6 +1,6 @@
 //! 对话镜像:会话记录(JSONL)的增量解析 → 镜像消息序列。
 //!
-//! 数据源是 Claude/Codex 会话记录文件,不是终端原始输出(docs/adr/0001)。
+//! 数据源是 Claude/Codex/Grok/OMP 会话记录文件,不是终端原始输出(docs/adr/0001)。
 //! 移动端按 pane 订阅;桌面端把 pane 绑定到其项目目录下**最新**的会话文件,
 //! 轮询增量解析新行并推送。用轮询而非复用 mt-project 的 notify 监听是有意取舍:
 //! 镜像除了"文件长大"还要发现"更新的会话文件出现"(换绑),对单文件挂 notify
@@ -20,13 +20,13 @@ use std::time::SystemTime;
 use mt_ai::sessions as ai_sessions;
 use mt_relay_protocol::{MirrorMessage, MirrorQuestionItem, MirrorQuestionOption};
 
-/// 该 agent 是否有本模块能解析的会话记录(Claude / Codex / Grok 三家)。
+/// 该 agent 是否有本模块能解析的会话记录(Claude / Codex / Grok / OMP 四家)。
 ///
 /// 判定与其测试随 `ai_sessions.rs` 一起迁进了 mt-ai(那边是会话记录格式的归属方),
 /// 这里 re-export 保留原调用点名字。**红线**:输入检测能认出的 agent 比这宽
 /// (pi / opencode 也在 `AI_COMMANDS` 里),它们**没有**可解析的记录文件,调用方
 /// 必须据此跳过启发式绑定 —— `resolve_session_file` 只按项目找"最新的
-/// claude/codex/grok 记录",对一个 pi pane 调它会把同项目里别家的对话贴到这个
+/// claude/codex/grok/omp 记录",对一个 pi pane 调它会把同项目里别家的对话贴到这个
 /// pane 上(串台)。宁可空镜像。
 pub use mt_ai::sessions::agent_has_session_log;
 
@@ -39,10 +39,11 @@ pub enum MirrorAgent {
     Claude,
     Codex,
     Grok,
+    Omp,
 }
 
 /// 挂起中的 agent 提问:卡片已下发、尚未见到作答或打断。
-/// 仅 Claude 有此形态(AskUserQuestion);Codex/Grok 的审批走 hook 黄灯,不落记录。
+/// Claude/Codex/Grok/OMP 四家共用同一套挂起与作答对账。
 struct PendingQuestion {
     /// 提问卡片消息的镜像 seq(移动端作答以此定位)
     seq: u64,
@@ -106,10 +107,11 @@ impl MirrorParser {
 
     fn parse_line(&mut self, line: &str, out: &mut Vec<MirrorMessage>) {
         match self.agent {
-            // Claude/Codex 一行可产出多条(说明文字 + 提问卡片 / 作答标记 + 用户输入)
+            // Claude/Codex/OMP 一行可产出多条（说明文字 + 提问卡片 / 作答标记）。
             MirrorAgent::Claude => self.parse_claude_line(line, out),
             MirrorAgent::Codex => self.parse_codex_line(line, out),
             MirrorAgent::Grok => self.parse_grok_line(line, out),
+            MirrorAgent::Omp => self.parse_omp_line(line, out),
         }
     }
 
@@ -210,11 +212,34 @@ impl MirrorParser {
             }
         }
     }
+    /// OMP 行：普通 user/assistant 文本 + assistant 的 ask toolCall +
+    /// toolResult(toolName=ask) 作答回执。
+    fn parse_omp_line(&mut self, line: &str, out: &mut Vec<MirrorMessage>) {
+        if let Some(answer) = ai_sessions::omp_question_answer_from_line(line) {
+            self.resolve_answer(&answer, out);
+        }
+
+        if let Some(raw) = ai_sessions::omp_message_from_line(line) {
+            let is_user_text = raw.role == "user";
+            out.push(self.next_text_message(raw));
+            if is_user_text {
+                self.pending.clear();
+            }
+        }
+
+        if let Some(question) = ai_sessions::omp_question_from_line(line) {
+            self.push_question(question, out);
+        }
+    }
 
     /// 作答对账:回执命中挂起提问 → 产出标记并只移除**该**提问。
     /// 不能一刀切清空——提问可能与别的工具调用并行(同一条 assistant 消息里
     /// AskUserQuestion + Bash),别家工具的回执行不代表提问已了结
-    fn resolve_answer(&mut self, answer: &ai_sessions::AiQuestionAnswer, out: &mut Vec<MirrorMessage>) {
+    fn resolve_answer(
+        &mut self,
+        answer: &ai_sessions::AiQuestionAnswer,
+        out: &mut Vec<MirrorMessage>,
+    ) {
         let (resolved, still): (Vec<_>, Vec<_>) = self
             .pending
             .drain(..)
@@ -260,18 +285,27 @@ impl MirrorParser {
 
     /// 产出提问卡片并登记挂起。
     ///
-    /// 三家 TUI 都会在选项末尾自动追加一个会话记录里没有的兜底项
-    /// (Claude「Other」/Codex「None of the above」/Grok「z. Type your answer here」),
+    /// 四家 TUI 都会在选项末尾自动追加一个会话记录里没有的兜底项
+    /// (Claude「Other」/Codex「None of the above」/Grok「z. Type your answer here」/OMP「Other (type your own)」),
     /// 这里补进卡片与挂起,让移动端也点得到它——追加在尾部,已有选项的下标映射
     /// 不受影响。选中后 TUI 进入文本输入态(Codex 直接提交),移动端用下方
     /// 指令输入框接着打字即可。
-    fn push_question(&mut self, mut question: ai_sessions::AiQuestion, out: &mut Vec<MirrorMessage>) {
+    fn push_question(
+        &mut self,
+        mut question: ai_sessions::AiQuestion,
+        out: &mut Vec<MirrorMessage>,
+    ) {
         let extra_label = match self.agent {
             MirrorAgent::Claude => "Other",
             MirrorAgent::Codex => "None of the above",
             MirrorAgent::Grok => "Type your answer here",
+            MirrorAgent::Omp => "Other (type your own)",
         };
         for item in &mut question.items {
+            // OMP 在追加 Other 前按真实选项范围钳位 recommended。
+            if let Some(index) = item.recommended_index.as_mut() {
+                *index = (*index).min(item.options.len().saturating_sub(1));
+            }
             // 多选题 v1 只展示不可点选,不补
             if !item.multi_select {
                 item.options.push(ai_sessions::AiQuestionOption {
@@ -347,13 +381,37 @@ impl MirrorParser {
         // 文本由用户经指令输入框补上。该项永远是我们追加在尾部的那一个
         let is_grok_free_input = matches!(self.agent, MirrorAgent::Grok)
             && option_index as usize == item.options.len() - 1;
-        let keys = if is_grok_free_input {
+        let is_omp_other = matches!(self.agent, MirrorAgent::Omp)
+            && option_index as usize == item.options.len() - 1;
+        let initial = if matches!(self.agent, MirrorAgent::Omp) {
+            item.recommended_index.unwrap_or(0)
+        } else {
+            0
+        };
+        let target = option_index as usize;
+        let mut keys = if is_grok_free_input {
             "z".to_string()
         } else {
-            let mut keys = "\x1b[B".repeat(option_index as usize);
+            let mut keys = if target >= initial {
+                "\x1b[B".repeat(target - initial)
+            } else {
+                "\x1b[A".repeat(initial - target)
+            };
             keys.push('\r');
             keys
         };
+        // OMP 多题最后一题普通选项后进入 Submit 页,需要第二个 CR。
+        // Other 会打开输入态,不能提交第二个 CR。
+        if matches!(self.agent, MirrorAgent::Omp)
+            && question_index + 1 == pending.question.items.len() as u32
+            && pending.question.items.len() > 1
+            && !is_omp_other
+        {
+            keys.push('\r');
+        }
+        // 已知限制：最后一题选 Other 后，OMP 会切到 Submit 页；手机端自定义文本
+        // 发完后无法通过底部输入框发送裸回车（sendMobileCommand 会 trim 空文本），
+        // 因此用户需要回到桌面再按一次 Enter 完成提交。
         Some(AnswerKeys {
             keys,
             label: option.label.clone(),
@@ -532,6 +590,13 @@ pub fn resolve_session_file(
             fresh_since(newest_grok_file(project_path), min_mtime),
             MirrorAgent::Grok,
         ),
+        (
+            fresh_since(
+                ai_sessions::newest_omp_session_file(project_path),
+                min_mtime,
+            ),
+            MirrorAgent::Omp,
+        ),
     ];
     let mut best: Option<(PathBuf, SystemTime, MirrorAgent)> = None;
     for (candidate, agent) in candidates {
@@ -603,9 +668,13 @@ pub fn resolve_session_file_by_id(
     } else if agent_lower.contains("grok") {
         let dir = ai_sessions::find_grok_session_dir(project_path, session_id)?;
         ai_sessions::grok_updates_path(&dir).map(|p| (p, MirrorAgent::Grok))
-    } else {
+    } else if agent_lower == "omp" {
+        ai_sessions::find_omp_session_file(project_path, session_id).map(|p| (p, MirrorAgent::Omp))
+    } else if agent_lower.contains("claude") || agent_lower.is_empty() {
         let dirs = ai_sessions::find_claude_project_dirs(project_path);
         claude_session_file_in(&dirs, session_id).map(|p| (p, MirrorAgent::Claude))
+    } else {
+        None
     }
 }
 
@@ -840,7 +909,11 @@ mod tests {
         parser.feed(format!("{}\n", question_line()).as_bytes());
         assert!(parser.answer_keys(1, "toolu_q1", 0, 0).is_some());
         let msgs = parser.feed(
-            format!("{}\n", claude_line("user", "算了,先不选", "2026-09-01T03:32:00Z")).as_bytes(),
+            format!(
+                "{}\n",
+                claude_line("user", "算了,先不选", "2026-09-01T03:32:00Z")
+            )
+            .as_bytes(),
         );
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].kind, None, "打断不产出已作答标记");
@@ -1041,15 +1114,27 @@ mod tests {
             parser.answer_keys(0, "toolu_q1", 0, 0).is_none(),
             "seq 0 是文字消息不是提问"
         );
-        assert!(parser.answer_keys(99, "toolu_q1", 0, 0).is_none(), "不存在的 seq");
+        assert!(
+            parser.answer_keys(99, "toolu_q1", 0, 0).is_none(),
+            "不存在的 seq"
+        );
         assert!(
             parser.answer_keys(1, "toolu_stale", 0, 0).is_none(),
             "提问身份不符(换绑后 seq 碰撞的防线)"
         );
         // 下标 3 是追加的「Other」兜底项,合法;4 才越界
-        assert!(parser.answer_keys(1, "toolu_q1", 0, 3).is_some(), "Other 兜底项可点选");
-        assert!(parser.answer_keys(1, "toolu_q1", 0, 4).is_none(), "选项越界");
-        assert!(parser.answer_keys(1, "toolu_q1", 1, 0).is_none(), "题号越界/乱序");
+        assert!(
+            parser.answer_keys(1, "toolu_q1", 0, 3).is_some(),
+            "Other 兜底项可点选"
+        );
+        assert!(
+            parser.answer_keys(1, "toolu_q1", 0, 4).is_none(),
+            "选项越界"
+        );
+        assert!(
+            parser.answer_keys(1, "toolu_q1", 1, 0).is_none(),
+            "题号越界/乱序"
+        );
 
         // 多选题只展示不可点选
         let mut parser = MirrorParser::new(MirrorAgent::Claude);
@@ -1057,7 +1142,10 @@ mod tests {
         let msgs = parser.feed(format!("{multi}\n").as_bytes());
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].kind.as_deref(), Some("question"));
-        assert!(parser.answer_keys(0, "toolu_m", 0, 0).is_none(), "多选题不可点选");
+        assert!(
+            parser.answer_keys(0, "toolu_m", 0, 0).is_none(),
+            "多选题不可点选"
+        );
     }
 
     #[test]
@@ -1098,6 +1186,77 @@ mod tests {
         assert_eq!(msgs[0].source, "desktop");
         assert_eq!(msgs[1].source, "assistant");
         assert_eq!(msgs[1].content, "world");
+    }
+    #[test]
+    fn parser_omp_messages_question_and_answer() {
+        let mut parser = MirrorParser::new(MirrorAgent::Omp);
+        let data = concat!(
+            r#"{"type":"message","timestamp":"t0","message":{"role":"user","content":[{"type":"text","text":"help me"}]}}"#,
+            "\n",
+            r#"{"type":"message","timestamp":"t1","message":{"role":"assistant","content":[{"type":"text","text":"choose first"},{"type":"toolCall","id":"ask-1","name":"ask","arguments":{"questions":[{"id":"q1","question":"Which?","header":"Plan","options":[{"label":"A","description":"safe"},{"label":"B","description":"fast"}],"multi":false,"recommended":1}]}}]}}"#,
+            "\n",
+        );
+        let msgs = parser.feed(data.as_bytes());
+        assert_eq!(msgs.len(), 3, "{msgs:?}");
+        assert_eq!(msgs[0].source, "desktop");
+        assert_eq!(msgs[1].content, "choose first");
+        assert_eq!(msgs[2].kind.as_deref(), Some("question"));
+        assert_eq!(parser.answer_keys(2, "ask-1", 0, 1).unwrap().keys, "\r");
+
+        // recommended=1，选 B 直接回车；选 A 先向上一次。
+        assert_eq!(
+            parser.answer_keys(2, "ask-1", 0, 0).unwrap().keys,
+            "\x1b[A\r"
+        );
+        assert_eq!(
+            parser.answer_keys(2, "ask-1", 0, 2).unwrap().label,
+            "Other (type your own)"
+        );
+
+        let answered = r#"{"type":"message","timestamp":"t2","message":{"role":"toolResult","toolCallId":"ask-1","toolName":"ask","details":{"question":"Which?","selectedOptions":["B"],"multi":false}}}"#;
+        let marks = parser.feed(format!("{answered}\n").as_bytes());
+        assert_eq!(marks.len(), 1);
+        assert_eq!(marks[0].kind.as_deref(), Some("questionAnswered"));
+        assert_eq!(marks[0].ref_seq, Some(2));
+        assert_eq!(marks[0].labels, ["B"]);
+    }
+
+    #[test]
+    fn parser_omp_ignores_synthetic_user_without_clearing_question() {
+        let mut parser = MirrorParser::new(MirrorAgent::Omp);
+        let ask = r#"{"type":"message","timestamp":"t1","message":{"role":"assistant","content":[{"type":"toolCall","id":"ask-synthetic","name":"ask","arguments":{"questions":[{"id":"q1","question":"Which?","options":[{"label":"A"}]}]}}]}}"#;
+        parser.feed(format!("{ask}\n").as_bytes());
+        let synthetic = r#"{"type":"message","timestamp":"t2","message":{"role":"user","synthetic":true,"content":[{"type":"text","text":"internal"}]}}"#;
+        assert!(parser.feed(format!("{synthetic}\n").as_bytes()).is_empty());
+        assert!(parser.answer_keys(0, "ask-synthetic", 0, 0).is_some());
+    }
+
+    #[test]
+    fn parser_omp_clamps_recommended_before_other() {
+        let mut parser = MirrorParser::new(MirrorAgent::Omp);
+        let ask = r#"{"type":"message","timestamp":"t1","message":{"role":"assistant","content":[{"type":"toolCall","id":"ask-clamp","name":"ask","arguments":{"questions":[{"id":"q1","question":"Which?","options":[{"label":"A"},{"label":"B"}],"recommended":99}]}}]}}"#;
+        parser.feed(format!("{ask}\n").as_bytes());
+        assert_eq!(parser.answer_keys(0, "ask-clamp", 0, 1).unwrap().keys, "\r");
+        assert_eq!(
+            parser.answer_keys(0, "ask-clamp", 0, 2).unwrap().keys,
+            "\x1b[B\r"
+        );
+    }
+
+    #[test]
+    fn parser_omp_multi_question_submits_last_choice_but_not_other() {
+        let mut parser = MirrorParser::new(MirrorAgent::Omp);
+        let ask = r#"{"type":"message","timestamp":"t1","message":{"role":"assistant","content":[{"type":"toolCall","id":"ask-multi","name":"ask","arguments":{"questions":[{"id":"q1","question":"First?","options":[{"label":"A"}]},{"id":"q2","question":"Second?","options":[{"label":"B"}]}]}}]}}"#;
+        parser.feed(format!("{ask}\n").as_bytes());
+        parser.mark_answered(0);
+        assert_eq!(
+            parser.answer_keys(0, "ask-multi", 1, 0).unwrap().keys,
+            "\r\r"
+        );
+        assert_eq!(
+            parser.answer_keys(0, "ask-multi", 1, 1).unwrap().keys,
+            "\x1b[B\r"
+        );
     }
 
     fn make_messages(n: u64) -> Vec<MirrorMessage> {
@@ -1195,8 +1354,11 @@ mod tests {
         let root = temp_dir("codex");
         let day = root.join("2026").join("07").join("25");
         fs::create_dir_all(&day).unwrap();
-        let meta =
-            |id: &str| format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":\"D:\\\\proj\"}}}}\n");
+        let meta = |id: &str| {
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":\"D:\\\\proj\"}}}}\n"
+            )
+        };
         fs::write(day.join("rollout-1.jsonl"), meta("sid-first")).unwrap();
         fs::write(day.join("rollout-2.jsonl"), meta("sid-second")).unwrap();
 

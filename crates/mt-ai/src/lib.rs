@@ -27,10 +27,10 @@
 //!   ① Claude 兼容层导致同一事件来两趟,靠 `GROK_SESSION_ID` + 有无 argv 丢弃
 //!   (只注册了 Claude 的用户必须放行);② 注册进 `~/.grok/hooks/` 的必须是
 //!   **不含空格的裸文件名**。
-//! - **只有 Claude / Codex / Grok 有可解析的会话记录**
-//!   ([`sessions::agent_has_session_log`])。opencode / pi / omp 这类没有记录解析的
-//!   agent 必须在镜像绑定时跳过,否则会绑到同项目其它 agent 的最新会话文件。
-//! - **oh-my-pi(omp)的 hook 不走 sidecar**:它的扩展点是进程内加载的 TS 模块,
+//! - **Claude / Codex / Grok / OMP 有移动镜像可解析的会话记录**
+//!   ([`sessions::agent_has_session_log`])。opencode / pi 必须在镜像绑定时跳过,
+//!   否则会绑到同项目其它 agent 的最新会话文件。
+//! - **oh-my-pi(omp) 的 hook 不走 sidecar**:它的扩展点是进程内加载的 TS 模块,
 //!   [`hook_registry`] 把自带的扩展整份写进 `~/.omp/agent/extensions/`,扩展在 omp
 //!   进程内 `fetch` 本地 hook 服务器,事件名翻译成与 Claude 同名的 PascalCase。
 //! - **hook 接收端原样保留**:端口(23456 起,冲突递增 5 次)、路由(`POST /hook`)、
@@ -56,9 +56,9 @@ pub mod sessions;
 pub mod tracker;
 mod util;
 
-pub use detect::{interactive_ai_command_name, is_interactive_ai_command, AI_COMMANDS};
-pub use hook_server::{is_attention_cause, HookState, HookStatusInfo};
+pub use detect::{AI_COMMANDS, interactive_ai_command_name, is_interactive_ai_command};
+pub use hook_server::{HookState, HookStatusInfo, is_attention_cause};
 pub use monitor::{SessionIdentity, StatusChange, StatusEmitter, StatusSink};
 pub use perception::AiPerception;
-pub use sessions::{agent_has_session_log, AiSession, AiSessionMessage, LineageEdge};
+pub use sessions::{AiSession, AiSessionMessage, LineageEdge, agent_has_session_log};
 pub use tracker::{SessionTracker, UserSubmit};

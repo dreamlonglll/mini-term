@@ -61,9 +61,9 @@ Status aggregates layer by layer from pane → tab → project. The moment a tas
 Fill in your relay address in the top-bar "Mobile" panel → save & connect → generate a pairing QR code. **Point your phone camera at it and the PWA opens and pairs itself.** From then on, while you're away you can:
 
 - See **active AI sessions grouped by project**, with status lights synced live with the desktop
-- Tap into any session for a **live conversation mirror** — Markdown-rendered replies, scroll up to page in older messages
+- Tap into any Claude / Codex / Grok / OMP session for a **live conversation mirror** — Markdown-rendered replies, scroll up to page in older messages
 - **Send commands** from the input box at the bottom — equivalent to typing it on the desktop keyboard and pressing Enter, with an immediate receipt
-- **Answer the agent's questions right on your phone** — Claude / Codex / Grok questions show up as cards in the mirror; tapping an option selects and confirms it in the desktop TUI on your behalf, and sessions waiting on you (a pending question, a permission prompt) glow amber in the list
+- **Answer the agent's questions right on your phone** — Claude / Codex / Grok / OMP questions show up as cards in the mirror; tapping an option selects and confirms it in the desktop TUI on your behalf, and sessions waiting on you (a pending question, a permission prompt) glow amber in the list
 - **Start a brand-new session from your phone**: pick a project → pick an AI launcher, and the desktop brings the agent up in a background tab
 
 > **Prerequisite**: the relay runs on **your own** server (1 vCPU / 1 GB is plenty, one Docker command to start, plus a domain pointed at it for TLS). That's deliberate — there is no third-party service in the middle. See the [deployment guide](docs/deploy-relay.md).
