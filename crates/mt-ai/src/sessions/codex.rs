@@ -389,6 +389,7 @@ pub fn codex_question_from_line(line: &str) -> Option<AiQuestion> {
                 options,
                 // request_user_input 无多选形态,TUI 是单选 + tab 附注
                 multi_select: false,
+                recommended_index: None,
             })
         })
         .collect();

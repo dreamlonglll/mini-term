@@ -1214,8 +1214,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "mt-secret"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "mt-core",
+ "ring",
+ "serde",
+ "serde_json",
+ "windows-sys 0.52.0",
+ "zeroize",
+]
+
+[[package]]
 name = "mt-sidecars"
-version = "0.4.8"
+version = "0.4.9"
 dependencies = [
  "base64",
  "clap",
@@ -1239,6 +1252,7 @@ dependencies = [
  "dirs",
  "futures",
  "mt-core",
+ "mt-secret",
  "rsa",
  "russh",
  "russh-sftp",

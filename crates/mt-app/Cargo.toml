@@ -40,6 +40,8 @@ mt-relay.workspace = true
 # 服务层在 `remote_ssh.rs`,自持一个小 tokio 运行时(见该模块的线程口径说明)。
 mt-ssh.workspace = true
 mt-core.workspace = true
+# 已存 SSH 密码的封存/解封(`secrets.rs` 接线):表单保存时封存、编辑与自动填充时解开。
+mt-secret.workspace = true
 # `remote_ssh` 的 tokio 边界:russh / russh-sftp 的 IO 要 tokio driver,
 # gpui 的执行器喂不动。工作区里已有这一行(mt-relay 用同一份 feature 集),
 # 这里只是引用,**没有改根 Cargo.toml**。
@@ -107,6 +109,9 @@ gpui = { workspace = true, features = ["x11", "wayland"] }
 # 版本跟随 gpui 已经在用的那个,不给依赖树引入第二份 windows crate。
 windows = { version = "0.61", features = [
     "Win32_Foundation",
+    # 装机版日志落盘(logfile.rs):GetStdHandle 判「有没有 stderr」,
+    # SetStdHandle 把 stderr / stdout 换成 mini-term.log 的句柄。
+    "Win32_System_Console",
     # 首启探测界面语言:GetUserDefaultLocaleName。Windows 上 LANG/LC_ALL 这些
     # 环境变量通常不存在,只能问系统(见 i18n::system_locale)。
     "Win32_Globalization",

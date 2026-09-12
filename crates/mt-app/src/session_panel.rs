@@ -95,6 +95,8 @@ pub fn build_resume_command(agent: &str, session_id: &str) -> Option<String> {
     Some(match agent {
         "codex" => format!("codex resume {session_id}"),
         "grok" => format!("grok --resume {session_id}"),
+        // omp 的会话 id 来自 hook 上报；`--resume` 按 id 前缀或路径查当前目录桶
+        "omp" => format!("omp --resume {session_id}"),
         _ => format!("claude --resume {session_id}"),
     })
 }
@@ -1434,6 +1436,10 @@ mod tests {
         assert_eq!(
             build_resume_command("grok", "0199-x").as_deref(),
             Some("grok --resume 0199-x")
+        );
+        assert_eq!(
+            build_resume_command("omp", "1f9d2a6b9c0d1234").as_deref(),
+            Some("omp --resume 1f9d2a6b9c0d1234")
         );
         // 未知 agent 按 claude 兜底(与旧版一致)
         assert!(build_resume_command("whatever", "id1").is_some());

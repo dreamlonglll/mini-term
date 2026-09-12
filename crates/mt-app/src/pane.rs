@@ -1015,6 +1015,9 @@ struct PasteContext {
     /// 远程 pane 的上传素材:连接 + 远程项目路径。断链时为 `None`。
     remote: Option<(mt_config::SshConnection, String)>,
     remote_paste_dir: String,
+    /// pane 里正跑着会自己读剪贴板的 agent(Claude Code):有图就发 `Alt+V`
+    /// 交给它,不落盘。判据见 [`clipboard::agent_takes_clipboard_image`]。
+    agent_takes_image: bool,
 }
 
 /// 取一次粘贴上下文。失败提示的标题行在这里定死,不会为空。
@@ -1043,21 +1046,30 @@ fn paste_context(pty_id: u32, cx: &gpui::App) -> PasteContext {
         let conn = s.remote_connection_of(pid)?;
         Some((conn, project.path.clone()))
     });
+    let target = clipboard::resolve_paste_target(s, pty_id);
+    // 状态与 agent 名都取 pane 当下那份:hook 上报优先、输入检测兜底(`ai_agent`),
+    // 与 tab 上品牌图标同一口径。
+    let agent_takes_image = owner
+        .as_ref()
+        .and_then(|(pid, pane_id)| s.project_state(pid)?.pane(pane_id))
+        .is_some_and(|p| clipboard::agent_takes_clipboard_image(p.status, p.ai_agent(), target));
     PasteContext {
         enabled: cfg.long_paste_to_file,
         line_threshold: cfg.long_paste_line_threshold,
         char_threshold: cfg.long_paste_char_threshold,
-        target: clipboard::resolve_paste_target(s, pty_id),
+        target,
         project_id: owner.map(|(pid, _)| pid).unwrap_or_default(),
         project_name,
         remote,
         remote_paste_dir: cfg.remote_paste_dir.clone(),
+        agent_takes_image,
     }
 }
 
 /// 一次粘贴该往终端里写什么(`terminalCache.ts::pasteToTerminalInner`)。
 ///
 /// ```text
+/// 剪贴板有图 && pane 里正跑着 Claude Code(本地/WSL)→ 不落盘,发 Alt+V 让它自己取
 /// 剪贴板有图 → 落盘 → 写 "{映射后的路径}";远程 pane 交给后台上传
 ///   └─ 有图但读不出 → 发 Alt+V,让终端里的 AI 工具自己读剪贴板
 /// 否则取文本 → 空则什么都不做
@@ -1087,6 +1099,14 @@ fn resolve_paste(pty_id: u32, cx: &mut gpui::App) -> PasteAction {
     // 内容,出现「判定是图、粘出来是文本」。
     let item = cx.read_from_clipboard();
 
+    // pane 里正跑着 Claude Code:有图就把 Alt+V 交给它,由它自己读剪贴板插
+    // `[Image #N]` 芯片 —— 模型直接看到图,比粘一条本机路径强。**排在落盘之前**,
+    // 否则临时目录里会多一个谁也不引用的文件。SSH pane 不进这里
+    // (`agent_takes_clipboard_image` 已挡),仍走下面的上传路线。
+    if ctx.agent_takes_image && clipboard::clipboard_has_image(item.as_ref()) {
+        return PasteAction::Raw(clipboard::ALT_V.to_string());
+    }
+
     // 图片先判 —— 截图工具放进剪贴板的只有位图,没有文本可粘,这一支不判阈值
     // 也不看 `enabled`。
     match clipboard::read_clipboard_image(item.as_ref()) {
@@ -1113,6 +1133,7 @@ fn resolve_paste(pty_id: u32, cx: &mut gpui::App) -> PasteAction {
         project_name,
         remote,
         remote_paste_dir,
+        agent_takes_image: _,
     } = ctx;
 
     // SSH 远程 pane:转存 + SFTP 上传是异步的,交给后台任务,钩子当场返回
@@ -1291,10 +1312,15 @@ fn connect_ssh(pty_id: u32, conn: SshConnection, window: &mut Window, cx: &mut A
     let Some(terminal) = AppStore::global(cx).read(cx).terminal(pty_id).cloned() else {
         return;
     };
-    if let Some(password) = conn.password.clone().filter(|p| !p.is_empty()) {
-        // `disarm_on_input = false`:与原版 `arm_ssh_autofill` command 同参
-        // (那条路是用户手动敲 `ssh`,首次输入不该把 autofill 解掉)
-        terminal.read(cx).arm_ssh_autofill(password, false);
+    // 已存密码是 `mt-secret` 信封,交给 autofill 前在这里解开;解不开就提示并不填
+    // (终端里照常出现密码提示,用户手输即可)。
+    if let Some(stored) = conn.password.as_deref().filter(|p| !p.is_empty()) {
+        match crate::secrets::reveal_password(stored) {
+            // `disarm_on_input = false`:与原版 `arm_ssh_autofill` command 同参
+            // (那条路是用户手动敲 `ssh`,首次输入不该把 autofill 解掉)
+            Ok(password) => terminal.read(cx).arm_ssh_autofill(password, false),
+            Err(err) => crate::secrets::toast_password_error(err, cx),
+        }
     }
     let identity = conn
         .identity_file

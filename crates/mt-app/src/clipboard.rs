@@ -14,6 +14,7 @@
 //!
 //! | 剪贴板内容 | 处理 |
 //! |---|---|
+//! | 图片,pane 里正跑着 Claude Code | **不落盘**,直接发 `Alt+V` 让它自己取([`agent_takes_clipboard_image`]) |
 //! | 图片 | 落盘临时文件 → 粘带引号的路径([`read_clipboard_image`]);读不出则退 `Alt+V` |
 //! | 长文本(过阈值) | 落盘 `.txt` → 粘带引号的路径 |
 //! | 其余文本 | 原样粘 |
@@ -31,9 +32,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::notify::ToastKind;
+use crate::pane_actions::is_ai_alive;
 use crate::store::AppStore;
 use crate::toast;
 use crate::tr;
+use crate::tree::PaneStatus;
 
 /// 临时文件目录名。图片(`clip-*.png`)与长文本(`paste-*.txt`)同处一处,
 /// 且与装机版**共用同一个目录名** —— 两边的 24h 清理因此互相覆盖得到。
@@ -117,10 +120,59 @@ pub fn cleanup_old_files() {
 
 /// AI CLI 自取剪贴板图片的转义序列(`Alt+V`)。
 ///
-/// 剪贴板里**确实有图但本进程读不出来**时发这个,让终端里跑着的 AI 工具自己去
-/// 读系统剪贴板(装机版 `pasteToTerminalInner` 的同名兜底)。注意它对 SSH 远程
-/// pane 无效 —— 那头的 agent 读的是**远端**剪贴板。
+/// 两处用它:① pane 里正跑着会读剪贴板的 agent([`agent_takes_clipboard_image`]),
+/// 有图就直接交给它;② 剪贴板里**确实有图但本进程读不出来**时的兜底,让终端里
+/// 跑着的 AI 工具自己去读系统剪贴板(装机版 `pasteToTerminalInner` 的同名兜底)。
+/// 注意它对 SSH 远程 pane 无效 —— 那头的 agent 读的是**远端**剪贴板。
 pub const ALT_V: &str = "\x1bv";
+
+/// 这个 pane 里的 agent 会不会**自己**从系统剪贴板取图 —— 会的话粘图时不落盘,
+/// 直接发 [`ALT_V`],由它插一枚 `[Image #N]` 芯片,模型直接看到图;粘一条本机
+/// 路径它还得再 Read 一次,而且路径串本身会占掉提示词的一截。
+///
+/// 目前只认 Claude Code:官方文档把 `Alt+V` 列为 Windows / WSL 下的「Paste image
+/// from clipboard」(`docs/en/interactive-mode`)。三个条件缺一不可:
+///
+/// - **agent 正活着**(`ai-working` / `ai-idle`,口径同 [`is_ai_alive`]):退出后的
+///   pane 仍留着会话身份备查(供续接),此时 shell 收到 `ESC v` 只是个 readline
+///   动作,图就静默丢了 —— 那种 pane 照旧落盘粘路径;
+/// - agent 是 Claude 系:codex / grok / omp 没有对应的键,照旧粘路径。⚠️ 同一家有
+///   **两种写法**:hook 上报的是 `claude-code`(sidecar `detect_agent`),输入检测
+///   认出的是 `claude` —— 只认全等 `"claude"` 会让开了 hook 的用户(绝大多数)
+///   永远走不进来,真机就是这么栽的。口径照抄 `mt_ai::sessions::agent_has_session_log`:
+///   小写后 `contains("claude")`;
+/// - 不是 SSH pane:远端的 Claude 读的是**远端**剪贴板,仍走 SFTP 上传那条路。
+///
+/// **不看「智能 Ctrl+C/V」开关**:开关关着时 Ctrl+V 压根到不了粘贴钩子
+/// (原样写 `^V`,Claude 自己就当图片粘贴处理),开着时才会被本程序截住 ——
+/// 这条规则正是让「截住」之后与「没截」等价;Ctrl+Shift+V / 右键粘贴同样走它,
+/// 同一个 pane 里三条入口粘出来的东西才是一样的。
+pub fn agent_takes_clipboard_image(
+    status: PaneStatus,
+    agent: Option<&str>,
+    target: PasteTarget,
+) -> bool {
+    let is_claude = agent.is_some_and(|a| a.to_ascii_lowercase().contains("claude"));
+    is_ai_alive(status) && is_claude && target != PasteTarget::Ssh
+}
+
+/// 剪贴板里有没有图 —— **只探测不落盘**。
+///
+/// 给 [`agent_takes_clipboard_image`] 那条路用:agent 自己会去读,这里再落一份
+/// 纯属浪费,还会在临时目录里留一个谁也不引用的文件。探测口径与
+/// [`read_clipboard_image`] 同源:Windows 先看 `CF_DIB` / `CF_BITMAP` 在不在场,
+/// 再看 gpui 快照里有没有图片 entry(浏览器复制图片走后者)。
+pub fn clipboard_has_image(item: Option<&gpui::ClipboardItem>) -> bool {
+    #[cfg(windows)]
+    if win::clipboard_has_bitmap() {
+        return true;
+    }
+    item.is_some_and(|it| {
+        it.entries()
+            .iter()
+            .any(|entry| matches!(entry, gpui::ClipboardEntry::Image(_)))
+    })
+}
 
 /// 读剪贴板图片的三态结果。
 ///
@@ -261,6 +313,18 @@ pub mod win {
         NoImage,
         /// 有图,但拿不到 / 解不出 / 存不下。
         Failed(String),
+    }
+
+    /// `CF_DIB` / `CF_BITMAP` 在不在剪贴板里 —— 只问格式,不取数据。
+    ///
+    /// `IsClipboardFormatAvailable` **不要求先 `OpenClipboard`**(MSDN 明示),
+    /// 所以这条探测不会与剪贴板管理器抢锁;[`read_clipboard_to_png`] 里那两次
+    /// 同名调用夹在 Open/Close 之间只是顺路。
+    pub fn clipboard_has_bitmap() -> bool {
+        unsafe {
+            IsClipboardFormatAvailable(CF_DIB).is_ok()
+                || IsClipboardFormatAvailable(CF_BITMAP).is_ok()
+        }
     }
 
     /// 尝试从剪贴板读取图片(`CF_DIB` → `CF_BITMAP`),保存为 PNG 到临时目录。
@@ -972,6 +1036,52 @@ mod tests {
         let text = gpui::ClipboardItem::new_string("hello".into());
         assert!(gpui_image(Some(&text)).is_none());
         assert!(gpui_image(None).is_none());
+    }
+
+    /// 只有「Claude 正活着 && 本地/WSL pane」才把图交给 agent 自己取;
+    /// 三个条件各缺一个都要退回落盘粘路径。
+    #[test]
+    fn 只有活着的_claude_本地_pane_才自取剪贴板图片() {
+        use PaneStatus as S;
+        use PasteTarget as T;
+        let takes = agent_takes_clipboard_image;
+
+        assert!(takes(S::AiIdle, Some("claude"), T::Local));
+        // hook 上报的是 `claude-code`,不是 `claude` —— 真机第一轮就栽在这里
+        assert!(takes(S::AiIdle, Some("claude-code"), T::Local));
+        assert!(
+            takes(S::AiIdle, Some("Claude-Code"), T::Local),
+            "大小写不敏感"
+        );
+        assert!(
+            takes(S::AiWorking, Some("claude"), T::Local),
+            "思考中也能排队贴图"
+        );
+        assert!(
+            takes(S::AiIdle, Some("claude"), T::Wsl),
+            "WSL 里的 Claude 读的也是 Windows 剪贴板"
+        );
+
+        // 退出后的 pane 留着会话身份备查,但 shell 收到 ESC v 只是 readline 动作
+        assert!(!takes(S::Idle, Some("claude"), T::Local));
+        assert!(!takes(S::Error, Some("claude"), T::Local));
+        // 别家 CLI 没有对应的键
+        assert!(!takes(S::AiIdle, Some("codex"), T::Local));
+        assert!(!takes(S::AiIdle, Some("grok"), T::Local));
+        assert!(!takes(S::AiIdle, Some("omp"), T::Local));
+        assert!(!takes(S::AiIdle, None, T::Local));
+        // 远端的 Claude 读的是远端剪贴板 —— 仍走 SFTP 上传
+        assert!(!takes(S::AiIdle, Some("claude"), T::Ssh));
+    }
+
+    /// 探测口径与落盘那条路同源:gpui 快照里有图片 entry 就算有图,纯文本 / 空
+    /// 快照不算。Windows 上 `CF_DIB` 那一问读的是真实系统剪贴板,这里不断言它 ——
+    /// 只断言「快照里有图 ⇒ 探测为真」这一边(另一边被真实剪贴板干扰)。
+    #[test]
+    fn 剪贴板探图认_gpui_图片_entry() {
+        let image = gpui::Image::from_bytes(gpui::ImageFormat::Png, b"\x89PNG".to_vec());
+        let item = gpui::ClipboardItem::new_image(&image);
+        assert!(clipboard_has_image(Some(&item)));
     }
 
     /// gpui 的每个图片格式都要有个像样的扩展名(拿它当文件名后缀)。

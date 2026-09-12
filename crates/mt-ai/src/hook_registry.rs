@@ -1,7 +1,15 @@
 //! Hook 注册/卸载模块
 //!
-//! 一键把 Claude Code / Codex / Grok 三家的 hook 配置写进各自的配置文件，
+//! 一键把 Claude Code / Codex / Grok / oh-my-pi 各家的 hook 配置写进各自的配置文件，
 //! 并提供配置片段供用户手动粘贴。原本是一组 Tauri command，迁移后是普通函数。
+//!
+//! # oh-my-pi（omp）不走 sidecar
+//!
+//! omp 没有「shell 命令 hook」这种东西：它的扩展点是**进程内加载的 TS 模块**
+//! （`{omp_agent_dir}/extensions/*.ts`，Bun 运行时）。所以这一家不注册二进制命令，
+//! 而是把一份自带的 TS 扩展（[`OMP_EXTENSION_SOURCE`]）整份写进该目录；扩展在 omp
+//! 进程内直接 `fetch` 本地 hook 服务器，事件名翻译成与 Claude 同名的 PascalCase 后
+//! POST，hook server 不用为它改一行。详见 [`register_omp_hooks`]。
 //!
 //! # Grok 的两处结构性差异（改动前先读 [`register_grok_hooks`] 与
 //! [`GROK_HOOK_FILE`] 的注释）
@@ -419,37 +427,71 @@ fn build_codex_hook_entry(hook_path: &str, event: &str) -> Value {
     }])
 }
 
-/// 确保 Codex config.toml 中启用了 hooks feature flag
-fn ensure_codex_hooks_feature() -> Result<(), String> {
+/// 将 Codex config.toml 更新为当前 hooks feature，并迁移旧版键。
+///
+/// 抽成纯函数，避免测试改写开发者真实的 `~/.codex/config.toml`。
+fn enable_codex_hooks_feature(content: &str) -> Result<String, String> {
+    let mut doc: toml_edit::DocumentMut = content
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| format!("解析 config.toml 失败: {}", e))?;
+
+    if doc.get("features").is_none() {
+        doc["features"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    let features = doc["features"]
+        .as_table_like_mut()
+        .ok_or_else(|| "config.toml 的 features 字段不是表".to_string())?;
+
+    // Codex CLI 0.152.1 起改用 `hooks`；移除旧键，避免新版本报告未知 feature。
+    features.remove("codex_hooks");
+    features.insert("hooks", toml_edit::value(true));
+    Ok(doc.to_string())
+}
+
+/// 确保 Codex config.toml 中启用了当前 hooks feature flag。
+///
+/// 返回是否真的落盘：键已经是现行名字时原样返回，一个字节都不写。启动期自愈
+/// （`sync_codex_hooks_feature_if_registered`）走的就是这条路，不能每次启动都
+/// 重写一遍用户的 config.toml。
+fn ensure_codex_hooks_feature() -> Result<bool, String> {
     let config_path = codex_config_path().ok_or_else(|| "无法获取 home 目录".to_string())?;
 
-    // 确保 .codex 目录存在
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("创建 .codex 目录失败: {}", e))?;
     }
 
-    // 读取或创建 config.toml
     let content = if config_path.exists() {
         std::fs::read_to_string(&config_path)
             .map_err(|e| format!("读取 config.toml 失败: {}", e))?
     } else {
         String::new()
     };
-
-    let mut doc: toml_edit::DocumentMut = content
-        .parse::<toml_edit::DocumentMut>()
-        .map_err(|e| format!("解析 config.toml 失败: {}", e))?;
-
-    // 确保 [features] 段落存在并设置 codex_hooks = true
-    if doc.get("features").is_none() {
-        doc["features"] = toml_edit::Item::Table(toml_edit::Table::new());
+    let updated = enable_codex_hooks_feature(&content)?;
+    if updated == content {
+        return Ok(false);
     }
-    doc["features"]["codex_hooks"] = toml_edit::value(true);
 
-    crate::util::atomic_write(&config_path, doc.to_string().as_bytes())
+    crate::util::atomic_write(&config_path, updated.as_bytes())
         .map_err(|e| format!("写入 config.toml 失败: {}", e))?;
 
-    Ok(())
+    Ok(true)
+}
+
+/// 已注册用户的启动期自愈：把 config.toml 里的 feature 键迁到当前名字。
+///
+/// config.toml 只有点「注册」时才写，而面板判「已注册」只看 hooks.json——存量
+/// 用户升级 mini-term 后面板照旧显示已注册，config.toml 里却还留着废弃的
+/// `codex_hooks`，每次开 codex 都吃一条弃用告警（issue #72），且界面上没有任何
+/// 线索提示他该去重点一次注册。故只要 hooks.json 里有我们的条目就迁一次。
+pub fn sync_codex_hooks_feature_if_registered() {
+    if registered_codex_events().is_empty() {
+        return;
+    }
+    match ensure_codex_hooks_feature() {
+        Ok(true) => eprintln!("[hook-registry] codex config.toml 已迁至 features.hooks"),
+        Ok(false) => {}
+        Err(e) => eprintln!("[hook-registry] codex feature 迁移失败: {}", e),
+    }
 }
 
 /// 注册 Codex hooks 到 ~/.codex/hooks.json
@@ -781,13 +823,209 @@ pub fn sync_grok_hooks_if_registered() {
     }
 }
 
+// ─── oh-my-pi（omp）扩展注册/卸载 ───
+//
+// 「注册现状」的判据是扩展文件在场且带 `miniterm-hook` 标识；事件计数按文件里
+// `pi.on("<event>"` 的出现与否对账，老版本模板缺的事件就显示成「旧版本 N/M」。
+// 启动期自愈（`sync_omp_hooks_if_registered`）在文件内容与当前模板不同时整份重写
+// ——模板修了 bug / 加了事件，老用户下次启动即拿到，不必再点一次「注册」。
+
+/// 写进 omp 扩展目录的文件名
+const OMP_EXTENSION_FILE: &str = "miniterm.ts";
+
+/// omp 扩展源码（随主程序编译进来，注册时整份落盘）。文件本身不含任何机器相关
+/// 信息：端口走 `MINITERM_HOOK_PORT` / hook-server.json，pane 走 `MINITERM_PTY_ID`，
+/// 所以任何机器上的内容都逐字相同，「是否需要刷新」按整份相等判断即可。
+const OMP_EXTENSION_SOURCE: &str = include_str!("../assets/miniterm-omp.ts");
+
+/// omp 扩展订阅的 omp 事件（omp 自己的 snake_case 事件名）。面板的「已注册 N/M」
+/// 与启动期补齐按它对账；与 `OMP_EXTENSION_SOURCE` 里的 `pi.on(...)` 逐条对应
+/// （单测钉住两边一致）。
+const OMP_HOOK_EVENTS: &[&str] = &[
+    "session_start",
+    "session_switch",
+    "session_branch",
+    "session_shutdown",
+    "agent_start",
+    "agent_end",
+    "tool_call",
+    "tool_result",
+    "tool_approval_requested",
+    "tool_approval_resolved",
+    "auto_retry_start",
+    "auto_compaction_start",
+    "auto_compaction_end",
+];
+
+/// omp 扩展会上报给 hook 服务器的事件名（PascalCase，与 Claude 同名）。
+/// `hook_server::map_event_to_status` 必须认识其中每一个（`SessionEnd` 单独处理），
+/// 由 hook_server 的单测钉住——漏一个就是一段状态空洞。
+/// （`pub` 而非 `pub(crate)`：它只被单测消费，crate 私有会在非测试构建里报 dead_code。）
+pub const OMP_REPORTED_EVENTS: &[&str] = &[
+    "SessionStart",
+    "SessionEnd",
+    "UserPromptSubmit",
+    "Stop",
+    "StopFailure",
+    "PreToolUse",
+    "PostToolUse",
+    "PostToolUseFailure",
+    "Elicitation",
+    "ElicitationResult",
+    "PermissionRequest",
+    "PermissionDenied",
+    "Notification",
+    "PreCompact",
+    "PostCompact",
+];
+
+/// omp 的 agent 目录（纯函数，环境取值由 [`omp_agent_dir`] 负责）：
+/// `PI_CODING_AGENT_DIR` 优先；否则 `~/{PI_CONFIG_DIR 或 .omp}/agent`，带 `PI_PROFILE`
+/// 时是 `~/.omp/profiles/{profile}/agent`——与 omp 自身 `getAgentDir()` 的口径一致。
+/// Linux 上经 `omp config init-xdg` 迁走的 XDG 布局不支持：那是罕见的显式迁移。
+fn omp_agent_dir_from(
+    home: &std::path::Path,
+    coding_agent_dir: Option<&str>,
+    config_dir: Option<&str>,
+    profile: Option<&str>,
+) -> PathBuf {
+    if let Some(dir) = coding_agent_dir.filter(|d| !d.trim().is_empty()) {
+        return PathBuf::from(dir);
+    }
+    let config_dir = config_dir
+        .filter(|d| !d.trim().is_empty())
+        .unwrap_or(".omp");
+    let root = home.join(config_dir);
+    let root = match profile.map(str::trim).filter(|p| !p.is_empty()) {
+        Some(p) => root.join("profiles").join(p),
+        None => root,
+    };
+    root.join("agent")
+}
+
+/// omp 的用户级 agent 目录（缺省 `~/.omp/agent`）
+pub fn omp_agent_dir() -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    let env = |k: &str| std::env::var(k).ok();
+    Some(omp_agent_dir_from(
+        &home,
+        env("PI_CODING_AGENT_DIR").as_deref(),
+        env("PI_CONFIG_DIR").as_deref(),
+        env("PI_PROFILE").as_deref(),
+    ))
+}
+
+/// mini-term 写入的 omp 扩展文件路径：`{omp_agent_dir}/extensions/miniterm.ts`
+fn omp_extension_path() -> Option<PathBuf> {
+    omp_agent_dir().map(|d| d.join("extensions").join(OMP_EXTENSION_FILE))
+}
+
+/// 某段扩展源码里订阅了哪些 omp 事件（`pi.on("<event>"`）。不带 miniterm-hook
+/// 标识的文件不是我们写的，一律按「没注册」——绝不把用户自己的同名扩展算成我们的。
+fn omp_events_in_source(source: &str) -> std::collections::HashSet<String> {
+    if !source.contains(HOOK_MARKER) {
+        return std::collections::HashSet::new();
+    }
+    OMP_HOOK_EVENTS
+        .iter()
+        .filter(|e| source.contains(&format!("pi.on(\"{}\"", e)))
+        .map(|e| e.to_string())
+        .collect()
+}
+
+fn registered_omp_events() -> std::collections::HashSet<String> {
+    let Some(path) = omp_extension_path() else {
+        return std::collections::HashSet::new();
+    };
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return std::collections::HashSet::new();
+    };
+    omp_events_in_source(&content)
+}
+
+/// 把扩展写到位。返回是否真的落盘：内容已是当前模板时一个字节不写（启动期自愈
+/// 每次启动都会走这里，不能每次都重写用户目录里的文件）。
+///
+/// 同名文件在场却**不带**我们的标识 → 拒绝覆盖：那是用户自己的扩展，撞名也不能吃掉。
+fn write_omp_extension() -> Result<bool, String> {
+    let path = omp_extension_path().ok_or_else(|| "无法获取 home 目录".to_string())?;
+    let current = std::fs::read_to_string(&path).ok();
+    if current.as_deref() == Some(OMP_EXTENSION_SOURCE) {
+        return Ok(false);
+    }
+    if current.is_some_and(|c| !c.contains(HOOK_MARKER)) {
+        return Err(format!(
+            "{} 已存在且不是 mini-term 写入的文件，未覆盖",
+            path.display()
+        ));
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建 extensions 目录失败: {}", e))?;
+    }
+    crate::util::atomic_write(&path, OMP_EXTENSION_SOURCE.as_bytes())
+        .map_err(|e| format!("写入 {} 失败: {}", OMP_EXTENSION_FILE, e))?;
+    Ok(true)
+}
+
+/// 注册 omp 扩展到 {omp_agent_dir}/extensions/miniterm.ts。
+///
+/// omp 只在启动时扫描扩展目录，正在跑的实例要重启或执行 `/reload-plugins` 才会装上
+/// ——结果文案里必须把这句带给用户，否则他会以为注册没生效。
+fn register_omp_hooks() -> Result<String, String> {
+    let written = write_omp_extension()?;
+    Ok(if written {
+        format!(
+            "oh-my-pi: 扩展已写入 (共 {} 个事件)；正在运行的 omp 需重启或执行 /reload-plugins 才生效",
+            OMP_HOOK_EVENTS.len()
+        )
+    } else {
+        format!(
+            "oh-my-pi: 扩展已是最新 (共 {} 个事件)",
+            OMP_HOOK_EVENTS.len()
+        )
+    })
+}
+
+/// 从 omp 扩展目录卸载：整个文件都是我们的，直接删；不带标识的同名文件不动。
+fn unregister_omp_hooks() -> Result<String, String> {
+    let path = match omp_extension_path() {
+        Some(p) if p.exists() => p,
+        _ => return Ok(format!("oh-my-pi: {} 不存在，无需卸载", OMP_EXTENSION_FILE)),
+    };
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("读取 {} 失败: {}", OMP_EXTENSION_FILE, e))?;
+    if !content.contains(HOOK_MARKER) {
+        return Ok(format!(
+            "oh-my-pi: {} 不是 mini-term 写入的文件，未动",
+            path.display()
+        ));
+    }
+    std::fs::remove_file(&path).map_err(|e| format!("删除 {} 失败: {}", OMP_EXTENSION_FILE, e))?;
+    Ok("oh-my-pi: 已移除扩展文件".to_string())
+}
+
+/// 已注册用户的启动期自愈：扩展文件与当前模板不同就整份重写。
+///
+/// 与 grok 刷新二进制副本同一个理由——mini-term 升级后模板变了，用户目录里那份
+/// 还是旧的；只要注册过就无条件对齐，从未注册的用户不碰。
+pub fn sync_omp_hooks_if_registered() {
+    if registered_omp_events().is_empty() {
+        return;
+    }
+    match write_omp_extension() {
+        Ok(true) => eprintln!("[hook-registry] omp 扩展已刷新至当前模板"),
+        Ok(false) => {}
+        Err(e) => eprintln!("[hook-registry] omp 扩展刷新失败: {}", e),
+    }
+}
+
 // ─── 注册目标 ───
 
 /// 可单独注册/卸载的 CLI。
 ///
-/// 三家的事件集、配置文件位置与命令写法都不同（见各自的 `register_*`），但对外
-/// 是同一套动作，所以用本枚举做选择而不是铺三对命令：调用方只传一个列表，将来
-/// 加第四家时签名不变。serde 层拒收未知值——未知 agent 若静默退化成
+/// 各家的事件集、配置文件位置与命令写法都不同（见各自的 `register_*`），但对外
+/// 是同一套动作，所以用本枚举做选择而不是铺几对命令：调用方只传一个列表，将来
+/// 再加一家时签名不变。serde 层拒收未知值——未知 agent 若静默退化成
 /// 「全量注册」，会往用户根本没在用的 CLI 里写配置。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -795,16 +1033,24 @@ pub enum HookAgent {
     Claude,
     Codex,
     Grok,
+    /// oh-my-pi（omp）：写的是 TS 扩展而不是 hook 命令，见模块注释
+    Omp,
 }
 
 impl HookAgent {
-    pub const ALL: &'static [HookAgent] = &[HookAgent::Claude, HookAgent::Codex, HookAgent::Grok];
+    pub const ALL: &'static [HookAgent] = &[
+        HookAgent::Claude,
+        HookAgent::Codex,
+        HookAgent::Grok,
+        HookAgent::Omp,
+    ];
 
     fn key(self) -> &'static str {
         match self {
             HookAgent::Claude => "claude",
             HookAgent::Codex => "codex",
             HookAgent::Grok => "grok",
+            HookAgent::Omp => "omp",
         }
     }
 
@@ -814,6 +1060,7 @@ impl HookAgent {
             HookAgent::Claude => "Claude Code",
             HookAgent::Codex => "Codex",
             HookAgent::Grok => "Grok",
+            HookAgent::Omp => "oh-my-pi",
         }
     }
 
@@ -822,6 +1069,7 @@ impl HookAgent {
             HookAgent::Claude => CLAUDE_HOOK_EVENTS,
             HookAgent::Codex => CODEX_HOOK_EVENTS,
             HookAgent::Grok => GROK_HOOK_EVENTS,
+            HookAgent::Omp => OMP_HOOK_EVENTS,
         }
     }
 
@@ -830,6 +1078,7 @@ impl HookAgent {
             HookAgent::Claude => registered_claude_events(),
             HookAgent::Codex => registered_codex_events(),
             HookAgent::Grok => registered_grok_events(),
+            HookAgent::Omp => registered_omp_events(),
         }
     }
 
@@ -839,6 +1088,7 @@ impl HookAgent {
             HookAgent::Claude => claude_settings_path(),
             HookAgent::Codex => codex_hooks_path(),
             HookAgent::Grok => grok_hooks_path(),
+            HookAgent::Omp => omp_extension_path(),
         };
         let Some(raw) = raw else {
             return String::new();
@@ -860,6 +1110,8 @@ impl HookAgent {
             HookAgent::Claude => register_claude_hooks(hook_path),
             HookAgent::Codex => register_codex_hooks(hook_path),
             HookAgent::Grok => register_grok_hooks(hook_path),
+            // omp 走的是进程内 TS 扩展，用不着 hook 二进制的路径
+            HookAgent::Omp => register_omp_hooks(),
         }
     }
 
@@ -868,11 +1120,12 @@ impl HookAgent {
             HookAgent::Claude => unregister_claude_hooks(),
             HookAgent::Codex => unregister_codex_hooks(),
             HookAgent::Grok => unregister_grok_hooks(),
+            HookAgent::Omp => unregister_omp_hooks(),
         }
     }
 }
 
-/// 入参缺省 / 空列表时的目标：三家全上，保持「一键注册」的原有语义。
+/// 入参缺省 / 空列表时的目标：各家全上，保持「一键注册」的原有语义。
 fn resolve_targets(agents: Option<Vec<HookAgent>>) -> Vec<HookAgent> {
     match agents {
         Some(list) if !list.is_empty() => {
@@ -906,22 +1159,22 @@ pub struct HookRegistrationInfo {
 
 // ─── 对外动作(原 Tauri Commands) ───
 
-/// 注册 AI hooks。`agents` 缺省 = 三家全注册（保持「一键注册」的原语义）。
+/// 注册 AI hooks。`agents` 缺省 = 各家全注册（保持「一键注册」的原语义）。
 pub fn register_ai_hooks(agents: Option<Vec<HookAgent>>) -> Result<String, String> {
     let hook_path = hook_binary_path()?;
     let results: Vec<String> = resolve_targets(agents)
         .into_iter()
         .map(|agent| match agent.register(&hook_path) {
             Ok(msg) => msg,
-            // 单家失败不打断其余：三个配置文件互不相干，一家读不动不该
-            // 让另外两家也注册不上
+            // 单家失败不打断其余：各家的配置文件互不相干，一家读不动不该
+            // 让其余几家也注册不上
             Err(e) => format!("{} 注册失败: {}", agent.label(), e),
         })
         .collect();
     Ok(results.join("\n"))
 }
 
-/// 卸载 AI hooks。`agents` 缺省 = 三家全卸载。
+/// 卸载 AI hooks。`agents` 缺省 = 各家全卸载。
 pub fn unregister_ai_hooks(agents: Option<Vec<HookAgent>>) -> Result<String, String> {
     let results: Vec<String> = resolve_targets(agents)
         .into_iter()
@@ -933,7 +1186,7 @@ pub fn unregister_ai_hooks(agents: Option<Vec<HookAgent>>) -> Result<String, Str
     Ok(results.join("\n"))
 }
 
-/// 三家各自的注册现状（面板据此定默认勾选、显示状态徽章）。
+/// 各家的注册现状（面板据此定默认勾选、显示状态徽章）。
 pub fn get_ai_hook_registrations() -> Vec<HookRegistrationInfo> {
     HookAgent::ALL
         .iter()
@@ -1017,7 +1270,18 @@ pub fn get_hook_config_snippet() -> Result<Value, String> {
                 {
                     "file": "~/.codex/config.toml",
                     "note": "追加以下内容",
-                    "content": "[features]\ncodex_hooks = true"
+                    "content": "[features]\nhooks = true"
+                }
+            ]
+        },
+        "omp": {
+            "files": [
+                {
+                    // 扩展文件不含机器相关信息，整份照抄即可；omp 只在启动时扫描
+                    // 扩展目录，保存后要重启或 /reload-plugins
+                    "file": format!("~/.omp/agent/extensions/{}", OMP_EXTENSION_FILE),
+                    "note": "整份保存；omp 需重启或执行 /reload-plugins",
+                    "content": OMP_EXTENSION_SOURCE
                 }
             ]
         }
@@ -1181,6 +1445,7 @@ mod tests {
     #[test]
     fn unknown_agent_is_rejected_at_deserialization() {
         assert!(serde_json::from_str::<HookAgent>("\"grok\"").is_ok());
+        assert!(serde_json::from_str::<HookAgent>("\"omp\"").is_ok());
         assert!(serde_json::from_str::<HookAgent>("\"gemini\"").is_err());
         assert!(serde_json::from_str::<HookAgent>("\"Claude\"").is_err());
     }
@@ -1195,7 +1460,121 @@ mod tests {
             assert!(!agent.label().is_empty());
             assert!(!agent.events().is_empty(), "{} 的事件集为空", agent.key());
         }
-        assert_eq!(keys.len(), 3);
+        assert_eq!(keys.len(), 4);
+    }
+
+    // ---- oh-my-pi（omp）扩展 ----
+
+    /// 从扩展源码里抠出所有 `pi.on("<event>"` 的事件名。
+    fn subscribed_events(source: &str) -> std::collections::BTreeSet<String> {
+        source
+            .match_indices("pi.on(\"")
+            .filter_map(|(idx, needle)| {
+                let rest = &source[idx + needle.len()..];
+                rest.find('"').map(|end| rest[..end].to_string())
+            })
+            .collect()
+    }
+
+    /// 模板订阅的事件与 `OMP_HOOK_EVENTS` 必须逐条相等：面板的「N/M」与启动期
+    /// 对账都按后者算，两边一漂移，要么永远显示「旧版本」，要么漏掉新事件。
+    #[test]
+    fn omp_template_subscribes_exactly_the_declared_events() {
+        let declared: std::collections::BTreeSet<String> =
+            OMP_HOOK_EVENTS.iter().map(|e| e.to_string()).collect();
+        assert_eq!(subscribed_events(OMP_EXTENSION_SOURCE), declared);
+        assert_eq!(
+            omp_events_in_source(OMP_EXTENSION_SOURCE).len(),
+            OMP_HOOK_EVENTS.len(),
+            "当前模板必须被判成「已注册全部事件」"
+        );
+        let mut seen = std::collections::HashSet::new();
+        for event in OMP_HOOK_EVENTS {
+            assert!(seen.insert(*event), "重复订阅事件: {event}");
+        }
+    }
+
+    /// 模板上报的事件名都得在 `OMP_REPORTED_EVENTS` 里（hook_server 按那张表验映射），
+    /// 且表里每一个都真的出现在模板中——表比模板宽会让 hook_server 的测试守着
+    /// 不存在的事件。
+    #[test]
+    fn omp_template_reports_only_declared_event_names() {
+        for event in OMP_REPORTED_EVENTS {
+            assert!(
+                OMP_EXTENSION_SOURCE.contains(&format!("\"{}\"", event)),
+                "模板里没有上报 {event}"
+            );
+        }
+        // Claude 专有、omp 模板不该冒出来的事件名
+        for absent in ["SubagentStart", "SubagentStop", "PostToolBatch"] {
+            assert!(
+                !OMP_EXTENSION_SOURCE.contains(&format!("\"{}\"", absent)),
+                "{absent} 出现在模板里却不在 OMP_REPORTED_EVENTS"
+            );
+        }
+    }
+
+    /// 模板的几条硬约束：带标识（注册现状与卸载都按它认）、按 pane/端口环境变量
+    /// 定位（缺失即空操作）、只让主会话上报（子代理是同进程里的独立会话）、
+    /// 换会话按 clear 收尾、打断按 aborted 上报（不算完成）。
+    #[test]
+    fn omp_template_keeps_its_contract_strings() {
+        for needle in [
+            HOOK_MARKER,
+            "MINITERM_PTY_ID",
+            "MINITERM_HOOK_PORT",
+            "hook-server.json",
+            "/hook",
+            "ctx.mode === \"tui\"",
+            "reason: \"clear\"",
+            "reason: \"aborted\"",
+            "willContinue",
+            "127.0.0.1",
+        ] {
+            assert!(OMP_EXTENSION_SOURCE.contains(needle), "模板缺少 {needle:?}");
+        }
+        // 只许打回环地址，不许出现别的主机
+        assert!(!OMP_EXTENSION_SOURCE.contains("https://"));
+    }
+
+    /// 不带标识的同名文件是用户自己的扩展：既不算「已注册」，也绝不能被覆盖。
+    #[test]
+    fn omp_source_without_marker_is_not_ours() {
+        let foreign = "export default function (pi) { pi.on(\"session_start\", () => {}); }";
+        assert!(omp_events_in_source(foreign).is_empty());
+        // 老版本模板（带标识但事件不全）识别成「旧版本 N/M」
+        let stale =
+            format!("// {HOOK_MARKER}\npi.on(\"session_start\", f); pi.on(\"agent_end\", g);");
+        let got = omp_events_in_source(&stale);
+        assert_eq!(got.len(), 2);
+        assert!(got.contains("session_start") && got.contains("agent_end"));
+    }
+
+    /// agent 目录的解析口径与 omp 自身一致：`PI_CODING_AGENT_DIR` 压倒一切，
+    /// `PI_CONFIG_DIR` 换根目录名，`PI_PROFILE` 落到 profiles/ 下。
+    #[test]
+    fn omp_agent_dir_follows_omp_env_precedence() {
+        let home = std::path::Path::new("/home/u");
+        assert_eq!(
+            omp_agent_dir_from(home, None, None, None),
+            PathBuf::from("/home/u/.omp/agent")
+        );
+        assert_eq!(
+            omp_agent_dir_from(home, Some("/custom/agent"), Some(".pi"), Some("work")),
+            PathBuf::from("/custom/agent")
+        );
+        assert_eq!(
+            omp_agent_dir_from(home, Some("  "), Some(".pi"), None),
+            PathBuf::from("/home/u/.pi/agent")
+        );
+        assert_eq!(
+            omp_agent_dir_from(home, None, None, Some("work")),
+            PathBuf::from("/home/u/.omp/profiles/work/agent")
+        );
+        assert_eq!(
+            omp_agent_dir_from(home, None, Some(""), Some(" ")),
+            PathBuf::from("/home/u/.omp/agent")
+        );
     }
 
     /// 与 Claude 同样的自愈语义：从未注册过的用户不写配置，已是最新的不重复补
@@ -1228,5 +1607,63 @@ mod tests {
             .expect("SessionEnd hook 应包含命令");
         assert!(command.contains("miniterm-hook"));
         assert!(command.ends_with(" SessionEnd"));
+    }
+
+    /// Codex CLI 0.152.1 起 feature 名改为 `hooks`。手动片段与一键注册必须
+    /// 使用同一现行键；继续展示旧键会让用户照抄后无法启动 hooks。
+    #[test]
+    fn codex_manual_config_uses_current_hooks_feature() {
+        let snippet = get_hook_config_snippet().expect("应生成 hook 配置片段");
+        let content = snippet["codex"]["files"][1]["content"]
+            .as_str()
+            .expect("Codex config.toml 片段应为字符串");
+
+        assert!(content.contains("hooks = true"));
+        assert!(
+            !content.contains("codex_hooks"),
+            "Codex CLI 已不再识别 codex_hooks feature"
+        );
+    }
+
+    #[test]
+    fn codex_feature_config_migrates_legacy_key_and_preserves_user_content() {
+        let updated = enable_codex_hooks_feature(
+            "# 用户注释\nmodel = \"gpt-5\"\n\n[features]\ncodex_hooks = true\nweb_search = true\n",
+        )
+        .expect("应迁移 Codex feature");
+        let doc = updated
+            .parse::<toml_edit::DocumentMut>()
+            .expect("迁移结果应是合法 TOML");
+
+        assert_eq!(doc["features"]["hooks"].as_bool(), Some(true));
+        assert!(doc["features"].get("codex_hooks").is_none());
+        assert_eq!(doc["features"]["web_search"].as_bool(), Some(true));
+        assert_eq!(doc["model"].as_str(), Some("gpt-5"));
+        assert!(updated.contains("# 用户注释"));
+    }
+
+    /// 键已经是现行名字时必须原样返回——`ensure_codex_hooks_feature` 拿这个
+    /// 相等判断决定写不写盘，启动期自愈全靠它才不会每次启动重写用户配置。
+    #[test]
+    fn codex_feature_config_is_noop_when_already_current() {
+        let current = "# 用户注释\n[features]\nhooks = true\nweb_search = true\n";
+        assert_eq!(
+            enable_codex_hooks_feature(current).expect("现行配置应可解析"),
+            current
+        );
+    }
+
+    #[test]
+    fn codex_feature_config_accepts_inline_features_table() {
+        let updated =
+            enable_codex_hooks_feature("features = { codex_hooks = true, web_search = true }\n")
+                .expect("应迁移内联 features 表");
+        let doc = updated
+            .parse::<toml_edit::DocumentMut>()
+            .expect("迁移结果应是合法 TOML");
+
+        assert_eq!(doc["features"]["hooks"].as_bool(), Some(true));
+        assert!(doc["features"].get("codex_hooks").is_none());
+        assert_eq!(doc["features"]["web_search"].as_bool(), Some(true));
     }
 }

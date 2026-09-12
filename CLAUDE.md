@@ -33,6 +33,9 @@ cd mobile && npm run build
 
 # 改文案后重新生成 i18n 字典
 node crates/mt-i18n/tools/gen_from_ts.mjs
+
+# 改 oh-my-pi 扩展模板后离线验证（Bun 运行时，omp 本身不必安装）
+bun run tools/omp-ext-check.ts
 ```
 
 - ⚠️ **禁跑 `cargo fmt`**：本仓 HEAD 非 rustfmt-clean，全仓 fmt 会重排几十个文件淹没 diff。
@@ -63,7 +66,8 @@ node crates/mt-i18n/tools/gen_from_ts.mjs
 | `mt-layout` | 界面布局持久化(`layout.db`,rusqlite):三栏比例 / 每项目分屏树 / 窗口几何。分屏树整棵存 JSON 不拆关系表,理由见模块注释 |
 | `mt-i18n` | 双语文案层。**字典源头是 `locales/*.ts`**（TS 对象字面量，随 Tauri 版下线迁入），`src/dict.rs` 由 `tools/gen_from_ts.mjs` 生成——**禁止手改 dict.rs**，改文案改 locales 后重跑生成器，`tests/consistency.rs` 的对账常量随之更新 |
 | `mt-relay` | 移动端中转桌面侧：出站 WSS 长连、配对、项目快照/增量、对话镜像（`mirror.rs`）、移动端指令写穿 |
-| `mt-ssh` | 共享 SSH 通信层（russh 持久会话池 + SFTP 原语），主程序与 sidecar 共用 |
+| `mt-ssh` | 共享 SSH 通信层（russh 持久会话池 + SFTP 原语），主程序与 sidecar 共用；密码信封在 `pool::authenticate` 解开 |
+| `mt-secret` | SSH 密码封存：AES-256-GCM 信封 + `credential.key` 主密钥（Windows DPAPI / Unix 0600）。在 mt-core 之上，经 mt-ssh 进入 sidecar，依赖表只许 ring/base64/serde/zeroize |
 | `mt-usage` | 用量统计：会话轮次解析 / SQLite 账本 / 聚合 / 计价 |
 | `mt-core` | 叶子共享库（WSL UNC 解析 / SSH 提示扫描 / 原子写等）。⚠️ 依赖方向铁律：只依赖 serde/serde_json/dirs，绝不反向依赖上层 crate——它同时被三个 sidecar 与 mt-ssh 链接 |
 
@@ -81,11 +85,13 @@ reader 线程读 PTY 字节直接喂 `mt-terminal` 的 VT 状态机，UI 按帧�
 |------|------|--------|
 | `config.db` | **配置本体**（项目、SSH 连接、全部设置） | 只有主程序（`mt-config::db`） |
 | `config.json` | **给 sidecar 读的 SSH 投影**，派生物 | 主程序写，三个 sidecar 二进制读 |
-| `config.json.pre-sqlite` | 存量用户迁移前的完整旧配置存档，不删不改 | 只在回退/排查时用 |
+| `config.json.pre-sqlite` | 存量用户迁移前的完整旧配置存档，除密码字段封存外不删不改 | 只在回退/排查时用 |
 | `config.db.bak` | 每次成功加载后留的一代库备份 | 库损坏时自动顶上 |
+| `credential.key` | SSH 密码信封的主密钥（Windows 内容经 DPAPI 包裹；Unix 0600） | 主程序生成，sidecar 只读（见下节） |
 | `layout.db` | 界面布局（见下节） | 只有主程序（`mt-layout`） |
 | `usage.db` | 用量账本（可从 JSONL 再生） | `mt-usage` |
 | `hook-server.json` | hook 端口文件 | 主程序写，sidecar 读 |
+| `mini-term.log` | 装机版的 stderr/stdout（全部 `eprintln!`、panic、启动埋点）。只在进程没有控制台时接管，启动时超 2 MB 轮转成 `.log.1`；`MT_LOG_FILE=1` 可在控制台下强制落文件 | 主程序（`mt-app::logfile`） |
 
 ### config.json 为什么还在（且必须还在）
 
@@ -96,6 +102,18 @@ reader 线程读 PTY 字节直接喂 `mt-terminal` 的 VT 状态机，UI 按帧�
 - `sidecars/src/ssh_service.rs` 那道「拒绝传输 mini-term 自己的 config.json」的安全护栏按的就是这个路径；审计日志与 IPC socket 目录也拿它的所在目录当锚点
 
 ⚠️ **改投影形状时必须同步 `mt_core::config_reader::ConfigSshView`**——两边隔着 crate 边界、没有共享类型，只靠字段名对齐。护栏是 `mt-config` 里的 `投影能被_sidecar_的解析器读懂`，它直接调 sidecar 那份解析器。
+
+### SSH 密码封存（`mt-secret`）
+
+`SshConnection.password` 在库、投影、`.bak`、`.pre-sqlite` 存档四处**一律是信封串** `enc:v1:<base64(nonce‖密文‖tag)>`（AES-256-GCM），明文只活在「表单 → `AppStore::upsert_ssh_connection`」那一小段与认证那一刻。主密钥 32 字节随机，存 `{active_data_dir}/credential.key`：Windows 内容经 DPAPI（当前用户范围、禁弹窗）包裹，macOS/Linux 靠 0600。
+
+- **封存点唯一**：`AppStore::upsert_ssh_connection`（`mt-app::secrets::stored_password`，密码没改就沿用旧信封——信封每次 nonce 不同，换了会让 `ssh_session_identity_changed` 误判身份变了、白白作废池里的 session）。`ConfigStore::save` 另有兜底封存挡「谁忘了封」
+- **解封点三处**：编辑表单回填、终端自动填充（`pane::connect_ssh` / `remote_ssh::prepare_remote_launch`）、`mt-ssh::pool::authenticate`——最后一处是主程序与三个 sidecar 共用的，所以 sidecar 不需要任何自己的解封代码
+- **迁移**：`ConfigStore::load` 把存量明文一次性封存并回写库，随后 `VACUUM` + `wal_checkpoint(TRUNCATE)`（SQLite 更新一行不会抹掉页内旧 cell 字节，WAL 旧帧里也躺着明文页），再做这一代 `.bak`；`.pre-sqlite` 存档只改密码字段
+- **密钥只由主程序生成**（`Vault::open_or_create`），sidecar 走 `mt_secret::global()` 懒加载：在 `mt_core::config_json_path()` 同目录**只读**打开，**刻意不认 `MT_APP_DATA_DIR`**——sidecar 读的投影本来就不认它，密钥跟着走就会拿 dev 实例的钥匙开装机版的信封。主程序在 `ConfigStore::load` 里 `mt_secret::install` 自己那把（先到先得），dev 隔离目录因此各有各的钥匙
+- **降级口径**：`reveal` 对不带 `enc:` 前缀的值原样放行（升级窗口期 sidecar 先读到旧明文投影也能连）；解不开返回 `Undecryptable`，UI 提示「请重新填写密码」，会话池报 `password unavailable`，**绝不把密文当密码送去认证**。凭据库开不起来时加载不失败，密码保持原样并在日志里喊
+- **威胁模型（诚实版）**：防的是配置文件被拷走/同步/被别的账户读到；**不防**同一账户下的本机进程（主程序自己就能无提示解密），与浏览器存密码同一档
+- `mt-secret` 的依赖表只许有 ring / base64 / serde / zeroize（都是 sidecar 依赖树里已有的），它经 `mt-ssh` 进入三个 sidecar；`mt-core` 的叶子铁律不动，`SshConnection` 序列化形状一字未变
 
 ### 布局持久化（`layout.db`，非 `config.json`）
 
@@ -122,7 +140,7 @@ reader 线程读 PTY 字节直接喂 `mt-terminal` 的 VT 状态机，UI 按帧�
 
 ### AI 状态判定（idle / ai-idle / ai-working）
 
-hook 上报（`mt-ai::hook_server`）一旦启用即为权威，退出以 SessionEnd 为准；无 hook 时降级为输入检测（`mt-ai::detect` 识别键入的 `claude`/`codex`/`opencode`/`pi`/`grok` 命令，含 ↑ 历史/Tab 补全的行快照兜底与输出回扫）+ 输出活跃度轮询。非 hook 的例外有两条：
+hook 上报（`mt-ai::hook_server`）一旦启用即为权威，退出以 SessionEnd 为准；无 hook 时降级为输入检测（`mt-ai::detect` 识别键入的 `claude`/`codex`/`opencode`/`pi`/`grok`/`omp` 命令，含 ↑ 历史/Tab 补全的行快照兜底与输出回扫）+ 输出活跃度轮询。非 hook 的例外有两条：
 
 1. **用户打断**：Claude 在 Esc/Ctrl+C 中断时不发任何事件（官方文档明示 `Stop` 不触发），由写入侧识别裸 Esc/Ctrl+C 后调 `note_user_interrupt` 把 hook 状态收敛为 ai-idle，cause=`Interrupt` 不算完成。
 2. **停摆兜底**（`stall_settle_target`）：hook 停在 ai-working 且状态与 PTY 输出双双静默 10s 时收敛——此前触发过退出（Ctrl+D/双击 Ctrl+C/`/exit` 且之后无 hook 事件扶正）判为已退出 → `idle`/cause=`StallExit`，否则 → `ai-idle`/cause=`Stall`；正等用户批准的 pane（上次 cause 属 attention 类，如 Codex 的 `PermissionRequest`）豁免，否则黄灯会被抹掉。
@@ -145,7 +163,8 @@ hook 上报（`mt-ai::hook_server`）一旦启用即为权威，退出以 Sessio
 ## 注意事项
 
 - Grok 的 hook 接入与另外两家有两处结构性差异，改动前先看 `mt-ai::hook_registry::register_grok_hooks` 的注释：① grok 默认还会扫描 `~/.claude/settings.json` 的 hooks（Claude 兼容层），同一事件会来两趟，sidecar 靠 `GROK_SESSION_ID` + 是否带 argv 丢弃兼容层那趟（只注册了 Claude 的用户必须放行——那是唯一来源，判据落在原生 hook 文件是否在场）；② 注册进 `~/.grok/hooks/` 的命令必须是**不含空格的裸文件名**（hook 二进制随注册复制进该目录），带空格会被 grok 丢给 shell，而 Windows 上具体是 git-bash/pwsh/powershell/cmd 由环境决定、四家引号语义互斥；事件名改由 grok 注入的 `GROK_HOOK_EVENT` 传递
-- 只有 Claude/Codex/Grok 有可解析的会话记录（`mt-relay::mirror` 的 `agent_has_session_log`）。opencode/pi 这类**只靠输入检测识别**的 agent 拿得到状态徽章与移动端指令，但没有对话镜像、AI 历史面板与用量统计——镜像必须据此跳过启发式绑定，否则会绑到同项目其它 agent 的最新会话文件，把别人的对话贴到该 pane 上
+- oh-my-pi（omp）的 hook **不走 sidecar**：它的扩展点是 Bun 进程内加载的 TS 模块，`mt-ai::hook_registry` 把自带的 `crates/mt-ai/assets/miniterm-omp.ts` 整份写进 `~/.omp/agent/extensions/miniterm.ts`，扩展在 omp 进程内 `fetch` 本地 hook 服务器、事件名翻译成与 Claude 同名的 PascalCase。两条硬约束：① **只有 `ctx.mode === "tui"` 的主会话上报**——omp 的子代理是同进程内的独立会话，会重新绑定所有扩展工厂，照常上报会把父会话误报成完成；② 打断后的 `agent_end` 以 `Stop` + `reason: aborted` 上报，hook server 落成 cause=`Interrupt`。模板里 `pi.on(...)` 的事件集与 `OMP_HOOK_EVENTS`、上报的事件名与 `OMP_REPORTED_EVENTS` 都有单测逐条对账，改模板先改常量
+- Claude/Codex/Grok/OMP 有移动镜像可解析的本机会话记录（`mt-ai::sessions::agent_has_session_log`）。OMP 18.x 的记录位于 `{omp_agent_dir}/sessions/{编码 cwd}/{timestamp}_{session-id}.jsonl`，镜像按 hook session id 精确定位，解析 `message` 的 user/assistant/toolResult 与 assistant `toolCall(name=ask)`；OMP 的 AI 历史面板、用量统计与谱系扫描仍未接入。opencode/pi 这类**只靠输入检测识别**的 agent 拿得到状态徽章与移动端指令，但没有对话镜像——镜像必须跳过启发式绑定，否则会把同项目其它 agent 的最新会话贴到该 pane 上
 - Grok 的会话记录形态与另外两家不同：一个会话是**一整个目录**（`{grok_home}/sessions/{URL 编码的 cwd}/{session-id}/`，正文 `updates.jsonl` 是 ACP 更新流，一条消息拆成多个 chunk 行、攒到边界才成一条；元信息在 `summary.json`）。定位项目走**解码目录名**而非编码项目路径，详见 `mt-ai::sessions` 的 Grok 段注释
 - GPUI 迁移期的逐批决策与「记档不修」清单在 `docs/gpui-migration-progress.md`——改到相关模块（拖拽/托盘/标题栏/关窗/toast 等）前先查该文档对应批次的记档，很多「看起来是 bug」的行为是评审定稿的取舍
 - 领域术语表在 `CONTEXT.md`（会话/会话来源/项目等 ubiquitous language）

@@ -1,6 +1,6 @@
 //! 文件树的文件操作自由函数(从 `file_tree` 平移):preflight 三件套、
 //! [`spawn_tree_op`]、应用内文件剪贴板的复制/粘贴、上传/下载全套、
-//! 在终端打开、新建文件/文件夹。
+//! 在终端打开、新建文件/文件夹、移动(拖拽落点与「移动到」菜单共用)。
 
 use std::path::PathBuf;
 
@@ -11,10 +11,29 @@ use crate::file_ops::{
 };
 use crate::fs_ops;
 use crate::i18n::{t, tr};
-use crate::prompt::{show_alert, show_file_conflict_choice, show_prompt};
+use crate::prompt::{Confirm, show_alert, show_file_conflict_choice, show_prompt};
 use crate::store::AppStore;
 
+use super::move_to::MoveSource;
 use super::{FileTree, Row, same_file_source};
+
+/// [`spawn_tree_op`] 跑完之后怎么刷树。
+///
+/// 老入口的四个位置参数原样收进来,再加两项只有「移动」要的旋钮 —— 它是唯一一件
+/// **两个目录同时变**的操作(源父目录少一项、目标目录多一项)。
+pub(super) struct TreeOpPlan {
+    /// 完成后重列的目录;`expand` 为真时顺带展开它(粘贴/新建/上传/移动的目标目录)。
+    pub refresh_dir: Option<PathBuf>,
+    pub expand: bool,
+    /// 操作期间脱挂(停监听、清缓存、屏蔽 watcher)的子树:删除/重命名/移动的源目录,
+    /// 上传的目标目录。
+    pub detach_before: Option<PathBuf>,
+    /// 结束后把脱挂子树的展开态折掉 —— 源路径已不复存在(删除/重命名/移动)时用;
+    /// 上传脱挂的是目标目录、结束后还要它展开,故不折。老入口按 `!expand` 推。
+    pub collapse_detached: bool,
+    /// 完成(或失败)后额外重列、**不展开**的目录:移动要同时刷源父目录与目标目录。
+    pub extra_reload: Vec<PathBuf>,
+}
 
 /// 跑一件阻塞文件操作。状态和结果都绑定开始时的项目/连接/generation；切换项目后
 /// 旧结果不会刷新新树。同一 FileTree 同时只接受一件 mutation/transfer。
@@ -108,6 +127,40 @@ pub(super) fn spawn_tree_op(
     window: &mut Window,
     cx: &mut App,
 ) -> bool {
+    spawn_tree_op_planned(
+        tree,
+        context,
+        TreeOpPlan {
+            refresh_dir,
+            expand,
+            detach_before,
+            collapse_detached: !expand,
+            extra_reload: Vec::new(),
+        },
+        label,
+        op,
+        window,
+        cx,
+    )
+}
+
+/// [`spawn_tree_op`] 的完整版:刷新计划走 [`TreeOpPlan`]。
+pub(super) fn spawn_tree_op_planned(
+    tree: Entity<FileTree>,
+    context: FileOperationContext,
+    plan: TreeOpPlan,
+    label: SharedString,
+    op: impl FnOnce() -> Result<Option<String>, String> + Send + 'static,
+    window: &mut Window,
+    cx: &mut App,
+) -> bool {
+    let TreeOpPlan {
+        refresh_dir,
+        expand,
+        detach_before,
+        collapse_detached,
+        extra_reload,
+    } = plan;
     let suppressed_path = detach_before.clone();
     let start_state = tree.update(cx, |tree, cx| {
         if tree.operation_context(cx).as_ref() != Some(&context) {
@@ -146,6 +199,7 @@ pub(super) fn spawn_tree_op(
         });
     }
     let failed_refresh_dir = refresh_dir.clone();
+    let failed_extra_reload = extra_reload.clone();
     let task = cx.background_executor().spawn(async move { op() });
     window
         .spawn(cx, async move |cx| {
@@ -169,7 +223,7 @@ pub(super) fn spawn_tree_op(
                                 tree.detach_subtree(path);
                             }
                             if same_source
-                                && !expand
+                                && collapse_detached
                                 && let Some(project_id) = tree.current_project.clone()
                             {
                                 let key = path.to_string_lossy().to_string();
@@ -179,11 +233,16 @@ pub(super) fn spawn_tree_op(
                             }
                             tree.suppressed_subtrees.remove(path);
                         }
-                        if same_source && let Some(refresh_dir) = refresh_dir {
-                            if expand {
-                                tree.ensure_expanded(refresh_dir, cx);
-                            } else {
-                                tree.reload_dir(refresh_dir, cx);
+                        if same_source {
+                            if let Some(refresh_dir) = refresh_dir {
+                                if expand {
+                                    tree.ensure_expanded(refresh_dir, cx);
+                                } else {
+                                    tree.reload_dir(refresh_dir, cx);
+                                }
+                            }
+                            for dir in extra_reload {
+                                tree.reload_dir(dir, cx);
                             }
                         }
                         cx.notify();
@@ -218,8 +277,13 @@ pub(super) fn spawn_tree_op(
                             }
                             tree.suppressed_subtrees.remove(path);
                         }
-                        if same_source && let Some(failed_refresh_dir) = failed_refresh_dir {
-                            tree.reload_dir(failed_refresh_dir, cx);
+                        if same_source {
+                            if let Some(failed_refresh_dir) = failed_refresh_dir {
+                                tree.reload_dir(failed_refresh_dir, cx);
+                            }
+                            for dir in failed_extra_reload {
+                                tree.reload_dir(dir, cx);
+                            }
                         }
                         cx.notify();
                         true
@@ -739,6 +803,116 @@ pub(super) fn start_download(
             });
         })
         .detach();
+}
+
+/// 移动(换父目录、保留原名)。拖拽落点确认之后与「移动到」菜单点选都到这里。
+///
+/// 刷新计划:目标目录展开并重列(与粘贴同,让用户看见落点);源父目录重列;
+/// 源是目录时操作期间脱挂它(旧路径下的监听与缓存作废,展开态折掉 —— 与重命名
+/// 同一口径)。无效落点(已在该目录 / 目录进自身)由 [`MoveSource::accepts_target`]
+/// 在这里最后兜一次,UI 层本该早就把它们判成不可落。
+pub(super) fn start_move(
+    tree: Entity<FileTree>,
+    context: FileOperationContext,
+    connection: Option<mt_config::SshConnection>,
+    source: MoveSource,
+    target_dir: PathBuf,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if !source.accepts_target(&target_dir) {
+        return;
+    }
+    let plan = TreeOpPlan {
+        refresh_dir: Some(target_dir.clone()),
+        expand: true,
+        detach_before: source.is_dir.then(|| source.path.clone()),
+        collapse_detached: true,
+        extra_reload: vec![source.parent.clone()],
+    };
+    let root = context.root.clone();
+    let path = source.path.clone();
+    spawn_tree_op_planned(
+        tree,
+        context,
+        plan,
+        t("fileTree", "operation.moving").into(),
+        move || match connection {
+            Some(conn) => crate::remote_ssh::move_entry(
+                &conn,
+                &root.to_string_lossy(),
+                &path.to_string_lossy(),
+                &target_dir.to_string_lossy(),
+            )
+            .map(|_| None),
+            None => mt_project::fs::move_entry(&root, &path, &target_dir)
+                .map(|_| None)
+                .map_err(|e| format!("{e:#}")),
+        },
+        window,
+        cx,
+    );
+}
+
+/// 拖拽落点的移动:先问一句再动。
+///
+/// gpui 的起拖阈值只有 2px(`dnd` 模块注释第 3 条),点一下手抖就是一次拖拽;
+/// 松手落在邻行上就把文件搬走,太容易误伤 —— 与 VS Code 资源管理器的
+/// `explorer.confirmDragAndDrop` 默认值同一取舍。菜单「移动到」是明确的意图,不问。
+pub(super) fn confirm_move(
+    tree: Entity<FileTree>,
+    context: FileOperationContext,
+    connection: Option<mt_config::SshConnection>,
+    source: MoveSource,
+    target_dir: PathBuf,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if tree.read(cx).operation_context(cx).as_ref() != Some(&context) {
+        return;
+    }
+    if !source.accepts_target(&target_dir) {
+        return;
+    }
+    let target_label = if target_dir == context.root {
+        t("fileTree", "moveTo.root").to_string()
+    } else if source.remote {
+        crate::remote_ssh::posix_relative(
+            &context.root.to_string_lossy(),
+            &target_dir.to_string_lossy(),
+        )
+        .unwrap_or_else(|| target_dir.to_string_lossy().into_owned())
+    } else {
+        fs_ops::relative_path(
+            &target_dir.to_string_lossy(),
+            &context.root.to_string_lossy(),
+        )
+    };
+    Confirm::new(
+        t("fileTree", "dialog.moveTitle"),
+        tr!(
+            "fileTree",
+            "dialog.moveConfirm",
+            name = source.name.clone(),
+            target = target_label
+        ),
+    )
+    .ok_text(t("fileTree", "dialog.moveOk"))
+    .open(
+        move |window, cx| {
+            start_move(
+                tree.clone(),
+                context.clone(),
+                connection.clone(),
+                source.clone(),
+                target_dir.clone(),
+                window,
+                cx,
+            );
+        },
+        window,
+        cx,
+    );
 }
 
 /// 「新建文件 / 新建文件夹」:问名字 → 建 → 展开父目录并重列。

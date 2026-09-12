@@ -1,6 +1,7 @@
 // release 构建在 Windows 上走 GUI 子系统:console 子系统的 exe 从快捷方式/Explorer 启动
 // 会被 Windows 新开一个控制台窗口滚启动日志(装机版即此形态)。debug 不挂,保留 console
-// 让 cargo run 的日志照常附着当前终端;代价是 release 版 println!/eprintln! 全部静默丢弃。
+// 让 cargo run 的日志照常附着当前终端。GUI 子系统下 println!/eprintln! 本会被 std 静默
+// 丢弃,`logfile::install`(main 第一行)把它们接到 `{数据目录}/mini-term.log`。
 #![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 
 //! mini-term 的 GPUI 应用壳。
@@ -69,6 +70,7 @@ mod git_watch;
 mod git_worktree;
 mod hotkeys;
 mod i18n;
+mod logfile;
 mod markers;
 mod menu;
 mod mobile_panel;
@@ -94,6 +96,7 @@ mod remote_directory_picker;
 mod remote_project;
 mod remote_ssh;
 mod search_modal;
+mod secrets;
 mod session_branch;
 mod session_panel;
 mod settings;
@@ -105,6 +108,7 @@ mod ssh_panel;
 mod ssh_registry;
 mod startup_trace;
 mod store;
+mod tab_expansion;
 mod terminal_area;
 mod terminals_panel;
 mod theme;
@@ -513,8 +517,9 @@ impl Workspace {
             }
         });
 
-        // 恢复出来的布局已经把 PTY 补齐了,键盘焦点也该落到当前 pane 上 ——
-        // 否则用户得先点一下终端才能打字。
+        // 把焦点记到当前 pane 上。此刻 PTY 还没补(启动补 PTY 排在首帧之后,见
+        // `main` 末尾),`focus_pane` 只能先记下 `focused_pane_id`;终端实体建出来后
+        // 由那一段再调一次 `focus_pane` 把键盘焦点真正落上去。
         let initial = {
             let s = store.read(cx);
             s.active_project_id.clone().zip(
@@ -1537,12 +1542,16 @@ impl Render for Workspace {
                     this.store.update(cx, |store, cx| store.toggle_middle_column(cx));
                 })),
             )
+            // ⚠️ **除「折叠中间栏」外全条都不给激活态**(恒传 `active = false`):
+            // 抽屉、竖条、用量页开着没开着本身就贴在屏幕上一眼可见,边条再点亮一次
+            // 是重复反馈,几颗方块各亮各的反而把第一颗真正需要读的状态淹了。
+            // 第一颗是唯一例外 —— 中间栏收起后没有任何其他线索能看出它的开合。
             .child(
                 activity_bar::strip_button(
                     "toggle-sessions",
                     activity_bar::SESSIONS,
                     t("app", "activityBar.sessions"),
-                    self.right_drawer == Some(DrawerPanel::Sessions),
+                    false,
                     self.activity_bar_hover.is_visible("toggle-sessions"),
                     Self::activity_bar_item_hover_listener("toggle-sessions", cx),
                 )
@@ -1557,7 +1566,7 @@ impl Render for Workspace {
                     "toggle-git",
                     activity_bar::GIT,
                     t("app", "activityBar.git"),
-                    self.right_drawer == Some(DrawerPanel::Git),
+                    false,
                     self.activity_bar_hover.is_visible("toggle-git"),
                     Self::activity_bar_item_hover_listener("toggle-git", cx),
                 )
@@ -1566,13 +1575,13 @@ impl Render for Workspace {
                 })),
             )
             // 终端列表竖条(GPUI 版新增,原版边条没有这颗)。开关的是终端区
-            // 右缘的**停靠竖条**而不是右抽屉,所以激活态跟 store 的持久化显隐走
+            // 右缘的**停靠竖条**而不是右抽屉,同样不给激活态(理由见上)。
             .child(
                 activity_bar::strip_button(
                     "toggle-terminals",
                     activity_bar::TERMINALS,
                     t("app", "activityBar.terminals"),
-                    terminals_visible && terminal_page_active,
+                    false,
                     self.activity_bar_hover.is_visible("toggle-terminals"),
                     Self::activity_bar_item_hover_listener("toggle-terminals", cx),
                 )
@@ -1593,7 +1602,7 @@ impl Render for Workspace {
                     "toggle-usage",
                     activity_bar::STATS,
                     t("app", "activityBar.stats"),
-                    self.usage_open,
+                    false,
                     self.activity_bar_hover.is_visible("toggle-usage"),
                     Self::activity_bar_item_hover_listener("toggle-usage", cx),
                 )
@@ -1947,6 +1956,29 @@ impl Render for Workspace {
                 )
             })
             .key_context("Workspace")
+            // Esc 中途取消**任何**内部拖拽(pane 拖拽 / 文件树行拖向终端或树内移动 /
+            // 项目列表排序)。原版 `fileDragState.ts` / `paneDragState.ts` 各挂一句
+            // `window.addEventListener('keydown', …, true)`,这里合成一处。
+            //
+            // **必须挂在根、且是捕获相**:按键沿「根 → 焦点节点」下行,焦点在终端上时
+            // `TerminalView` 会把 Esc 翻成 `\x1b` 写进 PTY 并 `stop_propagation`,
+            // 冒泡相收不到;而从文件树起拖时焦点在**文件树行**上(按下即聚焦),
+            // 终端区那一层压根不在派发路径上 —— 挂终端区根容器只对 pane 拖拽有效
+            // (此前正是那样,记档在 `dnd` 模块注释)。
+            //
+            // 只在**真有拖拽在飞**时吞掉这次 Esc,没拖拽时照常放行,终端里按 Esc
+            // 的行为一个字节都不变。各视图的落点残留(高亮/档位)不在这儿清:它们
+            // 都与 `cx.has_active_drag()` 与门、并在自己的 render 里对账,
+            // `stop_active_drag` 自带一次 `window.refresh()` 就够了。资源管理器拖进来的
+            // `ExternalPaths` 不经这里:OLE 拖拽期间 Esc 由拖源(Explorer)处理,
+            // gpui 收到 `FileDropEvent::Exited` 时自己清 active_drag。
+            .capture_key_down(|event: &gpui::KeyDownEvent, window, cx| {
+                if event.keystroke.key != "escape" || !cx.has_active_drag() {
+                    return;
+                }
+                cx.stop_active_drag(window);
+                cx.stop_propagation();
+            })
             .on_action(cx.listener(Self::on_new_terminal))
             .on_action(cx.listener(Self::on_close_pane))
             .on_action(cx.listener(Self::on_split_right))
@@ -2037,8 +2069,8 @@ impl Render for Workspace {
 /// 任务都在各自线程里跑,默认 hook 只打消息与位置,事后从用户贴来的日志里认不出
 /// 是哪条线路。原 hook 链式调用在后,backtrace 行为(RUST_BACKTRACE)一个字不改。
 ///
-/// ⚠️ release 的 Windows GUI 子系统下 stderr 无处可去(见文件头 `windows_subsystem`
-/// 注释),这一行只在 dev 实例 / 控制台启动时看得见。
+/// release 的 Windows GUI 子系统下 stderr 由 [`logfile::install`] 接到
+/// `mini-term.log`(`main` 第一行,早于本钩子安装),装机版的 panic 于是也留档。
 fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -2059,8 +2091,13 @@ fn install_panic_hook() {
 }
 
 fn main() {
-    // 启动链路埋点的 T0。**必须是第一行** —— 往后每个 `startup_trace::mark`
-    // 打的都是相对这一刻的偏移(装机版 `lib.rs::run()` 同位置)。
+    // 装机版没有控制台,stderr 先接到 `mini-term.log`(见 `logfile` 模块注释)。
+    // 必须排在埋点之前:`startup_trace::init` 自己就要打第一条 `run() enter`。
+    // 有控制台时它是空操作,dev 实例的日志照旧附着当前终端。
+    logfile::install();
+    // 启动链路埋点的 T0。**紧随日志接管之后** —— 往后每个 `startup_trace::mark`
+    // 打的都是相对这一刻的偏移(装机版 `lib.rs::run()` 同位置);上面那一步只是
+    // 打开一个文件,毫秒级,不影响埋点的可比性。
     startup_trace::init();
     // 紧随其后装 panic 兜底:再往后的任何一行倒下都得留下可定位的一行日志。
     install_panic_hook();
@@ -2075,8 +2112,8 @@ fn main() {
         // 右键菜单层的状态是全局的(项目列表 / 文件树 / tab / 终端四处都要弹),
         // 必须早于任何视图建出来 —— 视图的右键回调里直接取它。
         menu::init(cx);
-        // toast 层同理,而且要更早一档:启动补 PTY(`hydrate_project`)就可能推
-        // 一条 WSL 提示,那发生在窗口打开**之前**。
+        // toast 层同理:任何视图建出来之前就位。启动补 PTY(`hydrate_project`)
+        // 可能推一条 WSL 提示 —— 它现在排在首帧之后,但 toast 层早就位一档不亏。
         toast::init(cx);
         // 粘贴转存的临时文件清理(24h),启动时跑一次。丢后台线程:它要 stat
         // 整个目录,不该占住首帧(装机版是在 Rust 侧 setup 里同步跑的)。
@@ -2090,6 +2127,27 @@ fn main() {
         // 私钥明文副本。同样丢后台:它要遍历目录。
         cx.background_executor()
             .spawn(async { mt_core::cleanup_ssh_temp_keys() })
+            .detach();
+        // 已注册用户的启动期自愈,三家各一条。装机版 `lib.rs::setup` 里原本也是
+        // 一个后台线程按序跑这几条,GPUI 迁移时 hook_registry 逐字搬进了 mt-ai、
+        // 这行调用漏搬,claude/grok 两条自 2026-08-20(b52a654 删 src-tauri)起
+        // 一直没执行过 —— 补回来:
+        // - claude: 补齐新版本新增的 hook 事件(事件集没长过就直接 return,不写盘)
+        // - grok:   兼职把 `{grok_home}/hooks/` 里的 hook 二进制副本刷成当前版本
+        //           (mini-term 升级后旧副本会滞留),故不设「没变化」短路
+        // - codex:  把 config.toml 的 feature 键迁到现行名字(codex_hooks -> hooks),
+        //           面板判「已注册」只看 hooks.json,界面上没有线索提示用户重点
+        //           一次注册;键已是新名字就不落盘
+        // - omp:扩展文件与当前模板不同就整份重写(模板随版本演进)
+        // 四条都只在**已注册过**时才动手 —— 没开过这功能的用户一律不碰他的配置。
+        // 都要读写用户主目录下的文件,故丢后台不挡启动。
+        cx.background_executor()
+            .spawn(async {
+                mt_ai::hook_registry::sync_claude_hooks_if_registered();
+                mt_ai::hook_registry::sync_grok_hooks_if_registered();
+                mt_ai::hook_registry::sync_codex_hooks_feature_if_registered();
+                mt_ai::hook_registry::sync_omp_hooks_if_registered();
+            })
             .detach();
         // 真正的主题在 store 装好之后按 config 装配(`apply_theme_from_config`):
         // 亮/暗/auto + 外置主题包 + 终端配色一次算全。这里先钉一个暗色兜底,
@@ -2148,11 +2206,11 @@ fn main() {
         // 窗口还没开,`window` 传 None —— Theme::change 只是少一次 refresh。
         store.update(cx, |store, cx| store.apply_theme_from_config(None, cx));
 
-        // 启动即把当前项目的终端补起来(布局是从 config.json 恢复的,PTY 当然没了)
+        // 当前项目的终端要补起来(布局是从 layout.db 恢复的,PTY 当然没了),但
+        // **不在这里补** —— 每个 pane 的 openpty + 进程 spawn 都在主线程串行走,
+        // 恢复六七个 pane 就是几百毫秒,放在开窗之前等于让首帧陪着等。挪到首帧
+        // 呈现之后(见下方 `open_window` 之后那段),窗口先出来,终端随后贴上。
         let active = store.read(cx).active_project_id.clone();
-        if let Some(project_id) = active {
-            store.update(cx, |store, cx| store.hydrate_project(&project_id, cx));
-        }
         startup_trace::mark("setup: config applied (layout restored)");
 
         // 退出前把配置刷下去(不等 500ms 防抖),顺手收掉 hook server 的端口文件
@@ -2190,6 +2248,7 @@ fn main() {
         // 上次退出时的窗口大小/位置/最大化态(存在 layout.db)。没存过 / 存的框
         // 已经不在任何一块屏幕上 → 回落默认居中 1280×800。
         let window_bounds = restore_window_bounds(store.read(cx).window_geometry(), cx);
+        let store_for_window = store.clone();
         let window = cx.open_window(
             WindowOptions {
                 window_bounds: Some(window_bounds),
@@ -2223,18 +2282,53 @@ fn main() {
                 window.on_window_should_close(cx, title_bar::allow_close);
                 // 窗口的第一层必须是 gpui_component::Root:Dialog / 通知 / Input
                 // 的焦点登记都挂在它身上(Root::update 取不到就直接 panic)。
-                let workspace = cx.new(|cx| Workspace::new(store, ai_events, window, cx));
+                let workspace =
+                    cx.new(|cx| Workspace::new(store_for_window, ai_events, window, cx));
                 cx.new(|cx| Root::new(workspace, window, cx))
             },
         );
-        if let Err(err) = window {
-            eprintln!("打开窗口失败: {err:#}");
-            return;
-        }
+        let window = match window {
+            Ok(window) => window,
+            Err(err) => {
+                eprintln!("打开窗口失败: {err:#}");
+                return;
+            }
+        };
         cx.activate(true);
         // 装机版最后一个节点是前端的 `show() call (main UI first frame done)`;
         // GPUI 侧窗口一建出来元素树就已经构造完(`Workspace::new` 是同步的),
         // 差的只有 GPU 那一帧,于是收在这里。
         startup_trace::mark("setup exit (window opened)");
+
+        // 启动补 PTY,排在**首帧呈现之后**。
+        //
+        // gpui 的 `on_request_frame` 每帧的顺序是「先跑 `on_next_frame` 回调,再
+        // draw + present」;`open_window` 在 Windows 上虽已同步 draw 过一次,却要等
+        // 事件循环里第一个 request_frame 才 present。所以只挂一层回调会在首帧
+        // present **之前**执行,等于没挪;套两层才落在第一帧呈现之后、第二帧开画
+        // 之前。外层顺手 `refresh()` 保证第二帧一定会来(Windows 有 vsync 线程
+        // 常驻驱动,另外两家不一定)。
+        //
+        // 代价是 PTY 晚一个 vsync 起步(十几毫秒),换来的是窗口不再陪 spawn 干等。
+        if let Some(project_id) = active {
+            let store = store.clone();
+            let _ = window.update(cx, |_, window, _| {
+                window.on_next_frame(move |window, _| {
+                    window.refresh();
+                    window.on_next_frame(move |window, cx| {
+                        store.update(cx, |store, cx| {
+                            store.hydrate_project(&project_id, cx);
+                            // `Workspace::new` 那一下只记住了 focused_pane_id,当时
+                            // 还没有 PTY 实体可聚焦;真正的键盘焦点在这里落到终端上,
+                            // 否则用户得先点一下才能打字。
+                            if let Some(pane_id) = store.active_pane_id(&project_id) {
+                                store.focus_pane(&project_id, &pane_id, window, cx);
+                            }
+                        });
+                        startup_trace::mark("hydrate: PTYs spawned (after first frame)");
+                    });
+                });
+            });
+        }
     });
 }

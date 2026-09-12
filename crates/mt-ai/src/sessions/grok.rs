@@ -391,6 +391,7 @@ pub fn grok_question_from_line(line: &str) -> Option<AiQuestion> {
                     .get("multiSelect")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false),
+                recommended_index: None,
             })
         })
         .collect();

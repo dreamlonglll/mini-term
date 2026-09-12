@@ -193,6 +193,12 @@ pub enum TitleBarLight {
 
 impl TitleBarLight {
     /// tooltip / aria-label 的 key(`app.titleBar.status.{light}`)。
+    ///
+    /// ⚠️ 2026-09-04 标题栏那颗灯按用户要求撤掉(见 [`crate::title_bar`] 模块注释),
+    /// 于是这条**暂时没有生产调用方** —— 档位类型、归并算法与这张文案表都留着:
+    /// 它们仍由 [`compute_title_bar_light`] 那几条单测把着,哪天要把灯挂回来
+    /// (或换个位置画)不必从头再推一遍优先级。
+    #[allow(dead_code)]
     pub fn i18n_key(self) -> &'static str {
         match self {
             Self::Error => "titleBar.status.error",
@@ -396,7 +402,9 @@ pub(super) fn resolve_resume_cwd(session: &AiSessionRef) -> Option<String> {
     if let Some(cwd) = session.cwd.as_deref() {
         return Path::new(cwd).is_dir().then(|| cwd.to_string());
     }
-    if session.agent.as_deref() == Some("codex") {
+    // codex 不按目录分桶;omp 按目录分桶但没有记录解析可反查 —— 两者都不去
+    // `~/.claude/projects` 里翻(那里只会有 claude 的桶)
+    if matches!(session.agent.as_deref(), Some("codex") | Some("omp")) {
         return None;
     }
     mt_ai::sessions::lookup_ai_session_cwd(session.session_id.clone())

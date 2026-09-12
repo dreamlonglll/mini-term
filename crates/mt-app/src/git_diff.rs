@@ -37,6 +37,7 @@
 //! `loading → error → isBinary → tooLarge → 正常`(`DiffModal.tsx:233-259`)。
 //! 二进制文件的 `hunks` 是空的,先判 `tooLarge` 会把它显示成「文件过大」。
 
+use std::borrow::Cow;
 use std::ops::Range;
 
 use gpui::{
@@ -47,11 +48,13 @@ use gpui::{
 };
 use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel};
 use mt_project::git::{CommitFileInfo, DiffHunk, DiffLine, GitDiffResult};
+use mt_ui::TruncatedText;
 use mt_ui::tooltip::Tooltip;
 
 use crate::i18n::{t, tr};
 use crate::prompt::{kind, open_guarded};
 use crate::store::AppStore;
+use crate::tab_expansion::{TAB_WIDTH, expand_line};
 use crate::ui;
 
 /// 视图模式。**组件态,不落盘**;默认 side-by-side(`DiffModal.tsx:158`)。
@@ -351,6 +354,17 @@ fn flatten(hunks: &[DiffHunk]) -> Flat {
     for (hi, hunk) in hunks.iter().enumerate() {
         let base = f.lines.len();
         let (lines, pairs) = pair_rows(std::slice::from_ref(hunk));
+        // `\t` 在 gpui 文本里是零宽(见 `tab_expansion` 模块注释),显示前按制表位展开。
+        // 词级高亮与量宽都在展开后的文本上算,字节区间才对得上
+        let lines: Vec<DiffLine> = lines
+            .into_iter()
+            .map(|mut line| {
+                if let Cow::Owned(expanded) = expand_line(&line.content, TAB_WIDTH) {
+                    line.content = expanded;
+                }
+                line
+            })
+            .collect();
 
         f.heads.push(hunk_head(hunk));
         f.inline_jumps.push(f.inline_rows.len());
@@ -1123,11 +1137,11 @@ pub fn open_file_diff(
                     )
                     .child(
                         div()
+                            .min_w(px(0.0))
                             .max_w(px(300.0))
-                            .truncate()
                             .text_size(ui::font_px(13.0))
                             .text_color(ui::text_muted())
-                            .child(file_path.clone()),
+                            .child(TruncatedText::new(file_path.clone())),
                     )
                     .child(
                         div()
@@ -1291,7 +1305,7 @@ pub fn open_commit_diff(
                                 .text_color(color)
                                 .child(letter),
                         )
-                        .child(div().truncate().child(name))
+                        .child(div().min_w(px(0.0)).child(TruncatedText::new(name)))
                         .on_click(move |_: &ClickEvent, _window, cx| {
                             if pick.read(cx).selected == path {
                                 return;
@@ -1383,11 +1397,11 @@ pub fn open_commit_diff(
                         .border_color(ui::border_subtle())
                         .child(
                             div()
+                                .min_w(px(0.0))
                                 .max_w(px(400.0))
-                                .truncate()
                                 .text_size(ui::font_px(13.0))
                                 .text_color(ui::text_primary())
-                                .child(selected.clone()),
+                                .child(TruncatedText::new(selected.clone())),
                         )
                         .child(view_toggle(
                             &state,
@@ -1679,6 +1693,23 @@ mod tests {
         assert!(matches!(f.inline_rows[2], InlineRow::Line(1)));
         assert_eq!(f.widest_left, 2);
         assert_eq!(f.widest_right, 2);
+    }
+
+    /// `\t` 在 gpui 文本里零宽,拍平时按制表位展开;词级高亮在展开后的文本上算。
+    #[test]
+    fn 拍平_tab缩进按制表位展开() {
+        let h = hunk(vec![
+            line_with("delete", "\tvalue := 1"),
+            line_with("add", "\tvalue := 2"),
+            line_with("context", "a\tb"),
+        ]);
+        let f = flatten(&[h]);
+        assert_eq!(f.lines[0].content, "    value := 1");
+        assert_eq!(f.lines[1].content, "    value := 2");
+        assert_eq!(f.lines[2].content, "a   b");
+        // 高亮区间落在展开后的 `1` / `2` 上(下标 13),而不是原文里的 10
+        assert_eq!(f.marks[0], vec![13..14]);
+        assert_eq!(f.marks[1], vec![13..14]);
     }
 
     #[test]

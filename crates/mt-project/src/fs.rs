@@ -436,6 +436,54 @@ pub fn rename_entry(project_root: &Path, old_path: &Path, new_name: &str) -> Res
     Ok(new_canon)
 }
 
+/// 移动(换父目录、保留原名),返回新的绝对路径。
+///
+/// 文件树的拖拽移动与「移动到」菜单共用这一条。与 [`rename_entry`] 同一套
+/// 校验:源与目标目录都必须在项目根内;另外多三道闸 ——
+/// 不能移项目根、目录不能移进自身或其子孙(`fs::rename` 在这种情形下要么报
+/// 错要么把整棵树绕成环,不同平台行为不一)、目标已存在时**不覆盖**(与
+/// 重命名同一口径,用户改名再移)。
+///
+/// 源已经在目标目录里(`source.parent == target_dir`)按错误返回:UI 层应当在
+/// 那之前就把这种落点判成无效,这里兜底。
+pub fn move_entry(project_root: &Path, source: &Path, target_dir: &Path) -> Result<PathBuf> {
+    let root = project_root
+        .canonicalize()
+        .map(strip_verbatim_prefix)
+        .map_err(|e| anyhow!("项目根目录无效: {}: {}", project_root.display(), e))?;
+    let source_canon = verify_under_project_root(project_root, source, true)?;
+    if source_canon == root {
+        bail!("不能移动项目根目录");
+    }
+    let target_dir_canon = verify_under_project_root(project_root, target_dir, true)?;
+    if !target_dir_canon.is_dir() {
+        bail!("目标不是目录: {}", target_dir.display());
+    }
+    let name = source_canon
+        .file_name()
+        .ok_or_else(|| anyhow!("缺少文件名: {}", source.display()))?;
+    let destination = target_dir_canon.join(name);
+    if destination == source_canon {
+        bail!("已在该目录中: {}", source.display());
+    }
+    let source_is_dir = fs::symlink_metadata(&source_canon)
+        .with_context(|| format!("读取源条目失败: {}", source_canon.display()))?
+        .is_dir();
+    if source_is_dir && target_dir_canon.starts_with(&source_canon) {
+        bail!(
+            "不能把目录移动到自身或其子目录: {} → {}",
+            source.display(),
+            target_dir.display()
+        );
+    }
+    if path_entry_exists(&destination)? {
+        bail!("目标已存在: {}", destination.display());
+    }
+    fs::rename(&source_canon, &destination)
+        .with_context(|| format!("移动失败: {} → {}", source.display(), destination.display()))?;
+    Ok(destination)
+}
+
 /// 本地复制遇到同名目标时的落盘策略。`Skip` 由批处理层在调用本函数前
 /// 处理;这一层只负责两种真正会写盘的行为。
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1172,6 +1220,83 @@ mod tests {
         assert!(result.is_err(), "应拒绝 ../ 逃逸");
         // 旧文件应未被改动
         assert!(old_file.exists());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn move_entry_file_into_subdirectory() {
+        let (root, file) = make_test_project();
+        let target = root.join("sub");
+        fs::create_dir(&target).unwrap();
+        let moved = move_entry(&root, &file, &target).expect("move 失败");
+        assert_eq!(
+            moved,
+            strip_verbatim_prefix(target.canonicalize().unwrap()).join("inside.txt")
+        );
+        assert!(moved.exists());
+        assert!(!file.exists(), "源文件应被移走");
+        assert_eq!(fs::read(&moved).unwrap(), b"hi");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn move_entry_directory_keeps_children() {
+        let (root, _) = make_test_project();
+        let dir = root.join("pkg");
+        fs::create_dir_all(dir.join("deep")).unwrap();
+        fs::write(dir.join("deep").join("a.txt"), "a").unwrap();
+        let target = root.join("lib");
+        fs::create_dir(&target).unwrap();
+        let moved = move_entry(&root, &dir, &target).expect("move 失败");
+        assert!(moved.join("deep").join("a.txt").exists());
+        assert!(!dir.exists());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// 目录不能移进自身或其子孙 —— `fs::rename` 在这种情形下各平台行为不一,
+    /// 必须在调用前拒绝。
+    #[test]
+    fn move_entry_rejects_moving_directory_into_itself() {
+        let (root, _) = make_test_project();
+        let dir = root.join("pkg");
+        fs::create_dir_all(dir.join("deep")).unwrap();
+        assert!(move_entry(&root, &dir, &dir).is_err(), "移进自身");
+        assert!(
+            move_entry(&root, &dir, &dir.join("deep")).is_err(),
+            "移进子孙"
+        );
+        assert!(dir.join("deep").exists(), "拒绝后原树一字未动");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn move_entry_rejects_same_parent_existing_target_and_root() {
+        let (root, file) = make_test_project();
+        // 已在目标目录里
+        assert!(move_entry(&root, &file, &root).is_err());
+        // 目标已存在同名条目:不覆盖
+        let target = root.join("sub");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("inside.txt"), "taken").unwrap();
+        assert!(move_entry(&root, &file, &target).is_err());
+        assert_eq!(fs::read(target.join("inside.txt")).unwrap(), b"taken");
+        assert!(file.exists());
+        // 项目根本身不能动
+        assert!(move_entry(&root, &root, &target).is_err());
+        // 目标不是目录
+        assert!(move_entry(&root, &file, &target.join("inside.txt")).is_err());
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn move_entry_rejects_target_outside_project() {
+        let (root, file) = make_test_project();
+        let outside = std::env::temp_dir();
+        assert!(
+            move_entry(&root, &file, &outside).is_err(),
+            "目标在项目根之外"
+        );
+        assert!(file.exists());
         fs::remove_dir_all(&root).ok();
     }
 

@@ -12,6 +12,7 @@ use crate::menu::{self, MenuEntry, MenuItem};
 use crate::prompt::{Confirm, show_prompt};
 use crate::store::AppStore;
 
+use super::move_to::{MoveSource, move_to_menu_item};
 use super::ops::{
     choose_upload_paths, copy_to_file_clipboard, new_entry_prompt, open_entry_in_terminal,
     paste_file_clipboard, spawn_tree_op, start_download,
@@ -25,6 +26,8 @@ use super::{FileTree, Row};
 /// 逐条对照 `FileTree.tsx:210-325`。「查看变更」(`ViewDiff`)在 V 批把
 /// [`crate::git_diff::open_file_diff`] 建好之后补上,**条件与原版一字不差**:
 /// 非目录、且这个文件在 git 状态表里有条目,前置一条分隔线接在最末。
+/// 「移动到 ▸」(`MoveTo`)原版没有,GPUI 版补的,紧跟「重命名」——
+/// 两者都是「换路径」的操作,本地/远程、文件/目录一律有。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FileMenuAction {
     OpenWithDefault,
@@ -38,6 +41,7 @@ pub(super) enum FileMenuAction {
     RevealInFolder,
     OpenInTerminal,
     Rename,
+    MoveTo,
     Delete,
     NewFile,
     NewFolder,
@@ -68,7 +72,13 @@ pub(super) fn file_menu_actions(
     if !remote {
         actions.push(Some(RevealInFolder));
     }
-    actions.extend([Some(OpenInTerminal), None, Some(Rename), Some(Delete)]);
+    actions.extend([
+        Some(OpenInTerminal),
+        None,
+        Some(Rename),
+        Some(MoveTo),
+        Some(Delete),
+    ]);
     if is_dir {
         actions.extend([None, Some(NewFile), Some(NewFolder)]);
     }
@@ -280,6 +290,18 @@ pub(super) fn file_menu(
                     );
                 })
             }
+            FileMenuAction::MoveTo => move_to_menu_item(
+                tree,
+                context,
+                connection,
+                MoveSource {
+                    path,
+                    name,
+                    is_dir: row.is_dir,
+                    parent,
+                    remote,
+                },
+            ),
             FileMenuAction::Delete => {
                 let is_dir = row.is_dir;
                 MenuItem::new(t("fileTree", "menu.delete"))

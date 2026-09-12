@@ -26,6 +26,14 @@
 //! 写回时按探测结果还原。语义与原版一致(整份文件用同一种行尾),
 //! 唯一差别见 [`LineEnding::detect`] 的注释(混合行尾文件会被收敛成多数那一种)。
 //!
+//! # Tab:同一手法的第二件套
+//!
+//! GPUI 的整形器把 `\t` 画成零宽,Tab 缩进的文件(Go / Makefile)在编辑器里整篇顶格
+//! (issue #74)。读入时把 Tab 按制表位展成空格、写回时还原,规则与取舍全在
+//! [`crate::tab_expansion`] 的模块注释;本模块只在三处接线:[`FileViewer::apply_file_content`]
+//! 展开、[`FileViewer::save_with_mode`] 还原、[`FileViewer::finish_save`] 重算映射。
+//! 顺序是**先归一行尾再展开 Tab**,写回时反过来。
+//!
 //! # 与原版的偏差(逐条,详见各处注释)
 //!
 //! 1. **Markdown 里的链接点击拦不住**:gpui-component 的富文本渲染器把链接写死成
@@ -51,25 +59,27 @@ use futures::channel::mpsc;
 use futures::future::BoxFuture;
 use gpui::{
     App, AppContext, ClickEvent, Context, Entity, FocusHandle, Focusable, ImageAssetLoader,
-    InteractiveElement, IntoElement, KeyDownEvent, ParentElement, Render, Resource, ScrollHandle,
-    StatefulInteractiveElement, Styled, StyledImage as _, Subscription, Task, Window, div, img,
-    prelude::FluentBuilder as _, px,
+    InteractiveElement, IntoElement, KeyDownEvent, ListAlignment, ListState, ParentElement, Pixels,
+    Render, Resource, ScrollHandle, StatefulInteractiveElement, Styled, StyledImage as _,
+    Subscription, Task, Window, div, img, list, prelude::FluentBuilder as _, px,
 };
 use gpui::http_client::{
     AsyncBody, HttpClient, Request, Response, StatusCode, Url, http::HeaderValue,
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::WindowExt as _;
-use gpui_component::input::{Input, InputEvent, InputState, Position, Search};
+use gpui_component::input::{Input, InputEvent, InputState, Position, Search, TabSize};
 use gpui_component::scroll::Scrollbar;
 use gpui_component::text::{TextView, TextViewStyle};
 use markdown::{ParseOptions, mdast::Node as MarkdownNode};
 use mt_project::fs::FileContentResult;
 use mt_project::watch::FsWatcher;
+use mt_ui::TruncatedText;
 use mt_ui::icons::FileIcon;
 use mt_ui::tooltip::Tooltip;
 
 use crate::i18n::t;
+use crate::tab_expansion::{TAB_WIDTH, TabExpansion};
 use crate::ui;
 
 /// 文档的读写来源。远程来源持有打开时的连接快照；保存前还会与 `AppStore`
@@ -431,16 +441,19 @@ enum MdBlock {
 
 /// markdown 预览的分块缓存。key 是「源码 + 所在目录」,两者都没变就复用。
 ///
-/// 有它是因为**滚动一次就是整个视图重 render 一遍**(gpui 的滚轮处理改完
-/// offset 就 notify 当前 view),而 [`split_md_blocks`] 与
+/// 有它是因为**滚动一次就是整个视图重 render 一遍**(`gpui::list` 的滚轮处理
+/// 改完位置就 notify 当前 view),而 [`split_md_blocks`] 与
 /// [`rewrite_md_image_urls`] 都是全文逐字符扫描 —— 一份 40 KB 的文档每帧
-/// 重切一次纯属白烧。缓存的是**分块结果**,不是元素:元素每帧照建
+/// 重切一次纯属白烧。缓存的是**分块结果**,不是元素:视口附近的块每帧照建
 /// (gpui 的 retained 边界在 Element 那一层,不在这里)。
 struct MdCache {
     source: String,
     base_dir: PathBuf,
     local_resources: bool,
-    /// `(块顶间距, 块)`。`Rc` 让 [`FileViewer::render_markdown`] 拿完就撒手,
+    /// 分块代次:每重切一次 +1。[`FileViewer::sync_md_list`] 靠它知道「块的
+    /// 内容变了、量过的高度全作废」—— 只比块数不够,改一段话块数不变
+    generation: u64,
+    /// `(块顶间距, 块)`。`Rc` 让 [`FileViewer::render_md_item`] 拿完就撒手,
     /// 不必攥着 `RefCell` 的借用穿过整段渲染
     blocks: Rc<Vec<(f32, MdBlock)>>,
 }
@@ -1687,12 +1700,13 @@ fn display_width(s: &str) -> usize {
 /// 格子内容能不能不起 `TextView`、直接当纯文本画。
 ///
 /// **表格自绘的代价全压在这一个判定上。** 每个格子一个 [`TextView::markdown`],
-/// 而 [`FileViewer::render_markdown`] 的滚动容器是非虚拟化的普通 div ——
-/// gpui 的滚轮处理改完 offset 就 `cx.notify(current_view)`
-/// (`gpui::elements::div` 里那条),于是**滚一格 = 整篇重建一遍,视口外的表格
-/// 也不例外**。实测一份 26 张表的需求文档是每帧 1425 个 TextView(每个还各带
-/// 一个 focus handle 进 dispatch tree),滚动直接卡死;同等体量、只有 1 张表的
-/// 文档 89 个,毫无问题 —— 差的不是文件大小,是格子数。
+/// 每个 TextView 又是「focus handle + key context + 隐藏滚动条层 + 自己的
+/// 元素树」一整套。此前 [`FileViewer::render_markdown`] 的滚动容器还是非虚拟化
+/// 的普通 div,滚一格 = 整篇重建一遍、视口外的表格也不例外:实测一份 26 张表的
+/// 需求文档是每帧 1425 个 TextView,滚动直接卡死。现在容器已换成 `gpui::list`
+/// 按块虚拟化,只有视口附近的块付钱,但一张 20 行的表仍可能整张在视口里 ——
+/// 2026-09-09 采样(见 render_markdown 注释)一个格子的 TextView 约 0.04ms,
+/// 快路仍然值得留着。
 ///
 /// 判据**保守到底**:只要出现任何可能被 markdown 当标记的字符就判否,宁可多起
 /// 一个 TextView,也不能把行内 code / 加粗 / 链接画成源码。放行的格子渲染结果
@@ -1899,7 +1913,7 @@ fn md_image_placeholder(
         .bg(ui::bg_elevated())
         .text_size(ui::font_px(12.0))
         .text_color(ui::text_muted())
-        .child(div().min_w_0().truncate().child(label))
+        .child(div().min_w_0().child(TruncatedText::new(label)))
         .when_some(hint, |el, hint| {
             el.tooltip(move |window, cx| Tooltip::new(hint.clone()).build(window, cx))
         })
@@ -1934,27 +1948,38 @@ pub struct FileViewer {
     /// 「预览 ↔ 源码」来回切只是不画它,草稿与撤销栈都留着
     /// (原版 `className={preview ? 'hidden' : 'h-full'}`,只隐藏不卸载)。
     editor: Option<Entity<InputState>>,
-    /// 磁盘上最后一次已知内容(已归一成 `\n`)。载入 / 保存成功时更新。
+    /// 磁盘上最后一次已知内容的**编辑器投影**(已归一成 `\n`、Tab 已展开)。
+    /// 载入 / 保存成功时更新。
     saved: String,
     /// 磁盘现内容的投影(Markdown 预览渲染用它,不用 `result.content` ——
-    /// 后者是「打开时」的内容,保存后就旧了)。
+    /// 后者是「打开时」的内容,保存后就旧了)。与 [`Self::saved`] 同一口径。
     disk: String,
     /// 切到预览那一刻的草稿快照;`None` = 干净,预览直接用 [`Self::disk`]。
     preview_draft: Option<String>,
     /// 文件读进来时的行尾。写回时按它还原(见模块注释)。
     line_ending: LineEnding,
+    /// 文件读进来时的 Tab 展开记录。写回时按它还原(见模块注释「Tab」一节)。
+    tabs: TabExpansion,
     /// markdown 预览的分块缓存,见 [`MdCache`]。`RefCell` 是因为
     /// [`Self::render_markdown`] 只拿得到 `&self`(gpui 的 `Render::render`
     /// 之下全是不可变借用),而这份缓存要在渲染途中回填。
     md_cache: RefCell<Option<MdCache>>,
+    /// markdown 预览的虚拟化列表状态(`gpui::list`,一块一项)。**必须住在实体上**
+    /// (理由同 [`Self::preview_scroll`]):逻辑滚动位置(块序号 + 块内偏移)与
+    /// 各块量得的高度都在它里面,「预览 ↔ 源码」来回切靠它保住进度。
+    md_list: ListState,
+    /// 上次与 [`Self::md_list`] 对齐时的 `(分块代次, 视口宽)`,两者任一变了都要
+    /// 让列表重新量高,见 [`Self::sync_md_list`]。`Cell` 是因为对齐发生在
+    /// `render_markdown` 的 `&self` 里。
+    md_list_sync: std::cell::Cell<(u64, Pixels)>,
     /// 远程 Markdown 图片按文档、按 URL 记录用户明确批准。未命中时只能画
     /// 占位，绝不能把 URI 交给进程级图片加载器。
     approved_remote_images: HashSet<String>,
-    /// 预览态(markdown / html)的滚动位置。**必须住在实体上**:裸
+    /// html 预览的滚动位置。**必须住在实体上**:裸
     /// `overflow_y_scroll()` 的偏移存在按帧回收的 element state 里,切去终端页
-    /// 的那几帧预览不渲染、状态被回收,切回来就跳回顶部。一份文件只会走
-    /// md / html 其中一支,共用一个句柄;「预览 ↔ 源码」来回切也靠它保住进度
-    /// (源码态的滚动住在 `InputState` 实体里,组件自己管)。
+    /// 的那几帧预览不渲染、状态被回收,切回来就跳回顶部。「预览 ↔ 源码」来回切
+    /// 也靠它保住进度(源码态的滚动住在 `InputState` 实体里,组件自己管;
+    /// markdown 预览的住在 [`Self::md_list`] 里)。
     preview_scroll: ScrollHandle,
 
     preview: bool,
@@ -2033,7 +2058,15 @@ impl FileViewer {
             disk: String::new(),
             preview_draft: None,
             line_ending: LineEnding::Lf,
+            tabs: TabExpansion::default(),
             md_cache: RefCell::new(None),
+            // overdraw 600px:视口上下各多量这么多,滚轮一格(3 行 ≈ 60px)乃至
+            // 快甩都不会露白;再大只是白付视口外的布局钱。`measure_all` 让首帧
+            // 把所有块量一遍,滚动条的长度与位置才是准的(默认只量渲染过的块,
+            // 拇指会随着滚动逐渐变短、一路乱跳);代价是打开时多一帧的全量布局,
+            // 与旧路径每一帧的开销相同
+            md_list: ListState::new(0, ListAlignment::Top, px(600.0)).measure_all(),
+            md_list_sync: std::cell::Cell::new((0, px(0.0))),
             approved_remote_images: HashSet::new(),
             preview_scroll: ScrollHandle::new(),
             // 文件树打开 Markdown / HTML 时默认看渲染稿；内容搜索带行号时切到
@@ -2318,7 +2351,9 @@ impl FileViewer {
         cx: &mut Context<Self>,
     ) {
         self.line_ending = LineEnding::detect(&res.content);
-        let text = normalize_to_lf(&res.content);
+        // 先归一行尾再展开 Tab(见模块注释「Tab」一节)
+        let (text, tabs) = TabExpansion::expand(&normalize_to_lf(&res.content), TAB_WIDTH);
+        self.tabs = tabs;
         self.saved = text.clone();
         self.disk = text.clone();
         self.dirty = false;
@@ -2332,12 +2367,23 @@ impl FileViewer {
             let name = self.file_name();
             let lang = language_for(&name);
             let wrap = should_wrap(&name);
+            let tab_indented = self.tabs.indents_with_tabs();
             let editor = cx.new(|cx| {
-                InputState::new(window, cx)
+                let state = InputState::new(window, cx)
                     .code_editor(lang)
                     .line_number(true)
                     .soft_wrap(wrap)
-                    .default_value(text.clone())
+                    .default_value(text.clone());
+                // Tab 缩进的文件:Tab 键一次缩 `TAB_WIDTH` 个空格,写回时正好折成一个 `\t`
+                // (组件默认 2 个,折不回去会留下半档空格);其余文件维持组件默认
+                if tab_indented {
+                    state.tab_size(TabSize {
+                        tab_size: TAB_WIDTH,
+                        hard_tabs: false,
+                    })
+                } else {
+                    state
+                }
             });
             // 每次编辑都要重算脏态(原版 `onDocChange` → `setDirty(doc !== savedRef)`)
             let sub = cx.subscribe(&editor, |this: &mut FileViewer, editor, event, cx| {
@@ -2457,7 +2503,7 @@ impl FileViewer {
         }
     }
 
-    /// 当前草稿(编辑器全文,`\n` 行尾)。没有编辑器时就是磁盘内容。
+    /// 当前草稿(编辑器全文,`\n` 行尾、Tab 已展开)。没有编辑器时就是磁盘内容的投影。
     fn draft(&self, cx: &App) -> String {
         match &self.editor {
             Some(editor) => editor.read(cx).value().to_string(),
@@ -2548,8 +2594,8 @@ impl FileViewer {
 
         let path = self.current_path.clone();
         let generation = self.load_generation;
-        // 写回磁盘前把行尾还原(见模块注释)
-        let on_disk = restore_line_ending(&text, self.line_ending);
+        // 写回磁盘前先还原 Tab、再还原行尾(与读入时相反的顺序,见模块注释)
+        let on_disk = restore_line_ending(&self.tabs.restore(&text), self.line_ending);
         match self.source.clone() {
             DocumentSource::Local { project_root, .. } => {
                 cx.spawn(async move |this, cx| {
@@ -2657,6 +2703,10 @@ impl FileViewer {
         warning: Option<String>,
         cx: &App,
     ) {
+        // 写回的是 `tabs.restore(text)`,此后「没动过的行」以它为准:用写回文本重算
+        // 一遍映射。`expand(restore(v)) == v` 是 `tab_expansion` 的不变式,编辑器内容
+        // 不用重建,`saved` 直接取 `text`
+        self.tabs = TabExpansion::expand(&self.tabs.restore(&text), TAB_WIDTH).1;
         self.saved = text.clone();
         self.disk = text.clone();
         self.last_save_at = Some(Instant::now());
@@ -2835,8 +2885,7 @@ impl FileViewer {
                             .min_w(px(0.0))
                             .text_size(ui::font_px(12.0))
                             .text_color(ui::text_muted())
-                            .truncate()
-                            .child(path),
+                            .child(TruncatedText::new(path)),
                     ),
             )
             .child(
@@ -3390,20 +3439,28 @@ impl FileViewer {
     }
 
     /// 正文分块(带缓存,见 [`MdCache`])。源码或所在目录变了才重切。
+    /// 返回 `(分块, 代次)`,代次每重切一次 +1(见 [`MdCache::generation`])。
     fn md_blocks(
         &self,
         source: &str,
         base_dir: &Path,
         local_resources: bool,
-    ) -> Rc<Vec<(f32, MdBlock)>> {
+    ) -> (Rc<Vec<(f32, MdBlock)>>, u64) {
         // 先把命中与否算完再撒手,别让 borrow 活到 borrow_mut 那一行
-        let hit = self.md_cache.borrow().as_ref().and_then(|c| {
-            (c.source == source && c.base_dir == base_dir && c.local_resources == local_resources)
-                .then(|| c.blocks.clone())
-        });
-        if let Some(blocks) = hit {
-            return blocks;
+        let (hit, last_generation) = {
+            let cache = self.md_cache.borrow();
+            let hit = cache.as_ref().and_then(|c| {
+                (c.source == source
+                    && c.base_dir == base_dir
+                    && c.local_resources == local_resources)
+                    .then(|| (c.blocks.clone(), c.generation))
+            });
+            (hit, cache.as_ref().map_or(0, |c| c.generation))
+        };
+        if let Some(hit) = hit {
+            return hit;
         }
+        let generation = last_generation + 1;
 
         let blocks: Vec<(f32, MdBlock)> = split_md_blocks(source)
             .into_iter()
@@ -3445,9 +3502,34 @@ impl FileViewer {
             source: source.to_string(),
             base_dir: base_dir.to_path_buf(),
             local_resources,
+            generation,
             blocks: blocks.clone(),
         });
-        blocks
+        (blocks, generation)
+    }
+
+    /// 让 [`Self::md_list`] 与当前分块对齐:块数变了、分块代次变了(源码或所在
+    /// 目录变)、视口宽变了(拖分栏 / 缩放窗口,块高全部作废)三种情况都重置列表
+    /// 让它重新量高,但**保住逻辑滚动位置**(块序号 + 块内偏移)—— `reset` 会把
+    /// 位置清零,这里先存后还;块数变少时 `scroll_to` 自己夹到末尾。
+    ///
+    /// 宽度看的是列表**上一帧**的布局边界:`gpui::list` 自己在 prepaint 里发现
+    /// 变宽会把块高作废,但只重量视口内的块,视口外的按 0 计,滚动条就会随着
+    /// 滚动一路乱跳;这里晚一帧补一次全量测量(`measure_all` 经 `reset` 重新
+    /// 武装),代价与旧路径的一帧相同,只在真的变宽时付。首帧的宽是 0,不算变。
+    fn sync_md_list(&self, block_count: usize, generation: u64) {
+        let width = self.md_list.viewport_bounds().size.width;
+        let (last_generation, last_width) = self.md_list_sync.get();
+        let width_changed = last_width != px(0.0) && width != last_width;
+        if self.md_list.item_count() != block_count
+            || generation != last_generation
+            || width_changed
+        {
+            let keep = self.md_list.logical_scroll_top();
+            self.md_list.reset(block_count);
+            self.md_list.scroll_to(keep);
+        }
+        self.md_list_sync.set((generation, width));
     }
 
     /// 富文本排版。markdown 与 html 两支预览共用一份 —— 两边走的是
@@ -3485,12 +3567,8 @@ impl FileViewer {
     }
 
     /// 预览滚动壳:内容器挂上 [`Self::preview_scroll`](进度跨卸载存活),
-    /// 再叠一层滚动条(显隐跟主题的 `scrollbar_show`,默认滚动时现身、闲置淡出,
-    /// 与终端滚动条同口径)。
-    ///
-    /// 滚动条要自己套一层 `absolute` + 四边贴 0 的壳,理由与 `menu.rs` 那处相同:
-    /// `Scrollbar` 元素自身是 absolute 却不带 inset,直接塞进流式布局会被 taffy
-    /// 按静态位置摆到内容下方去。壳上没有监听器,不挡内容的点击与选择。
+    /// 再叠一层滚动条(见 [`Self::scrollbar_overlay`])。html 预览用;markdown
+    /// 预览的滚动由 `gpui::list` 自己管,见 [`Self::render_markdown`]。
     fn preview_scroll_shell(
         &self,
         bar_id: &'static str,
@@ -3500,16 +3578,28 @@ impl FileViewer {
             .size_full()
             .relative()
             .child(content.track_scroll(&self.preview_scroll))
-            .child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .right_0()
-                    .bottom_0()
-                    .child(Scrollbar::vertical(&self.preview_scroll).id(bar_id)),
-            )
+            .child(self.scrollbar_overlay(bar_id, &self.preview_scroll))
             .into_any_element()
+    }
+
+    /// 叠在滚动内容之上的滚动条层(显隐跟主题的 `scrollbar_show`,默认滚动时
+    /// 现身、闲置淡出,与终端滚动条同口径)。
+    ///
+    /// 滚动条要自己套一层 `absolute` + 四边贴 0 的壳,理由与 `menu.rs` 那处相同:
+    /// `Scrollbar` 元素自身是 absolute 却不带 inset,直接塞进流式布局会被 taffy
+    /// 按静态位置摆到内容下方去。壳上没有监听器,不挡内容的点击与选择。
+    fn scrollbar_overlay<H: gpui_component::scroll::ScrollbarHandle + Clone>(
+        &self,
+        bar_id: &'static str,
+        handle: &H,
+    ) -> gpui::Div {
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .bottom_0()
+            .child(Scrollbar::vertical(handle).id(bar_id))
     }
 
     /// Markdown 预览。样式对照 `src/styles.css:813-943` 的 `.md-preview`:
@@ -3517,72 +3607,106 @@ impl FileViewer {
     ///
     /// 代码块高亮是**改善**(原版 `.md-preview pre code` 只设颜色不做高亮),
     /// 且与编辑器同一份 `highlight_theme`,两处颜色一致。
-    fn render_markdown(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+    ///
+    /// # 为什么是 `gpui::list` 而不是 `overflow_y_scroll`
+    ///
+    /// GPUI 没有跨帧的布局缓存:一次 notify = 整棵元素树重建 + taffy 全量布局。
+    /// 非虚拟化容器下滚一格就把整篇文档重排一遍,视口外的也不例外。2026-09-09
+    /// 对一份 65 KB / 17 张表 / 226 个列表项的文档采样(debug 带符号):主线程
+    /// 90% 在 `Window::draw`,其中 **taffy 布局 81.5%**、元素构建 6.6%、文本整形
+    /// 6.4%(DirectWrite 本身 0.18%,行排版有缓存)、绘制 <2%;装机版实测每滚
+    /// 一格 130ms(≈8fps),同文件源码视图 16ms。成本 ∝ 元素数,不 ∝ 字节数
+    /// (每个表格格子 ≈0.04ms,列表项比同文字段落贵 1.7 倍),release 只比 debug
+    /// 快 1.3 倍 —— 编译优化救不了,只能不排视口外的东西。
+    ///
+    /// 于是这里一块([`MdBlock`])一项交给 `gpui::list`:只有视口 ± overdraw 里的
+    /// 块会被 [`Self::render_md_item`] 建出来、参与布局;块高量过就记在
+    /// [`Self::md_list`] 里,拖分栏 / 改源码时由 [`Self::sync_md_list`] 作废重量。
+    /// 只留第一屏内容的对照文档实测 28ms/帧,这就是虚拟化后的预期档位。
+    ///
+    /// 已知取舍:① 滚出视口的块的 TextView 状态(含选区)随 element state 一起
+    /// 回收,滚回来重新解析那一块(几百微秒);② 滚轮步长由 list 写死为每行 20px,
+    /// 比 `overflow_y_scroll` 按行高算的略慢;③ 水平内边距放在每一项上而不是
+    /// 列表上 —— list 的 padding 只影响纵向,横向不缩项宽。
+    fn render_markdown(&self, _window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
         let base_dir = self.preview_base_dir();
-        let style = self.preview_text_style(cx);
         // 表格与图片拆出来自绘(组件表格单行截断、图片只认网络 URI,见
-        // split_md_blocks 一节的说明),其余段落照走 TextView;段落 id 按段序编,
-        // 文档不变即稳定。分块结果跨帧缓存(见 MdCache)——「滚一格重画一遍」
-        // 这条路上,每帧重切 40 KB 正文是白烧。
-        let blocks = self.md_blocks(self.preview_source(), &base_dir, !self.source.is_remote());
+        // split_md_blocks 一节的说明),其余段落照走 TextView。分块结果跨帧缓存
+        // (见 MdCache)——「滚一格重 render 一遍」这条路上,每帧重切 40 KB 正文
+        // 是白烧。
+        let (blocks, generation) =
+            self.md_blocks(self.preview_source(), &base_dir, !self.source.is_remote());
+        self.sync_md_list(blocks.len(), generation);
         let content = div()
-            .id("file-viewer-md")
             .size_full()
-            .overflow_y_scroll()
-            .p(px(24.0))
             .text_size(ui::font_px(14.0))
             // 原版 .md-preview 是 1.7;数值对齐后用户仍觉得密(体感口径),
             // 放宽到 1.85 —— 表格格子行高同源跟随
             .line_height(gpui::relative(1.85))
+            .child(
+                list(self.md_list.clone(), cx.processor(Self::render_md_item))
+                    .size_full()
+                    // 原版容器 p-6 的纵向那一半;横向的在每一项上(见方法注释)
+                    .pt(px(24.0))
+                    .pb(px(24.0)),
+            );
+        div()
+            .size_full()
+            .relative()
+            .child(content)
+            .child(self.scrollbar_overlay("file-viewer-md-scrollbar", &self.md_list))
+            .into_any_element()
+    }
+
+    /// 虚拟化列表的一项 = 一块正文([`MdBlock`]),只有视口附近的块会被调到
+    /// (见 [`Self::render_markdown`])。行根必须撑满列表宽(`w_full`,否则里面
+    /// `relative()` 的宽度没有参照),再按原版 `.md-preview` 收成 860px 居中列。
+    ///
+    /// 段落 id 按块序编,文档不变即稳定,TextView 的解析结果与选区靠它跨帧复用。
+    fn render_md_item(
+        &mut self,
+        ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        // 缓存一定已由本帧的 render_markdown 填好;拿 Rc 就撒手,别让 borrow
+        // 活到下面 render_md_images 的 &self 调用
+        let blocks = self.md_cache.borrow().as_ref().map(|c| c.blocks.clone());
+        let Some((mt, block)) = blocks.as_ref().and_then(|blocks| blocks.get(ix)) else {
+            return div().into_any_element();
+        };
+        let style = self.preview_text_style(cx);
+        // 块间距按原版纵向节奏由这里统一给(em 基准,随 uiFontSize 缩放),
+        // TextView 内部的 paragraph_gap 在非虚拟化路径上是坏的(见 split_md_blocks
+        // 注释)
+        let content = match block {
+            MdBlock::Text(text) => TextView::markdown(
+                gpui::SharedString::from(format!("file-viewer-md-body-{ix}")),
+                text.clone(),
+                window,
+                cx,
+            )
+            .style(style.clone())
+            .selectable(true)
+            .into_any_element(),
+            MdBlock::Table(table) => render_md_table(ix, table, &style, window, cx),
+            MdBlock::Images(images) => {
+                self.render_md_images(ix, images, MARKDOWN_CONTENT_MAX_WIDTH, window, cx)
+            }
+        };
+        div()
+            .w_full()
+            .px(px(24.0))
             .child(
                 div()
                     .w_full()
                     .max_w(px(MARKDOWN_CONTENT_MAX_WIDTH))
                     .min_w_0()
                     .mx_auto()
-                    .children(
-                        blocks
-                            .iter()
-                            .enumerate()
-                            .map(|(ix, (mt, block))| {
-                                // 块间距按原版纵向节奏由这里统一给(em 基准,随
-                                // uiFontSize 缩放),TextView 内部的 paragraph_gap
-                                // 在非虚拟化路径上是坏的(见 split_md_blocks 注释)
-                                let content = match block {
-                                    MdBlock::Text(text) => TextView::markdown(
-                                        gpui::SharedString::from(format!(
-                                            "file-viewer-md-body-{ix}"
-                                        )),
-                                        text.clone(),
-                                        window,
-                                        cx,
-                                    )
-                                    .style(style.clone())
-                                    .selectable(true)
-                                    .into_any_element(),
-                                    MdBlock::Table(table) => {
-                                        render_md_table(ix, table, &style, window, cx)
-                                    }
-                                    MdBlock::Images(images) => self.render_md_images(
-                                        ix,
-                                        images,
-                                        MARKDOWN_CONTENT_MAX_WIDTH,
-                                        window,
-                                        cx,
-                                    ),
-                                };
-                                div()
-                                    .w_full()
-                                    .max_w_full()
-                                    .min_w_0()
-                                    .when(*mt > 0.0, |el| el.mt(ui::font_px(*mt)))
-                                    .child(content)
-                                    .into_any_element()
-                            })
-                            .collect::<Vec<_>>(),
-                    ),
-            );
-        self.preview_scroll_shell("file-viewer-md-scrollbar", content)
+                    .when(*mt > 0.0, |el| el.mt(ui::font_px(*mt)))
+                    .child(content),
+            )
+            .into_any_element()
     }
 
     /// Trusted local HTML preview. **富文本简版渲染,不是浏览器** —— GPUI 侧没有 iframe 等价物,

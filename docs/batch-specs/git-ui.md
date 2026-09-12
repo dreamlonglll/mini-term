@@ -88,7 +88,8 @@ ChangeFileStatus { path: String, old_path: Option<String>,
 GitFileStatus { path: String, old_path: Option<String>, status: GitStatus, status_label: String }       // git.rs:43
 GitCommitInfo { hash, short_hash, message, body: Option<String>, author, timestamp: i64,
                 parent_hashes: Vec<String> }                                                            // git.rs:242
-BranchInfo    { name: String, is_head: bool, is_remote: bool, commit_hash: String }                     // git.rs:263
+BranchInfo    { name: String, is_head: bool, is_remote: bool, commit_hash: String,
+                upstream: Option<String> /* 本地分支的上游短名 origin/main */ }                          // git.rs:263
 CommitFileInfo{ path: String, status: String /* added|deleted|modified|renamed */, old_path: Option<String> } // git.rs:255
 GitDiffResult { old_content: String, new_content: String, hunks: Vec<DiffHunk>,
                 is_binary: bool, too_large: bool }                                                      // git.rs:81

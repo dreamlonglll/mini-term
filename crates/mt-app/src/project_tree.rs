@@ -80,7 +80,8 @@ pub fn is_descendant(tree: &[ProjectTreeItem], ancestor_id: &str, target_id: &st
     contains_id(&ancestor.children, target_id)
 }
 
-fn contains_id(items: &[ProjectTreeItem], id: &str) -> bool {
+/// 树里(任意深度)有没有这个 id —— 项目与分组都算。
+pub fn contains_id(items: &[ProjectTreeItem], id: &str) -> bool {
     items.iter().any(|item| {
         item_id(item) == id
             || match item {

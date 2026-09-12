@@ -241,18 +241,27 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct TempDir(PathBuf);
 
     impl TempDir {
         fn new() -> Self {
+            // 光靠时间戳不够唯一：cargo 并行跑测试，Windows 上两个线程同一刻取到的
+            // 纳秒数会相等，撞名的两个用例就共用一份 portable-conpty 互相污染
+            // （一个删 arm64、另一个把 x64 写成别的架构，断言随机错位）。补一个进程内
+            // 自增序号兜底。
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
             let nonce = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let path = std::env::temp_dir()
-                .join(format!("mini-term-conpty-{}-{nonce}", std::process::id()));
+            let path = std::env::temp_dir().join(format!(
+                "mini-term-conpty-{}-{nonce}-{seq}",
+                std::process::id()
+            ));
             fs::create_dir_all(&path).unwrap();
             Self(path)
         }

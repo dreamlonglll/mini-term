@@ -52,6 +52,13 @@
 //! 字号写死、gpui 的 500ms 停留时长是私有常量,两个都调不动,所以自己包一层:
 //! 字号降一档 + 在 gpui 那 500ms 后再接一段延迟。理由与做法见该模块注释。
 //!
+//! ## 4.7 单行省略文本([`truncated_text`])
+//!
+//! `div().truncate()` 在**宽度随内容走**的 flex 项上画不出「…」(gpui 文本测量
+//! 的缓存按 `wrap_width` 命中,nowrap 时第一次 MaxContent 测量一锤定音),
+//! [`TruncatedText`] 改在 prepaint 拿到最终 bounds 后再截断整形。胶囊 / 徽章 /
+//! 标题这类自然宽度的文字用它;`flex_1` 的项 `truncate()` 照旧能用。
+//!
 //! ## 5. 布局复用件(尽量用 gpui-component,别自己造)
 //!
 //! | mini-term 现状 | GPUI 侧对应 |
@@ -85,6 +92,7 @@ pub mod motion;
 pub mod terminal;
 pub mod theme_bridge;
 pub mod tooltip;
+pub mod truncated_text;
 
 pub use background::{BackgroundArtElement, Fit, background_art, fit_bounds};
 pub use chart::{ChartCanvas, ChartColors, ChartKey, ChartModel, ChartStyle};
@@ -106,6 +114,7 @@ pub use theme_bridge::{
     AppliedThemePack, Appearance, BackgroundArt, ThemePackColors, ThemePackDef, switch_to_builtin,
     switch_to_theme_pack,
 };
+pub use truncated_text::TruncatedText;
 
 /// OSC 调色板查询的应答色(`TermEvent::ColorRequest` 的处理)。
 ///

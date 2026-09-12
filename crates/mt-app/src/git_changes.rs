@@ -33,6 +33,7 @@ use gpui::{
 };
 use gpui_component::input::{Input, InputState};
 use mt_project::git::{ChangeFileStatus, GitStatus};
+use mt_ui::TruncatedText;
 
 use crate::i18n::{t, tr};
 use crate::menu;
@@ -678,7 +679,7 @@ impl GitChanges {
                     .text_center()
                     .child(if collapsed { "▸" } else { "▾" }),
             )
-            .child(div().truncate().child(name))
+            .child(div().min_w(px(0.0)).child(TruncatedText::new(name)))
             .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
                 if !this.collapsed_dirs.remove(&key) {
                     this.collapsed_dirs.insert(key.clone());
@@ -740,9 +741,9 @@ impl GitChanges {
                     )
                     .child(
                         div()
-                            .truncate()
+                            .min_w(px(0.0))
                             .text_color(ui::text_primary())
-                            .child(display),
+                            .child(TruncatedText::new(display)),
                     ),
             )
             .child(

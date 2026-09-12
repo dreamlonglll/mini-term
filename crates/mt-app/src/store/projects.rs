@@ -11,12 +11,36 @@ use mt_config::ProjectConfig;
 use mt_ui::icons::ProjectKind;
 
 use crate::project_tree;
-use crate::tree::gen_id;
+use crate::tree::gen_unique_id;
 
 use super::pure::remove_from_tree;
 use super::{AppStore, ProjectState};
 
 impl AppStore {
+    /// 新项目 id:对 `projects` **与** `projectTree` 双双去重。树里也要查 ——
+    /// 树上可能残留指向已删项目的 id,撞上会让新项目凭空出现在残留的位置。
+    /// 背景见 [`gen_unique_id`] / `tree::gen_id` 的注释(曾把库里既有项目顶掉)。
+    pub(super) fn fresh_project_id(&self) -> String {
+        gen_unique_id("proj", |id| {
+            self.config.projects.iter().any(|p| p.id == id)
+                || self
+                    .config
+                    .project_tree
+                    .as_deref()
+                    .is_some_and(|tree| project_tree::contains_id(tree, id))
+        })
+    }
+
+    /// 新分组 id:只需对树去重(分组只活在树里)。
+    fn fresh_group_id(&self) -> String {
+        gen_unique_id("group", |id| {
+            self.config
+                .project_tree
+                .as_deref()
+                .is_some_and(|tree| project_tree::contains_id(tree, id))
+        })
+    }
+
     // === 目录技术栈探测(`useProjectKinds.ts`) ===
 
     /// 读缓存。`None` = 还没探过;`Some(None)` = 探过但识别不出。
@@ -115,7 +139,7 @@ impl AppStore {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| path_str.clone());
-        let id = gen_id("proj");
+        let id = self.fresh_project_id();
         let parent_ok = parent.filter(|pid| self.config.projects.iter().any(|p| p.id == *pid));
 
         self.config.projects.push(ProjectConfig {
@@ -179,7 +203,7 @@ impl AppStore {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| path_str.clone());
-        let id = gen_id("proj");
+        let id = self.fresh_project_id();
 
         self.config.projects.push(ProjectConfig {
             id: id.clone(),
@@ -386,7 +410,7 @@ impl AppStore {
         }
         self.ensure_tree();
         let group = mt_config::ProjectGroup {
-            id: gen_id("group"),
+            id: self.fresh_group_id(),
             name: name.to_string(),
             collapsed: false,
             children: Vec::new(),

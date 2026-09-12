@@ -429,10 +429,27 @@ pub fn prepare_remote_launch(
         remote_path,
     );
 
+    // 已存密码是 `mt-secret` 信封,这里解开交给 autofill;解不开只记日志、不填 ——
+    // 终端里会照常出现密码提示,用户手输即可,不该因此连 pane 都开不了(私钥登录的
+    // 连接更与它无关)。日志不含密码。
+    let password = match conn.password.as_deref().filter(|p| !p.is_empty()) {
+        Some(stored) => match crate::secrets::reveal_password(stored) {
+            Ok(plain) => Some(plain),
+            Err(err) => {
+                eprintln!(
+                    "[remote-ssh] 连接 {} 的已存密码无法解密,本次不自动填充: {err}",
+                    conn.id
+                );
+                None
+            }
+        },
+        None => None,
+    };
+
     Ok(RemoteLaunch {
         program: ssh_program.to_string_lossy().into_owned(),
         args,
-        password: conn.password.clone().filter(|p| !p.is_empty()),
+        password,
     })
 }
 

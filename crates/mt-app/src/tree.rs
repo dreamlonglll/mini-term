@@ -24,13 +24,40 @@
 //!    短路重渲染;gpui 靠 `cx.notify()` 显式触发,没有这个约束。
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// 进程内唯一 id(对应 store.ts 的 `genId`)。
+/// 生成 id:`{prefix}-{毫秒时间戳}-{进程内计数}`,对应 store.ts 的
+/// `genId = () => \`id-${Date.now()}-${++idCounter}\``。
+///
+/// ⚠️ **时间戳那一段不能省**。这里生成的 id 有一部分会**落盘**(项目 / 分组 /
+/// SSH 连接 / AI 启动器),而计数器每次启动都从 0 数起 —— 只靠计数的话,新一次
+/// 启动里第 N 个 id 与上一次启动里第 N 个 id 一模一样。曾经就是这样:
+/// 「分组右键 → 添加项目」偶发地拿到一个与库里既有项目相同的 `proj-N`,
+/// 新项目在列表上完全看不见(渲染按 id 去重、`store.project(id)` 找到的是旧那条),
+/// 重启后又因为 `config.db` 的 `projects` 表以 id 为主键、后写覆盖先写,**旧项目
+/// 的那一行被新项目悄悄顶掉**。单测锁的是「同前缀连续生成互不相同」;跨进程唯一
+/// 靠时间戳,再由各落盘点的 [`gen_unique_id`] 兜底。
 pub fn gen_id(prefix: &str) -> String {
     let n = ID_COUNTER.fetch_add(1, Ordering::Relaxed) + 1;
-    format!("{prefix}-{n}")
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    format!("{prefix}-{millis}-{n}")
+}
+
+/// [`gen_id`] 的「对既有数据去重」版:`is_taken` 说已经有了就再生成一个。
+/// 所有**会落盘**的 id 都该走这一条 —— 时间戳挡的是正常情况,这一道挡的是
+/// 时钟回拨 / 恢复旧库这类正常情况之外的事。
+pub fn gen_unique_id(prefix: &str, is_taken: impl Fn(&str) -> bool) -> String {
+    loop {
+        let id = gen_id(prefix);
+        if !is_taken(&id) {
+            return id;
+        }
+    }
 }
 
 /// pane / 项目的四态。聚合优先级 `error > ai-working > ai-idle > idle`。
@@ -1250,6 +1277,35 @@ mod tests {
         assert_ne!(a.id, b.id);
         assert!(a.id.starts_with("panel-"));
         assert_eq!(a.custom_title, None);
+    }
+
+    /// `gen_id` 的形状是 `{prefix}-{毫秒}-{计数}`:时间戳段是跨进程唯一的依据
+    /// (见函数注释里那桩「新项目顶掉旧项目」的事故),不能退化回 `{prefix}-{计数}`。
+    #[test]
+    fn gen_id带毫秒时间戳段() {
+        let id = gen_id("proj");
+        let parts: Vec<&str> = id.split('-').collect();
+        assert_eq!(parts.len(), 3, "形状应为 proj-<millis>-<n>: {id}");
+        assert_eq!(parts[0], "proj");
+        let millis: u128 = parts[1].parse().expect("中段是毫秒时间戳");
+        assert!(millis > 1_600_000_000_000, "毫秒时间戳量级不对: {millis}");
+        parts[2].parse::<u64>().expect("末段是计数");
+        assert_ne!(gen_id("proj"), id, "同前缀连续生成互不相同");
+    }
+
+    /// `gen_unique_id`:被占用的 id 会被跳过,直到拿到一个没人用的。
+    #[test]
+    fn gen_unique_id跳过已占用的id() {
+        let mut seen: Vec<String> = Vec::new();
+        for _ in 0..3 {
+            let id = gen_unique_id("proj", |candidate| seen.iter().any(|s| s == candidate));
+            assert!(!seen.contains(&id));
+            seen.push(id);
+        }
+        // 把「除第一次外全部占用」翻过来:只放行带特定后缀的,验证确实会重试
+        let taken = |candidate: &str| !candidate.ends_with('7');
+        let id = gen_unique_id("x", taken);
+        assert!(id.ends_with('7'), "应一直重试到计数末位为 7: {id}");
     }
 
     /// 深度优先的名牌序列(TS 的 `paneIds(node)`)。

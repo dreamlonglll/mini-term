@@ -258,13 +258,17 @@ pub struct CommitFileInfo {
     pub old_path: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct BranchInfo {
     pub name: String,
     pub is_head: bool,
     pub is_remote: bool,
     pub commit_hash: String,
+    /// 本地分支关联的远程分支短名(`origin/main`)。远程分支、没配上游、
+    /// 上游的远程跟踪引用已不存在(远端删了又 prune 过)时都是 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream: Option<String>,
 }
 
 /// 仓库发现允许越过**项目根**往上爬的层数(项目是 monorepo 子目录时仓库在项目根之上)。
@@ -426,6 +430,11 @@ fn discover_repo_paths(project_path: &Path) -> Vec<RepoPathEntry> {
         }
     }
     scan(project_path, 1, &mut entries);
+    // `read_dir` 给的是文件系统顺序 —— Windows 的 NTFS 恰好按名字,但 ext4 是
+    // 哈希序,同一个目录两次枚举都可能不一样,仓库下拉里的条目会莫名换位置。
+    // 按路径排一遍:顺序确定,且同名仓库(monorepo 里的一堆 `api`)按父目录
+    // 挨在一起,配上 UI 那行父级路径正好一眼对比。
+    entries.sort_by_key(|e| e.path.to_string_lossy().to_lowercase());
     entries
 }
 
@@ -614,11 +623,18 @@ pub fn get_repo_branches(repo_path: &Path) -> Result<Vec<BranchInfo>> {
         let (branch, _) = branch_result?;
         let name = branch.name()?.unwrap_or("").to_string();
         if let Some(target) = branch.get().target() {
+            // 上游:`branch.<name>.remote/merge` 经 fetch refspec 换算成远程跟踪引用;
+            // 没配或引用不在都是 Err,一律当没有上游
+            let upstream = branch
+                .upstream()
+                .ok()
+                .and_then(|u| u.name().ok().flatten().map(str::to_string));
             branches.push(BranchInfo {
                 name,
                 is_head: head_target == Some(target),
                 is_remote: false,
                 commit_hash: target.to_string(),
+                upstream,
             });
         }
     }
@@ -637,6 +653,7 @@ pub fn get_repo_branches(repo_path: &Path) -> Result<Vec<BranchInfo>> {
                 is_head: false,
                 is_remote: true,
                 commit_hash: target.to_string(),
+                upstream: None,
             });
         }
     }
@@ -1835,5 +1852,50 @@ mod tests {
         assert_eq!(nth_parent(p, 1), PathBuf::from("/a/b"));
         assert_eq!(nth_parent(p, 3), PathBuf::from("/"));
         assert_eq!(nth_parent(p, 10), PathBuf::from("/"));
+    }
+
+    /// 分支列表带上游:本地分支配了 `branch.<name>.remote/merge` 且远程跟踪引用在场时
+    /// 给出 `origin/<name>`;没配上游、以及远程分支自己,都是 `None`。
+    /// 不联网:远程只登记 URL,远程跟踪引用直接手写。
+    #[test]
+    fn branches_carry_upstream() {
+        let root = init_repo_with_file("upstream", "a.txt", "a\n");
+        let before = get_repo_branches(&root).unwrap();
+        assert_eq!(before.len(), 1, "{before:?}");
+        let local = &before[0];
+        assert!(local.is_head && !local.is_remote);
+        assert_eq!(local.upstream, None, "还没配上游");
+        let name = local.name.clone();
+
+        {
+            let repo = Repository::open(&root).unwrap();
+            repo.remote("origin", "https://example.invalid/repo.git")
+                .unwrap();
+            let head = repo.head().unwrap().target().unwrap();
+            repo.reference(&format!("refs/remotes/origin/{name}"), head, true, "test")
+                .unwrap();
+            let mut branch = repo.find_branch(&name, git2::BranchType::Local).unwrap();
+            branch
+                .set_upstream(Some(&format!("origin/{name}")))
+                .unwrap();
+        }
+
+        let after = get_repo_branches(&root).unwrap();
+        let local = after
+            .iter()
+            .find(|b| !b.is_remote && b.name == name)
+            .expect("本地分支还在");
+        assert_eq!(
+            local.upstream.as_deref(),
+            Some(format!("origin/{name}").as_str())
+        );
+        let remote = after
+            .iter()
+            .find(|b| b.is_remote)
+            .expect("远程跟踪分支要列出来");
+        assert_eq!(remote.name, format!("origin/{name}"));
+        assert_eq!(remote.upstream, None, "远程分支自己没有上游");
+        assert_eq!(remote.commit_hash, local.commit_hash);
+        std::fs::remove_dir_all(&root).ok();
     }
 }

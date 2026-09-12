@@ -40,6 +40,7 @@ use gpui::{
     div, prelude::FluentBuilder as _, px,
 };
 use mt_project::git::{BranchInfo, GitRepoInfo};
+use mt_ui::TruncatedText;
 
 use crate::git_changes::{GitChanges, GitChangesEvent};
 use crate::git_history::{GitHistoryContent, GitHistoryEvent};
@@ -348,10 +349,17 @@ impl GitPanel {
     fn push_repo_down(&mut self, cx: &mut Context<Self>) {
         let repo = self.selected_repo.clone();
         let branches = self.branches.clone();
+        let head_branch = self.current_branch().map(str::to_string);
         let view_branch = self.view_branch.clone();
         self.changes.update(cx, |c, cx| c.set_repo(&repo, cx));
         self.history.update(cx, |h, cx| {
-            h.sync(&repo, &branches, view_branch.as_deref(), cx)
+            h.sync(
+                &repo,
+                &branches,
+                head_branch.as_deref(),
+                view_branch.as_deref(),
+                cx,
+            )
         });
     }
 
@@ -474,6 +482,12 @@ fn centered_hint(text: &'static str) -> AnyElement {
 /// 任意 flex-grow(gpui 的 `flex_grow()` 只会设成 1)。
 fn grow<E: Styled>(mut el: E, value: f32) -> E {
     el.style().flex_grow = Some(value);
+    el
+}
+
+/// 任意 flex-shrink(gpui 只有 `flex_shrink()` = 1 与 `flex_shrink_0()`)。
+fn shrink<E: Styled>(mut el: E, value: f32) -> E {
+    el.style().flex_shrink = Some(value);
     el
 }
 
@@ -702,7 +716,11 @@ impl GitPanel {
         let info = self.selected_repo_info();
         let repo_name = info.map(|r| r.name.clone()).unwrap_or_default();
         let is_worktree = info.is_some_and(|r| r.is_worktree);
-        let repo_path_tip = self.selected_repo.clone();
+        // 选中的那个也只画叶子名,回头再看仍然认不出是哪个 `api` —— 名字前面
+        // 补一段弱化的父级路径(与下拉里第二行同一个判据),完整路径挂 tooltip
+        let detail =
+            info.and_then(|r| repo_detail(&r.path.to_string_lossy(), self.project_path.as_deref()));
+        let repo_path_tip: SharedString = self.selected_repo.clone().into();
         let display_branch = self
             .view_branch
             .clone()
@@ -736,14 +754,28 @@ impl GitPanel {
                 .text_color(ui::color_folder())
                 .hover(|el| el.bg(ui::border_subtle()))
                 .child(div().text_color(ui::text_muted()).child("▾"))
+                // 父级路径先让位:栏子窄下去时先截它,仓库名与分支徽章保住
+                .when_some(detail, |el, detail| {
+                    el.child(
+                        div()
+                            .min_w(px(0.0))
+                            .max_w(px(90.0))
+                            .text_size(ui::font_px(12.0))
+                            .text_color(ui::text_muted())
+                            .child(TruncatedText::new(format!("{detail}/"))),
+                    )
+                })
                 .child(
                     div()
-                        .truncate()
+                        .min_w(px(0.0))
                         .text_size(ui::font_px(13.0))
-                        .child(SharedString::from(repo_name)),
+                        .child(TruncatedText::new(repo_name)),
                 )
                 .when(is_worktree, |el| {
                     el.child(div().text_size(ui::font_px(13.0)).text_color(ui::text_muted()).child("⎇"))
+                })
+                .tooltip(move |window, cx| {
+                    mt_ui::tooltip::Tooltip::new(repo_path_tip.clone()).build(window, cx)
                 })
                 .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
                     let entries = this.repo_menu(cx);
@@ -758,9 +790,12 @@ impl GitPanel {
                     }),
                 ),
         );
-        let _ = repo_path_tip;
 
-        // 分支徽章
+        // 分支徽章。宽度**随分支名自适应**:不设上限,栏子挤不下时才与仓库名
+        // 一起收缩(两边都 `min_w(0)` + 省略截断),右侧三个按钮永不让位。
+        // 徽章的收缩权重是仓库名的 3 倍:flex 按「权重 × 基准宽」分摊,分支名
+        // 通常比仓库名长得多,等权会把仓库名先挤成「re…」。截断时全名挂 tooltip。
+        // 截断不能用 `truncate()`,理由见 `mt_ui::truncated_text` 模块注释。
         if let Some(branch) = display_branch {
             let (bg, fg) = if viewing_other {
                 (
@@ -770,6 +805,7 @@ impl GitPanel {
             } else {
                 (ui::border_subtle(), ui::text_muted())
             };
+            let branch_tip: SharedString = branch.clone().into();
             bar = bar.child(
                 div()
                     .id("git-branch-badge")
@@ -780,11 +816,22 @@ impl GitPanel {
                     .px(px(6.0))
                     .rounded(px(3.0))
                     .cursor_pointer()
+                    .min_w(px(0.0))
+                    .map(|el| shrink(el, 3.0))
                     .bg(bg)
                     .text_color(fg)
                     .text_size(ui::font_px(13.0))
-                    .child(div().max_w(px(140.0)).truncate().child(branch))
-                    .child(div().text_size(ui::font_px(11.0)).opacity(0.7).child("▾"))
+                    .child(TruncatedText::new(branch))
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(ui::font_px(11.0))
+                            .opacity(0.7)
+                            .child("▾"),
+                    )
+                    .tooltip(move |window, cx| {
+                        mt_ui::tooltip::Tooltip::new(branch_tip.clone()).build(window, cx)
+                    })
                     .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
                         // 分支列表为空时懒加载一次(`GitHistory.tsx:422`)
                         if this.branches.is_empty() {
@@ -914,6 +961,9 @@ impl GitPanel {
     /// 还原四件事那边已经做全了。代价是行内没法画「选中行 accent 底色」与右侧
     /// 分支胶囊的独立配色 —— 选中用 `✓ ` 前缀(菜单基件本来的勾选方案),
     /// 分支放右侧的弱化标签位。
+    ///
+    /// 重名仓库(monorepo 里的一堆 `api`)靠 [`repo_detail`] 补的第二行父级路径
+    /// 区分,缩进与标题对齐 —— `✓ ` / 全角空格前缀本身就占一格。
     fn repo_menu(&self, cx: &mut Context<Self>) -> Vec<menu::MenuEntry> {
         let this = cx.entity();
         self.repos
@@ -927,6 +977,9 @@ impl GitPanel {
                     format!("　{}", repo.name)
                 };
                 let mut item = MenuItem::new(label);
+                if let Some(detail) = repo_detail(&path, self.project_path.as_deref()) {
+                    item = item.detail(format!("　{detail}"));
+                }
                 if let Some(branch) = &repo.current_branch {
                     item = item.shortcut(if repo.is_worktree {
                         format!("⎇ {branch}")
@@ -1057,6 +1110,51 @@ pub fn trim_trailing_sep(path: &str) -> &str {
     path.trim_end_matches(['/', '\\'])
 }
 
+/// 归一化路径:分隔符统一成 `/`、去掉尾部分隔符。
+///
+/// 两边的来源不同,不归一化没法比:项目路径是用户填的(Windows 上是 `\`),
+/// 而项目根仓库那条走 `Repository::workdir()`,libgit2 内部一律用 `/`
+/// (`D:/Git/mini-term/`),直接 `starts_with` 会一个都对不上。
+fn normalize_path(path: &str) -> String {
+    trim_trailing_sep(&path.replace('\\', "/")).to_string()
+}
+
+/// 仓库在下拉/仓库栏里的**出处**:它的父目录相对项目根的那一段。
+///
+/// 仓库名取的是目录叶子名([`mt_project::git::discover_git_repos`]),于是
+/// `services/api`、`legacy/api` 这类 monorepo 布局会在下拉里排出好几个一模
+/// 一样的「api」,光看名字分不出是哪一个。叶子名撞车的前提就是父目录不同,
+/// 所以补上这一段父级路径**一定**能区分。
+///
+/// 三档:
+/// - 仓库就是项目根 / 项目的直接子目录 → `None`。深度 1 的名字在同一个父目录
+///   下天然唯一,给每行都挂一条空信息的副标题只是噪音。
+/// - 仓库在项目里更深处 → `services`、`packages/tools` 这样的相对段。
+/// - 仓库在项目**外**(项目落在某个仓库的子目录里,`discover_repo_limited`
+///   会向上找到它)→ 仓库自己的绝对路径,免得只剩一个没有出处的叶子名。
+fn repo_detail(repo_path: &str, project_path: Option<&str>) -> Option<String> {
+    let repo = normalize_path(repo_path);
+    if repo.is_empty() {
+        return None;
+    }
+    let project = project_path.map(normalize_path).unwrap_or_default();
+    // 项目根自己就是仓库:没有可补的出处
+    if repo == project {
+        return None;
+    }
+    let rel = if project.is_empty() {
+        None
+    } else {
+        repo.strip_prefix(&format!("{project}/"))
+    };
+    match rel {
+        // 项目内:掐掉叶子名,剩下的父级段就是出处(直接子目录 → 没有父级段 → None)
+        Some(rel) => rel.rsplit_once('/').map(|(parent, _)| parent.to_string()),
+        // 项目外(或压根没有项目路径):给绝对路径,总比只有一个叶子名强
+        None => Some(repo),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1103,23 +1201,83 @@ mod tests {
         );
     }
 
+    /// 仓库出处只在「有信息量」时才给:项目根自己、项目的直接子目录都没有。
+    #[test]
+    fn 浅层仓库不补出处() {
+        let project = r"D:\Git\washStatsion";
+        // 项目根自己就是仓库
+        assert_eq!(repo_detail(project, Some(project)), None);
+        // libgit2 的 workdir 是正斜杠 + 尾部分隔符,归一化后仍要认出是同一个
+        assert_eq!(repo_detail("D:/Git/washStatsion/", Some(project)), None);
+        // 直接子目录:同一个父目录下叶子名天然唯一,补出来是空信息
+        assert_eq!(repo_detail(r"D:\Git\washStatsion\web", Some(project)), None);
+        assert_eq!(repo_detail("/home/u/proj/web", Some("/home/u/proj")), None);
+    }
+
+    /// monorepo 里的同名仓库靠父级路径区分 —— 这正是「一堆 api」那个场景。
+    #[test]
+    fn 同名仓库靠父级路径区分() {
+        let project = r"D:\Git\mono";
+        assert_eq!(
+            repo_detail(r"D:\Git\mono\services\api", Some(project)),
+            Some("services".to_string())
+        );
+        assert_eq!(
+            repo_detail(r"D:\Git\mono\legacy\api", Some(project)),
+            Some("legacy".to_string())
+        );
+        // 更深的层级把整条父级路径都给出来,两条出处必然不同
+        assert_ne!(
+            repo_detail(r"D:\Git\mono\a\x\api", Some(project)),
+            repo_detail(r"D:\Git\mono\b\x\api", Some(project))
+        );
+        assert_eq!(
+            repo_detail(r"D:\Git\mono\packages\tools\api", Some(project)),
+            Some("packages/tools".to_string())
+        );
+    }
+
+    /// 项目落在某个仓库的子目录里时(`discover_repo_limited` 向上找到的那种),
+    /// 仓库不在项目内 —— 给绝对路径,别只剩一个没有出处的叶子名。
+    #[test]
+    fn 项目外的仓库给绝对路径() {
+        assert_eq!(
+            repo_detail(r"D:\Git\mini-term", Some(r"D:\Git\mini-term\crates")),
+            Some("D:/Git/mini-term".to_string())
+        );
+        // 前缀只是「字符串像」不算在项目内:mono2 不是 mono 的子目录
+        assert_eq!(
+            repo_detail(r"D:\Git\mono2\api", Some(r"D:\Git\mono")),
+            Some("D:/Git/mono2/api".to_string())
+        );
+        // 还没挂上项目路径时同理(空路径不能当前缀,否则谁都算项目内)
+        assert_eq!(
+            repo_detail(r"D:\Git\mono\api", None),
+            Some("D:/Git/mono/api".to_string())
+        );
+        // 空仓库路径没什么可说的
+        assert_eq!(repo_detail("", Some(r"D:\Git\mono")), None);
+    }
+
     /// detached HEAD 的 `current_branch` 是 `"(1a2b3c4)"` —— 它**不在**
     /// `get_repo_branches` 的结果里,所以 `viewBranch` 永远取不到它,
     /// 也就永远不会被当分支名传给 `get_git_log`(那会 `bail!`)。
     #[test]
     fn detached_head_不当分支名查询() {
-        let branches = vec![
+        let branches = [
             BranchInfo {
                 name: "main".into(),
                 is_head: false,
                 is_remote: false,
                 commit_hash: "abc".into(),
+                upstream: Some("origin/main".into()),
             },
             BranchInfo {
                 name: "origin/main".into(),
                 is_head: false,
                 is_remote: true,
                 commit_hash: "abc".into(),
+                upstream: None,
             },
         ];
         let detached = "(1a2b3c4)";

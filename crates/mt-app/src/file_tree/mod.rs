@@ -22,9 +22,12 @@
 //! - 单击文件开[文件预览器](crate::file_viewer)(AA 批之前是双击调外部编辑器 ——
 //!   预览器缺位时的临时替身,原版文件行上只有预览这一条路)。
 //!
-//! 文件拖进终端(把路径当文本写进 PTY)走 gpui 原生 drag:这边只在行上挂
+//! 文件拖进终端(把路径当文本写进 PTY)走 gpui 原生 drag:这边在行上挂
 //! [`on_drag`](gpui::StatefulInteractiveElement::on_drag) 交出
-//! [`crate::dnd::DragFilePath`],落点与写入在 `terminal_area.rs`。
+//! [`crate::dnd::DragFilePath`],落点与写入在 `terminal_area.rs`。**同一份载荷落回
+//! 树里就是移动**:目录行接进自身、文件行接进它的父目录、空白处接进项目根,
+//! 松手先问一句再动(判据与面板见 [`move_to`],后端见 `mt_project::fs::move_entry` /
+//! `remote_ssh::move_entry`)。
 //!
 //! # git 状态着色(Y 批)
 //!
@@ -54,6 +57,7 @@ use mt_ui::icons::FileIcon;
 use mt_ui::icons::vector::{Geom, Ink, Shape, VectorIcon};
 use mt_ui::tooltip::Tooltip;
 
+use crate::dnd::DragFilePath;
 use crate::file_ops::{FileBackendIdentity, FileClipboardEntry, FileOperationContext};
 use crate::fs_ops;
 use crate::git_watch;
@@ -63,17 +67,22 @@ use crate::store::AppStore;
 use crate::ui;
 
 mod menu;
+mod move_to;
 mod ops;
 #[cfg(test)]
 mod tests;
 
 use menu::{background_menu, file_menu, header_action_capabilities, mod_label};
+use move_to::MoveSource;
 use ops::{
-    choose_upload_paths, new_entry_prompt, paste_file_clipboard, start_download, start_upload,
+    choose_upload_paths, confirm_move, new_entry_prompt, paste_file_clipboard, start_download,
+    start_upload,
 };
 
+/// 拖拽悬停命中的落点(高亮用)。资源管理器拖进来的上传与树内拖拽移动共用:
+/// 同一时刻只可能有一种拖拽在飞,`hit_id` 是行 / 空白处的标识。
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ExternalDropTarget {
+struct DropTarget {
     hit_id: String,
     target_dir: PathBuf,
 }
@@ -192,8 +201,8 @@ pub struct FileTree {
     /// 正在被删除、重命名或批量改写的子树。操作结束前禁止 watcher / 展开态补列
     /// 重新挂载它，避免大目录删除时 watcher 事件洪泛和半成品缓存回写。
     suppressed_subtrees: HashSet<PathBuf>,
-    /// 外部文件拖放当前命中的远程目标目录。
-    external_drop_target: Option<ExternalDropTarget>,
+    /// 拖放当前命中的目标目录(外部文件上传 / 树内移动)。
+    drop_target: Option<DropTarget>,
     /// git 状态:相对项目根的 `/` 分隔路径 → 状态字母(M/A/D/R/?/C)。
     git_status: HashMap<String, String>,
     /// 排着的 git 状态刷新(去抖到点时刻);`None` = 没排。
@@ -216,6 +225,32 @@ pub struct FileTree {
 }
 
 impl FileTree {
+    /// `on_drag_move` 的落点记录。见 [`crate::dnd`] 模块注释第 2 条:这个回调会打给
+    /// **每一个**注册者,`hit`(命中矩形 + 落点有效)由调用方算好;不命中时只收
+    /// 自己那一份高亮,别人的留给别人清。
+    fn note_drop_target(&mut self, hit_id: &str, target: &Path, hit: bool, cx: &mut Context<Self>) {
+        if hit {
+            if self
+                .drop_target
+                .as_ref()
+                .is_none_or(|active| active.hit_id != hit_id || active.target_dir != target)
+            {
+                self.drop_target = Some(DropTarget {
+                    hit_id: hit_id.to_string(),
+                    target_dir: target.to_path_buf(),
+                });
+                cx.notify();
+            }
+        } else if self
+            .drop_target
+            .as_ref()
+            .is_some_and(|active| active.hit_id == hit_id)
+        {
+            self.drop_target = None;
+            cx.notify();
+        }
+    }
+
     fn note_external_drop_target(
         &mut self,
         hit_id: &str,
@@ -223,26 +258,71 @@ impl FileTree {
         event: &DragMoveEvent<ExternalPaths>,
         cx: &mut Context<Self>,
     ) {
-        if event.bounds.contains(&event.event.position) {
-            if self
-                .external_drop_target
-                .as_ref()
-                .is_none_or(|active| active.hit_id != hit_id || active.target_dir != target)
-            {
-                self.external_drop_target = Some(ExternalDropTarget {
-                    hit_id: hit_id.to_string(),
-                    target_dir: target.to_path_buf(),
-                });
-                cx.notify();
-            }
-        } else if self
-            .external_drop_target
-            .as_ref()
-            .is_some_and(|active| active.hit_id == hit_id)
-        {
-            self.external_drop_target = None;
-            cx.notify();
+        let hit = event.bounds.contains(&event.event.position);
+        self.note_drop_target(hit_id, target, hit, cx);
+    }
+
+    /// 树内拖拽悬停:命中矩形**且**这个目录接得住(见 [`MoveSource::accepts_target`])
+    /// 才亮 —— 拖着 `src` 划过它自己的子目录时不该亮。
+    fn note_move_drag_over(
+        &mut self,
+        hit_id: &str,
+        target: &Path,
+        event: &DragMoveEvent<DragFilePath>,
+        cx: &mut Context<Self>,
+    ) {
+        let hit = event.bounds.contains(&event.event.position)
+            && self.move_source(event.drag(cx), cx).accepts_target(target);
+        self.note_drop_target(hit_id, target, hit, cx);
+    }
+
+    /// 拖拽载荷 → 移动判据用的源描述。父目录按后端切分(远程 POSIX / 本地平台)。
+    fn move_source(&self, item: &DragFilePath, cx: &App) -> MoveSource {
+        let remote = self.is_remote(cx);
+        let parent = if remote {
+            crate::remote_ssh::parent_posix(&item.path.to_string_lossy()).map(PathBuf::from)
+        } else {
+            item.path.parent().map(Path::to_path_buf)
         }
+        .or_else(|| self.project_root(cx))
+        .unwrap_or_default();
+        MoveSource {
+            path: item.path.clone(),
+            name: item.name.clone(),
+            is_dir: item.is_dir,
+            parent,
+            remote,
+        }
+    }
+
+    /// 树内拖拽松手:高亮先收,再(延后一拍)弹确认。
+    ///
+    /// listener 里 FileTree 正被 update,`confirm_move` 一进门就 `tree.read` 会
+    /// double-lease panic —— 与外部文件上传那两处落点同一条理由,defer 到租约释放后。
+    fn drop_move(
+        &mut self,
+        item: &DragFilePath,
+        target: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.drop_target = None;
+        cx.notify();
+        let Some(context) = self.operation_context(cx) else {
+            return;
+        };
+        if matches!(&context.backend, FileBackendIdentity::BrokenRemote) {
+            return;
+        }
+        let source = self.move_source(item, cx);
+        if !source.accepts_target(&target) {
+            return;
+        }
+        let connection = self.remote_conn(cx);
+        let tree = cx.entity();
+        window.defer(cx, move |window, cx| {
+            confirm_move(tree, context, connection, source, target, window, cx);
+        });
     }
 
     pub fn new(store: Entity<AppStore>, cx: &mut Context<Self>) -> Self {
@@ -318,7 +398,7 @@ impl FileTree {
             active_operation_context: None,
             active_operation_suppressed_path: None,
             suppressed_subtrees: HashSet::new(),
-            external_drop_target: None,
+            drop_target: None,
             git_status: HashMap::new(),
             git_refresh_at: None,
             chain_owner: HashMap::new(),
@@ -447,7 +527,7 @@ impl FileTree {
         {
             self.suppressed_subtrees.insert(path.clone());
         }
-        self.external_drop_target = None;
+        self.drop_target = None;
         self.remote_broken = broken;
         self.git_status.clear();
         // 没有项目 / 远程项目都把旁路那一份关掉:远程不拉 git 状态,
@@ -1263,7 +1343,7 @@ const CARET_SHAPES: &[Shape] = &[Shape::line(
 impl Render for FileTree {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !cx.has_active_drag() {
-            self.external_drop_target = None;
+            self.drop_target = None;
         }
         let project_name = self.store.read(cx).active_project().map(|p| p.name.clone());
         let editors: Vec<String> = self
@@ -1706,9 +1786,12 @@ impl Render for FileTree {
         let background_drop_id = "background".to_string();
         let background_context = self.operation_context(cx);
         let background_highlight = self
-            .external_drop_target
+            .drop_target
             .as_ref()
             .is_some_and(|active| active.hit_id == background_drop_id);
+        let move_target = background_target.clone();
+        let move_drop_target = background_target.clone();
+        let move_id = background_drop_id.clone();
         list = list.child(
             div()
                 .id("file-tree-background")
@@ -1717,6 +1800,15 @@ impl Render for FileTree {
                 .when(background_highlight, |el| {
                     el.bg(ui::with_alpha(ui::accent(), 0.12))
                 })
+                // 树内拖拽落在空白处 = 移到项目根(本地/远程都有)
+                .on_drag_move(cx.listener(
+                    move |this, event: &DragMoveEvent<DragFilePath>, _window, cx| {
+                        this.note_move_drag_over(&move_id, &move_target, event, cx);
+                    },
+                ))
+                .on_drop(cx.listener(move |this, item: &DragFilePath, window, cx| {
+                    this.drop_move(item, move_drop_target.clone(), window, cx);
+                }))
                 .on_mouse_down(
                     MouseButton::Right,
                     cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -1751,7 +1843,7 @@ impl Render for FileTree {
                     ))
                     .on_drop(cx.listener(
                         move |this, paths: &ExternalPaths, window, cx| {
-                            this.external_drop_target = None;
+                            this.drop_target = None;
                             cx.notify();
                             let Some(context) = drop_context.clone() else {
                                 return;
@@ -1958,18 +2050,29 @@ impl FileTree {
         let key_context = row_context.clone();
         let click_context = row_context.clone();
         let drop_context = row_context.clone();
-        let upload_target = if row.is_dir {
+        // 这一行当落点时收进哪个目录:目录行是自身,文件行是它的父目录。
+        // 远程行按 POSIX 切父目录,本地按平台切(上传只有远程有,移动两边都有)
+        let entry_target = if row.is_dir {
             row.path.clone()
-        } else {
+        } else if remote {
             crate::remote_ssh::parent_posix(&row.path.to_string_lossy())
                 .map(PathBuf::from)
                 .unwrap_or_else(|| self.project_root(cx).unwrap_or_else(|| row.path.clone()))
+        } else {
+            row.path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| self.project_root(cx).unwrap_or_else(|| row.path.clone()))
         };
+        let upload_target = entry_target.clone();
         let row_drop_id = format!("row:{}", row.path.display());
         let drop_highlight = self
-            .external_drop_target
+            .drop_target
             .as_ref()
             .is_some_and(|active| active.hit_id == row_drop_id);
+        let move_id = row_drop_id.clone();
+        let move_target = entry_target.clone();
+        let move_drop_target = entry_target;
 
         div()
             .id(SharedString::from(format!("fs-{}", row.path.display())))
@@ -2031,7 +2134,11 @@ impl FileTree {
             // drop-zone 上);gpui 侧终端是自绘 Element、drop 目标就是它的容器,
             // 那条穿透规则一行都不必移植。
             .on_drag(
-                crate::dnd::DragFilePath(drag_path),
+                DragFilePath {
+                    path: drag_path,
+                    name: drag_name.clone(),
+                    is_dir: drag_is_dir,
+                },
                 move |_item, _offset, _window, cx| {
                     crate::dnd::preview(
                         drag_name.clone(),
@@ -2043,6 +2150,16 @@ impl FileTree {
                     )
                 },
             )
+            // 同一份载荷落回树里 = 移动(本地/远程都有)。拖到自己身上 / 自己的父目录
+            // 行上判为无效落点,不亮也不动 —— 手抖那 2px 的拖拽就此无害
+            .on_drag_move(cx.listener(
+                move |this, event: &DragMoveEvent<DragFilePath>, _window, cx| {
+                    this.note_move_drag_over(&move_id, &move_target, event, cx);
+                },
+            ))
+            .on_drop(cx.listener(move |this, item: &DragFilePath, window, cx| {
+                this.drop_move(item, move_drop_target.clone(), window, cx);
+            }))
             .when(remote, |el| {
                 let move_target = upload_target.clone();
                 let drop_target = upload_target.clone();
@@ -2055,7 +2172,7 @@ impl FileTree {
                 ))
                 .on_drop(cx.listener(
                     move |this, paths: &ExternalPaths, window, cx| {
-                        this.external_drop_target = None;
+                        this.drop_target = None;
                         cx.notify();
                         let Some(context) = drop_context.clone() else {
                             return;

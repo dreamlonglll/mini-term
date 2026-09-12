@@ -54,6 +54,8 @@ pub enum AiVendor {
     Zhipu,
     Copilot,
     Ollama,
+    /// oh-my-pi(omp,pi 的分支):GPUI 版新增,原版前端没有这一项
+    Omp,
 }
 
 impl AiVendor {
@@ -71,6 +73,7 @@ impl AiVendor {
             Self::Zhipu => "zhipu",
             Self::Copilot => "copilot",
             Self::Ollama => "ollama",
+            Self::Omp => "omp",
         }
     }
 
@@ -90,19 +93,21 @@ impl AiVendor {
             "zhipu" => Self::Zhipu,
             "copilot" => Self::Copilot,
             "ollama" => Self::Ollama,
+            "omp" => Self::Omp,
             _ => return None,
         })
     }
 
     /// CLI 类型 → 厂商(前端 `inferVendor.ts` 的 `CLI_VENDOR`)。
     ///
-    /// 只有会话记录能解析的三家在表里;其余 CLI 返回 `None`,由调用方走
-    /// [`Self::infer`] 或回退通用图标。
+    /// 会话记录能解析的三家,加上 hook 会上报 agent 名的 omp 在表里;其余 CLI
+    /// 返回 `None`,由调用方走 [`Self::infer`] 或回退通用图标。
     pub fn from_session_type(session_type: &str) -> Option<Self> {
         match session_type {
             "claude" => Some(Self::Claude),
             "codex" => Some(Self::OpenAi),
             "grok" => Some(Self::Grok),
+            "omp" => Some(Self::Omp),
             _ => None,
         }
     }
@@ -150,6 +155,7 @@ impl AiVendor {
             Self::Zhipu => "Zhipu",
             Self::Copilot => "GitHub Copilot",
             Self::Ollama => "Ollama",
+            Self::Omp => "oh-my-pi",
         }
     }
 
@@ -166,6 +172,7 @@ impl AiVendor {
             Self::Zhipu => ZHIPU,
             Self::Copilot => COPILOT,
             Self::Ollama => OLLAMA,
+            Self::Omp => OMP,
         }
     }
 }
@@ -195,6 +202,11 @@ impl Needle {
 /// zhipu 的 `chatglm` 必须留在 zhipu 这一行而不是挪到表尾,否则
 /// `chatglm3 + ollama` 这种串会先命中 ollama。
 const RULES: &[(AiVendor, &[Needle])] = &[
+    // omp 必须排在 pi 前面:`oh-my-pi` 末尾的 `pi` 正落在词边界上,后置就被 pi 抢走
+    (
+        AiVendor::Omp,
+        &[Needle::Word("omp"), Needle::Word("oh-my-pi")],
+    ),
     (AiVendor::Pi, &[Needle::Word("pi")]),
     (
         AiVendor::Claude,
@@ -317,6 +329,80 @@ const PI: &[Shape] = &[
     ),
 ];
 const VB_PI: (f32, f32, f32) = (165.29, 165.29, 469.43);
+
+/// oh-my-pi(omp)官方标记:π 加一枚插头(仓库 `assets/icon.svg`,120×90 画布)。
+///
+/// 原件全是轴对齐的圆角矩形,这里按基本形逐个搬(不用 path):坐标除以 120、
+/// 纵向把 90 高的图形居中到方框(y 加 15)。π 本体跟随主题色(原件是近白色,
+/// 亮色主题下会消失);插头保留品牌橙 `#f97316`,两根插脚是原件的深色。
+/// 原件左右各一枚 2px 的装饰小圆点略去 —— 13px 上只剩噪点。
+const OMP: &[Shape] = &[
+    // 横杠
+    Shape::fill(
+        Ink::Current,
+        Geom::Rect {
+            x: 0.0833,
+            y: 0.1917,
+            w: 0.8333,
+            h: 0.1,
+            round: 0.0167,
+        },
+    ),
+    // 左腿
+    Shape::fill(
+        Ink::Current,
+        Geom::Rect {
+            x: 0.2083,
+            y: 0.2917,
+            w: 0.1,
+            h: 0.5167,
+            round: 0.0167,
+        },
+    ),
+    // 右腿(短一截,给插头让位)
+    Shape::fill(
+        Ink::Current,
+        Geom::Rect {
+            x: 0.625,
+            y: 0.2917,
+            w: 0.1,
+            h: 0.375,
+            round: 0.0167,
+        },
+    ),
+    // 插头
+    Shape::fill(
+        Ink::Rgb(0xf9, 0x73, 0x16),
+        Geom::Rect {
+            x: 0.5917,
+            y: 0.5833,
+            w: 0.1667,
+            h: 0.1333,
+            round: 0.025,
+        },
+    ),
+    // 两根插脚
+    Shape::fill(
+        Ink::Rgb(0x0d, 0x0d, 0x0d),
+        Geom::Rect {
+            x: 0.6333,
+            y: 0.6167,
+            w: 0.025,
+            h: 0.0667,
+            round: 0.0083,
+        },
+    ),
+    Shape::fill(
+        Ink::Rgb(0x0d, 0x0d, 0x0d),
+        Geom::Rect {
+            x: 0.6833,
+            y: 0.6167,
+            w: 0.025,
+            h: 0.0667,
+            round: 0.0083,
+        },
+    ),
+];
 
 /// Gemini:官方 Color 变体的四角星。
 ///
@@ -446,6 +532,7 @@ pub const ALL_VENDORS: &[AiVendor] = &[
     AiVendor::Zhipu,
     AiVendor::Copilot,
     AiVendor::Ollama,
+    AiVendor::Omp,
 ];
 
 /// 厂商图标。`vendor` 为 `None` 时画通用机器人(与原版回退 lucide `Bot` 同)。
@@ -561,8 +648,64 @@ mod tests {
             Some(AiVendor::OpenAi)
         );
         assert_eq!(AiVendor::for_session("grok", None), Some(AiVendor::Grok));
+        // omp 没有会话记录,但 hook 会上报 agent 名 —— pane tab 靠这条认图标
+        assert_eq!(AiVendor::for_session("omp", None), Some(AiVendor::Omp));
         // 没有会话记录的 agent 没有 CLI 兜底
         assert_eq!(AiVendor::for_session("opencode", None), None);
+    }
+
+    /// omp 的推断必须压过 pi:`oh-my-pi` 末尾的 `pi` 正落在词边界上。
+    #[test]
+    fn omp_的推断压过_pi() {
+        assert_eq!(AiVendor::infer(Some("omp"), None), Some(AiVendor::Omp));
+        assert_eq!(AiVendor::infer(None, Some("oh-my-pi")), Some(AiVendor::Omp));
+        assert_eq!(
+            AiVendor::infer(None, Some("omp --model claude-sonnet-5")),
+            Some(AiVendor::Omp)
+        );
+        // 词边界:compose / ompx 都不是 omp
+        assert_eq!(AiVendor::infer(None, Some("docker compose up")), None);
+        assert_eq!(AiVendor::infer(None, Some("ompx")), None);
+        // 单独的 pi 仍归 pi
+        assert_eq!(AiVendor::infer(None, Some("pi")), Some(AiVendor::Pi));
+    }
+
+    /// omp 标记按基本形搬:六笔(横杠、两腿、插头、两插脚)全在单位方框内,
+    /// 插头压在右腿下端上(原件的构图,插头「接」在短腿上)。
+    #[test]
+    fn omp_标记六笔都在方框内且插头接在右腿上() {
+        assert_eq!(OMP.len(), 6);
+        for shape in OMP {
+            let (pts, closed) = shape.geom.points();
+            assert!(closed, "圆角矩形应闭合");
+            for (x, y) in pts {
+                assert!(
+                    (0.0..=1.0).contains(&x) && (0.0..=1.0).contains(&y),
+                    "({x},{y}) 出框"
+                );
+            }
+        }
+        let (leg, plug) = (&OMP[2].geom, &OMP[3].geom);
+        let (
+            Geom::Rect {
+                x: lx,
+                y: ly,
+                w: lw,
+                h: lh,
+                ..
+            },
+            Geom::Rect {
+                x: px,
+                y: py,
+                w: pw,
+                ..
+            },
+        ) = (*leg, *plug)
+        else {
+            panic!("右腿与插头都该是矩形");
+        };
+        assert!(px < lx && px + pw > lx + lw, "插头横向罩住右腿");
+        assert!(py < ly + lh, "插头顶边压在右腿下端之上");
     }
 
     #[test]

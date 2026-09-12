@@ -5,12 +5,14 @@
 //! **存量字段的序列化形状不动**；新增字段必须带 serde 缺省 —— 存量
 //! `config.json` 必须原样读得进来。
 
+use std::borrow::Cow;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow};
+use mt_secret::Vault;
 use serde::{Deserialize, Serialize};
 
 /// SSH 连接(`config.json` 的 `sshConnections` 数组元素)。
@@ -175,7 +177,10 @@ pub struct AppConfig {
     pub last_active_project_id: Option<String>,
     #[serde(default)]
     pub hook_enabled: bool,
-    #[serde(default)]
+    /// 「智能 Ctrl+C / Ctrl+V」。**默认开**(2026-09-11 起,此前默认关):库里没这个
+    /// 键的新装用户直接开;存量用户库里存的是显式的 `false`,不动 —— 分不清是
+    /// 用户关的还是旧默认值,宁可少开一个也别把人家关掉的又打开。
+    #[serde(default = "default_true")]
     pub smart_copy_paste: bool,
     /// 拖选按住不动自动复制的静止时长(秒)。`None` = UI 层默认 1s。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -637,7 +642,7 @@ impl Default for AppConfig {
             right_drawer_width: None,
             last_active_project_id: None,
             hook_enabled: false,
-            smart_copy_paste: false,
+            smart_copy_paste: true,
             selection_auto_copy_secs: None,
             tray_status_enabled: None,
             tray_max_projects: None,
@@ -778,6 +783,26 @@ fn normalize_split_node(node: &mut SavedSplitNode) {
     }
 }
 
+/// 把树里重复出现的项目 id 只留**深度优先的第一处**。
+///
+/// 这是给存量数据擦屁股的:GPUI 版一度用「进程内计数器」生成项目 id,跨启动会撞号,
+/// 「分组右键 → 添加项目」在撞号那次会把新 id 先追加到根层、再把树里**第一处**同 id
+/// 挪进目标组 —— 根层那条就此成了残留。渲染按 id 去重看不见它,但父组一折叠它就
+/// 在根层冒出来,分组行尾的计数也把它算在内。id 生成已改成带时间戳,这里只清旧账。
+/// 分组 id 不动:撞了分组号的树另有一套坏法,没有实证前不猜着修。
+pub fn dedupe_project_ids_in_tree(tree: &mut Vec<ProjectTreeItem>) {
+    fn walk(items: &mut Vec<ProjectTreeItem>, seen: &mut std::collections::HashSet<String>) {
+        items.retain_mut(|item| match item {
+            ProjectTreeItem::ProjectId(id) => seen.insert(id.clone()),
+            ProjectTreeItem::Group(group) => {
+                walk(&mut group.children, seen);
+                true
+            }
+        });
+    }
+    walk(tree, &mut std::collections::HashSet::new());
+}
+
 /// 逐代累积的 config 迁移。每次从磁盘读出来都要过一遍(含 `AppConfig::default()`,
 /// 首启用户也得拿到预置的移动端启动器)。
 pub fn migrate_config(mut config: AppConfig) -> AppConfig {
@@ -810,7 +835,8 @@ pub fn migrate_config(mut config: AppConfig) -> AppConfig {
         }
     }
 
-    if config.project_tree.is_some() {
+    if let Some(tree) = config.project_tree.as_mut() {
+        dedupe_project_ids_in_tree(tree);
         config.project_groups = None;
         config.project_ordering = None;
         return config;
@@ -982,13 +1008,23 @@ fn ssh_projection(config: &AppConfig) -> serde_json::Value {
 /// |---|---|---|
 /// | `config.db` | **配置本体**(见 [`crate::db`]) | 只有主程序 |
 /// | `config.json` | [`ssh_projection`] 的投影,派生物 | 三个 sidecar 二进制 |
+/// | `credential.key` | SSH 密码信封的主密钥(见 [`mt_secret`]) | 主程序生成;sidecar 只读 |
 ///
 /// `config.json` 曾经是配置的家,现在瘦身成投影 —— 那条 sidecar 链路必须原地
 /// 不动的理由见 [`crate::db`] 的模块注释。投影**内容没变就不写**,所以改个字号
 /// 不会碰它。
 ///
 /// 存量用户的完整 `config.json` 在首次迁移时被另存为 `config.json.pre-sqlite`,
-/// 不删不改 —— 那是回退到旧版本的唯一凭据。
+/// 除 `sshConnections[].password` 会随主库一起封存外不删不改 —— 那是回退到旧版本
+/// 的唯一凭据。
+///
+/// # 密码封存
+///
+/// `sshConnections[].password` 在库、投影、备份、存档四处**一律是 [`mt_secret`] 信封**
+/// (`enc:v1:…`),明文只活在「表单 → `AppStore::upsert_ssh_connection`」那一小段与
+/// 认证那一刻。本结构负责两件事:[`load`](Self::load) 时把存量明文一次性封存
+/// (并清扫库文件里的碎片),[`save`](Self::save) 时兜底封存漏网的明文。密钥文件
+/// 与库同目录,dev 实例的隔离目录自然各有各的钥匙。
 ///
 /// 令牌是一个乐观并发计数:[`load`](Self::load) 每成功一次就轮换,
 /// [`save`](Self::save) 必须携带当前令牌才允许写盘。不变量:**写盘的每一份配置,
@@ -1008,6 +1044,8 @@ pub struct ConfigStore {
     /// 首次用到时才开库。开失败**不缓存**,下次调用重试 —— 盘暂时忙/被杀软
     /// 锁住这类瞬时故障不该让整个进程此后永远存不下配置。
     db: Mutex<Option<Arc<crate::db::ConfigDb>>>,
+    /// 凭据库(`credential.key`),同样首次用到才开、失败不缓存。
+    vault: Mutex<Option<Vault>>,
 }
 
 impl ConfigStore {
@@ -1025,6 +1063,7 @@ impl ConfigStore {
             path: path.into(),
             token: AtomicU64::new(0),
             db: Mutex::new(None),
+            vault: Mutex::new(None),
         }
     }
 
@@ -1058,6 +1097,19 @@ impl ConfigStore {
         Ok(db)
     }
 
+    /// 凭据库:`{数据目录}/credential.key`(见 [`mt_secret`])。首次用到时打开或创建,
+    /// 失败**不缓存**、下次再试(与 [`Self::db`] 同一条)。只有主程序会走到「创建」:
+    /// sidecar 不链接本 crate,它们经 `mt_secret::global` 只读同目录那把。
+    pub fn vault(&self) -> Result<Vault> {
+        let mut slot = self.vault.lock().map_err(|_| anyhow!("凭据库句柄锁中毒"))?;
+        if let Some(vault) = slot.as_ref() {
+            return Ok(vault.clone());
+        }
+        let vault = Vault::open_or_create(self.dir()).map_err(|err| anyhow!("{err}"))?;
+        *slot = Some(vault.clone());
+        Ok(vault)
+    }
+
     /// 当前有效令牌。0 = 还没有过一次成功的 [`load`](Self::load)。
     pub fn current_token(&self) -> u64 {
         self.token.load(Ordering::Acquire)
@@ -1070,10 +1122,13 @@ impl ConfigStore {
     /// 加载成功才轮换发放令牌;上一轮的令牌随之作废。
     pub fn load(&self) -> Result<LoadedConfig> {
         let db = self.db()?;
-        let config = match db.load()? {
+        let mut config = match db.load()? {
             Some(config) => migrate_config(config),
             None => self.import_from_json(&db)?,
         };
+        // 密码封存:存量明文一次性换成信封并回写库(存档同理)。放在备份**之前**,
+        // 这一代 .bak 里才不会再躺着明文。
+        self.seal_passwords_on_load(&db, &mut config);
         // 每启动留一代库备份(配置不可再生,这是它与 layout.db 的关键差别)。
         // 失败只记日志:备份不该拦住启动。
         if let Err(err) = db.backup_to(&self.db_backup_path()) {
@@ -1150,9 +1205,101 @@ impl ConfigStore {
             });
         }
         let db = self.db().map_err(SaveError::Db)?;
-        db.save(config).map_err(SaveError::Db)?;
-        self.write_ssh_projection(config);
+        // 兜底封存:正常路径上 AppStore 交来的已经是信封,这里挡的是「谁忘了封」。
+        let config = self.sealed_for_disk(config);
+        db.save(&config).map_err(SaveError::Db)?;
+        self.write_ssh_projection(&config);
         Ok(())
+    }
+
+    /// 加载时的密码封存(见 [`mt_secret`] 的模块注释)。
+    ///
+    /// 凭据库开不起来只记日志、密码保持原样 —— 那是「本机生成不了密钥」这种环境
+    /// 故障,不该让配置加载失败;[`Self::save`] 每次写盘还会再试。封存过东西就
+    /// 回写库并清扫([`crate::db::ConfigDb::scrub_after_secret_rewrite`]),否则页内
+    /// 碎片与 WAL 旧帧里仍有明文。最后把这把钥匙登记为进程级凭据库
+    /// (`mt_secret::install`):`mt-ssh` 会话池与 UI 解封都从那里取,dev 实例的隔离
+    /// 目录也因此走对。
+    fn seal_passwords_on_load(&self, db: &crate::db::ConfigDb, config: &mut AppConfig) {
+        let vault = match self.vault() {
+            Ok(vault) => vault,
+            Err(err) => {
+                eprintln!("[config] {err:#};已存 SSH 密码本次保持原样(未封存)");
+                return;
+            }
+        };
+        let sealed = seal_plaintext_passwords(&mut config.ssh_connections, &vault);
+        if sealed > 0 {
+            match db
+                .save(config)
+                .and_then(|()| db.scrub_after_secret_rewrite())
+            {
+                Ok(()) => eprintln!("[config] 已把 {sealed} 条 SSH 密码封存进 config.db"),
+                Err(err) => {
+                    eprintln!("[config] 密码封存后回写库失败(内存中已是密文,下次保存再写): {err:#}")
+                }
+            }
+        }
+        self.seal_legacy_archive(&vault);
+        mt_secret::install(vault);
+    }
+
+    /// 存量存档 `config.json.pre-sqlite` 里的 `sshConnections[].password` 同样封存。
+    /// 存档的其余内容不动(它是回退旧版本的凭据),只改这一个字段;没有明文就不写。
+    fn seal_legacy_archive(&self, vault: &Vault) {
+        let path = self.legacy_archive_path();
+        let raw = match fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+            Err(err) => {
+                eprintln!("[config] 读存档失败,跳过密码封存: {err}");
+                return;
+            }
+        };
+        let mut root: serde_json::Value = match serde_json::from_str(&raw) {
+            Ok(root) => root,
+            Err(err) => {
+                eprintln!("[config] 存档不是合法 JSON,跳过密码封存: {err}");
+                return;
+            }
+        };
+        let sealed = seal_passwords_in_json(&mut root, vault);
+        if sealed == 0 {
+            return;
+        }
+        let json = match serde_json::to_string_pretty(&root) {
+            Ok(json) => json,
+            Err(err) => {
+                eprintln!("[config] 存档序列化失败,跳过密码封存: {err}");
+                return;
+            }
+        };
+        match atomic_write(&path, json.as_bytes()) {
+            Ok(()) => eprintln!(
+                "[config] 已把存档 {} 里的 {sealed} 条 SSH 密码封存",
+                path.display()
+            ),
+            Err(err) => eprintln!("[config] 存档密码封存写盘失败: {err}"),
+        }
+    }
+
+    /// 落盘前的兜底:还有明文密码就克隆一份封存后再写,没有就原样借用。
+    /// 凭据库开不起来只记日志、原样写(与加载时同一条降级)。
+    fn sealed_for_disk<'a>(&self, config: &'a AppConfig) -> Cow<'a, AppConfig> {
+        if !has_plaintext_password(&config.ssh_connections) {
+            return Cow::Borrowed(config);
+        }
+        let vault = match self.vault() {
+            Ok(vault) => vault,
+            Err(err) => {
+                eprintln!("[config] {err:#};本次按原样写盘");
+                return Cow::Borrowed(config);
+            }
+        };
+        let mut owned = config.clone();
+        let sealed = seal_plaintext_passwords(&mut owned.ssh_connections, &vault);
+        eprintln!("[config] 写盘前兜底封存了 {sealed} 条 SSH 密码");
+        Cow::Owned(owned)
     }
 
     /// 把 SSH 投影写进 `config.json`。**内容没变就不写** ——
@@ -1176,6 +1323,68 @@ impl ConfigStore {
             eprintln!("[config] SSH 投影写盘失败(sidecar 会读到上一版): {err}");
         }
     }
+}
+
+/// 这个值是「还没封存的明文密码」吗(非空且不带信封前缀)。
+fn is_plaintext_password(value: &str) -> bool {
+    !value.is_empty() && !mt_secret::is_sealed(value)
+}
+
+/// 有没有连接还带着明文密码。
+fn has_plaintext_password(connections: &[SshConnection]) -> bool {
+    connections
+        .iter()
+        .any(|c| c.password.as_deref().is_some_and(is_plaintext_password))
+}
+
+/// 把 `sshConnections[].password` 里的明文换成信封。返回改了几条;单条封存失败
+/// 只记日志、原样保留(下次再试)。日志不含密码。
+fn seal_plaintext_passwords(connections: &mut [SshConnection], vault: &Vault) -> usize {
+    let mut sealed = 0;
+    for conn in connections {
+        let Some(plain) = conn
+            .password
+            .as_deref()
+            .filter(|p| is_plaintext_password(p))
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        match vault.seal(&plain) {
+            Ok(envelope) => {
+                conn.password = Some(envelope);
+                sealed += 1;
+            }
+            Err(err) => eprintln!("[config] 连接 {} 的密码封存失败,保持原样: {err}", conn.id),
+        }
+    }
+    sealed
+}
+
+/// 同上,但作用在一份 JSON 树上(存档用)。字段缺失 / 形状不对就当没有。
+fn seal_passwords_in_json(root: &mut serde_json::Value, vault: &Vault) -> usize {
+    let Some(conns) = root
+        .get_mut("sshConnections")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return 0;
+    };
+    let mut sealed = 0;
+    for conn in conns {
+        let Some(plain) = conn
+            .get("password")
+            .and_then(serde_json::Value::as_str)
+            .filter(|p| is_plaintext_password(p))
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        if let Ok(envelope) = vault.seal(&plain) {
+            conn["password"] = serde_json::Value::String(envelope);
+            sealed += 1;
+        }
+    }
+    sealed
 }
 
 /// 同目录临时文件 + rename 的原子写。
@@ -1204,6 +1413,23 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let parsed: AppConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.available_shells.len(), config.available_shells.len());
+    }
+
+    /// 智能 Ctrl+C/V 默认开:`Default` 与「库里没这个键」两条路都得是 true,
+    /// 存量用户显式存的 `false` 要原样保留。
+    #[test]
+    fn smart_copy_paste_defaults_on_but_keeps_explicit_off() {
+        assert!(AppConfig::default().smart_copy_paste);
+        let missing: AppConfig = serde_json::from_str(
+            r#"{"projects": [], "defaultShell": "cmd", "availableShells": []}"#,
+        )
+        .unwrap();
+        assert!(missing.smart_copy_paste, "没这个键 = 新装用户,按新默认开");
+        let off: AppConfig = serde_json::from_str(
+            r#"{"projects": [], "defaultShell": "cmd", "availableShells": [], "smartCopyPaste": false}"#,
+        )
+        .unwrap();
+        assert!(!off.smart_copy_paste, "显式 false 不许被新默认盖掉");
     }
 
     #[test]
@@ -1629,6 +1855,34 @@ mod tests {
         assert!(config.project_ordering.is_none());
         let tree = config.project_tree.unwrap();
         assert_eq!(tree.len(), 2);
+    }
+
+    /// 撞号事故留下的树:`[G[proj-1], proj-1]`(旧项目在组里那条被挪进目标组、
+    /// 根层追加的那条成了残留)。读盘时只留深度优先第一处,分组本身与其它项目不动。
+    #[test]
+    fn migrate_config_去掉树里重复的项目id只留第一处() {
+        let json = r#"{
+            "projects": [
+                {"id": "proj-1", "name": "b", "path": "/tmp/b"},
+                {"id": "p2", "name": "p2", "path": "/tmp/2"}
+            ],
+            "projectTree": [
+                "p2",
+                {"id": "g1", "name": "G", "collapsed": false, "children": ["proj-1", "p2"]},
+                "proj-1"
+            ],
+            "defaultShell": "cmd",
+            "availableShells": [{"name": "cmd", "command": "cmd"}],
+            "uiFontSize": 13,
+            "terminalFontSize": 14
+        }"#;
+        let config = migrate_config(serde_json::from_str(json).unwrap());
+        let tree = config.project_tree.unwrap();
+        let dump = serde_json::to_string(&tree).unwrap();
+        assert_eq!(
+            dump,
+            r#"["p2",{"id":"g1","name":"G","collapsed":false,"children":["proj-1"]}]"#
+        );
     }
 
     fn unique_test_root(label: &str) -> PathBuf {
@@ -2344,7 +2598,17 @@ mod tests {
             mt_core::read_ssh_connections_for_token_at(Some(path.clone()), "tok-a").unwrap();
         let ids: Vec<&str> = scoped.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(ids, ["c1"], "令牌必须解析到该项目的范围");
-        assert_eq!(scoped[0].password.as_deref(), Some("secret"), "凭据要完整");
+        // 凭据要完整,但投影里只能是信封;sidecar 拿同目录那把钥匙解得开
+        let stored = scoped[0].password.as_deref().expect("凭据要完整");
+        assert!(mt_secret::is_sealed(stored), "投影里只能是信封: {stored}");
+        assert_eq!(
+            mt_secret::Vault::open(&root)
+                .unwrap()
+                .reveal(stored)
+                .unwrap(),
+            "secret",
+            "sidecar 只读打开同目录的密钥文件就能解"
+        );
 
         // 未知令牌仍 fail closed
         assert!(mt_core::read_ssh_connections_for_token_at(Some(path.clone()), "nope").is_err());
@@ -2355,6 +2619,136 @@ mod tests {
         let unscoped = mt_core::read_ssh_connections_for_project_at(Some(path), Some("p2"));
         assert_eq!(unscoped.len(), 2, "没设范围的项目仍是全部可见");
 
+        fs::remove_dir_all(&root).ok();
+    }
+
+    fn conn_with_plain_password(id: &str, password: &str) -> SshConnection {
+        SshConnection {
+            id: id.into(),
+            name: format!("conn-{id}"),
+            host: "h1".into(),
+            port: 22,
+            user: "root".into(),
+            password: Some(password.into()),
+            identity_file: None,
+            group: None,
+        }
+    }
+
+    fn contains_bytes(hay: &[u8], needle: &[u8]) -> bool {
+        hay.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// 旧版本落下的明文密码在加载时封存:库、备份、投影、存档四处**连字节都不留**
+    /// (库文件走 VACUUM + WAL 截断,页内碎片与旧帧一起清掉)。
+    #[test]
+    fn 存量明文密码加载时封存且四处不留明文() {
+        let root = unique_test_root("seal-on-load");
+        let path = root.join("config.json");
+        const PLAIN: &str = "pl41ntext-Hunter2";
+        // 直接用库层写一份明文(绕过 ConfigStore::save 的兜底封存,模拟旧版本落下的库)
+        {
+            let db = crate::db::ConfigDb::open_at(&root).unwrap();
+            let config = AppConfig {
+                ssh_connections: vec![conn_with_plain_password("c1", PLAIN)],
+                ..AppConfig::default()
+            };
+            db.save(&config).unwrap();
+        }
+        // 存量存档里也放一份明文
+        let archive = root.join("config.json.pre-sqlite");
+        let legacy = serde_json::json!({
+            "uiFontSize": 15.5,
+            "sshConnections": [
+                {"id": "c1", "name": "prod", "host": "h1", "port": 22, "user": "root",
+                 "password": PLAIN}
+            ]
+        });
+        fs::write(&archive, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
+
+        let store = ConfigStore::at(&path);
+        let loaded = store.load().unwrap();
+        let stored = loaded.config.ssh_connections[0]
+            .password
+            .clone()
+            .expect("密码还在");
+        assert!(mt_secret::is_sealed(&stored), "内存里已是信封: {stored}");
+        assert_eq!(store.vault().unwrap().reveal(&stored).unwrap(), PLAIN);
+        assert!(
+            root.join(mt_secret::KEY_FILE_NAME).exists(),
+            "主程序首次加载生成密钥文件"
+        );
+
+        for file in [
+            "config.db",
+            "config.db.bak",
+            "config.json",
+            "config.json.pre-sqlite",
+        ] {
+            let bytes = fs::read(root.join(file)).unwrap();
+            assert!(
+                !contains_bytes(&bytes, PLAIN.as_bytes()),
+                "{file} 里不该再有明文"
+            );
+        }
+        // WAL 要么已截成空,要么不存在
+        if let Ok(wal) = fs::read(root.join("config.db-wal")) {
+            assert!(
+                !contains_bytes(&wal, PLAIN.as_bytes()),
+                "WAL 旧帧里不该有明文"
+            );
+        }
+        // 存档其余内容原样,只有密码字段换了
+        let archived: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&archive).unwrap()).unwrap();
+        assert_eq!(archived["uiFontSize"], 15.5);
+        assert!(mt_secret::is_sealed(
+            archived["sshConnections"][0]["password"].as_str().unwrap()
+        ));
+
+        // 二次加载:信封不变(不重复封存)
+        let again = store.load().unwrap();
+        assert_eq!(
+            again.config.ssh_connections[0].password.as_deref(),
+            Some(stored.as_str())
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// `save` 兜底:谁交来明文都会被封成信封再落盘;已是信封的原样写、不重复封存。
+    #[test]
+    fn 写盘兜底把明文密码封成信封() {
+        let root = unique_test_root("seal-on-save");
+        let store = ConfigStore::at(root.join("config.json"));
+        let token = store.load().unwrap().token;
+        const PLAIN: &str = "pl41ntext-Hunter2";
+        let config = AppConfig {
+            ssh_connections: vec![
+                conn_with_plain_password("c1", PLAIN),
+                conn_with_plain_password("c2", ""),
+            ],
+            ..AppConfig::default()
+        };
+        store.save(token, &config).unwrap();
+
+        let back = store.read();
+        let stored = back.ssh_connections[0].password.clone().unwrap();
+        assert!(mt_secret::is_sealed(&stored), "库里只能是信封: {stored}");
+        assert_eq!(store.vault().unwrap().reveal(&stored).unwrap(), PLAIN);
+        assert_eq!(
+            back.ssh_connections[1].password.as_deref(),
+            Some(""),
+            "空串不封存(表单把空当 None,这里只是形状原样)"
+        );
+        let projection = fs::read_to_string(root.join("config.json")).unwrap();
+        assert!(!projection.contains(PLAIN), "投影里不该有明文");
+
+        store.save(token, &back).unwrap();
+        assert_eq!(
+            store.read().ssh_connections[0].password.as_deref(),
+            Some(stored.as_str()),
+            "已是信封的原样写,不换 nonce"
+        );
         fs::remove_dir_all(&root).ok();
     }
 

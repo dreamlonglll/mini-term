@@ -20,7 +20,11 @@ pub(crate) use mt_core::strip_ansi_codes;
 /// `grok`（xai-org/grok-build）的官方安装把二进制铺成 `grok`（artifact 名是
 /// `xai-grok-pager`），非交互用 `-p`、`--version`/`--help` 也与下面对齐；
 /// `--resume` / `--trust` 都是交互式启动，不该进非交互列表。
-pub const AI_COMMANDS: &[&str] = &["claude", "codex", "opencode", "pi", "grok"];
+///
+/// `omp`（oh-my-pi，can1357/oh-my-pi，pi 的分支）的命令名就是 `omp`，Windows 上
+/// 是 `omp.cmd`（basename 归一时剥掉）；一次性提问同样是 `-p`，`--resume` /
+/// `--continue` / `--fork` 都进交互式 TUI。它的 hook 接入见 `hook_registry` 的 omp 段。
+pub const AI_COMMANDS: &[&str] = &["claude", "codex", "opencode", "pi", "grok", "omp"];
 
 /// 这些标志表示非交互命令（仅输出信息后退出），不应触发 AI 会话状态
 const NON_INTERACTIVE_FLAGS: &[&str] = &["-v", "--version", "-h", "--help", "-p", "--print"];
@@ -139,6 +143,40 @@ pub(crate) fn is_interrupt_key(data: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// omp 的识别口径:裸命令 / Windows 的 `omp.cmd` / 带交互式参数都算进会话,
+    /// 一次性提问与版本查询不算;basename 全等,`compose` / `ompx` 都不会误伤。
+    #[test]
+    fn omp_is_recognized_only_when_interactive() {
+        for cmd in [
+            "omp",
+            "omp.cmd",
+            "omp --resume 1f9d2a6b",
+            "omp --continue",
+            "omp --fork abc",
+        ] {
+            assert_eq!(
+                interactive_ai_command_name(cmd),
+                Some("omp"),
+                "{cmd} 应识别为 omp"
+            );
+        }
+        for cmd in [
+            "omp -p 'fix it'",
+            "omp --version",
+            "omp -h",
+            "docker compose up",
+            "ompx",
+        ] {
+            assert_eq!(
+                interactive_ai_command_name(cmd),
+                None,
+                "{cmd} 不该进入 AI 会话"
+            );
+        }
+        // 行快照里带 prompt 也认得出
+        assert_eq!(line_ai_command_name("PS D:\\repo> omp"), Some("omp"));
+    }
 
     /// 打断键识别:只认单独一个字节的裸 Esc / Ctrl+C。方向键等 CSI 序列由
     /// 终端一次性发来(`\x1b[A`),不能因为首字节是 Esc 就当成打断——否则

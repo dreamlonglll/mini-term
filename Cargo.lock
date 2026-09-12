@@ -4239,7 +4239,7 @@ dependencies = [
 
 [[package]]
 name = "mt-ai"
-version = "1.2.2"
+version = "1.2.11"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4258,7 +4258,7 @@ dependencies = [
 
 [[package]]
 name = "mt-app"
-version = "1.2.2"
+version = "1.2.11"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4277,6 +4277,7 @@ dependencies = [
  "mt-project",
  "mt-pty",
  "mt-relay",
+ "mt-secret",
  "mt-ssh",
  "mt-terminal",
  "mt-ui",
@@ -4296,11 +4297,12 @@ dependencies = [
 
 [[package]]
 name = "mt-config"
-version = "1.2.2"
+version = "1.2.11"
 dependencies = [
  "anyhow",
  "dirs 6.0.0",
  "mt-core",
+ "mt-secret",
  "rusqlite",
  "serde",
  "serde_json",
@@ -4319,14 +4321,14 @@ dependencies = [
 
 [[package]]
 name = "mt-i18n"
-version = "1.2.2"
+version = "1.2.11"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "mt-layout"
-version = "1.2.2"
+version = "1.2.11"
 dependencies = [
  "anyhow",
  "mt-config",
@@ -4337,7 +4339,7 @@ dependencies = [
 
 [[package]]
 name = "mt-project"
-version = "1.2.2"
+version = "1.2.11"
 dependencies = [
  "anyhow",
  "git2",
@@ -4354,7 +4356,7 @@ dependencies = [
 
 [[package]]
 name = "mt-pty"
-version = "1.2.2"
+version = "1.2.11"
 dependencies = [
  "anyhow",
  "mt-core",
@@ -4364,7 +4366,7 @@ dependencies = [
 
 [[package]]
 name = "mt-relay"
-version = "1.2.2"
+version = "1.2.11"
 dependencies = [
  "anyhow",
  "dirs 6.0.0",
@@ -4390,6 +4392,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "mt-secret"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "mt-core",
+ "ring",
+ "serde",
+ "serde_json",
+ "windows-sys 0.52.0",
+ "zeroize",
+]
+
+[[package]]
 name = "mt-ssh"
 version = "0.6.5"
 dependencies = [
@@ -4397,6 +4412,7 @@ dependencies = [
  "dirs 6.0.0",
  "futures",
  "mt-core",
+ "mt-secret",
  "rsa",
  "russh",
  "russh-sftp",
@@ -4406,7 +4422,7 @@ dependencies = [
 
 [[package]]
 name = "mt-terminal"
-version = "1.2.2"
+version = "1.2.11"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -4416,7 +4432,7 @@ dependencies = [
 
 [[package]]
 name = "mt-ui"
-version = "1.2.2"
+version = "1.2.11"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -4432,7 +4448,7 @@ dependencies = [
 
 [[package]]
 name = "mt-usage"
-version = "1.2.2"
+version = "1.2.11"
 dependencies = [
  "anyhow",
  "chrono",

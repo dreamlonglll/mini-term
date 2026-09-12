@@ -17,10 +17,14 @@ edition = "2021"
 name = "mt_ssh"
 
 [dependencies]
-# SshConnection 类型(含明文 password / identityFile)来自 tauri-free 共享 crate。
+# SshConnection 类型(password 是封存信封或遗留明文 / identityFile)来自 tauri-free 共享 crate。
 # 相对路径写法保留:同一份 manifest 要在根工作区与两个旧 Tauri 工作区里都解析得动,
 # `../mt-core` 三处都指向 `crates/mt-core`,比 workspace 继承少一层解析假设。
 mt-core = { path = "../mt-core" }
+# 密码信封在**认证那一刻**解开(`pool.rs::authenticate`)。放在这里而不是让每个调用方
+# 先解再传:主程序与三个 sidecar 共用这个池,解封点唯一就不会有谁忘了。
+# 同样走相对路径:sidecars/ 独立工作区经本 crate 拉它进来。
+mt-secret = { path = "../mt-secret" }
 # SSH 客户端实现:纯 Rust + tokio 原生 async;
 # 持久会话池由它建/维持单条 SSH 连接,channel 用于 exec。
 #

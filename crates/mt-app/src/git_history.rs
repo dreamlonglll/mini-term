@@ -28,6 +28,7 @@ use gpui::{
     point, px, uniform_list,
 };
 use mt_project::git::{BranchInfo, GitCommitInfo};
+use mt_ui::TruncatedText;
 
 use crate::git_graph::{
     self, GRAPH_ROW_HEIGHT, GraphLayout, GraphRow, SegPath, palette_color, segment_path,
@@ -53,6 +54,9 @@ pub struct GitHistoryContent {
     repo_path: String,
     /// 只用来给提交行标注分支胶囊。
     branches: Vec<BranchInfo>,
+    /// HEAD 所在的分支名;detached 时是 `"(1a2b3c4)"` 那种短 hash,查不到分支就当没有。
+    /// 只用来找「跟随 HEAD 时正在展示的是哪条本地分支」,进而挂它的上游胶囊。
+    head_branch: Option<String>,
     /// 正在查看(未 checkout)的分支;`None` = 跟随 HEAD。
     view_branch: Option<String>,
     commits: Vec<GitCommitInfo>,
@@ -73,6 +77,7 @@ impl GitHistoryContent {
             store,
             repo_path: String::new(),
             branches: Vec::new(),
+            head_branch: None,
             view_branch: None,
             commits: Vec::new(),
             graph: git_graph::compute(&[]),
@@ -83,26 +88,27 @@ impl GitHistoryContent {
         }
     }
 
-    /// 容器把仓库 / 分支列表 / 查看分支一起透下来。任一变化都重头拉第一页
-    /// (原版靠 `key={historyRefreshKey}` 与 effect 依赖达到同样效果)。
+    /// 容器把仓库 / 分支列表 / HEAD 分支 / 查看分支一起透下来。换仓库、换查看分支
+    /// 重头拉第一页(原版靠 `key={historyRefreshKey}` 与 effect 依赖达到同样效果);
+    /// 分支列表变了只重画胶囊。
+    ///
+    /// ⚠️ 分支列表要**整条**比,不能只比名字:提交 / 推送后分支名一个没变、
+    /// 只有 `commit_hash` 前移,只比名字会把新列表丢掉,胶囊就钉死在旧 commit 上。
     pub fn sync(
         &mut self,
         repo_path: &str,
         branches: &[BranchInfo],
+        head_branch: Option<&str>,
         view_branch: Option<&str>,
         cx: &mut Context<Self>,
     ) {
-        let branches_changed = self.branches.len() != branches.len()
-            || self
-                .branches
-                .iter()
-                .zip(branches)
-                .any(|(a, b)| a.name != b.name || a.is_head != b.is_head);
+        let tags_changed = self.branches != branches || self.head_branch.as_deref() != head_branch;
         let reload = self.repo_path != repo_path || self.view_branch.as_deref() != view_branch;
         self.repo_path = repo_path.to_string();
         self.view_branch = view_branch.map(str::to_string);
-        if branches_changed {
+        if tags_changed {
             self.branches = branches.to_vec();
+            self.head_branch = head_branch.map(str::to_string);
             cx.notify();
         }
         if reload {
@@ -246,13 +252,50 @@ impl GitHistoryContent {
     /// ⚠️ **只标注本工作区的分支**(`GitHistoryContent.tsx:166-169` 原注释):
     /// worktree 与主仓库共享 refs,标出全部分支会把其他工作区/远程的分支全挂到
     /// commit 上,看起来像本工作区持有它们。
+    ///
+    /// 唯一的例外是**正在展示的本地分支的上游**(`origin/main`):它与本地分支
+    /// 胶囊同行就是「已推送」,落在下面几行就是「本地领先、还没推」,远端领先则
+    /// 压根不在这条线的历史里。用户一眼就能看出最新代码有没有到远程。
     fn shown_branches(&self, hash: &str) -> Vec<&BranchInfo> {
-        self.branches
-            .iter()
-            .filter(|b| b.is_head || Some(b.name.as_str()) == self.view_branch.as_deref())
-            .filter(|b| b.commit_hash == hash)
-            .collect()
+        pick_shown_branches(
+            &self.branches,
+            self.head_branch.as_deref(),
+            self.view_branch.as_deref(),
+            hash,
+        )
     }
+}
+
+/// [`GitHistoryContent::shown_branches`] 的纯函数体,抽出来好测。
+fn pick_shown_branches<'a>(
+    branches: &'a [BranchInfo],
+    head_branch: Option<&str>,
+    view_branch: Option<&str>,
+    hash: &str,
+) -> Vec<&'a BranchInfo> {
+    let upstream = tracked_upstream(branches, head_branch, view_branch);
+    branches
+        .iter()
+        .filter(|b| {
+            b.is_head || Some(b.name.as_str()) == view_branch || Some(b.name.as_str()) == upstream
+        })
+        .filter(|b| b.commit_hash == hash)
+        .collect()
+}
+
+/// 正在展示的本地分支关联的远程分支名。展示的是远程分支、本地分支没配上游、
+/// detached HEAD(`head_branch` 是短 hash,分支列表里查不到)时都是 `None`。
+fn tracked_upstream<'a>(
+    branches: &'a [BranchInfo],
+    head_branch: Option<&str>,
+    view_branch: Option<&str>,
+) -> Option<&'a str> {
+    let shown = view_branch.or(head_branch)?;
+    branches
+        .iter()
+        .find(|b| !b.is_remote && b.name == shown)?
+        .upstream
+        .as_deref()
 }
 
 /// 相对时间(`src/utils/timeFormat.ts:3-18`)。
@@ -381,6 +424,11 @@ impl GitHistoryContent {
             .min_w(px(0.0))
             .text_size(ui::font_px(13.0))
             .text_color(ui::text_primary());
+        // 胶囊与提交说明按各自宽度比例收缩、各自截断:胶囊不设 `flex_none`,否则
+        // `feature/MT-1234-…` 这种长名一个就把说明整个挤出行外。胶囊保底一截
+        // 宽度好认出 `origin/` 前缀,全名挂 tooltip。截断用 [`TruncatedText`]
+        // 而不是 `truncate()`(后者在这种自然宽度的 flex 项上画不出「…」,
+        // 理由见 `mt_ui::truncated_text` 模块注释)。
         for branch in self.shown_branches(&commit.hash) {
             let (bg, fg) = if branch.is_head {
                 (palette_color(0), gpui::white())
@@ -392,20 +440,34 @@ impl GitHistoryContent {
                     mt_ui::rgb8(63, 185, 80),
                 )
             };
+            let tip: SharedString = branch.name.clone().into();
             first_line = first_line.child(
                 div()
-                    .flex_none()
+                    .id(SharedString::from(format!(
+                        "git-tag-{short_hash}-{}",
+                        branch.name
+                    )))
+                    .min_w(px(56.0))
                     .px(px(6.0))
                     .rounded(px(3.0))
                     .bg(bg)
                     .text_color(fg)
-                    .child(branch.name.clone()),
+                    .child(TruncatedText::new(branch.name.clone()))
+                    .tooltip(move |window, cx| {
+                        mt_ui::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+                    }),
             );
         }
-        first_line = first_line.child(div().truncate().child(message));
+        first_line = first_line.child(TruncatedText::new(message));
 
+        // ⚠️ `w_full` 不能省:行是 uniform_list 的 item,单独 `layout_as_root`,而
+        // taffy 对没有已知主轴尺寸的 flex 根节点按**内容**宽度算、不吃 available
+        // space。没有它整行只有拓扑图那么宽,`flex_1` 容器是 0 —— 以前胶囊
+        // `flex_none`、说明 nowrap,谁都收不下去只是溢出着显示,看不出来;
+        // 一旦允许收缩,胶囊与说明就一起塌到最小宽度。
         div()
             .id(SharedString::from(format!("git-commit-{hash_full}")))
+            .w_full()
             .flex()
             .items_center()
             .h(px(GRAPH_ROW_HEIGHT))
@@ -434,7 +496,12 @@ impl GitHistoryContent {
                             .gap(px(6.0))
                             .text_size(ui::font_px(11.0))
                             .text_color(ui::text_muted())
-                            .child(div().max_w(px(140.0)).truncate().child(author))
+                            .child(
+                                div()
+                                    .min_w(px(0.0))
+                                    .max_w(px(140.0))
+                                    .child(TruncatedText::new(author)),
+                            )
                             .child("·")
                             .child(div().flex_none().child(relative))
                             .child("·")
@@ -724,6 +791,96 @@ mod tests {
         fake.merge(vec![test_commit("tail", &[])]);
         assert_eq!(fake.commits.len(), PAGE_SIZE + 1);
         assert!(!fake.has_more);
+    }
+
+    /// `origin/` 开头的当远程分支,与 `get_repo_branches` 的产出形态一致。
+    fn branch(name: &str, hash: &str, is_head: bool, upstream: Option<&str>) -> BranchInfo {
+        BranchInfo {
+            name: name.into(),
+            is_head,
+            is_remote: name.starts_with("origin/"),
+            commit_hash: hash.into(),
+            upstream: upstream.map(str::to_string),
+        }
+    }
+
+    fn names(picked: &[&BranchInfo]) -> Vec<String> {
+        picked.iter().map(|b| b.name.clone()).collect()
+    }
+
+    /// 跟随 HEAD 时,HEAD 分支的上游胶囊也要挂上:本地领先一格时 `origin/main`
+    /// 落在下一行(一眼看出没推),推完两者同行。其它远程分支照旧不挂。
+    #[test]
+    fn 上游胶囊跟着展示中的本地分支() {
+        let branches = vec![
+            branch("main", "c2", true, Some("origin/main")),
+            branch("dev", "c0", false, Some("origin/dev")),
+            branch("origin/main", "c1", false, None),
+            branch("origin/dev", "c0", false, None),
+        ];
+        assert_eq!(
+            names(&pick_shown_branches(&branches, Some("main"), None, "c2")),
+            vec!["main"]
+        );
+        assert_eq!(
+            names(&pick_shown_branches(&branches, Some("main"), None, "c1")),
+            vec!["origin/main"],
+            "本地领先:上游落在旧 commit 上"
+        );
+        // c0 上有 dev / origin/dev,但展示的是 main,一个都不挂
+        assert!(pick_shown_branches(&branches, Some("main"), None, "c0").is_empty());
+
+        // 推完:上游前移到 c2,与 main 同行,顺序本地在前远程在后
+        let pushed = vec![
+            branch("main", "c2", true, Some("origin/main")),
+            branch("origin/main", "c2", false, None),
+        ];
+        assert_eq!(
+            names(&pick_shown_branches(&pushed, Some("main"), None, "c2")),
+            vec!["main", "origin/main"]
+        );
+    }
+
+    /// 查看别的本地分支:挂它自己 + 它的上游,HEAD 胶囊照旧保留;
+    /// 查看的是远程分支 / 分支没配上游 / detached HEAD 都不再多挂。
+    #[test]
+    fn 上游只认本地分支() {
+        let branches = vec![
+            branch("main", "c2", true, Some("origin/main")),
+            branch("dev", "c0", false, Some("origin/dev")),
+            branch("lonely", "c3", false, None),
+            branch("origin/main", "c1", false, None),
+            branch("origin/dev", "c0", false, None),
+        ];
+        // 查看 dev:dev 与 origin/dev 同行,origin/main 不再挂
+        assert_eq!(
+            names(&pick_shown_branches(
+                &branches,
+                Some("main"),
+                Some("dev"),
+                "c0"
+            )),
+            vec!["dev", "origin/dev"]
+        );
+        assert!(pick_shown_branches(&branches, Some("main"), Some("dev"), "c1").is_empty());
+        // 查看远程分支 origin/dev:只挂它自己(与 HEAD)
+        assert_eq!(
+            names(&pick_shown_branches(
+                &branches,
+                Some("main"),
+                Some("origin/dev"),
+                "c0"
+            )),
+            vec!["origin/dev"]
+        );
+        // 没配上游的本地分支:只有它自己
+        assert_eq!(
+            tracked_upstream(&branches, Some("main"), Some("lonely")),
+            None
+        );
+        // detached HEAD:head_branch 是短 hash,查不到 → 没有上游
+        assert_eq!(tracked_upstream(&branches, Some("(1a2b3c4)"), None), None);
+        assert_eq!(tracked_upstream(&branches, None, None), None);
     }
 
     /// 相对时间四个档位的边界(59/60/3599/3600/86399/86400/2591999/2592000)。
