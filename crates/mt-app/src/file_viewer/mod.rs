@@ -138,7 +138,8 @@ pub enum DocumentSource {
     },
     Remote {
         project_id: String,
-        connection: mt_config::SshConnection,
+        /// 装箱:连接快照三百多字节,不装箱整个枚举(连带每个本地页签)都按它的尺寸占位
+        connection: Box<mt_config::SshConnection>,
         project_root: String,
         path: PathBuf,
     },

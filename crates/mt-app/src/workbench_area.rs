@@ -258,7 +258,7 @@ pub fn open_active_file(
         };
         DocumentSource::Remote {
             project_id: project.id.clone(),
-            connection,
+            connection: Box::new(connection),
             project_root: project.path.clone(),
             path,
         }
