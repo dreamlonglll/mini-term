@@ -1104,6 +1104,9 @@ mod tests {
         let root = std::env::temp_dir().join(format!("mini-term-fs-test-{ts}"));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
+        // 规范成长路径:被测函数返回 canonicalize 过的路径,而 GitHub Windows runner 的
+        // 临时目录是 8.3 短路径(`C:\Users\RUNNER~1\...`),直接拿 `root.join(..)` 比会对不上
+        let root = strip_verbatim_prefix(root.canonicalize().unwrap());
         let inner_file = root.join("inside.txt");
         fs::write(&inner_file, "hi").unwrap();
         (root, inner_file)

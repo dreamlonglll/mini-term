@@ -2022,9 +2022,9 @@ mod tests {
 
     /// 用 git2 搭一个只有一次提交、只含 `rel` 一个文件的仓库,返回仓库根。
     ///
-    /// 非 Windows 上对根做 canonicalize:libgit2 会对路径做 realpath,macOS 的
-    /// `/var` → `/private/var` 会让「文件相对 workdir 的路径」算歪。Windows 不做——
-    /// canonicalize 会带上 `\\?\` 前缀,而临时目录本来也没有符号链接。
+    /// 对根做 canonicalize(Windows 顺带剥掉 `\\?\` 前缀):libgit2 会对路径做 realpath,
+    /// macOS 的 `/var` → `/private/var`、GitHub Windows runner 临时目录的 8.3 短路径
+    /// (`RUNNER~1` → `runneradmin`)都会让「文件相对 workdir 的路径」算歪。
     fn init_repo_with_file(tag: &str, rel: &str, content: &str) -> PathBuf {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2032,11 +2032,7 @@ mod tests {
             .as_nanos();
         let root = std::env::temp_dir().join(format!("mini-term-git-{tag}-{ts}"));
         std::fs::create_dir_all(&root).unwrap();
-        let root = if cfg!(windows) {
-            root
-        } else {
-            std::fs::canonicalize(&root).unwrap()
-        };
+        let root = crate::fs::strip_verbatim_prefix(std::fs::canonicalize(&root).unwrap());
         let repo = Repository::init(&root).unwrap();
         let abs = root.join(rel);
         std::fs::create_dir_all(abs.parent().unwrap()).unwrap();
