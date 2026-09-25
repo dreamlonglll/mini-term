@@ -18,7 +18,7 @@ use super::events::StoreChanged;
 use super::pure::{
     apply_resolved_session_cwd, decide_resume_cwd, find_pane_of_pty, next_maximized,
     resolve_auto_resume_command, resolve_resume_cwd, resolve_scrollback, sanitize_osc_title,
-    terminal_style_from,
+    subtitle_enabled, terminal_style_from, visible_subtitle_changes,
 };
 use super::{AppStore, StoreEvent};
 
@@ -526,6 +526,12 @@ impl AppStore {
         cx: &mut Context<Self>,
     ) {
         self.focused_pane_id = Some(pane_id.to_string());
+        // 焦点给到它 = 用户看到它了:页签上「做完了还没看」的绿点就此熄灭。窗口不在
+        // 前台时(启动时还原焦点等)人并没有在看,不算。绿点只有渲染在读,变化由下面
+        // 这条 `FocusedPaneChanged` 带着重绘,不必另发账本事件
+        if self.window_focused {
+            self.done.mark_seen(pane_id);
+        }
         let pty_id = self
             .project_states
             .get(project_id)
@@ -903,11 +909,12 @@ impl AppStore {
             )
         });
 
-        // 子进程退出 → pane 状态 error(与旧版 pty-exit 同语义);
+        // 子进程退出 → pane 状态 error(与旧版 pty-exit 同语义);PTY 没起来同样落 error;
         // 用户键入 → 清 attention 黄灯(与旧版 clearPaneAttentionByPty 同语义)
         let sub = cx.subscribe(&entity, move |store, _entity, event: &PaneEvent, cx| {
             match event {
                 PaneEvent::Exited(code) => store.on_pty_exit(pty_id, *code, cx),
+                PaneEvent::SpawnFailed => store.on_pty_spawn_failed(pty_id, cx),
                 PaneEvent::UserInput => store.clear_pane_attention_by_pty(pty_id, cx),
                 // AI 任务标记。**必须走事件而不是在 write 里直接 update store** ——
                 // `write_to_pane` 是在 `store.update` 里调 `pane.write` 的,那里再去
@@ -957,6 +964,13 @@ impl AppStore {
     /// CLI 的 spinner 每秒改好几次标题,pane 侧已经按 250ms 合并过一层,
     /// 这里再挡一层「合并后仍然相同」的,避免白白 `notify` 整窗重绘。
     ///
+    /// **值变了但副段看不见的变化只存不报**:AI 在场时副段整个收起(Claude Code 的
+    /// spinner 帧就落在这一档,AI 工作时每 pane 约 4Hz)、有自定义名、默认标题换默认
+    /// 标题 —— 页签上一个像素都不动,却会叫醒全部 `observe(store)` 的视图(项目列表的
+    /// view 缓存也一并作废),而且 store 通知不走 `redraw` 节拍器,窗口在后台时照样
+    /// 一拍一帧。值照存:副段重新可见一定伴随状态 / 会话 / 改名 / 配置的变化,那些
+    /// 事件带着重绘读到的就是这里存的最新值。判据见 [`visible_subtitle_changes`]。
+    ///
     /// **不落盘**:`osc_title` 是运行时字段,`SavedPane` 里没有它。
     pub fn set_pane_osc_title(
         &mut self,
@@ -975,8 +989,12 @@ impl AppStore {
         if pane.osc_title == next {
             return;
         }
+        let enabled = subtitle_enabled(&self.config, pane);
+        let visible = visible_subtitle_changes(pane, next.as_deref(), enabled);
         pane.osc_title = next;
-        cx.changed(StoreEvent::PaneTitleChanged);
+        if visible {
+            cx.changed(StoreEvent::PaneTitleChanged);
+        }
     }
 
     /// [`Self::set_pane_osc_title`] 的 `pty_id` 入口 —— pane 只认得自己的 PTY 编号

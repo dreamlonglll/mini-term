@@ -654,17 +654,33 @@ fn default_shell_title_core(title: &str, shell_name: &str) -> bool {
 /// 报上来的是 `pwsh in mini-term`,而主段本来就写着 `pwsh`,原样缀上去就是
 /// 「pwsh · pwsh in mini-term」。前缀与 shell 名相同时剥掉,只留目录。
 pub fn osc_subtitle(pane: &PaneState, enabled: bool) -> Option<String> {
+    subtitle_for_title(pane, pane.osc_title.as_deref(), enabled)
+}
+
+/// [`osc_subtitle`] 的判定本体:拿「假如这个 pane 的标题是 `title`」来算副段 ——
+/// [`visible_subtitle_changes`] 要在写入之前比新旧两份,不必为此克隆整个 pane。
+fn subtitle_for_title(pane: &PaneState, title: Option<&str>, enabled: bool) -> Option<String> {
     if !enabled {
         return None;
     }
     if pane.custom_title.as_deref().is_some_and(|t| !t.is_empty()) {
         return None;
     }
-    let title = pane.osc_title.as_deref()?.trim();
+    let title = title?.trim();
     if title.is_empty() || is_default_shell_title(title, &pane.shell_name) {
         return None;
     }
     Some(strip_shell_in_prefix(title, &pane.shell_name).to_string())
+}
+
+/// OSC 标题从 `pane.osc_title` 换成 `next` 之后,页签上**看得见**的副段变没变。
+///
+/// 没变就不必叫醒任何视图(见 `AppStore::set_pane_osc_title`):AI 在场时副段整个
+/// 收起(`enabled` 为假),Claude Code 写进标题的 spinner 帧一帧也显示不出来;有自定义
+/// 名、新旧都是 shell 默认标题、剥壳后同一个目录,同理。
+pub fn visible_subtitle_changes(pane: &PaneState, next: Option<&str>, enabled: bool) -> bool {
+    subtitle_for_title(pane, pane.osc_title.as_deref(), enabled)
+        != subtitle_for_title(pane, next, enabled)
 }
 
 /// 这个 pane 现在该不该显示副段:开关开着,**且 tab 上没在显示 AI 会话身份**。
@@ -1724,6 +1740,43 @@ mod tests {
             Some("终端"),
             "剩余部分是多字节也不会切到字符中间"
         );
+    }
+
+    /// 只有页签上看得见的副段变了才算变化 —— 其余的只存不报(不叫醒整窗观察者)。
+    #[test]
+    fn 看不见的标题变化不算副段变化() {
+        let pane = titled("pwsh", Some("~/repo/a"), None);
+        // 纯 shell 换目录:看得见
+        assert!(visible_subtitle_changes(&pane, Some("~/repo/b"), true));
+        // ResetTitle:副段消失,也是看得见的变化
+        assert!(visible_subtitle_changes(&pane, None, true));
+
+        // AI 在场(副段收起):Claude Code 的 spinner 帧一帧也显示不出来
+        let ai = titled("pwsh", Some("✳ Claude Code"), None);
+        assert!(!visible_subtitle_changes(&ai, Some("✶ Claude Code"), false));
+        assert!(!visible_subtitle_changes(&ai, None, false));
+
+        // 有自定义名:副段恒不显示
+        let named = titled("pwsh", Some("~/repo/a"), Some("构建"));
+        assert!(!visible_subtitle_changes(&named, Some("~/repo/b"), true));
+
+        // 默认标题换默认标题:前后都没有副段
+        let default = titled("pwsh", Some("pwsh"), None);
+        assert!(!visible_subtitle_changes(
+            &default,
+            Some("PowerShell 7.5.3"),
+            true
+        ));
+        // 默认标题 → 有信息的标题:副段出现
+        assert!(visible_subtitle_changes(&default, Some("~/repo"), true));
+
+        // 剥壳之后是同一个目录:显示的字一个没变
+        let posh = titled("pwsh", Some("pwsh in mini-term"), None);
+        assert!(!visible_subtitle_changes(
+            &posh,
+            Some("PWSH in mini-term"),
+            true
+        ));
     }
 
     #[test]

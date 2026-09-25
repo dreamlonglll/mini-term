@@ -468,6 +468,10 @@ impl AppStore {
         let pane = state.pane_mut(pane_id)?;
         pane.pty_id = Some(new_pty);
         pane.status = PaneStatus::Idle;
+        pane.attention = false;
+        // 旧 shell 报的标题属于上一条会话,新 shell 起来会自己重报;留着的话,
+        // 不设标题的 shell 会一直顶着上一条连接的目录名
+        pane.osc_title = None;
         // notify 由 `after_layout_change` 收尾(它另发 `LayoutChanged`)
         cx.emit(StoreEvent::PaneStatusChanged);
         self.after_layout_change(project_id, cx);

@@ -11,12 +11,12 @@
 //!
 //! # 呼吸灯的口径([`panel_light_status`])
 //!
-//! 与项目级那颗灯(`AppStore::global_ai_status`)同一套语义,只是取样范围不同:
+//! 与边条全局那颗灯(`AppStore::global_ai_light`)同一套语义,只是取样范围不同:
 //! 只看该面板里「切过去就能看见」的 pane(各叶子的激活 tab,
 //! [`SplitNode::visible_panes`](crate::tree::SplitNode::visible_panes)),
-//! 后台 tab 不亮灯;`error` 压成 `idle` —— 一个 `exit 1` 的 shell 不该在竖条上
-//! 亮红点、盖住真在跑的 AI。`ai-working` 档闪烁(与项目级灯同一颗
-//! [`activity_bar::status_badge`]),idle 不挂灯。
+//! 后台 tab 不亮灯;档位含第五档「等你处理」;`error` 逐 pane 压成 `idle` —— 一个
+//! `exit 1` 的 shell 不该在竖条上亮红点、盖住真在跑的 AI。`ai-working` 档闪烁
+//! (与全局灯同一颗 [`activity_bar::status_badge`]),idle 不挂灯。
 //!
 //! 交互对齐 tab 栏的手感:单击切换、双击改名、右键菜单(重命名/关闭,关闭走
 //! [`crate::pane_actions::close_panel`] 的 AI 感知确认)。头部「+」新建面板,
@@ -41,7 +41,7 @@ use crate::pane_actions;
 use crate::prompt;
 use crate::store::AppStore;
 use crate::terminal_area::{click_count, click_position};
-use crate::tree::{PaneStatus, PaneState};
+use crate::tree::{PaneState, StatusLight};
 use crate::ui;
 
 /// 竖条宽度 = ActivityBar 宽度(用户要求同宽、只放图标)。
@@ -78,18 +78,14 @@ const PANEL_ICON: &[Shape] = &[
     ),
 ];
 
-/// 呼吸灯档位:可见 pane 里的最高 AI 档,`error` 压成 `idle`(口径见模块注释)。
-/// **纯判定**,单测钉在这上面。
-fn panel_light_status<'a>(visible: impl IntoIterator<Item = &'a PaneState>) -> PaneStatus {
+/// 呼吸灯档位:可见 pane 里的最高一档(含第五档 attention),`error` 逐 pane 压成
+/// `idle`(口径见模块注释)。**纯判定**,单测钉在这上面。
+fn panel_light_status<'a>(visible: impl IntoIterator<Item = &'a PaneState>) -> StatusLight {
     visible
         .into_iter()
-        .map(|p| match p.status {
-            PaneStatus::Error => PaneStatus::Idle,
-            other => other,
-        })
-        .fold(PaneStatus::Idle, |acc, s| {
-            if s.priority() > acc.priority() { s } else { acc }
-        })
+        .map(|p| p.light().error_as_idle())
+        .max()
+        .unwrap_or_default()
 }
 
 /// 一颗面板按钮的展示数据(渲染前从 store 一次性收齐)。
@@ -98,7 +94,7 @@ struct PanelItem {
     /// tooltip 与改名默认值:自定义名 > 「面板 N」。
     title: String,
     /// 呼吸灯档位([`panel_light_status`])。
-    status: PaneStatus,
+    light: StatusLight,
     /// 面板里的终端总数(含后台 tab)—— 右下角角标。
     count: usize,
     vendor: Option<AiVendor>,
@@ -125,7 +121,7 @@ impl TerminalsPanel {
         let PanelItem {
             panel_id,
             title,
-            status,
+            light,
             count,
             vendor,
             active,
@@ -166,8 +162,8 @@ impl TerminalsPanel {
             })
             // AI 进度呼吸灯(与项目级那颗同一套徽标,`ai-working` 档闪烁;
             // 档位口径见 [`panel_light_status`],idle 不挂)
-            .when(status != PaneStatus::Idle, |el| {
-                el.child(activity_bar::status_badge(status))
+            .when(light != StatusLight::Idle, |el| {
+                el.child(activity_bar::status_badge(light))
             })
             // 终端数角标(右下角):这个面板里一共几个终端(含后台 tab)
             .child(
@@ -360,6 +356,7 @@ fn panel_title(state: &crate::store::ProjectState, panel_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tree::PaneStatus;
 
     fn pane(status: PaneStatus) -> PaneState {
         let mut p = PaneState::new("pwsh");
@@ -367,26 +364,41 @@ mod tests {
         p
     }
 
-    /// 呼吸灯与项目级灯同口径:取最高 AI 档,`error` 压成 `idle` 不上冒。
+    /// 呼吸灯与全局灯同口径:取最高档,`error` 压成 `idle` 不上冒。
     #[test]
     fn 呼吸灯取最高档且error不上冒() {
-        assert_eq!(panel_light_status([].iter()), PaneStatus::Idle, "空面板不亮");
+        assert_eq!(
+            panel_light_status([].iter()),
+            StatusLight::Idle,
+            "空面板不亮"
+        );
         assert_eq!(
             panel_light_status([pane(PaneStatus::Idle), pane(PaneStatus::AiIdle)].iter()),
-            PaneStatus::AiIdle
+            StatusLight::AiIdle
         );
         assert_eq!(
             panel_light_status([pane(PaneStatus::AiIdle), pane(PaneStatus::AiWorking)].iter()),
-            PaneStatus::AiWorking
+            StatusLight::AiWorking
         );
         // 一个 exit 1 的 shell 不该亮红点,也不该盖住别格真在跑的 AI
         assert_eq!(
             panel_light_status([pane(PaneStatus::Error)].iter()),
-            PaneStatus::Idle
+            StatusLight::Idle
         );
         assert_eq!(
             panel_light_status([pane(PaneStatus::Error), pane(PaneStatus::AiWorking)].iter()),
-            PaneStatus::AiWorking
+            StatusLight::AiWorking
+        );
+    }
+
+    /// 第五档:可见 pane 里有个在等授权的,面板灯是「等你处理」,压过在跑的。
+    #[test]
+    fn 呼吸灯认等你处理() {
+        let mut waiting = pane(PaneStatus::AiWorking);
+        waiting.attention = true;
+        assert_eq!(
+            panel_light_status([pane(PaneStatus::AiWorking), waiting].iter()),
+            StatusLight::Attention
         );
     }
 }
@@ -416,7 +428,7 @@ impl Render for TerminalsPanel {
                     });
                     items.push(PanelItem {
                         title: panel_title(state, &panel.id),
-                        status: panel_light_status(panel.layout.visible_panes()),
+                        light: panel_light_status(panel.layout.visible_panes()),
                         count: panel.layout.panes().len(),
                         vendor,
                         active: active_id.as_deref() == Some(panel.id.as_str()),

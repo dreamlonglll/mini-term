@@ -160,6 +160,12 @@ hook 上报（`mt-ai::hook_server`）一旦启用即为权威，退出以 Sessio
 
 **铁律**：两条兜底都把结论**落盘**进 hook 状态，触发一次即收敛、不再摆动——无记忆兜底（假完成每 20~50s 重复播报）是踩过的坑，别回去。
 
+降级路径（无 hook，`hook_enabled` 缺省就是关的）的完成播报同一条铁律：用户在 AI 会话里提交一行才给 pane 上**回合闩**（`SessionTracker::take_turn`），这一回合第一个 ai-working→ai-idle 下降沿不带成因（UI 认作完成）并摘闩；没人提交过的下降沿（启动 banner、TUI 空闲期零星重绘）与同一回合之后的下降沿一律带 cause=`Quiet`，不播报。裸 Esc / Ctrl+C / 退出摘闩——被打断的回合不算做完。
+
+**PTY 死了（退出 / 没起来）error 是终态**：store 当场撤出 mt-ai 的 500ms 轮询（`AiBridge::remove_pane`）、清掉它的完成记录，`apply_ai_event` 对 error pane 的迟到事件一律不收；只有重连换一条新 PTY 才离开。
+
+**界面上的灯是五档**（`mt-app::tree::StatusLight`）：`PaneStatus` 四态（后端与移动端协议口径，不加值）再叠 `attention` 位，多出第五档「等你处理」（实心圆 + 叹号，`ui::color_attention`），优先级 error > attention > ai-working > ai-idle > idle。页签、折叠标题条、悬停预览、项目行、切换器、终端列表竖条、边条全局徽标、会话列表都按它画。
+
 ### 移动端中转体系（`relay-server/` + `mobile/` + `mt-relay`）
 
 - `relay-server/protocol`：桌面端与中转共享的协议消息 crate（JSON over WebSocket，serde camelCase，版本号握手校验，当前 v2）；PWA 侧 TypeScript 类型在 `mobile/src/protocol.ts` 手写镜像，两侧字段必须同步维护

@@ -5,7 +5,7 @@
 //!
 //! | TS 侧 | 这里 |
 //! |---|---|
-//! | `STATUS_PRIORITY` / `getHighestStatus` | [`PaneStatus::priority`] / [`SplitNode::highest_status`] |
+//! | `STATUS_PRIORITY` / `getHighestStatus` | [`StatusLight`] 的声明序 / [`SplitNode::highest_light`](多出第五档 attention,见 [`StatusLight`]) |
 //! | `collectPanes` / `collectPtyIds` | [`SplitNode::panes`] / [`SplitNode::pty_ids`] |
 //! | `insertSplit` / `insertSplitAt` | [`SplitNode::insert_split`] / [`SplitNode::insert_split_at`] |
 //! | `movePaneInLayout` | [`SplitNode::move_pane_in_layout`] |
@@ -60,7 +60,8 @@ pub fn gen_unique_id(prefix: &str, is_taken: impl Fn(&str) -> bool) -> String {
     }
 }
 
-/// pane / 项目的四态。聚合优先级 `error > ai-working > ai-idle > idle`。
+/// pane 的四态(后端与移动端协议的口径)。界面上的灯按 [`StatusLight`] 画 ——
+/// 它在这四态之上再叠一层 `attention`。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PaneStatus {
     #[default]
@@ -71,15 +72,6 @@ pub enum PaneStatus {
 }
 
 impl PaneStatus {
-    pub fn priority(self) -> u8 {
-        match self {
-            Self::Error => 3,
-            Self::AiWorking => 2,
-            Self::AiIdle => 1,
-            Self::Idle => 0,
-        }
-    }
-
     /// 与后端(`mt_ai::StatusChange::status`)之间的字符串口径,一字不改。
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
@@ -102,6 +94,57 @@ impl PaneStatus {
             Self::AiWorking => "ai-working",
             Self::Error => "error",
         }
+    }
+}
+
+/// 状态灯的**显示档位**:[`PaneStatus`] 四态再叠上 `attention` 位,多出第五档
+/// 「等你处理」(授权 / 表单 / 回合因 API 错误结束)。
+///
+/// 第五档不进 [`PaneStatus`]:那是后端与移动端协议的字符串口径(`as_str` / `from_str`),
+/// 加值会让旧手机端认不出;attention 本来就与状态解耦(Codex 的授权请求是
+/// ai-working + attention),在显示这一层叠出来即可。
+///
+/// **声明顺序即显示优先级**(`derive(Ord)`):error > attention > ai-working >
+/// ai-idle > idle —— 与标题栏灯 `TitleBarLight` 同一个「error 在前、attention 次之」。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum StatusLight {
+    #[default]
+    Idle,
+    AiIdle,
+    AiWorking,
+    Attention,
+    Error,
+}
+
+impl StatusLight {
+    /// 一个 pane 的显示档位。attention 只在两个 AI 态上生效:落 error / idle 时
+    /// `update_status_by_pty` 本来就把它清了,这里再兜一层,免得哪条写入口漏清时
+    /// 一个死掉的终端还挂着「等你处理」。
+    pub fn of(status: PaneStatus, attention: bool) -> Self {
+        match status {
+            PaneStatus::Error => Self::Error,
+            PaneStatus::AiIdle | PaneStatus::AiWorking if attention => Self::Attention,
+            PaneStatus::AiWorking => Self::AiWorking,
+            PaneStatus::AiIdle => Self::AiIdle,
+            PaneStatus::Idle => Self::Idle,
+        }
+    }
+
+    /// 「一个 `exit 1` 的 shell 不该亮红点、更不该盖住别处在跑的 AI」那几处聚合用
+    /// (边条全局徽标、终端列表竖条):error 压成 idle 再比。
+    pub fn error_as_idle(self) -> Self {
+        if self == Self::Error {
+            Self::Idle
+        } else {
+            self
+        }
+    }
+}
+
+/// 手上只有四态的调用点(会话列表的「在跑」点等)直接转:不带 attention。
+impl From<PaneStatus> for StatusLight {
+    fn from(status: PaneStatus) -> Self {
+        Self::of(status, false)
     }
 }
 
@@ -141,7 +184,8 @@ pub struct PaneState {
     pub resume_pending: bool,
     /// 后端识别到的会话内 AI 命令名(hook / 输入检测),品牌标识兜底用。
     pub detected_agent: Option<String>,
-    /// 本次 ai-idle 的成因是「需要用户确认」。
+    /// AI 停下来等你处理(授权 / 表单 / 回合因 API 错误结束)。与 `status` 解耦 ——
+    /// Codex 的授权请求是 ai-working + attention;界面上叠成第五档灯,见 [`StatusLight`]。
     pub attention: bool,
     /// shell 通过 OSC 0/2 报上来的窗口标题(已清洗 + 限长),页签副段的来源。
     ///
@@ -207,6 +251,11 @@ impl PaneState {
             .as_ref()
             .and_then(|s| s.agent.as_deref())
             .or(self.detected_agent.as_deref())
+    }
+
+    /// 状态灯画哪一档(四态 + attention,见 [`StatusLight`])。
+    pub fn light(&self) -> StatusLight {
+        StatusLight::of(self.status, self.attention)
     }
 }
 
@@ -308,21 +357,21 @@ impl SplitNode {
         }
     }
 
-    /// 聚合状态(`getHighestStatus`)。
-    pub fn highest_status(&self) -> PaneStatus {
-        match self {
-            Self::Leaf { panes, .. } => panes.iter().fold(PaneStatus::Idle, |acc, p| {
-                if p.status.priority() > acc.priority() {
-                    p.status
-                } else {
-                    acc
-                }
-            }),
-            Self::Split { children, .. } => children.iter().fold(PaneStatus::Idle, |acc, c| {
-                let s = c.highest_status();
-                if s.priority() > acc.priority() { s } else { acc }
-            }),
-        }
+    /// 聚合显示档位(`getHighestStatus` 再加第五档 attention):所有 pane 里最高的一档。
+    pub fn highest_light(&self) -> StatusLight {
+        self.highest_light_by(|light| light)
+    }
+
+    /// [`Self::highest_light`] 的「每个 pane 先过一道映射再比」版。边条全局徽标拿它
+    /// 逐 pane 把 error 压成 idle([`StatusLight::error_as_idle`]):**先聚合再压**的话,
+    /// 同一棵树里一个退出的 shell 与一个在跑的 AI 并存时聚合出 error、压完成了 idle,
+    /// 那个 AI 就被藏掉了。
+    pub fn highest_light_by(&self, map: fn(StatusLight) -> StatusLight) -> StatusLight {
+        let highest = match self {
+            Self::Leaf { panes, .. } => panes.iter().map(|p| map(p.light())).max(),
+            Self::Split { children, .. } => children.iter().map(|c| c.highest_light_by(map)).max(),
+        };
+        highest.unwrap_or_default()
     }
 
     /// 深度优先(左到右)收集所有 pane —— 与屏幕上的排列同序。
@@ -839,6 +888,11 @@ impl SplitNode {
     ///
     /// 回到 idle/error = AI 会话不复存在,连带清掉会话身份与识别到的 agent ——
     /// 否则用户主动退出 claude 之后,下次启动又会被 resume 回来。
+    ///
+    /// 从 AI 态落下来时 OSC 标题一并作废:那多半是 AI 自己写进去的(`✳ Claude Code`
+    /// 之类),会话期间被副段的闸挡着看不见,会话一结束副段回来,不少 shell 又不会
+    /// 自己重设标题 —— 留着就是一条过期的 AI 标题挂在页签上。**只在从 AI 态落下时清**:
+    /// 新 pane 首轮轮询那次 idle → idle 不能把 shell 刚报上来的标题抹掉。
     pub fn update_status_by_pty(
         &mut self,
         pty_id: u32,
@@ -849,6 +903,7 @@ impl SplitNode {
         let Some(pane) = self.pane_by_pty_mut(pty_id) else {
             return false;
         };
+        let was_ai = matches!(pane.status, PaneStatus::AiIdle | PaneStatus::AiWorking);
         pane.status = status;
         pane.attention = attention;
         match status {
@@ -856,6 +911,9 @@ impl SplitNode {
                 pane.ai_session = None;
                 pane.resume_pending = false;
                 pane.detected_agent = None;
+                if was_ai {
+                    pane.osc_title = None;
+                }
             }
             _ => {
                 if let Some(agent) = agent {
@@ -900,7 +958,7 @@ mod tests {
         }
     }
 
-    /// getHighestStatus:error > ai-working > ai-idle > idle,跨层聚合。
+    /// getHighestStatus 加第五档:error > attention > ai-working > ai-idle > idle,跨层聚合。
     #[test]
     fn 状态聚合按优先级取最高() {
         let mut root = leaf("a", 1);
@@ -910,13 +968,57 @@ mod tests {
         let target = root.panes()[0].id.clone();
         assert!(root.insert_split(&target, SplitDirection::Horizontal, leaf("b", 2)));
 
-        assert_eq!(root.highest_status(), PaneStatus::Idle);
+        assert_eq!(root.highest_light(), StatusLight::Idle);
         root.pane_by_pty_mut(2).unwrap().status = PaneStatus::AiIdle;
-        assert_eq!(root.highest_status(), PaneStatus::AiIdle);
+        assert_eq!(root.highest_light(), StatusLight::AiIdle);
         root.pane_by_pty_mut(1).unwrap().status = PaneStatus::AiWorking;
-        assert_eq!(root.highest_status(), PaneStatus::AiWorking);
+        assert_eq!(root.highest_light(), StatusLight::AiWorking);
+        // 另一格在等授权:「等你处理」压过「在跑」
+        root.pane_by_pty_mut(2).unwrap().attention = true;
+        assert_eq!(root.highest_light(), StatusLight::Attention);
         root.pane_by_pty_mut(2).unwrap().status = PaneStatus::Error;
-        assert_eq!(root.highest_status(), PaneStatus::Error);
+        assert_eq!(root.highest_light(), StatusLight::Error);
+    }
+
+    /// 第五档怎么叠出来:attention 只在两个 AI 态上生效,error 永远最高。
+    #[test]
+    fn 显示档位由状态叠_attention_得出() {
+        use PaneStatus::*;
+        let cases = [
+            (Idle, false, StatusLight::Idle),
+            (AiIdle, false, StatusLight::AiIdle),
+            (AiWorking, false, StatusLight::AiWorking),
+            (Error, false, StatusLight::Error),
+            // Claude 等授权 = ai-idle + attention;Codex 等授权 = ai-working + attention
+            (AiIdle, true, StatusLight::Attention),
+            (AiWorking, true, StatusLight::Attention),
+            // 死掉的终端 / 裸 shell 不挂「等你处理」
+            (Error, true, StatusLight::Error),
+            (Idle, true, StatusLight::Idle),
+        ];
+        for (status, attention, expected) in cases {
+            assert_eq!(
+                StatusLight::of(status, attention),
+                expected,
+                "{status:?} + {attention}"
+            );
+        }
+        assert_eq!(
+            StatusLight::from(AiWorking),
+            StatusLight::AiWorking,
+            "四态直转不带 attention"
+        );
+        // 声明序即优先级
+        assert!(StatusLight::Error > StatusLight::Attention);
+        assert!(StatusLight::Attention > StatusLight::AiWorking);
+        assert!(StatusLight::AiWorking > StatusLight::AiIdle);
+        assert!(StatusLight::AiIdle > StatusLight::Idle);
+        // 聚合时压红:只有 error 被压,其余原样
+        assert_eq!(StatusLight::Error.error_as_idle(), StatusLight::Idle);
+        assert_eq!(
+            StatusLight::Attention.error_as_idle(),
+            StatusLight::Attention
+        );
     }
 
     /// insertSplit:命中叶子变成 split,原叶子在第一格,新叶子在第二格,50/50。
@@ -1116,6 +1218,28 @@ mod tests {
         assert_eq!(p.ai_agent(), Some("codex"));
         p.ai_session = None;
         assert_eq!(p.ai_agent(), Some("claude"));
+    }
+
+    /// AI 会话结束时它写进标题的那条随之作废;没进过 AI 的 idle → idle 不动标题。
+    #[test]
+    fn ai_会话结束清掉它写的标题() {
+        let mut root = leaf("a", 1);
+        root.pane_by_pty_mut(1).unwrap().osc_title = Some("~/repo".into());
+        // 新 pane 首轮轮询的 idle → idle:shell 刚报的标题要留着
+        root.update_status_by_pty(1, PaneStatus::Idle, false, None);
+        assert_eq!(
+            root.pane_by_pty(1).unwrap().osc_title.as_deref(),
+            Some("~/repo")
+        );
+
+        root.update_status_by_pty(1, PaneStatus::AiWorking, false, Some("claude"));
+        root.pane_by_pty_mut(1).unwrap().osc_title = Some("✳ Claude Code".into());
+        root.update_status_by_pty(1, PaneStatus::Idle, false, None);
+        assert_eq!(
+            root.pane_by_pty(1).unwrap().osc_title,
+            None,
+            "过期的 AI 标题不留"
+        );
     }
 
     /// attention 与状态解耦:codex 的 PermissionRequest 状态是 ai-working 但要点黄灯。

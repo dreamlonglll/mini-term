@@ -23,7 +23,8 @@
 //! - **降级结论必须落盘**:用户打断([`hook_server::note_user_interrupt`])与停摆
 //!   兜底(`monitor::stall_settle_target`,10s 双静默)得出的结论要写回 hook 状态,
 //!   触发一次即收敛。v0.9.3 那版无记忆兜底会让假完成每 20~50s 重复播报 —— 这条
-//!   铁律不能丢失。
+//!   铁律不能丢失。无 hook 的降级路径同理:完成只认「用户提交过的回合」的第一个
+//!   下降沿([`SessionTracker::take_turn`] 那道回合闩),其余下降沿带 `Quiet`。
 //! - **正等用户批准的 pane 豁免停摆兜底**(上次 cause 属 attention 类,如 Codex 的
 //!   `PermissionRequest`),否则黄灯会被抹掉。
 //! - **Grok 的两处结构性差异**见 [`hook_registry`] 的模块注释:
