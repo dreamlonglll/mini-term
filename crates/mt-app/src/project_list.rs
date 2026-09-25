@@ -64,7 +64,7 @@ use crate::modal;
 use crate::pane_preview::{self, MiniLayout};
 use crate::project_tree::{self, MAX_DEPTH, OrderedItem};
 use crate::store::{AppStore, StoreEvent};
-use crate::tree::PaneStatus;
+use crate::tree::StatusLight;
 use crate::ui;
 
 /// AI 品牌图标尺寸(`ProjectList.tsx:144` 的 `AI_ICON_SIZE`)。
@@ -296,11 +296,18 @@ fn remote_badge_chip(id: &str, remote: RemoteBadge) -> gpui::Stateful<gpui::Div>
 }
 
 /// 完成标 / 状态灯二选一,**idle 且没有完成标时两个都不画**(原版 `ProjectList.tsx:912`)。
-fn row_status_mark(show_done_tag: bool, done_tag_in: f32, status: PaneStatus) -> Option<AnyElement> {
+///
+/// 灯按显示档位画(含第五档「等你处理」):项目里有 pane 在等授权,行上就是叹号 ——
+/// 标题栏那颗全局灯撤掉之后,跨项目找「谁在等我」主要就看这一列。
+fn row_status_mark(
+    show_done_tag: bool,
+    done_tag_in: f32,
+    light: StatusLight,
+) -> Option<AnyElement> {
     if show_done_tag {
         Some(done_tag(done_tag_in))
-    } else if status != PaneStatus::Idle {
-        Some(ui::status_dot(status).into_any_element())
+    } else if light != StatusLight::Idle {
+        Some(ui::status_dot(light).into_any_element())
     } else {
         None
     }
@@ -468,7 +475,8 @@ struct Row {
     id: String,
     name: String,
     path: String,
-    status: PaneStatus,
+    /// 项目聚合的状态灯档位(含第五档 attention)。
+    light: StatusLight,
     /// 非激活项目里有 AI 任务完成(行尾那颗绿点)。
     needs_attention: bool,
     /// 领位图标的技术栈;`None` = 走通用目录图标。
@@ -2193,9 +2201,7 @@ impl ProjectList {
                         id: p.id.clone(),
                         name: p.name.clone(),
                         path: p.path.clone(),
-                        status: state
-                            .map(|s| s.highest_status())
-                            .unwrap_or(PaneStatus::Idle),
+                        light: state.map(|s| s.highest_light()).unwrap_or_default(),
                         needs_attention: state.map(|s| s.needs_attention).unwrap_or(false),
                         kind: resolve_project_kind(p.kind_override.as_deref(), detected_kind),
                         detected_kind,
@@ -2574,7 +2580,7 @@ impl ProjectList {
     ) -> AnyElement {
         let Row {
             ref id,
-            status,
+            light,
             needs_attention,
             kind,
             is_child,
@@ -2634,7 +2640,7 @@ impl ProjectList {
             // 位置照原版 —— worktree 徽章之后、完成标/状态灯之前
             .children(remote.map(|remote| remote_badge_chip(&row.id, remote)))
             // 完成标 / 状态灯二选一,**idle 时两个都不画**
-            .children(row_status_mark(show_done_tag, done_tag_in, status))
+            .children(row_status_mark(show_done_tag, done_tag_in, light))
             // 移除:弹确认框(不可逆,布局与展开目录一起没)。只在行悬停时出现
             .children(hovered.then(|| self.project_remove_button(&row.id, cx)));
 

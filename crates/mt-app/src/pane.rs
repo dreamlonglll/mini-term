@@ -89,6 +89,9 @@ use crate::toast;
 pub enum PaneEvent {
     /// 子进程退出(退出码取不到为 `None`)。
     Exited(Option<u32>),
+    /// PTY 没能起来(预检失败 / spawn 失败)。pane 里画一行红字之外,store 据此把
+    /// pane 落 error,页签与项目行才看得出是哪个终端坏了。已关闭的 pane 不发。
+    SpawnFailed,
     /// 用户往这个 pane 里键入了东西 —— store 据此清掉 attention 黄灯
     /// (旧版 `clearPaneAttentionByPty`:键入即视为「已在处理待确认事项」)。
     UserInput,
@@ -519,7 +522,8 @@ impl TerminalPane {
     ///
     /// 成功:回填(补 resize → 按序冲刷空窗期的写入,见 [`PtySlot::backfill`])→
     /// WSL 提示 → 答复等回执的人 → 交还续接反查所得的 cwd → 补报空窗期挂着的退出。
-    /// 失败:落 `spawn_error` 画一行红字(与此前同步起失败同一效果)。
+    /// 失败:落 `spawn_error` 画一行红字(与此前同步起失败同一效果),并发
+    /// [`PaneEvent::SpawnFailed`] 让页签亮红叉。
     /// 回填前 pane 已关闭(`shutdown` 过):会话退回来当场丢弃(= kill),什么都不报。
     fn finish_spawn(&mut self, outcome: SpawnOutcome, cx: &mut Context<Self>) {
         let SpawnOutcome {
@@ -566,6 +570,7 @@ impl TerminalPane {
                 }
                 self.spawn_error = Some(msg);
                 self.settle_spawn_waiters(false);
+                cx.emit(PaneEvent::SpawnFailed);
                 None
             }
         };

@@ -1389,7 +1389,7 @@ impl Render for Workspace {
                 store.terminals_panel_visible(),
                 store.right_drawer_width(),
                 store.unread_done_count(),
-                store.global_ai_status(),
+                store.global_ai_light(),
                 store.background_art().cloned(),
             )
         };
@@ -1600,10 +1600,11 @@ impl Render for Workspace {
                     Self::activity_bar_item_hover_listener("toggle-middle", cx),
                 )
                 // 全局 AI 状态徽标挂在这颗按钮上(中间栏承载项目列表)。
-                // 口径与原版一致:只反映 AI 状态,**error 不往上冒** ——
-                // 某个 shell `exit 1` 不该让整条边栏亮红点、盖住真在跑的 AI。
-                // 徽标本体(含 ai-working 档的闪烁)在 `activity_bar::status_badge`。
-                .when(global_status != crate::tree::PaneStatus::Idle, |el| {
+                // 口径与原版一致:只反映 AI 状态(含第五档「等你处理」),
+                // **error 不往上冒** —— 某个 shell `exit 1` 不该让整条边栏亮红点、
+                // 盖住真在跑的 AI。徽标本体(含 ai-working 档的闪烁)在
+                // `activity_bar::status_badge`。
+                .when(global_status != crate::tree::StatusLight::Idle, |el| {
                     el.child(activity_bar::status_badge(global_status))
                 })
                 .on_click(cx.listener(|this, _event, _window, cx| {

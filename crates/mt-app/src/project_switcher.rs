@@ -37,7 +37,7 @@ use crate::i18n::t;
 use crate::overlay::kind;
 use crate::prompt::{autofocus, close_guarded, open_guarded};
 use crate::store::AppStore;
-use crate::tree::PaneStatus;
+use crate::tree::StatusLight;
 use crate::ui;
 
 actions!(
@@ -65,7 +65,8 @@ struct Row {
     name: String,
     path: String,
     group_path: Vec<String>,
-    status: PaneStatus,
+    /// 项目聚合的状态灯档位(含第五档 attention,与项目列表同口径)。
+    light: StatusLight,
     needs_attention: bool,
     /// 名字上的命中字符下标(**char** 口径);分组路径命中时为空 —— 与原版一致
     /// (`fuzzyMatch(path)` 命中时不高亮名字)。
@@ -170,9 +171,7 @@ impl ProjectSwitcher {
                     name: project.name.clone(),
                     path: project.path.clone(),
                     group_path,
-                    status: state
-                        .map(|s| s.highest_status())
-                        .unwrap_or(PaneStatus::Idle),
+                    light: state.map(|s| s.highest_light()).unwrap_or_default(),
                     needs_attention: state.is_some_and(|s| s.needs_attention),
                     hits: Vec::new(),
                 })
@@ -447,8 +446,8 @@ impl Render for ProjectSwitcher {
                                 .child(t("panels", "done")),
                         )
                     })
-                    .when(row.status != PaneStatus::Idle, |el| {
-                        el.child(div().flex_none().child(ui::status_dot(row.status)))
+                    .when(row.light != StatusLight::Idle, |el| {
+                        el.child(div().flex_none().child(ui::status_dot(row.light)))
                     }),
             );
         }
@@ -525,7 +524,7 @@ mod tests {
             name: name.to_string(),
             path: "/tmp".into(),
             group_path: group.iter().map(|s| s.to_string()).collect(),
-            status: PaneStatus::Idle,
+            light: StatusLight::Idle,
             needs_attention: false,
             hits: Vec::new(),
         };

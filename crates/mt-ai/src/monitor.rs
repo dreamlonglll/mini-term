@@ -89,6 +89,10 @@ const AI_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 const STALL_CAUSE: &str = "Stall";
 /// 停摆 + 此前已触发过退出 → 判定 AI 已经退出，回落 idle（见 `stall_settle_target`）
 const STALL_EXIT_CAUSE: &str = "StallExit";
+/// 降级路径上**不是完成**的下降沿带的成因:这一回合没人提交过(TUI 空闲期的零星
+/// 重绘把状态抬起又落下)。不是 `Stop`,UI 的完成判据认不出;也不在 attention 名单里。
+/// 见 [`fallback_edge_cause`]。
+const QUIET_CAUSE: &str = "Quiet";
 
 /// 状态变化的统一发射器：monitor 轮询与 hook server 直推
 /// 共用同一份"上次发出的状态"去重表。
@@ -163,6 +167,14 @@ impl StatusEmitter {
             .lock()
             .get(&pty_id)
             .and_then(|(_, cause)| cause.clone())
+    }
+
+    /// 上次发给 UI 的状态。降级路径据此认出「这一次是下降沿」(见 [`fallback_edge_cause`])。
+    pub(crate) fn last_status(&self, pty_id: u32) -> Option<String> {
+        self.prev
+            .lock()
+            .get(&pty_id)
+            .map(|(status, _)| status.clone())
     }
 
     /// 清掉已不存在的 pty 的去重记录
@@ -321,6 +333,63 @@ fn settle_stalled_ai(
     );
 }
 
+/// 降级路径(pane 没有 hook)这一轮发射要带的成因。`None` 以外只有一种:[`QUIET_CAUSE`]。
+///
+/// 降级路径没有回合概念,下降沿(ai-working → ai-idle)是它唯一的完成信号 —— 可 TUI
+/// 空闲期的零星重绘同样会抬起一次 ai-working、3s 后落下,每一个下降沿都被当成完成
+/// 播报(v0.9.3 在 hook 路径上根治过的同一个现象:以伪输出间隔为周期的假完成)。
+/// 降级路径用同一条铁律补上 —— **结论落盘**:用户在 AI 会话里提交一行才给这个 pane
+/// 上回合闩([`SessionTracker::take_turn`]),这一回合第一个下降沿按老口径不带成因
+/// (UI 认作完成)并摘闩;之后的下降沿、没人提交过的下降沿一律带 `Quiet`。一回合
+/// 至多播报一次,伪输出再怎么脉冲也不会重复。
+///
+/// 只动下降沿那一拍;其余情形(hook 已启用、不是 ai-idle、上一拍不是 ai-working)照旧
+/// 不带成因,与 [`StatusEmitter::emit_if_changed`] 的「同状态无成因不重发」配合不变。
+fn fallback_edge_cause(
+    hook_state: &HookState,
+    tracker: &SessionTracker,
+    emitter: &StatusEmitter,
+    pty_id: u32,
+    status: &str,
+) -> Option<&'static str> {
+    if hook_state.is_hook_enabled(pty_id) || status != "ai-idle" {
+        return None;
+    }
+    if emitter.last_status(pty_id).as_deref() != Some("ai-working") {
+        return None;
+    }
+    if tracker.take_turn(pty_id) {
+        None
+    } else {
+        Some(QUIET_CAUSE)
+    }
+}
+
+/// monitor 每一轮对单个 pane 做的全部事:停摆收敛 → 判定 → 发射。
+fn poll_pane(
+    hook_state: &HookState,
+    tracker: &SessionTracker,
+    emitter: &StatusEmitter,
+    pty_id: u32,
+) {
+    // 停摆收敛会改写 hook 状态，与 server 启停串行化；状态判定本身在
+    // 锁外。server 没起来**不是**跳过收敛的理由：判据是 pane 自己的
+    // hook 记录，AI 跑着时把 hook 开关关掉的 pane 照样得能被拉回来。
+    // 顺序不能颠倒：收敛命中时下面这次 emit 值已相同，会被去重吞掉，
+    // 上层只收到 settle 发出的那条带成因的。
+    hook_state.with_server_lock(|| {
+        settle_stalled_ai(hook_state, tracker, emitter, pty_id);
+    });
+    let status = resolve_status(hook_state, tracker, pty_id);
+    let agent = if status.starts_with("ai-") {
+        tracker.ai_session_agent(pty_id)
+    } else {
+        None
+    };
+    let cause = fallback_edge_cause(hook_state, tracker, emitter, pty_id, &status);
+    emitter.emit_if_changed(pty_id, &status, cause, agent);
+}
+
 /// 活着的 pane id 列表。原实现直接问 `PtyManager::get_pty_ids()`;本 crate 不认识
 /// PTY,由上层注入(mt-ai 不依赖 mt-pty 是迁移契约里的硬约束)。
 pub type PaneListFn = Box<dyn Fn() -> Vec<u32> + Send>;
@@ -336,21 +405,7 @@ pub fn start_monitor(
             let pty_ids = live_panes();
 
             for pty_id in &pty_ids {
-                // 停摆收敛会改写 hook 状态，与 server 启停串行化；状态判定本身在
-                // 锁外。server 没起来**不是**跳过收敛的理由：判据是 pane 自己的
-                // hook 记录，AI 跑着时把 hook 开关关掉的 pane 照样得能被拉回来。
-                // 顺序不能颠倒：收敛命中时下面这次 emit 值已相同，会被去重吞掉，
-                // 上层只收到 settle 发出的那条带成因的。
-                hook_state.with_server_lock(|| {
-                    settle_stalled_ai(&hook_state, &tracker, &emitter, *pty_id);
-                });
-                let status = resolve_status(&hook_state, &tracker, *pty_id);
-                let agent = if status.starts_with("ai-") {
-                    tracker.ai_session_agent(*pty_id)
-                } else {
-                    None
-                };
-                emitter.emit_if_changed(*pty_id, &status, None, agent);
+                poll_pane(&hook_state, &tracker, &emitter, *pty_id);
             }
 
             emitter.retain(&pty_ids);
@@ -678,7 +733,7 @@ mod tests {
     /// `utils/aiCompletion.ts` 的同名断言互为镜像。
     #[test]
     fn stall_causes_are_neither_completion_nor_attention() {
-        for cause in [STALL_CAUSE, STALL_EXIT_CAUSE] {
+        for cause in [STALL_CAUSE, STALL_EXIT_CAUSE, QUIET_CAUSE] {
             assert_ne!(cause, "Stop", "兜底不得伪装成完成事件");
             assert!(
                 !crate::hook_server::is_attention_cause(cause),
@@ -728,7 +783,111 @@ mod tests {
         let emitter = StatusEmitter::new(Arc::new(|_: StatusChange| {}));
         emitter.emit_if_changed(1, "ai-idle", Some("Stop"), None);
         assert_eq!(emitter.last_cause(1).as_deref(), Some("Stop"));
+        assert_eq!(emitter.last_status(1).as_deref(), Some("ai-idle"));
         emitter.retain(&[2]);
         assert_eq!(emitter.last_cause(1), None);
+        assert_eq!(emitter.last_status(1), None);
+    }
+
+    // ---- 降级路径的回合闩(fallback_edge_cause)----
+
+    type Seen = Arc<Mutex<Vec<(String, Option<String>)>>>;
+
+    fn collecting_emitter() -> (StatusEmitter, Seen) {
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let sink_seen = seen.clone();
+        let emitter = StatusEmitter::new(Arc::new(move |c: StatusChange| {
+            sink_seen.lock().push((c.status, c.cause));
+        }));
+        (emitter, seen)
+    }
+
+    fn change(status: &str, cause: Option<&str>) -> (String, Option<String>) {
+        (status.to_string(), cause.map(str::to_string))
+    }
+
+    /// 无 hook 的 pane:只有用户提交过的那一回合,下降沿才按完成(不带成因)发;
+    /// 没人提交过的下降沿(启动 banner、空闲期零星重绘)一律带 `Quiet` ——
+    /// 回合闩取走即清,同一回合的第二个下降沿也是 `Quiet`。
+    #[test]
+    fn fallback_only_reports_completion_once_per_submitted_turn() {
+        let (emitter, seen) = collecting_emitter();
+        let hooks = HookState::new();
+        let mgr = SessionTracker::new();
+
+        mgr.track_input(1, "claude\r");
+        poll_pane(&hooks, &mgr, &emitter, 1); // 进会话:ai-idle
+        mgr.note_output_for_test(1); // 启动 banner
+        poll_pane(&hooks, &mgr, &emitter, 1);
+        mgr.expire_output_for_test(1);
+        poll_pane(&hooks, &mgr, &emitter, 1); // 没人提交过 → Quiet
+
+        mgr.track_input(1, "fix the bug\r"); // 开一个回合
+        mgr.note_output_for_test(1);
+        poll_pane(&hooks, &mgr, &emitter, 1);
+        mgr.expire_output_for_test(1);
+        poll_pane(&hooks, &mgr, &emitter, 1); // 这一回合的收尾 → 完成
+        poll_pane(&hooks, &mgr, &emitter, 1); // 静置:同状态无成因,不重发
+
+        mgr.note_output_for_test(1); // 空闲期的零星重绘
+        poll_pane(&hooks, &mgr, &emitter, 1);
+        mgr.expire_output_for_test(1);
+        poll_pane(&hooks, &mgr, &emitter, 1); // 闩已取走 → Quiet,不再播报
+
+        assert_eq!(
+            seen.lock().clone(),
+            vec![
+                change("ai-idle", None),
+                change("ai-working", None),
+                change("ai-idle", Some(QUIET_CAUSE)),
+                change("ai-working", None),
+                change("ai-idle", None),
+                change("ai-working", None),
+                change("ai-idle", Some(QUIET_CAUSE)),
+            ]
+        );
+    }
+
+    /// 回合中途被打断(裸 Esc / Ctrl+C):这一回合不算做完,收尾的下降沿带 `Quiet`。
+    #[test]
+    fn fallback_interrupted_turn_is_not_a_completion() {
+        let (emitter, seen) = collecting_emitter();
+        let hooks = HookState::new();
+        let mgr = SessionTracker::new();
+
+        mgr.track_input(1, "codex\r");
+        mgr.track_input(1, "run the tests\r");
+        mgr.note_output_for_test(1);
+        poll_pane(&hooks, &mgr, &emitter, 1);
+        mgr.track_input(1, "\x1b"); // 打断
+        mgr.expire_output_for_test(1);
+        poll_pane(&hooks, &mgr, &emitter, 1);
+
+        assert_eq!(
+            seen.lock().last().cloned(),
+            Some(change("ai-idle", Some(QUIET_CAUSE)))
+        );
+    }
+
+    /// hook 已启用的 pane 不走回合闩:下降沿由 hook 事件(Stop)说了算,
+    /// monitor 这一路照旧不带成因、也不去动闩。
+    #[test]
+    fn hook_panes_are_untouched_by_the_turn_latch() {
+        let (emitter, seen) = collecting_emitter();
+        let hooks = HookState::new();
+        let mgr = SessionTracker::new();
+
+        mgr.track_input(1, "claude\r");
+        mgr.track_input(1, "fix the bug\r");
+        hooks.update(1, "ai-working".to_string());
+        poll_pane(&hooks, &mgr, &emitter, 1);
+        hooks.update(1, "ai-idle".to_string());
+        poll_pane(&hooks, &mgr, &emitter, 1);
+
+        assert_eq!(
+            seen.lock().clone(),
+            vec![change("ai-working", None), change("ai-idle", None)]
+        );
+        assert!(mgr.is_turn_armed(1), "hook pane 的闩原样留着,monitor 不取");
     }
 }

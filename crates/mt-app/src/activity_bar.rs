@@ -31,7 +31,7 @@ use gpui::{
 use gpui_component::ActiveTheme as _;
 use mt_ui::icons::{Geom, Ink, Shape, StatusDot, StatusKind, VectorIcon};
 
-use crate::tree::PaneStatus;
+use crate::tree::StatusLight;
 use crate::ui;
 
 /// 边条宽度。原版 `style={{ width: 44 }}`。
@@ -619,10 +619,13 @@ where
 ///
 /// ⚠️ 闪烁过 [`crate::motion`] 的闸:原版 reduce 段的通配规则把 `.animate-blink`
 /// 停在第一帧(它**不在**豁免名单里),用户机器上装机版就是不闪的。
-pub fn status_badge(status: PaneStatus) -> AnyElement {
+///
+/// 档位含第五档「等你处理」:颜色走 [`ui::status_color`] 的 attention 色,**不闪** ——
+/// 等人的状态靠颜色说话,与状态灯本体静止的口径一致。
+pub fn status_badge(light: StatusLight) -> AnyElement {
     CornerDot {
-        color: ui::status_color(status),
-        blinking: badge_blinks(status),
+        color: ui::status_color(light),
+        blinking: badge_blinks(light),
     }
     .into_any_element()
 }
@@ -689,8 +692,8 @@ fn blink_dot_frame(phase: f32) -> (f32, f32, f32) {
 const BLINK_PERIOD: std::time::Duration = std::time::Duration::from_millis(800);
 
 /// 这一档该不该闪。**纯判定**,单测钉在这上面。
-pub fn badge_blinks(status: PaneStatus) -> bool {
-    status == PaneStatus::AiWorking && mt_ui::motion::blinks()
+pub fn badge_blinks(light: StatusLight) -> bool {
+    light == StatusLight::AiWorking && mt_ui::motion::blinks()
 }
 
 /// 「有新版本」那颗圆点该不该闪。与 AI 徽标**不同档**:原版这颗恒带
@@ -841,17 +844,23 @@ mod tests {
     #[test]
     fn 徽标只在跑起来时闪且过减弱动效的闸() {
         crate::motion::with_reduce(false, || {
-            assert!(badge_blinks(PaneStatus::AiWorking));
-            for s in [PaneStatus::Idle, PaneStatus::AiIdle, PaneStatus::Error] {
+            assert!(badge_blinks(StatusLight::AiWorking));
+            for s in [
+                StatusLight::Idle,
+                StatusLight::AiIdle,
+                StatusLight::Attention,
+                StatusLight::Error,
+            ] {
                 assert!(!badge_blinks(s), "{s:?} 不该闪");
             }
         });
         crate::motion::with_reduce(true, || {
             for s in [
-                PaneStatus::Idle,
-                PaneStatus::AiIdle,
-                PaneStatus::AiWorking,
-                PaneStatus::Error,
+                StatusLight::Idle,
+                StatusLight::AiIdle,
+                StatusLight::AiWorking,
+                StatusLight::Attention,
+                StatusLight::Error,
             ] {
                 assert!(!badge_blinks(s), "减弱动效下 {s:?} 一律不闪");
             }

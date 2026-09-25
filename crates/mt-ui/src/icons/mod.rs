@@ -11,7 +11,7 @@
 //! │             (`ProjectKind` 枚举与菜单分组同出该生成器,住在 `mt_project::project_kind`)
 //! ├── file      文件树图标的查表规则与 Element(fileIcon.ts / FileTree.tsx)
 //! ├── file_art  ↑ 用的 263 枚官方图形状表 —— **生成物**,见 tools/gen_file_icons.mjs
-//! ├── status    四态状态灯 + spinner 旋转(StatusDot.tsx)
+//! ├── status    五态状态灯 + spinner 旋转(StatusDot.tsx 四态 + attention)
 //! ├── shell     shell 图标(pwsh/cmd/bash/…)—— idle 态的 tab 上顶替状态灯
 //! └── usage_glyphs  用量面板 KPI 六枚图标的形状表(KpiCards.tsx)
 //! ```

@@ -27,15 +27,15 @@
 //! | 面板与分屏树、pane 增删、PTY 绑定与回收、活动面板 / tab、最大化、面板名 | [`LayoutChanged`] |
 //! | **全部项目的 pane 集合** | [`LayoutChanged`] + [`ProjectsChanged`](删项目连 pane 一起没) |
 //! | `focused_pane_id` | [`FocusedPaneChanged`] |
-//! | pane 的 `status` / `attention` / 检测到的 agent | [`PaneStatusChanged`](补 PTY 时把起不来的 pane 标 error、重连回落 idle 这两处与 [`LayoutChanged`] 同发) |
+//! | pane 的 `status` / `attention` / 检测到的 agent | [`PaneStatusChanged`](补 PTY 时把起不来的 pane 标 error、重连回落 idle 这两处与 [`LayoutChanged`] 同发;PTY 退出 / 起不来落 error 也是它) |
 //! | 项目行完成提示点(`needs_attention`) | [`PaneStatusChanged`](置位)、[`ActiveProjectChanged`](切过去即清) |
 //! | PTY 退出登记(「已断开」遮罩) | [`PaneStatusChanged`](登记)、[`LayoutChanged`] / [`ProjectsChanged`](随 pane 回收) |
 //! | pane 的 AI 会话身份 | [`PaneSessionChanged`] |
 //! | pane 的续接标记(`resume_pending`) | [`PaneSessionChanged`](身份写入时清)、[`LayoutChanged`](补 PTY 写续接命令时清) |
-//! | pane 的 OSC 标题(页签副段) | [`PaneTitleChanged`] |
+//! | pane 的 OSC 标题(页签副段) | [`PaneTitleChanged`](只在**看得见的副段**变了才发;AI 在场时 spinner 写进标题这类看不见的变化只存不发) |
 //! | pane 的自定义名 | [`PaneRenamed`] |
 //! | AI 任务标记(⚑) | [`MarkersChanged`];随 pane 回收一并清掉时是 [`LayoutChanged`] / [`ProjectsChanged`] |
-//! | 完成账本(未读 / 完成序) | [`PaneStatusChanged`]、[`LayoutChanged`] / [`ProjectsChanged`](剔除已关 pane)、[`WindowFocusChanged`](聚焦即已读)、[`DoneChanged`](手动清) |
+//! | 完成账本(未读 / 未看 / 完成序) | [`PaneStatusChanged`]、[`LayoutChanged`] / [`ProjectsChanged`](剔除已关 pane)、[`WindowFocusChanged`](聚焦即已读,顺带焦点 pane 算看过)、[`FocusedPaneChanged`](焦点给到谁谁就算看过,页签绿点熄灭;只有渲染读它)、[`DoneChanged`](手动清) |
 //! | 主窗口聚焦 | [`WindowFocusChanged`] |
 //! | 目录技术栈缓存 | [`DirKindsChanged`] |
 //! | 文件树展开态 | [`ExpandedDirsChanged`] |

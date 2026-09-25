@@ -33,7 +33,7 @@ use mt_ui::icons::{StatusDot, StatusKind};
 use mt_ui::rgb8;
 use mt_ui::theme_bridge::{AppliedThemePack, ThemeSlot};
 
-use crate::tree::PaneStatus;
+use crate::tree::StatusLight;
 
 /// 壳的配色 token 表(对应 `styles.css` 的一组 CSS 变量)。
 #[derive(Clone, Debug, PartialEq)]
@@ -63,6 +63,13 @@ pub struct Palette {
     pub color_error: Hsla,
     pub color_warning: Hsla,
     pub color_ai_working: Hsla,
+    /// 状态灯第五档「等你处理」(授权 / 表单 / API 出错结束回合)的颜色。原版没有
+    /// 这个变量(原版只在托盘和标题栏灯上亮黄灯),主题包**不映射**它,恒用内置值。
+    ///
+    /// 取色的唯一约束是**同一套外观里与 `color_ai_working` 拉开**:暗色的 ai-working
+    /// 是亮黄、warning 是暗金,两者挤在一起,于是暗色取橙;亮色的 ai-working 本身是
+    /// 橙红,于是亮色取金(与 warning 同值)。形状上还有叹号兜底(见 mt-ui 的 `StatusKind`)。
+    pub color_attention: Hsla,
     pub color_folder: Hsla,
     pub color_file: Hsla,
     pub color_info: Hsla,
@@ -128,6 +135,7 @@ impl Palette {
             color_error: rgb8(0xd4, 0x60, 0x5a),
             color_warning: rgb8(0xd4, 0xa8, 0x4a),
             color_ai_working: rgb8(0xf5, 0xc5, 0x18),
+            color_attention: rgb8(0xf0, 0x88, 0x3e),
             color_folder: rgb8(0xd4, 0xc8, 0xa0),
             color_file: rgb8(0x7d, 0xcf, 0xb8),
             color_info: rgb8(0x6a, 0x9f, 0xd4),
@@ -183,6 +191,7 @@ impl Palette {
             color_error: rgb8(0xc0, 0x39, 0x2b),
             color_warning: rgb8(0xb0, 0x86, 0x20),
             color_ai_working: rgb8(0xc4, 0x52, 0x1a),
+            color_attention: rgb8(0xb0, 0x86, 0x20),
             color_folder: rgb8(0x8a, 0x7a, 0x40),
             color_file: rgb8(0x1a, 0x8a, 0x6a),
             color_info: rgb8(0x28, 0x60, 0xa0),
@@ -209,8 +218,8 @@ impl Palette {
     /// 10 个语义色、`surface_opacity`(面板半透明度,无背景图时是 1.0)、
     /// 终端背景色(已含 `terminalOpacity`)。
     ///
-    /// 包里没有的语义色(error / ai-working / folder / file)保留该明暗的内置值 ——
-    /// 前端同样不映射它们。`accentAlt` 在前端归到 `--color-warning`(见
+    /// 包里没有的语义色(error / ai-working / attention / folder / file)保留该明暗的
+    /// 内置值 —— 前端同样不映射它们(attention 是 GPUI 版新增的,原版无此变量)。`accentAlt` 在前端归到 `--color-warning`(见
     /// `themePackManager.ts` 的 `map['--color-warning'] = c.accentAlt`),P 批补上
     /// 这一格之后照着映;包里没声明就退回该明暗的内置值。
     pub fn from_pack(applied: &AppliedThemePack) -> Self {
@@ -478,6 +487,10 @@ pub fn color_warning() -> Hsla {
 /// `--color-ai-working`
 pub fn color_ai_working() -> Hsla {
     token(|p| p.color_ai_working)
+}
+/// 状态灯第五档「等你处理」(见 [`Palette::color_attention`])
+pub fn color_attention() -> Hsla {
+    token(|p| p.color_attention)
 }
 
 /// 乘性改 alpha 的公开入口(`bg-[var(--x)]/30` 那种写法的对应物)。
@@ -1050,36 +1063,49 @@ impl RenderOnce for Spinner {
     }
 }
 
-/// 状态灯的颜色(对齐 `src/components/StatusDot.tsx` 的 `STATUS_COLORS`)。
-pub fn status_color(status: PaneStatus) -> Hsla {
-    match status {
-        PaneStatus::Idle => text_muted(),
-        PaneStatus::AiIdle => color_success(),
-        PaneStatus::AiWorking => color_ai_working(),
-        PaneStatus::Error => color_error(),
+/// 状态灯的颜色(前四档对齐 `src/components/StatusDot.tsx` 的 `STATUS_COLORS`,
+/// 第五档 attention 用 [`color_attention`])。
+///
+/// 收 `impl Into<StatusLight>`:手上只有四态的调用点照旧直接传 `PaneStatus`。
+pub fn status_color(light: impl Into<StatusLight>) -> Hsla {
+    match light.into() {
+        StatusLight::Idle => text_muted(),
+        StatusLight::AiIdle => color_success(),
+        StatusLight::AiWorking => color_ai_working(),
+        StatusLight::Attention => color_attention(),
+        StatusLight::Error => color_error(),
     }
 }
 
-/// 四态状态灯([`mt_ui::icons::StatusDot`])。
+/// 显示档位 → mt-ui 的灯形。`StatusLight` 住在 mt-app(tree.rs),mt-ui 不能反向
+/// 依赖,所以在这里转一次;自己拼 `StatusDot` 的调用点(会话列表)也走这里。
+pub fn status_kind(light: impl Into<StatusLight>) -> StatusKind {
+    match light.into() {
+        StatusLight::Idle => StatusKind::Idle,
+        StatusLight::AiIdle => StatusKind::AiIdle,
+        StatusLight::AiWorking => StatusKind::AiWorking,
+        StatusLight::Attention => StatusKind::Attention,
+        StatusLight::Error => StatusKind::Error,
+    }
+}
+
+/// 五态状态灯([`mt_ui::icons::StatusDot`])。
 ///
-/// 形状 + 颜色双编码(空心圈 / 实心带勾 / 底环+亮弧 / 实心带叉),`ai-working`
-/// 那段弧 900ms 转一圈 —— 几何与动画都在 mt-ui 侧照抄原版 `StatusDot.tsx`,
-/// 这里只做两件事:`PaneStatus → StatusKind` 的转换,以及把壳的配色表喂进去
-/// (勾/叉是**挖空**语义,`contrast` 必须给面板底色,换主题包时跟着变)。
+/// 形状 + 颜色双编码(空心圈 / 实心带勾 / 底环+亮弧 / 实心带叹号 / 实心带叉),
+/// `ai-working` 那段弧 900ms 转一圈 —— 前四态的几何与动画在 mt-ui 侧照抄原版
+/// `StatusDot.tsx`,这里只做两件事:档位 → `StatusKind` 的转换,以及把壳的配色表
+/// 喂进去(勾/叉/叹号是**挖空**语义,`contrast` 必须给面板底色,换主题包时跟着变)。
+///
+/// 传 `pane.light()`(带 attention)还是 `pane.status`(只有四态)由调用点定:
+/// 能拿到 pane 的一律传前者,否则「等你处理」又会被画成绿勾或转圈。
 ///
 /// 旋转相位来自进程级墙钟(`mt_ui::motion::pulse_phase`),没有逐元素状态,
 /// 所以不需要 id;同状态的多颗灯天然同相。
-pub fn status_dot(status: PaneStatus) -> impl IntoElement {
-    // PaneStatus 住在 mt-app(tree.rs),mt-ui 不能反向依赖,所以在这里转一次
-    let kind = match status {
-        PaneStatus::Idle => StatusKind::Idle,
-        PaneStatus::AiIdle => StatusKind::AiIdle,
-        PaneStatus::AiWorking => StatusKind::AiWorking,
-        PaneStatus::Error => StatusKind::Error,
-    };
-    StatusDot::new(kind)
+pub fn status_dot(light: impl Into<StatusLight>) -> impl IntoElement {
+    let light = light.into();
+    StatusDot::new(status_kind(light))
         .size(px(11.0))
-        .color(status_color(status))
+        .color(status_color(light))
         .contrast(bg_elevated())
 }
 

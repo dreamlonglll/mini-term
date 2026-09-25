@@ -40,7 +40,7 @@ use mt_ui::{MiniTerminalElement, TerminalStyle, TerminalTheme};
 
 use crate::i18n::t;
 use crate::store::AppStore;
-use crate::tree::{PaneState, PaneStatus, SplitDirection, SplitNode};
+use crate::tree::{PaneState, SplitDirection, SplitNode, StatusLight};
 use crate::ui;
 
 /// 悬停到弹出的延迟(`ProjectList.tsx:472` / `PaneGroup.tsx:254` 的 250ms)。
@@ -74,15 +74,12 @@ pub fn has_ai_pane(layout: Option<&SplitNode>, auto_resume: bool) -> bool {
         .unwrap_or(false)
 }
 
-/// 隐藏 tab 里最要紧的状态(`ProjectPanePreview.tsx:89-91`)。
+/// 隐藏 tab 里最要紧的一档(`ProjectPanePreview.tsx:89-91`)。
 ///
-/// 口径限于 [`PaneStatus`] —— 真正的「等确认」是 `pane.attention`,不在
-/// `PaneStatus` 编码内,这里同样看不到(与 tab 栏现有行为一致)。
-pub fn hidden_top_status(hidden: &[&PaneState]) -> Option<PaneStatus> {
-    hidden
-        .iter()
-        .max_by_key(|p| p.status.priority())
-        .map(|p| p.status)
+/// 按显示档位取最高([`StatusLight`],含第五档「等你处理」)—— 与 tab 栏同一把尺子:
+/// 隐藏 tab 里有个在等授权的,徽章上就该是叹号,而不是绿勾或转圈。
+pub fn hidden_top_status(hidden: &[&PaneState]) -> Option<StatusLight> {
+    hidden.iter().map(|p| p.light()).max()
 }
 
 /// 按比例把主轴长度分给子节点(原版的 `flexGrow: sizes[i]` + `gap-[2px]`)。
@@ -115,7 +112,8 @@ pub fn split_child_sizes(total: f32, sizes: &[f64], count: usize, gap: f32) -> V
 pub struct MiniPaneInfo {
     pub pane_id: String,
     pub label: String,
-    pub status: PaneStatus,
+    /// 状态灯档位(四态 + attention,与 tab 栏同口径)。
+    pub light: StatusLight,
     /// 该显示 AI 品牌图标吗(`paneShowsAiSession`)。
     pub vendor: Option<AiVendor>,
     pub shows_ai: bool,
@@ -125,8 +123,8 @@ pub struct MiniPaneInfo {
     pub exited: bool,
     /// 同叶子的其余 tab 数(`+N` 徽章)。
     pub hidden_count: usize,
-    /// 隐藏 tab 里最高优先级的状态(idle 不画)。
-    pub hidden_top: Option<PaneStatus>,
+    /// 隐藏 tab 里最高的一档(idle 不画)。
+    pub hidden_top: Option<StatusLight>,
 }
 
 /// 微缩布局树(`SplitNode` 的展示侧投影)。
@@ -193,7 +191,7 @@ pub fn snapshot_pane(
     pane: &PaneState,
     project_id: &str,
     hidden_count: usize,
-    hidden_top: Option<PaneStatus>,
+    hidden_top: Option<StatusLight>,
     store: &AppStore,
     auto_resume: bool,
     cx: &App,
@@ -207,7 +205,7 @@ pub fn snapshot_pane(
         pane_id: pane.id.clone(),
         // 与 tab 栏同一口径(自定义名 > 远程连接名 > shell 名)
         label: store.pane_display_label(project_id, pane),
-        status: pane.status,
+        light: pane.light(),
         // tab 上那条口径:CLI 名直取,其余走词匹配
         vendor: pane.ai_agent().and_then(|agent| {
             AiVendor::from_session_type(agent).or_else(|| AiVendor::infer(Some(agent), None))
@@ -216,7 +214,7 @@ pub fn snapshot_pane(
         grid,
         exited: pane.pty_id.map(|id| store.is_pty_exited(id)).unwrap_or(false),
         hidden_count,
-        hidden_top: hidden_top.filter(|s| *s != PaneStatus::Idle),
+        hidden_top: hidden_top.filter(|light| *light != StatusLight::Idle),
     }
 }
 
@@ -268,7 +266,7 @@ fn mini_pane(info: &MiniPaneInfo, style: &TerminalStyle, area: Size<Pixels>) -> 
         // 原版是 `color-mix(bg-overlay 80%)` + `backdrop-blur(6px)`;
         // gpui 没有 backdrop-filter,退成同色 80% 不透明度的实底
         .bg(ui::with_alpha(ui::bg_overlay(), 0.8))
-        .child(ui::status_dot(info.status));
+        .child(ui::status_dot(info.light));
     if info.shows_ai {
         label_bar = label_bar.child(
             BrandIcon::new(info.vendor)
@@ -284,8 +282,8 @@ fn mini_pane(info: &MiniPaneInfo, style: &TerminalStyle, area: Size<Pixels>) -> 
             .items_center()
             .gap(px(4.0))
             .text_color(ui::text_muted());
-        if let Some(status) = info.hidden_top {
-            tail = tail.child(ui::status_dot(status));
+        if let Some(light) = info.hidden_top {
+            tail = tail.child(ui::status_dot(light));
         }
         label_bar = label_bar.child(tail.child(format!("+{}", info.hidden_count)));
     }
@@ -499,6 +497,7 @@ pub fn preview_style(store: &AppStore) -> TerminalStyle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tree::PaneStatus;
 
     fn pane(id: &str, status: PaneStatus) -> PaneState {
         let mut p = PaneState::new("bash");
@@ -540,7 +539,7 @@ mod tests {
         assert!(split_child_sizes(300.0, &[], 0, 2.0).is_empty());
     }
 
-    /// 隐藏 tab 的状态取**最高优先级**那一个(error > ai-working > ai-idle > idle)。
+    /// 隐藏 tab 的档位取**最高**那一个(error > attention > ai-working > ai-idle > idle)。
     #[test]
     fn 隐藏_tab_取最高优先级状态() {
         let a = pane("a", PaneStatus::Idle);
@@ -548,10 +547,17 @@ mod tests {
         let c = pane("c", PaneStatus::AiIdle);
         assert_eq!(
             hidden_top_status(&[&a, &b, &c]),
-            Some(PaneStatus::AiWorking)
+            Some(StatusLight::AiWorking)
+        );
+        // 隐藏 tab 里有个在等授权的(Claude:ai-idle + attention):徽章是叹号
+        let mut waiting = pane("w", PaneStatus::AiIdle);
+        waiting.attention = true;
+        assert_eq!(
+            hidden_top_status(&[&a, &b, &waiting]),
+            Some(StatusLight::Attention)
         );
         let e = pane("e", PaneStatus::Error);
-        assert_eq!(hidden_top_status(&[&b, &e]), Some(PaneStatus::Error));
+        assert_eq!(hidden_top_status(&[&b, &e]), Some(StatusLight::Error));
         assert_eq!(hidden_top_status(&[]), None);
     }
 

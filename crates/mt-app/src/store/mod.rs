@@ -57,7 +57,7 @@ use crate::markers::AiMarker;
 use crate::notify::{AlertPlan, DoneTracker};
 use crate::pane::TerminalPane;
 use crate::persist;
-use crate::tree::{PaneState, PaneStatus, ProjectPanel, SplitNode};
+use crate::tree::{PaneState, ProjectPanel, SplitNode, StatusLight};
 
 mod ai;
 mod commands;
@@ -85,11 +85,11 @@ pub struct ProjectState {
     pub panels: Vec<ProjectPanel>,
     /// 活动面板 id。列表非空时恒有效([`Self::active_panel`] 兜底取第一个)。
     pub active_panel_id: Option<String>,
-    // 项目级聚合状态**不再缓存**:读的时候由 [`Self::highest_status`] 现算
-    // (全部面板、error > ai-working > ai-idle > idle)。原先那个 `status` 字段有
-    // 五处写入、三处读取,漏一处写就是「项目行的灯不跟着变」—— 补 PTY 时把
+    // 项目级聚合状态**不再缓存**:读的时候由 [`Self::highest_light`] 现算
+    // (全部面板、error > attention > ai-working > ai-idle > idle)。原先那个 `status`
+    // 字段有五处写入、三处读取,漏一处写就是「项目行的灯不跟着变」—— 补 PTY 时把
     // 起不来的 pane 标成 error 那条路就漏了。现算的代价是遍历该项目的 pane,
-    // 最热的读点(根视图每帧的 `global_ai_status`)也只是几十次比较。
+    // 最热的读点(根视图每帧的 `global_ai_light`)也只是几十次比较。
     /// 非激活项目里有 AI 任务完成 —— 项目行上的提示点。
     pub needs_attention: bool,
     /// 双击最大化的 pane:终端区只渲染它所在的那个叶子。
@@ -204,12 +204,20 @@ impl ProjectState {
         self.layouts().flat_map(|l| l.pty_ids()).collect()
     }
 
-    /// 跨全部面板的聚合状态。
-    pub fn highest_status(&self) -> PaneStatus {
-        self.layouts().fold(PaneStatus::Idle, |acc, l| {
-            let s = l.highest_status();
-            if s.priority() > acc.priority() { s } else { acc }
-        })
+    /// 跨全部面板的聚合显示档位(含第五档 attention,见 [`StatusLight`])。
+    pub fn highest_light(&self) -> StatusLight {
+        self.layouts()
+            .map(SplitNode::highest_light)
+            .max()
+            .unwrap_or_default()
+    }
+
+    /// [`Self::highest_light`] 的逐 pane 映射版(见 [`SplitNode::highest_light_by`])。
+    pub fn highest_light_by(&self, map: fn(StatusLight) -> StatusLight) -> StatusLight {
+        self.layouts()
+            .map(|l| l.highest_light_by(map))
+            .max()
+            .unwrap_or_default()
     }
 
     /// 按节点 id 找叶子/split(跨全部面板;节点 id 全局唯一)。

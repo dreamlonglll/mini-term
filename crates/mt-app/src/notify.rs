@@ -5,9 +5,9 @@
 //!
 //! | TS 侧 | 这里 |
 //! |---|---|
-//! | `isAiCompletion` | [`is_completion`] |
+//! | `isAiCompletion` | [`is_completion`](+ [`DoneTracker::apply`] 里「不经过 ai-working 的回合收尾」) |
 //! | `isAttentionRise` | [`is_attention_rise`] |
-//! | `unreadDonePaneIds` / `aiDoneOrder` | [`DoneTracker`] |
+//! | `unreadDonePaneIds` / `aiDoneOrder` | [`DoneTracker`](另加页签绿点用的 `unseen`) |
 //! | `pickAttentionTarget`(attentionTarget.ts) | [`pick_attention_target`] |
 //! | `playNotificationSound` / `requestUserAttention` | [`play_sound`] / [`flash_taskbar`] |
 //!
@@ -26,11 +26,15 @@ use crate::tree::PaneStatus;
 /// 播报即误报(判据与 `src/utils/aiCompletion.ts` 逐字同源)。
 const COMPLETION_CAUSE: &str = "Stop";
 
-/// 这次状态变化是否构成「AI 任务完成」。
+/// 这次状态变化是否构成「AI 任务完成」—— **下降沿**那一种。
 ///
 /// `cause == None` 表示这次变化来自无 hook 的降级路径(WSL / SSH / hook 关闭),
 /// 那条路径压根收不到事件名,下降沿是它唯一的完成信号,必须放行 —— 否则这些
-/// pane 会彻底收不到完成通知。
+/// pane 会彻底收不到完成通知。降级路径上**不是**完成的下降沿(没人提交过就冒出来的
+/// 零星重绘脉冲)由 mt-ai 带上 `Quiet` 成因发来,在这里自然落进「有成因但不是 Stop」。
+///
+/// 不经过 ai-working 的回合收尾(Claude 授权被拒后直接 Stop)没有下降沿,这里认不出,
+/// 由 [`DoneTracker::apply`] 结合完成记录补判 —— 那一条要看账本,不是纯边沿判据。
 pub fn is_completion(old: PaneStatus, new: PaneStatus, cause: Option<&str>) -> bool {
     if old != PaneStatus::AiWorking || new != PaneStatus::AiIdle {
         return false;
@@ -60,6 +64,9 @@ pub struct StatusTransition<'a> {
     pub cause: Option<&'a str>,
     /// 主窗口是否聚焦 —— 只影响「未读完成」的计入,不影响提示音/闪烁。
     pub window_focused: bool,
+    /// 这个 pane 此刻是不是键盘焦点 pane。与 `window_focused` 同真 = 用户正盯着它,
+    /// 完成了也不在页签上打「还没看」的绿点(见 [`DoneTracker`] 的 `unseen`)。
+    pub pane_focused: bool,
     /// 该 pane 所属项目是否就是当前激活项目(决定要不要弹 toast)。
     pub project_active: bool,
 }
@@ -141,46 +148,73 @@ impl AlertPlan {
     }
 }
 
-/// 完成队列:未读集合 + 完成序号。
+/// 完成账本:未读集合 + 未看集合 + 完成序号。
 ///
-/// 两份口径**故意不同**(旧版同一注释):
-/// - `unread`:看窗口焦点。窗口聚焦时完成的任务用户正看着,不算未读。
-/// - `order`:不看窗口焦点(点状态灯时窗口必然聚焦),用于「先完成的先跳」。
+/// 三份口径**故意不同**:
+/// - `unread`:看**窗口**焦点 —— 托盘绿灯与边条的未读数。窗口聚焦时完成的任务
+///   用户正看着,不算未读;窗口一聚焦整份清空(旧版语义:人回到窗口前了,托盘的
+///   「有新回答」该灭)。
+/// - `unseen`:看**这个 pane** 有没有被看过 —— 页签上的绿点。完成时用户若正盯着它
+///   (窗口聚焦且它是焦点 pane)就不记,之后只有把焦点交给它才消
+///   ([`Self::mark_seen`])。窗口聚焦**不清**这一份:回到窗口后,哪几个页签是
+///   「做完了还没看」的得还看得出来 —— 旧版的页签点跟着 `unread` 走,人一回来就
+///   全灭,等于只在窗口失焦时有用。
+/// - `order`:不看焦点(点状态灯时窗口必然聚焦),只记「谁先做完」,用于「先完成的先跳」。
+///
+/// 三份共用一个撤销判据:pane **离开完成态**(重新开工 / 转入待确认 / 会话结束 /
+/// 出错)时一并作废。ai-idle 上的其它事件 —— 闲置提醒(Claude 完成约 60s 后的
+/// `idle_prompt` 通知)、打断、停摆收敛、降级路径的空闲脉冲 —— 不改变「上一回合
+/// 做完了还没人处理」这件事,记录原样保留(旧版任何非完成事件都撤 `order`,于是
+/// 「跳到下一件待办」里的完成项只活一分钟)。
 #[derive(Default)]
 pub struct DoneTracker {
     unread: HashSet<String>,
+    unseen: HashSet<String>,
     order: HashMap<String, u64>,
     /// 单调发号器。取序号而不是时间戳:同一批完成事件常落在同一毫秒里。
     seq: u64,
 }
 
 impl DoneTracker {
-    /// 吃进一次状态变化,更新两份队列并给出提醒动作。
+    /// 吃进一次状态变化,更新三份账并给出提醒动作。
     pub fn apply(&mut self, t: &StatusTransition<'_>, prefs: &NotifyPrefs) -> AlertPlan {
         let attention = t.cause.map(mt_ai::is_attention_cause).unwrap_or(false);
-        let completion = is_completion(t.old_status, t.new_status, t.cause);
-        // hook 的 Stop 是权威信号:ai-idle(待确认)→ 批准 → Stop 这类不经过
-        // ai-working 的路径靠它补上完成记账(无下降沿,不播报)。
+        // 不经过 ai-working 的回合收尾:Claude 的授权请求把状态落在 ai-idle,用户
+        // 拒绝后它直接结束回合发 Stop —— ai-idle → ai-idle,没有下降沿,纯边沿判据
+        // 认不出,此前每次都漏播。**只在这个 pane 手上没有完成记录时才算**:授权请求
+        // (attention)已经把旧记录撤了,而同一回合重复的 Stop 会撞上刚记下的那条被挡住,
+        // 不会再响一声。
+        let idle_turn_end = t.cause == Some(COMPLETION_CAUSE)
+            && t.old_status == PaneStatus::AiIdle
+            && t.new_status == PaneStatus::AiIdle
+            && !self.order.contains_key(t.pane_id);
+        let completion = is_completion(t.old_status, t.new_status, t.cause) || idle_turn_end;
+        // hook 的 Stop 是权威信号:同一回合重复的 Stop 不播报,但照样记账。
         let done = t.cause == Some(COMPLETION_CAUSE) || completion;
+        // 离开完成态:一个 pane 任一时刻只贡献一种灯 —— 转入待确认/异常时旧的「完成」
+        // 作废,否则同一个 pane 黄绿双计;重新开工 / 会话结束同理。
+        let leaves_done = attention
+            || matches!(
+                t.new_status,
+                PaneStatus::AiWorking | PaneStatus::Idle | PaneStatus::Error
+            );
 
-        // 一个 pane 任一时刻只贡献一种灯:转入待确认/异常时旧的「完成未读」作废,
-        // 否则同一个 pane 黄绿双计。
-        if attention || t.new_status == PaneStatus::Error {
+        if leaves_done {
             self.unread.remove(t.pane_id);
-        }
-        if done && !attention && !t.window_focused {
-            self.unread.insert(t.pane_id.to_string());
-        }
-
-        // 已在队列里的不重新发号:同一次任务的多个 Stop 不该把它挤到队尾。
-        let should_queue = done && !attention && t.new_status != PaneStatus::AiWorking;
-        if should_queue {
+            self.unseen.remove(t.pane_id);
+            self.order.remove(t.pane_id);
+        } else if done {
+            if !t.window_focused {
+                self.unread.insert(t.pane_id.to_string());
+            }
+            if !(t.window_focused && t.pane_focused) {
+                self.unseen.insert(t.pane_id.to_string());
+            }
+            // 已在队列里的不重新发号:同一次任务的多个 Stop 不该把它挤到队尾。
             if !self.order.contains_key(t.pane_id) {
                 self.seq += 1;
                 self.order.insert(t.pane_id.to_string(), self.seq);
             }
-        } else {
-            self.order.remove(t.pane_id);
         }
 
         let mut plan = AlertPlan::default();
@@ -205,10 +239,22 @@ impl DoneTracker {
         plan
     }
 
-    /// pane 关掉后撤出两份队列 —— 否则计数会往一个已经不存在的 pane 上跳,
-    /// 两张表也会随开关终端无界增长(旧版 `setProjectLayout` 的同一段)。
+    /// 这个 pane 的 PTY 死了(退出 / 没起来):三份账一起撤,与 [`Self::apply`] 里
+    /// 「落 error 即离开完成态」同一口径。旧版 `pty-exit` 走的是同一个
+    /// `updatePaneStatusByPty('error')`,账本随之更新;GPUI 版退出不经过 AI 事件那条路,
+    /// 得在这里补上 —— 否则死掉的终端还挂着「做完了没看」的绿点、「跳到下一件待办」
+    /// 还会往它身上跳。
+    pub fn forget(&mut self, pane_id: &str) {
+        self.unread.remove(pane_id);
+        self.unseen.remove(pane_id);
+        self.order.remove(pane_id);
+    }
+
+    /// pane 关掉后撤出三份账 —— 否则计数会往一个已经不存在的 pane 上跳,
+    /// 几张表也会随开关终端无界增长(旧版 `setProjectLayout` 的同一段)。
     pub fn retain_panes(&mut self, live: &HashSet<String>) {
         self.unread.retain(|id| live.contains(id));
+        self.unseen.retain(|id| live.contains(id));
         self.order.retain(|id, _| live.contains(id));
     }
 
@@ -220,8 +266,20 @@ impl DoneTracker {
         self.unread.contains(pane_id)
     }
 
+    /// 只清托盘口径的 `unread`。页签绿点(`unseen`)**不动**:它按 pane 逐个
+    /// 「看过」才消,见类型注释。
     pub fn clear_unread(&mut self) {
         self.unread.clear();
+    }
+
+    /// 页签绿点:这个 pane 做完了、用户还没把焦点给过它。
+    pub fn is_unseen(&self, pane_id: &str) -> bool {
+        self.unseen.contains(pane_id)
+    }
+
+    /// 用户看到这个 pane 了(窗口聚焦时焦点落到它身上)。返回「绿点有没有因此熄灭」。
+    pub fn mark_seen(&mut self, pane_id: &str) -> bool {
+        self.unseen.remove(pane_id)
     }
 
     pub fn order(&self) -> &HashMap<String, u64> {
@@ -640,6 +698,7 @@ mod tests {
             old_attention: false,
             cause,
             window_focused: false,
+            pane_focused: false,
             project_active: false,
         }
     }
@@ -739,7 +798,7 @@ mod tests {
         assert!(tracker.order().is_empty());
     }
 
-    /// 同一次任务的多个 Stop 不重新发号。
+    /// 同一次任务的多个 Stop 不重新发号,也不再响第二声。
     #[test]
     fn 重复_stop_不改完成序号() {
         let mut tracker = DoneTracker::default();
@@ -747,11 +806,153 @@ mod tests {
         tracker.apply(&t, &prefs());
         let first = tracker.order()["pane-1"];
         // 第二条 Stop:已经是 ai-idle 了,没有下降沿,但 cause 仍是权威完成信号
-        tracker.apply(
+        let plan = tracker.apply(
             &transition(PaneStatus::AiIdle, PaneStatus::AiIdle, Some("Stop")),
             &prefs(),
         );
         assert_eq!(tracker.order()["pane-1"], first);
+        assert!(
+            plan.is_empty(),
+            "手上已有完成记录 → 不是新的回合收尾,不播报"
+        );
+    }
+
+    /// Claude 授权被拒后直接结束回合:ai-idle(待确认)→ ai-idle(Stop),没有下降沿。
+    /// 此前漏播一次完成;授权请求已把旧完成记录撤掉,这一条 Stop 就是新回合的收尾。
+    #[test]
+    fn 授权被拒后直接收尾也算完成() {
+        let mut tracker = DoneTracker::default();
+        // 上一回合的完成记录(用户看过了也还在,等下一次离开完成态才撤)
+        tracker.apply(
+            &transition(PaneStatus::AiWorking, PaneStatus::AiIdle, Some("Stop")),
+            &prefs(),
+        );
+        // 新一回合:开工 → 要授权(Claude 落 ai-idle + 黄灯)
+        tracker.apply(
+            &transition(
+                PaneStatus::AiIdle,
+                PaneStatus::AiWorking,
+                Some("UserPromptSubmit"),
+            ),
+            &prefs(),
+        );
+        let plan = tracker.apply(
+            &transition(
+                PaneStatus::AiWorking,
+                PaneStatus::AiIdle,
+                Some("PermissionRequest"),
+            ),
+            &prefs(),
+        );
+        assert_eq!(plan.toast, Some(ToastKind::Attention));
+        assert!(tracker.order().is_empty());
+        // 拒绝 → 直接 Stop
+        let plan = tracker.apply(
+            &transition(PaneStatus::AiIdle, PaneStatus::AiIdle, Some("Stop")),
+            &prefs(),
+        );
+        assert!(plan.sound && plan.flash, "回合收尾要播报");
+        assert_eq!(plan.toast, Some(ToastKind::Completion));
+        assert!(tracker.order().contains_key("pane-1"));
+        assert!(tracker.is_unseen("pane-1"));
+    }
+
+    /// 其它 ai-idle 事件不算完成,也不撤完成记录:闲置提醒(Claude 完成约 60s 后的
+    /// idle_prompt)、打断、停摆收敛、降级路径的空闲脉冲(`Quiet`)。
+    #[test]
+    fn ai_idle_上的非完成事件保留完成记录() {
+        for cause in ["Notification", "Interrupt", "Stall", "Quiet"] {
+            let mut tracker = DoneTracker::default();
+            tracker.apply(
+                &transition(PaneStatus::AiWorking, PaneStatus::AiIdle, Some("Stop")),
+                &prefs(),
+            );
+            let plan = tracker.apply(
+                &transition(PaneStatus::AiIdle, PaneStatus::AiIdle, Some(cause)),
+                &prefs(),
+            );
+            assert!(plan.is_empty(), "{cause} 不播报");
+            assert!(tracker.order().contains_key("pane-1"), "{cause} 不撤完成序");
+            assert!(tracker.is_unread("pane-1"), "{cause} 不撤未读");
+            assert!(tracker.is_unseen("pane-1"), "{cause} 不撤页签绿点");
+        }
+    }
+
+    /// 降级路径没人提交过就冒出来的下降沿(TUI 空闲期的零星重绘)带 `Quiet` 成因,
+    /// 不是完成:不播报、不记账。
+    #[test]
+    fn 降级路径的空闲脉冲不算完成() {
+        let mut tracker = DoneTracker::default();
+        let plan = tracker.apply(
+            &transition(PaneStatus::AiWorking, PaneStatus::AiIdle, Some("Quiet")),
+            &prefs(),
+        );
+        assert!(plan.is_empty());
+        assert!(tracker.order().is_empty());
+        assert!(!tracker.is_unseen("pane-1"));
+        // 对照:同样的下降沿不带成因(本回合用户提交过)照旧是完成
+        let plan = tracker.apply(
+            &transition(PaneStatus::AiWorking, PaneStatus::AiIdle, None),
+            &prefs(),
+        );
+        assert!(plan.sound);
+    }
+
+    /// 重新开工 / 会话结束 → 三份账一起撤(移动端下发指令让它重新跑时,
+    /// 页签上不该一边转圈一边挂着「做完了没看」)。
+    #[test]
+    fn 离开完成态三份账一起撤() {
+        use PaneStatus::*;
+        for (new, cause) in [
+            (AiWorking, Some("UserPromptSubmit")),
+            (AiWorking, None),
+            (Idle, Some("SessionEnd")),
+            (Error, None),
+        ] {
+            let mut tracker = DoneTracker::default();
+            tracker.apply(&transition(AiWorking, AiIdle, Some("Stop")), &prefs());
+            tracker.apply(&transition(AiIdle, new, cause), &prefs());
+            assert!(!tracker.is_unread("pane-1"), "{new:?}");
+            assert!(!tracker.is_unseen("pane-1"), "{new:?}");
+            assert!(tracker.order().is_empty(), "{new:?}");
+        }
+    }
+
+    /// 页签绿点只在「用户没盯着这个 pane」时记:窗口聚焦 + 它是焦点 pane 才算盯着。
+    #[test]
+    fn 页签绿点看的是这个_pane_有没有被盯着() {
+        let done = || transition(PaneStatus::AiWorking, PaneStatus::AiIdle, Some("Stop"));
+
+        // 正盯着:不记绿点,也不计未读
+        let mut tracker = DoneTracker::default();
+        let mut t = done();
+        t.window_focused = true;
+        t.pane_focused = true;
+        tracker.apply(&t, &prefs());
+        assert!(!tracker.is_unseen("pane-1"));
+        assert!(!tracker.is_unread("pane-1"));
+
+        // 窗口聚焦但焦点在别的 pane:记绿点(页签上看得出是它做完了),不计未读
+        let mut tracker = DoneTracker::default();
+        let mut t = done();
+        t.window_focused = true;
+        tracker.apply(&t, &prefs());
+        assert!(tracker.is_unseen("pane-1"));
+        assert!(!tracker.is_unread("pane-1"));
+
+        // 窗口失焦:两份都记;窗口回来清的是未读,绿点要等焦点给到它
+        let mut tracker = DoneTracker::default();
+        tracker.apply(&done(), &prefs());
+        tracker.clear_unread();
+        assert!(!tracker.is_unread("pane-1"));
+        assert!(
+            tracker.is_unseen("pane-1"),
+            "回到窗口后还看得出是哪个做完了"
+        );
+        assert!(tracker.mark_seen("pane-1"));
+        assert!(!tracker.is_unseen("pane-1"));
+        assert!(!tracker.mark_seen("pane-1"), "已经看过了 → 没有变化");
+        assert!(tracker.order().contains_key("pane-1"), "看过不撤完成序");
     }
 
     #[test]
@@ -788,8 +989,22 @@ mod tests {
         assert!(tracker.order().contains_key("pane-1"));
     }
 
+    /// PTY 死了(退出 / 没起来):三份账一起撤,与「落 error 即离开完成态」同口径。
     #[test]
-    fn 关掉的_pane_撤出两份队列() {
+    fn 终端死了撤掉它的完成记录() {
+        let mut tracker = DoneTracker::default();
+        tracker.apply(
+            &transition(PaneStatus::AiWorking, PaneStatus::AiIdle, Some("Stop")),
+            &prefs(),
+        );
+        tracker.forget("pane-1");
+        assert!(!tracker.is_unread("pane-1"));
+        assert!(!tracker.is_unseen("pane-1"));
+        assert!(tracker.order().is_empty());
+    }
+
+    #[test]
+    fn 关掉的_pane_撤出三份账() {
         let mut tracker = DoneTracker::default();
         tracker.apply(
             &transition(PaneStatus::AiWorking, PaneStatus::AiIdle, Some("Stop")),
@@ -797,6 +1012,7 @@ mod tests {
         );
         tracker.retain_panes(&HashSet::new());
         assert_eq!(tracker.unread_count(), 0);
+        assert!(!tracker.is_unseen("pane-1"));
         assert!(tracker.order().is_empty());
     }
 

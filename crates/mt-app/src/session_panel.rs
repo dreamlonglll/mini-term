@@ -53,7 +53,7 @@ use gpui::{
 use gpui_component::ActiveTheme as _;
 use gpui_component::text::{TextView, TextViewStyle};
 use mt_ai::sessions::{AiSession, AiSessionMessage, LineageEdge};
-use mt_ui::icons::{AiVendor, BrandIcon, StatusDot, StatusKind};
+use mt_ui::icons::{AiVendor, BrandIcon, StatusDot};
 use mt_ui::tooltip::TooltipExt as _;
 
 use crate::i18n::{t, tr};
@@ -62,7 +62,7 @@ use crate::notify::ToastKind;
 use crate::session_branch::{build_session_tree, flatten_session_tree, merge_lineage_edges};
 use crate::store::{AppStore, StoreEvent};
 use crate::toast;
-use crate::tree::{AiSessionRef, PaneStatus};
+use crate::tree::{AiSessionRef, StatusLight};
 use crate::ui;
 
 /// 一页多少条(与旧版 `PAGE_SIZE` 同值)。
@@ -196,16 +196,6 @@ fn has_wsl_source(path: &str, distro: Option<&str>) -> bool {
     }
     let lower = path.to_ascii_lowercase().replace('/', "\\");
     lower.starts_with("\\\\wsl$\\") || lower.starts_with("\\\\wsl.localhost\\")
-}
-
-/// `PaneStatus` → `StatusKind`(mt-ui 不能反向依赖 mt-app,在这里转一次)。
-fn status_kind(status: PaneStatus) -> StatusKind {
-    match status {
-        PaneStatus::Idle => StatusKind::Idle,
-        PaneStatus::AiIdle => StatusKind::AiIdle,
-        PaneStatus::AiWorking => StatusKind::AiWorking,
-        PaneStatus::Error => StatusKind::Error,
-    }
 }
 
 /// ISO 8601 → 「刚刚 / n 分钟前 / n 小时前 / n 天前 / 月-日」。
@@ -1074,14 +1064,15 @@ impl Render for SessionPanel {
         };
         // 树模式的在跑徽章要对 pane 状态保持反应性 —— 面板已经 observe 了 store,
         // 这里逐行现查即可(跨项目遍历,规模是 pane 数)
-        let live_of: Vec<Option<(String, PaneStatus)>> = if tree {
+        // 档位带 attention:等授权的会话画第五档叹号,不是绿勾 / 转圈
+        let live_of: Vec<Option<(String, StatusLight)>> = if tree {
             sessions
                 .iter()
                 .map(|s| {
                     self.store
                         .read(cx)
                         .find_live_session_pane(&s.id)
-                        .map(|(project_id, _, status)| (project_id, status))
+                        .map(|(project_id, _, light)| (project_id, light))
                 })
                 .collect()
         } else {
@@ -1250,11 +1241,11 @@ impl Render for SessionPanel {
                                     .items_center()
                                     .gap(px(6.0))
                                     // 在跑状态点
-                                    .when_some(live.as_ref(), |el, (_, status)| {
+                                    .when_some(live.as_ref(), |el, (_, light)| {
                                         el.child(
-                                            StatusDot::new(status_kind(*status))
+                                            StatusDot::new(ui::status_kind(*light))
                                                 .size(px(11.0))
-                                                .color(ui::status_color(*status))
+                                                .color(ui::status_color(*light))
                                                 .contrast(ui::bg_surface()),
                                         )
                                     })

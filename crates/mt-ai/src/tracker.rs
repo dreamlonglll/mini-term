@@ -4,7 +4,7 @@
 //! 行编辑状态机、Ctrl+C 双击窗口、Enter 后的输出扫描窗口、TUI 重绘冷却、
 //! 最近输出时刻。PTY 只管字节进出,这些全是 AI 感知的私产,随迁移整块搬来。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -213,6 +213,11 @@ pub struct SessionTracker {
     last_output: Arc<Mutex<HashMap<u32, Instant>>>,
     /// resize / 焦点冷却窗口结束时间:在此之前 PTY 输出不刷新 last_output
     tui_redraw_cooldown_until: Arc<Mutex<HashMap<u32, Instant>>>,
+    /// 降级路径(无 hook)的「回合闩」:用户在 AI 会话里提交过一行就上闩,monitor 把
+    /// 这一回合的第一个下降沿当完成报出去时摘掉([`Self::take_turn`])。没有闩的下降沿
+    /// —— TUI 空闲期的零星重绘把状态抬起又落下 —— 不是完成。打断(裸 Esc / Ctrl+C)
+    /// 与退出同样摘闩:被打断的回合不算做完。hook 路径不读它。
+    turn_armed: Arc<Mutex<HashSet<u32>>>,
 }
 
 impl Default for SessionTracker {
@@ -232,6 +237,7 @@ impl SessionTracker {
             pending_submits: Arc::new(Mutex::new(HashMap::new())),
             last_output: Arc::new(Mutex::new(HashMap::new())),
             tui_redraw_cooldown_until: Arc::new(Mutex::new(HashMap::new())),
+            turn_armed: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -249,6 +255,7 @@ impl SessionTracker {
         self.pending_submits.lock().remove(&pane_id);
         self.last_output.lock().remove(&pane_id);
         self.tui_redraw_cooldown_until.lock().remove(&pane_id);
+        self.turn_armed.lock().remove(&pane_id);
     }
 
     pub fn has_recent_output(&self, pane_id: u32, within: Duration) -> bool {
@@ -263,6 +270,24 @@ impl SessionTracker {
         self.last_output
             .lock()
             .insert(pane_id, Instant::now());
+    }
+
+    /// 测试用:让「最近一次输出」过期(等价于输出静默满任意窗口)。
+    #[cfg(test)]
+    pub fn expire_output_for_test(&self, pane_id: u32) {
+        self.last_output.lock().remove(&pane_id);
+    }
+
+    /// 取走这个 pane 的回合闩(降级路径把下降沿当完成报出去时调)。返回「这一回合
+    /// 有没有人提交过」—— 取走即清,同一回合的第二个下降沿就拿不到了。
+    pub fn take_turn(&self, pane_id: u32) -> bool {
+        self.turn_armed.lock().remove(&pane_id)
+    }
+
+    /// 测试用:看一眼回合闩在不在(不取走)。
+    #[cfg(test)]
+    pub fn is_turn_armed(&self, pane_id: u32) -> bool {
+        self.turn_armed.lock().contains(&pane_id)
     }
 
     pub fn is_ai_session(&self, pane_id: u32) -> bool {
@@ -304,6 +329,7 @@ impl SessionTracker {
         self.ai_started.lock().remove(&pane_id);
         self.last_ctrlc.lock().remove(&pane_id);
         self.last_enter.lock().remove(&pane_id);
+        self.turn_armed.lock().remove(&pane_id);
     }
 
     pub fn drain_submits(&self, pane_id: u32) -> Vec<UserSubmit> {
@@ -403,7 +429,11 @@ impl SessionTracker {
             if data == "\x1b" {
                 state.clear_line();
                 // 裸 Esc 不进/不出 AI 会话(单次 Esc 只是打断,退出由
-                // `note_user_interrupt` 与 SessionEnd 那条路管),直接收工
+                // `note_user_interrupt` 与 SessionEnd 那条路管),直接收工。
+                // 打断的回合不算做完:降级路径的回合闩一并摘掉
+                if in_ai {
+                    self.turn_armed.lock().remove(&pane_id);
+                }
                 return;
             }
             for ch in data.chars() {
@@ -426,6 +456,8 @@ impl SessionTracker {
                     '\x03' => {
                         state.clear_line();
                         if in_ai {
+                            // 取消了当前任务:这一回合不算做完,摘掉降级路径的回合闩
+                            self.turn_armed.lock().remove(&pane_id);
                             // Ctrl+C: 单次取消当前任务，连续两次退出 AI 会话
                             let mut last = self.last_ctrlc.lock();
                             let now = Instant::now();
@@ -490,6 +522,10 @@ impl SessionTracker {
                                         ts,
                                         from_snapshot,
                                     });
+                                // 有人提交了一行 = 开了一个回合:降级路径这一回合的
+                                // 下降沿才算完成(见 `turn_armed`)。启动 AI 的那一行
+                                // 走不到这里(那时还不在会话里),banner 不会被当成回合
+                                self.turn_armed.lock().insert(pane_id);
                             }
                         }
                         let cmd = trimmed.to_lowercase();
@@ -1291,6 +1327,7 @@ mod tests {
         mgr.track_input(id, "claude\r"); // ai_sessions / ai_started / last_enter / input_states
         mgr.track_input(id, "abc"); // input_states 里留下半行
         mgr.track_input(id, "\x03"); // last_ctrlc
+        mgr.track_input(id, "go\r"); // turn_armed
         mgr.note_output_for_test(id);
         mgr.bump_cooldown(id, RESIZE_COOLDOWN);
         mgr.pending_submits
@@ -1319,5 +1356,49 @@ mod tests {
             mgr.tui_redraw_cooldown_until.lock().is_empty(),
             "tui_redraw_cooldown_until 未清"
         );
+        assert!(mgr.turn_armed.lock().is_empty(), "turn_armed 未清");
+    }
+
+    // ---- 降级路径的回合闩(turn_armed)----
+
+    /// 只有 AI 会话里的提交才上闩:启动 AI 的那一行不算(banner 输出不是回合),
+    /// shell 里的普通命令也不算。
+    #[test]
+    fn 回合闩只认_ai_会话里的提交() {
+        let mgr = SessionTracker::new();
+        mgr.track_input(1, "ls\r");
+        assert!(!mgr.is_turn_armed(1), "shell 命令不是 AI 回合");
+        mgr.track_input(1, "claude\r");
+        assert!(!mgr.is_turn_armed(1), "启动 AI 的那一行不算回合");
+        mgr.track_input(1, "\r");
+        assert!(!mgr.is_turn_armed(1), "会话里的空回车(没有快照)不算提交");
+        mgr.track_input(1, "fix the bug\r");
+        assert!(mgr.is_turn_armed(1));
+        // 取走即清:同一回合只报一次
+        assert!(mgr.take_turn(1));
+        assert!(!mgr.take_turn(1));
+    }
+
+    /// 打断(裸 Esc / 单次 Ctrl+C)与退出都摘闩 —— 被打断的回合不算做完。
+    #[test]
+    fn 打断与退出摘掉回合闩() {
+        for interrupt in ["\x1b", "\x03", "\x04", "/exit\r"] {
+            let mgr = SessionTracker::new();
+            mgr.track_input(1, "claude\r");
+            mgr.track_input(1, "fix the bug\r");
+            assert!(mgr.is_turn_armed(1));
+            mgr.track_input(1, interrupt);
+            assert!(!mgr.is_turn_armed(1), "{interrupt:?} 之后不该还挂着回合");
+        }
+    }
+
+    /// 方向键这类转义序列不是打断,不摘闩。
+    #[test]
+    fn 方向键不摘回合闩() {
+        let mgr = SessionTracker::new();
+        mgr.track_input(1, "claude\r");
+        mgr.track_input(1, "fix the bug\r");
+        mgr.track_input(1, "\x1b[A");
+        assert!(mgr.is_turn_armed(1));
     }
 }
