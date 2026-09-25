@@ -668,7 +668,9 @@ impl TitleBar {
             .rounded(px(4.0))
             .border_1()
             .border_color(ui::border_default())
-            .bg(ui::bg_elevated())
+            // 浮层用 `bg_overlay`(主题包下恒不透明),不用 `bg_elevated` —— 后者会乘
+            // `surface_opacity`,下拉叠在终端上时底下的字会透出来。判据见 `ui::Palette::from_pack`
+            .bg(ui::bg_overlay())
             .shadow_lg()
             .overflow_hidden()
             // 面板内的按下不算「点外」
