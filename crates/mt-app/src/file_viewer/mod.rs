@@ -41,12 +41,11 @@
 //!    切过去、没开的新开,历史栈由页签条承担。外链确认 / 文档内锚点滚动两条与
 //!    原版一致(gpui-component 0.6 起 `TextView::on_link_click` 开了回调口,
 //!    0.5.1 时代这三条整块做不了)。见 [`FileViewer::follow_link`]。
-//! 2. **本地 HTML 是简版渲染,不是浏览器**:GPUI 侧没有 iframe 等价物,`TextView::html`
-//!    与 markdown 那支是同一个富文本渲染器(无 CSS / 无 JS)。此处曾按规格 B.6.3
-//!    的建议「只留源码编辑器」,**已翻案**(用户要求):现在给预览态,但配一条
-//!    说明 + 工具栏常驻「用浏览器打开」——走样的排版有解释、真效果有出口,
-//!    比对着一屏源码有用。相对资源不再是问题,见 [`html_urls::rewrite_html_urls`]。远程
-//!    HTML 属于不可信输入，只走源码编辑器，不进入富文本 HTML 渲染器。
+//! 2. **本地 HTML 用系统 WebView 真渲染**(Windows / macOS,见 [`webview`]):原版的
+//!    iframe 等价物。WebView 建不起来或在 Linux 上时回落到简版渲染 —— `TextView::html`
+//!    与 markdown 那支是同一个富文本渲染器(无 CSS / 无 JS),配一条说明;两种形态下
+//!    工具栏都常驻「用浏览器打开」。简版的相对资源见 [`html_urls::rewrite_html_urls`]。
+//!    远程 HTML 属于不可信输入，只走源码编辑器，两种渲染都不进。
 //!
 //! # 模块结构
 //!
@@ -61,7 +60,8 @@
 //! | [`preview`] | Markdown / HTML 预览的渲染(`impl FileViewer` 的另一半)与自绘表格、图片占位 |
 //! | [`markdown`] | Markdown 纯逻辑:分块、图片落点、本地图片改写、链接处置、表格排版参数 |
 //! | [`sanitize`] | 不可信 Markdown(远程文档 / AI 会话正文)清洗 |
-//! | [`html_urls`] | 本地 HTML 的资源 URL 改写 |
+//! | [`html_urls`] | 本地 HTML 的资源 URL 改写(简版渲染用) |
+//! | [`webview`] | 本地 HTML 的系统 WebView 预览:资源服务、导航处置 |
 //! | [`mermaid`] | Mermaid 图表后台渲染与资源释放 |
 //! | [`images`] | 查看器图片资源、进程级持有账本、看图页签换代去抖 |
 //! | [`http`] | 预览用的进程级 HTTP 客户端 [`PreviewHttpClient`] |
@@ -103,6 +103,7 @@ mod markdown;
 mod mermaid;
 mod preview;
 mod sanitize;
+mod webview;
 
 // 行尾三件套的对外路径:`tab_expansion` 的单测与文档链接按 `crate::file_viewer::…`
 // 引用。本模块自己已不直接用(读写口径都收进了 `DocumentSession`),所以非测试
@@ -298,6 +299,11 @@ pub struct FileViewer {
     /// 也靠它保住进度(源码态的滚动住在 `InputState` 实体里,组件自己管;
     /// markdown 预览的住在 [`Self::md_list`] 里)。
     preview_scroll: ScrollHandle,
+    /// 本地 HTML 预览的系统 WebView(见 [`webview`])。第一次画 HTML 预览时才建,
+    /// 页签关掉随实体一起销毁;「预览 ↔ 源码」来回切只是不画它,页面状态留着。
+    /// `RefCell` 的理由同 [`Self::md_cache`]:在 `&self` 的渲染途中排上建立任务。
+    #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
+    html_view: RefCell<webview::HtmlView>,
 
     preview: bool,
 
@@ -370,6 +376,7 @@ impl FileViewer {
             lightbox: None,
             _lightbox_sub: None,
             preview_scroll: ScrollHandle::new(),
+            html_view: RefCell::new(webview::HtmlView::Idle),
             // 文件树打开 Markdown / HTML 时默认看渲染稿；内容搜索带行号时切到
             // 源码，否则命中光标虽然已经定位，用户看到的仍是无法对应行号的预览。
             preview: highlight_line.is_none(),
@@ -1565,11 +1572,13 @@ impl Render for FileViewer {
             .flex()
             .flex_col()
             .overflow_hidden()
+            .relative()
             // 着色统一由容器层承担**一层**(与终端区同口径,见 terminal_area 的
             // 「不刷底色」注释):工具栏/横幅/内容区都坐在这一层上,背景图皮肤下
             // bg_document 半透明,整页透出氛围图;内容区不再自己刷 bg_base,
-            // 免得两层叠乘把图盖死
-            .bg(ui::bg_document())
+            // 免得两层叠乘把图盖死。绕开 HTML 预览 WebView 挖的洞画
+            // (见 `native_view`),所以是第一个子节点而不是 `.bg()`
+            .child(crate::native_view::hole_bg(ui::bg_document()))
             // Ctrl/Cmd+S 与 Ctrl/Cmd+W。挂在容器上而不是绑 action:
             // 绑成全局 action 要动 `main.rs` 的 bindings 表,而这两个键**只在文件页里**
             // 有意义;`on_key_down` 沿焦点链冒泡上来,焦点在编辑器里照样收得到

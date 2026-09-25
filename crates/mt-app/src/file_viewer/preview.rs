@@ -629,7 +629,7 @@ impl FileViewer {
     /// 原版 `handleLinkClick` 的四条处置(分类在 [`classify_link`]):
     /// 外链弹确认再开浏览器;锚点滚到标题所在的块;其它协议直接交给系统;
     /// 本地文件作为页签打开(本地来源先验文件在不在,远程交给页签自己报错)。
-    fn follow_link(&mut self, href: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn follow_link(&mut self, href: &str, window: &mut Window, cx: &mut Context<Self>) {
         match classify_link(&self.current_path.to_string_lossy(), href) {
             LinkAction::External(url) => {
                 let open = url.clone();
@@ -715,7 +715,7 @@ impl FileViewer {
     /// 预览态要渲染的源码:切到预览那一刻的草稿快照,没有草稿就用磁盘现内容。
     ///
     /// 借出去而不是 clone —— 这条每帧都走(滚动即重画),而正文动辄几十 KB。
-    fn preview_source(&self) -> &str {
+    pub(super) fn preview_source(&self) -> &str {
         self.preview_draft.as_deref().unwrap_or(self.doc.disk())
     }
 
@@ -1083,20 +1083,26 @@ impl FileViewer {
             .into_any_element()
     }
 
-    /// Trusted local HTML preview. **富文本简版渲染,不是浏览器** —— GPUI 侧没有 iframe 等价物,
+    /// Trusted local HTML preview。Windows / macOS 先走系统 WebView(见 [`super::webview`]),
+    /// 效果与浏览器一致;建不起来或在 Linux 上时回落到下面的**富文本简版渲染** ——
     /// `TextView::html` 与 markdown 那支是同一个渲染器:标题 / 段落 / 列表 /
     /// 表格 / 图片 / 链接认得,CSS 与脚本一概不跑,带样式的页面会走样。
     ///
-    /// 这正是当初「只留源码态」的理由(`file_viewer` 模块注释偏差 2)。现在改为提供,配套两条:
-    /// 顶上一句说明写清楚它是简版,工具栏常驻「用浏览器打开」给真效果的出口。
-    /// 图片与其它本地资源靠 [`rewrite_html_urls`] 转 `file://`(原版是
+    /// 简版配套两条:顶上一句说明写清楚它是简版,工具栏常驻「用浏览器打开」给真效果
+    /// 的出口。图片与其它本地资源靠 [`rewrite_html_urls`] 转 `file://`(原版是
     /// `convertFileSrc`),由 [`super::PreviewHttpClient`] 读盘。
     pub(super) fn render_html(
         &self,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         debug_assert!(!self.source.is_remote());
+        #[cfg(any(windows, target_os = "macos"))]
+        if let Some(webview) = self.render_html_webview(window, cx) {
+            return webview;
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
+        let _ = window;
         let source = rewrite_html_urls(self.preview_source(), &self.preview_base_dir());
         let style = self.preview_text_style(cx);
         let content = div()

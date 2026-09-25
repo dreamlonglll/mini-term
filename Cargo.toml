@@ -53,6 +53,15 @@ gpui-component = "0.6.2"
 # 是 1830 枚(约 731 KB),本仓用不上。没有它时上游组件画 `IconName::*` 一律是
 # **空白且编译期无感**(svg 走 AssetSource 取,取不到只记一行日志)。
 gpui-kit-assets = "0.6.2"
+# 本地 HTML 预览的系统 WebView(Windows = WebView2,macOS = WKWebView)。gpui-component
+# 0.6 起把 `webview` feature 拆成了这个独立 crate(gpui-kit 出品,同一份 gpui-pre)。
+# ⚠️ 钉死 =0.6.4:0.6.5 起它把 gpui-pre 钉成 `=0.3.6`,与上面的 0.3.5 冲突(两版源码
+#    一字不差,底座升 0.3.6 时再一起放开)。只挂在 mt-app 的 Windows / macOS 段 ——
+#    wry 在 Linux 上要 webkit2gtk 系统库,CI 的 Linux 构建机没有。
+gpui-wry = "=0.6.4"
+# gpui-wry 用的 wry 分支(longbridge 维护)。建 WebView 要直接用它的 builder,
+# 版本与 gpui-wry 拉的那份一致,依赖树里只有一份。
+wry = { package = "lb-wry", version = "0.53.3" }
 
 # ---------------------------------------------------------------------------
 # 终端

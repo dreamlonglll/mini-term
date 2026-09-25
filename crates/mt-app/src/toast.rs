@@ -479,6 +479,8 @@ impl Render for ToastLayer {
                 .shadow_lg()
                 .cursor_pointer()
                 .occlude()
+                // 叠在 HTML 预览上时这块归 GPUI(见 `native_view` 模块注释「输入的空域」)
+                .child(crate::native_view::occluder())
                 // `.toast-card:hover { transform: translateX(-2px) }`
                 .hover(|el| el.left(px(-2.0)))
                 .child(
