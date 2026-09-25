@@ -1,0 +1,52 @@
+{
+  "schemaVersion": 1,
+  "id": "morning-mist",
+  "name": "Morning Mist 晨雾",
+  "appearance": "light",
+  "image": "background.jpg",
+  "art": {
+    "focusX": 0.62,
+    "focusY": 0.4
+  },
+  "colors": {
+    "background": "#f6f3f9",
+    "panel": "#eee9f4",
+    "panelAlt": "#e4ddee",
+    "accent": "#813412",
+    "accentAlt": "#674705",
+    "secondary": "#5d3a91",
+    "highlight": "#175536",
+    "text": "#261e33",
+    "muted": "#524861",
+    "line": "#d5cce1"
+  },
+  "effects": {
+    "surfaceOpacity": 0.2,
+    "backgroundDim": 0.2,
+    "terminalOpacity": 0.5,
+    "surfaceRadius": "12px",
+    "surfaceBlur": "14px"
+  },
+  "terminal": {
+    "foreground": "#261e33",
+    "cursor": "#813412",
+    "cursorAccent": "#f6f3f9",
+    "selectionBackground": "#81341233",
+    "selectionForeground": "#1a1424",
+    "black": "#2a2238",
+    "red": "#8d222f",
+    "green": "#175536",
+    "yellow": "#674705",
+    "blue": "#214990",
+    "magenta": "#693284",
+    "cyan": "#075450",
+    "white": "#4f485b",
+    "brightBlack": "#504660",
+    "brightRed": "#8b2a32",
+    "brightGreen": "#1a5534",
+    "brightYellow": "#64460b",
+    "brightBlue": "#274986",
+    "brightMagenta": "#663680",
+    "brightCyan": "#0c5552"
+  }
+}

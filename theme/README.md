@@ -17,11 +17,21 @@
 
 ---
 
+## Morning Mist 晨雾
+
+<img src="morning-mist/background.jpg" alt="Morning Mist 背景图" width="640">
+
+浅紫白底 + 蓝粉双色人像氛围图 + 深余烬 accent，浅色皮肤。面板与终端开得更透，氛围图清楚可见；次要文字与 ANSI 配色已按这张图压深，压在人物深色外套上也读得清。
+
+**📦 [下载 morning-mist.zip](https://github.com/dreamlonglll/mini-term/raw/main/theme/morning-mist.zip)（204 KB）** · [看包内文件](morning-mist/)
+
+---
+
 ## 怎么装
 
 ### 最快：下 zip → 「导入 zip」
 
-1. 点上面的 **下载 blue-hour.zip**（浏览器直接开始下载）；
+1. 点上面想要的那份 **下载 xxx.zip**（浏览器直接开始下载）；
 2. 回到 mini-term：设置 → 外观 → 主题与语言 → 外置皮肤 → **「导入 zip」**，选中刚下的文件；
 3. 列表里出现卡片，点一下就应用了。
 
@@ -33,7 +43,7 @@ GitHub 网页没法单独下载一个子目录，所以走文件夹得先把仓�
 git clone --depth 1 https://github.com/dreamlonglll/mini-term.git
 ```
 
-然后 **「添加皮肤」** 选中 `theme/blue-hour/` 那个文件夹（里面得有 `theme.json`）。
+然后 **「添加皮肤」** 选中 `theme/` 下对应的那个文件夹（如 `theme/blue-hour/`，里面得有 `theme.json`）。
 
 ### 或者：直接丢进皮肤目录
 
@@ -48,13 +58,13 @@ git clone --depth 1 https://github.com/dreamlonglll/mini-term.git
 
 ## 装完想调
 
-`blue-hour` 带背景图，所以终端和面板会**半透明地压在氛围图上**。嫌太透或太暗，直接改皮肤目录里的 `theme.json` —— **保存即热重载**（目录监听 300ms 防抖），不用重启：
+这两份皮肤都带背景图，所以终端和面板会**半透明地压在氛围图上**。嫌太透或太暗，直接改皮肤目录里的 `theme.json` —— **保存即热重载**（目录监听 300ms 防抖），不用重启：
 
 | 想改什么 | 改哪个 |
 |---|---|
 | 终端透明度 | `effects.terminalOpacity`（0–1，越小越透） |
 | 侧栏 / 面板透明度 | `effects.surfaceOpacity` |
-| 背景图压暗程度 | `effects.backgroundDim`（越大越暗） |
+| 背景图压暗程度 | `effects.backgroundDim`（越大越暗；纱罩取皮肤底色，浅色皮肤里是白纱，越大越淡） |
 | 人物在视口里的位置 | `art.focusX` / `art.focusY`（0–1） |
 | 配色 | `colors` 十个语义色、`terminal` 的 ANSI 配色 |
 
@@ -71,3 +81,5 @@ git clone --depth 1 https://github.com/dreamlonglll/mini-term.git
 **zip 与文件夹是同一份东西。** 两者的 `theme.json` 与背景图逐字节对齐，有测试钉着，不会漂开 —— 走哪条路装都一样。
 
 **背景图。** `blue-hour/background.jpg` 是 2560×1440 / JPEG q85（231 KB），由 3840×2160 的 PNG 原图压制：背景要被 `backgroundDim` 压暗、还要被面板盖掉大半，原图那 6.9 MB 进 Git 不划算，观感上分辨不出差别。这张图随皮肤一起分发，**出处尚未注明** —— 仓库以 MIT 发布，但 MIT 覆盖的是代码，图片素材需要单独说明来源与许可。在补上之前，请勿把它当作可自由再分发的素材；如果你是版权方，欢迎开 issue 告知。
+
+`morning-mist/background.jpg` 同样是 2560×1440 / JPEG q85（209 KB），由 3840×2160 的 PNG 原图压制，已确认可随皮肤一起再分发。
