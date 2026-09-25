@@ -243,12 +243,12 @@ pub fn hole_art(art: mt_ui::theme_bridge::BackgroundArt) -> impl IntoElement {
 /// 一帧收尾(paint 期,此时全树 prepaint 已完成):没被摆放的子视图等呈现后隐藏,
 /// 摆着的按本帧浮层对账输入(见模块注释「输入的空域」),清屏色跟着洞的有无切换。
 fn finish_frame(window: &mut Window, cx: &mut App) {
-    let frame = current_frame();
     let any_hole = STATE.with(|s| !s.borrow().holes.is_empty());
 
     #[cfg(any(windows, target_os = "macos"))]
     {
         use gpui_component::WindowExt as _;
+        let frame = current_frame();
         let (views, occluders, block_input) = STATE.with(|s| {
             let mut s = s.borrow_mut();
             s.views.retain(|view| view.strong_count() > 0);
