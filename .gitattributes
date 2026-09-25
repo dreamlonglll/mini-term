@@ -1,0 +1,4 @@
+# 皮肤库按字节原样分发:每份皮肤的 zip 与同名文件夹要逐字节一致
+# (mt-theme-packs 的测试会对账)。Windows 上 core.autocrlf=true 检出会把
+# 文件夹里的 JSON 换成 CRLF,zip 里仍是 LF,两边就对不上了。
+theme/**/*.json text eol=lf
