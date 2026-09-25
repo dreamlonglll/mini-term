@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.13.9-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.13.10-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -151,7 +151,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 - **Markdown 预览渲染 Mermaid 图表** — 顶层的 ```` ```mermaid ```` 围栏渲染成图（流程图 / 时序图 / 类图 / 状态图 / ER / 饼图 / 甘特图 / 思维导图等），纯 Rust 实现（`mermaid-rs-renderer` 排版 + gpui 自带的 SVG 栅格器），不依赖浏览器或 Node，中文标签用系统字体、节点里的 emoji 也能落字上色；配色跟随亮 / 暗主题、画布底色与文档页同色，2 倍栅格化在高 DPI 下不糊；渲染在后台线程完成、先占位后换图，宽度超过正文列时等比缩小。点击图表在整窗浮层里放大查看：滚轮 / 触控板捏合以光标为中心缩放、按住拖动平移、双击回到适应窗口，`+` / `-` / `0` 键与右上角工具栏同效，Esc / `×` / 点遮罩空白关闭。渲染失败（语法错误、空图、不支持的图类型）退回代码块并在下方给出原因，绝不留白；列表 / 引用块里的围栏仍按代码块显示。流程图在渲染器与 mermaid.js 不一致的几处按 mermaid.js 口径排版：标签里的 HTML 实体（`&lt;`、`#quot;` 等）解码后再画，子图有节点连到外面时忽略自己的 `direction` 跟父图方向走，只靠虚线挂着的节点也参与分层而不是被扔到最左。图表位图挂在进程级资源缓存上，文档改动后不再存在的图表与关闭页签时的全部图表都会连纹理一起释放
 - **Markdown 预览里的链接** — 点链接按四种目标分别处置：http(s) 外链先弹「在浏览器中打开链接?」确认再交给系统浏览器；`#锚点` 在当前预览里滚到对应标题（标题按 GitHub 风格 slug 比对，原始 HTML 的 `id="…"` 也认，围栏代码块里的 `#` 不算标题）；mailto / tel 这类其它协议直接交给系统；指向本地文件的相对 / 绝对路径按当前文件所在目录解析后**作为新页签打开**（已开着的直接切过去，文件不存在则提示）——原版单窗口里换文件的「返回」历史栈不再需要，页签条就是历史
 - **Markdown 行内代码配色与换行** — 行内 `code` 按原版 `.md-preview code` 的口径显示为主题强调色橙字 + 深底胶囊（经 gpui-component 0.6.2 新增的 `TextViewStyle.inline_code` 钩子直接给色，不再借用全局 accent 槽位，AI 历史抽屉里的会话正文同一口径）；底座升到 gpui-base 0.6.2 后，含行内代码的中文段落在换行处尾字不再掉到下一行与下行重叠（0.6.1 把已排好的片段再按逐字宽度包了一次行）
-- **HTML 预览** — `.html` 除源码编辑器外另有预览态（简版渲染，顶部一条「无 CSS / 无脚本」说明），`src` / `href` / `poster` 的本地目标改写成 `file://` 才看得到图片与本地资源；工具栏常驻「用浏览器打开」，走 **https 协议关联**而非 `.html` 文件关联（后者常被设成编辑器，点了只会再开一个编辑器）——Windows 读 `https` 的 UserChoice ProgId 再取 `shell\open\command`，三层退让 https → http → 系统级 `HKCR\http`，找不到浏览器直接报错而不悄悄退回文件关联；路径转 URL 时转义 `%`、空格、`#`、`?`
+- **HTML 预览** — 本地 `.html` 的预览态用系统 WebView（Windows 为 WebView2，macOS 为 WKWebView）真渲染，CSS 与脚本照跑，效果与浏览器一致：页面经自定义协议按项目根提供，相对路径与站点根路径（`/assets/…`）的样式、脚本、图片、字体都能加载，编辑后未保存的草稿切回预览即可看到；右键菜单、弹窗、toast、右侧抽屉照常盖在网页之上且点得到，切页签 / 切源码时网页隐藏但状态保留。安全口径比浏览器直接打开本地文件还紧：只放行网页资源扩展名、拒绝页面用 fetch / XHR 读项目文件，外链先弹确认再交系统浏览器，链到本地文件作为新页签打开，下载一律拒绝。WebView 建不起来（未装 WebView2 运行时）、Linux 或设了 `MT_DISABLE_HTML_WEBVIEW=1` 时回落简版渲染（顶部一条「无 CSS / 无脚本」说明，`src` / `href` / `poster` 的本地目标改写成 `file://`）；WebView 的用户数据目录落在应用数据目录下的 `webview/`。工具栏常驻「用浏览器打开」，走 **https 协议关联**而非 `.html` 文件关联（后者常被设成编辑器，点了只会再开一个编辑器）——Windows 读 `https` 的 UserChoice ProgId 再取 `shell\open\command`，三层退让 https → http → 系统级 `HKCR\http`，找不到浏览器直接报错而不悄悄退回文件关联；路径转 URL 时转义 `%`、空格、`#`、`?`
 - **外部编辑器打开** — 文件树右上角按钮一键用配置的编辑器（默认 VS Code）打开当前项目，路径可在「设置 → 系统 → 外部编辑器」自定义；文件可用系统默认应用打开
 - **项目级环境变量** — 项目右键菜单「环境变量…」打开管理弹窗，行级 `[启用 checkbox][key][value][✕]` 布局，启动该项目终端时按项目注入到 PTY 子进程；严格 POSIX 校验（key 匹配 `^[A-Za-z_][A-Za-z0-9_]*$`、非 `MINITERM_` 前缀、不可用 `WSLENV`、项目内不重复，value 禁 `\n/\r/\0`）；校验之外再加 `MINITERM_` 前缀 + `WSLENV` 防御性过滤，即便手改 `config.json` 绕过 UI 校验也无法破坏 hook 协议或 WSLENV 拼接；WSL 项目下环境变量通过 WSLENV 机制透传至 Linux bash（`/u` 单向不做路径翻译；`~/.bashrc` 中 `export` 同名变量会覆盖）
 
@@ -202,14 +202,14 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 
 | 层 | 实现 |
 |---|---|
-| 壳 / 渲染 | GPUI（gpui-pre 0.3，Zed 2026-09 快照；GPU 原生渲染，单进程、无 WebView） |
+| 壳 / 渲染 | GPUI（gpui-pre 0.3，Zed 2026-09 快照；GPU 原生渲染，单进程；仅 HTML 预览按需嵌入系统 WebView） |
 | UI | 纯 Rust：gpui-component + 自绘组件 |
 | 终端 | alacritty_terminal（进程内 VT 解析，零 IPC、零序列化）· portable-pty |
 | 状态 / 布局 | 单一 Store · 递归 SplitNode 分屏树 |
 | Git / 文件 | git2（libgit2）· notify + ignore |
 | 用量统计 | rusqlite 本地账本 · 自绘趋势图 |
 | 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`） |
-| 测试 | **2115 个 Rust 测试**（33 个测试目标）+ 中转服务端协议边界测试 |
+| 测试 | **2129 个 Rust 测试**（33 个测试目标）+ 中转服务端协议边界测试 |
 
 ## 快速开始
 
@@ -350,7 +350,7 @@ Root（gpui-component 根，承载 Dialog / 通知层）
 提交代码前请运行：
 
 ```bash
-# 全工作区 Rust 测试（33 个测试目标、2115 例）
+# 全工作区 Rust 测试（33 个测试目标、2129 例）
 cargo test --workspace
 
 # Node 侧测试（仅 2 个文件：ConPTY 打包 / vendored-openssl 守卫）

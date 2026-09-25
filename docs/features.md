@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.13.9-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.13.10-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -151,7 +151,7 @@ Watch the AI running on your desktop from your phone while you're out, and send 
 - **Mermaid diagrams in Markdown preview** — Top-level ```` ```mermaid ```` fences are rendered as diagrams (flowchart / sequence / class / state / ER / pie / Gantt / mindmap and more) by a pure-Rust pipeline (`mermaid-rs-renderer` for layout + gpui's built-in SVG rasterizer) — no browser or Node.js involved, CJK labels use system fonts, and emoji inside node labels render in color. Colors follow the light / dark theme with the canvas matching the document background, rasterized at 2x so high-DPI stays crisp; rendering happens on a background thread (placeholder first, then the image), and diagrams wider than the text column are scaled down proportionally. Click a diagram to open it in a full-window lightbox: mouse wheel / trackpad pinch zooms around the cursor, drag pans, double-click fits to window, `+` / `-` / `0` keys and a corner toolbar do the same, and Esc / `×` / clicking the backdrop closes it. Failures (syntax errors, empty diagrams, unsupported diagram types) fall back to the code block with the reason underneath — never a blank space; fences inside lists / blockquotes stay as code. Flowcharts follow mermaid.js conventions where the renderer differs: HTML entities in labels (`&lt;`, `#quot;` …) are decoded before drawing, a subgraph with edges to the outside ignores its own `direction` and follows the parent, and nodes attached only by dotted edges still take part in layering instead of being pushed to the far left. Diagram bitmaps live in the process-wide asset cache, and diagrams that disappear after an edit, or all of them when a tab closes, are released together with their GPU textures.
 - **Links inside the Markdown preview** — Clicking a link dispatches on four kinds of target: http(s) links ask "Open link in browser?" first and then hand off to the system browser; `#anchor` links scroll the current preview to the matching heading (headings are compared by GitHub-style slug, raw HTML `id="…"` attributes count too, and `#` lines inside fenced code blocks are not headings); other schemes such as mailto / tel go straight to the system; relative or absolute paths to local files are resolved against the current file's directory and **opened as a new tab** (an already-open tab is simply activated; a missing file shows a notice) — the old single-window "back" history stack is no longer needed because the tab bar is the history
 - **Inline code color and wrapping in Markdown** — Inline `code` follows the original `.md-preview code` rule: theme-accent orange text on an elevated-background pill (set directly through the `TextViewStyle.inline_code` hook added in gpui-component 0.6.2, instead of borrowing the global accent slot; the session viewer in the AI history drawer uses the same style). With the base moved to gpui-base 0.6.2, CJK paragraphs containing inline code no longer drop their last character onto the next line where it overlapped the following text (0.6.1 re-wrapped already-laid-out fragments by per-character width)
-- **HTML preview** — Besides the source editor, `.html` files get a preview mode (simplified rendering, with a "no CSS / no scripts" notice at the top); local targets in `src` / `href` / `poster` are rewritten to `file://` so images and local assets actually show up. The toolbar always carries "Open in browser", which resolves through the **https protocol handler** rather than the `.html` file association (the latter is often set to an editor, so clicking it just opened another editor) — on Windows it reads the UserChoice ProgId for `https`, then its `shell\open\command`, falling back https → http → system-level `HKCR\http`; if no browser is found it reports an error instead of silently falling back to the file association. Paths are escaped for `%`, spaces, `#`, and `?` when converted to URLs.
+- **HTML preview** — The preview mode of local `.html` files renders in the system WebView (WebView2 on Windows, WKWebView on macOS), so CSS and scripts run and the page looks exactly as it does in a browser: the page is served from the project root through a custom protocol, so relative and site-root (`/assets/…`) stylesheets, scripts, images and fonts all load, and unsaved edits show up as soon as you switch back to preview. Context menus, dialogs, toasts and the right drawer still draw on top of the page and remain clickable; switching tabs or to source hides the page but keeps its state. It is stricter than opening the file in a browser: only web-asset extensions are served, page scripts cannot fetch / XHR other project files, external links ask for confirmation before going to the system browser, links to local files open as a new tab, and downloads are refused. When the WebView cannot be created (no WebView2 runtime), on Linux, or with `MT_DISABLE_HTML_WEBVIEW=1`, it falls back to the simplified renderer (a "no CSS / no scripts" notice at the top, with local `src` / `href` / `poster` targets rewritten to `file://`); the WebView's user-data folder lives under `webview/` in the app data directory. The toolbar always carries "Open in browser", which resolves through the **https protocol handler** rather than the `.html` file association (the latter is often set to an editor, so clicking it just opened another editor) — on Windows it reads the UserChoice ProgId for `https`, then its `shell\open\command`, falling back https → http → system-level `HKCR\http`; if no browser is found it reports an error instead of silently falling back to the file association. Paths are escaped for `%`, spaces, `#`, and `?` when converted to URLs.
 - **Open in external editor** — A button at the top-right of the file tree opens the current project in your configured editor (VS Code by default), with the path customizable under "Settings → System → Editors"; files can be opened with the system default app.
 - **Project-level environment variables** — The project context menu "Environment Variables…" opens a management dialog with a row-level `[enable checkbox][key][value][✕]` layout, injecting per-project variables into the PTY child process when starting that project's terminal; strict POSIX validation (key matches `^[A-Za-z_][A-Za-z0-9_]*$`, no `MINITERM_` prefix, no `WSLENV`, no duplicates within a project, and value forbids `\n/\r/\0`); on top of validation, a defensive `MINITERM_`-prefix + `WSLENV` filter is applied, so even hand-editing `config.json` to bypass the UI validation cannot break the hook protocol or WSLENV concatenation; under WSL projects, variables pass through to Linux bash via the WSLENV mechanism (`/u` is one-way without path translation; an `export` of the same name in `~/.bashrc` will override).
 
@@ -202,14 +202,14 @@ The whole application is **native Rust** (the earlier Tauri + React build was re
 
 | Layer | Implementation |
 |---|---|
-| Shell / rendering | GPUI (gpui-pre 0.3, a 2026-09 snapshot of Zed's framework — GPU-native rendering, single process, no WebView) |
+| Shell / rendering | GPUI (gpui-pre 0.3, a 2026-09 snapshot of Zed's framework — GPU-native rendering, single process; only the HTML preview embeds the system WebView on demand) |
 | UI | Pure Rust: gpui-component + hand-drawn widgets |
 | Terminal | alacritty_terminal (in-process VT parsing — zero IPC, zero serialization) · portable-pty |
 | State / layout | Single store · recursive SplitNode tree |
 | Git / files | git2 (libgit2) · notify + ignore |
 | Usage stats | rusqlite local ledger · hand-drawn trend charts |
 | Mobile relay | axum + tokio WebSocket (`relay-server/`) · React + Vite PWA (`mobile/`) |
-| Tests | **2,115 Rust tests** (33 test targets) + relay-server protocol boundary tests |
+| Tests | **2,129 Rust tests** (33 test targets) + relay-server protocol boundary tests |
 
 ## Getting Started
 
@@ -350,7 +350,7 @@ Issues and PRs are welcome. External contributions are merged after functional v
 Before submitting, please run:
 
 ```bash
-# Workspace-wide Rust tests (33 test targets, 2,115 cases)
+# Workspace-wide Rust tests (33 test targets, 2,129 cases)
 cargo test --workspace
 
 # Node-side tests (just 2 files: ConPTY bundling / vendored-openssl guard)
