@@ -437,7 +437,9 @@ mod tests {
     #[test]
     fn 默认后台那一档必须明显慢于前台() {
         // 「后台降频」是这个模块的立身之本之一,默认值拉平了就等于没做
-        assert!(DEFAULT_FOREGROUND_FPS >= DEFAULT_BACKGROUND_FPS * 4);
+        const {
+            assert!(DEFAULT_FOREGROUND_FPS >= DEFAULT_BACKGROUND_FPS * 4);
+        }
     }
 
     #[test]
