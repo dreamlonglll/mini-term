@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.13.10-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.13.11--pre-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -86,16 +86,18 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 ### AI 进程感知
 
 - **Hook 事件系统** — 接入 Claude Code / Codex / Grok Build / oh-my-pi 官方 Hook API，接收 AI 工具事件（SessionStart / End、ToolUse 等），比进程轮询更精准及时；内置 `miniterm-hook` CLI 工具供 Hook 系统调用，自动 POST 事件到本地服务器（oh-my-pi 改为装进程内扩展，见下）；设置界面按「注入目标」勾选注册 / 卸载 Hook 配置——Claude Code / Codex / Grok / oh-my-pi 各一行可选，注册与卸载只作用于所选（各家配置文件互不相干，只用其中一家的用户没理由被写其它几家的配置）；每行显示该家的配置文件路径与注册现状（未注册 / 已注册 N 个事件 / 旧版本 N⁄M，黄色提示重新注册可补齐新增事件），默认勾选已经装了的那几家（老用户再点注册就是纯补齐），一家都没装过时全选保住首次一键注册的体验；写入合并而非覆盖用户已有 hook。Codex 权限请求从审批到工具执行完成期间持续保持 `ai-working`，避免提前触发任务完成提醒
-- **实时状态检测** — Hook 一旦接入即为该面板的状态来源，逐轮状态直接由 hook 事件决定，不看输出活跃度（AI 空闲期 TUI 的定时重绘曾被误判为「又在工作」，导致完成通知反复触发）；无 hook 的面板降级为输入检测（识别键入的 `claude` / `codex` / `opencode` / `pi` / `grok` / `omp` 命令，含 ↑ 历史与 Tab 补全的行快照兜底）加 500ms 输出活跃度轮询，显示 idle / working / error 状态
+- **实时状态检测** — Hook 一旦接入即为该面板的状态来源，逐轮状态直接由 hook 事件决定，不看输出活跃度（AI 空闲期 TUI 的定时重绘曾被误判为「又在工作」，导致完成通知反复触发）；无 hook 的面板降级为输入检测（识别键入的 `claude` / `codex` / `opencode` / `pi` / `grok` / `omp` 命令，含 ↑ 历史与 Tab 补全的行快照兜底）加 500ms 输出活跃度轮询，显示 idle / working / error 状态。降级路径的完成播报只认**用户提交过的回合**：在 AI 会话里回车提交一行才上「回合闩」，这一回合第一个 working → idle 下降沿算完成并摘闩；启动 banner、AI 空闲期 TUI 的零星重绘、被 Esc / Ctrl+C 打断的回合一律带 `Quiet` 成因，不再周期性误报「任务完成」
 - **Grok Build 的 hook 接入** — `grok`（xAI 的终端 agent）走与 Claude / Codex 同一套 hook 链路，状态徽章、完成播报、AI 启动器与移动端发起会话全通。三处结构性差异各有对策：① grok 默认还会扫描 `~/.claude/settings.json` 的 hooks（Claude 兼容层），同一事件因此会来两趟——sidecar 按 `GROK_SESSION_ID` 加「有没有 argv」判出兼容层那趟并丢弃，而用户只注册了 Claude 时又必须放行（那是唯一来源），判据落在「原生 hook 文件是否在场」上；② 注册进 `~/.grok/hooks/` 的命令是**不含空格的裸文件名**（注册时把 hook 二进制复制进同目录），因为带空格的命令会被 grok 丢给 shell，而 Windows 上具体是 git-bash / pwsh / powershell / cmd 由环境决定、四家引号语义互斥，事件名改由 grok 注入的 `GROK_HOOK_EVENT` 传递；③ grok 没有 `PermissionRequest` 事件，「等你批准」是 `Notification` 的 `permission_prompt` 类型，归一化后点同一盏黄灯，而它的 `task_complete` 是知会不是待办，不点灯。另有一处专门抹平：grok 在会话收尾时会补发一次 `Stop`（`reason` 为 `channel_closed` / `shutdown`），不拦掉的话每次退出 grok 都要白响一声「任务完成」
 - **Grok 的会话记录形态** — 与另外两家「一个文件一个会话」不同，grok 一个会话是**一整个目录**：`{grok_home}/sessions/{URL 编码的 cwd}/{session-id}/`，正文在 `updates.jsonl`（ACP 会话更新流），元信息在 `summary.json`。定位项目走**解码目录名**而不是编码项目路径（后者要逐字复刻它所用编码库的转义集；超长路径退化成 `{slug}-{hash}` 形态时回落读目录内的 `.cwd`）。正文一条消息会被拆成任意多个 chunk 行流式落盘，必须攒到边界（工具调用、回合收尾、对方开口）才算一条，否则一句回答在镜像里会碎成几十条。用量取 `turn_completed` 自带的 usage（按模型分解，ACP 口径的输入含缓存读写，拆成互斥桶后与 `totalTokens` 对齐）；**工具排行对 grok 为空**——持久化的 ACP `tool_call` 只带人类可读的 title，真正的工具名不落盘，拿 title 顶替会往排行里灌自然语言标签
 - **oh-my-pi（omp）的 hook 接入** — `omp`（can1357/oh-my-pi，pi 的分支）没有「shell 命令 hook」，它的扩展点是 Bun 运行时**进程内加载的 TS 模块**。注册因此不是写命令而是把一份自包含的扩展 `miniterm.ts` 写进 `~/.omp/agent/extensions/`（尊重 `PI_CODING_AGENT_DIR` / `PI_CONFIG_DIR` / `PI_PROFILE`），扩展在 omp 进程内直接 `fetch` 本地 hook 服务器——不经 sidecar 二进制，不在 Mini-Term 终端里（没有 `MINITERM_PTY_ID`）时整个是空操作。omp 的生命周期事件被翻译成与 Claude 同名的事件，hook 服务器一行不用改：`agent_start` → `UserPromptSubmit`；`agent_end` → `Stop`（最后一轮 assistant 以错误收场则 `StopFailure`；`stopReason` 为 `aborted` 的上报成 `Stop` + `reason: aborted`，落地为 `Interrupt`，绝不播成「任务完成」）；`tool_call` / `tool_result` → `PreToolUse` / `PostToolUse`（出错 `PostToolUseFailure`）；`ask` 提问工具 → `Elicitation` / `ElicitationResult`（等你作答期间点黄灯）；`tool_approval_requested` / `tool_approval_resolved` → `PermissionRequest` / `PreToolUse` 或 `PermissionDenied`；`auto_retry_start` → 重试类 `Notification`（保持 `ai-working`）；自动压缩 → `PreCompact` / `PostCompact`；`session_switch` / `session_branch` → 旧会话以 `reason: clear` 收尾、新会话 SessionStart；`session_shutdown` → `SessionEnd`。**只有交互式主会话上报**（`ctx.mode === "tui"`）：omp 的子代理（`task` 工具）是同一进程里的独立会话，会把每个扩展工厂再绑定一遍，若照常上报，子代理跑完就会把父会话误报成「已完成」。omp 只在启动时扫描扩展目录，注册后正在运行的实例要重启或执行 `/reload-plugins`；已注册的用户在 Mini-Term 每次启动时扩展会被刷成当前模板，升级自动带过去。会话记录（`~/.omp/agent/sessions/{编码 cwd}/{timestamp}_{session-id}.jsonl`）已接入移动端对话镜像——按 hook 上报的会话 id 精确定位，解析 user / assistant 文本、ask 提问与作答回执；历史面板、用量统计与会话分支对 omp 仍为空；启动续接靠 hook 上报的会话 id（`omp --resume <id>`）
 - **只靠输入检测识别的 agent** — `opencode` / `pi` 没有接 hook，也没有可解析的本地会话记录：状态徽章、完成播报、AI 启动器与移动端发起会话四条链路照常可用，但对话镜像、AI 历史面板与用量统计对它们为空。镜像的启发式绑定据此设了白名单（`mt-relay::mirror` 的 `agent_has_session_log`），不在名单内直接返回空镜像，不会退而绑到同项目里其它 agent 最新的会话文件、把别人的对话贴到这个 pane 上。命令匹配走 basename 全等，`pip` / `ping` / `pixi` / `pi.py` 不会被误判成 `pi`
 - **徽章卡死的三重兜底** — `Stop` 事件在若干情形下根本不触发：回合因 API 错误结束走 `StopFailure`（映射 ai-idle 并点黄灯提示回来重发）、用户按 Esc / Ctrl+C 打断则不发任何事件（由输入检测收敛，cause=`Interrupt`）；两者都覆盖不到的残余情况再由**停摆判定**兜底——hook 状态停在 ai-working 且状态与 PTY 输出双双静默 10 秒即收敛，此前已触发过退出（Ctrl+D / 双击 Ctrl+C / `/exit`，且之后无 hook 事件扶正）则判为已退出回落 idle，否则降为 ai-idle。三条兜底的结论都**一次性落盘**进 hook 状态，触发一次即收敛不再摆动，且 cause 一律不是 `Stop`，因此不会被当成「任务完成」播报（这正是 v0.9.3 删掉无记忆版兜底的原因）；正等用户批准的面板（如 Codex 的 `PermissionRequest`）豁免停摆判定，否则会连托盘黄灯一并抹掉
-- **状态聚合** — 面板 → 标签页 → 项目逐层聚合，优先级 `error > ai-working > ai-idle > idle`
-- **完成提醒三件套** — AI 任务从 working → idle、且成因确为 `Stop` 事件时立刻触发（权限请求、通知、澄清同样落到 `ai-idle`，不再被误报为任务完成；无 hook 的降级路径仍以下降沿为准）：
+- **终端退出即终态** — 终端进程退出或根本没起来时 pane 落 error（页签与项目行亮红叉），当场撤出 500ms 轮询并清掉它的完成记录；迟到的 hook 事件与轮询结果不再把红叉盖成绿勾，SSH 断线时也不会再误报一次「AI 完成」。只有「重连」换一条新进程才离开 error
+- **状态聚合与第五态** — 面板 → 标签页 → 项目逐层聚合，优先级 `error > 等你处理 > ai-working > ai-idle > idle`。「等你处理」是状态灯的第五档（实心圆 + 叹号，暗色主题橙、亮色主题金，静止不闪）：AI 停下来等你批工具权限、填表单，或这一轮因 API 错误结束时亮起——此前 Claude 等授权显示成完成的绿勾、Codex 等授权显示成在跑的转圈。页签、折叠标题条、悬停预览、项目行、项目切换器、终端列表竖条、边条全局徽标与会话列表同一口径；边条徽标逐 pane 把 error 压成 idle，同一项目里退出的 shell 不会藏掉在跑的 AI
+- **完成提醒三件套** — AI 任务从 working → idle、且成因确为 `Stop` 事件时立刻触发（权限请求、通知、澄清同样落到 `ai-idle`，不再被误报为任务完成；Claude 授权被拒后直接收尾的回合没有下降沿，同样照常播报；无 hook 的降级路径以用户提交过的回合的下降沿为准）：
   - 右下角 Toast 桌面通知（仅非活跃项目弹出，同项目去重）
   - 项目列表 DONE 徽章，点击清除
+  - 页签绿点：做完了还没看的页签在关闭钮的位置留一颗绿点（悬停换回 ×，不撑宽页签），把焦点给到它才消失；回到窗口不会一次清空，一眼看得出是哪几个做完了
   - 任务栏闪烁（Windows）/ Dock 跳动（macOS），窗口失焦时才触发
   - 提示音播放（内置合成默认音，支持自定义音频文件）
   - 所有通知开关独立可配，在「设置 → AI → 通知提醒」页统一管理（Hook 注册另在同组的「Hook 事件」页）
@@ -209,7 +211,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 | Git / 文件 | git2（libgit2）· notify + ignore |
 | 用量统计 | rusqlite 本地账本 · 自绘趋势图 |
 | 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`） |
-| 测试 | **2129 个 Rust 测试**（33 个测试目标）+ 中转服务端协议边界测试 |
+| 测试 | **2147 个 Rust 测试**（33 个测试目标）+ 中转服务端协议边界测试 |
 
 ## 快速开始
 
@@ -315,10 +317,10 @@ attention 上升沿(PermissionRequest…) → Toast(警告色) + 提示音 + 任
 
 ### 状态优先级
 
-终端面板状态从叶节点聚合到标签页和项目级别：
+终端面板状态从叶节点聚合到标签页和项目级别（「等你处理」由四态叠 attention 位得出，只是显示档位，后端与移动端协议仍是四态）：
 
 ```
-error > ai-working > ai-idle > idle
+error > 等你处理(attention) > ai-working > ai-idle > idle
 ```
 
 ### 组件树
@@ -350,7 +352,7 @@ Root（gpui-component 根，承载 Dialog / 通知层）
 提交代码前请运行：
 
 ```bash
-# 全工作区 Rust 测试（33 个测试目标、2129 例）
+# 全工作区 Rust 测试（33 个测试目标、2147 例）
 cargo test --workspace
 
 # Node 侧测试（仅 2 个文件：ConPTY 打包 / vendored-openssl 守卫）
