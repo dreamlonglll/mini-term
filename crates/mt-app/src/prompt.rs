@@ -49,6 +49,10 @@ use crate::ui;
 /// [`open_guarded`] 的 `Dialog → Dialog` 签名。这里按 0.5.1 的原样自绘:
 /// 按钮不直接调回调,而是派发 `Confirm` / `Cancel` 动作,由 Dialog 自己走
 /// `on_ok` / `on_cancel` → 关闭的既有路径(Enter / Esc 也走同一条)。
+///
+/// 组件库的 `Button` 只给 link / text 两种变体手型光标,其余一律 `cursor_default`;
+/// 实例上设的样式最后合并(`refine_style(&instance_style)`),所以这里的
+/// `cursor_pointer` 盖得过它。
 pub fn confirm_footer<S: Into<SharedString>>(
     ok: impl Into<SharedString>,
     cancel: Option<S>,
@@ -57,12 +61,14 @@ pub fn confirm_footer<S: Into<SharedString>>(
         .children(cancel.map(|cancel| {
             Button::new("cancel")
                 .label(cancel.into())
+                .cursor_pointer()
                 .on_click(|_, window, cx| window.dispatch_action(Box::new(Cancel), cx))
         }))
         .child(
             Button::new("ok")
                 .label(ok)
                 .primary()
+                .cursor_pointer()
                 .on_click(|_, window, cx| {
                     window.dispatch_action(
                         Box::new(gpui_component::dialog::Confirm { secondary: false }),
