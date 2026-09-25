@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.13.8--pre-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.13.9-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -44,7 +44,7 @@ Mini-Term solves all of the above with one lightweight desktop app.
 - **Recursive splitting** — Arbitrarily nested horizontal / vertical splits, drag to adjust ratios.
 - **Pane drag to rearrange & merge** — Terminal tabs can be dragged as a unit: drop onto another group's tab bar or the center of its terminal area to merge into that group (the tab bar shows an insertion indicator, and dragging within the same bar reorders tabs), or drop onto one of the four edges (25% depth) to split off a new pane in that direction, with a translucent drop preview. Dragging uses GPUI's built-in drag & drop (on_drag / on_drop), Esc cancels mid-drag, and cached terminal instances migrate intact through the layout-tree rearrangement — terminal content and PTYs are unaffected.
 - **Pane maximize** — Double-click the tab bar's empty area (or the maximize button on the right) to temporarily fill the terminal area with the current group; double-click or press again to restore. The state is runtime-only (never persisted), closing the maximized pane falls back to the full tree view automatically, and splitting while maximized restores first so the new pane is never invisible.
-- **High-performance rendering** — alacritty_terminal parses VT in-process with GPU-native rendering — zero IPC, zero serialization; minimum contrast is enforced, fixing Claude's prompt text being nearly invisible against a dark background. Terminal output, drag-selection and scrolling repaint only the terminal's own view tree, leaving the sidebar and project list caches untouched; when the window is minimized or the display sleeps the output and animation pumps stop entirely (not a single frame), an unfocused-but-visible window drops to 2fps, and everything wakes the moment it becomes visible again.
+- **High-performance rendering** — alacritty_terminal parses VT in-process with GPU-native rendering — zero IPC, zero serialization; minimum contrast is enforced, fixing Claude's prompt text being nearly invisible against a dark background. Terminal output, drag-selection and scrolling repaint only the terminal's own view tree, leaving the sidebar and project list caches untouched; when the window is minimized or the display sleeps the output and animation pumps stop entirely (not a single frame), an unfocused-but-visible window drops the terminal to 5fps and the animation pump to 2fps, and everything wakes the moment it becomes visible again. The terminal redraw rate is adjustable under Settings → System → Performance: focused 10–240 (default 30, never above the display's refresh rate) and unfocused 1–60 (default 5), effective immediately; returning to the foreground repaints on the spot and switches to the foreground cadence at once, so even a very low background rate never leaves the screen frozen waiting for the previous tick.
 - **Configurable scrollback buffer** — The number of retained normal-buffer lines is adjustable in Settings (10,000 by default; lowering it takes effect immediately and frees the memory — an early version hard-coded 100,000 lines and could be pushed to out-of-memory across enough projects and splits, a lesson baked into today's default). Standard CSI 3J (ED3) is honored globally, so applications such as Codex can discard transient output and replay a folded transcript, while `/clear` can truly purge old history. On Windows, mini-term bundles and preloads a pinned official ConPTY compatibility runtime (with a system-ConPTY fallback if validation fails) to keep Codex scrolling and transcript folding consistent across Windows versions.
 - **Terminal caching** — Switching projects / tabs / panes never rebuilds the terminal instance, so existing content is preserved; lazy startup creates a PTY only for the currently visible pane, avoiding the slowdown of spawning more terminals the more history projects you have.
 - **Project-switch caching** — File-tree / Git-history data is cached per project, so switching back to a visited project renders with zero latency; directory loading and Git status run in parallel.
@@ -209,7 +209,7 @@ The whole application is **native Rust** (the earlier Tauri + React build was re
 | Git / files | git2 (libgit2) · notify + ignore |
 | Usage stats | rusqlite local ledger · hand-drawn trend charts |
 | Mobile relay | axum + tokio WebSocket (`relay-server/`) · React + Vite PWA (`mobile/`) |
-| Tests | **2,107 Rust tests** (33 test targets) + relay-server protocol boundary tests |
+| Tests | **2,115 Rust tests** (33 test targets) + relay-server protocol boundary tests |
 
 ## Getting Started
 
@@ -350,7 +350,7 @@ Issues and PRs are welcome. External contributions are merged after functional v
 Before submitting, please run:
 
 ```bash
-# Workspace-wide Rust tests (33 test targets, 2,107 cases)
+# Workspace-wide Rust tests (33 test targets, 2,115 cases)
 cargo test --workspace
 
 # Node-side tests (just 2 files: ConPTY bundling / vendored-openssl guard)

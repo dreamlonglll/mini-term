@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.13.8--pre-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.13.9-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -70,7 +70,7 @@
 | **拖选停留自动复制** | 拖选后按住鼠标静止超过设定时长自动复制选区并弹「已复制」气泡，时长可调（0 = 关闭） |
 | **Alt+单击定位光标** | 按住 Alt（macOS ⌥）单击命令行任意位置，光标直接挪过去——同一行内按列差合成方向键；跨行一律不动，免得触发行编辑器的历史召回。shell 提示符下逐格准确，Claude CLI 这类 Ink TUI 不保证 |
 | **启动零网络请求** | 原生渲染无 Web 资源，启动不发任何网络请求（价格表按天拉取，拉不到用缓存）；启动时配置只读一次、备份挪到后台，首帧出得更快 |
-| **刷屏不卡界面** | PTY 字节在后台线程直喂 VT 状态机、UI 按帧取格子渲染——单进程零 IPC，没有中间缓冲可堆积，`cat` 大文件也拖不垮界面；终端刷屏只重绘终端自己，闲置的分屏终端直接复用上一帧，窗口最小化时渲染整个停掉、一帧不画 |
+| **刷屏不卡界面** | PTY 字节在后台线程直喂 VT 状态机、UI 按帧取格子渲染——单进程零 IPC，没有中间缓冲可堆积，`cat` 大文件也拖不垮界面；终端刷屏只重绘终端自己，闲置的分屏终端直接复用上一帧，窗口最小化时渲染整个停掉、一帧不画；终端重绘帧率可在「系统 → 性能」里调（前台 10~240、默认 30，失焦 1~60、默认 5），高刷屏想更顺就调高，笔记本想省电就调低，改完即时生效 |
 | **新版 ConPTY** | Windows 下随包附带 Windows Terminal 1.24 的 `conpty.dll` + `OpenConsole.exe` 并在启动时预载，绕开老版本系统 conhost 的宽字符列宽、换行回绕、resize 丢行等已知缺陷；怀疑显示问题出在它身上时，设环境变量 `MT_DISABLE_PORTABLE_CONPTY=1` 即回落系统 ConPTY |
 | **添加项目即打开** | 弹窗、分组右键、拖目录进列表、SSH 远程、Worktree 设为项目——任何一条入口添加完直接切过去并开好第一个终端，不必再面对空态页点一次「新建终端」 |
 | **项目行悬停预览** | 悬停 250ms 弹出该项目正在运行的 AI Session 终端区 |
@@ -92,7 +92,7 @@
 | Git / 文件 | git2（libgit2）· notify + ignore |
 | 用量统计 | rusqlite 本地账本 · 自绘趋势图 |
 | 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`） |
-| 测试 | **2107 个 Rust 测试**（33 个测试目标） |
+| 测试 | **2115 个 Rust 测试**（33 个测试目标） |
 
 ---
 

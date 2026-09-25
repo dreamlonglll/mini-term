@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.13.8--pre-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.13.9-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -44,7 +44,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 - **递归分屏** — 横向 / 纵向任意嵌套分屏，拖拽调整比例
 - **pane 拖拽重排与合并** — 终端 tab 可整块拖走：拖到其它分组的 tab 栏或终端区中央即并入该组（tab 栏落点带插入位指示线，同组内拖动即前后换位），拖到终端区四边（1/4 进深）则在对应方向分出新屏，落点半透明高亮预览；拖拽走 GPUI 内建拖拽（on_drag / on_drop），Esc 中途取消，终端实例经缓存随布局树重排原样迁移，终端内容与 PTY 不受影响
 - **pane 最大化** — 双击 tab 栏空白处（或右上角最大化按钮）把当前分组临时铺满终端区，再双击/点按钮还原；运行时状态不持久化，被最大化的 pane 关闭后自动回落整树视图，最大化期间发起分屏会先自动还原避免新屏不可见
-- **高性能渲染** — alacritty_terminal 进程内 VT 解析 + GPU 原生渲染，零 IPC、零序列化；启用最小对比度，修复 Claude 提问文字在暗色下与背景近乎同色不可见的问题。终端刷屏、拖选、滚动只重绘终端自己这棵视图，侧栏与项目列表的缓存不被牵连；窗口最小化或显示器休眠时终端输出与动画泵整个停掉、一帧不画，失焦但看得见时降到 2fps，恢复可见即醒
+- **高性能渲染** — alacritty_terminal 进程内 VT 解析 + GPU 原生渲染，零 IPC、零序列化；启用最小对比度，修复 Claude 提问文字在暗色下与背景近乎同色不可见的问题。终端刷屏、拖选、滚动只重绘终端自己这棵视图，侧栏与项目列表的缓存不被牵连；窗口最小化或显示器休眠时终端输出与动画泵整个停掉、一帧不画，失焦但看得见时终端降到 5fps、动画泵降到 2fps，恢复可见即醒。终端重绘帧率在「设置 → 系统 → 性能」里可调：前台 10~240（默认 30，实际不超过显示器刷新率）、失焦 1~60（默认 5），改完即时生效；切回前台当场补画并换到前台节拍，后台帧率调得再低也不会冻着等上一拍
 - **滚动缓冲行数可调** — 主缓冲区保留行数可在设置里调整（默认 1 万行，改小当场生效并释放内存；历史版本曾因硬编码 10 万行在多项目多分屏叠加时把内存推向 OOM，教训记入了默认值），同时全局遵循标准 CSI 3J（ED3）；Codex 等应用可删除流式临时内容并重放折叠后的最终 transcript，`/clear` 也能真正清除旧历史。Windows 版内置并预载固定版本的官方 ConPTY 兼容运行时（资源校验失败时自动回退系统 ConPTY），让不同 Windows 版本下的 Codex 滚动与 transcript 折叠行为保持一致
 - **终端缓存** — 切换项目 / 标签 / 分屏不重建终端实例，已有内容不丢失；启动按需懒加载，仅当前可见 pane 创建 PTY，避免历史项目终端越多启动越卡
 - **项目切换缓存** — 文件树 / Git 历史数据按项目缓存，切回已访问项目零延迟渲染；目录加载与 Git 状态并行执行
@@ -209,7 +209,7 @@ Mini-Term 用一个轻量桌面应用解决以上所有问题。
 | Git / 文件 | git2（libgit2）· notify + ignore |
 | 用量统计 | rusqlite 本地账本 · 自绘趋势图 |
 | 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`） |
-| 测试 | **2107 个 Rust 测试**（33 个测试目标）+ 中转服务端协议边界测试 |
+| 测试 | **2115 个 Rust 测试**（33 个测试目标）+ 中转服务端协议边界测试 |
 
 ## 快速开始
 
@@ -350,7 +350,7 @@ Root（gpui-component 根，承载 Dialog / 通知层）
 提交代码前请运行：
 
 ```bash
-# 全工作区 Rust 测试（33 个测试目标、2107 例）
+# 全工作区 Rust 测试（33 个测试目标、2115 例）
 cargo test --workspace
 
 # Node 侧测试（仅 2 个文件：ConPTY 打包 / vendored-openssl 守卫）
