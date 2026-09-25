@@ -161,6 +161,11 @@ ropey = "=2.0.0-beta.1"
 # 依赖之上追加不动根 manifest(与 gpui-component 的 tree-sitter 同一手法)。
 gpui_platform = { workspace = true, features = ["x11", "wayland"] }
 
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+# 本地 HTML 预览的系统 WebView(见 `file_viewer::webview` 模块注释)。
+gpui-wry.workspace = true
+wry.workspace = true
+
 [target.'cfg(windows)'.dependencies]
 # 任务栏闪烁(FlashWindowEx)、提示音(MessageBeep / PlaySoundW)与系统托盘。
 # 版本跟随 gpui 已经在用的那个,不给依赖树引入第二份 windows crate

@@ -631,6 +631,9 @@ impl TitleBar {
                     .w(size.width)
                     .h(size.height)
                     .occlude()
+                    // 点外关闭要收得到整窗的点击,包括 HTML 预览 WebView 那块
+                    // (见 `native_view` 模块注释「输入的空域」)
+                    .child(crate::native_view::input_blocker())
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _event: &MouseDownEvent, window, cx| {

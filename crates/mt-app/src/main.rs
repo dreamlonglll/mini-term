@@ -86,6 +86,7 @@ mod mobile_panel;
 mod mobile_relay;
 mod modal;
 mod motion;
+mod native_view;
 mod notify;
 mod overlay;
 mod pane;
@@ -1796,6 +1797,9 @@ impl Render for Workspace {
                 .flex()
                 .flex_col()
                 .bg(ui::bg_overlay())
+                // 盖在文档页上时,这块从 HTML 预览 WebView 的显示与点击里让出来
+                // (抽屉不进 overlay 栈,见 `native_view` 模块注释「输入的空域」)
+                .child(native_view::occluder())
                 .border_l_1()
                 .border_color(ui::border_default())
                 // `--shadow-overlay`(`RightDrawer.tsx:67`);gpui 侧用同一档
@@ -1889,6 +1893,8 @@ impl Render for Workspace {
                     .inset_0()
                     .occlude()
                     .bg(gpui::hsla(0.0, 0.0, 0.0, 0.5))
+                    // 自绘模态不进 overlay 栈:开着时 HTML 预览的 WebView 不收鼠标
+                    .child(native_view::input_blocker())
                     .on_mouse_down(
                         gpui::MouseButton::Left,
                         cx.listener(|this, _event, window, cx| {
@@ -2001,7 +2007,9 @@ impl Render for Workspace {
             // 窗口关掉(原版那句原注释)。GPUI 侧配置目录不可用时压根开不出窗口
             // (`main()` 里直接 return),这条门控在这边只剩语义上的对齐。
             .flex_col()
-            .bg(ui::bg_base())
+            // 窗口底色 + 每帧合成对账:绕开 HTML 预览 WebView 挖的洞画,必须是
+            // **第一个**子节点(prepaint 最先跑、paint 垫在最底下,见 `native_view`)
+            .child(native_view::root_bg(ui::bg_base()))
             .text_color(ui::text_primary())
             // 界面字族(`config.uiFontFamily`)。gpui 的 `font_family` 会**继承**给
             // 所有没自己设过字族的子元素 —— 等价于原版把它写进 `--app-font-family`
@@ -2014,14 +2022,8 @@ impl Render for Workspace {
             // ⚠️ 与 `TerminalView::set_background_art` 的逐终端那一路**二选一**:
             // 同时开等于同一块像素画两遍图、两层纱罩把 dim 平方。逐终端那路
             // 从没接过线(`pane.rs` 不调 `set_background_art`),这里是唯一一处。
-            .when_some(background, |el, art| {
-                el.child(
-                    div()
-                        .absolute()
-                        .inset_0()
-                        .child(mt_ui::background_art(art)),
-                )
-            })
+            // 同样绕开 WebView 的洞画。
+            .when_some(background, |el, art| el.child(native_view::hole_art(art)))
             .key_context("Workspace")
             // Esc 中途取消**任何**内部拖拽(pane 拖拽 / 文件树行拖向终端或树内移动 /
             // 项目列表排序)。原版 `fileDragState.ts` / `paneDragState.ts` 各挂一句
@@ -2445,7 +2447,10 @@ fn main() {
                 // 的焦点登记都挂在它身上(Root::update 取不到就直接 panic)。
                 let workspace =
                     cx.new(|cx| Workspace::new(store_for_window, ai_events, window, cx));
-                cx.new(|cx| Root::new(workspace, window, cx))
+                // Root 自己那层整窗底色(`tokens.background`)压在 HTML 预览 WebView 的
+                // 洞底下、绕不开,关掉它;窗口底色改由 Workspace 根上的
+                // `native_view::root_bg` 画(同一个 bg_base,不透明,观感不变)
+                cx.new(|cx| Root::new(workspace, window, cx).bg(gpui::transparent_black()))
             },
         );
         let window = match window {
