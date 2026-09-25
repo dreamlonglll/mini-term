@@ -81,6 +81,11 @@ export const settings = {
       downloadDirectoryReset: "恢复系统默认",
       downloadDirectoryDialogTitle: "选择文件下载目录",
       downloadDirectoryInvalid: "下载目录不可用",
+      performanceGroup: "性能",
+      fpsForegroundTitle: "前台帧率",
+      fpsForegroundDesc: "窗口在前台时，终端输出的最高重绘帧率（10~240），默认 30。调高滚动更顺滑，GPU / CPU 占用也随之上升；实际帧率不会超过显示器刷新率",
+      fpsBackgroundTitle: "后台帧率",
+      fpsBackgroundDesc: "窗口失焦但仍看得见时的重绘帧率（1~60），默认 5。窗口最小化时完全不重绘，不受这一项影响",
     },
     editor: {
       externalEditor: "外部编辑器（● = 默认）",
@@ -314,6 +319,11 @@ export const settings = {
       downloadDirectoryReset: "Restore System Default",
       downloadDirectoryDialogTitle: "Choose File Download Directory",
       downloadDirectoryInvalid: "Download directory unavailable",
+      performanceGroup: "Performance",
+      fpsForegroundTitle: "Foreground frame rate",
+      fpsForegroundDesc: "Maximum redraw rate for terminal output while the window is focused (10–240, default 30). Higher is smoother but uses more GPU / CPU; the actual rate never exceeds your display's refresh rate",
+      fpsBackgroundTitle: "Background frame rate",
+      fpsBackgroundDesc: "Redraw rate while the window is unfocused but still visible (1–60, default 5). A minimized window does not redraw at all, regardless of this setting",
     },
     editor: {
       externalEditor: "External editor (● = default)",

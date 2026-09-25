@@ -1,6 +1,6 @@
 //! 偏好与配置写入相关的 `AppStore` 方法:AI 历史面板视图、用量面板偏好、主题、
-//! shell 列表、通用配置补丁、终端渲染参数、界面字号/字族、AI 感知取数口、
-//! 界面语言、pane 重命名、移动端中转。
+//! shell 列表、通用配置补丁、终端渲染参数、终端重绘帧率、界面字号/字族、
+//! AI 感知取数口、界面语言、pane 重命名、移动端中转。
 //!
 //! 从 `store.rs` 原样搬来的一串段落,段注释随代码走,逻辑一行未改。
 
@@ -260,6 +260,42 @@ impl AppStore {
         for entity in entities {
             entity.update(cx, |pane, cx| pane.set_selection_dwell(dwell, cx));
         }
+        self.save_config_soon(cx);
+        cx.changed(StoreEvent::Config(ConfigSection::Terminal));
+    }
+
+    // === 终端重绘帧率 ===
+
+    /// 前台帧率(已归一:`None` → 默认 30,越界钳回区间)。
+    pub fn foreground_fps(&self) -> u32 {
+        crate::redraw::resolve_foreground_fps(self.config.terminal_fps_foreground)
+    }
+
+    /// 后台帧率(窗口失焦但仍看得见时;已归一:`None` → 默认 5)。
+    pub fn background_fps(&self) -> u32 {
+        crate::redraw::resolve_background_fps(self.config.terminal_fps_background)
+    }
+
+    pub fn set_foreground_fps(&mut self, fps: u32, cx: &mut Context<Self>) {
+        if self.config.terminal_fps_foreground == Some(fps) {
+            return;
+        }
+        self.config.terminal_fps_foreground = Some(fps);
+        self.frame_rates_changed(cx);
+    }
+
+    pub fn set_background_fps(&mut self, fps: u32, cx: &mut Context<Self>) {
+        if self.config.terminal_fps_background == Some(fps) {
+            return;
+        }
+        self.config.terminal_fps_background = Some(fps);
+        self.frame_rates_changed(cx);
+    }
+
+    /// 两档帧率下发给重绘节拍器(当场生效)+ 落盘。启动时那一次下发在
+    /// `main.rs`,赶在第一次 PTY 输出起泵之前。
+    fn frame_rates_changed(&mut self, cx: &mut Context<Self>) {
+        crate::redraw::set_frame_rates(self.foreground_fps(), self.background_fps(), cx);
         self.save_config_soon(cx);
         cx.changed(StoreEvent::Config(ConfigSection::Terminal));
     }

@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 33;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 916;
+pub const ZH_ENTRY_COUNT: usize = 921;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 916;
+pub const EN_ENTRY_COUNT: usize = 921;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -1379,6 +1379,11 @@ static SETTINGS_ZH: &[(&str, &str)] = &[
     ("system.downloadDirectoryInvalid", "下载目录不可用"),
     ("system.downloadDirectoryReset", "恢复系统默认"),
     ("system.downloadDirectoryTitle", "下载目录"),
+    ("system.fpsBackgroundDesc", "窗口失焦但仍看得见时的重绘帧率（1~60），默认 5。窗口最小化时完全不重绘，不受这一项影响"),
+    ("system.fpsBackgroundTitle", "后台帧率"),
+    ("system.fpsForegroundDesc", "窗口在前台时，终端输出的最高重绘帧率（10~240），默认 30。调高滚动更顺滑，GPU / CPU 占用也随之上升；实际帧率不会超过显示器刷新率"),
+    ("system.fpsForegroundTitle", "前台帧率"),
+    ("system.performanceGroup", "性能"),
     ("system.startupGroup", "启动"),
     ("system.trayClickFocusDesc", "左键点状态栏图标时，除唤起窗口外还跳到「下一个该我处理」的会话（待确认 > 最先完成 > 处理中），与标题栏状态灯一致；右键菜单点项目则定位到该项目内最该处理的那个。关闭后只唤起窗口，不改变当前视图"),
     ("system.trayClickFocusTitle", "点击图标定位到会话"),
@@ -1579,6 +1584,11 @@ static SETTINGS_EN: &[(&str, &str)] = &[
     ("system.downloadDirectoryInvalid", "Download directory unavailable"),
     ("system.downloadDirectoryReset", "Restore System Default"),
     ("system.downloadDirectoryTitle", "Download Directory"),
+    ("system.fpsBackgroundDesc", "Redraw rate while the window is unfocused but still visible (1–60, default 5). A minimized window does not redraw at all, regardless of this setting"),
+    ("system.fpsBackgroundTitle", "Background frame rate"),
+    ("system.fpsForegroundDesc", "Maximum redraw rate for terminal output while the window is focused (10–240, default 30). Higher is smoother but uses more GPU / CPU; the actual rate never exceeds your display's refresh rate"),
+    ("system.fpsForegroundTitle", "Foreground frame rate"),
+    ("system.performanceGroup", "Performance"),
     ("system.startupGroup", "Startup"),
     ("system.trayClickFocusDesc", "Left-clicking the status bar icon also jumps to the session that needs you next (awaiting confirmation > earliest finished > working), same as the title bar status light; picking a project from the right-click menu jumps to that project's most urgent pane. Turn off to only summon the window without changing the current view"),
     ("system.trayClickFocusTitle", "Click icon to jump to session"),

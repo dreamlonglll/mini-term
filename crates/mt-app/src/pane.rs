@@ -43,7 +43,7 @@
 //! | 走什么 | 归谁管 | 节拍 |
 //! |--------|--------|------|
 //! | `drain_term_events`(PtyWrite/DA/DSR 应答) | 本循环 | [`DRAIN_PERIOD`] 恒 16ms |
-//! | `cx.notify()`(重绘) | [`crate::redraw`] | 前台 33ms / 后台 200ms,**全局共用一条** |
+//! | `cx.notify()`(重绘) | [`crate::redraw`] | 默认前台 33ms / 后台 200ms(设置页可调),**全局共用一条** |
 //!
 //! 分开是因为两者的「晚一拍」代价完全不同:应答晚了对面的 TUI 干等,画面晚一拍
 //! 没人看得出来。此前两件事绑在同一个 16ms 定时器上,于是每个 pane 各自按 62fps
@@ -205,7 +205,7 @@ const MARK_SETTLE_DELAY: Duration = Duration::from_millis(200);
 /// 唤醒循环合并 PTY 读信号的窗口。刷屏时 reader 每读一块就发一个信号,不合并的话
 /// 这条循环会跟着 read 次数空转。
 ///
-/// ⚠️ 这**不是**重绘节拍 —— 那个在 [`crate::redraw`],前台 33ms / 后台 200ms。
+/// ⚠️ 这**不是**重绘节拍 —— 那个在 [`crate::redraw`],默认前台 33ms / 后台 200ms。
 /// 这一档管的是 [`TerminalPane::drain_term_events`]:终端要回给程序的应答
 /// (PtyWrite / DA / DSR)走它,晚一拍对面的 TUI 就多等一拍,所以它跟着读节奏走、
 /// **不随窗口前后台变**。

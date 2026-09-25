@@ -16,7 +16,7 @@
 //!
 //! 1. **没有「保存」按钮**:每一项都是即时生效 + 即时落盘(500ms 防抖,
 //!    `AppStore::save_config_soon`)。通用写入口是 [`AppStore::patch_config`],
-//!    需要额外副作用的(主题 / 字号 / 字族 / 回滚行数 / 停留时长)各有专用 setter;
+//!    需要额外副作用的(主题 / 字号 / 字族 / 回滚行数 / 停留时长 / 帧率)各有专用 setter;
 //! 2. **数字行是草稿态**:输入期间只改草稿,失焦 / 回车才归一并提交 ——
 //!    边打字边 clamp 会让「1000」在敲到「1」时就被吃掉
 //!    (`SettingsModal.tsx:167-171` 的注释)。滑块相反,**拖动即时提交**;
@@ -195,6 +195,10 @@ pub enum NumField {
     CharThreshold,
     /// 托盘菜单最多显示的项目数
     TrayMax,
+    /// 前台帧率(`terminalFpsForeground`)
+    FpsForeground,
+    /// 后台帧率(`terminalFpsBackground`)
+    FpsBackground,
 }
 
 impl NumField {
@@ -206,8 +210,15 @@ impl NumField {
             Self::LineThreshold => (0.0, 100_000.0),
             Self::CharThreshold => (0.0, 10_000_000.0),
             Self::TrayMax => (1.0, 20.0),
+            Self::FpsForeground => fps_bounds(&crate::redraw::FOREGROUND_FPS),
+            Self::FpsBackground => fps_bounds(&crate::redraw::BACKGROUND_FPS),
         }
     }
+}
+
+/// 帧率两行的区间直接取节拍器那边的常量,两处不各写一份。
+fn fps_bounds(range: &std::ops::RangeInclusive<u32>) -> (f64, f64) {
+    (f64::from(*range.start()), f64::from(*range.end()))
 }
 
 /// 数字设置行的归一(`SettingsModal.tsx:200-209` 的 `commit`)。
@@ -341,6 +352,8 @@ pub struct SettingsView {
     num_line_threshold: Entity<InputState>,
     num_char_threshold: Entity<InputState>,
     num_tray_max: Entity<InputState>,
+    num_fps_foreground: Entity<InputState>,
+    num_fps_background: Entity<InputState>,
 
     // ── 文本行(草稿态)──
     txt_remote_paste_dir: Entity<InputState>,
@@ -548,6 +561,22 @@ impl SettingsView {
             NumField::TrayMax,
             config.tray_max_projects.unwrap_or(5) as f64,
         );
+        let (foreground_fps, background_fps) = {
+            let store = store.read(cx);
+            (store.foreground_fps(), store.background_fps())
+        };
+        let num_fps_foreground = num(
+            cx,
+            window,
+            NumField::FpsForeground,
+            f64::from(foreground_fps),
+        );
+        let num_fps_background = num(
+            cx,
+            window,
+            NumField::FpsBackground,
+            f64::from(background_fps),
+        );
 
         let txt_remote_paste_dir = cx.new(|cx| {
             InputState::new(window, cx)
@@ -588,6 +617,8 @@ impl SettingsView {
             num_line_threshold,
             num_char_threshold,
             num_tray_max,
+            num_fps_foreground,
+            num_fps_background,
             txt_remote_paste_dir,
             txt_ui_font,
             txt_terminal_font,
@@ -625,6 +656,8 @@ impl SettingsView {
             (this.num_line_threshold.clone(), NumField::LineThreshold),
             (this.num_char_threshold.clone(), NumField::CharThreshold),
             (this.num_tray_max.clone(), NumField::TrayMax),
+            (this.num_fps_foreground.clone(), NumField::FpsForeground),
+            (this.num_fps_background.clone(), NumField::FpsBackground),
         ];
         for (entity, field) in numeric {
             this._subs.push(cx.subscribe_in(
@@ -697,17 +730,22 @@ impl SettingsView {
                 store.patch_config(|c| c.long_paste_char_threshold = next as u32, cx)
             }
             NumField::TrayMax => store.patch_config(|c| c.tray_max_projects = Some(next as u32), cx),
+            NumField::FpsForeground => store.set_foreground_fps(next as u32, cx),
+            NumField::FpsBackground => store.set_background_fps(next as u32, cx),
         });
     }
 
     fn saved_number(&self, field: NumField, cx: &App) -> f64 {
-        let config = self.store.read(cx).config();
+        let store = self.store.read(cx);
+        let config = store.config();
         match field {
             NumField::Scrollback => resolve_scrollback(config.terminal_scrollback as f64) as f64,
             NumField::Dwell => config.selection_auto_copy_secs.unwrap_or(1.0),
             NumField::LineThreshold => config.long_paste_line_threshold as f64,
             NumField::CharThreshold => config.long_paste_char_threshold as f64,
             NumField::TrayMax => config.tray_max_projects.unwrap_or(5) as f64,
+            NumField::FpsForeground => f64::from(store.foreground_fps()),
+            NumField::FpsBackground => f64::from(store.background_fps()),
         }
     }
 
@@ -984,6 +1022,19 @@ mod tests {
             Some(MAX_SCROLLBACK as f64)
         );
         assert_eq!(normalize_number(NumField::Scrollback, "nan"), None);
+    }
+
+    /// 帧率两行:区间取自节拍器那边的常量,低于下限回落已保存值,高于上限钳住。
+    #[test]
+    fn 帧率行归一() {
+        let fg = |draft| normalize_number(NumField::FpsForeground, draft);
+        let bg = |draft| normalize_number(NumField::FpsBackground, draft);
+        assert_eq!(fg("60"), Some(60.0));
+        assert_eq!(fg("9"), None);
+        assert_eq!(fg("1000"), Some(240.0));
+        assert_eq!(bg("0"), None, "后台不许停到 0");
+        assert_eq!(bg("1"), Some(1.0));
+        assert_eq!(bg("120"), Some(60.0));
     }
 
     /// 数字回显:整数不带小数点,浮点保留必要的小数。

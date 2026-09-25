@@ -462,7 +462,7 @@ impl Workspace {
         let activation = cx.observe_window_activation(window, move |_, window, cx| {
             let active = window.is_window_active();
             store_for_focus.update(cx, |store, cx| store.set_window_focused(active, cx));
-            // 终端重绘的节拍跟着前后台切档:后台按 5fps 画就够了,挂着 AI 跑、
+            // 终端重绘的节拍跟着前后台切档:后台默认按 5fps 画就够了,挂着 AI 跑、
             // 人切去别的窗口时按满帧重绘整窗是纯浪费。见 `crate::redraw`。
             redraw::set_window_active(active, cx);
             // 顺手重探一次「减少动画」:用户多半是切到系统设置里改完再切回来的。
@@ -2352,6 +2352,13 @@ fn main() {
         // 界面字号 / 字族同样要在**任何视图建出来之前**定下来:`ui::font_px` 读的是
         // 进程级快照,晚一步首帧会按默认 13px 画出来再被刷一遍(闪一下)。
         store.read(cx).apply_ui_font();
+
+        // 终端重绘帧率(设置页「性能」那两项)同理要赶在第一次 PTY 输出起泵之前
+        let (foreground_fps, background_fps) = {
+            let store = store.read(cx);
+            (store.foreground_fps(), store.background_fps())
+        };
+        redraw::set_frame_rates(foreground_fps, background_fps, cx);
 
         // 主题必须在**起 PTY 之前**装配:新建终端拿的是 store 里那份终端配色,
         // 晚一步的话首批终端会以默认配色建出来,再被热更新刷一遍(闪一下)。

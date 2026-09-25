@@ -210,6 +210,22 @@ impl SettingsView {
                         el.child(banner(err, ui::color_error()))
                     }),
             )
+            // 终端重绘帧率,即时生效(节拍器在跑就当场换档,见 `crate::redraw`)
+            .child(
+                section("system.performanceGroup")
+                    .child(number_row(
+                        "system.fpsForegroundTitle",
+                        "system.fpsForegroundDesc",
+                        &self.num_fps_foreground,
+                        false,
+                    ))
+                    .child(number_row(
+                        "system.fpsBackgroundTitle",
+                        "system.fpsBackgroundDesc",
+                        &self.num_fps_background,
+                        false,
+                    )),
+            )
             .into_any_element()
     }
 

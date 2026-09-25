@@ -209,6 +209,14 @@ pub struct AppConfig {
     /// 持久化，重新打开开关后下次启动照样能续上。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai_auto_resume: Option<bool>,
+    /// 窗口在前台时终端的重绘帧率。`None` = UI 层默认 30;越界值由 UI 层钳回
+    /// 合法区间(手改坏值不许拖垮整份 config)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_fps_foreground: Option<u32>,
+    /// 窗口失焦但仍看得见时终端的重绘帧率。`None` = UI 层默认 5。
+    /// 最小化不归它管 —— 那时一帧都不画。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_fps_background: Option<u32>,
     #[serde(default)]
     pub ssh_connections: Vec<SshConnection>,
     /// 显式创建的 SSH 分组名（允许空分组存在）。连接上的 group 字段仍是归属的
@@ -696,6 +704,8 @@ impl Default for AppConfig {
             terminal_animations: None,
             tab_title_follows_shell: None,
             ai_auto_resume: None,
+            terminal_fps_foreground: None,
+            terminal_fps_background: None,
             ssh_connections: vec![],
             ssh_groups: vec![],
             mobile_relay: None,
@@ -1604,6 +1614,30 @@ mod tests {
         assert!(json.contains(r#""tabTitleFollowsShell":false"#));
         let parsed: AppConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.tab_title_follows_shell, Some(false));
+    }
+
+    /// 终端帧率两项:纯增量字段,没设过不写进 JSON,设过能往返,键名 camelCase。
+    #[test]
+    fn terminal_fps_是纯增量字段() {
+        let legacy = r#"{
+            "projects": [],
+            "defaultShell": "cmd",
+            "availableShells": []
+        }"#;
+        let mut config: AppConfig = serde_json::from_str(legacy).unwrap();
+        assert!(config.terminal_fps_foreground.is_none());
+        assert!(config.terminal_fps_background.is_none());
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(!json.contains("terminalFps"), "没设过时不该污染持久化配置");
+
+        config.terminal_fps_foreground = Some(60);
+        config.terminal_fps_background = Some(10);
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains(r#""terminalFpsForeground":60"#));
+        assert!(json.contains(r#""terminalFpsBackground":10"#));
+        let parsed: AppConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.terminal_fps_foreground, Some(60));
+        assert_eq!(parsed.terminal_fps_background, Some(10));
     }
 
     #[test]
