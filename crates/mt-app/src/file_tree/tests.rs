@@ -1,5 +1,5 @@
 use super::menu::FileMenuAction::*;
-use super::menu::{HeaderActionCapabilities, file_menu_actions, header_action_capabilities};
+use super::menu::file_menu_actions;
 use super::*;
 
 #[test]
@@ -868,58 +868,4 @@ fn 汇总优先级与原版一致() {
     }
     // 认不出的字母不参与汇总(优先级 0)
     assert_eq!(git_priority("X"), 0);
-}
-
-#[test]
-fn 文件树头部动作按后端和忙碌状态收口() {
-    let local = FileOperationContext {
-        project_id: "p".into(),
-        root: PathBuf::from("/work"),
-        backend: FileBackendIdentity::Local,
-        generation: 1,
-    };
-    let clip = FileClipboardEntry {
-        project_id: "p".into(),
-        root: PathBuf::from("/work"),
-        backend: FileBackendIdentity::Local,
-        generation: 1,
-        source: PathBuf::from("/work/a.txt"),
-        is_dir: false,
-    };
-    assert_eq!(
-        header_action_capabilities(Some(&local), false, Some(&clip)),
-        HeaderActionCapabilities {
-            show_upload: false,
-            mutations_enabled: true,
-            paste_enabled: true,
-        }
-    );
-    assert_eq!(
-        header_action_capabilities(Some(&local), true, Some(&clip)),
-        HeaderActionCapabilities {
-            show_upload: false,
-            mutations_enabled: false,
-            paste_enabled: false,
-        }
-    );
-
-    let mut remote = local.clone();
-    remote.backend = FileBackendIdentity::Remote {
-        connection_id: "ssh".into(),
-        connection_fingerprint: 7,
-    };
-    let remote_caps = header_action_capabilities(Some(&remote), false, None);
-    assert!(remote_caps.show_upload && remote_caps.mutations_enabled);
-    assert!(!remote_caps.paste_enabled);
-
-    let mut broken = remote;
-    broken.backend = FileBackendIdentity::BrokenRemote;
-    assert_eq!(
-        header_action_capabilities(Some(&broken), false, None),
-        HeaderActionCapabilities {
-            show_upload: false,
-            mutations_enabled: false,
-            paste_enabled: false,
-        }
-    );
 }

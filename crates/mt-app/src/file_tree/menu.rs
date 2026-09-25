@@ -1,11 +1,10 @@
-//! 文件树的菜单构建与头部动作能力位(从 `file_tree` 平移):行/背景右键菜单、
-//! 菜单项序、[`HeaderActionCapabilities`]。
+//! 文件树的菜单构建(从 `file_tree` 平移):行/背景右键菜单、菜单项序。
 
 use std::path::{Path, PathBuf};
 
 use gpui::{ClipboardItem, Entity};
 
-use crate::file_ops::{FileBackendIdentity, FileClipboardEntry, FileOperationContext};
+use crate::file_ops::{FileBackendIdentity, FileOperationContext};
 use crate::fs_ops;
 use crate::i18n::{t, tr};
 use crate::menu::{self, MenuEntry, MenuItem};
@@ -517,37 +516,5 @@ pub(super) fn mod_label() -> &'static str {
         "⌘"
     } else {
         "Ctrl"
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct HeaderActionCapabilities {
-    pub(super) show_upload: bool,
-    pub(super) mutations_enabled: bool,
-    pub(super) paste_enabled: bool,
-}
-
-pub(super) fn header_action_capabilities(
-    context: Option<&FileOperationContext>,
-    operation_busy: bool,
-    clipboard: Option<&FileClipboardEntry>,
-) -> HeaderActionCapabilities {
-    let connected = context.is_some_and(|context| {
-        matches!(
-            &context.backend,
-            FileBackendIdentity::Local | FileBackendIdentity::Remote { .. }
-        )
-    });
-    let show_upload = context
-        .is_some_and(|context| matches!(&context.backend, FileBackendIdentity::Remote { .. }));
-    let mutations_enabled = connected && !operation_busy;
-    let paste_enabled = mutations_enabled
-        && context.is_some_and(|context| {
-            clipboard.is_some_and(|clipboard| clipboard.can_paste_into(context))
-        });
-    HeaderActionCapabilities {
-        show_upload,
-        mutations_enabled,
-        paste_enabled,
     }
 }

@@ -90,12 +90,9 @@ mod ops;
 #[cfg(test)]
 mod tests;
 
-use menu::{background_menu, file_menu, header_action_capabilities, mod_label};
+use menu::{background_menu, file_menu, mod_label};
 use move_to::MoveSource;
-use ops::{
-    choose_upload_paths, confirm_move, new_entry_prompt, paste_file_clipboard, start_download,
-    start_upload,
-};
+use ops::{confirm_move, start_download, start_upload};
 
 /// 拖拽悬停命中的落点(高亮用)。资源管理器拖进来的上传与树内拖拽移动共用:
 /// 同一时刻只可能有一种拖拽在飞,`hit_id` 是行 / 空白处的标识。
@@ -1439,10 +1436,6 @@ fn hash_visible_tree(
 
 /// 头部 26×26 图标钮共用的外观(`FileTree.tsx:734`)。
 fn header_button(id: &'static str) -> gpui::Stateful<gpui::Div> {
-    header_action_button(id, true)
-}
-
-fn header_action_button(id: &'static str, enabled: bool) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .w(px(26.0))
@@ -1453,11 +1446,8 @@ fn header_action_button(id: &'static str, enabled: bool) -> gpui::Stateful<gpui:
         .justify_center()
         .rounded(px(3.0))
         .text_color(ui::text_muted())
-        .when(enabled, |el| {
-            el.cursor_pointer()
-                .hover(|el| el.text_color(ui::text_primary()).bg(ui::border_subtle()))
-        })
-        .when(!enabled, |el| el.opacity(0.38))
+        .cursor_pointer()
+        .hover(|el| el.text_color(ui::text_primary()).bg(ui::border_subtle()))
 }
 
 /// 放大镜。原版是 `viewBox="0 0 16 16"` 的 `circle(7,7,r=4.2)` + `M10.2 10.2L14 14`
@@ -1499,99 +1489,6 @@ const REFRESH_SHAPES: &[Shape] = &[
     ),
 ];
 
-const FILE_SHAPES: &[Shape] = &[Shape::line(
-    Ink::Current,
-    0.075,
-    Geom::Polyline(&[
-        (0.22, 0.08),
-        (0.62, 0.08),
-        (0.82, 0.28),
-        (0.82, 0.92),
-        (0.22, 0.92),
-        (0.22, 0.08),
-        (0.62, 0.08),
-        (0.62, 0.28),
-        (0.82, 0.28),
-    ]),
-)];
-
-const FOLDER_SHAPES: &[Shape] = &[Shape::line(
-    Ink::Current,
-    0.075,
-    Geom::Polyline(&[
-        (0.08, 0.24),
-        (0.38, 0.24),
-        (0.48, 0.36),
-        (0.92, 0.36),
-        (0.92, 0.86),
-        (0.08, 0.86),
-        (0.08, 0.24),
-    ]),
-)];
-
-const UPLOAD_MARK_SHAPES: &[Shape] = &[
-    Shape::line(
-        Ink::Current,
-        0.095,
-        Geom::Polyline(&[(0.5, 0.76), (0.5, 0.42)]),
-    ),
-    Shape::line(
-        Ink::Current,
-        0.095,
-        Geom::Polyline(&[(0.34, 0.56), (0.5, 0.40), (0.66, 0.56)]),
-    ),
-];
-
-const PLUS_MARK_SHAPES: &[Shape] = &[
-    Shape::line(
-        Ink::Current,
-        0.095,
-        Geom::Polyline(&[(0.66, 0.68), (0.92, 0.68)]),
-    ),
-    Shape::line(
-        Ink::Current,
-        0.095,
-        Geom::Polyline(&[(0.79, 0.55), (0.79, 0.81)]),
-    ),
-];
-
-const PASTE_SHAPES: &[Shape] = &[
-    Shape::line(
-        Ink::Current,
-        0.075,
-        Geom::Polyline(&[
-            (0.28, 0.22),
-            (0.18, 0.22),
-            (0.18, 0.92),
-            (0.78, 0.92),
-            (0.78, 0.82),
-        ]),
-    ),
-    Shape::line(
-        Ink::Current,
-        0.075,
-        Geom::Polyline(&[
-            (0.38, 0.12),
-            (0.70, 0.12),
-            (0.70, 0.30),
-            (0.38, 0.30),
-            (0.38, 0.12),
-        ]),
-    ),
-    Shape::line(
-        Ink::Current,
-        0.075,
-        Geom::Polyline(&[
-            (0.34, 0.30),
-            (0.30, 0.30),
-            (0.30, 0.78),
-            (0.86, 0.78),
-            (0.86, 0.30),
-            (0.74, 0.30),
-        ]),
-    ),
-];
-
 /// 编辑器选择器的下拉箭头(原版 8×8 的 `M1.5 3L4 5.5L6.5 3`)。
 const CARET_SHAPES: &[Shape] = &[Shape::line(
     Ink::Current,
@@ -1623,11 +1520,6 @@ impl Render for FileTree {
             .clone()
             .filter(|name| editors.iter().any(|e| e == name))
             .or_else(|| editors.first().cloned());
-        let header_capabilities = header_action_capabilities(
-            self.operation_context(cx).as_ref(),
-            self.operation_busy,
-            self.file_clipboard.as_ref(),
-        );
 
         let is_remote = self.is_remote(cx);
         let mut header = div()
@@ -1637,7 +1529,7 @@ impl Render for FileTree {
             .justify_between()
             .gap(px(8.0))
             .flex_none()
-            // 180px 窄栏装不下远程侧 6 个固定 26px 图标。保持按钮尺寸并允许
+            // 180px 窄栏可能装不下固定 26px 图标。保持按钮尺寸并允许
             // 整条头部横向滚动，所有动作仍可达；宽栏内容未溢出时行为不变。
             .overflow_x_scroll()
             .px(px(10.0))
@@ -1699,179 +1591,7 @@ impl Render for FileTree {
                             }))
                             .child(VectorIcon::new(REFRESH_SHAPES, px(13.0)).ink(ui::text_muted())),
                     )
-                    .when(header_capabilities.show_upload, |el| {
-                        el.child(
-                            header_action_button(
-                                "file-tree-upload-file",
-                                header_capabilities.mutations_enabled,
-                            )
-                            .tip(t("fileTree", "menu.uploadFiles"))
-                            .when(header_capabilities.mutations_enabled, |el| {
-                                el.on_click(cx.listener(|this, _event, window, cx| {
-                                    let Some(context) = this.operation_context(cx) else {
-                                        return;
-                                    };
-                                    if this.operation_busy
-                                        || !matches!(
-                                            &context.backend,
-                                            FileBackendIdentity::Remote { .. }
-                                        )
-                                    {
-                                        return;
-                                    }
-                                    let root = context.root.clone();
-                                    choose_upload_paths(
-                                        cx.entity(),
-                                        context,
-                                        root,
-                                        false,
-                                        window,
-                                        cx,
-                                    );
-                                }))
-                            })
-                            .child(
-                                VectorIcon::new(FILE_SHAPES, px(13.0))
-                                    .overlay(UPLOAD_MARK_SHAPES)
-                                    .ink(ui::text_muted()),
-                            ),
-                        )
-                        .child(
-                            header_action_button(
-                                "file-tree-upload-folder",
-                                header_capabilities.mutations_enabled,
-                            )
-                            .tip(t("fileTree", "menu.uploadFolder"))
-                            .when(header_capabilities.mutations_enabled, |el| {
-                                el.on_click(cx.listener(|this, _event, window, cx| {
-                                    let Some(context) = this.operation_context(cx) else {
-                                        return;
-                                    };
-                                    if this.operation_busy
-                                        || !matches!(
-                                            &context.backend,
-                                            FileBackendIdentity::Remote { .. }
-                                        )
-                                    {
-                                        return;
-                                    }
-                                    let root = context.root.clone();
-                                    choose_upload_paths(
-                                        cx.entity(),
-                                        context,
-                                        root,
-                                        true,
-                                        window,
-                                        cx,
-                                    );
-                                }))
-                            })
-                            .child(
-                                VectorIcon::new(FOLDER_SHAPES, px(13.0))
-                                    .overlay(UPLOAD_MARK_SHAPES)
-                                    .ink(ui::text_muted()),
-                            ),
-                        )
-                    })
-                    .child(
-                        header_action_button("file-tree-paste", header_capabilities.paste_enabled)
-                            .tip(t("fileTree", "menu.paste"))
-                            .when(header_capabilities.paste_enabled, |el| {
-                                el.on_click(cx.listener(|this, _event, window, cx| {
-                                    let Some(context) = this.operation_context(cx) else {
-                                        return;
-                                    };
-                                    if this.operation_busy
-                                        || !this
-                                            .file_clipboard
-                                            .as_ref()
-                                            .is_some_and(|clip| clip.can_paste_into(&context))
-                                    {
-                                        return;
-                                    }
-                                    let root = context.root.clone();
-                                    // paste_file_clipboard 进门会 tree.read；当前 listener
-                                    // 仍持有 FileTree 的 update 租约，直接调用会触发 GPUI
-                                    // double-lease panic。延后一拍，并由业务入口再次校验
-                                    // context/clipboard，避免项目切换时使用旧快照。
-                                    let tree = cx.entity();
-                                    window.defer(cx, move |window, cx| {
-                                        paste_file_clipboard(tree, context, root, window, cx);
-                                    });
-                                }))
-                            })
-                            .child(VectorIcon::new(PASTE_SHAPES, px(13.0)).ink(ui::text_muted())),
-                    )
-                    .child(
-                        header_action_button(
-                            "file-tree-new-file",
-                            header_capabilities.mutations_enabled,
-                        )
-                        .tip(t("fileTree", "menu.newFile"))
-                        .when(header_capabilities.mutations_enabled, |el| {
-                            el.on_click(cx.listener(|this, _event, window, cx| {
-                                let Some(context) = this.operation_context(cx) else {
-                                    return;
-                                };
-                                if this.operation_busy
-                                    || matches!(&context.backend, FileBackendIdentity::BrokenRemote)
-                                {
-                                    return;
-                                }
-                                let root = context.root.clone();
-                                let connection = this.remote_conn(cx);
-                                new_entry_prompt(
-                                    cx.entity(),
-                                    context,
-                                    connection,
-                                    root,
-                                    false,
-                                    window,
-                                    cx,
-                                );
-                            }))
-                        })
-                        .child(
-                            VectorIcon::new(FILE_SHAPES, px(13.0))
-                                .overlay(PLUS_MARK_SHAPES)
-                                .ink(ui::text_muted()),
-                        ),
-                    )
-                    .child(
-                        header_action_button(
-                            "file-tree-new-folder",
-                            header_capabilities.mutations_enabled,
-                        )
-                        .tip(t("fileTree", "menu.newFolder"))
-                        .when(header_capabilities.mutations_enabled, |el| {
-                            el.on_click(cx.listener(|this, _event, window, cx| {
-                                let Some(context) = this.operation_context(cx) else {
-                                    return;
-                                };
-                                if this.operation_busy
-                                    || matches!(&context.backend, FileBackendIdentity::BrokenRemote)
-                                {
-                                    return;
-                                }
-                                let root = context.root.clone();
-                                let connection = this.remote_conn(cx);
-                                new_entry_prompt(
-                                    cx.entity(),
-                                    context,
-                                    connection,
-                                    root,
-                                    true,
-                                    window,
-                                    cx,
-                                );
-                            }))
-                        })
-                        .child(
-                            VectorIcon::new(FOLDER_SHAPES, px(13.0))
-                                .overlay(PLUS_MARK_SHAPES)
-                                .ink(ui::text_muted()),
-                        ),
-                    )
+                    // 粘贴/新建/上传不放头部:空白处右键菜单(background_menu)已有
                     .when(!is_remote, |el| {
                         el.when_some(default_editor.clone(), |el, current| {
                             el.child(self.render_editor_picker(current, editors.clone(), cx))
