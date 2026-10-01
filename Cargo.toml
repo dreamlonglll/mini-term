@@ -37,11 +37,16 @@ license = "MIT"
 #     crates.io 版本停在 0.3.3 / 2025-12-27。)
 #
 # ⚠️ Linux 构建需要额外打开 gpui_platform 的 `x11` / `wayland` feature
-#    (见 mt-app 的 target 依赖段),Windows / macOS 默认 feature 即可。
+#    (见 mt-app 的 target 依赖段)。
+# ⚠️ `font-kit` 不能删:gpui_platform 的 default 是空的,不开它 gpui_macos 就退到
+#    `NoopTextSystem` —— macOS 上排版照给字宽、一个字形都不画,界面只剩图标与边框
+#    (issue #82,v1.13.6-pre ~ v1.13.11-pre 的 mac 包全中)。gpui 自己 default 里那个
+#    `font-kit` 管不到 gpui_macos。Windows(DirectWrite)/ Linux 不受影响。
+#    守门:`tests/gpuiMacFontKit.test.cjs`。
 # spike/gpui-pre:底座换成 huacnlee 上传的 Zed 快照 gpui-pre(zed@d89e9c2,2026-09-14)。
 # 0.3.x 把窗口/文字后端拆去了 gpui_platform,应用入口改为 gpui_platform::application()。
 gpui = { package = "gpui-pre", version = "0.3.5" }
-gpui_platform = { package = "gpui-pre-platform", version = "0.3.5" }
+gpui_platform = { package = "gpui-pre-platform", version = "0.3.5", features = ["font-kit"] }
 # 组件库:Resizable(替 Allotment) / Tree(替 FileTree) / TabBar / Modal / Input /
 # Table，以及 JSON 驱动的主题层 + 运行时主题注册表(替自研 theme_packs 的一部分)。
 gpui-component = "0.6.2"
