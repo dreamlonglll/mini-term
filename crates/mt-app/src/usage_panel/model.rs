@@ -756,7 +756,11 @@ mod tests {
             "2026-08-01T",
             "2026-08-01 ab:cd",
         ] {
-            assert_eq!(accept_datetime_input(bad, prev, Edge::To), prev, "{bad:?} 该回弹");
+            assert_eq!(
+                accept_datetime_input(bad, prev, Edge::To),
+                prev,
+                "{bad:?} 该回弹"
+            );
         }
     }
 
@@ -773,9 +777,13 @@ mod tests {
     fn custom_窗口精确到秒() {
         let now = at(2026, 8, 18);
         let since = range_since_ms(UsageRange::Custom, "2026-08-10 09:30:15", now);
-        let until =
-            range_until_ms(UsageRange::Custom, "2026-08-10 09:30:15", "2026-08-10 18:00:00", now)
-                .unwrap();
+        let until = range_until_ms(
+            UsageRange::Custom,
+            "2026-08-10 09:30:15",
+            "2026-08-10 18:00:00",
+            now,
+        )
+        .unwrap();
         let a = chrono::Local.timestamp_millis_opt(since).unwrap();
         let b = chrono::Local.timestamp_millis_opt(until).unwrap();
         assert_eq!((a.day(), a.hour(), a.minute(), a.second()), (10, 9, 30, 15));
@@ -793,7 +801,10 @@ mod tests {
         let until = range_until_ms(UsageRange::Custom, from, "2026-08-10 10:00:00", now).unwrap();
         assert!(until > since);
         let b = chrono::Local.timestamp_millis_opt(until).unwrap();
-        assert_eq!((b.day(), b.hour(), b.minute(), b.second()), (10, 23, 59, 59));
+        assert_eq!(
+            (b.day(), b.hour(), b.minute(), b.second()),
+            (10, 23, 59, 59)
+        );
     }
 
     /// custom 图表窗口与查询窗口**同源**:起点走 since、终点走 until。
@@ -801,8 +812,14 @@ mod tests {
     fn custom_图表窗口与查询窗口同源() {
         let now = at(2026, 8, 18);
         let (start, end) = custom_chart_window("2026-08-01", "2026-08-10", now);
-        assert_eq!(start.date(), chrono::NaiveDate::from_ymd_opt(2026, 8, 1).unwrap());
-        assert_eq!(end.date(), chrono::NaiveDate::from_ymd_opt(2026, 8, 10).unwrap());
+        assert_eq!(
+            start.date(),
+            chrono::NaiveDate::from_ymd_opt(2026, 8, 1).unwrap()
+        );
+        assert_eq!(
+            end.date(),
+            chrono::NaiveDate::from_ymd_opt(2026, 8, 10).unwrap()
+        );
 
         // 截止缺失 → 无上界 → 补到今天
         let (_, end) = custom_chart_window("2026-08-01", "", now);
@@ -826,8 +843,14 @@ mod tests {
         assert!(!bucket_hourly(UsageRange::Days7, "", "", now));
         let custom = |from, to| bucket_hourly(UsageRange::Custom, from, to, now);
         assert!(custom("2026-08-10 09:00:00", "2026-08-10 18:00:00"));
-        assert!(custom("2026-08-10", "2026-08-10"), "单日 = 当天 00:00~23:59:59");
-        assert!(!custom("2026-08-10 22:00:00", "2026-08-11 02:00:00"), "跨午夜按日");
+        assert!(
+            custom("2026-08-10", "2026-08-10"),
+            "单日 = 当天 00:00~23:59:59"
+        );
+        assert!(
+            !custom("2026-08-10 22:00:00", "2026-08-11 02:00:00"),
+            "跨午夜按日"
+        );
         assert!(!custom("2026-08-01", "2026-08-10"));
     }
 

@@ -521,15 +521,7 @@ impl UsagePanel {
                 .background_executor()
                 .spawn(async move {
                     usage_ledger_query(
-                        &dir,
-                        agents,
-                        since,
-                        until,
-                        project,
-                        tz_offset,
-                        tz_name,
-                        hourly,
-                        pricing,
+                        &dir, agents, since, until, project, tz_offset, tz_name, hourly, pricing,
                     )
                 })
                 .await;
