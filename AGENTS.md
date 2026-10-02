@@ -115,6 +115,8 @@ reader 线程读 PTY 字节直接喂 `mt-terminal` 的 VT 状态机，UI 按帧�
 
 ⚠️ **改投影形状时必须同步 `mt_core::config_reader::ConfigSshView`**——两边隔着 crate 边界、没有共享类型，只靠字段名对齐。护栏是 `mt-config` 里的 `投影能被_sidecar_的解析器读懂`，它直接调 sidecar 那份解析器。
 
+能不改形状就别改：sidecar 不随主程序发版，装机目录里的旧 sidecar 认不得新字段。「关联 SSH」的**整组关联**（`ProjectConfig::ssh_connection_groups`，组内后续新增的连接也算）就是这么接的——库里存组名，写投影时由 `ProjectConfig::effective_ssh_connection_ids` 展开成连接 id 并进 `sshConnectionIds`，每次保存重写投影，组成员变化即时生效，sidecar 一行没改。
+
 ### SSH 密码封存（`mt-secret`）
 
 `SshConnection.password` 在库、投影、`.bak`、`.pre-sqlite` 存档四处**一律是信封串** `enc:v1:<base64(nonce‖密文‖tag)>`（AES-256-GCM），明文只活在「表单 → `AppStore::upsert_ssh_connection`」那一小段与认证那一刻。主密钥 32 字节随机，存 `{active_data_dir}/credential.key`：Windows 内容经 DPAPI（当前用户范围、禁弹窗）包裹，macOS/Linux 靠 0600。

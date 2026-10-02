@@ -110,8 +110,11 @@ use mt_i18n::{
 /// `noEditorMessage` 的设置路径改成 GPUI 设置页的实际层级（系统 → 外部编辑器）。
 /// 916 → 921：设置页系统页新增「性能」组，终端重绘的前台 / 后台帧率可调：
 /// `settings.system.{performanceGroup,fpsForeground{Title,Desc},fpsBackground{Title,Desc}}`。
+/// 921 → 927：SSH 连接「复制」按钮与确认框（`sshModal.{duplicate,duplicateConfirmTitle,
+/// duplicateConfirmMessage}`），「关联 SSH」整组关联的三条说明
+/// （`sshAssoc.{groupLinkedHint,coveredByGroup,scopeWithGroups}`）。
 const EXPECTED_NAMESPACES: usize = 33;
-const EXPECTED_ENTRIES_PER_LANG: usize = 921;
+const EXPECTED_ENTRIES_PER_LANG: usize = 927;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

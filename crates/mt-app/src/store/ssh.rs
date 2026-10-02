@@ -117,6 +117,30 @@ impl AppStore {
         cx.changed(StoreEvent::Config(ConfigSection::SshConnections));
     }
 
+    /// 复制一条连接(二次确认由调用方做),返回副本的 id;源连接不在了返回 `None`。
+    ///
+    /// 副本叫 `原名 (N)`、紧跟在原连接后面,其余字段连同密码信封原样照抄 —— 规则与
+    /// 「为什么信封不走 [`Self::upsert_ssh_connection`]」见
+    /// [`crate::ssh_conn::duplicate_connection`]。
+    ///
+    /// 不纳入任何项目的**显式**关联范围(新增连接不自动纳入已有项目,见
+    /// [`crate::ssh_conn::plan_assoc_save`]);整组关联了它所在分组的项目则自然看得到 ——
+    /// 那正是整组关联的意思。
+    pub fn duplicate_ssh_connection(
+        &mut self,
+        source_id: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let connections = &self.config.ssh_connections;
+        // 对既有连接去重:id 撞上就是顶掉一条老连接(与表单新增同一条)
+        let new_id = crate::tree::gen_unique_id("ssh", |id| connections.iter().any(|c| c.id == id));
+        let next = crate::ssh_conn::duplicate_connection(connections, source_id, new_id.clone())?;
+        self.config.ssh_connections = next;
+        self.save_config_now();
+        cx.changed(StoreEvent::Config(ConfigSection::SshConnections));
+        Some(new_id)
+    }
+
     /// 新建一个空分组(重名则只切选中态,由调用方处理)。返回是否真的新建了。
     pub fn create_ssh_group(&mut self, name: &str, cx: &mut Context<Self>) -> bool {
         let name = name.trim();
@@ -144,11 +168,28 @@ impl AppStore {
 
     /// 分组改名:连接归属改名 + `sshGroups` 同步替换。
     /// 重命名为已有组名时**自然合并、去重**(原版 `renameGroup` 的注释原话)。
+    ///
+    /// 整组关联了旧组的项目跟着改:改成新名字 → 关联随名字走;并进已有组 → 旧组成员
+    /// 摊成显式 id(不让项目借合并多看到目标组原有的连接)。规则见
+    /// [`crate::ssh_conn::regroup_project_scopes`]。
     pub fn rename_ssh_group(&mut self, old_name: &str, new_name: &str, cx: &mut Context<Self>) {
         let next = new_name.trim();
         if next.is_empty() || next == old_name {
             return;
         }
+        let merging = crate::ssh_conn::build_group_buckets(
+            &self.config.ssh_connections,
+            &self.config.ssh_groups,
+        )
+        .group_names()
+        .iter()
+        .any(|g| g == next);
+        crate::ssh_conn::regroup_project_scopes(
+            &mut self.config.projects,
+            &self.config.ssh_connections,
+            old_name,
+            (!merging).then_some(next),
+        );
         self.config.ssh_groups =
             crate::ssh_conn::merge_ssh_groups_on_rename(&self.config.ssh_groups, old_name, next);
         for c in &mut self.config.ssh_connections {
@@ -161,7 +202,16 @@ impl AppStore {
     }
 
     /// 解散分组:组里的连接回落「未分组」,组名从 `sshGroups` 移除(连接不删)。
+    ///
+    /// 整组关联了它的项目把组内此刻的连接摊成显式 id —— 整理分组不该顺手收走
+    /// agent 正在用的连接(见 [`crate::ssh_conn::regroup_project_scopes`])。
     pub fn dissolve_ssh_group(&mut self, name: &str, cx: &mut Context<Self>) {
+        crate::ssh_conn::regroup_project_scopes(
+            &mut self.config.projects,
+            &self.config.ssh_connections,
+            name,
+            None,
+        );
         self.config.ssh_groups.retain(|n| n.trim() != name);
         for c in &mut self.config.ssh_connections {
             if c.group.as_deref().map(str::trim).filter(|g| !g.is_empty()) == Some(name) {
@@ -315,13 +365,19 @@ impl AppStore {
     /// 把「关联 SSH」的结果写回项目配置(`SshAssocModal.tsx` 落盘那一段)。
     ///
     /// 范围**始终存显式 id 列表**,不用 `None` 表示「全选」—— 见
-    /// [`crate::ssh_conn::plan_assoc_save`] 里那条 v0.6.3 承诺。
+    /// [`crate::ssh_conn::plan_assoc_save`] 里那条 v0.6.3 承诺。整组关联的组名另存
+    /// (`groups`),写 sidecar 投影时才展开。
+    ///
+    /// 关联到的组顺手登记进 `sshGroups`(显式分组):否则组里的连接一旦全挪走,
+    /// 这个组就从界面上消失了,而项目还关联着它 —— 用户再也看不到、也解散不了它,
+    /// 哪天新建一个同名组,权限就悄悄回来了。
     pub fn set_project_ssh_assoc(
         &mut self,
         project_id: &str,
         enabled: bool,
         project_token: Option<String>,
         scope: Vec<String>,
+        groups: Vec<String>,
         cx: &mut Context<Self>,
     ) {
         let Some(project) = self.config.projects.iter_mut().find(|p| p.id == project_id) else {
@@ -330,8 +386,19 @@ impl AppStore {
         project.ssh_mcp_enabled = enabled;
         project.ssh_cli_token = if enabled { project_token } else { None };
         project.ssh_connection_ids = if enabled { Some(scope) } else { None };
+        project.ssh_connection_groups = if enabled { groups } else { Vec::new() };
+        let mut groups_registered = false;
+        for name in project.ssh_connection_groups.clone() {
+            if !self.config.ssh_groups.iter().any(|g| g.trim() == name) {
+                self.config.ssh_groups.push(name);
+                groups_registered = true;
+            }
+        }
         self.save_config_now();
         cx.changed(StoreEvent::ProjectsChanged);
+        if groups_registered {
+            cx.changed(StoreEvent::Config(ConfigSection::SshConnections));
+        }
     }
 
     /// 「关联 SSH」保存的**完整**动作:算计划 → 后台跑注册器 → 回主线程落配置。
@@ -342,22 +409,26 @@ impl AppStore {
     ///
     /// **注册器是阻塞文件 IO**(还要写 home 下的 Codex / Claude 配置),
     /// 全程在 `background_executor` 上,主线程只负责最后那一次 `set_...`。
+    ///
+    /// `checked` 是**单勾**的连接(已剔除被整组罩住的那些),`groups` 是整组勾选的组名。
     pub fn apply_ssh_assoc(
         &mut self,
         project_id: &str,
         checked: Vec<String>,
+        groups: Vec<String>,
         cx: &mut Context<Self>,
     ) -> Task<Result<Option<SshAssocOutcome>, String>> {
         let Some(project) = self.project(project_id).cloned() else {
             return Task::ready(Ok(None));
         };
-        let all_ids: Vec<String> = self
-            .config
-            .ssh_connections
+        let connections = &self.config.ssh_connections;
+        let plan = crate::ssh_conn::plan_assoc_save(&project, &checked, &groups, connections);
+        // 提示文案里的「N 个连接」数的是**此刻实际可见**的(单勾 ∪ 组内成员)
+        let scope_len = crate::ssh_conn::effective_scope(&checked, &groups, connections)
             .iter()
-            .map(|c| c.id.clone())
-            .collect();
-        let plan = crate::ssh_conn::plan_assoc_save(&project, &checked, &all_ids);
+            .filter(|id| connections.iter().any(|c| &c.id == *id))
+            .count();
+        let total_len = connections.len();
         let project_id = project_id.to_string();
         let project_dir = project.path.clone();
         let existing_token = project.ssh_cli_token.clone();
@@ -379,8 +450,9 @@ impl AppStore {
                         enabled: true,
                         was_enabled,
                         silent,
-                        scope_len: checked.len(),
-                        total_len: all_ids.len(),
+                        scope_len,
+                        total_len,
+                        group_count: groups.len(),
                         project_token: Some(res.project_token),
                         message: res.message,
                     }
@@ -396,17 +468,22 @@ impl AppStore {
                         was_enabled: true,
                         silent: false,
                         scope_len: 0,
-                        total_len: all_ids.len(),
+                        total_len,
+                        group_count: 0,
                         project_token: None,
                         message,
                     }
                 }
             };
-            let scope = if outcome.enabled { checked } else { Vec::new() };
+            let (scope, groups) = if outcome.enabled {
+                (checked, groups)
+            } else {
+                (Vec::new(), Vec::new())
+            };
             let token = outcome.project_token.clone();
             let enabled = outcome.enabled;
             this.update(cx, |store: &mut AppStore, cx| {
-                store.set_project_ssh_assoc(&project_id, enabled, token, scope, cx);
+                store.set_project_ssh_assoc(&project_id, enabled, token, scope, groups, cx);
             })
             .map_err(|e| e.to_string())?;
             Ok(Some(outcome))

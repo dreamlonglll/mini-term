@@ -300,8 +300,11 @@ pub struct SshAssocOutcome {
     /// 有效配置没变(幂等 reconcile / 存量迁移):落盘即可,**不弹提示**。
     pub silent: bool,
     /// 本次范围里的连接数与连接总数 —— 提示文案里的 `scopeAll` / `scopeSubset`。
+    /// `scope_len` 数的是此刻实际可见的(单勾 ∪ 整组关联分组里的成员)。
     pub scope_len: usize,
     pub total_len: usize,
+    /// 整组关联的分组数。非零时提示文案补一句「组内后续新增的连接也自动可用」。
+    pub group_count: usize,
     /// 启用时的项目能力令牌(已由 [`AppStore::set_project_ssh_assoc`] 落盘,
     /// 这里带回只为调用方需要时展示/排查)。
     pub project_token: Option<String>,

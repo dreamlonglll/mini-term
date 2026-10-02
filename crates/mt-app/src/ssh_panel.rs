@@ -1,6 +1,6 @@
 //! 「SSH 连接」面板(对照 `src/components/SshModal.tsx` 777 行)。
 //!
-//! 左栏分组列表 + 右栏连接列表:连接的增删改、分组的新建/改名/解散、把连接
+//! 左栏分组列表 + 右栏连接列表:连接的增删改与复制、分组的新建/改名/解散、把连接
 //! 拖进分组、在右栏行间拖拽排序。数据层全在 [`crate::store::AppStore`] 的 SSH 段(每一步立即落盘),
 //! 分组归类走 [`crate::ssh_conn`] 的纯函数 —— 「一处实现三处用」是原版的刻意
 //! 安排,三个弹窗(本面板 / [`crate::ssh_assoc`] / [`crate::remote_project`])
@@ -145,6 +145,20 @@ pub(crate) fn sidebar_row(
     active: bool,
     drop_active: bool,
 ) -> gpui::Stateful<gpui::Div> {
+    sidebar_row_with(id, None, label, count, active, drop_active)
+}
+
+/// [`sidebar_row`] 带一个**名字前面**的小件(「关联 SSH」的整组勾选框;没有勾选框的
+/// 行传同宽占位,名字才对得齐)。小件自己的点击要 `stop_propagation`,否则会连带
+/// 触发整行的「切到这个分组」。
+pub(crate) fn sidebar_row_with(
+    id: impl Into<gpui::ElementId>,
+    leading: Option<AnyElement>,
+    label: impl Into<SharedString>,
+    count: usize,
+    active: bool,
+    drop_active: bool,
+) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .flex()
@@ -172,6 +186,7 @@ pub(crate) fn sidebar_row(
         } else {
             ui::with_alpha(ui::accent(), 0.0)
         })
+        .children(leading)
         .child(
             div()
                 .flex_1()
@@ -916,6 +931,45 @@ fn delete_conn(state: &Entity<SshPanel>, conn: &SshConnection, window: &mut Wind
     );
 }
 
+/// 复制一条连接(副本叫 `原名 (N)`,紧跟在原连接后面)。走二次确认:副本连密码一起
+/// 照抄,手滑点一下就多出一条带凭据的连接 —— 确认框里先把新名字亮出来,用户点确定
+/// 之前就知道会多出哪一条。名字与 store 落盘时用的是同一个函数,两边不会对不上。
+fn duplicate_conn(
+    state: &Entity<SshPanel>,
+    conn: &SshConnection,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let copy_name = {
+        let store = state.read(cx).store.read(cx);
+        crate::ssh_conn::duplicate_name(&conn.name, store.ssh_connections())
+    };
+    let state = state.clone();
+    let id = conn.id.clone();
+    Confirm::new(
+        t("sshModal", "duplicateConfirmTitle"),
+        tr!(
+            "sshModal",
+            "duplicateConfirmMessage",
+            name = conn.name.clone(),
+            copy = copy_name
+        ),
+    )
+    .open(
+        move |_window, cx| {
+            let id = id.clone();
+            state.update(cx, |panel, cx| {
+                panel
+                    .store
+                    .update(cx, |store, cx| store.duplicate_ssh_connection(&id, cx));
+                cx.notify();
+            });
+        },
+        window,
+        cx,
+    );
+}
+
 fn dissolve_group(state: &Entity<SshPanel>, name: &str, cx: &mut App) {
     let name = name.to_string();
     state.update(cx, |panel, cx| {
@@ -1477,6 +1531,7 @@ fn render_row(state: &Entity<SshPanel>, conn: &SshConnection, frame: &Frame) -> 
     let is_source = frame.dragging.as_deref() == Some(id.as_str());
     let just_copied = frame.copied.as_deref() == Some(id.as_str());
     let conn_for_edit = conn.clone();
+    let conn_for_dup = conn.clone();
     let conn_for_del = conn.clone();
     let drag_label = conn.name.clone();
 
@@ -1525,6 +1580,18 @@ fn render_row(state: &Entity<SshPanel>, conn: &SshConnection, frame: &Frame) -> 
                         let state = state.clone();
                         move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
                             start_edit(&state, &conn_for_edit, window, cx);
+                        }
+                    }),
+                )
+                .child(
+                    ui::ghost_button(
+                        SharedString::from(format!("ssh-dup-{id}")),
+                        t("sshModal", "duplicate"),
+                    )
+                    .on_click({
+                        let state = state.clone();
+                        move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                            duplicate_conn(&state, &conn_for_dup, window, cx);
                         }
                     }),
                 )
