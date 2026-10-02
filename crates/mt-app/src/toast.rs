@@ -473,7 +473,9 @@ impl Render for ToastLayer {
                 // 默认 `stretch` 撑满高度,居中会把它压成 0
                 .rounded(px(6.0))
                 .overflow_hidden()
-                .bg(ui::bg_elevated())
+                // 浮层用 `bg_overlay`(主题包下恒不透明),不用 `bg_elevated` —— 后者会乘
+                // `surface_opacity`,卡片叠在终端上时底下的字会透出来。与标题栏项目下拉同口径
+                .bg(ui::bg_overlay())
                 .border_1()
                 .border_color(ui::border_default())
                 .shadow_lg()

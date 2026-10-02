@@ -1257,9 +1257,9 @@ impl TerminalArea {
                         } else {
                             ui::text_primary()
                         })
-                        // `--bg-hover` 在 ui::Palette 里没有对应项,统一用 bg_overlay
-                        // (与文件树行 hover 同一档)
-                        .hover(|el| el.bg(ui::bg_overlay()))
+                        // `--bg-hover` 在 ui::Palette 里没有对应项。面板底色就是
+                        // `bg_overlay`,悬停再刷它等于没刷,改用 `border_subtle`(同标题栏下拉)
+                        .hover(|el| el.bg(ui::border_subtle()))
                         // 悬停看全文(含粘贴多行时的换行);挂着的再补一句为什么跳不了
                         .tip(if pending {
                             SharedString::from(format!(
@@ -1348,7 +1348,9 @@ impl TerminalArea {
             .rounded(px(6.0))
             .border_1()
             .border_color(ui::border_subtle())
-            .bg(ui::bg_elevated())
+            // 浮层用 `bg_overlay`(主题包下恒不透明),不用 `bg_elevated` —— 后者会乘
+            // `surface_opacity`,面板叠在终端上时底下的字会透出来。与标题栏项目下拉同口径
+            .bg(ui::bg_overlay())
             .shadow_lg()
             // 面板内的按下不算「点外」—— 遮罩的 on_mouse_down 靠 hitbox 判定
             .occlude()

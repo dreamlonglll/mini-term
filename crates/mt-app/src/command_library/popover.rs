@@ -516,7 +516,8 @@ impl CommandPopover {
             .py(px(5.0))
             .cursor_pointer()
             .when(is_cursor, |el| el.bg(ui::accent_subtle()))
-            .when(!is_cursor, |el| el.hover(|el| el.bg(ui::bg_overlay())))
+            // 面板底色就是 `bg_overlay`,悬停再刷它等于没刷,改用 `border_subtle`(同标题栏下拉)
+            .when(!is_cursor, |el| el.hover(|el| el.bg(ui::border_subtle())))
             // 行上**不挂** tooltip:它跟着鼠标弹在行中间,正好盖住行尾那三颗
             // 图标钮(真机截到过);「↵ 运行 · Ctrl+↵ 只粘贴」的说明由底栏常驻承担
             // 悬停把游标挪过来(与项目切换器同款):高亮只有一处,不会出现
@@ -715,7 +716,9 @@ impl Render for CommandPopover {
             .rounded(px(6.0))
             .border_1()
             .border_color(ui::border_subtle())
-            .bg(ui::bg_elevated())
+            // 浮层用 `bg_overlay`(主题包下恒不透明),不用 `bg_elevated` —— 后者会乘
+            // `surface_opacity`,面板叠在终端上时底下的字会透出来。与标题栏项目下拉同口径
+            .bg(ui::bg_overlay())
             .shadow_lg()
             // 面板内的按下不算「点外」—— 宿主遮罩的 on_mouse_down 靠 hitbox 判定
             .occlude()
