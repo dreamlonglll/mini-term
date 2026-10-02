@@ -168,9 +168,9 @@ impl Scope {
 
 /// 自动刷新档位(秒);`0 = 关`。默认 5s。
 const AUTO_REFRESH_OPTIONS: [u32; 5] = [0, 5, 10, 30, 60];
-/// custom 起止输入框的宽度。够 `YYYY-MM-DD` 在等宽字族下也整串露出来 ——
+/// custom 起止输入框的宽度。够 `YYYY-MM-DD HH:MM:SS` 在等宽字族下也整串露出来 ——
 /// 逐层扣法见 [`UsagePanel::render_date_field`]。
-const DATE_INPUT_WIDTH: f32 = 150.0;
+const DATE_INPUT_WIDTH: f32 = 220.0;
 /// 项目下拉菜单与触发框之间的缝(与日历浮层贴触发钮的手感同一档)。
 const PROJECT_MENU_GAP: gpui::Pixels = px(4.0);
 /// 项目下拉菜单的高度上限。项目多的机器上这个菜单能长到顶满整屏 ——
@@ -307,14 +307,15 @@ impl UsagePanel {
         cx: &mut Context<Self>,
     ) -> Self {
         let now = chrono::Local::now();
-        // 偏好读盘:一律过白名单/正则,认不出回默认(**不写回、不报错**)
+        // 偏好读盘:一律过白名单/正则,认不出回默认(**不写回、不报错**)。
+        // custom 起止读进来就改写成规范形态 —— 存量值只有日期,补上时刻再回显
         let (scope, range, project_scope, auto_refresh, custom_from, custom_to) = {
             let config = store.read(cx).config();
-            let date = |v: &Option<String>, fallback: i64| -> String {
+            let date = |v: &Option<String>, edge: Edge| -> String {
                 v.as_deref()
-                    .filter(|s| parse_local_date(s).is_some())
-                    .map(str::to_string)
-                    .unwrap_or_else(|| local_date_str(fallback, now))
+                    .and_then(|s| parse_local_datetime(s, edge))
+                    .map(format_local_datetime)
+                    .unwrap_or_else(|| default_custom_edge(edge, now))
             };
             (
                 Scope::from_key(config.usage_scope.as_deref().unwrap_or("all")),
@@ -324,8 +325,8 @@ impl UsagePanel {
                     .usage_auto_refresh
                     .filter(|v| AUTO_REFRESH_OPTIONS.contains(v))
                     .unwrap_or(5),
-                date(&config.usage_custom_from, 29),
-                date(&config.usage_custom_to, 0),
+                date(&config.usage_custom_from, Edge::From),
+                date(&config.usage_custom_to, Edge::To),
             )
         };
 
@@ -510,6 +511,8 @@ impl UsagePanel {
         let now = chrono::Local::now();
         let since = range_since_ms(range, &self.custom_from, now);
         let until = range_until_ms(range, &self.custom_from, &self.custom_to, now);
+        // 与补桶(`fill_buckets`)同一个判据,否则同日 custom 查回日桶、轴却按小时补
+        let hourly = bucket_hourly(range, &self.custom_from, &self.custom_to, now);
         let tz_offset = tz_offset_minutes(now);
         let tz_name = iana_time_zone::get_timezone().ok();
 
@@ -525,7 +528,7 @@ impl UsagePanel {
                         project,
                         tz_offset,
                         tz_name,
-                        range.hourly(),
+                        hourly,
                         pricing,
                     )
                 })
@@ -682,7 +685,8 @@ impl UsagePanel {
         cx.notify();
     }
 
-    /// custom 起止输入的提交闸门。不合法就把输入回弹到上一个有效值。
+    /// custom 起止输入的提交闸门。不合法就把输入回弹到上一个有效值;
+    /// 合法但不是规范形态(只敲了日期 / 省了秒)就改写成补齐时刻的整串。
     fn commit_custom_date(&mut self, is_from: bool, window: &mut Window, cx: &mut Context<Self>) {
         let (state, prev) = if is_from {
             (self.from_input.clone(), self.custom_from.clone())
@@ -690,9 +694,9 @@ impl UsagePanel {
             (self.to_input.clone(), self.custom_to.clone())
         };
         let raw = state.read(cx).value().to_string();
-        let next = accept_date_input(&raw, &prev);
+        let next = accept_datetime_input(&raw, &prev, Edge::of(is_from));
         if next != raw {
-            // 受控输入回弹
+            // 受控输入回弹 / 改写成规范形态
             state.update(cx, |s, cx| s.set_value(next.clone(), window, cx));
         }
         if next == prev {
@@ -707,8 +711,9 @@ impl UsagePanel {
         self.query(cx);
     }
 
-    /// 日历选中一天:直接落值(不必再过 [`accept_date_input`] 那道闸 —— 日历给出的
-    /// 一定是合法日期),受控输入同步回写。
+    /// 日历选中一天:直接落值(不必再过 [`accept_datetime_input`] 那道闸 —— 日历给出的
+    /// 一定是合法日期),受控输入同步回写。日历只换日期,**时刻沿用这一端原来的**
+    /// (用户先调好 09:30 再去翻日历,不该被冲回 00:00)。
     fn set_custom_date(
         &mut self,
         is_from: bool,
@@ -716,12 +721,14 @@ impl UsagePanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let next = date.format("%Y-%m-%d").to_string();
+        let edge = Edge::of(is_from);
         let prev = if is_from {
             &self.custom_from
         } else {
             &self.custom_to
         };
+        let time = parse_local_datetime(prev, edge).map_or(edge.default_time(), |dt| dt.time());
+        let next = format_local_datetime(date.and_time(time));
         if *prev == next {
             return;
         }
@@ -750,11 +757,15 @@ impl UsagePanel {
         cx: &mut Context<Self>,
     ) {
         let today = chrono::Local::now().date_naive();
-        let current = parse_local_date(if is_from {
-            &self.custom_from
-        } else {
-            &self.custom_to
-        });
+        let current = parse_local_datetime(
+            if is_from {
+                &self.custom_from
+            } else {
+                &self.custom_to
+            },
+            Edge::of(is_from),
+        )
+        .map(|dt| dt.date());
         // 先清后建:换浮层时旧实体必须先 drop 掉,否则 overlay 栈会错乱
         // (理由见 `date_picker::DatePicker::new` 的注释)
         self.calendar = None;
@@ -1427,14 +1438,14 @@ impl UsagePanel {
             )
     }
 
-    /// 一个 custom 日期输入 + 它的日历触发钮。
+    /// 一个 custom 起止输入(`YYYY-MM-DD HH:MM:SS`)+ 它的日历触发钮。
     ///
-    /// 宽度 [`DATE_INPUT_WIDTH`] 而不是原来的 112:`gpui_component::Input` 逐层扣掉
+    /// 宽度 [`DATE_INPUT_WIDTH`] 的算法:`gpui_component::Input` 逐层扣掉
     /// 左右各 12 的 padding(`input_px(Medium)`)、1px 边框、再给光标留 10
-    /// (`input/element.rs` 的 `RIGHT_MARGIN`),112 只剩 76px 可视;而它的文字是
+    /// (`input/element.rs` 的 `RIGHT_MARGIN`),共吃掉 36px;而它的文字是
     /// **rem 定死的 14px**(`input_text_size` → `text_sm`,**不跟 `ui::font_px`
-    /// 缩放**),等宽字族下 `2026-08-20` 要 84px —— 年份直接被截掉,点到行尾时
-    /// 还会因为「光标要露出来」整行左移。
+    /// 缩放**),等宽字族下 19 个字符的 `2026-08-20 23:59:59` 要 160px。给窄了
+    /// 头尾直接被截掉,点到行尾时还会因为「光标要露出来」整行左移。
     ///
     /// 另外补 `flex_none`:原来那两层是默认可收缩的,挤的时候还会被压得更窄。
     fn render_date_field(&mut self, is_from: bool, cx: &mut Context<Self>) -> Div {

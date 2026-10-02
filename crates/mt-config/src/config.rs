@@ -260,10 +260,11 @@ pub struct AppConfig {
     /// 自动刷新间隔(秒);0 = 关。合法档位 0/5/10/30/60。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_auto_refresh: Option<u32>,
-    /// custom range 起始日 `"YYYY-MM-DD"`。
+    /// custom range 起点 `"YYYY-MM-DD HH:MM:SS"`(本地时间)。存量值只有
+    /// `"YYYY-MM-DD"`,面板读盘照收;旧版本读到带时刻的值认不出,回落缺省窗口。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_custom_from: Option<String>,
-    /// custom range 截止日 `"YYYY-MM-DD"`。
+    /// custom range 截止(含这一整秒)`"YYYY-MM-DD HH:MM:SS"`,形态同上。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_custom_to: Option<String>,
     /// 命令库(issue #81):全局一份常用命令,终端控制条的「命令」浮层按分组列出,

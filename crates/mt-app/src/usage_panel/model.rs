@@ -73,12 +73,33 @@ impl UsageRange {
             Self::Custom => t("usageStats", "range.custom"),
         }
     }
+}
 
-    /// 「今天」按小时分桶,其余按日历日。
-    pub fn hourly(self) -> bool {
-        self == Self::Today
+/// custom 起止的哪一端。只决定「只给了日期」时补哪个时刻:
+/// 起点补 `00:00:00`、截止补 `23:59:59` —— 与支持时分秒之前「起始日 00:00 起、
+/// 含截止日全天」的口径一字不差。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Edge {
+    From,
+    To,
+}
+
+impl Edge {
+    pub const fn of(is_from: bool) -> Self {
+        if is_from { Self::From } else { Self::To }
+    }
+
+    /// 「只给了日期」时这一端补的时刻。
+    pub fn default_time(self) -> chrono::NaiveTime {
+        match self {
+            Self::From => chrono::NaiveTime::MIN,
+            Self::To => chrono::NaiveTime::from_hms_opt(23, 59, 59).unwrap_or_default(),
+        }
     }
 }
+
+/// custom 起止的规范形态(落盘、输入框回显都是它)。
+const DATETIME_FMT: &str = "%Y-%m-%d %H:%M:%S";
 
 /// `"YYYY-MM-DD"` → 本地日历日。形态不符返回 `None`
 /// (对齐 `usageDates.ts::parseLocalDate` 的正则闸门)。
@@ -97,17 +118,63 @@ pub fn parse_local_date(s: &str) -> Option<chrono::NaiveDate> {
     chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
 }
 
-/// custom 起止日期输入的**提交闸门**(`usageDates.ts::acceptDateInput`)。
+/// `"HH:MM"` / `"HH:MM:SS"`(每段恰好两位数字)→ 时刻。省掉的秒按 `00`。
+fn parse_local_time(s: &str) -> Option<chrono::NaiveTime> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if !(2..=3).contains(&parts.len())
+        || parts
+            .iter()
+            .any(|p| p.len() != 2 || !p.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return None;
+    }
+    let num = |i: usize| parts.get(i).map_or(Some(0), |p| p.parse::<u32>().ok());
+    chrono::NaiveTime::from_hms_opt(num(0)?, num(1)?, num(2)?)
+}
+
+/// custom 起止 → 本地时刻。收三种形态(日期与时刻之间一个空格或 `T`):
 ///
-/// 只有完整 `YYYY-MM-DD` 才更新承诺值,其余输入保持上一个有效值(受控输入随之回弹)。
+/// - `YYYY-MM-DD` —— 时刻按 [`Edge`] 补(起点 00:00:00、截止 23:59:59)
+/// - `YYYY-MM-DD HH:MM` —— 秒按 00
+/// - `YYYY-MM-DD HH:MM:SS` —— 规范形态
+///
+/// 存量偏好里只有 `YYYY-MM-DD`,第一条就是它的读盘兼容。形态不符返回 `None`。
+pub fn parse_local_datetime(s: &str, edge: Edge) -> Option<chrono::NaiveDateTime> {
+    let s = s.trim();
+    let (date, time) = match s.split_once([' ', 'T']) {
+        Some((date, time)) => (date, parse_local_time(time)?),
+        None => (s, edge.default_time()),
+    };
+    Some(parse_local_date(date)?.and_time(time))
+}
+
+/// 本地时刻 → 规范形态 `YYYY-MM-DD HH:MM:SS`。
+pub fn format_local_datetime(dt: chrono::NaiveDateTime) -> String {
+    dt.format(DATETIME_FMT).to_string()
+}
+
+/// custom 起止输入的**提交闸门**(`usageDates.ts::acceptDateInput` 的时分秒版)。
+///
+/// 认得出(见 [`parse_local_datetime`])才更新承诺值,并改写成规范形态 ——
+/// 只敲了日期也回显成补齐时刻的整串,用户一眼看出「这一端算到几点」;
+/// 其余输入保持上一个有效值(受控输入随之回弹)。
 /// **空串一旦进查询,custom 会静默退化成无上界 / 近 30 天**,展示远大于所选
 /// 范围的数据 —— 这道闸是硬要求。
-pub fn accept_date_input(next: &str, prev: &str) -> String {
-    if parse_local_date(next).is_some() {
-        next.to_string()
-    } else {
-        prev.to_string()
+pub fn accept_datetime_input(next: &str, prev: &str, edge: Edge) -> String {
+    match parse_local_datetime(next, edge) {
+        Some(dt) => format_local_datetime(dt),
+        None => prev.to_string(),
     }
+}
+
+/// custom 起止的缺省值:起点 = 29 天前 00:00:00,截止 = 今天 23:59:59
+/// (与 days30 同一个窗口)。
+pub fn default_custom_edge(edge: Edge, now: chrono::DateTime<chrono::Local>) -> String {
+    let day = match edge {
+        Edge::From => now.date_naive() - chrono::Duration::days(29),
+        Edge::To => now.date_naive(),
+    };
+    format_local_datetime(day.and_time(edge.default_time()))
 }
 
 /// custom 起点的最早允许日(近一年)。原版 `<input type="date">` 的 `min`
@@ -116,29 +183,37 @@ pub(super) fn custom_floor(today: chrono::NaiveDate) -> chrono::NaiveDate {
     today - chrono::Duration::days(364)
 }
 
-/// n 天前的本地日历日,`"YYYY-MM-DD"`(custom 起止的缺省值用)。
-pub fn local_date_str(days_back: i64, now: chrono::DateTime<chrono::Local>) -> String {
-    (now.date_naive() - chrono::Duration::days(days_back))
-        .format("%Y-%m-%d")
-        .to_string()
+/// 本地时刻 → epoch ms。DST 拨快那一小时里的时刻不存在,顺延一小时再取;
+/// 仍取不到才用 `fallback`。
+fn local_ms(dt: chrono::NaiveDateTime, fallback: i64) -> i64 {
+    use chrono::TimeZone;
+    [dt, dt + chrono::Duration::hours(1)]
+        .into_iter()
+        .find_map(|dt| chrono::Local.from_local_datetime(&dt).earliest())
+        .map_or(fallback, |dt| dt.timestamp_millis())
 }
 
-/// 本地日历日 → 当天 00:00 的 epoch ms。DST 那天可能没有 00:00,取当天最早的合法时刻。
+/// 本地日历日 → 当天 00:00 的 epoch ms。
 fn midnight_ms(date: chrono::NaiveDate, fallback: i64) -> i64 {
+    local_ms(date.and_time(chrono::NaiveTime::MIN), fallback)
+}
+
+/// epoch ms → 本地时刻(补桶窗口用)。
+fn local_datetime(ms: i64, now: chrono::DateTime<chrono::Local>) -> chrono::NaiveDateTime {
     use chrono::TimeZone;
-    let naive = date.and_hms_opt(0, 0, 0).unwrap_or_default();
-    match chrono::Local.from_local_datetime(&naive).earliest() {
-        Some(dt) => dt.timestamp_millis(),
-        None => fallback,
-    }
+    chrono::Local
+        .timestamp_millis_opt(ms)
+        .single()
+        .unwrap_or(now)
+        .naive_local()
 }
 
 /// 范围 → 窗口起点(epoch ms)。
 ///
 /// **本地日历日口径**:today = 本地 00:00 起(绝不用滚动 24h);days7/30 = 含今天的
-/// 完整日历日;month/months3/months6 = 对应月份的月初;custom = 起始日本地 00:00
-/// (**缺失/非法回落近 30 天**、过旧钳到一年内)。逐条对照
-/// `src/utils/usageDates.ts` 的 `rangeStartDate` + `rangeSinceMs`。
+/// 完整日历日;month/months3/months6 = 对应月份的月初;custom = 起点那一刻
+/// (精确到秒;**缺失/非法回落近 30 天**、早于一年下限的钳到下限当天 00:00)。
+/// 逐条对照 `src/utils/usageDates.ts` 的 `rangeStartDate` + `rangeSinceMs`。
 pub fn range_since_ms(
     range: UsageRange,
     custom_from: &str,
@@ -153,21 +228,25 @@ pub fn range_since_ms(
         UsageRange::Month => today.with_day(1).unwrap_or(today),
         UsageRange::Months3 => month_start_back(today, 2),
         UsageRange::Months6 => month_start_back(today, 5),
-        UsageRange::Custom => match parse_local_date(custom_from) {
+        UsageRange::Custom => match parse_local_datetime(custom_from, Edge::From) {
             // 起始缺失/非法回落近 30 天,不让面板空转
             None => today - Duration::days(29),
-            Some(from) => from.max(custom_floor(today)),
+            Some(from) => {
+                let floor = custom_floor(today).and_time(chrono::NaiveTime::MIN);
+                return local_ms(from.max(floor), now.timestamp_millis());
+            }
         },
     };
     midnight_ms(start_date, now.timestamp_millis())
 }
 
-/// custom range 的窗口上界(**含截止日全天**);其余 range 开区间到现在。
+/// custom range 的窗口上界(**含截止那一整秒** —— 只给日期时即含截止日全天);
+/// 其余 range 开区间到现在。
 ///
-/// 两条钳位照抄 `usageDates.ts::rangeUntilMs`:
-/// - `from > to`(键盘可造出的倒置区间)→ 把上界抬到 `from`,等效单日查询,
-///   不许静默全零;
-/// - `day < floor` → 抬到一年下限,免得 since 被抬、until 不动产生倒置空窗。
+/// 上界落到 since 之前时(键盘可造出的 `from > to`,或两端都早于一年下限、
+/// since 被钳上去而 until 没动)→ 退成 **since 当天到 23:59:59** 的窗口,
+/// 不许倒置空窗静默全零。只给日期时这就是 `usageDates.ts::rangeUntilMs` 的
+/// 两条钳位:倒置等效起始日单日查询、过旧抬到一年下限当天。
 pub fn range_until_ms(
     range: UsageRange,
     custom_from: &str,
@@ -177,43 +256,51 @@ pub fn range_until_ms(
     if range != UsageRange::Custom {
         return None;
     }
-    let to = parse_local_date(custom_to)?;
-    let from = parse_local_date(custom_from);
-    let mut day = match from {
-        Some(f) if f > to => f,
-        _ => to,
-    };
-    let floor = custom_floor(now.date_naive());
-    if day < floor {
-        day = floor;
+    let to = parse_local_datetime(custom_to, Edge::To)?;
+    let since = range_since_ms(UsageRange::Custom, custom_from, now);
+    let until = local_ms(to, now.timestamp_millis()) + 999;
+    if until >= since {
+        return Some(until);
     }
-    // 该日 +1 天的 00:00 - 1ms
+    // since 所在日 +1 天的 00:00 - 1ms
+    let day = local_datetime(since, now).date();
     Some(midnight_ms(day + chrono::Duration::days(1), now.timestamp_millis()) - 1)
 }
 
-/// custom 趋势图的补桶窗口。与查询窗口**同源**:起点走 since、终点走 until 的
-/// 日历日;`end < start` 时 `end = start`。**轴反映所选窗口而非数据跨度**。
+/// custom 的补桶窗口(本地时刻)。与查询窗口**同源**:起点走 since、终点走 until;
+/// `end < start` 时 `end = start`。**轴反映所选窗口而非数据跨度**。
 pub fn custom_chart_window(
     custom_from: &str,
     custom_to: &str,
     now: chrono::DateTime<chrono::Local>,
-) -> (chrono::NaiveDate, chrono::NaiveDate) {
-    use chrono::TimeZone;
-    let since = range_since_ms(UsageRange::Custom, custom_from, now);
-    let start = chrono::Local
-        .timestamp_millis_opt(since)
-        .single()
-        .map(|d| d.date_naive())
-        .unwrap_or_else(|| now.date_naive());
+) -> (chrono::NaiveDateTime, chrono::NaiveDateTime) {
+    let start = local_datetime(range_since_ms(UsageRange::Custom, custom_from, now), now);
     let end = match range_until_ms(UsageRange::Custom, custom_from, custom_to, now) {
-        None => now.date_naive(),
-        Some(ms) => chrono::Local
-            .timestamp_millis_opt(ms)
-            .single()
-            .map(|d| d.date_naive())
-            .unwrap_or_else(|| now.date_naive()),
+        None => now.naive_local(),
+        Some(ms) => local_datetime(ms, now),
     };
     (start, end.max(start))
+}
+
+/// 按小时分桶?「今天」恒是;custom 窗口落在**同一个本地日历日**内也是
+/// (只看半天的数据,按日分桶就只剩一根柱子)。其余按日历日。
+///
+/// 不按「跨度 ≤ 24h」判:后端的小时桶标签只有 `HH:00` 不带日期,跨午夜的
+/// 窗口会撞出两个同名桶。
+pub fn bucket_hourly(
+    range: UsageRange,
+    custom_from: &str,
+    custom_to: &str,
+    now: chrono::DateTime<chrono::Local>,
+) -> bool {
+    match range {
+        UsageRange::Today => true,
+        UsageRange::Custom => {
+            let (start, end) = custom_chart_window(custom_from, custom_to, now);
+            start.date() == end.date()
+        }
+        _ => false,
+    }
 }
 
 /// n 个月前的月初(日历减法,跨年正确)。
@@ -235,7 +322,8 @@ pub fn tz_offset_minutes(now: chrono::DateTime<chrono::Local>) -> i32 {
 /// 补齐空桶(`DailyChart.tsx::fillBuckets`)。
 ///
 /// 后端快照是**稀疏的**(只有有数据的桶),无活动时段补 0 才画得出完整时间轴。
-/// today 从 00:00 补到当前小时;日粒度补窗口到今天;custom 补所选起止。
+/// today 从 00:00 补到当前小时;日粒度补窗口到今天;custom 补所选起止
+/// (同日窗口按小时补,见 [`bucket_hourly`])。
 pub fn fill_buckets(
     daily: &[DailyStat],
     range: UsageRange,
@@ -251,8 +339,15 @@ pub fn fill_buckets(
     };
     let mut out = Vec::new();
 
-    if range == UsageRange::Today {
-        for h in 0..=now.hour() {
+    if bucket_hourly(range, custom_from, custom_to, now) {
+        let (first, last) = match range {
+            UsageRange::Custom => {
+                let (start, end) = custom_chart_window(custom_from, custom_to, now);
+                (start.hour(), end.hour())
+            }
+            _ => (0, now.hour()),
+        };
+        for h in first..=last {
             let key = format!("{h:02}:00");
             out.push(match map.get(key.as_str()) {
                 Some(d) => (*d).clone(),
@@ -265,17 +360,14 @@ pub fn fill_buckets(
         return out;
     }
     let (start, end) = match range {
-        UsageRange::Custom => custom_chart_window(custom_from, custom_to, now),
-        _ => {
-            use chrono::TimeZone;
-            let since = range_since_ms(range, custom_from, now);
-            let start = chrono::Local
-                .timestamp_millis_opt(since)
-                .single()
-                .map(|d| d.date_naive())
-                .unwrap_or_else(|| now.date_naive());
-            (start, now.date_naive())
+        UsageRange::Custom => {
+            let (start, end) = custom_chart_window(custom_from, custom_to, now);
+            (start.date(), end.date())
         }
+        _ => (
+            local_datetime(range_since_ms(range, custom_from, now), now).date(),
+            now.date_naive(),
+        ),
     };
     let mut cur = start;
     while cur <= end {
@@ -618,41 +710,125 @@ mod tests {
         }
     }
 
-    /// 提交闸门:只有完整 `YYYY-MM-DD` 才更新承诺值,其余保持上一个有效值。
+    /// 提交闸门:认得出才更新承诺值(并改写成规范形态),其余保持上一个有效值。
     /// **空串一旦进查询,custom 会静默退化**。
     #[test]
     fn 日期输入闸门只收完整日期() {
-        assert_eq!(accept_date_input("2026-08-01", "2026-07-01"), "2026-08-01");
+        let prev = "2026-07-01 00:00:00";
+        assert_eq!(
+            accept_datetime_input("2026-08-01", prev, Edge::From),
+            "2026-08-01 00:00:00"
+        );
         for bad in ["", "2026-8-1", "2026/08/01", "2026-08-011", "abcd-ef-gh"] {
             assert_eq!(
-                accept_date_input(bad, "2026-07-01"),
-                "2026-07-01",
+                accept_datetime_input(bad, prev, Edge::From),
+                prev,
                 "{bad:?} 该回弹"
             );
         }
         // 形态对但日子不存在的也要拦(2 月 30 日)
-        assert_eq!(accept_date_input("2026-02-30", "2026-07-01"), "2026-07-01");
+        assert_eq!(accept_datetime_input("2026-02-30", prev, Edge::From), prev);
     }
 
-    /// custom 图表窗口与查询窗口**同源**:起点走 since、终点走 until 的日历日。
+    /// 时分秒:三种形态都收,统一改写成 `YYYY-MM-DD HH:MM:SS`;
+    /// 只给日期时截止端补 23:59:59(含截止日全天)。
+    #[test]
+    fn 时分秒输入改写成规范形态() {
+        let prev = "2026-07-01 00:00:00";
+        let cases = [
+            ("2026-08-01", Edge::To, "2026-08-01 23:59:59"),
+            ("2026-08-01 08:05", Edge::From, "2026-08-01 08:05:00"),
+            ("2026-08-01 08:05", Edge::To, "2026-08-01 08:05:00"),
+            ("2026-08-01 08:05:09", Edge::To, "2026-08-01 08:05:09"),
+            ("2026-08-01T08:05:09", Edge::From, "2026-08-01 08:05:09"),
+            (" 2026-08-01 23:59:59 ", Edge::From, "2026-08-01 23:59:59"),
+        ];
+        for (input, edge, want) in cases {
+            assert_eq!(accept_datetime_input(input, prev, edge), want, "{input:?}");
+        }
+        for bad in [
+            "2026-08-01 9:05",
+            "2026-08-01 24:00",
+            "2026-08-01 12:60",
+            "2026-08-01 12:00:60",
+            "2026-08-01 12",
+            "2026-08-01 12:00:00:00",
+            "2026-08-01T",
+            "2026-08-01 ab:cd",
+        ] {
+            assert_eq!(accept_datetime_input(bad, prev, Edge::To), prev, "{bad:?} 该回弹");
+        }
+    }
+
+    /// 缺省窗口与 days30 同一个:29 天前 00:00:00 起、今天 23:59:59 止。
+    #[test]
+    fn custom_缺省值补齐时刻() {
+        let now = at(2026, 8, 18);
+        assert_eq!(default_custom_edge(Edge::From, now), "2026-07-20 00:00:00");
+        assert_eq!(default_custom_edge(Edge::To, now), "2026-08-18 23:59:59");
+    }
+
+    /// 带时刻的起止精确到秒:起点那一刻起,含截止那一整秒。
+    #[test]
+    fn custom_窗口精确到秒() {
+        let now = at(2026, 8, 18);
+        let since = range_since_ms(UsageRange::Custom, "2026-08-10 09:30:15", now);
+        let until =
+            range_until_ms(UsageRange::Custom, "2026-08-10 09:30:15", "2026-08-10 18:00:00", now)
+                .unwrap();
+        let a = chrono::Local.timestamp_millis_opt(since).unwrap();
+        let b = chrono::Local.timestamp_millis_opt(until).unwrap();
+        assert_eq!((a.day(), a.hour(), a.minute(), a.second()), (10, 9, 30, 15));
+        assert_eq!(a.timestamp_subsec_millis(), 0);
+        assert_eq!((b.day(), b.hour(), b.minute(), b.second()), (10, 18, 0, 0));
+        assert_eq!(b.timestamp_subsec_millis(), 999, "含截止那一整秒");
+    }
+
+    /// 同日内时刻倒置(14:00 → 10:00)同样退成「起点到当天 23:59:59」,不许空窗。
+    #[test]
+    fn custom_时刻倒置退成起点当天() {
+        let now = at(2026, 8, 18);
+        let from = "2026-08-10 14:00:00";
+        let since = range_since_ms(UsageRange::Custom, from, now);
+        let until = range_until_ms(UsageRange::Custom, from, "2026-08-10 10:00:00", now).unwrap();
+        assert!(until > since);
+        let b = chrono::Local.timestamp_millis_opt(until).unwrap();
+        assert_eq!((b.day(), b.hour(), b.minute(), b.second()), (10, 23, 59, 59));
+    }
+
+    /// custom 图表窗口与查询窗口**同源**:起点走 since、终点走 until。
     #[test]
     fn custom_图表窗口与查询窗口同源() {
         let now = at(2026, 8, 18);
         let (start, end) = custom_chart_window("2026-08-01", "2026-08-10", now);
-        assert_eq!(start, chrono::NaiveDate::from_ymd_opt(2026, 8, 1).unwrap());
-        assert_eq!(end, chrono::NaiveDate::from_ymd_opt(2026, 8, 10).unwrap());
+        assert_eq!(start.date(), chrono::NaiveDate::from_ymd_opt(2026, 8, 1).unwrap());
+        assert_eq!(end.date(), chrono::NaiveDate::from_ymd_opt(2026, 8, 10).unwrap());
 
         // 截止缺失 → 无上界 → 补到今天
         let (_, end) = custom_chart_window("2026-08-01", "", now);
-        assert_eq!(end, now.date_naive());
+        assert_eq!(end.date(), now.date_naive());
 
-        // 倒置 → end 抬到 start(轴不许倒着长)
+        // 倒置 → end 抬到起点当天(轴不许倒着长)
         let (start, end) = custom_chart_window("2026-08-10", "2026-08-01", now);
-        assert_eq!(start, end);
+        assert_eq!(start.date(), end.date());
 
         // 过旧 → 与查询同步钳到一年下限
         let (start, _) = custom_chart_window("2020-01-01", "2020-02-01", now);
-        assert_eq!(start, now.date_naive() - chrono::Duration::days(364));
+        assert_eq!(start.date(), now.date_naive() - chrono::Duration::days(364));
+    }
+
+    /// 分桶粒度:同一本地日历日内的 custom 按小时,跨午夜一律按日
+    /// (小时桶标签只有 `HH:00`,跨日会撞名)。
+    #[test]
+    fn custom_同日窗口按小时分桶() {
+        let now = at(2026, 8, 18);
+        assert!(bucket_hourly(UsageRange::Today, "", "", now));
+        assert!(!bucket_hourly(UsageRange::Days7, "", "", now));
+        let custom = |from, to| bucket_hourly(UsageRange::Custom, from, to, now);
+        assert!(custom("2026-08-10 09:00:00", "2026-08-10 18:00:00"));
+        assert!(custom("2026-08-10", "2026-08-10"), "单日 = 当天 00:00~23:59:59");
+        assert!(!custom("2026-08-10 22:00:00", "2026-08-11 02:00:00"), "跨午夜按日");
+        assert!(!custom("2026-08-01", "2026-08-10"));
     }
 
     /// 补空桶:后端快照稀疏,不补就画不出完整时间轴。
@@ -678,6 +854,23 @@ mod tests {
         assert_eq!(filled.len(), 3);
         assert_eq!(filled.first().unwrap().date, "2026-08-15");
         assert_eq!(filled.last().unwrap().date, "2026-08-17");
+
+        // 同日 custom 按小时补:起点所在小时到截止所在小时
+        let hourly = vec![DailyStat {
+            date: "10:00".into(),
+            cost: 2.0,
+            ..Default::default()
+        }];
+        let filled = fill_buckets(
+            &hourly,
+            UsageRange::Custom,
+            "2026-08-16 09:30:00",
+            "2026-08-16 12:10:00",
+            now,
+        );
+        let keys: Vec<&str> = filled.iter().map(|d| d.date.as_str()).collect();
+        assert_eq!(keys, ["09:00", "10:00", "11:00", "12:00"]);
+        assert_eq!(filled[1].cost, 2.0);
 
         // today 从 00:00 补到当前小时
         let filled = fill_buckets(&daily, UsageRange::Today, "", "", now);
