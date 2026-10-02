@@ -491,6 +491,15 @@ pub struct ProjectConfig {
     /// `None` = 未设置 → 默认全部连接可见。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ssh_connection_ids: Option<Vec<String>>,
+    /// 「关联 SSH」里**整组**勾选的分组名(已 trim)。组内连接 —— 含之后才加进组的 ——
+    /// 都在该项目的范围里,与 `ssh_connection_ids` 取并集;只在后者为 `Some` 时有意义
+    /// (`None` 本来就是全部可见)。
+    ///
+    /// sidecar 不认这个字段:写 `config.json` 投影时经
+    /// [`ProjectConfig::effective_ssh_connection_ids`] 展开成连接 id 并进
+    /// `sshConnectionIds`,投影形状一字不变,三个 sidecar 不用跟着改。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ssh_connection_groups: Vec<String>,
     /// 项目级环境变量列表,新建终端时注入。空 Vec 时序列化跳过保持文件干净。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env_vars: Vec<ProjectEnvVar>,
@@ -514,7 +523,8 @@ pub struct ProjectConfig {
     ///
     /// 只由反序列化填充:已知字段(含只读不写的 `savedLayout`)先被各自的字段吃掉,
     /// 落不进这里。**不许手工往里塞已知字段名** —— flatten 序列化时会与真字段
-    /// 重复成两个同名键。SSH 投影只取四个已知字段,不带它。
+    /// 重复成两个同名键。SSH 投影只取四个已知字段(整组关联展开进
+    /// `sshConnectionIds`),不带它。
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
@@ -528,6 +538,40 @@ impl ProjectConfig {
             path: path.into(),
             ..Default::default()
         }
+    }
+
+    /// 该项目此刻实际可见的连接 id:显式列表 ∪ 整组关联分组里**此刻**的成员。
+    ///
+    /// - `None`(未设范围 = 全部可见)原样返回 `None`;
+    /// - 显式列表原样排在前面(含已删连接的陈旧 id —— 没有整组关联时与此前的投影
+    ///   逐字一致,sidecar 自己会滤掉),分组成员按连接表顺序追加、去重;
+    /// - 组名两边都按 trim 后比(连接的 `group` 可能是手改配置留下的带空白存量)。
+    pub fn effective_ssh_connection_ids(
+        &self,
+        connections: &[SshConnection],
+    ) -> Option<Vec<String>> {
+        let mut ids = self.ssh_connection_ids.clone()?;
+        if self.ssh_connection_groups.is_empty() {
+            return Some(ids);
+        }
+        for conn in connections {
+            let Some(group) = conn
+                .group
+                .as_deref()
+                .map(str::trim)
+                .filter(|g| !g.is_empty())
+            else {
+                continue;
+            };
+            let linked = self
+                .ssh_connection_groups
+                .iter()
+                .any(|name| name.trim() == group);
+            if linked && !ids.iter().any(|id| id == &conn.id) {
+                ids.push(conn.id.clone());
+            }
+        }
+        Some(ids)
     }
 }
 
@@ -1025,6 +1069,10 @@ impl std::error::Error for SaveError {
 /// 项目**一个都不筛**:`scope_connections` 把「项目未找到」与「项目没设
 /// sshConnectionIds」都判成"全部连接可见",漏写一个设过范围的项目就等于
 /// 悄悄放宽了它的可见范围。
+///
+/// 整组关联(`sshConnectionGroups`)在这里**展开**成连接 id 写进 `sshConnectionIds`,
+/// 不另起字段:sidecar 版本自成语义、不随主程序发版,让它们认新字段就得先换掉装机
+/// 目录里的旧 sidecar。每次保存都重写投影,往组里加 / 从组里挪走连接因此即时生效。
 fn ssh_projection(config: &AppConfig) -> serde_json::Value {
     use serde_json::{Map, Value};
     let projects: Vec<Value> = config
@@ -1037,10 +1085,10 @@ fn ssh_projection(config: &AppConfig) -> serde_json::Value {
             if let Some(token) = &p.ssh_cli_token {
                 m.insert("sshCliToken".into(), Value::String(token.clone()));
             }
-            if let Some(ids) = &p.ssh_connection_ids {
+            if let Some(ids) = p.effective_ssh_connection_ids(&config.ssh_connections) {
                 m.insert(
                     "sshConnectionIds".into(),
-                    Value::Array(ids.iter().cloned().map(Value::String).collect()),
+                    Value::Array(ids.into_iter().map(Value::String).collect()),
                 );
             }
             Value::Object(m)
@@ -2755,6 +2803,116 @@ mod tests {
         assert_eq!(by_id.len(), 1);
         let unscoped = mt_core::read_ssh_connections_for_project_at(Some(path), Some("p2"));
         assert_eq!(unscoped.len(), 2, "没设范围的项目仍是全部可见");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    fn grouped_conn(id: &str, group: Option<&str>) -> SshConnection {
+        SshConnection {
+            id: id.into(),
+            name: format!("n-{id}"),
+            host: "h".into(),
+            port: 22,
+            user: "u".into(),
+            password: None,
+            identity_file: None,
+            group: group.map(str::to_string),
+            extra: Default::default(),
+        }
+    }
+
+    /// 有效范围 = 显式 id ∪ 组内成员:显式列表原样在前(陈旧 id 也留着),
+    /// 组成员按连接表顺序追加且去重;组名两边 trim 后比;`None` 仍是全部可见。
+    #[test]
+    fn 有效范围是显式_id_并上整组成员() {
+        let conns = vec![
+            grouped_conn("a1", Some("A")),
+            grouped_conn("b1", Some("B")),
+            grouped_conn("a2", Some(" A ")),
+            grouped_conn("u1", None),
+        ];
+        let project = ProjectConfig {
+            ssh_connection_ids: Some(vec!["u1".into(), "a2".into(), "gone".into()]),
+            ssh_connection_groups: vec!["A".into()],
+            ..project_stub()
+        };
+        assert_eq!(
+            project.effective_ssh_connection_ids(&conns),
+            Some(vec!["u1".into(), "a2".into(), "gone".into(), "a1".into()])
+        );
+
+        // 没有整组关联:与显式列表逐字一致(存量项目的投影一个字节都不变)
+        let plain = ProjectConfig {
+            ssh_connection_ids: Some(vec!["b1".into()]),
+            ..project_stub()
+        };
+        assert_eq!(
+            plain.effective_ssh_connection_ids(&conns),
+            Some(vec!["b1".into()])
+        );
+
+        // 未设范围 = 全部可见,有没有组都不去收窄它
+        let all = ProjectConfig {
+            ssh_connection_groups: vec!["A".into()],
+            ..project_stub()
+        };
+        assert_eq!(all.effective_ssh_connection_ids(&conns), None);
+    }
+
+    /// 整组关联写进投影时展开成连接 id:sidecar 不认新字段也拿得到范围,
+    /// 之后加进组的连接下一次保存就在范围里 —— 「组内后续新增自动可用」的那半句。
+    #[test]
+    fn 整组关联在投影里展开且跟随组成员变化() {
+        let root = unique_test_root("projection-group-scope");
+        let path = root.join("config.json");
+        let store = ConfigStore::at(&path);
+        let token = store.load().unwrap().token;
+
+        let mut config = AppConfig {
+            ssh_connections: vec![
+                grouped_conn("a1", Some("A")),
+                grouped_conn("b1", Some("B")),
+                grouped_conn("u1", None),
+            ],
+            projects: vec![ProjectConfig {
+                id: "p1".into(),
+                ssh_mcp_enabled: true,
+                ssh_cli_token: Some("tok-g".into()),
+                ssh_connection_ids: Some(vec!["u1".into()]),
+                ssh_connection_groups: vec!["A".into()],
+                ..project_stub()
+            }],
+            ..Default::default()
+        };
+        store.save(token, &config).unwrap();
+
+        let scoped_ids = |path: &PathBuf| -> Vec<String> {
+            mt_core::read_ssh_connections_for_token_at(Some(path.clone()), "tok-g")
+                .unwrap()
+                .into_iter()
+                .map(|c| c.id)
+                .collect()
+        };
+        assert_eq!(scoped_ids(&path), ["a1", "u1"]);
+        let projection = fs::read_to_string(&path).unwrap();
+        assert!(
+            !projection.contains("sshConnectionGroups"),
+            "投影形状不许多出 sidecar 不认的字段: {projection}"
+        );
+
+        // 往 A 组里加一条、把 b1 也挪进 A:不动项目的范围设置,下一次保存即生效
+        config.ssh_connections.push(grouped_conn("a2", Some("A")));
+        config.ssh_connections[1].group = Some("A".into());
+        store.save(token, &config).unwrap();
+        assert_eq!(scoped_ids(&path), ["a1", "b1", "u1", "a2"]);
+
+        // 库里存的仍是组名,不是展开后的 id
+        let reloaded = store.read();
+        assert_eq!(reloaded.projects[0].ssh_connection_groups, ["A"]);
+        assert_eq!(
+            reloaded.projects[0].ssh_connection_ids.as_deref(),
+            Some(&["u1".to_string()][..])
+        );
 
         fs::remove_dir_all(&root).ok();
     }

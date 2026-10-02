@@ -190,6 +190,123 @@ pub fn reorder_connection(
     if unchanged { None } else { Some(next) }
 }
 
+/// 「复制」出来的那条连接叫什么:`原名 (N)`,N 从 1 起取第一个没被占用的号。
+///
+/// 原名已经带 ` (N)` 尾巴(复制的复制)时先剥掉再编号 —— 复制「prod (1)」得
+/// 「prod (2)」,而不是越叠越长的「prod (1) (1)」。占用判据是**整张连接表的名字**
+/// (trim 后比):名字是用户与 agent 按名引用连接的字面量(`mini-term-ssh` 那类),
+/// 两条同名会让按名查找含糊。
+pub fn duplicate_name(name: &str, connections: &[SshConnection]) -> String {
+    let base = strip_copy_suffix(name.trim());
+    let mut n = 1usize;
+    loop {
+        let candidate = if base.is_empty() {
+            format!("({n})")
+        } else {
+            format!("{base} ({n})")
+        };
+        if !connections.iter().any(|c| c.name.trim() == candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+/// 剥掉名字末尾一段 ` (数字)`;没有这种尾巴(或剥完只剩空串)就原样返回。
+fn strip_copy_suffix(name: &str) -> &str {
+    let Some(inner) = name.strip_suffix(')') else {
+        return name;
+    };
+    let Some(open) = inner.rfind(" (") else {
+        return name;
+    };
+    let digits = &inner[open + 2..];
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return name;
+    }
+    let base = inner[..open].trim_end();
+    if base.is_empty() { name } else { base }
+}
+
+/// 复制一条连接:换上 `new_id` 与 [`duplicate_name`] 起的名字,其余字段 —— 密码
+/// 信封、私钥路径、分组、新版本写的未知字段(`extra`)—— 原样照抄,插在原连接
+/// **紧后面**(同组相邻,左栏组序不动)。返回新的整张连接表;`source_id` 不存在时 `None`。
+///
+/// 密码信封直接照抄而不是解开再封:同一把钥匙解得开;而「表单 → 封存」那条路
+/// (`AppStore::upsert_ssh_connection`)认的是明文,把信封喂进去会被当明文再封一层。
+pub fn duplicate_connection(
+    connections: &[SshConnection],
+    source_id: &str,
+    new_id: String,
+) -> Option<Vec<SshConnection>> {
+    let idx = connections.iter().position(|c| c.id == source_id)?;
+    let source = &connections[idx];
+    let copy = SshConnection {
+        id: new_id,
+        name: duplicate_name(&source.name, connections),
+        ..source.clone()
+    };
+    let mut next = connections.to_vec();
+    next.insert(idx + 1, copy);
+    Some(next)
+}
+
+/// 分组改名 / 合并 / 解散之后,整组关联过旧组的项目跟着改。返回是否动了任何项目。
+///
+/// - `rename_to = Some(新名)`:改成一个此前**不存在**的组名 → 项目里的组名跟着改,
+///   关联不断;
+/// - `rename_to = None`:旧组从此不复存在(解散,或改名并进了另一个已有组)→ 把旧组
+///   **此刻**的成员摊成显式 id 补进 `ssh_connection_ids`,再摘掉旧组名。
+///
+/// 后一条不能偷懒:合并时直接把关联挪到目标组,项目会凭空多看到目标组原有的连接;
+/// 解散时只摘组名,项目会悄悄丢掉那几台。两样都是「整理分组」顺手改了 agent 的
+/// 权限 —— 摊成显式 id 让有效范围原样不变,要收窄 / 放宽由用户回「关联 SSH」里改。
+///
+/// `connections` 必须是**改组之前**的连接表(要据它数旧组的成员)。
+pub fn regroup_project_scopes(
+    projects: &mut [ProjectConfig],
+    connections: &[SshConnection],
+    old: &str,
+    rename_to: Option<&str>,
+) -> bool {
+    let old = old.trim();
+    let members = effective_scope(&[], &[old.to_string()], connections);
+    let mut changed = false;
+    for project in projects {
+        if !project
+            .ssh_connection_groups
+            .iter()
+            .any(|g| g.trim() == old)
+        {
+            continue;
+        }
+        changed = true;
+        match rename_to.map(str::trim) {
+            Some(new) => {
+                let mut next: Vec<String> = Vec::new();
+                for g in &project.ssh_connection_groups {
+                    let g = if g.trim() == old { new } else { g.trim() };
+                    if !next.iter().any(|n| n == g) {
+                        next.push(g.to_string());
+                    }
+                }
+                project.ssh_connection_groups = next;
+            }
+            None => {
+                project.ssh_connection_groups.retain(|g| g.trim() != old);
+                if let Some(ids) = project.ssh_connection_ids.as_mut() {
+                    for id in &members {
+                        if !ids.contains(id) {
+                            ids.push(id.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    changed
+}
+
 /// 「添加远程项目」的项目名兜底(`AddRemoteProjectModal.tsx:69-70`)。
 ///
 /// 用户填了就用用户的(trim);没填取远程路径的**末段**;末段也取不到
@@ -232,6 +349,45 @@ pub fn initial_checked(project: &ProjectConfig, all_ids: &[String]) -> Vec<Strin
     }
 }
 
+/// 弹窗打开时**整组**勾选的分组(按 `group_names` 的展示序)。
+///
+/// 只认此刻还在的组名(组已不存在就不勾,保存时自然摘掉);未启用、或旧配置
+/// 「未设范围」(`None` = 单条已全勾)时一个组都不勾。
+pub fn initial_checked_groups(project: &ProjectConfig, group_names: &[String]) -> Vec<String> {
+    if !project.ssh_mcp_enabled || project.ssh_connection_ids.is_none() {
+        return Vec::new();
+    }
+    group_names
+        .iter()
+        .filter(|g| {
+            project
+                .ssh_connection_groups
+                .iter()
+                .any(|linked| linked.trim() == g.as_str())
+        })
+        .cloned()
+        .collect()
+}
+
+/// 一次勾选的有效范围:单勾的 id ∪ 勾选分组**此刻**的成员。
+///
+/// 与写 sidecar 投影走同一条规则([`ProjectConfig::effective_ssh_connection_ids`]),
+/// 弹窗里数出来的「已选 N」与 agent 实际看得到的不会两样。`checked` 为空、`groups`
+/// 非空时就是「这几个组罩住了哪些连接」—— 弹窗据此把组内的行画成已勾、不可单取消。
+pub fn effective_scope(
+    checked: &[String],
+    groups: &[String],
+    connections: &[SshConnection],
+) -> Vec<String> {
+    ProjectConfig {
+        ssh_connection_ids: Some(checked.to_vec()),
+        ssh_connection_groups: groups.to_vec(),
+        ..ProjectConfig::default()
+    }
+    .effective_ssh_connection_ids(connections)
+    .unwrap_or_default()
+}
+
 /// 两个范围是否等价。`None` 视为 `all_ids`(兼容旧配置)。
 pub fn same_scope(a: Option<&[String]>, b: &[String], all_ids: &[String]) -> bool {
     let effective_a: &[String] = a.unwrap_or(all_ids);
@@ -239,6 +395,17 @@ pub fn same_scope(a: Option<&[String]>, b: &[String], all_ids: &[String]) -> boo
         return false;
     }
     effective_a.iter().all(|id| b.contains(id))
+}
+
+/// 两份整组关联是否等价(按 trim 后的组名集合比,不看顺序)。
+fn same_groups(a: &[String], b: &[String]) -> bool {
+    let norm = |v: &[String]| -> std::collections::BTreeSet<String> {
+        v.iter()
+            .map(|g| g.trim().to_string())
+            .filter(|g| !g.is_empty())
+            .collect()
+    };
+    norm(a) == norm(b)
 }
 
 /// 保存时该走哪条路(`SshAssocModal.tsx::handleSave` 的前半段判定)。
@@ -252,17 +419,32 @@ pub enum AssocPlan {
     Disable,
 }
 
-/// 依据「原项目配置 + 本次勾选」算出保存计划。
+/// 依据「原项目配置 + 本次勾选(单条 `checked` + 整组 `groups`)」算出保存计划。
 ///
 /// 旧配置 `ssh_connection_ids == None` 的语义是「含未来新增连接」,与显式 id
 /// 列表并不等价:即便当前全选,若不落盘迁移成显式列表,之后新增 SSH 连接会被
 /// 静默纳入该项目的可见范围(违背 v0.6.3「新增连接不自动纳入已有项目」的承诺)。
 /// 故启用状态下 `None` 必须迁移;仅当迁移前后「当前有效范围」不变时静默落盘。
-pub fn plan_assoc_save(project: &ProjectConfig, checked: &[String], all_ids: &[String]) -> AssocPlan {
+///
+/// 整组关联是用户**明说**的「组内以后新加的也算」,与上面那条承诺不冲突。只勾了
+/// 一个空组也算启用(用户要的就是往这组里加的连接都能用)。「有效配置没变」要求
+/// 此刻的有效范围与整组关联**两样都没变** —— 组集合变了,将来的范围就变了。
+pub fn plan_assoc_save(
+    project: &ProjectConfig,
+    checked: &[String],
+    groups: &[String],
+    connections: &[SshConnection],
+) -> AssocPlan {
+    let all_ids: Vec<String> = connections.iter().map(|c| c.id.clone()).collect();
     let was_enabled = project.ssh_mcp_enabled;
-    let now_enabled = !checked.is_empty();
+    let now_enabled = !checked.is_empty() || !groups.is_empty();
     let effective_unchanged = was_enabled == now_enabled
-        && (!now_enabled || same_scope(project.ssh_connection_ids.as_deref(), checked, all_ids));
+        && (!now_enabled
+            || (same_scope(
+                project.effective_ssh_connection_ids(connections).as_deref(),
+                &effective_scope(checked, groups, connections),
+                &all_ids,
+            ) && same_groups(&project.ssh_connection_groups, groups)));
 
     if effective_unchanged && !now_enabled {
         return AssocPlan::NoOp;
@@ -628,26 +810,36 @@ mod tests {
 
     // --- 保存计划 ---
 
+    /// 一组未分组的连接(保存计划的老用例只关心 id)。
+    fn conns(v: &[&str]) -> Vec<SshConnection> {
+        v.iter().map(|id| conn(id, None)).collect()
+    }
+
     #[test]
     fn plan_noop_when_never_enabled_and_nothing_checked() {
-        let all = ids(&["a"]);
-        assert_eq!(plan_assoc_save(&project(false, None), &[], &all), AssocPlan::NoOp);
+        assert_eq!(
+            plan_assoc_save(&project(false, None), &[], &[], &conns(&["a"])),
+            AssocPlan::NoOp
+        );
     }
 
     #[test]
     fn plan_disable_when_was_enabled_and_now_empty() {
-        let all = ids(&["a"]);
         assert_eq!(
-            plan_assoc_save(&project(true, Some(vec!["a"])), &[], &all),
+            plan_assoc_save(&project(true, Some(vec!["a"])), &[], &[], &conns(&["a"])),
             AssocPlan::Disable
         );
     }
 
     #[test]
     fn plan_enable_first_time_is_not_silent() {
-        let all = ids(&["a", "b"]);
         assert_eq!(
-            plan_assoc_save(&project(false, None), &ids(&["a"]), &all),
+            plan_assoc_save(
+                &project(false, None),
+                &ids(&["a"]),
+                &[],
+                &conns(&["a", "b"])
+            ),
             AssocPlan::Enable {
                 silent: false,
                 was_enabled: false
@@ -657,10 +849,9 @@ mod tests {
 
     #[test]
     fn plan_enable_unchanged_scope_is_silent_reconcile() {
-        let all = ids(&["a", "b"]);
         let p = project(true, Some(vec!["a", "b"]));
         assert_eq!(
-            plan_assoc_save(&p, &ids(&["b", "a"]), &all),
+            plan_assoc_save(&p, &ids(&["b", "a"]), &[], &conns(&["a", "b"])),
             AssocPlan::Enable {
                 silent: true,
                 was_enabled: true
@@ -672,9 +863,10 @@ mod tests {
     fn plan_enable_legacy_undefined_scope_migrates_silently_when_effectively_same() {
         // 旧配置 `None` + 当前全选 = 有效范围没变,静默落盘迁移成显式列表
         let all = ids(&["a", "b"]);
+        let list = conns(&["a", "b"]);
         let p = project(true, None);
         assert_eq!(
-            plan_assoc_save(&p, &all, &all),
+            plan_assoc_save(&p, &all, &[], &list),
             AssocPlan::Enable {
                 silent: true,
                 was_enabled: true
@@ -682,12 +874,210 @@ mod tests {
         );
         // 但缩小了范围就不是静默
         assert_eq!(
-            plan_assoc_save(&p, &ids(&["a"]), &all),
+            plan_assoc_save(&p, &ids(&["a"]), &[], &list),
             AssocPlan::Enable {
                 silent: false,
                 was_enabled: true
             }
         );
+    }
+
+    // --- 整组关联 ---
+
+    fn grouped_project(ids_: Vec<&str>, groups: &[&str]) -> ProjectConfig {
+        ProjectConfig {
+            ssh_connection_groups: ids(groups),
+            ..project(true, Some(ids_))
+        }
+    }
+
+    #[test]
+    fn plan_only_an_empty_group_still_enables() {
+        // 只勾了一个(此刻还空着的)组:用户要的就是「往这组里加的都能用」
+        assert_eq!(
+            plan_assoc_save(&project(false, None), &[], &ids(&["新组"]), &conns(&["a"])),
+            AssocPlan::Enable {
+                silent: false,
+                was_enabled: false
+            }
+        );
+    }
+
+    #[test]
+    fn plan_group_change_is_not_silent_even_if_current_scope_matches() {
+        // a 在 A 组里:「单勾 a」与「整组勾 A」此刻范围一样,但将来不一样 —— 不能静默
+        let list = vec![conn("a", Some("A")), conn("u", None)];
+        let p = project(true, Some(vec!["a"]));
+        assert_eq!(
+            plan_assoc_save(&p, &[], &ids(&["A"]), &list),
+            AssocPlan::Enable {
+                silent: false,
+                was_enabled: true
+            }
+        );
+        // 组没变、单勾也没变 → 静默(组名带空白的存量也算同一个组)
+        let p = grouped_project(vec!["u"], &[" A "]);
+        assert_eq!(
+            plan_assoc_save(&p, &ids(&["u"]), &ids(&["A"]), &list),
+            AssocPlan::Enable {
+                silent: true,
+                was_enabled: true
+            }
+        );
+    }
+
+    #[test]
+    fn initial_groups_only_when_enabled_and_still_existing() {
+        let names = ids(&["A", "B"]);
+        let p = grouped_project(vec![], &["B", "已删的组"]);
+        assert_eq!(initial_checked_groups(&p, &names), ids(&["B"]));
+        // 未启用:一个组都不勾(默认态是单条全选)
+        let mut off = p.clone();
+        off.ssh_mcp_enabled = false;
+        assert!(initial_checked_groups(&off, &names).is_empty());
+        // 旧配置「未设范围」:单条已全勾,组不勾
+        let legacy = ProjectConfig {
+            ssh_connection_groups: ids(&["A"]),
+            ..project(true, None)
+        };
+        assert!(initial_checked_groups(&legacy, &names).is_empty());
+    }
+
+    #[test]
+    fn effective_scope_unions_checked_and_group_members() {
+        let list = vec![
+            conn("a1", Some("A")),
+            conn("b1", Some("B")),
+            conn("a2", Some("A")),
+            conn("u", None),
+        ];
+        assert_eq!(
+            effective_scope(&ids(&["u", "a2"]), &ids(&["A"]), &list),
+            ids(&["u", "a2", "a1"])
+        );
+        // 只给组:就是这组罩住的连接(弹窗据此把行画成已勾)
+        assert_eq!(effective_scope(&[], &ids(&["B"]), &list), ids(&["b1"]));
+    }
+
+    #[test]
+    fn regroup_rename_to_fresh_name_follows() {
+        let list = vec![conn("a1", Some("A"))];
+        let mut projects = vec![grouped_project(vec!["x"], &["A", "C"])];
+        assert!(regroup_project_scopes(
+            &mut projects,
+            &list,
+            "A",
+            Some("新A")
+        ));
+        assert_eq!(projects[0].ssh_connection_groups, ids(&["新A", "C"]));
+        assert_eq!(
+            projects[0].ssh_connection_ids.as_deref(),
+            Some(&ids(&["x"])[..]),
+            "改名不该动显式列表"
+        );
+    }
+
+    #[test]
+    fn regroup_dissolve_or_merge_flattens_members_into_explicit_ids() {
+        let list = vec![
+            conn("a1", Some("A")),
+            conn("b1", Some("B")),
+            conn("a2", Some("A")),
+        ];
+        // 解散 / 并进别的组:旧组成员摊成显式 id,有效范围原样不变,不多看到 B 组的 b1
+        let mut projects = vec![grouped_project(vec!["a2"], &["A"])];
+        let before = projects[0].effective_ssh_connection_ids(&list);
+        assert!(regroup_project_scopes(&mut projects, &list, "A", None));
+        assert!(projects[0].ssh_connection_groups.is_empty());
+        assert_eq!(
+            projects[0].ssh_connection_ids.as_deref(),
+            Some(&ids(&["a2", "a1"])[..])
+        );
+        let mut after_list = list.clone();
+        for c in &mut after_list {
+            if c.group.as_deref() == Some("A") {
+                c.group = Some("B".into());
+            }
+        }
+        let mut before_ids = before.unwrap();
+        let mut after_ids = projects[0]
+            .effective_ssh_connection_ids(&after_list)
+            .unwrap();
+        before_ids.sort();
+        after_ids.sort();
+        assert_eq!(before_ids, after_ids, "合并进 B 之后范围仍是原来那几台");
+    }
+
+    #[test]
+    fn regroup_leaves_unrelated_projects_alone() {
+        let list = vec![conn("a1", Some("A"))];
+        let mut projects = vec![grouped_project(vec!["x"], &["B"]), project(false, None)];
+        assert!(!regroup_project_scopes(&mut projects, &list, "A", None));
+        assert_eq!(projects[0].ssh_connection_groups, ids(&["B"]));
+        assert_eq!(
+            projects[0].ssh_connection_ids.as_deref(),
+            Some(&ids(&["x"])[..])
+        );
+    }
+
+    // --- 复制连接 ---
+
+    fn named(id: &str, name: &str) -> SshConnection {
+        SshConnection {
+            name: name.to_string(),
+            ..conn(id, None)
+        }
+    }
+
+    #[test]
+    fn duplicate_name_picks_first_free_number() {
+        let list = vec![named("1", "prod")];
+        assert_eq!(duplicate_name("prod", &list), "prod (1)");
+        let list = vec![
+            named("1", "prod"),
+            named("2", "prod (1)"),
+            named("3", "prod (3)"),
+        ];
+        assert_eq!(duplicate_name("prod", &list), "prod (2)", "取第一个空号");
+    }
+
+    #[test]
+    fn duplicate_name_of_a_copy_does_not_stack_suffixes() {
+        let list = vec![named("1", "prod"), named("2", "prod (1)")];
+        assert_eq!(duplicate_name("prod (1)", &list), "prod (2)");
+        // 括号里不是纯数字的不算副本尾巴
+        assert_eq!(duplicate_name("db (主库)", &[]), "db (主库) (1)");
+        // 整个名字就是「(3)」:前面没有名字,不当副本尾巴
+        assert_eq!(duplicate_name("(3)", &[]), "(3) (1)");
+    }
+
+    #[test]
+    fn duplicate_connection_copies_everything_but_id_and_name() {
+        let mut src = conn("c1", Some("内网"));
+        src.name = "prod".into();
+        src.port = 2222;
+        src.password = Some("enc:v1:xxxx".into());
+        src.identity_file = Some("/k".into());
+        src.extra = serde_json::from_str(r#"{"jumpHost":"bastion"}"#).unwrap();
+        let list = vec![src.clone(), conn("c2", None)];
+
+        let next = duplicate_connection(&list, "c1", "c9".into()).expect("源连接存在");
+        assert_eq!(
+            next.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            ["c1", "c9", "c2"],
+            "副本紧跟在原连接后面"
+        );
+        let copy = &next[1];
+        assert_eq!(copy.name, "prod (1)");
+        assert_eq!(copy.host, src.host);
+        assert_eq!(copy.port, 2222);
+        assert_eq!(copy.user, src.user);
+        assert_eq!(copy.password, src.password, "信封原样照抄,不再封一层");
+        assert_eq!(copy.identity_file, src.identity_file);
+        assert_eq!(copy.group, src.group);
+        assert_eq!(copy.extra, src.extra);
+
+        assert!(duplicate_connection(&list, "gone", "c9".into()).is_none());
     }
 
     // --- 远程项目判定 ---

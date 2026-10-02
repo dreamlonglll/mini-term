@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 33;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 921;
+pub const ZH_ENTRY_COUNT: usize = 927;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 921;
+pub const EN_ENTRY_COUNT: usize = 927;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -1629,18 +1629,21 @@ static SETTINGS_EN: &[(&str, &str)] = &[
 static SSH_ASSOC_ZH: &[(&str, &str)] = &[
     ("allConnections", "全部连接"),
     ("cancel", "取消"),
+    ("coveredByGroup", " · 随分组整组关联"),
     ("disabledMessage", "已为「{name}」停用 SSH 工具。\n\n该项目里正在运行的 Claude / Codex 会话需重启后才会移除 SSH 工具。"),
     ("disabledTitle", "已停用 SSH 工具"),
     ("empty", "还没有 SSH 连接，先在顶栏「SSH」里添加"),
     ("enabledMessage", "「{name}」的 AI agent 现在可访问 {scope}。\n\n新会话即时可用；该项目里正在运行的 Claude / Codex 会话需重启后才生效。"),
     ("enabledTitle", "已启用 SSH 工具"),
-    ("footerHintEmpty", "不勾选任何连接 = 停用该项目的 SSH 工具"),
-    ("footerHintSelected", "勾选的连接对该项目的 AI agent 可见"),
+    ("footerHintEmpty", "不勾选任何连接或分组 = 停用该项目的 SSH 工具"),
+    ("footerHintSelected", "勾选的连接对该项目的 AI agent 可见；在左栏勾选分组 = 整组关联，之后加入该组的连接也自动可用"),
+    ("groupLinkedHint", "已整组关联「{group}」：组内现有及之后加入的连接都对该项目的 AI agent 可见"),
     ("save", "保存"),
     ("saveFailedTitle", "关联 SSH 失败"),
     ("saving", "处理中…"),
     ("scopeAll", "全部 {count} 个连接"),
     ("scopeSubset", "{count} 个连接"),
+    ("scopeWithGroups", "{scope}（含 {count} 个整组关联的分组，之后加入这些分组的连接也自动可用）"),
     ("selectAll", "全选"),
     ("selectNone", "全不选"),
     ("selectedCount", "已选 {checked} / {total}"),
@@ -1654,18 +1657,21 @@ static SSH_ASSOC_ZH: &[(&str, &str)] = &[
 static SSH_ASSOC_EN: &[(&str, &str)] = &[
     ("allConnections", "All Connections"),
     ("cancel", "Cancel"),
+    ("coveredByGroup", " · via linked group"),
     ("disabledMessage", "SSH tools disabled for \"{name}\".\n\nClaude / Codex sessions already running in this project must be restarted before the SSH tools are removed."),
     ("disabledTitle", "SSH tools disabled"),
     ("empty", "No SSH connections yet. Add one under \"SSH\" in the top bar first."),
     ("enabledMessage", "The AI agent of \"{name}\" can now access {scope}.\n\nNew sessions take effect immediately; Claude / Codex sessions already running in this project must be restarted to apply."),
     ("enabledTitle", "SSH tools enabled"),
-    ("footerHintEmpty", "No connections selected = disable SSH tools for this project"),
-    ("footerHintSelected", "Selected connections are visible to this project's AI agent"),
+    ("footerHintEmpty", "No connections or groups selected = disable SSH tools for this project"),
+    ("footerHintSelected", "Selected connections are visible to this project's AI agent; check a group on the left to link the whole group, including connections added to it later"),
+    ("groupLinkedHint", "Group \"{group}\" is linked as a whole: its current connections and any added later are visible to this project's AI agent"),
     ("save", "Save"),
     ("saveFailedTitle", "Failed to link SSH"),
     ("saving", "Working…"),
     ("scopeAll", "all {count} connections"),
     ("scopeSubset", "{count} connection(s)"),
+    ("scopeWithGroups", "{scope} (including {count} linked group(s); connections added to them later are included automatically)"),
     ("selectAll", "Select all"),
     ("selectNone", "Deselect all"),
     ("selectedCount", "Selected {checked} / {total}"),
@@ -1689,6 +1695,9 @@ static SSH_MODAL_ZH: &[(&str, &str)] = &[
     ("deleteConfirmMessage", "确定要删除连接「{name}」({summary}) 吗？\n此操作不可撤销，已保存的密码与私钥路径会一并丢失，已关联该连接的项目也将不再能访问它。"),
     ("deleteConfirmTitle", "删除 SSH 连接"),
     ("dissolveGroup", "解散分组"),
+    ("duplicate", "复制"),
+    ("duplicateConfirmMessage", "确定要复制连接「{name}」吗？\n将新增一条名为「{copy}」的连接，主机、端口、用户名、密码、私钥与分组均与原连接相同。"),
+    ("duplicateConfirmTitle", "复制 SSH 连接"),
     ("edit", "编辑"),
     ("empty", "还没有 SSH 连接，点下方按钮添加"),
     ("footerHint", "在终端中右键「SSH 连接」即可快速选择并连接"),
@@ -1732,6 +1741,9 @@ static SSH_MODAL_EN: &[(&str, &str)] = &[
     ("deleteConfirmMessage", "Delete connection \"{name}\" ({summary})?\nThis cannot be undone: the saved password and private key path go with it, and projects linked to this connection will lose access to it."),
     ("deleteConfirmTitle", "Delete SSH Connection"),
     ("dissolveGroup", "Dissolve group"),
+    ("duplicate", "Duplicate"),
+    ("duplicateConfirmMessage", "Duplicate connection \"{name}\"?\nA new connection named \"{copy}\" will be added with the same host, port, username, password, private key and group."),
+    ("duplicateConfirmTitle", "Duplicate SSH Connection"),
     ("edit", "Edit"),
     ("empty", "No SSH connections yet. Click the button below to add one."),
     ("footerHint", "Right-click \"SSH Connections\" in the terminal to quickly select and connect"),
