@@ -12,6 +12,7 @@ README 顶部用的是 GitHub 原生视频播放器(可暂停 / 拖动进度):�
 播放器没有封面参数,开播前显示的就是视频第一帧,所以片头第 0 帧就是完整标题卡,改片头时别丢了这一点。
 
 ```
+assets/ blue-hour/ morning-mist/  素材库:视频用到的 18 张 4K 实拍截图(WebP q92,入库),合成页只读这里
 e2e/   make-projects.sh  造演示项目(本仓克隆 + 5 个不同技术栈的小样例,带分支合并历史与未提交改动)
        seed.py           直接写 config.db / layout.db:项目分组、三分屏布局、皮肤、命令库、SSH 连接,
                          外加一个月的 Claude / Codex 会话记录(给「使用统计」「AI 历史」出图)
@@ -23,6 +24,7 @@ e2e/   make-projects.sh  造演示项目(本仓克隆 + 5 个不同技术栈的�
 video/ compose.html + engine.js + scenes.js   时间轴(所有动画都是 t 的纯函数,可任意跳帧)
        render.mjs        Playwright 逐帧截图 → ffmpeg 母版
        frames.mjs        抽帧预览(调镜头 / 字幕时不必整片重渲)
+       prepare-assets.sh 从一轮 e2e 截图里挑图、压成 WebP 写进素材库
        music.py          纯程序合成的氛围配乐(无采样、无版权素材)
 build.sh                 全流程,产物写到 docs/promo/mini-term-promo.mp4
 ```
@@ -32,14 +34,18 @@ build.sh                 全流程,产物写到 docs/promo/mini-term-promo.mp4
 只在 Linux 上跑(实测 Ubuntu 24.04,无显卡容器即可):
 
 ```bash
-sudo apt-get install -y xvfb mesa-vulkan-drivers xdotool xclip x11-utils imagemagick ffmpeg \
-  fonts-noto-cjk fonts-jetbrains-mono fonts-inter
+# 公共依赖(合成与编码)
+sudo apt-get install -y ffmpeg fonts-noto-cjk fonts-jetbrains-mono fonts-inter
 pip install numpy
 npm i -g playwright && npx playwright install chromium   # 已有 Chromium 时可跳过下载
 
-cargo build -p mt-app          # 先有 target/debug/mini-term
-tools/promo/build.sh           # 约 25 分钟:两套皮肤各跑一遍 e2e + 逐帧渲染 74 秒视频
-tools/promo/build.sh --skip-e2e   # 只改了 scenes.js 时,复用已有截图重做视频
+# 只改字幕 / 节奏 / 配乐:直接用素材库,新克隆的仓库即可,不必编译应用
+tools/promo/build.sh --skip-e2e    # 约 15~20 分钟(逐帧渲染 74 秒视频 + 编码)
+
+# 界面改版、要重新实拍:再装 e2e 依赖并先编出应用
+sudo apt-get install -y xvfb mesa-vulkan-drivers xdotool xclip x11-utils imagemagick
+cargo build -p mt-app              # 先有 target/debug/mini-term
+tools/promo/build.sh               # 约 25 分钟:两套皮肤各跑一遍 e2e → 更新素材库 → 渲染
 ```
 
 - 渲染走 Xvfb(3840×2160)+ `GPUI_X11_SCALE_FACTOR=2` + lavapipe 软件 Vulkan:4K 截图让视频里的推镜特写依然清晰;
@@ -47,6 +53,34 @@ tools/promo/build.sh --skip-e2e   # 只改了 scenes.js 时,复用已有截图�
 - 演示环境整个隔离:`env -i` 起应用、`HOME` 指向 `DEMO_HOME`(默认 `/home/dev`,画面里的路径就是它)、
   `MT_APP_DATA_DIR` 指向 `out/data-<皮肤>`,不会碰到本机的 mini-term 配置和 `~/.claude`。
 - Playwright 装在项目外时,用 `PLAYWRIGHT_MODULE=/path/to/playwright/index.mjs` 指给 `render.mjs`。
+
+## 素材库
+
+`assets/` 存的是**当前视频实际用到的那批截图**(拍于 v1.13.13-pre,2026-10-03),所以不重跑 e2e
+也能原样重做视频。重新实拍时 `prepare-assets.sh` 会整批覆盖它们 —— 与 `docs/promo/` 的视频一起提交。
+图标与片头片尾背景直接引用 `docs/icon.png`、`theme/blue-hour/background.jpg`;配乐由 `music.py`
+固定随机种子生成,每次一致,不必存。
+
+| 文件 | 画面 | 出自 e2e 截图 |
+|---|---|---|
+| `blue-hour/hero.webp` | 三分屏主视觉:左格 diff + 编译转圈、右上 Codex 做完、右下等待授权、右下角 toast | `02-hero-N`(连拍,默认第 3 张) |
+| `blue-hour/git.webp` | Git 抽屉:暂存 / 未暂存 / 未跟踪 + 提交历史图 | `06-git` |
+| `blue-hour/sessions.webp` | AI 历史会话列表 | `07-sessions` |
+| `blue-hour/hover.webp` | 项目行悬停预览 | `04-hover` |
+| `blue-hour/usage.webp` | 使用统计(趋势图悬停提示) | `08-usage-hover` |
+| `blue-hour/markdown.webp` | Markdown 预览 + Mermaid | `09-markdown` |
+| `blue-hour/mermaid.webp` | Mermaid 整窗放大 | `10-mermaid` |
+| `blue-hour/search.webp` | 全局搜索(内容模式) | `11-search` |
+| `blue-hour/commands.webp` | 命令库 | `12-commands` |
+| `blue-hour/switcher.webp` | 项目快速切换 | `13-switcher` |
+| `blue-hour/ssh.webp` | SSH 连接管理 | `14-ssh` |
+| `blue-hour/settings-theme.webp` | 设置 → 主题与语言(蓝调选中) | `15-settings-theme` |
+| `blue-hour/settings-switched.webp` | 点 Morning Mist 卡片后实时换肤 | `16-settings-switched` |
+| `blue-hour/switched-main.webp` | 换肤后的主界面 | `17-switched-main` |
+| `morning-mist/hero.webp` | 晨雾皮肤下的三分屏主视觉 | `02-hero-N` |
+| `morning-mist/markdown.webp` | 晨雾皮肤下的 Markdown 预览 | `09-markdown` |
+| `morning-mist/usage.webp` | 晨雾皮肤下的使用统计 | `08-usage` |
+| `morning-mist/git.webp` | 晨雾皮肤下的 Git 抽屉 | `06-git` |
 
 ## 调整
 

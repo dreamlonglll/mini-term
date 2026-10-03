@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # 宣传片一键产出:e2e 实拍(两套皮肤)→ 挑图 → 逐帧合成 → 配乐 → 编码交付物。
 # 用法:tools/promo/build.sh [--skip-e2e]
-#   --skip-e2e  复用 $WORK/shots 里已有的截图,只重做视频(调时间轴 / 字幕时用)
+#   --skip-e2e  直接用素材库 tools/promo/assets/ 重做视频(只改字幕 / 节奏 / 配乐时用;
+#               不必编译应用,也不需要 Xvfb / xdotool,有 node + Playwright + ffmpeg + numpy 即可)
 # 产物:docs/promo/mini-term-promo.mp4(1080p + 配乐);README 里的播放器要把它重新传到 GitHub(见 README.md)
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -13,9 +14,9 @@ mkdir -p "$WORK" "$OUT_DIR"
 if [ "${1:-}" != --skip-e2e ]; then
   bash "$HERE/e2e/e2e.sh" blue-hour morning-mist     # 蓝调时分全流程,结尾实时换成晨雾
   bash "$HERE/e2e/e2e.sh" morning-mist blue-hour     # 晨雾全流程,结尾换回蓝调
+  bash "$HERE/video/prepare-assets.sh" "$WORK"       # 挑图 → 素材库(与视频一起提交)
 fi
 
-bash "$HERE/video/prepare-assets.sh" "$WORK" "$REPO"
 node "$HERE/video/render.mjs" "$HERE/video/compose.html" "$WORK/master.mp4" 30
 DUR=$(grep -oP 'window\.DURATION = \K[0-9.]+' "$HERE/video/scenes.js")
 python3 "$HERE/video/music.py" "$WORK/music.wav" "$DUR"

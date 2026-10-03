@@ -1,7 +1,10 @@
 // Mini-Term 宣传片时间轴。所有画面元素都是 t(秒)的纯函数 —— render(t) 可任意跳帧。
-// 截图来自 e2e(4K,逻辑坐标 1920×1080);区域坐标一律写逻辑像素。
-const BH = (n) => `assets/bh/${n}.png`;
-const MM = (n) => `assets/mm/${n}.png`;
+// 截图来自 e2e(4K,逻辑坐标 1920×1080),存在 tools/promo/assets/ 素材库里;区域坐标一律写逻辑像素。
+// 路径相对 compose.html:素材库在 ../assets/,图标与背景图直接取仓库里的原件。
+const BH = (n) => `../assets/blue-hour/${n}.webp`;
+const MM = (n) => `../assets/morning-mist/${n}.webp`;
+const ICON = '../../../docs/icon.png';
+const ART = '../../../theme/blue-hour/background.jpg';
 const W = 1920, H = 1080;
 
 const root = $('#scenes');
@@ -103,7 +106,7 @@ function cursor(parent) {
 // 片头 0–5.2:第 0 帧就是完整标题卡 —— GitHub 视频播放器没有 poster,开播前显示的就是第一帧
 scene(0, 5.2, (n) => {
   const box = el('div', 'center', n);
-  const logo = el('img', 'logo', box); logo.src = 'assets/icon.png';
+  const logo = el('img', 'logo', box); logo.src = ICON;
   const wmWrap = el('div', 'wordmark-wrap', box);
   el('div', 'wordmark', wmWrap, 'Mini<span class="dash">-</span>Term');
   const shine = el('div', 'wordmark shine', wmWrap, 'Mini<span class="dash">-</span>Term');
@@ -149,7 +152,7 @@ scene(4.6, 11.0, (n) => {
 
 // 01 项目分组 + 后台完成提醒 11–16.5
 scene(11.0, 16.6, (n) => {
-  const s = shot(n, BH('hero-toast'));
+  const s = shot(n, BH('hero'));
   const h1 = highlight(n), h2 = highlight(n, 'green'), h3 = highlight(n, 'green');
   const cap = caption(n, { kicker: '01 · Projects', title: '项目分组，AI 状态一眼看全', sub: 'Every project row shows its AI sessions: working · done · needs you', pos: 'right' });
   const cap2 = caption(n, { kicker: '01 · Projects', title: '后台项目跑完，立刻提醒你', sub: 'An AI finished in another project? A toast pops up — click to jump there', pos: 'top' });
@@ -365,7 +368,7 @@ scene(65.0, 69.4, (n) => {
 // 片尾 69.4–74.4
 scene(69.4, 74.4, (n) => {
   const box = el('div', 'center', n);
-  const logo = el('img', 'logo', box); logo.src = 'assets/icon.png';
+  const logo = el('img', 'logo', box); logo.src = ICON;
   const wm = el('div', 'wordmark', box, 'Mini<span class="dash">-</span>Term');
   const tag = el('div', 'tagline', box, '为 AI 时代打造的桌面终端管理器<div class="tagline-en">A desktop terminal manager built for the AI era</div>');
   const url = el('div', 'url', box, 'github.com/<b>dreamlonglll/mini-term</b>');
@@ -386,7 +389,7 @@ const TAIL = 0.6;
 
 // ---------------------------------------------------------------- 渲染
 const art = $('#art'), gA = $('#glowA'), gB = $('#glowB'), vig = $('#vig');
-art.style.backgroundImage = 'url(assets/bh-bg.jpg)';
+art.style.backgroundImage = `url(${ART})`;
 window.render = (T) => {
   css(art, { transform: `scale(${1.04 + 0.05 * Math.sin(T / 9)}) translate(${Math.sin(T / 7) * 18}px, ${Math.cos(T / 8) * 12}px)` });
   css(gA, { left: `${380 + Math.sin(T / 4.2) * 260}px`, top: `${-260 + Math.cos(T / 5.1) * 160}px` });
