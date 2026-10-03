@@ -1,31 +1,34 @@
 #!/usr/bin/env bash
-# 把 e2e 截图挑选、改名进 video/assets/(视频合成页只认这些固定文件名)。
-# 用法:prepare-assets.sh <e2e 产物目录(含 shots/blue-hour 与 shots/morning-mist)> <仓库根>
+# 从一轮 e2e 截图里挑出视频要用的 18 张,压成 WebP 写进素材库 tools/promo/assets/(入库)。
+# 合成页(scenes.js)只读素材库,所以只改字幕 / 节奏 / 配乐时不必重跑 e2e。
+# 用法:prepare-assets.sh <e2e 产物目录(含 shots/blue-hour 与 shots/morning-mist)>
+#   HERO_BH / HERO_MM:主视觉用第几张连拍(02-hero-N),挑 toast 与 diff 同框的那张
 set -euo pipefail
-SRC=$1; REPO=$2
+SRC=$1
 HERE=$(cd "$(dirname "$0")" && pwd)
-A=$HERE/assets; mkdir -p "$A/bh" "$A/mm"
+A=$HERE/../assets
 B=$SRC/shots/blue-hour; M=$SRC/shots/morning-mist
-pick() { cp "$1" "$2"; }
-pick "$B/02-hero-${HERO_BH:-3}.png"   "$A/bh/hero.png"
-pick "$B/02-hero-${HERO_BH:-3}.png"   "$A/bh/hero-toast.png"
-pick "$B/06-git.png"                 "$A/bh/git.png"
-pick "$B/07-sessions.png"            "$A/bh/sessions.png"
-pick "$B/04-hover.png"               "$A/bh/hover.png"
-pick "$B/08-usage-hover.png"         "$A/bh/usage.png"
-pick "$B/09-markdown.png"            "$A/bh/markdown.png"
-pick "$B/10-mermaid.png"             "$A/bh/mermaid.png"
-pick "$B/11-search.png"              "$A/bh/search.png"
-pick "$B/12-commands.png"            "$A/bh/commands.png"
-pick "$B/13-switcher.png"            "$A/bh/switcher.png"
-pick "$B/14-ssh.png"                 "$A/bh/ssh.png"
-pick "$B/15-settings-theme.png"      "$A/bh/settings-theme.png"
-pick "$B/16-settings-switched.png"   "$A/bh/settings-switched.png"
-pick "$B/17-switched-main.png"       "$A/bh/switched-main.png"
-pick "$M/02-hero-${HERO_MM:-3}.png"   "$A/mm/hero.png"
-pick "$M/09-markdown.png"            "$A/mm/markdown.png"
-pick "$M/08-usage.png"               "$A/mm/usage.png"
-pick "$M/06-git.png"                 "$A/mm/git.png"
-cp "$REPO/docs/icon.png" "$A/icon.png"
-cp "$REPO/theme/blue-hour/background.jpg" "$A/bh-bg.jpg"
-echo "assets ready: $(ls "$A"/bh | wc -l) + $(ls "$A"/mm | wc -l)"
+mkdir -p "$A/blue-hour" "$A/morning-mist"
+
+# WebP q92:4K 截图逐像素看与 PNG 无差(PSNR ≈ 37 dB),体积约为 PNG 的四分之一
+webp() { ffmpeg -y -loglevel error -i "$1" -c:v libwebp -quality 92 -compression_level 6 "$2"; }
+
+webp "$B/02-hero-${HERO_BH:-3}.png"  "$A/blue-hour/hero.webp"
+webp "$B/06-git.png"                "$A/blue-hour/git.webp"
+webp "$B/07-sessions.png"           "$A/blue-hour/sessions.webp"
+webp "$B/04-hover.png"              "$A/blue-hour/hover.webp"
+webp "$B/08-usage-hover.png"        "$A/blue-hour/usage.webp"
+webp "$B/09-markdown.png"           "$A/blue-hour/markdown.webp"
+webp "$B/10-mermaid.png"            "$A/blue-hour/mermaid.webp"
+webp "$B/11-search.png"             "$A/blue-hour/search.webp"
+webp "$B/12-commands.png"           "$A/blue-hour/commands.webp"
+webp "$B/13-switcher.png"           "$A/blue-hour/switcher.webp"
+webp "$B/14-ssh.png"                "$A/blue-hour/ssh.webp"
+webp "$B/15-settings-theme.png"     "$A/blue-hour/settings-theme.webp"
+webp "$B/16-settings-switched.png"  "$A/blue-hour/settings-switched.webp"
+webp "$B/17-switched-main.png"      "$A/blue-hour/switched-main.webp"
+webp "$M/02-hero-${HERO_MM:-3}.png"  "$A/morning-mist/hero.webp"
+webp "$M/09-markdown.png"           "$A/morning-mist/markdown.webp"
+webp "$M/08-usage.png"              "$A/morning-mist/usage.webp"
+webp "$M/06-git.png"                "$A/morning-mist/git.webp"
+echo "素材库已更新:$(find "$A" -name '*.webp' | wc -l) 张 → $A"
