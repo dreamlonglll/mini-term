@@ -28,12 +28,10 @@
   <a href="docs/deploy-relay.zh-CN.md">中转部署</a>
 </p>
 
+https://github.com/user-attachments/assets/8a9c1dca-7289-4ab6-af1f-5158df7368a4
+
 <p align="center">
-  <a href="docs/promo/mini-term-promo.mp4">
-    <img src="docs/promo/mini-term-promo.webp" width="100%" alt="Mini-Term 宣传片：项目分组 · 分屏 · AI 状态感知（在跑 / 做完 / 等你批准）· Git 面板 · AI 历史 · 费用统计 · Markdown + Mermaid 预览 · 全局搜索 · 命令库 · SSH · 外置主题包一键换肤">
-  </a>
-  <br>
-  <sub>▶ 2 倍速预览 · <a href="docs/promo/mini-term-promo.mp4">下载 1080p 完整版宣传片（74 秒，含配乐）</a> · 画面由 <a href="tools/promo/">e2e 脚本</a>驱动真实应用、用仓库自带皮肤 <a href="theme/">Blue Hour / Morning Mist</a> 实拍（演示项目与 AI 会话为脚本模拟）</sub>
+  <sub>▶ 点击播放，可随时暂停、继续、拖动进度（有配乐，可在播放器里打开声音）· <a href="docs/promo/mini-term-promo.mp4">下载 1080p 原文件</a> · 画面由 <a href="tools/promo/">e2e 脚本</a>驱动真实应用、用仓库自带皮肤 <a href="theme/">Blue Hour / Morning Mist</a> 实拍（演示项目与 AI 会话为脚本模拟）</sub>
 </p>
 
 

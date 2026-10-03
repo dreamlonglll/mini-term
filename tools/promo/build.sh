@@ -2,7 +2,7 @@
 # 宣传片一键产出:e2e 实拍(两套皮肤)→ 挑图 → 逐帧合成 → 配乐 → 编码交付物。
 # 用法:tools/promo/build.sh [--skip-e2e]
 #   --skip-e2e  复用 $WORK/shots 里已有的截图,只重做视频(调时间轴 / 字幕时用)
-# 产物:docs/promo/mini-term-promo.mp4(1080p + 配乐)、mini-term-promo.webp(README 动图)
+# 产物:docs/promo/mini-term-promo.mp4(1080p + 配乐);README 里的播放器要把它重新传到 GitHub(见 README.md)
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(git -C "$HERE" rev-parse --show-toplevel)
@@ -27,10 +27,5 @@ ffmpeg -y -loglevel error -i "$WORK/master.mp4" -i "$WORK/music.wav" -map 0:v -m
   -c:v libx264 -preset veryslow -crf "${CRF:-31}" -x264-params aq-mode=3 -profile:v high -pix_fmt yuv420p \
   -c:a aac -b:a 96k -shortest -movflags +faststart "$OUT_DIR/mini-term-promo.mp4"
 
-# README 动图:动态 WebP(GitHub 原生渲染),整片 2 倍速、960 宽、10 fps
-ffmpeg -y -loglevel error -i "$WORK/master.mp4" -an \
-  -vf "setpts=PTS/${PREVIEW_SPEED:-2},fps=10,scale=960:-2:flags=lanczos" \
-  -c:v libwebp_anim -q:v "${WEBP_Q:-58}" -compression_level 6 -loop 0 "$OUT_DIR/mini-term-promo.webp"
-
-
 ls -lh "$OUT_DIR"
+echo "下一步:把 $OUT_DIR/mini-term-promo.mp4 拖进 GitHub 任意评论框,换掉 README.md / README.en.md 里的 user-attachments 链接"
