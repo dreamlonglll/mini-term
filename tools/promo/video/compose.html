@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Mini-Term Promo</title>
+<style>
+  :root {
+    --bg: #0b0814;
+    --ink: #ede4f2;
+    --muted: #a99bc0;
+    --accent: #ff9a62;
+    --accent2: #ffc971;
+    --violet: #c792ea;
+    --green: #8ddfa8;
+    --glass: rgba(16, 11, 28, 0.74);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; width: 1920px; height: 1080px; overflow: hidden; background: var(--bg); }
+  body { font-family: 'Noto Sans CJK SC', 'Inter', sans-serif; color: var(--ink); -webkit-font-smoothing: antialiased; }
+  #stage { position: absolute; inset: 0; overflow: hidden; background: var(--bg); }
+
+  /* ---------- 氛围层:主题背景图 + 漂移光斑 ---------- */
+  .art { position: absolute; inset: -60px; background-size: cover; background-position: 30% 35%; filter: blur(2.5px) saturate(1.15) brightness(0.5); }
+  .art-shade { position: absolute; inset: 0; background: radial-gradient(ellipse 70% 75% at 50% 50%, rgba(11,8,20,0.80) 0%, rgba(11,8,20,0.55) 55%, rgba(11,8,20,0.88) 100%); }
+  .glow { position: absolute; width: 1100px; height: 1100px; border-radius: 50%; filter: blur(40px); mix-blend-mode: screen; }
+  .glow.a { background: radial-gradient(circle, rgba(255,154,98,0.28), transparent 62%); }
+  .glow.b { background: radial-gradient(circle, rgba(199,146,234,0.30), transparent 62%); }
+  .vignette { position: absolute; inset: 0; background: radial-gradient(ellipse at center, transparent 55%, rgba(0,0,0,0.55) 100%); pointer-events: none; }
+
+  .scene { position: absolute; inset: 0; display: none; }
+
+  /* ---------- 截图「镜头」 ---------- */
+  .cam { position: absolute; left: 0; top: 0; width: 1920px; height: 1080px; transform-origin: 0 0; }
+  .cam img.shot { position: absolute; left: 0; top: 0; width: 1920px; height: 1080px; display: block; }
+  .frame { position: absolute; left: 0; top: 0; width: 1920px; height: 1080px; transform-origin: 50% 50%; overflow: hidden; }
+  .frame.windowed { border-radius: 16px; box-shadow: 0 50px 140px rgba(0,0,0,0.6), 0 0 0 1px rgba(255,255,255,0.09), 0 0 120px rgba(255,154,98,0.10); }
+  .hl { position: absolute; border-radius: 12px; border: 3px solid var(--accent); box-shadow: 0 0 0 6px rgba(255,154,98,0.16), 0 0 34px rgba(255,154,98,0.55); pointer-events: none; }
+  .hl.violet { border-color: var(--violet); box-shadow: 0 0 0 6px rgba(199,146,234,0.16), 0 0 34px rgba(199,146,234,0.5); }
+  .hl.green { border-color: var(--green); box-shadow: 0 0 0 6px rgba(141,223,168,0.16), 0 0 34px rgba(141,223,168,0.5); }
+
+  /* ---------- 字幕(左下角三行式) ---------- */
+  .cap { position: absolute; left: 72px; bottom: 72px; max-width: 1180px; padding: 26px 34px 28px 40px; border-radius: 18px;
+         background: var(--glass); backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px);
+         box-shadow: 0 20px 60px rgba(0,0,0,0.45), inset 0 0 0 1px rgba(255,255,255,0.07); }
+  .cap::before { content: ''; position: absolute; left: 0; top: 18px; bottom: 18px; width: 5px; border-radius: 4px; background: linear-gradient(var(--accent), var(--violet)); }
+  .cap.right { left: auto; right: 72px; }
+  .cap.top { bottom: auto; top: 72px; }
+  .cap .kicker { font: 700 22px 'Inter', 'Noto Sans CJK SC'; letter-spacing: 0.16em; color: var(--accent); text-transform: uppercase; margin-bottom: 10px; }
+  .cap .title { font: 900 58px/1.18 'Noto Sans CJK SC'; letter-spacing: 0.01em; white-space: nowrap; }
+  .cap .sub { margin-top: 12px; font: 500 25px/1.35 'Inter', 'Noto Sans CJK SC'; color: var(--muted); letter-spacing: 0.01em; }
+  .ch { display: inline-block; white-space: pre; }
+
+  /* ---------- 片头 / 片尾 ---------- */
+  .center { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; }
+  .logo { width: 176px; height: 176px; border-radius: 40px; box-shadow: 0 30px 90px rgba(0,0,0,0.55), 0 0 90px rgba(255,154,98,0.25); }
+  .wordmark { margin-top: 34px; font: 800 132px/1 'Inter Display', 'Inter'; letter-spacing: -0.02em; }
+  .wordmark .dash { color: var(--accent); }
+  .tagline { margin-top: 26px; font: 900 54px/1.2 'Noto Sans CJK SC'; letter-spacing: 0.04em; }
+  .tagline-en { margin-top: 14px; font: 500 28px 'Inter'; color: var(--muted); letter-spacing: 0.06em; }
+  .chips { display: flex; gap: 16px; margin-top: 40px; justify-content: center; }
+  .chip { padding: 12px 24px; border-radius: 999px; font: 700 24px 'Noto Sans CJK SC', 'Inter'; color: var(--ink);
+          background: rgba(255,255,255,0.07); box-shadow: inset 0 0 0 1px rgba(255,255,255,0.13); backdrop-filter: blur(10px); }
+  .chip b { color: var(--accent); font-weight: 800; margin-right: 8px; }
+
+  /* ---------- 三态说明卡 ---------- */
+  .states { position: absolute; left: 0; right: 0; top: 150px; display: flex; justify-content: center; gap: 44px; }
+  .state { width: 520px; border-radius: 20px; overflow: hidden; background: rgba(14,10,26,0.82);
+           box-shadow: 0 30px 80px rgba(0,0,0,0.5), inset 0 0 0 1px rgba(255,255,255,0.08); }
+  .state .crop { position: relative; width: 520px; height: 300px; overflow: hidden; }
+  .state .crop img { position: absolute; width: 1920px; height: 1080px; transform-origin: 0 0; }
+  .state .label { display: flex; align-items: center; gap: 16px; padding: 22px 26px 24px; }
+  .state .dot { width: 34px; height: 34px; border-radius: 50%; display: grid; place-items: center; font: 900 22px 'Inter'; color: #160f22; flex: none; }
+  .state .t1 { font: 900 34px 'Noto Sans CJK SC'; }
+  .state .t2 { font: 500 20px 'Inter'; color: var(--muted); margin-top: 4px; }
+
+  /* ---------- 技术卖点 ---------- */
+  .facts { position: absolute; left: 0; right: 0; top: 0; bottom: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+  .facts .big { font: 900 76px/1.2 'Noto Sans CJK SC'; letter-spacing: 0.02em; }
+  .facts .big em { font-style: normal; color: var(--accent); }
+  .facts .big .big-en { font: 500 30px 'Inter'; color: var(--muted); letter-spacing: 0.04em; text-align: center; margin-top: 14px; }
+  .fact .d .en { display: block; margin-top: 8px; font: 500 19px/1.4 'Inter'; color: #8d80a6; }
+  .facts .row { display: flex; gap: 34px; margin-top: 56px; }
+  .fact { width: 440px; padding: 34px 36px; border-radius: 22px; background: rgba(16,11,30,0.72); box-shadow: inset 0 0 0 1px rgba(255,255,255,0.08), 0 24px 70px rgba(0,0,0,0.45); text-align: left; }
+  .fact .n { font: 800 50px 'Inter Display', 'Noto Sans CJK SC'; color: var(--ink); }
+  .fact .n small { font-size: 26px; color: var(--accent); margin-left: 6px; }
+  .fact .d { margin-top: 10px; font: 500 24px/1.45 'Noto Sans CJK SC'; color: var(--muted); }
+
+  .wipe-edge { position: absolute; top: -200px; width: 6px; height: 1500px; background: linear-gradient(transparent, #fff, transparent); box-shadow: 0 0 40px 12px rgba(255,255,255,0.55); transform-origin: 50% 50%; }
+  .badge { position: absolute; padding: 10px 20px; border-radius: 12px; font: 800 26px 'Inter', 'Noto Sans CJK SC'; background: rgba(12,8,22,0.78); box-shadow: inset 0 0 0 1px rgba(255,255,255,0.12); }
+
+  .cursor { position: absolute; width: 34px; height: 34px; pointer-events: none; filter: drop-shadow(0 4px 8px rgba(0,0,0,0.5)); }
+  .ripple { position: absolute; width: 80px; height: 80px; margin: -40px 0 0 -40px; border-radius: 50%; border: 4px solid rgba(255,255,255,0.9); pointer-events: none; }
+  .url { margin-top: 44px; font: 600 34px 'JetBrains Mono', monospace; color: var(--ink); padding: 16px 30px; border-radius: 14px; background: rgba(255,255,255,0.06); box-shadow: inset 0 0 0 1px rgba(255,255,255,0.12); }
+  .url b { color: var(--accent); font-weight: 700; }
+  .plat { margin-top: 26px; font: 500 26px 'Inter', 'Noto Sans CJK SC'; color: var(--muted); letter-spacing: 0.08em; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <div class="art" id="art"></div>
+  <div class="art-shade"></div>
+  <div class="glow a" id="glowA"></div>
+  <div class="glow b" id="glowB"></div>
+  <div id="scenes"></div>
+  <div class="vignette" id="vig"></div>
+</div>
+<script src="engine.js"></script>
+<script src="scenes.js"></script>
+</body>
+</html>

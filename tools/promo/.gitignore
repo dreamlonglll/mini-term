@@ -1,0 +1,6 @@
+# e2e 截图、数据目录、母版视频等中间产物
+out/
+# prepare-assets.sh 从截图里挑出来的合成素材
+video/assets/
+# frames.mjs 抽帧预览
+video/prev*/
