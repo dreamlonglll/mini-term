@@ -4,6 +4,13 @@ README 顶部的宣传片(`docs/promo/`)由这里的脚本**实拍真实应用**
 mini-term 跑完一整套操作并截图,再把截图交给一张 HTML 时间轴逐帧合成、配乐、编码。
 界面改版后重跑一遍即可更新视频,不用手工录屏剪辑。
 
+README 顶部用的是 GitHub 原生视频播放器(可暂停 / 拖动进度):它只认网页上传得到的
+`https://github.com/user-attachments/assets/…` 链接,没有接口可用。所以重做视频后还要手动一步:
+把 `docs/promo/mini-term-promo.mp4` 拖进 GitHub 任意评论框(新建 issue 页面即可,不必提交),
+等出现链接后替换 `README.md` 与 `README.en.md` 里的那一行 —— 链接必须**单独成行、前后空行**,
+写进 HTML 标签里就不会渲染成播放器。免费账户的视频上限 10 MB,`build.sh` 的编码参数按这个压的。
+播放器没有封面参数,开播前显示的就是视频第一帧,所以片头第 0 帧就是完整标题卡,改片头时别丢了这一点。
+
 ```
 e2e/   make-projects.sh  造演示项目(本仓克隆 + 5 个不同技术栈的小样例,带分支合并历史与未提交改动)
        seed.py           直接写 config.db / layout.db:项目分组、三分屏布局、皮肤、命令库、SSH 连接,
@@ -17,7 +24,7 @@ video/ compose.html + engine.js + scenes.js   时间轴(所有动画都是 t 的
        render.mjs        Playwright 逐帧截图 → ffmpeg 母版
        frames.mjs        抽帧预览(调镜头 / 字幕时不必整片重渲)
        music.py          纯程序合成的氛围配乐(无采样、无版权素材)
-build.sh                 全流程,产物写到 docs/promo/
+build.sh                 全流程,产物写到 docs/promo/mini-term-promo.mp4
 ```
 
 ## 运行

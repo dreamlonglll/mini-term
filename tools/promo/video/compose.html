@@ -55,6 +55,11 @@
   .logo { width: 176px; height: 176px; border-radius: 40px; box-shadow: 0 30px 90px rgba(0,0,0,0.55), 0 0 90px rgba(255,154,98,0.25); }
   .wordmark { margin-top: 34px; font: 800 132px/1 'Inter Display', 'Inter'; letter-spacing: -0.02em; }
   .wordmark .dash { color: var(--accent); }
+  .wordmark-wrap { position: relative; }
+  .wordmark-wrap .wordmark.shine { position: absolute; left: 0; top: 0; right: 0; color: transparent;
+    background: linear-gradient(100deg, transparent 38%, rgba(255,255,255,0.9) 50%, transparent 62%) no-repeat;
+    background-size: 260% 100%; -webkit-background-clip: text; background-clip: text; }
+  .wordmark-wrap .wordmark.shine .dash { color: transparent; }
   .tagline { margin-top: 26px; font: 900 54px/1.2 'Noto Sans CJK SC'; letter-spacing: 0.04em; }
   .tagline-en { margin-top: 14px; font: 500 28px 'Inter'; color: var(--muted); letter-spacing: 0.06em; }
   .chips { display: flex; gap: 16px; margin-top: 40px; justify-content: center; }
