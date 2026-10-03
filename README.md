@@ -28,6 +28,14 @@
   <a href="docs/deploy-relay.zh-CN.md">中转部署</a>
 </p>
 
+<p align="center">
+  <a href="docs/promo/mini-term-promo.mp4">
+    <img src="docs/promo/mini-term-promo.webp" width="100%" alt="Mini-Term 宣传片：项目分组 · 分屏 · AI 状态感知（在跑 / 做完 / 等你批准）· Git 面板 · AI 历史 · 费用统计 · Markdown + Mermaid 预览 · 全局搜索 · 命令库 · SSH · 外置主题包一键换肤">
+  </a>
+  <br>
+  <sub>▶ 2 倍速预览 · <a href="docs/promo/mini-term-promo.mp4">下载 1080p 完整版宣传片（74 秒，含配乐）</a> · 画面由 <a href="tools/promo/">e2e 脚本</a>驱动真实应用、用仓库自带皮肤 <a href="theme/">Blue Hour / Morning Mist</a> 实拍（演示项目与 AI 会话为脚本模拟）</sub>
+</p>
+
 
 **GPUI 原生实现**：Rust 原生渲染、单进程，界面不依赖 WebView2（只有 HTML 预览按需调用系统 WebView，缺失时回落简版渲染）。
 

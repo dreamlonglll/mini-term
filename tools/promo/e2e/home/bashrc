@@ -1,0 +1,21 @@
+# demo shell for mini-term promo(颜色只用 ANSI 16 色,跟随皮肤的终端调色板)
+export PATH="$HOME/.local/bin:$PATH"
+export LANG=C.UTF-8 LC_ALL=C.UTF-8
+export TERM=xterm-256color COLORTERM=truecolor
+alias ls='ls --color=auto'
+alias ll='ls -lh --color=auto --group-directories-first'
+alias gl='git log --graph --oneline --decorate --color -n 14'
+__prompt() {
+  local b dir dirty=""
+  b=$(git symbolic-ref --short HEAD 2>/dev/null)
+  dir="${PWD/#$HOME/\~}"
+  printf '\e]2;%s\a' "${PWD##*/}"
+  PS1="\[\e[1;35m\]${dir}\[\e[0m\]"
+  if [ -n "$b" ]; then
+    [ -n "$(git status --porcelain 2>/dev/null | head -1)" ] && dirty=" \[\e[33m\]●"
+    PS1+=" \[\e[90m\]on\[\e[0m\] \[\e[32m\]${b}${dirty}\[\e[0m\]"
+  fi
+  PS1+="\n\[\e[1;34m\]❯\[\e[0m\] "
+}
+PROMPT_COMMAND=__prompt
+HISTFILE=/dev/null

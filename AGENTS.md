@@ -41,6 +41,10 @@ node crates/mt-i18n/tools/gen_from_ts.mjs
 
 # 改 oh-my-pi 扩展模板后离线验证（Bun 运行时，omp 本身不必安装）
 bun run tools/omp-ext-check.ts
+
+# 重做 README 顶部宣传片（Linux + Xvfb + lavapipe 实拍真实应用 → 逐帧合成，产物写到 docs/promo/；
+# 依赖与参数见 tools/promo/README.md）
+tools/promo/build.sh
 ```
 
 - **便携 ConPTY**（Windows）：`main()` 在建 gpui 平台层之前调 `mt_pty::conpty::initialize_default()`，从 exe 同目录的 `portable-conpty\` 预载 Windows Terminal 1.24 的 conpty.dll，PTY 宿主于是是 `portable-conpty\x64\OpenConsole.exe` 而不是系统 `conhost.exe`。dev 实例的这个目录由上面的 `stage-sidecars.mjs` 就位到 `target/debug/`；没就位就回落系统 ConPTY——看日志里的 `[conpty-bootstrap] backend=portable|system` 一行。⚠️ 该脚本不认 `CARGO_TARGET_DIR`：给构建另设了 target 目录时，要把 `target/debug/portable-conpty/`（连同三个 sidecar）复制到那个目录的 `debug/` 下，否则 dev 实例跑的是系统 conhost。`MT_DISABLE_PORTABLE_CONPTY=1` 跳过预载，用于开 / 关对比与排障

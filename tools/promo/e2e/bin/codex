@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+"""演示用的 Codex CLI 替身:只打印预设剧本,不联网、不调用任何模型。
+
+与 bin/claude 同一套约定:mini-term 开了 hook 时按事件名 POST 到 hook server
+(agent = codex),时长乘以 ~/.demo-speed;提示词含「单测」时跑长剧本(约 21s)。
+"""
+import json, os, re, shutil, sys, time, unicodedata, urllib.request
+
+E = '\x1b['; R = E + '0m'; B = E + '1m'
+def _read(name, default):
+    p = os.path.expanduser(f'~/.demo-{name}')
+    return open(p).read().strip() if os.path.exists(p) else default
+SPEED = float(_read('speed', '1'))
+GRAY = E + '90m'; CYAN = E + '36m'; GREEN = E + '32m'; RED = E + '31m'; MAG = E + '35m'
+SESSION = f'demo-codex-{os.getpid()}'
+
+
+def out(s=''):
+    sys.stdout.write(s + '\n'); sys.stdout.flush()
+
+
+def hook(event, **extra):
+    port, pty = os.environ.get('MINITERM_HOOK_PORT'), os.environ.get('MINITERM_PTY_ID')
+    if not port or not pty:
+        return
+    body = {'pty_id': int(pty), 'event': event, 'agent': 'codex', 'session_id': SESSION, 'cwd': os.getcwd(), **extra}
+    try:
+        req = urllib.request.Request(f'http://127.0.0.1:{port}/hook', data=json.dumps(body).encode(),
+                                     headers={'Content-Type': 'application/json'}, method='POST')
+        urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=2).read()
+    except Exception:
+        pass
+
+
+def cols():
+    return max(40, min(shutil.get_terminal_size((100, 30)).columns, 100))
+
+
+def visible_len(s):
+    plain = re.sub(r'\x1b\[[0-9;]*m', '', s)
+    return sum(2 if unicodedata.east_asian_width(c) in 'WF' else 1 for c in plain)
+
+
+def banner():
+    cwd = os.getcwd().replace(os.path.expanduser('~'), '~')
+    w = min(cols() - 2, 54)
+    def row(s=''):
+        out(GRAY + '│' + R + s + ' ' * max(0, w - visible_len(s)) + GRAY + '│' + R)
+    out(GRAY + '╭' + '─' * w + '╮' + R)
+    row(f' {B}>_ Codex CLI{R} {GRAY}(v0.50.0){R}')
+    row()
+    row(f' {GRAY}model:{R}     gpt-5-codex')
+    row(f' {GRAY}directory:{R} {cwd}')
+    out(GRAY + '╰' + '─' * w + '╯' + R)
+    out()
+    out(f'  {GRAY}To get started, describe a task or try one of these commands:{R}')
+    out(f'  {GRAY}/init · /status · /model · /review{R}')
+    out()
+
+
+def prompt():
+    sys.stdout.write(f'{CYAN}›{R} '); sys.stdout.flush()
+    line = sys.stdin.readline()
+    return None if not line else line.strip()
+
+
+def working(secs):
+    secs *= SPEED
+    t0 = time.time(); i = 0
+    dots = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+    while time.time() - t0 < secs:
+        sys.stdout.write(f'\r{CYAN}{dots[i % 10]}{R} {B}Working{R} {GRAY}({int(time.time()-t0)}s · esc to interrupt){R}{E}K')
+        sys.stdout.flush(); i += 1; time.sleep(0.1)
+    sys.stdout.write('\r' + E + 'K'); sys.stdout.flush()
+
+
+def run_tests():
+    out()
+    working(6)
+    hook('PreToolUse', tool_name='shell')
+    out(f'{MAG}•{R} {B}Explored{R}')
+    out(f'  {GRAY}└{R} Read src/components/Dashboard.tsx, src/hooks/useMetrics.ts')
+    working(8)
+    hook('PreToolUse', tool_name='apply_patch')
+    out(f'{MAG}•{R} {B}Added{R} src/components/Dashboard.test.tsx {GREEN}(+48){R}')
+    out(f'    {GRAY} 1{R} {GREEN}+import {{ render, screen }} from "@testing-library/react";{R}')
+    out(f'    {GRAY} 2{R} {GREEN}+import {{ Dashboard }} from "./Dashboard";{R}')
+    out(f'    {GRAY} 4{R} {GREEN}+it("renders delta badges", () => {{{R}')
+    working(7)
+    hook('PreToolUse', tool_name='shell')
+    out(f'{MAG}•{R} {B}Ran{R} npm test')
+    out(f'  {GRAY}└{R} {GREEN}✓{R} 21 passed {GRAY}(1.6s){R}')
+    out()
+    out(f'{GRAY}─ Worked for {int(21 * SPEED)}s ─{R}')
+    out()
+    out('Dashboard 补了 3 个渲染用例，覆盖涨跌徽标与空数据。')
+    out()
+
+
+def run_review():
+    out()
+    working(4)
+    hook('PreToolUse', tool_name='shell')
+    out(f'{MAG}•{R} {B}Explored{R}')
+    out(f'  {GRAY}└{R} Read src/limit.rs, src/main.rs')
+    working(3)
+    out(f'{MAG}•{R} {B}Review{R} src/limit.rs')
+    out(f'  {GRAY}└{R} {GREEN}✓{R} 令牌桶容量与补充速率可配置')
+    out(f'  {GRAY}└{R} {RED}!{R} 429 响应缺少 Retry-After 头')
+    out()
+    out(f'{GRAY}─ Worked for {int(7 * SPEED)}s ─{R}')
+    out()
+    out('建议在 429 响应里补上 Retry-After，其余实现没问题。')
+    out()
+
+
+def main():
+    banner()
+    hook('SessionStart', source='startup')
+    while True:
+        msg = prompt()
+        if msg is None or msg in ('/exit', '/quit', 'exit'):
+            hook('SessionEnd', reason='exit')
+            break
+        if not msg:
+            continue
+        hook('UserPromptSubmit', prompt=msg)
+        (run_tests if '单测' in msg or 'test' in msg else run_review)()
+        hook('Stop')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except KeyboardInterrupt:
+        hook('SessionEnd', reason='interrupt')

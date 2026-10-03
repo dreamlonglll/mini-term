@@ -28,6 +28,14 @@
   <a href="docs/deploy-relay.md">Relay deployment</a>
 </p>
 
+<p align="center">
+  <a href="docs/promo/mini-term-promo.mp4">
+    <img src="docs/promo/mini-term-promo.webp" width="100%" alt="Mini-Term promo video: project groups · splits · AI status awareness (working / done / needs you) · Git panel · AI history · cost statistics · Markdown + Mermaid preview · global search · command library · SSH · one-click theme packs">
+  </a>
+  <br>
+  <sub>▶ 2× speed preview · <a href="docs/promo/mini-term-promo.mp4">Download the full 1080p promo (74 s, with music)</a> · Captured from the real app by an <a href="tools/promo/">e2e script</a> with the bundled <a href="theme/">Blue Hour / Morning Mist</a> skins (demo projects and AI sessions are scripted)</sub>
+</p>
+
 
 **GPUI-native implementation**: Rust-native rendering, single process; the UI does not depend on WebView2 (only the HTML preview uses the system WebView on demand, falling back to a simplified renderer when it is missing).
 
