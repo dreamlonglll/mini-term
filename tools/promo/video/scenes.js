@@ -100,31 +100,32 @@ function cursor(parent) {
 }
 
 // =================================================================== 时间轴
-// 片头 0–5.2
+// 片头 0–5.2:第 0 帧就是完整标题卡 —— GitHub 视频播放器没有 poster,开播前显示的就是第一帧
 scene(0, 5.2, (n) => {
   const box = el('div', 'center', n);
   const logo = el('img', 'logo', box); logo.src = 'assets/icon.png';
-  const wm = el('div', 'wordmark', box, 'Mini<span class="dash">-</span>Term');
-  const tag = el('div', 'tagline', box, '为 AI 时代打造的桌面终端管理器');
-  const en = el('div', 'tagline-en', box, 'A desktop terminal manager built for the AI era');
+  const wmWrap = el('div', 'wordmark-wrap', box);
+  el('div', 'wordmark', wmWrap, 'Mini<span class="dash">-</span>Term');
+  const shine = el('div', 'wordmark shine', wmWrap, 'Mini<span class="dash">-</span>Term');
+  el('div', 'tagline', box, '为 AI 时代打造的桌面终端管理器');
+  el('div', 'tagline-en', box, 'A desktop terminal manager built for the AI era');
   const chips = el('div', 'chips', box);
   const chipEls = [['GPUI', '原生渲染'], ['AI', '状态感知'], ['多项目', '· 多标签 · 分屏'], ['SSH', '远程项目']]
     .map(([b, t]) => el('div', 'chip', chips, `<b>${b}</b>${t}`));
   return (t) => {
     const out = prog(t, 4.5, 5.2, 'inCubic');
-    const pl = prog(t, 0.2, 1.0, 'outBack');
-    css(logo, { opacity: prog(t, 0.2, 0.7), transform: `scale(${lerp(0.55, 1, pl)}) translateY(${(1 - prog(t, 0.2, 1, 'outCubic')) * 30}px)`, filter: `blur(${(1 - prog(t, 0.2, 0.8)) * 12}px)` });
-    const pw = prog(t, 0.7, 1.6, 'outExpo');
-    css(wm, { opacity: pw, letterSpacing: `${lerp(0.28, -0.02, pw)}em` });
-    const pt = prog(t, 1.3, 2.0, 'outCubic');
-    css(tag, { opacity: pt, transform: `translateY(${(1 - pt) * 24}px)` });
-    const pe = prog(t, 1.6, 2.3, 'outCubic');
-    css(en, { opacity: pe, transform: `translateY(${(1 - pe) * 16}px)` });
+    // 一道高光扫过字标
+    const sw = prog(t, 0.5, 1.7, 'inOutCubic');
+    css(shine, { backgroundPosition: `${lerp(130, -30, sw)}% 0`, opacity: t > 0.45 && t < 1.75 ? 1 : 0 });
+    // logo 呼吸光晕
+    const glow = Math.sin(clamp((t - 0.3) / 1.6) * Math.PI);
+    css(logo, { boxShadow: `0 30px 90px rgba(0,0,0,0.55), 0 0 ${90 + glow * 60}px rgba(255,154,98,${0.25 + glow * 0.25})` });
+    // 四个卖点依次亮一下
     chipEls.forEach((c, i) => {
-      const k = prog(t, 2.2 + i * 0.14, 2.8 + i * 0.14, 'outBack');
-      css(c, { opacity: clamp(k), transform: `translateY(${(1 - k) * 24}px) scale(${lerp(0.9, 1, k)})` });
+      const k = Math.sin(clamp((t - 1.6 - i * 0.28) / 0.7) * Math.PI);
+      css(c, { boxShadow: `inset 0 0 0 1px rgba(255,255,255,${0.13 + k * 0.25}), 0 0 ${k * 28}px rgba(255,154,98,${k * 0.45})`, transform: `translateY(${-k * 4}px)` });
     });
-    css(box, { opacity: 1 - out, transform: `scale(${1 + out * 0.12})`, filter: `blur(${out * 8}px)` });
+    css(box, { opacity: 1 - out, transform: `scale(${1 + t * 0.008 + out * 0.12})`, filter: `blur(${out * 8}px)` });
   };
 });
 
