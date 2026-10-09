@@ -240,6 +240,10 @@ const OSC_TITLE_PERIOD: Duration = Duration::from_millis(250);
 /// 拖分屏 / 三栏分隔条另有一道闸:gpui 拖拽在途时一律不发,松手才发 —— 慢慢拖时
 /// 两列之间隔得比这个窗口还久,光靠去抖仍会逐列漏发。这一档兜的是拖窗口边、
 /// 开合侧栏这类没有 gpui 拖拽的来源。grid 本身照旧当帧重排,画面不等。
+///
+/// 攒下的那一次 resize 在 Windows 上由 mt-pty 逐格走到目标尺寸(不是一步跳过去):
+/// ConPTY 的重排与路径有关,一步缩一大截会让 PSReadLine 的提示行错位,见
+/// `mt_pty` 的 `resize_path`。连发在一瞬间完成,TUI 仍只按最终尺寸重画一次。
 const PTY_RESIZE_SETTLE: Duration = Duration::from_millis(120);
 
 impl EventEmitter<PaneEvent> for TerminalPane {}

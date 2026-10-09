@@ -504,22 +504,26 @@ impl PtySession {
     ///
     /// 上层若要在「真的 resize 了」之后做别的事(例如开一个重绘冷却窗口),
     /// 用这个返回值判断,不要自己再存一份尺寸。
+    ///
+    /// Windows 上跨度大于一格时**逐格走到目标尺寸**,理由见 [`resize_path`]。
     pub fn resize_if_changed(&self, rows: u16, cols: u16) -> Result<bool> {
         let mut last_size = self.last_size.lock();
         if *last_size == (cols, rows) {
             return Ok(false);
         }
-        self.master
-            .as_ref()
-            .context("PTY 已关闭")?
-            .resize(PtySize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .context("resize 失败")?;
-        *last_size = (cols, rows);
+        let master = self.master.as_ref().context("PTY 已关闭")?;
+        for (step_cols, step_rows) in resize_path(*last_size, (cols, rows)) {
+            master
+                .resize(PtySize {
+                    rows: step_rows,
+                    cols: step_cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .context("resize 失败")?;
+            // 中途失败时记住已经走到的那一格,下次从这里接着走
+            *last_size = (step_cols, step_rows);
+        }
         Ok(true)
     }
 
@@ -602,6 +606,46 @@ fn write_chunked(writer: &mut dyn Write, bytes: &[u8]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// 一次 resize 实际下发的尺寸序列 `(cols, rows)`,末项即目标尺寸。
+///
+/// **Windows 上逐格走**([`cell_steps`]):portable-pty 建 ConPTY 时带
+/// `PSEUDOCONSOLE_RESIZE_QUIRK`,约定「终端自己重排缓冲区,ConPTY 不重画」——
+/// resize 时 ConPTY 一个字节都不发,光标在哪一行全凭两边各自重排的结果对得上。
+/// 而 conhost 的重排**与路径有关**:同样从 199 列缩到 136 列,一步跳过去与逐列
+/// 走过去,光标落的行不一样;只有逐格走(实测每步 ≤2 列)才与 alacritty 的重排
+/// 对得上。对不上的后果是 PSReadLine 按 conhost 的光标行发绝对定位,下一条输入
+/// 画到提示符上一行、输出盖掉提示符(oh-my-posh 右侧提示符那种占满整行的提示
+/// 最容易中);行数一步缩一大截同理。逐格连发很便宜(实测 521 次共 0.46ms,只是
+/// 往 conhost 的信号管道写消息),Claude Code 这类 TUI 也只按最终尺寸重画一次。
+///
+/// 其它平台 resize 只是一次 `TIOCSWINSZ`,没有这层对账,一步到位。
+fn resize_path(from: (u16, u16), to: (u16, u16)) -> Vec<(u16, u16)> {
+    if cfg!(windows) {
+        cell_steps(from, to)
+    } else {
+        vec![to]
+    }
+}
+
+/// 从 `from` 走到 `to` 的每一步 `(cols, rows)`:每步行、列各至多挪一格(两维
+/// 同时走,先到的那一维停住),不含起点、末项是 `to`;起止相同为空。
+fn cell_steps(from: (u16, u16), to: (u16, u16)) -> Vec<(u16, u16)> {
+    fn toward(value: u16, target: u16) -> u16 {
+        match value.cmp(&target) {
+            std::cmp::Ordering::Less => value + 1,
+            std::cmp::Ordering::Greater => value - 1,
+            std::cmp::Ordering::Equal => value,
+        }
+    }
+    let mut at = from;
+    let mut steps = Vec::new();
+    while at != to {
+        at = (toward(at.0, to.0), toward(at.1, to.1));
+        steps.push(at);
+    }
+    steps
 }
 
 /// 用户真实输入时的解除判定(见 [`PtySession::disarm_ssh_autofill_on_user_input`])。
@@ -704,6 +748,43 @@ mod tests {
             rows: INITIAL_PTY_ROWS,
             cols: INITIAL_PTY_COLS,
         }
+    }
+
+    // === resize 逐格下发(ConPTY 重排与路径有关,见 resize_path) ===
+
+    #[test]
+    fn 逐格走到目标_每步行列各至多一格() {
+        let steps = cell_steps((199, 40), (136, 20));
+        assert_eq!(steps.len(), 63, "步数 = 两维跨度里大的那个");
+        assert_eq!(steps.last(), Some(&(136, 20)));
+        let mut prev = (199u16, 40u16);
+        for &step in &steps {
+            assert!(prev.0.abs_diff(step.0) <= 1 && prev.1.abs_diff(step.1) <= 1);
+            prev = step;
+        }
+        // 行数先到 20 就停住,不越过
+        assert!(steps.iter().all(|&(_, rows)| rows >= 20));
+        assert_eq!(steps[19], (179, 20));
+        assert_eq!(steps[20], (178, 20));
+    }
+
+    #[test]
+    fn 逐格走_放大与单维() {
+        assert_eq!(cell_steps((80, 24), (82, 24)), vec![(81, 24), (82, 24)]);
+        assert_eq!(cell_steps((80, 24), (80, 22)), vec![(80, 23), (80, 22)]);
+        assert_eq!(cell_steps((80, 24), (81, 25)), vec![(81, 25)]);
+        assert!(cell_steps((80, 24), (80, 24)).is_empty());
+    }
+
+    #[test]
+    fn resize_path_只有_windows_逐格() {
+        let path = resize_path((199, 40), (136, 40));
+        if cfg!(windows) {
+            assert_eq!(path.len(), 63);
+        } else {
+            assert_eq!(path, vec![(136, 40)]);
+        }
+        assert_eq!(path.last(), Some(&(136, 40)));
     }
 
     // === 分块写入(Windows ConPTY 粘贴长文本会只剩最后一行) ===
