@@ -186,6 +186,10 @@ pub struct TerminalPane {
     pending_osc_title: Option<Option<String>>,
     /// OSC 标题限流窗口的计时器。掉了任务就没了,必须存着。
     _osc_title_timer: Option<Task<()>>,
+    /// grid 已经改了、还没下发给 PTY 的尺寸 `(rows, cols)`。见 [`PTY_RESIZE_SETTLE`]。
+    pending_pty_size: Option<(u16, u16)>,
+    /// PTY resize 的去抖计时器。新尺寸一到就换一个,旧的随之丢弃。
+    _pty_resize_timer: Option<Task<()>>,
     /// 唤醒任务的句柄。掉了任务就没了,必须存着。
     _wake: Task<()>,
 }
@@ -222,6 +226,21 @@ const DRAIN_PERIOD: Duration = Duration::from_millis(16);
 ///
 /// 代价是首个标题最多晚 250ms 上屏,而那 250ms 里 shell 多半还在打 banner。
 const OSC_TITLE_PERIOD: Duration = Duration::from_millis(250);
+
+/// grid 尺寸停稳多久才把 resize 下发给 PTY(尾沿去抖)。
+///
+/// 逐列下发会让 Claude Code 的输出在 scrollback 里一叠叠重复:alacritty 缩窄列时
+/// 按「底部锚定」重排,屏上每有一行折成两行,屏顶就有一行被挤进 scrollback;而
+/// Claude Code 收到 resize 后原地(`ESC[H` + 逐行 `ESC[2K`)重画整屏、不碰
+/// scrollback,被挤出去的那几行就与屏上重画的成了重复。拖分隔条每缩一列来一遍,
+/// 就重复一份(实测 130→110→130 拖一趟,启动横幅 21 份)。停稳再发至多留一份,
+/// 拖窄再拖回则一份都不留;单向拖窄残留的那一份终端侧无法无损消除 —— 不知道
+/// 哪些被挤出的行 TUI 会重画,删了会丢 shell 的真输出。
+///
+/// 拖分屏 / 三栏分隔条另有一道闸:gpui 拖拽在途时一律不发,松手才发 —— 慢慢拖时
+/// 两列之间隔得比这个窗口还久,光靠去抖仍会逐列漏发。这一档兜的是拖窗口边、
+/// 开合侧栏这类没有 gpui 拖拽的来源。grid 本身照旧当帧重排,画面不等。
+const PTY_RESIZE_SETTLE: Duration = Duration::from_millis(120);
 
 impl EventEmitter<PaneEvent> for TerminalPane {}
 
@@ -435,19 +454,10 @@ impl TerminalPane {
                 .search(search.clone())
                 .on_grid_resize(move |size: TermSize, _window, cx| {
                     // grid 尺寸是渲染侧量出来的(可用像素 ÷ cell 尺寸),PTY 必须跟着改,
-                    // 否则 shell 换行位置与画面对不上。
-                    // PTY 还在后台起时只记下最新尺寸,回填时补下发(`PtySlot::resize`)。
-                    let _ = this.update(cx, |pane: &mut TerminalPane, _cx| {
-                        match pane
-                            .pty
-                            .resize(size.screen_lines as u16, size.columns as u16)
-                        {
-                            // 只有**真实下发**的 resize 才开重绘冷却窗口:同尺寸的
-                            // resize 不会引起 TUI 重绘,平白开冷却会漏掉真的 AI 活跃
-                            Ok(true) => pane.ai.perception().note_resize(pane.pty_id),
-                            Ok(false) => {}
-                            Err(err) => eprintln!("[pane {}] resize 失败: {err:#}", pane.pty_id),
-                        }
+                    // 否则 shell 换行位置与画面对不上。grid 当帧就改,PTY 停稳再改
+                    // (见 `PTY_RESIZE_SETTLE`)。
+                    let _ = this.update(cx, |pane: &mut TerminalPane, cx| {
+                        pane.schedule_pty_resize(size.screen_lines as u16, size.columns as u16, cx);
                     });
                 })
                 // **唯一**的写 PTY 通道:键盘 / 粘贴 / IME 提交 / 鼠标上报 /
@@ -514,7 +524,52 @@ impl TerminalPane {
             _marks_timer: None,
             pending_osc_title: None,
             _osc_title_timer: None,
+            pending_pty_size: None,
+            _pty_resize_timer: None,
             _wake: wake,
+        }
+    }
+
+    /// grid 尺寸变了:停稳后再下发给 PTY,时机见 [`PTY_RESIZE_SETTLE`]。
+    fn schedule_pty_resize(&mut self, rows: u16, cols: u16, cx: &mut Context<Self>) {
+        // 会话还在后台起:`PtySlot` 只记最新一次、回填时补下发,本来就不会逐列下发;
+        // 直接交给它,回填拿到的就是此刻的真实尺寸
+        if self.pty.phase() != PtyPhase::Running {
+            self.pending_pty_size = None;
+            self._pty_resize_timer = None;
+            self.apply_pty_resize(rows, cols);
+            return;
+        }
+        self.pending_pty_size = Some((rows, cols));
+        // 换掉旧计时器 = 重新计时(尾沿去抖)
+        self._pty_resize_timer = Some(cx.spawn(async move |pane, cx| {
+            loop {
+                cx.background_executor().timer(PTY_RESIZE_SETTLE).await;
+                let settled = pane.update(cx, |pane: &mut TerminalPane, cx| {
+                    // 分隔条还按着:等松手
+                    if cx.has_active_drag() {
+                        return false;
+                    }
+                    if let Some((rows, cols)) = pane.pending_pty_size.take() {
+                        pane.apply_pty_resize(rows, cols);
+                    }
+                    true
+                });
+                // 已下发,或 pane 已释放
+                if settled.unwrap_or(true) {
+                    return;
+                }
+            }
+        }));
+    }
+
+    /// 真正下发 resize。只有**真实下发**的 resize 才开 AI 感知的重绘冷却窗口:
+    /// 同尺寸的 resize 不会引起 TUI 重绘,平白开冷却会漏掉真的 AI 活跃。
+    fn apply_pty_resize(&mut self, rows: u16, cols: u16) {
+        match self.pty.resize(rows, cols) {
+            Ok(true) => self.ai.perception().note_resize(self.pty_id),
+            Ok(false) => {}
+            Err(err) => eprintln!("[pane {}] resize 失败: {err:#}", self.pty_id),
         }
     }
 
