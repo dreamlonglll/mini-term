@@ -74,7 +74,7 @@
 //!
 //! 各纯逻辑模块的单测在同目录的 `*_tests.rs`,视图层的在 `tests.rs`。
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -328,6 +328,9 @@ pub struct FileViewer {
     /// markdown 预览目录栏自己的滚动位置(标题多到一屏放不下时)。住在实体上的
     /// 理由同 [`Self::preview_scroll`]。
     outline_scroll: ScrollHandle,
+    /// 目录栏上一帧高亮的条目。高亮换了一条才把它滚进目录栏可视区(见
+    /// [`preview`] 的 `render_md_outline`),手动滚目录栏看别处时不会被拽回来。
+    outline_active: Cell<Option<usize>>,
     /// 本地 HTML 预览 / PDF 页签的系统 WebView(见 [`webview`])。第一次画到时才建,
     /// 页签关掉随实体一起销毁;「预览 ↔ 源码」来回切只是不画它,页面状态留着。
     /// `RefCell` 的理由同 [`Self::md_cache`]:在 `&self` 的渲染途中排上建立任务。
@@ -406,6 +409,7 @@ impl FileViewer {
             _lightbox_sub: None,
             preview_scroll: ScrollHandle::new(),
             outline_scroll: ScrollHandle::new(),
+            outline_active: Cell::new(None),
             web_preview: RefCell::new(webview::WebPreview::Idle),
             // 文件树打开 Markdown / HTML 时默认看渲染稿；内容搜索带行号时切到
             // 源码，否则命中光标虽然已经定位，用户看到的仍是无法对应行号的预览。

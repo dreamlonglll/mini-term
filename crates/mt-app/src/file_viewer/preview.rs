@@ -738,6 +738,8 @@ impl FileViewer {
     /// 工具栏「目录」按钮:开合目录栏,所有页签共用一份、跨启动记住。
     pub(super) fn toggle_md_outline(&mut self, cx: &mut Context<Self>) {
         let next = !md_outline_visible(cx);
+        // 重新打开时把当前高亮条目滚进可视区(关着的那段时间正文可能滚走了)
+        self.outline_active.set(None);
         crate::store::AppStore::global(cx).update(cx, |store, cx| {
             store.patch_config(|config| config.md_outline_visible = Some(next), cx)
         });
@@ -754,6 +756,13 @@ impl FileViewer {
         let current = outline
             .iter()
             .rposition(|heading| heading.block <= top_block);
+        // 高亮换了一条(正文滚过一节、点了一条、刚打开目录)才请求把它滚进目录栏
+        // 可视区:每帧都请求的话,用户手动滚目录栏看别处会被立刻拽回来
+        if self.outline_active.replace(current) != current
+            && let Some(ix) = current
+        {
+            self.outline_scroll.scroll_to_item(ix);
+        }
         let min_level = outline
             .iter()
             .map(|heading| heading.level)
