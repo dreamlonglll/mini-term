@@ -23,9 +23,9 @@ use super::images::{
     local_image_resource, md_image_resources, release_viewer_images, remote_image_resource,
 };
 use super::markdown::{
-    LinkAction, MdAlign, MdBlock, MdImage, MdImageSrc, MdSegment, MdTable, block_has_anchor,
-    block_top_margin, classify_link, column_weights, is_plain_cell, resolve_image_src,
-    rewrite_md_image_urls, split_md_blocks,
+    LinkAction, MdAlign, MdBlock, MdHeading, MdImage, MdImageSrc, MdSegment, MdTable,
+    block_has_anchor, block_top_margin, classify_link, column_weights, is_plain_cell,
+    resolve_image_src, rewrite_md_image_urls, split_md_document,
 };
 use super::mermaid::{MermaidAsset, MermaidError, MermaidKey, release_mermaid_assets};
 use super::sanitize::sanitize_remote_markdown;
@@ -38,7 +38,7 @@ use crate::ui;
 /// markdown 预览的分块缓存。key 是「源码 + 所在目录」,两者都没变就复用。
 ///
 /// 有它是因为**滚动一次就是整个视图重 render 一遍**(`gpui::list` 的滚轮处理
-/// 改完位置就 notify 当前 view),而 [`split_md_blocks`] 与
+/// 改完位置就 notify 当前 view),而 [`split_md_document`] 与
 /// [`rewrite_md_image_urls`] 都是全文逐字符扫描 —— 一份 40 KB 的文档每帧
 /// 重切一次纯属白烧。缓存的是**分块结果**,不是元素:视口附近的块每帧照建
 /// (gpui 的 retained 边界在 Element 那一层,不在这里)。
@@ -52,6 +52,24 @@ pub(super) struct MdCache {
     /// `(块顶间距, 块)`。`Rc` 让 [`FileViewer::render_md_item`] 拿完就撒手,
     /// 不必攥着 `RefCell` 的借用穿过整段渲染
     blocks: Rc<Vec<(f32, MdBlock)>>,
+    /// 目录栏的条目(顶层标题 → 块号),与分块同一次解析得出
+    outline: Rc<Vec<MdHeading>>,
+}
+
+/// 标题少于这么多条就不出目录栏(也不出工具栏的「目录」按钮):只有一个大标题的
+/// 文档,目录里那一行什么也导航不了,白占一栏宽。
+const MD_OUTLINE_MIN_HEADINGS: usize = 2;
+
+/// 目录栏宽度。按 13px 字号能放下约 16 个汉字,再长的截断、悬停看全文。
+const MD_OUTLINE_WIDTH: f32 = 248.0;
+
+/// 目录栏开着没有(配置里的跨页签开关,缺省开)。
+pub(super) fn md_outline_visible(cx: &App) -> bool {
+    crate::store::AppStore::global(cx)
+        .read(cx)
+        .config()
+        .md_outline_visible
+        .unwrap_or(true)
 }
 
 /// 与组件库无回调时的默认口径一致:左/中键、键盘、非长按触摸才算「点开」。
@@ -696,12 +714,128 @@ impl FileViewer {
             _ => false,
         });
         if let Some(item_ix) = hit {
-            self.md_list.scroll_to(gpui::ListOffset {
-                item_ix,
-                offset_in_item: px(0.0),
-            });
-            cx.notify();
+            self.scroll_md_to_block(item_ix, cx);
         }
+    }
+
+    fn scroll_md_to_block(&mut self, item_ix: usize, cx: &mut Context<Self>) {
+        self.md_list.scroll_to(gpui::ListOffset {
+            item_ix,
+            offset_in_item: px(0.0),
+        });
+        cx.notify();
+    }
+
+    /// 当前 markdown 预览出得了目录没有(标题够数)。缓存由本帧的
+    /// [`Self::render_markdown`] 填好,所以要在渲染内容区之后问。
+    pub(super) fn md_outline_available(&self) -> bool {
+        self.md_cache
+            .borrow()
+            .as_ref()
+            .is_some_and(|cache| cache.outline.len() >= MD_OUTLINE_MIN_HEADINGS)
+    }
+
+    /// 工具栏「目录」按钮:开合目录栏,所有页签共用一份、跨启动记住。
+    pub(super) fn toggle_md_outline(&mut self, cx: &mut Context<Self>) {
+        let next = !md_outline_visible(cx);
+        crate::store::AppStore::global(cx).update(cx, |store, cx| {
+            store.patch_config(|config| config.md_outline_visible = Some(next), cx)
+        });
+        cx.notify();
+    }
+
+    /// 目录栏:顶层标题按级缩进,点一条滚到那一节;当前读到的那一节高亮
+    /// (视口顶上那一块之前的最后一个标题),滚动正文时跟着走。
+    ///
+    /// 只画文字,不画底色:着色由容器层统一承担(背景图皮肤下要透出氛围图,
+    /// 见 `FileViewer::render` 的注释),这里只用一条分隔线与正文分开。
+    fn render_md_outline(&self, outline: &[MdHeading], cx: &mut Context<Self>) -> gpui::AnyElement {
+        let top_block = self.md_list.logical_scroll_top().item_ix;
+        let current = outline
+            .iter()
+            .rposition(|heading| heading.block <= top_block);
+        let min_level = outline
+            .iter()
+            .map(|heading| heading.level)
+            .min()
+            .unwrap_or(1);
+        let items = outline.iter().enumerate().map(|(ix, heading)| {
+            let depth = f32::from(heading.level.saturating_sub(min_level).min(4));
+            let active = current == Some(ix);
+            let block = heading.block;
+            let text = gpui::SharedString::from(heading.text.clone());
+            div()
+                .id(("file-viewer-md-outline-item", ix))
+                .w_full()
+                .flex()
+                .items_center()
+                .pl(px(10.0 + depth * 14.0))
+                .pr(px(10.0))
+                .py(px(5.0))
+                .rounded(px(4.0))
+                .cursor_pointer()
+                .text_size(ui::font_px(13.0))
+                .when(active, |el| {
+                    el.bg(ui::accent_subtle()).text_color(ui::accent())
+                })
+                .when(!active, |el| {
+                    el.text_color(if heading.level == min_level {
+                        ui::text_primary()
+                    } else {
+                        ui::text_secondary()
+                    })
+                    .hover(|el| el.bg(ui::with_alpha(ui::text_primary(), 0.06)))
+                })
+                .child(div().min_w_0().truncate().child(text.clone()))
+                .tip(text)
+                .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                    this.scroll_md_to_block(block, cx)
+                }))
+        });
+        div()
+            .id("file-viewer-md-outline")
+            .flex_none()
+            .w(px(MD_OUTLINE_WIDTH))
+            .h_full()
+            .flex()
+            .flex_col()
+            .border_r_1()
+            .border_color(ui::border_subtle())
+            .child(
+                div()
+                    .flex_none()
+                    .px(px(18.0))
+                    .pt(px(18.0))
+                    .pb(px(10.0))
+                    .text_size(ui::font_px(13.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(ui::text_muted())
+                    .child(t("fileViewer", "outline")),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .relative()
+                    .child(
+                        div()
+                            .id("file-viewer-md-outline-list")
+                            .size_full()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.outline_scroll)
+                            .px(px(8.0))
+                            .pb(px(16.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .children(items),
+                    )
+                    .child(self.scrollbar_overlay(
+                        "file-viewer-md-outline-scrollbar",
+                        &self.outline_scroll,
+                    )),
+            )
+            .into_any_element()
     }
 
     /// 预览态的正文当前目录:相对路径的图片 / 资源按它解析。
@@ -748,7 +882,9 @@ impl FileViewer {
         }
         let generation = last_generation + 1;
 
-        let blocks: Vec<(f32, MdBlock)> = split_md_blocks(source)
+        let doc = split_md_document(source);
+        let blocks: Vec<(f32, MdBlock)> = doc
+            .segs
             .into_iter()
             .enumerate()
             .map(|(ix, seg)| {
@@ -803,6 +939,7 @@ impl FileViewer {
             local_resources,
             generation,
             blocks: blocks.clone(),
+            outline: Rc::new(doc.outline),
         });
         (blocks, generation)
     }
@@ -992,7 +1129,7 @@ impl FileViewer {
     ) -> gpui::AnyElement {
         let base_dir = self.preview_base_dir();
         // 表格、图片与 mermaid 图表拆出来自绘(组件表格单行截断、图片只认网络
-        // URI、mermaid 只会画成代码,见 split_md_blocks 一节的说明),其余段落照走
+        // URI、mermaid 只会画成代码,见 split_md_document 一节的说明),其余段落照走
         // TextView。分块结果跨帧缓存(见 MdCache)——「滚一格重 render 一遍」
         // 这条路上,每帧重切 40 KB 正文是白烧。
         let (blocks, generation) = self.md_blocks(
@@ -1016,12 +1153,25 @@ impl FileViewer {
                     .pt(px(24.0))
                     .pb(px(24.0)),
             );
-        div()
+        let body = div()
             .size_full()
             .relative()
             .child(content)
-            .child(self.scrollbar_overlay("file-viewer-md-scrollbar", &self.md_list))
-            .into_any_element()
+            .child(self.scrollbar_overlay("file-viewer-md-scrollbar", &self.md_list));
+        // 目录栏在左(对照 PDF 阅读器的目录)。开合会改正文宽度,块高由
+        // sync_md_list 的「视口宽变了」那一支作废重量,滚动位置保住
+        let outline = self.md_cache.borrow().as_ref().map(|c| c.outline.clone());
+        match outline {
+            Some(outline) if outline.len() >= MD_OUTLINE_MIN_HEADINGS && md_outline_visible(cx) => {
+                div()
+                    .size_full()
+                    .flex()
+                    .child(self.render_md_outline(&outline, cx))
+                    .child(div().flex_1().min_w_0().h_full().child(body))
+                    .into_any_element()
+            }
+            _ => body.into_any_element(),
+        }
     }
 
     /// 虚拟化列表的一项 = 一块正文([`MdBlock`]),只有视口附近的块会被调到
@@ -1043,7 +1193,7 @@ impl FileViewer {
         };
         let style = self.preview_text_style(cx);
         // 块间距按原版纵向节奏由这里统一给(em 基准,随 uiFontSize 缩放),
-        // TextView 内部的 paragraph_gap 在非虚拟化路径上是坏的(见 split_md_blocks
+        // TextView 内部的 paragraph_gap 在非虚拟化路径上是坏的(见 split_md_document
         // 注释)
         let content = match block {
             MdBlock::Text(text) => TextView::markdown(

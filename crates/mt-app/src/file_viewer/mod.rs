@@ -49,6 +49,9 @@
 //! 3. **本地 PDF 用同一个系统 WebView 内置的阅读器显示**(原版没有这一支):Windows 上
 //!    目录(书签)、页码、搜索、缩放都是 Edge 阅读器现成的。与图片一样不读成文本;
 //!    建不起来、在 Linux 上或远程 PDF 时落到「使用默认工具打开 / 下载」。
+//! 4. **Markdown 预览左侧有目录栏**(原版没有,对照 PDF 阅读器的目录):顶层标题
+//!    不少于两条时出现,点一条滚到那一节、当前一节随滚动高亮,工具栏「目录」开合
+//!    (所有页签共用、跨启动记住)。见 [`preview`] 的 `render_md_outline`。
 //!
 //! # 模块结构
 //!
@@ -322,6 +325,9 @@ pub struct FileViewer {
     /// 也靠它保住进度(源码态的滚动住在 `InputState` 实体里,组件自己管;
     /// markdown 预览的住在 [`Self::md_list`] 里)。
     preview_scroll: ScrollHandle,
+    /// markdown 预览目录栏自己的滚动位置(标题多到一屏放不下时)。住在实体上的
+    /// 理由同 [`Self::preview_scroll`]。
+    outline_scroll: ScrollHandle,
     /// 本地 HTML 预览 / PDF 页签的系统 WebView(见 [`webview`])。第一次画到时才建,
     /// 页签关掉随实体一起销毁;「预览 ↔ 源码」来回切只是不画它,页面状态留着。
     /// `RefCell` 的理由同 [`Self::md_cache`]:在 `&self` 的渲染途中排上建立任务。
@@ -399,6 +405,7 @@ impl FileViewer {
             lightbox: None,
             _lightbox_sub: None,
             preview_scroll: ScrollHandle::new(),
+            outline_scroll: ScrollHandle::new(),
             web_preview: RefCell::new(webview::WebPreview::Idle),
             // 文件树打开 Markdown / HTML 时默认看渲染稿；内容搜索带行号时切到
             // 源码，否则命中光标虽然已经定位，用户看到的仍是无法对应行号的预览。
@@ -1100,6 +1107,11 @@ impl FileViewer {
         let path = self.path_str();
         let is_html = !self.source.is_remote() && is_html_file(&path);
         let is_local_pdf = !self.source.is_remote() && is_pdf_file(&path);
+        // 「目录」开关只在 markdown 预览态、且标题够数时出现
+        let outline_toggle = self.has_preview_toggle()
+            && self.preview
+            && is_markdown_file(&path)
+            && self.md_outline_available();
         let can_edit =
             !self.doc.remote_source_invalid() && can_edit(self.is_img(), self.doc.result());
         let dirty = self.doc.is_dirty();
@@ -1206,6 +1218,22 @@ impl FileViewer {
                             )
                             .on_click(cx.listener(
                                 |this, _: &ClickEvent, _window, cx| this.open_with_default_app(cx),
+                            )),
+                        )
+                    })
+                    // 开着时描边与字都染 accent,与「预览 / 源码」的选中态同一套颜色
+                    .when(outline_toggle, |el| {
+                        let open = preview::md_outline_visible(cx);
+                        el.child(
+                            toolbar_outline_button(
+                                "file-viewer-outline-toggle",
+                                t("fileViewer", "outline"),
+                            )
+                            .when(open, |el| {
+                                el.text_color(ui::accent()).border_color(ui::accent())
+                            })
+                            .on_click(cx.listener(
+                                |this, _: &ClickEvent, _window, cx| this.toggle_md_outline(cx),
                             )),
                         )
                     })
@@ -1632,6 +1660,9 @@ impl Focusable for FileViewer {
 
 impl Render for FileViewer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // 内容区先建:markdown 的分块缓存(含目录条目)在这一步才填好,工具栏的
+        // 「目录」按钮要看它
+        let content = self.render_content(window, cx);
         div()
             .id("file-viewer")
             .track_focus(&self.focus)
@@ -1671,7 +1702,7 @@ impl Render for FileViewer {
                     .flex_1()
                     .min_h(px(0.0))
                     .overflow_hidden()
-                    .child(self.render_content(window, cx)),
+                    .child(content),
             )
             // 图片放大浮层:实体自己 `deferred` 到整窗之上,挂在哪一层都一样;
             // 挂根上是为了不随预览列表的行一起被回收

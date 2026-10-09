@@ -1,5 +1,102 @@
 use super::*;
 
+fn split_md_blocks(source: &str) -> Vec<MdSegment> {
+    split_md_document(source).segs
+}
+
+fn outline_of(source: &str) -> Vec<(u8, String, usize)> {
+    split_md_document(source)
+        .outline
+        .into_iter()
+        .map(|heading| (heading.level, heading.text, heading.block))
+        .collect()
+}
+
+#[test]
+fn 大纲收顶层标题_块号指向标题所在块() {
+    let src = concat!(
+        "# 标题 **一**\n",
+        "\n",
+        "正文\n",
+        "\n",
+        "| a | b |\n",
+        "|---|---|\n",
+        "| 1 | 2 |\n",
+        "\n",
+        "## 用 `cargo` 构建 [链接](https://x.y)\n",
+        "\n",
+        "Setext 二级\n",
+        "---\n",
+    );
+    let doc = split_md_document(src);
+    assert_eq!(
+        outline_of(src),
+        vec![
+            (1, "标题 一".to_string(), 0),
+            (2, "用 cargo 构建 链接".to_string(), 3),
+            (2, "Setext 二级".to_string(), 4),
+        ]
+    );
+    for heading in &doc.outline {
+        let MdSegment::Text(text) = &doc.segs[heading.block] else {
+            panic!("{heading:?} 落在了非正文块:{:?}", doc.segs);
+        };
+        let first_word = heading.text.split(' ').next().unwrap();
+        assert!(
+            text.contains(first_word),
+            "{heading:?} 应落在自己那一块:{text:?}"
+        );
+    }
+}
+
+#[test]
+fn 标题与上文没有空行也另起一块() {
+    let src = "前文\n## 第二节\n紧跟的正文";
+    let segs = split_md_blocks(src);
+    assert_eq!(segs.len(), 2, "{segs:?}");
+    assert!(matches!(&segs[0], MdSegment::Text(t) if t == "前文"));
+    // 标题与紧跟的正文仍在同一块(只在标题**之前**切)
+    assert!(matches!(&segs[1], MdSegment::Text(t) if t == "## 第二节\n紧跟的正文"));
+    assert_eq!(outline_of(src), vec![(2, "第二节".to_string(), 1)]);
+}
+
+#[test]
+fn 大纲不收容器里与代码里的标题_空标题不收() {
+    let src = concat!(
+        "> # 引用里的\n",
+        "\n",
+        "- # 列表里的\n",
+        "\n",
+        "```\n",
+        "# 代码里的\n",
+        "```\n",
+        "\n",
+        "#\n",
+        "\n",
+        "### 真标题\n",
+    );
+    let doc = split_md_document(src);
+    let outline: Vec<(u8, &str)> = doc
+        .outline
+        .iter()
+        .map(|heading| (heading.level, heading.text.as_str()))
+        .collect();
+    assert_eq!(outline, vec![(3, "真标题")], "{:?}", doc.segs);
+    assert!(
+        matches!(&doc.segs[doc.outline[0].block], MdSegment::Text(t) if t == "### 真标题"),
+        "{:?}",
+        doc.segs
+    );
+}
+
+#[test]
+fn 整篇交回_text_view_时不给大纲() {
+    // 引用定义要共享作用域 → 整篇一块,点哪条都只能滚到文首
+    let src = "# 一\n\n[链接][ref]\n\n## 二\n\n[ref]: https://example.com\n";
+    assert_eq!(split_md_blocks(src).len(), 1);
+    assert!(outline_of(src).is_empty());
+}
+
 #[test]
 fn 表格分段_基本两列表() {
     let src = "前文\n\n| 文件 | 职责 |\n|---|---|\n| `a.rs` | 说明 A |\n| b.rs | 说明 B |\n\n后文";

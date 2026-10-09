@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 33;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 928;
+pub const ZH_ENTRY_COUNT: usize = 929;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 928;
+pub const EN_ENTRY_COUNT: usize = 929;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -511,6 +511,7 @@ static FILE_VIEWER_ZH: &[(&str, &str)] = &[
     ("mermaidRendering", "Mermaid 图表渲染中…"),
     ("openInBrowser", "用浏览器打开"),
     ("openWithDefaultApp", "使用默认工具打开"),
+    ("outline", "目录"),
     ("pdfPreviewUnavailable", "PDF 内置预览不可用（需要系统 WebView），请用默认工具打开"),
     ("preview", "预览"),
     ("projectRemovalBlocked", "该项目仍有未保存的文件，请先保存或关闭这些页签后再移除项目。"),
@@ -557,6 +558,7 @@ static FILE_VIEWER_EN: &[(&str, &str)] = &[
     ("mermaidRendering", "Rendering Mermaid diagram…"),
     ("openInBrowser", "Open in browser"),
     ("openWithDefaultApp", "Open with default app"),
+    ("outline", "Outline"),
     ("pdfPreviewUnavailable", "Built-in PDF preview is unavailable (needs the system WebView) — open it with the default app"),
     ("preview", "Preview"),
     ("projectRemovalBlocked", "This project still has unsaved files. Save or close those tabs before removing the project."),

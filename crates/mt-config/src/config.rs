@@ -217,6 +217,10 @@ pub struct AppConfig {
     /// 最小化不归它管 —— 那时一帧都不画。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_fps_background: Option<u32>,
+    /// Markdown 预览左侧的目录栏开着没有(文件页工具栏「目录」按钮切换,所有
+    /// 页签共用一份)。`None` = UI 层默认开启;标题不足两条的文档本来就不出目录。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub md_outline_visible: Option<bool>,
     #[serde(default)]
     pub ssh_connections: Vec<SshConnection>,
     /// 显式创建的 SSH 分组名（允许空分组存在）。连接上的 group 字段仍是归属的
@@ -751,6 +755,7 @@ impl Default for AppConfig {
             ai_auto_resume: None,
             terminal_fps_foreground: None,
             terminal_fps_background: None,
+            md_outline_visible: None,
             ssh_connections: vec![],
             ssh_groups: vec![],
             mobile_relay: None,
@@ -1663,6 +1668,23 @@ mod tests {
         assert!(json.contains(r#""tabTitleFollowsShell":false"#));
         let parsed: AppConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.tab_title_follows_shell, Some(false));
+    }
+
+    /// Markdown 目录栏开合:纯增量字段,没设过不写进 JSON,设过能往返,键名 camelCase。
+    #[test]
+    fn md_outline_visible_是纯增量字段() {
+        let mut config = AppConfig::default();
+        assert!(config.md_outline_visible.is_none());
+        assert!(
+            !serde_json::to_string(&config)
+                .unwrap()
+                .contains("mdOutlineVisible")
+        );
+        config.md_outline_visible = Some(false);
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains(r#""mdOutlineVisible":false"#));
+        let parsed: AppConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.md_outline_visible, Some(false));
     }
 
     /// 终端帧率两项:纯增量字段,没设过不写进 JSON,设过能往返,键名 camelCase。
