@@ -46,6 +46,9 @@
 //!    与 markdown 那支是同一个富文本渲染器(无 CSS / 无 JS),配一条说明;两种形态下
 //!    工具栏都常驻「用浏览器打开」。简版的相对资源见 [`html_urls::rewrite_html_urls`]。
 //!    远程 HTML 属于不可信输入，只走源码编辑器，两种渲染都不进。
+//! 3. **本地 PDF 用同一个系统 WebView 内置的阅读器显示**(原版没有这一支):Windows 上
+//!    目录(书签)、页码、搜索、缩放都是 Edge 阅读器现成的。与图片一样不读成文本;
+//!    建不起来、在 Linux 上或远程 PDF 时落到「使用默认工具打开 / 下载」。
 //!
 //! # 模块结构
 //!
@@ -61,7 +64,7 @@
 //! | [`markdown`] | Markdown 纯逻辑:分块、图片落点、本地图片改写、链接处置、表格排版参数 |
 //! | [`sanitize`] | 不可信 Markdown(远程文档 / AI 会话正文)清洗 |
 //! | [`html_urls`] | 本地 HTML 的资源 URL 改写(简版渲染用) |
-//! | [`webview`] | 本地 HTML 的系统 WebView 预览:资源服务、导航处置 |
+//! | [`webview`] | 本地 HTML / PDF 的系统 WebView 预览:资源服务、导航处置 |
 //! | [`mermaid`] | Mermaid 图表后台渲染与资源释放 |
 //! | [`images`] | 查看器图片资源、进程级持有账本、看图页签换代去抖 |
 //! | [`http`] | 预览用的进程级 HTTP 客户端 [`PreviewHttpClient`] |
@@ -119,7 +122,8 @@ use document::{
     RemoteSave, SaveStart,
 };
 use file_kind::{
-    file_name_of, is_html_file, is_image_file, is_markdown_file, same_path, should_wrap,
+    file_name_of, is_html_file, is_image_file, is_markdown_file, is_pdf_file, same_path,
+    should_wrap,
 };
 use images::{
     IMAGE_RELOAD_DEBOUNCE, ReloadDebounce, ViewerImage, ViewerImageHolds, evict_viewer_image,
@@ -241,6 +245,25 @@ fn editor_text(editor: Option<&Entity<EditorState>>, cx: &App) -> Option<String>
     editor.map(|editor| editor.read(cx).value().to_string())
 }
 
+/// 工具栏上的描边小按钮(「用浏览器打开」「使用默认工具打开」),点击由调用方挂。
+fn toolbar_outline_button(id: &'static str, label: &'static str) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .px(px(10.0))
+        .py(px(4.0))
+        .rounded(px(4.0))
+        .border_1()
+        .border_color(ui::border_default())
+        .text_size(ui::font_px(12.0))
+        .text_color(ui::text_muted())
+        .cursor_pointer()
+        .hover(|el| {
+            el.text_color(ui::text_primary())
+                .border_color(ui::border_strong())
+        })
+        .child(label)
+}
+
 pub struct FileViewer {
     source: DocumentSource,
     project_root: PathBuf,
@@ -299,11 +322,11 @@ pub struct FileViewer {
     /// 也靠它保住进度(源码态的滚动住在 `InputState` 实体里,组件自己管;
     /// markdown 预览的住在 [`Self::md_list`] 里)。
     preview_scroll: ScrollHandle,
-    /// 本地 HTML 预览的系统 WebView(见 [`webview`])。第一次画 HTML 预览时才建,
+    /// 本地 HTML 预览 / PDF 页签的系统 WebView(见 [`webview`])。第一次画到时才建,
     /// 页签关掉随实体一起销毁;「预览 ↔ 源码」来回切只是不画它,页面状态留着。
     /// `RefCell` 的理由同 [`Self::md_cache`]:在 `&self` 的渲染途中排上建立任务。
     #[cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
-    html_view: RefCell<webview::HtmlView>,
+    web_preview: RefCell<webview::WebPreview>,
 
     preview: bool,
 
@@ -376,7 +399,7 @@ impl FileViewer {
             lightbox: None,
             _lightbox_sub: None,
             preview_scroll: ScrollHandle::new(),
-            html_view: RefCell::new(webview::HtmlView::Idle),
+            web_preview: RefCell::new(webview::WebPreview::Idle),
             // 文件树打开 Markdown / HTML 时默认看渲染稿；内容搜索带行号时切到
             // 源码，否则命中光标虽然已经定位，用户看到的仍是无法对应行号的预览。
             preview: highlight_line.is_none(),
@@ -412,6 +435,16 @@ impl FileViewer {
         is_image_file(&self.path_str())
     }
 
+    fn is_pdf(&self) -> bool {
+        is_pdf_file(&self.path_str())
+    }
+
+    /// 图片与 PDF:不读成文本,各有各的渲染分支,盘上改了按 [`Self::schedule_image_reload`]
+    /// 去抖后换代 / 重载。
+    fn is_media(&self) -> bool {
+        self.is_img() || self.is_pdf()
+    }
+
     fn renders_local_image(&self) -> bool {
         !self.source.is_remote() && self.is_img()
     }
@@ -435,10 +468,11 @@ impl FileViewer {
 
     // ── 读盘 ──────────────────────────────────────────────
 
-    /// 读当前文件并重建编辑器。图片分支不读盘(原版 `if (!open || isImg) return`)。
+    /// 读当前文件并重建编辑器。图片分支不读盘(原版 `if (!open || isImg) return`),
+    /// PDF 同理(内容由 WebView 自己按请求现读)。
     fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // 保存中不重建(理由与状态翻转见 `DocumentSession::begin_load`)
-        let Some(start) = self.doc.begin_load(self.is_img()) else {
+        let Some(start) = self.doc.begin_load(self.is_media()) else {
             return;
         };
         let watch_ready = self.rewatch();
@@ -722,7 +756,7 @@ impl FileViewer {
         self.validate_remote_source(cx);
         if self
             .doc
-            .should_refresh_on_activation(self.source.is_remote(), self.is_img())
+            .should_refresh_on_activation(self.source.is_remote(), self.is_media())
         {
             // Project switches reach this path from WorkbenchArea's deferred focus
             // hand-off. Keep focus on the newly visible document while the remote
@@ -776,13 +810,13 @@ impl FileViewer {
         Some(ready)
     }
 
-    /// 逐条对照 `FileViewerModal.tsx:275-283`。看图页签另走换代
+    /// 逐条对照 `FileViewerModal.tsx:275-283`。看图 / PDF 页签另走换代
     /// ([`Self::schedule_image_reload`]),原版那边图片改了是不跟的。
     fn on_fs_change(&mut self, path: &Path, window: &mut Window, cx: &mut Context<Self>) {
         if self.source.is_remote() || !same_path(&path.to_string_lossy(), &self.path_str()) {
             return;
         }
-        if self.is_img() {
+        if self.is_media() {
             self.schedule_image_reload(window, cx);
             return;
         }
@@ -807,12 +841,21 @@ impl FileViewer {
     /// 计时)重新计时,到点时手上的票还是最新的才动手。万一还是读到半截(写入
     /// 拖得比去抖还长),解码失败也只是落到「使用默认工具打开」那页,不会崩;
     /// 写完那一下的事件照样再换代一次。
+    ///
+    /// PDF 页签(LaTeX / 导出工具反复重写同一个文件)同一套去抖,到点让 WebView
+    /// 重新载入;读到半截时阅读器报一次错,写完那一下的事件同样再载一次。
     fn schedule_image_reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let ticket = self.image_reload.bump();
         self._image_reload_task = Some(cx.spawn_in(window, async move |this, cx| {
             cx.background_executor().timer(IMAGE_RELOAD_DEBOUNCE).await;
             let _ = this.update_in(cx, |view: &mut FileViewer, window, cx| {
-                if view.image_reload.is_current(ticket) {
+                if !view.image_reload.is_current(ticket) {
+                    return;
+                }
+                if view.is_pdf() {
+                    #[cfg(any(windows, target_os = "macos"))]
+                    view.reload_web_preview();
+                } else {
                     view.reload_image(window, cx);
                 }
             });
@@ -1056,6 +1099,7 @@ impl FileViewer {
         let name = self.file_name();
         let path = self.path_str();
         let is_html = !self.source.is_remote() && is_html_file(&path);
+        let is_local_pdf = !self.source.is_remote() && is_pdf_file(&path);
         let can_edit =
             !self.doc.remote_source_invalid() && can_edit(self.is_img(), self.doc.result());
         let dirty = self.doc.is_dirty();
@@ -1143,24 +1187,26 @@ impl FileViewer {
                     // 简版渲染(见 render_html),真效果只有浏览器给得了
                     .when(is_html, |el| {
                         el.child(
-                            div()
-                                .id("file-viewer-open-browser")
-                                .px(px(10.0))
-                                .py(px(4.0))
-                                .rounded(px(4.0))
-                                .border_1()
-                                .border_color(ui::border_default())
-                                .text_size(ui::font_px(12.0))
-                                .text_color(ui::text_muted())
-                                .cursor_pointer()
-                                .hover(|el| {
-                                    el.text_color(ui::text_primary())
-                                        .border_color(ui::border_strong())
-                                })
-                                .child(t("fileViewer", "openInBrowser"))
-                                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                                    this.open_in_browser(cx)
-                                })),
+                            toolbar_outline_button(
+                                "file-viewer-open-browser",
+                                t("fileViewer", "openInBrowser"),
+                            )
+                            .on_click(cx.listener(
+                                |this, _: &ClickEvent, _window, cx| this.open_in_browser(cx),
+                            )),
+                        )
+                    })
+                    // PDF 常驻「使用默认工具打开」:要批注、填表、打印排版时交给
+                    // 专门的阅读器
+                    .when(is_local_pdf, |el| {
+                        el.child(
+                            toolbar_outline_button(
+                                "file-viewer-open-default",
+                                t("fileViewer", "openWithDefaultApp"),
+                            )
+                            .on_click(cx.listener(
+                                |this, _: &ClickEvent, _window, cx| this.open_with_default_app(cx),
+                            )),
                         )
                     })
                     .when(self.has_preview_toggle(), |el| {
@@ -1471,7 +1517,29 @@ impl FileViewer {
         }
     }
 
+    /// PDF 分支:本地的交给系统 WebView 内置阅读器(见 [`webview`]);建不起来、
+    /// 在 Linux 上或远程 PDF 时给「使用默认工具打开 / 下载」。
+    fn render_pdf(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        #[cfg(any(windows, target_os = "macos"))]
+        if let Some(view) = self.render_web_preview(webview::PageKind::Pdf, window, cx) {
+            return view;
+        }
+        #[cfg(not(any(windows, target_os = "macos")))]
+        let _ = window;
+        let message = if self.source.is_remote() {
+            t("fileViewer", "binaryNotSupported")
+        } else {
+            t("fileViewer", "pdfPreviewUnavailable")
+        };
+        self.render_fallback("file-viewer-pdf-fallback", message.to_string(), cx)
+            .into_any_element()
+    }
+
     fn render_content(&self, window: &mut Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        // 先于 `branch_of`:PDF 不读盘,`result` 永远是空的,落进去只会一直「加载中」
+        if self.is_pdf() {
+            return self.render_pdf(window, cx);
+        }
         match branch_of(
             self.is_img(),
             self.doc.loading(),

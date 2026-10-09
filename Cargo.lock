@@ -5419,7 +5419,9 @@ dependencies = [
  "tree-sitter-swift",
  "tree-sitter-xml",
  "unicode-segmentation",
+ "webview2-com",
  "windows 0.62.2",
+ "windows-core 0.61.2",
  "winresource",
  "zed-reqwest",
 ]

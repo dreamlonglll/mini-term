@@ -4,6 +4,83 @@ fn root() -> PathBuf {
     PathBuf::from(if cfg!(windows) { r"D:\proj" } else { "/proj" })
 }
 
+fn plan_html(method: &str, path: &str, dest: Option<&str>, doc: &str, root: &Path) -> Plan {
+    plan_request(PageKind::Html, method, path, dest, doc, root)
+}
+
+fn html_nav(url: &str) -> bool {
+    navigation_allowed(PageKind::Html, url, "index.html")
+}
+
+#[test]
+fn pdf_只给文档本身() {
+    let root = root();
+    let doc = "docs/手册 v2.pdf";
+    let doc_path = format!("/{}", encode_path(doc));
+    assert_eq!(
+        plan_request(
+            PageKind::Pdf,
+            "GET",
+            &doc_path,
+            Some("document"),
+            doc,
+            &root
+        ),
+        Plan::Doc
+    );
+    // 阅读器自己再取一遍文档(范围请求 / 重载)照给
+    assert_eq!(
+        plan_request(PageKind::Pdf, "GET", &doc_path, Some("empty"), doc, &root),
+        Plan::Doc
+    );
+    // 网页资源白名单在 PDF 页签里不作数:同目录的图片 / 页面 / 别的 PDF 一律拒绝
+    for other in ["/docs/a.png", "/index.html", "/docs/other.pdf"] {
+        assert_eq!(
+            plan_request(PageKind::Pdf, "GET", other, Some("image"), doc, &root),
+            Plan::Deny(403),
+            "{other}"
+        );
+    }
+    // 越界判定先于文档比对
+    assert_eq!(
+        plan_request(PageKind::Pdf, "GET", "/docs/../x.pdf", None, doc, &root),
+        Plan::Deny(400)
+    );
+    assert_eq!(
+        plan_request(PageKind::Pdf, "POST", &doc_path, None, doc, &root),
+        Plan::Deny(405)
+    );
+}
+
+#[test]
+fn pdf_导航只放行文档自己() {
+    let doc = "docs/a.pdf";
+    assert!(navigation_allowed(PageKind::Pdf, &page_url(doc), doc));
+    // 带片段(页码跳转)也是自己
+    assert!(navigation_allowed(
+        PageKind::Pdf,
+        &format!("{}#page=3", page_url(doc)),
+        doc
+    ));
+    assert!(navigation_allowed(PageKind::Pdf, "about:blank", doc));
+    // PDF 里链到的别的本地文件(哪怕是 HTML)拦下,作为页签打开
+    assert!(!navigation_allowed(
+        PageKind::Pdf,
+        &page_url("docs/b.pdf"),
+        doc
+    ));
+    assert!(!navigation_allowed(
+        PageKind::Pdf,
+        &page_url("index.html"),
+        doc
+    ));
+    assert!(!navigation_allowed(
+        PageKind::Pdf,
+        "https://example.com/a.pdf",
+        doc
+    ));
+}
+
 #[test]
 fn 路径编码往返保住中文空格与保留字符() {
     let rel = "docs/说明 页#1?.html";
@@ -52,19 +129,19 @@ fn 同源_url_还原成相对路径() {
 
 #[test]
 fn 导航只放行同源的_html() {
-    assert!(navigation_allowed(&page_url("a/b.html")));
-    assert!(navigation_allowed(&page_url("a/B.HTM")));
-    assert!(navigation_allowed("about:blank"));
-    assert!(!navigation_allowed(&page_url("a/readme.md")));
-    assert!(!navigation_allowed("https://example.com/"));
-    assert!(!navigation_allowed("file:///D:/proj/a.html"));
+    assert!(html_nav(&page_url("a/b.html")));
+    assert!(html_nav(&page_url("a/B.HTM")));
+    assert!(html_nav("about:blank"));
+    assert!(!html_nav(&page_url("a/readme.md")));
+    assert!(!html_nav("https://example.com/"));
+    assert!(!html_nav("file:///D:/proj/a.html"));
 }
 
 #[test]
 fn 文档本身回预览源码() {
     let root = root();
     assert_eq!(
-        plan_request(
+        plan_html(
             "GET",
             "/site/index.html",
             Some("document"),
@@ -75,7 +152,7 @@ fn 文档本身回预览源码() {
     );
     // 自己 fetch 自己也无妨(源码本来就在页面里)
     assert_eq!(
-        plan_request(
+        plan_html(
             "GET",
             "/site/index.html",
             Some("empty"),
@@ -89,7 +166,7 @@ fn 文档本身回预览源码() {
 #[test]
 fn 页面资源按项目根解析() {
     let root = root();
-    let plan = plan_request(
+    let plan = plan_html(
         "GET",
         "/site/css/a%20b.css",
         Some("style"),
@@ -100,7 +177,7 @@ fn 页面资源按项目根解析() {
         plan,
         Plan::File(root.join("site").join("css").join("a b.css"))
     );
-    let plan = plan_request("GET", "/assets/app.js", None, "site/index.html", &root);
+    let plan = plan_html("GET", "/assets/app.js", None, "site/index.html", &root);
     assert_eq!(plan, Plan::File(root.join("assets").join("app.js")));
 }
 
@@ -108,25 +185,22 @@ fn 页面资源按项目根解析() {
 fn 非网页资源与_fetch_一律拒绝() {
     let root = root();
     let doc = "index.html";
+    assert_eq!(plan_html("GET", "/.env", None, doc, &root), Plan::Deny(403));
     assert_eq!(
-        plan_request("GET", "/.env", None, doc, &root),
+        plan_html("GET", "/config.json", Some("empty"), doc, &root),
         Plan::Deny(403)
     );
     assert_eq!(
-        plan_request("GET", "/config.json", Some("empty"), doc, &root),
-        Plan::Deny(403)
-    );
-    assert_eq!(
-        plan_request("GET", "/src/main.rs", Some("script"), doc, &root),
+        plan_html("GET", "/src/main.rs", Some("script"), doc, &root),
         Plan::Deny(403)
     );
     // 白名单里的扩展名,被 fetch 读也拒绝(浏览器 file:// 下同样读不到)
     assert_eq!(
-        plan_request("GET", "/other.html", Some("empty"), doc, &root),
+        plan_html("GET", "/other.html", Some("empty"), doc, &root),
         Plan::Deny(403)
     );
     assert_eq!(
-        plan_request("POST", "/a.css", None, doc, &root),
+        plan_html("POST", "/a.css", None, doc, &root),
         Plan::Deny(405)
     );
 }
@@ -136,22 +210,22 @@ fn 越界与换盘符的路径拒绝() {
     let root = root();
     let doc = "index.html";
     assert_eq!(
-        plan_request("GET", "/../x.css", None, doc, &root),
+        plan_html("GET", "/../x.css", None, doc, &root),
         Plan::Deny(400)
     );
     assert_eq!(
-        plan_request("GET", "/a/%2E%2E/b.css", None, doc, &root),
+        plan_html("GET", "/a/%2E%2E/b.css", None, doc, &root),
         Plan::Deny(400)
     );
     assert_eq!(
-        plan_request("GET", "/C:/Windows/a.css", None, doc, &root),
+        plan_html("GET", "/C:/Windows/a.css", None, doc, &root),
         Plan::Deny(400)
     );
     assert_eq!(
-        plan_request("GET", "/a%5C..%5Cb.css", None, doc, &root),
+        plan_html("GET", "/a%5C..%5Cb.css", None, doc, &root),
         Plan::Deny(400)
     );
-    assert_eq!(plan_request("GET", "/", None, doc, &root), Plan::Deny(400));
+    assert_eq!(plan_html("GET", "/", None, doc, &root), Plan::Deny(400));
 }
 
 #[test]

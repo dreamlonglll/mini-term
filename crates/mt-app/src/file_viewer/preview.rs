@@ -1098,7 +1098,7 @@ impl FileViewer {
     ) -> gpui::AnyElement {
         debug_assert!(!self.source.is_remote());
         #[cfg(any(windows, target_os = "macos"))]
-        if let Some(webview) = self.render_html_webview(window, cx) {
+        if let Some(webview) = self.render_web_preview(super::webview::PageKind::Html, window, cx) {
             return webview;
         }
         #[cfg(not(any(windows, target_os = "macos")))]

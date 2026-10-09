@@ -18,6 +18,9 @@ fn 文件类型三条判定与原版正则同口径() {
         "原版正则是 /\\.html?$/,xhtml 不算"
     );
 
+    assert!(is_pdf_file("D:\\docs\\手册.pdf") && is_pdf_file("/x/a.PDF"));
+    assert!(!is_pdf_file("a.pdf.bak") && !is_pdf_file("pdf"));
+
     // 折行只给散文类(CodeEditor.tsx:203-206)
     assert!(should_wrap("a.md") && should_wrap("a.txt"));
     assert!(!should_wrap("a.rs") && !should_wrap("a.json"));
