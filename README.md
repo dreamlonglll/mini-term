@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.13.13-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.13.14-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -35,7 +35,7 @@ https://github.com/user-attachments/assets/8a9c1dca-7289-4ab6-af1f-5158df7368a4
 </p>
 
 
-**GPUI 原生实现**：Rust 原生渲染、单进程，界面不依赖 WebView2（只有 HTML 预览按需调用系统 WebView，缺失时回落简版渲染）。
+**GPUI 原生实现**：Rust 原生渲染、单进程，界面不依赖 WebView2（只有 HTML / PDF 预览按需调用系统 WebView，缺失时回落简版渲染或打开提示）。
 
 > 早期的 Tauri + React 实现已于 v1.0.0-beta 后从仓库移除并停止发布（历史版本安装包仍可在旧 Release 下载，源码看 git 历史）。
 
@@ -62,8 +62,9 @@ https://github.com/user-attachments/assets/8a9c1dca-7289-4ab6-af1f-5158df7368a4
 | **手机端支持** | **前提**：中转要跑在**你自己的**服务器上（1C1G 足够，Docker 一条命令起，另需一个解析到它的域名做 TLS）。见[部署文档](docs/deploy-relay.zh-CN.md)。 |
 | **费用统计** | 顶栏「统计」打开使用统计面板：Claude Code / Codex / Grok 的**成本、调用、会话数**多维聚合，按日 / 按小时趋势图，模型、项目排行与 Top 会话，范围和口径随手切；自定义范围可精确到时分秒，同一天内的范围按小时出图。<br />数据计算方式参考 ccusage 项目 [ccusage/ccusage: npx ccusage](https://github.com/ccusage/ccusage) |
 | **SSH支持** | **SSH 远程项目** — 服务器上的目录直接添加成项目：文件树经 SFTP 懒加载，终端 `ssh -t` 直连并自动落到项目目录，断线后覆盖层一键重连，远程机器上的 Claude / Codex 历史会话也能读出正文。远程缓存键掺入连接 id，两台服务器上的同名路径不会串数据；连接管理弹窗按分组归类，连接可拖拽排序 / 换组、一键复制，密码加密保存 <br /><br />**WSL 支持** — `\\wsl$\<distro>\<path>` 直接当项目根，自动改用 `wsl.exe --cd` 启动，`pwd` 真的落在 WSL 里而不是 `C:\Windows`；Windows 下还能直接读 WSL 发行版内的 Claude / Codex 会话历史<br /><br />**供Agent调用** 通过内置Skill，允许AI通过SSH远程执行服务器命令。 项目右键「关联 SSH」勾选连接即按项目启用，也可整组关联（组内后加的连接自动生效） |
-| **Markdown 预览** | 文件树点开 `.md` 即按块虚拟化渲染（长文档滚动不重排整篇）：```` ```mermaid ```` 围栏纯 Rust 渲染成图表（不依赖浏览器 / Node，跟随亮暗主题，出错退回代码块；点击图表整窗放大，滚轮缩放、拖动平移）、本地与网络图片、GFM 表格、链接按四类处置（外链先确认、锚点滚到标题、本地文件开新页签），行内代码按主题强调色显示（橙字深底） |
+| **Markdown 预览** | 文件树点开 `.md` 即按块虚拟化渲染（长文档滚动不重排整篇）：```` ```mermaid ```` 围栏纯 Rust 渲染成图表（不依赖浏览器 / Node，跟随亮暗主题，出错退回代码块；点击图表整窗放大，滚轮缩放、拖动平移）、本地与网络图片、GFM 表格、链接按四类处置（外链先确认、锚点滚到标题、本地文件开新页签），行内代码按主题强调色显示（橙字深底）；顶层标题两条以上时左侧出**目录栏**，点击跳到章节、当前章节随滚动高亮，工具栏「目录」开合所有页签共用、跨启动记住 |
 | **HTML 预览** | 本地 `.html` 用系统 WebView（Windows 为 WebView2）真渲染，CSS 与脚本照跑、效果与浏览器一致，相对路径的样式 / 脚本 / 图片按项目目录加载，改完源码未保存也能切预览看效果；外链先确认再交浏览器，链到本地文件作为新页签打开，页面脚本读不到项目里的其它文件。WebView 不可用或 Linux 上回落简版渲染 |
+| **PDF 预览** | 文件树点开本地 `.pdf` 直接在页签里看，用系统 WebView 自带的阅读器显示（Windows 为 WebView2 内置的 Edge 阅读器），书签目录、页码跳转、搜索、缩放现成可用；文件在盘上被改写后自动重载，工具栏一键「使用默认工具打开」；页面只拿得到这份文档本身。WebView 不可用、Linux 或远程 PDF 时给出打开 / 下载提示 |
 | **终端页签** | 页签最左按 shell 显示图标（pwsh / Windows PowerShell / cmd / bash / zsh / fish / nu / WSL 各一枚），**标题跟随 shell 报的窗口标题**：oh-my-posh 的当前目录直接缀在 shell 名后，几个同名 pwsh 一眼分清；shell 自己的默认标题不显示、AI 会话跑着时只留品牌图标，可在「终端」设置里关闭。**AI 停下来等你**（批权限、填表单、这一轮因 API 错误结束）时状态灯亮橙色叹号，与「做完了」的绿勾、「在跑」的转圈分得开，项目行、悬停预览、边条徽标同一口径；做完了还没看的页签在关闭钮的位置留一颗绿点，点进去才消。工作台页签与终端页签两层分明：只有页级保留强调色顶线，终端页签是圆角胶囊，关闭按钮悬停才现身 |
 | **Git集成** | VS Code 风格的 **Changes 面板**（Staged / Changes / Untracked 分组，单文件或全量 stage / discard，`Ctrl+Enter` 提交），并且支持 **Worktree 管理**（对项目右键-> Worktree管理）；提交历史增量分页，十万级提交的大仓库首页也即点即出 |
 | **长文本粘贴** | 剪贴板 ≥10 行或 ≥2000 字符时自动转存临时 `.txt`，粘贴带引号的路径——AI 工具不必硬吞超长内容 |
@@ -91,7 +92,7 @@ https://github.com/user-attachments/assets/8a9c1dca-7289-4ab6-af1f-5158df7368a4
 
 | 层 | 实现 |
 |---|---|
-| 壳 / 渲染 | GPUI（gpui-pre 0.3，Zed 2026-09 快照；GPU 原生渲染，单进程；仅 HTML 预览按需嵌入系统 WebView） |
+| 壳 / 渲染 | GPUI（gpui-pre 0.3，Zed 2026-09 快照；GPU 原生渲染，单进程；仅 HTML / PDF 预览按需嵌入系统 WebView） |
 | UI | 纯 Rust：gpui-component + 自绘组件 |
 | 终端 | alacritty_terminal（进程内 VT 解析，零 IPC、零序列化）· portable-pty · Windows 随包 ConPTY（Windows Terminal 1.24） |
 | 状态 / 布局 | 单一 Store · 递归 SplitNode 分屏树 |
@@ -99,7 +100,7 @@ https://github.com/user-attachments/assets/8a9c1dca-7289-4ab6-af1f-5158df7368a4
 | Git / 文件 | git2（libgit2）· notify + ignore |
 | 用量统计 | rusqlite 本地账本 · 自绘趋势图 |
 | 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`） |
-| 测试 | **2165 个 Rust 测试**（33 个测试目标） |
+| 测试 | **2175 个 Rust 测试**（33 个测试目标） |
 
 ---
 

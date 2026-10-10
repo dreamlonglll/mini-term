@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.13.13-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.13.14-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -35,7 +35,7 @@ https://github.com/user-attachments/assets/8a9c1dca-7289-4ab6-af1f-5158df7368a4
 </p>
 
 
-**GPUI-native implementation**: Rust-native rendering, single process; the UI does not depend on WebView2 (only the HTML preview uses the system WebView on demand, falling back to a simplified renderer when it is missing).
+**GPUI-native implementation**: Rust-native rendering, single process; the UI does not depend on WebView2 (only the HTML / PDF previews use the system WebView on demand, falling back to a simplified renderer or an open-with notice when it is missing).
 
 > The earlier Tauri + React implementation was removed from the repository and discontinued after v1.0.0-beta (old installers remain downloadable on past Releases; the source lives in git history).
 
@@ -60,8 +60,9 @@ https://github.com/user-attachments/assets/8a9c1dca-7289-4ab6-af1f-5158df7368a4
 | **Mobile support** | **Prerequisite**: the relay runs on **your own** server (1 vCPU / 1 GB is plenty, one Docker command to start, plus a domain pointed at it for TLS). See the [deployment guide](docs/deploy-relay.md). |
 | **Cost statistics** | The "Stats" panel in the top bar aggregates Claude Code / Codex / Grok **cost, calls, and sessions** across every dimension: daily / hourly trend charts, model and project rankings, top sessions, with ranges and scopes one click away; custom ranges go down to the second, and a range within a single day charts by the hour.<br />Cost computation follows the approach of the ccusage project — [ccusage/ccusage: npx ccusage](https://github.com/ccusage/ccusage) |
 | **SSH support** | **SSH remote projects** — add a directory on a server as a project directly: the file tree lazy-loads over SFTP, the terminal connects via `ssh -t` and lands straight in the project directory, a one-click overlay reconnects after a drop, and the remote machine's Claude / Codex history is readable with full content. Remote cache keys mix in the connection id, so identical paths on two servers never cross-contaminate; the connection manager groups connections, lets you drag them to reorder / regroup or duplicate them in one click, and stores passwords encrypted <br /><br />**WSL support** — `\\wsl$\<distro>\<path>` works as a project root, launching switches to `wsl.exe --cd` automatically so `pwd` really lands inside WSL instead of `C:\Windows`; Windows can also read Claude / Codex session history from inside WSL distros directly<br /><br />**Callable by agents** — a built-in Skill lets the AI run commands on your servers over SSH. Right-click a project → "Link SSH" and tick the connections to enable it per project, or link a whole group (connections added to it later apply automatically) |
-| **Markdown preview** | Open a `.md` from the file tree and it renders block-virtualized (long documents scroll without re-laying out the whole page): ```` ```mermaid ```` fences become diagrams through a pure-Rust pipeline (no browser or Node, follows light / dark theme, falls back to the code block on errors; click one to open a full-window lightbox with wheel zoom and drag-to-pan), local and remote images, GFM tables, links dispatched by kind (external links confirm first, anchors scroll to the heading, local files open as a new tab), and inline code in the theme accent (orange on an elevated background) |
+| **Markdown preview** | Open a `.md` from the file tree and it renders block-virtualized (long documents scroll without re-laying out the whole page): ```` ```mermaid ```` fences become diagrams through a pure-Rust pipeline (no browser or Node, follows light / dark theme, falls back to the code block on errors; click one to open a full-window lightbox with wheel zoom and drag-to-pan), local and remote images, GFM tables, links dispatched by kind (external links confirm first, anchors scroll to the heading, local files open as a new tab), and inline code in the theme accent (orange on an elevated background); once a document has two or more top-level headings an **outline sidebar** appears on the left — click to jump to a section, the current section highlights as you scroll, and the toolbar "Outline" toggle is shared by every tab and remembered across launches |
 | **HTML preview** | Local `.html` files render in the system WebView (WebView2 on Windows) — CSS and scripts run, so it looks exactly like the browser; relative stylesheets / scripts / images load from the project, and unsaved edits show up when you switch back to preview. External links ask before opening in the browser, links to local files open as a new tab, and page scripts cannot read other files in the project. Falls back to the simplified renderer when the WebView is unavailable or on Linux |
+| **PDF preview** | Open a local `.pdf` from the file tree and it shows right in a tab through the system WebView's own reader (on Windows, the Edge reader built into WebView2), so bookmarks, page jumps, search and zoom work out of the box; the file reloads automatically when it is rewritten on disk, and the toolbar has a one-click "Open with default app"; the page can reach nothing but the document itself. When the WebView is unavailable, on Linux, or for remote PDFs, you get an open / download notice instead |
 | **Terminal tabs** | Each tab leads with an icon for its shell (pwsh / Windows PowerShell / cmd / bash / zsh / fish / nu / WSL) and **follows the window title the shell reports**: oh-my-posh's current directory lands right after the shell name, so several `pwsh` tabs are told apart at a glance; the shell's own default title is hidden, a running AI session leaves only the brand icon, and it can be switched off under Terminal settings. When **the AI is waiting on you** (a permission prompt, a form, or a turn that ended on an API error) the status light turns into an orange exclamation mark, distinct from the green check of "done" and the spinner of "working" — project rows, hover previews and the sidebar badge use the same light; a tab whose AI finished while you weren't looking keeps a green dot where its close button sits until you click into it. Workbench tabs and terminal tabs read as two distinct layers: only the page level keeps the accent top line, terminal tabs are rounded chips whose close button appears on hover |
 | **Git integration** | A VS Code-style **Changes panel** (Staged / Changes / Untracked groups, per-file or bulk stage / discard, `Ctrl+Enter` to commit), plus **worktree management** (right-click a project → Manage Worktrees); commit history pages in incrementally, so even a repository with 100k+ commits shows its first page instantly |
 | **Long-text paste** | Clipboard text ≥10 lines or ≥2000 chars is spilled to a temp `.txt` and pasted as a quoted path — your AI tool never has to swallow a wall of text |
@@ -89,7 +90,7 @@ The whole application is **native Rust**:
 
 | Layer | Implementation |
 |---|---|
-| Shell / rendering | GPUI (gpui-pre 0.3, a 2026-09 snapshot of Zed's framework — GPU-native rendering, single process; only the HTML preview embeds the system WebView on demand) |
+| Shell / rendering | GPUI (gpui-pre 0.3, a 2026-09 snapshot of Zed's framework — GPU-native rendering, single process; only the HTML / PDF previews embed the system WebView on demand) |
 | UI | Pure Rust: gpui-component + hand-drawn widgets |
 | Terminal | alacritty_terminal (in-process VT parsing — zero IPC, zero serialization) · portable-pty · bundled ConPTY on Windows (Windows Terminal 1.24) |
 | State / layout | Single store · recursive SplitNode tree |
@@ -97,7 +98,7 @@ The whole application is **native Rust**:
 | Git / files | git2 (libgit2) · notify + ignore |
 | Usage stats | rusqlite local ledger · hand-drawn trend charts |
 | Mobile relay | axum + tokio WebSocket (`relay-server/`) · React + Vite PWA (`mobile/`) |
-| Tests | **2,165 Rust tests** (33 test targets) |
+| Tests | **2,175 Rust tests** (33 test targets) |
 
 ---
 
