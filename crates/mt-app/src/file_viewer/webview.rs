@@ -30,6 +30,16 @@
 //!
 //! 外链不在 WebView 里开:导航与新窗口请求一律拦下,交给与 Markdown 预览同一套
 //! 处置(外链弹确认后交系统浏览器,本地文件作为页签打开);下载一律拒绝。
+//!
+//! # PDF 借同一套
+//!
+//! PDF 页签也是这么一个 WebView([`PageKind::Pdf`]),文档以 `application/pdf` 应答,
+//! 由 WebView 内置的阅读器显示:Windows 上是 Edge 那套,目录(书签)、页码跳转、
+//! 搜索、缩放、旋转都是现成的;macOS 的 WKWebView 只有翻页与缩放,没有目录栏。
+//! 口径比 HTML 更紧 —— 只给文档本身这一个文件,别的请求一律 403,顶层导航也只
+//! 放行文档自己。文档每次从盘上现读(PDF 没有草稿),盘上改了由页签去抖后重载。
+//! Windows 上把阅读器的「保存 / 另存为」按钮藏掉:下载被拒,留着就是两个点了没
+//! 反应的按钮,何况文件本来就在盘上。
 
 // Linux 上没有 WebView 分支,下面的纯逻辑只剩单测在用
 #![cfg_attr(not(any(windows, target_os = "macos")), allow(dead_code))]
@@ -46,7 +56,17 @@ pub(super) const ORIGIN: &str = "http://mtpreview.localhost";
 #[cfg(target_os = "macos")]
 pub(super) const ORIGIN: &str = "mtpreview://localhost";
 
-/// 设了 `MT_DISABLE_HTML_WEBVIEW=1` 就不建 WebView,一律走简版渲染(排障开关)。
+/// WebView 里装的是什么。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum PageKind {
+    /// 本地 HTML:页面资源按项目根解析,文档是预览源码(草稿也算)。
+    Html,
+    /// PDF:只服务文档本身,交给 WebView 内置的阅读器。
+    Pdf,
+}
+
+/// 设了 `MT_DISABLE_HTML_WEBVIEW=1` 就不建 WebView:HTML 一律走简版渲染,PDF 落到
+/// 「使用默认工具打开」(排障开关)。
 pub(super) fn disabled() -> bool {
     std::env::var_os("MT_DISABLE_HTML_WEBVIEW").is_some_and(|v| v == "1")
 }
@@ -150,23 +170,29 @@ pub(super) fn mime_for(name: &str) -> Option<&'static str> {
 }
 
 /// 顶层导航放不放行:同源的 HTML 页照常在 WebView 里跳(本地页面互链),
-/// `about:blank` 放行,其余一律拦下交给宿主处置。
-pub(super) fn navigation_allowed(url: &str) -> bool {
+/// `about:blank` 放行,其余一律拦下交给宿主处置。PDF 页签只放行文档自己
+/// (PDF 里指向别的本地文件的链接同样拦下,作为页签打开)。
+pub(super) fn navigation_allowed(kind: PageKind, url: &str, doc_rel: &str) -> bool {
     if url == "about:blank" {
         return true;
     }
-    same_origin_rel(url).is_some_and(|rel| {
-        rel.rsplit('/')
+    let Some(rel) = same_origin_rel(url) else {
+        return false;
+    };
+    match kind {
+        PageKind::Html => rel
+            .rsplit('/')
             .next()
             .and_then(mime_for)
-            .is_some_and(|mime| mime == "text/html")
-    })
+            .is_some_and(|mime| mime == "text/html"),
+        PageKind::Pdf => rel == doc_rel,
+    }
 }
 
 /// 一次资源请求的处置。
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Plan {
-    /// 文档本身:回预览源码(草稿也算)。
+    /// 文档本身:HTML 回预览源码(草稿也算),PDF 从盘上现读。
     Doc,
     /// 盘上的文件(还没规范化 —— 读之前要再验一次在不在根里)。
     File(PathBuf),
@@ -177,6 +203,7 @@ pub(super) enum Plan {
 /// 判定一次资源请求。`uri_path` 是请求 URL 的路径部分(未解码),`fetch_dest` 是
 /// `Sec-Fetch-Dest` 请求头(平台不给就是 `None`)。
 pub(super) fn plan_request(
+    kind: PageKind,
     method: &str,
     uri_path: &str,
     fetch_dest: Option<&str>,
@@ -203,7 +230,8 @@ pub(super) fn plan_request(
     if rel == doc_rel {
         return Plan::Doc;
     }
-    if fetch_dest == Some("empty") {
+    // PDF 没有页面资源可言,文档之外一个文件都不给
+    if kind == PageKind::Pdf || fetch_dest == Some("empty") {
         return Plan::Deny(403);
     }
     if mime_for(segments[segments.len() - 1]).is_none() {
@@ -217,17 +245,18 @@ pub(super) fn plan_request(
 }
 
 #[cfg(any(windows, target_os = "macos"))]
-pub(super) use imp::HtmlWebView;
+pub(super) use imp::PreviewWebView;
 
 /// 本页签的 WebView 走到哪一步了。
-pub(super) enum HtmlView {
+pub(super) enum WebPreview {
     /// 还没建。
     Idle,
     /// 建的任务已经排上(建 WebView2 要跑一段嵌套消息循环,不在渲染途中做)。
     Creating,
     #[cfg(any(windows, target_os = "macos"))]
-    Ready(std::rc::Rc<HtmlWebView>),
-    /// 建不起来(原因已进日志),本页签此后一直走简版渲染。
+    Ready(std::rc::Rc<PreviewWebView>),
+    /// 建不起来(原因已进日志),本页签此后一直走回落:HTML 简版渲染,PDF
+    /// 「使用默认工具打开」。
     Failed,
 }
 
@@ -246,7 +275,9 @@ mod imp {
     use wry::RequestAsyncResponder;
     use wry::http::{Request, Response};
 
-    use super::{HtmlView, Plan, SCHEME, disabled, navigation_allowed, page_url, plan_request};
+    use super::{
+        PageKind, Plan, SCHEME, WebPreview, disabled, navigation_allowed, page_url, plan_request,
+    };
     use crate::file_viewer::{DocumentSource, FileViewer};
     use crate::i18n::t;
     use crate::native_view::{Hosted, Slot};
@@ -254,15 +285,18 @@ mod imp {
 
     /// 资源服务要读的那几样。`Mutex` 是因为读盘在后台线程上完成。
     struct ServeState {
+        kind: PageKind,
         root: PathBuf,
         /// 规范化后的项目根(读盘前比前缀用)。规范化失败 = 一个文件都不给。
         root_canonical: Option<PathBuf>,
         doc_rel: String,
-        /// 文档本身的内容:预览源码(草稿或磁盘现内容)。
+        /// 文档在盘上的路径。PDF 每次请求都从这里现读。
+        doc_path: PathBuf,
+        /// HTML 文档本身的内容:预览源码(草稿或磁盘现内容)。PDF 不用。
         doc_body: Arc<str>,
     }
 
-    pub(in crate::file_viewer) struct HtmlWebView {
+    pub(in crate::file_viewer) struct PreviewWebView {
         pub(in crate::file_viewer) hosted: Rc<Hosted>,
         serve: Arc<Mutex<ServeState>>,
         doc_url: String,
@@ -276,8 +310,10 @@ mod imp {
         static WEB_CONTEXT: RefCell<Option<wry::WebContext>> = const { RefCell::new(None) };
     }
 
-    impl HtmlWebView {
+    impl PreviewWebView {
+        #[allow(clippy::too_many_arguments)]
         fn new(
+            kind: PageKind,
             root: &Path,
             doc: &Path,
             body: &str,
@@ -289,12 +325,15 @@ mod imp {
             let doc_rel = super::rel_of(root, doc)
                 .ok_or_else(|| format!("{} 不在项目目录 {} 之内", doc.display(), root.display()))?;
             let serve = Arc::new(Mutex::new(ServeState {
+                kind,
                 root: root.to_path_buf(),
                 root_canonical: std::fs::canonicalize(root).ok(),
                 doc_rel: doc_rel.clone(),
+                doc_path: doc.to_path_buf(),
                 doc_body: Arc::from(body),
             }));
             let doc_url = page_url(&doc_rel);
+            let navigation_doc = doc_rel;
 
             let webview = WEB_CONTEXT.with(|context| {
                 let mut context = context.borrow_mut();
@@ -319,7 +358,7 @@ mod imp {
                         },
                     )
                     .with_navigation_handler(move |url| {
-                        if navigation_allowed(&url) {
+                        if navigation_allowed(kind, &url, &navigation_doc) {
                             return true;
                         }
                         let _ = navigation_links.unbounded_send(url);
@@ -334,6 +373,10 @@ mod imp {
                     .build_as_child(window)
                     .map_err(|err| err.to_string())
             })?;
+            #[cfg(windows)]
+            if kind == PageKind::Pdf {
+                hide_pdf_save_buttons(&webview);
+            }
             Ok(Self {
                 hosted: Hosted::register(webview, window, cx),
                 serve,
@@ -342,8 +385,13 @@ mod imp {
             })
         }
 
+        /// 重新载入文档(PDF 在盘上被改写了)。
+        pub(in crate::file_viewer) fn reload(&self) {
+            let _ = self.hosted.webview().load_url(&self.doc_url);
+        }
+
         /// 预览源码变了(保存、外部改动、切预览时的草稿快照)就重新载入文档。
-        /// 每帧都调,没变时只是一次字符串比较。
+        /// 每帧都调,没变时只是一次字符串比较。只用于 HTML。
         fn sync(&self, body: &str) {
             let changed = {
                 let mut state = self.serve.lock().unwrap_or_else(|e| e.into_inner());
@@ -355,8 +403,37 @@ mod imp {
                 }
             };
             if changed {
-                let _ = self.hosted.webview().load_url(&self.doc_url);
+                self.reload();
             }
+        }
+    }
+
+    /// 藏掉 Edge PDF 阅读器的「保存 / 另存为」(理由见模块注释「PDF 借同一套」)。
+    /// 设置是这一个 WebView 自己的,不波及 HTML 预览。失败只记日志:按钮留着,
+    /// 点了没反应,不影响看。
+    #[cfg(windows)]
+    fn hide_pdf_save_buttons(webview: &wry::WebView) {
+        use webview2_com::Microsoft::Web::WebView2::Win32::{
+            COREWEBVIEW2_PDF_TOOLBAR_ITEMS_SAVE, COREWEBVIEW2_PDF_TOOLBAR_ITEMS_SAVE_AS,
+            ICoreWebView2Settings7,
+        };
+        use webview2_windows_core::Interface as _;
+        use wry::WebViewExtWindows as _;
+        // SAFETY: 都是 COM 调用,接口指针由 wry 持有、在 UI 线程上用
+        let result = unsafe {
+            webview
+                .webview()
+                .Settings()
+                .and_then(|settings| settings.cast::<ICoreWebView2Settings7>())
+                .and_then(|settings| {
+                    settings.SetHiddenPdfToolbarItems(
+                        COREWEBVIEW2_PDF_TOOLBAR_ITEMS_SAVE
+                            | COREWEBVIEW2_PDF_TOOLBAR_ITEMS_SAVE_AS,
+                    )
+                })
+        };
+        if let Err(err) = result {
+            eprintln!("[pdf-preview] 隐藏阅读器保存按钮失败: {err}");
         }
     }
 
@@ -373,16 +450,29 @@ mod imp {
             .get("sec-fetch-dest")
             .and_then(|value| value.to_str().ok());
         match plan_request(
+            state.kind,
             request.method().as_str(),
             request.uri().path(),
             dest,
             &state.doc_rel,
             &state.root,
         ) {
-            Plan::Doc => {
-                let body = state.doc_body.as_bytes().to_vec();
-                responder.respond(response(200, Some("text/html; charset=utf-8"), body));
-            }
+            Plan::Doc => match state.kind {
+                PageKind::Html => {
+                    let body = state.doc_body.as_bytes().to_vec();
+                    responder.respond(response(200, Some("text/html; charset=utf-8"), body));
+                }
+                PageKind::Pdf => {
+                    let path = state.doc_path.clone();
+                    drop(state);
+                    run_in_background(move || {
+                        responder.respond(match std::fs::read(&path) {
+                            Ok(bytes) => response(200, Some("application/pdf"), bytes),
+                            Err(_) => response(404, None, Vec::new()),
+                        })
+                    });
+                }
+            },
             Plan::File(path) => {
                 let root = state.root_canonical.clone();
                 drop(state);
@@ -451,22 +541,26 @@ mod imp {
     }
 
     impl FileViewer {
-        /// HTML 预览的 WebView 分支。返回 `None` = 走简版渲染。
-        pub(in crate::file_viewer) fn render_html_webview(
+        /// HTML 预览与 PDF 页签的 WebView 分支。返回 `None` = 走回落(HTML 简版渲染,
+        /// PDF「使用默认工具打开」)。
+        pub(in crate::file_viewer) fn render_web_preview(
             &self,
+            kind: PageKind,
             window: &mut Window,
             cx: &mut Context<Self>,
         ) -> Option<AnyElement> {
             if disabled() || self.source.is_remote() {
                 return None;
             }
-            let ready = match &*self.html_view.borrow() {
-                HtmlView::Failed => return None,
-                HtmlView::Ready(view) => Some(view.clone()),
-                HtmlView::Idle | HtmlView::Creating => None,
+            let ready = match &*self.web_preview.borrow() {
+                WebPreview::Failed => return None,
+                WebPreview::Ready(view) => Some(view.clone()),
+                WebPreview::Idle | WebPreview::Creating => None,
             };
             if let Some(view) = ready {
-                view.sync(self.preview_source());
+                if kind == PageKind::Html {
+                    view.sync(self.preview_source());
+                }
                 return Some(
                     div()
                         .size_full()
@@ -474,12 +568,12 @@ mod imp {
                         .into_any_element(),
                 );
             }
-            let idle = matches!(*self.html_view.borrow(), HtmlView::Idle);
+            let idle = matches!(*self.web_preview.borrow(), WebPreview::Idle);
             if idle {
-                *self.html_view.borrow_mut() = HtmlView::Creating;
+                *self.web_preview.borrow_mut() = WebPreview::Creating;
                 cx.spawn_in(window, async move |this, cx| {
                     let _ = this.update_in(cx, |view: &mut FileViewer, window, cx| {
-                        view.create_html_view(window, cx)
+                        view.create_web_preview(kind, window, cx)
                     });
                 })
                 .detach();
@@ -490,9 +584,21 @@ mod imp {
             )
         }
 
-        fn create_html_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        /// PDF 在盘上被改写了(去抖之后):WebView 已经建好就重新载入。
+        pub(in crate::file_viewer) fn reload_web_preview(&self) {
+            if let WebPreview::Ready(view) = &*self.web_preview.borrow() {
+                view.reload();
+            }
+        }
+
+        fn create_web_preview(
+            &mut self,
+            kind: PageKind,
+            window: &mut Window,
+            cx: &mut Context<Self>,
+        ) {
             let DocumentSource::Local { project_root, .. } = &self.source else {
-                *self.html_view.borrow_mut() = HtmlView::Failed;
+                *self.web_preview.borrow_mut() = WebPreview::Failed;
                 return;
             };
             let (tx, mut rx) = unbounded::<String>();
@@ -510,15 +616,20 @@ mod imp {
             });
             let root = project_root.clone();
             let doc = self.current_path.clone();
-            let body = self.preview_source().to_string();
-            let state = match HtmlWebView::new(&root, &doc, &body, tx, links_task, window, cx) {
-                Ok(view) => HtmlView::Ready(Rc::new(view)),
-                Err(err) => {
-                    eprintln!("[html-preview] WebView 建立失败,改用简版渲染: {err}");
-                    HtmlView::Failed
-                }
+            // PDF 每次请求都从盘上现读,用不着预览源码
+            let body = match kind {
+                PageKind::Html => self.preview_source().to_string(),
+                PageKind::Pdf => String::new(),
             };
-            *self.html_view.borrow_mut() = state;
+            let state =
+                match PreviewWebView::new(kind, &root, &doc, &body, tx, links_task, window, cx) {
+                    Ok(view) => WebPreview::Ready(Rc::new(view)),
+                    Err(err) => {
+                        eprintln!("[web-preview] {kind:?} 的 WebView 建立失败,改走回落: {err}");
+                        WebPreview::Failed
+                    }
+                };
+            *self.web_preview.borrow_mut() = state;
             cx.notify();
         }
 

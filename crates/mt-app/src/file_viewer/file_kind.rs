@@ -23,6 +23,11 @@ pub(super) fn is_html_file(path: &str) -> bool {
     has_ext(path, &["html", "htm"])
 }
 
+/// PDF 交给系统 WebView 内置的阅读器(见 [`super::webview`]),原版没有这一支。
+pub(super) fn is_pdf_file(path: &str) -> bool {
+    has_ext(path, &["pdf"])
+}
+
 /// 散文类文件折行,代码不折(`CodeEditor.tsx:203-206` 的 `shouldWrap`)。
 pub(super) fn should_wrap(path: &str) -> bool {
     has_ext(path, &["md", "markdown", "mkd", "mdx", "txt"])

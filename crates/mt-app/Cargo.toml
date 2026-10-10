@@ -162,7 +162,7 @@ ropey = "=2.0.0-beta.1"
 gpui_platform = { workspace = true, features = ["x11", "wayland"] }
 
 [target.'cfg(any(windows, target_os = "macos"))'.dependencies]
-# 本地 HTML 预览的系统 WebView(见 `file_viewer::webview` 模块注释)。
+# 本地 HTML 预览与 PDF 页签的系统 WebView(见 `file_viewer::webview` 模块注释)。
 gpui-wry.workspace = true
 wry.workspace = true
 
@@ -203,6 +203,12 @@ windows = { version = "0.62", features = [
 ] }
 # 从 gpui 的 Window 取 HWND。
 raw-window-handle = "0.6"
+# PDF 页签藏掉 Edge 阅读器的保存按钮要直接调 WebView2 的 COM 接口
+# (ICoreWebView2Settings7,见 file_viewer::webview)。两个都是 wry 已经带进依赖树的
+# 那一份,不新增编译量;windows-core 钉 0.61 是因为 webview2-com 的接口挂在它上面
+# (`cast` 要它的 Interface trait),与上面 0.62 那份不通用。
+webview2-com = "0.38"
+webview2-windows-core = { package = "windows-core", version = "0.61" }
 
 [target.'cfg(windows)'.build-dependencies]
 # exe 图标与版本资源嵌入(见 build.rs)。build-dependencies 的 cfg 判的是

@@ -90,9 +90,41 @@ pub(super) enum MdBlock {
     },
 }
 
+/// 大纲(目录)里的一条:一个**顶层**标题(`#` 与 `===` 两种写法都算;列表 /
+/// 引用里的不算,与表格、图片只认顶层同一口径)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct MdHeading {
+    /// 1~6
+    pub(super) level: u8,
+    /// 剥掉行内标记后的纯文本(强调、code span、链接只留文字)
+    pub(super) text: String,
+    /// 标题所在块在 [`MdDocument::segs`] 里的下标。标题总是另起一块、且是该块
+    /// 的第一个节点,所以滚到块顶就是滚到标题
+    pub(super) block: usize,
+}
+
+/// 一篇 markdown 的分块结果与大纲。
+#[derive(Debug, Default)]
+pub(super) struct MdDocument {
+    pub(super) segs: Vec<MdSegment>,
+    /// 整篇只能整块交回 TextView 时(引用 / 脚注要共享作用域、AST 拿不到)
+    /// 为空:所有标题都落在第 0 块,点哪条都只能滚到文首,不如不给
+    pub(super) outline: Vec<MdHeading>,
+}
+
+impl MdDocument {
+    fn text_only(source: &str) -> Self {
+        Self {
+            segs: markdown_text_only(source),
+            outline: Vec::new(),
+        }
+    }
+}
+
 /// 把 markdown 源切成**顶层 AST 块**:确认是顶层 GFM 表格或纯图片段落时才
 /// 自绘，其余节点按源码范围交回 TextView。列表/引用/raw HTML/代码块整块保留，
 /// 不能先按“看起来像图片的一行”拆开，否则会把容器里的代码误变成真实资源请求。
+/// 顶层标题总是另起一块,顺带收进大纲([`MdDocument::outline`])。
 ///
 /// 逐块喂 TextView 而不是整篇 —— 除了表格要自绘,还有一条硬理由:
 /// gpui-component 0.5.1 的非虚拟化路径把 `is_last: true` 原样传给 Root 的
@@ -100,39 +132,60 @@ pub(super) enum MdBlock {
 /// `is_last → paragraph_gap = 0`,整篇喂进去相邻段落会贴死(用户对照原版
 /// 实测)。块间距改由 [`block_top_margin`] 自己控,顺带复刻原版「标题前
 /// 间距更大」的非对称节奏(`.md-preview h* { margin-top: 1.4em }`)。
-pub(super) fn split_md_blocks(source: &str) -> Vec<MdSegment> {
+pub(super) fn split_md_document(source: &str) -> MdDocument {
     let Ok(ast) = markdown::to_mdast(source, &ParseOptions::gfm()) else {
-        return markdown_text_only(source);
+        return MdDocument::text_only(source);
     };
     // 引用、脚注与嵌套定义可能跨分段消费；遇到这些就整篇交回 TextView。
     // 仅有未被引用的顶层普通定义时可以安全分块，它本身不产生可见内容。
     if markdown_requires_shared_definition_scope(&ast) {
-        return markdown_text_only(source);
+        return MdDocument::text_only(source);
     }
     let Some(children) = ast.children() else {
-        return markdown_text_only(source);
+        return MdDocument::text_only(source);
     };
 
     let mut nodes = Vec::with_capacity(children.len());
     let mut previous_end = 0usize;
     for node in children {
         let Some(position) = node.position() else {
-            return markdown_text_only(source);
+            return MdDocument::text_only(source);
         };
         let (start, end) = (position.start.offset, position.end.offset);
         if start > end || start < previous_end || source.get(start..end).is_none() {
-            return markdown_text_only(source);
+            return MdDocument::text_only(source);
         }
         nodes.push((node, start, end));
         previous_end = end;
     }
 
     let mut segs = Vec::new();
+    let mut outline = Vec::new();
     let mut pending_text: Option<(usize, usize)> = None;
     for (node, start, end) in nodes {
         // 未被引用的顶层定义不产生可见内容。既然上面的共享作用域检查已经确认
         // 没有引用消费者，就直接跳过，避免为它建立一个空 TextView 和块间距。
         if matches!(node, MarkdownNode::Definition(_)) {
+            continue;
+        }
+        // 标题另起一块(哪怕与上文之间没有空行):大纲点过去滚到块顶,落点就是
+        // 标题本身,而不是它所在那一大块的开头
+        if let MarkdownNode::Heading(heading) = node {
+            if let Some((text_start, text_end)) = pending_text.take() {
+                push_markdown_text(source, text_start, text_end, &mut segs);
+            }
+            let mut text = String::new();
+            collect_plain_text(node, &mut text);
+            let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            if !text.is_empty() {
+                // 标题原文非空,这一块下一次推进 segs 时一定落在这个下标上
+                outline.push(MdHeading {
+                    level: heading.depth,
+                    text,
+                    block: segs.len(),
+                });
+            }
+            pending_text = Some((start, end));
             continue;
         }
         let raw = &source[start..end];
@@ -179,7 +232,24 @@ pub(super) fn split_md_blocks(source: &str) -> Vec<MdSegment> {
     if let Some((text_start, text_end)) = pending_text {
         push_markdown_text(source, text_start, text_end, &mut segs);
     }
-    segs
+    MdDocument { segs, outline }
+}
+
+/// 标题的纯文本:文字与 code span 照收,强调 / 删除线 / 链接只留里面的文字,
+/// 图片取 alt,硬换行算一个空格,内联 HTML 丢掉。
+fn collect_plain_text(node: &MarkdownNode, out: &mut String) {
+    match node {
+        MarkdownNode::Text(text) => out.push_str(&text.value),
+        MarkdownNode::InlineCode(code) => out.push_str(&code.value),
+        MarkdownNode::Image(image) => out.push_str(&image.alt),
+        MarkdownNode::Break(_) => out.push(' '),
+        MarkdownNode::Html(_) => {}
+        _ => {
+            for child in node.children().into_iter().flatten() {
+                collect_plain_text(child, out);
+            }
+        }
+    }
 }
 
 /// 围栏的 info string 是不是 mermaid。GitHub 只认 `mermaid` 一种拼法,这里放宽
