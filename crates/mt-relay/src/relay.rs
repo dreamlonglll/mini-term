@@ -812,7 +812,7 @@ impl MobileRelayManager {
     /// 移动端指令都只在这份全量里出现,不改标就一律显示成桌面输入。改标也在锁外
     /// (只取叶子锁 `recent_mobile_cmds`)。
     fn rebind_mirror(&self, job: &MirrorJob, path: PathBuf, agent: MirrorAgent) -> bool {
-        let mut parser = MirrorParser::new(agent);
+        let mut parser = MirrorParser::new(agent, &job.project_path);
         let Some((mut msgs, offset)) = mirror::parse_whole_file(&path, &mut parser) else {
             return false;
         };
