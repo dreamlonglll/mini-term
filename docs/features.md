@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.13.14-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.13.15-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -131,8 +131,10 @@ Watch the AI running on your desktop from your phone while you're out, and send 
 - **Active AI session list** — The phone shows running Claude / Codex / Grok sessions grouped by project, with status lights that add, remove, and change color in real time alongside the desktop; when the desktop goes offline a top banner appears and the list greys out, clearing automatically on reconnect.
 - **Start a new session from your phone** — Tap **+** → pick a project → pick an AI launcher, and the desktop opens a terminal tab in that project in the background and brings the agent up; once the session is really running the phone enters its mirror automatically, without disturbing whatever you are looking at on the desktop. Projects are listed with the desktop's group hierarchy and can be collapsed. Launchers are named entries configured on the desktop — the phone references them by id and only ever sees the name, so **the command text never passes through the phone or the relay**.
 - **Rename sessions** — Give a session a name you will recognise, from the ✎ on a list row or the title on the mirror page; it shows up on the desktop terminal tab as well. Leave it empty to restore the default name.
-- **Conversation mirror (read-only)** — Tap into any session to follow the conversation live, with AI replies rendered as Markdown and desktop input shown verbatim; scrolling to the top pages in older messages. Mirror binding resolves the session identity through hooks down to the exact pane, so multiple AI sessions running in the same project never cross-contaminate.
-- **Mobile commands** — The input box at the bottom of the mirror page writes text straight through to the corresponding desktop terminal (equivalent to typing it yourself and pressing Enter), with an immediate receipt and an explicit failure reason; when the desktop is offline the relay rejects the command outright rather than storing and forwarding it.
+- **Conversation mirror** — Tap into any session to follow the conversation live: AI replies render as Markdown (GFM tables, strikethrough and task lists; wide tables and long code lines scroll inside the bubble; one-tap copy on every code block), desktop input is shown verbatim and very long input folds automatically; scrolling to the top pages in older messages without losing your place. Mirror binding resolves the session identity through hooks down to the exact pane, so multiple AI sessions running in the same project never cross-contaminate.
+- **Tool activity and status** — Consecutive tool calls fold into a single "N tool calls · latest: …" bar that expands into each tool and its target (files inside the project shown as relative paths, commands as their first line); the bottom of the mirror shows "AI working" or "needs you" live, pointing you at a pending question when there is one.
+- **Noise filtering** — System content Claude injects into its transcript (skill bodies, local command output, background task notifications, system reminders and the like) stays out of the mirror and the desktop session viewer; slash commands show as `/xxx args`, and an interruption shows as a centered "Interrupted" note.
+- **Mobile commands** — The input box at the bottom of the mirror page writes text straight through to the corresponding desktop terminal (equivalent to typing it yourself and pressing Enter); long and multi-line commands are written as a paste and submitted with a separate Enter. Each command gets an immediate receipt and an explicit failure reason; when the desktop is offline the relay rejects the command outright rather than storing and forwarding it. Single-choice questions from the AI can be answered with a tap.
 - **The relay forwards, never persists** — The relay server stores no message bodies and logs metadata only (a subprocess-level automated test asserts zero file residue across the full flow); it ships with a three-stage Dockerfile and a compose example to build and run from source in one command — reverse proxy + TLS setup in the [deployment guide](deploy-relay.md).
 - **PWA experience** — "Add to Home Screen" runs it as a standalone window, with exponential-backoff reconnection that automatically restores subscriptions, and the same bilingual (English / 中文) layer as the desktop app.
 
@@ -215,7 +217,7 @@ The whole application is **native Rust** (the earlier Tauri + React build was re
 | Git / files | git2 (libgit2) · notify + ignore |
 | Usage stats | rusqlite local ledger · hand-drawn trend charts |
 | Mobile relay | axum + tokio WebSocket (`relay-server/`) · React + Vite PWA (`mobile/`) |
-| Tests | **2,175 Rust tests** (33 test targets) + relay-server protocol boundary tests |
+| Tests | **2,241 Rust tests** (33 test targets) + relay-server protocol boundary tests |
 
 ## Getting Started
 
@@ -356,7 +358,7 @@ Issues and PRs are welcome. External contributions are merged after functional v
 Before submitting, please run:
 
 ```bash
-# Workspace-wide Rust tests (33 test targets, 2,175 cases)
+# Workspace-wide Rust tests (33 test targets, 2,241 cases)
 cargo test --workspace
 
 # Node-side tests (just 2 files: ConPTY bundling / vendored-openssl guard)

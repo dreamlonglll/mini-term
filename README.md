@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.13.14-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.13.15-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -59,7 +59,7 @@ https://github.com/user-attachments/assets/8a9c1dca-7289-4ab6-af1f-5158df7368a4
 |:--|---|
 | **AI事件通知** | 直接接入 **Claude Code / Codex / Grok Build / oh-my-pi 官方 Hook API**（oh-my-pi 走它的进程内扩展机制），使用轮询作为兜底。<br />注意：windows端的 GrokBuild 需要将本程序安装到`非空格`目录，才能保证hook功能正常<br />Windows 下卸载 Mini-Term 时会自动摘掉它写进各家 AI 工具配置里的 hook 条目（升级安装不动） |
 | **外置主题包** | 兼容 Dream Skin 格式的皮肤：文件夹或 zip 导入、manifest 的 sha256 校验、改文件即热重载；皮肤可自带背景图，终端随之透明化压在氛围层上。外链一律走同一道闸（禁 `@import`，指向包外的引用全拒）。点「更多皮肤」直达仓库 [`theme/`](theme/) 皮肤库（现有深色 Blue Hour 蓝调时分、浅色 Morning Mist 晨雾两款），挑一份下载后导入即用；想自己做一份，字段说明在 [`docs/theme-pack-example/`](docs/theme-pack-example/) |
-| **手机端支持** | **前提**：中转要跑在**你自己的**服务器上（1C1G 足够，Docker 一条命令起，另需一个解析到它的域名做 TLS）。见[部署文档](docs/deploy-relay.zh-CN.md)。 |
+| **手机端支持** | 手机上实时看桌面 AI 会话的对话镜像：GFM 表格与代码块一键复制，连续的工具调用折叠成「工具调用 N 次」（读写了哪些文件、跑了什么命令），底部显示「AI 工作中 / 等你处理」，系统注入噪声自动滤掉；可直接给 AI 发指令、点选作答它的提问。<br />**前提**：中转要跑在**你自己的**服务器上（1C1G 足够，Docker 一条命令起，另需一个解析到它的域名做 TLS）。见[部署文档](docs/deploy-relay.zh-CN.md)。 |
 | **费用统计** | 顶栏「统计」打开使用统计面板：Claude Code / Codex / Grok 的**成本、调用、会话数**多维聚合，按日 / 按小时趋势图，模型、项目排行与 Top 会话，范围和口径随手切；自定义范围可精确到时分秒，同一天内的范围按小时出图。<br />数据计算方式参考 ccusage 项目 [ccusage/ccusage: npx ccusage](https://github.com/ccusage/ccusage) |
 | **SSH支持** | **SSH 远程项目** — 服务器上的目录直接添加成项目：文件树经 SFTP 懒加载，终端 `ssh -t` 直连并自动落到项目目录，断线后覆盖层一键重连，远程机器上的 Claude / Codex 历史会话也能读出正文。远程缓存键掺入连接 id，两台服务器上的同名路径不会串数据；连接管理弹窗按分组归类，连接可拖拽排序 / 换组、一键复制，密码加密保存 <br /><br />**WSL 支持** — `\\wsl$\<distro>\<path>` 直接当项目根，自动改用 `wsl.exe --cd` 启动，`pwd` 真的落在 WSL 里而不是 `C:\Windows`；Windows 下还能直接读 WSL 发行版内的 Claude / Codex 会话历史<br /><br />**供Agent调用** 通过内置Skill，允许AI通过SSH远程执行服务器命令。 项目右键「关联 SSH」勾选连接即按项目启用，也可整组关联（组内后加的连接自动生效） |
 | **Markdown 预览** | 文件树点开 `.md` 即按块虚拟化渲染（长文档滚动不重排整篇）：```` ```mermaid ```` 围栏纯 Rust 渲染成图表（不依赖浏览器 / Node，跟随亮暗主题，出错退回代码块；点击图表整窗放大，滚轮缩放、拖动平移）、本地与网络图片、GFM 表格、链接按四类处置（外链先确认、锚点滚到标题、本地文件开新页签），行内代码按主题强调色显示（橙字深底）；顶层标题两条以上时左侧出**目录栏**，点击跳到章节、当前章节随滚动高亮，工具栏「目录」开合所有页签共用、跨启动记住 |
@@ -100,7 +100,7 @@ https://github.com/user-attachments/assets/8a9c1dca-7289-4ab6-af1f-5158df7368a4
 | Git / 文件 | git2（libgit2）· notify + ignore |
 | 用量统计 | rusqlite 本地账本 · 自绘趋势图 |
 | 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`） |
-| 测试 | **2175 个 Rust 测试**（33 个测试目标） |
+| 测试 | **2241 个 Rust 测试**（33 个测试目标） |
 
 ---
 
