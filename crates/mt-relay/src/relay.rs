@@ -18,7 +18,7 @@ use mt_relay_protocol::{
     MobilePane, MobileProject, RelayToDesktop, StartSessionFailReason, PROTOCOL_VERSION,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::host::{AiLauncher, RelayEvents, RelayHost};
@@ -30,6 +30,24 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 镜像会话文件轮询间隔。
 const MIRROR_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// 移动端指令:正文写进 PTY 之后、单独补写提交回车之前的间隔。
+///
+/// 正文与回车**分两次写、中间隔一段**,模仿真人「粘贴 → 按回车」。此前一次写入
+/// `正文\r`,长指令的回车被当成正文里的换行、没有提交(E2E:约 30 字正常,121 字
+/// 中文、约 230 字的 curl 只进了输入框)。根因在 Claude Code(2.1.292)的 stdin 分词:
+/// 一次读到的数据 ≥ 64 个 UTF-16 码元时,控制字符(退格除外)不再切成单独的按键,
+/// `\r` 留在文本块里被输入框当换行插入 —— 30 字 + `\r` 不到 64,长指令超了。
+/// 所以回车必须落在 agent 的**另一次读**里:
+/// - bracketed paste 开着(Claude Code 会开;实测便携与系统 ConPTY 都把 `?2004h`
+///   透给终端、把 `ESC[200~` / `ESC[201~` 原样交给 agent):正文包成
+///   `ESC[200~ … ESC[201~`,结束标记之后的 `\r` 必定切成独立的回车键,与读的批次
+///   无关(Claude Code 自己往 PTY 里给会话回话也是「包裹正文 → 10ms 后单独写 `\r`」);
+/// - 没开:只能靠间隔让 agent 先把正文读走 —— 事件循环被渲染占住期间到的输入,
+///   下一次读会并成一块。实测(ConPTY + Bun 回显探针,事件循环每 100ms 忙 80ms):
+///   间隔 30ms 时 10 次里并块 5 次,150ms 时 0 次;空闲时 1ms 就分得开。取 150ms,
+///   比真人粘贴后按回车还快,只多压回执一拍。
+const MOBILE_SUBMIT_DELAY: Duration = Duration::from_millis(150);
 
 /// 启发式绑定(无 hook 会话身份)**已绑上**时多久重新定位一次。
 ///
@@ -322,6 +340,11 @@ pub struct MobileRelayManager {
     /// 每 pane 最近成功写入的移动端指令原文:会话记录回流时把匹配的
     /// user 消息来源改标为 "mobile"(见 relabel_mobile_sources)
     recent_mobile_cmds: Mutex<HashMap<String, Vec<MobileCmd>>>,
+    /// 上一条移动端指令写完(含提交回车)的信号:指令按到达顺序串行写入,
+    /// 见 [`handle_mobile_command`]
+    command_tail: Mutex<Option<oneshot::Receiver<()>>>,
+    /// 指令正文与提交回车之间的间隔:生产恒为 [`MOBILE_SUBMIT_DELAY`],单测改短
+    submit_delay: Duration,
     /// 桌面侧状态查询(项目表 / 启动器 / PTY 写穿 / AI 会话身份)
     host: Arc<dyn RelayHost>,
     /// 状态与动作出口(原来的四个 Tauri 事件)
@@ -345,6 +368,8 @@ impl MobileRelayManager {
             pane_ptys: Mutex::new(HashMap::new()),
             mirror_subs: Mutex::new(HashMap::new()),
             recent_mobile_cmds: Mutex::new(HashMap::new()),
+            command_tail: Mutex::new(None),
+            submit_delay: MOBILE_SUBMIT_DELAY,
             host,
             events,
             spawner: OnceLock::new(),
@@ -639,6 +664,30 @@ impl MobileRelayManager {
             ok: result.is_ok(),
             reason: result.err(),
         });
+    }
+
+    /// 把一条移动端指令写穿到 pane:正文 → 等 [`Self::submit_delay`] → 单独一个 `\r`
+    /// (为什么分两次写见 [`MOBILE_SUBMIT_DELAY`])。两次写同一个 PTY;回车写不进去
+    /// 同样算失败 —— 正文停在输入框里没提交,回执不能报成功。
+    ///
+    /// 等待是 `tokio::time::sleep`,不占运行时线程,也不持任何锁。
+    async fn write_mobile_command(
+        &self,
+        pane_id: &str,
+        text: &str,
+    ) -> Result<(), CommandFailReason> {
+        let pty_id = self.pane_ptys.lock().get(pane_id).copied();
+        let pty_id = pty_id.ok_or(CommandFailReason::PaneNotFound)?;
+        if !text.is_empty() {
+            let body = mobile_command_body(text, self.host.bracketed_paste(pty_id));
+            self.host
+                .write_pty(pty_id, body)
+                .map_err(|_| CommandFailReason::WriteFailed)?;
+            tokio::time::sleep(self.submit_delay).await;
+        }
+        self.host
+            .write_pty(pty_id, "\r".into())
+            .map_err(|_| CommandFailReason::WriteFailed)
     }
 
     /// 增量泵一次镜像:读绑定文件的新字节喂解析器,新消息改标来源、并入缓存并
@@ -1077,7 +1126,7 @@ fn handle_relay_message(manager: &Arc<MobileRelayManager>, text: &str) {
             pane_id,
             before_seq,
         }) => manager.send_mirror_history(&pane_id, before_seq),
-        // 移动端指令:到达即写入目标 pane 的 PTY(写穿,不排队),随即回执
+        // 移动端指令:按到达顺序写穿目标 pane 的 PTY(正文与回车分两次写),写完回执
         Ok(RelayToDesktop::MobileCommand {
             pane_id,
             command_id,
@@ -1211,31 +1260,56 @@ fn resolve_launcher(
         .ok_or(StartSessionFailReason::LauncherNotFound)
 }
 
-/// 写穿移动端指令:等价本人在桌面对该终端敲入同样内容并回车。
-/// 回执仅表示"已写入 PTY",AI 真正接收以镜像回流为准。
+/// 写穿移动端指令:等价本人在桌面对该终端粘贴同样内容、再按回车。走宿主的
+/// 写穿口(输入跟踪 / AI marker / SSH autofill 解除全语义);AI 工作中依赖 CLI
+/// 自身的输入缓冲。回执仅表示"已写入 PTY"(正文与回车都写进去了),AI 真正接收
+/// 以镜像回流为准。
+///
+/// 正文与回车之间要隔一段([`MOBILE_SUBMIT_DELAY`]),不能在连接循环里干等:整条
+/// 丢进运行时异步写。多条指令**按到达顺序串行**——每条先等上一条连同回车写完
+/// 再动手,否则紧挨着到的两条会交错成「正文A 正文B \r \r」。接龙(换上自己的完成
+/// 信号、拿走上一条的)在这里同步做,连接循环又是逐条处理消息,队序即到达序。
 fn handle_mobile_command(
     manager: &Arc<MobileRelayManager>,
     pane_id: String,
     command_id: String,
     text: String,
 ) {
-    let pty_id = manager.pane_ptys.lock().get(&pane_id).copied();
-    let result = match pty_id {
-        None => Err(CommandFailReason::PaneNotFound),
-        Some(pty_id) => {
-            // 走宿主的写穿口(输入跟踪/AI marker/SSH autofill 解除全语义),
-            // 文本 + \r 一次写入 = 敲入内容并回车;AI 工作中依赖 CLI 自身输入缓冲
-            let data = format!("{text}\r");
-            manager
-                .host
-                .write_pty(pty_id, data)
-                .map_err(|_| CommandFailReason::WriteFailed)
+    let (done_tx, done_rx) = oneshot::channel::<()>();
+    let prev = manager.command_tail.lock().replace(done_rx);
+    let task_manager = Arc::clone(manager);
+    // 连接循环本就跑在这个运行时上,不会落到「运行时建不起来」那一支
+    manager.spawn(async move {
+        // 上一条的任务没了(panic / 运行时收摊)时 Err,同样放行
+        if let Some(prev) = prev {
+            let _ = prev.await;
         }
-    };
-    if result.is_ok() {
-        manager.record_mobile_cmd(&pane_id, &text);
+        let result = task_manager.write_mobile_command(&pane_id, &text).await;
+        if result.is_ok() {
+            task_manager.record_mobile_cmd(&pane_id, &text);
+        }
+        task_manager.send_command_receipt(pane_id, command_id, result);
+        let _ = done_tx.send(());
+    });
+}
+
+/// 移动端指令正文 → 写进 PTY 的那一段(不含提交回车)。
+///
+/// - bracketed paste 开着:与桌面端粘贴(mt-ui `paste_to_bytes`)同一编码 —— 换行
+///   归一成 `\r`、剔掉正文里的结束标记(防正文提前「结束粘贴」、后半段被当按键)、
+///   包上 `ESC[200~ … ESC[201~`。多行指令因此整块是粘贴内容,中途不会提交;
+/// - 没开:裸写,换行一律归一成 `\n`(LF = Ctrl+J,Claude Code 输入框里是「插入
+///   换行」),只让随后单独写的那个 `\r` 承担提交。
+fn mobile_command_body(text: &str, bracketed: bool) -> String {
+    if bracketed {
+        let body = text
+            .replace("\r\n", "\r")
+            .replace('\n', "\r")
+            .replace("\x1b[201~", "");
+        format!("\x1b[200~{body}\x1b[201~")
+    } else {
+        text.replace("\r\n", "\n").replace('\r', "\n")
     }
-    manager.send_command_receipt(pane_id, command_id, result);
 }
 
 /// 移动端点选作答:回执复用 CommandReceipt,成功时登记选中项供回流改标来源。
@@ -2016,6 +2090,224 @@ mod tests {
         let list = &map["pane-1"];
         assert_eq!(list.len(), MOBILE_CMD_KEEP);
         assert_eq!(list[0].text, "cmd 5");
+    }
+
+    // ── 移动端指令写穿:正文与提交回车分两次写 ──
+
+    /// 记下每一次 PTY 写入的宿主。`bracketed` 模拟终端里的 agent 开没开
+    /// bracketed paste,`reject` 让写入一律失败(PTY 已没了)。
+    #[derive(Default)]
+    struct RecordingHost {
+        writes: Mutex<Vec<(u32, String)>>,
+        bracketed: bool,
+        reject: bool,
+    }
+
+    impl RelayHost for RecordingHost {
+        fn launchers(&self) -> Vec<AiLauncher> {
+            Vec::new()
+        }
+        fn project(&self, _project_id: &str) -> Option<RelayProject> {
+            None
+        }
+        fn write_pty(&self, pty_id: u32, data: String) -> Result<(), String> {
+            if self.reject {
+                return Err("pty gone".into());
+            }
+            self.writes.lock().push((pty_id, data));
+            Ok(())
+        }
+        fn bracketed_paste(&self, _pty_id: u32) -> bool {
+            self.bracketed
+        }
+        fn hook_session(&self, _pty_id: u32) -> Option<HookSessionId> {
+            None
+        }
+        fn ai_session_agent(&self, _pty_id: u32) -> Option<String> {
+            None
+        }
+        fn ai_session_started_at(&self, _pty_id: u32) -> Option<SystemTime> {
+            None
+        }
+    }
+
+    /// 接上真运行时的 manager:pane-1 → PTY 7,出站通道接到测试手里收回执。
+    struct CommandFixture {
+        rt: tokio::runtime::Runtime,
+        manager: Arc<MobileRelayManager>,
+        host: Arc<RecordingHost>,
+        outbound: mpsc::UnboundedReceiver<DesktopToRelay>,
+    }
+
+    type Receipt = (String, bool, Option<CommandFailReason>);
+
+    impl CommandFixture {
+        fn new(host: RecordingHost, submit_delay: Duration) -> Self {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_time()
+                .build()
+                .unwrap();
+            let host = Arc::new(host);
+            let mut manager = MobileRelayManager::with_runtime(
+                host.clone(),
+                Arc::new(NoopRelayHost),
+                rt.handle().clone(),
+            );
+            manager.submit_delay = submit_delay;
+            manager.pane_ptys.lock().insert("pane-1".into(), 7);
+            let (tx, outbound) = mpsc::unbounded_channel();
+            *manager.outbound.lock() = Some(tx);
+            Self {
+                rt,
+                manager: Arc::new(manager),
+                host,
+                outbound,
+            }
+        }
+
+        fn send(&self, pane_id: &str, command_id: &str, text: &str) {
+            handle_mobile_command(
+                &self.manager,
+                pane_id.into(),
+                command_id.into(),
+                text.into(),
+            );
+        }
+
+        /// 按到达顺序等齐 n 条指令回执(超时即失败)。
+        fn receipts(&mut self, n: usize) -> Vec<Receipt> {
+            let outbound = &mut self.outbound;
+            self.rt.block_on(async move {
+                let mut out = Vec::new();
+                while out.len() < n {
+                    let msg = tokio::time::timeout(Duration::from_secs(5), outbound.recv())
+                        .await
+                        .expect("等回执超时")
+                        .expect("出站通道已关");
+                    if let DesktopToRelay::CommandReceipt {
+                        command_id,
+                        ok,
+                        reason,
+                        ..
+                    } = msg
+                    {
+                        out.push((command_id, ok, reason));
+                    }
+                }
+                out
+            })
+        }
+
+        fn writes(&self) -> Vec<String> {
+            self.host
+                .writes
+                .lock()
+                .iter()
+                .map(|(_, data)| data.clone())
+                .collect()
+        }
+    }
+
+    fn ok_receipt(command_id: &str) -> Receipt {
+        (command_id.into(), true, None)
+    }
+
+    /// 正文与回车分两次写、先正文后回车、同一个 PTY;两次都写完才回执成功,
+    /// 并登记原文供回流改标。
+    #[test]
+    fn mobile_command_writes_text_then_enter_separately() {
+        let mut fx = CommandFixture::new(RecordingHost::default(), Duration::from_millis(1));
+        let text = "解释一下 crates/mt-relay/src/relay.rs 里镜像轮询为什么要丢进阻塞线程池";
+        fx.send("pane-1", "c1", text);
+        assert_eq!(fx.receipts(1), [ok_receipt("c1")]);
+        assert_eq!(fx.writes(), [text, "\r"]);
+        assert!(fx.host.writes.lock().iter().all(|(pty, _)| *pty == 7));
+        let registry = fx.manager.recent_mobile_cmds.lock();
+        assert_eq!(registry["pane-1"][0].text, text);
+    }
+
+    /// 终端开着 bracketed paste:正文按桌面粘贴同一编码包裹(多行的换行归一成
+    /// `\r`,只是粘贴内容),提交回车照旧单独写在结束标记之后。
+    #[test]
+    fn mobile_command_wraps_body_when_bracketed_paste_is_on() {
+        let host = RecordingHost {
+            bracketed: true,
+            ..Default::default()
+        };
+        let mut fx = CommandFixture::new(host, Duration::from_millis(1));
+        fx.send("pane-1", "c1", "第一行\n第二行");
+        assert_eq!(fx.receipts(1), [ok_receipt("c1")]);
+        assert_eq!(fx.writes(), ["\x1b[200~第一行\r第二行\x1b[201~", "\r"]);
+    }
+
+    /// 紧挨着到的几条指令不交错:每条等上一条连同回车写完才动手,回执也按到达序。
+    #[test]
+    fn mobile_commands_are_written_one_by_one_in_arrival_order() {
+        let mut fx = CommandFixture::new(RecordingHost::default(), Duration::from_millis(30));
+        fx.send("pane-1", "c1", "A");
+        fx.send("pane-1", "c2", "B");
+        fx.send("pane-1", "c3", "C");
+        assert_eq!(
+            fx.receipts(3),
+            [ok_receipt("c1"), ok_receipt("c2"), ok_receipt("c3")]
+        );
+        assert_eq!(fx.writes(), ["A", "\r", "B", "\r", "C", "\r"]);
+    }
+
+    /// 写不进去:回执报 WriteFailed,不补写回车、不登记;pane 不在映射里报
+    /// PaneNotFound。失败的那条不卡住后面的队伍。
+    #[test]
+    fn mobile_command_failures_report_and_skip_enter() {
+        let host = RecordingHost {
+            reject: true,
+            ..Default::default()
+        };
+        let mut fx = CommandFixture::new(host, Duration::from_millis(1));
+        fx.send("pane-1", "c1", "hi");
+        fx.send("ghost", "c2", "hi");
+        assert_eq!(
+            fx.receipts(2),
+            [
+                ("c1".into(), false, Some(CommandFailReason::WriteFailed)),
+                ("c2".into(), false, Some(CommandFailReason::PaneNotFound)),
+            ]
+        );
+        assert!(fx.writes().is_empty());
+        assert!(fx.manager.recent_mobile_cmds.lock().is_empty());
+    }
+
+    /// 正文编码:裸写时换行一律归一成 LF(只让最后单独的 `\r` 提交);包裹时与
+    /// 桌面粘贴同口径 —— 换行归一成 CR、剔掉内嵌的结束标记。
+    #[test]
+    fn mobile_command_body_encoding() {
+        assert_eq!(mobile_command_body("a\r\nb\rc\nd", false), "a\nb\nc\nd");
+        assert_eq!(
+            mobile_command_body("a\r\nb\nc", true),
+            "\x1b[200~a\rb\rc\x1b[201~"
+        );
+        assert_eq!(
+            mobile_command_body("x\x1b[201~y", true),
+            "\x1b[200~xy\x1b[201~"
+        );
+    }
+
+    /// 新版 Claude 的立即执行本地命令(`/usage`)命令行记在 system 行:镜像里显示成
+    /// 键入形态 `/usage`,移动端发的同文指令照样改标「移动端」;输出行不进镜像。
+    #[test]
+    fn local_command_system_line_is_mirrored_and_relabeled() {
+        let fx = MirrorFixture::new("local-command");
+        let a = fx.dir.join("a.jsonl");
+        let command = r#"{"type":"system","subtype":"local_command","content":"<command-name>/usage</command-name>\n            <command-message>usage</command-message>\n            <command-args></command-args>","level":"info","timestamp":"2026-01-01T00:00:00.000Z","uuid":"u1","isMeta":false}"#;
+        let output = r#"{"type":"system","subtype":"local_command","content":"<local-command-stdout>Total cost: $0.00</local-command-stdout>","level":"info","timestamp":"2026-01-01T00:00:00.000Z","uuid":"u2","isMeta":false,"commandRun":{"command":"usage","args":""}}"#;
+        std::fs::write(&a, format!("{command}\n{output}\n")).unwrap();
+        fx.manager
+            .record_mobile_cmd_at("pane-1", "/usage", at("2025-12-31T23:59:59Z"));
+        *fx.host.hook.lock() = hook("sid-a");
+        let locate = |_: &str, _: &LocateKey| Some((a.clone(), MirrorAgent::Claude));
+        fx.round(&mut MirrorLocator::default(), Instant::now(), locate);
+        assert_eq!(fx.texts(), ["/usage"]);
+        assert_eq!(sources(&fx.job.messages.lock()), ["mobile"]);
     }
 
     #[test]
