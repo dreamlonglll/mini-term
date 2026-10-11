@@ -417,6 +417,9 @@ body {
   flex-direction: column;
   gap: 12px;
   min-height: 0;
+  /* 加载更早历史时由 JS 自己保持阅读位置(iOS Safari 的滚动锚定靠不住);
+     关掉浏览器那份,免得支持锚定的浏览器再补偿一次 */
+  overflow-anchor: none;
 }
 
 .mirror-load-older {
@@ -495,6 +498,256 @@ body {
   font: inherit;
   white-space: pre-wrap;
   word-break: break-word;
+}
+
+/* 长输入折叠:超过 320px 收到 200px,底部渐隐。用 mask 而不是盖一层渐变色块——
+   输入气泡是半透明蓝底,色块对不上底色 */
+.input-clip.is-collapsed {
+  max-height: 200px;
+  overflow: hidden;
+  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 64px), transparent);
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 64px), transparent);
+}
+
+.input-toggle {
+  display: block;
+  margin: 8px 0 0 auto;
+  min-height: 34px;
+  padding: 6px 14px;
+  border-radius: 8px;
+  border: 1px solid rgba(74, 158, 255, 0.45);
+  background: rgba(74, 158, 255, 0.1);
+  color: var(--accent);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.input-toggle:active {
+  background: rgba(74, 158, 255, 0.22);
+}
+
+/* ── 打断标记:居中的灰色小提示 ── */
+
+.mirror-interrupt {
+  align-self: center;
+  flex-shrink: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 5px 14px;
+  border: 1px solid var(--border-subtle);
+  border-radius: 999px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+/* ── 工具活动折叠条 ── */
+
+.tool-group {
+  align-self: flex-start;
+  flex-shrink: 0;
+  /* 定宽而不是随内容伸缩:「最近」一栏每秒在变,宽度跟着跳读起来很吵 */
+  width: 92%;
+  border: 1px solid var(--border-subtle);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.tool-group-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-height: 42px;
+  padding: 9px 14px 9px 12px;
+  background: transparent;
+  border: none;
+  border-radius: 12px;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.tool-group-head:active {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.tool-group-chevron {
+  flex-shrink: 0;
+  width: 14px;
+  font-size: 17px;
+  line-height: 1;
+  text-align: center;
+  color: var(--text-muted);
+  transition: transform 0.15s ease;
+}
+
+.tool-group.is-expanded .tool-group-chevron {
+  transform: rotate(90deg);
+}
+
+.tool-group-count {
+  flex-shrink: 0;
+  font-weight: 600;
+}
+
+.tool-group-latest {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+}
+
+.tool-group-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px 14px 12px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.tool-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  min-width: 0;
+}
+
+.tool-name {
+  flex-shrink: 0;
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: rgba(74, 158, 255, 0.14);
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.6;
+}
+
+/* 目标摘要(路径 / 命令首行):等宽、长了折行,最多 3 行 */
+.tool-target {
+  flex: 1;
+  min-width: 0;
+  font-family: Consolas, Menlo, monospace;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  overflow: hidden;
+}
+
+/* ── 尾部状态行:AI 工作中 / 等你处理 ── */
+
+.mirror-activity {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border-radius: 12px;
+  font-size: 14px;
+  /* 入场是自下而上的位移,不从透明起播(深色底上淡入读起来像闪烁) */
+  animation: activityEnter 0.24s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.mirror-activity.is-working {
+  align-self: flex-start;
+  padding: 10px 16px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+}
+
+.mirror-activity.is-attention {
+  align-self: stretch;
+  padding: 12px 16px;
+  background: rgba(224, 169, 60, 0.14);
+  border: 1px solid rgba(224, 169, 60, 0.55);
+}
+
+/* 已有可作答的提问卡片时只轻声指路:卡片本身已是醒目的黄框 */
+.mirror-activity.is-answer {
+  align-self: flex-start;
+  padding: 8px 14px;
+  border: 1px dashed rgba(224, 169, 60, 0.45);
+  color: var(--color-attention);
+  font-size: 13px;
+}
+
+.activity-badge {
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: var(--color-attention);
+  color: #1a1a1a;
+  font-size: 15px;
+  font-weight: 700;
+  line-height: 24px;
+  text-align: center;
+}
+
+.activity-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.activity-title {
+  color: var(--color-attention);
+  font-weight: 600;
+}
+
+.activity-hint {
+  color: var(--text-secondary);
+  font-size: 12.5px;
+}
+
+/* 三点依次上下跳:循环动效只动 transform,不做透明度闪烁 */
+.activity-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 16px;
+}
+
+.activity-dots > span {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: activityBounce 1.2s ease-in-out infinite;
+}
+
+.activity-dots > span:nth-child(2) {
+  animation-delay: 0.15s;
+}
+
+.activity-dots > span:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+@keyframes activityEnter {
+  from { transform: translateY(14px); }
+  to { transform: translateY(0); }
+}
+
+@keyframes activityBounce {
+  0%, 60%, 100% { transform: translateY(0); }
+  30% { transform: translateY(-6px); }
 }
 
 /* ── agent 提问卡片 ── */
@@ -649,6 +902,151 @@ body {
   border-left: 3px solid var(--border-subtle);
   padding-left: 10px;
   color: var(--text-secondary);
+}
+
+.markdown del {
+  color: var(--text-muted);
+}
+
+/* 代码块:顶栏(语言名 + 复制按钮)+ 代码。外边距用单类选择器写,优先级低于
+   上面的 `.markdown > *:first-child`,首尾块照旧贴边 */
+.code-block {
+  margin: 8px 0;
+  background: #141414;
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.code-block-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 3px 4px 3px 12px;
+  border-bottom: 1px solid var(--border-subtle);
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.code-block-lang {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: Consolas, Menlo, monospace;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+/* 触控目标不小于 32px */
+.code-copy {
+  flex-shrink: 0;
+  min-width: 64px;
+  min-height: 32px;
+  padding: 4px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border-subtle);
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.code-copy:active {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.code-copy.is-copied {
+  color: var(--color-success);
+  border-color: rgba(76, 175, 120, 0.55);
+}
+
+.code-copy.is-failed {
+  color: var(--color-error);
+  border-color: rgba(224, 92, 92, 0.55);
+}
+
+.code-block pre {
+  margin: 0;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+}
+
+/* GFM 表格:外层容器负责横向滚动与圆角边框,宽表在窄屏上自己滚,不撑破气泡 */
+.md-table-wrap {
+  margin: 8px 0;
+  max-width: 100%;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+}
+
+.markdown table {
+  min-width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.markdown th,
+.markdown td {
+  padding: 8px 12px;
+  border-right: 1px solid var(--border-subtle);
+  border-bottom: 1px solid var(--border-subtle);
+  vertical-align: top;
+}
+
+/* 外圈边框由容器画,单元格贴边那一侧不再重复 */
+.markdown th:last-child,
+.markdown td:last-child {
+  border-right: none;
+}
+
+.markdown tbody tr:last-child td {
+  border-bottom: none;
+}
+
+/* 表头默认居中;GFM 的列对齐会以内联 style 下发,优先级高于这里 */
+.markdown th {
+  background: rgba(255, 255, 255, 0.06);
+  font-weight: 600;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.markdown tbody tr:nth-child(even) td {
+  background: rgba(255, 255, 255, 0.025);
+}
+
+/* GFM 任务列表:去掉圆点,复选框代替列表符 */
+.markdown .contains-task-list {
+  list-style: none;
+  padding-left: 4px;
+}
+
+.markdown .contains-task-list .contains-task-list {
+  padding-left: 22px;
+}
+
+.markdown .task-list-item input[type='checkbox'] {
+  width: 15px;
+  height: 15px;
+  margin: 0 8px 0 0;
+  vertical-align: -2px;
+  accent-color: var(--accent);
+}
+
+/* GFM 脚注区的「Footnotes」标题是给读屏用的 */
+.markdown .sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
 }
 
 /* ── 指令输入区 ── */
@@ -1023,6 +1421,12 @@ body {
   /* 例外：下拉刷新的 spinner 是「正在刷新」的唯一反馈，停住就等于假装卡死。
      放慢而不是取消 —— 小幅匀速旋转不属于 reduced-motion 要消除的那类动效。 */
   .pull-indicator .spinner {
+    animation-duration: 2.4s;
+  }
+
+  /* 镜像页「AI 工作中」的三点同理:停住就像卡死了,放慢即可。
+     状态行的入场位移是一次性的换场,不在此列 */
+  .activity-dots > span {
     animation-duration: 2.4s;
   }
 }
