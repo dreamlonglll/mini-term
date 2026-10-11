@@ -474,7 +474,12 @@ body {
   opacity: 0.8;
 }
 
+/* max-width:外层 .mirror-msg 是 align-items:flex-start 的纵向 flex,气泡宽度按内容
+   取 fit-content —— 宽表(th nowrap)、长代码行的最小内容宽度会把它撑出屏幕,
+   表格容器 / pre 自己的横向滚动就落空了,变成整个消息列表横着滚。夹到父宽,
+   宽内容才在气泡里自己滚 */
 .mirror-msg-body {
+  max-width: 100%;
   border-radius: 12px;
   padding: 9px 12px;
   font-size: 14px;
