@@ -729,28 +729,54 @@ fn claude_user_text(content: Option<&serde_json::Value>) -> Option<String> {
     Some(text)
 }
 
-/// 解析 Claude JSONL 的一行为消息。非 user/assistant / 空内容 / 非 JSON → None。
+/// Claude system 行里用户键入的本地斜杠命令,还原成 `/x args`。其余 system 行 → None。
+///
+/// 新版 Claude Code 对「立即执行」的本地命令(如 `/usage`、`/context`)把**命令行**
+/// 也记成 `type:"system", subtype:"local_command"`,`content` 是与 user 行同一套的
+/// `<command-name>` / `<command-message>` / `<command-args>` 标签;另一些本地命令
+/// (如 `/clear`)的命令行仍是 user 行。两种情况下命令输出都另起一条同 subtype 的
+/// system 行,`content` 以 `<local-command-stdout>`(出错时 `<local-command-stderr>`)
+/// 开头,另带结构化的 `commandRun` 字段。
+///
+/// 只认**以命令标签开头**的命令行:输出行、以及同 subtype 下的其他提示文本
+/// (会话恢复 / 更新提示之类)都不是用户键入,一律不出。
+fn claude_local_command_text(obj: &serde_json::Value) -> Option<String> {
+    if obj.get("subtype").and_then(|s| s.as_str()) != Some("local_command") {
+        return None;
+    }
+    let head = obj.get("content")?.as_str()?.trim_start();
+    if !(head.starts_with("<command-name>") || head.starts_with("<command-message>")) {
+        return None;
+    }
+    claude_slash_command_text(head)
+}
+
+/// 解析 Claude JSONL 的一行为消息。非 user/assistant(本地命令的 system 行除外)/
+/// 空内容 / 非 JSON → None。
 /// 行级纯函数,本地与远程(SFTP)两条正文读取路径、移动端对话镜像共用。
 ///
 /// 只留对话正文:带 `CLAUDE_NON_DIALOGUE_FLAGS` 标记的行整行跳过(两种角色都是),
 /// user 行再经 `claude_user_text` 滤掉系统注入。镜像依赖这一口径判断「用户动过」:
 /// 能解析出的 user 消息才清挂起提问,回合中途注入的 skill 正文等不算。
+///
+/// 例外一条 system 行:立即执行的本地斜杠命令(见 [`claude_local_command_text`])
+/// 是用户亲手键入的,按 user 消息给出 `/x args`,与 user 行里的斜杠命令同一形态
+/// —— 三处读者(镜像 / 本地面板 / SFTP 面板)都该显示它,移动端发的同文指令也据此
+/// 对得上来源改标;它同样清镜像的挂起提问(用户确实动过)。
 pub fn claude_message_from_line(line: &str) -> Option<AiSessionMessage> {
     let obj: serde_json::Value = serde_json::from_str(line).ok()?;
-
-    let role = match obj.get("type").and_then(|t| t.as_str()) {
-        Some("user") => "user",
-        Some("assistant") => "assistant",
-        _ => return None,
-    };
     if is_claude_non_dialogue_line(&obj) {
         return None;
     }
 
-    let content = if role == "user" {
-        claude_user_text(obj.pointer("/message/content"))?
-    } else {
-        extract_text_content(obj.pointer("/message/content"))
+    let (role, content) = match obj.get("type").and_then(|t| t.as_str()) {
+        Some("user") => ("user", claude_user_text(obj.pointer("/message/content"))?),
+        Some("assistant") => (
+            "assistant",
+            extract_text_content(obj.pointer("/message/content")),
+        ),
+        Some("system") => ("user", claude_local_command_text(&obj)?),
+        _ => return None,
     };
     if content.is_empty() {
         return None;
@@ -1643,6 +1669,90 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    /// system 行(形状取自 2.1.292 真机记录,正文为合成):`subtype` + 字符串
+    /// `content`,外加 `level` / `isMeta` 与可选的 `commandRun`。
+    fn claude_system_line(
+        subtype: &str,
+        content: &str,
+        command_run: Option<(&str, &str)>,
+    ) -> String {
+        let mut obj = serde_json::json!({
+            "parentUuid": "p1",
+            "isSidechain": false,
+            "type": "system",
+            "subtype": subtype,
+            "content": content,
+            "level": "info",
+            "timestamp": "2026-10-10T08:00:00.000Z",
+            "uuid": "u1",
+            "isMeta": false,
+            "version": "2.1.292",
+        });
+        if let Some((command, args)) = command_run {
+            obj["commandRun"] = serde_json::json!({"command": command, "args": args});
+        }
+        obj.to_string()
+    }
+
+    /// 立即执行的本地命令(`/usage` 等)的命令行记成 system local_command:
+    /// 按 user 消息还原成键入形态,内容与移动端登记的原文逐字相等(改标对得上)。
+    #[test]
+    fn claude_message_parses_system_local_command_line() {
+        let line = claude_system_line(
+            "local_command",
+            "<command-name>/usage</command-name>\n            <command-message>usage</command-message>\n            <command-args></command-args>",
+            None,
+        );
+        let m = claude_message_from_line(&line).expect("命令行应解析成消息");
+        assert_eq!(m.role, "user");
+        assert_eq!(m.content, "/usage");
+        assert_eq!(m.timestamp, "2026-10-10T08:00:00.000Z");
+    }
+
+    /// 带参数的本地命令:参数去首尾空白后拼在命令名后。
+    #[test]
+    fn claude_message_parses_system_local_command_with_args() {
+        let line = claude_system_line(
+            "local_command",
+            "<command-name>/context</command-name>\n            <command-message>context</command-message>\n            <command-args>  all files </command-args>",
+            None,
+        );
+        assert_eq!(
+            claude_user_content(&line).as_deref(),
+            Some("/context all files")
+        );
+    }
+
+    /// 本地命令的输出行(stdout / stderr,带 commandRun)不是用户键入:整条丢弃。
+    #[test]
+    fn claude_message_drops_system_local_command_output() {
+        for content in [
+            "<local-command-stdout>Total cost: $0.00</local-command-stdout>",
+            "<local-command-stderr>Unknown option</local-command-stderr>",
+        ] {
+            let line = claude_system_line("local_command", content, Some(("usage", "")));
+            assert!(claude_message_from_line(&line).is_none(), "{content}");
+        }
+    }
+
+    /// 其余 system 行照旧不出:别的 subtype,以及 local_command 下不以命令标签
+    /// 开头的提示文本;带非对话标记的命令行也不出。
+    #[test]
+    fn claude_message_skips_other_system_lines() {
+        for (subtype, content) in [
+            ("turn_duration", ""),
+            ("stop_hook_summary", ""),
+            ("informational", "<command-name>/x</command-name>"),
+            ("compact_boundary", "Conversation compacted"),
+            ("local_command", "Session resumed"),
+        ] {
+            let line = claude_system_line(subtype, content, None);
+            assert!(claude_message_from_line(&line).is_none(), "{subtype}");
+        }
+        let meta = r#"{"type":"system","subtype":"local_command","isMeta":true,"content":"<command-name>/usage</command-name>","timestamp":"t"}"#;
+        assert!(claude_message_from_line(meta).is_none());
     }
 
     /// `!` 命令的输入是用户键入的:还原成 `!cmd`。

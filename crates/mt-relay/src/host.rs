@@ -63,6 +63,13 @@ pub trait RelayHost: Send + Sync + 'static {
     /// (输入跟踪 / AI marker / SSH autofill 解除一个都不能少)。
     fn write_pty(&self, pty_id: u32, data: String) -> Result<(), String>;
 
+    /// 该 PTY 的终端此刻是否开着 bracketed paste(DECSET 2004,由终端里跑的程序开关)。
+    /// 移动端指令据此决定正文要不要包 `ESC[200~ … ESC[201~` —— 与桌面端粘贴同一判据。
+    /// 默认 false:不知道就按没开处理(正文裸写,提交回车靠间隔分开写,见 relay.rs)。
+    fn bracketed_paste(&self, _pty_id: u32) -> bool {
+        false
+    }
+
     /// hook 上报过的会话身份(pty → agent + session_id);None = 未启用 hook 或尚未上报。
     /// 镜像绑定的第一层就靠它精确定位会话文件。
     fn hook_session(&self, pty_id: u32) -> Option<HookSessionId>;

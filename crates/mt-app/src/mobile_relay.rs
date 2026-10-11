@@ -17,13 +17,14 @@
 //!
 //! # 为什么必须过 channel
 //!
-//! [`RelayHost`] / [`RelayEvents`] 的**十个方法全部在 mt-relay 自持的 tokio 运行时
+//! [`RelayHost`] / [`RelayEvents`] 的**十一个方法全部在 mt-relay 自持的 tokio 运行时
 //! 上被同步调用**(`host.rs:14-15`),而 gpui 的 `Entity` 只能在主线程碰。分工:
 //!
 //! - 四个 events + `write_pty` → channel 回主线程([`RelaySignal`]);
 //! - 三个 AI 查询(`hook_session` / `ai_session_agent` / `ai_session_started_at`)
 //!   → **直接透传** [`AiBridge`](它内部全是 `Arc` + `Mutex`,本来就跨线程安全);
-//! - `launchers` / `project` → 主线程刷新的[镜像快照](HostMirror)。
+//! - `launchers` / `project` → 主线程刷新的[镜像快照](HostMirror);
+//! - `bracketed_paste` → 镜像里存的终端模拟器 `Arc` 句柄,现读 VT 模式位。
 //!
 //! # tokio 运行时
 //!
@@ -52,6 +53,8 @@ use mt_relay::{
     MobileRelayManager, MobileRelayStatusPayload, RenamePanePayload, StartSessionFailReason,
     StartSessionPayload, SyncPane, SyncProject,
 };
+use mt_terminal::TerminalEmulator;
+use mt_terminal::alacritty_terminal::term::TermMode;
 use parking_lot::Mutex;
 
 use crate::ai::AiBridge;
@@ -97,6 +100,17 @@ struct HostMirror {
     launchers: Vec<mt_relay::AiLauncher>,
     projects: HashMap<String, RelayProject>,
     live_ptys: HashSet<u32>,
+    /// 活 PTY 的终端模拟器句柄:`bracketed_paste` 拿它**现读** VT 模式位,
+    /// 不吃快照的陈旧度(agent 启动那一刻才开 bracketed paste)
+    emulators: HashMap<u32, Arc<TerminalEmulator>>,
+}
+
+/// 该 PTY 的终端此刻开没开 bracketed paste —— 与桌面端粘贴(`paste_to_bytes`)
+/// 同一判据。镜像里还没有它(刚建的 pane 等下一轮刷新)按没开处理。
+/// 句柄先取出再读模式位:不持着镜像锁去等终端锁(reader 线程推进 grid 时持它)。
+fn bracketed_paste_of(mirror: &Mutex<HostMirror>, pty_id: u32) -> bool {
+    let emulator = mirror.lock().emulators.get(&pty_id).cloned();
+    emulator.is_some_and(|e| e.mode().contains(TermMode::BRACKETED_PASTE))
 }
 
 /// `mt_config::AiLauncher` → `mt_relay::AiLauncher`。
@@ -159,6 +173,12 @@ impl RelayHost for HostImpl {
         self.tx
             .unbounded_send(RelaySignal::WritePty { pty_id, data })
             .map_err(|_| "relay pump closed".to_string())
+    }
+
+    /// 移动端指令据此决定正文包不包 `ESC[200~ … ESC[201~`(mt-relay 那边先写正文、
+    /// 隔一拍再单独写回车)。在 tokio 线程上调:只碰镜像里的 `Arc` 句柄,不碰实体。
+    fn bracketed_paste(&self, pty_id: u32) -> bool {
+        bracketed_paste_of(&self.mirror, pty_id)
     }
 
     fn hook_session(&self, pty_id: u32) -> Option<HookSessionId> {
@@ -797,10 +817,15 @@ impl RelayBridge {
                 live_ptys.extend(state.pty_ids());
             }
         }
+        let emulators = live_ptys
+            .iter()
+            .filter_map(|&pty_id| Some((pty_id, store.terminal(pty_id)?.read(cx).emulator())))
+            .collect();
         *self.mirror.lock() = HostMirror {
             launchers,
             projects,
             live_ptys,
+            emulators,
         };
     }
 
@@ -979,6 +1004,21 @@ mod tests {
             &facet2.path,
             facet2.ssh_connection_id.as_deref()
         ));
+    }
+
+    /// 移动端指令包不包 bracketed paste,看终端**此刻**的 VT 模式位(agent 启动后才
+    /// 开,退出时关);镜像里还没有的 PTY 按没开处理。
+    #[test]
+    fn 移动端指令的粘贴包裹跟随终端模式位() {
+        let emulator = Arc::new(TerminalEmulator::new(mt_terminal::TermSize::new(80, 24)));
+        let mirror = Mutex::new(HostMirror::default());
+        mirror.lock().emulators.insert(7, emulator.clone());
+        assert!(!bracketed_paste_of(&mirror, 7));
+        emulator.advance(b"\x1b[?2004h");
+        assert!(bracketed_paste_of(&mirror, 7));
+        emulator.advance(b"\x1b[?2004l");
+        assert!(!bracketed_paste_of(&mirror, 7));
+        assert!(!bracketed_paste_of(&mirror, 8));
     }
 
     // ── relayHttpBase 四种前缀 ──────────────────────────────
