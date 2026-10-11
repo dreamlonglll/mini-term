@@ -987,6 +987,44 @@ mod tests {
         assert!(parser.answer_keys(1, "toolu_q1", 0, 0).is_none());
     }
 
+    /// 回合中途的系统注入(isMeta 的 skill 正文、本地命令输出、后台任务通知)
+    /// 不是用户作答:不进镜像、不占 seq,卡片仍挂起可点选。
+    #[test]
+    fn parser_keeps_pending_on_injected_claude_lines() {
+        let mut parser = MirrorParser::new(MirrorAgent::Claude);
+        parser.feed(format!("{}\n", question_line()).as_bytes());
+        let injected = [
+            r#"{"type":"user","isMeta":true,"message":{"role":"user","content":[{"type":"text","text":"Base directory for this skill: C:\\skills\\demo"}]},"timestamp":"2026-09-01T03:30:10Z"}"#,
+            r#"{"type":"user","message":{"role":"user","content":"<local-command-stdout>Set model to opus</local-command-stdout>"},"timestamp":"2026-09-01T03:30:11Z"}"#,
+            r#"{"type":"user","origin":{"kind":"task-notification"},"message":{"role":"user","content":"<task-notification>\n<status>completed</status>\n</task-notification>"},"timestamp":"2026-09-01T03:30:12Z"}"#,
+        ];
+        for line in injected {
+            let msgs = parser.feed(format!("{line}\n").as_bytes());
+            assert!(msgs.is_empty(), "注入不进镜像: {msgs:?}");
+        }
+        assert!(
+            parser.answer_keys(1, "toolu_q1", 0, 1).is_some(),
+            "注入行不清挂起"
+        );
+        // 被滤掉的注入不消耗 seq:下一条正文接着卡片编号
+        let next = parser.feed(format!("{}\n", answer_line()).as_bytes());
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].seq, 2);
+    }
+
+    /// 斜杠命令是用户动作:以键入形态(`/x args`)进镜像,并清挂起。
+    #[test]
+    fn parser_shows_slash_command_and_clears_pending() {
+        let mut parser = MirrorParser::new(MirrorAgent::Claude);
+        parser.feed(format!("{}\n", question_line()).as_bytes());
+        let command = r#"{"type":"user","message":{"role":"user","content":"<command-name>/model</command-name>\n            <command-message>model</command-message>\n            <command-args>opus</command-args>"},"timestamp":"2026-09-01T03:32:00Z"}"#;
+        let msgs = parser.feed(format!("{command}\n").as_bytes());
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert_eq!(msgs[0].content, "/model opus");
+        assert_eq!(msgs[0].source, "desktop");
+        assert!(parser.answer_keys(1, "toolu_q1", 0, 0).is_none());
+    }
+
     /// Codex 提问行(request_user_input 的 function_call,arguments 是 JSON 字符串)。
     fn codex_question_line() -> String {
         r#"{"timestamp":"t1","type":"response_item","payload":{"type":"function_call","name":"request_user_input","arguments":"{\"questions\":[{\"header\":\"测试选择\",\"id\":\"test_choice\",\"question\":\"测哪个?\",\"options\":[{\"label\":\"方案A\",\"description\":\"稳\"},{\"label\":\"方案B\",\"description\":\"\"}]}]}","call_id":"call_q1"}}"#.to_string()

@@ -229,6 +229,80 @@ impl MobileRelayStatusPayload {
     }
 }
 
+/// 每 pane 留存的移动端指令登记上限(含已认领的)。已认领的要留着:移动端退出
+/// 镜像再进 = 重订阅 = 整份重解析,得靠它们把早先的移动端指令再认回来,
+/// 一屏快照([`MIRROR_PAGE_SIZE`] 条)里的都该认得回。
+const MOBILE_CMD_KEEP: usize = MIRROR_PAGE_SIZE;
+
+/// 回流消息时间戳相对登记时刻的容差:登记在 PTY 投递之后,grok 的时间戳又只到秒,
+/// 真回显的时间戳可能略早于登记时刻。
+const MOBILE_ECHO_SLACK: Duration = Duration::from_secs(5);
+
+/// 一条已写入 PTY 的移动端指令原文(或点选作答的选中项),等会话记录回流时改标来源。
+struct MobileCmd {
+    text: String,
+    /// 登记时刻:回流消息的时间戳比它早(超出容差)就不可能是这条指令的回显
+    recorded_at: SystemTime,
+    /// 认领了这条登记的回流消息的时间戳;None = 回显还没到
+    claimed_ts: Option<String>,
+}
+
+/// 改标口径:增量新行与整份历史分开对待。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelabelScope {
+    /// 增量泵读到的新行:只认未认领的登记。时间戳解析不了照样放行 —— 新行本就是
+    /// 刚落盘的,这是改标一直以来的口径
+    Appended,
+    /// 换绑 / 重订阅整份解析出的历史:已认领的登记按 (原文, 时间戳) 认回原来那条;
+    /// 未认领的只认时间戳不早于登记时刻的消息,解析不了的一律不认 —— 历史里
+    /// 同文的旧桌面输入不能被近期的移动端指令认走
+    History,
+}
+
+impl MobileCmd {
+    fn accepts(&self, text: &str, ts: &str, at: Option<SystemTime>, scope: RelabelScope) -> bool {
+        if self.text != text {
+            return false;
+        }
+        match &self.claimed_ts {
+            // 已认领:只在整份重解析时认回同一条消息
+            Some(claimed) => scope == RelabelScope::History && !ts.is_empty() && claimed == ts,
+            None => match at {
+                Some(at) => at + MOBILE_ECHO_SLACK >= self.recorded_at,
+                None => scope == RelabelScope::Appended,
+            },
+        }
+    }
+}
+
+/// 镜像消息时间戳(RFC 3339,四家解析器都产出这个形态)→ 时刻;空串 / 认不得 → None。
+fn parse_mirror_timestamp(ts: &str) -> Option<SystemTime> {
+    chrono::DateTime::parse_from_rfc3339(ts.trim())
+        .ok()
+        .map(SystemTime::from)
+}
+
+/// 为回流消息里的一段原文找一条登记(跳过这一轮改标里已被占用的 `used`):
+/// 先找已认领的(重解析时认回同一条),再找未认领的。
+fn find_mobile_cmd(
+    list: &[MobileCmd],
+    used: &[usize],
+    text: &str,
+    ts: &str,
+    at: Option<SystemTime>,
+    scope: RelabelScope,
+) -> Option<usize> {
+    let ok = |i: &usize| !used.contains(i) && list[*i].accepts(text, ts, at, scope);
+    (0..list.len())
+        .filter(|i| list[*i].claimed_ts.is_some())
+        .find(ok)
+        .or_else(|| {
+            (0..list.len())
+                .filter(|i| list[*i].claimed_ts.is_none())
+                .find(ok)
+        })
+}
+
 /// 当前连接会话的取消句柄;整个 manager 由上层用 `Arc` 长期持有。
 pub struct MobileRelayManager {
     cancel: Mutex<Option<watch::Sender<bool>>>,
@@ -247,7 +321,7 @@ pub struct MobileRelayManager {
     mirror_subs: Mutex<HashMap<String, MirrorSub>>,
     /// 每 pane 最近成功写入的移动端指令原文:会话记录回流时把匹配的
     /// user 消息来源改标为 "mobile"(见 relabel_mobile_sources)
-    recent_mobile_cmds: Mutex<HashMap<String, Vec<String>>>,
+    recent_mobile_cmds: Mutex<HashMap<String, Vec<MobileCmd>>>,
     /// 桌面侧状态查询(项目表 / 启动器 / PTY 写穿 / AI 会话身份)
     host: Arc<dyn RelayHost>,
     /// 状态与动作出口(原来的四个 Tauri 事件)
@@ -479,45 +553,75 @@ impl MobileRelayManager {
         }
     }
 
-    /// 登记一条已写入 PTY 的移动端指令原文(镜像回流改标来源用,每 pane 上限 20 条)。
+    /// 登记一条已写入 PTY 的移动端指令原文(镜像回流改标来源用,每 pane 上限
+    /// [`MOBILE_CMD_KEEP`] 条)。
     fn record_mobile_cmd(&self, pane_id: &str, text: &str) {
+        self.record_mobile_cmd_at(pane_id, text, SystemTime::now());
+    }
+
+    fn record_mobile_cmd_at(&self, pane_id: &str, text: &str, recorded_at: SystemTime) {
         let mut map = self.recent_mobile_cmds.lock();
         let list = map.entry(pane_id.to_string()).or_default();
-        list.push(text.trim().to_string());
-        if list.len() > 20 {
+        list.push(MobileCmd {
+            text: text.trim().to_string(),
+            recorded_at,
+            claimed_ts: None,
+        });
+        if list.len() > MOBILE_CMD_KEEP {
             list.remove(0);
         }
     }
 
-    /// 镜像新消息回流时调用:与最近移动端指令逐字匹配的 user 消息改标 "mobile"。
+    /// 镜像消息回流时调用:与移动端指令登记逐字匹配的 user 消息改标 "mobile"。
     /// 不匹配保持 "desktop"(误差方向安全:最多把移动端指令标成桌面输入)。
-    fn relabel_mobile_sources(&self, pane_id: &str, messages: &mut [MirrorMessage]) {
+    ///
+    /// 一条登记只认领一条消息(认领后记下该消息的时间戳,不再匹配新消息);
+    /// 整份历史([`RelabelScope::History`])另有两条约束,见该枚举。
+    /// 只持 `recent_mobile_cmds` 一把锁且期间不碰别的锁(叶子锁):增量泵持着
+    /// runtime 锁调、换绑在不持锁时调,两种顺序都不会与点选作答的泵死锁。
+    fn relabel_mobile_sources(
+        &self,
+        pane_id: &str,
+        messages: &mut [MirrorMessage],
+        scope: RelabelScope,
+    ) {
         let mut map = self.recent_mobile_cmds.lock();
         let Some(list) = map.get_mut(pane_id) else {
             return;
         };
+        // 这一轮已被认领 / 认回的登记:同一轮里一条登记只配一条消息
+        // (重解析时时间戳与原文都相同的两条消息,也只认回一条)
+        let mut used: Vec<usize> = Vec::new();
         for msg in messages.iter_mut() {
             if msg.source != "desktop" {
                 continue;
             }
             // 作答标记按结构化 labels 对账——多题标记的 content 是合并文本,
-            // 与逐条登记的单个 label 对不上。全部选中项都出自本端登记才改标
-            if msg.kind.as_deref() == Some("questionAnswered") {
-                if !msg.labels.is_empty()
-                    && msg.labels.iter().all(|l| list.iter().any(|c| c == l))
-                {
-                    msg.source = "mobile".into();
-                    for label in &msg.labels {
-                        if let Some(pos) = list.iter().position(|c| c == label) {
-                            list.remove(pos);
-                        }
-                    }
-                }
+            // 与逐条登记的单个 label 对不上。全部选中项都出自本端登记才改标;
+            // 打断标记(labels 为空)不参与
+            let texts: Vec<&str> = if msg.kind.as_deref() == Some("questionAnswered") {
+                msg.labels.iter().map(String::as_str).collect()
+            } else {
+                vec![msg.content.trim()]
+            };
+            if texts.is_empty() {
                 continue;
             }
-            if let Some(pos) = list.iter().position(|cmd| cmd == msg.content.trim()) {
+            let at = parse_mirror_timestamp(&msg.timestamp);
+            let start = used.len();
+            for text in &texts {
+                match find_mobile_cmd(list, &used, text, &msg.timestamp, at, scope) {
+                    Some(i) => used.push(i),
+                    None => break,
+                }
+            }
+            if used.len() - start == texts.len() {
                 msg.source = "mobile".into();
-                list.remove(pos);
+                for &i in &used[start..] {
+                    list[i].claimed_ts = Some(msg.timestamp.clone());
+                }
+            } else {
+                used.truncate(start);
             }
         }
     }
@@ -560,7 +664,7 @@ impl MobileRelayManager {
                     return;
                 }
                 // 移动端指令/作答回流:匹配的消息改标 "mobile"
-                self.relabel_mobile_sources(pane_id, &mut new_msgs);
+                self.relabel_mobile_sources(pane_id, &mut new_msgs, RelabelScope::Appended);
                 messages.lock().extend(new_msgs.clone());
                 let _ = self.send(DesktopToRelay::MirrorAppend {
                     pane_id: pane_id.into(),
@@ -654,11 +758,16 @@ impl MobileRelayManager {
     /// 解析用一只新解析器、在锁外做完(文件可能不小,解析可能几百毫秒,不该让点选
     /// 作答的泵干等);换入运行态与替换消息缓存在同一次持锁内完成,防点选作答的泵
     /// 在中间插进来喂错解析器。
+    ///
+    /// 全量同样要改标来源:移动端发起的新会话里第一条指令、重订阅时早先发过的
+    /// 移动端指令都只在这份全量里出现,不改标就一律显示成桌面输入。改标也在锁外
+    /// (只取叶子锁 `recent_mobile_cmds`)。
     fn rebind_mirror(&self, job: &MirrorJob, path: PathBuf, agent: MirrorAgent) -> bool {
         let mut parser = MirrorParser::new(agent);
-        let Some((msgs, offset)) = mirror::parse_whole_file(&path, &mut parser) else {
+        let Some((mut msgs, offset)) = mirror::parse_whole_file(&path, &mut parser) else {
             return false;
         };
+        self.relabel_mobile_sources(&job.pane_id, &mut msgs, RelabelScope::History);
         let (page, has_more) = {
             let mut slot = job.runtime.lock();
             *slot = Some(MirrorRuntime {
@@ -1732,7 +1841,7 @@ mod tests {
                 ..Default::default()
             },
         ];
-        manager.relabel_mobile_sources("pane-1", &mut msgs);
+        manager.relabel_mobile_sources("pane-1", &mut msgs, RelabelScope::Appended);
         assert_eq!(msgs[0].source, "desktop");
         assert_eq!(msgs[1].source, "mobile");
         // assistant 消息不受影响
@@ -1746,7 +1855,7 @@ mod tests {
             timestamp: String::new(),
             ..Default::default()
         }];
-        manager.relabel_mobile_sources("pane-1", &mut again);
+        manager.relabel_mobile_sources("pane-1", &mut again, RelabelScope::Appended);
         assert_eq!(again[0].source, "desktop");
 
         // 其他 pane 的记录互不影响
@@ -1758,7 +1867,7 @@ mod tests {
             timestamp: String::new(),
             ..Default::default()
         }];
-        manager.relabel_mobile_sources("pane-1", &mut other);
+        manager.relabel_mobile_sources("pane-1", &mut other, RelabelScope::Appended);
         assert_eq!(other[0].source, "desktop");
     }
 
@@ -1782,22 +1891,131 @@ mod tests {
 
         // 有未登记的 label(桌面替答了一题)→ 不改标,登记条目也不消费
         let mut mixed = vec![marker(2, &["方案B", "桌面答的"])];
-        manager.relabel_mobile_sources("pane-1", &mut mixed);
+        manager.relabel_mobile_sources("pane-1", &mut mixed, RelabelScope::Appended);
         assert_eq!(mixed[0].source, "desktop");
 
         // 全部选中项都出自本端登记 → 改标并消费,再来一遍不再命中
         let mut mine = vec![marker(3, &["方案B"])];
-        manager.relabel_mobile_sources("pane-1", &mut mine);
+        manager.relabel_mobile_sources("pane-1", &mut mine, RelabelScope::Appended);
         assert_eq!(mine[0].source, "mobile");
         let mut again = vec![marker(4, &["方案B"])];
-        manager.relabel_mobile_sources("pane-1", &mut again);
+        manager.relabel_mobile_sources("pane-1", &mut again, RelabelScope::Appended);
         assert_eq!(again[0].source, "desktop");
 
         // 打断标记(labels 为空)不参与对账
         let mut interrupted = vec![marker(5, &[])];
         manager.record_mobile_cmd("pane-1", "whatever");
-        manager.relabel_mobile_sources("pane-1", &mut interrupted);
+        manager.relabel_mobile_sources("pane-1", &mut interrupted, RelabelScope::Appended);
         assert_eq!(interrupted[0].source, "desktop");
+    }
+
+    /// RFC 3339 时间戳 → SystemTime(测试里按会话记录的时间戳算登记时刻)。
+    fn at(ts: &str) -> SystemTime {
+        parse_mirror_timestamp(ts).unwrap()
+    }
+
+    fn desktop_msg(seq: u64, content: &str, ts: &str) -> MirrorMessage {
+        MirrorMessage {
+            seq,
+            source: "desktop".into(),
+            content: content.into(),
+            timestamp: ts.into(),
+            ..Default::default()
+        }
+    }
+
+    fn sources(msgs: &[MirrorMessage]) -> Vec<&str> {
+        msgs.iter().map(|m| m.source.as_str()).collect()
+    }
+
+    /// 整份历史改标:早于登记时刻的同文旧桌面输入不被认走,时间戳认不得的不认;
+    /// 认领后同一份历史再解析(重订阅)仍认回那一条,但增量新行不再命中。
+    #[test]
+    fn relabel_history_respects_record_time_and_reclaims_on_reparse() {
+        let manager = test_manager();
+        manager.record_mobile_cmd_at("pane-1", "继续", at("2026-01-01T00:10:00Z"));
+        let history = || {
+            vec![
+                // 移动端发送前一天桌面敲过同样的话
+                desktop_msg(0, "继续", "2025-12-31T09:00:00Z"),
+                // 发送前几分钟(超出容差)
+                desktop_msg(1, "继续", "2026-01-01T00:05:00Z"),
+                // 真回显:落盘略早于登记也在容差内(登记在 PTY 投递之后)
+                desktop_msg(2, "继续", "2026-01-01T00:09:58.120Z"),
+                // 时间戳认不得:历史里一律不认
+                desktop_msg(3, "继续", ""),
+            ]
+        };
+        let mut first = history();
+        manager.relabel_mobile_sources("pane-1", &mut first, RelabelScope::History);
+        assert_eq!(sources(&first), ["desktop", "desktop", "mobile", "desktop"]);
+
+        // 重订阅 = 同一份记录整份重解析:认回同一条,不多不少
+        let mut again = history();
+        manager.relabel_mobile_sources("pane-1", &mut again, RelabelScope::History);
+        assert_eq!(sources(&again), ["desktop", "desktop", "mobile", "desktop"]);
+
+        // 已认领的登记不再认增量新行(哪怕时间戳相同)
+        let mut appended = vec![desktop_msg(4, "继续", "2026-01-01T00:09:58.120Z")];
+        manager.relabel_mobile_sources("pane-1", &mut appended, RelabelScope::Appended);
+        assert_eq!(appended[0].source, "desktop");
+    }
+
+    /// 同文的两条移动端指令各认各的回显;重解析时已认领的优先认回原消息,
+    /// 不会被历史里更早的那条抢走而把后一条挤成桌面输入。
+    #[test]
+    fn relabel_history_pairs_repeated_commands_one_to_one() {
+        let manager = test_manager();
+        manager.record_mobile_cmd_at("pane-1", "继续", at("2026-01-01T00:00:00Z"));
+        manager.record_mobile_cmd_at("pane-1", "继续", at("2026-01-01T01:00:00Z"));
+        let history = || {
+            vec![
+                desktop_msg(0, "继续", "2026-01-01T00:00:01Z"),
+                desktop_msg(1, "继续", "2026-01-01T01:00:01Z"),
+                desktop_msg(2, "继续", "2026-01-01T02:00:00Z"),
+            ]
+        };
+        let mut first = history();
+        manager.relabel_mobile_sources("pane-1", &mut first, RelabelScope::History);
+        assert_eq!(sources(&first), ["mobile", "mobile", "desktop"]);
+        let mut again = history();
+        manager.relabel_mobile_sources("pane-1", &mut again, RelabelScope::History);
+        assert_eq!(sources(&again), ["mobile", "mobile", "desktop"]);
+    }
+
+    /// 作答标记在整份历史里同样按 labels 对账,重解析认回。
+    #[test]
+    fn relabel_history_marks_answer_markers() {
+        let manager = test_manager();
+        manager.record_mobile_cmd_at("pane-1", "方案B", at("2026-01-01T00:00:00Z"));
+        let marker = || MirrorMessage {
+            seq: 2,
+            source: "desktop".into(),
+            content: "方案B".into(),
+            timestamp: "2026-01-01T00:00:03Z".into(),
+            kind: Some("questionAnswered".into()),
+            ref_seq: Some(1),
+            labels: vec!["方案B".into()],
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            let mut msgs = vec![marker()];
+            manager.relabel_mobile_sources("pane-1", &mut msgs, RelabelScope::History);
+            assert_eq!(msgs[0].source, "mobile");
+        }
+    }
+
+    /// 登记上限按条数滚动,已认领的也占名额(最老的先出)。
+    #[test]
+    fn mobile_cmd_registry_is_bounded() {
+        let manager = test_manager();
+        for i in 0..MOBILE_CMD_KEEP + 5 {
+            manager.record_mobile_cmd("pane-1", &format!("cmd {i}"));
+        }
+        let map = manager.recent_mobile_cmds.lock();
+        let list = &map["pane-1"];
+        assert_eq!(list.len(), MOBILE_CMD_KEEP);
+        assert_eq!(list[0].text, "cmd 5");
     }
 
     #[test]
@@ -2011,6 +2229,47 @@ mod tests {
         assert_eq!(fx.texts(), ["hi"]);
         fx.round(&mut loc, t0 + Duration::from_secs(3), locate);
         assert_eq!(calls.get(), 3, "绑上之后只泵");
+    }
+
+    /// 移动端发起的新会话:第一条移动端指令只出现在首次绑定的全量里,同样标成
+    /// 「移动端」;之后增量进来的同文桌面输入照旧是「桌面」;移动端退出镜像再进
+    /// (重订阅 = 新运行态从头整份解析)两条都认回原样。
+    #[test]
+    fn rebind_relabels_mobile_commands_in_full_history() {
+        let fx = MirrorFixture::new("rebind-relabel");
+        let a = fx.dir.join("a.jsonl");
+        let locate = |_: &str, _: &LocateKey| a.exists().then(|| (a.clone(), MirrorAgent::Claude));
+        // user_line 的时间戳是 2026-01-01T00:00:00Z:指令在它前一秒写入 PTY
+        fx.manager
+            .record_mobile_cmd_at("pane-1", "fix the bug", at("2025-12-31T23:59:59Z"));
+        *fx.host.hook.lock() = hook("sid-a");
+        let t0 = Instant::now();
+        let mut loc = MirrorLocator::default();
+        fx.round(&mut loc, t0, locate);
+        assert_eq!(fx.bound(), None, "会话文件还没落盘");
+
+        std::fs::write(&a, user_line("fix the bug")).unwrap();
+        fx.round(&mut loc, t0 + Duration::from_secs(1), locate);
+        assert_eq!(sources(&fx.job.messages.lock()), ["mobile"]);
+
+        // 桌面又敲了一遍同样的话(测试行时间戳相同,真实记录精确到毫秒)
+        append(&a, "fix the bug");
+        fx.round(&mut loc, t0 + Duration::from_secs(2), locate);
+        assert_eq!(sources(&fx.job.messages.lock()), ["mobile", "desktop"]);
+
+        let job = MirrorJob {
+            pane_id: "pane-1".into(),
+            project_path: r"D:\proj".into(),
+            messages: Arc::new(Mutex::new(Vec::new())),
+            runtime: Arc::new(Mutex::new(None)),
+        };
+        fx.manager.mirror_round(
+            &job,
+            &mut MirrorLocator::default(),
+            t0 + Duration::from_secs(3),
+            locate,
+        );
+        assert_eq!(sources(&job.messages.lock()), ["mobile", "desktop"]);
     }
 
     /// 无 hook 的启发式:已绑上时 10s 才重新定位一次,期间照常泵;AI 换了一轮

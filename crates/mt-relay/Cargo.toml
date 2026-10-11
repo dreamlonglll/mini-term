@@ -17,6 +17,8 @@ mt-ai.workspace = true
 mt-core.workspace = true
 # Codex/grok 会话目录在用户家目录下(~/.codex/sessions 等)
 dirs.workspace = true
+# 镜像消息时间戳(RFC 3339)解析:改标来源时比对回流消息与移动端指令的登记时刻
+chrono.workspace = true
 # 与中转服务端共享的协议消息 crate。relay-server 是独立工作区,
 # 这条 path 依赖跨工作区,Cargo 允许。
 mt-relay-protocol = { path = "../../relay-server/protocol" }
