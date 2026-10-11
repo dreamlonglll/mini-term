@@ -61,10 +61,12 @@ const COLLAPSE_THRESHOLD = 320;
  */
 function CollapsibleInput({
   content,
+  rowKey,
   onUserResize,
 }: {
   content: string;
-  onUserResize: () => void;
+  rowKey: number;
+  onUserResize: (rowKey: number) => void;
 }) {
   const t = useT();
   const preRef = useRef<HTMLPreElement>(null);
@@ -90,8 +92,8 @@ function CollapsibleInput({
     if (!userToggled.current) return;
     userToggled.current = false;
     if (!expanded) toggleRef.current?.scrollIntoView({ block: 'nearest' });
-    onUserResize();
-  }, [expanded, onUserResize]);
+    onUserResize(rowKey);
+  }, [expanded, rowKey, onUserResize]);
 
   const collapsed = tall && !expanded;
   return (
@@ -124,7 +126,7 @@ const MessageRow = memo(function MessageRow({
   onUserResize,
 }: {
   msg: MirrorMessage;
-  onUserResize: () => void;
+  onUserResize: (rowKey: number) => void;
 }) {
   const t = useT();
   const isAssistant = msg.source === 'assistant';
@@ -141,7 +143,7 @@ const MessageRow = memo(function MessageRow({
             <Markdown content={msg.content} />
           </div>
         ) : (
-          <CollapsibleInput content={msg.content} onUserResize={onUserResize} />
+          <CollapsibleInput content={msg.content} rowKey={msg.seq} onUserResize={onUserResize} />
         )}
       </div>
     </div>
@@ -492,7 +494,10 @@ export function MirrorView() {
     rowsCache.current = rows;
   }, [rows]);
 
+  // 最近一次被点开/收起的工具组(首条 seq),供展开后的贴底判定认出是哪一行
+  const lastToggledTools = useRef<number | null>(null);
   const toggleTools = useCallback((firstSeq: number) => {
+    lastToggledTools.current = firstSeq;
     setExpandedTools((prev) => {
       const next = new Set(prev);
       if (!next.delete(firstSeq)) next.add(firstSeq);
@@ -500,12 +505,24 @@ export function MirrorView() {
     });
   }, []);
 
-  // 用户主动展开/收起后按实际几何重算贴底。内容在视口下方长出来不会触发 scroll
-  // 事件,不重算的话 stickToBottom 还停在 true,下一条消息一来就把正在读的
-  // 展开内容甩走
-  const syncStick = useCallback(() => {
+  // 用户主动展开/收起某一行后按实际几何重算贴底。内容在视口下方长出来不会触发
+  // scroll 事件,不重算的话 stickToBottom 还停在 true,下一条消息一来就把正在读的
+  // 展开内容甩走。
+  //
+  // 例外:此前贴着底、动的又是最后一行(最常见的是展开正在跑的那组工具)。内容
+  // 往视口下方长,按几何重算会判成离底,之后新到的工具与状态行就不再跟随,用户
+  // 得自己往下翻 —— 这种情况继续贴底。此刻 stickToBottom 仍是展开前的值:下方长
+  // 内容不改 scrollTop,不会有 scroll 事件先把它改掉。
+  const syncStick = useCallback((rowKey: number) => {
     const el = scrollRef.current;
-    if (el) stickToBottom.current = isAtBottom(el);
+    if (!el) return;
+    const committed = rowsCache.current;
+    const isLastRow = committed.length > 0 && committed[committed.length - 1].key === rowKey;
+    if (stickToBottom.current && isLastRow) {
+      el.scrollTop = el.scrollHeight;
+      return;
+    }
+    stickToBottom.current = isAtBottom(el);
   }, []);
 
   /** 上滑到顶 / 点「加载更早」:先记下锚点再发请求,插入后据此保持阅读位置 */
@@ -559,7 +576,12 @@ export function MirrorView() {
     }
   }, [messages, loaded, loadingOlder, indicator]);
 
-  useLayoutEffect(syncStick, [expandedTools, syncStick]);
+  useLayoutEffect(() => {
+    const key = lastToggledTools.current;
+    if (key === null) return;
+    lastToggledTools.current = null;
+    syncStick(key);
+  }, [expandedTools, syncStick]);
 
   if (!mirror) return null;
 
