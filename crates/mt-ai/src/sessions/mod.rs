@@ -13,6 +13,7 @@ mod grok;
 mod lineage;
 mod omp;
 mod tool_activity;
+mod tool_path;
 
 pub use codex::{
     CodexSessionMeta, codex_message_from_line, codex_meta_from_line,
@@ -36,6 +37,7 @@ pub use tool_activity::{
     AiToolCall, TOOL_TARGET_MAX_CHARS, claude_tool_calls_from_line, codex_tool_calls_from_line,
     grok_tool_calls_from_line, omp_tool_calls_from_line, summarize_tool_target,
 };
+pub use tool_path::ToolPathScope;
 
 use codex::{
     get_codex_sessions, get_codex_sessions_in, read_codex_session_content,

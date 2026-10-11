@@ -88,10 +88,14 @@ pub struct MirrorParser {
     grok: Option<ai_sessions::GrokUpdateParser>,
     /// 挂起中的提问(Claude 专用)。换绑即随解析器整体重建,天然清空。
     pending: Vec<PendingQuestion>,
+    /// 工具活动里路径类目标的缩短口径(项目根之下 → 相对路径、家目录 → `~`):
+    /// 手机窄屏上绝对路径一截就丢了文件名。哪些目标算路径由 mt-ai 按工具声明。
+    tool_paths: ai_sessions::ToolPathScope,
 }
 
 impl MirrorParser {
-    pub fn new(agent: MirrorAgent) -> Self {
+    /// `project_root`:被镜像 pane 所属项目的根目录,工具活动的路径类目标按它缩短。
+    pub fn new(agent: MirrorAgent, project_root: &str) -> Self {
         Self {
             agent,
             next_seq: 0,
@@ -99,6 +103,7 @@ impl MirrorParser {
             scanned: 0,
             grok: (agent == MirrorAgent::Grok).then(ai_sessions::GrokUpdateParser::new),
             pending: Vec::new(),
+            tool_paths: ai_sessions::ToolPathScope::new(project_root),
         }
     }
 
@@ -212,7 +217,8 @@ impl MirrorParser {
             }
         }
 
-        self.push_tool_calls(ai_sessions::claude_tool_calls_from_line(line), out);
+        let calls = ai_sessions::claude_tool_calls_from_line(line, &self.tool_paths);
+        self.push_tool_calls(calls, out);
 
         if let Some(question) = ai_sessions::claude_question_from_line(line) {
             self.push_question(question, out);
@@ -240,7 +246,8 @@ impl MirrorParser {
             }
         }
 
-        self.push_tool_calls(ai_sessions::codex_tool_calls_from_line(line), out);
+        let calls = ai_sessions::codex_tool_calls_from_line(line, &self.tool_paths);
+        self.push_tool_calls(calls, out);
 
         if let Some(question) = ai_sessions::codex_question_from_line(line) {
             self.push_question(question, out);
@@ -266,7 +273,8 @@ impl MirrorParser {
         }
 
         // tool_call 首行本身就是消息边界:上面先冲出被它收尾的文本,再出工具
-        self.push_tool_calls(ai_sessions::grok_tool_calls_from_line(line), out);
+        let calls = ai_sessions::grok_tool_calls_from_line(line, &self.tool_paths);
+        self.push_tool_calls(calls, out);
 
         if let Some(question) = ai_sessions::grok_question_from_line(line) {
             // 富化行可能重发同一提问:已挂起即跳过,不重复出卡
@@ -294,7 +302,8 @@ impl MirrorParser {
             }
         }
 
-        self.push_tool_calls(ai_sessions::omp_tool_calls_from_line(line), out);
+        let calls = ai_sessions::omp_tool_calls_from_line(line, &self.tool_paths);
+        self.push_tool_calls(calls, out);
 
         if let Some(question) = ai_sessions::omp_question_from_line(line) {
             self.push_question(question, out);
@@ -831,6 +840,9 @@ pub fn read_from_offset(path: &Path, offset: u64) -> Option<(Vec<u8>, u64)> {
 mod tests {
     use super::*;
 
+    /// 测试用项目根:既有用例的路径都不在它下面,目标按原文断言。
+    const PROJECT: &str = r"D:\proj";
+
     fn claude_line(role: &str, text: &str, ts: &str) -> String {
         format!(
             r#"{{"type":"{role}","message":{{"role":"{role}","content":[{{"type":"text","text":"{text}"}}]}},"timestamp":"{ts}"}}"#
@@ -841,7 +853,7 @@ mod tests {
     /// 否则一句回答会在镜像里碎成几十条。
     #[test]
     fn parser_joins_grok_chunks_into_one_message() {
-        let mut parser = MirrorParser::new(MirrorAgent::Grok);
+        let mut parser = MirrorParser::new(MirrorAgent::Grok, PROJECT);
         let chunk = |tag: &str, text: &str, ts: u64| {
             format!(
                 r#"{{"timestamp":{ts},"method":"session/update","params":{{"sessionId":"s","update":{{"sessionUpdate":"{tag}","content":{{"type":"text","text":"{text}"}}}}}}}}"#
@@ -882,7 +894,7 @@ mod tests {
     /// 用户说的话,镜像里不该出现——与 grok 自身的提示词抽取口径一致。
     #[test]
     fn parser_skips_grok_injected_user_chunks() {
-        let mut parser = MirrorParser::new(MirrorAgent::Grok);
+        let mut parser = MirrorParser::new(MirrorAgent::Grok, PROJECT);
         let data = concat!(
             r#"{"timestamp":1,"method":"session/update","params":{"update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"tool result"},"_meta":{"hostTurn":true}}}}"#,
             "\n",
@@ -901,7 +913,7 @@ mod tests {
     /// 半行拼接对 grok 同样成立(轮询按字节读,行边界不保证)
     #[test]
     fn parser_handles_grok_partial_line_across_chunks() {
-        let mut parser = MirrorParser::new(MirrorAgent::Grok);
+        let mut parser = MirrorParser::new(MirrorAgent::Grok, PROJECT);
         let line = r#"{"timestamp":9,"method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"split me"}}}}"#;
         let bytes = format!("{line}\n");
         let (head, tail) = bytes.as_bytes().split_at(bytes.len() / 2);
@@ -918,7 +930,7 @@ mod tests {
 
     #[test]
     fn parser_labels_sources_and_skips_noise() {
-        let mut parser = MirrorParser::new(MirrorAgent::Claude);
+        let mut parser = MirrorParser::new(MirrorAgent::Claude, PROJECT);
         let data = format!(
             "{}\n{}\n{}\n{}\n",
             claude_line("user", "fix the bug", "2026-07-24T10:00:00Z"),
@@ -952,7 +964,7 @@ mod tests {
     /// 纯文本兜底,且随即可点选作答。
     #[test]
     fn parser_emits_question_card_beside_text() {
-        let mut parser = MirrorParser::new(MirrorAgent::Claude);
+        let mut parser = MirrorParser::new(MirrorAgent::Claude, PROJECT);
         let msgs = parser.feed(format!("{}\n", question_line()).as_bytes());
         assert_eq!(msgs.len(), 2, "{msgs:?}");
         assert_eq!(msgs[0].content, "先确认方案。");
@@ -990,7 +1002,7 @@ mod tests {
     /// content 只是兜底文本),挂起随之清除。
     #[test]
     fn parser_marks_question_answered_on_tool_result() {
-        let mut parser = MirrorParser::new(MirrorAgent::Claude);
+        let mut parser = MirrorParser::new(MirrorAgent::Claude, PROJECT);
         parser.feed(format!("{}\n", question_line()).as_bytes());
         let msgs = parser.feed(format!("{}\n", answer_line()).as_bytes());
         assert_eq!(msgs.len(), 1, "{msgs:?}");
@@ -1010,7 +1022,7 @@ mod tests {
     /// 否则桌面还在等作答、移动端却只能收 QuestionNotPending。
     #[test]
     fn parser_keeps_pending_on_unrelated_tool_result() {
-        let mut parser = MirrorParser::new(MirrorAgent::Claude);
+        let mut parser = MirrorParser::new(MirrorAgent::Claude, PROJECT);
         parser.feed(format!("{}\n", question_line()).as_bytes());
         let unrelated = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"file list...","tool_use_id":"toolu_other"}]}}"#;
         let msgs = parser.feed(format!("{unrelated}\n").as_bytes());
@@ -1025,7 +1037,7 @@ mod tests {
     /// (移动端显示中性「已处理」),挂起清除。
     #[test]
     fn parser_marks_interrupted_question_as_handled() {
-        let mut parser = MirrorParser::new(MirrorAgent::Claude);
+        let mut parser = MirrorParser::new(MirrorAgent::Claude, PROJECT);
         parser.feed(format!("{}\n", question_line()).as_bytes());
         let interrupted = r#"{"type":"user","timestamp":"2026-09-01T03:33:00Z","message":{"role":"user","content":[{"type":"tool_result","content":"The user doesn't want to proceed","is_error":true,"tool_use_id":"toolu_q1"}]}}"#;
         let msgs = parser.feed(format!("{interrupted}\n").as_bytes());
@@ -1040,7 +1052,7 @@ mod tests {
     /// 否则卡片按钮会对着一个已消失的 TUI 注入按键。
     #[test]
     fn parser_clears_pending_on_user_interrupt() {
-        let mut parser = MirrorParser::new(MirrorAgent::Claude);
+        let mut parser = MirrorParser::new(MirrorAgent::Claude, PROJECT);
         parser.feed(format!("{}\n", question_line()).as_bytes());
         assert!(parser.answer_keys(1, "toolu_q1", 0, 0).is_some());
         let msgs = parser.feed(
@@ -1059,7 +1071,7 @@ mod tests {
     /// 不是用户作答:不进镜像、不占 seq,卡片仍挂起可点选。
     #[test]
     fn parser_keeps_pending_on_injected_claude_lines() {
-        let mut parser = MirrorParser::new(MirrorAgent::Claude);
+        let mut parser = MirrorParser::new(MirrorAgent::Claude, PROJECT);
         parser.feed(format!("{}\n", question_line()).as_bytes());
         let injected = [
             r#"{"type":"user","isMeta":true,"message":{"role":"user","content":[{"type":"text","text":"Base directory for this skill: C:\\skills\\demo"}]},"timestamp":"2026-09-01T03:30:10Z"}"#,
@@ -1083,7 +1095,7 @@ mod tests {
     /// 斜杠命令是用户动作:以键入形态(`/x args`)进镜像,并清挂起。
     #[test]
     fn parser_shows_slash_command_and_clears_pending() {
-        let mut parser = MirrorParser::new(MirrorAgent::Claude);
+        let mut parser = MirrorParser::new(MirrorAgent::Claude, PROJECT);
         parser.feed(format!("{}\n", question_line()).as_bytes());
         let command = r#"{"type":"user","message":{"role":"user","content":"<command-name>/model</command-name>\n            <command-message>model</command-message>\n            <command-args>opus</command-args>"},"timestamp":"2026-09-01T03:32:00Z"}"#;
         let msgs = parser.feed(format!("{command}\n").as_bytes());
@@ -1108,7 +1120,7 @@ mod tests {
     /// Codex 提问出卡 + 点选作答按键与 Claude 同一套(↓×n + 回车)。
     #[test]
     fn parser_codex_question_card_and_answer_keys() {
-        let mut parser = MirrorParser::new(MirrorAgent::Codex);
+        let mut parser = MirrorParser::new(MirrorAgent::Codex, PROJECT);
         let msgs = parser.feed(format!("{}\n", codex_question_line()).as_bytes());
         assert_eq!(msgs.len(), 1, "{msgs:?}");
         let card = &msgs[0];
@@ -1134,7 +1146,7 @@ mod tests {
     /// Esc 打断的回执("aborted by user …")不是用户的选择:标记 labels 留空。
     #[test]
     fn parser_codex_abort_marks_handled() {
-        let mut parser = MirrorParser::new(MirrorAgent::Codex);
+        let mut parser = MirrorParser::new(MirrorAgent::Codex, PROJECT);
         parser.feed(format!("{}\n", codex_question_line()).as_bytes());
         let abort = r#"{"timestamp":"t2","type":"response_item","payload":{"type":"function_call_output","call_id":"call_q1","output":"aborted by user after 32.9s"}}"#;
         let msgs = parser.feed(format!("{abort}\n").as_bytes());
@@ -1148,7 +1160,7 @@ mod tests {
     /// 模式门禁回执(Default 模式下工具不可用):卡片立即失效,不可再点选。
     #[test]
     fn parser_codex_mode_gate_marks_handled() {
-        let mut parser = MirrorParser::new(MirrorAgent::Codex);
+        let mut parser = MirrorParser::new(MirrorAgent::Codex, PROJECT);
         parser.feed(format!("{}\n", codex_question_line()).as_bytes());
         let gate = r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"call_q1","output":"request_user_input is unavailable in Default mode"}}"#;
         let msgs = parser.feed(format!("{gate}\n").as_bytes());
@@ -1160,7 +1172,7 @@ mod tests {
     /// 别家工具(exec 等)的回执不清挂起,与 Claude 侧同语义。
     #[test]
     fn parser_codex_keeps_pending_on_unrelated_output() {
-        let mut parser = MirrorParser::new(MirrorAgent::Codex);
+        let mut parser = MirrorParser::new(MirrorAgent::Codex, PROJECT);
         parser.feed(format!("{}\n", codex_question_line()).as_bytes());
         let unrelated = r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"call_other","output":"ls done"}}"#;
         let msgs = parser.feed(format!("{unrelated}\n").as_bytes());
@@ -1172,7 +1184,7 @@ mod tests {
     /// 但仍算用户动作——挂起提问照清;真实用户文本正常产出。
     #[test]
     fn parser_codex_filters_injected_noise() {
-        let mut parser = MirrorParser::new(MirrorAgent::Codex);
+        let mut parser = MirrorParser::new(MirrorAgent::Codex, PROJECT);
         let noise = format!(
             "{}\n{}\n",
             codex_user_line("# AGENTS.md instructions for D:\\Git\\mini-term\n\n<INSTRUCTIONS>…"),
@@ -1211,7 +1223,7 @@ mod tests {
     /// completed 回执从 UserAnswered.message 扫出选中项做高亮对账。
     #[test]
     fn parser_grok_question_card_and_answered_labels() {
-        let mut parser = MirrorParser::new(MirrorAgent::Grok);
+        let mut parser = MirrorParser::new(MirrorAgent::Grok, PROJECT);
         let msgs = parser.feed(format!("{}\n", grok_question_line()).as_bytes());
         assert_eq!(msgs.len(), 1, "{msgs:?}");
         let card = &msgs[0];
@@ -1242,7 +1254,7 @@ mod tests {
     /// 无 UserAnswered 的 completed 回执按打断处理(labels 留空)。
     #[test]
     fn parser_grok_no_duplicate_card_and_declined_marks_handled() {
-        let mut parser = MirrorParser::new(MirrorAgent::Grok);
+        let mut parser = MirrorParser::new(MirrorAgent::Grok, PROJECT);
         let first = r#"{"timestamp":1788249699,"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"call-g1","title":"ask_user_question","rawInput":{"questions":[{"question":"接下来做什么？","options":[{"label":"继续镜像工作","description":"继续处理改动"},{"label":"其他","description":"请说明"}]}]}}}}"#;
         let msgs = parser.feed(format!("{first}\n").as_bytes());
         assert_eq!(msgs.len(), 1, "首行即出卡: {msgs:?}");
@@ -1264,7 +1276,7 @@ mod tests {
     /// Grok 用户消息(分片攒出)成形即清挂起;正文消息照常产出。
     #[test]
     fn parser_grok_user_message_clears_pending() {
-        let mut parser = MirrorParser::new(MirrorAgent::Grok);
+        let mut parser = MirrorParser::new(MirrorAgent::Grok, PROJECT);
         parser.feed(format!("{}\n", grok_question_line()).as_bytes());
         assert!(parser.answer_keys(0, "call-g1", 0, 0).is_some());
         let chunk = r#"{"timestamp":1788249800,"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"算了,先看代码"}}}}"#;
@@ -1281,7 +1293,7 @@ mod tests {
     /// 作答校验的负路径:错 seq / 身份不符 / 越界选项 / 乱序题号 / 多选题一律拒绝。
     #[test]
     fn answer_keys_rejects_invalid_requests() {
-        let mut parser = MirrorParser::new(MirrorAgent::Claude);
+        let mut parser = MirrorParser::new(MirrorAgent::Claude, PROJECT);
         parser.feed(format!("{}\n", question_line()).as_bytes());
         assert!(
             parser.answer_keys(0, "toolu_q1", 0, 0).is_none(),
@@ -1310,7 +1322,7 @@ mod tests {
         );
 
         // 多选题只展示不可点选
-        let mut parser = MirrorParser::new(MirrorAgent::Claude);
+        let mut parser = MirrorParser::new(MirrorAgent::Claude, PROJECT);
         let multi = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_m","name":"AskUserQuestion","input":{"questions":[{"question":"启用哪些?","header":"","options":[{"label":"甲","description":""},{"label":"乙","description":""}],"multiSelect":true}]}}]}}"#;
         let msgs = parser.feed(format!("{multi}\n").as_bytes());
         assert_eq!(msgs.len(), 1);
@@ -1323,7 +1335,7 @@ mod tests {
 
     #[test]
     fn parser_handles_partial_line_across_chunks() {
-        let mut parser = MirrorParser::new(MirrorAgent::Claude);
+        let mut parser = MirrorParser::new(MirrorAgent::Claude, PROJECT);
         let line = claude_line("user", "incremental boundary", "2026-07-24T10:00:00Z");
         let bytes = format!("{line}\n");
         let (head, tail) = bytes.as_bytes().split_at(bytes.len() / 2);
@@ -1345,7 +1357,7 @@ mod tests {
 
     #[test]
     fn parser_codex_lines() {
-        let mut parser = MirrorParser::new(MirrorAgent::Codex);
+        let mut parser = MirrorParser::new(MirrorAgent::Codex, PROJECT);
         let data = concat!(
             r#"{"type":"session_meta","payload":{"id":"x","cwd":"D:\\proj"}}"#,
             "\n",
@@ -1362,7 +1374,7 @@ mod tests {
     }
     #[test]
     fn parser_omp_messages_question_and_answer() {
-        let mut parser = MirrorParser::new(MirrorAgent::Omp);
+        let mut parser = MirrorParser::new(MirrorAgent::Omp, PROJECT);
         let data = concat!(
             r#"{"type":"message","timestamp":"t0","message":{"role":"user","content":[{"type":"text","text":"help me"}]}}"#,
             "\n",
@@ -1396,7 +1408,7 @@ mod tests {
 
     #[test]
     fn parser_omp_ignores_synthetic_user_without_clearing_question() {
-        let mut parser = MirrorParser::new(MirrorAgent::Omp);
+        let mut parser = MirrorParser::new(MirrorAgent::Omp, PROJECT);
         let ask = r#"{"type":"message","timestamp":"t1","message":{"role":"assistant","content":[{"type":"toolCall","id":"ask-synthetic","name":"ask","arguments":{"questions":[{"id":"q1","question":"Which?","options":[{"label":"A"}]}]}}]}}"#;
         parser.feed(format!("{ask}\n").as_bytes());
         let synthetic = r#"{"type":"message","timestamp":"t2","message":{"role":"user","synthetic":true,"content":[{"type":"text","text":"internal"}]}}"#;
@@ -1406,7 +1418,7 @@ mod tests {
 
     #[test]
     fn parser_omp_clamps_recommended_before_other() {
-        let mut parser = MirrorParser::new(MirrorAgent::Omp);
+        let mut parser = MirrorParser::new(MirrorAgent::Omp, PROJECT);
         let ask = r#"{"type":"message","timestamp":"t1","message":{"role":"assistant","content":[{"type":"toolCall","id":"ask-clamp","name":"ask","arguments":{"questions":[{"id":"q1","question":"Which?","options":[{"label":"A"},{"label":"B"}],"recommended":99}]}}]}}"#;
         parser.feed(format!("{ask}\n").as_bytes());
         assert_eq!(parser.answer_keys(0, "ask-clamp", 0, 1).unwrap().keys, "\r");
@@ -1418,7 +1430,7 @@ mod tests {
 
     #[test]
     fn parser_omp_multi_question_submits_last_choice_but_not_other() {
-        let mut parser = MirrorParser::new(MirrorAgent::Omp);
+        let mut parser = MirrorParser::new(MirrorAgent::Omp, PROJECT);
         let ask = r#"{"type":"message","timestamp":"t1","message":{"role":"assistant","content":[{"type":"toolCall","id":"ask-multi","name":"ask","arguments":{"questions":[{"id":"q1","question":"First?","options":[{"label":"A"}]},{"id":"q2","question":"Second?","options":[{"label":"B"}]}]}}]}}"#;
         parser.feed(format!("{ask}\n").as_bytes());
         parser.mark_answered(0);
@@ -1618,7 +1630,7 @@ mod tests {
     /// 同一行:文本 → 工具(按块序),seq 连续;工具消息带结构化字段与 content 兜底。
     #[test]
     fn parser_emits_tool_messages_after_text() {
-        let mut parser = MirrorParser::new(MirrorAgent::Claude);
+        let mut parser = MirrorParser::new(MirrorAgent::Claude, PROJECT);
         let msgs = parser.feed(format!("{}\n", claude_tool_line()).as_bytes());
         assert_eq!(msgs.len(), 3, "{msgs:?}");
         assert_eq!(msgs[0].content, "先读代码。");
@@ -1647,11 +1659,34 @@ mod tests {
         assert_eq!(msgs[0].tool_target, None);
     }
 
+    /// 带项目根构造:路径类目标出相对路径(content 兜底同步),命令不动;
+    /// 根的大小写与末尾分隔符不影响,同前缀的兄弟目录不算根之下。
+    #[test]
+    fn parser_shortens_tool_paths_under_project_root() {
+        let mut parser = MirrorParser::new(MirrorAgent::Claude, r"d:\项目\");
+        let msgs = parser.feed(format!("{}\n", claude_tool_line()).as_bytes());
+        assert_eq!(msgs.len(), 3, "{msgs:?}");
+        assert_eq!(msgs[1].tool_target.as_deref(), Some(r"src\main.rs"));
+        assert_eq!(msgs[1].content, r"Read src\main.rs");
+        assert_eq!(msgs[2].tool_target.as_deref(), Some("cargo build"));
+
+        let sibling = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t","name":"Read","input":{"file_path":"D:\\项目2\\a.rs"}}]}}"#;
+        let msgs = parser.feed(format!("{sibling}\n").as_bytes());
+        assert_eq!(msgs[0].tool_target.as_deref(), Some(r"D:\项目2\a.rs"));
+
+        let mut parser = MirrorParser::new(MirrorAgent::Grok, r"D:\proj");
+        let line = r#"{"timestamp":1788251329,"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"call-r","title":"read_file","rawInput":{"target_file":"D:\\proj\\src\\cart.js"},"_meta":{"x.ai/tool":{"name":"read_file"}}}}}"#;
+        let msgs = parser.feed(format!("{line}\n").as_bytes());
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert_eq!(msgs[0].tool_target.as_deref(), Some(r"src\cart.js"));
+        assert_eq!(msgs[0].content, r"read_file src\cart.js");
+    }
+
     /// 提问与别家工具同行:文本 → 工具 → 提问卡片;AskUserQuestion 本身不出工具行。
     /// 工具消息不清挂起,之后单独的工具行同样不清——卡片照常可点选。
     #[test]
     fn parser_tool_messages_keep_question_pending() {
-        let mut parser = MirrorParser::new(MirrorAgent::Claude);
+        let mut parser = MirrorParser::new(MirrorAgent::Claude, PROJECT);
         let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"确认一下"},{"type":"tool_use","id":"toolu_g","name":"Grep","input":{"pattern":"fn main"}},{"type":"tool_use","id":"toolu_q1","name":"AskUserQuestion","input":{"questions":[{"question":"选哪个?","header":"","options":[{"label":"A","description":""},{"label":"B","description":""}],"multiSelect":false}]}}]}}"#;
         let msgs = parser.feed(format!("{line}\n").as_bytes());
         let kinds: Vec<Option<&str>> = msgs.iter().map(|m| m.kind.as_deref()).collect();
@@ -1673,7 +1708,7 @@ mod tests {
     /// Codex:function_call 出工具行;request_user_input 只出卡片不出工具行。
     #[test]
     fn parser_codex_tool_messages() {
-        let mut parser = MirrorParser::new(MirrorAgent::Codex);
+        let mut parser = MirrorParser::new(MirrorAgent::Codex, PROJECT);
         let data = concat!(
             r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"先看状态"}]}}"#,
             "\n",
@@ -1699,7 +1734,7 @@ mod tests {
     /// ask_user_question 只出卡片。
     #[test]
     fn parser_grok_tool_messages() {
-        let mut parser = MirrorParser::new(MirrorAgent::Grok);
+        let mut parser = MirrorParser::new(MirrorAgent::Grok, PROJECT);
         let data = concat!(
             r#"{"timestamp":1788251320,"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"我看一下"}}}}"#,
             "\n",
@@ -1727,7 +1762,7 @@ mod tests {
     /// OMP:文本 → 工具 → ask 卡片(ask 本身不出工具行)。
     #[test]
     fn parser_omp_tool_messages() {
-        let mut parser = MirrorParser::new(MirrorAgent::Omp);
+        let mut parser = MirrorParser::new(MirrorAgent::Omp, PROJECT);
         let line = r#"{"type":"message","timestamp":"t1","message":{"role":"assistant","content":[{"type":"text","text":"跑一下"},{"type":"toolCall","id":"c1","name":"bash","arguments":{"command":"bun test"}},{"type":"toolCall","id":"ask-1","name":"ask","arguments":{"questions":[{"id":"q1","question":"Which?","options":[{"label":"A"}]}]}}]}}"#;
         let msgs = parser.feed(format!("{line}\n").as_bytes());
         let kinds: Vec<Option<&str>> = msgs.iter().map(|m| m.kind.as_deref()).collect();
@@ -1791,10 +1826,10 @@ mod tests {
     fn feed_is_chunking_invariant() {
         let data = claude_transcript();
         let bytes = data.as_bytes();
-        let whole = MirrorParser::new(MirrorAgent::Claude).feed(bytes);
+        let whole = MirrorParser::new(MirrorAgent::Claude, PROJECT).feed(bytes);
         assert!(whole.len() >= 4, "样本至少要产出几条消息: {whole:?}");
         for size in 1..=bytes.len() {
-            let mut parser = MirrorParser::new(MirrorAgent::Claude);
+            let mut parser = MirrorParser::new(MirrorAgent::Claude, PROJECT);
             let mut got = Vec::new();
             for chunk in bytes.chunks(size) {
                 got.extend(parser.feed(chunk));
@@ -1822,9 +1857,9 @@ mod tests {
         fs::write(&file, &data).unwrap();
 
         let (bytes, read_offset) = read_from_offset(&file, 0).unwrap();
-        let expected = MirrorParser::new(MirrorAgent::Claude).feed(&bytes);
+        let expected = MirrorParser::new(MirrorAgent::Claude, PROJECT).feed(&bytes);
         for chunk in [1, 7, 64, REBIND_CHUNK] {
-            let mut parser = MirrorParser::new(MirrorAgent::Claude);
+            let mut parser = MirrorParser::new(MirrorAgent::Claude, PROJECT);
             let (msgs, offset) = parse_whole_file_chunked(&file, &mut parser, chunk).unwrap();
             assert_eq!(msgs, expected, "块大小 {chunk}");
             assert_eq!(offset, read_offset, "偏移必须推到文件尾(含半行)");
@@ -1838,7 +1873,7 @@ mod tests {
         assert!(
             parse_whole_file(
                 &dir.join("missing.jsonl"),
-                &mut MirrorParser::new(MirrorAgent::Claude)
+                &mut MirrorParser::new(MirrorAgent::Claude, PROJECT)
             )
             .is_none(),
             "打不开返回 None,调用方下一轮重试"

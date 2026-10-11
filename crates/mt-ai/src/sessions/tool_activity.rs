@@ -9,6 +9,9 @@
 //!   判据与对应的 `*_question_from_line` 一致;
 //! - 目标只给对象(路径 / 命令首行 / 搜索词),**不写任何自然语言文案**(工具名的
 //!   展示文案归前端 i18n),统一过 [`summarize_tool_target`];
+//! - **路径类目标**(文件 / 目录路径)在摘要之前先经调用方给的 [`ToolPathScope`]
+//!   缩短(项目根之下 → 相对路径、家目录 → `~`),先缩短再截断;哪些目标算路径
+//!   只在本文件按工具逐个声明([`Field::Path`]),命令 / 搜索词 / URL / 描述不碰;
 //! - 每家先做一次子串预筛再解析 JSON:换绑要把整份记录(实测可到 19 MB,工具输出
 //!   行动辄几 MB)从头解析一遍,不含工具调用判别串的行不必再多付一次全量解析。
 //!   预筛只会放过、不会误杀——判别串是 JSON 里必然逐字出现的键值。
@@ -20,6 +23,7 @@ use serde_json::Value;
 
 use super::grok::{grok_acp_update, unix_to_iso};
 use super::line_timestamp;
+use super::tool_path::ToolPathScope;
 
 /// 目标摘要的字符上限(按 char 计,超出截断并补 `…`)。
 pub const TOOL_TARGET_MAX_CHARS: usize = 160;
@@ -48,16 +52,41 @@ pub fn summarize_tool_target(raw: &str) -> Option<String> {
     Some(out)
 }
 
-/// `obj[key]` 是非空字符串 → 摘要。
-fn str_target(obj: &Value, key: &str) -> Option<String> {
-    obj.get(key)
-        .and_then(Value::as_str)
-        .and_then(summarize_tool_target)
+/// 路径类目标的摘要:先按 `paths` 缩短(项目根 → 相对路径、家目录 → `~`)再过
+/// [`summarize_tool_target`]——先截断的话,截掉的正是结尾的文件名。
+fn path_summary(raw: &str, paths: &ToolPathScope) -> Option<String> {
+    summarize_tool_target(&paths.shorten(raw.trim()))
+}
+
+/// 目标取自参数对象的哪个键,以及它是不是路径。**路径与否只在这里按工具声明**,
+/// 镜像侧不再按工具名判一遍。
+#[derive(Clone, Copy)]
+enum Field {
+    /// 命令 / 搜索词 / URL / 描述等:只摘要
+    Text(&'static str),
+    /// 文件 / 目录路径:缩短后摘要
+    Path(&'static str),
+}
+
+impl Field {
+    /// `obj[key]` 是非空字符串 → 摘要。
+    fn target(self, obj: &Value, paths: &ToolPathScope) -> Option<String> {
+        match self {
+            Field::Text(key) => obj
+                .get(key)
+                .and_then(Value::as_str)
+                .and_then(summarize_tool_target),
+            Field::Path(key) => obj
+                .get(key)
+                .and_then(Value::as_str)
+                .and_then(|raw| path_summary(raw, paths)),
+        }
+    }
 }
 
 /// 按优先级取第一个有摘要的键。
-fn first_target(obj: &Value, keys: &[&str]) -> Option<String> {
-    keys.iter().find_map(|key| str_target(obj, key))
+fn first_target(obj: &Value, fields: &[Field], paths: &ToolPathScope) -> Option<String> {
+    fields.iter().find_map(|field| field.target(obj, paths))
 }
 
 // ─── Claude ───────────────────────────────────────────────────
@@ -71,7 +100,8 @@ fn first_target(obj: &Value, keys: &[&str]) -> Option<String> {
 
 /// 解析 Claude JSONL 的一行为工具调用(assistant 行的 `tool_use` 块,按块序)。
 /// 子代理行(`isSidechain: true`)/ 非 assistant 行 / AskUserQuestion → 不产出。
-pub fn claude_tool_calls_from_line(line: &str) -> Vec<AiToolCall> {
+/// 路径类目标按 `paths` 缩短(见 [`ToolPathScope`])。
+pub fn claude_tool_calls_from_line(line: &str, paths: &ToolPathScope) -> Vec<AiToolCall> {
     if !line.contains("\"tool_use\"") {
         return Vec::new();
     }
@@ -98,28 +128,30 @@ pub fn claude_tool_calls_from_line(line: &str) -> Vec<AiToolCall> {
             }
             Some(AiToolCall {
                 name: name.to_string(),
-                target: b.get("input").and_then(|input| claude_target(name, input)),
+                target: b
+                    .get("input")
+                    .and_then(|input| claude_target(name, input, paths)),
                 timestamp: timestamp.clone(),
             })
         })
         .collect()
 }
 
-fn claude_target(name: &str, input: &Value) -> Option<String> {
-    let key = match name {
+fn claude_target(name: &str, input: &Value, paths: &ToolPathScope) -> Option<String> {
+    let field = match name {
         // PowerShell 是 Windows 上与 Bash 并列的 shell 工具,入参同为 command
-        "Bash" | "PowerShell" => "command",
-        "Read" | "Write" | "Edit" | "MultiEdit" => "file_path",
-        "NotebookEdit" => "notebook_path",
-        "Grep" | "Glob" => "pattern",
-        "WebFetch" => "url",
-        "WebSearch" => "query",
-        "Task" | "Agent" => "description",
-        "Skill" => "skill",
+        "Bash" | "PowerShell" => Field::Text("command"),
+        "Read" | "Write" | "Edit" | "MultiEdit" => Field::Path("file_path"),
+        "NotebookEdit" => Field::Path("notebook_path"),
+        "Grep" | "Glob" => Field::Text("pattern"),
+        "WebFetch" => Field::Text("url"),
+        "WebSearch" => Field::Text("query"),
+        "Task" | "Agent" => Field::Text("description"),
+        "Skill" => Field::Text("skill"),
         // TodoWrite / mcp__* / 其余工具:没有能一行概括的对象
         _ => return None,
     };
-    str_target(input, key)
+    field.target(input, paths)
 }
 
 // ─── Codex ────────────────────────────────────────────────────
@@ -137,8 +169,8 @@ fn claude_target(name: &str, input: &Value) -> Option<String> {
 // `local_shell_call`(action.command 为 argv)按协议定义一并认,本机记录里没见过。
 
 /// 解析 Codex JSONL 的一行为工具调用(`response_item` 的各类 `*_call`)。
-/// request_user_input → 不产出(走提问卡片)。
-pub fn codex_tool_calls_from_line(line: &str) -> Vec<AiToolCall> {
+/// request_user_input → 不产出(走提问卡片)。路径类目标按 `paths` 缩短。
+pub fn codex_tool_calls_from_line(line: &str, paths: &ToolPathScope) -> Vec<AiToolCall> {
     // `function_call"` / `custom_tool_call"` / `web_search_call"` … 都以 `_call"` 收尾
     if !line.contains("_call\"") {
         return Vec::new();
@@ -149,7 +181,10 @@ pub fn codex_tool_calls_from_line(line: &str) -> Vec<AiToolCall> {
     if obj.get("type").and_then(Value::as_str) != Some("response_item") {
         return Vec::new();
     }
-    let Some((name, target)) = obj.get("payload").and_then(codex_tool_call) else {
+    let Some((name, target)) = obj
+        .get("payload")
+        .and_then(|payload| codex_tool_call(payload, paths))
+    else {
         return Vec::new();
     };
     // 提问走提问卡片(判据同 codex_question_from_line)
@@ -164,7 +199,7 @@ pub fn codex_tool_calls_from_line(line: &str) -> Vec<AiToolCall> {
 }
 
 /// payload → (工具名, 目标)。不是工具调用的 payload → None。
-fn codex_tool_call(payload: &Value) -> Option<(String, Option<String>)> {
+fn codex_tool_call(payload: &Value, paths: &ToolPathScope) -> Option<(String, Option<String>)> {
     match payload.get("type").and_then(Value::as_str)? {
         "function_call" => {
             let name = payload.get("name").and_then(Value::as_str)?;
@@ -174,13 +209,13 @@ fn codex_tool_call(payload: &Value) -> Option<(String, Option<String>)> {
                 .and_then(Value::as_str)
                 .and_then(|s| serde_json::from_str::<Value>(s).ok())
                 .unwrap_or(Value::Null);
-            Some(codex_function_target(name, &args))
+            Some(codex_function_target(name, &args, paths))
         }
         "custom_tool_call" => {
             let name = payload.get("name").and_then(Value::as_str)?;
             let input = payload.get("input").and_then(Value::as_str).unwrap_or("");
             let target = match name {
-                "apply_patch" => patch_target(input),
+                "apply_patch" => patch_target(input, paths),
                 "exec" => exec_inner_tool(input),
                 _ => None,
             };
@@ -188,11 +223,16 @@ fn codex_tool_call(payload: &Value) -> Option<(String, Option<String>)> {
         }
         "local_shell_call" => {
             let command = payload.pointer("/action/command").and_then(command_text);
-            Some(shell_call("local_shell", command))
+            Some(shell_call("local_shell", command, paths))
         }
         "web_search_call" => {
             let target = payload.get("action").and_then(|action| {
-                first_target(action, &["query", "pattern", "url"]).or_else(|| {
+                let fields = [
+                    Field::Text("query"),
+                    Field::Text("pattern"),
+                    Field::Text("url"),
+                ];
+                first_target(action, &fields, paths).or_else(|| {
                     action
                         .get("queries")?
                         .as_array()?
@@ -207,21 +247,28 @@ fn codex_tool_call(payload: &Value) -> Option<(String, Option<String>)> {
     }
 }
 
-fn codex_function_target(name: &str, args: &Value) -> (String, Option<String>) {
+fn codex_function_target(
+    name: &str,
+    args: &Value,
+    paths: &ToolPathScope,
+) -> (String, Option<String>) {
     match name {
         "shell" | "container.exec" | "shell_command" => {
-            shell_call(name, args.get("command").and_then(command_text))
+            shell_call(name, args.get("command").and_then(command_text), paths)
         }
-        "exec_command" => shell_call(name, args.get("cmd").and_then(command_text)),
+        "exec_command" => shell_call(name, args.get("cmd").and_then(command_text), paths),
         // 旧版 JSON 形态的 apply_patch:补丁正文在 input
         "apply_patch" => (
             name.to_string(),
             args.get("input")
                 .and_then(Value::as_str)
-                .and_then(patch_target),
+                .and_then(|patch| patch_target(patch, paths)),
         ),
-        "view_image" => (name.to_string(), str_target(args, "path")),
-        "spawn_agent" => (name.to_string(), str_target(args, "task_name")),
+        "view_image" => (name.to_string(), Field::Path("path").target(args, paths)),
+        "spawn_agent" => (
+            name.to_string(),
+            Field::Text("task_name").target(args, paths),
+        ),
         // update_plan 及其余工具:没有能一行概括的对象
         _ => (name.to_string(), None),
     }
@@ -230,12 +277,16 @@ fn codex_function_target(name: &str, args: &Value) -> (String, Option<String>) {
 /// shell 类调用。命令里带补丁时(apply_patch 经 shell 下发,真实记录见过)按补丁
 /// 处理:工具名记作 `apply_patch`、目标取补丁里的文件路径——与 Codex 自家 TUI 把它
 /// 渲染成改文件同一口径;否则取命令首行。
-fn shell_call(name: &str, command: Option<String>) -> (String, Option<String>) {
+fn shell_call(
+    name: &str,
+    command: Option<String>,
+    paths: &ToolPathScope,
+) -> (String, Option<String>) {
     let Some(command) = command else {
         return (name.to_string(), None);
     };
     if command.contains("*** Begin Patch")
-        && let Some(path) = patch_target(&command)
+        && let Some(path) = patch_target(&command, paths)
     {
         return ("apply_patch".to_string(), Some(path));
     }
@@ -256,15 +307,16 @@ fn command_text(value: &Value) -> Option<String> {
     }
 }
 
-/// 补丁正文里第一个 `*** Update/Add/Delete File: <path>` 的路径。
-fn patch_target(patch: &str) -> Option<String> {
+/// 补丁正文里第一个 `*** Update/Add/Delete File: <path>` 的路径(路径类,按 `paths`
+/// 缩短;Codex 的补丁路径常常本来就是相对的,那就原样)。
+fn patch_target(patch: &str, paths: &ToolPathScope) -> Option<String> {
     const HEADERS: [&str; 3] = ["*** Update File:", "*** Add File:", "*** Delete File:"];
     patch.lines().find_map(|line| {
         let line = line.trim_start();
         HEADERS
             .iter()
             .find_map(|header| line.strip_prefix(header))
-            .and_then(summarize_tool_target)
+            .and_then(|path| path_summary(path, paths))
     })
 }
 
@@ -293,8 +345,8 @@ fn exec_inner_tool(script: &str) -> Option<String> {
 // list_dir.target_directory、grep.pattern、use_tool.tool_name、search_tool.query。
 
 /// 解析 grok updates.jsonl 的一行为工具调用(只认 `tool_call` 首行,见上)。
-/// ask_user_question → 不产出(走提问卡片)。
-pub fn grok_tool_calls_from_line(line: &str) -> Vec<AiToolCall> {
+/// ask_user_question → 不产出(走提问卡片)。路径类目标按 `paths` 缩短。
+pub fn grok_tool_calls_from_line(line: &str, paths: &ToolPathScope) -> Vec<AiToolCall> {
     // `"tool_call_update"` 不含这个判别串,富化行与终态行在这里就被筛掉
     if !line.contains("\"tool_call\"") {
         return Vec::new();
@@ -318,36 +370,34 @@ pub fn grok_tool_calls_from_line(line: &str) -> Vec<AiToolCall> {
         name: name.to_string(),
         target: update
             .get("rawInput")
-            .and_then(|input| grok_target(name, input)),
+            .and_then(|input| grok_target(name, input, paths)),
         timestamp: unix_to_iso(ts),
     }]
 }
 
-fn grok_target(name: &str, input: &Value) -> Option<String> {
-    match name {
-        "run_terminal_command" => str_target(input, "command"),
-        "read_file" => str_target(input, "target_file"),
-        "list_dir" => str_target(input, "target_directory"),
-        "grep" => str_target(input, "pattern"),
+fn grok_target(name: &str, input: &Value, paths: &ToolPathScope) -> Option<String> {
+    let fields: &[Field] = match name {
+        "run_terminal_command" => &[Field::Text("command")],
+        "read_file" => &[Field::Path("target_file")],
+        "list_dir" => &[Field::Path("target_directory")],
+        "grep" => &[Field::Text("pattern")],
         // use_tool 是代调别的(MCP 等)工具:目标就是被调的工具名
-        "use_tool" => str_target(input, "tool_name"),
+        "use_tool" => &[Field::Text("tool_name")],
         // search_tool 是工具发现(同 Claude 的 ToolSearch),没有对象
-        "search_tool" => None,
-        // 没见过的工具:按常见目标键的优先级取一个
-        _ => first_target(
-            input,
-            &[
-                "command",
-                "target_file",
-                "file_path",
-                "path",
-                "target_directory",
-                "pattern",
-                "query",
-                "url",
-            ],
-        ),
-    }
+        "search_tool" => return None,
+        // 没见过的工具:按常见目标键的优先级取一个(路径键照样缩短)
+        _ => &[
+            Field::Text("command"),
+            Field::Path("target_file"),
+            Field::Path("file_path"),
+            Field::Path("path"),
+            Field::Path("target_directory"),
+            Field::Text("pattern"),
+            Field::Text("query"),
+            Field::Text("url"),
+        ],
+    };
+    first_target(input, fields, paths)
 }
 
 // ─── OMP ──────────────────────────────────────────────────────
@@ -358,8 +408,8 @@ fn grok_target(name: &str, input: &Value) -> Option<String> {
 // grep.pattern(`search` 是 grep 的旧名)、web_search.query、task.name。
 
 /// 解析 OMP JSONL 的一行为工具调用(assistant 消息里的 `toolCall` 块,按块序)。
-/// ask → 不产出(走提问卡片)。
-pub fn omp_tool_calls_from_line(line: &str) -> Vec<AiToolCall> {
+/// ask → 不产出(走提问卡片)。路径类目标按 `paths` 缩短。
+pub fn omp_tool_calls_from_line(line: &str, paths: &ToolPathScope) -> Vec<AiToolCall> {
     if !line.contains("\"toolCall\"") {
         return Vec::new();
     }
@@ -386,29 +436,38 @@ pub fn omp_tool_calls_from_line(line: &str) -> Vec<AiToolCall> {
             }
             Some(AiToolCall {
                 name: name.to_string(),
-                target: b.get("arguments").and_then(|args| omp_target(name, args)),
+                target: b
+                    .get("arguments")
+                    .and_then(|args| omp_target(name, args, paths)),
                 timestamp: timestamp.clone(),
             })
         })
         .collect()
 }
 
-fn omp_target(name: &str, args: &Value) -> Option<String> {
-    match name {
-        "bash" => str_target(args, "command"),
-        "read" | "write" | "edit" | "ls" => first_target(args, &["path", "file_path"]),
-        "glob" | "find" => first_target(args, &["path", "pattern"]),
-        "grep" | "search" => str_target(args, "pattern"),
-        "web_search" => str_target(args, "query"),
-        "fetch" => str_target(args, "url"),
-        "task" => str_target(args, "name"),
-        _ => None,
-    }
+fn omp_target(name: &str, args: &Value, paths: &ToolPathScope) -> Option<String> {
+    let fields: &[Field] = match name {
+        "bash" => &[Field::Text("command")],
+        "read" | "write" | "edit" | "ls" => &[Field::Path("path"), Field::Path("file_path")],
+        // glob 的通配式写在 path 里(`src/**/*.ts`),绝对路径开头同样缩短
+        "glob" | "find" => &[Field::Path("path"), Field::Text("pattern")],
+        "grep" | "search" => &[Field::Text("pattern")],
+        "web_search" => &[Field::Text("query")],
+        "fetch" => &[Field::Text("url")],
+        "task" => &[Field::Text("name")],
+        _ => return None,
+    };
+    first_target(args, fields, paths)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 不缩短路径的口径(既有用例的目标都按原文断言)。
+    fn no_paths() -> ToolPathScope {
+        ToolPathScope::default()
+    }
 
     fn call(name: &str, target: Option<&str>, timestamp: &str) -> AiToolCall {
         AiToolCall {
@@ -468,7 +527,7 @@ mod tests {
     fn claude_text_and_tools_in_block_order() {
         let line = r#"{"type":"assistant","timestamp":"2026-10-11T08:00:00.000Z","isSidechain":false,"message":{"role":"assistant","content":[{"type":"text","text":"先看看。"},{"type":"tool_use","id":"toolu_1","name":"Read","input":{"file_path":"D:\\proj\\src\\main.rs","limit":40}},{"type":"tool_use","id":"toolu_2","name":"Bash","input":{"command":"cargo build\ncargo test","description":"构建"}}]}}"#;
         assert_eq!(
-            claude_tool_calls_from_line(line),
+            claude_tool_calls_from_line(line, &no_paths()),
             vec![
                 call(
                     "Read",
@@ -485,22 +544,22 @@ mod tests {
         // AskUserQuestion 走提问卡片;同行的别家工具照出
         let ask = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_q","name":"AskUserQuestion","input":{"questions":[]}},{"type":"tool_use","id":"toolu_t","name":"TodoWrite","input":{"todos":[]}}]}}"#;
         assert_eq!(
-            claude_tool_calls_from_line(ask),
+            claude_tool_calls_from_line(ask, &no_paths()),
             vec![call("TodoWrite", None, "")]
         );
 
         // 子代理行整行跳过
         let sidechain = r#"{"type":"assistant","isSidechain":true,"message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_s","name":"Bash","input":{"command":"ls"}}]}}"#;
-        assert!(claude_tool_calls_from_line(sidechain).is_empty());
+        assert!(claude_tool_calls_from_line(sidechain, &no_paths()).is_empty());
 
         // user 行(tool_result 正文里出现判别串)不是工具调用
         let user = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"\"tool_use\" mentioned"}]}}"#;
-        assert!(claude_tool_calls_from_line(user).is_empty());
+        assert!(claude_tool_calls_from_line(user, &no_paths()).is_empty());
 
         // 纯文本 / 非 JSON
         let text = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"done"}]}}"#;
-        assert!(claude_tool_calls_from_line(text).is_empty());
-        assert!(claude_tool_calls_from_line("not json \"tool_use\"").is_empty());
+        assert!(claude_tool_calls_from_line(text, &no_paths()).is_empty());
+        assert!(claude_tool_calls_from_line("not json \"tool_use\"", &no_paths()).is_empty());
     }
 
     #[test]
@@ -558,7 +617,7 @@ mod tests {
             let line = format!(
                 r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"tool_use","id":"t","name":{block}}}]}}}}"#
             );
-            let calls = claude_tool_calls_from_line(&line);
+            let calls = claude_tool_calls_from_line(&line, &no_paths());
             assert_eq!(calls.len(), 1, "{line}");
             assert_eq!(calls[0].target.as_deref(), expected, "{line}");
         }
@@ -589,7 +648,7 @@ mod tests {
             &serde_json::json!({"command": "git status\ngit diff", "workdir": "D:\\proj", "timeout_ms": 10000}),
         );
         assert_eq!(
-            codex_tool_calls_from_line(&line),
+            codex_tool_calls_from_line(&line, &no_paths()),
             vec![call(
                 "shell_command",
                 Some("git status"),
@@ -602,7 +661,9 @@ mod tests {
             &serde_json::json!({"cmd": "cargo  test", "yield_time_ms": 1000}),
         );
         assert_eq!(
-            codex_tool_calls_from_line(&line)[0].target.as_deref(),
+            codex_tool_calls_from_line(&line, &no_paths())[0]
+                .target
+                .as_deref(),
             Some("cargo test")
         );
 
@@ -611,7 +672,9 @@ mod tests {
             &serde_json::json!({"command": ["powershell.exe", "-Command", "Get-ChildItem src"]}),
         );
         assert_eq!(
-            codex_tool_calls_from_line(&line)[0].target.as_deref(),
+            codex_tool_calls_from_line(&line, &no_paths())[0]
+                .target
+                .as_deref(),
             Some("powershell.exe -Command Get-ChildItem src")
         );
     }
@@ -631,7 +694,7 @@ mod tests {
         })
         .to_string();
         assert_eq!(
-            codex_tool_calls_from_line(&custom),
+            codex_tool_calls_from_line(&custom, &no_paths()),
             vec![call("apply_patch", Some("docs/new.md"), "")]
         );
 
@@ -639,7 +702,7 @@ mod tests {
             "shell",
             &serde_json::json!({"command": ["apply_patch", "*** Begin Patch\n*** Delete File: old.txt\n*** End Patch"]}),
         );
-        let calls = codex_tool_calls_from_line(&via_shell);
+        let calls = codex_tool_calls_from_line(&via_shell, &no_paths());
         assert_eq!(calls[0].name, "apply_patch");
         assert_eq!(calls[0].target.as_deref(), Some("old.txt"));
 
@@ -648,7 +711,9 @@ mod tests {
             &serde_json::json!({"input": "*** Begin Patch\n*** Update File: a/b.rs\n*** End Patch"}),
         );
         assert_eq!(
-            codex_tool_calls_from_line(&legacy)[0].target.as_deref(),
+            codex_tool_calls_from_line(&legacy, &no_paths())[0]
+                .target
+                .as_deref(),
             Some("a/b.rs")
         );
 
@@ -657,7 +722,7 @@ mod tests {
             "shell_command",
             &serde_json::json!({"command": "rg \"*** Begin Patch\" docs"}),
         );
-        let calls = codex_tool_calls_from_line(&mention);
+        let calls = codex_tool_calls_from_line(&mention, &no_paths());
         assert_eq!(calls[0].name, "shell_command");
         assert_eq!(
             calls[0].target.as_deref(),
@@ -679,7 +744,7 @@ mod tests {
                 }
             })
             .to_string();
-            let calls = codex_tool_calls_from_line(&line);
+            let calls = codex_tool_calls_from_line(&line, &no_paths());
             assert_eq!(calls.len(), 1);
             assert_eq!(calls[0].name, "exec");
             calls[0].target.clone()
@@ -707,7 +772,7 @@ mod tests {
             )
         };
         let target = |action: &str| {
-            let calls = codex_tool_calls_from_line(&line(action));
+            let calls = codex_tool_calls_from_line(&line(action), &no_paths());
             assert_eq!(calls.len(), 1);
             assert_eq!(calls[0].name, "web_search");
             calls[0].target.clone()
@@ -735,7 +800,7 @@ mod tests {
     fn codex_excludes_question_and_non_call_items() {
         // request_user_input 走提问卡片
         let ask = codex_function_line("request_user_input", &serde_json::json!({"questions": []}));
-        assert!(codex_tool_calls_from_line(&ask).is_empty());
+        assert!(codex_tool_calls_from_line(&ask, &no_paths()).is_empty());
 
         // 回执 / 消息 / 非 response_item 都不是工具调用
         for line in [
@@ -744,20 +809,26 @@ mod tests {
             r#"{"type":"event_msg","payload":{"type":"web_search_call"}}"#,
             "garbage _call\"",
         ] {
-            assert!(codex_tool_calls_from_line(line).is_empty(), "{line}");
+            assert!(
+                codex_tool_calls_from_line(line, &no_paths()).is_empty(),
+                "{line}"
+            );
         }
 
         // update_plan 无对象;tool_search 是工具发现;arguments 解析失败只丢目标
         let plan = codex_function_line("update_plan", &serde_json::json!({"plan": []}));
-        assert_eq!(codex_tool_calls_from_line(&plan)[0].target, None);
+        assert_eq!(
+            codex_tool_calls_from_line(&plan, &no_paths())[0].target,
+            None
+        );
         let search = r#"{"type":"response_item","payload":{"type":"tool_search_call","arguments":{"query":"x"},"call_id":"c"}}"#;
         assert_eq!(
-            codex_tool_calls_from_line(search),
+            codex_tool_calls_from_line(search, &no_paths()),
             vec![call("tool_search", None, "")]
         );
         let bad = r#"{"type":"response_item","payload":{"type":"function_call","name":"shell_command","arguments":"not json","call_id":"c"}}"#;
         assert_eq!(
-            codex_tool_calls_from_line(bad),
+            codex_tool_calls_from_line(bad, &no_paths()),
             vec![call("shell_command", None, "")]
         );
     }
@@ -769,7 +840,7 @@ mod tests {
     fn grok_only_first_tool_call_line_counts() {
         let first = r#"{"timestamp":1788251329,"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"call-1","title":"read_file","rawInput":{"target_file":"src/lib.rs","limit":50},"_meta":{"x.ai/tool":{"name":"read_file"}}}}}"#;
         assert_eq!(
-            grok_tool_calls_from_line(first),
+            grok_tool_calls_from_line(first, &no_paths()),
             vec![call(
                 "read_file",
                 Some("src/lib.rs"),
@@ -779,8 +850,8 @@ mod tests {
 
         let enriched = r#"{"timestamp":1788251329,"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"call-1","kind":"read","title":"Read src/lib.rs","rawInput":{"variant":"ReadFile","target_file":"src/lib.rs"},"locations":[{"path":"src/lib.rs"}],"_meta":{"x.ai/tool":{"name":"read_file"}}}}}"#;
         let terminal = r#"{"timestamp":1788251351,"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"call-1","status":"completed","rawOutput":null,"content":[]}}}"#;
-        assert!(grok_tool_calls_from_line(enriched).is_empty());
-        assert!(grok_tool_calls_from_line(terminal).is_empty());
+        assert!(grok_tool_calls_from_line(enriched, &no_paths()).is_empty());
+        assert!(grok_tool_calls_from_line(terminal, &no_paths()).is_empty());
     }
 
     #[test]
@@ -791,7 +862,7 @@ mod tests {
             )
         };
         let target = |name: &str, raw_input: &str| {
-            let calls = grok_tool_calls_from_line(&line(name, raw_input));
+            let calls = grok_tool_calls_from_line(&line(name, raw_input), &no_paths());
             assert_eq!(calls.len(), 1, "{name}");
             assert_eq!(calls[0].name, name);
             calls[0].target.clone()
@@ -829,17 +900,21 @@ mod tests {
 
         // ask_user_question 走提问卡片
         assert!(
-            grok_tool_calls_from_line(&line("ask_user_question", r#"{"questions":[]}"#)).is_empty()
+            grok_tool_calls_from_line(
+                &line("ask_user_question", r#"{"questions":[]}"#),
+                &no_paths()
+            )
+            .is_empty()
         );
         // 没有 _meta 时 title 兜底当工具名
         let bare = r#"{"timestamp":0,"method":"session/update","params":{"update":{"sessionUpdate":"tool_call","toolCallId":"c","title":"read_file","rawInput":{"target_file":"x"}}}}"#;
         assert_eq!(
-            grok_tool_calls_from_line(bare),
+            grok_tool_calls_from_line(bare, &no_paths()),
             vec![call("read_file", Some("x"), "")]
         );
         // xAI 扩展轨不是 ACP 工具调用
         let xai = r#"{"timestamp":1,"method":"_x.ai/session/update","params":{"update":{"sessionUpdate":"tool_call","title":"read_file"}}}"#;
-        assert!(grok_tool_calls_from_line(xai).is_empty());
+        assert!(grok_tool_calls_from_line(xai, &no_paths()).is_empty());
     }
 
     // ---- OMP ----
@@ -848,7 +923,7 @@ mod tests {
     fn omp_text_and_tool_calls_with_question_excluded() {
         let line = r#"{"type":"message","timestamp":"2026-10-11T08:00:00Z","message":{"role":"assistant","content":[{"type":"text","text":"先跑测试"},{"type":"toolCall","id":"c1","name":"bash","arguments":{"command":"bun test\nbun lint","timeout":60}},{"type":"toolCall","id":"c2","name":"read","arguments":{"path":"src/index.ts"}},{"type":"toolCall","id":"c3","name":"ask","arguments":{"questions":[]}}]}}"#;
         assert_eq!(
-            omp_tool_calls_from_line(line),
+            omp_tool_calls_from_line(line, &no_paths()),
             vec![
                 call("bash", Some("bun test"), "2026-10-11T08:00:00Z"),
                 call("read", Some("src/index.ts"), "2026-10-11T08:00:00Z"),
@@ -857,7 +932,7 @@ mod tests {
 
         // toolResult / user 行不是工具调用
         let result = r#"{"type":"message","message":{"role":"toolResult","toolCallId":"c1","toolName":"bash","content":[{"type":"text","text":"\"toolCall\""}]}}"#;
-        assert!(omp_tool_calls_from_line(result).is_empty());
+        assert!(omp_tool_calls_from_line(result, &no_paths()).is_empty());
     }
 
     #[test]
@@ -893,9 +968,254 @@ mod tests {
             let line = format!(
                 r#"{{"type":"message","message":{{"role":"assistant","content":[{{"type":"toolCall","id":"c","name":{block}}}]}}}}"#
             );
-            let calls = omp_tool_calls_from_line(&line);
+            let calls = omp_tool_calls_from_line(&line, &no_paths());
             assert_eq!(calls.len(), 1, "{line}");
             assert_eq!(calls[0].target.as_deref(), expected, "{line}");
         }
+    }
+
+    // ---- 路径类目标的缩短 ----
+
+    fn proj_paths() -> ToolPathScope {
+        ToolPathScope::with_home(r"D:\proj", Some(r"C:\Users\Dev"))
+    }
+
+    fn claude_line_with(name: &str, input: serde_json::Value) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "t", "name": name, "input": input}]
+            }
+        })
+        .to_string()
+    }
+
+    fn claude_target_with(
+        name: &str,
+        input: serde_json::Value,
+        paths: &ToolPathScope,
+    ) -> Option<String> {
+        let calls = claude_tool_calls_from_line(&claude_line_with(name, input), paths);
+        assert_eq!(calls.len(), 1, "{name}");
+        calls[0].target.clone()
+    }
+
+    #[test]
+    fn claude_path_targets_are_shortened() {
+        let paths = proj_paths();
+        let cases = [
+            ("Read", "file_path", r"D:\proj\src\cart.js", r"src\cart.js"),
+            ("Write", "file_path", r"d:\PROJ\src\new.js", r"src\new.js"),
+            ("Edit", "file_path", "D:/proj/src/cart.js", "src/cart.js"),
+            ("MultiEdit", "file_path", r"D:\proj", "."),
+            (
+                "NotebookEdit",
+                "notebook_path",
+                r"D:\proj\nb\a.ipynb",
+                r"nb\a.ipynb",
+            ),
+            // 家目录 → `~`;都不沾 / 同前缀的兄弟目录 / 相对路径:原样
+            (
+                "Read",
+                "file_path",
+                r"C:\Users\Dev\.claude\CLAUDE.md",
+                r"~\.claude\CLAUDE.md",
+            ),
+            (
+                "Read",
+                "file_path",
+                r"D:\proj2\src\a.rs",
+                r"D:\proj2\src\a.rs",
+            ),
+            ("Read", "file_path", r"E:\data\x.csv", r"E:\data\x.csv"),
+            ("Read", "file_path", r"src\cart.js", r"src\cart.js"),
+        ];
+        for (name, key, raw, expected) in cases {
+            assert_eq!(
+                claude_target_with(name, serde_json::json!({ key: raw }), &paths).as_deref(),
+                Some(expected),
+                "{name} {raw}"
+            );
+        }
+    }
+
+    /// 命令 / 搜索词 / URL / 描述哪怕含项目根,也一个字不动。
+    #[test]
+    fn non_path_targets_are_not_shortened() {
+        let paths = proj_paths();
+        let cases = [
+            ("Bash", "command", r"type D:\proj\src\cart.js"),
+            ("PowerShell", "command", r"Get-Content D:\proj\a.txt"),
+            ("Grep", "pattern", r"D:\proj"),
+            ("Glob", "pattern", r"D:\proj\**\*.rs"),
+            ("WebFetch", "url", "https://example.com/D:/proj"),
+            ("WebSearch", "query", r"D:\proj readme"),
+            ("Agent", "description", r"看 D:\proj\src"),
+        ];
+        for (name, key, raw) in cases {
+            assert_eq!(
+                claude_target_with(name, serde_json::json!({ key: raw }), &paths).as_deref(),
+                Some(raw),
+                "{name}"
+            );
+        }
+
+        let codex = codex_function_line(
+            "shell_command",
+            &serde_json::json!({"command": r"cat D:\proj\src\lib.rs", "workdir": r"D:\proj"}),
+        );
+        assert_eq!(
+            codex_tool_calls_from_line(&codex, &paths)[0]
+                .target
+                .as_deref(),
+            Some(r"cat D:\proj\src\lib.rs")
+        );
+        let grok = serde_json::json!({
+            "timestamp": 1,
+            "method": "session/update",
+            "params": {"update": {
+                "sessionUpdate": "tool_call",
+                "title": "run_terminal_command",
+                "rawInput": {"command": r"ls D:\proj"}
+            }}
+        })
+        .to_string();
+        assert_eq!(
+            grok_tool_calls_from_line(&grok, &paths)[0]
+                .target
+                .as_deref(),
+            Some(r"ls D:\proj")
+        );
+        let omp = serde_json::json!({
+            "type": "message",
+            "message": {"role": "assistant", "content": [{
+                "type": "toolCall",
+                "id": "c",
+                "name": "grep",
+                "arguments": {"pattern": r"D:\proj", "path": r"D:\proj\src"}
+            }]}
+        })
+        .to_string();
+        assert_eq!(
+            omp_tool_calls_from_line(&omp, &paths)[0].target.as_deref(),
+            Some(r"D:\proj")
+        );
+    }
+
+    #[test]
+    fn codex_path_targets_are_shortened() {
+        let paths = proj_paths();
+        let custom = |patch: &str| {
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {"type": "custom_tool_call", "name": "apply_patch", "input": patch}
+            })
+            .to_string()
+        };
+        let target = |line: &str| codex_tool_calls_from_line(line, &paths)[0].target.clone();
+        let update =
+            custom("*** Begin Patch\n*** Update File: D:\\proj\\src\\lib.rs\n*** End Patch");
+        assert_eq!(target(&update).as_deref(), Some(r"src\lib.rs"));
+        // 补丁路径本来就是相对的:原样
+        let relative = custom("*** Begin Patch\n*** Add File: docs/new.md\n+x\n*** End Patch");
+        assert_eq!(target(&relative).as_deref(), Some("docs/new.md"));
+        // 经 shell 下发的补丁同样缩短
+        let via_shell = codex_function_line(
+            "shell",
+            &serde_json::json!({"command": ["apply_patch", "*** Begin Patch\n*** Delete File: D:/proj/old.txt\n*** End Patch"]}),
+        );
+        assert_eq!(target(&via_shell).as_deref(), Some("old.txt"));
+        let view = codex_function_line(
+            "view_image",
+            &serde_json::json!({"path": r"C:\Users\Dev\Pictures\shot.png"}),
+        );
+        assert_eq!(target(&view).as_deref(), Some(r"~\Pictures\shot.png"));
+        // spawn_agent 的 task_name 不是路径
+        let spawn =
+            codex_function_line("spawn_agent", &serde_json::json!({"task_name": r"D:\proj"}));
+        assert_eq!(target(&spawn).as_deref(), Some(r"D:\proj"));
+    }
+
+    #[test]
+    fn grok_and_omp_path_targets_are_shortened() {
+        let paths = proj_paths();
+        let grok = |name: &str, raw_input: serde_json::Value| {
+            let line = serde_json::json!({
+                "timestamp": 1,
+                "method": "session/update",
+                "params": {"update": {
+                    "sessionUpdate": "tool_call",
+                    "title": name,
+                    "rawInput": raw_input,
+                    "_meta": {"x.ai/tool": {"name": name}}
+                }}
+            })
+            .to_string();
+            grok_tool_calls_from_line(&line, &paths)[0].target.clone()
+        };
+        let read = grok(
+            "read_file",
+            serde_json::json!({"target_file": r"D:\proj\src\lib.rs"}),
+        );
+        assert_eq!(read.as_deref(), Some(r"src\lib.rs"));
+        let list = grok(
+            "list_dir",
+            serde_json::json!({"target_directory": r"D:\proj"}),
+        );
+        assert_eq!(list.as_deref(), Some("."));
+        // 没见过的工具:按键取到的若是路径键,同样缩短
+        let edit = grok(
+            "edit_file",
+            serde_json::json!({"file_path": r"D:\proj\a.rs"}),
+        );
+        assert_eq!(edit.as_deref(), Some("a.rs"));
+        let grep = grok("grep", serde_json::json!({"pattern": r"D:\proj\a.rs"}));
+        assert_eq!(grep.as_deref(), Some(r"D:\proj\a.rs"));
+
+        let omp = |name: &str, args: serde_json::Value| {
+            let line = serde_json::json!({
+                "type": "message",
+                "message": {"role": "assistant", "content": [
+                    {"type": "toolCall", "id": "c", "name": name, "arguments": args}
+                ]}
+            })
+            .to_string();
+            omp_tool_calls_from_line(&line, &paths)[0].target.clone()
+        };
+        for name in ["read", "write", "edit"] {
+            let got = omp(name, serde_json::json!({"path": r"D:\proj\src\index.ts"}));
+            assert_eq!(got.as_deref(), Some(r"src\index.ts"), "{name}");
+        }
+        let glob = omp("glob", serde_json::json!({"path": r"D:\proj\src\**\*.ts"}));
+        assert_eq!(glob.as_deref(), Some(r"src\**\*.ts"));
+        let bash = omp("bash", serde_json::json!({"command": r"cat D:\proj\a"}));
+        assert_eq!(bash.as_deref(), Some(r"cat D:\proj\a"));
+    }
+
+    /// 先缩短再截断:绝对路径超长、相对路径不超长时,文件名完整保住;
+    /// 相对路径本身超长时,截断后开头仍是相对路径。
+    #[test]
+    fn long_path_is_shortened_before_truncation() {
+        let read = |raw: &str, paths: &ToolPathScope| {
+            claude_target_with("Read", serde_json::json!({ "file_path": raw }), paths).unwrap()
+        };
+
+        let deep = "d".repeat(150);
+        let raw = format!(r"D:\proj\{deep}\cart.js");
+        assert!(raw.chars().count() > TOOL_TARGET_MAX_CHARS);
+        // 不缩短:文件名被截掉
+        let untouched = read(&raw, &no_paths());
+        assert!(untouched.starts_with(r"D:\proj\") && untouched.ends_with('…'));
+        assert!(!untouched.contains("cart.js"));
+        // 缩短后不超长:完整保住文件名
+        assert_eq!(read(&raw, &proj_paths()), format!(r"{deep}\cart.js"));
+
+        let deeper = r"segment\".repeat(30);
+        let raw = format!(r"D:\proj\{deeper}cart.js");
+        let got = read(&raw, &proj_paths());
+        assert!(got.starts_with(r"segment\segment\"), "{got}");
+        assert!(got.ends_with('…'));
+        assert_eq!(got.chars().count(), TOOL_TARGET_MAX_CHARS + 1);
     }
 }
