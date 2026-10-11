@@ -12,6 +12,7 @@ mod codex;
 mod grok;
 mod lineage;
 mod omp;
+mod tool_activity;
 
 pub use codex::{
     CodexSessionMeta, codex_message_from_line, codex_meta_from_line,
@@ -30,6 +31,10 @@ pub use lineage::{
 pub use omp::{
     OmpSessionMeta, find_omp_session_file, newest_omp_session_file, omp_message_from_line,
     omp_question_answer_from_line, omp_question_from_line, omp_session_meta_from_line,
+};
+pub use tool_activity::{
+    AiToolCall, TOOL_TARGET_MAX_CHARS, claude_tool_calls_from_line, codex_tool_calls_from_line,
+    grok_tool_calls_from_line, omp_tool_calls_from_line, summarize_tool_target,
 };
 
 use codex::{

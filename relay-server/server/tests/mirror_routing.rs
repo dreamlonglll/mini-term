@@ -203,6 +203,48 @@ async fn subscribe_routes_mirror_flow_end_to_end() {
     );
 }
 
+/// 中转按类型反序列化再重新序列化转发,不认识的字段会被吃掉:工具活动的
+/// toolName / toolTarget 必须是协议里的具名字段,才能原样到达移动端。
+#[tokio::test]
+async fn tool_activity_fields_survive_forwarding() {
+    let addr = spawn_relay().await;
+    let (mut desktop, mut mobile) = paired_pair(addr).await;
+
+    send_json(
+        &mut mobile,
+        &MobileToRelay::SubscribePane {
+            pane_id: "pane-1".into(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        recv_json::<RelayToDesktop>(&mut desktop).await,
+        Some(RelayToDesktop::SubscribePane { .. })
+    ));
+
+    let tool = MirrorMessage {
+        kind: Some("tool".into()),
+        tool_name: Some("Bash".into()),
+        tool_target: Some("cargo test".into()),
+        ..msg(3, "Bash cargo test")
+    };
+    send_json(
+        &mut desktop,
+        &DesktopToRelay::MirrorAppend {
+            pane_id: "pane-1".into(),
+            messages: vec![tool.clone()],
+        },
+    )
+    .await;
+    assert_eq!(
+        recv_json::<RelayToMobile>(&mut mobile).await,
+        Some(RelayToMobile::MirrorAppend {
+            pane_id: "pane-1".into(),
+            messages: vec![tool],
+        })
+    );
+}
+
 #[tokio::test]
 async fn unsubscribed_pane_messages_are_dropped() {
     let addr = spawn_relay().await;

@@ -112,8 +112,10 @@ pub struct MirrorMessage {
     /// 会话记录中的 ISO 8601 时间戳,缺失时为空串
     pub timestamp: String,
     /// 消息种类:缺省 = 普通文本;"question" = agent 提问卡片(questions 随行);
-    /// "questionAnswered" = 提问已作答标记(ref_seq 指向提问消息,content 为选中项)。
-    /// 三个字段都是向后兼容的可选扩展:旧桌面端不发,旧移动端只渲染 content 兜底文本。
+    /// "questionAnswered" = 提问已作答标记(ref_seq 指向提问消息,content 为选中项);
+    /// "tool" = agent 的一次工具调用(tool_name / tool_target 随行,source 恒为
+    /// "assistant",content 是 `工具名 目标` 的纯文本兜底)。
+    /// 这些字段都是向后兼容的可选扩展:旧桌面端不发,旧移动端只渲染 content 兜底文本。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
     /// kind = "question" 时的结构化题目(一次提问可含多题,TUI 逐题推进)
@@ -130,6 +132,12 @@ pub struct MirrorMessage {
     /// 为空 = 打断/旧版记录给不出选中项,移动端显示中性的「已处理」
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<String>,
+    /// kind = "tool" 时的工具名原文(Bash / Edit / shell / apply_patch …)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    /// kind = "tool" 时的一行目标摘要(文件路径 / 命令首行 / 搜索词…),可缺省
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_target: Option<String>,
 }
 
 /// agent 提问的一道题。
@@ -886,6 +894,8 @@ mod tests {
             question_id: Some("toolu_q1".into()),
             ref_seq: None,
             labels: Vec::new(),
+            tool_name: None,
+            tool_target: None,
         };
         let json = serde_json::to_string(&card).unwrap();
         assert!(
@@ -920,6 +930,67 @@ mod tests {
         assert_eq!(msg.question_id, None);
         assert_eq!(msg.ref_seq, None);
         assert!(msg.labels.is_empty());
+    }
+
+    /// 镜像消息的工具活动扩展:toolName / toolTarget camelCase 往返;None 不上 wire;
+    /// 旧桌面端 / 旧中转发来的不带这两个字段的 JSON 照常解析成 None。
+    #[test]
+    fn mirror_message_tool_fields_round_trip_and_stay_optional() {
+        let tool = MirrorMessage {
+            seq: 5,
+            source: "assistant".into(),
+            content: "Edit src/main.rs".into(),
+            timestamp: "2026-10-11T08:00:00Z".into(),
+            kind: Some("tool".into()),
+            tool_name: Some("Edit".into()),
+            tool_target: Some("src/main.rs".into()),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&tool).unwrap();
+        assert!(
+            json.contains(r#""kind":"tool""#)
+                && json.contains(r#""toolName":"Edit""#)
+                && json.contains(r#""toolTarget":"src/main.rs""#)
+                && !json.contains("tool_name")
+                && !json.contains("questions"),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<MirrorMessage>(&json).unwrap(), tool);
+
+        // 目标缺省(TodoWrite 之类):toolTarget 整个字段省略,toolName 照发
+        let bare = MirrorMessage {
+            tool_target: None,
+            content: "TodoWrite".into(),
+            tool_name: Some("TodoWrite".into()),
+            ..tool.clone()
+        };
+        let json = serde_json::to_string(&bare).unwrap();
+        assert!(
+            json.contains(r#""toolName":"TodoWrite""#) && !json.contains("toolTarget"),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<MirrorMessage>(&json).unwrap(), bare);
+
+        // 普通文本消息两个字段都不上 wire
+        let plain = MirrorMessage {
+            seq: 0,
+            source: "desktop".into(),
+            content: "hi".into(),
+            timestamp: String::new(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&plain).unwrap();
+        assert!(
+            !json.contains("toolName") && !json.contains("toolTarget"),
+            "{json}"
+        );
+
+        // 旧载荷(没有这两个字段,含旧版提问卡片)必须照常解析
+        let legacy = r#"{"seq":2,"source":"assistant","content":"done","timestamp":"","kind":"question","questionId":"toolu_q1"}"#;
+        let msg: MirrorMessage = serde_json::from_str(legacy).unwrap();
+        assert_eq!(msg.kind.as_deref(), Some("question"));
+        assert_eq!(msg.tool_name, None);
+        assert_eq!(msg.tool_target, None);
     }
 
     /// pane 黄灯字段:false 不上 wire(省流量),旧载荷缺字段按 false 解析。
