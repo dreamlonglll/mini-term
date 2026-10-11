@@ -12,6 +12,8 @@ mod codex;
 mod grok;
 mod lineage;
 mod omp;
+mod tool_activity;
+mod tool_path;
 
 pub use codex::{
     CodexSessionMeta, codex_message_from_line, codex_meta_from_line,
@@ -31,6 +33,11 @@ pub use omp::{
     OmpSessionMeta, find_omp_session_file, newest_omp_session_file, omp_message_from_line,
     omp_question_answer_from_line, omp_question_from_line, omp_session_meta_from_line,
 };
+pub use tool_activity::{
+    AiToolCall, TOOL_TARGET_MAX_CHARS, claude_tool_calls_from_line, codex_tool_calls_from_line,
+    grok_tool_calls_from_line, omp_tool_calls_from_line, summarize_tool_target,
+};
+pub use tool_path::ToolPathScope;
 
 use codex::{
     get_codex_sessions, get_codex_sessions_in, read_codex_session_content,
@@ -585,18 +592,194 @@ fn extract_text_content(content_val: Option<&serde_json::Value>) -> String {
     }
 }
 
-/// 解析 Claude JSONL 的一行为消息。非 user/assistant / 空内容 / 非 JSON → None。
-/// 行级纯函数,本地与远程(SFTP)两条正文读取路径共用。
-pub fn claude_message_from_line(line: &str) -> Option<AiSessionMessage> {
-    let obj: serde_json::Value = serde_json::from_str(line).ok()?;
+/// Claude 行级的「非对话正文」标记:带任一标记(值为 true)的行,type 是 user /
+/// assistant 也不算对话。
+/// - `isMeta`:Claude Code 代用户注入的内容 —— skill 正文("Base directory for this
+///   skill…")、斜杠命令展开后的提示词、`<local-command-caveat>`、图片来源说明、
+///   子代理 / 定时任务的来信等
+/// - `isSidechain`:旧版 Claude Code 把子代理对话写在主会话文件里
+/// - `isCompactSummary` / `isVisibleInTranscriptOnly`:/compact 之后的续接摘要,
+///   TUI 只在 transcript 视图里显示
+const CLAUDE_NON_DIALOGUE_FLAGS: [&str; 4] = [
+    "isMeta",
+    "isSidechain",
+    "isCompactSummary",
+    "isVisibleInTranscriptOnly",
+];
 
-    let role = match obj.get("type").and_then(|t| t.as_str()) {
-        Some("user") => "user",
-        Some("assistant") => "assistant",
+/// user 文本以这些标签开头 = 整条是注入,不是用户键入:本地斜杠命令的输出 /
+/// 提示(`/model`、`/clear` 之类)、后台任务的完成通知、`!` 命令的输出。
+const CLAUDE_INJECTED_USER_TAGS: [&str; 6] = [
+    "<local-command-stdout>",
+    "<local-command-stderr>",
+    "<local-command-caveat>",
+    "<task-notification>",
+    "<bash-stdout>",
+    "<bash-stderr>",
+];
+
+const SYSTEM_REMINDER_OPEN: &str = "<system-reminder>";
+const SYSTEM_REMINDER_CLOSE: &str = "</system-reminder>";
+
+fn is_claude_non_dialogue_line(obj: &serde_json::Value) -> bool {
+    CLAUDE_NON_DIALOGUE_FLAGS
+        .iter()
+        .any(|flag| obj.get(*flag).and_then(|v| v.as_bool()) == Some(true))
+}
+
+/// 剥掉成对的 `<system-reminder>…</system-reminder>` 块,剥过就顺手去首尾空白。
+/// 缺闭合标签的原样保留 —— 宁可多显示一段,不吞用户正文。
+fn strip_system_reminders(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains(SYSTEM_REMINDER_OPEN) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(SYSTEM_REMINDER_OPEN) {
+        let after_open = &rest[start + SYSTEM_REMINDER_OPEN.len()..];
+        let Some(end) = after_open.find(SYSTEM_REMINDER_CLOSE) else {
+            break;
+        };
+        out.push_str(&rest[..start]);
+        rest = &after_open[end + SYSTEM_REMINDER_CLOSE.len()..];
+    }
+    out.push_str(rest);
+    std::borrow::Cow::Owned(out.trim().to_string())
+}
+
+/// `<tag>…</tag>` 之间的内容(首个匹配)。
+fn tag_inner<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = text.find(&open)? + open.len();
+    let len = text[start..].find(&close)?;
+    Some(&text[start..start + len])
+}
+
+/// 斜杠命令行(`<command-name>/x</command-name>` 伴 `<command-message>` /
+/// `<command-args>`,三者先后顺序随版本变)还原成用户键入的 `/x args`。
+fn claude_slash_command_text(text: &str) -> Option<String> {
+    let name = tag_inner(text, "command-name")?.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let mut out = if name.starts_with('/') {
+        name.to_string()
+    } else {
+        format!("/{name}")
+    };
+    if let Some(args) = tag_inner(text, "command-args")
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+    {
+        out.push(' ');
+        out.push_str(args);
+    }
+    Some(out)
+}
+
+/// Claude user 行的可显示正文。None = 整条都是注入(或剥完为空)。
+///
+/// 剥 `<system-reminder>` 块;本地命令输出 / 后台任务通知一类注入整条丢弃;
+/// 斜杠命令与 `!` 命令还原成用户键入的样子(`/x args`、`!cmd`)——移动端发来的
+/// 同文指令据此才对得上来源改标。`[Request interrupted by user…]` 打断标记保持
+/// 原文(移动端渲染成灰色提示)。
+fn claude_user_text(content: Option<&serde_json::Value>) -> Option<String> {
+    let blocks: Vec<&str> = match content {
+        Some(serde_json::Value::String(s)) => vec![s.as_str()],
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item.get("type").and_then(|t| t.as_str()),
+                    Some("text" | "output_text" | "input_text")
+                )
+            })
+            .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
+            .collect(),
         _ => return None,
     };
+    // 逐块剥:整块都是 system-reminder 的 text 块剥完为空,直接丢
+    let kept: Vec<std::borrow::Cow<'_, str>> = blocks
+        .into_iter()
+        .map(strip_system_reminders)
+        .filter(|b| !b.trim().is_empty())
+        .collect();
+    if kept.is_empty() {
+        return None;
+    }
+    let text = kept.join("\n\n");
+    let head = text.trim_start();
+    if CLAUDE_INJECTED_USER_TAGS
+        .iter()
+        .any(|tag| head.starts_with(tag))
+    {
+        return None;
+    }
+    if (head.starts_with("<command-name>") || head.starts_with("<command-message>"))
+        && let Some(command) = claude_slash_command_text(head)
+    {
+        return Some(command);
+    }
+    if head.starts_with("<bash-input>")
+        && let Some(cmd) = tag_inner(head, "bash-input")
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+    {
+        return Some(format!("!{cmd}"));
+    }
+    Some(text)
+}
 
-    let content = extract_text_content(obj.pointer("/message/content"));
+/// Claude system 行里用户键入的本地斜杠命令,还原成 `/x args`。其余 system 行 → None。
+///
+/// 新版 Claude Code 对「立即执行」的本地命令(如 `/usage`、`/context`)把**命令行**
+/// 也记成 `type:"system", subtype:"local_command"`,`content` 是与 user 行同一套的
+/// `<command-name>` / `<command-message>` / `<command-args>` 标签;另一些本地命令
+/// (如 `/clear`)的命令行仍是 user 行。两种情况下命令输出都另起一条同 subtype 的
+/// system 行,`content` 以 `<local-command-stdout>`(出错时 `<local-command-stderr>`)
+/// 开头,另带结构化的 `commandRun` 字段。
+///
+/// 只认**以命令标签开头**的命令行:输出行、以及同 subtype 下的其他提示文本
+/// (会话恢复 / 更新提示之类)都不是用户键入,一律不出。
+fn claude_local_command_text(obj: &serde_json::Value) -> Option<String> {
+    if obj.get("subtype").and_then(|s| s.as_str()) != Some("local_command") {
+        return None;
+    }
+    let head = obj.get("content")?.as_str()?.trim_start();
+    if !(head.starts_with("<command-name>") || head.starts_with("<command-message>")) {
+        return None;
+    }
+    claude_slash_command_text(head)
+}
+
+/// 解析 Claude JSONL 的一行为消息。非 user/assistant(本地命令的 system 行除外)/
+/// 空内容 / 非 JSON → None。
+/// 行级纯函数,本地与远程(SFTP)两条正文读取路径、移动端对话镜像共用。
+///
+/// 只留对话正文:带 `CLAUDE_NON_DIALOGUE_FLAGS` 标记的行整行跳过(两种角色都是),
+/// user 行再经 `claude_user_text` 滤掉系统注入。镜像依赖这一口径判断「用户动过」:
+/// 能解析出的 user 消息才清挂起提问,回合中途注入的 skill 正文等不算。
+///
+/// 例外一条 system 行:立即执行的本地斜杠命令(见 [`claude_local_command_text`])
+/// 是用户亲手键入的,按 user 消息给出 `/x args`,与 user 行里的斜杠命令同一形态
+/// —— 三处读者(镜像 / 本地面板 / SFTP 面板)都该显示它,移动端发的同文指令也据此
+/// 对得上来源改标;它同样清镜像的挂起提问(用户确实动过)。
+pub fn claude_message_from_line(line: &str) -> Option<AiSessionMessage> {
+    let obj: serde_json::Value = serde_json::from_str(line).ok()?;
+    if is_claude_non_dialogue_line(&obj) {
+        return None;
+    }
+
+    let (role, content) = match obj.get("type").and_then(|t| t.as_str()) {
+        Some("user") => ("user", claude_user_text(obj.pointer("/message/content"))?),
+        Some("assistant") => (
+            "assistant",
+            extract_text_content(obj.pointer("/message/content")),
+        ),
+        Some("system") => ("user", claude_local_command_text(&obj)?),
+        _ => return None,
+    };
     if content.is_empty() {
         return None;
     }
@@ -1381,6 +1564,249 @@ mod tests {
         assert!(claude_message_from_line(r#"{"type":"system"}"#).is_none());
         assert!(claude_message_from_line(r#"{"type":"user","message":{"content":""}}"#).is_none());
         assert!(claude_message_from_line("not json").is_none());
+    }
+
+    // ---- Claude 系统注入过滤(形状取自真机记录,正文为合成)----
+
+    /// user 行:字符串 content,外加顶层字段。
+    fn claude_user_str(extra: &str, text: &str) -> String {
+        format!(
+            r#"{{"type":"user",{extra}"message":{{"role":"user","content":{}}},"timestamp":"t"}}"#,
+            serde_json::to_string(text).unwrap()
+        )
+    }
+
+    /// user 行:数组 content,每段一个 text 块。
+    fn claude_user_blocks(blocks: &[&str]) -> String {
+        let content: Vec<serde_json::Value> = blocks
+            .iter()
+            .map(|t| serde_json::json!({"type": "text", "text": t}))
+            .collect();
+        serde_json::json!({
+            "type": "user",
+            "message": {"role": "user", "content": content},
+            "timestamp": "t",
+        })
+        .to_string()
+    }
+
+    fn claude_user_content(line: &str) -> Option<String> {
+        claude_message_from_line(line).map(|m| m.content)
+    }
+
+    /// isMeta 行(skill 正文 / caveat / 斜杠命令展开的提示词)不是用户键入。
+    #[test]
+    fn claude_message_skips_is_meta_lines() {
+        let skill = r##"{"type":"user","isMeta":true,"message":{"role":"user","content":[{"type":"text","text":"Base directory for this skill: C:\\skills\\demo\n\n# Demo"}]},"timestamp":"t"}"##;
+        assert_eq!(claude_user_content(skill), None);
+        let caveat = claude_user_str(
+            r#""isMeta":true,"#,
+            "<local-command-caveat>Caveat: generated by local commands</local-command-caveat>",
+        );
+        assert_eq!(claude_user_content(&caveat), None);
+        // isMeta=false 照常
+        let plain = claude_user_str(r#""isMeta":false,"#, "真实输入");
+        assert_eq!(claude_user_content(&plain).as_deref(), Some("真实输入"));
+    }
+
+    /// 旧版写在主文件里的子代理对话:两种角色都跳过。
+    #[test]
+    fn claude_message_skips_sidechain_lines() {
+        let user = claude_user_str(r#""isSidechain":true,"#, "subagent prompt");
+        assert_eq!(claude_user_content(&user), None);
+        let assistant = r#"{"type":"assistant","isSidechain":true,"message":{"content":[{"type":"text","text":"subagent reply"}]},"timestamp":"t"}"#;
+        assert!(claude_message_from_line(assistant).is_none());
+        let main = r#"{"type":"assistant","isSidechain":false,"message":{"content":[{"type":"text","text":"reply"}]},"timestamp":"t"}"#;
+        assert_eq!(claude_user_content(main).as_deref(), Some("reply"));
+    }
+
+    /// /compact 的续接摘要只在 transcript 视图显示,两个标记任一即跳过。
+    #[test]
+    fn claude_message_skips_compact_summary_lines() {
+        let both = claude_user_str(
+            r#""isCompactSummary":true,"isVisibleInTranscriptOnly":true,"#,
+            "This session is being continued from a previous conversation…",
+        );
+        assert_eq!(claude_user_content(&both), None);
+        let summary_only = claude_user_str(r#""isCompactSummary":true,"#, "summary");
+        assert_eq!(claude_user_content(&summary_only), None);
+        let transcript_only = claude_user_str(r#""isVisibleInTranscriptOnly":true,"#, "x");
+        assert_eq!(claude_user_content(&transcript_only), None);
+    }
+
+    /// 斜杠命令还原成键入形态;三个标签的先后顺序随版本变,两种都认。
+    #[test]
+    fn claude_message_rewrites_slash_commands() {
+        let no_args = claude_user_str(
+            "",
+            "<command-name>/model</command-name>\n            <command-message>model</command-message>\n            <command-args></command-args>",
+        );
+        assert_eq!(claude_user_content(&no_args).as_deref(), Some("/model"));
+        let with_args = claude_user_str(
+            "",
+            "<command-message>review</command-message>\n<command-name>/review</command-name>\n<command-args>  fix the bug </command-args>",
+        );
+        assert_eq!(
+            claude_user_content(&with_args).as_deref(),
+            Some("/review fix the bug")
+        );
+        // 缺 command-args、名字缺斜杠也收敛成 `/x`
+        let bare = claude_user_str("", "<command-name>compact</command-name>");
+        assert_eq!(claude_user_content(&bare).as_deref(), Some("/compact"));
+    }
+
+    /// 本地命令输出 / 提示、后台任务通知、`!` 命令输出:整条丢弃。
+    #[test]
+    fn claude_message_drops_local_command_and_notification_output() {
+        for text in [
+            "<local-command-stdout>Set model to opus</local-command-stdout>",
+            "<local-command-stderr>error: unknown</local-command-stderr>",
+            "<local-command-caveat>Caveat: …</local-command-caveat>",
+            "<task-notification>\n<task-id>b1</task-id>\n<status>completed</status>\n</task-notification>\n<system-reminder>r</system-reminder>",
+            "<bash-stdout>file.txt</bash-stdout><bash-stderr></bash-stderr>",
+        ] {
+            assert_eq!(
+                claude_user_content(&claude_user_str("", text)),
+                None,
+                "{text}"
+            );
+        }
+    }
+
+    /// system 行(形状取自 2.1.292 真机记录,正文为合成):`subtype` + 字符串
+    /// `content`,外加 `level` / `isMeta` 与可选的 `commandRun`。
+    fn claude_system_line(
+        subtype: &str,
+        content: &str,
+        command_run: Option<(&str, &str)>,
+    ) -> String {
+        let mut obj = serde_json::json!({
+            "parentUuid": "p1",
+            "isSidechain": false,
+            "type": "system",
+            "subtype": subtype,
+            "content": content,
+            "level": "info",
+            "timestamp": "2026-10-10T08:00:00.000Z",
+            "uuid": "u1",
+            "isMeta": false,
+            "version": "2.1.292",
+        });
+        if let Some((command, args)) = command_run {
+            obj["commandRun"] = serde_json::json!({"command": command, "args": args});
+        }
+        obj.to_string()
+    }
+
+    /// 立即执行的本地命令(`/usage` 等)的命令行记成 system local_command:
+    /// 按 user 消息还原成键入形态,内容与移动端登记的原文逐字相等(改标对得上)。
+    #[test]
+    fn claude_message_parses_system_local_command_line() {
+        let line = claude_system_line(
+            "local_command",
+            "<command-name>/usage</command-name>\n            <command-message>usage</command-message>\n            <command-args></command-args>",
+            None,
+        );
+        let m = claude_message_from_line(&line).expect("命令行应解析成消息");
+        assert_eq!(m.role, "user");
+        assert_eq!(m.content, "/usage");
+        assert_eq!(m.timestamp, "2026-10-10T08:00:00.000Z");
+    }
+
+    /// 带参数的本地命令:参数去首尾空白后拼在命令名后。
+    #[test]
+    fn claude_message_parses_system_local_command_with_args() {
+        let line = claude_system_line(
+            "local_command",
+            "<command-name>/context</command-name>\n            <command-message>context</command-message>\n            <command-args>  all files </command-args>",
+            None,
+        );
+        assert_eq!(
+            claude_user_content(&line).as_deref(),
+            Some("/context all files")
+        );
+    }
+
+    /// 本地命令的输出行(stdout / stderr,带 commandRun)不是用户键入:整条丢弃。
+    #[test]
+    fn claude_message_drops_system_local_command_output() {
+        for content in [
+            "<local-command-stdout>Total cost: $0.00</local-command-stdout>",
+            "<local-command-stderr>Unknown option</local-command-stderr>",
+        ] {
+            let line = claude_system_line("local_command", content, Some(("usage", "")));
+            assert!(claude_message_from_line(&line).is_none(), "{content}");
+        }
+    }
+
+    /// 其余 system 行照旧不出:别的 subtype,以及 local_command 下不以命令标签
+    /// 开头的提示文本;带非对话标记的命令行也不出。
+    #[test]
+    fn claude_message_skips_other_system_lines() {
+        for (subtype, content) in [
+            ("turn_duration", ""),
+            ("stop_hook_summary", ""),
+            ("informational", "<command-name>/x</command-name>"),
+            ("compact_boundary", "Conversation compacted"),
+            ("local_command", "Session resumed"),
+        ] {
+            let line = claude_system_line(subtype, content, None);
+            assert!(claude_message_from_line(&line).is_none(), "{subtype}");
+        }
+        let meta = r#"{"type":"system","subtype":"local_command","isMeta":true,"content":"<command-name>/usage</command-name>","timestamp":"t"}"#;
+        assert!(claude_message_from_line(meta).is_none());
+    }
+
+    /// `!` 命令的输入是用户键入的:还原成 `!cmd`。
+    #[test]
+    fn claude_message_rewrites_bash_input() {
+        let line = claude_user_str("", "<bash-input>git status</bash-input>");
+        assert_eq!(claude_user_content(&line).as_deref(), Some("!git status"));
+    }
+
+    /// system-reminder:字符串里的块剥掉;数组里整块是提醒的 text 块丢弃;
+    /// 剥完为空 → None。
+    #[test]
+    fn claude_message_strips_system_reminders() {
+        let inline = claude_user_str(
+            "",
+            "修一下登录\n<system-reminder>\nThe user opened file x.\n</system-reminder>",
+        );
+        assert_eq!(claude_user_content(&inline).as_deref(), Some("修一下登录"));
+        let blocks = claude_user_blocks(&[
+            "<system-reminder>context</system-reminder>",
+            "真实输入",
+            "<system-reminder>more</system-reminder>",
+        ]);
+        assert_eq!(claude_user_content(&blocks).as_deref(), Some("真实输入"));
+        let only = claude_user_blocks(&["<system-reminder>a</system-reminder>"]);
+        assert_eq!(claude_user_content(&only), None);
+        let only_str = claude_user_str("", " <system-reminder>a</system-reminder>\n");
+        assert_eq!(claude_user_content(&only_str), None);
+        // 缺闭合标签:原样保留,不吞正文
+        let unclosed = claude_user_str("", "看看 <system-reminder> 这个词");
+        assert_eq!(
+            claude_user_content(&unclosed).as_deref(),
+            Some("看看 <system-reminder> 这个词")
+        );
+    }
+
+    /// 打断标记保持原文(移动端渲染成灰色提示);普通多块消息照旧以空行拼接。
+    #[test]
+    fn claude_message_keeps_interrupt_marker_and_plain_blocks() {
+        let interrupted = claude_user_blocks(&["[Request interrupted by user for tool use]"]);
+        assert_eq!(
+            claude_user_content(&interrupted).as_deref(),
+            Some("[Request interrupted by user for tool use]")
+        );
+        let multi = claude_user_blocks(&["[Image #1]", "看看这张图"]);
+        assert_eq!(
+            claude_user_content(&multi).as_deref(),
+            Some("[Image #1]\n\n看看这张图")
+        );
+        // 只有 tool_result 的 user 行没有正文
+        let tool_only = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"ok","tool_use_id":"t1"}]},"timestamp":"t"}"#;
+        assert!(claude_message_from_line(tool_only).is_none());
     }
 
     /// 两种语义各认各的等价:Windows 不分 `\` `/`,Unix 只认 `/`(`\` 是文件名字符)。

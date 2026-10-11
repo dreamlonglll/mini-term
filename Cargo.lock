@@ -5498,6 +5498,7 @@ dependencies = [
 name = "mt-relay"
 version = "1.13.14"
 dependencies = [
+ "chrono",
  "dirs 6.0.0",
  "futures-util",
  "mt-ai",

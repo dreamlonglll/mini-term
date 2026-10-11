@@ -18,6 +18,26 @@ export const mirror = {
       expired: "该提问已在桌面端处理",
       multiSelectHint: "多选题请回桌面终端作答",
     },
+    interrupted: "已打断",
+    activity: {
+      working: "AI 工作中",
+      attention: "等你处理",
+      attentionHint: "AI 正在等待授权或确认",
+      answerQuestion: "AI 在等你作答上方的提问",
+    },
+    tools: {
+      summary: "工具调用 {count} 次",
+      latest: "最近：{tool}",
+    },
+    code: {
+      copy: "复制",
+      copied: "已复制",
+      failed: "复制失败",
+    },
+    input: {
+      expand: "展开全文",
+      collapse: "收起",
+    },
     inputPlaceholder: "输入指令，将写入桌面终端…",
     send: "发送",
     sending: "发送中…",
@@ -48,6 +68,26 @@ export const mirror = {
       handled: "Handled",
       expired: "This question was handled on the desktop",
       multiSelectHint: "Multi-select questions must be answered in the desktop terminal",
+    },
+    interrupted: "Interrupted",
+    activity: {
+      working: "AI is working",
+      attention: "Needs your input",
+      attentionHint: "The AI is waiting for approval or confirmation",
+      answerQuestion: "The AI is waiting for your answer above",
+    },
+    tools: {
+      summary: "Tool calls: {count}",
+      latest: "Latest: {tool}",
+    },
+    code: {
+      copy: "Copy",
+      copied: "Copied",
+      failed: "Copy failed",
+    },
+    input: {
+      expand: "Show all",
+      collapse: "Collapse",
     },
     inputPlaceholder: "Type a command to write into the desktop terminal…",
     send: "Send",

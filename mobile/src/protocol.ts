@@ -194,7 +194,10 @@ export interface MirrorMessage {
   /**
    * 消息种类:缺省 = 普通文本;"question" = agent 提问卡片(questions/questionId
    * 随行);"questionAnswered" = 已作答标记(refSeq 指向提问消息,labels 为逐题
-   * 选中项,为空 = 打断/旧版记录给不出选中项;content 只是纯文本兜底)。
+   * 选中项,为空 = 打断/旧版记录给不出选中项;content 只是纯文本兜底);
+   * "tool" = agent 的一次工具调用(source 为 "assistant",toolName/toolTarget
+   * 随行,content 是兜底文本 "{toolName} {toolTarget}";提问类工具不在此列,
+   * 仍走 question 卡片)。
    * 旧桌面端不发、旧中转会把这些字段吃掉——缺省一律按普通文本渲染 content。
    */
   kind?: string;
@@ -203,6 +206,10 @@ export interface MirrorMessage {
   questionId?: string;
   refSeq?: number;
   labels?: string[];
+  /** kind="tool" 时的工具名原文(Bash / Edit / shell / apply_patch …) */
+  toolName?: string;
+  /** kind="tool" 时的一行目标摘要(文件路径 / 命令首行 / 搜索词…),可缺省 */
+  toolTarget?: string;
 }
 
 export interface MobileMirrorSnapshot {

@@ -237,7 +237,7 @@ fn parse_grok_update(line: &str) -> GrokUpdate {
 }
 
 /// unix 秒 → ISO 8601(前端与 MirrorMessage 都按 ISO 字符串排序/展示)
-fn unix_to_iso(secs: u64) -> String {
+pub(super) fn unix_to_iso(secs: u64) -> String {
     if secs == 0 {
         return String::new();
     }
@@ -316,7 +316,7 @@ impl GrokUpdateParser {
 // (`User has answered your questions: "题文"="label". …`),按引号对扫出。
 
 /// 行 → (params.update, unix 时间戳)。非 session/update 轨(xAI 扩展轨)返回 None。
-fn grok_acp_update(line: &str) -> Option<(serde_json::Value, u64)> {
+pub(super) fn grok_acp_update(line: &str) -> Option<(serde_json::Value, u64)> {
     let v: serde_json::Value = serde_json::from_str(line).ok()?;
     if v.get("method").and_then(|m| m.as_str()) == Some("_x.ai/session/update") {
         return None;
