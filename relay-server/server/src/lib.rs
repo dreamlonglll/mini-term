@@ -43,10 +43,11 @@ const PAIRING_CODE_TTL: Duration = Duration::from_secs(10 * 60);
 
 /// 桌面端单条入站消息上限:16 MiB。
 ///
-/// 桌面端发来的消息里只有对话镜像(`mirrorSnapshot` / `mirrorHistory` 一页 50 条、
+/// 桌面端发来的消息里只有对话镜像(`mirrorSnapshot` / `mirrorHistory` 一页 50 条文本、
 /// `mirrorAppend`)能长大:协议里没有图片或二进制载荷,镜像只抽会话记录里的
-/// user / assistant **文本**(不含工具输出)。常见一页几十 KB 到几百 KB;极端情况是
-/// 用户往 AI 里贴过大段日志,一页 50 条里带几条 MB 级正文,也就几 MB。16 MiB 给这种
+/// user / assistant **文本**,外加工具调用的一行摘要(工具名 + 截到 160 字的目标,
+/// 单条几百字节,不计入那 50 条、单页总数另有封顶;不含工具输出)。
+/// 常见一页几十 KB 到几百 KB;极端情况是用户往 AI 里贴过大段日志,一页 50 条里带几条 MB 级正文,也就几 MB。16 MiB 给这种
 /// 极端情况留出三倍以上余量,同时比默认的 64 MiB 收紧四倍 —— 升级前的这一跳谁都能连,
 /// 默认值等于允许任何人让中转为每条连接先攒 64 MiB。
 pub const DESKTOP_MAX_MESSAGE_BYTES: usize = 16 << 20;

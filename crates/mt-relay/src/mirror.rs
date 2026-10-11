@@ -34,8 +34,17 @@ use mt_relay_protocol::{MirrorMessage, MirrorQuestionItem, MirrorQuestionOption}
 /// pane 上(串台)。宁可空镜像。
 pub use mt_ai::sessions::agent_has_session_log;
 
-/// 打开对话默认取最近 50 条,上拉分页每页同量。
+/// 打开对话默认取最近 50 条,上拉分页每页同量。**工具活动消息(kind = "tool")
+/// 不计数**:真实记录里工具调用是文本消息的两三倍,按总条数切,首屏 50 条只剩
+/// 十来句话(把页长加到 100 也才二三十句);工具行只有工具名 + 一行目标(序列化后
+/// 单条几百字节),随页附带只多几十 KB。单纯把页长加倍则会让纯文本会话的单页体积
+/// 也加倍——中转对桌面端单条入站消息有 16 MiB 上限,超了直接断连,贴过大段日志的
+/// 会话离它最近。见 [`history_slice`]。
 pub const MIRROR_PAGE_SIZE: usize = 50;
+
+/// 单页消息总条数(含工具活动)的硬上限:兜住「连着几百次工具调用、中间一句话
+/// 都没有」的会话,免得一页无界长大。
+pub const MIRROR_PAGE_MAX_MESSAGES: usize = 400;
 
 /// 镜像绑定的会话记录格式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,7 +136,7 @@ impl MirrorParser {
 
     fn parse_line(&mut self, line: &str, out: &mut Vec<MirrorMessage>) {
         match self.agent {
-            // Claude/Codex/OMP 一行可产出多条（说明文字 + 提问卡片 / 作答标记）。
+            // 一行可产出多条（说明文字 + 工具活动 + 提问卡片 / 作答标记）。
             MirrorAgent::Claude => self.parse_claude_line(line, out),
             MirrorAgent::Codex => self.parse_codex_line(line, out),
             MirrorAgent::Grok => self.parse_grok_line(line, out),
@@ -154,6 +163,37 @@ impl MirrorParser {
         msg
     }
 
+    /// 工具活动消息(kind = "tool"):AI 的动作,source 恒为 assistant;content 是
+    /// `工具名 目标` 的纯文本兜底(旧移动端只渲染 content)。
+    ///
+    /// 只占 seq,**不碰挂起提问**:工具调用不是用户动作,与提问并行的工具
+    /// (同一条 assistant 消息里 AskUserQuestion + Bash)也不代表提问已了结。
+    /// 同一行内的产出顺序是 文本 → 工具 → 提问卡片:一条 assistant 消息里工具
+    /// 调用块总在说明文字之后(模型发出工具调用就停下等结果),文本又被合并成
+    /// 一条,这个顺序即块序。
+    fn push_tool_calls(
+        &mut self,
+        calls: Vec<ai_sessions::AiToolCall>,
+        out: &mut Vec<MirrorMessage>,
+    ) {
+        for call in calls {
+            let content = format!("{} {}", call.name, call.target.as_deref().unwrap_or(""))
+                .trim()
+                .to_string();
+            out.push(MirrorMessage {
+                seq: self.next_seq,
+                source: "assistant".into(),
+                content,
+                timestamp: call.timestamp,
+                kind: Some("tool".into()),
+                tool_name: Some(call.name),
+                tool_target: call.target,
+                ..Default::default()
+            });
+            self.next_seq += 1;
+        }
+    }
+
     /// Claude 行的完整解析:普通文本之外还产出提问卡片(assistant 行的
     /// AskUserQuestion tool_use)与已作答标记(user 行的 tool_result 对账)。
     fn parse_claude_line(&mut self, line: &str, out: &mut Vec<MirrorMessage>) {
@@ -171,6 +211,8 @@ impl MirrorParser {
                 self.pending.clear();
             }
         }
+
+        self.push_tool_calls(ai_sessions::claude_tool_calls_from_line(line), out);
 
         if let Some(question) = ai_sessions::claude_question_from_line(line) {
             self.push_question(question, out);
@@ -198,6 +240,8 @@ impl MirrorParser {
             }
         }
 
+        self.push_tool_calls(ai_sessions::codex_tool_calls_from_line(line), out);
+
         if let Some(question) = ai_sessions::codex_question_from_line(line) {
             self.push_question(question, out);
         }
@@ -220,6 +264,9 @@ impl MirrorParser {
                 self.pending.clear();
             }
         }
+
+        // tool_call 首行本身就是消息边界:上面先冲出被它收尾的文本,再出工具
+        self.push_tool_calls(ai_sessions::grok_tool_calls_from_line(line), out);
 
         if let Some(question) = ai_sessions::grok_question_from_line(line) {
             // 富化行可能重发同一提问:已挂起即跳过,不重复出卡
@@ -246,6 +293,8 @@ impl MirrorParser {
                 self.pending.clear();
             }
         }
+
+        self.push_tool_calls(ai_sessions::omp_tool_calls_from_line(line), out);
 
         if let Some(question) = ai_sessions::omp_question_from_line(line) {
             self.push_question(question, out);
@@ -479,6 +528,9 @@ fn question_fallback_text(q: &ai_sessions::AiQuestion) -> String {
 
 /// 分页取数:`before_seq = None` 取最近 `limit` 条(打开对话的首屏),
 /// `Some(s)` 取 seq 严格小于 s 的最近 `limit` 条(上拉加载更早)。
+/// 工具活动消息不计入 `limit`(理由见 [`MIRROR_PAGE_SIZE`]),夹在其间的随页带上;
+/// 单页总条数另受 [`MIRROR_PAGE_MAX_MESSAGES`] 封顶。凑够 `limit` 条即停,所以
+/// 页首总是一条非工具消息,它前面紧挨着的工具行归下一页。
 /// 返回 (切片, 是否还有更早)。依赖 `messages[i].seq == i`。
 pub fn history_slice(
     messages: &[MirrorMessage],
@@ -489,8 +541,20 @@ pub fn history_slice(
         None => messages.len(),
         Some(s) => (s as usize).min(messages.len()),
     };
-    let start = end.saturating_sub(limit);
+    let max_total = MIRROR_PAGE_MAX_MESSAGES.max(limit);
+    let mut start = end;
+    let mut counted = 0;
+    while start > 0 && counted < limit && end - start < max_total {
+        start -= 1;
+        if !is_tool_message(&messages[start]) {
+            counted += 1;
+        }
+    }
     (messages[start..end].to_vec(), start > 0)
+}
+
+fn is_tool_message(msg: &MirrorMessage) -> bool {
+    msg.kind.as_deref() == Some("tool")
 }
 
 fn mtime(path: &Path) -> Option<SystemTime> {
@@ -795,13 +859,17 @@ mod tests {
             r#"{"timestamp":1800000005,"method":"_x.ai/session/update","params":{"sessionId":"s","update":{"sessionUpdate":"turn_completed","stop_reason":"end_turn"}}}"#,
         );
         let msgs = parser.feed(data.as_bytes());
-        assert_eq!(msgs.len(), 2, "chunk 未合并: {msgs:?}");
+        // 文本两条 + 边界那次工具调用本身的工具活动行
+        assert_eq!(msgs.len(), 3, "chunk 未合并: {msgs:?}");
         assert_eq!(msgs[0].source, "desktop");
         assert_eq!(msgs[0].content, "fix the bug");
         assert_eq!(msgs[0].seq, 0);
-        assert_eq!(msgs[1].source, "assistant");
-        assert_eq!(msgs[1].content, "done ✅");
+        assert_eq!(msgs[1].kind.as_deref(), Some("tool"));
+        assert_eq!(msgs[1].tool_name.as_deref(), Some("read_file"));
         assert_eq!(msgs[1].seq, 1);
+        assert_eq!(msgs[2].source, "assistant");
+        assert_eq!(msgs[2].content, "done ✅");
+        assert_eq!(msgs[2].seq, 2);
         // 时间戳取该消息**第一个** chunk 的时刻
         assert!(
             msgs[0].timestamp.starts_with("2027-01-15T"),
@@ -1489,16 +1557,194 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// 一段带中文(多字节)、CRLF、空行与提问/作答的 Claude 记录。
+    /// 一段带中文(多字节)、CRLF、空行、工具调用与提问/作答的 Claude 记录。
     fn claude_transcript() -> String {
         format!(
-            "{}\r\n\n{}\n{}\n{}\n{}\n",
+            "{}\r\n\n{}\n{}\n{}\n{}\n{}\n",
             claude_line("user", "你好,帮我改个 bug", "2026-01-01T00:00:00Z"),
             claude_line("assistant", "好的 ✅ 马上看", "2026-01-01T00:00:01Z"),
+            claude_tool_line(),
             question_line(),
             answer_line(),
             claude_line("assistant", "改完了", "2026-01-01T00:00:04Z"),
         )
+    }
+
+    /// assistant 行:一句说明 + 两个工具调用(Read 带中文路径、Bash 多行命令)。
+    fn claude_tool_line() -> String {
+        r#"{"type":"assistant","timestamp":"2026-01-01T00:00:02Z","message":{"role":"assistant","content":[{"type":"text","text":"先读代码。"},{"type":"tool_use","id":"toolu_r","name":"Read","input":{"file_path":"D:\\项目\\src\\main.rs"}},{"type":"tool_use","id":"toolu_b","name":"Bash","input":{"command":"cargo   build\ncargo test","description":"构建"}}]}}"#.to_string()
+    }
+
+    // ── 工具活动(kind = "tool")镜像 ──
+
+    /// 同一行:文本 → 工具(按块序),seq 连续;工具消息带结构化字段与 content 兜底。
+    #[test]
+    fn parser_emits_tool_messages_after_text() {
+        let mut parser = MirrorParser::new(MirrorAgent::Claude);
+        let msgs = parser.feed(format!("{}\n", claude_tool_line()).as_bytes());
+        assert_eq!(msgs.len(), 3, "{msgs:?}");
+        assert_eq!(msgs[0].content, "先读代码。");
+        assert_eq!(msgs[0].kind, None);
+        let read = &msgs[1];
+        assert_eq!(read.seq, 1);
+        assert_eq!(read.source, "assistant");
+        assert_eq!(read.kind.as_deref(), Some("tool"));
+        assert_eq!(read.tool_name.as_deref(), Some("Read"));
+        assert_eq!(read.tool_target.as_deref(), Some(r"D:\项目\src\main.rs"));
+        assert_eq!(read.content, r"Read D:\项目\src\main.rs");
+        assert_eq!(read.timestamp, "2026-01-01T00:00:02Z");
+        let bash = &msgs[2];
+        assert_eq!(bash.seq, 2);
+        // 目标只取首行并折叠空白
+        assert_eq!(bash.tool_target.as_deref(), Some("cargo build"));
+        assert_eq!(bash.content, "Bash cargo build");
+        assert!(bash.questions.is_empty() && bash.question_id.is_none());
+
+        // 无目标的工具:content 兜底只有工具名,tool_target 缺省
+        let todo = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t","name":"TodoWrite","input":{"todos":[]}}]}}"#;
+        let msgs = parser.feed(format!("{todo}\n").as_bytes());
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].seq, 3, "seq 接着走");
+        assert_eq!(msgs[0].content, "TodoWrite");
+        assert_eq!(msgs[0].tool_target, None);
+    }
+
+    /// 提问与别家工具同行:文本 → 工具 → 提问卡片;AskUserQuestion 本身不出工具行。
+    /// 工具消息不清挂起,之后单独的工具行同样不清——卡片照常可点选。
+    #[test]
+    fn parser_tool_messages_keep_question_pending() {
+        let mut parser = MirrorParser::new(MirrorAgent::Claude);
+        let line = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"确认一下"},{"type":"tool_use","id":"toolu_g","name":"Grep","input":{"pattern":"fn main"}},{"type":"tool_use","id":"toolu_q1","name":"AskUserQuestion","input":{"questions":[{"question":"选哪个?","header":"","options":[{"label":"A","description":""},{"label":"B","description":""}],"multiSelect":false}]}}]}}"#;
+        let msgs = parser.feed(format!("{line}\n").as_bytes());
+        let kinds: Vec<Option<&str>> = msgs.iter().map(|m| m.kind.as_deref()).collect();
+        assert_eq!(kinds, [None, Some("tool"), Some("question")], "{msgs:?}");
+        assert_eq!(msgs[1].tool_name.as_deref(), Some("Grep"));
+        assert_eq!(msgs[2].seq, 2);
+        assert!(parser.answer_keys(2, "toolu_q1", 0, 1).is_some());
+
+        let tool_only = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"toolu_x","name":"Bash","input":{"command":"ls"}}]}}"#;
+        let msgs = parser.feed(format!("{tool_only}\n").as_bytes());
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].kind.as_deref(), Some("tool"));
+        let keys = parser
+            .answer_keys(2, "toolu_q1", 0, 1)
+            .expect("工具消息不该清掉挂起提问");
+        assert_eq!(keys.keys, "\x1b[B\r");
+    }
+
+    /// Codex:function_call 出工具行;request_user_input 只出卡片不出工具行。
+    #[test]
+    fn parser_codex_tool_messages() {
+        let mut parser = MirrorParser::new(MirrorAgent::Codex);
+        let data = concat!(
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"先看状态"}]}}"#,
+            "\n",
+            r#"{"timestamp":"t1","type":"response_item","payload":{"type":"function_call","name":"shell_command","arguments":"{\"command\":\"git status\",\"workdir\":\"D:\\\\proj\"}","call_id":"call_s"}}"#,
+            "\n",
+            r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"call_s","output":"clean"}}"#,
+            "\n",
+        );
+        let msgs = parser.feed(data.as_bytes());
+        assert_eq!(msgs.len(), 2, "{msgs:?}");
+        assert_eq!(msgs[1].kind.as_deref(), Some("tool"));
+        assert_eq!(msgs[1].tool_name.as_deref(), Some("shell_command"));
+        assert_eq!(msgs[1].tool_target.as_deref(), Some("git status"));
+        assert_eq!(msgs[1].timestamp, "t1");
+
+        let msgs = parser.feed(format!("{}\n", codex_question_line()).as_bytes());
+        assert_eq!(msgs.len(), 1, "提问不重复出工具行: {msgs:?}");
+        assert_eq!(msgs[0].kind.as_deref(), Some("question"));
+        assert!(parser.answer_keys(2, "call_q1", 0, 0).is_some());
+    }
+
+    /// Grok:tool_call 首行先冲出被它收尾的文本,再出工具行;富化行/终态行不重复出;
+    /// ask_user_question 只出卡片。
+    #[test]
+    fn parser_grok_tool_messages() {
+        let mut parser = MirrorParser::new(MirrorAgent::Grok);
+        let data = concat!(
+            r#"{"timestamp":1788251320,"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"我看一下"}}}}"#,
+            "\n",
+            r#"{"timestamp":1788251329,"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"call-r","title":"read_file","rawInput":{"target_file":"src/lib.rs"},"_meta":{"x.ai/tool":{"name":"read_file"}}}}}"#,
+            "\n",
+            r#"{"timestamp":1788251329,"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"call-r","kind":"read","title":"Read src/lib.rs","rawInput":{"variant":"ReadFile","target_file":"src/lib.rs"},"_meta":{"x.ai/tool":{"name":"read_file"}}}}}"#,
+            "\n",
+            r#"{"timestamp":1788251330,"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call_update","toolCallId":"call-r","status":"completed","content":[]}}}"#,
+            "\n",
+        );
+        let msgs = parser.feed(data.as_bytes());
+        assert_eq!(msgs.len(), 2, "{msgs:?}");
+        assert_eq!(msgs[0].content, "我看一下");
+        assert_eq!(msgs[1].kind.as_deref(), Some("tool"));
+        assert_eq!(msgs[1].tool_name.as_deref(), Some("read_file"));
+        assert_eq!(msgs[1].tool_target.as_deref(), Some("src/lib.rs"));
+        assert_eq!(msgs[1].seq, 1);
+
+        let ask = r#"{"timestamp":1788251400,"method":"session/update","params":{"sessionId":"s","update":{"sessionUpdate":"tool_call","toolCallId":"call-g1","title":"ask_user_question","rawInput":{"questions":[{"question":"继续吗？","options":[{"label":"继续","description":""}]}]},"_meta":{"x.ai/tool":{"name":"ask_user_question"}}}}}"#;
+        let msgs = parser.feed(format!("{ask}\n").as_bytes());
+        assert_eq!(msgs.len(), 1, "{msgs:?}");
+        assert_eq!(msgs[0].kind.as_deref(), Some("question"));
+    }
+
+    /// OMP:文本 → 工具 → ask 卡片(ask 本身不出工具行)。
+    #[test]
+    fn parser_omp_tool_messages() {
+        let mut parser = MirrorParser::new(MirrorAgent::Omp);
+        let line = r#"{"type":"message","timestamp":"t1","message":{"role":"assistant","content":[{"type":"text","text":"跑一下"},{"type":"toolCall","id":"c1","name":"bash","arguments":{"command":"bun test"}},{"type":"toolCall","id":"ask-1","name":"ask","arguments":{"questions":[{"id":"q1","question":"Which?","options":[{"label":"A"}]}]}}]}}"#;
+        let msgs = parser.feed(format!("{line}\n").as_bytes());
+        let kinds: Vec<Option<&str>> = msgs.iter().map(|m| m.kind.as_deref()).collect();
+        assert_eq!(kinds, [None, Some("tool"), Some("question")], "{msgs:?}");
+        assert_eq!(msgs[1].content, "bash bun test");
+        assert!(parser.answer_keys(2, "ask-1", 0, 0).is_some());
+    }
+
+    fn make_mixed(kinds: &[bool]) -> Vec<MirrorMessage> {
+        kinds
+            .iter()
+            .enumerate()
+            .map(|(i, &is_tool)| MirrorMessage {
+                seq: i as u64,
+                source: "assistant".into(),
+                content: format!("m{i}"),
+                kind: is_tool.then(|| "tool".to_string()),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    /// 工具消息不计入页长:每条文本后跟 3 条工具,首屏仍带够 50 条文本,
+    /// 页首是文本、它前面的工具行归下一页;翻页锚点接得上。
+    #[test]
+    fn history_slice_does_not_count_tool_messages() {
+        // 120 组「文本 + 3 工具」= 480 条
+        let kinds: Vec<bool> = (0..480).map(|i| i % 4 != 0).collect();
+        let msgs = make_mixed(&kinds);
+        let (page, has_more) = history_slice(&msgs, None, MIRROR_PAGE_SIZE);
+        assert!(has_more);
+        assert_eq!(page.iter().filter(|m| m.kind.is_none()).count(), 50);
+        assert_eq!(page.len(), 200);
+        assert_eq!(page.first().unwrap().seq, 280);
+        assert!(page.first().unwrap().kind.is_none(), "页首是文本");
+        assert_eq!(page.last().unwrap().seq, 479);
+
+        let (page2, _) = history_slice(&msgs, Some(280), MIRROR_PAGE_SIZE);
+        assert_eq!(page2.last().unwrap().seq, 279, "翻页无缝衔接");
+        assert_eq!(page2.first().unwrap().seq, 80);
+        let (page3, has_more3) = history_slice(&msgs, Some(80), MIRROR_PAGE_SIZE);
+        assert_eq!(page3.first().unwrap().seq, 0);
+        assert!(!has_more3);
+    }
+
+    /// 连着几百次工具调用、中间没有文本:单页总条数封顶。
+    #[test]
+    fn history_slice_caps_long_tool_runs() {
+        let mut kinds = vec![false];
+        kinds.extend(std::iter::repeat_n(true, 1000));
+        let msgs = make_mixed(&kinds);
+        let (page, has_more) = history_slice(&msgs, None, MIRROR_PAGE_SIZE);
+        assert_eq!(page.len(), MIRROR_PAGE_MAX_MESSAGES);
+        assert_eq!(page.last().unwrap().seq, 1000);
+        assert!(has_more);
     }
 
     /// 切块位置落在任何地方(含多字节字符中间、CRLF 中间)都与整块喂入逐条一致 ——
