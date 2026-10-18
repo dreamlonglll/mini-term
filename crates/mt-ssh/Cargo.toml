@@ -67,9 +67,11 @@ rsa = "=0.10.0-rc.18"
 # 无需开任何 feature:async-trait 仅 server 端用得到,client 不需要。
 russh-sftp = "2.3.0"
 # 池与 SFTP 需要的 tokio 面:rt(spawn reaper/后台 disconnect)、sync(Mutex)、
-# time(interval/timeout)、fs + io-util(SFTP 传输用 tokio::fs 流式读写本地文件,task 06-09)。
-tokio = { version = "1", features = ["rt", "sync", "time", "fs", "io-util"] }
-# known_hosts 默认路径 `~/.ssh/known_hosts` 的 home 定位(本 crate 无 Tauri AppHandle)。
+# time(interval/timeout)、fs + io-util(SFTP 传输用 tokio::fs 流式读写本地文件,task 06-09)、
+# net(自己 lookup_host 后逐地址限时连 TCP;ssh-agent 的命名管道 / Unix socket)。
+# net 不是新依赖:russh 在非 wasm 平台本就以 net feature 依赖 tokio,这里只是写明。
+tokio = { version = "1", features = ["rt", "sync", "time", "fs", "io-util", "net"] }
+# `~/.ssh/known_hosts`、`~/.ssh/config`、默认私钥的 home 定位(本 crate 无 Tauri AppHandle)。
 # 版本收在根工作区(继承的可行性见上面 futures 那条注释)。
 # ⚠️ mt-core 的 `dirs` 不要跟着改:它是三个 sidecar 的直接依赖,要保持自包含。
 dirs.workspace = true
