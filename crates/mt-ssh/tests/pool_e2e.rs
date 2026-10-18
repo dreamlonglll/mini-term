@@ -7,8 +7,10 @@
 use std::borrow::Cow;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use mt_core::SshConnection;
@@ -18,8 +20,8 @@ use russh::keys::agent::client::AgentClient;
 use russh::keys::{HashAlg, PrivateKey, PublicKey};
 use russh::server::{self, Auth, Msg, Session};
 use russh::{Channel, ChannelId, MethodKind, MethodSet};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::net::{TcpListener, TcpStream};
 
 static UNIQUE: AtomicUsize = AtomicUsize::new(0);
 
@@ -58,6 +60,24 @@ fn write_key(path: &Path, key: &PrivateKey) {
     std::fs::write(path, text.as_bytes()).unwrap();
 }
 
+/// Unix 上把测试写的 ssh config(或冒充它的目录)收紧权限:组可写的配置文件会被当成
+/// 「Bad owner or permissions」整个忽略,umask 偏松的机器上测试就不再测它想测的东西。
+fn set_private(path: &Path, mode: u32) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+    #[cfg(not(unix))]
+    let _ = (path, mode);
+}
+
+/// 一个刚刚还在、现在没人监听的本机端口:连上去立即被拒绝。
+fn closed_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().port()
+}
+
 /// 测试专用 home:`<root>/.ssh/{config,known_hosts,...}`,drop 时删除。
 struct TestHome {
     root: PathBuf,
@@ -81,6 +101,7 @@ impl TestHome {
 
     fn config(&self, text: &str) {
         std::fs::write(self.ssh("config"), text).unwrap();
+        set_private(&self.ssh("config"), 0o600);
     }
 
     fn env(&self) -> SshClientEnv {
@@ -145,8 +166,13 @@ struct Behavior {
     password: Option<String>,
     kbd_password: Option<String>,
     keys: Vec<PublicKey>,
-    /// 模拟 sshd `MaxAuthTries`:失败计到这个数就断开连接(0 = 不限)。
+    /// 失败计到这个数就直接关掉 TCP 连接、不发 DISCONNECT(dropbear 的做法;0 = 不限)。
     max_auth_tries: usize,
+    /// 模拟 OpenSSH sshd `MaxAuthTries`:失败计到这个数就发 DISCONNECT「Too many
+    /// authentication failures」再断开(0 = 不限)。
+    disconnect_after_failures: usize,
+    /// 收到密码认证请求时直接关掉 TCP 连接(模拟认证途中断网)。
+    drop_on_password: bool,
     /// 是否放行 direct-tcpip(当跳板用)。
     allow_tunnel: bool,
     preferred: Option<russh::Preferred>,
@@ -165,9 +191,64 @@ impl Behavior {
             kbd_password: None,
             keys: Vec::new(),
             max_auth_tries: 0,
+            disconnect_after_failures: 0,
+            drop_on_password: false,
             allow_tunnel: false,
             preferred: None,
         }
+    }
+}
+
+/// 服务器一侧 TCP 流的「静音」开关。模拟 sshd 因失败次数过多而断开时,russh 服务端的
+/// 认证回调里只能把 DISCONNECT 排进队列;静音让服务器先不读客户端发来的下一个请求,
+/// 排着的 DISCONNECT 一定先发出去(与 sshd 一样,后面的请求不再被处理)。服务器关写端
+/// 时解除。
+#[derive(Default)]
+struct Mute {
+    muted: AtomicBool,
+    waker: futures::task::AtomicWaker,
+}
+
+struct MutableStream {
+    inner: TcpStream,
+    mute: Arc<Mute>,
+}
+
+impl AsyncRead for MutableStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.mute.muted.load(Ordering::SeqCst) {
+            this.mute.waker.register(cx.waker());
+            if this.mute.muted.load(Ordering::SeqCst) {
+                return Poll::Pending;
+            }
+        }
+        Pin::new(&mut this.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for MutableStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        this.mute.muted.store(false, Ordering::SeqCst);
+        this.mute.waker.wake();
+        Pin::new(&mut this.inner).poll_shutdown(cx)
     }
 }
 
@@ -175,6 +256,9 @@ struct TestHandler {
     behavior: Behavior,
     log: Arc<Mutex<Vec<String>>>,
     failures: usize,
+    /// 本连接的服务端句柄(`run_stream` 返回后填上),发 DISCONNECT 用。
+    handle: Arc<Mutex<Option<server::Handle>>>,
+    mute: Arc<Mute>,
 }
 
 impl TestHandler {
@@ -182,11 +266,29 @@ impl TestHandler {
         self.log.lock().unwrap().push(line);
     }
 
-    fn reject(&mut self) -> Result<Auth, russh::Error> {
+    async fn reject(&mut self) -> Result<Auth, russh::Error> {
         self.failures += 1;
         if self.behavior.max_auth_tries != 0 && self.failures >= self.behavior.max_auth_tries {
             self.log("too many authentication failures".into());
             return Err(russh::Error::Disconnect);
+        }
+        let limit = self.behavior.disconnect_after_failures;
+        if limit != 0 && self.failures >= limit {
+            self.log("too many authentication failures, disconnecting".into());
+            self.mute.muted.store(true, Ordering::SeqCst);
+            let handle = self.handle.lock().unwrap().clone();
+            match handle {
+                Some(handle) => {
+                    let _ = handle
+                        .disconnect(
+                            russh::Disconnect::ProtocolError,
+                            "Too many authentication failures".into(),
+                            String::new(),
+                        )
+                        .await;
+                }
+                None => return Err(russh::Error::Disconnect),
+            }
         }
         Ok(Auth::reject())
     }
@@ -208,10 +310,14 @@ impl server::Handler for TestHandler {
 
     async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
         self.log(format!("password {user}"));
+        if self.behavior.drop_on_password {
+            // 不发 DISCONNECT、直接关掉 TCP:对客户端来说就是认证途中断了网。
+            return Err(russh::Error::Disconnect);
+        }
         if self.behavior.password.as_deref() == Some(password) {
             Ok(Auth::Accept)
         } else {
-            self.reject()
+            self.reject().await
         }
     }
 
@@ -225,7 +331,7 @@ impl server::Handler for TestHandler {
             Ok(Auth::Accept)
         } else {
             // 与 sshd 一样:被拒的公钥算一次失败。
-            self.reject()
+            self.reject().await
         }
     }
 
@@ -234,7 +340,7 @@ impl server::Handler for TestHandler {
         if self.accepts(key) {
             Ok(Auth::Accept)
         } else {
-            self.reject()
+            self.reject().await
         }
     }
 
@@ -258,7 +364,7 @@ impl server::Handler for TestHandler {
         if answer.is_some() && answer == self.behavior.kbd_password {
             Ok(Auth::Accept)
         } else {
-            self.reject()
+            self.reject().await
         }
     }
 
@@ -341,14 +447,23 @@ impl TestServer {
             tokio::spawn(async move {
                 while let Ok((socket, _)) = listener.accept().await {
                     accepted.fetch_add(1, Ordering::SeqCst);
+                    let mute = Arc::new(Mute::default());
+                    let slot = Arc::new(Mutex::new(None));
                     let handler = TestHandler {
                         behavior: behavior.clone(),
                         log: log.clone(),
                         failures: 0,
+                        handle: slot.clone(),
+                        mute: mute.clone(),
+                    };
+                    let socket = MutableStream {
+                        inner: socket,
+                        mute,
                     };
                     let (config, ended) = (config.clone(), ended.clone());
                     tokio::spawn(async move {
                         if let Ok(session) = server::run_stream(config, socket, handler).await {
+                            *slot.lock().unwrap() = Some(session.handle());
                             let _ = session.await;
                         }
                         ended.fetch_add(1, Ordering::SeqCst);
@@ -1055,22 +1170,167 @@ async fn multi_hop_proxy_jump_chains_tunnels() {
     pool.shutdown().await;
 }
 
+/// `Host *` 配了一条 ProxyCommand(公司代理、cloudflared 之类):本来能直连的主机照常
+/// 直连(读 ssh config 之前的行为);连不上时报错末尾写明忽略了哪条 ProxyCommand。
 #[tokio::test]
-async fn proxy_command_is_a_clear_config_error() {
+async fn proxy_command_is_ignored_and_the_host_is_reached_directly() {
+    let server = TestServer::start(Behavior {
+        password: Some("pw".into()),
+        ..Behavior::new("direct")
+    })
+    .await;
     let home = TestHome::new("proxy-command");
-    home.config("Host gated\n  ProxyCommand ssh -W %h:%p gateway\n");
+    home.config("Host *\n  ProxyCommand cloudflared access ssh --hostname %h\n");
     let pool = SshPool::with_env(pool_config(Duration::from_secs(5)), home.env());
+    let mut conn = connection("direct", "127.0.0.1", server.port(), "u");
+    conn.password = Some("pw".into());
+    let session = pool.try_acquire(&conn).await.expect("reached directly");
+    assert_eq!(exec(&session, "d").await, "direct:d");
+
+    let port = closed_port();
     let err = pool
-        .try_acquire(&connection("gated", "gated", 22, "u"))
+        .try_acquire(&connection("gated", "127.0.0.1", port, "u"))
         .await
         .err()
-        .expect("unsupported");
-    assert_eq!(err.kind, AcquireErrorKind::Config);
+        .expect("nothing listens there");
+    assert_eq!(err.kind, AcquireErrorKind::Network);
     assert!(
-        err.message.starts_with("ProxyCommand is not supported"),
+        err.message
+            .starts_with(&format!("ssh connect to 127.0.0.1:{port} failed: ")),
         "{}",
         err.message
     );
+    assert!(
+        err.message.contains(
+            "note: ignored \"ProxyCommand cloudflared access ssh --hostname %h\" from ssh config"
+        ),
+        "{}",
+        err.message
+    );
+    assert!(
+        err.message
+            .contains("已忽略 ~/.ssh/config 里的 ProxyCommand"),
+        "{}",
+        err.message
+    );
+    pool.shutdown().await;
+}
+
+/// ssh config 一时读不了(这里换成了同名目录,模拟编辑器保存时的独占锁):沿用上次的路线,
+/// 健康的会话照常复用;要新建时也按上次的路线连,而不是把别名当主机名。
+#[tokio::test]
+async fn unreadable_ssh_config_keeps_the_last_route() {
+    let server = TestServer::start(Behavior {
+        password: Some("pw".into()),
+        ..Behavior::new("svc")
+    })
+    .await;
+    let home = TestHome::new("unreadable-config");
+    home.config(&format!(
+        "Host svc-alias\n  HostName 127.0.0.1\n  Port {}\n",
+        server.port()
+    ));
+    let pool = SshPool::with_env(pool_config(Duration::from_secs(5)), home.env());
+    let mut conn = connection("svc", "svc-alias", 22, "u");
+    conn.password = Some("pw".into());
+    let first = pool.try_acquire(&conn).await.expect("via ssh config");
+
+    std::fs::remove_file(home.ssh("config")).unwrap();
+    std::fs::create_dir(home.ssh("config")).unwrap();
+    set_private(&home.ssh("config"), 0o700);
+    let again = pool.try_acquire(&conn).await.expect("reused");
+    assert!(Arc::ptr_eq(&first, &again), "the healthy session is reused");
+    assert_eq!(server.accepted(), 1);
+
+    // 会话没了也照上次的路线新建。
+    drop((first, again));
+    pool.evict(&conn.id).await;
+    let rebuilt = pool.try_acquire(&conn).await.expect("last route");
+    assert_eq!(exec(&rebuilt, "r").await, "svc:r");
+    assert_eq!(server.accepted(), 2);
+    pool.shutdown().await;
+}
+
+/// ssh config 写坏了:健康的会话照常复用;要新建连接时才报 `Config`(终端里的 ssh 同样
+/// 会拒绝)。
+#[tokio::test]
+async fn broken_ssh_config_does_not_block_reusing_a_healthy_session() {
+    let server = TestServer::start(Behavior {
+        password: Some("pw".into()),
+        ..Behavior::new("svc")
+    })
+    .await;
+    let home = TestHome::new("broken-config");
+    let config = |port: &str| format!("Host svc-alias\n  HostName 127.0.0.1\n  Port {port}\n");
+    home.config(&config(&server.port().to_string()));
+    let pool = SshPool::with_env(pool_config(Duration::from_secs(5)), home.env());
+    let mut conn = connection("svc", "svc-alias", 22, "u");
+    conn.password = Some("pw".into());
+    let first = pool.try_acquire(&conn).await.expect("via ssh config");
+
+    home.config(&config("abc"));
+    let again = pool.try_acquire(&conn).await.expect("reused");
+    assert!(Arc::ptr_eq(&first, &again));
+
+    drop((first, again));
+    pool.evict(&conn.id).await;
+    let err = pool.try_acquire(&conn).await.err().expect("config error");
+    assert_eq!(err.kind, AcquireErrorKind::Config);
+    assert!(
+        err.message.contains("invalid Port value 'abc'"),
+        "{}",
+        err.message
+    );
+    assert_eq!(server.accepted(), 1);
+    pool.shutdown().await;
+}
+
+/// 跳板只开密码类认证:跳板一律不用密码(有意如此),报错写明是跳板的认证失败、跳板支持
+/// 哪些方法、为什么不用密码。
+#[tokio::test]
+async fn password_only_jump_host_fails_with_a_jump_specific_message() {
+    let jump = TestServer::start(Behavior {
+        methods: vec![MethodKind::Password, MethodKind::KeyboardInteractive],
+        password: Some("jpw".into()),
+        allow_tunnel: true,
+        ..Behavior::new("jump")
+    })
+    .await;
+    let target = TestServer::start(Behavior {
+        password: Some("tpw".into()),
+        ..Behavior::new("target")
+    })
+    .await;
+    let home = TestHome::new("jump-password-only");
+    home.config(&format!(
+        "Host target-alias\n  HostName 127.0.0.1\n  Port {}\n  ProxyJump jumper@jump-alias\n\
+         Host jump-alias\n  HostName 127.0.0.1\n  Port {}\n",
+        target.port(),
+        jump.port()
+    ));
+    let pool = SshPool::with_env(pool_config(Duration::from_secs(10)), home.env());
+    let mut conn = connection("jumped", "target-alias", 22, "deploy");
+    conn.password = Some("tpw".into());
+    let err = pool.try_acquire(&conn).await.err().expect("jump auth");
+    assert_eq!(err.kind, AcquireErrorKind::Auth);
+    assert!(
+        err.message.starts_with(&format!(
+            "authentication failed for jump host jumper@127.0.0.1:{} (server allows: \
+             password,keyboard-interactive): ",
+            jump.port()
+        )),
+        "{}",
+        err.message
+    );
+    assert!(
+        err.message.contains(
+            "password: not used for jump hosts (mini-term signs in to a jump host with keys only"
+        ),
+        "{}",
+        err.message
+    );
+    assert_eq!(jump.count("password"), 0, "{:?}", jump.log());
+    assert_eq!(target.accepted(), 0);
     pool.shutdown().await;
 }
 
@@ -1163,5 +1423,266 @@ async fn changed_or_revoked_host_keys_are_rejected_with_english_prefixes() {
     std::fs::write(home.ssh("known_hosts"), format!("[127.0.0.*]:* {real}\n")).unwrap();
     let session = pool.try_acquire(&conn).await.expect("wildcard match");
     assert_eq!(exec(&session, "h").await, "hostkey:h");
+    pool.shutdown().await;
+}
+
+// ============================================================================
+// 评审修复:单飞建连 / 加固服务器 / 认证途中断网 / 公钥 IdentityFile
+// ============================================================================
+
+/// 同一连接的并发 acquire 单飞:密码错时服务器只看到一轮认证(一条 TCP、一次密码、一次
+/// keyboard-interactive),所有请求都拿到认证失败(或冷却)。
+#[tokio::test]
+async fn concurrent_acquires_with_a_wrong_password_run_one_authentication() {
+    let server = TestServer::start(Behavior {
+        password: Some("right".into()),
+        ..Behavior::new("single-flight")
+    })
+    .await;
+    let home = TestHome::new("single-flight-wrong");
+    let pool = SshPool::with_env(pool_config(Duration::from_secs(10)), home.env());
+    let mut conn = connection("flight", "127.0.0.1", server.port(), "u");
+    conn.password = Some("wrong".into());
+
+    let attempts = futures::future::join_all((0..6).map(|_| pool.try_acquire(&conn))).await;
+    for attempt in &attempts {
+        let err = attempt.as_ref().err().expect("wrong password");
+        assert!(
+            matches!(
+                err.kind,
+                AcquireErrorKind::Auth | AcquireErrorKind::Cooldown
+            ),
+            "{err:?}"
+        );
+    }
+    assert_eq!(server.accepted(), 1, "{:?}", server.log());
+    assert_eq!(server.count("password u"), 1, "{:?}", server.log());
+    assert_eq!(
+        server.count("keyboard-interactive u"),
+        1,
+        "{:?}",
+        server.log()
+    );
+    pool.shutdown().await;
+}
+
+/// 成功时同样只建一条会话,所有并发请求拿到同一个。
+#[tokio::test]
+async fn concurrent_acquires_share_one_new_session() {
+    let server = TestServer::start(Behavior {
+        password: Some("pw".into()),
+        ..Behavior::new("shared")
+    })
+    .await;
+    let home = TestHome::new("single-flight-ok");
+    let pool = SshPool::with_env(pool_config(Duration::from_secs(10)), home.env());
+    let mut conn = connection("shared", "127.0.0.1", server.port(), "u");
+    conn.password = Some("pw".into());
+
+    let sessions: Vec<Arc<CachedSession>> =
+        futures::future::join_all((0..6).map(|_| pool.try_acquire(&conn)))
+            .await
+            .into_iter()
+            .map(|result| result.expect("connects"))
+            .collect();
+    for session in &sessions[1..] {
+        assert!(Arc::ptr_eq(session, &sessions[0]));
+    }
+    assert_eq!(server.accepted(), 1);
+    assert_eq!(server.count("password u"), 1);
+    assert_eq!(pool.len().await, 1);
+    pool.shutdown().await;
+}
+
+/// 单飞的持闸者在建连途中被丢弃(调用方超时 / 取消):闸随之放开,下一个请求自己去建,
+/// 不会被一个已经不存在的建连挡住。
+#[tokio::test]
+async fn a_dropped_leader_releases_the_single_flight_gate() {
+    let server = TestServer::start(Behavior {
+        password: Some("pw".into()),
+        ..Behavior::new("after-drop")
+    })
+    .await;
+    // 第一条连接一声不吭地挂着,之后的连接转给真服务器。
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let upstream = server.addr;
+    let front = tokio::spawn(async move {
+        let mut parked = Vec::new();
+        while let Ok((mut socket, _)) = listener.accept().await {
+            if parked.is_empty() {
+                parked.push(socket);
+                continue;
+            }
+            tokio::spawn(async move {
+                if let Ok(mut upstream) = TcpStream::connect(upstream).await {
+                    let _ = tokio::io::copy_bidirectional(&mut socket, &mut upstream).await;
+                }
+            });
+        }
+    });
+    let home = TestHome::new("dropped-leader");
+    let pool = SshPool::with_env(pool_config(Duration::from_secs(10)), home.env());
+    let mut conn = connection("dropped", "127.0.0.1", port, "u");
+    conn.password = Some("pw".into());
+
+    let gave_up = tokio::time::timeout(Duration::from_millis(300), pool.try_acquire(&conn)).await;
+    assert!(gave_up.is_err(), "the first connection is parked");
+    let session = tokio::time::timeout(Duration::from_secs(5), pool.try_acquire(&conn))
+        .await
+        .expect("the gate was released with the dropped leader")
+        .expect("connects through the second connection");
+    assert_eq!(exec(&session, "x").await, "after-drop:x");
+    pool.shutdown().await;
+    front.abort();
+}
+
+/// 加固过的 sshd(`MaxAuthTries 3`)+ agent 里一堆它不认的 key:第三把被拒后服务器发
+/// 「Too many authentication failures」断开,密码还没轮到。重连一次只试密码,登录成功。
+#[tokio::test]
+async fn hardened_server_disconnecting_before_the_password_gets_a_password_only_retry() {
+    let keys: Vec<PrivateKey> = (110..115).map(ed25519).collect();
+    let server = TestServer::start(Behavior {
+        password: Some("pw".into()),
+        disconnect_after_failures: 3,
+        ..Behavior::new("hardened")
+    })
+    .await;
+    let agent_path = spawn_agent((), &keys).await;
+    let home = TestHome::new("hardened");
+    let env = SshClientEnv {
+        agent: AgentSource::Endpoint(agent_path),
+        ..home.env()
+    };
+    let pool = SshPool::with_env(pool_config(Duration::from_secs(10)), env);
+    let mut conn = connection("hardened", "127.0.0.1", server.port(), "u");
+    conn.password = Some("pw".into());
+
+    let session = pool.try_acquire(&conn).await.expect("password on retry");
+    assert_eq!(exec(&session, "p").await, "hardened:p");
+    let log = server.log();
+    assert_eq!(server.accepted(), 2, "{log:?}");
+    assert_eq!(server.count("password u"), 1, "{log:?}");
+    assert!(server.count("offered") <= 4, "{log:?}");
+    pool.shutdown().await;
+}
+
+/// 同样的服务器、密码却是错的:重连那一轮也失败。逐方法报错写明两轮,冷却只记一次 ——
+/// 下一次 acquire 直接冷却,不再碰服务器。
+#[tokio::test]
+async fn password_only_retry_failure_is_one_auth_failure() {
+    let keys: Vec<PrivateKey> = (120..125).map(ed25519).collect();
+    let server = TestServer::start(Behavior {
+        password: Some("right".into()),
+        disconnect_after_failures: 3,
+        ..Behavior::new("hardened-wrong")
+    })
+    .await;
+    let agent_path = spawn_agent((), &keys).await;
+    let home = TestHome::new("hardened-wrong");
+    let env = SshClientEnv {
+        agent: AgentSource::Endpoint(agent_path),
+        ..home.env()
+    };
+    let pool = SshPool::with_env(pool_config(Duration::from_secs(10)), env);
+    let mut conn = connection("hardened-wrong", "127.0.0.1", server.port(), "u");
+    conn.password = Some("s3cret-but-wrong".into());
+
+    let err = pool.try_acquire(&conn).await.err().expect("wrong password");
+    assert_eq!(err.kind, AcquireErrorKind::Auth, "{}", err.message);
+    let message = &err.message;
+    assert!(
+        message.contains("the server closed the connection: Too many authentication failures"),
+        "{message}"
+    );
+    assert!(
+        message.contains("reconnected to try the password without offering public keys"),
+        "{message}"
+    );
+    assert!(
+        message.contains("password: rejected by server"),
+        "{message}"
+    );
+    assert!(!message.contains("s3cret"), "password leaked: {message}");
+    assert_eq!(server.accepted(), 2);
+
+    let err = pool.try_acquire(&conn).await.err().expect("cooldown");
+    assert_eq!(err.kind, AcquireErrorKind::Cooldown);
+    assert_eq!(server.accepted(), 2, "no reconnect in cooldown");
+    pool.shutdown().await;
+}
+
+/// 认证途中断了网(服务器直接关 TCP、不发 DISCONNECT,之前也没拒过任何方法):是网络错误,
+/// 不冷却,报错不谎称「被服务器拒绝」。
+#[tokio::test]
+async fn connection_lost_during_authentication_is_a_network_error_without_cooldown() {
+    let server = TestServer::start(Behavior {
+        password: Some("pw".into()),
+        drop_on_password: true,
+        ..Behavior::new("flaky")
+    })
+    .await;
+    let home = TestHome::new("lost-mid-auth");
+    let pool = SshPool::with_env(pool_config(Duration::from_secs(10)), home.env());
+    let mut conn = connection("flaky", "127.0.0.1", server.port(), "u");
+    conn.password = Some("pw".into());
+
+    let err = pool.try_acquire(&conn).await.err().expect("dropped");
+    assert_eq!(err.kind, AcquireErrorKind::Network, "{}", err.message);
+    assert!(
+        err.message.starts_with(&format!(
+            "connection lost during authentication on u@127.0.0.1:{}: ",
+            server.port()
+        )),
+        "{}",
+        err.message
+    );
+    assert!(!err.message.contains("rejected"), "{}", err.message);
+
+    let err = pool.try_acquire(&conn).await.err().expect("dropped again");
+    assert_eq!(err.kind, AcquireErrorKind::Network, "not a cooldown");
+    assert_eq!(server.accepted(), 2);
+    pool.shutdown().await;
+}
+
+/// `IdentityFile` 指向公钥(1Password 推荐的写法)+ `IdentitiesOnly yes`:到 agent 里找
+/// 同一把 key 签名;agent 里的其它 key 一把都不出示。
+#[tokio::test]
+async fn public_key_identity_file_signs_through_the_agent() {
+    let wanted = ed25519(101);
+    let other = ed25519(102);
+    let server = TestServer::start(Behavior {
+        keys: vec![wanted.public_key().clone()],
+        ..Behavior::new("pubfile")
+    })
+    .await;
+    let agent_path = spawn_agent((), &[other.clone(), wanted.clone()]).await;
+    let home = TestHome::new("pubfile");
+    std::fs::write(
+        home.ssh("work.pub"),
+        format!("{}\n", wanted.public_key().to_openssh().unwrap()),
+    )
+    .unwrap();
+    home.config(&format!(
+        "Host pubfile-host\n  HostName 127.0.0.1\n  Port {}\n  IdentitiesOnly yes\n  \
+         IdentityFile ~/.ssh/work.pub\n",
+        server.port()
+    ));
+    let env = SshClientEnv {
+        agent: AgentSource::Endpoint(agent_path),
+        ..home.env()
+    };
+    let pool = SshPool::with_env(pool_config(Duration::from_secs(10)), env);
+    let session = pool
+        .try_acquire(&connection("pubfile", "pubfile-host", 22, "u"))
+        .await
+        .expect("signed by the agent");
+    assert_eq!(exec(&session, "k").await, "pubfile:k");
+    let log = server.log();
+    assert!(
+        !log.iter()
+            .any(|l| l.contains(&fingerprint(other.public_key()))),
+        "IdentitiesOnly must hide other agent keys: {log:?}"
+    );
     pool.shutdown().await;
 }

@@ -289,11 +289,16 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
 }
 
 /// 把一条新 host-key 写入 known_hosts,父目录不存在则创建。
+///
+/// 文件末尾没有换行(手工编辑、别的工具写的)时先补一个,否则新条目会粘在上一行后面,
+/// 两条一起作废、该主机退回首次信任 —— 与 OpenSSH `add_host_to_hostfile` 同一做法。
 pub(crate) fn append_known_host(
     path: &Path,
     host_pattern: &str,
     server_pubkey: &russh::keys::ssh_key::PublicKey,
 ) -> std::io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -307,12 +312,22 @@ pub(crate) fn append_known_host(
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         base64::engine::general_purpose::STANDARD.encode(bytes)
     };
-    let line = format!("{host_pattern} {algo} {b64}\n");
-    use std::io::Write;
     let mut f = std::fs::OpenOptions::new()
         .create(true)
+        .read(true)
         .append(true)
         .open(path)?;
+    let mut last = [0u8; 1];
+    let needs_newline = f.metadata()?.len() > 0 && {
+        f.seek(SeekFrom::End(-1))?;
+        f.read_exact(&mut last)?;
+        last[0] != b'\n'
+    };
+    let line = format!(
+        "{}{host_pattern} {algo} {b64}\n",
+        if needs_newline { "\n" } else { "" }
+    );
+    // 追加模式下写入总在文件末尾,与刚才读的位置无关;一次写完,免得只补了换行。
     f.write_all(line.as_bytes())
 }
 
@@ -1070,9 +1085,10 @@ mod tests {
             .await
             .unwrap();
         assert!(!accepted, "写不进 known_hosts 时不得放行");
+        // 两个平台走到的分支不同,但都是 fail-closed 拒绝:Windows 读 `文件/known_hosts`
+        // 得到 NotFound(当成空文件、按新主机去写,写失败);Linux 读它就得到 ENOTDIR
+        // (os error 20),走「读不了」分支。要守的是上面的 `!accepted`。
         let reason = rejection_of(&client);
-        // Windows 读「文件底下的路径」得 NotFound → 当新主机去写 → 写失败;Linux 读它得
-        // ENOTDIR → 直接按读失败拒绝。两种都是 fail closed,要守的是上面的「不放行」。
         assert!(
             reason.starts_with("known_hosts write failed (")
                 || reason.starts_with("known_hosts unreadable ("),
@@ -1162,6 +1178,34 @@ mod tests {
         append_known_host(&path, "other.example.com", &pub_key).expect("append 2");
         let content2 = std::fs::read_to_string(&path).expect("read 2");
         assert_eq!(content2.lines().count(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_known_host_adds_the_missing_trailing_newline_first() {
+        let dir = known_hosts_test_dir("no-trailing-newline");
+        let path = dir.join("known_hosts");
+        let pub_a = test_pubkey_from_bytes(KEY_BYTES_A);
+        let pub_b = test_pubkey_from_bytes(KEY_BYTES_B);
+        // 手工编辑留下的文件:最后一行没有换行。不补的话新条目粘在它后面,两条一起作废。
+        std::fs::write(&path, format!("a.example.com {}", key_fields(&pub_a))).unwrap();
+        append_known_host(&path, "b.example.com", &pub_b).unwrap();
+        let raw = read_known_hosts(&path).unwrap();
+        assert_eq!(raw.lines().count(), 2, "{raw}");
+        assert!(raw.ends_with('\n'), "{raw}");
+        assert_eq!(
+            match_known_host(&raw, "a.example.com", &pub_a),
+            HostKeyMatch::Match
+        );
+        assert_eq!(
+            match_known_host(&raw, "b.example.com", &pub_b),
+            HostKeyMatch::Match
+        );
+        // 已经以换行结尾:不多补空行。
+        append_known_host(&path, "c.example.com", &pub_a).unwrap();
+        let raw = read_known_hosts(&path).unwrap();
+        assert_eq!(raw.lines().count(), 3, "{raw}");
+        assert!(!raw.contains("\n\n"), "{raw}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

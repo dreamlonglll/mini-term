@@ -19,11 +19,20 @@
 //!   连不上时报错里能看出来;
 //! - `Include`:相对路径相对 `~/.ssh`,支持 `~` 与文件名里的 `*` / `?` 通配(按文件名
 //!   排序依次读);写在 `Host` 块里时只在该块生效时读(OpenSSH 的条件包含);嵌套最多
-//!   16 层,并跳过正在读的祖先文件,防止循环包含。
+//!   16 层,并跳过正在读的祖先文件,防止循环包含;
+//! - 文件不存在 = 没有配置;存在却读不了(Windows 上编辑器保存时独占着文件之类)报
+//!   [`RouteError::Unreadable`],由会话池沿用上次解析出的路线,不把它当成「没有配置」
+//!   (那会让路线变样、白白淘汰健康的会话);
+//! - Unix 上组或其他用户可写的配置文件(主配置与 Include 的)整个忽略并记一行日志,与
+//!   OpenSSH 的「Bad owner or permissions」同一口径。只查权限位:属主检查要当前 uid,
+//!   不加依赖拿不到。Windows 不查。
 //!
 //! 建连路线的取值规则(与终端拼的命令行等价)见 [`resolve_route`]。
 
+use std::collections::HashSet;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use mt_core::SshConnection;
 
@@ -32,6 +41,94 @@ const MAX_INCLUDE_DEPTH: usize = 16;
 
 /// ProxyJump 最多几跳。没有协议上的限制,只是挡住写错的超长链。
 const MAX_JUMP_HOPS: usize = 8;
+
+/// 解析建连路线失败的分类。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RouteError {
+    /// 配置内容或连接本身有误(取值非法、Include 过深、没有用户名……):改了才会好。
+    Invalid(String),
+    /// ssh config(或它 Include 的文件)存在却读不了。多半转瞬即逝(编辑器保存时的独占锁),
+    /// 调用方可沿用上次解析出的路线。
+    Unreadable(String),
+}
+
+impl RouteError {
+    pub(crate) fn message(&self) -> &str {
+        match self {
+            RouteError::Invalid(message) | RouteError::Unreadable(message) => message,
+        }
+    }
+}
+
+impl std::fmt::Display for RouteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+/// 解析途中的普通错误(取值非法……)一律是 [`RouteError::Invalid`]。
+impl From<String> for RouteError {
+    fn from(message: String) -> Self {
+        RouteError::Invalid(message)
+    }
+}
+
+/// 同一句提醒每个进程只记一次:路线每次 acquire 都重新解析,配置文件权限不对之类的
+/// 持续状况不该把日志刷满。
+pub(crate) fn warn_once(message: String) {
+    static WARNED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let mut warned = WARNED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !warned.contains(&message) {
+        eprintln!("[mt-ssh] {message}");
+        warned.insert(message);
+    }
+}
+
+/// 组或其他用户可写(OpenSSH `readconf.c` 权限检查里权限位的那一半:`mode & 022`)。
+fn writable_by_others(mode: u32) -> bool {
+    mode & 0o022 != 0
+}
+
+/// 打开的配置文件的权限位。只有 Unix 有意义;Windows 不查(OpenSSH for Windows 改查
+/// ACL,这里不跟)。
+#[cfg(unix)]
+fn file_mode(file: &std::fs::File) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    file.metadata()
+        .ok()
+        .map(|metadata| metadata.permissions().mode())
+}
+
+#[cfg(not(unix))]
+fn file_mode(_file: &std::fs::File) -> Option<u32> {
+    None
+}
+
+/// 读一个 ssh config 文件。不存在是 `Ok(None)`;组或其他用户可写时同样当作不存在,记一行
+/// 日志(OpenSSH 会因「Bad owner or permissions」拒绝这样的文件);其它 IO 错误原样返回。
+/// 权限按打开后的文件查(fstat 口径,不怕查完被换掉)。
+fn read_config_file(path: &Path) -> std::io::Result<Option<String>> {
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if let Some(mode) = file_mode(&file).filter(|&mode| writable_by_others(mode)) {
+        warn_once(format!(
+            "ssh config {} ignored: bad owner or permissions (mode {:o}; OpenSSH refuses a \
+             config file that is writable by group or others, run `chmod 600` on it)",
+            path.display(),
+            mode & 0o7777
+        ));
+        return Ok(None);
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+}
 
 /// OpenSSH `match_pattern`:`*` 匹配任意长(含空)串,`?` 恰好一个字符,其余逐字符
 /// 相等(区分大小写 —— 需要不敏感的调用方自己先转小写)。
@@ -251,17 +348,21 @@ pub(crate) fn expand_tokens(value: &str, ctx: &TokenContext<'_>) -> Result<Strin
 
 /// 读 ssh config,收集对 `alias` 生效的设置。`config_path` 为 `None` 时不读任何文件。
 ///
-/// 文件不存在 = 没有配置;读不了(权限等)记一行日志后同样当作没有 —— 与 OpenSSH
-/// 一样,配置文件打不开不该让连接本身失败。只有**生效行**的取值非法(`Port abc`)、
-/// `Include` 嵌套过深才报错:终端里的 ssh 遇到同样的配置也会拒绝连接。
+/// 文件不存在 = 没有配置。存在却读不了(独占锁、权限……)报 [`RouteError::Unreadable`]:
+/// 把它当成「没有配置」会让路线变样(别名解析不了、跳板没了),调用方应沿用上次的路线;
+/// `tolerate_unreadable` 为真(没有上次可沿用时)才记一行日志后跳过它。只有**生效行**的
+/// 取值非法(`Port abc`)、`Include` 嵌套过深才是 [`RouteError::Invalid`]:终端里的 ssh
+/// 遇到同样的配置也会拒绝连接。
 pub(crate) fn read_host_config(
     config_path: Option<&Path>,
     home: Option<&Path>,
     alias: &str,
-) -> Result<HostConfig, String> {
+    tolerate_unreadable: bool,
+) -> Result<HostConfig, RouteError> {
     let mut reader = ConfigReader {
         alias,
         home,
+        tolerate_unreadable,
         config: HostConfig::default(),
         stack: Vec::new(),
     };
@@ -274,22 +375,30 @@ pub(crate) fn read_host_config(
 struct ConfigReader<'a> {
     alias: &'a str,
     home: Option<&'a Path>,
+    /// 读不了的文件记日志后跳过,而不是报 [`RouteError::Unreadable`]。
+    tolerate_unreadable: bool,
     config: HostConfig,
     /// 正在读的文件链(防循环 Include)。
     stack: Vec<PathBuf>,
 }
 
 impl ConfigReader<'_> {
-    fn process_file(&mut self, path: &Path, depth: usize) -> Result<(), String> {
-        let text = match std::fs::read(path) {
-            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => {
+    fn process_file(&mut self, path: &Path, depth: usize) -> Result<(), RouteError> {
+        let text = match read_config_file(path) {
+            Ok(Some(text)) => text,
+            Ok(None) => return Ok(()),
+            Err(e) if self.tolerate_unreadable => {
                 eprintln!(
                     "[mt-ssh] ssh config {} unreadable, ignored: {e}",
                     path.display()
                 );
                 return Ok(());
+            }
+            Err(e) => {
+                return Err(RouteError::Unreadable(format!(
+                    "ssh config {} is unreadable: {e}",
+                    path.display()
+                )));
             }
         };
         self.stack.push(path.to_path_buf());
@@ -298,7 +407,7 @@ impl ConfigReader<'_> {
         result
     }
 
-    fn process_text(&mut self, text: &str, path: &Path, depth: usize) -> Result<(), String> {
+    fn process_text(&mut self, text: &str, path: &Path, depth: usize) -> Result<(), RouteError> {
         // 文件开头(全局段)对所有主机生效;被 Include 进来的文件同样从「生效」开始 ——
         // 只有生效位置的 Include 才会读到这里,与 OpenSSH 继承包含处状态的效果一致。
         let mut active = true;
@@ -382,11 +491,11 @@ impl ConfigReader<'_> {
         Ok(())
     }
 
-    fn include(&mut self, arg: &str, depth: usize, location: &str) -> Result<(), String> {
+    fn include(&mut self, arg: &str, depth: usize, location: &str) -> Result<(), RouteError> {
         if depth + 1 > MAX_INCLUDE_DEPTH {
-            return Err(format!(
+            return Err(RouteError::Invalid(format!(
                 "ssh config {location}: Include nested more than {MAX_INCLUDE_DEPTH} levels deep"
-            ));
+            )));
         }
         let pattern = if arg.starts_with('~') {
             expand_tilde(arg, self.home).map_err(|e| format!("ssh config {location}: {e}"))?
@@ -397,9 +506,9 @@ impl ConfigReader<'_> {
             match self.home {
                 Some(home) => home.join(".ssh").join(arg),
                 None => {
-                    return Err(format!(
+                    return Err(RouteError::Invalid(format!(
                         "ssh config {location}: cannot resolve Include '{arg}': home directory unknown"
-                    ));
+                    )));
                 }
             }
         };
@@ -464,6 +573,9 @@ pub(crate) struct RouteEnv<'a> {
     pub(crate) ssh_config_path: Option<&'a Path>,
     pub(crate) home: Option<&'a Path>,
     pub(crate) local_user: Option<&'a str>,
+    /// 读不了的 ssh config 文件记日志后跳过(见 [`read_host_config`])。只在没有上次的
+    /// 路线可沿用时打开。
+    pub(crate) tolerate_unreadable: bool,
 }
 
 /// 私钥文件来自哪里(写进认证失败的报错,便于用户找到该改哪儿)。
@@ -516,6 +628,10 @@ impl ResolvedHost {
 pub(crate) struct ResolvedRoute {
     pub(crate) jumps: Vec<ResolvedHost>,
     pub(crate) target: ResolvedHost,
+    /// ssh config 给这条连接配了本实现不支持的代理(`ProxyCommand`,或跳板自己又配了
+    /// 代理),路线已回落为不经代理的直连(与读 ssh config 之前的行为一致)。这是要附在
+    /// 连接失败的报错与日志里的那句说明。
+    pub(crate) ignored_proxy: Option<String>,
 }
 
 /// known_hosts 名:`HostKeyAlias` 原样(OpenSSH 不给别名带端口),否则 HostName 按
@@ -581,18 +697,27 @@ fn config_identities(
 /// - `ProxyJump`:逗号分隔的一跳或多跳 `[user@]host[:port]`(可带 `ssh://`),`none`
 ///   表示不用跳板。每个跳板按它自己的名字再查一遍 ssh config(HostName / Port / User /
 ///   IdentityFile / IdentitiesOnly / HostKeyAlias),跳板上的端口 / 用户以 ProxyJump
-///   里写的为准;跳板自己的 ssh config 若又配了 ProxyJump / ProxyCommand,明确报错
-///   (OpenSSH 会递归起子 ssh,这里不跟);
-/// - `ProxyCommand`:不支持,明确报错。
+///   里写的为准;
+/// - `ProxyCommand`,以及跳板自己的 ssh config 又配了 ProxyJump / ProxyCommand(OpenSSH
+///   会递归起子 ssh,这里不跟):不支持,回落为不经代理的直连,并在
+///   [`ResolvedRoute::ignored_proxy`] 里留一句说明。`Host *` 配一条公司代理 / cloudflared
+///   这类写法很常见,不该让本来能直连的连接全部失败。
 pub(crate) fn resolve_route(
     conn: &SshConnection,
     env: &RouteEnv<'_>,
-) -> Result<ResolvedRoute, String> {
+) -> Result<ResolvedRoute, RouteError> {
     let alias = conn.host.trim();
     if alias.is_empty() {
-        return Err("ssh connection has an empty host".into());
+        return Err(RouteError::Invalid(
+            "ssh connection has an empty host".into(),
+        ));
     }
-    let config = read_host_config(env.ssh_config_path, env.home, alias)?;
+    let config = read_host_config(
+        env.ssh_config_path,
+        env.home,
+        alias,
+        env.tolerate_unreadable,
+    )?;
     let host_name = match &config.host_name {
         Some(value) => expand_host_name(value, alias)?,
         None => alias.to_string(),
@@ -611,9 +736,9 @@ pub(crate) fn resolve_route(
     {
         user
     } else {
-        return Err(format!(
+        return Err(RouteError::Invalid(format!(
             "no user name for {alias}: the connection has no user and ssh config sets no User"
-        ));
+        )));
     };
     let ctx = TokenContext {
         home: env.home,
@@ -652,29 +777,63 @@ pub(crate) fn resolve_route(
         explicit_identities,
         identities_only: config.identities_only.unwrap_or(false),
     };
-    let jumps = match &config.proxy {
-        None => Vec::new(),
-        Some(proxy) if proxy.is_none() => Vec::new(),
-        Some(ProxySetting::Command(command)) => {
-            return Err(format!(
-                "ProxyCommand is not supported by mini-term's built-in SSH client (ssh config sets \
-                 \"ProxyCommand {command}\" for {alias}); use ProxyJump instead"
-            ));
-        }
+    let (jumps, ignored_proxy) = match &config.proxy {
+        None => (Vec::new(), None),
+        Some(proxy) if proxy.is_none() => (Vec::new(), None),
+        Some(ProxySetting::Command(command)) => (
+            Vec::new(),
+            Some(format!(
+                "ignored \"ProxyCommand {command}\" from ssh config for {alias} (mini-term's \
+                 built-in SSH client cannot run proxy commands) and connected directly; 已忽略 \
+                 ~/.ssh/config 里的 ProxyCommand,改为直连"
+            )),
+        ),
         Some(ProxySetting::Jump(spec)) => {
             let hops: Vec<&str> = spec.split(',').map(str::trim).collect();
             if hops.len() > MAX_JUMP_HOPS {
-                return Err(format!(
+                return Err(RouteError::Invalid(format!(
                     "ProxyJump for {alias} has {} hops; at most {MAX_JUMP_HOPS} are supported",
                     hops.len()
-                ));
+                )));
             }
-            hops.into_iter()
-                .map(|hop| resolve_jump(hop, env))
-                .collect::<Result<Vec<_>, _>>()?
+            let mut jumps = Vec::with_capacity(hops.len());
+            let mut nested = None;
+            for hop in hops {
+                match resolve_jump(hop, env)? {
+                    JumpHop::Host(host) => jumps.push(host),
+                    JumpHop::NestedProxy(name) => {
+                        nested = Some(name);
+                        break;
+                    }
+                }
+            }
+            match nested {
+                None => (jumps, None),
+                Some(name) => (
+                    Vec::new(),
+                    Some(format!(
+                        "ignored \"ProxyJump {spec}\" from ssh config for {alias} because jump \
+                         host {name} sets its own ProxyJump/ProxyCommand (nested proxies are not \
+                         supported by mini-term's built-in SSH client; list every hop in a single \
+                         ProxyJump instead) and connected directly; 已忽略 ~/.ssh/config 里的 \
+                         ProxyJump(跳板自己又配了代理),改为直连"
+                    )),
+                ),
+            }
         }
     };
-    Ok(ResolvedRoute { jumps, target })
+    Ok(ResolvedRoute {
+        jumps,
+        target,
+        ignored_proxy,
+    })
+}
+
+/// [`resolve_jump`] 的结果。
+enum JumpHop {
+    Host(ResolvedHost),
+    /// 跳板自己又配了代理(值是跳板名):整条路线回落为直连。
+    NestedProxy(String),
 }
 
 /// ProxyJump 里的一跳:`[ssh://][user@]host[:port]`,IPv6 写成 `[addr]:port`。
@@ -736,18 +895,16 @@ fn parse_jump_spec(spec: &str) -> Result<JumpSpec, String> {
 
 /// 解析一个跳板。跳板没有连接配置可依,全部取自 ProxyJump 写法与它自己的 ssh config;
 /// 认证只用 agent / 默认私钥 / 它自己的 `IdentityFile`(密码属于目标连接,不用于跳板)。
-fn resolve_jump(raw: &str, env: &RouteEnv<'_>) -> Result<ResolvedHost, String> {
+fn resolve_jump(raw: &str, env: &RouteEnv<'_>) -> Result<JumpHop, RouteError> {
     let spec = parse_jump_spec(raw)?;
-    let config = read_host_config(env.ssh_config_path, env.home, &spec.host)?;
-    if let Some(proxy) = &config.proxy {
-        if !proxy.is_none() {
-            return Err(format!(
-                "jump host {} has its own ProxyJump/ProxyCommand in ssh config; nested proxies are \
-                 not supported by mini-term's built-in SSH client (list every hop in a single \
-                 ProxyJump instead)",
-                spec.host
-            ));
-        }
+    let config = read_host_config(
+        env.ssh_config_path,
+        env.home,
+        &spec.host,
+        env.tolerate_unreadable,
+    )?;
+    if config.proxy.as_ref().is_some_and(|proxy| !proxy.is_none()) {
+        return Ok(JumpHop::NestedProxy(spec.host));
     }
     let host_name = match &config.host_name {
         Some(value) => expand_host_name(value, &spec.host)?,
@@ -762,11 +919,11 @@ fn resolve_jump(raw: &str, env: &RouteEnv<'_>) -> Result<ResolvedHost, String> {
     {
         Some(user) => user,
         None => {
-            return Err(format!(
+            return Err(RouteError::Invalid(format!(
                 "no user name for jump host {}: ProxyJump and ssh config set none and the local \
                  user name is unknown",
                 spec.host
-            ));
+            )));
         }
     };
     let ctx = TokenContext {
@@ -777,7 +934,7 @@ fn resolve_jump(raw: &str, env: &RouteEnv<'_>) -> Result<ResolvedHost, String> {
         port,
         alias: &spec.host,
     };
-    Ok(ResolvedHost {
+    Ok(JumpHop::Host(ResolvedHost {
         identities: config_identities(&config.identity_files, env, &ctx),
         explicit_identities: !config.identity_files.is_empty(),
         identities_only: config.identities_only.unwrap_or(false),
@@ -786,7 +943,7 @@ fn resolve_jump(raw: &str, env: &RouteEnv<'_>) -> Result<ResolvedHost, String> {
         host_name,
         port,
         user,
-    })
+    }))
 }
 
 // ============================================================================
@@ -815,6 +972,7 @@ mod tests {
             let path = self.dir.join(relative);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, content).unwrap();
+            restrict(&path);
             path
         }
 
@@ -827,7 +985,9 @@ mod tests {
                 Some(&self.dir.join(".ssh").join("config")),
                 Some(&self.dir),
                 alias,
+                false,
             )
+            .map_err(|e| e.to_string())
         }
 
         fn env(&self) -> RouteEnv<'_> {
@@ -835,9 +995,21 @@ mod tests {
                 ssh_config_path: None,
                 home: Some(&self.dir),
                 local_user: Some("localme"),
+                tolerate_unreadable: false,
             }
         }
     }
+
+    /// 测试写出的配置文件收紧成 0600:umask 偏松(002)的机器上,组可写的文件会被权限检查
+    /// 忽略掉。
+    #[cfg(unix)]
+    fn restrict(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[cfg(not(unix))]
+    fn restrict(_path: &Path) {}
 
     impl Drop for TempHome {
         fn drop(&mut self) {
@@ -865,7 +1037,7 @@ mod tests {
             ssh_config_path: Some(&config),
             ..home.env()
         };
-        resolve_route(conn, &env)
+        resolve_route(conn, &env).map_err(|e| e.to_string())
     }
 
     #[test]
@@ -1053,9 +1225,58 @@ mod tests {
         let home = TempHome::new("absent");
         assert_eq!(home.read("x").unwrap(), HostConfig::default());
         assert_eq!(
-            read_host_config(None, Some(&home.dir), "x").unwrap(),
+            read_host_config(None, Some(&home.dir), "x", false).unwrap(),
             HostConfig::default()
         );
+    }
+
+    #[test]
+    fn unreadable_config_is_reported_unless_tolerated() {
+        // 路径是个目录:打不开 / 读不出,但不是「不存在」—— 不能当成没有配置。
+        let home = TempHome::new("unreadable");
+        let config = home.dir.join(".ssh").join("config");
+        std::fs::create_dir_all(&config).unwrap();
+        restrict(&config);
+        let err = read_host_config(Some(&config), Some(&home.dir), "x", false).unwrap_err();
+        assert!(matches!(err, RouteError::Unreadable(_)), "{err:?}");
+        assert!(err.message().starts_with("ssh config "), "{err}");
+        assert!(err.message().contains("is unreadable"), "{err}");
+        // 没有上次的路线可沿用时才容忍:记日志后当它不存在。
+        assert_eq!(
+            read_host_config(Some(&config), Some(&home.dir), "x", true).unwrap(),
+            HostConfig::default()
+        );
+
+        // Include 进来的文件读不了同样如此。
+        let other = TempHome::new("unreadable-include");
+        let broken = other.dir.join(".ssh").join("broken");
+        std::fs::create_dir_all(&broken).unwrap();
+        restrict(&broken);
+        other.config("Include broken\nUser after-include\n");
+        let err = other.read("x").unwrap_err();
+        assert!(err.contains("is unreadable"), "{err}");
+    }
+
+    #[test]
+    fn group_or_world_writable_modes_match_openssh() {
+        for mode in [0o100600, 0o100644, 0o100755, 0o100400] {
+            assert!(!writable_by_others(mode), "{mode:o}");
+        }
+        for mode in [0o100664, 0o100660, 0o100646, 0o100666, 0o100602] {
+            assert!(writable_by_others(mode), "{mode:o}");
+        }
+    }
+
+    /// Unix:组可写的配置文件整个忽略(OpenSSH「Bad owner or permissions」)。
+    #[cfg(unix)]
+    #[test]
+    fn group_writable_config_is_ignored_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = TempHome::new("bad-perms");
+        let path = home.config("Host x\n\tUser from-config\n");
+        assert_eq!(home.read("x").unwrap().user.as_deref(), Some("from-config"));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
+        assert_eq!(home.read("x").unwrap(), HostConfig::default());
     }
 
     #[test]
@@ -1242,21 +1463,42 @@ mod tests {
     }
 
     #[test]
-    fn resolve_route_rejects_proxy_command_and_nested_jumps() {
-        let home = TempHome::new("route-reject");
+    fn resolve_route_falls_back_to_direct_for_proxy_command_and_nested_jumps() {
+        let home = TempHome::new("route-fallback");
         home.config(
             "Host viacmd\n\
+             \tHostName cmd.example.com\n\
              \tProxyCommand ssh -W %h:%p gateway\n\
              Host nested\n\
-             \tProxyJump hop1\n\
+             \tProxyJump ok-hop,hop1\n\
              Host hop1\n\
              \tProxyJump hop2\n",
         );
-        let err = route(&home, &connection("viacmd", 22, "u")).unwrap_err();
-        assert!(err.starts_with("ProxyCommand is not supported"), "{err}");
-        assert!(err.contains("use ProxyJump"), "{err}");
-        let err = route(&home, &connection("nested", 22, "u")).unwrap_err();
-        assert!(err.contains("nested proxies are not supported"), "{err}");
+        // ProxyCommand:不经代理直连(HostName 等其余设置照常生效),留一句说明。
+        let viacmd = route(&home, &connection("viacmd", 22, "u")).unwrap();
+        assert!(viacmd.jumps.is_empty());
+        assert_eq!(viacmd.target.host_name, "cmd.example.com");
+        let note = viacmd.ignored_proxy.expect("note");
+        assert!(
+            note.starts_with("ignored \"ProxyCommand ssh -W %h:%p gateway\" from ssh config"),
+            "{note}"
+        );
+        assert!(note.contains("connected directly"), "{note}");
+        assert!(
+            note.contains("已忽略 ~/.ssh/config 里的 ProxyCommand"),
+            "{note}"
+        );
+
+        // 跳板自己又配了代理:整条路线回落为直连(不是只丢掉那一跳)。
+        let nested = route(&home, &connection("nested", 22, "u")).unwrap();
+        assert!(nested.jumps.is_empty());
+        let note = nested.ignored_proxy.expect("note");
+        assert!(note.contains("\"ProxyJump ok-hop,hop1\""), "{note}");
+        assert!(note.contains("jump host hop1 sets its own"), "{note}");
+
+        // 没配代理的连接没有说明。
+        let plain = route(&home, &connection("plain", 22, "u")).unwrap();
+        assert_eq!(plain.ignored_proxy, None);
     }
 
     #[test]
@@ -1299,14 +1541,16 @@ mod tests {
             ssh_config_path: None,
             home: None,
             local_user: None,
+            tolerate_unreadable: false,
         };
         let mut conn = connection("h.example.com", 22, "u");
         conn.identity_file = Some("~/.ssh/key".into());
         let route = resolve_route(&conn, &env).unwrap();
         // home 未知:`~` 展开失败留到认证阶段作为该私钥的失败原因,路线本身照常。
         assert!(route.target.identities[0].path.is_err());
-        // user 为空且没有本机用户名:明确报错。
+        // user 为空且没有本机用户名:明确报错(配置类错误,不是「读不了」)。
         let err = resolve_route(&connection("h.example.com", 22, ""), &env).unwrap_err();
-        assert!(err.starts_with("no user name"), "{err}");
+        assert!(matches!(err, RouteError::Invalid(_)), "{err:?}");
+        assert!(err.message().starts_with("no user name"), "{err}");
     }
 }

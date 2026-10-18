@@ -36,4 +36,5 @@ pub use sftp::{SftpDirEntry, SftpHandle, SftpNodeKind};
 // 函数单列一组:与类型混在同一个 `{}` 里时,rustfmt 2021 / 2024 两种口径的排序相反。
 pub use pool::{
     run_bounded_exec_on_session, run_sftp_download_on_session, run_sftp_upload_on_session,
+    run_sftp_upload_until,
 };
