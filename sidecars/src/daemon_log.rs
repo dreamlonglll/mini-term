@@ -297,7 +297,9 @@ mod tests {
                         barrier.wait();
                         let mut file =
                             open_for_daemon_with(&log, 512, Duration::from_secs(10)).unwrap();
-                        writeln!(file, "daemon-{i}").unwrap();
+                        // 整行一次写出(与 `event` 同一口径):`writeln!` 会分几次 write,
+                        // 并发追加时片段在 Linux 上会交错成 `daemon-daemon-30`。
+                        file.write_all(format!("daemon-{i}\n").as_bytes()).unwrap();
                     })
                 })
                 .collect();
