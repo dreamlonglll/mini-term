@@ -90,7 +90,7 @@ mt-ssh-cli daemon-stop      # 请求 daemon 优雅退出（停止接新连接 �
 - daemon 就是 `mt-ssh-cli --daemon`（同一二进制），持有一个 `SshPool`，复用 MCP 侧全套编排：acquire → exec → transport 错精确淘汰（`evict_if_same`，0.4.11 起，不误杀并发请求刚建好的新 session）+ 单次 retry → 失败 mark_unhealthy 30s cooldown → 审计。0.4.11 起的 exec 编排细节：
   - **会话锁只在开 channel 时持有**：拿锁 → `channel_open_session` → 立即放锁（与 mt-ssh `run_bounded_exec_on_session` 同口径）。daemon 是全机单例，此前锁一直持到命令结束，同一连接上所有 agent 的 exec 全局串行，排队时间还不算超时；
   - **开 channel 短超时** `min(10s, 剩余时限)`（只计 `channel_open` 本身，不计等锁——锁被占说明 session 在用，不说明它死了）：到点说明这条 session 多半已死（网络切换后 TCP 半开等）→ `evict_if_same` → 在剩余时限内重新 acquire → 重试一次；新连接上仍开不出 channel → 报错（exit 2）。与「命令运行超时」区分：后者照旧第一次不淘汰——单个 channel 超时不代表 session 死了；
-  - 建连这一步封装成 `ssh_service::acquire_within`，失败分类 `AcquireFailure::{DeadlineExpired, Cancelled, Failed}`：exec 把 `DeadlineExpired` 映射成连接阶段超时（124），`Failed` 原文透传（2）；transfer 三类都是错误，沿用 transfer 既有的超时口径。B1 合入后池会给出细分的 `AcquireError { kind }`，届时在这里把池内的 `Timeout` 也映射成 124；
+  - 建连这一步封装成 `ssh_service::acquire_within`，失败分类 `AcquireFailure::{DeadlineExpired, Cancelled, Failed}`：exec 把 `DeadlineExpired` 映射成连接阶段超时（124），`Failed` 原文透传（2）；transfer 三类都是错误，沿用 transfer 既有的超时口径。池内建连另有自己的整段预算（`PoolConfig::connect_timeout`，默认 20s，覆盖 DNS / TCP / 握手 / 认证，见 mt-ssh `transport`），到点由池返回连接错误、报错写明卡在哪个阶段，按 `Failed` 原文透传（exit 2）——这种超时调大 `--timeout` 也没用，所以刻意不并入 124；只有 `--timeout` 比它短、在建连途中先到点才是 124；
   - 冷却文案：冷却由「同一请求在新 session 上重试仍 transport 失败」触发，与认证无关（认证失败由池自己冷却），提示调用方约 30 秒后重试。
 
 #### IPC 传输与协议
@@ -218,7 +218,7 @@ PowerShell 的带引号可执行路径前必须使用调用运算符 `&`：
 
 PowerShell 路径中的 `'` 按 `''` 转义。
 
-（0.4.11 起正文另有一节 Behaviour 与退出码清单：没有 TTY / 没有 stdin（远端立即 EOF，交互式提示会失败，用 `sudo -n`、`-y`、`DEBIAN_FRONTEND=noninteractive` 等非交互参数）；`--cwd` 默认远端是 POSIX shell，Windows 主机把切目录写进命令本身；`--timeout` 覆盖整个调用含建连；退出码 = 远程退出码 / 124 超时（"while connecting" 表示命令没启动）/ 128+n 信号 / 2 CLI 或连接错误。WSL 一节说明 upload/download 的本地路径用相对路径或 `"$(wslpath -w '/abs/path')"`，当前目录在 `/mnt/*` 下时传 `/tmp/x` 这类 POSIX 绝对路径会被拒（exit 2）。upload/download 一节注明它们不预批、会弹审批。）
+（0.4.11 起正文另有一节 Behaviour 与退出码清单：没有 TTY / 没有 stdin（远端立即 EOF，交互式提示会失败，用 `sudo -n`、`-y`、`DEBIAN_FRONTEND=noninteractive` 等非交互参数）；`--cwd` 默认远端是 POSIX shell，Windows 主机把切目录写进命令本身；`--timeout` 覆盖整个调用含建连，建连本身另有 20s 上限（到点按连接错误 exit 2，调大 `--timeout` 无济于事）；退出码 = 远程退出码 / 124 超时（"while connecting" 表示命令没启动）/ 128+n 信号 / 2 CLI 或连接错误。WSL 一节说明 upload/download 的本地路径用相对路径或 `"$(wslpath -w '/abs/path')"`，当前目录在 `/mnt/*` 下时传 `/tmp/x` 这类 POSIX 绝对路径会被拒（exit 2）。upload/download 一节注明它们不预批、会弹审批。）
 
 Do NOT base64-echo file contents through exec — use upload/download.
 ```

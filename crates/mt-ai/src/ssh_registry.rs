@@ -241,6 +241,8 @@ PowerShell requires the call operator `&` before a quoted executable path:
   `cd DIR && ...`). On Windows hosts, put the directory change into the command
   itself instead.
 - `--timeout SECS` (default 60) covers the whole call, connecting included.
+  Connecting also has its own 20 s limit: a host that cannot be reached or
+  authenticated in time fails with exit 2, and raising `--timeout` won't help.
 - Large output: append `> file.log` and read the file afterwards.
 
 Exit codes:
