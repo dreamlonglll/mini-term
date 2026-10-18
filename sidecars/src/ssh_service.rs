@@ -1584,8 +1584,12 @@ pub enum SessionExecOutcome {
     Cancelled(ExecPhase),
     /// 服务端拒绝了 exec 请求(`want_reply` 换来 Failure),命令没有启动。
     Rejected,
-    /// 开 channel 的短超时到点、整体时限还有余量:这条 session 多半已死。
+    /// 开 channel 的短超时到点、整体时限还有余量:这条 session 多半已死 —— 已在持锁期间标记
+    /// 不健康并交给 `retire` 退役(见 [`run_exec_on_session`])。
     ChannelOpenTimedOut,
+    /// 拿到会话锁时这条 session 已带着不健康标记:排队等锁期间被别的请求判死退役(开 channel
+    /// 超时),或进了冷却。没在它上面开 channel,命令没有发出 —— 编排层重新 acquire,不算重试。
+    SessionRetired,
 }
 
 /// 收流阶段的状态机:逐条吃 `ChannelMsg`,把输出交给回调,记下退出状态 / 信号,以及
@@ -1675,8 +1679,12 @@ async fn close_channel(channel: &Channel<mt_ssh::russh::client::Msg>) {
 ///   连接上的多个 exec 并发跑(与 mt-ssh `run_bounded_exec_on_session` 同一口径)。
 ///   等锁算进整体时限,但不算进开 channel 的短超时 —— 锁被占着说明 session 在用,
 ///   不说明它死了;
-/// - 开 channel 的时限是 `min(channel_open_timeout, 剩余时限)`;短超时先到 →
-///   [`SessionExecOutcome::ChannelOpenTimedOut`],由编排层淘汰这条 session 重试;
+/// - 开 channel 的时限是 `min(channel_open_timeout, 剩余时限)`;短超时先到 → 这条 session
+///   多半已死:**持锁**标记不健康、调 `retire` 把它移出池,再放锁,返回
+///   [`SessionExecOutcome::ChannelOpenTimedOut`] 由编排层换一条重试。排在锁上的请求一拿到锁
+///   就看到标记、返回 [`SessionExecOutcome::SessionRetired`];排在池 acquire 存活检查上的
+///   请求放锁后发现它已不在池里、换新的 —— 谁都不会在这条死 session 上再耗一次短超时,池也
+///   不会把它再交出去;
 /// - exec 请求发出后立刻发 EOF:CLI 不支持 stdin,读 stdin 的远端命令马上读到 EOF,
 ///   而不是挂到超时;
 /// - 超时与取消在同一个状态机里处理:一旦 channel 已建立,任何提前结束的分支都先显式
@@ -1684,14 +1692,18 @@ async fn close_channel(channel: &Channel<mt_ssh::russh::client::Msg>) {
 ///
 /// `Err(String)` 代表 transport 层失败(channel 开不了 / exec 发不出去),只会发生在
 /// 任何输出流出之前,caller 可据此「淘汰 + 重连」重试,不会造成输出重复。
-pub async fn run_exec_on_session(
+pub async fn run_exec_on_session<R>(
     session: &CachedSession,
     remote_command: &str,
     deadline: tokio::time::Instant,
     channel_open_timeout: Duration,
     cancellation: &ExecCancellation,
+    retire: impl FnOnce() -> R,
     on_output: &mut (impl FnMut(StreamKind, &[u8]) + Send),
-) -> Result<SessionExecOutcome, String> {
+) -> Result<SessionExecOutcome, String>
+where
+    R: std::future::Future,
+{
     session.touch();
     // 1. 拿会话锁 —— 只为开 channel。
     let handle_guard = match await_exec_step(session.lock(), deadline, cancellation).await {
@@ -1703,6 +1715,11 @@ pub async fn run_exec_on_session(
             return Ok(SessionExecOutcome::Cancelled(ExecPhase::WaitingForSession));
         }
     };
+    // 排队等锁期间被判了死刑(前一个请求在它上面开 channel 超时)或进了冷却:不在它上面开
+    // channel —— 否则排在锁上的每个请求都要再耗一次开 channel 的短超时。
+    if session.is_unhealthy_now() {
+        return Ok(SessionExecOutcome::SessionRetired);
+    }
     // 2. 开 channel,短超时;拿到结果立刻放锁。
     let open_deadline = deadline.min(tokio::time::Instant::now() + channel_open_timeout);
     let opened = await_exec_step(
@@ -1711,11 +1728,18 @@ pub async fn run_exec_on_session(
         cancellation,
     )
     .await;
+    let short_timeout = matches!(opened, ControlledStep::TimedOut) && open_deadline < deadline;
+    if short_timeout {
+        // 判死:先标记、退役,再放锁(见函数注释)。标记时长无所谓 —— 它已不在池里,标记只给
+        // 手上还攥着它的请求看。
+        session.mark_unhealthy(UNHEALTHY_COOLDOWN);
+        retire().await;
+    }
     drop(handle_guard);
     let mut channel = match opened {
         ControlledStep::Ready(Ok(channel)) => channel,
         ControlledStep::Ready(Err(e)) => return Err(format!("channel_open_session failed: {e}")),
-        ControlledStep::TimedOut if open_deadline < deadline => {
+        ControlledStep::TimedOut if short_timeout => {
             return Ok(SessionExecOutcome::ChannelOpenTimedOut);
         }
         ControlledStep::TimedOut => {
@@ -1843,9 +1867,11 @@ impl ExecRun {
 /// 1. 在整体时限 / 取消令牌之内 acquire;冷却中直接返错;
 /// 2. 在 session 上跑 [`run_exec_on_session`];
 /// 3. transport 错或开 channel 短超时 → 精确淘汰这条 session(`evict_if_same`,不误杀并发
-///    请求刚建好的新 session)→ 在剩余时限内重新 acquire → 再试一次;第二次 transport
-///    错 → 标记冷却 + 返错;
-/// 4. 跑到时限:命令已发出 → `timed_out`(不淘汰 —— 单个 channel 超时不代表 session
+///    请求刚建好的新 session;短超时的淘汰在 `run_exec_on_session` 持锁期间就做了)→ 在剩余
+///    时限内重新 acquire → 再试一次;第二次 transport 错 → 标记冷却 + 返错;
+/// 4. 排队等锁期间这条 session 被别的请求判死退役(`SessionRetired`)→ 重新 acquire,不算
+///    那一次重试;
+/// 5. 跑到时限:命令已发出 → `timed_out`(不淘汰 —— 单个 channel 超时不代表 session
 ///    死了);还没发出 → `timed_out + not_started`(连接阶段超时)。
 async fn exec_resolved(
     pool: &SshPool,
@@ -1880,6 +1906,10 @@ async fn exec_resolved(
                 return ExecRun::not_started(Err(ServiceError::Internal(message)));
             }
         };
+        // 池交出的带标记 session 只会是冷却标记(同一连接上一次请求连续两次栽在传输层,
+        // session 带着标记留在池里挡新请求):开 channel 超时判死的 session 是持锁期间标记并
+        // 移出池的,池不会再交出来。所以因 `SessionRetired` 重新 acquire、池交回的却仍是刚退役
+        // 的同一条(`Arc::ptr_eq`)且带着标记时,同样在这里按冷却报错 —— 不会绕圈。
         if session.is_unhealthy_now() {
             return ExecRun::not_started(Err(ServiceError::Internal(cooldown_message(&conn.name))));
         }
@@ -1890,6 +1920,7 @@ async fn exec_resolved(
             deadline,
             channel_open_timeout,
             cancellation,
+            || pool.evict_if_same(&conn.id, &session),
             on_output,
         )
         .await;
@@ -1935,8 +1966,18 @@ async fn exec_resolved(
                         .into(),
                 )));
             }
+            Ok(SessionExecOutcome::SessionRetired) => {
+                // 排队等锁期间被别的请求判死退役(或进了冷却):命令还没发出,换一条再来,
+                // 不算那一次重试。还是这一条就会在上面的冷却判定处收住。
+                eprintln!(
+                    "[mt-ssh-svc] session for connection '{}' was retired while this request \
+                     waited for it; switching to another one",
+                    conn.name
+                );
+                continue;
+            }
             Ok(SessionExecOutcome::ChannelOpenTimedOut) => {
-                pool.evict_if_same(&conn.id, &session).await;
+                // run_exec_on_session 已持锁标记并退役了这条 session。
                 if retried {
                     return ExecRun::not_started(Err(ServiceError::Internal(format!(
                         "the SSH server did not open a channel within {}s, even on a fresh \

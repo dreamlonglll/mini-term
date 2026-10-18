@@ -150,6 +150,8 @@ enum EndpointProbe {
     LiveDaemon,
     /// 端点上的服务端不属于当前用户。绝不能让位:让了就等于默许冒充者接走所有请求。
     Untrusted(String),
+    /// 端点在,但拒绝本进程连接(安全描述符不放行):同样不是当前用户的活 daemon。
+    Denied(String),
     /// 连不上,或连上了但不讲 daemon 协议。
     NoDaemon,
 }
@@ -162,6 +164,10 @@ impl EndpointProbe {
                 ServeError::AlreadyRunning("endpoint already held by a live daemon".into())
             }
             EndpointProbe::Untrusted(reason) => untrusted_holder(&reason),
+            EndpointProbe::Denied(reason) => ServeError::Runtime(format!(
+                "endpoint is held by a server this process is not allowed to connect to \
+                 ({reason}); refusing to yield to it"
+            )),
             EndpointProbe::NoDaemon => ServeError::Runtime(no_daemon),
         }
     }
@@ -189,6 +195,8 @@ async fn probe_endpoint(endpoint: &str) -> EndpointProbe {
                 };
             }
             Err(ipc::ConnectError::Untrusted(reason)) => return EndpointProbe::Untrusted(reason),
+            // 拒绝访问是确定的,重试也一样,不必耗满探测窗口。
+            Err(ipc::ConnectError::Denied(e)) => return EndpointProbe::Denied(e.to_string()),
             Err(ipc::ConnectError::Unreachable(_)) if tokio::time::Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
@@ -1256,6 +1264,38 @@ mod tests {
             "got: {result:?}"
         );
         holder_task.await.unwrap();
+    }
+
+    /// F6:端点被一个不让本进程连的管道占着 —— 不是让位,也不耗满探测窗口。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn endpoint_held_by_a_pipe_that_refuses_us_is_runtime_error() {
+        use tokio::net::windows::named_pipe::ServerOptions;
+
+        let ep = test_endpoint("denied-holder");
+        let security = ipc::windows_security::PipeSecurity::from_sddl("D:P(A;;GA;;;SY)").unwrap();
+        // SAFETY: security 在本测试内存活。
+        let holder = unsafe {
+            ServerOptions::new()
+                .first_pipe_instance(true)
+                .create_with_security_attributes_raw(&ep, security.attributes_ptr())
+        }
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let result = serve(&ep, Duration::from_secs(60)).await;
+        match result {
+            Err(ServeError::Runtime(message)) => {
+                assert!(message.contains("not allowed to connect"), "{message}")
+            }
+            other => panic!("expected Runtime, got {other:?}"),
+        }
+        assert!(
+            started.elapsed() < DAEMON_HELLO_PROBE_TIMEOUT,
+            "took {:?}",
+            started.elapsed()
+        );
+        drop(holder);
     }
 
     #[tokio::test]
