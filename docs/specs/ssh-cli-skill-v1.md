@@ -1,6 +1,6 @@
 # Spec：SSH 工具从 MCP 迁移到 CLI + Skill v1
 
-> 状态：draft · 2026-07-31（rev2：CLI 改为守护进程架构；rev3：PR1–PR3 已落地；rev4：code review 安全加固——项目能力令牌、显式 channel 取消、IPC fail-closed；rev5 · 2026-10 · sidecar 0.4.11：传输层修复——拉起 daemon 不再泄漏调用方标准句柄与工作目录、daemon 日志落盘、版本握手只换代更旧的 daemon、shutdown 优雅退出、IPC 客户端校验端点属主、WSL 下 POSIX 本地路径；同属 0.4.11 的 service 层与注册器修复——`--timeout` 覆盖整个请求（含建连）、exec 只在开 channel 时持会话锁、开 channel 短超时后淘汰重试、exec 立即 EOF、服务端拒绝与远端信号的退出码、`--cwd` 引号、审计脱敏扩展与只记可能已执行的命令、传输护栏识别本机别名、能力令牌报错分类、SKILL.md 只预批 list/exec、dev 实例不碰 SKILL.md、启动校正 SKILL.md）
+> 状态：draft · 2026-07-31（rev2：CLI 改为守护进程架构；rev3：PR1–PR3 已落地；rev4：code review 安全加固——项目能力令牌、显式 channel 取消、IPC fail-closed；rev5 · 2026-10 · sidecar 0.4.11：传输层修复——拉起 daemon 不再泄漏调用方标准句柄与工作目录、daemon 日志落盘、版本握手只换代更旧的 daemon、shutdown 优雅退出、IPC 客户端校验端点属主、WSL 下 POSIX 本地路径；同属 0.4.11 的 service 层与注册器修复——`--timeout` 覆盖整个请求（含建连）、exec 只在开 channel 时持会话锁、开 channel 短超时后淘汰重试、exec 立即 EOF、服务端拒绝与远端信号的退出码、`--cwd` 引号、审计脱敏扩展与只记可能已执行的命令、传输护栏识别本机别名、能力令牌报错分类、SKILL.md 只预批 list/exec、dev 实例不碰 SKILL.md、启动校正 SKILL.md；同批的会话池与 SFTP 修复——建连读 `~/.ssh/config` 并依次试 agent / 默认私钥 / 密码、建连整段限时、认证失败冷却、兼容老算法、known_hosts 通配与吊销、SFTP 不再全程占会话锁、下载流水线、上传保留属性与软链、密钥重载，见 §3）
 > 前置研究结论：Codex CLI 自 2025-12 起原生支持 skills（项目级 `.codex/skills/`），SKILL.md 已是跨 agent 标准格式，单一方案可同时覆盖 Claude Code 与 Codex。
 
 ## Problem Statement
@@ -151,6 +151,19 @@ daemon 化后抽取层次升级：不只抽纯函数，而是把**完整业务�
 - `exec(pool, ExecRequest, cancellation, on_output) -> ExecOutcome`——含范围解析、find_connection、acquire、evict+retry、cooldown、审计与 channel 内超时/取消；`on_output: impl FnMut(StreamKind, &[u8])` 流式回调：daemon 侧写 IPC 帧实时转发，MCP 侧收集进 Vec 再 cap_output 打包 JSON；
 - `transfer(pool, direction, ...) -> u64`——含护栏 + retry + 审计（迁自 `run_transfer`）；
 - 纯函数与既有单测随迁：`find_connection` / `build_remote_command` / `cap_output` / audit 系列 / `is_blocked_local_path*` / `run_exec_on_session`（改造为回调式）/ `TransferDirection`。
+
+#### 会话池与 SFTP 原语（`mt-ssh` / `mt-secret`，0.4.11 同批；主程序的远程项目同样受益）
+
+- **建连对齐终端里的系统 ssh**：读 `~/.ssh/config`（`HostName` / `Port` / `User` / `IdentityFile` / `IdentitiesOnly` / `HostKeyAlias` / `Include`，以及含多跳的 `ProxyJump`）；连接自身的端口（非 22 时）、用户、私钥优先，与终端拼的 `ssh [-p port] [-i key] user@host` 等价。`ProxyCommand` 明确报不支持，`Match` 块整块跳过；
+- **认证顺序**：连接私钥 → ssh-agent 里其余的 key（Windows：`SSH_AUTH_SOCK` 为命名管道时用它，再试 `\\.\pipe\openssh-ssh-agent`，最后 Pageant）→ 默认私钥 `id_ed25519` / `id_ecdsa` / `id_rsa`（没显式指定私钥时）→ 密码 → keyboard-interactive。私钥读不了（不存在 / 格式不支持 / 带口令）只记原因、继续试别的；带口令的私钥只能经 agent 使用；公钥尝试有上限（配了密码 4 把、没配 5 把），保证密码在 sshd 默认 `MaxAuthTries 6` 之内轮得到。失败时逐方法列出结果（英文前缀、不含密码）；
+- **建连限时**：DNS / TCP / 握手 / 认证整段 20s（`PoolConfig::connect_timeout`，逐地址 5s），超时写明卡在哪个阶段；建连途中被丢弃（请求时限、取消）时掐断传输，不留 russh 任务与 socket。退出码口径见 §2「进程模型」：池内超时 = 连接错误 exit 2；
+- **认证失败冷却**：按连接身份冷却 30s，期间 acquire 直接返回 `authentication cooldown: …`、不碰网络；改了连接配置即换了身份，可立即重试。网络错误、超时、主机密钥问题不计入；
+- **兼容算法**：在 russh 默认表之后追加 `ecdh-sha2-nistp256/384/521`、`aes128-gcm@openssh.com`、`hmac-sha1-etm@openssh.com` / `hmac-sha1`（强算法仍优先）；
+- **known_hosts**：支持 `*` / `?` 通配、`!` 否定、`@revoked`（命中即拒、不追加）与哈希条目；拒绝原因带英文前缀（`host key verification failed: …`、`known_hosts unreadable …`）；
+- **SFTP 传输**：会话锁只在开 channel 时持有，传输期间持 SFTP lease，同一连接上的 exec、其它传输与 acquire 不排队；
+  - download：约 1 MiB 窗口多请求并行（块大小按 `limits@openssh.com`，封顶 64 KiB；未通告时 32 KiB），短读从实际位置补读；先写本地 `<local>.<pid>-<seq>.mt-sftp-partial` 再 rename 替换，失败或超时删除临时文件、原有本地文件不动；远端是目录时报错；
+  - upload：逐跳跟随软链，软链保持软链（悬空软链在它指向处新建；成环、指向目录或特殊文件时传输前报错）；在最终文件所在目录写隐藏临时文件 `.<名>.mt-partial-…`，创建时权限位即与目标一致、属主尽量对齐；有 `posix-rename@openssh.com` 时原子替换，否则「目标 → 备份、临时 → 目标、删备份」带回滚；原文件不在原位时绝不删临时文件，留下的临时 / 备份路径写进错误信息。属主或权限位复刻不了、或目录里建不了临时文件时，像 scp 一样原地覆盖写（中途失败会留下不完整的文件，错误信息写明）；目标不可写时报错、文件不动。超时取消后在后台清理远端临时文件；
+- **密钥重载**：sidecar 懒加载的 `credential.key` 解不开信封时，若密钥文件已被主程序重建则重读并重试一次（主程序自己登记的密钥不重载），常驻 daemon 不再一直报 `password unavailable`。
 
 `mt-ssh-mcp.rs` 瘦身成 rmcp 适配层，**过渡期继续构建发布**（存量项目 `.mcp.json` 仍指向它，两者共享同一审计日志与行为）。
 

@@ -243,6 +243,9 @@ PowerShell requires the call operator `&` before a quoted executable path:
 - `--timeout SECS` (default 60) covers the whole call, connecting included.
   Connecting also has its own 20 s limit: a host that cannot be reached or
   authenticated in time fails with exit 2, and raising `--timeout` won't help.
+- After an authentication failure the same connection is not retried for 30 s
+  (`authentication cooldown: ...`). Report the error to the user instead of
+  retrying in a loop.
 - Large output: append `> file.log` and read the file afterwards.
 
 Exit codes:

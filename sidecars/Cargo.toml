@@ -18,6 +18,13 @@ name = "mt-sidecars"
 # 环境变量与 Authorization 头,只记可能已执行的命令;传输护栏识别 `\\localhost\C$`、
 # `\\?\`、WSL `\\wsl.localhost\…\mnt\c` 等别名并按装机版数据目录名纵深拦截;能力令牌报错
 # 分类(配置不存在 / 读不了 / 令牌对不上 / 范围为空),fail closed 不变。
+# 同属 0.4.11、经 mt-ssh / mt-secret 链进三个 sidecar 的改动:建连对齐终端里的系统 ssh(读
+# `~/.ssh/config` 含 ProxyJump;认证依次试连接私钥 / ssh-agent / 默认私钥 / 密码,私钥读不了
+# 就回落,公钥尝试有上限);池内建连整段 20s 上限(到点按连接错误 exit 2,报错写明卡在哪个
+# 阶段);认证失败后同一连接冷却 30s;补 ecdh-nistp / aes128-gcm / hmac-sha1 兼容算法;
+# known_hosts 认通配 / 否定 / @revoked。SFTP 传输只在开 channel 时持会话锁,下载约 1 MiB
+# 窗口流水线,上传跟随软链、保留权限与属主(保不住时像 scp 一样原地覆盖写)、posix-rename
+# 原子替换或备份 + 回滚。daemon 缓存的密钥在 credential.key 被主程序重建后解不开时重读。
 version = "0.4.11"
 description = "mini-term sidecar binaries: miniterm-hook (AI hook), mt-ssh-mcp (SSH MCP server) and mt-ssh-cli (SSH CLI + daemon)"
 edition = "2021"
