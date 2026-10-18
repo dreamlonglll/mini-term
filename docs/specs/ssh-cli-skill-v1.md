@@ -1,6 +1,6 @@
 # Spec：SSH 工具从 MCP 迁移到 CLI + Skill v1
 
-> 状态：draft · 2026-07-31（rev2：CLI 改为守护进程架构；rev3：PR1–PR3 已落地；rev4：code review 安全加固——项目能力令牌、显式 channel 取消、IPC fail-closed）
+> 状态：draft · 2026-07-31（rev2：CLI 改为守护进程架构；rev3：PR1–PR3 已落地；rev4：code review 安全加固——项目能力令牌、显式 channel 取消、IPC fail-closed；rev5 · 2026-10 · sidecar 0.4.11：传输层修复——拉起 daemon 不再泄漏调用方标准句柄与工作目录、daemon 日志落盘、版本握手只换代更旧的 daemon、shutdown 优雅退出、IPC 客户端校验端点属主、WSL 下 POSIX 本地路径）
 > 前置研究结论：Codex CLI 自 2025-12 起原生支持 skills（项目级 `.codex/skills/`），SKILL.md 已是跨 agent 标准格式，单一方案可同时覆盖 Claude Code 与 Codex。
 
 ## Problem Statement
@@ -46,15 +46,18 @@ mt-ssh-cli download --project-token <TOKEN> [--timeout <SECS>] <CONNECTION> <REM
 
 # 运维子命令（排障用，不进 SKILL.md）：
 mt-ssh-cli daemon           # 前台跑 daemon（正常由 CLI 自动 detached 拉起，无需手动）
-mt-ssh-cli daemon-status    # 打印 daemon 版本 / pid / 池内 session 数
-mt-ssh-cli daemon-stop      # 请求 daemon 优雅退出（drain 池后退出）
+mt-ssh-cli daemon-status    # 打印 daemon 版本 / 协议 / pid / 池内 session 数 / 在途请求数，以及日志路径
+mt-ssh-cli daemon-stop      # 请求 daemon 优雅退出（停止接新连接 → 等在途请求，上限 60s → drain 池 → 退出）
 ```
+
+`daemon-status` 退出码：0 = 在跑、1 = 不在跑（或端点忙——daemon 正在优雅退出）；`daemon-status` / `daemon-stop` 遇到被非当前用户的进程占着的端点一律拒绝通信、exit 2（见 §2 安全边界）。
 
 - 四个业务子命令都强制要求 `--project-token`。令牌由 mini-term 后端生成 UUID v4、写入项目配置与 SKILL.md；CLI 不接受 project-id，也没有「缺省 = 全部连接」路径；
 - `<CONNECTION>` 按 name 优先、id 兜底匹配（复用 `find_connection`，歧义/未找到语义不变）；
 - exec 的 `<COMMAND>...` 为 trailing args，按空格 join 成远程命令（clap `trailing_var_arg` + `allow_hyphen_values`）；`--cwd` 沿用 `cd <dir> && ` 前缀拼接；
 - 超时默认：exec 60s、upload/download 300s（与 MCP 对齐），由 daemon 端强制执行（CLI 被杀不影响清理）；
-- upload/download 的 `<LOCAL_PATH>` 在 **CLI 端绝对化**后再发给 daemon——daemon 的 cwd 与调用方无关，相对路径必须在调用现场解析。
+- upload/download 的 `<LOCAL_PATH>` 在 **CLI 端绝对化**后再发给 daemon——daemon 的 cwd 固定为 exe 所在目录、与调用方无关，相对路径必须在调用现场解析；
+- Windows 上以单个 `/` 开头的本地路径（POSIX 绝对路径，`//server/share` 不算）单独处理：CLI 经 WSL interop 被调用时仍是 Windows 进程，直接绝对化会把当前目录在 `/mnt/d/…` 时的 `/tmp/a.log` 解析成 `D:\tmp\a.log`。当前目录是 WSL 发行版自己的文件系统（interop 给的 cwd 形如 `\\wsl.localhost\<发行版>\…` / `\\wsl$\<发行版>\…`）时映射进该发行版根目录（`\\wsl.localhost\<发行版>\tmp\a.log`）；否则按用法错误 exit 2，提示在 WSL 里用 `"$(wslpath -w '<path>')"` 传 Windows 路径。Git Bash / MSYS2 会在拉起原生程序前把 `/c/…`、`/tmp/…` 实参换成 Windows 路径，不受影响（关掉转换的 `MSYS_NO_PATHCONV=1` 下才会走到报错分支）。
 
 #### 输出与退出码契约
 
@@ -84,32 +87,46 @@ mt-ssh-cli daemon-stop      # 请求 daemon 优雅退出（drain 池后退出）
 - Windows：named pipe `\\.\pipe\mini-term.ssh-cli.<用户 SID（清洗后原文，非哈希——哈希在 Rust 版本间不保证稳定，会让升级前后的 CLI/daemon 算出不同 pipe 名、版本握手失效）>`，pipe security descriptor 限**仅当前用户**可连；
 - macOS/Linux：Unix domain socket（`$XDG_RUNTIME_DIR` 优先，回退 config.json 同目录），权限 0600；stale socket 恢复由 advisory lock 串行化，且删除前两次核对 `dev+ino`。chmod 失败会关闭 listener、删除 socket 并返回 Runtime；
 - WSL 关键路径：CLI 在 WSL 里经 interop 执行时**仍是 Windows 进程**，连的是 Windows 侧 named pipe——daemon、池、config.json 全在 Windows 侧，天然一致；
+- **客户端核验服务端身份**（0.4.11 起）：上面的 ACL / 0600 只挡得住「别的用户连我的 daemon」，挡不住「别的用户抢先占住端点冒充 daemon」——管道名全局可见、用户 SID 也不是秘密，冒充者能看到 agent 的命令与能力令牌、伪造输出和退出码（tokio 客户端默认 `SECURITY_IDENTIFICATION`，令牌冒充提权不成立，但读请求、伪造响应成立）。所以 CLI 连上后、收发任何数据之前先核验：Windows 走 `GetNamedPipeServerProcessId` → `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` → `OpenProcessToken(TOKEN_QUERY)` → `GetTokenInformation(TokenUser)` → 与本进程用户 SID `EqualSid`；Unix 取 `UnixStream::peer_cred()` 的 uid 与 `getuid()` 比。任何一步失败或不相等都判「不可信」（Windows 核验失败先断开重连一次，排除 daemon 恰在退出的竞态）。不可信与「连不上」是两类错误：前者 CLI 不再自拉起 daemon（端点被占，拉起也绑不上），直接降级 one-shot 并在 stderr 提示端点被非当前用户的进程占用。已知会误判为不可信的情形：同一用户以管理员身份（提权）跑着 daemon 而 CLI 未提权——代价只是降级；
 - 协议：newline-delimited JSON 帧（serde camelCase，`v` 字段为 IPC 协议版本，当前为 2）。
   - 连接建立后 daemon 先发 `{type:"hello", version:"<CARGO_PKG_VERSION>", protocolVersion:2, pid}`；`protocolVersion` 对反序列化保持可选，缺失时按 legacy v1 处理；
   - 请求（CLI→daemon，单行）：`{v:2, op:"list|exec|upload|download|status|shutdown", projectToken?, connection?, command?, cwd?, timeoutSecs?, localPath?, remotePath?}`；
   - 响应流（daemon→CLI，多行直至终帧）：
     - `{type:"stdout", dataB64}` / `{type:"stderr", dataB64}`（exec 输出分片，base64 保二进制安全）；
-    - 终帧 `{type:"result", exitCode?, timedOut?, bytes?, connections?}`（按 op 携带对应字段）；
+    - 终帧 `{type:"result", exitCode?, timedOut?, bytes?, connections?, sessions?, activeRequests?}`（按 op 携带对应字段；`activeRequests` 是 0.4.11 起 status 附带的「除这条 status 外仍在处理的连接数」，加字段不升协议版本——旧 CLI 解码时忽略不认识的字段）；
     - 终帧 `{type:"error", message}`（message 绝不含密码，与 MCP 同一纪律）。
 
 #### 生命周期
 
-- **自拉起**：CLI 连 pipe 失败 → spawn 自身 `daemon` 子命令（detached：Windows `DETACHED_PROCESS`+`CREATE_NEW_PROCESS_GROUP`，Unix `process_group(0)` + stdio 全空——与双 fork/setsid 等效且免 unsafe）→ 带退避重试连接（总窗口 ~3s）；
-- **并发竞态**：多个 CLI 同时拉 daemon → Windows 首 pipe 实例或 Unix endpoint recovery lock 收敛；只有探测到活 daemon 才归类 `AlreadyRunning` 并静默让位，非法路径、权限与其它 bind 错误一律 Runtime；
+- **自拉起**：CLI 连 pipe 失败 → spawn 自身 `daemon` 子命令（detached：Windows `DETACHED_PROCESS`+`CREATE_NEW_PROCESS_GROUP`，Unix `process_group(0)`——与双 fork/setsid 等效且免 unsafe）→ 带退避重试连接（总窗口 ~3s）。端点在但所有管道实例都忙（`ERROR_PIPE_BUSY`：高并发瞬间，或 daemon 正在优雅退出）时不拉起、只退避重连，拉起的新 daemon 反正绑不上。拉起的 daemon 与调用方彻底脱钩（0.4.11 起，实现在 `daemon_spawn`）：
+  - **不继承调用方的标准句柄**：std 的 `Command::spawn` 在 Windows 上以 `bInheritHandles=TRUE` 调 `CreateProcessW` 且不带句柄白名单，子进程继承本进程所有可继承句柄——调用方交给 CLI 的 stdout/stderr 管道写端正是可继承的，被常驻 daemon 拿走后，CLI 早已退出，`$(cli …)` / `cli … | tail` 却要等 daemon 空闲自退（10 分钟）才见 EOF，WSL interop 下调用本身不返回（实测）。`CommandExt::inherit_handles(false)` / `raw_attribute` 仍是 unstable，所以拉起前用 `SetHandleInformation` 把 CLI 自己的三个标准句柄设成不可继承（`GetStdHandle` 返回 NULL / `INVALID_HANDLE_VALUE` 时跳过）。Unix 不需要：std 在子进程里把 NUL / 日志文件 dup2 到 0/1/2，Rust 自己开的 fd 一律 `O_CLOEXEC`。两个平台共同的残留边界：调用方额外塞进来的非标准可继承句柄 / 没设 CLOEXEC 的 fd 3+ 仍会跟进 daemon；
+  - **工作目录 = exe 所在目录**（取不到用系统临时目录）：否则 daemon 继承调用方 cwd（通常是项目目录），Windows 上整段生命周期锁着它，改名报 EBUSY（实测）；
+  - **stdout/stderr 接日志文件** `mt-ssh-cli-daemon.log`（见下「daemon 日志」），定位不到数据目录就接 NUL；
+- **并发竞态**：多个 CLI 同时拉 daemon → Windows 首 pipe 实例或 Unix endpoint recovery lock 收敛；只有探测到**当前用户**的活 daemon（身份核验通过且发了 hello）才归类 `AlreadyRunning` 并静默让位；非法路径、权限、其它 bind 错误，以及端点被别的用户的进程占着，一律 Runtime；
 - **空闲自退**：无活跃请求且 10 分钟无新连接 → drain 池（逐 session disconnect ByApplication，复用 `pool.shutdown()`）→ 退出。孤儿 daemon 最多存活一个空闲周期；
-- **版本握手**：CLI 同时比对 hello 帧的包版本 `version` 与 IPC 版本 `protocolVersion`；任一不符（app 升级后旧 daemon 还在跑，或同包版本内协议升级）→ 按对端协议版本发 `shutdown` op → 等旧 daemon 退出 → 拉起新版。缺失 `protocolVersion` 的旧 hello 按 v1 发送 shutdown，因此可正常收尸同为 0.4.8 的 legacy v1 daemon。dev 迭代同理受益：`daemon-stop` 可手动踢掉占着二进制文件锁的旧 daemon（Windows 下运行中的 exe 无法被 stage-sidecars 覆盖，现有「跳过被占用文件」的容忍逻辑继续兜底）；
-- **CLI 中途被杀**（agent Bash 超时 / Ctrl+C）：daemon 用状态型取消令牌通知 service，并等待显式 `channel.close().await` 完成；请求超时也在同一 channel 状态机内先 close 再返回 124。不能依赖 russh `Channel` Drop（Drop 不发送 Close）。
+- **版本握手**（0.4.11 起）：CLI 读 hello 帧的包版本 `version`（semver 数值比较）与 IPC 版本 `protocolVersion`，按下表处置；缺失 `protocolVersion` 的 legacy v1 hello 按 v1 认，版本串解析不了按「更旧」处理。只换代**更旧**的 daemon，是因为 dev 实例与装机版的 sidecar 版本不同、共用同一个端点，旧规则「版本不等就踢」会让两边来回互踢、互相切断在途请求。
+
+  | daemon 相对 CLI | 协议一致 | 协议不同 |
+  |---|---|---|
+  | 更旧 | 按对端协议发 `shutdown` 换代 → 等端点释放 → 拉起新版（最多两轮） | 同左 |
+  | 相同或更新 | 直接使用 | 不踢，本次降级 one-shot，stderr 说明原因 |
+
+  dev 迭代：`daemon-stop` 可手动踢掉占着二进制文件锁的 daemon（Windows 下运行中的 exe 无法被 stage-sidecars 覆盖，现有「跳过被占用文件」的容忍逻辑继续兜底）；同版本而协议不同（只会是 dev 构建）也只能这样手动换；
+- **优雅退出**（0.4.11 起）：daemon 收到 `shutdown`（`daemon-stop` 或版本换代）→ 先回 ack → **立刻停止接受新连接**（Windows 丢掉监听实例，新客户端拿到 `ERROR_PIPE_BUSY` / 找不到管道；Unix 关 listener、删 socket 并放掉 recovery lock，新 daemon 可立即在同一路径起来）→ 等在途请求做完，上限 60s（= exec 默认超时：默认参数的 exec 不会被换代硬切；upload/download 默认 300s、显式加大 `--timeout` 的 exec 到点照样被切断，那条 CLI 得到 "connection to daemon lost mid-request"——换代不能被一个长传输拖住几分钟）→ drain 池 → 退出。等待期间新来的 CLI 连不上，退避 ~3s 后降级 one-shot。⚠️ **0.4.10 及更早的 daemon 收到 shutdown 仍是立即退出、硬切在途请求**——已发出去的旧二进制改不了，新 CLI 给它们换代那一刻的在途请求照旧会断；反过来旧 CLI（0.4.10）遇到新 daemon 仍会按旧规则发 shutdown，新 daemon 按上面的流程优雅退出；
+- **CLI 中途被杀**（agent Bash 超时 / Ctrl+C）：daemon 用状态型取消令牌通知 service，并等待显式 `channel.close().await` 完成；请求超时也在同一 channel 状态机内先 close 再返回 124。不能依赖 russh `Channel` Drop（Drop 不发送 Close）。取消令牌只在 channel 阶段被响应，编排若卡在建连 / 认证会无视取消，所以这次等待以 10s 为限：到点放弃这次编排（丢弃 future）并记日志，保证连接计数归零、daemon 能空闲自退；
+- **daemon 日志**（0.4.11 起）：CLI 拉起 daemon 时把它的 stdout/stderr 追加写到数据目录（`mt_core::config_json_path()` 的父目录，与审计日志同一锚点，不存在就创建）下的 `mt-ssh-cli-daemon.log`；拉起前超过 1 MiB 就轮转成 `.log.1`（只留一代）。daemon 自己的生命周期事件（启动 / 版本 / 端点、空闲退出、shutdown、客户端断开、取消兜底超时）带 UTC 毫秒时间戳，每行一次写出（并发冷启动的几个 daemon 共写一份日志，行不交错）；会话池等下层的 `eprintln!`（如 `[mt-ssh] host key rejected: …`、重试日志）不带时间戳，夹在事件行之间。日志句柄只交给 daemon，不经过调用方的标准句柄。`daemon-status` 打印日志路径（daemon 不在时也打印）。
 
 #### 安全边界
 
 - IPC 仅限当前用户可连；信任边界与现状**等价**——本机同用户进程本来就能直接 spawn `mt-ssh-mcp` 或读 config.json，daemon 不新增暴露面；
+- 反方向，CLI 只和**当前用户**的 daemon 说话（见上「客户端核验服务端身份」）：别的用户抢注同名管道 / 在 /tmp 放同名 socket 时，CLI 不发请求、不自拉起、降级 one-shot；`daemon-status` / `daemon-stop` 拒绝通信并 exit 2；daemon 绑定失败后的活体探测同样核验，端点被别的用户占着时报 Runtime，不静默让位；
 - CLI 的项目授权由随机能力令牌决定，agent 可见自己的 token，但不能通过省略参数或伪造 project-id 扩大范围；
 - `is_blocked_local_path`（config.json 传输硬拒绝）在 **daemon 端**执行，单点强制，CLI 无法绕过；
 - 审计日志由 daemon 单点追加（沿用 `ssh-mcp-audit.log` 文件与行格式），消除并发写交错。
 
 #### 降级路径
 
-daemon 拉不起来或 IPC 异常（极端环境）→ CLI 自动 fallback 为进程内 one-shot 执行（`SshPool::new()` → acquire → 执行 → `shutdown()`），stderr 记一行降级提示。业务逻辑走同一 service 层（见 §3），fallback 近零成本，保证工具永远可用。
+daemon 拉不起来或 IPC 异常（极端环境）→ CLI 自动 fallback 为进程内 one-shot 执行（`SshPool::new()` → acquire → 执行 → `shutdown()`），stderr 记一行降级提示。业务逻辑走同一 service 层（见 §3），fallback 近零成本，保证工具永远可用。0.4.11 起另有三种降级，提示各自说明原因：端点被非当前用户的进程占着；正在跑的 daemon 比 CLI 新且协议不同（不踢它）；端点一直忙（daemon 正在优雅退出）。请求一旦被 daemon 受理就不再降级——中途断连按 CLI 错误收尾（exec 可能有副作用，不能盲目重跑）。
 
 ### 3. 共享 service 层（`mt-sidecars` 加 lib target）
 
@@ -229,7 +246,8 @@ Do NOT base64-echo file contents through exec — use upload/download.
 - `ssh_service` 迁移后原测试全绿（find_connection / cap_output / audit / 护栏等 40+ 条），`run_exec_on_session` 回调化后 MCP 侧收集行为等价；
 - CLI 新增：trailing args 拼装、强制 `--project-token`、clap 错误前缀、退出码映射、list 文本/JSON 投影不含密码、local_path 绝对化；
 - daemon 协议：请求/响应帧序列化 round-trip、hello 版本比对逻辑、stdout/stderr 分片 base64 编解码（纯函数级）；
-- daemon 生命周期（集成测试，进程内起 socket/pipe）：并发绑定互斥收敛、空闲计时触发 drain、shutdown op 幂等；
+- daemon 生命周期（集成测试，进程内起 socket/pipe）：并发绑定互斥收敛、空闲计时触发 drain、shutdown op 幂等；shutdown 后立刻连不上、在途请求照常做完、等待有上限；status 的在途数；同进程起的管道服务端核验通过、换成别的 SID 必判不可信；
+- 冷启动端到端（`sidecars/tests/cli_daemon_spawn.rs`，仅 Windows，跑真实 `mt-ssh-cli.exe`，独立端点 + 临时 APPDATA，收尾必 `daemon-stop`）：用管道接住 CLI 的 stdout/stderr，CLI 退出后数秒内必须 EOF；CLI 的 cwd 退出后能改名；`daemon-status` 报日志路径、日志里有带时间戳的启动事件。对 0.4.10 二进制跑同一用例会在 5s 处失败（不挂死）；
 - registry 新增：SKILL.md 生成内容断言（含 project-token、PowerShell `&`、POSIX/PowerShell 撇号转义、frontmatter 差异化）、覆盖写幂等、disable 清理含空目录、`.gitignore` 追加幂等、enable/disable round-trip 含 MCP 迁移清理。
 
 **手动 e2e 清单**：
@@ -272,4 +290,4 @@ rev3 自动化 e2e 已跑通（Windows + 真实 SSH 连接 oracle-4c-24g）；re
 2. Windows + Codex：沙箱是否拦网络/拦 pipe（开放问题 #2）；
 3. WSL + Claude Code：interop 路径执行、连 Windows 侧 daemon、退出码透传；
 4. 存量 MCP 项目在 UI 里重新保存关联 → 生成并持久化 capability token、重写 Skill、迁移清理生效（单测已覆盖文件级行为，差 UI 全流程一遍）；
-5. IPC 端点跨用户连接被拒（Windows ACL / Unix 0600 —— 代码已实现，需第二个系统用户实测）。
+5. IPC 端点跨用户连接被拒（Windows ACL / Unix 0600 —— 代码已实现，需第二个系统用户实测）；反方向「别的用户抢注端点 → CLI 判不可信、降级 one-shot，`daemon-status` / `daemon-stop` exit 2」同样需第二个用户实测（单用户下只验证了核验链本身与 SID 不同时的判定）。

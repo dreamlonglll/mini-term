@@ -6,14 +6,24 @@
 //! 范围即时生效」的既有承诺。
 //!
 //! 生命周期:IPC 端点绑定天然互斥(抢输实例静默退出);空闲(无活跃请求且
-//! `idle_exit` 内无新连接)→ drain 池 → 返回;收到 shutdown op → 回 ack →
-//! drain 池 → 返回。**本模块只返回不 exit** —— `std::process::exit` 由 bin 调,
-//! 进程内集成测试才能安全驱动完整生命周期。
+//! `idle_exit` 内无新连接)→ drain 池 → 返回。收到 shutdown op → 回 ack → **立刻
+//! 停止接受新连接**(Windows 关掉监听实例、Unix 关 listener 并删 socket)→ 等在途
+//! 请求做完(上限 [`SHUTDOWN_DRAIN_TIMEOUT`])→ drain 池 → 返回。**本模块只返回不
+//! exit** —— `std::process::exit` 由 bin 调,进程内集成测试才能安全驱动完整生命周期。
+//! ⚠️ 0.4.10 及更早的 daemon 收到 shutdown 仍是立即退出、硬切在途请求 —— 已发出去
+//! 的旧二进制改不了,新 CLI 给旧 daemon 换代时那一刻的在途请求照旧会断。
 //!
 //! 每个连接一问一答:daemon 先发 hello(版本握手用),读一行请求,流式回帧至
 //! 终帧。CLI 中途断开 → 触发状态型取消令牌 → service 显式发送 channel close，
-//! 等关闭路径完成后结束请求；session 留池、daemon 不退出。
+//! 等关闭路径完成后结束请求(等待有上限,见 [`CANCEL_SETTLE_TIMEOUT`]);session
+//! 留池、daemon 不退出。
+//!
+//! 生命周期事件(启动 / 版本 / 端点 / 空闲退出 / shutdown / 客户端断开 / 取消兜底超时)
+//! 经 [`daemon_log::event`] 带 UTC 时间戳写 stderr;CLI 拉起的 daemon 的 stderr 接在
+//! 数据目录的 `mt-ssh-cli-daemon.log` 上(见 [`crate::daemon_spawn`])。
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,6 +32,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::sync::mpsc;
 use tokio::sync::Notify;
 
+use crate::daemon_log;
 use crate::ipc::{self, Op, Request, ServerFrame};
 use crate::ssh_service::{self, ConnectionScope, StreamKind, TransferDirection};
 use mt_ssh::pool::SshPool;
@@ -36,6 +47,25 @@ const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
 /// 绑定失败后的活 daemon 探测上限。仅成功连接不够：同名普通 pipe/socket
 /// 也能 accept，必须在有限时间内读到协议 hello 才能静默让位。
 const DAEMON_HELLO_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// shutdown 后等在途请求做完的上限。
+///
+/// 取 60s = exec 的默认超时([`ssh_service::DEFAULT_TIMEOUT_SECS`]):默认参数下的 exec
+/// 在这个窗口里要么跑完、要么被它自己的超时收掉,换代 / `daemon-stop` 不会硬切断它。
+/// 更长的请求(upload/download 默认 300s、显式加大 `--timeout` 的 exec)到点照样被切断,
+/// 那条 CLI 收到 "connection to daemon lost mid-request" —— 换代不能被一个长传输拖住
+/// 好几分钟,这是有意的取舍。
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// shutdown 等在途请求时的轮询间隔。
+const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// 客户端断开、发出取消后,等 exec 编排收尾的上限。
+///
+/// 取消令牌只在 SSH channel 阶段才被响应;编排若卡在建连 / 认证(会话池那几步目前不看
+/// 取消),`await` 会无限挂住 —— 连带 `ActiveGuard` 不释放、daemon 永远不会空闲自退。
+/// 到点就放弃这次编排(丢弃 future)并记一笔日志。
+const CANCEL_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// serve 的退出原因。
 #[derive(Debug, PartialEq, Eq)]
@@ -112,20 +142,64 @@ where
     )
 }
 
-async fn endpoint_has_live_daemon(endpoint: &str) -> bool {
+/// 绑定失败后对端点的探测结论。
+#[derive(Debug)]
+enum EndpointProbe {
+    /// 当前用户的活 daemon(身份核验通过且发了 hello)—— 静默让位。
+    LiveDaemon,
+    /// 端点上的服务端不属于当前用户。绝不能让位:让了就等于默许冒充者接走所有请求。
+    Untrusted(String),
+    /// 连不上,或连上了但不讲 daemon 协议。
+    NoDaemon,
+}
+
+impl EndpointProbe {
+    /// 按探测结论给绑定失败归类;`no_daemon` 是「没有活 daemon」时的报错文本。
+    fn into_serve_error(self, no_daemon: String) -> ServeError {
+        match self {
+            EndpointProbe::LiveDaemon => {
+                ServeError::AlreadyRunning("endpoint already held by a live daemon".into())
+            }
+            EndpointProbe::Untrusted(reason) => untrusted_holder(&reason),
+            EndpointProbe::NoDaemon => ServeError::Runtime(no_daemon),
+        }
+    }
+}
+
+/// 端点被别的用户的进程占着:按运行期故障暴露,不静默让位。
+fn untrusted_holder(reason: &str) -> ServeError {
+    ServeError::Runtime(format!(
+        "endpoint is held by a process that does not belong to the current user ({reason}); \
+         refusing to yield to it"
+    ))
+}
+
+/// 探测端点上是不是**当前用户**的活 daemon。`ipc::connect` 先核验服务端身份,
+/// 核验通过后再看首帧是不是 hello。
+async fn probe_endpoint(endpoint: &str) -> EndpointProbe {
     let deadline = tokio::time::Instant::now() + DAEMON_HELLO_PROBE_TIMEOUT;
     loop {
         match ipc::connect(endpoint).await {
-            Ok(stream) => return stream_speaks_daemon_hello(stream).await,
-            Err(_) if tokio::time::Instant::now() < deadline => {
+            Ok(stream) => {
+                return if stream_speaks_daemon_hello(stream).await {
+                    EndpointProbe::LiveDaemon
+                } else {
+                    EndpointProbe::NoDaemon
+                };
+            }
+            Err(ipc::ConnectError::Untrusted(reason)) => return EndpointProbe::Untrusted(reason),
+            Err(ipc::ConnectError::Unreachable(_)) if tokio::time::Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
-            Err(_) => return false,
+            Err(ipc::ConnectError::Unreachable(_)) => return EndpointProbe::NoDaemon,
         }
     }
 }
 
 /// 活跃连接计数的 RAII guard:drop 时递减并刷新活动时间。
+///
+/// 在 accept 循环里、spawn 处理协程**之前**就建好:shutdown 一旦让 accept 循环返回,
+/// 计数里就已含所有接下的连接,不会出现「协程还没开始跑、计数还是 0」就 drain 退出的空档。
 struct ActiveGuard(Arc<DaemonState>);
 
 impl ActiveGuard {
@@ -145,9 +219,19 @@ impl Drop for ActiveGuard {
 
 /// 绑定端点并服务直至空闲/收到 shutdown。返回前已 drain 池。
 ///
-/// `Err(AlreadyRunning)` = 端点已被别的 daemon 持有,caller 应静默退出 ——
-/// 并发自拉起的竞态由端点绑定互斥收敛;`Err(Runtime)` = 绑定后的运行期故障。
+/// `Err(AlreadyRunning)` = 端点已被当前用户的另一个 daemon 持有,caller 应静默退出 ——
+/// 并发自拉起的竞态由端点绑定互斥收敛;`Err(Runtime)` = 其它绑定错误(含端点被别的
+/// 用户的进程占着)或绑定后的运行期故障。
 pub async fn serve(endpoint: &str, idle_exit: Duration) -> Result<ServeOutcome, ServeError> {
+    serve_with_drain_timeout(endpoint, idle_exit, SHUTDOWN_DRAIN_TIMEOUT).await
+}
+
+/// [`serve`] 的本体;shutdown 等在途请求的上限可注入(测试用短上限)。
+async fn serve_with_drain_timeout(
+    endpoint: &str,
+    idle_exit: Duration,
+    drain_timeout: Duration,
+) -> Result<ServeOutcome, ServeError> {
     let state = Arc::new(DaemonState {
         pool: Arc::new(SshPool::new()),
         active: AtomicUsize::new(0),
@@ -155,18 +239,51 @@ pub async fn serve(endpoint: &str, idle_exit: Duration) -> Result<ServeOutcome, 
         shutdown: Notify::new(),
     });
 
-    eprintln!(
-        "[mt-ssh-cli daemon] v{} pid={} listening on {endpoint}",
+    daemon_log::event(&format!(
+        "starting v{} (protocol v{}) pid={} endpoint={endpoint}",
         env!("CARGO_PKG_VERSION"),
+        ipc::PROTOCOL_VERSION,
         std::process::id()
-    );
+    ));
 
+    // 返回时监听实例 / socket 已经关掉:shutdown 之后新客户端连不上。
     let outcome = serve_until_exit(endpoint, idle_exit, &state).await?;
+    match outcome {
+        ServeOutcome::Idle => daemon_log::event(&format!(
+            "idle for {idle_exit:?} with no active requests, exiting"
+        )),
+        ServeOutcome::Shutdown => wait_for_active_requests(&state, drain_timeout).await,
+    }
 
     // drain 池:逐 session disconnect(ByApplication),远端不留 dangling。
-    eprintln!("[mt-ssh-cli daemon] draining session pool ({outcome:?})");
+    let sessions = state.pool.len().await;
+    daemon_log::event(&format!("draining session pool ({sessions} session(s))"));
     state.pool.shutdown().await;
     Ok(outcome)
+}
+
+/// shutdown 之后等在途请求做完,最多等 `limit`。监听已关,`active` 只减不增。
+async fn wait_for_active_requests(state: &DaemonState, limit: Duration) {
+    daemon_log::event(&format!(
+        "shutdown requested: stopped accepting connections; {} connection(s) in flight, \
+         waiting up to {limit:?}",
+        state.active.load(Ordering::SeqCst)
+    ));
+    let deadline = tokio::time::Instant::now() + limit;
+    loop {
+        let active = state.active.load(Ordering::SeqCst);
+        if active == 0 {
+            daemon_log::event("shutdown: no requests in flight, exiting");
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            daemon_log::event(&format!(
+                "shutdown: {active} connection(s) still in flight after {limit:?}, exiting anyway"
+            ));
+            return;
+        }
+        tokio::time::sleep(SHUTDOWN_POLL_INTERVAL).await;
+    }
 }
 
 /// 平台特定的 accept 循环 + 空闲计时 + shutdown 信号,三路 select。
@@ -192,18 +309,14 @@ async fn serve_until_exit(
     let mut server = match first_server {
         Ok(server) => server,
         Err(bind_error) => {
-            // 只有确实能连上活 daemon 才是正常让位；非法名称、权限等绑定错误
-            // 必须暴露为 Runtime，不能静默退出 0。
-            if endpoint_has_live_daemon(endpoint).await {
-                return Err(ServeError::AlreadyRunning(
-                    "endpoint already held by a live daemon".into(),
-                ));
-            }
-            return Err(ServeError::Runtime(format!(
+            // 只有确认是**当前用户**的活 daemon 才是正常让位;非法名称、权限等绑定错误,
+            // 以及别的用户抢先占住端点,都必须暴露为 Runtime,不能静默退出 0。
+            return Err(probe_endpoint(endpoint).await.into_serve_error(format!(
                 "endpoint bind failed and no live daemon was reachable: {bind_error}"
             )));
         }
     };
+    daemon_log::event(&format!("listening on {endpoint}"));
 
     let mut idle_tick = tokio::time::interval(idle_check_tick(idle_exit));
     idle_tick.tick().await; // 首个 tick 立即返回,跳过
@@ -220,8 +333,9 @@ async fn serve_until_exit(
                 }
                 .map_err(|e| ServeError::Runtime(format!("pipe re-create failed: {e}")))?;
                 let client = std::mem::replace(&mut server, next);
+                let guard = ActiveGuard::new(state.clone());
                 let st = state.clone();
-                tokio::spawn(async move { handle_connection(client, st).await });
+                tokio::spawn(async move { handle_connection(client, st, guard).await });
             }
             _ = idle_tick.tick() => {
                 if state.active.load(Ordering::SeqCst) == 0 && state.idle_for() >= idle_exit {
@@ -229,6 +343,9 @@ async fn serve_until_exit(
                 }
             }
             _ = state.shutdown.notified() => {
+                // 返回即丢弃正在等连接的那个监听实例:此后再没有空闲实例,新客户端连不上
+                // (拿到 ERROR_PIPE_BUSY / 找不到管道);仍连着的实例由各自的处理协程持有,
+                // 请求做完自然关闭。
                 return Ok(ServeOutcome::Shutdown);
             }
         }
@@ -269,15 +386,11 @@ impl UnixEndpointLock {
         if rc != 0 {
             let error = std::io::Error::last_os_error();
             return if error.kind() == std::io::ErrorKind::WouldBlock {
-                if endpoint_has_live_daemon(&endpoint.to_string_lossy()).await {
-                    Err(ServeError::AlreadyRunning(
-                        "endpoint already held by a live daemon".into(),
-                    ))
-                } else {
-                    Err(ServeError::Runtime(
+                Err(probe_endpoint(&endpoint.to_string_lossy())
+                    .await
+                    .into_serve_error(
                         "endpoint lock is held but no live daemon was reachable".into(),
                     ))
-                }
             } else {
                 Err(ServeError::Runtime(format!(
                     "endpoint lock acquisition failed: {error}"
@@ -335,6 +448,10 @@ async fn bind_unix_listener(
         };
         match UnixStream::connect(path).await {
             Ok(stream) => {
+                // 先核身份:别的用户放在这里的 socket 绝不能当成「已有 daemon」静默让位。
+                if let Err(reason) = ipc::verify_socket_peer(&stream) {
+                    return Err(untrusted_holder(&reason));
+                }
                 if stream_speaks_daemon_hello(stream).await {
                     return Err(ServeError::AlreadyRunning(
                         "endpoint already held by a live daemon".into(),
@@ -402,6 +519,8 @@ async fn serve_until_exit(
         )));
     }
 
+    daemon_log::event(&format!("listening on {endpoint}"));
+
     let mut idle_tick = tokio::time::interval(idle_check_tick(idle_exit));
     idle_tick.tick().await;
 
@@ -410,8 +529,9 @@ async fn serve_until_exit(
             accepted = listener.accept() => {
                 let (stream, _) = accepted
                     .map_err(|e| ServeError::Runtime(format!("socket accept failed: {e}")))?;
+                let guard = ActiveGuard::new(state.clone());
                 let st = state.clone();
-                tokio::spawn(async move { handle_connection(stream, st).await });
+                tokio::spawn(async move { handle_connection(stream, st, guard).await });
             }
             _ = idle_tick.tick() => {
                 if state.active.load(Ordering::SeqCst) == 0 && state.idle_for() >= idle_exit {
@@ -423,6 +543,9 @@ async fn serve_until_exit(
             }
         }
     };
+    // 先删 socket 再关 listener、放恢复锁(函数返回时依次 drop):shutdown 之后新客户端
+    // 连不上;锁一放,新 daemon 就能在同一路径上起来,本进程继续把在途请求做完 ——
+    // 它已不再碰这个路径,两者互不干扰。
     let _ = std::fs::remove_file(path);
     Ok(outcome)
 }
@@ -433,11 +556,12 @@ fn idle_check_tick(idle_exit: Duration) -> Duration {
 }
 
 /// 处理一个客户端连接:hello → 读一行请求 → 按 op 分发 → 终帧。
-async fn handle_connection<S>(stream: S, state: Arc<DaemonState>)
+///
+/// `_guard` 由 accept 循环建好传进来,随本函数返回释放(见 [`ActiveGuard`])。
+async fn handle_connection<S>(stream: S, state: Arc<DaemonState>, _guard: ActiveGuard)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let _guard = ActiveGuard::new(state.clone());
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
 
@@ -501,10 +625,13 @@ where
         }
         Op::Status => {
             let sessions = state.pool.len().await;
-            let _ = write_frame(&mut writer, &ServerFrame::result_sessions(sessions)).await;
+            // 活跃数不含这条 status 连接自己。
+            let others = state.active.load(Ordering::SeqCst).saturating_sub(1);
+            let _ = write_frame(&mut writer, &ServerFrame::result_status(sessions, others)).await;
         }
         Op::Shutdown => {
-            // 先 ack 再触发退出:CLI 拿得到确认,drain 由 serve 统一做。
+            // 先 ack 再触发退出:CLI 拿得到确认;停止监听、等在途请求、drain 池由 serve
+            // 统一做。
             let _ = write_frame(&mut writer, &ServerFrame::result_empty()).await;
             state.shutdown.notify_one();
         }
@@ -523,7 +650,8 @@ where
 ///
 /// CLI 断开的两路感知(spec §2「daemon 检测到连接断开即关闭对应 exec channel」):
 /// 写帧失败(有输出时),或读端到 EOF(无输出的长命令也能立即感知)——
-/// 任一触发即设置状态型取消令牌，并等待 service 显式发送 SSH channel close；
+/// 任一触发即设置状态型取消令牌，并等待 service 显式发送 SSH channel close
+/// (等待有上限,见 [`cancel_after_disconnect`]);
 /// 请求级超时同样在 service 的 channel 状态机内强制，不依赖 CLI 存活。
 async fn handle_exec<R, W>(reader: &mut R, writer: &mut W, req: Request, state: &Arc<DaemonState>)
 where
@@ -581,18 +709,14 @@ where
                 let Some(frame) = maybe_frame else { continue };
                 if write_frame(writer, &frame).await.is_err() {
                     // CLI 断开:通知 service 显式关闭 SSH channel，并等 close 路径完成。
-                    eprintln!("[mt-ssh-cli daemon] client disconnected mid-exec, closing channel");
-                    cancellation.cancel();
-                    let _ = exec_fut.as_mut().await;
+                    cancel_after_disconnect(&cancellation, exec_fut.as_mut()).await;
                     return;
                 }
             }
             read = reader.read_line(&mut probe) => {
                 match read {
                     Ok(0) | Err(_) => {
-                        eprintln!("[mt-ssh-cli daemon] client disconnected mid-exec, closing channel");
-                        cancellation.cancel();
-                        let _ = exec_fut.as_mut().await;
+                        cancel_after_disconnect(&cancellation, exec_fut.as_mut()).await;
                         return;
                     }
                     Ok(_) => probe.clear(),
@@ -614,6 +738,30 @@ where
         },
     };
     let _ = write_frame(writer, &terminal).await;
+}
+
+/// 客户端中途断开:设取消令牌,等 exec 编排显式关掉 channel 收尾。
+///
+/// 等待以 [`CANCEL_SETTLE_TIMEOUT`] 为限:编排卡在建连 / 认证时不响应取消,无限等下去
+/// 会让这条连接的 `ActiveGuard` 永不释放、daemon 永不空闲自退。到点放弃 —— future 随
+/// 调用方返回被丢弃。
+async fn cancel_after_disconnect<F: Future>(
+    cancellation: &ssh_service::ExecCancellation,
+    exec: Pin<&mut F>,
+) {
+    daemon_log::event("client disconnected mid-exec, cancelling the remote command");
+    cancellation.cancel();
+    if !settle_within(exec, CANCEL_SETTLE_TIMEOUT).await {
+        daemon_log::event(&format!(
+            "exec did not settle within {CANCEL_SETTLE_TIMEOUT:?} after cancellation \
+             (likely stuck connecting); abandoning it"
+        ));
+    }
+}
+
+/// 在 `limit` 内等 `fut` 完成;超时返回 false(future 本身由调用方处置)。
+async fn settle_within<F: Future>(fut: Pin<&mut F>, limit: Duration) -> bool {
+    tokio::time::timeout(limit, fut).await.is_ok()
 }
 
 /// upload / download:service 编排 → bytes 终帧。
@@ -742,9 +890,50 @@ mod tests {
         endpoint: String,
         idle_exit: Duration,
     ) -> tokio::task::JoinHandle<Result<ServeOutcome, ServeError>> {
-        let handle = tokio::spawn(async move { serve(&endpoint, idle_exit).await });
+        spawn_daemon_with_drain(endpoint, idle_exit, SHUTDOWN_DRAIN_TIMEOUT).await
+    }
+
+    /// 同 [`spawn_daemon`],shutdown 等在途请求的上限可调。
+    async fn spawn_daemon_with_drain(
+        endpoint: String,
+        idle_exit: Duration,
+        drain_timeout: Duration,
+    ) -> tokio::task::JoinHandle<Result<ServeOutcome, ServeError>> {
+        let handle = tokio::spawn(async move {
+            serve_with_drain_timeout(&endpoint, idle_exit, drain_timeout).await
+        });
         tokio::time::sleep(Duration::from_millis(100)).await;
         handle
+    }
+
+    fn status_request() -> Request {
+        Request {
+            v: ipc::PROTOCOL_VERSION,
+            op: Some(Op::Status),
+            ..Default::default()
+        }
+    }
+
+    fn shutdown_request() -> Request {
+        Request {
+            v: ipc::PROTOCOL_VERSION,
+            op: Some(Op::Shutdown),
+            ..Default::default()
+        }
+    }
+
+    /// 等到端点连不上为止(最多 2s)。期间万一连上(监听实例还没来得及关),立刻断开 ——
+    /// 只发 hello 不发请求的连接会被 daemon 当作探测静默收尾。
+    async fn wait_until_unreachable(endpoint: &str) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            match ipc::connect(endpoint).await {
+                Err(_) => return true,
+                Ok(stream) => drop(stream),
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
     }
 
     #[tokio::test]
@@ -776,10 +965,118 @@ mod tests {
         )
         .await;
         match read_frame(&mut reader).await {
-            ServerFrame::Result { sessions, .. } => assert_eq!(sessions, Some(0)),
+            ServerFrame::Result {
+                sessions,
+                active_requests,
+                ..
+            } => {
+                assert_eq!(sessions, Some(0));
+                // 只有这条 status 自己,不算在内。
+                assert_eq!(active_requests, Some(0));
+            }
             other => panic!("expected result, got {other:?}"),
         }
         daemon.abort();
+    }
+
+    #[tokio::test]
+    async fn status_counts_other_connections_in_flight() {
+        let ep = test_endpoint("inflight");
+        let daemon = spawn_daemon(ep.clone(), Duration::from_secs(60)).await;
+
+        // A:连上、收了 hello、还没发请求 —— 对 daemon 来说就是一条在途连接。
+        let (_a_reader, _a_writer, _) = connect_and_hello(&ep).await;
+
+        let (mut reader, mut writer, _) = connect_and_hello(&ep).await;
+        send_request(&mut writer, &status_request()).await;
+        match read_frame(&mut reader).await {
+            ServerFrame::Result {
+                active_requests, ..
+            } => assert_eq!(active_requests, Some(1)),
+            other => panic!("expected result, got {other:?}"),
+        }
+        daemon.abort();
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_accepting_but_finishes_requests_in_flight() {
+        let ep = test_endpoint("graceful");
+        let daemon = spawn_daemon(ep.clone(), Duration::from_secs(60)).await;
+
+        // A:在途连接(已连上,请求稍后才发)。
+        let (mut a_reader, mut a_writer, _) = connect_and_hello(&ep).await;
+
+        // B:请求 shutdown,先拿到 ack。
+        let (mut b_reader, mut b_writer, _) = connect_and_hello(&ep).await;
+        send_request(&mut b_writer, &shutdown_request()).await;
+        assert!(matches!(
+            read_frame(&mut b_reader).await,
+            ServerFrame::Result { .. }
+        ));
+        drop((b_reader, b_writer));
+
+        // 立刻停止接受新连接……
+        assert!(
+            wait_until_unreachable(&ep).await,
+            "endpoint must stop accepting new clients after shutdown"
+        );
+        // ……但还在等 A,没有退出。
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!daemon.is_finished(), "must wait for the request in flight");
+
+        // A 的请求照常处理完。
+        send_request(&mut a_writer, &status_request()).await;
+        assert!(matches!(
+            read_frame(&mut a_reader).await,
+            ServerFrame::Result { .. }
+        ));
+        drop((a_reader, a_writer));
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), daemon)
+            .await
+            .expect("serve should return once nothing is in flight")
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome, ServeOutcome::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn shutdown_wait_for_requests_in_flight_is_bounded() {
+        let ep = test_endpoint("drain-cap");
+        let daemon = spawn_daemon_with_drain(
+            ep.clone(),
+            Duration::from_secs(60),
+            Duration::from_millis(300),
+        )
+        .await;
+
+        // 一条一直不发请求的在途连接,撑满等待上限。
+        let (_stuck_reader, _stuck_writer, _) = connect_and_hello(&ep).await;
+
+        let (mut reader, mut writer, _) = connect_and_hello(&ep).await;
+        send_request(&mut writer, &shutdown_request()).await;
+        assert!(matches!(
+            read_frame(&mut reader).await,
+            ServerFrame::Result { .. }
+        ));
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), daemon)
+            .await
+            .expect("drain wait must give up at its limit")
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome, ServeOutcome::Shutdown);
+    }
+
+    #[tokio::test]
+    async fn settle_gives_up_on_a_future_that_ignores_cancellation() {
+        let stuck = std::future::pending::<()>();
+        tokio::pin!(stuck);
+        assert!(!settle_within(stuck.as_mut(), Duration::from_millis(50)).await);
+
+        let done = async {};
+        tokio::pin!(done);
+        assert!(settle_within(done.as_mut(), Duration::from_millis(50)).await);
     }
 
     #[tokio::test]

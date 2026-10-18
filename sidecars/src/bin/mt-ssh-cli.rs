@@ -5,9 +5,11 @@
 //! 业务(连接查找/池编排/审计/护栏)全部在 `mt_sidecars::ssh_service`。
 //!
 //! 执行路径(spec §2):**优先连 daemon**(全机单例持全局 SshPool,同一连接
-//! 二次调用免 SSH 握手)——daemon 不在则自动 detached 拉起、带退避重连;版本
-//! 不符(app 升级后旧 daemon 残留)自动踢旧拉新;彻底连不上则降级为进程内
-//! one-shot(建池 → 执行 → drain),stderr 记一行降级提示。对 agent 无感知差异。
+//! 二次调用免 SSH 握手)——daemon 不在则自动 detached 拉起、带退避重连(拉起细节见
+//! `mt_sidecars::daemon_spawn`);daemon 比 CLI 旧(app 升级后旧 daemon 残留)自动踢旧
+//! 拉新,比 CLI 新则直接用(协议不同时不踢、降级);端点被非当前用户的进程占着时不连、
+//! 不拉起;彻底连不上则降级为进程内 one-shot(建池 → 执行 → drain),stderr 记一行降级
+//! 提示。对 agent 无感知差异。
 //!
 //! 退出码契约(spec §1):
 //! - exec 正常:透传远程退出码;远端未上报 exit-status → 2 + stderr 前缀;
@@ -16,11 +18,14 @@
 //! - list / upload / download 成功:0。
 
 use clap::{Parser, Subcommand};
+use std::cmp::Ordering;
 use std::io::Write;
 use std::time::Duration;
 
-use mt_sidecars::daemon::{self, ServeOutcome};
-use mt_sidecars::ipc::{self, Op, Request, ServerFrame};
+use mt_sidecars::daemon;
+use mt_sidecars::daemon_log;
+use mt_sidecars::daemon_spawn;
+use mt_sidecars::ipc::{self, ConnectError, Op, Request, ServerFrame};
 use mt_sidecars::ssh_service::{self, ConnectionScope, StreamKind, TransferDirection};
 use mt_ssh::pool::SshPool;
 
@@ -135,14 +140,82 @@ fn join_command(parts: &[String]) -> String {
     parts.join(" ")
 }
 
-/// 把本地路径绝对化:daemon 的 cwd 与调用方无关,相对路径必须在调用现场解析。
-/// one-shot 模式虽在本进程执行,也统一走这里,保证两条路径行为一致。
-fn absolutize_local_path(path: &str) -> String {
-    match std::path::absolute(path) {
+/// 把本地路径绝对化:daemon 的 cwd 与调用方无关(固定为 exe 所在目录),相对路径必须
+/// 在调用现场解析。one-shot 模式虽在本进程执行,也统一走这里,保证两条路径行为一致。
+///
+/// Windows 上还要接住 WSL:CLI 经 interop 在 WSL 里被调用时仍是 Windows 进程,
+/// `/tmp/a.log` 这类 POSIX 绝对路径会被 `std::path::absolute`(`GetFullPathNameW`)当成
+/// 「当前目录所在根」下的路径 —— 当前目录在 `/mnt/d/…` 时就成了 `D:\tmp\a.log`,下载写错
+/// 位置、上传读错文件。见 [`resolve_posix_absolute_path`]。`Err` = 用法错误(exit 2)。
+fn absolutize_local_path(path: &str) -> Result<String, String> {
+    #[cfg(windows)]
+    {
+        let cwd = std::env::current_dir().ok();
+        if let Some(mapped) = resolve_posix_absolute_path(path, cwd.as_deref())? {
+            return Ok(mapped);
+        }
+    }
+    Ok(match std::path::absolute(path) {
         Ok(p) => p.to_string_lossy().to_string(),
         // 绝对化失败(如空路径)→ 原样透传,让底层文件操作报可读错误。
         Err(_) => path.to_string(),
+    })
+}
+
+/// Windows:以单个 `/` 开头的本地路径(POSIX 绝对路径;`//server/share` 是 UNC,不算)
+/// 按当前目录分两种情况处理。返回 `Ok(None)` = 不是这种路径,交给通用绝对化。
+///
+/// - 当前目录是 WSL 发行版自己的文件系统(`\\wsl.localhost\<发行版>\…` 或
+///   `\\wsl$\<发行版>\…`,含 `\\?\UNC\` 前缀形式)—— 在 WSL 里、当前目录不在 `/mnt/*`
+///   下调用时 interop 给的就是这种 cwd(实测 `cd /tmp` 后 Windows 进程看到
+///   `\\wsl.localhost\Ubuntu-24.04\tmp`):把路径映射进该发行版的根目录,
+///   `/tmp/a.log` → `\\wsl.localhost\<发行版>\tmp\a.log`。这里显式拼接,不依赖
+///   `GetFullPathNameW` 对「根相对路径」的解释;拼完再交给 `std::path::absolute` 折叠
+///   `.` / `..`(它不会越过 `\\server\share` 这一级根);
+/// - 否则(当前目录是盘符路径,例如 WSL 里 cd 到了 `/mnt/d/…`)无从得知路径属于哪个
+///   发行版 → 用法错误,提示用 `wslpath -w` 换成 Windows 路径再传。
+///
+/// Git Bash / MSYS2 不受影响:bash 拉起原生程序前会把 `/c/…`、`/tmp/…` 这类实参换成
+/// Windows 路径(实测 `/tmp/a.log` → `C:/Users/<用户>/AppData/Local/Temp/a.log`,
+/// `/c/x` → `C:/x`),到这里时已不是单斜杠开头;只有设了 `MSYS_NO_PATHCONV=1` 之类
+/// 关掉转换时才会落进报错分支 —— 那时这个路径本来就有歧义。
+#[cfg(windows)]
+fn resolve_posix_absolute_path(
+    path: &str,
+    cwd: Option<&std::path::Path>,
+) -> Result<Option<String>, String> {
+    if !path.starts_with('/') || path.starts_with("//") {
+        return Ok(None);
     }
+    let Some(root) = cwd.and_then(|dir| wsl_distro_root(&dir.to_string_lossy())) else {
+        return Err(format!(
+            "local path '{path}' is a POSIX absolute path, which this Windows binary cannot \
+             locate from the current directory; pass a Windows path instead \
+             (in WSL: \"$(wslpath -w '{path}')\")"
+        ));
+    };
+    let joined = format!("{root}{}", path.replace('/', "\\"));
+    Ok(Some(match std::path::absolute(&joined) {
+        Ok(p) => p.to_string_lossy().to_string(),
+        Err(_) => joined,
+    }))
+}
+
+/// WSL 发行版根目录的 UNC 前缀 `\\<wsl.localhost|wsl$>\<发行版>`(不带尾随 `\`);
+/// `dir` 不是 WSL UNC 路径则 `None`。主机名照调用方原样保留 —— 老版本 Windows 10 只认
+/// `wsl$`,不能一律改写成 `wsl.localhost`。
+#[cfg(windows)]
+fn wsl_distro_root(dir: &str) -> Option<String> {
+    let rest = dir
+        .strip_prefix(r"\\?\UNC\")
+        .or_else(|| dir.strip_prefix(r"\\"))?;
+    let mut parts = rest.splitn(3, '\\');
+    let host = parts.next()?;
+    let distro = parts.next().filter(|distro| !distro.is_empty())?;
+    if !(host.eq_ignore_ascii_case("wsl.localhost") || host.eq_ignore_ascii_case("wsl$")) {
+        return None;
+    }
+    Some(format!(r"\\{host}\{distro}"))
 }
 
 /// exec 结果 → 进程退出码的映射。
@@ -319,6 +392,189 @@ impl Plan {
             json: false,
         }
     }
+
+    /// upload / download 的计划。本地路径在这里(调用现场)绝对化;`Err` = 用法错误。
+    fn transfer(
+        op: Op,
+        project_token: String,
+        timeout: Option<u64>,
+        connection: String,
+        local_path: &str,
+        remote_path: String,
+    ) -> Result<Self, String> {
+        let mut plan = Self::new(op);
+        plan.req.project_token = Some(project_token);
+        plan.req.connection = Some(connection);
+        plan.req.local_path = Some(absolutize_local_path(local_path)?);
+        plan.req.remote_path = Some(remote_path);
+        plan.req.timeout_secs = timeout;
+        Ok(plan)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 版本握手:决定用、换代还是绕开眼前这个 daemon
+// ---------------------------------------------------------------------------
+
+/// 包版本(semver 2.0:`MAJOR.MINOR.PATCH[-PRE][+BUILD]`)的比较用解析结果。
+/// 不引依赖、只服务握手比较;build 元数据不参与比较,不保存。
+#[derive(Debug, PartialEq, Eq)]
+struct PackageVersion {
+    core: [u64; 3],
+    /// 预发布标识(`-` 之后按 `.` 切分);空 = 正式版。
+    pre: Vec<String>,
+}
+
+impl PackageVersion {
+    fn parse(text: &str) -> Option<Self> {
+        let text = text.trim();
+        let without_build = text.split_once('+').map_or(text, |(version, _)| version);
+        let (core_text, pre_text) = match without_build.split_once('-') {
+            Some((core, pre)) => (core, Some(pre)),
+            None => (without_build, None),
+        };
+        let mut numbers = core_text.split('.');
+        let mut core = [0u64; 3];
+        for slot in &mut core {
+            *slot = parse_numeric_identifier(numbers.next()?)?;
+        }
+        if numbers.next().is_some() {
+            return None;
+        }
+        let pre = match pre_text {
+            None => Vec::new(),
+            Some(pre_text) => {
+                let ids: Vec<String> = pre_text.split('.').map(str::to_string).collect();
+                let malformed = |id: &String| {
+                    id.is_empty() || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                };
+                if ids.iter().any(malformed) {
+                    return None;
+                }
+                ids
+            }
+        };
+        Some(Self { core, pre })
+    }
+}
+
+/// 纯数字标识 → 数值;含非数字(或空)返回 None。
+fn parse_numeric_identifier(text: &str) -> Option<u64> {
+    if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    text.parse().ok()
+}
+
+/// semver 优先级:先按数值比 MAJOR.MINOR.PATCH(`0.4.9 < 0.4.10`,不是字典序),
+/// 再比预发布 —— 有预发布标识的低于同号正式版;逐段比较时纯数字段按数值、且低于含字母
+/// 的段,含字母的段按 ASCII;前面各段都相同则段数少的低。
+fn compare_versions(a: &PackageVersion, b: &PackageVersion) -> Ordering {
+    a.core
+        .cmp(&b.core)
+        .then_with(|| match (a.pre.is_empty(), b.pre.is_empty()) {
+            (true, true) => Ordering::Equal,
+            (true, false) => Ordering::Greater,
+            (false, true) => Ordering::Less,
+            (false, false) => a
+                .pre
+                .iter()
+                .zip(&b.pre)
+                .map(
+                    |(x, y)| match (parse_numeric_identifier(x), parse_numeric_identifier(y)) {
+                        (Some(x), Some(y)) => x.cmp(&y),
+                        (Some(_), None) => Ordering::Less,
+                        (None, Some(_)) => Ordering::Greater,
+                        (None, None) => x.cmp(y),
+                    },
+                )
+                .find(|order| order.is_ne())
+                .unwrap_or_else(|| a.pre.len().cmp(&b.pre.len())),
+        })
+}
+
+/// daemon 版本相对 CLI 版本的新旧。daemon 的版本串解析不了按「更旧」处理(换代);
+/// `own` 是编译期常量,单测钉住它一定可解析。
+fn daemon_version_order(daemon_version: &str, own_version: &str) -> Ordering {
+    match (
+        PackageVersion::parse(daemon_version),
+        PackageVersion::parse(own_version),
+    ) {
+        (Some(daemon), Some(own)) => compare_versions(&daemon, &own),
+        _ => Ordering::Less,
+    }
+}
+
+/// 握手结论。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HandshakeDecision {
+    /// 协议一致,且 daemon 不比 CLI 旧:直接用。
+    Use,
+    /// daemon 比 CLI 旧:按对端协议发 shutdown 换代。
+    Replace,
+    /// daemon 不比 CLI 旧但协议不同:不踢它,本次降级 one-shot。
+    FallBack,
+}
+
+/// 握手规则(纯函数)。
+///
+/// 只换代**更旧**的 daemon:dev 实例与装机版的 sidecar 版本不同、共用同一个端点,
+/// 旧规则「版本不等就踢」会让两边来回互踢、互相切断在途请求。现在新 CLI 遇到更新的
+/// daemon 直接用(协议相同,新 daemon 向下兼容旧请求);协议也不同就绕开它走 one-shot,
+/// 由更新的那一方继续用它。同版本而协议不同(只会是 dev 构建)同样不踢,要换手动
+/// `daemon-stop`。缺 `protocolVersion` 的 legacy v1 hello 按 v1 认(见
+/// [`peer_protocol_version`]),比 CLI 旧时照常按 v1 发 shutdown 收尸。
+fn handshake_decision(
+    hello_version: &str,
+    hello_protocol_version: Option<u32>,
+    own_version: &str,
+) -> HandshakeDecision {
+    let same_protocol = peer_protocol_version(hello_protocol_version) == ipc::PROTOCOL_VERSION;
+    match daemon_version_order(hello_version, own_version) {
+        Ordering::Less => HandshakeDecision::Replace,
+        _ if same_protocol => HandshakeDecision::Use,
+        _ => HandshakeDecision::FallBack,
+    }
+}
+
+/// daemon 路径走不通、要降级 one-shot 的原因;每种在 stderr 给一行说明。
+#[derive(Debug)]
+enum DaemonUnavailable {
+    /// 连不上、拉不起、握手失败等。
+    Unreachable(String),
+    /// 端点被非当前用户的进程占着(或核验不了它属于谁)。不自拉起 —— 端点被占,
+    /// 新 daemon 也绑不上。
+    Untrusted(String),
+    /// 正在跑的 daemon 比 CLI 新且协议不同。不踢它:它服务的是更新的调用方。
+    NewerIncompatible { version: String, protocol: u32 },
+}
+
+impl DaemonUnavailable {
+    /// 降级时 stderr 的一行说明(不带 `error:` 前缀 —— 降级后业务照常执行)。
+    fn fallback_notice(&self) -> String {
+        match self {
+            DaemonUnavailable::Unreachable(reason) => {
+                format!("mt-ssh-cli: daemon unavailable ({reason}); falling back to in-process SSH")
+            }
+            DaemonUnavailable::Untrusted(reason) => format!(
+                "mt-ssh-cli: daemon endpoint is occupied by a process not owned by the current \
+                 user ({reason}); not starting a daemon, falling back to in-process SSH"
+            ),
+            DaemonUnavailable::NewerIncompatible { version, protocol } => format!(
+                "mt-ssh-cli: running daemon {version} (protocol v{protocol}) is newer than this \
+                 CLI ({}, protocol v{}) and speaks a different protocol; leaving it running and \
+                 falling back to in-process SSH",
+                env!("CARGO_PKG_VERSION"),
+                ipc::PROTOCOL_VERSION
+            ),
+        }
+    }
+}
+
+impl From<String> for DaemonUnavailable {
+    fn from(reason: String) -> Self {
+        DaemonUnavailable::Unreachable(reason)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -357,53 +613,36 @@ async fn write_request(writer: &mut DaemonWriter, req: &Request) -> Result<(), S
 }
 
 /// 连接 daemon;连不上则 detached 拉起自身 `daemon` 并带退避重连。
-async fn connect_or_spawn(ep: &str) -> Result<Box<dyn ipc::IpcStream>, String> {
-    if let Ok(s) = ipc::connect(ep).await {
-        return Ok(s);
-    }
-    spawn_daemon_detached()?;
+async fn connect_or_spawn(ep: &str) -> Result<Box<dyn ipc::IpcStream>, DaemonUnavailable> {
+    let spawned = match ipc::connect(ep).await {
+        Ok(stream) => return Ok(stream),
+        // 别的用户占着端点:不连、也不拉起(拉起也绑不上),直接降级。
+        Err(ConnectError::Untrusted(reason)) => return Err(DaemonUnavailable::Untrusted(reason)),
+        // 端点在、只是所有实例都忙(高并发瞬间,或 daemon 正在优雅退出、已不再监听):
+        // 拉起新 daemon 也绑不上,只做退避重连。
+        Err(e) if e.is_busy() => false,
+        Err(ConnectError::Unreachable(_)) => {
+            daemon_spawn::spawn_daemon_detached()?;
+            true
+        }
+    };
     for delay in SPAWN_RETRY_DELAYS_MS {
         tokio::time::sleep(Duration::from_millis(*delay)).await;
         // 多个 CLI 并发首调:端点绑定互斥保证恰好一个 daemon 存活,
         // 抢输的实例静默退出,这里重试连接即收敛。
-        if let Ok(s) = ipc::connect(ep).await {
-            return Ok(s);
+        match ipc::connect(ep).await {
+            Ok(stream) => return Ok(stream),
+            Err(ConnectError::Untrusted(reason)) => {
+                return Err(DaemonUnavailable::Untrusted(reason));
+            }
+            Err(ConnectError::Unreachable(_)) => {}
         }
     }
-    Err("daemon did not become reachable after spawning".into())
-}
-
-/// detached 拉起 `mt-ssh-cli daemon`:无窗口、脱离本进程组、stdio 全空。
-fn spawn_daemon_detached() -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|e| format!("cannot locate own binary: {e}"))?;
-    let mut cmd = std::process::Command::new(exe);
-    cmd.arg("daemon")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    // 端点被 env 覆盖时(测试/排障)透传给 daemon,保持两端一致。
-    if let Ok(ep) = std::env::var(ENDPOINT_ENV) {
-        cmd.env(ENDPOINT_ENV, ep);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        // DETACHED_PROCESS:不继承控制台(agent 的 Bash 结束不连坐 daemon);
-        // CREATE_NEW_PROCESS_GROUP:Ctrl+C 信号不波及。
-        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // 新进程组:调用方所在会话/作业结束不连坐 daemon(setsid 的轻量替代,
-        // stdio 已全空,无控制终端依赖)。
-        cmd.process_group(0);
-    }
-    cmd.spawn()
-        .map(|_| ())
-        .map_err(|e| format!("failed to spawn daemon: {e}"))
+    Err(DaemonUnavailable::Unreachable(if spawned {
+        "daemon did not become reachable after spawning".into()
+    } else {
+        "daemon endpoint stayed busy (the daemon may be shutting down)".into()
+    }))
 }
 
 /// v1 hello 没有 `protocolVersion`；新 CLI 将缺失字段识别为 legacy v1，
@@ -412,22 +651,15 @@ fn peer_protocol_version(hello_protocol_version: Option<u32>) -> u32 {
     hello_protocol_version.unwrap_or(ipc::LEGACY_PROTOCOL_VERSION)
 }
 
-/// 握手同时比较包版本与 IPC 协议版本。仅比较 `CARGO_PKG_VERSION` 会漏掉
-/// 同一包版本内的协议升级（本次 v1 → v2 即是这种情况）。
-fn daemon_handshake_mismatch(
-    hello_version: &str,
-    hello_protocol_version: Option<u32>,
-    own_version: &str,
-) -> bool {
-    hello_version != own_version
-        || peer_protocol_version(hello_protocol_version) != ipc::PROTOCOL_VERSION
-}
-
 /// 建立一条通过版本握手的 daemon 会话(hello 已消费)。
 ///
-/// 版本不符(app 升级后旧 daemon 残留)→ 发 shutdown 踢掉旧 daemon → 等端点
-/// 释放 → 重新自拉起新版。最多两轮,仍不符则放弃(caller 走降级)。
-async fn open_daemon_session(ep: &str) -> Result<(DaemonReader, DaemonWriter), String> {
+/// 规则见 [`handshake_decision`]:daemon 更旧(app 升级后旧 daemon 残留)→ 发 shutdown
+/// 踢掉 → 等端点释放 → 重新自拉起新版,最多两轮;daemon 更新但协议不同 → 不踢,
+/// 返回 [`DaemonUnavailable::NewerIncompatible`](caller 走降级)。
+///
+/// ⚠️ 0.4.10 及更早的 daemon 收到 shutdown 立即退出,它手上的在途请求会被硬切断;
+/// 0.4.11 起的 daemon 收到后先停止接新连接、等在途请求做完(上限 60s)再退出。
+async fn open_daemon_session(ep: &str) -> Result<(DaemonReader, DaemonWriter), DaemonUnavailable> {
     let own_version = env!("CARGO_PKG_VERSION");
     let mut last_err = String::new();
     for _cycle in 0..2 {
@@ -445,18 +677,25 @@ async fn open_daemon_session(ep: &str) -> Result<(DaemonReader, DaemonWriter), S
                 protocol_version,
                 ..
             } => (version, protocol_version),
-            other => return Err(format!("unexpected first frame from daemon: {other:?}")),
+            other => return Err(format!("unexpected first frame from daemon: {other:?}").into()),
         };
         let peer_protocol = peer_protocol_version(hello_protocol_version);
-        if !daemon_handshake_mismatch(&version, hello_protocol_version, own_version) {
-            return Ok((reader, writer));
+        match handshake_decision(&version, hello_protocol_version, own_version) {
+            HandshakeDecision::Use => return Ok((reader, writer)),
+            HandshakeDecision::FallBack => {
+                return Err(DaemonUnavailable::NewerIncompatible {
+                    version,
+                    protocol: peer_protocol,
+                });
+            }
+            HandshakeDecision::Replace => {}
         }
 
         // 旧 daemon 残留：按对端协议版本请求优雅退出（v1 hello 缺字段时用 v1），
-        // 等它 drain 并放掉端点后再拉起当前版本。
+        // 等它放掉端点后再拉起当前版本。
         eprintln!(
-            "[mt-ssh-cli] daemon version/protocol {version}/v{peer_protocol} != \
-             {own_version}/v{}, restarting daemon",
+            "[mt-ssh-cli] daemon {version} (protocol v{peer_protocol}) is older than \
+             {own_version} (protocol v{}), restarting daemon",
             ipc::PROTOCOL_VERSION
         );
         let shutdown = Request {
@@ -471,7 +710,8 @@ async fn open_daemon_session(ep: &str) -> Result<(DaemonReader, DaemonWriter), S
         }
         drop(reader);
         drop(writer);
-        // 等端点真正释放(旧 daemon drain 池需要一点时间)。
+        // 等端点真正释放:旧版 daemon 退出前要 drain 池;0.4.11 起的 daemon 一收到
+        // shutdown 就不再监听,这里很快就连不上了(它在后台把在途请求做完再退出)。
         for _ in 0..20 {
             tokio::time::sleep(Duration::from_millis(100)).await;
             if ipc::connect(ep).await.is_err() {
@@ -481,16 +721,16 @@ async fn open_daemon_session(ep: &str) -> Result<(DaemonReader, DaemonWriter), S
         last_err =
             format!("old daemon {version}/protocol-v{peer_protocol} still holding the endpoint");
     }
-    Err(if last_err.is_empty() {
+    Err(DaemonUnavailable::Unreachable(if last_err.is_empty() {
         "daemon version handshake failed".into()
     } else {
         last_err
-    })
+    }))
 }
 
 /// 经 daemon 执行一个业务计划。`Err` = daemon 路径不可用(caller 降级 one-shot);
 /// `Ok(code)` = 请求已被 daemon 受理并出了终帧(不再降级 —— 业务错误原样透传)。
-async fn run_via_daemon(plan: &Plan) -> Result<i32, String> {
+async fn run_via_daemon(plan: &Plan) -> Result<i32, DaemonUnavailable> {
     let ep = endpoint();
     let (mut reader, mut writer) = open_daemon_session(&ep).await?;
     write_request(&mut writer, &plan.req).await?;
@@ -669,12 +909,12 @@ where
     code
 }
 
-/// 业务计划入口:daemon 优先,不可用降级 one-shot(stderr 记一行)。
+/// 业务计划入口:daemon 优先,不可用降级 one-shot(stderr 记一行原因)。
 async fn run_plan(plan: Plan) -> i32 {
     match run_via_daemon(&plan).await {
         Ok(code) => code,
-        Err(reason) => {
-            eprintln!("mt-ssh-cli: daemon unavailable ({reason}); falling back to in-process SSH");
+        Err(unavailable) => {
+            eprintln!("{}", unavailable.fallback_notice());
             run_one_shot(&plan).await
         }
     }
@@ -685,38 +925,78 @@ async fn run_plan(plan: Plan) -> i32 {
 // ---------------------------------------------------------------------------
 
 /// `daemon`:前台跑守护进程(正常由 CLI 自动 detached 拉起)。
+///
+/// 正常退出(空闲 / shutdown)的事件由 `daemon::serve` 自己带时间戳记好了;这里只补
+/// 「没起来」的两种结局。
 async fn run_daemon_foreground(idle_secs: Option<u64>) -> i32 {
     let idle = idle_secs
         .map(Duration::from_secs)
         .unwrap_or(daemon::DEFAULT_IDLE_EXIT);
     match daemon::serve(&endpoint(), idle).await {
-        Ok(ServeOutcome::Idle) => {
-            eprintln!("[mt-ssh-cli daemon] idle for {}s, exiting", idle.as_secs());
-            0
-        }
-        Ok(ServeOutcome::Shutdown) => {
-            eprintln!("[mt-ssh-cli daemon] shutdown requested, exiting");
-            0
-        }
+        Ok(_) => 0,
         Err(daemon::ServeError::AlreadyRunning(e)) => {
-            // 端点被占 = 另一个 daemon 赢了 —— 静默让位(并发竞态收敛)。
-            eprintln!("[mt-ssh-cli daemon] not starting: {e}");
+            // 端点被当前用户的另一个 daemon 占着 = 它赢了 —— 静默让位(并发竞态收敛)。
+            daemon_log::event(&format!("not starting: {e}"));
             0
         }
-        // 绑定成功后的运行期故障:必须按错误暴露,不能伪装成「让位」。
-        Err(daemon::ServeError::Runtime(e)) => fail(&format!("daemon failed: {e}")),
+        // 其它绑定错误(含端点被别的用户占着)与运行期故障:必须按错误暴露,
+        // 不能伪装成「让位」。
+        Err(daemon::ServeError::Runtime(e)) => {
+            daemon_log::event(&format!("daemon failed: {e}"));
+            fail(&format!("daemon failed: {e}"))
+        }
     }
 }
 
-/// `daemon-status`:打印版本 / pid / 池内 session 数;daemon 不在时友好提示。
+/// `daemon-status` / `daemon-stop` 遇到不可信端点时的报错文本。
+fn untrusted_endpoint_message(reason: &str) -> String {
+    format!(
+        "refusing to talk to the daemon endpoint: it is occupied by a process not owned by the \
+         current user ({reason})"
+    )
+}
+
+/// `daemon-status` 输出里的日志路径行(daemon 不在时也打印,方便事后翻日志)。
+fn daemon_log_line() -> String {
+    match daemon_log::log_path() {
+        Some(path) => format!("mt-ssh-cli daemon log: {}", path.display()),
+        None => "mt-ssh-cli daemon log: unavailable (cannot locate the mini-term data directory)"
+            .to_string(),
+    }
+}
+
+/// `daemon-status` 的状态行。`active` 缺省 = 0.4.10 及更早的 daemon 不报这个数。
+fn render_daemon_status(
+    version: &str,
+    protocol: u32,
+    pid: u32,
+    sessions: usize,
+    active: Option<usize>,
+) -> String {
+    let active = active.map(|n| format!(" active={n}")).unwrap_or_default();
+    format!("mt-ssh-cli daemon: version={version} protocol=v{protocol} pid={pid} sessions={sessions}{active}")
+}
+
+/// `daemon-status`:打印版本 / 协议 / pid / 池内 session 数 / 在途请求数,以及日志路径;
+/// daemon 不在时友好提示。
 ///
 /// 退出码语义对齐 `systemctl is-active` 一类状态探测命令:0 = 在跑、1 = 不在跑,
-/// 便于脚本判断;「exit 2 = CLI 错误」的契约只约束业务子命令(本命令不进 SKILL.md)。
+/// 便于脚本判断;端点被非当前用户的进程占着等错误按 CLI 契约 exit 2(本命令不进 SKILL.md)。
 async fn run_daemon_status() -> i32 {
     let ep = endpoint();
-    let Ok(stream) = ipc::connect(&ep).await else {
-        println!("mt-ssh-cli daemon: not running");
-        return 1;
+    let stream = match ipc::connect(&ep).await {
+        Ok(stream) => stream,
+        Err(ConnectError::Untrusted(reason)) => return fail(&untrusted_endpoint_message(&reason)),
+        Err(e) if e.is_busy() => {
+            println!("mt-ssh-cli daemon: endpoint busy (the daemon may be shutting down)");
+            println!("{}", daemon_log_line());
+            return 1;
+        }
+        Err(ConnectError::Unreachable(_)) => {
+            println!("mt-ssh-cli daemon: not running");
+            println!("{}", daemon_log_line());
+            return 1;
+        }
     };
     let (r, mut w) = tokio::io::split(stream);
     let mut reader = tokio::io::BufReader::new(r);
@@ -737,13 +1017,22 @@ async fn run_daemon_status() -> i32 {
         return fail(&e);
     }
     match read_server_frame(&mut reader).await {
-        Ok(ServerFrame::Result { sessions, .. }) => {
+        Ok(ServerFrame::Result {
+            sessions,
+            active_requests,
+            ..
+        }) => {
             println!(
-                "mt-ssh-cli daemon: version={} pid={} sessions={}",
-                hello.0,
-                hello.2,
-                sessions.unwrap_or(0)
+                "{}",
+                render_daemon_status(
+                    &hello.0,
+                    hello.1,
+                    hello.2,
+                    sessions.unwrap_or(0),
+                    active_requests
+                )
             );
+            println!("{}", daemon_log_line());
             0
         }
         Ok(ServerFrame::Error { message }) => fail(&message),
@@ -752,12 +1041,21 @@ async fn run_daemon_status() -> i32 {
     }
 }
 
-/// `daemon-stop`:请求优雅退出。幂等 —— daemon 不在时提示后仍返回 0。
+/// `daemon-stop`:请求优雅退出。幂等 —— daemon 不在时提示后仍返回 0;端点被非当前
+/// 用户的进程占着则拒绝通信、exit 2(绝不把请求发给冒充者)。
 async fn run_daemon_stop() -> i32 {
     let ep = endpoint();
-    let Ok(stream) = ipc::connect(&ep).await else {
-        println!("mt-ssh-cli daemon: not running (nothing to stop)");
-        return 0;
+    let stream = match ipc::connect(&ep).await {
+        Ok(stream) => stream,
+        Err(ConnectError::Untrusted(reason)) => return fail(&untrusted_endpoint_message(&reason)),
+        Err(e) if e.is_busy() => {
+            println!("mt-ssh-cli daemon: endpoint busy (the daemon may already be shutting down)");
+            return 0;
+        }
+        Err(ConnectError::Unreachable(_)) => {
+            println!("mt-ssh-cli daemon: not running (nothing to stop)");
+            return 0;
+        }
     };
     let (r, mut w) = tokio::io::split(stream);
     let mut reader = tokio::io::BufReader::new(r);
@@ -779,7 +1077,9 @@ async fn run_daemon_stop() -> i32 {
     }
     match tokio::time::timeout(Duration::from_secs(5), read_server_frame(&mut reader)).await {
         Ok(Ok(ServerFrame::Result { .. })) => {
-            println!("mt-ssh-cli daemon: stop requested (pool draining)");
+            // 0.4.11 起:daemon 已停止接新连接,做完在途请求(上限 60s)再 drain 池退出;
+            // 更早的 daemon 立即 drain 退出。
+            println!("mt-ssh-cli daemon: stop requested (finishing requests in flight, then draining the pool)");
             0
         }
         // 旧 daemon 可能不认识 shutdown → error 帧;或直接断连 —— 都算处理过。
@@ -835,30 +1135,34 @@ async fn main() {
             connection,
             local_path,
             remote_path,
-        } => {
-            let mut plan = Plan::new(Op::Upload);
-            plan.req.project_token = Some(project_token);
-            plan.req.connection = Some(connection);
-            plan.req.local_path = Some(absolutize_local_path(&local_path));
-            plan.req.remote_path = Some(remote_path);
-            plan.req.timeout_secs = timeout;
-            run_plan(plan).await
-        }
+        } => match Plan::transfer(
+            Op::Upload,
+            project_token,
+            timeout,
+            connection,
+            &local_path,
+            remote_path,
+        ) {
+            Ok(plan) => run_plan(plan).await,
+            Err(e) => fail(&e),
+        },
         Command::Download {
             project_token,
             timeout,
             connection,
             remote_path,
             local_path,
-        } => {
-            let mut plan = Plan::new(Op::Download);
-            plan.req.project_token = Some(project_token);
-            plan.req.connection = Some(connection);
-            plan.req.local_path = Some(absolutize_local_path(&local_path));
-            plan.req.remote_path = Some(remote_path);
-            plan.req.timeout_secs = timeout;
-            run_plan(plan).await
-        }
+        } => match Plan::transfer(
+            Op::Download,
+            project_token,
+            timeout,
+            connection,
+            &local_path,
+            remote_path,
+        ) {
+            Ok(plan) => run_plan(plan).await,
+            Err(e) => fail(&e),
+        },
         Command::Daemon { idle_secs } => run_daemon_foreground(idle_secs).await,
         Command::DaemonStatus => run_daemon_status().await,
         Command::DaemonStop => run_daemon_stop().await,
@@ -986,28 +1290,164 @@ mod tests {
         ));
     }
 
-    // --- 版本握手比对 ---
+    // --- 版本握手 ---
+
+    fn version(text: &str) -> PackageVersion {
+        PackageVersion::parse(text).unwrap_or_else(|| panic!("should parse: {text}"))
+    }
 
     #[test]
-    fn daemon_handshake_checks_binary_and_protocol_versions() {
-        assert!(!daemon_handshake_mismatch(
-            "0.4.8",
-            Some(ipc::PROTOCOL_VERSION),
-            "0.4.8"
-        ));
-        assert!(daemon_handshake_mismatch(
-            "0.4.8",
-            Some(ipc::PROTOCOL_VERSION),
-            "0.4.9"
-        ));
-        // v1 hello 缺 protocolVersion：识别为 v1，且 shutdown 必须按 v1 发送。
+    fn package_versions_compare_numerically() {
+        let order = |a: &str, b: &str| compare_versions(&version(a), &version(b));
+        assert_eq!(order("0.4.10", "0.4.11"), Ordering::Less);
+        // 数值比较,不是字典序。
+        assert_eq!(order("0.4.9", "0.4.10"), Ordering::Less);
+        assert_eq!(order("0.10.0", "0.9.99"), Ordering::Greater);
+        assert_eq!(order("1.0.0", "0.99.99"), Ordering::Greater);
+        assert_eq!(order("0.4.11", "0.4.11"), Ordering::Equal);
+        // build 元数据不参与比较。
+        assert_eq!(order("0.4.11+dev.3", "0.4.11"), Ordering::Equal);
+    }
+
+    #[test]
+    fn package_versions_follow_semver_pre_release_precedence() {
+        // semver.org §11 的示例序列,逐对递增。
+        let chain = [
+            "1.0.0-alpha",
+            "1.0.0-alpha.1",
+            "1.0.0-alpha.beta",
+            "1.0.0-beta",
+            "1.0.0-beta.2",
+            "1.0.0-beta.11",
+            "1.0.0-rc.1",
+            "1.0.0",
+        ];
+        for pair in chain.windows(2) {
+            assert_eq!(
+                compare_versions(&version(pair[0]), &version(pair[1])),
+                Ordering::Less,
+                "{} < {}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_versions_do_not_parse() {
+        for text in [
+            "",
+            "0.4",
+            "0.4.11.1",
+            "v0.4.11",
+            "a.b.c",
+            "0.4.x",
+            "0.4.11-",
+            "0.4.11-a..b",
+            "0.4.11-a_b",
+        ] {
+            assert_eq!(PackageVersion::parse(text), None, "{text:?}");
+        }
+        // 自己的版本号必须可解析 —— 握手里「解析失败按更旧处理」只针对对端。
+        assert!(PackageVersion::parse(env!("CARGO_PKG_VERSION")).is_some());
+    }
+
+    #[test]
+    fn handshake_uses_same_or_newer_daemon_with_same_protocol() {
+        let p = Some(ipc::PROTOCOL_VERSION);
+        assert_eq!(
+            handshake_decision("0.4.11", p, "0.4.11"),
+            HandshakeDecision::Use
+        );
+        // dev 实例比装机版新:装机版 CLI 直接用它,不再把它踢掉。
+        assert_eq!(
+            handshake_decision("0.4.12", p, "0.4.11"),
+            HandshakeDecision::Use
+        );
+    }
+
+    #[test]
+    fn handshake_replaces_only_older_daemons() {
+        let p = Some(ipc::PROTOCOL_VERSION);
+        assert_eq!(
+            handshake_decision("0.4.10", p, "0.4.11"),
+            HandshakeDecision::Replace
+        );
+        assert_eq!(
+            handshake_decision("0.4.11-rc.1", p, "0.4.11"),
+            HandshakeDecision::Replace
+        );
+        // 版本串解析不了按更旧处理。
+        assert_eq!(
+            handshake_decision("garbage", p, "0.4.11"),
+            HandshakeDecision::Replace
+        );
+        // legacy v1 hello 缺 protocolVersion:识别为 v1,比 CLI 旧照常换代(按 v1 发 shutdown)。
         assert_eq!(peer_protocol_version(None), ipc::LEGACY_PROTOCOL_VERSION);
-        assert!(daemon_handshake_mismatch("0.4.8", None, "0.4.8"));
-        assert!(daemon_handshake_mismatch(
-            "0.4.8",
-            Some(ipc::LEGACY_PROTOCOL_VERSION),
-            "0.4.8"
-        ));
+        assert_eq!(
+            handshake_decision("0.4.8", None, "0.4.11"),
+            HandshakeDecision::Replace
+        );
+    }
+
+    #[test]
+    fn handshake_falls_back_instead_of_kicking_newer_incompatible_daemons() {
+        let other = Some(ipc::PROTOCOL_VERSION + 1);
+        assert_eq!(
+            handshake_decision("0.5.0", other, "0.4.11"),
+            HandshakeDecision::FallBack
+        );
+        // 同版本而协议不同(只会是 dev 构建):同样不踢。
+        assert_eq!(
+            handshake_decision("0.4.11", None, "0.4.11"),
+            HandshakeDecision::FallBack
+        );
+        assert_eq!(
+            handshake_decision("0.4.11", other, "0.4.11"),
+            HandshakeDecision::FallBack
+        );
+    }
+
+    #[test]
+    fn fallback_notices_explain_the_reason() {
+        let untrusted = DaemonUnavailable::Untrusted("belongs to another user".into());
+        let notice = untrusted.fallback_notice();
+        assert!(notice.contains("not owned by the current user"), "{notice}");
+        assert!(notice.contains("belongs to another user"), "{notice}");
+        assert!(
+            notice.contains("falling back to in-process SSH"),
+            "{notice}"
+        );
+
+        let newer = DaemonUnavailable::NewerIncompatible {
+            version: "0.5.0".into(),
+            protocol: 3,
+        }
+        .fallback_notice();
+        assert!(
+            newer.contains("0.5.0") && newer.contains("protocol v3"),
+            "{newer}"
+        );
+        assert!(newer.contains("leaving it running"), "{newer}");
+
+        let unreachable = DaemonUnavailable::from("boom".to_string()).fallback_notice();
+        assert!(
+            unreachable.contains("daemon unavailable (boom)"),
+            "{unreachable}"
+        );
+    }
+
+    #[test]
+    fn daemon_status_line_includes_active_count_when_reported() {
+        assert_eq!(
+            render_daemon_status("0.4.11", 2, 42, 3, Some(1)),
+            "mt-ssh-cli daemon: version=0.4.11 protocol=v2 pid=42 sessions=3 active=1"
+        );
+        // 0.4.10 daemon 不报在途数:不编造。
+        assert_eq!(
+            render_daemon_status("0.4.10", 2, 42, 0, None),
+            "mt-ssh-cli daemon: version=0.4.10 protocol=v2 pid=42 sessions=0"
+        );
     }
 
     // --- exec_exit_code: 退出码矩阵 ---
@@ -1048,7 +1488,7 @@ mod tests {
 
     #[test]
     fn absolutize_local_path_resolves_relative() {
-        let abs = absolutize_local_path("some-file.txt");
+        let abs = absolutize_local_path("some-file.txt").unwrap();
         assert!(std::path::Path::new(&abs).is_absolute(), "got: {abs}");
         assert!(abs.ends_with("some-file.txt"));
     }
@@ -1060,7 +1500,113 @@ mod tests {
         } else {
             "/tmp/x.bin"
         };
-        assert_eq!(absolutize_local_path(input), input);
+        assert_eq!(absolutize_local_path(input).unwrap(), input);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn transfer_plan_rejects_unmappable_posix_paths_as_usage_errors() {
+        // 测试进程的 cwd 是盘符路径(cargo 在 crate 目录跑测试),不是 WSL 文件系统。
+        let err = Plan::transfer(
+            Op::Download,
+            "token".into(),
+            None,
+            "prod".into(),
+            "/tmp/a.log",
+            "/var/log/a.log".into(),
+        )
+        .err()
+        .expect("POSIX absolute path must be rejected outside WSL file systems");
+        assert!(err.contains("wslpath -w"), "{err}");
+
+        let plan = Plan::transfer(
+            Op::Upload,
+            "token".into(),
+            Some(5),
+            "prod".into(),
+            "rel.bin",
+            "/srv/rel.bin".into(),
+        )
+        .unwrap();
+        assert!(std::path::Path::new(plan.req.local_path.as_deref().unwrap()).is_absolute());
+        assert_eq!(plan.req.remote_path.as_deref(), Some("/srv/rel.bin"));
+        assert_eq!(plan.req.timeout_secs, Some(5));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn posix_paths_map_into_the_wsl_distro_of_the_current_directory() {
+        use std::path::Path;
+        let map = |path: &str, cwd: &str| resolve_posix_absolute_path(path, Some(Path::new(cwd)));
+
+        assert_eq!(
+            map("/tmp/a.log", r"\\wsl.localhost\Ubuntu-24.04\home\u").unwrap(),
+            Some(r"\\wsl.localhost\Ubuntu-24.04\tmp\a.log".to_string())
+        );
+        // 老式主机名原样保留。
+        assert_eq!(
+            map("/var/log/x", r"\\wsl$\Ubuntu\home").unwrap(),
+            Some(r"\\wsl$\Ubuntu\var\log\x".to_string())
+        );
+        // `\\?\UNC\` 形式的 cwd 也认。
+        assert_eq!(
+            map("/tmp/a.log", r"\\?\UNC\wsl.localhost\Debian\root").unwrap(),
+            Some(r"\\wsl.localhost\Debian\tmp\a.log".to_string())
+        );
+        // `..` 折叠,且越不过发行版根。
+        assert_eq!(
+            map("/tmp/../etc/../../x", r"\\wsl.localhost\Ubuntu\home").unwrap(),
+            Some(r"\\wsl.localhost\Ubuntu\x".to_string())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn posix_paths_outside_wsl_file_systems_are_usage_errors() {
+        use std::path::Path;
+        for cwd in [r"D:\Git\proj", r"\\server\share\dir", r"\\wsl.localhost"] {
+            let err =
+                resolve_posix_absolute_path("/tmp/a.log", Some(Path::new(cwd))).expect_err(cwd);
+            assert!(err.contains("wslpath -w '/tmp/a.log'"), "{err}");
+        }
+        assert!(resolve_posix_absolute_path("/tmp/a.log", None).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn non_posix_paths_are_left_to_regular_absolutization() {
+        use std::path::Path;
+        let wsl = Some(Path::new(r"\\wsl.localhost\Ubuntu\home"));
+        for path in [
+            r"C:\x\a.log",
+            "C:/x/a.log",
+            "rel/a.log",
+            r"\root-relative",
+            "//server/share/a",
+        ] {
+            assert_eq!(
+                resolve_posix_absolute_path(path, wsl).unwrap(),
+                None,
+                "{path}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn wsl_distro_root_recognizes_only_wsl_unc_paths() {
+        assert_eq!(
+            wsl_distro_root(r"\\WSL.LOCALHOST\Ubuntu\home").as_deref(),
+            Some(r"\\WSL.LOCALHOST\Ubuntu")
+        );
+        assert_eq!(
+            wsl_distro_root(r"\\wsl$\Ubuntu-22.04").as_deref(),
+            Some(r"\\wsl$\Ubuntu-22.04")
+        );
+        assert_eq!(wsl_distro_root(r"\\wsl$\"), None);
+        assert_eq!(wsl_distro_root(r"\\server\share"), None);
+        assert_eq!(wsl_distro_root(r"C:\Users"), None);
+        assert_eq!(wsl_distro_root(r"\\?\C:\Users"), None);
     }
 
     // --- list 表格渲染 ---
