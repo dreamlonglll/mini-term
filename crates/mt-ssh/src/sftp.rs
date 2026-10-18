@@ -189,18 +189,9 @@ impl SftpHandle {
     ) -> Result<Self, SftpTransferError> {
         session.acquire_sftp_lease();
         let lease = SftpLease(session.clone());
-        // 只在开 channel 期间持锁;拿到独立 stream 后立刻释放。
-        let channel = {
-            let handle_guard = session.lock().await;
-            let channel = handle_guard.channel_open_session().await.map_err(|e| {
-                SftpTransferError::Transport(format!("channel_open_session failed: {e}"))
-            })?;
-            channel.request_subsystem(true, "sftp").await.map_err(|e| {
-                SftpTransferError::Transport(format!("request_subsystem(sftp) failed: {e}"))
-            })?;
-            channel
-        };
-        let sftp = SftpSession::new(channel.into_stream())
+        // 只在开 channel 期间持锁;拿到独立 stream 后立刻释放(与上传 / 下载同一个入口)。
+        let stream = session.open_sftp_stream().await?;
+        let sftp = SftpSession::new(stream)
             .await
             .map_err(|e| SftpTransferError::Transport(format!("sftp handshake failed: {e}")))?;
         // 协议层每请求超时默认 10s,必须同步到调用方窗口(下限 1s)。

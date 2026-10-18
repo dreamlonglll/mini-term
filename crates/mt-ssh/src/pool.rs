@@ -10,7 +10,8 @@
 //!   MSVC 上对 aws-lc-sys NASM 的依赖)。
 //! - 数据结构:`HashMap<ConnId, Arc<CachedSession>>` 包在 `tokio::sync::Mutex` 内;
 //!   每个 `CachedSession` 自己再裹一层 `Mutex<russh::client::Handle>` 把同 session
-//!   的 channel 操作串行化(YAGNI 多 channel 并发)。
+//!   上「开 channel」这一步串行化;channel 建好即放锁,本 crate 的 exec 与 SFTP 传输
+//!   在各自的 channel 上并发跑,不排队。
 //! - 默认 profile:idle 10min / lifetime 2h / keepalive 30s × 3 / cap 8 LRU /
 //!   lazy 重连 + 单次 retry + 30s 认证失败冷却 + 20s 建连超时。来源见 research 文件。
 //! - 建连对齐终端里的系统 ssh(`ssh [-p port] [-i key] user@host`):读 `~/.ssh/config`
@@ -371,6 +372,32 @@ impl CachedSession {
         self.active_sftp_leases.load(Ordering::Acquire) != 0
     }
 
+    /// 借用式 SFTP lease:构造即登记、drop 即释放(`?` 提前返回、外层超时丢弃 future
+    /// 也一样),期间 reaper / LRU 不回收本会话,释放时刷新 `last_used`。
+    pub(crate) fn sftp_lease(&self) -> SftpLeaseGuard<'_> {
+        self.acquire_sftp_lease();
+        SftpLeaseGuard { session: self }
+    }
+
+    /// 开一个 SFTP channel。会话锁只罩「开 channel + 请求 sftp 子系统」两步,拿到
+    /// channel 立即放锁:传输本身不占这把锁,同一连接上的 exec、别的传输与 `acquire`
+    /// 的存活检查都不必排队等它。失败一律算 transport 级(调用方可 evict + 重连)。
+    pub(crate) async fn open_sftp_stream(
+        &self,
+    ) -> Result<russh::ChannelStream<client::Msg>, SftpTransferError> {
+        let channel = {
+            let handle = self.handle.lock().await;
+            let channel = handle.channel_open_session().await.map_err(|e| {
+                SftpTransferError::Transport(format!("channel_open_session failed: {e}"))
+            })?;
+            channel.request_subsystem(true, "sftp").await.map_err(|e| {
+                SftpTransferError::Transport(format!("request_subsystem(sftp) failed: {e}"))
+            })?;
+            channel
+        };
+        Ok(channel.into_stream())
+    }
+
     /// 取 last_used 的 UNIX 毫秒(reaper 用)。
     pub fn last_used_millis(&self) -> u64 {
         self.last_used.load(Ordering::Relaxed)
@@ -380,6 +407,17 @@ impl CachedSession {
     /// 我们提供 `now: Instant` 入参便于测试与避免单次 tick 内多次取 `Instant::now()`。
     pub fn age_from(&self, now: Instant) -> Duration {
         now.saturating_duration_since(self.opened_at)
+    }
+}
+
+/// [`CachedSession::sftp_lease`] 的守卫。
+pub(crate) struct SftpLeaseGuard<'a> {
+    session: &'a CachedSession,
+}
+
+impl Drop for SftpLeaseGuard<'_> {
+    fn drop(&mut self) {
+        self.session.release_sftp_lease();
     }
 }
 
@@ -579,9 +617,10 @@ impl SshPool {
             .map_err(|e| AcquireError::new(AcquireErrorKind::Config, e))?;
         let identity = CachedConnectionIdentity::new(conn, route);
         // **持池锁期间只克隆 Arc,立刻放锁**。下面的 `is_closed()` 要 await 单会话锁,
-        // 而传输操作(`run_sftp_upload_on_session` / `run_sftp_download_on_session`)
-        // 全程持有单会话锁 —— 若在池锁里等它,任何一条连接传大文件都会把**其它所有
-        // 连接**的 acquire 一起堵死(全池 head-of-line 阻塞)。池锁只保护 map 本身。
+        // 而别人可能正拿着它等服务器回应(开 channel,或调用方经 `CachedSession::lock`
+        // 自己持锁跑的操作)—— 若在池锁里等它,一条连接卡住就会把**其它所有连接**的
+        // acquire 一起堵死(全池 head-of-line 阻塞)。池锁只保护 map 本身。SFTP 传输只在
+        // 开 channel 时持单会话锁(`CachedSession::open_sftp_stream`)。
         loop {
             let cached = {
                 let inner = self.inner.lock().await;
@@ -1390,23 +1429,8 @@ pub async fn run_bounded_exec_on_session(
 // ============================================================================
 // SFTP 文件传输原语 (task 06-09-ssh-mcp-sftp-transfer)
 // ============================================================================
-
-/// 流式分块读写的 chunk 大小。8 KB 与 russh-sftp `File` 内部按 max_packet_len
-/// 切包的行为相容(每次 read/write 内部会再按服务器协商的上限二次切分),仅用作
-/// 上层 copy 缓冲区,内存占用恒定、不随文件大小线性增长。
-const SFTP_CHUNK_BYTES: usize = 8 * 1024;
-
-/// 把 russh-sftp 的**协议层每请求超时**(`SftpSession::set_timeout`,默认仅 10s)
-/// 放宽到与外层 `tokio::time::timeout` 传输窗口一致。
-///
-/// 关键:russh-sftp 的 10s 超时是**逐个 SFTP 请求包**(每次 read/write 一个 chunk、
-/// 每次 open)各自计时的,不是整段传输。慢链路 / 拥塞下单个 chunk 等待 >10s 就会以
-/// 一个晦涩的协议错中断整段传输,而此时外层 300s 窗口远未到。故按外层超时窗口同步放宽,
-/// 让真正的「整段超时」由外层 `tokio::time::timeout` 统一裁决(见 prd Technical Notes)。
-fn sftp_request_timeout_secs(transfer_timeout: Duration) -> u64 {
-    // 至少 1s;并以外层窗口为上限,避免协议层比外层还早超时。
-    transfer_timeout.as_secs().max(1)
-}
+//
+// 实现在 `sftp_transfer.rs`;这里只留公开入口(签名与路径不变,sidecar 照旧调用)。
 
 /// SFTP 传输的错误分类:供 caller 决定是否 evict + 重连。
 ///
@@ -1443,13 +1467,23 @@ impl std::fmt::Display for SftpTransferError {
     }
 }
 
-/// 在已 acquire 到的 session 上开 SFTP channel,把本地文件流式上传到远程路径。
+/// 在已 acquire 到的 session 上开 SFTP channel,把本地文件上传到远程路径。
 ///
-/// 全程持有 `session.lock()`(沿用现有 channel 串行化语义),用 `open_with_flags`
-/// 拿到流式 `File`,以固定大小缓冲分块 `read`→`write_all`,内存占用恒定。
+/// - 会话锁只在开 channel 时短暂持有,传输期间持 SFTP lease;同一连接上的 exec、
+///   别的传输与 `acquire` 不再排队。
+/// - 多个写请求同时在途(约 1 MiB 窗口),块大小按服务器 `limits@openssh.com` 通告。
+/// - 目标是软链时解析到最终文件,在那个文件的目录里写临时文件再替换,软链保持软链;
+///   悬空软链在它指向的位置新建文件。目标是目录或特殊文件时报错、不上传。
+/// - 先写同目录的隐藏临时文件(权限位一出生就与目标一致,属主 / 属组尽量对齐),
+///   写完优先用 `posix-rename@openssh.com` 原子替换,否则「目标 → 备份、临时 → 目标、
+///   删备份」并带回滚。**中断不会把远端原文件截成半截**;原文件不在原位时绝不删临时
+///   文件,留下的临时 / 备份路径写进错误信息。
+/// - 属主(或权限位)在替换后保不住、或目录里建不了临时文件时,改为像 scp 一样原地
+///   覆盖写:原文件的 inode、属主、权限原样保留,代价是中途失败会留下不完整的文件
+///   (错误信息写明);文件本身不可写时报错、不动它。理由见 `sftp_transfer::upload`。
 ///
-/// 与下载侧同款:先写远端临时文件(`<remote>.mt-sftp-partial`)再改名到目标,
-/// **中断绝不会把远端原文件截成半截**;失败时清理临时文件。
+/// 整段超时由调用方在外面套 `tokio::time::timeout`;`transfer_timeout` 用来放宽协议层
+/// 的每请求超时。超时取消时远端临时文件在后台尽力删除。
 ///
 /// 返回写入的字节数。错误区分 transport(可 evict 重连)与 SFTP 业务错(不 evict)。
 pub async fn run_sftp_upload_on_session(
@@ -1458,116 +1492,15 @@ pub async fn run_sftp_upload_on_session(
     remote_path: &str,
     transfer_timeout: Duration,
 ) -> Result<u64, SftpTransferError> {
-    use russh_sftp::client::SftpSession;
-    use russh_sftp::protocol::OpenFlags;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    // 本地文件先打开 —— 本地不存在/不可读属业务错,不必去碰远端。
-    let mut local = tokio::fs::File::open(local_path).await.map_err(|e| {
-        SftpTransferError::Sftp(format!("cannot open local file '{local_path}': {e}"))
-    })?;
-
-    let handle_guard = session.lock().await;
-    let channel = handle_guard
-        .channel_open_session()
-        .await
-        .map_err(|e| SftpTransferError::Transport(format!("channel_open_session failed: {e}")))?;
-    channel.request_subsystem(true, "sftp").await.map_err(|e| {
-        SftpTransferError::Transport(format!("request_subsystem(sftp) failed: {e}"))
-    })?;
-    let sftp = SftpSession::new(channel.into_stream())
-        .await
-        .map_err(|e| SftpTransferError::Transport(format!("sftp handshake failed: {e}")))?;
-    // 放宽协议层每请求超时(默认 10s),避免慢链路下单个 chunk 包就把整段传输打断。
-    sftp.set_timeout(sftp_request_timeout_secs(transfer_timeout));
-
-    // 临时文件路径:目标旁边加后缀,与下载侧同一套命名(`sftp_partial_path`)。
-    // 传输期间远端目标文件**一个字节都不会被动**,中断只会留下一个临时文件。
-    let tmp_path = sftp_partial_path(remote_path);
-
-    let mut remote = sftp
-        .open_with_flags(
-            tmp_path.as_str(),
-            OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
-        )
-        .await
-        .map_err(|e| SftpTransferError::Sftp(format!("sftp open '{tmp_path}' failed: {e}")))?;
-
-    let mut buf = vec![0u8; SFTP_CHUNK_BYTES];
-    let mut total: u64 = 0;
-    let copy_result: Result<(), SftpTransferError> = async {
-        loop {
-            let n = local.read(&mut buf).await.map_err(|e| {
-                SftpTransferError::Sftp(format!("read local file '{local_path}' failed: {e}"))
-            })?;
-            if n == 0 {
-                break;
-            }
-            remote.write_all(&buf[..n]).await.map_err(|e| {
-                SftpTransferError::Sftp(format!("sftp write to '{tmp_path}' failed: {e}"))
-            })?;
-            total += n as u64;
-        }
-        remote
-            .flush()
-            .await
-            .map_err(|e| SftpTransferError::Sftp(format!("sftp flush '{tmp_path}' failed: {e}")))?;
-        remote.shutdown().await.map_err(|e| {
-            SftpTransferError::Sftp(format!("sftp close remote '{tmp_path}' failed: {e}"))
-        })?;
-
-        // 收尾改名 —— 必须在本 sftp 会话关闭前做。
-        //
-        // ⚠️ SFTP 的 rename 语义:标准 `SSH_FXP_RENAME` 在目标已存在时会失败
-        // (OpenSSH 行为),而 russh-sftp **没有** `posix-rename@openssh.com`
-        // 扩展 —— 主工作区的 2.4 与 sidecars 工作区的 2.3 都只有
-        // limits/hardlink/fsync/statvfs(+2.4 的 expand-path),两边一致。
-        // 故先直接 rename:目标不存在时一次成功、**零空窗**;只有「目标已存在」
-        // 才回退到 remove + rename,留一个极小的空窗 —— 仍远好于原先
-        // CREATE|TRUNCATE 的「一中断就把远端原文件截成半截」。
-        if let Err(first) = sftp.rename(tmp_path.as_str(), remote_path).await {
-            // remove 对「目标本就不存在」容错:那说明 rename 是别的原因失败,
-            // 下面这次重试会把真正的错误报出来。
-            let _ = sftp.remove_file(remote_path).await;
-            sftp.rename(tmp_path.as_str(), remote_path)
-                .await
-                .map_err(|e| {
-                    SftpTransferError::Sftp(format!(
-                        "failed to move uploaded file into place '{remote_path}': {e} \
-                        (first rename attempt: {first})"
-                    ))
-                })?;
-        }
-        Ok(())
-    }
-    .await;
-
-    // 失败:清掉远端半截临时文件(目标文件从头到尾没被动过),再把错误返出去。
-    if let Err(e) = copy_result {
-        let _ = sftp.remove_file(tmp_path.as_str()).await;
-        let _ = sftp.close().await; // best-effort
-        drop(handle_guard);
-        return Err(e);
-    }
-
-    let _ = sftp.close().await; // best-effort
-    drop(handle_guard);
-
-    Ok(total)
+    crate::sftp_transfer::upload(session, local_path, remote_path, transfer_timeout).await
 }
 
-/// 传输中途落地的临时文件名:目标旁边加 `.mt-sftp-partial` 后缀。
+/// 在已 acquire 到的 session 上开 SFTP channel,把远程文件下载并**落盘**到本地路径。
 ///
-/// 上传(远端)与下载(本地)共用同一套命名 —— 同目录保证 rename 是同一文件系统
-/// 内的原子改名而非跨盘拷贝,后缀也让用户一眼认出「这是没传完的残留」。
-fn sftp_partial_path(target: &str) -> String {
-    format!("{target}.mt-sftp-partial")
-}
-
-/// 在已 acquire 到的 session 上开 SFTP channel,把远程文件流式下载并**落盘**到本地路径。
-///
-/// 不把内容回传给 caller(避免二进制 base64 + 返回体封顶问题)。先写临时文件
-/// (`<local>.mt-sftp-partial`)再原子 rename,避免下载中途失败留下半截文件;失败时清理临时文件。
+/// 不把内容回传给 caller(避免二进制 base64 + 返回体封顶问题)。多个读请求同时在途
+/// (约 1 MiB 窗口),按偏移顺序写进目标旁的临时文件(`<local>.<pid>-<序号>.mt-sftp-partial`),
+/// 读到 EOF 后再改名替换目标;短读从实际位置补读。失败(含超时取消)删掉临时文件,
+/// 原有的本地目标不受影响。会话锁只在开 channel 时短暂持有。
 ///
 /// 返回写入本地的字节数。错误区分 transport(可 evict 重连)与 SFTP 业务错(不 evict)。
 pub async fn run_sftp_download_on_session(
@@ -1576,84 +1509,7 @@ pub async fn run_sftp_download_on_session(
     local_path: &str,
     transfer_timeout: Duration,
 ) -> Result<u64, SftpTransferError> {
-    use russh_sftp::client::SftpSession;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    // 临时文件路径:目标旁边加后缀,与目标同盘保证 rename 是原子改名而非跨盘拷贝。
-    let tmp_path = sftp_partial_path(local_path);
-
-    let handle_guard = session.lock().await;
-    let channel = handle_guard
-        .channel_open_session()
-        .await
-        .map_err(|e| SftpTransferError::Transport(format!("channel_open_session failed: {e}")))?;
-    channel.request_subsystem(true, "sftp").await.map_err(|e| {
-        SftpTransferError::Transport(format!("request_subsystem(sftp) failed: {e}"))
-    })?;
-    let sftp = SftpSession::new(channel.into_stream())
-        .await
-        .map_err(|e| SftpTransferError::Transport(format!("sftp handshake failed: {e}")))?;
-    // 放宽协议层每请求超时(默认 10s),避免慢链路下单个 chunk 包就把整段传输打断。
-    sftp.set_timeout(sftp_request_timeout_secs(transfer_timeout));
-
-    // 先打开远端文件 —— 远端不存在/无权限是业务错,失败时无需建临时文件。
-    let mut remote = sftp
-        .open(remote_path)
-        .await
-        .map_err(|e| SftpTransferError::Sftp(format!("sftp open '{remote_path}' failed: {e}")))?;
-
-    let mut local = tokio::fs::File::create(&tmp_path).await.map_err(|e| {
-        SftpTransferError::Sftp(format!("cannot create local file '{tmp_path}': {e}"))
-    })?;
-
-    let mut buf = vec![0u8; SFTP_CHUNK_BYTES];
-    let mut total: u64 = 0;
-    let copy_result: Result<(), SftpTransferError> = async {
-        loop {
-            let n = remote.read(&mut buf).await.map_err(|e| {
-                SftpTransferError::Sftp(format!("sftp read '{remote_path}' failed: {e}"))
-            })?;
-            if n == 0 {
-                break;
-            }
-            local.write_all(&buf[..n]).await.map_err(|e| {
-                SftpTransferError::Sftp(format!("write local file '{tmp_path}' failed: {e}"))
-            })?;
-            total += n as u64;
-        }
-        local.flush().await.map_err(|e| {
-            SftpTransferError::Sftp(format!("flush local file '{tmp_path}' failed: {e}"))
-        })?;
-        Ok(())
-    }
-    .await;
-
-    let _ = sftp.close().await; // best-effort
-    drop(handle_guard);
-
-    // 失败:清理半截临时文件后把错误返出去。
-    if let Err(e) = copy_result {
-        drop(local);
-        let _ = tokio::fs::remove_file(&tmp_path).await;
-        return Err(e);
-    }
-
-    // 成功:确保数据落盘后原子 rename 到目标。
-    drop(local);
-    tokio::fs::rename(&tmp_path, local_path)
-        .await
-        .map_err(|e| {
-            // rename 失败也要清掉临时文件,避免污染目录。
-            let tmp = tmp_path.clone();
-            tokio::spawn(async move {
-                let _ = tokio::fs::remove_file(&tmp).await;
-            });
-            SftpTransferError::Sftp(format!(
-                "failed to move downloaded file into place '{local_path}': {e}"
-            ))
-        })?;
-
-    Ok(total)
+    crate::sftp_transfer::download(session, remote_path, local_path, transfer_timeout).await
 }
 
 /// 认证一跳(细节见 `auth.rs`)。
@@ -1775,17 +1631,6 @@ mod tests {
     }
 
     #[test]
-    fn sftp_request_timeout_tracks_transfer_window() {
-        // 协议层每请求超时随外层传输窗口放宽,而非停在默认 10s。
-        assert_eq!(sftp_request_timeout_secs(Duration::from_secs(300)), 300);
-        assert_eq!(sftp_request_timeout_secs(Duration::from_secs(60)), 60);
-        // 下限保护:0 秒窗口至少返 1s,不会出现 0 秒立即超时。
-        assert_eq!(sftp_request_timeout_secs(Duration::from_secs(0)), 1);
-        // 亚秒窗口(被 caller .max(1) 前可能出现)也至少 1s。
-        assert_eq!(sftp_request_timeout_secs(Duration::from_millis(500)), 1);
-    }
-
-    #[test]
     fn append_bounded_output_caps_without_losing_prefix() {
         let mut output = b"abc".to_vec();
         assert!(append_bounded_output(&mut output, b"defgh", 6));
@@ -1893,26 +1738,6 @@ mod tests {
         assert!(!should_disconnect_removed_session(true, 1));
         assert!(!should_disconnect_removed_session(false, 2));
         assert!(!should_disconnect_removed_session(true, 2));
-    }
-
-    /// 临时文件名:上传(远端路径)与下载(本地路径)共用同一后缀,
-    /// 且**永远落在目标同目录**(同文件系统 → rename 是原子改名)。
-    #[test]
-    fn sftp_partial_path_appends_suffix_next_to_target() {
-        assert_eq!(
-            sftp_partial_path("/home/u/.mini-term/pasted/a.png"),
-            "/home/u/.mini-term/pasted/a.png.mt-sftp-partial"
-        );
-        // Windows 本地路径(下载侧)同理:只加后缀,目录部分一字不动。
-        assert_eq!(
-            sftp_partial_path(r"D:\dl\a.zip"),
-            r"D:\dl\a.zip.mt-sftp-partial"
-        );
-        // 无扩展名 / 带空格的目标也只是加后缀。
-        assert_eq!(
-            sftp_partial_path("/tmp/my file"),
-            "/tmp/my file.mt-sftp-partial"
-        );
     }
 
     #[test]
