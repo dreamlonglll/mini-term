@@ -1071,7 +1071,13 @@ mod tests {
             .unwrap();
         assert!(!accepted, "写不进 known_hosts 时不得放行");
         let reason = rejection_of(&client);
-        assert!(reason.starts_with("known_hosts write failed ("), "{reason}");
+        // Windows 读「文件底下的路径」得 NotFound → 当新主机去写 → 写失败;Linux 读它得
+        // ENOTDIR → 直接按读失败拒绝。两种都是 fail closed,要守的是上面的「不放行」。
+        assert!(
+            reason.starts_with("known_hosts write failed (")
+                || reason.starts_with("known_hosts unreadable ("),
+            "{reason}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
