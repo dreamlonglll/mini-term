@@ -79,7 +79,7 @@ tools/promo/build.sh
 | `mt-layout` | 界面布局持久化(`layout.db`,rusqlite):三栏比例 / 每项目分屏树 / 窗口几何。分屏树整棵存 JSON 不拆关系表,理由见模块注释 |
 | `mt-i18n` | 双语文案层。**字典源头是 `locales/*.ts`**（TS 对象字面量，随 Tauri 版下线迁入），`src/dict.rs` 由 `tools/gen_from_ts.mjs` 生成——**禁止手改 dict.rs**，改文案改 locales 后重跑生成器，`tests/consistency.rs` 的对账常量随之更新 |
 | `mt-relay` | 移动端中转桌面侧：出站 WSS 长连、配对、项目快照/增量、对话镜像（`mirror.rs`）、移动端指令写穿 |
-| `mt-ssh` | 共享 SSH 通信层（russh 持久会话池 + SFTP 原语），主程序与 sidecar 共用；密码信封在 `pool::authenticate` 解开 |
+| `mt-ssh` | 共享 SSH 通信层（russh 持久会话池 + SFTP 原语），主程序与 sidecar 共用；建连对齐终端里的系统 ssh：`ssh_config.rs` 读 `~/.ssh/config`（含 ProxyJump）、`auth.rs` 依次试显式私钥 / ssh-agent / 默认私钥 / 密码、`known_hosts.rs` 认通配与 `@revoked`、`transport.rs` 建连整段限时且超时掐断传输；密码信封在 `pool::authenticate` 解开 |
 | `mt-remote` | SSH 远程项目的服务层：SFTP 文件树 / 读写 / 上传下载 / 删除、远程 AI 会话扫描、远程 pane 启动预检。自持小 tokio 运行时，入口全是同步阻塞函数（调用方丢 background executor）。不依赖 gpui |
 | `mt-secret` | SSH 密码封存：AES-256-GCM 信封 + `credential.key` 主密钥（Windows DPAPI / Unix 0600）。在 mt-core 之上，经 mt-ssh 进入 sidecar，依赖表只许 mt-core/ring/base64/serde/serde_json/zeroize（Windows 另加 DPAPI 用的 windows-sys） |
 | `mt-usage` | 用量统计：会话轮次解析 / SQLite 账本 / 聚合 / 计价；models.dev 价格表的归一 / 24h 磁盘缓存 / 降级链路（`models_dev.rs`，拉网那一跳由 mt-app 的 `pricing.rs` 注入） |
@@ -128,7 +128,7 @@ reader 线程读 PTY 字节直接喂 `mt-terminal` 的 VT 状态机，UI 按帧�
 - **封存点唯一**：`AppStore::upsert_ssh_connection`（`mt-app::secrets::stored_password`，密码没改就沿用旧信封——信封每次 nonce 不同，换了会让 `ssh_session_identity_changed` 误判身份变了、白白作废池里的 session）。`ConfigStore::save` 另有兜底封存挡「谁忘了封」
 - **解封点三处**：编辑表单回填、终端自动填充（`pane::connect_ssh` / `mt_remote::prepare_remote_launch`）、`mt-ssh::pool::authenticate`——最后一处是主程序与三个 sidecar 共用的，所以 sidecar 不需要任何自己的解封代码
 - **迁移**：`ConfigStore::load` 把存量明文一次性封存并回写库，随后 `VACUUM` + `wal_checkpoint(TRUNCATE)`（SQLite 更新一行不会抹掉页内旧 cell 字节，WAL 旧帧里也躺着明文页），再做这一代 `.bak`；`.pre-sqlite` 存档只改密码字段
-- **密钥只由主程序生成**（`Vault::open_or_create`），sidecar 走 `mt_secret::global()` 懒加载：在 `mt_core::config_json_path()` 同目录**只读**打开，**刻意不认 `MT_APP_DATA_DIR`**——sidecar 读的投影本来就不认它，密钥跟着走就会拿 dev 实例的钥匙开装机版的信封。主程序在 `ConfigStore::load` 里 `mt_secret::install` 自己那把（先到先得），dev 隔离目录因此各有各的钥匙
+- **密钥只由主程序生成**（`Vault::open_or_create`），sidecar 走 `mt_secret::global()` 懒加载：在 `mt_core::config_json_path()` 同目录**只读**打开，**刻意不认 `MT_APP_DATA_DIR`**——sidecar 读的投影本来就不认它，密钥跟着走就会拿 dev 实例的钥匙开装机版的信封。主程序在 `ConfigStore::load` 里 `mt_secret::install` 自己那把（先到先得），dev 隔离目录因此各有各的钥匙。常驻的 sidecar daemon 懒加载的钥匙解不开（`Undecryptable`）时会重读一次密钥文件，文件确实换过（主程序重建了 `credential.key`）才换上新钥匙再解一次；`install` 登记的钥匙从不重载
 - **降级口径**：`reveal` 对不带 `enc:` 前缀的值原样放行（升级窗口期 sidecar 先读到旧明文投影也能连）；解不开返回 `Undecryptable`，UI 提示「请重新填写密码」，会话池报 `password unavailable`，**绝不把密文当密码送去认证**。凭据库开不起来时加载不失败，密码保持原样并在日志里喊
 - **中转桌面密钥同一套**：`mobileRelay.desktopKey` 与 SSH 密码同一把钥匙、同一迁移时机（`ConfigStore::load`）与兜底封存；封存点 `AppStore::set_mobile_relay_endpoint`，解封点 `mobile_relay::install`（建连）与 `mobile_panel::open`（回填），交给 mt-relay 的是明文。空串 = 未填不封存；解不开按未填写处理（中转回「密钥不正确」后停住）并在面板就地标红
 - **威胁模型（诚实版）**：防的是配置文件被拷走/同步/被别的账户读到；**不防**同一账户下的本机进程（主程序自己就能无提示解密），与浏览器存密码同一档

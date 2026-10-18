@@ -308,6 +308,10 @@ pub struct SshAssocOutcome {
     /// 启用时的项目能力令牌(已由 [`AppStore::set_project_ssh_assoc`] 落盘,
     /// 这里带回只为调用方需要时展示/排查)。
     pub project_token: Option<String>,
+    /// 本实例的数据目录不是 sidecar 读的那个(dev 实例):注册器的一切文件改动都跳过了,
+    /// 关联只存进本实例配置(见 `mt_ai::ssh_registry::projection_reaches_sidecar`)。
+    /// 为 true 时提示框补一句说明,且不走静默。
+    pub registry_skipped: bool,
     /// 注册器返回的中文提示(与装机版一字不差,不走 mt-i18n)。
     /// ⚠️ **当前没有读者**,与原版一致:`EnableSshToolsResult` 也带 `message`,
     /// 而 `SshAssocModal.tsx` 只取 `projectToken` —— 提示文案是弹窗自己按

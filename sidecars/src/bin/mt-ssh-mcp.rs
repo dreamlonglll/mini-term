@@ -61,15 +61,15 @@ struct SshExecArgs {
     /// 在远程主机上执行的命令。
     #[schemars(description = "The command to run on the remote host.")]
     command: String,
-    /// 可选:超时秒数,超时关闭 channel(不影响池里 session)。缺省 60。
+    /// 可选:超时秒数(整个请求,含建连),超时关闭 channel(不影响池里 session)。缺省 60。
     #[schemars(
-        description = "Optional timeout in seconds; the exec channel is closed if it exceeds this. Defaults to 60."
+        description = "Optional timeout in seconds for the whole call, connecting included; the exec channel is closed if it exceeds this. Defaults to 60."
     )]
     #[serde(default)]
     timeout_secs: Option<u64>,
-    /// 可选:远程工作目录,非空时命令前缀 `cd <cwd> && `。
+    /// 可选:远程工作目录,非空时命令前缀 `cd <cwd> && `(按 POSIX shell 需要时加引号)。
     #[schemars(
-        description = "Optional remote working directory; the command is prefixed with `cd <cwd> && ` when set."
+        description = "Optional remote working directory; the command is prefixed with `cd <cwd> && ` when set (quoted for a POSIX shell when needed)."
     )]
     #[serde(default)]
     cwd: Option<String>,
@@ -97,16 +97,24 @@ struct SshExecResult {
 /// - 超时路径:旧实现的 timeout 会取消收集 future、拿不到部分输出,返回空
 ///   stdout/stderr —— 这里对应地**丢弃**已收集缓冲,保持返回体一致;
 /// - 正常路径:lossy UTF-8 + 100KB cap + truncated 标记。
+///
+/// 远端以信号终止时(`exitCode` 已是 128+n),stderr 末尾补一行信号说明。
 fn finalize_collected(
     stdout_buf: Vec<u8>,
     stderr_buf: Vec<u8>,
     outcome: &ssh_service::ExecOutcome,
 ) -> SshExecResult {
-    let (stdout_buf, stderr_buf) = if outcome.timed_out {
+    let (stdout_buf, mut stderr_buf) = if outcome.timed_out {
         (Vec::new(), Vec::new())
     } else {
         (stdout_buf, stderr_buf)
     };
+    if let Some(note) = outcome.signal_note() {
+        if !stderr_buf.is_empty() && !stderr_buf.ends_with(b"\n") {
+            stderr_buf.push(b'\n');
+        }
+        stderr_buf.extend_from_slice(format!("[mt-ssh-mcp] {note}\n").as_bytes());
+    }
     let (stdout, out_trunc) = ssh_service::cap_output(
         &String::from_utf8_lossy(&stdout_buf),
         ssh_service::OUTPUT_CAP_BYTES,
@@ -290,6 +298,18 @@ impl SshMcp {
         )
         .await
         .map_err(to_mcp_error)?;
+
+        // 时限在连接阶段就用完:命令根本没跑,按连接失败报错(与 acquire 失败同口径),
+        // 不伪装成「跑了但超时」的结果。
+        if outcome.timed_out && outcome.not_started {
+            let secs = timeout_secs
+                .unwrap_or(ssh_service::DEFAULT_TIMEOUT_SECS)
+                .max(1);
+            return Err(McpError::internal_error(
+                ssh_service::not_started_timeout_message(secs, &connection),
+                None,
+            ));
+        }
 
         let exec_result = finalize_collected(stdout_buf, stderr_buf, &outcome);
 
@@ -492,12 +512,18 @@ mod tests {
 
     // --- finalize_collected:回调收集 → MCP 返回结构(等价旧 finalize_outcome) ---
 
+    fn outcome(exit_code: Option<i32>, timed_out: bool) -> ExecOutcome {
+        ExecOutcome {
+            exit_code,
+            timed_out,
+            not_started: false,
+            signal: None,
+        }
+    }
+
     #[test]
     fn finalize_collected_passes_through_normal_exec() {
-        let outcome = ExecOutcome {
-            exit_code: Some(0),
-            timed_out: false,
-        };
+        let outcome = outcome(Some(0), false);
         let r = finalize_collected(b"hi\n".to_vec(), b"warn\n".to_vec(), &outcome);
         assert_eq!(r.stdout, "hi\n");
         assert_eq!(r.stderr, "warn\n");
@@ -508,10 +534,7 @@ mod tests {
 
     #[test]
     fn finalize_collected_marks_truncated_when_stdout_overflows() {
-        let outcome = ExecOutcome {
-            exit_code: Some(0),
-            timed_out: false,
-        };
+        let outcome = outcome(Some(0), false);
         let r = finalize_collected(
             vec![b'a'; ssh_service::OUTPUT_CAP_BYTES + 10],
             Vec::new(),
@@ -526,16 +549,33 @@ mod tests {
     fn finalize_collected_timed_out_drops_output_and_exit_code() {
         // 超时路径:旧实现拿不到部分输出(future 被取消),返回空 stdout/stderr;
         // 回调化后已收集的缓冲也要对应丢弃,保持返回体逐字节一致。
-        let outcome = ExecOutcome {
-            exit_code: None,
-            timed_out: true,
-        };
+        let outcome = outcome(None, true);
         let r = finalize_collected(b"partial".to_vec(), b"errs".to_vec(), &outcome);
         assert!(r.timed_out);
         assert_eq!(r.exit_code, None);
         assert_eq!(r.stdout, "");
         assert_eq!(r.stderr, "");
         assert!(!r.truncated);
+    }
+
+    #[test]
+    fn finalize_collected_appends_signal_note_to_stderr() {
+        // 远端以信号终止:exitCode 是 service 映射好的 128+n,stderr 末尾补一行说明。
+        let outcome = ExecOutcome {
+            signal: Some(mt_sidecars::ssh_service::RemoteSignal {
+                name: "TERM".into(),
+                core_dumped: false,
+                error_message: String::new(),
+            }),
+            ..outcome(Some(143), false)
+        };
+        let r = finalize_collected(b"out".to_vec(), b"partial line".to_vec(), &outcome);
+        assert_eq!(r.exit_code, Some(143));
+        assert_eq!(
+            r.stderr,
+            "partial line\n[mt-ssh-mcp] remote command terminated by signal SIGTERM; exit code 143\n"
+        );
+        assert_eq!(r.stdout, "out");
     }
 
     // --- SshTransferResult 序列化(camelCase) -----------------------------

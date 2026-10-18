@@ -6,7 +6,7 @@ use mt_config::SshConnection;
 use mt_ssh::{SftpHandle, SftpNodeKind};
 
 use super::{
-    FileConflictStrategy, LOCAL_TRANSFER_SEQUENCE, PASTE_UPLOAD_REQUEST_TIMEOUT,
+    FileConflictStrategy, LOCAL_TRANSFER_SEQUENCE, PASTE_UPLOAD_FINISH_GRACE,
     PASTE_UPLOAD_TOTAL_TIMEOUT, join_posix, keep_both_name, keep_both_remote_path, open_sftp,
     open_sftp_with_session, paste_file_name, posix_relative, remote_home, resolve_paste_dir,
     split_posix_leaf, state, valid_remote_name, validate_remote_dir_under_root,
@@ -1175,7 +1175,10 @@ pub fn upload_paste(
     st.block_on(async move {
         let (session, sftp) = open_sftp_with_session(st, conn).await?;
 
-        // 整段(建目录 + 上传)套一层墙钟上限:见 PASTE_UPLOAD_TOTAL_TIMEOUT。
+        // 整段(建目录 + 上传)套一层墙钟上限:见 PASTE_UPLOAD_TOTAL_TIMEOUT。上传本身交给
+        // 池在稍早的时限前收尾(见 PASTE_UPLOAD_FINISH_GRACE),外层只作兜底。
+        let upload_deadline =
+            tokio::time::Instant::now() + PASTE_UPLOAD_TOTAL_TIMEOUT - PASTE_UPLOAD_FINISH_GRACE;
         let result = tokio::time::timeout(PASTE_UPLOAD_TOTAL_TIMEOUT, async {
             let home = remote_home(st, &sftp, &conn.id).await?;
             let dir = resolve_paste_dir(project_path, &home, dest_dir)?;
@@ -1197,14 +1200,19 @@ pub fn upload_paste(
             }
 
             let remote_path = join_posix(&dir, &file_name);
-            mt_ssh::run_sftp_upload_on_session(
-                &session,
-                local_path,
-                &remote_path,
-                PASTE_UPLOAD_REQUEST_TIMEOUT,
-            )
-            .await
-            .map_err(|e| format!("上传到远程失败: {}", e.message()))?;
+            mt_ssh::run_sftp_upload_until(&session, local_path, &remote_path, upload_deadline)
+                .await
+                .map_err(|e| {
+                    if e.is_timeout() {
+                        format!(
+                            "上传到远程超时({}s): {}",
+                            PASTE_UPLOAD_TOTAL_TIMEOUT.as_secs(),
+                            e.message()
+                        )
+                    } else {
+                        format!("上传到远程失败: {}", e.message())
+                    }
+                })?;
             session.touch();
             Ok(remote_path)
         })

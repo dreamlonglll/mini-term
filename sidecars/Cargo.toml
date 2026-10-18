@@ -3,7 +3,37 @@ name = "mt-sidecars"
 # 0.4.10:传输护栏从只拦 config.json 扩到整个数据目录(config.db / 备份 / WAL /
 # credential.key 等,上传下载都拦);会话池的 known_hosts 校验认哈希条目、读失败即拒绝、
 # 已登记其它算法时不再当新主机追加(旧 daemon 仍按旧规则放行)。
-version = "0.4.10"
+# 0.4.11:mt-ssh-cli 的 CLI / daemon / IPC 传输层 —— 冷启动拉起 daemon 不再泄漏调用方的
+# 标准句柄(`$(…)` / `| tail` / WSL interop 不再等到 daemon 空闲自退)、daemon 工作目录改为
+# exe 所在目录(不再锁住项目目录)、daemon 的 stderr 落数据目录下的 mt-ssh-cli-daemon.log;
+# 版本握手只换代更旧的 daemon(更新且协议不同 → 降级 one-shot,不再与 dev 实例互踢),
+# shutdown 改为停止接新连接、等在途请求(上限 60s)后再退出;IPC 客户端校验端点属于
+# 当前用户(Windows 查管道服务端进程的 token SID,Unix 查 peer uid);WSL 里传
+# `/tmp/x` 这类 POSIX 绝对路径不再错位成 `D:\tmp\x`。
+# 同属 0.4.11 的 service 层:`--timeout` 覆盖整个请求(含建连 / 认证,连接阶段到点 exit 124
+# 并说明命令没启动,取消令牌也能打断建连);exec 只在开 channel 时持会话锁(同连接并发、
+# 不再全局串行),开 channel 10s 短超时 → 精确淘汰 session 后换新连接重试;exec 发出后立即
+# 发 EOF;服务端拒绝 exec 立即报错,远端信号映射成 128+n 并在 stderr 说明;`--cwd` 按需加
+# 引号(保留 `~/` 展开);审计脱敏补 --token / --api-key / --secret 等、sshpass、凭据类
+# 环境变量与 Authorization 头,只记可能已执行的命令;传输护栏识别 `\\localhost\C$`、
+# `\\?\`、WSL `\\wsl.localhost\…\mnt\c` 等别名并按装机版数据目录名纵深拦截;能力令牌报错
+# 分类(配置不存在 / 读不了 / 令牌对不上 / 范围为空),fail closed 不变。
+# 同属 0.4.11、经 mt-ssh / mt-secret 链进三个 sidecar 的改动:建连对齐终端里的系统 ssh(读
+# `~/.ssh/config` 含 ProxyJump;认证依次试连接私钥 / ssh-agent / 默认私钥 / 密码,私钥读不了
+# 就回落,公钥尝试有上限);池内建连整段 20s 上限(到点按连接错误 exit 2,报错写明卡在哪个
+# 阶段);认证失败后同一连接冷却 30s;补 ecdh-nistp / aes128-gcm / hmac-sha1 兼容算法;
+# known_hosts 认通配 / 否定 / @revoked。SFTP 传输只在开 channel 时持会话锁,下载约 1 MiB
+# 窗口流水线,上传跟随软链、保留权限与属主(保不住时像 scp 一样原地覆盖写)、posix-rename
+# 原子替换或备份 + 回滚。daemon 缓存的密钥在 credential.key 被主程序重建后解不开时重读。
+# 同属 0.4.11 的评审修复:以管理员身份运行时 CLI 不连也不拉起 daemon、`daemon` 子命令提权时
+# 拒绝启动(提权 daemon 会被同用户的普通权限进程借去绕过 UAC);Git Bash 改写过的 exec 命令 /
+# `--cwd` / 远端路径按用法错误拒绝并教写法;管道核验加 owner SID;端点拒绝访问时不拉起、
+# 直接降级;日志轮转持文件锁;开 channel 超时持锁标记并退役 session,排队的请求不再各耗一次超时。
+# 会话池一侧的评审修复同样链进 sidecar:上传经 sticky 且全局可写目录里的软链时按
+# protected_symlinks 规则把关;同一连接建连单飞,冷却不会被并发绕过;替换 / 回滚在独立任务里跑完,
+# 上传走带时限的 run_sftp_upload_until;ProxyCommand 回落直连并说明;认证途中断网不计冷却;
+# 加固服务器先断开时重连一次只试密码;IdentityFile 指向 .pub 时经 agent 签名;SFTP 开 channel 10s 上限。
+version = "0.4.11"
 description = "mini-term sidecar binaries: miniterm-hook (AI hook), mt-ssh-mcp (SSH MCP server) and mt-ssh-cli (SSH CLI + daemon)"
 edition = "2021"
 
@@ -61,11 +91,15 @@ base64 = "0.22"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "time", "sync", "net"] }
 
 # named pipe 安全描述符（仅当前用户可连）：SID 查询 + SDDL 转换。
+# Win32_System_Pipes：客户端取管道服务端 PID 核验身份（GetNamedPipeServerProcessId）；
+# Win32_System_Console：拉起 daemon 前取标准句柄、清掉可继承位（GetStdHandle）。
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_System_Console",
+    "Win32_System_Pipes",
     "Win32_System_Threading",
 ] }
 

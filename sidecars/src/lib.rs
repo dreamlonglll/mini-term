@@ -8,5 +8,7 @@
 //! SshConnection 类型），这里放仅 sidecar 需要的业务编排（依赖 mt-ssh 会话池）。
 
 pub mod daemon;
+pub mod daemon_log;
+pub mod daemon_spawn;
 pub mod ipc;
 pub mod ssh_service;

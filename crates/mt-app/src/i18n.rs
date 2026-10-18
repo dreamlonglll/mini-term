@@ -813,6 +813,7 @@ const USED_KEYS: &[&str] = &[
     "sshAssoc.allConnections",
     "sshAssoc.cancel",
     "sshAssoc.coveredByGroup",
+    "sshAssoc.devInstanceNote",
     "sshAssoc.disabledMessage",
     "sshAssoc.disabledTitle",
     "sshAssoc.empty",

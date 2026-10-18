@@ -168,40 +168,46 @@ fn scope_desc(scope_len: usize, total_len: usize, group_count: usize) -> String 
 
 /// 三档提示的标题 / 正文 key。**动态 key 必须写成 match**(不能拼字符串):
 /// `t()` 的 debug_assert 与 `i18n.rs` 的 `USED_KEYS` 表都要求 key 是字面量。
+///
+/// dev 实例(`registry_skipped`)正文末尾补一段说明:关联只存进了本实例配置,
+/// 没有生成 / 改写 / 删除任何 SKILL.md —— 否则用户会以为 agent 已经能用了。
 fn outcome_alert(outcome: &SshAssocOutcome, project_name: &str) -> (SharedString, SharedString) {
     let scope = scope_desc(outcome.scope_len, outcome.total_len, outcome.group_count);
-    match (outcome.enabled, outcome.was_enabled) {
+    let (title, message) = match (outcome.enabled, outcome.was_enabled) {
         (true, false) => (
-            t("sshAssoc", "enabledTitle").into(),
+            t("sshAssoc", "enabledTitle"),
             tr!(
                 "sshAssoc",
                 "enabledMessage",
                 name = project_name.to_string(),
                 scope = scope
-            )
-            .into(),
+            ),
         ),
         (true, true) => (
-            t("sshAssoc", "updatedTitle").into(),
+            t("sshAssoc", "updatedTitle"),
             tr!(
                 "sshAssoc",
                 "updatedMessage",
                 name = project_name.to_string(),
                 scope = scope
-            )
-            .into(),
+            ),
         ),
         _ => (
-            t("sshAssoc", "disabledTitle").into(),
+            t("sshAssoc", "disabledTitle"),
             tr!(
                 "sshAssoc",
                 "disabledMessage",
                 name = project_name.to_string(),
                 scope = scope
-            )
-            .into(),
+            ),
         ),
-    }
+    };
+    let message = if outcome.registry_skipped {
+        format!("{message}\n\n{}", t("sshAssoc", "devInstanceNote"))
+    } else {
+        message
+    };
+    (title.into(), message.into())
 }
 
 fn save(state: &Entity<SshAssocPanel>, window: &mut Window, cx: &mut App) {
@@ -687,7 +693,27 @@ mod tests {
             total_len: total,
             group_count: 0,
             project_token: None,
+            registry_skipped: false,
             message: String::new(),
+        }
+    }
+
+    /// dev 实例:三档提示都在正文末尾补上「只存进本实例配置」的说明;正常实例不带。
+    #[test]
+    fn dev_instance_alert_explains_why_no_skill_md_was_written() {
+        let note = t("sshAssoc", "devInstanceNote");
+        for (enabled, was_enabled) in [(true, false), (true, true), (false, true)] {
+            let plain = outcome(enabled, was_enabled, 1, 2);
+            let normal = outcome_alert(&plain, "P").1.to_string();
+            assert!(!normal.contains(note), "{normal}");
+
+            let skipped = SshAssocOutcome {
+                registry_skipped: true,
+                ..outcome(enabled, was_enabled, 1, 2)
+            };
+            let message = outcome_alert(&skipped, "P").1.to_string();
+            assert!(message.starts_with(&normal), "{message}");
+            assert!(message.ends_with(note), "{message}");
         }
     }
 

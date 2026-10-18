@@ -2,8 +2,9 @@
 //! 整块搬来(含块前的段注释),逻辑一行未改。
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 
-use gpui::{Context, Task};
+use gpui::{App, Context, Task};
 use mt_config::{ProjectConfig, SshConnection};
 
 use crate::tree::{PaneState, PaneStatus};
@@ -410,6 +411,10 @@ impl AppStore {
     /// **注册器是阻塞文件 IO**(还要写 home 下的 Codex / Claude 配置),
     /// 全程在 `background_executor` 上,主线程只负责最后那一次 `set_...`。
     ///
+    /// dev 实例(本实例写 `config.json` 投影的目录不是 sidecar 读的那个)由注册器自己
+    /// 识别并跳过一切文件改动,关联照常存进本实例配置;结果里 `registry_skipped = true`,
+    /// 提示框据此补一句说明(这种结果不走静默)。
+    ///
     /// `checked` 是**单勾**的连接(已剔除被整组罩住的那些),`groups` 是整组勾选的组名。
     pub fn apply_ssh_assoc(
         &mut self,
@@ -432,6 +437,7 @@ impl AppStore {
         let project_id = project_id.to_string();
         let project_dir = project.path.clone();
         let existing_token = project.ssh_cli_token.clone();
+        let projection_dir = self.projection_dir();
 
         cx.spawn(async move |this, cx| {
             let outcome = match plan {
@@ -442,26 +448,31 @@ impl AppStore {
                 } => {
                     let dir = project_dir.clone();
                     let token = existing_token.clone();
+                    let projection = projection_dir.clone();
                     let res = cx
                         .background_executor()
-                        .spawn(async move { mt_ai::ssh_registry::enable(&dir, token.as_deref()) })
+                        .spawn(async move {
+                            mt_ai::ssh_registry::enable(&dir, token.as_deref(), &projection)
+                        })
                         .await?;
                     SshAssocOutcome {
                         enabled: true,
                         was_enabled,
-                        silent,
+                        silent: silent && !res.registry_skipped,
                         scope_len,
                         total_len,
                         group_count: groups.len(),
                         project_token: Some(res.project_token),
+                        registry_skipped: res.registry_skipped,
                         message: res.message,
                     }
                 }
                 crate::ssh_conn::AssocPlan::Disable => {
                     let dir = project_dir.clone();
-                    let message = cx
+                    let projection = projection_dir.clone();
+                    let res = cx
                         .background_executor()
-                        .spawn(async move { mt_ai::ssh_registry::disable(&dir) })
+                        .spawn(async move { mt_ai::ssh_registry::disable(&dir, &projection) })
                         .await?;
                     SshAssocOutcome {
                         enabled: false,
@@ -471,7 +482,8 @@ impl AppStore {
                         total_len,
                         group_count: 0,
                         project_token: None,
-                        message,
+                        registry_skipped: res.registry_skipped,
+                        message: res.message,
                     }
                 }
             };
@@ -488,6 +500,48 @@ impl AppStore {
             .map_err(|e| e.to_string())?;
             Ok(Some(outcome))
         })
+    }
+
+    /// 本实例写 `config.json`(给 sidecar 读的 SSH 投影)的目录。
+    fn projection_dir(&self) -> PathBuf {
+        self.config_store
+            .path()
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_default()
+    }
+
+    /// 启动时校正项目里的 SKILL.md(模板升级 / 令牌漂移 / CLI 换了位置):后台跑一次,
+    /// 结果只进日志,不拦启动。
+    ///
+    /// 只看开启了「关联 SSH」且带令牌的**本地**项目 —— 远程 SSH 项目的目录在远端,
+    /// 本机没有它的 SKILL.md。判据与写法全在
+    /// [`mt_ai::ssh_registry::reconcile_skill_files_on_startup`](dev 实例它自己跳过)。
+    pub fn reconcile_ssh_skills_in_background(&self, cx: &App) {
+        let targets: Vec<mt_ai::ssh_registry::SkillReconcileTarget> = self
+            .config
+            .projects
+            .iter()
+            .filter(|project| {
+                project.ssh_mcp_enabled && !crate::ssh_conn::is_remote_project(project)
+            })
+            .filter_map(|project| {
+                let token = project.ssh_cli_token.as_deref()?.trim();
+                (!token.is_empty()).then(|| mt_ai::ssh_registry::SkillReconcileTarget {
+                    project_dir: project.path.clone(),
+                    project_token: token.to_string(),
+                })
+            })
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        let projection_dir = self.projection_dir();
+        cx.background_executor()
+            .spawn(async move {
+                mt_ai::ssh_registry::reconcile_skill_files_on_startup(&targets, &projection_dir);
+            })
+            .detach();
     }
 
     // =======================================================================

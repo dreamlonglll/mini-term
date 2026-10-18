@@ -2467,6 +2467,10 @@ fn main() {
         // 差的只有 GPU 那一帧,于是收在这里。
         startup_trace::mark("setup exit (window opened)");
 
+        // 项目里的 SKILL.md 对齐当前模板 / 令牌 / CLI 位置:后台跑一次,只进日志,
+        // 不拦启动(dev 实例由注册器自己跳过)。
+        store.read(cx).reconcile_ssh_skills_in_background(cx);
+
         // 帧剖析叠层(度量工具)。挂在窗口建好之后:叠层状态住在 `Window` 上,
         // 不是 App 级的。`MT_FRAME_OVERLAY` 没设时这一行什么都不做。
         #[cfg(feature = "frame-profiler")]

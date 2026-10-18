@@ -6,6 +6,11 @@
 //! - macOS/Linux:Unix domain socket(`$XDG_RUNTIME_DIR` 优先,回退 config.json
 //!   同目录),权限 0600。
 //!
+//! 反方向同样要核验:客户端连上后先确认**服务端进程属于当前用户**再收发任何数据
+//! (见 [`connect`])。上面的 ACL / 0600 只挡得住「别的用户连我的 daemon」,挡不住
+//! 「别的用户抢先占住端点冒充 daemon」—— 管道名全局可见、用户 SID 也不是秘密,
+//! 冒充者能看到 agent 的命令与能力令牌,还能往 agent 上下文里塞伪造的输出和退出码。
+//!
 //! 协议:newline-delimited JSON 帧(serde camelCase,`v` 字段版本号)。
 //! - 连接建立后 daemon 先发 `{type:"hello", version, protocolVersion, pid}`;
 //! - 请求(CLI→daemon,单行):`{v:2, op, projectToken?, connection?, ...}`;
@@ -102,6 +107,11 @@ pub enum ServerFrame {
         /// exec:是否超时。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timed_out: Option<bool>,
+        /// exec:超时发生在远程命令启动之前(建连 / 认证 / 开 channel 阶段),命令没有
+        /// 执行(0.4.11 起)。只在为 true 时出现 —— 与 `activeRequests` 同样是加字段不升
+        /// 协议版本:旧 CLI 忽略它,照旧按普通超时打印。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        not_started: Option<bool>,
         /// upload/download:传输字节数。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bytes: Option<u64>,
@@ -111,6 +121,12 @@ pub enum ServerFrame {
         /// status:池内 session 数。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sessions: Option<usize>,
+        /// status:除这条 status 请求自身外,daemon 手上仍在处理的连接数(0.4.11 起)。
+        ///
+        /// 加字段不升协议版本:旧 CLI 解码时忽略不认识的字段,新 CLI 读旧 daemon 的
+        /// 回复得到 `None`。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        active_requests: Option<usize>,
     },
     /// 失败终帧。message 绝不含密码(service 层同一纪律)。
     Error { message: String },
@@ -122,20 +138,24 @@ impl ServerFrame {
         ServerFrame::Result {
             exit_code: None,
             timed_out: None,
+            not_started: None,
             bytes: None,
             connections: None,
             sessions: None,
+            active_requests: None,
         }
     }
 
-    /// exec 的 result 终帧。
-    pub fn result_exec(exit_code: Option<i32>, timed_out: bool) -> Self {
+    /// exec 的 result 终帧。`not_started` 只在为 true 时上线(见字段注释)。
+    pub fn result_exec(exit_code: Option<i32>, timed_out: bool, not_started: bool) -> Self {
         ServerFrame::Result {
             exit_code,
             timed_out: Some(timed_out),
+            not_started: not_started.then_some(true),
             bytes: None,
             connections: None,
             sessions: None,
+            active_requests: None,
         }
     }
 
@@ -144,9 +164,11 @@ impl ServerFrame {
         ServerFrame::Result {
             exit_code: None,
             timed_out: None,
+            not_started: None,
             bytes: Some(bytes),
             connections: None,
             sessions: None,
+            active_requests: None,
         }
     }
 
@@ -155,20 +177,24 @@ impl ServerFrame {
         ServerFrame::Result {
             exit_code: None,
             timed_out: None,
+            not_started: None,
             bytes: None,
             connections: Some(connections),
             sessions: None,
+            active_requests: None,
         }
     }
 
-    /// status 的 result 终帧。
-    pub fn result_sessions(sessions: usize) -> Self {
+    /// status 的 result 终帧:池内 session 数 + 其它仍在处理的连接数。
+    pub fn result_status(sessions: usize, active_requests: usize) -> Self {
         ServerFrame::Result {
             exit_code: None,
             timed_out: None,
+            not_started: None,
             bytes: None,
             connections: None,
             sessions: Some(sessions),
+            active_requests: Some(active_requests),
         }
     }
 }
@@ -292,32 +318,196 @@ unsafe fn libc_getuid() -> u32 {
 pub trait IpcStream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> IpcStream for T {}
 
-/// 连接到 daemon 端点。失败返回 io::Error(caller 据此走自拉起/降级)。
-pub async fn connect(endpoint: &str) -> std::io::Result<Box<dyn IpcStream>> {
+/// Windows `ERROR_PIPE_BUSY`:管道的所有实例都已连上客户端,暂时没有空闲实例。
+#[cfg(windows)]
+const ERROR_PIPE_BUSY: i32 = 231;
+
+/// Windows `ERROR_ACCESS_DENIED`:管道在,但它的安全描述符不让本进程连。
+#[cfg(windows)]
+const ERROR_ACCESS_DENIED: i32 = 5;
+
+/// [`connect`] 的失败分类。三类的处置截然不同,调用方必须区分。
+#[derive(Debug)]
+pub enum ConnectError {
+    /// 端点上没有可连的服务端(不存在 / 一直忙)。调用方可以自拉起 daemon。
+    Unreachable(std::io::Error),
+    /// 端点在,但拒绝本进程连接(Windows `ERROR_ACCESS_DENIED`、Unix `EACCES`):它被一个
+    /// 本进程连不上的服务端占着 —— 别的账户建的管道 / socket,或安全描述符不放行本进程
+    /// (完整性级别、受限令牌)。连不上,自拉起也没用(端点被占着,新 daemon 绑不上)。
+    Denied(std::io::Error),
+    /// 连上了,但服务端进程不属于当前用户 —— 或者核验链本身断了,同样按不可信处理。
+    /// 绝不能往这条连接上发请求;自拉起也没用(端点被占着,新 daemon 绑不上)。
+    Untrusted(String),
+}
+
+/// 打开端点的 io 错误是不是「端点在、但不让本进程连」。
+fn is_access_denied(error: &std::io::Error) -> bool {
     #[cfg(windows)]
     {
-        use tokio::net::windows::named_pipe::ClientOptions;
-        // ERROR_PIPE_BUSY(231):所有实例都在忙 —— daemon 每 accept 一个连接就
-        // 立即补一个新实例,忙窗口极短,小退避重试几次即可。
-        const ERROR_PIPE_BUSY: i32 = 231;
-        let mut last_err = None;
-        for _ in 0..5 {
-            match ClientOptions::new().open(endpoint) {
-                Ok(client) => return Ok(Box::new(client)),
-                Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) => {
-                    last_err = Some(e);
-                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                }
-                Err(e) => return Err(e),
+        error.raw_os_error() == Some(ERROR_ACCESS_DENIED)
+    }
+    #[cfg(not(windows))]
+    {
+        error.kind() == std::io::ErrorKind::PermissionDenied
+    }
+}
+
+/// 把打开端点失败的 io 错误分进 [`ConnectError::Denied`] / [`ConnectError::Unreachable`]。
+fn classify_open_error(error: std::io::Error) -> ConnectError {
+    if is_access_denied(&error) {
+        ConnectError::Denied(error)
+    } else {
+        ConnectError::Unreachable(error)
+    }
+}
+
+impl ConnectError {
+    /// 所有管道实例都在忙(仅 Windows)。端点确实被某个服务端持有 —— 高并发瞬间,
+    /// 或 daemon 正在优雅退出、已不再补监听实例 —— 此时拉起新 daemon 也绑不上。
+    pub fn is_busy(&self) -> bool {
+        #[cfg(windows)]
+        {
+            matches!(self, ConnectError::Unreachable(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY))
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+}
+
+impl std::fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConnectError::Unreachable(e) => write!(f, "{e}"),
+            ConnectError::Denied(e) => write!(f, "endpoint refused this process: {e}"),
+            ConnectError::Untrusted(reason) => {
+                write!(f, "endpoint is not served by the current user: {reason}")
             }
         }
-        Err(last_err.unwrap_or_else(|| std::io::Error::other("pipe busy")))
+    }
+}
+
+/// 连接到 daemon 端点,并在收发任何数据之前核验服务端属于当前用户。
+///
+/// 核验不过返回 [`ConnectError::Untrusted`],连接随即丢弃 —— 请求帧里带着能力令牌,
+/// 一个字节都不能发给冒充者。
+pub async fn connect(endpoint: &str) -> Result<Box<dyn IpcStream>, ConnectError> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use tokio::net::windows::named_pipe::ClientOptions;
+        // ClientOptions 默认带 SECURITY_IDENTIFICATION:服务端最多只能「识别」我们,
+        // 冒充不了我们的令牌去提权;剩下的风险(看请求、伪造响应)靠下面的身份核验堵。
+        let mut busy_retries = 0;
+        let mut verify_retried = false;
+        loop {
+            match ClientOptions::new().open(endpoint) {
+                Ok(client) => {
+                    let pipe = client.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+                    match windows_security::verify_pipe_server(pipe) {
+                        Ok(()) => return Ok(Box::new(client)),
+                        // 核验失败先断开重来一次:daemon 恰在此刻退出(进程已没、实例刚断)
+                        // 也会让核验链断掉。重连就分得清 —— 真退出了会变成「连不上」,
+                        // 别的用户占着则再次核验失败。
+                        Err(_) if !verify_retried => {
+                            verify_retried = true;
+                            drop(client);
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
+                        Err(reason) => return Err(ConnectError::Untrusted(reason)),
+                    }
+                }
+                // 所有实例都在忙 —— daemon 每 accept 一个连接就立即补一个新实例,忙窗口
+                // 极短,小退避重试几次即可。
+                Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) && busy_retries < 4 => {
+                    busy_retries += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                Err(e) => return Err(classify_open_error(e)),
+            }
+        }
     }
     #[cfg(unix)]
     {
-        let stream = tokio::net::UnixStream::connect(endpoint).await?;
+        let stream = tokio::net::UnixStream::connect(endpoint)
+            .await
+            .map_err(classify_open_error)?;
+        verify_socket_peer(&stream).map_err(ConnectError::Untrusted)?;
         Ok(Box::new(stream))
     }
+}
+
+/// 服务端身份核验的判定规则(纯函数,两平台共用)。
+///
+/// 核验链断在哪一步都 fail closed:取不到自己的身份、取不到对端的身份、两边不同,
+/// 一律判不可信;只有两边都取到且相同才放行。身份的相等语义由 `T` 给出
+/// (Windows 是 `EqualSid`,Unix 是 uid 相等)。
+pub(crate) fn judge_peer_identity<T: PartialEq>(
+    own: Result<T, String>,
+    peer: Result<T, String>,
+) -> Result<(), String> {
+    let own = own.map_err(|e| format!("cannot determine the current user: {e}"))?;
+    let peer = peer.map_err(|e| format!("cannot verify the process serving the endpoint: {e}"))?;
+    if own == peer {
+        Ok(())
+    } else {
+        Err("the process serving the endpoint belongs to another user".to_string())
+    }
+}
+
+/// Windows 管道服务端核验的判定规则(纯函数):`process` 是创建这个管道实例的进程的用户,
+/// `owner` 是管道对象的 owner,两项都必须是当前用户才放行。
+///
+/// 只看 `process` 不够:它以 `GetNamedPipeServerProcessId` 给的 PID 为锚,建管道的进程退出、
+/// 实例句柄还活在别处时,PID 可能被回收给当前用户的某个进程,核验就会误判成可信。`owner` 是
+/// 管道对象自己的属性,创建时就定了 —— 别的账户建的管道 owner 是它自己,改成我们的 SID 要
+/// `SeRestorePrivilege`。任何一步取不到都 fail closed。
+#[cfg(any(windows, test))]
+pub(crate) fn judge_pipe_server<T: PartialEq>(
+    own: Result<T, String>,
+    process: Result<T, String>,
+    owner: Result<T, String>,
+) -> Result<(), String> {
+    let own = own.map_err(|e| format!("cannot determine the current user: {e}"))?;
+    judge_peer_identity(Ok(&own), process.as_ref().map_err(String::clone))?;
+    match owner {
+        Err(e) => Err(format!("cannot read the owner of the endpoint: {e}")),
+        Ok(owner) if owner != own => Err("the endpoint is owned by another account".to_string()),
+        Ok(_) => Ok(()),
+    }
+}
+
+/// 本进程是否以提权(管理员)令牌运行。Unix 不涉及(没有「同一用户、两种权限」的拆分令牌),
+/// 恒为 `Ok(false)`。
+///
+/// mt-ssh-cli 据此决定能不能用 daemon:提权的 daemon 会被同一用户的普通权限进程借去以管理员
+/// 身份读写本机文件(见 `mt-ssh-cli` 的 `daemon_blocked_by_elevation`)。
+pub fn current_process_elevated() -> Result<bool, String> {
+    #[cfg(windows)]
+    {
+        windows_security::current_process_is_elevated()
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(false)
+    }
+}
+
+/// Unix:对端 socket 的 uid 必须是当前用户。
+///
+/// `peer_cred` 是内核给的(Linux `SO_PEERCRED` / macOS `getpeereid`),记录的是服务端
+/// `listen` 时的凭据,对端伪造不了。socket 回退路径落在 /tmp 时别的用户能抢先放一个
+/// 同名 socket,这里就是那道闸。
+#[cfg(unix)]
+pub(crate) fn verify_socket_peer(stream: &tokio::net::UnixStream) -> Result<(), String> {
+    // SAFETY: getuid 没有参数、不会失败。
+    let own: Result<u32, String> = Ok(unsafe { libc_getuid() });
+    let peer = stream
+        .peer_cred()
+        .map(|cred| cred.uid())
+        .map_err(|e| format!("peer credentials unavailable: {e}"));
+    judge_peer_identity(own, peer)
 }
 
 // ---------------------------------------------------------------------------
@@ -326,66 +516,316 @@ pub async fn connect(endpoint: &str) -> std::io::Result<Box<dyn IpcStream>> {
 
 #[cfg(windows)]
 pub mod windows_security {
-    //! 用 SDDL 构造「仅当前用户 GENERIC_ALL」的 security descriptor,
-    //! 供 named pipe server 端限制连接方(spec §2 安全边界)。
+    //! Windows 侧的身份与管道安全:
+    //! - 用 SDDL 构造「owner 与唯一授权都是当前用户」的 security descriptor,供 named pipe
+    //!   server 端限制连接方(spec §2 安全边界);
+    //! - 客户端反向核验管道服务端进程的用户 SID 与管道对象的 owner([`verify_pipe_server`]),
+    //!   防别的用户抢先建同名管道冒充 daemon;
+    //! - 本进程是否提权([`current_process_is_elevated`]):提权时 CLI 不用 daemon。
 
     use std::ffi::c_void;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 
-    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, HANDLE};
+    use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS, HANDLE, PSID};
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-        SDDL_REVISION_1,
+        GetSecurityInfo, SDDL_REVISION_1, SE_KERNEL_OBJECT,
     };
-    use windows_sys::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    use windows_sys::Win32::Security::{
+        CopySid, EqualSid, GetLengthSid, GetTokenInformation, IsValidSid, TokenElevation,
+        TokenUser, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, TOKEN_ELEVATION, TOKEN_QUERY,
+        TOKEN_USER,
+    };
+    use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    /// 自持缓冲的 SID 副本。
+    ///
+    /// SID 末尾是 `u32` 子权限数组,按 `u32` 缓冲保存才保证交给 Win32 时对齐;
+    /// 相等比较走 `EqualSid`。
+    pub struct OwnedSid {
+        words: Vec<u32>,
+    }
+
+    impl OwnedSid {
+        /// 从 Win32 给出的 SID 指针拷一份。
+        ///
+        /// # Safety
+        /// `sid` 必须指向一个在本调用期间有效的 SID。
+        unsafe fn copy_from(sid: PSID) -> Result<Self, String> {
+            if IsValidSid(sid) == 0 {
+                return Err("invalid SID".into());
+            }
+            let len = GetLengthSid(sid);
+            let mut words = vec![0u32; (len as usize).div_ceil(4)];
+            if CopySid(len, words.as_mut_ptr().cast(), sid) == 0 {
+                return Err(format!(
+                    "CopySid failed: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            Ok(Self { words })
+        }
+
+        /// 从字符串形式(`S-1-5-18` 等)构造,测试里借它造一个「别的用户」。
+        #[cfg(test)]
+        pub(crate) fn from_string_sid(text: &str) -> Result<Self, String> {
+            use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
+
+            let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+            let mut sid: PSID = std::ptr::null_mut();
+            // SAFETY: wide 以 NUL 结尾;成功时 sid 由系统 LocalAlloc,拷完即释放。
+            unsafe {
+                if ConvertStringSidToSidW(wide.as_ptr(), &mut sid) == 0 {
+                    return Err(format!(
+                        "ConvertStringSidToSidW failed: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+                let owned = Self::copy_from(sid);
+                LocalFree(sid);
+                owned
+            }
+        }
+
+        fn as_psid(&self) -> PSID {
+            self.words.as_ptr() as PSID
+        }
+
+        /// 字符串形式(如 `S-1-5-21-...`)。
+        pub fn to_string_sid(&self) -> Result<String, String> {
+            let mut pstr: *mut u16 = std::ptr::null_mut();
+            // SAFETY: as_psid 指向有效 SID;成功时 pstr 由系统 LocalAlloc、以 NUL 结尾,
+            // 读完即 LocalFree。
+            unsafe {
+                if ConvertSidToStringSidW(self.as_psid(), &mut pstr) == 0 {
+                    return Err(format!(
+                        "ConvertSidToStringSidW failed: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+                let mut len = 0usize;
+                while *pstr.add(len) != 0 {
+                    len += 1;
+                }
+                let sid = String::from_utf16_lossy(std::slice::from_raw_parts(pstr, len));
+                LocalFree(pstr as *mut c_void);
+                Ok(sid)
+            }
+        }
+    }
+
+    impl PartialEq for OwnedSid {
+        fn eq(&self, other: &Self) -> bool {
+            // SAFETY: 两边都是 copy_from 校验过的有效 SID。
+            unsafe { EqualSid(self.as_psid(), other.as_psid()) != 0 }
+        }
+    }
+
+    impl std::fmt::Debug for OwnedSid {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self.to_string_sid() {
+                Ok(sid) => f.write_str(&sid),
+                Err(e) => write!(f, "<unprintable SID: {e}>"),
+            }
+        }
+    }
+
+    /// 读 token 的用户 SID(`TokenUser`)。
+    fn token_user_sid(token: &OwnedHandle) -> Result<OwnedSid, String> {
+        let raw = token.as_raw_handle() as HANDLE;
+        let mut needed: u32 = 0;
+        // SAFETY: 探长度调用 —— 缓冲为 NULL、长度 0,预期失败并写回所需字节数。
+        unsafe { GetTokenInformation(raw, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
+        if needed == 0 {
+            return Err(format!(
+                "GetTokenInformation size probe failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // TOKEN_USER 里有指针,用 u64 缓冲保证对齐。
+        let mut buf = vec![0u64; (needed as usize).div_ceil(8)];
+        // SAFETY: buf 至少 needed 字节且 8 字节对齐。
+        let ok = unsafe {
+            GetTokenInformation(raw, TokenUser, buf.as_mut_ptr().cast(), needed, &mut needed)
+        };
+        if ok == 0 {
+            return Err(format!(
+                "GetTokenInformation failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: 成功后缓冲开头是 TOKEN_USER,User.Sid 指向缓冲内部(buf 此刻仍存活)。
+        unsafe {
+            let token_user = &*(buf.as_ptr() as *const TOKEN_USER);
+            OwnedSid::copy_from(token_user.User.Sid)
+        }
+    }
+
+    /// 当前进程的 token(`TOKEN_QUERY`)。
+    fn current_process_token() -> Result<OwnedHandle, String> {
+        // windows-sys 0.52:HANDLE = isize,0 即 NULL。
+        let mut token: HANDLE = 0;
+        // SAFETY: GetCurrentProcess 是无需关闭的伪句柄。
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(format!(
+                "OpenProcessToken failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: token 是刚打开、无人共享的有效句柄,交给 OwnedHandle 负责关闭。
+        Ok(unsafe { OwnedHandle::from_raw_handle(token as RawHandle) })
+    }
+
+    /// 当前进程 token 的用户 SID。
+    pub fn current_user_sid() -> Result<OwnedSid, String> {
+        token_user_sid(&current_process_token()?)
+    }
+
+    /// 当前进程是否以提权(管理员)令牌运行(`TokenElevation`)。
+    ///
+    /// 提权令牌与同一用户的普通权限令牌 `TokenUser` 是同一个 SID,daemon 管道的「仅当前用户」
+    /// ACL 拦不住后者 —— 所以提权时 CLI 不连也不拉起 daemon,`daemon` 子命令拒绝启动。
+    pub fn current_process_is_elevated() -> Result<bool, String> {
+        let token = current_process_token()?;
+        let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+        let mut returned: u32 = 0;
+        // SAFETY: elevation 是本地可写的 TOKEN_ELEVATION,长度如实传入。
+        let ok = unsafe {
+            GetTokenInformation(
+                token.as_raw_handle() as HANDLE,
+                TokenElevation,
+                (&mut elevation as *mut TOKEN_ELEVATION).cast(),
+                std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                &mut returned,
+            )
+        };
+        if ok == 0 {
+            return Err(format!(
+                "GetTokenInformation(TokenElevation) failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(elevation.TokenIsElevated != 0)
+    }
 
     /// 取当前进程 token 的用户 SID 字符串(如 `S-1-5-21-...`)。
     pub fn current_user_sid_string() -> Result<String, String> {
-        unsafe {
-            // windows-sys 0.52:HANDLE = isize,0 即 NULL。
-            let mut token: HANDLE = 0;
-            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
-                return Err("OpenProcessToken failed".into());
-            }
-            // 先探长度,再取 TOKEN_USER。
-            let mut needed: u32 = 0;
-            GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed);
-            if needed == 0 {
-                CloseHandle(token);
-                return Err("GetTokenInformation size probe failed".into());
-            }
-            let mut buf = vec![0u8; needed as usize];
-            let ok = GetTokenInformation(
-                token,
-                TokenUser,
-                buf.as_mut_ptr() as *mut c_void,
-                needed,
-                &mut needed,
-            );
-            CloseHandle(token);
-            if ok == 0 {
-                return Err("GetTokenInformation failed".into());
-            }
-            let token_user = &*(buf.as_ptr() as *const TOKEN_USER);
-            let mut pstr: *mut u16 = std::ptr::null_mut();
-            if ConvertSidToStringSidW(token_user.User.Sid, &mut pstr) == 0 {
-                return Err("ConvertSidToStringSidW failed".into());
-            }
-            // 读出宽字符串再 LocalFree。
-            let mut len = 0usize;
-            while *pstr.add(len) != 0 {
-                len += 1;
-            }
-            let sid = String::from_utf16_lossy(std::slice::from_raw_parts(pstr, len));
-            LocalFree(pstr as *mut c_void);
-            Ok(sid)
+        current_user_sid()?.to_string_sid()
+    }
+
+    /// 指定进程 token 的用户 SID。
+    ///
+    /// 只要 `PROCESS_QUERY_LIMITED_INFORMATION` + `TOKEN_QUERY` 两项最小权限。别的用户的
+    /// 进程通常两步都过不了(进程 / token 的默认 DACL 不给外人),过不了就是核验失败,
+    /// 调用方按不可信处理 —— 宁可降级,不可误信。
+    pub fn process_user_sid(pid: u32) -> Result<OwnedSid, String> {
+        // SAFETY: 失败返回 NULL,不涉及调用方内存。
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if process == 0 {
+            return Err(format!(
+                "OpenProcess(pid {pid}) failed: {}",
+                std::io::Error::last_os_error()
+            ));
         }
+        // SAFETY: process 是刚打开的有效句柄,交给 OwnedHandle 负责关闭。
+        let process = unsafe { OwnedHandle::from_raw_handle(process as RawHandle) };
+        let mut token: HANDLE = 0;
+        // SAFETY: process 在本作用域内有效。
+        let opened =
+            unsafe { OpenProcessToken(process.as_raw_handle() as HANDLE, TOKEN_QUERY, &mut token) };
+        if opened == 0 {
+            return Err(format!(
+                "OpenProcessToken(pid {pid}) failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: 同上,token 交给 OwnedHandle 关闭。
+        let token = unsafe { OwnedHandle::from_raw_handle(token as RawHandle) };
+        token_user_sid(&token)
+    }
+
+    /// 管道服务端(创建这个管道实例的)进程的 PID。在客户端句柄上调用。
+    pub fn pipe_server_process_id(pipe: HANDLE) -> Result<u32, String> {
+        let mut pid: u32 = 0;
+        // SAFETY: pipe 是调用方持有的有效管道句柄。
+        if unsafe { GetNamedPipeServerProcessId(pipe, &mut pid) } == 0 {
+            return Err(format!(
+                "GetNamedPipeServerProcessId failed: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(pid)
+    }
+
+    /// 管道对象的 owner SID。在客户端句柄上调用,句柄要有 `READ_CONTROL` —— tokio 的
+    /// `ClientOptions` 以 `GENERIC_READ | GENERIC_WRITE` 打开,含这一项。
+    pub fn pipe_owner_sid(pipe: HANDLE) -> Result<OwnedSid, String> {
+        let mut owner: PSID = std::ptr::null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: pipe 是调用方持有的有效句柄;只要 owner,其余出参传 NULL。成功时 owner 指向
+        // descriptor 内部,descriptor 由系统 LocalAlloc,拷完 SID 即释放。
+        let status = unsafe {
+            GetSecurityInfo(
+                pipe,
+                SE_KERNEL_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                &mut owner,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(format!(
+                "GetSecurityInfo(owner) failed: {}",
+                std::io::Error::from_raw_os_error(status as i32)
+            ));
+        }
+        let copied = if owner.is_null() {
+            Err("the endpoint has no owner".to_string())
+        } else {
+            // SAFETY: owner 指向 descriptor 内的 SID,descriptor 此刻仍未释放。
+            unsafe { OwnedSid::copy_from(owner) }
+        };
+        // SAFETY: descriptor 由 GetSecurityInfo 分配,只释放这一次。
+        unsafe { LocalFree(descriptor) };
+        copied
+    }
+
+    /// 客户端核验:管道服务端进程的用户 SID、管道对象的 owner 都必须是当前用户。
+    ///
+    /// - 服务端进程:`GetNamedPipeServerProcessId` → `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)`
+    ///   → `OpenProcessToken(TOKEN_QUERY)` → `GetTokenInformation(TokenUser)` → `EqualSid`;
+    /// - 管道 owner:`GetSecurityInfo(SE_KERNEL_OBJECT, OWNER_SECURITY_INFORMATION)` → `EqualSid`
+    ///   —— 补 PID 被回收后误判的口子(见 [`super::judge_pipe_server`])。
+    ///
+    /// 任何一步失败都按不可信处理。已知会被判成不可信的情形:旧版留下的、以管理员身份(提权)
+    /// 跑着的 daemon —— 未提权进程打不开它的 token,它建的管道 owner 通常也是 Administrators
+    /// 组(提权令牌的默认 owner)而不是用户本人。0.4.11 起 daemon 不再提权运行;遇到旧的,
+    /// 代价只是这次降级 one-shot。
+    pub fn verify_pipe_server(pipe: HANDLE) -> Result<(), String> {
+        verify_pipe_server_as(pipe, current_user_sid())
+    }
+
+    /// [`verify_pipe_server`] 的可注入版本:`own` 由调用方给(测试借此走通「SID 不同」分支)。
+    pub(crate) fn verify_pipe_server_as(
+        pipe: HANDLE,
+        own: Result<OwnedSid, String>,
+    ) -> Result<(), String> {
+        let process = pipe_server_process_id(pipe).and_then(process_user_sid);
+        super::judge_pipe_server(own, process, pipe_owner_sid(pipe))
     }
 
     /// 持有「仅当前用户可连」的 SECURITY_ATTRIBUTES,生命周期内指针有效。
     ///
-    /// SD 由 SDDL `D:P(A;;GA;;;<sid>)` 转换而来:DACL protected(不继承)、
-    /// 仅当前用户 GENERIC_ALL,其它一律拒绝(默认 deny)。
+    /// SD 由 SDDL `O:<sid>D:P(A;;GA;;;<sid>)` 转换而来:owner 显式写成当前用户(客户端核验
+    /// 管道 owner,不能随建管道进程令牌的默认 owner 漂移 —— 提权令牌的默认 owner 通常是
+    /// Administrators 组);DACL protected(不继承)、仅当前用户 GENERIC_ALL,其它一律拒绝
+    /// (默认 deny)。
     pub struct PipeSecurity {
         security_descriptor: *mut c_void,
         attrs: Box<SecurityAttributes>,
@@ -406,7 +846,12 @@ pub mod windows_security {
         /// 构造仅当前用户可访问的 pipe 安全属性。
         pub fn current_user_only() -> Result<Self, String> {
             let sid = current_user_sid_string()?;
-            let sddl = format!("D:P(A;;GA;;;{sid})");
+            Self::from_sddl(&format!("O:{sid}D:P(A;;GA;;;{sid})"))
+        }
+
+        /// 由任意 SDDL 构造。daemon 只用 [`Self::current_user_only`];单测与集成测试借它造一个
+        /// 不让本进程连的管道。
+        pub fn from_sddl(sddl: &str) -> Result<Self, String> {
             let wide: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
             let mut psd: *mut c_void = std::ptr::null_mut();
             let ok = unsafe {
@@ -587,9 +1032,11 @@ mod tests {
         let f = ServerFrame::Result {
             exit_code: Some(17),
             timed_out: Some(false),
+            not_started: None,
             bytes: None,
             connections: None,
             sessions: None,
+            active_requests: None,
         };
         let line = encode_frame(&f).unwrap();
         assert!(line.contains("\"type\":\"result\""));
@@ -597,6 +1044,85 @@ mod tests {
         assert!(line.contains("\"timedOut\":false"));
         assert!(!line.contains("bytes"));
         assert!(!line.contains("connections"));
+        assert!(!line.contains("activeRequests"));
+        assert!(!line.contains("notStarted"));
+    }
+
+    #[test]
+    fn exec_result_flags_not_started_timeouts_without_changing_normal_frames() {
+        // 普通结果与运行中超时:线上形状与 0.4.10 一字不差(不带 notStarted)。
+        let normal = encode_frame(&ServerFrame::result_exec(Some(0), false, false)).unwrap();
+        assert!(!normal.contains("notStarted"), "got: {normal}");
+        let running = encode_frame(&ServerFrame::result_exec(None, true, false)).unwrap();
+        assert!(!running.contains("notStarted"), "got: {running}");
+
+        // 连接阶段超时:带上 notStarted,新 CLI 据此改报「连接阶段超时」。
+        let line = encode_frame(&ServerFrame::result_exec(None, true, true)).unwrap();
+        assert!(line.contains("\"notStarted\":true"), "got: {line}");
+        match decode_frame::<ServerFrame>(&line).unwrap() {
+            ServerFrame::Result {
+                timed_out,
+                not_started,
+                exit_code,
+                ..
+            } => {
+                assert_eq!(timed_out, Some(true));
+                assert_eq!(not_started, Some(true));
+                assert_eq!(exit_code, None);
+            }
+            other => panic!("expected result, got {other:?}"),
+        }
+
+        // 旧 daemon 的超时帧没有这个字段 → None,新 CLI 按普通超时处理。
+        let old: ServerFrame = decode_frame(r#"{"type":"result","timedOut":true}"#).unwrap();
+        assert!(matches!(
+            old,
+            ServerFrame::Result {
+                timed_out: Some(true),
+                not_started: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn status_result_carries_active_requests_and_stays_compatible() {
+        let line = encode_frame(&ServerFrame::result_status(3, 2)).unwrap();
+        assert!(line.contains("\"sessions\":3"), "got: {line}");
+        assert!(line.contains("\"activeRequests\":2"), "got: {line}");
+        match decode_frame::<ServerFrame>(&line).unwrap() {
+            ServerFrame::Result {
+                sessions,
+                active_requests,
+                ..
+            } => {
+                assert_eq!(sessions, Some(3));
+                assert_eq!(active_requests, Some(2));
+            }
+            other => panic!("expected result, got {other:?}"),
+        }
+
+        // 0.4.10 daemon 的 status 回复没有 activeRequests → None。
+        let old: ServerFrame = decode_frame(r#"{"type":"result","sessions":1}"#).unwrap();
+        assert!(matches!(
+            old,
+            ServerFrame::Result {
+                sessions: Some(1),
+                active_requests: None,
+                ..
+            }
+        ));
+        // 反过来,旧 CLI 解码新字段靠的是「不认识的字段一律忽略」—— 这里用一个
+        // 本版也不认识的字段钉住这条 serde 行为。
+        let future: ServerFrame =
+            decode_frame(r#"{"type":"result","sessions":1,"someFutureField":7}"#).unwrap();
+        assert!(matches!(
+            future,
+            ServerFrame::Result {
+                sessions: Some(1),
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -604,6 +1130,7 @@ mod tests {
         let f = ServerFrame::Result {
             exit_code: None,
             timed_out: None,
+            not_started: None,
             bytes: None,
             connections: Some(vec![SshConnectionView {
                 id: "id-1".into(),
@@ -614,6 +1141,7 @@ mod tests {
                 group: None,
             }]),
             sessions: None,
+            active_requests: None,
         };
         let line = encode_frame(&f).unwrap();
         assert!(line.contains("\"connections\""));
@@ -688,5 +1216,279 @@ mod tests {
     fn pipe_security_builds() {
         let sec = windows_security::PipeSecurity::current_user_only().unwrap();
         assert!(!sec.attributes_ptr().is_null());
+    }
+
+    // --- 服务端身份核验 ---
+
+    #[test]
+    fn judge_peer_identity_fails_closed() {
+        assert!(judge_peer_identity::<u32>(Ok(1000), Ok(1000)).is_ok());
+
+        let other = judge_peer_identity::<u32>(Ok(1000), Ok(0)).unwrap_err();
+        assert!(other.contains("another user"), "got: {other}");
+
+        // 核验链断在哪一步都不放行。
+        let peer_unknown =
+            judge_peer_identity::<u32>(Ok(1000), Err("OpenProcess failed".into())).unwrap_err();
+        assert!(
+            peer_unknown.contains("cannot verify") && peer_unknown.contains("OpenProcess failed"),
+            "got: {peer_unknown}"
+        );
+        let own_unknown = judge_peer_identity::<u32>(Err("no token".into()), Ok(1000)).unwrap_err();
+        assert!(
+            own_unknown.contains("current user") && own_unknown.contains("no token"),
+            "got: {own_unknown}"
+        );
+    }
+
+    #[test]
+    fn judge_pipe_server_requires_both_the_process_and_the_owner() {
+        assert!(judge_pipe_server::<u32>(Ok(7), Ok(7), Ok(7)).is_ok());
+
+        // 服务端进程属于别人:不看 owner 就拒。
+        let process = judge_pipe_server::<u32>(Ok(7), Ok(8), Ok(7)).unwrap_err();
+        assert!(process.contains("another user"), "got: {process}");
+
+        // 进程核验过了(PID 被回收给了当前用户的进程),owner 却是别人:照样拒。
+        let owner = judge_pipe_server::<u32>(Ok(7), Ok(7), Ok(8)).unwrap_err();
+        assert!(owner.contains("owned by another account"), "got: {owner}");
+
+        // 任何一步取不到都 fail closed。
+        let unreadable =
+            judge_pipe_server::<u32>(Ok(7), Ok(7), Err("GetSecurityInfo failed".into()))
+                .unwrap_err();
+        assert!(
+            unreadable.contains("cannot read the owner") && unreadable.contains("GetSecurityInfo"),
+            "got: {unreadable}"
+        );
+        assert!(judge_pipe_server::<u32>(Ok(7), Err("no pid".into()), Ok(7)).is_err());
+        assert!(judge_pipe_server::<u32>(Err("no token".into()), Ok(7), Ok(7)).is_err());
+    }
+
+    #[test]
+    fn connect_error_kinds_render_and_classify() {
+        let untrusted = ConnectError::Untrusted("belongs to another user".into());
+        assert!(!untrusted.is_busy());
+        assert!(untrusted
+            .to_string()
+            .contains("not served by the current user"));
+
+        let missing = ConnectError::Unreachable(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert!(!missing.is_busy());
+        assert!(matches!(
+            classify_open_error(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            ConnectError::Unreachable(_)
+        ));
+
+        #[cfg(windows)]
+        {
+            let busy =
+                ConnectError::Unreachable(std::io::Error::from_raw_os_error(ERROR_PIPE_BUSY));
+            assert!(busy.is_busy());
+
+            // ACCESS_DENIED:端点在、但不让本进程连 —— 不是「连不上」,不能拿去自拉起 daemon。
+            let denied = classify_open_error(std::io::Error::from_raw_os_error(5));
+            assert!(matches!(denied, ConnectError::Denied(_)), "{denied:?}");
+            assert!(!denied.is_busy());
+            assert!(
+                denied.to_string().contains("refused this process"),
+                "{denied}"
+            );
+            // 找不到管道(ERROR_FILE_NOT_FOUND)仍是「连不上」。
+            assert!(matches!(
+                classify_open_error(std::io::Error::from_raw_os_error(2)),
+                ConnectError::Unreachable(_)
+            ));
+        }
+        #[cfg(unix)]
+        {
+            assert!(matches!(
+                classify_open_error(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+                ConnectError::Denied(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn elevation_query_succeeds_on_this_platform() {
+        // 真值取决于跑测试的 shell 是否以管理员身份运行,这里只钉住「问得出来」。
+        let elevated = current_process_elevated();
+        assert!(elevated.is_ok(), "{elevated:?}");
+        #[cfg(not(windows))]
+        assert_eq!(elevated, Ok(false));
+    }
+
+    #[cfg(windows)]
+    fn unique_pipe(label: &str) -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!(
+            r"\\.\pipe\mt-ssh-cli-ipc-test-{label}-{}-{nanos}",
+            std::process::id()
+        )
+    }
+
+    /// 按 daemon 的口径建管道首实例:安全描述符由 `security` 给出。
+    #[cfg(windows)]
+    fn pipe_server_with(
+        ep: &str,
+        security: &windows_security::PipeSecurity,
+    ) -> tokio::net::windows::named_pipe::NamedPipeServer {
+        use tokio::net::windows::named_pipe::ServerOptions;
+        // SAFETY: security 在调用期间存活,attributes_ptr 指向的内存有效。
+        unsafe {
+            ServerOptions::new()
+                .first_pipe_instance(true)
+                .create_with_security_attributes_raw(ep, security.attributes_ptr())
+        }
+        .unwrap()
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn pipe_served_by_same_user_is_trusted() {
+        let ep = unique_pipe("trusted");
+        let security = windows_security::PipeSecurity::current_user_only().unwrap();
+        let server = pipe_server_with(&ep, &security);
+        let accept = tokio::spawn(async move {
+            server.connect().await.unwrap();
+            server
+        });
+        let client = connect(&ep).await;
+        assert!(
+            client.is_ok(),
+            "same-process server must verify: {:?}",
+            client.err()
+        );
+        drop(accept.await.unwrap());
+    }
+
+    /// F3:同进程建的管道,owner 就是当前用户 —— daemon 的安全描述符显式写了 owner,
+    /// 跑测试的 shell 提不提权都一样。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn pipe_owner_is_the_current_user() {
+        use std::os::windows::io::AsRawHandle;
+        use tokio::net::windows::named_pipe::ClientOptions;
+
+        let ep = unique_pipe("owner");
+        let security = windows_security::PipeSecurity::current_user_only().unwrap();
+        let server = pipe_server_with(&ep, &security);
+        let accept = tokio::spawn(async move {
+            server.connect().await.unwrap();
+            server
+        });
+        let client = ClientOptions::new().open(&ep).unwrap();
+        let pipe = client.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+
+        let owner = windows_security::pipe_owner_sid(pipe).unwrap();
+        assert_eq!(owner, windows_security::current_user_sid().unwrap());
+        assert_ne!(
+            owner,
+            windows_security::OwnedSid::from_string_sid("S-1-5-32-544").unwrap(),
+            "owner must not drift to the Administrators group"
+        );
+        assert!(windows_security::verify_pipe_server(pipe).is_ok());
+
+        drop(client);
+        drop(accept.await.unwrap());
+    }
+
+    /// F6:管道在、但安全描述符不放行本进程 → `Denied`,不是「连不上」。
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn pipe_that_refuses_this_process_is_denied_not_unreachable() {
+        let ep = unique_pipe("denied");
+        // 只授权 LocalSystem:本进程连不上(owner 只隐含 READ_CONTROL / WRITE_DAC)。
+        let security = windows_security::PipeSecurity::from_sddl("D:P(A;;GA;;;SY)").unwrap();
+        let server = pipe_server_with(&ep, &security);
+        match connect(&ep).await {
+            Err(ConnectError::Denied(e)) => assert_eq!(e.raw_os_error(), Some(5), "{e}"),
+            Err(other) => panic!("expected Denied, got {other:?}"),
+            Ok(_) => panic!("the pipe's DACL does not admit this process"),
+        }
+        drop(server);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn pipe_server_identity_mismatch_is_rejected() {
+        use std::os::windows::io::AsRawHandle;
+        use tokio::net::windows::named_pipe::ClientOptions;
+
+        let ep = unique_pipe("mismatch");
+        let security = windows_security::PipeSecurity::current_user_only().unwrap();
+        let server = pipe_server_with(&ep, &security);
+        let accept = tokio::spawn(async move {
+            server.connect().await.unwrap();
+            server
+        });
+        let client = ClientOptions::new().open(&ep).unwrap();
+        let pipe = client.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+
+        // 真实服务端就是本进程:按本进程身份核验必然通过……
+        assert!(windows_security::verify_pipe_server(pipe).is_ok());
+        // ……换成「我是 LocalSystem」再核一次,完整走过 PID → 进程 → token → EqualSid
+        // 整条链后必须判不可信 —— 冒充者的进程属于别的用户时就是这条路径。
+        let system = windows_security::OwnedSid::from_string_sid("S-1-5-18").unwrap();
+        let err = windows_security::verify_pipe_server_as(pipe, Ok(system)).unwrap_err();
+        assert!(err.contains("another user"), "got: {err}");
+
+        drop(client);
+        drop(accept.await.unwrap());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn missing_pipe_is_unreachable_not_untrusted() {
+        match connect(&unique_pipe("missing")).await {
+            Err(ConnectError::Unreachable(_)) => {}
+            Err(other) => panic!("expected Unreachable, got {other:?}"),
+            Ok(_) => panic!("nothing listens on this pipe"),
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn current_user_sid_equals_itself_and_differs_from_system() {
+        let me = windows_security::current_user_sid().unwrap();
+        let me_again = windows_security::current_user_sid().unwrap();
+        assert_eq!(me, me_again);
+        assert_eq!(
+            me.to_string_sid().unwrap(),
+            windows_security::current_user_sid_string().unwrap()
+        );
+        let system = windows_security::OwnedSid::from_string_sid("S-1-5-18").unwrap();
+        assert_ne!(me, system);
+        assert_eq!(
+            windows_security::process_user_sid(std::process::id()).unwrap(),
+            me
+        );
+    }
+
+    // ⚠️ 下面这条 cfg(unix) 用例本机(Windows)编不到,由 CI 的 Ubuntu 作业编译运行。
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_socket_served_by_same_user_is_trusted() {
+        let path = std::env::temp_dir().join(format!(
+            "mt-ssh-cli-ipc-test-{}-{}.sock",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.map(|(s, _)| s) });
+        let client = connect(&path.to_string_lossy()).await;
+        assert!(
+            client.is_ok(),
+            "same-user socket must verify: {:?}",
+            client.err()
+        );
+        drop(accept.await.unwrap());
+        let _ = std::fs::remove_file(&path);
     }
 }
