@@ -12,14 +12,17 @@
 //!   每个 `CachedSession` 自己再裹一层 `Mutex<russh::client::Handle>` 把同 session
 //!   的 channel 操作串行化(YAGNI 多 channel 并发)。
 //! - 默认 profile:idle 10min / lifetime 2h / keepalive 30s × 3 / cap 8 LRU /
-//!   lazy 重连 + 单次 retry + 30s gatetime cooldown。来源见 research 文件。
+//!   lazy 重连 + 单次 retry + 30s 认证失败冷却 + 20s 建连超时。来源见 research 文件。
+//! - 建连对齐终端里的系统 ssh(`ssh [-p port] [-i key] user@host`):读 `~/.ssh/config`
+//!   (HostName / Port / User / IdentityFile / IdentitiesOnly / HostKeyAlias /
+//!   ProxyJump,见 `ssh_config.rs`);认证依次试显式私钥 / ssh-agent / 默认私钥 /
+//!   密码(见 `auth.rs`);DNS + TCP + 握手 + 认证整段受 `connect_timeout` 约束,
+//!   超时报错写明卡在哪个阶段(见 `transport.rs`)。
 //! - host-key 策略:`accept-new` 语义(对齐 OpenSSH `StrictHostKeyChecking=accept-new`)。
-//!   首见接受并以 plaintext 追加到 `~/.ssh/known_hosts`,变更拒绝;plaintext 与
-//!   `|1|` 哈希条目都认。连接前把该 host 已登记的 key 类型排到首选算法最前,服务器
-//!   仍给出未登记的类型而该 host 已有其它类型的 key 时同样按变更拒绝。拒绝原因会
-//!   拼进连接错误(见 [`MtClient`])。
-//! - 认证顺序:identity_file 优先 → password 兜底,password 走 password 与
-//!   keyboard-interactive 两种 method(某些服务器仅接后者)。
+//!   首见接受并以 plaintext 追加到 `~/.ssh/known_hosts`,变更 / 吊销拒绝;plaintext、
+//!   通配与 `|1|` 哈希条目都认(见 `known_hosts.rs`)。拒绝原因会拼进连接错误。
+//! - 认证失败冷却:同一连接身份认证失败后 `gatetime_cooldown` 内直接返错、不再去打
+//!   远端,避免 agent 反复重试把本机 IP 送进 fail2ban(之后连终端也连不上)。
 //!
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -28,11 +31,18 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mt_core::SshConnection;
+use russh::client::{self, Handle};
 use russh::ChannelMsg;
-use russh::client::{self, Handle, Handler};
-use russh::keys::{PrivateKeyWithHashAlg, load_secret_key};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+
+pub use crate::known_hosts::MtClient;
+
+use crate::auth::{self, AgentSession, AuthError, AuthPlan, ClientNotes, PasswordInput};
+use crate::known_hosts;
+use crate::ssh_config::{self, ResolvedHost, ResolvedRoute, RouteEnv};
+use crate::transport::{self, ConnectStage, GuardedStream, KillOnDrop, StageTracker, StreamKill};
 
 /// 会话池可调参数。所有默认值都来自 research/session-pool-patterns.md TL;DR 表。
 #[derive(Debug, Clone)]
@@ -47,13 +57,30 @@ pub struct PoolConfig {
     pub keepalive_max: usize,
     /// 池上限。到上限时按 `last_used` 最小者 LRU 淘汰。
     pub max_sessions: usize,
-    /// session 上一次 auth 失败后,在此时长内直接返回错误,不再去打远端
-    /// (autossh `AUTOSSH_GATETIME=30s` 风格)。
+    /// 认证失败冷却:某连接身份认证失败后,在此时长内 `acquire` 直接返回错误,不再去打
+    /// 远端(autossh `AUTOSSH_GATETIME=30s` 风格),免得反复重试触发 fail2ban。网络错误与
+    /// 超时不计;连接配置(或 ssh config 解析结果)一改,身份就变了,可立即重试。
+    /// 为 0 时不冷却。sidecar 另用它配合 [`CachedSession::mark_unhealthy`]。
     pub gatetime_cooldown: Duration,
     /// 后台 reaper 扫描频率。默认 60s。
     pub reaper_tick: Duration,
     /// shutdown 时单 session disconnect 的上限,防止远端 hang 阻塞 sidecar 退出。
     pub shutdown_per_session_timeout: Duration,
+    /// 建连总预算:DNS 解析 + TCP 连接 + SSH 握手(含主机密钥校验)+ 认证整段,
+    /// ProxyJump 时含每一跳。超时报错写明卡在哪个阶段。
+    ///
+    /// 默认 20s:系统 ssh 没有默认 ConnectTimeout(Windows TCP 栈自身约 21s 放弃);
+    /// 正常链路握手 + 认证一两秒内完成,PAM 每次密码失败约 2s 延迟、硬件 key 等人触摸
+    /// 也都在这个量级之内,再长对调用方只是干等。主程序远程项目外层另有 30s 兜底
+    /// (`mt-remote` 的 `ACQUIRE_TIMEOUT`),池先到点才能给出分阶段的原因。
+    ///
+    /// 宜小于 `keepalive_interval`:russh 认证前的 keepalive 计时器到点后不会重新上弦、
+    /// 会空转(见 `transport.rs` 模块注释),建连在它到点前结束就碰不上。
+    pub connect_timeout: Duration,
+    /// 一个主机名解析出多个地址(如 IPv6 + IPv4)时,除最后一个外每个地址的 TCP 连接上限,
+    /// 免得一个黑洞地址吃光整段预算;最后一个地址可用掉剩余的全部预算。默认 5s:够
+    /// Windows 丢一次 SYN 后的首次重传(约 3s)。
+    pub connect_timeout_per_address: Duration,
 }
 
 impl Default for PoolConfig {
@@ -67,9 +94,126 @@ impl Default for PoolConfig {
             gatetime_cooldown: Duration::from_secs(30),
             reaper_tick: Duration::from_secs(60),
             shutdown_per_session_timeout: Duration::from_secs(2),
+            connect_timeout: Duration::from_secs(20),
+            connect_timeout_per_address: Duration::from_secs(5),
         }
     }
 }
+
+/// 池建连依赖的本机环境。生产用 [`SshClientEnv::system`];测试从
+/// [`SshClientEnv::isolated`] 起步再按需打开,**绝不碰**真实的 `~/.ssh` 与 ssh-agent。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshClientEnv {
+    /// home 目录:`~` 展开、默认私钥(`~/.ssh/id_*`)与 ssh config `Include` 相对路径的
+    /// 基准。`None` 时不展开 `~`、不试默认私钥。
+    pub home_dir: Option<PathBuf>,
+    /// OpenSSH 客户端配置文件(`~/.ssh/config`)。`None` = 不读任何 ssh config。
+    pub ssh_config_path: Option<PathBuf>,
+    /// known_hosts 文件(读、并按 accept-new 追加)。
+    pub known_hosts_path: PathBuf,
+    /// ssh-agent 来源。
+    pub agent: AgentSource,
+    /// 本机用户名:ssh config token `%u`,以及连接与 ssh config 都没给用户名时的
+    /// 默认登录名(OpenSSH 同样如此)。
+    pub local_user: Option<String>,
+}
+
+impl SshClientEnv {
+    /// 真实环境:`~/.ssh/config`、`~/.ssh/known_hosts`、默认私钥、系统 ssh-agent。
+    /// 只取路径与环境变量,不读任何文件(构造池不该有 IO)。
+    ///
+    /// 找不到 home 时 known_hosts 回退到当前目录下 `.known_hosts`(极端环境的兜底,
+    /// 正常桌面端不会触发),也不读 ssh config。
+    pub fn system() -> Self {
+        let home_dir = dirs::home_dir();
+        let ssh_dir = home_dir.as_ref().map(|home| home.join(".ssh"));
+        Self {
+            known_hosts_path: ssh_dir
+                .as_ref()
+                .map(|dir| dir.join("known_hosts"))
+                .unwrap_or_else(|| PathBuf::from(".known_hosts")),
+            ssh_config_path: ssh_dir.map(|dir| dir.join("config")),
+            home_dir,
+            agent: AgentSource::System,
+            local_user: local_user_name(),
+        }
+    }
+
+    /// 隔离环境:只用给定的 known_hosts;不读 ssh config、不展开 `~`、不试默认私钥、
+    /// 不连 ssh-agent —— 认证只剩连接配置里的私钥与密码(本 crate 早先的全部能力)。
+    pub fn isolated(known_hosts_path: PathBuf) -> Self {
+        Self {
+            home_dir: None,
+            ssh_config_path: None,
+            known_hosts_path,
+            agent: AgentSource::Disabled,
+            local_user: None,
+        }
+    }
+}
+
+fn local_user_name() -> Option<String> {
+    let primary = if cfg!(windows) { "USERNAME" } else { "USER" };
+    [primary, "LOGNAME"]
+        .iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .find(|value| !value.trim().is_empty())
+}
+
+/// ssh-agent 来源。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentSource {
+    /// 不使用 ssh-agent。
+    Disabled,
+    /// 系统默认:Windows 先连 OpenSSH 的 agent(`SSH_AUTH_SOCK`,未设置时为
+    /// `\\.\pipe\openssh-ssh-agent`),连不上再试 Pageant;Unix 用 `SSH_AUTH_SOCK`。
+    System,
+    /// 指定端点:Windows 为命名管道路径,Unix 为 socket 路径(主要给测试)。
+    Endpoint(PathBuf),
+}
+
+/// [`SshPool::try_acquire`] 失败的分类。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AcquireErrorKind {
+    /// 连接 / ssh config 的配置问题(ProxyCommand 不支持、取值非法……),重试无用。
+    Config,
+    /// DNS、TCP、跳板隧道或 SSH 握手失败(含算法协商失败)。
+    Network,
+    /// `connect_timeout` 内没建好连接;消息写明卡在哪个阶段。
+    Timeout,
+    /// 主机密钥校验失败(不符 / 已吊销 / known_hosts 读写失败)。
+    HostKey,
+    /// 服务器拒绝了全部认证方法(或根本没有可用的凭据)。随后进入认证失败冷却。
+    Auth,
+    /// 处于认证失败冷却期,没有去连服务器。
+    Cooldown,
+}
+
+/// [`SshPool::try_acquire`] 的错误。`message` 一律英文开头(agent 在 GBK 代码页的控制台
+/// 里读也认得出类别),绝不含密码或私钥内容;主机密钥拒绝原因后面附中文细节。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcquireError {
+    pub kind: AcquireErrorKind,
+    pub message: String,
+}
+
+impl AcquireError {
+    fn new(kind: AcquireErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for AcquireError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for AcquireError {}
 
 /// 池内部状态。`SshPool` 用 `Mutex` 把它包起来,保证 acquire/evict 串行。
 struct PoolInner {
@@ -100,11 +244,18 @@ fn remove_arc_if_same<T>(
 pub struct CachedSession {
     /// 建立该 session 时真正参与认证/寻址的连接身份。池的 map key 仍是稳定的
     /// connection id，但复用前必须逐字段核对这一份，避免用户原地修改 host、
-    /// port、user 或凭据后短暂命中旧服务器 session。
+    /// port、user、凭据或 ssh config 后短暂命中旧服务器 session。
     connection_identity: CachedConnectionIdentity,
     /// 串行化同 session 上的 channel 操作。russh Handle 自身 Clone 廉价,但允许
     /// 并发开 channel 会让审计日志顺序与"标记 unhealthy"的语义复杂化。
     handle: Mutex<Handle<MtClient>>,
+    /// 目标会话底层传输的掐断开关,随本结构 drop 即掐断:russh 会话任务与 socket
+    /// (或跳板上的 direct-tcpip 通道)不会比本结构活得久,见 `transport.rs`。
+    transport: KillOnDrop,
+    /// ProxyJump 经过的跳板会话,第一跳在前。目标会话的传输跑在最后一跳的
+    /// direct-tcpip 通道里,所以它们与目标会话同生共死:关闭 / 淘汰时先断目标、再由近
+    /// 及远断跳板([`CachedSession::close`]),drop 时一并掐断。
+    jumps: Vec<JumpLink>,
     /// session 建立时刻;用于 `max_lifetime` 判定。
     opened_at: Instant,
     /// 最近一次使用(`ssh_exec` 触发)的 UNIX 毫秒。Atomic 是为了 reaper 不抢锁就能读。
@@ -115,6 +266,13 @@ pub struct CachedSession {
     active_sftp_leases: AtomicUsize,
 }
 
+/// 一跳跳板会话。
+struct JumpLink {
+    handle: Mutex<Handle<MtClient>>,
+    transport: KillOnDrop,
+}
+
+/// 连接身份:连接配置里参与寻址 / 认证的字段,加上 ssh config 解析出的实际路线。
 #[derive(Clone, PartialEq, Eq)]
 struct CachedConnectionIdentity {
     id: String,
@@ -123,10 +281,13 @@ struct CachedConnectionIdentity {
     user: String,
     password: Option<String>,
     identity_file: Option<String>,
+    /// ssh config 解析出的实际路线(HostName / Port / User / 私钥 / 跳板 /
+    /// known_hosts 名)。`~/.ssh/config` 改了,连接配置一字未动也不能复用到旧目标上。
+    route: ResolvedRoute,
 }
 
 impl CachedConnectionIdentity {
-    fn from_connection(connection: &SshConnection) -> Self {
+    fn new(connection: &SshConnection, route: ResolvedRoute) -> Self {
         Self {
             id: connection.id.clone(),
             host: connection.host.clone(),
@@ -134,22 +295,44 @@ impl CachedConnectionIdentity {
             user: connection.user.clone(),
             password: connection.password.clone(),
             identity_file: connection.identity_file.clone(),
+            route,
         }
     }
+}
 
-    fn matches(&self, connection: &SshConnection) -> bool {
-        self.id == connection.id
-            && self.host == connection.host
-            && self.port == connection.port
-            && self.user == connection.user
-            && self.password == connection.password
-            && self.identity_file == connection.identity_file
+/// 发 DISCONNECT 并等 russh 会话任务把它写出去、退出(任务退出前才关闭消息通道,
+/// `is_closed` 由此变真)。调用方负责限时。
+async fn disconnect_handle(handle: &Mutex<Handle<MtClient>>) {
+    let handle = handle.lock().await;
+    let _ = handle
+        .disconnect(russh::Disconnect::ByApplication, "", "en")
+        .await;
+    while !handle.is_closed() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
 impl CachedSession {
-    fn matches_connection(&self, connection: &SshConnection) -> bool {
-        self.connection_identity.matches(connection)
+    fn matches_identity(&self, identity: &CachedConnectionIdentity) -> bool {
+        self.connection_identity == *identity
+    }
+
+    /// 优雅断开:先目标、再由近及远的跳板,整体限时 `timeout`;到点无论成败都掐断
+    /// 全部传输,保证 russh 会话任务与 socket 一定释放。返回优雅断开是否按时完成。
+    async fn close(&self, timeout: Duration) -> bool {
+        let graceful = tokio::time::timeout(timeout, async {
+            disconnect_handle(&self.handle).await;
+            for jump in self.jumps.iter().rev() {
+                disconnect_handle(&jump.handle).await;
+            }
+        })
+        .await
+        .is_ok();
+        self.transport.kill();
+        for jump in &self.jumps {
+            jump.transport.kill();
+        }
+        graceful
     }
 
     /// 现在是否处于 gatetime cooldown 内。
@@ -208,12 +391,50 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
+/// 一次认证失败的记录(冷却用)。
+struct AuthFailure {
+    /// 失败时的连接身份。身份一变(改了连接配置或 ssh config)记录即不再适用。
+    identity: CachedConnectionIdentity,
+    failed_at: Instant,
+    until: Instant,
+    /// 当时的认证失败报错(不含凭据),冷却期内原样附在错误后面。
+    message: String,
+}
+
+/// 冷却判定(纯函数便于单测):同一连接身份、仍在冷却期内时返回剩余时长。
+fn cooldown_remaining(
+    record: &AuthFailure,
+    identity: &CachedConnectionIdentity,
+    now: Instant,
+) -> Option<Duration> {
+    if record.identity != *identity {
+        return None;
+    }
+    let remaining = record.until.saturating_duration_since(now);
+    (!remaining.is_zero()).then_some(remaining)
+}
+
+/// 冷却期内的报错。英文开头,写明剩余秒数与「这是为了避免触发封禁」。
+fn cooldown_message(record: &AuthFailure, remaining: Duration, now: Instant) -> String {
+    let ago = now.saturating_duration_since(record.failed_at).as_secs();
+    let remaining_secs = remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0);
+    format!(
+        "authentication cooldown: the last attempt for this connection failed authentication \
+         {ago}s ago; not retrying for another {remaining_secs}s to avoid triggering server-side \
+         bans (fail2ban / sshd MaxAuthTries). Fix the credentials (editing the connection allows \
+         an immediate retry) or wait. Last error: {}",
+        record.message
+    )
+}
+
 /// 池的对外 facade。`Arc<SshPool>` 由 `SshMcp` 持有,跨工具调用共享。
 pub struct SshPool {
     inner: Arc<Mutex<PoolInner>>,
     config: PoolConfig,
-    /// known_hosts 文件路径。为了便于测试,允许在构造时显式覆盖默认 `~/.ssh/known_hosts`。
-    known_hosts_path: PathBuf,
+    /// 建连依赖的本机环境(known_hosts / ssh config / home / ssh-agent)。
+    env: SshClientEnv,
+    /// 认证失败冷却记录:connection id → 最近一次认证失败。
+    auth_failures: std::sync::Mutex<HashMap<String, AuthFailure>>,
     /// 后台 reaper task 句柄,持有以便在 Drop 时 abort。
     ///
     /// 用 `std::sync::Mutex` 而非 `tokio::sync::Mutex`:Drop 是同步上下文,不能
@@ -223,26 +444,27 @@ pub struct SshPool {
 }
 
 impl SshPool {
-    /// 用默认 config 与 `~/.ssh/known_hosts` 路径构造。
-    ///
-    /// 找不到 home 时回退到当前目录下 `.known_hosts`(极端环境的兜底,正常 Tauri
-    /// 桌面端不会触发)。
+    /// 用默认 config 与真实环境([`SshClientEnv::system`])构造。
     pub fn new() -> Self {
         Self::with_config(PoolConfig::default())
     }
 
+    /// 指定 config,真实环境([`SshClientEnv::system`])。
     pub fn with_config(config: PoolConfig) -> Self {
-        let known_hosts_path = dirs::home_dir()
-            .map(|h| h.join(".ssh").join("known_hosts"))
-            .unwrap_or_else(|| PathBuf::from(".known_hosts"));
-        Self::with_paths(config, known_hosts_path)
+        Self::with_env(config, SshClientEnv::system())
     }
 
-    /// 全显式构造,主要给单测用。会在 tokio runtime 中 spawn 后台 reaper task。
+    /// 隔离环境([`SshClientEnv::isolated`]):只用给定的 known_hosts,不读 ssh config、
+    /// 不试默认私钥、不连 ssh-agent。主要给单测用。
+    pub fn with_paths(config: PoolConfig, known_hosts_path: PathBuf) -> Self {
+        Self::with_env(config, SshClientEnv::isolated(known_hosts_path))
+    }
+
+    /// 全显式构造。会在 tokio runtime 中 spawn 后台 reaper task。不做任何文件 IO。
     ///
     /// **前置**:必须在 tokio runtime 内调用(直接或间接处于 `#[tokio::main]` /
     /// `#[tokio::test]` 上下文),否则 `tokio::spawn` 会 panic。
-    pub fn with_paths(config: PoolConfig, known_hosts_path: PathBuf) -> Self {
+    pub fn with_env(config: PoolConfig, env: SshClientEnv) -> Self {
         let inner = Arc::new(Mutex::new(PoolInner {
             sessions: HashMap::new(),
         }));
@@ -258,9 +480,66 @@ impl SshPool {
         Self {
             inner,
             config,
-            known_hosts_path,
+            env,
+            auth_failures: std::sync::Mutex::new(HashMap::new()),
             reaper: std::sync::Mutex::new(Some(reaper_handle)),
         }
+    }
+
+    fn route_env(&self) -> RouteEnv<'_> {
+        RouteEnv {
+            ssh_config_path: self.env.ssh_config_path.as_deref(),
+            home: self.env.home_dir.as_deref(),
+            local_user: self.env.local_user.as_deref(),
+        }
+    }
+
+    fn auth_failures(&self) -> std::sync::MutexGuard<'_, HashMap<String, AuthFailure>> {
+        self.auth_failures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// 冷却期内直接返错;身份已变 / 已过期的旧记录顺手清掉。
+    fn check_auth_cooldown(
+        &self,
+        conn: &SshConnection,
+        identity: &CachedConnectionIdentity,
+    ) -> Result<(), AcquireError> {
+        let mut failures = self.auth_failures();
+        let Some(record) = failures.get(&conn.id) else {
+            return Ok(());
+        };
+        let now = Instant::now();
+        match cooldown_remaining(record, identity, now) {
+            Some(remaining) => Err(AcquireError::new(
+                AcquireErrorKind::Cooldown,
+                cooldown_message(record, remaining, now),
+            )),
+            None => {
+                failures.remove(&conn.id);
+                Ok(())
+            }
+        }
+    }
+
+    fn record_auth_failure(&self, identity: &CachedConnectionIdentity, message: &str) {
+        let cooldown = self.config.gatetime_cooldown;
+        if cooldown.is_zero() {
+            return;
+        }
+        let now = Instant::now();
+        let mut failures = self.auth_failures();
+        failures.retain(|_, record| record.until > now);
+        failures.insert(
+            identity.id.clone(),
+            AuthFailure {
+                identity: identity.clone(),
+                failed_at: now,
+                until: now + cooldown,
+                message: message.to_string(),
+            },
+        );
     }
 
     /// 查池里有几条 session(主要给测试用)。
@@ -273,12 +552,32 @@ impl SshPool {
         self.inner.lock().await.sessions.is_empty()
     }
 
-    /// 拿一条可用 session。lazy 建,池满时 LRU 淘汰。
+    /// 拿一条可用 session。lazy 建,池满时 LRU 淘汰。错误是 [`AcquireError`] 的文本,
+    /// 分类见 [`Self::try_acquire`]。
     ///
     /// 返回 `Arc<CachedSession>`,调用方再 `session.lock().await` 开 channel。
     /// 若返回的 session `is_unhealthy_now() == true`,调用方应立即返错而不去开 channel,
     /// 实现 30s gatetime cooldown 的语义。
     pub async fn acquire(&self, conn: &SshConnection) -> Result<Arc<CachedSession>, String> {
+        self.try_acquire(conn).await.map_err(|e| e.message)
+    }
+
+    /// 同 [`Self::acquire`],错误带分类([`AcquireErrorKind`])。
+    ///
+    /// - 每次都按当前 ssh config 解析连接的实际路线;解析失败(ProxyCommand、取值非法……)
+    ///   是 `Config`;
+    /// - 池里有同 id 且身份(连接配置 + 解析出的路线)一致的存活 session 就复用;
+    /// - 否则要新建:该身份仍在认证失败冷却期内时直接返 `Cooldown`,不碰网络;
+    /// - 新建整段受 `PoolConfig::connect_timeout` 约束,超时是 `Timeout`(写明阶段);
+    ///   服务器拒绝全部认证方法是 `Auth`,并开始冷却;主机密钥不符 / 吊销是 `HostKey`;
+    ///   DNS / TCP / 隧道 / 握手失败是 `Network`。
+    pub async fn try_acquire(
+        &self,
+        conn: &SshConnection,
+    ) -> Result<Arc<CachedSession>, AcquireError> {
+        let route = ssh_config::resolve_route(conn, &self.route_env())
+            .map_err(|e| AcquireError::new(AcquireErrorKind::Config, e))?;
+        let identity = CachedConnectionIdentity::new(conn, route);
         // **持池锁期间只克隆 Arc,立刻放锁**。下面的 `is_closed()` 要 await 单会话锁,
         // 而传输操作(`run_sftp_upload_on_session` / `run_sftp_download_on_session`)
         // 全程持有单会话锁 —— 若在池锁里等它,任何一条连接传大文件都会把**其它所有
@@ -291,7 +590,7 @@ impl SshPool {
             let Some(session) = cached else {
                 break;
             };
-            if !session.matches_connection(conn) {
+            if !session.matches_identity(&identity) {
                 // `invalidate_connection` 是 fire-and-forget；配置保存后紧接着发起的
                 // 请求可能先于异步 evict 到达这里。复用边界本身必须再次核对完整
                 // 身份，不能让 map 的纯 id key 把新配置导向旧服务器。
@@ -335,8 +634,18 @@ impl SshPool {
             let _ = remove_arc_if_same(&mut inner.sessions, &conn.id, &session);
         }
 
-        // 不在池里、或缓存的 session 已死 —— 重建。
-        let cached = self.build_session(conn).await?;
+        // 不在池里、或缓存的 session 已死 —— 重建。认证失败冷却只拦「新建」:
+        // 池里有健康的同身份 session 时照常复用。
+        self.check_auth_cooldown(conn, &identity)?;
+        let cached = match self.build_session(conn, &identity).await {
+            Ok(cached) => cached,
+            Err(error) => {
+                if error.kind == AcquireErrorKind::Auth {
+                    self.record_auth_failure(&identity, &error.message);
+                }
+                return Err(error);
+            }
+        };
         let candidate = Arc::new(cached);
 
         // connect/auth 不持池锁，因此同 id 的并发 miss 可能同时建好多条。
@@ -361,7 +670,7 @@ impl SshPool {
                 }
             };
 
-            if !winner.matches_connection(conn) {
+            if !winner.matches_identity(&identity) {
                 let victim = {
                     let mut inner = self.inner.lock().await;
                     remove_arc_if_same(&mut inner.sessions, &conn.id, &winner)
@@ -445,72 +754,233 @@ impl SshPool {
         let entries: Vec<_> = inner.sessions.drain().map(|(_, v)| v).collect();
         drop(inner);
 
+        // 每条 session(连同它的跳板)各自限时优雅断开,到点即掐断传输。
         let timeout = self.config.shutdown_per_session_timeout;
-        let futures = entries.into_iter().map(|s| {
-            let t = timeout;
-            async move {
-                let _ = tokio::time::timeout(t, async {
-                    let h = s.handle.lock().await;
-                    let _ = h
-                        .disconnect(russh::Disconnect::ByApplication, "", "en")
-                        .await;
-                })
-                .await;
-            }
+        let futures = entries.into_iter().map(|s| async move {
+            let _ = s.close(timeout).await;
         });
         futures::future::join_all(futures).await;
     }
 
-    /// 真正建一条 session。涵盖 connect + 主机密钥校验(在 Handler 内) + auth。
-    async fn build_session(&self, conn: &SshConnection) -> Result<CachedSession, String> {
-        // 首选 host key 算法按 known_hosts 调序(见 `preferred_host_key_algorithms`)。
-        // 这里读失败就沿用默认顺序 —— `check_server_key` 会再读一次,失败即拒绝并说明原因。
-        let preferred = read_known_hosts(&self.known_hosts_path)
-            .ok()
-            .and_then(|raw| {
-                let pattern = host_pattern(&conn.host, conn.port);
-                preferred_host_key_algorithms(&known_host_key_types(&raw, &pattern))
-            })
-            .map(|key| russh::Preferred {
-                key: std::borrow::Cow::Owned(key),
-                ..russh::Preferred::default()
-            })
-            .unwrap_or_default();
-        // 用 `..Default::default()` 一次性赋值,避开 clippy::field_reassign_with_default。
-        let cfg = Arc::new(client::Config {
-            keepalive_interval: Some(self.config.keepalive_interval),
-            keepalive_max: self.config.keepalive_max,
-            preferred,
-            ..Default::default()
-        });
-
-        let rejection = Arc::new(std::sync::Mutex::new(None));
-        let handler = MtClient {
-            host: conn.host.clone(),
-            port: conn.port,
-            known_hosts_path: self.known_hosts_path.clone(),
-            rejection: Arc::clone(&rejection),
+    /// 真正建一条 session:按路线逐跳建连(第一跳走 TCP,其后经上一跳的 direct-tcpip
+    /// 隧道)→ 握手(主机密钥校验在 Handler 内)→ 认证。整段受 `connect_timeout` 约束;
+    /// 超时丢弃建连 future 时,各跳的 [`KillOnDrop`] 随之 drop、掐断传输,russh 已 spawn
+    /// 的会话任务随即退出,不泄漏任务与 socket。
+    async fn build_session(
+        &self,
+        conn: &SshConnection,
+        identity: &CachedConnectionIdentity,
+    ) -> Result<CachedSession, AcquireError> {
+        let route = &identity.route;
+        let target = format!("{}@{}", route.target.user, route.target.endpoint());
+        let budget = self.config.connect_timeout;
+        let deadline = tokio::time::Instant::now() + budget;
+        let tracker = StageTracker::default();
+        let connecting = self.connect_route(conn, route, deadline, &tracker, &target);
+        let (mut links, target_link) = match tokio::time::timeout_at(deadline, connecting).await {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(AcquireError::new(
+                    AcquireErrorKind::Timeout,
+                    tracker.describe_timeout(&target, budget),
+                ));
+            }
         };
-
-        let port = if conn.port == 0 { 22 } else { conn.port };
-        let mut handle = client::connect(cfg, (conn.host.as_str(), port), handler)
-            .await
-            .map_err(|e| {
-                let rejected = rejection.lock().ok().and_then(|mut slot| slot.take());
-                connect_error(&conn.host, port, &e, rejected)
-            })?;
-
-        authenticate(&mut handle, conn).await?;
-
+        let jumps = links
+            .drain(..)
+            .map(|link| JumpLink {
+                handle: Mutex::new(link.handle),
+                transport: link.transport,
+            })
+            .collect();
         Ok(CachedSession {
-            connection_identity: CachedConnectionIdentity::from_connection(conn),
-            handle: Mutex::new(handle),
+            connection_identity: identity.clone(),
+            handle: Mutex::new(target_link.handle),
+            transport: target_link.transport,
+            jumps,
             opened_at: Instant::now(),
             last_used: AtomicU64::new(now_millis()),
             unhealthy_until: AtomicU64::new(0),
             active_sftp_leases: AtomicUsize::new(0),
         })
     }
+
+    /// 逐跳建连,返回 (跳板们, 目标)。任何一步失败,已建好的各跳随返回值 drop 而掐断。
+    async fn connect_route(
+        &self,
+        conn: &SshConnection,
+        route: &ResolvedRoute,
+        deadline: tokio::time::Instant,
+        tracker: &StageTracker,
+        target: &str,
+    ) -> Result<(Vec<Link>, Link), AcquireError> {
+        // 一次建连里各跳共用一个 agent 连接(懒连接,用不到就不连)。
+        let mut agent = AgentSession::new(self.env.agent.clone());
+        let mut jumps: Vec<Link> = Vec::with_capacity(route.jumps.len());
+        let hops = route
+            .jumps
+            .iter()
+            .map(|hop| (hop, true))
+            .chain(std::iter::once((&route.target, false)));
+        for (hop, is_jump) in hops {
+            let label = if is_jump {
+                format!("jump host {}", hop.endpoint())
+            } else {
+                hop.endpoint()
+            };
+            let kill = StreamKill::new();
+            // 先装好「drop 即掐断」的守卫再把流交给 russh:之后任何失败或超时丢弃本
+            // future,它都会随之 drop。
+            let transport = KillOnDrop::new(kill.clone());
+            let notes = Arc::new(ClientNotes::default());
+            let mut handle = match jumps.last() {
+                None => {
+                    let tcp = transport::connect_tcp(
+                        &hop.host_name,
+                        hop.port,
+                        &label,
+                        deadline,
+                        self.config.connect_timeout_per_address,
+                        tracker,
+                    )
+                    .await
+                    .map_err(|e| match e {
+                        transport::TcpConnectError::Resolve(message)
+                        | transport::TcpConnectError::Failed(message) => AcquireError::new(
+                            AcquireErrorKind::Network,
+                            format!("ssh connect to {label} failed: {message}"),
+                        ),
+                        transport::TcpConnectError::DeadlineExceeded => AcquireError::new(
+                            AcquireErrorKind::Timeout,
+                            tracker.describe_timeout(target, self.config.connect_timeout),
+                        ),
+                    })?;
+                    // 不设 TCP_NODELAY:与此前 `client::connect`(russh 默认 `nodelay =
+                    // false`)的行为保持一致。
+                    tracker.enter(&label, ConnectStage::Handshake);
+                    tracker.watch_stream(&kill);
+                    self.handshake(kill.wrap(tcp), hop, &label, &notes).await?
+                }
+                Some(previous) => {
+                    tracker.enter(&label, ConnectStage::Tunnel);
+                    let channel = previous
+                        .handle
+                        .channel_open_direct_tcpip(
+                            hop.host_name.clone(),
+                            u32::from(hop.port),
+                            "127.0.0.1",
+                            0,
+                        )
+                        .await
+                        .map_err(|e| {
+                            AcquireError::new(
+                                AcquireErrorKind::Network,
+                                format!(
+                                    "ssh connect to {label} failed: the previous jump host \
+                                     refused to open a tunnel to it ({e})"
+                                ),
+                            )
+                        })?;
+                    tracker.enter(&label, ConnectStage::Handshake);
+                    tracker.watch_stream(&kill);
+                    self.handshake(kill.wrap(channel.into_stream()), hop, &label, &notes)
+                        .await?
+                }
+            };
+            tracker.enter(&label, ConnectStage::Auth);
+            let auth_label = if is_jump {
+                format!("jump host {}@{}", hop.user, hop.endpoint())
+            } else {
+                format!("{}@{}", hop.user, hop.endpoint())
+            };
+            // 密码属于目标连接,跳板不用。
+            let stored_password = if is_jump {
+                None
+            } else {
+                conn.password.as_deref()
+            };
+            authenticate(
+                &mut handle,
+                hop,
+                auth_label,
+                stored_password,
+                &self.env,
+                &mut agent,
+                &notes,
+                tracker,
+            )
+            .await?;
+            let link = Link { handle, transport };
+            if !is_jump {
+                return Ok((jumps, link));
+            }
+            jumps.push(link);
+        }
+        Err(AcquireError::new(
+            AcquireErrorKind::Config,
+            "ssh route has no target host",
+        ))
+    }
+
+    /// 在已建立的传输上做 SSH 握手(标识串 + 密钥交换 + 主机密钥校验)。
+    async fn handshake<S>(
+        &self,
+        stream: GuardedStream<S>,
+        hop: &ResolvedHost,
+        label: &str,
+        notes: &Arc<ClientNotes>,
+    ) -> Result<Handle<MtClient>, AcquireError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        // 首选 host key 算法按 known_hosts 调序(见 `preferred_host_key_algorithms`)。
+        // 这里读失败就沿用默认顺序 —— `check_server_key` 会再读一次,失败即拒绝并说明原因。
+        let host_keys = known_hosts::read_known_hosts(&self.env.known_hosts_path)
+            .ok()
+            .and_then(|raw| {
+                known_hosts::preferred_host_key_algorithms(&known_hosts::known_host_key_types(
+                    &raw,
+                    &hop.known_hosts_name,
+                ))
+            });
+        // 不设 `inactivity_timeout`(russh 默认 None):
+        // - 认证前它兜不住 —— keepalive 计时器在认证前到点后空转、每轮都把 inactivity
+        //   计时器重置(见 transport 模块注释)。建连期的收尾改由 connect_timeout +
+        //   传输掐断保证,有测试证明服务器一侧会立刻看到连接关闭;
+        // - 认证后,服务器不回 keepalive 时 `keepalive_max` 次后 russh 已会断开;服务器
+        //   正常回 keepalive 时,每个回包都会重置 inactivity 计时,设了也不会误杀长时间
+        //   没有输出的会话 —— 但也没有任何增益。
+        // 用 `..Default::default()` 一次性赋值,避开 clippy::field_reassign_with_default。
+        let cfg = Arc::new(client::Config {
+            keepalive_interval: Some(self.config.keepalive_interval),
+            keepalive_max: self.config.keepalive_max,
+            preferred: transport::preferred_algorithms(host_keys),
+            ..Default::default()
+        });
+        let handler = MtClient::new(
+            hop.known_hosts_name.clone(),
+            self.env.known_hosts_path.clone(),
+            Arc::clone(notes),
+        );
+        client::connect_stream(cfg, stream, handler)
+            .await
+            .map_err(|e| match notes.take_rejection() {
+                Some(reason) => AcquireError::new(
+                    AcquireErrorKind::HostKey,
+                    known_hosts::connect_error(label, &e, Some(reason)),
+                ),
+                None => AcquireError::new(
+                    AcquireErrorKind::Network,
+                    known_hosts::connect_error(label, &e, None),
+                ),
+            })
+    }
+}
+
+/// 建连途中的一跳:会话 handle + 它底层传输的掐断开关。
+struct Link {
+    handle: Handle<MtClient>,
+    transport: KillOnDrop,
 }
 
 impl Default for SshPool {
@@ -640,16 +1110,11 @@ fn retire_removed_session(session: Arc<CachedSession>, timeout: Duration) {
     }
 }
 
-/// 后台异步 disconnect 一条 session,带超时;失败静默(stderr 一行)。
+/// 后台异步 disconnect 一条 session(连同它的跳板),带超时;到点即掐断传输,
+/// 失败静默(stderr 一行)。
 fn spawn_disconnect(s: Arc<CachedSession>, timeout: Duration) {
     tokio::spawn(async move {
-        let res = tokio::time::timeout(timeout, async {
-            let h = s.handle.lock().await;
-            h.disconnect(russh::Disconnect::ByApplication, "", "en")
-                .await
-        })
-        .await;
-        if res.is_err() {
+        if !s.close(timeout).await {
             eprintln!("[mt-ssh] session disconnect timed out, dropping");
         }
     });
@@ -1191,511 +1656,42 @@ pub async fn run_sftp_download_on_session(
     Ok(total)
 }
 
-/// 按"先 publickey 后 password"顺序尝试认证;两路皆败抛错。
+/// 认证一跳(细节见 `auth.rs`)。
 ///
-/// password 路径包含 `authenticate_password` 与 `authenticate_keyboard_interactive_*`
-/// 两个 method —— 某些服务器禁用 password 而只接受 keyboard-interactive。
-async fn authenticate(handle: &mut Handle<MtClient>, conn: &SshConnection) -> Result<(), String> {
-    // 1) publickey
-    if let Some(path) = conn
-        .identity_file
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        let key = load_private_key_compat(path)?;
-        // RSA 公钥签名的 hash 选择 —— 关键:`PrivateKeyWithHashAlg::new(key, None)` 对
-        // RSA key 会落到 **legacy ssh-rsa(SHA-1)**,而现代 OpenSSH(>=8.8,如 Ubuntu
-        // 22.04/24.04)默认禁用 SHA-1 公钥认证,导致 "server rejected all methods"。
-        // 按服务器通告的 server-sig-algs 选 rsa-sha2-512/256;服务器未发 EXT_INFO 时
-        // best_supported_rsa_hash 返回 Ok(None),回退 SHA-512(现代服务器普遍接受,远胜
-        // 默认 SHA-1)。仅 RSA key 需要查 —— `best_supported_rsa_hash` 会等最多 1s
-        // EXT_INFO,对 ed25519/ecdsa 该 hash 反正被 new() 忽略,无谓多查只会平添连接延迟。
-        let rsa_hash = if key.algorithm().is_rsa() {
-            match handle.best_supported_rsa_hash().await {
-                Ok(Some(alg)) => alg,
-                Ok(None) | Err(_) => Some(russh::keys::HashAlg::Sha512),
-            }
-        } else {
-            None
-        };
-        let with_hash = PrivateKeyWithHashAlg::new(Arc::new(key), rsa_hash);
-        let auth = handle
-            .authenticate_publickey(&conn.user, with_hash)
-            .await
-            .map_err(|e| format!("publickey auth error: {e}"))?;
-        if auth.success() {
-            return Ok(());
-        }
-    }
-
-    // 2) password (含 keyboard-interactive fallback)
-    //
-    // 配置里的 password 是 `mt-secret` 的信封(或升级窗口期的遗留明文),**在这里**
-    // 解开 —— 主程序与三个 sidecar 共用这个池,解封点唯一就不会有谁忘了。
-    // 解不开(密钥换了 / 密文被改)直接报错,绝不把密文当密码送出去;错误文本不含密码。
-    if let Some(stored) = conn.password.as_deref().filter(|p| !p.is_empty()) {
-        let pw =
-            mt_secret::reveal_global(stored).map_err(|e| format!("password unavailable: {e}"))?;
-        let pw = pw.as_str();
-        let auth = handle
-            .authenticate_password(&conn.user, pw)
-            .await
-            .map_err(|e| format!("password auth error: {e}"))?;
-        if auth.success() {
-            return Ok(());
-        }
-        // keyboard-interactive fallback —— 给一个空 submethods 走默认。
-        let auth_kbd = handle
-            .authenticate_keyboard_interactive_start(&conn.user, None)
-            .await
-            .map_err(|e| format!("keyboard-interactive auth start error: {e}"))?;
-        // 简化处理:遇到任何 prompt 就把密码 echo 进去。多数服务器只问一个 password。
-        let success = drive_keyboard_interactive(handle, auth_kbd, pw).await?;
-        if success {
-            return Ok(());
-        }
-    }
-
-    Err("authentication failed: server rejected all configured methods (publickey/password)".into())
-}
-
-/// 加载私钥,在 russh 原生 `load_secret_key` 之上对传统 PEM 格式做 fallback。
-///
-/// russh 底层 `ssh-key` 只解析 OpenSSH(`-----BEGIN OPENSSH PRIVATE KEY-----`)与
-/// PKCS#8(`-----BEGIN PRIVATE KEY-----`)两种明文私钥;OpenSSH 早期版本及
-/// `ssh-keygen -m PEM` / 各类云控制台(如 Oracle Cloud)下发的传统 **PKCS#1 明文
-/// RSA**(`-----BEGIN RSA PRIVATE KEY-----`)会被它判为 `Unsupported key type RSA`,
-/// 导致用该密钥的连接永远建不起来(系统 `ssh` 客户端却能正常登录)。
-///
-/// 这里先走 russh 原生解析覆盖现代密钥;失败再读原文件按 PEM 标签判定:命中
-/// PKCS#1 标签就用纯 Rust 的 `rsa` crate 解析、转成 `ssh_key::PrivateKey`。其余
-/// 格式回退到 russh 原始错误文本,并附 passphrase 不支持的指引。
-///
-/// 加密私钥(passphrase —— 传统 PEM 的 `Proc-Type: 4,ENCRYPTED` 或 OpenSSH 加密块)
-/// 仍不支持,给出明确指引而非吐底层晦涩错误。
-fn load_private_key_compat(path: &str) -> Result<russh::keys::PrivateKey, String> {
-    // 1) russh 原生: OpenSSH / PKCS#8 明文,覆盖绝大多数现代密钥。
-    //    失败时保留错误,供步骤 3 回退诊断复用——避免重复读盘+重复解析。
-    let orig_err = match load_secret_key(path, None) {
-        Ok(key) => return Ok(key),
-        Err(e) => e,
-    };
-
-    // 2) fallback: 读原文件,按 PEM 标签判定传统格式。
-    //    注意先于"加密指引"读文件,文件不可读直接给 IO 错误。
-    let pem = std::fs::read_to_string(path)
-        .map_err(|e| format!("failed to read private key '{path}': {e}"))?;
-
-    if let Some(key) = try_parse_pkcs1_rsa(&pem)
-        .map_err(|e| format!("failed to load private key '{path}': {e}"))?
-    {
-        return Ok(key);
-    }
-
-    // 3) 不是我们能补救的格式 —— 回退到 russh 原始错误 + passphrase 指引。
-    Err(format!(
-        "failed to load private key '{path}': {orig_err}. \
-        If the key is encrypted with a passphrase, mt-ssh-mcp does not support \
-        passphrase keys yet — use an unencrypted key (`ssh-keygen -p -N \"\" -f <key>`) or ssh-agent."
-    ))
-}
-
-/// 尝试把传统 **PKCS#1 明文 RSA** PEM(`-----BEGIN RSA PRIVATE KEY-----`)解析成
-/// `ssh_key::PrivateKey`。不是 PKCS#1 标签时返回 `Ok(None)`,让调用方回退到原始错误。
-///
-/// 抽成接受 `&str`、不碰文件系统的纯函数,便于单测直接喂 PEM 字符串。
-fn try_parse_pkcs1_rsa(pem: &str) -> Result<Option<russh::keys::PrivateKey>, String> {
-    use rsa::pkcs1::DecodeRsaPrivateKey;
-
-    const BEGIN: &str = "-----BEGIN RSA PRIVATE KEY-----";
-    const END: &str = "-----END RSA PRIVATE KEY-----";
-
-    // 不是 PKCS#1 标签 —— 交回上层(可能是 SEC1 EC / 加密 OpenSSH 等,本函数不处理)。
-    let Some(begin_at) = pem.find(BEGIN) else {
-        return Ok(None);
-    };
-    // 加密的传统 PEM(`Proc-Type: 4,ENCRYPTED`)明确不支持,给可操作指引。
-    if pem.contains("Proc-Type:") && pem.contains("ENCRYPTED") {
-        return Err(
-            "key is an encrypted PKCS#1 RSA private key (Proc-Type: 4,ENCRYPTED); \
-            passphrase keys are not supported — decrypt it first \
-            (`openssl rsa -in <key> -out <key.dec>` or re-export without a passphrase)"
-                .into(),
-        );
-    }
-
-    // 自剥 PEM -> DER:rsa 0.10 没有 `pem` feature(PEM 方法 gated 在 pkcs1/pem,
-    // rsa 未传递),故不能用 from_pkcs1_pem;改取 BEGIN/END 之间的 base64 主体、
-    // 去掉所有空白后解码成 DER,再走不依赖 pem feature 的 from_pkcs1_der。
-    let body_start = begin_at + BEGIN.len();
-    let body_end = pem
-        .find(END)
-        .filter(|&e| e >= body_start)
-        .ok_or_else(|| "PKCS#1 RSA PEM missing END marker".to_string())?;
-    let b64: String = pem[body_start..body_end].split_whitespace().collect();
-    let der = {
-        use base64_engine::Engine;
-        base64_engine::engine::general_purpose::STANDARD
-            .decode(b64.as_bytes())
-            .map_err(|e| format!("invalid base64 in PKCS#1 RSA PEM: {e}"))?
-    };
-
-    let rsa_key = rsa::RsaPrivateKey::from_pkcs1_der(&der)
-        .map_err(|e| format!("invalid PKCS#1 RSA private key: {e}"))?;
-    let keypair = russh::keys::ssh_key::private::RsaKeypair::try_from(&rsa_key)
-        .map_err(|e| format!("cannot convert RSA key into ssh-key form: {e}"))?;
-    Ok(Some(russh::keys::PrivateKey::from(keypair)))
-}
-
-/// 把 password 灌进 keyboard-interactive 响应。多 round prompt 都重复 echo 同一密码,
-/// 服务器若用奇怪 prompt(如 OTP)会自然失败 —— 这是设计意图,不要瞎猜。
-async fn drive_keyboard_interactive(
+/// 配置里的 password 是 `mt-secret` 的信封(或升级窗口期的遗留明文),**在这里**
+/// 解开 —— 主程序与三个 sidecar 共用这个池,解封点唯一就不会有谁忘了。
+/// 解不开(密钥换了 / 密文被改)只记进报错(`password: stored password unavailable`),
+/// 照样去试别的方法,绝不把密文当密码送出去;错误文本不含密码。跳板不传密码。
+#[allow(clippy::too_many_arguments)]
+async fn authenticate(
     handle: &mut Handle<MtClient>,
-    mut state: russh::client::KeyboardInteractiveAuthResponse,
-    password: &str,
-) -> Result<bool, String> {
-    use russh::client::KeyboardInteractiveAuthResponse::*;
-    loop {
-        match state {
-            Success => return Ok(true),
-            Failure { .. } => return Ok(false),
-            InfoRequest { prompts, .. } => {
-                let answers: Vec<String> = prompts.iter().map(|_| password.to_string()).collect();
-                state = handle
-                    .authenticate_keyboard_interactive_respond(answers)
-                    .await
-                    .map_err(|e| format!("keyboard-interactive respond error: {e}"))?;
-            }
-        }
-    }
-}
-
-/// russh Handler 实现:每条 session 一个实例,负责主机密钥校验。
-pub struct MtClient {
-    host: String,
-    port: u16,
-    known_hosts_path: PathBuf,
-    /// 主机密钥被拒绝时的可读原因。`check_server_key` 返回 `false` 后 russh 只报
-    /// 泛泛的 "Unknown server key",handler 本身也随失败的连接一起丢了 ——
-    /// `build_session` 持同一个 `Arc`,在 connect 的错误路径上取出来拼进错误
-    /// (主程序远程项目 / sidecar 都把这条错误原样展示给用户)。
-    rejection: Arc<std::sync::Mutex<Option<String>>>,
-}
-
-impl MtClient {
-    /// 记下拒绝原因并打一行日志。返回 `false`,调用处直接 `Ok(self.reject(..))`。
-    fn reject(&self, reason: String) -> bool {
-        eprintln!("[mt-ssh] host key rejected: {reason}");
-        if let Ok(mut slot) = self.rejection.lock() {
-            *slot = Some(reason);
-        }
-        false
-    }
-}
-
-impl Handler for MtClient {
-    type Error = russh::Error;
-
-    /// host-key 校验:accept-new 语义(对齐 OpenSSH `StrictHostKeyChecking=accept-new`)。
-    /// - known_hosts 里有该 host + 同算法的条目且 key 字节一致 → 通过(plaintext 与
-    ///   `|1|` 哈希条目都认)。
-    /// - 有该 host + 同算法的条目但 key 不同 → 拒绝。
-    /// - 该 host 只登记了**其它算法**的 key → 拒绝且不追加,视同换 key。连接前已把
-    ///   已登记的类型排到首选(`preferred_host_key_algorithms`),服务器还支持它时
-    ///   根本走不到这里;走到了说明服务器不再提供登记过的那把 key。
-    /// - 该 host 没有任何条目 → 把当前 key 以 plaintext 追加到 known_hosts,通过。
-    /// - known_hosts 读失败(文件不存在除外,那等于空文件)或追加失败 → 拒绝,
-    ///   绝不在没法校验时悄悄放行。
-    ///
-    /// 拒绝原因记进 `rejection`,由 `build_session` 拼进连接错误。
-    async fn check_server_key(
-        &mut self,
-        server_pubkey: &russh::keys::ssh_key::PublicKey,
-    ) -> Result<bool, Self::Error> {
-        let host_pattern = host_pattern(&self.host, self.port);
-        let path = self.known_hosts_path.display();
-        let raw = match read_known_hosts(&self.known_hosts_path) {
-            Ok(raw) => raw,
-            Err(e) => {
-                return Ok(self.reject(format!(
-                    "known_hosts 读取失败({path}: {e}),无法校验 {host_pattern} 的主机密钥,拒绝连接"
-                )));
-            }
-        };
-        let offered_algo = server_pubkey.algorithm();
-        let offered_algo = offered_algo.as_str();
-        match match_known_host(&raw, &host_pattern, server_pubkey) {
-            HostKeyMatch::Match => Ok(true),
-            HostKeyMatch::Mismatch { line } => Ok(self.reject(format!(
-                "主机密钥与 known_hosts 不符:{path} 第 {line} 行登记的 {host_pattern} {offered_algo} \
-                 密钥与服务器这次给出的不同(可能遭遇中间人攻击,也可能是服务器重装换了密钥;\
-                 确认是后者的话删除该行后重试)"
-            ))),
-            HostKeyMatch::OtherAlgorithm { line, algo } => Ok(self.reject(format!(
-                "主机密钥与 known_hosts 不符:服务器给出的是 {offered_algo} 密钥,而 {path} 第 {line} 行\
-                 登记的是 {host_pattern} 的 {algo} 密钥,服务器已不再提供该类型,按密钥变更处理\
-                 (确认服务器确实换了密钥类型的话删除该主机的旧条目后重试)"
-            ))),
-            HostKeyMatch::Unknown => {
-                if let Err(e) =
-                    append_known_host(&self.known_hosts_path, &host_pattern, server_pubkey)
-                {
-                    return Ok(self.reject(format!(
-                        "无法把 {host_pattern} 的新主机密钥写入 known_hosts({path}: {e}),拒绝连接"
-                    )));
-                }
-                Ok(true)
-            }
-        }
-    }
-}
-
-/// 拼连接失败的错误文本。主机密钥被 [`MtClient`] 拒绝时换成它记下的具体原因
-/// (文件路径 / 行号 / 读失败),而不是 russh 泛泛的 "Unknown server key"。
-fn connect_error(
-    host: &str,
-    port: u16,
-    err: &dyn std::fmt::Display,
-    rejected: Option<String>,
-) -> String {
-    match rejected {
-        Some(reason) => format!("ssh connect to {host}:{port} failed: {reason}"),
-        None => format!("ssh connect to {host}:{port} failed: {err}"),
-    }
-}
-
-/// 读 known_hosts 全文。
-///
-/// - 文件不存在 = 空文件(从没连过任何主机的正常情况);
-/// - 其它 IO 错误(权限、路径是目录、`~/.ssh` 是个文件……)原样返回,调用方据此
-///   **拒绝**连接 —— 以前一律当空文件,等于把「读不到」当成「没见过」,对已登记
-///   过的主机也会重新 accept-new;
-/// - 内容按 lossy 解码:个别行混进非 UTF-8 字节不该让整份文件作废。坏字节只会让
-///   所在那一行匹配不上(主机名 / base64 里出现替换字符),不会造出假匹配。
-fn read_known_hosts(path: &std::path::Path) -> std::io::Result<String> {
-    match std::fs::read(path) {
-        Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-        Err(e) => Err(e),
-    }
-}
-
-/// 拼一条 known_hosts 的 host 字段。22 端口写 `host`,其它端口写 `[host]:port`,
-/// 与 OpenSSH 客户端写入风格一致。
-fn host_pattern(host: &str, port: u16) -> String {
-    if port == 22 || port == 0 {
-        host.to_string()
-    } else {
-        format!("[{host}]:{port}")
-    }
-}
-
-/// 主机密钥比对结果。行号从 1 起,供拒绝原因指给用户看。
-#[derive(Debug, PartialEq, Eq)]
-enum HostKeyMatch {
-    /// host 匹配且同算法的 key 字节相同。
-    Match,
-    /// host 匹配,**同算法**但 key 字节不同(`line` 是第一条这样的行)。
-    /// MITM / 服务器换 key 都会落这条。
-    Mismatch { line: usize },
-    /// 该 host 只登记了**其它算法**的 key(`line` / `algo` 取第一条)。服务器不再
-    /// 提供登记过的那种 key —— 同样按换 key 处理,见 `check_server_key`。
-    OtherAlgorithm { line: usize, algo: String },
-    /// 没找到任何 host 匹配条目。
-    Unknown,
-}
-
-/// known_hosts 里命中某 host 的一条记录。
-struct KnownHostEntry<'a> {
-    /// 行号,从 1 起。
-    line: usize,
-    /// key 类型字段(`ssh-ed25519` / `ssh-rsa` / `ecdsa-sha2-nistp256` ……)。
-    algo: &'a str,
-    /// base64 解码后的 key blob。
-    key: Vec<u8>,
-}
-
-/// 逐行找出 known_hosts 里命中 `host_pattern` 的条目。
-///
-/// 解析规则:
-/// - 跳过空行与 `#` 起始的注释;`@cert-authority` / `@revoked` 标记行不在本实现
-///   支持范围,整行跳过。
-/// - 字段以空格 / TAB 分隔:`<hostspec> <algo> <base64key> [comment]`,缺字段或
-///   base64 解不开的行跳过。
-/// - hostspec 是逗号分隔的多个 host,任一命中即可:plaintext 按 ASCII 大小写
-///   不敏感比较;`|1|salt|hash` 哈希条目见 [`hashed_host_matches`]。通配符与 `!`
-///   否定模式不支持(同样视为不匹配)。
-fn known_host_entries<'a>(
-    raw: &'a str,
-    host_pattern: &'a str,
-) -> impl Iterator<Item = KnownHostEntry<'a>> + 'a {
-    raw.lines().enumerate().filter_map(move |(index, line)| {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with('@') {
-            return None;
-        }
-        let mut fields = line.split_ascii_whitespace();
-        let hostspec = fields.next()?;
-        let host_matches = hostspec.split(',').any(|entry| {
-            if entry.starts_with("|1|") {
-                hashed_host_matches(entry, host_pattern)
-            } else {
-                entry.eq_ignore_ascii_case(host_pattern)
-            }
-        });
-        if !host_matches {
-            return None;
-        }
-        let algo = fields.next()?;
-        let key = base64_decode(fields.next()?)?;
-        Some(KnownHostEntry {
-            line: index + 1,
-            algo,
-            key,
+    hop: &ResolvedHost,
+    label: String,
+    stored_password: Option<&str>,
+    env: &SshClientEnv,
+    agent: &mut AgentSession,
+    notes: &ClientNotes,
+    tracker: &StageTracker,
+) -> Result<(), AcquireError> {
+    let password = match stored_password.filter(|p| !p.is_empty()) {
+        Some(stored) => match mt_secret::reveal_global(stored) {
+            Ok(password) => PasswordInput::Available(password),
+            Err(e) => PasswordInput::Unavailable(e.to_string()),
+        },
+        None => PasswordInput::NotConfigured,
+    };
+    let plan = AuthPlan {
+        host: hop,
+        label,
+        password,
+        default_key_dir: env.home_dir.as_ref().map(|home| home.join(".ssh")),
+    };
+    auth::authenticate_host(handle, &plan, agent, notes, tracker)
+        .await
+        .map_err(|e| match e {
+            AuthError::Rejected(message) => AcquireError::new(AcquireErrorKind::Auth, message),
+            AuthError::Transport(message) => AcquireError::new(AcquireErrorKind::Network, message),
         })
-    })
-}
-
-/// OpenSSH `HashKnownHosts` 条目:`|1|base64(salt)|base64(HMAC-SHA1(key=salt, msg=host))`,
-/// host 取与 plaintext 条目相同的 `host` / `[host]:port` 形态。
-///
-/// OpenSSH 哈希前会把主机名转成小写;为兼容按原样写入的其它工具,原样也试一次。
-/// 比对走 `ring::hmac::verify`(常量时间)。
-fn hashed_host_matches(entry: &str, host_pattern: &str) -> bool {
-    let Some((salt, hash)) = entry
-        .strip_prefix("|1|")
-        .and_then(|rest| rest.split_once('|'))
-    else {
-        return false;
-    };
-    let (Some(salt), Some(hash)) = (base64_decode(salt), base64_decode(hash)) else {
-        return false;
-    };
-    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, &salt);
-    let lowered = host_pattern.to_ascii_lowercase();
-    ring::hmac::verify(&key, lowered.as_bytes(), &hash).is_ok()
-        || (lowered != host_pattern
-            && ring::hmac::verify(&key, host_pattern.as_bytes(), &hash).is_ok())
-}
-
-/// 在 known_hosts 文本里查 `host_pattern` 对应的条目并与 `server_pubkey` 比对。
-///
-/// 同算法条目里只要有一条 key 字节一致就是 `Match`(同一 host 登记过新旧两把 key
-/// 时以能对上的为准,与 OpenSSH 一致);同算法的全都对不上才是 `Mismatch`;
-/// 没有同算法条目、但有其它算法的条目是 `OtherAlgorithm`;一条都没有是 `Unknown`。
-fn match_known_host(
-    raw: &str,
-    host_pattern: &str,
-    server_pubkey: &russh::keys::ssh_key::PublicKey,
-) -> HostKeyMatch {
-    let want_algo = server_pubkey.algorithm();
-    let want_algo = want_algo.as_str();
-    let want_bytes = match server_pubkey.to_bytes() {
-        Ok(b) => b,
-        Err(_) => return HostKeyMatch::Unknown,
-    };
-    let mut mismatch: Option<usize> = None;
-    let mut other_algo: Option<(usize, String)> = None;
-    for entry in known_host_entries(raw, host_pattern) {
-        if !entry.algo.eq_ignore_ascii_case(want_algo) {
-            other_algo.get_or_insert_with(|| (entry.line, entry.algo.to_string()));
-            continue;
-        }
-        if entry.key == want_bytes {
-            return HostKeyMatch::Match;
-        }
-        mismatch.get_or_insert(entry.line);
-    }
-    match (mismatch, other_algo) {
-        (Some(line), _) => HostKeyMatch::Mismatch { line },
-        (None, Some((line, algo))) => HostKeyMatch::OtherAlgorithm { line, algo },
-        (None, None) => HostKeyMatch::Unknown,
-    }
-}
-
-/// known_hosts 里该 host 已登记的 key 类型(去重,保持文件中的先后)。
-fn known_host_key_types(raw: &str, host_pattern: &str) -> Vec<String> {
-    let mut types: Vec<String> = Vec::new();
-    for entry in known_host_entries(raw, host_pattern) {
-        if !types.iter().any(|t| t.eq_ignore_ascii_case(entry.algo)) {
-            types.push(entry.algo.to_string());
-        }
-    }
-    types
-}
-
-/// 按该 host 已登记的 key 类型调整首选 host key 算法:已登记的排前面(各自保持
-/// russh 默认的相对顺序),其余照旧跟在后面 —— 即 OpenSSH `order_hostkeyalgs` 的做法。
-///
-/// 协商取客户端列表里第一个双方都支持的算法。服务器通常同时有 ed25519 / ecdsa /
-/// rsa 几把 host key,known_hosts 只登记了 rsa 而我们默认首选 ed25519 时,会拿到
-/// 一把「没见过」的 ed25519 key。已登记类型排前面后,服务器仍支持它就自然协商到它、
-/// 与登记的 key 比对;服务器不再提供时才会拿到别的类型,由 `check_server_key`
-/// 按 [`HostKeyMatch::OtherAlgorithm`] 拒绝。
-///
-/// known_hosts 里 RSA key 的类型只有 `ssh-rsa`,对应的签名算法 rsa-sha2-512 /
-/// rsa-sha2-256 / ssh-rsa 整组前移。没有任何能对上 russh 支持算法的已登记类型时
-/// 返回 `None`,沿用默认顺序。
-fn preferred_host_key_algorithms(known_types: &[String]) -> Option<Vec<russh::keys::Algorithm>> {
-    let is_known = |algo: &russh::keys::Algorithm| {
-        let key_type = if matches!(algo, russh::keys::Algorithm::Rsa { .. }) {
-            "ssh-rsa"
-        } else {
-            algo.as_str()
-        };
-        known_types.iter().any(|t| t.eq_ignore_ascii_case(key_type))
-    };
-    let (mut ordered, rest): (Vec<_>, Vec<_>) = russh::Preferred::default()
-        .key
-        .iter()
-        .cloned()
-        .partition(is_known);
-    if ordered.is_empty() {
-        return None;
-    }
-    ordered.extend(rest);
-    Some(ordered)
-}
-
-/// 标准 base64 解码(需带 `=` 填充 —— OpenSSH 写出的 key 与哈希条目都带)。
-fn base64_decode(s: &str) -> Option<Vec<u8>> {
-    use base64_engine::Engine;
-    base64_engine::engine::general_purpose::STANDARD
-        .decode(s.trim())
-        .ok()
-}
-
-// 我们已经间接通过 russh 拉了 base64 —— 但直接 use 路径不稳。改成自己引入。
-// (实际依赖在 Cargo.toml 也已添加。)
-use base64 as base64_engine;
-
-/// 把一条新 host-key 写入 known_hosts,父目录不存在则创建。
-fn append_known_host(
-    path: &std::path::Path,
-    host_pattern: &str,
-    server_pubkey: &russh::keys::ssh_key::PublicKey,
-) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    // algorithm() 返回临时,先 bind 延长生命周期再借 as_str()。
-    let algo_holder = server_pubkey.algorithm();
-    let algo = algo_holder.as_str();
-    let b64 = {
-        use base64_engine::Engine;
-        let bytes = server_pubkey
-            .to_bytes()
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-        base64_engine::engine::general_purpose::STANDARD.encode(bytes)
-    };
-    let line = format!("{host_pattern} {algo} {b64}\n");
-    use std::io::Write;
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    f.write_all(line.as_bytes())
 }
 
 // ============================================================================
@@ -1720,11 +1716,25 @@ mod tests {
         }
     }
 
+    /// 不读 ssh config、没有 home 的路线解析(纯函数测试用)。
+    fn plain_route(conn: &SshConnection) -> ResolvedRoute {
+        let env = RouteEnv {
+            ssh_config_path: None,
+            home: None,
+            local_user: Some("me"),
+        };
+        ssh_config::resolve_route(conn, &env).unwrap()
+    }
+
+    fn identity_of(conn: &SshConnection) -> CachedConnectionIdentity {
+        CachedConnectionIdentity::new(conn, plain_route(conn))
+    }
+
     #[test]
-    fn cached_connection_identity_tracks_endpoint_and_credentials_only() {
+    fn cached_connection_identity_tracks_endpoint_credentials_and_route() {
         let base = connection("ssh");
-        let identity = CachedConnectionIdentity::from_connection(&base);
-        assert!(identity.matches(&base));
+        let identity = identity_of(&base);
+        assert!(identity == identity_of(&base));
 
         for changed in [
             SshConnection {
@@ -1748,15 +1758,20 @@ mod tests {
                 ..base.clone()
             },
         ] {
-            assert!(!identity.matches(&changed));
+            assert!(identity != identity_of(&changed));
         }
 
         let display_only = SshConnection {
             name: "renamed".into(),
             group: Some("production".into()),
-            ..base
+            ..base.clone()
         };
-        assert!(identity.matches(&display_only));
+        assert!(identity == identity_of(&display_only));
+
+        // 连接配置一字未动,但 ssh config 把它解析到了别处:不能复用到旧目标上。
+        let mut rerouted = plain_route(&base);
+        rerouted.target.host_name = "elsewhere.example.com".into();
+        assert!(identity != CachedConnectionIdentity::new(&base, rerouted));
     }
 
     #[test]
@@ -1911,23 +1926,121 @@ mod tests {
         assert_eq!(c.gatetime_cooldown, Duration::from_secs(30));
         assert_eq!(c.reaper_tick, Duration::from_secs(60));
         assert_eq!(c.shutdown_per_session_timeout, Duration::from_secs(2));
+        assert_eq!(c.connect_timeout, Duration::from_secs(20));
+        assert_eq!(c.connect_timeout_per_address, Duration::from_secs(5));
+        // 建连在认证前的 keepalive 计时器到点之前结束(见 connect_timeout 注释)。
+        assert!(c.connect_timeout < c.keepalive_interval);
     }
 
     #[test]
-    fn host_pattern_uses_bracket_form_only_for_nonstandard_port() {
-        assert_eq!(host_pattern("h.example.com", 22), "h.example.com");
-        assert_eq!(host_pattern("h.example.com", 0), "h.example.com");
-        assert_eq!(host_pattern("h.example.com", 2222), "[h.example.com]:2222");
-    }
-
-    #[test]
-    fn match_known_host_ignores_blank_and_comment_lines() {
-        let pub_key = test_pubkey_from_bytes(KEY_BYTES_A);
-        let raw = "\n# comment line\n\n# another\n";
-        assert_eq!(
-            match_known_host(raw, "h.example.com", &pub_key),
-            HostKeyMatch::Unknown
+    fn cooldown_applies_only_to_the_same_identity_within_the_window() {
+        let base = connection("ssh");
+        let identity = identity_of(&base);
+        let now = Instant::now();
+        let record = AuthFailure {
+            identity: identity.clone(),
+            failed_at: now,
+            until: now + Duration::from_secs(30),
+            message: "authentication failed for deploy@example.com:22 (server allows: \
+                      password): password: rejected by server"
+                .into(),
+        };
+        let later = now + Duration::from_millis(10_500);
+        let remaining = cooldown_remaining(&record, &identity, later).expect("仍在冷却期");
+        assert_eq!(remaining, Duration::from_millis(19_500));
+        let message = cooldown_message(&record, remaining, later);
+        assert!(
+            message.starts_with("authentication cooldown: "),
+            "{message}"
         );
+        assert!(message.contains("10s ago"), "{message}");
+        // 剩余 19.5s 向上取整为 20s。
+        assert!(message.contains("another 20s"), "{message}");
+        assert!(
+            message.contains("to avoid triggering server-side bans"),
+            "{message}"
+        );
+        assert!(
+            message.ends_with("password: rejected by server"),
+            "{message}"
+        );
+
+        // 冷却期一过即可重试。
+        assert!(cooldown_remaining(&record, &identity, now + Duration::from_secs(30)).is_none());
+        // 改了连接配置(这里是密码):身份变了,立即可重试。
+        let edited = SshConnection {
+            password: Some("new-secret".into()),
+            ..base
+        };
+        assert!(cooldown_remaining(&record, &identity_of(&edited), later).is_none());
+    }
+
+    #[tokio::test]
+    async fn pool_auth_cooldown_is_keyed_by_connection_identity() {
+        let pool = SshPool::with_paths(
+            PoolConfig::default(),
+            std::env::temp_dir().join("mt-ssh-test-known_hosts-cooldown"),
+        );
+        let base = connection("ssh");
+        let identity = identity_of(&base);
+        assert!(pool.check_auth_cooldown(&base, &identity).is_ok());
+
+        pool.record_auth_failure(&identity, "authentication failed: x");
+        let err = pool.check_auth_cooldown(&base, &identity).unwrap_err();
+        assert_eq!(err.kind, AcquireErrorKind::Cooldown);
+        let message = &err.message;
+        assert!(
+            message.ends_with("Last error: authentication failed: x"),
+            "{message}"
+        );
+
+        // 换了用户 = 新身份:放行,并清掉不再适用的旧记录。
+        let edited = SshConnection {
+            user: "root".into(),
+            ..base.clone()
+        };
+        let edited_identity = identity_of(&edited);
+        assert!(pool.check_auth_cooldown(&edited, &edited_identity).is_ok());
+        assert!(pool.check_auth_cooldown(&base, &identity).is_ok());
+
+        // gatetime_cooldown = 0:不冷却。
+        let no_cooldown = SshPool::with_paths(
+            PoolConfig {
+                gatetime_cooldown: Duration::ZERO,
+                ..PoolConfig::default()
+            },
+            std::env::temp_dir().join("mt-ssh-test-known_hosts-cooldown"),
+        );
+        no_cooldown.record_auth_failure(&identity, "authentication failed: x");
+        assert!(no_cooldown.check_auth_cooldown(&base, &identity).is_ok());
+    }
+
+    #[test]
+    fn isolated_env_uses_nothing_but_the_given_known_hosts() {
+        let path = PathBuf::from("known_hosts_for_test");
+        let env = SshClientEnv::isolated(path.clone());
+        assert_eq!(env.known_hosts_path, path);
+        assert_eq!(env.home_dir, None);
+        assert_eq!(env.ssh_config_path, None);
+        assert_eq!(env.agent, AgentSource::Disabled);
+        assert_eq!(env.local_user, None);
+    }
+
+    #[test]
+    fn system_env_points_at_the_users_ssh_directory() {
+        // 只看路径的拼法,不读任何文件。
+        let env = SshClientEnv::system();
+        assert_eq!(env.agent, AgentSource::System);
+        if let Some(home) = &env.home_dir {
+            assert_eq!(env.known_hosts_path, home.join(".ssh").join("known_hosts"));
+            assert_eq!(env.ssh_config_path, Some(home.join(".ssh").join("config")));
+        }
+    }
+
+    #[test]
+    fn acquire_error_displays_its_message() {
+        let error = AcquireError::new(AcquireErrorKind::Timeout, "ssh connection to x timed out");
+        assert_eq!(error.to_string(), "ssh connection to x timed out");
     }
 
     /// pick_lru_victim 的算法纯函数等价物,用 u64 而非 Arc<CachedSession>,
@@ -1951,478 +2064,6 @@ mod tests {
     fn pick_lru_victim_empty_map_returns_none() {
         let m: HashMap<String, Arc<CachedSession>> = HashMap::new();
         assert!(pick_lru_victim(&m).is_none());
-    }
-
-    // --- match_known_host fixture helpers ----------------------------------
-    //
-    // 直接用 32 字节常量构造 ed25519 PublicKey,不经过 rng;ssh-key 不验证 ed25519
-    // 公钥的密码学合法性(只解析 wire 格式),所以任意 32 字节都能 round-trip。
-
-    fn test_pubkey_from_bytes(bytes: [u8; 32]) -> russh::keys::ssh_key::PublicKey {
-        use russh::keys::ssh_key::public::{Ed25519PublicKey, KeyData, PublicKey};
-        PublicKey::new(KeyData::Ed25519(Ed25519PublicKey(bytes)), "test")
-    }
-
-    fn pubkey_b64(pub_key: &russh::keys::ssh_key::PublicKey) -> String {
-        use base64_engine::Engine;
-        base64_engine::engine::general_purpose::STANDARD.encode(pub_key.to_bytes().unwrap())
-    }
-
-    fn pubkey_algo(pub_key: &russh::keys::ssh_key::PublicKey) -> String {
-        pub_key.algorithm().as_str().to_string()
-    }
-
-    const KEY_BYTES_A: [u8; 32] = [0x11; 32];
-    const KEY_BYTES_B: [u8; 32] = [0x22; 32];
-
-    #[test]
-    fn match_known_host_finds_exact_plaintext_entry() {
-        let pub_key = test_pubkey_from_bytes(KEY_BYTES_A);
-        let host = "h.example.com";
-        let raw = format!(
-            "# header\n{host} {} {}\nother-host ssh-rsa AAAA\n",
-            pubkey_algo(&pub_key),
-            pubkey_b64(&pub_key)
-        );
-        assert_eq!(match_known_host(&raw, host, &pub_key), HostKeyMatch::Match);
-    }
-
-    #[test]
-    fn match_known_host_detects_same_host_same_algo_diff_key_as_mismatch() {
-        let pub_a = test_pubkey_from_bytes(KEY_BYTES_A);
-        let pub_b = test_pubkey_from_bytes(KEY_BYTES_B);
-        let raw = format!(
-            "h.example.com {} {}\n",
-            pubkey_algo(&pub_a),
-            pubkey_b64(&pub_b)
-        );
-        // 文件里登记的是 pub_b,但服务器报上来的是 pub_a → mismatch
-        assert_eq!(
-            match_known_host(&raw, "h.example.com", &pub_a),
-            HostKeyMatch::Mismatch { line: 1 }
-        );
-    }
-
-    #[test]
-    fn match_known_host_prefers_matching_line_over_stale_one() {
-        // 同一 host 登记过新旧两把同算法 key:能对上的那条为准,不因旧行判 mismatch。
-        let pub_a = test_pubkey_from_bytes(KEY_BYTES_A);
-        let pub_b = test_pubkey_from_bytes(KEY_BYTES_B);
-        let algo = pubkey_algo(&pub_a);
-        let raw = format!(
-            "h.example.com {algo} {}\nh.example.com {algo} {}\n",
-            pubkey_b64(&pub_b),
-            pubkey_b64(&pub_a)
-        );
-        assert_eq!(
-            match_known_host(&raw, "h.example.com", &pub_a),
-            HostKeyMatch::Match
-        );
-    }
-
-    #[test]
-    fn match_known_host_malformed_hashed_entry_is_not_a_match() {
-        // salt / hash 不是合法 base64 的哈希条目:匹配不上任何 host。
-        let pub_key = test_pubkey_from_bytes(KEY_BYTES_A);
-        let raw = "|1|abcsalt|abchash ssh-ed25519 AAAA\n";
-        assert_eq!(
-            match_known_host(raw, "h.example.com", &pub_key),
-            HostKeyMatch::Unknown
-        );
-    }
-
-    /// 按 OpenSSH `HashKnownHosts` 的算法造一个哈希 hostspec。
-    fn hashed_hostspec(host: &str, salt: &[u8]) -> String {
-        use base64_engine::Engine;
-        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, salt);
-        let tag = ring::hmac::sign(&key, host.as_bytes());
-        let b64 = &base64_engine::engine::general_purpose::STANDARD;
-        format!("|1|{}|{}", b64.encode(salt), b64.encode(tag.as_ref()))
-    }
-
-    #[test]
-    fn hashed_host_matches_openssh_generated_entry() {
-        // 已知答案:russh 自带测试里由 OpenSSH 生成的 example.com 哈希条目,
-        // 不依赖本实现自己算出来的值。
-        let entry = "|1|O33ESRMWPVkMYIwJ1Uw+n877jTo=|nuuC5vEqXlEZ/8BXQR7m619W6Ak=";
-        assert!(hashed_host_matches(entry, "example.com"));
-        // OpenSSH 按小写主机名哈希:大小写不同的输入也要命中
-        assert!(hashed_host_matches(entry, "Example.COM"));
-        assert!(!hashed_host_matches(entry, "example.org"));
-        assert!(!hashed_host_matches(entry, "[example.com]:2222"));
-    }
-
-    #[test]
-    fn match_known_host_matches_openssh_hashed_line() {
-        let raw = "|1|O33ESRMWPVkMYIwJ1Uw+n877jTo=|nuuC5vEqXlEZ/8BXQR7m619W6Ak= ssh-ed25519 \
-                   AAAAC3NzaC1lZDI1NTE5AAAAILIG2T/B0l0gaqj3puu510tu9N1OkQ4znY3LYuEm5zCF\n";
-        let pub_key = russh::keys::parse_public_key_base64(
-            "AAAAC3NzaC1lZDI1NTE5AAAAILIG2T/B0l0gaqj3puu510tu9N1OkQ4znY3LYuEm5zCF",
-        )
-        .unwrap();
-        assert_eq!(
-            match_known_host(raw, "example.com", &pub_key),
-            HostKeyMatch::Match
-        );
-        // 同一条目换一把同算法 key → 按变更拒绝,而不是像以前那样当新主机追加
-        let other = test_pubkey_from_bytes(KEY_BYTES_A);
-        assert_eq!(
-            match_known_host(raw, "example.com", &other),
-            HostKeyMatch::Mismatch { line: 1 }
-        );
-        assert_eq!(
-            match_known_host(raw, "other.example.com", &other),
-            HostKeyMatch::Unknown
-        );
-    }
-
-    #[test]
-    fn match_known_host_hashed_entry_with_port_and_mixed_list() {
-        let pub_key = test_pubkey_from_bytes(KEY_BYTES_A);
-        let pattern = host_pattern("h.example.com", 2222);
-        let raw = format!(
-            "# 第一行注释\nplain.example.com,{} {} {}\n",
-            hashed_hostspec(&pattern, &[7u8; 20]),
-            pubkey_algo(&pub_key),
-            pubkey_b64(&pub_key)
-        );
-        assert_eq!(
-            match_known_host(&raw, &pattern, &pub_key),
-            HostKeyMatch::Match
-        );
-        // 端口不同就是另一个 host
-        assert_eq!(
-            match_known_host(&raw, "h.example.com", &pub_key),
-            HostKeyMatch::Unknown
-        );
-        let pub_b = test_pubkey_from_bytes(KEY_BYTES_B);
-        assert_eq!(
-            match_known_host(&raw, &pattern, &pub_b),
-            HostKeyMatch::Mismatch { line: 2 }
-        );
-    }
-
-    #[test]
-    fn match_known_host_comma_separated_hosts_match_any() {
-        let pub_key = test_pubkey_from_bytes(KEY_BYTES_A);
-        let raw = format!(
-            "alias.example.com,h.example.com {} {}\n",
-            pubkey_algo(&pub_key),
-            pubkey_b64(&pub_key)
-        );
-        assert_eq!(
-            match_known_host(&raw, "h.example.com", &pub_key),
-            HostKeyMatch::Match
-        );
-    }
-
-    #[test]
-    fn match_known_host_other_algorithm_only_is_reported() {
-        // 同 host 只登记了别的算法:不再当新主机放行,报出第一条的行号与算法。
-        let pub_key = test_pubkey_from_bytes(KEY_BYTES_A);
-        let other_blob = pubkey_b64(&test_pubkey_from_bytes(KEY_BYTES_B));
-        let raw = format!(
-            "other.example.com ssh-ed25519 {other_blob}\nh.example.com ssh-rsa {other_blob}\n"
-        );
-        assert_eq!(
-            match_known_host(&raw, "h.example.com", &pub_key),
-            HostKeyMatch::OtherAlgorithm {
-                line: 2,
-                algo: "ssh-rsa".into()
-            }
-        );
-        // 同时有同算法条目时以同算法的比对结果为准
-        let with_same_algo = format!(
-            "{raw}h.example.com {} {}\n",
-            pubkey_algo(&pub_key),
-            pubkey_b64(&pub_key)
-        );
-        assert_eq!(
-            match_known_host(&with_same_algo, "h.example.com", &pub_key),
-            HostKeyMatch::Match
-        );
-    }
-
-    #[test]
-    fn match_known_host_skips_marker_and_malformed_lines() {
-        let pub_key = test_pubkey_from_bytes(KEY_BYTES_A);
-        let raw = format!(
-            "@cert-authority h.example.com {algo} {b64}\n\
-             h.example.com {algo}\n\
-             h.example.com {algo} not-base64!\n",
-            algo = pubkey_algo(&pub_key),
-            b64 = pubkey_b64(&test_pubkey_from_bytes(KEY_BYTES_B)),
-        );
-        assert_eq!(
-            match_known_host(&raw, "h.example.com", &pub_key),
-            HostKeyMatch::Unknown
-        );
-    }
-
-    #[test]
-    fn known_host_key_types_dedupes_in_file_order() {
-        let blob = pubkey_b64(&test_pubkey_from_bytes(KEY_BYTES_A));
-        let raw = format!(
-            "h.example.com ssh-rsa {blob}\n\
-             other.example.com ecdsa-sha2-nistp256 {blob}\n\
-             h.example.com ssh-ed25519 {blob}\n\
-             H.EXAMPLE.COM SSH-RSA {blob}\n"
-        );
-        assert_eq!(
-            known_host_key_types(&raw, "h.example.com"),
-            vec!["ssh-rsa".to_string(), "ssh-ed25519".to_string()]
-        );
-        assert!(known_host_key_types(&raw, "nobody.example.com").is_empty());
-    }
-
-    #[test]
-    fn preferred_host_key_algorithms_puts_known_types_first() {
-        use russh::keys::{Algorithm, EcdsaCurve, HashAlg};
-        let default_len = russh::Preferred::default().key.len();
-
-        // 只登记了 RSA:签名算法三兄弟整组前移,其余保持默认相对顺序
-        let order = preferred_host_key_algorithms(&["ssh-rsa".to_string()]).unwrap();
-        assert_eq!(order.len(), default_len, "只调序,不增删");
-        assert_eq!(
-            order[..4],
-            [
-                Algorithm::Rsa {
-                    hash: Some(HashAlg::Sha512)
-                },
-                Algorithm::Rsa {
-                    hash: Some(HashAlg::Sha256)
-                },
-                Algorithm::Rsa { hash: None },
-                Algorithm::Ed25519,
-            ]
-        );
-
-        // 登记了 nistp384 与 ed25519:两者都前移,仍按默认相对顺序(ed25519 在前)
-        let order = preferred_host_key_algorithms(&[
-            "ecdsa-sha2-nistp384".to_string(),
-            "ssh-ed25519".to_string(),
-        ])
-        .unwrap();
-        assert_eq!(
-            order[..3],
-            [
-                Algorithm::Ed25519,
-                Algorithm::Ecdsa {
-                    curve: EcdsaCurve::NistP384
-                },
-                Algorithm::Ecdsa {
-                    curve: EcdsaCurve::NistP256
-                },
-            ]
-        );
-
-        // 没有已登记类型 / 只有 russh 不支持的类型:沿用默认顺序
-        assert!(preferred_host_key_algorithms(&[]).is_none());
-        assert!(preferred_host_key_algorithms(&["ssh-dss".to_string()]).is_none());
-    }
-
-    // --- known_hosts 读取与 check_server_key ------------------------------
-
-    fn known_hosts_test_dir(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("mt-ssh-known-hosts-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    fn test_client(known_hosts_path: PathBuf) -> MtClient {
-        MtClient {
-            host: "h.example.com".into(),
-            port: 22,
-            known_hosts_path,
-            rejection: Arc::new(std::sync::Mutex::new(None)),
-        }
-    }
-
-    fn rejection_of(client: &MtClient) -> String {
-        client
-            .rejection
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("拒绝时应记下原因")
-    }
-
-    #[test]
-    fn read_known_hosts_missing_file_is_empty() {
-        let dir = known_hosts_test_dir("missing");
-        assert_eq!(read_known_hosts(&dir.join("known_hosts")).unwrap(), "");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn read_known_hosts_decodes_non_utf8_lossily() {
-        // 某一行混进非 UTF-8 字节:不能让整份文件读失败,其余条目照常可用。
-        let dir = known_hosts_test_dir("non-utf8");
-        let path = dir.join("known_hosts");
-        let pub_key = test_pubkey_from_bytes(KEY_BYTES_A);
-        let mut bytes = b"# caf\xe9 \xff\xfe\n".to_vec();
-        bytes.extend_from_slice(
-            format!(
-                "h.example.com {} {}\n",
-                pubkey_algo(&pub_key),
-                pubkey_b64(&pub_key)
-            )
-            .as_bytes(),
-        );
-        std::fs::write(&path, &bytes).unwrap();
-
-        let raw = read_known_hosts(&path).expect("非 UTF-8 内容不应读失败");
-        assert_eq!(
-            match_known_host(&raw, "h.example.com", &pub_key),
-            HostKeyMatch::Match
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn read_known_hosts_other_io_error_is_an_error() {
-        // 路径是个目录:读失败但不是 NotFound —— 不能再当成空文件。
-        let dir = known_hosts_test_dir("is-dir");
-        let path = dir.join("known_hosts");
-        std::fs::create_dir_all(&path).unwrap();
-        assert!(read_known_hosts(&path).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn check_server_key_rejects_unreadable_known_hosts() {
-        let dir = known_hosts_test_dir("reject-unreadable");
-        let path = dir.join("known_hosts");
-        std::fs::create_dir_all(&path).unwrap();
-        let mut client = test_client(path.clone());
-
-        let accepted = client
-            .check_server_key(&test_pubkey_from_bytes(KEY_BYTES_A))
-            .await
-            .unwrap();
-        assert!(!accepted, "known_hosts 读不了时不得放行");
-        let reason = rejection_of(&client);
-        assert!(reason.contains("known_hosts 读取失败"), "{reason}");
-        assert!(reason.contains(&path.display().to_string()), "{reason}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn check_server_key_mismatch_reason_names_path_and_line() {
-        let dir = known_hosts_test_dir("reject-mismatch");
-        let path = dir.join("known_hosts");
-        let pub_a = test_pubkey_from_bytes(KEY_BYTES_A);
-        let pub_b = test_pubkey_from_bytes(KEY_BYTES_B);
-        std::fs::write(
-            &path,
-            format!(
-                "# header\nh.example.com {} {}\n",
-                pubkey_algo(&pub_b),
-                pubkey_b64(&pub_b)
-            ),
-        )
-        .unwrap();
-        let mut client = test_client(path.clone());
-
-        assert!(!client.check_server_key(&pub_a).await.unwrap());
-        let reason = rejection_of(&client);
-        assert!(reason.contains("主机密钥与 known_hosts 不符"), "{reason}");
-        assert!(reason.contains(&path.display().to_string()), "{reason}");
-        assert!(reason.contains("第 2 行"), "{reason}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn check_server_key_rejects_other_algorithm_without_appending() {
-        let dir = known_hosts_test_dir("reject-other-algo");
-        let path = dir.join("known_hosts");
-        let blob = pubkey_b64(&test_pubkey_from_bytes(KEY_BYTES_B));
-        let original = format!("h.example.com ssh-rsa {blob}\n");
-        std::fs::write(&path, &original).unwrap();
-        let mut client = test_client(path.clone());
-
-        assert!(!client
-            .check_server_key(&test_pubkey_from_bytes(KEY_BYTES_A))
-            .await
-            .unwrap());
-        let reason = rejection_of(&client);
-        assert!(reason.contains("ssh-rsa"), "{reason}");
-        assert!(reason.contains("第 1 行"), "{reason}");
-        assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            original,
-            "拒绝时不得把新算法的 key 追加进去"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[tokio::test]
-    async fn check_server_key_accepts_and_records_new_host() {
-        let dir = known_hosts_test_dir("accept-new");
-        let path = dir.join("known_hosts");
-        let pub_key = test_pubkey_from_bytes(KEY_BYTES_A);
-        let mut client = test_client(path.clone());
-
-        assert!(client.check_server_key(&pub_key).await.unwrap());
-        assert!(client.rejection.lock().unwrap().is_none());
-        let raw = read_known_hosts(&path).unwrap();
-        assert_eq!(
-            match_known_host(&raw, "h.example.com", &pub_key),
-            HostKeyMatch::Match
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn connect_error_prefers_recorded_rejection() {
-        let generic = russh::Error::UnknownKey;
-        assert_eq!(
-            connect_error(
-                "h",
-                22,
-                &generic,
-                Some("主机密钥与 known_hosts 不符".into())
-            ),
-            "ssh connect to h:22 failed: 主机密钥与 known_hosts 不符"
-        );
-        assert_eq!(
-            connect_error("h", 2222, &generic, None),
-            "ssh connect to h:2222 failed: Unknown server key"
-        );
-    }
-
-    #[test]
-    fn host_pattern_case_insensitive_match() {
-        let pub_key = test_pubkey_from_bytes(KEY_BYTES_A);
-        let raw = format!(
-            "H.Example.COM {} {}\n",
-            pubkey_algo(&pub_key),
-            pubkey_b64(&pub_key)
-        );
-        assert_eq!(
-            match_known_host(&raw, "h.example.com", &pub_key),
-            HostKeyMatch::Match
-        );
-    }
-
-    #[test]
-    fn append_known_host_creates_parent_dir_and_writes_entry() {
-        let dir =
-            std::env::temp_dir().join(format!("mt-ssh-mcp-test-append-{}", std::process::id()));
-        let path = dir.join("nested").join("known_hosts");
-        let _ = std::fs::remove_dir_all(&dir);
-        let pub_key = test_pubkey_from_bytes(KEY_BYTES_A);
-        append_known_host(&path, "[h.example.com]:2222", &pub_key).expect("append");
-        let content = std::fs::read_to_string(&path).expect("read back");
-        assert!(content.starts_with("[h.example.com]:2222 ssh-ed25519 "));
-        assert!(content.ends_with("\n"));
-        // 再追加一条不同 host,文件应有两行。
-        append_known_host(&path, "other.example.com", &pub_key).expect("append 2");
-        let content2 = std::fs::read_to_string(&path).expect("read 2");
-        assert_eq!(content2.lines().count(), 2);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // --- PR3: reaper / select_expired / Drop --------------------------------
@@ -2616,86 +2257,5 @@ mod tests {
             handle.is_finished(),
             "reaper should have exited after the pool's inner Arc was dropped"
         );
-    }
-
-    // --- PKCS#1 传统 RSA 私钥 fallback (task 06-06-ssh-mcp-pkcs1-rsa-key) -------
-    //
-    // 下面这把私钥是 `ssh-keygen -t rsa -b 2048 -m PEM` 一次性生成的**测试专用
-    // 废弃密钥**,只用于验证 PKCS#1 PEM 能被 try_parse_pkcs1_rsa 解析,不对应任何
-    // 真实主机/账号,无任何安全意义。
-
-    const PKCS1_RSA_FIXTURE: &str = r#"-----BEGIN RSA PRIVATE KEY-----
-MIIEowIBAAKCAQEAlsXj/txeglED7/6iFd1ic1U6NygRpptNLQ5AxqEBHFgRLOxa
-v5oTe1JQCIz4AcUiBM1d8DCRhFgdrUCz8O/gc7R3d0CjlWmcrw9VTe/OsndWeexz
-WQWduN7dqBR53jNmVw1+638mc6hXq2wNvDpohVJVK7WkpyGIfTJ6Pu/RE0JIpLjj
-5UoYHGOtGApME3/xmznA77BLjACCDvOzBtnRJWdvMruzzFgvfZEOJJIEqbgXSrCd
-XBxBFo+QEggaHtSzvCE2f5ADAnlZya6EZrxkMykxqWbHrRPrlISw7kOqgx4636QQ
-trdwNr6qpWFTon9wMPMC3soJg0wNs3gVxXVuaQIDAQABAoIBAA2/wAR8DguY3bYN
-+gk/u1GZzQmTQtYhmrkSxVTCVo/szAF/uuAhaci41ImNvrP9SRaNBRWj0tvxuSBq
-d75EnFWQzcV3LzOvLNWd8qvSbtPsJAZRn0yClu5xNwoJIU/iT2EoNDxqHOnhHmrd
-xfw14KrVEOU/1uL9di03OYScaUF13xFsvrRgdpjIKyJF7G/Tg7iSn0CrQ14mGmqJ
-1y+xYHGEezZjNAQNqYVpcyGXgNqWyNjdg0VOyunnR77GuyGgLzZMTMJGPTm7psnz
-o2ieLJOyZWO9H9EnjhwLkC+SfG6f1h6l65ZB/kS9lTwyZehQJZsN0aHUQeEYK45D
-GalV1X0CgYEAzbGacQ2FR7Pc0RM52pvRRFc3pI1LAyAiJCnDI80DKUW0dlZurr2D
-/jG3WY3FMlPImM5juzwosxgOwBvA3x6Enwz2ZFt9IXDkcykzSXKITp3OdK8Xjy+L
-gn2wdvAWHhzp859wwoekXc0oRTAXWsiW9bhSysWoroaTy2HRgwwSf58CgYEAu6W5
-FGY7oIHwOXP0uSDBs3HMkuXoUMVcUnk397GGk2rNzH0LkFzYqmsB56IRNgZG2IbZ
-3SKPx+9qrm7/SOv7Hbr/HJ8rTfj6U9xGoIGX2ruX8lS2pRhlcgB38t2bvFsrb8RN
-xIueELXerOOMnq4oBXp+EGPtEMuK1vf3tQRQNPcCgYAL8TzTRYKweAvhA6m/PH64
-5gtv/VgWlV4GFXqj8Ho3gjmJCVmhwZURRBeuFmIVmvGxlYIK0+JVC5eHpdTb32y5
-w0nm57zrHR/WY9T7da/eSKE8+xF2Gb+S0vNU5HmUQ/99SouEb9WmMIwfADzK44yI
-Naxw42r4vw2DqGk+n4vPZwKBgBLEuaVTsGUWeguVEIYvw5AKMtcCjeD+TISnQTTS
-Gc7G4PyyCSUQVE9/UnpzmFsZ954Sptnaah0qUjZOPdRyXfSUTo3zUaaD363hm2LU
-c3baSpFfbcFHlmX3rAerqLcHO2n7bXfaKx4qwrHyNI9uhew+WzuScxS59xIXTTxa
-yRbzAoGBALUQGCvKpui8rdcPsRAIjqxQ1/EPB2smWtvLwv23d0D9xjotpWdW5Ujk
-vm3b+9rtE2PW5jCNTR/JgxaWkAqC6j+fCIAunMUxYFqHMC+Q2aExzL+dDSxBe1Jb
-ipMBLNlhlJHNKVmgnpLBSiUoO5fDWn1KcwvQouOC3U3hSMAPnT+7
------END RSA PRIVATE KEY-----
-"#;
-
-    #[test]
-    fn try_parse_pkcs1_rsa_parses_plaintext_pkcs1() {
-        let key = try_parse_pkcs1_rsa(PKCS1_RSA_FIXTURE)
-            .expect("PKCS#1 RSA 应解析成功")
-            .expect("PKCS#1 标签应命中 Some 分支");
-        // 解析出的私钥算法应为 RSA(ssh-rsa)。
-        assert!(
-            key.algorithm().as_str().contains("rsa"),
-            "expected an RSA key, got algorithm {}",
-            key.algorithm().as_str()
-        );
-    }
-
-    #[test]
-    fn try_parse_pkcs1_rsa_returns_none_for_non_pkcs1_tag() {
-        // OpenSSH 格式标签 —— 本函数不处理,返回 None 让上层回退到 russh 原生错误。
-        let openssh =
-            "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAA\n-----END OPENSSH PRIVATE KEY-----\n";
-        assert!(matches!(try_parse_pkcs1_rsa(openssh), Ok(None)));
-        // PKCS#8 标签同理。
-        let pkcs8 = "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n";
-        assert!(matches!(try_parse_pkcs1_rsa(pkcs8), Ok(None)));
-    }
-
-    #[test]
-    fn try_parse_pkcs1_rsa_rejects_encrypted_pkcs1_with_guidance() {
-        let encrypted = "-----BEGIN RSA PRIVATE KEY-----\n\
-            Proc-Type: 4,ENCRYPTED\n\
-            DEK-Info: AES-128-CBC,0123456789ABCDEF0123456789ABCDEF\n\n\
-            QUJDRA==\n\
-            -----END RSA PRIVATE KEY-----\n";
-        let err = try_parse_pkcs1_rsa(encrypted).expect_err("加密 PKCS#1 应被拒绝");
-        assert!(
-            err.contains("passphrase"),
-            "错误信息应给 passphrase 指引,实际: {err}"
-        );
-    }
-
-    #[test]
-    fn try_parse_pkcs1_rsa_errors_on_corrupt_base64() {
-        // 命中 PKCS#1 标签但主体不是合法 base64/DER —— 返回 Err,不会 panic。
-        let bad =
-            "-----BEGIN RSA PRIVATE KEY-----\n@@@not-base64@@@\n-----END RSA PRIVATE KEY-----\n";
-        assert!(try_parse_pkcs1_rsa(bad).is_err());
     }
 }
