@@ -1845,6 +1845,9 @@ pub async fn run_sftp_upload_on_session(
     crate::sftp_transfer::upload(session, local_path, remote_path, options).await
 }
 
+/// [`run_sftp_upload_until`] 给协议层每请求超时额外留的余量(见其注释)。
+const UPLOAD_REQUEST_TIMEOUT_GRACE: Duration = Duration::from_secs(5);
+
 /// 同 [`run_sftp_upload_on_session`],但整段受 `deadline` 约束、由池自己收尾:到点时
 /// 不再继续写,返回 [`SftpTransferError::TimedOut`],消息写明远端文件的状态 —— 还在写
 /// 临时文件时原文件没动过(临时文件在后台删掉);原地覆盖写到一半时写明「远端文件可能
@@ -1854,15 +1857,18 @@ pub async fn run_sftp_upload_on_session(
 /// 几个往返)。调用方在外面套的兜底超时应比 `deadline` 多留一点余量;万一兜底先到,替换
 /// 照样在后台跑完、结局记日志。替换任务持有 `session` 的一份引用,期间会话不会被回收。
 ///
-/// 协议层每请求超时取 `deadline` 前的剩余时间(至少 1s)。
+/// 协议层每请求超时取 `deadline` 前的剩余时间再加 [`UPLOAD_REQUEST_TIMEOUT_GRACE`]:
+/// 必须比整体时限晚到,到点才由时限统一裁决、按阶段写明远端文件的状态。否则一个卡住的
+/// 写请求会先以晦涩的协议超时失败 —— 按整秒取整后它甚至比时限早到(剩 1.99s 取成 1s)。
 pub async fn run_sftp_upload_until(
     session: &Arc<CachedSession>,
     local_path: &str,
     remote_path: &str,
     deadline: tokio::time::Instant,
 ) -> Result<u64, SftpTransferError> {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
     let options = crate::sftp_transfer::UploadOptions {
-        request_timeout: deadline.saturating_duration_since(tokio::time::Instant::now()),
+        request_timeout: remaining + UPLOAD_REQUEST_TIMEOUT_GRACE,
         deadline: Some(deadline),
         keep_alive: Some(Arc::clone(session)),
     };
