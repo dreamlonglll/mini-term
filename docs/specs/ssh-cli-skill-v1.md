@@ -163,15 +163,15 @@ daemon 化后抽取层次升级：不只抽纯函数，而是把**完整业务�
 
 #### 会话池与 SFTP 原语（`mt-ssh` / `mt-secret`，0.4.11 同批；主程序的远程项目同样受益）
 
-- **建连对齐终端里的系统 ssh**：读 `~/.ssh/config`（`HostName` / `Port` / `User` / `IdentityFile` / `IdentitiesOnly` / `HostKeyAlias` / `Include`，以及含多跳的 `ProxyJump`）；连接自身的端口（非 22 时）、用户、私钥优先，与终端拼的 `ssh [-p port] [-i key] user@host` 等价。`ProxyCommand` 明确报不支持，`Match` 块整块跳过；
-- **认证顺序**：连接私钥 → ssh-agent 里其余的 key（Windows：`SSH_AUTH_SOCK` 为命名管道时用它，再试 `\\.\pipe\openssh-ssh-agent`，最后 Pageant）→ 默认私钥 `id_ed25519` / `id_ecdsa` / `id_rsa`（没显式指定私钥时）→ 密码 → keyboard-interactive。私钥读不了（不存在 / 格式不支持 / 带口令）只记原因、继续试别的；带口令的私钥只能经 agent 使用；公钥尝试有上限（配了密码 4 把、没配 5 把），保证密码在 sshd 默认 `MaxAuthTries 6` 之内轮得到。失败时逐方法列出结果（英文前缀、不含密码）；
+- **建连对齐终端里的系统 ssh**：读 `~/.ssh/config`（`HostName` / `Port` / `User` / `IdentityFile` / `IdentitiesOnly` / `HostKeyAlias` / `Include`，以及含多跳的 `ProxyJump`）；连接自身的端口（非 22 时）、用户、私钥优先，与终端拼的 `ssh [-p port] [-i key] user@host` 等价。`ProxyCommand`（以及跳板自己又配了代理）不支持：回落为不经代理的直连（等同旧行为），连接失败的报错与日志里附一句「已忽略 ~/.ssh/config 里的 ProxyCommand」；`Match` 块整块跳过。配置文件读不了（IO 错误，不是不存在）时沿用该连接上次成功解析的路线；写坏时只拿上次的路线复用健康会话，新建连接报 Config 错误。Unix 上组或其他用户可写的配置文件按 OpenSSH 口径忽略（只查权限位）；
+- **认证顺序**：连接私钥 → ssh-agent 里其余的 key（Windows：`SSH_AUTH_SOCK` 为命名管道时用它，再试 `\\.\pipe\openssh-ssh-agent`，最后 Pageant）→ 默认私钥 `id_ed25519` / `id_ecdsa` / `id_rsa`（没显式指定私钥时）→ 密码 → keyboard-interactive。私钥读不了（不存在 / 格式不支持 / 带口令）只记原因、继续试别的；带口令的私钥只能经 agent 使用；公钥尝试有上限（配了密码 4 把、没配 5 把），保证密码在 sshd 默认 `MaxAuthTries 6` 之内轮得到；加固服务器（MaxAuthTries 更小）在密码轮到之前就断开时，同一建连预算内重连一次、只试密码与 keyboard-interactive。`IdentityFile` 指向 `.pub` 时到 agent 里找同一把 key 签名（1Password 等的写法）。跳板只用 agent / 默认私钥 / 它自己的 `IdentityFile`（密码属于目标连接），跳板认证失败的报错以 `authentication failed for jump host …` 开头。失败时逐方法列出结果（英文前缀、不含密码）；认证途中断网按网络错误报（`connection lost during authentication …`），不计冷却；
 - **建连限时**：DNS / TCP / 握手 / 认证整段 20s（`PoolConfig::connect_timeout`，逐地址 5s），超时写明卡在哪个阶段；建连途中被丢弃（请求时限、取消）时掐断传输，不留 russh 任务与 socket。退出码口径见 §2「进程模型」：池内超时 = 连接错误 exit 2；
-- **认证失败冷却**：按连接身份冷却 30s，期间 acquire 直接返回 `authentication cooldown: …`、不碰网络；改了连接配置即换了身份，可立即重试。网络错误、超时、主机密钥问题不计入；
+- **认证失败冷却**：按连接身份冷却 30s，期间 acquire 直接返回 `authentication cooldown: …`、不碰网络；改了连接配置即换了身份，可立即重试。网络错误、超时、主机密钥问题不计入。同一连接的建连单飞（按 `conn.id`）：并发请求排队等同一次建连，拿到闸后重查池与冷却，排队期间同一身份建连失败的直接共享那次的错误——冷却不会被一波并发绕过；
 - **兼容算法**：在 russh 默认表之后追加 `ecdh-sha2-nistp256/384/521`、`aes128-gcm@openssh.com`、`hmac-sha1-etm@openssh.com` / `hmac-sha1`（强算法仍优先）；
-- **known_hosts**：支持 `*` / `?` 通配、`!` 否定、`@revoked`（命中即拒、不追加）与哈希条目；拒绝原因带英文前缀（`host key verification failed: …`、`known_hosts unreadable …`）；
-- **SFTP 传输**：会话锁只在开 channel 时持有，传输期间持 SFTP lease，同一连接上的 exec、其它传输与 acquire 不排队；
+- **known_hosts**：支持 `*` / `?` 通配、`!` 否定、`@revoked`（命中即拒、不追加）与哈希条目；拒绝原因带英文前缀（`host key verification failed: …`、`known_hosts unreadable …`）；追加新条目前若文件末尾没有换行先补一个（与 OpenSSH 相同，免得粘坏上一行、让那台主机退回首次信任）；
+- **SFTP 传输**：会话锁只在开 channel 时持有，传输期间持 SFTP lease，同一连接上的 exec、其它传输与 acquire 不排队；「等锁 + 开 channel + 请求子系统」整段 10s 上限（`PoolConfig::sftp_open_timeout`），超时或会话已被标记不健康时返回 transport 错误，由调用方淘汰重连；
   - download：约 1 MiB 窗口多请求并行（块大小按 `limits@openssh.com`，封顶 64 KiB；未通告时 32 KiB），短读从实际位置补读；先写本地 `<local>.<pid>-<seq>.mt-sftp-partial` 再 rename 替换，失败或超时删除临时文件、原有本地文件不动；远端是目录时报错；
-  - upload：逐跳跟随软链，软链保持软链（悬空软链在它指向处新建；成环、指向目录或特殊文件时传输前报错）；在最终文件所在目录写隐藏临时文件 `.<名>.mt-partial-…`，创建时权限位即与目标一致、属主尽量对齐；有 `posix-rename@openssh.com` 时原子替换，否则「目标 → 备份、临时 → 目标、删备份」带回滚；原文件不在原位时绝不删临时文件，留下的临时 / 备份路径写进错误信息。属主或权限位复刻不了、或目录里建不了临时文件时，像 scp 一样原地覆盖写（中途失败会留下不完整的文件，错误信息写明）；目标不可写时报错、文件不动。超时取消后在后台清理远端临时文件；
+  - upload：逐跳跟随软链，软链保持软链（悬空软链在它指向处新建；成环、指向目录或特殊文件时传输前报错）。跟随前按内核 `fs.protected_symlinks` 的规则把关：软链所在目录 sticky 且全局可写（如 `/tmp`）时，只跟随目录属主或登录用户自己的软链，否则报错——防止共享目录里预埋的软链把上传引去覆盖别人的文件；在最终文件所在目录写隐藏临时文件 `.<名>.mt-partial-…`，创建时权限位即与目标一致、属主尽量对齐；有 `posix-rename@openssh.com` 时原子替换，否则「目标 → 备份、临时 → 目标、删备份」带回滚；原文件不在原位时绝不删临时文件，留下的临时 / 备份路径写进错误信息。属主或权限位复刻不了、或目录里建不了临时文件时，像 scp 一样原地覆盖写（中途失败会留下不完整的文件，错误信息写明）；目标不可写时报错、文件不动。超时取消后在后台清理远端临时文件。替换与回滚一旦开始就在独立任务里跑完，外层超时或取消不会让目标停在被挪走的状态。sidecar 与 mt-remote 粘贴上传走带整体时限的入口 `run_sftp_upload_until`：池在时限前收尾并按阶段写明结局（没动过 / 原文件未动、临时文件后台删除 / 原地覆盖到一半——远端文件可能不完整），调用方外层只留 10s 兜底（`SftpTransferError::TimedOut`）；双斜杠开头的远端路径（Git Bash 下的 `//var/log/x`）全程原样保留；
 - **密钥重载**：sidecar 懒加载的 `credential.key` 解不开信封时，若密钥文件已被主程序重建则重读并重试一次（主程序自己登记的密钥不重载），常驻 daemon 不再一直报 `password unavailable`。
 
 `mt-ssh-mcp.rs` 瘦身成 rmcp 适配层，**过渡期继续构建发布**（存量项目 `.mcp.json` 仍指向它，两者共享同一审计日志与行为）。

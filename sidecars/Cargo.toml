@@ -29,6 +29,10 @@ name = "mt-sidecars"
 # 拒绝启动(提权 daemon 会被同用户的普通权限进程借去绕过 UAC);Git Bash 改写过的 exec 命令 /
 # `--cwd` / 远端路径按用法错误拒绝并教写法;管道核验加 owner SID;端点拒绝访问时不拉起、
 # 直接降级;日志轮转持文件锁;开 channel 超时持锁标记并退役 session,排队的请求不再各耗一次超时。
+# 会话池一侧的评审修复同样链进 sidecar:上传经 sticky 且全局可写目录里的软链时按
+# protected_symlinks 规则把关;同一连接建连单飞,冷却不会被并发绕过;替换 / 回滚在独立任务里跑完,
+# 上传走带时限的 run_sftp_upload_until;ProxyCommand 回落直连并说明;认证途中断网不计冷却;
+# 加固服务器先断开时重连一次只试密码;IdentityFile 指向 .pub 时经 agent 签名;SFTP 开 channel 10s 上限。
 version = "0.4.11"
 description = "mini-term sidecar binaries: miniterm-hook (AI hook), mt-ssh-mcp (SSH MCP server) and mt-ssh-cli (SSH CLI + daemon)"
 edition = "2021"
