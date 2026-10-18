@@ -41,6 +41,8 @@
 //!   主程序跑到、投影还是旧明文)与存档回退都靠这条。
 //! - 解不开(密钥换了 / 密文被改)返回 [`SecretError::Undecryptable`],调用方
 //!   给用户「请重新填写密码」;**绝不**把密文当密码送去认证。
+//! - 常驻 sidecar 懒加载的钥匙解不开时,[`reveal_global`] 重读一次密钥文件:主程序
+//!   可能已重建 `credential.key`,文件确实换过才换上新钥匙再试;登记来的钥匙不重载。
 //!
 //! # 依赖方向
 //!
@@ -56,7 +58,7 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
@@ -204,6 +206,29 @@ fn decode_key_file(raw: &[u8]) -> Result<Zeroizing<[u8; KEY_LEN]>, SecretError> 
     Ok(key)
 }
 
+/// 读 `{data_dir}/credential.key` 的原始字节(Unix 上里面就是裸密钥,读完即清零)。
+fn read_key_file(data_dir: &Path) -> Result<Zeroizing<Vec<u8>>, SecretError> {
+    let path = key_file_path(data_dir);
+    match fs::read(&path) {
+        Ok(raw) => Ok(Zeroizing::new(raw)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Err(SecretError::KeyMissing(path)),
+        Err(e) => Err(SecretError::KeyUnreadable(format!(
+            "{}: {e}",
+            path.display()
+        ))),
+    }
+}
+
+/// 密钥文件原始字节的 SHA-256。DPAPI 每次包裹的结果都不同,主程序重建过密钥,
+/// 文件字节一定变。
+type KeyFileDigest = [u8; 32];
+
+fn key_file_digest(raw: &[u8]) -> KeyFileDigest {
+    let mut out = [0u8; 32];
+    out.copy_from_slice(ring::digest::digest(&ring::digest::SHA256, raw).as_ref());
+    out
+}
+
 /// 写密钥文件:同目录临时文件 → rename。Unix 下临时文件一出生就是 0600。
 fn write_key_file(path: &Path, content: &str) -> Result<(), SecretError> {
     let tmp = path.with_extension(format!("key.tmp-{}", std::process::id()));
@@ -267,22 +292,17 @@ impl Vault {
 
     /// 打开 `{data_dir}/credential.key`。**不存在不创建**(sidecar 走这条)。
     pub fn open(data_dir: &Path) -> Result<Self, SecretError> {
-        let path = key_file_path(data_dir);
-        let raw = match fs::read(&path) {
-            Ok(raw) => raw,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                return Err(SecretError::KeyMissing(path));
-            }
-            Err(e) => {
-                return Err(SecretError::KeyUnreadable(format!(
-                    "{}: {e}",
-                    path.display()
-                )));
-            }
-        };
-        Ok(Self {
+        Self::open_with_digest(data_dir).map(|(vault, _)| vault)
+    }
+
+    /// 同 [`open`](Self::open),另返回密钥文件原始字节的摘要:懒加载的进程级凭据库
+    /// 凭它判断文件换没换过(不在内存里多留一份密钥文件内容)。
+    fn open_with_digest(data_dir: &Path) -> Result<(Self, KeyFileDigest), SecretError> {
+        let raw = read_key_file(data_dir)?;
+        let vault = Self {
             key: Arc::new(decode_key_file(&raw)?),
-        })
+        };
+        Ok((vault, key_file_digest(&raw)))
     }
 
     /// 打开,不存在就生成一把并落盘(只有主程序走这条)。
@@ -371,13 +391,134 @@ impl Vault {
 
 // ─── 进程级凭据库 ─────────────────────────────────────────────
 
-static GLOBAL: OnceLock<Vault> = OnceLock::new();
+/// 进程级凭据库的槽位。
+enum Slot {
+    /// 还没有钥匙:没登记过,懒加载也还没成功过。
+    Empty,
+    /// 主程序 [`install`] 登记的权威钥匙,**从不重载**。
+    Installed(Vault),
+    /// sidecar 懒加载的钥匙,连同当时密钥文件的摘要(判断文件后来换没换过)。
+    Loaded { vault: Vault, digest: KeyFileDigest },
+}
+
+/// 可替换的进程级凭据库。用一把 `Mutex` 串起登记、懒加载与重载:并发解封各自
+/// 克隆出 [`Vault`](廉价,共享同一份密钥)后在锁外解密;只有懒加载与「解不开时
+/// 重读密钥文件」在锁内做,同一时刻至多一个线程碰密钥文件。
+///
+/// 结构体本身不知道密钥目录在哪,由调用方传入定位函数 —— 单测因此不必改进程环境变量
+/// (`APPDATA` 等),用临时目录即可。
+struct GlobalVault {
+    slot: Mutex<Slot>,
+}
+
+impl GlobalVault {
+    const fn new() -> Self {
+        Self {
+            slot: Mutex::new(Slot::Empty),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Slot> {
+        self.slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// 先到先得:槽位里已有钥匙(登记的或懒加载的)就返回 `false` 并忽略。
+    fn install(&self, vault: Vault) -> bool {
+        let mut slot = self.lock();
+        if matches!(*slot, Slot::Empty) {
+            *slot = Slot::Installed(vault);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 取当前钥匙;没有就从 `key_dir()` 只读懒加载。成功才缓存,失败下次重试。
+    fn get(
+        &self,
+        key_dir: impl FnOnce() -> Result<PathBuf, SecretError>,
+    ) -> Result<Vault, SecretError> {
+        let mut slot = self.lock();
+        match &*slot {
+            Slot::Installed(vault) | Slot::Loaded { vault, .. } => return Ok(vault.clone()),
+            Slot::Empty => {}
+        }
+        let (vault, digest) = Vault::open_with_digest(&key_dir()?)?;
+        *slot = Slot::Loaded {
+            vault: vault.clone(),
+            digest,
+        };
+        Ok(vault)
+    }
+
+    /// 解封。遗留明文原样放行、不碰密钥。懒加载的钥匙解不开时重读一次密钥文件:
+    /// 内容确实变了(主程序重建过密钥,用户重填的密码都由新钥匙封存)就换上新钥匙
+    /// 再试一次;登记来的钥匙不重载。
+    fn reveal(
+        &self,
+        stored: &str,
+        key_dir: impl Fn() -> Result<PathBuf, SecretError>,
+    ) -> Result<String, SecretError> {
+        if !is_sealed(stored) {
+            return Ok(stored.to_string());
+        }
+        let vault = self.get(&key_dir)?;
+        match vault.reveal(stored) {
+            Err(SecretError::Undecryptable) => {}
+            other => return other,
+        }
+        match self.reload_if_changed(&vault, &key_dir) {
+            Some(fresh) => fresh.reveal(stored),
+            None => Err(SecretError::Undecryptable),
+        }
+    }
+
+    /// `tried` 解不开时的重载。返回值是该拿来重试的钥匙:
+    /// - 别的线程已经换上了一把(槽里不再是 `tried`)→ 直接用那把;
+    /// - 密钥文件的摘要变了且能解开 → 换上并返回新钥匙;
+    /// - 登记来的钥匙、文件没变、文件没了或读不了 → `None`(沿用旧钥匙,不清槽)。
+    fn reload_if_changed(
+        &self,
+        tried: &Vault,
+        key_dir: impl FnOnce() -> Result<PathBuf, SecretError>,
+    ) -> Option<Vault> {
+        let mut slot = self.lock();
+        let Slot::Loaded { vault, digest } = &mut *slot else {
+            return None;
+        };
+        if !Arc::ptr_eq(&vault.key, &tried.key) {
+            return Some(vault.clone());
+        }
+        let raw = read_key_file(&key_dir().ok()?).ok()?;
+        let fresh_digest = key_file_digest(&raw);
+        if fresh_digest == *digest {
+            return None;
+        }
+        let fresh = Vault {
+            key: Arc::new(decode_key_file(&raw).ok()?),
+        };
+        *vault = fresh.clone();
+        *digest = fresh_digest;
+        Some(fresh)
+    }
+}
+
+static GLOBAL: GlobalVault = GlobalVault::new();
+
+/// sidecar 懒加载密钥的目录:`mt_core::config_json_path()` 的同目录。
+fn sidecar_key_dir() -> Result<PathBuf, SecretError> {
+    mt_core::config_json_path()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .ok_or(SecretError::DataDirUnknown)
+}
 
 /// 登记进程级凭据库。**先到先得**,再登记返回 `false` 并忽略 —— 主程序在
 /// `ConfigStore::load` 里登记它数据目录那把(dev 实例的 `MT_APP_DATA_DIR` 隔离
-/// 目录也因此走对)。
+/// 目录也因此走对)。登记的钥匙是权威钥匙,解不开时也不会被重载替换。
 pub fn install(vault: Vault) -> bool {
-    GLOBAL.set(vault).is_ok()
+    GLOBAL.install(vault)
 }
 
 /// 进程级凭据库。没登记过就**懒加载**:在 `mt_core::config_json_path()` 的同目录
@@ -385,24 +526,18 @@ pub fn install(vault: Vault) -> bool {
 /// 密钥必须与投影同源(**刻意不认** `MT_APP_DATA_DIR`:sidecar 读的投影不认它,
 /// 密钥跟着它走就会拿 dev 实例的钥匙去开装机版的信封)。成功才缓存,失败下次重试。
 pub fn global() -> Result<Vault, SecretError> {
-    if let Some(vault) = GLOBAL.get() {
-        return Ok(vault.clone());
-    }
-    let dir = mt_core::config_json_path()
-        .and_then(|p| p.parent().map(Path::to_path_buf))
-        .ok_or(SecretError::DataDirUnknown)?;
-    let vault = Vault::open(&dir)?;
-    let _ = GLOBAL.set(vault.clone());
-    Ok(vault)
+    GLOBAL.get(sidecar_key_dir)
 }
 
 /// 用进程级凭据库解开一个已存值。遗留明文原样放行、**不碰**密钥文件 ——
 /// sidecar 在升级窗口期读到旧明文投影时不该因为密钥还没生成而失败。
+///
+/// 懒加载的钥匙解不开([`SecretError::Undecryptable`])时重读一次密钥文件:常驻的
+/// sidecar daemon 加载密钥之后,主程序可能重建了 `credential.key`(旧文件被删、用户
+/// 重填密码),新信封都由新钥匙封存。文件内容确实变了才换上新钥匙、再试一次;
+/// [`install`] 登记的钥匙不重载。
 pub fn reveal_global(stored: &str) -> Result<String, SecretError> {
-    if !is_sealed(stored) {
-        return Ok(stored.to_string());
-    }
-    global()?.reveal(stored)
+    GLOBAL.reveal(stored, sidecar_key_dir)
 }
 
 /// 用进程级凭据库封存一个明文。
@@ -599,5 +734,153 @@ mod tests {
     fn debug_never_prints_key_material() {
         let vault = Vault::from_key([0x42; KEY_LEN]);
         assert_eq!(format!("{vault:?}"), "Vault(<redacted>)");
+    }
+
+    // ─── 进程级凭据库的槽位(用独立实例 + 临时目录,不碰真实数据目录与进程环境) ───
+
+    fn write_plain_key(dir: &Path, key: [u8; KEY_LEN]) {
+        let file = KeyFile {
+            version: 1,
+            scheme: "plain".into(),
+            key: B64.encode(key),
+        };
+        fs::write(key_file_path(dir), serde_json::to_string(&file).unwrap()).unwrap();
+    }
+
+    /// 常驻 sidecar 懒加载了旧钥匙,主程序随后重建了密钥(旧文件删掉、生成新钥匙),
+    /// 用户重填的密码由新钥匙封存:解不开时重读文件、换上新钥匙,不必等 daemon 退出。
+    #[test]
+    fn lazy_vault_reloads_after_the_key_file_is_replaced() {
+        let dir = temp_dir("reload");
+        let locate = || -> Result<PathBuf, SecretError> { Ok(dir.clone()) };
+        write_plain_key(&dir, [1; KEY_LEN]);
+        let slot = GlobalVault::new();
+        let old_envelope = Vault::from_key([1; KEY_LEN]).seal("old").unwrap();
+        assert_eq!(slot.reveal(&old_envelope, locate).unwrap(), "old");
+
+        write_plain_key(&dir, [2; KEY_LEN]);
+        let new_envelope = Vault::from_key([2; KEY_LEN]).seal("new").unwrap();
+        assert_eq!(slot.reveal(&new_envelope, locate).unwrap(), "new");
+        // 换上的是新钥匙:旧钥匙封的信封从此解不开(主程序那边同样要重填)。
+        assert_eq!(
+            slot.reveal(&old_envelope, locate),
+            Err(SecretError::Undecryptable)
+        );
+        assert_eq!(
+            slot.get(locate).unwrap().reveal(&new_envelope).unwrap(),
+            "new"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 主程序登记的是它自己的权威钥匙:解不开也不去读文件替换。
+    #[test]
+    fn installed_vault_is_never_reloaded() {
+        let dir = temp_dir("installed");
+        let locate = || -> Result<PathBuf, SecretError> { Ok(dir.clone()) };
+        write_plain_key(&dir, [2; KEY_LEN]);
+        let slot = GlobalVault::new();
+        assert!(slot.install(Vault::from_key([1; KEY_LEN])));
+        assert!(!slot.install(Vault::from_key([3; KEY_LEN])), "先到先得");
+        let from_file = Vault::from_key([2; KEY_LEN]).seal("x").unwrap();
+        assert_eq!(
+            slot.reveal(&from_file, locate),
+            Err(SecretError::Undecryptable)
+        );
+        let own = Vault::from_key([1; KEY_LEN]).seal("y").unwrap();
+        assert_eq!(slot.reveal(&own, locate).unwrap(), "y");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 文件没变、没了或坏了:沿用已加载的钥匙,解不开的照旧报解不开,绝不交出密文。
+    #[test]
+    fn unchanged_missing_or_corrupt_key_file_keeps_the_loaded_key() {
+        let dir = temp_dir("keep");
+        let locate = || -> Result<PathBuf, SecretError> { Ok(dir.clone()) };
+        write_plain_key(&dir, [1; KEY_LEN]);
+        let slot = GlobalVault::new();
+        let own = Vault::from_key([1; KEY_LEN]).seal("own").unwrap();
+        let foreign = Vault::from_key([9; KEY_LEN]).seal("foreign").unwrap();
+        assert_eq!(slot.reveal(&own, locate).unwrap(), "own");
+        assert_eq!(
+            slot.reveal(&foreign, locate),
+            Err(SecretError::Undecryptable)
+        );
+
+        fs::remove_file(key_file_path(&dir)).unwrap();
+        assert_eq!(
+            slot.reveal(&foreign, locate),
+            Err(SecretError::Undecryptable)
+        );
+        assert_eq!(slot.reveal(&own, locate).unwrap(), "own");
+
+        fs::write(key_file_path(&dir), "{ not json").unwrap();
+        assert_eq!(
+            slot.reveal(&foreign, locate),
+            Err(SecretError::Undecryptable)
+        );
+        assert_eq!(slot.reveal(&own, locate).unwrap(), "own");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 懒加载失败不缓存、下次重试;遗留明文不去定位密钥;懒加载之后再登记照旧先到先得。
+    #[test]
+    fn lazy_load_failure_is_retried_and_plaintext_never_needs_the_key() {
+        let dir = temp_dir("lazy");
+        let locate = || -> Result<PathBuf, SecretError> { Ok(dir.clone()) };
+        let slot = GlobalVault::new();
+        let never = || -> Result<PathBuf, SecretError> {
+            panic!("legacy plaintext must not locate the key")
+        };
+        assert_eq!(slot.reveal("legacy", never).unwrap(), "legacy");
+
+        assert!(matches!(slot.get(locate), Err(SecretError::KeyMissing(_))));
+        let envelope = Vault::from_key([5; KEY_LEN]).seal("pw").unwrap();
+        assert!(matches!(
+            slot.reveal(&envelope, locate),
+            Err(SecretError::KeyMissing(_))
+        ));
+        write_plain_key(&dir, [5; KEY_LEN]);
+        assert_eq!(slot.reveal(&envelope, locate).unwrap(), "pw");
+        assert!(!slot.install(Vault::from_key([6; KEY_LEN])));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn concurrent_reveals_after_a_key_rotation_all_succeed() {
+        let dir = temp_dir("concurrent");
+        let locate = || -> Result<PathBuf, SecretError> { Ok(dir.clone()) };
+        write_plain_key(&dir, [1; KEY_LEN]);
+        let slot = GlobalVault::new();
+        slot.get(locate).unwrap();
+        write_plain_key(&dir, [2; KEY_LEN]);
+        let envelope = Vault::from_key([2; KEY_LEN]).seal("rotated").unwrap();
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| scope.spawn(|| slot.reveal(&envelope, locate)))
+                .collect();
+            for worker in workers {
+                assert_eq!(worker.join().unwrap().unwrap(), "rotated");
+            }
+        });
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 真实格式的密钥文件(Windows 上是 DPAPI 包裹,同一把钥匙每次包裹的字节也不同):
+    /// 主程序删掉旧文件、`open_or_create` 生成新钥匙。
+    #[test]
+    fn rotation_through_open_or_create_is_picked_up() {
+        let dir = temp_dir("rotate-real");
+        let locate = || -> Result<PathBuf, SecretError> { Ok(dir.clone()) };
+        let first = Vault::open_or_create(&dir).unwrap();
+        let slot = GlobalVault::new();
+        let old = first.seal("old").unwrap();
+        assert_eq!(slot.reveal(&old, locate).unwrap(), "old");
+
+        fs::remove_file(key_file_path(&dir)).unwrap();
+        let second = Vault::open_or_create(&dir).unwrap();
+        let new = second.seal("new").unwrap();
+        assert_eq!(slot.reveal(&new, locate).unwrap(), "new");
+        fs::remove_dir_all(&dir).ok();
     }
 }

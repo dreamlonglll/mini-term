@@ -18,6 +18,7 @@ mod auth;
 mod known_hosts;
 pub mod pool;
 pub mod sftp;
+mod sftp_transfer;
 mod ssh_config;
 mod transport;
 
