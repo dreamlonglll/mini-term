@@ -6,6 +6,9 @@
 //! - daemon 不继承 CLI 的工作目录:CLI 退出后,调用方的当前目录能被改名;
 //! - daemon 的 stderr 落进数据目录下的日志文件,`daemon-status` 报得出日志路径。
 //!
+//! 另有两条不拉起 daemon 的路径:Git Bash(MSYS)改写过的实参在任何动作之前就被拒;
+//! 端点拒绝本进程连接时立即降级、不白拉起一个 daemon 再等满重连窗口。
+//!
 //! 隔离:独立端点(`MINITERM_SSH_CLI_ENDPOINT`)+ 临时 `APPDATA`,不碰真实 daemon 与真实
 //! 配置。测试拉起的 daemon 跑的是 target 里的 exe,不停掉会锁住它、让下次构建失败 ——
 //! 收尾无论成败都 `daemon-stop` 并等进程真正退出。所有等待都有上限:回归时报失败,
@@ -58,12 +61,16 @@ impl Sandbox {
         }
     }
 
-    /// 带隔离环境的 CLI 命令。
+    /// 带隔离环境的 CLI 命令。MSYS 的环境变量一并剔掉:从 Git Bash 里跑 `cargo test` 时它们会
+    /// 被继承,CLI 的行为就跟着跑测试的 shell 变了。
     fn cli(&self) -> Command {
         let mut cmd = Command::new(CLI);
         cmd.env("APPDATA", &self.appdata)
             .env("MINITERM_SSH_CLI_ENDPOINT", &self.endpoint)
-            .env_remove("MT_APP_DATA_DIR");
+            .env_remove("MT_APP_DATA_DIR")
+            .env_remove("MSYSTEM")
+            .env_remove("MSYS_NO_PATHCONV")
+            .env_remove("MSYS2_ARG_CONV_EXCL");
         cmd
     }
 
@@ -225,8 +232,18 @@ fn parse_pid(status_line: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
+/// 跑测试的进程是否以管理员身份(提权)运行。提权的 CLI 不用 daemon(直接进程内执行),
+/// 冷启动这条用例在那种 shell 里无从验证。
+fn running_elevated() -> bool {
+    mt_sidecars::ipc::current_process_elevated().unwrap_or(true)
+}
+
 #[test]
 fn cold_start_releases_caller_pipes_and_cwd_and_logs_to_the_data_dir() {
+    if running_elevated() {
+        eprintln!("skipped: running elevated — an elevated mt-ssh-cli never starts the daemon");
+        return;
+    }
     let sandbox = Sandbox::new("cold");
     let mut cleanup = DaemonCleanup::new(&sandbox);
 
@@ -319,4 +336,125 @@ fn cold_start_releases_caller_pipes_and_cwd_and_logs_to_the_data_dir() {
         text.contains(&format!("listening on {}", sandbox.endpoint)),
         "{text}"
     );
+}
+
+/// F2:在 Git Bash(`MSYSTEM` 在、没关路径转换)里,看起来被改写过的远端命令 / `--cwd` / 远端
+/// 路径在任何动作之前就被拒(exit 2,说明怎么写),不连 daemon、也不拉起。
+#[test]
+fn msys_rewritten_arguments_are_refused_before_anything_runs() {
+    let sandbox = Sandbox::new("msys");
+    let _cleanup = DaemonCleanup::new(&sandbox);
+    let cases: [&[&str]; 3] = [
+        &[
+            "exec",
+            "--project-token",
+            "bogus-token",
+            "prod",
+            "--",
+            "tail",
+            "-n",
+            "50",
+            "D:/Program Files/Git/var/log/syslog",
+        ],
+        &[
+            "exec",
+            "--project-token",
+            "bogus-token",
+            "--cwd",
+            "D:/Program Files/Git/etc/nginx",
+            "prod",
+            "--",
+            "ls",
+        ],
+        &[
+            "download",
+            "--project-token",
+            "bogus-token",
+            "prod",
+            "C:/Users/me/AppData/Local/Temp/x.log",
+            "x.log",
+        ],
+    ];
+    for args in cases {
+        let mut cmd = sandbox.cli();
+        cmd.env("MSYSTEM", "MINGW64").args(args);
+        let run = run_cli(&mut cmd, Duration::from_secs(30)).expect("run mt-ssh-cli");
+        assert_eq!(run.code, Some(2), "{args:?}: {}", run.stderr);
+        assert!(
+            run.stderr.starts_with("mt-ssh-cli: error: ") && run.stderr.contains("Git Bash (MSYS)"),
+            "{args:?}: {}",
+            run.stderr
+        );
+        assert!(!run.stderr.contains("falling back"), "{}", run.stderr);
+    }
+
+    // 什么都没跑:端点上没有被拉起的 daemon。
+    let status = run_cli(sandbox.cli().arg("daemon-status"), Duration::from_secs(15))
+        .expect("run daemon-status");
+    assert_eq!(status.code, Some(1), "{}{}", status.stdout, status.stderr);
+    assert!(status.stdout.contains("not running"), "{}", status.stdout);
+}
+
+/// F6:端点被一个拒绝本进程连接的管道占着 —— 立即降级 one-shot 并说明原因,不再白拉起一个
+/// 注定绑不上的 daemon、等满约 3 秒的重连窗口;`daemon-status` 报错 exit 2。
+#[test]
+fn endpoint_that_refuses_this_process_falls_back_at_once_without_spawning() {
+    use mt_sidecars::ipc::windows_security::PipeSecurity;
+    use tokio::net::windows::named_pipe::ServerOptions;
+
+    if running_elevated() {
+        eprintln!("skipped: running elevated — an elevated mt-ssh-cli never contacts the daemon");
+        return;
+    }
+    let sandbox = Sandbox::new("denied");
+    let _cleanup = DaemonCleanup::new(&sandbox);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    // 只授权 LocalSystem 的管道占住端点:本进程(及它拉起的 CLI)连不上。
+    let security = PipeSecurity::from_sddl("D:P(A;;GA;;;SY)").unwrap();
+    let holder = runtime.block_on(async {
+        // SAFETY: security 在本测试内存活。
+        unsafe {
+            ServerOptions::new()
+                .first_pipe_instance(true)
+                .create_with_security_attributes_raw(&sandbox.endpoint, security.attributes_ptr())
+        }
+        .unwrap()
+    });
+
+    let started = Instant::now();
+    let run = run_cli(
+        sandbox
+            .cli()
+            .args(["list", "--project-token", "bogus-token"]),
+        Duration::from_secs(30),
+    )
+    .expect("run mt-ssh-cli list");
+    let elapsed = started.elapsed();
+    assert!(
+        run.stderr.contains("refused this process") && run.stderr.contains("not starting a daemon"),
+        "stderr: {}",
+        run.stderr
+    );
+    // 降级后照常执行:临时 APPDATA 是空的,报「配置不存在」、exit 2。
+    assert_eq!(run.code, Some(2), "stderr: {}", run.stderr);
+    assert!(
+        run.stderr.contains("does not exist"),
+        "stderr: {}",
+        run.stderr
+    );
+    // 此前要先拉起 daemon、再退避重连约 3 秒才降级。
+    assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
+
+    let status = run_cli(sandbox.cli().arg("daemon-status"), Duration::from_secs(15))
+        .expect("run daemon-status");
+    assert_eq!(status.code, Some(2), "{}{}", status.stdout, status.stderr);
+    assert!(
+        status.stderr.contains("refused this process"),
+        "{}",
+        status.stderr
+    );
+    drop(holder);
 }

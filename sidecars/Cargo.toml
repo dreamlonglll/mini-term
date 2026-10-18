@@ -25,6 +25,10 @@ name = "mt-sidecars"
 # known_hosts 认通配 / 否定 / @revoked。SFTP 传输只在开 channel 时持会话锁,下载约 1 MiB
 # 窗口流水线,上传跟随软链、保留权限与属主(保不住时像 scp 一样原地覆盖写)、posix-rename
 # 原子替换或备份 + 回滚。daemon 缓存的密钥在 credential.key 被主程序重建后解不开时重读。
+# 同属 0.4.11 的评审修复:以管理员身份运行时 CLI 不连也不拉起 daemon、`daemon` 子命令提权时
+# 拒绝启动(提权 daemon 会被同用户的普通权限进程借去绕过 UAC);Git Bash 改写过的 exec 命令 /
+# `--cwd` / 远端路径按用法错误拒绝并教写法;管道核验加 owner SID;端点拒绝访问时不拉起、
+# 直接降级;日志轮转持文件锁;开 channel 超时持锁标记并退役 session,排队的请求不再各耗一次超时。
 version = "0.4.11"
 description = "mini-term sidecar binaries: miniterm-hook (AI hook), mt-ssh-mcp (SSH MCP server) and mt-ssh-cli (SSH CLI + daemon)"
 edition = "2021"

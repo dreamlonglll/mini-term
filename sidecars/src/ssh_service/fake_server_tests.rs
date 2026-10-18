@@ -15,7 +15,8 @@
 //!   `together`;等不到输出 `alone` —— 用来证明同一 session 上的两个 exec 真的并发。
 //!
 //! 服务器开关 `hang_channel_open_on_first`:前 N 条 TCP 连接上的 channel-open 永不确认,
-//! 模拟「网络切换后 session 已死、开 channel 卡住」。
+//! 模拟「网络切换后 session 已死、开 channel 卡住」;`channel_opens` 记服务端收到的
+//! channel-open 数。
 
 use super::*;
 
@@ -32,6 +33,8 @@ use tokio::sync::Notify;
 struct FakeServerState {
     /// 已接受的 TCP 连接数。
     connections: AtomicUsize,
+    /// 服务端收到的 channel-open 请求数(含永不确认的那些)。
+    channel_opens: AtomicUsize,
     /// 前多少条连接上的 channel-open 永不确认。
     hang_channel_open_on_first: AtomicUsize,
     /// `rendezvous` 已到达的数量与唤醒器。
@@ -82,6 +85,7 @@ impl server::Handler for FakeHandler {
         _channel: russh::Channel<server::Msg>,
         _session: &mut server::Session,
     ) -> Result<bool, Self::Error> {
+        self.state.channel_opens.fetch_add(1, Ordering::SeqCst);
         if self.hang_channel_open {
             // 卡住整条 session 的消息循环:客户端的 channel-open 永远等不到确认。
             std::future::pending::<()>().await;
@@ -686,6 +690,189 @@ async fn cancellation_while_running_is_audited() {
     .await;
     assert!(matches!(captured.run.result, Err(ServiceError::Cancelled)));
     assert_eq!(captured.run.audit, Some(AuditExit::Cancelled));
+
+    pool.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 直接在给定 session 上跑一次 [`run_exec_on_session`](绕过 acquire,好让请求排在会话锁上),
+/// 退役时把它移出池。返回结局与耗时。
+async fn attempt_on(
+    pool: Arc<SshPool>,
+    conn_id: String,
+    session: Arc<CachedSession>,
+    deadline: tokio::time::Instant,
+    open_timeout: Duration,
+) -> (Result<SessionExecOutcome, String>, Duration) {
+    let started = std::time::Instant::now();
+    let mut sink = |_: StreamKind, _: &[u8]| {};
+    let outcome = run_exec_on_session(
+        &session,
+        "echo:queued",
+        deadline,
+        open_timeout,
+        &ExecCancellation::new(),
+        || pool.evict_if_same(&conn_id, &session),
+        &mut sink,
+    )
+    .await;
+    (outcome, started.elapsed())
+}
+
+/// F5:排在一条 session 锁上的请求,在前一个请求开 channel 超时、把它判死之后,一拿到锁就看到
+/// 标记、直接让出(`SessionRetired`)—— 不再各自耗一次开 channel 超时;session 已移出池。
+#[tokio::test]
+async fn requests_queued_on_a_session_retired_meanwhile_give_it_up_at_once() {
+    const OPEN_TIMEOUT: Duration = Duration::from_millis(1000);
+    let dir = temp_dir("retired-queue");
+    let state = Arc::new(FakeServerState::default());
+    state.hang_channel_open_on_first.store(1, Ordering::SeqCst);
+    let port = start_fake_server(state.clone()).await;
+    let pool = Arc::new(fake_pool(&dir));
+    let conn = fake_conn(port);
+    // 第一条连接(其上的 channel-open 永不确认)只建连、不开 channel,放进池里。
+    let dead = pool.acquire(&conn).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let started = std::time::Instant::now();
+    let attempt = || {
+        tokio::spawn(attempt_on(
+            pool.clone(),
+            conn.id.clone(),
+            dead.clone(),
+            deadline,
+            OPEN_TIMEOUT,
+        ))
+    };
+    let first = attempt();
+    // 让第一个请求先拿到锁、卡在开 channel 上,其余的排在锁后面。
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let queued: Vec<_> = (0..4).map(|_| attempt()).collect();
+
+    let (outcome, elapsed) = first.await.unwrap();
+    assert_eq!(outcome, Ok(SessionExecOutcome::ChannelOpenTimedOut));
+    assert!(elapsed >= OPEN_TIMEOUT, "took {elapsed:?}");
+    for task in queued {
+        let (outcome, _) = task.await.unwrap();
+        assert_eq!(outcome, Ok(SessionExecOutcome::SessionRetired));
+    }
+    // 此前排在锁上的第二个请求要到 2 × OPEN_TIMEOUT 才轮完自己的超时。
+    assert!(
+        started.elapsed() < OPEN_TIMEOUT * 3 / 2,
+        "took {:?}",
+        started.elapsed()
+    );
+    assert!(dead.is_unhealthy_now());
+    assert_eq!(pool.len().await, 0, "退役的 session 已在放锁前移出池");
+    assert_eq!(
+        state.channel_opens.load(Ordering::SeqCst),
+        1,
+        "只有第一个请求开过 channel"
+    );
+
+    pool.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// F5(评审实测的场景):8 个并发 exec 落在同一条死 session 上 —— 都在约一次开 channel 超时
+/// 之后完成(此前 8 个里有 6 个花了两倍时间:排在锁上的请求各自再耗一次超时)。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_execs_on_a_dead_session_pay_a_single_channel_open_timeout() {
+    const OPEN_TIMEOUT: Duration = Duration::from_millis(1500);
+    let dir = temp_dir("dead-concurrent");
+    let state = Arc::new(FakeServerState::default());
+    state.hang_channel_open_on_first.store(1, Ordering::SeqCst);
+    let port = start_fake_server(state.clone()).await;
+    let pool = Arc::new(fake_pool(&dir));
+    let conn = Arc::new(fake_conn(port));
+    drop(pool.acquire(&conn).await.unwrap());
+
+    let started = std::time::Instant::now();
+    let tasks: Vec<_> = (0..8)
+        .map(|i| {
+            let (pool, conn) = (pool.clone(), conn.clone());
+            tokio::spawn(async move {
+                let captured = run_exec(
+                    &pool,
+                    &conn,
+                    &format!("echo:{i}"),
+                    Duration::from_secs(20),
+                    OPEN_TIMEOUT,
+                    &ExecCancellation::new(),
+                )
+                .await;
+                (i, captured, started.elapsed())
+            })
+        })
+        .collect();
+    for task in tasks {
+        let (i, captured, elapsed) = task.await.unwrap();
+        assert_eq!(outcome_of(&captured).exit_code, Some(0), "request {i}");
+        assert_eq!(captured.stdout, format!("{i}").into_bytes(), "request {i}");
+        assert!(
+            elapsed < OPEN_TIMEOUT * 3 / 2,
+            "request {i} took {elapsed:?}"
+        );
+    }
+
+    pool.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 拿到锁时 session 已带标记:不开 channel,直接让出。
+#[tokio::test]
+async fn marked_session_is_given_up_before_opening_a_channel() {
+    let dir = temp_dir("marked");
+    let state = Arc::new(FakeServerState::default());
+    let port = start_fake_server(state.clone()).await;
+    let pool = fake_pool(&dir);
+    let session = pool.acquire(&fake_conn(port)).await.unwrap();
+    session.mark_unhealthy(UNHEALTHY_COOLDOWN);
+
+    let mut sink = |_: StreamKind, _: &[u8]| {};
+    let outcome = run_exec_on_session(
+        &session,
+        "echo:never",
+        tokio::time::Instant::now() + Duration::from_secs(10),
+        CHANNEL_OPEN_TIMEOUT,
+        &ExecCancellation::new(),
+        || async {},
+        &mut sink,
+    )
+    .await;
+    assert_eq!(outcome, Ok(SessionExecOutcome::SessionRetired));
+    assert_eq!(state.channel_opens.load(Ordering::SeqCst), 0);
+
+    pool.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 冷却标记(连续两次传输失败后留在池里的 session):acquire 交出的就是它,直接按冷却报错 ——
+/// 因 `SessionRetired` 重新 acquire 拿回同一条时走的也是这里,不开 channel、不绕圈。
+#[tokio::test]
+async fn cooldown_marked_session_fails_fast_without_opening_a_channel() {
+    let dir = temp_dir("cooldown");
+    let state = Arc::new(FakeServerState::default());
+    let port = start_fake_server(state.clone()).await;
+    let pool = fake_pool(&dir);
+    let conn = fake_conn(port);
+    pool.acquire(&conn)
+        .await
+        .unwrap()
+        .mark_unhealthy(UNHEALTHY_COOLDOWN);
+
+    let started = std::time::Instant::now();
+    let captured = run_simple(&pool, &conn, "echo:never").await;
+    match &captured.run.result {
+        Err(ServiceError::Internal(message)) => {
+            assert!(message.contains("cooling down"), "{message}");
+        }
+        other => panic!("expected the cooldown error, got {other:?}"),
+    }
+    assert_eq!(captured.run.audit, None);
+    assert_eq!(state.channel_opens.load(Ordering::SeqCst), 0);
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(pool.len().await, 1, "冷却标记留在池里挡新请求");
 
     pool.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);

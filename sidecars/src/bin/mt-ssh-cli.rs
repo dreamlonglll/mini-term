@@ -7,9 +7,13 @@
 //! 执行路径(spec §2):**优先连 daemon**(全机单例持全局 SshPool,同一连接
 //! 二次调用免 SSH 握手)——daemon 不在则自动 detached 拉起、带退避重连(拉起细节见
 //! `mt_sidecars::daemon_spawn`);daemon 比 CLI 旧(app 升级后旧 daemon 残留)自动踢旧
-//! 拉新,比 CLI 新则直接用(协议不同时不踢、降级);端点被非当前用户的进程占着时不连、
-//! 不拉起;彻底连不上则降级为进程内 one-shot(建池 → 执行 → drain),stderr 记一行降级
-//! 提示。对 agent 无感知差异。
+//! 拉新,比 CLI 新则直接用(协议不同时不踢、降级);端点被非当前用户的进程占着、或拒绝本进程
+//! 连接时不连、不拉起;彻底连不上则降级为进程内 one-shot(建池 → 执行 → drain),stderr 记一行
+//! 降级提示。对 agent 无感知差异。以管理员身份(提权)运行时一律不碰 daemon,直接 one-shot
+//! (见 [`daemon_blocked_by_elevation`])。
+//!
+//! Git Bash(MSYS)会在拉起本程序前把像 POSIX 路径的实参改写成 Windows 路径;exec 的命令、
+//! `--cwd` 与远端路径看起来被改写过时按用法错误拒绝(见 [`looks_msys_converted`])。
 //!
 //! 退出码契约(spec §1):
 //! - exec 正常:透传远程退出码;
@@ -27,6 +31,7 @@
 
 use clap::{Parser, Subcommand};
 use std::cmp::Ordering;
+use std::ffi::OsStr;
 use std::io::Write;
 use std::time::Duration;
 
@@ -228,6 +233,182 @@ fn wsl_distro_root(dir: &str) -> Option<String> {
         return None;
     }
     Some(format!(r"\\{host}\{distro}"))
+}
+
+// ---------------------------------------------------------------------------
+// Git Bash(MSYS)的实参改写
+// ---------------------------------------------------------------------------
+
+/// MSYS 路径改写在不在生效(纯函数)。
+///
+/// Git Bash / MSYS2 拉起原生程序前,会把像 POSIX 路径的实参改写成 Windows 路径。实测(Git for
+/// Windows,`MSYSTEM=MINGW64`):`/var/log/x` → `D:/Program Files/Git/var/log/x`、`/tmp/x` →
+/// `C:/Users/<用户>/AppData/Local/Temp/x`、`--cwd=/etc` → `--cwd=D:/Program Files/Git/etc`、
+/// `-I/x` → `-ID:/…`、`@/x` → `@D:/…`、`/a:/b` → `D:\…;D:\…`、未加引号的 `~/x` 先被 bash 展开
+/// 再改写;**单引号括起来的整条命令**(不以 `/` 开头)与以 `//` 开头、后面还有 `/` 的路径原样
+/// 到达(`//var/log/x` 不改,单独的 `//var` 变成 `/var`)。Claude Code 在 Windows 上的 Bash
+/// 工具就是 Git Bash。
+///
+/// 只在 MSYS 环境里查(`MSYSTEM` 非空),且转换没被关掉:`MSYS_NO_PATHCONV` 在环境里(Git for
+/// Windows 只看在不在,实测值为空、为 0 都关)或 `MSYS2_ARG_CONV_EXCL=*` 时实参原样到达,盘符
+/// 路径就是调用方的本意。WSL 与 PowerShell 不改写实参,也不设 `MSYSTEM`。
+fn msys_conversion_in_effect(
+    msystem: Option<&OsStr>,
+    no_pathconv: Option<&OsStr>,
+    conv_excl: Option<&OsStr>,
+) -> bool {
+    msystem.is_some_and(|value| !value.is_empty())
+        && no_pathconv.is_none()
+        && conv_excl.is_none_or(|value| value != "*")
+}
+
+/// 本进程的环境里 MSYS 路径改写是否生效(见 [`msys_conversion_in_effect`])。
+fn msys_path_conversion_active() -> bool {
+    msys_conversion_in_effect(
+        std::env::var_os("MSYSTEM").as_deref(),
+        std::env::var_os("MSYS_NO_PATHCONV").as_deref(),
+        std::env::var_os("MSYS2_ARG_CONV_EXCL").as_deref(),
+    )
+}
+
+/// `text` 是否以盘符路径开头:`X:/`;`backslash` 为真时也认 `X:\`。
+fn starts_with_drive_path(text: &str, backslash: bool) -> bool {
+    match text.as_bytes() {
+        [letter, b':', b'/', ..] => letter.is_ascii_alphabetic(),
+        [letter, b':', b'\\', ..] => backslash && letter.is_ascii_alphabetic(),
+        _ => false,
+    }
+}
+
+/// 一个实参看起来是不是被 MSYS 从 POSIX 路径改写成了 Windows 路径(纯函数):
+///
+/// - 整个实参以盘符路径开头:`X:/…`,或路径列表改写出的 `X:\…;…`;
+/// - `-<字母>`、`@`、`+` 之后紧跟 `X:/`(`-I/x` → `-ID:/…`);
+/// - 任一 `=` 之后紧跟 `X:/`(`key=/x`、`--cwd=/x`)。
+///
+/// 误报的出路:真要给 Windows 远端传盘符路径时,exec 把整条命令单引号成一个实参(它不以盘符
+/// 开头),或给这次调用加 `MSYS_NO_PATHCONV=1`(见 [`msys_conversion_in_effect`])。
+fn looks_msys_converted(arg: &str) -> bool {
+    if starts_with_drive_path(arg, true) {
+        return true;
+    }
+    let after_prefix = match arg.as_bytes() {
+        [b'-', letter, ..] if letter.is_ascii_alphabetic() => &arg[2..],
+        [b'@' | b'+', ..] => &arg[1..],
+        _ => "",
+    };
+    starts_with_drive_path(after_prefix, false)
+        || arg
+            .match_indices('=')
+            .any(|(at, _)| starts_with_drive_path(&arg[at + 1..], false))
+}
+
+/// 被改写的是哪一类实参 —— 决定报错里教的写法。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MsysArg {
+    /// exec 的远端命令(`--` 之后的实参)。
+    Command,
+    /// exec 的 `--cwd`。
+    Cwd,
+    /// upload / download 的远端路径。
+    RemotePath,
+}
+
+/// 实参被 MSYS 改写过的报错(用法错误,exit 2;什么都没执行)。
+fn msys_rewrite_error(kind: MsysArg, arg: &str) -> String {
+    let (what, fix) = match kind {
+        MsysArg::Command => (
+            "remote command argument",
+            "Pass the whole remote command as ONE single-quoted argument after `--` \
+             (-- 'tail -n 50 /var/log/syslog'); if the command itself starts with an absolute \
+             path, double its leading slash (-- '//opt/app/bin/run --check'). A Windows drive \
+             path meant for a Windows host passes once the whole command is single-quoted",
+        ),
+        MsysArg::Cwd => (
+            "--cwd value",
+            "Write an absolute remote directory with a leading `//` (--cwd //var/log) and \
+             single-quote `~` paths (--cwd '~/app'); on a Windows host, put the directory \
+             change into the single-quoted command instead",
+        ),
+        MsysArg::RemotePath => (
+            "remote path",
+            "Write an absolute remote path with a leading `//` (//var/log/app.log is \
+             /var/log/app.log on the remote host); for a drive path on a Windows host, prefix \
+             the call with MSYS_NO_PATHCONV=1",
+        ),
+    };
+    format!(
+        "{what} '{arg}' looks like a POSIX path that Git Bash (MSYS) rewrote into a Windows \
+         path before mt-ssh-cli saw it; refusing to run it. {fix}. Local paths are not affected."
+    )
+}
+
+/// exec 的 MSYS 改写检查:`--cwd` 的值与 `--` 之后的每个实参(纯函数)。
+fn check_exec_args_for_msys(cwd: Option<&str>, command: &[String]) -> Result<(), String> {
+    if let Some(cwd) = cwd.filter(|cwd| looks_msys_converted(cwd)) {
+        return Err(msys_rewrite_error(MsysArg::Cwd, cwd));
+    }
+    match command.iter().find(|arg| looks_msys_converted(arg)) {
+        Some(arg) => Err(msys_rewrite_error(MsysArg::Command, arg)),
+        None => Ok(()),
+    }
+}
+
+/// upload / download 的 MSYS 改写检查:只查远端路径(纯函数)。本地路径不查 —— MSYS 把
+/// `/c/x`、`/tmp/x` 改成的正是它们在这台 Windows 上对应的本地路径。
+fn check_remote_path_for_msys(remote_path: &str) -> Result<(), String> {
+    if looks_msys_converted(remote_path) {
+        Err(msys_rewrite_error(MsysArg::RemotePath, remote_path))
+    } else {
+        Ok(())
+    }
+}
+
+/// 只在 MSYS 路径改写生效的环境里跑 `check`。
+fn guard_msys(check: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+    if msys_path_conversion_active() {
+        check()
+    } else {
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 提权:不用 daemon
+// ---------------------------------------------------------------------------
+
+/// 提权时不能用 daemon 的原因(纯函数);`None` = 可以用。
+///
+/// 提权(管理员)运行的 daemon 会被同一用户的普通权限进程借走:管道 ACL 只认用户 SID,提权令牌
+/// 与普通令牌的 `TokenUser` 是同一个 SID,同用户的任何进程都能连上来,带着 SKILL.md 里的令牌
+/// (或改写用户自己可写的 config.json 造一个)让它以管理员身份读写本机文件 —— 等于绕过 UAC。
+/// 所以提权的 CLI 不连也不拉起 daemon,业务请求在本进程里跑;`daemon` 子命令提权时拒绝启动。
+/// 判定不了按提权处理(fail closed:进程内 one-shot 总是可用的)。
+fn daemon_blocked_by_elevation(elevated: &Result<bool, String>) -> Option<String> {
+    match elevated {
+        Ok(false) => None,
+        Ok(true) => Some("this process runs elevated (as administrator)".to_string()),
+        Err(e) => Some(format!(
+            "cannot tell whether this process runs elevated ({e})"
+        )),
+    }
+}
+
+/// 提权时业务请求改在本进程里跑的那一行 stderr 说明。
+fn elevated_in_process_notice(reason: &str) -> String {
+    format!(
+        "mt-ssh-cli: {reason}: not using the shared daemon (non-elevated processes of the same \
+         user could borrow its rights); running this request in-process"
+    )
+}
+
+/// `daemon` 子命令提权时拒绝启动的报错。
+fn elevated_daemon_refusal(reason: &str) -> String {
+    format!(
+        "refusing to run the daemon: {reason}; non-elevated processes of the same user could \
+         connect to it and borrow its administrator rights. Run it from a non-elevated shell \
+         (elevated CLI calls run in-process and never start it)"
+    )
 }
 
 /// exec 结果 → 进程退出码的映射。
@@ -586,6 +767,9 @@ enum DaemonUnavailable {
     /// 端点被非当前用户的进程占着(或核验不了它属于谁)。不自拉起 —— 端点被占,
     /// 新 daemon 也绑不上。
     Untrusted(String),
+    /// 端点在,但拒绝本进程连接(`ERROR_ACCESS_DENIED`:别的账户建的管道,或安全描述符不放行
+    /// 本进程的权限级别 / 沙箱令牌)。同样不自拉起 —— 端点被占着,新 daemon 也绑不上。
+    Denied(String),
     /// 正在跑的 daemon 比 CLI 新且协议不同。不踢它:它服务的是更新的调用方。
     NewerIncompatible { version: String, protocol: u32 },
 }
@@ -600,6 +784,10 @@ impl DaemonUnavailable {
             DaemonUnavailable::Untrusted(reason) => format!(
                 "mt-ssh-cli: daemon endpoint is occupied by a process not owned by the current \
                  user ({reason}); not starting a daemon, falling back to in-process SSH"
+            ),
+            DaemonUnavailable::Denied(reason) => format!(
+                "mt-ssh-cli: daemon endpoint refused this process ({reason}); {DENIED_HOLDER}; \
+                 not starting a daemon, falling back to in-process SSH"
             ),
             DaemonUnavailable::NewerIncompatible { version, protocol } => format!(
                 "mt-ssh-cli: running daemon {version} (protocol v{protocol}) is newer than this \
@@ -617,6 +805,10 @@ impl From<String> for DaemonUnavailable {
         DaemonUnavailable::Unreachable(reason)
     }
 }
+
+/// 端点拒绝本进程连接时,对占着它的是谁的说明(降级提示与运维子命令共用)。
+const DENIED_HOLDER: &str = "it is held by a server this process may not connect to (another \
+     account, or a different privilege level / sandbox)";
 
 // ---------------------------------------------------------------------------
 // daemon 客户端:自拉起 + 版本握手 + 帧流处理
@@ -659,6 +851,9 @@ async fn connect_or_spawn(ep: &str) -> Result<Box<dyn ipc::IpcStream>, DaemonUna
         Ok(stream) => return Ok(stream),
         // 别的用户占着端点:不连、也不拉起(拉起也绑不上),直接降级。
         Err(ConnectError::Untrusted(reason)) => return Err(DaemonUnavailable::Untrusted(reason)),
+        // 端点在、但拒绝本进程:同样被占着,拉起也绑不上 —— 此前当成「连不上」,每次都白拉起一个
+        // 注定绑定失败的 daemon,再等满 ~3s 重连窗口才降级。
+        Err(ConnectError::Denied(e)) => return Err(DaemonUnavailable::Denied(e.to_string())),
         // 端点在、只是所有实例都忙(高并发瞬间,或 daemon 正在优雅退出、已不再监听):
         // 拉起新 daemon 也绑不上,只做退避重连。
         Err(e) if e.is_busy() => false,
@@ -676,6 +871,7 @@ async fn connect_or_spawn(ep: &str) -> Result<Box<dyn ipc::IpcStream>, DaemonUna
             Err(ConnectError::Untrusted(reason)) => {
                 return Err(DaemonUnavailable::Untrusted(reason));
             }
+            Err(ConnectError::Denied(e)) => return Err(DaemonUnavailable::Denied(e.to_string())),
             Err(ConnectError::Unreachable(_)) => {}
         }
     }
@@ -958,8 +1154,13 @@ where
     code
 }
 
-/// 业务计划入口:daemon 优先,不可用降级 one-shot(stderr 记一行原因)。
+/// 业务计划入口:daemon 优先,不可用降级 one-shot(stderr 记一行原因)。提权运行时不碰
+/// daemon(不连、不拉起),直接 one-shot(见 [`daemon_blocked_by_elevation`])。
 async fn run_plan(plan: Plan) -> i32 {
+    if let Some(reason) = daemon_blocked_by_elevation(&ipc::current_process_elevated()) {
+        eprintln!("{}", elevated_in_process_notice(&reason));
+        return run_one_shot(&plan).await;
+    }
     match run_via_daemon(&plan).await {
         Ok(code) => code,
         Err(unavailable) => {
@@ -976,8 +1177,13 @@ async fn run_plan(plan: Plan) -> i32 {
 /// `daemon`:前台跑守护进程(正常由 CLI 自动 detached 拉起)。
 ///
 /// 正常退出(空闲 / shutdown)的事件由 `daemon::serve` 自己带时间戳记好了;这里只补
-/// 「没起来」的两种结局。
+/// 「没起来」的几种结局。提权运行时拒绝启动(exit 2,见 [`daemon_blocked_by_elevation`])。
 async fn run_daemon_foreground(idle_secs: Option<u64>) -> i32 {
+    if let Some(reason) = daemon_blocked_by_elevation(&ipc::current_process_elevated()) {
+        let refusal = elevated_daemon_refusal(&reason);
+        daemon_log::event(&format!("not starting: {refusal}"));
+        return fail(&refusal);
+    }
     let idle = idle_secs
         .map(Duration::from_secs)
         .unwrap_or(daemon::DEFAULT_IDLE_EXIT);
@@ -1005,6 +1211,24 @@ fn untrusted_endpoint_message(reason: &str) -> String {
     )
 }
 
+/// `daemon-status` / `daemon-stop` 遇到拒绝本进程连接的端点时的报错文本。
+fn denied_endpoint_message(reason: &str) -> String {
+    format!(
+        "cannot talk to the daemon endpoint: it refused this process ({reason}); {DENIED_HOLDER}"
+    )
+}
+
+/// `daemon-status` 在提权时补的一行:提权的 CLI 不用 daemon,看到的状态与它自己的请求无关。
+/// `daemon-status` / `daemon-stop` 本身提权时照常工作 —— 不带能力令牌,也不让 daemon 读写文件。
+fn elevated_status_note(elevated: &Result<bool, String>) -> Option<String> {
+    daemon_blocked_by_elevation(elevated).map(|reason| {
+        format!(
+            "mt-ssh-cli: note: {reason}, so this CLI does not use the daemon; its requests run \
+             in-process"
+        )
+    })
+}
+
 /// `daemon-status` 输出里的日志路径行(daemon 不在时也打印,方便事后翻日志)。
 fn daemon_log_line() -> String {
     match daemon_log::log_path() {
@@ -1030,12 +1254,17 @@ fn render_daemon_status(
 /// daemon 不在时友好提示。
 ///
 /// 退出码语义对齐 `systemctl is-active` 一类状态探测命令:0 = 在跑、1 = 不在跑,
-/// 便于脚本判断;端点被非当前用户的进程占着等错误按 CLI 契约 exit 2(本命令不进 SKILL.md)。
+/// 便于脚本判断;端点被非当前用户的进程占着、拒绝本进程连接等错误按 CLI 契约 exit 2
+/// (本命令不进 SKILL.md)。
 async fn run_daemon_status() -> i32 {
+    if let Some(note) = elevated_status_note(&ipc::current_process_elevated()) {
+        println!("{note}");
+    }
     let ep = endpoint();
     let stream = match ipc::connect(&ep).await {
         Ok(stream) => stream,
         Err(ConnectError::Untrusted(reason)) => return fail(&untrusted_endpoint_message(&reason)),
+        Err(ConnectError::Denied(e)) => return fail(&denied_endpoint_message(&e.to_string())),
         Err(e) if e.is_busy() => {
             println!("mt-ssh-cli daemon: endpoint busy (the daemon may be shutting down)");
             println!("{}", daemon_log_line());
@@ -1091,12 +1320,14 @@ async fn run_daemon_status() -> i32 {
 }
 
 /// `daemon-stop`:请求优雅退出。幂等 —— daemon 不在时提示后仍返回 0;端点被非当前
-/// 用户的进程占着则拒绝通信、exit 2(绝不把请求发给冒充者)。
+/// 用户的进程占着则拒绝通信、exit 2(绝不把请求发给冒充者);端点拒绝本进程连接时同样
+/// exit 2(停不了它)。
 async fn run_daemon_stop() -> i32 {
     let ep = endpoint();
     let stream = match ipc::connect(&ep).await {
         Ok(stream) => stream,
         Err(ConnectError::Untrusted(reason)) => return fail(&untrusted_endpoint_message(&reason)),
+        Err(ConnectError::Denied(e)) => return fail(&denied_endpoint_message(&e.to_string())),
         Err(e) if e.is_busy() => {
             println!("mt-ssh-cli daemon: endpoint busy (the daemon may already be shutting down)");
             return 0;
@@ -1169,29 +1400,35 @@ async fn main() {
             timeout,
             connection,
             command,
-        } => {
-            let mut plan = Plan::new(Op::Exec);
-            plan.req.project_token = Some(project_token);
-            plan.req.connection = Some(connection);
-            plan.req.command = Some(join_command(&command));
-            plan.req.cwd = cwd;
-            plan.req.timeout_secs = timeout;
-            run_plan(plan).await
-        }
+        } => match guard_msys(|| check_exec_args_for_msys(cwd.as_deref(), &command)) {
+            // Git Bash 改写过的命令 / 目录已无从还原:拒绝,什么都不发出去。
+            Err(e) => fail(&e),
+            Ok(()) => {
+                let mut plan = Plan::new(Op::Exec);
+                plan.req.project_token = Some(project_token);
+                plan.req.connection = Some(connection);
+                plan.req.command = Some(join_command(&command));
+                plan.req.cwd = cwd;
+                plan.req.timeout_secs = timeout;
+                run_plan(plan).await
+            }
+        },
         Command::Upload {
             project_token,
             timeout,
             connection,
             local_path,
             remote_path,
-        } => match Plan::transfer(
-            Op::Upload,
-            project_token,
-            timeout,
-            connection,
-            &local_path,
-            remote_path,
-        ) {
+        } => match guard_msys(|| check_remote_path_for_msys(&remote_path)).and_then(|()| {
+            Plan::transfer(
+                Op::Upload,
+                project_token,
+                timeout,
+                connection,
+                &local_path,
+                remote_path,
+            )
+        }) {
             Ok(plan) => run_plan(plan).await,
             Err(e) => fail(&e),
         },
@@ -1201,14 +1438,16 @@ async fn main() {
             connection,
             remote_path,
             local_path,
-        } => match Plan::transfer(
-            Op::Download,
-            project_token,
-            timeout,
-            connection,
-            &local_path,
-            remote_path,
-        ) {
+        } => match guard_msys(|| check_remote_path_for_msys(&remote_path)).and_then(|()| {
+            Plan::transfer(
+                Op::Download,
+                project_token,
+                timeout,
+                connection,
+                &local_path,
+                remote_path,
+            )
+        }) {
             Ok(plan) => run_plan(plan).await,
             Err(e) => fail(&e),
         },
@@ -1744,5 +1983,172 @@ mod tests {
     fn render_table_empty_has_friendly_message() {
         let out = render_connections_table(&[]);
         assert!(out.contains("no SSH connections"));
+    }
+
+    // --- F2:Git Bash(MSYS)改写实参 ---
+
+    /// (bash 里写的, Git Bash 实际交给原生程序的)—— 实测,见 [`msys_conversion_in_effect`]。
+    #[test]
+    fn msys_detection_matches_the_measured_rewrites() {
+        for (typed, rewritten) in [
+            ("/var/log/syslog", "D:/Program Files/Git/var/log/syslog"),
+            ("/tmp/x.log", "C:/Users/me/AppData/Local/Temp/x.log"),
+            ("/", "D:/Program Files/Git/"),
+            ("~/app (unquoted)", "C:/Users/me/app"),
+            (
+                "'/usr/bin/uptime -a'",
+                "D:/Program Files/Git/usr/bin/uptime -a",
+            ),
+            (
+                "/usr/bin:/bin",
+                r"D:\Program Files\Git\usr\bin;D:\Program Files\Git\bin",
+            ),
+            ("--cwd=/etc/nginx", "--cwd=D:/Program Files/Git/etc/nginx"),
+            ("FOO=/var/x", "FOO=D:/Program Files/Git/var/x"),
+            ("-Dkey=/var", "-Dkey=D:/Program Files/Git/var"),
+            ("-I/usr/include", "-ID:/Program Files/Git/usr/include"),
+            ("@/var", "@D:/Program Files/Git/var"),
+            ("+/var", "+D:/Program Files/Git/var"),
+        ] {
+            assert!(looks_msys_converted(rewritten), "{typed} -> {rewritten:?}");
+        }
+        // 原样到达的(含 `'…'` 整条命令、`//` 开头的路径、`//var` 改写成的 `/var`)与普通实参。
+        for intact in [
+            "tail -n 50 /var/log/syslog",
+            "cd /var && ls",
+            " /usr/bin/uptime",
+            "//srv/app",
+            "//var/log/x",
+            "/var",
+            "~/app",
+            "-ab/var",
+            "--opt/var",
+            "ab:/var",
+            "user@host:/var",
+            "http://x/y",
+            "-n",
+            "50",
+            "",
+            "C:",
+            "1:/x",
+        ] {
+            assert!(!looks_msys_converted(intact), "{intact:?}");
+        }
+    }
+
+    #[test]
+    fn msys_check_only_applies_while_conversion_is_in_effect() {
+        let os = |s: &'static str| Some(OsStr::new(s));
+        assert!(msys_conversion_in_effect(os("MINGW64"), None, None));
+        assert!(msys_conversion_in_effect(os("MSYS"), None, os("/var")));
+        // 不是 MSYS 环境(PowerShell / WSL / cmd)。
+        assert!(!msys_conversion_in_effect(None, None, None));
+        assert!(!msys_conversion_in_effect(os(""), None, None));
+        // 转换被关掉:MSYS_NO_PATHCONV 只看在不在(实测空值、0 都生效)。
+        assert!(!msys_conversion_in_effect(os("MINGW64"), os("1"), None));
+        assert!(!msys_conversion_in_effect(os("MINGW64"), os(""), None));
+        assert!(!msys_conversion_in_effect(os("MINGW64"), os("0"), None));
+        assert!(!msys_conversion_in_effect(os("MINGW64"), None, os("*")));
+    }
+
+    #[test]
+    fn exec_msys_check_names_the_argument_and_the_fix() {
+        let words = |args: &[&str]| args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // 单引号括起来的整条命令、`//` 开头的目录:放行。
+        assert!(check_exec_args_for_msys(
+            Some("//var/log"),
+            &words(&["tail -n 50 /var/log/syslog"])
+        )
+        .is_ok());
+        assert!(check_exec_args_for_msys(None, &words(&["uptime"])).is_ok());
+        // Windows 远端的盘符路径:整条命令单引号括起来就不拦。
+        assert!(check_exec_args_for_msys(None, &words(&[r"dir C:\Users"])).is_ok());
+
+        let command = check_exec_args_for_msys(
+            None,
+            &words(&["tail", "-n", "50", "D:/Program Files/Git/var/log/syslog"]),
+        )
+        .unwrap_err();
+        assert!(
+            command.contains("'D:/Program Files/Git/var/log/syslog'"),
+            "{command}"
+        );
+        assert!(command.contains("Git Bash (MSYS)"), "{command}");
+        assert!(command.contains("ONE single-quoted argument"), "{command}");
+        assert!(command.contains("'//opt/app/bin/run --check'"), "{command}");
+
+        let cwd = check_exec_args_for_msys(Some("D:/Program Files/Git/etc/nginx"), &words(&["ls"]))
+            .unwrap_err();
+        assert!(cwd.starts_with("--cwd value"), "{cwd}");
+        assert!(cwd.contains("--cwd //var/log"), "{cwd}");
+        assert!(cwd.contains("'~/app'"), "{cwd}");
+    }
+
+    #[test]
+    fn transfer_msys_check_covers_only_the_remote_path() {
+        assert!(check_remote_path_for_msys("//var/log/app.log").is_ok());
+        assert!(check_remote_path_for_msys("app.log").is_ok());
+        let err = check_remote_path_for_msys("C:/Users/me/AppData/Local/Temp/x.log").unwrap_err();
+        assert!(err.starts_with("remote path"), "{err}");
+        assert!(err.contains("//var/log/app.log"), "{err}");
+        assert!(err.contains("MSYS_NO_PATHCONV=1"), "{err}");
+        assert!(err.contains("Local paths are not affected"), "{err}");
+    }
+
+    // --- F1:提权时不用 daemon ---
+
+    #[test]
+    fn elevation_keeps_the_cli_away_from_the_daemon() {
+        assert_eq!(daemon_blocked_by_elevation(&Ok(false)), None);
+        assert_eq!(elevated_status_note(&Ok(false)), None);
+
+        let elevated = daemon_blocked_by_elevation(&Ok(true)).expect("elevated must be blocked");
+        assert!(elevated.contains("elevated"), "{elevated}");
+        // 判定不了按提权处理(fail closed)。
+        let unknown = daemon_blocked_by_elevation(&Err("no token".into()))
+            .expect("unknown elevation must be blocked");
+        assert!(unknown.contains("no token"), "{unknown}");
+
+        let notice = elevated_in_process_notice(&elevated);
+        assert!(notice.starts_with("mt-ssh-cli: "), "{notice}");
+        assert!(
+            notice.contains("running this request in-process"),
+            "{notice}"
+        );
+        assert!(!notice.contains("error:"), "降级后业务照常执行: {notice}");
+        assert!(!notice.contains('\n'), "一行: {notice}");
+
+        let refusal = elevated_daemon_refusal(&elevated);
+        assert!(
+            refusal.starts_with("refusing to run the daemon"),
+            "{refusal}"
+        );
+        assert!(refusal.contains("non-elevated shell"), "{refusal}");
+
+        let note = elevated_status_note(&Ok(true)).unwrap();
+        assert!(note.contains("does not use the daemon"), "{note}");
+    }
+
+    // --- F6:端点拒绝本进程 ---
+
+    #[test]
+    fn denied_endpoints_fall_back_without_spawning_and_say_why() {
+        let notice =
+            DaemonUnavailable::Denied("Access is denied. (os error 5)".into()).fallback_notice();
+        assert!(notice.contains("refused this process"), "{notice}");
+        assert!(notice.contains("os error 5"), "{notice}");
+        assert!(notice.contains("not starting a daemon"), "{notice}");
+        assert!(
+            notice.contains("falling back to in-process SSH"),
+            "{notice}"
+        );
+
+        let message = denied_endpoint_message("Access is denied. (os error 5)");
+        assert!(
+            message.starts_with("cannot talk to the daemon endpoint"),
+            "{message}"
+        );
+        assert!(message.contains("another account"), "{message}");
     }
 }
