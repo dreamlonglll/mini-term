@@ -62,9 +62,10 @@ const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// 客户端断开、发出取消后,等 exec 编排收尾的上限。
 ///
-/// 取消令牌只在 SSH channel 阶段才被响应;编排若卡在建连 / 认证(会话池那几步目前不看
-/// 取消),`await` 会无限挂住 —— 连带 `ActiveGuard` 不释放、daemon 永远不会空闲自退。
-/// 到点就放弃这次编排(丢弃 future)并记一笔日志。
+/// 0.4.11 起取消令牌在编排的每一步都被响应(建连 / 认证、等会话锁、开 channel、收流),
+/// 正常情况下几毫秒内就收尾;这道上限是纵深兜底:万一哪一步不看取消,`await` 无限挂住会
+/// 连带 `ActiveGuard` 不释放、daemon 永远不会空闲自退。到点就放弃这次编排(丢弃 future)
+/// 并记一笔日志。
 const CANCEL_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// serve 的退出原因。
@@ -651,8 +652,11 @@ where
 /// CLI 断开的两路感知(spec §2「daemon 检测到连接断开即关闭对应 exec channel」):
 /// 写帧失败(有输出时),或读端到 EOF(无输出的长命令也能立即感知)——
 /// 任一触发即设置状态型取消令牌，并等待 service 显式发送 SSH channel close
-/// (等待有上限,见 [`cancel_after_disconnect`]);
-/// 请求级超时同样在 service 的 channel 状态机内强制，不依赖 CLI 存活。
+/// (还在建连时直接放弃建连;等待有上限,见 [`cancel_after_disconnect`]);
+/// 请求级超时(从请求进门算起,含建连)同样由 service 强制，不依赖 CLI 存活。
+///
+/// 远端以信号终止命令时,终帧之前补一个 stderr 帧说明信号(退出码已在 service 层映射成
+/// 128+n)—— 走现有帧,不改协议;任何版本的 CLI 都会把它原样打到 stderr。
 async fn handle_exec<R, W>(reader: &mut R, writer: &mut W, req: Request, state: &Arc<DaemonState>)
 where
     R: tokio::io::AsyncBufRead + Unpin,
@@ -732,7 +736,17 @@ where
         }
     }
     let terminal = match result {
-        Ok(outcome) => ServerFrame::result_exec(outcome.exit_code, outcome.timed_out),
+        Ok(outcome) => {
+            if let Some(note) = outcome.signal_note() {
+                let note = ServerFrame::Stderr {
+                    data_b64: ipc::b64_encode(format!("mt-ssh-cli: {note}\n").as_bytes()),
+                };
+                if write_frame(writer, &note).await.is_err() {
+                    return;
+                }
+            }
+            ServerFrame::result_exec(outcome.exit_code, outcome.timed_out, outcome.not_started)
+        }
         Err(e) => ServerFrame::Error {
             message: e.message().to_string(),
         },
@@ -1079,6 +1093,7 @@ mod tests {
         assert!(settle_within(done.as_mut(), Duration::from_millis(50)).await);
     }
 
+    /// 缺令牌在读配置之前就被拒(这条与下一条都不碰真实的 config.json)。
     #[tokio::test]
     async fn daemon_list_without_token_is_rejected() {
         let ep = test_endpoint("list");
@@ -1095,14 +1110,17 @@ mod tests {
         )
         .await;
         match read_frame(&mut reader).await {
-            ServerFrame::Error { message } => assert_eq!(message, "invalid project token"),
+            ServerFrame::Error { message } => {
+                assert_eq!(message, mt_core::TokenScopeError::MissingToken.to_string());
+                assert!(message.contains("--project-token"), "got: {message}");
+            }
             other => panic!("expected error, got {other:?}"),
         }
         daemon.abort();
     }
 
     #[tokio::test]
-    async fn daemon_exec_unknown_token_yields_error_frame() {
+    async fn daemon_exec_scope_error_yields_error_frame() {
         let ep = test_endpoint("exec-err");
         let daemon = spawn_daemon(ep.clone(), Duration::from_secs(60)).await;
 
@@ -1112,7 +1130,8 @@ mod tests {
             &Request {
                 v: ipc::PROTOCOL_VERSION,
                 op: Some(Op::Exec),
-                project_token: Some("definitely-not-a-real-token".into()),
+                // 纯空白令牌:fail closed 且先于读盘 —— 测试不读真实数据目录。
+                project_token: Some("   ".into()),
                 connection: Some("mt-test-definitely-no-such-connection".into()),
                 command: Some("true".into()),
                 ..Default::default()
@@ -1121,7 +1140,7 @@ mod tests {
         .await;
         match read_frame(&mut reader).await {
             ServerFrame::Error { message } => {
-                assert_eq!(message, "invalid project token");
+                assert_eq!(message, mt_core::TokenScopeError::MissingToken.to_string());
                 assert!(!message.to_lowercase().contains("password"));
             }
             other => panic!("expected error, got {other:?}"),

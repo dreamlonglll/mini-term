@@ -34,7 +34,7 @@ mod wsl_path;
 pub use atomic_file::atomic_write;
 pub use config_reader::{
     config_json_path, read_ssh_connections_for_project, read_ssh_connections_for_project_at,
-    read_ssh_connections_for_token, read_ssh_connections_for_token_at,
+    read_ssh_connections_for_token, read_ssh_connections_for_token_at, TokenScopeError,
 };
 pub use ssh_connection::SshConnection;
 pub use ssh_key::{cleanup_ssh_temp_keys, prepare_ssh_key, restrict_permissions, temp_keys_dir};

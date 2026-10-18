@@ -10,6 +10,14 @@ name = "mt-sidecars"
 # shutdown 改为停止接新连接、等在途请求(上限 60s)后再退出;IPC 客户端校验端点属于
 # 当前用户(Windows 查管道服务端进程的 token SID,Unix 查 peer uid);WSL 里传
 # `/tmp/x` 这类 POSIX 绝对路径不再错位成 `D:\tmp\x`。
+# 同属 0.4.11 的 service 层:`--timeout` 覆盖整个请求(含建连 / 认证,连接阶段到点 exit 124
+# 并说明命令没启动,取消令牌也能打断建连);exec 只在开 channel 时持会话锁(同连接并发、
+# 不再全局串行),开 channel 10s 短超时 → 精确淘汰 session 后换新连接重试;exec 发出后立即
+# 发 EOF;服务端拒绝 exec 立即报错,远端信号映射成 128+n 并在 stderr 说明;`--cwd` 按需加
+# 引号(保留 `~/` 展开);审计脱敏补 --token / --api-key / --secret 等、sshpass、凭据类
+# 环境变量与 Authorization 头,只记可能已执行的命令;传输护栏识别 `\\localhost\C$`、
+# `\\?\`、WSL `\\wsl.localhost\…\mnt\c` 等别名并按装机版数据目录名纵深拦截;能力令牌报错
+# 分类(配置不存在 / 读不了 / 令牌对不上 / 范围为空),fail closed 不变。
 version = "0.4.11"
 description = "mini-term sidecar binaries: miniterm-hook (AI hook), mt-ssh-mcp (SSH MCP server) and mt-ssh-cli (SSH CLI + daemon)"
 edition = "2021"

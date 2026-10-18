@@ -107,6 +107,11 @@ pub enum ServerFrame {
         /// exec:是否超时。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         timed_out: Option<bool>,
+        /// exec:超时发生在远程命令启动之前(建连 / 认证 / 开 channel 阶段),命令没有
+        /// 执行(0.4.11 起)。只在为 true 时出现 —— 与 `activeRequests` 同样是加字段不升
+        /// 协议版本:旧 CLI 忽略它,照旧按普通超时打印。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        not_started: Option<bool>,
         /// upload/download:传输字节数。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bytes: Option<u64>,
@@ -133,6 +138,7 @@ impl ServerFrame {
         ServerFrame::Result {
             exit_code: None,
             timed_out: None,
+            not_started: None,
             bytes: None,
             connections: None,
             sessions: None,
@@ -140,11 +146,12 @@ impl ServerFrame {
         }
     }
 
-    /// exec 的 result 终帧。
-    pub fn result_exec(exit_code: Option<i32>, timed_out: bool) -> Self {
+    /// exec 的 result 终帧。`not_started` 只在为 true 时上线(见字段注释)。
+    pub fn result_exec(exit_code: Option<i32>, timed_out: bool, not_started: bool) -> Self {
         ServerFrame::Result {
             exit_code,
             timed_out: Some(timed_out),
+            not_started: not_started.then_some(true),
             bytes: None,
             connections: None,
             sessions: None,
@@ -157,6 +164,7 @@ impl ServerFrame {
         ServerFrame::Result {
             exit_code: None,
             timed_out: None,
+            not_started: None,
             bytes: Some(bytes),
             connections: None,
             sessions: None,
@@ -169,6 +177,7 @@ impl ServerFrame {
         ServerFrame::Result {
             exit_code: None,
             timed_out: None,
+            not_started: None,
             bytes: None,
             connections: Some(connections),
             sessions: None,
@@ -181,6 +190,7 @@ impl ServerFrame {
         ServerFrame::Result {
             exit_code: None,
             timed_out: None,
+            not_started: None,
             bytes: None,
             connections: None,
             sessions: Some(sessions),
@@ -875,6 +885,7 @@ mod tests {
         let f = ServerFrame::Result {
             exit_code: Some(17),
             timed_out: Some(false),
+            not_started: None,
             bytes: None,
             connections: None,
             sessions: None,
@@ -887,6 +898,44 @@ mod tests {
         assert!(!line.contains("bytes"));
         assert!(!line.contains("connections"));
         assert!(!line.contains("activeRequests"));
+        assert!(!line.contains("notStarted"));
+    }
+
+    #[test]
+    fn exec_result_flags_not_started_timeouts_without_changing_normal_frames() {
+        // 普通结果与运行中超时:线上形状与 0.4.10 一字不差(不带 notStarted)。
+        let normal = encode_frame(&ServerFrame::result_exec(Some(0), false, false)).unwrap();
+        assert!(!normal.contains("notStarted"), "got: {normal}");
+        let running = encode_frame(&ServerFrame::result_exec(None, true, false)).unwrap();
+        assert!(!running.contains("notStarted"), "got: {running}");
+
+        // 连接阶段超时:带上 notStarted,新 CLI 据此改报「连接阶段超时」。
+        let line = encode_frame(&ServerFrame::result_exec(None, true, true)).unwrap();
+        assert!(line.contains("\"notStarted\":true"), "got: {line}");
+        match decode_frame::<ServerFrame>(&line).unwrap() {
+            ServerFrame::Result {
+                timed_out,
+                not_started,
+                exit_code,
+                ..
+            } => {
+                assert_eq!(timed_out, Some(true));
+                assert_eq!(not_started, Some(true));
+                assert_eq!(exit_code, None);
+            }
+            other => panic!("expected result, got {other:?}"),
+        }
+
+        // 旧 daemon 的超时帧没有这个字段 → None,新 CLI 按普通超时处理。
+        let old: ServerFrame = decode_frame(r#"{"type":"result","timedOut":true}"#).unwrap();
+        assert!(matches!(
+            old,
+            ServerFrame::Result {
+                timed_out: Some(true),
+                not_started: None,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -934,6 +983,7 @@ mod tests {
         let f = ServerFrame::Result {
             exit_code: None,
             timed_out: None,
+            not_started: None,
             bytes: None,
             connections: Some(vec![SshConnectionView {
                 id: "id-1".into(),

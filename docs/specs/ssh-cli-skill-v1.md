@@ -1,6 +1,6 @@
 # Spec：SSH 工具从 MCP 迁移到 CLI + Skill v1
 
-> 状态：draft · 2026-07-31（rev2：CLI 改为守护进程架构；rev3：PR1–PR3 已落地；rev4：code review 安全加固——项目能力令牌、显式 channel 取消、IPC fail-closed；rev5 · 2026-10 · sidecar 0.4.11：传输层修复——拉起 daemon 不再泄漏调用方标准句柄与工作目录、daemon 日志落盘、版本握手只换代更旧的 daemon、shutdown 优雅退出、IPC 客户端校验端点属主、WSL 下 POSIX 本地路径）
+> 状态：draft · 2026-07-31（rev2：CLI 改为守护进程架构；rev3：PR1–PR3 已落地；rev4：code review 安全加固——项目能力令牌、显式 channel 取消、IPC fail-closed；rev5 · 2026-10 · sidecar 0.4.11：传输层修复——拉起 daemon 不再泄漏调用方标准句柄与工作目录、daemon 日志落盘、版本握手只换代更旧的 daemon、shutdown 优雅退出、IPC 客户端校验端点属主、WSL 下 POSIX 本地路径；同属 0.4.11 的 service 层与注册器修复——`--timeout` 覆盖整个请求（含建连）、exec 只在开 channel 时持会话锁、开 channel 短超时后淘汰重试、exec 立即 EOF、服务端拒绝与远端信号的退出码、`--cwd` 引号、审计脱敏扩展与只记可能已执行的命令、传输护栏识别本机别名、能力令牌报错分类、SKILL.md 只预批 list/exec、dev 实例不碰 SKILL.md、启动校正 SKILL.md）
 > 前置研究结论：Codex CLI 自 2025-12 起原生支持 skills（项目级 `.codex/skills/`），SKILL.md 已是跨 agent 标准格式，单一方案可同时覆盖 Claude Code 与 Codex。
 
 ## Problem Statement
@@ -53,9 +53,10 @@ mt-ssh-cli daemon-stop      # 请求 daemon 优雅退出（停止接新连接 �
 `daemon-status` 退出码：0 = 在跑、1 = 不在跑（或端点忙——daemon 正在优雅退出）；`daemon-status` / `daemon-stop` 遇到被非当前用户的进程占着的端点一律拒绝通信、exit 2（见 §2 安全边界）。
 
 - 四个业务子命令都强制要求 `--project-token`。令牌由 mini-term 后端生成 UUID v4、写入项目配置与 SKILL.md；CLI 不接受 project-id，也没有「缺省 = 全部连接」路径；
-- `<CONNECTION>` 按 name 优先、id 兜底匹配（复用 `find_connection`，歧义/未找到语义不变）；
-- exec 的 `<COMMAND>...` 为 trailing args，按空格 join 成远程命令（clap `trailing_var_arg` + `allow_hyphen_values`）；`--cwd` 沿用 `cd <dir> && ` 前缀拼接；
-- 超时默认：exec 60s、upload/download 300s（与 MCP 对齐），由 daemon 端强制执行（CLI 被杀不影响清理）；
+- `<CONNECTION>` 按 name 优先、id 兜底匹配（复用 `find_connection`，歧义/未找到语义不变；未找到时 CLI 提示用 `mt-ssh-cli list`，MCP 提示 `ssh_list_connections`）；
+- exec 的 `<COMMAND>...` 为 trailing args，按空格 join 成远程命令（clap `trailing_var_arg` + `allow_hyphen_values`）；`--cwd` 沿用 `cd <dir> && ` 前缀拼接，目录按 POSIX shell 规则**按需**加引号（0.4.11 起）：简单路径原样（Windows OpenSSH 的 cmd.exe 远端照样认），带空格 / 特殊字符的优先双引号（POSIX 与 cmd 都认），含 `$`、反引号、`"`、`!`、换行或会被双引号转义的 `\` 时退回 POSIX 单引号；开头的 `~` / `~user` 连同第一个 `/` 留在引号外以保住 home 展开（`~"/x"` 在 POSIX 里不展开）；`-` 开头的相对路径补成 `./-x`。`--cwd` 默认远端是 POSIX shell，Windows 主机建议把切目录写进命令本身；
+- exec 不转发 stdin：exec 请求发出后立即给 channel 发 EOF（0.4.11 起），读 stdin 的远端命令马上读到 EOF 而不是挂到超时；没有 TTY，交互式提示会失败；
+- 超时默认：exec 60s、upload/download 300s（与 MCP 对齐），由 daemon 端强制执行（CLI 被杀不影响清理）。0.4.11 起时限覆盖**整个请求**：从请求进门算起，建连 / 握手 / 认证（池 acquire，含复用前等会话锁）、开 channel、跑命令（或传输）都在里面——此前 acquire 不受时限约束，假服务器只收 TCP 不说话就会无限挂住；
 - upload/download 的 `<LOCAL_PATH>` 在 **CLI 端绝对化**后再发给 daemon——daemon 的 cwd 固定为 exe 所在目录、与调用方无关，相对路径必须在调用现场解析；
 - Windows 上以单个 `/` 开头的本地路径（POSIX 绝对路径，`//server/share` 不算）单独处理：CLI 经 WSL interop 被调用时仍是 Windows 进程，直接绝对化会把当前目录在 `/mnt/d/…` 时的 `/tmp/a.log` 解析成 `D:\tmp\a.log`。当前目录是 WSL 发行版自己的文件系统（interop 给的 cwd 形如 `\\wsl.localhost\<发行版>\…` / `\\wsl$\<发行版>\…`）时映射进该发行版根目录（`\\wsl.localhost\<发行版>\tmp\a.log`）；否则按用法错误 exit 2，提示在 WSL 里用 `"$(wslpath -w '<path>')"` 传 Windows 路径。Git Bash / MSYS2 会在拉起原生程序前把 `/c/…`、`/tmp/…` 实参换成 Windows 路径，不受影响（关掉转换的 `MSYS_NO_PATHCONV=1` 下才会走到报错分支）。
 
@@ -64,13 +65,18 @@ mt-ssh-cli daemon-stop      # 请求 daemon 优雅退出（停止接新连接 �
 | 场景 | stdout | stderr | 退出码 |
 |------|--------|--------|--------|
 | exec 正常 | 远程 stdout 原样字节流（**实时流式**） | 远程 stderr 原样 | 透传远程退出码 |
-| exec 超时 | 已收到的部分输出 | `mt-ssh-cli: error: timed out after <N>s` | 124（对齐 GNU timeout） |
-| 连接/认证/传输失败、用法错误、daemon 不可达 | — | `mt-ssh-cli: error: <原因>`（绝不含密码） | 2 |
+| exec 远端以信号终止（0.4.11 起） | 已收到的输出 | 远程 stderr + 一行 `mt-ssh-cli: remote command terminated by signal SIGKILL[ (core dumped)][: <服务端说明>]; exit code 137` | `128 + 信号号`（HUP 1、INT 2、QUIT 3、ILL 4、ABRT 6、FPE 8、KILL 9、USR1 10、SEGV 11、USR2 12、PIPE 13、ALRM 14、TERM 15；认不出的信号 255） |
+| exec 远端既没报退出码也没报信号 | 已收到的输出 | `mt-ssh-cli: error: remote exit status unavailable` | 2 |
+| exec 超时（命令已发出） | 已收到的部分输出 | `mt-ssh-cli: error: timed out after <N>s` | 124（对齐 GNU timeout） |
+| exec 连接阶段超时（0.4.11 起：建连 / 认证 / 开 channel 时就到点，命令没有启动） | — | `mt-ssh-cli: error: timed out after <N>s while connecting to '<连接>'; the remote command was not started` | 124 |
+| 服务端拒绝 exec 请求（channel Failure，0.4.11 起立即返回） | — | `mt-ssh-cli: error: the SSH server rejected the exec request; ...` | 2 |
+| 连接/认证/传输失败、用法错误、daemon 不可达、令牌 / 配置错误 | — | `mt-ssh-cli: error: <原因>`（绝不含密码） | 2 |
 | list | 表格文本；`--json` 输出与 MCP `SshConnectionView` 同构的 JSON | — | 0 |
 | upload/download 成功 | 一行 `uploaded/downloaded <N> bytes: <local> ↔ <remote>` | — | 0 |
 
 - **不做 100KB 封顶**：输出经 daemon 流式转发、CLI 实时打印，Claude/Codex 的 Bash 结果自身有截断；SKILL.md 教 agent 大输出重定向到文件；
-- 远程命令自身返回 124 时与超时无法区分——接受该歧义（stderr 有无 `mt-ssh-cli: error:` 前缀可辅助判断）；
+- 远程命令自身返回 124 时与超时无法区分——接受该歧义（stderr 有无 `mt-ssh-cli: error:` 前缀可辅助判断）；同理远程命令自己 `exit 137` 与被 KILL 无法从退出码区分，信号说明行不带 `error:`（那是远端的结局，不是 CLI 错误）；
+- 信号映射在 service 层完成（exit-status 与 exit-signal 都报时以 exit-status 为准），说明行由各 transport 打：daemon 在终帧前补一个 stderr 帧（走现有帧，**不改协议**），one-shot 由 CLI 打，MCP 的 `exitCode` 同样是 128+n、`stderr` 末尾补 `[mt-ssh-mcp] ...` 一行；MCP 遇连接阶段超时按 `internal_error` 报（命令没跑，不伪装成「跑了但超时」）；
 - CLI 自身错误统一 exit 2 + 前缀，包含 clap 用法错误（先输出 `mt-ssh-cli: error:` 再输出 clap 详情）；`--help` / `--version` 保持原样 exit 0。
 
 ### 2. 守护进程架构（CLI ↔ daemon）
@@ -79,8 +85,13 @@ mt-ssh-cli daemon-stop      # 请求 daemon 优雅退出（停止接新连接 �
 
 #### 进程模型
 
-- **全局单例**，不按 project 拆分：池按 `connection_id` 缓存 session，与 project 无关；CLI 的 project 范围是**请求级能力令牌**——daemon 每次重读 config.json，把 `projectToken` 精确解析到唯一且已启用的项目后再按 `sshConnectionIds` 过滤。令牌缺失、为空或纯空白、未知、在任意项目间重复、命中未启用项目，或配置不可读时都返回错误，绝不回退到全部连接；存量 MCP 继续走原 project-id 语义；
-- daemon 就是 `mt-ssh-cli --daemon`（同一二进制），持有一个 `SshPool`，复用 MCP 侧全套编排：acquire → exec → transport 错 evict + 单次 retry → 失败 mark_unhealthy 30s cooldown → 审计。
+- **全局单例**，不按 project 拆分：池按 `connection_id` 缓存 session，与 project 无关；CLI 的 project 范围是**请求级能力令牌**——daemon 每次重读 config.json，把 `projectToken` 精确解析到唯一且已启用的项目后再按 `sshConnectionIds` 过滤。令牌缺失、为空或纯空白、未知、在任意项目间重复、命中未启用项目、解析出的范围为空，或配置不可读时都返回错误，绝不回退到全部连接；存量 MCP 继续走原 project-id 语义（读不到就是空，语义不变）；
+- 令牌路径的报错分类（0.4.11 起，`mt_core::TokenScopeError`，此前一律 `invalid project token`）：缺令牌（先于读盘判）；数据目录定位不了；`config.json` 不存在（给出路径，提示 mini-term 没在这个账户下运行过，或本进程的 APPDATA 与 mini-term 不同）；读不了（io 错误类别 + 系统文案）；解析不了（serde 错误类别 + 行列号——serde 的 Display 会带出错的值原文，可能是一段密文，所以不用它）；没有项目持有令牌（SKILL.md 过期，请在 mini-term 里重新保存「关联 SSH」；或 SKILL.md 来自 dev 实例——sidecar 只读装机版数据目录）；令牌被多个项目持有；项目已停用；范围里没有仍存在的连接。**报错里绝不回显配置内容，也不回显完整令牌**（只露前 8 位）；
+- daemon 就是 `mt-ssh-cli --daemon`（同一二进制），持有一个 `SshPool`，复用 MCP 侧全套编排：acquire → exec → transport 错精确淘汰（`evict_if_same`，0.4.11 起，不误杀并发请求刚建好的新 session）+ 单次 retry → 失败 mark_unhealthy 30s cooldown → 审计。0.4.11 起的 exec 编排细节：
+  - **会话锁只在开 channel 时持有**：拿锁 → `channel_open_session` → 立即放锁（与 mt-ssh `run_bounded_exec_on_session` 同口径）。daemon 是全机单例，此前锁一直持到命令结束，同一连接上所有 agent 的 exec 全局串行，排队时间还不算超时；
+  - **开 channel 短超时** `min(10s, 剩余时限)`（只计 `channel_open` 本身，不计等锁——锁被占说明 session 在用，不说明它死了）：到点说明这条 session 多半已死（网络切换后 TCP 半开等）→ `evict_if_same` → 在剩余时限内重新 acquire → 重试一次；新连接上仍开不出 channel → 报错（exit 2）。与「命令运行超时」区分：后者照旧第一次不淘汰——单个 channel 超时不代表 session 死了；
+  - 建连这一步封装成 `ssh_service::acquire_within`，失败分类 `AcquireFailure::{DeadlineExpired, Cancelled, Failed}`：exec 把 `DeadlineExpired` 映射成连接阶段超时（124），`Failed` 原文透传（2）；transfer 三类都是错误，沿用 transfer 既有的超时口径。B1 合入后池会给出细分的 `AcquireError { kind }`，届时在这里把池内的 `Timeout` 也映射成 124；
+  - 冷却文案：冷却由「同一请求在新 session 上重试仍 transport 失败」触发，与认证无关（认证失败由池自己冷却），提示调用方约 30 秒后重试。
 
 #### IPC 传输与协议
 
@@ -93,7 +104,8 @@ mt-ssh-cli daemon-stop      # 请求 daemon 优雅退出（停止接新连接 �
   - 请求（CLI→daemon，单行）：`{v:2, op:"list|exec|upload|download|status|shutdown", projectToken?, connection?, command?, cwd?, timeoutSecs?, localPath?, remotePath?}`；
   - 响应流（daemon→CLI，多行直至终帧）：
     - `{type:"stdout", dataB64}` / `{type:"stderr", dataB64}`（exec 输出分片，base64 保二进制安全）；
-    - 终帧 `{type:"result", exitCode?, timedOut?, bytes?, connections?, sessions?, activeRequests?}`（按 op 携带对应字段；`activeRequests` 是 0.4.11 起 status 附带的「除这条 status 外仍在处理的连接数」，加字段不升协议版本——旧 CLI 解码时忽略不认识的字段）；
+    - 终帧 `{type:"result", exitCode?, timedOut?, notStarted?, bytes?, connections?, sessions?, activeRequests?}`（按 op 携带对应字段；`activeRequests` 是 0.4.11 起 status 附带的「除这条 status 外仍在处理的连接数」；`notStarted` 是 0.4.11 起 exec 连接阶段超时时才出现的 `true`——新 CLI 据此改报「连接阶段超时、命令没启动」，普通结果与运行中超时的线上形状不变。两者都是加字段不升协议版本——旧 CLI 解码时忽略不认识的字段）；
+    - 远端信号的说明行作为终帧前的一个普通 stderr 帧送达（不新增帧类型）；
     - 终帧 `{type:"error", message}`（message 绝不含密码，与 MCP 同一纪律）。
 
 #### 生命周期
@@ -113,7 +125,7 @@ mt-ssh-cli daemon-stop      # 请求 daemon 优雅退出（停止接新连接 �
 
   dev 迭代：`daemon-stop` 可手动踢掉占着二进制文件锁的 daemon（Windows 下运行中的 exe 无法被 stage-sidecars 覆盖，现有「跳过被占用文件」的容忍逻辑继续兜底）；同版本而协议不同（只会是 dev 构建）也只能这样手动换；
 - **优雅退出**（0.4.11 起）：daemon 收到 `shutdown`（`daemon-stop` 或版本换代）→ 先回 ack → **立刻停止接受新连接**（Windows 丢掉监听实例，新客户端拿到 `ERROR_PIPE_BUSY` / 找不到管道；Unix 关 listener、删 socket 并放掉 recovery lock，新 daemon 可立即在同一路径起来）→ 等在途请求做完，上限 60s（= exec 默认超时：默认参数的 exec 不会被换代硬切；upload/download 默认 300s、显式加大 `--timeout` 的 exec 到点照样被切断，那条 CLI 得到 "connection to daemon lost mid-request"——换代不能被一个长传输拖住几分钟）→ drain 池 → 退出。等待期间新来的 CLI 连不上，退避 ~3s 后降级 one-shot。⚠️ **0.4.10 及更早的 daemon 收到 shutdown 仍是立即退出、硬切在途请求**——已发出去的旧二进制改不了，新 CLI 给它们换代那一刻的在途请求照旧会断；反过来旧 CLI（0.4.10）遇到新 daemon 仍会按旧规则发 shutdown，新 daemon 按上面的流程优雅退出；
-- **CLI 中途被杀**（agent Bash 超时 / Ctrl+C）：daemon 用状态型取消令牌通知 service，并等待显式 `channel.close().await` 完成；请求超时也在同一 channel 状态机内先 close 再返回 124。不能依赖 russh `Channel` Drop（Drop 不发送 Close）。取消令牌只在 channel 阶段被响应，编排若卡在建连 / 认证会无视取消，所以这次等待以 10s 为限：到点放弃这次编排（丢弃 future）并记日志，保证连接计数归零、daemon 能空闲自退；
+- **CLI 中途被杀**（agent Bash 超时 / Ctrl+C）：daemon 用状态型取消令牌通知 service，并等待显式 `channel.close().await` 完成；请求超时也在同一 channel 状态机内先 close 再返回 124。不能依赖 russh `Channel` Drop（Drop 不发送 Close）。0.4.11 起取消令牌在编排的每一步都被响应——建连 / 认证（acquire 的 future 直接丢弃）、等会话锁、开 channel、收流；这次等待仍以 10s 为限作为纵深兜底：到点放弃这次编排（丢弃 future）并记日志，保证连接计数归零、daemon 能空闲自退；
 - **daemon 日志**（0.4.11 起）：CLI 拉起 daemon 时把它的 stdout/stderr 追加写到数据目录（`mt_core::config_json_path()` 的父目录，与审计日志同一锚点，不存在就创建）下的 `mt-ssh-cli-daemon.log`；拉起前超过 1 MiB 就轮转成 `.log.1`（只留一代）。daemon 自己的生命周期事件（启动 / 版本 / 端点、空闲退出、shutdown、客户端断开、取消兜底超时）带 UTC 毫秒时间戳，每行一次写出（并发冷启动的几个 daemon 共写一份日志，行不交错）；会话池等下层的 `eprintln!`（如 `[mt-ssh] host key rejected: …`、重试日志）不带时间戳，夹在事件行之间。日志句柄只交给 daemon，不经过调用方的标准句柄。`daemon-status` 打印日志路径（daemon 不在时也打印）。
 
 #### 安全边界
@@ -121,8 +133,9 @@ mt-ssh-cli daemon-stop      # 请求 daemon 优雅退出（停止接新连接 �
 - IPC 仅限当前用户可连；信任边界与现状**等价**——本机同用户进程本来就能直接 spawn `mt-ssh-mcp` 或读 config.json，daemon 不新增暴露面；
 - 反方向，CLI 只和**当前用户**的 daemon 说话（见上「客户端核验服务端身份」）：别的用户抢注同名管道 / 在 /tmp 放同名 socket 时，CLI 不发请求、不自拉起、降级 one-shot；`daemon-status` / `daemon-stop` 拒绝通信并 exit 2；daemon 绑定失败后的活体探测同样核验，端点被别的用户占着时报 Runtime，不静默让位；
 - CLI 的项目授权由随机能力令牌决定，agent 可见自己的 token，但不能通过省略参数或伪造 project-id 扩大范围；
-- `is_blocked_local_path`（config.json 传输硬拒绝）在 **daemon 端**执行，单点强制，CLI 无法绕过；
-- 审计日志由 daemon 单点追加（沿用 `ssh-mcp-audit.log` 文件与行格式），消除并发写交错。
+- `is_blocked_local_path`（数据目录传输硬拒绝，0.4.10 起整棵目录树）在 **daemon 端**执行，单点强制，CLI 无法绕过。0.4.11 起比较前先把指向本机磁盘的 Windows 别名改写回盘符路径：`\\?\C:\…`、`\\.\C:\…`、本机管理共享 `\\localhost\C$\…` / `\\127.0.0.1\c$\…` / `\\<本机名>\C$\…`（含 `\\?\UNC\…` 写法）、WSL 的 `\\wsl.localhost\<发行版>\mnt\c\…` / `\\wsl$\…\mnt\c\…`（canonicalize 之后仍是 9P 的 UNC 路径，此前拦不住）；纵深再加一道：路径任一分量（规范化前后都查，大小写不敏感，忽略 NTFS 流后缀与结尾的点 / 空格）就是装机版数据目录名 `com.mini-term.app` 一律拦——改写规则覆盖不到的别名（非管理共享、改过 automount 根的 WSL）也跑不掉。dev 数据目录（`MT_APP_DATA_DIR`）名字可能很普通，只按前缀拦；
+- 审计日志由 daemon 单点追加（沿用 `ssh-mcp-audit.log` 文件与行格式），消除并发写交错。0.4.11 起 exec 审计行只记**远程命令可能已经开始执行**的请求，`exit=` 取 `<退出码>`（信号终止时是 128+n）/ `timeout` / `cancelled`（跑到一半调用方断开，此前不记）/ `unknown`（远端没报退出状态，此前误记成 `timeout`）；建连阶段失败、超时或取消、冷却中、服务端拒绝、传输层失败（含重试仍失败，此前误记成 `exit=timeout`）都不记——命令没离开本机或没被远端接受，记一行只会误导。transfer 的审计口径不变，只是连接阶段超时与 acquire 失败一样不记；
+- 审计脱敏（`redact_command`，0.4.11 扩展）：`--password` / `--passwd` / `--pass` / `--passphrase` / `--token` / `--api-key` / `--secret` / `--client-secret` 等（以 `-password` / `-secret` / `-token` / `-api-key` 结尾的长选项同样算，`--opt 值` 与 `--opt=值` 两种写法）、keytool 的 `-storepass` 一类、openssl 的 `pass:<口令>`、`sshpass -p`（只认 sshpass 自己的选项区，`ssh -p 22` 不受影响）、变量赋值 / `key=value`（键含 PASSWORD / PASSWD / SECRET / TOKEN / API_KEY / APIKEY / PRIVATE_KEY，或 `*_PWD`、`SSHPASS`、`REDISCLI_AUTH`）、HTTP 头 `Authorization` / `Proxy-Authorization`（`Bearer` / `Basic` / `token` 等方案名之后的凭据）与 `X-Api-Key` 一类。命令按空白切段、不解析引号，带引号的值跨多段时一并打码到收尾引号。「宁漏勿误伤」不变：`ps -p 123`、`ssh -p 22`、`grep token file`、`--password-stdin`、`--no-password` 等原样。
 
 #### 降级路径
 
@@ -150,13 +163,20 @@ daemon 对 skill 完全透明——SKILL.md 只描述 CLI 用法，不提 daemon
 
 生成策略与 `.mcp.json` 不同：SKILL.md 是 mini-term **独占生成物**（不是与用户共享的合并文件），直接整文件覆盖写入，文件头带 generated 注释标记。内容含 CLI 绝对路径与项目 capability token（机器相关 → 进 `.gitignore`）。
 
-模板（Claude 版；Codex 版去掉 `allowed-tools` 行，其余相同）：
+模板（Claude 版；Codex 版去掉 `allowed-tools` 整段，其余相同）：
 
 ```markdown
 ---
 name: mini-term-ssh
 description: Run commands or transfer files on remote servers over SSH using this project's saved connections (managed by mini-term). Use when the user asks to operate on a remote host — run commands, inspect logs, deploy services, upload or download files.
-allowed-tools: 'Bash("<ABS_PATH>" *), PowerShell("<ABS_PATH>" *)'
+allowed-tools:
+  - 'Bash(''<ABS_PATH>'' list --project-token ''<PROJECT_TOKEN>'' *)'
+  - 'Bash(''<ABS_PATH>'' exec --project-token ''<PROJECT_TOKEN>'' *)'
+  - 'Bash("$(wslpath ''<ABS_PATH>'')" list --project-token ''<PROJECT_TOKEN>'' *)'
+  - 'Bash("$(wslpath ''<ABS_PATH>'')" exec --project-token ''<PROJECT_TOKEN>'' *)'
+  - 'Bash(wslpath ''<ABS_PATH>'')'
+  - 'PowerShell(& ''<ABS_PATH>'' list --project-token ''<PROJECT_TOKEN>'' *)'
+  - 'PowerShell(& ''<ABS_PATH>'' exec --project-token ''<PROJECT_TOKEN>'' *)'
 ---
 
 <!-- generated by mini-term; do not edit (regenerated on enable) -->
@@ -198,9 +218,7 @@ PowerShell 的带引号可执行路径前必须使用调用运算符 `&`：
 
 PowerShell 路径中的 `'` 按 `''` 转义。
 
-- Remote stdout/stderr stream through; exit code = remote exit code.
-- Exit 124 = timeout (default 60s), exit 2 + `mt-ssh-cli: error:` on stderr = CLI/connection error.
-- Large output: append `> file.log` and read the file afterwards.
+（0.4.11 起正文另有一节 Behaviour 与退出码清单：没有 TTY / 没有 stdin（远端立即 EOF，交互式提示会失败，用 `sudo -n`、`-y`、`DEBIAN_FRONTEND=noninteractive` 等非交互参数）；`--cwd` 默认远端是 POSIX shell，Windows 主机把切目录写进命令本身；`--timeout` 覆盖整个调用含建连；退出码 = 远程退出码 / 124 超时（"while connecting" 表示命令没启动）/ 128+n 信号 / 2 CLI 或连接错误。WSL 一节说明 upload/download 的本地路径用相对路径或 `"$(wslpath -w '/abs/path')"`，当前目录在 `/mnt/*` 下时传 `/tmp/x` 这类 POSIX 绝对路径会被拒（exit 2）。upload/download 一节注明它们不预批、会弹审批。）
 
 Do NOT base64-echo file contents through exec — use upload/download.
 ```
@@ -208,6 +226,9 @@ Do NOT base64-echo file contents through exec — use upload/download.
 要点：
 
 - frontmatter 仅 `name` / `description`（+ Claude 版 `allowed-tools`）——两端公共子集；`allowed-tools` 让 skill 激活期间免审批（授权随下一条用户消息失效，符合预期）；
+- `allowed-tools` **只预批 `list` 与 `exec`**（0.4.11 起；此前 `Bash("<ABS_PATH>" *)` 放行整个 CLI，upload/download 能免审批读写任意本地文件，而且双引号写法与正文教的单引号写法根本对不上）。Claude Code 的 Bash / PowerShell 规则按命令原文匹配（引号算在内，`*` 匹配任意文本，末尾 ` *` 也匹配不带参数的形式），所以每条规则都与正文的调用形式逐字一致：Bash 的 `'<ABS_PATH>'`、WSL 的 `"$(wslpath '<ABS_PATH>')"`（外加命令替换里那条 `wslpath '<ABS_PATH>'`——Claude Code 会单独检查命令替换内部的命令）、PowerShell 的 `& '<ABS_PATH>'`，后面紧跟子命令与本项目令牌。写成 YAML 列表、每项单引号标量（内部 `'` 双写），避免「空格 / 逗号分隔的一行」被路径里的空格拆坏；路径或令牌含 `*`（会变成通配）或换行时整段不写，宁可每次弹审批；
+- dev 实例（本实例写 `config.json` 投影的目录不是 sidecar 读的那个，通常是设了 `MT_APP_DATA_DIR`）：它生成的令牌永远验证不过，写 SKILL.md 只会覆盖装机版那份、停用时删的也是装机版的——启用 / 停用 / 启动校正都跳过注册器的一切文件改动（SKILL.md、`.gitignore`、`~/.codex/config.toml` 信任、MCP 迁移清理），关联照常存进本实例配置，界面提示补一句说明（`sshAssoc.devInstanceNote`）；
+- 启动校正（0.4.11 起）：主程序启动后在后台把现存的、mini-term 生成的 SKILL.md（Claude / Codex 两份）对齐——引用的 CLI 不存在、令牌与配置不符、或内容与当前模板输出不同（模板升级）才按 enable 的写法重写；缺失的不重建（可能是用户故意删的），用户自己写的同名文件不碰，引用同机另一处仍存在的 CLI 且内容与模板一致的不改（免得两份安装来回改写）；只看开启了关联且带令牌的本地项目，远程 SSH 项目跳过；dev 实例整个跳过；每次重写打一行日志，任何失败都不影响启动；
 - 正文英文（与现有 MCP tool descriptions 一致，对两端 agent 触发与遵循最稳）；
 - description 是触发关键：明确列出「远程执行 / 查日志 / 部署 / 传文件」场景。
 
@@ -225,6 +246,8 @@ Do NOT base64-echo file contents through exec — use upload/download.
 已有非空 token 稳定复用；旧项目没有 token 时后端生成 UUID v4 并返回，前端随后持久化到对应 `ProjectConfig.sshCliToken`。
 
 **`disable_ssh_tools(project_dir)`**：删两份 SKILL.md 及空目录（`skills/` 目录若空一并删除，不留空壳）；顺带执行同样的 MCP 迁移清理（兜底存量）。Codex 信任与 `.gitignore` 沿用现行策略不回收。
+
+（GPUI 版落在 `mt_ai::ssh_registry`。0.4.11 起 `enable` / `disable` 多一个参数 `projection_dir`——本实例写 `config.json` 投影的目录（mt-app 取 `ConfigStore::path()` 的父目录），与 sidecar 读的 `mt_core::config_json_path()` 父目录规范化后比较，不同即 dev 实例：只解析令牌 / 什么都不删，结果带 `registry_skipped`。另有 `reconcile_skill_files_on_startup`（启动校正，见 §4），mt-app 在窗口打开后丢 background executor 调一次。）
 
 `lib.rs`：注册 `enable_ssh_tools` / `disable_ssh_tools`，移除 `enable_ssh_mcp` / `disable_ssh_mcp`。
 
@@ -248,7 +271,8 @@ Do NOT base64-echo file contents through exec — use upload/download.
 - daemon 协议：请求/响应帧序列化 round-trip、hello 版本比对逻辑、stdout/stderr 分片 base64 编解码（纯函数级）；
 - daemon 生命周期（集成测试，进程内起 socket/pipe）：并发绑定互斥收敛、空闲计时触发 drain、shutdown op 幂等；shutdown 后立刻连不上、在途请求照常做完、等待有上限；status 的在途数；同进程起的管道服务端核验通过、换成别的 SID 必判不可信；
 - 冷启动端到端（`sidecars/tests/cli_daemon_spawn.rs`，仅 Windows，跑真实 `mt-ssh-cli.exe`，独立端点 + 临时 APPDATA，收尾必 `daemon-stop`）：用管道接住 CLI 的 stdout/stderr，CLI 退出后数秒内必须 EOF；CLI 的 cwd 退出后能改名；`daemon-status` 报日志路径、日志里有带时间戳的启动事件。对 0.4.10 二进制跑同一用例会在 5s 处失败（不挂死）；
-- registry 新增：SKILL.md 生成内容断言（含 project-token、PowerShell `&`、POSIX/PowerShell 撇号转义、frontmatter 差异化）、覆盖写幂等、disable 清理含空目录、`.gitignore` 追加幂等、enable/disable round-trip 含 MCP 迁移清理。
+- registry 新增：SKILL.md 生成内容断言（含 project-token、PowerShell `&`、POSIX/PowerShell 撇号转义、frontmatter 差异化）、覆盖写幂等、disable 清理含空目录、`.gitignore` 追加幂等、enable/disable round-trip 含 MCP 迁移清理。0.4.11 补：`allowed-tools` 只含 list / exec、每条规则（按 YAML 单引号标量解码后）都是正文某条示例的开头、含 `*` / 换行时整段不写；正文的 stdin / `--cwd` / WSL / 退出码说明；dev 实例启用只解析令牌、停用不删装机版文件；启动校正的各分支（最新不动、旧模板重写、令牌漂移重写、CLI 不存在改指向、另一处安装不动、外来文件与缺失文件不碰）；
+- service 层（0.4.11）：收流状态机喂消息序列（Success / Data / stderr / ExitStatus / ExitSignal / Failure 的组合）、信号号映射与说明行、`--cwd` 引号的正反例（实测过 POSIX shell 的展开与字面）、脱敏正反例、护栏别名改写与按名字拦截、能力令牌报错分类（不回显配置内容与完整令牌）。另有进程内 russh 假服务器的端到端用例（`ssh_service/fake_server_tests.rs`，127.0.0.1 临时端口，池用 `SshPool::with_paths` + 临时 known_hosts，编排核心不读配置不写审计）：输出与退出码、立即 EOF、KILL / SEGV / 自定义名 USR2 信号、服务端拒绝、同一 session 上两个 exec 真并发（服务端会合点，串行就超时）、开 channel 卡住后淘汰重试成功 / 新连接也卡住报错、只收 TCP 不说话时连接阶段超时、取消打断建连、运行中超时记 timeout 且 session 留池、运行中取消记 cancelled。并发与 EOF 两条已做过变异验证（退回旧实现必红）。
 
 **手动 e2e 清单**：
 1. Windows + Claude Code：skill 触发 → list/exec/upload/download → 首调自拉 daemon → 二调复用池（观察延迟差）→ 审计日志落行；
@@ -263,7 +287,7 @@ Do NOT base64-echo file contents through exec — use upload/download.
 |---|------|---------|------------------------------|
 | 1 | daemon 引入生命周期复杂度（自拉起竞态、孤儿、版本换代、dev 下二进制文件锁定） | 接受，换取池复用；空闲 10min 自退 + 版本握手 + `daemon-stop` 三道兜底 | 真机全部验证通过：4 路并发冷启动收敛到单 daemon；空闲窗口后自退；旧版 daemon 被新 CLI 自动踢旧拉新；`daemon-stop` 后二进制文件锁释放、stage 脚本可覆盖 |
 | 2 | Codex workspace-write 沙箱默认禁网，CLI 需网络（连 pipe 是否被沙箱拦也未知）→ 可能每次审批 | v1 不写 `network_access = true`（Windows 主平台沙箱为实验状态、影响有限）；实测被拦再评估是否随 enable 写入项目 `.codex/config.toml` | **待手动实测**（Windows + Codex 交互式会话） |
-| 3 | `allowed-tools: 'Bash("<带空格路径>" *)'` 语法未实测 | 实测失败则去掉该行，agent 首次调用手动批准一次 | matcher 保持可执行文件形式；正文另列 PowerShell 可执行命令并正确使用 `& '<ABS_PATH>'`。无头沙箱环境无法验证自动放行；交互式自动放行**待手动实测** |
+| 3 | `allowed-tools: 'Bash("<带空格路径>" *)'` 语法未实测 | 实测失败则去掉该行，agent 首次调用手动批准一次 | 0.4.11 起改为 YAML 列表、只预批 list / exec，每条规则与正文调用形式逐字一致（Bash 单引号路径、WSL `"$(wslpath …)"`、PowerShell `& '<ABS_PATH>'`）——依据 Claude Code 文档「Bash / PowerShell 规则按命令原文匹配、`*` 匹配任意文本、末尾 ` *` 也匹配裸命令、命令替换内部单独检查」。PowerShell 规则对 `&` 调用形式的匹配（文档说按 AST 解析、别名会被规范化，没说调用运算符如何处理）与 WSL 命令替换的放行**待交互式手动实测**；匹配不上的后果只是照常弹审批 |
 | 4 | Codex 对未知 frontmatter 字段（如误留 allowed-tools）容忍度未知 | 两份模板独立生成规避 | 按决策落地（Codex 版无 allowed-tools），无需再验 |
 | 5 | skill 触发率不如 MCP 工具列表强曝光 | description 覆盖典型场景；实测触发不稳再在 CLAUDE.md 模板补一句指引 | Claude Code 无头会话 4/4 轮自然语言（"查远程服务器 uptime"）均正确触发 skill；rev4 模板改为 capability token 后需随最终手动矩阵复核 |
 | 6 | 远程命令自身 exit 124 与超时歧义 | 接受，stderr 前缀可辅助区分 | 按决策落地 |

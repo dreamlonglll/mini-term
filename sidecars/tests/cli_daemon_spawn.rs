@@ -268,9 +268,18 @@ fn cold_start_releases_caller_pipes_and_cwd_and_logs_to_the_data_dir() {
             ),
         }
     }
-    // 业务结果:请求确实经新拉起的 daemon 处理(没走降级),假令牌被拒、exit 2。
+    // 业务结果:请求确实经新拉起的 daemon 处理(没走降级),被拒、exit 2。临时 APPDATA
+    // 是空的,报的是「配置不存在」那一类,并指出 sidecar 读的是哪份配置。
     assert_eq!(status.code(), Some(2), "stderr: {stderr}");
-    assert!(stderr.contains("invalid project token"), "stderr: {stderr}");
+    let config = sandbox
+        .appdata
+        .join("com.mini-term.app")
+        .join("config.json");
+    assert!(stderr.contains("does not exist"), "stderr: {stderr}");
+    assert!(
+        stderr.contains(&config.display().to_string()),
+        "stderr: {stderr}"
+    );
     assert!(
         !stderr.contains("falling back"),
         "the request must go through the spawned daemon; stderr: {stderr}"
