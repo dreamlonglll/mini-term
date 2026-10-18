@@ -359,6 +359,11 @@ struct SftpConfig {
     reply_delay: Option<Duration>,
     /// 读 / 写请求在这里排队,测试放行前一律卡住。
     gate: Option<Arc<Semaphore>>,
+    /// 标准 rename 的新路径包含这个片段时:改名照做,应答扣到测试放行(模拟应答在路上时
+    /// 调用方放弃等待)。
+    rename_hold: Option<(String, Arc<Semaphore>)>,
+    /// 开 session channel 卡在这里,测试放行前不回确认(模拟服务器挂起 / 半开连接)。
+    stall_channel_open: Option<Arc<Semaphore>>,
 }
 
 impl Default for SftpConfig {
@@ -370,6 +375,8 @@ impl Default for SftpConfig {
             max_read: None,
             reply_delay: None,
             gate: None,
+            rename_hold: None,
+            stall_channel_open: None,
         }
     }
 }
@@ -394,6 +401,8 @@ struct Stats {
     renames: Mutex<Vec<String>>,
     /// 新建文件时的 (路径, 权限)。
     created: Mutex<Vec<(String, u32)>>,
+    /// 收到的开 session channel 请求数。
+    channel_opens: AtomicUsize,
 }
 
 struct Shared {
@@ -712,6 +721,14 @@ impl russh_sftp::server::Handler for SftpHandler {
         newpath: String,
     ) -> Result<Status, Self::Error> {
         self.rename_entry(&oldpath, &newpath, false)?;
+        if let Some((fragment, hold)) = &self.config.rename_hold {
+            if newpath.contains(fragment.as_str()) {
+                hold.acquire()
+                    .await
+                    .map_err(|_| StatusCode::Failure)?
+                    .forget();
+            }
+        }
         Ok(ok(id))
     }
 
@@ -853,6 +870,15 @@ impl server::Handler for SshHandler {
         channel: Channel<Msg>,
         _session: &mut Session,
     ) -> Result<bool, Self::Error> {
+        self.shared
+            .stats
+            .channel_opens
+            .fetch_add(1, Ordering::SeqCst);
+        if let Some(stall) = &self.config.stall_channel_open {
+            if let Ok(permit) = stall.acquire().await {
+                permit.forget();
+            }
+        }
         self.channels.insert(channel.id(), channel);
         Ok(true)
     }
@@ -1036,14 +1062,20 @@ struct Client {
 
 impl Client {
     async fn connect(server: &TestServer, name: &str) -> (Self, Arc<CachedSession>) {
+        let config = PoolConfig {
+            connect_timeout: Duration::from_secs(10),
+            ..PoolConfig::default()
+        };
+        Self::connect_with(server, name, config).await
+    }
+
+    async fn connect_with(
+        server: &TestServer,
+        name: &str,
+        config: PoolConfig,
+    ) -> (Self, Arc<CachedSession>) {
         let dir = TempDir::new(name);
-        let pool = SshPool::with_env(
-            PoolConfig {
-                connect_timeout: Duration::from_secs(10),
-                ..PoolConfig::default()
-            },
-            SshClientEnv::isolated(dir.path("known_hosts")),
-        );
+        let pool = SshPool::with_env(config, SshClientEnv::isolated(dir.path("known_hosts")));
         let conn = SshConnection {
             id: name.into(),
             name: name.into(),
@@ -1756,5 +1788,379 @@ async fn cancelled_transfers_clean_up_their_temporary_files() {
     })
     .await;
     assert!(server.node("/home/u/cancelled.bin").is_none());
+    client.pool.shutdown().await;
+}
+
+// ============================================================================
+// 评审修复:protected_symlinks / 替换中途被丢弃 / 整体时限 / 开 channel 卡住
+// ============================================================================
+
+/// 软链落在 sticky 且全局可写的目录(`/tmp`)里:别人预埋的软链不跟随(与内核
+/// `fs.protected_symlinks` 同一规则),什么都不动、悬空的也一样;自己的、目录属主
+/// (root)的软链照常跟随。
+#[tokio::test]
+async fn upload_refuses_foreign_symlinks_in_sticky_world_writable_directories() {
+    let server = TestServer::start(SftpConfig::default()).await;
+    server.put("/tmp", Kind::Dir, 0o1777, 0, 0);
+    server.put_file("/home/u/.bashrc", b"original rc", 0o644, UID, GID);
+    let foreign = |target: &str| Kind::Symlink(target.into());
+    server.put("/tmp/build.sh", foreign("/home/u/.bashrc"), 0o777, WWW, WWW);
+    server.put(
+        "/tmp/dangling.sh",
+        foreign("/home/u/.profile"),
+        0o777,
+        WWW,
+        WWW,
+    );
+    server.put("/tmp/mine.sh", foreign("/home/u/mine.txt"), 0o777, UID, GID);
+    server.put("/tmp/roots.sh", foreign("/home/u/roots.txt"), 0o777, 0, 0);
+    let (client, session) = Client::connect(&server, "protected-symlinks").await;
+    let local = client.write_local("payload", b"redirected upload");
+
+    for link in ["/tmp/build.sh", "/tmp/dangling.sh"] {
+        let error = upload(&session, &local, link).await.unwrap_err();
+        assert!(!error.is_transport(), "{error}");
+        let message = error.message();
+        assert!(
+            message.contains(&format!("refusing to follow the symbolic link '{link}'")),
+            "{message}"
+        );
+        assert!(message.contains("owned by uid 33"), "{message}");
+        assert!(message.contains("fs.protected_symlinks"), "{message}");
+    }
+    assert_eq!(server.data("/home/u/.bashrc").unwrap(), b"original rc");
+    assert!(server.node("/home/u/.profile").is_none());
+    assert!(
+        server.leftovers(HOME).is_empty(),
+        "{:?}",
+        server.names(HOME)
+    );
+
+    upload(&session, &local, "/tmp/mine.sh").await.unwrap();
+    assert_eq!(
+        server.data("/home/u/mine.txt").unwrap(),
+        b"redirected upload"
+    );
+    upload(&session, &local, "/tmp/roots.sh").await.unwrap();
+    assert_eq!(
+        server.data("/home/u/roots.txt").unwrap(),
+        b"redirected upload"
+    );
+    client.pool.shutdown().await;
+}
+
+/// 没有 posix-rename 时的「目标 → 备份、临时 → 目标」:调用方恰在两步之间放弃等待(外层
+/// 超时 / 取消丢弃 future),替换照样在后台跑完,目标不会就此消失;就位失败时回滚。
+#[tokio::test]
+async fn dropping_the_upload_mid_backup_swap_still_finishes_or_rolls_back() {
+    let hold = Arc::new(Semaphore::new(0));
+    let server = TestServer::start(SftpConfig {
+        posix_rename: false,
+        rename_hold: Some((".mt-backup-".into(), hold.clone())),
+        ..SftpConfig::default()
+    })
+    .await;
+    server.put_file("/home/u/swap.txt", b"old swap", 0o600, UID, GID);
+    server.put_file("/home/u/roll.txt", b"old roll", 0o600, UID, GID);
+    server.fail_renames(false, ".mt-partial-", "/home/u/roll.txt");
+    let (client, session) = Client::connect(&server, "swap-cancel").await;
+    let local = client.write_local("payload", b"new content");
+
+    for (target, expected) in [
+        ("/home/u/swap.txt", &b"new content"[..]),
+        ("/home/u/roll.txt", &b"old roll"[..]),
+    ] {
+        let task = {
+            let session = session.clone();
+            let local = local.clone();
+            tokio::spawn(async move { upload(&session, &local, target).await })
+        };
+        // 「目标 → 备份」已经做完、应答被扣住:此刻目标路径是空的。
+        wait_until("the original to be moved aside", || {
+            server.node(target).is_none()
+        })
+        .await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        hold.add_permits(1);
+        wait_until("the background replacement to finish", || {
+            server.data(target).as_deref() == Some(expected)
+        })
+        .await;
+        wait_until("no leftovers", || server.leftovers(HOME).is_empty()).await;
+        assert_eq!(server.node(target).unwrap().mode, 0o600);
+    }
+    client.pool.shutdown().await;
+}
+
+/// 带整体时限的上传:原地覆盖写到一半到点,报错写明远端文件可能不完整并给出路径;还在
+/// 写临时文件时到点,报错写明原文件没动过,临时文件随后删掉。
+#[tokio::test]
+async fn upload_deadline_reports_the_state_of_the_remote_file() {
+    let gate = Arc::new(Semaphore::new(0));
+    let server = TestServer::start(SftpConfig {
+        user: User::normal(&[WWW]),
+        gate: Some(gate.clone()),
+        ..SftpConfig::default()
+    })
+    .await;
+    // 属主是别人:替换保不住属主,只能原地覆盖写。
+    server.put_file("/home/u/site.conf", b"old site config", 0o664, WWW, WWW);
+    server.put_file("/home/u/own.conf", b"old own config", 0o600, UID, GID);
+    let (client, session) = Client::connect(&server, "upload-deadline").await;
+    let local = client.write_local("payload", &pattern(200_000, 13));
+    let local = local.to_str().unwrap();
+
+    // 写请求卡在闸门上,时限一定落在写的途中;给足 2s,慢机器上也来得及走到那一步。
+    let started = Instant::now();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let error = mt_ssh::run_sftp_upload_until(&session, local, "/home/u/site.conf", deadline)
+        .await
+        .unwrap_err();
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(error.is_timeout(), "{error}");
+    assert!(
+        error
+            .message()
+            .contains("the remote file '/home/u/site.conf' may now be incomplete"),
+        "{error}"
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let error = mt_ssh::run_sftp_upload_until(&session, local, "/home/u/own.conf", deadline)
+        .await
+        .unwrap_err();
+    assert!(error.is_timeout(), "{error}");
+    assert!(
+        error
+            .message()
+            .contains("'/home/u/own.conf' was not changed"),
+        "{error}"
+    );
+    gate.add_permits(1_000_000);
+    wait_until("the staging file to be removed", || {
+        server.leftovers(HOME).is_empty()
+    })
+    .await;
+    assert_eq!(server.data("/home/u/own.conf").unwrap(), b"old own config");
+
+    // 时限够用时与普通上传无异。
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let written = mt_ssh::run_sftp_upload_until(&session, local, "/home/u/own.conf", deadline)
+        .await
+        .unwrap();
+    assert_eq!(written, 200_000);
+    assert!(server.data("/home/u/own.conf").unwrap() == pattern(200_000, 13));
+    client.pool.shutdown().await;
+}
+
+/// 开 SFTP channel 卡住(服务器不回 channel 确认):到 `sftp_open_timeout` 就按 transport
+/// 错返回、放开会话锁,同一连接上的 acquire 不会一直被它挡着。
+#[tokio::test]
+async fn a_stuck_sftp_channel_open_does_not_block_acquire() {
+    let stall = Arc::new(Semaphore::new(0));
+    let server = TestServer::start(SftpConfig {
+        stall_channel_open: Some(stall.clone()),
+        ..SftpConfig::default()
+    })
+    .await;
+    let config = PoolConfig {
+        connect_timeout: Duration::from_secs(10),
+        sftp_open_timeout: Duration::from_millis(800),
+        ..PoolConfig::default()
+    };
+    let (client, session) = Client::connect_with(&server, "stuck-open", config).await;
+    let local = client.dir.path("never.bin").to_str().unwrap().to_string();
+
+    let started = Instant::now();
+    let download = {
+        let session = session.clone();
+        tokio::spawn(async move {
+            mt_ssh::run_sftp_download_on_session(&session, "/home/u/x", &local, TRANSFER_TIMEOUT)
+                .await
+        })
+    };
+    // 服务器收到了开 channel 请求 = 下载正攥着会话锁、卡在等确认上。
+    let stats = &server.shared.stats;
+    wait_until("the channel open to reach the server", || {
+        stats.channel_opens.load(Ordering::SeqCst) > 0
+    })
+    .await;
+    let again = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.pool.try_acquire(&client.conn),
+    )
+    .await
+    .expect("acquire must not wait for the stuck channel open")
+    .expect("the cached session");
+    assert!(Arc::ptr_eq(&again, &session));
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+
+    let error = download.await.unwrap().unwrap_err();
+    assert!(error.is_transport(), "{error}");
+    assert!(
+        error
+            .message()
+            .contains("opening an SFTP channel timed out after 800ms"),
+        "{error}"
+    );
+    stall.add_permits(100);
+    client.pool.shutdown().await;
+}
+
+/// 会话被标记不健康(如 exec 开 channel 超时判死)后,排在会话锁上的 SFTP 传输拿到锁就
+/// 立即按 transport 错返回,不在一条已判死的会话上再开 channel、白等一次超时。
+#[tokio::test]
+async fn sftp_open_fails_fast_on_a_session_marked_unhealthy() {
+    let stall = Arc::new(Semaphore::new(0));
+    let server = TestServer::start(SftpConfig {
+        stall_channel_open: Some(stall.clone()),
+        ..SftpConfig::default()
+    })
+    .await;
+    let config = PoolConfig {
+        connect_timeout: Duration::from_secs(10),
+        sftp_open_timeout: Duration::from_secs(2),
+        ..PoolConfig::default()
+    };
+    let (client, session) = Client::connect_with(&server, "unhealthy-open", config).await;
+    let download = |name: &str| {
+        let session = session.clone();
+        let local = client.dir.path(name).to_str().unwrap().to_string();
+        tokio::spawn(async move {
+            mt_ssh::run_sftp_download_on_session(&session, "/home/u/x", &local, TRANSFER_TIMEOUT)
+                .await
+        })
+    };
+
+    let stuck = download("first.bin");
+    let stats = &server.shared.stats;
+    wait_until("the first channel open to reach the server", || {
+        stats.channel_opens.load(Ordering::SeqCst) > 0
+    })
+    .await;
+    // 第二个传输晚一点出发、排在会话锁上:第一个放锁时它离自己的超时还早。
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let queued = download("second.bin");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    session.mark_unhealthy(Duration::from_secs(30));
+
+    let error = stuck.await.unwrap().unwrap_err();
+    assert!(error.message().contains("timed out"), "{error}");
+    let error = queued.await.unwrap().unwrap_err();
+    assert!(error.is_transport(), "{error}");
+    assert!(error.message().contains("marked unhealthy"), "{error}");
+    assert_eq!(
+        stats.channel_opens.load(Ordering::SeqCst),
+        1,
+        "no channel is opened on a session marked unhealthy"
+    );
+    stall.add_permits(100);
+    client.pool.shutdown().await;
+}
+
+/// Git Bash 下 SKILL.md 让远端绝对路径写成 `//var/log/app.log`(躲开 Git Bash 的路径
+/// 改写,POSIX 上等价于 `/var/log/app.log`):上传(新建 / 备份交换替换 / 经软链)、下载、
+/// protected_symlinks 把关都照常,报错里的路径按用户写的原样展示。
+#[tokio::test]
+async fn double_slash_remote_paths_work_like_single_slash_ones() {
+    let server = TestServer::start(SftpConfig {
+        posix_rename: false,
+        ..SftpConfig::default()
+    })
+    .await;
+    server.put_file("/home/u/existing.txt", b"old", 0o640, UID, GID);
+    server.put_file("/home/u/target.txt", b"old target", 0o600, UID, GID);
+    server.put_symlink("/home/u/link.txt", "target.txt");
+    server.put("/tmp", Kind::Dir, 0o1777, 0, 0);
+    server.put(
+        "/tmp/foreign.sh",
+        Kind::Symlink("/home/u/target.txt".into()),
+        0o777,
+        WWW,
+        WWW,
+    );
+    server.put_dir("/srv");
+    let (client, session) = Client::connect(&server, "double-slash").await;
+    let local = client.write_local("payload", b"via double slash");
+
+    // 新建与替换:临时名、备份名都在同一个 `//` 目录下推导。
+    upload(&session, &local, "//home/u/new.txt").await.unwrap();
+    assert_eq!(server.data("/home/u/new.txt").unwrap(), b"via double slash");
+    upload(&session, &local, "//home/u/existing.txt")
+        .await
+        .unwrap();
+    assert_eq!(
+        server.data("/home/u/existing.txt").unwrap(),
+        b"via double slash"
+    );
+    assert_eq!(server.node("/home/u/existing.txt").unwrap().mode, 0o640);
+    let renames = server.renames();
+    assert!(
+        renames.iter().any(|rename| rename
+            .starts_with("rename //home/u/existing.txt -> //home/u/.existing.txt.mt-backup-")),
+        "{renames:?}"
+    );
+    // 软链的相对目标按软链所在目录(`//home/u/`)拼接,软链保持软链。
+    upload(&session, &local, "//home/u/link.txt").await.unwrap();
+    assert_eq!(
+        server.data("/home/u/target.txt").unwrap(),
+        b"via double slash"
+    );
+    assert_eq!(
+        server.node("/home/u/link.txt").unwrap().kind,
+        Kind::Symlink("target.txt".into())
+    );
+    assert!(
+        server.leftovers(HOME).is_empty(),
+        "{:?}",
+        server.names(HOME)
+    );
+
+    // 下载。
+    let downloaded = client.dir.path("downloaded.txt");
+    let copied = download(&session, "//home/u/existing.txt", &downloaded)
+        .await
+        .unwrap();
+    assert_eq!(copied, 16);
+    assert_eq!(std::fs::read(&downloaded).unwrap(), b"via double slash");
+
+    // 报错里的路径按用户写的原样展示。
+    let error = download(&session, "//home/u/missing.txt", &downloaded)
+        .await
+        .unwrap_err();
+    assert!(
+        error.message().contains("sftp open '//home/u/missing.txt'"),
+        "{error}"
+    );
+    let error = upload(&session, &local, "//srv").await.unwrap_err();
+    assert!(
+        error
+            .message()
+            .contains("remote path '//srv' is a directory"),
+        "{error}"
+    );
+    let error = upload(&session, &local, "//tmp/foreign.sh")
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .message()
+            .contains("refusing to follow the symbolic link '//tmp/foreign.sh'"),
+        "{error}"
+    );
+    assert!(error.message().contains("in '//tmp'"), "{error}");
+    assert_eq!(
+        server.data("/home/u/target.txt").unwrap(),
+        b"via double slash"
+    );
     client.pool.shutdown().await;
 }

@@ -15,11 +15,13 @@
 //!   失败(含外层超时丢弃 future)删掉临时文件。
 //! - **上传**:见 [`upload`]。
 //!
-//! 整段超时仍由调用方在外面套 `tokio::time::timeout`;这里只把协议层的每请求超时放宽到
-//! 同一个窗口。
+//! 整段超时默认由调用方在外面套 `tokio::time::timeout`,这里只把协议层的每请求超时放宽到
+//! 同一个窗口;上传另有带整体时限的入口(`pool::run_sftp_upload_until`),到点由这里收尾
+//! 并写明远端文件的状态。上传的替换阶段一旦开始就在独立任务里跑完,不受外层取消影响。
 
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::stream::{FuturesOrdered, FuturesUnordered, StreamExt};
@@ -126,6 +128,14 @@ fn sftp_error(message: String) -> SftpTransferError {
     SftpTransferError::Sftp(message)
 }
 
+/// `deadline` 为 `None` 时照常跑完;否则到点丢弃 `future`,返回 `None`。
+async fn within<F: Future>(deadline: Option<tokio::time::Instant>, future: F) -> Option<F::Output> {
+    match deadline {
+        None => Some(future.await),
+        Some(deadline) => tokio::time::timeout_at(deadline, future).await.ok(),
+    }
+}
+
 /// 把「删不掉临时文件」之类的附注拼到错误后面。
 fn with_note(message: String, note: Option<String>) -> SftpTransferError {
     match note {
@@ -211,7 +221,9 @@ fn local_partial_path(target: &str) -> String {
 // SFTP 会话
 // ============================================================================
 
-/// 一次传输用的 SFTP 会话:原始会话 + 握手时协商出的能力。
+/// 一次传输用的 SFTP 会话:原始会话 + 握手时协商出的能力。克隆共享同一个会话(上传的
+/// 替换阶段在独立任务里用它)。
+#[derive(Clone)]
 struct TransferSftp {
     raw: Arc<RawSftpSession>,
     posix_rename: bool,
@@ -558,7 +570,9 @@ async fn fill_gap(
 ///
 /// 1. 目标是软链就逐跳解析到最终文件(悬空软链 → 在它指向的位置新建文件,与 `scp` /
 ///    `open(O_CREAT)` 跟随悬空软链的行为一致);软链本身不动。最终是目录或特殊文件就
-///    报错、不上传。
+///    报错、不上传。软链落在 sticky 且全局可写的目录里时按内核 `fs.protected_symlinks`
+///    的规则把关(见 [`may_follow_symlink`]):在客户端跟随软链就绕开了内核的这道防线,
+///    `/tmp` 里别人预埋的软链能把上传引到受害者家目录里去。
 /// 2. 在最终文件的目录里排他创建隐藏临时文件,权限位一出生就按目标设好(0600 的文件,
 ///    新内容在传输期间也不会被别人读到),目标已存在时再把属主 / 属组对齐(root 能整个
 ///    改过来,普通用户至少能把属组改成自己所在的组)。
@@ -573,20 +587,177 @@ async fn fill_gap(
 ///    复制这两位),核对服务器上的大小,关闭句柄。
 /// 5. 替换:优先 `posix-rename@openssh.com` 原子覆盖;否则「目标 → 备份、临时 → 目标、
 ///    删备份」,失败回滚。原文件不在原位时**绝不删临时文件**;留下的临时 / 备份路径写进
-///    错误信息。
+///    错误信息。替换(含回滚)一旦开始就在独立任务里跑完(见 [`commit_detached`]):外层
+///    超时 / 取消落在「目标 → 备份」之后、「临时 → 目标」之前时,目标路径不能就此消失。
+///
+/// `options.deadline` 给定时(`pool::run_sftp_upload_until`)1~4 步到点即止,返回
+/// [`SftpTransferError::TimedOut`] 并写明远端文件的状态(见 [`UploadProgress`]);第 5 步
+/// 不受它截断。
 pub(crate) async fn upload(
     session: &CachedSession,
     local_path: &str,
     remote_path: &str,
-    transfer_timeout: Duration,
+    options: UploadOptions,
 ) -> Result<u64, SftpTransferError> {
     // 本地文件先打开 —— 本地不存在 / 不可读属业务错,不必去碰远端。
     let mut local = open_local_source(local_path).await?;
     let _lease = session.sftp_lease();
-    let sftp = TransferSftp::open(session, transfer_timeout).await?;
-    let result = upload_file(&sftp, &mut local, local_path, remote_path).await;
+    let deadline = options.deadline;
+    let Some(opened) = within(
+        deadline,
+        TransferSftp::open(session, options.request_timeout),
+    )
+    .await
+    else {
+        return Err(SftpTransferError::TimedOut(format!(
+            "sftp upload to '{remote_path}' timed out while opening the SFTP channel; the \
+             remote file was not changed"
+        )));
+    };
+    let sftp = opened?;
+    let progress = UploadProgress::default();
+    let staged = within(
+        deadline,
+        stage_upload(&sftp, &mut local, local_path, remote_path, &progress),
+    )
+    .await;
+    let result = match staged {
+        // 到点:收尾已在被丢弃的 future 里安排好(临时文件后台删除),这里只写明状态。
+        // 不关 SFTP 会话 —— 后台删除还要用它,最后一个引用放掉时自然关闭。
+        None => return Err(progress.timed_out(remote_path)),
+        Some(Err(error)) => Err(error),
+        Some(Ok(Staged::Written(written))) => Ok(written),
+        Some(Ok(Staged::Ready(commit))) => {
+            let written = commit.size;
+            commit_detached(&sftp, session, options.keep_alive, commit)
+                .await
+                .map(|()| written)
+        }
+    };
     sftp.close();
     result
+}
+
+/// 上传入口的选项(两个公开入口的差别在这里)。
+pub(crate) struct UploadOptions {
+    /// 协议层每请求超时(见 [`sftp_request_timeout_secs`])。
+    pub(crate) request_timeout: Duration,
+    /// 池自己收尾的整体时限;`None` 时由调用方在外面限时。
+    pub(crate) deadline: Option<tokio::time::Instant>,
+    /// 替换阶段的独立任务持有它,保证会话在替换跑完之前不会因调用方放手而被回收。
+    pub(crate) keep_alive: Option<Arc<CachedSession>>,
+}
+
+/// 上传走到了哪一步:整体时限到点时据此写明远端文件的状态。
+#[derive(Default)]
+struct UploadProgress(Mutex<UploadStage>);
+
+#[derive(Default, Clone)]
+enum UploadStage {
+    /// 解析目标、建临时文件:远端什么都还没写。
+    #[default]
+    Preparing,
+    /// 正往临时文件里写:目标没动过。
+    Staging { target: String, staging: String },
+    /// 原地覆盖写:目标已被截断,写到一半就是不完整的。
+    InPlace { target: String, reason: String },
+}
+
+impl UploadProgress {
+    fn set(&self, stage: UploadStage) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = stage;
+    }
+
+    fn stage(&self) -> UploadStage {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// 到点时的报错:写明远端文件处在什么状态。
+    fn timed_out(&self, remote_path: &str) -> SftpTransferError {
+        SftpTransferError::TimedOut(match self.stage() {
+            UploadStage::Preparing => format!(
+                "sftp upload to '{remote_path}' timed out before any data was written; the \
+                 remote file was not changed"
+            ),
+            UploadStage::Staging { target, staging } => format!(
+                "sftp upload to '{target}' timed out before all data was sent; '{target}' was \
+                 not changed (the partial upload at '{staging}' is being removed)"
+            ),
+            UploadStage::InPlace { target, reason } => format!(
+                "sftp upload to '{target}' timed out while overwriting it in place ({reason}); \
+                 the remote file '{target}' may now be incomplete"
+            ),
+        })
+    }
+}
+
+/// [`stage_upload`] 的结果。
+enum Staged {
+    /// 原地覆盖写完了(没有替换阶段)。
+    Written(u64),
+    /// 临时文件写完、关好了,等替换。
+    Ready(PendingCommit),
+}
+
+/// 写完的临时文件 + 替换它要用的信息。
+struct PendingCommit {
+    staging: String,
+    target: String,
+    /// 目标原本存在(要替换它,而不是新建)。
+    replacing: bool,
+    /// 写出去的字节数(替换后核对用)。
+    size: u64,
+}
+
+/// 在独立任务里跑替换(含回滚)并等它的结果。调用方的 future 被丢弃(外层超时 / 取消)
+/// 时任务照样跑完 —— 半路停下可能让目标路径消失(原文件已挪成备份、新文件还没就位);
+/// 结局记进日志。任务持有 SFTP 会话的一份引用、一份 SFTP lease(reaper / LRU 不回收会话)
+/// 与调用方给的 `keep_alive`。
+async fn commit_detached(
+    sftp: &TransferSftp,
+    session: &CachedSession,
+    keep_alive: Option<Arc<CachedSession>>,
+    commit: PendingCommit,
+) -> Result<(), SftpTransferError> {
+    let worker = sftp.clone();
+    let lease = session.detached_sftp_lease();
+    let target = commit.target.clone();
+    let (reply, outcome) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let _lease = lease;
+        let _keep_alive = keep_alive;
+        let PendingCommit {
+            staging,
+            target,
+            replacing,
+            size,
+        } = commit;
+        let result = commit_staging(&worker, &staging, &target, replacing, size).await;
+        if let Err(result) = reply.send(result) {
+            match result {
+                Ok(()) => eprintln!(
+                    "[mt-ssh] upload: the caller stopped waiting while the upload was being moved \
+                     into place at '{target}'; the replacement completed"
+                ),
+                Err(error) => eprintln!(
+                    "[mt-ssh] upload: the caller stopped waiting while the upload was being moved \
+                     into place at '{target}'; the replacement did not complete: {error}"
+                ),
+            }
+        }
+    });
+    outcome.await.unwrap_or_else(|_| {
+        Err(sftp_error(format!(
+            "the task moving the upload into place at '{target}' stopped without a result; check \
+             '{target}'"
+        )))
+    })
 }
 
 async fn open_local_source(local_path: &str) -> Result<tokio::fs::File, SftpTransferError> {
@@ -619,6 +790,8 @@ async fn resolve_upload_target(
 ) -> Result<UploadTarget, SftpTransferError> {
     split_remote_leaf(remote_path)?;
     let mut path = remote_path.to_string();
+    // 登录用户的 uid(猜测),只在真碰上可疑软链时才去查一次。
+    let mut login_uid: Option<Option<u32>> = None;
     for _ in 0..=MAX_SYMLINK_HOPS {
         let attrs = match sftp.raw.lstat(path.as_str()).await {
             Ok(attrs) => attrs.attrs,
@@ -639,6 +812,7 @@ async fn resolve_upload_target(
             format!(" (symbolic link resolves to '{path}')")
         };
         if attrs.permissions.is_some() && attrs.file_type() == FileType::Symlink {
+            check_symlink_protection(sftp, &path, &attrs, &mut login_uid).await?;
             let link = sftp
                 .raw
                 .readlink(path.as_str())
@@ -673,12 +847,115 @@ async fn resolve_upload_target(
     )))
 }
 
-async fn upload_file(
+/// 路径所在的目录(给 `stat` 用):`/srv/x` → `/srv`,`/x` → `/`,`x` → `.`。
+fn parent_dir(path: &str) -> &str {
+    match path.rfind('/') {
+        Some(0) => "/",
+        Some(index) => &path[..index],
+        None => ".",
+    }
+}
+
+/// Linux `fs.protected_symlinks`(`may_follow_link`)的判定,纯函数便于单测:
+///
+/// - 软链所在目录不是「sticky 且全局可写」(`mode & 0o1002 == 0o1002`)→ 可以跟随;
+/// - 软链属主是目录属主,或是登录用户本人 → 可以跟随;
+/// - 其余拒绝。目录权限 / 软链属主不明的一律不跟随(拿不准时从严)。
+fn may_follow_symlink(
+    dir_mode: Option<u32>,
+    dir_uid: Option<u32>,
+    link_uid: Option<u32>,
+    login_uid: Option<u32>,
+) -> bool {
+    let Some(mode) = dir_mode else {
+        return false;
+    };
+    if mode & 0o1002 != 0o1002 {
+        return true;
+    }
+    link_uid.is_some_and(|owner| dir_uid == Some(owner) || login_uid == Some(owner))
+}
+
+/// 在客户端跟随软链等于绕开了服务器内核的 `fs.protected_symlinks`:多用户服务器上,别人
+/// 在 `/tmp` 预埋 `/tmp/build.sh -> /home/victim/.bashrc`,受害者上传到 `/tmp/build.sh`
+/// 时,临时文件会建进受害者的家目录、再替换掉 `.bashrc`(以前由服务器 open 这条路径,内核
+/// 直接拒绝,什么都不碰)。这里照内核的规则把关(见 [`may_follow_symlink`]),悬空软链
+/// 同样适用。
+///
+/// 登录用户的 uid 取 SFTP 初始目录(`realpath(".")`,通常是家目录)的属主 —— 多半就是
+/// 自己;拿不到时只认目录属主(更严)。只在真碰上「sticky 全局可写目录里、属主不是目录
+/// 属主的软链」时才去查一次。
+async fn check_symlink_protection(
+    sftp: &TransferSftp,
+    link: &str,
+    link_attrs: &FileAttributes,
+    login_uid: &mut Option<Option<u32>>,
+) -> Result<(), SftpTransferError> {
+    let dir = parent_dir(link);
+    let dir_attrs = sftp
+        .raw
+        .stat(dir)
+        .await
+        .map_err(|e| {
+            sftp_error(format!(
+                "cannot check the directory '{dir}' that holds the symbolic link '{link}': sftp \
+                 stat failed: {e}"
+            ))
+        })?
+        .attrs;
+    let suspicious = dir_attrs
+        .permissions
+        .is_some_and(|mode| mode & 0o1002 == 0o1002)
+        && link_attrs.uid.is_some()
+        && link_attrs.uid != dir_attrs.uid;
+    if suspicious && login_uid.is_none() {
+        *login_uid = Some(probe_login_uid(sftp).await);
+    }
+    let login = login_uid.flatten();
+    if may_follow_symlink(dir_attrs.permissions, dir_attrs.uid, link_attrs.uid, login) {
+        return Ok(());
+    }
+    if dir_attrs.permissions.is_none() {
+        return Err(sftp_error(format!(
+            "refusing to follow the symbolic link '{link}': the server does not report the \
+             permissions of '{dir}', so mini-term cannot tell whether it is a sticky \
+             world-writable directory where another user's link could redirect the upload; \
+             upload to the link's target directly if this is intended"
+        )));
+    }
+    let uid = |uid: Option<u32>| uid.map_or_else(|| "unknown".to_string(), |uid| uid.to_string());
+    Err(sftp_error(format!(
+        "refusing to follow the symbolic link '{link}' (owned by uid {}) in '{dir}', a sticky \
+         world-writable directory owned by uid {}: like the kernel's fs.protected_symlinks, \
+         mini-term only follows links there that belong to the directory's owner or to you, \
+         because another user's link could redirect the upload anywhere (symlink attack); \
+         upload to the link's target directly if this is intended",
+        uid(link_attrs.uid),
+        uid(dir_attrs.uid)
+    )))
+}
+
+/// 登录用户 uid 的猜测:SFTP 初始目录(通常是家目录)的属主。
+async fn probe_login_uid(sftp: &TransferSftp) -> Option<u32> {
+    let home = sftp
+        .raw
+        .realpath(".")
+        .await
+        .ok()?
+        .files
+        .into_iter()
+        .next()?;
+    sftp.raw.stat(home.filename).await.ok()?.attrs.uid
+}
+
+/// [`upload`] 的 1~4 步:解析目标,写临时文件(或原地覆盖写)。替换留给调用方。
+async fn stage_upload(
     sftp: &TransferSftp,
     local: &mut tokio::fs::File,
     local_path: &str,
     remote_path: &str,
-) -> Result<u64, SftpTransferError> {
+    progress: &UploadProgress,
+) -> Result<Staged, SftpTransferError> {
     let target = resolve_upload_target(sftp, remote_path).await?;
     let staging = remote_temp_sibling(&target.path, "partial")?;
     let mut create_attrs = FileAttributes::empty();
@@ -687,6 +964,15 @@ async fn upload_file(
         .as_ref()
         .and_then(|attrs| attrs.permissions)
         .map(|mode| mode & 0o777);
+    // 发出创建请求之前就装好清理:整体时限可能恰在请求途中到点,那时文件也许已经建出来了。
+    let mut cleanup = StagingCleanup {
+        raw: &sftp.raw,
+        path: Some(&staging),
+    };
+    progress.set(UploadStage::Staging {
+        target: target.path.clone(),
+        staging: staging.clone(),
+    });
     let created = sftp
         .raw
         .open(
@@ -702,18 +988,19 @@ async fn upload_file(
         Err(error)
             if target.existing.is_some() && is_status(&error, StatusCode::PermissionDenied) =>
         {
+            // 没建出来,无需清理。
+            cleanup.path = None;
             let reason = format!("no staging copy can be created next to it ({error})");
-            return upload_in_place(sftp, local, local_path, &target.path, &reason).await;
+            return upload_in_place(sftp, local, local_path, &target.path, &reason, progress)
+                .await
+                .map(Staged::Written);
         }
         Err(error) => {
+            cleanup.path = None;
             return Err(sftp_error(format!(
                 "sftp create '{staging}' failed: {error}"
             )));
         }
-    };
-    let mut cleanup = StagingCleanup {
-        raw: &sftp.raw,
-        path: Some(&staging),
     };
 
     let final_mode = match &target.existing {
@@ -723,13 +1010,15 @@ async fn upload_file(
             Ok(StagingFit::Mismatch(reason)) => {
                 let _ = sftp.raw.close(handle.as_str()).await;
                 let note = cleanup.discard(sftp).await;
-                return match upload_in_place(sftp, local, local_path, &target.path, &reason).await {
+                let in_place =
+                    upload_in_place(sftp, local, local_path, &target.path, &reason, progress).await;
+                return match in_place {
                     Err(error) => Err(with_note(error.message().to_string(), note)),
                     Ok(written) => {
                         if let Some(note) = note {
                             eprintln!("[mt-ssh] upload of '{}': {note}", target.path);
                         }
-                        Ok(written)
+                        Ok(Staged::Written(written))
                     }
                 };
             }
@@ -769,15 +1058,13 @@ async fn upload_file(
 
     // 进入替换阶段:临时文件的去留从此由替换流程按原文件的状态决定。
     cleanup.path = None;
-    commit_staging(
-        sftp,
-        &staging,
-        &target.path,
-        target.existing.is_some(),
-        written,
-    )
-    .await?;
-    Ok(written)
+    drop(cleanup);
+    Ok(Staged::Ready(PendingCommit {
+        staging,
+        replacing: target.existing.is_some(),
+        target: target.path,
+        size: written,
+    }))
 }
 
 fn permissions(mode: u32) -> FileAttributes {
@@ -895,8 +1182,11 @@ struct StagingCleanup<'a> {
 
 impl StagingCleanup<'_> {
     async fn discard(&mut self, sftp: &TransferSftp) -> Option<String> {
-        let path = self.path.take()?;
-        sftp.remove_staging(path).await
+        let path = self.path?;
+        let note = sftp.remove_staging(path).await;
+        // 删完才解除:删到一半被丢弃(整体时限 / 取消)时,drop 里照样补删。
+        self.path = None;
+        note
     }
 
     async fn discard_with(
@@ -928,17 +1218,51 @@ impl Drop for StagingCleanup<'_> {
 }
 
 /// 替换做不到或会改掉属主 / 权限时的退路:像 scp 一样原地截断后写入,原文件的 inode
-/// 与全部属性不变。
+/// 与全部属性不变。写到一半被打断(出错、整体时限到点、调用方取消)时文件可能不完整:
+/// 出错与到点都写进报错,取消没有报错可写,记一行日志。
 async fn upload_in_place(
     sftp: &TransferSftp,
     local: &mut tokio::fs::File,
     local_path: &str,
     target: &str,
     reason: &str,
+    progress: &UploadProgress,
 ) -> Result<u64, SftpTransferError> {
     eprintln!(
         "[mt-ssh] upload: '{target}' cannot be replaced safely: {reason}; overwriting it in place"
     );
+    // 截断在 open 时就可能已经生效:发出 open 之前就记下「原地写」。
+    progress.set(UploadStage::InPlace {
+        target: target.to_string(),
+        reason: reason.to_string(),
+    });
+    let mut interrupted = InPlaceInterrupted(Some(target));
+    let result = overwrite_in_place(sftp, local, local_path, target, reason).await;
+    interrupted.0 = None;
+    result
+}
+
+/// 原地覆盖写被丢弃(调用方取消 / 超时)时记一行日志:那时没有报错可写,文件可能不完整。
+struct InPlaceInterrupted<'a>(Option<&'a str>);
+
+impl Drop for InPlaceInterrupted<'_> {
+    fn drop(&mut self) {
+        if let Some(target) = self.0.take() {
+            eprintln!(
+                "[mt-ssh] upload: overwriting '{target}' in place was interrupted (cancelled or \
+                 timed out); the remote file may now be incomplete"
+            );
+        }
+    }
+}
+
+async fn overwrite_in_place(
+    sftp: &TransferSftp,
+    local: &mut tokio::fs::File,
+    local_path: &str,
+    target: &str,
+    reason: &str,
+) -> Result<u64, SftpTransferError> {
     let handle = sftp
         .raw
         .open(
@@ -1380,6 +1704,27 @@ mod tests {
         assert_eq!(truncate_utf8("a长", 2), "a");
     }
 
+    /// Git Bash 下远端绝对路径写成 `//var/log/app.log`(躲开路径改写;POSIX 上等价于
+    /// `/var/log/app.log`):父目录、临时名、软链目标都在同一个 `//` 前缀下推导。
+    #[test]
+    fn double_slash_remote_paths_keep_their_prefix() {
+        assert_eq!(
+            split_remote_leaf("//var/log/app.log").unwrap(),
+            ("//var/log/", "app.log")
+        );
+        assert_eq!(split_remote_leaf("//app.log").unwrap(), ("//", "app.log"));
+        assert!(split_remote_leaf("//").is_err());
+        let temp = remote_temp_sibling("//var/log/app.log", "partial").unwrap();
+        assert!(temp.starts_with("//var/log/.app.log.mt-partial-"), "{temp}");
+        assert_eq!(
+            link_target_path("//var/log/current", "app.log"),
+            "//var/log/app.log"
+        );
+        assert_eq!(link_target_path("//var/log/current", "/opt/x"), "/opt/x");
+        assert_eq!(parent_dir("//tmp/build.sh"), "//tmp");
+        assert_eq!(parent_dir("//build.sh"), "/");
+    }
+
     #[test]
     fn local_partial_names_sit_next_to_the_target_and_never_repeat() {
         let first = local_partial_path(r"D:\dl\a.zip");
@@ -1456,6 +1801,79 @@ mod tests {
         assert!(!is_regular_file(&attrs(None, None, Some(0o120777))));
         assert!(is_directory(&attrs(None, None, Some(0o040755))));
         assert!(!is_directory(&attrs(None, None, None)));
+    }
+
+    #[test]
+    fn protected_symlinks_rule_matches_the_kernel() {
+        const STICKY_WORLD: Option<u32> = Some(0o041777);
+        const ROOT: Option<u32> = Some(0);
+        const ME: Option<u32> = Some(1000);
+        const OTHER: Option<u32> = Some(1001);
+        // (目录权限, 目录属主, 软链属主, 登录用户, 能否跟随)
+        let cases = [
+            // 普通目录:谁的软链都跟随(与内核一致)。
+            (Some(0o040755), ME, OTHER, None, true),
+            // 只 sticky 不全局可写、只全局可写不 sticky:都不是受保护的目录。
+            (Some(0o041775), ROOT, OTHER, None, true),
+            (Some(0o040777), ROOT, OTHER, None, true),
+            // /tmp:别人的软链拒绝;目录属主(root)的、自己的照常跟随。
+            (STICKY_WORLD, ROOT, OTHER, ME, false),
+            (STICKY_WORLD, ROOT, ROOT, ME, true),
+            (STICKY_WORLD, ROOT, ME, ME, true),
+            // 登录用户拿不准:只认目录属主。
+            (STICKY_WORLD, ROOT, ME, None, false),
+            // 属主 / 权限不明:不跟随。
+            (STICKY_WORLD, ROOT, None, ME, false),
+            (None, ROOT, ROOT, ROOT, false),
+        ];
+        for (dir_mode, dir_uid, link_uid, login_uid, expected) in cases {
+            assert_eq!(
+                may_follow_symlink(dir_mode, dir_uid, link_uid, login_uid),
+                expected,
+                "dir {dir_mode:?} owned by {dir_uid:?}, link owned by {link_uid:?}, login \
+                 {login_uid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parent_dirs_for_stat() {
+        assert_eq!(parent_dir("/tmp/build.sh"), "/tmp");
+        assert_eq!(parent_dir("/build.sh"), "/");
+        assert_eq!(parent_dir("build.sh"), ".");
+        assert_eq!(parent_dir("dir/link"), "dir");
+    }
+
+    #[test]
+    fn timed_out_uploads_say_what_happened_to_the_remote_file() {
+        let progress = UploadProgress::default();
+        let message = progress.timed_out("/srv/a.txt").message().to_string();
+        assert!(message.contains("before any data was written"), "{message}");
+        assert!(message.contains("was not changed"), "{message}");
+
+        progress.set(UploadStage::Staging {
+            target: "/srv/a.txt".into(),
+            staging: "/srv/.a.txt.mt-partial-1".into(),
+        });
+        let error = progress.timed_out("/srv/a.txt");
+        assert!(error.is_timeout());
+        let message = error.message();
+        assert!(
+            message.contains("'/srv/a.txt' was not changed"),
+            "{message}"
+        );
+        assert!(message.contains("/srv/.a.txt.mt-partial-1"), "{message}");
+
+        progress.set(UploadStage::InPlace {
+            target: "/etc/app.conf".into(),
+            reason: "its owner 0:33 cannot be kept".into(),
+        });
+        let message = progress.timed_out("/etc/app.conf").message().to_string();
+        assert!(
+            message.contains("the remote file '/etc/app.conf' may now be incomplete"),
+            "{message}"
+        );
+        assert!(message.contains("overwriting it in place"), "{message}");
     }
 
     #[test]

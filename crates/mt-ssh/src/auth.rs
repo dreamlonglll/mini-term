@@ -7,9 +7,13 @@
 //! - 先发 `none` 拿服务器允许的方法表(OpenSSH 同样如此,且 sshd 不把这次计入失败),
 //!   之后只试服务器允许的方法;
 //! - 私钥加载失败(不存在 / 带口令 / 格式不支持 / `~` 展不开)只记原因,继续试别的;
-//! - 带口令的私钥若已在 ssh-agent 里,经 agent 签名使用(OpenSSH 的效果相同:它会让
-//!   agent 签名而不是弹口令框);
-//! - 公钥尝试有上限,保证配了密码时密码一定有机会,见 [`MAX_PUBLICKEY_ATTEMPTS`]。
+//! - 带口令的私钥、以及 `IdentityFile` 指向的公钥文件(`key.pub`),若 ssh-agent 里有同一把,
+//!   经 agent 签名使用(OpenSSH 的效果相同:它会让 agent 签名而不是弹口令框);
+//! - 公钥尝试有上限,保证配了密码时密码一定有机会,见 [`MAX_PUBLICKEY_ATTEMPTS`];服务器的
+//!   `MaxAuthTries` 比默认还小、密码没轮到就被断开时,由会话池重连一次只试密码
+//!   ([`AuthRound::WithoutKeys`]);
+//! - 认证途中会话结束:服务器断开 / 不再给方法算认证失败,还没被拒过就断网算网络错误
+//!   (见 [`classify_loss`])。
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -130,6 +134,11 @@ pub(crate) enum KeyLoad {
     Encrypted {
         public: Option<PublicKey>,
     },
+    /// 文件本身是公钥(`IdentityFile ~/.ssh/key.pub`,1Password 等 agent 推荐的写法):
+    /// 与带口令的私钥一样,只能到 ssh-agent 里找同一把来签名(OpenSSH 的效果相同)。
+    PublicOnly {
+        public: PublicKey,
+    },
     NotFound,
     Failed(String),
 }
@@ -139,7 +148,8 @@ pub(crate) enum KeyLoad {
 ///
 /// russh 原生解析覆盖 OpenSSH / PKCS#8 / PuTTY 明文私钥;传统 PKCS#1 RSA
 /// (`-----BEGIN RSA PRIVATE KEY-----`)由 [`try_parse_pkcs1_rsa`] 兜底。带口令的私钥
-/// 一律不在这里解密(池拿不到口令),归为 [`KeyLoad::Encrypted`]。
+/// 一律不在这里解密(池拿不到口令),归为 [`KeyLoad::Encrypted`];文件是 OpenSSH 一行式
+/// 公钥时归为 [`KeyLoad::PublicOnly`]。
 pub(crate) fn load_identity(path: &Path) -> KeyLoad {
     let text = match std::fs::read(path) {
         Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
@@ -162,9 +172,22 @@ pub(crate) fn load_identity(path: &Path) -> KeyLoad {
     }
     match try_parse_pkcs1_rsa(&text) {
         Ok(Some(key)) => KeyLoad::Loaded(Arc::new(key)),
-        Ok(None) => KeyLoad::Failed(format!("unsupported or invalid private key ({original})")),
+        Ok(None) => match parse_public_key_file(&text) {
+            Some(public) => KeyLoad::PublicOnly { public },
+            None => KeyLoad::Failed(format!("unsupported or invalid private key ({original})")),
+        },
         Err(e) => KeyLoad::Failed(e),
     }
+}
+
+/// `.pub` 文件:第一行非空、非注释的内容按 OpenSSH 一行式公钥(`ssh-ed25519 AAAA… 注释`)
+/// 解析。
+fn parse_public_key_file(text: &str) -> Option<PublicKey> {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))?;
+    PublicKey::from_openssh(line).ok()
 }
 
 /// 加密的 PKCS#8 / 传统 PEM。russh 对这两种报的不是 `KeyIsEncrypted`,单独认一下。
@@ -317,6 +340,16 @@ impl AgentSession {
         match &mut self.state {
             AgentState::Ready { client, .. } => Some(client),
             _ => None,
+        }
+    }
+
+    /// 「只能经 agent 用」的 key 没找到时附在说明后面的 agent 状况(被配置禁用时为空)。
+    fn unavailable_note(&self) -> String {
+        match &self.state {
+            AgentState::Unavailable(Some(reason)) => {
+                format!(" (ssh-agent not available: {reason})")
+            }
+            _ => String::new(),
         }
     }
 }
@@ -504,13 +537,30 @@ fn with_placeholder_signature(
 // 认证流程
 // ============================================================================
 
-/// 配置里的密码,已由调用方(`pool::authenticate`,唯一解封点)解开。
+/// 配置里的密码,已由调用方(`pool::reveal_password`,唯一解封点)解开。
 pub(crate) enum PasswordInput {
-    /// 没配密码(跳板一律如此:密码属于目标连接)。
+    /// 连接没配密码。
     NotConfigured,
+    /// 跳板:密码属于目标连接,有意不用于跳板(只用 key 登录跳板)。
+    NotForJumpHost,
     /// 已存密码解不开(信封换了钥匙 / 被改过)。绝不把密文当密码送出去。
     Unavailable(String),
     Available(String),
+}
+
+/// 跳板只允许密码类方法时的说明:密码有意不用于跳板,报错要写清楚是跳板认证失败、该怎么办。
+const JUMP_HOST_PASSWORD_NOTE: &str = "password: not used for jump hosts (mini-term signs in to \
+     a jump host with keys only: ssh-agent, an IdentityFile for the jump host in ssh config, or \
+     the default keys ~/.ssh/id_*; the saved password belongs to the target connection)";
+
+/// 这一跳是第几轮认证。
+pub(crate) enum AuthRound {
+    /// 按 OpenSSH 的顺序:公钥,再密码 / keyboard-interactive。
+    First,
+    /// 第一轮还没轮到密码就被服务器断开了(加固过的 sshd 把 `MaxAuthTries` 设成 3、4,
+    /// agent 里 key 一多就会这样),重连后的这一轮:不再出示公钥,直接密码与
+    /// keyboard-interactive。`earlier` 是第一轮的逐方法结果,拼进这一轮的报错。
+    WithoutKeys { earlier: Vec<String> },
 }
 
 /// 一跳的认证计划。
@@ -518,18 +568,24 @@ pub(crate) struct AuthPlan<'a> {
     pub(crate) host: &'a ResolvedHost,
     /// 报错里的身份描述(`deploy@example.com:22` / `jump host jumper@bastion:22`)。
     pub(crate) label: String,
-    pub(crate) password: PasswordInput,
+    pub(crate) password: &'a PasswordInput,
     /// 默认私钥所在目录(`~/.ssh`);home 未知时为 `None`,不试默认私钥。
     pub(crate) default_key_dir: Option<PathBuf>,
+    pub(crate) round: AuthRound,
 }
 
 /// 认证失败的分类。
 #[derive(Debug)]
 pub(crate) enum AuthError {
-    /// 服务器拒绝了全部可用方法 / 根本没有可用的凭据:计入认证失败冷却。
+    /// 服务器拒绝了全部可用方法 / 根本没有可用的凭据 / 认证途中被服务器断开:计入认证失败
+    /// 冷却。
     Rejected(String),
-    /// 还没被拒过就断了连接:按网络错误处理,不计冷却。
+    /// 还没被服务器拒过就断了连接(断网之类):按网络错误处理,不计冷却。
     Transport(String),
+    /// 第一轮在密码轮到之前就被服务器断开 / 不再给方法:值得重连一次、跳过公钥只试密码
+    /// (见 [`AuthRound::WithoutKeys`])。`message` 是不重连时的报错,`notes` 是第一轮的
+    /// 逐方法结果。调用方不重连就按 [`AuthError::Rejected`] 处理。
+    RetryWithoutKeys { message: String, notes: Vec<String> },
 }
 
 /// 每种方法的尝试结果,全部失败时拼成报错。
@@ -537,7 +593,10 @@ struct AuthReport {
     label: String,
     server_methods: Option<String>,
     notes: Vec<String>,
-    /// 是否已有方法被服务器明确拒绝过(决定断连时按认证失败还是网络错误算)。
+    /// 是否已有方法被服务器以 USERAUTH_FAILURE 明确拒绝过(`none` 探测不算)。决定连接
+    /// 意外中断(没有 DISCONNECT 消息)时按认证失败还是网络错误算:拒过之后连接没了,多半是
+    /// 服务器到了失败次数上限直接关连接(dropbear 就不发 DISCONNECT),按认证失败冷却才不会
+    /// 招来封禁;一次都没拒过就断了,才是断网。
     rejected_any: bool,
 }
 
@@ -571,6 +630,18 @@ impl AuthReport {
                 self.notes.join("; ")
             )
         }
+    }
+
+    /// 还没被服务器拒过就断了连接时的报错(网络错误,不计冷却)。
+    fn render_connection_lost(&self, why: &str) -> String {
+        let mut message = format!(
+            "connection lost during authentication on {}: {why}",
+            self.label
+        );
+        if !self.notes.is_empty() {
+            message.push_str(&format!(" (before that: {})", self.notes.join("; ")));
+        }
+        message
     }
 }
 
@@ -679,7 +750,23 @@ async fn file_candidate(
             }
             report.note(format!(
                 "{label}: encrypted with a passphrase and not loaded in ssh-agent (passphrase-protected \
-                 keys are only usable through ssh-agent: run `ssh-add` on it)"
+                 keys are only usable through ssh-agent: run `ssh-add` on it){}",
+                agent.unavailable_note()
+            ));
+            None
+        }
+        KeyLoad::PublicOnly { public } => {
+            agent.ensure_connected().await;
+            if agent.holds(&public) {
+                return Some(KeyCandidate {
+                    label: format!("{label} (public key, signed by ssh-agent)"),
+                    source: KeySource::Agent(public),
+                });
+            }
+            report.note(format!(
+                "{label}: is a public key, and ssh-agent does not hold the matching private key (a \
+                 public key IdentityFile is only usable through ssh-agent){}",
+                agent.unavailable_note()
             ));
             None
         }
@@ -788,55 +875,112 @@ async fn rsa_hash(
     hash
 }
 
-/// 认证途中连接没了:等 russh 会话任务收尾、取出断开原因,再按是否已被拒过分类。
-async fn connection_lost(
+/// 认证途中会话结束了:等 russh 会话任务收尾,取出 [`MtClient`] 记下的结束原因。
+async fn wait_session_end(
     handle: &mut Handle<MtClient>,
     notes: &ClientNotes,
-    report: &mut AuthReport,
-) -> AuthError {
+) -> Option<SessionEnd> {
     // Handle 自身就是会话任务 JoinHandle 的 Future:等它结束,MtClient::disconnected
     // 记下的原因才一定已经落地。认证失败的 handle 随后就被丢弃,不会被二次 poll。
     let _ = tokio::time::timeout(SESSION_END_GRACE, &mut *handle).await;
-    let why = notes
-        .ended()
-        .map(|end| end.to_string())
-        .unwrap_or_else(|| "the connection was closed".to_string());
-    if report.rejected_any || notes.ended() == Some(SessionEnd::NoMoreMethods) {
-        report.note(why);
-        AuthError::Rejected(report.render())
-    } else {
-        AuthError::Transport(format!("authentication on {} failed: {why}", report.label))
+    notes.ended()
+}
+
+/// 认证途中会话结束了,按结束原因分类(纯函数便于单测)。`attempt` 是当时在等回复的那次
+/// 尝试(`none` 探测时为 `None`)。
+///
+/// - [`SessionEnd::NoMoreMethods`]:服务器以 USERAUTH_FAILURE 明确拒绝,且没有方法可试了;
+/// - [`SessionEnd::ServerDisconnect`]:服务器主动断开(典型是 sshd 的「Too many
+///   authentication failures」)。
+///
+/// 这两种算认证失败(计入冷却)。其余(IO 断开、原因不明)只在之前已有尝试被明确拒绝过时
+/// 才算认证失败(见 [`AuthReport::rejected_any`]),否则是断网:网络错误、不计冷却,报错写
+/// 「connection lost during authentication」。russh 0.61 在会话结束时把等回复的请求报成
+/// 「剩余方法为空的 Failure」,与真正的「没有剩余方法」长得一样,只能靠结束原因区分。
+fn classify_loss(
+    report: &mut AuthReport,
+    attempt: Option<&str>,
+    ended: Option<SessionEnd>,
+) -> AuthError {
+    let with_attempt = |what: String| match attempt {
+        Some(attempt) => format!("{attempt}: {what}"),
+        None => what,
+    };
+    match ended {
+        Some(SessionEnd::NoMoreMethods) => {
+            report.note(match attempt {
+                Some(attempt) => {
+                    format!("{attempt}: rejected by server (no authentication methods left)")
+                }
+                None => SessionEnd::NoMoreMethods.to_string(),
+            });
+            AuthError::Rejected(report.render())
+        }
+        Some(end @ SessionEnd::ServerDisconnect(_)) => {
+            report.note(with_attempt(format!("no answer, {end}")));
+            AuthError::Rejected(report.render())
+        }
+        other => {
+            let why = other.map_or_else(
+                || "the connection was closed".to_string(),
+                |end| end.to_string(),
+            );
+            if report.rejected_any {
+                report.note(with_attempt(format!("no answer, {why}")));
+                AuthError::Rejected(report.render())
+            } else {
+                AuthError::Transport(report.render_connection_lost(&why))
+            }
+        }
     }
 }
 
 /// 一次公钥 / 密码尝试的结论。
 enum Step {
     Success,
-    /// 被拒,服务器还允许这些方法。
+    /// 被服务器明确拒绝,服务器还允许这些方法。
     Rejected(MethodSet),
-    /// 连接没了。`rejected`:断开前这次尝试是否已被服务器拒绝(russh 把「失败且
-    /// 再无可用方法」与「会话已结束」都报成剩余方法为空的 Failure)。
-    Lost {
-        rejected: bool,
-    },
+    /// 没有回复:会话结束了(或服务器回了「再无可用方法」,russh 随即结束会话 —— 两者在
+    /// russh 0.61 里都表现为剩余方法为空的 Failure),按 [`classify_loss`] 收尾。
+    Ended,
 }
 
-fn step_of(result: Result<AuthResult, String>, report: &mut AuthReport) -> Step {
+fn step_of(result: Result<AuthResult, String>) -> Step {
     match result {
         Ok(AuthResult::Success) => Step::Success,
         Ok(AuthResult::Failure {
             remaining_methods, ..
-        }) if remaining_methods.is_empty() => {
-            report.rejected_any = true;
-            Step::Lost { rejected: true }
-        }
+        }) if remaining_methods.is_empty() => Step::Ended,
         Ok(AuthResult::Failure {
             remaining_methods, ..
-        }) => {
-            report.rejected_any = true;
-            Step::Rejected(remaining_methods)
+        }) => Step::Rejected(remaining_methods),
+        Err(_) => Step::Ended,
+    }
+}
+
+/// 第一轮在公钥阶段被服务器断开 / 拒绝到无路可走,而配置的密码还没轮到:换成
+/// [`AuthError::RetryWithoutKeys`],让调用方重连一次只试密码。服务器一开始就不收密码类
+/// 方法、或已经是重连后的那一轮时原样返回。
+fn offer_retry_without_keys(
+    error: AuthError,
+    plan: &AuthPlan<'_>,
+    initial_methods: &MethodSet,
+    report: &AuthReport,
+) -> AuthError {
+    let password_accepted = initial_methods.contains(&MethodKind::Password)
+        || initial_methods.contains(&MethodKind::KeyboardInteractive);
+    match error {
+        AuthError::Rejected(message)
+            if password_accepted
+                && matches!(plan.round, AuthRound::First)
+                && matches!(plan.password, PasswordInput::Available(_)) =>
+        {
+            AuthError::RetryWithoutKeys {
+                message,
+                notes: report.notes.clone(),
+            }
         }
-        Err(_) => Step::Lost { rejected: false },
+        other => other,
     }
 }
 
@@ -850,18 +994,38 @@ pub(crate) async fn authenticate_host(
 ) -> Result<(), AuthError> {
     let user = plan.host.user.as_str();
     let mut report = AuthReport::new(&plan.label);
+    let offer_keys = match &plan.round {
+        AuthRound::First => true,
+        AuthRound::WithoutKeys { earlier } => {
+            for note in earlier {
+                report.note(note.clone());
+            }
+            report.note(
+                "reconnected to try the password without offering public keys (the server \
+                 closed the previous connection before the password's turn)",
+            );
+            // 上一轮已经被服务器拒过 / 断开过:这一轮即便断网也按认证失败算,免得下一次
+            // 请求立刻把公钥那一轮整个重来一遍。
+            report.rejected_any = true;
+            false
+        }
+    };
 
     // 1) `none`:拿服务器允许的方法表(sshd 不把首次 none 计入失败)。
     tracker.set_detail("waiting for the server's list of authentication methods");
-    let mut methods = match handle.authenticate_none(user).await {
-        Ok(AuthResult::Success) => return Ok(()),
-        Ok(AuthResult::Failure {
-            remaining_methods, ..
-        }) if !remaining_methods.is_empty() => remaining_methods,
-        Ok(AuthResult::Failure { .. }) | Err(_) => {
-            return Err(connection_lost(handle, notes, &mut report).await);
+    let none = handle
+        .authenticate_none(user)
+        .await
+        .map_err(|e| e.to_string());
+    let initial_methods = match step_of(none) {
+        Step::Success => return Ok(()),
+        Step::Rejected(methods) => methods,
+        Step::Ended => {
+            let ended = wait_session_end(handle, notes).await;
+            return Err(classify_loss(&mut report, None, ended));
         }
     };
+    let mut methods = initial_methods.clone();
     report.server_methods = Some(method_names(&methods));
 
     // 2) 公钥。
@@ -869,7 +1033,7 @@ pub(crate) async fn authenticate_host(
         PasswordInput::Available(_) => MAX_PUBLICKEY_ATTEMPTS_WITH_PASSWORD,
         _ => MAX_PUBLICKEY_ATTEMPTS,
     };
-    if methods.contains(&MethodKind::PublicKey) {
+    if offer_keys && methods.contains(&MethodKind::PublicKey) {
         let candidates = collect_candidates(plan, agent, &mut report).await;
         let total = candidates.len();
         let mut rsa_hash_cache: Option<Option<HashAlg>> = None;
@@ -926,9 +1090,11 @@ pub(crate) async fn authenticate_host(
                     ..
                 })
             );
-            match step_of(result, &mut report) {
+            match step_of(result) {
                 Step::Success => return Ok(()),
                 Step::Rejected(remaining) => {
+                    // 部分成功(这把 key 被接受、还要再验别的)不算被拒。
+                    report.rejected_any |= !partial;
                     report.note(match (&sign_failure, partial) {
                         (Some(why), _) => {
                             format!("{}: ssh-agent failed to sign ({why})", candidate.label)
@@ -941,23 +1107,34 @@ pub(crate) async fn authenticate_host(
                     });
                     methods = remaining;
                 }
-                Step::Lost { rejected } => {
-                    if rejected {
-                        report.note(format!("{}: rejected by server", candidate.label));
-                    }
-                    return Err(connection_lost(handle, notes, &mut report).await);
+                Step::Ended => {
+                    let ended = wait_session_end(handle, notes).await;
+                    let error = classify_loss(&mut report, Some(&candidate.label), ended);
+                    return Err(offer_retry_without_keys(
+                        error,
+                        plan,
+                        &initial_methods,
+                        &report,
+                    ));
                 }
             }
         }
     }
 
     // 3) 密码:password 方法,再 keyboard-interactive(有的服务器只开后者)。
-    match &plan.password {
+    match plan.password {
         PasswordInput::NotConfigured => {
             if methods.contains(&MethodKind::Password)
                 || methods.contains(&MethodKind::KeyboardInteractive)
             {
                 report.note("password: not configured");
+            }
+        }
+        PasswordInput::NotForJumpHost => {
+            if methods.contains(&MethodKind::Password)
+                || methods.contains(&MethodKind::KeyboardInteractive)
+            {
+                report.note(JUMP_HOST_PASSWORD_NOTE);
             }
         }
         PasswordInput::Unavailable(reason) => {
@@ -972,17 +1149,16 @@ pub(crate) async fn authenticate_host(
                     .authenticate_password(user, password.as_str())
                     .await
                     .map_err(|e| e.to_string());
-                match step_of(result, &mut report) {
+                match step_of(result) {
                     Step::Success => return Ok(()),
                     Step::Rejected(remaining) => {
+                        report.rejected_any = true;
                         report.note("password: rejected by server");
                         methods = remaining;
                     }
-                    Step::Lost { rejected } => {
-                        if rejected {
-                            report.note("password: rejected by server");
-                        }
-                        return Err(connection_lost(handle, notes, &mut report).await);
+                    Step::Ended => {
+                        let ended = wait_session_end(handle, notes).await;
+                        return Err(classify_loss(&mut report, Some("password"), ended));
                     }
                 }
             }
@@ -1003,12 +1179,13 @@ pub(crate) async fn authenticate_host(
                              can give)"
                         ));
                     }
-                    KbdOutcome::Lost { rejected } => {
-                        if rejected {
-                            report.rejected_any = true;
-                            report.note("keyboard-interactive: rejected by server");
-                        }
-                        return Err(connection_lost(handle, notes, &mut report).await);
+                    KbdOutcome::Ended => {
+                        let ended = wait_session_end(handle, notes).await;
+                        return Err(classify_loss(
+                            &mut report,
+                            Some("keyboard-interactive"),
+                            ended,
+                        ));
                     }
                 }
             }
@@ -1028,10 +1205,8 @@ enum KbdOutcome {
     Success,
     Rejected,
     TooManyPrompts,
-    /// 连接没了;`rejected` 含义同 [`Step::Lost`]。
-    Lost {
-        rejected: bool,
-    },
+    /// 没有回复(会话结束,或服务器回了「再无可用方法」),含义同 [`Step::Ended`]。
+    Ended,
 }
 
 /// keyboard-interactive:每个提示都用配置的密码作答。服务器若问的是 OTP 之类,自然
@@ -1046,7 +1221,7 @@ async fn keyboard_interactive(
         .await
     {
         Ok(state) => state,
-        Err(_) => return KbdOutcome::Lost { rejected: false },
+        Err(_) => return KbdOutcome::Ended,
     };
     let mut rounds = 0;
     loop {
@@ -1056,7 +1231,7 @@ async fn keyboard_interactive(
                 remaining_methods, ..
             } => {
                 return if remaining_methods.is_empty() {
-                    KbdOutcome::Lost { rejected: true }
+                    KbdOutcome::Ended
                 } else {
                     KbdOutcome::Rejected
                 };
@@ -1073,7 +1248,7 @@ async fn keyboard_interactive(
                     .await
                 {
                     Ok(state) => state,
-                    Err(_) => return KbdOutcome::Lost { rejected: false },
+                    Err(_) => return KbdOutcome::Ended,
                 };
             }
         }
@@ -1395,5 +1570,179 @@ ipMBLNlhlJHNKVmgnpLBSiUoO5fDWn1KcwvQouOC3U3hSMAPnT+7
         let bad =
             "-----BEGIN RSA PRIVATE KEY-----\n@@@not-base64@@@\n-----END RSA PRIVATE KEY-----\n";
         assert!(try_parse_pkcs1_rsa(bad).is_err());
+    }
+
+    #[test]
+    fn public_key_identity_files_are_recognised() {
+        // `IdentityFile ~/.ssh/key.pub`(1Password 推荐的写法):认成公钥,交给 agent 签名。
+        let dir = temp_dir("public-only");
+        let key = seeded_key(9);
+        let path = dir.join("key.pub");
+        let line = key.public_key().to_openssh().unwrap();
+        std::fs::write(&path, format!("# comment\n\n{line}\n")).unwrap();
+        match load_identity(&path) {
+            KeyLoad::PublicOnly { public } => {
+                assert_eq!(public.key_data(), key.public_key().key_data());
+            }
+            _ => panic!("a public key file should load as PublicOnly"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn report_with_rejection(rejected_before: bool) -> AuthReport {
+        let mut report = AuthReport::new("u@h:22");
+        report.server_methods = Some("publickey,password".into());
+        if rejected_before {
+            report.rejected_any = true;
+            report.note("key-a: rejected by server");
+        }
+        report
+    }
+
+    #[test]
+    fn session_end_during_auth_is_classified_by_its_cause() {
+        // 服务器断开(MaxAuthTries):认证失败,写明是谁断的。
+        let mut report = report_with_rejection(false);
+        let ended = SessionEnd::ServerDisconnect("Too many authentication failures".into());
+        match classify_loss(&mut report, Some("key-b"), Some(ended)) {
+            AuthError::Rejected(message) => assert!(
+                message.ends_with(
+                    "key-b: no answer, the server closed the connection: Too many \
+                     authentication failures"
+                ),
+                "{message}"
+            ),
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+
+        // 服务器明确拒绝且再无方法:认证失败。
+        let mut report = report_with_rejection(false);
+        match classify_loss(
+            &mut report,
+            Some("password"),
+            Some(SessionEnd::NoMoreMethods),
+        ) {
+            AuthError::Rejected(message) => assert!(
+                message.contains("password: rejected by server (no authentication methods left)"),
+                "{message}"
+            ),
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+
+        // 还没被拒过就断了(断网):网络错误,不计冷却,不谎称「被服务器拒绝」。
+        for ended in [Some(SessionEnd::Error("connection reset".into())), None] {
+            let mut report = report_with_rejection(false);
+            match classify_loss(&mut report, Some("password"), ended) {
+                AuthError::Transport(message) => {
+                    assert!(
+                        message.starts_with("connection lost during authentication on u@h:22: "),
+                        "{message}"
+                    );
+                    assert!(!message.contains("rejected"), "{message}");
+                }
+                other => panic!("expected Transport, got {other:?}"),
+            }
+        }
+
+        // 已被明确拒过、随后连接没了(dropbear 到了失败上限直接关连接):认证失败。
+        let mut report = report_with_rejection(true);
+        let ended = Some(SessionEnd::Error("connection reset".into()));
+        match classify_loss(&mut report, Some("key-b"), ended) {
+            AuthError::Rejected(message) => {
+                assert!(message.contains("key-a: rejected by server"), "{message}");
+                assert!(
+                    message.contains("key-b: no answer, the connection failed"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+    }
+
+    fn test_host() -> ResolvedHost {
+        ResolvedHost {
+            alias: "h".into(),
+            host_name: "h".into(),
+            port: 22,
+            user: "u".into(),
+            identities: Vec::new(),
+            explicit_identities: false,
+            identities_only: false,
+            known_hosts_name: "h".into(),
+        }
+    }
+
+    fn test_plan<'a>(
+        host: &'a ResolvedHost,
+        password: &'a PasswordInput,
+        round: AuthRound,
+    ) -> AuthPlan<'a> {
+        AuthPlan {
+            host,
+            label: "u@h:22".into(),
+            password,
+            default_key_dir: None,
+            round,
+        }
+    }
+
+    #[test]
+    fn retry_without_keys_only_when_the_password_never_got_its_turn() {
+        let host = test_host();
+        let password = PasswordInput::Available("pw".into());
+        let all = MethodSet::from(
+            &[
+                MethodKind::PublicKey,
+                MethodKind::Password,
+                MethodKind::KeyboardInteractive,
+            ][..],
+        );
+        let keys_only = MethodSet::from(&[MethodKind::PublicKey][..]);
+        let report = report_with_rejection(true);
+        let rejected = || AuthError::Rejected("authentication failed".into());
+        let first = test_plan(&host, &password, AuthRound::First);
+
+        match offer_retry_without_keys(rejected(), &first, &all, &report) {
+            AuthError::RetryWithoutKeys { message, notes } => {
+                assert_eq!(message, "authentication failed");
+                assert_eq!(notes, report.notes);
+            }
+            other => panic!("expected RetryWithoutKeys, got {other:?}"),
+        }
+        // 服务器本来就不收密码类方法:重连也没用。
+        assert!(matches!(
+            offer_retry_without_keys(rejected(), &first, &keys_only, &report),
+            AuthError::Rejected(_)
+        ));
+        // 断网不重连:网络错误原样交回。
+        assert!(matches!(
+            offer_retry_without_keys(
+                AuthError::Transport("connection lost".into()),
+                &first,
+                &all,
+                &report
+            ),
+            AuthError::Transport(_)
+        ));
+        // 已经是重连后的那一轮:不再重连。
+        let retried = test_plan(
+            &host,
+            &password,
+            AuthRound::WithoutKeys {
+                earlier: Vec::new(),
+            },
+        );
+        assert!(matches!(
+            offer_retry_without_keys(rejected(), &retried, &all, &report),
+            AuthError::Rejected(_)
+        ));
+        // 没配密码 / 跳板:没有可试的密码。
+        for no_password in [PasswordInput::NotConfigured, PasswordInput::NotForJumpHost] {
+            let plan = test_plan(&host, &no_password, AuthRound::First);
+            assert!(matches!(
+                offer_retry_without_keys(rejected(), &plan, &all, &report),
+                AuthError::Rejected(_)
+            ));
+        }
     }
 }

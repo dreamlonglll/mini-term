@@ -22,8 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mt_ssh::pool::{
-    run_sftp_download_on_session, run_sftp_upload_on_session, CachedSession, SftpTransferError,
-    SshPool,
+    run_sftp_download_on_session, run_sftp_upload_until, CachedSession, SftpTransferError, SshPool,
 };
 use mt_ssh::russh::{Channel, ChannelMsg, Sig};
 use serde::Serialize;
@@ -2039,21 +2038,79 @@ pub async fn exec(
 
 /// 根据方向在一条 session 上跑一次 SFTP 传输。把 upload/download 两个 pool 函数
 /// 统一成同一签名,供重试编排复用。
+///
+/// 上传走池的带整体时限入口:到 `deadline` 时池自己收尾,报错写明远端文件的状态(原地
+/// 覆盖写到一半时写明「可能不完整」并给出路径);替换一旦开始必定跑完。下载到点由外层
+/// 截断即可(本地临时文件随之删除,已有的本地文件不动),不需要这层收尾。
 async fn run_one_transfer(
     direction: TransferDirection,
-    session: &CachedSession,
+    session: &Arc<CachedSession>,
     local_path: &str,
     remote_path: &str,
-    timeout: Duration,
+    deadline: tokio::time::Instant,
 ) -> Result<u64, SftpTransferError> {
     match direction {
         TransferDirection::Upload => {
-            run_sftp_upload_on_session(session, local_path, remote_path, timeout).await
+            run_sftp_upload_until(session, local_path, remote_path, deadline).await
         }
         TransferDirection::Download => {
+            let timeout = remaining(deadline);
             run_sftp_download_on_session(session, remote_path, local_path, timeout).await
         }
     }
+}
+
+/// 上传在 deadline 之后再多等这么久才由外层兜底:池到点自己收尾,但替换一旦开始就要跑完
+/// (通常只是几个往返),不能在那时被截断。
+const UPLOAD_FINISH_GRACE: Duration = Duration::from_secs(10);
+
+/// 外层兜底超时的时刻:下载就是 deadline,上传多留 [`UPLOAD_FINISH_GRACE`]。
+fn transfer_backstop(
+    direction: TransferDirection,
+    deadline: tokio::time::Instant,
+) -> tokio::time::Instant {
+    match direction {
+        TransferDirection::Upload => deadline + UPLOAD_FINISH_GRACE,
+        TransferDirection::Download => deadline,
+    }
+}
+
+/// 外层兜底到点时的报错。上传的兜底只会落在替换阶段(之前的阶段池在 deadline 前已收尾):
+/// 替换在后台照样跑完,提醒调用方先看一眼远端文件再重试。下载沿用原来的文案。
+fn transfer_backstop_message(
+    direction: TransferDirection,
+    timeout: Duration,
+    remote_path: &str,
+    retried: bool,
+) -> String {
+    let on_retry = if retried { " on retry" } else { "" };
+    match direction {
+        TransferDirection::Upload => format!(
+            "ssh upload timed out after {}s{on_retry} while the uploaded file was being moved \
+             into place at '{remote_path}'; that step finishes in the background, check the \
+             remote file before retrying",
+            timeout.as_secs()
+        ),
+        TransferDirection::Download => {
+            format!(
+                "ssh download timed out after {}s{on_retry}",
+                timeout.as_secs()
+            )
+        }
+    }
+}
+
+/// 池到点收尾的报错(只有上传会有):连接 / 传输层一类,消息里保留池写明的远端文件状态。
+fn transfer_timed_out(
+    direction: TransferDirection,
+    timeout: Duration,
+    error: &SftpTransferError,
+) -> ServiceError {
+    ServiceError::Internal(format!(
+        "ssh {} timed out after {}s: {error}",
+        direction.as_str(),
+        timeout.as_secs()
+    ))
 }
 
 /// 距 `deadline` 还剩多少时间。
@@ -2098,6 +2155,10 @@ async fn acquire_for_transfer(
 /// 审计 → 返回字节数。时限从请求进门算起,建连与传输共用(建连阶段到点报「连接阶段
 /// 超时、传输没有开始」,不记审计 —— 与 acquire 失败同口径)。SFTP 业务错(路径不存在 /
 /// 无权限 / 本地 IO)不 evict、不 retry,按 `InvalidParams` 返回。
+///
+/// 上传到点由池自己收尾,报错写明远端文件的状态(原地覆盖写到一半时写明「可能不完整」并
+/// 给出路径);替换(含回滚)一旦开始必定跑完,外层兜底比时限多留
+/// [`UPLOAD_FINISH_GRACE`]。
 pub async fn transfer(
     pool: &SshPool,
     direction: TransferDirection,
@@ -2138,15 +2199,12 @@ pub async fn transfer(
     let session = acquire_for_transfer(pool, &conn, deadline, timeout, direction, false).await?;
 
     // 3. 跑传输,受剩余时限约束。第一次 transport 错 → 精确淘汰 + 重连 → 再试一次。
+    //    上传由池自己在 deadline 前收尾、报出精确的错误,外层兜底多留一点余量(见
+    //    `transfer_backstop`);下载照旧到点即止。
+    let backstop = transfer_backstop(direction, deadline);
     let first = tokio::time::timeout_at(
-        deadline,
-        run_one_transfer(
-            direction,
-            &session,
-            local_path,
-            remote_path,
-            remaining(deadline),
-        ),
+        backstop,
+        run_one_transfer(direction, &session, local_path, remote_path, deadline),
     )
     .await;
 
@@ -2164,20 +2222,18 @@ pub async fn transfer(
             let session2 =
                 acquire_for_transfer(pool, &conn, deadline, timeout, direction, true).await?;
             match tokio::time::timeout_at(
-                deadline,
-                run_one_transfer(
-                    direction,
-                    &session2,
-                    local_path,
-                    remote_path,
-                    remaining(deadline),
-                ),
+                backstop,
+                run_one_transfer(direction, &session2, local_path, remote_path, deadline),
             )
             .await
             {
                 Ok(Ok(n)) => {
                     session2.touch();
                     n
+                }
+                Ok(Err(second_err)) if second_err.is_timeout() => {
+                    audit(None);
+                    return Err(transfer_timed_out(direction, timeout, &second_err));
                 }
                 Ok(Err(second_err)) => {
                     if second_err.is_transport() {
@@ -2190,12 +2246,19 @@ pub async fn transfer(
                 }
                 Err(_) => {
                     audit(None);
-                    return Err(ServiceError::Internal(format!(
-                        "ssh {dir} timed out after {}s on retry",
-                        timeout.as_secs()
+                    return Err(ServiceError::Internal(transfer_backstop_message(
+                        direction,
+                        timeout,
+                        remote_path,
+                        true,
                     )));
                 }
             }
+        }
+        Ok(Err(e)) if e.is_timeout() => {
+            // 池在 deadline 前收的尾:报错里已写明远端文件的状态。
+            audit(None);
+            return Err(transfer_timed_out(direction, timeout, &e));
         }
         Ok(Err(e)) => {
             // SFTP 业务错(路径不存在/无权限/本地 IO):不 evict、不 retry,直接返。
@@ -2205,11 +2268,13 @@ pub async fn transfer(
             )));
         }
         Err(_) => {
-            // 传输途中到点。
+            // 传输途中到点(上传:替换阶段超出了兜底余量,替换在后台照样跑完)。
             audit(None);
-            return Err(ServiceError::Internal(format!(
-                "ssh {dir} timed out after {}s",
-                timeout.as_secs()
+            return Err(ServiceError::Internal(transfer_backstop_message(
+                direction,
+                timeout,
+                remote_path,
+                false,
             )));
         }
     };
@@ -2793,6 +2858,10 @@ mod tests {
     fn sftp_transfer_error_classification() {
         assert!(SftpTransferError::Transport("x".into()).is_transport());
         assert!(!SftpTransferError::Sftp("x".into()).is_transport());
+        // 池到点收尾:不重试(不是 transport 错)。
+        let timed_out = SftpTransferError::TimedOut("x".into());
+        assert!(timed_out.is_timeout());
+        assert!(!timed_out.is_transport());
     }
 
     #[test]
@@ -2804,6 +2873,69 @@ mod tests {
         let msg = err.to_string();
         assert!(!msg.to_lowercase().contains("password"));
         assert!(msg.contains("permission denied"));
+    }
+
+    // --- transfer 的时限:上传由池收尾,外层兜底多留余量 ----------------------
+
+    #[test]
+    fn upload_backstop_leaves_room_for_the_replacement_to_finish() {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        assert_eq!(
+            transfer_backstop(TransferDirection::Download, deadline),
+            deadline
+        );
+        assert_eq!(
+            transfer_backstop(TransferDirection::Upload, deadline),
+            deadline + UPLOAD_FINISH_GRACE
+        );
+    }
+
+    #[test]
+    fn transfer_timeout_messages() {
+        let timeout = Duration::from_secs(300);
+        // 下载沿用原来的文案。
+        assert_eq!(
+            transfer_backstop_message(TransferDirection::Download, timeout, "/r", false),
+            "ssh download timed out after 300s"
+        );
+        assert_eq!(
+            transfer_backstop_message(TransferDirection::Download, timeout, "/r", true),
+            "ssh download timed out after 300s on retry"
+        );
+        // 上传的兜底只会落在替换阶段:写明替换在后台跑完,先看远端文件。
+        let upload =
+            transfer_backstop_message(TransferDirection::Upload, timeout, "/srv/app.conf", false);
+        assert!(
+            upload.starts_with("ssh upload timed out after 300s"),
+            "{upload}"
+        );
+        assert!(upload.contains("'/srv/app.conf'"), "{upload}");
+        assert!(upload.contains("finishes in the background"), "{upload}");
+
+        // 池到点收尾的报错:连接 / 传输层一类,保留池写明的远端文件状态。
+        let pool_error = SftpTransferError::TimedOut(
+            "sftp upload to '/etc/app.conf' timed out while overwriting it in place (x); the \
+             remote file '/etc/app.conf' may now be incomplete"
+                .into(),
+        );
+        let error = transfer_timed_out(
+            TransferDirection::Upload,
+            Duration::from_secs(30),
+            &pool_error,
+        );
+        assert!(matches!(error, ServiceError::Internal(_)), "{error}");
+        assert!(
+            error
+                .message()
+                .starts_with("ssh upload timed out after 30s: "),
+            "{error}"
+        );
+        assert!(
+            error
+                .message()
+                .contains("the remote file '/etc/app.conf' may now be incomplete"),
+            "{error}"
+        );
     }
 
     // --- ServiceError 分类与文本 -------------------------------------------

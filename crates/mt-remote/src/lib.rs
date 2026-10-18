@@ -94,10 +94,10 @@ const REMOTE_DELETE_OUTPUT_CAP: usize = 16 * 1024;
 static LOCAL_TRANSFER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// 建立(或复用)SSH session 的外层超时:TCP 连接 + 握手 + 认证。
 const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
-/// 粘贴上传的**单请求**超时(`run_sftp_upload_on_session` 把它转成
-/// `SftpSession::set_timeout`,不是整段传输的上限)。慢链路下单个 chunk 包
-/// 不该把整段打断,故比只读的 20s 宽。
-const PASTE_UPLOAD_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// 交给池的上传时限(`mt_ssh::run_sftp_upload_until`)比 [`PASTE_UPLOAD_TOTAL_TIMEOUT`]
+/// 提前这么多到点:池自己收尾、报出写明远端文件状态的错误,外层的墙钟上限只作兜底 ——
+/// 替换一旦开始要跑完,不能在那时被截断。协议层每请求超时随之取池时限前的剩余时间。
+const PASTE_UPLOAD_FINISH_GRACE: Duration = Duration::from_secs(10);
 /// 粘贴上传的**整体**墙钟上限。必须显式加 —— 上层在上传期间用 in-flight 去重
 /// 挡住重复 Ctrl+V,如果这里没有硬上限,一次卡死的传输会让该 pane 的粘贴
 /// 静默失效且永不恢复。用户此刻正盯着「按了 Ctrl+V 还没出路径」,宁可早报错。
