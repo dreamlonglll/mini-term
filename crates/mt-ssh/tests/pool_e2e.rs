@@ -1,7 +1,7 @@
 //! 会话池端到端测试:进程内 russh 服务器(必要时外加进程内 ssh-agent)对本 crate 的池。
 //!
-//! 只连 127.0.0.1 上本测试自己起的服务器;home / ssh config / known_hosts / ssh-agent
-//! 一律指向测试自己的临时目录与端点,**绝不碰**真实的 `~/.ssh` 与系统 ssh-agent。
+//! 只连 127.0.0.1 上本测试自己起的服务器;home / known_hosts / ssh-agent 一律指向测试
+//! 自己的临时目录与端点,**绝不碰**真实的 `~/.ssh` 与系统 ssh-agent。
 //! 密码一律用明文(`mt_secret::reveal_global` 对非信封值原样放行,不碰凭据密钥文件)。
 
 use std::borrow::Cow;
@@ -60,25 +60,13 @@ fn write_key(path: &Path, key: &PrivateKey) {
     std::fs::write(path, text.as_bytes()).unwrap();
 }
 
-/// Unix 上把测试写的 ssh config(或冒充它的目录)收紧权限:组可写的配置文件会被当成
-/// 「Bad owner or permissions」整个忽略,umask 偏松的机器上测试就不再测它想测的东西。
-fn set_private(path: &Path, mode: u32) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
-    }
-    #[cfg(not(unix))]
-    let _ = (path, mode);
-}
-
 /// 一个刚刚还在、现在没人监听的本机端口:连上去立即被拒绝。
 fn closed_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.local_addr().unwrap().port()
 }
 
-/// 测试专用 home:`<root>/.ssh/{config,known_hosts,...}`,drop 时删除。
+/// 测试专用 home:`<root>/.ssh/{known_hosts,...}`,drop 时删除。
 struct TestHome {
     root: PathBuf,
 }
@@ -99,15 +87,9 @@ impl TestHome {
         self.root.join(".ssh").join(name)
     }
 
-    fn config(&self, text: &str) {
-        std::fs::write(self.ssh("config"), text).unwrap();
-        set_private(&self.ssh("config"), 0o600);
-    }
-
     fn env(&self) -> SshClientEnv {
         SshClientEnv {
             home_dir: Some(self.root.clone()),
-            ssh_config_path: Some(self.ssh("config")),
             known_hosts_path: self.ssh("known_hosts"),
             agent: AgentSource::Disabled,
             local_user: Some("tester".into()),
@@ -173,8 +155,6 @@ struct Behavior {
     disconnect_after_failures: usize,
     /// 收到密码认证请求时直接关掉 TCP 连接(模拟认证途中断网)。
     drop_on_password: bool,
-    /// 是否放行 direct-tcpip(当跳板用)。
-    allow_tunnel: bool,
     preferred: Option<russh::Preferred>,
 }
 
@@ -193,7 +173,6 @@ impl Behavior {
             max_auth_tries: 0,
             disconnect_after_failures: 0,
             drop_on_password: false,
-            allow_tunnel: false,
             preferred: None,
         }
     }
@@ -389,29 +368,6 @@ impl server::Handler for TestHandler {
         session.eof(channel)?;
         session.close(channel)?;
         Ok(())
-    }
-
-    async fn channel_open_direct_tcpip(
-        &mut self,
-        channel: Channel<Msg>,
-        host_to_connect: &str,
-        port_to_connect: u32,
-        _originator_address: &str,
-        _originator_port: u32,
-        _session: &mut Session,
-    ) -> Result<bool, Self::Error> {
-        self.log(format!("direct-tcpip {host_to_connect}:{port_to_connect}"));
-        if !self.behavior.allow_tunnel {
-            return Ok(false);
-        }
-        let target = format!("{host_to_connect}:{port_to_connect}");
-        tokio::spawn(async move {
-            if let Ok(mut tcp) = tokio::net::TcpStream::connect(target).await {
-                let mut stream = channel.into_stream();
-                let _ = tokio::io::copy_bidirectional(&mut stream, &mut tcp).await;
-            }
-        });
-        Ok(true)
     }
 }
 
@@ -701,10 +657,7 @@ async fn banner_only_server_times_out_in_key_exchange_and_the_russh_task_exits()
 #[tokio::test]
 async fn refused_port_is_a_network_error_not_a_timeout() {
     let home = TestHome::new("refused");
-    let port = {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap().port()
-    };
+    let port = closed_port();
     let pool = SshPool::with_env(pool_config(Duration::from_secs(10)), home.env());
     let err = pool
         .try_acquire(&connection("refused", "127.0.0.1", port, "u"))
@@ -823,32 +776,58 @@ async fn key_load_failure_falls_back_to_password_with_per_method_report_and_cool
     pool.shutdown().await;
 }
 
-/// 什么都没配:按 OpenSSH 习惯试默认私钥 `~/.ssh/id_ed25519`。
+/// 默认私钥 `~/.ssh/id_*` 一律不试(`~/.ssh` 里只碰 known_hosts):服务器只认那把默认
+/// 私钥时也不出示它,没配私钥 / 密码就是「没有可用凭据」;配了密码照常用密码登录。
 #[tokio::test]
-async fn default_key_is_tried_when_nothing_is_configured() {
+async fn default_keys_are_never_tried() {
     let key = ed25519(11);
     let server = TestServer::start(Behavior {
         keys: vec![key.public_key().clone()],
+        password: Some("pw".into()),
         ..Behavior::new("default-key")
     })
     .await;
     let home = TestHome::new("default-key");
-    write_key(&home.ssh("id_ed25519"), &key);
+    for name in ["id_ed25519", "id_ecdsa", "id_rsa"] {
+        write_key(&home.ssh(name), &key);
+    }
     let pool = SshPool::with_env(pool_config(Duration::from_secs(5)), home.env());
-    let session = pool
-        .try_acquire(&connection("default", "127.0.0.1", server.port(), "u"))
-        .await
-        .expect("default key");
+    let mut conn = connection("default", "127.0.0.1", server.port(), "u");
+    let err = pool.try_acquire(&conn).await.err().expect("no credential");
+    assert_eq!(err.kind, AcquireErrorKind::Auth, "{}", err.message);
+    assert!(
+        !err.message.contains("default key"),
+        "default keys must not be mentioned: {}",
+        err.message
+    );
+
+    conn.password = Some("pw".into());
+    let session = pool.try_acquire(&conn).await.expect("password");
     assert_eq!(exec(&session, "x").await, "default-key:x");
-    assert_eq!(server.count("password"), 0);
+    assert_eq!(server.count("offered"), 0, "{:?}", server.log());
+    assert!(
+        !server
+            .log()
+            .iter()
+            .any(|l| l.contains(&fingerprint(key.public_key()))),
+        "default key must not be offered: {:?}",
+        server.log()
+    );
+    // known_hosts 照常按 accept-new 追加(`~/.ssh` 里唯一还碰的文件)。
+    assert!(
+        home.known_hosts()
+            .contains(&format!("[127.0.0.1]:{} ", server.port())),
+        "{}",
+        home.known_hosts()
+    );
     pool.shutdown().await;
 }
 
-/// 连接配置里写 `~/.ssh/...`:展开到 home;显式配了私钥时不再试默认私钥。
+/// 连接配置里写 `~/.ssh/...`:展开到 home(用户自己指定的路径,照常读)。shutdown 时
+/// 会话被断开,服务器一侧看到连接关闭。
 #[tokio::test]
-async fn tilde_identity_file_is_expanded_and_suppresses_default_keys() {
+async fn tilde_identity_file_is_expanded_and_shutdown_closes_the_session() {
     let wanted = ed25519(12);
-    let default_key = ed25519(13);
     let server = TestServer::start(Behavior {
         keys: vec![wanted.public_key().clone()],
         ..Behavior::new("tilde")
@@ -856,21 +835,17 @@ async fn tilde_identity_file_is_expanded_and_suppresses_default_keys() {
     .await;
     let home = TestHome::new("tilde");
     write_key(&home.ssh("work_key"), &wanted);
-    write_key(&home.ssh("id_ed25519"), &default_key);
     let pool = SshPool::with_env(pool_config(Duration::from_secs(5)), home.env());
     let mut conn = connection("tilde", "127.0.0.1", server.port(), "u");
     conn.identity_file = Some("~/.ssh/work_key".into());
     let session = pool.try_acquire(&conn).await.expect("tilde key");
     assert_eq!(exec(&session, "y").await, "tilde:y");
-    assert!(
-        !server
-            .log()
-            .iter()
-            .any(|l| l.contains(&fingerprint(default_key.public_key()))),
-        "default key must not be offered: {:?}",
-        server.log()
-    );
+    drop(session);
     pool.shutdown().await;
+    assert!(
+        server.wait_ended(1, Duration::from_secs(3)).await,
+        "session closed"
+    );
 }
 
 /// ssh-agent 里的 key;以及带口令、但已加载进 agent 的私钥经 agent 签名使用。
@@ -889,19 +864,16 @@ async fn agent_keys_are_used_including_for_an_encrypted_identity_file() {
     let agent_path = spawn_agent((), &[other.clone(), encrypted.clone()]).await;
     let home = TestHome::new("agent");
     std::fs::write(home.ssh("encrypted_key"), ENCRYPTED_ED25519).unwrap();
-    // IdentitiesOnly:只用显式私钥 —— agent 里另一把 key 不得出现在服务器日志里。
-    home.config(&format!(
-        "Host agent-host\n  HostName 127.0.0.1\n  Port {}\n  IdentitiesOnly yes\n  \
-         IdentityFile ~/.ssh/encrypted_key\n",
-        server.port()
-    ));
     let env = SshClientEnv {
         agent: AgentSource::Endpoint(agent_path),
         ..home.env()
     };
     let pool = SshPool::with_env(pool_config(Duration::from_secs(10)), env);
+    // 连接私钥排在 agent 的其余 key 之前:它一把就过,agent 里另一把 key 不会被出示。
+    let mut conn = connection("agent", "127.0.0.1", server.port(), "u");
+    conn.identity_file = Some("~/.ssh/encrypted_key".into());
     let session = pool
-        .try_acquire(&connection("agent", "agent-host", 22, "u"))
+        .try_acquire(&conn)
         .await
         .expect("agent-backed encrypted key");
     assert_eq!(exec(&session, "z").await, "agent:z");
@@ -909,10 +881,10 @@ async fn agent_keys_are_used_including_for_an_encrypted_identity_file() {
     assert!(
         !log.iter()
             .any(|l| l.contains(&fingerprint(other.public_key()))),
-        "IdentitiesOnly must hide other agent keys: {log:?}"
+        "the connection's key goes first: {log:?}"
     );
 
-    // 没有 IdentitiesOnly、没有显式私钥:agent 里的 key 照常被试到。
+    // 没有显式私钥:agent 里的 key 照常被试到。
     let plain = TestServer::start(Behavior {
         keys: vec![other.public_key().clone()],
         ..Behavior::new("agent-plain")
@@ -1035,305 +1007,6 @@ async fn keyboard_interactive_only_server_accepts_the_password() {
     pool.shutdown().await;
 }
 
-/// ssh config 的 HostName / Port / User / IdentityFile 生效;改了 ssh config 后
-/// 不会复用到旧目标上的 session。
-#[tokio::test]
-async fn ssh_config_alias_resolves_and_config_changes_are_not_reused() {
-    let key = ed25519(51);
-    let a = TestServer::start(Behavior {
-        keys: vec![key.public_key().clone()],
-        ..Behavior::new("server-a")
-    })
-    .await;
-    let b = TestServer::start(Behavior {
-        keys: vec![key.public_key().clone()],
-        ..Behavior::new("server-b")
-    })
-    .await;
-    let home = TestHome::new("alias");
-    write_key(&home.ssh("svc_key"), &key);
-    let config_for = |port: u16| {
-        format!(
-            "Host svc\n  HostName 127.0.0.1\n  Port {port}\n  User cfg-user\n  \
-             IdentityFile ~/.ssh/svc_key\n"
-        )
-    };
-    home.config(&config_for(a.port()));
-    let pool = SshPool::with_env(pool_config(Duration::from_secs(5)), home.env());
-    let conn = connection("svc", "svc", 22, "");
-
-    let first = pool.try_acquire(&conn).await.expect("alias -> a");
-    assert_eq!(exec(&first, "1").await, "server-a:1");
-    assert!(a.log().iter().any(|l| l.starts_with("publickey cfg-user")));
-    drop(first);
-
-    home.config(&config_for(b.port()));
-    let second = pool.try_acquire(&conn).await.expect("alias -> b");
-    assert_eq!(exec(&second, "2").await, "server-b:2");
-    pool.shutdown().await;
-}
-
-/// 单跳 ProxyJump:跳板按自己的 ssh config 认证、做主机密钥校验,在跳板上开
-/// direct-tcpip 到目标;shutdown 时目标与跳板都被断开。
-#[tokio::test]
-async fn proxy_jump_tunnels_to_the_target_and_shutdown_closes_both_hops() {
-    let jump_key = ed25519(61);
-    let jump = TestServer::start(Behavior {
-        keys: vec![jump_key.public_key().clone()],
-        allow_tunnel: true,
-        ..Behavior::new("jump")
-    })
-    .await;
-    let target = TestServer::start(Behavior {
-        password: Some("tpw".into()),
-        ..Behavior::new("target")
-    })
-    .await;
-    let home = TestHome::new("jump");
-    write_key(&home.ssh("jump_key"), &jump_key);
-    home.config(&format!(
-        "Host target-alias\n  HostName 127.0.0.1\n  Port {}\n  ProxyJump jumper@jump-alias\n\
-         Host jump-alias\n  HostName 127.0.0.1\n  Port {}\n  IdentityFile ~/.ssh/jump_key\n",
-        target.port(),
-        jump.port()
-    ));
-    let pool = SshPool::with_env(pool_config(Duration::from_secs(10)), home.env());
-    let mut conn = connection("jumped", "target-alias", 22, "deploy");
-    conn.password = Some("tpw".into());
-
-    let session = pool.try_acquire(&conn).await.expect("via jump host");
-    assert_eq!(exec(&session, "hostname").await, "target:hostname");
-    let tunnel = format!("direct-tcpip 127.0.0.1:{}", target.port());
-    assert_eq!(jump.count(&tunnel), 1, "{:?}", jump.log());
-    assert_eq!(jump.count("publickey jumper "), 1, "{:?}", jump.log());
-    assert_eq!(
-        jump.count("password"),
-        0,
-        "the target's password is not sent to the jump host"
-    );
-    assert_eq!(target.count("password deploy"), 1);
-    let known_hosts = home.known_hosts();
-    assert!(known_hosts.contains(&format!("[127.0.0.1]:{} ", jump.port())));
-    assert!(known_hosts.contains(&format!("[127.0.0.1]:{} ", target.port())));
-
-    drop(session);
-    pool.shutdown().await;
-    assert!(
-        target.wait_ended(1, Duration::from_secs(3)).await,
-        "target closed"
-    );
-    assert!(
-        jump.wait_ended(1, Duration::from_secs(3)).await,
-        "jump host closed"
-    );
-}
-
-/// 多跳 ProxyJump(逗号分隔):逐跳经上一跳的隧道连下一跳。
-#[tokio::test]
-async fn multi_hop_proxy_jump_chains_tunnels() {
-    let key = ed25519(71);
-    let first = TestServer::start(Behavior {
-        keys: vec![key.public_key().clone()],
-        allow_tunnel: true,
-        ..Behavior::new("hop1")
-    })
-    .await;
-    let second = TestServer::start(Behavior {
-        keys: vec![key.public_key().clone()],
-        allow_tunnel: true,
-        ..Behavior::new("hop2")
-    })
-    .await;
-    let target = TestServer::start(Behavior {
-        keys: vec![key.public_key().clone()],
-        ..Behavior::new("final")
-    })
-    .await;
-    let home = TestHome::new("multi-hop");
-    write_key(&home.ssh("id_ed25519"), &key);
-    home.config(&format!(
-        "Host final\n  HostName 127.0.0.1\n  Port {}\n  ProxyJump 127.0.0.1:{},127.0.0.1:{}\n",
-        target.port(),
-        first.port(),
-        second.port()
-    ));
-    let pool = SshPool::with_env(pool_config(Duration::from_secs(10)), home.env());
-    let session = pool
-        .try_acquire(&connection("multi", "final", 22, "u"))
-        .await
-        .expect("two hops");
-    assert_eq!(exec(&session, "m").await, "final:m");
-    let to_second = format!("direct-tcpip 127.0.0.1:{}", second.port());
-    assert_eq!(first.count(&to_second), 1, "{:?}", first.log());
-    let to_target = format!("direct-tcpip 127.0.0.1:{}", target.port());
-    assert_eq!(second.count(&to_target), 1, "{:?}", second.log());
-    pool.shutdown().await;
-}
-
-/// `Host *` 配了一条 ProxyCommand(公司代理、cloudflared 之类):本来能直连的主机照常
-/// 直连(读 ssh config 之前的行为);连不上时报错末尾写明忽略了哪条 ProxyCommand。
-#[tokio::test]
-async fn proxy_command_is_ignored_and_the_host_is_reached_directly() {
-    let server = TestServer::start(Behavior {
-        password: Some("pw".into()),
-        ..Behavior::new("direct")
-    })
-    .await;
-    let home = TestHome::new("proxy-command");
-    home.config("Host *\n  ProxyCommand cloudflared access ssh --hostname %h\n");
-    let pool = SshPool::with_env(pool_config(Duration::from_secs(5)), home.env());
-    let mut conn = connection("direct", "127.0.0.1", server.port(), "u");
-    conn.password = Some("pw".into());
-    let session = pool.try_acquire(&conn).await.expect("reached directly");
-    assert_eq!(exec(&session, "d").await, "direct:d");
-
-    let port = closed_port();
-    let err = pool
-        .try_acquire(&connection("gated", "127.0.0.1", port, "u"))
-        .await
-        .err()
-        .expect("nothing listens there");
-    assert_eq!(err.kind, AcquireErrorKind::Network);
-    assert!(
-        err.message
-            .starts_with(&format!("ssh connect to 127.0.0.1:{port} failed: ")),
-        "{}",
-        err.message
-    );
-    assert!(
-        err.message.contains(
-            "note: ignored \"ProxyCommand cloudflared access ssh --hostname %h\" from ssh config"
-        ),
-        "{}",
-        err.message
-    );
-    assert!(
-        err.message
-            .contains("已忽略 ~/.ssh/config 里的 ProxyCommand"),
-        "{}",
-        err.message
-    );
-    pool.shutdown().await;
-}
-
-/// ssh config 一时读不了(这里换成了同名目录,模拟编辑器保存时的独占锁):沿用上次的路线,
-/// 健康的会话照常复用;要新建时也按上次的路线连,而不是把别名当主机名。
-#[tokio::test]
-async fn unreadable_ssh_config_keeps_the_last_route() {
-    let server = TestServer::start(Behavior {
-        password: Some("pw".into()),
-        ..Behavior::new("svc")
-    })
-    .await;
-    let home = TestHome::new("unreadable-config");
-    home.config(&format!(
-        "Host svc-alias\n  HostName 127.0.0.1\n  Port {}\n",
-        server.port()
-    ));
-    let pool = SshPool::with_env(pool_config(Duration::from_secs(5)), home.env());
-    let mut conn = connection("svc", "svc-alias", 22, "u");
-    conn.password = Some("pw".into());
-    let first = pool.try_acquire(&conn).await.expect("via ssh config");
-
-    std::fs::remove_file(home.ssh("config")).unwrap();
-    std::fs::create_dir(home.ssh("config")).unwrap();
-    set_private(&home.ssh("config"), 0o700);
-    let again = pool.try_acquire(&conn).await.expect("reused");
-    assert!(Arc::ptr_eq(&first, &again), "the healthy session is reused");
-    assert_eq!(server.accepted(), 1);
-
-    // 会话没了也照上次的路线新建。
-    drop((first, again));
-    pool.evict(&conn.id).await;
-    let rebuilt = pool.try_acquire(&conn).await.expect("last route");
-    assert_eq!(exec(&rebuilt, "r").await, "svc:r");
-    assert_eq!(server.accepted(), 2);
-    pool.shutdown().await;
-}
-
-/// ssh config 写坏了:健康的会话照常复用;要新建连接时才报 `Config`(终端里的 ssh 同样
-/// 会拒绝)。
-#[tokio::test]
-async fn broken_ssh_config_does_not_block_reusing_a_healthy_session() {
-    let server = TestServer::start(Behavior {
-        password: Some("pw".into()),
-        ..Behavior::new("svc")
-    })
-    .await;
-    let home = TestHome::new("broken-config");
-    let config = |port: &str| format!("Host svc-alias\n  HostName 127.0.0.1\n  Port {port}\n");
-    home.config(&config(&server.port().to_string()));
-    let pool = SshPool::with_env(pool_config(Duration::from_secs(5)), home.env());
-    let mut conn = connection("svc", "svc-alias", 22, "u");
-    conn.password = Some("pw".into());
-    let first = pool.try_acquire(&conn).await.expect("via ssh config");
-
-    home.config(&config("abc"));
-    let again = pool.try_acquire(&conn).await.expect("reused");
-    assert!(Arc::ptr_eq(&first, &again));
-
-    drop((first, again));
-    pool.evict(&conn.id).await;
-    let err = pool.try_acquire(&conn).await.err().expect("config error");
-    assert_eq!(err.kind, AcquireErrorKind::Config);
-    assert!(
-        err.message.contains("invalid Port value 'abc'"),
-        "{}",
-        err.message
-    );
-    assert_eq!(server.accepted(), 1);
-    pool.shutdown().await;
-}
-
-/// 跳板只开密码类认证:跳板一律不用密码(有意如此),报错写明是跳板的认证失败、跳板支持
-/// 哪些方法、为什么不用密码。
-#[tokio::test]
-async fn password_only_jump_host_fails_with_a_jump_specific_message() {
-    let jump = TestServer::start(Behavior {
-        methods: vec![MethodKind::Password, MethodKind::KeyboardInteractive],
-        password: Some("jpw".into()),
-        allow_tunnel: true,
-        ..Behavior::new("jump")
-    })
-    .await;
-    let target = TestServer::start(Behavior {
-        password: Some("tpw".into()),
-        ..Behavior::new("target")
-    })
-    .await;
-    let home = TestHome::new("jump-password-only");
-    home.config(&format!(
-        "Host target-alias\n  HostName 127.0.0.1\n  Port {}\n  ProxyJump jumper@jump-alias\n\
-         Host jump-alias\n  HostName 127.0.0.1\n  Port {}\n",
-        target.port(),
-        jump.port()
-    ));
-    let pool = SshPool::with_env(pool_config(Duration::from_secs(10)), home.env());
-    let mut conn = connection("jumped", "target-alias", 22, "deploy");
-    conn.password = Some("tpw".into());
-    let err = pool.try_acquire(&conn).await.err().expect("jump auth");
-    assert_eq!(err.kind, AcquireErrorKind::Auth);
-    assert!(
-        err.message.starts_with(&format!(
-            "authentication failed for jump host jumper@127.0.0.1:{} (server allows: \
-             password,keyboard-interactive): ",
-            jump.port()
-        )),
-        "{}",
-        err.message
-    );
-    assert!(
-        err.message.contains(
-            "password: not used for jump hosts (mini-term signs in to a jump host with keys only"
-        ),
-        "{}",
-        err.message
-    );
-    assert_eq!(jump.count("password"), 0, "{:?}", jump.log());
-    assert_eq!(target.accepted(), 0);
-    pool.shutdown().await;
-}
-
 // ============================================================================
 // B1-4 老服务器算法 / B1-5、B1-6 主机密钥
 // ============================================================================
@@ -1427,7 +1100,7 @@ async fn changed_or_revoked_host_keys_are_rejected_with_english_prefixes() {
 }
 
 // ============================================================================
-// 评审修复:单飞建连 / 加固服务器 / 认证途中断网 / 公钥 IdentityFile
+// 评审修复:单飞建连 / 加固服务器 / 认证途中断网 / 私钥配成公钥文件
 // ============================================================================
 
 /// 同一连接的并发 acquire 单飞:密码错时服务器只看到一轮认证(一条 TCP、一次密码、一次
@@ -1645,8 +1318,8 @@ async fn connection_lost_during_authentication_is_a_network_error_without_cooldo
     pool.shutdown().await;
 }
 
-/// `IdentityFile` 指向公钥(1Password 推荐的写法)+ `IdentitiesOnly yes`:到 agent 里找
-/// 同一把 key 签名;agent 里的其它 key 一把都不出示。
+/// 连接私钥配成公钥文件(1Password 推荐的写法):到 agent 里找同一把 key 签名;它排在
+/// agent 的其余 key 之前,一把就过,其它 key 不出示。
 #[tokio::test]
 async fn public_key_identity_file_signs_through_the_agent() {
     let wanted = ed25519(101);
@@ -1663,26 +1336,20 @@ async fn public_key_identity_file_signs_through_the_agent() {
         format!("{}\n", wanted.public_key().to_openssh().unwrap()),
     )
     .unwrap();
-    home.config(&format!(
-        "Host pubfile-host\n  HostName 127.0.0.1\n  Port {}\n  IdentitiesOnly yes\n  \
-         IdentityFile ~/.ssh/work.pub\n",
-        server.port()
-    ));
     let env = SshClientEnv {
         agent: AgentSource::Endpoint(agent_path),
         ..home.env()
     };
     let pool = SshPool::with_env(pool_config(Duration::from_secs(10)), env);
-    let session = pool
-        .try_acquire(&connection("pubfile", "pubfile-host", 22, "u"))
-        .await
-        .expect("signed by the agent");
+    let mut conn = connection("pubfile", "127.0.0.1", server.port(), "u");
+    conn.identity_file = Some("~/.ssh/work.pub".into());
+    let session = pool.try_acquire(&conn).await.expect("signed by the agent");
     assert_eq!(exec(&session, "k").await, "pubfile:k");
     let log = server.log();
     assert!(
         !log.iter()
             .any(|l| l.contains(&fingerprint(other.public_key()))),
-        "IdentitiesOnly must hide other agent keys: {log:?}"
+        "the connection's key goes first: {log:?}"
     );
     pool.shutdown().await;
 }

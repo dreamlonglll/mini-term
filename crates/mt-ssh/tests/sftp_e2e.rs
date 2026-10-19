@@ -1,7 +1,7 @@
 //! SFTP 传输端到端测试:进程内 russh 服务器 + 内存文件系统的 SFTP 子系统,对本 crate 的
 //! `run_sftp_download_on_session` / `run_sftp_upload_on_session`。
 //!
-//! 只连 127.0.0.1 上本测试自己起的服务器;known_hosts 在临时目录里,不读 ssh config、
+//! 只连 127.0.0.1 上本测试自己起的服务器;known_hosts 在临时目录里,不展开 `~`、
 //! 不连 ssh-agent([`SshClientEnv::isolated`]);密码用明文(`mt_secret::reveal_global`
 //! 对非信封值原样放行,不碰凭据密钥文件)。本地文件一律落在临时目录。
 //!
