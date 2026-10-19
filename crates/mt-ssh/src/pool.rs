@@ -15,11 +15,10 @@
 //! - 默认 profile:idle 10min / lifetime 2h / keepalive 30s × 3 / cap 8 LRU /
 //!   lazy 重连 + 单次 retry + 30s 认证失败冷却 + 20s 建连超时 + 10s 开 SFTP channel
 //!   超时。来源见 research 文件。
-//! - 建连对齐终端里的系统 ssh(`ssh [-p port] [-i key] user@host`):读 `~/.ssh/config`
-//!   (HostName / Port / User / IdentityFile / IdentitiesOnly / HostKeyAlias /
-//!   ProxyJump,见 `ssh_config.rs`);认证依次试显式私钥 / ssh-agent / 默认私钥 /
-//!   密码(见 `auth.rs`);DNS + TCP + 握手 + 认证整段受 `connect_timeout` 约束,
-//!   超时报错写明卡在哪个阶段(见 `transport.rs`)。
+//! - 建连只看连接配置本身(等价于终端里的 `ssh [-p port] [-i key] user@host`,见
+//!   `target.rs`):`~/.ssh` 里只碰 known_hosts,不读 `~/.ssh/config`、不试默认私钥。
+//!   认证依次试连接私钥 / ssh-agent / 密码(见 `auth.rs`);DNS + TCP + 握手 + 认证整段受
+//!   `connect_timeout` 约束,超时报错写明卡在哪个阶段(见 `transport.rs`)。
 //! - host-key 策略:`accept-new` 语义(对齐 OpenSSH `StrictHostKeyChecking=accept-new`)。
 //!   首见接受并以 plaintext 追加到 `~/.ssh/known_hosts`,变更 / 吊销拒绝;plaintext、
 //!   通配与 `|1|` 哈希条目都认(见 `known_hosts.rs`)。拒绝原因会拼进连接错误。
@@ -44,7 +43,7 @@ pub use crate::known_hosts::MtClient;
 
 use crate::auth::{self, AgentSession, AuthError, AuthPlan, AuthRound, ClientNotes, PasswordInput};
 use crate::known_hosts;
-use crate::ssh_config::{self, ResolvedHost, ResolvedRoute, RouteEnv, RouteError};
+use crate::target::{self, ResolvedHost};
 use crate::transport::{self, ConnectStage, GuardedStream, KillOnDrop, StageTracker, StreamKill};
 
 /// 会话池可调参数。所有默认值都来自 research/session-pool-patterns.md TL;DR 表。
@@ -62,15 +61,15 @@ pub struct PoolConfig {
     pub max_sessions: usize,
     /// 认证失败冷却:某连接身份认证失败后,在此时长内 `acquire` 直接返回错误,不再去打
     /// 远端(autossh `AUTOSSH_GATETIME=30s` 风格),免得反复重试触发 fail2ban。网络错误与
-    /// 超时不计;连接配置(或 ssh config 解析结果)一改,身份就变了,可立即重试。
+    /// 超时不计;连接配置一改,身份就变了,可立即重试。
     /// 为 0 时不冷却。sidecar 另用它配合 [`CachedSession::mark_unhealthy`]。
     pub gatetime_cooldown: Duration,
     /// 后台 reaper 扫描频率。默认 60s。
     pub reaper_tick: Duration,
     /// shutdown 时单 session disconnect 的上限,防止远端 hang 阻塞 sidecar 退出。
     pub shutdown_per_session_timeout: Duration,
-    /// 建连总预算:DNS 解析 + TCP 连接 + SSH 握手(含主机密钥校验)+ 认证整段,
-    /// ProxyJump 时含每一跳。超时报错写明卡在哪个阶段。
+    /// 建连总预算:DNS 解析 + TCP 连接 + SSH 握手(含主机密钥校验)+ 认证整段。
+    /// 超时报错写明卡在哪个阶段。
     ///
     /// 默认 20s:系统 ssh 没有默认 ConnectTimeout(Windows TCP 栈自身约 21s 放弃);
     /// 正常链路握手 + 认证一两秒内完成,PAM 每次密码失败约 2s 延迟、硬件 key 等人触摸
@@ -111,49 +110,45 @@ impl Default for PoolConfig {
 
 /// 池建连依赖的本机环境。生产用 [`SshClientEnv::system`];测试从
 /// [`SshClientEnv::isolated`] 起步再按需打开,**绝不碰**真实的 `~/.ssh` 与 ssh-agent。
+///
+/// `~/.ssh` 里池只碰 known_hosts:不读 `~/.ssh/config`、不试默认私钥 `~/.ssh/id_*`
+/// (见 `target.rs`),这里也就没有它们的位置。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SshClientEnv {
-    /// home 目录:`~` 展开、默认私钥(`~/.ssh/id_*`)与 ssh config `Include` 相对路径的
-    /// 基准。`None` 时不展开 `~`、不试默认私钥。
+    /// home 目录:连接私钥路径里 `~` 的展开基准。`None` 时不展开 `~`。
     pub home_dir: Option<PathBuf>,
-    /// OpenSSH 客户端配置文件(`~/.ssh/config`)。`None` = 不读任何 ssh config。
-    pub ssh_config_path: Option<PathBuf>,
     /// known_hosts 文件(读、并按 accept-new 追加)。
     pub known_hosts_path: PathBuf,
     /// ssh-agent 来源。
     pub agent: AgentSource,
-    /// 本机用户名:ssh config token `%u`,以及连接与 ssh config 都没给用户名时的
-    /// 默认登录名(OpenSSH 同样如此)。
+    /// 本机用户名:连接没给用户名时的默认登录名(OpenSSH 同样如此)。
     pub local_user: Option<String>,
 }
 
 impl SshClientEnv {
-    /// 真实环境:`~/.ssh/config`、`~/.ssh/known_hosts`、默认私钥、系统 ssh-agent。
-    /// 只取路径与环境变量,不读任何文件(构造池不该有 IO)。
+    /// 真实环境:`~/.ssh/known_hosts`、系统 ssh-agent。只取路径与环境变量,不读任何
+    /// 文件(构造池不该有 IO)。
     ///
     /// 找不到 home 时 known_hosts 回退到当前目录下 `.known_hosts`(极端环境的兜底,
-    /// 正常桌面端不会触发),也不读 ssh config。
+    /// 正常桌面端不会触发)。
     pub fn system() -> Self {
         let home_dir = dirs::home_dir();
-        let ssh_dir = home_dir.as_ref().map(|home| home.join(".ssh"));
         Self {
-            known_hosts_path: ssh_dir
+            known_hosts_path: home_dir
                 .as_ref()
-                .map(|dir| dir.join("known_hosts"))
+                .map(|home| home.join(".ssh").join("known_hosts"))
                 .unwrap_or_else(|| PathBuf::from(".known_hosts")),
-            ssh_config_path: ssh_dir.map(|dir| dir.join("config")),
             home_dir,
             agent: AgentSource::System,
             local_user: local_user_name(),
         }
     }
 
-    /// 隔离环境:只用给定的 known_hosts;不读 ssh config、不展开 `~`、不试默认私钥、
-    /// 不连 ssh-agent —— 认证只剩连接配置里的私钥与密码(本 crate 早先的全部能力)。
+    /// 隔离环境:只用给定的 known_hosts;不展开 `~`、不连 ssh-agent —— 认证只剩连接
+    /// 配置里的私钥与密码。
     pub fn isolated(known_hosts_path: PathBuf) -> Self {
         Self {
             home_dir: None,
-            ssh_config_path: None,
             known_hosts_path,
             agent: AgentSource::Disabled,
             local_user: None,
@@ -185,9 +180,9 @@ pub enum AgentSource {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AcquireErrorKind {
-    /// 连接 / ssh config 的配置问题(ProxyCommand 不支持、取值非法……),重试无用。
+    /// 连接配置本身的问题(主机为空、没有用户名……),重试无用。
     Config,
-    /// DNS、TCP、跳板隧道或 SSH 握手失败(含算法协商失败)。
+    /// DNS、TCP 或 SSH 握手失败(含算法协商失败)。
     Network,
     /// `connect_timeout` 内没建好连接;消息写明卡在哪个阶段。
     Timeout,
@@ -253,18 +248,14 @@ fn remove_arc_if_same<T>(
 pub struct CachedSession {
     /// 建立该 session 时真正参与认证/寻址的连接身份。池的 map key 仍是稳定的
     /// connection id，但复用前必须逐字段核对这一份，避免用户原地修改 host、
-    /// port、user、凭据或 ssh config 后短暂命中旧服务器 session。
+    /// port、user 或凭据后短暂命中旧服务器 session。
     connection_identity: CachedConnectionIdentity,
     /// 串行化同 session 上的 channel 操作。russh Handle 自身 Clone 廉价,但允许
     /// 并发开 channel 会让审计日志顺序与"标记 unhealthy"的语义复杂化。
     handle: Mutex<Handle<MtClient>>,
-    /// 目标会话底层传输的掐断开关,随本结构 drop 即掐断:russh 会话任务与 socket
-    /// (或跳板上的 direct-tcpip 通道)不会比本结构活得久,见 `transport.rs`。
+    /// 会话底层传输的掐断开关,随本结构 drop 即掐断:russh 会话任务与 socket 不会比
+    /// 本结构活得久,见 `transport.rs`。
     transport: KillOnDrop,
-    /// ProxyJump 经过的跳板会话,第一跳在前。目标会话的传输跑在最后一跳的
-    /// direct-tcpip 通道里,所以它们与目标会话同生共死:关闭 / 淘汰时先断目标、再由近
-    /// 及远断跳板([`CachedSession::close`]),drop 时一并掐断。
-    jumps: Vec<JumpLink>,
     /// session 建立时刻;用于 `max_lifetime` 判定。
     opened_at: Instant,
     /// 最近一次使用(`ssh_exec` 触发)的 UNIX 毫秒。Atomic 是为了 reaper 不抢锁就能读。
@@ -278,13 +269,7 @@ pub struct CachedSession {
     sftp_open_timeout: Duration,
 }
 
-/// 一跳跳板会话。
-struct JumpLink {
-    handle: Mutex<Handle<MtClient>>,
-    transport: KillOnDrop,
-}
-
-/// 连接身份:连接配置里参与寻址 / 认证的字段,加上 ssh config 解析出的实际路线。
+/// 连接身份:连接配置里参与寻址 / 认证的字段,加上由它们解析出的建连目标。
 #[derive(Clone, PartialEq, Eq)]
 struct CachedConnectionIdentity {
     id: String,
@@ -293,13 +278,12 @@ struct CachedConnectionIdentity {
     user: String,
     password: Option<String>,
     identity_file: Option<String>,
-    /// ssh config 解析出的实际路线(HostName / Port / User / 私钥 / 跳板 /
-    /// known_hosts 名)。`~/.ssh/config` 改了,连接配置一字未动也不能复用到旧目标上。
-    route: ResolvedRoute,
+    /// 解析出的建连目标(主机名 / 端口 / 登录名 / 私钥 / known_hosts 名,见 `target.rs`)。
+    target: ResolvedHost,
 }
 
 impl CachedConnectionIdentity {
-    fn new(connection: &SshConnection, route: ResolvedRoute) -> Self {
+    fn new(connection: &SshConnection, target: ResolvedHost) -> Self {
         Self {
             id: connection.id.clone(),
             host: connection.host.clone(),
@@ -307,7 +291,7 @@ impl CachedConnectionIdentity {
             user: connection.user.clone(),
             password: connection.password.clone(),
             identity_file: connection.identity_file.clone(),
-            route,
+            target,
         }
     }
 }
@@ -329,21 +313,13 @@ impl CachedSession {
         self.connection_identity == *identity
     }
 
-    /// 优雅断开:先目标、再由近及远的跳板,整体限时 `timeout`;到点无论成败都掐断
-    /// 全部传输,保证 russh 会话任务与 socket 一定释放。返回优雅断开是否按时完成。
+    /// 优雅断开,限时 `timeout`;到点无论成败都掐断传输,保证 russh 会话任务与 socket
+    /// 一定释放。返回优雅断开是否按时完成。
     async fn close(&self, timeout: Duration) -> bool {
-        let graceful = tokio::time::timeout(timeout, async {
-            disconnect_handle(&self.handle).await;
-            for jump in self.jumps.iter().rev() {
-                disconnect_handle(&jump.handle).await;
-            }
-        })
-        .await
-        .is_ok();
+        let graceful = tokio::time::timeout(timeout, disconnect_handle(&self.handle))
+            .await
+            .is_ok();
         self.transport.kill();
-        for jump in &self.jumps {
-            jump.transport.kill();
-        }
         graceful
     }
 
@@ -489,7 +465,7 @@ fn now_millis() -> u64 {
 
 /// 一次认证失败的记录(冷却用)。
 struct AuthFailure {
-    /// 失败时的连接身份。身份一变(改了连接配置或 ssh config)记录即不再适用。
+    /// 失败时的连接身份。身份一变(改了连接配置)记录即不再适用。
     identity: CachedConnectionIdentity,
     failed_at: Instant,
     until: Instant,
@@ -521,46 +497,6 @@ fn cooldown_message(record: &AuthFailure, remaining: Duration, now: Instant) -> 
          an immediate retry) or wait. Last error: {}",
         record.message
     )
-}
-
-/// 一条连接上次成功解析出的路线。ssh config 一时读不了(Windows 上编辑器保存时独占着
-/// 文件)时沿用它,免得路线变样、白白淘汰健康的会话;ssh config 写坏时也只拿它复用还活着
-/// 的会话。
-struct RouteMemo {
-    /// 解析时连接里参与寻址的字段:连接一改就不再沿用。
-    inputs: RouteInputs,
-    route: ResolvedRoute,
-}
-
-#[derive(PartialEq, Eq)]
-struct RouteInputs {
-    host: String,
-    port: u16,
-    user: String,
-    identity_file: Option<String>,
-}
-
-impl RouteInputs {
-    fn of(conn: &SshConnection) -> Self {
-        Self {
-            host: conn.host.clone(),
-            port: conn.port,
-            user: conn.user.clone(),
-            identity_file: conn.identity_file.clone(),
-        }
-    }
-}
-
-/// [`SshPool::choose_route`] 的结论。
-enum RouteChoice {
-    /// 复用与新建都按这条路线来。
-    Usable(ResolvedRoute),
-    /// ssh config 写坏了:上次的路线只用来复用还活着的会话,要新建连接时报 `error`
-    /// (终端里的 ssh 对同样的配置也会拒绝连接)。
-    ReuseOnly {
-        route: ResolvedRoute,
-        error: AcquireError,
-    },
 }
 
 /// 同一连接的建连单飞闸(见 [`SshPool::try_acquire`])。
@@ -607,12 +543,10 @@ impl Drop for FlightTicket<'_> {
 pub struct SshPool {
     inner: Arc<Mutex<PoolInner>>,
     config: PoolConfig,
-    /// 建连依赖的本机环境(known_hosts / ssh config / home / ssh-agent)。
+    /// 建连依赖的本机环境(known_hosts / home / ssh-agent)。
     env: SshClientEnv,
     /// 认证失败冷却记录:connection id → 最近一次认证失败。
     auth_failures: std::sync::Mutex<HashMap<String, AuthFailure>>,
-    /// connection id → 上次成功解析出的路线(见 [`RouteMemo`])。
-    routes: std::sync::Mutex<HashMap<String, RouteMemo>>,
     /// connection id → 建连单飞闸。只在有请求要新建连接时存在,用完即摘。
     flights: std::sync::Mutex<HashMap<String, Arc<ConnectFlight>>>,
     /// 后台 reaper task 句柄,持有以便在 Drop 时 abort。
@@ -634,8 +568,8 @@ impl SshPool {
         Self::with_env(config, SshClientEnv::system())
     }
 
-    /// 隔离环境([`SshClientEnv::isolated`]):只用给定的 known_hosts,不读 ssh config、
-    /// 不试默认私钥、不连 ssh-agent。主要给单测用。
+    /// 隔离环境([`SshClientEnv::isolated`]):只用给定的 known_hosts,不展开 `~`、
+    /// 不连 ssh-agent。主要给单测用。
     pub fn with_paths(config: PoolConfig, known_hosts_path: PathBuf) -> Self {
         Self::with_env(config, SshClientEnv::isolated(known_hosts_path))
     }
@@ -662,74 +596,19 @@ impl SshPool {
             config,
             env,
             auth_failures: std::sync::Mutex::new(HashMap::new()),
-            routes: std::sync::Mutex::new(HashMap::new()),
             flights: std::sync::Mutex::new(HashMap::new()),
             reaper: std::sync::Mutex::new(Some(reaper_handle)),
         }
     }
 
-    fn route_env(&self, tolerate_unreadable: bool) -> RouteEnv<'_> {
-        RouteEnv {
-            ssh_config_path: self.env.ssh_config_path.as_deref(),
-            home: self.env.home_dir.as_deref(),
-            local_user: self.env.local_user.as_deref(),
-            tolerate_unreadable,
-        }
-    }
-
-    fn routes(&self) -> std::sync::MutexGuard<'_, HashMap<String, RouteMemo>> {
-        self.routes
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// 按当前 ssh config 解析连接的实际路线,解析不了时尽量沿用上次的:
-    ///
-    /// - 解析成功:记作这条连接「上次的路线」;
-    /// - ssh config 读不了(IO 错误,不是文件不存在):沿用上次的路线并记日志 —— 当成「没有
-    ///   配置」会让路线变样、白白淘汰健康的会话。没有上次可沿用时跳过读不了的文件;
-    /// - ssh config 写坏了(取值非法……):上次的路线只用来复用还活着的会话,要新建时报
-    ///   `Config`;从没解析成功过就直接报 `Config`。
-    fn choose_route(&self, conn: &SshConnection) -> Result<RouteChoice, AcquireError> {
-        let inputs = RouteInputs::of(conn);
-        let last_route = |inputs: &RouteInputs| {
-            self.routes()
-                .get(&conn.id)
-                .filter(|memo| memo.inputs == *inputs)
-                .map(|memo| memo.route.clone())
-        };
-        match ssh_config::resolve_route(conn, &self.route_env(false)) {
-            Ok(route) => {
-                self.routes().insert(
-                    conn.id.clone(),
-                    RouteMemo {
-                        inputs,
-                        route: route.clone(),
-                    },
-                );
-                Ok(RouteChoice::Usable(route))
-            }
-            Err(RouteError::Unreadable(why)) => {
-                if let Some(route) = last_route(&inputs) {
-                    eprintln!(
-                        "[mt-ssh] {why}; connection '{}' keeps the route resolved last time",
-                        conn.name
-                    );
-                    return Ok(RouteChoice::Usable(route));
-                }
-                // 没有上次可沿用:跳过读不了的文件(日志里有一行)。这条路线不记作「上次的」。
-                ssh_config::resolve_route(conn, &self.route_env(true))
-                    .map(RouteChoice::Usable)
-                    .map_err(|e| AcquireError::new(AcquireErrorKind::Config, e.message()))
-            }
-            Err(RouteError::Invalid(why)) => {
-                let error = AcquireError::new(AcquireErrorKind::Config, why);
-                match last_route(&inputs) {
-                    Some(route) => Ok(RouteChoice::ReuseOnly { route, error }),
-                    None => Err(error),
-                }
-            }
-        }
+    /// 解析连接的建连目标(只看连接配置本身,见 `target.rs`)。
+    fn resolve_target(&self, conn: &SshConnection) -> Result<ResolvedHost, AcquireError> {
+        target::resolve_target(
+            conn,
+            self.env.home_dir.as_deref(),
+            self.env.local_user.as_deref(),
+        )
+        .map_err(|why| AcquireError::new(AcquireErrorKind::Config, why))
     }
 
     fn auth_failures(&self) -> std::sync::MutexGuard<'_, HashMap<String, AuthFailure>> {
@@ -802,9 +681,8 @@ impl SshPool {
 
     /// 同 [`Self::acquire`],错误带分类([`AcquireErrorKind`])。
     ///
-    /// - 每次都按当前 ssh config 解析连接的实际路线(规则见 [`Self::choose_route`]):
-    ///   ssh config 读不了就沿用上次的路线;写坏了只复用还活着的会话,要新建时报 `Config`;
-    /// - 池里有同 id 且身份(连接配置 + 解析出的路线)一致的存活 session 就复用;
+    /// - 先按连接配置解析建连目标,连接本身有误(主机为空、没有用户名)时报 `Config`;
+    /// - 池里有同 id 且身份(连接配置 + 解析出的目标)一致的存活 session 就复用;
     /// - 否则要新建:该身份仍在认证失败冷却期内时直接返 `Cooldown`,不碰网络;
     /// - 同一连接的新建是**单飞**的:并发请求排队等同一道闸(不占池的全局锁,future 被
     ///   丢弃时自动放开),拿到闸后先看排队期间有没有人建好 / 记下了冷却;排队期间别人建失败
@@ -812,29 +690,14 @@ impl SshPool {
     ///   轮把本机送进 fail2ban,也不会在服务器不通时排着队一个接一个地等超时;
     /// - 新建整段受 `PoolConfig::connect_timeout` 约束,超时是 `Timeout`(写明阶段);
     ///   服务器拒绝全部认证方法是 `Auth`,并开始冷却;主机密钥不符 / 吊销是 `HostKey`;
-    ///   DNS / TCP / 隧道 / 握手失败是 `Network`。ssh config 里被忽略的代理(见
-    ///   [`ResolvedRoute::ignored_proxy`])写在连接失败的报错末尾。
+    ///   DNS / TCP / 握手失败是 `Network`。
     pub async fn try_acquire(
         &self,
         conn: &SshConnection,
     ) -> Result<Arc<CachedSession>, AcquireError> {
-        let (route, build_error) = match self.choose_route(conn)? {
-            RouteChoice::Usable(route) => (route, None),
-            RouteChoice::ReuseOnly { route, error } => (route, Some(error)),
-        };
-        let identity = CachedConnectionIdentity::new(conn, route);
+        let identity = CachedConnectionIdentity::new(conn, self.resolve_target(conn)?);
         if let Some(session) = self.reuse_cached(&conn.id, &identity).await {
-            if let Some(error) = &build_error {
-                ssh_config::warn_once(format!(
-                    "{}; connection '{}' keeps using its open session, but new connections fail \
-                     until the ssh config is fixed",
-                    error.message, conn.name
-                ));
-            }
             return Ok(session);
-        }
-        if let Some(error) = build_error {
-            return Err(error);
         }
         // 认证失败冷却只拦「新建」:池里有健康的同身份 session 时照常复用。
         self.check_auth_cooldown(conn, &identity)?;
@@ -941,8 +804,7 @@ impl SshPool {
         }
     }
 
-    /// 新建一条 session 并放进池(持单飞闸时调用)。认证失败在这里记冷却;ssh config 里
-    /// 被忽略的代理附在失败的报错末尾并记日志。
+    /// 新建一条 session 并放进池(持单飞闸时调用)。认证失败在这里记冷却。
     async fn build_and_insert(
         &self,
         conn: &SshConnection,
@@ -950,14 +812,7 @@ impl SshPool {
     ) -> Result<Arc<CachedSession>, AcquireError> {
         let cached = match self.build_session(conn, identity).await {
             Ok(cached) => cached,
-            Err(mut error) => {
-                if let Some(note) = &identity.route.ignored_proxy {
-                    error.message = format!("{}; note: {note}", error.message);
-                    eprintln!(
-                        "[mt-ssh] connecting '{}' failed: {}",
-                        conn.name, error.message
-                    );
-                }
+            Err(error) => {
                 if error.kind == AcquireErrorKind::Auth {
                     self.record_auth_failure(identity, &error.message);
                 }
@@ -1072,7 +927,7 @@ impl SshPool {
         let entries: Vec<_> = inner.sessions.drain().map(|(_, v)| v).collect();
         drop(inner);
 
-        // 每条 session(连同它的跳板)各自限时优雅断开,到点即掐断传输。
+        // 每条 session 各自限时优雅断开,到点即掐断传输。
         let timeout = self.config.shutdown_per_session_timeout;
         let futures = entries.into_iter().map(|s| async move {
             let _ = s.close(timeout).await;
@@ -1080,22 +935,21 @@ impl SshPool {
         futures::future::join_all(futures).await;
     }
 
-    /// 真正建一条 session:按路线逐跳建连(第一跳走 TCP,其后经上一跳的 direct-tcpip
-    /// 隧道)→ 握手(主机密钥校验在 Handler 内)→ 认证。整段受 `connect_timeout` 约束;
-    /// 超时丢弃建连 future 时,各跳的 [`KillOnDrop`] 随之 drop、掐断传输,russh 已 spawn
-    /// 的会话任务随即退出,不泄漏任务与 socket。
+    /// 真正建一条 session:TCP → 握手(主机密钥校验在 Handler 内)→ 认证。整段受
+    /// `connect_timeout` 约束;超时丢弃建连 future 时,[`KillOnDrop`] 随之 drop、掐断传输,
+    /// russh 已 spawn 的会话任务随即退出,不泄漏任务与 socket。
     async fn build_session(
         &self,
         conn: &SshConnection,
         identity: &CachedConnectionIdentity,
     ) -> Result<CachedSession, AcquireError> {
-        let route = &identity.route;
-        let target = format!("{}@{}", route.target.user, route.target.endpoint());
+        let host = &identity.target;
+        let target = format!("{}@{}", host.user, host.endpoint());
         let budget = self.config.connect_timeout;
         let deadline = tokio::time::Instant::now() + budget;
         let tracker = StageTracker::default();
-        let connecting = self.connect_route(conn, route, deadline, &tracker, &target);
-        let (mut links, target_link) = match tokio::time::timeout_at(deadline, connecting).await {
+        let connecting = self.connect_target(conn, host, deadline, &tracker, &target);
+        let link = match tokio::time::timeout_at(deadline, connecting).await {
             Ok(result) => result?,
             Err(_) => {
                 return Err(AcquireError::new(
@@ -1104,18 +958,10 @@ impl SshPool {
                 ));
             }
         };
-        let jumps = links
-            .drain(..)
-            .map(|link| JumpLink {
-                handle: Mutex::new(link.handle),
-                transport: link.transport,
-            })
-            .collect();
         Ok(CachedSession {
             connection_identity: identity.clone(),
-            handle: Mutex::new(target_link.handle),
-            transport: target_link.transport,
-            jumps,
+            handle: Mutex::new(link.handle),
+            transport: link.transport,
             opened_at: Instant::now(),
             last_used: AtomicU64::new(now_millis()),
             unhealthy_until: AtomicU64::new(0),
@@ -1124,55 +970,39 @@ impl SshPool {
         })
     }
 
-    /// 逐跳建连,返回 (跳板们, 目标)。任何一步失败,已建好的各跳随返回值 drop 而掐断。
+    /// 建连并认证,返回建好的 [`Link`]。任何一步失败,已建好的连接随返回值 drop 而掐断。
     ///
-    /// 目标的认证在密码轮到之前就被服务器断开(加固过的 sshd `MaxAuthTries` 只有 3、4,
+    /// 认证在密码轮到之前就被服务器断开(加固过的 sshd `MaxAuthTries` 只有 3、4,
     /// agent 里 key 一多就会这样)时,重连一次只试密码与 keyboard-interactive,见
     /// [`AuthRound::WithoutKeys`]。重连同样受 `connect_timeout` 约束,逐方法报错里写明;
     /// 一次 acquire 不管试了几轮,认证失败只记一次冷却。
-    async fn connect_route(
+    async fn connect_target(
         &self,
         conn: &SshConnection,
-        route: &ResolvedRoute,
+        host: &ResolvedHost,
         deadline: tokio::time::Instant,
         tracker: &StageTracker,
         target: &str,
-    ) -> Result<(Vec<Link>, Link), AcquireError> {
-        // 一次建连里各跳共用一个 agent 连接(懒连接,用不到就不连)。
+    ) -> Result<Link, AcquireError> {
+        // 一次建连(含重连那一轮)共用一个 agent 连接(懒连接,用不到就不连)。
         let mut agent = AgentSession::new(self.env.agent.clone());
-        let mut jumps: Vec<Link> = Vec::with_capacity(route.jumps.len());
-        for hop in &route.jumps {
-            let label = format!("jump host {}", hop.endpoint());
-            let (mut link, notes) = self
-                .open_hop(hop, jumps.last(), &label, deadline, tracker, target)
-                .await?;
-            tracker.enter(&label, ConnectStage::Auth);
-            // 密码属于目标连接,有意不用于跳板;跳板只认 key 时报错里写明。
-            let plan = self.auth_plan(
-                hop,
-                format!("jump host {}@{}", hop.user, hop.endpoint()),
-                &PasswordInput::NotForJumpHost,
-                AuthRound::First,
-            );
-            auth::authenticate_host(&mut link.handle, &plan, &mut agent, &notes, tracker)
-                .await
-                .map_err(auth_error)?;
-            jumps.push(link);
-        }
-
-        let hop = &route.target;
-        let label = hop.endpoint();
-        let auth_label = format!("{}@{}", hop.user, hop.endpoint());
+        let label = host.endpoint();
+        let auth_label = format!("{}@{}", host.user, host.endpoint());
         let password = reveal_password(conn.password.as_deref());
         let (mut link, notes) = self
-            .open_hop(hop, jumps.last(), &label, deadline, tracker, target)
+            .open_target(host, &label, deadline, tracker, target)
             .await?;
         tracker.enter(&label, ConnectStage::Auth);
-        let plan = self.auth_plan(hop, auth_label.clone(), &password, AuthRound::First);
+        let plan = AuthPlan {
+            host,
+            label: auth_label.clone(),
+            password: &password,
+            round: AuthRound::First,
+        };
         let first =
             auth::authenticate_host(&mut link.handle, &plan, &mut agent, &notes, tracker).await;
         let earlier = match first {
-            Ok(()) => return Ok((jumps, link)),
+            Ok(()) => return Ok(link),
             Err(AuthError::RetryWithoutKeys { notes: earlier, .. }) => earlier,
             Err(other) => return Err(auth_error(other)),
         };
@@ -1186,43 +1016,26 @@ impl SshPool {
         drop(link);
         let label = format!("{label} (reconnected for password authentication)");
         let (mut link, notes) = self
-            .open_hop(hop, jumps.last(), &label, deadline, tracker, target)
+            .open_target(host, &label, deadline, tracker, target)
             .await?;
         tracker.enter(&label, ConnectStage::Auth);
-        let plan = self.auth_plan(
-            hop,
-            auth_label,
-            &password,
-            AuthRound::WithoutKeys { earlier },
-        );
+        let plan = AuthPlan {
+            host,
+            label: auth_label,
+            password: &password,
+            round: AuthRound::WithoutKeys { earlier },
+        };
         auth::authenticate_host(&mut link.handle, &plan, &mut agent, &notes, tracker)
             .await
             .map_err(auth_error)?;
-        Ok((jumps, link))
+        Ok(link)
     }
 
-    fn auth_plan<'a>(
+    /// 连上目标的 TCP 并握手。返回的 [`Link`] drop 即掐断传输;建到一半失败或超时丢弃时
+    /// 同样掐断。
+    async fn open_target(
         &self,
-        hop: &'a ResolvedHost,
-        label: String,
-        password: &'a PasswordInput,
-        round: AuthRound,
-    ) -> AuthPlan<'a> {
-        AuthPlan {
-            host: hop,
-            label,
-            password,
-            default_key_dir: self.env.home_dir.as_ref().map(|home| home.join(".ssh")),
-            round,
-        }
-    }
-
-    /// 建好一跳的传输并握手:第一跳走 TCP,其后经上一跳(`previous`)的 direct-tcpip 隧道。
-    /// 返回的 [`Link`] drop 即掐断传输;建到一半失败或超时丢弃时同样掐断。
-    async fn open_hop(
-        &self,
-        hop: &ResolvedHost,
-        previous: Option<&Link>,
+        host: &ResolvedHost,
         label: &str,
         deadline: tokio::time::Instant,
         tracker: &StageTracker,
@@ -1233,60 +1046,31 @@ impl SshPool {
         // future,它都会随之 drop。
         let transport = KillOnDrop::new(kill.clone());
         let notes = Arc::new(ClientNotes::default());
-        let handle = match previous {
-            None => {
-                let tcp = transport::connect_tcp(
-                    &hop.host_name,
-                    hop.port,
-                    label,
-                    deadline,
-                    self.config.connect_timeout_per_address,
-                    tracker,
-                )
-                .await
-                .map_err(|e| match e {
-                    transport::TcpConnectError::Resolve(message)
-                    | transport::TcpConnectError::Failed(message) => AcquireError::new(
-                        AcquireErrorKind::Network,
-                        format!("ssh connect to {label} failed: {message}"),
-                    ),
-                    transport::TcpConnectError::DeadlineExceeded => AcquireError::new(
-                        AcquireErrorKind::Timeout,
-                        tracker.describe_timeout(target, self.config.connect_timeout),
-                    ),
-                })?;
-                // 不设 TCP_NODELAY:与此前 `client::connect`(russh 默认 `nodelay =
-                // false`)的行为保持一致。
-                tracker.enter(label, ConnectStage::Handshake);
-                tracker.watch_stream(&kill);
-                self.handshake(kill.wrap(tcp), hop, label, &notes).await?
-            }
-            Some(previous) => {
-                tracker.enter(label, ConnectStage::Tunnel);
-                let channel = previous
-                    .handle
-                    .channel_open_direct_tcpip(
-                        hop.host_name.clone(),
-                        u32::from(hop.port),
-                        "127.0.0.1",
-                        0,
-                    )
-                    .await
-                    .map_err(|e| {
-                        AcquireError::new(
-                            AcquireErrorKind::Network,
-                            format!(
-                                "ssh connect to {label} failed: the previous jump host refused \
-                                 to open a tunnel to it ({e})"
-                            ),
-                        )
-                    })?;
-                tracker.enter(label, ConnectStage::Handshake);
-                tracker.watch_stream(&kill);
-                self.handshake(kill.wrap(channel.into_stream()), hop, label, &notes)
-                    .await?
-            }
-        };
+        let tcp = transport::connect_tcp(
+            &host.host_name,
+            host.port,
+            label,
+            deadline,
+            self.config.connect_timeout_per_address,
+            tracker,
+        )
+        .await
+        .map_err(|e| match e {
+            transport::TcpConnectError::Resolve(message)
+            | transport::TcpConnectError::Failed(message) => AcquireError::new(
+                AcquireErrorKind::Network,
+                format!("ssh connect to {label} failed: {message}"),
+            ),
+            transport::TcpConnectError::DeadlineExceeded => AcquireError::new(
+                AcquireErrorKind::Timeout,
+                tracker.describe_timeout(target, self.config.connect_timeout),
+            ),
+        })?;
+        // 不设 TCP_NODELAY:与此前 `client::connect`(russh 默认 `nodelay =
+        // false`)的行为保持一致。
+        tracker.enter(label, ConnectStage::Handshake);
+        tracker.watch_stream(&kill);
+        let handle = self.handshake(kill.wrap(tcp), host, label, &notes).await?;
         Ok((Link { handle, transport }, notes))
     }
 
@@ -1294,7 +1078,7 @@ impl SshPool {
     async fn handshake<S>(
         &self,
         stream: GuardedStream<S>,
-        hop: &ResolvedHost,
+        host: &ResolvedHost,
         label: &str,
         notes: &Arc<ClientNotes>,
     ) -> Result<Handle<MtClient>, AcquireError>
@@ -1308,7 +1092,7 @@ impl SshPool {
             .and_then(|raw| {
                 known_hosts::preferred_host_key_algorithms(&known_hosts::known_host_key_types(
                     &raw,
-                    &hop.known_hosts_name,
+                    &host.known_hosts_name,
                 ))
             });
         // 不设 `inactivity_timeout`(russh 默认 None):
@@ -1326,7 +1110,7 @@ impl SshPool {
             ..Default::default()
         });
         let handler = MtClient::new(
-            hop.known_hosts_name.clone(),
+            host.known_hosts_name.clone(),
             self.env.known_hosts_path.clone(),
             Arc::clone(notes),
         );
@@ -1345,7 +1129,7 @@ impl SshPool {
     }
 }
 
-/// 建连途中的一跳:会话 handle + 它底层传输的掐断开关。
+/// 建好的连接:会话 handle + 它底层传输的掐断开关。
 struct Link {
     handle: Handle<MtClient>,
     transport: KillOnDrop,
@@ -1478,7 +1262,7 @@ fn retire_removed_session(session: Arc<CachedSession>, timeout: Duration) {
     }
 }
 
-/// 后台异步 disconnect 一条 session(连同它的跳板),带超时;到点即掐断传输,
+/// 后台异步 disconnect 一条 session,带超时;到点即掐断传输,
 /// 失败静默(stderr 一行)。
 fn spawn_disconnect(s: Arc<CachedSession>, timeout: Duration) {
     tokio::spawn(async move {
@@ -1897,7 +1681,7 @@ pub async fn run_sftp_download_on_session(
 /// 配置里的 password 是 `mt-secret` 的信封(或升级窗口期的遗留明文),**在这里**
 /// 解开 —— 主程序与三个 sidecar 共用这个池,解封点唯一就不会有谁忘了。
 /// 解不开(密钥换了 / 密文被改)只记进报错(`password: stored password unavailable`),
-/// 照样去试别的方法,绝不把密文当密码送出去;错误文本不含密码。跳板不传密码。
+/// 照样去试别的方法,绝不把密文当密码送出去;错误文本不含密码。
 fn reveal_password(stored: Option<&str>) -> PasswordInput {
     match stored.filter(|p| !p.is_empty()) {
         Some(stored) => match mt_secret::reveal_global(stored) {
@@ -1940,23 +1724,17 @@ mod tests {
         }
     }
 
-    /// 不读 ssh config、没有 home 的路线解析(纯函数测试用)。
-    fn plain_route(conn: &SshConnection) -> ResolvedRoute {
-        let env = RouteEnv {
-            ssh_config_path: None,
-            home: None,
-            local_user: Some("me"),
-            tolerate_unreadable: false,
-        };
-        ssh_config::resolve_route(conn, &env).unwrap()
+    /// 没有 home 的目标解析(纯函数测试用)。
+    fn plain_target(conn: &SshConnection) -> ResolvedHost {
+        target::resolve_target(conn, None, Some("me")).unwrap()
     }
 
     fn identity_of(conn: &SshConnection) -> CachedConnectionIdentity {
-        CachedConnectionIdentity::new(conn, plain_route(conn))
+        CachedConnectionIdentity::new(conn, plain_target(conn))
     }
 
     #[test]
-    fn cached_connection_identity_tracks_endpoint_credentials_and_route() {
+    fn cached_connection_identity_tracks_endpoint_and_credentials() {
         let base = connection("ssh");
         let identity = identity_of(&base);
         assert!(identity == identity_of(&base));
@@ -1992,11 +1770,6 @@ mod tests {
             ..base.clone()
         };
         assert!(identity == identity_of(&display_only));
-
-        // 连接配置一字未动,但 ssh config 把它解析到了别处:不能复用到旧目标上。
-        let mut rerouted = plain_route(&base);
-        rerouted.target.host_name = "elsewhere.example.com".into();
-        assert!(identity != CachedConnectionIdentity::new(&base, rerouted));
     }
 
     #[test]
@@ -2216,19 +1989,17 @@ mod tests {
         let env = SshClientEnv::isolated(path.clone());
         assert_eq!(env.known_hosts_path, path);
         assert_eq!(env.home_dir, None);
-        assert_eq!(env.ssh_config_path, None);
         assert_eq!(env.agent, AgentSource::Disabled);
         assert_eq!(env.local_user, None);
     }
 
     #[test]
-    fn system_env_points_at_the_users_ssh_directory() {
-        // 只看路径的拼法,不读任何文件。
+    fn system_env_uses_only_known_hosts_from_the_users_ssh_directory() {
+        // 只看路径的拼法,不读任何文件。`~/.ssh` 里只有 known_hosts 这一个路径。
         let env = SshClientEnv::system();
         assert_eq!(env.agent, AgentSource::System);
         if let Some(home) = &env.home_dir {
             assert_eq!(env.known_hosts_path, home.join(".ssh").join("known_hosts"));
-            assert_eq!(env.ssh_config_path, Some(home.join(".ssh").join("config")));
         }
     }
 
@@ -2470,91 +2241,5 @@ mod tests {
         drop(second);
         drop(other);
         assert!(pool.flights.lock().unwrap().is_empty());
-    }
-
-    /// 写一份测试用的 ssh config(Unix 上收紧权限,免得被当成「Bad owner or permissions」)。
-    fn set_private(path: &std::path::Path, mode: u32) {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
-        }
-        #[cfg(not(unix))]
-        let _ = (path, mode);
-    }
-
-    fn write_config(path: &std::path::Path, text: &str) {
-        std::fs::write(path, text).unwrap();
-        set_private(path, 0o600);
-    }
-
-    #[tokio::test]
-    async fn route_choice_keeps_the_last_route_when_the_config_is_unreadable_or_broken() {
-        // 测试专用 home,绝不碰真实 `~/.ssh`。
-        let dir =
-            std::env::temp_dir().join(format!("mt-ssh-pool-route-choice-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join(".ssh")).unwrap();
-        let config = dir.join(".ssh").join("config");
-        let env = SshClientEnv {
-            home_dir: Some(dir.clone()),
-            ssh_config_path: Some(config.clone()),
-            known_hosts_path: dir.join(".ssh").join("known_hosts"),
-            agent: AgentSource::Disabled,
-            local_user: Some("me".into()),
-        };
-        let pool = SshPool::with_env(PoolConfig::default(), env);
-        let usable = |choice: RouteChoice| match choice {
-            RouteChoice::Usable(route) => route,
-            RouteChoice::ReuseOnly { error, .. } => panic!("expected a usable route: {error}"),
-        };
-
-        write_config(
-            &config,
-            "Host svc\n\tHostName real.example.com\n\tPort 2200\n",
-        );
-        let conn = SshConnection {
-            host: "svc".into(),
-            ..connection("svc")
-        };
-        let first = usable(pool.choose_route(&conn).unwrap());
-        assert_eq!(first.target.host_name, "real.example.com");
-
-        // 读不了(这里是被换成了目录):沿用上次的路线,照常可以新建。
-        std::fs::remove_file(&config).unwrap();
-        std::fs::create_dir(&config).unwrap();
-        set_private(&config, 0o700);
-        assert_eq!(usable(pool.choose_route(&conn).unwrap()), first);
-        // 连接改了:上次的路线不再适用,只好跳过读不了的文件(别名原样当主机名)。
-        let edited = SshConnection {
-            port: 2222,
-            ..conn.clone()
-        };
-        let skipped = usable(pool.choose_route(&edited).unwrap());
-        assert_eq!(skipped.target.host_name, "svc");
-        assert_eq!(skipped.target.port, 2222);
-
-        // 写坏了:上次的路线只用来复用,要新建时报 Config。
-        std::fs::remove_dir(&config).unwrap();
-        write_config(&config, "Host svc\n\tPort abc\n");
-        match pool.choose_route(&conn).unwrap() {
-            RouteChoice::ReuseOnly { route, error } => {
-                assert_eq!(route, first);
-                assert_eq!(error.kind, AcquireErrorKind::Config);
-                assert!(
-                    error.message.contains("invalid Port value 'abc'"),
-                    "{error}"
-                );
-            }
-            RouteChoice::Usable(_) => panic!("a broken config must not be used to build"),
-        }
-        // 从没解析成功过的连接:直接报 Config。
-        let other = SshConnection {
-            id: "other".into(),
-            ..conn.clone()
-        };
-        let error = pool.choose_route(&other).err().expect("config error");
-        assert_eq!(error.kind, AcquireErrorKind::Config);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

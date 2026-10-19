@@ -17,7 +17,35 @@ use std::sync::Arc;
 use russh::client::Handler;
 
 use crate::auth::{ClientNotes, SessionEnd};
-use crate::ssh_config::match_pattern;
+
+/// OpenSSH `match_pattern`:`*` 匹配任意长(含空)串,`?` 恰好一个字符,其余逐字符
+/// 相等(区分大小写 —— 需要不敏感的调用方自己先转小写)。
+fn match_pattern(text: &str, pattern: &str) -> bool {
+    let text: Vec<char> = text.chars().collect();
+    let pattern: Vec<char> = pattern.chars().collect();
+    let (mut t, mut p) = (0usize, 0usize);
+    // 最近一个 `*` 之后的模式位置,以及它当前吞到的文本位置(回溯用)。
+    let mut star: Option<(usize, usize)> = None;
+    while t < text.len() {
+        if p < pattern.len() && (pattern[p] == '?' || pattern[p] == text[t]) {
+            t += 1;
+            p += 1;
+        } else if p < pattern.len() && pattern[p] == '*' {
+            star = Some((p + 1, t));
+            p += 1;
+        } else if let Some((after_star, swallowed)) = star {
+            p = after_star;
+            t = swallowed + 1;
+            star = Some((after_star, swallowed + 1));
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len() && pattern[p] == '*' {
+        p += 1;
+    }
+    p == pattern.len()
+}
 
 /// 读 known_hosts 全文。
 ///
@@ -334,7 +362,7 @@ pub(crate) fn append_known_host(
 /// 拼连接失败的错误文本。主机密钥被 [`MtClient`] 拒绝时换成它记下的具体原因
 /// (文件路径 / 行号 / 读失败),而不是 russh 泛泛的 "Unknown server key"。
 ///
-/// `hop` 是这一跳的可读描述(`example.com:22` / `jump host bastion:22`)。
+/// `hop` 是目标的可读描述(`example.com:22`)。
 pub(crate) fn connect_error(
     hop: &str,
     err: &dyn std::fmt::Display,
@@ -346,11 +374,10 @@ pub(crate) fn connect_error(
     }
 }
 
-/// russh Handler 实现:每条 session(含 ProxyJump 的每一跳)一个实例,负责主机密钥校验,
-/// 并记下会话结束的原因。
+/// russh Handler 实现:每条 session 一个实例,负责主机密钥校验,并记下会话结束的原因。
 pub struct MtClient {
-    /// known_hosts 查找 / 写入用的名字:ssh config 的 `HostKeyAlias` 原样,否则
-    /// 解析后的 HostName 按 [`host_pattern`] 带上端口(OpenSSH 同一口径)。
+    /// known_hosts 查找 / 写入用的名字:主机名按 [`host_pattern`] 带上端口(OpenSSH
+    /// 同一口径)。
     known_hosts_name: String,
     known_hosts_path: PathBuf,
     /// 与建连方共享的旁路信息。主机密钥被拒后 russh 只报泛泛的 "Unknown server key",
@@ -484,6 +511,27 @@ impl Handler for MtClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn match_pattern_wildcards() {
+        assert!(match_pattern("", "*"));
+        assert!(match_pattern("anything", "*"));
+        assert!(match_pattern("abc", "a?c"));
+        assert!(!match_pattern("ac", "a?c"));
+        assert!(match_pattern("h.example.com", "*.example.com"));
+        assert!(!match_pattern("example.com", "*.example.com"));
+        assert!(match_pattern("a.b.c", "a*c"));
+        assert!(match_pattern(
+            "[h.example.com]:2222",
+            "[*.example.com]:2222"
+        ));
+        assert!(
+            !match_pattern("Host", "host"),
+            "match_pattern 本身区分大小写"
+        );
+        assert!(match_pattern("aaab", "*a*b"));
+        assert!(!match_pattern("aaa", "*a*b"));
+    }
 
     // --- match_known_host fixture helpers ----------------------------------
     //
@@ -1149,8 +1197,8 @@ mod tests {
             "ssh connect to h:22 failed: host key verification failed: x"
         );
         assert_eq!(
-            connect_error("jump host j:2222", &generic, None),
-            "ssh connect to jump host j:2222 failed: Unknown server key"
+            connect_error("j:2222", &generic, None),
+            "ssh connect to j:2222 failed: Unknown server key"
         );
     }
 

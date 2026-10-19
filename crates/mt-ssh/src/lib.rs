@@ -6,9 +6,9 @@
 //! 池实例。本 crate **不依赖 tauri / rmcp**;MCP 胶水、工具 schema、审计日志等
 //! sidecar 专属逻辑仍留在 `mt-sidecars`。
 //!
-//! 建连行为对齐终端里的系统 ssh:读 `~/.ssh/config`(`ssh_config`)、认证依次试显式
-//! 私钥 / ssh-agent / 默认私钥 / 密码(`auth`)、known_hosts 支持通配与 `@revoked`
-//! (`known_hosts`)、建连整段限时且超时不泄漏 russh 任务(`transport`)。
+//! 建连只看连接配置本身(`target`),`~/.ssh` 里只碰 known_hosts(支持通配与
+//! `@revoked`,`known_hosts`):不读 `~/.ssh/config`、不试默认私钥。认证依次试连接私钥 /
+//! ssh-agent / 密码(`auth`),建连整段限时且超时不泄漏 russh 任务(`transport`)。
 //!
 //! 依赖版本注意:russh 用 ring 后端(Windows MSVC 无 NASM,见
 //! spec/backend/rust-crypto-on-windows-msvc.md);ssh-key / rsa 精确锁定(见
@@ -19,7 +19,7 @@ mod known_hosts;
 pub mod pool;
 pub mod sftp;
 mod sftp_transfer;
-mod ssh_config;
+mod target;
 mod transport;
 
 /// 再导出 russh:消费方(如 mt-ssh-mcp 对 `ChannelMsg` 的匹配)必须与池用同一个

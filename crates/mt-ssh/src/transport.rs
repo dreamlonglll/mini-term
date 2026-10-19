@@ -110,7 +110,7 @@ impl Drop for KillOnDrop {
     }
 }
 
-/// 套在 TCP 流 / 跳板 direct-tcpip 通道流外面的可掐断包装,见模块注释。
+/// 套在 TCP 流外面的可掐断包装,见模块注释。
 pub(crate) struct GuardedStream<S> {
     inner: S,
     state: Arc<KillState>,
@@ -191,8 +191,6 @@ pub(crate) enum ConnectStage {
     Resolve,
     /// TCP 连接(逐个地址尝试)。
     TcpConnect,
-    /// 经上一跳开 direct-tcpip 隧道(ProxyJump)。
-    Tunnel,
     /// SSH 标识串交换 + 密钥交换(含主机密钥校验)。
     Handshake,
     /// 认证。
@@ -201,7 +199,7 @@ pub(crate) enum ConnectStage {
 
 #[derive(Default)]
 struct TrackerState {
-    /// 当前这一跳的可读描述(`example.com:22` / `jump host bastion:22`)。
+    /// 当前在连的那一端的可读描述(`example.com:22`)。
     hop: String,
     stage: Option<ConnectStage>,
     /// 当前阶段的补充说明(已试过的地址、正在等的认证方法……)。
@@ -250,7 +248,6 @@ impl StageTracker {
                 None => "before the connection attempt started".to_string(),
                 Some(ConnectStage::Resolve) => format!("during DNS resolution of {hop}"),
                 Some(ConnectStage::TcpConnect) => format!("during TCP connect to {hop}"),
-                Some(ConnectStage::Tunnel) => format!("while opening a tunnel to {hop}"),
                 Some(ConnectStage::Handshake) => format!("during SSH handshake with {hop}"),
                 Some(ConnectStage::Auth) => format!("during authentication on {hop}"),
             };
@@ -678,18 +675,18 @@ mod tests {
         let text = tracker.describe_timeout("u@h:22", budget);
         assert!(text.contains("the key exchange did not complete"), "{text}");
 
-        tracker.enter("jump host j:22", ConnectStage::Auth);
+        tracker.enter("h:22", ConnectStage::Auth);
         tracker.set_detail("waiting for: password");
         assert_eq!(
             tracker.describe_timeout("u@h:22", budget),
-            "ssh connection to u@h:22 timed out after 20s during authentication on jump host j:22 \
+            "ssh connection to u@h:22 timed out after 20s during authentication on h:22 \
              (waiting for: password)"
         );
 
-        tracker.enter("h:22", ConnectStage::Tunnel);
+        tracker.enter("h:22", ConnectStage::TcpConnect);
         let text = tracker.describe_timeout("u@h:22", Duration::from_millis(1500));
         assert!(
-            text.contains("timed out after 1.5s while opening a tunnel to h:22"),
+            text.contains("timed out after 1.5s during TCP connect to h:22"),
             "{text}"
         );
     }

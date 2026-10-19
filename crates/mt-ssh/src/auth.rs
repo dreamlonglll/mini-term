@@ -1,13 +1,13 @@
-//! 认证:按 OpenSSH 的习惯组织公钥候选(显式私钥 / ssh-agent / 默认私钥),再试
-//! password 与 keyboard-interactive;每种方法的结果都记下来,全部失败时拼成一条可读的
-//! 报错(绝不含密码或私钥内容)。
+//! 认证:公钥候选是连接里配的私钥与 ssh-agent 里的 key,再试 password 与
+//! keyboard-interactive;每种方法的结果都记下来,全部失败时拼成一条可读的报错(绝不含
+//! 密码或私钥内容)。不试默认私钥 `~/.ssh/id_*`:`~/.ssh` 里本 crate 只碰 known_hosts。
 //!
-//! 与终端里的系统 ssh 对齐的要点:
+//! 要点:
 //!
 //! - 先发 `none` 拿服务器允许的方法表(OpenSSH 同样如此,且 sshd 不把这次计入失败),
 //!   之后只试服务器允许的方法;
 //! - 私钥加载失败(不存在 / 带口令 / 格式不支持 / `~` 展不开)只记原因,继续试别的;
-//! - 带口令的私钥、以及 `IdentityFile` 指向的公钥文件(`key.pub`),若 ssh-agent 里有同一把,
+//! - 带口令的私钥、以及配成私钥的公钥文件(`key.pub`),若 ssh-agent 里有同一把,
 //!   经 agent 签名使用(OpenSSH 的效果相同:它会让 agent 签名而不是弹口令框);
 //! - 公钥尝试有上限,保证配了密码时密码一定有机会,见 [`MAX_PUBLICKEY_ATTEMPTS`];服务器的
 //!   `MaxAuthTries` 比默认还小、密码没轮到就被断开时,由会话池重连一次只试密码
@@ -31,7 +31,7 @@ use russh::keys::agent::client::{AgentClient, AgentStream};
 
 use crate::known_hosts::MtClient;
 use crate::pool::AgentSource;
-use crate::ssh_config::{IdentityOrigin, IdentitySpec, ResolvedHost};
+use crate::target::{IdentitySpec, ResolvedHost};
 use crate::transport::StageTracker;
 
 /// sshd 的 `MaxAuthTries` 默认值:失败计到这个数就直接断开连接
@@ -61,11 +61,6 @@ const MAX_KEYBOARD_INTERACTIVE_ROUNDS: usize = 4;
 
 /// 等 russh 会话任务收尾(拿到断开原因)的上限。
 const SESSION_END_GRACE: Duration = Duration::from_millis(500);
-
-/// 默认私钥,没有任何显式私钥(连接配置 / ssh config `IdentityFile`)时依次尝试。
-/// OpenSSH 的默认表把 `id_rsa` 放最前;这里让 ed25519 打头 —— 现代服务器都接受它,
-/// 少一次被拒就离 `MaxAuthTries` 远一步。
-pub(crate) const DEFAULT_KEY_FILES: [&str; 3] = ["id_ed25519", "id_ecdsa", "id_rsa"];
 
 /// Windows OpenSSH 的 ssh-agent 服务监听的命名管道。
 #[cfg(windows)]
@@ -134,7 +129,7 @@ pub(crate) enum KeyLoad {
     Encrypted {
         public: Option<PublicKey>,
     },
-    /// 文件本身是公钥(`IdentityFile ~/.ssh/key.pub`,1Password 等 agent 推荐的写法):
+    /// 文件本身是公钥(私钥配成 `key.pub`,1Password 等 agent 推荐的写法):
     /// 与带口令的私钥一样,只能到 ssh-agent 里找同一把来签名(OpenSSH 的效果相同)。
     PublicOnly {
         public: PublicKey,
@@ -283,7 +278,7 @@ enum AgentState {
     },
 }
 
-/// 一次建连里共用的 ssh-agent 连接(ProxyJump 的每一跳都用同一个),懒连接。
+/// 一次建连里共用的 ssh-agent 连接(重连只试密码的那一轮也用同一个),懒连接。
 pub(crate) struct AgentSession {
     source: AgentSource,
     state: AgentState,
@@ -541,19 +536,12 @@ fn with_placeholder_signature(
 pub(crate) enum PasswordInput {
     /// 连接没配密码。
     NotConfigured,
-    /// 跳板:密码属于目标连接,有意不用于跳板(只用 key 登录跳板)。
-    NotForJumpHost,
     /// 已存密码解不开(信封换了钥匙 / 被改过)。绝不把密文当密码送出去。
     Unavailable(String),
     Available(String),
 }
 
-/// 跳板只允许密码类方法时的说明:密码有意不用于跳板,报错要写清楚是跳板认证失败、该怎么办。
-const JUMP_HOST_PASSWORD_NOTE: &str = "password: not used for jump hosts (mini-term signs in to \
-     a jump host with keys only: ssh-agent, an IdentityFile for the jump host in ssh config, or \
-     the default keys ~/.ssh/id_*; the saved password belongs to the target connection)";
-
-/// 这一跳是第几轮认证。
+/// 这是第几轮认证。
 pub(crate) enum AuthRound {
     /// 按 OpenSSH 的顺序:公钥,再密码 / keyboard-interactive。
     First,
@@ -563,14 +551,12 @@ pub(crate) enum AuthRound {
     WithoutKeys { earlier: Vec<String> },
 }
 
-/// 一跳的认证计划。
+/// 一次认证的计划。
 pub(crate) struct AuthPlan<'a> {
     pub(crate) host: &'a ResolvedHost,
-    /// 报错里的身份描述(`deploy@example.com:22` / `jump host jumper@bastion:22`)。
+    /// 报错里的身份描述(`deploy@example.com:22`)。
     pub(crate) label: String,
     pub(crate) password: &'a PasswordInput,
-    /// 默认私钥所在目录(`~/.ssh`);home 未知时为 `None`,不试默认私钥。
-    pub(crate) default_key_dir: Option<PathBuf>,
     pub(crate) round: AuthRound,
 }
 
@@ -620,7 +606,7 @@ impl AuthReport {
         if self.notes.is_empty() {
             format!(
                 "authentication failed for {} (server allows: {methods}): no usable credential \
-                 (no identity file, no ssh-agent identity, no default key, no password)",
+                 (no identity file, no ssh-agent identity, no password)",
                 self.label
             )
         } else {
@@ -671,14 +657,7 @@ impl KeyCandidate {
 }
 
 fn describe_identity(spec: &IdentitySpec) -> String {
-    match spec.origin {
-        IdentityOrigin::Connection => {
-            format!("identity file {} (connection setting)", spec.display)
-        }
-        IdentityOrigin::SshConfig => {
-            format!("identity file {} (ssh config IdentityFile)", spec.display)
-        }
-    }
+    format!("identity file {} (connection setting)", spec.display)
 }
 
 fn describe_agent_key(key: &AgentKey) -> String {
@@ -695,25 +674,14 @@ fn describe_agent_key(key: &AgentKey) -> String {
     }
 }
 
-/// 按 OpenSSH 的习惯排公钥候选并去重(同一把公钥只试一次):
-/// - 有显式私钥:显式私钥在前,agent 里的其余 key 在后;
-/// - 没有:agent 的 key 在前,默认私钥在后。
-///
-/// `IdentitiesOnly yes` 时调用方传空的 `agent_keys`(经 agent 签名的加密显式私钥不受影响,
-/// 它们已经在 `explicit` / `defaults` 里)。抽成纯函数便于单测。
+/// 按 OpenSSH 的习惯排公钥候选并去重(同一把公钥只试一次):连接里配的私钥在前,
+/// agent 里的其余 key 在后。抽成纯函数便于单测。
 fn assemble_candidates(
-    explicit: Vec<KeyCandidate>,
+    explicit: Option<KeyCandidate>,
     agent_keys: Vec<KeyCandidate>,
-    defaults: Vec<KeyCandidate>,
-    has_explicit: bool,
 ) -> Vec<KeyCandidate> {
-    let ordered: Vec<KeyCandidate> = if has_explicit {
-        explicit.into_iter().chain(agent_keys).collect()
-    } else {
-        agent_keys.into_iter().chain(defaults).collect()
-    };
-    let mut out: Vec<KeyCandidate> = Vec::with_capacity(ordered.len());
-    for candidate in ordered {
+    let mut out: Vec<KeyCandidate> = Vec::with_capacity(agent_keys.len() + 1);
+    for candidate in explicit.into_iter().chain(agent_keys) {
         let duplicate = out
             .iter()
             .any(|seen| seen.public().key_data() == candidate.public().key_data());
@@ -724,12 +692,10 @@ fn assemble_candidates(
     out
 }
 
-/// 读一个私钥文件变成候选;读不了只记原因。`quiet_if_missing` 用于默认私钥:不存在
-/// 很正常,不必写进报错。
+/// 读一个私钥文件变成候选;读不了只记原因。
 async fn file_candidate(
     path: &Path,
     label: String,
-    quiet_if_missing: bool,
     agent: &mut AgentSession,
     report: &mut AuthReport,
 ) -> Option<KeyCandidate> {
@@ -765,12 +731,11 @@ async fn file_candidate(
             }
             report.note(format!(
                 "{label}: is a public key, and ssh-agent does not hold the matching private key (a \
-                 public key IdentityFile is only usable through ssh-agent){}",
+                 public key file is only usable through ssh-agent){}",
                 agent.unavailable_note()
             ));
             None
         }
-        KeyLoad::NotFound if quiet_if_missing => None,
         KeyLoad::NotFound => {
             report.note(format!("{label}: file not found"));
             None
@@ -810,51 +775,16 @@ async fn collect_candidates(
     agent: &mut AgentSession,
     report: &mut AuthReport,
 ) -> Vec<KeyCandidate> {
-    let host = plan.host;
-    let mut explicit = Vec::new();
-    for spec in &host.identities {
+    let mut explicit = None;
+    if let Some(spec) = &plan.host.identity {
         let label = describe_identity(spec);
         match &spec.path {
-            Ok(path) => {
-                if let Some(candidate) = file_candidate(path, label, false, agent, report).await {
-                    explicit.push(candidate);
-                }
-            }
+            Ok(path) => explicit = file_candidate(path, label, agent, report).await,
             Err(reason) => report.note(format!("{label}: {reason}")),
         }
     }
-    // agent 的 key 在显式私钥之后 / 默认私钥之前;IdentitiesOnly 时不用。
-    let agent_keys = if host.identities_only {
-        Vec::new()
-    } else {
-        agent_candidates(agent, report).await
-    };
-    let mut defaults = Vec::new();
-    if !host.explicit_identities {
-        match &plan.default_key_dir {
-            Some(dir) => {
-                let mut any_exists = false;
-                for name in DEFAULT_KEY_FILES {
-                    let path = dir.join(name);
-                    any_exists |= path.exists();
-                    let label = format!("default key ~/.ssh/{name}");
-                    if let Some(candidate) = file_candidate(&path, label, true, agent, report).await
-                    {
-                        defaults.push(candidate);
-                    }
-                }
-                if !any_exists {
-                    report.note(format!(
-                        "default keys: none found in {} ({})",
-                        dir.display(),
-                        DEFAULT_KEY_FILES.join(", ")
-                    ));
-                }
-            }
-            None => report.note("default keys: home directory unknown, not tried"),
-        }
-    }
-    assemble_candidates(explicit, agent_keys, defaults, host.explicit_identities)
+    let agent_keys = agent_candidates(agent, report).await;
+    assemble_candidates(explicit, agent_keys)
 }
 
 /// 本次连接里服务器偏好的 RSA 签名哈希(查一次缓存起来)。服务器没发 server-sig-algs
@@ -984,7 +914,7 @@ fn offer_retry_without_keys(
     }
 }
 
-/// 认证一跳。`notes` 是这条连接的 [`MtClient`] 共享出来的旁路信息。
+/// 认证目标。`notes` 是这条连接的 [`MtClient`] 共享出来的旁路信息。
 pub(crate) async fn authenticate_host(
     handle: &mut Handle<MtClient>,
     plan: &AuthPlan<'_>,
@@ -1128,13 +1058,6 @@ pub(crate) async fn authenticate_host(
                 || methods.contains(&MethodKind::KeyboardInteractive)
             {
                 report.note("password: not configured");
-            }
-        }
-        PasswordInput::NotForJumpHost => {
-            if methods.contains(&MethodKind::Password)
-                || methods.contains(&MethodKind::KeyboardInteractive)
-            {
-                report.note(JUMP_HOST_PASSWORD_NOTE);
             }
         }
         PasswordInput::Unavailable(reason) => {
@@ -1378,23 +1301,23 @@ v9aDxRcrMAaNVKMzZbmEjucR5L+VMM5njNnS4=
 
     #[test]
     fn candidates_follow_openssh_order_and_dedupe() {
-        // 有显式私钥:显式在前,agent 在后;agent 里与显式私钥相同的那把不再重复。
+        // 连接私钥在前,agent 在后;agent 里与连接私钥相同的那把不再重复。
         let ordered = assemble_candidates(
-            vec![local("explicit", 1)],
+            Some(local("explicit", 1)),
             vec![from_agent("agent-dup", 1), from_agent("agent-b", 2)],
-            vec![local("default", 3)],
-            true,
         );
         assert_eq!(labels(&ordered), ["explicit", "agent-b"]);
 
-        // 没有显式私钥:agent 在前,默认私钥在后;与 agent 重复的默认私钥跳过。
+        // 没配私钥:只有 agent 的 key(不试默认私钥),agent 自己重复的也只试一次。
         let ordered = assemble_candidates(
-            Vec::new(),
-            vec![from_agent("agent-a", 4), from_agent("agent-b", 5)],
-            vec![local("default-dup", 4), local("default-c", 6)],
-            false,
+            None,
+            vec![
+                from_agent("agent-a", 4),
+                from_agent("agent-b", 5),
+                from_agent("agent-a-dup", 4),
+            ],
         );
-        assert_eq!(labels(&ordered), ["agent-a", "agent-b", "default-c"]);
+        assert_eq!(labels(&ordered), ["agent-a", "agent-b"]);
     }
 
     #[cfg(windows)]
@@ -1574,7 +1497,7 @@ ipMBLNlhlJHNKVmgnpLBSiUoO5fDWn1KcwvQouOC3U3hSMAPnT+7
 
     #[test]
     fn public_key_identity_files_are_recognised() {
-        // `IdentityFile ~/.ssh/key.pub`(1Password 推荐的写法):认成公钥,交给 agent 签名。
+        // 私钥配成 `key.pub`(1Password 推荐的写法):认成公钥,交给 agent 签名。
         let dir = temp_dir("public-only");
         let key = seeded_key(9);
         let path = dir.join("key.pub");
@@ -1661,13 +1584,10 @@ ipMBLNlhlJHNKVmgnpLBSiUoO5fDWn1KcwvQouOC3U3hSMAPnT+7
 
     fn test_host() -> ResolvedHost {
         ResolvedHost {
-            alias: "h".into(),
             host_name: "h".into(),
             port: 22,
             user: "u".into(),
-            identities: Vec::new(),
-            explicit_identities: false,
-            identities_only: false,
+            identity: None,
             known_hosts_name: "h".into(),
         }
     }
@@ -1681,7 +1601,6 @@ ipMBLNlhlJHNKVmgnpLBSiUoO5fDWn1KcwvQouOC3U3hSMAPnT+7
             host,
             label: "u@h:22".into(),
             password,
-            default_key_dir: None,
             round,
         }
     }
@@ -1736,8 +1655,11 @@ ipMBLNlhlJHNKVmgnpLBSiUoO5fDWn1KcwvQouOC3U3hSMAPnT+7
             offer_retry_without_keys(rejected(), &retried, &all, &report),
             AuthError::Rejected(_)
         ));
-        // 没配密码 / 跳板:没有可试的密码。
-        for no_password in [PasswordInput::NotConfigured, PasswordInput::NotForJumpHost] {
+        // 没配密码 / 密码解不开:没有可试的密码。
+        for no_password in [
+            PasswordInput::NotConfigured,
+            PasswordInput::Unavailable("undecryptable".into()),
+        ] {
             let plan = test_plan(&host, &no_password, AuthRound::First);
             assert!(matches!(
                 offer_retry_without_keys(rejected(), &plan, &all, &report),

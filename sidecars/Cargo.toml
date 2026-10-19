@@ -33,7 +33,11 @@ name = "mt-sidecars"
 # protected_symlinks 规则把关;同一连接建连单飞,冷却不会被并发绕过;替换 / 回滚在独立任务里跑完,
 # 上传走带时限的 run_sftp_upload_until;ProxyCommand 回落直连并说明;认证途中断网不计冷却;
 # 加固服务器先断开时重连一次只试密码;IdentityFile 指向 .pub 时经 agent 签名;SFTP 开 channel 10s 上限。
-version = "0.4.11"
+# 0.4.12:会话池撤回 0.4.11 的「读 ~/.ssh/config」与「试默认私钥 ~/.ssh/id_*」——`~/.ssh` 里只碰
+# known_hosts。连接里填的 host 就是真正去连的主机(不认 ssh config 别名 / ProxyJump),私钥只用
+# 连接里配的那一把,认证依次试连接私钥 / ssh-agent / 密码。升版本号是为了让装机目录里还在跑的
+# 0.4.11 daemon 被换代(版本握手只换代更旧的 daemon)。
+version = "0.4.12"
 description = "mini-term sidecar binaries: miniterm-hook (AI hook), mt-ssh-mcp (SSH MCP server) and mt-ssh-cli (SSH CLI + daemon)"
 edition = "2021"
 
