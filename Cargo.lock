@@ -5376,6 +5376,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "futures",
+ "gpui-base",
  "gpui-component",
  "gpui-kit-assets",
  "gpui-pre",

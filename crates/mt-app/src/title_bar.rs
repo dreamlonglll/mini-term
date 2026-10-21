@@ -396,6 +396,27 @@ pub fn request_close_window(window: &mut Window, cx: &mut App) {
     }
 }
 
+/// 拖拽区(品牌段与中段留白共用)。
+///
+/// 左键按下顺手**压掉这一下的窗口级选区**:`WM_NCLBUTTONDOWN` 会先被翻成
+/// MouseDown 冒泡到根,gpui-component `Root` 里的选区层收到就开始拖选;随后
+/// `DefWindowProc` 进系统移动循环把抬起吃掉,选区层等不到 MouseUp,光标划过
+/// 会话详情就整段选中(详见 `main.rs` 的 `text_selection_release_guard`,那边是
+/// 全窗口的兜底,这里是让标题栏这一下根本不进拖选态)。
+///
+/// ⚠️ 只能 `suppress_text_selection`,**不许 `stop_propagation`**:平台层按
+/// 「有没有人停止冒泡」判定这次按下是否被吞
+/// (`gpui-pre-windows-0.3.5/src/events.rs:1078-1083`),停了就
+/// 不交 `DefWindowProc`,窗口拖不动、双击也不再最大化。选区层是 `Root` 的首个
+/// 子元素,冒泡相最后跑,看得到这里立的标记。
+fn drag_area() -> Div {
+    div()
+        .window_control_area(WindowControlArea::Drag)
+        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+            gpui_component::GlobalState::suppress_text_selection(cx)
+        })
+}
+
 /// 最小化窗口(Linux 降级路径;Windows 由 `WindowControlArea::Min` 接管)。
 pub fn minimize(window: &mut Window, _cx: &mut App) {
     window.minimize_window();
@@ -805,14 +826,13 @@ impl Render for TitleBar {
             .when(is_mac, |el| el.child(div().w(px(MAC_TRAFFIC_LIGHT_WIDTH)).flex_none()))
             // 品牌段 —— 拖拽区之一。⚠️ 挂了 Drag 之后里面不能再放可点元素
             .child(
-                div()
+                drag_area()
                     .flex()
                     .items_center()
                     .gap(px(6.0))
                     .pl(px(12.0))
                     .pr(px(6.0))
                     .flex_none()
-                    .window_control_area(WindowControlArea::Drag)
                     .child(VectorIcon::new(ICON_LOGO, px(14.0)).ink(ui::text_muted()))
                     .child(
                         div()
@@ -855,12 +875,7 @@ impl Render for TitleBar {
                     ))
             }))
             // 中段留白 —— 主要的拖拽区
-            .child(
-                div()
-                    .flex_1()
-                    .h_full()
-                    .window_control_area(WindowControlArea::Drag),
-            )
+            .child(drag_area().flex_1().h_full())
             // 窗口控制 —— macOS 用系统交通灯,这里不画(两套并存会撞在一起)
             .when(!is_mac, |el| {
                 el.child(

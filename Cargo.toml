@@ -58,6 +58,11 @@ gpui-component = "0.6.2"
 # 是 1830 枚(约 731 KB),本仓用不上。没有它时上游组件画 `IconName::*` 一律是
 # **空白且编译期无感**(svg 走 AssetSource 取,取不到只记一行日志)。
 gpui-kit-assets = "0.6.2"
+# 组件库的底层原语包,同样**本来就在依赖树里**(gpui-component 的直接依赖),
+# 提成直接依赖只为拿窗口级选区的 `TextSelection` —— gpui-component 没重导出它
+# (见 `main.rs` 的 `text_selection_release_guard`)。版本同上,必须与
+# gpui-component 拉的那份完全一致。
+gpui-base = "0.6.2"
 # 本地 HTML 预览的系统 WebView(Windows = WebView2,macOS = WKWebView)。gpui-component
 # 0.6 起把 `webview` feature 拆成了这个独立 crate(gpui-kit 出品,同一份 gpui-pre)。
 # ⚠️ 钉死 =0.6.4:0.6.5 起它把 gpui-pre 钉成 `=0.3.6`,与上面的 0.3.5 冲突(两版源码

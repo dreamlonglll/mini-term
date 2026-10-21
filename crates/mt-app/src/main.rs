@@ -1354,6 +1354,45 @@ fn columns_host() -> gpui::Div {
     div().flex_1().min_w(px(0.0)).h_full()
 }
 
+/// 窗口级选区「抬起丢了」的兜底:左键没按着却还在拖选,当场收尾。
+///
+/// gpui-base 的 `TextSelectionLayer`(gpui-component `Root` 的首个子元素)在左键按下
+/// 冒泡到根时就进拖选态,**只认冒泡到根的 MouseUp 收尾**
+/// (`gpui-base-0.6.2/src/text_selection.rs:2589-2598` 开始、`:2741-2750` 收尾);期间
+/// 每次 MouseMove / 滚轮都在延伸选区,且不看左键还按没按着(`:2724-2738`)。按下到了、
+/// 抬起没到,光标划过会话详情 / md 预览就整段选成蓝底,直到下一次完整的点击。
+/// 已知丢抬起的两条路:
+///
+/// 1. **单击标题栏拖拽区**:`WM_NCLBUTTONDOWN` 先被翻成 MouseDown 派发一遍
+///    (`gpui-pre-windows-0.3.5/src/events.rs:1054-1099`),`HTCAPTION` 没人吞就交给
+///    `DefWindowProc` 进系统移动循环,抬起被循环吃掉,`WM_NCLBUTTONUP` 根本不来。
+///    标题栏自己另有一道(`title_bar::drag_area`);窗口边缘缩放按同一条路推断也会中。
+/// 2. **MouseUp 半路被 `stop_propagation`**:自绘菜单项的 `on_click` 就是这样。
+///
+/// 所以「capture 相补一次 MouseUp 收尾」兜不住第 1 条 —— 那里压根没有 MouseUp。
+/// 判据改看 MouseMove 自带的 `pressed_button`:正经拖选时左键一定按着(Windows 取
+/// `MK_LBUTTON`),没按着还在拖选 = 抬起丢了。挂 **capture 相**,先于选区层的冒泡相
+/// 处理器收尾,这一拍的移动就不会再延伸选区。`TextSelection::end` 不在拖选态时直接
+/// 返回,每次移动只多一次表查;起点没落在文字上(标题栏、菜单)的,收尾时连锚点一起
+/// 清掉(`text_selection.rs:1248-1260`)。
+///
+/// 触摸长按也会置拖选态,但它只来自 `PlatformInput::Touch`,三个桌面平台都不产生
+/// (只有 web 后端有),不会被这里误收。
+fn text_selection_release_guard() -> impl IntoElement {
+    gpui::canvas(
+        |_, _, _| {},
+        |_, _, window, _| {
+            window.on_mouse_event(|event: &gpui::MouseMoveEvent, phase, window, cx| {
+                if phase.capture() && event.pressed_button != Some(gpui::MouseButton::Left) {
+                    gpui_base::TextSelection::end(window, cx);
+                }
+            });
+        },
+    )
+    .absolute()
+    .inset_0()
+}
+
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 窗口尺寸变了就让两组分栏重新以持久化的绝对像素做种(见该函数注释)——
@@ -2025,6 +2064,8 @@ impl Render for Workspace {
             // 从没接过线(`pane.rs` 不调 `set_background_art`),这里是唯一一处。
             // 同样绕开 WebView 的洞画。
             .when_some(background, |el, art| el.child(native_view::hole_art(art)))
+            // 窗口级选区丢了 MouseUp 的兜底(见该函数注释)。不登记 hitbox,不挡点击
+            .child(text_selection_release_guard())
             .key_context("Workspace")
             // Esc 中途取消**任何**内部拖拽(pane 拖拽 / 文件树行拖向终端或树内移动 /
             // 项目列表排序)。原版 `fileDragState.ts` / `paneDragState.ts` 各挂一句

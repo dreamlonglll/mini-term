@@ -40,6 +40,10 @@ gpui-component = { workspace = true, features = ["tree-sitter-languages"] }
 # 画出来是**空白**,而且编译期毫无提示(这条前提此前拖着全仓十来处「只能自绘」的记档)。
 # 与 gpui-component 同版本同源(见根 Cargo.toml 的说明),净新增 crate = 0。
 gpui-kit-assets.workspace = true
+# 窗口级选区的 `TextSelection::end`(gpui-component 没重导出),用于兜住「按下到了、
+# 抬起丢了」的选区卡死,见 `main.rs` 的 `text_selection_release_guard`。同版本同源,
+# 净新增 crate = 0。
+gpui-base.workspace = true
 # ---- 语法高亮补充语言包(`syntax_languages.rs`)----
 # 组件库那 30 余种里 C# / Swift / CMake / Proto / GraphQL 只挂了解析器、高亮查询是空串,
 # 打开 .cs 整篇纯文本色;PowerShell / XML / Dart 这些常见类型它根本没有
