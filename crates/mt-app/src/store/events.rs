@@ -238,6 +238,13 @@ impl StoreEvent {
             Self::ProjectsChanged | Self::DirKindsChanged | Self::WindowFocusChanged
         )
     }
+
+    /// 「添加远程项目」弹窗选中的连接要不要重定(`ssh_conn::reselect_connection`)。
+    ///
+    /// 依赖:连接表本身 —— 用户从弹窗里跳去「SSH 连接」面板新建一条,回来要选中它。
+    pub fn touches_ssh_connections(self) -> bool {
+        matches!(self, Self::Config(ConfigSection::SshConnections))
+    }
 }
 
 #[cfg(test)]
@@ -340,6 +347,7 @@ mod tests {
             assert!(!e.touches_relay_sync(), "{e:?}");
             assert!(!e.touches_document_sources(), "{e:?}");
             assert!(!e.touches_project_probes(), "{e:?}");
+            assert!(!e.touches_ssh_connections(), "{e:?}");
         }
     }
 
@@ -412,6 +420,15 @@ mod tests {
                 StoreEvent::WindowFocusChanged,
                 StoreEvent::DirKindsChanged,
             ]
+        );
+    }
+
+    /// 添加远程项目重定选中只看连接表:AI 状态、布局这些热路径不该让它每次都比一遍。
+    #[test]
+    fn 添加远程项目只认ssh连接表() {
+        assert_eq!(
+            accepted(StoreEvent::touches_ssh_connections),
+            vec![StoreEvent::Config(ConfigSection::SshConnections)]
         );
     }
 

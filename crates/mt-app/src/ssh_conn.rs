@@ -10,6 +10,8 @@
 //!
 //! 全是纯函数,不碰 store、不碰网络,单测直接钉。
 
+use std::collections::HashSet;
+
 use mt_config::{ProjectConfig, SshConnection};
 
 /// `user@host:port` 摘要(端口为 22 时省略)。
@@ -324,6 +326,33 @@ pub fn remote_project_name(name: &str, remote_path: &str) -> String {
         .next_back()
         .unwrap_or(remote_path)
         .to_string()
+}
+
+/// 连接表变了之后,「添加远程项目」该选中哪一条;`None` = 保持不动。
+///
+/// 弹窗开着时连接表只会因一件事变化:用户点了弹窗里的「添加 SSH 连接」,在叠开的
+/// 「SSH 连接」面板里增删改了连接。于是:
+///
+/// - 多出来的那条(`known` 里没有)→ 选它:用户就是为了用它才跳过去建的;
+/// - 选中的那条不在了(打开时一条都没有;或刚被删)→ 回落第一条,一条不剩就清空;
+/// - 其余(改名、挪分组、排序)→ 不动。
+///
+/// ⚠️ 结果要**写回**弹窗状态,不能只在渲染时现算:保存校验完会拿状态里的 id 与
+/// 提交时的快照对账,对不上就静默作废 —— 只在画面上回落,项目永远加不进去。
+pub fn reselect_connection(
+    current: &str,
+    known: &HashSet<String>,
+    connections: &[SshConnection],
+) -> Option<String> {
+    let next = match connections.iter().rev().find(|c| !known.contains(&c.id)) {
+        Some(added) => added.id.clone(),
+        None if connections.iter().any(|c| c.id == current) => return None,
+        None => connections
+            .first()
+            .map(|c| c.id.clone())
+            .unwrap_or_default(),
+    };
+    (next != current).then_some(next)
 }
 
 // ---------------------------------------------------------------------------
@@ -767,6 +796,57 @@ mod tests {
         assert_eq!(remote_project_name("  ", "/home/u/proj/"), "proj");
         // 根目录:末段取不到 → 用整条路径
         assert_eq!(remote_project_name("", "/"), "/");
+    }
+
+    // --- 添加远程项目的连接选中 ---
+
+    fn known(v: &[&str]) -> HashSet<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn reselect_picks_the_connection_just_created() {
+        // 空态打开(一条都没有、什么都没选),回来时多了一条
+        let conns = [conn("a", None)];
+        assert_eq!(
+            reselect_connection("", &known(&[]), &conns),
+            Some("a".into())
+        );
+        // 已有连接时从列表末尾跳去新建:新的那条压过原先的选中
+        let conns = [conn("a", None), conn("b", None), conn("c", Some("prod"))];
+        assert_eq!(
+            reselect_connection("a", &known(&["a", "b"]), &conns),
+            Some("c".into())
+        );
+        // 复制出来的副本插在原连接后面,不在末尾也认得出
+        let conns = [conn("a", None), conn("a2", None), conn("b", None)];
+        assert_eq!(
+            reselect_connection("b", &known(&["a", "b"]), &conns),
+            Some("a2".into())
+        );
+    }
+
+    #[test]
+    fn reselect_falls_back_when_the_selected_connection_is_gone() {
+        let conns = [conn("a", None)];
+        assert_eq!(
+            reselect_connection("b", &known(&["a", "b"]), &conns),
+            Some("a".into())
+        );
+        // 删光了:清空选中
+        assert_eq!(
+            reselect_connection("a", &known(&["a"]), &[]),
+            Some(String::new())
+        );
+    }
+
+    #[test]
+    fn reselect_keeps_selection_when_nothing_was_added_or_removed() {
+        // 改名 / 挪分组 / 排序
+        let conns = [conn("b", Some("prod")), conn("a", None)];
+        assert_eq!(reselect_connection("a", &known(&["a", "b"]), &conns), None);
+        // 本来就空,也仍然没有连接(比如只新建了一个空分组)
+        assert_eq!(reselect_connection("", &known(&[]), &[]), None);
     }
 
     // --- 初始勾选 ---

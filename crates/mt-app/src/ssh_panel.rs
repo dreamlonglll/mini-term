@@ -46,6 +46,11 @@
 //!
 //! [`crate::overlay::kind::SSH_PANEL`]。删除连接的确认框是**另一种类**
 //! (`CONFIRM`),照样叠得上去,Esc 只关它 —— 与原版 `overlayStack` 同语义。
+//!
+//! # 从「添加远程项目」跳进来新建(issue #83)
+//!
+//! [`open_adding`]:本面板叠在 [`crate::remote_project`] 之上、直接开新建表单,新连接
+//! 一保存成功就自己关掉退回去(那边会选中这条)。边条那颗按钮走的 [`open`] 不受影响。
 
 use std::collections::HashSet;
 
@@ -60,7 +65,7 @@ use mt_config::SshConnection;
 use crate::dnd::{self, DropPosition};
 use crate::i18n::{t, tr};
 use crate::menu::{self, MenuItem};
-use crate::prompt::{Confirm, autofocus, kind, open_guarded};
+use crate::prompt::{Confirm, autofocus, close_guarded, kind, open_guarded};
 use crate::ssh_conn::{SshGroupBucket, build_group_buckets, connection_summary};
 use crate::store::AppStore;
 use crate::ui;
@@ -330,6 +335,32 @@ pub(crate) fn panel_footer(hint: impl Into<SharedString>) -> gpui::Div {
                 .text_color(ui::text_muted())
                 .child(hint.into()),
         )
+}
+
+/// 连接列表末尾那颗「+ 添加连接」虚线按钮(不含 `on_click`,由调用方挂)。
+///
+/// 本面板右栏一颗;[`crate::remote_project`] 的连接列表末尾一颗(点开的是本面板的
+/// 新建表单,见 [`open_adding`])—— 两处同一个样子,用户一眼认得出是同一件事。
+pub(crate) fn add_conn_button(
+    id: &'static str,
+    label: impl Into<SharedString>,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .w_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .py(px(10.0))
+        .rounded(px(6.0))
+        .border_1()
+        .border_dashed()
+        .border_color(ui::border_default())
+        .cursor_pointer()
+        .text_size(ui::font_px(13.0))
+        .text_color(ui::text_muted())
+        .hover(|el| el.border_color(ui::accent()).text_color(ui::accent()))
+        .child(label.into())
 }
 
 /// 一条连接的卡片外壳(名称 + `user@host:port` 副行)。三个弹窗共用同一款卡,
@@ -609,6 +640,9 @@ pub struct SshPanel {
     /// 面板内的一行提示(目前只有「密码加密失败,本次未保存密码」)。画在右栏顶部,
     /// 下一次开表单 / 保存成功时清掉。不走 toast 的理由见 [`ConnForm::password_unreadable`]。
     notice: Option<SharedString>,
+    /// 经 [`open_adding`] 打开:新建的连接一保存成功就关掉面板,退回下面那个弹窗 ——
+    /// 用户是为了在那边用它才跳过来建的,不该再让他自己去找 ✕。
+    return_after_add: bool,
 }
 
 impl Render for SshPanel {
@@ -671,14 +705,41 @@ impl SshPanel {
 
 /// 打开「SSH 连接」面板。
 pub fn open(window: &mut Window, cx: &mut App) {
+    open_with(OpenMode::Browse, window, cx);
+}
+
+/// 打开「SSH 连接」面板并直接进入新建表单,保存成功即关面板退回调用方。
+///
+/// 给 [`crate::remote_project`] 用(空态那颗按钮、连接列表末尾那颗):用户点进来
+/// 就是要建一条连接接着用。面板叠在那个弹窗之上(覆盖物种类不同,`open_guarded`
+/// 放行);那边订阅着连接表,新建的这条会被选中。`group` 是新连接默认落进的分组。
+pub fn open_adding(group: Option<String>, window: &mut Window, cx: &mut App) {
+    open_with(OpenMode::Add { group }, window, cx);
+}
+
+/// 面板怎么打开。
+enum OpenMode {
+    /// 边条那颗按钮:普通打开。
+    Browse,
+    /// 别的弹窗里的「添加 SSH 连接」:直接开新建表单,新连接默认落进 `group`。
+    Add { group: Option<String> },
+}
+
+fn open_with(mode: OpenMode, window: &mut Window, cx: &mut App) {
     // 守卫要在**建任何输入框之前**判(与 `prompt::show_prompt` 同一条)
     if crate::overlay::contains(crate::overlay::key(kind::SSH_PANEL)) {
         return;
     }
     let store = AppStore::global(cx);
+    // 带着分组进来:左栏先切到那一组,新建表单就长在这一组的列表末尾
+    let selected = match &mode {
+        OpenMode::Add { group: Some(group) } => GroupKey::Named(group.clone()),
+        _ => GroupKey::All,
+    };
+    let return_after_add = matches!(mode, OpenMode::Add { .. });
     let state = cx.new(|_cx| SshPanel {
         store,
-        selected: GroupKey::All,
+        selected,
         collapsed: HashSet::new(),
         form: None,
         renaming: None,
@@ -690,7 +751,9 @@ pub fn open(window: &mut Window, cx: &mut App) {
         _copied_timer: None,
         _subs: Vec::new(),
         notice: None,
+        return_after_add,
     });
+    let state_for_add = state.clone();
 
     open_guarded(kind::SSH_PANEL, window, cx, move |dialog, window, cx| {
         let total = panel_total_h(window.viewport_size());
@@ -716,6 +779,12 @@ pub fn open(window: &mut Window, cx: &mut App) {
             })
             .child(body)
     });
+
+    // 新建表单排在 `open_guarded` **之后**:表单首个输入框的聚焦要压过弹窗打开时
+    // 对面板的抢焦点(判据见 `prompt::autofocus`)
+    if let OpenMode::Add { group } = mode {
+        start_add(&state_for_add, group, window, cx);
+    }
 }
 
 // ─── 动作 ─────────────────────────────────────────────────────
@@ -864,7 +933,7 @@ fn toggle_password_reveal(
     }
 }
 
-fn save_form(state: &Entity<SshPanel>, cx: &mut App) {
+fn save_form(state: &Entity<SshPanel>, window: &mut Window, cx: &mut App) {
     let Some(conn) = state.read(cx).form.as_ref().map(|f| {
         build_connection(
             f.id.clone(),
@@ -883,12 +952,13 @@ fn save_form(state: &Entity<SshPanel>, cx: &mut App) {
         return;
     }
     let mut conn = conn;
-    if conn.id.is_empty() {
+    let is_new = conn.id.is_empty();
+    if is_new {
         // 对既有连接去重:`upsert_ssh_connection` 按 id 覆盖,撞上就是顶掉一条老连接
         let existing = state.read(cx).store.read(cx).ssh_connections();
         conn.id = crate::tree::gen_unique_id("ssh", |id| existing.iter().any(|c| c.id == id));
     }
-    state.update(cx, |panel, cx| {
+    let sealed = state.update(cx, |panel, cx| {
         panel.form = None;
         // 明文只活到这一步:store 落库前把它封成信封。封存失败时连接照存、密码不存,
         // 在面板顶部提示用户再填一次(见 `AppStore::upsert_ssh_connection`;不走
@@ -896,11 +966,18 @@ fn save_form(state: &Entity<SshPanel>, cx: &mut App) {
         let saved = panel
             .store
             .update(cx, |store, cx| store.upsert_ssh_connection(conn, cx));
+        let sealed = saved.is_ok();
         panel.notice = saved
             .err()
             .map(|err| SharedString::from(tr!("sshModal", "passwordSealFailed", error = err)));
         cx.notify();
+        sealed
     });
+    // 从「添加远程项目」跳过来新建的:建好就退回去(那边会选中这条)。密码没封存成功
+    // 时留在面板上 —— 顶部那行红字要让用户看见,退回去就看不到了
+    if is_new && sealed && state.read(cx).return_after_add {
+        close_guarded(kind::SSH_PANEL, window, cx);
+    }
 }
 
 /// 删除一条连接。**不可撤销**(密码/私钥路径一并丢失)且会静默收窄已关联项目的
@@ -1482,28 +1559,12 @@ fn render_list(state: &Entity<SshPanel>, frame: &Frame, cx: &mut App) -> AnyElem
             _ => None,
         };
         list = list.child(
-            div()
-                .id("ssh-add-conn")
-                .w_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .py(px(10.0))
-                .rounded(px(6.0))
-                .border_1()
-                .border_dashed()
-                .border_color(ui::border_default())
-                .cursor_pointer()
-                .text_size(ui::font_px(13.0))
-                .text_color(ui::text_muted())
-                .hover(|el| el.border_color(ui::accent()).text_color(ui::accent()))
-                .child(t("sshModal", "addConnection"))
-                .on_click({
-                    let state = state.clone();
-                    move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
-                        start_add(&state, group_for_new.clone(), window, cx);
-                    }
-                }),
+            add_conn_button("ssh-add-conn", t("sshModal", "addConnection")).on_click({
+                let state = state.clone();
+                move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                    start_add(&state, group_for_new.clone(), window, cx);
+                }
+            }),
         );
     }
 
@@ -1892,7 +1953,9 @@ fn render_form(state: &Entity<SshPanel>, cx: &mut App) -> AnyElement {
                         .opacity(if can_save { 1.0 } else { 0.4 })
                         .on_click({
                             let state = state.clone();
-                            move |_: &ClickEvent, _window, cx: &mut App| save_form(&state, cx)
+                            move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                                save_form(&state, window, cx)
+                            }
                         }),
                 ),
         )

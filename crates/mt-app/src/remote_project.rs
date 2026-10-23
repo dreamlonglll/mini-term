@@ -18,9 +18,18 @@
 //!
 //! # 三个入口
 //!
-//! 项目列表底部的 `SSH` 钮(根层)、分组右键「添加远程项目」(落进该组)、
+//! 项目列表底部的「添加远程项目」钮(根层)、分组右键「添加远程项目」(落进该组)、
 //! 首启引导第二颗按钮。三者共用 [`crate::overlay::kind::ADD_REMOTE_PROJECT`]
 //! 一种覆盖物 —— 防的正是「两处入口各开一个」。
+//!
+//! # 就地新建连接(issue #83)
+//!
+//! 空态与连接列表末尾各有一颗「+ 添加 SSH 连接」:把「SSH 连接」面板叠在本弹窗之上、
+//! 直接开新建表单([`crate::ssh_panel::open_adding`]),保存成功面板自己关掉。本弹窗
+//! 订阅着连接表,多出来的那条被选中、路径复位成 `~`、焦点交给路径框
+//! ([`crate::ssh_conn::reselect_connection`])。此前空态只有一句「请先通过顶部菜单
+//! 『SSH』添加连接」—— 那个顶部菜单早在 Tauri 版 v0.6.8 改三栏时就挪进了左侧边条,
+//! 用户卡在这里出不去。
 
 use std::collections::HashSet;
 
@@ -34,20 +43,23 @@ use mt_config::SshConnection;
 
 use crate::i18n::t;
 use crate::prompt::{autofocus, close_guarded, kind, open_guarded};
-use crate::ssh_conn::{SshGroupBucket, build_group_buckets};
+use crate::ssh_conn::{SshGroupBucket, build_group_buckets, reselect_connection};
 use crate::ssh_panel::{
-    BucketCollapse, GroupKey, PANEL_W, conn_card, conn_text, panel_footer, panel_header,
-    panel_total_h, render_conn_buckets, resolve_active, sidebar_row, visible_buckets,
+    BucketCollapse, GroupKey, PANEL_W, add_conn_button, conn_card, conn_text, panel_footer,
+    panel_header, panel_total_h, render_conn_buckets, resolve_active, sidebar_row, visible_buckets,
 };
-use crate::store::AppStore;
+use crate::store::{AppStore, StoreEvent};
 use crate::ui;
 
 const SIDEBAR_W: f32 = 176.0;
 
 pub struct AddRemotePanel {
     store: Entity<AppStore>,
-    /// 选中的连接 id(原版是 `<input type=radio>` 的受控值)。
+    /// 选中的连接 id(原版是 `<input type=radio>` 的受控值)。连接表变了由 `open`
+    /// 里那条订阅重定,判据见 [`reselect_connection`]。
     connection_id: String,
+    /// 上一次见到的全部连接 id —— 连接表再变时,不在这里的就是刚新建的那条。
+    known_ids: HashSet<String>,
     path: Entity<InputState>,
     name: Entity<InputState>,
     busy: bool,
@@ -88,12 +100,19 @@ pub fn open(
         return;
     }
     // 默认选第一条连接(原版 `connections[0]?.id ?? ''`)
-    let first = store
-        .read(cx)
-        .ssh_connections()
-        .first()
-        .map(|c| c.id.clone())
-        .unwrap_or_default();
+    let (first, known_ids) = {
+        let connections = store.read(cx).ssh_connections();
+        (
+            connections
+                .first()
+                .map(|c| c.id.clone())
+                .unwrap_or_default(),
+            connections
+                .iter()
+                .map(|c| c.id.clone())
+                .collect::<HashSet<_>>(),
+        )
+    };
 
     let path = cx.new(|cx| {
         InputState::new(window, cx)
@@ -103,7 +122,10 @@ pub fn open(
     let name =
         cx.new(|cx| InputState::new(window, cx).placeholder(t("remoteProject", "namePlaceholder")));
     // 打开即可直接接着 `~` 往下敲路径。聚焦排在 `open_guarded` 之后,
-    // 判据见 `prompt::autofocus`
+    // 判据见 `prompt::autofocus`。一条连接都没有时空态里不画路径框,硬聚焦过去焦点就
+    // 落了空(Esc / 回车都不响应,得先点一下面板),所以留给弹窗自己 —— 建好连接回来
+    // 再由连接表订阅把焦点交给路径框
+    let focus_path = !known_ids.is_empty();
     let path_for_focus = path.clone();
 
     let state = cx.new(|cx| {
@@ -118,10 +140,43 @@ pub fn open(
                 cx.notify();
             }
         };
-        let subs = vec![cx.subscribe(&path, on_enter), cx.subscribe(&name, on_enter)];
+        let mut subs = vec![cx.subscribe(&path, on_enter), cx.subscribe(&name, on_enter)];
+        // 连接表变了(用户点「添加 SSH 连接」在叠开的面板里新建 / 删了连接)就重定选中
+        // 的那条。选中换了,路径照「手点另一条连接」的口径复位成 `~`;本弹窗已回到栈顶
+        // (面板建好就自己关了)才把焦点交给路径框,让用户接着敲 —— 面板还开着(比如
+        // 密码没封存成功、红字还要给人看)时不去抢它的焦点。
+        subs.push(cx.subscribe_in(
+            &store,
+            window,
+            |this: &mut AddRemotePanel, store, event: &StoreEvent, window, cx| {
+                if !event.touches_ssh_connections() {
+                    return;
+                }
+                let (next, known) = {
+                    let connections = store.read(cx).ssh_connections();
+                    (
+                        reselect_connection(&this.connection_id, &this.known_ids, connections),
+                        connections.iter().map(|c| c.id.clone()).collect(),
+                    )
+                };
+                this.known_ids = known;
+                let Some(id) = next else {
+                    return;
+                };
+                this.connection_id = id;
+                this.error.clear();
+                this.path
+                    .update(cx, |input, cx| input.set_value("~", window, cx));
+                if crate::overlay::is_top(crate::overlay::key(kind::ADD_REMOTE_PROJECT)) {
+                    autofocus(&this.path, window, cx);
+                }
+                cx.notify();
+            },
+        ));
         AddRemotePanel {
             store,
             connection_id: first,
+            known_ids,
             path,
             name,
             busy: false,
@@ -164,7 +219,9 @@ pub fn open(
         },
     );
 
-    autofocus(&path_for_focus, window, cx);
+    if focus_path {
+        autofocus(&path_for_focus, window, cx);
+    }
 }
 
 // ─── 保存 ─────────────────────────────────────────────────────
@@ -346,17 +403,37 @@ fn render_body(state: &Entity<AddRemotePanel>, total: gpui::Pixels, cx: &mut App
     ));
 
     if frame.total == 0 {
-        // 一条连接都没有:整个选择区与表单都不画,只给一句引导
+        // 一条连接都没有:选择区与表单都不画,只给一句引导 + 一颗直达新建表单的按钮
         root = root.child(
             div()
                 .flex_1()
                 .flex()
+                .flex_col()
                 .items_center()
                 .justify_center()
+                .gap(px(16.0))
                 .px(px(32.0))
-                .text_size(ui::font_px(11.0))
-                .text_color(ui::text_muted())
-                .child(t("remoteProject", "noConnections")),
+                .child(
+                    div()
+                        .text_size(ui::font_px(12.0))
+                        .text_color(ui::text_muted())
+                        .text_center()
+                        .child(t("remoteProject", "noConnections")),
+                )
+                .child(
+                    ui::primary_button(
+                        "remote-add-first-connection",
+                        t("remoteProject", "addConnection"),
+                    )
+                    .px(px(16.0))
+                    .py(px(8.0))
+                    .text_size(ui::font_px(13.0))
+                    .on_click(
+                        |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                            crate::ssh_panel::open_adding(None, window, cx);
+                        },
+                    ),
+                ),
         );
     } else {
         root = root
@@ -508,6 +585,25 @@ fn render_list(state: &Entity<AddRemotePanel>, frame: &Frame) -> AnyElement {
                 .into_any_element()
         },
     ));
+    // 列表末尾:就地新建一条连接,建好回来就是选中的那条。正看着某个分组时新连接
+    // 默认落进该组 —— 与「SSH 连接」面板里那颗「+ 添加连接」同口径
+    let group_for_new = match &frame.active {
+        GroupKey::Named(name) => Some(name.clone()),
+        _ => None,
+    };
+    list = list.child(
+        add_conn_button("remote-add-connection", t("remoteProject", "addConnection"))
+            .opacity(if frame.busy { 0.4 } else { 1.0 })
+            .on_click({
+                let state = state.clone();
+                move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                    if state.read(cx).busy {
+                        return;
+                    }
+                    crate::ssh_panel::open_adding(group_for_new.clone(), window, cx);
+                }
+            }),
+    );
     list.into_any_element()
 }
 

@@ -2267,18 +2267,25 @@ impl ProjectList {
             )
     }
 
-    /// 底部按钮条。
+    /// 底部按钮条:添加本地项目 / 添加远程项目 / 新建分组。
+    ///
+    /// 原版(`ProjectList.tsx:1087-1113`)是「+ 添加项目 / SSH / +」:后两颗要悬停才
+    /// 说得清自己是干什么的,issue #83 的用户就把「SSH」当成了「添加 SSH 连接」。
+    /// 现在每颗都写明动作,领位图标与它建出来的那种行同一枚(文件夹 / 服务器 /
+    /// 分组容器),悬停提示再补一句细节。中栏拖窄放不下一行就**折行**而不是截断 ——
+    /// 截成「添加本…」又回到了要靠猜的老路。
     fn render_footer(&self, cx: &mut Context<Self>) -> gpui::Div {
-        // 底部按钮条(`ProjectList.tsx:1087-1113`):添加项目 / SSH / +。
-        // 中间那颗 `SSH` 走 `remote_project::open`(根层),BB-b 补齐。
-        let dashed_button = |id: &'static str, label: SharedString, wide: bool| {
+        let dashed_button = |id: &'static str, icon: AnyElement, label: &'static str| {
             div()
                 .id(id)
-                .when(wide, |el| el.flex_1())
+                // 按自然宽度起步、平分剩余空间;一行放不下就整颗挪到下一行(见上)
+                .flex_grow_1()
+                .flex_shrink_0()
                 .flex()
                 .items_center()
                 .justify_center()
-                .px(px(12.0))
+                .gap(px(6.0))
+                .px(px(10.0))
                 .py(px(8.0))
                 .rounded(px(6.0))
                 .border_1()
@@ -2288,47 +2295,65 @@ impl ProjectList {
                 .text_size(ui::font_px(11.4))
                 .text_color(ui::text_muted())
                 .hover(|el| el.border_color(ui::accent()).text_color(ui::accent()))
-                .child(label)
+                .child(icon)
+                .child(div().whitespace_nowrap().child(label))
         };
         let store_for_add = self.store.clone();
         div()
             .flex()
+            .flex_wrap()
             .flex_none()
             .gap(px(6.0))
             .p(px(8.0))
             .child(
                 dashed_button(
                     "add-project",
-                    t("projectList", "addProject").into(),
-                    true,
+                    FileIcon::folder(false)
+                        .size(px(14.0))
+                        .color(ui::color_file())
+                        .into_any_element(),
+                    t("projectList", "addProject"),
                 )
+                .tip(t("projectList", "addProjectTip"))
                 .on_click(move |_event, window, cx| {
                     modal::open_add_project(store_for_add.clone(), window, cx);
                 }),
             )
             .child(
-                dashed_button("add-remote-project", "SSH".into(), false)
-                    .tip(t("projectList", "addRemoteProject"))
-                    .on_click(cx.listener(|this, _event, window, cx| {
-                        crate::remote_project::open(this.store.clone(), None, window, cx);
-                    })),
+                dashed_button(
+                    "add-remote-project",
+                    VectorIcon::new(SERVER, px(14.0))
+                        .ink(ui::color_info())
+                        .into_any_element(),
+                    t("projectList", "addRemoteProject"),
+                )
+                .tip(t("projectList", "addRemoteProjectTip"))
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    crate::remote_project::open(this.store.clone(), None, window, cx);
+                })),
             )
             .child(
-                dashed_button("new-group", "+".into(), false)
-                    .tip(t("projectList", "newGroup"))
-                    .on_click(cx.listener(|this, _event, window, cx| {
-                        let store = this.store.clone();
-                        crate::prompt::show_prompt(
-                            t("projectList", "newGroup"),
-                            t("projectList", "newGroupPlaceholder"),
-                            "",
-                            move |value, _window, cx| {
-                                store.update(cx, |store, cx| store.create_group(&value, None, cx));
-                            },
-                            window,
-                            cx,
-                        );
-                    })),
+                dashed_button(
+                    "new-group",
+                    VectorIcon::new(dnd::BOXES_SHAPES, px(13.0))
+                        .ink(ui::color_folder())
+                        .into_any_element(),
+                    t("projectList", "newGroup"),
+                )
+                .tip(t("projectList", "newGroupTip"))
+                .on_click(cx.listener(|this, _event, window, cx| {
+                    let store = this.store.clone();
+                    crate::prompt::show_prompt(
+                        t("projectList", "newGroup"),
+                        t("projectList", "newGroupPlaceholder"),
+                        "",
+                        move |value, _window, cx| {
+                            store.update(cx, |store, cx| store.create_group(&value, None, cx));
+                        },
+                        window,
+                        cx,
+                    );
+                })),
             )
     }
 

@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 33;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 930;
+pub const ZH_ENTRY_COUNT: usize = 934;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 930;
+pub const EN_ENTRY_COUNT: usize = 934;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -891,8 +891,10 @@ static PANELS_EN: &[(&str, &str)] = &[
 
 #[rustfmt::skip]
 static PROJECT_LIST_ZH: &[(&str, &str)] = &[
-    ("addProject", "+ 添加项目"),
-    ("addRemoteProject", "添加远程项目（SSH）"),
+    ("addProject", "添加本地项目"),
+    ("addProjectTip", "选择本机上的项目文件夹（也可以直接把文件夹拖进列表）"),
+    ("addRemoteProject", "添加远程项目"),
+    ("addRemoteProjectTip", "通过 SSH 连接添加远程服务器上的目录；还没有连接的话，可以在弹窗里直接新建"),
     ("chooseDirDialogTitle", "选择项目目录"),
     ("deleteGroupConfirm.message", "确定要删除分组「{name}」吗？组内 {count} 个项目会移到上一级，不会被删除。"),
     ("deleteGroupConfirm.title", "删除分组"),
@@ -930,6 +932,7 @@ static PROJECT_LIST_ZH: &[(&str, &str)] = &[
     ("menu.wslSessionsNotFound", "{name}（未找到）"),
     ("newGroup", "新建分组"),
     ("newGroupPlaceholder", "请输入分组名称"),
+    ("newGroupTip", "新建一个分组来整理项目，项目可以拖进分组"),
     ("newSubgroup", "新建子组"),
     ("newSubgroupPlaceholder", "请输入子组名称"),
     ("pathHint", "目录不存在时不会添加。"),
@@ -949,8 +952,10 @@ static PROJECT_LIST_ZH: &[(&str, &str)] = &[
 ];
 #[rustfmt::skip]
 static PROJECT_LIST_EN: &[(&str, &str)] = &[
-    ("addProject", "+ Add Project"),
-    ("addRemoteProject", "Add Remote Project (SSH)"),
+    ("addProject", "Add Local Project"),
+    ("addProjectTip", "Pick a project folder on this computer (or just drag a folder into the list)"),
+    ("addRemoteProject", "Add Remote Project"),
+    ("addRemoteProjectTip", "Add a directory on a remote server over SSH; no connection yet? Create one right in the dialog"),
     ("chooseDirDialogTitle", "Choose project directory"),
     ("deleteGroupConfirm.message", "Delete group “{name}”? Its {count} project(s) will move up one level and won't be deleted."),
     ("deleteGroupConfirm.title", "Delete Group"),
@@ -988,6 +993,7 @@ static PROJECT_LIST_EN: &[(&str, &str)] = &[
     ("menu.wslSessionsNotFound", "{name} (not found)"),
     ("newGroup", "New Group"),
     ("newGroupPlaceholder", "Enter group name"),
+    ("newGroupTip", "Create a group to organize projects; drag projects into it"),
     ("newSubgroup", "New Subgroup"),
     ("newSubgroupPlaceholder", "Enter subgroup name"),
     ("pathHint", "Nothing is added when the directory does not exist."),
@@ -1046,6 +1052,7 @@ static PROMPT_EN: &[(&str, &str)] = &[
 
 #[rustfmt::skip]
 static REMOTE_PROJECT_ZH: &[(&str, &str)] = &[
+    ("addConnection", "+ 添加 SSH 连接"),
     ("allConnections", "全部连接"),
     ("browse", "浏览…"),
     ("cancel", "取消"),
@@ -1055,7 +1062,7 @@ static REMOTE_PROJECT_ZH: &[(&str, &str)] = &[
     ("footerHint", "保存前会通过 SFTP 验证目录存在"),
     ("nameLabel", "项目名称"),
     ("namePlaceholder", "留空则取路径末段"),
-    ("noConnections", "尚无 SSH 连接。请先通过顶部菜单「SSH」添加连接，再回来创建远程项目。"),
+    ("noConnections", "尚无 SSH 连接。点下方按钮新建一个，保存后会回到这里并自动选中它；之后也可以在左侧边栏的「SSH 连接」里管理连接。"),
     ("pathLabel", "远程路径（POSIX，支持 ~）"),
     ("pathPlaceholder", "~"),
     ("picker.chooseCurrent", "选择当前文件夹"),
@@ -1074,6 +1081,7 @@ static REMOTE_PROJECT_ZH: &[(&str, &str)] = &[
 ];
 #[rustfmt::skip]
 static REMOTE_PROJECT_EN: &[(&str, &str)] = &[
+    ("addConnection", "+ Add SSH Connection"),
     ("allConnections", "All Connections"),
     ("browse", "Browse…"),
     ("cancel", "Cancel"),
@@ -1083,7 +1091,7 @@ static REMOTE_PROJECT_EN: &[(&str, &str)] = &[
     ("footerHint", "The directory is verified over SFTP before saving"),
     ("nameLabel", "Project name"),
     ("namePlaceholder", "Defaults to the last path segment"),
-    ("noConnections", "No SSH connections yet. Add one via the \"SSH\" menu in the title bar first, then come back to create a remote project."),
+    ("noConnections", "No SSH connections yet. Create one with the button below — once it is saved you will be back here with it selected. You can also manage connections later under \"SSH connections\" in the left sidebar."),
     ("pathLabel", "Remote path (POSIX, ~ supported)"),
     ("pathPlaceholder", "~"),
     ("picker.chooseCurrent", "Choose Current Folder"),
@@ -1637,7 +1645,7 @@ static SSH_ASSOC_ZH: &[(&str, &str)] = &[
     ("devInstanceNote", "注意：本实例的数据目录不是 SSH 工具（mt-ssh-cli）读取的装机版数据目录（通常是设置了 MT_APP_DATA_DIR 的开发实例），这里生成的令牌在那边验证不过。因此本次只把关联保存进本实例的配置，没有生成、改写或删除任何 SKILL.md、.gitignore 与 Claude / Codex 配置，装机版生成的文件保持原样。"),
     ("disabledMessage", "已为「{name}」停用 SSH 工具。\n\n该项目里正在运行的 Claude / Codex 会话需重启后才会移除 SSH 工具。"),
     ("disabledTitle", "已停用 SSH 工具"),
-    ("empty", "还没有 SSH 连接，先在顶栏「SSH」里添加"),
+    ("empty", "还没有 SSH 连接，可以先在左侧边栏的「SSH 连接」里添加"),
     ("enabledMessage", "「{name}」的 AI agent 现在可访问 {scope}。\n\n新会话即时可用；该项目里正在运行的 Claude / Codex 会话需重启后才生效。"),
     ("enabledTitle", "已启用 SSH 工具"),
     ("footerHintEmpty", "不勾选任何连接或分组 = 停用该项目的 SSH 工具"),
@@ -1666,7 +1674,7 @@ static SSH_ASSOC_EN: &[(&str, &str)] = &[
     ("devInstanceNote", "Note: this instance's data directory is not the installed app's data directory that the SSH tools (mt-ssh-cli) read (usually a development instance with MT_APP_DATA_DIR set), so tokens created here would never validate there. The link was therefore saved to this instance's configuration only: no SKILL.md, .gitignore or Claude / Codex configuration was created, changed or removed, and the files generated by the installed app stay as they are."),
     ("disabledMessage", "SSH tools disabled for \"{name}\".\n\nClaude / Codex sessions already running in this project must be restarted before the SSH tools are removed."),
     ("disabledTitle", "SSH tools disabled"),
-    ("empty", "No SSH connections yet. Add one under \"SSH\" in the top bar first."),
+    ("empty", "No SSH connections yet. Add one under \"SSH connections\" in the left sidebar first."),
     ("enabledMessage", "The AI agent of \"{name}\" can now access {scope}.\n\nNew sessions take effect immediately; Claude / Codex sessions already running in this project must be restarted to apply."),
     ("enabledTitle", "SSH tools enabled"),
     ("footerHintEmpty", "No connections or groups selected = disable SSH tools for this project"),

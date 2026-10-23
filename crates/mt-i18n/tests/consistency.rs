@@ -118,8 +118,11 @@ use mt_i18n::{
 /// 928 → 929：Markdown 预览左侧目录栏的标题与工具栏开关（`fileViewer.outline`）。
 /// 929 → 930：「关联 SSH」在开发实例（数据目录不是 sidecar 读取的那个）里只存配置、
 /// 不碰 SKILL.md 时的说明（`sshAssoc.devInstanceNote`）。
+/// 930 → 934（issue #83）：「添加远程项目」里直达新建连接的按钮
+/// （`remoteProject.addConnection`），项目列表底部三颗按钮写明动作后补的悬停说明
+/// （`projectList.{addProjectTip,addRemoteProjectTip,newGroupTip}`）。
 const EXPECTED_NAMESPACES: usize = 33;
-const EXPECTED_ENTRIES_PER_LANG: usize = 930;
+const EXPECTED_ENTRIES_PER_LANG: usize = 934;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

@@ -2,7 +2,7 @@ export const sshAssoc = {
   zh: {
     title: "关联 SSH",
     subtitle: "选择项目「{name}」的 AI agent 可访问的 SSH 连接",
-    empty: "还没有 SSH 连接，先在顶栏「SSH」里添加",
+    empty: "还没有 SSH 连接，可以先在左侧边栏的「SSH 连接」里添加",
     selectedCount: "已选 {checked} / {total}",
     selectAll: "全选",
     selectNone: "全不选",
@@ -30,7 +30,7 @@ export const sshAssoc = {
   en: {
     title: "Link SSH",
     subtitle: "Choose which SSH connections the AI agent of \"{name}\" can access",
-    empty: "No SSH connections yet. Add one under \"SSH\" in the top bar first.",
+    empty: "No SSH connections yet. Add one under \"SSH connections\" in the left sidebar first.",
     selectedCount: "Selected {checked} / {total}",
     selectAll: "Select all",
     selectNone: "Deselect all",
