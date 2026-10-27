@@ -453,6 +453,16 @@ pub(super) fn background_menu(
         ]);
     }
     entries.push(menu::separator());
+    // 空白处代表项目根:直接打开根目录本身(看到的就是树里这些文件),而不是行菜单
+    // 那种「开父目录并选中」—— 后者项目列表右键已有。断链远程的根是 POSIX 路径,同样不给
+    if matches!(&context.backend, FileBackendIdentity::Local) {
+        entries.push(menu::item(t("fileTree", "menu.revealInFolder"), {
+            let root = root.clone();
+            move |_window, cx| {
+                fs_ops::open_external(fs_ops::ExternalOpen::DefaultApp, root.clone(), cx);
+            }
+        }));
+    }
     entries.push(menu::item(t("fileTree", "menu.openInTerminal"), {
         let tree = tree.clone();
         let store = store.clone();
