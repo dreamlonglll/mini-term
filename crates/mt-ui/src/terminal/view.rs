@@ -201,9 +201,10 @@ use std::sync::Arc;
 use alacritty_terminal::grid::Scroll;
 use gpui::{
     App, Bounds, ClipboardItem, Context, ElementId, ElementInputHandler, EntityInputHandler,
-    FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
-    ParentElement, Pixels, Point, Render, Styled, UTF16Selection, Window, div,
+    FocusHandle, Focusable, InteractiveElement, IntoElement, KeyDownEvent, ModifiersChangedEvent,
+    MouseButton, ParentElement, Pixels, Point, Render, Styled, UTF16Selection, Window, div, size,
 };
+use mt_terminal::links::PathCandidate;
 use mt_terminal::{TermSize, TerminalEmulator};
 
 use super::damage::DamageStats;
@@ -212,6 +213,7 @@ use super::element::{
 };
 use super::ime::{ImeState, commit_to_bytes};
 use super::input::{is_text_input_key, keystroke_to_bytes, paste_to_bytes};
+use super::links::{FileLink, FileLinks};
 use super::scrollbar::ScrollbarStyle;
 use super::search::TerminalSearch;
 use super::selection_dwell::{DwellConfig, OnSelectionCopied};
@@ -244,6 +246,10 @@ pub struct TerminalView {
     on_paste: Option<OnPaste>,
     /// 「智能 Ctrl+C / Ctrl+V」现在开着吗。见 [`TerminalView::smart_copy_paste`]。
     smart_copy_paste: Option<SmartCopyPaste>,
+    /// Ctrl(⌘)+悬停 / 单击文件路径。见 [`TerminalView::file_links`]。
+    file_links: Option<FileLinks>,
+    /// 上一次 modifiers-changed 时链接修饰键按着没有 —— 只在它翻转时要一帧。
+    link_modifier_held: bool,
 }
 
 /// 宿主对一次粘贴的裁决。
@@ -349,7 +355,27 @@ impl TerminalView {
             flash: None,
             on_paste: None,
             smart_copy_paste: None,
+            file_links: None,
+            link_modifier_held: false,
         }
+    }
+
+    /// 接上「文件链接」:按住 Ctrl(macOS 上 ⌘)悬停在输出里的文件路径上出下划线与
+    /// 手形光标,单击交给 `open`。
+    ///
+    /// `resolve` 回答「这段文字指向哪个能打开的文件」(相对路径对着哪个目录解析、
+    /// 在不在项目里、盘上有没有),`None` = 不是链接、不画下划线。它在 paint 期被调用,
+    /// 结果按片段缓存,松开 Ctrl 才作废。识别口径见 [`mt_terminal::links`]。
+    ///
+    /// `open` 在元素的鼠标监听里调用,**没有**借着这个视图 —— 宿主可以放心去
+    /// update 别的实体(开文件页签)。
+    pub fn file_links(
+        mut self,
+        resolve: impl Fn(&PathCandidate, &App) -> Option<std::path::PathBuf> + 'static,
+        open: impl Fn(&FileLink, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.file_links = Some(FileLinks::new(resolve, open));
+        self
     }
 
     /// 宿主接管粘贴。设了之后 Ctrl+Shift+V、智能 Ctrl+V 与
@@ -706,6 +732,38 @@ impl TerminalView {
         cx.stop_propagation();
         cx.notify();
     }
+
+    /// 链接修饰键(Ctrl / ⌘)按下或松开时要一帧,让元素按新的修饰键重算悬停态
+    /// (悬停态是 paint 里现算的,见 [`super::links`])。
+    ///
+    /// 这一路只有**焦点终端**收得到(gpui 沿焦点路径派发),非焦点的分屏靠 mouse-move。
+    /// 鼠标不在终端上就不要帧:Ctrl+C / Ctrl+V 每按一下都会经过这里。
+    fn on_modifiers_changed(
+        &mut self,
+        event: &ModifiersChangedEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.file_links.is_none() {
+            return;
+        }
+        let held = event.modifiers.secondary();
+        if held == self.link_modifier_held {
+            return;
+        }
+        self.link_modifier_held = held;
+        let geometry = self.geometry.get();
+        let grid = Bounds::new(
+            geometry.origin,
+            size(
+                geometry.cell_size.width * geometry.columns as f32,
+                geometry.cell_size.height * geometry.screen_lines as f32,
+            ),
+        );
+        if grid.contains(&window.mouse_position()) {
+            cx.notify();
+        }
+    }
 }
 
 impl Focusable for TerminalView {
@@ -734,6 +792,7 @@ impl Render for TerminalView {
         .search(self.search.clone())
         .search_colors(self.search_colors)
         .flash(self.flash)
+        .file_links(self.file_links.clone())
         .selection_dwell(self.dwell)
         .background_art(self.background_art.clone())
         .geometry_sink(self.geometry.clone())
@@ -764,6 +823,7 @@ impl Render for TerminalView {
             .track_focus(&self.focus)
             .key_context("Terminal")
             .on_key_down(cx.listener(Self::on_key_down))
+            .on_modifiers_changed(cx.listener(Self::on_modifiers_changed))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _event, window, cx| {

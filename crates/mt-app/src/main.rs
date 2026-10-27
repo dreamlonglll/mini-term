@@ -116,6 +116,7 @@ mod store;
 mod syntax_languages;
 mod tab_expansion;
 mod terminal_area;
+mod terminal_links;
 mod terminals_panel;
 mod theme;
 mod title_bar;

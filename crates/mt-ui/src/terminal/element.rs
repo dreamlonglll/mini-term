@@ -73,17 +73,18 @@ use alacritty_terminal::term::TermMode;
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::vte::ansi::CursorShape;
 use gpui::{
-    App, Bounds, ClipboardItem, ContentMask, Corners, DispatchPhase, Element, ElementId, EntityId,
-    FocusHandle, FontId, GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId,
-    IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    Point, ScrollDelta, ScrollWheelEvent, ShapedLine, SharedString, Size, StrikethroughStyle,
-    Style, TextRun, UnderlineStyle, Window, fill, point, px, size,
+    App, Bounds, ClipboardItem, ContentMask, Corners, CursorStyle, DispatchPhase, Element,
+    ElementId, EntityId, FocusHandle, FontId, GlobalElementId, Hitbox, HitboxBehavior, Hsla,
+    InspectorElementId, IntoElement, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Point, ScrollDelta, ScrollWheelEvent, ShapedLine, SharedString, Size,
+    StrikethroughStyle, Style, TextRun, UnderlineStyle, Window, fill, point, px, size,
 };
 use mt_terminal::{TermSize, TerminalEmulator};
 
 use super::colors;
 use super::damage::{CellSignature, DamageStats, FrameKey, MAX_ZEROWIDTH_CHARS, RowCache, row_signature};
 use super::input::{Arrow, arrow_bytes};
+use super::links::{self, FileLinks, HoveredLink, LinkCache};
 use super::mouse::{
     GridPos, MouseAction, MouseBtn, MouseMods, WheelDir, alt_screen_scroll_bytes,
     mouse_report_bytes, mouse_reporting_active, prefers_local_handling,
@@ -98,6 +99,9 @@ use crate::theme_bridge::BackgroundArt;
 /// 一屏最多认多少列/行。窗口被拖到荒谬尺寸时防止 grid 爆掉。
 const MAX_COLUMNS: usize = 1024;
 const MAX_LINES: usize = 512;
+
+/// 6px 的滚动条精确命中太难点,左右各放宽 3px(与原生滚动条的手感一致)。
+const GRAB_SLACK: Pixels = px(3.0);
 
 /// `Pixels` 的内部字段是 `pub(crate)`,取标量只能走 `From`。写成短名字省得刷屏。
 #[inline]
@@ -164,6 +168,7 @@ pub struct TerminalElement {
     search: Option<Rc<RefCell<TerminalSearch>>>,
     search_colors: SearchColors,
     flash: Option<FlashLine>,
+    file_links: Option<FileLinks>,
 }
 
 /// 一次性的「整行闪一下」。跳到某一行之后给的可见反馈,到期由**宿主**撤掉
@@ -250,7 +255,14 @@ impl TerminalElement {
             search: None,
             search_colors: SearchColors::default(),
             flash: None,
+            file_links: None,
         }
+    }
+
+    /// Ctrl(⌘)+悬停 / 单击文件路径。见 [`super::links`]。
+    pub fn file_links(mut self, links: Option<FileLinks>) -> Self {
+        self.file_links = links;
+        self
     }
 
     /// 接上查找引擎:每帧同步命中集合并把命中格子画上底色。
@@ -375,6 +387,11 @@ struct TerminalElementState {
     dwell: Rc<RefCell<DwellTracker>>,
     /// 在飞的 dwell 定时器。**必须留着句柄** —— gpui 的 `Task` 一 drop 就取消。
     dwell_task: Rc<RefCell<Option<gpui::Task<()>>>>,
+    /// 按住 Ctrl 时鼠标上一次所在的格子(没按 / 不在元素上 = `None`)。只用来判断
+    /// 「该不该要一帧」,悬停态本身在 paint 里现算(见 [`super::links`])。
+    link_pointer: Rc<StdCell<Option<(usize, usize)>>>,
+    /// 宿主对路径候选的裁决缓存。
+    link_cache: Rc<RefCell<LinkCache>>,
 }
 
 impl Default for TerminalElementState {
@@ -392,6 +409,8 @@ impl Default for TerminalElementState {
             last_offset: Rc::new(StdCell::new(0)),
             dwell: Rc::new(RefCell::new(DwellTracker::default())),
             dwell_task: Rc::new(RefCell::new(None)),
+            link_pointer: Rc::new(StdCell::new(None)),
+            link_cache: Rc::new(RefCell::new(LinkCache::default())),
         }
     }
 }
@@ -439,6 +458,8 @@ pub struct PreparedFrame {
     origin: Point<Pixels>,
     columns: usize,
     screen_lines: usize,
+    /// 本帧的回看偏移。屏幕行 ↔ grid 行号的换算(`line = row - display_offset`)。
+    display_offset: usize,
     mode: TermMode,
     /// 本帧要画的行:`(行首 y,渲染产物)`。y 相对元素原点。
     rows: Vec<(Pixels, Rc<RowRender>)>,
@@ -668,6 +689,73 @@ impl TerminalElement {
         AlacPoint::new(Line(row as i32 - display_offset as i32), Column(col))
     }
 
+    /// 这一帧鼠标底下的文件链接。**只能在 paint 里调**:`hitbox.is_hovered` 认的是
+    /// 本帧的命中测试,prepaint 时它还是上一帧的。
+    ///
+    /// 不在链接态(没按 Ctrl / 鼠标不在终端上 / 正在拖选或拖滚动条 / 按键正被上报给
+    /// TUI)时顺手清掉裁决缓存,下次按下 Ctrl 时刚生成的文件也认得出来。
+    fn hovered_link(&self, prepared: &PreparedFrame, window: &Window, cx: &App) -> Option<HoveredLink> {
+        let links = self.file_links.as_ref()?;
+        let state = &prepared.state;
+        let position = window.mouse_position();
+        let on_bar = prepared
+            .scrollbar
+            .is_some_and(|bar| bar.hit(position, GRAB_SLACK) != ScrollbarHit::Miss);
+        let active = window.modifiers().secondary()
+            && prepared.hitbox.is_hovered(window)
+            && !on_bar
+            && !state.selecting.get()
+            && state.reported_button.get().is_none()
+            && state.scrollbar.get().grab_offset.is_none();
+        if !active {
+            state.link_cache.borrow_mut().clear();
+            return None;
+        }
+        let (col, row, _) = Self::hit_cell(
+            position,
+            prepared.origin,
+            prepared.cell_size,
+            prepared.columns,
+            prepared.screen_lines,
+        );
+        let line = row as i32 - prepared.display_offset as i32;
+        links::probe(
+            &self.emulator,
+            links,
+            line,
+            col,
+            &mut state.link_cache.borrow_mut(),
+            cx,
+        )
+    }
+
+    /// 链接下划线:每段一条 1px 的线,贴着格子底边往上 2px(与 IME 预编辑串的
+    /// 下划线同一粗细)。颜色取前景色 —— 链接文字本身可能是任何颜色,前景色在
+    /// 默认背景上的对比度由主题保证。
+    fn paint_link_underline(&self, prepared: &PreparedFrame, link: &HoveredLink, window: &mut Window) {
+        let cell = prepared.cell_size;
+        for span in &link.spans {
+            let row = span.line + prepared.display_offset as i32;
+            if row < 0 || row as usize >= prepared.screen_lines {
+                continue;
+            }
+            let end = span.end.min(prepared.columns);
+            if end <= span.start {
+                continue;
+            }
+            window.paint_quad(fill(
+                Bounds::new(
+                    point(
+                        prepared.origin.x + cell.width * span.start as f32,
+                        prepared.origin.y + cell.height * (row + 1) as f32 - px(2.0),
+                    ),
+                    size(cell.width * (end - span.start) as f32, px(1.0)),
+                ),
+                self.theme.foreground,
+            ));
+        }
+    }
+
     /// 滚动条的两个 quad(轨道可选 + 滑块)。
     ///
     /// 淡出是「按时间算 alpha + 没淡完就再要一帧」,不走 `with_animation` ——
@@ -769,8 +857,6 @@ impl TerminalElement {
             f32::from(prepared.hitbox.bounds.size.width),
             f32::from(prepared.hitbox.bounds.size.height),
         );
-        // 6px 的条子精确命中太难点,左右各放宽 3px(与原生滚动条的手感一致)
-        const GRAB_SLACK: Pixels = px(3.0);
 
         // ── 滚轮
         //
@@ -862,6 +948,8 @@ impl TerminalElement {
             let dwell_cfg = self.dwell;
             let this_emulator = self.emulator.clone();
             let on_copied = self.on_selection_copied.clone();
+            let file_links = self.file_links.clone();
+            let link_cache = state.link_cache.clone();
             window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
                 if phase != DispatchPhase::Bubble || !hitbox.is_hovered(window) {
                     return;
@@ -905,6 +993,28 @@ impl TerminalElement {
                             return;
                         }
                         ScrollbarHit::Miss => {}
+                    }
+                }
+
+                // ── 文件链接:Ctrl(⌘)+左键点在链接上 = 打开。排在鼠标上报之前 ——
+                //    开了上报的 TUI 里照样能点;点中了既不起选区、也不报给程序。
+                //
+                //    按**这一下**的位置与修饰键现识别,不读上一帧画出来的悬停态:
+                //    非焦点的分屏按下 Ctrl 收不到 modifiers-changed,没动鼠标就直接点,
+                //    上一帧根本没画过下划线。
+                if event.button == MouseButton::Left
+                    && event.modifiers.secondary()
+                    && let Some(links) = file_links.as_ref()
+                {
+                    let display_offset = emulator.with_term(|t| t.grid().display_offset());
+                    let line = row as i32 - display_offset as i32;
+                    let hit =
+                        links::probe(&emulator, links, line, col, &mut link_cache.borrow_mut(), cx);
+                    if let Some(hit) = hit {
+                        (links.open)(&hit.link, window, cx);
+                        // 视图那层的「左键聚焦终端」不必再跑:焦点马上要交给文件页
+                        cx.stop_propagation();
+                        return;
                     }
                 }
 
@@ -1019,9 +1129,27 @@ impl TerminalElement {
             let dwell_cfg = self.dwell;
             let on_copied = self.on_selection_copied.clone();
             let this_emulator = self.emulator.clone();
+            let has_links = self.file_links.is_some();
+            let link_pointer = state.link_pointer.clone();
             window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
                 if phase != DispatchPhase::Bubble {
                     return;
+                }
+
+                // ── 文件链接:按住 Ctrl 跨格、松开、移出元素时要一帧(悬停态在 paint 里
+                //    现算)。不按 Ctrl 的移动这里只比一次 `None == None`,不要帧。
+                if has_links {
+                    let cell = (event.modifiers.secondary()
+                        && event.pressed_button.is_none()
+                        && hitbox.is_hovered(window))
+                    .then(|| {
+                        let (col, row, _) =
+                            Self::hit_cell(event.position, origin, cell_size, columns, screen_lines);
+                        (col, row)
+                    });
+                    if link_pointer.replace(cell) != cell {
+                        cx.notify(view_id);
+                    }
                 }
 
                 // ── 拖着滑块:全局跟手,拖出元素也继续(和所有滚动条一样)
@@ -1763,6 +1891,7 @@ impl Element for TerminalElement {
             origin: bounds.origin,
             columns,
             screen_lines,
+            display_offset: frame_display_offset,
             mode,
             rows,
             cursor,
@@ -1795,6 +1924,9 @@ impl Element for TerminalElement {
         }
 
         let origin = bounds.origin;
+        // 文件链接的悬停态:这一帧现算(理由见 `super::links` 模块注释)。
+        // 不进行签名、不碰 RowCache —— 下划线是叠在格子上的一层浮标,与整行闪烁同一口径
+        let hovered_link = self.hovered_link(prepared, window, cx);
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             for (y, render) in prepared.rows.iter() {
                 let delta = point(origin.x, origin.y + *y);
@@ -1881,6 +2013,11 @@ impl Element for TerminalElement {
                 }
             }
 
+            // ── 文件链接下划线压在文字之上、预编辑浮层之下(组合串要盖住它底下的一切)
+            if let Some(link) = hovered_link.as_ref() {
+                self.paint_link_underline(prepared, link, window);
+            }
+
             // ── IME 预编辑浮层:盖住底下的 grid 内容再画,否则组合串会与残留字符叠糊
             if let Some(p) = prepared.preedit.as_ref() {
                 let height = prepared.cell_size.height;
@@ -1905,6 +2042,10 @@ impl Element for TerminalElement {
             //    拖滑块时行缓存该命中还是命中(滚屏行只是换了个 y)。
             self.paint_scrollbar(prepared, window);
         });
+
+        if hovered_link.is_some() {
+            window.set_cursor_style(CursorStyle::PointingHand, &prepared.hitbox);
+        }
 
         self.paint_mouse_listeners(prepared, window, cx);
     }

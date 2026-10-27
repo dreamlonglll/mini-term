@@ -12,6 +12,7 @@ pub mod damage;
 mod element;
 pub mod ime;
 mod input;
+pub mod links;
 mod mini;
 pub mod mouse;
 pub mod scrollbar;
@@ -28,6 +29,7 @@ pub use element::{
 };
 pub use ime::{ImeState, Preedit, commit_to_bytes};
 pub use input::{is_text_input_key, keystroke_to_bytes, paste_to_bytes};
+pub use links::{FileLink, FileLinks, OpenFileLink, ResolveFileLink};
 pub use mini::{
     MINI_REFRESH_MS, MiniCell, MiniGeometry, MiniRun, MiniTerminalElement, build_row_runs,
     mini_geometry,

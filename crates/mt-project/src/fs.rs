@@ -299,6 +299,14 @@ fn verify_followed_under_project_root(project_root: &Path, target: &Path) -> Res
     Ok(followed)
 }
 
+/// 这个路径能不能交给文件页打开:跟随链接后仍在项目根内,且是个文件。
+///
+/// 与 [`read_file_content`] 读前那道校验同一把尺子 —— 终端里 Ctrl+悬停判过的路径,
+/// 点开时不会再被文件页以「不在项目根内」拒掉。
+pub fn is_viewable_file(project_root: &Path, path: &Path) -> bool {
+    verify_followed_under_project_root(project_root, path).is_ok_and(|p| p.is_file())
+}
+
 /// 过滤出有效的目录路径（用于拖拽添加项目时验证）
 pub fn filter_directories(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     paths.into_iter().filter(|p| p.is_dir()).collect()
