@@ -81,8 +81,8 @@ impl SettingsView {
     }
 
     fn toggle_env_row(&mut self, rid: u64, cx: &mut Context<Self>) {
-        if let Some(row) = self.env_rows.iter_mut().find(|r| r.rid == rid) {
-            row.enabled = !row.enabled;
+        if let Some(row) = self.env_rows.iter().find(|r| r.rid == rid) {
+            row.enabled.set(!row.enabled.get());
         }
         self.commit_env_vars(cx);
         cx.notify();

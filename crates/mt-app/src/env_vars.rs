@@ -29,6 +29,9 @@
 //!    (`save_config_now`),写失败只会在 stderr 留痕 —— 与本壳其它每一处配置
 //!    写入同一条路,不为这一个弹窗另造回滚机制。
 
+use std::cell::Cell;
+use std::rc::Rc;
+
 use gpui::{
     AnyElement, App, AppContext, ClickEvent, Context, Entity, InteractiveElement, IntoElement,
     ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
@@ -36,7 +39,7 @@ use gpui::{
 };
 use gpui_component::input::{Input, InputState};
 use mt_config::ProjectEnvVar;
-use mt_ui::tooltip::TooltipExt as _;
+use mt_ui::tooltip::{Tooltip, TooltipExt as _};
 
 use crate::i18n::{t, tr};
 use crate::prompt::{autofocus, close_guarded, kind, open_guarded};
@@ -165,7 +168,11 @@ pub struct EnvRow {
     pub rid: u64,
     pub key: Entity<InputState>,
     pub value: Entity<InputState>,
-    pub enabled: bool,
+    /// 勾选状态放在共享格子里(克隆出来的行与原行共用),而不是一个 `bool`:
+    /// gpui 在鼠标**移入**那一刻就把气泡构造闭包抓进延时任务,按下鼠标也只清已显示的
+    /// 气泡、不清等待中的 —— 移上去随手一点,延时到点弹出来的是点击前的「已启用」。
+    /// 勾选框的提示因此每次渲染都现读这个格子(见 [`table_row`])。
+    pub enabled: Rc<Cell<bool>>,
 }
 
 /// 建一行的两个输入框。
@@ -189,7 +196,7 @@ pub fn new_row(
                 .placeholder(t("envVars", "valuePlaceholder"))
                 .default_value(value.to_string())
         }),
-        enabled,
+        enabled: Rc::new(Cell::new(enabled)),
     }
 }
 
@@ -200,7 +207,7 @@ pub fn snapshot(rows: &[EnvRow], cx: &App) -> Vec<(String, String, bool)> {
             (
                 r.key.read(cx).value().to_string(),
                 r.value.read(cx).value().to_string(),
-                r.enabled,
+                r.enabled.get(),
             )
         })
         .collect()
@@ -246,7 +253,7 @@ pub fn table_row(
     on_remove: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> gpui::Div {
     let rid = row.rid;
-    let enabled = row.enabled;
+    let enabled = row.enabled.clone();
     div()
         .flex()
         .flex_col()
@@ -257,11 +264,18 @@ pub fn table_row(
                 .items_center()
                 .gap(px(8.0))
                 .child(
-                    ui::checkbox(SharedString::from(format!("env-on-{rid}")), enabled)
-                        .tip(if enabled {
-                            t("envVars", "rowEnabled")
-                        } else {
-                            t("envVars", "rowDisabled")
+                    ui::checkbox(SharedString::from(format!("env-on-{rid}")), enabled.get())
+                        // 文案在气泡每次渲染时现读勾选状态,理由见 `EnvRow::enabled`
+                        .tip_with(move |window, cx| {
+                            let enabled = enabled.clone();
+                            Tooltip::element(move |_window, _cx| {
+                                if enabled.get() {
+                                    t("envVars", "rowEnabled")
+                                } else {
+                                    t("envVars", "rowDisabled")
+                                }
+                            })
+                            .build(window, cx)
                         })
                         .on_click(on_toggle),
                 )
@@ -442,8 +456,8 @@ fn render_body(state: &Entity<EnvVarsPanel>, cx: &mut App) -> AnyElement {
                 let state = state.clone();
                 move |_: &ClickEvent, _window: &mut Window, cx: &mut App| {
                     state.update(cx, |panel, cx| {
-                        if let Some(row) = panel.rows.iter_mut().find(|r| r.rid == rid) {
-                            row.enabled = !row.enabled;
+                        if let Some(row) = panel.rows.iter().find(|r| r.rid == rid) {
+                            row.enabled.set(!row.enabled.get());
                         }
                         cx.notify();
                     });
