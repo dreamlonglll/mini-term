@@ -324,8 +324,9 @@ impl TerminalPane {
     /// 建 emulator 与视图、登记 AI 感知后**立即返回**;PTY 由 `launch` 在后台起,
     /// 完成后回主线程回填(见模块注释「PTY 在后台起」)。
     ///
-    /// `user_env` 是项目级环境变量:走 [`mt_pty::PtyOptions::user_env`] 而不是
-    /// `spec.env`,因为前者会被 `MINITERM_` 前缀过滤挡一道 —— 用户手改配置
+    /// `user_env` 是用户配的环境变量(全局 + 项目级,已合并):走
+    /// [`mt_pty::PtyOptions::user_env`] 而不是 `spec.env`,
+    /// 因为前者会被 `MINITERM_` 前缀过滤挡一道 —— 用户手改配置
     /// (现在是 `config.db`)也覆盖不掉内部协议变量。
     #[allow(clippy::too_many_arguments)]
     pub fn new(

@@ -93,6 +93,11 @@ pub struct AppConfig {
     /// (GPUI 侧换 `alacritty_terminal` 的 grid 后单行开销另算,但语义与上限含义不变。)
     #[serde(default = "default_terminal_scrollback")]
     pub terminal_scrollback: u32,
+    /// 全局终端环境变量(设置 → 环境变量):每个**本地**终端新建时都注入。
+    /// 项目级 [`ProjectConfig::env_vars`] 里的同名变量优先;远程 pane 两者都不注入。
+    /// 空 Vec 时序列化跳过,旧配置缺字段按空表读。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub terminal_env_vars: Vec<ProjectEnvVar>,
     // ─── 以下五个字段已搬进 `layout.db`(见 `mt-layout`)───────────────────
     //
     // **只读不写**:保留反序列化是为了给存量 `config.json` 做一次性迁移,
@@ -454,7 +459,9 @@ pub struct SavedProjectLayout {
 
 /// 项目级环境变量。注入到该项目新建终端 PTY 的子进程,与 portable-pty 默认继承的
 /// 父进程 env 合并(同名 key 覆盖)。已开终端不受影响。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// 全局那一份([`AppConfig::terminal_env_vars`])用的也是这个形状。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectEnvVar {
     pub key: String,
@@ -722,6 +729,7 @@ impl Default for AppConfig {
             terminal_font_family: None,
             terminal_ligatures: false,
             terminal_scrollback: default_terminal_scrollback(),
+            terminal_env_vars: vec![],
             layout_sizes: None,
             middle_column_sizes: None,
             theme: default_theme(),
@@ -2257,6 +2265,41 @@ mod tests {
             !serialized.contains("envVars"),
             "空 envVars 不应序列化进 JSON: {serialized}"
         );
+    }
+
+    /// 全局终端环境变量:缺字段读成空表、空表不落盘,有值时按 `terminalEnvVars` 往返。
+    #[test]
+    fn terminal_env_vars_round_trip() {
+        let json = r#"{
+            "projects": [],
+            "defaultShell": "cmd",
+            "availableShells": [{"name": "cmd", "command": "cmd"}]
+        }"#;
+        let mut config: AppConfig = serde_json::from_str(json).unwrap();
+        assert!(config.terminal_env_vars.is_empty());
+        let serialized = serde_json::to_string(&config).unwrap();
+        assert!(
+            !serialized.contains("terminalEnvVars"),
+            "空表不应序列化: {serialized}"
+        );
+
+        config.terminal_env_vars = vec![
+            ProjectEnvVar {
+                key: "LANG".into(),
+                value: "zh_CN.UTF-8".into(),
+                enabled: true,
+            },
+            ProjectEnvVar {
+                key: "HTTPS_PROXY".into(),
+                value: "http://127.0.0.1:7890".into(),
+                enabled: false,
+            },
+        ];
+        let value = serde_json::to_value(&config).unwrap();
+        assert_eq!(value["terminalEnvVars"][1]["key"], "HTTPS_PROXY");
+        assert_eq!(value["terminalEnvVars"][1]["enabled"], false);
+        let reparsed: AppConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(reparsed.terminal_env_vars, config.terminal_env_vars);
     }
 
     #[test]

@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use mt_config::ProjectConfig;
+use mt_config::{ProjectConfig, ProjectEnvVar};
 use mt_ui::TerminalStyle;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -359,6 +359,40 @@ pub fn terminal_style_from(size: f64, family: Option<&str>, ligatures: bool) -> 
     }
     style.font_fallbacks = families.into_iter().map(Into::into).collect();
     style
+}
+
+// ─── 终端环境变量的纯函数(可测) ──────────────────────────────
+
+/// 新建本地终端要注入的环境变量:设置页的全局表打底,项目级表覆盖同名项。
+///
+/// - 只收 `enabled` 的行 —— 取消勾选的项目级变量等于没写,**不会**挡住全局同名值;
+/// - 同名判定在 Windows 上不分大小写(环境块本身就不分,`Path` 与 `PATH` 是同一个),
+///   其余平台按原文;覆盖时留在先出现的那个位置,key 与 value 都换成后来者;
+/// - 输出里同名 key 只出现一次:WSL 分支要拿这张表拼 `WSLENV`。
+///
+/// 保留前缀 / `WSLENV` 的过滤不在这里 —— 那道防线在 `mt_pty` 的启动计划里,
+/// 两处各判一遍会漂移。
+pub fn merge_terminal_env(
+    global: &[ProjectEnvVar],
+    project: &[ProjectEnvVar],
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for var in global.iter().chain(project).filter(|v| v.enabled) {
+        let entry = (var.key.clone(), var.value.clone());
+        match out.iter_mut().find(|(key, _)| same_env_key(key, &var.key)) {
+            Some(slot) => *slot = entry,
+            None => out.push(entry),
+        }
+    }
+    out
+}
+
+fn same_env_key(a: &str, b: &str) -> bool {
+    if cfg!(windows) {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a == b
+    }
 }
 
 /// 启动恢复某个 pane 时该不该自动续接、续接命令是什么
@@ -1310,6 +1344,62 @@ mod tests {
         // 小数四舍五入
         assert_eq!(resolve_scrollback(1234.6), 1235);
         assert_eq!(resolve_scrollback(MAX_SCROLLBACK as f64), MAX_SCROLLBACK);
+    }
+
+    fn env_var(key: &str, value: &str, enabled: bool) -> ProjectEnvVar {
+        ProjectEnvVar {
+            key: key.into(),
+            value: value.into(),
+            enabled,
+        }
+    }
+
+    fn env_pairs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// 全局打底、项目覆盖同名;两边都只收勾选的行,取消勾选的项目行挡不住全局值。
+    #[test]
+    fn 终端环境变量_项目级覆盖全局同名() {
+        let global = [
+            env_var("A", "global", true),
+            env_var("B", "global", true),
+            env_var("OFF", "global", false),
+        ];
+        let project = [
+            env_var("B", "project", true),
+            env_var("C", "project", true),
+            env_var("A", "project-off", false),
+        ];
+        assert_eq!(
+            merge_terminal_env(&global, &project),
+            env_pairs(&[("A", "global"), ("B", "project"), ("C", "project")])
+        );
+        // 只有一边有值时原样透出
+        assert_eq!(
+            merge_terminal_env(&global, &[]),
+            env_pairs(&[("A", "global"), ("B", "global")])
+        );
+        assert_eq!(
+            merge_terminal_env(&[], &project),
+            env_pairs(&[("B", "project"), ("C", "project")])
+        );
+        assert!(merge_terminal_env(&[], &[]).is_empty());
+    }
+
+    /// 同名判定:Windows 上 `Path` 与 `PATH` 是同一个变量,其余平台是两个。
+    #[test]
+    fn 终端环境变量_同名判定随平台() {
+        let merged =
+            merge_terminal_env(&[env_var("Path", "g", true)], &[env_var("PATH", "p", true)]);
+        if cfg!(windows) {
+            assert_eq!(merged, env_pairs(&[("PATH", "p")]));
+        } else {
+            assert_eq!(merged, env_pairs(&[("Path", "g"), ("PATH", "p")]));
+        }
     }
 
     /// 终端字族:首项当主字体,其余进回退,并**自动补 CJK 与 emoji**。
