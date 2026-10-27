@@ -51,6 +51,12 @@ export const settings = {
       remotePasteDirDesc: "在 SSH 远程项目的终端里粘贴图片 / 超长文本时，文件会先传到远端这个目录，再粘贴远端路径",
       remotePasteFooter: "相对路径按远程项目根解析（默认 .mini-term/pasted，落在项目内 agent 可直接读取）· 也可填远端绝对路径如 /tmp/mini-term 或 ~/uploads · 不允许包含 .. · WSL 项目无需上传，自动改用 /mnt 路径",
     },
+    envVars: {
+      section: "终端环境变量",
+      addVar: "+ 添加环境变量",
+      hint: "所有项目新建的本地终端都会带上这些变量 · 项目右键菜单「环境变量」里的同名变量优先 · 修改只对之后新建的终端生效 · SSH 远程终端不注入 · 值按原样写入，不展开 %PATH% / $PATH 这类引用",
+      hasErrors: "有校验错误时整张表都不保存，改正后自动保存",
+    },
     appearance: {
       language: "语言",
       languageLabel: "界面语言",
@@ -226,6 +232,7 @@ export const settings = {
       // 分页
       shell: "Shell",
       clipboard: "复制粘贴",
+      envVars: "环境变量",
       appearance: "主题与语言",
       font: "字体",
       aiNotification: "通知提醒",
@@ -288,6 +295,12 @@ export const settings = {
       remotePasteDir: "Upload directory for remote projects",
       remotePasteDirDesc: "When pasting images / long text into an SSH remote project's terminal, the file is uploaded to this directory first and the remote path is pasted instead",
       remotePasteFooter: "Relative paths resolve against the remote project root (default .mini-term/pasted, inside the project so agents can read it without extra permission) · Absolute remote paths like /tmp/mini-term or ~/uploads also work · `..` is rejected · WSL projects need no upload and use /mnt paths automatically",
+    },
+    envVars: {
+      section: "Terminal environment variables",
+      addVar: "+ Add variable",
+      hint: "Every new local terminal in every project gets these variables · A variable with the same name in a project's \"Environment Variables\" (right-click menu) wins · Changes only apply to terminals opened afterwards · Not injected into SSH remote terminals · Values are written verbatim; references like %PATH% / $PATH are not expanded",
+      hasErrors: "Nothing in the table is saved while any row has an error; it saves automatically once fixed",
     },
     appearance: {
       language: "Language",
@@ -464,6 +477,7 @@ export const settings = {
       // Pages
       shell: "Shell",
       clipboard: "Copy & paste",
+      envVars: "Environment variables",
       appearance: "Theme & language",
       font: "Font",
       aiNotification: "Notifications",

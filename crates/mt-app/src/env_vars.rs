@@ -5,6 +5,10 @@
 //! 由 [`AppStore::start_pty`] 在**新建终端**时注入(已有终端不受影响 —— 底栏
 //! 那句脚注说的就是这件事)。
 //!
+//! 设置页的「环境变量」页(全局那一份,`AppConfig::terminal_env_vars`)用的是
+//! 同一张表:行状态 [`EnvRow`]、表头 [`table_header`]、一行 [`table_row`] 与校验
+//! 都在这里,两边只是外壳与提交时机不同(弹窗点「保存」,设置页失焦即落盘)。
+//!
 //! # 校验(纯逻辑,单测钉死)
 //!
 //! [`compute_errors`] 逐行判,优先级照抄原版:
@@ -125,6 +129,15 @@ pub fn compute_errors(rows: &[(String, String)]) -> Vec<Option<RowError>> {
         .collect()
 }
 
+/// [`compute_errors`] 的快照版:入参是 [`snapshot`] 的三元组(勾选与否不参与校验)。
+pub fn snapshot_errors(snapshot: &[(String, String, bool)]) -> Vec<Option<RowError>> {
+    let pairs: Vec<(String, String)> = snapshot
+        .iter()
+        .map(|(k, v, _)| (k.clone(), v.clone()))
+        .collect();
+    compute_errors(&pairs)
+}
+
 /// 保存时的清洗:丢掉「key 空白」的占位行,**保留 `enabled=false` 的行**
 /// (取消勾选时 value 保留但不注入,是配置字段本身的语义)。
 pub fn clean_rows(rows: &[(String, String, bool)]) -> Vec<ProjectEnvVar> {
@@ -144,43 +157,182 @@ fn is_wsl_path(path: &str) -> bool {
     lower.starts_with("\\\\wsl$\\") || lower.starts_with("\\\\wsl.localhost\\")
 }
 
-// ─── 视图 ─────────────────────────────────────────────────────
+// ─── 表格(弹窗与设置页共用) ─────────────────────────────────
 
 /// 编辑中的一行。`rid` 只用来做元素 id 与「刚新增的那一行」定位,不落盘。
-struct Row {
-    rid: u64,
-    key: Entity<InputState>,
-    value: Entity<InputState>,
-    enabled: bool,
+#[derive(Clone)]
+pub struct EnvRow {
+    pub rid: u64,
+    pub key: Entity<InputState>,
+    pub value: Entity<InputState>,
+    pub enabled: bool,
 }
+
+/// 建一行的两个输入框。
+pub fn new_row(
+    rid: u64,
+    key: &str,
+    value: &str,
+    enabled: bool,
+    window: &mut Window,
+    cx: &mut App,
+) -> EnvRow {
+    EnvRow {
+        rid,
+        key: cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(t("envVars", "keyPlaceholder"))
+                .default_value(key.to_string())
+        }),
+        value: cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(t("envVars", "valuePlaceholder"))
+                .default_value(value.to_string())
+        }),
+        enabled,
+    }
+}
+
+/// 表里此刻的 `(key, value, enabled)`,原文不 trim(校验与清洗各自处理空白)。
+pub fn snapshot(rows: &[EnvRow], cx: &App) -> Vec<(String, String, bool)> {
+    rows.iter()
+        .map(|r| {
+            (
+                r.key.read(cx).value().to_string(),
+                r.value.read(cx).value().to_string(),
+                r.enabled,
+            )
+        })
+        .collect()
+}
+
+/// 表头:启用 / 变量名 / 变量值,右侧给删行按钮留位。
+pub fn table_header() -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(8.0))
+        .mb(px(8.0))
+        .text_size(ui::font_px(10.0))
+        .text_color(ui::text_muted())
+        .child(
+            div()
+                .w(px(16.0))
+                .flex_none()
+                .child(t("envVars", "colEnabled")),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .child(t("envVars", "keyHeader")),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .child(t("envVars", "valueHeader")),
+        )
+        .child(div().w(px(24.0)).flex_none())
+}
+
+/// 一行:勾选框 + 变量名 + 变量值 + 删行,报错时下方一行红字。
+///
+/// 点击回调由调用方给 —— 弹窗改的是它自己的面板实体,设置页走 `cx.listener`。
+pub fn table_row(
+    row: &EnvRow,
+    err: Option<RowError>,
+    on_toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    on_remove: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> gpui::Div {
+    let rid = row.rid;
+    let enabled = row.enabled;
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(2.0))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .child(
+                    ui::checkbox(SharedString::from(format!("env-on-{rid}")), enabled)
+                        .tip(if enabled {
+                            t("envVars", "rowEnabled")
+                        } else {
+                            t("envVars", "rowDisabled")
+                        })
+                        .on_click(on_toggle),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        // 报错行描红边:gpui 的 `Input` 自带边框,这里在外层
+                        // 套一圈同色边(1px)最不破版
+                        .when(err.is_some(), |el| {
+                            el.rounded(px(4.0))
+                                .border_1()
+                                .border_color(ui::color_error())
+                        })
+                        .child(Input::new(&row.key)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .when(err.is_some(), |el| {
+                            el.rounded(px(4.0))
+                                .border_1()
+                                .border_color(ui::color_error())
+                        })
+                        .child(Input::new(&row.value)),
+                )
+                .child(
+                    div()
+                        .id(SharedString::from(format!("env-del-{rid}")))
+                        .w(px(24.0))
+                        .h(px(24.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(4.0))
+                        .cursor_pointer()
+                        .text_size(ui::font_px(11.0))
+                        .text_color(ui::text_muted())
+                        .hover(|el| el.text_color(ui::color_error()))
+                        .tip(t("envVars", "removeRow"))
+                        .child("✕")
+                        .on_click(on_remove),
+                ),
+        )
+        .when_some(err, |el, err| {
+            el.child(
+                div()
+                    .ml(px(24.0))
+                    .text_size(ui::font_px(10.0))
+                    .text_color(ui::color_error())
+                    .child(t("envVars", err.key())),
+            )
+        })
+}
+
+// ─── 视图 ─────────────────────────────────────────────────────
 
 pub struct EnvVarsPanel {
     store: Entity<AppStore>,
     project_id: String,
     project_name: String,
     project_path: String,
-    rows: Vec<Row>,
+    rows: Vec<EnvRow>,
     next_rid: u64,
 }
 
 impl Render for EnvVarsPanel {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
-    }
-}
-
-impl EnvVarsPanel {
-    fn snapshot(&self, cx: &App) -> Vec<(String, String, bool)> {
-        self.rows
-            .iter()
-            .map(|r| {
-                (
-                    r.key.read(cx).value().to_string(),
-                    r.value.read(cx).value().to_string(),
-                    r.enabled,
-                )
-            })
-            .collect()
     }
 }
 
@@ -240,37 +392,9 @@ pub fn open(store: Entity<AppStore>, project_id: &str, window: &mut Window, cx: 
     }
 }
 
-fn new_row(
-    rid: u64,
-    key: &str,
-    value: &str,
-    enabled: bool,
-    window: &mut Window,
-    cx: &mut App,
-) -> Row {
-    Row {
-        rid,
-        key: cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder(t("envVars", "keyPlaceholder"))
-                .default_value(key.to_string())
-        }),
-        value: cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder(t("envVars", "valuePlaceholder"))
-                .default_value(value.to_string())
-        }),
-        enabled,
-    }
-}
-
 fn save(state: &Entity<EnvVarsPanel>, window: &mut Window, cx: &mut App) {
-    let snapshot = state.read(cx).snapshot(cx);
-    let pairs: Vec<(String, String)> = snapshot
-        .iter()
-        .map(|(k, v, _)| (k.clone(), v.clone()))
-        .collect();
-    if compute_errors(&pairs).iter().any(Option::is_some) {
+    let snapshot = snapshot(&state.read(cx).rows, cx);
+    if snapshot_errors(&snapshot).iter().any(Option::is_some) {
         return;
     }
     let vars = clean_rows(&snapshot);
@@ -286,25 +410,15 @@ fn save(state: &Entity<EnvVarsPanel>, window: &mut Window, cx: &mut App) {
 }
 
 fn render_body(state: &Entity<EnvVarsPanel>, cx: &mut App) -> AnyElement {
-    let (project_name, project_path, rows, snapshot) = {
+    let (project_name, project_path, rows) = {
         let panel = state.read(cx);
-        let rows: Vec<(u64, Entity<InputState>, Entity<InputState>, bool)> = panel
-            .rows
-            .iter()
-            .map(|r| (r.rid, r.key.clone(), r.value.clone(), r.enabled))
-            .collect();
         (
             panel.project_name.clone(),
             panel.project_path.clone(),
-            rows,
-            panel.snapshot(cx),
+            panel.rows.clone(),
         )
     };
-    let pairs: Vec<(String, String)> = snapshot
-        .iter()
-        .map(|(k, v, _)| (k.clone(), v.clone()))
-        .collect();
-    let errors = compute_errors(&pairs);
+    let errors = snapshot_errors(&snapshot(&rows, cx));
     let has_errors = errors.iter().any(Option::is_some);
 
     let mut table = div()
@@ -315,121 +429,36 @@ fn render_body(state: &Entity<EnvVarsPanel>, cx: &mut App) -> AnyElement {
         .py(px(16.0))
         .flex()
         .flex_col()
-        // 表头
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(8.0))
-                .mb(px(8.0))
-                .text_size(ui::font_px(10.0))
-                .text_color(ui::text_muted())
-                .child(div().w(px(16.0)).flex_none().child(t("envVars", "colEnabled")))
-                .child(div().flex_1().min_w(px(0.0)).child(t("envVars", "keyHeader")))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .child(t("envVars", "valueHeader")),
-                )
-                .child(div().w(px(24.0)).flex_none()),
-        );
+        .child(table_header());
 
     let mut list = div().flex().flex_col().gap(px(6.0));
-    for (idx, (rid, key_input, value_input, enabled)) in rows.into_iter().enumerate() {
+    for (idx, row) in rows.iter().enumerate() {
+        let rid = row.rid;
         let err = errors.get(idx).copied().flatten();
-        list = list.child(
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(2.0))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(8.0))
-                        .child(
-                            ui::checkbox(SharedString::from(format!("env-on-{rid}")), enabled)
-                                .tip(if enabled {
-                                    t("envVars", "rowEnabled")
-                                } else {
-                                    t("envVars", "rowDisabled")
-                                })
-                                .on_click({
-                                    let state = state.clone();
-                                    move |_: &ClickEvent, _window: &mut Window, cx: &mut App| {
-                                        state.update(cx, |panel, cx| {
-                                            if let Some(row) =
-                                                panel.rows.iter_mut().find(|r| r.rid == rid)
-                                            {
-                                                row.enabled = !row.enabled;
-                                            }
-                                            cx.notify();
-                                        });
-                                    }
-                                }),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.0))
-                                // 报错行描红边:gpui 的 `Input` 自带边框,这里在外层
-                                // 套一圈同色边(1px)最不破版
-                                .when(err.is_some(), |el| {
-                                    el.rounded(px(4.0))
-                                        .border_1()
-                                        .border_color(ui::color_error())
-                                })
-                                .child(Input::new(&key_input)),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.0))
-                                .when(err.is_some(), |el| {
-                                    el.rounded(px(4.0))
-                                        .border_1()
-                                        .border_color(ui::color_error())
-                                })
-                                .child(Input::new(&value_input)),
-                        )
-                        .child(
-                            div()
-                                .id(SharedString::from(format!("env-del-{rid}")))
-                                .w(px(24.0))
-                                .h(px(24.0))
-                                .flex_none()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded(px(4.0))
-                                .cursor_pointer()
-                                .text_size(ui::font_px(11.0))
-                                .text_color(ui::text_muted())
-                                .hover(|el| el.text_color(ui::color_error()))
-                                .tip(t("envVars", "removeRow"))
-                                .child("✕")
-                                .on_click({
-                                    let state = state.clone();
-                                    move |_: &ClickEvent, _window: &mut Window, cx: &mut App| {
-                                        state.update(cx, |panel, cx| {
-                                            panel.rows.retain(|r| r.rid != rid);
-                                            cx.notify();
-                                        });
-                                    }
-                                }),
-                        ),
-                )
-                .when_some(err, |el, err| {
-                    el.child(
-                        div()
-                            .ml(px(24.0))
-                            .text_size(ui::font_px(10.0))
-                            .text_color(ui::color_error())
-                            .child(t("envVars", err.key())),
-                    )
-                }),
-        );
+        list = list.child(table_row(
+            row,
+            err,
+            {
+                let state = state.clone();
+                move |_: &ClickEvent, _window: &mut Window, cx: &mut App| {
+                    state.update(cx, |panel, cx| {
+                        if let Some(row) = panel.rows.iter_mut().find(|r| r.rid == rid) {
+                            row.enabled = !row.enabled;
+                        }
+                        cx.notify();
+                    });
+                }
+            },
+            {
+                let state = state.clone();
+                move |_: &ClickEvent, _window: &mut Window, cx: &mut App| {
+                    state.update(cx, |panel, cx| {
+                        panel.rows.retain(|r| r.rid != rid);
+                        cx.notify();
+                    });
+                }
+            },
+        ));
     }
 
     table = table.child(list).child(
@@ -619,6 +648,24 @@ mod tests {
             );
         }
         assert_eq!(compute_errors(&rows(&[("K", "a b\tc")])), vec![None]);
+    }
+
+    /// 快照版与二元组版同一口径:勾选与否不影响校验。
+    #[test]
+    fn 快照校验不看勾选() {
+        let snapshot = [
+            ("A".to_string(), "1".to_string(), true),
+            ("A".to_string(), "2".to_string(), false),
+            ("1X".to_string(), "3".to_string(), false),
+        ];
+        assert_eq!(
+            snapshot_errors(&snapshot),
+            vec![
+                Some(RowError::DuplicateKey),
+                Some(RowError::DuplicateKey),
+                Some(RowError::InvalidKey)
+            ]
+        );
     }
 
     /// 清洗:丢掉 key 空白的占位行,**保留取消勾选的行**(value 留着不注入)。

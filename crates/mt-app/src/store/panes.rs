@@ -16,9 +16,9 @@ use crate::tree::{
 
 use super::events::StoreChanged;
 use super::pure::{
-    apply_resolved_session_cwd, decide_resume_cwd, find_pane_of_pty, next_maximized,
-    resolve_auto_resume_command, resolve_resume_cwd, resolve_scrollback, sanitize_osc_title,
-    subtitle_enabled, terminal_style_from, visible_subtitle_changes,
+    apply_resolved_session_cwd, decide_resume_cwd, find_pane_of_pty, merge_terminal_env,
+    next_maximized, resolve_auto_resume_command, resolve_resume_cwd, resolve_scrollback,
+    sanitize_osc_title, subtitle_enabled, terminal_style_from, visible_subtitle_changes,
 };
 use super::{AppStore, StoreEvent};
 
@@ -811,7 +811,7 @@ impl AppStore {
         // AI 状态感知在这条路上走 PTY 输入/输出扫描的降级路径(输入检测作用于
         // 数据流,对远程天然可用);hook 精确状态不可用,PRD 已接受。
         //
-        // 项目级环境变量对远程 pane **不注入**(装机版同款:那些变量属于本地
+        // 项目级与全局环境变量对远程 pane **不注入**(装机版同款:那些变量属于本地
         // 机器,注给本地 ssh 客户端毫无意义)。
         //
         // 定 spec 的活全部打包成「启动预案」交给 pane 在后台兑现:远程预检要在 PATH
@@ -882,18 +882,14 @@ impl AppStore {
             Some(Err(err)) => Box::new(move || Err(err)),
         };
         let is_remote = project.ssh_connection_id.is_some();
-        // 项目级环境变量走 user_env —— 它会被 `MINITERM_` 前缀过滤挡一道,
-        // 用户手改配置(现在是 config.db)也覆盖不掉内部协议变量。
-        // 远程 pane 不注入(见上方分支注释)。
+        // 全局(设置 → 环境变量)+ 项目级环境变量走 user_env —— 它会被 `MINITERM_`
+        // 前缀过滤挡一道,用户手改配置(现在是 config.db)也覆盖不掉内部协议变量。
+        // 项目级同名优先,合并口径见 [`merge_terminal_env`]。
+        // 远程 pane 两者都不注入(见上方分支注释)。
         let user_env: Vec<(String, String)> = if is_remote {
             Vec::new()
         } else {
-            project
-                .env_vars
-                .iter()
-                .filter(|v| v.enabled)
-                .map(|v| (v.key.clone(), v.value.clone()))
-                .collect()
+            merge_terminal_env(&self.config.terminal_env_vars, &project.env_vars)
         };
 
         let style = self.terminal_style();

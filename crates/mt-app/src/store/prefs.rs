@@ -1,11 +1,11 @@
 //! 偏好与配置写入相关的 `AppStore` 方法:AI 历史面板视图、用量面板偏好、主题、
-//! shell 列表、通用配置补丁、终端渲染参数、终端重绘帧率、界面字号/字族、
-//! AI 感知取数口、界面语言、pane 重命名、移动端中转。
+//! shell 列表、全局终端环境变量、通用配置补丁、终端渲染参数、终端重绘帧率、
+//! 界面字号/字族、AI 感知取数口、界面语言、pane 重命名、移动端中转。
 //!
 //! 从 `store.rs` 原样搬来的一串段落,段注释随代码走,逻辑一行未改。
 
 use gpui::{App, Context, Entity, Window};
-use mt_config::{AiLauncher, AppConfig, MobileRelayConfig};
+use mt_config::{AiLauncher, AppConfig, MobileRelayConfig, ProjectEnvVar};
 use mt_relay::MobileRelayStatusPayload;
 use mt_ui::theme_bridge::BackgroundArt;
 
@@ -168,6 +168,20 @@ impl AppStore {
         self.config.default_shell = list.default_shell;
         self.save_config_soon(cx);
         cx.changed(StoreEvent::Config(ConfigSection::Shells));
+    }
+
+    // === 全局终端环境变量 ===
+
+    /// 设置 → 环境变量。与 [`Self::set_project_env_vars`] 同一口径:**立即落盘**,
+    /// 入参已由设置页清洗过(校验的唯一实现在 `env_vars::compute_errors`),
+    /// 只影响之后新建的终端。
+    pub fn set_terminal_env_vars(&mut self, vars: Vec<ProjectEnvVar>, cx: &mut Context<Self>) {
+        if self.config.terminal_env_vars == vars {
+            return;
+        }
+        self.config.terminal_env_vars = vars;
+        self.save_config_now();
+        cx.changed(StoreEvent::Config(ConfigSection::Settings));
     }
 
     // === 通用配置补丁 ===

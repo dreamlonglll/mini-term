@@ -1,10 +1,12 @@
-//! 设置面板:两级侧栏 + 10 个分页。逐页对照 `src/components/SettingsModal.tsx`。
+//! 设置面板:两级侧栏 + 11 个分页。逐页对照 `src/components/SettingsModal.tsx`
+//! (「环境变量」页是 GPUI 版新增的,原版没有)。
 //!
 //! ```text
 //! ┌──────────────┬────────────────────────────────────────┐
 //! │ 终端          │                                        │
 //! │  · Shell      │   (当前分页)                            │
 //! │  · 复制粘贴    │                                        │
+//! │  · 环境变量    │                                        │
 //! │ 外观          │                                        │
 //! │  · 主题与语言  │                                        │
 //! │  · 字体       │                                        │
@@ -44,12 +46,13 @@
 //! # 目录划分
 //!
 //! 本模块只留**面板本体**:分页枚举与侧栏分组、[`SettingsView`] 的状态字段、
-//! 草稿行的归一与提交、`open_settings` 与分页路由。十个分页各自的渲染按主题
-//! 分在四个 `pages_*` 里,共用小件在 `widgets`:
+//! 草稿行的归一与提交、`open_settings` 与分页路由。十一个分页各自的渲染按主题
+//! 分在五个 `pages_*` 里,共用小件在 `widgets`:
 //!
 //! | 文件 | 内容 |
 //! |------|------|
 //! | `pages_terminal` | terminal(Shell 列表)/ clipboard |
+//! | `pages_env_vars` | env-vars(全局终端环境变量,表格与项目弹窗共用 `crate::env_vars`) |
 //! | `pages_appearance` | appearance(语言 / 主题 / 外置皮肤)/ font |
 //! | `pages_ai` | ai-notification / ai-hook |
 //! | `pages_system` | system / editor / shortcuts / about |
@@ -58,7 +61,7 @@
 //! about 页要用的版本比较与 GitHub 查询**不在这棵树里** —— 它同时被 `main.rs`
 //! 的启动自检引用,住在顶层 [`crate::update_check`]。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use gpui::{
     AnyElement, App, AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement,
@@ -68,6 +71,7 @@ use gpui::{
 use gpui_component::input::{InputEvent, InputState};
 use mt_ai::hook_registry::HookRegistrationInfo;
 
+use crate::env_vars::EnvRow;
 use crate::i18n::t;
 use crate::prompt::{kind, open_guarded};
 use crate::store::{AppStore, MAX_SCROLLBACK, resolve_scrollback};
@@ -76,6 +80,7 @@ use crate::update_check::ReleaseInfo;
 
 mod pages_ai;
 mod pages_appearance;
+mod pages_env_vars;
 mod pages_system;
 mod pages_terminal;
 mod widgets;
@@ -88,11 +93,13 @@ use pages_appearance::{ThemeCard, ThemeThumbKey, release_theme_thumbs};
 ///
 /// ⚠️ [`Self::id`] 的字符串**与原版一字不差**(`SettingsModal.tsx:40-50`)——
 /// 原版注释明说「旧 id 一律保留、拆页只挪内容不改 key」,因为外部深链
-/// (`initialPage`)会因为改名失效。
+/// (`initialPage`)会因为改名失效。GPUI 版新增的页(`env-vars`)同样一经发布不改。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SettingsPage {
     Terminal,
     Clipboard,
+    /// 全局终端环境变量。GPUI 版新增,原版没有这一页。
+    EnvVars,
     Appearance,
     Font,
     AiNotification,
@@ -109,6 +116,7 @@ impl SettingsPage {
         match self {
             Self::Terminal => "terminal",
             Self::Clipboard => "clipboard",
+            Self::EnvVars => "env-vars",
             Self::Appearance => "appearance",
             Self::Font => "font",
             Self::AiNotification => "ai-notification",
@@ -125,6 +133,7 @@ impl SettingsPage {
         match self {
             Self::Terminal => "menu.shell",
             Self::Clipboard => "menu.clipboard",
+            Self::EnvVars => "menu.envVars",
             Self::Appearance => "menu.appearance",
             Self::Font => "menu.font",
             Self::AiNotification => "menu.aiNotification",
@@ -148,7 +157,11 @@ impl SettingsPage {
 const MENU_GROUPS: &[(&str, &[SettingsPage])] = &[
     (
         "menu.groupTerminal",
-        &[SettingsPage::Terminal, SettingsPage::Clipboard],
+        &[
+            SettingsPage::Terminal,
+            SettingsPage::Clipboard,
+            SettingsPage::EnvVars,
+        ],
     ),
     (
         "menu.groupAppearance",
@@ -170,6 +183,7 @@ const MENU_GROUPS: &[(&str, &[SettingsPage])] = &[
 pub const ALL_PAGES: &[SettingsPage] = &[
     SettingsPage::Terminal,
     SettingsPage::Clipboard,
+    SettingsPage::EnvVars,
     SettingsPage::Appearance,
     SettingsPage::Font,
     SettingsPage::AiNotification,
@@ -340,6 +354,12 @@ pub struct SettingsView {
     shell_command: Entity<InputState>,
     shell_args: Entity<InputState>,
     shell_error: Option<&'static str>,
+
+    // ── env-vars 页:全局终端环境变量 ──
+    env_rows: Vec<EnvRow>,
+    env_next_rid: u64,
+    /// 每行两个输入框的订阅(失焦 / 回车即提交),删行时随行一起丢。
+    env_subs: HashMap<u64, [Subscription; 2]>,
 
     // ── editor 页:编辑器列表 ──
     editor_editing: Editing,
@@ -605,6 +625,9 @@ impl SettingsView {
             shell_command: ph(cx, window, t("settings", "terminal.newCommandPlaceholder")),
             shell_args: ph(cx, window, t("settings", "terminal.newArgsPlaceholder")),
             shell_error: None,
+            env_rows: Vec::new(),
+            env_next_rid: 0,
+            env_subs: HashMap::new(),
             editor_editing: None,
             editor_name: ph(cx, window, t("settings", "editor.newEditorNamePlaceholder")),
             editor_command: ph(
@@ -687,11 +710,15 @@ impl SettingsView {
             ));
         }
 
+        this.init_env_rows(&config.terminal_env_vars, window, cx);
+
         // 关掉设置时把皮肤卡片的缩略图从资源缓存与图集里放掉(见字段注释)。
-        // `on_release` 不在任何窗口的更新里,`drop_image` 自己遍历得到所有窗口
+        // `on_release` 不在任何窗口的更新里,`drop_image` 自己遍历得到所有窗口。
+        // 环境变量页在这里兜底提交一次:点 ✕ 关面板不保证输入框先失焦
         cx.on_release(|this: &mut Self, cx: &mut App| {
             let keys: Vec<ThemeThumbKey> = this.theme_thumbs.drain().collect();
             release_theme_thumbs(&keys, cx, None);
+            this.commit_env_vars(cx);
         })
         .detach();
 
@@ -941,6 +968,7 @@ impl SettingsView {
         match self.page {
             SettingsPage::Terminal => self.render_terminal_page(cx),
             SettingsPage::Clipboard => self.render_clipboard_page(cx),
+            SettingsPage::EnvVars => self.render_env_vars_page(cx),
             // 外观页要 `window`:皮肤卡片的缩略图走 `window.use_asset`
             SettingsPage::Appearance => self.render_appearance_page(window, cx),
             SettingsPage::Font => self.render_font_page(cx),
@@ -959,6 +987,7 @@ mod tests {
     use super::*;
 
     /// 分页 id 与原版**一字不差** —— 改了会让外部深链(`initialPage`)失效。
+    /// `env-vars` 是 GPUI 版新增的,同一条规矩。
     #[test]
     fn 分页_id_与原版一致() {
         let ids: Vec<&str> = ALL_PAGES.iter().map(|p| p.id()).collect();
@@ -967,6 +996,7 @@ mod tests {
             vec![
                 "terminal",
                 "clipboard",
+                "env-vars",
                 "appearance",
                 "font",
                 "ai-notification",

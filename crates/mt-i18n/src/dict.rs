@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 33;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 934;
+pub const ZH_ENTRY_COUNT: usize = 939;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 934;
+pub const EN_ENTRY_COUNT: usize = 939;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -1318,6 +1318,10 @@ static SETTINGS_ZH: &[(&str, &str)] = &[
     ("editor.newEditorCommandPlaceholder", "可执行文件路径"),
     ("editor.newEditorNamePlaceholder", "名称（如 VS Code）"),
     ("editorRow.execPathPlaceholder", "可执行文件路径"),
+    ("envVars.addVar", "+ 添加环境变量"),
+    ("envVars.hasErrors", "有校验错误时整张表都不保存，改正后自动保存"),
+    ("envVars.hint", "所有项目新建的本地终端都会带上这些变量 · 项目右键菜单「环境变量」里的同名变量优先 · 修改只对之后新建的终端生效 · SSH 远程终端不注入 · 值按原样写入，不展开 %PATH% / $PATH 这类引用"),
+    ("envVars.section", "终端环境变量"),
     ("font.font", "字体"),
     ("font.fontFamilyFooterPrefix", "留空使用默认 · 支持 CSS font-family 语法（如 "),
     ("font.fontFamilyFooterSuffix", "）"),
@@ -1338,6 +1342,7 @@ static SETTINGS_ZH: &[(&str, &str)] = &[
     ("menu.appearance", "主题与语言"),
     ("menu.clipboard", "复制粘贴"),
     ("menu.editor", "外部编辑器"),
+    ("menu.envVars", "环境变量"),
     ("menu.font", "字体"),
     ("menu.general", "常规"),
     ("menu.groupAi", "AI"),
@@ -1523,6 +1528,10 @@ static SETTINGS_EN: &[(&str, &str)] = &[
     ("editor.newEditorCommandPlaceholder", "Executable path"),
     ("editor.newEditorNamePlaceholder", "Name (e.g. VS Code)"),
     ("editorRow.execPathPlaceholder", "Executable path"),
+    ("envVars.addVar", "+ Add variable"),
+    ("envVars.hasErrors", "Nothing in the table is saved while any row has an error; it saves automatically once fixed"),
+    ("envVars.hint", "Every new local terminal in every project gets these variables · A variable with the same name in a project's \"Environment Variables\" (right-click menu) wins · Changes only apply to terminals opened afterwards · Not injected into SSH remote terminals · Values are written verbatim; references like %PATH% / $PATH are not expanded"),
+    ("envVars.section", "Terminal environment variables"),
     ("font.font", "Font"),
     ("font.fontFamilyFooterPrefix", "Leave empty for the default · Supports CSS font-family syntax (e.g. "),
     ("font.fontFamilyFooterSuffix", ")"),
@@ -1543,6 +1552,7 @@ static SETTINGS_EN: &[(&str, &str)] = &[
     ("menu.appearance", "Theme & language"),
     ("menu.clipboard", "Copy & paste"),
     ("menu.editor", "Editors"),
+    ("menu.envVars", "Environment variables"),
     ("menu.font", "Font"),
     ("menu.general", "General"),
     ("menu.groupAi", "AI"),
