@@ -61,7 +61,9 @@ pub fn resolve(pty_id: u32, cand: &PathCandidate, cx: &App) -> Option<PathBuf> {
             wsl_shell: clipboard::resolve_paste_target(s, pty_id) == PasteTarget::Wsl,
         }
     };
-    let pane = s.project_state(&project_id).and_then(|st| st.pane(&pane_id));
+    let pane = s
+        .project_state(&project_id)
+        .and_then(|st| st.pane(&pane_id));
     // 相对路径的基准:AI 会话启动目录在前(agent 报的路径相对它),再是 pane 工作目录
     let bases: Vec<&str> = pane
         .into_iter()
@@ -75,9 +77,11 @@ pub fn resolve(pty_id: u32, cand: &PathCandidate, cx: &App) -> Option<PathBuf> {
         .collect();
     match &host {
         Host::Remote { root } => remote_target(cand, root),
-        Host::Local { root, .. } | Host::Wsl { root, .. } => local_targets(&cand.path, &host, &bases)
-            .into_iter()
-            .find(|path| mt_project::fs::is_viewable_file(root, path)),
+        Host::Local { root, .. } | Host::Wsl { root, .. } => {
+            local_targets(&cand.path, &host, &bases)
+                .into_iter()
+                .find(|path| mt_project::fs::is_viewable_file(root, path))
+        }
     }
 }
 
@@ -282,10 +286,26 @@ mod tests {
             Some(PathBuf::from("/srv/app/lib/a.py")),
             "相对路径对着项目根,`.`/`..` 字面消掉"
         );
-        assert_eq!(remote_target(&cand("/etc/passwd", Some(1)), root), None, "根外");
-        assert_eq!(remote_target(&cand("../../etc/x.conf", None), root), None, "爬出根外");
-        assert_eq!(remote_target(&cand("README.md", None), root), None, "不带 / 的相对名不认");
-        assert_eq!(remote_target(&cand("src/components", None), root), None, "末段不像文件");
+        assert_eq!(
+            remote_target(&cand("/etc/passwd", Some(1)), root),
+            None,
+            "根外"
+        );
+        assert_eq!(
+            remote_target(&cand("../../etc/x.conf", None), root),
+            None,
+            "爬出根外"
+        );
+        assert_eq!(
+            remote_target(&cand("README.md", None), root),
+            None,
+            "不带 / 的相对名不认"
+        );
+        assert_eq!(
+            remote_target(&cand("src/components", None), root),
+            None,
+            "末段不像文件"
+        );
         assert_eq!(
             remote_target(&cand("src/Makefile", Some(9)), root),
             Some(PathBuf::from("/srv/app/src/Makefile")),
@@ -295,10 +315,20 @@ mod tests {
 
     #[test]
     fn 目录前缀按整段匹配() {
-        assert_eq!(strip_dir_prefix("/home/u/proj/a.rs", "/home/u/proj"), Some("a.rs"));
+        assert_eq!(
+            strip_dir_prefix("/home/u/proj/a.rs", "/home/u/proj"),
+            Some("a.rs")
+        );
         assert_eq!(strip_dir_prefix("/home/u/proj", "/home/u/proj/"), Some(""));
-        assert_eq!(strip_dir_prefix("/home/u/project2/a.rs", "/home/u/proj"), None);
-        assert_eq!(strip_dir_prefix("/a.rs", "/"), Some("a.rs"), "distro 根当项目");
+        assert_eq!(
+            strip_dir_prefix("/home/u/project2/a.rs", "/home/u/proj"),
+            None
+        );
+        assert_eq!(
+            strip_dir_prefix("/a.rs", "/"),
+            Some("a.rs"),
+            "distro 根当项目"
+        );
     }
 
     #[cfg(windows)]
@@ -327,10 +357,17 @@ mod tests {
         );
         // 认不出的绝对写法不拿去拼基准目录
         assert!(local_targets("~/x.ts", &host, &[]).is_empty());
-        assert!(local_targets("/usr/lib/x.so", &Host::Local {
-            root: PathBuf::from(r"D:\proj"),
-            wsl_shell: true,
-        }, &[]).is_empty());
+        assert!(
+            local_targets(
+                "/usr/lib/x.so",
+                &Host::Local {
+                    root: PathBuf::from(r"D:\proj"),
+                    wsl_shell: true,
+                },
+                &[]
+            )
+            .is_empty()
+        );
     }
 
     #[cfg(windows)]
@@ -345,8 +382,16 @@ mod tests {
             Some(PathBuf::from(r"D:\Git\x\a.ts")),
             "Git Bash"
         );
-        assert_eq!(posix_drive_to_windows("/d/Git/x/a.ts", true), None, "WSL 里 /d 不是盘符");
-        assert_eq!(posix_drive_to_windows("/data/x", false), None, "首段不止一个字母");
+        assert_eq!(
+            posix_drive_to_windows("/d/Git/x/a.ts", true),
+            None,
+            "WSL 里 /d 不是盘符"
+        );
+        assert_eq!(
+            posix_drive_to_windows("/data/x", false),
+            None,
+            "首段不止一个字母"
+        );
     }
 
     #[cfg(windows)]
@@ -358,9 +403,14 @@ mod tests {
         };
         assert_eq!(
             local_targets("/home/u/proj/src/main.rs", &host, &[]),
-            vec![PathBuf::from(r"\\wsl.localhost\Ubuntu\home\u\proj\src\main.rs")]
+            vec![PathBuf::from(
+                r"\\wsl.localhost\Ubuntu\home\u\proj\src\main.rs"
+            )]
         );
-        assert!(local_targets("/etc/hosts", &host, &[]).is_empty(), "项目外不换");
+        assert!(
+            local_targets("/etc/hosts", &host, &[]).is_empty(),
+            "项目外不换"
+        );
         // AI 会话报上来的 cwd 是 Linux 写法,也要先换回 UNC 再拼
         assert_eq!(
             local_targets("a.rs", &host, &["/home/u/proj/crates/x"])[0],

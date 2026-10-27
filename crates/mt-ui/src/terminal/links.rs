@@ -114,19 +114,17 @@ pub(crate) fn probe(
 ) -> Option<HoveredLink> {
     // 连 TUI 自己折开的上下行一起认(硬换行),见 `mt_terminal::links` 模块注释
     let (logical, candidates) = emulator.path_candidates_at(line, column)?;
-    candidates
-        .into_iter()
-        .find_map(|cand| {
-            let path = cache.resolve(&cand, links, cx)?;
-            Some(HoveredLink {
-                link: FileLink {
-                    path,
-                    line: cand.line,
-                    column: cand.column,
-                },
-                spans: spans(&logical, cand.range),
-            })
+    candidates.into_iter().find_map(|cand| {
+        let path = cache.resolve(&cand, links, cx)?;
+        Some(HoveredLink {
+            link: FileLink {
+                path,
+                line: cand.line,
+                column: cand.column,
+            },
+            spans: spans(&logical, cand.range),
         })
+    })
 }
 
 /// 字符区间 → 逐行的列区间。宽字符多盖一列;软换行折开的链接落成多段。
@@ -171,8 +169,16 @@ mod tests {
         assert_eq!(
             spans(&line, 1..5),
             vec![
-                LinkSpan { line: -1, start: 8, end: 10 },
-                LinkSpan { line: 0, start: 0, end: 2 },
+                LinkSpan {
+                    line: -1,
+                    start: 8,
+                    end: 10
+                },
+                LinkSpan {
+                    line: 0,
+                    start: 0,
+                    end: 2
+                },
             ]
         );
     }
@@ -183,7 +189,14 @@ mod tests {
             chars: "改a".chars().collect(),
             cells: vec![cell(0, 0, true), cell(0, 2, false)],
         };
-        assert_eq!(spans(&line, 0..2), vec![LinkSpan { line: 0, start: 0, end: 3 }]);
+        assert_eq!(
+            spans(&line, 0..2),
+            vec![LinkSpan {
+                line: 0,
+                start: 0,
+                end: 3
+            }]
+        );
         assert!(spans(&line, 5..9).is_empty(), "越界区间不 panic");
     }
 }

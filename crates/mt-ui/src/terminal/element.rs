@@ -694,7 +694,12 @@ impl TerminalElement {
     ///
     /// 不在链接态(没按 Ctrl / 鼠标不在终端上 / 正在拖选或拖滚动条 / 按键正被上报给
     /// TUI)时顺手清掉裁决缓存,下次按下 Ctrl 时刚生成的文件也认得出来。
-    fn hovered_link(&self, prepared: &PreparedFrame, window: &Window, cx: &App) -> Option<HoveredLink> {
+    fn hovered_link(
+        &self,
+        prepared: &PreparedFrame,
+        window: &Window,
+        cx: &App,
+    ) -> Option<HoveredLink> {
         let links = self.file_links.as_ref()?;
         let state = &prepared.state;
         let position = window.mouse_position();
@@ -732,7 +737,12 @@ impl TerminalElement {
     /// 链接下划线:每段一条 1px 的线,贴着格子底边往上 2px(与 IME 预编辑串的
     /// 下划线同一粗细)。颜色取前景色 —— 链接文字本身可能是任何颜色,前景色在
     /// 默认背景上的对比度由主题保证。
-    fn paint_link_underline(&self, prepared: &PreparedFrame, link: &HoveredLink, window: &mut Window) {
+    fn paint_link_underline(
+        &self,
+        prepared: &PreparedFrame,
+        link: &HoveredLink,
+        window: &mut Window,
+    ) {
         let cell = prepared.cell_size;
         for span in &link.spans {
             let row = span.line + prepared.display_offset as i32;
@@ -1008,8 +1018,14 @@ impl TerminalElement {
                 {
                     let display_offset = emulator.with_term(|t| t.grid().display_offset());
                     let line = row as i32 - display_offset as i32;
-                    let hit =
-                        links::probe(&emulator, links, line, col, &mut link_cache.borrow_mut(), cx);
+                    let hit = links::probe(
+                        &emulator,
+                        links,
+                        line,
+                        col,
+                        &mut link_cache.borrow_mut(),
+                        cx,
+                    );
                     if let Some(hit) = hit {
                         (links.open)(&hit.link, window, cx);
                         // 视图那层的「左键聚焦终端」不必再跑:焦点马上要交给文件页
@@ -1143,8 +1159,13 @@ impl TerminalElement {
                         && event.pressed_button.is_none()
                         && hitbox.is_hovered(window))
                     .then(|| {
-                        let (col, row, _) =
-                            Self::hit_cell(event.position, origin, cell_size, columns, screen_lines);
+                        let (col, row, _) = Self::hit_cell(
+                            event.position,
+                            origin,
+                            cell_size,
+                            columns,
+                            screen_lines,
+                        );
                         (col, row)
                     });
                     if link_pointer.replace(cell) != cell {

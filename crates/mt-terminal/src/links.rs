@@ -234,7 +234,11 @@ fn logical_line(grid: &Grid<Cell>, line: i32) -> Option<LogicalLine> {
         return None;
     }
     // 行尾那一格带 WRAPLINE = 这一行是被终端折过去的,下一行接着它
-    let wraps = |l: i32| grid[Line(l)][Column(columns - 1)].flags.contains(Flags::WRAPLINE);
+    let wraps = |l: i32| {
+        grid[Line(l)][Column(columns - 1)]
+            .flags
+            .contains(Flags::WRAPLINE)
+    };
     let mut start = line;
     while start > top && line - start < MAX_WRAPPED_ROWS && wraps(start - 1) {
         start -= 1;
@@ -506,7 +510,9 @@ fn github_anchor(token: &[char]) -> Option<(usize, Option<u32>, Option<u32>)> {
     if !tail.is_empty()
         && !(tail[0] == '-'
             && tail.len() > 1
-            && tail[1..].iter().all(|c| c.is_ascii_digit() || matches!(c, 'L' | 'C')))
+            && tail[1..]
+                .iter()
+                .all(|c| c.is_ascii_digit() || matches!(c, 'L' | 'C')))
     {
         return None;
     }
@@ -593,10 +599,16 @@ mod tests {
     #[test]
     fn 行列号与范围写法() {
         let cand = first_at("  --> src/main.rs:10:5", "src").unwrap();
-        assert_eq!((cand.path.as_str(), cand.line, cand.column), ("src/main.rs", Some(10), Some(5)));
+        assert_eq!(
+            (cand.path.as_str(), cand.line, cand.column),
+            ("src/main.rs", Some(10), Some(5))
+        );
 
         let cand = first_at("./main.go:12:3: undefined: x", "main").unwrap();
-        assert_eq!((cand.path.as_str(), cand.line, cand.column), ("./main.go", Some(12), Some(3)));
+        assert_eq!(
+            (cand.path.as_str(), cand.line, cand.column),
+            ("./main.go", Some(12), Some(3))
+        );
 
         let cand = first_at("改动见 `src/a.ts:20-35`", "src").unwrap();
         assert_eq!((cand.path.as_str(), cand.line), ("src/a.ts", Some(20)));
@@ -610,7 +622,10 @@ mod tests {
     fn tsc_括号行列号() {
         let text = "src/a.ts(20,5): error TS2322";
         let cand = first_at(text, "src").unwrap();
-        assert_eq!((cand.path.as_str(), cand.line, cand.column), ("src/a.ts", Some(20), Some(5)));
+        assert_eq!(
+            (cand.path.as_str(), cand.line, cand.column),
+            ("src/a.ts", Some(20), Some(5))
+        );
         assert_eq!(covered(text, &cand), "src/a.ts(20,5)");
 
         let cand = first_at("x.cs(7, 12)", "x.cs").unwrap();
@@ -631,14 +646,20 @@ mod tests {
     fn python_回溯行号在引号外() {
         let text = r#"  File "C:\proj\app.py", line 42, in <module>"#;
         let cand = first_at(text, "proj").unwrap();
-        assert_eq!((cand.path.as_str(), cand.line), (r"C:\proj\app.py", Some(42)));
+        assert_eq!(
+            (cand.path.as_str(), cand.line),
+            (r"C:\proj\app.py", Some(42))
+        );
         assert_eq!(covered(text, &cand), r"C:\proj\app.py");
     }
 
     #[test]
     fn github_锚点与标题锚点() {
         let cand = first_at("docs/a.md#L12C3", "docs").unwrap();
-        assert_eq!((cand.path.as_str(), cand.line, cand.column), ("docs/a.md", Some(12), Some(3)));
+        assert_eq!(
+            (cand.path.as_str(), cand.line, cand.column),
+            ("docs/a.md", Some(12), Some(3))
+        );
         let cand = first_at("src/x.rs#L5-L9", "src").unwrap();
         assert_eq!((cand.path.as_str(), cand.line), ("src/x.rs", Some(5)));
 
@@ -659,12 +680,24 @@ mod tests {
 
     #[test]
     fn 剥掉两头的标点与框线() {
-        assert_eq!(first_at("修改了 src/a.ts。", "src").unwrap().path, "src/a.ts");
-        assert_eq!(first_at("见：src/a.ts，然后", "src").unwrap().path, "src/a.ts");
+        assert_eq!(
+            first_at("修改了 src/a.ts。", "src").unwrap().path,
+            "src/a.ts"
+        );
+        assert_eq!(
+            first_at("见：src/a.ts，然后", "src").unwrap().path,
+            "src/a.ts"
+        );
         assert_eq!(first_at("│ src/a.ts │", "src").unwrap().path, "src/a.ts");
         assert_eq!(first_at("see src/a.ts.", "src").unwrap().path, "src/a.ts");
-        assert_eq!(first_at("**README.md**", "README").unwrap().path, "README.md");
-        assert_eq!(first_at("[src/a.ts](src/a.ts)", "src").unwrap().path, "src/a.ts");
+        assert_eq!(
+            first_at("**README.md**", "README").unwrap().path,
+            "README.md"
+        );
+        assert_eq!(
+            first_at("[src/a.ts](src/a.ts)", "src").unwrap().path,
+            "src/a.ts"
+        );
         assert_eq!(first_at("(see src/a.ts)", "src").unwrap().path, "src/a.ts");
     }
 
@@ -674,7 +707,10 @@ mod tests {
             first_at("app/[slug]/page.tsx", "page").unwrap().path,
             "app/[slug]/page.tsx"
         );
-        assert_eq!(first_at("pages/[id].tsx", "pages").unwrap().path, "pages/[id].tsx");
+        assert_eq!(
+            first_at("pages/[id].tsx", "pages").unwrap().path,
+            "pages/[id].tsx"
+        );
     }
 
     #[test]
@@ -682,7 +718,10 @@ mod tests {
         assert!(first_at("https://example.com/a.ts", "example").is_none());
         let cand = first_at("file:///D:/proj/a.ts:3", "proj").unwrap();
         assert_eq!((cand.path.as_str(), cand.line), ("D:/proj/a.ts", Some(3)));
-        assert_eq!(first_at("file:///home/u/a.rs", "home").unwrap().path, "/home/u/a.rs");
+        assert_eq!(
+            first_at("file:///home/u/a.rs", "home").unwrap().path,
+            "/home/u/a.rs"
+        );
     }
 
     #[test]
@@ -701,12 +740,29 @@ mod tests {
         let line = e.logical_line_at(1).expect("第二段物理行");
         let text: String = line.chars.iter().collect();
         assert!(text.starts_with("src/abc/def.ts:7"), "实际 {text:?}");
-        assert_eq!(line.cells[0], LineCell { line: 0, column: 0, wide: false });
-        assert_eq!(line.cells[10], LineCell { line: 1, column: 0, wide: false });
+        assert_eq!(
+            line.cells[0],
+            LineCell {
+                line: 0,
+                column: 0,
+                wide: false
+            }
+        );
+        assert_eq!(
+            line.cells[10],
+            LineCell {
+                line: 1,
+                column: 0,
+                wide: false
+            }
+        );
 
         // 鼠标在第二段上照样拿到整条路径
         let index = line.index_at(1, 2).unwrap();
-        let cand = path_candidates(&line.chars, index).into_iter().next().unwrap();
+        let cand = path_candidates(&line.chars, index)
+            .into_iter()
+            .next()
+            .unwrap();
         assert_eq!((cand.path.as_str(), cand.line), ("src/abc/def.ts", Some(7)));
 
         // 没被折的行只有它自己
@@ -740,7 +796,11 @@ mod tests {
             );
             let covered = &joined.cells[first.range.clone()];
             assert_eq!(covered.first().map(|c| (c.line, c.column)), Some((0, 7)));
-            assert_eq!(covered.last().map(|c| c.line), Some(1), "下划线要盖到第二行");
+            assert_eq!(
+                covered.last().map(|c| c.line),
+                Some(1),
+                "下划线要盖到第二行"
+            );
         }
         // 没接的那一截垫底(接错时宿主落到它)
         assert!(paths_at(&e, 1, 4).contains(&r"\src\lib.rs".to_string()));
