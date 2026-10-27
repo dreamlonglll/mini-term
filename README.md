@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.13.19-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.13.20-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -77,6 +77,7 @@ https://github.com/user-attachments/assets/8a9c1dca-7289-4ab6-af1f-5158df7368a4
 | **智能 Ctrl+C/V** | 默认开启：有选区时复制、无选区时中断程序，`Ctrl+V` 直接粘贴；Windows 大段粘贴自动分块防 ConPTY 丢行 |
 | **拖选停留自动复制** | 拖选后按住鼠标静止超过设定时长自动复制选区并弹「已复制」气泡，时长可调（0 = 关闭） |
 | **Alt+单击定位光标** | 按住 Alt（macOS ⌥）单击命令行任意位置，光标直接挪过去——同一行内按列差合成方向键；跨行一律不动，免得触发行编辑器的历史召回。shell 提示符下逐格准确，Claude CLI 这类 Ink TUI 不保证 |
+| **终端文件链接** | 按住 Ctrl（macOS ⌘）悬停终端里 AI 输出的文件路径即出下划线，单击在文件页打开并跳到对应行（认 `:20`、`(30,5)` 等行号写法）；相对路径依次按 AI 会话目录、pane 目录、项目根解析，WSL 的 `/mnt/d/…` 与 Git Bash 的 `/d/…` 自动换回 Windows 路径，软换行与 TUI 硬换行折开的长路径都能接上；只认项目根内的文件 |
 | **启动零网络请求** | 原生渲染无 Web 资源，启动不发任何网络请求（价格表按天拉取，拉不到用缓存）；启动时配置只读一次、备份挪到后台，首帧出得更快 |
 | **刷屏不卡界面** | PTY 字节在后台线程直喂 VT 状态机、UI 按帧取格子渲染——单进程零 IPC，没有中间缓冲可堆积，`cat` 大文件也拖不垮界面；终端刷屏只重绘终端自己，闲置的分屏终端直接复用上一帧，窗口最小化时渲染整个停掉、一帧不画；终端重绘帧率可在「系统 → 性能」里调（前台 10~240、默认 30，失焦 1~60、默认 5），高刷屏想更顺就调高，笔记本想省电就调低，改完即时生效 |
 | **新版 ConPTY** | Windows 下随包附带 Windows Terminal 1.24 的 `conpty.dll` + `OpenConsole.exe` 并在启动时预载，绕开老版本系统 conhost 的宽字符列宽、换行回绕、resize 丢行等已知缺陷；怀疑显示问题出在它身上时，设环境变量 `MT_DISABLE_PORTABLE_CONPTY=1` 即回落系统 ConPTY |
@@ -100,7 +101,7 @@ https://github.com/user-attachments/assets/8a9c1dca-7289-4ab6-af1f-5158df7368a4
 | Git / 文件 | git2（libgit2）· notify + ignore |
 | 用量统计 | rusqlite 本地账本 · 自绘趋势图 |
 | 移动端中转 | axum + tokio WebSocket（`relay-server/`）· React + Vite PWA（`mobile/`） |
-| 测试 | **2374 个 Rust 测试**（35 个测试目标） |
+| 测试 | **2402 个 Rust 测试**（35 个测试目标） |
 
 ---
 

@@ -14,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.13.19-blue" alt="version">
+  <img src="https://img.shields.io/badge/version-1.13.20-blue" alt="version">
   <img src="https://img.shields.io/badge/platform-Windows-0078D4" alt="platform">
   <img src="https://img.shields.io/badge/macOS%20%7C%20Linux-experimental-lightgrey" alt="platform-experimental">
   <img src="https://img.shields.io/badge/GPUI-native-8A2BE2" alt="gpui">
@@ -75,6 +75,7 @@ https://github.com/user-attachments/assets/8a9c1dca-7289-4ab6-af1f-5158df7368a4
 | **Smart Ctrl+C/V** | On by default: copy when there's a selection, interrupt the program when there isn't, and `Ctrl+V` pastes directly; large Windows pastes are chunked so ConPTY doesn't drop lines |
 | **Dwell-to-copy selection** | Hold the mouse still after drag-selecting and the selection is copied with a "Copied" tip; dwell time configurable (0 = off) |
 | **Alt+click to place the cursor** | Hold Alt (⌥ on macOS) and click anywhere on the command line to move the cursor there — arrow keys are synthesized from the column delta, same line only; cross-line clicks are ignored so the line editor's history recall never fires. Cell-accurate at shell prompts; Ink-style TUIs such as Claude CLI are best-effort |
+| **Terminal file links** | Hold Ctrl (⌘ on macOS) and hover a file path in AI output to underline it; click to open it in a file tab and jump to the line (`:20`, `(30,5)` and similar suffixes are understood). Relative paths resolve against the AI session directory, then the pane directory, then the project root; WSL `/mnt/d/…` and Git Bash `/d/…` map back to Windows paths, and long paths broken by soft wraps or a TUI's hard wraps are stitched back together. Only files inside the project root are linked |
 | **Zero network requests at startup** | Native rendering, no web assets — startup makes no network request at all (the price table refreshes daily and falls back to its cache); the config is read only once at startup and its backup moved to the background, so the first frame arrives sooner |
 | **Flood-proof UI** | PTY bytes feed the VT state machine on a background thread while the UI samples the grid per frame — single process, zero IPC, no intermediate buffer to pile up, so `cat`-ing a huge file can't drag the interface down; terminal output repaints only the terminal itself, idle split panes reuse their previous frame, and a minimized window stops rendering entirely; the terminal redraw rate is adjustable under System → Performance (focused 10–240, default 30; unfocused 1–60, default 5) — raise it for smoother output on high-refresh displays or lower it to save battery, effective immediately |
 | **Newer ConPTY** | On Windows the package ships Windows Terminal 1.24's `conpty.dll` + `OpenConsole.exe` and preloads them at startup, sidestepping known bugs in older system conhost builds (wide-character widths, line wrapping, lines lost on resize); if you suspect a display issue comes from it, set the environment variable `MT_DISABLE_PORTABLE_CONPTY=1` to fall back to the system ConPTY |
@@ -98,7 +99,7 @@ The whole application is **native Rust**:
 | Git / files | git2 (libgit2) · notify + ignore |
 | Usage stats | rusqlite local ledger · hand-drawn trend charts |
 | Mobile relay | axum + tokio WebSocket (`relay-server/`) · React + Vite PWA (`mobile/`) |
-| Tests | **2,374 Rust tests** (35 test targets) |
+| Tests | **2,402 Rust tests** (35 test targets) |
 
 ---
 
