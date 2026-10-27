@@ -10,24 +10,41 @@
 //!
 //! 这里**只看形状**。存不存在、在不在项目里、相对路径对着哪个目录解析,全是宿主的事
 //! (mt-app 的 `terminal_links`)—— 所以给出的是一串候选(最像的排在前面),宿主
-//! 挨个去盘上验,第一个成立的才算链接。
+//! 挨个去盘上验,第一个成立的才算链接。入口是 [`TerminalEmulator::path_candidates_at`]。
 //!
-//! # 硬换行认不出来
+//! # 硬换行:TUI 自己折开的路径
 //!
 //! 只有终端自己折的行(写满一行自动换行)带 `WRAPLINE`。Claude Code / Codex 这类
-//! TUI 按宽度**自己插换行符**排版,折开的路径在 grid 里就是两行互不相干的文本 ——
-//! 这一类只认得出鼠标所在的那一截。
+//! TUI 按宽度**自己插换行符**排版(Ink 的 wrap 遇到超长「词」直接在列宽处硬断),
+//! 折开的路径在 grid 里就是两行互不相干的文本:
+//!
+//! ```text
+//! ● …宽屏终端要更长的行:D:\Git\mini-term\crates   ← 写到右边缘
+//!   \mt-core\src\lib.rs                          ← 下一行缩进两格接着写
+//! ```
+//!
+//! 判据只看形状:上一行的内容写到右边缘附近([`HARD_WRAP_EDGE_SLACK`])、收尾是路径
+//! 字符,下一行(去掉缩进)以路径字符开头,就把两行接起来再认一遍。接上的候选排前面,
+//! 没接的照样垫底 —— 散文在词边界被折开(`…the file` / `src/a.ts`)时接出来的
+//! `filesrc/a.ts` 盘上不存在,宿主自然落到没接的那个。一行一个路径的短列表不贴右边缘,
+//! 不会被接。
 
 use std::ops::Range;
 
-use alacritty_terminal::grid::Dimensions as _;
+use alacritty_terminal::grid::{Dimensions as _, Grid};
 use alacritty_terminal::index::{Column, Line};
-use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::cell::{Cell, Flags};
 
 use crate::TerminalEmulator;
 
 /// 往上 / 往下各最多拼多少段软换行。再长的「一行」多半是日志刷屏,不是路径。
 const MAX_WRAPPED_ROWS: i32 = 16;
+/// 往上 / 往下各最多接几段 TUI 自己折开的行(硬换行)。
+const MAX_HARD_WRAP_ROWS: usize = 2;
+/// 行尾离右边缘不超过这么多列,才算「写满了、被 TUI 折到下一行」。
+///
+/// 留的是 TUI 的右边距(Claude Code 一两列)与「宽字符放不下、行尾空一格」。
+const HARD_WRAP_EDGE_SLACK: usize = 6;
 /// 认作路径的片段最多多少个字符。超了直接不认,免得在一整屏 base64 上逐字扫。
 const MAX_PATH_CHARS: usize = 1024;
 
@@ -57,51 +74,196 @@ impl LogicalLine {
             cell.line == line && (cell.column == column || (cell.wide && cell.column + 1 == column))
         })
     }
+
+    /// 第一个 / 最后一个非空白字符的下标。全是空白返回 `None`。
+    fn content_bounds(&self) -> Option<(usize, usize)> {
+        let first = self.chars.iter().position(|c| !c.is_whitespace())?;
+        let last = self.chars.iter().rposition(|c| !c.is_whitespace())?;
+        Some((first, last))
+    }
+
+    /// 内容写到了最后一个物理行的右边缘附近、收尾是路径字符 —— 像是被 TUI 折下去了。
+    fn runs_to_edge(&self, columns: usize) -> bool {
+        let Some((_, last)) = self.content_bounds() else {
+            return false;
+        };
+        let cell = self.cells[last];
+        let end = cell.column + if cell.wide { 2 } else { 1 };
+        self.cells.last().is_some_and(|tail| tail.line == cell.line)
+            && end + HARD_WRAP_EDGE_SLACK >= columns
+            && is_path_char(self.chars[last])
+    }
+
+    /// 去掉缩进之后以路径字符开头 —— 可能是上一行被 TUI 折下来的后半截。
+    fn starts_with_path_char(&self) -> bool {
+        self.content_bounds()
+            .is_some_and(|(first, _)| is_path_char(self.chars[first]))
+    }
+
+    fn top_line(&self) -> Option<i32> {
+        self.cells.first().map(|cell| cell.line)
+    }
+
+    fn bottom_line(&self) -> Option<i32> {
+        self.cells.last().map(|cell| cell.line)
+    }
+
+    fn push_slice(&mut self, other: &LogicalLine, range: Range<usize>) {
+        self.chars.extend_from_slice(&other.chars[range.clone()]);
+        self.cells.extend_from_slice(&other.cells[range]);
+    }
 }
 
 impl TerminalEmulator {
     /// `line`(grid 行号)所在的整条逻辑行。行号越界返回 `None`。
     pub fn logical_line_at(&self, line: i32) -> Option<LogicalLine> {
+        logical_line(self.term.lock().grid(), line)
+    }
+
+    /// 鼠标对着 grid 的 `(line, column)` 时的路径候选,连同候选下标所指的那条行。
+    ///
+    /// 先按终端软换行拼整行;路径贴着行首 / 行尾时,再试着接上 TUI 自己折开的上下行
+    /// (见模块注释「硬换行」)。接上的候选排前面,没接的垫底 —— 接错了由宿主验盘淘汰。
+    /// 整个过程只拿一次 grid 锁。
+    pub fn path_candidates_at(
+        &self,
+        line: i32,
+        column: usize,
+    ) -> Option<(LogicalLine, Vec<PathCandidate>)> {
         let term = self.term.lock();
         let grid = term.grid();
-        let top = -(grid.history_size() as i32);
-        let bottom = grid.screen_lines() as i32 - 1;
         let columns = grid.columns();
-        if columns == 0 || line < top || line > bottom {
-            return None;
+        let current = logical_line(grid, line)?;
+        let index = current.index_at(line, column)?;
+        // 鼠标不在路径字符上就不必往上下找了。反过来不成立:`:20` 这种只剩行号的
+        // 后半截自己认不出候选,接上前半截才是完整的 `…lib.rs:20`
+        if !current.chars.get(index).is_some_and(|&c| is_path_char(c)) {
+            return Some((current, Vec::new()));
         }
-        // 行尾那一格带 WRAPLINE = 这一行是被终端折过去的,下一行接着它
-        let wraps = |l: i32| grid[Line(l)][Column(columns - 1)].flags.contains(Flags::WRAPLINE);
-        let mut start = line;
-        while start > top && line - start < MAX_WRAPPED_ROWS && wraps(start - 1) {
-            start -= 1;
+        let plain = path_candidates(&current.chars, index);
+
+        // 往上:当前行以路径字符开头,上一行写满且以路径字符收尾
+        let mut before: Vec<LogicalLine> = Vec::new();
+        let mut head = current.top_line()?;
+        let mut head_continues = current.starts_with_path_char();
+        while head_continues && before.len() < MAX_HARD_WRAP_ROWS {
+            let Some(prev) = logical_line(grid, head - 1) else {
+                break;
+            };
+            if !prev.runs_to_edge(columns) {
+                break;
+            }
+            head = prev.top_line()?;
+            head_continues = prev.starts_with_path_char();
+            before.push(prev);
         }
-        let mut end = line;
-        while end < bottom && end - line < MAX_WRAPPED_ROWS && wraps(end) {
-            end += 1;
+        // 往下:当前行写满且以路径字符收尾,下一行以路径字符开头
+        let mut after: Vec<LogicalLine> = Vec::new();
+        let mut tail = current.bottom_line()?;
+        let mut tail_continues = current.runs_to_edge(columns);
+        while tail_continues && after.len() < MAX_HARD_WRAP_ROWS {
+            let Some(next) = logical_line(grid, tail + 1) else {
+                break;
+            };
+            if !next.starts_with_path_char() {
+                break;
+            }
+            tail = next.bottom_line()?;
+            tail_continues = next.runs_to_edge(columns);
+            after.push(next);
+        }
+        drop(term);
+        if before.is_empty() && after.is_empty() {
+            return Some((current, plain));
         }
 
-        let mut out = LogicalLine::default();
-        for l in start..=end {
-            let row = &grid[Line(l)];
-            for col in 0..columns {
-                let cell = &row[Column(col)];
-                if cell
-                    .flags
-                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
-                {
-                    continue;
-                }
-                out.chars.push(cell.c);
-                out.cells.push(LineCell {
-                    line: l,
-                    column: col,
-                    wide: cell.flags.contains(Flags::WIDE_CHAR),
-                });
+        // 拼:接缝两侧的空白都去掉 —— 上一行的行尾空白、下一行 TUI 补的对齐缩进
+        let mut joined = LogicalLine::default();
+        for prev in before.iter().rev() {
+            let (first, last) = prev.content_bounds()?;
+            joined.push_slice(prev, first..last + 1);
+        }
+        let (cur_first, cur_last) = current.content_bounds()?;
+        let cur_from = if before.is_empty() { 0 } else { cur_first };
+        let cur_to = if after.is_empty() {
+            current.chars.len()
+        } else {
+            cur_last + 1
+        };
+        if !(cur_from..cur_to).contains(&index) {
+            return Some((current, plain));
+        }
+        let offset = joined.chars.len();
+        joined.push_slice(&current, cur_from..cur_to);
+        let cur_end = joined.chars.len();
+        for (i, next) in after.iter().enumerate() {
+            let (first, last) = next.content_bounds()?;
+            let to = if i + 1 == after.len() {
+                next.chars.len()
+            } else {
+                last + 1
+            };
+            joined.push_slice(next, first..to);
+        }
+
+        let shift = |i: usize| offset + i - cur_from;
+        // 接上的只留真跨过接缝的;没跨的与「没接」那份重复
+        let mut out: Vec<PathCandidate> = path_candidates(&joined.chars, shift(index))
+            .into_iter()
+            .filter(|cand| cand.range.start < offset || cand.range.end > cur_end)
+            .collect();
+        for cand in plain {
+            let shifted = PathCandidate {
+                range: shift(cand.range.start)..shift(cand.range.end),
+                ..cand
+            };
+            if !out.contains(&shifted) {
+                out.push(shifted);
             }
         }
-        Some(out)
+        Some((joined, out))
     }
+}
+
+/// `line` 所在的整条逻辑行(顺着 `WRAPLINE` 往上下拼)。行号越界返回 `None`。
+fn logical_line(grid: &Grid<Cell>, line: i32) -> Option<LogicalLine> {
+    let top = -(grid.history_size() as i32);
+    let bottom = grid.screen_lines() as i32 - 1;
+    let columns = grid.columns();
+    if columns == 0 || line < top || line > bottom {
+        return None;
+    }
+    // 行尾那一格带 WRAPLINE = 这一行是被终端折过去的,下一行接着它
+    let wraps = |l: i32| grid[Line(l)][Column(columns - 1)].flags.contains(Flags::WRAPLINE);
+    let mut start = line;
+    while start > top && line - start < MAX_WRAPPED_ROWS && wraps(start - 1) {
+        start -= 1;
+    }
+    let mut end = line;
+    while end < bottom && end - line < MAX_WRAPPED_ROWS && wraps(end) {
+        end += 1;
+    }
+
+    let mut out = LogicalLine::default();
+    for l in start..=end {
+        let row = &grid[Line(l)];
+        for col in 0..columns {
+            let cell = &row[Column(col)];
+            if cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                continue;
+            }
+            out.chars.push(cell.c);
+            out.cells.push(LineCell {
+                line: l,
+                column: col,
+                wide: cell.flags.contains(Flags::WIDE_CHAR),
+            });
+        }
+    }
+    Some(out)
 }
 
 /// 一个「可能是文件」的片段。
@@ -553,6 +715,64 @@ mod tests {
         assert_eq!(short.cells.len(), 10);
         assert!(short.cells.iter().all(|c| c.line == 2));
         assert!(e.logical_line_at(4).is_none(), "越过屏底");
+    }
+
+    fn paths_at(e: &TerminalEmulator, line: i32, column: usize) -> Vec<String> {
+        e.path_candidates_at(line, column)
+            .map(|(_, cands)| cands.into_iter().map(|c| c.path).collect())
+            .unwrap_or_default()
+    }
+
+    /// Claude Code 的排版:路径写到右边缘被硬断,下一行缩进两格接着写(用户截图那种)。
+    /// 鼠标停在上下哪一截都认出整条路径,下划线跨两行。
+    #[test]
+    fn tui_硬换行折开的路径接回来() {
+        let e = TerminalEmulator::new(TermSize::new(24, 4));
+        // 「  see：」占 7 列,D 落在第 7 列,行尾 crates 写到第 21 列
+        e.advance("  see：D:\\proj\\crates\r\n  \\src\\lib.rs:7".as_bytes());
+        for (line, column) in [(1, 4), (0, 9)] {
+            let (joined, cands) = e.path_candidates_at(line, column).unwrap();
+            let first = &cands[0];
+            assert_eq!(
+                (first.path.as_str(), first.line),
+                (r"D:\proj\crates\src\lib.rs", Some(7)),
+                "鼠标在 ({line},{column})"
+            );
+            let covered = &joined.cells[first.range.clone()];
+            assert_eq!(covered.first().map(|c| (c.line, c.column)), Some((0, 7)));
+            assert_eq!(covered.last().map(|c| c.line), Some(1), "下划线要盖到第二行");
+        }
+        // 没接的那一截垫底(接错时宿主落到它)
+        assert!(paths_at(&e, 1, 4).contains(&r"\src\lib.rs".to_string()));
+    }
+
+    /// 盘符刚好断在行尾(截图第二行:`D:\` / `Git\...`),以及只剩行号的后半截。
+    #[test]
+    fn 断在盘符后与断在行号前() {
+        let e = TerminalEmulator::new(TermSize::new(16, 6));
+        e.advance("  abc def D:\\\r\n  Git\\a.rs\r\n".as_bytes());
+        assert_eq!(paths_at(&e, 1, 4)[0], r"D:\Git\a.rs");
+
+        e.advance("  abcdefg x.rs\r\n  :20 tail".as_bytes());
+        let (_, cands) = e.path_candidates_at(3, 2).unwrap();
+        assert_eq!((cands[0].path.as_str(), cands[0].line), ("x.rs", Some(20)));
+    }
+
+    /// 一行一个路径的短列表不贴右边缘,不接。
+    #[test]
+    fn 短行不接() {
+        let e = TerminalEmulator::new(TermSize::new(40, 4));
+        e.advance(b"  src/a.ts\r\n  src/b.ts");
+        assert_eq!(paths_at(&e, 0, 3), ["src/a.ts"]);
+        assert_eq!(paths_at(&e, 1, 3), ["src/b.ts"]);
+    }
+
+    /// 散文在词边界被折开:接出来的排前面,没接的垫底,宿主验盘时落到后者。
+    #[test]
+    fn 词边界折行时没接的候选垫底() {
+        let e = TerminalEmulator::new(TermSize::new(20, 4));
+        e.advance(b"aaaa bbbb cccc file\r\n  src/a.ts ok");
+        assert_eq!(paths_at(&e, 1, 3), ["filesrc/a.ts", "src/a.ts"]);
     }
 
     #[test]

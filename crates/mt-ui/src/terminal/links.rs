@@ -21,7 +21,7 @@ use std::rc::Rc;
 
 use gpui::{App, Window};
 use mt_terminal::TerminalEmulator;
-use mt_terminal::links::{LogicalLine, PathCandidate, path_candidates};
+use mt_terminal::links::{LogicalLine, PathCandidate};
 
 /// 一个确定能打开的文件链接。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -112,9 +112,9 @@ pub(crate) fn probe(
     cache: &mut LinkCache,
     cx: &App,
 ) -> Option<HoveredLink> {
-    let logical = emulator.logical_line_at(line)?;
-    let index = logical.index_at(line, column)?;
-    path_candidates(&logical.chars, index)
+    // 连 TUI 自己折开的上下行一起认(硬换行),见 `mt_terminal::links` 模块注释
+    let (logical, candidates) = emulator.path_candidates_at(line, column)?;
+    candidates
         .into_iter()
         .find_map(|cand| {
             let path = cache.resolve(&cand, links, cx)?;
