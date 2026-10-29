@@ -1,12 +1,12 @@
 export const gitHistoryContent = {
   zh: {
-    remoteBranch: "远程分支: {name}",
-    currentBranch: "当前分支: {name}",
-    localBranch: "本地分支: {name}",
+    remoteBranch: "远程分支：{name}",
+    currentBranch: "当前分支：{name}",
+    localBranch: "本地分支：{name}",
     copyCommitHash: "复制 Commit Hash",
     viewChanges: "查看变更",
-    viewingBranchHistory: "正在查看分支 {branch} 的历史(当前 HEAD: {head}),点击切换",
-    switchBranchHint: "点击切换查看其他分支的 git log(不会 checkout)",
+    viewingBranchHistory: "正在查看分支 {branch} 的历史（当前 HEAD：{head}），点击切换",
+    switchBranchHint: "点击切换查看其他分支的 git log（不会 checkout）",
     loading: "加载中...",
     refresh: "刷新",
     noCommits: "暂无提交",

@@ -250,6 +250,8 @@ pub struct GitHistoryContent {
     filter: FilterState,
     /// 选中的提交(按 hash 记:分页 / 刷新后照样认得出)。
     selected: Option<String>,
+    /// 这一轮重载回来之后要核对选中还在不在列表里(见 [`Self::verify_selection`])。
+    verify_selection: bool,
     detail: detail::DetailState,
     focus: FocusHandle,
     scroll: UniformListScrollHandle,
@@ -313,6 +315,7 @@ impl GitHistoryContent {
                 debounce: None,
             },
             selected: None,
+            verify_selection: false,
             focus: cx.focus_handle(),
             scroll: UniformListScrollHandle::new(),
             busy: None,
@@ -385,6 +388,7 @@ impl GitHistoryContent {
         self.filter.scanned = 0;
         self.filter.want = PAGE_SIZE;
         self.request += 1;
+        self.verify_selection = true;
         // ⚠️ loading 必须复位:令牌已 +1,在途响应注定被丢弃,而丢弃分支
         // 不会走到 `loading = false` —— 不复位的话这次 load_page 被 loading
         // 闸挡掉,历史区就永远停在旧仓库的内容上再也不刷
@@ -499,6 +503,8 @@ impl GitHistoryContent {
 
     fn load_failed(&mut self, err: anyhow::Error) {
         eprintln!("[git] 取提交历史失败: {err:#}");
+        // 没拿到新列表就无从核对,别留到之后的续页去误判
+        self.verify_selection = false;
         self.refreshing = false;
         self.load_error = Some(format!("{err:#}"));
     }
@@ -527,6 +533,22 @@ impl GitHistoryContent {
         self.has_more = merge_into(&mut self.commits, page);
         self.graph = git_graph::compute(&self.commits);
         self.refresh_head_hash();
+        self.verify_selection();
+    }
+
+    /// 重载回来(首页落定)之后核对选中:新列表里找不到它(切了分支 / 重置 / 改写掉了),
+    /// 选中与详情一起清掉 —— 否则「提交详情」还挂着别的分支上的提交。找得到就留着。
+    ///
+    /// 只在每轮重载落定时核一次(`verify_selection` 由 [`Self::begin_load`] 置上),
+    /// 之后触底续页不再核:那时选中的多半就是刚滚到的行。
+    fn verify_selection(&mut self) {
+        if !std::mem::take(&mut self.verify_selection) {
+            return;
+        }
+        if !selection_survives(self.selected.as_deref(), &self.commits) {
+            self.selected = None;
+            self.detail.clear();
+        }
     }
 
     /// 合并一页过滤结果;没凑够 [`FilterState::want`] 且还有下文就接着扫。
@@ -551,6 +573,9 @@ impl GitHistoryContent {
         self.refresh_head_hash();
         if self.has_more && self.commits.len() < self.filter.want {
             self.load_page(false, cx);
+        } else {
+            // 过滤要连扫好几页才凑够首屏,凑够了才算这一轮落定
+            self.verify_selection();
         }
     }
 
@@ -966,6 +991,22 @@ fn tracked_upstream<'a>(
         .as_deref()
 }
 
+/// 「仅我的」开关的提示:查不到邮箱时说原因,开着时写出按哪个邮箱筛。
+fn only_mine_tip(filter: &FilterState) -> SharedString {
+    if filter.no_email {
+        t("gitLog", "filter.noEmail").into()
+    } else if let Some(email) = filter.email.as_deref().filter(|_| filter.only_mine) {
+        tr!("gitLog", "filter.onlyMineTip", email = email).into()
+    } else {
+        t("gitLog", "filter.onlyMine").into()
+    }
+}
+
+/// 重载之后选中还算不算数:没选中,或选中的提交还在新列表里。
+fn selection_survives(selected: Option<&str>, commits: &[GitCommitInfo]) -> bool {
+    selected.is_none_or(|hash| commits.iter().any(|c| c.hash == hash))
+}
+
 /// 相对时间(`src/utils/timeFormat.ts:3-18`)。
 ///
 /// ⚠️ 命名空间是 **`time`**,不是 `session_panel` 用的 `sessionList.time.*` ——
@@ -998,6 +1039,18 @@ pub(crate) fn format_absolute_time(timestamp: i64) -> String {
     match Local.timestamp_opt(timestamp, 0).single() {
         Some(dt) => dt.format("%Y-%m-%d %H:%M").to_string(),
         None => timestamp.to_string(),
+    }
+}
+
+/// 详情区的时间:绝对时间 + 括号里的相对时间。30 天以上相对时间退成纯日期,
+/// 与绝对时间的日期部分一模一样(「2026-07-19 14:03  (2026-07-19)」),这时只写绝对时间。
+pub(crate) fn format_detail_time(timestamp: i64, now: i64) -> String {
+    let absolute = format_absolute_time(timestamp);
+    let relative = format_relative_time(timestamp, now);
+    if absolute.starts_with(relative.as_str()) {
+        absolute
+    } else {
+        format!("{absolute}  ({relative})")
     }
 }
 
@@ -1109,13 +1162,8 @@ impl GitHistoryContent {
         } else {
             ui::text_secondary()
         };
-        let mine_tip: SharedString = if self.filter.no_email {
-            t("gitLog", "filter.noEmail").into()
-        } else if let Some(email) = self.filter.email.as_deref().filter(|_| mine) {
-            tr!("gitLog", "filter.onlyMineTip", email = email).into()
-        } else {
-            t("gitLog", "filter.onlyMine").into()
-        };
+        // 点一下就切状态的开关:提示文案在气泡渲染时现读(见 `TooltipExt::tip_live`)
+        let view = cx.entity().downgrade();
         let mine_pill = div()
             .id("git-log-only-mine")
             .flex_none()
@@ -1141,7 +1189,11 @@ impl GitHistoryContent {
             })
             .child(icon(ICON_USER, git_ui::ICON_SIZE_SM, mine_color))
             .child(t("gitLog", "filter.onlyMine"))
-            .tip(mine_tip)
+            .tip_live(move |cx| {
+                view.upgrade()
+                    .map(|v| only_mine_tip(&v.read(cx).filter))
+                    .unwrap_or_default()
+            })
             .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
                 this.toggle_only_mine(cx);
             }));
@@ -1860,6 +1912,35 @@ mod tests {
         let lines: Vec<_> = tip.lines().collect();
         assert_eq!(lines[0], "fix: something");
         assert!(lines[1].starts_with("tester · ") && lines[1].ends_with("abcdef1"));
+    }
+
+    /// 详情区时间:30 天以上相对时间就是日期本身,不再括号里重复一遍;
+    /// 近期的照旧「绝对  (相对)」。
+    #[test]
+    fn 详情时间不重复日期() {
+        let ts = 1_700_000_000;
+        let old = format_detail_time(ts, ts + 90 * 86_400);
+        assert_eq!(old, format_absolute_time(ts));
+        assert!(!old.contains('('), "{old}");
+        let recent = format_detail_time(ts, ts + 3 * 3600);
+        assert_eq!(
+            recent,
+            format!(
+                "{}  ({})",
+                format_absolute_time(ts),
+                format_relative_time(ts, ts + 3 * 3600)
+            )
+        );
+    }
+
+    /// 切分支 / 重置后重载:选中的提交不在新列表里就作废,还在就留着;没选中不算作废。
+    #[test]
+    fn 重载后选中不在列表里就作废() {
+        let commits = vec![test_commit("aaa", &["bbb"]), test_commit("bbb", &[])];
+        assert!(selection_survives(None, &commits));
+        assert!(selection_survives(Some("bbb"), &commits));
+        assert!(!selection_survives(Some("ccc"), &commits));
+        assert!(!selection_survives(Some("aaa"), &[]));
     }
 
     /// 过滤条件:「仅我的」查不到邮箱时不算生效;路径是仓库根不算;几项都给时一起带下去。

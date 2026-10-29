@@ -53,7 +53,7 @@ use gpui::{
     StatefulInteractiveElement, Styled, Window, div, prelude::FluentBuilder as _, px,
 };
 use gpui_component::Disableable as _;
-use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::button::ButtonVariants as _;
 use gpui_component::dialog::{Cancel, Confirm as DialogConfirm, DialogFooter};
 use gpui_component::input::{Textarea, TextareaState};
 use mt_project::git::GitStatus;
@@ -62,7 +62,7 @@ use mt_ui::tooltip::TooltipExt as _;
 
 use crate::i18n::t;
 use crate::notify::ToastKind;
-use crate::prompt::{close_guarded, kind, open_guarded};
+use crate::prompt::{FOCUS_RING_ROOM, close_guarded, footer_button, kind, open_guarded};
 use crate::store::AppStore;
 use crate::ui;
 
@@ -86,16 +86,52 @@ pub fn soft_bg(color: Hsla) -> Hsla {
     ui::with_alpha(color, 0.15)
 }
 
-/// 语义色写在自己淡底上的字色:浅底上亮度压一截(色相不变),见模块注释。
-pub fn soft_fg(color: Hsla) -> Hsla {
-    if light_ground() {
-        Hsla {
-            l: color.l * 0.8,
-            ..color
+/// 浅底上语义色字与胶囊底的最低对比度(WCAG AA 正文档)。11px 的胶囊字比正文还小,
+/// 低于这一档就糊成一片(浅色主题的「2 个冲突」attention 胶囊踩过)。
+const SOFT_FG_MIN_CONTRAST: f32 = 4.5;
+
+/// WCAG 相对亮度(按 sRGB 线性化)。
+fn luminance(color: Hsla) -> f32 {
+    let rgb = color.to_rgb();
+    let lin = |c: f32| {
+        if c <= 0.039_28 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
         }
-    } else {
-        color
+    };
+    0.2126 * lin(rgb.r) + 0.7152 * lin(rgb.g) + 0.0722 * lin(rgb.b)
+}
+
+/// 两色的 WCAG 对比度(1 ~ 21)。
+pub(crate) fn contrast_ratio(a: Hsla, b: Hsla) -> f32 {
+    let (la, lb) = (luminance(a), luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
+/// 语义色写在自己淡底上的字色:浅底上亮度压一截(色相不变),见模块注释。
+///
+/// 压多少按对比度定,不是固定比例:先压到 0.8 倍,与胶囊实际底色(面板底 + 15% 淡底)
+/// 的对比度还不到 [`SOFT_FG_MIN_CONTRAST`] 就继续压 —— 黄 / 琥珀一类本身很亮的
+/// 语义色(attention、warning)固定 0.8 倍远远不够。
+pub fn soft_fg(color: Hsla) -> Hsla {
+    if !light_ground() {
+        return color;
     }
+    let ground = opaque(ui::bg_surface().blend(soft_bg(color)));
+    let mut fg = Hsla {
+        l: color.l * 0.8,
+        ..color
+    };
+    while fg.l > 0.05 && contrast_ratio(fg, ground) < SOFT_FG_MIN_CONTRAST {
+        fg.l -= 0.02;
+    }
+    fg
+}
+
+/// 去掉 alpha(预混出来的底色当不透明色用)。
+fn opaque(color: Hsla) -> Hsla {
+    Hsla { a: 1.0, ..color }
 }
 
 /// 行的悬停底:前景色的一层薄纱(见模块注释)。
@@ -948,25 +984,49 @@ pub fn commit_file_status(status: &str) -> (&'static str, Hsla) {
 
 // ─── 头像 ─────────────────────────────────────────────────────
 
-/// 头像的语义色池(按作者稳定取一个)。
-fn avatar_color(key: &str) -> Hsla {
-    // FNV-1a:稳定、无依赖,同名作者永远同色
+/// 头像色相的档数(色环等分,30° 一档)。
+///
+/// 早先是从八个语义色里挑,可那八个里 accent / ai / file / folder 有好几个本来就是
+/// 相近的紫蓝,`Developer` 与 `Alice` 撞成一样的紫。改成色环十二等分:相邻两档差
+/// 30°,一眼分得开。
+const AVATAR_HUES: u32 = 12;
+
+/// 作者 → 色相档(`0..AVATAR_HUES`)。FNV-1a 再过一遍 murmur3 的 fmix32 打散:
+/// FNV 的低位对短名字分布很差(取模只看低位),不打散的话常见名字扎堆在几档里。
+/// 不分大小写(`alice` 与 `Alice` 是同一个人)。
+fn avatar_hue_index(key: &str) -> u32 {
     let mut h: u32 = 0x811c_9dc5;
-    for b in key.as_bytes() {
-        h ^= u32::from(*b);
+    for b in key.trim().to_lowercase().bytes() {
+        h ^= u32::from(b);
         h = h.wrapping_mul(0x0100_0193);
     }
-    let pool = [
-        ui::accent(),
-        ui::color_success(),
-        ui::color_info(),
-        ui::color_warning(),
-        ui::color_error(),
-        ui::color_ai(),
-        ui::color_file(),
-        ui::color_folder(),
-    ];
-    pool[(h as usize) % pool.len()]
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x85eb_ca6b);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0xc2b2_ae35);
+    h ^= h >> 16;
+    h % AVATAR_HUES
+}
+
+/// 头像的主色:色相按作者取档,饱和度 / 亮度跟着主题的 info 色走(深浅主题各自合适)。
+fn avatar_color(key: &str) -> Hsla {
+    let base = ui::color_info();
+    Hsla {
+        h: avatar_hue_index(key) as f32 / AVATAR_HUES as f32,
+        s: base.s.clamp(0.45, 0.75),
+        l: base.l,
+        a: 1.0,
+    }
+}
+
+/// 头像底色:主色 22% 预混到面板底色上,**不透明**。
+///
+/// 不用半透明底:E2E 三路截图里,弹窗毛玻璃背板之下头像圆周冒出白色弧线;预混成
+/// 实色后圆周的弧线不再出现。⚠️ 偶尔仍能在头像字形 / 彩色 emoji 上截到零星白点,
+/// 与底色透明与否无关 —— 都是全分辨率的锐利像素,不可能来自 1/4 降采样再模糊的
+/// 背板,疑在 PrintWindow 截 DirectComposition 表面那条链路,待真机截屏确认。
+fn avatar_bg(color: Hsla) -> Hsla {
+    opaque(ui::bg_surface().blend(ui::with_alpha(color, 0.22)))
 }
 
 /// 作者名 → 头像上的字(首个字母 / 汉字,字母大写)。
@@ -978,9 +1038,9 @@ pub fn avatar_initial(name: &str) -> String {
         .unwrap_or_else(|| "?".to_string())
 }
 
-/// 16px 圆形首字母头像:按作者取的语义色淡底 + 同色字。
+/// 16px 圆形首字母头像:按作者取的色相淡底(不透明,见 [`avatar_bg`])+ 同色字。
 pub fn avatar(name: &str) -> Div {
-    let color = avatar_color(name.trim());
+    let color = avatar_color(name);
     div()
         .flex_none()
         .size(px(16.0))
@@ -988,7 +1048,7 @@ pub fn avatar(name: &str) -> Div {
         .flex()
         .items_center()
         .justify_center()
-        .bg(ui::with_alpha(color, 0.18))
+        .bg(avatar_bg(color))
         .text_color(soft_fg(color))
         .text_size(ui::font_px(9.0))
         .font_weight(FontWeight::SEMIBOLD)
@@ -1040,9 +1100,7 @@ pub fn dialog_footer(
     danger: bool,
     disabled: bool,
 ) -> DialogFooter {
-    let ok_button = Button::new("ok")
-        .label(ok)
-        .cursor_pointer()
+    let ok_button = footer_button("ok", ok)
         .disabled(disabled)
         .on_click(|_, window, cx| {
             window.dispatch_action(Box::new(DialogConfirm { secondary: false }), cx)
@@ -1054,18 +1112,21 @@ pub fn dialog_footer(
     };
     DialogFooter::new()
         .children(cancel.map(|cancel| {
-            Button::new("cancel")
-                .label(cancel)
-                .cursor_pointer()
+            footer_button("cancel", cancel)
                 .on_click(|_, window, cx| window.dispatch_action(Box::new(Cancel), cx))
         }))
         .child(ok_button)
 }
 
 /// 弹窗正文的外壳。左右不另加内边距 —— Dialog 已给正文、标题、页脚同一份 16px,
-/// 再加一层正文就比标题与页脚缩进一截。
+/// 再加一层正文就比标题与页脚缩进一截。上下各垫 [`FOCUS_RING_ROOM`]:正文区是裁剪
+/// 容器,排在首尾的输入框的聚焦环(画在边框外)贴边就被切掉一条。
 pub fn form_body() -> Div {
-    div().flex().flex_col().gap(px(12.0))
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(12.0))
+        .py(px(FOCUS_RING_ROOM))
 }
 
 /// 表单字段标签。
@@ -1162,31 +1223,44 @@ pub fn check_row(
         .child(label.into())
 }
 
-/// 只读、可选中复制的多行原文框(git 的 stderr)。高度按行数估,封顶 `max_rows`。
+/// 原文框最少几行高(一行的报错也留出第二行,不至于扁成一条)。
+const ERROR_TEXT_MIN_ROWS: usize = 2;
+
+/// 只读、可选中复制的多行原文框(git 的 stderr)。高度随内容(按折行后的行数)在
+/// [`ERROR_TEXT_MIN_ROWS`] ~ `max_rows` 之间长,再多就在框里滚。
+///
+/// ⚠️ 必须是 `auto_grow`:`TextareaState::rows` 在普通多行模式下只是个记录值,
+/// 布局时最小高度恒为一行(gpui-base `input/base/element.rs` 只有 AutoGrow 才按
+/// 行数撑高),原文框于是只有一行多高,`fatal:` 那行要滚好几格才看得到。
 pub fn error_text_state(
     text: &str,
     max_rows: usize,
     window: &mut Window,
     cx: &mut App,
 ) -> Entity<TextareaState> {
-    let rows = text.lines().count().clamp(2, max_rows);
     let text = text.to_string();
     cx.new(|cx| {
         TextareaState::new(window, cx)
-            .rows(rows)
+            .auto_grow(ERROR_TEXT_MIN_ROWS, max_rows.max(ERROR_TEXT_MIN_ROWS))
             .default_value(text)
     })
 }
 
-/// 原文框元素(与 [`error_block`] 同一套红框淡底)。
+/// 原文框元素(与 [`error_block`] 同一套红框淡底):等宽字(git 的原文常按列对齐,
+/// 路径、哈希也好认),可选中复制。
 pub fn error_text_box(state: &Entity<TextareaState>) -> AnyElement {
-    div()
+    mono(div())
         .w_full()
         .rounded(px(4.0))
         .border_1()
         .border_color(ui::with_alpha(ui::color_error(), 0.35))
         .bg(ui::with_alpha(ui::color_error(), 0.06))
-        .child(Textarea::new(state).readonly(true).bordered(false))
+        .child(
+            Textarea::new(state)
+                .readonly(true)
+                .bordered(false)
+                .text_size(ui::font_px(12.0)),
+        )
         .into_any_element()
 }
 
@@ -1310,21 +1384,16 @@ pub fn show_git_error(
             .overlay_closable(true)
             .footer(
                 DialogFooter::new()
+                    .child(footer_button("copy", t("gitBranch", "copy")).on_click(
+                        move |_, _window, cx| {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                copy_text.clone(),
+                            ));
+                        },
+                    ))
                     .child(
-                        Button::new("copy")
-                            .label(t("gitBranch", "copy"))
-                            .cursor_pointer()
-                            .on_click(move |_, _window, cx| {
-                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                                    copy_text.clone(),
-                                ));
-                            }),
-                    )
-                    .child(
-                        Button::new("ok")
-                            .label(t("gitBranch", "gotIt"))
+                        footer_button("ok", t("gitBranch", "gotIt"))
                             .primary()
-                            .cursor_pointer()
                             .on_click(|_, window, cx| {
                                 window.dispatch_action(
                                     Box::new(DialogConfirm { secondary: false }),
@@ -1415,6 +1484,90 @@ mod tests {
         assert!(is_light(0.97));
         assert!(!is_light(0.08));
         assert!(!is_light(LIGHT_GROUND_L), "等于阈值不算亮");
+    }
+
+    /// E2E 里 Developer 与 Alice 同为紫色认不出来:三个演示作者两两不同档;
+    /// 同一个人不分大小写、首尾空白同色;常见名字铺得开(20 个名字至少占 8 档)。
+    #[test]
+    fn 头像色相分得开() {
+        let (dev, alice, bob) = (
+            avatar_hue_index("Developer"),
+            avatar_hue_index("Alice Chen"),
+            avatar_hue_index("Bob Wang"),
+        );
+        assert!(dev != alice && dev != bob && alice != bob);
+        assert_eq!(
+            avatar_hue_index(" Alice Chen "),
+            avatar_hue_index("alice chen")
+        );
+        let names = [
+            "Developer",
+            "Alice Chen",
+            "Bob Wang",
+            "Carol",
+            "Dave",
+            "Eve",
+            "Mallory",
+            "Trent",
+            "张三",
+            "李四",
+            "王五",
+            "赵六",
+            "Linus Torvalds",
+            "dependabot[bot]",
+            "github-actions[bot]",
+            "renovate[bot]",
+            "John Smith",
+            "Jane Doe",
+            "Mike",
+            "Lucy",
+        ];
+        let used: std::collections::HashSet<u32> =
+            names.iter().map(|n| avatar_hue_index(n)).collect();
+        assert!(used.len() >= 8, "只占了 {} 档", used.len());
+        assert!(used.iter().all(|h| *h < AVATAR_HUES));
+    }
+
+    /// 头像底色预混成实色(半透明小圆在毛玻璃背板下出白弧,见 `avatar_bg`),深浅主题都是。
+    #[test]
+    fn 头像底色不透明() {
+        for palette in [ui::Palette::dark(), ui::Palette::light()] {
+            ui::set_palette(palette);
+            for name in ["Developer", "Alice Chen", "张三"] {
+                assert_eq!(avatar_bg(avatar_color(name)).a, 1.0);
+            }
+        }
+        ui::set_palette(ui::Palette::dark());
+    }
+
+    /// 浅色主题下胶囊字(语义色写在自己 15% 淡底上)对比度够 AA:attention / warning
+    /// 这类亮色固定压 0.8 倍不够(「2 个冲突」胶囊读不清),要按对比度压到够为止。
+    #[test]
+    fn 浅色主题胶囊字对比度够() {
+        ui::set_palette(ui::Palette::light());
+        for color in [
+            ui::color_attention(),
+            ui::color_warning(),
+            ui::color_success(),
+            ui::color_info(),
+            ui::color_error(),
+            ui::accent(),
+        ] {
+            let ground = opaque(ui::bg_surface().blend(soft_bg(color)));
+            let ratio = contrast_ratio(soft_fg(color), ground);
+            assert!(ratio >= SOFT_FG_MIN_CONTRAST - 1e-3, "{color:?}: {ratio}");
+            assert_eq!(soft_fg(color).h, color.h, "色相不变");
+        }
+        ui::set_palette(ui::Palette::dark());
+    }
+
+    /// 对比度的两个端点:同色 1:1,黑白 21:1。
+    #[test]
+    fn 对比度端点() {
+        let black = gpui::hsla(0.0, 0.0, 0.0, 1.0);
+        let white = gpui::hsla(0.0, 0.0, 1.0, 1.0);
+        assert!((contrast_ratio(black, black) - 1.0).abs() < 1e-3);
+        assert!((contrast_ratio(black, white) - 21.0).abs() < 0.05);
     }
 
     #[test]

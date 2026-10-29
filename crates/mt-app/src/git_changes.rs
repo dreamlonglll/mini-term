@@ -976,6 +976,7 @@ impl GitChanges {
             .detail(preview_paths(&paths))
             .ok_text(t("gitChanges", "discardOk"))
             .cancel_text(t("gitChanges", "discardCancel"))
+            .danger()
             .open(
                 move |window, cx| {
                     let paths = paths.clone();

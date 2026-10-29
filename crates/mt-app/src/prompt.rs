@@ -42,6 +42,35 @@ use crate::ui;
 
 // ─── 页脚按钮 ─────────────────────────────────────────────────
 
+/// 通用弹窗(prompt / confirm / alert)的宽度。原版 `.prompt-dialog` 是 360px,
+/// 中文确认语一长,末尾就剩「回。」「状态。」一两个字单独成行;420 与 Git 弹窗的
+/// `git_ui::DIALOG_W_SM` 同档。
+pub const DIALOG_W: f32 = 420.0;
+
+/// 页脚按钮的文字字号:与正文(`body` 的 13)一致。
+///
+/// 组件库 `Button` 的 Medium 档把标签写成 `text_base`(1rem),比弹窗正文大一档,
+/// 「取消 / 删除」两个字压过整段说明。标签改走 child、自带字号,按钮高度不变。
+const FOOTER_TEXT: f32 = 13.0;
+
+/// 输入框聚焦环的外扩宽度(gpui-component `styled.rs` 的 `FOCUS_RING_WIDTH`,
+/// crate 私有拿不到,对齐着写)。弹窗正文区是裁剪容器,环画在输入框边框**外面**,
+/// 输入框贴着正文区上下边时要垫出这么多,否则那一边的环被切掉。
+pub const FOCUS_RING_ROOM: f32 = 3.0;
+
+/// 页脚里的一颗按钮:标签字号与正文一致([`FOOTER_TEXT`]),手型光标。
+///
+/// 组件库的 `Button` 只给 link / text 两种变体手型光标,其余一律 `cursor_default`;
+/// 实例上设的样式最后合并(`refine_style(&instance_style)`),所以这里的
+/// `cursor_pointer` 盖得过它。
+pub fn footer_button(id: &'static str, label: impl Into<SharedString>) -> Button {
+    let label: SharedString = label.into();
+    Button::new(id)
+        .accessibility_label(label.clone())
+        .child(div().text_size(ui::font_px(FOOTER_TEXT)).child(label))
+        .cursor_pointer()
+}
+
 /// 「取消 / 确定」页脚(`cancel` 为 `None` 时只有「确定」)。
 ///
 /// gpui-component 0.6 的 `Dialog` 不再有 `.confirm()` / `.alert()`——自动页脚
@@ -49,33 +78,31 @@ use crate::ui;
 /// [`open_guarded`] 的 `Dialog → Dialog` 签名。这里按 0.5.1 的原样自绘:
 /// 按钮不直接调回调,而是派发 `Confirm` / `Cancel` 动作,由 Dialog 自己走
 /// `on_ok` / `on_cancel` → 关闭的既有路径(Enter / Esc 也走同一条)。
-///
-/// 组件库的 `Button` 只给 link / text 两种变体手型光标,其余一律 `cursor_default`;
-/// 实例上设的样式最后合并(`refine_style(&instance_style)`),所以这里的
-/// `cursor_pointer` 盖得过它。
 pub fn confirm_footer<S: Into<SharedString>>(
     ok: impl Into<SharedString>,
     cancel: Option<S>,
 ) -> DialogFooter {
+    footer(ok.into(), cancel.map(Into::into), false)
+}
+
+/// [`confirm_footer`] 的本体;`danger` = 确认键用危险色(删除 / 丢弃一类)。
+fn footer(ok: SharedString, cancel: Option<SharedString>, danger: bool) -> DialogFooter {
+    let ok_button = footer_button("ok", ok).on_click(|_, window, cx| {
+        window.dispatch_action(
+            Box::new(gpui_component::dialog::Confirm { secondary: false }),
+            cx,
+        )
+    });
     DialogFooter::new()
         .children(cancel.map(|cancel| {
-            Button::new("cancel")
-                .label(cancel.into())
-                .cursor_pointer()
+            footer_button("cancel", cancel)
                 .on_click(|_, window, cx| window.dispatch_action(Box::new(Cancel), cx))
         }))
-        .child(
-            Button::new("ok")
-                .label(ok)
-                .primary()
-                .cursor_pointer()
-                .on_click(|_, window, cx| {
-                    window.dispatch_action(
-                        Box::new(gpui_component::dialog::Confirm { secondary: false }),
-                        cx,
-                    )
-                }),
-        )
+        .child(if danger {
+            ok_button.danger()
+        } else {
+            ok_button.primary()
+        })
 }
 
 // ─── 防叠开 ───────────────────────────────────────────────────
@@ -304,14 +331,16 @@ pub fn show_prompt(
         let on_ok = on_ok.clone();
         dialog
             .title(title.clone())
-            .w(px(360.0))
+            .w(px(DIALOG_W))
             // 遮罩点击 = 取消(原版 prompt-overlay 的点击行为)
             .overlay_closable(true)
             .footer(confirm_footer(
                 t("prompt", "confirm"),
                 Some(t("prompt", "cancel")),
             ))
-            .child(div().px(px(20.0)).child(Input::new(&input)))
+            // 左右不另加内边距(与标题、页脚同一条左缘,见 `body`);上下留出
+            // 聚焦环的 3px —— 正文区是裁剪容器,环画在输入框外,贴边就被切掉
+            .child(div().py(px(FOCUS_RING_ROOM)).child(Input::new(&input)))
             .on_ok(move |_: &ClickEvent, window, cx| {
                 let value = input_for_ok.read(cx).value().to_string();
                 on_ok(value, window, cx);
@@ -333,6 +362,8 @@ pub struct Confirm {
     detail: Vec<String>,
     ok_text: SharedString,
     cancel_text: SharedString,
+    /// 确认键用危险色(删除 / 丢弃 / 强推这类不可逆操作)。
+    danger: bool,
 }
 
 impl Confirm {
@@ -343,7 +374,14 @@ impl Confirm {
             detail: Vec::new(),
             ok_text: t("prompt", "confirm").into(),
             cancel_text: t("prompt", "cancel").into(),
+            danger: false,
         }
+    }
+
+    /// 不可逆操作:确认键换危险色(与 `git_ui::dialog_footer` 的 danger 同一颗)。
+    pub fn danger(mut self) -> Self {
+        self.danger = true;
+        self
     }
 
     pub fn detail(mut self, lines: Vec<String>) -> Self {
@@ -373,12 +411,13 @@ impl Confirm {
             let on_ok = on_ok.clone();
             dialog
                 .title(self.title.clone())
-                // 原版 `.prompt-dialog` 三件套(prompt/confirm/alert)统一 360px
-                .w(px(360.0))
+                // 三件套(prompt/confirm/alert)统一宽度,见 `DIALOG_W`
+                .w(px(DIALOG_W))
                 .overlay_closable(true)
-                .footer(confirm_footer(
+                .footer(footer(
                     self.ok_text.clone(),
                     Some(self.cancel_text.clone()),
+                    self.danger,
                 ))
                 .child(body(&self.message, &self.detail))
                 .on_ok(move |_: &ClickEvent, window, cx| {
@@ -404,8 +443,8 @@ pub fn show_alert(
     open_guarded(kind::ALERT, window, cx, move |dialog, _window, _cx| {
         dialog
             .title(title.clone())
-            // 原版 `.prompt-dialog` 三件套(prompt/confirm/alert)统一 360px
-            .w(px(360.0))
+            // 三件套(prompt/confirm/alert)统一宽度,见 `DIALOG_W`
+            .w(px(DIALOG_W))
             .footer(confirm_footer(t("prompt", "ok"), None::<SharedString>))
             .child(body(&message, &[]))
             // 「知道了」按钮与回车都派发 `Confirm`,要它关窗就得显式说:
@@ -478,7 +517,6 @@ pub fn show_file_conflict_choice(
                         .child(body(message, &details))
                         .child(
                             div()
-                                .px(px(20.0))
                                 .flex()
                                 .items_center()
                                 .justify_end()
@@ -510,8 +548,11 @@ pub fn show_file_conflict_choice(
 
 /// 正文 + 补充行。文案里的 `\n` 要真换行(确认框普遍用它排版),
 /// 而 gpui 的文本不认转义符,得自己拆成多个 child。
+///
+/// 左右**不另加内边距**:Dialog 已给标题、正文、页脚同一份 16px,正文再套一层
+/// 20px 就比标题右缩一截(看着像给图标留了位却没有图标)。
 fn body(message: &str, detail: &[String]) -> gpui::AnyElement {
-    let mut el = div().px(px(20.0)).flex().flex_col().gap(px(4.0));
+    let mut el = div().flex().flex_col().gap(px(4.0));
     for line in message.split('\n') {
         el = el.child(
             div()
@@ -553,6 +594,12 @@ mod tests {
 
         assert_eq!(preview.as_slice(), &conflicts[..5]);
         assert_eq!(remaining, 2);
+    }
+
+    /// 通用确认框与 Git 的确认类小弹窗同宽(360 时中文末尾一两个字单独成行)。
+    #[test]
+    fn 通用弹窗与_git_小弹窗同宽() {
+        assert_eq!(DIALOG_W, crate::git_ui::DIALOG_W_SM);
     }
 
     #[test]

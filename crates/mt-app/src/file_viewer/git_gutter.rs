@@ -115,6 +115,20 @@ const POPUP_MIN_WIDTH: f32 = 360.0;
 const POPUP_MAX_WIDTH: f32 = 760.0;
 /// 浮层里旧内容最多显示多少行高(再多滚动)。
 const POPUP_MAX_LINES: f32 = 14.0;
+/// 浮层旧内容的行号列:每位数字的宽度(13px 等宽字一位约 7.8px,留点余量 ——
+/// 编辑器字族是用户可配的,宽一点的等宽字也装得下)与左右留白。
+const POPUP_DIGIT_W: f32 = 8.5;
+const POPUP_NUMBER_PAD_L: f32 = 10.0;
+const POPUP_NUMBER_PAD_R: f32 = 8.0;
+
+/// 行号列的总宽(含左右留白):按最大行号的位数算。
+///
+/// 早先是 `7.5 × (位数 + 2)` 再减掉 8px 右留白,一位数只剩 7px 放 13px 的数字,
+/// 右对齐的数字向左溢出,被浮层的圆角边框切掉半个(E2E 截到「9」只剩右半)。
+fn popup_number_width(max_line: usize) -> Pixels {
+    let digits = max_line.max(1).ilog10() + 1;
+    px(POPUP_DIGIT_W * digits as f32 + POPUP_NUMBER_PAD_L + POPUP_NUMBER_PAD_R)
+}
 
 // ─── 纯逻辑(可测) ────────────────────────────────────────────
 
@@ -1046,7 +1060,7 @@ impl FileViewer {
             });
 
         // 旧内容:等宽、删除底色,左边是 HEAD 里的行号
-        let number_width = px(7.5 * ((hunk.old_start + hunk.old_len).max(1).ilog10() as f32 + 2.0));
+        let number_width = popup_number_width(hunk.old_start + hunk.old_len);
         let body = has_old.then(|| {
             let rows = old_lines.into_iter().enumerate().map(|(i, line)| {
                 div()
@@ -1058,7 +1072,8 @@ impl FileViewer {
                         div()
                             .flex_none()
                             .w(number_width)
-                            .pr(px(8.0))
+                            .pl(px(POPUP_NUMBER_PAD_L))
+                            .pr(px(POPUP_NUMBER_PAD_R))
                             .text_right()
                             .text_color(ui::text_muted())
                             .child((hunk.old_start + i + 1).to_string()),

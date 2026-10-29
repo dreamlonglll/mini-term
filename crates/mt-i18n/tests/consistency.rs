@@ -149,8 +149,10 @@ use mt_i18n::{
 /// （带原文）换成标题 `gitChanges.operationFailedTitle`；随之下线不再使用的
 /// `gitCommit.{pushing,pushedToast,pushFailedAfterCommit}`、`gitLog.toast.failed`、
 /// `gitGutter.openCommitFailed`、`gitLog.action.viewChanges`。净减两条。
+/// 1417 → 1418：推送进行中对话框左键不再叫「取消」（推送撤不回，点它只是收框），
+/// 换成「在后台继续」（`gitBranch.pushInBackground`）。
 const EXPECTED_NAMESPACES: usize = 38;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1417;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1418;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。

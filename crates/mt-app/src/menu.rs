@@ -628,6 +628,27 @@ fn entry_id(ancestors: &[usize], index: usize) -> SharedString {
     SharedString::from(s)
 }
 
+/// 勾选项的前缀(文本方案,见模块注释第 1 条):勾上是 `✓ `,没勾是一个全角空格。
+const CHECK_ON: &str = "✓ ";
+const CHECK_OFF: &str = "　";
+
+/// 勾选槽的宽度(约 1.2em)。
+///
+/// 调用方照原版拼前缀(`✓ ` / 全角空格),本以为两者等宽,实际 `✓` + 半角空格比
+/// 全角空格宽一截(Windows 上 ✓ 回落到符号字体),勾上那项的文字整体右移约 5px。
+/// 这里把前缀摘出来放进定宽槽,文字从同一条左缘起笔 —— 调用方一行不用改。
+fn check_slot_width() -> Pixels {
+    ui::font_px(14.0)
+}
+
+/// 拆出标签上的勾选前缀:`Some((勾没勾, 余下文字))`;不是勾选项为 `None`。
+fn split_check(label: &str) -> Option<(bool, &str)> {
+    if let Some(rest) = label.strip_prefix(CHECK_ON) {
+        return Some((true, rest));
+    }
+    label.strip_prefix(CHECK_OFF).map(|rest| (false, rest))
+}
+
 /// 乘性改 alpha(与 `ui::alpha` 同语义,那个是私有的)。
 fn with_alpha(color: Hsla, a: f32) -> Hsla {
     Hsla {
@@ -637,6 +658,49 @@ fn with_alpha(color: Hsla, a: f32) -> Hsla {
 }
 
 // ─── 渲染 ─────────────────────────────────────────────────────
+
+/// 菜单项左侧:标题(+ 副标题)。勾选项的前缀摘进定宽槽([`check_slot_width`]),
+/// 副标题跟着标题文字对齐 —— 调用方给副标题垫的全角空格(对齐用的)一并摘掉。
+/// 有副标题时左侧变成两行一列;快捷键仍按整块垂直居中(行上的 `items_center`)。
+fn render_label(label: &SharedString, detail: Option<&str>) -> gpui::Div {
+    let (check, text) = match split_check(label) {
+        Some((on, rest)) => (Some(on), SharedString::from(rest.to_string())),
+        None => (None, label.clone()),
+    };
+    let detail = detail.map(|d| match check {
+        Some(_) => d.strip_prefix(CHECK_OFF).unwrap_or(d).to_string(),
+        None => d.to_string(),
+    });
+    let column = match detail {
+        Some(detail) => div()
+            .flex()
+            .flex_col()
+            .gap(px(1.0))
+            .min_w(px(0.0))
+            .child(div().child(text))
+            .child(
+                div()
+                    .text_size(ui::font_px(11.0))
+                    .text_color(ui::text_muted())
+                    .child(detail),
+            ),
+        None => div().child(text),
+    };
+    match check {
+        Some(on) => div()
+            .flex()
+            .items_start()
+            .min_w(px(0.0))
+            .child(
+                div()
+                    .flex_none()
+                    .w(check_slot_width())
+                    .when(on, |el| el.child("✓")),
+            )
+            .child(column),
+        None => column,
+    }
+}
 
 impl ContextMenu {
     fn dismiss(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1027,22 +1091,7 @@ impl ContextMenu {
                     cx.notify();
                 }
             }))
-            // 有副标题时左侧变成两行一列;快捷键仍按整块垂直居中(`items_center`)
-            .child(match item.detail.clone() {
-                Some(detail) => div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(1.0))
-                    .min_w(px(0.0))
-                    .child(div().child(item.label.clone()))
-                    .child(
-                        div()
-                            .text_size(ui::font_px(11.0))
-                            .text_color(ui::text_muted())
-                            .child(detail),
-                    ),
-                None => div().child(item.label.clone()),
-            });
+            .child(render_label(&item.label, item.detail.as_deref()));
 
         if let Some(shortcut) = item.shortcut.clone() {
             row = row.child(
@@ -1213,6 +1262,18 @@ mod tests {
         assert_eq!(entry_id(&[1], 0).to_string(), "ctx-1-i0");
         assert_ne!(entry_id(&[1], 0), entry_id(&[], 1));
         assert_ne!(entry_id(&[1, 2], 0), entry_id(&[1], 2));
+    }
+
+    /// 勾选前缀拆得出来:`✓ ` = 勾上、全角空格 = 没勾,余下是要画的文字;
+    /// 普通项(没前缀、半角空格开头)不算勾选项。
+    #[test]
+    fn 勾选前缀拆进定宽槽() {
+        assert_eq!(split_check("✓ main"), Some((true, "main")));
+        assert_eq!(split_check("　dev"), Some((false, "dev")));
+        assert_eq!(split_check("feature/x"), None);
+        assert_eq!(split_check(" x"), None);
+        // 只摘一层:文字本身以全角空格开头的照样留着
+        assert_eq!(split_check("　　x"), Some((false, "　x")));
     }
 
     /// 快捷键串照 `comboLabel` 的规则拼(本机平台那一支)。

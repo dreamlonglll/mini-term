@@ -174,3 +174,15 @@ fn 行映射_没变直通_变了按对齐_旧代结果丢弃() {
     annotate.enabled = false;
     assert!(annotate.diff_input().is_none());
 }
+
+/// 「注解」开关的提示随开关状态取文案(开着说隐藏、关着说显示),两个 key 中英齐全。
+#[test]
+fn 注解开关提示随状态() {
+    assert_eq!(annotate_tip_key(true), "hideAnnotations");
+    assert_eq!(annotate_tip_key(false), "showAnnotations");
+    for on in [true, false] {
+        for locale in [mt_i18n::Locale::Zh, mt_i18n::Locale::En] {
+            assert!(mt_i18n::lookup(locale, "gitGutter", annotate_tip_key(on)).is_some());
+        }
+    }
+}
