@@ -11,7 +11,11 @@
 //! 凭证管理器 / SSH agent / hooks 这些都由 CLI 天然继承。原实现靠
 //! `#[tauri::command(async)]` 把阻塞等待挪出主线程,现在这一层不做线程调度,
 //! **调用方必须自己放到后台执行器上跑**(GPUI 的 `background_executor`),
-//! 否则 30s/120s 的 `recv_timeout` 会卡住 UI 线程。
+//! 否则 30s/120s 的超时等待会卡住 UI 线程。
+//!
+//! 本文件之外的能力按主题拆成子模块(`git/<主题>.rs`,在这里 `mod` + `pub use`
+//! 摊平,调用方照旧 `mt_project::git::xxx`)。子模块直接用本模块私有的 CLI 执行器
+//! `run_git_command` / `run_git_command_labeled` / `run_git_output`。
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -1339,12 +1343,20 @@ fn full_replace_diff(old_content: &str, new_content: &str) -> Vec<DiffHunk> {
     }]
 }
 
-/// 工作区/暂存区文件相对 HEAD 的 diff。`file_path` 是相对 `project_path` 的路径。
-pub fn get_git_diff(
-    project_path: &Path,
-    file_path: &str,
-    staged: Option<bool>,
-) -> Result<GitDiffResult> {
+/// 单文件 diff 比的是哪两侧(与 `git diff` 家族同口径)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffSide {
+    /// HEAD → 暂存区(`git diff --cached`,「已暂存」分组)
+    Staged,
+    /// 暂存区 → 工作区(`git diff`,「未暂存」/「未跟踪」分组)。部分暂存的文件
+    /// 只显示**还没暂存**的那部分 —— 按块暂存 / 丢弃都以这一侧为准
+    Unstaged,
+    /// HEAD → 工作区(`git diff HEAD`,文件树「查看变更」:相对上次提交的全部改动)
+    Working,
+}
+
+/// 单文件 diff,两侧由 [`DiffSide`] 决定。`file_path` 是相对 `project_path` 的路径。
+pub fn get_git_diff(project_path: &Path, file_path: &str, side: DiffSide) -> Result<GitDiffResult> {
     let abs_file = project_path.join(file_path);
 
     let repo = discover_repo_for(project_path, &abs_file).ok_or_else(|| {
@@ -1363,40 +1375,82 @@ pub fn get_git_diff(
         .ok_or_else(|| anyhow!("file is outside repository working directory"))?;
     let rel_str = rel_path.to_string_lossy().replace('\\', "/");
 
-    let is_staged = staged.unwrap_or(false);
-
-    // 新内容:暂存区取 index,否则取工作区
-    let new_content = if is_staged {
-        let index = repo.index()?;
-        match index.get_path(Path::new(&rel_str), 0) {
-            Some(entry) => {
-                let blob = repo.find_blob(entry.id)?;
-                if blob.is_binary() {
-                    return Ok(binary_diff_result());
-                }
-                if blob.content().len() > MAX_DIFF_BYTES {
+    // 新侧:暂存区取 index,否则取工作区(已删除的文件 = 空)
+    let new_content = match side {
+        DiffSide::Staged => match index_text(&repo, &rel_str)? {
+            Some(SideText::Text(s)) => s,
+            Some(SideText::Binary) => return Ok(binary_diff_result()),
+            Some(SideText::TooLarge) => return Ok(too_large_diff_result()),
+            None => String::new(),
+        },
+        DiffSide::Unstaged | DiffSide::Working => {
+            if !abs_file.exists() {
+                String::new()
+            } else {
+                let new_bytes = std::fs::read(&abs_file)?;
+                if new_bytes.len() > MAX_DIFF_BYTES {
                     return Ok(too_large_diff_result());
                 }
-                std::str::from_utf8(blob.content())
-                    .map_err(|_| anyhow!("binary"))?
-                    .to_string()
+                match String::from_utf8(new_bytes) {
+                    Ok(s) => s,
+                    Err(_) => return Ok(binary_diff_result()),
+                }
             }
-            None => String::new(),
-        }
-    } else {
-        let new_bytes = std::fs::read(&abs_file)?;
-        if new_bytes.len() > MAX_DIFF_BYTES {
-            return Ok(too_large_diff_result());
-        }
-        match std::str::from_utf8(&new_bytes) {
-            Ok(s) => s.to_string(),
-            Err(_) => return Ok(binary_diff_result()),
         }
     };
 
-    let old_content = get_head_content(&repo, &rel_str)?.unwrap_or_default();
+    // 旧侧:未暂存比暂存区,其余比 HEAD
+    let old_content = match side {
+        DiffSide::Unstaged => match index_text(&repo, &rel_str)? {
+            Some(SideText::Text(s)) => s,
+            Some(SideText::Binary) => return Ok(binary_diff_result()),
+            Some(SideText::TooLarge) => return Ok(too_large_diff_result()),
+            // 冲突中的文件没有 stage 0 条目 —— 退回 HEAD(ours),不能当成新增
+            None if is_conflicted(&repo, &rel_str)? => {
+                get_head_content(&repo, &rel_str)?.unwrap_or_default()
+            }
+            // 不在暂存区 = 未跟踪 / 已暂存删除,全部算新增
+            None => String::new(),
+        },
+        DiffSide::Staged | DiffSide::Working => {
+            get_head_content(&repo, &rel_str)?.unwrap_or_default()
+        }
+    };
 
     Ok(diff_two_texts(old_content, new_content))
+}
+
+/// index / blob 一侧的取值结果。
+enum SideText {
+    Text(String),
+    Binary,
+    TooLarge,
+}
+
+/// 暂存区 stage 0 条目的内容。`None` = 该路径不在暂存区(未跟踪 / 已暂存删除 / 冲突中)。
+fn index_text(repo: &Repository, rel_path: &str) -> Result<Option<SideText>> {
+    let index = repo.index()?;
+    let Some(entry) = index.get_path(Path::new(rel_path), 0) else {
+        return Ok(None);
+    };
+    let blob = repo.find_blob(entry.id)?;
+    if blob.is_binary() {
+        return Ok(Some(SideText::Binary));
+    }
+    if blob.content().len() > MAX_DIFF_BYTES {
+        return Ok(Some(SideText::TooLarge));
+    }
+    Ok(Some(match std::str::from_utf8(blob.content()) {
+        Ok(s) => SideText::Text(s.to_string()),
+        Err(_) => SideText::Binary,
+    }))
+}
+
+/// 该路径在暂存区里有没有冲突条目(stage 1~3)。
+fn is_conflicted(repo: &Repository, rel_path: &str) -> Result<bool> {
+    let index = repo.index()?;
+    let path = Path::new(rel_path);
+    Ok((1..=3).any(|stage| index.get_path(path, stage).is_some()))
 }
 
 // ---------------------------------------------------------------------------
@@ -1417,9 +1471,10 @@ fn hide_console_window(_cmd: &mut std::process::Command) {
 
 /// 通用 git CLI 执行器(pull/push/worktree 系列共用):
 /// - 校验 `repo_path` 是目录并且包含 `.git`(避免在任意目录上跑 git)
-/// - 在独立线程里 spawn git 进程,通过 mpsc 回传 output
-/// - `recv_timeout` 到达上限后立即返回超时错误(子进程会被 drop,
-///   虽然不保证立刻 kill,但调用线程不再被阻塞)
+/// - `GIT_TERMINAL_PROMPT=0`:没有终端可问,要账号密码时立刻失败,不干等到超时
+///   (凭证管理器的 GUI 弹窗不受影响)
+/// - 到达上限即 kill 子进程并返回超时错误;stdout/stderr 由独立线程读,
+///   孙进程(ssh / 凭证助手)攥着管道不放也不会把调用线程拖住
 ///
 /// **会阻塞当前线程最多 `timeout`**,调用方自行放到后台执行器上跑。
 fn run_git_command(
@@ -1443,6 +1498,23 @@ fn run_git_command_labeled(
     timeout: Duration,
     timeout_hint: &str,
 ) -> Result<String> {
+    let output = run_git_output(repo_path, args, op_label, timeout, timeout_hint)?;
+    if output.success {
+        Ok(output.stdout)
+    } else {
+        bail!("{}", output.stderr);
+    }
+}
+
+/// 同 `run_git_command_labeled`,但退出码非零也返回 `Ok`,交调用方按 stdout/stderr
+/// 自己判(merge 冲突、`branch -d` 未合并这类要和「真失败」分开处理的场合)。
+fn run_git_output(
+    repo_path: &Path,
+    args: &[&str],
+    op_label: &str,
+    timeout: Duration,
+    timeout_hint: &str,
+) -> Result<GitOutput> {
     if !repo_path.is_dir() {
         bail!("不是有效目录:{}", repo_path.display());
     }
@@ -1450,36 +1522,86 @@ fn run_git_command_labeled(
     if !repo_path.join(".git").exists() {
         bail!("不是 git 仓库(缺少 .git):{}", repo_path.display());
     }
+    spawn_git(repo_path, args, op_label, timeout, timeout_hint)
+}
 
-    let op = op_label.to_string();
-    let (tx, rx) = std::sync::mpsc::channel();
-    let repo_path_owned = repo_path.to_path_buf();
-    let args_owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-    std::thread::spawn(move || {
-        let mut cmd = std::process::Command::new("git");
-        cmd.args(&args_owned)
-            .current_dir(&repo_path_owned)
-            .stdin(std::process::Stdio::null());
-        hide_console_window(&mut cmd);
-        let result = cmd.output();
-        // 忽略发送失败:调用方超时后接收端已被 drop
-        let _ = tx.send(result);
-    });
+/// 一次 git CLI 调用的结果。
+struct GitOutput {
+    success: bool,
+    stdout: String,
+    stderr: String,
+}
 
-    match rx.recv_timeout(timeout) {
-        Ok(Ok(output)) => {
-            if output.status.success() {
-                Ok(String::from_utf8_lossy(&output.stdout).to_string())
-            } else {
-                bail!("{}", String::from_utf8_lossy(&output.stderr));
+/// 管道读完后等孙进程松手的上限。git 本身已退出,剩下的只是 ssh / 凭证助手
+/// 这类可能继承了管道句柄的后代 —— 等不到就按已读到的算。
+const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// 起 git 子进程并限时等待;只有「起不来 / 超时」是 `Err`。
+fn spawn_git(
+    repo_path: &Path,
+    args: &[&str],
+    op_label: &str,
+    timeout: Duration,
+    timeout_hint: &str,
+) -> Result<GitOutput> {
+    use std::io::Read as _;
+    use std::process::{Command, Stdio};
+
+    let mut cmd = Command::new("git");
+    cmd.args(args)
+        .current_dir(repo_path)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    hide_console_window(&mut cmd);
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| anyhow!("启动 git {} 失败:{}", op_label, e))?;
+
+    let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut buf);
             }
+            // 忽略发送失败:超时路径上接收端已被 drop
+            let _ = tx.send(buf);
+        });
+        rx
+    };
+    let stdout_rx = drain(child.stdout.take().map(|p| Box::new(p) as _));
+    let stderr_rx = drain(child.stderr.take().map(|p| Box::new(p) as _));
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!(
+                    "git {} 超时({}s){}",
+                    op_label,
+                    timeout.as_secs(),
+                    timeout_hint
+                );
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(15)),
+            Err(e) => bail!("git {} 等待失败:{}", op_label, e),
         }
-        Ok(Err(e)) => bail!("启动 git {} 失败:{}", op, e),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            bail!("git {} 超时({}s){}", op, timeout.as_secs(), timeout_hint)
-        }
-        Err(e) => bail!("git {} 通信错误:{}", op, e),
-    }
+    };
+
+    let collect = |rx: std::sync::mpsc::Receiver<Vec<u8>>| {
+        let bytes = rx.recv_timeout(PIPE_DRAIN_GRACE).unwrap_or_default();
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    Ok(GitOutput {
+        success: status.success(),
+        stdout: collect(stdout_rx),
+        stderr: collect(stderr_rx),
+    })
 }
 
 fn run_git_network_command(repo_path: &Path, op: &'static str) -> Result<String> {
@@ -2071,7 +2193,7 @@ mod tests {
         let rel = "src/pages/task/my/my.vue";
         let root = init_repo_with_file("deep", rel, "old\n");
         std::fs::write(root.join(rel), "new\n").unwrap();
-        let result = get_git_diff(&root, rel, Some(false)).unwrap();
+        let result = get_git_diff(&root, rel, DiffSide::Unstaged).unwrap();
         assert_eq!(diff_lines(&result), old_to_new());
         std::fs::remove_dir_all(&root).ok();
 
@@ -2079,7 +2201,7 @@ mod tests {
         let rel = "a/b/c/d/e/f/g/h/i/j.txt";
         let root = init_repo_with_file("deeper", rel, "old\n");
         std::fs::write(root.join(rel), "new\n").unwrap();
-        let result = get_git_diff(&root, rel, Some(false)).unwrap();
+        let result = get_git_diff(&root, rel, DiffSide::Unstaged).unwrap();
         assert_eq!(diff_lines(&result), old_to_new());
         std::fs::remove_dir_all(&root).ok();
     }
@@ -2092,7 +2214,7 @@ mod tests {
         let root = init_repo_with_file("monorepo", rel_in_repo, "old\n");
         std::fs::write(root.join(rel_in_repo), "new\n").unwrap();
         let project = root.join("packages").join("app");
-        let result = get_git_diff(&project, "src/pages/task/my/my.vue", Some(false)).unwrap();
+        let result = get_git_diff(&project, "src/pages/task/my/my.vue", DiffSide::Unstaged).unwrap();
         assert_eq!(diff_lines(&result), old_to_new());
         std::fs::remove_dir_all(&root).ok();
     }
@@ -2110,11 +2232,109 @@ mod tests {
             index.remove_path(Path::new(rel)).unwrap();
             index.write().unwrap();
         }
-        let result = get_git_diff(&root, rel, Some(true)).unwrap();
+        let result = get_git_diff(&root, rel, DiffSide::Staged).unwrap();
         assert_eq!(
             diff_lines(&result),
             vec![("delete".to_string(), "old".to_string())]
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    fn changed_lines(result: &GitDiffResult) -> Vec<(String, String)> {
+        diff_lines(result)
+            .into_iter()
+            .filter(|(kind, _)| kind != "context")
+            .collect()
+    }
+
+    fn pair(kind: &str, content: &str) -> (String, String) {
+        (kind.to_string(), content.to_string())
+    }
+
+    /// 部分暂存:首行改动已暂存、末行改动未暂存。三侧各看各的 ——
+    /// 「未暂存」只剩末行(按块暂存/丢弃的前提),「已暂存」只有首行,「工作区」两处都在。
+    #[test]
+    fn diff_sides_split_partially_staged_file() {
+        let rel = "a.txt";
+        let root = init_repo_with_file("sides", rel, "a\nb\nc\nd\ne\nf\ng\nh\n");
+        std::fs::write(root.join(rel), "A\nb\nc\nd\ne\nf\ng\nh\n").unwrap();
+        git_stage(&root, &[rel.to_string()]).unwrap();
+        std::fs::write(root.join(rel), "A\nb\nc\nd\ne\nf\ng\nH\n").unwrap();
+
+        let unstaged = get_git_diff(&root, rel, DiffSide::Unstaged).unwrap();
+        assert_eq!(
+            changed_lines(&unstaged),
+            vec![pair("delete", "h"), pair("add", "H")]
+        );
+        let staged = get_git_diff(&root, rel, DiffSide::Staged).unwrap();
+        assert_eq!(
+            changed_lines(&staged),
+            vec![pair("delete", "a"), pair("add", "A")]
+        );
+        let working = get_git_diff(&root, rel, DiffSide::Working).unwrap();
+        assert_eq!(
+            changed_lines(&working),
+            vec![
+                pair("delete", "a"),
+                pair("add", "A"),
+                pair("delete", "h"),
+                pair("add", "H"),
+            ]
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 工作区删除(未暂存):旧实现读工作区文件直接报「找不到文件」,现在新侧按空算。
+    #[test]
+    fn unstaged_diff_of_deleted_file_is_full_delete() {
+        let rel = "gone.txt";
+        let root = init_repo_with_file("wt-delete", rel, "x\ny\n");
+        std::fs::remove_file(root.join(rel)).unwrap();
+        let result = get_git_diff(&root, rel, DiffSide::Unstaged).unwrap();
+        assert_eq!(
+            changed_lines(&result),
+            vec![pair("delete", "x"), pair("delete", "y")]
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 未跟踪文件不在暂存区:未暂存一侧整份算新增。
+    #[test]
+    fn unstaged_diff_of_untracked_file_is_full_add() {
+        let root = init_repo_with_file("untracked", "a.txt", "a\n");
+        std::fs::write(root.join("new.txt"), "n1\nn2\n").unwrap();
+        let result = get_git_diff(&root, "new.txt", DiffSide::Unstaged).unwrap();
+        assert_eq!(
+            changed_lines(&result),
+            vec![pair("add", "n1"), pair("add", "n2")]
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// 退出码非零不算 `Err`:由调用方按 stderr 自己判(merge 冲突、未合并分支删除等)。
+    #[test]
+    fn run_git_output_reports_failure_without_err() {
+        let root = init_repo_with_file("output", "a.txt", "a\n");
+        let out = run_git_output(
+            &root,
+            &["rev-parse", "--verify", "refs/heads/definitely-missing"],
+            "rev-parse",
+            Duration::from_secs(20),
+            "",
+        )
+        .unwrap();
+        assert!(!out.success);
+        assert!(!out.stderr.trim().is_empty());
+        let ok = run_git_output(
+            &root,
+            &["rev-parse", "--abbrev-ref", "HEAD"],
+            "rev-parse",
+            Duration::from_secs(20),
+            "",
+        )
+        .unwrap();
+        assert!(ok.success, "stderr: {}", ok.stderr);
+        assert!(!ok.stdout.trim().is_empty());
         std::fs::remove_dir_all(&root).ok();
     }
 

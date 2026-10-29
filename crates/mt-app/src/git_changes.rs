@@ -495,7 +495,11 @@ impl GitChanges {
             self.store.clone(),
             self.repo_path.clone(),
             file.path.clone(),
-            area == Area::Staged,
+            if area == Area::Staged {
+                git_diff::DiffSide::Staged
+            } else {
+                git_diff::DiffSide::Unstaged
+            },
             status_label_for(status_in_area(file, area)).to_string(),
             window,
             cx,

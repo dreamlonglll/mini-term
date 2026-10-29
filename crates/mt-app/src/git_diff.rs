@@ -47,6 +47,7 @@ use gpui::{
     UniformListScrollHandle, Window, div, point, prelude::FluentBuilder as _, px, uniform_list,
 };
 use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel};
+pub use mt_project::git::DiffSide;
 use mt_project::git::{CommitFileInfo, DiffHunk, DiffLine, GitDiffResult};
 use mt_ui::tooltip::TooltipExt as _;
 
@@ -1059,12 +1060,12 @@ fn view_toggle(
 
 // ─── DiffModal(工作区/暂存区单文件) ──────────────────────────
 
-/// 打开单文件 diff。`staged` 决定取暂存区还是工作区那一侧。
+/// 打开单文件 diff。`side` 决定比的是哪两侧(见 [`DiffSide`])。
 pub fn open_file_diff(
     store: Entity<AppStore>,
     repo_path: String,
     file_path: String,
-    staged: bool,
+    side: DiffSide,
     status_label: String,
     window: &mut Window,
     cx: &mut App,
@@ -1075,7 +1076,7 @@ pub fn open_file_diff(
     let font_size = store.read(cx).config().terminal_font_size as f32;
     let state = cx.new(|cx| DiffState::new(font_size, cx));
 
-    // 取数:`(repo, path, staged)` 三元组一次到位(原版漏了 staged,见模块注释)
+    // 取数:`(repo, path, side)` 三元组一次到位(原版漏了 staged,见模块注释)
     {
         let (repo, path) = (repo_path.clone(), file_path.clone());
         let state = state.clone();
@@ -1083,11 +1084,7 @@ pub fn open_file_diff(
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    mt_project::git::get_git_diff(
-                        std::path::Path::new(&repo),
-                        &path,
-                        Some(staged),
-                    )
+                    mt_project::git::get_git_diff(std::path::Path::new(&repo), &path, side)
                 })
                 .await;
             let _ = state.update(cx, |s: &mut DiffState, cx| {

@@ -374,7 +374,7 @@ pub(super) fn file_menu(
             FileMenuAction::ViewDiff => {
                 // 原版 `DiffModal` 收的是 (projectPath, GitFileStatus):仓库那一侧
                 // 传的就是**项目根**,文件那一侧是状态表里的相对路径 —— 照抄。
-                // 工作区侧(staged=false)与原版一致:文件树里看的是「改了什么还没提交」
+                // HEAD → 工作区:文件树里看的是「相对上次提交改了什么」,暂存与否都算
                 let store = store.clone();
                 let repo = root.to_string_lossy().to_string();
                 let rel = row.rel.clone();
@@ -384,7 +384,7 @@ pub(super) fn file_menu(
                         store.clone(),
                         repo.clone(),
                         rel.clone(),
-                        false,
+                        crate::git_diff::DiffSide::Working,
                         label.clone(),
                         window,
                         cx,
