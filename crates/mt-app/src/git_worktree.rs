@@ -38,9 +38,10 @@ use gpui_component::input::{Input, InputState};
 use mt_core::path_key::windows_eq_key;
 use mt_project::git::{BranchInfo, WorktreeInfo};
 
+use crate::git_ui::{self, ButtonKind};
 use crate::i18n::{t, tr};
 use crate::menu::{self, MenuItem};
-use crate::prompt::{autofocus, dialog_title, kind, open_guarded, show_alert};
+use crate::prompt::{autofocus, kind, open_guarded, show_alert};
 use crate::store::AppStore;
 use crate::ui;
 
@@ -283,13 +284,13 @@ pub fn open(
     open_guarded(kind::GIT_WORKTREE, window, cx, move |dialog, window, cx| {
         let body = render_body(&state, window, cx);
         dialog
-            // 无底部按钮,右上角 ✕ 是唯一看得见的出口(见 `prompt::dialog_title`)
-            .title(dialog_title(
+            // 无底部按钮,右上角关闭是唯一看得见的出口(见 `git_ui::dialog_title`)
+            .title(git_ui::dialog_title(
                 kind::GIT_WORKTREE,
                 tr!("worktree", "title", name = root_name.clone()),
             ))
             .w(px(600.0))
-            .child(div().px(px(16.0)).child(body))
+            .child(body)
     });
 }
 
@@ -412,38 +413,12 @@ fn ensure_branches(state: &Entity<WorktreeModal>, cx: &mut App) {
 
 // ─── 渲染 ─────────────────────────────────────────────────────
 
-fn badge(text: impl Into<SharedString>) -> AnyElement {
-    div()
-        .flex_none()
-        .px(px(6.0))
-        .rounded(px(3.0))
-        .bg(ui::border_subtle())
-        .text_size(ui::font_px(11.0))
-        .text_color(ui::text_muted())
-        .child(text.into())
-        .into_any_element()
-}
-
-fn colored_badge(text: impl Into<SharedString>, fg: gpui::Hsla, bg: gpui::Hsla) -> AnyElement {
-    div()
-        .flex_none()
-        .px(px(6.0))
-        .rounded(px(3.0))
-        .bg(bg)
-        .text_size(ui::font_px(11.0))
-        .text_color(fg)
-        .child(text.into())
-        .into_any_element()
-}
-
-fn hint_line(text: impl Into<SharedString>, color: gpui::Hsla) -> AnyElement {
-    div()
-        .py(px(8.0))
+/// 居中的弱化说明(「请先勾选仓库」「没有可用分支」这类)。
+fn hint_line(text: impl Into<SharedString>) -> AnyElement {
+    git_ui::hint_line(text)
         .w_full()
+        .py(px(8.0))
         .text_center()
-        .text_size(ui::font_px(13.0))
-        .text_color(color)
-        .child(text.into())
         .into_any_element()
 }
 
@@ -454,15 +429,19 @@ fn render_body(state: &Entity<WorktreeModal>, window: &mut Window, cx: &mut App)
 
     let Some(groups) = s.groups.clone() else {
         return root
-            .child(hint_line(t("worktree", "loading"), ui::text_muted()))
+            .child(git_ui::loading_state(t("worktree", "loading")))
             .into_any_element();
     };
     if let Some(err) = &s.load_error {
-        root = root.child(hint_line(err.clone(), ui::color_error()));
+        root = root.child(git_ui::error_block(err.clone()));
     }
     if groups.is_empty() && s.load_error.is_none() {
         return root
-            .child(hint_line(t("worktree", "noRepoFound"), ui::text_muted()))
+            .child(git_ui::empty_state(
+                git_ui::ICON_REPO,
+                t("worktree", "noRepoFound"),
+                None,
+            ))
             .into_any_element();
     }
 
@@ -487,13 +466,15 @@ fn render_body(state: &Entity<WorktreeModal>, window: &mut Window, cx: &mut App)
                         )),
                 )
                 .child(
-                    ui::ghost_button(
+                    git_ui::action_button(
                         "worktree-select-all",
                         if all {
                             t("worktree", "clearAll")
                         } else {
                             t("worktree", "selectAll")
                         },
+                        ButtonKind::Ghost,
+                        true,
                     )
                     .on_click(move |_: &ClickEvent, _window, cx| {
                         state_for_toggle.update(cx, |s, cx| {
@@ -599,7 +580,8 @@ fn render_group(
         .flex()
         .flex_col()
         .when(multi_repo, |el| {
-            el.rounded(px(4.0))
+            el.rounded(px(6.0))
+                .overflow_hidden()
                 .border_1()
                 .border_color(ui::border_subtle())
         });
@@ -611,38 +593,33 @@ fn render_group(
                 .id(SharedString::from(format!("worktree-group-{}", group.key)))
                 .flex()
                 .items_center()
-                .gap(px(6.0))
+                .gap(px(8.0))
+                .h(px(git_ui::ROW_H + 4.0))
                 .px(px(8.0))
-                .py(px(4.0))
                 .cursor_pointer()
                 .when(selected, |el| el.bg(ui::accent_subtle()))
+                .when(!selected, |el| el.hover(|el| el.bg(git_ui::hover_bg())))
+                .child(git_ui::check_box(selected, ui::accent()))
+                .child(git_ui::icon(
+                    git_ui::ICON_REPO,
+                    git_ui::ICON_SIZE,
+                    ui::color_folder(),
+                ))
                 .child(
                     div()
-                        .w(px(12.0))
-                        .text_size(ui::font_px(12.0))
-                        .text_color(if selected {
-                            ui::accent()
-                        } else {
-                            ui::text_muted()
-                        })
-                        .child(if selected { "☑" } else { "☐" }),
-                )
-                .child(
-                    div()
+                        .flex_none()
                         .text_size(ui::font_px(13.0))
-                        .text_color(if selected {
-                            ui::accent()
-                        } else {
-                            ui::text_primary()
-                        })
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(ui::text_primary())
                         .child(group.name.clone()),
                 )
                 .child(
                     div()
-                        .ml_auto()
-                        .min_w(px(0.0))
-                        .text_size(ui::font_px(11.0))
+                        .flex_1()
+                        .min_w_0()
+                        .text_size(ui::font_px(12.0))
                         .text_color(ui::text_muted())
+                        .text_right()
                         .truncate()
                         .child(group.main_path.clone()),
                 )
@@ -666,14 +643,12 @@ fn render_group(
                 div()
                     .px(px(8.0))
                     .py(px(6.0))
-                    .text_size(ui::font_px(11.0))
-                    .text_color(ui::color_error())
-                    .child(err.clone()),
+                    .child(git_ui::notice_line(err.clone(), ui::color_error())),
             )
             .into_any_element();
     }
 
-    let mut rows = div().flex().flex_col().gap(px(2.0));
+    let mut rows = div().flex().flex_col().gap(px(2.0)).p(px(4.0));
     for (idx, wt) in group.worktrees.iter().enumerate() {
         rows = rows.child(render_worktree_row(state, group, idx, wt, cx));
     }
@@ -682,14 +657,16 @@ fn render_group(
     if group.worktrees.iter().any(|w| !w.is_valid) {
         let (state_for_prune, group_for_prune) = (state.clone(), group.clone());
         block = block.child(
-            div().flex().justify_end().py(px(4.0)).child(
-                ui::ghost_button(
+            div().flex().justify_end().px(px(8.0)).pb(px(8.0)).child(
+                git_ui::action_button(
                     SharedString::from(format!("worktree-prune-{}", group.key)),
                     if pruning {
                         t("worktree", "pruning")
                     } else {
                         t("worktree", "prune")
                     },
+                    ButtonKind::Ghost,
+                    !pruning,
                 )
                 .when(!pruning, |el| {
                     el.on_click(move |_: &ClickEvent, _window, cx| {
@@ -723,29 +700,27 @@ fn render_worktree_row(
         .map(|p| p.id.clone());
     let is_project = existing_project.is_some();
 
-    let mut badges = div().flex().items_center().gap(px(4.0));
+    // 胶囊全走共用的语义胶囊:分支 = 本地分支色(带分支图标)、失效 = 错误、
+    // 锁定 = 警告、已是项目 = accent、主仓库 = 中性
+    let mut badges = div().flex().items_center().gap(px(4.0)).min_w_0();
     if wt.is_main {
-        badges = badges.child(badge(t("worktree", "mainRepo")));
+        badges = badges.child(git_ui::pill(t("worktree", "mainRepo"), ui::text_muted()));
     }
     if let Some(branch) = &wt.branch {
-        badges = badges.child(badge(format!("⎇ {branch}")));
+        badges = badges.child(git_ui::icon_pill(
+            git_ui::ICON_BRANCH,
+            branch.clone(),
+            git_ui::RefKind::Local.color(),
+        ));
     }
     if !wt.is_valid {
-        badges = badges.child(colored_badge(
-            t("worktree", "invalid"),
-            ui::color_error(),
-            ui::with_alpha(ui::color_error(), 0.15),
-        ));
+        badges = badges.child(git_ui::pill(t("worktree", "invalid"), ui::color_error()));
     }
     if wt.is_locked {
-        badges = badges.child(badge(t("worktree", "locked")));
+        badges = badges.child(git_ui::pill(t("worktree", "locked"), ui::color_warning()));
     }
     if is_project {
-        badges = badges.child(colored_badge(
-            t("worktree", "isProject"),
-            ui::accent(),
-            ui::accent_subtle(),
-        ));
+        badges = badges.child(git_ui::pill(t("worktree", "isProject"), ui::accent()));
     }
 
     let mut actions = div().flex().items_center().gap(px(4.0)).flex_none();
@@ -762,9 +737,11 @@ fn render_worktree_row(
             .clone()
             .or_else(|| s.store.read(cx).active_project_id.clone());
         actions = actions.child(
-            ui::ghost_button(
+            git_ui::action_button(
                 SharedString::from(format!("wt-open-{}-{idx}", group.key)),
                 t("worktree", "openTerminal"),
+                ButtonKind::Ghost,
+                true,
             )
             .on_click(move |_: &ClickEvent, window, cx| {
                 let Some(project_id) = project_id.clone() else {
@@ -798,13 +775,15 @@ fn render_worktree_row(
         let main_path = group.main_path.clone();
         let parent_hint = s.project_id.clone();
         actions = actions.child(
-            ui::ghost_button(
+            git_ui::action_button(
                 SharedString::from(format!("wt-project-{}-{idx}", group.key)),
                 if is_project {
                     t("worktree", "switchToProject")
                 } else {
                     t("worktree", "addAsProject")
                 },
+                ButtonKind::Ghost,
+                true,
             )
             .on_click(move |_: &ClickEvent, window, cx| {
                 let path = path.clone();
@@ -840,9 +819,11 @@ fn render_worktree_row(
             let (state_for_remove, group_for_remove, wt_for_remove) =
                 (state.clone(), group.clone(), wt.clone());
             actions = actions.child(
-                ui::danger_button(
+                git_ui::action_button(
                     SharedString::from(format!("wt-remove-{}-{idx}", group.key)),
                     t("worktree", "remove"),
+                    ButtonKind::Danger,
+                    true,
                 )
                 .on_click(move |_: &ClickEvent, window, cx| {
                     open_remove_confirm(
@@ -857,6 +838,7 @@ fn render_worktree_row(
         }
     }
 
+    // 两行:名字 + 胶囊 / 弱化的路径。行首是 worktree 图标,悬停薄纱底(与列表行同口径)
     div()
         .flex()
         .items_center()
@@ -864,15 +846,33 @@ fn render_worktree_row(
         .px(px(8.0))
         .py(px(6.0))
         .rounded(px(4.0))
+        .hover(|el| el.bg(git_ui::hover_bg()))
+        .child(git_ui::icon(
+            if wt.is_main {
+                git_ui::ICON_REPO
+            } else {
+                git_ui::ICON_WORKTREE
+            },
+            git_ui::ICON_SIZE,
+            if wt.is_main {
+                ui::color_folder()
+            } else {
+                ui::text_muted()
+            },
+        ))
         .child(
             div()
                 .flex_1()
                 .min_w(px(0.0))
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
                 .child(
                     div()
                         .flex()
                         .items_center()
-                        .gap(px(6.0))
+                        .gap(px(8.0))
+                        .min_w_0()
                         .child(
                             div()
                                 .min_w(px(0.0))
@@ -885,8 +885,9 @@ fn render_worktree_row(
                 )
                 .child(
                     div()
+                        .min_w_0()
                         .truncate()
-                        .text_size(ui::font_px(11.0))
+                        .text_size(ui::font_px(12.0))
                         .text_color(ui::text_muted())
                         .child(wt.path.clone()),
                 ),
@@ -911,83 +912,71 @@ fn render_create_section(
 
     let mut section = div()
         .mt(px(8.0))
-        .pt(px(8.0))
+        .pt(px(12.0))
         .border_t_1()
         .border_color(ui::border_subtle())
         .flex()
         .flex_col()
-        .gap(px(6.0));
+        .gap(px(8.0));
 
     // 标题行 + 模式段控件
     let mut head = div()
         .flex()
         .items_center()
         .gap(px(8.0))
+        .child(git_ui::icon(
+            git_ui::ICON_PLUS,
+            git_ui::ICON_SIZE,
+            ui::text_muted(),
+        ))
         .child(
             div()
                 .text_size(ui::font_px(13.0))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
                 .text_color(ui::text_primary())
                 .child(t("worktree", "createTitle")),
         );
     if multi_repo {
-        head = head.child(
-            div()
-                .text_size(ui::font_px(11.0))
-                .text_color(ui::text_muted())
-                .child(tr!(
-                    "worktree",
-                    "selectedCount",
-                    count = selected.len().to_string()
-                )),
-        );
+        head = head.child(git_ui::pill(
+            tr!(
+                "worktree",
+                "selectedCount",
+                count = selected.len().to_string()
+            ),
+            ui::accent(),
+        ));
     }
-    let mut seg = div()
-        .ml_auto()
-        .flex()
-        .rounded(px(4.0))
-        .overflow_hidden()
-        .border_1()
-        .border_color(ui::border_default());
+    let mut seg = git_ui::segmented().ml_auto();
     for (mode, label) in [
         (Mode::Existing, t("worktree", "modeExisting")),
         (Mode::New, t("worktree", "modeNew")),
     ] {
         let active = s.mode == mode;
         let state_for_mode = state.clone();
-        seg = seg.child(
-            div()
-                .id(SharedString::from(format!(
-                    "worktree-mode-{}",
-                    if matches!(mode, Mode::New) { "new" } else { "existing" }
-                )))
-                .px(px(10.0))
-                .py(px(2.0))
-                .text_size(ui::font_px(12.0))
-                .cursor_pointer()
-                .when(active, |el| {
-                    el.bg(ui::accent_subtle()).text_color(ui::accent())
-                })
-                .when(!active, |el| el.text_color(ui::text_muted()))
-                .child(label)
-                .on_click(move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
-                    let input = state_for_mode.update(cx, |s, cx| {
-                        s.mode = mode;
-                        cx.notify();
-                        matches!(mode, Mode::New).then(|| s.new_branch.clone())
-                    });
-                    // 切到「新建」就该能直接敲分支名,不必再点一下输入框
-                    // (「已有」那侧是下拉选择,没有可聚焦的输入框)
-                    if let Some(input) = input {
-                        autofocus(&input, window, cx);
-                    }
-                }),
-        );
+        let id = match mode {
+            Mode::New => "worktree-mode-new",
+            Mode::Existing => "worktree-mode-existing",
+        };
+        seg = seg.child(git_ui::segment(id, label, active).on_click(
+            move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+                let input = state_for_mode.update(cx, |s, cx| {
+                    s.mode = mode;
+                    cx.notify();
+                    matches!(mode, Mode::New).then(|| s.new_branch.clone())
+                });
+                // 切到「新建」就该能直接敲分支名,不必再点一下输入框
+                // (「已有」那侧是下拉选择,没有可聚焦的输入框)
+                if let Some(input) = input {
+                    autofocus(&input, window, cx);
+                }
+            },
+        ));
     }
     section = section.child(head.child(seg));
 
     // 模式区
     if selected.is_empty() {
-        section = section.child(hint_line(t("worktree", "selectRepoHint"), ui::text_muted()));
+        section = section.child(hint_line(t("worktree", "selectRepoHint")));
         return section.into_any_element();
     }
 
@@ -997,7 +986,7 @@ fn render_create_section(
     match s.mode {
         Mode::Existing => {
             if !branches_ready {
-                section = section.child(hint_line(t("worktree", "loading"), ui::text_muted()));
+                section = section.child(git_ui::loading_state(t("worktree", "loading")));
             } else {
                 let per_group: Vec<(Vec<BranchInfo>, Vec<Option<String>>)> = selected
                     .iter()
@@ -1016,7 +1005,6 @@ fn render_create_section(
                         } else {
                             t("worktree", "noBranchAvailable")
                         },
-                        ui::text_muted(),
                     ));
                 } else {
                     section = section.child(dropdown(
@@ -1074,38 +1062,42 @@ fn render_create_section(
             .gap(px(6.0))
             .child(div().flex_1().child(Input::new(&s.wt_path)))
             .child(
-                ui::ghost_button("worktree-browse", t("worktree", "browse")).on_click(
-                    move |_: &ClickEvent, window, cx| {
-                        let paths = cx.prompt_for_paths(PathPromptOptions {
-                            files: false,
-                            directories: true,
-                            multiple: false,
-                            prompt: Some(t("projectList", "chooseDirDialogTitle").into()),
-                        });
-                        let state = state_for_browse.clone();
-                        window
-                            .spawn(cx, async move |cx| {
-                                let Ok(Ok(Some(paths))) = paths.await else {
-                                    return;
-                                };
-                                let Some(path) = paths.into_iter().next() else {
-                                    return;
-                                };
-                                let text = path.to_string_lossy().to_string();
-                                let _ = cx.update(|window, cx| {
-                                    state.update(cx, |s, cx| {
-                                        s.path_edited = true;
-                                        let input = s.wt_path.clone();
-                                        input.update(cx, |state, cx| {
-                                            state.set_value(text.clone(), window, cx)
-                                        });
-                                        cx.notify();
+                git_ui::action_button(
+                    "worktree-browse",
+                    t("worktree", "browse"),
+                    ButtonKind::Ghost,
+                    true,
+                )
+                .on_click(move |_: &ClickEvent, window, cx| {
+                    let paths = cx.prompt_for_paths(PathPromptOptions {
+                        files: false,
+                        directories: true,
+                        multiple: false,
+                        prompt: Some(t("projectList", "chooseDirDialogTitle").into()),
+                    });
+                    let state = state_for_browse.clone();
+                    window
+                        .spawn(cx, async move |cx| {
+                            let Ok(Ok(Some(paths))) = paths.await else {
+                                return;
+                            };
+                            let Some(path) = paths.into_iter().next() else {
+                                return;
+                            };
+                            let text = path.to_string_lossy().to_string();
+                            let _ = cx.update(|window, cx| {
+                                state.update(cx, |s, cx| {
+                                    s.path_edited = true;
+                                    let input = s.wt_path.clone();
+                                    input.update(cx, |state, cx| {
+                                        state.set_value(text.clone(), window, cx)
                                     });
+                                    cx.notify();
                                 });
-                            })
-                            .detach();
-                    },
-                ),
+                            });
+                        })
+                        .detach();
+                }),
             ),
     );
 
@@ -1113,48 +1105,25 @@ fn render_create_section(
     let add_as_project = s.add_as_project;
     let state_for_check = state.clone();
     section = section.child(
-        div()
-            .id("worktree-add-project")
-            .flex()
-            .items_center()
-            .gap(px(6.0))
-            .cursor_pointer()
-            .text_size(ui::font_px(12.0))
-            .text_color(ui::text_secondary())
-            .child(
-                div()
-                    .w(px(12.0))
-                    .text_color(if add_as_project {
-                        ui::accent()
-                    } else {
-                        ui::text_muted()
-                    })
-                    .child(if add_as_project { "☑" } else { "☐" }),
-            )
-            .child(t("worktree", "addAsProjectAfterCreate"))
-            .on_click(move |_: &ClickEvent, _window, cx| {
-                state_for_check.update(cx, |s, cx| {
-                    s.add_as_project = !s.add_as_project;
-                    cx.notify();
-                });
-            }),
+        git_ui::check_row(
+            "worktree-add-project",
+            add_as_project,
+            t("worktree", "addAsProjectAfterCreate"),
+            false,
+        )
+        .on_click(move |_: &ClickEvent, _window, cx| {
+            state_for_check.update(cx, |s, cx| {
+                s.add_as_project = !s.add_as_project;
+                cx.notify();
+            });
+        }),
     );
 
     if let Some(err) = &s.create_error {
-        section = section.child(
-            div()
-                .text_size(ui::font_px(11.0))
-                .text_color(ui::color_error())
-                .child(err.clone()),
-        );
+        section = section.child(git_ui::error_block(err.clone()));
     }
     for (target, err) in &s.create_results {
-        section = section.child(
-            div()
-                .text_size(ui::font_px(11.0))
-                .text_color(ui::color_error())
-                .child(format!("{target}: {err}")),
-        );
+        section = section.child(git_ui::error_block(format!("{target}: {err}")));
     }
 
     let creating = s.creating;
@@ -1162,7 +1131,7 @@ fn render_create_section(
     let groups_for_create = groups.to_vec();
     section = section.child(
         div().flex().justify_end().child(
-            ui::primary_button(
+            git_ui::action_button(
                 "worktree-create",
                 if creating {
                     t("worktree", "creating").to_string()
@@ -1175,6 +1144,8 @@ fn render_create_section(
                 } else {
                     t("worktree", "create").to_string()
                 },
+                ButtonKind::Primary,
+                !creating,
             )
             .when(!creating, |el| {
                 el.on_click(move |_: &ClickEvent, window, cx| {
@@ -1202,18 +1173,23 @@ fn dropdown(
         .items_center()
         .justify_between()
         .gap(px(6.0))
+        .h(px(30.0))
         .px(px(8.0))
-        .py(px(4.0))
         .w(px(180.0))
         .flex_none()
         .rounded(px(4.0))
         .border_1()
         .border_color(ui::border_default())
         .cursor_pointer()
+        .hover(|el| el.bg(git_ui::hover_bg()))
         .text_size(ui::font_px(12.0))
         .text_color(ui::text_primary())
         .child(div().min_w(px(0.0)).truncate().child(current))
-        .child(div().text_color(ui::text_muted()).child("▾"))
+        .child(git_ui::icon(
+            git_ui::ICON_CHEVRON_DOWN,
+            git_ui::ICON_SIZE_SM,
+            ui::text_muted(),
+        ))
         .on_click(move |event: &ClickEvent, window, cx| {
             let entries: Vec<menu::MenuEntry> = options
                 .iter()
@@ -1449,55 +1425,31 @@ fn open_remove_confirm(
             let linked = linked_project.clone();
             let form_for_ok = form.clone();
 
-            let mut body = div()
-                .px(px(16.0))
-                .flex()
-                .flex_col()
-                .gap(px(6.0))
-                .child(
-                    div()
-                        .text_size(ui::font_px(13.0))
-                        .text_color(ui::text_primary())
-                        .child(tr!(
-                            "worktree",
-                            "removeConfirmMessage",
-                            name = wt.name.clone()
-                        )),
-                )
-                .child(
-                    div()
-                        .text_size(ui::font_px(11.0))
-                        .text_color(ui::text_muted())
-                        .child(wt.path.clone()),
-                );
-            if let Some((_, name)) = &linked {
-                body = body.child(
-                    div()
-                        .text_size(ui::font_px(11.0))
-                        .text_color(ui::color_warning())
-                        .child(tr!("worktree", "removeAlsoProject", name = name.clone())),
-                );
-            }
-            body = body.child(
+            let mut body = git_ui::form_body().child(
                 div()
-                    .id("worktree-force")
                     .flex()
-                    .items_center()
-                    .gap(px(6.0))
-                    .cursor_pointer()
-                    .text_size(ui::font_px(12.0))
-                    .text_color(ui::text_secondary())
+                    .flex_col()
+                    .gap(px(4.0))
                     .child(
                         div()
-                            .w(px(12.0))
-                            .text_color(if force {
-                                ui::color_error()
-                            } else {
-                                ui::text_muted()
-                            })
-                            .child(if force { "☑" } else { "☐" }),
+                            .text_size(ui::font_px(13.0))
+                            .text_color(ui::text_primary())
+                            .child(tr!(
+                                "worktree",
+                                "removeConfirmMessage",
+                                name = wt.name.clone()
+                            )),
                     )
-                    .child(t("worktree", "forceRemove"))
+                    .child(git_ui::hint_line(wt.path.clone())),
+            );
+            if let Some((_, name)) = &linked {
+                body = body.child(git_ui::notice_line(
+                    tr!("worktree", "removeAlsoProject", name = name.clone()),
+                    ui::color_warning(),
+                ));
+            }
+            body = body.child(
+                git_ui::check_row("worktree-force", force, t("worktree", "forceRemove"), true)
                     .on_click(move |_: &ClickEvent, _window, cx| {
                         form_for_toggle.update(cx, |f, cx| {
                             f.force = !f.force;
@@ -1506,24 +1458,21 @@ fn open_remove_confirm(
                     }),
             );
             if let Some(err) = error {
-                body = body.child(
-                    div()
-                        .text_size(ui::font_px(11.0))
-                        .text_color(ui::color_error())
-                        .child(err),
-                );
+                body = body.child(git_ui::error_block(err));
             }
 
             dialog
                 .title(t("worktree", "removeConfirmTitle"))
-                .w(px(400.0))
-                .footer(crate::prompt::confirm_footer(
+                .w(px(git_ui::DIALOG_W_SM))
+                .footer(git_ui::dialog_footer(
                     if removing {
                         t("worktree", "removing")
                     } else {
                         t("worktree", "removeConfirm")
                     },
-                    Some(t("worktree", "cancel")),
+                    Some(t("worktree", "cancel").into()),
+                    true,
+                    removing,
                 ))
                 .child(body)
                 .on_ok(move |_: &ClickEvent, window, cx| {

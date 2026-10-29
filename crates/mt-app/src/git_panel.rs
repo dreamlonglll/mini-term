@@ -985,16 +985,15 @@ fn branch_tip_lines(
 
 // ─── 渲染 ─────────────────────────────────────────────────────
 
-fn centered_hint(text: &'static str) -> AnyElement {
+/// 整面板的空态(没选项目 / 远程项目):与列表空态同一套「大图标 + 说明」。
+fn centered_hint(shapes: &'static [mt_ui::icons::Shape], text: &'static str) -> AnyElement {
     div()
         .size_full()
         .flex()
         .items_center()
         .justify_center()
         .bg(ui::bg_surface())
-        .text_size(ui::font_px(15.0))
-        .text_color(ui::text_muted())
-        .child(text)
+        .child(git_ui::empty_state(shapes, text, None))
         .into_any_element()
 }
 
@@ -1014,9 +1013,10 @@ impl Render for GitPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 空态按顺序短路(`GitHistory.tsx:331-345`)
         if self.store.read(cx).active_project().is_none() {
-            return div()
-                .size_full()
-                .child(centered_hint(t("gitHistory", "selectProject")));
+            return div().size_full().child(centered_hint(
+                git_ui::ICON_REPO,
+                t("gitHistory", "selectProject"),
+            ));
         }
         if self.is_remote_project(cx) {
             // git 命令跑在本地,对远程路径无意义(远程 Git 二期)
@@ -1024,7 +1024,10 @@ impl Render for GitPanel {
                 .size_full()
                 .border_t_1()
                 .border_color(ui::border_subtle())
-                .child(centered_hint(t("gitHistory", "remoteNotSupported")));
+                .child(centered_hint(
+                    git_ui::ICON_REMOTE,
+                    t("gitHistory", "remoteNotSupported"),
+                ));
         }
 
         let section = SECTION_UI.with(|s| *s.borrow());
@@ -1163,9 +1166,9 @@ impl Render for GitPanel {
     }
 }
 
-/// SectionHeader(`GitHistory.tsx:69-100`)。`bordered` 只有下方「提交历史」用。
-/// `trailing` 是右侧的动作位(「更改」的视图切换按钮住这);它自己的 on_click
-/// 要 stop_propagation,否则会连带触发 header 的折叠。
+/// SectionHeader(`GitHistory.tsx:69-100`),走共用的 [`git_ui::SectionHeader`]。
+/// `bordered` 只有下方「提交历史」用。`trailing` 是右侧的动作位(「更改」的视图切换
+/// 按钮住这);共用图标按钮自己拦住冒泡,不会连带触发 header 的折叠。
 fn section_header(
     id: &'static str,
     label: &'static str,
@@ -1174,40 +1177,14 @@ fn section_header(
     trailing: Option<AnyElement>,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
-    div()
-        .id(id)
-        .flex()
-        .items_center()
-        .gap(px(4.0))
-        .px(px(8.0))
-        .h(px(30.0))
-        .flex_none()
-        .cursor_pointer()
-        .text_color(ui::text_primary())
-        .hover(|el| el.bg(ui::border_subtle()))
+    let mut header = git_ui::SectionHeader::new(id, label).collapsible(open);
+    if let Some(trailing) = trailing {
+        header = header.trailing(trailing);
+    }
+    header
+        .build()
         .when(bordered, |el| {
             el.border_t_1().border_color(ui::border_subtle())
-        })
-        .child(
-            // 原版靠 `transform: rotate(-90deg)` 转 ▾;gpui 没有元素旋转,
-            // 换成两枚图标(与文件树同一处理)
-            div()
-                .w(px(14.0))
-                .flex()
-                .justify_center()
-                .child(git_ui::icon(
-                    if open {
-                        git_ui::ICON_CHEVRON_DOWN
-                    } else {
-                        git_ui::ICON_CHEVRON_RIGHT
-                    },
-                    12.0,
-                    ui::text_muted(),
-                )),
-        )
-        .child(div().text_size(ui::font_px(13.0)).child(label))
-        .when_some(trailing, |el, trailing| {
-            el.child(div().flex_1()).child(trailing)
         })
         .on_click(on_click)
         .into_any_element()
@@ -1269,7 +1246,7 @@ impl GitPanel {
             .rounded(px(4.0))
             .cursor_pointer()
             .min_w(px(0.0))
-            .hover(|el| el.bg(ui::bg_elevated()))
+            .hover(|el| el.bg(git_ui::button_hover_bg()))
             .child(git_ui::icon(
                 git_ui::ICON_REPO,
                 git_ui::ICON_SIZE,
@@ -1296,11 +1273,15 @@ impl GitPanel {
                     .child(repo_name),
             )
             .when(is_worktree, |el| {
-                el.child(git_ui::icon(git_ui::ICON_WORKTREE, 12.0, ui::text_muted()))
+                el.child(git_ui::icon(
+                    git_ui::ICON_WORKTREE,
+                    git_ui::ICON_SIZE_SM,
+                    ui::text_muted(),
+                ))
             })
             .child(git_ui::icon(
                 git_ui::ICON_CHEVRON_DOWN,
-                12.0,
+                git_ui::ICON_SIZE_SM,
                 ui::text_muted(),
             ))
             .tip(repo_path_tip)
@@ -1333,7 +1314,7 @@ impl GitPanel {
             .h(px(BAR_HEIGHT))
             .flex_none()
             .pl(px(4.0))
-            .pr(px(6.0))
+            .pr(px(8.0))
             .border_b_1()
             .border_color(ui::border_subtle())
             .child(left)
@@ -1341,8 +1322,12 @@ impl GitPanel {
             .into_any_element()
     }
 
-    /// 左段 ② 分支:分支图标 + 分支胶囊(HEAD = accent;正在查看另一个分支 = info)
-    /// + ↑n(待推送,success)/ ↓m(待拉取,info)计数胶囊。点开分支弹窗。
+    /// 左段 ② 分支:分支图标 + 引用胶囊 + ↑n(待推送)/ ↓m(待拉取)计数胶囊。
+    /// 点开分支弹窗。
+    ///
+    /// 胶囊配色与提交历史同一张语义表([`git_ui::RefKind`]):HEAD = accent;正在
+    /// 查看另一个分支时按它是本地(success)还是远程(info)上色,前面的图标跟着换色
+    /// 提示「这不是 HEAD」;detached HEAD 是语义表之外的状态,用警告色 + 提交图标。
     ///
     /// 宽度**随分支名自适应**:栏子挤不下时才与仓库名一起收缩(两边都 `min_w(0)` +
     /// 省略截断)。徽章的收缩权重是仓库名的 3 倍:flex 按「权重 × 基准宽」分摊,
@@ -1357,17 +1342,35 @@ impl GitPanel {
         } else {
             self.meta.head_tracking.as_ref()
         };
-        let color = if viewing {
-            ui::color_info()
-        } else if detached {
-            ui::color_warning()
+        let viewing_remote = viewing
+            && self
+                .branches
+                .iter()
+                .any(|b| b.is_remote && b.name == branch);
+        let (lead, lead_color, pill_color) = if detached {
+            (git_ui::ICON_COMMIT, ui::text_muted(), ui::color_warning())
+        } else if viewing {
+            let kind = if viewing_remote {
+                git_ui::RefKind::Remote
+            } else {
+                git_ui::RefKind::Local
+            };
+            let shapes = if viewing_remote {
+                git_ui::ICON_REMOTE
+            } else {
+                git_ui::ICON_BRANCH
+            };
+            (shapes, kind.color(), kind.color())
         } else {
-            ui::accent()
+            (
+                git_ui::ICON_BRANCH,
+                ui::text_muted(),
+                git_ui::RefKind::Head.color(),
+            )
         };
         let tip: SharedString = branch_tip_lines(&branch, tracking, detached, viewing)
             .join("\n")
             .into();
-        let mono = git_ui::mono_font(&self.store, cx);
         let (ahead, behind) = tracking.map_or((0, 0), |t| (t.ahead, t.behind));
         let busy = self.busy.is_some_and(GitBusy::touches_branch);
 
@@ -1378,51 +1381,24 @@ impl GitPanel {
                 .items_center()
                 .gap(px(6.0))
                 .h(px(26.0))
-                .px(px(4.0))
+                .px(px(6.0))
                 .rounded(px(4.0))
                 .min_w(px(0.0))
                 .map(|el| shrink(el, 3.0))
                 .cursor_pointer()
-                .hover(|el| el.bg(ui::bg_elevated()))
-                .child(git_ui::icon(
-                    git_ui::ICON_BRANCH,
-                    git_ui::ICON_SIZE,
-                    if viewing {
-                        ui::color_info()
-                    } else {
-                        ui::text_muted()
-                    },
+                .hover(|el| el.bg(git_ui::button_hover_bg()))
+                .child(git_ui::icon(lead, git_ui::ICON_SIZE, lead_color))
+                .child(git_ui::name_pill(
+                    "git-branch-badge-name",
+                    branch,
+                    pill_color,
+                    None,
                 ))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .min_w(px(0.0))
-                        .h(px(20.0))
-                        .px(px(8.0))
-                        .rounded_full()
-                        .bg(ui::with_alpha(color, 0.15))
-                        .text_color(color)
-                        .text_size(ui::font_px(12.0))
-                        .child(div().min_w_0().truncate().child(branch)),
-                )
-                .when(ahead > 0, |el| {
-                    el.child(git_ui::count_pill(
-                        git_ui::ICON_ARROW_UP,
-                        ahead,
-                        ui::color_success(),
-                        mono.clone(),
-                    ))
+                .when(ahead > 0, |el| el.child(git_ui::ahead_pill(ahead)))
+                .when(behind > 0, |el| el.child(git_ui::behind_pill(behind)))
+                .when(busy, |el| {
+                    el.child(ui::spinner(px(git_ui::ICON_SIZE_SM), ui::accent()))
                 })
-                .when(behind > 0, |el| {
-                    el.child(git_ui::count_pill(
-                        git_ui::ICON_ARROW_DOWN,
-                        behind,
-                        ui::color_info(),
-                        mono.clone(),
-                    ))
-                })
-                .when(busy, |el| el.child(ui::spinner(px(12.0), ui::accent())))
                 .tip(tip)
                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
                     // 分支列表为空时懒加载一次(`GitHistory.tsx:422`)
@@ -1452,13 +1428,13 @@ impl GitPanel {
         } else {
             t("gitBranch", "fetchTip").into()
         };
-        let fetch = git_ui::icon_button(
+        let fetch = git_ui::busy_icon_button(
             "git-fetch",
             git_ui::ICON_FETCH,
+            fetch_tip,
             is(GitBusy::Fetch),
             blocked(GitBusy::Fetch),
         )
-        .tip(fetch_tip)
         .when(busy.is_none(), |el| {
             el.on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.fetch(window, cx)))
         });
@@ -1481,13 +1457,13 @@ impl GitPanel {
             }
             .into()
         };
-        let pull = git_ui::icon_button(
+        let pull = git_ui::busy_icon_button(
             "git-pull",
             git_ui::ICON_PULL,
+            pull_tip,
             is(GitBusy::Pull),
             blocked(GitBusy::Pull) || detached,
         )
-        .tip(pull_tip)
         .when(busy.is_none() && !detached, |el| {
             el.on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.pull(window, cx)))
         })
@@ -1513,13 +1489,13 @@ impl GitPanel {
             }
             .into()
         };
-        let push = git_ui::icon_button(
+        let push = git_ui::busy_icon_button(
             "git-push",
             git_ui::ICON_PUSH,
+            push_tip,
             is(GitBusy::Push),
             blocked(GitBusy::Push) || detached,
         )
-        .tip(push_tip)
         .when(busy.is_none() && !detached, |el| {
             el.on_click(
                 cx.listener(|this, _: &ClickEvent, window, cx| this.open_push_dialog(window, cx)),
@@ -1528,11 +1504,16 @@ impl GitPanel {
 
         // 刷新:后台重载期间转小圈(列表保留旧内容,不清空)
         let refreshing = self.branches_loading;
-        let refresh = git_ui::icon_button("git-refresh", git_ui::ICON_REFRESH, refreshing, false)
-            .tip(t("gitBranch", "refreshTip"))
-            .when(!refreshing, |el| {
-                el.on_click(cx.listener(|this, _: &ClickEvent, _window, cx| this.refresh_all(cx)))
-            });
+        let refresh = git_ui::busy_icon_button(
+            "git-refresh",
+            git_ui::ICON_REFRESH,
+            t("gitBranch", "refreshTip"),
+            refreshing,
+            false,
+        )
+        .when(!refreshing, |el| {
+            el.on_click(cx.listener(|this, _: &ClickEvent, _window, cx| this.refresh_all(cx)))
+        });
 
         div()
             .flex()
@@ -1605,30 +1586,36 @@ impl GitPanel {
         } else {
             t("gitBranch", "continue").to_string()
         };
-        let continue_button = ui::primary_button("git-op-continue", continue_label)
-            .flex_none()
-            .when(!can_continue, |el| el.opacity(0.5).cursor_default())
-            .when(conflicted > 0, |el| {
-                el.tip(tr!("gitBranch", "continueBlocked", count = conflicted))
-            })
-            .when(can_continue, |el| {
-                el.on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                    this.continue_op(kind, window, cx)
-                }))
-            });
+        let continue_button = git_ui::action_button(
+            "git-op-continue",
+            continue_label,
+            git_ui::ButtonKind::Primary,
+            can_continue,
+        )
+        .when(conflicted > 0, |el| {
+            el.tip(tr!("gitBranch", "continueBlocked", count = conflicted))
+        })
+        .when(can_continue, |el| {
+            el.on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                this.continue_op(kind, window, cx)
+            }))
+        });
         let abort_label = if aborting {
             tr!("gitBranch", "busyTip", op = GitBusy::Abort.label())
         } else {
             t("gitBranch", "abort").to_string()
         };
-        let abort_button = ui::ghost_button("git-op-abort", abort_label)
-            .flex_none()
-            .when(busy.is_some(), |el| el.opacity(0.5))
-            .when(busy.is_none(), |el| {
-                el.on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                    this.confirm_abort(kind, window, cx)
-                }))
-            });
+        let abort_button = git_ui::action_button(
+            "git-op-abort",
+            abort_label,
+            git_ui::ButtonKind::Ghost,
+            busy.is_none(),
+        )
+        .when(busy.is_none(), |el| {
+            el.on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                this.confirm_abort(kind, window, cx)
+            }))
+        });
 
         Some(
             div()
@@ -1689,17 +1676,15 @@ impl GitPanel {
             } else {
                 git_ui::ICON_LIST_TREE
             },
-            false,
-            false,
+            if tree_mode {
+                t("gitChanges", "switchToList")
+            } else {
+                t("gitChanges", "switchToTree")
+            },
+            true,
         )
-        .tip(if tree_mode {
-            t("gitChanges", "switchToList")
-        } else {
-            t("gitChanges", "switchToTree")
-        })
         .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-            // 按钮在 header 里,不拦住冒泡会连带把整块折叠
-            cx.stop_propagation();
+            // 按钮在 header 里:冒泡由共用图标按钮拦住,不会连带把整块折叠
             this.store.update(cx, |store, cx| {
                 let next = if store.git_changes_view_mode() == "tree" {
                     "list"

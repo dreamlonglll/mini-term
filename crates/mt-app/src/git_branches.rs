@@ -32,10 +32,10 @@ use std::cell::Cell;
 use std::path::Path;
 
 use gpui::{
-    AnyElement, App, AppContext as _, ClickEvent, Context, Div, Entity, Focusable as _, FontWeight,
-    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement,
-    Pixels, Point, Render, ScrollHandle, SharedString, Stateful, StatefulInteractiveElement,
-    Styled, Subscription, Window, actions, div, point, prelude::FluentBuilder as _, px,
+    AnyElement, App, AppContext as _, ClickEvent, Context, Entity, Focusable as _, FontWeight,
+    HighlightStyle, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
+    ParentElement, Pixels, Point, Render, ScrollHandle, SharedString, StatefulInteractiveElement,
+    Styled, StyledText, Subscription, Window, actions, div, point, prelude::FluentBuilder as _, px,
 };
 use gpui_component::input::{Input, InputEvent, InputState, SelectAll};
 use mt_project::git::{
@@ -49,7 +49,7 @@ use crate::git_panel::{BranchSnapshot, GitBusy, GitPanel};
 use crate::git_ui::{self, Tone};
 use crate::i18n::{t, tr};
 use crate::menu::{self, MenuEntry, MenuItem};
-use crate::prompt::{self, Confirm, autofocus, close_guarded, confirm_footer, kind, open_guarded};
+use crate::prompt::{self, Confirm, autofocus, close_guarded, kind, open_guarded};
 use crate::ui;
 
 actions!(
@@ -66,8 +66,8 @@ actions!(
 
 /// 弹窗宽度。
 const POPUP_WIDTH: f32 = 348.0;
-/// 行高 / 分组标题高(与 `render_row` / `git_ui::group_header` 一一对应,估高度用)。
-const ROW_H: f32 = 30.0;
+/// 行高 / 分组标题高(与 `git_ui::list_row` / `git_ui::list_caption` 一一对应,估高度用)。
+const ROW_H: f32 = git_ui::ROW_H;
 const GROUP_H: f32 = 26.0;
 /// 搜索框 + 动作行 + 底部提示条的固定高度。
 const CHROME_H: f32 = 52.0 + 40.0 + 36.0;
@@ -420,7 +420,6 @@ impl BranchPopup {
         index: usize,
         row: &Row,
         active: bool,
-        mono: &SharedString,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let (shapes, icon_color): (&'static [Shape], _) = if row.is_head {
@@ -430,26 +429,30 @@ impl BranchPopup {
         } else {
             (git_ui::ICON_BRANCH, ui::text_muted())
         };
-        // 名字 + 命中高亮(逐段发元素,与项目切换器同法)
-        let ranges: Vec<(usize, usize)> = row.hit.into_iter().collect();
-        let mut name = div().flex().items_center().min_w_0().overflow_hidden();
-        for (text, hit) in ui::highlight_runs(&row.label, &ranges) {
-            name = name.child(
-                div()
-                    .flex_none()
-                    .text_size(ui::font_px(13.0))
-                    .when(hit, |el| {
-                        el.text_color(ui::accent())
-                            .font_weight(FontWeight::BOLD)
-                            .bg(ui::with_alpha(ui::accent(), 0.12))
-                    })
-                    .when(!hit, |el| el.text_color(ui::text_primary()))
-                    .when(!hit && row.is_head, |el| {
-                        el.font_weight(FontWeight::SEMIBOLD)
-                    })
-                    .child(SharedString::from(text)),
-            );
-        }
+        // 名字 + 命中高亮:**一段**文字带高亮区间,而不是逐段发元素 —— 逐段的话
+        // 长名字只能被 overflow 硬裁掉,截断处没有省略号
+        let label = SharedString::from(row.label.clone());
+        let highlights = row
+            .hit
+            .and_then(|(start, end)| char_range_to_bytes(&row.label, start, end))
+            .map(|range| {
+                (
+                    range,
+                    HighlightStyle {
+                        color: Some(ui::accent()),
+                        font_weight: Some(FontWeight::BOLD),
+                        background_color: Some(ui::with_alpha(ui::accent(), 0.12)),
+                        ..Default::default()
+                    },
+                )
+            });
+        let name = div()
+            .min_w_0()
+            .truncate()
+            .text_size(ui::font_px(13.0))
+            .text_color(ui::text_primary())
+            .when(row.is_head, |el| el.font_weight(FontWeight::SEMIBOLD))
+            .child(StyledText::new(label).with_highlights(highlights));
         let tip = row.upstream.as_ref().map(|upstream| {
             SharedString::from(tr!(
                 "gitBranch",
@@ -460,39 +463,14 @@ impl BranchPopup {
             ))
         });
 
-        div()
-            .id(SharedString::from(format!("git-branch-row-{index}")))
-            .relative()
-            .flex()
-            .items_center()
-            .gap(px(8.0))
-            .h(px(28.0))
-            .mx(px(4.0))
-            .my(px(1.0))
-            .px(px(10.0))
-            .rounded(px(4.0))
-            .cursor_pointer()
-            .when(active, |el| {
-                el.bg(ui::accent_subtle()).child(git_ui::selection_bar())
-            })
+        let row_id = SharedString::from(format!("git-branch-row-{index}"));
+        git_ui::list_row(row_id, active)
             .child(git_ui::icon(shapes, git_ui::ICON_SIZE, icon_color))
             .child(name)
             .child(div().flex_1())
-            .when(row.ahead > 0, |el| {
-                el.child(git_ui::count_pill(
-                    git_ui::ICON_ARROW_UP,
-                    row.ahead,
-                    ui::color_success(),
-                    mono.clone(),
-                ))
-            })
+            .when(row.ahead > 0, |el| el.child(git_ui::ahead_pill(row.ahead)))
             .when(row.behind > 0, |el| {
-                el.child(git_ui::count_pill(
-                    git_ui::ICON_ARROW_DOWN,
-                    row.behind,
-                    ui::color_info(),
-                    mono.clone(),
-                ))
+                el.child(git_ui::behind_pill(row.behind))
             })
             .when_some(tip, |el, tip| el.tip(tip))
             // 鼠标移到哪行就高亮哪行(键盘高亮与悬停同一视觉)。挂在 mouse_move 而不是
@@ -520,48 +498,19 @@ impl BranchPopup {
     }
 }
 
-/// 弹窗顶部动作行里的一颗「图标 + 文字」按钮。
-fn action_chip(
-    id: &'static str,
-    shapes: &'static [Shape],
-    label: impl Into<SharedString>,
-    busy: bool,
-    disabled: bool,
-) -> Stateful<Div> {
-    let base = div()
-        .id(id)
-        .group(id)
-        .flex()
-        .items_center()
-        .gap(px(6.0))
-        .h(px(26.0))
-        .px(px(8.0))
-        .rounded(px(4.0))
-        .text_size(ui::font_px(12.0));
-    if busy {
-        return base
-            .text_color(ui::text_muted())
-            .child(ui::spinner(px(12.0), ui::accent()))
-            .child(label.into());
+/// 命中区间(char 下标,`find_ci` 的口径)→ 字节区间(`StyledText` 的高亮口径)。
+/// 越界 / 逆序返回 `None`(一条坏区间不该把整行名字吞掉)。
+fn char_range_to_bytes(text: &str, start: usize, end: usize) -> Option<std::ops::Range<usize>> {
+    if start >= end {
+        return None;
     }
-    if disabled {
-        return base
-            .opacity(0.45)
-            .text_color(ui::text_muted())
-            .child(git_ui::icon(shapes, git_ui::ICON_SIZE, ui::text_muted()))
-            .child(label.into());
-    }
-    base.cursor_pointer()
-        .text_color(ui::text_secondary())
-        .hover(|el| el.bg(ui::bg_elevated()).text_color(ui::text_primary()))
-        .child(git_ui::hover_icon(
-            id,
-            shapes,
-            git_ui::ICON_SIZE,
-            ui::text_muted(),
-            ui::text_primary(),
-        ))
-        .child(label.into())
+    let byte_at = |n: usize| {
+        text.char_indices()
+            .map(|(i, _)| i)
+            .chain(std::iter::once(text.len()))
+            .nth(n)
+    };
+    Some(byte_at(start)?..byte_at(end)?)
 }
 
 fn group_label(group: &Group) -> String {
@@ -580,7 +529,6 @@ impl Render for BranchPopup {
         let rows = build_rows(&snap, &query);
         // 候选变少之后游标可能越界
         let cursor = self.cursor.min(rows.len().saturating_sub(1));
-        let mono = git_ui::mono_font(self.panel.read(cx).store(), cx);
         let busy = snap.busy;
         let fetching = busy == Some(GitBusy::Fetch);
 
@@ -605,14 +553,14 @@ impl Render for BranchPopup {
             .border_b_1()
             .border_color(ui::border_subtle())
             .child(
-                action_chip(
+                git_ui::chip_button(
                     "git-branches-new",
                     git_ui::ICON_PLUS,
                     t("gitBranch", "newBranch"),
                     false,
                     busy.is_some() || snap.repo.is_empty(),
                 )
-                .when(busy.is_none(), |el| {
+                .when(busy.is_none() && !snap.repo.is_empty(), |el| {
                     el.on_click(move |_: &ClickEvent, window, cx| {
                         close_guarded(kind::GIT_BRANCHES, window, cx);
                         open_name_dialog(
@@ -625,7 +573,7 @@ impl Render for BranchPopup {
                 }),
             )
             .child(
-                action_chip(
+                git_ui::chip_button(
                     "git-branches-fetch",
                     git_ui::ICON_FETCH,
                     if fetching {
@@ -651,30 +599,33 @@ impl Render for BranchPopup {
             .min_h(px(0.0))
             .overflow_y_scroll()
             .track_scroll(&self.scroll)
+            .px(px(4.0))
             .py(px(4.0));
 
         if rows.is_empty() {
             let this = cx.entity();
             let query_input = self.query.clone();
             list = list.child(if snap.loading && snap.branches.is_empty() {
-                div()
-                    .py(px(24.0))
-                    .flex()
-                    .justify_center()
-                    .child(git_ui::busy_line(t("gitBranch", "loading")))
+                git_ui::loading_state(t("gitBranch", "loading"))
             } else if !query.is_empty() {
                 git_ui::empty_state(
                     git_ui::ICON_SEARCH,
                     tr!("gitBranch", "noMatch", query = query.as_str()),
                     Some(
-                        ui::ghost_button("git-branches-clear", t("gitBranch", "clearSearch"))
-                            .on_click(move |_: &ClickEvent, window, cx| {
-                                query_input.update(cx, |state, cx| state.set_value("", window, cx));
-                                this.update(cx, |this, cx| {
-                                    this.cursor = 0;
-                                    cx.notify();
-                                });
-                            }),
+                        git_ui::action_button(
+                            "git-branches-clear",
+                            t("gitBranch", "clearSearch"),
+                            git_ui::ButtonKind::Ghost,
+                            true,
+                        )
+                        .on_click(move |_: &ClickEvent, window, cx| {
+                            query_input.update(cx, |state, cx| state.set_value("", window, cx));
+                            this.update(cx, |this, cx| {
+                                this.cursor = 0;
+                                cx.notify();
+                            });
+                        })
+                        .into_any_element(),
                     ),
                 )
             } else {
@@ -685,28 +636,28 @@ impl Render for BranchPopup {
         let mut last: Option<&Group> = None;
         for (index, row) in rows.iter().enumerate() {
             if last != Some(&row.group) {
-                list = list.child(git_ui::group_header(group_label(&row.group)));
+                list = list.child(git_ui::list_caption(group_label(&row.group)));
                 last = Some(&row.group);
             }
-            list = list.child(self.render_row(index, row, index == cursor, &mono, cx));
+            list = list.child(self.render_row(index, row, index == cursor, cx));
         }
 
         // detached HEAD 时置顶一句说明(它不是分支,列表里没有它)
         let detached_note = snap.detached.as_ref().map(|label| {
             div()
-                .flex()
-                .items_center()
-                .gap(px(8.0))
                 .mx(px(12.0))
                 .mb(px(8.0))
                 .px(px(10.0))
                 .py(px(6.0))
                 .rounded(px(4.0))
                 .bg(ui::with_alpha(ui::color_warning(), 0.12))
-                .text_size(ui::font_px(12.0))
-                .text_color(ui::text_secondary())
-                .child(git_ui::icon(git_ui::ICON_ALERT, 12.0, ui::color_warning()))
-                .child(tr!("gitBranch", "detachedNote", commit = label.as_str()))
+                .child(
+                    git_ui::notice_line(
+                        tr!("gitBranch", "detachedNote", commit = label.as_str()),
+                        ui::color_warning(),
+                    )
+                    .text_color(ui::text_secondary()),
+                )
         });
 
         let hint = |keys: &'static str, label: &'static str| {
@@ -1291,35 +1242,29 @@ pub(crate) fn open_name_dialog(
                 ),
             };
 
-            // 第一行:起点(新建)/ 原名(重命名),用胶囊表达
-            let (lead, lead_name, lead_color) = match &f.mode {
+            // 第一行:起点(新建)/ 原名(重命名),引用胶囊按语义表上色
+            // (HEAD = accent、其它本地分支 = success、远程 = info)
+            let (lead, lead_name) = match &f.mode {
                 NameMode::Create { start } => (
                     t("gitBranch", "startPoint"),
                     start.clone().unwrap_or_else(|| head_label.clone()),
-                    if start
-                        .as_ref()
-                        .is_some_and(|s| !snap_is_local(&f.existing, s))
-                    {
-                        ui::color_info()
-                    } else {
-                        ui::accent()
-                    },
                 ),
-                NameMode::Rename { old } => {
-                    (t("gitBranch", "currentName"), old.clone(), ui::accent())
-                }
+                NameMode::Rename { old } => (t("gitBranch", "currentName"), old.clone()),
             };
-            let mut body = div()
-                .px(px(16.0))
-                .pb(px(8.0))
-                .flex()
-                .flex_col()
-                .gap(px(10.0))
+            let lead_kind = if lead_name == head_label {
+                git_ui::RefKind::Head
+            } else if snap_is_local(&f.existing, &lead_name) {
+                git_ui::RefKind::Local
+            } else {
+                git_ui::RefKind::Remote
+            };
+            let mut body = git_ui::form_body()
                 .child(
                     div()
                         .flex()
                         .items_center()
                         .gap(px(8.0))
+                        .min_w_0()
                         .text_size(ui::font_px(12.0))
                         .text_color(ui::text_muted())
                         .child(git_ui::icon(
@@ -1327,65 +1272,57 @@ pub(crate) fn open_name_dialog(
                             git_ui::ICON_SIZE,
                             ui::text_muted(),
                         ))
-                        .child(lead)
-                        .child(git_ui::pill(lead_name, lead_color)),
+                        .child(div().flex_none().child(lead))
+                        .child(
+                            git_ui::ref_pill("git-branch-name-lead", lead_name.clone(), lead_kind)
+                                .tip(lead_name),
+                        ),
                 )
-                .child(Input::new(&f.input))
-                .child(match show_issue {
-                    Some(key) => div()
+                .child(
+                    div()
                         .flex()
-                        .items_center()
+                        .flex_col()
                         .gap(px(6.0))
-                        .text_size(ui::font_px(12.0))
-                        .text_color(ui::color_error())
-                        .child(git_ui::icon(git_ui::ICON_ALERT, 12.0, ui::color_error()))
-                        .child(t("gitBranch", key)),
-                    None => div()
-                        .text_size(ui::font_px(12.0))
-                        .text_color(ui::text_muted())
-                        .child(t("gitBranch", "nameHint")),
-                });
+                        .child(Input::new(&f.input))
+                        .child(match show_issue {
+                            Some(key) => {
+                                git_ui::notice_line(t("gitBranch", key), ui::color_error())
+                            }
+                            None => git_ui::hint_line(t("gitBranch", "nameHint")),
+                        }),
+                );
             if matches!(f.mode, NameMode::Create { .. }) {
-                let checked = f.checkout;
                 let form_for_toggle = form.clone();
                 body = body.child(
-                    div()
-                        .id("git-new-branch-checkout")
-                        .flex()
-                        .items_center()
-                        .gap(px(8.0))
-                        .cursor_pointer()
-                        .text_size(ui::font_px(12.0))
-                        .text_color(ui::text_secondary())
-                        .child(git_ui::check_box(checked, ui::accent()))
-                        .child(t("gitBranch", "checkoutAfterCreate"))
-                        .on_click(move |_: &ClickEvent, _window, cx| {
-                            form_for_toggle.update(cx, |f, cx| {
-                                f.checkout = !f.checkout;
-                                cx.notify();
-                            });
-                        }),
+                    git_ui::check_row(
+                        "git-new-branch-checkout",
+                        f.checkout,
+                        t("gitBranch", "checkoutAfterCreate"),
+                        false,
+                    )
+                    .on_click(move |_: &ClickEvent, _window, cx| {
+                        form_for_toggle.update(cx, |f, cx| {
+                            f.checkout = !f.checkout;
+                            cx.notify();
+                        });
+                    }),
                 );
             }
             if let Some(err) = &f.error {
-                body = body.child(
-                    div()
-                        .px(px(10.0))
-                        .py(px(8.0))
-                        .rounded(px(4.0))
-                        .bg(ui::with_alpha(ui::color_error(), 0.08))
-                        .text_size(ui::font_px(12.0))
-                        .text_color(ui::color_error())
-                        .child(err.clone()),
-                );
+                body = body.child(git_ui::error_block(err.clone()));
             }
 
             let form_for_ok = form.clone();
             dialog
                 .title(title)
-                .w(px(420.0))
+                .w(px(git_ui::DIALOG_W_MD))
                 .overlay_closable(true)
-                .footer(confirm_footer(ok_label, Some(t("gitBranch", "cancel"))))
+                .footer(git_ui::dialog_footer(
+                    ok_label,
+                    Some(t("gitBranch", "cancel").into()),
+                    false,
+                    f.busy,
+                ))
                 .child(body)
                 .on_ok(move |_: &ClickEvent, window, cx| submit_name(&form_for_ok, window, cx))
         },
@@ -1393,7 +1330,7 @@ pub(crate) fn open_name_dialog(
     autofocus(&input_for_focus, window, cx);
 }
 
-/// 起点是不是本地分支(决定胶囊配色:本地 accent / 远程 info)。
+/// 起点是不是本地分支(决定胶囊配色:本地 success / 远程 info)。
 fn snap_is_local(existing: &[String], name: &str) -> bool {
     existing.iter().any(|n| n == name)
 }
@@ -1599,6 +1536,18 @@ mod tests {
         assert!(build_rows(&snapshot(), "zzz").is_empty());
         // 首尾空白不算
         assert_eq!(build_rows(&snapshot(), "  dev ").len(), 2);
+    }
+
+    /// 命中区间(char)换成 `StyledText` 要的字节区间:中文名不能切在半个字上。
+    #[test]
+    fn 命中区间换成字节区间() {
+        assert_eq!(char_range_to_bytes("feature/Login", 8, 13), Some(8..13));
+        assert_eq!(char_range_to_bytes("修复/登录页", 3, 5), Some(7..13));
+        // 命中到末尾
+        assert_eq!(char_range_to_bytes("修复", 1, 2), Some(3..6));
+        // 坏区间不 panic
+        assert_eq!(char_range_to_bytes("abc", 2, 9), None);
+        assert_eq!(char_range_to_bytes("abc", 2, 2), None);
     }
 
     #[test]

@@ -24,8 +24,8 @@ use mt_project::git::{FileLogEntry, GitLogCursor};
 use mt_ui::tooltip::TooltipExt as _;
 
 use crate::git_diff::{self, CommitFileDiffPane};
-use crate::git_history::icons::{ICON_HISTORY, empty_state, file_status, mono};
 use crate::git_history::{format_absolute_time, format_relative_time};
+use crate::git_ui::{self, ButtonKind, ICON_HISTORY, commit_file_status, empty_state, mono};
 use crate::i18n::{t, tr};
 use crate::menu;
 use crate::prompt::{is_open, kind, open_guarded};
@@ -315,10 +315,11 @@ fn render_list_column(state: &Entity<FileHistory>, file_name: &str, cx: &mut App
     let count = s.entries.len();
     let path_hint = s.path_in_repo.clone().unwrap_or_else(|| s.file_rel.clone());
 
+    // 头部与提交 diff 左栏同一口径(左右 12、上下 10、14px 半粗标题 + 12px 弱化副行)
     let header = div()
         .flex_none()
-        .px(px(14.0))
-        .py(px(12.0))
+        .px(px(git_diff::SIDE_PAD))
+        .py(px(10.0))
         .flex()
         .flex_col()
         .gap(px(4.0))
@@ -329,11 +330,8 @@ fn render_list_column(state: &Entity<FileHistory>, file_name: &str, cx: &mut App
                 .flex()
                 .items_center()
                 .gap(px(8.0))
-                .child(crate::git_history::icons::icon(
-                    ICON_HISTORY,
-                    crate::git_history::icons::ICON_SIZE,
-                    ui::accent(),
-                ))
+                .min_w_0()
+                .child(git_ui::icon(ICON_HISTORY, git_ui::ICON_SIZE, ui::accent()))
                 .child(
                     div()
                         .min_w_0()
@@ -356,14 +354,16 @@ fn render_list_column(state: &Entity<FileHistory>, file_name: &str, cx: &mut App
     let body: AnyElement = if let Some(err) = s.error.clone().filter(|_| count == 0) {
         div()
             .flex_1()
-            .p(px(16.0))
-            .text_size(ui::font_px(12.0))
-            .text_color(ui::color_error())
-            .child(tr!("gitLog", "fileHistory.failed", detail = err))
+            .child(git_ui::error_state(tr!(
+                "gitLog",
+                "fileHistory.failed",
+                detail = err
+            )))
             .into_any_element()
     } else if count == 0 {
-        let text = if s.loading || s.cursor.is_some() {
-            if s.scanned > 0 {
+        let pending = s.loading || s.cursor.is_some();
+        let state_el = if pending {
+            git_ui::loading_state(if s.scanned > 0 {
                 tr!(
                     "gitLog",
                     "fileHistory.scanning",
@@ -371,14 +371,14 @@ fn render_list_column(state: &Entity<FileHistory>, file_name: &str, cx: &mut App
                 )
             } else {
                 t("gitLog", "fileHistory.loading").to_string()
-            }
+            })
         } else {
-            t("gitLog", "fileHistory.empty").to_string()
+            empty_state(ICON_HISTORY, t("gitLog", "fileHistory.empty"), None)
         };
         div()
             .flex_1()
             .min_h(px(0.0))
-            .child(empty_state(ICON_HISTORY, text, None))
+            .child(state_el.size_full())
             .into_any_element()
     } else {
         let list_state = state.clone();
@@ -419,7 +419,7 @@ fn render_list_column(state: &Entity<FileHistory>, file_name: &str, cx: &mut App
     };
     let footer = div()
         .flex_none()
-        .px(px(14.0))
+        .px(px(git_diff::SIDE_PAD))
         .py(px(8.0))
         .flex()
         .items_center()
@@ -454,7 +454,7 @@ fn render_row(state: &Entity<FileHistory>, index: usize, cx: &mut App) -> AnyEle
     };
     let selected = s.selected == Some(index);
     let commit = &entry.commit;
-    let (letter, color) = file_status(&entry.status);
+    let (letter, color) = commit_file_status(&entry.status);
     let now = chrono::Utc::now().timestamp();
     let meta = format!(
         "{} · {} · {}",
@@ -472,46 +472,24 @@ fn render_row(state: &Entity<FileHistory>, index: usize, cx: &mut App) -> AnyEle
     let (click_state, menu_state) = (state.clone(), state.clone());
     let hash = commit.hash.clone();
 
-    let mut row = div()
-        .id(SharedString::from(format!("git-file-history-{index}")))
-        .relative()
-        .w_full()
-        .h(px(ROW_HEIGHT))
-        .flex()
-        .flex_col()
-        .justify_center()
-        .gap(px(4.0))
-        .px(px(10.0))
-        .rounded(px(4.0))
-        .cursor_pointer();
-    row = if selected {
-        row.bg(ui::accent_subtle()).child(
-            div()
-                .absolute()
-                .left_0()
-                .top(px(8.0))
-                .bottom(px(8.0))
-                .w(px(2.0))
-                .rounded(px(1.0))
-                .bg(ui::accent()),
-        )
-    } else {
-        row.hover(|el| el.bg(ui::bg_overlay()))
-    };
-    row.child(
+    // 共用列表行(选中 = accent 淡底 + 左侧竖条、悬停薄纱底),两行布局:
+    // 状态字母 + 提交标题 / 作者 · 时间 · 短哈希(与标题左缘对齐)
+    git_ui::list_row(
+        SharedString::from(format!("git-file-history-{index}")),
+        selected,
+    )
+    .h(px(ROW_HEIGHT))
+    .flex_col()
+    .items_stretch()
+    .justify_center()
+    .gap(px(4.0))
+    .px(px(10.0))
+    .child(
         div()
             .flex()
             .items_center()
             .gap(px(8.0))
-            .child(
-                mono(div())
-                    .flex_none()
-                    .w(px(12.0))
-                    .text_size(ui::font_px(12.0))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(color)
-                    .child(letter),
-            )
+            .child(git_ui::status_letter(letter, color))
             .child(
                 div()
                     .flex_1()
@@ -524,10 +502,10 @@ fn render_row(state: &Entity<FileHistory>, index: usize, cx: &mut App) -> AnyEle
     )
     .child(
         mono(div())
-            .pl(px(20.0))
+            .pl(px(22.0))
             .min_w_0()
             .truncate()
-            .text_size(ui::font_px(11.0))
+            .text_size(ui::font_px(12.0))
             .text_color(ui::text_muted())
             .child(meta),
     )
@@ -575,13 +553,14 @@ fn render_diff_column(state: &Entity<FileHistory>, cx: &mut App) -> AnyElement {
     };
     let toolbar = diff.toolbar("git-file-history", kind::GIT_FILE_HISTORY, cx);
 
+    // 与另两个 diff 弹窗的工具栏同高同距
     let mut head = div()
         .flex_none()
         .flex()
         .items_center()
-        .gap(px(10.0))
+        .gap(px(16.0))
+        .h(px(git_diff::TOOLBAR_H))
         .px(px(16.0))
-        .py(px(10.0))
         .border_b_1()
         .border_color(ui::border_subtle());
     let body: AnyElement = match picked {
@@ -599,7 +578,7 @@ fn render_diff_column(state: &Entity<FileHistory>, cx: &mut App) -> AnyElement {
                             div()
                                 .min_w_0()
                                 .truncate()
-                                .text_size(ui::font_px(13.0))
+                                .text_size(ui::font_px(14.0))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(ui::text_primary())
                                 .child(commit.message.clone()),
@@ -613,11 +592,12 @@ fn render_diff_column(state: &Entity<FileHistory>, cx: &mut App) -> AnyElement {
                         ),
                 )
                 .child(
-                    ui::ghost_button(
+                    git_ui::action_button(
                         "git-file-history-open-commit",
                         t("gitLog", "fileHistory.viewInCommit"),
+                        ButtonKind::Ghost,
+                        true,
                     )
-                    .flex_none()
                     .on_click(move |_: &ClickEvent, window, cx| {
                         open_in_commit_diff(&state, index, window, cx);
                     }),
@@ -626,14 +606,8 @@ fn render_diff_column(state: &Entity<FileHistory>, cx: &mut App) -> AnyElement {
         }
         None => {
             head = head.child(div().flex_1());
-            div()
+            empty_state(ICON_HISTORY, t("gitLog", "fileHistory.selectHint"), None)
                 .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_size(ui::font_px(13.0))
-                .text_color(ui::text_muted())
-                .child(t("gitLog", "fileHistory.selectHint"))
                 .into_any_element()
         }
     };

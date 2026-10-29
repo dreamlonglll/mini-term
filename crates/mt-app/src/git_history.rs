@@ -38,7 +38,6 @@
 
 mod actions;
 mod detail;
-pub(crate) mod icons;
 
 pub use actions::GitLogRewordConfirm;
 
@@ -61,15 +60,14 @@ use mt_ui::tooltip::TooltipExt as _;
 use crate::git_graph::{
     self, GRAPH_ROW_HEIGHT, GraphLayout, GraphRow, SegPath, palette_color, segment_path,
 };
+use crate::git_ui::{
+    self, ButtonKind, ICON_CLOSE, ICON_COMMIT, ICON_SEARCH, ICON_USER, RefKind, Tone, avatar,
+    empty_state, icon, icon_button, mono, more_pill, ref_pill,
+};
 use crate::i18n::{t, tr};
 use crate::store::AppStore;
 use crate::ui;
 use crate::{git_diff, git_watch};
-
-use icons::{
-    ICON_CLOSE, ICON_COMMIT, ICON_SEARCH, ICON_USER, RefKind, avatar, empty_state, icon,
-    icon_button, mono, more_pill, ref_pill,
-};
 
 gpui::actions!(
     mini_term,
@@ -848,37 +846,26 @@ impl GitHistoryContent {
         refs
     }
 
-    // ── toast ─────────────────────────────────────────────
-
-    fn project_ident(&self, cx: &App) -> (String, String) {
-        self.store
-            .read(cx)
-            .active_project()
-            .map(|p| (p.id.clone(), p.name.clone()))
-            .unwrap_or_else(|| (String::new(), "Git".to_string()))
-    }
+    // ── toast(走 Git 面板共用的结果 toast) ──────────────
 
     /// 成功摘要(信息档:`i` 图标,点击只关闭)。
     fn toast_info(&self, message: String, cx: &mut App) {
-        let (id, name) = self.project_ident(cx);
-        crate::toast::push_message(crate::notify::ToastKind::WslInfo, id, name, message, cx);
+        git_ui::toast(&self.store, message, Tone::Info, cx);
     }
 
-    /// 失败(错误档,正文带 git 的原文)。`action` 是 `gitLog.action.*` 的 key。
+    /// 失败(需要留意那一档,正文带 git 的原文)。`action` 是 `gitLog.action.*` 的 key。
     fn toast_failure(&self, action: &'static str, err: &anyhow::Error, cx: &mut App) {
         eprintln!("[git] {action} 失败: {err:#}");
-        let (id, name) = self.project_ident(cx);
         let detail = error_text(err);
-        crate::toast::push_message(
-            crate::notify::ToastKind::PasteError,
-            id,
-            name,
+        git_ui::toast(
+            &self.store,
             tr!(
                 "gitLog",
                 "toast.failed",
                 action = t("gitLog", action),
                 detail = detail
             ),
+            Tone::Attention,
             cx,
         );
     }
@@ -1013,11 +1000,9 @@ impl Render for GitHistoryContent {
             });
 
         if self.repo_path.is_empty() {
-            return root.child(empty_state(
-                ICON_COMMIT,
-                t("gitHistoryContent", "noRepos"),
-                None,
-            ));
+            return root.child(
+                empty_state(ICON_COMMIT, t("gitHistoryContent", "noRepos"), None).size_full(),
+            );
         }
 
         root = root.child(self.render_filter_bar(cx));
@@ -1048,18 +1033,21 @@ impl GitHistoryContent {
         let has_text = !self.filter.input.read(cx).value().is_empty();
         let active = self.filter.active() || self.filter.only_mine;
         let clear_text = has_text.then(|| {
-            icon_button("git-log-filter-clear-text", ICON_CLOSE, true)
-                .tip(t("gitLog", "filter.clearText"))
-                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                    cx.stop_propagation();
-                    this.clear_filter_text(window, cx);
-                }))
+            icon_button(
+                "git-log-filter-clear-text",
+                ICON_CLOSE,
+                t("gitLog", "filter.clearText"),
+                true,
+            )
+            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                this.clear_filter_text(window, cx);
+            }))
         });
         let input = div().flex_1().min_w_0().child(
             Input::new(&self.filter.input)
                 .prefix(div().pl(px(2.0)).child(icon(
                     ICON_SEARCH,
-                    icons::ICON_SIZE,
+                    git_ui::ICON_SIZE,
                     ui::text_muted(),
                 )))
                 .when_some(clear_text, |el, btn| el.suffix(btn)),
@@ -1095,14 +1083,15 @@ impl GitHistoryContent {
             .text_color(mine_color)
             .map(|el| {
                 if mine {
-                    el.bg(ui::with_alpha(mine_color, 0.15))
+                    el.bg(git_ui::soft_bg(mine_color))
+                        .text_color(git_ui::soft_fg(mine_color))
                         .border_color(ui::with_alpha(mine_color, 0.5))
                 } else {
                     el.border_color(ui::border_default())
-                        .hover(|el| el.bg(ui::bg_elevated()))
+                        .hover(|el| el.bg(git_ui::button_hover_bg()))
                 }
             })
-            .child(icon(ICON_USER, 12.0, mine_color))
+            .child(icon(ICON_USER, git_ui::ICON_SIZE_SM, mine_color))
             .child(t("gitLog", "filter.onlyMine"))
             .tip(mine_tip)
             .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
@@ -1167,12 +1156,16 @@ impl GitHistoryContent {
                 )
             })
             .when(active, |el| {
+                let clear = git_ui::action_button(
+                    "git-log-filter-clear",
+                    t("gitLog", "filter.clear"),
+                    ButtonKind::Ghost,
+                    true,
+                );
                 el.child(
-                    ui::ghost_button("git-log-filter-clear", t("gitLog", "filter.clear"))
-                        .flex_none()
-                        .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                            this.clear_filter(window, cx);
-                        })),
+                    clear.on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.clear_filter(window, cx);
+                    })),
                 )
             })
             .into_any_element()
@@ -1230,43 +1223,41 @@ impl GitHistoryContent {
 
     fn render_empty(&self, cx: &mut Context<Self>) -> AnyElement {
         if let Some(err) = &self.load_error {
-            return div()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .px(px(16.0))
-                .text_size(ui::font_px(12.0))
-                .text_color(ui::color_error())
-                .child(tr!("gitLog", "loadFailed", detail = err.clone()))
+            return git_ui::error_state(tr!("gitLog", "loadFailed", detail = err.clone()))
                 .into_any_element();
         }
         if self.filter.active() {
             if self.loading || self.has_more {
-                return empty_state(
-                    ICON_SEARCH,
-                    tr!(
-                        "gitLog",
-                        "filter.searching",
-                        count = self.filter.scanned.to_string()
-                    ),
-                    None,
-                );
+                return git_ui::loading_state(tr!(
+                    "gitLog",
+                    "filter.searching",
+                    count = self.filter.scanned.to_string()
+                ))
+                .size_full()
+                .into_any_element();
             }
-            let clear =
-                ui::primary_button("git-log-empty-clear", t("gitLog", "filter.clearFilter"))
-                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                        this.clear_filter(window, cx);
-                    }))
-                    .into_any_element();
-            return empty_state(ICON_SEARCH, t("gitLog", "filter.noMatch"), Some(clear));
+            let clear = git_ui::action_button(
+                "git-log-empty-clear",
+                t("gitLog", "filter.clearFilter"),
+                ButtonKind::Primary,
+                true,
+            )
+            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                this.clear_filter(window, cx);
+            }))
+            .into_any_element();
+            return empty_state(ICON_SEARCH, t("gitLog", "filter.noMatch"), Some(clear))
+                .size_full()
+                .into_any_element();
         }
-        let text = if self.loading {
-            t("gitHistoryContent", "loading")
-        } else {
-            t("gitHistoryContent", "noCommits")
-        };
-        empty_state(ICON_COMMIT, text, None)
+        if self.loading {
+            return git_ui::loading_state(t("gitHistoryContent", "loading"))
+                .size_full()
+                .into_any_element();
+        }
+        empty_state(ICON_COMMIT, t("gitHistoryContent", "noCommits"), None)
+            .size_full()
+            .into_any_element()
     }
 
     fn render_commit(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
@@ -1289,35 +1280,16 @@ impl GitHistoryContent {
         let short_hash = commit.short_hash.clone();
         let refs = self.row_refs(&commit.hash);
 
-        let mut row = div()
-            .id(SharedString::from(format!("git-commit-{hash_full}")))
-            .relative()
-            // ⚠️ `w_full` 不能省:行是 uniform_list 的 item,单独 `layout_as_root`,而
-            // taffy 对没有已知主轴尺寸的 flex 根节点按**内容**宽度算、不吃 available
-            // space。没有它整行只有内容那么宽,`flex_1` 的标题是 0。
-            .w_full()
-            .h(px(GRAPH_ROW_HEIGHT))
-            .flex()
-            .items_center()
-            .gap(px(8.0))
-            .pl(px(if graph_row.is_some() { 4.0 } else { 10.0 }))
-            .pr(px(8.0))
-            .rounded(px(4.0))
-            .cursor_pointer();
-        row = if selected {
-            row.bg(ui::accent_subtle()).child(
-                div()
-                    .absolute()
-                    .left_0()
-                    .top(px(6.0))
-                    .bottom(px(6.0))
-                    .w(px(2.0))
-                    .rounded(px(1.0))
-                    .bg(ui::accent()),
-            )
-        } else {
-            row.hover(|el| el.bg(ui::bg_elevated()))
-        };
+        // 共用列表行(选中 = accent 淡底 + 左侧竖条、悬停薄纱底)。
+        // ⚠️ `w_full` 不能省(`list_row` 已带):行是 uniform_list 的 item,单独
+        // `layout_as_root`,而 taffy 对没有已知主轴尺寸的 flex 根节点按**内容**宽度算、
+        // 不吃 available space。没有它整行只有内容那么宽,`flex_1` 的标题是 0。
+        let mut row = git_ui::list_row(
+            SharedString::from(format!("git-commit-{hash_full}")),
+            selected,
+        )
+        .h(px(GRAPH_ROW_HEIGHT))
+        .pl(px(if graph_row.is_some() { 4.0 } else { 10.0 }));
         if let Some(graph_row) = graph_row {
             row = row.child(GraphCell {
                 row: graph_row,
@@ -1350,6 +1322,7 @@ impl GitHistoryContent {
                     name.clone(),
                     *kind,
                 )
+                .max_w(px(160.0))
                 .tip(name.clone()),
             );
         }
@@ -1423,7 +1396,8 @@ impl GitHistoryContent {
     }
 }
 
-/// 列表末尾那一行「加载更多… / 搜索中…」。高度与提交行一致(uniform_list 按行等高排)。
+/// 列表末尾那一行「加载更多… / 搜索中…」(共用的加载提示行)。高度与提交行一致
+/// (uniform_list 按行等高排)。
 fn footer_row(text: String) -> AnyElement {
     div()
         .w_full()
@@ -1431,9 +1405,7 @@ fn footer_row(text: String) -> AnyElement {
         .flex()
         .items_center()
         .justify_center()
-        .text_size(ui::font_px(12.0))
-        .text_color(ui::text_muted())
-        .child(text)
+        .child(git_ui::busy_line(text))
         .into_any_element()
 }
 
