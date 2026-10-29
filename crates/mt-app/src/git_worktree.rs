@@ -576,15 +576,12 @@ fn render_group(
             s.pruning_key.as_deref() == Some(group.key.as_str()),
         )
     };
-    let mut block = div()
-        .flex()
-        .flex_col()
-        .when(multi_repo, |el| {
-            el.rounded(px(6.0))
-                .overflow_hidden()
-                .border_1()
-                .border_color(ui::border_subtle())
-        });
+    let mut block = div().flex().flex_col().when(multi_repo, |el| {
+        el.rounded(px(6.0))
+            .overflow_hidden()
+            .border_1()
+            .border_color(ui::border_subtle())
+    });
 
     if multi_repo {
         let (state_for_click, key) = (state.clone(), group.key.clone());
@@ -999,13 +996,11 @@ fn render_create_section(
                     .collect();
                 let options = available_branches(&per_group);
                 if options.is_empty() {
-                    section = section.child(hint_line(
-                        if multi_target {
-                            t("worktree", "noCommonBranch")
-                        } else {
-                            t("worktree", "noBranchAvailable")
-                        },
-                    ));
+                    section = section.child(hint_line(if multi_target {
+                        t("worktree", "noCommonBranch")
+                    } else {
+                        t("worktree", "noBranchAvailable")
+                    }));
                 } else {
                     section = section.child(dropdown(
                         state,

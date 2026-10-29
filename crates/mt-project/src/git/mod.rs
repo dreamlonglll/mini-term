@@ -1266,11 +1266,7 @@ fn edit_script(old_lines: &[&str], new_lines: &[&str]) -> Vec<(char, usize, usiz
     }
 
     for k in 0..tail {
-        flat.push((
-            '=',
-            old_lines.len() - tail + k,
-            new_lines.len() - tail + k,
-        ));
+        flat.push(('=', old_lines.len() - tail + k, new_lines.len() - tail + k));
     }
     flat
 }
@@ -2547,7 +2543,8 @@ mod tests {
         let root = init_repo_with_file("monorepo", rel_in_repo, "old\n");
         std::fs::write(root.join(rel_in_repo), "new\n").unwrap();
         let project = root.join("packages").join("app");
-        let result = get_git_diff(&project, "src/pages/task/my/my.vue", DiffSide::Unstaged).unwrap();
+        let result =
+            get_git_diff(&project, "src/pages/task/my/my.vue", DiffSide::Unstaged).unwrap();
         assert_eq!(diff_lines(&result), old_to_new());
         std::fs::remove_dir_all(&root).ok();
     }

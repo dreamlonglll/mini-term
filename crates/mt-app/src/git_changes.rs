@@ -1215,9 +1215,9 @@ impl GitChanges {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move {
-                    mt_project::git::git_push_with(&repo, &PushOptions::default())
-                })
+                .spawn(
+                    async move { mt_project::git::git_push_with(&repo, &PushOptions::default()) },
+                )
                 .await;
             let _ = this.update(cx, |this: &mut Self, cx| {
                 this.pushing = false;
