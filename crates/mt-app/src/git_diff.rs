@@ -538,7 +538,7 @@ const MODAL_W_RATIO: f32 = 0.8;
 const MODAL_H_RATIO: f32 = 0.85;
 
 /// 返回 `(面板宽, 正文高)`。builder 每帧重跑,拖窗口改大小时跟着变。
-fn modal_size(viewport: gpui::Size<gpui::Pixels>) -> (gpui::Pixels, gpui::Pixels) {
+pub(crate) fn modal_size(viewport: gpui::Size<gpui::Pixels>) -> (gpui::Pixels, gpui::Pixels) {
     (
         ui::clamp_dialog_width(viewport.width * MODAL_W_RATIO, viewport),
         // `chrome = 0`:正文即整块面板(标题/页脚都没有),下限交给 helper
@@ -1233,9 +1233,46 @@ pub fn open_commit_diff(
     window: &mut Window,
     cx: &mut App,
 ) {
+    open_commit_diff_at(
+        store,
+        repo_path,
+        commit_hash,
+        commit_message,
+        files,
+        None,
+        window,
+        cx,
+    );
+}
+
+/// 同 [`open_commit_diff`],但打开时先选中 `initial` 这个文件(提交详情区点文件、
+/// 单文件历史「在完整提交 diff 中查看」用)。`None` 或不在列表里时选第一个。
+#[allow(clippy::too_many_arguments)]
+pub fn open_commit_diff_at(
+    store: Entity<AppStore>,
+    repo_path: String,
+    commit_hash: String,
+    commit_message: String,
+    files: Vec<CommitFileInfo>,
+    initial: Option<String>,
+    window: &mut Window,
+    cx: &mut App,
+) {
     let font_size = store.read(cx).config().terminal_font_size as f32;
     let state = cx.new(|cx| DiffState::new(font_size, cx));
-    let first = files.first().map(|f| f.path.clone()).unwrap_or_default();
+    let initial_ix = initial
+        .as_deref()
+        .and_then(|p| files.iter().position(|f| f.path == p));
+    let first = initial_ix
+        .and_then(|ix| files.get(ix))
+        .or(files.first())
+        .map(|f| f.path.clone())
+        .unwrap_or_default();
+    // 选中的文件可能排在很后面:左栏滚到它那一行(下一次布局时生效)
+    let file_scroll = gpui::ScrollHandle::new();
+    if let Some(ix) = initial_ix {
+        file_scroll.scroll_to_item(ix);
+    }
     let pick = cx.new(|_| CommitPick {
         selected: first.clone(),
     });
@@ -1263,7 +1300,8 @@ pub fn open_commit_diff(
                 .id("git-commit-files")
                 .flex_1()
                 .min_h(px(0.0))
-                .overflow_y_scroll();
+                .overflow_y_scroll()
+                .track_scroll(&file_scroll);
             for (idx, file) in files.iter().enumerate() {
                 let (letter, color) = commit_file_badge(&file.status);
                 let active = file.path == selected;
@@ -1455,6 +1493,18 @@ fn load_commit_file(
         .iter()
         .find(|f| f.path == path)
         .and_then(|f| f.old_path.clone());
+    load_commit_file_at(state, repo_path, commit_hash, path, old_path, cx);
+}
+
+/// [`load_commit_file`] 的本体:旧路径由调用方给(单文件历史没有整份文件列表)。
+fn load_commit_file_at(
+    state: &Entity<DiffState>,
+    repo_path: &str,
+    commit_hash: &str,
+    path: &str,
+    old_path: Option<String>,
+    cx: &mut App,
+) {
     let req = state.update(cx, |s, cx| {
         s.loading = true;
         s.error = None;
@@ -1496,6 +1546,70 @@ fn load_commit_file(
         });
     })
     .detach();
+}
+
+// ─── 嵌入式单文件提交 diff(单文件历史弹窗用) ────────────────
+
+/// 「某个提交里的某一个文件」的 diff 面板,给别的弹窗嵌进去用(单文件历史)。
+///
+/// 只是把 [`open_commit_diff`] 右栏那一套(状态 + 取数 + 正文 + 右上角工具组)
+/// 包了一层,行为与那边一致;文案沿用 `commitDiff` 命名空间。
+#[derive(Clone)]
+pub(crate) struct CommitFileDiffPane {
+    state: Entity<DiffState>,
+}
+
+impl CommitFileDiffPane {
+    pub(crate) fn new(store: &Entity<AppStore>, cx: &mut App) -> Self {
+        let font_size = store.read(cx).config().terminal_font_size as f32;
+        Self {
+            state: cx.new(|cx| DiffState::new(font_size, cx)),
+        }
+    }
+
+    /// 换成另一个(提交, 文件)。重命名过的文件要给 `old_path`,否则父树里查不到旧内容。
+    pub(crate) fn load(
+        &self,
+        repo_path: &str,
+        commit_hash: &str,
+        path: &str,
+        old_path: Option<String>,
+        cx: &mut App,
+    ) {
+        load_commit_file_at(&self.state, repo_path, commit_hash, path, old_path, cx);
+    }
+
+    /// 正文(加载中 / 出错 / 二进制 / 过大 / 正常 五选一)。
+    pub(crate) fn body(&self, cx: &mut App) -> AnyElement {
+        render_body(
+            &self.state,
+            t("commitDiff", "loading"),
+            t("commitDiff", "binaryFile"),
+            t("commitDiff", "tooLarge"),
+            cx,
+        )
+    }
+
+    /// 右上角:改动跳转 + 并排 / 行内切换 + ✕(关的是 `close_kind` 那个弹窗)。
+    pub(crate) fn toolbar(
+        &self,
+        id_prefix: &'static str,
+        close_kind: &'static str,
+        cx: &mut App,
+    ) -> AnyElement {
+        view_toggle(
+            &self.state,
+            id_prefix,
+            ToolbarLabels {
+                side: t("commitDiff", "sideBySide"),
+                inline: t("commitDiff", "inline"),
+                prev: t("commitDiff", "prevChange"),
+                next: t("commitDiff", "nextChange"),
+            },
+            close_kind,
+            cx,
+        )
+    }
 }
 
 #[cfg(test)]

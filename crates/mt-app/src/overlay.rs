@@ -113,6 +113,19 @@ pub mod kind {
     /// 「新增 / 编辑命令」弹窗。与浮层**不共存**(宿主先关浮层再开它),
     /// 但仍是独立种类 —— 分组的新建 / 改名走通用 [`PROMPT`],三者互不叠。
     pub const COMMAND_EDITOR: &str = "command-editor";
+    /// 提交历史右键「从此提交新建分支…」。
+    pub const GIT_LOG_NEW_BRANCH: &str = "git-log-new-branch";
+    /// 提交历史右键「在此提交新建标签…」。
+    pub const GIT_LOG_NEW_TAG: &str = "git-log-new-tag";
+    /// 提交历史右键「修改提交消息…」。
+    pub const GIT_LOG_REWORD: &str = "git-log-reword";
+    /// 提交历史右键「将当前分支重置到此处…」。
+    pub const GIT_LOG_RESET: &str = "git-log-reset";
+    /// 提交历史的危险操作二次确认(Hard 重置 / 删标签 / 撤销已推送的提交)。
+    /// 与 [`GIT_LOG_RESET`] **不同种类**:Hard 的二次确认叠在重置框之上。
+    pub const GIT_LOG_DANGER: &str = "git-log-danger";
+    /// 单文件 Git 历史(文件树右键「Git 历史」)。完整提交 diff 能叠在它之上。
+    pub const GIT_FILE_HISTORY: &str = "git-file-history";
 }
 
 /// 栈里的一条。

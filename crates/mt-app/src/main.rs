@@ -70,6 +70,7 @@ mod frost;
 mod fs_ops;
 mod git_changes;
 mod git_diff;
+mod git_file_history;
 mod git_graph;
 mod git_history;
 mod git_panel;

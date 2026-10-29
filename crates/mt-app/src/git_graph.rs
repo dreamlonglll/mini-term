@@ -8,17 +8,20 @@
 //! 2. **`segmentPath` 返回几何而不是 SVG path 串**。gpui 没有 SVG,画线走
 //!    [`gpui::PathBuilder`],要的是端点与控制点本身,见 [`SegPath`]。
 //!
-//! # 为什么行高必须固定 48px
+//! # 为什么行高必须固定
 //!
 //! 连线要跨行接续:上一行的下半程止于底边某条 lane,下一行的上半程从顶边同一条
 //! lane 起步。行高一变,两段接不上。原注释就在 `gitGraph.ts:17`。
+//!
+//! 原版是两行布局的 48px;提交行改成 IDEA Log 那样的单行布局(标题 | 引用 | 作者 |
+//! 时间)之后收到 32px —— 几何全部按 [`GRAPH_ROW_HEIGHT`] 推,常量一改连线照样接得上。
 
 use mt_project::git::GitCommitInfo;
 
 /// 单个 lane 的水平间距(px)。
 pub const GRAPH_LANE_WIDTH: f32 = 14.0;
 /// 每个 commit 行的固定高度(px)。
-pub const GRAPH_ROW_HEIGHT: f32 = 48.0;
+pub const GRAPH_ROW_HEIGHT: f32 = 32.0;
 /// 最多渲染的 lane 数,超出的一律画在最后一列。
 pub const GRAPH_MAX_LANES: usize = 8;
 
@@ -35,9 +38,24 @@ pub const PALETTE: [(u8, u8, u8); 8] = [
 ];
 
 /// 调色板下标 → 颜色。越界按 TS 的 `% length` 同款折回。
+///
+/// 色表是给暗底调的(GitHub dark 那一套):亮色主题下浅蓝 / 浅青几乎贴着白底,
+/// 所以底色偏亮时整体压暗一截,色相不变 —— 同一条分支在两套主题里仍是同一个颜色。
 pub fn palette_color(index: u8) -> gpui::Hsla {
     let (r, g, b) = PALETTE[index as usize % PALETTE.len()];
-    mt_ui::rgb8(r, g, b)
+    adapt_to_ground(mt_ui::rgb8(r, g, b), crate::ui::bg_surface().l)
+}
+
+/// 按面板底色的亮度调整线色:底色亮于 0.6 时亮度乘 0.68,饱和度略提。
+fn adapt_to_ground(color: gpui::Hsla, ground_lightness: f32) -> gpui::Hsla {
+    if ground_lightness <= 0.6 {
+        return color;
+    }
+    gpui::Hsla {
+        l: color.l * 0.68,
+        s: (color.s * 1.1).min(1.0),
+        ..color
+    }
 }
 
 /// 一条线段。`from`/`to` 为 `-1` 时表示该端点是**本行节点**。
@@ -480,16 +498,20 @@ mod tests {
         assert_eq!(lane_x(-1), lane_x(0), "-1 是节点标记,不该产生负坐标");
     }
 
-    /// 路径编译:同 lane 走直线、异 lane 走贝塞尔,控制点位置逐条对表。
+    /// 路径编译:同 lane 走直线、异 lane 走贝塞尔,控制点位置逐条对表
+    /// (全按行高推:中线 = H/2,控制点偏移 CURVE = H/4)。
     #[test]
     fn 路径编译三种形态() {
+        let h = GRAPH_ROW_HEIGHT;
+        let mid = h / 2.0;
+        let curve = h / 4.0;
         // 直穿同 lane
         assert_eq!(
             segment_path(&seg(1, 1, 0, None), 0),
             Some(SegPath::Line {
                 x: 21.0,
                 y0: 0.0,
-                y1: 48.0
+                y1: h
             })
         );
         // 直穿异 lane:控制点在行中线
@@ -497,19 +519,19 @@ mod tests {
             segment_path(&seg(0, 1, 0, None), 2),
             Some(SegPath::Cubic {
                 p0: (7.0, 0.0),
-                c1: (7.0, 24.0),
-                c2: (21.0, 24.0),
-                p1: (21.0, 48.0),
+                c1: (7.0, mid),
+                c2: (21.0, mid),
+                p1: (21.0, h),
             })
         );
-        // 上半程异 lane:控制点在 CURVE(12)
+        // 上半程异 lane:控制点在 CURVE
         assert_eq!(
             segment_path(&seg(1, -1, 0, None), 0),
             Some(SegPath::Cubic {
                 p0: (21.0, 0.0),
-                c1: (21.0, 12.0),
-                c2: (7.0, 12.0),
-                p1: (7.0, 24.0),
+                c1: (21.0, curve),
+                c2: (7.0, curve),
+                p1: (7.0, mid),
             })
         );
         // 下半程同 lane
@@ -517,18 +539,18 @@ mod tests {
             segment_path(&seg(-1, 0, 0, None), 0),
             Some(SegPath::Line {
                 x: 7.0,
-                y0: 24.0,
-                y1: 48.0
+                y0: mid,
+                y1: h
             })
         );
-        // 下半程异 lane:控制点在 mid + CURVE(36)
+        // 下半程异 lane:控制点在 mid + CURVE
         assert_eq!(
             segment_path(&seg(-1, 1, 0, None), 0),
             Some(SegPath::Cubic {
-                p0: (7.0, 24.0),
-                c1: (7.0, 36.0),
-                c2: (21.0, 36.0),
-                p1: (21.0, 48.0),
+                p0: (7.0, mid),
+                c1: (7.0, mid + curve),
+                c2: (21.0, mid + curve),
+                p1: (21.0, h),
             })
         );
         // 两端都是 -1(不会出现)→ 无路径
@@ -541,6 +563,16 @@ mod tests {
         assert!(!needs_gradient(&seg(0, 1, 3, None)));
         assert!(!needs_gradient(&seg(0, -1, 3, Some(3))));
         assert!(needs_gradient(&seg(0, -1, 3, Some(5))));
+    }
+
+    /// 亮底压暗、暗底原样:同一条分支两套主题里色相不变。
+    #[test]
+    fn 线色按底色亮度调整() {
+        let c = mt_ui::rgb8(0xa5, 0xd6, 0xff);
+        assert_eq!(adapt_to_ground(c, 0.08), c, "暗底不动");
+        let light = adapt_to_ground(c, 0.97);
+        assert!(light.l < c.l * 0.7 + 0.001);
+        assert_eq!(light.h, c.h);
     }
 
     /// 空输入不炸,宽度是 1 条 lane 的最小值(`maxLane` 初值 0)。

@@ -32,7 +32,8 @@ use crate::{
     ClosePane, FocusDown, FocusLeft, FocusRight, FocusUp, GlobalSearch, JumpAttention, MarkerNext,
     MarkerPrev, NewTerminal, NextPane, OpenTerminalSettings, PrevPane, RenamePane, SelectPane,
     SplitDown, SplitRight, SwitchProject, TerminalSearch, ToggleCommandLibrary, ToggleMiddleColumn,
-    ToggleSessions, ToggleUsage, command_library, git_changes, project_switcher,
+    ToggleSessions, ToggleUsage, command_library, git_changes, git_file_history, git_history,
+    project_switcher,
 };
 
 /// 应用级动作的 key context(与 `Workspace::render` 的 `key_context` 一致)。
@@ -463,6 +464,64 @@ pub fn bind_keys(cx: &mut App) {
         "cmd-enter",
         git_changes::GitCommitMessage,
         Some("GitChanges > Input"),
+    ));
+
+    // Git 提交历史(焦点在历史区时)。**不进快捷键表** —— 面板内部键位,同上。
+    // `GitHistory` 比 `Workspace` 深,Ctrl+F 在历史区里归过滤框、出了历史区照旧是
+    // 终端查找;过滤框自己的 ↑/↓/Enter/Ctrl+C 绑在更深的 `Input` 上,先轮到它。
+    // Esc 要与 `Input` 同深度才压得过输入框自带的那条(理由同项目切换器)。
+    bindings.push(KeyBinding::new(
+        "up",
+        git_history::GitLogSelectPrev,
+        Some("GitHistory"),
+    ));
+    bindings.push(KeyBinding::new(
+        "down",
+        git_history::GitLogSelectNext,
+        Some("GitHistory"),
+    ));
+    bindings.push(KeyBinding::new(
+        "enter",
+        git_history::GitLogOpenSelected,
+        Some("GitHistory"),
+    ));
+    for keystroke in ["ctrl-c", "cmd-c"] {
+        bindings.push(KeyBinding::new(
+            keystroke,
+            git_history::GitLogCopyHash,
+            Some("GitHistory"),
+        ));
+    }
+    for keystroke in ["ctrl-f", "cmd-f"] {
+        bindings.push(KeyBinding::new(
+            keystroke,
+            git_history::GitLogFocusFilter,
+            Some("GitHistory"),
+        ));
+    }
+    bindings.push(KeyBinding::new(
+        "escape",
+        git_history::GitLogClearFilter,
+        Some("GitHistory > Input"),
+    ));
+    // 「修改提交消息」多行框里回车是换行,Ctrl/Cmd+Enter 才是确认
+    for keystroke in ["ctrl-enter", "cmd-enter"] {
+        bindings.push(KeyBinding::new(
+            keystroke,
+            git_history::GitLogRewordConfirm,
+            Some("GitLogReword > Input"),
+        ));
+    }
+    // 单文件历史弹窗:↑/↓ 换提交
+    bindings.push(KeyBinding::new(
+        "up",
+        git_file_history::FileHistoryPrev,
+        Some("GitFileHistory"),
+    ));
+    bindings.push(KeyBinding::new(
+        "down",
+        git_file_history::FileHistoryNext,
+        Some("GitFileHistory"),
     ));
 
     // 终端里的裸 Tab / Shift+Tab 必须归终端(shell 补全、Claude 的 Tab 切模式全靠它)。
