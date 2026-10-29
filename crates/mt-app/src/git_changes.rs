@@ -1258,30 +1258,42 @@ impl GitChanges {
     }
 
     /// 提交成功后的推送。失败时提交已经落地,要明确说「已提交,但推送失败」。
+    ///
+    /// 走与推送对话框同一条 `git_push_with`:新分支没有上游时顺带 `-u`(裸 `git push`
+    /// 在这种情况下直接失败),被拒时给出「先拉取」的说明。
     fn push_after_commit(&mut self, cx: &mut Context<Self>) {
+        use mt_project::git::{PushOptions, PushOutcome};
+
         self.pushing = true;
         let repo = PathBuf::from(&self.repo_path);
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { mt_project::git::git_push(&repo) })
+                .spawn(async move {
+                    mt_project::git::git_push_with(&repo, &PushOptions::default())
+                })
                 .await;
             let _ = this.update(cx, |this: &mut Self, cx| {
                 this.pushing = false;
-                match result {
-                    Ok(_) => {
-                        this.notify_info(t("gitCommit", "pushedToast").to_string(), cx);
+                let failure = match result {
+                    Ok(PushOutcome::Pushed(target)) => {
+                        let target = format!("{}/{}", target.remote, target.remote_branch);
+                        this.notify_info(tr!("gitCommit", "pushedToast", target = target), cx);
                         // 远程跟踪分支前移了:分支列表 / 历史的远程标记要跟上
                         cx.emit(GitChangesEvent::Committed);
+                        None
                     }
-                    Err(err) => {
-                        eprintln!("[git] 提交后推送失败: {err:#}");
-                        this.commit_error = Some(tr!(
-                            "gitCommit",
-                            "pushFailedAfterCommit",
-                            detail = format!("{err:#}")
-                        ));
-                    }
+                    Ok(PushOutcome::Rejected { detail }) => Some(format!(
+                        "{}\n{}",
+                        t("gitBranch", "rejectedHint"),
+                        detail.trim()
+                    )),
+                    Err(err) => Some(format!("{err:#}")),
+                };
+                if let Some(detail) = failure {
+                    eprintln!("[git] 提交后推送失败: {detail}");
+                    this.commit_error =
+                        Some(tr!("gitCommit", "pushFailedAfterCommit", detail = detail));
                 }
                 cx.notify();
             });
@@ -1308,6 +1320,21 @@ impl GitChanges {
     }
 
     /// 勾 / 取消「修改上次提交」。勾上时取 HEAD 的消息(输入框为空就预填)与「已推送」判定。
+    /// 历史区「撤销提交」后回填它的消息(IDEA 的 Undo Commit 口径)。用户已经在框里
+    /// 写了东西就不覆盖;Amend 勾着时先收起 —— 被撤销的那条已经不是 HEAD 了。
+    pub fn restore_message(&mut self, message: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.amend {
+            self.toggle_amend(window, cx);
+        }
+        if !self.commit_input.read(cx).value().trim().is_empty() {
+            return;
+        }
+        let message = message.trim_end().to_string();
+        self.commit_input
+            .update(cx, |state, cx| state.set_value(message, window, cx));
+        cx.notify();
+    }
+
     fn toggle_amend(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.has_head || self.committing {
             return;
@@ -2142,6 +2169,30 @@ impl GitChanges {
                         .into(),
                 );
             }
+        }
+        // 单文件历史(IDEA Show History)。未跟踪文件还没有历史,多选时没有「那一个文件」
+        if !many
+            && area != Area::Untracked
+            && let Some(file) = self.changes.get(index)
+        {
+            let (store, repo, rel) = (
+                self.store.clone(),
+                PathBuf::from(&self.repo_path),
+                file.path.clone(),
+            );
+            entries.push(menu::separator());
+            entries.push(menu::item(
+                t("gitLog", "fileHistory.menu"),
+                move |window, cx| {
+                    crate::git_file_history::open(
+                        store.clone(),
+                        repo.clone(),
+                        rel.clone(),
+                        window,
+                        cx,
+                    );
+                },
+            ));
         }
         entries
     }

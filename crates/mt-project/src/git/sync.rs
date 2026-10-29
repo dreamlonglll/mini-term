@@ -94,7 +94,8 @@ pub fn git_fetch_all(repo_path: &Path) -> Result<FetchOutcome> {
 /// 拉取方式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PullMode {
-    /// 合并(`--no-rebase`:压过用户 `pull.rebase=true` 的配置,按钮上写的是什么就做什么)。
+    /// 合并(`--no-rebase`:用户手选了合并就按合并做;没手选时面板按
+    /// [`PullMode::from_config`] 取默认,不会拿它压掉 `pull.rebase=true`)。
     #[default]
     Merge,
     /// 变基(`--rebase`)。
@@ -104,6 +105,33 @@ pub enum PullMode {
 }
 
 impl PullMode {
+    /// 用户 git 配置里的拉取方式:`pull.rebase=true/merges/interactive` → 变基,
+    /// `pull.ff=only` → 仅快进,其余合并。面板在用户本次会话没手选之前按它拉,
+    /// 不拿 `--no-rebase` 压掉别人配好的 `pull.rebase`。读不到配置按合并算。
+    pub fn from_config(repo_path: &Path) -> PullMode {
+        let Ok(config) = Repository::open(repo_path).and_then(|r| r.config()) else {
+            return PullMode::Merge;
+        };
+        let rebase = config
+            .get_string("pull.rebase")
+            .map(|v| v.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        if matches!(
+            rebase.as_str(),
+            "true" | "yes" | "on" | "1" | "merges" | "m" | "interactive" | "i"
+        ) {
+            return PullMode::Rebase;
+        }
+        let ff = config
+            .get_string("pull.ff")
+            .map(|v| v.trim().to_ascii_lowercase())
+            .unwrap_or_default();
+        if ff == "only" {
+            return PullMode::FfOnly;
+        }
+        PullMode::Merge
+    }
+
     fn args(self) -> &'static [&'static str] {
         match self {
             PullMode::Merge => &["pull", "--no-rebase", "--no-edit"],
@@ -405,6 +433,28 @@ mod tests {
         assert!(!push_was_rejected(hook));
         let ok = "To ../o.git\n \trefs/heads/main:refs/heads/main\t1a2b..3c4d\nDone\n";
         assert!(!push_was_rejected(ok));
+    }
+
+    /// 没手选拉取方式时跟随用户配置:rebase 用户不该被 `--no-rebase` 压成合并。
+    #[test]
+    fn 拉取方式跟随_git_配置() {
+        let root = init_repo_with_file("pull-mode", "a.txt", "a\n");
+        assert_eq!(PullMode::from_config(&root), PullMode::Merge);
+        let set = |key: &str, value: &str| {
+            Repository::open(&root)
+                .unwrap()
+                .config()
+                .unwrap()
+                .set_str(key, value)
+                .unwrap();
+        };
+        set("pull.ff", "only");
+        assert_eq!(PullMode::from_config(&root), PullMode::FfOnly);
+        set("pull.rebase", "true");
+        assert_eq!(PullMode::from_config(&root), PullMode::Rebase);
+        set("pull.rebase", "false");
+        assert_eq!(PullMode::from_config(&root), PullMode::FfOnly);
+        cleanup(&[&root]);
     }
 
     #[test]

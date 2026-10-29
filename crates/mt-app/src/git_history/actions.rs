@@ -636,14 +636,19 @@ impl GitHistoryContent {
         cx: &mut Context<Self>,
     ) {
         let (hash, short) = (commit.hash.clone(), commit.short_hash.clone());
+        let message = match commit.body.as_deref().map(str::trim_end) {
+            Some(body) if !body.trim().is_empty() => format!("{}\n\n{body}", commit.message),
+            _ => commit.message.clone(),
+        };
         let run = move |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
-            let (op_hash, short) = (hash.clone(), short.clone());
+            let (op_hash, short, message) = (hash.clone(), short.clone(), message.clone());
             this.run_op(
                 "action.undo",
                 move |repo| git::undo_last_commit(repo, &op_hash),
                 move |this, parent, window, cx| {
                     this.toast_info(tr!("gitLog", "toast.undone", hash = short), cx);
                     this.select_after(parent, window, cx);
+                    cx.emit(GitHistoryEvent::CommitUndone { message });
                 },
                 window,
                 cx,

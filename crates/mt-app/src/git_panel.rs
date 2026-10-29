@@ -96,8 +96,9 @@ thread_local! {
     static REPO_CACHE: RefCell<HashMap<String, (Vec<GitRepoInfo>, String)>> =
         RefCell::new(HashMap::new());
 
-    /// 拉取方式(仓库栏「拉取」右键菜单里选)。会话级、**不落盘**,左键按它拉。
-    static PULL_MODE: Cell<PullMode> = const { Cell::new(PullMode::Merge) };
+    /// 拉取方式(仓库栏「拉取」右键菜单里选)。会话级、**不落盘**,左键按它拉;
+    /// `None` = 本次会话还没手选,跟随仓库的 git 配置([`RepoMeta::pull_default`])。
+    static PULL_MODE: Cell<Option<PullMode>> = const { Cell::new(None) };
 }
 
 /// 区块比例的钳位(`GitHistory.tsx:17`)。
@@ -178,6 +179,8 @@ struct RepoMeta {
     op: RepoOpState,
     /// 读这份快照时的仓库签名 —— `.git` 监听的「没变就不刷」拿它比。
     signature: Option<RepoSignature>,
+    /// 仓库 git 配置里的拉取方式(`pull.rebase` / `pull.ff`),没手选时按它拉。
+    pull_default: PullMode,
 }
 
 /// 后台读一份分支快照。只读;除分支列表外,单项查询失败不拖垮整份。
@@ -192,6 +195,7 @@ fn load_branch_snapshot(repo: &Path) -> anyhow::Result<(Vec<BranchInfo>, RepoMet
         remotes: g::list_remotes(repo).unwrap_or_default(),
         op: g::repo_operation_state(repo).unwrap_or_default(),
         signature: g::repo_signature(repo).ok(),
+        pull_default: PullMode::from_config(repo),
     };
     Ok((branches, meta))
 }
@@ -273,8 +277,10 @@ impl GitPanel {
                 }
             }
         }));
-        subs.push(cx.subscribe(&history, |this: &mut Self, _entity, event, cx| {
-            match event {
+        subs.push(cx.subscribe_in(
+            &history,
+            window,
+            |this: &mut Self, _entity, event, window, cx| match event {
                 GitHistoryEvent::RefreshRepos => this.refresh_repo_meta(cx),
                 // 历史区的改写操作(检出 / 重置 / 拣选…)动了 HEAD、分支或工作区:
                 // 分支徽章与「更改」列表都要重取(历史区自己已重载)
@@ -282,8 +288,12 @@ impl GitPanel {
                     this.refresh_repo_meta(cx);
                     this.changes.update(cx, |c, cx| c.load(cx));
                 }
-            }
-        }));
+                GitHistoryEvent::CommitUndone { message } => {
+                    this.changes
+                        .update(cx, |c, cx| c.restore_message(message, window, cx));
+                }
+            },
+        ));
         // render 读活动项目(空态 / 远程)与更改视图模式,任何变化都照旧重画
         subs.push(cx.observe(&store, |_, _, cx| cx.notify()));
         // 项目路径的比对只在活动项目可能变了时做(`StoreEvent::touches_active_project`),
@@ -700,9 +710,16 @@ impl GitPanel {
         );
     }
 
+    /// 当前拉取方式:本次会话手选过的优先,否则跟随仓库 git 配置。
+    fn pull_mode(&self) -> PullMode {
+        PULL_MODE
+            .with(Cell::get)
+            .unwrap_or(self.meta.pull_default)
+    }
+
     /// 按当前拉取方式拉取。
     fn pull(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let mode = PULL_MODE.with(Cell::get);
+        let mode = self.pull_mode();
         self.run_write_op(
             GitBusy::Pull,
             move |repo| mt_project::git::git_pull_with(repo, mode),
@@ -1426,7 +1443,7 @@ impl GitPanel {
         let head = self.head_branch().map(str::to_string);
         let detached = self.current_branch().is_some_and(is_detached_label);
         let upstream = self.meta.head_tracking.as_ref().map(|t| t.upstream.clone());
-        let mode = PULL_MODE.with(Cell::get);
+        let mode = self.pull_mode();
         let busy_tip =
             |op: GitBusy| -> SharedString { tr!("gitBranch", "busyTip", op = op.label()).into() };
 
@@ -1531,7 +1548,7 @@ impl GitPanel {
 
     /// 拉取方式菜单。当前选中的打勾;选了只改方式,不立刻拉。
     fn pull_mode_menu(&self, _cx: &mut Context<Self>) -> Vec<menu::MenuEntry> {
-        let current = PULL_MODE.with(Cell::get);
+        let current = self.pull_mode();
         let mut entries = vec![menu::MenuEntry::Header(
             t("gitBranch", "pullModeHeader").into(),
         )];
@@ -1543,7 +1560,7 @@ impl GitPanel {
             let prefix = if mode == current { "✓ " } else { "　" };
             entries.push(
                 MenuItem::new(format!("{prefix}{}", t("gitBranch", key)))
-                    .on_click(move |_window, _cx| PULL_MODE.with(|m| m.set(mode)))
+                    .on_click(move |_window, _cx| PULL_MODE.with(|m| m.set(Some(mode))))
                     .into(),
             );
         }

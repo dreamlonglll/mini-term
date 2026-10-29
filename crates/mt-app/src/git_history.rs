@@ -107,6 +107,9 @@ pub enum GitHistoryEvent {
     /// 右键菜单里的改写操作动了仓库(HEAD / 分支 / 标签 / 暂存区 / 工作区):容器要
     /// 重载仓库与分支,并让「更改」区重取。历史区自己已经重载过了。
     RepoChanged,
+    /// 撤销了最近一次提交:它的完整消息交给提交框回填(IDEA 的 Undo Commit 口径),
+    /// 改完直接再提交即可。
+    CommitUndone { message: String },
 }
 
 /// 过滤栏的状态。
