@@ -71,6 +71,8 @@
 //! | [`mermaid`] | Mermaid 图表后台渲染与资源释放 |
 //! | [`images`] | 查看器图片资源、进程级持有账本、看图页签换代去抖 |
 //! | [`http`] | 预览用的进程级 HTTP 客户端 [`PreviewHttpClient`] |
+//! | [`git_gutter`] | 源码态的 Git 变更标记(gutter 竖条)、变更小窗、上一处 / 下一处变更 |
+//! | [`git_blame`] | 源码态的 Git 注解列(blame):作者 · 日期、按新旧着色、悬停详情 |
 //!
 //! 各纯逻辑模块的单测在同目录的 `*_tests.rs`,视图层的在 `tests.rs`。
 
@@ -89,7 +91,7 @@ use gpui::{
     prelude::FluentBuilder as _, px,
 };
 use gpui_component::WindowExt as _;
-use gpui_component::input::{Editor, EditorState, InputEvent, Position, Search, TabSize};
+use gpui_component::input::{EditorState, Escape, InputEvent, Position, Search, TabSize};
 use mt_project::fs::FileContentResult;
 use mt_project::watch::{FsWatcher, WATCH_READY_BUDGET, WatchReady};
 use mt_ui::icons::FileIcon;
@@ -102,6 +104,8 @@ use crate::ui;
 
 mod document;
 mod file_kind;
+mod git_blame;
+mod git_gutter;
 mod html_urls;
 mod http;
 mod images;
@@ -117,6 +121,7 @@ mod webview;
 #[cfg_attr(not(test), allow(unused_imports))]
 pub use document::{LineEnding, normalize_to_lf, restore_line_ending};
 pub use file_kind::language_for;
+pub use git_gutter::git_change_key_bindings;
 pub use http::PreviewHttpClient;
 pub use sanitize::sanitize_session_markdown;
 
@@ -128,6 +133,8 @@ use file_kind::{
     file_name_of, is_html_file, is_image_file, is_markdown_file, is_pdf_file, same_path,
     should_wrap,
 };
+use git_blame::Annotations;
+use git_gutter::{GitGutter, GitNextChange, GitPrevChange};
 use images::{
     IMAGE_RELOAD_DEBOUNCE, ReloadDebounce, ViewerImage, ViewerImageHolds, evict_viewer_image,
     local_image_resource, release_viewer_images,
@@ -248,6 +255,24 @@ fn editor_text(editor: Option<&Entity<EditorState>>, cx: &App) -> Option<String>
     editor.map(|editor| editor.read(cx).value().to_string())
 }
 
+/// 源码编辑器的字族(排版口径见 [`FileViewer::render_content`] 编辑器分支的注释):
+/// 用户配过界面字体就跟它,否则 Win11 自带的 Cascadia Code。Git 注解列、变更小窗
+/// 与编辑器同一套,对得齐。
+fn editor_font_family() -> gpui::SharedString {
+    ui::ui_font_family().unwrap_or_else(|| "Cascadia Code".into())
+}
+
+/// 编辑器字族的回退链(含 CJK / emoji 兜底,文件里的中文注释靠它)。
+fn editor_font_fallbacks() -> gpui::FontFallbacks {
+    gpui::FontFallbacks::from_fonts(vec![
+        "Cascadia Mono".into(),
+        "Consolas".into(),
+        "JetBrains Mono".into(),
+        "Microsoft YaHei".into(),
+        "Segoe UI Emoji".into(),
+    ])
+}
+
 /// 工具栏上的描边小按钮(「用浏览器打开」「使用默认工具打开」),点击由调用方挂。
 fn toolbar_outline_button(id: &'static str, label: &'static str) -> gpui::Stateful<gpui::Div> {
     div()
@@ -345,6 +370,11 @@ pub struct FileViewer {
     focus: FocusHandle,
     _fs_task: Task<()>,
     _editor_sub: Option<Subscription>,
+
+    /// 源码态的 Git 变更标记与变更小窗(见 [`git_gutter`])。
+    gutter: GitGutter,
+    /// 源码态的 Git 注解列(见 [`git_blame`])。
+    annotate: Annotations,
 }
 
 impl FileViewer {
@@ -419,6 +449,8 @@ impl FileViewer {
             focus: cx.focus_handle(),
             _fs_task: fs_task,
             _editor_sub: None,
+            gutter: GitGutter::default(),
+            annotate: Annotations::default(),
         };
         // 页签关掉时把要过的 mermaid 图表与图片从进程级缓存与图集里放掉(理由见
         // 字段注释;图片还有别的页签在用的,由账本留着)
@@ -489,6 +521,7 @@ impl FileViewer {
         let watch_ready = self.rewatch();
         self.editor = None;
         self._editor_sub = None;
+        self.git_on_editor_dropped();
         cx.notify();
         let LoadStart::Read { generation } = start else {
             return;
@@ -670,16 +703,20 @@ impl FileViewer {
                     state
                 }
             });
-            // 每次编辑都要重算脏态(原版 `onDocChange` → `setDirty(doc !== savedRef)`)
+            // 每次编辑都要重算脏态(原版 `onDocChange` → `setDirty(doc !== savedRef)`);
+            // Git 变更标记随之去抖重算
             let sub = cx.subscribe(&editor, |this: &mut FileViewer, editor, event, cx| {
                 if matches!(event, InputEvent::Change) {
                     let value = editor.read(cx).value().to_string();
                     this.doc.on_edit(&value);
+                    this.git_on_buffer_changed(cx);
                     cx.notify();
                 }
             });
             self._editor_sub = Some(sub);
             self.editor = Some(editor.clone());
+            // 本地文档去取 HEAD 版本(标记 / 注解的基准)
+            self.git_on_editor_installed(cx);
 
             // 命中行定位(全局搜索点进来那条路)。`highlight_line` 是 **1-based**,
             // `Position` 是 0-based;越界直接不动(原版
@@ -696,6 +733,7 @@ impl FileViewer {
             // later refresh cannot reuse stale text behind the fallback view.
             self.editor = None;
             self._editor_sub = None;
+            self.git_on_editor_dropped();
         }
         // 原版编辑器每次都是带 `autoFocus` 重新挂载的(`preview` 态下才不抢焦点),
         // 这里在内容落位之后统一把焦点摆回该在的地方。工作区允许多个并发加载
@@ -765,6 +803,8 @@ impl FileViewer {
     /// 脏草稿只做连接身份检查，外部变化继续由保存前基线比较兜底。
     pub fn on_activated(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.validate_remote_source(cx);
+        // 本地文档:切回来时查一次 HEAD 指纹(别处提交 / 切过分支,标记与注解要跟上)
+        self.git_on_activated(cx);
         if self
             .doc
             .should_refresh_on_activation(self.source.is_remote(), self.is_media())
@@ -929,6 +969,7 @@ impl FileViewer {
                         if view.current_path != path || !view.doc.settle_save(generation) {
                             return;
                         }
+                        let saved = outcome.is_ok();
                         let editor = view.editor.as_ref();
                         view.doc.on_local_save_result(
                             text.clone(),
@@ -936,6 +977,11 @@ impl FileViewer {
                             Instant::now(),
                             || editor_text(editor, cx),
                         );
+                        if saved {
+                            // 保存成功:HEAD 缓存按指纹复核一次(外部工具可能已提交),
+                            // 注解按落盘内容校准
+                            view.git_on_saved(cx);
+                        }
                         cx.notify();
                     });
                 })
@@ -1225,6 +1271,8 @@ impl FileViewer {
                             )),
                         )
                     })
+                    // Git 注解开关:本地、源码态、文件在 HEAD 里才出现
+                    .children(self.render_annotate_toggle(cx))
                     // 开着时描边与字都染 accent,与「预览 / 源码」的选中态同一套颜色
                     .when(outline_toggle, |el| {
                         let open = preview::md_outline_visible(cx);
@@ -1303,6 +1351,8 @@ impl FileViewer {
             .flex()
             .flex_col()
             .flex_none()
+            // Git 注解没能显示(过大 / 失败)
+            .children(self.render_annotate_notice(cx))
             .when(self.doc.remote_source_invalid(), |el| {
                 el.child(
                     div()
@@ -1628,26 +1678,15 @@ impl FileViewer {
                         // uiFontFamily 时原版把 `--app-font-mono` 一并覆盖
                         // (fontManager.ts:8-18),这里同样让它优先。Input 与行号列
                         // 都吃 window.text_style(),包一层即全部生效。
+                        // 编辑器外面再包一层 Git 标记 / 注解(见 `git_gutter`)。
                         let mut wrap = div().size_full();
                         let ts = wrap.text_style();
-                        ts.font_family =
-                            Some(ui::ui_font_family().unwrap_or_else(|| "Cascadia Code".into()));
-                        ts.font_fallbacks = Some(gpui::FontFallbacks::from_fonts(vec![
-                            "Cascadia Mono".into(),
-                            "Consolas".into(),
-                            "JetBrains Mono".into(),
-                            "Microsoft YaHei".into(),
-                            "Segoe UI Emoji".into(),
-                        ]));
+                        ts.font_family = Some(editor_font_family());
+                        ts.font_fallbacks = Some(editor_font_fallbacks());
                         ts.font_size = Some(px(13.0).into());
                         ts.line_height = Some(gpui::relative(1.6));
-                        wrap.child(
-                            Editor::new(editor)
-                                .h_full()
-                                .appearance(false)
-                                .bordered(false),
-                        )
-                        .into_any_element()
+                        wrap.child(self.render_code_editor(editor, window, cx))
+                            .into_any_element()
                     }
                     None => div().into_any_element(),
                 }
@@ -1697,7 +1736,26 @@ impl Render for FileViewer {
                 if ks.key == "s" && mods.secondary() && !mods.shift && !mods.alt {
                     cx.stop_propagation();
                     this.save(cx);
+                    return;
                 }
+                // 焦点不在编辑器里(点过注解列 / 工具栏)时的 Esc:关 Git 变更小窗
+                if ks.key == "escape" && this.close_change_popup(cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            // 焦点在编辑器里时 Esc 是编辑器自己的 action(`Escape`),key 监听收不到:
+            // 在捕获阶段先截一道,开着变更小窗就只关小窗,否则照常交给编辑器
+            .capture_action(cx.listener(|this, _: &Escape, _window, cx| {
+                if this.close_change_popup(cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            // 上一处 / 下一处 Git 变更(Ctrl+Alt+Shift+↑/↓,绑定见 `git_change_key_bindings`)
+            .on_action(cx.listener(|this, _: &GitNextChange, window, cx| {
+                this.goto_change(true, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &GitPrevChange, window, cx| {
+                this.goto_change(false, window, cx);
             }))
             .child(self.render_toolbar(cx))
             .child(self.render_banners(cx))
@@ -1711,6 +1769,9 @@ impl Render for FileViewer {
             // 图片放大浮层:实体自己 `deferred` 到整窗之上,挂在哪一层都一样;
             // 挂根上是为了不随预览列表的行一起被回收
             .when_some(self.lightbox.clone(), |el, lightbox| el.child(lightbox))
+            // Git 变更小窗与注解悬停详情:同样 `deferred` 到整窗之上
+            .children(self.render_change_popup(cx))
+            .children(self.render_blame_tooltip())
     }
 }
 

@@ -124,15 +124,16 @@ use mt_i18n::{
 /// 934 → 939：设置页新增「环境变量」页（全局终端环境变量），侧栏项
 /// `settings.menu.envVars` 与页内四条（`settings.envVars.{section,addVar,hint,hasErrors}`）；
 /// 表格本身复用项目环境变量弹窗的 `envVars.*`。
-/// 939 → 1315（33 → 36 个命名空间）：Git 面板对标 IDEA 新增三个命名空间 ——
+/// 939 → 1334（33 → 37 个命名空间）：Git 对标 IDEA 新增四个命名空间 ——
 /// `gitCommit` 73 条（diff 弹窗的按块暂存 / 取消暂存 / 丢弃与前后换文件，更改列表的
 /// 冲突分组 / 多选批量操作 / 只丢未暂存的丢弃，提交区的 Amend / 消息历史 / 提交并推送 /
 /// 消息软提示）、`gitBranch` 157 条（分支弹窗的搜索 / 分组 / 动作菜单、新建与重命名
 /// 弹窗的就地校验、推送对话框、Fetch / 拉取方式 / 推送的 tooltip 与结果摘要、
-/// 进行中操作横幅、各类确认框与失败详情框）与 `gitLog` 146 条（提交历史的右键操作 /
-/// 过滤栏 / 提交详情 / 标签 / 单文件历史）。
-const EXPECTED_NAMESPACES: usize = 36;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1315;
+/// 进行中操作横幅、各类确认框与失败详情框）、`gitLog` 146 条（提交历史的右键操作 /
+/// 过滤栏 / 提交详情 / 标签 / 单文件历史）与 `gitGutter` 19 条（文件查看器的变更标记
+/// 小窗与注解列）。
+const EXPECTED_NAMESPACES: usize = 37;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1334;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。
@@ -148,6 +149,7 @@ const TS_NAMESPACES: &[&str] = &[
     "gitBranch",
     "gitChanges",
     "gitCommit",
+    "gitGutter",
     "gitHistory",
     "gitHistoryContent",
     "gitLog",

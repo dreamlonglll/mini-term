@@ -366,6 +366,12 @@ impl<R: RemoteContent> DocumentSession<R> {
         editor_text.unwrap_or_else(|| self.saved.clone())
     }
 
+    /// 编辑器文本 → 落盘形态:先还原 Tab、再还原行尾(与读入时相反的顺序,见
+    /// `file_viewer` 模块注释)。只算不写,保存与 Git 注解(`blame --contents`)共用。
+    pub(super) fn to_disk_form(&self, text: &str) -> String {
+        restore_line_ending(&self.tabs.restore(text), self.line_ending)
+    }
+
     // ── 载入 ───────────────────────────────────────────────
 
     /// 发起一次(重新)载入。`None` = 保存还在进行中,这次不载。
@@ -577,9 +583,7 @@ impl<R: RemoteContent> DocumentSession<R> {
         self.remote_conflict = None;
         Some(SaveStart {
             generation: self.load_generation,
-            // 写回磁盘前先还原 Tab、再还原行尾(与读入时相反的顺序,见 `file_viewer`
-            // 模块注释)
-            on_disk: restore_line_ending(&self.tabs.restore(text), self.line_ending),
+            on_disk: self.to_disk_form(text),
         })
     }
 

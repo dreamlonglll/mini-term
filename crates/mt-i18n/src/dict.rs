@@ -10,11 +10,11 @@
 use crate::Namespace;
 
 /// 命名空间总数（生成器对账用，测试断言防漂移）
-pub const NAMESPACE_COUNT: usize = 36;
+pub const NAMESPACE_COUNT: usize = 37;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1315;
+pub const ZH_ENTRY_COUNT: usize = 1334;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1315;
+pub const EN_ENTRY_COUNT: usize = 1334;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -1095,6 +1095,51 @@ static GIT_COMMIT_EN: &[(&str, &str)] = &[
     ("unstageAll", "Unstage all"),
     ("unstageHunk", "Unstage hunk"),
     ("unstageSelected", "Unstage {count} selected files"),
+];
+
+#[rustfmt::skip]
+static GIT_GUTTER_ZH: &[(&str, &str)] = &[
+    ("annotate", "注解"),
+    ("annotateFailed", "注解载入失败"),
+    ("annotateTooLarge", "文件超过 {count} 行，未显示注解"),
+    ("changeAdded", "新增 {count} 行"),
+    ("changeDeleted", "删除 {count} 行"),
+    ("changeModified", "修改 {count} 行"),
+    ("copied", "已复制"),
+    ("copyOriginal", "复制原内容"),
+    ("dismiss", "关闭"),
+    ("hideAnnotations", "隐藏 Git 注解"),
+    ("nextChange", "下一处变更"),
+    ("openCommitFailed", "打开提交失败"),
+    ("openCommitHint", "点击查看该提交的完整改动"),
+    ("prevChange", "上一处变更"),
+    ("rollback", "回滚此处改动"),
+    ("showAnnotations", "显示 Git 注解：逐行标出最后改动它的提交"),
+    ("showDiff", "查看完整 diff"),
+    ("uncommitted", "未提交"),
+    ("uncommittedTip", "尚未提交的改动"),
+];
+#[rustfmt::skip]
+static GIT_GUTTER_EN: &[(&str, &str)] = &[
+    ("annotate", "Annotate"),
+    ("annotateFailed", "Failed to load annotations"),
+    ("annotateTooLarge", "File has more than {count} lines; annotations not shown"),
+    ("changeAdded", "{count} lines added"),
+    ("changeDeleted", "{count} lines deleted"),
+    ("changeModified", "{count} lines modified"),
+    ("copied", "Copied"),
+    ("copyOriginal", "Copy original"),
+    ("dismiss", "Dismiss"),
+    ("hideAnnotations", "Hide Git annotations"),
+    ("nextChange", "Next change"),
+    ("openCommitFailed", "Failed to open commit"),
+    ("openCommitHint", "Click to view the full changes of this commit"),
+    ("prevChange", "Previous change"),
+    ("rollback", "Roll back this change"),
+    ("showAnnotations", "Show Git annotations: the commit that last changed each line"),
+    ("showDiff", "Show full diff"),
+    ("uncommitted", "Uncommitted"),
+    ("uncommittedTip", "Changes not committed yet"),
 ];
 
 #[rustfmt::skip]
@@ -2954,6 +2999,11 @@ pub static NAMESPACES: &[Namespace] = &[
         name: "gitCommit",
         zh: GIT_COMMIT_ZH,
         en: GIT_COMMIT_EN,
+    },
+    Namespace {
+        name: "gitGutter",
+        zh: GIT_GUTTER_ZH,
+        en: GIT_GUTTER_EN,
     },
     Namespace {
         name: "gitHistory",
