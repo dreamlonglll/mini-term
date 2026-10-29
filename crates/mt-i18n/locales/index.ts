@@ -17,6 +17,7 @@ import { terminalArea } from './terminalArea';
 import { gitHistory } from './gitHistory';
 import { gitHistoryContent } from './gitHistoryContent';
 import { gitChanges } from './gitChanges';
+import { gitBranch } from './gitBranch';
 import { gitCommit } from './gitCommit';
 import { worktree } from './worktree';
 import { search } from './search';
@@ -56,6 +57,7 @@ export const dicts: { zh: Dict; en: Dict } = {
     gitHistory: gitHistory.zh,
     gitHistoryContent: gitHistoryContent.zh,
     gitChanges: gitChanges.zh,
+    gitBranch: gitBranch.zh,
     gitCommit: gitCommit.zh,
     worktree: worktree.zh,
     search: search.zh,
@@ -92,6 +94,7 @@ export const dicts: { zh: Dict; en: Dict } = {
     gitHistory: gitHistory.en,
     gitHistoryContent: gitHistoryContent.en,
     gitChanges: gitChanges.en,
+    gitBranch: gitBranch.en,
     gitCommit: gitCommit.en,
     worktree: worktree.en,
     search: search.en,

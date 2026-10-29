@@ -1515,6 +1515,22 @@ fn run_git_output(
     timeout: Duration,
     timeout_hint: &str,
 ) -> Result<GitOutput> {
+    run_git_output_env(repo_path, args, &[], op_label, timeout, timeout_hint)
+}
+
+/// 同 [`run_git_output`],另给子进程补几条环境变量。
+///
+/// 给 `rebase --continue` / `cherry-pick --continue` 这类**会拉起编辑器**的续跑用:
+/// 传 `GIT_EDITOR=true` 让它直接沿用现成的提交信息。不用 `-c core.editor=true` ——
+/// 用户环境里设了 `GIT_EDITOR` 时它压过 `core.editor`,编辑器照样被拉起来。
+fn run_git_output_env(
+    repo_path: &Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+    op_label: &str,
+    timeout: Duration,
+    timeout_hint: &str,
+) -> Result<GitOutput> {
     if !repo_path.is_dir() {
         bail!("不是有效目录:{}", repo_path.display());
     }
@@ -1522,7 +1538,7 @@ fn run_git_output(
     if !repo_path.join(".git").exists() {
         bail!("不是 git 仓库(缺少 .git):{}", repo_path.display());
     }
-    spawn_git(repo_path, args, op_label, timeout, timeout_hint)
+    spawn_git(repo_path, args, envs, op_label, timeout, timeout_hint)
 }
 
 /// 一次 git CLI 调用的结果。
@@ -1540,6 +1556,7 @@ const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(2);
 fn spawn_git(
     repo_path: &Path,
     args: &[&str],
+    envs: &[(&str, &str)],
     op_label: &str,
     timeout: Duration,
     timeout_hint: &str,
@@ -1551,6 +1568,7 @@ fn spawn_git(
     cmd.args(args)
         .current_dir(repo_path)
         .env("GIT_TERMINAL_PROMPT", "0")
+        .envs(envs.iter().copied())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1947,12 +1965,18 @@ pub fn get_worktree_branches(paths: &[PathBuf]) -> Vec<Option<String>> {
         .collect()
 }
 
+mod branch;
 mod commit;
 mod conflict;
 mod hunk;
+mod repo_state;
+mod sync;
+pub use branch::*;
 pub use commit::*;
 pub use conflict::*;
 pub use hunk::*;
+pub use repo_state::*;
+pub use sync::*;
 
 #[cfg(test)]
 mod test_support;

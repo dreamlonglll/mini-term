@@ -1,11 +1,12 @@
 //! Git 面板容器。对应 `src/components/GitHistory.tsx`(548 行)。
 //!
 //! ```text
-//! ① 仓库栏(repos 非空时才画)h34
-//!    ├ 仓库下拉触发器(▾ + 名称 + ⎇)   右键 = 「在终端中打开」/「Worktree 管理」
-//!    ├ 分支徽章 + 分支下拉(displayBranch 存在时)
-//!    ├ 刷新 ↻ / pull ↓ / push ↑
-//! ② SectionHeader「更改」  h30   右侧挂 视图切换 ⊞/≡
+//! ① 仓库栏(repos 非空时才画)h36
+//!    ├ 左段:仓库图标 + 名称 ▾          右键 = 「在终端中打开」/「Worktree 管理」
+//!    │       分支图标 + 分支胶囊 + ↑n / ↓m 计数胶囊   点开 = 分支弹窗(git_branches)
+//!    └ 右段:Fetch / 拉取(右键选方式)/ 推送(开推送对话框)/ 刷新
+//! ①' 进行中操作横幅(合并 / 变基 / 拣选 / 还原时才画)h36
+//! ② SectionHeader「更改」  h30   右侧挂 视图切换(树 / 列表)
 //! ③ GitChanges           .git-section-body
 //! ④ 中缝拖拽手柄(两块都展开时)
 //! ⑤ SectionHeader「提交历史」h30(带上边框)
@@ -21,32 +22,55 @@
 //!
 //! `sectionUi`(两块的展开态与比例)是**模块级、不落盘**的临时视图状态
 //! (`GitHistory.tsx:13-15` 原注释)。GPUI 侧对应 [`SECTION_UI`] 这个 `thread_local`,
-//! 与 `overlay.rs` / `ui.rs` 的先例同一形态。
+//! 与 `overlay.rs` / `ui.rs` 的先例同一形态。拉取方式([`PULL_MODE`])同理。
 //!
 //! # 可见性闸
 //!
 //! [`GitPanel::set_visible`] 收起时**不跑 `discover_git_repos`**(它要扫盘,
-//! 大 monorepo 上是秒级);同时开关 [`git_watch`] 的输出旁路总闸。
+//! 大 monorepo 上是秒级);同时开关 [`git_watch`] 的输出旁路总闸与 `.git` 目录监听。
 //! 范式照 `SessionPanel::set_visible`。
+//!
+//! # 写操作(分支 / 同步)
+//!
+//! Fetch / 拉取 / 推送 / 检出 / 合并 / 变基 / 删除…统一走 [`GitPanel::run_write_op`]:
+//! **同一时刻只跑一个**([`GitBusy`],git 自己也靠 `index.lock` 互斥),进行中的那颗
+//! 按钮转圈、其余禁用;成功推一条**带结果的摘要** toast(「已检出 feature/x」「拉取了
+//! 5 个提交」),失败弹可选中复制原文的详情框([`git_ui::show_git_error`] —— toast
+//! 5s 就收,装不下 git 的多行报错);完了一律整面板刷新。
+//!
+//! # 自动刷新
+//!
+//! 两路:原有的 pty 输出旁路([`git_watch`]),外加 `.git` 目录监听
+//! ([`crate::git_dir_watch`]):AI agent 在终端里提交、外部工具切分支后面板自己跟上。
+//! 目录监听去抖之后先在后台算 [`RepoSignature`],**没变就不刷**(防别的程序只刷新
+//! 索引 stat 缓存时白刷一遍);只变了索引就只重取「更改」区与冲突数,引用变了才连
+//! 分支、计数、提交历史一起刷。
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use gpui::{
-    AnyElement, App, AppContext as _, Bounds, ClickEvent, Context, Entity, InteractiveElement,
-    IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
-    Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Task, Window, canvas,
-    div, prelude::FluentBuilder as _, px,
+    AnyElement, App, AppContext as _, Bounds, ClickEvent, Context, Entity, FontWeight,
+    InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ParentElement, Pixels, Render, SharedString, StatefulInteractiveElement, Styled, Subscription,
+    Task, Window, canvas, div, prelude::FluentBuilder as _, px,
 };
-use mt_project::git::{BranchInfo, GitRepoInfo};
+use mt_project::git::{
+    BranchInfo, BranchTracking, GitRepoInfo, PullMode, PullOutcome, RepoOpKind, RepoOpState,
+    RepoSignature,
+};
 use mt_ui::tooltip::TooltipExt as _;
 
 use crate::git_changes::{GitChanges, GitChangesEvent};
+use crate::git_dir_watch::GitDirWatch;
 use crate::git_history::{GitHistoryContent, GitHistoryEvent};
+use crate::git_ui::{self, Tone};
 use crate::git_watch;
-use crate::i18n::t;
+use crate::i18n::{t, tr};
 use crate::menu::{self, MenuItem};
+use crate::prompt::Confirm;
 use crate::store::{AppStore, StoreEvent};
 use crate::ui;
 
@@ -71,6 +95,9 @@ thread_local! {
     /// 换项目回来时先吃缓存再重新发现,避免每次都白屏一下。
     static REPO_CACHE: RefCell<HashMap<String, (Vec<GitRepoInfo>, String)>> =
         RefCell::new(HashMap::new());
+
+    /// 拉取方式(仓库栏「拉取」右键菜单里选)。会话级、**不落盘**,左键按它拉。
+    static PULL_MODE: Cell<PullMode> = const { Cell::new(PullMode::Merge) };
 }
 
 /// 区块比例的钳位(`GitHistory.tsx:17`)。
@@ -78,12 +105,111 @@ pub fn clamp_ratio(r: f32) -> f32 {
     r.clamp(0.15, 0.85)
 }
 
-/// pull / push 的一次性状态(`GitHistory.tsx:19`)。
-#[derive(Clone, PartialEq)]
-enum SyncState {
-    Loading,
-    Success,
-    Error(String),
+/// 仓库栏 / 横幅的高度。两块内容区的可分配高度要扣掉它们。
+const BAR_HEIGHT: f32 = 36.0;
+/// 「最近」分组最多几条。
+const RECENT_LIMIT: usize = 5;
+
+/// 正在跑的写操作。同一时刻只跑一个 —— git 自己也靠 `index.lock` 互斥,并发点两下
+/// 只会让第二个报「另一个 git 进程正在运行」。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GitBusy {
+    Fetch,
+    Pull,
+    Push,
+    Checkout,
+    Create,
+    Rename,
+    Delete,
+    Merge,
+    Rebase,
+    Continue,
+    Abort,
+}
+
+impl GitBusy {
+    /// 动作名(失败弹窗标题「{动作}失败」、按钮提示「{动作}中…」)。
+    pub(crate) fn label(self) -> &'static str {
+        t(
+            "gitBranch",
+            match self {
+                GitBusy::Fetch => "opFetch",
+                GitBusy::Pull => "opPull",
+                GitBusy::Push => "opPush",
+                GitBusy::Checkout => "opCheckout",
+                GitBusy::Create => "opCreate",
+                GitBusy::Rename => "opRename",
+                GitBusy::Delete => "opDelete",
+                GitBusy::Merge => "opMerge",
+                GitBusy::Rebase => "opRebase",
+                GitBusy::Continue => "opContinue",
+                GitBusy::Abort => "opAbort",
+            },
+        )
+    }
+
+    /// 改分支 / HEAD 的那几种:进行中时分支徽章旁转圈。
+    fn touches_branch(self) -> bool {
+        matches!(
+            self,
+            GitBusy::Checkout
+                | GitBusy::Create
+                | GitBusy::Rename
+                | GitBusy::Delete
+                | GitBusy::Merge
+                | GitBusy::Rebase
+        )
+    }
+}
+
+/// 随分支列表一起在后台读的仓库元数据。
+#[derive(Clone, Default)]
+struct RepoMeta {
+    /// HEAD 的显示名(分支名;detached 是 `"(1a2b3c4)"`)。比仓库列表里那份新 ——
+    /// 那份要等下一次重新发现仓库才更新。
+    head_label: Option<String>,
+    /// HEAD 分支相对上游的领先 / 落后。
+    head_tracking: Option<BranchTracking>,
+    /// 全部本地分支的领先 / 落后(分支弹窗逐行用)。
+    tracking: Vec<BranchTracking>,
+    recent: Vec<String>,
+    remotes: Vec<String>,
+    /// 进行中的合并 / 变基…(横幅)。
+    op: RepoOpState,
+    /// 读这份快照时的仓库签名 —— `.git` 监听的「没变就不刷」拿它比。
+    signature: Option<RepoSignature>,
+}
+
+/// 后台读一份分支快照。只读;除分支列表外,单项查询失败不拖垮整份。
+fn load_branch_snapshot(repo: &Path) -> anyhow::Result<(Vec<BranchInfo>, RepoMeta)> {
+    use mt_project::git as g;
+    let branches = g::get_repo_branches(repo)?;
+    let meta = RepoMeta {
+        head_label: g::current_head_label(repo).ok().flatten(),
+        head_tracking: g::ahead_behind(repo).ok().flatten(),
+        tracking: g::local_branch_tracking(repo).unwrap_or_default(),
+        recent: g::recent_branches(repo, RECENT_LIMIT).unwrap_or_default(),
+        remotes: g::list_remotes(repo).unwrap_or_default(),
+        op: g::repo_operation_state(repo).unwrap_or_default(),
+        signature: g::repo_signature(repo).ok(),
+    };
+    Ok((branches, meta))
+}
+
+/// 分支弹窗要的一份快照(弹窗每帧从面板现取,数据始终与仓库栏一致)。
+#[derive(Clone)]
+pub(crate) struct BranchSnapshot {
+    pub repo: String,
+    pub branches: Vec<BranchInfo>,
+    pub tracking: Vec<BranchTracking>,
+    pub recent: Vec<String>,
+    pub remotes: Vec<String>,
+    /// HEAD 所在的本地分支;detached / 空仓库为 `None`。
+    pub head: Option<String>,
+    /// detached 时的显示名(`"(1a2b3c4)"`)。
+    pub detached: Option<String>,
+    pub loading: bool,
+    pub busy: Option<GitBusy>,
 }
 
 /// 中缝拖拽的一次会话。
@@ -105,8 +231,9 @@ pub struct GitPanel {
     branches_loading: bool,
     /// 正在查看(**未 checkout**)的分支;`None` = 跟随 HEAD。
     view_branch: Option<String>,
-    pull_state: Option<SyncState>,
-    push_state: Option<SyncState>,
+    meta: RepoMeta,
+    /// 正在跑的写操作(见模块注释「写操作」)。
+    busy: Option<GitBusy>,
     /// 抽屉里显示的是不是本面板。收着时不扫盘。
     visible: bool,
     /// 收着的时候项目切过 → 打开时补拉一次。
@@ -116,6 +243,14 @@ pub struct GitPanel {
     /// 迟到响应丢弃(换仓库后旧的分支响应不许覆盖)。
     branch_request: u64,
     repo_request: u64,
+    /// `.git` 目录监听(见模块注释「自动刷新」)。
+    dir_watch: GitDirWatch,
+    /// 换监听目标的请求令牌(后台列目录期间又换了仓库,旧结果丢弃)。
+    watch_request: u64,
+    /// 监听触发的签名检查正在后台跑。
+    sig_checking: bool,
+    /// 检查在跑期间又来了一批变化:等它回来再查一轮,别把这批漏掉。
+    sig_recheck: bool,
     /// 两块内容区加起来的高度,中缝拖拽换算比例要用。
     sections_height: f32,
     drag: Option<SectionDrag>,
@@ -175,13 +310,17 @@ impl GitPanel {
             branches: Vec::new(),
             branches_loading: false,
             view_branch: None,
-            pull_state: None,
-            push_state: None,
+            meta: RepoMeta::default(),
+            busy: None,
             visible: false,
             stale: true,
             project_path: None,
             branch_request: 0,
             repo_request: 0,
+            dir_watch: GitDirWatch::new(),
+            watch_request: 0,
+            sig_checking: false,
+            sig_recheck: false,
             sections_height: 0.0,
             drag: None,
             _tick: None,
@@ -189,7 +328,7 @@ impl GitPanel {
         }
     }
 
-    /// 抽屉开合 / 换面板。收着时不扫盘、不嗅探 pty 输出。
+    /// 抽屉开合 / 换面板。收着时不扫盘、不嗅探 pty 输出、不盯 `.git`。
     pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
         if self.visible == visible {
             return;
@@ -205,11 +344,14 @@ impl GitPanel {
         } else {
             self._tick = None;
         }
+        // 可见 → 按当时选中的仓库挂监听;收起 → 撤掉
+        self.retarget_watch(cx);
         cx.notify();
     }
 
     /// pty-output 嗅探的节拍。100ms 一拍:抽干旁路 → 命中就通知两个子面板
     /// (**各自** 500ms 去抖,原版是两个独立定时器)→ 到点的那个自己重取。
+    /// 同一拍顺带问一声 `.git` 监听有没有攒够一批安静下来的变化。
     fn start_tick(&mut self, cx: &mut Context<Self>) {
         self._tick = Some(cx.spawn(async move |this, cx| {
             loop {
@@ -224,6 +366,9 @@ impl GitPanel {
                         }
                         this.changes.update(cx, |c, cx| c.tick(cx));
                         this.history.update(cx, |h, cx| h.tick(cx));
+                        if this.dir_watch.take_due() {
+                            this.check_git_dir_change(cx);
+                        }
                     })
                     .is_ok();
                 if !alive {
@@ -245,8 +390,7 @@ impl GitPanel {
         self.stale = false;
         self.view_branch = None;
         self.branches.clear();
-        self.pull_state = None;
-        self.push_state = None;
+        self.meta = RepoMeta::default();
         let path = self.project_path.clone().unwrap_or_default();
         let cached = REPO_CACHE.with(|c| c.borrow().get(&path).cloned());
         match cached {
@@ -261,6 +405,7 @@ impl GitPanel {
         }
         self.push_repo_down(cx);
         self.load_repos(cx);
+        self.retarget_watch(cx);
     }
 
     /// 发现仓库(**重**:首次扫盘深度 5)。远程项目直接 return。
@@ -310,16 +455,19 @@ impl GitPanel {
                 }
                 this.push_repo_down(cx);
                 this.load_branches(cx);
+                this.retarget_watch(cx);
                 cx.notify();
             });
         })
         .detach();
     }
 
+    /// 重载分支列表与随它一起的元数据(领先落后、最近分支、进行中操作、签名)。
     fn load_branches(&mut self, cx: &mut Context<Self>) {
         let repo = self.selected_repo.clone();
         if repo.is_empty() {
             self.branches.clear();
+            self.meta = RepoMeta::default();
             return;
         }
         self.branches_loading = true;
@@ -329,7 +477,7 @@ impl GitPanel {
         cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { mt_project::git::get_repo_branches(&task_repo) })
+                .spawn(async move { load_branch_snapshot(&task_repo) })
                 .await;
             let _ = this.update(cx, |this: &mut Self, cx| {
                 // 迟到响应丢弃:换仓库后的旧响应不许覆盖
@@ -338,7 +486,27 @@ impl GitPanel {
                 }
                 this.branches_loading = false;
                 match result {
-                    Ok(list) => this.branches = list,
+                    Ok((list, meta)) => {
+                        // 正在查看的分支没了(被删 / 改名):回到跟随 HEAD,
+                        // 否则历史区拿着一个不存在的分支名去查
+                        if this
+                            .view_branch
+                            .as_ref()
+                            .is_some_and(|v| !list.iter().any(|b| &b.name == v))
+                        {
+                            this.view_branch = None;
+                        }
+                        let selected = this.selected_repo.clone();
+                        if let Some(info) = this
+                            .repos
+                            .iter_mut()
+                            .find(|r| r.path.to_string_lossy() == selected)
+                        {
+                            info.current_branch = meta.head_label.clone();
+                        }
+                        this.branches = list;
+                        this.meta = meta;
+                    }
                     Err(err) => eprintln!("[git] 取分支失败: {err:#}"),
                 }
                 this.push_repo_down(cx);
@@ -346,12 +514,23 @@ impl GitPanel {
             });
         })
         .detach();
+        cx.notify();
     }
 
     /// 仓库栏的手动刷新与 pty 嗅探回调都走这里(原版 `refreshRepoMeta`)。
     fn refresh_repo_meta(&mut self, cx: &mut Context<Self>) {
         self.load_repos(cx);
         self.load_branches(cx);
+    }
+
+    /// 整面板刷新:仓库元数据 + 分支 + 「更改」+ 提交历史。手动 ↻、写操作完成、
+    /// `.git` 引用变化都走这里。
+    pub(crate) fn refresh_all(&mut self, cx: &mut Context<Self>) {
+        self.refresh_repo_meta(cx);
+        // 「更改」列表也要跟着重取 —— push_repo_down 的 set_repo
+        // 对同仓库路径会短路,不显式 load 它就纹丝不动
+        self.changes.update(cx, |c, cx| c.load(cx));
+        self.history.update(cx, |h, cx| h.reload(cx));
     }
 
     /// 把仓库 / 分支透给两个子面板。
@@ -377,11 +556,10 @@ impl GitPanel {
             return;
         }
         self.selected_repo = path;
-        // 换仓库:分支清空、viewBranch 复位、pull/push 状态清掉
+        // 换仓库:分支清空、viewBranch 复位、元数据清掉
         self.branches.clear();
         self.view_branch = None;
-        self.pull_state = None;
-        self.push_state = None;
+        self.meta = RepoMeta::default();
         if let Some(project) = self.project_path.clone() {
             REPO_CACHE.with(|c| {
                 c.borrow_mut()
@@ -390,6 +568,7 @@ impl GitPanel {
         }
         self.push_repo_down(cx);
         self.load_branches(cx);
+        self.retarget_watch(cx);
         cx.notify();
     }
 
@@ -406,71 +585,379 @@ impl GitPanel {
             .and_then(|r| r.current_branch.as_deref())
     }
 
-    // ── pull / push ────────────────────────────────────────
+    /// HEAD 所在的本地分支名;detached / 空仓库为 `None`。
+    fn head_branch(&self) -> Option<&str> {
+        self.current_branch().filter(|b| !is_detached_label(b))
+    }
 
-    fn run_sync(&mut self, pull: bool, cx: &mut Context<Self>) {
-        if self.selected_repo.is_empty()
-            || self.pull_state == Some(SyncState::Loading)
-            || self.push_state == Some(SyncState::Loading)
-        {
+    // ── 给分支弹窗 / 推送对话框的接口 ──────────────────────
+
+    /// 分支弹窗的数据快照。
+    pub(crate) fn branch_snapshot(&self) -> BranchSnapshot {
+        BranchSnapshot {
+            repo: self.selected_repo.clone(),
+            branches: self.branches.clone(),
+            tracking: self.meta.tracking.clone(),
+            recent: self.meta.recent.clone(),
+            remotes: self.meta.remotes.clone(),
+            head: self.head_branch().map(str::to_string),
+            detached: self
+                .current_branch()
+                .filter(|b| is_detached_label(b))
+                .map(str::to_string),
+            loading: self.branches_loading,
+            busy: self.busy,
+        }
+    }
+
+    pub(crate) fn repo_path(&self) -> &str {
+        &self.selected_repo
+    }
+
+    pub(crate) fn store(&self) -> &Entity<AppStore> {
+        &self.store
+    }
+
+    /// 切换「查看哪个分支的历史」(**不 checkout**)。`None` = 跟随 HEAD。
+    pub(crate) fn set_view_branch(&mut self, name: Option<String>, cx: &mut Context<Self>) {
+        self.view_branch = name;
+        self.push_repo_down(cx);
+        cx.notify();
+    }
+
+    /// 推一条结果 toast(标题是当前项目名)。
+    pub(crate) fn notify_result(&self, message: String, tone: Tone, cx: &mut App) {
+        git_ui::toast(&self.store, message, tone, cx);
+    }
+
+    /// 跑一个 git 写操作(见模块注释「写操作」)。
+    ///
+    /// `op` 在后台执行器上跑(阻塞 CLI);`done` 拿到成功结果后在主线程上推摘要 /
+    /// 接着开下一个确认框。失败统一弹详情框,标题是「{动作}失败」。无论成败都整面板
+    /// 刷新 —— 失败也可能已经改了一半(合并停在冲突上之类)。
+    pub(crate) fn run_write_op<T: Send + 'static>(
+        &mut self,
+        busy: GitBusy,
+        op: impl FnOnce(&Path) -> anyhow::Result<T> + Send + 'static,
+        done: impl FnOnce(&mut Self, T, &mut Window, &mut Context<Self>) + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected_repo.is_empty() || self.busy.is_some() {
             return;
         }
-        if pull {
-            self.pull_state = Some(SyncState::Loading);
-            self.push_state = None;
-        } else {
-            self.push_state = Some(SyncState::Loading);
-            self.pull_state = None;
-        }
+        self.busy = Some(busy);
         cx.notify();
-        let repo = std::path::PathBuf::from(&self.selected_repo);
-        cx.spawn(async move |this, cx| {
-            // ⚠️ pull / push 是 30s 阻塞 CLI,必须后台执行器
+        let repo = PathBuf::from(&self.selected_repo);
+        cx.spawn_in(window, async move |this, cx| {
+            // ⚠️ 全是阻塞 CLI(网络操作最多 120s),必须后台执行器
             let result = cx
                 .background_executor()
-                .spawn(async move {
-                    if pull {
-                        mt_project::git::git_pull(&repo)
-                    } else {
-                        mt_project::git::git_push(&repo)
-                    }
-                })
+                .spawn(async move { op(&repo) })
                 .await;
-            let ok = result.is_ok();
-            let _ = this.update(cx, |this: &mut Self, cx| {
-                let state = match result {
-                    Ok(_) => SyncState::Success,
-                    Err(err) => SyncState::Error(format!("{err:#}")),
-                };
-                if pull {
-                    this.pull_state = Some(state);
-                } else {
-                    this.push_state = Some(state);
-                }
-                if ok {
-                    this.load_branches(cx);
-                    // pull 成功还要刷历史;push 只重载分支
-                    if pull {
-                        this.history.update(cx, |h, cx| h.reload(cx));
+            let _ = this.update_in(cx, |this: &mut Self, window, cx| {
+                this.busy = None;
+                match result {
+                    Ok(value) => done(this, value, window, cx),
+                    Err(err) => {
+                        eprintln!("[git] {}失败: {err:#}", busy.label());
+                        git_ui::show_git_error(
+                            tr!("gitBranch", "opFailed", op = busy.label()),
+                            format!("{err:#}"),
+                            window,
+                            cx,
+                        );
                     }
                 }
-                cx.notify();
-            });
-            // 无论成败 1500ms 后清回 None(`GitHistory.tsx:276`)
-            cx.background_executor()
-                .timer(Duration::from_millis(1500))
-                .await;
-            let _ = this.update(cx, |this: &mut Self, cx| {
-                if pull {
-                    this.pull_state = None;
-                } else {
-                    this.push_state = None;
-                }
+                this.refresh_all(cx);
                 cx.notify();
             });
         })
         .detach();
     }
+
+    /// `git fetch --all`。
+    pub(crate) fn fetch(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.run_write_op(
+            GitBusy::Fetch,
+            mt_project::git::git_fetch_all,
+            |this, outcome, _window, cx| {
+                let message = if outcome.updated_refs == 0 {
+                    t("gitBranch", "fetchUpToDate").to_string()
+                } else {
+                    tr!("gitBranch", "fetched", count = outcome.updated_refs)
+                };
+                this.notify_result(message, Tone::Info, cx);
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// 按当前拉取方式拉取。
+    fn pull(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mode = PULL_MODE.with(Cell::get);
+        self.run_write_op(
+            GitBusy::Pull,
+            move |repo| mt_project::git::git_pull_with(repo, mode),
+            |this, outcome, _window, cx| {
+                let (message, tone) = match outcome {
+                    PullOutcome::UpToDate => {
+                        (t("gitBranch", "pullUpToDate").to_string(), Tone::Info)
+                    }
+                    PullOutcome::Updated { commits } => {
+                        (tr!("gitBranch", "pulled", count = commits), Tone::Info)
+                    }
+                    PullOutcome::Conflicts { files } => (
+                        tr!("gitBranch", "pullConflicts", count = files),
+                        Tone::Attention,
+                    ),
+                };
+                this.notify_result(message, tone, cx);
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// 打开「推送」对话框(当前分支)。
+    pub(crate) fn open_push_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected_repo.is_empty() || self.busy.is_some() {
+            return;
+        }
+        crate::git_push::open(cx.entity(), self.selected_repo.clone(), window, cx);
+    }
+
+    /// 推送对话框里推送进行中 / 结束时同步一下按钮状态。
+    pub(crate) fn set_push_busy(&mut self, busy: bool, cx: &mut Context<Self>) {
+        self.busy = busy.then_some(GitBusy::Push);
+        cx.notify();
+    }
+
+    /// 横幅「继续」。
+    fn continue_op(&mut self, kind: RepoOpKind, window: &mut Window, cx: &mut Context<Self>) {
+        self.run_write_op(
+            GitBusy::Continue,
+            move |repo| mt_project::git::continue_operation(repo, kind),
+            move |this, state, _window, cx| {
+                let noun = op_noun(kind);
+                let (message, tone) = match state.kind {
+                    None => (tr!("gitBranch", "opFinished", op = noun), Tone::Info),
+                    Some(_) if state.conflicted > 0 => (
+                        tr!(
+                            "gitBranch",
+                            "opStillConflict",
+                            op = noun,
+                            count = state.conflicted
+                        ),
+                        Tone::Attention,
+                    ),
+                    Some(_) => (tr!("gitBranch", "opStillRunning", op = noun), Tone::Info),
+                };
+                this.notify_result(message, tone, cx);
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// 横幅「中止」:先确认(已做的冲突解决会丢)。
+    fn confirm_abort(&mut self, kind: RepoOpKind, window: &mut Window, cx: &mut Context<Self>) {
+        let noun = op_noun(kind);
+        let this = cx.entity();
+        Confirm::new(
+            tr!("gitBranch", "abortTitle", op = noun),
+            tr!("gitBranch", "abortMessage", op = noun),
+        )
+        .ok_text(t("gitBranch", "abort"))
+        .open(
+            move |window, cx| {
+                this.update(cx, |this, cx| {
+                    this.run_write_op(
+                        GitBusy::Abort,
+                        move |repo| mt_project::git::abort_operation(repo, kind),
+                        move |this, (), _window, cx| {
+                            this.notify_result(
+                                tr!("gitBranch", "opAborted", op = op_noun(kind)),
+                                Tone::Info,
+                                cx,
+                            );
+                        },
+                        window,
+                        cx,
+                    );
+                });
+            },
+            window,
+            cx,
+        );
+    }
+
+    // ── `.git` 目录监听 ───────────────────────────────────
+
+    /// 让监听目标跟上「可见 + 本地项目 + 选中的仓库」。目录在后台列(要读盘)。
+    fn retarget_watch(&mut self, cx: &mut Context<Self>) {
+        let want = (self.visible && !self.selected_repo.is_empty() && !self.is_remote_project(cx))
+            .then(|| self.selected_repo.clone());
+        if want.as_deref() == self.dir_watch.repo() {
+            return;
+        }
+        self.watch_request += 1;
+        self.dir_watch.clear();
+        let Some(repo) = want else {
+            return;
+        };
+        let req = self.watch_request;
+        let path = PathBuf::from(&repo);
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let layout = mt_project::git::git_dir_layout(&path)?;
+                    let dirs = mt_project::git::git_watch_dirs(&layout);
+                    anyhow::Ok((layout, dirs))
+                })
+                .await;
+            let _ = this.update(cx, |this: &mut Self, _cx| {
+                if this.watch_request != req {
+                    return;
+                }
+                match result {
+                    Ok((layout, dirs)) => {
+                        this.dir_watch.set_target(repo, layout, dirs);
+                    }
+                    // 监听挂不上不影响使用:手动 ↻ 与 pty 嗅探照旧
+                    Err(err) => eprintln!("[git] 监听 .git 失败: {err:#}"),
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// `.git` 下攒够一批安静下来的变化:后台算签名,对比上一份快照决定刷什么
+    /// (见模块注释「自动刷新」)。顺带重列监听目录(新出现的分支前缀目录要补挂)。
+    fn check_git_dir_change(&mut self, cx: &mut Context<Self>) {
+        let (Some(repo), Some(layout)) = (
+            self.dir_watch.repo().map(str::to_string),
+            self.dir_watch.layout(),
+        ) else {
+            return;
+        };
+        if self.sig_checking {
+            self.sig_recheck = true;
+            return;
+        }
+        self.sig_checking = true;
+        let path = PathBuf::from(&repo);
+        cx.spawn(async move |this, cx| {
+            let (signature, dirs) = cx
+                .background_executor()
+                .spawn(async move {
+                    (
+                        mt_project::git::repo_signature(&path).ok(),
+                        mt_project::git::git_watch_dirs(&layout),
+                    )
+                })
+                .await;
+            let _ = this.update(cx, |this: &mut Self, cx| {
+                this.sig_checking = false;
+                if this.dir_watch.repo() != Some(repo.as_str()) || this.selected_repo != repo {
+                    this.sig_recheck = false;
+                    return;
+                }
+                if std::mem::take(&mut this.sig_recheck) {
+                    // 期间又有变化:这份签名可能已经旧了,下一拍重查(变化时刻按现在算)
+                    this.dir_watch.poke();
+                }
+                this.dir_watch.update_dirs(dirs);
+                match (this.meta.signature, signature) {
+                    // 没变:别的程序只是刷新了索引的 stat 缓存之类
+                    (Some(old), Some(new)) if old == new => {}
+                    // 只动了索引(终端里 `git add`、解决了一个冲突):「更改」区与冲突数
+                    (Some(old), Some(new)) if old.refs == new.refs => {
+                        this.meta.signature = Some(new);
+                        this.changes.update(cx, |c, cx| c.load(cx));
+                        this.load_branches(cx);
+                    }
+                    _ => {
+                        this.meta.signature = signature;
+                        this.refresh_all(cx);
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+}
+
+/// detached HEAD 的显示名是带括号的短 hash(`"(1a2b3c4)"`)。
+fn is_detached_label(label: &str) -> bool {
+    label.starts_with('(') && label.ends_with(')')
+}
+
+/// 进行中操作的名词(「合并」「变基」…),拼进横幅与提示。
+pub(crate) fn op_noun(kind: RepoOpKind) -> &'static str {
+    t(
+        "gitBranch",
+        match kind {
+            RepoOpKind::Merge => "kindMerge",
+            RepoOpKind::Rebase => "kindRebase",
+            RepoOpKind::CherryPick => "kindCherryPick",
+            RepoOpKind::Revert => "kindRevert",
+        },
+    )
+}
+
+/// 拉取方式的名字(tooltip 与菜单共用)。
+fn pull_mode_name(mode: PullMode) -> &'static str {
+    t(
+        "gitBranch",
+        match mode {
+            PullMode::Merge => "modeMerge",
+            PullMode::Rebase => "modeRebase",
+            PullMode::FfOnly => "modeFfOnly",
+        },
+    )
+}
+
+/// 分支徽章的 tooltip:分支名 + 上游 + ↑↓ 的含义 + 操作提示,一行一条。
+///
+/// `viewing` = 正在查看的另一个分支(未检出)—— 此时计数不显示,第一行说明这一点。
+fn branch_tip_lines(
+    branch: &str,
+    tracking: Option<&BranchTracking>,
+    detached: bool,
+    viewing: bool,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if viewing {
+        lines.push(tr!("gitBranch", "tipViewing", branch = branch));
+    } else if detached {
+        lines.push(tr!("gitBranch", "tipDetached", commit = branch));
+    } else {
+        lines.push(branch.to_string());
+        match tracking {
+            Some(tracking) => {
+                lines.push(tr!(
+                    "gitBranch",
+                    "tipUpstream",
+                    upstream = tracking.upstream.as_str()
+                ));
+                if tracking.ahead == 0 && tracking.behind == 0 {
+                    lines.push(t("gitBranch", "tipInSync").to_string());
+                }
+                if tracking.ahead > 0 {
+                    lines.push(tr!("gitBranch", "tipAhead", count = tracking.ahead));
+                }
+                if tracking.behind > 0 {
+                    lines.push(tr!("gitBranch", "tipBehind", count = tracking.behind));
+                }
+            }
+            None => lines.push(t("gitBranch", "tipNoUpstream").to_string()),
+        }
+    }
+    lines.push(t("gitBranch", "tipOpenBranches").to_string());
+    lines
 }
 
 // ─── 渲染 ─────────────────────────────────────────────────────
@@ -545,6 +1032,9 @@ impl Render for GitPanel {
 
         if !self.repos.is_empty() {
             root = root.child(self.render_repo_bar(cx));
+            if let Some(banner) = self.render_op_banner(cx) {
+                root = root.child(banner);
+            }
         }
 
         root = root
@@ -609,8 +1099,14 @@ impl Render for GitPanel {
                 canvas(
                     move |bounds: Bounds<Pixels>, _window, cx| {
                         this.update(cx, |panel: &mut GitPanel, _cx| {
-                            // 整块面板的高度减掉固定件(仓库栏 34 + 两个 header 30)
-                            let fixed = if panel.repos.is_empty() { 60.0 } else { 94.0 };
+                            // 整块面板的高度减掉固定件(仓库栏 + 横幅 + 两个 header 30)
+                            let fixed = if panel.repos.is_empty() {
+                                60.0
+                            } else if panel.meta.op.kind.is_some() {
+                                60.0 + BAR_HEIGHT * 2.0
+                            } else {
+                                60.0 + BAR_HEIGHT
+                            };
                             panel.sections_height =
                                 (f32::from(bounds.size.height) - fixed).max(1.0);
                         });
@@ -670,14 +1166,21 @@ fn section_header(
             el.border_t_1().border_color(ui::border_subtle())
         })
         .child(
+            // 原版靠 `transform: rotate(-90deg)` 转 ▾;gpui 没有元素旋转,
+            // 换成两枚图标(与文件树同一处理)
             div()
-                .w(px(12.0))
-                .text_center()
-                .text_size(ui::font_px(15.0))
-                .text_color(ui::text_muted())
-                // 原版靠 `transform: rotate(-90deg)` 转 ▾;gpui 没有元素旋转,
-                // 换成两个字形(与文件树同一处理)
-                .child(if open { "▾" } else { "▸" }),
+                .w(px(14.0))
+                .flex()
+                .justify_center()
+                .child(git_ui::icon(
+                    if open {
+                        git_ui::ICON_CHEVRON_DOWN
+                    } else {
+                        git_ui::ICON_CHEVRON_RIGHT
+                    },
+                    12.0,
+                    ui::text_muted(),
+                )),
         )
         .child(div().text_size(ui::font_px(13.0)).child(label))
         .when_some(trailing, |el, trailing| {
@@ -720,7 +1223,8 @@ impl GitPanel {
             .into_any_element()
     }
 
-    /// 仓库栏(`GitHistory.tsx:353-499`)。
+    /// 仓库栏(`GitHistory.tsx:353-499`),重排成清晰的两段:左段仓库 + 分支,
+    /// 右段图标按钮组。窄下去时左段先截断,按钮组永不让位。
     fn render_repo_bar(&self, cx: &mut Context<Self>) -> AnyElement {
         let info = self.selected_repo_info();
         let repo_name = info.map(|r| r.name.clone()).unwrap_or_default();
@@ -730,235 +1234,462 @@ impl GitPanel {
         let detail =
             info.and_then(|r| repo_detail(&r.path.to_string_lossy(), self.project_path.as_deref()));
         let repo_path_tip: SharedString = self.selected_repo.clone().into();
-        let display_branch = self
-            .view_branch
-            .clone()
-            .or_else(|| self.current_branch().map(str::to_string));
-        let current = self.current_branch().map(str::to_string);
-        let viewing_other =
-            self.view_branch.is_some() && self.view_branch != current;
 
-        let mut bar = div()
+        // ── 左段 ① 仓库 ──
+        let repo_trigger = div()
+            .id("git-repo-trigger")
             .flex()
             .items_center()
-            .h(px(34.0))
-            .flex_none()
-            .pl(px(6.0))
-            .pr(px(8.0))
-            .border_b_1()
-            .border_color(ui::border_subtle());
-
-        // 仓库下拉触发器(左键开下拉 / 右键开菜单)
-        bar = bar.child(
-            div()
-                .id("git-repo-trigger")
-                .flex()
-                .items_center()
-                .gap(px(4.0))
-                .px(px(4.0))
-                .py(px(2.0))
-                .rounded(px(4.0))
-                .cursor_pointer()
-                .min_w(px(0.0))
-                .text_color(ui::color_folder())
-                .hover(|el| el.bg(ui::border_subtle()))
-                .child(div().text_color(ui::text_muted()).child("▾"))
-                // 父级路径先让位:栏子窄下去时先截它,仓库名与分支徽章保住
-                .when_some(detail, |el, detail| {
-                    el.child(
-                        div()
-                            .min_w(px(0.0))
-                            .max_w(px(90.0))
-                            .text_size(ui::font_px(12.0))
-                            .text_color(ui::text_muted())
-                            .truncate()
-                            .child(format!("{detail}/")),
-                    )
-                })
-                .child(
+            .gap(px(6.0))
+            .h(px(26.0))
+            .px(px(6.0))
+            .rounded(px(4.0))
+            .cursor_pointer()
+            .min_w(px(0.0))
+            .hover(|el| el.bg(ui::bg_elevated()))
+            .child(git_ui::icon(
+                git_ui::ICON_REPO,
+                git_ui::ICON_SIZE,
+                ui::color_folder(),
+            ))
+            // 父级路径先让位:栏子窄下去时先截它,仓库名与分支徽章保住
+            .when_some(detail, |el, detail| {
+                el.child(
                     div()
                         .min_w(px(0.0))
-                        .text_size(ui::font_px(13.0))
+                        .max_w(px(90.0))
+                        .text_size(ui::font_px(12.0))
+                        .text_color(ui::text_muted())
                         .truncate()
-                        .child(repo_name),
+                        .child(format!("{detail}/")),
                 )
-                .when(is_worktree, |el| {
-                    el.child(div().text_size(ui::font_px(13.0)).text_color(ui::text_muted()).child("⎇"))
-                })
-                .tip(repo_path_tip)
-                .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
-                    let entries = this.repo_menu(cx);
-                    menu::show(event.position(), entries, window, cx);
-                }))
-                .on_mouse_down(
-                    MouseButton::Right,
-                    cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                        cx.stop_propagation();
-                        let entries = this.repo_context_menu(cx);
-                        menu::show(event.position, entries, window, cx);
-                    }),
-                ),
-        );
-
-        // 分支徽章。宽度**随分支名自适应**:不设上限,栏子挤不下时才与仓库名
-        // 一起收缩(两边都 `min_w(0)` + 省略截断),右侧三个按钮永不让位。
-        // 徽章的收缩权重是仓库名的 3 倍:flex 按「权重 × 基准宽」分摊,分支名
-        // 通常比仓库名长得多,等权会把仓库名先挤成「re…」。截断时全名挂 tooltip。
-        // 分支名单独套一层 `min_w_0().truncate()`:徽章行里还有「▾」,`truncate()`
-        // 直接挂徽章上会把那个箭头也卷进 nowrap/省略的文本流。
-        if let Some(branch) = display_branch {
-            let (bg, fg) = if viewing_other {
-                (
-                    ui::with_alpha(mt_ui::rgb8(88, 166, 255), 0.15),
-                    mt_ui::rgb8(88, 166, 255),
-                )
-            } else {
-                (ui::border_subtle(), ui::text_muted())
-            };
-            let branch_tip: SharedString = branch.clone().into();
-            bar = bar.child(
+            })
+            .child(
                 div()
-                    .id("git-branch-badge")
-                    .ml(px(6.0))
-                    .flex()
-                    .items_center()
-                    .gap(px(2.0))
-                    .px(px(6.0))
-                    .rounded(px(3.0))
-                    .cursor_pointer()
                     .min_w(px(0.0))
-                    .map(|el| shrink(el, 3.0))
-                    .bg(bg)
-                    .text_color(fg)
                     .text_size(ui::font_px(13.0))
-                    .child(div().min_w_0().truncate().child(branch))
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(ui::font_px(11.0))
-                            .opacity(0.7)
-                            .child("▾"),
-                    )
-                    .tip(branch_tip)
-                    .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
-                        // 分支列表为空时懒加载一次(`GitHistory.tsx:422`)
-                        if this.branches.is_empty() {
-                            this.load_branches(cx);
-                        }
-                        let entries = this.branch_menu(cx);
-                        menu::show(event.position(), entries, window, cx);
-                    })),
+                    .text_color(ui::text_primary())
+                    .truncate()
+                    .child(repo_name),
+            )
+            .when(is_worktree, |el| {
+                el.child(git_ui::icon(git_ui::ICON_WORKTREE, 12.0, ui::text_muted()))
+            })
+            .child(git_ui::icon(
+                git_ui::ICON_CHEVRON_DOWN,
+                12.0,
+                ui::text_muted(),
+            ))
+            .tip(repo_path_tip)
+            .on_click(cx.listener(|this, event: &ClickEvent, window, cx| {
+                let entries = this.repo_menu(cx);
+                menu::show(event.position(), entries, window, cx);
+            }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    let entries = this.repo_context_menu(cx);
+                    menu::show(event.position, entries, window, cx);
+                }),
             );
-        }
 
-        bar = bar.child(div().flex_1());
+        let left = div()
+            .flex()
+            .flex_1()
+            .min_w(px(0.0))
+            .items_center()
+            .gap(px(4.0))
+            .child(repo_trigger)
+            .children(self.render_branch_badge(cx));
 
-        // 刷新
-        bar = bar.child(
-            div()
-                .id("git-repo-refresh")
-                .w(px(20.0))
-                .h(px(20.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .flex_none()
-                .rounded(px(3.0))
-                .cursor_pointer()
-                .text_size(ui::font_px(13.0))
-                .text_color(ui::text_muted())
-                .hover(|el| el.text_color(ui::text_primary()))
-                .child("↻")
-                .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                    this.refresh_repo_meta(cx);
-                    // 「更改」列表也要跟着重取 —— push_repo_down 的 set_repo
-                    // 对同仓库路径会短路,不显式 load 它就纹丝不动
-                    this.changes.update(cx, |c, cx| c.load(cx));
-                    this.history.update(cx, |h, cx| h.reload(cx));
-                })),
-        );
-
-        bar = bar
-            .child(self.render_sync_button(true, cx))
-            .child(self.render_sync_button(false, cx));
-
-        bar.into_any_element()
-    }
-
-    /// `GitActionButton`(`GitHistory.tsx:21-67`)。
-    fn render_sync_button(&self, pull: bool, cx: &mut Context<Self>) -> AnyElement {
-        let state = if pull { &self.pull_state } else { &self.push_state };
-        let busy = self.pull_state == Some(SyncState::Loading)
-            || self.push_state == Some(SyncState::Loading);
-        let (glyph, color) = match state {
-            Some(SyncState::Loading) => ("↻", ui::text_muted()),
-            Some(SyncState::Success) => ("✓", ui::color_success()),
-            Some(SyncState::Error(_)) => ("✕", ui::color_error()),
-            None => (if pull { "↓" } else { "↑" }, ui::text_muted()),
-        };
-        // title:出错时是错误全文,否则是**硬编码**的 'Git Pull' / 'Git Push'
-        // (原版这两个字符串没进 i18n,照抄)
-        let tip: SharedString = match state {
-            Some(SyncState::Error(err)) => err.clone().into(),
-            _ => if pull { "Git Pull" } else { "Git Push" }.into(),
-        };
         div()
-            .id(if pull { "git-pull" } else { "git-push" })
-            .w(px(20.0))
-            .h(px(20.0))
             .flex()
             .items_center()
-            .justify_center()
+            .gap(px(12.0))
+            .h(px(BAR_HEIGHT))
             .flex_none()
-            .rounded(px(3.0))
-            .text_size(ui::font_px(13.0))
-            .text_color(color)
-            .when(busy, |el| el.opacity(0.5))
-            .when(!busy, |el| {
-                el.cursor_pointer().hover(|el| el.text_color(ui::text_primary()))
-            })
-            .child(glyph)
-            .tip(tip)
-            .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
-                this.run_sync(pull, cx)
-            }))
+            .pl(px(4.0))
+            .pr(px(6.0))
+            .border_b_1()
+            .border_color(ui::border_subtle())
+            .child(left)
+            .child(self.render_bar_buttons(cx))
             .into_any_element()
+    }
+
+    /// 左段 ② 分支:分支图标 + 分支胶囊(HEAD = accent;正在查看另一个分支 = info)
+    /// + ↑n(待推送,success)/ ↓m(待拉取,info)计数胶囊。点开分支弹窗。
+    ///
+    /// 宽度**随分支名自适应**:栏子挤不下时才与仓库名一起收缩(两边都 `min_w(0)` +
+    /// 省略截断)。徽章的收缩权重是仓库名的 3 倍:flex 按「权重 × 基准宽」分摊,
+    /// 分支名通常比仓库名长得多,等权会把仓库名先挤成「re…」。截断时全名在 tooltip 里。
+    fn render_branch_badge(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let head = self.current_branch().map(str::to_string);
+        let branch = self.view_branch.clone().or_else(|| head.clone())?;
+        let viewing = self.view_branch.is_some() && self.view_branch != head;
+        let detached = !viewing && head.as_deref().is_some_and(is_detached_label);
+        let tracking = if viewing {
+            None
+        } else {
+            self.meta.head_tracking.as_ref()
+        };
+        let color = if viewing {
+            ui::color_info()
+        } else if detached {
+            ui::color_warning()
+        } else {
+            ui::accent()
+        };
+        let tip: SharedString = branch_tip_lines(&branch, tracking, detached, viewing)
+            .join("\n")
+            .into();
+        let mono = git_ui::mono_font(&self.store, cx);
+        let (ahead, behind) = tracking.map_or((0, 0), |t| (t.ahead, t.behind));
+        let busy = self.busy.is_some_and(GitBusy::touches_branch);
+
+        Some(
+            div()
+                .id("git-branch-badge")
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .h(px(26.0))
+                .px(px(4.0))
+                .rounded(px(4.0))
+                .min_w(px(0.0))
+                .map(|el| shrink(el, 3.0))
+                .cursor_pointer()
+                .hover(|el| el.bg(ui::bg_elevated()))
+                .child(git_ui::icon(
+                    git_ui::ICON_BRANCH,
+                    git_ui::ICON_SIZE,
+                    if viewing {
+                        ui::color_info()
+                    } else {
+                        ui::text_muted()
+                    },
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .min_w(px(0.0))
+                        .h(px(20.0))
+                        .px(px(8.0))
+                        .rounded_full()
+                        .bg(ui::with_alpha(color, 0.15))
+                        .text_color(color)
+                        .text_size(ui::font_px(12.0))
+                        .child(div().min_w_0().truncate().child(branch)),
+                )
+                .when(ahead > 0, |el| {
+                    el.child(git_ui::count_pill(
+                        git_ui::ICON_ARROW_UP,
+                        ahead,
+                        ui::color_success(),
+                        mono.clone(),
+                    ))
+                })
+                .when(behind > 0, |el| {
+                    el.child(git_ui::count_pill(
+                        git_ui::ICON_ARROW_DOWN,
+                        behind,
+                        ui::color_info(),
+                        mono.clone(),
+                    ))
+                })
+                .when(busy, |el| el.child(ui::spinner(px(12.0), ui::accent())))
+                .tip(tip)
+                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                    // 分支列表为空时懒加载一次(`GitHistory.tsx:422`)
+                    if this.branches.is_empty() {
+                        this.load_branches(cx);
+                    }
+                    crate::git_branches::open(cx.entity(), window, cx);
+                }))
+                .into_any_element(),
+        )
+    }
+
+    /// 右段图标按钮组:Fetch / 拉取 / 推送 / 刷新。
+    fn render_bar_buttons(&self, cx: &mut Context<Self>) -> AnyElement {
+        let busy = self.busy;
+        let is = |op: GitBusy| busy == Some(op);
+        let blocked = |op: GitBusy| busy.is_some() && busy != Some(op);
+        let head = self.head_branch().map(str::to_string);
+        let detached = self.current_branch().is_some_and(is_detached_label);
+        let upstream = self.meta.head_tracking.as_ref().map(|t| t.upstream.clone());
+        let mode = PULL_MODE.with(Cell::get);
+        let busy_tip =
+            |op: GitBusy| -> SharedString { tr!("gitBranch", "busyTip", op = op.label()).into() };
+
+        let fetch_tip: SharedString = if is(GitBusy::Fetch) {
+            busy_tip(GitBusy::Fetch)
+        } else {
+            t("gitBranch", "fetchTip").into()
+        };
+        let fetch = git_ui::icon_button(
+            "git-fetch",
+            git_ui::ICON_FETCH,
+            is(GitBusy::Fetch),
+            blocked(GitBusy::Fetch),
+        )
+        .tip(fetch_tip)
+        .when(busy.is_none(), |el| {
+            el.on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.fetch(window, cx)))
+        });
+
+        let pull_tip: SharedString = if is(GitBusy::Pull) {
+            busy_tip(GitBusy::Pull)
+        } else {
+            match &upstream {
+                Some(upstream) => tr!(
+                    "gitBranch",
+                    "pullTip",
+                    target = upstream.as_str(),
+                    mode = pull_mode_name(mode)
+                ),
+                None => tr!(
+                    "gitBranch",
+                    "pullTipNoUpstream",
+                    mode = pull_mode_name(mode)
+                ),
+            }
+            .into()
+        };
+        let pull = git_ui::icon_button(
+            "git-pull",
+            git_ui::ICON_PULL,
+            is(GitBusy::Pull),
+            blocked(GitBusy::Pull) || detached,
+        )
+        .tip(pull_tip)
+        .when(busy.is_none() && !detached, |el| {
+            el.on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.pull(window, cx)))
+        })
+        // 右键选拉取方式(会话级,不落盘)
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                cx.stop_propagation();
+                let entries = this.pull_mode_menu(cx);
+                menu::show(event.position, entries, window, cx);
+            }),
+        );
+
+        let push_tip: SharedString = if is(GitBusy::Push) {
+            busy_tip(GitBusy::Push)
+        } else if detached {
+            t("gitBranch", "pushTipDetached").into()
+        } else {
+            match (&upstream, &head) {
+                (Some(upstream), _) => tr!("gitBranch", "pushTip", target = upstream.as_str()),
+                (None, Some(head)) => tr!("gitBranch", "pushTipNoUpstream", branch = head.as_str()),
+                (None, None) => t("gitBranch", "pushTipDetached").to_string(),
+            }
+            .into()
+        };
+        let push = git_ui::icon_button(
+            "git-push",
+            git_ui::ICON_PUSH,
+            is(GitBusy::Push),
+            blocked(GitBusy::Push) || detached,
+        )
+        .tip(push_tip)
+        .when(busy.is_none() && !detached, |el| {
+            el.on_click(
+                cx.listener(|this, _: &ClickEvent, window, cx| this.open_push_dialog(window, cx)),
+            )
+        });
+
+        // 刷新:后台重载期间转小圈(列表保留旧内容,不清空)
+        let refreshing = self.branches_loading;
+        let refresh = git_ui::icon_button("git-refresh", git_ui::ICON_REFRESH, refreshing, false)
+            .tip(t("gitBranch", "refreshTip"))
+            .when(!refreshing, |el| {
+                el.on_click(cx.listener(|this, _: &ClickEvent, _window, cx| this.refresh_all(cx)))
+            });
+
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(px(2.0))
+            .child(fetch)
+            .child(pull)
+            .child(push)
+            .child(refresh)
+            .into_any_element()
+    }
+
+    /// 拉取方式菜单。当前选中的打勾;选了只改方式,不立刻拉。
+    fn pull_mode_menu(&self, _cx: &mut Context<Self>) -> Vec<menu::MenuEntry> {
+        let current = PULL_MODE.with(Cell::get);
+        let mut entries = vec![menu::MenuEntry::Header(
+            t("gitBranch", "pullModeHeader").into(),
+        )];
+        for (mode, key) in [
+            (PullMode::Merge, "modeMergeItem"),
+            (PullMode::Rebase, "modeRebaseItem"),
+            (PullMode::FfOnly, "modeFfOnlyItem"),
+        ] {
+            let prefix = if mode == current { "✓ " } else { "　" };
+            entries.push(
+                MenuItem::new(format!("{prefix}{}", t("gitBranch", key)))
+                    .on_click(move |_window, _cx| PULL_MODE.with(|m| m.set(mode)))
+                    .into(),
+            );
+        }
+        entries
+    }
+
+    /// 进行中操作横幅:attention 语义 —— 左侧 3px 竖条 + 淡底 + 图标 + 加粗动词 +
+    /// 冲突数胶囊,右对齐「继续」(主)「中止」(次)。仍有冲突时「继续」禁用。
+    fn render_op_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let kind = self.meta.op.kind?;
+        let conflicted = self.meta.op.conflicted;
+        let color = ui::color_attention();
+        let verb = t(
+            "gitBranch",
+            match kind {
+                RepoOpKind::Merge => "bannerMerge",
+                RepoOpKind::Rebase => "bannerRebase",
+                RepoOpKind::CherryPick => "bannerCherryPick",
+                RepoOpKind::Revert => "bannerRevert",
+            },
+        );
+        let busy = self.busy;
+        let continuing = busy == Some(GitBusy::Continue);
+        let aborting = busy == Some(GitBusy::Abort);
+        let can_continue = conflicted == 0 && busy.is_none();
+
+        let status = if conflicted > 0 {
+            git_ui::pill(tr!("gitBranch", "conflictCount", count = conflicted), color)
+                .into_any_element()
+        } else {
+            div()
+                .min_w_0()
+                .truncate()
+                .text_size(ui::font_px(12.0))
+                .text_color(ui::text_muted())
+                .child(t("gitBranch", "conflictsResolved"))
+                .into_any_element()
+        };
+
+        let continue_label = if continuing {
+            tr!("gitBranch", "busyTip", op = GitBusy::Continue.label())
+        } else {
+            t("gitBranch", "continue").to_string()
+        };
+        let continue_button = ui::primary_button("git-op-continue", continue_label)
+            .flex_none()
+            .when(!can_continue, |el| el.opacity(0.5).cursor_default())
+            .when(conflicted > 0, |el| {
+                el.tip(tr!("gitBranch", "continueBlocked", count = conflicted))
+            })
+            .when(can_continue, |el| {
+                el.on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.continue_op(kind, window, cx)
+                }))
+            });
+        let abort_label = if aborting {
+            tr!("gitBranch", "busyTip", op = GitBusy::Abort.label())
+        } else {
+            t("gitBranch", "abort").to_string()
+        };
+        let abort_button = ui::ghost_button("git-op-abort", abort_label)
+            .flex_none()
+            .when(busy.is_some(), |el| el.opacity(0.5))
+            .when(busy.is_none(), |el| {
+                el.on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.confirm_abort(kind, window, cx)
+                }))
+            });
+
+        Some(
+            div()
+                .relative()
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(px(8.0))
+                .h(px(BAR_HEIGHT))
+                .pl(px(12.0))
+                .pr(px(8.0))
+                .bg(ui::with_alpha(color, 0.12))
+                .border_b_1()
+                .border_color(ui::border_subtle())
+                .child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top_0()
+                        .bottom_0()
+                        .w(px(3.0))
+                        .bg(color),
+                )
+                .child(git_ui::icon(
+                    if conflicted > 0 {
+                        git_ui::ICON_ALERT
+                    } else {
+                        git_ui::ICON_MERGE
+                    },
+                    git_ui::ICON_SIZE,
+                    color,
+                ))
+                .child(
+                    div()
+                        .flex_none()
+                        .text_size(ui::font_px(13.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(ui::text_primary())
+                        .child(verb),
+                )
+                .child(status)
+                .child(div().flex_1())
+                .child(continue_button)
+                .child(abort_button)
+                .into_any_element(),
+        )
     }
 
     /// 「更改」标题栏右侧的视图切换(树/列表)。原先住在 GitChanges 的工具栏里,
     /// 工具栏撤掉后上移到这。
     fn render_view_mode_toggle(&self, cx: &mut Context<Self>) -> AnyElement {
         let tree_mode = self.store.read(cx).git_changes_view_mode() == "tree";
-        div()
-            .id("git-changes-view-mode")
-            .w(px(20.0))
-            .h(px(20.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .flex_none()
-            .rounded(px(3.0))
-            .text_size(ui::font_px(12.0))
-            .text_color(ui::text_muted())
-            .hover(|el| el.text_color(ui::text_primary()))
-            // list 时显示 ⊞(点它切树),tree 时显示 ≡(点它切列表)
-            .child(if tree_mode { "≡" } else { "⊞" })
-            .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
-                // 按钮在 header 里,不拦住冒泡会连带把整块折叠
-                cx.stop_propagation();
-                this.store.update(cx, |store, cx| {
-                    let next = if store.git_changes_view_mode() == "tree" {
-                        "list"
-                    } else {
-                        "tree"
-                    };
-                    store.set_git_changes_view_mode(next, cx);
-                });
-                // GitChanges 不 observe store,列表要重排得显式踢它一脚
-                this.changes.update(cx, |_, cx| cx.notify());
-                cx.notify();
-            }))
-            .into_any_element()
+        // 显示的是「点了会切到」的那种视图
+        git_ui::icon_button(
+            "git-changes-view-mode",
+            if tree_mode {
+                git_ui::ICON_LIST
+            } else {
+                git_ui::ICON_LIST_TREE
+            },
+            false,
+            false,
+        )
+        .tip(if tree_mode {
+            t("gitChanges", "switchToList")
+        } else {
+            t("gitChanges", "switchToTree")
+        })
+        .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
+            // 按钮在 header 里,不拦住冒泡会连带把整块折叠
+            cx.stop_propagation();
+            this.store.update(cx, |store, cx| {
+                let next = if store.git_changes_view_mode() == "tree" {
+                    "list"
+                } else {
+                    "tree"
+                };
+                store.set_git_changes_view_mode(next, cx);
+            });
+            // GitChanges 不 observe store,列表要重排得显式踢它一脚
+            this.changes.update(cx, |_, cx| cx.notify());
+            cx.notify();
+        }))
+        .into_any_element()
     }
 
     /// 仓库下拉。
@@ -997,48 +1728,6 @@ impl GitPanel {
                 item.on_click(move |_window, cx| {
                     let path = path.clone();
                     this.update(cx, |this, cx| this.select_repo(path, cx));
-                })
-                .into()
-            })
-            .collect()
-    }
-
-    /// 分支下拉。**只改历史显示,不做 checkout**。
-    fn branch_menu(&self, cx: &mut Context<Self>) -> Vec<menu::MenuEntry> {
-        if self.branches.is_empty() {
-            return vec![
-                MenuItem::new(if self.branches_loading {
-                    t("gitHistoryContent", "loading")
-                } else {
-                    t("gitHistoryContent", "noCommits")
-                })
-                .disabled(true)
-                .into(),
-            ];
-        }
-        let this = cx.entity();
-        let current = self.current_branch().map(str::to_string);
-        self.branches
-            .iter()
-            .map(|branch| {
-                let name = branch.name.clone();
-                let selected = Some(&name) == self.view_branch.as_ref();
-                // 远程用空心圈、本地用实心点(原版是两种颜色的小圆点,
-                // 菜单基件的行是纯文本,换成字形区分)
-                let dot = if branch.is_remote { "○" } else { "●" };
-                let label = format!("{}{dot} {name}", if selected { "✓ " } else { "　" });
-                let mut item = MenuItem::new(label);
-                if Some(&name) == current.as_ref() {
-                    item = item.shortcut("HEAD");
-                }
-                let this = this.clone();
-                item.on_click(move |_window, cx| {
-                    let name = name.clone();
-                    this.update(cx, |this, cx| {
-                        this.view_branch = Some(name);
-                        this.push_repo_down(cx);
-                        cx.notify();
-                    });
                 })
                 .into()
             })
@@ -1287,5 +1976,54 @@ mod tests {
             .find(|b| b.name == detached)
             .map(|b| b.name.as_str());
         assert!(picked.is_none());
+        assert!(is_detached_label(detached));
+        assert!(!is_detached_label("main"));
+        assert!(!is_detached_label("(wip"), "只有成对括号才算");
+    }
+
+    /// 分支徽章 tooltip:有上游时写出上游与 ↑↓ 的含义(为 0 的那项不写),同步时
+    /// 说「与上游同步」;没上游 / detached / 查看别的分支各有说法;末行都是操作提示。
+    #[test]
+    fn 分支徽章提示逐行() {
+        let tracking = BranchTracking {
+            branch: "main".into(),
+            upstream: "origin/main".into(),
+            ahead: 2,
+            behind: 0,
+        };
+        let lines = branch_tip_lines("main", Some(&tracking), false, false);
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert_eq!(lines[0], "main");
+        assert!(lines[1].contains("origin/main"));
+        assert!(lines[2].contains('2'));
+        assert_eq!(lines[3], t("gitBranch", "tipOpenBranches"));
+
+        let synced = BranchTracking {
+            ahead: 0,
+            ..tracking.clone()
+        };
+        let lines = branch_tip_lines("main", Some(&synced), false, false);
+        assert_eq!(lines[2], t("gitBranch", "tipInSync"));
+
+        let lines = branch_tip_lines("dev", None, false, false);
+        assert_eq!(lines[1], t("gitBranch", "tipNoUpstream"));
+
+        let lines = branch_tip_lines("(1a2b3c4)", None, true, false);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("1a2b3c4"));
+
+        let lines = branch_tip_lines("origin/x", Some(&tracking), false, true);
+        assert_eq!(lines.len(), 2, "查看别的分支时不列计数");
+        assert!(lines[0].contains("origin/x"));
+    }
+
+    /// 改分支 / HEAD 的操作才让分支徽章转圈;同步类操作在自己的按钮上转。
+    #[test]
+    fn 忙碌态归属() {
+        assert!(GitBusy::Checkout.touches_branch());
+        assert!(GitBusy::Merge.touches_branch());
+        assert!(!GitBusy::Fetch.touches_branch());
+        assert!(!GitBusy::Push.touches_branch());
+        assert!(!GitBusy::Continue.touches_branch());
     }
 }
