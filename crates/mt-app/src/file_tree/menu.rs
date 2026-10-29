@@ -380,12 +380,18 @@ pub(super) fn file_menu(
                 let rel = row.rel.clone();
                 let label = row.git.as_ref().map(|(l, _)| l.clone()).unwrap_or_default();
                 menu::item(t("fileTree", "menu.viewDiff"), move |window, cx| {
+                    // 单元素序列、不支持按块操作(HEAD → 工作区两侧都不是能写回的那一侧)
                     crate::git_diff::open_file_diff(
                         store.clone(),
                         repo.clone(),
-                        rel.clone(),
-                        crate::git_diff::DiffSide::Working,
-                        label.clone(),
+                        vec![crate::git_diff::DiffFile {
+                            path: rel.clone(),
+                            side: crate::git_diff::DiffSide::Working,
+                            status_label: label.clone(),
+                            hunk_actions: false,
+                        }],
+                        0,
+                        None,
                         window,
                         cx,
                     );

@@ -1947,6 +1947,13 @@ pub fn get_worktree_branches(paths: &[PathBuf]) -> Vec<Option<String>> {
         .collect()
 }
 
+mod commit;
+mod conflict;
+mod hunk;
+pub use commit::*;
+pub use conflict::*;
+pub use hunk::*;
+
 #[cfg(test)]
 mod test_support;
 

@@ -69,6 +69,7 @@ mod frame_profiler;
 mod frost;
 mod fs_ops;
 mod git_changes;
+mod git_commit_ui;
 mod git_diff;
 mod git_graph;
 mod git_history;
