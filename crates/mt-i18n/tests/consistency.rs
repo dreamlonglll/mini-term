@@ -124,8 +124,12 @@ use mt_i18n::{
 /// 934 → 939：设置页新增「环境变量」页（全局终端环境变量），侧栏项
 /// `settings.menu.envVars` 与页内四条（`settings.envVars.{section,addVar,hint,hasErrors}`）；
 /// 表格本身复用项目环境变量弹窗的 `envVars.*`。
-const EXPECTED_NAMESPACES: usize = 33;
-const EXPECTED_ENTRIES_PER_LANG: usize = 939;
+/// 939 → 1096(33 → 34 个命名空间):Git 面板「分支与同步」新增 `gitBranch` 命名空间
+/// 157 条 —— 分支弹窗(搜索 / 分组 / 动作菜单)、新建与重命名弹窗的就地校验、
+/// 推送对话框、Fetch / 拉取方式 / 推送的 tooltip 与结果摘要、进行中操作横幅、
+/// 各类确认框与失败详情框。
+const EXPECTED_NAMESPACES: usize = 34;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1096;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。
@@ -138,6 +142,7 @@ const TS_NAMESPACES: &[&str] = &[
     "externalLink",
     "fileTree",
     "fileViewer",
+    "gitBranch",
     "gitChanges",
     "gitHistory",
     "gitHistoryContent",

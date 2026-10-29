@@ -452,6 +452,25 @@ pub fn bind_keys(cx: &mut App) {
         Some("CommandLibrary > Input"),
     ));
 
+    // Git 分支弹窗:↑↓ 移动高亮、→ 弹出高亮分支的操作菜单。与项目切换器同一套理由
+    // (谓词与 `Input` 同深度才压得过它自带的 up/down/right);→ 只在光标位于搜索词
+    // 末尾时才接管,否则处理器 `propagate()` 让给输入框的 MoveRight(见 git_branches)。
+    bindings.push(KeyBinding::new(
+        "up",
+        crate::git_branches::BranchPopupPrev,
+        Some("GitBranchPopup > Input"),
+    ));
+    bindings.push(KeyBinding::new(
+        "down",
+        crate::git_branches::BranchPopupNext,
+        Some("GitBranchPopup > Input"),
+    ));
+    bindings.push(KeyBinding::new(
+        "right",
+        crate::git_branches::BranchPopupMenu,
+        Some("GitBranchPopup > Input"),
+    ));
+
     // Git 提交框的 Ctrl/Cmd+Enter(`GitChanges.tsx:411-415`)。**不进快捷键表** ——
     // 原版它是 textarea 的 onKeyDown,不在 hotkeys.ts 里。谓词同上要与 `Input` 同深度。
     bindings.push(KeyBinding::new(
