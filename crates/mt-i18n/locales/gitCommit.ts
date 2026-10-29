@@ -11,7 +11,7 @@ export const gitCommit = {
     discardHunk: "丢弃此块",
     hunkWorking: "处理中…",
     discardHunkTitle: "丢弃此块",
-    discardHunkConfirm: "确定丢弃这一块未暂存的修改吗？\n只影响这一块，已暂存的内容不受影响。此操作不可恢复。",
+    discardHunkConfirm: "确定丢弃这一块未暂存的修改吗？\n只影响这一块，已暂存的内容不受影响。\n此操作不可恢复。",
     hunkStale: "文件已变化，请刷新后重试",
     hunkFailed: "按块操作失败：{detail}",
     noMoreChanges: "没有更多改动",
@@ -58,7 +58,7 @@ export const gitCommit = {
     takeTheirsRebaseDeleted: "采用正在重放的提交（theirs，你的改动：删除此文件）",
     markResolved: "标记为已解决",
     markResolvedTitle: "标记为已解决",
-    markResolvedConfirm: "{count} 个文件里仍有冲突标记（<<<<<<<），确定按当前内容标记为已解决吗？",
+    markResolvedConfirm: "{count} 个文件里仍有冲突标记（<<<<<<<）。\n确定按当前内容标记为已解决吗？",
     markResolvedOk: "标记为已解决",
 
     // ── 提交区 ──

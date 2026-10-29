@@ -1426,6 +1426,7 @@ fn request_hunk_op(
         t("gitCommit", "discardHunkConfirm"),
     )
     .ok_text(t("gitChanges", "discardOk"))
+    .danger()
     .open(
         move |_window, cx| run_hunk_op(&state, &ctl, op, hunk, cx),
         window,

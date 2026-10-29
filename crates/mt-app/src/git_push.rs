@@ -159,7 +159,7 @@ pub(crate) fn open(
             // 勾上强推:确认键整颗换危险色(正文里那块选项区同时转红并给警告)
             .footer(git_ui::dialog_footer(
                 push_label,
-                Some(t("gitBranch", "cancel").into()),
+                Some(t("gitBranch", dismiss_key(pushing)).into()),
                 force,
                 !can_push,
             ))
@@ -170,6 +170,20 @@ pub(crate) fn open(
                 false
             })
     });
+}
+
+/// 左边那颗按钮的文案 key。
+///
+/// 推送一旦发出去就撤不回(`git push` 的子进程不受这个框管),这时点它只是把框收起、
+/// 推送在后台接着跑(结果走 toast / 失败详情框)—— 再叫「取消」就是误导。没改成
+/// 「进行中不许关」:网络推送最长 120s,把人困在框里更糟;关掉后仓库栏的推送键
+/// 照样转着圈,看得出还在推。
+fn dismiss_key(pushing: bool) -> &'static str {
+    if pushing {
+        "pushInBackground"
+    } else {
+        "cancel"
+    }
 }
 
 /// 后台读推送计划与待推送提交。
@@ -228,6 +242,7 @@ fn start_push(state: &Entity<PushDialog>, window: &mut Window, cx: &mut App) {
         ),
     )
     .ok_text(t("gitBranch", "forcePushOk"))
+    .danger()
     .open(move |window, cx| do_push(&state, window, cx), window, cx);
 }
 
@@ -607,6 +622,24 @@ mod tests {
             upstream_differs: false,
             tracking_oid: None,
         }
+    }
+
+    /// 推送进行中左键不叫「取消」(撤不回,只是收框),说清推送在后台继续;
+    /// 两个 key 中英文案都在。
+    #[test]
+    fn 推送中左键说明在后台继续() {
+        assert_eq!(dismiss_key(false), "cancel");
+        assert_eq!(dismiss_key(true), "pushInBackground");
+        for pushing in [false, true] {
+            for locale in [mt_i18n::Locale::Zh, mt_i18n::Locale::En] {
+                assert!(mt_i18n::lookup(locale, "gitBranch", dismiss_key(pushing)).is_some());
+            }
+        }
+        assert_ne!(
+            t("gitBranch", dismiss_key(true)),
+            t("gitBranch", "cancel"),
+            "进行中的文案不能还是「取消」"
+        );
     }
 
     /// 只有「配了上游、但这次推的不是它」才出那行说明,且写明目标与上游。

@@ -328,3 +328,16 @@ fn 变更跳转键位不与编辑器和全局键冲突() {
     );
     assert!(bindings.is_empty());
 }
+
+/// 变更小窗的行号列:去掉左右留白后放得下最大行号的每一位(13px 等宽一位约 7.8px),
+/// 一位数也不会向左溢出被圆角边框切掉;位数多一位,列宽跟着多一位。
+#[test]
+fn 变更小窗行号列放得下行号() {
+    for max_line in [1, 9, 10, 99, 100, 12_345] {
+        let digits = max_line.to_string().len() as f32;
+        let content = popup_number_width(max_line) - px(POPUP_NUMBER_PAD_L + POPUP_NUMBER_PAD_R);
+        assert!(content >= px(7.8 * digits), "{max_line}: {content:?}");
+    }
+    assert!(popup_number_width(10) > popup_number_width(9));
+    assert_eq!(popup_number_width(0), popup_number_width(1), "0 行按一位算");
+}

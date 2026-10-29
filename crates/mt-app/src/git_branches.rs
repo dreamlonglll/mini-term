@@ -592,10 +592,19 @@ impl Render for BranchPopup {
                     fetching,
                     !writable && !fetching,
                 )
-                .tip(if snap.gated {
-                    git_ui::gate_busy_text()
-                } else {
-                    t("gitBranch", "fetchTip")
+                // 闸的忙闲随别的区的写操作变:提示现读(见 `TooltipExt::tip_live`)
+                .tip_live({
+                    let panel = self.panel.downgrade();
+                    move |cx| {
+                        let gated = panel
+                            .upgrade()
+                            .is_some_and(|p| p.read(cx).branch_snapshot().gated);
+                        if gated {
+                            git_ui::gate_busy_text().into()
+                        } else {
+                            t("gitBranch", "fetchTip").into()
+                        }
+                    }
                 })
                 .when(writable, |el| {
                     // Fetch 不收弹窗:回来之后列表就地更新
@@ -1066,6 +1075,7 @@ fn confirm_delete(panel: &Entity<GitPanel>, row: &Row, window: &mut Window, cx: 
             ),
         )
         .ok_text(t("gitBranch", "deleteRemoteOk"))
+        .danger()
         .open(
             move |window, cx| {
                 let name = name.clone();
@@ -1096,6 +1106,7 @@ fn confirm_delete(panel: &Entity<GitPanel>, row: &Row, window: &mut Window, cx: 
         tr!("gitBranch", "deleteMessage", name = name.as_str()),
     )
     .ok_text(t("gitBranch", "deleteOk"))
+    .danger()
     .open(
         move |window, cx| delete_local(&panel, name.clone(), false, window, cx),
         window,
@@ -1133,6 +1144,7 @@ fn delete_local(
                         tr!("gitBranch", "forceDeleteMessage", name = shown.as_str()),
                     )
                     .ok_text(t("gitBranch", "forceDeleteOk"))
+                    .danger()
                     .open(
                         move |window, cx| delete_local(&panel, name.clone(), true, window, cx),
                         window,
@@ -1254,8 +1266,8 @@ pub(crate) fn open_name_dialog(
             }
             let f = form.read(cx);
             let value = f.input.read(cx).value().trim().to_string();
-            let issue = name_issue(&f.mode, &value, &f.existing);
-            let show_issue = issue.filter(|_| f.touched || !value.is_empty());
+            let (show_issue, valid) =
+                name_feedback(name_issue(&f.mode, &value, &f.existing), f.touched);
             let (title, ok_label) = match &f.mode {
                 NameMode::Create { .. } => (
                     t("gitBranch", "newBranchTitle"),
@@ -1354,13 +1366,22 @@ pub(crate) fn open_name_dialog(
                     ok_label,
                     Some(t("gitBranch", "cancel").into()),
                     false,
-                    f.op.busy,
+                    f.op.busy || !valid,
                 ))
                 .child(body)
                 .on_ok(move |_: &ClickEvent, window, cx| submit_name(&form_for_ok, window, cx))
         },
     );
     autofocus(&input_for_focus, window, cx);
+}
+
+/// 名称弹窗的校验反馈:(就地显示的问题, 名字合不合法)。
+///
+/// 问题要等用户**动过输入框**才显示:一打开就红一行不友好,而重命名预填的正是原名,
+/// 「与原名相同」恰恰一打开就成立(E2E 截到过)。确认键则不等 —— 名字不合法就禁用,
+/// 回车照样能提交,那时 `submit_name` 置上 `touched`,问题随之显示出来。
+fn name_feedback(issue: Option<&'static str>, touched: bool) -> (Option<&'static str>, bool) {
+    (issue.filter(|_| touched), issue.is_none())
 }
 
 /// 起点是不是本地分支(决定胶囊配色:本地 success / 远程 info)。
@@ -1655,5 +1676,22 @@ mod tests {
                 "{key}"
             );
         }
+    }
+
+    /// 重命名弹窗一打开(预填原名、用户还没动)不红字,只把确认键禁用;
+    /// 动过之后问题才就地显示;合法名字确认键可点。新建弹窗同一口径。
+    #[test]
+    fn 名称问题等用户动过才显示() {
+        let existing = vec!["main".to_string(), "dev".to_string()];
+        let rename = NameMode::Rename { old: "dev".into() };
+        let opened = name_feedback(name_issue(&rename, "dev", &existing), false);
+        assert_eq!(opened, (None, false), "一打开不红字,确认键禁用");
+        let edited = name_feedback(name_issue(&rename, "dev", &existing), true);
+        assert_eq!(edited, (Some("nameUnchanged"), false));
+        let ok = name_feedback(name_issue(&rename, "dev2", &existing), true);
+        assert_eq!(ok, (None, true));
+        let create = NameMode::Create { start: None };
+        let fresh = name_feedback(name_issue(&create, "", &existing), false);
+        assert_eq!(fresh, (None, false));
     }
 }

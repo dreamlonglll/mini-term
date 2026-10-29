@@ -895,9 +895,11 @@ impl GitHistoryContent {
         let form = cx.new(|_| DialogForm::new());
         let name_input =
             cx.new(|cx| InputState::new(window, cx).placeholder(t("gitLog", "tag.placeholder")));
+        // ⚠️ 高度只认 `auto_grow`:普通多行模式下 `rows` 不参与布局(恒为一行高),
+        // 见 `git_ui::error_text_state` 的注释
         let message_input = cx.new(|cx| {
             TextareaState::new(window, cx)
-                .rows(3)
+                .auto_grow(3, 6)
                 .placeholder(t("gitLog", "tag.messagePlaceholder"))
         });
         let existing: Vec<String> = self.tags.iter().map(|t| t.name.clone()).collect();
@@ -1011,7 +1013,12 @@ impl GitHistoryContent {
             Some(body) => format!("{}\n\n{}", commit.message, body.trim_end()),
             None => commit.message.clone(),
         };
-        let input = cx.new(|cx| TextareaState::new(window, cx).rows(6).default_value(full));
+        // 随内容长到 10 行再滚(`rows` 不参与布局,见 `git_ui::error_text_state`)
+        let input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .auto_grow(3, 10)
+                .default_value(full)
+        });
         let pushed = rel.pushed;
         let hint = tr!("gitLog", "reword.hint", hash = commit.short_hash);
         let hash = commit.hash.clone();

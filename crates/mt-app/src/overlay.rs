@@ -242,8 +242,15 @@ thread_local! {
 }
 
 /// 压入一层。返回 `false` = 同一层已经开着(调用方应当直接放弃这次打开)。
+///
+/// 真压进去了就顺带打断 tooltip(`mt_ui::tooltip::interrupt`):还在等待中的提示
+/// 不再弹出、已弹出的收起 —— 气泡画在所有覆盖物之上,不收就叠在弹窗 / 菜单上。
 pub fn push(key: OverlayKey) -> bool {
-    CURRENT.with(|s| s.borrow_mut().push(key))
+    let pushed = CURRENT.with(|s| s.borrow_mut().push(key));
+    if pushed {
+        mt_ui::tooltip::interrupt();
+    }
+    pushed
 }
 
 /// 弹出一层(幂等)。

@@ -274,6 +274,15 @@ pub(super) enum BlameNotice {
     Failed(String),
 }
 
+/// 「注解」开关的提示文案 key:开着时说「隐藏」,关着时说「显示」。
+pub(super) fn annotate_tip_key(on: bool) -> &'static str {
+    if on {
+        "hideAnnotations"
+    } else {
+        "showAnnotations"
+    }
+}
+
 /// 报错只取第一行:git 的错误常带好几行 hint,提示条是单行的。
 fn first_line(err: &anyhow::Error) -> String {
     format!("{err:#}")
@@ -593,11 +602,10 @@ impl FileViewer {
             return None;
         }
         let on = self.annotate.enabled;
-        let tip = if on {
-            t("gitGutter", "hideAnnotations")
-        } else {
-            t("gitGutter", "showAnnotations")
-        };
+        // 点一下就切开关:提示文案在气泡渲染时现读开关状态。写成 `.tip(if on ..)` 的话,
+        // gpui 在鼠标移入那一刻就抓好了构造闭包,点完弹出来的仍是「显示 Git 注解」,
+        // 移出再移入才变(E2E 截到过)。见 `TooltipExt::tip_live`。
+        let view = cx.entity().downgrade();
         Some(
             super::toolbar_outline_button("file-viewer-annotate", t("gitGutter", "annotate"))
                 .flex()
@@ -609,7 +617,10 @@ impl FileViewer {
                 .when(self.annotate.loading, |el| {
                     el.child(ui::spinner(px(12.0), ui::text_muted()))
                 })
-                .tip(tip)
+                .tip_live(move |cx| {
+                    let on = view.upgrade().is_some_and(|v| v.read(cx).annotate.enabled);
+                    t("gitGutter", annotate_tip_key(on)).into()
+                })
                 .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
                     this.toggle_annotations(cx);
                 }))

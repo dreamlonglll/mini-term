@@ -505,6 +505,7 @@ const USED_KEYS: &[&str] = &[
     "gitBranch.pulled",
     "gitBranch.push",
     "gitBranch.pushDetached",
+    "gitBranch.pushInBackground",
     "gitBranch.pushNoRemote",
     "gitBranch.pushOtherThanUpstream",
     "gitBranch.pushTip",

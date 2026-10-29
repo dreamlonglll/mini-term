@@ -11,14 +11,15 @@ use std::path::PathBuf;
 
 use gpui::{
     AnyElement, AppContext as _, ClickEvent, ClipboardItem, Context, Entity, FontWeight,
-    InteractiveElement, IntoElement, ParentElement, SharedString, StatefulInteractiveElement,
-    Styled, Window, div, prelude::FluentBuilder as _, px,
+    InteractiveElement, IntoElement, ParentElement, ScrollHandle, SharedString,
+    StatefulInteractiveElement, Styled, Window, div, point, prelude::FluentBuilder as _, px,
 };
+use gpui_component::Size;
 use gpui_component::input::{Textarea, TextareaState};
 use mt_project::git::CommitDetail;
 use mt_ui::tooltip::TooltipExt as _;
 
-use super::{GitHistoryContent, format_absolute_time, format_relative_time, grow};
+use super::{GitHistoryContent, format_detail_time, grow};
 use crate::git_ui::{
     self, ICON_COPY, SectionHeader, commit_file_row, error_text, icon_button, mono, ref_pill,
 };
@@ -38,6 +39,9 @@ pub(super) struct DetailState {
     request: u64,
     /// 只读正文(可选中复制)。
     body: Entity<TextareaState>,
+    /// 详情区的滚动位置。换了一个提交就回到顶上(标题与元信息在最上面),
+    /// 不然上一个提交往下翻过,新提交一进来先看到的是文件列表的半截。
+    scroll: ScrollHandle,
 }
 
 impl DetailState {
@@ -49,6 +53,7 @@ impl DetailState {
             data: None,
             request: 0,
             body: cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 12)),
+            scroll: ScrollHandle::new(),
         }
     }
 
@@ -102,6 +107,12 @@ impl GitHistoryContent {
                         this.detail
                             .body
                             .update(cx, |s, cx| s.set_value(body, window, cx));
+                        // 换了提交才回顶;同一个提交重拉(刷新)不打断正在看的位置
+                        let changed = this.detail.data.as_ref().map(|d| d.hash.as_str())
+                            != Some(detail.hash.as_str());
+                        if changed {
+                            this.detail.scroll.set_offset(point(px(0.0), px(0.0)));
+                        }
                         this.detail.data = Some(detail);
                         this.detail.error = None;
                     }
@@ -206,15 +217,20 @@ pub(super) fn render(
             }),
         );
     }
+    // 点一下就切展开 / 收起:提示文案在气泡渲染时现读(见 `TooltipExt::tip_live`)
+    let view = cx.entity().downgrade();
     let header = header
         .build()
         .border_t_1()
         .border_b_1()
         .border_color(ui::border_subtle())
-        .tip(if open {
-            t("gitLog", "detail.collapse")
-        } else {
-            t("gitLog", "detail.expand")
+        .tip_live(move |cx| {
+            let open = view.upgrade().is_some_and(|v| v.read(cx).detail.open);
+            if open {
+                t("gitLog", "detail.collapse").into()
+            } else {
+                t("gitLog", "detail.expand").into()
+            }
         })
         .on_click(cx.listener(|this, _: &ClickEvent, _window, cx| {
             this.detail.open = !this.detail.open;
@@ -233,6 +249,7 @@ pub(super) fn render(
         .id("git-log-detail-body")
         .flex_1()
         .min_h(px(0.0))
+        .track_scroll(&this.detail.scroll)
         .overflow_y_scroll()
         .px(px(12.0))
         .py(px(10.0))
@@ -287,12 +304,20 @@ fn render_content(
             .child(title),
     );
     if !text.is_empty() {
+        // 多行输入框自带内边距(组件库 Medium 档:左右 10、上下 8,`appearance(false)`
+        // 也照样留着),正文因此比标题右缩一截。外面用等量负外边距抵掉,
+        // 正文字与标题、元信息同一条左缘。
+        let (pad_x, pad_y) = (Size::Medium.input_px(), Size::Medium.input_py());
         body = body.child(
-            div().text_size(ui::font_px(13.0)).child(
-                Textarea::new(&this.detail.body)
-                    .readonly(true)
-                    .appearance(false),
-            ),
+            div()
+                .mx(-pad_x)
+                .my(-pad_y)
+                .text_size(ui::font_px(13.0))
+                .child(
+                    Textarea::new(&this.detail.body)
+                        .readonly(true)
+                        .appearance(false),
+                ),
         );
     }
 
@@ -310,11 +335,7 @@ fn render_content(
     }
     meta = meta.child(meta_row(
         t("gitLog", "detail.date"),
-        mono(div()).child(format!(
-            "{}  ({})",
-            format_absolute_time(d.author_time),
-            format_relative_time(d.author_time, now)
-        )),
+        mono(div()).child(format_detail_time(d.author_time, now)),
     ));
     {
         let hash = d.hash.clone();
@@ -342,16 +363,23 @@ fn render_content(
             let loaded = this.commits.iter().any(|c| &c.hash == parent);
             let short: String = parent.chars().take(7).collect();
             let target = parent.clone();
+            // 「已加载 / 未加载」会随触底续页变:提示现读,不抓移入那一刻的
+            let (view, probe) = (cx.entity().downgrade(), parent.clone());
             parents = parents.child(
                 link(
                     SharedString::from(format!("git-log-detail-parent-{i}")),
                     short,
                     loaded,
                 )
-                .tip(if loaded {
-                    t("gitLog", "detail.jumpParent")
-                } else {
-                    t("gitLog", "detail.parentNotLoaded")
+                .tip_live(move |cx| {
+                    let loaded = view
+                        .upgrade()
+                        .is_some_and(|v| v.read(cx).commits.iter().any(|c| c.hash == probe));
+                    if loaded {
+                        t("gitLog", "detail.jumpParent").into()
+                    } else {
+                        t("gitLog", "detail.parentNotLoaded").into()
+                    }
                 })
                 .when(loaded, |el| {
                     el.on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {

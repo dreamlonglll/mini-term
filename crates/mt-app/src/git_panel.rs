@@ -943,6 +943,7 @@ impl GitPanel {
             tr!("gitBranch", "abortMessage", op = noun),
         )
         .ok_text(t("gitBranch", "abort"))
+        .danger()
         .open(
             move |window, cx| {
                 this.update(cx, |this, cx| {
