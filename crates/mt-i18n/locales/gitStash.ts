@@ -90,6 +90,7 @@ export const gitStash = {
       working: "正在贮藏…",
       nothing: "没有可贮藏的改动",
       saved: "已贮藏为 {reference}",
+      savedWithWarnings: "已贮藏为 {reference}，但有文件未能清理：{detail}",
       failedTitle: "贮藏失败",
     },
 
@@ -105,6 +106,7 @@ export const gitStash = {
       restored: "已检出 {branch}，本地改动已恢复",
       conflicts: "已检出 {branch}，但恢复本地改动时出现冲突：请在更改区解决；贮藏已保留（{reference}）",
       restoreFailed: "已检出 {branch}，但恢复本地改动失败；贮藏已保留（{reference}），可在贮藏列表里手动应用。git 的原文：",
+      cancelled: "已贮藏为 {reference}，但部分未跟踪文件被占用、未能清理，检出已取消（仍在当前分支）。改动都在该贮藏里，可在贮藏列表中查看或恢复。git 的原文：",
       failedTitle: "检出失败",
       gotIt: "知道了",
     },
@@ -190,6 +192,7 @@ export const gitStash = {
       working: "Stashing…",
       nothing: "No local changes to stash",
       saved: "Stashed as {reference}",
+      savedWithWarnings: "Stashed as {reference}, but some files could not be cleaned up: {detail}",
       failedTitle: "Stash failed",
     },
 
@@ -204,6 +207,7 @@ export const gitStash = {
       restored: "Checked out {branch}; local changes restored",
       conflicts: "Checked out {branch}, but restoring local changes caused conflicts. Resolve them in Changes; the stash was kept ({reference})",
       restoreFailed: "Checked out {branch}, but local changes could not be restored. The stash was kept ({reference}); apply it manually from the stash list. Git said:",
+      cancelled: "Stashed as {reference}, but some untracked files are in use and could not be cleaned up, so the checkout was cancelled (you are still on the current branch). Your changes are in that stash; view or restore them from the stash list. Git said:",
       failedTitle: "Checkout failed",
       gotIt: "Got It",
     },

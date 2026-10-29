@@ -201,13 +201,23 @@ pub struct StashSaveOptions {
 pub enum StashSaveOutcome {
     /// 生成了新贮藏(新贮藏永远是 `stash@{0}`)。
     Saved { reference: String },
+    /// 贮藏已经生成,但 git 退出码非零:典型是带 `--include-untracked` 时有未跟踪文件
+    /// 被别的程序占用、清不掉(git 跳过了随后的 `reset --hard`,工作区没被清干净)。
+    /// `detail` 是 git 的 stderr 原文。
+    SavedWithWarnings { reference: String, detail: String },
     /// 没有可贮藏的改动(git 正常退出、什么都没做)。
     NothingToStash,
 }
 
 /// `git stash push [-m <消息>] [--keep-index] [--include-untracked]`。
 ///
-/// 「没有可贮藏的改动」不认 git 的提示文本(会被本地化),看 `refs/stash` 前后变没变。
+/// 成败一律看 `refs/stash` 前后变没变,不看退出码、更不认 git 的提示文本(会被本地化):
+/// - 变了 = 生成了新贮藏。退出码非零的话是 [`StashSaveOutcome::SavedWithWarnings`]
+///   —— 带 `-u` 时有未跟踪文件被占用删不掉,git 已经存好贮藏、删掉了其余未跟踪文件,
+///   只是随后的清理失败、退出码 1。报成失败的话用户会以为什么都没发生,再点一次就叠出
+///   第二个贮藏;
+/// - 没变且退出码为零 = 没有可贮藏的改动;没变且非零 = 真失败。
+///
 /// **阻塞最多 120s**。
 pub fn stash_save(repo_path: &Path, options: &StashSaveOptions) -> Result<StashSaveOutcome> {
     let before = stash_tip(repo_path)?;
@@ -229,15 +239,19 @@ pub fn stash_save(repo_path: &Path, options: &StashSaveOptions) -> Result<StashS
     }
     // 操作名写死:args 里带着用户的消息文本,不该被拼进「超时 / 启动失败」的报错
     let out = run_git_output(repo_path, &args, "stash push", WORKTREE_TIMEOUT, "")?;
-    if !out.success {
-        bail!("{}", failure_text(&out));
-    }
     let after = stash_tip(repo_path)?;
-    Ok(match after {
-        Some(after) if Some(after) != before => StashSaveOutcome::Saved {
-            reference: "stash@{0}".to_string(),
+    let created = after.is_some() && after != before;
+    let reference = || "stash@{0}".to_string();
+    Ok(match (created, out.success) {
+        (true, true) => StashSaveOutcome::Saved {
+            reference: reference(),
         },
-        _ => StashSaveOutcome::NothingToStash,
+        (true, false) => StashSaveOutcome::SavedWithWarnings {
+            reference: reference(),
+            detail: failure_text(&out),
+        },
+        (false, true) => StashSaveOutcome::NothingToStash,
+        (false, false) => bail!("{}", failure_text(&out)),
     })
 }
 
@@ -444,7 +458,8 @@ pub fn stash_file_diff(repo_path: &Path, file: &StashFileInfo) -> Result<GitDiff
 // Smart checkout:贮藏后检出再恢复
 // ---------------------------------------------------------------------------
 
-/// 「贮藏后检出」的结果。只要返回 `Ok`,HEAD 就已经在目标分支上了。
+/// 「贮藏后检出」的结果。除 [`SmartCheckoutOutcome::CheckoutCancelled`] 外,只要返回
+/// `Ok`,HEAD 就已经在目标分支上了。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SmartCheckoutOutcome {
     /// 没有需要贮藏的本地改动(或本来就在该分支上),直接检出了。
@@ -457,6 +472,10 @@ pub enum SmartCheckoutOutcome {
     /// 已检出,但恢复本地改动失败(非冲突:比如未跟踪文件与目标分支上的文件同名),
     /// **自动贮藏保留**;`detail` 是 git 的原文。
     RestoreFailed { detail: String },
+    /// **没有检出**:自动贮藏已生成(在 `stash@{0}`),但工作区没清干净(有未跟踪文件被
+    /// 占用删不掉),带着残留检出只会更乱,于是停在原分支。改动都在那个贮藏里;`detail`
+    /// 是 git 的原文。
+    CheckoutCancelled { detail: String },
 }
 
 /// 恢复自动贮藏的三种结局。
@@ -529,6 +548,7 @@ fn try_restore(repo_path: &Path, stash_hash: &str) -> Result<Restore> {
 /// (先带 `--index`,暂存区贴不上再退回不带)。
 ///
 /// - 没有可贮藏的改动:直接检出,[`SmartCheckoutOutcome::CheckedOut`];
+/// - 贮藏生成了但工作区没清干净:不检出,[`SmartCheckoutOutcome::CheckoutCancelled`];
 /// - **检出失败**:把贮藏原样恢复回去,返回 `Err`(检出的 git 原文;恢复也不顺时附上说明);
 /// - 恢复时冲突 / 失败:HEAD 已在目标分支,贮藏保留,见各变体的说明。
 ///
@@ -557,9 +577,18 @@ pub fn checkout_with_stash(repo_path: &Path, branch: &str) -> Result<SmartChecko
             include_untracked: true,
         },
     )?;
-    if saved == StashSaveOutcome::NothingToStash {
-        checkout_branch(repo_path, branch)?;
-        return Ok(SmartCheckoutOutcome::CheckedOut);
+    match saved {
+        StashSaveOutcome::NothingToStash => {
+            checkout_branch(repo_path, branch)?;
+            return Ok(SmartCheckoutOutcome::CheckedOut);
+        }
+        // 贮藏生成了、工作区却没清干净(被占用的未跟踪文件删不掉,git 也就跳过了随后的
+        // `reset --hard`):带着残留检出,要么被它们挡住、要么切过去再恢复时与自己撞车,
+        // 两头都更乱。停在原分支,告诉用户改动都在贮藏里
+        StashSaveOutcome::SavedWithWarnings { detail, .. } => {
+            return Ok(SmartCheckoutOutcome::CheckoutCancelled { detail });
+        }
+        StashSaveOutcome::Saved { .. } => {}
     }
     let stash_hash = stash_tip(repo_path)?
         .ok_or_else(|| anyhow!("自动贮藏后找不到 refs/stash"))?
@@ -1108,6 +1137,68 @@ mod tests {
         assert_eq!(read(&root, "a.txt"), "one\n2\n3\n4\nfive\n");
         assert!(list_stashes(&root).unwrap().is_empty());
         cleanup(&[&root, &hooks]);
+    }
+
+    /// 以「读写都共享、唯独不共享删除」打开:编辑器 / 杀毒软件开着文件时的样子 ——
+    /// git 读得到内容(贮藏得进去),删不掉(清理工作区失败)。
+    #[cfg(windows)]
+    fn hold_open(path: &Path) -> std::fs::File {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_SHARE_READ: u32 = 0x1;
+        const FILE_SHARE_WRITE: u32 = 0x2;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(path)
+            .unwrap()
+    }
+
+    /// `stash push -u` 删不掉被占用的未跟踪文件:贮藏已经生成、其余未跟踪文件已删,
+    /// 只是退出码 1。按 `refs/stash` 前后变化判成「已贮藏但有警告」,不能报成失败
+    /// (用户会以为什么都没发生,再点一次就叠出第二个贮藏)。
+    #[cfg(windows)]
+    #[test]
+    fn 贮藏时未跟踪文件被占用_贮藏照样生成并带警告() {
+        let root = init_repo_with_file("stash-locked", "a.txt", "a\n");
+        std::fs::write(root.join("a.txt"), "changed\n").unwrap();
+        std::fs::write(root.join("locked.txt"), "l\n").unwrap();
+        std::fs::write(root.join("free.txt"), "f\n").unwrap();
+        let handle = hold_open(&root.join("locked.txt"));
+        let out = stash_save(&root, &opts(Some("busy"), false, true));
+        drop(handle);
+        match out.unwrap() {
+            StashSaveOutcome::SavedWithWarnings { reference, detail } => {
+                assert_eq!(reference, "stash@{0}");
+                assert!(detail.contains("locked.txt"), "{detail}");
+            }
+            other => panic!("应为已贮藏但有警告: {other:?}"),
+        }
+        let list = list_stashes(&root).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].summary, "busy");
+        assert!(!root.join("free.txt").exists(), "其余未跟踪文件照常收走");
+        cleanup(&[&root]);
+    }
+
+    /// 贮藏后检出遇到同样的情况:工作区没清干净就**不检出**,明确告诉用户改动在贮藏里。
+    #[cfg(windows)]
+    #[test]
+    fn 贮藏后检出_未跟踪文件被占用就不检出() {
+        let (root, main) = two_branch_repo("smart-locked");
+        std::fs::write(root.join("a.txt"), "x\n2\n3\n4\n5\n").unwrap();
+        std::fs::write(root.join("locked.txt"), "l\n").unwrap();
+        let handle = hold_open(&root.join("locked.txt"));
+        let out = checkout_with_stash(&root, "other");
+        drop(handle);
+        match out.unwrap() {
+            SmartCheckoutOutcome::CheckoutCancelled { detail } => {
+                assert!(detail.contains("locked.txt"), "{detail}")
+            }
+            other => panic!("应为检出已取消: {other:?}"),
+        }
+        assert_eq!(current(&root), main, "停在原分支");
+        assert_eq!(list_stashes(&root).unwrap().len(), 1, "自动贮藏保留");
+        cleanup(&[&root]);
     }
 
     /// `.git` 下每个文件的 (修改时间, 长度)。

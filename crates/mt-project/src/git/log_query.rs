@@ -23,12 +23,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow};
 use git2::{Commit, Oid, Repository};
-use pathdiff::diff_paths;
 use serde::{Deserialize, Serialize};
 
 use super::{
     CommitFileInfo, DateTopoWalk, GitCommitInfo, GitLogCursor, MAX_DISCOVER_PARENTS,
-    discover_repo_for, get_commit_files, log_tip, nth_parent,
+    discover_repo_for, get_commit_files, log_tip, nth_parent, repo_relative_path,
 };
 
 /// 每次调用最多走过的提交数。实测 git2 读一个提交 + 比对条件是几微秒级,
@@ -257,12 +256,8 @@ pub fn resolve_repo_file(project_path: &Path, file_rel: &str) -> Result<(PathBuf
         .workdir()
         .ok_or_else(|| anyhow!("bare repository not supported"))?
         .to_path_buf();
-    let rel = diff_paths(&abs_file, &workdir)
+    let rel = repo_relative_path(&workdir, project_path, &abs_file)
         .ok_or_else(|| anyhow!("file is outside repository working directory"))?;
-    let rel = rel.to_string_lossy().replace('\\', "/");
-    if rel.is_empty() || rel.starts_with("../") {
-        return Err(anyhow!("file is outside repository working directory"));
-    }
     Ok((workdir, rel))
 }
 

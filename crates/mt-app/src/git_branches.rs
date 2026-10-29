@@ -1058,7 +1058,7 @@ fn push_branch(panel: &Entity<GitPanel>, row: &Row, window: &mut Window, cx: &mu
                     .unwrap_or(0);
                 let options = PushOptions {
                     branch: Some(name.clone()),
-                    force_with_lease: false,
+                    ..PushOptions::default()
                 };
                 Ok((count, mt_project::git::git_push_with(repo, &options)?))
             },

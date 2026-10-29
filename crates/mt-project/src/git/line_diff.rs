@@ -27,14 +27,14 @@
 //! 形态(行尾、Tab 展开),这里只比字符串。
 
 use std::collections::HashMap;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use git2::{ObjectType, Repository};
-use pathdiff::diff_paths;
 
 use super::{
     MAX_DIFF_BYTES, MAX_LCS_CELLS, common_affix, discover_repo_for, edit_script, lcs_workload,
+    repo_relative_path,
 };
 
 /// Myers 允许的最大编辑距离。超过它说明改动面已经大到「整段重写」的量级,
@@ -315,17 +315,10 @@ pub fn head_file(project_path: &Path, abs_file: &Path) -> Result<HeadFile> {
     let Some(workdir) = repo.workdir() else {
         return Ok(HeadFile::NotInRepo);
     };
-    let Some(rel) = diff_paths(abs_file, workdir) else {
+    // 工作区之外的文件(相对路径是 `../x`)不归这个仓库管
+    let Some(rel_path) = repo_relative_path(workdir, project_path, abs_file) else {
         return Ok(HeadFile::NotInRepo);
     };
-    // 工作区之外的文件 diff_paths 给的是 `../x`,不归这个仓库管
-    if rel
-        .components()
-        .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
-    {
-        return Ok(HeadFile::NotInRepo);
-    }
-    let rel_path = rel.to_string_lossy().replace('\\', "/");
     let signature = signature_of(&repo, &rel_path)?;
     let blob_id = signature.blob.clone();
     let repo_file = RepoFile {

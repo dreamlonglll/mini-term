@@ -13,7 +13,9 @@
 //! └─────────────────────────────────────────┘
 //! ```
 //!
-//! 待推送 = 分支有、上游没有的提交;没上游时取「不在任何远程分支上」的(最多 100 条)。
+//! 待推送 = 分支有、**推送目标**的远程分支没有的提交(目标可以不是上游:从 origin/main
+//! 拉出来的 feature 推到 origin/feature,这时目标行下面多一句说明上游不动);目标在本地
+//! 还没有远程跟踪引用时取「不在任何远程分支上」的(最多 100 条)。
 //! 没有待推送提交也能打开(没上游时推送仍有意义:在远程建分支并设上游)。
 //! detached HEAD / 没有远程时推送按钮禁用并说明原因。强推要再确认一次。
 
@@ -64,7 +66,7 @@ pub(crate) fn pushed_summary(
     truncated: bool,
     forced: bool,
 ) -> String {
-    let remote = format!("{}/{}", target.remote, target.remote_branch);
+    let remote = target.label();
     let mut message = if forced {
         tr!("gitBranch", "forcePushed", target = remote.as_str())
     } else if count == 0 {
@@ -82,10 +84,25 @@ pub(crate) fn pushed_summary(
             target = remote.as_str()
         )
     };
-    if !target.has_upstream {
+    if target.sets_upstream() {
         message.push_str(t("gitBranch", "upstreamSetSuffix"));
     }
     message
+}
+
+/// 目标与上游不同时目标行下面那句说明:「将推送到 origin/feature;当前上游是
+/// origin/main,不会修改」。其余情况(没上游 / 推的就是上游)为 `None`。
+pub(crate) fn upstream_note(target: &PushTarget) -> Option<String> {
+    let upstream = target
+        .upstream
+        .as_deref()
+        .filter(|_| target.upstream_differs)?;
+    Some(tr!(
+        "gitBranch",
+        "pushOtherThanUpstream",
+        target = target.label(),
+        upstream = upstream
+    ))
 }
 
 /// 打开推送对话框(当前分支)。已经开着时是空操作。
@@ -190,7 +207,7 @@ fn start_push(state: &Entity<PushDialog>, window: &mut Window, cx: &mut App) {
             "gitBranch",
             "forceConfirmMessage",
             branch = target.branch.as_str(),
-            target = format!("{}/{}", target.remote, target.remote_branch)
+            target = target.label()
         ),
     )
     .ok_text(t("gitBranch", "forcePushOk"))
@@ -198,13 +215,26 @@ fn start_push(state: &Entity<PushDialog>, window: &mut Window, cx: &mut App) {
 }
 
 fn do_push(state: &Entity<PushDialog>, window: &mut Window, cx: &mut App) {
-    let (panel, repo, force, count, truncated) = {
+    let (panel, repo, force, count, truncated, expected_oid) = {
         let s = state.read(cx);
         let (count, truncated) = s
             .outgoing
             .as_ref()
             .map_or((0, false), |o| (o.commits.len(), o.truncated));
-        (s.panel.clone(), s.repo.clone(), s.force, count, truncated)
+        // 强推的 lease 期望值取**预览这一刻**的远程跟踪值:对话框开着期间点过 Fetch 的话,
+        // 别人刚推上去、本地还没整合的提交不能被当成「见过的」覆盖掉
+        let expected_oid = match &s.plan {
+            Some(PushPlan::Ready(target)) => target.tracking_oid.clone(),
+            _ => None,
+        };
+        (
+            s.panel.clone(),
+            s.repo.clone(),
+            s.force,
+            count,
+            truncated,
+            expected_oid,
+        )
     };
     state.update(cx, |s, cx| {
         s.pushing = true;
@@ -218,6 +248,7 @@ fn do_push(state: &Entity<PushDialog>, window: &mut Window, cx: &mut App) {
             let options = PushOptions {
                 branch: None,
                 force_with_lease: force,
+                expected_oid,
             };
             let result = cx
                 .background_executor()
@@ -337,8 +368,8 @@ fn render_body(state: &Entity<PushDialog>, cx: &mut App) -> AnyElement {
     };
     root = root.child(match &plan {
         PushPlan::Ready(target) => {
-            let remote = format!("{}/{}", target.remote, target.remote_branch);
-            div()
+            let remote = target.label();
+            let row = div()
                 .flex()
                 .items_center()
                 .gap(px(8.0))
@@ -365,7 +396,7 @@ fn render_body(state: &Entity<PushDialog>, cx: &mut App) -> AnyElement {
                     git_ui::ref_pill("git-push-remote", remote.clone(), git_ui::RefKind::Remote)
                         .tip(remote),
                 )
-                .when(!target.has_upstream, |el| {
+                .when(target.sets_upstream(), |el| {
                     el.child(
                         div()
                             .flex_none()
@@ -373,6 +404,17 @@ fn render_body(state: &Entity<PushDialog>, cx: &mut App) -> AnyElement {
                             .text_color(ui::text_muted())
                             .child(t("gitBranch", "willSetUpstream")),
                     )
+                });
+            // 目标不是上游(从 origin/main 拉出来的 feature 推到 origin/feature):说清楚
+            // 推到哪、上游保持原样 —— 不然用户会以为在往 main 上推
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .min_w_0()
+                .child(row)
+                .when_some(upstream_note(target), |el, note| {
+                    el.child(git_ui::hint_line(note))
                 })
                 .into_any_element()
         }
@@ -396,7 +438,7 @@ fn render_body(state: &Entity<PushDialog>, cx: &mut App) -> AnyElement {
     if outgoing.commits.is_empty() {
         list = list.child(git_ui::empty_state(
             git_ui::ICON_CLEAN,
-            if target.as_ref().is_some_and(|t| !t.has_upstream) {
+            if target.as_ref().is_some_and(PushTarget::sets_upstream) {
                 t("gitBranch", "noOutgoingNewUpstream")
             } else {
                 t("gitBranch", "noOutgoing")
@@ -508,11 +550,7 @@ fn render_body(state: &Entity<PushDialog>, cx: &mut App) -> AnyElement {
         });
     let warning = target.as_ref().filter(|_| force).map(|target| {
         git_ui::notice_line(
-            tr!(
-                "gitBranch",
-                "forceWarning",
-                target = format!("{}/{}", target.remote, target.remote_branch)
-            ),
+            tr!("gitBranch", "forceWarning", target = target.label()),
             danger,
         )
     });
@@ -550,8 +588,34 @@ mod tests {
             branch: "main".into(),
             remote: "origin".into(),
             remote_branch: "main".into(),
-            has_upstream,
+            upstream: has_upstream.then(|| "origin/main".to_string()),
+            upstream_differs: false,
+            tracking_oid: None,
         }
+    }
+
+    /// 只有「配了上游、但这次推的不是它」才出那行说明,且写明目标与上游。
+    #[test]
+    fn 目标与上游不同时才有说明() {
+        assert_eq!(upstream_note(&target(true)), None);
+        assert_eq!(upstream_note(&target(false)), None);
+        let feature = PushTarget {
+            branch: "feature".into(),
+            remote_branch: "feature".into(),
+            upstream_differs: true,
+            ..target(true)
+        };
+        let note = upstream_note(&feature).expect("应有说明");
+        assert!(
+            note.contains("origin/feature") && note.contains("origin/main"),
+            "{note}"
+        );
+        // 已有上游:推完不补「并设为上游」
+        let summary = pushed_summary(&feature, 1, false, false);
+        assert!(
+            !summary.ends_with(t("gitBranch", "upstreamSetSuffix")),
+            "{summary}"
+        );
     }
 
     /// 推送摘要:带提交数与目标;截断时写 `100+`;没上游时补「设为上游」;强推单独一句。

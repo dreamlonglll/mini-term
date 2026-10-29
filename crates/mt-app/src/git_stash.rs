@@ -82,8 +82,22 @@ pub const STASH_CONTEXT: &str = "GitStash";
 
 /// 操作之后让 Git 面板重载的回调。
 type OnChanged = Rc<dyn Fn(&mut App)>;
-/// 贮藏成功之后的回调(参数是新贮藏的引用 `stash@{0}`)。
-type OnSaved = Rc<dyn Fn(String, &mut Window, &mut App)>;
+/// 贮藏成功之后的回调。参数是新贮藏的引用 `stash@{0}`,以及「已贮藏、但有文件未能清理」
+/// 时 git 的原文(见 [`StashSaveOutcome::SavedWithWarnings`])。
+type OnSaved = Rc<dyn Fn(String, Option<String>, &mut Window, &mut App)>;
+
+/// 贮藏成功的说明;带警告时把「有文件未能清理」与 git 原文一起写进去。
+fn saved_text(reference: &str, warning: Option<&str>) -> String {
+    match warning {
+        Some(detail) => tr!(
+            "gitStash",
+            "save.savedWithWarnings",
+            reference = reference,
+            detail = detail
+        ),
+        None => tr!("gitStash", "save.saved", reference = reference),
+    }
+}
 
 /// 左栏宽度(与单文件历史弹窗同宽)。
 const LIST_WIDTH: f32 = 320.0;
@@ -276,11 +290,17 @@ pub fn open_save(
 ) {
     let toast_store = store.clone();
     let on_saved = Rc::new(
-        move |reference: String, _window: &mut Window, cx: &mut App| {
+        move |reference: String, warning: Option<String>, _window: &mut Window, cx: &mut App| {
+            // 有文件没清掉:需要留意那一档,别让人以为工作区已经干净了
+            let tone = if warning.is_some() {
+                Tone::Attention
+            } else {
+                Tone::Info
+            };
             git_ui::toast(
                 &toast_store,
-                tr!("gitStash", "save.saved", reference = reference),
-                Tone::Info,
+                saved_text(&reference, warning.as_deref()),
+                tone,
                 cx,
             );
             on_changed(cx);
@@ -350,11 +370,16 @@ pub fn open_smart_checkout(
                 branch.clone(),
                 on_changed.clone(),
             );
+            let form_cancel = form.clone();
             dialog
                 .title(title)
                 .w(px(git_ui::DIALOG_W_LG))
-                // 执行中别让一下误点遮罩把框收了(结果回来要在框里显示)
+                // 执行中(贮藏 → 检出 → 恢复,三条改仓库的命令)框一律关不掉:遮罩、Esc、
+                // 「取消」都不行。框一关,面板的按钮就又能点了(这一段不经面板的 busy),
+                // 并发的 git 命令会撞 index.lock、把贮藏 / 恢复截在半路
                 .overlay_closable(!busy)
+                .keyboard(!busy)
+                .on_cancel(move |_: &ClickEvent, _window, cx| !form_cancel.read(cx).busy)
                 .footer(git_ui::dialog_footer(
                     if busy {
                         t("gitStash", "checkout.working")
@@ -793,14 +818,18 @@ fn open_save_from_list(state: &Entity<StashDialog>, window: &mut Window, cx: &mu
     let repo = state.read(cx).repo_path.clone();
     let list = state.clone();
     let on_saved = Rc::new(
-        move |reference: String, window: &mut Window, cx: &mut App| {
+        move |reference: String, warning: Option<String>, window: &mut Window, cx: &mut App| {
+            let text = saved_text(&reference, warning.as_deref());
             let on_changed = list.update(cx, |s, cx| {
                 s.select_newest = true;
-                s.notice = Some(Notice::Info(tr!(
-                    "gitStash",
-                    "save.saved",
-                    reference = reference
-                )));
+                s.notice = Some(if warning.is_some() {
+                    Notice::Attention {
+                        text,
+                        files: Vec::new(),
+                    }
+                } else {
+                    Notice::Info(text)
+                });
                 cx.notify();
                 s.on_changed.clone()
             });
@@ -1759,7 +1788,13 @@ fn open_save_with(repo_path: String, on_saved: OnSaved, window: &mut Window, cx:
                         move |outcome, form, window, cx| match outcome {
                             StashSaveOutcome::Saved { reference } => {
                                 close_guarded(kind::GIT_STASH_SAVE, window, cx);
-                                on_saved(reference, window, cx);
+                                on_saved(reference, None, window, cx);
+                            }
+                            // 贮藏已经生成(按 refs/stash 判的),只是有文件清不掉:照样关框、
+                            // 刷新,说明里带上 git 原文
+                            StashSaveOutcome::SavedWithWarnings { reference, detail } => {
+                                close_guarded(kind::GIT_STASH_SAVE, window, cx);
+                                on_saved(reference, Some(detail), window, cx);
                             }
                             StashSaveOutcome::NothingToStash => form.update(cx, |f, cx| {
                                 f.hint = Some(t("gitStash", "save.nothing").to_string());
@@ -1839,6 +1874,24 @@ fn submit_smart_checkout(
                         branch = branch,
                         reference = reference
                     );
+                    if !is_open(kind::GIT_STASH_CHECKOUT) {
+                        git_ui::show_git_error(
+                            tr!("gitStash", "checkout.title", branch = branch),
+                            format!("{text}\n\n{detail}"),
+                            window,
+                            cx,
+                        );
+                        return;
+                    }
+                    let detail = git_ui::error_text_state(&detail, 8, window, cx);
+                    form.update(cx, |f, cx| {
+                        f.outcome = Some((text, Vec::new(), Some(detail)));
+                        cx.notify();
+                    });
+                }
+                // 贮藏生成了、工作区却没清干净(有文件被占用):没有检出,仍在原分支
+                SmartCheckoutOutcome::CheckoutCancelled { detail } => {
+                    let text = tr!("gitStash", "checkout.cancelled", reference = reference);
                     if !is_open(kind::GIT_STASH_CHECKOUT) {
                         git_ui::show_git_error(
                             tr!("gitStash", "checkout.title", branch = branch),

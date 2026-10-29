@@ -10,8 +10,27 @@ use anyhow::{Result, bail};
 use git2::Repository;
 use serde::{Deserialize, Serialize};
 
+use super::branch::{NO_EDITOR, failure_text};
 use super::log_ops::is_commit_hash;
-use super::run_git_command_labeled;
+use super::run_git_output_env;
+
+/// 跑一条 `git tag` / `git push`,非零退出即把原文装进错误。
+///
+/// 一律带 `GIT_EDITOR=true`:面板里没有终端,任何一条意外要消息的路径(比如
+/// `tag.gpgSign=true` 把轻量标签升格成签名的附注标签)都不能拉起编辑器干等到超时。
+fn run_tag_command(
+    repo_path: &Path,
+    args: &[&str],
+    op_label: &str,
+    timeout: Duration,
+    timeout_hint: &str,
+) -> Result<()> {
+    let out = run_git_output_env(repo_path, args, NO_EDITOR, op_label, timeout, timeout_hint)?;
+    if !out.success {
+        bail!("{}", failure_text(&out));
+    }
+    Ok(())
+}
 
 /// 指向某个提交的标签。
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -65,8 +84,8 @@ pub fn list_tags(repo_path: &Path) -> Result<Vec<TagInfo>> {
     Ok(tags)
 }
 
-/// 在某个提交上打标签。`message` 非空 = 附注标签(`-a -m`),否则轻量标签。
-/// **阻塞最多 60s**(附注标签可能要 gpg 签名)。
+/// 在某个提交上打标签。`message` 非空 = 附注标签(`-a -m`,继承用户的 `tag.gpgSign`),
+/// 否则轻量标签。**阻塞最多 60s**(附注标签可能要 gpg 签名)。
 pub fn create_tag(repo_path: &Path, name: &str, hash: &str, message: Option<&str>) -> Result<()> {
     if !is_valid_tag_name(name) {
         bail!("不是合法的标签名:{name}");
@@ -75,19 +94,22 @@ pub fn create_tag(repo_path: &Path, name: &str, hash: &str, message: Option<&str
         bail!("不是有效的提交哈希:{hash}");
     }
     let message = message.map(str::trim).filter(|m| !m.is_empty());
-    let mut args = vec!["tag"];
-    if let Some(message) = message {
-        args.extend(["-a", "-m", message]);
+    let mut args = Vec::new();
+    match message {
+        Some(message) => args.extend(["tag", "-a", "-m", message]),
+        // 轻量标签显式关掉签名:`tag.gpgSign=true` 会把 `git tag <name>` 升格成签名的附注
+        // 标签、转头要消息。不用 `--no-sign`(老 git 不认),`-c` 覆盖配置哪个版本都认
+        None => args.extend(["-c", "tag.gpgSign=false", "tag"]),
     }
     args.extend([name, hash]);
-    run_git_command_labeled(
+    // 操作名写死:args 里可能带着用户的标签消息
+    run_tag_command(
         repo_path,
         &args,
         "tag",
         Duration::from_secs(60),
         ",可能卡在 gpg 签名上",
     )
-    .map(|_| ())
 }
 
 /// 删除本地标签(远程上的不动)。
@@ -95,14 +117,13 @@ pub fn delete_tag(repo_path: &Path, name: &str) -> Result<()> {
     if !is_valid_tag_name(name) {
         bail!("不是合法的标签名:{name}");
     }
-    run_git_command_labeled(
+    run_tag_command(
         repo_path,
         &["tag", "-d", name],
         "tag -d",
         Duration::from_secs(30),
         "",
     )
-    .map(|_| ())
 }
 
 /// 把一个标签推到远程(`git push <remote> refs/tags/<name>`)。写全引用名,
@@ -115,14 +136,13 @@ pub fn push_tag(repo_path: &Path, remote: &str, name: &str) -> Result<()> {
         bail!("不是合法的标签名:{name}");
     }
     let refspec = format!("refs/tags/{name}");
-    run_git_command_labeled(
+    run_tag_command(
         repo_path,
         &["push", remote, &refspec],
         "push tag",
         Duration::from_secs(60),
         ",可能在等待凭证或网络故障。请确认已配置凭证管理器或 SSH key",
     )
-    .map(|_| ())
 }
 
 /// 仓库配置的远程名(`origin` …),推送标签的子菜单用。
@@ -198,6 +218,28 @@ mod tests {
             .collect();
         assert_eq!(names, ["rel/v3", "v2"]);
         assert!(delete_tag(&root, "nope").is_err(), "不存在的标签要报错");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// `tag.gpgSign=true` 时 `git tag <name>` 会被升格成签名的附注标签、拉起编辑器要消息 ——
+    /// 面板里没有终端,原先就是挂到 60s 超时。轻量标签显式关掉签名,且一律 `GIT_EDITOR=true`。
+    #[test]
+    fn 轻量标签不受_tag_gpgsign_影响() {
+        let root = init_repo_with_file("tags-gpgsign", "a.txt", "1\n");
+        {
+            let repo = Repository::open(&root).unwrap();
+            let mut config = repo.config().unwrap();
+            config.set_bool("tag.gpgSign", true).unwrap();
+            // 修好之前别真等 60s:编辑器一起来就失败(环境里的 GIT_EDITOR 会压过它,同样不等)
+            config.set_str("core.editor", "false").unwrap();
+        }
+        let hash = head(&root);
+        create_tag(&root, "v1", &hash, None).unwrap();
+        let tags = list_tags(&root).unwrap();
+        assert_eq!(tags.len(), 1, "{tags:?}");
+        assert!(!tags[0].annotated, "仍是轻量标签");
+        assert_eq!(tags[0].target_hash, hash);
+        delete_tag(&root, "v1").unwrap();
         std::fs::remove_dir_all(root).ok();
     }
 

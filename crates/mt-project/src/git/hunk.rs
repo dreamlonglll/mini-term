@@ -42,9 +42,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow, bail};
 use git2::{Index, IndexEntry, IndexTime, Oid, Repository};
-use pathdiff::diff_paths;
 
-use super::{DiffHunk, GitDiffResult, discover_repo_for, get_head_content, is_conflicted};
+use super::{
+    DiffHunk, GitDiffResult, discover_repo_for, get_head_content, is_conflicted, repo_relative_path,
+};
 
 /// diff 已过期:取 diff 之后文件或暂存区又变了(或者块与全文对不上)。
 ///
@@ -314,10 +315,8 @@ fn locate(project_path: &Path, file_path: &str) -> Result<Located> {
     let workdir = repo
         .workdir()
         .ok_or_else(|| anyhow!("bare repository not supported"))?;
-    let rel = diff_paths(&abs, workdir)
-        .ok_or_else(|| anyhow!("file is outside repository working directory"))?
-        .to_string_lossy()
-        .replace('\\', "/");
+    let rel = repo_relative_path(workdir, project_path, &abs)
+        .ok_or_else(|| anyhow!("file is outside repository working directory"))?;
     Ok(Located { repo, rel, abs })
 }
 

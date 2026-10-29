@@ -11,14 +11,15 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Result, anyhow, bail};
-use git2::{BranchType, Oid, Repository};
+use git2::{BranchType, Direction, Oid, Repository};
 
 use super::branch::{
     NETWORK_HINT, NETWORK_TIMEOUT, NO_EDITOR, failure_text, head_branch_name, remote_names,
     run_checked,
 };
+use super::log_ops::is_commit_hash;
 use super::repo_state::{conflicted_file_count, op_kind_of};
-use super::{GitCommitInfo, commit_info, run_git_output, run_git_output_env};
+use super::{GIT_USAGE_ERROR, GitCommitInfo, commit_info, run_git_output, run_git_output_env};
 
 /// 全部远程跟踪引用 → 指向的提交。
 fn remote_refs(repo: &Repository) -> HashMap<String, Oid> {
@@ -91,11 +92,10 @@ pub fn git_fetch_all(repo_path: &Path) -> Result<FetchOutcome> {
 // Pull
 // ---------------------------------------------------------------------------
 
-/// 拉取方式。
+/// 拉取方式(用户在面板里**手选**的那种;没手选时走 [`git_pull_by_config`])。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PullMode {
-    /// 合并(`--no-rebase`:用户手选了合并就按合并做;没手选时面板按
-    /// [`PullMode::from_config`] 取默认,不会拿它压掉 `pull.rebase=true`)。
+    /// 合并(`--no-rebase`)。
     #[default]
     Merge,
     /// 变基(`--rebase`)。
@@ -105,31 +105,9 @@ pub enum PullMode {
 }
 
 impl PullMode {
-    /// 用户 git 配置里的拉取方式:`pull.rebase=true/merges/interactive` → 变基,
-    /// `pull.ff=only` → 仅快进,其余合并。面板在用户本次会话没手选之前按它拉,
-    /// 不拿 `--no-rebase` 压掉别人配好的 `pull.rebase`。读不到配置按合并算。
+    /// 用户 git 配置里的拉取方式(只用于显示,见 [`PullConfig`])。
     pub fn from_config(repo_path: &Path) -> PullMode {
-        let Ok(config) = Repository::open(repo_path).and_then(|r| r.config()) else {
-            return PullMode::Merge;
-        };
-        let rebase = config
-            .get_string("pull.rebase")
-            .map(|v| v.trim().to_ascii_lowercase())
-            .unwrap_or_default();
-        if matches!(
-            rebase.as_str(),
-            "true" | "yes" | "on" | "1" | "merges" | "m" | "interactive" | "i"
-        ) {
-            return PullMode::Rebase;
-        }
-        let ff = config
-            .get_string("pull.ff")
-            .map(|v| v.trim().to_ascii_lowercase())
-            .unwrap_or_default();
-        if ff == "only" {
-            return PullMode::FfOnly;
-        }
-        PullMode::Merge
+        pull_config(repo_path).mode
     }
 
     fn args(self) -> &'static [&'static str] {
@@ -140,6 +118,74 @@ impl PullMode {
         }
     }
 }
+
+/// 用户 git 配置里写的拉取方式。**只用于显示**(「跟随配置:变基」):真正拉取时
+/// [`git_pull_by_config`] 不带方式参数,`interactive`、`merges` 这些细节全交给 git 自己读。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PullConfig {
+    pub mode: PullMode,
+    /// `rebase=merges`:变基时保留本地的合并提交(`--rebase=merges`)。
+    pub rebase_merges: bool,
+    /// 配置里写明了方式(`branch.<b>.rebase` / `pull.rebase` / `pull.ff` 任一)。
+    /// 都没写时 git 2.33+ 遇到分叉会直接报「需要指定如何调和」,见 [`git_pull_by_config`]。
+    pub explicit: bool,
+}
+
+/// 读当前分支的拉取配置:`branch.<b>.rebase` 压过 `pull.rebase`(与 git 一致);变基的
+/// 取值 `true / merges / interactive`(及其缩写、布尔同义词)都算变基;不变基时
+/// `pull.ff=only` → 仅快进,其余合并。读不到配置按合并算。
+pub fn pull_config(repo_path: &Path) -> PullConfig {
+    let Ok(repo) = Repository::open(repo_path) else {
+        return PullConfig::default();
+    };
+    let Ok(config) = repo.config() else {
+        return PullConfig::default();
+    };
+    let get = |key: &str| {
+        config
+            .get_string(key)
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+    };
+    let branch_rebase = head_branch_name(&repo).and_then(|b| get(&format!("branch.{b}.rebase")));
+    let pull_rebase = get("pull.rebase");
+    let ff = get("pull.ff");
+    let explicit = branch_rebase.is_some() || pull_rebase.is_some() || ff.is_some();
+    let rebase = branch_rebase.or(pull_rebase).unwrap_or_default();
+    let rebase_merges = matches!(rebase.as_str(), "merges" | "m");
+    let rebasing = rebase_merges
+        || matches!(
+            rebase.as_str(),
+            "true" | "yes" | "on" | "1" | "interactive" | "i"
+        );
+    let mode = if rebasing {
+        PullMode::Rebase
+    } else if ff.as_deref() == Some("only") {
+        PullMode::FfOnly
+    } else {
+        PullMode::Merge
+    };
+    PullConfig {
+        mode,
+        rebase_merges,
+        explicit,
+    }
+}
+
+/// 「按配置拉取」的命令行:配置里写明了方式就一个方式参数都不带,完全交给 git(含
+/// `branch.<b>.rebase`、`merges`、`interactive`);什么都没写时补 `--no-rebase` —— 那是
+/// git 一直以来的默认行为,但 2.33+ 在分叉时不再默认、直接报「需要指定如何调和」。
+fn config_pull_args(config: &PullConfig) -> &'static [&'static str] {
+    if config.explicit {
+        &["pull"]
+    } else {
+        &["pull", "--no-rebase"]
+    }
+}
+
+/// 不带方式参数拉取也不能拉起编辑器:合并提交沿用 git 生成的消息,`rebase=interactive`
+/// 的待办列表原样执行(`GIT_SEQUENCE_EDITOR=true` 等于直接保存退出)。
+const PULL_NO_EDITOR: &[(&str, &str)] = &[("GIT_EDITOR", "true"), ("GIT_SEQUENCE_EDITOR", "true")];
 
 /// 一次 Pull 的结果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,8 +204,20 @@ pub enum PullOutcome {
 /// 数提交的上限 —— 只是给摘要用的数字,不必为几万个提交走完整张图。
 const COUNT_CAP: usize = 10_000;
 
-/// 按指定方式拉取当前分支。
+/// 按用户手选的方式拉取当前分支。
 pub fn git_pull_with(repo_path: &Path, mode: PullMode) -> Result<PullOutcome> {
+    pull_run(repo_path, mode.args(), NO_EDITOR)
+}
+
+/// 用户本次会话没手选方式时的拉取:**不带方式参数**,完全按用户的 git 配置来(见
+/// [`config_pull_args`])。旧实现把配置折算成 [`PullMode`] 再带参数,`pull.rebase=merges`
+/// 被降成 `--rebase` 拍平了合并提交,`branch.<b>.rebase` 也压根没读。
+pub fn git_pull_by_config(repo_path: &Path) -> Result<PullOutcome> {
+    let config = pull_config(repo_path);
+    pull_run(repo_path, config_pull_args(&config), PULL_NO_EDITOR)
+}
+
+fn pull_run(repo_path: &Path, args: &[&str], envs: &[(&str, &str)]) -> Result<PullOutcome> {
     let repo = Repository::open(repo_path)?;
     let branch = head_branch_name(&repo).ok_or_else(|| anyhow!("分离 HEAD 状态下无法拉取"))?;
     let before = repo
@@ -167,14 +225,7 @@ pub fn git_pull_with(repo_path: &Path, mode: PullMode) -> Result<PullOutcome> {
         .target()
         .ok_or_else(|| anyhow!("当前没有提交"))?;
     drop(repo);
-    let out = run_git_output_env(
-        repo_path,
-        mode.args(),
-        NO_EDITOR,
-        "pull",
-        NETWORK_TIMEOUT,
-        NETWORK_HINT,
-    )?;
+    let out = run_git_output_env(repo_path, args, envs, "pull", NETWORK_TIMEOUT, NETWORK_HINT)?;
     let repo = Repository::open(repo_path)?;
     if !out.success {
         if op_kind_of(repo.state()).is_some() {
@@ -210,11 +261,34 @@ pub fn git_pull_with(repo_path: &Path, mode: PullMode) -> Result<PullOutcome> {
 pub struct PushTarget {
     /// 要推的本地分支。
     pub branch: String,
+    /// 推到哪个远程:`branch.<b>.pushRemote` > `remote.pushDefault` > 上游所在的远程 >
+    /// 默认远程(与 git 的取法一致;配置里写了不存在的远程就往下一档退)。
     pub remote: String,
-    /// 远端的分支名(有上游时取上游的,可能与本地不同名;没上游时同名)。
+    /// 远端的分支名。`push.default=upstream` 且推往上游所在的远程时取上游名;其余一律与
+    /// 本地**同名**(git 的 `simple` / `current`;`matching` / `nothing` / 未设置也按 `simple`)。
     pub remote_branch: String,
-    /// 已配上游。`false` = 这次推送会顺带 `-u` 设上游。
-    pub has_upstream: bool,
+    /// 上游的显示名(`origin/main`;`branch.<b>.remote=.` 的本地上游只有分支名)。
+    /// `None` = 没配上游,这次推送顺带 `-u` 设上去(见 [`PushTarget::sets_upstream`])。
+    pub upstream: Option<String>,
+    /// 配了上游、但这次推的不是它(上游名与本地名不同,或推送远程另有配置)。推完上游
+    /// 配置保持原样 —— 推送对话框要把这一点说出来。
+    pub upstream_differs: bool,
+    /// 算计划这一刻目标的远程跟踪引用(`refs/remotes/<远程>/<分支>`)指向的提交;
+    /// 不在 = `None`。强推时当 lease 的期望值(见 [`PushOptions::expected_oid`])。
+    pub tracking_oid: Option<String>,
+}
+
+impl PushTarget {
+    /// 这次推送会不会顺带设上游(`-u`):只在**完全没有**上游时。已有上游(哪怕与这次的
+    /// 目标不同)一律不动,不擅自改用户的配置。
+    pub fn sets_upstream(&self) -> bool {
+        self.upstream.is_none()
+    }
+
+    /// `origin/feature`。
+    pub fn label(&self) -> String {
+        format!("{}/{}", self.remote, self.remote_branch)
+    }
 }
 
 /// 能不能推、推到哪。
@@ -241,7 +315,32 @@ fn default_remote(remotes: &[String]) -> Option<String> {
         .cloned()
 }
 
+/// 远程分支 `<remote>/<branch>` 在本地的远程跟踪引用名:按该远程的 fetch refspec 换算
+/// (自定义过 refspec 的也认),换算不出来退回默认布局 `refs/remotes/<remote>/<branch>`。
+fn tracking_ref_name(repo: &Repository, remote: &str, branch: &str) -> String {
+    let src = format!("refs/heads/{branch}");
+    if let Ok(found) = repo.find_remote(remote) {
+        for spec in found.refspecs() {
+            if spec.direction() != Direction::Fetch || !spec.src_matches(&src) {
+                continue;
+            }
+            if let Some(name) = spec
+                .transform(&src)
+                .ok()
+                .and_then(|b| b.as_str().map(str::to_string))
+            {
+                return name;
+            }
+        }
+    }
+    format!("refs/remotes/{remote}/{branch}")
+}
+
 /// 算推送计划。`branch = None` 表示当前分支。
+///
+/// 推到哪与 git 自己的口径一致(见 [`PushTarget`] 各字段)。旧实现一律拿
+/// `branch.<b>.merge` 当目标名:从 `origin/main` 新建的分支(git 自动把上游设成
+/// origin/main)「提交并推送」会执行 `push origin feature:main`,直接快进远端 main。
 ///
 /// 上游按配置读(`branch.<b>.remote` + `branch.<b>.merge`),不要求远程跟踪引用在场 ——
 /// 「远端分支被删了又 prune 过」时上游配置还在,推送会把它重新建出来。
@@ -258,33 +357,63 @@ pub fn push_plan(repo_path: &Path, branch: Option<&str>) -> Result<PushPlan> {
             None => return Ok(PushPlan::Detached),
         },
     };
+    plan_for(&repo, branch)
+}
+
+fn plan_for(repo: &Repository, branch: String) -> Result<PushPlan> {
     let config = repo.config()?;
-    let remote = config.get_string(&format!("branch.{branch}.remote")).ok();
-    let merge = config.get_string(&format!("branch.{branch}.merge")).ok();
-    let remotes = remote_names(&repo);
-    if let (Some(remote), Some(merge)) = (remote, merge)
-        && remotes.contains(&remote)
-    {
-        let remote_branch = merge
-            .strip_prefix("refs/heads/")
-            .unwrap_or(&merge)
-            .to_string();
-        return Ok(PushPlan::Ready(PushTarget {
-            branch,
-            remote,
-            remote_branch,
-            has_upstream: true,
-        }));
-    }
-    match default_remote(&remotes) {
-        Some(remote) => Ok(PushPlan::Ready(PushTarget {
-            remote_branch: branch.clone(),
-            branch,
-            remote,
-            has_upstream: false,
-        })),
-        None => Ok(PushPlan::NoRemote { branch }),
-    }
+    let get = |key: &str| {
+        config
+            .get_string(key)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    let remotes = remote_names(repo);
+    let known = |name: &String| remotes.contains(name);
+    let upstream = match (
+        get(&format!("branch.{branch}.remote")),
+        get(&format!("branch.{branch}.merge")),
+    ) {
+        (Some(remote), Some(merge)) => {
+            let name = merge
+                .strip_prefix("refs/heads/")
+                .unwrap_or(&merge)
+                .to_string();
+            Some((remote, name))
+        }
+        _ => None,
+    };
+    let remote = get(&format!("branch.{branch}.pushRemote"))
+        .filter(known)
+        .or_else(|| get("remote.pushDefault").filter(known))
+        .or_else(|| upstream.as_ref().map(|(r, _)| r.clone()).filter(known))
+        .or_else(|| default_remote(&remotes));
+    let Some(remote) = remote else {
+        return Ok(PushPlan::NoRemote { branch });
+    };
+    let push_default = get("push.default").map(|v| v.to_ascii_lowercase());
+    // `tracking` 是 `upstream` 的旧名
+    let to_upstream = matches!(push_default.as_deref(), Some("upstream" | "tracking"));
+    let remote_branch = match &upstream {
+        Some((up_remote, up_branch)) if to_upstream && *up_remote == remote => up_branch.clone(),
+        _ => branch.clone(),
+    };
+    let upstream_differs = upstream
+        .as_ref()
+        .is_some_and(|(r, b)| *r != remote || *b != remote_branch);
+    let tracking_oid = repo
+        .refname_to_id(&tracking_ref_name(repo, &remote, &remote_branch))
+        .ok()
+        .map(|oid| oid.to_string());
+    Ok(PushPlan::Ready(PushTarget {
+        upstream: upstream.map(|(r, b)| if r == "." { b } else { format!("{r}/{b}") }),
+        upstream_differs,
+        tracking_oid,
+        remote_branch,
+        branch,
+        remote,
+    }))
 }
 
 /// 待推送的提交。
@@ -296,7 +425,8 @@ pub struct OutgoingCommits {
     pub truncated: bool,
 }
 
-/// 待推送的提交:分支有、上游没有的;没上游时取「不在任何远程分支上」的。
+/// 待推送的提交:分支有、**推送目标**的远程分支没有的(与 [`push_plan`] 同一个目标,
+/// 不是上游 —— 两者可以不同);目标在本地还没有远程跟踪引用时取「不在任何远程分支上」的。
 /// `branch = None` 表示当前分支;detached / 空仓库返回空列表。
 ///
 /// 遍历不设排序(libgit2 一设排序就先走完全部可达提交再排,见 `get_git_log`
@@ -324,8 +454,12 @@ pub fn outgoing_commits(
     let Some(tip) = local.get().target() else {
         return Ok(empty);
     };
-    let hide: Vec<Oid> = match local.upstream().ok().and_then(|u| u.get().target()) {
-        Some(upstream) => vec![upstream],
+    let target_tip = match plan_for(&repo, name)? {
+        PushPlan::Ready(target) => target.tracking_oid.and_then(|o| Oid::from_str(&o).ok()),
+        _ => None,
+    };
+    let hide: Vec<Oid> = match target_tip {
+        Some(oid) => vec![oid],
         None => remote_refs(&repo).into_values().collect(),
     };
     let mut walk = repo.revwalk()?;
@@ -351,8 +485,12 @@ pub fn outgoing_commits(
 pub struct PushOptions {
     /// `None` = 当前分支。
     pub branch: Option<String>,
-    /// `--force-with-lease`:远端有本地没见过的新提交时拒绝,否则覆盖远端历史。
+    /// 强推(带 lease):远端已不是预览时的样子就拒绝,否则覆盖远端历史。
     pub force_with_lease: bool,
+    /// 强推的期望值:推送对话框预览时目标远程跟踪引用指向的提交(见
+    /// [`PushTarget::tracking_oid`])。`None` = 预览时目标远端分支还不存在 —— 这时用不着
+    /// 强推,按普通推送走(远端其实已有且不是快进的话照常被拒)。
+    pub expected_oid: Option<String>,
 }
 
 /// 一次推送的结果。网络 / 认证这类失败是 `Err`。
@@ -377,8 +515,14 @@ pub fn push_was_rejected(porcelain: &str) -> bool {
         .any(|line| line.starts_with('!') && line.contains("[rejected]"))
 }
 
-/// 按选项推送。没上游时带 `-u` 顺带设上游;refspec 写全 `refs/heads/`,本地恰好有
+/// 按选项推送。完全没有上游时带 `-u` 顺带设上游;refspec 写全 `refs/heads/`,本地恰好有
 /// 同名 tag 也不会推错。
+///
+/// 强推的 lease 写明期望值 `--force-with-lease=refs/heads/<目标>:<预览时的 oid>`,不用裸
+/// `--force-with-lease`:后者取的是**推送这一刻**的远程跟踪引用 —— 对话框开着期间点过
+/// Fetch 的话,别人刚推上去、本地还没整合的提交会被当成「见过的」覆盖掉。另带
+/// `--force-if-includes` 多兜一层(按 git 文档,它只在不写期望值的 lease 上生效,写明期望值
+/// 时由期望值本身把关);老 git(< 2.30)不认它,报用法错误时去掉重试一次。
 pub fn git_push_with(repo_path: &Path, options: &PushOptions) -> Result<PushOutcome> {
     let target = match push_plan(repo_path, options.branch.as_deref())? {
         PushPlan::Ready(target) => target,
@@ -389,16 +533,37 @@ pub fn git_push_with(repo_path: &Path, options: &PushOptions) -> Result<PushOutc
         "refs/heads/{}:refs/heads/{}",
         target.branch, target.remote_branch
     );
-    let mut args: Vec<&str> = vec!["push", "--porcelain"];
-    if !target.has_upstream {
-        args.push("-u");
+    let lease = match (options.force_with_lease, options.expected_oid.as_deref()) {
+        (true, Some(oid)) => {
+            if !is_commit_hash(oid) || oid.len() < 40 {
+                bail!("强推的期望值不是完整的提交哈希:{oid}");
+            }
+            Some(format!(
+                "--force-with-lease=refs/heads/{}:{oid}",
+                target.remote_branch
+            ))
+        }
+        _ => None,
+    };
+    let push = |if_includes: bool| {
+        let mut args: Vec<&str> = vec!["push", "--porcelain"];
+        if target.sets_upstream() {
+            args.push("-u");
+        }
+        if let Some(lease) = &lease {
+            args.push(lease);
+            if if_includes {
+                args.push("--force-if-includes");
+            }
+        }
+        args.push(&target.remote);
+        args.push(&refspec);
+        run_git_output(repo_path, &args, "push", NETWORK_TIMEOUT, NETWORK_HINT)
+    };
+    let mut out = push(true)?;
+    if lease.is_some() && !out.success && out.code == Some(GIT_USAGE_ERROR) {
+        out = push(false)?;
     }
-    if options.force_with_lease {
-        args.push("--force-with-lease");
-    }
-    args.push(&target.remote);
-    args.push(&refspec);
-    let out = run_git_output(repo_path, &args, "push", NETWORK_TIMEOUT, NETWORK_HINT)?;
     if out.success {
         return Ok(PushOutcome::Pushed(target));
     }
@@ -540,25 +705,30 @@ mod tests {
     #[test]
     fn 推送计划() {
         let (work, bare, branch) = repo_with_origin("sync-plan");
+        let head = git(&work, &["rev-parse", "HEAD"]);
         assert_eq!(
             push_plan(&work, None).unwrap(),
             PushPlan::Ready(PushTarget {
                 branch: branch.clone(),
                 remote: "origin".into(),
                 remote_branch: branch.clone(),
-                has_upstream: true,
+                upstream: Some(format!("origin/{branch}")),
+                upstream_differs: false,
+                tracking_oid: Some(head.clone()),
             })
         );
         git(&work, &["checkout", "-q", "-b", "fresh"]);
-        assert_eq!(
-            push_plan(&work, None).unwrap(),
-            PushPlan::Ready(PushTarget {
-                branch: "fresh".into(),
-                remote: "origin".into(),
-                remote_branch: "fresh".into(),
-                has_upstream: false,
-            })
-        );
+        let fresh = PushTarget {
+            branch: "fresh".into(),
+            remote: "origin".into(),
+            remote_branch: "fresh".into(),
+            upstream: None,
+            upstream_differs: false,
+            tracking_oid: None,
+        };
+        assert!(fresh.sets_upstream());
+        assert_eq!(fresh.label(), "origin/fresh");
+        assert_eq!(push_plan(&work, None).unwrap(), PushPlan::Ready(fresh));
         let oid = git(&work, &["rev-parse", "HEAD"]);
         git(&work, &["checkout", "-q", &oid]);
         assert_eq!(push_plan(&work, None).unwrap(), PushPlan::Detached);
@@ -639,13 +809,21 @@ mod tests {
             other => panic!("应被拒: {other:?}"),
         }
 
-        // fetch 过之后带 lease 强推:覆盖远端
+        // fetch 过之后再预览、带 lease 强推(期望值 = 预览时的远程值):覆盖远端
         git(&work, &["fetch", "-q", "origin"]);
+        let PushPlan::Ready(previewed) = push_plan(&work, None).unwrap() else {
+            panic!("应当可推");
+        };
+        assert_eq!(
+            previewed.tracking_oid,
+            Some(git(&other, &["rev-parse", "HEAD"]))
+        );
         let forced = git_push_with(
             &work,
             &PushOptions {
                 branch: None,
                 force_with_lease: true,
+                expected_oid: previewed.tracking_oid,
             },
         )
         .unwrap();
@@ -653,6 +831,286 @@ mod tests {
         assert_eq!(
             git(&bare, &["rev-parse", &branch]),
             git(&work, &["rev-parse", "HEAD"])
+        );
+        cleanup(&[&work, &bare, &other]);
+    }
+
+    /// 从 `origin/main` 新建的分支(git 自动把上游设成 origin/main)「提交并推送」:
+    /// 旧实现拿上游名当目标,执行 `push origin refs/heads/feature:refs/heads/main`,
+    /// 直接把远端 main 快进了。与 git 的 `push.default=simple` 一致:推到同名分支,
+    /// 且不擅自改用户的上游配置(不带 `-u`)。
+    #[test]
+    fn 从远程分支新建的分支推到同名分支且不改上游() {
+        let (work, bare, branch) = repo_with_origin("sync-push-feature");
+        let main_before = git(&bare, &["rev-parse", &branch]);
+        git(
+            &work,
+            &[
+                "checkout",
+                "-q",
+                "-b",
+                "feature",
+                &format!("origin/{branch}"),
+            ],
+        );
+        let merge_key = "branch.feature.merge";
+        assert_eq!(
+            git(&work, &["config", merge_key]),
+            format!("refs/heads/{branch}"),
+            "前提:git 自动把上游设成了 origin/{branch}"
+        );
+        commit_file(&work, "f.txt", "f\n", "feature work");
+
+        let PushPlan::Ready(target) = push_plan(&work, None).unwrap() else {
+            panic!("应当可推");
+        };
+        assert_eq!(
+            (target.remote.as_str(), target.remote_branch.as_str()),
+            ("origin", "feature")
+        );
+        assert_eq!(target.upstream, Some(format!("origin/{branch}")));
+        assert!(target.upstream_differs, "目标与上游不同,UI 要说明");
+        assert!(!target.sets_upstream(), "已有上游,不带 -u");
+        assert_eq!(target.tracking_oid, None, "远端还没有 feature");
+        let out = outgoing_commits(&work, None, 100).unwrap();
+        let titles: Vec<&str> = out.commits.iter().map(|c| c.message.as_str()).collect();
+        assert_eq!(titles, vec!["feature work"]);
+
+        let pushed = git_push_with(&work, &PushOptions::default()).unwrap();
+        assert!(matches!(pushed, PushOutcome::Pushed(_)), "{pushed:?}");
+        assert_eq!(
+            git(&bare, &["rev-parse", &branch]),
+            main_before,
+            "远端 {branch} 不能被快进"
+        );
+        assert_eq!(
+            git(&bare, &["rev-parse", "feature"]),
+            git(&work, &["rev-parse", "HEAD"])
+        );
+        assert_eq!(
+            git(&work, &["config", merge_key]),
+            format!("refs/heads/{branch}"),
+            "上游配置保持原样"
+        );
+        cleanup(&[&work, &bare]);
+    }
+
+    /// 强推的 lease 期望值取**预览时**的远程跟踪值:对话框开着期间点了 Fetch,远程跟踪
+    /// 引用已经是别人的新提交、但本地没整合它 —— 裸 `--force-with-lease` 拿的是 Fetch 之后
+    /// 的值,会把别人的提交覆盖掉。
+    #[test]
+    fn 强推的_lease_按预览时的远程值() {
+        let (work, bare, branch) = repo_with_origin("sync-lease");
+        let PushPlan::Ready(plan) = push_plan(&work, None).unwrap() else {
+            panic!("应当可推");
+        };
+        let previewed = plan.tracking_oid.expect("预览时远程跟踪引用在场");
+        assert_eq!(
+            previewed,
+            git(
+                &work,
+                &["rev-parse", &format!("refs/remotes/origin/{branch}")]
+            )
+        );
+        let other = clone_of(&bare, &branch);
+        commit_file(&other, "o.txt", "o\n", "theirs");
+        git(&other, &["push", "-q", "origin", &branch]);
+        let theirs = git(&other, &["rev-parse", "HEAD"]);
+        git(&work, &["fetch", "-q", "origin"]);
+        commit_file(&work, "w.txt", "w\n", "mine");
+
+        let out = git_push_with(
+            &work,
+            &PushOptions {
+                branch: None,
+                force_with_lease: true,
+                expected_oid: Some(previewed),
+            },
+        )
+        .unwrap();
+        assert!(matches!(out, PushOutcome::Rejected { .. }), "{out:?}");
+        assert_eq!(
+            git(&bare, &["rev-parse", &branch]),
+            theirs,
+            "别人的提交不能被覆盖"
+        );
+        // 期望值不是完整哈希(UI 传错 / 被篡改)直接拒绝,不拼进命令行
+        let bad = PushOptions {
+            branch: None,
+            force_with_lease: true,
+            expected_oid: Some("-x".into()),
+        };
+        assert!(git_push_with(&work, &bad).is_err());
+        cleanup(&[&work, &bare, &other]);
+    }
+
+    /// 强推时目标远端分支不存在(预览时没有远程跟踪引用):用不着强推选项,按普通推送建出来。
+    #[test]
+    fn 强推到不存在的远端分支按普通推送() {
+        let (work, bare, _) = repo_with_origin("sync-force-new");
+        git(&work, &["checkout", "-q", "-b", "brand-new"]);
+        commit_file(&work, "n.txt", "n\n", "new");
+        let out = git_push_with(
+            &work,
+            &PushOptions {
+                branch: None,
+                force_with_lease: true,
+                expected_oid: None,
+            },
+        )
+        .unwrap();
+        assert!(matches!(out, PushOutcome::Pushed(_)), "{out:?}");
+        assert_eq!(
+            git(&bare, &["rev-parse", "brand-new"]),
+            git(&work, &["rev-parse", "HEAD"])
+        );
+        cleanup(&[&work, &bare]);
+    }
+
+    /// `push.default=upstream` 推到上游名;推送远程按 `branch.<b>.pushRemote` >
+    /// `remote.pushDefault` > 上游所在的远程;推往别的远程时目标与上游不同。
+    #[test]
+    fn 推送目标跟随_push_配置() {
+        let (work, bare, branch) = repo_with_origin("sync-push-config");
+        git(
+            &work,
+            &[
+                "checkout",
+                "-q",
+                "-b",
+                "feature",
+                &format!("origin/{branch}"),
+            ],
+        );
+        git(&work, &["config", "push.default", "upstream"]);
+        let PushPlan::Ready(target) = push_plan(&work, None).unwrap() else {
+            panic!("应当可推");
+        };
+        assert_eq!(target.label(), format!("origin/{branch}"));
+        assert!(!target.upstream_differs);
+
+        let fork = bare.with_file_name(format!(
+            "{}-fork.git",
+            bare.file_name().unwrap().to_string_lossy()
+        ));
+        git(
+            bare.parent().unwrap(),
+            &["init", "-q", "--bare", &fork.to_string_lossy()],
+        );
+        git(&work, &["remote", "add", "fork", &fork.to_string_lossy()]);
+        git(&work, &["config", "remote.pushDefault", "fork"]);
+        let PushPlan::Ready(target) = push_plan(&work, None).unwrap() else {
+            panic!("应当可推");
+        };
+        assert_eq!(target.label(), "fork/feature", "推往别的远程:按同名");
+        assert!(target.upstream_differs);
+        assert!(!target.sets_upstream());
+
+        git(&work, &["config", "branch.feature.pushRemote", "origin"]);
+        git(&work, &["config", "push.default", "simple"]);
+        let PushPlan::Ready(target) = push_plan(&work, None).unwrap() else {
+            panic!("应当可推");
+        };
+        assert_eq!(
+            target.label(),
+            "origin/feature",
+            "分支级 pushRemote 压过 pushDefault"
+        );
+        // 配置里写了不存在的远程:退到下一档
+        git(&work, &["config", "branch.feature.pushRemote", "gone"]);
+        let PushPlan::Ready(target) = push_plan(&work, None).unwrap() else {
+            panic!("应当可推");
+        };
+        assert_eq!(target.remote, "fork");
+        cleanup(&[&work, &bare, &fork]);
+    }
+
+    /// 老 git 不认 `--force-if-includes` 时据以重试的信号:不认识的选项一律退出码 129
+    /// (只看退出码,不看会被本地化的提示文本)。
+    #[test]
+    fn 不认识的选项退出码是_129() {
+        let root = init_repo_with_file("exit-129", "a.txt", "a\n");
+        let out = run_git_output(
+            &root,
+            &["push", "--mt-definitely-unknown-option"],
+            "push",
+            std::time::Duration::from_secs(20),
+            "",
+        )
+        .unwrap();
+        assert!(!out.success);
+        assert_eq!(out.code, Some(GIT_USAGE_ERROR), "{}", out.stderr);
+        cleanup(&[&root]);
+    }
+
+    /// 拉取方式的显示也读 `branch.<b>.rebase`(它压过 `pull.rebase`)。
+    #[test]
+    fn 拉取方式读分支级_rebase_配置() {
+        let root = init_repo_with_file("pull-branch-rebase", "a.txt", "a\n");
+        let branch = current(&root);
+        let set = |key: &str, value: &str| {
+            Repository::open(&root)
+                .unwrap()
+                .config()
+                .unwrap()
+                .set_str(key, value)
+                .unwrap();
+        };
+        // 「什么都没配」测不了:Git for Windows 的安装器会往系统级配置里写 `pull.rebase=false`
+        set(&format!("branch.{branch}.rebase"), "true");
+        assert_eq!(PullMode::from_config(&root), PullMode::Rebase);
+        set("pull.rebase", "true");
+        set(&format!("branch.{branch}.rebase"), "false");
+        assert_eq!(
+            PullMode::from_config(&root),
+            PullMode::Merge,
+            "分支级配置压过 pull.rebase"
+        );
+        set(&format!("branch.{branch}.rebase"), "merges");
+        let config = pull_config(&root);
+        assert_eq!(config.mode, PullMode::Rebase);
+        assert!(config.rebase_merges, "merges 要显示成「保留合并的变基」");
+        assert!(config.explicit);
+        cleanup(&[&root]);
+    }
+
+    /// 按配置拉取的命令行:配置写明了方式就一个方式参数都不带;什么都没写时补
+    /// `--no-rebase`(git 2.33+ 分叉时不再默认合并,而是直接报错)。
+    #[test]
+    fn 按配置拉取的参数() {
+        let explicit = PullConfig {
+            explicit: true,
+            ..PullConfig::default()
+        };
+        assert_eq!(config_pull_args(&explicit), ["pull"]);
+        assert_eq!(
+            config_pull_args(&PullConfig::default()),
+            ["pull", "--no-rebase"]
+        );
+    }
+
+    /// 没手选方式时按用户配置拉:`pull.rebase=merges` 要保留本地的合并提交,
+    /// 旧实现把它降成 `--rebase`,合并被拍平。
+    #[test]
+    fn 跟随配置拉取不拍平合并提交() {
+        let (work, bare, branch) = repo_with_origin("sync-pull-merges");
+        let other = clone_of(&bare, &branch);
+        commit_file(&other, "o.txt", "o\n", "theirs");
+        git(&other, &["push", "-q", "origin", &branch]);
+
+        git(&work, &["checkout", "-q", "-b", "side"]);
+        commit_file(&work, "s.txt", "s\n", "side");
+        git(&work, &["checkout", "-q", &branch]);
+        commit_file(&work, "m.txt", "m\n", "main");
+        git(&work, &["merge", "-q", "--no-ff", "--no-edit", "side"]);
+        git(&work, &["config", "pull.rebase", "merges"]);
+
+        let out = git_pull_by_config(&work).unwrap();
+        assert!(matches!(out, PullOutcome::Updated { .. }), "{out:?}");
+        assert_eq!(
+            git(&work, &["rev-list", "--count", "--merges", "@{u}..HEAD"]),
+            "1",
+            "本地的合并提交要保留"
         );
         cleanup(&[&work, &bare, &other]);
     }

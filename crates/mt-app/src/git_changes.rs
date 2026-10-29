@@ -62,7 +62,7 @@ use gpui::{
 use gpui_component::input::{InputEvent, Textarea, TextareaState};
 use mt_project::git::{
     AmendInfo, ChangeFileStatus, CommitMessageEntry, CommitTarget, ConflictInfo, ConflictSide,
-    GitStatus,
+    GitStatus, RepoOpKind,
 };
 use mt_ui::icons::FileIcon;
 use mt_ui::tooltip::TooltipExt as _;
@@ -316,6 +316,8 @@ fn flatten_tree(
 struct Snapshot {
     changes: Vec<ChangeFileStatus>,
     conflicts: Vec<ConflictInfo>,
+    /// 进行中的合并 / 变基…(冲突菜单「采用 ours / theirs」的文案随它翻转)
+    op_kind: Option<RepoOpKind>,
     target: Option<CommitTarget>,
     has_head: bool,
     /// 勾着 amend 时顺带刷新「已推送」判定;没勾为 `None`
@@ -337,6 +339,9 @@ pub struct GitChanges {
     changes: Vec<ChangeFileStatus>,
     /// 冲突文件的三方条目在不在(删除 / 修改冲突时有一侧缺席),随列表一起取
     conflicts: Vec<ConflictInfo>,
+    /// 进行中的合并 / 变基 / 拣选 / 还原,随列表一起取。变基时 git 的 ours / theirs
+    /// 与直觉相反,冲突菜单据此换成写清方向的文案
+    op_kind: Option<RepoOpKind>,
     loading: bool,
     /// 上一次取变更失败的原文;`Some` 时列表区显示它而不是空态。
     load_error: Option<String>,
@@ -405,6 +410,7 @@ impl GitChanges {
             repo_path: String::new(),
             changes: Vec::new(),
             conflicts: Vec::new(),
+            op_kind: None,
             loading: false,
             load_error: None,
             collapsed_dirs: HashSet::new(),
@@ -444,6 +450,7 @@ impl GitChanges {
         self.repo_path = repo_path.to_string();
         self.changes.clear();
         self.conflicts.clear();
+        self.op_kind = None;
         self.collapsed_dirs.clear();
         self.clear_selection();
         self.target = None;
@@ -498,6 +505,7 @@ impl GitChanges {
                     Ok(snap) => {
                         this.changes = snap.changes;
                         this.conflicts = snap.conflicts;
+                        this.op_kind = snap.op_kind;
                         this.target = snap.target;
                         this.has_head = snap.has_head;
                         if !this.has_head {
@@ -514,6 +522,7 @@ impl GitChanges {
                         eprintln!("[git] 取变更失败: {err:#}");
                         this.changes.clear();
                         this.conflicts.clear();
+                        this.op_kind = None;
                         this.load_error = Some(format!("{err:#}"));
                     }
                 }
@@ -1214,8 +1223,10 @@ impl GitChanges {
                 this.pushing = false;
                 let failure = match result {
                     Ok(PushOutcome::Pushed(target)) => {
-                        let target = format!("{}/{}", target.remote, target.remote_branch);
-                        this.notify_info(tr!("gitCommit", "pushedToast", target = target), cx);
+                        this.notify_info(
+                            tr!("gitCommit", "pushedToast", target = target.label()),
+                            cx,
+                        );
                         // 远程跟踪分支前移了:分支列表 / 历史的远程标记要跟上
                         cx.emit(GitChangesEvent::Committed);
                         None
@@ -1407,13 +1418,36 @@ fn load_snapshot(repo: &Path, want_amend: bool) -> anyhow::Result<Snapshot> {
     } else {
         Vec::new()
     };
+    let op_kind = mt_project::git::repo_operation_state(repo)
+        .ok()
+        .and_then(|state| state.kind);
     Ok(Snapshot {
         changes,
         conflicts,
+        op_kind,
         target: mt_project::git::commit_target(repo).ok(),
         has_head: mt_project::git::head_exists(repo),
         amend: want_amend.then(|| mt_project::git::amend_info(repo).ok().flatten()),
     })
+}
+
+/// 冲突菜单「采用一侧」的文案 key(`gitCommit` 命名空间)。`deleted` = 那一侧是删除。
+///
+/// 变基时 git 的 ours / theirs 与直觉**相反**:ours 是被变基到的那一侧(上游),
+/// theirs 才是正在重放的、用户自己的提交 —— 照「我方 / 对方」写,用户点「采用我方」
+/// 恰好丢掉自己的改动。合并 / 拣选 / 还原时 ours 就是当前分支,维持原文案。
+fn take_side_key(side: ConflictSide, deleted: bool, op: Option<RepoOpKind>) -> &'static str {
+    let rebasing = op == Some(RepoOpKind::Rebase);
+    match (side, deleted, rebasing) {
+        (ConflictSide::Ours, false, false) => "takeOurs",
+        (ConflictSide::Ours, true, false) => "takeOursDeleted",
+        (ConflictSide::Theirs, false, false) => "takeTheirs",
+        (ConflictSide::Theirs, true, false) => "takeTheirsDeleted",
+        (ConflictSide::Ours, false, true) => "takeOursRebase",
+        (ConflictSide::Ours, true, true) => "takeOursRebaseDeleted",
+        (ConflictSide::Theirs, false, true) => "takeTheirsRebase",
+        (ConflictSide::Theirs, true, true) => "takeTheirsRebaseDeleted",
+    }
 }
 
 /// 确认框里列出的文件(最多 5 个,多出的写「…等 N 个」)。
@@ -1932,12 +1966,7 @@ impl GitChanges {
                         ConflictSide::Ours => !c.ours,
                         ConflictSide::Theirs => !c.theirs,
                     });
-                    let label = match (side, deleted) {
-                        (ConflictSide::Ours, false) => t("gitCommit", "takeOurs"),
-                        (ConflictSide::Ours, true) => t("gitCommit", "takeOursDeleted"),
-                        (ConflictSide::Theirs, false) => t("gitCommit", "takeTheirs"),
-                        (ConflictSide::Theirs, true) => t("gitCommit", "takeTheirsDeleted"),
-                    };
+                    let label = t("gitCommit", take_side_key(side, deleted, self.op_kind));
                     let (this, paths) = (this.clone(), paths.clone());
                     let mut item =
                         MenuItem::new(label)
@@ -2314,6 +2343,33 @@ impl GitChanges {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 变基中「采用 ours / theirs」换成写清方向的文案(ours = 变基目标,theirs = 你的
+    /// 改动);合并 / 拣选 / 还原 / 没有进行中的操作时维持「我方 / 对方」。
+    #[test]
+    fn 变基时采用一侧的文案写清方向() {
+        use ConflictSide::{Ours, Theirs};
+        for op in [
+            None,
+            Some(RepoOpKind::Merge),
+            Some(RepoOpKind::CherryPick),
+            Some(RepoOpKind::Revert),
+        ] {
+            assert_eq!(take_side_key(Ours, false, op), "takeOurs");
+            assert_eq!(take_side_key(Theirs, true, op), "takeTheirsDeleted");
+        }
+        let rebase = Some(RepoOpKind::Rebase);
+        assert_eq!(take_side_key(Ours, false, rebase), "takeOursRebase");
+        assert_eq!(take_side_key(Ours, true, rebase), "takeOursRebaseDeleted");
+        assert_eq!(take_side_key(Theirs, false, rebase), "takeTheirsRebase");
+        assert_eq!(
+            take_side_key(Theirs, true, rebase),
+            "takeTheirsRebaseDeleted"
+        );
+        // 文案里真写着方向:theirs 那条点明是「你的改动」
+        let theirs = mt_i18n::t_in(mt_i18n::Locale::Zh, "gitCommit", "takeTheirsRebase");
+        assert!(theirs.contains("你的改动"), "{theirs}");
+    }
 
     fn change(
         path: &str,

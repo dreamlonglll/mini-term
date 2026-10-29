@@ -19,8 +19,8 @@
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Result, anyhow, bail};
 use git2::{Commit, Oid, Repository, RepositoryOpenFlags, Status, StatusOptions};
@@ -186,6 +186,9 @@ fn collect_repo_status(
         .include_ignored(false);
 
     let statuses = repo.statuses(Some(&mut opts))?;
+    let repo_workdir = repo.workdir().unwrap_or_else(|| repo.path());
+    // 项目经软链进入时 workdir 是解析过的真实路径,前缀也得换成真实路径才比得上
+    let path_prefix = path_prefix.map(|prefix| status_prefix(repo_workdir, prefix));
 
     let mut result = Vec::new();
     for entry in statuses.iter() {
@@ -200,8 +203,7 @@ fn collect_repo_status(
         let label = status_label(&git_status).to_string();
 
         // 相对 path_prefix 的展示路径;没给 prefix 就用仓库内相对路径
-        let display_path = if let Some(prefix) = path_prefix {
-            let repo_workdir = repo.workdir().unwrap_or_else(|| repo.path());
+        let display_path = if let Some(prefix) = &path_prefix {
             let abs = repo_workdir.join(&raw_path);
             diff_paths(&abs, prefix)
                 .map(|p| p.to_string_lossy().replace('\\', "/"))
@@ -302,6 +304,52 @@ fn discover_repo_for(project_path: &Path, abs_file: &Path) -> Option<Repository>
         .find(|p| p.is_dir())
         .unwrap_or(project_path);
     open_repo_within(start, project_path)
+}
+
+/// `project_path` 下的文件 `abs_file` 在仓库工作区 `workdir` 里的相对路径(`/` 分隔);
+/// 不在这个工作区里(或就是工作区根本身)为 `None`。
+///
+/// 先直接算;算出 `..` 开头时再把项目根 `canonicalize` 一遍重算:libgit2 发现仓库时对
+/// 起点做过 realpath,Unix 上经软链进入的项目(macOS 的 `/var` → `/private/var` 也是)
+/// workdir 是解析后的真实路径、项目路径不是,直接比出来是 `../<链接名>/…` —— diff 误显示
+/// 为整文件新增、按块暂存找不到条目。只规范化**项目根**(它一定存在),文件那一段原样
+/// 拼回去:文件本身可能已被删除,也不该顺着文件自己的软链跳走。
+///
+/// Windows 上 `canonicalize` 给的是 `\\?\` 形式,经 [`crate::fs::strip_verbatim_prefix`]
+/// 剥回 `C:\…` / `\\server\share\…`(`\\?\UNC\wsl$\…` → `\\wsl$\…`)。第一步就算对时
+/// (绝大多数情况,libgit2 在 Windows 上不解析联接点)根本走不到这里。
+fn repo_relative_path(workdir: &Path, project_path: &Path, abs_file: &Path) -> Option<String> {
+    let inside = |rel: PathBuf| -> Option<String> {
+        let escapes = rel.components().any(|c| {
+            matches!(
+                c,
+                Component::ParentDir | Component::Prefix(_) | Component::RootDir
+            )
+        });
+        let text = rel.to_string_lossy().replace('\\', "/");
+        (!escapes && !text.is_empty()).then_some(text)
+    };
+    if let Some(rel) = diff_paths(abs_file, workdir).and_then(inside) {
+        return Some(rel);
+    }
+    let in_project = abs_file.strip_prefix(project_path).ok()?;
+    let real_project = crate::fs::strip_verbatim_prefix(project_path.canonicalize().ok()?);
+    diff_paths(real_project.join(in_project), workdir).and_then(inside)
+}
+
+/// 仓库里的路径相对项目根的展示形式要用的「项目根」:与 workdir 有前缀关系就用原样;
+/// 对不上(项目经软链进入、workdir 是解析过的真实路径)时换成规范化后的项目根。
+fn status_prefix(workdir: &Path, project_path: &Path) -> PathBuf {
+    let related = |p: &Path| workdir.starts_with(p) || p.starts_with(workdir);
+    if related(project_path) {
+        return project_path.to_path_buf();
+    }
+    project_path
+        .canonicalize()
+        .map(crate::fs::strip_verbatim_prefix)
+        .ok()
+        .filter(|real| related(real))
+        .unwrap_or_else(|| project_path.to_path_buf())
 }
 
 /// 项目根所属的仓库:从项目根本身向上找,上界同样是项目根再往上 [`MAX_DISCOVER_PARENTS`] 级。
@@ -1399,9 +1447,8 @@ pub fn get_git_diff(project_path: &Path, file_path: &str, side: DiffSide) -> Res
         .workdir()
         .ok_or_else(|| anyhow!("bare repository not supported"))?;
 
-    let rel_path = diff_paths(&abs_file, workdir)
+    let rel_str = repo_relative_path(workdir, project_path, &abs_file)
         .ok_or_else(|| anyhow!("file is outside repository working directory"))?;
-    let rel_str = rel_path.to_string_lossy().replace('\\', "/");
 
     // 新侧:暂存区取 index,否则取工作区(已删除的文件 = 空)
     let new_content = match side {
@@ -1605,13 +1652,181 @@ fn run_git_command_with_input(
 /// 一次 git CLI 调用的结果。
 struct GitOutput {
     success: bool,
+    /// 退出码;Unix 上被信号杀掉时为 `None`。[`GIT_USAGE_ERROR`] = 不认识的选项。
+    code: Option<i32>,
     stdout: String,
     stderr: String,
 }
 
+/// git 的「用法错误」退出码(`usage_with_options` 一律 `exit(129)`):老版本不认某个
+/// 新选项时就是它。判断「这个 git 不支持某选项」只看它,不看会被本地化的提示文本。
+const GIT_USAGE_ERROR: i32 = 129;
+
 /// 管道读完后等孙进程松手的上限。git 本身已退出,剩下的只是 ssh / 凭证助手
 /// 这类可能继承了管道句柄的后代 —— 等不到就按已读到的算。
 const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// 判断 index.lock 是不是「本次启动之后才出现」时对启动时刻的放宽量:文件时间戳取自
+/// 粗粒度的系统时钟(Windows 上一拍约 15ms),可能比启动前读到的精确时刻还早一点。
+const LOCK_MTIME_SLACK: Duration = Duration::from_millis(100);
+
+/// 边读边攒的管道输出。读线程把读到的每一块追加进共享缓冲,读到 EOF 再发信号;
+/// 等不到 EOF(孙进程攥着管道不放)时取走已经攒下的那部分 —— 旧实现读完才整块交出,
+/// 宽限期一到已读到的输出就整块丢了。
+struct PipeDrain {
+    buf: std::sync::Arc<Mutex<Vec<u8>>>,
+    done: std::sync::mpsc::Receiver<()>,
+}
+
+impl PipeDrain {
+    fn start(pipe: Option<Box<dyn std::io::Read + Send>>) -> Self {
+        use std::io::Read as _;
+        let buf = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let (tx, done) = std::sync::mpsc::channel();
+        let sink = buf.clone();
+        std::thread::spawn(move || {
+            if let Some(mut pipe) = pipe {
+                let mut chunk = [0u8; 8192];
+                loop {
+                    match pipe.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => sink.lock().extend_from_slice(&chunk[..n]),
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(_) => break,
+                    }
+                }
+            }
+            // 忽略发送失败:超时路径上接收端已被 drop
+            let _ = tx.send(());
+        });
+        Self { buf, done }
+    }
+
+    /// 最多等到 `deadline` 读线程收尾,然后取走已读到的内容。
+    fn collect(self, deadline: Instant) -> String {
+        let _ = self
+            .done
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        let bytes = std::mem::take(&mut *self.buf.lock());
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+/// 子进程连同它的全部后代。超时要整棵终止:Git for Windows 的 `git.exe` 只是个启动器,
+/// 真正干活的 git、hook 的 sh、ssh / 凭证助手都是它的后代 —— 只杀启动器,它们照跑,
+/// checkout / merge / `commit -a` 的 pre-commit 期间攥着的 index.lock 也一直不放。
+///
+/// - Windows:spawn 后把子进程放进一个 Job Object,之后它起的后代自动入 Job,超时
+///   `TerminateJobObject` 一把收掉。**不**设 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`:那样
+///   正常结束时一关句柄就连带杀掉合法地留在后台的后代(凭证缓存守护进程之类)。
+///   spawn 与入 Job 之间有极短的窗口,git 在那之前还没起任何子进程。
+/// - Unix:spawn 时 `process_group(0)` 让 git 自成一个进程组(pgid = pid),超时对整组
+///   发 SIGKILL(本 crate 不依赖 libc,借系统的 `kill` 命令)。
+struct ProcessTree {
+    #[cfg(windows)]
+    job: Option<job_object::Job>,
+}
+
+impl ProcessTree {
+    /// spawn 之前:Unix 上让子进程自成进程组。
+    fn prepare(_cmd: &mut std::process::Command) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            _cmd.process_group(0);
+        }
+    }
+
+    /// spawn 之后:Windows 上把子进程挂进 Job。挂不上(极少见)就只能退回只杀 git 本身。
+    fn attach(_child: &std::process::Child) -> Self {
+        Self {
+            #[cfg(windows)]
+            job: job_object::Job::attach(_child),
+        }
+    }
+
+    /// 终止整棵进程树并等 git 本身退出。
+    fn kill(&self, child: &mut std::process::Child) {
+        #[cfg(windows)]
+        if let Some(job) = &self.job {
+            job.terminate();
+        }
+        #[cfg(unix)]
+        {
+            use std::process::{Command, Stdio};
+            // process_group(0) 之后 pgid 就是 git 的 pid;负号 = 发给整个进程组
+            let group = format!("-{}", child.id());
+            let _ = Command::new("kill")
+                .args(["-KILL", "--", group.as_str()])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        // 兜底(没挂进 Job / 系统里没有 kill 命令):至少把 git 自己杀掉
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+#[cfg(windows)]
+mod job_object {
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, TerminateJobObject,
+    };
+
+    /// 一个匿名 Job Object 的句柄,Drop 时关闭(不连带终止里面的进程)。
+    pub(super) struct Job(HANDLE);
+
+    impl Job {
+        pub(super) fn attach(child: &std::process::Child) -> Option<Job> {
+            // SAFETY:两个参数都允许为空(默认安全属性、匿名);返回的句柄归 Job 所有
+            let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            if handle == 0 {
+                return None;
+            }
+            let job = Job(handle);
+            // SAFETY:child 存活期间它的进程句柄一直有效
+            let ok = unsafe { AssignProcessToJobObject(job.0, child.as_raw_handle() as HANDLE) };
+            (ok != 0).then_some(job)
+        }
+
+        pub(super) fn terminate(&self) {
+            // SAFETY:句柄在 Job 存活期间有效
+            unsafe { TerminateJobObject(self.0, 1) };
+        }
+    }
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            // SAFETY:句柄只在这里关一次
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+}
+
+/// 超时被杀的 git 留下的 `<gitdir>/index.lock`:只认**本次启动之后**才出现的那个(更早的
+/// 属于别的 git 进程,不归这里管)。gitdir 走 git2 求 —— linked worktree 的 `.git` 是个
+/// 文件,锁在 `<主仓库>/.git/worktrees/<名字>/` 下。返回删掉的路径。
+fn remove_fresh_index_lock(repo_path: &Path, started: SystemTime) -> Option<PathBuf> {
+    let lock = Repository::open(repo_path).ok()?.path().join("index.lock");
+    let since = started.checked_sub(LOCK_MTIME_SLACK).unwrap_or(started);
+    if std::fs::metadata(&lock).ok()?.modified().ok()? < since {
+        return None;
+    }
+    // Windows 上被终止的进程要过一会儿才真正放开文件句柄:删不掉就稍等再试
+    for _ in 0..20 {
+        match std::fs::remove_file(&lock) {
+            Ok(()) => return Some(lock),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(_) => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+    None
+}
 
 /// 起 git 子进程并限时等待;只有「起不来 / 超时」是 `Err`。stdin 是 null。
 fn spawn_git(
@@ -1637,9 +1852,11 @@ fn spawn_git_with_input(
     timeout_hint: &str,
     input: Option<Vec<u8>>,
 ) -> Result<GitOutput> {
-    use std::io::{Read as _, Write as _};
+    use std::io::Write as _;
     use std::process::{Command, Stdio};
 
+    // 超时后据此认出「本次留下的」index.lock(见 remove_fresh_index_lock)
+    let started = SystemTime::now();
     let mut cmd = Command::new("git");
     cmd.args(args)
         .current_dir(repo_path)
@@ -1653,9 +1870,11 @@ fn spawn_git_with_input(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     hide_console_window(&mut cmd);
+    ProcessTree::prepare(&mut cmd);
     let mut child = cmd
         .spawn()
         .map_err(|e| anyhow!("启动 git {} 失败:{}", op_label, e))?;
+    let tree = ProcessTree::attach(&child);
 
     if let (Some(bytes), Some(mut stdin)) = (input, child.stdin.take()) {
         std::thread::spawn(move || {
@@ -1665,33 +1884,29 @@ fn spawn_git_with_input(
         });
     }
 
-    let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(mut pipe) = pipe {
-                let _ = pipe.read_to_end(&mut buf);
-            }
-            // 忽略发送失败:超时路径上接收端已被 drop
-            let _ = tx.send(buf);
-        });
-        rx
-    };
-    let stdout_rx = drain(child.stdout.take().map(|p| Box::new(p) as _));
-    let stderr_rx = drain(child.stderr.take().map(|p| Box::new(p) as _));
+    let stdout = PipeDrain::start(child.stdout.take().map(|p| Box::new(p) as _));
+    let stderr = PipeDrain::start(child.stderr.take().map(|p| Box::new(p) as _));
 
     let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
+                tree.kill(&mut child);
+                let lock_note = remove_fresh_index_lock(repo_path, started)
+                    .map(|lock| {
+                        format!(
+                            "\n已终止 git 及其子进程,并删除了它留下的 {}",
+                            lock.display()
+                        )
+                    })
+                    .unwrap_or_default();
                 bail!(
-                    "git {} 超时({}s){}",
+                    "git {} 超时({}s){}{}",
                     op_label,
                     timeout.as_secs(),
-                    timeout_hint
+                    timeout_hint,
+                    lock_note
                 );
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(15)),
@@ -1699,14 +1914,13 @@ fn spawn_git_with_input(
         }
     };
 
-    let collect = |rx: std::sync::mpsc::Receiver<Vec<u8>>| {
-        let bytes = rx.recv_timeout(PIPE_DRAIN_GRACE).unwrap_or_default();
-        String::from_utf8_lossy(&bytes).into_owned()
-    };
+    // 两根管道共用一个宽限期:git 已退出,只剩后代可能还攥着管道
+    let grace = Instant::now() + PIPE_DRAIN_GRACE;
     Ok(GitOutput {
         success: status.success(),
-        stdout: collect(stdout_rx),
-        stderr: collect(stderr_rx),
+        code: status.code(),
+        stdout: stdout.collect(grace),
+        stderr: stderr.collect(grace),
     })
 }
 
@@ -1729,91 +1943,97 @@ pub fn git_push(repo_path: &Path) -> Result<String> {
     run_git_network_command(repo_path, "push")
 }
 
-pub fn git_stage(repo_path: &Path, files: &[String]) -> Result<()> {
-    let repo = Repository::open(repo_path)?;
-    let mut index = repo.index()?;
-    for file in files {
-        let path = Path::new(file);
-        let abs_path = repo
-            .workdir()
-            .ok_or_else(|| anyhow!("bare repo"))?
-            .join(path);
-        if abs_path.exists() {
-            index.add_path(path)?;
-        } else {
-            // 文件已删除，需要从 index 移除
-            index.remove_path(path)?;
-        }
+// ---------------------------------------------------------------------------
+// 暂存 / 取消暂存(整文件)
+//
+// 一律走 git CLI:
+// - 暂存要过 clean 过滤器(git-lfs、`.gitattributes` 里的 `filter=`),libgit2 不跑外部
+//   过滤驱动,LFS 文件会以原始大文件入库;
+// - 取消暂存用**带路径**的 `git reset -- <paths>`:不带路径的 reset(libgit2 的
+//   `reset(HEAD, Mixed)` 也一样)会顺手清掉 MERGE_HEAD / rebase-merge / sequencer,
+//   解决完冲突点一下「全部取消暂存」,合并提交就静默成了单亲、变基现场被毁;
+// - 路径一律 `--literal-pathspecs` + `--`:文件名里的 `*` `?` `[ab]` 不许被当通配
+//   (libgit2 的 `reset_default` 就把它们当 glob),`-` 开头的不许被当选项。
+// ---------------------------------------------------------------------------
+
+/// 暂存类操作的超时:本身毫秒级,但 clean 过滤器(git-lfs 给大文件算哈希)可能很慢。
+const INDEX_OP_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// 一次带太多路径会撞上 Windows 命令行 32K 的上限,分批跑(与 `conflict.rs` 同口径)。
+const PATHS_PER_CALL: usize = 64;
+
+/// `git --literal-pathspecs <head_args> -- <files>`,按批跑。
+fn run_with_literal_paths(
+    repo_path: &Path,
+    head_args: &[&str],
+    files: &[String],
+    op_label: &str,
+) -> Result<()> {
+    for chunk in files.chunks(PATHS_PER_CALL) {
+        let mut args = vec!["--literal-pathspecs"];
+        args.extend_from_slice(head_args);
+        args.push("--");
+        args.extend(chunk.iter().map(String::as_str));
+        run_git_command_labeled(repo_path, &args, op_label, INDEX_OP_TIMEOUT, "")?;
     }
-    index.write()?;
     Ok(())
 }
 
+/// 还没有任何提交(HEAD 指向未出生的分支)。这时没有 HEAD 可以 reset 回去,
+/// 取消暂存 = 从暂存区摘掉。
+fn is_unborn(repo_path: &Path) -> Result<bool> {
+    Ok(Repository::open(repo_path)?.head().is_err())
+}
+
+/// 暂存这些文件(`git add -A -- <paths>`:工作区里已删除的暂存为删除)。
+/// **阻塞**(起 git 进程、跑 clean 过滤器),调用方放后台执行器。
+pub fn git_stage(repo_path: &Path, files: &[String]) -> Result<()> {
+    if files.is_empty() {
+        return Ok(());
+    }
+    run_with_literal_paths(repo_path, &["add", "-A"], files, "add")
+}
+
+/// 取消暂存这些文件(`git reset -q -- <paths>`,只动暂存区、不碰仓库状态)。
 pub fn git_unstage(repo_path: &Path, files: &[String]) -> Result<()> {
-    let repo = Repository::open(repo_path)?;
-
-    let head = match repo.head() {
-        Ok(h) => Some(h.peel_to_commit()?),
-        Err(_) => None, // 空仓库,没有 HEAD
-    };
-
-    if let Some(ref commit) = head {
-        for file in files {
-            repo.reset_default(Some(commit.as_object()), [file.as_str()])?;
-        }
-    } else {
-        // 空仓库:批量从 index 移除，最后一次 write
+    if files.is_empty() {
+        return Ok(());
+    }
+    if is_unborn(repo_path)? {
+        let repo = Repository::open(repo_path)?;
         let mut index = repo.index()?;
         for file in files {
             index.remove_path(Path::new(file))?;
         }
         index.write()?;
+        return Ok(());
     }
-    Ok(())
+    run_with_literal_paths(repo_path, &["reset", "-q"], files, "reset")
 }
 
+/// 暂存全部改动(`git add -A`,含未跟踪文件与删除)。
 pub fn git_stage_all(repo_path: &Path) -> Result<()> {
-    let repo = Repository::open(repo_path)?;
-    let mut index = repo.index()?;
-    index.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)?;
-
-    // 处理已删除的文件：遍历 index，移除工作区中不存在的文件
-    let workdir = repo.workdir().ok_or_else(|| anyhow!("bare repo"))?;
-    let entries: Vec<String> = index
-        .iter()
-        .filter_map(|e| {
-            let path = String::from_utf8_lossy(&e.path).to_string();
-            if !workdir.join(&path).exists() {
-                Some(path)
-            } else {
-                None
-            }
-        })
-        .collect();
-    for path in entries {
-        index.remove_path(Path::new(&path))?;
-    }
-
-    index.write()?;
-    Ok(())
+    run_git_command(repo_path, &["add", "-A"], INDEX_OP_TIMEOUT, "").map(|_| ())
 }
 
+/// 取消暂存全部(`git reset -q -- .`):带路径的 reset 只把暂存区对回 HEAD,
+/// 进行中的合并 / 变基 / 拣选 / 还原原样保留。
 pub fn git_unstage_all(repo_path: &Path) -> Result<()> {
-    let repo = Repository::open(repo_path)?;
-
-    match repo.head() {
-        Ok(head) => {
-            let commit = head.peel_to_commit()?;
-            repo.reset(commit.as_object(), git2::ResetType::Mixed, None)?;
-        }
-        Err(_) => {
-            // 空仓库:清空整个 index
-            let mut index = repo.index()?;
-            index.clear()?;
-            index.write()?;
-        }
+    if is_unborn(repo_path)? {
+        let repo = Repository::open(repo_path)?;
+        let mut index = repo.index()?;
+        index.clear()?;
+        index.write()?;
+        return Ok(());
     }
-    Ok(())
+    // 在仓库根上跑(执行器要求 repo_path 下有 .git),`.` 就是整个工作区
+    run_git_command(
+        repo_path,
+        &["--literal-pathspecs", "reset", "-q", "--", "."],
+        INDEX_OP_TIMEOUT,
+        "",
+    )
+    .map(|_| ())
 }
 
 /// 走 git CLI 而非 git2:提交要继承用户的 hooks / gpg 签名 / user.name 配置。
@@ -2081,6 +2301,10 @@ pub use tags::*;
 
 #[cfg(test)]
 mod test_support;
+
+#[cfg(test)]
+#[path = "index_exec_tests.rs"]
+mod index_exec_tests;
 
 #[cfg(test)]
 mod tests {

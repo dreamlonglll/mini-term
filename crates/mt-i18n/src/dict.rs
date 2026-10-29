@@ -12,9 +12,9 @@ use crate::Namespace;
 /// 命名空间总数（生成器对账用，测试断言防漂移）
 pub const NAMESPACE_COUNT: usize = 38;
 /// 中文条目总数
-pub const ZH_ENTRY_COUNT: usize = 1409;
+pub const ZH_ENTRY_COUNT: usize = 1419;
 /// 英文条目总数
-pub const EN_ENTRY_COUNT: usize = 1409;
+pub const EN_ENTRY_COUNT: usize = 1419;
 
 #[rustfmt::skip]
 static APP_ZH: &[(&str, &str)] = &[
@@ -661,10 +661,13 @@ static GIT_BRANCH_ZH: &[(&str, &str)] = &[
     ("mergeUpToDate", "{name} 已全部合入，无需合并"),
     ("modeFfOnly", "仅快进"),
     ("modeFfOnlyItem", "仅快进（--ff-only）"),
+    ("modeFollowConfig", "跟随配置：{mode}"),
+    ("modeFollowConfigItem", "跟随 git 配置（{mode}）"),
     ("modeMerge", "合并"),
     ("modeMergeItem", "合并（--no-rebase）"),
     ("modeRebase", "变基"),
     ("modeRebaseItem", "变基（--rebase）"),
+    ("modeRebaseMerges", "变基（保留合并）"),
     ("nameBadFormat", "格式不合法：不能含 .. 或 //，不能以 / 开头或以 / . 结尾，各段不能以 . 开头或以 .lock 结尾"),
     ("nameEmpty", "请输入分支名"),
     ("nameExists", "已存在同名本地分支"),
@@ -708,6 +711,7 @@ static GIT_BRANCH_ZH: &[(&str, &str)] = &[
     ("push", "推送"),
     ("pushDetached", "当前处于分离 HEAD 状态，没有可推送的分支。"),
     ("pushNoRemote", "仓库没有配置远程，无法推送。"),
+    ("pushOtherThanUpstream", "将推送到 {target}；当前上游是 {upstream}，不会修改"),
     ("pushTip", "推送到 {target}…"),
     ("pushTipDetached", "分离 HEAD 状态，没有可推送的分支"),
     ("pushTipNoUpstream", "推送 {branch}（将设置上游）…"),
@@ -821,10 +825,13 @@ static GIT_BRANCH_EN: &[(&str, &str)] = &[
     ("mergeUpToDate", "{name} is already merged — nothing to do"),
     ("modeFfOnly", "fast-forward only"),
     ("modeFfOnlyItem", "Fast-forward only (--ff-only)"),
+    ("modeFollowConfig", "per Git config: {mode}"),
+    ("modeFollowConfigItem", "Follow Git config ({mode})"),
     ("modeMerge", "merge"),
     ("modeMergeItem", "Merge (--no-rebase)"),
     ("modeRebase", "rebase"),
     ("modeRebaseItem", "Rebase (--rebase)"),
+    ("modeRebaseMerges", "rebase (keep merges)"),
     ("nameBadFormat", "Invalid format: no .. or //, cannot start with / or end with / or ., and no part may start with . or end with .lock"),
     ("nameEmpty", "Enter a branch name"),
     ("nameExists", "A local branch with this name already exists"),
@@ -868,6 +875,7 @@ static GIT_BRANCH_EN: &[(&str, &str)] = &[
     ("push", "Push"),
     ("pushDetached", "Detached HEAD: there is no branch to push."),
     ("pushNoRemote", "This repository has no remote configured."),
+    ("pushOtherThanUpstream", "Will push to {target}; the current upstream {upstream} stays unchanged"),
     ("pushTip", "Push to {target}…"),
     ("pushTipDetached", "Detached HEAD: no branch to push"),
     ("pushTipNoUpstream", "Push {branch} (sets upstream)…"),
@@ -1014,8 +1022,12 @@ static GIT_COMMIT_ZH: &[(&str, &str)] = &[
     ("statusUntracked", "未跟踪"),
     ("takeOurs", "采用我方版本（ours）"),
     ("takeOursDeleted", "采用我方版本（ours：删除此文件）"),
+    ("takeOursRebase", "采用变基目标的版本（ours）"),
+    ("takeOursRebaseDeleted", "采用变基目标的版本（ours：删除此文件）"),
     ("takeTheirs", "采用对方版本（theirs）"),
     ("takeTheirsDeleted", "采用对方版本（theirs：删除此文件）"),
+    ("takeTheirsRebase", "采用正在重放的提交（theirs，你的改动）"),
+    ("takeTheirsRebaseDeleted", "采用正在重放的提交（theirs，你的改动：删除此文件）"),
     ("unstageAll", "全部取消暂存"),
     ("unstageHunk", "取消暂存此块"),
     ("unstageSelected", "取消暂存所选 {count} 个文件"),
@@ -1090,8 +1102,12 @@ static GIT_COMMIT_EN: &[(&str, &str)] = &[
     ("statusUntracked", "Untracked"),
     ("takeOurs", "Accept ours"),
     ("takeOursDeleted", "Accept ours (delete this file)"),
+    ("takeOursRebase", "Accept the rebase target's version (ours)"),
+    ("takeOursRebaseDeleted", "Accept the rebase target's version (ours: delete this file)"),
     ("takeTheirs", "Accept theirs"),
     ("takeTheirsDeleted", "Accept theirs (delete this file)"),
+    ("takeTheirsRebase", "Accept the commit being replayed (theirs: your change)"),
+    ("takeTheirsRebaseDeleted", "Accept the commit being replayed (theirs: your change, delete this file)"),
     ("unstageAll", "Unstage all"),
     ("unstageHunk", "Unstage hunk"),
     ("unstageSelected", "Unstage {count} selected files"),
@@ -1510,6 +1526,7 @@ static GIT_STASH_ZH: &[(&str, &str)] = &[
     ("busy.clear", "正在清除…"),
     ("busy.drop", "正在删除…"),
     ("busy.pop", "正在弹出…"),
+    ("checkout.cancelled", "已贮藏为 {reference}，但部分未跟踪文件被占用、未能清理，检出已取消（仍在当前分支）。改动都在该贮藏里，可在贮藏列表中查看或恢复。git 的原文："),
     ("checkout.conflicts", "已检出 {branch}，但恢复本地改动时出现冲突：请在更改区解决；贮藏已保留（{reference}）"),
     ("checkout.done", "已检出 {branch}"),
     ("checkout.explain", "「贮藏后检出」会先把全部本地改动（含未跟踪文件）贮藏起来，检出 {branch} 后再自动恢复；恢复时如有冲突，贮藏会保留。"),
@@ -1561,6 +1578,7 @@ static GIT_STASH_ZH: &[(&str, &str)] = &[
     ("save.placeholder", "留空则用 git 的默认消息（WIP on …）"),
     ("save.repo", "仓库：{name}"),
     ("save.saved", "已贮藏为 {reference}"),
+    ("save.savedWithWarnings", "已贮藏为 {reference}，但有文件未能清理：{detail}"),
     ("save.title", "贮藏改动"),
     ("save.working", "正在贮藏…"),
     ("stashChanges", "贮藏当前改动…"),
@@ -1588,6 +1606,7 @@ static GIT_STASH_EN: &[(&str, &str)] = &[
     ("busy.clear", "Clearing…"),
     ("busy.drop", "Dropping…"),
     ("busy.pop", "Popping…"),
+    ("checkout.cancelled", "Stashed as {reference}, but some untracked files are in use and could not be cleaned up, so the checkout was cancelled (you are still on the current branch). Your changes are in that stash; view or restore them from the stash list. Git said:"),
     ("checkout.conflicts", "Checked out {branch}, but restoring local changes caused conflicts. Resolve them in Changes; the stash was kept ({reference})"),
     ("checkout.done", "Checked out {branch}"),
     ("checkout.explain", "\"Stash and Checkout\" stashes all local changes (including untracked files), checks out {branch}, then restores them; the stash is kept if restoring conflicts."),
@@ -1639,6 +1658,7 @@ static GIT_STASH_EN: &[(&str, &str)] = &[
     ("save.placeholder", "Leave empty to use Git's default message (WIP on …)"),
     ("save.repo", "Repository: {name}"),
     ("save.saved", "Stashed as {reference}"),
+    ("save.savedWithWarnings", "Stashed as {reference}, but some files could not be cleaned up: {detail}"),
     ("save.title", "Stash Changes"),
     ("save.working", "Stashing…"),
     ("stashChanges", "Stash Changes…"),

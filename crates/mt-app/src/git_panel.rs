@@ -60,8 +60,8 @@ use gpui::{
     Task, Window, canvas, div, prelude::FluentBuilder as _, px,
 };
 use mt_project::git::{
-    BranchInfo, BranchTracking, GitRepoInfo, PullMode, PullOutcome, RepoOpKind, RepoOpState,
-    RepoSignature,
+    BranchInfo, BranchTracking, GitRepoInfo, PullConfig, PullMode, PullOutcome, PushPlan,
+    RepoOpKind, RepoOpState, RepoSignature,
 };
 use mt_ui::tooltip::TooltipExt as _;
 
@@ -99,7 +99,9 @@ thread_local! {
         RefCell::new(HashMap::new());
 
     /// 拉取方式(仓库栏「拉取」右键菜单里选)。会话级、**不落盘**,左键按它拉;
-    /// `None` = 本次会话还没手选,跟随仓库的 git 配置([`RepoMeta::pull_default`])。
+    /// `None` = 本次会话还没手选(或选回了「跟随 git 配置」):不带方式参数拉,完全交给
+    /// 用户的 git 配置([`mt_project::git::git_pull_by_config`]),tooltip 照
+    /// [`RepoMeta::pull_config`] 显示「跟随配置:…」。
     static PULL_MODE: Cell<Option<PullMode>> = const { Cell::new(None) };
 }
 
@@ -181,8 +183,11 @@ struct RepoMeta {
     op: RepoOpState,
     /// 读这份快照时的仓库签名 —— `.git` 监听的「没变就不刷」拿它比。
     signature: Option<RepoSignature>,
-    /// 仓库 git 配置里的拉取方式(`pull.rebase` / `pull.ff`),没手选时按它拉。
-    pull_default: PullMode,
+    /// 仓库 git 配置里的拉取方式(`branch.<b>.rebase` / `pull.rebase` / `pull.ff`),
+    /// 只用于显示:没手选时拉取不带方式参数,由 git 自己读配置。
+    pull_config: PullConfig,
+    /// HEAD 分支的推送计划(推送按钮的 tooltip 写真实目标:目标可以不是上游)。
+    push_plan: Option<PushPlan>,
     /// 贮藏条数(仓库栏贮藏按钮旁的数量胶囊)。
     stash_count: usize,
 }
@@ -199,7 +204,8 @@ fn load_branch_snapshot(repo: &Path) -> anyhow::Result<(Vec<BranchInfo>, RepoMet
         remotes: g::list_remotes(repo).unwrap_or_default(),
         op: g::repo_operation_state(repo).unwrap_or_default(),
         signature: g::repo_signature(repo).ok(),
-        pull_default: PullMode::from_config(repo),
+        pull_config: g::pull_config(repo),
+        push_plan: g::push_plan(repo, None).ok(),
         stash_count: g::stash_count(repo).unwrap_or_default(),
     };
     Ok((branches, meta))
@@ -719,19 +725,29 @@ impl GitPanel {
         );
     }
 
-    /// 当前拉取方式:本次会话手选过的优先,否则跟随仓库 git 配置。
-    fn pull_mode(&self) -> PullMode {
-        PULL_MODE
-            .with(Cell::get)
-            .unwrap_or(self.meta.pull_default)
+    /// tooltip 里的拉取方式:手选过的照名字写;没手选时写「跟随配置:<配置里的方式>」。
+    fn pull_mode_label(&self) -> String {
+        match PULL_MODE.with(Cell::get) {
+            Some(mode) => pull_mode_name(mode).to_string(),
+            None => tr!(
+                "gitBranch",
+                "modeFollowConfig",
+                mode = config_pull_name(&self.meta.pull_config)
+            ),
+        }
     }
 
-    /// 按当前拉取方式拉取。
+    /// 拉取。手选过方式就带对应参数;没手选时**不带方式参数**,完全交给用户的 git 配置
+    /// (`branch.<b>.rebase`、`rebase=merges` / `interactive` 都由 git 自己读)——
+    /// 折算成三种方式再带参数会把 `merges` 降成 `--rebase`、拍平合并提交。
     fn pull(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let mode = self.pull_mode();
+        let mode = PULL_MODE.with(Cell::get);
         self.run_write_op(
             GitBusy::Pull,
-            move |repo| mt_project::git::git_pull_with(repo, mode),
+            move |repo| match mode {
+                Some(mode) => mt_project::git::git_pull_with(repo, mode),
+                None => mt_project::git::git_pull_by_config(repo),
+            },
             |this, outcome, _window, cx| {
                 let (message, tone) = match outcome {
                     PullOutcome::UpToDate => {
@@ -1004,6 +1020,15 @@ fn pull_mode_name(mode: PullMode) -> &'static str {
             PullMode::FfOnly => "modeFfOnly",
         },
     )
+}
+
+/// 用户 git 配置里那种拉取方式的名字:`rebase=merges` 单独写成「变基(保留合并)」。
+fn config_pull_name(config: &PullConfig) -> &'static str {
+    if config.mode == PullMode::Rebase && config.rebase_merges {
+        t("gitBranch", "modeRebaseMerges")
+    } else {
+        pull_mode_name(config.mode)
+    }
 }
 
 /// 分支徽章的 tooltip:分支名 + 上游 + ↑↓ 的含义 + 操作提示,一行一条。
@@ -1482,7 +1507,7 @@ impl GitPanel {
         let head = self.head_branch().map(str::to_string);
         let detached = self.current_branch().is_some_and(is_detached_label);
         let upstream = self.meta.head_tracking.as_ref().map(|t| t.upstream.clone());
-        let mode = self.pull_mode();
+        let mode = self.pull_mode_label();
         let busy_tip =
             |op: GitBusy| -> SharedString { tr!("gitBranch", "busyTip", op = op.label()).into() };
 
@@ -1510,13 +1535,9 @@ impl GitPanel {
                     "gitBranch",
                     "pullTip",
                     target = upstream.as_str(),
-                    mode = pull_mode_name(mode)
+                    mode = mode.as_str()
                 ),
-                None => tr!(
-                    "gitBranch",
-                    "pullTipNoUpstream",
-                    mode = pull_mode_name(mode)
-                ),
+                None => tr!("gitBranch", "pullTipNoUpstream", mode = mode.as_str()),
             }
             .into()
         };
@@ -1545,10 +1566,24 @@ impl GitPanel {
         } else if detached {
             t("gitBranch", "pushTipDetached").into()
         } else {
-            match (&upstream, &head) {
-                (Some(upstream), _) => tr!("gitBranch", "pushTip", target = upstream.as_str()),
-                (None, Some(head)) => tr!("gitBranch", "pushTipNoUpstream", branch = head.as_str()),
-                (None, None) => t("gitBranch", "pushTipDetached").to_string(),
+            // 写真实的推送目标(与推送对话框同一份计划):目标可以不是上游 —— 从
+            // origin/main 拉出来的 feature 推的是 origin/feature
+            let plan = match &self.meta.push_plan {
+                Some(PushPlan::Ready(target)) => Some(target),
+                _ => None,
+            };
+            match (plan, &upstream, &head) {
+                (Some(target), _, _) if !target.sets_upstream() => {
+                    tr!("gitBranch", "pushTip", target = target.label())
+                }
+                (Some(_), _, Some(head)) | (None, None, Some(head)) => {
+                    tr!("gitBranch", "pushTipNoUpstream", branch = head.as_str())
+                }
+                // 计划没读到:退回按上游写
+                (None, Some(upstream), _) => {
+                    tr!("gitBranch", "pushTip", target = upstream.as_str())
+                }
+                _ => t("gitBranch", "pushTipDetached").to_string(),
             }
             .into()
         };
@@ -1614,22 +1649,35 @@ impl GitPanel {
             .into_any_element()
     }
 
-    /// 拉取方式菜单。当前选中的打勾;选了只改方式,不立刻拉。
+    /// 拉取方式菜单。当前选中的打勾;选了只改方式,不立刻拉。第一项「跟随 git 配置」
+    /// (默认)= 不带方式参数拉,括号里写配置里的方式;下面三项是本次会话手选。
     fn pull_mode_menu(&self, _cx: &mut Context<Self>) -> Vec<menu::MenuEntry> {
-        let current = self.pull_mode();
-        let mut entries = vec![menu::MenuEntry::Header(
-            t("gitBranch", "pullModeHeader").into(),
-        )];
+        let current = PULL_MODE.with(Cell::get);
+        let mark = |on: bool| if on { "✓ " } else { "　" };
+        let follow = tr!(
+            "gitBranch",
+            "modeFollowConfigItem",
+            mode = config_pull_name(&self.meta.pull_config)
+        );
+        let mut entries = vec![
+            menu::MenuEntry::Header(t("gitBranch", "pullModeHeader").into()),
+            MenuItem::new(format!("{}{follow}", mark(current.is_none())))
+                .on_click(|_window, _cx| PULL_MODE.with(|m| m.set(None)))
+                .into(),
+        ];
         for (mode, key) in [
             (PullMode::Merge, "modeMergeItem"),
             (PullMode::Rebase, "modeRebaseItem"),
             (PullMode::FfOnly, "modeFfOnlyItem"),
         ] {
-            let prefix = if mode == current { "✓ " } else { "　" };
             entries.push(
-                MenuItem::new(format!("{prefix}{}", t("gitBranch", key)))
-                    .on_click(move |_window, _cx| PULL_MODE.with(|m| m.set(Some(mode))))
-                    .into(),
+                MenuItem::new(format!(
+                    "{}{}",
+                    mark(current == Some(mode)),
+                    t("gitBranch", key)
+                ))
+                .on_click(move |_window, _cx| PULL_MODE.with(|m| m.set(Some(mode))))
+                .into(),
             );
         }
         entries

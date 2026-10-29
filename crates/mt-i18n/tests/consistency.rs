@@ -137,8 +137,13 @@ use mt_i18n::{
 /// 1408 → 1409：贮藏接入 Git 面板 —— 仓库栏贮藏按钮带数量的 tooltip（`gitStash.countTip`）；
 /// 改动文件的分组标题改用共用的数量胶囊，`gitStash.files.header`（带 `{count}`）换成
 /// 不带数字的 `gitStash.files.title`，一删一增。
+/// 1409 → 1419：Git 集成一批修复补的可见说明 —— 推送目标与上游不同时的一行
+/// （`gitBranch.pushOtherThanUpstream`）、拉取「跟随配置」的显示与菜单项及「变基（保留合并）」
+/// （`gitBranch.{modeFollowConfig,modeFollowConfigItem,modeRebaseMerges}`）、变基中冲突
+/// 「采用 ours / theirs」写清方向的四条（`gitCommit.take{Ours,Theirs}Rebase{,Deleted}`）、
+/// 贮藏已生成但有文件清不掉的两条（`gitStash.{save.savedWithWarnings,checkout.cancelled}`）。
 const EXPECTED_NAMESPACES: usize = 38;
-const EXPECTED_ENTRIES_PER_LANG: usize = 1409;
+const EXPECTED_ENTRIES_PER_LANG: usize = 1419;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。
