@@ -43,6 +43,10 @@
 //! 主线程被叫醒的次数由消费方自己节流(文件树两次扫描之间至少隔 [`POLL_MS`])。
 //! 置位与复位都在同一把锁里,「扫完之后又来的字节」一定能再叫醒一次,不会漏。
 //!
+//! 另有一条不经字节的路:[`request_refresh`] 点名让某个订阅者刷一次(Git 面板发现仓库
+//! 变了 —— `.git` 监听命中、面板里的写操作做完 —— 叫文件树重算 git 标记),下一次扫描
+//! 直接算命中。
+//!
 //! # 多订阅者(Y 批扩)
 //!
 //! 文件树的 git 状态着色要在「外部跑了 git 命令」之后刷新(`FileTree.tsx:667-674`
@@ -132,6 +136,8 @@ struct Sub {
     skip_overlap: bool,
     /// 已经往唤醒口丢过一声、该订阅者还没来扫。期间再来字节不重复叫醒。
     wake_sent: bool,
+    /// 有人点名要它刷一次([`request_refresh`]):下一次扫描不看字节、直接算命中。
+    forced: bool,
 }
 
 const IDLE_SUB: Sub = Sub {
@@ -139,6 +145,7 @@ const IDLE_SUB: Sub = Sub {
     cursor: 0,
     skip_overlap: false,
     wake_sent: false,
+    forced: false,
 };
 
 struct Tap {
@@ -197,6 +204,7 @@ pub fn set_enabled_for(sub: Subscriber, on: bool) {
     slot.cursor = total;
     slot.skip_overlap = true;
     slot.wake_sent = false;
+    slot.forced = false;
     let any = tap.subs.iter().any(|s| s.enabled);
     if !any {
         tap.head_seq = total;
@@ -208,6 +216,29 @@ pub fn set_enabled_for(sub: Subscriber, on: bool) {
 /// 老签名 = [`Subscriber::GitPanel`] 的快捷方式(V 批的调用点原样保留)。
 pub fn set_enabled(on: bool) {
     set_enabled_for(Subscriber::GitPanel, on);
+}
+
+/// 不经输出旁路,直接点名让某个订阅者刷一次:下一次 [`drain_hit_for`] 算命中,
+/// 登记了唤醒口的(文件树)当场叫醒。
+///
+/// Git 面板知道仓库变了而终端里不一定有输出的时候用 —— `.git` 监听命中(AI 在 pane 里
+/// 提交、合并 / 变基「继续」做完)、面板里的暂存 / 丢弃 / 提交做完:文件树的 git 标记
+/// 要跟着重算,否则 rebase 已经干净了文件树还标着 M。订阅者关着时什么都不做
+/// (远程项目 / 没项目本来就不拉 git 状态)。刷新仍走订阅者自己的去抖。
+pub fn request_refresh(sub: Subscriber) {
+    let mut tap = TAP.lock();
+    let tap = &mut *tap;
+    let slot = &mut tap.subs[sub.idx()];
+    if !slot.enabled {
+        return;
+    }
+    slot.forced = true;
+    if !slot.wake_sent
+        && let Some(waker) = &tap.wakers[sub.idx()]
+    {
+        slot.wake_sent = true;
+        let _ = waker.unbounded_send(());
+    }
 }
 
 /// 标记某个 PTY 是不是 AI pane。对应 `App.tsx:284` 的
@@ -281,7 +312,18 @@ pub fn drain_hit_for(sub: Subscriber) -> bool {
     // 丢过的那一声就算领走了:从这一刻起再进来的字节要重新叫醒它
     tap.subs[sub.idx()].wake_sent = false;
     let slot = tap.subs[sub.idx()];
-    if !slot.enabled || slot.cursor >= total {
+    if !slot.enabled {
+        return false;
+    }
+    // 被点名刷新(见 `request_refresh`):不看字节,游标推到末尾、不留接缝
+    if slot.forced {
+        let slot = &mut tap.subs[sub.idx()];
+        slot.forced = false;
+        slot.cursor = total;
+        slot.skip_overlap = true;
+        return true;
+    }
+    if slot.cursor >= total {
         return false;
     }
     // 从上次扫到的地方往回退一个接缝,再与窗口首端取交(滚掉的部分找不回来了)
@@ -588,6 +630,21 @@ mod tests {
         observe_output(1, b"z");
         assert_eq!(pending(&mut wake), 0);
         assert_eq!(pending(&mut fresh), 1);
+
+        // ─── 点名刷新(Git 面板叫文件树重算标记) ───────────────
+        // ⑱ 不带字节也叫醒、扫一次算命中、只算一次
+        assert!(!drain_hit_for(Subscriber::FileTree));
+        let _ = pending(&mut fresh);
+        request_refresh(Subscriber::FileTree);
+        assert_eq!(pending(&mut fresh), 1, "点名刷新要叫醒订阅者");
+        assert!(drain_hit_for(Subscriber::FileTree));
+        assert!(!drain_hit_for(Subscriber::FileTree), "点名一次只算一次");
+
+        // ⑲ 订阅者关着时点名无效,开闸也不带出旧的点名
+        set_enabled_for(Subscriber::FileTree, false);
+        request_refresh(Subscriber::FileTree);
+        set_enabled_for(Subscriber::FileTree, true);
+        assert!(!drain_hit_for(Subscriber::FileTree));
 
         reset();
     }

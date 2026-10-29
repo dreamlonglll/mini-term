@@ -400,6 +400,7 @@ pub(super) fn file_menu(
                         repo.clone(),
                         vec![crate::git_diff::DiffFile {
                             path: rel.clone(),
+                            old_path: None,
                             side: crate::git_diff::DiffSide::Working,
                             status_label: label.clone(),
                             hunk_actions: false,

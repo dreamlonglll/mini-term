@@ -20,11 +20,15 @@
 //!    `uniform_list` 默认只竖滚、且文字会回绕后被固定行高裁掉 —— 靠
 //!    [`ListHorizontalSizingBehavior::Unconstrained`] + 「按最宽那一行量宽」
 //!    ([`Flat::widest_inline`])补回来。⚠️ uniform_list **只量一行**来定内容宽
-//!    (`uniform_list.rs:336`),量错行横向滚动范围就不够。
+//!    (`uniform_list.rs:336`),量错行横向滚动范围就不够;字号也得挂在列表**外面**
+//!    (它量宽时还没套上自己的样式)。横向滚动时**行号列与 hunk 头(连同块操作按钮)
+//!    钉在左缘不动**([`pinned`]),只有正文滚;有行超出视野时底部常显一条横向滚动条,
+//!    截在视野外的部分一眼看得出、也能直接拖。
 //! 4. **hunk 之间有 `@@ -a,b +c,d @@` 头,工具栏有「上一处/下一处改动」**。
 //!    原版两样都没有,几处改动连在一起看不出断点、几千行的文件里也只能自己拖。
-//! 5. **并排视图两栏纵向同步**([`DiffState::sync_columns`])。原版两栏各滚各的,
-//!    对照着看要来回对齐。
+//!    头里纯新增 / 纯删除那一侧的起点按 git 的写法(插入点之前那一行,见 [`head_start`])。
+//! 5. **并排视图两栏纵向、横向都同步**([`DiffState::sync_columns`])。原版两栏各滚各的,
+//!    对照着看要来回对齐;只有一栏有长行时另一栏停在自己的尽头。
 //! 6. **配对成功的删/增行做词级高亮**([`intra_line_marks`])。原版一行里改一个字符
 //!    也是整行涂红/绿。
 //! 7. **正文用等宽字体**(与文件查看器同一条 mono 链)。原版是 `font-mono`,
@@ -50,10 +54,12 @@ use std::rc::Rc;
 use gpui::{
     AnyElement, App, AppContext as _, ClickEvent, ClipboardItem, Context, Entity, FocusHandle,
     HighlightStyle, InteractiveElement, IntoElement, ListHorizontalSizingBehavior, ParentElement,
-    Pixels, Render, ScrollStrategy, SharedString, StatefulInteractiveElement, Styled, StyledText,
-    UniformListScrollHandle, Window, div, point, prelude::FluentBuilder as _, px, uniform_list,
+    Pixels, Point, Render, ScrollStrategy, SharedString, StatefulInteractiveElement, Styled,
+    StyledText, UniformListScrollHandle, Window, div, point, prelude::FluentBuilder as _, px,
+    uniform_list,
 };
 use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel};
+use gpui_component::scroll::{Scrollbar, ScrollbarMode};
 pub use mt_project::git::DiffSide;
 use mt_project::git::{CommitFileInfo, DiffHunk, DiffLine, GitDiffResult, StaleDiff};
 use mt_ui::icons::FileIcon;
@@ -324,14 +330,25 @@ struct HunkHead {
 }
 
 fn hunk_head(h: &DiffHunk) -> HunkHead {
+    let (old, new) = (
+        head_start(h.old_start, h.old_lines),
+        head_start(h.new_start, h.new_lines),
+    );
     HunkHead {
-        inline: format!(
-            "@@ -{},{} +{},{} @@",
-            h.old_start, h.old_lines, h.new_start, h.new_lines
-        )
-        .into(),
-        left: format!("@@ -{},{} @@", h.old_start, h.old_lines).into(),
-        right: format!("@@ +{},{} @@", h.new_start, h.new_lines).into(),
+        inline: format!("@@ -{old},{} +{new},{} @@", h.old_lines, h.new_lines).into(),
+        left: format!("@@ -{old},{} @@", h.old_lines).into(),
+        right: format!("@@ +{new},{} @@", h.new_lines).into(),
+    }
+}
+
+/// hunk 头里某一侧的起始行号,按 git 的写法:那一侧一行都没有(纯新增的旧侧、纯删除的
+/// 新侧)时写**插入点之前那一行**,文件开头为 0 —— `@@ -0,0 +1,3 @@`、`@@ -4,0 +5,2 @@`。
+/// 后端 `DiffHunk` 里存的是「插在第几行之前」(按块操作按它拼文本),**只改显示**。
+fn head_start(start: u32, lines: u32) -> u32 {
+    if lines == 0 {
+        start.saturating_sub(1)
+    } else {
+        start
     }
 }
 
@@ -424,20 +441,21 @@ fn flatten(hunks: &[DiffHunk]) -> Flat {
         }
     }
 
-    // 三个量宽下标一起算完再写回 —— 闭包借着 `f`,不能边借边写
+    // 三个量宽下标一起算完再写回 —— 闭包借着 `f`,不能边借边写。hunk 头不参与:它钉在
+    // 左缘不随横向滚动(见 `hunk_row`),整行内容是绝对定位的、量出来宽度为 0
     let (inline_ix, left_ix, right_ix) = {
         let cols_of = |ix: Option<usize>| ix.map_or(0, |i| text_cols(&f.lines[i].content));
         (
             widest(&f.inline_rows, |row| match row {
-                InlineRow::Head(h) => text_cols(&f.heads[*h].inline),
+                InlineRow::Head(_) => 0,
                 InlineRow::Line(i) => cols_of(Some(*i)),
             }),
             widest(&f.pair_rows, |row| match row {
-                PairRow::Head(h) => text_cols(&f.heads[*h].left),
+                PairRow::Head(_) => 0,
                 PairRow::Line(l, _) => cols_of(*l),
             }),
             widest(&f.pair_rows, |row| match row {
-                PairRow::Head(h) => text_cols(&f.heads[*h].right),
+                PairRow::Head(_) => 0,
                 PairRow::Line(_, r) => cols_of(*r),
             }),
         )
@@ -491,9 +509,23 @@ fn word_bg(kind: &str) -> gpui::Hsla {
     }
 }
 
+/// 横向滚动时**钉在左缘**的一层(行号列、hunk 头连同块操作按钮)。
+///
+/// 横向滚动是整份内容一起平移的(uniform_list 只有一个滚动偏移),要让某一块不动,
+/// 就把它绝对定位、再往右挪回「已经滚出去的那一段」:`scroll_x` 是列表当前的横向偏移
+/// (≤ 0),`left = -scroll_x`。偏移是每帧画行时现读的(滚轮改了偏移就重画),不落后一帧。
+///
+/// 绝对定位的元素不计入行的内容宽,uniform_list 量宽时只量正文 —— 横向可滚范围不变。
+fn pinned(scroll_x: Pixels) -> gpui::Div {
+    div().absolute().top_0().left(-scroll_x).h_full()
+}
+
 /// 一行:若干行号列 + 内容列。`gutters` 是各行号列的 `(文本, 宽)`(并排视图一列,
 /// inline 视图旧 / 新两列 + 符号列),`marks` 是这一行里**真正变了的片段**
 /// (空 = 整行一个底色,与原版一致)。
+///
+/// 行号列钉在左缘([`pinned`]),正文从它底下横向滚过:行号列先铺一层不透明的正文底、
+/// 再叠这一行的增删底色,滚过去的字不会透出来;正文左侧留出行号列的宽。
 ///
 /// 行根 `w_full()`:横向不受限的 uniform_list 里行宽 = 内容区宽,少了它增删行的底色
 /// 只涂到文字为止,长短行参差不齐。
@@ -502,14 +534,18 @@ fn diff_line_row(
     gutters: &[(String, f32)],
     line_height: f32,
     marks: &[Range<usize>],
+    scroll_x: Pixels,
 ) -> AnyElement {
     let kind = line.kind.as_str();
     let content = SharedString::from(line.content.clone());
+    let gutter_w: f32 = gutters.iter().map(|(_, width)| *width).sum();
     // `whitespace-pre`:diff 行不换行 —— 少了它 gpui 会把长行回绕,而行高是恒定的
-    // (uniform_list 的前提),回绕出来的第二行直接被裁掉,看着像「缺了半行」
+    // (uniform_list 的前提),回绕出来的第二行直接被裁掉,看着像「缺了半行」。
+    // `flex_none`:宽度就是整行文字的宽,uniform_list 按它量横向可滚范围
     let mut text = div()
-        .flex_1()
-        .px(px(8.0))
+        .flex_none()
+        .pl(px(gutter_w + 8.0))
+        .pr(px(8.0))
         .whitespace_nowrap()
         .text_color(line_fg(kind));
     if marks.is_empty() {
@@ -524,31 +560,39 @@ fn diff_line_row(
                 .with_highlights(marks.iter().map(|r| (r.clone(), style))),
         );
     }
+    let numbers = pinned(scroll_x).w(px(gutter_w)).bg(ui::bg_base()).child(
+        div()
+            .size_full()
+            .flex()
+            .when_some(line_bg(kind), |el, bg| el.bg(bg))
+            // 行号直接用 muted,不再叠 0.6 的透明度:叠上之后深浅两套主题里都只剩
+            // 2:1 上下的对比,行号基本读不出来
+            .children(gutters.iter().map(|(no, width)| {
+                div()
+                    .w(px(*width))
+                    .flex_none()
+                    .pr(px(8.0))
+                    .text_right()
+                    .text_color(ui::text_muted())
+                    .child(no.clone())
+            })),
+    );
 
     div()
+        .relative()
         .w_full()
         .flex()
         .h(px(line_height))
         .when_some(line_bg(kind), |el, bg| el.bg(bg))
-        // 行号直接用 muted,不再叠 0.6 的透明度:叠上之后深浅两套主题里都只剩
-        // 2:1 上下的对比,行号基本读不出来
-        .children(gutters.iter().map(|(no, width)| {
-            div()
-                .w(px(*width))
-                .flex_none()
-                .pr(px(8.0))
-                .text_right()
-                .text_color(ui::text_muted())
-                .child(no.clone())
-        }))
         .child(text)
+        .child(numbers)
         .into_any_element()
 }
 
 /// hunk 头(`@@ -a,b +c,d @@`),后面可以跟一组块操作按钮。
 ///
-/// 按钮紧跟在 `@@` 文字后面而不是贴右缘:横向不受限的列表里「右缘」是最长那一行的
-/// 尽头,长行文件里按钮会被挤到视野外,得先横向滚过去才点得到。
+/// 整块钉在左缘([`pinned`]):横向滚到长行的尽头时,`@@` 与「暂存此块 / 丢弃此块」
+/// 仍在视野左侧,不用先滚回去才点得到;底色铺满整行,分隔照旧。
 ///
 /// ⚠️ 高度必须**恰好**是 `line_height`:uniform_list 按「量到的那一行」的高度
 /// 摆所有行,这里多一像素边框,整份 diff 的行位就会与滚动条对不上。分隔靠底色;
@@ -558,13 +602,11 @@ fn hunk_row(
     line_height: f32,
     gutter: f32,
     actions: Option<AnyElement>,
+    scroll_x: Pixels,
 ) -> AnyElement {
-    div()
-        .w_full()
+    let head = pinned(scroll_x)
         .flex()
         .items_center()
-        .h(px(line_height))
-        .bg(ui::bg_elevated())
         .child(div().w(px(gutter)).flex_none())
         .child(
             div()
@@ -583,7 +625,13 @@ fn hunk_row(
                 .items_stretch()
                 .gap(px(8.0))
                 .child(actions)
-        }))
+        }));
+    div()
+        .relative()
+        .w_full()
+        .h(px(line_height))
+        .bg(ui::bg_elevated())
+        .child(head)
         .into_any_element()
 }
 
@@ -652,8 +700,10 @@ struct DiffState {
     inline_scroll: UniformListScrollHandle,
     left_scroll: UniformListScrollHandle,
     right_scroll: UniformListScrollHandle,
-    /// 两栏纵向同步的基准值,见 [`DiffState::sync_columns`]。
-    synced_y: Pixels,
+    /// 两栏上一帧同步后的偏移(谁跟这个不一样谁就是这一帧动过的),见
+    /// [`DiffState::sync_columns`]。
+    synced_left: Point<Pixels>,
+    synced_right: Point<Pixels>,
     /// 「上一处/下一处改动」走到第几个 hunk。`None` = 还没跳过。
     jump: Option<usize>,
 }
@@ -672,7 +722,8 @@ impl DiffState {
             inline_scroll: UniformListScrollHandle::new(),
             left_scroll: UniformListScrollHandle::new(),
             right_scroll: UniformListScrollHandle::new(),
-            synced_y: px(0.0),
+            synced_left: Point::default(),
+            synced_right: Point::default(),
             jump: None,
         }
     }
@@ -684,7 +735,6 @@ impl DiffState {
     fn apply(&mut self, result: anyhow::Result<GitDiffResult>) {
         self.loading = false;
         self.jump = None;
-        self.synced_y = px(0.0);
         match result {
             Ok(diff) => {
                 self.flat = flatten(&diff.hunks);
@@ -699,43 +749,45 @@ impl DiffState {
         }
     }
 
-    /// 并排两栏的纵向同步。
+    /// 并排两栏的同步,纵向横向都同步。
     ///
-    /// `Dialog` 的 builder 每帧重跑(滚轮改了偏移就 `notify`),这里比对两个句柄
-    /// 与上一帧基准:谁动了谁当主,另一边跟上。
+    /// `Dialog` 的 builder 每帧重跑(滚轮改了偏移就 `notify`),这里比对两个句柄与
+    /// 上一帧同步后的值:谁动了谁当主,另一边跟上。
     ///
-    /// **只同步纵向**:横向内容宽是两栏各自按「最宽那一行」量出来的,共享 x 会被
-    /// 各自的钳制来回推(窄的那栏一到边就把 x 抹回去),越同步越抖。
-    ///
-    /// 两栏行数与行高完全一致 ⇒ 纵向的可滚范围也一致,不会互相钳。
+    /// - 纵向:两栏行数与行高完全一致 ⇒ 可滚范围一致,照抄;
+    /// - 横向:两栏的内容宽各按自己最宽那一行量,可滚范围不一样。跟随的一边**先按自己的
+    ///   范围钳住**再写,记下的也是钳过的值。早先只同步纵向,就是因为不钳的话窄的一栏
+    ///   会在下一帧把越界的 x 抹回去、被当成「它动了」,反过来把宽的那栏拽回来,越同步
+    ///   越抖。钳过之后窄的一栏停在自己的尽头,宽的一栏照常往下滚。
     fn sync_columns(&mut self) {
-        let left = self.left_scroll.0.borrow().base_handle.offset();
-        let right = self.right_scroll.0.borrow().base_handle.offset();
-        let target = if left.y != self.synced_y {
-            left.y
-        } else if right.y != self.synced_y {
-            right.y
-        } else {
-            return;
+        let left = self.left_scroll.0.borrow().base_handle.clone();
+        let right = self.right_scroll.0.borrow().base_handle.clone();
+        let (mut l, mut r) = (left.offset(), right.offset());
+        let clamp_x = |x: Pixels, handle: &gpui::ScrollHandle| {
+            let max = f32::from(handle.max_offset().x).max(0.0);
+            px(f32::from(x).clamp(-max, 0.0))
         };
-        if left.y != target {
-            self.left_scroll
-                .0
-                .borrow()
-                .base_handle
-                .set_offset(point(left.x, target));
+        if l.y != self.synced_left.y {
+            r.y = l.y;
+        } else if r.y != self.synced_right.y {
+            l.y = r.y;
         }
-        if right.y != target {
-            self.right_scroll
-                .0
-                .borrow()
-                .base_handle
-                .set_offset(point(right.x, target));
+        if l.x != self.synced_left.x {
+            r.x = clamp_x(l.x, &right);
+        } else if r.x != self.synced_right.x {
+            l.x = clamp_x(r.x, &left);
         }
-        self.synced_y = target;
+        if left.offset() != l {
+            left.set_offset(l);
+        }
+        if right.offset() != r {
+            right.set_offset(r);
+        }
+        self.synced_left = l;
+        self.synced_right = r;
     }
 
-    /// 三个列表都回到顶部(换文件时用,否则新文件一进来停在上一份的偏移上)。
+    /// 三个列表都回到顶部、左缘(换文件时用,否则新文件一进来停在上一份的偏移上)。
     fn reset_scroll(&mut self) {
         for handle in [&self.inline_scroll, &self.left_scroll, &self.right_scroll] {
             handle
@@ -744,7 +796,8 @@ impl DiffState {
                 .base_handle
                 .set_offset(point(px(0.0), px(0.0)));
         }
-        self.synced_y = px(0.0);
+        self.synced_left = Point::default();
+        self.synced_right = Point::default();
     }
 
     /// 跳到上/下一处改动(= 上/下一个 hunk 头)。`delta` 取 ±1,到头绕回。
@@ -896,11 +949,12 @@ fn render_inline(state: &Entity<DiffState>, hunks: Option<HunkUi>, cx: &mut App)
     let widest_ix = s.flat.widest_inline;
     let scroll = s.inline_scroll.clone();
     let state = state.clone();
-    uniform_list(
+    let list = uniform_list(
         "git-diff-inline",
         count,
         move |range, _window, cx: &mut App| {
             let s = state.read(cx);
+            let scroll_x = s.inline_scroll.0.borrow().base_handle.offset().x;
             range
                 .map(|i| match s.flat.inline_rows[i] {
                     InlineRow::Head(h) => hunk_row(
@@ -908,6 +962,7 @@ fn render_inline(state: &Entity<DiffState>, hunks: Option<HunkUi>, cx: &mut App)
                         line_height,
                         INLINE_GUTTER,
                         hunks.as_ref().map(|ui| hunk_actions(ui, h)),
+                        scroll_x,
                     ),
                     InlineRow::Line(ix) => {
                         let line = &s.flat.lines[ix];
@@ -926,6 +981,7 @@ fn render_inline(state: &Entity<DiffState>, hunks: Option<HunkUi>, cx: &mut App)
                             ],
                             line_height,
                             &s.flat.marks[ix],
+                            scroll_x,
                         )
                     }
                 })
@@ -933,12 +989,35 @@ fn render_inline(state: &Entity<DiffState>, hunks: Option<HunkUi>, cx: &mut App)
         },
     )
     .size_full()
-    .text_size(ui::font_px(font_size))
     .track_scroll(&scroll)
     // 见模块注释第 3 条:量宽只量这一行,量错了长行就滚不到头
     .with_width_from_item(Some(widest_ix))
-    .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
-    .into_any_element()
+    .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained);
+    // 字号挂在外面一层:uniform_list 在 prepaint 里先量宽、后才套上自己的样式,
+    // 字号挂在它自己身上的话量宽用的是继承来的界面字号,长行滚不到头
+    div()
+        .relative()
+        .size_full()
+        .text_size(ui::font_px(font_size))
+        .child(list)
+        .child(h_scrollbar("git-diff-inline-hbar", &scroll))
+        .into_any_element()
+}
+
+/// 横向滚动条(只在有行比视野宽时出现,常显):超长行有没有截在视野外,一眼看得出,
+/// 也能直接拖。要自己套一层 `absolute` + 四边贴 0 的壳,理由见 `menu.rs` 同款注释。
+fn h_scrollbar(id: &'static str, handle: &UniformListScrollHandle) -> gpui::Div {
+    div()
+        .absolute()
+        .top_0()
+        .left_0()
+        .right_0()
+        .bottom_0()
+        .child(
+            Scrollbar::horizontal(handle)
+                .id(id)
+                .mode(ScrollbarMode::Always),
+        )
 }
 
 /// `SideBySideView`(`DiffModal.tsx:62-152`),外加 hunk 头、横向滚动与纵向同步。
@@ -962,7 +1041,8 @@ fn render_side_by_side(
     let column = |side_left: bool, widest_ix: usize, scroll: UniformListScrollHandle| {
         let state = state.clone();
         let hunks = if side_left { None } else { hunks.clone() };
-        uniform_list(
+        let handle = scroll.clone();
+        let list = uniform_list(
             if side_left {
                 "git-diff-left"
             } else {
@@ -971,6 +1051,7 @@ fn render_side_by_side(
             count,
             move |range, _window, cx: &mut App| {
                 let s = state.read(cx);
+                let scroll_x = handle.0.borrow().base_handle.offset().x;
                 range
                     .map(|i| match s.flat.pair_rows[i] {
                         // 两栏各显示自己那侧的区间,行数仍一一对应
@@ -986,6 +1067,7 @@ fn render_side_by_side(
                                 line_height,
                                 GUTTER,
                                 hunks.as_ref().map(|ui| hunk_actions(ui, h)),
+                                scroll_x,
                             )
                         }
                         PairRow::Line(left, right) => {
@@ -1005,6 +1087,7 @@ fn render_side_by_side(
                                         &[(no.map(|n| n.to_string()).unwrap_or_default(), GUTTER)],
                                         line_height,
                                         &s.flat.marks[index],
+                                        scroll_x,
                                     )
                                 }
                             }
@@ -1016,7 +1099,15 @@ fn render_side_by_side(
         .size_full()
         .track_scroll(&scroll)
         .with_width_from_item(Some(widest_ix))
-        .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained)
+        .with_horizontal_sizing_behavior(ListHorizontalSizingBehavior::Unconstrained);
+        div().relative().size_full().child(list).child(h_scrollbar(
+            if side_left {
+                "git-diff-left-hbar"
+            } else {
+                "git-diff-right-hbar"
+            },
+            &scroll,
+        ))
     };
 
     div()
@@ -1025,20 +1116,8 @@ fn render_side_by_side(
         .child(
             h_resizable("git-diff-columns")
                 .with_state(&split)
-                .child(
-                    resizable_panel().child(
-                        div()
-                            .size_full()
-                            .child(column(true, widest_left, left_scroll)),
-                    ),
-                )
-                .child(
-                    resizable_panel().child(
-                        div()
-                            .size_full()
-                            .child(column(false, widest_right, right_scroll)),
-                    ),
-                ),
+                .child(resizable_panel().child(column(true, widest_left, left_scroll)))
+                .child(resizable_panel().child(column(false, widest_right, right_scroll))),
         )
         .into_any_element()
 }
@@ -1071,6 +1150,14 @@ fn jump_button(
         .into_any_element()
 }
 
+/// 跳转组中间的计数:跳过之后是 `2/5`,还没跳过是「共 5 处」。
+fn counter_text(jump: Option<usize>, total: usize) -> String {
+    match jump {
+        Some(cur) => format!("{}/{}", cur + 1, total),
+        None => tr!("gitCommit", "changeTotal", count = total.to_string()),
+    }
+}
+
 /// 改动跳转组(↑ / 计数 / ↓)。没有 hunk(空 diff / 还在加载)时整组不画。
 fn jump_group(
     state: &Entity<DiffState>,
@@ -1083,11 +1170,9 @@ fn jump_group(
     if total == 0 {
         return None;
     }
-    // 还没跳过时不硬说「第 1 处」—— 视野里那处是哪一处,滚动位置说了不算
-    let counter = match s.jump {
-        Some(cur) => format!("{}/{}", cur + 1, total),
-        None => format!("–/{}", total),
-    };
+    // 还没跳过时不硬说「第 1 处」—— 视野里那处是哪一处,滚动位置说了不算;也不写
+    // 「–/N」(看着像漏了个数),只报总数。跳过一次之后才是「第几处 / 共几处」
+    let counter = counter_text(s.jump, total);
     Some(
         div()
             .flex()
@@ -1186,6 +1271,9 @@ fn view_toggle(
 pub struct DiffFile {
     /// 相对 `repo_path` 的路径
     pub path: String,
+    /// 重命名前的路径(已暂存的重命名才有):HEAD 那一侧按它取,否则新路径在 HEAD 里
+    /// 查不到、整份显示成新增(见 `mt_project::git::get_git_diff_from`)
+    pub old_path: Option<String>,
     pub side: DiffSide,
     /// 标题栏状态胶囊里的字母(`M` / `A` / …)
     pub status_label: String,
@@ -1196,6 +1284,16 @@ pub struct DiffFile {
 
 /// 按块操作成功后的回调(更改列表据此重载)。
 pub type OnChanged = Rc<dyn Fn(&mut App)>;
+
+/// Alt+← / Alt+→(或标题栏按钮)换到了序列里的另一个文件(更改列表据此把选中项跟过去)。
+pub type OnSwitch = Rc<dyn Fn(&DiffFile, &mut App)>;
+
+/// [`open_file_diff_with`] 的回调。
+#[derive(Default)]
+pub struct FileDiffHooks {
+    pub on_changed: Option<OnChanged>,
+    pub on_switch: Option<OnSwitch>,
+}
 
 /// 三种块操作。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1213,6 +1311,7 @@ struct FileDiff {
     files: Vec<DiffFile>,
     current: usize,
     on_changed: Option<OnChanged>,
+    on_switch: Option<OnSwitch>,
     /// 进行中的块操作(第几块)。`Some` 时全部块按钮禁用,防重复点击
     busy: Option<usize>,
     /// 块操作失败的原文。就地显示在工具栏下方 —— toast 画在弹窗遮罩底下,看不见
@@ -1443,7 +1542,12 @@ fn load_file(
         let result = cx
             .background_executor()
             .spawn(async move {
-                mt_project::git::get_git_diff(std::path::Path::new(&repo), &file.path, file.side)
+                mt_project::git::get_git_diff_from(
+                    std::path::Path::new(&repo),
+                    &file.path,
+                    file.old_path.as_deref(),
+                    file.side,
+                )
             })
             .await;
         state.update(cx, |s: &mut DiffState, cx| {
@@ -1468,19 +1572,23 @@ fn load_file(
 }
 
 /// 在文件序列里前后换一个(到头不绕回)。块操作进行中不换 —— 回包会落到别的文件上。
+/// 换成了就告诉打开方(更改列表让选中项跟过去)。
 fn switch_file(state: &Entity<DiffState>, ctl: &Entity<FileDiff>, delta: isize, cx: &mut App) {
     let moved = ctl.update(cx, |c, cx| {
         let next = c.current as isize + delta;
         if c.busy.is_some() || next < 0 || next as usize >= c.files.len() {
-            return false;
+            return None;
         }
         c.current = next as usize;
         c.op_error = None;
         c.stale = false;
         cx.notify();
-        true
+        Some((c.file().clone(), c.on_switch.clone()))
     });
-    if moved {
+    if let Some((file, on_switch)) = moved {
+        if let Some(on_switch) = on_switch {
+            on_switch(&file, cx);
+        }
         load_file(state, ctl, None, cx);
     }
 }
@@ -1731,6 +1839,24 @@ pub fn open_file_diff(
     window: &mut Window,
     cx: &mut App,
 ) {
+    let hooks = FileDiffHooks {
+        on_changed,
+        on_switch: None,
+    };
+    open_file_diff_with(store, repo_path, files, current, hooks, window, cx);
+}
+
+/// 同 [`open_file_diff`],回调多一个 `on_switch`(弹窗里换了文件时调,更改列表让选中项
+/// 跟着走)。
+pub fn open_file_diff_with(
+    store: Entity<AppStore>,
+    repo_path: String,
+    files: Vec<DiffFile>,
+    current: usize,
+    hooks: FileDiffHooks,
+    window: &mut Window,
+    cx: &mut App,
+) {
     // 守卫要在建实体之前判:已经开着一个的话,下面的取数与聚焦都是白干
     // (聚焦还会把焦点送给一个永远不会画出来的元素,见 `prompt::autofocus`)
     if repo_path.is_empty() || files.is_empty() || crate::prompt::is_open(kind::GIT_DIFF) {
@@ -1743,7 +1869,8 @@ pub fn open_file_diff(
         repo_path,
         files,
         current,
-        on_changed,
+        on_changed: hooks.on_changed,
+        on_switch: hooks.on_switch,
         busy: None,
         op_error: None,
         stale: false,
@@ -2189,10 +2316,10 @@ fn load_commit_file_at(
         s.error = None;
         s.result = None;
         s.flat = Flat::default();
-        // 换文件 = 换一份 diff:跳转计数与两栏同步基准都要归零,否则新文件
+        // 换文件 = 换一份 diff:跳转计数与滚动位置(连同两栏同步基准)都要归零,否则新文件
         // 一进来就显示「3/12」,而两栏还停在上一份的偏移上
         s.jump = None;
-        s.synced_y = px(0.0);
+        s.reset_scroll();
         s.request += 1;
         cx.notify();
         s.request
@@ -2483,7 +2610,7 @@ mod tests {
             line_with("context", "a much much longer line"),
         ]);
         let f = flatten(&[h]);
-        // 行 0 是 hunk 头,行 1/2 是两条 context —— 最宽的是第 2 行
+        // 行 0 是 hunk 头(钉在左缘,不参与量宽),行 1/2 是两条 context —— 最宽的是第 2 行
         assert_eq!(f.widest_inline, 2);
         assert!(matches!(f.inline_rows[2], InlineRow::Line(1)));
         assert_eq!(f.widest_left, 2);
@@ -2512,5 +2639,38 @@ mod tests {
         assert_eq!(text_cols("abc"), 3);
         assert_eq!(text_cols("中文"), 4);
         assert_eq!(text_cols(""), 0);
+    }
+
+    /// hunk 头按 git 的写法:某一侧一行都没有时,起点写「插入点之前那一行」(文件开头
+    /// 为 0)—— `@@ -0,0 +1,2 @@`、`@@ -4,0 +5,2 @@`;两侧都有行时照旧。
+    #[test]
+    fn hunk_头空范围按_git_写法() {
+        let head = |old_start, old_lines, new_start, new_lines| {
+            hunk_head(&DiffHunk {
+                old_start,
+                old_lines,
+                new_start,
+                new_lines,
+                lines: Vec::new(),
+            })
+        };
+        // 新文件:后端记的是「插在旧侧第 1 行之前」
+        let new_file = head(1, 0, 1, 2);
+        assert_eq!(new_file.inline.as_ref(), "@@ -0,0 +1,2 @@");
+        assert_eq!(new_file.left.as_ref(), "@@ -0,0 @@");
+        assert_eq!(new_file.right.as_ref(), "@@ +1,2 @@");
+        // 第 4 行后插两行(无上下文)、删光文件
+        assert_eq!(head(5, 0, 5, 2).inline.as_ref(), "@@ -4,0 +5,2 @@");
+        assert_eq!(head(1, 3, 1, 0).inline.as_ref(), "@@ -1,3 +0,0 @@");
+        // 普通块不动
+        assert_eq!(head(6, 7, 6, 8).inline.as_ref(), "@@ -6,7 +6,8 @@");
+    }
+
+    /// 跳转组的计数:跳过之后「第几处 / 共几处」,还没跳过只报总数(不再是「–/N」)。
+    #[test]
+    fn 跳转计数没跳过时只报总数() {
+        assert_eq!(counter_text(Some(1), 3), "2/3");
+        let total = counter_text(None, 3);
+        assert!(total.contains('3') && !total.contains('/'), "{total}");
     }
 }

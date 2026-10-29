@@ -58,18 +58,19 @@
 //! 全部 git 调用(git2 的同步 IO 与带超时的 git CLI)一律丢 `cx.background_executor()`
 //! (范式照 `file_tree.rs:138-156`);异步回包用请求令牌防迟到。
 
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, App, AppContext as _, ClickEvent, ClipboardItem, Context, Entity, EventEmitter,
-    FocusHandle, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, ParentElement,
-    Pixels, Point, Render, ScrollHandle, SharedString, StatefulInteractiveElement, Styled,
-    Subscription, Window, div, prelude::FluentBuilder as _, px,
+    AnyElement, App, AppContext as _, Bounds, ClickEvent, ClipboardItem, Context, Entity,
+    EventEmitter, FocusHandle, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    ParentElement, Pixels, Point, Render, ScrollHandle, SharedString, StatefulInteractiveElement,
+    Styled, Subscription, Window, canvas, div, point, prelude::FluentBuilder as _, px,
 };
-use gpui_component::input::{InputEvent, Textarea, TextareaState};
+use gpui_component::input::{InputEvent, Position, Textarea, TextareaState};
 use mt_project::git::{
     AmendInfo, ChangeFileStatus, CommitMessageEntry, CommitTarget, ConflictInfo, ConflictSide,
     GitStatus, RepoOpKind,
@@ -400,6 +401,10 @@ pub struct GitChanges {
     history_loading: bool,
     /// 上一次提交失败的说明(已格式化好的整句),挂在提交按钮下方。
     commit_error: Option<String>,
+    /// 提交区整块的高度(canvas 量的):面板按内容分高度时要([`Self::natural_height`])。
+    commit_area_h: Rc<Cell<f32>>,
+    /// 提交按钮那一行(主按钮 + ▾)的窗口坐标:▾ 菜单贴着它的下沿 / 上沿弹,不压按钮。
+    commit_buttons: Rc<Cell<Option<Bounds<Pixels>>>>,
     _subs: Vec<Subscription>,
 }
 
@@ -450,8 +455,26 @@ impl GitChanges {
             committing: false,
             history_loading: false,
             commit_error: None,
+            commit_area_h: Rc::new(Cell::new(0.0)),
+            commit_buttons: Rc::new(Cell::new(None)),
             _subs: subs,
         }
+    }
+
+    /// 「更改」区整块摊开(列表不滚动)要多高:列表内容 + 上下留白 + 提交区。面板分配
+    /// 「更改 / 提交历史」两块高度时用(`git_panel::section_split`)。都是上一帧量的;
+    /// 还没画过时为 `None`。
+    pub fn natural_height(&self) -> Option<f32> {
+        let commit = self.commit_area_h.get();
+        let last = self.list_scroll.children_count().checked_sub(1)?;
+        let first = self.list_scroll.bounds_for_item(0)?;
+        let last = self.list_scroll.bounds_for_item(last)?;
+        if commit <= 0.0 {
+            return None;
+        }
+        // 列表的上下内边距(4 + 8)+ 首个分组标题的上外边距 4
+        let list = f32::from(last.bottom() - first.top()) + LIST_PAD_Y + 4.0;
+        Some(list + commit)
     }
 
     /// 换仓库(容器调)。空串 = 无仓库。
@@ -871,6 +894,8 @@ impl GitChanges {
                         }
                     }
                     this.load(cx);
+                    // 丢弃改了工作区、解决冲突改了状态:文件树的 git 标记跟着重算
+                    git_watch::request_refresh(git_watch::Subscriber::FileTree);
                 });
             },
             window,
@@ -1103,6 +1128,11 @@ impl GitChanges {
                 };
                 git_diff::DiffFile {
                     path: file.path.clone(),
+                    // 已暂存的重命名:HEAD 那一侧按旧路径取(暂存侧才比 HEAD)
+                    old_path: file
+                        .old_path
+                        .clone()
+                        .filter(|_| matches!(status, Some(GitStatus::Renamed))),
                     side,
                     status_label: status_label_for(status).to_string(),
                     hunk_actions,
@@ -1114,15 +1144,38 @@ impl GitChanges {
         let on_changed: git_diff::OnChanged = Rc::new(move |cx: &mut App| {
             let _ = weak.update(cx, |this, cx| this.load(cx));
         });
-        git_diff::open_file_diff(
+        let weak = cx.entity().downgrade();
+        let on_switch: git_diff::OnSwitch =
+            Rc::new(move |file: &git_diff::DiffFile, cx: &mut App| {
+                let path = file.path.clone();
+                let _ = weak.update(cx, |this, cx| this.follow_diff(area, &path, cx));
+            });
+        git_diff::open_file_diff_with(
             self.store.clone(),
             self.repo_path.clone(),
             files,
             current,
-            Some(on_changed),
+            git_diff::FileDiffHooks {
+                on_changed: Some(on_changed),
+                on_switch: Some(on_switch),
+            },
             window,
             cx,
         );
+    }
+
+    /// diff 弹窗里换了文件:列表的选中项跟过去(并滚进视野),关掉弹窗时停在看到的那个。
+    fn follow_diff(&mut self, area: Area, path: &str, cx: &mut Context<Self>) {
+        let Some(index) = self
+            .changes
+            .iter()
+            .position(|c| c.path == path && in_area(c, area))
+        else {
+            return;
+        };
+        self.select_single(area, index);
+        self.scroll_to_row(RowKey::File(area, index));
+        cx.notify();
     }
 
     // ── 提交 ──
@@ -1229,6 +1282,7 @@ impl GitChanges {
                                 cx,
                             );
                             this.load(cx);
+                            git_watch::request_refresh(git_watch::Subscriber::FileTree);
                             cx.emit(GitChangesEvent::Committed { open_push });
                         }
                         Err(err) => {
@@ -1503,9 +1557,12 @@ fn history_entries(
                 .detail(format_date(entry.timestamp))
                 .on_click(move |window, cx| {
                     let message = message.clone();
+                    let end = text_end(&message);
                     input.update(cx, |state, cx| {
                         state.set_value(message, window, cx);
-                        state.focus(window, cx);
+                        // 多行输入框 set_value 后光标在开头;接着往下写是常态,挪到末尾
+                        // (set_cursor_position 顺带聚焦)
+                        state.set_cursor_position(end, window, cx);
                     });
                     // set_value 不发 Change 事件,得自己叫一声重画(字数 / 提示 / 按钮)
                     owner.update(cx, |_, cx| cx.notify());
@@ -1513,6 +1570,13 @@ fn history_entries(
                 .into()
         })
         .collect()
+}
+
+/// 一段文本末尾的光标位置(行、列都从 0 数,列按字符)。
+fn text_end(text: &str) -> Position {
+    let line = text.matches('\n').count();
+    let last = text.rsplit('\n').next().unwrap_or_default();
+    Position::new(line as u32, last.chars().count() as u32)
 }
 
 fn format_date(timestamp: i64) -> String {
@@ -1527,6 +1591,13 @@ fn format_date(timestamp: i64) -> String {
 
 /// 文件行 / 目录行的行高(与分支弹窗、提交详情的文件列表同一口径)。
 const ROW_HEIGHT: f32 = git_ui::ROW_H;
+/// 列表的上 / 下内边距。
+const LIST_PAD_TOP: f32 = 4.0;
+const LIST_PAD_BOTTOM: f32 = 8.0;
+const LIST_PAD_Y: f32 = LIST_PAD_TOP + LIST_PAD_BOTTOM;
+/// ▾ 菜单的高度估计(三项、两三项带副标题、一条分隔线;按界面字号缩放)。只用来判断
+/// 按钮下方放不放得下、放不下就往上弹,估大了只是离按钮远一点。
+const COMMIT_MENU_EST_H: f32 = 160.0;
 /// 行右端「状态字母 / hover 时的操作按钮」那一格的宽:两颗图标按钮 + 间隙。
 /// 每行都留同样宽,状态字母竖着对齐。
 const ROW_ACTIONS_W: f32 = git_ui::ICON_BUTTON * 2.0 + 2.0;
@@ -1642,13 +1713,17 @@ impl GitChanges {
             .overflow_y_scroll()
             .track_scroll(&self.list_scroll)
             .px(px(4.0))
-            .pt(px(4.0))
-            .pb(px(8.0))
+            .pt(px(LIST_PAD_TOP))
+            .pb(px(LIST_PAD_BOTTOM))
             .children(rows)
             .into_any_element()
     }
 
     /// 工作区干净:32px 勾形图标 + 一句说明 + 「刷新」。
+    ///
+    /// 上下留白只用 `empty_state` 自带的那一份(24)。此前另叠了 `py(32)`,整块比列表区高,
+    /// 「刷新」被挤到可见区外、只露一道顶边(E2E b/s75)。现在面板也会按内容给「更改」区
+    /// 让高度(`git_panel::section_split`),这一块整个看得见。
     fn render_clean_state(&self, cx: &mut Context<Self>) -> AnyElement {
         git_ui::empty_state(
             ICON_CLEAN,
@@ -1664,7 +1739,6 @@ impl GitChanges {
                 .into_any_element(),
             ),
         )
-        .py(px(32.0))
         .into_any_element()
     }
 
@@ -2219,16 +2293,28 @@ impl GitChanges {
                     .hover(|el| el.opacity(0.9))
                     .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                         let entries = this.commit_menu(can_commit, stage_first_ok, cx);
-                        menu::show(event.position(), entries, window, cx);
+                        let position = this.commit_menu_anchor(event.position(), window);
+                        menu::show(position, entries, window, cx);
                     }))
             });
+        let buttons_bounds = self.commit_buttons.clone();
         let buttons = div()
+            .relative()
             .mt(px(8.0))
             .flex()
             .rounded(px(4.0))
             .overflow_hidden()
             .child(main_button)
-            .child(split);
+            .child(split)
+            // 记下这一行在窗口里的位置(▾ 菜单的锚点,见 `commit_menu_anchor`)
+            .child(
+                canvas(
+                    move |bounds: Bounds<Pixels>, _window, _cx| buttons_bounds.set(Some(bounds)),
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            );
 
         // 错误原文:与弹窗里的 git 失败原文同一套红框淡底,右侧一颗「复制」
         let error = self.commit_error.clone().map(|err| {
@@ -2270,7 +2356,9 @@ impl GitChanges {
                 )
         });
 
+        let area_h = self.commit_area_h.clone();
         div()
+            .relative()
             .flex_none()
             .border_t_1()
             .border_color(ui::border_subtle())
@@ -2285,7 +2373,38 @@ impl GitChanges {
             )
             .child(buttons)
             .children(error)
+            // 量提交区整块的高度(面板按内容分高度时要,见 `natural_height`)
+            .child(
+                canvas(
+                    move |bounds: Bounds<Pixels>, _window, _cx| {
+                        area_h.set(f32::from(bounds.size.height));
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
             .into_any_element()
+    }
+
+    /// ▾ 菜单的左上角:贴着提交按钮那一行的下沿弹出(与整行左对齐);下面放不下就整块
+    /// 弹到上沿之上。菜单基件只会把越出视口的面板**平移**回来 —— 在下沿弹、被推回来时
+    /// 正好压住按钮下半截(E2E b/s60),所以朝上弹要在这里先算好。还没画过按钮(量不到)
+    /// 时退回鼠标点。
+    fn commit_menu_anchor(&self, fallback: Point<Pixels>, window: &Window) -> Point<Pixels> {
+        let Some(row) = self.commit_buttons.get() else {
+            return fallback;
+        };
+        let gap = px(4.0);
+        let estimate = ui::font_px(COMMIT_MENU_EST_H);
+        if row.bottom() + gap + estimate <= window.viewport_size().height {
+            point(row.left(), row.bottom() + gap)
+        } else {
+            point(
+                row.left(),
+                px(f32::from(row.top() - gap - estimate).max(0.0)),
+            )
+        }
     }
 
     /// ▾ 菜单:提交并推送…(提交后打开推送对话框)/ 全部暂存并提交 /(分隔)贮藏当前改动…。

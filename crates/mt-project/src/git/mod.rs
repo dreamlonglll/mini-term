@@ -176,25 +176,51 @@ fn map_unstaged_status(status: Status, is_empty_repo: bool) -> Option<GitStatus>
     None
 }
 
+/// 取状态的选项:含未跟踪(逐个文件)、不含忽略,**暂存区一侧开重命名检测**。
+///
+/// 只开 HEAD → 暂存区这一侧(`git mv` / 暂存了「删旧 + 加新」之后显示一行 R,与
+/// `git status` 一致)。工作区一侧不开:libgit2 的 `RENAMES_INDEX_TO_WORKDIR` 会把
+/// 「工作区删掉的已跟踪文件」与**未跟踪文件**配成一对,`git status` 从不这么做 ——
+/// 未跟踪文件只是躺在那里,不该被认成谁的新名字。
+fn status_options() -> StatusOptions {
+    let mut opts = StatusOptions::new();
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .include_ignored(false)
+        .renames_head_to_index(true);
+    opts
+}
+
+/// 一条状态的路径:`(当前路径, 重命名前的路径)`。
+///
+/// ⚠️ 不能直接用 `StatusEntry::path()`:git2 取的是 `head_to_index` 的**旧**路径 ——
+/// 开了重命名检测之后,已暂存的重命名会被报成旧名字。重命名要从 diff 的新旧两端各取。
+fn entry_paths(entry: &git2::StatusEntry<'_>) -> (String, Option<String>) {
+    let slash = |p: &Path| p.to_string_lossy().replace('\\', "/");
+    if entry.status().contains(Status::INDEX_RENAMED)
+        && let Some(delta) = entry.head_to_index()
+        && let Some(new) = delta.new_file().path()
+    {
+        return (slash(new), delta.old_file().path().map(slash));
+    }
+    (entry.path().unwrap_or("").to_string(), None)
+}
+
 fn collect_repo_status(
     repo: &Repository,
     path_prefix: Option<&Path>,
 ) -> Result<Vec<GitFileStatus>> {
     let is_empty_repo = repo.head().is_err();
 
-    let mut opts = StatusOptions::new();
-    opts.include_untracked(true)
-        .recurse_untracked_dirs(true)
-        .include_ignored(false);
-
-    let statuses = repo.statuses(Some(&mut opts))?;
+    let statuses = repo.statuses(Some(&mut status_options()))?;
     let repo_workdir = repo.workdir().unwrap_or_else(|| repo.path());
     // 项目经软链进入时 workdir 是解析过的真实路径,前缀也得换成真实路径才比得上
     let path_prefix = path_prefix.map(|prefix| status_prefix(repo_workdir, prefix));
 
     let mut result = Vec::new();
     for entry in statuses.iter() {
-        let raw_path = entry.path().unwrap_or("").to_string();
+        // 重命名只报新路径(旧路径已不在工作区,文件树上没有它那一行)
+        let (raw_path, renamed_from) = entry_paths(&entry);
         let s = entry.status();
 
         let git_status = match map_status(s, is_empty_repo) {
@@ -215,15 +241,7 @@ fn collect_repo_status(
         };
 
         // 重命名才有 old_path
-        let old_path = if matches!(git_status, GitStatus::Renamed) {
-            entry.head_to_index().and_then(|d| {
-                d.old_file()
-                    .path()
-                    .map(|p| p.to_string_lossy().replace('\\', "/"))
-            })
-        } else {
-            None
-        };
+        let old_path = renamed_from.filter(|_| matches!(git_status, GitStatus::Renamed));
 
         result.push(GitFileStatus {
             path: display_path,
@@ -254,6 +272,9 @@ pub struct GitCommitInfo {
     pub message: String,
     pub body: Option<String>,
     pub author: String,
+    /// **作者时间**(秒),只给界面显示:与 `git log` 默认、IDEA 的 Log 一致,修改消息 /
+    /// 拣选 / 变基之后行里的时间不会变成「刚刚」而与详情区对不上。提交历史的拓扑 / 分页
+    /// 排序仍按提交者时间(`DateTopoWalk`),与这个字段无关。
     pub timestamp: i64,
     /// 全部父提交 hash（按 git 顺序：第 0 个是主线父）。据此绘制分支拓扑图。
     pub parent_hashes: Vec<String>,
@@ -523,20 +544,17 @@ pub fn get_git_status(project_path: &Path) -> Result<Vec<GitFileStatus>> {
     Ok(all)
 }
 
+/// 「更改」列表的数据:每个文件的暂存 / 未暂存两侧状态。已暂存的重命名是一行
+/// (`path` = 新路径、`old_path` = 旧路径、`staged_status = Renamed`),口径见 [`status_options`]。
 pub fn get_changes_status(repo_path: &Path) -> Result<Vec<ChangeFileStatus>> {
     let repo = Repository::open(repo_path)?;
     let is_empty_repo = repo.head().is_err();
 
-    let mut opts = StatusOptions::new();
-    opts.include_untracked(true)
-        .recurse_untracked_dirs(true)
-        .include_ignored(false);
-
-    let statuses = repo.statuses(Some(&mut opts))?;
+    let statuses = repo.statuses(Some(&mut status_options()))?;
     let mut result = Vec::new();
 
     for entry in statuses.iter() {
-        let raw_path = entry.path().unwrap_or("").to_string();
+        let (raw_path, old_path) = entry_paths(&entry);
         let s = entry.status();
 
         let staged = map_staged_status(s);
@@ -552,16 +570,6 @@ pub fn get_changes_status(repo_path: &Path) -> Result<Vec<ChangeFileStatus>> {
             .map(status_label)
             .unwrap_or("")
             .to_string();
-
-        let old_path = if s.contains(Status::INDEX_RENAMED) || s.contains(Status::WT_RENAMED) {
-            entry.head_to_index().and_then(|d| {
-                d.old_file()
-                    .path()
-                    .map(|p| p.to_string_lossy().replace('\\', "/"))
-            })
-        } else {
-            None
-        };
 
         result.push(ChangeFileStatus {
             path: raw_path,
@@ -861,7 +869,8 @@ fn commit_info(commit: &Commit<'_>) -> GitCommitInfo {
         message: commit.summary().unwrap_or("").to_string(),
         body: commit.body().map(|s| s.to_string()),
         author: commit.author().name().unwrap_or("unknown").to_string(),
-        timestamp: commit.time().seconds(),
+        // 显示用作者时间(见字段注释);排序在 `DateTopoWalk` 里另按提交者时间
+        timestamp: commit.author().when().seconds(),
         parent_hashes: commit.parent_ids().map(|id| id.to_string()).collect(),
         hash,
     }
@@ -1273,9 +1282,10 @@ fn edit_script(old_lines: &[&str], new_lines: &[&str]) -> Vec<(char, usize, usiz
     flat
 }
 
-/// 基于 LCS 的行 diff,上下文 3 行。
+/// 基于 LCS 的行 diff,上下文 3 行。改动块先按 git 的口径滑到位(见 `slide` 模块注释),
+/// 行号才与 `git diff` 对得上。
 fn build_hunks(old_lines: &[&str], new_lines: &[&str]) -> Vec<DiffHunk> {
-    let flat = edit_script(old_lines, new_lines);
+    let flat = slide::compact_ops(&edit_script(old_lines, new_lines), old_lines, new_lines);
 
     // 按上下文 3 行分组成 hunk
     const CONTEXT: usize = 3;
@@ -1431,6 +1441,21 @@ pub enum DiffSide {
 
 /// 单文件 diff,两侧由 [`DiffSide`] 决定。`file_path` 是相对 `project_path` 的路径。
 pub fn get_git_diff(project_path: &Path, file_path: &str, side: DiffSide) -> Result<GitDiffResult> {
+    get_git_diff_from(project_path, file_path, None, side)
+}
+
+/// 同 [`get_git_diff`],外加重命名前的路径 `old_path`(同样相对 `project_path`)。
+///
+/// 已暂存的重命名(`git mv a b`)在 HEAD 里只有旧路径 `a`:拿新路径 `b` 去 HEAD 里查
+/// 查不到,整份内容就成了「新增」。给了 `old_path` 时,取 HEAD 那一侧(`Staged` /
+/// `Working` 的旧侧)改按旧路径取 —— 与 `git diff --cached -M` 一样只显示真正改了的行。
+/// 暂存区 / 工作区那一侧照旧按新路径取;`None` 与 [`get_git_diff`] 完全相同。
+pub fn get_git_diff_from(
+    project_path: &Path,
+    file_path: &str,
+    old_path: Option<&str>,
+    side: DiffSide,
+) -> Result<GitDiffResult> {
     let abs_file = project_path.join(file_path);
 
     let repo = discover_repo_for(project_path, &abs_file).ok_or_else(|| {
@@ -1447,6 +1472,10 @@ pub fn get_git_diff(project_path: &Path, file_path: &str, side: DiffSide) -> Res
 
     let rel_str = repo_relative_path(workdir, project_path, &abs_file)
         .ok_or_else(|| anyhow!("file is outside repository working directory"))?;
+    // HEAD 里按哪个路径取:重命名取旧路径(算不出来就退回新路径,至少不报错)
+    let head_rel = old_path
+        .and_then(|old| repo_relative_path(workdir, project_path, &project_path.join(old)))
+        .unwrap_or_else(|| rel_str.clone());
 
     // 新侧:暂存区取 index,否则取工作区(已删除的文件 = 空)
     let new_content = match side {
@@ -1486,7 +1515,7 @@ pub fn get_git_diff(project_path: &Path, file_path: &str, side: DiffSide) -> Res
             None => String::new(),
         },
         DiffSide::Staged | DiffSide::Working => {
-            get_head_content(&repo, &rel_str)?.unwrap_or_default()
+            get_head_content(&repo, &head_rel)?.unwrap_or_default()
         }
     };
 
@@ -2056,6 +2085,9 @@ pub fn git_stage(repo_path: &Path, files: &[String]) -> Result<()> {
 }
 
 /// 取消暂存这些文件(`git reset -q -- <paths>`,只动暂存区、不碰仓库状态)。
+///
+/// 已暂存的重命名连旧路径一起取消(见 [`with_rename_sources`]):结果与对两条路径各
+/// `git restore --staged` 一样 —— 旧路径回到「工作区已删除」、新路径回到「未跟踪」。
 pub fn git_unstage(repo_path: &Path, files: &[String]) -> Result<()> {
     if files.is_empty() {
         return Ok(());
@@ -2069,7 +2101,31 @@ pub fn git_unstage(repo_path: &Path, files: &[String]) -> Result<()> {
         index.write()?;
         return Ok(());
     }
-    run_with_literal_paths(repo_path, &["reset", "-q"], files, "reset")
+    let files = with_rename_sources(repo_path, files)?;
+    run_with_literal_paths(repo_path, &["reset", "-q"], &files, "reset")
+}
+
+/// `files` 里已暂存重命名的新路径,补上各自的旧路径(列表里已有的不重复)。
+///
+/// 只 reset 新路径的话,旧路径那条「已暂存删除」还挂在暂存区,一行 R 就裂成
+/// 「已暂存 D + 未跟踪」。只比 HEAD 与暂存区(`StatusShow::Index`),不扫工作区。
+fn with_rename_sources(repo_path: &Path, files: &[String]) -> Result<Vec<String>> {
+    let repo = Repository::open(repo_path)?;
+    let mut opts = StatusOptions::new();
+    opts.show(git2::StatusShow::Index)
+        .renames_head_to_index(true);
+    let statuses = repo.statuses(Some(&mut opts))?;
+    let wanted: HashSet<&str> = files.iter().map(String::as_str).collect();
+    let mut out = files.to_vec();
+    for entry in statuses.iter() {
+        if let (new, Some(old)) = entry_paths(&entry)
+            && wanted.contains(new.as_str())
+            && !out.contains(&old)
+        {
+            out.push(old);
+        }
+    }
+    Ok(out)
 }
 
 /// 暂存全部改动(`git add -A`,含未跟踪文件与删除)。
@@ -2336,6 +2392,7 @@ mod line_diff;
 mod log_ops;
 mod log_query;
 mod repo_state;
+mod slide;
 mod stash;
 mod sync;
 mod tags;
@@ -2358,6 +2415,10 @@ mod test_support;
 #[cfg(test)]
 #[path = "index_exec_tests.rs"]
 mod index_exec_tests;
+
+#[cfg(test)]
+#[path = "changes_tests.rs"]
+mod changes_tests;
 
 #[cfg(test)]
 mod tests {
