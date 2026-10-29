@@ -1525,6 +1525,38 @@ fn run_git_output(
     spawn_git(repo_path, args, op_label, timeout, timeout_hint)
 }
 
+/// 同 `run_git_command_labeled`,但把 `input` 整段喂给子进程的 stdin(写完即关管道)。
+/// 给 `git blame --contents -` 这类要从 stdin 读内容的调用用;其余调用的 stdin
+/// 仍是 null(见 `spawn_git`)。
+fn run_git_command_with_input(
+    repo_path: &Path,
+    args: &[&str],
+    op_label: &str,
+    input: Vec<u8>,
+    timeout: Duration,
+    timeout_hint: &str,
+) -> Result<String> {
+    if !repo_path.is_dir() {
+        bail!("不是有效目录:{}", repo_path.display());
+    }
+    if !repo_path.join(".git").exists() {
+        bail!("不是 git 仓库(缺少 .git):{}", repo_path.display());
+    }
+    let output = spawn_git_with_input(
+        repo_path,
+        args,
+        op_label,
+        timeout,
+        timeout_hint,
+        Some(input),
+    )?;
+    if output.success {
+        Ok(output.stdout)
+    } else {
+        bail!("{}", output.stderr);
+    }
+}
+
 /// 一次 git CLI 调用的结果。
 struct GitOutput {
     success: bool,
@@ -1536,7 +1568,7 @@ struct GitOutput {
 /// 这类可能继承了管道句柄的后代 —— 等不到就按已读到的算。
 const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(2);
 
-/// 起 git 子进程并限时等待;只有「起不来 / 超时」是 `Err`。
+/// 起 git 子进程并限时等待;只有「起不来 / 超时」是 `Err`。stdin 是 null。
 fn spawn_git(
     repo_path: &Path,
     args: &[&str],
@@ -1544,20 +1576,46 @@ fn spawn_git(
     timeout: Duration,
     timeout_hint: &str,
 ) -> Result<GitOutput> {
-    use std::io::Read as _;
+    spawn_git_with_input(repo_path, args, op_label, timeout, timeout_hint, None)
+}
+
+/// [`spawn_git`] 的本体。`input` 为 `Some` 时 stdin 接管道,由独立线程整段写完后
+/// 关闭(内容大于管道缓冲时,git 一边读一边已经开始往 stdout 写,同一线程先写后读会
+/// 互相等死);`None` 时 stdin 是 null,与此前的行为一致。
+fn spawn_git_with_input(
+    repo_path: &Path,
+    args: &[&str],
+    op_label: &str,
+    timeout: Duration,
+    timeout_hint: &str,
+    input: Option<Vec<u8>>,
+) -> Result<GitOutput> {
+    use std::io::{Read as _, Write as _};
     use std::process::{Command, Stdio};
 
     let mut cmd = Command::new("git");
     cmd.args(args)
         .current_dir(repo_path)
         .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     hide_console_window(&mut cmd);
     let mut child = cmd
         .spawn()
         .map_err(|e| anyhow!("启动 git {} 失败:{}", op_label, e))?;
+
+    if let (Some(bytes), Some(mut stdin)) = (input, child.stdin.take()) {
+        std::thread::spawn(move || {
+            // 写失败(git 提前退出、管道已断)不在这里报:退出码与 stderr 会说明原因
+            let _ = stdin.write_all(&bytes);
+            // drop 即关管道,git 才读得到 EOF
+        });
+    }
 
     let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1946,6 +2004,12 @@ pub fn get_worktree_branches(paths: &[PathBuf]) -> Vec<Option<String>> {
         })
         .collect()
 }
+
+// 编辑器 gutter 变更标记 / 注解(blame)的后端,见各自的模块注释
+mod blame;
+mod line_diff;
+pub use blame::*;
+pub use line_diff::*;
 
 #[cfg(test)]
 mod test_support;

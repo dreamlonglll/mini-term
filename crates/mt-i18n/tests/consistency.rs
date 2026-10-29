@@ -124,8 +124,11 @@ use mt_i18n::{
 /// 934 → 939：设置页新增「环境变量」页（全局终端环境变量），侧栏项
 /// `settings.menu.envVars` 与页内四条（`settings.envVars.{section,addVar,hint,hasErrors}`）；
 /// 表格本身复用项目环境变量弹窗的 `envVars.*`。
-const EXPECTED_NAMESPACES: usize = 33;
-const EXPECTED_ENTRIES_PER_LANG: usize = 939;
+/// 939 → 958（33 → 34 个命名空间）：文件查看器源码编辑器接入 Git（对标 IDEA 的 gutter
+/// 变更标记 + 变更小窗 + Annotate）新增 `gitGutter` 命名空间 19 条（注解开关 / 提示条 /
+/// 悬停详情 9 条、变更小窗 9 条、提示条关闭钮 1 条）。
+const EXPECTED_NAMESPACES: usize = 34;
+const EXPECTED_ENTRIES_PER_LANG: usize = 958;
 
 /// TS 侧 `locales/index.ts` 收编的全部命名空间，手抄一份放这里做交叉验证 ——
 /// 只信生成器的话，「某个 ns 文件整体没被读到」这种错会一起漏过去。
@@ -139,6 +142,7 @@ const TS_NAMESPACES: &[&str] = &[
     "fileTree",
     "fileViewer",
     "gitChanges",
+    "gitGutter",
     "gitHistory",
     "gitHistoryContent",
     "markerList",

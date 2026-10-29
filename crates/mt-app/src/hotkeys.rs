@@ -465,6 +465,11 @@ pub fn bind_keys(cx: &mut App) {
         Some("GitChanges > Input"),
     ));
 
+    // 文件查看器源码态的「上一处 / 下一处 Git 变更」(IDEA 键位 Ctrl+Alt+Shift+↑/↓)。
+    // **不进快捷键表**:只在文件页里有意义,谓词挂 `FileViewer`;与编辑器自带的
+    // `ctrl-alt-up/down`(加光标)修饰键不同,不冲突。键位与机制单测见 `file_viewer::git_gutter`
+    bindings.extend(crate::file_viewer::git_change_key_bindings());
+
     // 终端里的裸 Tab / Shift+Tab 必须归终端(shell 补全、Claude 的 Tab 切模式全靠它)。
     //
     // 组件库的 `Root` 在 `root::init` 里把这两个键绑成了 `focus_next` / `focus_prev`,

@@ -38,6 +38,7 @@ import { terminalSearch } from './terminalSearch';
 import { projectSwitcher } from './projectSwitcher';
 import { usageStats } from './usageStats';
 import { commandLibrary } from './commandLibrary';
+import { gitGutter } from './gitGutter';
 
 type Dict = Record<string, unknown>;
 
@@ -76,6 +77,7 @@ export const dicts: { zh: Dict; en: Dict } = {
     projectSwitcher: projectSwitcher.zh,
     usageStats: usageStats.zh,
     commandLibrary: commandLibrary.zh,
+    gitGutter: gitGutter.zh,
   },
   en: {
     app: app.en,
@@ -111,5 +113,6 @@ export const dicts: { zh: Dict; en: Dict } = {
     projectSwitcher: projectSwitcher.en,
     usageStats: usageStats.en,
     commandLibrary: commandLibrary.en,
+    gitGutter: gitGutter.en,
   },
 };
